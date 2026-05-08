@@ -1,3 +1,2978 @@
+--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp	2026-05-07 18:54:15.234843180 +0200
++++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp	2026-05-08 18:58:14.342812753 +0200
+@@ -157,14 +157,16 @@ class SinkStoreInfo {
+   PredicatedScalarEvolution &PSE;
+   const Loop &L;
+   VPTypeAnalysis &TypeInfo;
++  std::optional<uint64_t> MaxFixedVF;
+ 
+-  // Return true if \p A and \p B are known to not alias for all VFs in the
+-  // plan, checked via the distance between the accesses
+   bool isNoAliasViaDistance(VPReplicateRecipe *A, VPReplicateRecipe *B) const {
+     if (A->getOpcode() != Instruction::Store ||
+         B->getOpcode() != Instruction::Store)
+       return false;
+ 
++    if (!MaxFixedVF)
++      return false;
++
+     VPValue *AddrA = A->getOperand(1);
+     const SCEV *SCEVA = vputils::getSCEVExprForVPValue(AddrA, PSE, &L);
+     VPValue *AddrB = B->getOperand(1);
+@@ -179,21 +181,14 @@ class SinkStoreInfo {
+ 
+     const DataLayout &DL = SE.getDataLayout();
+     Type *TyA = TypeInfo.inferScalarType(A->getOperand(0));
+-    uint64_t SizeA = DL.getTypeStoreSize(TyA);
+     Type *TyB = TypeInfo.inferScalarType(B->getOperand(0));
+-    uint64_t SizeB = DL.getTypeStoreSize(TyB);
+-
+-    // Use the maximum store size to ensure no overlap from either direction.
+-    // Currently only handles fixed sizes, as it is only used for
+-    // replicating VPReplicateRecipes.
+-    uint64_t MaxStoreSize = std::max(SizeA, SizeB);
++    uint64_t MaxStoreSize =
++        std::max(DL.getTypeStoreSize(TyA), DL.getTypeStoreSize(TyB));
+ 
+-    auto VFs = B->getParent()->getPlan()->vectorFactors();
+-    ElementCount MaxVF = *max_element(VFs, ElementCount::isKnownLT);
+-    if (MaxVF.isScalable())
+-      return false;
+-    return Distance->abs().uge(
+-        MaxVF.multiplyCoefficientBy(MaxStoreSize).getFixedValue());
++    APInt RequiredDistance(/*numBits=*/129, MaxStoreSize);
++    RequiredDistance *= APInt(/*numBits=*/129, *MaxFixedVF);
++    APInt AbsDistance = Distance->abs().zextOrTrunc(/*width=*/129);
++    return AbsDistance.uge(RequiredDistance);
+   }
+ 
+ public:
+@@ -201,11 +196,13 @@ public:
+                 VPReplicateRecipe &GroupLeader, PredicatedScalarEvolution &PSE,
+                 const Loop &L, VPTypeAnalysis &TypeInfo)
+       : ExcludeRecipes(ExcludeRecipes), GroupLeader(GroupLeader), PSE(PSE),
+-        L(L), TypeInfo(TypeInfo) {}
++        L(L), TypeInfo(TypeInfo) {
++    auto VFs = GroupLeader.getParent()->getPlan()->vectorFactors();
++    ElementCount MaxVF = *max_element(VFs, ElementCount::isKnownLT);
++    if (!MaxVF.isScalable())
++      MaxFixedVF = MaxVF.getFixedValue();
++  }
+ 
+-  /// Return true if \p R should be skipped during alias checking, either
+-  /// because it's in the exclude set or because no-alias can be proven via
+-  /// SCEV.
+   bool shouldSkip(VPRecipeBase &R) const {
+     auto *Store = dyn_cast<VPReplicateRecipe>(&R);
+     return ExcludeRecipes.contains(&R) ||
+@@ -698,52 +695,75 @@ createScalarIVSteps(VPlan &Plan, Inducti
+                                      &Plan.getVF(), DL);
+ }
+ 
+-void VPlanTransforms::replaceWideCanonicalIVWithWideIV(
+-    VPlan &Plan, ScalarEvolution &SE, const TargetTransformInfo &TTI,
+-    TargetTransformInfo::TargetCostKind CostKind, ElementCount VF, unsigned UF,
+-    const SmallPtrSetImpl<const Value *> &ValuesToIgnore) {
++/// Try to replace VPWidenCanonicalIVRecipes with a widened canonical IV
++/// recipe, if it exists.
++static void removeRedundantCanonicalIVs(VPlan &Plan) {
+   VPRegionBlock *LoopRegion = Plan.getVectorLoopRegion();
+-  if (!LoopRegion)
+-    return;
++  VPRegionValue *CanonicalIV = LoopRegion->getCanonicalIV();
++  auto *WidenNewIV = vputils::findUserOf<VPWidenCanonicalIVRecipe>(CanonicalIV);
+ 
+-  auto *WideCanIV = vputils::findUserOf<VPWidenCanonicalIVRecipe>(
+-      LoopRegion->getCanonicalIV());
+-  if (!WideCanIV)
++  if (!WidenNewIV)
+     return;
+ 
+-  Type *CanIVTy = LoopRegion->getCanonicalIVType();
++  VPBasicBlock *HeaderVPBB = LoopRegion->getEntryBasicBlock();
++  for (VPRecipeBase &Phi : HeaderVPBB->phis()) {
++    auto *WidenOriginalIV = dyn_cast<VPWidenIntOrFpInductionRecipe>(&Phi);
+ 
+-  // Replace the wide canonical IV with a scalar-iv-steps over the canonical
+-  // IV.
+-  if (Plan.hasScalarVFOnly() || vputils::onlyFirstLaneUsed(WideCanIV)) {
+-    VPBuilder Builder(WideCanIV);
+-    WideCanIV->replaceAllUsesWith(createScalarIVSteps(
+-        Plan, InductionDescriptor::IK_IntInduction, Instruction::Add, nullptr,
+-        nullptr, Plan.getZero(CanIVTy), Plan.getConstantInt(CanIVTy, 1),
+-        WideCanIV->getDebugLoc(), Builder));
+-    WideCanIV->eraseFromParent();
++    if (!WidenOriginalIV || !WidenOriginalIV->isCanonical())
++      continue;
++
++    // Replace WidenNewIV with WidenOriginalIV if WidenOriginalIV provides
++    // everything WidenNewIV's users need. That is, WidenOriginalIV will
++    // generate a vector phi or all users of WidenNewIV demand the first lane
++    // only.
++    if (Plan.hasScalarVFOnly() ||
++        !vputils::onlyScalarValuesUsed(WidenOriginalIV) ||
++        vputils::onlyFirstLaneUsed(WidenNewIV)) {
++      // We are replacing a wide canonical iv with a suitable wide induction.
++      // This is used to compute header mask, hence all lanes will be used and
++      // we need to drop wrap flags only applying to lanes guranteed to execute
++      // in the original scalar loop.
++      WidenOriginalIV->dropPoisonGeneratingFlags();
++      WidenNewIV->replaceAllUsesWith(WidenOriginalIV);
++      WidenNewIV->eraseFromParent();
++      return;
++    }
++  }
++
++  if (!vputils::onlyFirstLaneUsed(WidenNewIV) && !Plan.hasScalarVFOnly()) {
++    assert(!vputils::onlyScalarValuesUsed(WidenNewIV) &&
++           "Lanes other than first lane being used should imply that not just "
++           "scalars are used");
+     return;
+   }
+ 
+-  if (vputils::onlyScalarValuesUsed(WideCanIV))
++  // Replace the wide canonical IV with a scalar-iv-steps over the canonical
++  // IV.
++  Type *CanonicalIVTy = LoopRegion->getCanonicalIVType();
++  VPBuilder Builder(WidenNewIV);
++  WidenNewIV->replaceAllUsesWith(createScalarIVSteps(
++      Plan, InductionDescriptor::IK_IntInduction, Instruction::Add, nullptr,
++      nullptr, Plan.getZero(CanonicalIVTy),
++      Plan.getConstantInt(CanonicalIVTy, 1), CanonicalIV->getDebugLoc(),
++      Builder));
++  WidenNewIV->eraseFromParent();
++}
++
++void VPlanTransforms::replaceWideCanonicalIVWithWideIV(
++    VPlan &Plan, ScalarEvolution &SE, const TargetTransformInfo &TTI,
++    TargetTransformInfo::TargetCostKind CostKind, ElementCount VF, unsigned UF,
++    const SmallPtrSetImpl<const Value *> &ValuesToIgnore) {
++  VPRegionBlock *LoopRegion = Plan.getVectorLoopRegion();
++  if (!LoopRegion || Plan.hasScalarVFOnly())
+     return;
+ 
+-  // If a canonical VPWidenIntOrFpInductionRecipe already produces vector lanes
+-  // in the header, reuse it instead of introducing another wide induction phi.
+-  VPBasicBlock *Header = LoopRegion->getEntryBasicBlock();
+-  for (VPRecipeBase &Phi : Header->phis()) {
+-    auto *WidenIV = dyn_cast<VPWidenIntOrFpInductionRecipe>(&Phi);
+-    if (!WidenIV || !WidenIV->isCanonical())
+-      continue;
+-    // The reused wide IV feeds the header mask, whose lanes may extend past
+-    // the trip count; drop flags that only hold inside the scalar loop.
+-    WidenIV->dropPoisonGeneratingFlags();
+-    WideCanIV->replaceAllUsesWith(WidenIV);
+-    WideCanIV->eraseFromParent();
++  VPValue *CanonicalIV = LoopRegion->getCanonicalIV();
++  auto *WideCanIV = vputils::findUserOf<VPWidenCanonicalIVRecipe>(CanonicalIV);
++  if (!WideCanIV || vputils::onlyScalarValuesUsed(WideCanIV))
+     return;
+-  }
+ 
+   // Introduce a new VPWidenIntOrFpInductionRecipe if profitable.
++  Type *CanIVTy = LoopRegion->getCanonicalIVType();
+   auto *VecTy = VectorType::get(CanIVTy, VF);
+   InstructionCost BroadcastCost = TTI.getShuffleCost(
+       TargetTransformInfo::SK_Broadcast, VecTy, VecTy, {}, CostKind);
+@@ -772,6 +792,7 @@ void VPlanTransforms::replaceWideCanonic
+       VPIRFlags::WrapFlagsTy(/*HasNUW=*/LoopRegion->hasCanonicalIVNUW(),
+                              /*HasNSW=*/false),
+       WideCanIV->getDebugLoc());
++  VPBasicBlock *Header = LoopRegion->getEntryBasicBlock();
+   NewWideIV->insertBefore(&*Header->getFirstNonPhi());
+   WideCanIV->replaceAllUsesWith(NewWideIV);
+   WideCanIV->eraseFromParent();
+@@ -826,13 +847,23 @@ void VPlanTransforms::removeDeadRecipes(
+ }
+ 
+ static SmallVector<VPUser *> collectUsersRecursively(VPValue *V) {
+-  SetVector<VPUser *> Users(llvm::from_range, V->users());
++  SmallVector<VPUser *, 16> Users;
++  SmallPtrSet<VPUser *, 16> Seen;
++
++  for (VPUser *U : V->users())
++    if (Seen.insert(U).second)
++      Users.push_back(U);
++
++  // Deterministic insertion order.
+   for (unsigned I = 0; I != Users.size(); ++I) {
+     VPRecipeBase *Cur = cast<VPRecipeBase>(Users[I]);
+-    for (VPValue *V : Cur->definedValues())
+-      Users.insert_range(V->users());
++    for (VPValue *Def : Cur->definedValues())
++      for (VPUser *U : Def->users())
++        if (Seen.insert(U).second)
++          Users.push_back(U);
+   }
+-  return Users.takeVector();
++
++  return Users;
+ }
+ 
+ /// Scalarize a VPWidenPointerInductionRecipe by replacing it with a PtrAdd
+@@ -1645,6 +1676,13 @@ static void simplifyRecipe(VPSingleDefRe
+           BuildVector->getOperand(BuildVector->getNumOperands() - 1));
+       return;
+     }
++
++    if (match(A, m_Broadcast(m_VPValue(X))))
++      return Def->replaceAllUsesWith(X);
++
++    if (vputils::isSingleScalar(A))
++      return Def->replaceAllUsesWith(A);
++
+     if (Plan->hasScalarVFOnly())
+       return Def->replaceAllUsesWith(A);
+   }
+@@ -1767,30 +1805,25 @@ static void simplifyRecipe(VPSingleDefRe
+     return;
+   }
+ 
+-  if (match(Def, m_ExtractLastLane(m_Broadcast(m_VPValue(A))))) {
+-    Def->replaceAllUsesWith(A);
+-    return;
+-  }
+-
+-  if (match(Def, m_ExtractLastLane(m_VPValue(A))) &&
+-      vputils::isSingleScalar(A) && all_of(A->users(), [Def, A](VPUser *U) {
+-        return U->usesScalars(A) || Def == U;
+-      })) {
+-    return Def->replaceAllUsesWith(A);
+-  }
+-
+   if (Plan->getConcreteUF() == 1 && match(Def, m_ExtractLastPart(m_VPValue(A))))
+     return Def->replaceAllUsesWith(A);
+ }
+ 
+ void VPlanTransforms::simplifyRecipes(VPlan &Plan) {
++  VPTypeAnalysis TypeInfo(Plan);
++
++  // Bounded local fixpoint per block. This captures second-order simplifications
++  // without needing an unsafe pointer-based mutable worklist.
++  constexpr unsigned MaxLocalRounds = 3;
++
+   ReversePostOrderTraversal<VPBlockDeepTraversalWrapper<VPBlockBase *>> RPOT(
+       Plan.getEntry());
+-  VPTypeAnalysis TypeInfo(Plan);
+   for (VPBasicBlock *VPBB : VPBlockUtils::blocksOnly<VPBasicBlock>(RPOT)) {
+-    for (VPRecipeBase &R : make_early_inc_range(*VPBB))
+-      if (auto *Def = dyn_cast<VPSingleDefRecipe>(&R))
+-        simplifyRecipe(Def, TypeInfo);
++    for (unsigned Round = 0; Round != MaxLocalRounds; ++Round) {
++      for (VPRecipeBase &R : make_early_inc_range(*VPBB))
++        if (auto *Def = dyn_cast<VPSingleDefRecipe>(&R))
++          simplifyRecipe(Def, TypeInfo);
++    }
+   }
+ }
+ 
+@@ -1854,11 +1887,9 @@ static void narrowToSingleScalarRecipes(
+         continue;
+       }
+ 
+-      // Skip recipes that aren't single scalars.
+       if (!vputils::isSingleScalar(RepOrWidenR))
+         continue;
+ 
+-      // Predicate to check if a user of Op introduces extra broadcasts.
+       auto IntroducesBCastOf = [](const VPValue *Op) {
+         return [Op](const VPUser *U) {
+           if (auto *VPI = dyn_cast<VPInstruction>(U)) {
+@@ -1878,8 +1909,6 @@ static void narrowToSingleScalarRecipes(
+                     make_filter_range(Op->users(), not_equal_to(RepOrWidenR)),
+                     IntroducesBCastOf(Op)))
+               return false;
+-            // Non-constant live-ins require broadcasts, while constants do not
+-            // need explicit broadcasts.
+             auto *IRV = dyn_cast<VPIRValue>(Op);
+             bool LiveInNeedsBroadcast = IRV && !isa<Constant>(IRV->getValue());
+             auto *OpR = dyn_cast<VPReplicateRecipe>(Op);
+@@ -2425,7 +2454,75 @@ struct VPCSEDenseMapInfo : public DenseM
+ /// Plan.
+ void VPlanTransforms::cse(VPlan &Plan) {
+   VPDominatorTree VPDT(Plan);
+-  DenseMap<VPSingleDefRecipe *, VPSingleDefRecipe *, VPCSEDenseMapInfo> CSEMap;
++  VPTypeAnalysis TypeInfo(Plan);
++
++  DenseMap<const VPValue *, Type *> ScalarTypeCache;
++  auto getScalarType = [&](const VPSingleDefRecipe *Def) -> Type * {
++    const VPValue *V = Def->getVPSingleValue();
++    auto It = ScalarTypeCache.find(V);
++    if (It != ScalarTypeCache.end())
++      return It->second;
++    Type *Ty = TypeInfo.inferScalarType(V);
++    ScalarTypeCache[V] = Ty;
++    return Ty;
++  };
++
++  auto getGEPSourceElementType = [](const VPSingleDefRecipe *R) -> Type * {
++    return TypeSwitch<const VPSingleDefRecipe *, Type *>(R)
++        .Case([](const VPReplicateRecipe *I) -> Type * {
++          if (auto *GEP = dyn_cast<GetElementPtrInst>(I->getUnderlyingValue()))
++            return GEP->getSourceElementType();
++          return nullptr;
++        })
++        .Case<VPVectorPointerRecipe, VPWidenGEPRecipe>(
++            [](auto *I) { return I->getSourceElementType(); })
++        .Default([](auto *) { return nullptr; });
++  };
++
++  auto isEquivalent = [&](const VPSingleDefRecipe *L,
++                          const VPSingleDefRecipe *R) -> bool {
++    if (L->getVPRecipeID() != R->getVPRecipeID() ||
++        getOpcodeOrIntrinsicID(L) != getOpcodeOrIntrinsicID(R) ||
++        getGEPSourceElementType(L) != getGEPSourceElementType(R) ||
++        vputils::isSingleScalar(L) != vputils::isSingleScalar(R) ||
++        !equal(L->operands(), R->operands()))
++      return false;
++
++    if (auto *LFlags = dyn_cast<VPRecipeWithIRFlags>(L))
++      if (LFlags->hasPredicate() &&
++          LFlags->getPredicate() !=
++              cast<VPRecipeWithIRFlags>(R)->getPredicate())
++        return false;
++
++    if (auto *LSIV = dyn_cast<VPScalarIVStepsRecipe>(L))
++      if (LSIV->getInductionOpcode() !=
++          cast<VPScalarIVStepsRecipe>(R)->getInductionOpcode())
++        return false;
++
++    const VPRegionBlock *RegionL = L->getRegion();
++    const VPRegionBlock *RegionR = R->getRegion();
++    if (((RegionL && RegionL->isReplicator()) ||
++         (RegionR && RegionR->isReplicator())) &&
++        L->getParent() != R->getParent())
++      return false;
++
++    return getScalarType(L) == getScalarType(R);
++  };
++
++  auto computeHash = [&](const VPSingleDefRecipe *Def) -> uint64_t {
++    hash_code H = hash_combine(
++        Def->getVPRecipeID(), getOpcodeOrIntrinsicID(Def),
++        getGEPSourceElementType(Def), getScalarType(Def),
++        vputils::isSingleScalar(Def), hash_combine_range(Def->operands()));
++    if (auto *RFlags = dyn_cast<VPRecipeWithIRFlags>(Def))
++      if (RFlags->hasPredicate())
++        H = hash_combine(H, RFlags->getPredicate());
++    if (auto *SIVSteps = dyn_cast<VPScalarIVStepsRecipe>(Def))
++      H = hash_combine(H, SIVSteps->getInductionOpcode());
++    return static_cast<uint64_t>(H);
++  };
++
++  DenseMap<uint64_t, SmallVector<VPSingleDefRecipe *, 2>> Buckets;
+ 
+   ReversePostOrderTraversal<VPBlockDeepTraversalWrapper<VPBlockBase *>> RPOT(
+       Plan.getEntry());
+@@ -2434,17 +2531,28 @@ void VPlanTransforms::cse(VPlan &Plan) {
+       auto *Def = dyn_cast<VPSingleDefRecipe>(&R);
+       if (!Def || !VPCSEDenseMapInfo::canHandle(Def))
+         continue;
+-      if (VPSingleDefRecipe *V = CSEMap.lookup(Def)) {
+-        // V must dominate Def for a valid replacement.
+-        if (!VPDT.dominates(V->getParent(), VPBB))
++
++      uint64_t H = computeHash(Def);
++      auto &Bucket = Buckets[H];
++
++      VPSingleDefRecipe *Replacement = nullptr;
++      for (VPSingleDefRecipe *Cand : Bucket) {
++        if (!isEquivalent(Cand, Def))
++          continue;
++        if (!VPDT.dominates(Cand->getParent(), VPBB))
+           continue;
+-        // Only keep flags present on both V and Def.
+-        if (auto *RFlags = dyn_cast<VPRecipeWithIRFlags>(V))
+-          RFlags->intersectFlags(*cast<VPRecipeWithIRFlags>(Def));
+-        Def->replaceAllUsesWith(V);
++        Replacement = Cand;
++        break;
++      }
++
++      if (!Replacement) {
++        Bucket.push_back(Def);
+         continue;
+       }
+-      CSEMap[Def] = Def;
++
++      if (auto *RFlags = dyn_cast<VPRecipeWithIRFlags>(Replacement))
++        RFlags->intersectFlags(*cast<VPRecipeWithIRFlags>(Def));
++      Def->replaceAllUsesWith(Replacement);
+     }
+   }
+ }
+@@ -2452,15 +2560,11 @@ void VPlanTransforms::cse(VPlan &Plan) {
+ /// Move loop-invariant recipes out of the vector loop region in \p Plan.
+ static void licm(VPlan &Plan) {
+   VPBasicBlock *Preheader = Plan.getVectorPreheader();
+-
+-  // Hoist any loop invariant recipes from the vector loop region to the
+-  // preheader. Preform a shallow traversal of the vector loop region, to
+-  // exclude recipes in replicate regions. Since the top-level blocks in the
+-  // vector loop region are guaranteed to execute if the vector pre-header is,
+-  // we don't need to check speculation safety.
+   VPRegionBlock *LoopRegion = Plan.getVectorLoopRegion();
++
+   assert(Preheader->getSingleSuccessor() == LoopRegion &&
+-         "Expected vector prehader's successor to be the vector loop region");
++         "Expected vector preheader's successor to be the vector loop region");
++
+   for (VPBasicBlock *VPBB : VPBlockUtils::blocksOnly<VPBasicBlock>(
+            vp_depth_first_shallow(LoopRegion->getEntry()))) {
+     for (VPRecipeBase &R : make_early_inc_range(*VPBB)) {
+@@ -2474,12 +2578,8 @@ static void licm(VPlan &Plan) {
+     }
+   }
+ 
+-#ifndef NDEBUG
+   VPDominatorTree VPDT(Plan);
+-#endif
+-  // Sink recipes with no users inside the vector loop region if all users are
+-  // in the same exit block of the region.
+-  // TODO: Extend to sink recipes from inner loops.
++
+   PostOrderTraversal<VPBlockShallowTraversalWrapper<VPBlockBase *>> POT(
+       LoopRegion->getEntry());
+   for (VPBasicBlock *VPBB : VPBlockUtils::blocksOnly<VPBasicBlock>(POT)) {
+@@ -2491,46 +2591,54 @@ static void licm(VPlan &Plan) {
+         assert(!RepR->isPredicated() &&
+                "Expected prior transformation of predicated replicates to "
+                "replicate regions");
+-        // narrowToSingleScalarRecipes should have already maximally narrowed
+-        // replicates to single-scalar replicates.
+-        // TODO: When unrolling, replicateByVF doesn't handle sunk
+-        // non-single-scalar replicates correctly.
+         if (!RepR->isSingleScalar())
+           continue;
+       }
+ 
+-      // TODO: Use R.definedValues() instead of casting to VPSingleDefRecipe to
+-      // support recipes with multiple defined values (e.g., interleaved loads).
+-      auto *Def = cast<VPSingleDefRecipe>(&R);
+-
+-      // Cannot sink the recipe if the user is defined in a loop region or a
+-      // non-successor of the vector loop region. Cannot sink if user is a phi
+-      // either.
+       VPBasicBlock *SinkBB = nullptr;
+-      if (any_of(Def->users(), [&SinkBB, &LoopRegion](VPUser *U) {
+-            auto *UserR = cast<VPRecipeBase>(U);
+-            VPBasicBlock *Parent = UserR->getParent();
+-            // TODO: Support sinking when users are in multiple blocks.
+-            if (SinkBB && SinkBB != Parent)
+-              return true;
+-            SinkBB = Parent;
+-            // TODO: If the user is a PHI node, we should check the block of
+-            // incoming value. Support PHI node users if needed.
+-            return UserR->isPhi() || Parent->getEnclosingLoopRegion() ||
+-                   Parent->getSinglePredecessor() != LoopRegion;
+-          }))
++      bool IllegalUserFound = false;
++      bool HasAnyUser = false;
++
++      for (VPValue *Def : R.definedValues()) {
++        for (VPUser *U : Def->users()) {
++          HasAnyUser = true;
++          auto *UserR = cast<VPRecipeBase>(U);
++          VPBasicBlock *Parent = UserR->getParent();
++
++          if (UserR->isPhi()) {
++            IllegalUserFound = true;
++            break;
++          }
++
++          if (Parent->getEnclosingLoopRegion() ||
++              Parent->getSinglePredecessor() != LoopRegion) {
++            IllegalUserFound = true;
++            break;
++          }
++
++          if (SinkBB && SinkBB != Parent) {
++            IllegalUserFound = true;
++            break;
++          }
++          SinkBB = Parent;
++        }
++        if (IllegalUserFound)
++          break;
++      }
++
++      if (IllegalUserFound)
+         continue;
+ 
+-      if (!SinkBB)
++      if (!HasAnyUser)
+         SinkBB = cast<VPBasicBlock>(LoopRegion->getSingleSuccessor());
+ 
+-      // TODO: This will need to be a check instead of a assert after
+-      // conditional branches in vectorized loops are supported.
+-      assert(VPDT.properlyDominates(VPBB, SinkBB) &&
+-             "Defining block must dominate sink block");
+-      // TODO: Clone the recipe if users are on multiple exit paths, instead of
+-      // just moving.
+-      Def->moveBefore(*SinkBB, SinkBB->getFirstNonPhi());
++      if (!SinkBB)
++        continue;
++
++      if (!VPDT.properlyDominates(VPBB, SinkBB))
++        continue;
++
++      R.moveBefore(*SinkBB, SinkBB->getFirstNonPhi());
+     }
+   }
+ }
+@@ -2634,13 +2742,10 @@ void VPlanTransforms::removeBranchOnCons
+   if (OnlyLatches)
+     VPDT.emplace(Plan);
+ 
+-  // Collect all blocks before modifying the CFG so we can identify unreachable
+-  // ones after constant branch removal.
+   SmallVector<VPBlockBase *> AllBlocks(vp_depth_first_shallow(Plan.getEntry()));
+ 
+   for (VPBasicBlock *VPBB : VPBlockUtils::blocksOnly<VPBasicBlock>(AllBlocks)) {
+     VPValue *Cond;
+-    // Skip blocks that are not terminated by BranchOnCond.
+     if (VPBB->empty() || !match(&VPBB->back(), m_BranchOnCond(m_VPValue(Cond))))
+       continue;
+ 
+@@ -2649,6 +2754,7 @@ void VPlanTransforms::removeBranchOnCons
+ 
+     assert(VPBB->getNumSuccessors() == 2 &&
+            "Two successors expected for BranchOnCond");
++
+     unsigned RemovedIdx;
+     if (match(Cond, m_True()))
+       RemovedIdx = 1;
+@@ -2661,45 +2767,47 @@ void VPlanTransforms::removeBranchOnCons
+         cast<VPBasicBlock>(VPBB->getSuccessors()[RemovedIdx]);
+     assert(count(RemovedSucc->getPredecessors(), VPBB) == 1 &&
+            "There must be a single edge between VPBB and its successor");
+-    // Values coming from VPBB into phi recipes of RemovedSucc are removed from
+-    // these recipes.
++
+     for (VPRecipeBase &R : RemovedSucc->phis())
+       cast<VPPhiAccessors>(&R)->removeIncomingValueFor(VPBB);
+ 
+-    // Disconnect blocks and remove the terminator.
+     VPBlockUtils::disconnectBlocks(VPBB, RemovedSucc);
+     VPBB->back().eraseFromParent();
+   }
+ 
+-  // Compute which blocks are still reachable from the entry after constant
+-  // branch removal.
+   SmallPtrSet<VPBlockBase *, 16> Reachable(
+       llvm::from_range, vp_depth_first_shallow(Plan.getEntry()));
+ 
+-  // Detach all unreachable blocks from their successors, removing their recipes
+-  // and incoming values from phi recipes.
+   VPSymbolicValue Tmp;
+-  for (VPBlockBase *B : AllBlocks) {
+-    if (Reachable.contains(B))
++  SmallPtrSet<VPBlockBase *, 32> VisitedDead;
++  for (VPBlockBase *Root : AllBlocks) {
++    if (Reachable.contains(Root))
+       continue;
+-    for (VPBlockBase *Succ : to_vector(B->successors())) {
+-      if (auto *SuccBB = dyn_cast<VPBasicBlock>(Succ))
+-        for (VPRecipeBase &R : SuccBB->phis())
+-          cast<VPPhiAccessors>(&R)->removeIncomingValueFor(B);
+-      VPBlockUtils::disconnectBlocks(B, Succ);
+-    }
+-    for (VPBasicBlock *DeadBB :
+-         VPBlockUtils::blocksOnly<VPBasicBlock>(vp_depth_first_deep(B))) {
+-      for (VPRecipeBase &R : make_early_inc_range(*DeadBB)) {
+-        for (VPValue *Def : R.definedValues())
+-          Def->replaceAllUsesWith(&Tmp);
+-        R.eraseFromParent();
++
++    for (VPBlockBase *Dead : vp_depth_first_deep(Root)) {
++      if (!VisitedDead.insert(Dead).second)
++        continue;
++
++      for (VPBlockBase *Succ : to_vector(Dead->successors())) {
++        if (auto *SuccBB = dyn_cast<VPBasicBlock>(Succ))
++          for (VPRecipeBase &R : SuccBB->phis())
++            cast<VPPhiAccessors>(&R)->removeIncomingValueFor(Dead);
++        VPBlockUtils::disconnectBlocks(Dead, Succ);
++      }
++
++      if (auto *DeadBB = dyn_cast<VPBasicBlock>(Dead)) {
++        for (VPRecipeBase &R : make_early_inc_range(*DeadBB)) {
++          for (VPValue *Def : R.definedValues())
++            Def->replaceAllUsesWith(&Tmp);
++          R.eraseFromParent();
++        }
+       }
+     }
+   }
+ }
+ 
+ void VPlanTransforms::optimize(VPlan &Plan) {
++  RUN_VPLAN_PASS(removeRedundantCanonicalIVs, Plan);
+   RUN_VPLAN_PASS(removeRedundantInductionCasts, Plan);
+ 
+   RUN_VPLAN_PASS(reassociateHeaderMask, Plan);
+@@ -2985,6 +3093,13 @@ void VPlanTransforms::optimizeEVLMasks(V
+ 
+   VPTypeAnalysis TypeInfo(Plan);
+   SmallVector<VPRecipeBase *> OldRecipes;
++  SmallPtrSet<VPRecipeBase *, 16> OldRecipeSet;
++
++  auto MarkForErase = [&](VPRecipeBase *R) {
++    if (OldRecipeSet.insert(R).second)
++      OldRecipes.push_back(R);
++  };
++
+   for (VPUser *U : collectUsersRecursively(HeaderMask)) {
+     VPRecipeBase *R = cast<VPRecipeBase>(U);
+     if (auto *NewR = optimizeMaskToEVL(HeaderMask, *R, TypeInfo, *EVL)) {
+@@ -2992,23 +3107,27 @@ void VPlanTransforms::optimizeEVLMasks(V
+       for (auto [Old, New] :
+            zip_equal(R->definedValues(), NewR->definedValues()))
+         Old->replaceAllUsesWith(New);
+-      OldRecipes.push_back(R);
++      MarkForErase(R);
+     }
+   }
+ 
+   // Replace remaining (HeaderMask && Mask) with vp.merge (True, Mask,
+-  // False, EVL)
++  // False, EVL).
+   for (VPUser *U : collectUsersRecursively(HeaderMask)) {
++    auto *LogicalAnd = dyn_cast<VPInstruction>(U);
++    if (!LogicalAnd || OldRecipeSet.contains(LogicalAnd))
++      continue;
++
+     VPValue *Mask;
+-    if (match(U, m_LogicalAnd(m_Specific(HeaderMask), m_VPValue(Mask)))) {
+-      auto *LogicalAnd = cast<VPInstruction>(U);
+-      auto *Merge = new VPWidenIntrinsicRecipe(
+-          Intrinsic::vp_merge, {Plan.getTrue(), Mask, Plan.getFalse(), EVL},
+-          TypeInfo.inferScalarType(Mask), {}, {}, LogicalAnd->getDebugLoc());
+-      Merge->insertBefore(LogicalAnd);
+-      LogicalAnd->replaceAllUsesWith(Merge);
+-      OldRecipes.push_back(LogicalAnd);
+-    }
++    if (!match(LogicalAnd, m_LogicalAnd(m_Specific(HeaderMask), m_VPValue(Mask))))
++      continue;
++
++    auto *Merge = new VPWidenIntrinsicRecipe(
++        Intrinsic::vp_merge, {Plan.getTrue(), Mask, Plan.getFalse(), EVL},
++        TypeInfo.inferScalarType(Mask), {}, {}, LogicalAnd->getDebugLoc());
++    Merge->insertBefore(LogicalAnd);
++    LogicalAnd->replaceAllUsesWith(Merge);
++    MarkForErase(LogicalAnd);
+   }
+ 
+   // Erase old recipes at the end so we don't invalidate TypeInfo.
+@@ -4531,7 +4650,7 @@ void VPlanTransforms::materializeBroadca
+         (isa<VPIRValue>(VPV) && isa<Constant>(VPV->getLiveInIRValue())))
+       continue;
+ 
+-    // Add explicit broadcast at the insert point that dominates all users.
++    // Add explicit broadcast at an insert point that dominates all vector users.
+     VPBasicBlock *HoistBlock = VectorPreheader;
+     VPBasicBlock::iterator HoistPoint = VectorPreheader->end();
+     for (VPUser *User : VPV->users()) {
+@@ -4539,17 +4658,37 @@ void VPlanTransforms::materializeBroadca
+         continue;
+       if (cast<VPRecipeBase>(User)->getParent() == VectorPreheader)
+         HoistPoint = HoistBlock->begin();
++#ifndef NDEBUG
+       else
+         assert(VPDT.dominates(VectorPreheader,
+                               cast<VPRecipeBase>(User)->getParent()) &&
+                "All users must be in the vector preheader or dominated by it");
++#endif
++    }
++
++    // Reuse existing preheader broadcast of VPV when possible.
++    VPSingleDefRecipe *BroadcastDef = nullptr;
++    for (VPUser *User : VPV->users()) {
++      auto *BC = dyn_cast<VPInstruction>(User);
++      if (!BC || BC->getParent() != VectorPreheader ||
++          BC->getOpcode() != VPInstruction::Broadcast ||
++          BC->getNumOperands() != 1 || BC->getOperand(0) != VPV)
++        continue;
++      BroadcastDef = BC;
++      break;
+     }
+ 
+-    VPBuilder Builder(cast<VPBasicBlock>(HoistBlock), HoistPoint);
+-    auto *Broadcast = Builder.createNaryOp(VPInstruction::Broadcast, {VPV});
+-    VPV->replaceUsesWithIf(Broadcast,
+-                           [VPV, Broadcast](VPUser &U, unsigned Idx) {
+-                             return Broadcast != &U && !U.usesScalars(VPV);
++    if (!BroadcastDef) {
++      VPBuilder Builder(HoistBlock, HoistPoint);
++      BroadcastDef = Builder.createNaryOp(VPInstruction::Broadcast, {VPV});
++    }
++
++    // Replace non-scalar uses, excluding the broadcast recipe itself.
++    VPV->replaceUsesWithIf(BroadcastDef->getVPSingleValue(),
++                           [VPV, BroadcastDef](VPUser &U, unsigned) {
++                             auto *UserR = cast<VPRecipeBase>(&U);
++                             return UserR != BroadcastDef &&
++                                    !U.usesScalars(VPV);
+                            });
+   }
+ }
+@@ -4611,6 +4750,15 @@ static VPIRMetadata getCommonMetadata(Ar
+   return CommonMetadata;
+ }
+ 
++static VPValue *stripLogicalNot(VPValue *Mask, bool &IsNegated) {
++  VPValue *Inner;
++  while (match(Mask, m_Not(m_VPValue(Inner)))) {
++    IsNegated = !IsNegated;
++    Mask = Inner;
++  }
++  return Mask;
++}
++
+ template <unsigned Opcode>
+ static SmallVector<SmallVector<VPReplicateRecipe *, 4>>
+ collectComplementaryPredicatedMemOps(VPlan &Plan,
+@@ -4621,51 +4769,47 @@ collectComplementaryPredicatedMemOps(VPl
+   constexpr bool IsLoad = (Opcode == Instruction::Load);
+   VPTypeAnalysis TypeInfo(Plan);
+ 
+-  // For each address, collect operations with the same or complementary masks.
+-  SmallVector<SmallVector<VPReplicateRecipe *, 4>> AllGroups;
+-  auto GetLoadStoreValueType = [&](VPReplicateRecipe *Recipe) {
+-    return TypeInfo.inferScalarType(IsLoad ? Recipe : Recipe->getOperand(0));
++  auto GetLoadStoreValueType = [&](VPReplicateRecipe *Recipe) -> Type * {
++    if constexpr (IsLoad)
++      return TypeInfo.inferScalarType(Recipe);
++    return TypeInfo.inferScalarType(Recipe->getOperand(0));
+   };
++
++  SmallVector<SmallVector<VPReplicateRecipe *, 4>> AllGroups;
+   auto Groups = collectGroupedReplicateMemOps<Opcode>(
+       Plan, PSE, L,
+       [](VPReplicateRecipe *RepR) { return RepR->isPredicated(); });
+-  for (auto Recipes : Groups) {
+-    if (Recipes.size() < 2)
++
++  for (auto &RecipesAtAddr : Groups) {
++    if (RecipesAtAddr.size() < 2)
+       continue;
+ 
+-    // Collect groups with the same or complementary masks.
+-    for (VPReplicateRecipe *&RecipeI : Recipes) {
+-      if (!RecipeI)
+-        continue;
++    DenseMap<Type *, SmallVector<VPReplicateRecipe *, 4>> ByType;
++    for (VPReplicateRecipe *R : RecipesAtAddr)
++      ByType[GetLoadStoreValueType(R)].push_back(R);
+ 
+-      VPValue *MaskI = RecipeI->getMask();
+-      Type *TypeI = GetLoadStoreValueType(RecipeI);
+-      SmallVector<VPReplicateRecipe *, 4> Group;
+-      Group.push_back(RecipeI);
+-      RecipeI = nullptr;
++    for (auto &KV : ByType) {
++      SmallVector<VPReplicateRecipe *, 4> &TypeGroup = KV.second;
++      if (TypeGroup.size() < 2)
++        continue;
+ 
+-      // Find all operations with the same or complementary masks.
++      DenseMap<VPValue *, unsigned char> SeenPolarity;
+       bool HasComplementaryMask = false;
+-      for (VPReplicateRecipe *&RecipeJ : Recipes) {
+-        if (!RecipeJ)
+-          continue;
+ 
+-        VPValue *MaskJ = RecipeJ->getMask();
+-        Type *TypeJ = GetLoadStoreValueType(RecipeJ);
+-        if (TypeI == TypeJ) {
+-          // Check if any operation in the group has a complementary mask with
+-          // another, that is M1 == NOT(M2) or M2 == NOT(M1).
+-          HasComplementaryMask |= match(MaskI, m_Not(m_Specific(MaskJ))) ||
+-                                  match(MaskJ, m_Not(m_Specific(MaskI)));
+-          Group.push_back(RecipeJ);
+-          RecipeJ = nullptr;
++      for (VPReplicateRecipe *R : TypeGroup) {
++        bool IsNegated = false;
++        VPValue *Base = stripLogicalNot(R->getMask(), IsNegated);
++        unsigned char Bit = IsNegated ? 0x2 : 0x1;
++        unsigned char &Seen = SeenPolarity[Base];
++        Seen |= Bit;
++        if (Seen == 0x3) {
++          HasComplementaryMask = true;
++          break;
+         }
+       }
+ 
+-      if (HasComplementaryMask) {
+-        assert(Group.size() >= 2 && "must have at least 2 entries");
+-        AllGroups.push_back(std::move(Group));
+-      }
++      if (HasComplementaryMask)
++        AllGroups.push_back(std::move(TypeGroup));
+     }
+   }
+ 
+@@ -6244,9 +6388,6 @@ matchExtendedReductionOperand(VPWidenRec
+ static std::optional<SmallVector<VPPartialReductionChain>>
+ getScaledReductions(VPReductionPHIRecipe *RedPhiR, VPCostContext &CostCtx,
+                     VFRange &Range) {
+-  // Get the backedge value from the reduction PHI and find the
+-  // ComputeReductionResult that uses it (directly or through a select for
+-  // predicated reductions).
+   auto *RdxResult = vputils::findComputeReductionResult(RedPhiR);
+   if (!RdxResult)
+     return std::nullopt;
+@@ -6259,7 +6400,6 @@ getScaledReductions(VPReductionPHIRecipe
+   Type *PhiType = TypeInfo.inferScalarType(RedPhiR);
+   TypeSize PHISize = PhiType->getPrimitiveSizeInBits();
+ 
+-  // Work backwards from the ExitValue examining each reduction operation.
+   VPValue *CurrentValue = ExitValue;
+   while (CurrentValue != RedPhiR) {
+     auto *UpdateR = dyn_cast<VPWidenRecipe>(CurrentValue);
+@@ -6269,8 +6409,6 @@ getScaledReductions(VPReductionPHIRecipe
+     VPValue *Op = UpdateR->getOperand(1);
+     VPValue *PrevValue = UpdateR->getOperand(0);
+ 
+-    // Find the extended operand. The other operand (PrevValue) is the next link
+-    // in the reduction chain.
+     std::optional<ExtendedReductionOperand> ExtendedOp =
+         matchExtendedReductionOperand(UpdateR, Op, TypeInfo);
+     if (!ExtendedOp) {
+@@ -6285,19 +6423,13 @@ getScaledReductions(VPReductionPHIRecipe
+     if (!PHISize.hasKnownScalarFactor(ExtSrcSize))
+       return std::nullopt;
+ 
+-    // Check if a partial reduction chain is supported by the target (i.e. does
+-    // not have an invalid cost) for the given VF range. Clamps the range and
+-    // returns true if feasible for any VF.
+     VPPartialReductionChain Link(
+-        {UpdateR, *ExtendedOp, RK,
+-         PrevValue == UpdateR->getOperand(0) ? 0U : 1U,
++        {UpdateR, *ExtendedOp, RK, PrevValue == UpdateR->getOperand(0) ? 0U : 1U,
+          static_cast<unsigned>(PHISize.getKnownScalarFactor(ExtSrcSize))});
+     Chain.push_back(Link);
+     CurrentValue = PrevValue;
+   }
+ 
+-  // The chain links were collected by traversing backwards from the exit value.
+-  // Reverse the chains so they are in program order.
+   std::reverse(Chain.begin(), Chain.end());
+   return Chain;
+ }
+@@ -6306,9 +6438,6 @@ getScaledReductions(VPReductionPHIRecipe
+ void VPlanTransforms::createPartialReductions(VPlan &Plan,
+                                               VPCostContext &CostCtx,
+                                               VFRange &Range) {
+-  // Find all possible valid partial reductions, grouping chains by their PHI.
+-  // This grouping allows invalidating the whole chain, if any link is not a
+-  // valid partial reduction.
+   MapVector<VPReductionPHIRecipe *, SmallVector<VPPartialReductionChain>>
+       ChainsByPhi;
+   VPBasicBlock *HeaderVPBB = Plan.getVectorLoopRegion()->getEntryBasicBlock();
+@@ -6324,9 +6453,7 @@ void VPlanTransforms::createPartialReduc
+   if (ChainsByPhi.empty())
+     return;
+ 
+-  // Build set of partial reduction operations for extend user validation and
+-  // a map of reduction bin ops to their scale factors for scale validation.
+-  SmallPtrSet<VPRecipeBase *, 4> PartialReductionOps;
++  SmallPtrSet<VPRecipeBase *, 8> PartialReductionOps;
+   DenseMap<VPSingleDefRecipe *, unsigned> ScaledReductionMap;
+   for (const auto &[_, Chains] : ChainsByPhi)
+     for (const VPPartialReductionChain &Chain : Chains) {
+@@ -6334,9 +6461,6 @@ void VPlanTransforms::createPartialReduc
+       ScaledReductionMap[Chain.ReductionBinOp] = Chain.ScaleFactor;
+     }
+ 
+-  // A partial reduction is invalid if any of its extends are used by
+-  // something that isn't another partial reduction. This is because the
+-  // extends are intended to be lowered along with the reduction itself.
+   auto ExtendUsersValid = [&](VPValue *Ext) {
+     return !isa<VPWidenCastRecipe>(Ext) || all_of(Ext->users(), [&](VPUser *U) {
+       return PartialReductionOps.contains(cast<VPRecipeBase>(U));
+@@ -6345,11 +6469,9 @@ void VPlanTransforms::createPartialReduc
+ 
+   auto IsProfitablePartialReductionChainForVF =
+       [&](ArrayRef<VPPartialReductionChain> Chain, ElementCount VF) -> bool {
+-    InstructionCost PartialCost = 0, RegularCost = 0;
++    InstructionCost PartialCost = 0;
++    InstructionCost RegularCost = 0;
+ 
+-    // The chain is a profitable partial reduction chain if the cost of handling
+-    // the entire chain is cheaper when using partial reductions than when
+-    // handling the entire chain using regular reductions.
+     for (const VPPartialReductionChain &Link : Chain) {
+       const ExtendedReductionOperand &ExtendedOp = Link.ExtendedOp;
+       InstructionCost LinkCost = getPartialReductionLinkCost(CostCtx, Link, VF);
+@@ -6358,30 +6480,31 @@ void VPlanTransforms::createPartialReduc
+ 
+       PartialCost += LinkCost;
+       RegularCost += Link.ReductionBinOp->computeCost(VF, CostCtx);
+-      // If ExtendB is not none, then the "ExtendsUser" is the binary operation.
+       if (ExtendedOp.ExtendB.Kind != ExtendKind::PR_None)
+         RegularCost += ExtendedOp.ExtendsUser->computeCost(VF, CostCtx);
+       for (VPValue *Op : ExtendedOp.ExtendsUser->operands())
+         if (auto *Extend = dyn_cast<VPWidenCastRecipe>(Op))
+           RegularCost += Extend->computeCost(VF, CostCtx);
+     }
++
+     return PartialCost.isValid() && PartialCost < RegularCost;
+   };
+ 
+-  // Validate chains: check that extends are only used by partial reductions,
+-  // and that reduction bin ops are only used by other partial reductions with
+-  // matching scale factors, are outside the loop region or the select
+-  // introduced by tail-folding. Otherwise we would create users of scaled
+-  // reductions where the types of the other operands don't match.
+   for (auto &[RedPhiR, Chains] : ChainsByPhi) {
++    if (Chains.empty())
++      continue;
++
++    bool Invalid = false;
+     for (const VPPartialReductionChain &Chain : Chains) {
+       if (!all_of(Chain.ExtendedOp.ExtendsUser->operands(), ExtendUsersValid)) {
+-        Chains.clear();
++        Invalid = true;
+         break;
+       }
++
+       auto UseIsValid = [&, RedPhiR = RedPhiR](VPUser *U) {
+         if (auto *PhiR = dyn_cast<VPReductionPHIRecipe>(U))
+           return PhiR == RedPhiR;
++
+         auto *R = cast<VPSingleDefRecipe>(U);
+         return Chain.ScaleFactor == ScaledReductionMap.lookup_or(R, 0) ||
+                match(R, m_ComputeReductionResult(
+@@ -6390,24 +6513,26 @@ void VPlanTransforms::createPartialReduc
+                                  m_Specific(RedPhiR)));
+       };
+       if (!all_of(Chain.ReductionBinOp->users(), UseIsValid)) {
+-        Chains.clear();
++        Invalid = true;
+         break;
+       }
+ 
+-      // Check if the compute-reduction-result is used by a sunk store.
+-      // TODO: Also form partial reductions in those cases.
+       if (auto *RdxResult = vputils::findComputeReductionResult(RedPhiR)) {
+         if (any_of(RdxResult->users(), [](VPUser *U) {
+               auto *RepR = dyn_cast<VPReplicateRecipe>(U);
+               return RepR && RepR->getOpcode() == Instruction::Store;
+             })) {
+-          Chains.clear();
++          Invalid = true;
+           break;
+         }
+       }
+     }
+ 
+-    // Clear the chain if it is not profitable.
++    if (Invalid) {
++      Chains.clear();
++      continue;
++    }
++
+     if (!LoopVectorizationPlanner::getDecisionAndClampRange(
+             [&, &Chains = Chains](ElementCount VF) {
+               return IsProfitablePartialReductionChainForVF(Chains, VF);
+@@ -6487,25 +6612,21 @@ void VPlanTransforms::makeScalarizationD
+         continue;
+ 
+       auto *I = cast_or_null<Instruction>(VPI->getUnderlyingValue());
+-      // Wouldn't be able to create a `VPReplicateRecipe` anyway.
+       if (!I)
+         continue;
+ 
+-      // If executing other lanes produces side-effects we can't avoid them.
+       if (VPI->mayHaveSideEffects())
+         continue;
+ 
+-      // We want to drop the mask operand, verify we can safely do that.
+       if (VPI->isMasked() && !VPI->isSafeToSpeculativelyExecute())
+         continue;
+ 
+-      // Avoid rewriting IV increment as that interferes with
+-      // `removeRedundantCanonicalIVs`.
++      // Avoid rewriting canonical IV increment forms; they are handled by
++      // dedicated IV canonicalization transforms.
+       if (VPI->getOpcode() == Instruction::Add &&
+           any_of(VPI->operands(), IsaPred<VPWidenIntOrFpInductionRecipe>))
+         continue;
+ 
+-      // Other lanes are needed - can't drop them.
+       if (!vputils::onlyFirstLaneUsed(VPI))
+         continue;
+ 
+
+--- a/llvm/lib/CodeGen/PeepholeOptimizer.cpp	2026-05-06 01:01:03.951568731 +0200
++++ b/llvm/lib/CodeGen/PeepholeOptimizer.cpp	2026-05-06 01:14:22.015734013 +0200
+@@ -26,7 +26,7 @@
+ //       cmp r1, 0
+ //       bz  L1
+ //
+-//     If the "sub" instruction all ready sets (or could be modified to set) the
++//     If the "sub" instruction already sets (or could be modified to set) the
+ //     same flag that the "cmp" instruction sets and that "bz" uses, then we can
+ //     eliminate the "cmp" instruction.
+ //
+@@ -94,6 +94,7 @@
+ #include "llvm/Support/raw_ostream.h"
+ #include <cassert>
+ #include <cstdint>
++#include <optional>
+ #include <utility>
+ 
+ using namespace llvm;
+@@ -110,7 +111,7 @@ static cl::opt<bool>
+     DisablePeephole("disable-peephole", cl::Hidden, cl::init(false),
+                     cl::desc("Disable the peephole optimizer"));
+ 
+-/// Specifiy whether or not the value tracking looks through
++/// Specify whether or not the value tracking looks through
+ /// complex instructions. When this is true, the value tracker
+ /// bails on everything that is not a copy or a bitcast.
+ static cl::opt<bool>
+@@ -153,6 +154,7 @@ class Rewriter {
+ protected:
+   MachineInstr &CopyLike;
+   int CurrentSrcIdx = 0; ///< The index of the source being rewritten.
++
+ public:
+   Rewriter(MachineInstr &CopyLike) : CopyLike(CopyLike) {}
+   virtual ~Rewriter() = default;
+@@ -162,26 +164,11 @@ public:
+   /// A source is considered rewritable if its register class and the
+   /// register class of the related DstReg may not be register
+   /// coalescer friendly. In other words, given a copy-like instruction
+-  /// not all the arguments may be returned at rewritable source, since
+-  /// some arguments are none to be register coalescer friendly.
++  /// not all the arguments may be returned as rewritable source, since
++  /// some arguments may already be register coalescer friendly.
+   ///
+   /// Each call of this method moves the current source to the next
+   /// rewritable source.
+-  /// For instance, let CopyLike be the instruction to rewrite.
+-  /// CopyLike has one definition and one source:
+-  /// dst.dstSubIdx = CopyLike src.srcSubIdx.
+-  ///
+-  /// The first call will give the first rewritable source, i.e.,
+-  /// the only source this instruction has:
+-  /// (SrcReg, SrcSubReg) = (src, srcSubIdx).
+-  /// This source defines the whole definition, i.e.,
+-  /// (DstReg, DstSubReg) = (dst, dstSubIdx).
+-  ///
+-  /// The second and subsequent calls will return false, as there is only one
+-  /// rewritable source.
+-  ///
+-  /// \return True if a rewritable source has been found, false otherwise.
+-  /// The output arguments are valid if and only if true is returned.
+   virtual bool getNextRewritableSource(RegSubRegPair &Src,
+                                        RegSubRegPair &Dst) = 0;
+ 
+@@ -203,10 +190,9 @@ public:
+     if (++CurrentSrcIdx > 1)
+       return false;
+ 
+-    // The rewritable source is the argument.
+     const MachineOperand &MOSrc = CopyLike.getOperand(CurrentSrcIdx);
+     Src = RegSubRegPair(MOSrc.getReg(), MOSrc.getSubReg());
+-    // What we track are the alternative sources of the definition.
++
+     const MachineOperand &MODef = CopyLike.getOperand(0);
+     Dst = RegSubRegPair(MODef.getReg(), MODef.getSubReg());
+     return true;
+@@ -220,23 +206,18 @@ public:
+   }
+ };
+ 
+-/// Helper class to rewrite uncoalescable copy like instructions
+-/// into new COPY (coalescable friendly) instructions.
++/// Helper class to rewrite uncoalescable copy-like instructions
++/// into new COPY (coalescer-friendly) instructions.
+ class UncoalescableRewriter : public Rewriter {
+-  int NumDefs; ///< Number of defs in the bitcast.
++  int NumDefs; ///< Number of defs in the bitcast-like instruction.
+ 
+ public:
+   UncoalescableRewriter(MachineInstr &MI) : Rewriter(MI) {
+     NumDefs = MI.getDesc().getNumDefs();
+   }
+ 
+-  /// \see See Rewriter::getNextRewritableSource()
+-  /// All such sources need to be considered rewritable in order to
+-  /// rewrite a uncoalescable copy-like instruction. This method return
+-  /// each definition that must be checked if rewritable.
+   bool getNextRewritableSource(RegSubRegPair &Src,
+                                RegSubRegPair &Dst) override {
+-    // Find the next non-dead definition and continue from there.
+     if (CurrentSrcIdx == NumDefs)
+       return false;
+ 
+@@ -246,16 +227,17 @@ public:
+         return false;
+     }
+ 
+-    // What we track are the alternative sources of the definition.
+     Src = RegSubRegPair(0, 0);
+     const MachineOperand &MODef = CopyLike.getOperand(CurrentSrcIdx);
+     Dst = RegSubRegPair(MODef.getReg(), MODef.getSubReg());
+ 
+-    CurrentSrcIdx++;
++    ++CurrentSrcIdx;
+     return true;
+   }
+ 
+   bool RewriteCurrentSource(Register NewReg, unsigned NewSubReg) override {
++    (void)NewReg;
++    (void)NewSubReg;
+     return false;
+   }
+ };
+@@ -267,42 +249,28 @@ public:
+     assert(MI.isInsertSubreg() && "Invalid instruction");
+   }
+ 
+-  /// \see See Rewriter::getNextRewritableSource()
+-  /// Here CopyLike has the following form:
+-  /// dst = INSERT_SUBREG Src1, Src2.src2SubIdx, subIdx.
+-  /// Src1 has the same register class has dst, hence, there is
+-  /// nothing to rewrite.
+-  /// Src2.src2SubIdx, may not be register coalescer friendly.
+-  /// Therefore, the first call to this method returns:
+-  /// (SrcReg, SrcSubReg) = (Src2, src2SubIdx).
+-  /// (DstReg, DstSubReg) = (dst, subIdx).
+-  ///
+-  /// Subsequence calls will return false.
+   bool getNextRewritableSource(RegSubRegPair &Src,
+                                RegSubRegPair &Dst) override {
+-    // If we already get the only source we can rewrite, return false.
+     if (CurrentSrcIdx == 2)
+       return false;
+-    // We are looking at v2 = INSERT_SUBREG v0, v1, sub0.
++
+     CurrentSrcIdx = 2;
+     const MachineOperand &MOInsertedReg = CopyLike.getOperand(2);
+     Src = RegSubRegPair(MOInsertedReg.getReg(), MOInsertedReg.getSubReg());
+     const MachineOperand &MODef = CopyLike.getOperand(0);
+ 
+-    // We want to track something that is compatible with the
+-    // partial definition.
+     if (MODef.getSubReg())
+-      // Bail if we have to compose sub-register indices.
+       return false;
++
+     Dst = RegSubRegPair(MODef.getReg(),
+-                        (unsigned)CopyLike.getOperand(3).getImm());
++                        static_cast<unsigned>(CopyLike.getOperand(3).getImm()));
+     return true;
+   }
+ 
+   bool RewriteCurrentSource(Register NewReg, unsigned NewSubReg) override {
+     if (CurrentSrcIdx != 2)
+       return false;
+-    // We are rewriting the inserted reg.
++
+     MachineOperand &MO = CopyLike.getOperand(CurrentSrcIdx);
+     MO.setReg(NewReg);
+     MO.setSubReg(NewSubReg);
+@@ -320,53 +288,37 @@ public:
+     assert(MI.isExtractSubreg() && "Invalid instruction");
+   }
+ 
+-  /// \see Rewriter::getNextRewritableSource()
+-  /// Here CopyLike has the following form:
+-  /// dst.dstSubIdx = EXTRACT_SUBREG Src, subIdx.
+-  /// There is only one rewritable source: Src.subIdx,
+-  /// which defines dst.dstSubIdx.
+   bool getNextRewritableSource(RegSubRegPair &Src,
+                                RegSubRegPair &Dst) override {
+-    // If we already get the only source we can rewrite, return false.
+     if (CurrentSrcIdx == 1)
+       return false;
+-    // We are looking at v1 = EXTRACT_SUBREG v0, sub0.
++
+     CurrentSrcIdx = 1;
+     const MachineOperand &MOExtractedReg = CopyLike.getOperand(1);
+-    // If we have to compose sub-register indices, bail out.
+     if (MOExtractedReg.getSubReg())
+       return false;
+ 
+     Src =
+         RegSubRegPair(MOExtractedReg.getReg(), CopyLike.getOperand(2).getImm());
+ 
+-    // We want to track something that is compatible with the definition.
+     const MachineOperand &MODef = CopyLike.getOperand(0);
+     Dst = RegSubRegPair(MODef.getReg(), MODef.getSubReg());
+     return true;
+   }
+ 
+   bool RewriteCurrentSource(Register NewReg, unsigned NewSubReg) override {
+-    // The only source we can rewrite is the input register.
+     if (CurrentSrcIdx != 1)
+       return false;
+ 
+     CopyLike.getOperand(CurrentSrcIdx).setReg(NewReg);
+ 
+-    // If we find a source that does not require to extract something,
+-    // rewrite the operation with a copy.
+     if (!NewSubReg) {
+-      // Move the current index to an invalid position.
+-      // We do not want another call to this method to be able
+-      // to do any change.
+       CurrentSrcIdx = -1;
+-      // Rewrite the operation as a COPY.
+-      // Get rid of the sub-register index.
+       CopyLike.removeOperand(2);
+-      // Morph the operation into a COPY.
+       CopyLike.setDesc(TII.get(TargetOpcode::COPY));
+       return true;
+     }
++
+     CopyLike.getOperand(CurrentSrcIdx + 1).setImm(NewSubReg);
+     return true;
+   }
+@@ -380,25 +332,8 @@ public:
+     CurrentSrcIdx = -1;
+   }
+ 
+-  /// \see Rewriter::getNextRewritableSource()
+-  /// Here CopyLike has the following form:
+-  /// dst = REG_SEQUENCE Src1.src1SubIdx, subIdx1, Src2.src2SubIdx, subIdx2.
+-  /// Each call will return a different source, walking all the available
+-  /// source.
+-  ///
+-  /// The first call returns:
+-  /// (SrcReg, SrcSubReg) = (Src1, src1SubIdx).
+-  /// (DstReg, DstSubReg) = (dst, subIdx1).
+-  ///
+-  /// The second call returns:
+-  /// (SrcReg, SrcSubReg) = (Src2, src2SubIdx).
+-  /// (DstReg, DstSubReg) = (dst, subIdx2).
+-  ///
+-  /// And so on, until all the sources have been traversed, then
+-  /// it returns false.
+   bool getNextRewritableSource(RegSubRegPair &Src,
+                                RegSubRegPair &Dst) override {
+-    // We are looking at v0 = REG_SEQUENCE v1, sub1, v2, sub2, etc.
+     CurrentSrcIdx += 2;
+     if (static_cast<unsigned>(CurrentSrcIdx) >= CopyLike.getNumOperands())
+       return false;
+@@ -407,8 +342,6 @@ public:
+     Src.Reg = MOInsertedReg.getReg();
+     Src.SubReg = MOInsertedReg.getSubReg();
+ 
+-    // We want to track something that is compatible with the related
+-    // partial definition.
+     Dst.SubReg = CopyLike.getOperand(CurrentSrcIdx + 1).getImm();
+ 
+     const MachineOperand &MODef = CopyLike.getOperand(0);
+@@ -429,7 +362,7 @@ class PeepholeOptimizer : private Machin
+   const TargetInstrInfo *TII = nullptr;
+   const TargetRegisterInfo *TRI = nullptr;
+   MachineRegisterInfo *MRI = nullptr;
+-  MachineDominatorTree *DT = nullptr; // Machine dominator tree
++  MachineDominatorTree *DT = nullptr;
+   MachineLoopInfo *MLI = nullptr;
+ 
+ public:
+@@ -437,14 +370,15 @@ public:
+       : DT(DT), MLI(MLI) {}
+ 
+   bool run(MachineFunction &MF);
+-  /// Track Def -> Use info used for rewriting copies.
+-  using RewriteMapTy = SmallDenseMap<RegSubRegPair, ValueTrackerResult>;
+ 
+-  /// Sequence of instructions that formulate recurrence cycle.
++  using RewriteMapTy = SmallDenseMap<RegSubRegPair, ValueTrackerResult>;
+   using RecurrenceCycle = SmallVector<RecurrenceInstr, 4>;
+ 
+ private:
+   bool optimizeCmpInstr(MachineInstr &MI);
++  bool optimizeCmpInstr(MachineInstr &MI, Register SrcReg, Register SrcReg2,
++                        int64_t CmpMask, int64_t CmpValue);
++
+   bool optimizeExtInstr(MachineInstr &MI, MachineBasicBlock &MBB,
+                         SmallPtrSetImpl<MachineInstr *> &LocalMIs);
+   bool optimizeSelect(MachineInstr &MI,
+@@ -456,56 +390,41 @@ private:
+   bool optimizeUncoalescableCopy(MachineInstr &MI,
+                                  SmallPtrSetImpl<MachineInstr *> &LocalMIs);
+   bool optimizeRecurrence(MachineInstr &PHI);
++
+   bool findNextSource(const TargetRegisterClass *DefRC, unsigned DefSubReg,
+                       RegSubRegPair RegSubReg, RewriteMapTy &RewriteMap);
++
+   bool isMoveImmediate(MachineInstr &MI, SmallSet<Register, 4> &ImmDefRegs,
+                        DenseMap<Register, MachineInstr *> &ImmDefMIs);
++
+   bool foldImmediate(MachineInstr &MI, SmallSet<Register, 4> &ImmDefRegs,
+                      DenseMap<Register, MachineInstr *> &ImmDefMIs,
+                      bool &Deleted);
+ 
+-  /// Finds recurrence cycles, but only ones that formulated around
+-  /// a def operand and a use operand that are tied. If there is a use
+-  /// operand commutable with the tied use operand, find recurrence cycle
+-  /// along that operand as well.
+   bool findTargetRecurrence(Register Reg,
+                             const SmallSet<Register, 2> &TargetReg,
+                             RecurrenceCycle &RC);
+ 
+-  /// If copy instruction \p MI is a virtual register copy or a copy of a
+-  /// constant physical register to a virtual register, track it in the
+-  /// set CopySrcMIs. If this virtual register was previously seen as a
+-  /// copy, replace the uses of this copy with the previously seen copy's
+-  /// destination register.
+   bool foldRedundantCopy(MachineInstr &MI);
+-
+-  /// Is the register \p Reg a non-allocatable physical register?
+   bool isNAPhysCopy(Register Reg);
+-
+-  /// If copy instruction \p MI is a non-allocatable virtual<->physical
+-  /// register copy, track it in the \p NAPhysToVirtMIs map. If this
+-  /// non-allocatable physical register was previously copied to a virtual
+-  /// registered and hasn't been clobbered, the virt->phys copy can be
+-  /// deleted.
+-  bool
+-  foldRedundantNAPhysCopy(MachineInstr &MI,
+-                          DenseMap<Register, MachineInstr *> &NAPhysToVirtMIs);
++  bool foldRedundantNAPhysCopy(
++      MachineInstr &MI, DenseMap<Register, MachineInstr *> &NAPhysToVirtMIs);
+ 
+   bool isLoadFoldable(MachineInstr &MI,
+                       SmallSet<Register, 16> &FoldAsLoadDefCandidates);
+ 
+-  /// Check whether \p MI is understood by the register coalescer
+-  /// but may require some rewriting.
++  MachineInstr *foldLoadInto(MachineInstr &MI, Register FoldReg,
++                             SmallPtrSetImpl<MachineInstr *> &LocalMIs);
++
++  bool tryFoldLoadAfterCompareElim(Register CmpSrcReg,
++                                   SmallPtrSetImpl<MachineInstr *> &LocalMIs);
++
+   static bool isCoalescableCopy(const MachineInstr &MI) {
+-    // SubregToRegs are not interesting, because they are already register
+-    // coalescer friendly.
+     return MI.isCopy() ||
+            (!DisableAdvCopyOpt && (MI.isRegSequence() || MI.isInsertSubreg() ||
+                                    MI.isExtractSubreg()));
+   }
+ 
+-  /// Check whether \p MI is a copy like instruction that is
+-  /// not recognized by the register coalescer.
+   static bool isUncoalescableCopy(const MachineInstr &MI) {
+     return MI.isBitcast() || (!DisableAdvCopyOpt && (MI.isRegSequenceLike() ||
+                                                      MI.isInsertSubregLike() ||
+@@ -515,12 +434,9 @@ private:
+   MachineInstr &rewriteSource(MachineInstr &CopyLike, RegSubRegPair Def,
+                               RewriteMapTy &RewriteMap);
+ 
+-  // Set of copies to virtual registers keyed by source register.  Never
+-  // holds any physreg which requires def tracking.
+   DenseMap<RegSubRegPair, MachineInstr *> CopySrcMIs;
+ 
+-  // MachineFunction::Delegate implementation. Used to maintain CopySrcMIs.
+-  void MF_HandleInsertion(MachineInstr &MI) override {}
++  void MF_HandleInsertion(MachineInstr &MI) override { (void)MI; }
+ 
+   bool getCopySrc(MachineInstr &MI, RegSubRegPair &SrcPair) {
+     if (!MI.isCopy())
+@@ -535,8 +451,6 @@ private:
+     return true;
+   }
+ 
+-  // If a COPY instruction is to be deleted or changed, we should also remove
+-  // it from CopySrcMIs.
+   void deleteChangedCopy(MachineInstr &MI) {
+     RegSubRegPair SrcPair;
+     if (!getCopySrc(MI, SrcPair))
+@@ -550,13 +464,14 @@ private:
+   void MF_HandleRemoval(MachineInstr &MI) override { deleteChangedCopy(MI); }
+ 
+   void MF_HandleChangeDesc(MachineInstr &MI, const MCInstrDesc &TID) override {
++    (void)TID;
+     deleteChangedCopy(MI);
+   }
+ };
+ 
+ class PeepholeOptimizerLegacy : public MachineFunctionPass {
+ public:
+-  static char ID; // Pass identification
++  static char ID;
+ 
+   PeepholeOptimizerLegacy() : MachineFunctionPass(ID) {}
+ 
+@@ -578,12 +493,6 @@ public:
+   }
+ };
+ 
+-/// Helper class to hold instructions that are inside recurrence cycles.
+-/// The recurrence cycle is formulated around 1) a def operand and its
+-/// tied use operand, or 2) a def operand and a use operand that is commutable
+-/// with another use operand which is tied to the def operand. In the latter
+-/// case, index of the tied use operand and the commutable use operand are
+-/// maintained with CommutePair.
+ class RecurrenceInstr {
+ public:
+   using IndexPair = std::pair<unsigned, unsigned>;
+@@ -600,20 +509,13 @@ private:
+   std::optional<IndexPair> CommutePair;
+ };
+ 
+-/// Helper class to hold a reply for ValueTracker queries.
+-/// Contains the returned sources for a given search and the instructions
+-/// where the sources were tracked from.
+ class ValueTrackerResult {
+ private:
+-  /// Track all sources found by one ValueTracker query.
+   SmallVector<RegSubRegPair, 2> RegSrcs;
+-
+-  /// Instruction using the sources in 'RegSrcs'.
+   const MachineInstr *Inst = nullptr;
+ 
+ public:
+   ValueTrackerResult() = default;
+-
+   ValueTrackerResult(Register Reg, unsigned SubReg) { addSource(Reg, SubReg); }
+ 
+   bool isValid() const { return getNumSources() > 0; }
+@@ -652,7 +554,6 @@ public:
+   bool operator==(const ValueTrackerResult &Other) const {
+     if (Other.getInst() != getInst())
+       return false;
+-
+     if (Other.getNumSources() != getNumSources())
+       return false;
+ 
+@@ -664,76 +565,25 @@ public:
+   }
+ };
+ 
+-/// Helper class to track the possible sources of a value defined by
+-/// a (chain of) copy related instructions.
+-/// Given a definition (instruction and definition index), this class
+-/// follows the use-def chain to find successive suitable sources.
+-/// The given source can be used to rewrite the definition into
+-/// def = COPY src.
+-///
+-/// For instance, let us consider the following snippet:
+-/// v0 =
+-/// v2 = INSERT_SUBREG v1, v0, sub0
+-/// def = COPY v2.sub0
+-///
+-/// Using a ValueTracker for def = COPY v2.sub0 will give the following
+-/// suitable sources:
+-/// v2.sub0 and v0.
+-/// Then, def can be rewritten into def = COPY v0.
+ class ValueTracker {
+ private:
+-  /// The current point into the use-def chain.
+   const MachineInstr *Def = nullptr;
+-
+-  /// The index of the definition in Def.
+   unsigned DefIdx = 0;
+-
+-  /// The sub register index of the definition.
+   unsigned DefSubReg;
+-
+-  /// The register where the value can be found.
+   Register Reg;
+-
+-  /// MachineRegisterInfo used to perform tracking.
+   const MachineRegisterInfo &MRI;
+-
+-  /// Optional TargetInstrInfo used to perform some complex tracking.
+   const TargetInstrInfo *TII;
+ 
+-  /// Dispatcher to the right underlying implementation of getNextSource.
+   ValueTrackerResult getNextSourceImpl();
+-
+-  /// Specialized version of getNextSource for Copy instructions.
+   ValueTrackerResult getNextSourceFromCopy();
+-
+-  /// Specialized version of getNextSource for Bitcast instructions.
+   ValueTrackerResult getNextSourceFromBitcast();
+-
+-  /// Specialized version of getNextSource for RegSequence instructions.
+   ValueTrackerResult getNextSourceFromRegSequence();
+-
+-  /// Specialized version of getNextSource for InsertSubreg instructions.
+   ValueTrackerResult getNextSourceFromInsertSubreg();
+-
+-  /// Specialized version of getNextSource for ExtractSubreg instructions.
+   ValueTrackerResult getNextSourceFromExtractSubreg();
+-
+-  /// Specialized version of getNextSource for SubregToReg instructions.
+   ValueTrackerResult getNextSourceFromSubregToReg();
+-
+-  /// Specialized version of getNextSource for PHI instructions.
+   ValueTrackerResult getNextSourceFromPHI();
+ 
+ public:
+-  /// Create a ValueTracker instance for the value defined by \p Reg.
+-  /// \p DefSubReg represents the sub register index the value tracker will
+-  /// track. It does not need to match the sub register index used in the
+-  /// definition of \p Reg.
+-  /// If \p Reg is a physical register, a value tracker constructed with
+-  /// this constructor will not find any alternative source.
+-  /// Indeed, when \p Reg is a physical register that constructor does not
+-  /// know which definition of \p Reg it should track.
+-  /// Use the next constructor to track a physical register.
+   ValueTracker(Register Reg, unsigned DefSubReg, const MachineRegisterInfo &MRI,
+                const TargetInstrInfo *TII = nullptr)
+       : DefSubReg(DefSubReg), Reg(Reg), MRI(MRI), TII(TII) {
+@@ -743,18 +593,12 @@ public:
+     }
+   }
+ 
+-  /// Following the use-def chain, get the next available source
+-  /// for the tracked value.
+-  /// \return A ValueTrackerResult containing a set of registers
+-  /// and sub registers with tracked values. A ValueTrackerResult with
+-  /// an empty set of registers means no source was found.
+   ValueTrackerResult getNextSource();
+ };
+ 
+ } // end anonymous namespace
+ 
+ char PeepholeOptimizerLegacy::ID = 0;
+-
+ char &llvm::PeepholeOptimizerLegacyID = PeepholeOptimizerLegacy::ID;
+ 
+ INITIALIZE_PASS_BEGIN(PeepholeOptimizerLegacy, DEBUG_TYPE,
+@@ -764,14 +608,6 @@ INITIALIZE_PASS_DEPENDENCY(MachineLoopIn
+ INITIALIZE_PASS_END(PeepholeOptimizerLegacy, DEBUG_TYPE,
+                     "Peephole Optimizations", false, false)
+ 
+-/// If instruction is a copy-like instruction, i.e. it reads a single register
+-/// and writes a single register and it does not modify the source, and if the
+-/// source value is preserved as a sub-register of the result, then replace all
+-/// reachable uses of the source with the subreg of the result.
+-///
+-/// Do not generate an EXTRACT that is used only in a debug use, as this changes
+-/// the code. Since this code does not currently share EXTRACTs, just ignore all
+-/// debug uses.
+ bool PeepholeOptimizer::optimizeExtInstr(
+     MachineInstr &MI, MachineBasicBlock &MBB,
+     SmallPtrSetImpl<MachineInstr *> &LocalMIs) {
+@@ -784,34 +620,21 @@ bool PeepholeOptimizer::optimizeExtInstr
+     return false;
+ 
+   if (MRI->hasOneNonDBGUse(SrcReg))
+-    // No other uses.
+     return false;
+ 
+-  // Ensure DstReg can get a register class that actually supports
+-  // sub-registers. Don't change the class until we commit.
+   const TargetRegisterClass *DstRC = MRI->getRegClass(DstReg);
+   DstRC = TRI->getSubClassWithSubReg(DstRC, SubIdx);
+   if (!DstRC)
+     return false;
+ 
+-  // The ext instr may be operating on a sub-register of SrcReg as well.
+-  // PPC::EXTSW is a 32 -> 64-bit sign extension, but it reads a 64-bit
+-  // register.
+-  // If UseSrcSubIdx is Set, SubIdx also applies to SrcReg, and only uses of
+-  // SrcReg:SubIdx should be replaced.
+   bool UseSrcSubIdx =
+       TRI->getSubClassWithSubReg(MRI->getRegClass(SrcReg), SubIdx) != nullptr;
+ 
+-  // The source has other uses. See if we can replace the other uses with use of
+-  // the result of the extension.
+   SmallPtrSet<MachineBasicBlock *, 4> ReachedBBs;
+   for (MachineInstr &UI : MRI->use_nodbg_instructions(DstReg))
+     ReachedBBs.insert(UI.getParent());
+ 
+-  // Uses that are in the same BB of uses of the result of the instruction.
+   SmallVector<MachineOperand *, 8> Uses;
+-
+-  // Uses that the result of the instruction can reach.
+   SmallVector<MachineOperand *, 8> ExtendedUses;
+ 
+   bool ExtendLife = true;
+@@ -825,63 +648,32 @@ bool PeepholeOptimizer::optimizeExtInstr
+       continue;
+     }
+ 
+-    // Only accept uses of SrcReg:SubIdx.
+     if (UseSrcSubIdx && UseMO.getSubReg() != SubIdx)
+       continue;
+ 
+-    // It's an error to translate this:
+-    //
+-    //    %reg1025 = <sext> %reg1024
+-    //     ...
+-    //    %reg1026 = SUBREG_TO_REG %reg1024, 4
+-    //
+-    // into this:
+-    //
+-    //    %reg1025 = <sext> %reg1024
+-    //     ...
+-    //    %reg1027 = COPY %reg1025:4
+-    //    %reg1026 = SUBREG_TO_REG %reg1027, 4
+-    //
+-    // The problem here is that SUBREG_TO_REG is there to assert that an
+-    // implicit zext occurs. It doesn't insert a zext instruction. If we allow
+-    // the COPY here, it will give us the value after the <sext>, not the
+-    // original value of %reg1024 before <sext>.
+     if (UseMI->getOpcode() == TargetOpcode::SUBREG_TO_REG)
+       continue;
+ 
+     MachineBasicBlock *UseMBB = UseMI->getParent();
+     if (UseMBB == &MBB) {
+-      // Local uses that come after the extension.
+       if (!LocalMIs.count(UseMI))
+         Uses.push_back(&UseMO);
+     } else if (ReachedBBs.count(UseMBB)) {
+-      // Non-local uses where the result of the extension is used. Always
+-      // replace these unless it's a PHI.
+       Uses.push_back(&UseMO);
+     } else if (Aggressive && DT->dominates(&MBB, UseMBB)) {
+-      // We may want to extend the live range of the extension result in order
+-      // to replace these uses.
+       ExtendedUses.push_back(&UseMO);
+     } else {
+-      // Both will be live out of the def MBB anyway. Don't extend live range of
+-      // the extension result.
+       ExtendLife = false;
+       break;
+     }
+   }
+ 
+   if (ExtendLife && !ExtendedUses.empty())
+-    // Extend the liveness of the extension result.
+     Uses.append(ExtendedUses.begin(), ExtendedUses.end());
+ 
+-  // Now replace all uses.
+   bool Changed = false;
+   if (!Uses.empty()) {
+     SmallPtrSet<MachineBasicBlock *, 4> PHIBBs;
+-
+-    // Look for PHI uses of the extended result, we don't want to extend the
+-    // liveness of a PHI input. It breaks all kinds of assumptions down
+-    // stream. A PHI use is expected to be the kill of its source values.
+     for (MachineInstr &UI : MRI->use_nodbg_instructions(DstReg))
+       if (UI.isPHI())
+         PHIBBs.insert(UI.getParent());
+@@ -893,26 +685,11 @@ bool PeepholeOptimizer::optimizeExtInstr
+       if (PHIBBs.count(UseMBB))
+         continue;
+ 
+-      // About to add uses of DstReg, clear DstReg's kill flags.
+       if (!Changed) {
+         MRI->clearKillFlags(DstReg);
+         MRI->constrainRegClass(DstReg, DstRC);
+       }
+ 
+-      // SubReg defs are illegal in machine SSA phase,
+-      // we should not generate SubReg defs.
+-      //
+-      // For example, for the instructions:
+-      //
+-      // %1:g8rc_and_g8rc_nox0 = EXTSW %0:g8rc
+-      // %3:gprc_and_gprc_nor0 = COPY %0.sub_32:g8rc
+-      //
+-      // We should generate:
+-      //
+-      // %1:g8rc_and_g8rc_nox0 = EXTSW %0:g8rc
+-      // %6:gprc_and_gprc_nor0 = COPY %1.sub_32:g8rc_and_g8rc_nox0
+-      // %3:gprc_and_gprc_nor0 = COPY %6:gprc_and_gprc_nor0
+-      //
+       if (UseSrcSubIdx)
+         RC = MRI->getRegClass(UseMI->getOperand(0).getReg());
+ 
+@@ -920,6 +697,7 @@ bool PeepholeOptimizer::optimizeExtInstr
+       BuildMI(*UseMBB, UseMI, UseMI->getDebugLoc(),
+               TII->get(TargetOpcode::COPY), NewVR)
+           .addReg(DstReg, {}, SubIdx);
++
+       if (UseSrcSubIdx)
+         UseMO->setSubReg(0);
+ 
+@@ -932,20 +710,21 @@ bool PeepholeOptimizer::optimizeExtInstr
+   return Changed;
+ }
+ 
+-/// If the instruction is a compare and the previous instruction it's comparing
+-/// against already sets (or could be modified to set) the same flag as the
+-/// compare, then we can remove the comparison and use the flag from the
+-/// previous instruction.
+ bool PeepholeOptimizer::optimizeCmpInstr(MachineInstr &MI) {
+-  // If this instruction is a comparison against zero and isn't comparing a
+-  // physical register, we can try to optimize it.
+   Register SrcReg, SrcReg2;
+-  int64_t CmpMask, CmpValue;
+-  if (!TII->analyzeCompare(MI, SrcReg, SrcReg2, CmpMask, CmpValue) ||
+-      SrcReg.isPhysical() || SrcReg2.isPhysical())
++  int64_t CmpMask = 0;
++  int64_t CmpValue = 0;
++  if (!TII->analyzeCompare(MI, SrcReg, SrcReg2, CmpMask, CmpValue))
++    return false;
++  return optimizeCmpInstr(MI, SrcReg, SrcReg2, CmpMask, CmpValue);
++}
++
++bool PeepholeOptimizer::optimizeCmpInstr(MachineInstr &MI, Register SrcReg,
++                                         Register SrcReg2, int64_t CmpMask,
++                                         int64_t CmpValue) {
++  if (SrcReg.isPhysical() || SrcReg2.isPhysical())
+     return false;
+ 
+-  // Attempt to optimize the comparison instruction.
+   LLVM_DEBUG(dbgs() << "Attempting to optimize compare: " << MI);
+   if (TII->optimizeCompareInstr(MI, SrcReg, SrcReg2, CmpMask, CmpValue, MRI)) {
+     LLVM_DEBUG(dbgs() << "  -> Successfully optimized compare!\n");
+@@ -956,7 +735,6 @@ bool PeepholeOptimizer::optimizeCmpInstr
+   return false;
+ }
+ 
+-/// Optimize a select instruction.
+ bool PeepholeOptimizer::optimizeSelect(
+     MachineInstr &MI, SmallPtrSetImpl<MachineInstr *> &LocalMIs) {
+   assert(MI.isSelect() && "Should only be called when MI->isSelect() is true");
+@@ -968,32 +746,14 @@ bool PeepholeOptimizer::optimizeSelect(
+   return true;
+ }
+ 
+-/// Check if a simpler conditional branch can be generated.
+ bool PeepholeOptimizer::optimizeCondBranch(MachineInstr &MI) {
+   return TII->optimizeCondBranch(MI);
+ }
+ 
+-/// Try to find a better source value that shares the same register file to
+-/// replace \p RegSubReg in an instruction like
+-/// `DefRC.DefSubReg = COPY RegSubReg`
+-///
+-/// When true is returned, the \p RewriteMap can be used by the client to
+-/// retrieve all Def -> Use along the way up to the next source. Any found
+-/// Use that is not itself a key for another entry, is the next source to
+-/// use. During the search for the next source, multiple sources can be found
+-/// given multiple incoming sources of a PHI instruction. In this case, we
+-/// look in each PHI source for the next source; all found next sources must
+-/// share the same register file as \p Reg and \p SubReg. The client should
+-/// then be capable to rewrite all intermediate PHIs to get the next source.
+-/// \return False if no alternative sources are available. True otherwise.
+ bool PeepholeOptimizer::findNextSource(const TargetRegisterClass *DefRC,
+                                        unsigned DefSubReg,
+                                        RegSubRegPair RegSubReg,
+                                        RewriteMapTy &RewriteMap) {
+-  // Do not try to find a new source for a physical register.
+-  // So far we do not have any motivating example for doing that.
+-  // Thus, instead of maintaining untested code, we will revisit that if
+-  // that changes at some point.
+   Register Reg = RegSubReg.Reg;
+   RegSubRegPair CurSrcPair = RegSubReg;
+   SmallVector<RegSubRegPair, 4> SrcToLook = {CurSrcPair};
+@@ -1001,29 +761,20 @@ bool PeepholeOptimizer::findNextSource(c
+   unsigned PHICount = 0;
+   do {
+     CurSrcPair = SrcToLook.pop_back_val();
+-    // As explained above, do not handle physical registers
+     if (CurSrcPair.Reg.isPhysical())
+       return false;
+ 
+     ValueTracker ValTracker(CurSrcPair.Reg, CurSrcPair.SubReg, *MRI, TII);
+ 
+-    // Follow the chain of copies until we find a more suitable source, a phi
+-    // or have to abort.
+     while (true) {
+       ValueTrackerResult Res = ValTracker.getNextSource();
+-      // Abort at the end of a chain (without finding a suitable source).
+       if (!Res.isValid())
+         return false;
+ 
+-      // Insert the Def -> Use entry for the recently found source.
+       auto [InsertPt, WasInserted] = RewriteMap.try_emplace(CurSrcPair, Res);
+-
+       if (!WasInserted) {
+         const ValueTrackerResult &CurSrcRes = InsertPt->second;
+-
+         assert(CurSrcRes == Res && "ValueTrackerResult found must match");
+-        // An existent entry with multiple sources is a PHI cycle we must avoid.
+-        // Otherwise it's an entry with a valid next source we already found.
+         if (CurSrcRes.getNumSources() > 1) {
+           LLVM_DEBUG(dbgs()
+                      << "findNextSource: found PHI cycle, aborting...\n");
+@@ -1032,11 +783,9 @@ bool PeepholeOptimizer::findNextSource(c
+         break;
+       }
+ 
+-      // ValueTrackerResult usually have one source unless it's the result from
+-      // a PHI instruction. Add the found PHI edges to be looked up further.
+       unsigned NumSrcs = Res.getNumSources();
+       if (NumSrcs > 1) {
+-        PHICount++;
++        ++PHICount;
+         if (PHICount >= RewritePHILimit) {
+           LLVM_DEBUG(dbgs() << "findNextSource: PHI limit reached\n");
+           return false;
+@@ -1048,38 +797,24 @@ bool PeepholeOptimizer::findNextSource(c
+       }
+ 
+       CurSrcPair = Res.getSrc(0);
+-      // Do not extend the live-ranges of physical registers as they add
+-      // constraints to the register allocator. Moreover, if we want to extend
+-      // the live-range of a physical register, unlike SSA virtual register,
+-      // we will have to check that they aren't redefine before the related use.
+       if (CurSrcPair.Reg.isPhysical())
+         return false;
+ 
+-      // Keep following the chain if the value isn't any better yet.
+       const TargetRegisterClass *SrcRC = MRI->getRegClass(CurSrcPair.Reg);
+       if (!TRI->shouldRewriteCopySrc(DefRC, DefSubReg, SrcRC,
+                                      CurSrcPair.SubReg))
+         continue;
+ 
+-      // We currently cannot deal with subreg operands on PHI instructions
+-      // (see insertPHI()).
+       if (PHICount > 0 && CurSrcPair.SubReg != 0)
+         continue;
+ 
+-      // We found a suitable source, and are done with this chain.
+       break;
+     }
+   } while (!SrcToLook.empty());
+ 
+-  // If we did not find a more suitable source, there is nothing to optimize.
+   return CurSrcPair.Reg != Reg;
+ }
+ 
+-/// Insert a PHI instruction with incoming edges \p SrcRegs that are
+-/// guaranteed to have the same register class. This is necessary whenever we
+-/// successfully traverse a PHI instruction and find suitable sources coming
+-/// from its edges. By inserting a new PHI, we provide a rewritten PHI def
+-/// suitable to be used in a new COPY instruction.
+ static MachineInstr &insertPHI(MachineRegisterInfo &MRI,
+                                const TargetInstrInfo &TII,
+                                const SmallVectorImpl<RegSubRegPair> &SrcRegs,
+@@ -1087,8 +822,6 @@ static MachineInstr &insertPHI(MachineRe
+   assert(!SrcRegs.empty() && "No sources to create a PHI instruction?");
+ 
+   const TargetRegisterClass *NewRC = MRI.getRegClass(SrcRegs[0].Reg);
+-  // NewRC is only correct if no subregisters are involved. findNextSource()
+-  // should have rejected those cases already.
+   assert(SrcRegs[0].SubReg == 0 && "should not have subreg operand");
+   Register NewVR = MRI.createVirtualRegister(NewRC);
+   MachineBasicBlock *MBB = OrigPHI.getParent();
+@@ -1099,9 +832,6 @@ static MachineInstr &insertPHI(MachineRe
+   for (const RegSubRegPair &RegPair : SrcRegs) {
+     MIB.addReg(RegPair.Reg, {}, RegPair.SubReg);
+     MIB.addMBB(OrigPHI.getOperand(MBBOpIdx).getMBB());
+-    // Since we're extended the lifetime of RegPair.Reg, clear the
+-    // kill flags to account for that and make RegPair.Reg reaches
+-    // the new PHI.
+     MRI.clearKillFlags(RegPair.Reg);
+     MBBOpIdx += 2;
+   }
+@@ -1109,12 +839,6 @@ static MachineInstr &insertPHI(MachineRe
+   return *MIB;
+ }
+ 
+-/// Given a \p Def.Reg and Def.SubReg  pair, use \p RewriteMap to find
+-/// the new source to use for rewrite. If \p HandleMultipleSources is true and
+-/// multiple sources for a given \p Def are found along the way, we found a
+-/// PHI instructions that needs to be rewritten.
+-/// TODO: HandleMultipleSources should be removed once we test PHI handling
+-/// with coalescable copies.
+ static RegSubRegPair
+ getNewSource(MachineRegisterInfo *MRI, const TargetInstrInfo *TII,
+              RegSubRegPair Def,
+@@ -1123,11 +847,9 @@ getNewSource(MachineRegisterInfo *MRI, c
+   RegSubRegPair LookupSrc(Def.Reg, Def.SubReg);
+   while (true) {
+     ValueTrackerResult Res = RewriteMap.lookup(LookupSrc);
+-    // If there are no entries on the map, LookupSrc is the new source.
+     if (!Res.isValid())
+       return LookupSrc;
+ 
+-    // There's only one source for this definition, keep searching...
+     unsigned NumSrcs = Res.getNumSources();
+     if (NumSrcs == 1) {
+       LookupSrc.Reg = Res.getSrcReg(0);
+@@ -1135,12 +857,9 @@ getNewSource(MachineRegisterInfo *MRI, c
+       continue;
+     }
+ 
+-    // TODO: Remove once multiple srcs w/ coalescable copies are supported.
+     if (!HandleMultipleSources)
+       break;
+ 
+-    // Multiple sources, recurse into each source to find a new source
+-    // for it. Then, rewrite the PHI accordingly to its new edges.
+     SmallVector<RegSubRegPair, 4> NewPHISrcs;
+     for (unsigned i = 0; i < NumSrcs; ++i) {
+       RegSubRegPair PHISrc(Res.getSrcReg(i), Res.getSrcSubReg(i));
+@@ -1148,7 +867,6 @@ getNewSource(MachineRegisterInfo *MRI, c
+           getNewSource(MRI, TII, PHISrc, RewriteMap, HandleMultipleSources));
+     }
+ 
+-    // Build the new PHI node and return its def register as the new source.
+     MachineInstr &OrigPHI = const_cast<MachineInstr &>(*Res.getInst());
+     MachineInstr &NewPHI = insertPHI(*MRI, *TII, NewPHISrcs, OrigPHI);
+     LLVM_DEBUG(dbgs() << "-- getNewSource\n");
+@@ -1163,30 +881,18 @@ getNewSource(MachineRegisterInfo *MRI, c
+ 
+ bool PeepholeOptimizer::optimizeCoalescableCopyImpl(Rewriter &&CpyRewriter) {
+   bool Changed = false;
+-  // Get the right rewriter for the current copy.
+-  // Rewrite each rewritable source.
+   RegSubRegPair Dst;
+   RegSubRegPair TrackPair;
+   while (CpyRewriter.getNextRewritableSource(TrackPair, Dst)) {
+-    if (Dst.Reg.isPhysical()) {
+-      // Do not try to find a new source for a physical register.
+-      // So far we do not have any motivating example for doing that.
+-      // Thus, instead of maintaining untested code, we will revisit that if
+-      // that changes at some point.
++    if (Dst.Reg.isPhysical())
+       continue;
+-    }
+ 
+     const TargetRegisterClass *DefRC = MRI->getRegClass(Dst.Reg);
+ 
+-    // Keep track of PHI nodes and its incoming edges when looking for sources.
+     RewriteMapTy RewriteMap;
+-    // Try to find a more suitable source. If we failed to do so, or get the
+-    // actual source, move to the next source.
+     if (!findNextSource(DefRC, Dst.SubReg, TrackPair, RewriteMap))
+       continue;
+ 
+-    // Get the new source to rewrite. TODO: Only enable handling of multiple
+-    // sources (PHIs) once we have a motivating example and testcases for it.
+     RegSubRegPair NewSrc = getNewSource(MRI, TII, TrackPair, RewriteMap,
+                                         /*HandleMultipleSources=*/false);
+     assert(TrackPair.Reg != NewSrc.Reg &&
+@@ -1195,51 +901,29 @@ bool PeepholeOptimizer::optimizeCoalesca
+       continue;
+ 
+     if (NewSrc.SubReg) {
+-      // Verify the register class supports the subregister index. ARM's
+-      // copy-like queries return register:subreg pairs where the register's
+-      // current class does not directly support the subregister index.
+       const TargetRegisterClass *RC = MRI->getRegClass(NewSrc.Reg);
+       const TargetRegisterClass *WithSubRC =
+           TRI->getSubClassWithSubReg(RC, NewSrc.SubReg);
+-      if (!MRI->constrainRegClass(NewSrc.Reg, WithSubRC))
++      if (!WithSubRC || !MRI->constrainRegClass(NewSrc.Reg, WithSubRC))
+         continue;
+       Changed = true;
+     }
+ 
+-    // Rewrite source.
+     if (CpyRewriter.RewriteCurrentSource(NewSrc.Reg, NewSrc.SubReg)) {
+-      // We may have extended the live-range of NewSrc, account for that.
+       MRI->clearKillFlags(NewSrc.Reg);
+       Changed = true;
+     }
+   }
+ 
+-  // TODO: We could have a clean-up method to tidy the instruction.
+-  // E.g., v0 = INSERT_SUBREG v1, v1.sub0, sub0
+-  // => v0 = COPY v1
+-  // Currently we haven't seen motivating example for that and we
+-  // want to avoid untested code.
+   NumRewrittenCopies += Changed;
+   return Changed;
+ }
+ 
+-/// Optimize generic copy instructions to avoid cross register bank copy.
+-/// The optimization looks through a chain of copies and tries to find a source
+-/// that has a compatible register class.
+-/// Two register classes are considered to be compatible if they share the same
+-/// register bank.
+-/// New copies issued by this optimization are register allocator
+-/// friendly. This optimization does not remove any copy as it may
+-/// overconstrain the register allocator, but replaces some operands
+-/// when possible.
+-/// \pre isCoalescableCopy(*MI) is true.
+-/// \return True, when \p MI has been rewritten. False otherwise.
+ bool PeepholeOptimizer::optimizeCoalescableCopy(MachineInstr &MI) {
+   assert(isCoalescableCopy(MI) && "Invalid argument");
+   assert(MI.getDesc().getNumDefs() == 1 &&
+          "Coalescer can understand multiple defs?!");
+   const MachineOperand &MODef = MI.getOperand(0);
+-  // Do not rewrite physical definitions.
+   if (MODef.getReg().isPhysical())
+     return false;
+ 
+@@ -1253,7 +937,6 @@ bool PeepholeOptimizer::optimizeCoalesca
+   case TargetOpcode::REG_SEQUENCE:
+     return optimizeCoalescableCopyImpl(RegSequenceRewriter(MI));
+   default:
+-    // Handle uncoalescable copy-like instructions.
+     if (MI.isBitcast() || MI.isRegSequenceLike() || MI.isInsertSubregLike() ||
+         MI.isExtractSubregLike())
+       return optimizeCoalescableCopyImpl(UncoalescableRewriter(MI));
+@@ -1261,20 +944,13 @@ bool PeepholeOptimizer::optimizeCoalesca
+   }
+ }
+ 
+-/// Rewrite the source found through \p Def, by using the \p RewriteMap
+-/// and create a new COPY instruction. More info about RewriteMap in
+-/// PeepholeOptimizer::findNextSource. Right now this is only used to handle
+-/// Uncoalescable copies, since they are copy like instructions that aren't
+-/// recognized by the register allocator.
+ MachineInstr &PeepholeOptimizer::rewriteSource(MachineInstr &CopyLike,
+                                                RegSubRegPair Def,
+                                                RewriteMapTy &RewriteMap) {
+   assert(!Def.Reg.isPhysical() && "We do not rewrite physical registers");
+ 
+-  // Find the new source to use in the COPY rewrite.
+   RegSubRegPair NewSrc = getNewSource(MRI, TII, Def, RewriteMap);
+ 
+-  // Insert the COPY.
+   const TargetRegisterClass *DefRC = MRI->getRegClass(Def.Reg);
+   Register NewVReg = MRI->createVirtualRegister(DefRC);
+ 
+@@ -1282,11 +958,7 @@ MachineInstr &PeepholeOptimizer::rewrite
+     const TargetRegisterClass *NewSrcRC = MRI->getRegClass(NewSrc.Reg);
+     const TargetRegisterClass *WithSubRC =
+         TRI->getSubClassWithSubReg(NewSrcRC, NewSrc.SubReg);
+-
+-    // The new source may not directly support the subregister, but we should be
+-    // able to assume it is constrainable to support the subregister (otherwise
+-    // ValueTracker was lying and reported a useless value).
+-    if (!MRI->constrainRegClass(NewSrc.Reg, WithSubRC))
++    if (!WithSubRC || !MRI->constrainRegClass(NewSrc.Reg, WithSubRC))
+       llvm_unreachable("replacement register cannot support subregister");
+   }
+ 
+@@ -1303,101 +975,129 @@ MachineInstr &PeepholeOptimizer::rewrite
+   LLVM_DEBUG(dbgs() << "-- RewriteSource\n");
+   LLVM_DEBUG(dbgs() << "   Replacing: " << CopyLike);
+   LLVM_DEBUG(dbgs() << "        With: " << *NewCopy);
++
+   MRI->replaceRegWith(Def.Reg, NewVReg);
+   MRI->clearKillFlags(NewVReg);
+-
+-  // We extended the lifetime of NewSrc.Reg, clear the kill flags to
+-  // account for that.
+   MRI->clearKillFlags(NewSrc.Reg);
+ 
+   return *NewCopy;
+ }
+ 
+-/// Optimize copy-like instructions to create
+-/// register coalescer friendly instruction.
+-/// The optimization tries to kill-off the \p MI by looking
+-/// through a chain of copies to find a source that has a compatible
+-/// register class.
+-/// If such a source is found, it replace \p MI by a generic COPY
+-/// operation.
+-/// \pre isUncoalescableCopy(*MI) is true.
+-/// \return True, when \p MI has been optimized. In that case, \p MI has
+-/// been removed from its parent.
+-/// All COPY instructions created, are inserted in \p LocalMIs.
+ bool PeepholeOptimizer::optimizeUncoalescableCopy(
+     MachineInstr &MI, SmallPtrSetImpl<MachineInstr *> &LocalMIs) {
+   assert(isUncoalescableCopy(MI) && "Invalid argument");
+   UncoalescableRewriter CpyRewriter(MI);
+ 
+-  // Rewrite each rewritable source by generating new COPYs. This works
+-  // differently from optimizeCoalescableCopy since it first makes sure that all
+-  // definitions can be rewritten.
+   RewriteMapTy RewriteMap;
+   RegSubRegPair Src;
+   RegSubRegPair Def;
+   SmallVector<RegSubRegPair, 4> RewritePairs;
+   while (CpyRewriter.getNextRewritableSource(Src, Def)) {
+-    // If a physical register is here, this is probably for a good reason.
+-    // Do not rewrite that.
++    (void)Src;
+     if (Def.Reg.isPhysical())
+       return false;
+ 
+-    // FIXME: Uncoalescable copies are treated differently by
+-    // UncoalescableRewriter, and this probably should not share
+-    // API. getNextRewritableSource really finds rewritable defs.
+     const TargetRegisterClass *DefRC = MRI->getRegClass(Def.Reg);
+-
+-    // If we do not know how to rewrite this definition, there is no point
+-    // in trying to kill this instruction.
+     if (!findNextSource(DefRC, Def.SubReg, Def, RewriteMap))
+       return false;
+ 
+     RewritePairs.push_back(Def);
+   }
+ 
+-  // The change is possible for all defs, do it.
+-  for (const RegSubRegPair &Def : RewritePairs) {
+-    // Rewrite the "copy" in a way the register coalescer understands.
+-    MachineInstr &NewCopy = rewriteSource(MI, Def, RewriteMap);
++  for (const RegSubRegPair &DefPair : RewritePairs) {
++    MachineInstr &NewCopy = rewriteSource(MI, DefPair, RewriteMap);
+     LocalMIs.insert(&NewCopy);
+   }
+ 
+-  // MI is now dead.
+   LLVM_DEBUG(dbgs() << "Deleting uncoalescable copy: " << MI);
+   MI.eraseFromParent();
+   ++NumUncoalescableCopies;
+   return true;
+ }
+ 
+-/// Check whether MI is a candidate for folding into a later instruction.
+-/// We only fold loads to virtual registers and the virtual register defined
+-/// has a single user.
+ bool PeepholeOptimizer::isLoadFoldable(
+     MachineInstr &MI, SmallSet<Register, 16> &FoldAsLoadDefCandidates) {
+   if (!MI.canFoldAsLoad() || !MI.mayLoad())
+     return false;
++
+   const MCInstrDesc &MCID = MI.getDesc();
+   if (MCID.getNumDefs() != 1)
+     return false;
+ 
+   Register Reg = MI.getOperand(0).getReg();
+-  // To reduce compilation time, we check MRI->hasOneNonDBGUser when inserting
+-  // loads. It should be checked when processing uses of the load, since
+-  // uses can be removed during peephole.
+   if (Reg.isVirtual() && !MI.getOperand(0).getSubReg() &&
+       MRI->hasOneNonDBGUser(Reg)) {
+     FoldAsLoadDefCandidates.insert(Reg);
+     return true;
+   }
++
+   return false;
+ }
+ 
++MachineInstr *PeepholeOptimizer::foldLoadInto(
++    MachineInstr &MI, Register FoldReg,
++    SmallPtrSetImpl<MachineInstr *> &LocalMIs) {
++  Register FoldedReg = FoldReg;
++  MachineInstr *DefMI = nullptr;
++  MachineInstr *CopyMI = nullptr;
++
++  MachineInstr *FoldMI =
++      TII->optimizeLoadInstr(MI, MRI, FoldReg, DefMI, CopyMI);
++  if (!FoldMI || !DefMI)
++    return nullptr;
++
++  LLVM_DEBUG(dbgs() << "Replacing: " << MI);
++  LLVM_DEBUG(dbgs() << "     With: " << *FoldMI);
++
++  LocalMIs.erase(&MI);
++  LocalMIs.erase(DefMI);
++  LocalMIs.insert(FoldMI);
++  if (CopyMI)
++    LocalMIs.insert(CopyMI);
++
++  if (MI.shouldUpdateAdditionalCallInfo())
++    MI.getMF()->moveAdditionalCallInfo(&MI, FoldMI);
++
++  if (DefMI != FoldMI)
++    DefMI->eraseFromParent();
++  if (&MI != FoldMI)
++    MI.eraseFromParent();
++
++  MRI->markUsesInDebugValueAsUndef(FoldedReg);
++  ++NumLoadFold;
++  return FoldMI;
++}
++
++bool PeepholeOptimizer::tryFoldLoadAfterCompareElim(
++    Register CmpSrcReg, SmallPtrSetImpl<MachineInstr *> &LocalMIs) {
++  if (!CmpSrcReg.isVirtual() || !MRI->hasOneNonDBGUser(CmpSrcReg))
++    return false;
++
++  auto UI = MRI->use_nodbg_begin(CmpSrcReg);
++  if (UI == MRI->use_nodbg_end())
++    return false;
++
++  MachineInstr *FlagProducer = UI->getParent();
++  MachineInstr *LoadMI = MRI->getVRegDef(CmpSrcReg);
++  if (!FlagProducer || !LoadMI || FlagProducer == LoadMI)
++    return false;
++
++  if (!LocalMIs.count(FlagProducer) || !LocalMIs.count(LoadMI))
++    return false;
++
++  if (!LoadMI->canFoldAsLoad() || !LoadMI->mayLoad())
++    return false;
++
++  return foldLoadInto(*FlagProducer, CmpSrcReg, LocalMIs) != nullptr;
++}
++
+ bool PeepholeOptimizer::isMoveImmediate(
+     MachineInstr &MI, SmallSet<Register, 4> &ImmDefRegs,
+     DenseMap<Register, MachineInstr *> &ImmDefMIs) {
+   const MCInstrDesc &MCID = MI.getDesc();
+   if (MCID.getNumDefs() != 1 || !MI.getOperand(0).isReg())
+     return false;
++
+   Register Reg = MI.getOperand(0).getReg();
+   if (!Reg.isVirtual())
+     return false;
+@@ -1411,9 +1111,6 @@ bool PeepholeOptimizer::isMoveImmediate(
+   return true;
+ }
+ 
+-/// Try folding register operands that are defined by move immediate
+-/// instructions, i.e. a trivial constant folding optimization, if
+-/// and only if the def and use are in the same BB.
+ bool PeepholeOptimizer::foldImmediate(
+     MachineInstr &MI, SmallSet<Register, 4> &ImmDefRegs,
+     DenseMap<Register, MachineInstr *> &ImmDefMIs, bool &Deleted) {
+@@ -1422,18 +1119,19 @@ bool PeepholeOptimizer::foldImmediate(
+     MachineOperand &MO = MI.getOperand(i);
+     if (!MO.isReg() || MO.isDef())
+       continue;
++
+     Register Reg = MO.getReg();
+     if (!Reg.isVirtual())
+       continue;
++
+     if (ImmDefRegs.count(Reg) == 0)
+       continue;
+-    DenseMap<Register, MachineInstr *>::iterator II = ImmDefMIs.find(Reg);
++
++    auto II = ImmDefMIs.find(Reg);
+     assert(II != ImmDefMIs.end() && "couldn't find immediate definition");
+     if (TII->foldImmediate(MI, *II->second, Reg, MRI)) {
+       ++NumImmFold;
+-      // foldImmediate can delete ImmDefMI if MI was its only user. If ImmDefMI
+-      // is not deleted, and we happened to get a same MI, we can delete MI and
+-      // replace its users.
++
+       if (MRI->getVRegDef(Reg) &&
+           MI.isIdenticalTo(*II->second, MachineInstr::IgnoreVRegDefs)) {
+         Register DstReg = MI.getOperand(0).getReg();
+@@ -1448,23 +1146,10 @@ bool PeepholeOptimizer::foldImmediate(
+       return true;
+     }
+   }
++
+   return false;
+ }
+ 
+-// FIXME: This is very simple and misses some cases which should be handled when
+-// motivating examples are found.
+-//
+-// The copy rewriting logic should look at uses as well as defs and be able to
+-// eliminate copies across blocks.
+-//
+-// Later copies that are subregister extracts will also not be eliminated since
+-// only the first copy is considered.
+-//
+-// e.g.
+-// %1 = COPY %0
+-// %2 = COPY %0:sub1
+-//
+-// Should replace %2 uses with %1:sub1
+ bool PeepholeOptimizer::foldRedundantCopy(MachineInstr &MI) {
+   assert(MI.isCopy() && "expected a COPY machine instruction");
+ 
+@@ -1476,10 +1161,8 @@ bool PeepholeOptimizer::foldRedundantCop
+   if (!DstReg.isVirtual())
+     return false;
+ 
+-  if (CopySrcMIs.insert(std::make_pair(SrcPair, &MI)).second) {
+-    // First copy of this reg seen.
++  if (CopySrcMIs.insert(std::make_pair(SrcPair, &MI)).second)
+     return false;
+-  }
+ 
+   MachineInstr *PrevCopy = CopySrcMIs.find(SrcPair)->second;
+ 
+@@ -1487,17 +1170,10 @@ bool PeepholeOptimizer::foldRedundantCop
+          "Unexpected mismatching subreg!");
+ 
+   Register PrevDstReg = PrevCopy->getOperand(0).getReg();
+-
+-  // Only replace if the copy register class is the same.
+-  //
+-  // TODO: If we have multiple copies to different register classes, we may want
+-  // to track multiple copies of the same source register.
+   if (MRI->getRegClass(DstReg) != MRI->getRegClass(PrevDstReg))
+     return false;
+ 
+   MRI->replaceRegWith(DstReg, PrevDstReg);
+-
+-  // Lifetime of the previous copy has been extended.
+   MRI->clearKillFlags(PrevDstReg);
+   return true;
+ }
+@@ -1515,22 +1191,17 @@ bool PeepholeOptimizer::foldRedundantNAP
+ 
+   Register DstReg = MI.getOperand(0).getReg();
+   Register SrcReg = MI.getOperand(1).getReg();
++
+   if (isNAPhysCopy(SrcReg) && DstReg.isVirtual()) {
+-    // %vreg = COPY $physreg
+-    // Avoid using a datastructure which can track multiple live non-allocatable
+-    // phys->virt copies since LLVM doesn't seem to do this.
+-    NAPhysToVirtMIs.insert({SrcReg, &MI});
++    NAPhysToVirtMIs.insert_or_assign(SrcReg, &MI);
+     return false;
+   }
+ 
+   if (!(SrcReg.isVirtual() && isNAPhysCopy(DstReg)))
+     return false;
+ 
+-  // $physreg = COPY %vreg
+   auto PrevCopy = NAPhysToVirtMIs.find(DstReg);
+   if (PrevCopy == NAPhysToVirtMIs.end()) {
+-    // We can't remove the copy: there was an intervening clobber of the
+-    // non-allocatable physical register after the copy to virtual.
+     LLVM_DEBUG(dbgs() << "NAPhysCopy: intervening clobber forbids erasing "
+                       << MI);
+     return false;
+@@ -1538,51 +1209,38 @@ bool PeepholeOptimizer::foldRedundantNAP
+ 
+   Register PrevDstReg = PrevCopy->second->getOperand(0).getReg();
+   if (PrevDstReg == SrcReg) {
+-    // Remove the virt->phys copy: we saw the virtual register definition, and
+-    // the non-allocatable physical register's state hasn't changed since then.
+     LLVM_DEBUG(dbgs() << "NAPhysCopy: erasing " << MI);
+     ++NumNAPhysCopies;
+     return true;
+   }
+ 
+-  // Potential missed optimization opportunity: we saw a different virtual
+-  // register get a copy of the non-allocatable physical register, and we only
+-  // track one such copy. Avoid getting confused by this new non-allocatable
+-  // physical register definition, and remove it from the tracked copies.
+   LLVM_DEBUG(dbgs() << "NAPhysCopy: missed opportunity " << MI);
+   NAPhysToVirtMIs.erase(PrevCopy);
+   return false;
+ }
+ 
+-/// \bried Returns true if \p MO is a virtual register operand.
+-static bool isVirtualRegisterOperand(MachineOperand &MO) {
++/// \brief Returns true if \p MO is a virtual register operand.
++static bool isVirtualRegisterOperand(const MachineOperand &MO) {
+   return MO.isReg() && MO.getReg().isVirtual();
+ }
+ 
+ bool PeepholeOptimizer::findTargetRecurrence(
+     Register Reg, const SmallSet<Register, 2> &TargetRegs,
+     RecurrenceCycle &RC) {
+-  // Recurrence found if Reg is in TargetRegs.
+   if (TargetRegs.count(Reg))
+     return true;
+ 
+-  // TODO: Curerntly, we only allow the last instruction of the recurrence
+-  // cycle (the instruction that feeds the PHI instruction) to have more than
+-  // one uses to guarantee that commuting operands does not tie registers
+-  // with overlapping live range. Once we have actual live range info of
+-  // each register, this constraint can be relaxed.
+   if (!MRI->hasOneNonDBGUse(Reg))
+     return false;
+ 
+-  // Give up if the reccurrence chain length is longer than the limit.
+   if (RC.size() >= MaxRecurrenceChain)
+     return false;
+ 
+   MachineInstr &MI = *(MRI->use_instr_nodbg_begin(Reg));
+   unsigned Idx = MI.findRegisterUseOperandIdx(Reg, /*TRI=*/nullptr);
++  if (Idx == static_cast<unsigned>(-1))
++    return false;
+ 
+-  // Only interested in recurrences whose instructions have only one def, which
+-  // is a virtual register.
+   if (MI.getDesc().getNumDefs() != 1)
+     return false;
+ 
+@@ -1590,9 +1248,6 @@ bool PeepholeOptimizer::findTargetRecurr
+   if (!isVirtualRegisterOperand(DefOp))
+     return false;
+ 
+-  // Check if def operand of MI is tied to any use operand. We are only
+-  // interested in the case that all the instructions in the recurrence chain
+-  // have there def operand tied with one of the use operand.
+   unsigned TiedUseIdx;
+   if (!MI.isRegTiedToUseOperand(0, &TiedUseIdx))
+     return false;
+@@ -1600,40 +1255,21 @@ bool PeepholeOptimizer::findTargetRecurr
+   if (Idx == TiedUseIdx) {
+     RC.push_back(RecurrenceInstr(&MI));
+     return findTargetRecurrence(DefOp.getReg(), TargetRegs, RC);
+-  } else {
+-    // If Idx is not TiedUseIdx, check if Idx is commutable with TiedUseIdx.
+-    unsigned CommIdx = TargetInstrInfo::CommuteAnyOperandIndex;
+-    if (TII->findCommutedOpIndices(MI, Idx, CommIdx) && CommIdx == TiedUseIdx) {
+-      RC.push_back(RecurrenceInstr(&MI, Idx, CommIdx));
+-      return findTargetRecurrence(DefOp.getReg(), TargetRegs, RC);
+-    }
++  }
++
++  unsigned CommIdx = TargetInstrInfo::CommuteAnyOperandIndex;
++  if (TII->findCommutedOpIndices(MI, Idx, CommIdx) && CommIdx == TiedUseIdx) {
++    RC.push_back(RecurrenceInstr(&MI, Idx, CommIdx));
++    return findTargetRecurrence(DefOp.getReg(), TargetRegs, RC);
+   }
+ 
+   return false;
+ }
+ 
+-/// Phi instructions will eventually be lowered to copy instructions.
+-/// If phi is in a loop header, a recurrence may formulated around the source
+-/// and destination of the phi. For such case commuting operands of the
+-/// instructions in the recurrence may enable coalescing of the copy instruction
+-/// generated from the phi. For example, if there is a recurrence of
+-///
+-/// LoopHeader:
+-///   %1 = phi(%0, %100)
+-/// LoopLatch:
+-///   %0<def, tied1> = ADD %2<def, tied0>, %1
+-///
+-/// , the fact that %0 and %2 are in the same tied operands set makes
+-/// the coalescing of copy instruction generated from the phi in
+-/// LoopHeader(i.e. %1 = COPY %0) impossible, because %1 and
+-/// %2 have overlapping live range. This introduces additional move
+-/// instruction to the final assembly. However, if we commute %2 and
+-/// %1 of ADD instruction, the redundant move instruction can be
+-/// avoided.
+ bool PeepholeOptimizer::optimizeRecurrence(MachineInstr &PHI) {
+   SmallSet<Register, 2> TargetRegs;
+   for (unsigned Idx = 1; Idx < PHI.getNumOperands(); Idx += 2) {
+-    MachineOperand &MO = PHI.getOperand(Idx);
++    const MachineOperand &MO = PHI.getOperand(Idx);
+     assert(isVirtualRegisterOperand(MO) && "Invalid PHI instruction");
+     TargetRegs.insert(MO.getReg());
+   }
+@@ -1641,8 +1277,6 @@ bool PeepholeOptimizer::optimizeRecurren
+   bool Changed = false;
+   RecurrenceCycle RC;
+   if (findTargetRecurrence(PHI.getOperand(0).getReg(), TargetRegs, RC)) {
+-    // Commutes operands of instructions in RC if necessary so that the copy to
+-    // be generated from PHI can be coalesced.
+     LLVM_DEBUG(dbgs() << "Optimize recurrence chain from " << PHI);
+     for (auto &RI : RC) {
+       LLVM_DEBUG(dbgs() << "\tInst: " << *(RI.getMI()));
+@@ -1690,7 +1324,6 @@ bool PeepholeOptimizerLegacy::runOnMachi
+ }
+ 
+ bool PeepholeOptimizer::run(MachineFunction &MF) {
+-
+   LLVM_DEBUG(dbgs() << "********** PEEPHOLE OPTIMIZER **********\n");
+   LLVM_DEBUG(dbgs() << "********** Function: " << MF.getName() << '\n');
+ 
+@@ -1707,23 +1340,18 @@ bool PeepholeOptimizer::run(MachineFunct
+   for (MachineBasicBlock &MBB : MF) {
+     bool SeenMoveImm = false;
+ 
+-    // During this forward scan, at some point it needs to answer the question
+-    // "given a pointer to an MI in the current BB, is it located before or
+-    // after the current instruction".
+-    // To perform this, the following set keeps track of the MIs already seen
+-    // during the scan, if a MI is not in the set, it is assumed to be located
+-    // after. Newly created MIs have to be inserted in the set as well.
++    // #1 Capacity planning for hot per-MBB containers.
+     SmallPtrSet<MachineInstr *, 16> LocalMIs;
++    LocalMIs.reserve(MBB.size());
++
+     SmallSet<Register, 4> ImmDefRegs;
+     DenseMap<Register, MachineInstr *> ImmDefMIs;
++    ImmDefMIs.reserve(MBB.size());
++
+     SmallSet<Register, 16> FoldAsLoadDefCandidates;
+ 
+-    // Track when a non-allocatable physical register is copied to a virtual
+-    // register so that useless moves can be removed.
+-    //
+-    // $physreg is the map index; MI is the last valid `%vreg = COPY $physreg`
+-    // without any intervening re-definition of $physreg.
+     DenseMap<Register, MachineInstr *> NAPhysToVirtMIs;
++    NAPhysToVirtMIs.reserve(8);
+ 
+     CopySrcMIs.clear();
+ 
+@@ -1732,16 +1360,10 @@ bool PeepholeOptimizer::run(MachineFunct
+     for (MachineBasicBlock::iterator MII = MBB.begin(), MIE = MBB.end();
+          MII != MIE;) {
+       MachineInstr *MI = &*MII;
+-      // We may be erasing MI below, increment MII now.
+       ++MII;
+       LocalMIs.insert(MI);
+ 
+-      // Skip debug instructions. They should not affect this peephole
+-      // optimization.
+-      if (MI->isDebugInstr())
+-        continue;
+-
+-      if (MI->isPosition())
++      if (MI->isDebugInstr() || MI->isPosition())
+         continue;
+ 
+       if (IsLoopHeader && MI->isPHI()) {
+@@ -1753,14 +1375,11 @@ bool PeepholeOptimizer::run(MachineFunct
+ 
+       if (!MI->isCopy()) {
+         for (const MachineOperand &MO : MI->operands()) {
+-          // Visit all operands: definitions can be implicit or explicit.
+           if (MO.isReg()) {
+             Register Reg = MO.getReg();
+             if (MO.isDef() && isNAPhysCopy(Reg)) {
+-              const auto &Def = NAPhysToVirtMIs.find(Reg);
++              auto Def = NAPhysToVirtMIs.find(Reg);
+               if (Def != NAPhysToVirtMIs.end()) {
+-                // A new definition of the non-allocatable physical register
+-                // invalidates previous copies.
+                 LLVM_DEBUG(dbgs()
+                            << "NAPhysCopy: invalidating because of " << *MI);
+                 NAPhysToVirtMIs.erase(Def);
+@@ -1768,13 +1387,17 @@ bool PeepholeOptimizer::run(MachineFunct
+             }
+           } else if (MO.isRegMask()) {
+             const uint32_t *RegMask = MO.getRegMask();
+-            for (auto &RegMI : NAPhysToVirtMIs) {
+-              Register Def = RegMI.first;
+-              if (MachineOperand::clobbersPhysReg(RegMask, Def)) {
+-                LLVM_DEBUG(dbgs()
+-                           << "NAPhysCopy: invalidating because of " << *MI);
+-                NAPhysToVirtMIs.erase(Def);
+-              }
++            // #3 Two-step erase for map iteration safety/predictability.
++            SmallVector<Register, 4> ClobberedRegs;
++            for (const auto &RegMI : NAPhysToVirtMIs) {
++              Register DefReg = RegMI.first;
++              if (MachineOperand::clobbersPhysReg(RegMask, DefReg))
++                ClobberedRegs.push_back(DefReg);
++            }
++            for (Register DefReg : ClobberedRegs) {
++              LLVM_DEBUG(dbgs()
++                         << "NAPhysCopy: invalidating because of " << *MI);
++              NAPhysToVirtMIs.erase(DefReg);
+             }
+           }
+         }
+@@ -1784,22 +1407,35 @@ bool PeepholeOptimizer::run(MachineFunct
+         continue;
+ 
+       if (MI->isInlineAsm() || MI->hasUnmodeledSideEffects()) {
+-        // Blow away all non-allocatable physical registers knowledge since we
+-        // don't know what's correct anymore.
+-        //
+-        // FIXME: handle explicit asm clobbers.
+         LLVM_DEBUG(dbgs() << "NAPhysCopy: blowing away all info due to "
+                           << *MI);
+         NAPhysToVirtMIs.clear();
+       }
+ 
++      const bool IsCompare = MI->isCompare();
++      Register CmpSrcReg;
++      Register CmpSrcReg2;
++      int64_t CmpMask = 0;
++      int64_t CmpValue = 0;
++      bool HasCmpInfo = false;
++
++      if (IsCompare) {
++        HasCmpInfo =
++            TII->analyzeCompare(*MI, CmpSrcReg, CmpSrcReg2, CmpMask, CmpValue) &&
++            !CmpSrcReg.isPhysical() && !CmpSrcReg2.isPhysical();
++      }
++
+       if ((isUncoalescableCopy(*MI) &&
+            optimizeUncoalescableCopy(*MI, LocalMIs)) ||
+-          (MI->isCompare() && optimizeCmpInstr(*MI)) ||
++          (IsCompare && HasCmpInfo &&
++           optimizeCmpInstr(*MI, CmpSrcReg, CmpSrcReg2, CmpMask, CmpValue)) ||
+           (MI->isSelect() && optimizeSelect(*MI, LocalMIs))) {
+-        // MI is deleted.
+         LocalMIs.erase(MI);
+         Changed = true;
++
++        if (IsCompare && HasCmpInfo)
++          (void)tryFoldLoadAfterCompareElim(CmpSrcReg, LocalMIs);
++
+         continue;
+       }
+ 
+@@ -1809,7 +1445,6 @@ bool PeepholeOptimizer::run(MachineFunct
+       }
+ 
+       if (isCoalescableCopy(*MI) && optimizeCoalescableCopy(*MI)) {
+-        // MI is just rewritten.
+         Changed = true;
+         continue;
+       }
+@@ -1827,13 +1462,12 @@ bool PeepholeOptimizer::run(MachineFunct
+         SeenMoveImm = true;
+       } else {
+         Changed |= optimizeExtInstr(*MI, MBB, LocalMIs);
+-        // optimizeExtInstr might have created new instructions after MI
+-        // and before the already incremented MII. Adjust MII so that the
+-        // next iteration sees the new instructions.
++
+         MII = MI;
+         ++MII;
++
+         if (SeenMoveImm) {
+-          bool Deleted;
++          bool Deleted = false;
+           Changed |= foldImmediate(*MI, ImmDefRegs, ImmDefMIs, Deleted);
+           if (Deleted) {
+             LocalMIs.erase(MI);
+@@ -1842,62 +1476,28 @@ bool PeepholeOptimizer::run(MachineFunct
+         }
+       }
+ 
+-      // Check whether MI is a load candidate for folding into a later
+-      // instruction. If MI is not a candidate, check whether we can fold an
+-      // earlier load into MI.
+       if (!isLoadFoldable(*MI, FoldAsLoadDefCandidates) &&
+           !FoldAsLoadDefCandidates.empty()) {
+-
+-        // We visit each operand even after successfully folding a previous
+-        // one.  This allows us to fold multiple loads into a single
+-        // instruction.  We do assume that optimizeLoadInstr doesn't insert
+-        // foldable uses earlier in the argument list.  Since we don't restart
+-        // iteration, we'd miss such cases.
+-        const MCInstrDesc &MIDesc = MI->getDesc();
+-        for (unsigned i = MIDesc.getNumDefs(); i != MI->getNumOperands(); ++i) {
++        for (unsigned i = MI->getDesc().getNumDefs(); i != MI->getNumOperands();
++             ++i) {
+           const MachineOperand &MOp = MI->getOperand(i);
+           if (!MOp.isReg())
+             continue;
++
+           Register FoldAsLoadDefReg = MOp.getReg();
+-          if (FoldAsLoadDefCandidates.count(FoldAsLoadDefReg)) {
+-            // We need to fold load after optimizeCmpInstr, since
+-            // optimizeCmpInstr can enable folding by converting SUB to CMP.
+-            // Save FoldAsLoadDefReg because optimizeLoadInstr() resets it and
+-            // we need it for markUsesInDebugValueAsUndef().
+-            Register FoldedReg = FoldAsLoadDefReg;
+-            MachineInstr *DefMI = nullptr;
+-            MachineInstr *CopyMI = nullptr;
+-            if (MachineInstr *FoldMI = TII->optimizeLoadInstr(
+-                    *MI, MRI, FoldAsLoadDefReg, DefMI, CopyMI)) {
+-              // Update LocalMIs since we replaced MI with FoldMI and deleted
+-              // DefMI.
+-              LLVM_DEBUG(dbgs() << "Replacing: " << *MI);
+-              LLVM_DEBUG(dbgs() << "     With: " << *FoldMI);
+-              LocalMIs.erase(MI);
+-              LocalMIs.erase(DefMI);
+-              LocalMIs.insert(FoldMI);
+-              if (CopyMI)
+-                LocalMIs.insert(CopyMI);
+-              // Update the call info.
+-              if (MI->shouldUpdateAdditionalCallInfo())
+-                MI->getMF()->moveAdditionalCallInfo(MI, FoldMI);
+-              MI->eraseFromParent();
+-              DefMI->eraseFromParent();
+-              MRI->markUsesInDebugValueAsUndef(FoldedReg);
+-              FoldAsLoadDefCandidates.erase(FoldedReg);
+-              ++NumLoadFold;
+-
+-              // MI is replaced with FoldMI so we can continue trying to fold
+-              Changed = true;
+-              MI = FoldMI;
+-            }
++          if (!FoldAsLoadDefCandidates.count(FoldAsLoadDefReg))
++            continue;
++
++          // #2 Single helper for repeated fold+bookkeeping mechanics.
++          if (MachineInstr *FoldMI =
++                  foldLoadInto(*MI, FoldAsLoadDefReg, LocalMIs)) {
++            FoldAsLoadDefCandidates.erase(FoldAsLoadDefReg);
++            Changed = true;
++            MI = FoldMI;
+           }
+         }
+       }
+ 
+-      // If we run into an instruction we can't fold across, discard
+-      // the load candidates.  Note: We might be able to fold *into* this
+-      // instruction, so this needs to be after the folding logic.
+       if (MI->isLoadFoldBarrier()) {
+         LLVM_DEBUG(dbgs() << "Encountered load fold barrier on " << *MI);
+         FoldAsLoadDefCandidates.clear();
+@@ -1911,16 +1511,11 @@ bool PeepholeOptimizer::run(MachineFunct
+ 
+ ValueTrackerResult ValueTracker::getNextSourceFromCopy() {
+   assert(Def->isCopy() && "Invalid definition");
+-  // Copy instruction are supposed to be: Def = Src.
+-  // If someone breaks this assumption, bad things will happen everywhere.
+-  // There may be implicit uses preventing the copy to be moved across
+-  // some target specific register definitions
+   assert(Def->getNumOperands() - Def->getNumImplicitOperands() == 2 &&
+          "Invalid number of operands");
+   assert(!Def->hasImplicitDef() && "Only implicit uses are allowed");
+   assert(!Def->getOperand(DefIdx).getSubReg() && "no subregister defs in SSA");
+ 
+-  // Otherwise, we want the whole source.
+   const MachineOperand &Src = Def->getOperand(1);
+   if (Src.isUndef())
+     return ValueTrackerResult();
+@@ -1932,13 +1527,11 @@ ValueTrackerResult ValueTracker::getNext
+     SubReg = TRI->composeSubRegIndices(SubReg, DefSubReg);
+ 
+     if (SrcReg.isVirtual()) {
+-      // TODO: Try constraining on rewrite if we can
+       const TargetRegisterClass *RegRC = MRI.getRegClass(SrcReg);
+       if (!TRI->isSubRegValidForRegClass(RegRC, SubReg))
+         return ValueTrackerResult();
+-    } else {
+-      if (!TRI->getSubReg(SrcReg, SubReg))
+-        return ValueTrackerResult();
++    } else if (!TRI->getSubReg(SrcReg, SubReg)) {
++      return ValueTrackerResult();
+     }
+   }
+ 
+@@ -1948,11 +1541,9 @@ ValueTrackerResult ValueTracker::getNext
+ ValueTrackerResult ValueTracker::getNextSourceFromBitcast() {
+   assert(Def->isBitcast() && "Invalid definition");
+ 
+-  // Bail if there are effects that a plain copy will not expose.
+   if (Def->mayRaiseFPException() || Def->hasUnmodeledSideEffects())
+     return ValueTrackerResult();
+ 
+-  // Bitcasts with more than one def are not supported.
+   if (Def->getDesc().getNumDefs() != 1)
+     return ValueTrackerResult();
+ 
+@@ -1964,25 +1555,18 @@ ValueTrackerResult ValueTracker::getNext
+     const MachineOperand &MO = Def->getOperand(OpIdx);
+     if (!MO.isReg() || !MO.getReg())
+       continue;
+-    // Ignore dead implicit defs.
+     if (MO.isImplicit() && MO.isDead())
+       continue;
+     assert(!MO.isDef() && "We should have skipped all the definitions by now");
+     if (SrcIdx != EndOpIdx)
+-      // Multiple sources?
+       return ValueTrackerResult();
+     SrcIdx = OpIdx;
+   }
+ 
+-  // In some rare case, Def has no input, SrcIdx is out of bound,
+-  // getOperand(SrcIdx) will fail below.
+   if (SrcIdx >= Def->getNumOperands())
+     return ValueTrackerResult();
+ 
+   const MachineOperand &DefOp = Def->getOperand(DefIdx);
+-
+-  // Stop when any user of the bitcast is a SUBREG_TO_REG, replacing with a COPY
+-  // will break the assumed guarantees for the upper bits.
+   for (const MachineInstr &UseMI : MRI.use_nodbg_instructions(DefOp.getReg())) {
+     if (UseMI.isSubregToReg())
+       return ValueTrackerResult();
+@@ -1991,41 +1575,29 @@ ValueTrackerResult ValueTracker::getNext
+   const MachineOperand &Src = Def->getOperand(SrcIdx);
+   if (Src.isUndef())
+     return ValueTrackerResult();
++
+   return ValueTrackerResult(Src.getReg(), Src.getSubReg());
+ }
+ 
+ ValueTrackerResult ValueTracker::getNextSourceFromRegSequence() {
+   assert((Def->isRegSequence() || Def->isRegSequenceLike()) &&
+          "Invalid definition");
+-
+   assert(!Def->getOperand(DefIdx).getSubReg() && "illegal subregister def");
+ 
+   SmallVector<RegSubRegPairAndIdx, 8> RegSeqInputRegs;
+   if (!TII->getRegSequenceInputs(*Def, DefIdx, RegSeqInputRegs))
+     return ValueTrackerResult();
+ 
+-  // We are looking at:
+-  // Def = REG_SEQUENCE v0, sub0, v1, sub1, ...
+-  //
+-  // Check if one of the operands exactly defines the subreg we are interested
+-  // in.
+   for (const RegSubRegPairAndIdx &RegSeqInput : RegSeqInputRegs) {
+     if (RegSeqInput.SubIdx == DefSubReg)
+       return ValueTrackerResult(RegSeqInput.Reg, RegSeqInput.SubReg);
+   }
+ 
+   const TargetRegisterInfo *TRI = MRI.getTargetRegisterInfo();
+-
+-  // If we did not find an exact match, see if we can do a composition to
+-  // extract a sub-subregister.
+   for (const RegSubRegPairAndIdx &RegSeqInput : RegSeqInputRegs) {
+     LaneBitmask DefMask = TRI->getSubRegIndexLaneMask(DefSubReg);
+     LaneBitmask ThisOpRegMask = TRI->getSubRegIndexLaneMask(RegSeqInput.SubIdx);
+ 
+-    // Check that this extract reads a subset of this single reg_sequence input.
+-    //
+-    // FIXME: We should be able to filter this in terms of the indexes directly
+-    // without checking the lanemasks.
+     if ((DefMask & ThisOpRegMask) != DefMask)
+       continue;
+ 
+@@ -2037,10 +1609,6 @@ ValueTrackerResult ValueTracker::getNext
+     unsigned ComposedDefInSrcReg1 =
+         TRI->composeSubRegIndices(RegSeqInput.SubReg, ReverseDefCompose);
+ 
+-    // TODO: We should be able to defer checking if the result register class
+-    // supports the index to continue looking for a rewritable source.
+-    //
+-    // TODO: Should we modify the register class to support the index?
+     const TargetRegisterClass *SrcRC = MRI.getRegClass(RegSeqInput.Reg);
+     if (!TRI->isSubRegValidForRegClass(SrcRC, ComposedDefInSrcReg1))
+       return ValueTrackerResult();
+@@ -2048,9 +1616,6 @@ ValueTrackerResult ValueTracker::getNext
+     return ValueTrackerResult(RegSeqInput.Reg, ComposedDefInSrcReg1);
+   }
+ 
+-  // If the subreg we are tracking is super-defined by another subreg,
+-  // we could follow this value. However, this would require to compose
+-  // the subreg and we do not do that for now.
+   return ValueTrackerResult();
+ }
+ 
+@@ -2064,47 +1629,27 @@ ValueTrackerResult ValueTracker::getNext
+   if (!TII->getInsertSubregInputs(*Def, DefIdx, BaseReg, InsertedReg))
+     return ValueTrackerResult();
+ 
+-  // We are looking at:
+-  // Def = INSERT_SUBREG v0, v1, sub1
+-  // There are two cases:
+-  // 1. DefSubReg == sub1, get v1.
+-  // 2. DefSubReg != sub1, the value may be available through v0.
+-
+-  // #1 Check if the inserted register matches the required sub index.
+-  if (InsertedReg.SubIdx == DefSubReg) {
++  if (InsertedReg.SubIdx == DefSubReg)
+     return ValueTrackerResult(InsertedReg.Reg, InsertedReg.SubReg);
+-  }
+-  // #2 Otherwise, if the sub register we are looking for is not partial
+-  // defined by the inserted element, we can look through the main
+-  // register (v0).
++
+   const MachineOperand &MODef = Def->getOperand(DefIdx);
+-  // If the result register (Def) and the base register (v0) do not
+-  // have the same register class or if we have to compose
+-  // subregisters, bail out.
+   if (MRI.getRegClass(MODef.getReg()) != MRI.getRegClass(BaseReg.Reg) ||
+       BaseReg.SubReg)
+     return ValueTrackerResult();
+ 
+-  // Get the TRI and check if the inserted sub-register overlaps with the
+-  // sub-register we are tracking.
+   const TargetRegisterInfo *TRI = MRI.getTargetRegisterInfo();
+   if ((TRI->getSubRegIndexLaneMask(DefSubReg) &
+        TRI->getSubRegIndexLaneMask(InsertedReg.SubIdx))
+           .any())
+     return ValueTrackerResult();
+-  // At this point, the value is available in v0 via the same subreg
+-  // we used for Def.
++
+   return ValueTrackerResult(BaseReg.Reg, DefSubReg);
+ }
+ 
+ ValueTrackerResult ValueTracker::getNextSourceFromExtractSubreg() {
+   assert((Def->isExtractSubreg() || Def->isExtractSubregLike()) &&
+          "Invalid definition");
+-  // We are looking at:
+-  // Def = EXTRACT_SUBREG v0, sub0
+ 
+-  // Bail if we have to compose sub registers.
+-  // Indeed, if DefSubReg != 0, we would have to compose it with sub0.
+   if (DefSubReg)
+     return ValueTrackerResult();
+ 
+@@ -2112,28 +1657,19 @@ ValueTrackerResult ValueTracker::getNext
+   if (!TII->getExtractSubregInputs(*Def, DefIdx, ExtractSubregInputReg))
+     return ValueTrackerResult();
+ 
+-  // Bail if we have to compose sub registers.
+-  // Likewise, if v0.subreg != 0, we would have to compose v0.subreg with sub0.
+   if (ExtractSubregInputReg.SubReg)
+     return ValueTrackerResult();
+-  // Otherwise, the value is available in the v0.sub0.
++
+   return ValueTrackerResult(ExtractSubregInputReg.Reg,
+                             ExtractSubregInputReg.SubIdx);
+ }
+ 
+ ValueTrackerResult ValueTracker::getNextSourceFromSubregToReg() {
+   assert(Def->isSubregToReg() && "Invalid definition");
+-  // We are looking at:
+-  // Def = SUBREG_TO_REG v0, sub0
+ 
+-  // Bail if we have to compose sub registers.
+-  // If DefSubReg != sub0, we would have to check that all the bits
+-  // we track are included in sub0 and if yes, we would have to
+-  // determine the right subreg in v0.
+   if (DefSubReg != Def->getOperand(2).getImm())
+     return ValueTrackerResult();
+-  // Bail if we have to compose sub registers.
+-  // Likewise, if v0.subreg != 0, we would have to compose it with sub0.
++
+   if (Def->getOperand(1).getSubReg())
+     return ValueTrackerResult();
+ 
+@@ -2141,17 +1677,13 @@ ValueTrackerResult ValueTracker::getNext
+                             Def->getOperand(2).getImm());
+ }
+ 
+-/// Explore each PHI incoming operand and return its sources.
+ ValueTrackerResult ValueTracker::getNextSourceFromPHI() {
+   assert(Def->isPHI() && "Invalid definition");
+   ValueTrackerResult Res;
+ 
+-  // Return all register sources for PHI instructions.
+   for (unsigned i = 1, e = Def->getNumOperands(); i < e; i += 2) {
+     const MachineOperand &MO = Def->getOperand(i);
+     assert(MO.isReg() && "Invalid PHI instruction");
+-    // We have no code to deal with undef operands. They shouldn't happen in
+-    // normal programs anyway.
+     if (MO.isUndef())
+       return ValueTrackerResult();
+     Res.addSource(MO.getReg(), MO.getSubReg());
+@@ -2162,18 +1694,17 @@ ValueTrackerResult ValueTracker::getNext
+ 
+ ValueTrackerResult ValueTracker::getNextSourceImpl() {
+   assert(Def && "This method needs a valid definition");
+-
+   assert(((Def->getOperand(DefIdx).isDef() &&
+            (DefIdx < Def->getDesc().getNumDefs() ||
+             Def->getDesc().isVariadic())) ||
+           Def->getOperand(DefIdx).isImplicit()) &&
+          "Invalid DefIdx");
++
+   if (Def->isCopy())
+     return getNextSourceFromCopy();
+   if (Def->isBitcast())
+     return getNextSourceFromBitcast();
+-  // All the remaining cases involve "complex" instructions.
+-  // Bail if we did not ask for the advanced tracking.
++
+   if (DisableAdvCopyOpt)
+     return ValueTrackerResult();
+   if (Def->isRegSequence() || Def->isRegSequenceLike())
+@@ -2190,25 +1721,17 @@ ValueTrackerResult ValueTracker::getNext
+ }
+ 
+ ValueTrackerResult ValueTracker::getNextSource() {
+-  // If we reach a point where we cannot move up in the use-def chain,
+-  // there is nothing we can get.
+   if (!Def)
+     return ValueTrackerResult();
+ 
+   ValueTrackerResult Res = getNextSourceImpl();
+   if (Res.isValid()) {
+-    // Update definition, definition index, and subregister for the
+-    // next call of getNextSource.
+-    // Update the current register.
+     bool OneRegSrc = Res.getNumSources() == 1;
+     if (OneRegSrc)
+       Reg = Res.getSrcReg(0);
+-    // Update the result before moving up in the use-def chain
+-    // with the instruction containing the last found sources.
++
+     Res.setInst(Def);
+ 
+-    // If we can still move up in the use-def chain, move to the next
+-    // definition.
+     if (!Reg.isPhysical() && OneRegSrc) {
+       MachineRegisterInfo::def_iterator DI = MRI.def_begin(Reg);
+       if (DI != MRI.def_end()) {
+@@ -2221,9 +1744,7 @@ ValueTrackerResult ValueTracker::getNext
+       return Res;
+     }
+   }
+-  // If we end up here, this means we will not be able to find another source
+-  // for the next iteration. Make sure any new call to getNextSource bails out
+-  // early by cutting the use-def chain.
++
+   Def = nullptr;
+   return Res;
+ }
+
 --- a/llvm/lib/CodeGen/TargetInstrInfo.cpp	2026-05-05 19:07:53.546132784 +0200
 +++ b/llvm/lib/CodeGen/TargetInstrInfo.cpp	2026-05-05 19:12:29.258239384 +0200
 @@ -816,20 +816,23 @@ MachineInstr *TargetInstrInfo::foldMemor
@@ -101,1494 +3076,7 @@
 
 
 --- a/llvm/lib/Transforms/Scalar/DFAJumpThreading.cpp	2026-05-03 12:04:14.478843240 +0200
-+++ b/llvm/lib/Transforms/Scalar/DFAJumpThreading.cpp	2026-05-05 12:15:36.617542747 +0200
-@@ -18,7 +18,7 @@
- //       determinator            det.2   det.3  det.1
- //        br sw.bb                /        |        \
- //                          sw.bb.2     sw.bb.3     sw.bb.1
--//                           br case2    br case3    br case1§
-+//                           br case2    br case3    br case1
- //
- // Definitions and Terminology:
- //
-@@ -60,9 +60,12 @@
- #include "llvm/Transforms/Scalar/DFAJumpThreading.h"
- #include "llvm/ADT/APInt.h"
- #include "llvm/ADT/DenseMap.h"
-+#include "llvm/ADT/DenseSet.h"
- #include "llvm/ADT/Statistic.h"
- #include "llvm/ADT/StringExtras.h"
- #include "llvm/Analysis/AssumptionCache.h"
-+#include "llvm/Analysis/BlockFrequencyInfo.h"
-+#include "llvm/Analysis/BranchProbabilityInfo.h"
- #include "llvm/Analysis/CodeMetrics.h"
- #include "llvm/Analysis/DomTreeUpdater.h"
- #include "llvm/Analysis/LoopInfo.h"
-@@ -76,7 +79,9 @@
- #include "llvm/Transforms/Utils/Cloning.h"
- #include "llvm/Transforms/Utils/SSAUpdaterBulk.h"
- #include "llvm/Transforms/Utils/ValueMapper.h"
-+#include <cmath>
- #include <deque>
-+#include <limits>
- 
- #ifdef EXPENSIVE_CHECKS
- #include "llvm/IR/Verifier.h"
-@@ -89,6 +94,8 @@ using namespace llvm;
- STATISTIC(NumTransforms, "Number of transformations done");
- STATISTIC(NumCloned, "Number of blocks cloned");
- STATISTIC(NumPaths, "Number of individual paths threaded");
-+STATISTIC(NumHotPathsPruned,
-+          "Number of threading paths pruned by hot-path budget");
- 
- namespace llvm {
- static cl::opt<bool>
-@@ -134,8 +141,37 @@ static cl::opt<unsigned>
-                                "accepted for the transformation"),
-                       cl::Hidden, cl::init(40));
- 
--extern cl::opt<bool> ProfcheckDisableMetadataFixes;
-+static cl::opt<bool> HotPathHeuristic(
-+    "dfa-hot-path-heuristic",
-+    cl::desc("Prioritize and prune DFA threading paths by block frequency"),
-+    cl::Hidden, cl::init(true));
-+
-+static cl::opt<unsigned> HotPathCloneBudgetInst(
-+    "dfa-hot-path-clone-budget-inst",
-+    cl::desc("Instruction clone budget used by hot-path pruning (0 = unlimited)"),
-+    cl::Hidden, cl::init(250));
-+
-+static cl::opt<bool> TracePathHeuristic(
-+    "dfa-trace-path-heuristic",
-+    cl::desc("Prefer trace-like threading paths (fewer side exits/header crossings)"),
-+    cl::Hidden, cl::init(true));
-+
-+static cl::opt<bool> EntropyProfitabilityHeuristic(
-+    "dfa-entropy-profitability",
-+    cl::desc("Adjust DFA profitability threshold by switch branch entropy"),
-+    cl::Hidden, cl::init(true));
- 
-+static cl::opt<unsigned> RegionCloneBudgetInst(
-+    "dfa-region-clone-budget-inst",
-+    cl::desc("Absolute max instructions cloned per DFA transform (0 = unlimited)"),
-+    cl::Hidden, cl::init(1200));
-+
-+static cl::opt<double> MaxLoopCloneRate(
-+    "dfa-max-loop-clone-rate",
-+    cl::desc("Max cloned/original instruction ratio within containing loop"),
-+    cl::Hidden, cl::init(2.0));
-+
-+extern cl::opt<bool> ProfcheckDisableMetadataFixes;
- } // namespace llvm
- 
- namespace {
-@@ -155,39 +191,49 @@ public:
- class DFAJumpThreading {
- public:
-   DFAJumpThreading(AssumptionCache *AC, DomTreeUpdater *DTU, LoopInfo *LI,
--                   TargetTransformInfo *TTI, OptimizationRemarkEmitter *ORE)
--      : AC(AC), DTU(DTU), LI(LI), TTI(TTI), ORE(ORE) {}
-+                   TargetTransformInfo *TTI, OptimizationRemarkEmitter *ORE,
-+                   BlockFrequencyInfo *BFI, BranchProbabilityInfo *BPI)
-+      : AC(AC), DTU(DTU), LI(LI), TTI(TTI), ORE(ORE), BFI(BFI), BPI(BPI) {}
- 
-   bool run(Function &F);
-   bool LoopInfoBroken;
- 
- private:
--  void
--  unfoldSelectInstrs(const SmallVector<SelectInstToUnfold, 4> &SelectInsts) {
-+  void unfoldSelectInstrs(const SmallVector<SelectInstToUnfold, 4> &SelectInsts) {
-     SmallVector<SelectInstToUnfold, 4> Stack(SelectInsts);
-+    SmallPtrSet<SelectInst *, 16> VisitedSelects;
- 
-     while (!Stack.empty()) {
-       SelectInstToUnfold SIToUnfold = Stack.pop_back_val();
-+      SelectInst *SI = SIToUnfold.getInst();
-+      if (!SI || !VisitedSelects.insert(SI).second)
-+        continue;
- 
--      std::vector<SelectInstToUnfold> NewSIsToUnfold;
--      std::vector<BasicBlock *> NewBBs;
--      unfold(DTU, LI, SIToUnfold, &NewSIsToUnfold, &NewBBs);
-+      SmallVector<SelectInstToUnfold, 4> NewSIsToUnfold;
-+      SmallVector<BasicBlock *, 4> NewBBs;
-+      unfold(DTU, LI, SIToUnfold, NewSIsToUnfold, NewBBs);
- 
-       // Put newly discovered select instructions into the work list.
--      llvm::append_range(Stack, NewSIsToUnfold);
-+      for (SelectInstToUnfold NewSI : NewSIsToUnfold) {
-+        SelectInst *Inst = NewSI.getInst();
-+        if (Inst && !VisitedSelects.contains(Inst))
-+          Stack.push_back(NewSI);
-+      }
-     }
-   }
- 
-   static void unfold(DomTreeUpdater *DTU, LoopInfo *LI,
-                      SelectInstToUnfold SIToUnfold,
--                     std::vector<SelectInstToUnfold> *NewSIsToUnfold,
--                     std::vector<BasicBlock *> *NewBBs);
-+                     SmallVectorImpl<SelectInstToUnfold> &NewSIsToUnfold,
-+                     SmallVectorImpl<BasicBlock *> &NewBBs);
- 
-   AssumptionCache *AC;
-   DomTreeUpdater *DTU;
-   LoopInfo *LI;
-   TargetTransformInfo *TTI;
-   OptimizationRemarkEmitter *ORE;
-+  BlockFrequencyInfo *BFI;
-+  BranchProbabilityInfo *BPI;
- };
- } // namespace
- 
-@@ -198,55 +244,51 @@ private:
- /// created basic blocks into \p NewBBs.
- ///
- /// TODO: merge it with CodeGenPrepare::optimizeSelectInst() if possible.
--void DFAJumpThreading::unfold(DomTreeUpdater *DTU, LoopInfo *LI,
--                              SelectInstToUnfold SIToUnfold,
--                              std::vector<SelectInstToUnfold> *NewSIsToUnfold,
--                              std::vector<BasicBlock *> *NewBBs) {
-+void DFAJumpThreading::unfold(
-+    DomTreeUpdater *DTU, LoopInfo *LI, SelectInstToUnfold SIToUnfold,
-+    SmallVectorImpl<SelectInstToUnfold> &NewSIsToUnfold,
-+    SmallVectorImpl<BasicBlock *> &NewBBs) {
-   SelectInst *SI = SIToUnfold.getInst();
-   PHINode *SIUse = SIToUnfold.getUse();
--  assert(SI->hasOneUse());
--  // The select may come indirectly, instead of from where it is defined.
-+  assert(SI->hasOneUse() && "Select must have exactly one use");
-+
-   BasicBlock *StartBlock = SIUse->getIncomingBlock(*SI->use_begin());
-+  Instruction *StartTerm = StartBlock->getTerminator();
- 
--  if (UncondBrInst *StartBlockTerm =
--          dyn_cast<UncondBrInst>(StartBlock->getTerminator())) {
-+  if (auto *StartBlockTerm = dyn_cast<UncondBrInst>(StartTerm)) {
-     BasicBlock *EndBlock = StartBlock->getUniqueSuccessor();
--    // Arbitrarily choose the 'false' side for a new input value to the PHI.
-     BasicBlock *NewBlock = BasicBlock::Create(
-         SI->getContext(), Twine(SI->getName(), ".si.unfold.false"),
-         EndBlock->getParent(), EndBlock);
--    NewBBs->push_back(NewBlock);
-+    NewBBs.push_back(NewBlock);
-     UncondBrInst::Create(EndBlock, NewBlock);
-     DTU->applyUpdates({{DominatorTree::Insert, NewBlock, EndBlock}});
- 
--    // StartBlock
--    //   |  \
--    //   |  NewBlock
--    //   |  /
--    // EndBlock
-     Value *SIOp1 = SI->getTrueValue();
-     Value *SIOp2 = SI->getFalseValue();
- 
--    PHINode *NewPhi = PHINode::Create(SIUse->getType(), 1,
--                                      Twine(SIOp2->getName(), ".si.unfold.phi"),
--                                      NewBlock->getFirstInsertionPt());
-+    PHINode *NewPhi = PHINode::Create(
-+        SIUse->getType(), 1, Twine(SIOp2->getName(), ".si.unfold.phi"),
-+        NewBlock->getFirstInsertionPt());
-     NewPhi->addIncoming(SIOp2, StartBlock);
- 
--    // Update any other PHI nodes in EndBlock.
-     for (PHINode &Phi : EndBlock->phis()) {
-       if (SIUse == &Phi)
-         continue;
--      Phi.addIncoming(Phi.getIncomingValueForBlock(StartBlock), NewBlock);
-+      int Idx = Phi.getBasicBlockIndex(StartBlock);
-+      if (Idx >= 0)
-+        Phi.addIncoming(Phi.getIncomingValue(Idx), NewBlock);
-     }
- 
--    // Update the phi node of SI, which is its only use.
-     if (EndBlock == SIUse->getParent()) {
-       SIUse->addIncoming(NewPhi, NewBlock);
-       SIUse->replaceUsesOfWith(SI, SIOp1);
-     } else {
--      PHINode *EndPhi = PHINode::Create(SIUse->getType(), pred_size(EndBlock),
--                                        Twine(SI->getName(), ".si.unfold.phi"),
--                                        EndBlock->getFirstInsertionPt());
-+      PHINode *EndPhi = PHINode::Create(
-+          SIUse->getType(), pred_size(EndBlock),
-+          Twine(SI->getName(), ".si.unfold.phi"),
-+          EndBlock->getFirstInsertionPt());
-+
-       for (BasicBlock *Pred : predecessors(EndBlock)) {
-         if (Pred != StartBlock && Pred != NewBlock)
-           EndPhi->addIncoming(EndPhi, Pred);
-@@ -259,11 +301,10 @@ void DFAJumpThreading::unfold(DomTreeUpd
-     }
- 
-     if (auto *OpSi = dyn_cast<SelectInst>(SIOp1))
--      NewSIsToUnfold->push_back(SelectInstToUnfold(OpSi, SIUse));
-+      NewSIsToUnfold.push_back(SelectInstToUnfold(OpSi, SIUse));
-     if (auto *OpSi = dyn_cast<SelectInst>(SIOp2))
--      NewSIsToUnfold->push_back(SelectInstToUnfold(OpSi, NewPhi));
-+      NewSIsToUnfold.push_back(SelectInstToUnfold(OpSi, NewPhi));
- 
--    // Insert the real conditional branch based on the original condition.
-     StartBlockTerm->eraseFromParent();
-     auto *BI =
-         CondBrInst::Create(SI->getCondition(), EndBlock, NewBlock, StartBlock);
-@@ -271,8 +312,18 @@ void DFAJumpThreading::unfold(DomTreeUpd
-       BI->setMetadata(LLVMContext::MD_prof,
-                       SI->getMetadata(LLVMContext::MD_prof));
-     DTU->applyUpdates({{DominatorTree::Insert, StartBlock, NewBlock}});
--  } else {
-+
-+  } else if (auto *CondBr = dyn_cast<CondBrInst>(StartTerm)) {
-     BasicBlock *EndBlock = SIUse->getParent();
-+
-+    unsigned NumEdgesToEndBlock = 0;
-+    for (unsigned I = 0, E = CondBr->getNumSuccessors(); I != E; ++I)
-+      if (CondBr->getSuccessor(I) == EndBlock)
-+        ++NumEdgesToEndBlock;
-+
-+    if (NumEdgesToEndBlock != 1)
-+      return;
-+
-     BasicBlock *NewBlockT = BasicBlock::Create(
-         SI->getContext(), Twine(SI->getName(), ".si.unfold.true"),
-         EndBlock->getParent(), EndBlock);
-@@ -280,29 +331,10 @@ void DFAJumpThreading::unfold(DomTreeUpd
-         SI->getContext(), Twine(SI->getName(), ".si.unfold.false"),
-         EndBlock->getParent(), EndBlock);
- 
--    NewBBs->push_back(NewBlockT);
--    NewBBs->push_back(NewBlockF);
-+    NewBBs.push_back(NewBlockT);
-+    NewBBs.push_back(NewBlockF);
- 
--    // Def only has one use in EndBlock.
--    // Before transformation:
--    // StartBlock(Def)
--    //   |      \
--    // EndBlock  OtherBlock
--    //  (Use)
--    //
--    // After transformation:
--    // StartBlock(Def)
--    //   |      \
--    //   |       OtherBlock
--    // NewBlockT
--    //   |     \
--    //   |   NewBlockF
--    //   |      /
--    //   |     /
--    // EndBlock
--    //  (Use)
-     UncondBrInst::Create(EndBlock, NewBlockF);
--    // Insert the real conditional branch based on the original condition.
-     auto *BI =
-         CondBrInst::Create(SI->getCondition(), EndBlock, NewBlockF, NewBlockT);
-     if (!ProfcheckDisableMetadataFixes)
-@@ -325,39 +357,41 @@ void DFAJumpThreading::unfold(DomTreeUpd
-     NewPhiF->addIncoming(FalseVal, NewBlockT);
- 
-     if (auto *TrueSI = dyn_cast<SelectInst>(TrueVal))
--      NewSIsToUnfold->push_back(SelectInstToUnfold(TrueSI, NewPhiT));
-+      NewSIsToUnfold.push_back(SelectInstToUnfold(TrueSI, NewPhiT));
-     if (auto *FalseSi = dyn_cast<SelectInst>(FalseVal))
--      NewSIsToUnfold->push_back(SelectInstToUnfold(FalseSi, NewPhiF));
-+      NewSIsToUnfold.push_back(SelectInstToUnfold(FalseSi, NewPhiF));
- 
-     SIUse->addIncoming(NewPhiT, NewBlockT);
-     SIUse->addIncoming(NewPhiF, NewBlockF);
--    SIUse->removeIncomingValue(StartBlock);
- 
--    // Update any other PHI nodes in EndBlock.
-+    while (SIUse->getBasicBlockIndex(StartBlock) >= 0)
-+      SIUse->removeIncomingValue(StartBlock, /*DeletePHIIfEmpty=*/false);
-+
-     for (PHINode &Phi : EndBlock->phis()) {
-       if (SIUse == &Phi)
-         continue;
--      Phi.addIncoming(Phi.getIncomingValueForBlock(StartBlock), NewBlockT);
--      Phi.addIncoming(Phi.getIncomingValueForBlock(StartBlock), NewBlockF);
--      Phi.removeIncomingValue(StartBlock);
-+      int Idx = Phi.getBasicBlockIndex(StartBlock);
-+      if (Idx >= 0) {
-+        Value *OldVal = Phi.getIncomingValue(Idx);
-+        Phi.addIncoming(OldVal, NewBlockT);
-+        Phi.addIncoming(OldVal, NewBlockF);
-+        while (Phi.getBasicBlockIndex(StartBlock) >= 0)
-+          Phi.removeIncomingValue(StartBlock, /*DeletePHIIfEmpty=*/false);
-+      }
-     }
- 
--    // Update the appropriate successor of the start block to point to the new
--    // unfolded block.
--    CondBrInst *CondBr = cast<CondBrInst>(StartBlock->getTerminator());
-     unsigned SuccNum = CondBr->getSuccessor(1) == EndBlock ? 1 : 0;
-     CondBr->setSuccessor(SuccNum, NewBlockT);
-     DTU->applyUpdates({{DominatorTree::Delete, StartBlock, EndBlock},
-                        {DominatorTree::Insert, StartBlock, NewBlockT}});
-+  } else {
-+    return;
-   }
- 
--  // Preserve loop info
--  if (Loop *L = LI->getLoopFor(StartBlock)) {
--    for (BasicBlock *NewBB : *NewBBs)
-+  if (Loop *L = LI->getLoopFor(StartBlock))
-+    for (BasicBlock *NewBB : NewBBs)
-       L->addBasicBlockToLoop(NewBB, *LI);
--  }
- 
--  // The select is now dead.
-   assert(SI->use_empty() && "Select must be dead now");
-   SI->eraseFromParent();
- }
-@@ -374,7 +408,7 @@ typedef std::vector<PathType> PathsType;
- typedef SmallPtrSet<const BasicBlock *, 8> VisitedBlocks;
- typedef std::vector<ClonedBlock> CloneList;
- 
--// This data structure keeps track of all blocks that have been cloned.  If two
-+// This data structure keeps track of all blocks that have been cloned. If two
- // different ThreadingPaths clone the same block for a certain state it should
- // be reused, and it can be looked up in this map.
- typedef DenseMap<BasicBlock *, CloneList> DuplicateBlockMap;
-@@ -702,6 +736,13 @@ private:
-     }
- 
-     Visited.insert(BB);
-+
-+    struct EraseOnExit {
-+      VisitedBlocks &Visited;
-+      BasicBlock *BB;
-+      ~EraseOnExit() { Visited.erase(BB); }
-+    } Guard{Visited, BB};
-+
-     if (++NumVisited > MaxNumVisitiedPaths)
-       return Res;
- 
-@@ -730,6 +771,7 @@ private:
-         continue;
- 
-       auto *CurrLoop = LI->getLoopFor(BB);
-+      assert(CurrLoop && "BB in SwitchOuterLoop must have a containing loop");
-       // Unlikely to be beneficial.
-       if (Succ == CurrLoop->getHeader())
-         continue;
-@@ -745,10 +787,7 @@ private:
-         Res.push_back(Path);
-       }
-     }
--    // This block could now be visited again from a different predecessor. Note
--    // that this will result in exponential runtime. Subpaths could possibly be
--    // cached but it takes a lot of memory to store them.
--    Visited.erase(BB);
-+
-     return Res;
-   }
- 
-@@ -756,18 +795,22 @@ private:
-   /// PHI nodes in those blocks that define the state.
-   StateDefMap getStateDefMap() const {
-     StateDefMap Res;
-+    DenseSet<const BasicBlock *> MultipleDefBBs;
-     PHINode *FirstDef = dyn_cast<PHINode>(Switch->getOperand(0));
-     assert(FirstDef && "The first definition must be a phi.");
- 
-     SmallVector<PHINode *, 8> Stack;
-     Stack.push_back(FirstDef);
-     SmallPtrSet<Value *, 16> SeenValues;
-+    SeenValues.insert(FirstDef);
- 
-     while (!Stack.empty()) {
-       PHINode *CurPhi = Stack.pop_back_val();
-+      BasicBlock *CurDefBlock = CurPhi->getParent();
- 
--      Res[CurPhi->getParent()] = CurPhi;
--      SeenValues.insert(CurPhi);
-+      auto [It, Inserted] = Res.try_emplace(CurDefBlock, CurPhi);
-+      if (!Inserted && It->second != CurPhi)
-+        MultipleDefBBs.insert(CurDefBlock);
- 
-       for (BasicBlock *IncomingBB : CurPhi->blocks()) {
-         PHINode *IncomingPhi =
-@@ -775,13 +818,20 @@ private:
-         if (!IncomingPhi)
-           continue;
-         bool IsOutsideLoops = !SwitchOuterLoop->contains(IncomingBB);
--        if (SeenValues.contains(IncomingPhi) || IsOutsideLoops)
-+        if (IsOutsideLoops || !SeenValues.insert(IncomingPhi).second)
-           continue;
- 
-         Stack.push_back(IncomingPhi);
-       }
-     }
- 
-+    // NOTE: If multiple phi definitions exist in a block, we cannot
-+    // thread paths with such block by simple cloning.
-+    for (const BasicBlock *BB : MultipleDefBBs) {
-+      LLVM_DEBUG(dbgs() << "Not a state-defining block: Multiple defs in "
-+                        << BB->getNameOrAsOperand() << "\n");
-+      Res.erase(BB);
-+    }
-     return Res;
-   }
- 
-@@ -852,17 +902,47 @@ private:
-   // Unify the states in different threading path if the states are equivalent.
-   void unifyTPaths() {
-     SmallDenseMap<BasicBlock *, APInt> DestToState;
-+    SmallDenseMap<BasicBlock *, bool> DestDistinguishes;
-+
-     for (ThreadingPath &Path : TPaths) {
-       APInt NextState = Path.getExitValue();
-       BasicBlock *Dest = getNextCaseSuccessor(NextState);
-+
-       auto [StateIt, Inserted] = DestToState.try_emplace(Dest, NextState);
-       if (Inserted)
-         continue;
--      if (NextState != StateIt->second) {
--        LLVM_DEBUG(dbgs() << "Next state in " << Path << " is equivalent to "
--                          << StateIt->second << "\n");
--        Path.setExitValue(StateIt->second);
-+
-+      if (NextState == StateIt->second)
-+        continue;
-+
-+      auto [DistIt, DistInserted] = DestDistinguishes.try_emplace(Dest, false);
-+      if (DistInserted) {
-+        bool Distinguishes = false;
-+        for (PHINode &Phi : Dest->phis()) {
-+          Value *FirstVal = nullptr;
-+          for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I) {
-+            if (Phi.getIncomingBlock(I) != SwitchBlock)
-+              continue;
-+            Value *Incoming = Phi.getIncomingValue(I);
-+            if (!FirstVal)
-+              FirstVal = Incoming;
-+            else if (FirstVal != Incoming) {
-+              Distinguishes = true;
-+              break;
-+            }
-+          }
-+          if (Distinguishes)
-+            break;
-+        }
-+        DistIt->second = Distinguishes;
-       }
-+
-+      if (DistIt->second)
-+        continue;
-+
-+      LLVM_DEBUG(dbgs() << "Next state in " << Path << " is equivalent to "
-+                        << StateIt->second << "\n");
-+      Path.setExitValue(StateIt->second);
-     }
-   }
- 
-@@ -880,11 +960,16 @@ struct TransformDFA {
-   TransformDFA(AllSwitchPaths *SwitchPaths, DomTreeUpdater *DTU,
-                AssumptionCache *AC, TargetTransformInfo *TTI,
-                OptimizationRemarkEmitter *ORE,
--               SmallPtrSet<const Value *, 32> EphValues)
-+               SmallPtrSet<const Value *, 32> EphValues,
-+               BlockFrequencyInfo *BFI, BranchProbabilityInfo *BPI, LoopInfo *LI)
-       : SwitchPaths(SwitchPaths), DTU(DTU), AC(AC), TTI(TTI), ORE(ORE),
--        EphValues(EphValues) {}
-+        EphValues(EphValues), BFI(BFI), BPI(BPI), LI(LI) {}
- 
-   bool run() {
-+    prioritizeAndPruneThreadingPaths();
-+    if (SwitchPaths->getThreadingPaths().empty())
-+      return false;
-+
-     if (isLegalAndProfitableToTransform()) {
-       createAllExitPaths();
-       NumTransforms++;
-@@ -894,6 +979,259 @@ struct TransformDFA {
-   }
- 
- private:
-+  struct PathScore {
-+    unsigned Index = 0;
-+    uint64_t MinFreq = 0;
-+    uint64_t SumFreq = 0;
-+    unsigned SideExits = 0;
-+    unsigned HeaderCrossings = 0;
-+    unsigned Length = 0;
-+  };
-+
-+  void prioritizeAndPruneThreadingPaths() {
-+    if (!HotPathHeuristic)
-+      return;
-+
-+    auto &Paths = SwitchPaths->getThreadingPaths();
-+    if (Paths.size() <= 1)
-+      return;
-+
-+    BasicBlock *SwitchBlock = SwitchPaths->getSwitchBlock();
-+
-+    auto stateSeen = [](DenseMap<BasicBlock *, SmallVector<APInt, 4>> &Seen,
-+                        BasicBlock *BB, const APInt &State) -> bool {
-+      auto It = Seen.find(BB);
-+      if (It == Seen.end())
-+        return false;
-+      return llvm::any_of(It->second, [&](const APInt &S) { return S == State; });
-+    };
-+
-+    auto markStateSeen = [](DenseMap<BasicBlock *, SmallVector<APInt, 4>> &Seen,
-+                            BasicBlock *BB, const APInt &State) {
-+      Seen[BB].push_back(State);
-+    };
-+
-+    auto computeScore = [&](const ThreadingPath &TPath, unsigned Idx) -> PathScore {
-+      PathScore S;
-+      S.Index = Idx;
-+
-+      const PathType &PathBBs = TPath.getPath();
-+      const BasicBlock *Determinator = TPath.getDeterminatorBB();
-+      auto It = llvm::find(PathBBs, Determinator);
-+      if (It == PathBBs.end())
-+        return S;
-+
-+      if (!PathBBs.empty() && PathBBs.front() == Determinator)
-+        ++It;
-+      if (It == PathBBs.end())
-+        return S;
-+
-+      SmallPtrSet<const BasicBlock *, 32> PathSet(PathBBs.begin(), PathBBs.end());
-+
-+      uint64_t MinF = std::numeric_limits<uint64_t>::max();
-+      uint64_t SumF = 0;
-+      unsigned SideExitCount = 0;
-+      unsigned HeaderCount = 0;
-+      unsigned Len = 0;
-+
-+      for (auto Cur = It; Cur != PathBBs.end(); ++Cur) {
-+        BasicBlock *BB = *Cur;
-+        ++Len;
-+
-+        if (BFI) {
-+          uint64_t F = BFI->getBlockFreq(BB).getFrequency();
-+          MinF = std::min(MinF, F);
-+          SumF += F;
-+        }
-+
-+        if (TracePathHeuristic) {
-+          if (LI && LI->isLoopHeader(BB))
-+            ++HeaderCount;
-+
-+          for (BasicBlock *Succ : successors(BB)) {
-+            if (!PathSet.contains(Succ))
-+              ++SideExitCount;
-+          }
-+        }
-+      }
-+
-+      if (MinF == std::numeric_limits<uint64_t>::max())
-+        MinF = 0;
-+
-+      S.MinFreq = MinF;
-+      S.SumFreq = SumF;
-+      S.SideExits = SideExitCount;
-+      S.HeaderCrossings = HeaderCount;
-+      S.Length = Len;
-+      return S;
-+    };
-+
-+    using SeenStateMap = DenseMap<BasicBlock *, SmallVector<APInt, 4>>;
-+    auto estimateIncrementalCloneInsts = [&](const ThreadingPath &TPath,
-+                                             SeenStateMap &Seen,
-+                                             bool Commit) -> uint64_t {
-+      uint64_t Cost = 0;
-+      APInt State = TPath.getExitValue();
-+      SmallVector<std::pair<BasicBlock *, unsigned>, 16> Touched;
-+      Touched.reserve(8);
-+
-+      auto markSeen = [&](BasicBlock *BB) {
-+        unsigned OldSize = Seen[BB].size();
-+        markStateSeen(Seen, BB, State);
-+        Touched.push_back({BB, OldSize});
-+      };
-+
-+      // Switch block is always cloned per state.
-+      if (!stateSeen(Seen, SwitchBlock, State)) {
-+        Cost += SwitchBlock->size();
-+        markSeen(SwitchBlock);
-+      }
-+
-+      const PathType &PathBBs = TPath.getPath();
-+      const BasicBlock *Determinator = TPath.getDeterminatorBB();
-+
-+      auto It = llvm::find(PathBBs, Determinator);
-+      if (It == PathBBs.end())
-+        return Cost;
-+
-+      if (!PathBBs.empty() && PathBBs.front() == Determinator)
-+        ++It;
-+
-+      for (; It != PathBBs.end(); ++It) {
-+        BasicBlock *BB = *It;
-+        if (stateSeen(Seen, BB, State))
-+          continue;
-+        Cost += BB->size();
-+        markSeen(BB);
-+      }
-+
-+      if (!Commit) {
-+        for (auto RIt = Touched.rbegin(), RE = Touched.rend(); RIt != RE; ++RIt) {
-+          BasicBlock *BB = RIt->first;
-+          unsigned OldSize = RIt->second;
-+          auto ItSeen = Seen.find(BB);
-+          if (ItSeen == Seen.end())
-+            continue;
-+          ItSeen->second.resize(OldSize);
-+          if (OldSize == 0)
-+            Seen.erase(ItSeen);
-+        }
-+      }
-+
-+      return Cost;
-+    };
-+
-+    SmallVector<PathScore, 16> Ranked;
-+    Ranked.reserve(Paths.size());
-+    for (unsigned I = 0, E = Paths.size(); I != E; ++I)
-+      Ranked.push_back(computeScore(Paths[I], I));
-+
-+    llvm::stable_sort(Ranked, [](const PathScore &A, const PathScore &B) {
-+      if (A.MinFreq != B.MinFreq)
-+        return A.MinFreq > B.MinFreq;
-+      if (A.SideExits != B.SideExits)
-+        return A.SideExits < B.SideExits;
-+      if (A.HeaderCrossings != B.HeaderCrossings)
-+        return A.HeaderCrossings < B.HeaderCrossings;
-+      if (A.SumFreq != B.SumFreq)
-+        return A.SumFreq > B.SumFreq;
-+      if (A.Length != B.Length)
-+        return A.Length < B.Length;
-+      return A.Index < B.Index;
-+    });
-+
-+    const uint64_t Budget = HotPathCloneBudgetInst.getValue();
-+    const bool Unlimited = (Budget == 0);
-+
-+    SeenStateMap SeenPairs;
-+    SmallVector<ThreadingPath, 16> Selected;
-+    Selected.reserve(Paths.size());
-+
-+    uint64_t UsedBudget = 0;
-+    unsigned FallbackIdx = Ranked.empty() ? 0 : Ranked.front().Index;
-+
-+    for (const PathScore &S : Ranked) {
-+      ThreadingPath &Path = Paths[S.Index];
-+
-+      uint64_t Inc = estimateIncrementalCloneInsts(Path, SeenPairs, false);
-+
-+      if (!Unlimited && UsedBudget + Inc > Budget)
-+        continue;
-+
-+      estimateIncrementalCloneInsts(Path, SeenPairs, true);
-+      UsedBudget += Inc;
-+      Selected.push_back(Path);
-+    }
-+
-+    if (Selected.empty() && !Paths.empty()) {
-+      Selected.push_back(Paths[FallbackIdx]);
-+      NumHotPathsPruned += Paths.size() - 1;
-+      Paths = std::vector<ThreadingPath>(Selected.begin(), Selected.end());
-+      return;
-+    }
-+
-+    if (Selected.size() < Paths.size())
-+      NumHotPathsPruned += (Paths.size() - Selected.size());
-+
-+    Paths = std::vector<ThreadingPath>(Selected.begin(), Selected.end());
-+  }
-+
-+  uint64_t getContainingLoopInstCount() const {
-+    if (!LI)
-+      return 0;
-+    BasicBlock *SwitchBB = SwitchPaths->getSwitchBlock();
-+    Loop *L = LI->getLoopFor(SwitchBB);
-+    if (!L)
-+      return 0;
-+
-+    uint64_t Count = 0;
-+    for (BasicBlock *BB : L->blocks())
-+      Count += BB->size();
-+    return Count;
-+  }
-+
-+  unsigned getEntropyAdjustedThreshold(const SwitchInst *Switch) const {
-+    if (!EntropyProfitabilityHeuristic || !BPI)
-+      return CostThreshold;
-+
-+    const BasicBlock *SwitchBB = Switch->getParent();
-+    unsigned NSucc = Switch->getNumSuccessors();
-+    if (NSucc <= 1)
-+      return CostThreshold;
-+
-+    double Entropy = 0.0;
-+    double MaxP = 0.0;
-+
-+    for (unsigned I = 0; I < NSucc; ++I) {
-+      BranchProbability P = BPI->getEdgeProbability(SwitchBB, I);
-+      double Pd = static_cast<double>(P.getNumerator()) /
-+      static_cast<double>(P.getDenominator());
-+      MaxP = std::max(MaxP, Pd);
-+      if (Pd > 0.0)
-+        Entropy -= Pd * std::log2(Pd);
-+    }
-+
-+    double MaxEntropy = std::log2(static_cast<double>(NSucc));
-+    double NormEntropy = (MaxEntropy > 0.0) ? (Entropy / MaxEntropy) : 0.0;
-+    NormEntropy = std::max(0.0, std::min(1.0, NormEntropy));
-+
-+    // Threshold scale:
-+    // - high entropy (harder predictability) => larger threshold (accept more)
-+    // - high dominance (easy predictability) => smaller threshold
-+    int EntropyScale = 900 + static_cast<int>(std::llround(350.0 * NormEntropy));
-+    int DominancePenalty = 0;
-+    if (MaxP > 0.70)
-+      DominancePenalty = static_cast<int>(
-+        std::llround(((MaxP - 0.70) / 0.30) * 200.0)); // up to 200 permille
-+
-+      int ScalePermille = std::max(700, std::min(1300, EntropyScale - DominancePenalty));
-+    uint64_t Adjusted =
-+    (static_cast<uint64_t>(CostThreshold) * static_cast<uint64_t>(ScalePermille) + 999) /
-+    1000;
-+
-+    return static_cast<unsigned>(std::max<uint64_t>(1, Adjusted));
-+  }
-+
-   /// This function performs both a legality check and profitability check at
-   /// the same time since it is convenient to do so. It iterates through all
-   /// blocks that will be cloned, and keeps track of the duplication cost. It
-@@ -911,11 +1249,11 @@ private:
-     // just being used to ensure (BB, State) pairs are only counted once.
-     DuplicateBlockMap DuplicateMap;
-     for (ThreadingPath &TPath : SwitchPaths->getThreadingPaths()) {
--      PathType PathBBs = TPath.getPath();
-+      const PathType &PathBBs = TPath.getPath();
-       APInt NextState = TPath.getExitValue();
-       const BasicBlock *Determinator = TPath.getDeterminatorBB();
- 
--      // Update Metrics for the Switch block, this is always cloned
-+      // Update Metrics for the Switch block, this is always cloned.
-       BasicBlock *BB = SwitchPaths->getSwitchBlock();
-       BasicBlock *VisitedBB = getClonedBB(BB, NextState, DuplicateMap);
-       if (!VisitedBB) {
-@@ -926,13 +1264,13 @@ private:
- 
-       // If the Switch block is the Determinator, then we can continue since
-       // this is the only block that is cloned and we already counted for it.
--      if (PathBBs.front() == Determinator)
-+      if (!PathBBs.empty() && PathBBs.front() == Determinator)
-         continue;
- 
-       // Otherwise update Metrics for all blocks that will be cloned. If any
-       // block is already cloned and would be reused, don't double count it.
-       auto DetIt = llvm::find(PathBBs, Determinator);
--      for (auto BBIt = DetIt; BBIt != PathBBs.end(); BBIt++) {
-+      for (auto BBIt = DetIt; BBIt != PathBBs.end(); ++BBIt) {
-         BB = *BBIt;
-         VisitedBB = getClonedBB(BB, NextState, DuplicateMap);
-         if (VisitedBB)
-@@ -968,25 +1306,46 @@ private:
-         LLVM_DEBUG(dbgs() << "DFA Jump Threading: Not jump threading, contains "
-                           << "instructions with invalid cost.\n");
-         ORE->emit([&]() {
--          return OptimizationRemarkMissed(DEBUG_TYPE, "ConvergentInst", Switch)
-+          return OptimizationRemarkMissed(DEBUG_TYPE, "InvalidCost", Switch)
-                  << "Contains instructions with invalid cost.";
-         });
-         return false;
-       }
-     }
- 
--    // Too much cloned instructions slow down later optimizations, especially
--    // SLPVectorizer.
--    // TODO: Thread the switch partially before reaching the threshold.
-     uint64_t NumOrigInst = 0;
-     uint64_t NumOuterUseBlock = 0;
--    for (auto *BB : DuplicateMap.keys()) {
-+    for (BasicBlock *BB : DuplicateMap.keys()) {
-       NumOrigInst += BB->size();
-       // Only unduplicated blocks with single predecessor require new phi
-       // nodes.
--      for (auto *Succ : successors(BB))
-+      for (BasicBlock *Succ : successors(BB))
-         if (!DuplicateMap.count(Succ) && Succ->getSinglePredecessor())
--          NumOuterUseBlock++;
-+          ++NumOuterUseBlock;
-+    }
-+
-+    if (NumOrigInst == 0)
-+      return false;
-+
-+    if (RegionCloneBudgetInst != 0 && NumClonedInst > RegionCloneBudgetInst) {
-+      ORE->emit([&]() {
-+        return OptimizationRemarkMissed(DEBUG_TYPE, "NotProfitable", Switch)
-+               << "Cloned instructions exceed region budget.";
-+      });
-+      return false;
-+    }
-+
-+    uint64_t LoopInstCount = getContainingLoopInstCount();
-+    if (LoopInstCount > 0) {
-+      double LoopCloneRate = static_cast<double>(NumClonedInst) /
-+                             static_cast<double>(LoopInstCount);
-+      if (LoopCloneRate > MaxLoopCloneRate) {
-+        ORE->emit([&]() {
-+          return OptimizationRemarkMissed(DEBUG_TYPE, "NotProfitable", Switch)
-+                 << "Cloned instructions exceed max loop clone rate.";
-+        });
-+        return false;
-+      }
-     }
- 
-     if (double(NumClonedInst) / double(NumOrigInst) > MaxClonedRate) {
-@@ -1000,9 +1359,7 @@ private:
-     }
- 
-     // Too much unduplicated blocks with outer uses may cause too much
--    // insertions of phi nodes for duplicated definitions. TODO: Drop this
--    // threshold if we come up with another way to reduce the number of inserted
--    // phi nodes.
-+    // insertions of phi nodes for duplicated definitions.
-     if (NumOuterUseBlock > MaxOuterUseBlocks) {
-       LLVM_DEBUG(dbgs() << "DFA Jump Threading: Not jump threading, too much "
-                            "blocks with outer uses\n");
-@@ -1029,26 +1386,26 @@ private:
-       DuplicationCost = Metrics.NumInsts / CondBranches;
-     } else {
-       // Compared with jump tables, the DFA optimizer removes an indirect branch
--      // on each loop iteration, thus making branch prediction more precise. The
--      // more branch targets there are, the more likely it is for the branch
--      // predictor to make a mistake, and the more benefit there is in the DFA
--      // optimizer. Thus, the more branch targets there are, the lower is the
--      // cost of the DFA opt.
-+      // on each loop iteration, thus making branch prediction more precise.
-       DuplicationCost = Metrics.NumInsts / JumpTableSize;
-     }
- 
-+    const unsigned EffectiveThreshold = getEntropyAdjustedThreshold(Switch);
-+
-     LLVM_DEBUG(dbgs() << "\nDFA Jump Threading: Cost to jump thread block "
-                       << SwitchPaths->getSwitchBlock()->getName()
--                      << " is: " << DuplicationCost << "\n\n");
-+                      << " is: " << DuplicationCost
-+                      << ", threshold: " << EffectiveThreshold << "\n\n");
- 
--    if (DuplicationCost > CostThreshold) {
-+    if (DuplicationCost > EffectiveThreshold) {
-       LLVM_DEBUG(dbgs() << "Not jump threading, duplication cost exceeds the "
-                         << "cost threshold.\n");
-       ORE->emit([&]() {
-         return OptimizationRemarkMissed(DEBUG_TYPE, "NotProfitable", Switch)
--               << "Duplication cost exceeds the cost threshold (cost="
-+               << "Duplication cost exceeds the effective threshold (cost="
-                << ore::NV("Cost", DuplicationCost)
--               << ", threshold=" << ore::NV("Threshold", CostThreshold) << ").";
-+               << ", threshold=" << ore::NV("Threshold", EffectiveThreshold)
-+               << ").";
-       });
-       return false;
-     }
-@@ -1061,40 +1418,28 @@ private:
-     return true;
-   }
- 
--  /// Transform each threading path to effectively jump thread the DFA.
-   void createAllExitPaths() {
--    // Move the switch block to the end of the path, since it will be duplicated
--    BasicBlock *SwitchBlock = SwitchPaths->getSwitchBlock();
--    for (ThreadingPath &TPath : SwitchPaths->getThreadingPaths()) {
--      LLVM_DEBUG(dbgs() << TPath << "\n");
--      // TODO: Fix exit path creation logic so that we dont need this
--      // placeholder.
--      TPath.push_front(SwitchBlock);
--    }
--
--    // Transform the ThreadingPaths and keep track of the cloned values
--    DuplicateBlockMap DuplicateMap;
-     DefMap NewDefs;
-+    DuplicateBlockMap DuplicateMap;
-+
-+    BasicBlock *SwitchBlock = SwitchPaths->getSwitchBlock();
- 
--    SmallPtrSet<BasicBlock *, 16> BlocksToClean;
-+    SmallPtrSet<BasicBlock *, 32> BlocksToClean;
-     BlocksToClean.insert_range(successors(SwitchBlock));
-+    BlocksToClean.insert(SwitchBlock);
- 
-     for (const ThreadingPath &TPath : SwitchPaths->getThreadingPaths()) {
-       createExitPath(NewDefs, TPath, DuplicateMap, BlocksToClean, DTU);
--      NumPaths++;
-+      ++NumPaths;
-     }
- 
--    // After all paths are cloned, now update the last successor of the cloned
--    // path so it skips over the switch statement
-     for (const ThreadingPath &TPath : SwitchPaths->getThreadingPaths())
-       updateLastSuccessor(TPath, DuplicateMap, DTU);
- 
--    // For each instruction that was cloned and used outside, update its uses
--    updateSSA(NewDefs);
--
--    // Clean PHI Nodes for the newly created blocks
-     for (BasicBlock *BB : BlocksToClean)
-       cleanPhiNodes(BB);
-+
-+    updateSSA(NewDefs);
-   }
- 
-   /// For a specific ThreadingPath \p Path, create an exit path starting from
-@@ -1105,34 +1450,40 @@ private:
-   /// the predecessors, and phis in the successor blocks.
-   void createExitPath(DefMap &NewDefs, const ThreadingPath &Path,
-                       DuplicateBlockMap &DuplicateMap,
--                      SmallPtrSet<BasicBlock *, 16> &BlocksToClean,
-+                      SmallPtrSetImpl<BasicBlock *> &BlocksToClean,
-                       DomTreeUpdater *DTU) {
-     APInt NextState = Path.getExitValue();
-     const BasicBlock *Determinator = Path.getDeterminatorBB();
--    PathType PathBBs = Path.getPath();
-+    const PathType &PathBBs = Path.getPath();
- 
--    // Don't select the placeholder block in front
--    if (PathBBs.front() == Determinator)
--      PathBBs.pop_front();
-+    if (PathBBs.empty())
-+      return;
- 
-     auto DetIt = llvm::find(PathBBs, Determinator);
--    // When there is only one BB in PathBBs, the determinator takes itself as a
--    // direct predecessor.
--    BasicBlock *PrevBB = PathBBs.size() == 1 ? *DetIt : *std::prev(DetIt);
--    for (auto BBIt = DetIt; BBIt != PathBBs.end(); BBIt++) {
-+    if (DetIt == PathBBs.end())
-+      return;
-+
-+    auto BeginIt = DetIt;
-+    if (PathBBs.front() == Determinator && std::next(BeginIt) != PathBBs.end())
-+      ++BeginIt;
-+
-+    BasicBlock *PrevBB =
-+        (BeginIt != PathBBs.begin()) ? *std::prev(BeginIt) : *BeginIt;
-+
-+    for (auto BBIt = BeginIt; BBIt != PathBBs.end(); ++BBIt) {
-       BasicBlock *BB = *BBIt;
-       BlocksToClean.insert(BB);
- 
--      // We already cloned BB for this NextState, now just update the branch
--      // and continue.
--      BasicBlock *NextBB = getClonedBB(BB, NextState, DuplicateMap);
--      if (NextBB) {
--        updatePredecessor(PrevBB, BB, NextBB, DTU);
-+      if (BasicBlock *NextBB = getClonedBB(BB, NextState, DuplicateMap)) {
-+        if (llvm::is_contained(predecessors(BB), PrevBB))
-+          updatePredecessor(PrevBB, BB, NextBB, DTU);
-         PrevBB = NextBB;
-         continue;
-       }
- 
--      // Clone the BB and update the successor of Prev to jump to the new block
-+      if (!llvm::is_contained(predecessors(BB), PrevBB))
-+        return;
-+
-       BasicBlock *NewBB = cloneBlockAndUpdatePredecessor(
-           BB, PrevBB, NextState, DuplicateMap, NewDefs, DTU);
-       DuplicateMap[BB].push_back({NewBB, NextState});
-@@ -1154,7 +1505,7 @@ private:
-     for (const auto &KV : NewDefs) {
-       Instruction *I = KV.first;
-       BasicBlock *BB = I->getParent();
--      std::vector<Instruction *> Cloned = KV.second;
-+      const std::vector<Instruction *> &Cloned = KV.second;
- 
-       // Scan all uses of this instruction to see if it is used outside of its
-       // block, and if so, record them in UsesToRename.
-@@ -1177,9 +1528,8 @@ private:
-       LLVM_DEBUG(dbgs() << "DFA-JT: Renaming non-local uses of: " << *I
-                         << "\n");
- 
--      // We found a use of I outside of BB.  Rename all uses of I that are
--      // outside its block to be uses of the appropriate PHI node etc.  See
--      // ValuesInBlocks with the values we know.
-+      // We found a use of I outside of BB. Rename all uses of I that are
-+      // outside its block to be uses of the appropriate PHI node etc.
-       unsigned VarNum = SSAUpdate.AddVariable(I->getName(), I->getType());
-       SSAUpdate.AddAvailableValue(VarNum, BB, I);
-       for (Instruction *New : Cloned)
-@@ -1197,20 +1547,17 @@ private:
- 
-   /// Helper to get the successor corresponding to a particular case value for
-   /// a switch statement.
--  /// TODO: Unify it with SwitchPaths->getNextCaseSuccessor(SwitchInst *Switch)
--  /// by updating cached value => successor mapping during threading.
--  static BasicBlock *getNextCaseSuccessor(SwitchInst *Switch,
--                                          const APInt &NextState) {
--    BasicBlock *NextCase = nullptr;
--    for (auto Case : Switch->cases()) {
--      if (Case.getCaseValue()->getValue() == NextState) {
--        NextCase = Case.getCaseSuccessor();
--        break;
--      }
-+  BasicBlock *getNextCaseSuccessor(const APInt &NextState) {
-+    if (CaseValToDestCache.empty()) {
-+      SwitchInst *Switch = SwitchPaths->getSwitchInst();
-+      for (auto Case : Switch->cases())
-+        CaseValToDestCache[Case.getCaseValue()->getValue()] =
-+            Case.getCaseSuccessor();
-+      DefaultDestCache = Switch->getDefaultDest();
-     }
--    if (!NextCase)
--      NextCase = Switch->getDefaultDest();
--    return NextCase;
-+
-+    auto It = CaseValToDestCache.find(NextState);
-+    return It == CaseValToDestCache.end() ? DefaultDestCache : It->second;
-   }
- 
-   /// Clones a basic block, and adds it to the CFG.
-@@ -1218,115 +1565,169 @@ private:
-   /// This function also includes updating phi nodes in the successors of the
-   /// BB, and remapping uses that were defined locally in the cloned BB.
-   BasicBlock *cloneBlockAndUpdatePredecessor(BasicBlock *BB, BasicBlock *PrevBB,
--                                             const APInt &NextState,
--                                             DuplicateBlockMap &DuplicateMap,
--                                             DefMap &NewDefs,
--                                             DomTreeUpdater *DTU) {
-+                                            const APInt &NextState,
-+                                            DuplicateBlockMap &DuplicateMap,
-+                                            DefMap &NewDefs,
-+                                            DomTreeUpdater *DTU) {
-     ValueToValueMapTy VMap;
-     BasicBlock *NewBB = CloneBasicBlock(
-         BB, VMap, ".jt" + std::to_string(NextState.getLimitedValue()),
-         BB->getParent());
-     NewBB->moveAfter(BB);
--    NumCloned++;
-+    ++NumCloned;
- 
-     for (Instruction &I : *NewBB) {
--      // Do not remap operands of PHINode in case a definition in BB is an
--      // incoming value to a phi in the same block. This incoming value will
--      // be renamed later while restoring SSA.
-       if (isa<PHINode>(&I))
-         continue;
-       RemapInstruction(&I, VMap,
--                       RF_IgnoreMissingLocals | RF_NoModuleLevelChanges);
--      if (AssumeInst *II = dyn_cast<AssumeInst>(&I))
-+                      RF_IgnoreMissingLocals | RF_NoModuleLevelChanges);
-+      if (auto *II = dyn_cast<AssumeInst>(&I))
-         AC->registerAssumption(II);
-     }
- 
-     updateSuccessorPhis(BB, NewBB, NextState, VMap, DuplicateMap);
-     updatePredecessor(PrevBB, BB, NewBB, DTU);
-+
-+    // Fresh clones inherit PHI entries for all original predecessors.
-+    // Trim immediately so the IR is valid after this function returns.
-+    cleanPhiNodes(NewBB);
-+
-     updateDefMap(NewDefs, VMap);
- 
--    // Add all successors to the DominatorTree
-     SmallPtrSet<BasicBlock *, 4> SuccSet;
--    for (auto *SuccBB : successors(NewBB)) {
-+    for (BasicBlock *SuccBB : successors(NewBB))
-       if (SuccSet.insert(SuccBB).second)
-         DTU->applyUpdates({{DominatorTree::Insert, NewBB, SuccBB}});
--    }
--    SuccSet.clear();
-+
-     return NewBB;
-   }
- 
-   /// Update the phi nodes in BB's successors.
-   ///
--  /// This means creating a new incoming value from NewBB with the new
-+  /// This means creating a new incoming value from ClonedBB with the new
-   /// instruction wherever there is an incoming value from BB.
-   void updateSuccessorPhis(BasicBlock *BB, BasicBlock *ClonedBB,
--                           const APInt &NextState, ValueToValueMapTy &VMap,
--                           DuplicateBlockMap &DuplicateMap) {
--    std::vector<BasicBlock *> BlocksToUpdate;
--
--    // If BB is the last block in the path, we can simply update the one case
--    // successor that will be reached.
--    if (BB == SwitchPaths->getSwitchBlock()) {
--      SwitchInst *Switch = SwitchPaths->getSwitchInst();
--      BasicBlock *NextCase = getNextCaseSuccessor(Switch, NextState);
--      BlocksToUpdate.push_back(NextCase);
--      BasicBlock *ClonedSucc = getClonedBB(NextCase, NextState, DuplicateMap);
--      if (ClonedSucc)
--        BlocksToUpdate.push_back(ClonedSucc);
--    }
--    // Otherwise update phis in all successors.
--    else {
--      for (BasicBlock *Succ : successors(BB)) {
--        BlocksToUpdate.push_back(Succ);
--
--        // Check if a successor has already been cloned for the particular exit
--        // value. In this case if a successor was already cloned, the phi nodes
--        // in the cloned block should be updated directly.
--        BasicBlock *ClonedSucc = getClonedBB(Succ, NextState, DuplicateMap);
--        if (ClonedSucc)
--          BlocksToUpdate.push_back(ClonedSucc);
--      }
--    }
-+                          const APInt &NextState, ValueToValueMapTy &VMap,
-+                          DuplicateBlockMap &DuplicateMap) {
-+    (void)NextState;
-+    (void)DuplicateMap;
-+
-+    auto GetMappedValue = [&](Value *Incoming) -> Value * {
-+      if (isa<Constant>(Incoming))
-+        return Incoming;
-+      auto It = VMap.find(Incoming);
-+      if (It != VMap.end() && It->second)
-+        return cast<Value>(It->second);
-+      return Incoming;
-+    };
-+
-+    SmallVector<BasicBlock *, 8> UniqueSuccs;
-+    SmallPtrSet<BasicBlock *, 8> SeenSuccs;
-+    for (BasicBlock *Succ : successors(ClonedBB))
-+      if (SeenSuccs.insert(Succ).second)
-+        UniqueSuccs.push_back(Succ);
-+
-+    for (BasicBlock *Succ : UniqueSuccs) {
-+      unsigned EdgeCount = 0;
-+      Instruction *TI = ClonedBB->getTerminator();
-+      for (unsigned I = 0, E = TI->getNumSuccessors(); I != E; ++I)
-+        if (TI->getSuccessor(I) == Succ)
-+          ++EdgeCount;
- 
--    // If there is a phi with an incoming value from BB, create a new incoming
--    // value for the new predecessor ClonedBB. The value will either be the same
--    // value from BB or a cloned value.
--    for (BasicBlock *Succ : BlocksToUpdate) {
-       for (PHINode &Phi : Succ->phis()) {
--        Value *Incoming = Phi.getIncomingValueForBlock(BB);
--        if (Incoming) {
--          if (isa<Constant>(Incoming)) {
--            Phi.addIncoming(Incoming, ClonedBB);
--            continue;
--          }
--          Value *ClonedVal = VMap[Incoming];
--          if (ClonedVal)
--            Phi.addIncoming(ClonedVal, ClonedBB);
--          else
--            Phi.addIncoming(Incoming, ClonedBB);
--        }
-+        SmallVector<Value *, 4> IncomingVals;
-+        for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I)
-+          if (Phi.getIncomingBlock(I) == BB)
-+            IncomingVals.push_back(Phi.getIncomingValue(I));
-+
-+  #ifndef NDEBUG
-+        assert(IncomingVals.size() >= EdgeCount &&
-+              "source PHI must match CFG edge multiplicity");
-+  #endif
-+
-+        unsigned CopyCount = std::min<unsigned>(IncomingVals.size(), EdgeCount);
-+        for (unsigned I = 0; I < CopyCount; ++I)
-+          Phi.addIncoming(GetMappedValue(IncomingVals[I]), ClonedBB);
-+
-+        for (unsigned I = CopyCount; I < EdgeCount; ++I)
-+          Phi.addIncoming(PoisonValue::get(Phi.getType()), ClonedBB);
-       }
-     }
-   }
- 
--  /// Sets the successor of PrevBB to be NewBB instead of OldBB. Note that all
--  /// other successors are kept as well.
-+  /// Sets the successor of PrevBB to be NewBB instead of OldBB, redirecting
-+  /// every parallel edge PrevBB→OldBB at once, and removing the matching
-+  /// number of incoming entries from PHIs in OldBB. Tolerant of PHIs that
-+  /// were already partially trimmed by an earlier path (path sharing); a
-+  /// downstream `cleanPhiNodes(OldBB)` is the canonical recovery point and
-+  /// will trim/extend as needed against the post-redirect edge count.
-   void updatePredecessor(BasicBlock *PrevBB, BasicBlock *OldBB,
--                         BasicBlock *NewBB, DomTreeUpdater *DTU) {
--    // When a path is reused, there is a chance that predecessors were already
--    // updated before. Check if the predecessor needs to be updated first.
--    if (!isPredecessor(OldBB, PrevBB))
-+                        BasicBlock *NewBB, DomTreeUpdater *DTU) {
-+    Instruction *PrevTerm = PrevBB->getTerminator();
-+    SmallVector<unsigned, 4> EdgeIdxs;
-+
-+    for (unsigned I = 0, E = PrevTerm->getNumSuccessors(); I != E; ++I)
-+      if (PrevTerm->getSuccessor(I) == OldBB)
-+        EdgeIdxs.push_back(I);
-+
-+    if (EdgeIdxs.empty())
-       return;
- 
--    Instruction *PrevTerm = PrevBB->getTerminator();
--    for (unsigned Idx = 0; Idx < PrevTerm->getNumSuccessors(); Idx++) {
--      if (PrevTerm->getSuccessor(Idx) == OldBB) {
--        OldBB->removePredecessor(PrevBB, /* KeepOneInputPHIs = */ true);
--        PrevTerm->setSuccessor(Idx, NewBB);
-+    const unsigned RedirectedEdges = EdgeIdxs.size();
-+
-+    {
-+      auto OldRange = OldBB->phis();
-+      auto NewRange = NewBB->phis();
-+      auto OldIt = OldRange.begin();
-+      auto NewIt = NewRange.begin();
-+
-+      for (; OldIt != OldRange.end() && NewIt != NewRange.end();
-+          ++OldIt, ++NewIt) {
-+        PHINode &OldPhi = *OldIt;
-+        PHINode &NewPhi = *NewIt;
-+
-+        unsigned ExistingInNew = 0;
-+        for (unsigned I = 0, E = NewPhi.getNumIncomingValues(); I != E; ++I)
-+          if (NewPhi.getIncomingBlock(I) == PrevBB)
-+            ++ExistingInNew;
-+
-+        if (ExistingInNew >= RedirectedEdges)
-+          continue;
-+
-+        SmallVector<Value *, 4> OldVals;
-+        for (unsigned I = 0, E = OldPhi.getNumIncomingValues(); I != E; ++I)
-+          if (OldPhi.getIncomingBlock(I) == PrevBB)
-+            OldVals.push_back(OldPhi.getIncomingValue(I));
-+
-+        for (unsigned I = ExistingInNew; I < RedirectedEdges; ++I) {
-+          Value *Val =
-+              I < OldVals.size() ? OldVals[I] : PoisonValue::get(NewPhi.getType());
-+          NewPhi.addIncoming(Val, PrevBB);
-+        }
-+      }
-+
-+  #ifndef NDEBUG
-+      assert(OldIt == OldRange.end() && NewIt == NewRange.end() &&
-+            "clone must preserve PHI structure");
-+  #endif
-+    }
-+
-+    for (unsigned Idx : EdgeIdxs)
-+      PrevTerm->setSuccessor(Idx, NewBB);
-+
-+    for (PHINode &Phi : OldBB->phis()) {
-+      unsigned Removed = 0;
-+      for (int I = static_cast<int>(Phi.getNumIncomingValues()) - 1;
-+          I >= 0 && Removed < RedirectedEdges; --I) {
-+        if (Phi.getIncomingBlock(I) != PrevBB)
-+          continue;
-+        Phi.removeIncomingValue(I, /*DeletePHIIfEmpty=*/false);
-+        ++Removed;
-       }
-     }
-+
-     DTU->applyUpdates({{DominatorTree::Delete, PrevBB, OldBB},
--                       {DominatorTree::Insert, PrevBB, NewBB}});
-+                      {DominatorTree::Insert, PrevBB, NewBB}});
-   }
- 
-   /// Add new value mappings to the DefMap to keep track of all new definitions
-@@ -1335,7 +1736,7 @@ private:
-     SmallVector<std::pair<Instruction *, Instruction *>> NewDefsVector;
-     NewDefsVector.reserve(VMap.size());
- 
--    for (auto Entry : VMap) {
-+    for (const auto &Entry : VMap) {
-       Instruction *Inst =
-           dyn_cast<Instruction>(const_cast<Value *>(Entry.first));
-       if (!Inst || !Entry.second ||
-@@ -1368,34 +1769,38 @@ private:
-   void updateLastSuccessor(const ThreadingPath &TPath,
-                            DuplicateBlockMap &DuplicateMap,
-                            DomTreeUpdater *DTU) {
-+    if (TPath.getPath().empty())
-+      return;
-+
-     APInt NextState = TPath.getExitValue();
-     BasicBlock *BB = TPath.getPath().back();
-     BasicBlock *LastBlock = getClonedBB(BB, NextState, DuplicateMap);
- 
--    // Note multiple paths can end at the same block so check that it is not
--    // updated yet
--    if (!isa<SwitchInst>(LastBlock->getTerminator()))
-+    if (!LastBlock)
-       return;
--    SwitchInst *Switch = cast<SwitchInst>(LastBlock->getTerminator());
--    BasicBlock *NextCase = getNextCaseSuccessor(Switch, NextState);
-+
-+    // Multiple paths can end at the same block, so check that it has not
-+    // already been rewritten.
-+    auto *Switch = dyn_cast<SwitchInst>(LastBlock->getTerminator());
-+    if (!Switch)
-+      return;
-+
-+    BasicBlock *NextCase = getNextCaseSuccessor(NextState);
- 
-     std::vector<DominatorTree::UpdateType> DTUpdates;
--    SmallPtrSet<BasicBlock *, 4> SuccSet;
--    for (BasicBlock *Succ : successors(LastBlock)) {
-+    SmallPtrSet<BasicBlock *, 8> SuccSet;
-+
-+    for (BasicBlock *Succ : successors(LastBlock))
-       if (Succ != NextCase && SuccSet.insert(Succ).second)
-         DTUpdates.push_back({DominatorTree::Delete, LastBlock, Succ});
--    }
- 
-     Switch->eraseFromParent();
--    UncondBrInst::Create(NextCase, LastBlock);
-+    BranchInst::Create(NextCase, LastBlock);
- 
-     DTU->applyUpdates(DTUpdates);
-   }
- 
--  /// After cloning blocks, some of the phi nodes have extra incoming values
--  /// that are no longer used. This function removes them.
-   void cleanPhiNodes(BasicBlock *BB) {
--    // If BB is no longer reachable, remove any remaining phi nodes
-     if (pred_empty(BB)) {
-       for (PHINode &PN : make_early_inc_range(BB->phis())) {
-         PN.replaceAllUsesWith(PoisonValue::get(PN.getType()));
-@@ -1404,31 +1809,62 @@ private:
-       return;
-     }
- 
--    // Remove any incoming values that come from an invalid predecessor
--    for (PHINode &Phi : BB->phis())
--      Phi.removeIncomingValueIf([&](unsigned Index) {
--        BasicBlock *IncomingBB = Phi.getIncomingBlock(Index);
--        return !isPredecessor(BB, IncomingBB);
--      });
-+    SmallDenseMap<BasicBlock *, unsigned, 8> PredEdgeCounts;
-+    for (BasicBlock *Pred : predecessors(BB))
-+      ++PredEdgeCounts[Pred];
-+
-+    for (PHINode &Phi : BB->phis()) {
-+      SmallDenseMap<BasicBlock *, unsigned, 8> TotalInPhi;
-+      for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I)
-+        ++TotalInPhi[Phi.getIncomingBlock(I)];
-+
-+      SmallDenseMap<BasicBlock *, unsigned, 8> ToRemove;
-+      for (auto &KV : TotalInPhi) {
-+        unsigned Allowed = PredEdgeCounts.lookup(KV.first);
-+        if (KV.second > Allowed)
-+          ToRemove[KV.first] = KV.second - Allowed;
-+      }
-+
-+      for (unsigned I = 0; I < Phi.getNumIncomingValues();) {
-+        if (Phi.getNumIncomingValues() <= 1)
-+          break;
-+
-+        BasicBlock *IncomingBB = Phi.getIncomingBlock(I);
-+        auto It = ToRemove.find(IncomingBB);
-+        if (It != ToRemove.end() && It->second > 0) {
-+          Phi.removeIncomingValue(I, /*DeletePHIIfEmpty=*/false);
-+          --It->second;
-+          continue;
-+        }
-+        ++I;
-+      }
-+
-+  #ifndef NDEBUG
-+      SmallDenseMap<BasicBlock *, unsigned, 8> Seen;
-+      for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I) {
-+        BasicBlock *IncomingBB = Phi.getIncomingBlock(I);
-+        assert(PredEdgeCounts.lookup(IncomingBB) > 0 &&
-+              "PHI entry from non-predecessor remains after cleanup");
-+        assert(++Seen[IncomingBB] <= PredEdgeCounts.lookup(IncomingBB) &&
-+              "Too many PHI entries remain for predecessor after cleanup");
-+      }
-+  #endif
-+    }
-   }
- 
-   /// Checks if BB was already cloned for a particular next state value. If it
-   /// was then it returns this cloned block, and otherwise null.
-   BasicBlock *getClonedBB(BasicBlock *BB, const APInt &NextState,
-                           DuplicateBlockMap &DuplicateMap) {
--    CloneList ClonedBBs = DuplicateMap[BB];
-+    auto MIt = DuplicateMap.find(BB);
-+    if (MIt == DuplicateMap.end())
-+      return nullptr;
- 
--    // Find an entry in the CloneList with this NextState. If it exists then
--    // return the corresponding BB
--    auto It = llvm::find_if(ClonedBBs, [NextState](const ClonedBlock &C) {
-+    const CloneList &ClonedBBs = MIt->second;
-+    auto It = llvm::find_if(ClonedBBs, [&](const ClonedBlock &C) {
-       return C.State == NextState;
-     });
--    return It != ClonedBBs.end() ? (*It).BB : nullptr;
--  }
--
--  /// Returns true if IncomingBB is a predecessor of BB.
--  bool isPredecessor(BasicBlock *BB, BasicBlock *IncomingBB) {
--    return llvm::is_contained(predecessors(BB), IncomingBB);
-+    return It != ClonedBBs.end() ? It->BB : nullptr;
-   }
- 
-   AllSwitchPaths *SwitchPaths;
-@@ -1438,6 +1874,11 @@ private:
-   OptimizationRemarkEmitter *ORE;
-   SmallPtrSet<const Value *, 32> EphValues;
-   std::vector<ThreadingPath> TPaths;
-+  DenseMap<APInt, BasicBlock *> CaseValToDestCache;
-+  BasicBlock *DefaultDestCache = nullptr;
-+  BlockFrequencyInfo *BFI;
-+  BranchProbabilityInfo *BPI;
-+  LoopInfo *LI;
- };
- } // namespace
- 
-@@ -1484,14 +1925,11 @@ bool DFAJumpThreading::run(Function &F)
-     SwitchPaths.run();
- 
-     if (SwitchPaths.getNumThreadingPaths() > 0) {
--      ThreadableLoops.push_back(SwitchPaths);
-+      ThreadableLoops.push_back(std::move(SwitchPaths));
- 
-       // For the time being limit this optimization to occurring once in a
--      // function since it can change the CFG significantly. This is not a
--      // strict requirement but it can cause buggy behavior if there is an
--      // overlap of blocks in different opportunities. There is a lot of room to
--      // experiment with catching more opportunities here.
--      // NOTE: To release this contraint, we must handle LoopInfo invalidation
-+      // function since it can change the CFG significantly.
-+      // NOTE: To release this contraint, we must handle LoopInfo invalidation.
-       break;
-     }
-   }
-@@ -1501,11 +1939,12 @@ bool DFAJumpThreading::run(Function &F)
- #endif
- 
-   SmallPtrSet<const Value *, 32> EphValues;
--  if (ThreadableLoops.size() > 0)
-+  if (!ThreadableLoops.empty())
-     CodeMetrics::collectEphemeralValues(&F, AC, EphValues);
- 
--  for (AllSwitchPaths SwitchPaths : ThreadableLoops) {
--    TransformDFA Transform(&SwitchPaths, DTU, AC, TTI, ORE, EphValues);
-+  for (AllSwitchPaths &SwitchPaths : ThreadableLoops) {
-+    TransformDFA Transform(&SwitchPaths, DTU, AC, TTI, ORE, EphValues,
-+                           BFI, BPI, LI);
-     if (Transform.run())
-       MadeChanges = LoopInfoBroken = true;
-   }
-@@ -1530,10 +1969,12 @@ PreservedAnalyses DFAJumpThreadingPass::
-   DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
-   LoopInfo &LI = AM.getResult<LoopAnalysis>(F);
-   TargetTransformInfo &TTI = AM.getResult<TargetIRAnalysis>(F);
-+  BlockFrequencyInfo &BFI = AM.getResult<BlockFrequencyAnalysis>(F);
-+  BranchProbabilityInfo &BPI = AM.getResult<BranchProbabilityAnalysis>(F);
-   OptimizationRemarkEmitter ORE(&F);
- 
-   DomTreeUpdater DTU(DT, DomTreeUpdater::UpdateStrategy::Lazy);
--  DFAJumpThreading ThreadImpl(&AC, &DTU, &LI, &TTI, &ORE);
-+  DFAJumpThreading ThreadImpl(&AC, &DTU, &LI, &TTI, &ORE, &BFI, &BPI);
-   if (!ThreadImpl.run(F))
-     return PreservedAnalyses::all();
- 
++++ b/llvm/lib/Transforms/Scalar/DFAJumpThreading.cpp	2026-05-08 00:15:36.617542747 +0200
 
 --- a/llvm/lib/Target/X86/X86InstrInfo.cpp	2026-05-03 11:08:44.783579748 +0200
 +++ b/llvm/lib/Target/X86/X86InstrInfo.cpp	2026-05-05 11:32:44.535054636 +0200
