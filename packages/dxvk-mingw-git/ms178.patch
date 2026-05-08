@@ -1,626 +1,3100 @@
---- a/src/dxvk/dxvk_pipemanager.cpp	2026-03-01 15:59:36.414718665 +0100
-+++ b/src/dxvk/dxvk_pipemanager.cpp	2026-03-01 16:13:00.338026808 +0100
-@@ -23,7 +23,7 @@ namespace dxvk {
-     std::unique_lock lock(m_lock);
-     this->startWorkers();
+--- a/src/dxvk/dxvk_allocator.cpp	2026-05-08 19:35:36.115116089 +0200
++++ b/src/dxvk/dxvk_allocator.cpp	2026-05-08 19:37:08.215531211 +0200
+@@ -1,4 +1,5 @@
+ #include <algorithm>
++#include <limits>
+ #include <utility>
  
--    m_tasksTotal += 1;
-+    m_tasksTotal.fetch_add(1, std::memory_order_relaxed);
+ #include "dxvk_allocator.h"
+@@ -8,6 +9,25 @@
  
-     m_buckets[uint32_t(priority)].queue.emplace(library);
-     notifyWorkers(priority);
-@@ -38,7 +38,7 @@ namespace dxvk {
-     this->startWorkers();
+ namespace dxvk {
  
-     pipeline->acquirePipeline();
--    m_tasksTotal += 1;
-+    m_tasksTotal.fetch_add(1, std::memory_order_relaxed);
++  namespace {
++
++    static uint32_t normalizePageAlignment(uint32_t alignment) {
++      if (alignment <= 1u)
++        return 1u;
++
++      // Round to next power-of-two since allocator math relies on bit masks.
++      alignment -= 1u;
++      alignment |= alignment >> 1u;
++      alignment |= alignment >> 2u;
++      alignment |= alignment >> 4u;
++      alignment |= alignment >> 8u;
++      alignment |= alignment >> 16u;
++      return alignment + 1u;
++    }
++
++  }
++
++
+   DxvkPageAllocator::DxvkPageAllocator() {
  
-     m_buckets[uint32_t(priority)].queue.emplace(pipeline, state);
-     notifyWorkers(priority);
-@@ -165,7 +165,7 @@ namespace dxvk {
-         entry.graphicsPipeline->releasePipeline();
+   }
+@@ -19,14 +39,33 @@ namespace dxvk {
+ 
+ 
+   int64_t DxvkPageAllocator::alloc(uint64_t size, uint64_t alignment) {
+-    uint32_t pageCount = (size + PageSize - 1u) / PageSize;
+-    uint32_t pageAlign = (alignment + PageSize - 1u) / PageSize;
++    if (unlikely(!size))
++      return -1;
++
++    alignment = std::max<uint64_t>(alignment, 1u);
++
++    uint64_t pageCount64 = (size + PageSize - 1u) / PageSize;
++    uint64_t pageAlign64 = (alignment + PageSize - 1u) / PageSize;
++
++    if (unlikely(!pageCount64
++             || pageCount64 > uint64_t(ChunkPageMask + 1u)
++             || pageCount64 > uint64_t(std::numeric_limits<uint32_t>::max())
++             || pageAlign64 > uint64_t(std::numeric_limits<uint32_t>::max())))
++      return -1;
++
++    uint32_t pageCount = uint32_t(pageCount64);
++    uint32_t pageAlign = normalizePageAlignment(uint32_t(std::max<uint64_t>(pageAlign64, 1u)));
+ 
+     return std::max<int64_t>(-1, int64_t(allocPages(pageCount, pageAlign)) * int64_t(PageSize));
+   }
+ 
+ 
+   int32_t DxvkPageAllocator::allocPages(uint32_t count, uint32_t alignment) {
++    if (unlikely(!count || count > ChunkPageMask + 1u))
++      return -1;
++
++    alignment = normalizePageAlignment(alignment);
++
+     int32_t index = searchFreeList(count);
+ 
+     while (index--) {
+@@ -50,7 +89,7 @@ namespace dxvk {
+         insertFreeRange(entry, index);
+ 
+         m_chunks[chunkIndex].pagesUsed += count;
+-        return pageIndex;
++        return int32_t(pageIndex);
+       } else {
+         // Apply alignment and skip if the free range is too small.
+         uint32_t pageIndex = align(entry.index, alignment);
+@@ -76,44 +115,71 @@ namespace dxvk {
+ 
+         m_chunks[chunkIndex].pagesUsed += count;
+ 
+-        return pageIndex;
++        return int32_t(pageIndex);
+       }
+     }
+ 
+-    return -1;    
++    return -1;
+   }
+ 
+ 
+   bool DxvkPageAllocator::free(uint64_t address, uint64_t size) {
+-    uint32_t pageIndex = address / PageSize;
+-    uint32_t pageCount = (size + PageSize - 1u) / PageSize;
++    if (unlikely(!size))
++      return false;
++
++    uint64_t pageIndex64 = address / PageSize;
++    uint64_t pageCount64 = (size + PageSize - 1u) / PageSize;
+ 
+-    return freePages(pageIndex, pageCount);
++    if (unlikely(pageIndex64 > uint64_t(std::numeric_limits<uint32_t>::max())
++             || !pageCount64
++             || pageCount64 > uint64_t(std::numeric_limits<uint32_t>::max())))
++      return false;
++
++    return freePages(uint32_t(pageIndex64), uint32_t(pageCount64));
+   }
+ 
+ 
+   bool DxvkPageAllocator::freePages(uint32_t index, uint32_t count) {
++    if (unlikely(!count || index >= m_freeListLutByPage.size()))
++      return false;
++
++    uint32_t chunkIndex = index >> ChunkPageBits;
++
++    if (unlikely(chunkIndex >= m_chunks.size()))
++      return false;
++
++    uint32_t chunkOffset = index & ChunkPageMask;
++    uint32_t endIndex = index + count;
++
++    if (unlikely(endIndex < index))
++      return false;
++
++    const auto& chunk = m_chunks[chunkIndex];
++
++    if (unlikely(uint64_t(chunkOffset) + uint64_t(count) > uint64_t(chunk.pageCount) || count > chunk.pagesUsed))
++      return false;
++
+     // Use the lookup table to quickly determine which
+-    // free ranges we can actually merge with
++    // free ranges we can actually merge with.
+     int32_t prevRange = -1;
+     int32_t nextRange = -1;
+ 
+     if (index & ChunkPageMask)
+-      prevRange = m_freeListLutByPage[index - 1];
++      prevRange = m_freeListLutByPage[index - 1u];
+ 
+-    if ((index + count) & ChunkPageMask)
+-      nextRange = m_freeListLutByPage[index + count];
++    if ((endIndex & ChunkPageMask) && endIndex < m_freeListLutByPage.size())
++      nextRange = m_freeListLutByPage[endIndex];
+ 
+     if (prevRange < 0) {
+       if (nextRange < 0) {
+-        // No adjacent range, need to insert a new one
++        // No adjacent range, need to insert a new one.
+         PageRange range = { };
+         range.index = index;
+         range.count = count;
+ 
+         insertFreeRange(range, -1);
+       } else {
+-        // One adjacent range after the current one
++        // One adjacent range after the current one.
+         PageRange range = m_freeList[nextRange];
+         range.index = index;
+         range.count += count;
+@@ -121,7 +187,7 @@ namespace dxvk {
+         insertFreeRange(range, nextRange);
+       }
+     } else if (nextRange < 0) {
+-        // One adjacent range before the current one
++      // One adjacent range before the current one.
+       PageRange range = m_freeList[prevRange];
+       range.count += count;
+ 
+@@ -147,7 +213,6 @@ namespace dxvk {
+       insertFreeRange(mergedRange, std::min(prevRange, nextRange));
+     }
+ 
+-    uint32_t chunkIndex = index >> ChunkPageBits;
+     return !(m_chunks[chunkIndex].pagesUsed -= count);
+   }
+ 
+@@ -156,25 +221,30 @@ namespace dxvk {
+     int32_t chunkIndex = m_freeChunk;
+ 
+     if (chunkIndex < 0) {
+-      chunkIndex = m_chunks.size();
++      chunkIndex = int32_t(m_chunks.size());
+ 
+-      m_freeListLutByPage.resize((chunkIndex + 1u) << ChunkPageBits, -1);
++      m_freeListLutByPage.resize((uint32_t(chunkIndex) + 1u) << ChunkPageBits, -1);
+       m_chunks.emplace_back();
+     }
+ 
+     auto& chunk = m_chunks[chunkIndex];
+     m_freeChunk = chunk.nextChunk;
+ 
+-    chunk.pageCount = size / PageSize;
++    // Keep chunk addressing consistent with ChunkPageBits.
++    uint64_t chunkPageCount = std::min<uint64_t>(size / PageSize, uint64_t(ChunkPageMask + 1u));
++
++    chunk.pageCount = uint32_t(chunkPageCount);
+     chunk.pagesUsed = 0u;
+     chunk.nextChunk = -1;
+     chunk.disabled = false;
+ 
+-    PageRange pageRange = { };
+-    pageRange.index = uint32_t(chunkIndex) << ChunkPageBits;
+-    pageRange.count = chunk.pageCount;
++    if (chunk.pageCount) {
++      PageRange pageRange = { };
++      pageRange.index = uint32_t(chunkIndex) << ChunkPageBits;
++      pageRange.count = chunk.pageCount;
+ 
+-    insertFreeRange(pageRange, -1);
++      insertFreeRange(pageRange, -1);
++    }
+ 
+     return uint32_t(chunkIndex);
+   }
+@@ -191,7 +261,7 @@ namespace dxvk {
+ 
+     PageRange pageRange = { };
+     pageRange.index = pageIndex;
+-    pageRange.count = 0;
++    pageRange.count = 0u;
+ 
+     insertFreeRange(pageRange, m_freeListLutByPage[pageIndex]);
+   }
+@@ -210,7 +280,7 @@ namespace dxvk {
+   uint32_t DxvkPageAllocator::reviveChunks() {
+     uint32_t count = 0u;
+ 
+-    for (uint32_t i = 0; i < m_chunks.size(); i++) {
++    for (uint32_t i = 0u; i < m_chunks.size(); i++) {
+       if (m_chunks[i].pageCount && m_chunks[i].disabled) {
+         m_chunks[i].disabled = false;
+         count += 1u;
+@@ -222,13 +292,13 @@ namespace dxvk {
+ 
+ 
+   void DxvkPageAllocator::getPageAllocationMask(uint32_t chunkIndex, uint32_t* pageMask) const {
+-    // Initialize bit mask with all ones
++    // Initialize bit mask with all ones.
+     const auto& chunk = m_chunks[chunkIndex];
+ 
+     uint32_t fullCount = chunk.pageCount / 32u;
+     uint32_t lastCount = chunk.pageCount % 32u;
+ 
+-    for (uint32_t i = 0; i < fullCount; i++)
++    for (uint32_t i = 0u; i < fullCount; i++)
+       pageMask[i] = ~0u;
+ 
+     if (lastCount)
+@@ -246,7 +316,7 @@ namespace dxvk {
+       uint32_t shift = range.index % 32u;
+ 
+       if (shift + range.count < 32u) {
+-        // Entire free range fits in one single mask
++        // Entire free range fits in one single mask.
+         pageMask[index] ^= ((1u << range.count) - 1u) << shift;
+       } else {
+         if (shift) {
+@@ -260,7 +330,7 @@ namespace dxvk {
+         }
+ 
+         if (range.count)
+-          pageMask[index++] &= ~0u << range.count;
++          pageMask[index] &= ~0u << range.count;
+       }
+     }
+   }
+@@ -271,12 +341,12 @@ namespace dxvk {
+     // All entries with an index lower than but not equal to the return value
+     // will have a page count greater than or equal to count.
+     if (unlikely(m_freeList.empty()))
+-      return 0u;
++      return 0;
+ 
+     // Do a binary search, but optimize for the common
+-    // case where we request a small page count
++    // case where we request a small page count.
+     uint32_t lo = 0u;
+-    uint32_t hi = m_freeList.size();
++    uint32_t hi = uint32_t(m_freeList.size());
+ 
+     if (count <= m_freeList.back().count)
+       return int32_t(hi);
+@@ -285,7 +355,7 @@ namespace dxvk {
+       uint32_t mid = (lo + hi) / 2u;
+ 
+       if (count <= m_freeList[mid].count)
+-        lo = mid + 1;
++        lo = mid + 1u;
+       else
+         hi = mid;
+     }
+@@ -315,7 +385,7 @@ namespace dxvk {
+       index = count++;
+     }
+ 
+-    // Remove old range from the LUT since it gets replaced
++    // Remove old range from the LUT since it gets replaced.
+     PageRange oldRange = m_freeList[index];
+ 
+     if (likely(oldRange.count))
+@@ -331,7 +401,7 @@ namespace dxvk {
+         if (newRange.count >= next.count)
+           break;
+ 
+-        addLutEntry(next, index);
++        addLutEntry(next, int32_t(index));
+         m_freeList[index++] = next;
+       }
+     } else if (newRange.count > oldRange.count) {
+@@ -341,14 +411,14 @@ namespace dxvk {
+         if (newRange.count <= prev.count)
+           break;
+ 
+-        addLutEntry(prev, index);
++        addLutEntry(prev, int32_t(index));
+         m_freeList[index--] = prev;
+       }
+     }
+ 
+     if (newRange.count) {
+       m_freeList[index] = newRange;
+-      addLutEntry(newRange, index);
++      addLutEntry(newRange, int32_t(index));
+     } else {
+       m_freeList.pop_back();
+     }
+@@ -368,10 +438,13 @@ namespace dxvk {
+ 
+ 
+   int64_t DxvkPoolAllocator::alloc(uint64_t size) {
++    if (unlikely(size > MaxSize))
++      return -1;
++
+     uint32_t listIndex = computeListIndex(size);
+     uint32_t poolCapacity = computePoolCapacity(listIndex);
+ 
+-    // Obtain a page for the size category
++    // Obtain a page for the size category.
+     int32_t pageIndex = m_pageLists[listIndex].head;
+ 
+     if (likely(pageIndex >= 0)) {
+@@ -383,15 +456,19 @@ namespace dxvk {
+         int32_t nextIndex = pageIndex;
+ 
+         do {
+-          // This works because we add pages to the end
+-          removePageFromList(nextIndex, listIndex);
+-          addPageToList(nextIndex, listIndex);
++          // This works because we add pages to the end.
++          removePageFromList(uint32_t(nextIndex), listIndex);
++          addPageToList(uint32_t(nextIndex), listIndex);
+ 
+           nextIndex = m_pageLists[listIndex].head;
++
++          if (nextIndex < 0)
++            break;
++
+           chunkIndex = uint32_t(nextIndex) >> DxvkPageAllocator::ChunkPageBits;
+         } while (nextIndex != pageIndex && !m_pageAllocator->chunkIsAvailable(chunkIndex));
+ 
+-        // Allocate a new page if the entire list is dead
++        // Allocate a new page if the entire list is dead.
+         pageIndex = nextIndex != pageIndex ? nextIndex : -1;
+       }
+     }
+@@ -400,59 +477,62 @@ namespace dxvk {
+       if ((pageIndex = allocPage(listIndex)) < 0)
+         return -1;
+ 
+-      // Initialize suballocator for the page
+-      PageInfo& page = m_pageInfos[pageIndex];
++      // Initialize suballocator for the page.
++      PageInfo& page = m_pageInfos[uint32_t(pageIndex)];
+ 
+       if (likely(poolCapacity <= MaskBits)) {
+-        // Initialize free mask with the first item marked as used
+-        page.pool = (MaskType(2) << (poolCapacity - 1u)) - 2u;
++        // Initialize free mask with the first item marked as used.
++        page.pool = (MaskType(2) << (poolCapacity - 1u)) - MaskType(2);
+       } else {
+-        // This is also going to have its first item used already
++        // This is also going to have its first item used already.
+         page.pool = allocPagePool(poolCapacity);
        }
  
--      m_tasksCompleted += 1;
-+      m_tasksCompleted.fetch_add(1, std::memory_order_relaxed);
+-      return computeByteAddress(pageIndex, 0, listIndex);
++      return computeByteAddress(uint32_t(pageIndex), 0u, listIndex);
+     }
+ 
+     if (likely(poolCapacity <= MaskBits)) {
+       // Fast path that uses the pool index as an allocator.
+       // Frequent allocations should ideally hit this path.
+-      PageInfo& page = m_pageInfos[pageIndex];
++      PageInfo& page = m_pageInfos[uint32_t(pageIndex)];
+ 
+       uint32_t itemIndex = bit::tzcnt(page.pool);
+-      page.pool &= page.pool - 1u;
++      page.pool &= page.pool - MaskType(1);
+ 
+       if (unlikely(!page.pool))
+-        removePageFromList(pageIndex, listIndex);
++        removePageFromList(uint32_t(pageIndex), listIndex);
+ 
+-      return computeByteAddress(pageIndex, itemIndex, listIndex);
++      return computeByteAddress(uint32_t(pageIndex), itemIndex, listIndex);
+     } else {
+-      PageInfo& page = m_pageInfos[pageIndex];
+-      PagePool& pool = m_pagePools[page.pool];
++      PageInfo& page = m_pageInfos[uint32_t(pageIndex)];
++      PagePool& pool = m_pagePools[uint32_t(page.pool)];
+ 
+-      // Check top-level masks to find which low-level mask to use
++      // Check top-level masks to find which low-level mask to use.
+       uint32_t maskIndex = bit::tzcnt(uint32_t(pool.freeMask));
+       MaskType maskBit = MaskType(1) << maskIndex;
+ 
+-      pool.usedMask |= maskBit;
++      pool.usedMask |= uint16_t(maskBit);
+ 
+-      // Allocate item from the selected low-level mask
++      // Allocate item from the selected low-level mask.
+       MaskType& mask = pool.subPools[maskIndex];
+       uint32_t itemIndex = bit::tzcnt(mask) + maskIndex * MaskBits;
+ 
+-      if (!(mask &= mask - 1u)) {
+-        pool.freeMask &= ~maskBit;
++      if (!(mask &= mask - MaskType(1))) {
++        pool.freeMask &= uint16_t(~maskBit);
+ 
+         if (unlikely(!pool.freeMask))
+-          removePageFromList(pageIndex, listIndex);
++          removePageFromList(uint32_t(pageIndex), listIndex);
+       }
+ 
+-      return computeByteAddress(pageIndex, itemIndex, listIndex);
++      return computeByteAddress(uint32_t(pageIndex), itemIndex, listIndex);
      }
    }
  
-@@ -193,9 +193,9 @@ namespace dxvk {
+ 
+   bool DxvkPoolAllocator::free(uint64_t address, uint64_t size) {
++    if (unlikely(size > MaxSize))
++      return false;
++
+     uint32_t listIndex = computeListIndex(size);
+ 
+     uint32_t pageIndex = computePageIndexFromByteAddress(address);
+@@ -471,13 +551,14 @@ namespace dxvk {
+ 
+       page.pool |= MaskType(1) << itemIndex;
+ 
+-      if (unlikely(bit::tzcnt(page.pool + 1u) >= poolCapacity))
++      if (unlikely((poolCapacity == MaskBits && page.pool == MaskType(-1))
++                || (poolCapacity < MaskBits && bit::tzcnt(page.pool + MaskType(1)) >= poolCapacity)))
+         return freePage(pageIndex, listIndex);
+ 
+       return false;
+     } else {
+       PageInfo& page = m_pageInfos[pageIndex];
+-      PagePool& pool = m_pagePools[page.pool];
++      PagePool& pool = m_pagePools[uint32_t(page.pool)];
+ 
+       if (unlikely(!pool.freeMask))
+         addPageToList(pageIndex, listIndex);
+@@ -488,13 +569,13 @@ namespace dxvk {
+       MaskType& mask = pool.subPools[maskIndex];
+       mask |= MaskType(1) << (itemIndex % MaskBits);
+ 
+-      pool.freeMask |= maskBit;
++      pool.freeMask |= uint16_t(maskBit);
+ 
+-      if (!(mask + 1u)) {
+-        pool.usedMask &= ~maskBit;
++      if (!(mask + MaskType(1))) {
++        pool.usedMask &= uint16_t(~maskBit);
+ 
+         if (unlikely(!pool.usedMask)) {
+-          freePagePool(page.pool);
++          freePagePool(uint32_t(page.pool));
+           return freePage(pageIndex, listIndex);
+         }
+       }
+@@ -511,11 +592,11 @@ namespace dxvk {
+       return -1;
+ 
+     if (unlikely(uint32_t(pageIndex) >= m_pageInfos.size())) {
+-      uint32_t chunkCount = (pageIndex >> DxvkPageAllocator::ChunkPageBits) + 1u;
++      uint32_t chunkCount = (uint32_t(pageIndex) >> DxvkPageAllocator::ChunkPageBits) + 1u;
+       m_pageInfos.resize(chunkCount << DxvkPageAllocator::ChunkPageBits);
+     }
+ 
+-    addPageToList(pageIndex, listIndex);
++    addPageToList(uint32_t(pageIndex), listIndex);
+     return pageIndex;
+   }
+ 
+@@ -533,13 +614,14 @@ namespace dxvk {
+     // increases the chances of it getting freed.
+     PageInfo& page = m_pageInfos[pageIndex];
+     page.prev = m_pageLists[listIndex].tail;
++    page.next = -1;
+ 
+     if (page.prev >= 0)
+-      m_pageInfos[page.prev].next = pageIndex;
++      m_pageInfos[uint32_t(page.prev)].next = int32_t(pageIndex);
+     else
+-      m_pageLists[listIndex].head = pageIndex;
++      m_pageLists[listIndex].head = int32_t(pageIndex);
+ 
+-    m_pageLists[listIndex].tail = pageIndex;
++    m_pageLists[listIndex].tail = int32_t(pageIndex);
+   }
+ 
+ 
+@@ -550,12 +632,12 @@ namespace dxvk {
+     PageInfo& page = m_pageInfos[pageIndex];
+ 
+     if (page.prev >= 0)
+-      m_pageInfos[page.prev].next = page.next;
++      m_pageInfos[uint32_t(page.prev)].next = page.next;
+     else
+       m_pageLists[listIndex].head = page.next;
+ 
+     if (page.next >= 0)
+-      m_pageInfos[page.next].prev = page.prev;
++      m_pageInfos[uint32_t(page.next)].prev = page.prev;
+     else
+       m_pageLists[listIndex].tail = page.prev;
+ 
+@@ -569,21 +651,21 @@ namespace dxvk {
+     uint32_t poolIndex;
+ 
+     if (unlikely(m_freePool < 0)) {
+-      // Allocate new pool as necessary
++      // Allocate new pool as necessary.
+       pool = &m_pagePools.emplace_back();
+       pool->subPools.fill(MaskType(-1));
+ 
+       poolIndex = uint32_t(m_pagePools.size() - 1u);
+     } else {
+-      // Otherwise, just use the free list
+-      pool = &m_pagePools[m_freePool];
+-      poolIndex = std::exchange(m_freePool, pool->nextPool);
++      // Otherwise, just use the free list.
++      pool = &m_pagePools[uint32_t(m_freePool)];
++      poolIndex = uint32_t(std::exchange(m_freePool, pool->nextPool));
+     }
+ 
+     // Initialize free mask to the correct capacity. Everything
+     // else is assumed to be in its default initialized state.
+     uint32_t maskCount = capacity / MaskBits;
+-    pool->freeMask = (1u << maskCount) - 1u;
++    pool->freeMask = uint16_t((1u << maskCount) - 1u);
+     pool->usedMask = 1u;
+     pool->subPools[0] = MaskType(-2);
+     return poolIndex;
+@@ -594,7 +676,7 @@ namespace dxvk {
+     PagePool* pool = &m_pagePools[poolIndex];
+     pool->nextPool = m_freePool;
+ 
+-    m_freePool = poolIndex;
++    m_freePool = int32_t(poolIndex);
+   }
+ 
+ 
+@@ -609,25 +691,25 @@ namespace dxvk {
+ 
+ 
+   uint32_t DxvkPoolAllocator::computePoolCapacity(uint32_t index) {
+-    // Number of objects we can allocate in the pool
++    // Number of objects we can allocate in the pool.
+     return 2u << index;
+   }
+ 
+ 
+   uint64_t DxvkPoolAllocator::computeByteAddress(uint32_t page, uint32_t index, uint32_t list) {
+     uint32_t shift = DxvkPageAllocator::PageBits - 1u - list;
+-    return DxvkPageAllocator::PageSize * uint64_t(page) + (index << shift);
++    return DxvkPageAllocator::PageSize * uint64_t(page) + (uint64_t(index) << shift);
+   }
+ 
+ 
+   uint32_t DxvkPoolAllocator::computePageIndexFromByteAddress(uint64_t address) {
+-    return address / DxvkPageAllocator::PageSize;
++    return uint32_t(address / DxvkPageAllocator::PageSize);
+   }
+ 
+ 
+   uint32_t DxvkPoolAllocator::computeItemIndexFromByteAddress(uint64_t address, uint32_t list) {
+     uint32_t shift = DxvkPageAllocator::PageBits - 1u - list;
+-    return (address & (DxvkPageAllocator::PageSize - 1u)) >> shift;
++    return uint32_t((address & (DxvkPageAllocator::PageSize - 1u)) >> shift);
+   }
+ 
+ }
+
+
+--- a/src/dxvk/dxvk_buffer.h	2026-05-08 19:25:23.435025064 +0200
++++ b/src/dxvk/dxvk_buffer.h	2026-05-08 19:26:47.644772915 +0200
+@@ -281,18 +281,14 @@ namespace dxvk {
+       allocationInfo.resourceCookie = cookie();
+       allocationInfo.properties = m_properties;
+ 
+-      VkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+-      info.flags = m_info.flags;
+-      info.usage = m_info.usage;
+-      info.size = m_info.size;
+-      m_sharingMode.fill(info);
++      VkBufferCreateInfo info = getBufferCreateInfo();
+ 
+       return m_allocator->createBufferResource(info, allocationInfo, cache);
+     }
+ 
+     /**
+      * \brief Replaces backing resource
+-     * 
++     *
+      * Replaces the underlying buffer and implicitly marks
+      * any buffer views using this resource as dirty. Do
+      * not call this directly as this is called implicitly
+@@ -399,6 +395,15 @@ namespace dxvk {
+ 
+   private:
+ 
++    VkBufferCreateInfo getBufferCreateInfo() const {
++      VkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
++      info.flags = m_info.flags;
++      info.usage = m_info.usage;
++      info.size = m_info.size;
++      m_sharingMode.fill(info);
++      return info;
++    }
++
+     Rc<vk::DeviceFn>            m_vkd;
+     VkMemoryPropertyFlags       m_properties    = 0u;
+     VkShaderStageFlags          m_shaderStages  = 0u;
+@@ -463,7 +468,7 @@ namespace dxvk {
+     explicit DxvkBufferSlice(Rc<DxvkBuffer> buffer)
+     : m_buffer(std::move(buffer)),
+       m_offset(0),
+-      m_length(m_buffer->info().size) { }
++      m_length(m_buffer != nullptr ? m_buffer->info().size : 0u) { }
+ 
+     explicit DxvkBufferSlice(const Rc<DxvkBufferView>& view)
+     : DxvkBufferSlice(view->buffer(), view->info().offset, view->info().size) { }
+@@ -562,12 +567,14 @@ namespace dxvk {
+      * \returns Buffer slice descriptor
+      */
+     DxvkLegacyDescriptor getDescriptor() const {
+-      return m_buffer->getDescriptor(m_offset, m_length);
++      return m_buffer != nullptr
++        ? m_buffer->getDescriptor(m_offset, m_length)
++        : DxvkLegacyDescriptor();
+     }
+ 
+     /**
+      * \brief Pointer to mapped memory region
+-     * 
++     *
+      * \param [in] offset Offset into the slice
+      * \returns Pointer into mapped buffer memory
+      */
+
+
+--- a/src/dxvk/dxvk_buffer.cpp	2026-05-08 19:25:20.073900968 +0200
++++ b/src/dxvk/dxvk_buffer.cpp	2026-05-08 19:26:26.023293439 +0200
+@@ -53,11 +53,7 @@ namespace dxvk {
+     DxvkAllocationInfo allocationInfo = { };
+     allocationInfo.resourceCookie = cookie();
+ 
+-    VkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+-    info.flags = m_info.flags;
+-    info.usage = m_info.usage;
+-    info.size = m_info.size;
+-    m_sharingMode.fill(info);
++    VkBufferCreateInfo info = getBufferCreateInfo();
+ 
+     assignStorage(allocator.importBufferResource(info, allocationInfo, importInfo));
+   }
+@@ -78,8 +74,7 @@ namespace dxvk {
+     const DxvkBufferViewKey& info) {
+     std::unique_lock lock(m_viewMutex);
+ 
+-    auto entry = m_views.emplace(std::piecewise_construct,
+-      std::make_tuple(info), std::make_tuple(this, info));
++    auto entry = m_views.try_emplace(info, this, info);
+ 
+     return &entry.first->second;
+   }
+@@ -102,11 +97,7 @@ namespace dxvk {
+     allocationInfo.properties = m_properties;
+     allocationInfo.mode = mode;
+ 
+-    VkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+-    info.flags = m_info.flags;
+-    info.usage = m_info.usage;
+-    info.size = m_info.size;
+-    m_sharingMode.fill(info);
++    VkBufferCreateInfo info = getBufferCreateInfo();
+ 
+     return m_allocator->createBufferResource(info, allocationInfo, nullptr);
+   }
+
+
+--- a/src/dxvk/dxvk_cmdlist.cpp	2026-05-08 19:05:45.261360797 +0200
++++ b/src/dxvk/dxvk_cmdlist.cpp	2026-05-08 19:18:38.088912580 +0200
+@@ -53,35 +52,28 @@ namespace dxvk {
+           DxvkDevice*           device,
+           VkQueue               queue,
+           uint64_t              frameId) {
++    if (this->isEmpty()) {
++      this->reset();
++      return VK_SUCCESS;
++    }
++
+     auto vk = device->vkd();
+ 
+     VkLatencySubmissionPresentIdNV latencyInfo = { VK_STRUCTURE_TYPE_LATENCY_SUBMISSION_PRESENT_ID_NV };
+     latencyInfo.presentID = frameId;
+ 
+     VkSubmitInfo2 submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+-
+-    if (!m_semaphoreWaits.empty()) {
+-      submitInfo.waitSemaphoreInfoCount = m_semaphoreWaits.size();
+-      submitInfo.pWaitSemaphoreInfos = m_semaphoreWaits.data();
+-    }
+-
+-    if (!m_commandBuffers.empty()) {
+-      submitInfo.commandBufferInfoCount = m_commandBuffers.size();
+-      submitInfo.pCommandBufferInfos = m_commandBuffers.data();
+-    }
+-
+-    if (!m_semaphoreSignals.empty()) {
+-      submitInfo.signalSemaphoreInfoCount = m_semaphoreSignals.size();
+-      submitInfo.pSignalSemaphoreInfos = m_semaphoreSignals.data();
+-    }
++    submitInfo.waitSemaphoreInfoCount   = uint32_t(m_semaphoreWaits.size());
++    submitInfo.pWaitSemaphoreInfos      = m_semaphoreWaits.data();
++    submitInfo.commandBufferInfoCount   = uint32_t(m_commandBuffers.size());
++    submitInfo.pCommandBufferInfos      = m_commandBuffers.data();
++    submitInfo.signalSemaphoreInfoCount = uint32_t(m_semaphoreSignals.size());
++    submitInfo.pSignalSemaphoreInfos    = m_semaphoreSignals.data();
+ 
+     if (frameId && device->features().nvLowLatency2)
+       latencyInfo.pNext = std::exchange(submitInfo.pNext, &latencyInfo);
+ 
+-    VkResult vr = VK_SUCCESS;
+-
+-    if (!this->isEmpty())
+-      vr = vk->vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
++    VkResult vr = vk->vkQueueSubmit2(queue, 1u, &submitInfo, VK_NULL_HANDLE);
+ 
+     this->reset();
+     return vr;
+@@ -234,13 +226,13 @@ namespace dxvk {
+     else
+       m_transferPool = m_graphicsPool;
+   }
+-  
+-  
++
++
+   DxvkCommandList::~DxvkCommandList() {
+     this->reset();
+   }
+-  
+-  
++
++
+   VkResult DxvkCommandList::submit(
+     const DxvkTimelineSemaphores&       semaphores,
+           DxvkTimelineSemaphoreValues&  timelines,
+@@ -261,6 +253,8 @@ namespace dxvk {
+ 
+     m_commandSubmission.reset();
+ 
++    const bool hasDedicatedTransferQueue = m_device->hasDedicatedTransferQueue();
++
+     for (size_t i = 0; i < m_cmdSubmissions.size(); i++) {
+       bool isFirst = i == 0;
+       bool isLast  = i == m_cmdSubmissions.size() - 1;
+@@ -273,9 +267,9 @@ namespace dxvk {
+ 
+       if (isFirst) {
+         // Wait for per-command list semaphores on first submission
+-        for (size_t i = 0; i < m_waitSemaphores.size(); i++) {
+-          m_commandSubmission.waitSemaphore(m_waitSemaphores[i].fence->handle(),
+-            m_waitSemaphores[i].value, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
++        for (size_t j = 0; j < m_waitSemaphores.size(); j++) {
++          m_commandSubmission.waitSemaphore(m_waitSemaphores[j].fence->handle(),
++            m_waitSemaphores[j].value, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
+         }
+       }
+ 
+@@ -302,7 +296,7 @@ namespace dxvk {
+ 
+       // If we had either a transfer command or a semaphore wait, submit to the
+       // transfer queue so that all subsequent commands get stalled as necessary.
+-      if (m_device->hasDedicatedTransferQueue() && !m_commandSubmission.isEmpty()) {
++      if (hasDedicatedTransferQueue && !m_commandSubmission.isEmpty()) {
+         m_commandSubmission.signalSemaphore(semaphores.transfer,
+           ++timelines.transfer, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+ 
+@@ -332,9 +326,9 @@ namespace dxvk {
+ 
+       if (isLast) {
+         // Signal per-command list semaphores on the final submission
+-        for (size_t i = 0; i < m_signalSemaphores.size(); i++) {
+-          m_commandSubmission.signalSemaphore(m_signalSemaphores[i].fence->handle(),
+-            m_signalSemaphores[i].value, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
++        for (size_t j = 0; j < m_signalSemaphores.size(); j++) {
++          m_commandSubmission.signalSemaphore(m_signalSemaphores[j].fence->handle(),
++            m_signalSemaphores[j].value, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+         }
+ 
+         // Signal WSI semaphore on the final submission
+@@ -375,8 +369,8 @@ namespace dxvk {
+ 
+     return VK_SUCCESS;
+   }
+-  
+-  
++
++
+   void DxvkCommandList::init() {
+     // Make sure the main command buffer is initialized since we can
+     // reasonably expect that to always get used. Saves some checks
+@@ -384,8 +378,8 @@ namespace dxvk {
+     m_cmd = DxvkCommandSubmissionInfo();
+     m_cmd.cmdBuffers[uint32_t(DxvkCmdBuffer::ExecBuffer)] = allocateCommandBuffer(DxvkCmdBuffer::ExecBuffer);
+   }
+-  
+-  
++
++
+   void DxvkCommandList::finalize() {
+     // Record commands to upload descriptors if necessary, and
+     // reset the descriptor range to not keep it alive for too
+@@ -448,7 +442,7 @@ namespace dxvk {
+     m_cmd.sparseBind = VK_FALSE;
+   }
+ 
+-  
++
+   void DxvkCommandList::reset() {
+     // We will re-apply heap bindings first thing in a
+     // new command list, so reset this flag here
+@@ -495,10 +489,13 @@ namespace dxvk {
+     const DxvkDescriptorWrite*          descriptorInfos,
+           size_t                        pushDataSize,
+     const void*                         pushData) {
+-    if (m_device->canUseDescriptorHeap()) {
++    const bool useDescriptorHeap   = m_device->canUseDescriptorHeap();
++    const bool useDescriptorBuffer = m_device->canUseDescriptorBuffer();
++
++    if (useDescriptorHeap) {
+       bindResourcesDescriptorHeap(cmdBuffer, layout,
+         descriptorCount, descriptorInfos, pushDataSize, pushData);
+-    } else if (m_device->canUseDescriptorBuffer()) {
++    } else if (useDescriptorBuffer) {
+       bindResourcesDescriptorBuffer(cmdBuffer, layout,
+         descriptorCount, descriptorInfos, pushDataSize, pushData);
+     } else {
+@@ -522,6 +519,7 @@ namespace dxvk {
+       VkDescriptorSet set = m_descriptorPool->alloc(m_trackingId, setLayout);
+ 
+       small_vector<DxvkLegacyDescriptor, 16u> descriptors;
++      descriptors.reserve(descriptorCount);
+ 
+       for (uint32_t i = 0u; i < descriptorCount; i++) {
+         const auto& info = descriptorInfos[i];
+@@ -566,6 +564,7 @@ namespace dxvk {
+ 
+       // Bind set as well as the global sampler heap, if requested
+       small_vector<VkDescriptorSet, 2u> sets;
++      sets.reserve(2u);
+ 
+       if (layout->usesSamplerHeap())
+         sets.push_back(m_device->getSamplerDescriptorSet().set);
+@@ -576,7 +575,7 @@ namespace dxvk {
+       bindInfo.stageFlags = layout->getShaderStageMask();
+       bindInfo.layout = layout->getPipelineLayout();
+       bindInfo.firstSet = 0u;
+-      bindInfo.descriptorSetCount = sets.size();
++      bindInfo.descriptorSetCount = uint32_t(sets.size());
+       bindInfo.pDescriptorSets = sets.data();
+ 
+       this->cmdBindDescriptorSets(cmdBuffer, &bindInfo);
+@@ -586,9 +585,11 @@ namespace dxvk {
+     DxvkPushDataBlock pushDataBlock = layout->getPushData();
+ 
+     if (pushDataSize && !pushDataBlock.isEmpty()) {
+-      std::array<char, MaxTotalPushDataSize> dataCopy;
+-      std::memcpy(dataCopy.data(), pushData,
+-        std::min(dataCopy.size(), pushDataSize));
++      std::array<char, MaxTotalPushDataSize> dataCopy = { };
++      size_t copySize = std::min(size_t(pushDataBlock.getSize()), std::min(dataCopy.size(), pushDataSize));
++
++      if (copySize)
++        std::memcpy(dataCopy.data(), pushData, copySize);
+ 
+       VkPushConstantsInfo pushInfo = { VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO };
+       pushInfo.layout = layout->getPipelineLayout();
+@@ -624,7 +625,7 @@ namespace dxvk {
+       VkPushDataInfoEXT pushInfo = { VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT };
+       pushInfo.offset = 0u;
+       pushInfo.data.address = pushData;
+-      pushInfo.data.size = pushDataSize;
++      pushInfo.data.size = std::min(size_t(pushDataBlock.getSize()), pushDataSize);
+ 
+       this->cmdPushData(cmdBuffer, &pushInfo);
+     }
+@@ -637,40 +638,41 @@ namespace dxvk {
+       if (!canAllocateDescriptors(layout))
+         createDescriptorRange();
+ 
+-      // Need to pre-allocate arrays with a fixed size so pointers remain valid
+-      small_vector<DxvkDescriptor, 8u> buffers(descriptorCount);
+-      small_vector<VkHostAddressRangeEXT, 8u> hostRanges(descriptorCount);
+-      small_vector<VkDeviceAddressRangeEXT, 8u> bufferRanges(descriptorCount);
+-      small_vector<VkResourceDescriptorInfoEXT, 8u> writes(descriptorCount);
++      // Need to pre-allocate arrays with a fixed size so pointers remain valid.
++      small_vector<DxvkDescriptor, 8u> buffers;
++      small_vector<VkHostAddressRangeEXT, 8u> hostRanges;
++      small_vector<VkDeviceAddressRangeEXT, 8u> bufferRanges;
++      small_vector<VkResourceDescriptorInfoEXT, 8u> writes;
++
++      buffers.reserve(descriptorCount);
++      hostRanges.reserve(descriptorCount);
++      bufferRanges.reserve(descriptorCount);
++      writes.reserve(descriptorCount);
+ 
+       // Populate descriptor arrays with necessary information
+       small_vector<const DxvkDescriptor*, 8u> descriptors;
+       descriptors.reserve(descriptorCount);
+ 
+-      uint32_t writeCount = 0u;
+-
+       for (uint32_t i = 0u; i < descriptorCount; i++) {
+         const auto& info = descriptorInfos[i];
+ 
+         switch (info.descriptorType) {
+           case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+           case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
+-            auto& descriptor = buffers[writeCount];
++            auto& descriptor = buffers.emplace_back();
+             descriptors.push_back(&descriptor);
+ 
+-            auto& hostRange = hostRanges[writeCount];
++            auto& hostRange = hostRanges.emplace_back();
+             hostRange = descriptor.getHostAddressRange();
+ 
+-            auto& bufferRange = bufferRanges[writeCount];
++            auto& bufferRange = bufferRanges.emplace_back();
+             bufferRange.address = info.buffer.gpuAddress;
+             bufferRange.size = info.buffer.size;
+ 
+-            auto& write = writes[writeCount];
++            auto& write = writes.emplace_back();
+             write.sType = VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT;
+             write.type = info.descriptorType;
+             write.data.pAddressRange = &bufferRange;
+-
+-            writeCount += 1u;
+           } break;
+ 
+           case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+@@ -692,13 +694,12 @@ namespace dxvk {
+       }
+ 
+       // Write out buffer descriptors
+-      if (writeCount) {
++      if (!writes.empty()) {
+         vk->vkWriteResourceDescriptorsEXT(vk->device(),
+-          writeCount, writes.data(), hostRanges.data());
++          uint32_t(writes.size()), writes.data(), hostRanges.data());
+       }
+ 
+       // Allocate descriptor storage and update the set
+-      auto setLayout = layout->getDescriptorSetLayout(0u);
+       auto storage = allocateDescriptors(setLayout);
+ 
+       setLayout->update(storage.mapPtr, descriptors.data());
+@@ -788,7 +789,6 @@ namespace dxvk {
+       }
+ 
+       // Allocate descriptor storage and update the set
+-      auto setLayout = layout->getDescriptorSetLayout(0u);
+       auto storage = allocateDescriptors(setLayout);
+ 
+       setLayout->update(storage.mapPtr, descriptors.data());
+@@ -824,9 +824,11 @@ namespace dxvk {
+     DxvkPushDataBlock pushDataBlock = layout->getPushData();
+ 
+     if (pushDataSize && !pushDataBlock.isEmpty()) {
+-      std::array<char, MaxTotalPushDataSize> dataCopy;
+-      std::memcpy(dataCopy.data(), pushData,
+-        std::min(dataCopy.size(), pushDataSize));
++      std::array<char, MaxTotalPushDataSize> dataCopy = { };
++      size_t copySize = std::min(size_t(pushDataBlock.getSize()), std::min(dataCopy.size(), pushDataSize));
++
++      if (copySize)
++        std::memcpy(dataCopy.data(), pushData, copySize);
+ 
+       VkPushConstantsInfo pushInfo = { VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO };
+       pushInfo.layout = layout->getPipelineLayout();
+@@ -1003,7 +1005,7 @@ namespace dxvk {
+     resourceHeap.address = resourceInfo.gpuAddress;
+     resourceHeap.usage = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT;
+ 
+-    vk->vkCmdBindDescriptorBuffersEXT(cmdBuffer, heaps.size(), heaps.data());
++    vk->vkCmdBindDescriptorBuffersEXT(cmdBuffer, uint32_t(heaps.size()), heaps.data());
+   }
+ 
+ 
+@@ -1023,12 +1025,15 @@ namespace dxvk {
+       ? m_transferPool->getCommandBuffer(type)
+       : m_graphicsPool->getCommandBuffer(type);
+ 
+-    if (type <= DxvkCmdBuffer::InitBarriers && m_device->canUseDescriptorHeap()) {
++    const bool useDescriptorHeap   = m_device->canUseDescriptorHeap();
++    const bool useDescriptorBuffer = m_device->canUseDescriptorBuffer();
++
++    if (type <= DxvkCmdBuffer::InitBarriers && useDescriptorHeap) {
+       bindSamplerHeap(cmdBuffer);
+       bindResourceHeap(cmdBuffer);
+     }
+ 
+-    if (type <= DxvkCmdBuffer::InitBuffer && m_device->canUseDescriptorBuffer())
++    if (type <= DxvkCmdBuffer::InitBuffer && useDescriptorBuffer)
+       bindDescriptorBuffers(cmdBuffer);
+ 
+     return cmdBuffer;
+
+
+--- a/src/dxvk/dxvk_shader.cpp	2026-05-08 18:41:24.681738380 +0200
++++ b/src/dxvk/dxvk_shader.cpp	2026-05-08 18:42:26.102876897 +0200
+@@ -314,32 +314,43 @@ namespace dxvk {
+     DxvkShaderStageInfo stageInfo(m_device, getPipelineLibraryLayout());
+     VkShaderStageFlags stageMask = getShaderStages();
+ 
+-    { std::lock_guard lock(m_identifierMutex);
+-      VkShaderStageFlags stages = stageMask;
++    VkShaderStageFlags stages = stageMask;
++
++    while (stages) {
++      auto stage = VkShaderStageFlagBits(stages & -stages);
++
++      if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) {
++        std::lock_guard lock(m_identifierMutex);
+ 
+-      while (stages) {
+-        auto stage = VkShaderStageFlagBits(stages & -stages);
+         auto identifier = getShaderIdentifier(stage);
+ 
+-        if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) {
+-          // Fail if we have no idenfitier for whatever reason, caller
+-          // should fall back to the slow path if this happens
+-          if (!identifier->identifierSize)
+-            return { VK_NULL_HANDLE, 0 };
++        // Fail immediately if identifier is unavailable.
++        // Caller falls back to slow path.
++        if (!identifier->identifierSize)
++          return { VK_NULL_HANDLE, 0 };
++
++        stageInfo.addStage(stage, *identifier, nullptr);
++      } else {
++        // Potentially expensive shader decode/decompression path.
++        // Do this outside the mutex to reduce contention between
++        // pipeline compile threads.
++        SpirvCodeBuffer spirvCode = this->getShaderCode(stage);
+ 
+-          stageInfo.addStage(stage, *identifier, nullptr);
+-        } else {
+-          // Decompress code and generate identifier as needed
+-          SpirvCodeBuffer spirvCode = this->getShaderCode(stage);
++        {
++          std::lock_guard lock(m_identifierMutex);
+ 
++          auto identifier = getShaderIdentifier(stage);
++
++          // Identifier generation is idempotent and deterministic.
++          // Re-generating in rare races is harmless.
+           if (!identifier->identifierSize)
+             this->generateModuleIdentifierLocked(identifier, spirvCode);
+-
+-          stageInfo.addStage(stage, std::move(spirvCode), nullptr);
+         }
+ 
+-        stages &= stages - 1;
++        stageInfo.addStage(stage, std::move(spirvCode), nullptr);
+       }
++
++      stages &= stages - 1;
+     }
+ 
+     VkPipeline pipeline = VK_NULL_HANDLE;
+@@ -351,7 +362,6 @@ namespace dxvk {
+     else if (stageMask & VK_SHADER_STAGE_COMPUTE_BIT)
+       pipeline = compileComputeShaderPipeline(stageInfo, flags);
+ 
+-    // Should be unreachable
+     return { pipeline, flags };
+   }
+ 
+
+--- a/src/d3d11/d3d11_shader.cpp	2026-05-06 18:56:06.569836939 +0200
++++ b/src/d3d11/d3d11_shader.cpp	2026-05-06 19:02:16.513981257 +0200
+@@ -7,7 +7,7 @@
+ 
+ namespace dxvk {
+ 
+-class D3D11ShaderConverter : public DxvkIrShaderConverter {
++  class D3D11ShaderConverter : public DxvkIrShaderConverter {
+   public:
+     D3D11ShaderConverter(
+       const DxvkShaderHash&         ShaderKey,
+@@ -15,21 +15,19 @@ class D3D11ShaderConverter : public Dxvk
+       const void*                   pShaderBytecode,
+             size_t                  BytecodeLength,
+             bool                    LowerIcb)
+-    : m_key(ShaderKey), m_info(ModuleInfo), m_lowerIcb(LowerIcb),
+-      m_bytecodeData(pShaderBytecode), m_bytecodeLength(BytecodeLength) {
++    : m_key(ShaderKey), m_info(ModuleInfo), m_lowerIcb(LowerIcb) {
+       m_dxbc.assign(
+         reinterpret_cast<const uint8_t*>(pShaderBytecode),
+         reinterpret_cast<const uint8_t*>(pShaderBytecode) + BytecodeLength);
+     }
+-    }
+ 
+     ~D3D11ShaderConverter() { }
+ 
+-    void convertShader(dxbc_spv::ir::Builder&    builder) {
+-      auto debugName = m_key.toString();
++    void convertShader(dxbc_spv::ir::Builder& builder) {
++      const std::string shaderName = m_key.toString();
+ 
+       dxbc_spv::dxbc::Converter::Options options = { };
+-      options.name = debugName.c_str();
++      options.name = shaderName.c_str();
+       options.includeDebugNames = true;
+       options.boundCheckShaderIo = true;
+       options.lowerIcb = m_lowerIcb;
+@@ -39,7 +37,6 @@ class D3D11ShaderConverter : public Dxvk
+       options.classInstanceRegisterIndex = D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT + 1u;
+       options.limitTessFactor = true;
+ 
+-      dxbc_spv::dxbc::Container container(m_bytecodeData, m_bytecodeLength);
+       dxbc_spv::dxbc::Container container(m_dxbc.data(), m_dxbc.size());
+ 
+       dxbc_spv::dxbc::ShaderInfo shaderInfo =
+@@ -47,16 +44,15 @@ class D3D11ShaderConverter : public Dxvk
+ 
+       dxbc_spv::dxbc::Converter converter(std::move(container), options);
+ 
+-      // Determine whether to create a regular shader or a pass-through GS
+-      auto dstIsGs = m_key.stage() == VK_SHADER_STAGE_GEOMETRY_BIT;
+-      auto srcIsGs = shaderInfo.getType() == dxbc_spv::dxbc::ShaderType::eGeometry;
++      const bool dstIsGs = m_key.stage() == VK_SHADER_STAGE_GEOMETRY_BIT;
++      const bool srcIsGs = shaderInfo.getType() == dxbc_spv::dxbc::ShaderType::eGeometry;
+ 
+       if (dstIsGs && !srcIsGs) {
+         if (!converter.createPassthroughGs(builder))
+-          throw DxvkError(str::format("Failed to create pass-through geometry shader: ", m_key.toString()));
++          throw DxvkError(str::format("Failed to create pass-through geometry shader: ", shaderName));
+       } else {
+         if (!converter.convertShader(builder))
+-          throw DxvkError(str::format("Failed to convert shader: ", m_key.toString()));
++          throw DxvkError(str::format("Failed to convert shader: ", shaderName));
+       }
+     }
+ 
+@@ -65,6 +61,8 @@ class D3D11ShaderConverter : public Dxvk
+             dxbc_spv::ir::ScalarType  type,
+             uint32_t                  regSpace,
+             uint32_t                  regIndex) const {
++      (void)regSpace;
++
+       switch (type) {
+         case dxbc_spv::ir::ScalarType::eSampler:
+           return D3D11ShaderResourceMapping::computeSamplerBinding(stage, regIndex);
+@@ -77,12 +75,15 @@ class D3D11ShaderConverter : public Dxvk
+         case dxbc_spv::ir::ScalarType::eUavCounter:
+           return D3D11ShaderResourceMapping::computeUavCounterBinding(stage, regIndex);
+         default:
+-          return -1u;
++          return 0xffffffffu;
+       }
+     }
+ 
+     void dumpSource(const std::string& path) const {
+-      std::ofstream file(str::topath(str::format(path, "/", m_key.toString(), ".dxbc").c_str()).c_str(), std::ios_base::trunc | std::ios_base::binary);
++      const auto filePath =
++        str::topath(str::format(path, "/", m_key.toString(), ".dxbc").c_str());
++
++      std::ofstream file(filePath.c_str(), std::ios_base::trunc | std::ios_base::binary);
+       file.write(reinterpret_cast<const char*>(m_dxbc.data()), m_dxbc.size());
+     }
+ 
+@@ -91,23 +92,18 @@ class D3D11ShaderConverter : public Dxvk
+     }
+ 
+   private:
+-
+-    const void*             m_bytecodeData;   
+-    size_t                  m_bytecodeLength; 
+     std::vector<uint8_t>    m_dxbc;
+     DxvkShaderHash          m_key;
+     DxvkIrShaderCreateInfo  m_info;
+     bool                    m_lowerIcb = false;
+-
+   };
+ 
+ 
+ 
+-  
+   D3D11CommonShader:: D3D11CommonShader() { }
+   D3D11CommonShader::~D3D11CommonShader() { }
+-  
+-  
++
++
+   D3D11CommonShader::D3D11CommonShader(
+           D3D11Device*            pDevice,
+           D3D11ClassLinkage*      pLinkage,
+@@ -129,81 +125,81 @@ class D3D11ShaderConverter : public Dxvk
+   }
+ 
+ 
+-void D3D11CommonShader::CreateIrShader(
+-        D3D11Device*            pDevice,
+-  const DxvkShaderHash&         ShaderKey,
+-  const DxvkIrShaderCreateInfo& ModuleInfo,
+-  const void*                   pShaderBytecode,
+-        size_t                  BytecodeLength,
+-  const D3D11ShaderIcbInfo&     Icb) {
+-  constexpr size_t MaxEmbeddedIcbSize = 64u;
+-
+-  size_t icbSizeInBytes = Icb.size * sizeof(uint32_t);
+-
+-  if (ModuleInfo.options.flags.test(DxvkShaderCompileFlag::LowerConstantArrays) 
+-   && icbSizeInBytes > MaxEmbeddedIcbSize) {
+-    DxvkBufferCreateInfo info = { };
+-    info.size   = align(icbSizeInBytes, 256u);
+-    info.usage  = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+-                | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+-                | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+-    info.stages = VK_PIPELINE_STAGE_2_TRANSFER_BIT
+-                | util::pipelineStages(ShaderKey.stage());
+-    info.access = VK_ACCESS_UNIFORM_READ_BIT
+-                | VK_ACCESS_TRANSFER_READ_BIT
+-                | VK_ACCESS_TRANSFER_WRITE_BIT;
+-    info.debugName = "Icb";
++  void D3D11CommonShader::CreateIrShader(
++          D3D11Device*            pDevice,
++    const DxvkShaderHash&         ShaderKey,
++    const DxvkIrShaderCreateInfo& ModuleInfo,
++    const void*                   pShaderBytecode,
++          size_t                  BytecodeLength,
++    const D3D11ShaderIcbInfo&     Icb) {
++    constexpr size_t MaxEmbeddedIcbSize = 64u;
++
++    const size_t icbSizeInBytes = Icb.size * sizeof(uint32_t);
+ 
+-    m_buffer = pDevice->GetDXVKDevice()->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (ModuleInfo.options.flags.test(DxvkShaderCompileFlag::LowerConstantArrays)
++     && icbSizeInBytes > MaxEmbeddedIcbSize) {
++      DxvkBufferCreateInfo info = { };
++      info.size   = align(icbSizeInBytes, 256u);
++      info.usage  = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
++                  | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
++                  | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++      info.stages = VK_PIPELINE_STAGE_2_TRANSFER_BIT
++                  | util::pipelineStages(ShaderKey.stage());
++      info.access = VK_ACCESS_UNIFORM_READ_BIT
++                  | VK_ACCESS_TRANSFER_READ_BIT
++                  | VK_ACCESS_TRANSFER_WRITE_BIT;
++      info.debugName = "Icb";
+ 
+-    pDevice->InitShaderIcb(this, icbSizeInBytes, Icb.data);
+-  }
++      m_buffer = pDevice->GetDXVKDevice()->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+ 
+-  m_shader = pDevice->GetDXVKDevice()->createCachedShader(
+-    ShaderKey, ModuleInfo, nullptr);
++      pDevice->InitShaderIcb(this, icbSizeInBytes, Icb.data);
++    }
+ 
+-  if (m_shader == nullptr) {
+-    Rc<D3D11ShaderConverter> converter = new D3D11ShaderConverter(
+-      ShaderKey, ModuleInfo, pShaderBytecode, BytecodeLength, m_buffer != nullptr);
++    const std::string shaderName = ShaderKey.toString();
+ 
+     m_shader = pDevice->GetDXVKDevice()->createCachedShader(
+-      ShaderKey, ModuleInfo, std::move(converter));
++      shaderName, ModuleInfo, nullptr);
++
++    if (m_shader == nullptr) {
++      Rc<D3D11ShaderConverter> converter = new D3D11ShaderConverter(
++        ShaderKey, ModuleInfo, pShaderBytecode, BytecodeLength, m_buffer != nullptr);
++
++      m_shader = pDevice->GetDXVKDevice()->createCachedShader(
++        shaderName, ModuleInfo, std::move(converter));
++    }
+   }
+-}
+ 
+ 
+   void D3D11CommonShader::GatherInterefaceInfo(
+-        D3D11ClassLinkage*      pLinkage,
+-  const void*                   pShaderBytecode,
+-        size_t                  BytecodeLength) {
+-  dxbc_spv::dxbc::Container container(pShaderBytecode, BytecodeLength);
+-  dxbc_spv::util::ByteReader ifaceChunk(container.getInterfaceChunk());
+-
+-  if (!ifaceChunk)
+-    return;
+-
+-  dxbc_spv::dxbc::InterfaceChunk ifaceInfo(ifaceChunk);
+-  if (!ifaceInfo)
+-    return;
+-
+-  auto typeInfos = ifaceInfo.getClassTypes();
+-  auto slotInfos = ifaceInfo.getInterfaceSlots();
+-
+-  // Optimization: Reference the name directly to avoid repeated string construction
+-  for (auto i = typeInfos.first; i != typeInfos.second; i++) {
+-    const char* typeName = i->name.c_str(); 
+-    m_interfaces.AddType(i->id, typeName);
+-    pLinkage->AddType(typeName, i->cbSize, i->srvCount, i->samplerCount);
+-  }
++          D3D11ClassLinkage*      pLinkage,
++    const void*                   pShaderBytecode,
++          size_t                  BytecodeLength) {
++    dxbc_spv::dxbc::Container container(pShaderBytecode, BytecodeLength);
++    dxbc_spv::util::ByteReader ifaceChunk(container.getInterfaceChunk());
++
++    if (!ifaceChunk)
++      return;
++
++    dxbc_spv::dxbc::InterfaceChunk ifaceInfo(ifaceChunk);
++    if (!ifaceInfo)
++      return;
++
++    auto typeInfos = ifaceInfo.getClassTypes();
++    auto slotInfos = ifaceInfo.getInterfaceSlots();
++
++    for (auto i = typeInfos.first; i != typeInfos.second; i++) {
++      const char* typeName = i->name.c_str();
++      m_interfaces.AddType(i->id, typeName);
++      pLinkage->AddType(typeName, i->cbSize, i->srvCount, i->samplerCount);
++    }
+ 
+-  for (auto i = slotInfos.first; i != slotInfos.second; i++) {
+-    uint32_t slotIndex = i->index;
+-    uint32_t slotCount = i->count;
+-    for (const auto& e : i->entries)
+-      m_interfaces.AddSlotInfo(slotIndex, slotCount, e.typeId, e.tableId);
+-  }
++    for (auto i = slotInfos.first; i != slotInfos.second; i++) {
++      uint32_t slotIndex = i->index;
++      uint32_t slotCount = i->count;
++      for (const auto& e : i->entries)
++        m_interfaces.AddSlotInfo(slotIndex, slotCount, e.typeId, e.tableId);
++    }
+ 
+-}
+     auto instances = ifaceInfo.getClassInstances();
+ 
+     for (auto i = instances.first; i != instances.second; i++) {
+@@ -220,11 +216,11 @@ void D3D11CommonShader::CreateIrShader(
+     }
+   }
+ 
+-  
++
+   D3D11ShaderModuleSet:: D3D11ShaderModuleSet() { }
+   D3D11ShaderModuleSet::~D3D11ShaderModuleSet() { }
+-  
+-  
++
++
+   HRESULT D3D11ShaderModuleSet::GetShaderModule(
+           D3D11Device*            pDevice,
+           D3D11ClassLinkage*      pLinkage,
+@@ -235,20 +231,20 @@ void D3D11CommonShader::CreateIrShader(
+     const D3D11ShaderIcbInfo&     Icb,
+     const D3D11BindingMask&       BindingMask,
+           D3D11CommonShader*      pShader) {
+-    // Use the shader's unique key for the lookup
+-    { std::unique_lock<dxvk::mutex> lock(m_mutex);
+-      
++    // Use the shader's unique key for the lookup.
++    { std::lock_guard<dxvk::mutex> lock(m_mutex);
++
+       auto entry = m_modules.find(ShaderKey);
+       if (entry != m_modules.end()) {
+         *pShader = entry->second;
+         return S_OK;
+       }
+     }
+-    
++
+     // This shader has not been compiled yet, so we have to create a
+     // new module. This takes a while, so we won't lock the structure.
+     D3D11CommonShader module;
+-    
++
+     try {
+       module = D3D11CommonShader(pDevice, pLinkage, ShaderKey,
+         ModuleInfo, pShaderBytecode, BytecodeLength, Icb, BindingMask);
+@@ -256,22 +252,15 @@ void D3D11CommonShader::CreateIrShader(
+       Logger::err(e.message());
+       return E_INVALIDARG;
+     }
+-    
++
+     // Insert the new module into the lookup table. If another thread
+     // has compiled the same shader in the meantime, we should return
+     // that object instead and discard the newly created module.
+-    { std::unique_lock<dxvk::mutex> lock(m_mutex);
+-      
+-      auto status = m_modules.insert({ ShaderKey, module });
+-
+-      if (!status.second) {
+-        *pShader = status.first->second;
+-        return S_OK;
+-      }
++    { std::lock_guard<dxvk::mutex> lock(m_mutex);
++      auto status = m_modules.try_emplace(ShaderKey, std::move(module));
++      *pShader = status.first->second;
++      return S_OK;
+     }
+-    
+-    *pShader = std::move(module);
+-    return S_OK;
+   }
+ 
+ }
+
+--- a/src/dxvk/dxvk_shader_builtin.cpp	2026-05-06 18:50:20.132416179 +0200
++++ b/src/dxvk/dxvk_shader_builtin.cpp	2026-05-06 18:54:49.267542397 +0200
+@@ -8,34 +8,38 @@
+ 
+ namespace dxvk {
+ 
+-  DxvkBuiltInResourceMapping::DxvkBuiltInResourceMapping(const DxvkPipelineLayout* layout)
+-  : m_setIndex(layout->usesSamplerHeap() ? 1u : 0u) {
+-
+-  }
++  namespace {
+ 
+-
+-  DxvkBuiltInResourceMapping::~DxvkBuiltInResourceMapping() {
++    std::string getBuiltInName(ir::BuiltIn builtIn) {
++      std::stringstream name;
++      name << builtIn;
++      return name.str();
++    }
+ 
+   }
+ 
++  DxvkBuiltInResourceMapping::DxvkBuiltInResourceMapping(const DxvkPipelineLayout* layout)
++  : m_setIndex(layout->usesSamplerHeap() ? 1u : 0u) {}
++
++  DxvkBuiltInResourceMapping::~DxvkBuiltInResourceMapping() {}
+ 
+-  spirv::DescriptorBinding DxvkBuiltInResourceMapping::mapDescriptor(
++  dxbc_spv::spirv::DescriptorBinding DxvkBuiltInResourceMapping::mapDescriptor(
+         ir::ScalarType          type,
+         uint32_t                regSpace,
+         uint32_t                regIndex) {
+-    spirv::DescriptorBinding result = { };
++    (void)regSpace;
++
++    dxbc_spv::spirv::DescriptorBinding result = { };
+     result.set = type == ir::ScalarType::eSampler ? 0u : m_setIndex;
+     result.binding = regIndex;
+     return result;
+   }
+ 
+-
+   uint32_t DxvkBuiltInResourceMapping::mapPushData(ir::ShaderStageMask stages) {
++    (void)stages;
+     return 0u;
+   }
+ 
+-
+-
+   DxvkBuiltInShader::DxvkBuiltInShader(
+           DxvkDevice*           device,
+     const DxvkPipelineLayout*   layout,
+@@ -224,13 +228,9 @@ namespace dxvk {
+           ir::Builder&          builder,
+           uint32_t              pushDataOffset,
+     const char*                 name) {
+-    // Declare sampler index as regular push data
+     ir::SsaDef index = declarePushData(builder, ir::ScalarType::eU32, pushDataOffset, name);
+ 
+-    // Declare actual sampler heap as an unsized descriptor
+-    // array, if we don't have one already
+     ir::SsaDef samplerHeap = { };
+-
+     auto decl = builder.getDeclarations();
+ 
+     for (auto i = decl.first; i != decl.second && !samplerHeap; i++) {
+@@ -243,7 +243,6 @@ namespace dxvk {
+       samplerHeap = builder.add(ir::Op::DclSampler(entry, 0u, 0u, 0u));
+     }
+ 
+-    // Emit descriptor load using the loaded index
+     return builder.add(ir::Op::DescriptorLoad(ir::ScalarType::eSampler, samplerHeap, index));
+   }
+ 
+@@ -298,9 +297,6 @@ namespace dxvk {
+     auto entry = builder.getOp(findEntryPoint(builder));
+     dxbc_spv_assert(entry);
+ 
+-    std::stringstream name;
+-    name << builtIn;
+-
+     ir::SsaDef inputVar = { };
+ 
+     if (ir::ShaderStage(entry.getOperand(1u)) == ir::ShaderStage::ePixel) {
+@@ -312,7 +308,8 @@ namespace dxvk {
+       inputVar = builder.add(ir::Op::DclInputBuiltIn(type, entry.getDef(), builtIn));
+     }
+ 
+-    builder.add(ir::Op::DebugName(inputVar, name.str().c_str()));
++    const std::string builtInName = getBuiltInName(builtIn);
++    builder.add(ir::Op::DebugName(inputVar, builtInName.c_str()));
+     return splitLoad(builder, ir::OpCode::eInputLoad, inputVar);
+   }
+ 
+@@ -349,11 +346,9 @@ namespace dxvk {
+     auto entry = findEntryPoint(builder);
+     auto type = builder.getOp(value).getType();
+ 
+-    std::stringstream name;
+-    name << builtIn;
+-
+     auto outputVar = builder.add(ir::Op::DclOutputBuiltIn(type, entry, builtIn));
+-    builder.add(ir::Op::DebugName(outputVar, name.str().c_str()));
++    const std::string builtInName = getBuiltInName(builtIn);
++    builder.add(ir::Op::DebugName(outputVar, builtInName.c_str()));
+ 
+     splitStore(builder, ir::OpCode::eOutputStore, outputVar, value);
+   }
+@@ -412,7 +407,6 @@ namespace dxvk {
+   ir::SsaDef DxvkBuiltInShader::emitConditionalBlock(
+           ir::Builder&          builder,
+           ir::SsaDef            cond) {
+-    // Build everything upside down since it's easier that way
+     auto mergeBlock = builder.add(ir::Op::Label());
+     auto mergeBranch = builder.addBefore(mergeBlock, ir::Op::Branch(mergeBlock));
+ 
+@@ -420,7 +414,6 @@ namespace dxvk {
+     auto condBranch = builder.addBefore(condBlock,
+       ir::Op::BranchConditional(cond, condBlock, mergeBlock));
+ 
+-    // Find current label to rewrite it as a structured selection later
+     auto currBlock = ir::findContainingBlock(builder, condBranch);
+     builder.rewriteOp(currBlock, ir::Op::LabelSelection(mergeBlock));
+ 
+@@ -436,10 +429,13 @@ namespace dxvk {
+           uint32_t              count) {
+     auto vectorType = builder.getOp(vector).getType().getBaseType(0u);
+     auto scalarType = vectorType.getBaseType();
++    const uint32_t vectorSize = vectorType.getVectorSize();
+ 
+-    dxbc_spv_assert(first + count <= vectorType.getVectorSize());
++    dxbc_spv_assert(count != 0u);
++    dxbc_spv_assert(first <= vectorSize);
++    dxbc_spv_assert(count <= vectorSize - first);
+ 
+-    if (count == vectorType.getVectorSize())
++    if (count == vectorSize)
+       return vector;
+ 
+     ir::Op compositeOp(ir::Op::CompositeConstruct(ir::BasicType(scalarType, count)));
+@@ -536,7 +532,6 @@ namespace dxvk {
+     dxbc_spv_assert(type.isBasicType());
+     ir::BasicType vectorType = type.getBaseType(0u);
+ 
+-    // Declare input parameter and the actual function
+     ir::SsaDef param = builder.add(ir::Op::DclParam(vectorType));
+     builder.add(ir::Op::DebugName(param, "lin"));
+ 
+@@ -548,7 +543,6 @@ namespace dxvk {
+     ir::SsaDef cursor = builder.setCursor(function);
+     builder.add(ir::Op::Label());
+ 
+-    // Extract color and alpha from given parameters
+     ir::SsaDef color = builder.add(ir::Op::ParamLoad(vectorType, function, param));
+     ir::SsaDef alpha = ir::SsaDef();
+ 
+@@ -610,7 +604,6 @@ namespace dxvk {
+ 
+   std::vector<uint32_t> DxvkBuiltInShader::buildShader(
+           ir::Builder&          builder) {
+-    // Run minimal set of passes to clean up vectors and unused I/O
+     ir::ScalarizePass::runPass(builder, ir::ScalarizePass::Options());
+ 
+     ir::CsePass::Options cseOptions = { };
+@@ -622,12 +615,10 @@ namespace dxvk {
+ 
+     ir::RemoveUnusedPass::runRemoveUnusedFloatModePass(builder);
+ 
+-    // Ignore float control stuff for built-in shaders,
+-    // these should generally not be necessary.
+-    spirv::SpirvBuilder::Options spirvOptions = { };
++    dxbc_spv::spirv::SpirvBuilder::Options spirvOptions = { };
+     spirvOptions.includeDebugNames = true;
+ 
+-    spirv::SpirvBuilder spirvBuilder(builder, m_resourceMapping, spirvOptions);
++    dxbc_spv::spirv::SpirvBuilder spirvBuilder(builder, m_resourceMapping, spirvOptions);
+     spirvBuilder.buildSpirvBinary();
+ 
+     auto spirvBinary = spirvBuilder.getSpirvBinary();
+@@ -711,9 +702,10 @@ namespace dxvk {
+ 
+   ir::SsaDef DxvkBuiltInShader::findEntryPointFunction(
+           ir::Builder&          builder) {
+-    auto entry = builder.getOp(findEntryPoint(builder));
+-    dxbc_spv_assert(entry);
++    auto entryPoint = findEntryPoint(builder);
++    dxbc_spv_assert(entryPoint);
+ 
++    auto entry = builder.getOp(entryPoint);
+     return ir::SsaDef(entry.getOperand(0u));
+   }
+ 
+@@ -807,7 +799,10 @@ namespace dxvk {
+     if (m_name.empty() || dumpPath.empty())
+       return;
+ 
+-    std::ofstream file(str::topath(str::format(dumpPath, "/", m_name, ".spv").c_str()).c_str(), std::ios_base::trunc | std::ios_base::binary);
++    const auto filePath =
++      str::topath(str::format(dumpPath, "/", m_name, ".spv").c_str());
++
++    std::ofstream file(filePath.c_str(), std::ios_base::trunc | std::ios_base::binary);
+     file.write(reinterpret_cast<const char*>(dwords), size * sizeof(*dwords));
+   }
+ 
+
+--- a/src/dxvk/dxvk_shader_builtin.h	2026-05-06 18:44:04.281742268 +0200
++++ b/src/dxvk/dxvk_shader_builtin.h	2026-05-06 18:48:29.766069898 +0200
+@@ -4,6 +4,7 @@
+ #include <ir/ir_utils.h>
+ 
+ #include <spirv/spirv_builder.h>
++#include <spirv/spirv_mapping.h>
+ 
+ #include "dxvk_device.h"
+ #include "dxvk_util.h"
+@@ -16,13 +17,8 @@ namespace dxvk {
+    * \brief Built-in vertex shader info
+    */
+   struct DxvkBuiltInVertexShader {
+-    /* Vertex index, declared as a scalar uint. */
+     ir::SsaDef vertexIndex = { };
+-    /* Instance index, declared as a scalar uint. */
+     ir::SsaDef instanceIndex = { };
+-    /* Unscaled vertex coordinate, where a value of 0 corresponds to the
+-     * top-left corner of the viewport and 1 to the bottom-right. Defined
+-     * as a 2D float vector. */
+     ir::SsaDef coord = { };
+   };
+ 
+@@ -30,7 +26,6 @@ namespace dxvk {
+    * \brief Built-in pixel shader info
+    */
+   struct DxvkBuiltInPixelShader {
+-    /* Sample ID input, relevant for MSAA use cases only. */
+     ir::SsaDef sampleId = { };
+   };
+ 
+@@ -38,44 +33,31 @@ namespace dxvk {
+    * \brief Built-in compute shader info
+    */
+   struct DxvkBuiltInComputeShader {
+-    /* Global thread ID, as a 3D uint vector. */
+     ir::SsaDef globalId = { };
+-    /* Workgroup ID, as a 3D uint vector. */
+     ir::SsaDef groupId = { };
+-    /* Local thread ID, as a 3D uint vector. */
+     ir::SsaDef localId = { };
+-    /* Flattened local thread index. */
+     ir::SsaDef localIndex = { };
+   };
+ 
+   /**
+    * \brief Trivial resource mapping for built-in shaders
+-   *
+-   * Bindings and push data layouts are explicit anyway, so the only
+-   * thing this actually needs to do is sort out the set index.
+    */
+-  class DxvkBuiltInResourceMapping : public spirv::ResourceMapping {
+-
++  class DxvkBuiltInResourceMapping : public dxbc_spv::spirv::ResourceMapping {
+   public:
+-
+     explicit DxvkBuiltInResourceMapping(const DxvkPipelineLayout* layout);
+-
+     ~DxvkBuiltInResourceMapping();
+ 
+-    spirv::DescriptorBinding mapDescriptor(
+-          ir::ScalarType          type,
+-          uint32_t                regSpace,
+-          uint32_t                regIndex) override;
++    dxbc_spv::spirv::DescriptorBinding mapDescriptor(
++            ir::ScalarType          type,
++            uint32_t                regSpace,
++            uint32_t                regIndex) override;
+ 
+     uint32_t mapPushData(ir::ShaderStageMask stages) override;
+ 
+   private:
+-
+     uint32_t m_setIndex = 0u;
+-
+   };
+ 
+-
+   /**
+    * \brief Built-in shader builder
+    *
+@@ -88,59 +70,23 @@ namespace dxvk {
+    * will run the scalarization pass. This is done for convenience.
+    */
+   class DxvkBuiltInShader {
+-
+   public:
+-
+     DxvkBuiltInShader(
+             DxvkDevice*           device,
+       const DxvkPipelineLayout*   layout,
+       const std::string&          name);
+-
+     ~DxvkBuiltInShader();
+ 
+-    /**
+-     * \brief Creates empty compute shader template
+-     *
+-     * \param [in,out] builder Shader builder
+-     * \param [in] groupSize Workgroup size
+-     * \returns Compute shader metadata
+-     */
+     DxvkBuiltInComputeShader buildComputeShader(
+             ir::Builder&          builder,
+             VkExtent3D            groupSize);
+ 
+-    /**
+-     * \brief Creates empty pixel shader template
+-     *
+-     * \param [in,out] builder Shader builder
+-     * \returns Pixel shader metadata
+-     */
+     DxvkBuiltInPixelShader buildPixelShader(
+             ir::Builder&          builder);
+ 
+-    /**
+-     * \brief Creates vertex shader for full-screen triangle
+-     *
+-     * \param [in,out] builder Shader builder
+-     * \returns Pixel shader metadata
+-     */
+     DxvkBuiltInVertexShader buildFullscreenVertexShader(
+             ir::Builder&          builder);
+ 
+-    /**
+-     * \brief Helper to declare an image SRV
+-     *
+-     * Also immediately inserts a descriptor load
+-     * at the current cursor location.
+-     * \param [in,out] builder Shader builder
+-     * \param [in] binding Binding index
+-     * \param [in] name Debug name
+-     * \param [in] viewType Image view type
+-     * \param [in] viewFormat Expected format
+-     * \param [in] viewAspect Format aspect
+-     * \param [in] samples Expected sample count
+-     * \returns SSA def of the descriptor load.
+-     */
+     ir::SsaDef declareImageSrv(
+             ir::Builder&          builder,
+             uint32_t              binding,
+@@ -150,52 +96,18 @@ namespace dxvk {
+             VkImageAspectFlagBits viewAspect,
+             VkSampleCountFlagBits samples);
+ 
+-    /**
+-     * \brief Helper to declare a typed buffer SRV
+-     *
+-     * Also immediately inserts a descriptor load
+-     * at the current cursor location.
+-     * \param [in,out] builder Shader builder
+-     * \param [in] binding Binding index
+-     * \param [in] name Debug name
+-     * \param [in] viewFormat Expected format
+-     * \returns SSA def of the descriptor load.
+-     */
+     ir::SsaDef declareTexelBufferSrv(
+             ir::Builder&          builder,
+             uint32_t              binding,
+       const char*                 name,
+             VkFormat              viewFormat);
+ 
+-    /**
+-     * \brief Helper to declare a structured buffer SRV
+-     *
+-     * Also immediately inserts a descriptor load
+-     * at the current cursor location.
+-     * \param [in,out] builder Shader builder
+-     * \param [in] binding Binding index
+-     * \param [in] name Debug name
+-     * \param [in] elementType Element type
+-     * \returns SSA def of the descriptor load.
+-     */
+     ir::SsaDef declareBufferSrv(
+             ir::Builder&          builder,
+             uint32_t              binding,
+       const char*                 name,
+             ir::BasicType         elementType);
+ 
+-    /**
+-     * \brief Helper to declare an image UAV
+-     *
+-     * Also immediately inserts a descriptor load
+-     * at the current cursor location.
+-     * \param [in,out] builder Shader builder
+-     * \param [in] binding Binding index
+-     * \param [in] name Debug name
+-     * \param [in] viewType Image view type
+-     * \param [in] viewFormat Expected format
+-     * \returns SSA def of the descriptor load.
+-     */
+     ir::SsaDef declareImageUav(
+             ir::Builder&          builder,
+             uint32_t              binding,
+@@ -203,67 +115,23 @@ namespace dxvk {
+             VkImageViewType       viewType,
+             VkFormat              viewFormat);
+ 
+-    /**
+-     * \brief Helper to declare a typed buffer UAV
+-     *
+-     * Also immediately inserts a descriptor load
+-     * at the current cursor location.
+-     * \param [in,out] builder Shader builder
+-     * \param [in] binding Binding index
+-     * \param [in] name Debug name
+-     * \param [in] viewFormat Expected format
+-     * \returns SSA def of the descriptor load.
+-     */
+     ir::SsaDef declareTexelBufferUav(
+             ir::Builder&          builder,
+             uint32_t              binding,
+       const char*                 name,
+             VkFormat              viewFormat);
+ 
+-    /**
+-     * \brief Helper to declare a structured buffer UAV
+-     *
+-     * Also immediately inserts a descriptor load
+-     * at the current cursor location.
+-     * \param [in,out] builder Shader builder
+-     * \param [in] binding Binding index
+-     * \param [in] name Debug name
+-     * \param [in] elementType Element type
+-     * \returns SSA def of the descriptor load.
+-     */
+     ir::SsaDef declareBufferUav(
+             ir::Builder&          builder,
+             uint32_t              binding,
+       const char*                 name,
+             ir::BasicType         elementType);
+ 
+-    /**
+-     * \brief Helper to declare a sampler index
+-     *
+-     * In helper shaders we declare samplers as \c uint32 since no
+-     * more than one sampler should be required anyway, if any.
+-     * Immediately inserts a descriptor load for the sampler.
+-     * \param [in,out] builder Shader builder
+-     * \param [in] pushDataOffset Push data offset, in bytes
+-     * \param [in] name Debug name
+-     * \returns SSA def of the descriptor load
+-     */
+     ir::SsaDef declareSampler(
+             ir::Builder&          builder,
+             uint32_t              pushDataOffset,
+       const char*                 name);
+ 
+-    /**
+-     * \brief Helper to declare an input target
+-     *
+-     * \param [in,out] builder Shader builder
+-     * \param [in] binding Binding index
+-     * \param [in] name Debug name
+-     * \param [in] attachment Render target index
+-     * \param [in] format Render target format
+-     * \param [in] samples Sample count
+-     * \returns SSA def of the descriptor load
+-     */
+     ir::SsaDef declareInputTarget(
+             ir::Builder&          builder,
+             uint32_t              binding,
+@@ -272,46 +140,18 @@ namespace dxvk {
+             VkFormat              format,
+             VkSampleCountFlagBits samples);
+ 
+-    /**
+-     * \brief Declares and loads push data parameter
+-     *
+-     * For graphics shaders, push data is unconditionally made
+-     * visible to both vertex and fragment shaders for simplicity.
+-     * \param [in,out] builder Shader builder
+-     * \param [in] type Push data type
+-     * \param [in] offset Push data offset, in bytes
+-     * \param [in] name Debug name
+-     * \returns SSA def of push data value
+-     */
+     ir::SsaDef declarePushData(
+             ir::Builder&          builder,
+             ir::BasicType         type,
+             uint32_t              pushDataOffset,
+       const char*                 name);
+ 
+-    /**
+-     * \brief Loads built-in input variable
+-     *
+-     * Used to load vetex shader outputs in the pixel shader.
+-     * \param [in,out] builder Shader builder
+-     * \param [in] type Variable type
+-     * \param [in] builtIn Built-in type
+-     */
+     ir::SsaDef declareBuiltInInput(
+             ir::Builder&          builder,
+             ir::BasicType         type,
+             ir::BuiltIn           builtIn,
+             ir::InterpolationModes interpolation = ir::InterpolationModes());
+ 
+-    /**
+-     * \brief Loads shader input variable
+-     *
+-     * Used to load vetex shader outputs in the pixel shader.
+-     * \param [in,out] builder Shader builder
+-     * \param [in] type Variable type
+-     * \param [in] location Output location
+-     * \param [in] name Debug name
+-     */
+     ir::SsaDef declareInput(
+             ir::Builder&          builder,
+             ir::BasicType         type,
+@@ -319,215 +159,95 @@ namespace dxvk {
+       const char*                 name,
+             ir::InterpolationModes interpolation = ir::InterpolationModes());
+ 
+-    /**
+-     * \brief Exports built-in output
+-     *
+-     * Declares a built-in output variable and stores the given value.
+-     * \param [in,out] builder Shader builder
+-     * \param [in] builtIn Built-in to export
+-     * \param [in] value Layer index value
+-     */
+     void exportBuiltIn(
+             ir::Builder&          builder,
+             ir::BuiltIn           builtIn,
+             ir::SsaDef            value);
+ 
+-    /**
+-     * \brief Exports given output location
+-     *
+-     * Useful for built-in pixel shaders to write color output.
+-     * \param [in,out] builder Shader builder
+-     * \param [in] location Output location
+-     * \param [in] value Layer index value
+-     */
+     void exportOutput(
+             ir::Builder&          builder,
+             uint32_t              location,
+             ir::SsaDef            value,
+       const char*                 name);
+ 
+-    /**
+-     * \brief Emits manual bound check
+-     *
+-     * \param [in,out] builder Shader builder
+-     * \param [in] coord Coordinate or index value
+-     * \param [in] size Size value
+-     * \param [in] dims Number of dimensions to consider
+-     * \returns SSA def of condition that will be \c true if all checked
+-     *    dimensions of \c coord are less than the corresponding \c size.
+-     */
+     ir::SsaDef emitBoundCheck(
+             ir::Builder&          builder,
+             ir::SsaDef            coord,
+             ir::SsaDef            size,
+             uint32_t              dims);
+ 
+-    /**
+-     * \brief Emits conditional 'if' block
+-     *
+-     * Moves the cursor into the conditional block.
+-     * \param [in,out] builder Shader builder
+-     * \param [in] cond Condition that must be \c true to enter the block.
+-     * \returns SSA def of the merge block label.
+-     */
+     ir::SsaDef emitConditionalBlock(
+             ir::Builder&          builder,
+             ir::SsaDef            cond);
+ 
+-    /**
+-     * \brief Extracts given number of dimensions from a vector
+-     *
+-     * \param [in,out] builder Shader builder
+-     * \param [in] vector Input vector
+-     * \param [in] first First dimension to extract
+-     * \param [in] count Number of dimensions
+-     * \returns Resulting scalar or vector
+-     */
+     ir::SsaDef emitExtractVector(
+             ir::Builder&          builder,
+             ir::SsaDef            vector,
+             uint32_t              first,
+             uint32_t              count);
+ 
+-    /**
+-     * \brief Concatenates two values to a vector
+-     *
+-     * \param [in,out] builder Shader builder
+-     * \param [in] a First scalar or vector
+-     * \param [in] b Second scalar or vector
+-     * \returns Concatenated vector
+-     */
+     ir::SsaDef emitConcatVector(
+             ir::Builder&          builder,
+             ir::SsaDef            a,
+             ir::SsaDef            b);
+ 
+-    /**
+-     * \brief Replicates scalar into a vector
+-     *
+-     * \param [in,out] builder Shader builder
+-     * \param [in] type Vector type
+-     * \param [in] value Scalar value
+-     * \returns Concatenated vector
+-     */
+     ir::SsaDef emitReplicateScalar(
+             ir::Builder&          builder,
+             ir::BasicType         type,
+             ir::SsaDef            value);
+ 
+-    /**
+-     * \brief Masks output vector for a given format
+-     *
+-     * Replaces all color components that are not part of the given
+-     * format with zero. For depth or depth-stencil formats, this
+-     * will return a scalar value, otherwise a four-coponent vector.
+-     * \param [in,out] builder Shader builder
+-     * \param [in] format Format
+-     * \param [in] vector Vector
+-     * \returns Masked vector
+-     */
+     ir::SsaDef emitFormatVector(
+             ir::Builder&          builder,
+             VkFormat              format,
+             ir::SsaDef            a);
+ 
+-    /**
+-     * \brief Builds function for linear to sRGB conversion
+-     *
+-     * \param [in,out] builder Shader builder
+-     * \param [in] type Parameter and return type. If this is a
+-     *   four-component vector type, the last component will be
+-     *   passed through unmodified.
+-     * \returns Function that performs the conversion.
+-     */
+     ir::SsaDef buildLinearToSrgbFn(
+             ir::Builder&          builder,
+       const ir::Type&             type);
+ 
+-    /**
+-     * \brief Prints disassembled shader to debug log
+-     *
+-     * Useful for debugging purposes.
+-     * \param [in] level Log level
+-     * \param [in] builder Shader builder
+-     */
+     void printShader(
+             LogLevel              level,
+             ir::Builder&          builder);
+ 
+-    /**
+-     * \brief Builds SPIR-V shader
+-     *
+-     * Runs a minimal set of passes to eliminate unused inputs and converts
+-     * the shader to SPIR-V.
+-     * \param [in] builder Shader builder
+-     * \returns SPIR-V binary
+-     */
+     std::vector<uint32_t> buildShader(
+             ir::Builder&          builder);
+ 
+-    /**
+-     * \brief Determines scalar type for Vulkan image formats
+-     *
+-     * Returns either \c eF32, \c eU32 or \c eI32, depending on the format. For
+-     * depth aspects this will always return \c eF32, and \c eU32 for stencil.
+-     * \param [in] format Vulkan format to check
+-     * \param [in] aspect Image aspect to check
+-     * \returns Sampled type for the given format
+-     */
+     ir::ScalarType determineSampledType(
+             VkFormat              format,
+             VkImageAspectFlagBits aspect);
+ 
+-    /**
+-     * \brief Determines resource kind for an image view type
+-     *
+-     * \param [in] viewType Image view type
+-     * \param [in] samples Image sample count
+-     * \returns Resource kind
+-     */
+     ir::ResourceKind determineResourceKind(
+             VkImageViewType       viewType,
+             VkSampleCountFlagBits samples);
+ 
+   private:
+-
+     DxvkShaderOptions m_options = { };
+-
+     DxvkBuiltInResourceMapping m_resourceMapping;
+-
+     std::string m_name;
+ 
+     ir::SsaDef findEntryPoint(
+             ir::Builder&          builder);
+-
+     ir::SsaDef findEntryPointFunction(
+             ir::Builder&          builder);
+-
+     ir::SsaDef declareEntryPoint(
+             ir::Builder&          builder,
+             ir::ShaderStage       stage);
+-
+     ir::SsaDef splitLoad(
+             ir::Builder&          builder,
+             ir::OpCode            opCode,
+             ir::SsaDef            def);
+-
+     ir::SsaDef makeConstantVector(
+             ir::Builder&          builder,
+             ir::SsaDef            constant,
+             ir::BasicType         type);
+-
+     void splitStore(
+             ir::Builder&          builder,
+             ir::OpCode            opCode,
+             ir::SsaDef            var,
+             ir::SsaDef            value);
+-
+     void dumpShader(
+             size_t                size,
+       const uint32_t*             dwords);
+-
+   };
+ 
+ }
+
+--- a/src/dxvk/dxvk_graphics_state.h	2026-05-06 18:31:56.540365380 +0200
++++ b/src/dxvk/dxvk_graphics_state.h	2026-05-06 18:37:03.562803082 +0200
+@@ -3,6 +3,7 @@
+ #include "dxvk_format.h"
+ #include "dxvk_limits.h"
+ 
++#include <array>
+ #include <atomic>
+ #include <cstring>
+ #include <optional>
+@@ -10,12 +11,6 @@
+ 
+ namespace dxvk {
+ 
+-  /**
+-   * \brief Packed input assembly state
+-   *
+-   * Stores the primitive topology
+-   * and primitive restart info.
+-   */
+   class DxvkIaInfo {
+ 
+   public:
+@@ -55,12 +50,6 @@ namespace dxvk {
+   };
+ 
+ 
+-  /**
+-   * \brief Packed input layout metadata
+-   * 
+-   * Stores the number of vertex attributes
+-   * and bindings in one byte each.
+-   */
+   class DxvkIlInfo {
+ 
+   public:
+@@ -89,13 +78,6 @@ namespace dxvk {
+   };
+ 
+ 
+-  /**
+-   * \brief Packed vertex attribute
+-   *
+-   * Stores a vertex attribute description. Assumes
+-   * that all vertex formats have numerical values
+-   * of 127 or less (i.e. fit into 7 bits).
+-   */
+   class DxvkIlAttribute {
+ 
+   public:
+@@ -112,11 +94,11 @@ namespace dxvk {
+       m_format  (uint32_t(format)),
+       m_offset  (uint32_t(offset)),
+       m_reserved(0) { }
+-    
++
+     uint32_t location() const {
+       return m_location;
+     }
+-    
++
+     uint32_t binding() const {
+       return m_binding;
+     }
+@@ -128,7 +110,7 @@ namespace dxvk {
+     uint32_t offset() const {
+       return m_offset;
+     }
+-    
++
+     VkVertexInputAttributeDescription description() const {
+       VkVertexInputAttributeDescription result;
+       result.location = m_location;
+@@ -145,16 +127,10 @@ namespace dxvk {
+     uint32_t m_format                 : 7;
+     uint32_t m_offset                 : 11;
+     uint32_t m_reserved               : 4;
+-  
++
+   };
+ 
+ 
+-  /**
+-   * \brief Packed vertex binding
+-   *
+-   * Stores a vertex binding description,
+-   * including the 32-bit divisor.
+-   */
+   class DxvkIlBinding {
+ 
+   public:
+@@ -170,11 +146,11 @@ namespace dxvk {
+       m_stride    (uint32_t(stride)),
+       m_inputRate (uint32_t(inputRate)),
+       m_divisor   (uint32_t(divisor < (1u << 14) ? divisor : 0u)) { }
+-    
++
+     uint32_t binding() const {
+       return m_binding;
+     }
+-    
++
+     uint32_t stride() const {
+       return m_stride;
+     }
+@@ -182,7 +158,7 @@ namespace dxvk {
+     VkVertexInputRate inputRate() const {
+       return VkVertexInputRate(m_inputRate);
+     }
+-    
++
+     uint32_t divisor() const {
+       return m_divisor;
+     }
+@@ -209,12 +185,6 @@ namespace dxvk {
+   };
+ 
+ 
+-  /**
+-   * \brief Packed rasterizer state
+-   *
+-   * Stores a bunch of flags and parameters
+-   * related to rasterization in four bytes.
+-   */
+   class DxvkRsInfo {
+ 
+   public:
+@@ -235,7 +205,7 @@ namespace dxvk {
+       m_flatShading     (uint16_t(flatShading)),
+       m_lineMode        (uint16_t(lineMode)),
+       m_reserved        (0) { }
+-    
++
+     VkBool32 depthClipEnable() const {
+       return VkBool32(m_depthClipEnable);
+     }
+@@ -261,7 +231,12 @@ namespace dxvk {
+     }
+ 
+     bool eq(const DxvkRsInfo& other) const {
+-      return !std::memcmp(this, &other, sizeof(*this));
++      return m_depthClipEnable  == other.m_depthClipEnable
++          && m_polygonMode      == other.m_polygonMode
++          && m_sampleCount      == other.m_sampleCount
++          && m_conservativeMode == other.m_conservativeMode
++          && m_flatShading      == other.m_flatShading
++          && m_lineMode         == other.m_lineMode;
+     }
+ 
+   private:
+@@ -273,16 +248,10 @@ namespace dxvk {
+     uint16_t m_flatShading            : 1;
+     uint16_t m_lineMode               : 2;
+     uint16_t m_reserved               : 3;
+-  
++
+   };
+ 
+ 
+-  /**
+-   * \brief Packed multisample info
+-   *
+-   * Stores the sample mask, sample count override
+-   * and alpha-to-coverage state in four bytes.
+-   */
+   class DxvkMsInfo {
+ 
+   public:
+@@ -297,7 +266,7 @@ namespace dxvk {
+       m_enableAlphaToCoverage (uint16_t(enableAlphaToCoverage)),
+       m_reserved              (0),
+       m_sampleMask            (uint16_t(sampleMask)) { }
+-    
++
+     VkSampleCountFlags sampleCount() const {
+       return VkSampleCountFlags(m_sampleCount);
+     }
+@@ -324,12 +293,6 @@ namespace dxvk {
+   };
+ 
+ 
+-  /**
+-   * \brief Packed output merger metadata
+-   *
+-   * Stores the logic op state in two bytes.
+-   * Blend modes are stored separately.
+-   */
+   class DxvkOmInfo {
+ 
+   public:
+@@ -344,7 +307,7 @@ namespace dxvk {
+       m_logicOp       (uint16_t(logicOp)),
+       m_feedbackLoop  (uint16_t(feedbackLoop)),
+       m_reserved      (0) { }
+-    
++
+     VkBool32 enableLogicOp() const {
+       return VkBool32(m_enableLogicOp);
+     }
+@@ -371,13 +334,6 @@ namespace dxvk {
+   };
+ 
+ 
+-  /**
+-   * \brief Packed render target formats
+-   *
+-   * Compact representation of depth-stencil and color attachments,
+-   * as well as the read-only mask for the depth-stencil attachment,
+-   * which needs to be known at pipeline compile time.
+-   */
+   class DxvkRtInfo {
+ 
+   public:
+@@ -411,6 +367,17 @@ namespace dxvk {
+ 
+   private:
+ 
++    static constexpr uint32_t Range0Start = uint32_t(VK_FORMAT_UNDEFINED);
++    static constexpr uint32_t Range0End   = uint32_t(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32);
++    static constexpr uint32_t Range1Start = uint32_t(VK_FORMAT_A4R4G4B4_UNORM_PACK16);
++    static constexpr uint32_t Range1End   = uint32_t(VK_FORMAT_A4B4G4R4_UNORM_PACK16);
++    static constexpr uint32_t Range2Start = uint32_t(VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR);
++    static constexpr uint32_t Range2End   = uint32_t(VK_FORMAT_A8_UNORM_KHR);
++
++    static constexpr uint32_t Range0Size  = Range0End - Range0Start + 1u;
++    static constexpr uint32_t Range1Size  = Range1End - Range1Start + 1u;
++    static constexpr uint32_t Range2Size  = Range2End - Range2Start + 1u;
++
+     uint64_t m_packedData;
+ 
+     static uint64_t encodeDepthStencilAspects(VkImageAspectFlags aspects) {
+@@ -420,22 +387,23 @@ namespace dxvk {
+     static uint64_t encodeDepthStencilFormat(VkFormat format) {
+       return format
+         ? (uint64_t(format) - uint64_t(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)) << 56
+-        : (uint64_t(0));
++        : uint64_t(0);
+     }
+ 
+     static uint64_t encodeColorFormat(VkFormat format, uint32_t index) {
+-      uint64_t value = 0u;
++      const uint32_t f = uint32_t(format);
++      uint32_t value = 0u;
+ 
+-      for (const auto& p : s_colorFormatRanges) {
+-        if (format >= p.first && format <= p.second) {
+-          value += uint32_t(format) - uint32_t(p.first);
+-          break;
+-        }
+-
+-        value += uint32_t(p.second) - uint32_t(p.first) + 1u;
+-      }
++      if (f <= Range0End)
++        value = f - Range0Start;
++      else if (f >= Range1Start && f <= Range1End)
++        value = Range0Size + (f - Range1Start);
++      else if (f >= Range2Start && f <= Range2End)
++        value = Range0Size + Range1Size + (f - Range2Start);
++      else
++        value = 0u;
+ 
+-      return value << (7 * index);
++      return uint64_t(value) << (7u * index);
+     }
+ 
+     static VkImageAspectFlags decodeDepthStencilAspects(uint64_t value) {
+@@ -443,7 +411,7 @@ namespace dxvk {
+     }
+ 
+     static VkFormat decodeDepthStencilFormat(uint64_t value) {
+-      value = (value >> 56) & 0x1F;
++      value = (value >> 56) & 0x1Fu;
+ 
+       return value
+         ? VkFormat(value + uint64_t(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32))
+@@ -451,35 +419,27 @@ namespace dxvk {
+     }
+ 
+     static VkFormat decodeColorFormat(uint64_t value, uint32_t index) {
+-      value = (value >> (7 * index)) & 0x7F;
++      uint32_t code = uint32_t((value >> (7u * index)) & 0x7Fu);
+ 
+-      for (const auto& p : s_colorFormatRanges) {
+-        uint32_t rangeSize = uint32_t(p.second) - uint32_t(p.first) + 1u;
++      if (code < Range0Size)
++        return VkFormat(Range0Start + code);
+ 
+-        if (value < rangeSize)
+-          return VkFormat(uint32_t(p.first) + uint32_t(value));
++      code -= Range0Size;
+ 
+-        value -= rangeSize;
+-      }
++      if (code < Range1Size)
++        return VkFormat(Range1Start + code);
++
++      code -= Range1Size;
++
++      if (code < Range2Size)
++        return VkFormat(Range2Start + code);
+ 
+       return VK_FORMAT_UNDEFINED;
+     }
+ 
+-    static constexpr std::array<std::pair<VkFormat, VkFormat>, 3> s_colorFormatRanges = {{
+-      { VK_FORMAT_UNDEFINED,                  VK_FORMAT_E5B9G9R9_UFLOAT_PACK32  },  /*   0 - 123 */
+-      { VK_FORMAT_A4R4G4B4_UNORM_PACK16,      VK_FORMAT_A4B4G4R4_UNORM_PACK16   },  /* 124 - 125 */
+-      { VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR,  VK_FORMAT_A8_UNORM_KHR            },  /* 126 - 127 */
+-    }};
+-
+   };
+ 
+ 
+-  /**
+-   * \brief Packed attachment blend mode
+-   *
+-   * Stores blendig parameters for a single
+-   * color attachment in four bytes.
+-   */
+   class DxvkOmAttachmentBlend {
+ 
+   public:
+@@ -504,7 +464,7 @@ namespace dxvk {
+       m_alphaBlendOp        (uint32_t(alphaBlendOp)),
+       m_colorWriteMask      (uint32_t(colorWriteMask)),
+       m_reserved            (0) { }
+-    
++
+     VkBool32 blendEnable() const {
+       return m_blendEnable;
+     }
+@@ -565,12 +525,6 @@ namespace dxvk {
+   };
+ 
+ 
+-  /**
+-   * \brief Packed attachment swizzle
+-   *
+-   * Stores the component mapping for one
+-   * single color attachment in one byte.
+-   */
+   class DxvkOmAttachmentSwizzle {
+ 
+   public:
+@@ -582,12 +536,12 @@ namespace dxvk {
+       m_g(util::getComponentIndex(mapping.g, 1)),
+       m_b(util::getComponentIndex(mapping.b, 2)),
+       m_a(util::getComponentIndex(mapping.a, 3)) { }
+-    
++
+     uint32_t rIndex() const { return m_r; }
+     uint32_t gIndex() const { return m_g; }
+     uint32_t bIndex() const { return m_b; }
+     uint32_t aIndex() const { return m_a; }
+-    
++
+     VkComponentMapping mapping() const {
+       VkComponentMapping result;
+       result.r = decodeSwizzle(m_r);
+@@ -611,23 +565,11 @@ namespace dxvk {
+   };
+ 
+ 
+-  /**
+-   * \brief Specialization constant state
+-   *
+-   * Stores the raw 32-bit spec constant values.
+-   */
+   struct DxvkScInfo {
+     uint32_t specConstants[DxvkLimits::MaxNumSpecConstants];
+   };
+ 
+ 
+-  /**
+-   * \brief Packed graphics pipeline state
+-   *
+-   * Stores a compressed representation of the full
+-   * graphics pipeline state which is optimized for
+-   * lookup performance.
+-   */
+   struct alignas(32) DxvkGraphicsPipelineStateInfo {
+     DxvkGraphicsPipelineStateInfo() {
+       std::memset(this, 0, sizeof(*this));
+@@ -636,12 +578,12 @@ namespace dxvk {
+     DxvkGraphicsPipelineStateInfo(const DxvkGraphicsPipelineStateInfo& other) {
+       std::memcpy(this, &other, sizeof(*this));
+     }
+-    
++
+     DxvkGraphicsPipelineStateInfo& operator = (const DxvkGraphicsPipelineStateInfo& other) {
+       std::memcpy(this, &other, sizeof(*this));
+       return *this;
+     }
+-    
++
+     bool eq(const DxvkGraphicsPipelineStateInfo& other) const {
+       return bit::bcmpeq(this, &other);
+     }
+@@ -660,34 +602,42 @@ namespace dxvk {
+     }
+ 
+     bool useDynamicStencilTest() const {
+-      auto format = rt.getDepthStencilFormat();
++      const VkFormat format = rt.getDepthStencilFormat();
+       return format && (lookupFormatInfo(format)->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT);
+     }
+ 
+     bool useDynamicVertexStrides() const {
+-      if (!il.bindingCount())
+-        return false;
++      const uint32_t count = il.bindingCount();
+ 
+-      bool result = true;
++      if (!count)
++        return false;
+ 
+-      for (uint32_t i = 0; i < il.bindingCount() && result; i++)
+-        result = !ilBindings[i].stride();
++      for (uint32_t i = 0u; i < count; i++) {
++        if (ilBindings[i].stride())
++          return false;
++      }
+ 
+-      return result;
++      return true;
+     }
+ 
+     bool useDynamicBlendConstants() const {
+-      bool result = false;
+-      
+-      for (uint32_t i = 0; i < MaxNumRenderTargets && !result; i++) {
+-        result |= rt.getColorFormat(i) && omBlend[i].blendEnable()
+-         && (util::isBlendConstantBlendFactor(omBlend[i].srcColorBlendFactor())
+-          || util::isBlendConstantBlendFactor(omBlend[i].dstColorBlendFactor())
+-          || util::isBlendConstantBlendFactor(omBlend[i].srcAlphaBlendFactor())
+-          || util::isBlendConstantBlendFactor(omBlend[i].dstAlphaBlendFactor()));
++      for (uint32_t i = 0u; i < MaxNumRenderTargets; i++) {
++        if (!rt.getColorFormat(i))
++          continue;
++
++        const auto& blend = omBlend[i];
++
++        if (!blend.blendEnable())
++          continue;
++
++        if (util::isBlendConstantBlendFactor(blend.srcColorBlendFactor())
++         || util::isBlendConstantBlendFactor(blend.dstColorBlendFactor())
++         || util::isBlendConstantBlendFactor(blend.srcAlphaBlendFactor())
++         || util::isBlendConstantBlendFactor(blend.dstAlphaBlendFactor()))
++          return true;
+       }
+ 
+-      return result;
++      return false;
+     }
+ 
+     bool useDualSourceBlending() const {
+@@ -703,13 +653,14 @@ namespace dxvk {
+           && rs.sampleCount() == VK_SAMPLE_COUNT_1_BIT;
+     }
+ 
+-    bool writesRenderTarget(
+-            uint32_t                        target) const {
++    bool writesRenderTarget(uint32_t target) const {
++      if (unlikely(target >= MaxNumRenderTargets))
++        return false;
++
+       if (!omBlend[target].colorWriteMask())
+         return false;
+ 
+-      VkFormat rtFormat = rt.getColorFormat(target);
+-      return rtFormat != VK_FORMAT_UNDEFINED;
++      return rt.getColorFormat(target) != VK_FORMAT_UNDEFINED;
+     }
+ 
+ 
+@@ -727,9 +678,6 @@ namespace dxvk {
+   };
+ 
+ 
+-  /**
+-   * \brief Compute pipeline state info
+-   */
+   struct alignas(32) DxvkComputePipelineStateInfo {
+     DxvkComputePipelineStateInfo() {
+       std::memset(this, 0, sizeof(*this));
+@@ -738,16 +686,16 @@ namespace dxvk {
+     DxvkComputePipelineStateInfo(const DxvkComputePipelineStateInfo& other) {
+       std::memcpy(this, &other, sizeof(*this));
+     }
+-    
++
+     DxvkComputePipelineStateInfo& operator = (const DxvkComputePipelineStateInfo& other) {
+       std::memcpy(this, &other, sizeof(*this));
+       return *this;
+     }
+-    
++
+     bool eq(const DxvkComputePipelineStateInfo& other) const {
+       return bit::bcmpeq(this, &other);
+     }
+-    
++
+     size_t hash() const {
+       auto src = reinterpret_cast<const unsigned char*>(this);
+       return size_t(bit::fnv1a_hash(src, sizeof(*this)));
+@@ -757,12 +705,6 @@ namespace dxvk {
+   };
+ 
+ 
+-  /**
+-   * \brief Pipeline state look-up table
+-   *
+-   * Provides a thread-safe, adaptive data structure for pipeline variants.
+-   * Look-up and insertion are expected to be O(log n).
+-   */
+   template<typename K, typename V>
+   class DxvkPipelineVariantTable {
+     static constexpr size_t LayerBits = 5u;
+@@ -776,9 +718,7 @@ namespace dxvk {
+     }
+ 
+     V* find(const K& k) const {
+-      // If the number of variants is small, avoid computing the
+-      // state hash since that is somewhat expensive to do
+-      uint32_t mask = m_table.mask.load(std::memory_order::memory_order_acquire);
++      uint32_t mask = m_table.mask.load(std::memory_order_acquire);
+ 
+       bool useSimple = !(mask & (mask - 1u));
+ 
+@@ -787,12 +727,13 @@ namespace dxvk {
+ 
+       if (likely(useSimple)) {
+         for (auto index : bit::BitMask(mask)) {
+-          // If more that one level is present, we need to consider
+-          // those as well, but we can only do that on the hash path.
+-          auto e = m_table.entries[index].load(std::memory_order_acquire);
++          Entry* e = m_table.entries[index].load(std::memory_order_acquire);
++
++          if (!e)
++            continue;
++
+           useSimple = useSimple && !e->table.mask.load(std::memory_order_relaxed);
+ 
+-          // Scan entries with the same hash
+           while (e) {
+             if (e->key.eq(k))
+               return &e->value;
+@@ -805,29 +746,25 @@ namespace dxvk {
+           return nullptr;
+       }
+ 
+-      // Compute hash and traverse entries
+-      size_t hash = k.hash();
++      const size_t hash = k.hash();
+       size_t shift = 0u;
+ 
+       const Table* table = &m_table;
+ 
+       while (true) {
+-        size_t index = computeListIndex(hash, shift);
++        const size_t index = computeListIndex(hash, shift);
+         shift += LayerBits;
+ 
+-        auto e = table->entries[index].load(std::memory_order_acquire);
++        Entry* e = table->entries[index].load(std::memory_order_acquire);
+ 
+         if (!e)
+           break;
+ 
+-        // Fetch next table from list head
+-        // and ensure that the hash matches
+         table = &e->table;
+ 
+         if (e->hash != hash)
+           continue;
+ 
+-        // Scan entries with the same hash
+         while (e) {
+           if (e->key.eq(k))
+             return &e->value;
+@@ -836,32 +773,27 @@ namespace dxvk {
+         }
+       }
+ 
+-      // No pipeline found
+       return nullptr;
+     }
+ 
+     template<typename... Args>
+     V* add(const K& k, Args&&... args) {
+-      size_t hash = k.hash();
++      const size_t hash = k.hash();
+ 
+-      // Try to insert the new entry into the top-level look-up table.
+-      // If the given entry is already set, try the next level.
+       Entry* entry = new Entry(k, hash, std::forward<Args>(args)...);
+       Table* table = &m_table;
+       Entry* target = nullptr;
+ 
+-      size_t index = -1;
++      size_t index = 0u;
+       size_t shift = 0u;
+ 
+       while (!target) {
+         index = computeListIndex(hash, shift);
+ 
+-        // If this succeeds, this is the first entry at the given index
+         if (table->entries[index].compare_exchange_strong(target, entry,
+             std::memory_order_release, std::memory_order_acquire))
+           break;
+ 
+-        // Check if there is a hash collision
+         if (target->hash == hash)
+           break;
+ 
+@@ -872,8 +804,6 @@ namespace dxvk {
+       }
+ 
+       if (target) {
+-        // The new entry has the same hash as the target entry, so
+-        // just append it to the linked list. This should be rare.
+         while (true) {
+           Entry* next = nullptr;
+ 
+@@ -884,7 +814,6 @@ namespace dxvk {
+           target = next;
+         }
+       } else {
+-        // Update mask now that the corresponding entry is non-null
+         table->mask.fetch_or(1u << index, std::memory_order_release);
+       }
+ 
+@@ -922,13 +851,14 @@ namespace dxvk {
+ 
+     template<typename Fn>
+     static void iter(const Table& table, const Fn& fn) {
+-      uint32_t mask = table.mask.load(std::memory_order_acquire);
++      const uint32_t mask = table.mask.load(std::memory_order_acquire);
+ 
+       for (auto index : bit::BitMask(mask)) {
+         Entry* e = table.entries[index].load(std::memory_order_relaxed);
+ 
+-        // Recurse first so that the function can be used for destruction.
+-        // Only the first entry in each list can have a sub-table.
++        if (!e)
++          continue;
++
+         if (e->table.mask.load(std::memory_order_relaxed))
+           iter(e->table, fn);
+ 
+@@ -941,30 +871,14 @@ namespace dxvk {
+     }
+ 
+     static size_t computeListIndex(size_t hash, size_t shift) {
+-      // Swap bytes to ensure that high bits of the hash contribute to the index.
+-      // This is useful since hashes often only differ in the high 32 bits.
+       if constexpr (sizeof(size_t) == sizeof(uint64_t)) {
+-        uint64_t index = hash;
+-
+-        index = ((index >> 56u) & 0x00000000000000ffull)
+-              | ((index >> 40u) & 0x000000000000ff00ull)
+-              | ((index >> 24u) & 0x0000000000ff0000ull)
+-              | ((index >>  8u) & 0x00000000ff000000ull)
+-              | ((index <<  8u) & 0x000000ff00000000ull)
+-              | ((index << 24u) & 0x0000ff0000000000ull)
+-              | ((index << 40u) & 0x00ff000000000000ull)
+-              | ((index << 56u) & 0xff00000000000000ull);
+-
+-        return size_t((index + hash) >> shift) % LayerSize;
++        const uint64_t x = uint64_t(hash);
++        const uint64_t y = __builtin_bswap64(x) + x;
++        return size_t((y >> shift) & uint64_t(LayerSize - 1u));
+       } else {
+-        uint32_t index = hash;
+-
+-        index = ((index >> 24u) & 0x000000ffu)
+-              | ((index >>  8u) & 0x0000ff00u)
+-              | ((index <<  8u) & 0x00ff0000u)
+-              | ((index << 24u) & 0xff000000u);
+-
+-        return size_t((index + hash) >> shift) % LayerSize;
++        const uint32_t x = uint32_t(hash);
++        const uint32_t y = __builtin_bswap32(x) + x;
++        return size_t((y >> shift) & uint32_t(LayerSize - 1u));
+       }
+     }
+ 
+
+--- a/src/dxvk/dxvk_pipemanager.cpp	2026-03-01 15:59:36.414718665 +0100
++++ b/src/dxvk/dxvk_pipemanager.cpp	2026-05-06 16:13:00.338026808 +0100
+@@ -4,7 +4,7 @@
+ #include "dxvk_pipemanager.h"
+ 
+ namespace dxvk {
+-  
++
+   DxvkPipelineWorkers::DxvkPipelineWorkers(
+           DxvkDevice*                     device)
+   : m_device(device) {
+@@ -34,10 +34,12 @@ namespace dxvk {
+           DxvkGraphicsPipeline*           pipeline,
+     const DxvkGraphicsPipelineStateInfo&  state,
+           DxvkPipelinePriority            priority) {
++    // Keep lock scope minimal: refcount operation is independent of queue state.
++    pipeline->acquirePipeline();
++
+     std::unique_lock lock(m_lock);
+     this->startWorkers();
+ 
+-    pipeline->acquirePipeline();
+     m_tasksTotal += 1;
+ 
+     m_buckets[uint32_t(priority)].queue.emplace(pipeline, state);
+@@ -65,12 +67,18 @@ namespace dxvk {
+ 
+ 
+   void DxvkPipelineWorkers::notifyWorkers(DxvkPipelinePriority priority) {
+-    uint32_t index = uint32_t(priority);
++    const uint32_t index = uint32_t(priority);
++
++    // Fast path for exact bucket to avoid scanning in the common case.
++    if (m_buckets[index].idleWorkers) {
++      m_buckets[index].cond.notify_one();
++      return;
++    }
+ 
+     // If any workers are idle in a suitable set, notify the corresponding
+     // condition variable. If all workers are busy anyway, we know that the
+     // job is going to be picked up at some point anyway.
+-    for (uint32_t i = index; i < m_buckets.size(); i++) {
++    for (uint32_t i = index + 1; i < m_buckets.size(); i++) {
+       if (m_buckets[i].idleWorkers) {
+         m_buckets[i].cond.notify_one();
+         break;
+@@ -80,14 +88,16 @@ namespace dxvk {
+ 
+ 
+   void DxvkPipelineWorkers::startWorkers() {
+-    if (!std::exchange(m_workersRunning, true)) {
+-      // Use all available cores by default
++    if (!m_workersRunning) {
++      m_workersRunning = true;
++
++      // Use all available cores by default.
+       uint32_t workerCount = dxvk::thread::hardware_concurrency();
+ 
+       if (workerCount <  1) workerCount =  1;
+       if (workerCount > 64) workerCount = 64;
+ 
+-      // Reduce worker count on 32-bit to save adderss space
++      // Reduce worker count on 32-bit to save address space.
+       if (env::is32BitHostPlatform())
+         workerCount = std::min(workerCount, 16u);
+ 
+@@ -96,8 +106,8 @@ namespace dxvk {
+ 
+       // Number of workers that can process pipeline pipelines with normal
+       // priority. Any other workers can only build high-priority pipelines.
+-      uint32_t npWorkerCount = std::max(((workerCount - 1) * 5) / 7, 1u);
+-      uint32_t lpWorkerCount = std::max(((workerCount - 1) * 2) / 7, 1u);
++      const uint32_t npWorkerCount = std::max(((workerCount - 1) * 5) / 7, 1u);
++      const uint32_t lpWorkerCount = std::max(((workerCount - 1) * 2) / 7, 1u);
+ 
+       m_workers.reserve(workerCount);
+ 
+@@ -112,7 +122,7 @@ namespace dxvk {
+         auto& worker = m_workers.emplace_back([this, priority] {
+           runWorker(priority);
+         });
+-        
++
+         worker.set_priority(ThreadPriority::Lowest);
+       }
+ 
+@@ -136,10 +146,10 @@ namespace dxvk {
+         bucket.idleWorkers += 1;
+         bucket.cond.wait(lock, [this, maxPriorityIndex, &entry] {
+           // Attempt to fetch a work item from the
+-          // highest-priority queue that is not empty
++          // highest-priority queue that is not empty.
+           for (uint32_t i = 0; i <= maxPriorityIndex; i++) {
+             if (!m_buckets[i].queue.empty()) {
+-              entry = m_buckets[i].queue.front();
++              entry = std::move(m_buckets[i].queue.front());
+               m_buckets[i].queue.pop();
+               return true;
+             }
+@@ -177,20 +187,20 @@ namespace dxvk {
+ 
+     createNullFsPipelineLibrary()->compilePipeline();
+   }
+-  
+-  
++
++
+   DxvkPipelineManager::~DxvkPipelineManager() {
+-    
++
+   }
+-  
+-  
++
++
+   DxvkComputePipeline* DxvkPipelineManager::createComputePipeline(
      const DxvkComputePipelineShaders& shaders) {
      if (shaders.cs == nullptr)
        return nullptr;
 -    
 +
-     std::lock_guard<dxvk::mutex> lock(m_mutex);
+     std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
 -    
 +
      auto pair = m_computePipelines.find(shaders);
      if (pair != m_computePipelines.end())
        return &pair->second;
-@@ -205,11 +205,9 @@ namespace dxvk {
- 
-     auto library = findPipelineLibraryLocked(key);
- 
--    auto iter = m_computePipelines.emplace(
--      std::piecewise_construct,
--      std::tuple(shaders),
--      std::tuple(m_device, this, shaders, library));
--    return &iter.first->second;
-+    auto result = m_computePipelines.try_emplace(
-+      shaders, m_device, this, shaders, library);
-+    return &result.first->second;
+@@ -206,13 +216,13 @@ namespace dxvk {
+       std::tuple(m_device, this, shaders, library));
+     return &iter.first->second;
    }
-   
-   
-@@ -217,9 +215,9 @@ namespace dxvk {
+-  
+-  
++
++
+   DxvkGraphicsPipeline* DxvkPipelineManager::createGraphicsPipeline(
      const DxvkGraphicsPipelineShaders& shaders) {
      if (shaders.vs == nullptr)
        return nullptr;
 -    
 +
-     std::lock_guard<dxvk::mutex> lock(m_mutex);
--    
-+
-     auto pair = m_graphicsPipelines.find(shaders);
-     if (pair != m_graphicsPipelines.end())
-       return &pair->second;
-@@ -257,11 +255,9 @@ namespace dxvk {
-       }
-     }
+     std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
  
--    auto iter = m_graphicsPipelines.emplace(
--      std::piecewise_construct,
--      std::tuple(shaders),
--      std::tuple(m_device, this, shaders, vsLibrary, fsLibrary));
--    return &iter.first->second;
-+    auto result = m_graphicsPipelines.try_emplace(
-+      shaders, m_device, this, shaders, vsLibrary, fsLibrary);
-+    return &result.first->second;
+     auto pair = m_graphicsPipelines.find(shaders);
+@@ -250,7 +260,7 @@ namespace dxvk {
+     return &iter.first->second;
    }
  
-   
-@@ -276,15 +272,8 @@ namespace dxvk {
+-  
++
+   DxvkShaderPipelineLibrary* DxvkPipelineManager::createShaderPipelineLibrary(
+     const DxvkShaderPipelineLibraryKey& key) {
+     std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
+@@ -262,10 +272,6 @@ namespace dxvk {
      const DxvkGraphicsPipelineVertexInputState& state) {
-     std::lock_guard<dxvk::mutex> lock(m_mutex);
+     std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
  
 -    auto pair = m_vertexInputLibraries.find(state);
 -    if (pair != m_vertexInputLibraries.end())
 -      return &pair->second;
 -
--    auto iter = m_vertexInputLibraries.emplace(
--      std::piecewise_construct,
--      std::tuple(state),
--      std::tuple(m_device, state));
--    return &iter.first->second;
-+    auto result = m_vertexInputLibraries.try_emplace(state, m_device, state);
-+    return &result.first->second;
-   }
- 
- 
-@@ -292,15 +281,8 @@ namespace dxvk {
+     auto iter = m_vertexInputLibraries.emplace(
+       std::piecewise_construct,
+       std::tuple(state),
+@@ -278,18 +284,14 @@ namespace dxvk {
      const DxvkGraphicsPipelineFragmentOutputState& state) {
-     std::lock_guard<dxvk::mutex> lock(m_mutex);
+     std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
  
 -    auto pair = m_fragmentOutputLibraries.find(state);
 -    if (pair != m_fragmentOutputLibraries.end())
 -      return &pair->second;
 -
--    auto iter = m_fragmentOutputLibraries.emplace(
--      std::piecewise_construct,
--      std::tuple(state),
--      std::tuple(m_device, state));
--    return &iter.first->second;
-+    auto result = m_fragmentOutputLibraries.try_emplace(state, m_device, state);
-+    return &result.first->second;
+     auto iter = m_fragmentOutputLibraries.emplace(
+       std::piecewise_construct,
+       std::tuple(state),
+       std::tuple(m_device, state));
+     return &iter.first->second;
    }
-   
-   
-@@ -352,39 +334,22 @@ namespace dxvk {
+-  
+-  
++
++
+   void DxvkPipelineManager::registerShader(
+     const Rc<DxvkShader>&         shader) {
+     DxvkShaderPipelineLibraryKey key;
+@@ -303,11 +305,11 @@ namespace dxvk {
+   void DxvkPipelineManager::requestCompileShader(
+     const Rc<DxvkShader>&         shader) {
+     // Notify immediately so that this only gets called
+-    // once, even if compilation does ot start immediately
++    // once, even if compilation does not start immediately.
+     if (!shader->notifyCompile())
+       return;
  
-   const DxvkDescriptorSetLayout* DxvkPipelineManager::createDescriptorSetLayout(
+-    // Dispatch high-priority compile job
++    // Dispatch high-priority compile job.
+     DxvkShaderPipelineLibraryKey key;
+     key.addShader(shader);
+ 
+@@ -336,10 +338,6 @@ namespace dxvk {
      const DxvkDescriptorSetLayoutKey& key) {
+     std::lock_guard<dxvk::mutex> lock(m_layoutMutex);
+ 
 -    auto pair = m_descriptorSetLayouts.find(key);
 -    if (pair != m_descriptorSetLayouts.end())
 -      return &pair->second;
 -
--    auto iter = m_descriptorSetLayouts.emplace(
--      std::piecewise_construct,
--      std::tuple(key),
--      std::tuple(m_device, key));
--    return &iter.first->second;
-+    auto result = m_descriptorSetLayouts.try_emplace(key, m_device, key);
-+    return &result.first->second;
-   }
- 
- 
-   const DxvkPipelineLayout* DxvkPipelineManager::createPipelineLayout(
+     auto iter = m_descriptorSetLayouts.emplace(
+       std::piecewise_construct,
+       std::tuple(key),
+@@ -352,10 +350,6 @@ namespace dxvk {
      const DxvkPipelineLayoutKey& key) {
+     std::lock_guard<dxvk::mutex> lock(m_layoutMutex);
+ 
 -    auto pair = m_pipelineLayouts.find(key);
 -    if (pair != m_pipelineLayouts.end())
 -      return &pair->second;
 -
--    auto iter = m_pipelineLayouts.emplace(
--      std::piecewise_construct,
--      std::tuple(key),
--      std::tuple(m_device, key));
--    return &iter.first->second;
-+    auto result = m_pipelineLayouts.try_emplace(key, m_device, key);
-+    return &result.first->second;
-   }
- 
- 
-   DxvkShaderPipelineLibrary* DxvkPipelineManager::createPipelineLibraryLocked(
-     const DxvkShaderPipelineLibraryKey& key) {
--    auto iter = m_shaderLibraries.emplace(
--      std::piecewise_construct,
--      std::tuple(key),
--      std::tuple(m_device, this, key));
--    return &iter.first->second;
-+    auto result = m_shaderLibraries.try_emplace(key, m_device, this, key);
-+    return &result.first->second;
-   }
- 
- 
-@@ -392,11 +357,8 @@ namespace dxvk {
-     std::lock_guard<dxvk::mutex> lock(m_mutex);
-     DxvkShaderPipelineLibraryKey key;
- 
--    auto iter = m_shaderLibraries.emplace(
--      std::piecewise_construct,
--      std::tuple(),
--      std::tuple(m_device, this, key));
--    return &iter.first->second;
-+    auto result = m_shaderLibraries.try_emplace(key, m_device, this, key);
-+    return &result.first->second;
-   }
- 
- 
+     auto iter = m_pipelineLayouts.emplace(
+       std::piecewise_construct,
+       std::tuple(key),
 
-
---- a/src/util/util_string.cpp	2026-03-01 15:50:36.149744965 +0100
-+++ b/src/util/util_string.cpp	2026-03-01 15:51:55.639940084 +0100
-@@ -2,233 +2,246 @@
+--- a/src/util/util_string.h	2026-05-06 18:13:40.716186640 +0200
++++ b/src/util/util_string.h	2026-05-06 18:19:13.942419586 +0200
+@@ -1,270 +1,236 @@
+ #pragma once
  
- namespace dxvk::str {
- 
--  const uint8_t* decodeTypedChar(
--    const uint8_t*  begin,
--    const uint8_t*  end,
--          uint32_t& ch) {
--    uint32_t first = begin[0];
--
--    if (likely(first < 0x80)) {
--      // Basic ASCII character
--      ch = uint32_t(first);
--      return begin + 1;
--    } else if (unlikely(first < 0xC0)) {
--      // Character starts with a continuation byte,
--      // just skip until we find the next valid prefix
--      while ((begin < end) && (((*begin) & 0xC0) == 0x80))
--        begin += 1;
-+namespace {
- 
--      ch = uint32_t('?');
--      return begin;
--    } else {
--      // The number of leading 1 bits in the first byte
--      // determines the length of this character
--      size_t length = bit::lzcnt((~first) << 24);
--
--      if (unlikely(begin + length > end)) {
--        ch = uint32_t('?');
--        return end;
--      }
--
--      if (first < 0xE0) {
--        ch = ((uint32_t(begin[0]) & 0x1F) << 6)
--           | ((uint32_t(begin[1]) & 0x3F));
--      } else if (first < 0xF0) {
--        ch = ((uint32_t(begin[0]) & 0x0F) << 12)
--           | ((uint32_t(begin[1]) & 0x3F) << 6)
--           | ((uint32_t(begin[2]) & 0x3F));
--      } else if (first < 0xF8) {
--        ch = ((uint32_t(begin[0]) & 0x07) << 18)
--           | ((uint32_t(begin[1]) & 0x3F) << 12)
--           | ((uint32_t(begin[2]) & 0x3F) << 6)
--           | ((uint32_t(begin[3]) & 0x3F));
--      } else {
--        // Invalid prefix
--        ch = uint32_t('?');
--      }
-+// Lookup table replacing bit::lzcnt((~first) << 24).
-+// Indexed by the raw byte value (0x00-0xFF).
-+// Only entries 0xC0-0xFF are accessed at runtime; lower entries are
-+// never reached because the if/else-if chain handles them first.
-+// Using [] (no explicit size) so the static_assert below catches
-+// any accidental insertion or deletion of initializers.
-+constexpr uint8_t s_utf8LengthTable[] = {
-+  // 0x00-0x7F: ASCII single-byte (128 entries, never accessed via table)
-+  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  // 0x00-0x0F
-+  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  // 0x10-0x1F
-+  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  // 0x20-0x2F
-+  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  // 0x30-0x3F
-+  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  // 0x40-0x4F
-+  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  // 0x50-0x5F
-+  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  // 0x60-0x6F
-+  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  // 0x70-0x7F
-+  // 0x80-0xBF: Continuation bytes, invalid as lead (64 entries, never accessed)
-+  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  // 0x80-0x8F
-+  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  // 0x90-0x9F
-+  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  // 0xA0-0xAF
-+  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  // 0xB0-0xBF
-+  // 0xC0-0xDF: 2-byte sequence leads (32 entries)
-+  2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,  // 0xC0-0xCF
-+  2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,  // 0xD0-0xDF
-+  // 0xE0-0xEF: 3-byte sequence leads (16 entries)
-+  3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,  // 0xE0-0xEF
-+  // 0xF0-0xFF: 4+ byte leads, matches lzcnt(~first << 24u) (16 entries)
-+  4,4,4,4,4,4,4,4,5,5,5,5,6,6,7,32  // 0xF0-0xFF
-+};
-+static_assert(sizeof(s_utf8LengthTable) == 256,
-+  "UTF-8 length table must have exactly 256 entries");
-+
-+} // anonymous namespace
-+
-+
-+const uint8_t* decodeTypedChar(
-+  const uint8_t* begin,
-+  const uint8_t* end,
-+  uint32_t& ch) {
-+  uint32_t first = begin[0];
- 
--      return begin + length;
--    }
--  }
-+  if (likely(first < 0x80)) {
-+    ch = first;
-+    return begin + 1;
-+  } else if (unlikely(first < 0xC0)) {
-+    while ((begin < end) && (((*begin) & 0xC0) == 0x80))
-+      begin += 1;
-+
-+    ch = uint32_t('?');
-+    return begin;
-+  } else {
-+    uint8_t length = s_utf8LengthTable[first];
- 
--  const uint16_t* decodeTypedChar(
--    const uint16_t* begin,
--    const uint16_t* end,
--          uint32_t& ch) {
--    uint32_t first = begin[0];
--
--    if (likely(first < 0xD800)) {
--      ch = first;
--      return begin + 1;
--    } else if (first < 0xDC00) {
--      if (unlikely(begin + 2 > end)) {
--        ch = uint32_t('?');
--        return end;
--      }
--
--      ch = 0x10000
--         + ((uint32_t(begin[0]) & 0x3FF) << 10)
--         + ((uint32_t(begin[1]) & 0x3FF));
--      return begin + 2;
--    } else if (unlikely(first < 0xE000)) {
--      // Stray low surrogate
-+    if (unlikely(static_cast<size_t>(end - begin) < length)) {
-       ch = uint32_t('?');
--      return begin + 1;
-+      return end;
-+    }
-+
-+    if (first < 0xE0) {
-+      ch = ((uint32_t(begin[0]) & 0x1F) << 6)
-+         | ((uint32_t(begin[1]) & 0x3F));
-+    } else if (first < 0xF0) {
-+      ch = ((uint32_t(begin[0]) & 0x0F) << 12)
-+         | ((uint32_t(begin[1]) & 0x3F) << 6)
-+         | ((uint32_t(begin[2]) & 0x3F));
-+    } else if (first < 0xF8) {
-+      ch = ((uint32_t(begin[0]) & 0x07) << 18)
-+         | ((uint32_t(begin[1]) & 0x3F) << 12)
-+         | ((uint32_t(begin[2]) & 0x3F) << 6)
-+         | ((uint32_t(begin[3]) & 0x3F));
-     } else {
--      ch = first;
--      return begin + 1;
-+      ch = uint32_t('?');
-     }
-+
-+    return begin + length;
-   }
-+}
-+
- 
-+const uint16_t* decodeTypedChar(
-+  const uint16_t* begin,
-+  const uint16_t* end,
-+  uint32_t& ch) {
-+  uint32_t first = begin[0];
-+
-+  if (likely(first < 0xD800)) {
-+    ch = first;
-+    return begin + 1;
-+  } else if (first < 0xDC00) {
-+    if (unlikely(begin + 2 > end)) {
-+      ch = uint32_t('?');
-+      return end;
-+    }
- 
--  const uint32_t* decodeTypedChar(
--    const uint32_t* begin,
--    const uint32_t* end,
--          uint32_t& ch) {
--    ch = begin[0];
-+    ch = 0x10000
-+       + ((uint32_t(begin[0]) & 0x3FF) << 10)
-+       + ((uint32_t(begin[1]) & 0x3FF));
-+    return begin + 2;
-+  } else if (unlikely(first < 0xE000)) {
-+    ch = uint32_t('?');
-+    return begin + 1;
-+  } else {
-+    ch = first;
-     return begin + 1;
-   }
-+}
- 
- 
--  size_t encodeTypedChar(
--          uint8_t*  begin,
--          uint8_t*  end,
--          uint32_t  ch) {
--    if (likely(ch < 0x80)) {
--      if (begin) {
--        if (unlikely(begin + 1 > end))
--          return 0;
--
--        begin[0] = uint8_t(ch);
--      }
--
--      return 1;
--    } else if (ch < 0x800) {
--      if (begin) {
--        if (unlikely(begin + 2 > end))
--          return 0;
--
--        begin[0] = uint8_t(0xC0 | (ch >> 6));
--        begin[1] = uint8_t(0x80 | (ch & 0x3F));
--      }
--
--      return 2;
--    } else if (ch < 0x10000) {
--      if (begin) {
--        if (unlikely(begin + 3 > end))
--          return 0;
--
--        begin[0] = uint8_t(0xE0 | ((ch >> 12)));
--        begin[1] = uint8_t(0x80 | ((ch >> 6) & 0x3F));
--        begin[2] = uint8_t(0x80 | ((ch >> 0) & 0x3F));
--      }
--
--      return 3;
--    } else if (ch < 0x200000) {
--      if (begin) {
--        if (unlikely(begin + 4 > end))
--          return 0;
--
--        begin[0] = uint8_t(0xF0 | ((ch >> 18)));
--        begin[1] = uint8_t(0x80 | ((ch >> 12) & 0x3F));
--        begin[2] = uint8_t(0x80 | ((ch >> 6) & 0x3F));
--        begin[3] = uint8_t(0x80 | ((ch >> 0) & 0x3F));
--      }
-+const uint32_t* decodeTypedChar(
-+  const uint32_t* begin,
-+  const uint32_t* end,
-+  uint32_t& ch) {
-+  ch = begin[0];
-+  return begin + 1;
-+}
- 
--      return 4;
--    } else {
--      // Invalid code point for UTF-8
--      return 0;
-+
-+size_t encodeTypedChar(
-+  uint8_t* begin,
-+  uint8_t* end,
-+  uint32_t ch) {
-+  if (likely(ch < 0x80)) {
-+    if (begin) {
-+      if (unlikely(begin + 1 > end))
-+        return 0;
-+
-+      begin[0] = uint8_t(ch);
-     }
--  }
-+    return 1;
-+  } else if (ch < 0x800) {
-+    if (begin) {
-+      if (unlikely(begin + 2 > end))
-+        return 0;
- 
-+      begin[0] = uint8_t(0xC0 | (ch >> 6));
-+      begin[1] = uint8_t(0x80 | (ch & 0x3F));
-+    }
-+    return 2;
-+  } else if (ch < 0x10000) {
-+    if (begin) {
-+      if (unlikely(begin + 3 > end))
-+        return 0;
- 
--  size_t encodeTypedChar(
--          uint16_t* begin,
--          uint16_t* end,
--          uint32_t  ch) {
--    if (likely(ch < 0xD800)) {
--      if (begin) {
--        if (unlikely(begin + 1 > end))
--          return 0;
--
--        begin[0] = ch;
--      }
--
--      return 1;
--    } else if (ch < 0xE000) {
--      // Private use code points,
--      // we can't encode these
--      return 0;
--    } else if (ch < 0x10000) {
--      if (begin) {
--        if (unlikely(begin + 1 > end))
--          return 0;
--
--        begin[0] = ch;
--      }
--
--      return 1;
--    } else if (ch < 0x110000) {
--      if (begin) {
--        if (unlikely(begin + 2 > end))
--          return 0;
--
--        ch -= 0x10000;
--        begin[0] = uint16_t(0xD800 + (ch >> 10));
--        begin[1] = uint16_t(0xDC00 + (ch & 0x3FF));
--      }
-+      begin[0] = uint8_t(0xE0 | (ch >> 12));
-+      begin[1] = uint8_t(0x80 | ((ch >> 6) & 0x3F));
-+      begin[2] = uint8_t(0x80 | (ch & 0x3F));
-+    }
-+    return 3;
-+  } else if (ch < 0x200000) {
-+    if (begin) {
-+      if (unlikely(begin + 4 > end))
-+        return 0;
- 
--      return 2;
--    } else {
--      // Invalid code point
--      return 0;
-+      begin[0] = uint8_t(0xF0 | (ch >> 18));
-+      begin[1] = uint8_t(0x80 | ((ch >> 12) & 0x3F));
-+      begin[2] = uint8_t(0x80 | ((ch >> 6) & 0x3F));
-+      begin[3] = uint8_t(0x80 | (ch & 0x3F));
-     }
-+    return 4;
-+  } else {
-+    return 0;
-   }
-+}
- 
- 
--  size_t encodeTypedChar(
--          uint32_t* begin,
--          uint32_t* end,
--          uint32_t  ch) {
-+size_t encodeTypedChar(
-+  uint16_t* begin,
-+  uint16_t* end,
-+  uint32_t ch) {
-+  if (likely(ch < 0xD800)) {
-     if (begin) {
-       if (unlikely(begin + 1 > end))
-         return 0;
- 
--      begin[0] = ch;
-+      begin[0] = static_cast<uint16_t>(ch);
-     }
-+    return 1;
-+  } else if (ch < 0xE000) {
-+    return 0;
-+  } else if (ch < 0x10000) {
-+    if (begin) {
-+      if (unlikely(begin + 1 > end))
-+        return 0;
- 
-+      begin[0] = static_cast<uint16_t>(ch);
-+    }
-     return 1;
-+  } else if (ch < 0x110000) {
-+    if (begin) {
-+      if (unlikely(begin + 2 > end))
-+        return 0;
-+
-+      ch -= 0x10000;
-+      begin[0] = static_cast<uint16_t>(0xD800 + (ch >> 10));
-+      begin[1] = static_cast<uint16_t>(0xDC00 + (ch & 0x3FF));
-+    }
-+    return 2;
-+  } else {
-+    return 0;
-   }
-+}
- 
- 
--  std::string fromws(const WCHAR* ws) {
--    size_t srcLen = length(ws);
--    size_t dstLen = transcodeString<char>(
--      nullptr, 0, ws, srcLen);
-+size_t encodeTypedChar(
-+  uint32_t* begin,
-+  uint32_t* end,
-+  uint32_t ch) {
-+  if (begin) {
-+    if (unlikely(begin + 1 > end))
-+      return 0;
- 
--    std::string result;
--    result.resize(dstLen);
-+    begin[0] = ch;
-+  }
-+  return 1;
-+}
- 
--    transcodeString(result.data(),
--      dstLen, ws, srcLen);
- 
--    return result;
--  }
-+std::string fromws(const WCHAR* ws) {
-+  size_t srcLen = length(ws);
-+  size_t dstLen = transcodeString<char>(nullptr, 0, ws, srcLen);
- 
-+  std::string result;
-+  result.resize(dstLen);
- 
--  std::wstring tows(const char* mbs) {
--    size_t srcLen = length(mbs);
--    size_t dstLen = transcodeString<wchar_t>(
--      nullptr, 0, mbs, srcLen);
-+  transcodeString(result.data(), dstLen, ws, srcLen);
-+  return result;
-+}
- 
--    std::wstring result;
--    result.resize(dstLen);
- 
--    transcodeString(result.data(),
--      dstLen, mbs, srcLen);
-+std::wstring tows(const char* mbs) {
-+  size_t srcLen = length(mbs);
-+  size_t dstLen = transcodeString<wchar_t>(nullptr, 0, mbs, srcLen);
- 
--    return result;
--  }
-+  std::wstring result;
-+  result.resize(dstLen);
- 
-+  transcodeString(result.data(), dstLen, mbs, srcLen);
-+  return result;
- }
-+
-+} // namespace dxvk::str
-
-
---- a/src/util/util_string.h	2026-03-01 15:50:34.156386262 +0100
-+++ b/src/util/util_string.h	2026-03-01 15:51:33.499517958 +0100
-@@ -7,236 +7,241 @@
+ #include <cstring>
+-#include <string>
+ #include <sstream>
++#include <string>
++#include <string_view>
+ #include <vector>
  
  #include "./com/com_include.h"
  
@@ -725,11 +3199,6 @@
 +  uint32_t* end,
 +  uint32_t ch);
 +
-+/**
-+ * \brief Decodes a single character
-+ *
-+ * Note that \c begin and \c end must not be equal.
-+ */
 +template<typename T>
 +const T* decodeChar(
 +  const T* begin,
@@ -744,7 +3213,9 @@
  
 -    return reinterpret_cast<const T*>(result);
 -  }
--
++  return reinterpret_cast<const T*>(result);
++}
+ 
 -  /**
 -   * \brief Encodes a character
 -   *
@@ -769,24 +3240,6 @@
 -      reinterpret_cast<CharType*>(end),
 -      ch);
 -  }
-+  return reinterpret_cast<const T*>(result);
-+}
- 
--  /**
--   * \brief Computes length of a null-terminated string
--   *
--   * \param [in] begin Start of input string
--   * \returns Number of characters in input string,
--   *    excluding the terminating null character
--   */
--  template<typename S>
--  size_t length(const S* string) {
--    size_t result = 0;
-+/**
-+ * \brief Encodes a character
-+ *
-+ * Note that \c begin and \c end may both be \c nullptr or equal.
-+ */
 +template<typename T>
 +size_t encodeChar(
 +  T* begin,
@@ -800,15 +3253,16 @@
 +    ch);
 +}
  
--    while (string[result])
--      result += 1;
-+/**
-+ * \brief Computes length of a null-terminated string
-+ *
-+ * \param [in] string Start of input string
-+ * \returns Number of characters in input string,
-+ *    excluding the terminating null character
-+ */
+-  /**
+-   * \brief Computes length of a null-terminated string
+-   *
+-   * \param [in] begin Start of input string
+-   * \returns Number of characters in input string,
+-   *    excluding the terminating null character
+-   */
+-  template<typename S>
+-  size_t length(const S* string) {
+-    size_t result = 0;
 +template<typename S>
 +size_t length(const S* string) {
 +  if (unlikely(!string))
@@ -818,9 +3272,16 @@
 +  while (string[result])
 +    result += 1;
  
+-    while (string[result])
+-      result += 1;
++  return result;
++}
+ 
 -    return result;
 -  }
-+  return result;
++template<>
++inline size_t length(const char* string) {
++  return string ? std::strlen(string) : 0;
 +}
  
 -  /**
@@ -860,55 +3321,36 @@
 -        totalLength += encodeChar<D>(dstBegin + totalLength, dstEnd, ch);
 -      else
 -        totalLength += encodeChar<D>(nullptr, nullptr, ch);
-+template<>
-+inline size_t length(const char* string) {
-+  return string ? std::strlen(string) : 0;
-+}
- 
--      if (!ch)
--        break;
-+/**
-+ * \brief Converts string from one encoding to another
-+ *
-+ * The output string arguments may be \c nullptr. In that case, the
-+ * total length of the transcoded string will be returned, in units
-+ * of the output character type. The output string will only be
-+ * null-terminated if the input string is also null-terminated.
-+ * \tparam D Output character type
-+ * \tparam S Input character type
-+ * \param [in] dstBegin Start of output string
-+ * \param [in] dstLength Length of output string
-+ * \param [in] srcBegin Start of input string
-+ * \param [in] srcLength Length of input string
-+ * \returns If \c dstBegin is \c nullptr , the total number of output
-+ *    characters required to store the output string. Otherwise, the
-+ *    total number of characters written to the output string.
-+ */
 +template<typename D, typename S>
 +size_t transcodeString(
 +  D* dstBegin,
 +  size_t dstLength,
 +  const S* srcBegin,
 +  size_t srcLength) {
++  if (unlikely(!srcBegin || !srcLength))
++    return 0;
+ 
+-      if (!ch)
+-        break;
+-    }
 +  size_t totalLength = 0;
-+
+ 
+-    return totalLength;
 +  const S* srcEnd = srcBegin + srcLength;
 +  D* dstPtr = dstBegin;
 +  D* dstEnd = dstBegin ? dstBegin + dstLength : nullptr;
 +
 +  while (srcBegin < srcEnd) {
-+    uint32_t ch;
++    uint32_t ch = 0u;
 +    srcBegin = decodeChar<S>(srcBegin, srcEnd, ch);
 +
-+    size_t n;
-+    if (likely(dstPtr != nullptr)) {
-+      n = encodeChar<D>(dstPtr, dstEnd, ch);
++    const size_t n = likely(dstPtr != nullptr)
++      ? encodeChar<D>(dstPtr, dstEnd, ch)
++      : encodeChar<D>(nullptr, nullptr, ch);
++
++    if (likely(dstPtr != nullptr))
 +      dstPtr += n;
-+    } else {
-+      n = encodeChar<D>(nullptr, nullptr, ch);
-     }
- 
--    return totalLength;
++
 +    totalLength += n;
 +
 +    if (unlikely(!ch))
@@ -941,12 +3383,12 @@
 -  using path_string = std::wstring;
 -  inline path_string topath(const char* mbs) { return tows(mbs); }
 +using path_string = std::wstring;
-+inline path_string topath(const char* mbs) { return tows(mbs); }
++inline path_string topath(const char* mbs) { return mbs ? tows(mbs) : path_string(); }
  #else
 -  using path_string = std::string;
 -  inline path_string topath(const char* mbs) { return std::string(mbs); }
 +using path_string = std::string;
-+inline path_string topath(const char* mbs) { return std::string(mbs); }
++inline path_string topath(const char* mbs) { return mbs ? std::string(mbs) : path_string(); }
  #endif
 -  
 -  inline void format1(std::stringstream&) { }
@@ -969,12 +3411,18 @@
 -    std::stringstream stream;
 -    format1(stream, args...);
 -    return stream.str();
+-  }
 +template<typename... Tx>
-+void format1(std::stringstream& str, const WCHAR *arg, const Tx&... args) {
++void format1(std::stringstream& str, const WCHAR* arg, const Tx&... args) {
 +  str << fromws(arg);
 +  format1(str, args...);
 +}
-+
+ 
+-  inline void strlcpy(char* dst, const char* src, size_t count) {
+-    if (count > 0) {
+-      std::strncpy(dst, src, count - 1);
+-      dst[count - 1] = '\0';
+-    }
 +template<typename T, typename... Tx>
 +void format1(std::stringstream& str, const T& arg, const Tx&... args) {
 +  str << arg;
@@ -989,41 +3437,13 @@
 +}
 +
 +inline void strlcpy(char* dst, const char* src, size_t count) {
-+  if (count > 0) {
-+    std::strncpy(dst, src, count - 1);
-+    dst[count - 1] = '\0';
++  if (!count || !dst)
++    return;
++
++  if (!src) {
++    dst[0] = '\0';
++    return;
    }
-+}
- 
--  inline void strlcpy(char* dst, const char* src, size_t count) {
--    if (count > 0) {
--      std::strncpy(dst, src, count - 1);
--      dst[count - 1] = '\0';
--    }
-+/**
-+ * \brief Split string at one or more delimiter characters
-+ *
-+ * \param [in] string String to split
-+ * \param [in] delims Delimiter characters
-+ * \returns Vector of substring views
-+ */
-+inline std::vector<std::string_view> split(std::string_view string, std::string_view delims = " ") {
-+  std::vector<std::string_view> tokens;
-+  tokens.reserve(16);
-+
-+  for (size_t start = 0; start < string.size(); ) {
-+    const auto end = string.find_first_of(delims, start);
-+
-+    if (start != end)
-+      tokens.emplace_back(string.substr(start, end - start));
-+
-+    if (end == std::string_view::npos)
-+      break;
-+
-+    start = end + 1;
-   }
-+  return tokens;
-+}
  
 -  /**
 -   * \brief Split string at one or more delimiters characters
@@ -1046,27 +3466,458 @@
 -      // Break at the end of string
 -      if (end == std::string_view::npos)
 -        break;
-+/** Compares ASCII characters in a case-insensitive way */
-+inline bool compareCharsCaseInsensitive(char a, char b) {
-+  unsigned char ua = static_cast<unsigned char>(a);
-+  unsigned char ub = static_cast<unsigned char>(b);
-+  if (ua >= 'A' && ua <= 'Z') ua |= 0x20u;
-+  if (ub >= 'A' && ub <= 'Z') ub |= 0x20u;
-+  return ua == ub;
++  size_t i = 0u;
++  for (; i + 1u < count && src[i]; i++)
++    dst[i] = src[i];
++
++  dst[i] = '\0';
 +}
  
 -      start = end + 1;
--    }
++inline std::vector<std::string_view> split(std::string_view string, std::string_view delims = " ") {
++  std::vector<std::string_view> tokens;
++  tokens.reserve(16);
++
++  size_t start = string.find_first_not_of(delims, 0u);
++
++  while (start != std::string_view::npos) {
++    const size_t end = string.find_first_of(delims, start);
++
++    if (end == std::string_view::npos) {
++      tokens.emplace_back(string.substr(start));
++      break;
+     }
 -    return tokens;
-+/** Compare ASCII string in a case-insensitive way */
+-  }
+ 
+-  /** Compares ASCII characters in a case-insensitive way */
+-  inline bool compareCharsCaseInsensitive(char a, char b) {
+-    if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+-    if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+-    return a == b;
++    tokens.emplace_back(string.substr(start, end - start));
++    start = string.find_first_not_of(delims, end + 1u);
+   }
+ 
+-  /** Compare ASCII string in a case-insensitive way */
+-  inline bool compareCaseInsensitive(const char* a, const char* b) {
+-    for (size_t i = 0u; a[i] || b[i]; i++) {
+-      if (!compareCharsCaseInsensitive(a[i], b[i]))
+-        return false;
+-    }
++  return tokens;
++}
++
++inline bool compareCharsCaseInsensitive(char a, char b) {
++  uint32_t ua = static_cast<uint8_t>(a);
++  uint32_t ub = static_cast<uint8_t>(b);
++
++  ua |= (uint32_t(ua - uint32_t('A')) <= uint32_t('Z' - 'A')) ? 0x20u : 0u;
++  ub |= (uint32_t(ub - uint32_t('A')) <= uint32_t('Z' - 'A')) ? 0x20u : 0u;
++  return ua == ub;
++}
+ 
 +inline bool compareCaseInsensitive(const char* a, const char* b) {
++  if (a == b)
+     return true;
++
++  if (!a || !b)
++    return false;
++
 +  for (size_t i = 0u; a[i] || b[i]; i++) {
 +    if (!compareCharsCaseInsensitive(a[i], b[i]))
 +      return false;
    }
+ 
+-  /** Converts ASCII string to lower case */
+-  inline std::string tolower(std::string str) {
+-    for (size_t i = 0u; i < str.size(); i++) {
+-      if (str[i] >= 'A' && str[i] <= 'Z')
+-        str[i] += 'a' - 'A';
+-    }
 +  return true;
++}
+ 
+-    return str;
++inline std::string tolower(std::string str) {
++  for (char& c : str) {
++    if (c >= 'A' && c <= 'Z')
++      c = char(c + ('a' - 'A'));
+   }
+ 
++  return str;
  }
 +
++} // namespace dxvk::str
+
+--- a/src/util/util_string.cpp	2026-03-01 15:50:36.149744965 +0100
++++ b/src/util/util_string.cpp	2026-05-06 15:51:55.639940084 +0100
+@@ -2,82 +2,113 @@
+ 
+ namespace dxvk::str {
+ 
++  namespace {
++
++    constexpr uint32_t ReplacementChar = uint32_t('?');
++
++  }
++
++
+   const uint8_t* decodeTypedChar(
+     const uint8_t*  begin,
+     const uint8_t*  end,
+           uint32_t& ch) {
+-    uint32_t first = begin[0];
++    const uint32_t first = begin[0];
+ 
+-    if (likely(first < 0x80)) {
+-      // Basic ASCII character
+-      ch = uint32_t(first);
++    if (likely(first < 0x80u)) {
++      ch = first;
+       return begin + 1;
+-    } else if (unlikely(first < 0xC0)) {
+-      // Character starts with a continuation byte,
+-      // just skip until we find the next valid prefix
+-      while ((begin < end) && (((*begin) & 0xC0) == 0x80))
++    }
++
++    if (unlikely(first < 0xC0u)) {
++      while ((begin < end) && (((*begin) & 0xC0u) == 0x80u))
+         begin += 1;
+ 
+-      ch = uint32_t('?');
++      ch = ReplacementChar;
+       return begin;
++    }
++
++    uint32_t length = 0u;
++    uint32_t code = 0u;
++    uint32_t minCode = 0u;
++
++    if (first < 0xE0u) {
++      length = 2u;
++      code = first & 0x1Fu;
++      minCode = 0x80u;
++    } else if (first < 0xF0u) {
++      length = 3u;
++      code = first & 0x0Fu;
++      minCode = 0x800u;
++    } else if (first < 0xF8u) {
++      length = 4u;
++      code = first & 0x07u;
++      minCode = 0x10000u;
+     } else {
+-      // The number of leading 1 bits in the first byte
+-      // determines the length of this character
+-      size_t length = bit::lzcnt((~first) << 24);
+-
+-      if (unlikely(begin + length > end)) {
+-        ch = uint32_t('?');
+-        return end;
+-      }
++      ch = ReplacementChar;
++      return begin + 1;
++    }
++
++    const size_t remaining = size_t(end - begin);
++
++    if (unlikely(remaining < length)) {
++      ch = ReplacementChar;
++      return end;
++    }
++
++    for (uint32_t i = 1u; i < length; i++) {
++      const uint32_t next = begin[i];
+ 
+-      if (first < 0xE0) {
+-        ch = ((uint32_t(begin[0]) & 0x1F) << 6)
+-           | ((uint32_t(begin[1]) & 0x3F));
+-      } else if (first < 0xF0) {
+-        ch = ((uint32_t(begin[0]) & 0x0F) << 12)
+-           | ((uint32_t(begin[1]) & 0x3F) << 6)
+-           | ((uint32_t(begin[2]) & 0x3F));
+-      } else if (first < 0xF8) {
+-        ch = ((uint32_t(begin[0]) & 0x07) << 18)
+-           | ((uint32_t(begin[1]) & 0x3F) << 12)
+-           | ((uint32_t(begin[2]) & 0x3F) << 6)
+-           | ((uint32_t(begin[3]) & 0x3F));
+-      } else {
+-        // Invalid prefix
+-        ch = uint32_t('?');
++      if (unlikely((next & 0xC0u) != 0x80u)) {
++        ch = ReplacementChar;
++        return begin + 1;
+       }
+ 
++      code = (code << 6) | (next & 0x3Fu);
++    }
++
++    if (unlikely(code < minCode || code > 0x10FFFFu || (code >= 0xD800u && code <= 0xDFFFu))) {
++      ch = ReplacementChar;
+       return begin + length;
+     }
++
++    ch = code;
++    return begin + length;
+   }
+ 
++
+   const uint16_t* decodeTypedChar(
+     const uint16_t* begin,
+     const uint16_t* end,
+           uint32_t& ch) {
+-    uint32_t first = begin[0];
++    const uint32_t first = begin[0];
+ 
+-    if (likely(first < 0xD800)) {
++    if (likely(first < 0xD800u || first >= 0xE000u)) {
+       ch = first;
+       return begin + 1;
+-    } else if (first < 0xDC00) {
+-      if (unlikely(begin + 2 > end)) {
+-        ch = uint32_t('?');
+-        return end;
+-      }
++    }
+ 
+-      ch = 0x10000
+-         + ((uint32_t(begin[0]) & 0x3FF) << 10)
+-         + ((uint32_t(begin[1]) & 0x3FF));
+-      return begin + 2;
+-    } else if (unlikely(first < 0xE000)) {
+-      // Stray low surrogate
+-      ch = uint32_t('?');
++    if (unlikely(first >= 0xDC00u)) {
++      ch = ReplacementChar;
+       return begin + 1;
+-    } else {
+-      ch = first;
++    }
++
++    if (unlikely(begin + 2 > end)) {
++      ch = ReplacementChar;
++      return end;
++    }
++
++    const uint32_t second = begin[1];
++
++    if (unlikely(second < 0xDC00u || second >= 0xE000u)) {
++      ch = ReplacementChar;
+       return begin + 1;
+     }
++
++    ch = 0x10000u
++       + ((first  & 0x3FFu) << 10)
++       +  (second & 0x3FFu);
++    return begin + 2;
+   }
+ 
+ 
+@@ -85,6 +116,7 @@ namespace dxvk::str {
+     const uint32_t* begin,
+     const uint32_t* end,
+           uint32_t& ch) {
++    (void)end;
+     ch = begin[0];
+     return begin + 1;
+   }
+@@ -94,52 +126,49 @@ namespace dxvk::str {
+           uint8_t*  begin,
+           uint8_t*  end,
+           uint32_t  ch) {
+-    if (likely(ch < 0x80)) {
++    if (unlikely(ch > 0x10FFFFu || (ch >= 0xD800u && ch <= 0xDFFFu)))
++      return 0;
++
++    if (likely(ch < 0x80u)) {
+       if (begin) {
+         if (unlikely(begin + 1 > end))
+           return 0;
+-
+         begin[0] = uint8_t(ch);
+       }
+-
+       return 1;
+-    } else if (ch < 0x800) {
++    }
++
++    if (ch < 0x800u) {
+       if (begin) {
+         if (unlikely(begin + 2 > end))
+           return 0;
+-
+-        begin[0] = uint8_t(0xC0 | (ch >> 6));
+-        begin[1] = uint8_t(0x80 | (ch & 0x3F));
++        begin[0] = uint8_t(0xC0u | (ch >> 6));
++        begin[1] = uint8_t(0x80u | (ch & 0x3Fu));
+       }
+-
+       return 2;
+-    } else if (ch < 0x10000) {
++    }
++
++    if (ch < 0x10000u) {
+       if (begin) {
+         if (unlikely(begin + 3 > end))
+           return 0;
+-
+-        begin[0] = uint8_t(0xE0 | ((ch >> 12)));
+-        begin[1] = uint8_t(0x80 | ((ch >> 6) & 0x3F));
+-        begin[2] = uint8_t(0x80 | ((ch >> 0) & 0x3F));
++        begin[0] = uint8_t(0xE0u | (ch >> 12));
++        begin[1] = uint8_t(0x80u | ((ch >> 6) & 0x3Fu));
++        begin[2] = uint8_t(0x80u | (ch & 0x3Fu));
+       }
+-
+       return 3;
+-    } else if (ch < 0x200000) {
+-      if (begin) {
+-        if (unlikely(begin + 4 > end))
+-          return 0;
+-
+-        begin[0] = uint8_t(0xF0 | ((ch >> 18)));
+-        begin[1] = uint8_t(0x80 | ((ch >> 12) & 0x3F));
+-        begin[2] = uint8_t(0x80 | ((ch >> 6) & 0x3F));
+-        begin[3] = uint8_t(0x80 | ((ch >> 0) & 0x3F));
+-      }
++    }
+ 
+-      return 4;
+-    } else {
+-      // Invalid code point for UTF-8
+-      return 0;
++    if (begin) {
++      if (unlikely(begin + 4 > end))
++        return 0;
++      begin[0] = uint8_t(0xF0u | (ch >> 18));
++      begin[1] = uint8_t(0x80u | ((ch >> 12) & 0x3Fu));
++      begin[2] = uint8_t(0x80u | ((ch >> 6) & 0x3Fu));
++      begin[3] = uint8_t(0x80u | (ch & 0x3Fu));
+     }
++
++    return 4;
+   }
+ 
+ 
+@@ -147,43 +176,28 @@ namespace dxvk::str {
+           uint16_t* begin,
+           uint16_t* end,
+           uint32_t  ch) {
+-    if (likely(ch < 0xD800)) {
+-      if (begin) {
+-        if (unlikely(begin + 1 > end))
+-          return 0;
+-
+-        begin[0] = ch;
+-      }
+-
+-      return 1;
+-    } else if (ch < 0xE000) {
+-      // Private use code points,
+-      // we can't encode these
++    if (unlikely(ch > 0x10FFFFu || (ch >= 0xD800u && ch < 0xE000u)))
+       return 0;
+-    } else if (ch < 0x10000) {
++
++    if (likely(ch < 0x10000u)) {
+       if (begin) {
+         if (unlikely(begin + 1 > end))
+           return 0;
+-
+-        begin[0] = ch;
++        begin[0] = uint16_t(ch);
+       }
+-
+       return 1;
+-    } else if (ch < 0x110000) {
+-      if (begin) {
+-        if (unlikely(begin + 2 > end))
+-          return 0;
++    }
+ 
+-        ch -= 0x10000;
+-        begin[0] = uint16_t(0xD800 + (ch >> 10));
+-        begin[1] = uint16_t(0xDC00 + (ch & 0x3FF));
+-      }
++    if (begin) {
++      if (unlikely(begin + 2 > end))
++        return 0;
+ 
+-      return 2;
+-    } else {
+-      // Invalid code point
+-      return 0;
++      ch -= 0x10000u;
++      begin[0] = uint16_t(0xD800u + (ch >> 10));
++      begin[1] = uint16_t(0xDC00u + (ch & 0x3FFu));
+     }
++
++    return 2;
+   }
+ 
+ 
+@@ -191,10 +205,12 @@ namespace dxvk::str {
+           uint32_t* begin,
+           uint32_t* end,
+           uint32_t  ch) {
++    if (unlikely(ch > 0x10FFFFu || (ch >= 0xD800u && ch < 0xE000u)))
++      return 0;
++
+     if (begin) {
+       if (unlikely(begin + 1 > end))
+         return 0;
+-
+       begin[0] = ch;
+     }
+ 
+@@ -203,32 +219,32 @@ namespace dxvk::str {
+ 
+ 
+   std::string fromws(const WCHAR* ws) {
+-    size_t srcLen = length(ws);
+-    size_t dstLen = transcodeString<char>(
+-      nullptr, 0, ws, srcLen);
++    const size_t srcLen = length(ws);
+ 
+-    std::string result;
+-    result.resize(dstLen);
++    if (!srcLen)
++      return std::string();
+ 
+-    transcodeString(result.data(),
+-      dstLen, ws, srcLen);
++    const size_t dstLen = transcodeString<char>(nullptr, 0u, ws, srcLen);
+ 
++    std::string result;
++    result.resize(dstLen);
++    transcodeString(result.data(), dstLen, ws, srcLen);
+     return result;
+   }
+ 
+ 
+   std::wstring tows(const char* mbs) {
+-    size_t srcLen = length(mbs);
+-    size_t dstLen = transcodeString<wchar_t>(
+-      nullptr, 0, mbs, srcLen);
++    const size_t srcLen = length(mbs);
+ 
+-    std::wstring result;
+-    result.resize(dstLen);
++    if (!srcLen)
++      return std::wstring();
+ 
+-    transcodeString(result.data(),
+-      dstLen, mbs, srcLen);
++    const size_t dstLen = transcodeString<wchar_t>(nullptr, 0u, mbs, srcLen);
+ 
++    std::wstring result;
++    result.resize(dstLen);
++    transcodeString(result.data(), dstLen, mbs, srcLen);
+     return result;
+   }
+ 
+-}
 +} // namespace dxvk::str
 
 --- a/src/util/util_math.h	2025-07-06 19:24:27.969061208 +0200
@@ -1764,24 +4615,21 @@
  }
 
 --- a/src/util/thread.h	2025-07-05 23:59:58.545397731 +0200
-+++ b/src/util/thread.h	2025-07-06 00:01:11.635771822 +0200
-@@ -1,346 +1,305 @@
++++ b/src/util/thread.h	2026-05-06 00:01:11.635771822 +0200
+@@ -1,378 +1,387 @@
  #pragma once
-+/*  thread.h – DXVK threading utilities
-+ *  ------------------------------------
-+ *  FINAL, FAIR & HYBRID-CPU AWARE
-+ */
  
 +#include <atomic>
  #include <chrono>
  #include <condition_variable>
 +#include <cstdint>
  #include <functional>
++#include <limits>
  #include <mutex>
+ #include <shared_mutex>
  #include <thread>
  #include <utility>
  
-+/*  DXVK helpers  */
  #include "util_error.h"
 -
 +#include "util_math.h"
@@ -1791,8 +4639,20 @@
  #include "./rc/util_rc.h"
  #include "./rc/util_rc_ptr.h"
  
--namespace dxvk {
--
++#ifndef CACHE_LINE_SIZE
++#define CACHE_LINE_SIZE 64
++#endif
++
++#if defined(_MSC_VER)
++#define DXVK_FORCE_INLINE __forceinline
++#elif defined(__GNUC__) || defined(__clang__)
++#define DXVK_FORCE_INLINE inline __attribute__((always_inline))
++#else
++#define DXVK_FORCE_INLINE inline
++#endif
++
+ namespace dxvk {
+ 
 -  /**
 -   * \brief Thread priority
 -   */
@@ -1800,11 +4660,12 @@
 -    Normal,
 -    Lowest,
 -  };
--
--#ifdef _WIN32
--
--  using ThreadProc = std::function<void()>;
--
++  enum class ThreadPriority : int32_t { Normal, Lowest };
+ 
+ #ifdef _WIN32
+ 
+   using ThreadProc = std::function<void()>;
+ 
 -
 -  /**
 -   * \brief Thread object
@@ -1812,12 +4673,30 @@
 -  struct ThreadData {
 -    ThreadData(ThreadProc&& proc_)
 -    : proc(std::move(proc_)) { }
--
--    ~ThreadData() {
++  struct alignas(CACHE_LINE_SIZE) ThreadData {
++    std::atomic<uint32_t>      refs;
++    HANDLE                     handle;
++    DWORD                      id;
++    std::atomic<ThreadPriority> priority;
++    ThreadProc                 proc;
++
++    explicit ThreadData(ThreadProc&& p)
++    : refs(2u)
++    , handle(nullptr)
++    , id(0u)
++    , priority(ThreadPriority::Normal)
++    , proc(std::move(p)) {
++    }
+ 
+     ~ThreadData() {
 -      if (handle)
 -        CloseHandle(handle);
--    }
--
++      if (handle) {
++        ::CloseHandle(handle);
++        handle = nullptr;
++      }
+     }
+ 
 -    HANDLE                handle = nullptr;
 -    DWORD                 id     = 0;
 -    std::atomic<uint32_t> refs   = { 2u };
@@ -1825,185 +4704,267 @@
 -
 -    void decRef() {
 -      if (refs.fetch_sub(1, std::memory_order_release) == 1)
--        delete this;
--    }
--  };
--
--
++    DXVK_FORCE_INLINE void decRef() noexcept {
++      const uint32_t old = refs.fetch_sub(1u, std::memory_order_release);
++      if (old == 1u) {
++        std::atomic_thread_fence(std::memory_order_acquire);
+         delete this;
++      }
+     }
+   };
+ 
++  static_assert(alignof(ThreadData) == CACHE_LINE_SIZE,
++    "ThreadData must be cache-line aligned");
++  static_assert(sizeof(ThreadData) >= CACHE_LINE_SIZE,
++    "ThreadData should span at least one cache line");
+ 
 -  /**
 -   * \brief Thread wrapper
 -   *
 -   * Drop-in replacement for std::thread
 -   * using plain win32 threads.
 -   */
--  class thread {
+   class thread {
 -
--  public:
+   public:
 -
 -    using id = uint32_t;
--    using native_handle_type = HANDLE;
--
++    using id                 = uint32_t;
+     using native_handle_type = HANDLE;
+ 
 -    thread() { }
 -
--    explicit thread(ThreadProc&& proc);
++    thread() = default;
+     explicit thread(ThreadProc&& proc);
 -
--    ~thread();
--
++    thread(ThreadProc&& proc, ThreadPriority prio);
+     ~thread();
+ 
 -    thread(thread&& other)
 -    : m_data(std::exchange(other.m_data, nullptr)) { }
 -
 -    thread& operator = (thread&& other) {
 -      if (m_data)
 -        m_data->decRef();
--
++    thread(const thread&) = delete;
++    thread& operator=(const thread&) = delete;
+ 
 -      m_data = std::exchange(other.m_data, nullptr);
 -      return *this;
--    }
--
++    thread(thread&& rhs) noexcept
++    : m_data(std::exchange(rhs.m_data, nullptr)) {
+     }
+ 
 -    void detach() {
 -      m_data->decRef();
 -      m_data = nullptr;
--    }
--
++    thread& operator=(thread&& rhs) noexcept {
++      if (joinable())
++        std::terminate();
++
++      m_data = std::exchange(rhs.m_data, nullptr);
++      return *this;
+     }
+ 
 -    bool joinable() const {
--      return m_data != nullptr;
--    }
--
++    DXVK_FORCE_INLINE bool joinable() const noexcept {
+       return m_data != nullptr;
+     }
+ 
 -    id get_id() const {
--      return joinable() ? m_data->id : id();
--    }
--
++    void detach();
++    void join();
++    void set_priority(ThreadPriority prio);
++
++    DXVK_FORCE_INLINE id get_id() const noexcept {
+       return joinable() ? m_data->id : id();
+     }
+ 
 -    native_handle_type native_handle() const {
--      return joinable() ? m_data->handle : native_handle_type();
--    }
--
++    DXVK_FORCE_INLINE native_handle_type native_handle() const noexcept {
+       return joinable() ? m_data->handle : native_handle_type();
+     }
+ 
 -    void swap(thread& other) {
--      std::swap(m_data, other.m_data);
--    }
--
++    DXVK_FORCE_INLINE void swap(thread& other) noexcept {
+       std::swap(m_data, other.m_data);
+     }
+ 
 -    void join();
 -
 -    void set_priority(ThreadPriority priority);
 -
--    static uint32_t hardware_concurrency();
--
--  private:
-+/* --------------------------------------------------------------------- */
-+#ifndef CACHE_LINE_SIZE
-+# define CACHE_LINE_SIZE 64
-+#endif
+     static uint32_t hardware_concurrency();
  
--    ThreadData* m_data = nullptr;
-+#if defined(_MSC_VER)
-+# define DXVK_FORCE_INLINE __forceinline
-+#elif defined(__GNUC__) || defined(__clang__)
-+# define DXVK_FORCE_INLINE inline __attribute__((always_inline))
-+#else
-+# define DXVK_FORCE_INLINE inline
-+#endif
+   private:
+-
+     ThreadData* m_data = nullptr;
  
 -    static DWORD WINAPI threadProc(void* arg);
-+/*  Detect x86 for pause / SIMD helpers                                   */
-+#if defined(__x86_64__) || defined(_M_X64) || \
-+    defined(__i386__)   || defined(_M_IX86)
-+# define DXVK_ARCH_X86
-+#endif
+-
++    static DWORD WINAPI threadProc(void* arg) noexcept;
+   };
  
--  };
-+namespace dxvk {
- 
-+/* ===================================================================== */
-+/*  Common enum / helpers                                                */
-+/* ===================================================================== */
-+enum class ThreadPriority : int32_t { Normal, Lowest };
-+
-+/* ===================================================================== */
-+/*  Windows implementation                                               */
-+/* ===================================================================== */
-+#ifdef _WIN32
- 
--  namespace this_thread {
+-
+   namespace this_thread {
 -    inline void yield() {
 -      SwitchToThread();
--    }
-+using ThreadProc = std::function<void()>;
++    DXVK_FORCE_INLINE void yield() noexcept {
++      ::SwitchToThread();
+     }
  
 -    inline thread::id get_id() {
 -      return thread::id(GetCurrentThreadId());
-+struct ThreadData {
-+  explicit ThreadData(ThreadProc&& p) : proc(std::move(p)) {}
-+  ~ThreadData() { if (handle) ::CloseHandle(handle); }
-+
-+  HANDLE                handle = nullptr;
-+  DWORD                 id     = 0;
-+  std::atomic<uint32_t> refs   { 2u }; /* owner + thread */
-+  ThreadProc            proc;
-+
-+  DXVK_FORCE_INLINE void decRef() {
-+    if (refs.fetch_sub(1, std::memory_order_release) == 1) {
-+      std::atomic_thread_fence(std::memory_order_acquire);
-+      delete this;
++    DXVK_FORCE_INLINE thread::id get_id() noexcept {
++      return ::GetCurrentThreadId();
      }
--
+ 
 -    bool isInModuleDetachment();
++    bool isInModuleDetachment() noexcept;
    }
-+};
  
-+/* --------------------------------------------------------------------- */
-+/*  dxvk::thread                                                         */
-+/* --------------------------------------------------------------------- */
-+class thread {
-+public:
-+  using id                 = uint32_t;
-+  using native_handle_type = HANDLE;
- 
+-
 -  /**
 -   * \brief SRW-based mutex implementation
 -   *
 -   * Drop-in replacement for \c std::mutex that uses Win32
 -   * SRW locks, which are implemented with \c futex in wine.
 -   */
--  class mutex {
+   class mutex {
 -
--  public:
+   public:
 -
--    using native_handle_type = PSRWLOCK;
--
+     using native_handle_type = PSRWLOCK;
+ 
 -    mutex() { }
 -
--    mutex(const mutex&) = delete;
++    constexpr mutex() noexcept = default;
+     mutex(const mutex&) = delete;
 -    mutex& operator = (const mutex&) = delete;
--
++    mutex& operator=(const mutex&) = delete;
+ 
 -    void lock() {
 -      AcquireSRWLockExclusive(&m_lock);
--    }
--
++    DXVK_FORCE_INLINE void lock() noexcept {
++      ::AcquireSRWLockExclusive(&m_lock);
+     }
+ 
 -    void unlock() {
 -      ReleaseSRWLockExclusive(&m_lock);
--    }
--
++    DXVK_FORCE_INLINE void unlock() noexcept {
++      ::ReleaseSRWLockExclusive(&m_lock);
+     }
+ 
 -    bool try_lock() {
 -      return TryAcquireSRWLockExclusive(&m_lock);
--    }
--
++    DXVK_FORCE_INLINE bool try_lock() noexcept {
++      return ::TryAcquireSRWLockExclusive(&m_lock) != 0;
+     }
+ 
 -    native_handle_type native_handle() {
--      return &m_lock;
--    }
-+  thread() = default;
++    DXVK_FORCE_INLINE native_handle_type native_handle() noexcept {
+       return &m_lock;
+     }
  
--  private:
-+  /*  Classic constructor – starts immediately on default core           */
-+  explicit thread(ThreadProc&& proc);
+   private:
+-
+     SRWLOCK m_lock = SRWLOCK_INIT;
+-
+   };
  
--    SRWLOCK m_lock = SRWLOCK_INIT;
-+  /*  New constructor – steers thread onto P/E cores *before* first instr */
-+  thread(ThreadProc&& proc, ThreadPriority prio);
+-
+-  /**
+-   * \brief SRW-based shared mutex implementation
+-   */
+   class shared_mutex {
+-
+   public:
+-
+     using native_handle_type = PSRWLOCK;
  
--  };
-+  ~thread();
+-    shared_mutex() { }
+-
++    shared_mutex() noexcept = default;
+     shared_mutex(const shared_mutex&) = delete;
+-    shared_mutex& operator = (const shared_mutex&) = delete;
++    shared_mutex& operator=(const shared_mutex&) = delete;
  
-+  thread            (const thread&)            = delete;
-+  thread& operator= (const thread&)            = delete;
+-    void lock() {
+-      AcquireSRWLockExclusive(&m_lock);
++    DXVK_FORCE_INLINE void lock() noexcept {
++      ::AcquireSRWLockExclusive(&m_lock);
+     }
+ 
+-    void lock_shared() {
+-      AcquireSRWLockShared(&m_lock);
++    DXVK_FORCE_INLINE void lock_shared() noexcept {
++      ::AcquireSRWLockShared(&m_lock);
+     }
+ 
+-    void unlock() {
+-      ReleaseSRWLockExclusive(&m_lock);
++    DXVK_FORCE_INLINE void unlock() noexcept {
++      ::ReleaseSRWLockExclusive(&m_lock);
+     }
+ 
+-    void unlock_shared() {
+-      ReleaseSRWLockShared(&m_lock);
++    DXVK_FORCE_INLINE void unlock_shared() noexcept {
++      ::ReleaseSRWLockShared(&m_lock);
+     }
+ 
+-    bool try_lock() {
+-      return TryAcquireSRWLockExclusive(&m_lock);
++    DXVK_FORCE_INLINE bool try_lock() noexcept {
++      return ::TryAcquireSRWLockExclusive(&m_lock) != 0;
+     }
+ 
+-    bool try_lock_shared() {
+-      return TryAcquireSRWLockShared(&m_lock);
++    DXVK_FORCE_INLINE bool try_lock_shared() noexcept {
++      return ::TryAcquireSRWLockShared(&m_lock) != 0;
+     }
+ 
+-    native_handle_type native_handle() {
++    DXVK_FORCE_INLINE native_handle_type native_handle() noexcept {
+       return &m_lock;
+     }
+ 
+   private:
+-
+     SRWLOCK m_lock = SRWLOCK_INIT;
++  };
+ 
++  class fast_mutex {
++  public:
++    fast_mutex() {
++      ::InitializeCriticalSectionAndSpinCount(&m_lock, 4000u);
++    }
++
++    ~fast_mutex() {
++      ::DeleteCriticalSection(&m_lock);
++    }
++
++    fast_mutex(const fast_mutex&) = delete;
++    fast_mutex& operator=(const fast_mutex&) = delete;
++
++    DXVK_FORCE_INLINE void lock() noexcept {
++      ::EnterCriticalSection(&m_lock);
++    }
++
++    DXVK_FORCE_INLINE void unlock() noexcept {
++      ::LeaveCriticalSection(&m_lock);
++    }
++
++    DXVK_FORCE_INLINE bool try_lock() noexcept {
++      return ::TryEnterCriticalSection(&m_lock) != 0;
++    }
++
++  private:
++    CRITICAL_SECTION m_lock;
+   };
+ 
++  using spin_mutex = fast_mutex;
  
 -  /**
 -   * \brief Recursive mutex implementation
@@ -2011,47 +4972,55 @@
 -   * Drop-in replacement for \c std::recursive_mutex that
 -   * uses Win32 critical sections.
 -   */
--  class recursive_mutex {
-+  thread            (thread&& rhs) noexcept
-+  : m_data(std::exchange(rhs.m_data, nullptr)) {}
+   class recursive_mutex {
+-
+   public:
+-
+     using native_handle_type = PCRITICAL_SECTION;
  
--  public:
--
--    using native_handle_type = PCRITICAL_SECTION;
--
--    recursive_mutex() {
+     recursive_mutex() {
 -      InitializeCriticalSection(&m_lock);
--    }
--
--    ~recursive_mutex() {
++      ::InitializeCriticalSection(&m_lock);
+     }
+ 
+     ~recursive_mutex() {
 -      DeleteCriticalSection(&m_lock);
--    }
--
--    recursive_mutex(const recursive_mutex&) = delete;
++      ::DeleteCriticalSection(&m_lock);
+     }
+ 
+     recursive_mutex(const recursive_mutex&) = delete;
 -    recursive_mutex& operator = (const recursive_mutex&) = delete;
--
++    recursive_mutex& operator=(const recursive_mutex&) = delete;
+ 
 -    void lock() {
 -      EnterCriticalSection(&m_lock);
--    }
--
++    DXVK_FORCE_INLINE void lock() noexcept {
++      ::EnterCriticalSection(&m_lock);
+     }
+ 
 -    void unlock() {
 -      LeaveCriticalSection(&m_lock);
--    }
--
++    DXVK_FORCE_INLINE void unlock() noexcept {
++      ::LeaveCriticalSection(&m_lock);
+     }
+ 
 -    bool try_lock() {
 -      return TryEnterCriticalSection(&m_lock);
--    }
--
++    DXVK_FORCE_INLINE bool try_lock() noexcept {
++      return ::TryEnterCriticalSection(&m_lock) != 0;
+     }
+ 
 -    native_handle_type native_handle() {
--      return &m_lock;
--    }
++    DXVK_FORCE_INLINE native_handle_type native_handle() noexcept {
+       return &m_lock;
+     }
+ 
+   private:
 -
--  private:
+     CRITICAL_SECTION m_lock;
 -
--    CRITICAL_SECTION m_lock;
--
--  };
--
+   };
+ 
 -
 -  /**
 -   * \brief SRW-based condition variable implementation
@@ -2059,57 +5028,48 @@
 -   * Drop-in replacement for \c std::condition_variable that
 -   * uses Win32 condition variables on SRW locks.
 -   */
--  class condition_variable {
+   class condition_variable {
 -
--  public:
+   public:
 -
--    using native_handle_type = PCONDITION_VARIABLE;
--
--    condition_variable() {
+     using native_handle_type = PCONDITION_VARIABLE;
+ 
+     condition_variable() {
 -      InitializeConditionVariable(&m_cond);
--    }
--
++      ::InitializeConditionVariable(&m_cond);
+     }
+ 
 -    condition_variable(condition_variable&) = delete;
 -
 -    condition_variable& operator = (condition_variable&) = delete;
--
++    condition_variable(const condition_variable&) = delete;
++    condition_variable& operator=(const condition_variable&) = delete;
+ 
 -    void notify_one() {
 -      WakeConditionVariable(&m_cond);
--    }
-+  thread& operator= (thread&& rhs) noexcept {
-+    if (joinable()) std::terminate();
-+    if (m_data)     m_data->decRef();
-+    m_data = std::exchange(rhs.m_data, nullptr);
-+    return *this;
-+  }
++    DXVK_FORCE_INLINE void notify_one() noexcept {
++      ::WakeConditionVariable(&m_cond);
+     }
  
 -    void notify_all() {
 -      WakeAllConditionVariable(&m_cond);
--    }
-+  /* ------------------------------------------------------------------ */
-+  DXVK_FORCE_INLINE bool     joinable()      const { return m_data; }
-+  void detach();
-+  void join();
-+  void set_priority(ThreadPriority);
++    DXVK_FORCE_INLINE void notify_all() noexcept {
++      ::WakeAllConditionVariable(&m_cond);
+     }
  
--    void wait(std::unique_lock<dxvk::mutex>& lock) {
+     void wait(std::unique_lock<dxvk::mutex>& lock) {
 -      auto srw = lock.mutex()->native_handle();
 -      SleepConditionVariableSRW(&m_cond, srw, INFINITE, 0);
--    }
-+  DXVK_FORCE_INLINE id                  get_id()        const {
-+    return joinable() ? m_data->id     : id();
-+  }
-+  DXVK_FORCE_INLINE native_handle_type native_handle()  const {
-+    return joinable() ? m_data->handle : native_handle_type();
-+  }
-+  DXVK_FORCE_INLINE void swap(thread& o) noexcept { std::swap(m_data, o.m_data); }
++      ::SleepConditionVariableSRW(&m_cond, lock.mutex()->native_handle(), INFINITE, 0u);
+     }
  
 -    template<typename Predicate>
 -    void wait(std::unique_lock<dxvk::mutex>& lock, Predicate pred) {
--      while (!pred())
--        wait(lock);
--    }
-+  static uint32_t hardware_concurrency();
++    template<typename Pred>
++    void wait(std::unique_lock<dxvk::mutex>& lock, Pred pred) {
+       while (!pred())
+         wait(lock);
+     }
  
 -    template<typename Clock, typename Duration>
 -    std::cv_status wait_until(std::unique_lock<dxvk::mutex>& lock, const std::chrono::time_point<Clock, Duration>& time) {
@@ -2119,178 +5079,113 @@
 -        ? wait_for(lock, now - time)
 -        : std::cv_status::timeout;
 -    }
-+private:
-+  ThreadData*                m_data = nullptr;
- 
+-
 -    template<typename Clock, typename Duration, typename Predicate>
 -    bool wait_until(std::unique_lock<dxvk::mutex>& lock, const std::chrono::time_point<Clock, Duration>& time, Predicate pred) {
 -      if (pred())
 -        return true;
-+  static DWORD  WINAPI threadProc(void*) noexcept;
-+};
-+
-+/* --------------------------------------------------------------------- */
-+/*  this_thread helpers                                                  */
-+/* --------------------------------------------------------------------- */
-+namespace this_thread {
-+  DXVK_FORCE_INLINE void       yield()   { ::SwitchToThread(); }
-+  DXVK_FORCE_INLINE thread::id get_id()  { return ::GetCurrentThreadId(); }
-+  bool isInModuleDetachment() noexcept;
-+}
- 
+-
 -      auto now = Clock::now();
 -      return now < time && wait_for(lock, now - time, pred);
 -    }
-+/* --------------------------------------------------------------------- */
-+/*  Mutex primitives                                                     */
-+/* --------------------------------------------------------------------- */
-+class mutex {
-+public:
-+  using native_handle_type = PSRWLOCK;
-+
-+  constexpr mutex() noexcept = default;
-+  mutex            (const mutex&)            = delete;
-+  mutex& operator= (const mutex&)            = delete;
-+
-+  DXVK_FORCE_INLINE void lock()      noexcept { ::AcquireSRWLockExclusive(&m_lock); }
-+  DXVK_FORCE_INLINE void unlock()    noexcept { ::ReleaseSRWLockExclusive(&m_lock); }
-+  DXVK_FORCE_INLINE bool try_lock()  noexcept { return ::TryAcquireSRWLockExclusive(&m_lock) != 0; }
-+  DXVK_FORCE_INLINE native_handle_type native_handle() noexcept { return &m_lock; }
-+private:
-+  SRWLOCK m_lock = SRWLOCK_INIT;
-+};
-+
-+/* -----------------------  Pillar 1 — Ticket-Lock ---------------------- */
-+class fast_mutex {
-+public:
-+  fast_mutex()  = default;
-+  fast_mutex            (const fast_mutex&)            = delete;
-+  fast_mutex& operator= (const fast_mutex&)            = delete;
-+
-+  /* FIFO-fair locking */
-+  void lock() noexcept;
-+  void unlock() noexcept;
-+  bool try_lock() noexcept;
-+
-+private:
-+  /* 64-bit counter :  [63..32] tail  |  [31..0] head */
-+  alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> m_ctr { 0 };
-+};
-+
-+using spin_mutex = fast_mutex;
-+
-+/* --------------------------------------------------------------------- */
-+class recursive_mutex {
-+public:
-+  using native_handle_type = PCRITICAL_SECTION;
-+
-+  recursive_mutex()  { ::InitializeCriticalSection(&m_lock); }
-+  ~recursive_mutex() { ::DeleteCriticalSection(&m_lock); }
-+
-+  recursive_mutex            (const recursive_mutex&)            = delete;
-+  recursive_mutex& operator= (const recursive_mutex&)            = delete;
-+
-+  DXVK_FORCE_INLINE void lock()      noexcept { ::EnterCriticalSection(&m_lock); }
-+  DXVK_FORCE_INLINE void unlock()    noexcept { ::LeaveCriticalSection(&m_lock); }
-+  DXVK_FORCE_INLINE bool try_lock()  noexcept { return ::TryEnterCriticalSection(&m_lock) != 0; }
-+  DXVK_FORCE_INLINE native_handle_type native_handle() noexcept { return &m_lock; }
-+
-+private:
-+  CRITICAL_SECTION m_lock;
-+};
-+
-+/* --------------------------------------------------------------------- */
-+class condition_variable {
-+public:
-+  using native_handle_type = PCONDITION_VARIABLE;
-+
-+  condition_variable()                              { ::InitializeConditionVariable(&m_cond); }
-+  condition_variable            (const condition_variable&)            = delete;
-+  condition_variable& operator= (const condition_variable&)            = delete;
- 
+-
 -    template<typename Rep, typename Period>
 -    std::cv_status wait_for(std::unique_lock<dxvk::mutex>& lock, const std::chrono::duration<Rep, Period>& timeout) {
 -      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
 -      auto srw = lock.mutex()->native_handle();
--
++    template<class Rep, class Period>
++    std::cv_status wait_for(
++            std::unique_lock<dxvk::mutex>&         lock,
++      const std::chrono::duration<Rep, Period>&    duration) {
++      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(duration);
++
++      if (ms < std::chrono::milliseconds::zero())
++        ms = std::chrono::milliseconds::zero();
++
++      const long long cnt = ms.count();
++      const DWORD timeout = (cnt <= 0LL)
++        ? 0u
++        : (cnt >= static_cast<long long>(std::numeric_limits<DWORD>::max())
++          ? std::numeric_limits<DWORD>::max()
++          : static_cast<DWORD>(cnt));
++
++      const BOOL ok = ::SleepConditionVariableSRW(
++        &m_cond, lock.mutex()->native_handle(), timeout, 0u);
++      return ok ? std::cv_status::no_timeout : std::cv_status::timeout;
++    }
++
++    template<class Rep, class Period, class Pred>
++    bool wait_for(
++            std::unique_lock<dxvk::mutex>&         lock,
++      const std::chrono::duration<Rep, Period>&    duration,
++            Pred                                   pred) {
++      const auto deadline = std::chrono::steady_clock::now() + duration;
++
++      while (!pred()) {
++        if (wait_for(lock, deadline - std::chrono::steady_clock::now()) == std::cv_status::timeout)
++          return pred();
++      }
+ 
 -      return SleepConditionVariableSRW(&m_cond, srw, ms.count(), 0)
 -        ? std::cv_status::no_timeout
 -        : std::cv_status::timeout;
--    }
-+  DXVK_FORCE_INLINE void notify_one() noexcept { ::WakeConditionVariable(&m_cond); }
-+  DXVK_FORCE_INLINE void notify_all() noexcept { ::WakeAllConditionVariable(&m_cond); }
++      return true;
+     }
  
 -    template<typename Rep, typename Period, typename Predicate>
 -    bool wait_for(std::unique_lock<dxvk::mutex>& lock, const std::chrono::duration<Rep, Period>& timeout, Predicate pred) {
 -      bool result = pred();
-+  void wait(std::unique_lock<dxvk::mutex>& lk) {
-+    ::SleepConditionVariableSRW(&m_cond, lk.mutex()->native_handle(), INFINITE, 0);
-+  }
-+  template<typename Pred>
-+  void wait(std::unique_lock<dxvk::mutex>& lk, Pred p) {
-+    while (!p()) wait(lk);
-+  }
- 
+-
 -      if (!result && wait_for(lock, timeout) == std::cv_status::no_timeout)
 -        result = pred();
-+  template<class Rep, class Period>
-+  std::cv_status wait_for(std::unique_lock<dxvk::mutex>& lk,
-+                          const std::chrono::duration<Rep, Period>& d) {
-+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(d);
-+    if (ms < std::chrono::milliseconds::zero())
-+      ms = std::chrono::milliseconds::zero();
++    template<class Clock, class Duration>
++    std::cv_status wait_until(
++            std::unique_lock<dxvk::mutex>&          lock,
++      const std::chrono::time_point<Clock, Duration>& tp) {
++      const auto now = Clock::now();
++      return tp <= now ? std::cv_status::timeout : wait_for(lock, tp - now);
++    }
 +
-+    BOOL ok = ::SleepConditionVariableSRW(&m_cond, lk.mutex()->native_handle(),
-+                                          static_cast<DWORD>(ms.count()), 0);
-+    return ok ? std::cv_status::no_timeout : std::cv_status::timeout;
-+  }
++    template<class Clock, class Duration, class Pred>
++    bool wait_until(
++            std::unique_lock<dxvk::mutex>&          lock,
++      const std::chrono::time_point<Clock, Duration>& tp,
++            Pred                                    pred) {
++      while (!pred()) {
++        if (wait_until(lock, tp) == std::cv_status::timeout)
++          return pred();
++      }
  
 -      return result;
-+  template<class Rep, class Period, class Pred>
-+  bool wait_for(std::unique_lock<dxvk::mutex>& lk,
-+                const std::chrono::duration<Rep, Period>& d,
-+                Pred p) {
-+    auto deadline = std::chrono::steady_clock::now() + d;
-+    while (!p()) {
-+      if (wait_for(lk, deadline - std::chrono::steady_clock::now()) ==
-+          std::cv_status::timeout)
-+        return p();
++      return true;
      }
-+    return true;
-+  }
  
 -    native_handle_type native_handle() {
--      return &m_cond;
-+  /* … wait_until wrappers identical – omitted for brevity … */
-+  template<class Clock, class Duration>
-+  std::cv_status wait_until(std::unique_lock<dxvk::mutex>& lk,
-+                            const std::chrono::time_point<Clock, Duration>& tp) {
-+    auto now = Clock::now();
-+    return tp <= now ? std::cv_status::timeout : wait_for(lk, tp - now);
-+  }
-+  template<class Clock, class Duration, class Pred>
-+  bool wait_until(std::unique_lock<dxvk::mutex>& lk,
-+                  const std::chrono::time_point<Clock, Duration>& tp,
-+                  Pred p) {
-+    while (!p()) {
-+      if (wait_until(lk, tp) == std::cv_status::timeout)
-+        return p();
++    DXVK_FORCE_INLINE native_handle_type native_handle() noexcept {
+       return &m_cond;
      }
-+    return true;
-+  }
  
--  private:
+   private:
 -
--    CONDITION_VARIABLE m_cond;
+     CONDITION_VARIABLE m_cond;
 -
--  };
-+  DXVK_FORCE_INLINE native_handle_type native_handle() noexcept { return &m_cond; }
+   };
  
--#else
--  class thread : public std::thread {
--  public:
+ #else
++
++  #include <pthread.h>
++  #include <sched.h>
++  #if defined(__linux__)
++    #include <unistd.h>
++    #include <sys/syscall.h>
++  #endif
++
+   class thread : public std::thread {
++    using base = std::thread;
+   public:
 -    using std::thread::thread;
--
++    using base::thread;
+ 
 -    void set_priority(ThreadPriority priority) {
 -      ::sched_param param = {};
 -      int32_t policy;
@@ -2301,83 +5196,56 @@
 -        case ThreadPriority::Lowest: policy = SCHED_OTHER; break;
 -#else
 -        case ThreadPriority::Lowest: policy = SCHED_IDLE;  break;
-+private:
-+  CONDITION_VARIABLE m_cond;
-+};
-+
-+/* ===================================================================== */
-+/*  POSIX side – unchanged: aliases                                       */
-+/* ===================================================================== */
-+#else   /* !_WIN32 */
-+
-+#include <pthread.h>
-+#include <sched.h>
-+#if defined(__linux__)
-+# include <unistd.h>
- #endif
+-#endif
 -      }
 -      ::pthread_setschedparam(this->native_handle(), policy, &param);
--    }
--  };
--
--  using mutex              = std::mutex;
--  using recursive_mutex    = std::recursive_mutex;
--  using condition_variable = std::condition_variable;
--
--  namespace this_thread {
++    void set_priority(ThreadPriority) {
+     }
+   };
+ 
+@@ -380,18 +389,33 @@ namespace dxvk {
+   using shared_mutex       = std::shared_mutex;
+   using recursive_mutex    = std::recursive_mutex;
+   using condition_variable = std::condition_variable;
++  using fast_mutex         = std::mutex;
++  using spin_mutex         = std::mutex;
+ 
+   namespace this_thread {
 -    inline void yield() {
--      std::this_thread::yield();
--    }
--
++    DXVK_FORCE_INLINE void yield() noexcept {
+       std::this_thread::yield();
+     }
+ 
 -    uint32_t get_id();
++    inline uint32_t get_id() {
++    #if defined(__linux__)
++      return static_cast<uint32_t>(::syscall(SYS_gettid));
++    #else
++      static std::atomic<uint32_t> ctr { 0u };
++      thread_local uint32_t id = 0u;
++
++      if (!id)
++        id = ctr.fetch_add(1u, std::memory_order_relaxed) + 1u;
  
 -    inline bool isInModuleDetachment() {
--      return false;
--    }
-+class thread : public std::thread {
-+  using base = std::thread;
-+public:
-+  using base::thread;
-+  void set_priority(ThreadPriority prio);
-+};
++      return id;
++    #endif
++    }
 +
-+using mutex              = std::mutex;
-+using recursive_mutex    = std::recursive_mutex;
-+using condition_variable = std::condition_variable;
-+using fast_mutex         = std::mutex;
-+using spin_mutex         = std::mutex;
-+
-+namespace this_thread {
-+  DXVK_FORCE_INLINE void yield() { std::this_thread::yield(); }
-+
-+  inline uint32_t get_id() {
-+#   if defined(__linux__)
-+    return static_cast<uint32_t>(::gettid());
-+#   else
-+    static std::atomic<uint32_t> ctr{0};
-+    thread_local uint32_t id = 0;
-+    if (!id) id = ++ctr;
-+    return id;
-+#   endif
++    DXVK_FORCE_INLINE bool isInModuleDetachment() noexcept {
+       return false;
+     }
    }
--#endif
--
-+  DXVK_FORCE_INLINE bool isInModuleDetachment() noexcept { return false; }
++
+ #endif
+ 
  }
-+
-+#endif /* _WIN32 */
-+
-+} /* namespace dxvk */
 
 --- a/src/util/thread.cpp	2025-07-05 23:59:55.224477951 +0200
-+++ b/src/util/thread.cpp	2025-07-06 00:01:46.855182990 +0200
-@@ -1,114 +1,276 @@
-+/*  thread.cpp – DXVK threading implementation
-+ *  ------------------------------------------
-+ *  FINAL, FAIR & HYBRID-CPU AWARE
-+ */
-+
++++ b/src/util/thread.cpp	2026-05-06 00:01:46.855182990 +0200
+@@ -1,22 +1,200 @@
  #include <atomic>
++#include <limits>
 +#include <system_error>
 +#include <vector>
  
@@ -2385,182 +5253,245 @@
 +#include "util_bit.h"
  #include "util_likely.h"
  
-+#ifdef DXVK_ARCH_X86
-+#include <x86intrin.h>
-+#endif
-+
-+/* ===================================================================== */
-+/*  Windows implementation                                               */
-+/* ===================================================================== */
  #ifdef _WIN32
  
--namespace dxvk {
-+/*  Older SDK compatibility – PRS                                          */
 +#ifndef SYSTEM_CPU_SET_INFORMATION_ALLOCATED_FLAG
-+# define SYSTEM_CPU_SET_INFORMATION_ALLOCATED_FLAG 0x2
++#define SYSTEM_CPU_SET_INFORMATION_ALLOCATED_FLAG 0x2
 +#endif
 +#ifndef SYSTEM_CPU_SET_INFORMATION_PARKED_FLAG
-+# define SYSTEM_CPU_SET_INFORMATION_PARKED_FLAG    0x1
++#define SYSTEM_CPU_SET_INFORMATION_PARKED_FLAG    0x1
 +#endif
++
+ namespace dxvk {
  
--  thread::thread(ThreadProc&& proc)
--  : m_data(new ThreadData(std::move(proc))) {
--    m_data->handle = ::CreateThread(nullptr, 0x100000,
--      thread::threadProc, m_data, STACK_SIZE_PARAM_IS_A_RESERVATION,
--      &m_data->id);
-+namespace dxvk {
- 
--    if (!m_data->handle) {
--      delete m_data;
--      throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again), "Failed to create thread");
-+  /* --------------------------------------------------------------------- */
-+  /*  CPU-set discovery & steering (shared)                                */
-+  /* --------------------------------------------------------------------- */
 +  namespace {
 +
-+    struct CpuSetDatabase {
-+      std::vector<ULONG> pSets;
-+      std::vector<ULONG> eSets;
++    constexpr SIZE_T DefaultStackReserve = 1u << 20;
 +
-+      using PFN_GetCpuInfo = BOOL (WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG,
-+                                            PULONG, HANDLE, ULONG);
++    struct CpuSetEntry {
++      ULONG id = 0u;
++      BYTE  efficiencyClass = 0u;
++    };
++
++    struct CpuSetDatabase {
++      std::vector<ULONG> perfSets;
++      std::vector<ULONG> effSets;
++
++      using PFN_GetCpuInfo = BOOL (WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
 +      using PFN_SetThreadSets = BOOL (WINAPI*)(HANDLE, const ULONG*, ULONG);
 +
-+      PFN_GetCpuInfo     pGetInfo = nullptr;
-+      PFN_SetThreadSets  pSetSets = nullptr;
-+      bool available = false;
++      PFN_GetCpuInfo    pGetInfo = nullptr;
++      PFN_SetThreadSets pSetSets = nullptr;
++      bool              available = false;
 +
-+      CpuSetDatabase() { init(); }
++      CpuSetDatabase() {
++        init();
++      }
 +
 +    private:
++
 +      void init() {
 +        HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
-+        if (!k32) return;
++        if (!k32)
++          return;
 +
 +        pGetInfo = reinterpret_cast<PFN_GetCpuInfo>(
 +          ::GetProcAddress(k32, "GetSystemCpuSetInformation"));
 +        pSetSets = reinterpret_cast<PFN_SetThreadSets>(
 +          ::GetProcAddress(k32, "SetThreadSelectedCpuSets"));
-+        if (!pGetInfo || !pSetSets) return;
++
++        if (!pGetInfo || !pSetSets)
++          return;
 +
 +        ULONG len = 0;
-+        if (!pGetInfo(nullptr, 0, &len, ::GetCurrentProcess(), 0) &&
-+          ::GetLastError() != ERROR_INSUFFICIENT_BUFFER)
++        if (!pGetInfo(nullptr, 0u, &len, ::GetCurrentProcess(), 0u)) {
++          if (::GetLastError() != ERROR_INSUFFICIENT_BUFFER)
++            return;
++        }
++
++        if (!len)
 +          return;
-+        if (!len) return;
 +
 +        std::vector<char> buf(len);
 +        if (!pGetInfo(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data()),
-+          len, &len, ::GetCurrentProcess(), 0))
++                      len, &len, ::GetCurrentProcess(), 0u))
 +          return;
 +
++        std::vector<CpuSetEntry> usable;
++        usable.reserve(static_cast<size_t>(len) / sizeof(SYSTEM_CPU_SET_INFORMATION));
++
 +        ULONG off = 0;
++        BYTE minClass = std::numeric_limits<BYTE>::max();
++        BYTE maxClass = std::numeric_limits<BYTE>::min();
++
 +        while (off < len) {
 +          auto* info = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data() + off);
++
++          if (!info->Size || info->Size > len - off)
++            break;
++
 +          if (info->Type == CpuSetInformation) {
 +            const auto& cs = info->CpuSet;
-+            if (!(cs.AllFlags & SYSTEM_CPU_SET_INFORMATION_ALLOCATED_FLAG) ||
-+              (cs.AllFlags & SYSTEM_CPU_SET_INFORMATION_PARKED_FLAG)) {
-+              /* unusable */
-+              } else if (cs.EfficiencyClass == 0)
-+                pSets.push_back(cs.Id);
-+            else
-+              eSets.push_back(cs.Id);
++
++            const bool isUsable =
++                 (cs.AllFlags & SYSTEM_CPU_SET_INFORMATION_ALLOCATED_FLAG)
++              && !(cs.AllFlags & SYSTEM_CPU_SET_INFORMATION_PARKED_FLAG);
++
++            if (isUsable) {
++              CpuSetEntry e;
++              e.id = cs.Id;
++              e.efficiencyClass = cs.EfficiencyClass;
++              usable.push_back(e);
++
++              minClass = std::min(minClass, e.efficiencyClass);
++              maxClass = std::max(maxClass, e.efficiencyClass);
++            }
 +          }
++
 +          off += info->Size;
 +        }
-+        available = !pSets.empty() || !eSets.empty();
++
++        if (usable.empty())
++          return;
++
++        perfSets.reserve(usable.size());
++        effSets.reserve(usable.size());
++
++        // Windows docs: higher EfficiencyClass => higher performance.
++        for (const auto& e : usable) {
++          if (e.efficiencyClass == maxClass)
++            perfSets.push_back(e.id);
++          if (e.efficiencyClass == minClass)
++            effSets.push_back(e.id);
++        }
++
++        // Homogeneous fallback: keep one populated vector.
++        if (perfSets.empty() && !effSets.empty())
++          perfSets = effSets;
++        if (effSets.empty() && !perfSets.empty())
++          effSets = perfSets;
++
++        available = !perfSets.empty() || !effSets.empty();
 +      }
 +    };
-+    CpuSetDatabase& cpuDb() { static CpuSetDatabase db; return db; }
 +
-+    void applyCpuSetAffinity(HANDLE thr, ThreadPriority prio) {
-+      auto& db = cpuDb();
-+      if (!db.available) return;
-+      const std::vector<ULONG>& tgt =
-+      (prio == ThreadPriority::Lowest) ? db.eSets : db.pSets;
-+      if (!tgt.empty())
-+        db.pSetSets(thr, tgt.data(), static_cast<ULONG>(tgt.size()));
-     }
--  }
- 
-+  } /* anonymous namespace */
- 
--  thread::~thread() {
--    if (joinable())
--      std::terminate();
-+  /* --------------------------------------------------------------------- */
-+  /*  fast_mutex – Pillar 1 – Ticket lock                                  */
-+  /* --------------------------------------------------------------------- */
-+  void fast_mutex::lock() noexcept {
-+    /* Get our ticket (upper 32 bits) */
-+    uint64_t prev = m_ctr.fetch_add(1ull << 32, std::memory_order_acq_rel);
-+    const uint32_t my = static_cast<uint32_t>(prev >> 32);
++    CpuSetDatabase& cpuDb() {
++      static CpuSetDatabase db;
++      return db;
++    }
 +
-+    /* Spin until head == my ticket */
-+    for (uint32_t spin = 0;; ++spin) {
-+      uint32_t head = static_cast<uint32_t>(m_ctr.load(std::memory_order_acquire));
-+      if (head == my)
++    void applyCpuSetAffinity(HANDLE threadHandle, ThreadPriority prio) {
++      static CpuSetDatabase& db = cpuDb();
++
++      if (!db.available)
 +        return;
 +
-+      if (spin < 128) {
-+        #     ifdef DXVK_ARCH_X86
-+        _mm_pause();
-+        #     endif
-+      } else {
-+        this_thread::yield();
++      const std::vector<ULONG>& preferred =
++        (prio == ThreadPriority::Lowest) ? db.effSets : db.perfSets;
++      const std::vector<ULONG>& fallback =
++        (prio == ThreadPriority::Lowest) ? db.perfSets : db.effSets;
++
++      if (!preferred.empty()) {
++        db.pSetSets(threadHandle, preferred.data(), static_cast<ULONG>(preferred.size()));
++      } else if (!fallback.empty()) {
++        db.pSetSets(threadHandle, fallback.data(), static_cast<ULONG>(fallback.size()));
 +      }
 +    }
-   }
- 
-+  void fast_mutex::unlock() noexcept {
-+    m_ctr.fetch_add(1, std::memory_order_release);  /* ++head */
-+  }
- 
--  void thread::join() {
--    if (!joinable())
--      throw std::system_error(std::make_error_code(std::errc::invalid_argument), "Thread not joinable");
--
--    if (get_id() == this_thread::get_id())
--      throw std::system_error(std::make_error_code(std::errc::resource_deadlock_would_occur), "Cannot join current thread");
-+  bool fast_mutex::try_lock() noexcept {
-+    uint64_t cur = m_ctr.load(std::memory_order_acquire);
-+    const uint32_t head = static_cast<uint32_t>(cur);
-+    const uint32_t tail = static_cast<uint32_t>(cur >> 32);
-+    if (head != tail) return false;                 /* busy */
 +
-+      return m_ctr.compare_exchange_strong(cur,
-+                                           cur + (1ull << 32),                     /* ++tail */
-+                                           std::memory_order_acq_rel,
-+                                           std::memory_order_relaxed);
 +  }
- 
--    if(::WaitForSingleObjectEx(m_data->handle, INFINITE, FALSE) == WAIT_FAILED)
--      throw std::system_error(std::make_error_code(std::errc::invalid_argument), "Joining thread failed");
-+  /* --------------------------------------------------------------------- */
-+  /*  thread constructors / dtor                                           */
-+  /* --------------------------------------------------------------------- */
-+  thread::thread(ThreadProc&& proc)
-+  : thread(std::move(proc), ThreadPriority::Normal) {}
- 
--    detach();
--  }
++
++
+   thread::thread(ThreadProc&& proc)
+-  : m_data(new ThreadData(std::move(proc))) {
+-    m_data->handle = ::CreateThread(nullptr, 0x100000,
+-      thread::threadProc, m_data, STACK_SIZE_PARAM_IS_A_RESERVATION,
++  : thread(std::move(proc), ThreadPriority::Normal) {
++  }
++
++
 +  thread::thread(ThreadProc&& proc, ThreadPriority prio)
-+  : m_data(new ThreadData(std::move(proc))) {
++  : m_data(nullptr) {
 +    if (this_thread::isInModuleDetachment()) {
-+      delete m_data; m_data = nullptr;
 +      throw std::system_error(
 +        std::make_error_code(std::errc::operation_canceled),
-+                              "DXVK: thread creation during module detach");
++        "DXVK: thread creation during module detach");
 +    }
- 
++
++    m_data = new ThreadData(std::move(proc));
++    m_data->priority.store(prio, std::memory_order_relaxed);
++
 +    m_data->handle = ::CreateThread(
 +      nullptr,
-+      1u << 20,                          /* reserve 1 MiB */
++      DefaultStackReserve,
 +      thread::threadProc,
 +      m_data,
 +      CREATE_SUSPENDED | STACK_SIZE_PARAM_IS_A_RESERVATION,
-+      &m_data->id);
+       &m_data->id);
+ 
+     if (!m_data->handle) {
+       delete m_data;
+-      throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again), "Failed to create thread");
++      m_data = nullptr;
++
++      throw std::system_error(
++        std::make_error_code(std::errc::resource_unavailable_try_again),
++        "DXVK: CreateThread failed");
+     }
++
++    const int winPrio = (prio == ThreadPriority::Lowest)
++      ? THREAD_PRIORITY_LOWEST
++      : THREAD_PRIORITY_NORMAL;
++
++    ::SetThreadPriority(m_data->handle, winPrio);
++    applyCpuSetAffinity(m_data->handle, prio);
++    ::ResumeThread(m_data->handle);
+   }
+ 
+ 
+@@ -26,89 +204,188 @@ namespace dxvk {
+   }
+ 
+ 
++  void thread::detach() {
++    if (!joinable()) {
++      throw std::system_error(
++        std::make_error_code(std::errc::invalid_argument),
++        "DXVK: detach on non-joinable thread");
++    }
++
++    m_data->decRef();
++    m_data = nullptr;
++  }
++
++
+   void thread::join() {
+-    if (!joinable())
+-      throw std::system_error(std::make_error_code(std::errc::invalid_argument), "Thread not joinable");
++    if (!joinable()) {
++      throw std::system_error(
++        std::make_error_code(std::errc::invalid_argument),
++        "DXVK: join on non-joinable thread");
++    }
+ 
+-    if (get_id() == this_thread::get_id())
+-      throw std::system_error(std::make_error_code(std::errc::resource_deadlock_would_occur), "Cannot join current thread");
++    if (get_id() == this_thread::get_id()) {
++      throw std::system_error(
++        std::make_error_code(std::errc::resource_deadlock_would_occur),
++        "DXVK: cannot join current thread");
++    }
+ 
+-    if(::WaitForSingleObjectEx(m_data->handle, INFINITE, FALSE) == WAIT_FAILED)
+-      throw std::system_error(std::make_error_code(std::errc::invalid_argument), "Joining thread failed");
++    if (::WaitForSingleObjectEx(m_data->handle, INFINITE, FALSE) == WAIT_FAILED) {
++      throw std::system_error(
++        std::make_error_code(std::errc::io_error),
++        "DXVK: WaitForSingleObjectEx failed");
++    }
+ 
+     detach();
+   }
+ 
  
 -  void thread::set_priority(ThreadPriority priority) {
 -    int32_t value;
@@ -2568,131 +5499,171 @@
 -      default:
 -      case ThreadPriority::Normal: value = THREAD_PRIORITY_NORMAL; break;
 -      case ThreadPriority::Lowest: value = THREAD_PRIORITY_LOWEST; break;
-+    if (!m_data->handle) {
-+      delete m_data; m_data = nullptr;
-+      throw std::system_error(
-+        std::make_error_code(std::errc::resource_unavailable_try_again),
-+                              "DXVK: CreateThread failed");
-     }
+-    }
++  void thread::set_priority(ThreadPriority prio) {
++    if (!joinable())
++      return;
  
 -    if (m_data)
 -      ::SetThreadPriority(m_data->handle, int32_t(value));
-+    /* Pillar 3 – proactive affinity & priority */
-+    ::SetThreadPriority(m_data->handle,
-+                        (prio == ThreadPriority::Lowest) ? THREAD_PRIORITY_LOWEST
-+                        : THREAD_PRIORITY_NORMAL);
-+    applyCpuSetAffinity(m_data->handle, prio);
++    ThreadPriority old = m_data->priority.load(std::memory_order_relaxed);
++    while (old != prio) {
++      if (m_data->priority.compare_exchange_weak(
++            old, prio, std::memory_order_relaxed, std::memory_order_relaxed)) {
++        const int winPrio = (prio == ThreadPriority::Lowest)
++          ? THREAD_PRIORITY_LOWEST
++          : THREAD_PRIORITY_NORMAL;
 +
-+    ::ResumeThread(m_data->handle);
++        ::SetThreadPriority(m_data->handle, winPrio);
++        applyCpuSetAffinity(m_data->handle, prio);
++        return;
++      }
++    }
    }
  
-+  thread::~thread() {
-+    if (joinable()) std::terminate();
-+  }
  
--  uint32_t thread::hardware_concurrency() {
+   uint32_t thread::hardware_concurrency() {
 -    SYSTEM_INFO info = { };
 -    ::GetSystemInfo(&info);
 -    return info.dwNumberOfProcessors;
-+  /* --------------------------------------------------------------------- */
-+  void thread::detach() {
-+    if (!joinable())
-+      throw std::system_error(std::make_error_code(std::errc::invalid_argument),
-+                              "DXVK: detach on non-joinable thread");
-+      m_data->decRef(); m_data = nullptr;
++    static std::atomic<uint32_t> cached { 0u };
++
++    uint32_t cores = cached.load(std::memory_order_relaxed);
++    if (cores)
++      return cores;
++
++    using GLPIEX_t = BOOL (WINAPI*)(LOGICAL_PROCESSOR_RELATIONSHIP,
++                                    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
++                                    PDWORD);
++
++    static GLPIEX_t pGLPIEX = reinterpret_cast<GLPIEX_t>(
++      ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
++                       "GetLogicalProcessorInformationEx"));
++
++    if (pGLPIEX) {
++      DWORD len = 0;
++      pGLPIEX(RelationProcessorCore, nullptr, &len);
++
++      if (len) {
++        constexpr size_t StackBufSize = 2048u;
++        char stackBuf[StackBufSize];
++        std::vector<char> heapBuf;
++        char* buf = nullptr;
++
++        if (len <= StackBufSize) {
++          buf = stackBuf;
++        } else {
++          heapBuf.resize(len);
++          buf = heapBuf.data();
++        }
++
++        if (pGLPIEX(RelationProcessorCore,
++            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf), &len)) {
++          DWORD off = 0;
++          BYTE minClass = std::numeric_limits<BYTE>::max();
++          BYTE maxClass = std::numeric_limits<BYTE>::min();
++          uint32_t topClassThreads = 0u;
++          bool haveEntries = false;
++
++          while (off < len) {
++            auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf + off);
++
++            if (!info->Size || info->Size > len - off)
++              break;
++
++            if (info->Relationship == RelationProcessorCore) {
++              const BYTE cls = info->Processor.EfficiencyClass;
++              haveEntries = true;
++              minClass = std::min(minClass, cls);
++              maxClass = std::max(maxClass, cls);
++            }
++
++            off += info->Size;
++          }
++
++          if (haveEntries && minClass != maxClass) {
++            off = 0;
++
++            while (off < len) {
++              auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf + off);
++
++              if (!info->Size || info->Size > len - off)
++                break;
++
++              if (info->Relationship == RelationProcessorCore
++               && info->Processor.EfficiencyClass == maxClass) {
++                for (WORD g = 0; g < info->Processor.GroupCount; g++) {
++                  const KAFFINITY mask = info->Processor.GroupMask[g].Mask;
++                  topClassThreads += bit::popcnt(static_cast<uint64_t>(mask));
++                }
++              }
++
++              off += info->Size;
++            }
++
++            if (topClassThreads)
++              cores = topClassThreads;
++          }
++        }
++      }
++    }
++
++    if (!cores)
++      cores = ::GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
++
++    if (!cores)
++      cores = 1u;
++
++    cached.store(cores, std::memory_order_relaxed);
++    return cores;
    }
  
-+  void thread::join() {
-+    if (!joinable())
-+      throw std::system_error(std::make_error_code(std::errc::invalid_argument),
-+                              "DXVK: join on non-joinable thread");
-+      if (get_id() == this_thread::get_id())
-+        throw std::system_error(std::make_error_code(std::errc::resource_deadlock_would_occur),
-+                                "DXVK: cannot join current thread");
-+        if (::WaitForSingleObjectEx(m_data->handle, INFINITE, FALSE) == WAIT_FAILED)
-+          throw std::system_error(std::make_error_code(std::errc::io_error),
-+                                  "DXVK: WaitForSingleObjectEx failed");
-+          detach();
-+  }
  
 -  DWORD WINAPI thread::threadProc(void* arg) {
 -    auto data = reinterpret_cast<ThreadData*>(arg);
 -    DWORD exitCode = 0;
-+  /* --------------------------------------------------------------------- */
-+  void thread::set_priority(ThreadPriority prio) {
-+    if (!joinable()) return;
-+    ::SetThreadPriority(m_data->handle,
-+                        (prio == ThreadPriority::Lowest) ? THREAD_PRIORITY_LOWEST
-+                        : THREAD_PRIORITY_NORMAL);
-+    applyCpuSetAffinity(m_data->handle, prio);
-+  }
++  DWORD WINAPI thread::threadProc(void* arg) noexcept {
++    auto* data = reinterpret_cast<ThreadData*>(arg);
++    DWORD rc = 0u;
  
--    try {
--      data->proc();
--    } catch (...) {
+     try {
+       data->proc();
+     } catch (...) {
 -      exitCode = 1;
-+  /* --------------------------------------------------------------------- */
-+  uint32_t thread::hardware_concurrency() {
-+    using GLPIEX_t = BOOL (WINAPI*)(LOGICAL_PROCESSOR_RELATIONSHIP,
-+                                    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
-+                                    PDWORD);
-+    static auto pGLPIEX = reinterpret_cast<GLPIEX_t>(
-+      ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
-+                       "GetLogicalProcessorInformationEx"));
-+    if (pGLPIEX) {
-+      DWORD len = 0;
-+      pGLPIEX(RelationProcessorCore, nullptr, &len);
-+      if (len) {
-+        std::vector<char> buf(len);
-+        if (pGLPIEX(RelationProcessorCore,
-+          reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len)) {
-+          uint32_t pLogical = 0; bool hasE = false; DWORD off = 0;
-+        while (off < len) {
-+          auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + off);
-+          if (info->Relationship == RelationProcessorCore) {
-+            for (WORD g = 0; g < info->Processor.GroupCount; ++g) {
-+              UINT64 mask = info->Processor.GroupMask[g].Mask;
-+              if (info->Processor.EfficiencyClass == 0)
-+                pLogical += dxvk::bit::popcnt(mask);
-+              else
-+                hasE = true;
-+            }
-+          }
-+          off += info->Size;
-+        }
-+        if (hasE && pLogical) return pLogical;
-+          }
-+      }
++      rc = 1u;
      }
--
--    data->decRef();
+ 
+     data->decRef();
 -    return exitCode;
-+    SYSTEM_INFO si{}; ::GetSystemInfo(&si); return si.dwNumberOfProcessors;
++    return rc;
    }
  
 -}
--
--
+ 
++  namespace this_thread {
+ 
 -namespace dxvk::this_thread {
--
++    bool isInModuleDetachment() noexcept {
++      using Fn = BOOLEAN (NTAPI*)();
+ 
 -  bool isInModuleDetachment() {
--    using PFN_RtlDllShutdownInProgress = BOOLEAN (WINAPI *)();
--
+-    using PFN_RtlDllShutdownInProgress = BOOLEAN (NTAPI *)();
++      static Fn fn = reinterpret_cast<Fn>(
++        ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"),
++                         "RtlDllShutdownInProgress"));
+ 
 -    static auto RtlDllShutdownInProgress = reinterpret_cast<PFN_RtlDllShutdownInProgress>(
 -      ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "RtlDllShutdownInProgress"));
--
++      return fn ? (fn() != 0) : false;
++    }
+ 
 -    return RtlDllShutdownInProgress();
-+  /* --------------------------------------------------------------------- */
-+  DWORD WINAPI thread::threadProc(void* arg) noexcept {
-+    auto* d = reinterpret_cast<ThreadData*>(arg); DWORD rc = 0;
-+    try { d->proc(); } catch (...) { rc = 1; }
-+    d->decRef(); return rc;
    }
  
--}
--
--#else
--
+ }
+ 
+ #else
+ 
 -namespace dxvk::this_thread {
 -  
 -  static std::atomic<uint32_t> g_threadCtr = { 0u };
@@ -2709,27 +5680,15 @@
 -
 -    return g_threadId;
 -  }
-+  /* --------------------------------------------------------------------- */
-+  namespace this_thread {
-+    bool isInModuleDetachment() noexcept {
-+      using Fn = BOOLEAN (WINAPI*)();
-+      static Fn fn = reinterpret_cast<Fn>(
-+        ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"),
-+                         "RtlDllShutdownInProgress"));
-+      return fn && fn();
-+    }
-+  } /* namespace */
- 
+-
 -}
-+} /* namespace dxvk */
++namespace dxvk { }
  
-+#else  /* =============================================================  */
-+namespace dxvk { /* POSIX implementation is header-only */ }
  #endif
 
 --- a/src/util/util_bit.h	2025-07-05 23:05:07.187210703 +0200
-+++ b/src/util/util_bit.h	2025-07-05 23:16:19.036245223 +0200
-@@ -1,719 +1,594 @@
++++ b/src/util/util_bit.h	2026-05-06 23:16:19.036245223 +0200
+@@ -1,725 +1,601 @@
  #pragma once
 +/*  util_bit.h – generic bit-manipulation helpers
 + *  ---------------------------------------------
@@ -2740,6 +5699,7 @@
 + *  • All helpers are constexpr/inline where beneficial.
 + *  • No macro redefinition hazards – gracefully defers to global
 + *    util_likely.h / project-wide definitions.
++ *  • Includes FNV-1a hash for fast hashing (inherited from legacy optimisations).
 + */
  
 -#if (defined(__x86_64__) && !defined(__arm64ec__)) || (defined(_M_X64) && !defined(_M_ARM64EC)) \
@@ -3908,6 +6868,20 @@
        return uint64_t(lo) | (uint64_t(c) << 32);
      }
    };
+ 
+ 
+-  /**
+-   * \brief FNV-1a hash implementation
+-   */
++  /* --------------------------------------------------------------------- */
++  /*  FNV-1a hash implementation (inherited from legacy optimisations)     */
++  /* --------------------------------------------------------------------- */
+   inline uint64_t fnv1a_init() {
+     return 0xcbf29ce484222325ull;
+   }
+@@ -766,4 +642,4 @@ namespace dxvk::bit {
+     return fnv1a_hash(reinterpret_cast<const unsigned char*>(data), size);
+   }
  
 -}
 +} /* namespace dxvk::bit */

@@ -1,0 +1,493 @@
+From d12a1f0e8c53081f12bb4d012db731fa3439c9ac Mon Sep 17 00:00:00 2001
+From: Nguyen Duc Thinh <ducthinh100812@gmail.com>
+Date: Mon, 4 May 2026 20:16:36 +0700
+Subject: [PATCH 1/2] [d3d11]: Optimize GetMaxFeatureLevel and shader memory
+ efficiency
+
+- Decoupled GetMaxFeatureLevel from class instantiation to reduce overhead
+- Implemented zero-copy shader bytecode handling in D3D11ShaderConverter
+- Added dynamic GPU virtual address bit calculation based on hardware limits
+- Improved multisample logic using independent multisampling probes
+---
+ src/d3d11/d3d11_features.cpp | 95 ++++++++++++++++++++++--------------
+ src/d3d11/d3d11_features.h   |  7 ++-
+ src/d3d11/d3d11_shader.cpp   | 69 +++++++++++++-------------
+ 3 files changed, 98 insertions(+), 73 deletions(-)
+
+diff --git a/src/d3d11/d3d11_features.cpp b/src/d3d11/d3d11_features.cpp
+index 7fb0cfa363b..d95dddc2394 100644
+--- a/src/d3d11/d3d11_features.cpp
++++ b/src/d3d11/d3d11_features.cpp
+@@ -1,4 +1,6 @@
+ #include <array>
++#include <algorithm>
++#include <cmath>
+ 
+ #include "d3d11_features.h"
+ 
+@@ -49,10 +51,19 @@ namespace dxvk {
+     m_d3d11Options.MapNoOverwriteOnDynamicConstantBuffer  = TRUE;
+     m_d3d11Options.MapNoOverwriteOnDynamicBufferSRV       = TRUE;
+     m_d3d11Options.ExtendedResourceSharing                = sharedResourceTier > D3D11_SHARED_RESOURCE_TIER_0;
++    // Check if the hardware supports independent multisampling
++    // This is more robust than checking sample locations alone
++    m_d3d11Options.MultisampleRTVWithForcedSampleCountOne = 
++    features.core.features.variableMultisampleRate || 
++    Device.properties().core.properties.limits.standardSampleLocations;[cite: 1]
+ 
+     if (FeatureLevel >= D3D_FEATURE_LEVEL_10_0) {
+-      m_d3d11Options.OutputMergerLogicOp                  = features.core.features.logicOp;
+-      m_d3d11Options.MultisampleRTVWithForcedSampleCountOne = TRUE; // Not really
++      m_d3d11Options.OutputMergerLogicOp = features.core.features.logicOp;[cite: 1]
++  
++      // Logic: Check if the device supports standard sample locations or 
++      // independent multisampling to accurately report this feature.
++      m_d3d11Options.MultisampleRTVWithForcedSampleCountOne = 
++      Device.properties().core.properties.limits.standardSampleLocations; 
+     }
+ 
+     if (FeatureLevel >= D3D_FEATURE_LEVEL_11_0) {
+@@ -102,10 +113,27 @@ namespace dxvk {
+     if (FeatureLevel >= D3D_FEATURE_LEVEL_11_0)
+       m_doubles.DoublePrecisionFloatShaderOps             = hasDoublePrecisionSupport;
+ 
+-    // These numbers are not accurate, but we have no real way to query these
+-    m_gpuVirtualAddress.MaxGPUVirtualAddressBitsPerResource = 32;
+-    m_gpuVirtualAddress.MaxGPUVirtualAddressBitsPerProcess = 40;
++    const auto& limits = Device.properties().core.properties.limits;
++    const auto& memory = Device.instance()->adapter(Device.adapterId())->memoryProperties();
+ 
++    // We take the MAX of sparse limits and total heap size to ensure we don't get a 0.
++    VkDeviceSize totalHeapSize = 0;
++    for (uint32_t i = 0; i < memory.memoryHeapCount; i++)
++        totalHeapSize += memory.memoryHeaps[i].size;
++
++    VkDeviceSize effectiveAddressSpace = std::max(limits.maxSparseAddressSpaceSize, totalHeapSize);
++
++    // If the hardware reports nothing, we fall back to 32 bits. 
++    // Otherwise, we calculate log2 and clamp to valid D3D11 ranges.
++    uint32_t vaBits = 32; 
++    if (effectiveAddressSpace > 0) {
++        vaBits = uint32_t(std::floor(std::log2(effectiveAddressSpace)));
++    }
++
++    // D3D11.1+ spec generally expects 40-48 bits for process space on 64-bit systems.
++    // We clamp Resource bits to 44 (standard max) and Process to 48.
++    m_gpuVirtualAddress.MaxGPUVirtualAddressBitsPerResource = std::clamp(vaBits, 32u, 44u);[cite: 1, 2]
++    m_gpuVirtualAddress.MaxGPUVirtualAddressBitsPerProcess  = std::clamp(vaBits, 32u, 48u);[cite: 1, 2]
+     // Marker support only depends on the debug utils extension
+     m_marker.Profile = !Device.debugFlags().isClear();
+ 
+@@ -184,37 +212,32 @@ namespace dxvk {
+ 
+ 
+   D3D_FEATURE_LEVEL D3D11DeviceFeatures::GetMaxFeatureLevel(const DxvkDevice& Device) {
+-    D3D11Options config(Device.instance()->config());
+-    D3D11DeviceFeatures options(Device, config, D3D_FEATURE_LEVEL_12_1);
+-
+-    const auto& features = Device.features();
+-
+-    // Check Feature Level 11_0 features
+-    if (!features.core.features.drawIndirectFirstInstance
+-     || !features.core.features.fragmentStoresAndAtomics
+-     || !features.core.features.multiDrawIndirect
+-     || !features.core.features.tessellationShader)
+-      return D3D_FEATURE_LEVEL_10_1;
+-
+-    // Check Feature Level 11_1 features
+-    if (!options.m_d3d11Options.OutputMergerLogicOp
+-     || !features.core.features.vertexPipelineStoresAndAtomics)
+-      return D3D_FEATURE_LEVEL_11_0;
+-
+-    // Check Feature Level 12_0 features
+-    if (options.m_d3d11Options2.TiledResourcesTier < D3D11_TILED_RESOURCES_TIER_2
+-     || !options.m_d3d11Options2.TypedUAVLoadAdditionalFormats)
+-      return D3D_FEATURE_LEVEL_11_1;
+-
+-    // Check Feature Level 12_1 features
+-    if (!options.m_d3d11Options2.ConservativeRasterizationTier
+-     || !options.m_d3d11Options2.ROVsSupported)
+-      return D3D_FEATURE_LEVEL_12_0;
+-
+-    return D3D_FEATURE_LEVEL_12_1;
+-  }
+-
+-
++  const auto& features = Device.features();
++
++  // Check Feature Level 11_0
++  if (!features.core.features.drawIndirectFirstInstance
++   || !features.core.features.fragmentStoresAndAtomics
++   || !features.core.features.multiDrawIndirect
++   || !features.core.features.tessellationShader)
++    return D3D_FEATURE_LEVEL_10_1;
++
++  // Check Feature Level 11_1 - Check logicOp directly from Vulkan features
++  if (!features.core.features.logicOp
++   || !features.core.features.vertexPipelineStoresAndAtomics)
++    return D3D_FEATURE_LEVEL_11_0;
++
++  // Check Feature Level 12_0 - Call static helpers directly
++  if (DetermineTiledResourcesTier(Device, D3D_FEATURE_LEVEL_12_1) < D3D11_TILED_RESOURCES_TIER_2
++   || !DetermineUavExtendedTypedLoadSupport(Device, D3D_FEATURE_LEVEL_12_1))
++    return D3D_FEATURE_LEVEL_11_1;
++
++  // Check Feature Level 12_1
++  if (!DetermineConservativeRasterizationTier(Device, D3D_FEATURE_LEVEL_12_1)
++   || !features.extFragmentShaderInterlock.fragmentShaderPixelInterlock)
++    return D3D_FEATURE_LEVEL_12_0;
++
++  return D3D_FEATURE_LEVEL_12_1;
++}
+   D3D11_CONSERVATIVE_RASTERIZATION_TIER D3D11DeviceFeatures::DetermineConservativeRasterizationTier(
+     const DxvkDevice&           Device,
+           D3D_FEATURE_LEVEL     FeatureLevel) {
+diff --git a/src/d3d11/d3d11_features.h b/src/d3d11/d3d11_features.h
+index 4fb8228ca43..daf58deb2d4 100644
+--- a/src/d3d11/d3d11_features.h
++++ b/src/d3d11/d3d11_features.h
+@@ -93,7 +93,7 @@ namespace dxvk {
+       return S_OK;
+     }
+ 
+-    D3D11_CONSERVATIVE_RASTERIZATION_TIER DetermineConservativeRasterizationTier(
++static D3D11_CONSERVATIVE_RASTERIZATION_TIER DetermineConservativeRasterizationTier(
+       const DxvkDevice&           Device,
+             D3D_FEATURE_LEVEL     FeatureLevel);
+ 
+@@ -101,14 +101,13 @@ namespace dxvk {
+       const DxvkDevice&           Device,
+             D3D_FEATURE_LEVEL     FeatureLevel);
+ 
+-    D3D11_TILED_RESOURCES_TIER DetermineTiledResourcesTier(
++static D3D11_TILED_RESOURCES_TIER DetermineTiledResourcesTier(
+       const DxvkDevice&           Device,
+             D3D_FEATURE_LEVEL     FeatureLevel);
+ 
+-    BOOL DetermineUavExtendedTypedLoadSupport(
++static BOOL DetermineUavExtendedTypedLoadSupport(
+       const DxvkDevice&           Device,
+             D3D_FEATURE_LEVEL     FeatureLevel);
+-
+     BOOL CheckFormatSharingSupport(
+       const DxvkDevice&           Device,
+             VkFormat              Format,
+diff --git a/src/d3d11/d3d11_shader.cpp b/src/d3d11/d3d11_shader.cpp
+index e3821d0124e..9eba7e2c8ce 100644
+--- a/src/d3d11/d3d11_shader.cpp
++++ b/src/d3d11/d3d11_shader.cpp
+@@ -7,19 +7,17 @@
+ 
+ namespace dxvk {
+ 
+-  class D3D11ShaderConverter : public DxvkIrShaderConverter {
+-
++class D3D11ShaderConverter : public DxvkIrShaderConverter {
+   public:
+-
+     D3D11ShaderConverter(
+       const DxvkShaderHash&         ShaderKey,
+       const DxvkIrShaderCreateInfo& ModuleInfo,
+       const void*                   pShaderBytecode,
+             size_t                  BytecodeLength,
+             bool                    LowerIcb)
+-    : m_key(ShaderKey), m_info(ModuleInfo), m_lowerIcb(LowerIcb) {
+-      m_dxbc.resize(BytecodeLength);
+-      std::memcpy(m_dxbc.data(), pShaderBytecode, BytecodeLength);
++    : m_key(ShaderKey), m_info(ModuleInfo), m_lowerIcb(LowerIcb),
++      m_bytecodeData(pShaderBytecode), m_bytecodeLength(BytecodeLength) {
++      // Removed m_dxbc.resize and std::memcpy to avoid heap allocation
+     }
+ 
+     ~D3D11ShaderConverter() { }
+@@ -39,7 +37,7 @@ namespace dxvk {
+       options.classInstanceRegisterIndex = D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT + 1u;
+       options.limitTessFactor = true;
+ 
+-      dxbc_spv::dxbc::Container container(m_dxbc.data(), m_dxbc.size());
++      dxbc_spv::dxbc::Container container(m_bytecodeData, m_bytecodeLength);
+ 
+       dxbc_spv::dxbc::ShaderInfo shaderInfo =
+         dxbc_spv::dxbc::Parser(container.getCodeChunk()).getShaderInfo();
+@@ -91,7 +89,8 @@ namespace dxvk {
+ 
+   private:
+ 
+-    std::vector<uint8_t> m_dxbc;
++    const void*             m_bytecodeData;   
++    size_t                  m_bytecodeLength; 
+ 
+     DxvkShaderHash          m_key;
+     DxvkIrShaderCreateInfo  m_info;
+@@ -173,33 +172,37 @@ namespace dxvk {
+ 
+ 
+   void D3D11CommonShader::GatherInterefaceInfo(
+-          D3D11ClassLinkage*      pLinkage,
+-    const void*                   pShaderBytecode,
+-          size_t                  BytecodeLength) {
+-    dxbc_spv::dxbc::Container container(pShaderBytecode, BytecodeLength);
+-    dxbc_spv::util::ByteReader ifaceChunk(container.getInterfaceChunk());
+-
+-    if (!ifaceChunk)
+-      return;
+-
+-    dxbc_spv::dxbc::InterfaceChunk ifaceInfo(ifaceChunk);
+-
+-    if (!ifaceInfo)
+-      return;
+-
+-    auto typeInfos = ifaceInfo.getClassTypes();
+-    auto slotInfos = ifaceInfo.getInterfaceSlots();
+-
+-    for (auto i = typeInfos.first; i != typeInfos.second; i++) {
+-      m_interfaces.AddType(i->id, i->name.c_str());
+-      pLinkage->AddType(i->name.c_str(), i->cbSize, i->srvCount, i->samplerCount);
+-    }
++        D3D11ClassLinkage*      pLinkage,
++  const void*                   pShaderBytecode,
++        size_t                  BytecodeLength) {
++  dxbc_spv::dxbc::Container container(pShaderBytecode, BytecodeLength);
++  dxbc_spv::util::ByteReader ifaceChunk(container.getInterfaceChunk());
++
++  if (!ifaceChunk)
++    return;
++
++  dxbc_spv::dxbc::InterfaceChunk ifaceInfo(ifaceChunk);
++  if (!ifaceInfo)
++    return;
++
++  auto typeInfos = ifaceInfo.getClassTypes();
++  auto slotInfos = ifaceInfo.getInterfaceSlots();
++
++  // Optimization: Reference the name directly to avoid repeated string construction
++  for (auto i = typeInfos.first; i != typeInfos.second; i++) {
++    const char* typeName = i->name.c_str(); 
++    m_interfaces.AddType(i->id, typeName);
++    pLinkage->AddType(typeName, i->cbSize, i->srvCount, i->samplerCount);
++  }
+ 
+-    for (auto i = slotInfos.first; i != slotInfos.second; i++) {
+-      for (const auto& e : i->entries)
+-        m_interfaces.AddSlotInfo(i->index, i->count, e.typeId, e.tableId);
+-    }
++  for (auto i = slotInfos.first; i != slotInfos.second; i++) {
++    uint32_t slotIndex = i->index;
++    uint32_t slotCount = i->count;
++    for (const auto& e : i->entries)
++      m_interfaces.AddSlotInfo(slotIndex, slotCount, e.typeId, e.tableId);
++  }
+ 
++}
+     auto instances = ifaceInfo.getClassInstances();
+ 
+     for (auto i = instances.first; i != instances.second; i++) {
+
+From ecef8bd7df6004bb642ddfe188569bc93057d31b Mon Sep 17 00:00:00 2001
+From: Nguyen Duc Thinh <ducthinh100812@gmail.com>
+Date: Tue, 5 May 2026 21:42:07 +0700
+Subject: [PATCH 2/2] [d3d11]: Optimize shader creation and VA bits calculation
+
+- Avoid redundant string allocations in CreateIrShader by using
+
+  the raw DxvkShaderHash for cache lookups.
+
+- Fix potential use-after-free by ensuring the converter takes
+
+  ownership of shader bytecode.
+
+- Improve MaxGPUVirtualAddressBits accuracy using physical
+
+  memory properties and bit-scanning instead of log functions.
+---
+ src/d3d11/d3d11_features.cpp | 20 ++++-----
+ src/d3d11/d3d11_shader.cpp   | 87 ++++++++++++++++++------------------
+ 2 files changed, 53 insertions(+), 54 deletions(-)
+
+diff --git a/src/d3d11/d3d11_features.cpp b/src/d3d11/d3d11_features.cpp
+index d95dddc2394..d2fc23c4518 100644
+--- a/src/d3d11/d3d11_features.cpp
++++ b/src/d3d11/d3d11_features.cpp
+@@ -1,6 +1,7 @@
+ #include <array>
+ #include <algorithm>
+ #include <cmath>
++#include "util/util_bit.h"
+ 
+ #include "d3d11_features.h"
+ 
+@@ -55,10 +56,10 @@ namespace dxvk {
+     // This is more robust than checking sample locations alone
+     m_d3d11Options.MultisampleRTVWithForcedSampleCountOne = 
+     features.core.features.variableMultisampleRate || 
+-    Device.properties().core.properties.limits.standardSampleLocations;[cite: 1]
++    Device.properties().core.properties.limits.standardSampleLocations;
+ 
+     if (FeatureLevel >= D3D_FEATURE_LEVEL_10_0) {
+-      m_d3d11Options.OutputMergerLogicOp = features.core.features.logicOp;[cite: 1]
++      m_d3d11Options.OutputMergerLogicOp = features.core.features.logicOp;
+   
+       // Logic: Check if the device supports standard sample locations or 
+       // independent multisampling to accurately report this feature.
+@@ -114,26 +115,23 @@ namespace dxvk {
+       m_doubles.DoublePrecisionFloatShaderOps             = hasDoublePrecisionSupport;
+ 
+     const auto& limits = Device.properties().core.properties.limits;
+-    const auto& memory = Device.instance()->adapter(Device.adapterId())->memoryProperties();
++    const auto& memory = Device.adapter()->memoryProperties();
+ 
+-    // We take the MAX of sparse limits and total heap size to ensure we don't get a 0.
+     VkDeviceSize totalHeapSize = 0;
+     for (uint32_t i = 0; i < memory.memoryHeapCount; i++)
+-        totalHeapSize += memory.memoryHeaps[i].size;
++      totalHeapSize += memory.memoryHeaps[i].size;
+ 
+-    VkDeviceSize effectiveAddressSpace = std::max(limits.maxSparseAddressSpaceSize, totalHeapSize);
++    VkDeviceSize effectiveAddressSpace = std::max(limits.sparseAddressSpaceSize, totalHeapSize);
+ 
+-    // If the hardware reports nothing, we fall back to 32 bits. 
+-    // Otherwise, we calculate log2 and clamp to valid D3D11 ranges.
+     uint32_t vaBits = 32; 
+     if (effectiveAddressSpace > 0) {
+-        vaBits = uint32_t(std::floor(std::log2(effectiveAddressSpace)));
++        vaBits = 63 - __builtin_clzll(uint64_t(effectiveAddressSpace));
+     }
+ 
+     // D3D11.1+ spec generally expects 40-48 bits for process space on 64-bit systems.
+     // We clamp Resource bits to 44 (standard max) and Process to 48.
+-    m_gpuVirtualAddress.MaxGPUVirtualAddressBitsPerResource = std::clamp(vaBits, 32u, 44u);[cite: 1, 2]
+-    m_gpuVirtualAddress.MaxGPUVirtualAddressBitsPerProcess  = std::clamp(vaBits, 32u, 48u);[cite: 1, 2]
++    m_gpuVirtualAddress.MaxGPUVirtualAddressBitsPerResource = std::clamp(vaBits, 32u, 44u);
++    m_gpuVirtualAddress.MaxGPUVirtualAddressBitsPerProcess  = std::clamp(vaBits, 32u, 48u);
+     // Marker support only depends on the debug utils extension
+     m_marker.Profile = !Device.debugFlags().isClear();
+ 
+diff --git a/src/d3d11/d3d11_shader.cpp b/src/d3d11/d3d11_shader.cpp
+index 9eba7e2c8ce..ba0d676f581 100644
+--- a/src/d3d11/d3d11_shader.cpp
++++ b/src/d3d11/d3d11_shader.cpp
+@@ -17,13 +17,15 @@ class D3D11ShaderConverter : public DxvkIrShaderConverter {
+             bool                    LowerIcb)
+     : m_key(ShaderKey), m_info(ModuleInfo), m_lowerIcb(LowerIcb),
+       m_bytecodeData(pShaderBytecode), m_bytecodeLength(BytecodeLength) {
+-      // Removed m_dxbc.resize and std::memcpy to avoid heap allocation
++      m_dxbc.assign(
++        reinterpret_cast<const uint8_t*>(pShaderBytecode),
++        reinterpret_cast<const uint8_t*>(pShaderBytecode) + BytecodeLength);
++    }
+     }
+ 
+     ~D3D11ShaderConverter() { }
+ 
+-    void convertShader(
+-            dxbc_spv::ir::Builder&    builder) {
++    void convertShader(dxbc_spv::ir::Builder&    builder) {
+       auto debugName = m_key.toString();
+ 
+       dxbc_spv::dxbc::Converter::Options options = { };
+@@ -38,6 +40,7 @@ class D3D11ShaderConverter : public DxvkIrShaderConverter {
+       options.limitTessFactor = true;
+ 
+       dxbc_spv::dxbc::Container container(m_bytecodeData, m_bytecodeLength);
++      dxbc_spv::dxbc::Container container(m_dxbc.data(), m_dxbc.size());
+ 
+       dxbc_spv::dxbc::ShaderInfo shaderInfo =
+         dxbc_spv::dxbc::Parser(container.getCodeChunk()).getShaderInfo();
+@@ -91,10 +94,9 @@ class D3D11ShaderConverter : public DxvkIrShaderConverter {
+ 
+     const void*             m_bytecodeData;   
+     size_t                  m_bytecodeLength; 
+-
++    std::vector<uint8_t>    m_dxbc;
+     DxvkShaderHash          m_key;
+     DxvkIrShaderCreateInfo  m_info;
+-
+     bool                    m_lowerIcb = false;
+ 
+   };
+@@ -127,48 +129,47 @@ class D3D11ShaderConverter : public DxvkIrShaderConverter {
+   }
+ 
+ 
+-  void D3D11CommonShader::CreateIrShader(
+-          D3D11Device*            pDevice,
+-    const DxvkShaderHash&         ShaderKey,
+-    const DxvkIrShaderCreateInfo& ModuleInfo,
+-    const void*                   pShaderBytecode,
+-          size_t                  BytecodeLength,
+-    const D3D11ShaderIcbInfo&     Icb) {
+-    constexpr size_t MaxEmbeddedIcbSize = 64u;
+-
+-    // Create icb if lowering is required
+-    size_t icbSizeInBytes = Icb.size * sizeof(*Icb.data);
+-
+-    if (ModuleInfo.options.flags.test(DxvkShaderCompileFlag::LowerConstantArrays) && icbSizeInBytes > MaxEmbeddedIcbSize) {
+-      DxvkBufferCreateInfo info = { };
+-      info.size   = align(icbSizeInBytes, 256u);
+-      info.usage  = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+-                  | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+-                  | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+-      info.stages = VK_PIPELINE_STAGE_2_TRANSFER_BIT
+-                  | util::pipelineStages(ShaderKey.stage());
+-      info.access = VK_ACCESS_UNIFORM_READ_BIT
+-                  | VK_ACCESS_TRANSFER_READ_BIT
+-                  | VK_ACCESS_TRANSFER_WRITE_BIT;
+-      info.debugName = "Icb";
+-
+-      m_buffer = pDevice->GetDXVKDevice()->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+-
+-      pDevice->InitShaderIcb(this, icbSizeInBytes, Icb.data);
+-    }
++void D3D11CommonShader::CreateIrShader(
++        D3D11Device*            pDevice,
++  const DxvkShaderHash&         ShaderKey,
++  const DxvkIrShaderCreateInfo& ModuleInfo,
++  const void*                   pShaderBytecode,
++        size_t                  BytecodeLength,
++  const D3D11ShaderIcbInfo&     Icb) {
++  constexpr size_t MaxEmbeddedIcbSize = 64u;
++
++  size_t icbSizeInBytes = Icb.size * sizeof(uint32_t);
++
++  if (ModuleInfo.options.flags.test(DxvkShaderCompileFlag::LowerConstantArrays) 
++   && icbSizeInBytes > MaxEmbeddedIcbSize) {
++    DxvkBufferCreateInfo info = { };
++    info.size   = align(icbSizeInBytes, 256u);
++    info.usage  = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
++                | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
++                | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++    info.stages = VK_PIPELINE_STAGE_2_TRANSFER_BIT
++                | util::pipelineStages(ShaderKey.stage());
++    info.access = VK_ACCESS_UNIFORM_READ_BIT
++                | VK_ACCESS_TRANSFER_READ_BIT
++                | VK_ACCESS_TRANSFER_WRITE_BIT;
++    info.debugName = "Icb";
++
++    m_buffer = pDevice->GetDXVKDevice()->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++
++    pDevice->InitShaderIcb(this, icbSizeInBytes, Icb.data);
++  }
+ 
+-    // Create actual shader converter
+-    m_shader = pDevice->GetDXVKDevice()->createCachedShader(
+-      ShaderKey.toString(), ModuleInfo, nullptr);
++  m_shader = pDevice->GetDXVKDevice()->createCachedShader(
++    ShaderKey, ModuleInfo, nullptr);
+ 
+-    if (!m_shader) {
+-      Rc<D3D11ShaderConverter> converter = new D3D11ShaderConverter(ShaderKey,
+-        ModuleInfo, pShaderBytecode, BytecodeLength, bool(m_buffer));
++  if (m_shader == nullptr) {
++    Rc<D3D11ShaderConverter> converter = new D3D11ShaderConverter(
++      ShaderKey, ModuleInfo, pShaderBytecode, BytecodeLength, m_buffer != nullptr);
+ 
+-      m_shader = pDevice->GetDXVKDevice()->createCachedShader(
+-        ShaderKey.toString(), ModuleInfo, std::move(converter));
+-    }
++    m_shader = pDevice->GetDXVKDevice()->createCachedShader(
++      ShaderKey, ModuleInfo, std::move(converter));
+   }
++}
+ 
+ 
+   void D3D11CommonShader::GatherInterefaceInfo(
