@@ -79,6 +79,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/SSAUpdaterBulk.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
+#include <algorithm>
 #include <cmath>
 #include <deque>
 #include <limits>
@@ -915,6 +916,7 @@ struct TransformDFA {
         EphValues(std::move(EphValues)), BFI(BFI), BPI(BPI), LI(LI) {}
 
   bool run() {
+    pruneUnsupportedPaths();
     NumHotPathsPruned += prunePathsByHotness();
 
     if (SwitchPaths->getThreadingPaths().empty())
@@ -974,13 +976,12 @@ private:
     if (DetIt == PathBBs.end())
       return S;
 
-    size_t DetIdx = std::distance(PathBBs.begin(), DetIt);
-    size_t BeginIdx = (DetIdx == 0) ? 1 : DetIdx;
-    if (BeginIdx >= PathBBs.size())
+    const size_t DetIdx = std::distance(PathBBs.begin(), DetIt);
+    if (DetIdx >= PathBBs.size())
       return S;
 
     SmallPtrSet<const BasicBlock *, 32> PathSet(PathBBs.begin(),
-                                                 PathBBs.end());
+                                                PathBBs.end());
 
     uint64_t MinF = std::numeric_limits<uint64_t>::max();
     uint64_t SumF = 0;
@@ -988,7 +989,7 @@ private:
     unsigned HeaderCount = 0;
     unsigned Len = 0;
 
-    for (size_t I = BeginIdx, E = PathBBs.size(); I < E; ++I) {
+    for (size_t I = DetIdx, E = PathBBs.size(); I < E; ++I) {
       BasicBlock *BB = PathBBs[I];
       ++Len;
 
@@ -1035,9 +1036,8 @@ private:
     if (DetIt == PathBBs.end())
       return Cost;
 
-    size_t DetIdx = std::distance(PathBBs.begin(), DetIt);
-    size_t BeginIdx = (DetIdx == 0) ? 1 : DetIdx;
-    for (size_t I = BeginIdx, E = PathBBs.size(); I < E; ++I) {
+    const size_t DetIdx = std::distance(PathBBs.begin(), DetIt);
+    for (size_t I = DetIdx, E = PathBBs.size(); I < E; ++I) {
       BasicBlock *BB = PathBBs[I];
       if (stateSeen(Seen, BB, State))
         continue;
@@ -1048,8 +1048,67 @@ private:
     return Cost;
   }
 
+  static bool hasCFGEdge(BasicBlock *From, BasicBlock *To) {
+    Instruction *TI = From->getTerminator();
+
+    for (unsigned I = 0, E = TI->getNumSuccessors(); I != E; ++I)
+      if (TI->getSuccessor(I) == To)
+        return true;
+
+    return false;
+  }
+
+  void pruneUnsupportedPaths() {
+    std::vector<ThreadingPath> &Paths = SwitchPaths->getThreadingPaths();
+    if (Paths.empty())
+      return;
+
+    BasicBlock *SwitchBB = SwitchPaths->getSwitchBlock();
+    auto *SI = dyn_cast<SwitchInst>(SwitchBB->getTerminator());
+    if (!SI) {
+      Paths.clear();
+      return;
+    }
+
+    auto countEdgesTo = [&](BasicBlock *Dest) -> unsigned {
+      unsigned C = 0;
+      for (unsigned I = 0, E = SI->getNumSuccessors(); I != E; ++I)
+        if (SI->getSuccessor(I) == Dest)
+          ++C;
+      return C;
+    };
+
+    SmallVector<ThreadingPath, 32> Kept;
+    Kept.reserve(Paths.size());
+
+    for (ThreadingPath &TPath : Paths) {
+      const PathType &PathBBs = TPath.getPath();
+      auto DetIt = llvm::find(PathBBs, TPath.getDeterminatorBB());
+      if (DetIt == PathBBs.end())
+        continue;
+
+      const size_t DetIdx = std::distance(PathBBs.begin(), DetIt);
+      if (DetIdx >= PathBBs.size())
+        continue;
+
+      BasicBlock *FirstCloned = PathBBs[DetIdx];
+      BasicBlock *PrevBB = (DetIdx == 0) ? SwitchBB : PathBBs[DetIdx - 1];
+
+      if (!hasCFGEdge(PrevBB, FirstCloned))
+        continue;
+
+      if (PrevBB == SwitchBB && countEdgesTo(FirstCloned) != 1)
+        continue;
+
+      Kept.push_back(std::move(TPath));
+    }
+
+    Paths.assign(std::make_move_iterator(Kept.begin()),
+                 std::make_move_iterator(Kept.end()));
+  }
+
   unsigned prunePathsByHotness() {
-    if (!HotPathHeuristic)
+    if (!HotPathHeuristic || !BFI)
       return 0;
 
     std::vector<ThreadingPath> &Paths = SwitchPaths->getThreadingPaths();
@@ -1105,8 +1164,6 @@ private:
       return 0;
 
     const unsigned Removed = static_cast<unsigned>(OrigSize - Selected.size());
-    // Keeping paths in Ranked order allows the hottest paths to dictate
-    // unifications and clone reuse priorities.
     Paths.assign(std::make_move_iterator(Selected.begin()),
                  std::make_move_iterator(Selected.end()));
     return Removed;
@@ -1234,9 +1291,8 @@ private:
 
       auto DetIt = llvm::find(PathBBs, Determinator);
       if (DetIt != PathBBs.end()) {
-        size_t DetIdx = std::distance(PathBBs.begin(), DetIt);
-        size_t BeginIdx = (DetIdx == 0) ? 1 : DetIdx;
-        for (size_t I = BeginIdx, E = PathBBs.size(); I < E; ++I) {
+        const size_t DetIdx = std::distance(PathBBs.begin(), DetIt);
+        for (size_t I = DetIdx, E = PathBBs.size(); I < E; ++I) {
           BB = PathBBs[I];
           VisitedBB = getClonedBB(BB, NextState, DuplicateMap);
           if (VisitedBB)
@@ -1376,14 +1432,18 @@ private:
   }
 
   void createAllExitPaths() {
+    BasicBlock *SwitchBlock = SwitchPaths->getSwitchBlock();
+
+    for (ThreadingPath &TPath : SwitchPaths->getThreadingPaths()) {
+      LLVM_DEBUG(TPath.print(dbgs()); dbgs() << "\n");
+      TPath.push_front(SwitchBlock);
+    }
+
     DefMap NewDefs;
     DuplicateBlockMap DuplicateMap;
 
-    BasicBlock *SwitchBlock = SwitchPaths->getSwitchBlock();
-
     SmallPtrSet<BasicBlock *, 32> BlocksToClean;
     BlocksToClean.insert_range(successors(SwitchBlock));
-    BlocksToClean.insert(SwitchBlock);
 
     for (const ThreadingPath &TPath : SwitchPaths->getThreadingPaths()) {
       createExitPath(NewDefs, TPath, DuplicateMap, BlocksToClean, DTU);
@@ -1393,57 +1453,45 @@ private:
     for (const ThreadingPath &TPath : SwitchPaths->getThreadingPaths())
       updateLastSuccessor(TPath, DuplicateMap, DTU);
 
+    updateSSA(NewDefs);
+
     for (BasicBlock *BB : BlocksToClean)
       cleanPhiNodes(BB);
-
-    updateSSA(NewDefs);
-  }
-
-  static bool hasCFGEdge(BasicBlock *From, BasicBlock *To) {
-    Instruction *TI = From->getTerminator();
-
-    for (unsigned I = 0, E = TI->getNumSuccessors(); I != E; ++I)
-      if (TI->getSuccessor(I) == To)
-        return true;
-
-    return false;
   }
 
   void createExitPath(DefMap &NewDefs, const ThreadingPath &Path,
                       DuplicateBlockMap &DuplicateMap,
                       SmallPtrSetImpl<BasicBlock *> &BlocksToClean,
                       DomTreeUpdater *DTU) {
-    const PathType &PathBBs = Path.getPath();
+    APInt NextState = Path.getExitValue();
     const BasicBlock *Determinator = Path.getDeterminatorBB();
+    PathType PathBBs = Path.getPath();
+
+    if (PathBBs.empty())
+      return;
+
+    if (PathBBs.front() == Determinator)
+      PathBBs.pop_front();
+
     auto DetIt = llvm::find(PathBBs, Determinator);
     if (DetIt == PathBBs.end())
       return;
 
-    size_t DetIdx = std::distance(PathBBs.begin(), DetIt);
-    size_t BeginIdx = (DetIdx == 0) ? 1 : DetIdx;
-    if (BeginIdx >= PathBBs.size())
-      return;
+    BasicBlock *PrevBB = PathBBs.size() == 1 ? *DetIt : *std::prev(DetIt);
 
-    BasicBlock *PrevBB = PathBBs[BeginIdx - 1];
-
-    for (size_t I = BeginIdx, E = PathBBs.size(); I < E; ++I) {
-      BasicBlock *BB = PathBBs[I];
+    for (auto BBIt = DetIt; BBIt != PathBBs.end(); ++BBIt) {
+      BasicBlock *BB = *BBIt;
       BlocksToClean.insert(BB);
 
-      if (BasicBlock *NextBB =
-              getClonedBB(BB, Path.getExitValue(), DuplicateMap)) {
-        if (hasCFGEdge(PrevBB, BB))
-          updatePredecessor(PrevBB, BB, NextBB, DTU);
+      if (BasicBlock *NextBB = getClonedBB(BB, NextState, DuplicateMap)) {
+        updatePredecessor(PrevBB, BB, NextBB, DTU);
         PrevBB = NextBB;
         continue;
       }
 
-      if (!hasCFGEdge(PrevBB, BB))
-        return;
-
       BasicBlock *NewBB = cloneBlockAndUpdatePredecessor(
-          BB, PrevBB, Path.getExitValue(), DuplicateMap, NewDefs, DTU);
-      DuplicateMap[BB].push_back({NewBB, Path.getExitValue()});
+          BB, PrevBB, NextState, DuplicateMap, NewDefs, DTU);
+      DuplicateMap[BB].push_back({NewBB, NextState});
       BlocksToClean.insert(NewBB);
       PrevBB = NewBB;
     }
@@ -1514,17 +1562,20 @@ private:
     ++NumCloned;
 
     for (Instruction &I : *NewBB) {
+
       if (isa<PHINode>(&I))
         continue;
+
       RemapInstruction(&I, VMap,
                        RF_IgnoreMissingLocals | RF_NoModuleLevelChanges);
+
       if (auto *II = dyn_cast<AssumeInst>(&I))
         AC->registerAssumption(II);
     }
 
     updateSuccessorPhis(BB, NewBB, NextState, VMap, DuplicateMap);
     updatePredecessor(PrevBB, BB, NewBB, DTU);
-    cleanPhiNodes(NewBB);
+
     updateDefMap(NewDefs, VMap);
 
     SmallPtrSet<BasicBlock *, 4> SuccSet;
@@ -1539,8 +1590,29 @@ private:
                            const APInt &NextState,
                            ValueToValueMapTy &VMap,
                            DuplicateBlockMap &DuplicateMap) {
-    (void)NextState;
-    (void)DuplicateMap;
+    SmallVector<BasicBlock *, 8> BlocksToUpdate;
+
+    auto AddUnique = [&](BasicBlock *Succ) {
+      if (!llvm::is_contained(BlocksToUpdate, Succ))
+        BlocksToUpdate.push_back(Succ);
+    };
+
+    if (BB == SwitchPaths->getSwitchBlock()) {
+      BasicBlock *NextCase = getNextCaseSuccessor(NextState);
+      AddUnique(NextCase);
+
+      if (BasicBlock *ClonedSucc =
+              getClonedBB(NextCase, NextState, DuplicateMap))
+        AddUnique(ClonedSucc);
+    } else {
+      for (BasicBlock *Succ : successors(BB)) {
+        AddUnique(Succ);
+
+        if (BasicBlock *ClonedSucc =
+                getClonedBB(Succ, NextState, DuplicateMap))
+          AddUnique(ClonedSucc);
+      }
+    }
 
     auto MapValue = [&](Value *V) -> Value * {
       if (isa<Constant>(V))
@@ -1553,18 +1625,7 @@ private:
       return V;
     };
 
-    SmallPtrSet<BasicBlock *, 8> SeenSuccs;
-    Instruction *TI = ClonedBB->getTerminator();
-
-    for (BasicBlock *Succ : successors(ClonedBB)) {
-      if (!SeenSuccs.insert(Succ).second)
-        continue;
-
-      unsigned EdgeMultiplicity = 0;
-      for (unsigned I = 0, E = TI->getNumSuccessors(); I != E; ++I)
-        if (TI->getSuccessor(I) == Succ)
-          ++EdgeMultiplicity;
-
+    for (BasicBlock *Succ : BlocksToUpdate) {
       for (PHINode &Phi : Succ->phis()) {
         SmallVector<Value *, 4> IncomingVals;
 
@@ -1572,89 +1633,35 @@ private:
           if (Phi.getIncomingBlock(I) == BB)
             IncomingVals.push_back(Phi.getIncomingValue(I));
 
-        assert(IncomingVals.size() >= EdgeMultiplicity &&
-               "PHI edge multiplicity mismatch while cloning");
+        if (IncomingVals.empty())
+          continue;
 
-        if (!IncomingVals.empty()) {
-          for (unsigned I = 0; I != EdgeMultiplicity; ++I)
-            Phi.addIncoming(MapValue(IncomingVals[I % IncomingVals.size()]),
-                            ClonedBB);
-        }
+        unsigned Existing = 0;
+        for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I)
+          if (Phi.getIncomingBlock(I) == ClonedBB)
+            ++Existing;
+
+        for (unsigned I = Existing, E = IncomingVals.size(); I != E; ++I)
+          Phi.addIncoming(MapValue(IncomingVals[I]), ClonedBB);
       }
     }
   }
 
-  void updatePredecessor(BasicBlock *PrevBB,
-                         BasicBlock *OldBB,
-                         BasicBlock *NewBB,
-                         DomTreeUpdater *DTU) {
-    Instruction *PrevTerm = PrevBB->getTerminator();
+  void updatePredecessor(BasicBlock *PrevBB, BasicBlock *OldBB,
+                         BasicBlock *NewBB, DomTreeUpdater *DTU) {
+    (void)DTU;
 
-    SmallVector<unsigned, 4> EdgeIdxs;
-
-    for (unsigned I = 0, E = PrevTerm->getNumSuccessors(); I != E; ++I)
-      if (PrevTerm->getSuccessor(I) == OldBB)
-        EdgeIdxs.push_back(I);
-
-    if (EdgeIdxs.empty())
+    if (!hasCFGEdge(PrevBB, OldBB))
       return;
 
-    const unsigned RedirectedEdges = EdgeIdxs.size();
+    Instruction *PrevTerm = PrevBB->getTerminator();
 
-    auto OldRange = OldBB->phis();
-    auto NewRange = NewBB->phis();
-
-    auto OldIt = OldRange.begin();
-    auto NewIt = NewRange.begin();
-
-    for (; OldIt != OldRange.end() && NewIt != NewRange.end();
-         ++OldIt, ++NewIt) {
-      PHINode &OldPhi = *OldIt;
-      PHINode &NewPhi = *NewIt;
-
-      SmallVector<Value *, 4> IncomingVals;
-
-      for (unsigned I = 0, E = OldPhi.getNumIncomingValues(); I != E; ++I)
-        if (OldPhi.getIncomingBlock(I) == PrevBB)
-          IncomingVals.push_back(OldPhi.getIncomingValue(I));
-
-      unsigned Existing = 0;
-
-      for (unsigned I = 0, E = NewPhi.getNumIncomingValues(); I != E; ++I)
-        if (NewPhi.getIncomingBlock(I) == PrevBB)
-          ++Existing;
-
-      if (!IncomingVals.empty()) {
-        for (unsigned I = Existing; I < RedirectedEdges; ++I) {
-          Value *V = IncomingVals[I % IncomingVals.size()];
-          NewPhi.addIncoming(V, PrevBB);
-        }
+    for (unsigned Idx = 0, E = PrevTerm->getNumSuccessors(); Idx != E; ++Idx) {
+      if (PrevTerm->getSuccessor(Idx) == OldBB) {
+        OldBB->removePredecessor(PrevBB, /*KeepOneInputPHIs=*/true);
+        PrevTerm->setSuccessor(Idx, NewBB);
       }
     }
-
-#ifndef NDEBUG
-    assert(OldIt == OldRange.end() && NewIt == NewRange.end() &&
-           "clone must preserve PHI structure");
-#endif
-
-    for (unsigned Idx : EdgeIdxs)
-      PrevTerm->setSuccessor(Idx, NewBB);
-
-    for (PHINode &Phi : OldBB->phis()) {
-      unsigned Removed = 0;
-
-      for (int I = static_cast<int>(Phi.getNumIncomingValues()) - 1;
-           I >= 0 && Removed < RedirectedEdges; --I) {
-        if (Phi.getIncomingBlock(I) != PrevBB)
-          continue;
-
-        Phi.removeIncomingValue(I, /*DeletePHIIfEmpty=*/false);
-        ++Removed;
-      }
-    }
-
-    DTU->applyUpdates({{DominatorTree::Delete, PrevBB, OldBB},
-                       {DominatorTree::Insert, PrevBB, NewBB}});
   }
 
   void updateDefMap(DefMap &NewDefs, ValueToValueMapTy &VMap) {
@@ -1675,7 +1682,7 @@ private:
       NewDefsVector.push_back({Inst, Cloned});
     }
 
-    sort(NewDefsVector, [](const auto &LHS, const auto &RHS) {
+    llvm::sort(NewDefsVector, [](const auto &LHS, const auto &RHS) {
       if (LHS.first == RHS.first)
         return LHS.second->comesBefore(RHS.second);
       return LHS.first->comesBefore(RHS.first);
@@ -1691,10 +1698,9 @@ private:
     if (TPath.getPath().empty())
       return;
 
-    APInt NextState = TPath.getExitValue();
-    BasicBlock *BB = TPath.getPath().back();
-    BasicBlock *LastBlock = getClonedBB(BB, NextState, DuplicateMap);
-
+    const APInt &NextState = TPath.getExitValue();
+    BasicBlock *OrigLast = TPath.getPath().back();
+    BasicBlock *LastBlock = getClonedBB(OrigLast, NextState, DuplicateMap);
     if (!LastBlock)
       return;
 
@@ -1702,19 +1708,90 @@ private:
     if (!Switch)
       return;
 
-    BasicBlock *NextCase = getNextCaseSuccessor(NextState);
+    unsigned SelectedSuccIdx = 0;
+    BasicBlock *NextCase = Switch->getDefaultDest();
+
+    for (auto Case : Switch->cases()) {
+      if (Case.getCaseValue()->getValue() == NextState) {
+        SelectedSuccIdx = Case.getSuccessorIndex();
+        NextCase = Case.getCaseSuccessor();
+        break;
+      }
+    }
+
+    unsigned SelectedOrdinalToNext = 0;
+    bool FoundSelectedOrdinal = false;
+
+    for (unsigned I = 0, Ord = 0, E = Switch->getNumSuccessors(); I != E; ++I) {
+      if (Switch->getSuccessor(I) != NextCase)
+        continue;
+
+      if (I == SelectedSuccIdx) {
+        SelectedOrdinalToNext = Ord;
+        FoundSelectedOrdinal = true;
+      }
+
+      ++Ord;
+    }
+
+    if (!FoundSelectedOrdinal)
+      return;
 
     std::vector<DominatorTree::UpdateType> DTUpdates;
-    SmallPtrSet<BasicBlock *, 8> SuccSet;
+    SmallPtrSet<BasicBlock *, 8> SeenSuccs;
+    SmallVector<BasicBlock *, 8> TouchedSuccs;
 
-    for (BasicBlock *Succ : successors(LastBlock))
-      if (Succ != NextCase && SuccSet.insert(Succ).second)
+    for (BasicBlock *Succ : successors(LastBlock)) {
+      if (!SeenSuccs.insert(Succ).second)
+        continue;
+
+      TouchedSuccs.push_back(Succ);
+
+      for (PHINode &Phi : Succ->phis()) {
+        SmallVector<unsigned, 4> IncomingIdxs;
+
+        for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I)
+          if (Phi.getIncomingBlock(I) == LastBlock)
+            IncomingIdxs.push_back(I);
+
+        Value *ChosenIncoming = nullptr;
+
+        if (Succ == NextCase) {
+          assert(!IncomingIdxs.empty() &&
+                 "selected switch successor must have an incoming value from "
+                 "the cloned switch block");
+
+          if (!IncomingIdxs.empty()) {
+            unsigned Pick = std::min<unsigned>(SelectedOrdinalToNext,
+                                               IncomingIdxs.size() - 1);
+            ChosenIncoming = Phi.getIncomingValue(IncomingIdxs[Pick]);
+          } else {
+
+            ChosenIncoming = PoisonValue::get(Phi.getType());
+          }
+        }
+
+        for (int I = static_cast<int>(Phi.getNumIncomingValues()) - 1; I >= 0;
+             --I)
+          if (Phi.getIncomingBlock(I) == LastBlock)
+            Phi.removeIncomingValue(I, /*DeletePHIIfEmpty=*/false);
+
+        if (Succ == NextCase)
+          Phi.addIncoming(ChosenIncoming, LastBlock);
+      }
+
+      if (Succ != NextCase)
         DTUpdates.push_back({DominatorTree::Delete, LastBlock, Succ});
+    }
 
     Switch->eraseFromParent();
     BranchInst::Create(NextCase, LastBlock);
 
-    DTU->applyUpdates(DTUpdates);
+    if (!DTUpdates.empty())
+      DTU->applyUpdates(DTUpdates);
+
+    for (BasicBlock *Succ : TouchedSuccs)
+      cleanPhiNodes(Succ);
   }
 
   void cleanPhiNodes(BasicBlock *BB) {
@@ -1810,6 +1887,7 @@ bool DFAJumpThreading::run(Function &F) {
 
   SmallVector<AllSwitchPaths, 2> ThreadableLoops;
   bool MadeChanges = false;
+  bool InvalidatedBFIAndBPI = false;
   LoopInfoBroken = false;
 
   for (BasicBlock &BB : F) {
@@ -1819,6 +1897,7 @@ bool DFAJumpThreading::run(Function &F) {
 
     LLVM_DEBUG(dbgs() << "\nCheck if SwitchInst in BB " << BB.getName()
                       << " is a candidate\n");
+
     MainSwitch Switch(SI, LI, ORE);
 
     if (!Switch.getInstr()) {
@@ -1832,8 +1911,11 @@ bool DFAJumpThreading::run(Function &F) {
     LLVM_DEBUG(SI->dump());
 
     unfoldSelectInstrs(Switch.getSelectInsts());
-    if (!Switch.getSelectInsts().empty())
+
+    if (!Switch.getSelectInsts().empty()) {
       MadeChanges = true;
+      InvalidatedBFIAndBPI = true;
+    }
 
     AllSwitchPaths SwitchPaths(&Switch, ORE, LI,
                                LI->getLoopFor(&BB)->getOutermostLoop());
@@ -1841,11 +1923,12 @@ bool DFAJumpThreading::run(Function &F) {
 
     if (SwitchPaths.getNumThreadingPaths() > 0) {
       ThreadableLoops.push_back(std::move(SwitchPaths));
+
       break;
     }
   }
 
-#ifdef NDEBUG
+#ifndef NDEBUG
   LI->verify(DTU->getDomTree());
 #endif
 
@@ -1853,9 +1936,13 @@ bool DFAJumpThreading::run(Function &F) {
   if (!ThreadableLoops.empty())
     CodeMetrics::collectEphemeralValues(&F, AC, EphValues);
 
+  BlockFrequencyInfo *UsableBFI = InvalidatedBFIAndBPI ? nullptr : BFI;
+  BranchProbabilityInfo *UsableBPI = InvalidatedBFIAndBPI ? nullptr : BPI;
+
   for (AllSwitchPaths &SwitchPaths : ThreadableLoops) {
     TransformDFA Transform(&SwitchPaths, DTU, AC, TTI, ORE, EphValues,
-                           BFI, BPI, LI);
+                           UsableBFI, UsableBPI, LI);
+
     if (Transform.run())
       MadeChanges = LoopInfoBroken = true;
   }
