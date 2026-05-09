@@ -19,8 +19,8 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <KConfigGroup>
 #include <KSharedConfig>
-#include <QThread>
 
+#include <QThread>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -45,25 +45,30 @@ constexpr int16_t kCadenceStableThreshold = 224;
 constexpr int16_t kCadenceUnstableThreshold = 64;
 constexpr int64_t kMaxReasonableIntervalNs = 100'000'000;
 constexpr int64_t kMinReasonableIntervalNs = 2'000'000;
+
 constexpr uint16_t kVrrToVsyncStabilityFrames = 4;
 constexpr uint16_t kVsyncToVrrStabilityFrames = 2;
 constexpr uint16_t kMinModeDwellFrames = 2;
 constexpr uint16_t kOscillationCooldownFrames = 120;
 constexpr uint16_t kInteractiveGraceFrames = 90;
 constexpr uint16_t kInteractiveTailFrames = 45;
+
 constexpr auto kVrrControlThreshold = 25ms;
 constexpr auto kOscillationWindow = 500ms;
 constexpr uint8_t kOscillationThreshold = 10;
 constexpr int kMaxTimerDelayMs = 16000;
+
 constexpr int kTripleBufferEnterPct = 90;
 constexpr int kTripleBufferExitPct = 70;
 constexpr uint8_t kTripleBufferHysteresisLimit = 5;
+
 constexpr uint8_t kMaxConsecutiveErrors = 3;
 constexpr int kMaxErrorBackoffMs = 50;
 constexpr int64_t kTimerJitterFilterNs = 250'000;
 constexpr int64_t kCadenceNoiseFloorNs = 125'000;
 constexpr int64_t kFilm24Ns = 41'666'666;
 constexpr int64_t kFilm25Ns = 40'000'000;
+
 constexpr int64_t kStalledFrameMinTimeoutNs = 12'000'000;
 constexpr int64_t kStalledFrameMaxTimeoutNs = 120'000'000;
 constexpr int64_t kStalledFrameExtraTimeoutNs = 2'000'000;
@@ -71,7 +76,7 @@ constexpr uint8_t kStalledFrameRecoveryThreshold = 2;
 constexpr int64_t kStalledFrameVblankMultiplier = 3;
 
 [[nodiscard]]
-inline KWin::SurfaceInterface *resolvePresentationSurface(KWin::Window *window) noexcept
+inline KWin::SurfaceInterface *resolvePresentationSurface(KWin::Window* window) noexcept
 {
     if (window == nullptr) {
         return nullptr;
@@ -80,20 +85,16 @@ inline KWin::SurfaceInterface *resolvePresentationSurface(KWin::Window *window) 
     if (surf == nullptr) {
         return nullptr;
     }
-    auto *const wayland = qobject_cast<KWin::SurfaceItemWayland *>(surf);
+    auto *const wayland = qobject_cast<KWin::SurfaceItemWayland* >(surf);
     return wayland ? wayland->surface() : nullptr;
 }
 
 [[gnu::always_inline, gnu::const]]
-inline constexpr int64_t safeAbs64(int64_t v) noexcept
+inline constexpr int64_t fastAbs64(int64_t v) noexcept
 {
-    if (v == std::numeric_limits<int64_t>::min()) [[unlikely]] {
-        return std::numeric_limits<int64_t>::max();
-    }
     const int64_t mask = v >> 63;
     return (v ^ mask) - mask;
 }
-
 
 [[gnu::always_inline, gnu::const]]
 inline constexpr bool isVrrMode(KWin::PresentationMode mode) noexcept
@@ -123,7 +124,7 @@ inline constexpr uint64_t ceilDivU64Reciprocal(uint64_t n, uint64_t d, uint64_t 
 [[nodiscard]] consteval uint64_t reciprocalForInterval(uint64_t interval) noexcept
 {
     constexpr uint8_t shift = 63;
-    return static_cast<uint64_t>(((static_cast<__uint128_t>(1) << shift) + interval - 1) / interval);
+    return ((1ULL << shift) + interval - 1) / interval;
 }
 
 constexpr uint64_t kRecip60Hz = reciprocalForInterval(16'666'666ULL);
@@ -143,7 +144,7 @@ inline bool durationEstimateAtMost(const Estimate &estimate, std::chrono::nanose
 inline constexpr bool nearIntervalNs(int64_t value, int64_t target, int64_t minToleranceNs) noexcept
 {
     const int64_t tolerance = std::max<int64_t>(target / 64, minToleranceNs);
-    return safeAbs64(value - target) <= tolerance;
+    return fastAbs64(value - target) <= tolerance;
 }
 
 template <int64_t Target, int64_t MinToleranceNs>
@@ -151,7 +152,7 @@ template <int64_t Target, int64_t MinToleranceNs>
 inline constexpr bool nearIntervalNs(int64_t value) noexcept
 {
     constexpr int64_t tolerance = (Target / 64) > MinToleranceNs ? (Target / 64) : MinToleranceNs;
-    return safeAbs64(value - Target) <= tolerance;
+    return fastAbs64(value - Target) <= tolerance;
 }
 
 [[gnu::always_inline, gnu::const]]
@@ -203,6 +204,7 @@ inline int effectiveMaxPendingFrames(const KWin::RenderLoopPrivate *d, bool vrrA
     if (!vrrActive) [[likely]] {
         return configuredMax;
     }
+
     if (configuredMax <= 1) {
         return configuredMax;
     }
@@ -220,7 +222,6 @@ inline int effectiveMaxPendingFrames(const KWin::RenderLoopPrivate *d, bool vrrA
     }
 
     const int maxPending = std::min(configuredMax, 2);
-
     if (d->interactiveGraceFrames_ > 0U ||
         d->pendingReschedule ||
         d->starvationRecoveryCounter >= KWin::RenderLoopPrivate::kStarvationRecoveryFrames ||
@@ -241,7 +242,6 @@ inline int effectiveMaxPendingFrames(const KWin::RenderLoopPrivate *d, bool vrrA
     return (predictedNs * 5) >= (vblankNs * 2) ? maxPending : 1;
 }
 
-
 } // namespace
 
 namespace KWin
@@ -249,12 +249,12 @@ namespace KWin
 
 static const bool s_debugEnabled = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0;
 
-RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop) noexcept
+RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop* loop) noexcept
 {
     return loop ? loop->d.get() : nullptr;
 }
 
-RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, BackendOutput *output)
+RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, BackendOutput* output)
     : q(q)
     , output(output)
 {
@@ -308,8 +308,8 @@ void RenderLoopPrivate::updateReciprocal() noexcept
         vblankIntervalReciprocal64 = kRecip240Hz;
         break;
     default: {
-        const auto num = static_cast<__uint128_t>(1) << shift;
-        vblankIntervalReciprocal64 = static_cast<uint64_t>((num + interval - 1) / interval);
+        const uint64_t num = 1ULL << shift;
+        vblankIntervalReciprocal64 = (num + interval - 1) / interval;
         break;
     }
     }
@@ -422,7 +422,6 @@ void RenderLoopPrivate::initializeVrrCapabilities()
     }
 
     vrrCapable = output->capabilities().testFlag(BackendOutput::Capability::Vrr);
-
     const auto config = KSharedConfig::openConfig(QStringLiteral("kwinrc"));
     const auto group = config->group(QStringLiteral("VRR"));
     const QString policy = group.readEntry(QStringLiteral("Policy"), QStringLiteral("Automatic"));
@@ -453,8 +452,8 @@ void RenderLoopPrivate::connectVrrSignals(Window *window)
     }
 
     disconnectVrrSignals();
-
     trackedWindow_ = window;
+    trackedSurfaceItem_ = window->surfaceItem();
     trackedSurface_ = surface;
     vrrConnectionCount_ = 0;
 
@@ -493,6 +492,7 @@ void RenderLoopPrivate::disconnectVrrSignals() noexcept
     }
     vrrConnectionCount_ = 0;
     trackedWindow_ = nullptr;
+    trackedSurfaceItem_ = nullptr;
     trackedSurface_ = nullptr;
 }
 
@@ -516,8 +516,7 @@ void RenderLoopPrivate::updateVrrState() noexcept
 
     if (!vrrStateDirty_) {
         if (trackedWindow_ != nullptr) {
-            SurfaceInterface *const live = resolvePresentationSurface(trackedWindow_.data());
-            if (live != trackedSurface_.data()) {
+            if (trackedWindow_->surfaceItem() != trackedSurfaceItem_.data()) {
                 vrrStateDirty_ = true;
             }
         }
@@ -525,8 +524,8 @@ void RenderLoopPrivate::updateVrrState() noexcept
             return;
         }
     }
-    vrrStateDirty_ = false;
 
+    vrrStateDirty_ = false;
     VrrStateCache::State state{};
     const uint8_t oldRaw = vrrStateCache_.raw();
 
@@ -553,7 +552,6 @@ void RenderLoopPrivate::updateVrrState() noexcept
     }
 
     connectVrrSignals(active);
-
     state.isOnOutput = 1U;
     state.isFullScreen = 1U;
 
@@ -566,7 +564,6 @@ void RenderLoopPrivate::updateVrrState() noexcept
         vrrStateCache_.setState(state);
     }
 }
-
 
 void RenderLoopPrivate::setVrrCapabilities(const VrrCapabilities &caps) noexcept
 {
@@ -626,9 +623,9 @@ void RenderLoopPrivate::addPresentFeedback(const PresentFeedback &feedback) noex
 
     PresentSample sample{};
     sample.timestamp = ts;
-    sample.refresh = feedback.refreshDuration.count() > 0
-        ? feedback.refreshDuration
-        : std::chrono::nanoseconds{static_cast<int64_t>(cachedVblankIntervalNs)};
+    sample.refresh = static_cast<uint32_t>(std::clamp<int64_t>(
+        feedback.refreshDuration.count() > 0 ? feedback.refreshDuration.count() : static_cast<int64_t>(cachedVblankIntervalNs),
+        0LL, 4'000'000'000LL));
     sample.deadlineMissed = feedback.deadlineMissed;
     sample.directScanout = feedback.directScanout;
     sample.valid = true;
@@ -660,6 +657,7 @@ bool RenderLoopPrivate::cadenceMatchesNominal() const noexcept
         const uint8_t idx = static_cast<uint8_t>(
             (presentHistoryHead_ + kPresentHistorySize - 1U - offset) & (kPresentHistorySize - 1U));
         const PresentSample &sample = presentHistory_[idx];
+
         if (!sample.valid) {
             continue;
         }
@@ -678,11 +676,10 @@ bool RenderLoopPrivate::cadenceMatchesNominal() const noexcept
                 maxValue = std::max(maxValue, delta);
 
                 const bool match =
-                    sample.directScanout || safeAbs64(delta - nominalNs) <= doubleTolerance;
+                    sample.directScanout || fastAbs64(delta - nominalNs) <= doubleTolerance;
                 matches += static_cast<size_t>(match);
             }
         }
-
         prevTs = ts;
     }
 
@@ -690,9 +687,27 @@ bool RenderLoopPrivate::cadenceMatchesNominal() const noexcept
         return nearIntervalNs(lastIntervalNs_, nominalNs, toleranceNs);
     }
 
-    const int64_t avgNs = found > 2
-        ? (sum - minValue - maxValue) / static_cast<int64_t>(found - 2)
-        : sum / static_cast<int64_t>(found);
+    const int64_t divisor = static_cast<int64_t>(found > 2 ? found - 2 : found);
+    const int64_t dividend = found > 2 ? sum - minValue - maxValue : sum;
+    int64_t avgNs = 0;
+
+    switch (divisor) {
+    case 1:
+        avgNs = dividend;
+        break;
+    case 2:
+        avgNs = dividend >> 1;
+        break;
+    case 3:
+        avgNs = dividend / 3;
+        break;
+    case 4:
+        avgNs = dividend >> 2;
+        break;
+    default:
+        avgNs = dividend / divisor;
+        break;
+    }
 
     if (!nearIntervalNs(avgNs, nominalNs, toleranceNs)) {
         return false;
@@ -725,6 +740,7 @@ void RenderLoopPrivate::recordModeSwitch() noexcept
     const auto now = std::chrono::steady_clock::now();
     lastModeSwitch = now;
     modeDwellCounter_ = 0;
+
     modeSwitchHistory_[modeSwitchHistoryHead_] = now;
     modeSwitchHistoryHead_ = static_cast<uint8_t>((modeSwitchHistoryHead_ + 1U) & (kModeSwitchHistorySize - 1U));
     modeSwitchHistoryCount_ += static_cast<uint8_t>(modeSwitchHistoryCount_ < kModeSwitchHistorySize);
@@ -750,7 +766,6 @@ bool RenderLoopPrivate::detectVrrOscillation() noexcept
     return false;
 }
 
-
 void RenderLoopPrivate::updatePresentationCadence(int64_t intervalNs) noexcept
 {
     if (intervalNs < kMinReasonableIntervalNs || intervalNs > kMaxReasonableIntervalNs) [[unlikely]] {
@@ -761,6 +776,7 @@ void RenderLoopPrivate::updatePresentationCadence(int64_t intervalNs) noexcept
 
     const int64_t prev = lastIntervalNs_;
     lastIntervalNs_ = intervalNs;
+
     if (prev < kMinReasonableIntervalNs) [[unlikely]] {
         return;
     }
@@ -770,9 +786,8 @@ void RenderLoopPrivate::updatePresentationCadence(int64_t intervalNs) noexcept
     const int64_t hi = std::min<int64_t>(prev + maxStepNs, kMaxReasonableIntervalNs);
     const int64_t filtered = std::clamp(intervalNs, lo, hi);
 
-    const int64_t rawDiff = safeAbs64(filtered - prev);
+    const int64_t rawDiff = fastAbs64(filtered - prev);
     const int64_t diff = rawDiff > kCadenceNoiseFloorNs ? (rawDiff - kCadenceNoiseFloorNs) : 0LL;
-
     const int64_t relativeDeviation = std::min<int64_t>(
         (diff << 8) / std::max<int64_t>(prev, 1LL),
         256LL);
@@ -780,6 +795,7 @@ void RenderLoopPrivate::updatePresentationCadence(int64_t intervalNs) noexcept
     const int32_t sample = static_cast<int32_t>(256LL - relativeDeviation);
     const int32_t current = static_cast<int32_t>(cadenceStability_);
     const int32_t isGreater = static_cast<int32_t>(sample > current);
+
     const int32_t shift = 1 + (isGreater << 1);
     const int32_t weight = 1 + (isGreater * 6);
 
@@ -982,14 +998,15 @@ void RenderLoopPrivate::updateFramePrediction(std::chrono::nanoseconds measured)
 
     const int shift = 1 + ((cadenceStability_ * 3) >> 8);
     const int64_t diff = m - cur;
-
     const int64_t isPos = diff > 0 ? 1 : 0;
     const int actualShift = isPos ? std::min(shift, 2) : shift;
+
     int64_t updated = cur + ((diff + isPos) >> actualShift);
 
     const int64_t vblank = static_cast<int64_t>(cachedVblankIntervalNs);
     const int64_t lo = std::max(vblank >> 5, int64_t{100'000});
     const int64_t hi = vblank << 2;
+
     framePrediction = std::chrono::nanoseconds{std::clamp(updated, lo, hi)};
 }
 
@@ -998,11 +1015,13 @@ void RenderLoopPrivate::scheduleNextRepaint()
     if (kwinApp()->isTerminating() || compositeTimer.isActive()) {
         return;
     }
+
     if (preparingNewFrame) {
         pendingReschedule = true;
         armStalledFrameTimer();
         return;
     }
+
     scheduleRepaint();
 }
 
@@ -1016,7 +1035,6 @@ void RenderLoopPrivate::scheduleRepaint()
     }
 
     pendingReschedule = false;
-
     const uint64_t vblankNs = cachedVblankIntervalNs;
     if (vblankNs == 0) [[unlikely]] {
         return;
@@ -1024,6 +1042,7 @@ void RenderLoopPrivate::scheduleRepaint()
 
     const int64_t nowNs = steadyNowNs();
     int64_t lastPresNs = lastPresentationTimestamp.count();
+
     if (lastPresNs <= 0 || lastPresNs > nowNs) [[unlikely]] {
         lastPresNs = nowNs - static_cast<int64_t>(vblankNs);
         lastPresentationTimestamp = std::chrono::nanoseconds{lastPresNs};
@@ -1060,6 +1079,7 @@ void RenderLoopPrivate::scheduleRepaint()
 
     const bool vrrActive = isVrrMode(presentationMode);
     const int maxPending = effectiveMaxPendingFrames(this, vrrActive);
+
     if (pendingFrameCount >= maxPending) {
         if (!vrrActive && delayedVrrTimer.isActive()) {
             delayedVrrTimer.stop();
@@ -1077,6 +1097,7 @@ void RenderLoopPrivate::scheduleRepaint()
     if (presentationMode == PresentationMode::VSync) [[likely]] {
         const int64_t earliestReadyNs = nowNs + compositeNs;
         const int64_t nsFromLastPres = std::max<int64_t>(earliestReadyNs - lastPresNs, 1LL);
+
         int64_t targetVblank = static_cast<int64_t>(
             ceilDivU64Reciprocal(static_cast<uint64_t>(nsFromLastPres),
                                  vblankNs,
@@ -1108,10 +1129,9 @@ void RenderLoopPrivate::scheduleRepaint()
     if (nextPresNs < minPresNs) {
         nextPresNs = minPresNs;
     }
-
     nextPresentationTimestamp = std::chrono::nanoseconds{nextPresNs};
-    const int64_t nextRenderNs = nextPresNs - compositeNs;
 
+    const int64_t nextRenderNs = nextPresNs - compositeNs;
     const int64_t delayNs = std::max<int64_t>(nextRenderNs - nowNs, 0LL);
     const int timerMs = delayNs < kNsPerMs
         ? 0
@@ -1119,10 +1139,12 @@ void RenderLoopPrivate::scheduleRepaint()
 
     if (compositeTimer.isActive()) {
         const int64_t scheduledNs = scheduledRenderTimestamp.count();
-        const int64_t absDiffNs = safeAbs64(nextRenderNs - scheduledNs);
+        const int64_t absDiffNs = fastAbs64(nextRenderNs - scheduledNs);
+
         if (absDiffNs < kTimerJitterFilterNs) {
             return;
         }
+
         if (scheduledTimerMs >= 0 && timerMs == scheduledTimerMs && absDiffNs < kNsPerMs) {
             return;
         }
@@ -1148,10 +1170,10 @@ void RenderLoopPrivate::notifyFrameDropped()
     }
 
     preparingNewFrame = false;
-
     if (pendingFrameCount > 0) {
         --pendingFrameCount;
     }
+
     if (consecutiveErrorCount < std::numeric_limits<uint8_t>::max()) {
         ++consecutiveErrorCount;
     }
@@ -1179,7 +1201,6 @@ void RenderLoopPrivate::notifyFrameDropped()
 
 namespace
 {
-
 void writeDebug(RenderLoopPrivate *d,
                 std::optional<RenderTimeSpan> rt,
                 std::chrono::nanoseconds targetFlip,
@@ -1196,12 +1217,10 @@ void writeDebug(RenderLoopPrivate *d,
         if (!d->output) {
             return;
         }
-
         std::string name = d->output->name().toStdString();
         for (char &c : name) {
             c = std::isalnum(static_cast<unsigned char>(c)) ? c : '_';
         }
-
         d->m_debugOutput.emplace("kwin_perf_" + name + ".csv", std::ios::out | std::ios::trunc);
         if (d->m_debugOutput && d->m_debugOutput->is_open()) {
             *d->m_debugOutput << "target,flip,start,end,margin,dur,vrr,pred,cadence\n";
@@ -1221,7 +1240,6 @@ void writeDebug(RenderLoopPrivate *d,
                           << d->cadenceStability_ << '\n';
     }
 }
-
 } // namespace
 
 void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
@@ -1255,8 +1273,8 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
 
     const int64_t prevPresentationNs = lastPresentationTimestamp.count();
     const int64_t nowNs = steadyNowNs();
-
     int64_t tsNs = timestamp.count();
+
     if (tsNs > nowNs) [[unlikely]] {
         tsNs = nowNs;
     }
@@ -1294,6 +1312,7 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
 
         const int64_t vblankNs = static_cast<int64_t>(cachedVblankIntervalNs);
         int64_t graceNs = vblankNs / 8;
+
         if (graceNs < 700'000) {
             graceNs = 700'000;
         } else if (graceNs > 2'500'000) {
@@ -1338,7 +1357,6 @@ void RenderLoopPrivate::notifyVblank(std::chrono::nanoseconds timestamp, int64_t
 
     const int64_t prev = lastPresentationTimestamp.count();
     if (ts < prev) [[unlikely]] {
-        // Avoid backward jumps that can destabilize interval estimation and trigger mode oscillation.
         ts = prev;
     }
 
@@ -1353,6 +1371,7 @@ void RenderLoopPrivate::dispatch()
 void RenderLoop::timerEvent(QTimerEvent *event)
 {
     const int id = event->timerId();
+
     if (id == d->compositeTimer.timerId()) {
         d->compositeTimer.stop();
         d->scheduledTimerMs = -1;
@@ -1402,7 +1421,6 @@ void RenderLoop::prepareNewFrame()
 void RenderLoop::newFramePrepared()
 {
     d->preparingNewFrame = false;
-
     const bool vrrActive = isVrrMode(d->presentationMode);
     const int maxPending = effectiveMaxPendingFrames(d.get(), vrrActive);
 
@@ -1431,11 +1449,12 @@ void RenderLoop::setRefreshRate(int rate)
 
     d->refreshRate = rate;
     d->cachedVblankIntervalNs = 1'000'000'000'000ULL / static_cast<uint64_t>(rate);
+
     if (d->vrrCaps_.maxRefreshRate <= 0) {
         d->vrrCaps_.maxRefreshRate = rate;
     }
-    d->updateReciprocal();
 
+    d->updateReciprocal();
     Q_EMIT refreshRateChanged();
 
     if (d->inhibitCount == 0) {
@@ -1490,10 +1509,9 @@ void RenderLoop::notifyPresentFeedback(const PresentFeedback &feedback)
     d->addPresentFeedback(feedback);
 }
 
-void RenderLoop::scheduleRepaint(Item *item, OutputLayer *layer)
+void RenderLoop::scheduleRepaint(Item *item, OutputLayer* layer)
 {
     (void)layer;
-
     if (thread() != QThread::currentThread()) [[unlikely]] {
         QMetaObject::invokeMethod(this, [this]() {
             scheduleRepaint(nullptr, nullptr);
@@ -1624,6 +1642,7 @@ void RenderLoop::setPresentationMode(PresentationMode mode)
     if (d->presentationMode == mode) {
         return;
     }
+
     d->presentationMode = mode;
     d->lastStableMode = mode;
     Q_EMIT presentationModeChanged(this, mode, VrrDecisionReason::UserPolicy);

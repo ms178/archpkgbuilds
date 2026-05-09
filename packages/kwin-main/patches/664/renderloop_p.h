@@ -3,6 +3,7 @@
     SPDX-FileCopyrightText: 2025 Performance Engineering Team
     SPDX-License-Identifier: GPL-2.0-or-later
 */
+
 #pragma once
 
 #include "renderbackend.h"
@@ -25,7 +26,6 @@
 
 namespace KWin
 {
-
 class SurfaceItem;
 class SurfaceInterface;
 class OutputFrame;
@@ -40,6 +40,7 @@ public:
         uint8_t isFullScreen : 1;
         uint8_t valid : 1;
         uint8_t reserved : 3;
+
         constexpr State() noexcept
             : hint(0)
             , isOnOutput(0)
@@ -48,15 +49,18 @@ public:
             , reserved(0)
         {
         }
+
         [[nodiscard]] constexpr uint8_t toRaw() const noexcept
         {
             return std::bit_cast<uint8_t>(*this);
         }
+
         [[nodiscard]] static constexpr State fromRaw(uint8_t raw) noexcept
         {
             return std::bit_cast<State>(raw);
         }
     };
+
     static_assert(sizeof(State) == 1);
     static_assert(std::is_trivially_copyable_v<State>);
 
@@ -64,14 +68,17 @@ public:
     {
         m_state = s.toRaw();
     }
+
     [[nodiscard]] constexpr State getState() const noexcept
     {
         return State::fromRaw(m_state);
     }
+
     [[nodiscard]] constexpr uint8_t raw() const noexcept
     {
         return m_state;
     }
+
     constexpr void setRaw(uint8_t v) noexcept
     {
         m_state = v;
@@ -88,6 +95,7 @@ public:
     static constexpr size_t kPresentHistorySize = 16;
     static_assert((kModeSwitchHistorySize & (kModeSwitchHistorySize - 1U)) == 0U, "Must be power of two");
     static_assert((kPresentHistorySize & (kPresentHistorySize - 1U)) == 0U, "Must be power of two");
+
     static constexpr uint16_t kStarvationRecoveryFrames = 4;
 
     enum class VrrMode : uint8_t {
@@ -98,41 +106,50 @@ public:
 
     struct PresentSample {
         std::chrono::nanoseconds timestamp{0};
-        std::chrono::nanoseconds refresh{0};
+        uint32_t refresh{0};
         bool deadlineMissed{false};
         bool directScanout{false};
         bool valid{false};
+        uint8_t pad{0};
     };
 
     RenderLoop *const q;
     BackendOutput *const output;
+
     std::chrono::nanoseconds lastPresentationTimestamp{0};
     std::chrono::nanoseconds nextPresentationTimestamp{0};
     std::chrono::nanoseconds scheduledRenderTimestamp{0};
     std::chrono::nanoseconds framePrediction{0};
     std::chrono::nanoseconds safetyMargin{0};
     std::chrono::nanoseconds nominalContentFrameInterval{0};
+
     uint64_t cachedVblankIntervalNs{16666667ULL};
     uint64_t vblankIntervalReciprocal64{0};
+
     int64_t lastIntervalNs_{0};
     int64_t tripleBufferEnterThresholdNs{0};
     int64_t tripleBufferExitThresholdNs{0};
+
     QBasicTimer compositeTimer;
     QBasicTimer delayedVrrTimer;
     QBasicTimer stalledFrameTimer;
+
     int32_t pendingFrameCount{0};
     int32_t refreshRate{60000};
     int32_t inhibitCount{0};
     int32_t maxPendingFrameCount{1};
+
     int16_t cadenceStability_{128};
     int16_t scheduledTimerMs{-1};
     int16_t vrrControlDelayMs{-1};
     int16_t stalledFrameTimerMs_{-1};
+
     uint16_t starvationRecoveryCounter{0};
     uint16_t modeDwellCounter_{0};
     uint16_t pendingModeCounter_{0};
     uint16_t oscillationCooldownCounter_{0};
     uint16_t interactiveGraceFrames_{0};
+
     uint8_t reciprocalShift64{0};
     uint8_t consecutiveErrorCount{0};
     uint8_t vrrConnectionCount_{0};
@@ -142,6 +159,7 @@ public:
     uint8_t presentHistoryHead_{0};
     uint8_t presentHistoryCount_{0};
     uint8_t stalledFrameTimeoutCount_{0};
+
     bool preparingNewFrame{false};
     bool pendingReschedule{false};
     bool wasTripleBuffering{false};
@@ -150,28 +168,34 @@ public:
     bool vrrCapable{false};
     bool vrrStateDirty_{true};
     bool lfcCapable_{false};
+
     PresentationMode presentationMode{PresentationMode::VSync};
     PresentationMode lastStableMode{PresentationMode::VSync};
     PresentationMode pendingTargetMode_{PresentationMode::VSync};
     VrrMode vrrMode{VrrMode::Automatic};
     VrrContentHint activeContentHint_{VrrContentHint::Unknown};
     VrrDecisionReason lastDecisionReason_{VrrDecisionReason::None};
+
     VrrCapabilities vrrCaps_{};
     VrrStateCache vrrStateCache_{};
+
     std::chrono::steady_clock::time_point lastModeSwitch{};
     std::array<std::chrono::steady_clock::time_point, kModeSwitchHistorySize> modeSwitchHistory_{};
     std::array<PresentSample, kPresentHistorySize> presentHistory_{};
+
     RenderJournal renderJournal;
 
     QPointer<Window> trackedWindow_{nullptr};
+    QPointer<SurfaceItem> trackedSurfaceItem_{nullptr};
     QPointer<SurfaceInterface> trackedSurface_{nullptr};
-
     std::array<QMetaObject::Connection, 4> vrrConnections_{};
+
     std::optional<std::fstream> m_debugOutput;
 
-    [[nodiscard]] static RenderLoopPrivate *get(RenderLoop *loop) noexcept;
-    explicit RenderLoopPrivate(RenderLoop *q, BackendOutput *output);
+    [[nodiscard]] static RenderLoopPrivate *get(RenderLoop* loop) noexcept;
+    explicit RenderLoopPrivate(RenderLoop *q, BackendOutput* output);
     ~RenderLoopPrivate();
+
     RenderLoopPrivate(const RenderLoopPrivate &) = delete;
     RenderLoopPrivate &operator=(const RenderLoopPrivate &) = delete;
     RenderLoopPrivate(RenderLoopPrivate &&) = delete;
@@ -190,12 +214,14 @@ public:
     void setActiveContentHint(VrrContentHint hint,
                               std::optional<std::chrono::nanoseconds> nominalFrameInterval) noexcept;
     void addPresentFeedback(const PresentFeedback &feedback) noexcept;
+
     [[nodiscard]] bool cadenceMatchesNominal() const noexcept;
     [[nodiscard]] bool isBelowVrrFloor() const noexcept;
     [[nodiscard]] PresentationMode selectPresentationMode() noexcept;
     [[nodiscard]] bool shouldSwitchMode(PresentationMode target) noexcept;
     void recordModeSwitch() noexcept;
     [[nodiscard]] bool detectVrrOscillation() noexcept;
+
     void updateFramePrediction(std::chrono::nanoseconds measured) noexcept;
     void updatePresentationCadence(int64_t intervalNs) noexcept;
     void dispatch();
