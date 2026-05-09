@@ -1,16 +1,30 @@
-# Maintainer: Chocobo1 <chocobo1 AT archlinux DOT net>
+# Maintainer: ms178
 
 pkgname=make-git
-pkgver=4.4.1.r128.gaa8626ce
-pkgrel=1
-pkgdesc="A tool which controls the generation of executables and other non-source files of a program from the program's source files"
+pkgver=4.4.1.r146.gb3802782
+pkgrel=7
+
+pkgdesc="GNU make built with highly tuned Clang PGO + Context Sensitive PGO"
 arch=('i686' 'x86_64')
 url="https://www.gnu.org/software/make/"
 license=('GPL3')
+
 depends=('glibc' 'guile')
-makedepends=('git' 'rsync' 'wget')
-provides=("make=$pkgver")
+makedepends=(
+  'git'
+  'rsync'
+  'wget'
+  'autoconf'
+  'automake'
+  'libtool'
+  'llvm'
+  'clang'
+  'lld'
+)
+
+provides=("make=${pkgver}")
 conflicts=('make')
+
 source=("git+https://git.savannah.gnu.org/git/make.git")
 sha256sums=('SKIP')
 
@@ -21,12 +35,106 @@ pkgver() {
 
 prepare() {
   cd "make"
-  # Remove -C flag from configure.ac
+
+  # Remove -C flag from configure.ac (must be done before bootstrap)
   sed -i 's/-C //' configure.ac
+
   # Remove -C flag from cfg.mk if it exists
   if [ -f cfg.mk ]; then
     sed -i 's/-C //' cfg.mk
   fi
+
+  # Generate configure script from patched configure.ac
+  ./bootstrap
+}
+
+# High-coverage training workload for maximum profile quality
+_run_training_workload() {
+  local makebin="$1"
+
+  local workdir
+  workdir="$(mktemp -d)"
+  pushd "${workdir}" >/dev/null
+
+  mkdir -p src build generated nested/deep/tree
+
+  # Generate 2500 source files to exercise code paths
+  for i in $(seq 1 2500); do
+    cat > "src/file${i}.c" << EOF
+int func${i}(void) { return ${i}; }
+EOF
+  done
+
+  # Complex Makefile stressing variable expansion, VPATH, and recursion
+  cat > Makefile << 'EOF'
+MAKEFLAGS += --no-builtin-rules
+MAKEFLAGS += --warn-undefined-variables
+
+export MASSIVE_VAR := $(shell seq 1 5000)
+
+VPATH = src:generated
+
+SOURCES := $(wildcard src/*.c)
+OBJECTS := $(patsubst src/%.c,build/%.o,$(SOURCES))
+GENERATED := $(patsubst src/%.c,generated/%.c,$(SOURCES))
+
+.PHONY: all recurse recurse2 recurse3 vars shell implicit clean
+
+all: vars shell implicit recurse recurse2 recurse3 $(OBJECTS) $(GENERATED:.c=.o)
+
+build/%.o: %.c
+	@cp $< $@
+
+generated/%.c: src/%.c
+	@cp $< $@
+
+vars:
+	@echo $(foreach x,$(MASSIVE_VAR),$(x)) >/dev/null
+
+shell:
+	@for x in $(MASSIVE_VAR); do echo $$x >/dev/null; done
+
+implicit:
+	@touch generated/test.c
+	@$(MAKE) generated/test.o
+
+recurse:
+	@$(MAKE) recurse2
+
+recurse2:
+	@$(MAKE) -j16 recurse3
+
+recurse3:
+	@printf ""
+
+clean:
+	rm -rf build generated/*.o generated/*.c
+EOF
+
+  # Multi-pass execution with varying parallelism
+  for pass in {1..30}; do
+    "${makebin}" -j"$(nproc)" all >/dev/null 2>&1 || true
+    "${makebin}" -j1 -B all >/dev/null 2>&1 || true
+    "${makebin}" -j"$(nproc)" clean >/dev/null 2>&1 || true
+    "${makebin}" -j"$(nproc)" -B all >/dev/null 2>&1 || true
+  done
+
+  popd >/dev/null
+  rm -rf "${workdir}"
+}
+
+# Unified training function to run both make check and custom workload
+_train() {
+  local profdir="$1"
+  mkdir -p "${profdir}"
+
+  export LLVM_PROFILE_FILE="${profdir}/default_%m_%p.profraw"
+
+  # Run the official test suite to gather real-world profile data
+  make -j"$(nproc)" -k check || true
+
+  # Run the synthetic stress workload
+  _run_training_workload "$PWD/make"
 }
 
 build() {
@@ -35,24 +143,86 @@ build() {
   export CC=clang
   export CXX=clang++
 
-  ./bootstrap
-  ./configure \
-    --prefix="/usr" \
-    --with-guile
+  local profroot="${srcdir}/profiles"
+  rm -rf "${profroot}"
+  mkdir -p "${profroot}"
 
-  # Remove -C flag from the generated Makefile
+  echo "============================================================"
+  echo "STAGE 1 — PGO PROFILE GENERATION"
+  echo "============================================================"
+
+  mkdir -p build-pgo-gen && cd build-pgo-gen
+
+  ../configure \
+    --prefix="/usr" \
+    --with-guile \
+    --disable-dependency-tracking \
+    CC=clang \
+    CXX=clang++ \
+    CFLAGS="${CFLAGS} -fprofile-generate -fprofile-update=atomic -mllvm -vp-counters-per-site=64" \
+    LDFLAGS="${LDFLAGS} -fprofile-generate"
+
   sed -i 's/-C //g' Makefile
 
-  # Build with modified flags
-  make WARN_CFLAGS="-Wno-error"
+  make -j"$(nproc)" WARN_CFLAGS="-Wno-error"
+
+  _train "${profroot}/stage1"
+  cd ..
+
+  llvm-profdata merge --sparse "${profroot}/stage1"/*.profraw -o "${profroot}/stage1.profdata"
+
+  echo "============================================================"
+  echo "STAGE 2 — CONTEXT SENSITIVE PGO"
+  echo "============================================================"
+
+  mkdir -p build-cspgo-gen && cd build-cspgo-gen
+
+  ../configure \
+    --prefix="/usr" \
+    --with-guile \
+    --disable-dependency-tracking \
+    CC=clang \
+    CXX=clang++ \
+    CFLAGS="${CFLAGS} -fprofile-use=${profroot}/stage1.profdata -fprofile-correction -fcs-profile-generate -fprofile-update=atomic -mllvm -vp-counters-per-site=64" \
+    LDFLAGS="${LDFLAGS} -fprofile-use=${profroot}/stage1.profdata -fprofile-correction -fcs-profile-generate"
+
+  sed -i 's/-C //g' Makefile
+
+  make -j"$(nproc)" WARN_CFLAGS="-Wno-error"
+
+  _train "${profroot}/cspgo"
+  cd ..
+
+  llvm-profdata merge --sparse "${profroot}/cspgo"/*.profraw -o "${profroot}/cspgo.profdata"
+
+  echo "============================================================"
+  echo "STAGE 3 — FINAL CS-PGO OPTIMIZED BUILD"
+  echo "============================================================"
+
+  mkdir -p build-final && cd build-final
+
+  ../configure \
+    --prefix="/usr" \
+    --with-guile \
+    --disable-dependency-tracking \
+    CC=clang \
+    CXX=clang++ \
+    CFLAGS="${CFLAGS} -fprofile-use=${profroot}/cspgo.profdata -fprofile-correction -mllvm -vp-counters-per-site=64" \
+    LDFLAGS="${LDFLAGS} -fprofile-use=${profroot}/cspgo.profdata -fprofile-correction"
+
+  sed -i 's/-C //g' Makefile
+
+  make -j"$(nproc)" WARN_CFLAGS="-Wno-error"
+  cd ..
 }
 
 check() {
-  cd "make"
-  make check
+  cd "make/build-final"
+  make -j"$(nproc)" check
 }
 
 package() {
-  cd "make"
-  make DESTDIR="$pkgdir" install
+  cd "make/build-final"
+  make DESTDIR="${pkgdir}" install
+  install -Dm644 ../COPYING "${pkgdir}/usr/share/licenses/${pkgname}/COPYING"
 }
