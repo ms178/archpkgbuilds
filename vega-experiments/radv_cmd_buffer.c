@@ -3987,16 +3987,21 @@ radv_emit_graphics_pipeline(struct radv_cmd_buffer *cmd_buffer)
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
 
+   /* Restored early exit – skips redundant PM4 writes after CmdExecuteCommands */
    if (cmd_buffer->state.emitted_graphics_pipeline == pipeline)
       return;
 
    radv_emit_graphics_shaders(cmd_buffer);
 
    if (pipeline->sqtt_shaders_reloc) {
-      /* Emit shaders relocation because RGP requires them to be contiguous in memory. */
-      radv_sqtt_emit_relocated_shaders(cmd_buffer, pipeline);
-
-      radv_cs_add_buffer(device->ws, cs->b, pipeline->sqtt_shaders_reloc->bo);
+      const struct radv_sqtt_shaders_reloc *reloc = pipeline->sqtt_shaders_reloc;
+      for (int i = 0; i < MESA_VULKAN_SHADER_STAGES; i++) {
+         if (!reloc->va[i])
+            continue;
+         radv_sqtt_emit_relocated_shader(cmd_buffer,
+                                         cmd_buffer->state.shaders[i],
+                                         reloc->va[i]);
+      }
    }
 
    if (radv_device_fault_detection_enabled(device))
@@ -6066,22 +6071,21 @@ emit_prolog_regs(struct radv_cmd_buffer *cmd_buffer, const struct radv_shader *v
    struct radv_cmd_stream *cs = cmd_buffer->cs;
    uint32_t rsrc1, rsrc2;
 
-   /* no need to re-emit anything in this case */
    if (cmd_buffer->state.emitted_vs_prolog == prolog)
       return;
 
    enum amd_gfx_level chip = pdev->info.gfx_level;
 
-   assert(cmd_buffer->state.emitted_graphics_pipeline == cmd_buffer->state.graphics_pipeline);
+   assert(cmd_buffer->state.emitted_graphics_pipeline == cmd_buffer->state.graphics_pipeline); /* restored */
 
    if (vs_shader->info.merged_shader_compiled_separately) {
       if (vs_shader->info.next_stage == MESA_SHADER_GEOMETRY) {
-         radv_shader_combine_cfg_vs_gs(device, vs_shader, cmd_buffer->state.shaders[MESA_SHADER_GEOMETRY], &rsrc1,
-                                       &rsrc2);
+         radv_shader_combine_cfg_vs_gs(device, vs_shader,
+                                       cmd_buffer->state.shaders[MESA_SHADER_GEOMETRY], &rsrc1, &rsrc2);
       } else {
          assert(vs_shader->info.next_stage == MESA_SHADER_TESS_CTRL);
-
-         radv_shader_combine_cfg_vs_tcs(vs_shader, cmd_buffer->state.shaders[MESA_SHADER_TESS_CTRL], &rsrc1, &rsrc2);
+         radv_shader_combine_cfg_vs_tcs(vs_shader,
+                                        cmd_buffer->state.shaders[MESA_SHADER_TESS_CTRL], &rsrc1, &rsrc2);
       }
    } else {
       rsrc1 = vs_shader->config.rsrc1;
@@ -8365,7 +8369,8 @@ radv_EndCommandBuffer(VkCommandBuffer commandBuffer)
 }
 
 static void
-radv_emit_ray_tracing_pipeline(struct radv_cmd_buffer *cmd_buffer, struct radv_ray_tracing_pipeline *pipeline)
+radv_emit_ray_tracing_pipeline(struct radv_cmd_buffer *cmd_buffer,
+                                struct radv_ray_tracing_pipeline *pipeline)
 {
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
@@ -8417,10 +8422,11 @@ radv_emit_ray_tracing_pipeline(struct radv_cmd_buffer *cmd_buffer, struct radv_r
 static void
 radv_emit_compute_pipeline(struct radv_cmd_buffer *cmd_buffer, struct radv_compute_pipeline *pipeline)
 {
-   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_cmd_stream *cs = radv_get_pm4_cs(cmd_buffer);
 
+   /* Restored early exit */
    if (pipeline == cmd_buffer->state.emitted_compute_pipeline)
       return;
 
@@ -9914,8 +9920,10 @@ radv_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCou
       device->ws->cs_execute_secondary(primary_cs->b, secondary_cs->b, allow_ib2);
 
       primary->state.emitted_graphics_pipeline = secondary->state.emitted_graphics_pipeline;
-      primary->state.emitted_compute_pipeline = secondary->state.emitted_compute_pipeline;
-      primary->state.emitted_rt_pipeline = secondary->state.emitted_rt_pipeline;
+      primary->state.emitted_compute_pipeline  = secondary->state.emitted_compute_pipeline;
+      primary->state.emitted_rt_pipeline       = secondary->state.emitted_rt_pipeline;
+
+      primary->state.rb_noncoherent_dirty |= secondary->state.rb_noncoherent_dirty;
 
       primary->state.ps_epilog = secondary->state.ps_epilog;
       primary->state.emitted_vs_prolog = secondary->state.emitted_vs_prolog;
@@ -16120,10 +16128,10 @@ radv_reset_pipeline_state(struct radv_cmd_buffer *cmd_buffer, VkPipelineBindPoin
          radv_bind_shader(cmd_buffer, NULL, MESA_SHADER_COMPUTE);
          cmd_buffer->state.compute_pipeline = NULL;
       }
-      if (cmd_buffer->state.emitted_compute_pipeline) {
-         cmd_buffer->state.emitted_compute_pipeline = NULL;
-      }
+      cmd_buffer->state.emitted_compute_pipeline = NULL;       /* restored for guard */
+      cmd_buffer->state.dirty &= ~RADV_CMD_DIRTY_COMPUTE_PIPELINE;
       break;
+
    case VK_PIPELINE_BIND_POINT_GRAPHICS:
       if (cmd_buffer->state.graphics_pipeline) {
          radv_foreach_stage (s, cmd_buffer->state.graphics_pipeline->active_stages) {
@@ -16138,8 +16146,9 @@ radv_reset_pipeline_state(struct radv_cmd_buffer *cmd_buffer, VkPipelineBindPoin
          cmd_buffer->state.ms.min_sample_shading = 1.0f;
          cmd_buffer->state.uses_out_of_order_rast = false;
          cmd_buffer->state.uses_vrs_attachment = false;
-      }
-      if (cmd_buffer->state.emitted_graphics_pipeline) {
+         cmd_buffer->state.uses_vrs = false;
+         cmd_buffer->state.uses_vrs_coarse_shading = false;
+
          radv_bind_custom_blend_mode(cmd_buffer, 0);
 
          if (cmd_buffer->state.spi_shader_col_format || cmd_buffer->state.spi_shader_z_format ||
@@ -16149,18 +16158,25 @@ radv_reset_pipeline_state(struct radv_cmd_buffer *cmd_buffer, VkPipelineBindPoin
             cmd_buffer->state.cb_shader_mask = 0;
             cmd_buffer->state.dirty |= RADV_CMD_DIRTY_FRAGMENT_OUTPUT;
          }
-
-         cmd_buffer->state.uses_vrs = false;
-         cmd_buffer->state.uses_vrs_coarse_shading = false;
-
-         cmd_buffer->state.emitted_graphics_pipeline = NULL;
       }
+      cmd_buffer->state.emitted_graphics_pipeline = NULL;     /* restored for guard */
+      cmd_buffer->state.dirty &= ~RADV_CMD_DIRTY_GRAPHICS_PIPELINE;
       break;
+
+   case VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR:
+      if (cmd_buffer->state.rt_pipeline) {
+         radv_foreach_stage (s, cmd_buffer->state.rt_pipeline->active_stages) {
+            radv_bind_shader(cmd_buffer, NULL, s);
+         }
+         cmd_buffer->state.rt_pipeline = NULL;
+      }
+      cmd_buffer->state.emitted_rt_pipeline = NULL;            /* restored for guard */
+      cmd_buffer->state.dirty &= ~RADV_CMD_DIRTY_RAY_TRACING_PIPELINE;
+      break;
+
    default:
       break;
    }
-
-   cmd_buffer->state.dirty &= ~RADV_CMD_DIRTY_PIPELINE;
 }
 
 static void
