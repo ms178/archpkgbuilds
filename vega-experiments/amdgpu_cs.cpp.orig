@@ -255,7 +255,7 @@ amdgpu_cs_get_next_fence(struct radeon_cmdbuf *rcs)
    struct amdgpu_cs *acs = amdgpu_cs(rcs);
    struct pipe_fence_handle *fence = NULL;
 
-   if (acs->noop)
+   if (!acs || acs->noop)
       return NULL;
 
    if (acs->next_fence) {
@@ -663,7 +663,12 @@ static unsigned amdgpu_cs_add_buffer(struct radeon_cmdbuf *rcs,
    /* Don't use the "domains" parameter. Amdgpu doesn't support changing
     * the buffer placement during command submission.
     */
-   struct amdgpu_cs_context *csc = amdgpu_csc_get_current(amdgpu_cs(rcs));
+   struct amdgpu_cs *acs = amdgpu_cs(rcs);
+   assert(acs);
+   if (!acs)
+      return 0;
+
+   struct amdgpu_cs_context *csc = amdgpu_csc_get_current(acs);
    struct amdgpu_winsys_bo *bo = (struct amdgpu_winsys_bo*)buf;
    struct amdgpu_cs_buffer *buffer;
 
@@ -810,7 +815,7 @@ static void amdgpu_set_ib_size(struct radeon_cmdbuf *rcs, struct amdgpu_ib *ib)
       *ib->ptr_ib_size = rcs->current.cdw | S_3F3_CHAIN(1) | S_3F3_VALID(1);
 
       struct amdgpu_cs *acs = amdgpu_cs(rcs);
-      if (!rcs->gang && acs->preamble_ib_bo)
+      if (acs && !rcs->gang && acs->preamble_ib_bo)
          *ib->ptr_ib_size |= S_3F3_PRE_ENA(1);
    } else {
       *ib->ptr_ib_size = rcs->current.cdw;
@@ -896,7 +901,8 @@ static void amdgpu_destroy_cs_context(struct amdgpu_winsys *aws, struct amdgpu_c
 static enum amd_ip_type amdgpu_cs_get_ip_type(struct radeon_cmdbuf *rcs)
 {
    struct amdgpu_cs *acs = amdgpu_cs(rcs);
-   return rcs->gang ? AMD_IP_COMPUTE : acs->ip_type;
+   assert(acs);
+   return (rcs->gang || !acs) ? AMD_IP_COMPUTE : acs->ip_type;
 }
 
 static bool ip_uses_alt_fence(enum amd_ip_type ip_type)
@@ -1023,10 +1029,16 @@ amdgpu_cs_setup_preemption(struct radeon_cmdbuf *rcs, const uint32_t *preamble_i
                            unsigned preamble_num_dw)
 {
    struct amdgpu_cs *acs = amdgpu_cs(rcs);
-   struct amdgpu_winsys *aws = acs->aws;
-   unsigned size = align(preamble_num_dw * 4, aws->info.ip[AMD_IP_GFX].ib_alignment);
+   struct amdgpu_winsys *aws;
+   unsigned size;
    struct pb_buffer_lean *preamble_bo;
    uint32_t *map;
+
+   assert(acs);
+   if (!acs)
+      return false;
+   aws = acs->aws;
+   size = align(preamble_num_dw * 4, aws->info.ip[AMD_IP_GFX].ib_alignment);
 
    /* Create the preamble IB buffer. */
    preamble_bo = amdgpu_bo_create(aws, size, aws->info.ip[AMD_IP_GFX].ib_alignment,
@@ -2407,8 +2419,11 @@ static void amdgpu_winsys_fence_reference(struct radeon_winsys *rws,
 static bool amdgpu_cs_create_compute_gang(struct radeon_cmdbuf *rcs)
 {
    struct amdgpu_cs *acs = amdgpu_cs(rcs);
+   struct radeon_cmdbuf *gang;
+   if (!acs)
+      return false;
 
-   struct radeon_cmdbuf *gang = CALLOC_STRUCT(radeon_cmdbuf);
+   gang = CALLOC_STRUCT(radeon_cmdbuf);
    if (!gang)
       return false;
 
