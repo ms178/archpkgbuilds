@@ -130,6 +130,11 @@ enum radv_cmd_dirty_bits {
    RADV_CMD_DIRTY_ALL = (1ull << 38) - 1,
 
    RADV_CMD_DIRTY_SHADER_QUERY = RADV_CMD_DIRTY_NGG_STATE | RADV_CMD_DIRTY_TASK_STATE,
+
+   /* Compatibility aliases for older code paths. */
+   RADV_CMD_DIRTY_COMPUTE_PIPELINE = RADV_CMD_DIRTY_PIPELINE,
+   RADV_CMD_DIRTY_GRAPHICS_PIPELINE = RADV_CMD_DIRTY_PIPELINE,
+   RADV_CMD_DIRTY_RAY_TRACING_PIPELINE = RADV_CMD_DIRTY_PIPELINE,
 };
 
 /* Compile-time validation: ensure all dirty bits fit in uint64_t. */

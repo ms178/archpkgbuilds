@@ -3998,7 +3998,7 @@ radv_emit_graphics_pipeline(struct radv_cmd_buffer *cmd_buffer)
       for (int i = 0; i < MESA_VULKAN_SHADER_STAGES; i++) {
          if (!reloc->va[i])
             continue;
-         radv_sqtt_emit_relocated_shader(cmd_buffer,
+         radv_sqtt_emit_relocated_shaders(cmd_buffer,
                                          cmd_buffer->state.shaders[i],
                                          reloc->va[i]);
       }
@@ -6527,9 +6527,6 @@ radv_flush_constants(struct radv_cmd_buffer *cmd_buffer, VkShaderStageFlags stag
       break;
    case VK_PIPELINE_BIND_POINT_COMPUTE:
       break;
-   case VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR:
-      internal_stages = VK_SHADER_STAGE_COMPUTE_BIT;
-      break;
    default:
       UNREACHABLE("Unhandled bind point");
    }
@@ -7560,7 +7557,7 @@ radv_dst_access_flush(struct radv_cmd_buffer *cmd_buffer, VkPipelineStageFlags2 
 
    if (dst_flags & (VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_CONDITIONAL_RENDERING_READ_BIT_EXT)) {
       /* SMEM loads are used to read compute dispatch size in shaders */
-      if ((dst_flags & VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT) && !device->load_grid_size_from_user_sgpr) {
+      if ((dst_flags & VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT) && !pdev->load_grid_size_from_user_sgpr) {
          flush_bits |= RADV_CMD_FLAG_INV_SCACHE;
       }
 
@@ -13914,7 +13911,7 @@ radv_emit_dispatch_packets(struct radv_cmd_buffer *cmd_buffer, const struct radv
       if (grid_size_offset) {
          radeon_begin(cs);
 
-         if (device->load_grid_size_from_user_sgpr) {
+         if (pdev->load_grid_size_from_user_sgpr) {
             assert(pdev->info.gfx_level >= GFX10_3);
 
             radeon_emit(PKT3(PKT3_LOAD_SH_REG_INDEX, 3, 0));
@@ -14020,7 +14017,7 @@ radv_emit_dispatch_packets(struct radv_cmd_buffer *cmd_buffer, const struct radv
       }
 
       if (grid_size_offset) {
-         if (device->load_grid_size_from_user_sgpr) {
+         if (pdev->load_grid_size_from_user_sgpr) {
             radeon_begin(cs);
             radeon_set_sh_reg_seq(grid_size_offset, 3);
             radeon_emit(blocks[0]);
@@ -16128,7 +16125,6 @@ radv_reset_pipeline_state(struct radv_cmd_buffer *cmd_buffer, VkPipelineBindPoin
          radv_bind_shader(cmd_buffer, NULL, MESA_SHADER_COMPUTE);
          cmd_buffer->state.compute_pipeline = NULL;
       }
-      cmd_buffer->state.emitted_compute_pipeline = NULL;       /* restored for guard */
       cmd_buffer->state.dirty &= ~RADV_CMD_DIRTY_COMPUTE_PIPELINE;
       break;
 
@@ -16159,19 +16155,7 @@ radv_reset_pipeline_state(struct radv_cmd_buffer *cmd_buffer, VkPipelineBindPoin
             cmd_buffer->state.dirty |= RADV_CMD_DIRTY_FRAGMENT_OUTPUT;
          }
       }
-      cmd_buffer->state.emitted_graphics_pipeline = NULL;     /* restored for guard */
       cmd_buffer->state.dirty &= ~RADV_CMD_DIRTY_GRAPHICS_PIPELINE;
-      break;
-
-   case VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR:
-      if (cmd_buffer->state.rt_pipeline) {
-         radv_foreach_stage (s, cmd_buffer->state.rt_pipeline->active_stages) {
-            radv_bind_shader(cmd_buffer, NULL, s);
-         }
-         cmd_buffer->state.rt_pipeline = NULL;
-      }
-      cmd_buffer->state.emitted_rt_pipeline = NULL;            /* restored for guard */
-      cmd_buffer->state.dirty &= ~RADV_CMD_DIRTY_RAY_TRACING_PIPELINE;
       break;
 
    default:
