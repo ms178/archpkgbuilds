@@ -130,11 +130,6 @@ enum radv_cmd_dirty_bits {
    RADV_CMD_DIRTY_ALL = (1ull << 38) - 1,
 
    RADV_CMD_DIRTY_SHADER_QUERY = RADV_CMD_DIRTY_NGG_STATE | RADV_CMD_DIRTY_TASK_STATE,
-
-   /* Compatibility aliases for older code paths. */
-   RADV_CMD_DIRTY_COMPUTE_PIPELINE = RADV_CMD_DIRTY_PIPELINE,
-   RADV_CMD_DIRTY_GRAPHICS_PIPELINE = RADV_CMD_DIRTY_PIPELINE,
-   RADV_CMD_DIRTY_RAY_TRACING_PIPELINE = RADV_CMD_DIRTY_PIPELINE,
 };
 
 /* Compile-time validation: ensure all dirty bits fit in uint64_t. */
@@ -206,22 +201,6 @@ struct radv_streamout_state {
 
    /* State of VGT_STRMOUT_(CONFIG|EN) */
    bool streamout_enabled;
-};
-
-struct radv_index_buffer_state {
-   uint32_t index_type;
-   uint32_t max_index_count;
-   uint64_t va;
-};
-
-struct radv_cond_render_state {
-   bool enabled;
-   uint8_t op;
-   int type;
-   uint64_t user_va;
-   uint64_t emulated_va;
-   uint64_t mec_inv_pred_va;
-   bool mec_inv_pred_emitted;
 };
 
 /**
@@ -385,15 +364,10 @@ struct radv_cmd_state {
 
    struct radv_meta_saved_state meta;
 
-   /* Index buffer (keep both new and legacy layouts in sync). */
-   union {
-      struct {
-         uint32_t index_type;
-         uint32_t max_index_count;
-         uint64_t index_va;
-      };
-      struct radv_index_buffer_state index_buffer;
-   };
+   /* Index buffer */
+   uint32_t index_type;
+   uint32_t max_index_count;
+   uint64_t index_va;
    int32_t last_index_type;
 
    /* Primitive restart */
@@ -428,18 +402,13 @@ struct radv_cmd_state {
    /* Whether any images that are not L2 coherent are dirty from the CB. */
    bool rb_noncoherent_dirty;
 
-   /* Conditional rendering info (keep both new and legacy layouts in sync). */
-   union {
-      struct {
-         uint8_t predication_op;           /* 32-bit or 64-bit predicate value */
-         int predication_type;             /* -1: disabled, 0: normal, 1: inverted */
-         uint64_t user_predication_va;     /* User predication VA. */
-         uint64_t emulated_predication_va; /* Emulated VA if no 32-bit predication support. */
-         uint64_t mec_inv_pred_va;         /* For inverted predication when using MEC. */
-         bool mec_inv_pred_emitted;        /* To ensure we don't have to repeat inverting the VA. */
-      };
-      struct radv_cond_render_state cond_render;
-   };
+   /* Conditional rendering info. */
+   uint8_t predication_op;           /* 32-bit or 64-bit predicate value */
+   int predication_type;             /* -1: disabled, 0: normal, 1: inverted */
+   uint64_t user_predication_va;     /* User predication VA. */
+   uint64_t emulated_predication_va; /* Emulated VA if no 32-bit predication support. */
+   uint64_t mec_inv_pred_va;         /* For inverted predication when using MEC. */
+   bool mec_inv_pred_emitted;        /* To ensure we don't have to repeat inverting the VA. */
    bool saved_user_cond_render;
    bool is_user_cond_render_suspended;
 
