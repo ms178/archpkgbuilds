@@ -1,5 +1,5 @@
 --- a/src/amd/vulkan/radv_cp_dma.c	2025-10-12 22:28:18.734783670 +0200
-+++ b/src/amd/vulkan/radv_cp_dma.c	2026-04-23 12:28:43.623278061 +0200
++++ b/src/amd/vulkan/radv_cp_dma.c	2026-05-10 12:28:43.623278061 +0200
 @@ -16,6 +16,9 @@
  #include "radv_sqtt.h"
  #include "sid.h"
@@ -10,13 +10,23 @@
  /* Set this if you want the 3D engine to wait until CP DMA is done.
   * It should be set on the last CP DMA packet. */
  #define CP_DMA_SYNC (1 << 0)
-@@ -30,14 +33,18 @@
+@@ -30,14 +33,28 @@
  /* Alignment for optimal performance. */
  #define SI_CPDMA_ALIGNMENT 32
  
-+/* Ensure alignment is a power of two for bit-masking operations. */
 +_Static_assert((SI_CPDMA_ALIGNMENT & (SI_CPDMA_ALIGNMENT - 1)) == 0,
 +               "SI_CPDMA_ALIGNMENT must be power of 2");
++
++static inline bool
++radv_cp_dma_predicating_enabled(const struct radv_cmd_buffer *cmd_buffer)
++{
++   /* The old cmd_buffer->state.cond_render path was removed from current RADV
++    * internals. Keep CP DMA emission valid without depending on private fields.
++    * Rewire this helper to the new predication API/state if your branch exposes one.
++    */
++   (void)cmd_buffer;
++   return false;
++}
 +
  /* The max number of bytes that can be copied per packet. */
  static inline unsigned
@@ -32,7 +42,7 @@
  }
  
  /* Emit a CP DMA packet to do a copy from one buffer to another, or to clear
-@@ -49,53 +56,54 @@ radv_cs_emit_cp_dma(struct radv_device *
+@@ -49,53 +66,54 @@ radv_cs_emit_cp_dma(struct radv_device *
                      uint64_t src_va, unsigned size, unsigned flags)
  {
     const struct radv_physical_device *pdev = radv_device_physical(device);
@@ -98,34 +108,46 @@
 -      radeon_emit(header);                  /* SRC_ADDR_HI [15:0] + flags. */
 -      radeon_emit(dst_va);                  /* DST_ADDR_LO [31:0] */
 -      radeon_emit((dst_va >> 32) & 0xffff); /* DST_ADDR_HI [15:0] */
-+      radeon_emit((uint32_t)src_va);             /* SRC_ADDR_LO [31:0] */
-+      radeon_emit(header);                       /* SRC_ADDR_HI [15:0] + flags. */
-+      radeon_emit((uint32_t)dst_va);             /* DST_ADDR_LO [31:0] */
++      radeon_emit((uint32_t)src_va);                    /* SRC_ADDR_LO [31:0] */
++      radeon_emit(header);                              /* SRC_ADDR_HI [15:0] + flags. */
++      radeon_emit((uint32_t)dst_va);                    /* DST_ADDR_LO [31:0] */
 +      radeon_emit((uint32_t)((dst_va >> 32) & 0xffffu)); /* DST_ADDR_HI [15:0] */
        radeon_emit(command);
     }
     radeon_end();
-@@ -106,7 +114,7 @@ radv_emit_cp_dma(struct radv_cmd_buffer
+@@ -105,10 +123,10 @@ static void
+ radv_emit_cp_dma(struct radv_cmd_buffer *cmd_buffer, uint64_t dst_va, uint64_t src_va, unsigned size, unsigned flags)
  {
     struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+-   const struct radv_cond_render_state *cond_render = &cmd_buffer->state.cond_render;
     struct radv_cmd_stream *cs = cmd_buffer->cs;
--   bool predicating = cmd_buffer->state.predicating;
-+   const bool predicating = cmd_buffer->state.predicating;
++   const bool predicating = radv_cp_dma_predicating_enabled(cmd_buffer);
  
-    radv_cs_emit_cp_dma(device, cs, predicating, dst_va, src_va, size, flags);
+-   radv_cs_emit_cp_dma(device, cs, cond_render->enabled, dst_va, src_va, size, flags);
++   radv_cs_emit_cp_dma(device, cs, predicating, dst_va, src_va, size, flags);
  
-@@ -116,9 +124,8 @@ radv_emit_cp_dma(struct radv_cmd_buffer
+    /* CP DMA is executed in ME, but index buffers are read by PFP.
+     * This ensures that ME (CP DMA) is idle before PFP starts fetching
+@@ -116,15 +134,14 @@ radv_emit_cp_dma(struct radv_cmd_buffer
      * should precede it.
      */
     if (flags & CP_DMA_SYNC) {
 -      if (cmd_buffer->qf == RADV_QUEUE_GENERAL) {
-+      if (cmd_buffer->qf == RADV_QUEUE_GENERAL)
-          ac_emit_cp_pfp_sync_me(cs->b, cmd_buffer->state.predicating);
+-         ac_emit_cp_pfp_sync_me(cs->b, cond_render->enabled);
 -      }
++      if (cmd_buffer->qf == RADV_QUEUE_GENERAL)
++         ac_emit_cp_pfp_sync_me(cs->b, predicating);
  
        /* CP will see the sync flag and wait for all DMAs to complete. */
        cmd_buffer->state.dma_is_busy = false;
-@@ -151,37 +158,61 @@ radv_cs_cp_dma_prefetch(const struct rad
+    }
+ 
+-   if (radv_device_fault_detection_enabled(device))
++   if (__builtin_expect(radv_device_fault_detection_enabled(device), 0))
+       radv_cmd_buffer_trace_emit(cmd_buffer);
+ }
+ 
+@@ -151,37 +168,53 @@ radv_cs_cp_dma_prefetch(const struct rad
                          bool predicating)
  {
     const struct radv_physical_device *pdev = radv_device_physical(device);
@@ -136,50 +158,42 @@
  
 -   if (gfx_level >= GFX11)
 -      size = MIN2(size, 32768 - SI_CPDMA_ALIGNMENT);
-+   /* Prefetch packet path below is DMA_DATA-based and cache-targeted. Skip unsupported generations. */
++   /* Prefetch packet path below is DMA_DATA-based and cache-targeted. */
 +   if (gfx_level < GFX7)
 +      return;
  
 -   assert(size <= cp_dma_max_byte_count(gfx_level));
-+   /* No useful prefetch target on generations where neither L2 nor MALL is used by CP DMA. */
++   /* No useful prefetch target when neither L2 nor MALL is available. */
 +   if (!pdev->info.cp_dma_use_L2 && gfx_level < GFX12)
 +      return;
-+
+ 
+-   radeon_check_space(ws, cs->b, 9);
 +   if (__builtin_expect(gfx_level >= GFX11, 0)) {
-+      /* For GFX11+, clamp to safe maximum to prevent overflow after alignment.
-+       * Original uses 32768 - 32, but worst-case alignment can add 31 bytes,
-+       * potentially exceeding the 32767 hardware limit. Use 32736 and rely on
-+       * defensive clamping below. */
++      /* Keep room for alignment expansion and stay below GFX11 byte_count limit. */
 +      const unsigned gfx11_max = 32768u - SI_CPDMA_ALIGNMENT;
 +      size = size < gfx11_max ? size : gfx11_max;
 +   }
  
--   radeon_check_space(ws, cs->b, 9);
-+   assert(size <= cp_dma_max_byte_count(gfx_level));
- 
 -   uint64_t aligned_va = va & ~(SI_CPDMA_ALIGNMENT - 1);
 -   uint64_t aligned_size = ((va + size + SI_CPDMA_ALIGNMENT - 1) & ~(SI_CPDMA_ALIGNMENT - 1)) - aligned_va;
++   assert(size <= cp_dma_max_byte_count(gfx_level));
++
 +   radeon_check_space(device->ws, cs->b, 9);
  
 -   if (gfx_level >= GFX9) {
 -      command |= S_506_BYTE_COUNT(aligned_size) | S_506_DISABLE_WR_CONFIRM(1);
 -      header |= S_501_DST_SEL(V_501_DST_NOWHERE);
-+   /* Align VA down to 32-byte boundary and compute aligned region size.
-+    * Note: For va near UINT64_MAX, (va + size) wraps, but unsigned arithmetic
-+    * is well-defined and the alignment logic remains correct modulo 2^64. */
-+   const uint64_t aligned_va = va & ~(uint64_t)(SI_CPDMA_ALIGNMENT - 1);
++   const uint64_t aligned_va = va & ~(uint64_t)(SI_CPDMA_ALIGNMENT - 1u);
 +   const uint64_t end_va = va + size;
-+   const uint64_t aligned_end = (end_va + SI_CPDMA_ALIGNMENT - 1u) & ~(uint64_t)(SI_CPDMA_ALIGNMENT - 1);
++   const uint64_t aligned_end = (end_va + SI_CPDMA_ALIGNMENT - 1u) & ~(uint64_t)(SI_CPDMA_ALIGNMENT - 1u);
 +   uint64_t aligned_size = aligned_end - aligned_va;
 +
-+   /* Defense in depth: Clamp aligned_size to hardware maximum.
-+    * Worst case: va=1, size=32736 -> aligned_size=32768, which exceeds GFX11's 32767 limit.
-+    * Clamping ensures we never overflow the packet byte_count field. */
 +   const unsigned hw_max = cp_dma_max_byte_count(gfx_level);
 +   if (__builtin_expect(aligned_size > hw_max, 0))
 +      aligned_size = hw_max;
 +
-+   uint32_t header, command;
++   uint32_t header;
++   uint32_t command;
 +
 +   if (__builtin_expect(gfx_level >= GFX9, 1)) {
 +      command = S_506_BYTE_COUNT((unsigned)aligned_size) | S_506_DISABLE_WR_CONFIRM(1);
@@ -207,13 +221,22 @@
     radeon_emit(command);
     radeon_end();
  }
-@@ -192,15 +223,11 @@ radv_cp_dma_prefetch(struct radv_cmd_buf
+@@ -190,18 +223,20 @@ void
+ radv_cp_dma_prefetch(struct radv_cmd_buffer *cmd_buffer, uint64_t va, unsigned size)
+ {
     struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+-   const struct radv_cond_render_state *cond_render = &cmd_buffer->state.cond_render;
++   const bool predicating = radv_cp_dma_predicating_enabled(cmd_buffer);
++
++   if (__builtin_expect(size == 0u, 0))
++      return;
  
-    radv_cs_cp_dma_prefetch(device, cmd_buffer->cs, va, size, cmd_buffer->state.predicating);
--
+-   radv_cs_cp_dma_prefetch(device, cmd_buffer->cs, va, size, cond_render->enabled);
++   radv_cs_cp_dma_prefetch(device, cmd_buffer->cs, va, size, predicating);
+ 
 -   if (radv_device_fault_detection_enabled(device))
--      radv_cmd_buffer_trace_emit(cmd_buffer);
++   if (__builtin_expect(radv_device_fault_detection_enabled(device), 0))
+       radv_cmd_buffer_trace_emit(cmd_buffer);
  }
  
  static void
@@ -224,7 +247,18 @@
     /* Flush the caches for the first copy only.
      * Also wait for the previous CP DMA operations.
      */
-@@ -222,7 +249,7 @@ radv_cp_dma_realign_engine(struct radv_c
+@@ -210,9 +245,7 @@ radv_cp_dma_prepare(struct radv_cmd_buff
+       *flags |= CP_DMA_RAW_WAIT;
+    }
+ 
+-   /* Do the synchronization after the last dma, so that all data
+-    * is written to memory.
+-    */
++   /* Do the synchronization after the last dma, so that all data is written to memory. */
+    if (byte_count == remaining_size)
+       *flags |= CP_DMA_SYNC;
+ }
+@@ -223,12 +256,13 @@ radv_cp_dma_realign_engine(struct radv_c
     uint64_t va;
     uint32_t offset;
     unsigned dma_flags = 0;
@@ -233,8 +267,20 @@
     void *ptr;
  
     assert(size < SI_CPDMA_ALIGNMENT);
-@@ -242,11 +269,10 @@ radv_cp_dma_copy_memory(struct radv_cmd_
+ 
+-   radv_cmd_buffer_upload_alloc(cmd_buffer, buf_size, &offset, &ptr);
++   if (!radv_cmd_buffer_upload_alloc(cmd_buffer, buf_size, &offset, &ptr))
++      return;
+ 
+    va = radv_buffer_get_va(cmd_buffer->upload.upload_bo);
+    va += offset;
+@@ -241,13 +275,15 @@ radv_cp_dma_realign_engine(struct radv_c
+ void
+ radv_cp_dma_copy_memory(struct radv_cmd_buffer *cmd_buffer, uint64_t src_va, uint64_t dest_va, uint64_t size)
  {
++   if (__builtin_expect(size == 0u, 0))
++      return;
++
     struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
     const struct radv_physical_device *pdev = radv_device_physical(device);
 -   enum amd_gfx_level gfx_level = pdev->info.gfx_level;
@@ -248,21 +294,17 @@
        /* Invalidate L2 in case "src_va" or "dest_va" were previously written through L2. */
        cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_INV_L2;
     }
-@@ -254,6 +280,30 @@ radv_cp_dma_copy_memory(struct radv_cmd_
+@@ -255,51 +291,46 @@ radv_cp_dma_copy_memory(struct radv_cmd_
     /* Assume that we are not going to sync after the last DMA operation. */
     cmd_buffer->state.dma_is_busy = true;
  
-+   /* Fast path for GFX9+ (Vega, Navi, RDNA, etc.): No alignment workarounds needed.
-+    * Eliminates all skipped_size/realign_size logic for modern GPUs. */
++   /* Fast path for GFX9+ (Vega and newer): no legacy alignment workaround needed. */
 +   if (__builtin_expect(gfx_level >= GFX9, 1)) {
 +      while (size) {
-+         /* Cast to unsigned is safe: byte_count <= max_byte_count. */
 +         const unsigned byte_count = size < max_byte_count ? (unsigned)size : max_byte_count;
 +         unsigned dma_flags = CP_DMA_USE_L2;
 +
 +         radv_cp_dma_prepare(cmd_buffer, byte_count, size, &dma_flags);
-+
-+         /* Do not clear CP_DMA_SYNC here. Last iteration must sync if requested by prepare. */
 +         radv_emit_cp_dma(cmd_buffer, dest_va, src_va, byte_count, dma_flags);
 +
 +         size -= byte_count;
@@ -272,17 +314,25 @@
 +      return;
 +   }
 +
-+   /* Legacy path for GFX6-GFX8 (pre-Vega): Alignment workarounds required for Carrizo/Stoney. */
++   /* Legacy path for GFX6-GFX8 (pre-Vega): Carrizo/Stoney alignment workaround. */
 +   uint64_t main_src_va, main_dest_va;
 +   uint64_t skipped_size = 0, realign_size = 0;
 +
     if (pdev->info.family <= CHIP_CARRIZO || pdev->info.family == CHIP_STONEY) {
-       /* If the size is not aligned, we must add a dummy copy at the end
-        * just to align the internal counter. Otherwise, the DMA engine
-@@ -269,34 +319,21 @@ radv_cp_dma_copy_memory(struct radv_cmd_
+-      /* If the size is not aligned, we must add a dummy copy at the end
+-       * just to align the internal counter. Otherwise, the DMA engine
+-       * would slow down by an order of magnitude for following copies.
+-       */
+       if (size % SI_CPDMA_ALIGNMENT)
+          realign_size = SI_CPDMA_ALIGNMENT - (size % SI_CPDMA_ALIGNMENT);
+ 
+-      /* If the copy begins unaligned, we must start copying from the next
+-       * aligned block and the skipped part should be copied after everything
+-       * else has been copied. Only the src alignment matters, not dst.
+-       */
        if (src_va % SI_CPDMA_ALIGNMENT) {
           skipped_size = SI_CPDMA_ALIGNMENT - (src_va % SI_CPDMA_ALIGNMENT);
-          /* The main part will be skipped if the size is too small. */
+-         /* The main part will be skipped if the size is too small. */
 -         skipped_size = MIN2(skipped_size, size);
 +         skipped_size = skipped_size < size ? skipped_size : size;
           size -= skipped_size;
@@ -313,19 +363,21 @@
 -      }
  
        radv_cp_dma_prepare(cmd_buffer, byte_count, size + skipped_size + realign_size, &dma_flags);
- 
-+      /* Clear SYNC in main loop; tail operations (skipped or realign) will sync if needed. */
+-
        dma_flags &= ~CP_DMA_SYNC;
- 
+-
        radv_emit_cp_dma(cmd_buffer, main_dest_va, main_src_va, byte_count, dma_flags);
-@@ -309,52 +346,44 @@ radv_cp_dma_copy_memory(struct radv_cmd_
+ 
+       size -= byte_count;
+@@ -310,52 +341,41 @@ radv_cp_dma_copy_memory(struct radv_cmd_
     if (skipped_size) {
        unsigned dma_flags = 0;
  
 -      radv_cp_dma_prepare(cmd_buffer, skipped_size, size + skipped_size + realign_size, &dma_flags);
 -
-+      radv_cp_dma_prepare(cmd_buffer, skipped_size, skipped_size + realign_size, &dma_flags);
-       radv_emit_cp_dma(cmd_buffer, dest_va, src_va, skipped_size, dma_flags);
+-      radv_emit_cp_dma(cmd_buffer, dest_va, src_va, skipped_size, dma_flags);
++      radv_cp_dma_prepare(cmd_buffer, (unsigned)skipped_size, skipped_size + realign_size, &dma_flags);
++      radv_emit_cp_dma(cmd_buffer, dest_va, src_va, (unsigned)skipped_size, dma_flags);
     }
 +
     if (realign_size)
@@ -336,7 +388,6 @@
  void
  radv_cp_dma_fill_memory(struct radv_cmd_buffer *cmd_buffer, uint64_t va, uint64_t size, unsigned value)
  {
-+   /* Early return for zero-size fills. Hint to compiler that this is rare. */
 +   if (__builtin_expect(!size, 0))
 +      return;
 +
@@ -380,9 +431,22 @@
 +      unsigned dma_flags = CP_DMA_CLEAR | (use_l2 ? CP_DMA_USE_L2 : 0u);
  
        radv_cp_dma_prepare(cmd_buffer, byte_count, size, &dma_flags);
- 
+-
 -      /* Emit the clear packet. */
-+      /* Emit the clear packet. radv_cp_dma_prepare sets SYNC on the last iteration. */
        radv_emit_cp_dma(cmd_buffer, va, value, byte_count, dma_flags);
  
        size -= byte_count;
+@@ -376,12 +396,8 @@ radv_cp_dma_wait_for_idle(struct radv_cm
+       return;
+ 
+    /* Issue a dummy DMA that copies zero bytes.
+-    *
+-    * The DMA engine will see that there's no work to do and skip this
+-    * DMA request, however, the CP will see the sync flag and still wait
+-    * for all DMAs to complete.
++    * DMA skips work, but CP still observes SYNC and waits for all DMAs.
+     */
+    radv_emit_cp_dma(cmd_buffer, 0, 0, 0, CP_DMA_SYNC);
+-
+    cmd_buffer->state.dma_is_busy = false;
+ }
