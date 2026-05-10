@@ -7,7 +7,9 @@
 # Prefer distro mingw toolchain over accidental PATH pollution (e.g. /opt/llvm-mingw).
 # For non-mingw tools, return the original name unchanged.
 resolve-mingw-tool = $(if $(findstring w64-mingw32,$(1)),$(if $(wildcard /usr/bin/$(1)),/usr/bin/$(1),$(1)),$(1))
-
+# Ensure host system toolchain precedence for prefixed tool lookups.
+# This prevents accidental pickup of /opt/llvm-mingw tools.
+SYSTEM_BIN := /usr/bin
 # Flags that are valid/beneficial for GCC builds but break or are noisy with clang.
 GCC_ONLY_CFLAGS = -fvect-cost-model=cheap -fipa-pta -Wl,--exclude-libs=libstdc++.a
 
@@ -132,13 +134,15 @@ $(2)_$(3)_ENV = \
     STRIP="$$(STRIP)" \
     AR="$$(call resolve-mingw-tool,$$($(3)-$(4)_TARGET)-ar)" \
     RANLIB="$$(call resolve-mingw-tool,$$($(3)-$(4)_TARGET)-ranlib)" \
+    NM="$$(call resolve-mingw-tool,$$($(3)-$(4)_TARGET)-nm)" \
+    AS="$$(call resolve-mingw-tool,$$($(3)-$(4)_TARGET)-as)" \
+    LD="$$(call resolve-mingw-tool,$$($(3)-$(4)_TARGET)-ld)" \
     CC="$$(call resolve-mingw-tool,$$($(3)-$(4)_TARGET)-gcc)" \
     CXX="$$(call resolve-mingw-tool,$$($(3)-$(4)_TARGET)-g++)" \
-    LD="$$(call resolve-mingw-tool,$$($(3)-$(4)_TARGET)-ld)" \
     RC="$$(call resolve-mingw-tool,$$($(3)-windows_TARGET)-windres)" \
     WIDL="$$(call resolve-mingw-tool,$$($(3)-windows_TARGET)-widl)" \
     PKG_CONFIG="$$($$(HOST_ARCH)-unix_TARGET)-pkg-config" \
-    PATH="$$(call list-join,:,$$(foreach d,$$($(2)_$(3)_HOST_DEPS),$$($$(d)_$$(HOST_ARCH)_BINDIR)),,:):$$$$PATH" \
+    PATH="$(SYSTEM_BIN):$$(call list-join,:,$$(foreach d,$$($(2)_$(3)_HOST_DEPS),$$($$(d)_$$(HOST_ARCH)_BINDIR))):$$$$PATH" \
     LD_LIBRARY_PATH="$$(call list-join,:,$$(foreach d,$$($(2)_$(3)_HOST_DEPS),$$($$(d)_$$(HOST_ARCH)_LIBDIR)/$$($$(HOST_ARCH)-unix_LIBDIR)),,:)$$$$LD_LIBRARY_PATH" \
     PKG_CONFIG_PATH="$$(call list-join,:,$$(foreach d,$$($(2)_$(3)_DEPS),$$($$(d)_$(3)_LIBDIR)/$$($(3)-$(4)_LIBDIR)/pkgconfig)):$$(call list-join,:,$$(foreach d,$$($(2)_$(3)_DEPS),$$($$(d)_$(3)_DST)/share/pkgconfig))" \
     PKG_CONFIG_LIBDIR="/usr/$$($(3)-$(4)_LIBDIR_ARCH)/pkgconfig:/usr/share/pkgconfig" \
@@ -163,6 +167,8 @@ $(2)_$(3)_ENV += \
     CROSSLDFLAGS="$$($(2)_$(3)-windows_LIBFLAGS) $$($(2)_$(3)_LIBFLAGS) $$($(2)_LDFLAGS) $$($(3)_LDFLAGS) $$(LDFLAGS)" \
     i386_AR="$$(call resolve-mingw-tool,$$(i386-windows_TARGET)-ar)" \
     i386_RANLIB="$$(call resolve-mingw-tool,$$(i386-windows_TARGET)-ranlib)" \
+    i386_NM="$$(call resolve-mingw-tool,$$(i386-windows_TARGET)-nm)" \
+    i386_AS="$$(call resolve-mingw-tool,$$(i386-windows_TARGET)-as)" \
     i386_CC="$$(call resolve-mingw-tool,$$(i386-windows_TARGET)-gcc)" \
     i386_CXX="$$(call resolve-mingw-tool,$$(i386-windows_TARGET)-g++)" \
     i386_LD="$$(call resolve-mingw-tool,$$(i386-windows_TARGET)-ld)" \
@@ -173,6 +179,8 @@ $(2)_$(3)_ENV += \
     i386_PKG_CONFIG_LIBDIR="/usr/lib32/pkgconfig:/usr/share/pkgconfig" \
     x86_64_AR="$$(call resolve-mingw-tool,$$(x86_64-windows_TARGET)-ar)" \
     x86_64_RANLIB="$$(call resolve-mingw-tool,$$(x86_64-windows_TARGET)-ranlib)" \
+    x86_64_NM="$$(call resolve-mingw-tool,$$(x86_64-windows_TARGET)-nm)" \
+    x86_64_AS="$$(call resolve-mingw-tool,$$(x86_64-windows_TARGET)-as)" \
     x86_64_CC="$$(call resolve-mingw-tool,$$(x86_64-windows_TARGET)-gcc)" \
     x86_64_CXX="$$(call resolve-mingw-tool,$$(x86_64-windows_TARGET)-g++)" \
     x86_64_LD="$$(call resolve-mingw-tool,$$(x86_64-windows_TARGET)-ld)" \
