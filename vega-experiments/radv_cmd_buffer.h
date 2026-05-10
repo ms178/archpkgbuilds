@@ -89,47 +89,52 @@ static_assert(RADV_DYNAMIC_SCISSOR_WITH_COUNT < (1ull << 63),
               "Dynamic state bits must fit in 64-bit storage");
 
 enum radv_cmd_dirty_bits {
-   RADV_CMD_DIRTY_PIPELINE = 1ull << 0,
-   RADV_CMD_DIRTY_INDEX_BUFFER = 1ull << 1,
-   RADV_CMD_DIRTY_VERTEX_BUFFER = 1ull << 2,
-   RADV_CMD_DIRTY_STREAMOUT_BUFFER = 1ull << 3,
-   RADV_CMD_DIRTY_GUARDBAND = 1ull << 4,
-   RADV_CMD_DIRTY_RBPLUS = 1ull << 5,
-   RADV_CMD_DIRTY_OCCLUSION_QUERY = 1ull << 6,
-   RADV_CMD_DIRTY_DB_SHADER_CONTROL = 1ull << 7,
-   RADV_CMD_DIRTY_STREAMOUT_ENABLE = 1ull << 8,
-   RADV_CMD_DIRTY_GRAPHICS_SHADERS = 1ull << 9,
-   RADV_CMD_DIRTY_FRAGMENT_OUTPUT = 1ull << 10,
-   RADV_CMD_DIRTY_PS_STATE = 1ull << 11,
-   RADV_CMD_DIRTY_NGG_STATE = 1ull << 12,
-   RADV_CMD_DIRTY_TASK_STATE = 1ull << 13,
-   RADV_CMD_DIRTY_DEPTH_STENCIL_STATE = 1ull << 14,
-   RADV_CMD_DIRTY_RASTER_STATE = 1ull << 15,
-   RADV_CMD_DIRTY_MSAA_STATE = 1ull << 16,
-   RADV_CMD_DIRTY_CLIP_RECTS_STATE = 1ull << 17,
-   RADV_CMD_DIRTY_TCS_TES_STATE = 1ull << 18,
-   RADV_CMD_DIRTY_CB_RENDER_STATE = 1ull << 19,
-   RADV_CMD_DIRTY_VIEWPORT_STATE = 1ull << 20,
-   RADV_CMD_DIRTY_BINNING_STATE = 1ull << 21,
-   RADV_CMD_DIRTY_FSR_STATE = 1ull << 22,
-   RADV_CMD_DIRTY_RAST_SAMPLES_STATE = 1ull << 23,
-   RADV_CMD_DIRTY_DEPTH_BIAS_STATE = 1ull << 24,
-   RADV_CMD_DIRTY_VS_PROLOG_STATE = 1ull << 25,
-   RADV_CMD_DIRTY_BLEND_CONSTANTS_STATE = 1ull << 26,
-   RADV_CMD_DIRTY_SAMPLE_LOCATIONS_STATE = 1ull << 27,
-   RADV_CMD_DIRTY_SCISSOR_STATE = 1ull << 28,
-   RADV_CMD_DIRTY_TESS_DOMAIN_ORIGIN_STATE = 1ull << 29,
-   RADV_CMD_DIRTY_LS_HS_CONFIG = 1ull << 30,
-   RADV_CMD_DIRTY_VGT_PRIM_STATE = 1ull << 31,
-   RADV_CMD_DIRTY_FORCE_VRS_STATE = 1ull << 32,
-   RADV_CMD_DIRTY_NGGC_VIEWPORT = 1ull << 33,
-   RADV_CMD_DIRTY_NGGC_SETTINGS = 1ull << 34,
-   RADV_CMD_DIRTY_PS_EPILOG_SHADER = 1ull << 35,
-   RADV_CMD_DIRTY_PS_EPILOG_STATE = 1ull << 36,
-   RADV_CMD_DIRTY_GFX12_HIZ_WA_STATE = 1ull << 37,
-   RADV_CMD_DIRTY_ALL = (1ull << 38) - 1,
+   RADV_CMD_DIRTY_GRAPHICS_PIPELINE = 1ull << 0,
+   RADV_CMD_DIRTY_COMPUTE_PIPELINE = 1ull << 1,
+   RADV_CMD_DIRTY_RAY_TRACING_PIPELINE = 1ull << 2,
+   RADV_CMD_DIRTY_INDEX_BUFFER = 1ull << 3,
+   RADV_CMD_DIRTY_VERTEX_BUFFER = 1ull << 4,
+   RADV_CMD_DIRTY_STREAMOUT_BUFFER = 1ull << 5,
+   RADV_CMD_DIRTY_GUARDBAND = 1ull << 6,
+   RADV_CMD_DIRTY_RBPLUS = 1ull << 7,
+   RADV_CMD_DIRTY_OCCLUSION_QUERY = 1ull << 8,
+   RADV_CMD_DIRTY_DB_SHADER_CONTROL = 1ull << 9,
+   RADV_CMD_DIRTY_STREAMOUT_ENABLE = 1ull << 10,
+   RADV_CMD_DIRTY_GRAPHICS_SHADERS = 1ull << 11,
+   RADV_CMD_DIRTY_FRAGMENT_OUTPUT = 1ull << 12,
+   RADV_CMD_DIRTY_PS_STATE = 1ull << 13,
+   RADV_CMD_DIRTY_NGG_STATE = 1ull << 14,
+   RADV_CMD_DIRTY_TASK_STATE = 1ull << 15,
+   RADV_CMD_DIRTY_DEPTH_STENCIL_STATE = 1ull << 16,
+   RADV_CMD_DIRTY_RASTER_STATE = 1ull << 17,
+   RADV_CMD_DIRTY_MSAA_STATE = 1ull << 18,
+   RADV_CMD_DIRTY_CLIP_RECTS_STATE = 1ull << 19,
+   RADV_CMD_DIRTY_TCS_TES_STATE = 1ull << 20,
+   RADV_CMD_DIRTY_CB_RENDER_STATE = 1ull << 21,
+   RADV_CMD_DIRTY_VIEWPORT_STATE = 1ull << 22,
+   RADV_CMD_DIRTY_BINNING_STATE = 1ull << 23,
+   RADV_CMD_DIRTY_FSR_STATE = 1ull << 24,
+   RADV_CMD_DIRTY_RAST_SAMPLES_STATE = 1ull << 25,
+   RADV_CMD_DIRTY_DEPTH_BIAS_STATE = 1ull << 26,
+   RADV_CMD_DIRTY_VS_PROLOG_STATE = 1ull << 27,
+   RADV_CMD_DIRTY_BLEND_CONSTANTS_STATE = 1ull << 28,
+   RADV_CMD_DIRTY_SAMPLE_LOCATIONS_STATE = 1ull << 29,
+   RADV_CMD_DIRTY_SCISSOR_STATE = 1ull << 30,
+   RADV_CMD_DIRTY_TESS_DOMAIN_ORIGIN_STATE = 1ull << 31,
+   RADV_CMD_DIRTY_LS_HS_CONFIG = 1ull << 32,
+   RADV_CMD_DIRTY_VGT_PRIM_STATE = 1ull << 33,
+   RADV_CMD_DIRTY_FORCE_VRS_STATE = 1ull << 34,
+   RADV_CMD_DIRTY_NGGC_VIEWPORT = 1ull << 35,
+   RADV_CMD_DIRTY_NGGC_SETTINGS = 1ull << 36,
+   RADV_CMD_DIRTY_PS_EPILOG_SHADER = 1ull << 37,
+   RADV_CMD_DIRTY_PS_EPILOG_STATE = 1ull << 38,
+   RADV_CMD_DIRTY_GFX12_HIZ_WA_STATE = 1ull << 39,
+   RADV_CMD_DIRTY_ALL = (1ull << 40) - 1,
 
    RADV_CMD_DIRTY_SHADER_QUERY = RADV_CMD_DIRTY_NGG_STATE | RADV_CMD_DIRTY_TASK_STATE,
+
+   /* Compatibility alias for older code paths. */
+   RADV_CMD_DIRTY_PIPELINE = RADV_CMD_DIRTY_GRAPHICS_PIPELINE,
 };
 
 /* Compile-time validation: ensure all dirty bits fit in uint64_t. */
@@ -201,6 +206,22 @@ struct radv_streamout_state {
 
    /* State of VGT_STRMOUT_(CONFIG|EN) */
    bool streamout_enabled;
+};
+
+struct radv_index_buffer_state {
+   uint32_t index_type;
+   uint32_t max_index_count;
+   uint64_t va;
+};
+
+struct radv_cond_render_state {
+   bool enabled;
+   uint8_t op;
+   int type;
+   uint64_t user_va;
+   uint64_t emulated_va;
+   uint64_t mec_inv_pred_va;
+   bool mec_inv_pred_emitted;
 };
 
 /**
@@ -364,10 +385,15 @@ struct radv_cmd_state {
 
    struct radv_meta_saved_state meta;
 
-   /* Index buffer */
-   uint32_t index_type;
-   uint32_t max_index_count;
-   uint64_t index_va;
+   /* Index buffer (keep both new and legacy layouts in sync). */
+   union {
+      struct {
+         uint32_t index_type;
+         uint32_t max_index_count;
+         uint64_t index_va;
+      };
+      struct radv_index_buffer_state index_buffer;
+   };
    int32_t last_index_type;
 
    /* Primitive restart */
@@ -402,13 +428,18 @@ struct radv_cmd_state {
    /* Whether any images that are not L2 coherent are dirty from the CB. */
    bool rb_noncoherent_dirty;
 
-   /* Conditional rendering info. */
-   uint8_t predication_op;           /* 32-bit or 64-bit predicate value */
-   int predication_type;             /* -1: disabled, 0: normal, 1: inverted */
-   uint64_t user_predication_va;     /* User predication VA. */
-   uint64_t emulated_predication_va; /* Emulated VA if no 32-bit predication support. */
-   uint64_t mec_inv_pred_va;         /* For inverted predication when using MEC. */
-   bool mec_inv_pred_emitted;        /* To ensure we don't have to repeat inverting the VA. */
+   /* Conditional rendering info (keep both new and legacy layouts in sync). */
+   union {
+      struct {
+         uint8_t predication_op;           /* 32-bit or 64-bit predicate value */
+         int predication_type;             /* -1: disabled, 0: normal, 1: inverted */
+         uint64_t user_predication_va;     /* User predication VA. */
+         uint64_t emulated_predication_va; /* Emulated VA if no 32-bit predication support. */
+         uint64_t mec_inv_pred_va;         /* For inverted predication when using MEC. */
+         bool mec_inv_pred_emitted;        /* To ensure we don't have to repeat inverting the VA. */
+      };
+      struct radv_cond_render_state cond_render;
+   };
    bool saved_user_cond_render;
    bool is_user_cond_render_suspended;
 
