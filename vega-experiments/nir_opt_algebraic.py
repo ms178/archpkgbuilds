@@ -309,6 +309,10 @@ optimizations += [
      ('fmulz', 'ma', 'mb'), has_fmulz), {'ma': a, 'mb': b}),
     *add_fabs_fneg((('fmul@32(nsz)', ('bcsel', ('fneu', b, 0.0), 'ma', 0.0), ('bcsel', ('fneu', a, 0.0), 'mb', 0.0)),
      ('fmulz', 'ma', 'mb'), has_fmulz), {'ma': a, 'mb': b}),
+    *add_fabs_fneg((('fmul@32(nsz)', ('b2f', ('iand', ('fneu', a, 0.0), b)), ('bcsel', b, 'ma', 0.0)),
+     ('fmulz', 'ma', ('b2f', b)), has_fmulz), {'ma' : a}),
+    *add_fabs_fneg((('fmul@32(nsz)', ('b2f', ('inot', ('ior', ('feq', a, 0.0), b))), ('bcsel', b, 0.0, 'ma')),
+     ('fmulz', 'ma', ('b2f', ('inot', b))), has_fmulz), {'ma' : a}),
 
     *add_fabs_fneg((('bcsel', ('feq', ('fmin', ('fabs', a), ('fabs', b)), 0.0), 0.0, ('fmul@32', 'ma', 'mb')),
      ('fmulz', 'ma', 'mb'), has_fmulz), {'ma': a, 'mb': b}),
@@ -320,6 +324,11 @@ optimizations += [
      ('ffmaz', 'ma', 'mb', c), has_fmulz), {'ma': a, 'mb': b}),
     *add_fabs_fneg((('ffma@32(nsz)', 'ma', ('bcsel', ('feq', a, 0.0), 0.0, '#b(is_not_const_zero)'), c),
      ('ffmaz', 'ma', b, c), has_fmulz), {'ma': a}),
+
+    *add_fabs_fneg((('ffma@32(nsz)', ('b2f', ('iand', ('fneu', a, 0.0), b)), ('bcsel', b, 'ma', 0.0), c),
+     ('ffmaz', 'ma', ('b2f', b), c), has_fmulz), {'ma' : a}),
+    *add_fabs_fneg((('ffma@32(nsz)', ('b2f', ('inot', ('ior', ('feq', a, 0.0), b))), ('bcsel', b, 0.0, 'ma'), c),
+     ('ffmaz', 'ma', ('b2f', ('inot', b)), c), has_fmulz), {'ma' : a}),
 
     *add_fabs_fneg((('bcsel(nsz,nnan,ninf)', ('feq', b, 0.0), 1.0, ('fexp2', ('fmul@32', a, 'mb'))),
      ('fexp2', ('fmulz', a, 'mb')),
@@ -672,6 +681,10 @@ optimizations.extend([
    (('bcsel(is_only_used_as_float_nsz)', ('fneu', a, 0.0), a, 0.0), a),
    (('bcsel(is_only_used_as_float_nsz)', ('feq', a, 0.0), -0.0, a),  a),
    (('bcsel(is_only_used_as_float_nsz)', ('fneu', a, 0.0), a, -0.0), a),
+   (('bcsel(is_only_used_as_float_nsz)', ('ior',  ('feq', a, 0.0),  b), 0.0, a), ('bcsel', b, 0, a)),
+   (('bcsel(is_only_used_as_float_nsz)', ('iand', ('fneu', a, 0.0), b), a, 0.0), ('bcsel', b, a, 0)),
+   (('bcsel(is_only_used_as_float_nsz)', ('ior',  ('feq', a, 0.0),  b), -0.0, a), ('bcsel', b, 0, a)),
+   (('bcsel(is_only_used_as_float_nsz)', ('iand', ('fneu', a, 0.0), b), a, -0.0), ('bcsel', b, a, 0)),
    (('bcsel', ('feq', a, 0), 0, ('fsat', ('fmul', a, 'b(is_a_number)'))), ('fsat(preserve_sz)', ('fmul', a, b))),
    (('bcsel', ('fneu', a, 0), ('fsat', ('fmul', a, 'b(is_a_number)')), 0), ('fsat(preserve_sz)', ('fmul', a, b))),
    (('bcsel', ('feq', a, 0), 0, ('fsat', ('fmul_rtz', a, 'b(is_a_number)'))), ('fsat(preserve_sz)', ('fmul_rtz', a, b))),
@@ -2002,12 +2015,6 @@ optimizations.extend([
    (('ior', ('bcsel', ('ine', ('iand', a, 0x00800000), 0), ~0xff, 0), ('extract_u8', a, 2)), ('extract_i8', a, 2)),
    (('ior', ('bcsel', ('ilt',          'a@32',         0), ~0xff, 0), ('extract_u8', a, 3)), ('extract_i8', a, 3)),
 
-   (('extract_i8', ('ushr', a, 8), 0), ('extract_i8', a, 1)),
-   (('extract_i8', ('ushr', a, 8), 1), ('extract_i8', a, 2)),
-   (('extract_i8', ('ushr', a, 8), 2), ('extract_i8', a, 3)),
-   (('extract_u8', ('ushr', a, 8), 0), ('extract_u8', a, 1)),
-   (('extract_u8', ('ushr', a, 8), 1), ('extract_u8', a, 2)),
-   (('extract_u8', ('ushr', a, 8), 2), ('extract_u8', a, 3)),
    (('extract_u8', ('ushr', 'a@32', 16), 0), ('extract_u8', a, 2)),
    (('extract_u8', ('ushr', 'a@32', 16), 1), ('extract_u8', a, 3)),
    (('extract_u16', ('ushr', 'a@64', 32), 0), ('extract_u16', a, 2)),
@@ -2078,6 +2085,15 @@ optimizations.extend([
 
    (('extract_u16', ('extract_i16', a, b), 0), ('extract_u16', a, b)),
    (('extract_u16', ('extract_u16', a, b), 0), ('extract_u16', a, b)),
+
+   (('u2u32', ('u2u8', 'a@32')), ('extract_u8', a, 0), '!options->lower_extract_byte'),
+   (('u2u32', ('i2i8', 'a@32')), ('extract_u8', a, 0), '!options->lower_extract_byte'),
+   (('i2i32', ('i2i8', 'a@32')), ('extract_i8', a, 0), '!options->lower_extract_byte'),
+   (('i2i32', ('u2u8', 'a@32')), ('extract_i8', a, 0), '!options->lower_extract_byte'),
+   (('u2u32', ('u2u16', 'a@32')), ('extract_u16', a, 0), '!options->lower_extract_word'),
+   (('u2u32', ('i2i16', 'a@32')), ('extract_u16', a, 0), '!options->lower_extract_word'),
+   (('i2i32', ('i2i16', 'a@32')), ('extract_i16', a, 0), '!options->lower_extract_word'),
+   (('i2i32', ('u2u16', 'a@32')), ('extract_i16', a, 0), '!options->lower_extract_word'),
 
    (('extract_i16', ('iand', a, 0x00ff0000), 1), ('extract_u8', a, 2), '!options->lower_extract_byte'),
    (('extract_u16', ('iand', a, 0x00ff0000), 1), ('extract_u8', a, 2), '!options->lower_extract_byte'),
@@ -2172,16 +2188,11 @@ optimizations.extend([
    (('u2u16', ('ushr', ('ior', ('ishl', a, 16), ('u2u32', 'b@16')), 16)), ('u2u16', a)),
 ])
 
-for op in ('ushr', 'ishr'):
-    optimizations.extend([
-        (('extract_u8', (op, 'a@16', 8), 0), ('extract_u8', a, 1)),
-    ])
-    optimizations.extend([
-        (('extract_u8', (op, 'a@32', 8 * i), 0), ('extract_u8', a, i)) for i in range(1, 4)
-    ])
-    optimizations.extend([
-        (('extract_u8', (op, 'a@64', 8 * i), 0), ('extract_u8', a, i)) for i in range(1, 8)
-    ])
+for extract_op in ('extract_u8', 'extract_i8'):
+   for op in ('ushr', 'ishr'):
+      optimizations.extend([((extract_op, (op, a, 8), i), (extract_op, a, i + 1)) for i in range (0, 3)])
+      optimizations.extend([((extract_op, (op, 'a@32',  8 * i), 0), (extract_op, a, i)) for i in range(2, 4)])
+      optimizations.extend([((extract_op, (op, 'a@64',  8 * i), 0), (extract_op, a, i)) for i in range(2, 8)])
 
 optimizations.extend([
     (('extract_u8', ('extract_u16', a, 1), 0), ('extract_u8', a, 2)),
@@ -4100,6 +4111,21 @@ before_lower_int64_optimizations = [
     (('iadd', ('u2u64', a), ('u2u64', a)), ('ishl', ('u2u64', a), 1)),
 ]
 
+reassoc_fma_optimizations = [
+    (('~fadd', ('fadd(is_used_once)', 'a(is_fmul)', ('fadd(is_used_once)', 'b(is_fmul)', ('fadd(is_used_once)', 'c(is_fmul)', 'd(is_fmul)'))), 'e(is_not_fmul)'),
+     ('fadd', a, ('fadd', b, ('fadd', c, ('fadd', d, e))))),
+    (('~fadd', ('fadd(is_used_once)', 'a(is_fmul)', ('fadd(is_used_once)', 'b(is_fmul)', 'c(is_fmul)')), 'd(is_not_fmul)'),
+     ('fadd', a, ('fadd', b, ('fadd', c, d)))),
+    (('~fadd', ('fadd(is_used_once)', 'a(is_fmul)', 'b(is_fmul)'), 'c(is_not_fmul)'),
+     ('fadd', a, ('fadd', b, c))),
+
+    (('~fadd', ('fneg(is_used_once)', ('fadd(is_used_once)', 'a(is_fmul)', ('fadd(is_used_once)', 'b(is_fmul)', ('fadd(is_used_once)', 'c(is_fmul)', 'd(is_fmul)')))), 'e(is_not_fmul)'),
+     ('fadd', ('fneg', a), ('fneg', ('fadd', b, ('fadd', c, ('fadd', d, ('fneg', e))))))),
+    (('~fadd', ('fneg(is_used_once)', ('fadd(is_used_once)', 'a(is_fmul)', ('fadd(is_used_once)', 'b(is_fmul)', 'c(is_fmul)'))), 'd(is_not_fmul)'),
+     ('fadd', ('fneg', a), ('fneg', ('fadd', b, ('fadd', c, ('fneg', d)))))),
+    (('~fadd', ('fneg(is_used_once)', ('fadd(is_used_once)', 'a(is_fmul)', 'b(is_fmul)')), 'c(is_not_fmul)'),
+     ('fadd', ('fneg', a), ('fadd', ('fneg', b), c))),
+]
 
 integer_promotion_optimizations = []
 for s in (8, 16):
@@ -4167,6 +4193,12 @@ passes = [
         build_tests=build_tests,
     ),
 ]
+
+passes.append(nir_algebraic.AlgebraicPass(
+    "nir_opt_reassociate_for_fma",
+    reassoc_fma_optimizations,
+    build_tests=build_tests
+))
 
 if build_tests:
     with open(args.out_tests, "w", encoding="utf-8") as f:
