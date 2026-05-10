@@ -8,6 +8,9 @@
 # For non-mingw tools, return the original name unchanged.
 resolve-mingw-tool = $(if $(findstring w64-mingw32,$(1)),$(if $(wildcard /usr/bin/$(1)),/usr/bin/$(1),$(1)),$(1))
 
+# Flags that are valid/beneficial for GCC builds but break or are noisy with clang.
+GCC_ONLY_CFLAGS = -fvect-cost-model=cheap -fipa-pta -Wl,--exclude-libs=libstdc++.a
+
 define create-rules-common
 ifneq ($$(findstring $(3)-$(4),$$(ARCHS)),)
 $(2)_$(3)_OBJ := $$(OBJ)/obj-$(1)-$(3)
@@ -68,14 +71,14 @@ $$(OBJ)/.$(1)-$(3)-dist:
 ifneq ($(UNSTRIPPED_BUILD),)
 	cd $$($(2)_$(3)_LIBDIR) && find -type f -not '(' -iname '*.pc' -or -iname '*.cmake' -or -iname '*.a' -or -iname '*.la' -or -iname '*.def' -or -iname '*.h' ')' -print0 | \
 	    xargs $(--verbose?) -0 -r -P$$(J) -n1 sh -ec ' \
-		f="$$1"; \
-		dst="$$(DST_LIBDIR)/$$f"; \
-		if $(OBJCOPY) $(OBJCOPY_FLAGS) --only-keep-debug "$$f" "$$dst.debug" >/dev/null 2>&1 && \
-		   $(OBJCOPY) $(OBJCOPY_FLAGS) --add-gnu-debuglink="$$dst.debug" --strip-debug --set-section-flags .text=contents,alloc,load,readonly,code "$$f" "$$dst" >/dev/null 2>&1; then \
+		f="$$$$1"; \
+		dst="$$(DST_LIBDIR)/$$$$f"; \
+		if $(OBJCOPY) $(OBJCOPY_FLAGS) --only-keep-debug "$$$$f" "$$$$dst.debug" >/dev/null 2>&1 && \
+		   $(OBJCOPY) $(OBJCOPY_FLAGS) --add-gnu-debuglink="$$$$dst.debug" --strip-debug --set-section-flags .text=contents,alloc,load,readonly,code "$$$$f" "$$$$dst" >/dev/null 2>&1; then \
 			:; \
 		else \
-			cp -a "$$f" "$$dst"; \
-			rm -f "$$dst.debug"; \
+			cp -a "$$$$f" "$$$$dst"; \
+			rm -f "$$$$dst.debug"; \
 		fi' sh
 	touch $$@
 else
@@ -83,12 +86,12 @@ else
 	    -printf '$$(DST_LIBDIR)/%p.debug\0' | xargs $(--verbose?) -0 -r -P$$(J) rm -f
 	cd $$($(2)_$(3)_LIBDIR) && find -type f -not '(' -iname '*.pc' -or -iname '*.cmake' -or -iname '*.a' -or -iname '*.la' -or -iname '*.def' -or -iname '*.h' ')' -print0 | \
 	    xargs $(--verbose?) -0 -r -P$$(J) -n1 sh -ec ' \
-		f="$$1"; \
-		dst="$$(DST_LIBDIR)/$$f"; \
-		if $(OBJCOPY) $(OBJCOPY_FLAGS) --strip-debug --set-section-flags .text=contents,alloc,load,readonly,code "$$f" "$$dst" >/dev/null 2>&1; then \
+		f="$$$$1"; \
+		dst="$$(DST_LIBDIR)/$$$$f"; \
+		if $(OBJCOPY) $(OBJCOPY_FLAGS) --strip-debug --set-section-flags .text=contents,alloc,load,readonly,code "$$$$f" "$$$$dst" >/dev/null 2>&1; then \
 			:; \
 		else \
-			cp -a "$$f" "$$dst"; \
+			cp -a "$$$$f" "$$$$dst"; \
 		fi' sh
 	touch $$@
 endif
@@ -140,9 +143,9 @@ $(2)_$(3)_ENV = \
     PKG_CONFIG_PATH="$$(call list-join,:,$$(foreach d,$$($(2)_$(3)_DEPS),$$($$(d)_$(3)_LIBDIR)/$$($(3)-$(4)_LIBDIR)/pkgconfig)):$$(call list-join,:,$$(foreach d,$$($(2)_$(3)_DEPS),$$($$(d)_$(3)_DST)/share/pkgconfig))" \
     PKG_CONFIG_LIBDIR="/usr/$$($(3)-$(4)_LIBDIR_ARCH)/pkgconfig:/usr/share/pkgconfig" \
     CMAKE_PREFIX_PATH="$$(call list-join,:,$$(foreach d,$$($(2)_$(3)_DEPS),$$($$(d)_$(3)_DST)))" \
-    CFLAGS="$$($(2)_$(3)_INCFLAGS) $$($(2)_CFLAGS) $$($(3)_CFLAGS) $$(CFLAGS) $$($(2)_$(3)_CFLAGS)" \
-    CPPFLAGS="$$($(2)_$(3)_INCFLAGS) $$($(2)_CFLAGS) $$($(3)_CFLAGS) $$(CFLAGS) $$($(2)_$(3)_CFLAGS)" \
-    CXXFLAGS="$$($(2)_$(3)_INCFLAGS) -std=c++17 $$($(2)_CFLAGS) $$($(3)_CFLAGS) $$(CFLAGS) $$($(2)_$(3)_CFLAGS)" \
+    CFLAGS="$$($(2)_$(3)_INCFLAGS) $$(if $$(filter 1 yes true,$$($(2)_USE_CLANG)),$$(filter-out $$(GCC_ONLY_CFLAGS),$$($(2)_CFLAGS) $$($(3)_CFLAGS) $$(CFLAGS) $$($(2)_$(3)_CFLAGS)),$$($(2)_CFLAGS) $$($(3)_CFLAGS) $$(CFLAGS) $$($(2)_$(3)_CFLAGS))" \
+    CPPFLAGS="$$($(2)_$(3)_INCFLAGS) $$(if $$(filter 1 yes true,$$($(2)_USE_CLANG)),$$(filter-out $$(GCC_ONLY_CFLAGS),$$($(2)_CFLAGS) $$($(3)_CFLAGS) $$(CFLAGS) $$($(2)_$(3)_CFLAGS)),$$($(2)_CFLAGS) $$($(3)_CFLAGS) $$(CFLAGS) $$($(2)_$(3)_CFLAGS))" \
+    CXXFLAGS="$$($(2)_$(3)_INCFLAGS) -std=c++17 $$(if $$(filter 1 yes true,$$($(2)_USE_CLANG)),$$(filter-out $$(GCC_ONLY_CFLAGS),$$($(2)_CFLAGS) $$($(3)_CFLAGS) $$(CFLAGS) $$($(2)_$(3)_CFLAGS)),$$($(2)_CFLAGS) $$($(3)_CFLAGS) $$(CFLAGS) $$($(2)_$(3)_CFLAGS))" \
     LDFLAGS="$$($(2)_$(3)-$(4)_LIBFLAGS) $$($(2)_$(3)_LIBFLAGS) $$($(2)_LDFLAGS) $$($(3)_LDFLAGS) $$(LDFLAGS)" \
     SOURCE_DATE_EPOCH="$$($(2)_$(3)_SOURCE_DATE_EPOCH)" \
 
