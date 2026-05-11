@@ -15,7 +15,6 @@
 #include <QPointer>
 
 #include <array>
-#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -52,12 +51,22 @@ public:
 
         [[nodiscard]] constexpr uint8_t toRaw() const noexcept
         {
-            return std::bit_cast<uint8_t>(*this);
+            const uint8_t h = static_cast<uint8_t>(hint & 0x3U);
+            const uint8_t on = static_cast<uint8_t>((isOnOutput != 0U) ? 1U : 0U);
+            const uint8_t fs = static_cast<uint8_t>((isFullScreen != 0U) ? 1U : 0U);
+            const uint8_t v = static_cast<uint8_t>((valid != 0U) ? 1U : 0U);
+            return static_cast<uint8_t>(h | (on << 2) | (fs << 3) | (v << 4));
         }
 
         [[nodiscard]] static constexpr State fromRaw(uint8_t raw) noexcept
         {
-            return std::bit_cast<State>(raw);
+            State s;
+            s.hint = static_cast<uint8_t>(raw & 0x3U);
+            s.isOnOutput = static_cast<uint8_t>((raw >> 2) & 0x1U);
+            s.isFullScreen = static_cast<uint8_t>((raw >> 3) & 0x1U);
+            s.valid = static_cast<uint8_t>((raw >> 4) & 0x1U);
+            s.reserved = 0U;
+            return s;
         }
     };
 

@@ -75,6 +75,32 @@ constexpr int64_t kStalledFrameExtraTimeoutNs = 2'000'000;
 constexpr uint8_t kStalledFrameRecoveryThreshold = 2;
 constexpr int64_t kStalledFrameVblankMultiplier = 3;
 
+constexpr int64_t kMinDynamicJitterNs = 50'000;
+constexpr int64_t kMinSameMsGuardNs = 100'000;
+constexpr int64_t kMaxSameMsGuardNs = 900'000;
+
+[[gnu::always_inline, gnu::const]]
+inline constexpr int64_t dynamicRescheduleJitterNs(int64_t vblankNs) noexcept
+{
+    const int64_t scaled = vblankNs / 24;
+    return std::clamp(scaled, kMinDynamicJitterNs, kTimerJitterFilterNs);
+}
+
+[[gnu::always_inline, gnu::const]]
+inline constexpr int64_t dynamicSameMsGuardNs(int64_t vblankNs) noexcept
+{
+    const int64_t scaled = vblankNs / 8;
+    return std::clamp(scaled, kMinSameMsGuardNs, kMaxSameMsGuardNs);
+}
+
+[[gnu::always_inline]]
+inline int adaptiveErrorBackoffMaxMs(int64_t vblankNs) noexcept
+{
+    const int64_t vblankMs = std::clamp<int64_t>((vblankNs + kNsPerMs - 1) / kNsPerMs, 1LL, 16LL);
+    const int64_t adaptive = std::clamp<int64_t>(vblankMs * 2, 4LL, static_cast<int64_t>(kMaxErrorBackoffMs));
+    return static_cast<int>(adaptive);
+}
+
 [[nodiscard]]
 inline KWin::SurfaceInterface *resolvePresentationSurface(KWin::Window* window) noexcept
 {
@@ -775,9 +801,8 @@ void RenderLoopPrivate::updatePresentationCadence(int64_t intervalNs) noexcept
     }
 
     const int64_t prev = lastIntervalNs_;
-    lastIntervalNs_ = intervalNs;
-
     if (prev < kMinReasonableIntervalNs) [[unlikely]] {
+        lastIntervalNs_ = intervalNs;
         return;
     }
 
@@ -785,6 +810,8 @@ void RenderLoopPrivate::updatePresentationCadence(int64_t intervalNs) noexcept
     const int64_t lo = std::max<int64_t>(prev - maxStepNs, kMinReasonableIntervalNs);
     const int64_t hi = std::min<int64_t>(prev + maxStepNs, kMaxReasonableIntervalNs);
     const int64_t filtered = std::clamp(intervalNs, lo, hi);
+
+    lastIntervalNs_ = filtered;
 
     const int64_t rawDiff = fastAbs64(filtered - prev);
     const int64_t diff = rawDiff > kCadenceNoiseFloorNs ? (rawDiff - kCadenceNoiseFloorNs) : 0LL;
@@ -1057,7 +1084,7 @@ void RenderLoopPrivate::scheduleRepaint()
     }
 
     const int64_t stabilityBonus = (static_cast<int64_t>(cadenceStability_) * kRenderSlackNs) >> 9;
-    const int64_t effectiveSlack = kRenderSlackNs - stabilityBonus;
+    const int64_t effectiveSlack = std::max<int64_t>(kRenderSlackNs - stabilityBonus, 0LL);
     const int64_t compositeNs = std::clamp(
         predNs + safetyMargin.count() + effectiveSlack,
         kMinCompositeNs,
@@ -1140,13 +1167,18 @@ void RenderLoopPrivate::scheduleRepaint()
     if (compositeTimer.isActive()) {
         const int64_t scheduledNs = scheduledRenderTimestamp.count();
         const int64_t absDiffNs = fastAbs64(nextRenderNs - scheduledNs);
+        const bool earlier = nextRenderNs < scheduledNs;
 
-        if (absDiffNs < kTimerJitterFilterNs) {
+        const int64_t jitterFilterNs = dynamicRescheduleJitterNs(vblankI64);
+        if (!earlier && absDiffNs < jitterFilterNs) {
             return;
         }
 
-        if (scheduledTimerMs >= 0 && timerMs == scheduledTimerMs && absDiffNs < kNsPerMs) {
-            return;
+        if (scheduledTimerMs >= 0 && timerMs == scheduledTimerMs) {
+            const int64_t sameMsGuardNs = dynamicSameMsGuardNs(vblankI64);
+            if (!earlier && absDiffNs < sameMsGuardNs) {
+                return;
+            }
         }
     }
 
@@ -1190,9 +1222,11 @@ void RenderLoopPrivate::notifyFrameDropped()
     if (inhibitCount == 0 && pendingReschedule) {
         if (consecutiveErrorCount > kMaxConsecutiveErrors) {
             int delay = 1 << std::min<int>(consecutiveErrorCount - kMaxConsecutiveErrors, 6);
-            delay = std::min(delay, kMaxErrorBackoffMs);
+            delay = std::min(delay, adaptiveErrorBackoffMaxMs(static_cast<int64_t>(cachedVblankIntervalNs)));
             compositeTimer.start(delay, Qt::PreciseTimer, q);
             scheduledTimerMs = static_cast<int16_t>(delay);
+            scheduledRenderTimestamp = std::chrono::nanoseconds{
+                steadyNowNs() + static_cast<int64_t>(delay) * kNsPerMs};
         } else {
             scheduleNextRepaint();
         }
