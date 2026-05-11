@@ -388,34 +388,39 @@ public:
         Region.setEndLoc(*NonScratchExpansionLoc.second);
       }
 
-      if (!SystemHeadersCoverage && SM.isInSystemMacro(Loc)) {
-        const SourceLocation BeginLoc = SM.getSpellingLoc(Loc);
-        const SourceLocation EndLoc = SM.getSpellingLoc(Region.getEndLoc());
-        if (SM.isWrittenInSameFile(BeginLoc, EndLoc)) {
-          Loc = SM.getFileLoc(Loc);
-          Region.setStartLoc(Loc);
-          Region.setEndLoc(SM.getFileLoc(Region.getEndLoc()));
+      // For regions whose spelling is in a system header, remap macro tokens to
+      // their user-code call site so coverage is attributed to the user
+      // expression. Drop anything still in a system header (e.g. a plain FileID
+      // into a -isystem .def file).
+      if (!SystemHeadersCoverage && SM.isInSystemHeader(SM.getSpellingLoc(Loc))) {
+        if (Loc.isMacroID()) {
+          const SourceLocation BeginLoc = SM.getSpellingLoc(Loc);
+          const SourceLocation EndLoc = SM.getSpellingLoc(Region.getEndLoc());
+          if (SM.isWrittenInSameFile(BeginLoc, EndLoc)) {
+            Loc = SM.getFileLoc(Loc);
+            Region.setStartLoc(Loc);
+            Region.setEndLoc(SM.getFileLoc(Region.getEndLoc()));
+          }
         }
+        if (SM.isInSystemHeader(SM.getSpellingLoc(Loc)))
+          continue;
       }
 
       const FileID File = SM.getFileID(Loc);
       if (!Visited.insert(File).second)
         continue;
 
-      assert(SystemHeadersCoverage || !SM.isInSystemHeader(SM.getSpellingLoc(Loc)));
-
       unsigned Depth = 0;
-      for (SourceLocation Parent = getIncludeOrExpansionLoc(Loc); Parent.isValid();
-          Parent = getIncludeOrExpansionLoc(Parent)) {
+      for (SourceLocation Parent = getIncludeOrExpansionLoc(Loc);
+          Parent.isValid(); Parent = getIncludeOrExpansionLoc(Parent))
         ++Depth;
-      }
 
       FileLocs.emplace_back(Loc, Depth);
     }
 
     llvm::stable_sort(FileLocs, llvm::less_second());
-    Mapping.reserve(Mapping.size() + FileLocs.size());
 
+    Mapping.reserve(Mapping.size() + FileLocs.size());
     for (const auto &FL : FileLocs) {
       const SourceLocation Loc = FL.first;
       const FileID SpellingFile = SM.getDecomposedSpellingLoc(Loc).first;
