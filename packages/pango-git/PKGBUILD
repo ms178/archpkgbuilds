@@ -4,17 +4,186 @@
 
 pkgbase=pango-git
 pkgname=(pango-git)
-pkgver=1.50.10
-pkgrel=2.1
+pkgver=1.57.1.r5.g81750aec
+pkgrel=2
 epoch=1
 pkgdesc="A library for layout and rendering of text"
 url="https://www.pango.org/"
 arch=(x86_64)
 license=(LGPL)
 depends=(cairo libxft harfbuzz fribidi libthai)
-makedepends=(gobject-introspection help2man git meson gi-docgen)
+makedepends=(gobject-introspection help2man git meson gi-docgen clang llvm lld)
 source=("git+https://gitlab.gnome.org/GNOME/pango.git")
 sha256sums=('SKIP')
+
+_setup_llvm_toolchain() {
+  export CC=clang
+  export CXX=clang++
+  export AR=llvm-ar
+  export NM=llvm-nm
+  export RANLIB=llvm-ranlib
+  export STRIP=llvm-strip
+}
+
+_meson_array_from_flags() {
+  local flags="$1"
+  local -a arr
+  local out='['
+  local f
+
+  read -r -a arr <<< "$flags"
+  for f in "${arr[@]}"; do
+    f=${f//\\/\\\\}
+    f=${f//\'/\'"\'"\'}
+    out+="'${f}',"
+  done
+
+  out=${out%,}
+  out+=']'
+  printf '%s\n' "$out"
+}
+
+_merge_profraw_dir() {
+  local out="$1"
+  local dir="$2"
+  local -a files chunk parts
+  local idx=0 chunk_idx=0
+  local tmpdir="${dir}/.merge_tmp"
+
+  rm -rf "$tmpdir"
+  mkdir -p "$tmpdir"
+
+  shopt -s nullglob
+  files=("$dir"/*.profraw)
+  shopt -u nullglob
+  (( ${#files[@]} > 0 )) || return 1
+
+  while (( idx < ${#files[@]} )); do
+    chunk=("${files[@]:idx:400}")
+    llvm-profdata merge -sparse -output="${tmpdir}/part-${chunk_idx}.profdata" "${chunk[@]}"
+    ((idx += 400, chunk_idx++))
+  done
+
+  shopt -s nullglob
+  parts=("${tmpdir}"/*.profdata)
+  shopt -u nullglob
+  (( ${#parts[@]} > 0 )) || return 1
+
+  llvm-profdata merge -sparse -output="$out" "${parts[@]}"
+}
+
+_stage_configure_build() {
+  local builddir="$1"
+  local extra_cflags="$2"
+  local extra_cxxflags="$3"
+  local extra_ldflags="$4"
+
+  local c_args cpp_args c_link_args cpp_link_args
+  c_args="$(_meson_array_from_flags "${_base_cflags} ${extra_cflags}")"
+  cpp_args="$(_meson_array_from_flags "${_base_cxxflags} ${extra_cxxflags}")"
+  c_link_args="$(_meson_array_from_flags "${_base_ldflags} ${extra_ldflags}")"
+  cpp_link_args="$(_meson_array_from_flags "${_base_ldflags} ${extra_ldflags}")"
+
+  rm -rf "$builddir"
+
+  arch-meson pango "$builddir" \
+    -D documentation=false \
+    -D man-pages=false \
+    -D introspection="${_pango_introspection_opt}" \
+    -D build-testsuite=true \
+    -D build-examples=true \
+    -D fontconfig=enabled \
+    -D libthai=enabled \
+    -D cairo=enabled \
+    -D xft=enabled \
+    -D freetype=enabled \
+    -D sysprof=disabled \
+    -D b_ndebug=true \
+    -D b_pie=false \
+    -D c_std=gnu18 \
+    -D cpp_std=gnu++2a \
+    -D c_args="${c_args}" \
+    -D cpp_args="${cpp_args}" \
+    -D c_link_args="${c_link_args}" \
+    -D cpp_link_args="${cpp_link_args}" \
+    --buildtype=release
+
+  meson compile -C "$builddir"
+}
+
+_detect_introspection_mode() {
+  # Pango GIR generation includes HarfBuzz-0.0; if it is missing, forcing
+  # introspection causes a hard build failure in g-ir-scanner.
+  if [[ -f /usr/share/gir-1.0/HarfBuzz-0.0.gir ]]; then
+    _pango_introspection_opt=enabled
+  else
+    _pango_introspection_opt=disabled
+    echo "==> HarfBuzz-0.0.gir not found, disabling introspection for this build"
+  fi
+}
+
+_run_tool_workload() {
+  local builddir="$1"
+  local work="${srcdir}/pango-pgo-work"
+  local pangoview="${builddir}/utils/pango-view"
+  local pangolist="${builddir}/utils/pango-list"
+  local pangoquery="${builddir}/utils/pango-querymodules"
+
+  rm -rf "$work"
+  mkdir -p "$work"
+
+  cat > "${work}/corpus.txt" <<'EOF'
+The quick brown fox jumps over the lazy dog.
+Sphinx of black quartz, judge my vow.
+Pango shaping and rendering stress test with mixed scripts.
+0123456789 !@#$%^&*() []{} <>?/\\|`~
+Ligatures: ffi ffl fi fl AV WA To Yo
+Arabic: السلام عليكم
+Hebrew: שלום עולם
+Hindi: नमस्ते दुनिया
+Thai: สวัสดีชาวโลก
+Japanese: こんにちは世界
+Korean: 안녕하세요 세계
+EOF
+
+  local text iter
+  for iter in {1..20}; do
+    [[ -x "$pangolist" ]] && "$pangolist" >/dev/null 2>&1 || true
+    [[ -x "$pangoquery" ]] && "$pangoquery" >/dev/null 2>&1 || true
+
+    if [[ -x "$pangoview" ]]; then
+      while IFS= read -r text; do
+        "$pangoview" --no-display --output="${work}/out.png" --text="$text" >/dev/null 2>&1 || true
+      done < "${work}/corpus.txt"
+    fi
+  done
+
+  rm -rf "$work"
+}
+
+_run_profile_training() {
+  local builddir="$1"
+  local profdir="$2"
+  local label="$3"
+
+  mkdir -p "$profdir"
+  rm -f "${profdir}"/*.profraw
+
+  export LLVM_PROFILE_FILE="${profdir}/%h-%p-%m.profraw"
+  export LLVM_PROFILE_MERGE_POOL_SIZE=8
+
+  echo "==> ${label}: meson tests (parallel)"
+  meson test -C "$builddir" --no-rebuild -j"$(nproc)" --print-errorlogs >/dev/null 2>&1 || true
+
+  echo "==> ${label}: meson tests (serial)"
+  meson test -C "$builddir" --no-rebuild -j1 --print-errorlogs >/dev/null 2>&1 || true
+
+  echo "==> ${label}: pango utilities workload"
+  _run_tool_workload "$builddir"
+  _run_tool_workload "$builddir"
+
+  unset LLVM_PROFILE_FILE LLVM_PROFILE_MERGE_POOL_SIZE
+}
 
 pkgver() {
   cd pango
@@ -22,27 +191,91 @@ pkgver() {
 }
 
 build() {
-  arch-meson pango build -D gtk_doc=false \
-    -D b_ndebug=true \
-    -D b_pie=false \
-    -D c_std=gnu18 \
-    -D cpp_std=gnu++2a \
-    --buildtype=release
-  meson compile -C build
+  _setup_llvm_toolchain
+  _detect_introspection_mode
+
+  local build_std="build-pgo-gen"
+  local build_cs="build-cspgo-gen"
+  local build_opt="build-opt"
+
+  local pgo_dir="${srcdir}/pgo"
+  local std_raw="${pgo_dir}/standard"
+  local cs_raw="${pgo_dir}/cs"
+  local std_prof="${pgo_dir}/standard.profdata"
+  local cs_prof="${pgo_dir}/cs.profdata"
+  local merged_prof="${pgo_dir}/merged.profdata"
+
+  _base_cflags="${CFLAGS}"
+  _base_cxxflags="${CXXFLAGS}"
+  _base_ldflags="${LDFLAGS}"
+
+  local pgo_common_flags="-fprofile-update=atomic -mllvm -enable-value-profiling"
+  local std_vp_flags="${pgo_common_flags} -mllvm -vp-counters-per-site=16"
+  local cs_vp_flags="${pgo_common_flags} -mllvm -vp-counters-per-site=32"
+  local profile_warn_flags="-Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled"
+
+  rm -rf "$build_std" "$build_cs" "$build_opt" "$pgo_dir"
+  mkdir -p "$std_raw" "$cs_raw"
+
+  echo "=========================================================================="
+  echo " Stage 1/3: Standard IR-PGO instrumentation"
+  echo "=========================================================================="
+  _stage_configure_build \
+    "$build_std" \
+    "-fprofile-generate=${std_raw} ${std_vp_flags}" \
+    "-fprofile-generate=${std_raw} ${std_vp_flags}" \
+    "-fprofile-generate=${std_raw} -fprofile-update=atomic"
+
+  _run_profile_training "$build_std" "$std_raw" "Stage 1"
+
+  _merge_profraw_dir "$std_prof" "$std_raw" || {
+    echo "ERROR: failed to create standard profile data" >&2
+    return 1
+  }
+
+  echo "=========================================================================="
+  echo " Stage 2/3: Context-sensitive PGO instrumentation"
+  echo "=========================================================================="
+  _stage_configure_build \
+    "$build_cs" \
+    "-fprofile-use=${std_prof} -fcs-profile-generate=${cs_raw} ${cs_vp_flags} ${profile_warn_flags}" \
+    "-fprofile-use=${std_prof} -fcs-profile-generate=${cs_raw} ${cs_vp_flags} ${profile_warn_flags}" \
+    "-fprofile-use=${std_prof} -fcs-profile-generate=${cs_raw} -fprofile-update=atomic"
+
+  _run_profile_training "$build_cs" "$cs_raw" "Stage 2"
+
+  _merge_profraw_dir "$cs_prof" "$cs_raw" || {
+    echo "ERROR: failed to create context-sensitive profile data" >&2
+    return 1
+  }
+
+  llvm-profdata merge -sparse -output="$merged_prof" "$std_prof" "$cs_prof"
+  [[ -s "$merged_prof" ]] || {
+    echo "ERROR: failed to create merged profile data" >&2
+    return 1
+  }
+
+  echo "=========================================================================="
+  echo " Stage 3/3: Final PGO-optimized build"
+  echo "=========================================================================="
+  _stage_configure_build \
+    "$build_opt" \
+    "-fprofile-use=${merged_prof} ${profile_warn_flags}" \
+    "-fprofile-use=${merged_prof} ${profile_warn_flags}" \
+    "-fprofile-use=${merged_prof}"
 }
 
-#Not running checks according to official PKGBUILD
-#check() {
-#  meson test -C build --print-errorlogs
-#}
+# Not running checks according to official PKGBUILD
+# check() {
+#   meson test -C build-opt --print-errorlogs
+# }
 
 package_pango-git() {
   provides=(pango libpango-1.0.so=0-64 libpango{,cairo,ft2,xft}-1.0.so)
   conflicts=(pango)
 
-  meson install -C build --destdir "$pkgdir"
+  meson install -C build-opt --destdir "$pkgdir"
 
-  #mkdir -p doc/usr/share
-  #mv {"$pkgdir",doc}/usr/share/doc
+  # mkdir -p doc/usr/share
+  # mv {"$pkgdir",doc}/usr/share/doc
 }
-
