@@ -3501,6 +3501,7 @@ void task_numa_free(struct task_struct *p, bool final)
 	if (final) {
 		p->numa_faults = NULL;
 		kfree(numa_faults);
+		numa_faults = NULL;
 	} else {
 		p->total_numa_faults = 0;
 		for (i = 0; i < NR_NUMA_HINT_FAULT_STATS * nr_node_ids; i++)
