@@ -2,11 +2,10 @@
 /*
  * Copyright (c) 2025 Valve Corporation.
  * Author: Changwoo Min <changwoo@igalia.com>
- * Optimized for Intel Raptor Lake i7-14700KF hybrid architecture
  */
 
 #include <scx/common.bpf.h>
-#include <scx/bpf_arena_common.bpf.h>
+#include <bpf_arena_common.bpf.h>
 #include "intf.h"
 #include "lavd.bpf.h"
 #include "util.bpf.h"
@@ -19,52 +18,142 @@
 
 
 extern const volatile u8	mig_delta_pct;
+extern const volatile u8	no_fast_lb;
+extern const volatile u64	lb_low_util_wall;
 
-/*
- * Calculate migration delta based on system load.
- * noinline required: Reduces BPF verifier complexity per-function.
- */
-u64 __attribute__((noinline)) calc_mig_delta(u64 avg_sc_load, int nz_qlen)
+u64 __attribute__ ((noinline)) calc_mig_delta(u64 avg_load_invr, int nz_qlen,
+					      u64 mig_delta_factor)
 {
 	/*
-	 * Dynamic threshold adjustment based on queue pressure:
-	 * - Overloaded (nz_qlen >= active_cpdoms): Aggressive migration
-	 * - Underloaded (nz_qlen == 0): Conservative migration
-	 * - Normal: Balanced migration
+	 * Note that added "noinline" to make the verifier happy.
+	 * When mig_delta_factor > 0, the user specified a fixed
+	 * migration delta percentage; otherwise use the dynamic
+	 * shift-based heuristic.
 	 */
+	if (mig_delta_factor > 0)
+		return avg_load_invr * mig_delta_factor / LAVD_SCALE;
 	if (nz_qlen >= sys_stat.nr_active_cpdoms)
-		return avg_sc_load >> LAVD_CPDOM_MIG_SHIFT_OL;
+		return avg_load_invr >> LAVD_CPDOM_MIG_SHIFT_OL;
 	if (nz_qlen == 0)
-		return avg_sc_load >> LAVD_CPDOM_MIG_SHIFT_UL;
-	return avg_sc_load >> LAVD_CPDOM_MIG_SHIFT;
+		return avg_load_invr >> LAVD_CPDOM_MIG_SHIFT_UL;
+	return avg_load_invr >> LAVD_CPDOM_MIG_SHIFT;
 }
 
 /*
- * Plan cross-domain migration by identifying stealer and stealee domains.
- * __weak: Allows override for specialized hardware configurations.
+ * Classify a single compute domain as stealer, stealee, or neutral.
+ * Returns 1 if the domain became a stealee, 0 otherwise.
+ * Marked noinline so the verifier analyses it separately from the
+ * calling loop, keeping the jump complexity of the caller manageable.
  */
+int __attribute__((noinline))
+classify_cpdom(struct cpdom_ctx *cpdomc, u64 total_load_invr,
+	       u64 total_cap_sum, int nz_qlen, u64 mig_delta_factor)
+{
+	u64 x_mig_delta = 0;
+	u64 fair_share_invr = 0;
+	u64 stealer_threshold = 0;
+	u64 stealee_threshold = 0;
+
+	if (!cpdomc)
+		return 0;
+
+	if (no_fast_lb && sys_stat.nr_active_cpdoms) {
+		u64 avg = total_load_invr / sys_stat.nr_active_cpdoms;
+		x_mig_delta = calc_mig_delta(avg, nz_qlen, mig_delta_factor);
+		stealer_threshold = avg - x_mig_delta;
+		stealee_threshold = avg + x_mig_delta;
+	} else if (cpdomc->nr_active_cpus && total_cap_sum > 0) {
+		fair_share_invr = total_load_invr *
+			     cpdomc->cap_sum_active_cpus /
+			     total_cap_sum;
+
+		x_mig_delta = calc_mig_delta(
+				fair_share_invr, nz_qlen,
+				mig_delta_factor);
+
+		stealer_threshold = fair_share_invr - x_mig_delta;
+		stealee_threshold = fair_share_invr + x_mig_delta;
+	}
+
+	/*
+	 * Under-loaded active domains become a stealer.
+	 * Ingress budget = half the deficit below fair share.
+	 */
+	if (cpdomc->nr_active_cpus &&
+	    cpdomc->load_invr <= stealer_threshold) {
+		u64 stealer_budget = 0;
+
+		if (fair_share_invr > cpdomc->load_invr)
+			stealer_budget = (fair_share_invr -
+					  cpdomc->load_invr) / 2;
+
+		WRITE_ONCE(cpdomc->stealer_budget_invr, stealer_budget);
+		WRITE_ONCE(cpdomc->stealee_budget_invr, 0);
+		WRITE_ONCE(cpdomc->is_stealer, true);
+		WRITE_ONCE(cpdomc->is_stealee, false);
+		return 0;
+	}
+
+	/*
+	 * Over-loaded or non-active domains become a stealee.
+	 * Egress budget = half the excess above fair share. Halving
+	 * (rather than draining the full excess) avoids two failure
+	 * modes:
+	 * - Ping-pong: prevent overshooting. Moving everything in one
+	 *   round may trigger the imbalance and ping-pong effect.
+	 * - Thundering-herd: without a per-round limit, every stealer
+	 *   that sees this domain can migrate out the tasks from it and
+	 *   drain it past the fair share in a single round.
+	 *
+	 * Also skip domains with nothing to steal: a domain may appear
+	 * overloaded due to running task utilization (avg_util_invr_sum)
+	 * but have an empty DSQ — trying to steal from it would waste
+	 * cycles and could cause oscillation.
+	 */
+	if (!cpdomc->nr_active_cpus ||
+	    cpdomc->load_invr >= stealee_threshold) {
+		u64 stealee_budget_invr = 0;
+
+		if (cpdomc->qload_invr == 0)
+			goto reset_role;
+
+		if (cpdomc->load_invr > fair_share_invr)
+			stealee_budget_invr = (cpdomc->load_invr -
+					       fair_share_invr) / 2;
+
+		if (!stealee_budget_invr)
+			goto reset_role;
+
+		WRITE_ONCE(cpdomc->stealee_budget_invr, stealee_budget_invr);
+		WRITE_ONCE(cpdomc->stealer_budget_invr, 0);
+		WRITE_ONCE(cpdomc->is_stealer, false);
+		WRITE_ONCE(cpdomc->is_stealee, true);
+		return 1;
+	}
+
+reset_role:
+	WRITE_ONCE(cpdomc->stealee_budget_invr, 0);
+	WRITE_ONCE(cpdomc->stealer_budget_invr, 0);
+	WRITE_ONCE(cpdomc->is_stealer, false);
+	WRITE_ONCE(cpdomc->is_stealee, false);
+	return 0;
+}
+
 __weak
 int plan_x_cpdom_migration(void)
 {
 	struct cpdom_ctx *cpdomc;
 	u64 cpdom_id;
-	u32 stealer_threshold, stealee_threshold, nr_stealee = 0;
-	u64 avg_sc_load = 0, min_sc_load = U64_MAX, max_sc_load = 0;
-	u64 x_mig_delta, util, qlen, sc_qlen;
+	u32 nr_stealee = 0;
+	u64 max_avg_util_wall = 0;
+	u64 util;
+	u64 total_load_invr = 0;
+	u64 total_cap_sum = 0;
 	bool overflow_running = false;
 	int nz_qlen = 0;
 
 	/*
-	 * Load balancing goals:
-	 * 1) Equalize non-scaled CPU utilization (latency optimization)
-	 * 2) Equalize scaled queue lengths (throughput optimization)
-	 *
-	 * For Raptor Lake: P-cores get higher capacity weighting,
-	 * naturally attracting more work during high load.
-	 */
-
-	/*
-	 * Phase 1: Calculate scaled load per active compute domain.
+	 * Calculate load for each active compute domain.
 	 */
 	bpf_for(cpdom_id, 0, nr_cpdoms) {
 		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
@@ -72,147 +161,104 @@ int plan_x_cpdom_migration(void)
 
 		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
 		if (!cpdomc->nr_active_cpus) {
-			/*
-			 * Overflow domain: Tasks running on inactive domain
-			 * indicates work overflow - trigger rebalancing.
-			 */
-			if (cpdomc->cur_util_sum > 0) {
+			if (cpdomc->cur_util_wall_sum > 0)
 				overflow_running = true;
-				cpdomc->sc_load = U32_MAX;
-			} else {
-				cpdomc->sc_load = 0;
-			}
 			continue;
 		}
 
+		util = (cpdomc->avg_util_wall_sum << LAVD_SHIFT) / cpdomc->nr_active_cpus;
+		if ((util >> LAVD_SHIFT) > max_avg_util_wall)
+			max_avg_util_wall = util >> LAVD_SHIFT;
+
 		/*
-		 * Utilization calculation:
-		 * - mig_delta_pct > 0: Use smoothed average (stable)
-		 * - mig_delta_pct == 0: Use instantaneous (responsive)
+		 * Domain load combines running load (avg_util_invr_sum)
+		 * and queued load (qload_invr, tracked atomically via
+		 * account/unaccount at enqueue/running).
 		 */
-		if (mig_delta_pct > 0)
-			util = (cpdomc->avg_util_sum << LAVD_SHIFT) / cpdomc->nr_active_cpus;
-		else
-			util = (cpdomc->cur_util_sum << LAVD_SHIFT) / cpdomc->nr_active_cpus;
-
-		qlen = cpdomc->nr_queued_task;
-		/*
-		 * Scaled queue length: Normalizes by domain capacity.
-		 * Higher capacity domains (P-cores) get lower sc_qlen
-		 * for same qlen, attracting more work.
-		 */
-		sc_qlen = (qlen << (LAVD_SHIFT * 3)) / cpdomc->cap_sum_active_cpus;
-		cpdomc->sc_load = util + sc_qlen;
-		avg_sc_load += cpdomc->sc_load;
-
-		if (min_sc_load > cpdomc->sc_load)
-			min_sc_load = cpdomc->sc_load;
-		if (max_sc_load < cpdomc->sc_load)
-			max_sc_load = cpdomc->sc_load;
-		if (qlen)
-			nz_qlen++;
-	}
-
-	if (sys_stat.nr_active_cpdoms)
-		avg_sc_load /= sys_stat.nr_active_cpdoms;
-
-	/*
-	 * Phase 2: Determine stealer/stealee thresholds.
-	 * Tighter thresholds under higher load.
-	 */
-	if (mig_delta_pct > 0) {
-		u64 mig_delta_factor = (mig_delta_pct << LAVD_SHIFT) / 100;
-		x_mig_delta = avg_sc_load * mig_delta_factor / LAVD_SCALE;
-	} else {
-		x_mig_delta = calc_mig_delta(avg_sc_load, nz_qlen);
-	}
-
-	stealer_threshold = avg_sc_load - x_mig_delta;
-	stealee_threshold = avg_sc_load + x_mig_delta;
-
-	/*
-	 * If there is no overloaded domain (no stealees), skip load balancing.
-	 * Clear all stealer/stealee roles to prevent stale state from previous
-	 * balancing rounds from triggering incorrect migrations.
-	 *  <~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~>
-	 * [stealer_threshold ... avg_sc_load ... max_sc_load ... stealee_threshold]
-	 *            -------------------------------------->
-	 */
-	if ((stealee_threshold > max_sc_load) && !overflow_running) {
-		/*
-		 * To avoid the expensive reset loop, only reset if there exists
-		 * stealers/stealees in the previous round.
-		 */
-		if (sys_stat.nr_stealee > 0) {
-			bpf_for(cpdom_id, 0, nr_cpdoms) {
-				if (cpdom_id >= LAVD_CPDOM_MAX_NR)
-					break;
-
-				cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
-				WRITE_ONCE(cpdomc->is_stealer, false);
-				WRITE_ONCE(cpdomc->is_stealee, false);
-			}
-			sys_stat.nr_stealee = 0;
+		if (no_fast_lb) {
+			u64 qlen = cpdomc->nr_queued_task;
+			u64 qlen_invr = (qlen << (LAVD_SHIFT * 3)) /
+					cpdomc->cap_sum_active_cpus;
+			cpdomc->load_invr = util + qlen_invr;
+			if (qlen)
+				nz_qlen++;
+		} else {
+			cpdomc->load_invr = cpdomc->avg_util_invr_sum +
+					    cpdomc->qload_invr;
+			if (cpdomc->qload_invr)
+				nz_qlen++;
 		}
-		return 0;
+		total_load_invr += cpdomc->load_invr;
+		total_cap_sum += cpdomc->cap_sum_active_cpus;
 	}
 
 	/*
-	 * At this point, there is at least one overloaded domain (stealee).
-	 * Adjust stealer threshold to minimum scaled load to ensure that
-	 * there exists at least one stealer.
+	 * When the highest per-CPU utilization among all compute
+	 * domains is below the low utilization threshold, there is
+	 * no meaningful workload worth rebalancing across domains.
 	 */
-	if (stealer_threshold < min_sc_load)
-		stealer_threshold = min_sc_load;
+	if (lb_low_util_wall > 0 && max_avg_util_wall < lb_low_util_wall)
+		goto reset_and_skip_lb;
 
 	/*
-	 * Phase 3: Classify domains as stealer, stealee, or neutral.
+	 * Classify stealer and stealee domains using per-domain
+	 * capacity-proportional targets. Each domain's target is its
+	 * fair share of total system load scaled by its capacity
+	 * proportion.
 	 */
+	u64 mig_delta_factor = 0;
+	if (mig_delta_pct > 0)
+		mig_delta_factor = (mig_delta_pct << LAVD_SHIFT) / 100;
+
 	bpf_for(cpdom_id, 0, nr_cpdoms) {
 		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
 			break;
 
 		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
 
-		/* Under-loaded active domains: eligible to steal */
-		if (cpdomc->nr_active_cpus &&
-		    cpdomc->sc_load <= stealer_threshold) {
-			WRITE_ONCE(cpdomc->is_stealer, true);
-			WRITE_ONCE(cpdomc->is_stealee, false);
-			continue;
-		}
-
-		/* Over-loaded or inactive domains: eligible for stealing from */
-		if (!cpdomc->nr_active_cpus ||
-		    cpdomc->sc_load >= stealee_threshold) {
-			WRITE_ONCE(cpdomc->is_stealer, false);
-			WRITE_ONCE(cpdomc->is_stealee, true);
-			nr_stealee++;
-			continue;
-		}
-
-		/* Neutral: neither stealing nor being stolen from */
-		WRITE_ONCE(cpdomc->is_stealer, false);
-		WRITE_ONCE(cpdomc->is_stealee, false);
+		nr_stealee += classify_cpdom(cpdomc, total_load_invr,
+					     total_cap_sum, nz_qlen,
+					     mig_delta_factor);
 	}
+
+	if (nr_stealee == 0 && !overflow_running)
+		goto reset_and_skip_lb;
 
 	sys_stat.nr_stealee = nr_stealee;
 
 	return 0;
+
+reset_and_skip_lb:
+	if (sys_stat.nr_stealee > 0) {
+		bpf_for(cpdom_id, 0, nr_cpdoms) {
+			if (cpdom_id >= LAVD_CPDOM_MAX_NR)
+				break;
+
+			cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
+			WRITE_ONCE(cpdomc->stealee_budget_invr, 0);
+			WRITE_ONCE(cpdomc->stealer_budget_invr, 0);
+			WRITE_ONCE(cpdomc->is_stealer, false);
+			WRITE_ONCE(cpdomc->is_stealee, false);
+		}
+		sys_stat.nr_stealee = 0;
+	}
+	return 0;
 }
 
 /*
- * Consume a task from the specified DSQ with latency tracking.
+ * dsq_id: candidate DSQ to consume from, can be per-cpdom or per-cpu.
  */
-static __always_inline bool consume_dsq(struct cpdom_ctx *cpdomc, u64 dsq_id)
+static bool consume_dsq(struct cpdom_ctx *cpdomc, u64 dsq_id)
 {
 	bool ret;
 	u64 before = 0;
 
 	if (is_monitored)
 		before = bpf_ktime_get_ns();
-
-	ret = scx_bpf_dsq_move_to_local(dsq_id);
+	/*
+	 * Try to consume a task on the associated DSQ.
+	 */
+	ret = scx_bpf_dsq_move_to_local(dsq_id, 0);
 
 	if (is_monitored)
 		cpdomc->dsq_consume_lat = time_delta(bpf_ktime_get_ns(), before);
@@ -220,32 +266,18 @@ static __always_inline bool consume_dsq(struct cpdom_ctx *cpdomc, u64 dsq_id)
 	return ret;
 }
 
-/*
- * Optimized bit manipulation for CPU mask iteration.
- * Uses TZCNT instruction (1 cycle on Raptor Lake) instead of
- * function call overhead.
- *
- * Returns: bit position (0-63) or -1 if no bits set.
- * Side effect: Clears the returned bit from mask.
- */
-static __always_inline int mask_pop_lsb(u64 *mask)
+u64 __attribute__((noinline)) dsq_peek_task_load(u64 dsq_id)
 {
-	u64 val = *mask;
+	struct task_struct *peek_p = __COMPAT_scx_bpf_dsq_peek(dsq_id);
 
-	if (!val)
-		return -1;
-
-	/* Clear lowest set bit: x & (x-1) */
-	*mask = val & (val - 1);
-
-	/* Count trailing zeros = position of lowest set bit */
-	return __builtin_ctzll(val);
+	if (peek_p) {
+		task_ctx *peek_taskc = get_task_ctx(peek_p);
+		if (peek_taskc)
+			return task_load_metric(peek_taskc);
+	}
+	return 0;
 }
 
-/*
- * Find the most loaded DSQ within a compute domain for work stealing.
- * noinline: Required for BPF verifier complexity management.
- */
 u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 {
 	u64 pick_dsq_id = -ENOENT;
@@ -257,53 +289,35 @@ u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 	}
 
 	/*
-	 * Strategy: Find DSQ with highest queued task count.
-	 * For hybrid architectures, this naturally balances between
-	 * P-core and E-core DSQs based on actual load.
+	 * For simplicity, try to just steal from the (either per-CPU or
+	 * per-domain) DSQs with the highest number of queued_tasks
+	 * in this domain.
 	 */
-
-	/* Check per-domain DSQ first */
 	if (use_cpdom_dsq()) {
 		pick_dsq_id = cpdom_to_dsq(cpdomc->id);
 		highest_queued = scx_bpf_dsq_nr_queued(pick_dsq_id);
 	}
 
-	/* Check per-CPU DSQs if migratable */
+	/*
+	 * When tasks on a per-CPU DSQ are not migratable
+	 * (e.g., pinned_slice_ns is on but per_cpu_dsq is not),
+	 * there is no need to check per-CPU DSQs.
+	 */
 	if (is_per_cpu_dsq_migratable()) {
-		s32 pick_cpu = -ENOENT;
-		s32 word;
-		s32 iter;
+		int pick_cpu = -ENOENT, cpu, i, j, k;
 
-		/*
-		 * Iterate through CPU mask words (64 CPUs per word).
-		 * For 14700KF: 28 threads = 1 word (bits 0-27 set).
-		 */
-		bpf_for(word, 0, LAVD_CPU_ID_MAX / 64) {
-			u64 mask = cpdomc->__cpumask[word];
-
-			/*
-			 * Process each set bit using optimized pop.
-			 * Early exit when mask exhausted.
-			 */
-			bpf_for(iter, 0, 64) {
-				int bit = mask_pop_lsb(&mask);
+		bpf_for(i, 0, LAVD_CPU_ID_MAX/64) {
+			u64 cpumask = cpdomc->__cpumask[i];
+			bpf_for(k, 0, 64) {
 				s32 queued;
-				s32 cpu;
-
-				if (bit < 0)
+				j = cpumask_next_set_bit(&cpumask);
+				if (j < 0)
 					break;
-
-				cpu = (word * 64) + bit;
+				cpu = (i * 64) + j;
 				if (cpu >= nr_cpu_ids)
 					break;
-
-				/*
-				 * Count both regular per-CPU DSQ and
-				 * LOCAL_ON DSQ (tasks pinned to this CPU).
-				 */
 				queued = scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)) +
 					 scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
-
 				if (queued > highest_queued) {
 					highest_queued = queued;
 					pick_cpu = cpu;
@@ -311,51 +325,45 @@ u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 			}
 		}
 
-		if (pick_cpu >= 0)
+		if (pick_cpu != -ENOENT)
 			pick_dsq_id = cpu_to_dsq(pick_cpu);
 	}
 
 	return pick_dsq_id;
 }
 
-/*
- * Probabilistic task stealing from neighbor domains.
- * Uses distance-ordered traversal to prefer closer domains
- * (important for NUMA and hybrid cache topologies).
- */
 static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 {
 	struct cpdom_ctx *cpdomc_pick;
 	s64 nr_nbr, cpdom_id;
 
-	/* Defensive null check + active domain requirement */
-	if (!cpdomc || !cpdomc->nr_active_cpus)
+	/*
+	 * Only active domains steal the tasks from other domains.
+	 */
+	if (!cpdomc->nr_active_cpus)
+		return false;
+
+	if (no_fast_lb &&
+	    !prob_x_out_of_y(1, cpdomc->nr_active_cpus * LAVD_CPDOM_MIG_PROB_FT))
 		return false;
 
 	/*
-	 * Probabilistic gating: Prevents thundering herd when multiple
-	 * CPUs become idle simultaneously. Only 1/N CPUs attempt stealing.
+	 * Traverse neighbor compute domains in distance order.
 	 */
-	if (!prob_x_out_of_y(1, cpdomc->nr_active_cpus * LAVD_CPDOM_MIG_PROB_FT))
-		return false;
-
-	/*
-	 * Traverse neighbors by distance (cache topology aware).
-	 * For Raptor Lake: P-core to E-core is distance 1 (shared L3).
-	 */
-	for (int dist = 0; dist < LAVD_CPDOM_MAX_DIST; dist++) {
-		nr_nbr = min(cpdomc->nr_neighbors[dist], LAVD_CPDOM_MAX_NR);
-		if (!nr_nbr)
+	for (int i = 0; i < LAVD_CPDOM_MAX_DIST; i++) {
+		nr_nbr = min(cpdomc->nr_neighbors[i], LAVD_CPDOM_MAX_NR);
+		if (nr_nbr == 0)
 			break;
 
 		/*
-		 * OPTIMIZED: Direct loop bound using nr_nbr.
-		 * Avoids extra conditional check per iteration.
+		 * Traverse neighbors in the same distance in circular distance order.
 		 */
-		for (int idx = 0; idx < nr_nbr; idx++) {
+		for (int j = 0; j < LAVD_CPDOM_MAX_NR; j++) {
 			u64 dsq_id;
+			if (j >= nr_nbr)
+				break;
 
-			cpdom_id = get_neighbor_id(cpdomc, dist, idx);
+			cpdom_id = get_neighbor_id(cpdomc, i, j);
 			if (cpdom_id < 0)
 				continue;
 
@@ -365,26 +373,56 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 				return false;
 			}
 
-			/* Skip non-stealee or invalid domains */
 			if (!READ_ONCE(cpdomc_pick->is_stealee) || !cpdomc_pick->is_valid)
+				continue;
+
+			if (READ_ONCE(cpdomc_pick->stealee_budget_invr) <= 0)
 				continue;
 
 			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
 
 			/*
-			 * Successful steal: Mark both domains to prevent
-			 * over-migration within this scheduling round.
+			 * Peek at the head task to get its size for budget
+			 * accounting.
+			 *
+			 * TOCTOU: the task peeked here may not be the one
+			 * actually consumed by consume_dsq() below. To be more
+			 * specific, another CPU may grab the head first, or the
+			 * task may become ineligible during the window between
+			 * the peek and the consume_dsq. The budget is just a
+			 * hint, and over-debiting will be self-corrected
+			 * because the next LB round recomputes budgets from
+			 * scratch.
+			 */
+			u64 task_load = dsq_peek_task_load(dsq_id);
+
+			/*
+			 * On success, decrement both egress and ingress
+			 * budgets. The stealer stays active for the
+			 * entire round. Budget exhaustion clears the
+			 * is_stealee/is_stealer flags via the decrement
+			 * helpers.
 			 */
 			if (consume_dsq(cpdomc_pick, dsq_id)) {
-				WRITE_ONCE(cpdomc_pick->is_stealee, false);
-				WRITE_ONCE(cpdomc->is_stealer, false);
+				if (no_fast_lb) {
+					WRITE_ONCE(cpdomc_pick->is_stealee, false);
+					WRITE_ONCE(cpdomc->is_stealer, false);
+				} else {
+					decrement_stealee_budget(cpdomc_pick, task_load);
+					decrement_stealer_budget(cpdomc, task_load);
+				}
 				return true;
 			}
 		}
 
 		/*
-		 * Exponential backoff for distant neighbors.
-		 * Reduces cross-NUMA migration probability.
+		 * Now, we need to steal a task from a farther neighbor
+		 * for load balancing. Since task migration from a farther
+		 * neighbor is more expensive (e.g., crossing a NUMA boundary),
+		 * we will do this with a lot of hesitation. The chance of
+		 * further migration will decrease exponentially as distance
+		 * increases, so, on the other hand, it increases the chance
+		 * of closer migration.
 		 */
 		if (!prob_x_out_of_y(1, LAVD_CPDOM_MIG_PROB_FT))
 			break;
@@ -393,35 +431,28 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 	return false;
 }
 
-/*
- * Forced task stealing without probabilistic gating.
- * Used when local DSQs are empty and work is needed.
- */
 static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 {
 	struct cpdom_ctx *cpdomc_pick;
 	s64 nr_nbr, cpdom_id;
 
-	if (!cpdomc)
-		return false;
-
 	/*
-	 * Traverse all neighbors unconditionally.
-	 * No probability check - CPU is idle and needs work.
+	 * Traverse neighbor compute domains in distance order.
 	 */
-	for (int dist = 0; dist < LAVD_CPDOM_MAX_DIST; dist++) {
-		nr_nbr = min(cpdomc->nr_neighbors[dist], LAVD_CPDOM_MAX_NR);
-		if (!nr_nbr)
+	for (int i = 0; i < LAVD_CPDOM_MAX_DIST; i++) {
+		nr_nbr = min(cpdomc->nr_neighbors[i], LAVD_CPDOM_MAX_NR);
+		if (nr_nbr == 0)
 			break;
 
 		/*
-		 * OPTIMIZED: Direct loop bound using nr_nbr.
-		 * Avoids extra conditional check per iteration.
+		 * Traverse neighbors in the same distance in circular distance order.
 		 */
-		for (int idx = 0; idx < nr_nbr; idx++) {
+		for (int j = 0; j < LAVD_CPDOM_MAX_NR; j++) {
 			u64 dsq_id;
+			if (j >= nr_nbr)
+				break;
 
-			cpdom_id = get_neighbor_id(cpdomc, dist, idx);
+			cpdom_id = get_neighbor_id(cpdomc, i, j);
 			if (cpdom_id < 0)
 				continue;
 
@@ -436,24 +467,35 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 
 			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
 
-			if (consume_dsq(cpdomc_pick, dsq_id))
+			/*
+			 * Peek at the head task to get its size.
+			 */
+			u64 task_load = dsq_peek_task_load(dsq_id);
+
+			/*
+			 * Force steal is unconditional for work
+			 * conservation. Decrement budgets to keep
+			 * the accounting consistent.
+			 */
+			if (consume_dsq(cpdomc_pick, dsq_id)) {
+				decrement_stealee_budget(cpdomc_pick, task_load);
+				decrement_stealer_budget(cpdomc, task_load);
 				return true;
+			}
 		}
 	}
 
 	return false;
 }
 
-/*
- * Main task consumption entry point for dispatch path.
- * Orchestrates local consumption and cross-domain stealing.
- */
 __hidden
 bool consume_task(u64 cpu_dsq_id, u64 cpdom_dsq_id)
 {
 	struct cpdom_ctx *cpdomc;
-	struct task_struct *p;
-	u64 vtime = U64_MAX;
+	struct cpu_ctx *cpuc;
+	u64 cpdom_turb_dsq_id;
+	bool turbulent;
+	struct dsq_entry dsqs[3];
 
 	cpdomc = MEMBER_VPTR(cpdom_ctxs, [dsq_to_cpdom(cpdom_dsq_id)]);
 	if (!cpdomc) {
@@ -461,62 +503,71 @@ bool consume_task(u64 cpu_dsq_id, u64 cpdom_dsq_id)
 		return false;
 	}
 
+	cpdom_turb_dsq_id = cpdom_to_turb_dsq(dsq_to_cpdom(cpdom_dsq_id));
+
 	/*
-	 * Priority 1: Cross-domain stealing if we're a designated stealer.
-	 * Probabilistic to prevent thundering herd.
+	 * Determine if this CPU is turbulent (high IRQ/steal time).
+	 * Non-turbulent CPUs consume from all 3 DSQs.
+	 * Turbulent CPUs only consume from the turbulent DSQ
+	 * (which holds non-latency-critical tasks).
+	 */
+	cpuc = get_cpu_ctx();
+	if (!cpuc)
+		return false;
+	turbulent = cpuc->lat_headroom < LAVD_LC_LATENCY_SENSITIVE_THRESH;
+
+	/*
+	 * If the current compute domain is a stealer, try to steal
+	 * a task from any of stealee domains probabilistically.
 	 */
 	if (nr_cpdoms > 1 && READ_ONCE(cpdomc->is_stealer) &&
 	    try_to_steal_task(cpdomc))
 		goto x_domain_migration_out;
 
 	/*
-	 * Priority 2: Consume from local DSQs.
-	 * When both per-CPU and per-domain DSQs are active,
-	 * select task with lowest vtime for fairness.
+	 * Collect eligible DSQs and consume in lowest-vtime-first order.
+	 * Non-turbulent CPUs always see the cpdom DSQ. Turbulent CPUs
+	 * also see it when it has more queued tasks than the turbulent
+	 * DSQ (to prevent starvation) or when there are no steady CPUs
+	 * to drain it.
 	 */
-	if (use_per_cpu_dsq() && use_cpdom_dsq()) {
-		u64 dsq_id = cpu_dsq_id;
-		u64 backup_dsq_id = cpdom_dsq_id;
+	dsqs[0] = (struct dsq_entry){ cpu_dsq_id,       U64_MAX, use_per_cpu_dsq() };
+	dsqs[1] = (struct dsq_entry){ cpdom_dsq_id,     U64_MAX, use_cpdom_dsq() &&
+		(!turbulent ||
+		 scx_bpf_dsq_nr_queued(cpdom_dsq_id) > scx_bpf_dsq_nr_queued(cpdom_turb_dsq_id) ||
+		 cpdomc->nr_steady_cpus == 0) };
+	dsqs[2] = (struct dsq_entry){ cpdom_turb_dsq_id, U64_MAX, use_cpdom_dsq() };
 
-		/* Peek CPU DSQ for vtime comparison */
-		p = __COMPAT_scx_bpf_dsq_peek(cpu_dsq_id);
-		if (p)
-			vtime = p->scx.dsq_vtime;
+	if (dsqs[0].eligible)
+		dsqs[0].vtime = peek_dsq_vtime(dsqs[0].dsq_id);
+	if (dsqs[1].eligible)
+		dsqs[1].vtime = peek_dsq_vtime(dsqs[1].dsq_id);
+	if (dsqs[2].eligible)
+		dsqs[2].vtime = peek_dsq_vtime(dsqs[2].dsq_id);
 
-		/* Compare with domain DSQ, prefer lower vtime */
-		p = __COMPAT_scx_bpf_dsq_peek(cpdom_dsq_id);
-		if (p && p->scx.dsq_vtime < vtime) {
-			dsq_id = cpdom_dsq_id;
-			backup_dsq_id = cpu_dsq_id;
-		}
+	sort_dsqs(&dsqs[0], &dsqs[1], &dsqs[2]);
 
-		/*
-		 * Race handling: If preferred DSQ loses race,
-		 * fall back to alternate DSQ to prevent stalls.
-		 */
-		if (consume_dsq(cpdomc, dsq_id))
-			return true;
-		if (consume_dsq(cpdomc, backup_dsq_id))
-			return true;
-
-	} else if (use_cpdom_dsq()) {
-		if (consume_dsq(cpdomc, cpdom_dsq_id))
-			return true;
-
-	} else if (use_per_cpu_dsq()) {
-		if (consume_dsq(cpdomc, cpu_dsq_id))
-			return true;
-	}
+	if (dsqs[0].eligible && consume_dsq(cpdomc, dsqs[0].dsq_id))
+		return true;
+	if (dsqs[1].eligible && consume_dsq(cpdomc, dsqs[1].dsq_id))
+		return true;
+	if (dsqs[2].eligible && consume_dsq(cpdomc, dsqs[2].dsq_id))
+		return true;
 
 	/*
-	 * Priority 3: Force stealing when local DSQs are empty.
-	 * Disabled when mig_delta_pct is set to respect explicit thresholds.
+	 * If there is no task in the associated DSQ, traverse neighbor
+	 * compute domains in distance order -- task stealing.
+	 * Skip force stealing when mig_delta_pct is set (> 0) to rely
+	 * only on the is_stealer/is_stealee thresholds.
 	 */
 	if (nr_cpdoms > 1 && mig_delta_pct == 0 && force_to_steal_task(cpdomc))
 		goto x_domain_migration_out;
 
 	return false;
 
+	/*
+	 * Task migration across compute domains happens.
+	 */
 x_domain_migration_out:
 	return true;
 }
