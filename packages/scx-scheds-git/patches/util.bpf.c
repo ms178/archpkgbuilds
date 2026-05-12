@@ -2,6 +2,9 @@
 /*
  * Copyright (c) 2023, 2024 Valve Corporation.
  * Author: Changwoo Min <changwoo@igalia.com>
+ *
+ * Utility functions for scx_lavd scheduler
+ * Optimized for Intel Raptor Lake hybrid architecture
  */
 
 #include <scx/common.bpf.h>
@@ -15,22 +18,18 @@
 #include <bpf/bpf_tracing.h>
 
 /*
- * To be included to the main.bpf.c
- */
-
-/*
  * Sched related globals
  */
-private(LAVD) struct bpf_cpumask __kptr *turbo_cpumask; /* CPU mask for turbo CPUs */
-private(LAVD) struct bpf_cpumask __kptr *big_cpumask; /* CPU mask for big CPUs */
-private(LAVD) struct bpf_cpumask __kptr *active_cpumask; /* CPU mask for active CPUs */
-private(LAVD) struct bpf_cpumask __kptr *ovrflw_cpumask; /* CPU mask for overflow CPUs */
-private(LAVD) struct bpf_cpumask __kptr *steady_cpumask; /* CPU mask for non-turbulent (steady) CPUs */
+private(LAVD) struct bpf_cpumask __kptr *turbo_cpumask;
+private(LAVD) struct bpf_cpumask __kptr *big_cpumask;
+private(LAVD) struct bpf_cpumask __kptr *active_cpumask;
+private(LAVD) struct bpf_cpumask __kptr *ovrflw_cpumask;
 
-const volatile u64	nr_llcs;	/* number of LLC domains */
-volatile u64		nr_cpus_onln;	/* current number of online CPUs */
+const volatile u64	nr_llcs;
+const volatile u64	__nr_cpu_ids;
+volatile u64		nr_cpus_onln;
 
-const volatile u32	cpu_sibling[LAVD_CPU_ID_MAX]; /* siblings for CPUs when SMT is active */
+const volatile u32	cpu_sibling[LAVD_CPU_ID_MAX];
 
 /*
  * Options
@@ -63,31 +62,64 @@ struct {
 } cpu_ctx_stor SEC(".maps");
 
 __hidden
-u64 __get_task_ctx_slowpath(struct task_struct __arg_trusted *p,
-			    struct cpu_ctx *cpuc)
+u64 get_task_ctx_internal(struct task_struct __arg_trusted *p)
 {
-	u64 raw = (u64)scx_task_data(p);
-
-	if (cpuc && raw) {
-		cpuc->cached_task = (u64)p;
-		cpuc->cached_pid = p->pid;
-		cpuc->cached_taskc_raw = raw;
-	}
-	return raw;
+	return (u64)scx_task_data(p);
 }
 
+/*
+ * Get CPU context for current CPU.
+ * Prefetch optimization: cpu_ctx is frequently accessed in hot scheduling
+ * paths. Prefetching to L1 with high locality hint reduces access latency
+ * by avoiding L2 round-trips on Raptor Lake's split L1/L2 hierarchy.
+ */
 __hidden
 struct cpu_ctx *get_cpu_ctx(void)
 {
 	const u32 idx = 0;
-	return bpf_map_lookup_elem(&cpu_ctx_stor, &idx);
+	struct cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx_stor, &idx);
+
+	if (cpuc)
+		__builtin_prefetch(cpuc, 0, 3);
+
+	return cpuc;
 }
 
+/*
+ * Get CPU context for specified CPU ID.
+ * Same prefetch optimization as get_cpu_ctx() for cross-CPU lookups
+ * during load balancing and task migration decisions.
+ */
 __hidden
 struct cpu_ctx *get_cpu_ctx_id(s32 cpu_id)
 {
 	const u32 idx = 0;
-	return bpf_map_lookup_percpu_elem(&cpu_ctx_stor, &idx, cpu_id);
+	u32 nr;
+
+	if (cpu_id < 0)
+		return NULL;
+
+	if ((u32)cpu_id >= LAVD_CPU_ID_MAX)
+		return NULL;
+
+	/*
+	 * nr_cpu_ids is provided by the kernel BPF global and should be
+	 * valid at init. Guard only if it is non-zero to avoid rejecting
+	 * valid CPUs during early init.
+	 */
+	nr = READ_ONCE(nr_cpu_ids);
+	if (nr && (u32)cpu_id >= nr)
+		return NULL;
+
+	{
+		struct cpu_ctx *cpuc =
+			bpf_map_lookup_percpu_elem(&cpu_ctx_stor, &idx, cpu_id);
+
+		if (cpuc)
+			__builtin_prefetch(cpuc, 0, 3);
+
+		return cpuc;
+	}
 }
 
 __hidden
@@ -97,7 +129,7 @@ struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p)
 }
 
 __hidden
-u32 __attribute__ ((noinline)) calc_avg32(u32 old_val, u32 new_val)
+u32 __attribute__((noinline)) calc_avg32(u32 old_val, u32 new_val)
 {
 	/*
 	 * Calculate the exponential weighted moving average (EWMA).
@@ -107,7 +139,7 @@ u32 __attribute__ ((noinline)) calc_avg32(u32 old_val, u32 new_val)
 }
 
 __hidden
-u64 __attribute__ ((noinline)) calc_avg(u64 old_val, u64 new_val)
+u64 __attribute__((noinline)) calc_avg(u64 old_val, u64 new_val)
 {
 	/*
 	 * Calculate the exponential weighted moving average (EWMA).
@@ -117,10 +149,11 @@ u64 __attribute__ ((noinline)) calc_avg(u64 old_val, u64 new_val)
 }
 
 __hidden
-u64 __attribute__ ((noinline)) calc_asym_avg(u64 old_val, u64 new_val)
+u64 __attribute__((noinline)) calc_asym_avg(u64 old_val, u64 new_val)
 {
 	/*
 	 * Increase fast but decrease slowly.
+	 * Useful for tracking peak values while smoothing noise.
 	 */
 	if (old_val < new_val)
 		return __calc_avg(new_val, old_val, 2);
@@ -129,7 +162,7 @@ u64 __attribute__ ((noinline)) calc_asym_avg(u64 old_val, u64 new_val)
 }
 
 __hidden
-u64 __attribute__ ((noinline)) calc_avg_freq(u64 old_freq, u64 interval)
+u64 __attribute__((noinline)) calc_avg_freq(u64 old_freq, u64 interval)
 {
 	u64 new_freq, ewma_freq;
 
@@ -137,9 +170,75 @@ u64 __attribute__ ((noinline)) calc_avg_freq(u64 old_freq, u64 interval)
 	 * Calculate the exponential weighted moving average (EWMA) of a
 	 * frequency with a new interval measured.
 	 */
+	if (unlikely(interval == 0))
+		interval = 1;
+
 	new_freq = LAVD_TIME_ONE_SEC / interval;
 	ewma_freq = __calc_avg(old_freq, new_freq, 3);
 	return ewma_freq;
+}
+
+__hidden
+bool is_pinned(const struct task_struct *p)
+{
+	return p->nr_cpus_allowed == 1;
+}
+
+__hidden __always_inline void maybe_inc_pinned_waiting(task_ctx __arg_arena *taskc,
+						       struct cpu_ctx *cpuc,
+						       struct task_struct *p)
+{
+	u32 this_cpu;
+
+	if (unlikely(!taskc || !cpuc || !p))
+		return;
+
+	if (!pinned_waiting_enabled())
+		return;
+
+	if (!is_pinned(p))
+		return;
+
+	if (test_task_flag(taskc, LAVD_FLAG_PINNED_WAITING))
+		return;
+
+	set_task_flag(taskc, LAVD_FLAG_PINNED_WAITING);
+
+	this_cpu = (u32)bpf_get_smp_processor_id();
+	if (likely(this_cpu == (u32)cpuc->cpu_id)) {
+		/*
+		 * Local CPU update: no other CPU can update this per-CPU
+		 * instance simultaneously, so non-atomic is safe and faster.
+		 */
+		cpuc->nr_pinned_waiting++;
+	} else {
+		/* Cross-CPU update must be atomic. */
+		__sync_fetch_and_add(&cpuc->nr_pinned_waiting, 1);
+	}
+}
+
+__hidden __always_inline void maybe_dec_pinned_waiting(task_ctx __arg_arena *taskc,
+						       struct cpu_ctx *cpuc)
+{
+	u32 this_cpu;
+
+	if (unlikely(!taskc || !cpuc))
+		return;
+
+	if (!test_task_flag(taskc, LAVD_FLAG_PINNED_WAITING))
+		return;
+
+	reset_task_flag(taskc, LAVD_FLAG_PINNED_WAITING);
+
+	this_cpu = (u32)bpf_get_smp_processor_id();
+	if (likely(this_cpu == (u32)cpuc->cpu_id)) {
+		/* Local CPU: fast non-atomic decrement. */
+		if (likely(cpuc->nr_pinned_waiting > 0))
+			cpuc->nr_pinned_waiting--;
+	} else {
+		/* Cross-CPU: atomic decrement. */
+		__sync_fetch_and_sub(&cpuc->nr_pinned_waiting, 1);
+	}
 }
 
 __hidden
@@ -161,21 +260,9 @@ bool is_ksoftirqd(struct task_struct *p)
 }
 
 __hidden
-bool is_pinned(const struct task_struct *p)
-{
-	return p->nr_cpus_allowed == 1;
-}
-
-__hidden
 bool test_task_flag(task_ctx __arg_arena *taskc, u64 flag)
 {
 	return (taskc->flags & flag) == flag;
-}
-
-__hidden
-bool test_task_flag_mask(task_ctx __arg_arena *taskc, u64 flag)
-{
-	return (taskc->flags & flag);
 }
 
 __hidden
@@ -211,7 +298,7 @@ inline void reset_cpu_flag(struct cpu_ctx *cpuc, u64 flag)
 __hidden
 bool is_lat_cri(task_ctx __arg_arena *taskc)
 {
-	return taskc->lat_cri >= sys_stat.avg_lat_cri;
+	return taskc->lat_cri >= READ_ONCE(sys_stat.avg_lat_cri);
 }
 
 __hidden
@@ -226,67 +313,50 @@ bool is_lock_holder_running(struct cpu_ctx *cpuc)
 	return test_cpu_flag(cpuc, LAVD_FLAG_FUTEX_BOOST);
 }
 
+__hidden
 bool have_scheduled(task_ctx __arg_arena *taskc)
 {
 	/*
 	 * If task's time slice hasn't been updated, that means the task has
 	 * been scheduled by this scheduler.
 	 */
-	return taskc->slice_wall != 0;
+	return taskc->slice != 0;
 }
 
 __hidden
 bool can_boost_slice(void)
 {
-	/*
-	 * When CPU utilization is too high (>= 95%), do not boost the
-	 * time slice. Checking the number of queued tasks alone is not
-	 * sufficient, especially when many tasks are slice-boosted and
-	 * unlikely relinquish CPUs soon.
-	 */
-	return (sys_stat.avg_util_wall <= LAVD_SLICE_BOOST_UTIL_WALL) &&
-	       (sys_stat.nr_queued_task <= sys_stat.nr_active);
+	return READ_ONCE(sys_stat.nr_queued_task) <= READ_ONCE(sys_stat.nr_active);
 }
 
 __hidden
 u16 get_nice_prio(struct task_struct __arg_trusted *p)
 {
-	u16 prio = p->static_prio - MAX_RT_PRIO; /* [0, 40) */
-	return prio;
+	s32 prio = (s32)p->static_prio - MAX_RT_PRIO; /* [0, 40) for normal tasks */
+	if (prio < 0)
+		prio = 0;
+	return (u16)prio;
 }
 
 __hidden
 bool use_full_cpus(void)
 {
-	return sys_stat.nr_active >= nr_cpus_onln;
+	return READ_ONCE(sys_stat.nr_active) >= READ_ONCE(nr_cpus_onln);
 }
 
 __hidden
-void set_affinity_flags(task_ctx __arg_arena *taskc,
-			const struct cpumask *cpumask)
+void set_on_core_type(task_ctx __arg_arena *taskc,
+		      const struct cpumask *cpumask)
 {
-	bool is_affinitized, dom_pinned, dom_pinned_settled;
 	bool on_big = false, on_little = false;
-	s32 first_cpdom_id = -ENOENT;
 	struct cpu_ctx *cpuc;
+	u32 nr = READ_ONCE(nr_cpu_ids);
 	int cpu;
 
-	if (!cpumask)
+	if (nr == 0)
 		return;
 
-	is_affinitized = bpf_cpumask_weight(cpumask) != nr_cpu_ids;
-	if (nr_cpdoms == 1) {
-		dom_pinned = false;
-		dom_pinned_settled = true;
-	} else {
-		dom_pinned = is_affinitized;
-		dom_pinned_settled = !is_affinitized;
-	}
-
-	bpf_for(cpu, 0, nr_cpu_ids) {
-		if (cpu >= LAVD_CPU_ID_MAX)
-			break;
-
+	bpf_for(cpu, 0, nr) {
 		if (!bpf_cpumask_test_cpu(cpu, cpumask))
 			continue;
 
@@ -301,29 +371,10 @@ void set_affinity_flags(task_ctx __arg_arena *taskc,
 		else
 			on_little = true;
 
-		/*
-		 * Track whether the task is domain-pinned: confined to a
-		 * single compute domain. On the first CPU seen, record its
-		 * domain. On any subsequent CPU in a different domain, the
-		 * task spans multiple domains and is not domain-pinned.
-		 */
-		if (!dom_pinned_settled) {
-			if (first_cpdom_id < 0)
-				first_cpdom_id = cpuc->cpdom_id;
-			else if (cpuc->cpdom_id != first_cpdom_id) {
-				dom_pinned = false;
-				dom_pinned_settled = true;
-			}
-		}
-
-		if (on_big && on_little && dom_pinned_settled)
+		/* Early exit once both types found */
+		if (on_big && on_little)
 			break;
 	}
-
-	if (is_affinitized)
-		set_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
-	else
-		reset_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
 
 	if (on_big)
 		set_task_flag(taskc, LAVD_FLAG_ON_BIG);
@@ -334,36 +385,41 @@ void set_affinity_flags(task_ctx __arg_arena *taskc,
 		set_task_flag(taskc, LAVD_FLAG_ON_LITTLE);
 	else
 		reset_task_flag(taskc, LAVD_FLAG_ON_LITTLE);
-
-	if (dom_pinned)
-		set_task_flag(taskc, LAVD_FLAG_DOMAIN_PINNED);
-	else
-		reset_task_flag(taskc, LAVD_FLAG_DOMAIN_PINNED);
 }
 
 __hidden
-bool __attribute__ ((noinline)) prob_x_out_of_y(u32 x, u32 y)
+bool __attribute__((noinline)) prob_x_out_of_y(u32 x, u32 y)
 {
 	u32 r;
+
+	if (y == 0)
+		return false;
 
 	if (x >= y)
 		return true;
 
 	/*
-	 * [0, r, y)
-	 *  ---- x?
+	 * Generate random number in [0, y) and check if < x.
+	 * This gives probability x/y of returning true.
 	 */
 	r = bpf_get_prandom_u32() % y;
 	return r < x;
 }
+
 /*
  * We define the primary cpu in the physical core as the lowest logical cpu id.
+ * For Raptor Lake: P-cores have 2 threads (SMT), E-cores have 1 thread.
+ * This function returns the primary (lower) thread ID for SMT siblings.
  */
 __hidden
-u32 __attribute__ ((noinline)) get_primary_cpu(u32 cpu) {
+u32 __attribute__((noinline)) get_primary_cpu(u32 cpu)
+{
 	const volatile u32 *sibling;
 
 	if (!is_smt_active)
+		return cpu;
+
+	if (cpu >= LAVD_CPU_ID_MAX || cpu >= (u32)__nr_cpu_ids)
 		return cpu;
 
 	sibling = MEMBER_VPTR(cpu_sibling, [cpu]);
@@ -381,9 +437,22 @@ u32 cpu_to_dsq(u32 cpu)
 	return (get_primary_cpu(cpu)) | LAVD_DSQ_TYPE_CPU << LAVD_DSQ_TYPE_SHFT;
 }
 
+/*
+ * Check if there are any tasks queued for this CPU.
+ * Uses short-circuit evaluation for efficiency - returns true immediately
+ * upon finding any queued task, avoiding unnecessary DSQ queries.
+ * This is optimal for the common case where we only need presence detection.
+ */
 __hidden
 bool queued_on_cpu(struct cpu_ctx *cpuc)
 {
+	if (unlikely(!cpuc))
+		return false;
+
+	/*
+	 * Check LOCAL_ON DSQ first - tasks explicitly pinned to this CPU
+	 * via scx_bpf_dsq_insert with SCX_DSQ_LOCAL_ON flag.
+	 */
 	if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id))
 		return true;
 
@@ -393,73 +462,19 @@ bool queued_on_cpu(struct cpu_ctx *cpuc)
 	if (use_cpdom_dsq() && scx_bpf_dsq_nr_queued(cpdom_to_dsq(cpuc->cpdom_id)))
 		return true;
 
-	if (use_cpdom_dsq() && scx_bpf_dsq_nr_queued(cpdom_to_turb_dsq(cpuc->cpdom_id)))
-		return true;
-
 	return false;
 }
 
 __hidden
-u64 peek_dsq_vtime(u64 dsq_id)
+u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc)
 {
-	struct task_struct *p;
-
-	p = __COMPAT_scx_bpf_dsq_peek(dsq_id);
-	return p ? p->scx.dsq_vtime : U64_MAX;
-}
-
-__hidden
-void sort_dsqs(struct dsq_entry *a, struct dsq_entry *b,
-	       struct dsq_entry *c)
-{
-	struct dsq_entry t;
-
-	if (b->vtime < a->vtime) { t = *a; *a = *b; *b = t; }
-	if (c->vtime < b->vtime) { t = *b; *b = *c; *c = t; }
-	if (b->vtime < a->vtime) { t = *a; *a = *b; *b = t; }
-}
-
-__hidden
-u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc, task_ctx *taskc)
-{
-	struct cpdom_ctx *cpdomc;
-
-	if (per_cpu_dsq || (pinned_slice_ns && is_pinned(p)))
+	if (per_cpu_dsq || (READ_ONCE(pinned_slice_ns) && is_pinned(p)))
 		return cpu_to_dsq(cpuc->cpu_id);
-
-	cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
-	if (cpdomc &&
-	    preemption_vulnerability(taskc->normalized_lat_cri,
-				    taskc->util_est) >= cpdomc->vuln_thresh)
-		return cpdom_to_dsq(cpuc->cpdom_id);
-
-	return cpdom_to_turb_dsq(cpuc->cpdom_id);
+	return cpdom_to_dsq(cpuc->cpdom_id);
 }
 
-/**
- * normalize_lat_cri - Normalize latency criticality to 1024 scale
- * @lat_cri: The latency criticality value from task_ctx
- *
- * Normalizes the lat_cri value from the range [0, max_lat_cri] to [0, 1024].
- * Uses the system-wide max_lat_cri as the upper bound for normalization.
- *
- * Returns: Normalized value in range [0, 1024]
- */
 __hidden
-u16 normalize_lat_cri(u16 lat_cri)
+u64 task_exec_time(struct task_struct __arg_trusted *p)
 {
-	u32 max = sys_stat.max_lat_cri;
-
-	/*
-	 * Handle edge cases:
-	 * - If max_lat_cri is 0, return 0 (no tasks have run yet)
-	 * - If lat_cri >= max_lat_cri, return 1024 (maximum)
-	 */
-	if (max == 0)
-		return 0;
-
-	if (lat_cri >= max)
-		return 1024;
-
-	return (u16)(((u64)lat_cri << LAVD_SHIFT) / max);
+	return READ_ONCE(p->se.sum_exec_runtime);
 }
