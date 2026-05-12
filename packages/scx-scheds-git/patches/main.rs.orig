@@ -104,7 +104,7 @@ struct Opts {
     #[clap(long = "performance", action = clap::ArgAction::SetTrue)]
     performance: bool,
 
-    /// Run the scheduler in powersave mode to minimize powr consumption.
+    /// Run the scheduler in powersave mode to minimize power consumption.
     /// This option cannot be used with other conflicting options (--autopilot,
     /// --autopower, --performance, --balanced, --no-core-compaction)
     /// affecting the use of core compaction.
@@ -126,15 +126,39 @@ struct Opts {
     #[clap(long = "slice-min-us", default_value = "500")]
     slice_min_us: u64,
 
+    /// Target load percentage for turbulent CPUs relative to non-turbulent
+    /// CPUs' per-capacity utilization. 100 means turbulent CPUs should carry
+    /// the same per-capacity load as non-turbulent CPUs. Values below 100
+    /// route fewer tasks to turbulent CPUs; values above 100 route more.
+    /// Range: 0-200. Default: 100.
+    #[clap(long = "lat-load-target-pct", default_value = "100", value_parser=Opts::lat_load_target_pct_range)]
+    lat_load_target_pct: u16,
+
     /// Migration delta threshold percentage (0-100). When set to a non-zero value,
-    /// uses average utilization for threshold calculation instead of current
-    /// utilization, and the threshold is calculated as: avg_load * (mig-delta-pct / 100).
+    /// the migration threshold is mig-delta-pct percent of the average load.
     /// Additionally, disables force task stealing in the consume path, relying only
     /// on the is_stealer/is_stealee thresholds for more predictable load balancing.
     /// Default is 0 (disabled, uses dynamic threshold based on load with both
     /// probabilistic and force task stealing enabled). This is an experimental feature.
     #[clap(long = "mig-delta-pct", default_value = "0", value_parser=Opts::mig_delta_pct_range)]
     mig_delta_pct: u8,
+
+    /// Low utilization threshold percentage (0-100) for periodic load balancing.
+    /// When set to a non-zero value, periodic load balancing is skipped when
+    /// the maximum per-domain utilization is below this percentage.
+    /// Default is 25 (skip periodic LB below 25% utilization).
+    /// Set to 0 to disable. Set to 100 to always skip periodic LB.
+    #[clap(long = "lb-low-util-pct", default_value = "25", value_parser=Opts::lb_low_util_pct_range)]
+    lb_low_util_pct: u8,
+
+    /// Low utilization threshold percentage (0-100) for bypassing deadline
+    /// scheduling. When set to a non-zero value, tasks are dispatched directly
+    /// to the local DSQ (FIFO) instead of using deadline-based ordering when
+    /// the per-CPU utilization is below this percentage.
+    /// Default is 10 (bypass deadline scheduling below 10% utilization).
+    /// Set to 0 to disable. Set to 100 to always bypass deadline scheduling.
+    #[clap(long = "lb-local-dsq-util-pct", default_value = "10", value_parser=Opts::lb_local_dsq_util_pct_range)]
+    lb_local_dsq_util_pct: u8,
 
     /// Slice duration in microseconds to use for all tasks when pinned tasks
     /// are running on a CPU. Must be between slice-min-us and slice-max-us.
@@ -168,6 +192,12 @@ struct Opts {
     /// Do not boost futex holders.
     #[clap(long = "no-futex-boost", action = clap::ArgAction::SetTrue)]
     no_futex_boost: bool,
+
+    /// Default: --no-fast-lb is deactivated (fast load balancer is on).
+    /// Disable the fast (batch-migration) load balancer and fall back to
+    /// the pre-fast-lb load-balancer behavior.
+    #[clap(long = "no-fast-lb", action = clap::ArgAction::SetTrue)]
+    no_fast_lb: bool,
 
     /// Disable preemption.
     #[clap(long = "no-preemption", action = clap::ArgAction::SetTrue)]
@@ -371,7 +401,19 @@ impl Opts {
         number_range(s, 0, 10)
     }
 
+    fn lat_load_target_pct_range(s: &str) -> Result<u16, String> {
+        number_range(s, 0, 200)
+    }
+
     fn mig_delta_pct_range(s: &str) -> Result<u8, String> {
+        number_range(s, 0, 100)
+    }
+
+    fn lb_low_util_pct_range(s: &str) -> Result<u8, String> {
+        number_range(s, 0, 100)
+    }
+
+    fn lb_local_dsq_util_pct_range(s: &str) -> Result<u8, String> {
         number_range(s, 0, 100)
     }
 }
@@ -645,8 +687,12 @@ impl<'a> Scheduler<'a> {
         rodata.slice_min_ns = opts.slice_min_us * 1000;
         rodata.pinned_slice_ns = opts.pinned_slice_us.map(|v| v * 1000).unwrap_or(0);
         rodata.preempt_shift = opts.preempt_shift;
+        rodata.lat_load_target_pct = opts.lat_load_target_pct;
         rodata.mig_delta_pct = opts.mig_delta_pct;
+        rodata.lb_low_util_wall = ((opts.lb_low_util_pct as u64) << 10) / 100;
+        rodata.lb_local_dsq_util_wall = ((opts.lb_local_dsq_util_pct as u64) << 10) / 100;
         rodata.no_use_em = opts.no_use_em as u8;
+        rodata.no_fast_lb = opts.no_fast_lb as u8;
         rodata.no_wake_sync = opts.no_wake_sync;
         rodata.no_slice_boost = opts.no_slice_boost;
         rodata.per_cpu_dsq = opts.per_cpu_dsq;
@@ -723,9 +769,17 @@ impl<'a> Scheduler<'a> {
             cpuperf_cur: tx.cpuperf_cur,
             cpu_util_wall: tx.cpu_util_wall,
             cpu_util_invr: tx.cpu_util_invr,
+            steal_util_wall: tx.steal_util_wall,
+            steal_util_invr: tx.steal_util_invr,
+            dom_pinned_util_wall: tx.dom_pinned_util_wall,
+            dom_pinned_util_invr: tx.dom_pinned_util_invr,
             nr_active: tx.nr_active,
             dsq_id: tx.dsq_id,
             dsq_consume_lat: tx.dsq_consume_lat,
+            lat_headroom: tx.lat_headroom,
+            vuln_thresh: tx.vuln_thresh,
+            task_util_est: tx.task_util_est,
+            norm_lat_cri: tx.norm_lat_cri,
             slice_used_wall: tx.last_slice_used_wall,
         }) {
             Ok(()) | Err(TrySendError::Full(_)) => 0,
@@ -876,7 +930,7 @@ impl<'a> Scheduler<'a> {
     fn update_power_profile(&mut self, prev_profile: PowerProfile) -> (bool, PowerProfile) {
         let profile = fetch_power_profile(false);
         if profile == prev_profile {
-            // If the profile is the same, skip updaring the profile for BPF.
+            // If the profile is the same, skip updating the profile for BPF.
             return (true, profile);
         }
 
