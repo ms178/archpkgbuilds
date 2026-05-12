@@ -3,6 +3,9 @@
 // Copyright (c) 2024 Valve Corporation.
 // Author: Changwoo Min <changwoo@igalia.com>
 
+// This software may be used and distributed according to the terms of the
+// GNU General Public License version 2.
+
 mod bpf_skel;
 pub use bpf_skel::*;
 pub mod bpf_intf;
@@ -14,7 +17,6 @@ mod stats;
 use std::ffi::c_int;
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
-use std::str;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -65,7 +67,6 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::filter::EnvFilter;
 
 const SCHEDULER_NAME: &str = "scx_lavd";
-
 const STATS_TIMEOUT: Duration = Duration::from_secs(1);
 const RINGBUF_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -95,11 +96,18 @@ struct Opts {
     #[clap(long = "slice-min-us", default_value = "500")]
     slice_min_us: u64,
 
+    #[clap(long = "lat-load-target-pct", default_value = "100", value_parser=Opts::lat_load_target_pct_range)]
+    lat_load_target_pct: u16,
+
     #[clap(long = "mig-delta-pct", default_value = "0", value_parser=Opts::mig_delta_pct_range)]
     mig_delta_pct: u8,
 
-    /// Slice duration in microseconds to use for all tasks when pinned tasks
-    /// are running on a CPU. Must be between slice-min-us and slice-max-us.
+    #[clap(long = "lb-low-util-pct", default_value = "25", value_parser=Opts::lb_low_util_pct_range)]
+    lb_low_util_pct: u8,
+
+    #[clap(long = "lb-local-dsq-util-pct", default_value = "10", value_parser=Opts::lb_local_dsq_util_pct_range)]
+    lb_local_dsq_util_pct: u8,
+
     #[clap(long = "pinned-slice-us", default_value = "5000")]
     pinned_slice_us: Option<u64>,
 
@@ -115,6 +123,9 @@ struct Opts {
     #[clap(long = "no-futex-boost", action = clap::ArgAction::SetTrue)]
     no_futex_boost: bool,
 
+    #[clap(long = "no-fast-lb", action = clap::ArgAction::SetTrue)]
+    no_fast_lb: bool,
+
     #[clap(long = "no-preemption", action = clap::ArgAction::SetTrue)]
     no_preemption: bool,
 
@@ -129,6 +140,9 @@ struct Opts {
 
     #[clap(long = "enable-cpu-bw", action = clap::ArgAction::SetTrue)]
     enable_cpu_bw: bool,
+
+    #[clap(long = "partial", action = clap::ArgAction::SetTrue)]
+    partial: bool,
 
     #[clap(long = "no-core-compaction", action = clap::ArgAction::SetTrue)]
     no_core_compaction: bool,
@@ -284,7 +298,7 @@ impl Opts {
                 return None;
             } else {
                 info!(
-                    "Pinned task slice mode is enabled ({} μs). Pinned tasks use per-CPU DSQs.",
+                    "Pinned task slice mode is enabled ({} us). Pinned tasks will use per-CPU DSQs.",
                     pinned_slice
                 );
             }
@@ -303,7 +317,22 @@ impl Opts {
     }
 
     #[inline]
+    fn lat_load_target_pct_range(s: &str) -> Result<u16, String> {
+        number_range(s, 0, 200)
+    }
+
+    #[inline]
     fn mig_delta_pct_range(s: &str) -> Result<u8, String> {
+        number_range(s, 0, 100)
+    }
+
+    #[inline]
+    fn lb_low_util_pct_range(s: &str) -> Result<u8, String> {
+        number_range(s, 0, 100)
+    }
+
+    #[inline]
+    fn lb_local_dsq_util_pct_range(s: &str) -> Result<u8, String> {
         number_range(s, 0, 100)
     }
 }
@@ -391,6 +420,11 @@ impl<'a> Scheduler<'a> {
         let order = CpuOrder::new(opts.topology.as_ref())?;
         Self::init_cpus(&mut skel, &order);
         Self::init_cpdoms(&mut skel, &order);
+
+        if order.cpdom_map.len() > 1 {
+            let _ = Self::attach_execve_tracepoints(&mut skel)?;
+        }
+
         Self::init_globals(&mut skel, opts, &order, debug_level);
 
         let mut skel = scx_ops_load!(skel, lavd_ops, uei)?;
@@ -422,10 +456,7 @@ impl<'a> Scheduler<'a> {
         let ftraces = vec![
             ("__futex_wait", &skel.progs.fexit___futex_wait),
             ("futex_wait_multiple", &skel.progs.fexit_futex_wait_multiple),
-            (
-                "futex_wait_requeue_pi",
-                &skel.progs.fexit_futex_wait_requeue_pi,
-            ),
+            ("futex_wait_requeue_pi", &skel.progs.fexit_futex_wait_requeue_pi),
             ("futex_wake", &skel.progs.fexit_futex_wake),
             ("futex_wake_op", &skel.progs.fexit_futex_wake_op),
             ("futex_lock_pi", &skel.progs.fexit_futex_lock_pi),
@@ -444,18 +475,18 @@ impl<'a> Scheduler<'a> {
         let tracepoints = vec![
             ("syscalls:sys_enter_futex", &skel.progs.rtp_sys_enter_futex),
             ("syscalls:sys_exit_futex", &skel.progs.rtp_sys_exit_futex),
-            (
-                "syscalls:sys_exit_futex_wait",
-                &skel.progs.rtp_sys_exit_futex_wait,
-            ),
-            (
-                "syscalls:sys_exit_futex_waitv",
-                &skel.progs.rtp_sys_exit_futex_waitv,
-            ),
-            (
-                "syscalls:sys_exit_futex_wake",
-                &skel.progs.rtp_sys_exit_futex_wake,
-            ),
+            ("syscalls:sys_exit_futex_wait", &skel.progs.rtp_sys_exit_futex_wait),
+            ("syscalls:sys_exit_futex_waitv", &skel.progs.rtp_sys_exit_futex_waitv),
+            ("syscalls:sys_exit_futex_wake", &skel.progs.rtp_sys_exit_futex_wake),
+        ];
+
+        compat::cond_tracepoints_enable(tracepoints)
+    }
+
+    fn attach_execve_tracepoints(skel: &mut OpenBpfSkel) -> Result<bool> {
+        let tracepoints = vec![
+            ("syscalls:sys_enter_execve", &skel.progs.cond_hook_sys_enter_execve),
+            ("syscalls:sys_enter_execveat", &skel.progs.cond_hook_sys_enter_execveat),
         ];
 
         compat::cond_tracepoints_enable(tracepoints)
@@ -472,13 +503,9 @@ impl<'a> Scheduler<'a> {
             );
         }
 
-        let rodata = skel
-            .maps
-            .rodata_data
-            .as_mut()
-            .expect("rodata not available");
+        let rodata = skel.maps.rodata_data.as_mut().expect("rodata not available");
 
-        for cpu in order.cpuids.iter() {
+        for cpu in &order.cpuids {
             let cid = cpu.cpu_adx;
             rodata.cpu_capacity[cid] = cpu.cpu_cap as u16;
             rodata.cpu_big[cid] = cpu.big_core as u8;
@@ -502,11 +529,7 @@ impl<'a> Scheduler<'a> {
 
     #[inline]
     fn init_pco_tuple(skel: &mut OpenBpfSkel, i: usize, pco: &PerfCpuOrder) {
-        let rodata = skel
-            .maps
-            .rodata_data
-            .as_mut()
-            .expect("rodata not available");
+        let rodata = skel.maps.rodata_data.as_mut().expect("rodata not available");
 
         let cpus_perf = &pco.cpus_perf;
         let cpus_ovflw = &pco.cpus_ovflw;
@@ -528,7 +551,7 @@ impl<'a> Scheduler<'a> {
     fn init_cpdoms(skel: &mut OpenBpfSkel, order: &CpuOrder) {
         let bss_data = skel.maps.bss_data.as_mut().expect("bss_data not available");
 
-        for (k, v) in order.cpdom_map.iter() {
+        for (k, v) in &order.cpdom_map {
             let cpdom = &mut bss_data.cpdom_ctxs[v.cpdom_id];
 
             cpdom.id = v.cpdom_id as u64;
@@ -538,8 +561,8 @@ impl<'a> Scheduler<'a> {
             cpdom.is_big = k.is_big as u8;
             cpdom.is_valid = 1;
 
-            for &cpu_id in v.cpu_ids.iter() {
-                let word_idx = (cpu_id / 64) as usize;
+            for &cpu_id in &v.cpu_ids {
+                let word_idx = cpu_id / 64;
                 let bit_idx = cpu_id % 64;
                 cpdom.__cpumask[word_idx] |= 1u64 << bit_idx;
             }
@@ -572,23 +595,14 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    fn init_globals(
-        skel: &mut OpenBpfSkel,
-        opts: &Opts,
-        order: &CpuOrder,
-        debug_level: u8,
-    ) {
+    fn init_globals(skel: &mut OpenBpfSkel, opts: &Opts, order: &CpuOrder, debug_level: u8) {
         let bss_data = skel.maps.bss_data.as_mut().expect("bss_data not available");
         bss_data.no_preemption = opts.no_preemption;
         bss_data.no_core_compaction = opts.no_core_compaction;
         bss_data.no_freq_scaling = opts.no_freq_scaling;
         bss_data.is_powersave_mode = opts.powersave;
 
-        let rodata = skel
-            .maps
-            .rodata_data
-            .as_mut()
-            .expect("rodata not available");
+        let rodata = skel.maps.rodata_data.as_mut().expect("rodata not available");
         rodata.nr_llcs = order.nr_llcs as u64;
         rodata.nr_cpu_ids = *NR_CPU_IDS as u32;
         rodata.is_smt_active = order.smt_enabled;
@@ -598,14 +612,20 @@ impl<'a> Scheduler<'a> {
         rodata.slice_min_ns = opts.slice_min_us * 1000;
         rodata.pinned_slice_ns = opts.pinned_slice_us.map(|v| v * 1000).unwrap_or(0);
         rodata.preempt_shift = opts.preempt_shift;
+        rodata.lat_load_target_pct = opts.lat_load_target_pct;
         rodata.mig_delta_pct = opts.mig_delta_pct;
+        rodata.lb_low_util_wall = ((opts.lb_low_util_pct as u64) << 10) / 100;
+        rodata.lb_local_dsq_util_wall = ((opts.lb_local_dsq_util_pct as u64) << 10) / 100;
         rodata.no_use_em = opts.no_use_em as u8;
+        rodata.no_fast_lb = opts.no_fast_lb as u8;
         rodata.no_wake_sync = opts.no_wake_sync;
         rodata.no_slice_boost = opts.no_slice_boost;
         rodata.per_cpu_dsq = opts.per_cpu_dsq;
         rodata.enable_cpu_bw = opts.enable_cpu_bw;
 
-        if !ksym_exists("scx_cgroup_set_bandwidth").unwrap() {
+        let has_bw_kfunc = ksym_exists("scx_group_set_bandwidth").unwrap_or(false)
+            || ksym_exists("scx_cgroup_set_bandwidth").unwrap_or(false);
+        if !has_bw_kfunc {
             skel.struct_ops.lavd_ops_mut().cgroup_set_bandwidth = std::ptr::null_mut();
             warn!("Kernel does not support ops.cgroup_set_bandwidth(), so disable it.");
         }
@@ -614,6 +634,10 @@ impl<'a> Scheduler<'a> {
             | *compat::SCX_OPS_ENQ_LAST
             | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
             | *compat::SCX_OPS_KEEP_BUILTIN_IDLE;
+
+        if opts.partial {
+            skel.struct_ops.lavd_ops_mut().flags |= *compat::SCX_OPS_SWITCH_PARTIAL;
+        }
     }
 
     #[inline(always)]
@@ -662,25 +686,33 @@ impl<'a> Scheduler<'a> {
             suggested_cpu_id: tx.suggested_cpu_id,
             waker_pid: tx.waker_pid,
             waker_comm,
-            slice: tx.slice,
+            slice_wall: tx.slice_wall,
             lat_cri: tx.lat_cri,
             avg_lat_cri: tx.avg_lat_cri,
             static_prio: tx.static_prio,
-            rerunnable_interval: tx.rerunnable_interval,
-            resched_interval: tx.resched_interval,
+            rerunnable_interval_wall: tx.rerunnable_interval_wall,
+            resched_interval_wall: tx.resched_interval_wall,
             run_freq: tx.run_freq,
-            avg_runtime: tx.avg_runtime,
+            avg_runtime_wall: tx.avg_runtime_wall,
             wait_freq: tx.wait_freq,
             wake_freq: tx.wake_freq,
             perf_cri: tx.perf_cri,
             thr_perf_cri: tx.thr_perf_cri,
             cpuperf_cur: tx.cpuperf_cur,
-            cpu_util: tx.cpu_util,
-            cpu_sutil: tx.cpu_sutil,
+            cpu_util_wall: tx.cpu_util_wall,
+            cpu_util_invr: tx.cpu_util_invr,
+            steal_util_wall: tx.steal_util_wall,
+            steal_util_invr: tx.steal_util_invr,
+            dom_pinned_util_wall: tx.dom_pinned_util_wall,
+            dom_pinned_util_invr: tx.dom_pinned_util_invr,
             nr_active: tx.nr_active,
             dsq_id: tx.dsq_id,
             dsq_consume_lat: tx.dsq_consume_lat,
-            slice_used: tx.last_slice_used,
+            lat_headroom: tx.lat_headroom,
+            vuln_thresh: tx.vuln_thresh,
+            task_util_est: tx.task_util_est,
+            norm_lat_cri: tx.norm_lat_cri,
+            slice_used_wall: tx.last_slice_used_wall,
         }) {
             Ok(()) => 0,
             Err(TrySendError::Full(_)) => Self::handle_channel_full(),
@@ -712,12 +744,7 @@ impl<'a> Scheduler<'a> {
 
     #[inline]
     fn prep_introspec(&mut self) {
-        let bss_data = self
-            .skel
-            .maps
-            .bss_data
-            .as_mut()
-            .expect("bss_data not available");
+        let bss_data = self.skel.maps.bss_data.as_mut().expect("bss_data not available");
         if !bss_data.is_monitored {
             bss_data.is_monitored = true;
         }
@@ -765,12 +792,7 @@ impl<'a> Scheduler<'a> {
                     return Ok(StatsRes::Bye);
                 }
 
-                let bss_data = self
-                    .skel
-                    .maps
-                    .bss_data
-                    .as_ref()
-                    .expect("bss_data not available");
+                let bss_data = self.skel.maps.bss_data.as_ref().expect("bss_data not available");
                 let st = &bss_data.sys_stat;
 
                 let mseq = Self::get_msg_seq_id();
@@ -946,6 +968,7 @@ impl<'a> Scheduler<'a> {
             }
             self.cleanup_introspec();
         }
+
         self.rb_mgr
             .consume()
             .context("Failed to flush ring buffer before exit")?;

@@ -2,7 +2,6 @@
 //
 // Copyright (c) 2025 Valve Corporation.
 // Author: Changwoo Min <changwoo@igalia.com>
-// Optimized for Intel Raptor Lake (i7-14700KF)
 
 use anyhow::Result;
 use combinations::Combinations;
@@ -22,23 +21,25 @@ use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
 pub struct CpuId {
-    // Hot fields first for cache locality during sorting/iteration
-    pub cpu_adx: usize,
-    pub cpu_sibling: usize,
-    pub cpu_cap: usize,
     pub numa_adx: usize,
     pub pd_adx: usize,
     pub llc_adx: usize,
+    pub llc_rdx: usize,
     pub llc_kernel_id: usize,
+    pub cpu_adx: usize,
     pub smt_level: usize,
+    pub cache_size: usize,
+    pub cpu_cap: usize,
     pub big_core: bool,
     pub turbo_core: bool,
+    pub cpu_sibling: usize,
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
 pub struct ComputeDomainId {
     pub numa_adx: usize,
     pub llc_adx: usize,
+    pub llc_rdx: usize,
     pub llc_kernel_id: usize,
     pub is_big: bool,
 }
@@ -75,18 +76,14 @@ impl CpuOrder {
         let cpus_ps = ctx.build_topo_order(true);
         let cpdom_map = ctx.build_cpdom(&cpus_pf);
 
-        // Raptor Lake Optimization:
-        // We force the tiered topological generation for hybrid CPUs because
-        // generic Energy Model traversal often creates fragmented sets that
-        // break L2 cluster locality on E-cores.
         let perf_cpu_order = if ctx.topo.has_little_cores() {
-             EnergyModelOptimizer::get_tiered_perf_cpu_order_table(&cpus_pf, &cpus_ps)
+            EnergyModelOptimizer::get_tiered_perf_cpu_order_table(&cpus_pf, &cpus_ps)
         } else if let Ok(em) = &ctx.em {
             if em.perf_doms.len() <= 16 {
                 EnergyModelOptimizer::get_perf_cpu_order_table(em, &cpus_pf)
             } else {
                 warn!(
-                    "Too many performance domains ({}), utilizing topological fallback",
+                    "Too many performance domains ({}), using topological fallback",
                     em.perf_doms.len()
                 );
                 EnergyModelOptimizer::get_tiered_perf_cpu_order_table(&cpus_pf, &cpus_ps)
@@ -120,97 +117,52 @@ impl CpuOrderCtx {
 
         let em = EnergyModel::new();
         let smt_enabled = topo.smt_enabled;
-        let has_biglittle = topo.has_little_cores();
 
         debug!(
-            "Topology: {} CPUs, Big.Little: {}",
+            "Topology: cpus={} llcs={} numa={} smt={} hybrid={}",
             topo.all_cpus.len(),
-            has_biglittle
+            topo.all_llcs.len(),
+            topo.nodes.len(),
+            smt_enabled,
+            topo.has_little_cores()
         );
 
-        Ok(CpuOrderCtx {
+        Ok(Self {
             topo,
             em,
             smt_enabled,
         })
     }
 
-    /// **Godlike Ranking for Raptor Lake (i7-14700KF)**
-    fn rank_cpu_performance(&self, cpu: &CpuId) -> u64 {
-        // SMT Penalty: SMT=1 is last.
-        let smt_score = if cpu.smt_level == 0 { 0 } else { 1 };
-
-        // Core Type: Big(P)=0, Little(E)=1
-        let core_type_score = if cpu.big_core { 0 } else { 1 };
-
-        // Turbo Bias: Turbo=0, Non-Turbo=1 (P-Cores only)
-        let turbo_score = if cpu.turbo_core { 0 } else { 1 };
-
-        // Capacity Score: Higher capacity = Lower score (preferred)
-        // We invert capacity. 14700KF max is ~1024.
-        let cap_inv = (2048 - cpu.cpu_cap.min(2048)) as u64;
-
-        // Locality Score:
-        // For E-Cores, we MUST sort by ID to keep L2 clusters contiguous.
-        // Sorting E-Cores by capacity is noise and breaks L2 locality.
-        // For P-Cores, capacity/turbo matters more than ID.
-        let locality_score = if !cpu.big_core {
-            cpu.cpu_adx as u64
-        } else {
-            0 // Let turbo/cap decide for P-cores
-        };
-
-        ((smt_score as u64) << 60)
-            | ((core_type_score as u64) << 55)
-            | ((turbo_score as u64) << 50)
-            | (cap_inv << 20)
-            | locality_score
-    }
-
-    fn rank_cpu_powersave(&self, cpu: &CpuId) -> u64 {
-        // 1. Prefer E-Cores (0) over P-Cores (1)
-        let core_type_score = if !cpu.big_core { 0 } else { 1 };
-
-        // 2. Prefer Physical (0) over SMT (1)
-        let smt_score = if cpu.smt_level == 0 { 0 } else { 1 };
-
-        // 3. Prefer contiguous IDs for E-cores (L2 locality)
-        // For P-cores in powersave, ID order is fine too.
-        let id_score = cpu.cpu_adx as u64;
-
-        ((core_type_score as u64) << 60)
-            | ((smt_score as u64) << 50)
-            | id_score
-    }
-
     fn build_topo_order(&self, prefer_powersave: bool) -> Vec<CpuId> {
         let mut cpu_ids = Vec::with_capacity(self.topo.all_cpus.len());
         let smt_siblings = self.topo.sibling_cpus();
 
-        for (&numa_adx, node) in self.topo.nodes.iter() {
-            for (&llc_adx, llc) in node.llcs.iter() {
-                for (_core_adx, core) in llc.cores.iter() {
-                    for (cpu_adx, cpu) in core.cpus.iter() {
-                        let cpu_adx = *cpu_adx;
+        for (&numa_adx, node) in &self.topo.nodes {
+            for (llc_rdx, (&llc_adx, llc)) in node.llcs.iter().enumerate() {
+                for (_core_rdx, (_core_adx, core)) in llc.cores.iter().enumerate() {
+                    for (_cpu_rdx, (&cpu_adx, cpu)) in core.cpus.iter().enumerate() {
                         let pd_adx = Self::get_pd_id(&self.em, cpu_adx, llc_adx);
-
-                        let cpu_id = CpuId {
-                            cpu_adx,
-                            cpu_sibling: smt_siblings[cpu_adx] as usize,
-                            cpu_cap: cpu.cpu_capacity,
+                        cpu_ids.push(CpuId {
                             numa_adx,
                             pd_adx,
                             llc_adx,
+                            llc_rdx,
                             llc_kernel_id: llc.kernel_id,
+                            cpu_adx,
                             smt_level: cpu.smt_level,
+                            cache_size: cpu.cache_size,
+                            cpu_cap: cpu.cpu_capacity,
                             big_core: cpu.core_type != CoreType::Little,
-                            turbo_core: cpu.core_type == CoreType::Big { turbo: true },
-                        };
-                        cpu_ids.push(cpu_id);
+                            turbo_core: false,
+                            cpu_sibling: smt_siblings[cpu_adx] as usize,
+                        });
                     }
                 }
             }
         }
+
+        Self::mark_turbo_candidates(&mut cpu_ids);
 
         if prefer_powersave {
             cpu_ids.sort_unstable_by_key(|cpu| self.rank_cpu_powersave(cpu));
@@ -221,15 +173,76 @@ impl CpuOrderCtx {
         cpu_ids
     }
 
-    fn build_cpdom(&self, cpu_ids: &Vec<CpuId>) -> BTreeMap<ComputeDomainId, ComputeDomain> {
+    fn mark_turbo_candidates(cpu_ids: &mut [CpuId]) {
+        let mut p_phys: Vec<(usize, usize, usize)> = cpu_ids
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.big_core && c.smt_level == 0)
+            .map(|(idx, c)| (idx, c.cpu_cap, c.cpu_adx))
+            .collect();
+
+        p_phys.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+
+        let top = p_phys.len().min(2);
+        for (idx, _, _) in p_phys.into_iter().take(top) {
+            cpu_ids[idx].turbo_core = true;
+        }
+    }
+
+    fn rank_cpu_performance(&self, cpu: &CpuId) -> u64 {
+        let smt_score = if cpu.smt_level == 0 { 0_u64 } else { 1_u64 };
+        let core_type_score = if cpu.big_core { 0_u64 } else { 1_u64 };
+        let turbo_score = if cpu.turbo_core { 0_u64 } else { 1_u64 };
+
+        // Prefer higher capacity and larger cache.
+        let cap_inv = (2048_u64).saturating_sub(cpu.cpu_cap.min(2048) as u64);
+        let cache_kib = (cpu.cache_size >> 10).min(0xFF);
+        let cache_inv = 0xFF_u64.saturating_sub(cache_kib as u64);
+
+        // Keep E-core ordering contiguous by cpu_adx for cluster locality.
+        let locality_score = if cpu.big_core {
+            ((cpu.numa_adx as u64) << 8) | (cpu.cpu_adx as u64 & 0xFF)
+        } else {
+            cpu.cpu_adx as u64
+        } & 0xFFF;
+
+        (smt_score << 60)
+        | (core_type_score << 56)
+        | (turbo_score << 52)
+        | (cap_inv << 20)
+        | (cache_inv << 12)
+        | locality_score
+    }
+
+    fn rank_cpu_powersave(&self, cpu: &CpuId) -> u64 {
+        // Prefer E-cores, then non-SMT, then better perf-per-watt hints:
+        // smaller capacity first, larger cache first, then stable locality.
+        let core_type_score = if !cpu.big_core { 0_u64 } else { 1_u64 };
+        let smt_score = if cpu.smt_level == 0 { 0_u64 } else { 1_u64 };
+
+        let cap_score = cpu.cpu_cap.min(0xFFFF) as u64;
+        let cache_kib = (cpu.cache_size >> 10).min(0xFF);
+        let cache_inv = 0xFF_u64.saturating_sub(cache_kib as u64);
+
+        let locality_score = (((cpu.numa_adx as u64) << 8) | (cpu.cpu_adx as u64 & 0xFF)) & 0xFFF;
+
+        (core_type_score << 60)
+        | (smt_score << 56)
+        | (cap_score << 20)
+        | (cache_inv << 12)
+        | locality_score
+    }
+
+    fn build_cpdom(&self, cpu_ids: &[CpuId]) -> BTreeMap<ComputeDomainId, ComputeDomain> {
         let mut cpdom_map: BTreeMap<ComputeDomainId, ComputeDomain> = BTreeMap::new();
         let mut cpdom_types: BTreeMap<usize, bool> = BTreeMap::new();
 
-        let mut next_cpdom_id = 0;
+        let mut next_cpdom_id = 0usize;
         for cpu_id in cpu_ids {
             let key = ComputeDomainId {
                 numa_adx: cpu_id.numa_adx,
                 llc_adx: cpu_id.llc_adx,
+                llc_rdx: cpu_id.llc_rdx,
                 llc_kernel_id: cpu_id.llc_kernel_id,
                 is_big: cpu_id.big_core,
             };
@@ -248,7 +261,8 @@ impl CpuOrderCtx {
             entry.cpu_ids.push(cpu_id.cpu_adx);
         }
 
-        let lookup: BTreeMap<ComputeDomainId, usize> = cpdom_map.iter()
+        let lookup: BTreeMap<ComputeDomainId, usize> = cpdom_map
+            .iter()
             .map(|(k, v)| (k.clone(), v.cpdom_id))
             .collect();
 
@@ -261,27 +275,30 @@ impl CpuOrderCtx {
                 if from_k == to_k {
                     continue;
                 }
-                let dist = Self::dist(from_k, to_k);
+                let d = Self::dist(from_k, to_k);
                 let to_id = lookup[to_k];
                 neighbors
                     .entry(from_id)
                     .or_default()
-                    .entry(dist)
+                    .entry(d)
                     .or_default()
                     .push(to_id);
             }
         }
 
-        for (cpdom_id, dist_map) in neighbors {
-            if let Some(domain) = cpdom_map.values_mut().find(|d| d.cpdom_id == cpdom_id) {
-                for (dist, n_list) in dist_map {
-                    let sorted = Self::circular_sort(domain.cpdom_id, &n_list);
-                    domain.neighbor_map.insert(dist, sorted);
+        for from_k in &keys {
+            let from_id = lookup[from_k];
+            if let Some(dist_map) = neighbors.remove(&from_id) {
+                if let Some(domain) = cpdom_map.get_mut(from_k) {
+                    for (dist, n_list) in dist_map {
+                        let sorted = Self::circular_sort(domain.cpdom_id, &n_list);
+                        domain.neighbor_map.insert(dist, sorted);
+                    }
                 }
             }
         }
 
-        for (k, v) in cpdom_map.iter_mut() {
+        for (k, v) in &mut cpdom_map {
             let mut alt_k = k.clone();
             alt_k.is_big = !k.is_big;
 
@@ -304,16 +321,32 @@ impl CpuOrderCtx {
         cpdom_map
     }
 
-    fn circular_sort(start: usize, the_rest: &Vec<usize>) -> Vec<usize> {
-        let mut list = the_rest.clone();
+    fn circular_sort(start: usize, the_rest: &[usize]) -> Vec<usize> {
+        let mut list = Vec::with_capacity(the_rest.len() + 1);
+        list.extend_from_slice(the_rest);
         list.push(start);
         list.sort_unstable();
 
-        if let Ok(s) = list.binary_search(&start) {
-            list.rotate_left(s);
-            list.remove(0);
+        let s = match list.binary_search(&start) {
+            Ok(s) => s,
+            Err(_) => return the_rest.to_vec(),
+        };
+
+        let n = list.len();
+        if n <= 1 {
+            return Vec::new();
         }
-        list
+
+        let dist = |x: usize| {
+            let d = (x + n - s) % n;
+            d.min(n - d)
+        };
+
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by_key(|&x| (dist(x), x));
+
+        let sorted: Vec<usize> = order.into_iter().map(|i| list[i]).collect();
+        sorted[1..].to_vec()
     }
 
     fn get_pd_id(em: &Result<EnergyModel>, cpu_adx: usize, llc_adx: usize) -> usize {
@@ -327,14 +360,19 @@ impl CpuOrderCtx {
     }
 
     fn dist(from: &ComputeDomainId, to: &ComputeDomainId) -> usize {
-        let mut d = 0;
+        let mut d = 0usize;
         if from.is_big != to.is_big {
             d += 100;
         }
         if from.numa_adx != to.numa_adx {
             d += 10;
-        } else if from.llc_kernel_id != to.llc_kernel_id {
-            d += 1;
+        } else {
+            if from.llc_rdx != to.llc_rdx {
+                d += 1;
+            }
+            if from.llc_kernel_id != to.llc_kernel_id {
+                d += 1;
+            }
         }
         d
     }
@@ -376,66 +414,59 @@ const CPU_UNIT: usize = 100_000;
 const LOOKAHEAD_CNT: usize = 10;
 
 impl<'a> EnergyModelOptimizer<'a> {
-    /// Generates a tiered PCO table for optimal Core Compaction on Hybrid CPUs.
-    /// Fixes regression by creating stable performance plateaus:
-    /// 1. Top Turbo P-Cores (Latency Sensitive / Gaming)
-    /// 2. All Physical P-Cores (High Throughput)
-    /// 3. All Physical Cores (P + E) (Max Physical Throughput)
-    /// 4. All Cores (P + E + SMT) (Saturation)
     fn get_tiered_perf_cpu_order_table(
-        cpus_pf: &'a Vec<CpuId>,
-        cpus_ps: &'a Vec<CpuId>,
+        cpus_pf: &'a [CpuId],
+        cpus_ps: &'a [CpuId],
     ) -> BTreeMap<usize, PerfCpuOrder> {
         let mut map = BTreeMap::new();
-        let tot_perf: usize = cpus_pf.iter().map(|c| c.cpu_cap).sum();
+        let tot_perf: usize = cpus_pf.iter().map(|c| c.cpu_cap).sum::<usize>().max(1);
 
-        let mut current_cap = 0;
-        let mut current_cpus = Vec::new();
+        let mut current_cap = 0usize;
+        let mut current_cpus = Vec::with_capacity(cpus_pf.len());
 
-        let mut p_turbo_count = 0;
-        let mut p_count = 0;
-        let mut e_count = 0;
+        let mut p_turbo_count = 0usize;
+        let mut p_count = 0usize;
+        let mut e_count = 0usize;
 
-        // Count core types for logical tiers
         for cpu in cpus_pf {
             if cpu.smt_level == 0 {
                 if cpu.big_core {
                     p_count += 1;
-                    if cpu.turbo_core { p_turbo_count += 1; }
+                    if cpu.turbo_core {
+                        p_turbo_count += 1;
+                    }
                 } else {
                     e_count += 1;
                 }
             }
         }
 
-        // Scan through sorted CPU list and insert breakpoints
         for (i, cpu) in cpus_pf.iter().enumerate() {
             current_cap += cpu.cpu_cap;
             current_cpus.push(cpu.cpu_adx);
 
-            // Tier 1: Turbo P-Cores (usually top 2)
-            let tier1_end = i == (p_turbo_count - 1);
-            // Tier 2: All P-Cores
-            let tier2_end = i == (p_count - 1);
-            // Tier 3: All Physical Cores (P+E)
-            let tier3_end = i == (p_count + e_count - 1);
-            // Tier 4: Everything (Implicit at end of loop)
-            let tier4_end = i == cpus_pf.len() - 1;
+            let tier1_end = p_turbo_count > 0 && i + 1 == p_turbo_count;
+            let tier2_end = p_count > 0 && i + 1 == p_count;
+            let tier3_target = p_count + e_count;
+            let tier3_end = tier3_target > 0 && i + 1 == tier3_target;
+            let tier4_end = i + 1 == cpus_pf.len();
 
             if tier1_end || tier2_end || tier3_end || tier4_end {
-                let perf_util = (current_cap as f32) / (tot_perf.max(1) as f32);
-                map.insert(current_cap, PerfCpuOrder {
-                    perf_cap: current_cap,
-                    perf_util,
-                    cpus_perf: current_cpus.clone(),
-                    cpus_ovflw: Vec::new(),
-                });
+                let perf_util = (current_cap as f32) / (tot_perf as f32);
+                map.insert(
+                    current_cap,
+                    PerfCpuOrder {
+                        perf_cap: current_cap,
+                        perf_util,
+                        cpus_perf: current_cpus.clone(),
+                        cpus_ovflw: Vec::new(),
+                    },
+                );
             }
         }
 
         Self::fill_overflow(&mut map);
 
-        // Powersave: Just 1 E-core to start.
         let pco_ps = Self::fake_pco(tot_perf, cpus_ps, true);
         map.entry(pco_ps.perf_cap).or_insert(pco_ps);
 
@@ -443,45 +474,55 @@ impl<'a> EnergyModelOptimizer<'a> {
     }
 
     fn fill_overflow(map: &mut BTreeMap<usize, PerfCpuOrder>) {
-        let keys: Vec<usize> = map.keys().cloned().collect();
-        if keys.is_empty() { return; }
+        let keys: Vec<usize> = map.keys().copied().collect();
+        if keys.is_empty() {
+            return;
+        }
 
         for i in 1..keys.len() {
             let current_cap = keys[i - 1];
-            let used_cpus: HashSet<usize> = map[&current_cap]
-                .cpus_perf.iter().cloned().collect();
-
+            let mut used: HashSet<usize> = map[&current_cap].cpus_perf.iter().copied().collect();
             let mut overflow = Vec::new();
-            // Gather all CPUs from higher tiers that aren't in current tier
+
             for &cap in &keys[i..] {
                 for &cpu in &map[&cap].cpus_perf {
-                    if !used_cpus.contains(&cpu) && !overflow.contains(&cpu) {
+                    if used.insert(cpu) {
                         overflow.push(cpu);
                     }
                 }
             }
-            map.get_mut(&current_cap).unwrap().cpus_ovflw = overflow;
+
+            if let Some(entry) = map.get_mut(&current_cap) {
+                entry.cpus_ovflw = overflow;
+            }
         }
     }
 
-    fn fake_pco(tot_perf: usize, cpuids: &'a Vec<CpuId>, powersave: bool) -> PerfCpuOrder {
-        // For powersave, pick 1 E-core.
-        let split = if powersave { 1 } else { cpuids.len() };
+    fn fake_pco(tot_perf: usize, cpuids: &'a [CpuId], powersave: bool) -> PerfCpuOrder {
+        if cpuids.is_empty() {
+            return PerfCpuOrder {
+                perf_cap: 0,
+                perf_util: 0.0,
+                cpus_perf: Vec::new(),
+                cpus_ovflw: Vec::new(),
+            };
+        }
 
+        let split = if powersave { 1 } else { cpuids.len() };
         let cpus: Vec<usize> = cpuids.iter().map(|c| c.cpu_adx).collect();
+
         let (primary, overflow) = if split < cpus.len() {
             (cpus[..split].to_vec(), cpus[split..].to_vec())
         } else {
             (cpus.clone(), Vec::new())
         };
 
-        let perf_cap = if powersave {
-            cpuids[0].cpu_cap
+        let perf_cap = if powersave { cpuids[0].cpu_cap } else { tot_perf };
+        let perf_util = if tot_perf == 0 {
+            0.0
         } else {
-            tot_perf
+            (perf_cap as f32) / (tot_perf as f32)
         };
-
-        let perf_util = (perf_cap as f32) / (tot_perf.max(1) as f32);
 
         PerfCpuOrder {
             perf_cap,
@@ -493,26 +534,26 @@ impl<'a> EnergyModelOptimizer<'a> {
 
     fn get_perf_cpu_order_table(
         em: &'a EnergyModel,
-        cpus_pf: &'a Vec<CpuId>,
+        cpus_pf: &'a [CpuId],
     ) -> BTreeMap<usize, PerfCpuOrder> {
         let mut emo = Self::new(em, cpus_pf);
         emo.gen_perf_cpu_order_table();
         emo.perf_cpu_order
     }
 
-    fn new(em: &'a EnergyModel, cpus_pf: &'a Vec<CpuId>) -> Self {
-        let mut pd_cpu_order = BTreeMap::new();
+    fn new(em: &'a EnergyModel, cpus_pf: &'a [CpuId]) -> Self {
+        let mut pd_cpu_order: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         let mut cpus_topological_order = Vec::with_capacity(cpus_pf.len());
 
         for cpuid in cpus_pf {
             pd_cpu_order
                 .entry(cpuid.pd_adx)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(cpuid.cpu_adx);
             cpus_topological_order.push(cpuid.cpu_adx);
         }
 
-        EnergyModelOptimizer {
+        Self {
             em,
             pd_cpu_order,
             cpus_topological_order,
@@ -555,6 +596,10 @@ impl<'a> EnergyModelOptimizer<'a> {
         let pds_set = self.gen_pds_set(util);
         let n = pds_set.len();
 
+        if n == 0 {
+            return Vec::new();
+        }
+
         if n > 12 {
             return vec![PDSetInfo::new(pds_set)];
         }
@@ -569,6 +614,7 @@ impl<'a> EnergyModelOptimizer<'a> {
 
     fn gen_pds_set(&self, util: f32) -> Vec<PDS<'a>> {
         let mut pds_set = Vec::new();
+
         for pd in self.em.perf_doms.values() {
             if let Some(ps) = pd.select_perf_state(util) {
                 let weight = pd.span.weight();
@@ -577,12 +623,14 @@ impl<'a> EnergyModelOptimizer<'a> {
                 }
             }
         }
+
         pds_set.sort_unstable();
         pds_set
     }
 
     fn insert_pds_combinations(&mut self, new_pdsis: Vec<PDSetInfo<'a>>) -> bool {
         let mut found = false;
+
         for item in new_pdsis {
             let entry = self.pdss_infos.entry(item.performance).or_default();
 
@@ -592,7 +640,8 @@ impl<'a> EnergyModelOptimizer<'a> {
                 continue;
             }
 
-            let current_best = entry.iter().next().unwrap().power;
+            let current_best = entry.iter().next().map(|x| x.power).unwrap_or(usize::MAX);
+
             match item.power.cmp(&current_best) {
                 Ordering::Less => {
                     entry.clear();
@@ -607,13 +656,14 @@ impl<'a> EnergyModelOptimizer<'a> {
                 Ordering::Greater => {}
             }
         }
+
         found
     }
 
     fn gen_perf_pds_table(&mut self) {
-        let utils = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+        let utils = [0.05_f32, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
-        for &util in &utils {
+        for util in utils {
             let base = self.perf_pdsi.last_key_value().map(|(_, v)| v.clone());
             let best = self.find_perf_pds_for(util, base.as_ref());
 
@@ -630,15 +680,11 @@ impl<'a> EnergyModelOptimizer<'a> {
         }
     }
 
-    fn find_perf_pds_for(
-        &self,
-        util: f32,
-        base: Option<&PDSetInfo<'a>>,
-    ) -> Option<PDSetInfo<'a>> {
+    fn find_perf_pds_for(&self, util: f32, base: Option<&PDSetInfo<'a>>) -> Option<PDSetInfo<'a>> {
         let target_perf = (util * self.tot_perf as f32) as usize;
         let mut best_pdsi = None;
         let mut min_dist = usize::MAX;
-        let mut lookahead = 0;
+        let mut lookahead = 0usize;
 
         for (&perf, set) in &self.pdss_infos {
             if perf >= target_perf {
@@ -655,10 +701,18 @@ impl<'a> EnergyModelOptimizer<'a> {
                 }
             }
         }
+
         best_pdsi
     }
 
     fn assign_cpu_vids(&mut self) {
+        let topo_rank: BTreeMap<usize, usize> = self
+            .cpus_topological_order
+            .iter()
+            .enumerate()
+            .map(|(idx, &cpu)| (cpu, idx))
+            .collect();
+
         for (&perf_cap, pdsi) in &self.perf_pdsi {
             let mut cpus_perf = Vec::new();
 
@@ -670,14 +724,13 @@ impl<'a> EnergyModelOptimizer<'a> {
                 }
             }
 
-            cpus_perf.sort_unstable_by_key(|&id| {
-                self.cpus_topological_order
-                    .iter()
-                    .position(|&x| x == id)
-                    .unwrap_or(usize::MAX)
-            });
+            cpus_perf.sort_unstable_by_key(|id| topo_rank.get(id).copied().unwrap_or(usize::MAX));
 
-            let perf_util = (perf_cap as f32) / (self.tot_perf as f32);
+            let perf_util = if self.tot_perf == 0 {
+                0.0
+            } else {
+                (perf_cap as f32) / (self.tot_perf as f32)
+            };
 
             self.perf_cpu_order.insert(
                 perf_cap,
@@ -696,14 +749,14 @@ impl<'a> EnergyModelOptimizer<'a> {
 
 impl<'a> PDSetInfo<'a> {
     fn new(pds_set: Vec<PDS<'a>>) -> Self {
-        let mut performance = 0;
-        let mut power = 0;
+        let mut performance = 0usize;
+        let mut power = 0usize;
         let mut pd_id_set = BTreeSet::new();
-        let mut pds_groups: BTreeMap<&PDS<'a>, usize> = BTreeMap::new();
+        let mut pds_groups: BTreeMap<PDS<'a>, usize> = BTreeMap::new();
 
-        for pds in &pds_set {
-            performance += pds.ps.performance;
-            power += pds.ps.power;
+        for pds in pds_set {
+            performance = performance.saturating_add(pds.ps.performance);
+            power = power.saturating_add(pds.ps.power);
             pd_id_set.insert(pds.pd.id);
             *pds_groups.entry(pds).or_default() += 1;
         }
@@ -718,7 +771,7 @@ impl<'a> PDSetInfo<'a> {
             }
         }
 
-        PDSetInfo {
+        Self {
             performance,
             power,
             pdcpu_set,
@@ -734,14 +787,10 @@ impl<'a> PDSetInfo<'a> {
             .map(|b| self.pd_id_set.intersection(&b.pd_id_set).count())
             .unwrap_or(0);
 
+        let first_pd = self.pd_id_set.first().copied().unwrap_or(0);
         ((nr_pds - overlap) * PD_UNIT)
             + ((*NR_CPU_IDS - nr_cpus) * CPU_UNIT)
-            + (*NR_CPU_IDS
-                - self
-                    .pd_id_set
-                    .first()
-                    .cloned()
-                    .unwrap_or(0))
+            + (*NR_CPU_IDS - first_pd)
     }
 }
 
@@ -766,15 +815,9 @@ impl PartialEq for PerfCpuOrder {
 }
 
 impl fmt::Display for PerfCpuOrder {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "capacity bound:  {} ({}%)\n",
-            self.perf_cap,
-            self.perf_util * 100.0
-        )?;
-        write!(f, "  primary CPUs:  {:?}\n", self.cpus_perf)?;
-        write!(f, "  overflow CPUs: {:?}", self.cpus_ovflw)?;
-        Ok(())
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "capacity bound:  {} ({}%)", self.perf_cap, self.perf_util * 100.0)?;
+        writeln!(f, "  primary CPUs:  {:?}", self.cpus_perf)?;
+        write!(f, "  overflow CPUs: {:?}", self.cpus_ovflw)
     }
 }
