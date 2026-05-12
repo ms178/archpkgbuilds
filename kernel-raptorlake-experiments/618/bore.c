@@ -1,13 +1,14 @@
 /*
  *  Burst-Oriented Response Enhancer (BORE) CPU Scheduler
  *  Copyright (C) 2021-2025 Masahito Suzuki <firelzrd@gmail.com>
- *
  */
+
 #include <linux/cpuset.h>
-#include <linux/sched/task.h>
-#include <linux/sched/bore.h>
-#include <linux/percpu.h>
+#include <linux/kernel.h>
 #include <linux/limits.h>
+#include <linux/percpu.h>
+#include <linux/sched/bore.h>
+#include <linux/sched/task.h>
 #include <linux/workqueue.h>
 #include "sched.h"
 
@@ -20,18 +21,18 @@
 #ifdef CONFIG_SCHED_BORE
 
 DEFINE_STATIC_KEY_TRUE(sched_bore_key);
-u8   __read_mostly sched_bore                 = 1;
-u8   __read_mostly sched_burst_inherit_type   = 2;
-u8   __read_mostly sched_burst_smoothness     = 1;
-u8   __read_mostly sched_burst_penalty_offset = 24;
-uint __read_mostly sched_burst_penalty_scale  = 1536;
+u8 __read_mostly sched_bore = 1;
+u8 __read_mostly sched_burst_inherit_type = 2;
+u8 __read_mostly sched_burst_smoothness = 1;
+u8 __read_mostly sched_burst_penalty_offset = 24;
+uint __read_mostly sched_burst_penalty_scale = 1536;
 uint __read_mostly sched_burst_cache_lifetime = 75000000;
 
-static int __maybe_unused maxval_6_bits  = 63;
+static int __maybe_unused maxval_6_bits = 63;
 static int __maybe_unused maxval_12_bits = 4095;
 static int __maybe_unused maxval_100 = 100;
 
-#define MAX_BURST_PENALTY      ((40U << 8) - 1)
+#define MAX_BURST_PENALTY        ((40U << 8) - 1U)
 #define BURST_CACHE_SAMPLE_LIMIT 63U
 #define BURST_CACHE_SCAN_LIMIT   (BURST_CACHE_SAMPLE_LIMIT * 2U)
 
@@ -54,7 +55,40 @@ static const u8 bore_log2_lut[256] = {
 	237, 238, 239, 239, 240, 241, 241, 242, 243, 244, 244, 245, 246, 247, 247, 248,
 };
 
-static u32 bore_reciprocal_lut[BURST_CACHE_SAMPLE_LIMIT + 1];
+static u32 bore_reciprocal_lut[BURST_CACHE_SAMPLE_LIMIT + 1U];
+
+DEFINE_STATIC_KEY_TRUE(sched_burst_inherit_key);
+DEFINE_STATIC_KEY_TRUE(sched_burst_ancestor_key);
+
+struct bore_penalty_params {
+	u16 offset_q8;
+	u16 scale;
+	u16 exp_floor_q8;
+	u16 sat_delta;
+	u64 burst_floor;
+	u8 gen;
+};
+
+static DEFINE_PER_CPU(struct bore_penalty_params, bore_pparams);
+static atomic_t bore_pparam_gen = ATOMIC_INIT(1);
+static u8 __read_mostly bore_pparam_gen_shadow = 1;
+
+#ifdef CONFIG_X86
+static u8 __read_mostly sched_burst_itd_enable = 1;
+static u32 __read_mostly sched_burst_itd_async_interval_ms = 10;
+static u32 __read_mostly sched_burst_itd_cap_pct = 60;
+
+#define BORE_ITD_MAX_CLASSES 8
+
+static u32 __read_mostly sched_burst_itd_bias_pcore_pct[BORE_ITD_MAX_CLASSES] = {
+	[0] = 0, [1] = 5, [2] = 45, [3] = 90,
+	[4 ... BORE_ITD_MAX_CLASSES - 1] = 0,
+};
+
+static u32 __read_mostly sched_burst_itd_bias_ecore_pct[BORE_ITD_MAX_CLASSES] = {
+	[0] = 0, [1] = 10, [2] = 50, [3] = 100,
+	[4 ... BORE_ITD_MAX_CLASSES - 1] = 0,
+};
 
 static const u16 bore_pct_to_q8_lut[101] = {
 	[0 ... 100] = 0,
@@ -80,24 +114,6 @@ static const u16 bore_pct_to_q8_lut[101] = {
 	[96] = 245, [97] = 248, [98] = 250, [99] = 253, [100] = 256,
 };
 
-DEFINE_STATIC_KEY_TRUE(sched_burst_inherit_key);
-DEFINE_STATIC_KEY_TRUE(sched_burst_ancestor_key);
-
-#ifdef CONFIG_X86
-static u8  __read_mostly sched_burst_itd_enable = 1;
-static u32 __read_mostly sched_burst_itd_async_interval_ms = 10;
-static u32 __read_mostly sched_burst_itd_cap_pct = 60;
-
-#define BORE_ITD_MAX_CLASSES 8
-static u32 __read_mostly sched_burst_itd_bias_pcore_pct[BORE_ITD_MAX_CLASSES] = {
-	[0] = 0, [1] = 5, [2] = 45, [3] = 90,
-	[4 ... BORE_ITD_MAX_CLASSES - 1] = 0,
-};
-static u32 __read_mostly sched_burst_itd_bias_ecore_pct[BORE_ITD_MAX_CLASSES] = {
-	[0] = 0, [1] = 10, [2] = 50, [3] = 100,
-	[4 ... BORE_ITD_MAX_CLASSES - 1] = 0,
-};
-
 struct bore_itd_state {
 	u8 cached_class;
 	u8 cached_valid;
@@ -105,7 +121,6 @@ struct bore_itd_state {
 	u8 is_pcore;
 	u16 cached_q8;
 	u8 _pad1[58];
-
 	u64 last_sample_ns;
 	u8 _pad2[56];
 } ____cacheline_aligned_in_smp;
@@ -119,32 +134,16 @@ DEFINE_STATIC_KEY_FALSE(bore_itd_key);
 #endif
 #endif
 
-/*
- * Per-CPU cached penalty parameters, rebuilt lazily after sysctl updates.
- * This avoids repeated global variable reads in update_curr() hot path.
- */
-struct bore_penalty_params {
-	u16 offset_q8;
-	u16 scale;
-	u16 exp_floor_q8;
-	u16 sat_delta;
-	u8 gen;
-};
-
-static DEFINE_PER_CPU(struct bore_penalty_params, bore_pparams);
-static atomic_t bore_pparam_gen = ATOMIC_INIT(1);
-static u8 __read_mostly bore_pparam_gen_shadow = 1;
-
 static __always_inline void bore_bump_pparam_gen(void)
 {
-	WRITE_ONCE(bore_pparam_gen_shadow,
-		   (u8)atomic_inc_return(&bore_pparam_gen));
+	WRITE_ONCE(bore_pparam_gen_shadow, (u8)atomic_inc_return(&bore_pparam_gen));
 }
 
 static __always_inline const struct bore_penalty_params *bore_get_params(void)
 {
 	struct bore_penalty_params *pp;
 	u8 gen_now;
+	u8 floor_msb;
 
 	pp = this_cpu_ptr(&bore_pparams);
 	gen_now = READ_ONCE(bore_pparam_gen_shadow);
@@ -154,10 +153,17 @@ static __always_inline const struct bore_penalty_params *bore_get_params(void)
 
 	pp->offset_q8 = (u16)READ_ONCE(sched_burst_penalty_offset) << 8;
 	pp->scale = max_t(u16, (u16)READ_ONCE(sched_burst_penalty_scale), 1U);
-	pp->exp_floor_q8 = (pp->offset_q8 > 248U) ? (pp->offset_q8 - 248U) : 0U;
+	pp->exp_floor_q8 = (pp->offset_q8 > 248U) ? (u16)(pp->offset_q8 - 248U) : 0U;
 	pp->sat_delta = min_t(u32,
-				DIV_ROUND_UP((u32)MAX_BURST_PENALTY << 10, (u32)pp->scale),
-				U16_MAX);
+			      DIV_ROUND_UP((u32)MAX_BURST_PENALTY << 10, (u32)pp->scale),
+			      U16_MAX);
+
+	floor_msb = (u8)(pp->exp_floor_q8 >> 8);
+	if (floor_msb >= 63U)
+		pp->burst_floor = U64_MAX;
+	else
+		pp->burst_floor = (1ULL << (floor_msb + 1U)) - 1ULL;
+
 	smp_wmb();
 	WRITE_ONCE(pp->gen, gen_now);
 
@@ -186,13 +192,13 @@ static void bore_itd_sample_work_fn(struct work_struct *work)
 	if (!READ_ONCE(sched_burst_itd_enable))
 		return;
 
-	cpu = get_cpu();
-	st = per_cpu_ptr(&bore_itd_state, cpu);
+	cpu = smp_processor_id();
+	st = this_cpu_ptr(&bore_itd_state);
 
 	if (rdmsrq_safe(MSR_IA32_HW_FEEDBACK_CHAR, &msr_val)) {
 		WRITE_ONCE(st->cached_valid, 0);
 	} else {
-		u8 valid = (msr_val >> 63) & 0x1;
+		u8 valid = (u8)((msr_val >> 63) & 0x1);
 
 		if (valid) {
 			u8 classid = (u8)(msr_val & 0xff);
@@ -200,26 +206,23 @@ static void bore_itd_sample_work_fn(struct work_struct *work)
 			u32 cap;
 			u32 eff_pct;
 			u32 delta_q8;
-			u16 q8 = 256;
+			u16 q8 = 256U;
 
-			if (classid >= BORE_ITD_MAX_CLASSES) {
-				q8 = 256;
-			} else {
+			if (classid < BORE_ITD_MAX_CLASSES) {
 				pct = READ_ONCE(st->is_pcore) ?
 					READ_ONCE(sched_burst_itd_bias_pcore_pct[classid]) :
 					READ_ONCE(sched_burst_itd_bias_ecore_pct[classid]);
+
 				cap = clamp_t(u32, READ_ONCE(sched_burst_itd_cap_pct), 0U, 100U);
 				pct = clamp_t(u32, pct, 0U, 100U);
 				eff_pct = min(cap, pct);
 
 				if (eff_pct) {
 					delta_q8 = bore_pct_to_q8_lut[eff_pct];
-					if (READ_ONCE(st->is_pcore)) {
+					if (READ_ONCE(st->is_pcore))
 						q8 = (delta_q8 >= 256U) ? 0U : (u16)(256U - delta_q8);
-					} else {
-						u32 up = 256U + delta_q8;
-						q8 = (u16)min_t(u32, up, 1024U);
-					}
+					else
+						q8 = (u16)min_t(u32, 256U + delta_q8, 1024U);
 				}
 			}
 
@@ -232,18 +235,31 @@ static void bore_itd_sample_work_fn(struct work_struct *work)
 		}
 	}
 
-	delay_ms = max_t(u32, 1, READ_ONCE(sched_burst_itd_async_interval_ms));
-	schedule_delayed_work_on(cpu,
-				 this_cpu_ptr(&bore_itd_sample_work),
-				 msecs_to_jiffies(delay_ms));
-	put_cpu();
+	delay_ms = max_t(u32, 1U, READ_ONCE(sched_burst_itd_async_interval_ms));
+	schedule_delayed_work_on(cpu, this_cpu_ptr(&bore_itd_sample_work), msecs_to_jiffies(delay_ms));
 }
 
-static __always_inline void bore_itd_lazy_enable_this_cpu(void)
+static __always_inline bool bore_itd_read_q8_fast(u16 *q8)
+{
+	struct bore_itd_state *st;
+
+	st = this_cpu_ptr(&bore_itd_state);
+	if (!READ_ONCE(st->cached_valid))
+		return false;
+
+	smp_rmb();
+	*q8 = READ_ONCE(st->cached_q8);
+	return true;
+}
+
+static __always_inline void bore_itd_init_this_cpu_if_needed(void)
 {
 	struct bore_itd_state *st;
 	u32 delay_ms;
 	int cpu;
+
+	if (unlikely(system_state < SYSTEM_RUNNING))
+		return;
 
 	st = this_cpu_ptr(&bore_itd_state);
 	if (READ_ONCE(st->inited))
@@ -251,31 +267,22 @@ static __always_inline void bore_itd_lazy_enable_this_cpu(void)
 
 	cpu = raw_smp_processor_id();
 	WRITE_ONCE(st->is_pcore, arch_asym_cpu_priority(cpu) >= 768);
-	WRITE_ONCE(st->cached_q8, 256);
+	WRITE_ONCE(st->cached_q8, 256U);
+	WRITE_ONCE(st->cached_valid, 0);
 
 	INIT_DELAYED_WORK(this_cpu_ptr(&bore_itd_sample_work), bore_itd_sample_work_fn);
-	delay_ms = max_t(u32, 1, READ_ONCE(sched_burst_itd_async_interval_ms));
-	schedule_delayed_work_on(cpu,
-				 this_cpu_ptr(&bore_itd_sample_work),
-				 msecs_to_jiffies(delay_ms));
+	delay_ms = max_t(u32, 1U, READ_ONCE(sched_burst_itd_async_interval_ms));
+	schedule_delayed_work_on(cpu, this_cpu_ptr(&bore_itd_sample_work), msecs_to_jiffies(delay_ms));
 
-	WRITE_ONCE(st->cached_valid, 0);
 	WRITE_ONCE(st->inited, 1);
 }
 
-static __always_inline bool bore_itd_read_q8_fast(u16 *q8)
+static void bore_itd_cancel_all_works(void)
 {
-	struct bore_itd_state *st;
-	u8 valid;
+	int cpu;
 
-	st = this_cpu_ptr(&bore_itd_state);
-	valid = READ_ONCE(st->cached_valid);
-	smp_rmb();
-	if (!valid)
-		return false;
-
-	*q8 = READ_ONCE(st->cached_q8);
-	return true;
+	for_each_online_cpu(cpu)
+		cancel_delayed_work_sync(per_cpu_ptr(&bore_itd_sample_work, cpu));
 }
 
 static __always_inline u32 bore_apply_itd_bias(u32 penalty)
@@ -286,13 +293,15 @@ static __always_inline u32 bore_apply_itd_bias(u32 penalty)
 	if (unlikely(!penalty) || !static_branch_unlikely(&bore_itd_key))
 		return penalty;
 
-	bore_itd_lazy_enable_this_cpu();
+	bore_itd_init_this_cpu_if_needed();
+
 	if (!bore_itd_read_q8_fast(&q8))
 		return penalty;
-	if (likely(q8 == 256))
+
+	if (likely(q8 == 256U))
 		return penalty;
 
-	prod = (u64)penalty * q8;
+	prod = (u64)penalty * (u64)q8;
 	return min_t(u32, (u32)(prod >> 8), MAX_BURST_PENALTY);
 }
 
@@ -315,50 +324,51 @@ static __always_inline u32 calc_burst_penalty(u64 burst_time)
 	const struct bore_penalty_params *pp;
 	u32 offset_q8;
 	u32 exp_q8;
-	u32 frac_idx;
 	u32 greed;
 	u32 delta;
-	u32 scale;
 	u32 scaled_penalty;
-	u32 msb;
-	u64 frac;
+	u32 frac_idx;
+	int lz;
 
 	if (unlikely(!burst_time))
-		return 0;
+		return 0U;
 
 	pp = bore_get_params();
+
+	if (likely(burst_time <= pp->burst_floor))
+		return 0U;
+
 	offset_q8 = pp->offset_q8;
-	scale = pp->scale;
-	msb = fls64(burst_time);
-	exp_q8 = msb << 8;
+
+	lz = __builtin_clzll(burst_time);
+	exp_q8 = (64U - (u32)lz) << 8;
 
 	if (likely(exp_q8 <= pp->exp_floor_q8))
-		return 0;
+		return 0U;
 
-	frac = burst_time << (64U - msb + 1U);
-	frac_idx = (u32)((frac >> 56) & 0xffU);
+	if (likely(lz < 56))
+		frac_idx = (u32)((burst_time << (lz + 1)) >> 56);
+	else
+		frac_idx = 0U;
+
 	greed = exp_q8 + (u32)bore_log2_lut[frac_idx];
-
 	if (likely(greed <= offset_q8))
-		return 0;
+		return 0U;
 
 	delta = greed - offset_q8;
 	if (unlikely(delta >= pp->sat_delta))
 		return MAX_BURST_PENALTY;
 
-	scaled_penalty = (delta * scale) >> 10;
+	scaled_penalty = (delta * pp->scale) >> 10;
 	return min_t(u32, scaled_penalty, MAX_BURST_PENALTY);
 }
 
 static __always_inline u64 rescale_slice(u64 delta, u8 old_prio, u8 new_prio)
 {
 	u64 unscaled;
-	u64 rescaled;
 
 	unscaled = mul_u64_u32_shr(delta, sched_prio_to_weight[old_prio], 10);
-	rescaled = mul_u64_u32_shr(unscaled, sched_prio_to_wmult[new_prio], 22);
-
-	return rescaled;
+	return mul_u64_u32_shr(unscaled, sched_prio_to_wmult[new_prio], 22);
 }
 
 static __always_inline u32 binary_smooth(u32 new_val, u32 old_val)
@@ -369,11 +379,28 @@ static __always_inline u32 binary_smooth(u32 new_val, u32 old_val)
 		return new_val;
 
 	shift = min_t(u32, READ_ONCE(sched_burst_smoothness), 31U);
-	if (unlikely(!shift))
+	if (!shift)
 		return new_val;
 
-	/* Ceil-divide by 2^shift to keep monotonic growth with small deltas. */
 	return old_val + DIV_ROUND_UP(new_val - old_val, 1U << shift);
+}
+
+static __always_inline u64 bore_u64_add_sat(u64 a, u64 b)
+{
+	u64 s = a + b;
+
+	if (unlikely(s < a))
+		return U64_MAX;
+	return s;
+}
+
+static __always_inline u8 bore_penalty_to_score(u16 penalty)
+{
+	u32 score = (u32)penalty >> 8;
+
+	if (unlikely(score > 39U))
+		score = 39U;
+	return (u8)score;
 }
 
 static void reweight_task_by_prio(struct task_struct *p, int prio)
@@ -384,8 +411,8 @@ static void reweight_task_by_prio(struct task_struct *p, int prio)
 	if (task_has_idle_policy(p))
 		return;
 
+	prio = clamp_t(int, prio, 0, NICE_WIDTH - 1);
 	se = &p->se;
-	prio = clamp(prio, 0, NICE_WIDTH - 1);
 	weight = scale_load(sched_prio_to_weight[prio]);
 
 	if (se->on_rq) {
@@ -407,26 +434,7 @@ u8 effective_prio_bore(struct task_struct *p)
 	if (static_branch_likely(&sched_bore_key))
 		prio += p->bore.score;
 
-	prio = clamp(prio, 0, 39);
-	return (u8)prio;
-}
-
-static __always_inline u64 bore_u64_add_sat(u64 a, u64 b)
-{
-	u64 s = a + b;
-
-	if (unlikely(s < a))
-		return U64_MAX;
-	return s;
-}
-
-static __always_inline u8 bore_penalty_to_score(u16 penalty)
-{
-	u32 score = (u32)penalty >> 8;
-
-	if (unlikely(score > 39U))
-		score = 39U;
-	return (u8)score;
+	return (u8)clamp_t(int, prio, 0, 39);
 }
 
 static void update_penalty(struct task_struct *p)
@@ -457,8 +465,8 @@ static void update_penalty(struct task_struct *p)
 	WRITE_ONCE(ctx->score, new_score);
 
 	base_prio = clamp_t(int, p->static_prio - MAX_RT_PRIO, 0, 39);
-	old_prio = clamp(base_prio + old_score, 0, 39);
-	new_prio = clamp(base_prio + new_score, 0, 39);
+	old_prio = clamp_t(int, base_prio + old_score, 0, 39);
+	new_prio = clamp_t(int, base_prio + new_score, 0, 39);
 
 	if (likely(new_prio != old_prio))
 		reweight_task_by_prio(p, new_prio);
@@ -468,9 +476,12 @@ void update_curr_bore(struct task_struct *p, u64 delta_exec)
 {
 	struct bore_ctx *ctx;
 	u32 curr_penalty;
-	u16 prev_penalty;
 	u16 old_curr_penalty;
+	u16 prev_penalty;
 	u64 burst_time;
+
+	if (!static_branch_likely(&sched_bore_key))
+		return;
 
 	ctx = &p->bore;
 	if (unlikely(ctx->stop_update) || unlikely(!delta_exec))
@@ -481,8 +492,8 @@ void update_curr_bore(struct task_struct *p, u64 delta_exec)
 
 	curr_penalty = calc_burst_penalty(burst_time);
 	curr_penalty = bore_apply_itd_bias(curr_penalty);
-	old_curr_penalty = READ_ONCE(ctx->curr_penalty);
 
+	old_curr_penalty = READ_ONCE(ctx->curr_penalty);
 	if (likely(curr_penalty == old_curr_penalty))
 		return;
 
@@ -504,6 +515,7 @@ void restart_burst_bore(struct task_struct *p)
 
 	ctx = &p->bore;
 	smoothed = binary_smooth(ctx->curr_penalty, ctx->prev_penalty);
+
 	ctx->prev_penalty = (u16)smoothed;
 	ctx->curr_penalty = 0;
 	ctx->burst_time = 0;
@@ -531,12 +543,8 @@ void restart_burst_rescale_deadline_bore(struct task_struct *p)
 	if (old_prio <= new_prio)
 		return;
 
-	/*
-	 * Compute |vremain| without signed overflow for S64_MIN.
-	 * For negative x: |x| = -(x + 1) + 1.
-	 */
 	if (unlikely(vremain < 0))
-		abs_vremain = (u64)(-(vremain + 1)) + 1;
+		abs_vremain = (u64)(-(vremain + 1)) + 1ULL;
 	else
 		abs_vremain = (u64)vremain;
 
@@ -580,7 +588,7 @@ static __always_inline u32 count_children_upto2(struct task_struct *p)
 	head = &p->children;
 	first = READ_ONCE(head->next);
 	if (first == head)
-		return 0;
+		return 0U;
 
 	return 1U + (READ_ONCE(first->next) != head);
 }
@@ -604,20 +612,18 @@ static __always_inline bool burst_cache_try_read(struct bore_bc *bc, u64 now, u3
 	return true;
 }
 
-static u32 update_burst_cache(struct bore_bc *bc,
-			      struct task_struct *owner,
+static u32 update_burst_cache(struct bore_bc *bc, struct task_struct *owner,
 			      u32 count, u64 total, u64 now)
 {
 	struct bore_bc new_bc;
 	u32 average;
 
 	if (!count) {
-		average = 0;
-	} else if (count == 1) {
+		average = 0U;
+	} else if (count == 1U) {
 		average = (u32)min_t(u64, total, U32_MAX);
 	} else {
-		u64 scaled = total * bore_reciprocal_lut[count];
-		average = (u32)(scaled >> 32);
+		average = (u32)((total * bore_reciprocal_lut[count]) >> 32);
 	}
 
 	new_bc.penalty = max_t(u32, average, owner->bore.penalty);
@@ -631,37 +637,33 @@ static u32 inherit_from_parent(struct task_struct *parent, u64 clone_flags, u64 
 {
 	struct bore_bc *bc;
 	u32 cached_penalty;
+	struct task_struct *child;
+	u32 count = 0;
+	u32 scan_count = 0;
+	u64 total = 0;
 
 	if (clone_flags & CLONE_PARENT)
 		parent = rcu_dereference(parent->real_parent);
 
 	if (unlikely(!parent))
-		return 0;
+		return 0U;
 
 	bc = &parent->bore.subtree;
 	if (likely(burst_cache_try_read(bc, now, &cached_penalty)))
 		return cached_penalty;
 
-	{
-		struct task_struct *child;
-		u32 count = 0;
-		u32 scan_count = 0;
-		u64 total = 0;
+	for_each_child_task(parent, child) {
+		if (count >= BURST_CACHE_SAMPLE_LIMIT || scan_count++ >= BURST_CACHE_SCAN_LIMIT)
+			break;
 
-		for_each_child_task(parent, child) {
-			if (count >= BURST_CACHE_SAMPLE_LIMIT ||
-			    scan_count++ >= BURST_CACHE_SCAN_LIMIT)
-				break;
+		if (!task_is_bore_eligible(child))
+			continue;
 
-			if (!task_is_bore_eligible(child))
-				continue;
-
-			count++;
-			total += READ_ONCE(child->bore.penalty);
-		}
-
-		return update_burst_cache(bc, parent, count, total, now);
+		count++;
+		total += READ_ONCE(child->bore.penalty);
 	}
+
+	return update_burst_cache(bc, parent, count, total, now);
 }
 
 static u32 inherit_from_ancestor_hub(struct task_struct *parent, u64 clone_flags, u64 now)
@@ -669,6 +671,10 @@ static u32 inherit_from_ancestor_hub(struct task_struct *parent, u64 clone_flags
 	struct task_struct *ancestor;
 	u32 sole_child_count = 0;
 	u32 cached_penalty;
+	struct task_struct *direct_child;
+	u32 count = 0;
+	u32 scan_count = 0;
+	u64 total = 0;
 
 	ancestor = parent;
 	if (clone_flags & CLONE_PARENT) {
@@ -677,7 +683,7 @@ static u32 inherit_from_ancestor_hub(struct task_struct *parent, u64 clone_flags
 	}
 
 	if (unlikely(!ancestor))
-		return 0;
+		return 0U;
 
 	while (true) {
 		struct task_struct *next;
@@ -696,40 +702,32 @@ static u32 inherit_from_ancestor_hub(struct task_struct *parent, u64 clone_flags
 	if (likely(burst_cache_try_read(&ancestor->bore.subtree, now, &cached_penalty)))
 		return cached_penalty;
 
-	{
-		struct task_struct *direct_child;
-		u32 count = 0;
-		u32 scan_count = 0;
-		u64 total = 0;
+	for_each_child_task(ancestor, direct_child) {
+		struct task_struct *descendant;
 
-		for_each_child_task(ancestor, direct_child) {
-			struct task_struct *descendant;
+		if (count >= BURST_CACHE_SAMPLE_LIMIT || scan_count++ >= BURST_CACHE_SCAN_LIMIT)
+			break;
 
-			if (count >= BURST_CACHE_SAMPLE_LIMIT ||
-			    scan_count++ >= BURST_CACHE_SCAN_LIMIT)
+		descendant = direct_child;
+		while (count_children_upto2(descendant) == 1U) {
+			struct task_struct *next_descendant;
+
+			next_descendant = list_first_or_null_rcu(&descendant->children,
+								 struct task_struct, sibling);
+			if (!next_descendant)
 				break;
 
-			descendant = direct_child;
-			while (count_children_upto2(descendant) == 1) {
-				struct task_struct *next_descendant;
-
-				next_descendant = list_first_or_null_rcu(&descendant->children,
-									 struct task_struct,
-									 sibling);
-				if (!next_descendant)
-					break;
-				descendant = next_descendant;
-			}
-
-			if (!task_is_bore_eligible(descendant))
-				continue;
-
-			count++;
-			total += READ_ONCE(descendant->bore.penalty);
+			descendant = next_descendant;
 		}
 
-		return update_burst_cache(&ancestor->bore.subtree, ancestor, count, total, now);
+		if (!task_is_bore_eligible(descendant))
+			continue;
+
+		count++;
+		total += READ_ONCE(descendant->bore.penalty);
 	}
+
+	return update_burst_cache(&ancestor->bore.subtree, ancestor, count, total, now);
 }
 
 static u32 inherit_from_thread_group(struct task_struct *p, u64 now)
@@ -737,42 +735,37 @@ static u32 inherit_from_thread_group(struct task_struct *p, u64 now)
 	struct task_struct *leader;
 	struct bore_bc *bc;
 	u32 cached_penalty;
+	struct task_struct *sibling;
+	u32 count = 0;
+	u32 scan_count = 0;
+	u64 total = 0;
 
 	leader = READ_ONCE(p->group_leader);
 	if (unlikely(!leader))
-		return 0;
+		return 0U;
 
 	bc = &leader->bore.group;
 	if (likely(burst_cache_try_read(bc, now, &cached_penalty)))
 		return cached_penalty;
 
-	{
-		struct task_struct *sibling;
-		u32 count = 0;
-		u32 scan_count = 0;
-		u64 total = 0;
+	for_each_thread(leader, sibling) {
+		if (count >= BURST_CACHE_SAMPLE_LIMIT || scan_count++ >= BURST_CACHE_SCAN_LIMIT)
+			break;
 
-		for_each_thread(leader, sibling) {
-			if (count >= BURST_CACHE_SAMPLE_LIMIT ||
-			    scan_count++ >= BURST_CACHE_SCAN_LIMIT)
-				break;
+		if (!task_is_bore_eligible(sibling))
+			continue;
 
-			if (!task_is_bore_eligible(sibling))
-				continue;
-
-			count++;
-			total += READ_ONCE(sibling->bore.penalty);
-		}
-
-		return update_burst_cache(bc, leader, count, total, now);
+		count++;
+		total += READ_ONCE(sibling->bore.penalty);
 	}
+
+	return update_burst_cache(bc, leader, count, total, now);
 }
 
-void task_fork_bore(struct task_struct *p, struct task_struct *parent,
-		    u64 clone_flags, u64 now)
+void task_fork_bore(struct task_struct *p, struct task_struct *parent, u64 clone_flags, u64 now)
 {
 	struct bore_ctx *ctx;
-	u32 inherited_penalty = 0;
+	u32 inherited_penalty = 0U;
 
 	ctx = &p->bore;
 	ctx->burst_time = 0;
@@ -792,21 +785,19 @@ void task_fork_bore(struct task_struct *p, struct task_struct *parent,
 
 	rcu_read_lock();
 
-	if (clone_flags & CLONE_THREAD) {
+	if (clone_flags & CLONE_THREAD)
 		inherited_penalty = inherit_from_thread_group(parent, now);
-	} else if (static_branch_likely(&sched_burst_inherit_key)) {
-		if (static_branch_likely(&sched_burst_ancestor_key))
-			inherited_penalty = inherit_from_ancestor_hub(parent, clone_flags, now);
-		else
-			inherited_penalty = inherit_from_parent(parent, clone_flags, now);
-	} else {
-		inherited_penalty = 0;
-	}
+	else if (static_branch_likely(&sched_burst_inherit_key))
+		inherited_penalty = static_branch_likely(&sched_burst_ancestor_key) ?
+			inherit_from_ancestor_hub(parent, clone_flags, now) :
+			inherit_from_parent(parent, clone_flags, now);
+
+	rcu_read_unlock();
 
 	ctx->prev_penalty = (u16)inherited_penalty;
 	ctx->penalty = (u16)inherited_penalty;
+
 	update_penalty(p);
-	rcu_read_unlock();
 }
 
 void reset_task_bore(struct task_struct *p)
@@ -827,6 +818,7 @@ static void update_inherit_type(void)
 		break;
 	default:
 		static_branch_disable(&sched_burst_inherit_key);
+		static_branch_disable(&sched_burst_ancestor_key);
 		break;
 	}
 }
@@ -835,10 +827,9 @@ void __init sched_init_bore(void)
 {
 	u32 i;
 
-	pr_info("%s %s by %s\n", SCHED_BORE_PROGNAME,
-		SCHED_BORE_VERSION, SCHED_BORE_AUTHOR);
+	pr_info("%s %s by %s\n", SCHED_BORE_PROGNAME, SCHED_BORE_VERSION, SCHED_BORE_AUTHOR);
 
-	for (i = 1; i <= BURST_CACHE_SAMPLE_LIMIT; i++)
+	for (i = 1U; i <= BURST_CACHE_SAMPLE_LIMIT; i++)
 		bore_reciprocal_lut[i] = (u32)div64_u64(0xffffffffULL + i, i);
 
 	reset_task_bore(&init_task);
@@ -853,14 +844,16 @@ static void readjust_all_task_weights(void)
 {
 	struct task_struct *g;
 	struct task_struct *t;
-	struct rq *rq;
-	struct rq_flags rf;
 
 	rcu_read_lock();
 	for_each_process(g) {
 		for_each_thread(g, t) {
+			struct rq *rq;
+			struct rq_flags rf;
+
 			if (!task_is_bore_eligible(t))
 				continue;
+
 			if (!tryget_task_struct(t))
 				continue;
 
@@ -875,8 +868,8 @@ static void readjust_all_task_weights(void)
 }
 
 int sched_bore_update_handler(const struct ctl_table *table,
-			     int write, void __user *buffer,
-			     size_t *lenp, loff_t *ppos)
+			      int write, void __user *buffer,
+			      size_t *lenp, loff_t *ppos)
 {
 	int ret;
 
@@ -907,6 +900,38 @@ int sched_burst_inherit_type_update_handler(const struct ctl_table *table,
 	return 0;
 }
 
+static int sched_burst_penalty_offset_update_handler(const struct ctl_table *table,
+						     int write, void __user *buffer,
+						     size_t *lenp, loff_t *ppos)
+{
+	u8 old;
+	int ret;
+
+	old = READ_ONCE(sched_burst_penalty_offset);
+	ret = proc_dou8vec_minmax(table, write, buffer, lenp, ppos);
+
+	if (!ret && write && old != READ_ONCE(sched_burst_penalty_offset))
+		bore_bump_pparam_gen();
+
+	return ret;
+}
+
+static int sched_burst_penalty_scale_update_handler(const struct ctl_table *table,
+						    int write, void __user *buffer,
+						    size_t *lenp, loff_t *ppos)
+{
+	uint old;
+	int ret;
+
+	old = READ_ONCE(sched_burst_penalty_scale);
+	ret = proc_douintvec_minmax(table, write, buffer, lenp, ppos);
+
+	if (!ret && write && old != READ_ONCE(sched_burst_penalty_scale))
+		bore_bump_pparam_gen();
+
+	return ret;
+}
+
 #ifdef CONFIG_X86
 static int sched_burst_itd_enable_update_handler(const struct ctl_table *table,
 						 int write, void __user *buffer,
@@ -917,46 +942,21 @@ static int sched_burst_itd_enable_update_handler(const struct ctl_table *table,
 
 	old = READ_ONCE(sched_burst_itd_enable);
 	ret = proc_dou8vec_minmax(table, write, buffer, lenp, ppos);
-	if (!ret && write && old != READ_ONCE(sched_burst_itd_enable))
-		bore_itd_update_key_handler();
+
+	if (!ret && write && old != READ_ONCE(sched_burst_itd_enable)) {
+		if (READ_ONCE(sched_burst_itd_enable))
+			bore_itd_update_key_handler();
+		else {
+			static_branch_disable(&bore_itd_key);
+			bore_itd_cancel_all_works();
+		}
+	}
 
 	return ret;
 }
 #endif
 
-static int sched_burst_penalty_offset_update_handler(const struct ctl_table *table,
-					     int write, void __user *buffer,
-					     size_t *lenp, loff_t *ppos)
-{
-	u8 old;
-	int ret;
-
-	old = READ_ONCE(sched_burst_penalty_offset);
-	ret = proc_dou8vec_minmax(table, write, buffer, lenp, ppos);
-	if (!ret && write && old != READ_ONCE(sched_burst_penalty_offset))
-		bore_bump_pparam_gen();
-
-	return ret;
-}
-
-static int sched_burst_penalty_scale_update_handler(const struct ctl_table *table,
-					    int write, void __user *buffer,
-					    size_t *lenp, loff_t *ppos)
-{
-	uint old;
-	int ret;
-
-	old = READ_ONCE(sched_burst_penalty_scale);
-	ret = proc_douintvec_minmax(table, write, buffer, lenp, ppos);
-	if (!ret && write && old != READ_ONCE(sched_burst_penalty_scale))
-		bore_bump_pparam_gen();
-
-	return ret;
-}
-
 #ifdef CONFIG_SYSCTL
-static struct ctl_table_header *sched_bore_sysctl_hdr;
-
 static struct ctl_table sched_bore_sysctls[] = {
 	{
 		.procname = "sched_bore",
@@ -1109,23 +1109,17 @@ static struct ctl_table sched_bore_sysctls[] = {
 		.extra2 = &maxval_100,
 	},
 #endif
-	{ }
 };
 
 static int __init sched_bore_sysctl_init(void)
 {
-	/* register_sysctl_sz() expects the number of real entries (no sentinel). */
-	sched_bore_sysctl_hdr = register_sysctl_sz("kernel",
-					      sched_bore_sysctls,
-					      ARRAY_SIZE(sched_bore_sysctls) - 1);
-	if (!sched_bore_sysctl_hdr) {
-		pr_err("failed when register_sysctl_sz sched_bore_sysctls to kernel\n");
-		return -ENOMEM;
-	}
-
+	register_sysctl_init("kernel", sched_bore_sysctls);
+#ifdef CONFIG_X86
+	bore_itd_update_key_handler();
+#endif
 	return 0;
 }
 late_initcall(sched_bore_sysctl_init);
-#endif /* CONFIG_SYSCTL */
+#endif
 
 #endif /* CONFIG_SCHED_BORE */
