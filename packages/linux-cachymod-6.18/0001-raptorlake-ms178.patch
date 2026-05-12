@@ -1,3 +1,165 @@
+--- a/kernel/sched/ext.c	2026-05-13 00:11:14.128824553 +0200
++++ b/kernel/sched/ext.c	2026-05-13 00:20:58.430420196 +0200
+@@ -2776,9 +2776,12 @@ static bool check_rq_for_timeouts(struct
+ 	struct scx_sched *sch;
+ 	struct task_struct *p;
+ 	struct rq_flags rf;
++	unsigned long now = READ_ONCE(jiffies);
++	unsigned long timeout = READ_ONCE(scx_watchdog_timeout);
+ 	bool timed_out = false;
+ 
+ 	rq_lock_irqsave(rq, &rf);
++
+ 	sch = rcu_dereference_bh(scx_root);
+ 	if (unlikely(!sch))
+ 		goto out_unlock;
+@@ -2786,17 +2789,19 @@ static bool check_rq_for_timeouts(struct
+ 	list_for_each_entry(p, &rq->scx.runnable_list, scx.runnable_node) {
+ 		unsigned long last_runnable = p->scx.runnable_at;
+ 
+-		if (unlikely(time_after(jiffies,
+-					last_runnable + scx_watchdog_timeout))) {
+-			u32 dur_ms = jiffies_to_msecs(jiffies - last_runnable);
++		if (unlikely(time_after(now, last_runnable + timeout))) {
++			u32 dur_ms = jiffies_to_msecs(now - last_runnable);
+ 
+ 			scx_exit(sch, SCX_EXIT_ERROR_STALL, 0,
+ 				 "%s[%d] failed to run for %u.%03us",
+-				 p->comm, p->pid, dur_ms / 1000, dur_ms % 1000);
++				 p->comm, p->pid,
++				 dur_ms / 1000, dur_ms % 1000);
++
+ 			timed_out = true;
+ 			break;
+ 		}
+ 	}
++
+ out_unlock:
+ 	rq_unlock_irqrestore(rq, &rf);
+ 	return timed_out;
+@@ -2804,6 +2809,8 @@ out_unlock:
+ 
+ static void scx_watchdog_workfn(struct work_struct *work)
+ {
++	unsigned long timeout = READ_ONCE(scx_watchdog_timeout);
++	unsigned long delay = max(1UL, timeout / 2);
+ 	int cpu;
+ 
+ 	WRITE_ONCE(scx_watchdog_timestamp, jiffies);
+@@ -2814,8 +2821,8 @@ static void scx_watchdog_workfn(struct w
+ 
+ 		cond_resched();
+ 	}
+-	queue_delayed_work(system_unbound_wq, to_delayed_work(work),
+-			   scx_watchdog_timeout / 2);
++
++	queue_delayed_work(system_unbound_wq, to_delayed_work(work), delay);
+ }
+ 
+ void scx_tick(struct rq *rq)
+@@ -2845,7 +2852,7 @@ void scx_tick(struct rq *rq)
+ 
+ static void task_tick_scx(struct rq *rq, struct task_struct *curr, int queued)
+ {
+-	struct scx_sched *sch = scx_root;
++	struct scx_sched *sch;
+ 
+ 	update_curr_scx(rq);
+ 
+@@ -2856,8 +2863,10 @@ static void task_tick_scx(struct rq *rq,
+ 	if (scx_rq_bypassing(rq)) {
+ 		curr->scx.slice = 0;
+ 		touch_core_sched(rq, curr);
+-	} else if (SCX_HAS_OP(sch, tick)) {
+-		SCX_CALL_OP_TASK(sch, SCX_KF_REST, tick, rq, curr);
++	} else {
++		sch = rcu_dereference_bh(scx_root);
++		if (likely(sch) && SCX_HAS_OP(sch, tick))
++			SCX_CALL_OP_TASK(sch, SCX_KF_REST, tick, rq, curr);
+ 	}
+ 
+ 	if (!curr->scx.slice)
+@@ -2911,11 +2920,14 @@ static void scx_set_task_state(struct ta
+ 		warn = prev_state != SCX_TASK_READY;
+ 		break;
+ 	default:
+-		warn = true;
++		WARN_ONCE(true,
++			  "sched_ext: Invalid task state %d for %s[%d]",
++			  state, p->comm, p->pid);
+ 		return;
+ 	}
+ 
+-	WARN_ONCE(warn, "sched_ext: Invalid task state transition %d -> %d for %s[%d]",
++	WARN_ONCE(warn,
++		  "sched_ext: Invalid task state transition %d -> %d for %s[%d]",
+ 		  prev_state, state, p->comm, p->pid);
+ 
+ 	p->scx.flags &= ~SCX_TASK_STATE_MASK;
+@@ -3339,14 +3351,24 @@ void scx_cgroup_move_task(struct task_st
+ 		return;
+ 
+ 	/*
+-	 * @p must have ops.cgroup_prep_move() called on it and thus
+-	 * cgrp_moving_from set.
++	 * Explicit task migrations go through scx_cgroup_can_attach(), which
++	 * records cgrp_moving_from and pairs with ops.cgroup_move().
++	 *
++	 * css-only task_group updates, e.g. cgroup.subtree_control changes,
++	 * also call sched_move_task() but are not prepared task migrations.
++	 * There is no old cgroup to pass to BPF in that case, so skip
++	 * cgroup_move() without warning.
++	 *
++	 * sched_move_task() calls us with @p's rq locked. Expose the actual
++	 * context to BPF as SCX_KF_REST with task_rq(p), matching other
++	 * rq-locked task callbacks and avoiding kfunc permission / rq tracking
++	 * mismatch.
+ 	 */
+-	if (SCX_HAS_OP(sch, cgroup_move) &&
+-	    !WARN_ON_ONCE(!p->scx.cgrp_moving_from))
+-		SCX_CALL_OP_TASK(sch, SCX_KF_UNLOCKED, cgroup_move, NULL,
++	if (SCX_HAS_OP(sch, cgroup_move) && p->scx.cgrp_moving_from)
++		SCX_CALL_OP_TASK(sch, SCX_KF_REST, cgroup_move, task_rq(p),
+ 				 p, p->scx.cgrp_moving_from,
+ 				 tg_cgrp(task_group(p)));
++
+ 	p->scx.cgrp_moving_from = NULL;
+ }
+ 
+@@ -3370,11 +3392,13 @@ void scx_cgroup_cancel_attach(struct cgr
+ 
+ void scx_group_set_weight(struct task_group *tg, unsigned long weight)
+ {
+-	struct scx_sched *sch = scx_root;
++	struct scx_sched *sch;
+ 
+ 	percpu_down_read(&scx_cgroup_ops_rwsem);
+ 
+-	if (scx_cgroup_enabled && SCX_HAS_OP(sch, cgroup_set_weight) &&
++	sch = scx_root;
++	if (scx_cgroup_enabled && sch &&
++	    SCX_HAS_OP(sch, cgroup_set_weight) &&
+ 	    tg->scx.weight != weight)
+ 		SCX_CALL_OP(sch, SCX_KF_UNLOCKED, cgroup_set_weight, NULL,
+ 			    tg_cgrp(tg), weight);
+@@ -3392,11 +3416,13 @@ void scx_group_set_idle(struct task_grou
+ void scx_group_set_bandwidth(struct task_group *tg,
+ 			     u64 period_us, u64 quota_us, u64 burst_us)
+ {
+-	struct scx_sched *sch = scx_root;
++	struct scx_sched *sch;
+ 
+ 	percpu_down_read(&scx_cgroup_ops_rwsem);
+ 
+-	if (scx_cgroup_enabled && SCX_HAS_OP(sch, cgroup_set_bandwidth) &&
++	sch = scx_root;
++	if (scx_cgroup_enabled && sch &&
++	    SCX_HAS_OP(sch, cgroup_set_bandwidth) &&
+ 	    (tg->scx.bw_period_us != period_us ||
+ 	     tg->scx.bw_quota_us != quota_us ||
+ 	     tg->scx.bw_burst_us != burst_us))
+
+
 --- a/arch/x86/mm/pat/set_memory.c	2026-04-18 10:45:02.000000000 +0200
 +++ b/arch/x86/mm/pat/set_memory.c	2026-04-22 00:23:43.873733155 +0200
 @@ -433,11 +433,71 @@ static void cpa_collapse_large_pages(str
@@ -191,7 +353,7 @@
 
 
 --- a/drivers/usb/host/xhci.c	2026-04-11 14:26:52.000000000 +0200
-+++ b/drivers/usb/host/xhci.c	2026-04-13 16:03:14.567835031 +0200
++++ b/drivers/usb/host/xhci.c	2026-05-08 16:03:14.567835031 +0200
 @@ -44,15 +44,27 @@ MODULE_PARM_DESC(quirks, "Bit flags for
  static bool td_on_ring(struct xhci_td *td, struct xhci_ring *ring)
  {
@@ -378,7 +540,7 @@
  	}
  	spin_unlock_irqrestore(&xhci->lock, flags);
  	return ret;
-@@ -5535,7 +5571,7 @@ int xhci_gen_setup(struct usb_hcd *hcd,
+@@ -5534,7 +5570,7 @@ int xhci_gen_setup(struct usb_hcd *hcd,
  EXPORT_SYMBOL_GPL(xhci_gen_setup);
  
  static void xhci_clear_tt_buffer_complete(struct usb_hcd *hcd,
@@ -387,7 +549,7 @@
  {
  	struct xhci_hcd *xhci;
  	struct usb_device *udev;
-@@ -5546,12 +5582,20 @@ static void xhci_clear_tt_buffer_complet
+@@ -5545,12 +5581,20 @@ static void xhci_clear_tt_buffer_complet
  	xhci = hcd_to_xhci(hcd);
  
  	spin_lock_irqsave(&xhci->lock, flags);
