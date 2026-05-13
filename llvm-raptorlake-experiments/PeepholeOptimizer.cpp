@@ -413,8 +413,12 @@ private:
   bool isLoadFoldable(MachineInstr &MI,
                       SmallSet<Register, 16> &FoldAsLoadDefCandidates);
 
-  MachineInstr *foldLoadInto(MachineInstr &MI, Register FoldReg,
-                             SmallPtrSetImpl<MachineInstr *> &LocalMIs);
+  /// Try to fold the load defined by \p FoldReg into \p MI using
+  /// TII->optimizeLoadInstr. On success, updates \p LocalMIs, erases the old
+  /// instructions, and returns the replacement; returns nullptr otherwise.
+  MachineInstr *foldLoadInto(MachineFunction &MF, MachineInstr &MI,
+                             Register FoldReg,
+                             SmallPtrSet<MachineInstr *, 16> &LocalMIs);
 
   bool tryFoldLoadAfterCompareElim(Register CmpSrcReg,
                                    SmallPtrSetImpl<MachineInstr *> &LocalMIs);
@@ -1034,21 +1038,19 @@ bool PeepholeOptimizer::isLoadFoldable(
   return false;
 }
 
-MachineInstr *PeepholeOptimizer::foldLoadInto(
-    MachineInstr &MI, Register FoldReg,
-    SmallPtrSetImpl<MachineInstr *> &LocalMIs) {
-  Register FoldedReg = FoldReg;
+MachineInstr *
+PeepholeOptimizer::foldLoadInto(MachineFunction &MF, MachineInstr &MI,
+                                Register FoldReg,
+                                SmallPtrSet<MachineInstr *, 16> &LocalMIs) {
+  Register Reg = FoldReg;
   MachineInstr *DefMI = nullptr;
   MachineInstr *CopyMI = nullptr;
 
-  MachineInstr *FoldMI =
-      TII->optimizeLoadInstr(MI, MRI, FoldReg, DefMI, CopyMI);
-  if (!FoldMI || !DefMI)
+  MachineInstr *FoldMI = TII->optimizeLoadInstr(MI, MRI, Reg, DefMI, CopyMI);
+  if (!FoldMI)
     return nullptr;
 
-  LLVM_DEBUG(dbgs() << "Replacing: " << MI);
-  LLVM_DEBUG(dbgs() << "     With: " << *FoldMI);
-
+  LLVM_DEBUG(dbgs() << "Replacing: " << MI << "     With: " << *FoldMI);
   LocalMIs.erase(&MI);
   LocalMIs.erase(DefMI);
   LocalMIs.insert(FoldMI);
@@ -1056,14 +1058,11 @@ MachineInstr *PeepholeOptimizer::foldLoadInto(
     LocalMIs.insert(CopyMI);
 
   if (MI.shouldUpdateAdditionalCallInfo())
-    MI.getMF()->moveAdditionalCallInfo(&MI, FoldMI);
+    MF.moveAdditionalCallInfo(&MI, FoldMI);
+  MI.eraseFromParent();
+  DefMI->eraseFromParent();
 
-  if (DefMI != FoldMI)
-    DefMI->eraseFromParent();
-  if (&MI != FoldMI)
-    MI.eraseFromParent();
-
-  MRI->markUsesInDebugValueAsUndef(FoldedReg);
+  MRI->markUsesInDebugValueAsUndef(FoldReg);
   ++NumLoadFold;
   return FoldMI;
 }
@@ -1088,7 +1087,8 @@ bool PeepholeOptimizer::tryFoldLoadAfterCompareElim(
   if (!LoadMI->canFoldAsLoad() || !LoadMI->mayLoad())
     return false;
 
-  return foldLoadInto(*FlagProducer, CmpSrcReg, LocalMIs) != nullptr;
+  return foldLoadInto(*FlagProducer->getMF(), *FlagProducer, CmpSrcReg,
+                      LocalMIs) != nullptr;
 }
 
 bool PeepholeOptimizer::isMoveImmediate(
@@ -1490,7 +1490,7 @@ bool PeepholeOptimizer::run(MachineFunction &MF) {
 
           // #2 Single helper for repeated fold+bookkeeping mechanics.
           if (MachineInstr *FoldMI =
-                  foldLoadInto(*MI, FoldAsLoadDefReg, LocalMIs)) {
+                  foldLoadInto(MF, *MI, FoldAsLoadDefReg, LocalMIs)) {
             FoldAsLoadDefCandidates.erase(FoldAsLoadDefReg);
             Changed = true;
             MI = FoldMI;
