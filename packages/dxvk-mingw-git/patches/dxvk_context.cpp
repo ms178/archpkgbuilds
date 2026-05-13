@@ -2649,6 +2649,21 @@ namespace dxvk {
   void DxvkContext::setViewports(
           uint32_t            viewportCount,
     const DxvkViewport*       viewports) {
+    // Treat the new viewport/scissor through a single normalising helper
+    // so we can both stage them and compare against current state in one
+    // pass, avoiding the redundant write-back when nothing changes.
+    auto normalise = [] (const DxvkViewport& src, VkViewport& vp, VkRect2D& sc) {
+      vp = src.viewport;
+      sc = src.scissor;
+
+      // Vulkan viewports may not have width or height of zero. Fall back
+      // to a dummy viewport with an empty scissor (which is legal).
+      if (src.viewport.width <= 0.0f || src.viewport.height == 0.0f) {
+        vp = VkViewport { 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
+        sc = VkRect2D { VkOffset2D { 0, 0 }, VkExtent2D { 0, 0 } };
+      }
+    };
+
     auto viewportEq = [] (const VkViewport& a, const VkViewport& b) {
       return a.x        == b.x
           && a.y        == b.y
@@ -2671,23 +2686,11 @@ namespace dxvk {
     bool changed = m_state.vp.viewportCount != viewportCount;
 
     for (uint32_t i = 0; i < viewportCount; i++) {
-      newViewports[i] = viewports[i].viewport;
-      newScissors[i] = viewports[i].scissor;
-
-      // Vulkan viewports are not allowed to have a width or
-      // height of zero, so we fall back to a dummy viewport
-      // and instead set an empty scissor rect, which is legal.
-      if (viewports[i].viewport.width <= 0.0f || viewports[i].viewport.height == 0.0f) {
-        newViewports[i] = VkViewport {
-          0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
-        newScissors[i] = VkRect2D {
-          VkOffset2D { 0, 0 },
-          VkExtent2D { 0, 0 } };
-      }
+      normalise(viewports[i], newViewports[i], newScissors[i]);
 
       if (!changed) {
         changed = !viewportEq(m_state.vp.viewports[i], newViewports[i])
-              || !rectEq(m_state.vp.scissorRects[i], newScissors[i]);
+               || !rectEq(m_state.vp.scissorRects[i], newScissors[i]);
       }
     }
 
@@ -2750,17 +2753,20 @@ namespace dxvk {
   
   
   void DxvkContext::setInputAssemblyState(const DxvkInputAssemblyState& ia) {
-    DxvkIaInfo iaInfo(
-      ia.primitiveTopology(),
-      ia.primitiveRestart(),
-      ia.patchVertexCount());
+    // Compare against the current packed state via accessors before
+    // constructing a new DxvkIaInfo. The ctor performs several bit-packing
+    // operations that are pure waste when the state is unchanged, which
+    // is the common case for D3D11 titles that re-set IA state per draw.
+    const VkPrimitiveTopology newTopology = ia.primitiveTopology();
+    const VkBool32            newRestart  = ia.primitiveRestart();
+    const uint32_t            newPatch    = ia.patchVertexCount();
 
-    if (m_state.gp.state.ia.primitiveTopology() == iaInfo.primitiveTopology()
-    && m_state.gp.state.ia.primitiveRestart()  == iaInfo.primitiveRestart()
-    && m_state.gp.state.ia.patchVertexCount()  == iaInfo.patchVertexCount())
+    if (m_state.gp.state.ia.primitiveTopology() == newTopology
+     && m_state.gp.state.ia.primitiveRestart()  == newRestart
+     && m_state.gp.state.ia.patchVertexCount()  == newPatch)
       return;
 
-    m_state.gp.state.ia = iaInfo;
+    m_state.gp.state.ia = DxvkIaInfo(newTopology, newRestart, newPatch);
     m_flags.set(DxvkContextFlag::GpDirtyPipelineState);
   }
   
@@ -2770,17 +2776,23 @@ namespace dxvk {
     const DxvkVertexInput*     attributes,
           uint32_t             bindingCount,
     const DxvkVertexInput*     bindings) {
-    bool changed = m_state.gp.state.il.attributeCount() != attributeCount
-                || m_state.gp.state.il.bindingCount()   != bindingCount;
+    // Snapshot the current binding/attribute counts. Reading these via the
+    // packed-bit accessor inside a loop bound forces the optimizer to keep
+    // reloading the fields; one local read each saves a reload per iteration.
+    const uint32_t curBindings   = m_state.gp.state.il.bindingCount();
+    const uint32_t curAttributes = m_state.gp.state.il.attributeCount();
+
+    bool changed = curAttributes != attributeCount
+                || curBindings   != bindingCount;
 
     for (uint32_t i = 0; !changed && i < bindingCount; i++) {
       auto binding = bindings[i].binding();
       const auto& current = m_state.gp.state.ilBindings[i];
 
-      changed = current.binding()   != binding.binding
-            || current.inputRate() != binding.inputRate
-            || current.divisor()   != binding.divisor
-            || m_state.vi.vertexExtents[i] != binding.extent;
+      changed = current.binding()    != binding.binding
+             || current.inputRate()  != binding.inputRate
+             || current.divisor()    != binding.divisor
+             || m_state.vi.vertexExtents[i] != binding.extent;
     }
 
     for (uint32_t i = 0; !changed && i < attributeCount; i++) {
@@ -2788,9 +2800,9 @@ namespace dxvk {
       const auto& current = m_state.gp.state.ilAttributes[i];
 
       changed = current.location() != attribute.location
-            || current.binding()  != attribute.binding
-            || current.format()   != attribute.format
-            || current.offset()   != attribute.offset;
+             || current.binding()  != attribute.binding
+             || current.format()   != attribute.format
+             || current.offset()   != attribute.offset;
     }
 
     if (!changed)
@@ -2810,7 +2822,7 @@ namespace dxvk {
       m_state.vi.vertexExtents[i] = binding.extent;
     }
 
-    for (uint32_t i = bindingCount; i < m_state.gp.state.il.bindingCount(); i++) {
+    for (uint32_t i = bindingCount; i < curBindings; i++) {
       m_state.gp.state.ilBindings[i] = DxvkIlBinding();
       m_state.vi.vertexExtents[i] = 0;
     }
@@ -2825,7 +2837,7 @@ namespace dxvk {
         attribute.offset);
     }
 
-    for (uint32_t i = attributeCount; i < m_state.gp.state.il.attributeCount(); i++)
+    for (uint32_t i = attributeCount; i < curAttributes; i++)
       m_state.gp.state.ilAttributes[i] = DxvkIlAttribute();
 
     m_state.gp.state.il = DxvkIlInfo(attributeCount, bindingCount);
@@ -2870,16 +2882,19 @@ namespace dxvk {
   
   
   void DxvkContext::setMultisampleState(const DxvkMultisampleState& ms) {
-    DxvkMsInfo msInfo(
-      m_state.gp.state.ms.sampleCount(),
-      ms.sampleMask(),
-      ms.alphaToCoverage());
+    // Compare via accessors before constructing the packed DxvkMsInfo;
+    // see setInputAssemblyState() for the rationale.
+    const uint32_t newSampleMask  = ms.sampleMask();
+    const VkBool32 newAlphaToCov  = ms.alphaToCoverage();
 
-    if (m_state.gp.state.ms.sampleMask()            == msInfo.sampleMask()
-    && m_state.gp.state.ms.enableAlphaToCoverage() == msInfo.enableAlphaToCoverage())
+    if (m_state.gp.state.ms.sampleMask()            == newSampleMask
+     && m_state.gp.state.ms.enableAlphaToCoverage() == newAlphaToCov)
       return;
 
-    m_state.gp.state.ms = msInfo;
+    m_state.gp.state.ms = DxvkMsInfo(
+      m_state.gp.state.ms.sampleCount(),
+      newSampleMask,
+      newAlphaToCov);
 
     m_flags.set(
       DxvkContextFlag::GpDirtyPipelineState,
@@ -2903,16 +2918,17 @@ namespace dxvk {
   
   
   void DxvkContext::setLogicOpState(const DxvkLogicOpState& lo) {
-    DxvkOmInfo omInfo(
-      lo.logicOpEnable(),
-      lo.logicOp(),
-      m_state.gp.state.om.feedbackLoop());
+    // Compare via accessors before constructing the packed DxvkOmInfo;
+    // see setInputAssemblyState() for the rationale.
+    const VkBool32  newEnable = lo.logicOpEnable();
+    const VkLogicOp newOp     = lo.logicOp();
 
-    if (m_state.gp.state.om.enableLogicOp() == omInfo.enableLogicOp()
-    && m_state.gp.state.om.logicOp()       == omInfo.logicOp())
+    if (m_state.gp.state.om.enableLogicOp() == newEnable
+     && m_state.gp.state.om.logicOp()       == newOp)
       return;
 
-    m_state.gp.state.om = omInfo;
+    m_state.gp.state.om = DxvkOmInfo(
+      newEnable, newOp, m_state.gp.state.om.feedbackLoop());
     m_flags.set(DxvkContextFlag::GpDirtyPipelineState);
   }
 
@@ -2920,29 +2936,35 @@ namespace dxvk {
   void DxvkContext::setBlendMode(
           uint32_t            attachment,
     const DxvkBlendMode&      blendMode) {
-    DxvkOmAttachmentBlend blendInfo(
-      blendMode.blendEnable(),
-      blendMode.colorSrcFactor(),
-      blendMode.colorDstFactor(),
-      blendMode.colorBlendOp(),
-      blendMode.alphaSrcFactor(),
-      blendMode.alphaDstFactor(),
-      blendMode.alphaBlendOp(),
-      blendMode.writeMask());
+    // Read once into locals, compare against the current packed state, and
+    // only construct DxvkOmAttachmentBlend (which assembles 8 bit-packed
+    // fields) if anything actually changes. D3D11 titles routinely re-issue
+    // identical OMSetBlendState calls per draw, so this guard is a measurable
+    // CPU win on the CS thread.
+    const VkBool32              newBlendEnable = blendMode.blendEnable();
+    const VkBlendFactor         newSrcColor    = blendMode.colorSrcFactor();
+    const VkBlendFactor         newDstColor    = blendMode.colorDstFactor();
+    const VkBlendOp             newColorOp     = blendMode.colorBlendOp();
+    const VkBlendFactor         newSrcAlpha    = blendMode.alphaSrcFactor();
+    const VkBlendFactor         newDstAlpha    = blendMode.alphaDstFactor();
+    const VkBlendOp             newAlphaOp     = blendMode.alphaBlendOp();
+    const VkColorComponentFlags newWriteMask   = blendMode.writeMask();
 
     const auto& current = m_state.gp.state.omBlend[attachment];
 
-    if (current.blendEnable()         == blendInfo.blendEnable()
-    && current.srcColorBlendFactor() == blendInfo.srcColorBlendFactor()
-    && current.dstColorBlendFactor() == blendInfo.dstColorBlendFactor()
-    && current.colorBlendOp()        == blendInfo.colorBlendOp()
-    && current.srcAlphaBlendFactor() == blendInfo.srcAlphaBlendFactor()
-    && current.dstAlphaBlendFactor() == blendInfo.dstAlphaBlendFactor()
-    && current.alphaBlendOp()        == blendInfo.alphaBlendOp()
-    && current.colorWriteMask()      == blendInfo.colorWriteMask())
+    if (current.blendEnable()         == newBlendEnable
+     && current.srcColorBlendFactor() == newSrcColor
+     && current.dstColorBlendFactor() == newDstColor
+     && current.colorBlendOp()        == newColorOp
+     && current.srcAlphaBlendFactor() == newSrcAlpha
+     && current.dstAlphaBlendFactor() == newDstAlpha
+     && current.alphaBlendOp()        == newAlphaOp
+     && current.colorWriteMask()      == newWriteMask)
       return;
 
-    m_state.gp.state.omBlend[attachment] = blendInfo;
+    m_state.gp.state.omBlend[attachment] = DxvkOmAttachmentBlend(
+      newBlendEnable, newSrcColor, newDstColor, newColorOp,
+      newSrcAlpha, newDstAlpha, newAlphaOp, newWriteMask);
     m_flags.set(DxvkContextFlag::GpDirtyPipelineState);
   }
 
@@ -7658,24 +7680,30 @@ namespace dxvk {
   void DxvkContext::updateVertexBufferBindings() {
     m_flags.clr(DxvkContextFlag::GpDirtyVertexBuffers);
 
-    if (unlikely(!m_state.gp.state.il.bindingCount()))
+    // Hoist the binding count out of the per-iteration loop header.
+    // bindingCount() is an accessor on a packed bit-field struct that the
+    // optimizer is conservative about reloading; reading it once into a
+    // local lets the loop header become a register compare.
+    const uint32_t bindingCount = m_state.gp.state.il.bindingCount();
+
+    if (unlikely(!bindingCount))
       return;
-    
+
     std::array<VkBuffer,     MaxNumVertexBindings> buffers;
     std::array<VkDeviceSize, MaxNumVertexBindings> offsets;
     std::array<VkDeviceSize, MaxNumVertexBindings> lengths;
     std::array<VkDeviceSize, MaxNumVertexBindings> strides;
-    
+
     bool oldDynamicStrides = m_flags.test(DxvkContextFlag::GpDynamicVertexStrides);
     bool newDynamicStrides = true;
 
     // Set buffer handles and offsets for active bindings
-    for (uint32_t i = 0; i < m_state.gp.state.il.bindingCount(); i++) {
+    for (uint32_t i = 0; i < bindingCount; i++) {
       uint32_t binding = m_state.gp.state.ilBindings[i].binding();
-      
+
       if (likely(m_state.vi.vertexBuffers[binding].length())) {
         auto vbo = m_state.vi.vertexBuffers[binding].getSliceInfo();
-        
+
         buffers[i] = vbo.buffer;
         offsets[i] = vbo.offset;
         lengths[i] = vbo.size;
@@ -7708,7 +7736,7 @@ namespace dxvk {
     if (unlikely(!oldDynamicStrides) || unlikely(!newDynamicStrides)) {
       m_flags.clr(DxvkContextFlag::GpDynamicVertexStrides);
 
-      for (uint32_t i = 0; i < m_state.gp.state.il.bindingCount(); i++) {
+      for (uint32_t i = 0; i < bindingCount; i++) {
         uint32_t stride = newDynamicStrides ? 0 : strides[i];
 
         if (m_state.gp.state.ilBindings[i].stride() != stride) {
@@ -7723,7 +7751,7 @@ namespace dxvk {
 
     // Vertex bindigs get remapped when compiling the
     // pipeline, so this actually does the right thing
-    m_cmd->cmdBindVertexBuffers(0, m_state.gp.state.il.bindingCount(),
+    m_cmd->cmdBindVertexBuffers(0, bindingCount,
       buffers.data(), offsets.data(), lengths.data(),
       newDynamicStrides ? strides.data() : nullptr);
   }
