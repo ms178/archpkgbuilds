@@ -171,25 +171,30 @@ bool DrmAtomicCommit::commitModeset()
 bool DrmAtomicCommit::doCommit(uint32_t flags)
 {
     const bool allowInFence = !isTearing();
+    const bool isNv = m_gpu->isNVidia();
 
+    auto eraseProperty = [this](uint32_t objectId, uint32_t propertyId) {
+        auto it = std::remove_if(m_properties.begin(), m_properties.end(),
+                                 [objectId, propertyId](const PropertyValue &p) {
+                                     return p.objectId == objectId && p.propertyId == propertyId;
+                                 });
+        m_properties.erase(it, m_properties.end());
+    };
+
+    // Rebuild IN_FENCE_FD properties from current buffers every submit to avoid stale FDs.
     for (const auto &pair : m_buffers) {
         DrmPlane *plane = pair.first;
         const auto &buffer = pair.second;
 
-        if (!plane || !plane->inFenceFd.isValid()) [[unlikely]] {
+        if (!plane || !plane->inFenceFd.isValid()) {
             continue;
         }
 
-        const uint32_t objId = plane->fbId.drmObject()->id();
-        const uint32_t propId = plane->inFenceFd.propId();
+        const uint32_t objectId = plane->fbId.drmObject()->id();
+        const uint32_t inFencePropId = plane->inFenceFd.propId();
+        eraseProperty(objectId, inFencePropId);
 
-        auto it = std::remove_if(m_properties.begin(), m_properties.end(),
-                                 [objId, propId](const PropertyValue &p) {
-                                     return p.objectId == objId && p.propertyId == propId;
-                                 });
-        m_properties.erase(it, m_properties.end());
-
-        if (!allowInFence || !buffer || plane->gpu()->isNVidia()) [[unlikely]] {
+        if (!allowInFence || !buffer || isNv) {
             continue;
         }
 
@@ -199,12 +204,13 @@ bool DrmAtomicCommit::doCommit(uint32_t flags)
         }
     }
 
-    std::sort(m_properties.begin(), m_properties.end(),[](const PropertyValue &a, const PropertyValue &b) {
-        if (a.objectId != b.objectId) {
-            return a.objectId < b.objectId;
-        }
-        return a.propertyId < b.propertyId;
-    });
+    std::sort(m_properties.begin(), m_properties.end(),
+              [](const PropertyValue &a, const PropertyValue &b) {
+                  if (a.objectId != b.objectId) {
+                      return a.objectId < b.objectId;
+                  }
+                  return a.propertyId < b.propertyId;
+              });
 
     constexpr size_t kInlineObjectCapacity = 16;
     constexpr size_t kInlinePropertyCapacity = 128;
@@ -215,41 +221,53 @@ bool DrmAtomicCommit::doCommit(uint32_t flags)
     QVarLengthArray<uint64_t, kInlinePropertyCapacity> values;
 
     const size_t propCount = m_properties.size();
-    propertyIds.reserve(static_cast<int>(propCount));
-    values.reserve(static_cast<int>(propCount));
+    propertyIds.reserve(static_cast<qsizetype>(propCount));
+    values.reserve(static_cast<qsizetype>(propCount));
 
-    uint32_t currentObj = 0;
-    uint32_t currentPropCount = 0;
+    uint32_t currentObject = 0;
+    uint32_t currentObjectPropCount = 0;
 
     for (size_t i = 0; i < propCount; ++i) {
-        const auto &p = m_properties[i];
-        if (p.objectId != currentObj) {
-            if (currentObj != 0) {
-                objects.push_back(currentObj);
-                propertyCounts.push_back(currentPropCount);
+        const PropertyValue &p = m_properties[i];
+
+        if (p.objectId != currentObject) {
+            if (currentObject != 0) {
+                objects.push_back(currentObject);
+                propertyCounts.push_back(currentObjectPropCount);
             }
-            currentObj = p.objectId;
-            currentPropCount = 0;
+            currentObject = p.objectId;
+            currentObjectPropCount = 0;
         }
+
         propertyIds.push_back(p.propertyId);
         values.push_back(p.value);
-        ++currentPropCount;
+        ++currentObjectPropCount;
     }
 
-    if (currentObj != 0) {
-        objects.push_back(currentObj);
-        propertyCounts.push_back(currentPropCount);
+    if (currentObject != 0) {
+        objects.push_back(currentObject);
+        propertyCounts.push_back(currentObjectPropCount);
     }
+
+#ifndef NDEBUG
+    uint64_t packedCount = 0;
+    for (uint32_t c : propertyCounts) {
+        packedCount += c;
+    }
+    Q_ASSERT(objects.size() == propertyCounts.size());
+    Q_ASSERT(static_cast<size_t>(packedCount) == propertyIds.size());
+    Q_ASSERT(propertyIds.size() == values.size());
+#endif
 
     drm_mode_atomic commitData{
         .flags = flags,
         .count_objs = static_cast<uint32_t>(objects.size()),
-        .objs_ptr = reinterpret_cast<uint64_t>(objects.data()),
-        .count_props_ptr = reinterpret_cast<uint64_t>(propertyCounts.data()),
-        .props_ptr = reinterpret_cast<uint64_t>(propertyIds.data()),
-        .prop_values_ptr = reinterpret_cast<uint64_t>(values.data()),
+        .objs_ptr = reinterpret_cast<uintptr_t>(objects.data()),
+        .count_props_ptr = reinterpret_cast<uintptr_t>(propertyCounts.data()),
+        .props_ptr = reinterpret_cast<uintptr_t>(propertyIds.data()),
+        .prop_values_ptr = reinterpret_cast<uintptr_t>(values.data()),
         .reserved = 0,
-        .user_data = reinterpret_cast<uint64_t>(this),
+        .user_data = reinterpret_cast<uintptr_t>(this),
     };
 
     return drmIoctl(m_gpu->fd(), DRM_IOCTL_MODE_ATOMIC, &commitData) == 0;
@@ -481,5 +499,3 @@ void DrmLegacyCommit::pageFlipped(std::chrono::nanoseconds timestamp)
 }
 
 }
-
-#include "moc_drm_commit.cpp"

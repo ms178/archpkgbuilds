@@ -358,59 +358,65 @@ void DrmGpu::removeOutputs()
     }
 }
 
-DrmPipeline::Error DrmGpu::checkCrtcAssignment(QList<DrmConnector *> connectors, const QList<DrmCrtc *> &crtcs, std::chrono::steady_clock::time_point deadline)
+DrmPipeline::Error DrmGpu::checkCrtcAssignment(QList<DrmConnector *> connectors,
+                                               const QList<DrmCrtc *> &crtcs,
+                                               std::chrono::steady_clock::time_point deadline)
 {
     if (std::chrono::steady_clock::now() > deadline) {
         return DrmPipeline::Error::Timeout;
     }
 
     struct ActiveConnector {
-        DrmConnector *connector;
-        DrmPipeline *pipeline;
+        DrmConnector *connector = nullptr;
+        DrmPipeline *pipeline = nullptr;
     };
-    QList<ActiveConnector> activeConnectors;
-    activeConnectors.reserve(connectors.size());
+
+    QList<ActiveConnector> active;
+    active.reserve(connectors.size());
+
     for (DrmConnector *connector : std::as_const(connectors)) {
-        const auto pipelineIt = m_pipelineMap.find(connector);
-        if (pipelineIt == m_pipelineMap.end()) {
+        const auto it = m_pipelineMap.find(connector);
+        if (it == m_pipelineMap.end()) {
             continue;
         }
-        DrmPipeline *pipeline = pipelineIt->second.get();
+
+        DrmPipeline *pipeline = it->second.get();
         if (!pipeline->enabled() || !connector->isConnected()) {
             pipeline->setCrtc(nullptr);
             continue;
         }
-        activeConnectors.push_back({connector, pipeline});
+
+        active.push_back({connector, pipeline});
     }
 
-    if (activeConnectors.isEmpty()) {
+    if (active.isEmpty()) {
         return testPipelines();
     }
     if (crtcs.isEmpty()) {
         return DrmPipeline::Error::NotEnoughCrtcs;
     }
 
-    std::vector<bool> used(static_cast<size_t>(crtcs.size()), false);
-    const auto isTerminalError = [](DrmPipeline::Error err) {
+    std::vector<uint8_t> used(static_cast<size_t>(crtcs.size()), 0);
+
+    const auto isTerminal = [](DrmPipeline::Error err) {
         return err == DrmPipeline::Error::None
             || err == DrmPipeline::Error::NoPermission
             || err == DrmPipeline::Error::FramePending
             || err == DrmPipeline::Error::Timeout;
     };
 
-    const auto recurse = [&](auto &&self, qsizetype connectorIndex) -> DrmPipeline::Error {
+    const auto recurse = [&](auto &&self, qsizetype idx) -> DrmPipeline::Error {
         if (std::chrono::steady_clock::now() > deadline) {
             return DrmPipeline::Error::Timeout;
         }
-        if (connectorIndex >= activeConnectors.size()) {
+        if (idx >= active.size()) {
             return testPipelines();
         }
 
-        const ActiveConnector active = activeConnectors[connectorIndex];
-        DrmConnector *connector = active.connector;
-        DrmPipeline *pipeline = active.pipeline;
-        qsizetype preferredIndex = -1;
+        DrmConnector *connector = active[idx].connector;
+        DrmPipeline *pipeline = active[idx].pipeline;
 
+        qsizetype preferredIndex = -1;
         if (m_atomicModeSetting) {
             const uint32_t currentId = connector->crtcId.value();
             for (qsizetype i = 0; i < crtcs.size(); ++i) {
@@ -422,13 +428,15 @@ DrmPipeline::Error DrmGpu::checkCrtcAssignment(QList<DrmConnector *> connectors,
         }
 
         if (preferredIndex >= 0) {
-            DrmCrtc *crtc = crtcs[preferredIndex];
-            if (connector->isCrtcSupported(crtc)) {
-                used[static_cast<size_t>(preferredIndex)] = true;
-                pipeline->setCrtc(crtc);
-                const DrmPipeline::Error err = self(self, connectorIndex + 1);
-                used[static_cast<size_t>(preferredIndex)] = false;
-                if (isTerminalError(err)) {
+            DrmCrtc *preferred = crtcs[preferredIndex];
+            if (connector->isCrtcSupported(preferred)) {
+                used[static_cast<size_t>(preferredIndex)] = 1;
+                pipeline->setCrtc(preferred);
+
+                const DrmPipeline::Error err = self(self, idx + 1);
+
+                used[static_cast<size_t>(preferredIndex)] = 0;
+                if (isTerminal(err)) {
                     return err;
                 }
             }
@@ -438,18 +446,25 @@ DrmPipeline::Error DrmGpu::checkCrtcAssignment(QList<DrmConnector *> connectors,
             if (i == preferredIndex || used[static_cast<size_t>(i)]) {
                 continue;
             }
+
             DrmCrtc *crtc = crtcs[i];
             if (!connector->isCrtcSupported(crtc)) {
                 continue;
             }
-            used[static_cast<size_t>(i)] = true;
+
+            used[static_cast<size_t>(i)] = 1;
             pipeline->setCrtc(crtc);
-            const DrmPipeline::Error err = self(self, connectorIndex + 1);
-            used[static_cast<size_t>(i)] = false;
-            if (isTerminalError(err)) {
+
+            const DrmPipeline::Error err = self(self, idx + 1);
+
+            used[static_cast<size_t>(i)] = 0;
+            if (isTerminal(err)) {
                 return err;
             }
         }
+
+        // Important cleanup on non-terminal failure during backtracking.
+        pipeline->setCrtc(nullptr);
         return DrmPipeline::Error::InvalidArguments;
     };
 

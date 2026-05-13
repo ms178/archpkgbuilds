@@ -1,41 +1,50 @@
 /*
-    SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
-    SPDX-FileCopyrightText: 2025 Xaver Hugl <xaver.hugl@kde.org>
-
-    SPDX-License-Identifier: GPL-2.0-or-later
-*/
+ * SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
 
 #pragma once
 
 #include "kwin_export.h"
 
-#include <array>
 #include <chrono>
-#include <cstddef>
-#include <cstdint>
+#include <optional>
 
 namespace KWin
 {
 
+/**
+ * The RenderJournal class tracks render time history and estimates a safe
+ * render budget for the next frame.
+ */
 class KWIN_EXPORT RenderJournal
 {
 public:
     explicit RenderJournal();
 
+    /**
+     * Adds a new render-time sample.
+     *
+     * @param renderTime             Time spent rendering a frame.
+     * @param presentationTimestamp  Monotonic presentation timestamp of that frame.
+     */
     void add(std::chrono::nanoseconds renderTime, std::chrono::nanoseconds presentationTimestamp);
 
+    /**
+     * Returns the predicted render budget for the next frame.
+     */
     [[nodiscard]] std::chrono::nanoseconds result() const noexcept;
 
 private:
-    static constexpr std::size_t kHistorySize = 64;
-    static constexpr std::size_t kHistoryMask = kHistorySize - 1;
-
-    static_assert((kHistorySize & kHistoryMask) == 0, "kHistorySize must be power of 2");
-
-    alignas(64) std::array<double, kHistorySize> m_history{};
-    std::size_t m_writeIndex{0};
-    std::size_t m_count{0};
+    // Predicted render budget consumed by the scheduler.
     std::chrono::nanoseconds m_result{0};
+
+    // Internal model state (nanoseconds domain).
+    double m_meanNs{0.0};
+    double m_varianceNs2{0.0};
+
+    // Last monotonic presentation timestamp used for time-aware adaptation.
+    std::optional<std::chrono::nanoseconds> m_lastPresentationTimestamp;
 };
 
-}
+} // namespace KWin

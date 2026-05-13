@@ -1,13 +1,13 @@
 /*
-    SPDX-FileCopyrightText: 2024 Xaver Hugl <xaver.hugl@gmail.com>
-
-    SPDX-License-Identifier: GPL-2.0-or-later
-*/
+ * SPDX-FileCopyrightText: 2024 Xaver Hugl <xaver.hugl@gmail.com>
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
 
 #include "syncobjtimeline.h"
 
 #include <cerrno>
 #include <cstring>
+#include <libdrm/drm.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <xf86drm.h>
@@ -15,8 +15,7 @@
 #if defined(Q_OS_LINUX)
 #include <linux/sync_file.h>
 #else
-struct sync_merge_data
-{
+struct sync_merge_data {
     char name[32];
     __s32 fd2;
     __s32 fence;
@@ -38,25 +37,30 @@ constexpr int s_maxIoctlRetries = 8;
 
 FileDescriptor mergeSyncFds(const FileDescriptor &fd1, const FileDescriptor &fd2)
 {
+    if (!fd1.isValid() || !fd2.isValid()) [[unlikely]] {
+        return FileDescriptor{};
+    }
+
     struct sync_merge_data data = {};
     static_assert(sizeof(s_mergeName) <= sizeof(data.name), "merge name too long");
     std::memcpy(data.name, s_mergeName, sizeof(s_mergeName));
     data.fd2 = fd2.get();
     data.fence = -1;
 
-    int ret;
+    int ret = -1;
     int retries = 0;
     do {
         ret = ioctl(fd1.get(), SYNC_IOC_MERGE, &data);
     } while (ret == -1 && (errno == EINTR || errno == EAGAIN) && ++retries < s_maxIoctlRetries);
 
-    if (ret < 0) [[unlikely]] {
+    if (ret < 0 || data.fence < 0) [[unlikely]] {
         return FileDescriptor{};
     }
+
     return FileDescriptor(data.fence);
 }
 
-}
+} // namespace
 
 SyncReleasePoint::SyncReleasePoint(std::shared_ptr<SyncTimeline> timeline, uint64_t timelinePoint)
     : m_timeline(std::move(timeline))
@@ -66,12 +70,14 @@ SyncReleasePoint::SyncReleasePoint(std::shared_ptr<SyncTimeline> timeline, uint6
 
 SyncReleasePoint::~SyncReleasePoint()
 {
-    if (m_timeline) [[likely]] {
-        if (m_releaseFence.isValid()) {
-            m_timeline->moveInto(m_timelinePoint, m_releaseFence);
-        } else {
-            m_timeline->signal(m_timelinePoint);
-        }
+    if (!m_timeline) [[unlikely]] {
+        return;
+    }
+
+    if (m_releaseFence.isValid()) {
+        m_timeline->moveInto(m_timelinePoint, m_releaseFence);
+    } else {
+        m_timeline->signal(m_timelinePoint);
     }
 }
 
@@ -84,18 +90,22 @@ SyncReleasePoint::SyncReleasePoint(SyncReleasePoint &&other) noexcept
 
 SyncReleasePoint &SyncReleasePoint::operator=(SyncReleasePoint &&other) noexcept
 {
-    if (this != &other) [[likely]] {
-        if (m_timeline) {
-            if (m_releaseFence.isValid()) {
-                m_timeline->moveInto(m_timelinePoint, m_releaseFence);
-            } else {
-                m_timeline->signal(m_timelinePoint);
-            }
-        }
-        m_timeline = std::move(other.m_timeline);
-        m_timelinePoint = other.m_timelinePoint;
-        m_releaseFence = std::move(other.m_releaseFence);
+    if (this == &other) [[unlikely]] {
+        return *this;
     }
+
+    if (m_timeline) {
+        if (m_releaseFence.isValid()) {
+            m_timeline->moveInto(m_timelinePoint, m_releaseFence);
+        } else {
+            m_timeline->signal(m_timelinePoint);
+        }
+    }
+
+    m_timeline = std::move(other.m_timeline);
+    m_timelinePoint = other.m_timelinePoint;
+    m_releaseFence = std::move(other.m_releaseFence);
+
     return *this;
 }
 
@@ -104,10 +114,22 @@ void SyncReleasePoint::addReleaseFence(const FileDescriptor &fd)
     if (!fd.isValid()) [[unlikely]] {
         return;
     }
-    if (m_releaseFence.isValid()) {
-        m_releaseFence = mergeSyncFds(m_releaseFence, fd);
-    } else {
+
+    if (!m_releaseFence.isValid()) {
         m_releaseFence = fd.duplicate();
+        return;
+    }
+
+    // Keep existing fence if merge fails; never regress to "no fence".
+    if (FileDescriptor merged = mergeSyncFds(m_releaseFence, fd); merged.isValid()) {
+        m_releaseFence = std::move(merged);
+        return;
+    }
+
+    // Retry opposite order for kernels/drivers sensitive to merge direction.
+    if (FileDescriptor merged = mergeSyncFds(fd, m_releaseFence); merged.isValid()) {
+        m_releaseFence = std::move(merged);
+        return;
     }
 }
 
@@ -136,7 +158,7 @@ const FileDescriptor &SyncTimeline::fileDescriptor()
 {
     if (!m_fileDescriptor.isValid() && m_handle != 0) {
         int fd = -1;
-        if (drmSyncobjHandleToFD(m_drmFd, m_handle, &fd) == 0) {
+        if (drmSyncobjHandleToFD(m_drmFd, m_handle, &fd) == 0 && fd >= 0) {
             m_fileDescriptor = FileDescriptor(fd);
         }
     }
@@ -148,13 +170,16 @@ FileDescriptor SyncTimeline::eventFd(uint64_t timelinePoint) const
     if (m_handle == 0) [[unlikely]] {
         return {};
     }
+
     FileDescriptor ret{eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)};
     if (!ret.isValid()) [[unlikely]] {
         return {};
     }
+
     if (drmSyncobjEventfd(m_drmFd, m_handle, timelinePoint, ret.get(), 0) != 0) [[unlikely]] {
         return {};
     }
+
     return ret;
 }
 
@@ -170,6 +195,7 @@ void SyncTimeline::moveInto(uint64_t timelinePoint, const FileDescriptor &fd)
     if (m_handle == 0) [[unlikely]] {
         return;
     }
+
     if (!fd.isValid()) [[unlikely]] {
         signal(timelinePoint);
         return;
@@ -188,6 +214,7 @@ void SyncTimeline::moveInto(uint64_t timelinePoint, const FileDescriptor &fd)
     }
 
     if (!success) [[unlikely]] {
+        // Preserve forward progress semantics on any import/transfer failure.
         signal(timelinePoint);
     }
 }
@@ -204,10 +231,14 @@ FileDescriptor SyncTimeline::exportSyncFile(uint64_t timelinePoint)
     }
 
     int syncFileFd = -1;
-    if (drmSyncobjTransfer(m_drmFd, tempHandle, 0, m_handle, timelinePoint, 0) == 0) [[likely]] {
-        drmSyncobjExportSyncFile(m_drmFd, tempHandle, &syncFileFd);
-    }
+    const bool transferred = drmSyncobjTransfer(m_drmFd, tempHandle, 0, m_handle, timelinePoint, 0) == 0;
+    const bool exported = transferred && drmSyncobjExportSyncFile(m_drmFd, tempHandle, &syncFileFd) == 0;
+
     drmSyncobjDestroy(m_drmFd, tempHandle);
+
+    if (!exported || syncFileFd < 0) [[unlikely]] {
+        return {};
+    }
 
     return FileDescriptor(syncFileFd);
 }
@@ -217,13 +248,15 @@ bool SyncTimeline::isMaterialized(uint64_t timelinePoint)
     if (m_handle == 0) [[unlikely]] {
         return false;
     }
+
     return drmSyncobjTimelineWait(m_drmFd,
                                   &m_handle,
                                   &timelinePoint,
                                   1,
                                   0,
                                   DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
-                                  nullptr) == 0;
+                                  nullptr)
+        == 0;
 }
 
-}
+} // namespace KWin

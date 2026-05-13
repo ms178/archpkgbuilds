@@ -1195,13 +1195,12 @@ void RenderLoopPrivate::delayScheduleRepaint() noexcept
 void RenderLoopPrivate::notifyFrameDropped()
 {
     if (q->thread() != QThread::currentThread()) [[unlikely]] {
-        QMetaObject::invokeMethod(q, [this]() {
-            notifyFrameDropped();
-        }, Qt::QueuedConnection);
+        QMetaObject::invokeMethod(q, [this]() { notifyFrameDropped(); }, Qt::QueuedConnection);
         return;
     }
 
     preparingNewFrame = false;
+
     if (pendingFrameCount > 0) {
         --pendingFrameCount;
     }
@@ -1225,8 +1224,7 @@ void RenderLoopPrivate::notifyFrameDropped()
             delay = std::min(delay, adaptiveErrorBackoffMaxMs(static_cast<int64_t>(cachedVblankIntervalNs)));
             compositeTimer.start(delay, Qt::PreciseTimer, q);
             scheduledTimerMs = static_cast<int16_t>(delay);
-            scheduledRenderTimestamp = std::chrono::nanoseconds{
-                steadyNowNs() + static_cast<int64_t>(delay) * kNsPerMs};
+            scheduledRenderTimestamp = std::chrono::nanoseconds{steadyNowNs() + static_cast<int64_t>(delay) * kNsPerMs};
         } else {
             scheduleNextRepaint();
         }
@@ -1281,9 +1279,45 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
                                              PresentationMode mode,
                                              OutputFrame *frame)
 {
+    auto buildFeedback = [this, timestamp, frame, mode]() -> std::optional<PresentFeedback> {
+        if (!frame) {
+            return std::nullopt;
+        }
+
+        PresentFeedback feedback{};
+        feedback.actualPresentationTimestamp = timestamp;
+        feedback.targetPresentationTimestamp =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(frame->targetPageflipTime().time_since_epoch());
+        feedback.refreshDuration = frame->refreshDuration();
+
+        const int64_t vblankNs = static_cast<int64_t>(cachedVblankIntervalNs);
+        int64_t graceNs = vblankNs / 8;
+        if (graceNs < 700'000) {
+            graceNs = 700'000;
+        } else if (graceNs > 2'500'000) {
+            graceNs = 2'500'000;
+        }
+
+        if (!isVrrMode(mode) && feedback.targetPresentationTimestamp.count() > 0) {
+            feedback.deadlineMissed = timestamp > (feedback.targetPresentationTimestamp + std::chrono::nanoseconds{graceNs});
+        } else {
+            feedback.deadlineMissed = false;
+        }
+
+        feedback.directScanout = false;
+        feedback.valid = true;
+        return feedback;
+    };
+
+    const std::optional<PresentFeedback> initialFeedback = buildFeedback();
+
     if (q->thread() != QThread::currentThread()) [[unlikely]] {
-        QMetaObject::invokeMethod(q, [this, timestamp, renderTime, mode]() {
+        // Preserve feedback data on thread hop.
+        QMetaObject::invokeMethod(q, [this, timestamp, renderTime, mode, initialFeedback]() {
             notifyFrameCompleted(timestamp, renderTime, mode, nullptr);
+            if (initialFeedback.has_value()) {
+                addPresentFeedback(*initialFeedback);
+            }
         }, Qt::QueuedConnection);
         return;
     }
@@ -1307,8 +1341,8 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
 
     const int64_t prevPresentationNs = lastPresentationTimestamp.count();
     const int64_t nowNs = steadyNowNs();
-    int64_t tsNs = timestamp.count();
 
+    int64_t tsNs = timestamp.count();
     if (tsNs > nowNs) [[unlikely]] {
         tsNs = nowNs;
     }
@@ -1337,32 +1371,8 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
         starvationRecoveryCounter = 0;
     }
 
-    if (frame != nullptr) {
-        PresentFeedback feedback{};
-        feedback.actualPresentationTimestamp = timestamp;
-        feedback.targetPresentationTimestamp =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(frame->targetPageflipTime().time_since_epoch());
-        feedback.refreshDuration = frame->refreshDuration();
-
-        const int64_t vblankNs = static_cast<int64_t>(cachedVblankIntervalNs);
-        int64_t graceNs = vblankNs / 8;
-
-        if (graceNs < 700'000) {
-            graceNs = 700'000;
-        } else if (graceNs > 2'500'000) {
-            graceNs = 2'500'000;
-        }
-
-        if (!isVrrMode(mode) && feedback.targetPresentationTimestamp.count() > 0) {
-            feedback.deadlineMissed =
-                timestamp > (feedback.targetPresentationTimestamp + std::chrono::nanoseconds{graceNs});
-        } else {
-            feedback.deadlineMissed = false;
-        }
-
-        feedback.directScanout = false;
-        feedback.valid = true;
-        addPresentFeedback(feedback);
+    if (initialFeedback.has_value()) {
+        addPresentFeedback(*initialFeedback);
     }
 
     const bool vrrActive = isVrrMode(presentationMode);
@@ -1374,7 +1384,12 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
         armStalledFrameTimer();
     }
 
-    if (inhibitCount == 0 && (pendingReschedule || pendingFrameCount == 0)) {
+    // Retarget already-armed timer against new present timestamp to avoid phase drift.
+    if (compositeTimer.isActive()) {
+        compositeTimer.stop();
+        scheduledTimerMs = -1;
+        scheduleRepaint();
+    } else if (inhibitCount == 0 && (pendingReschedule || pendingFrameCount == 0)) {
         pendingReschedule = false;
         scheduleNextRepaint();
     }
@@ -1447,9 +1462,13 @@ void RenderLoop::uninhibit()
 
 void RenderLoop::prepareNewFrame()
 {
-    Q_ASSERT(!d->preparingNewFrame);
+    if (d->preparingNewFrame) {
+        return;
+    }
+
     ++d->pendingFrameCount;
     d->preparingNewFrame = true;
+    d->armStalledFrameTimer();
 }
 
 void RenderLoop::newFramePrepared()
@@ -1543,12 +1562,14 @@ void RenderLoop::notifyPresentFeedback(const PresentFeedback &feedback)
     d->addPresentFeedback(feedback);
 }
 
-void RenderLoop::scheduleRepaint(Item *item, OutputLayer* layer)
+void RenderLoop::scheduleRepaint(Item *item, OutputLayer *layer)
 {
     (void)layer;
+
     if (thread() != QThread::currentThread()) [[unlikely]] {
-        QMetaObject::invokeMethod(this, [this]() {
-            scheduleRepaint(nullptr, nullptr);
+        // Preserve call semantics; do not drop caller context by always using nullptrs.
+        QMetaObject::invokeMethod(this, [this, item, layer]() {
+            scheduleRepaint(item, layer);
         }, Qt::QueuedConnection);
         return;
     }
@@ -1573,9 +1594,8 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer* layer)
 
     const bool vrrActive = isVrrMode(d->presentationMode);
     const int maxPending = effectiveMaxPendingFrames(d.get(), vrrActive);
-    const bool blockedByQueue = d->pendingFrameCount >= maxPending;
 
-    if (blockedByQueue) {
+    if (d->pendingFrameCount >= maxPending) {
         if (!vrrActive && d->delayedVrrTimer.isActive()) {
             d->delayedVrrTimer.stop();
         }
@@ -1584,12 +1604,13 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer* layer)
         return;
     }
 
-    const bool maybeDelayControl = vrrActive &&
-        item != nullptr &&
-        d->activeContentHint_ == VrrContentHint::Unknown &&
-        d->interactiveGraceFrames_ == 0U &&
-        d->cadenceStability_ < kCadenceStableThreshold &&
-        d->pendingFrameCount > 0;
+    const bool maybeDelayControl =
+        vrrActive
+        && item != nullptr
+        && d->activeContentHint_ == VrrContentHint::Unknown
+        && d->interactiveGraceFrames_ == 0U
+        && d->cadenceStability_ < kCadenceStableThreshold
+        && d->pendingFrameCount > 0;
 
     if (maybeDelayControl) {
         const VrrStateCache::State state = d->vrrStateCache_.getState();
