@@ -8,7 +8,9 @@
 namespace dxvk {
 
   class D3D11ShaderConverter : public DxvkIrShaderConverter {
+
   public:
+
     D3D11ShaderConverter(
       const DxvkShaderHash&         ShaderKey,
       const DxvkIrShaderCreateInfo& ModuleInfo,
@@ -16,12 +18,17 @@ namespace dxvk {
             size_t                  BytecodeLength,
             bool                    LowerIcb)
     : m_key(ShaderKey), m_info(ModuleInfo), m_lowerIcb(LowerIcb) {
-      m_dxbc.assign(
-        reinterpret_cast<const uint8_t*>(pShaderBytecode),
-        reinterpret_cast<const uint8_t*>(pShaderBytecode) + BytecodeLength);
+      // The DXBC bytecode pointer is owned by the caller and may be freed
+      // immediately after Create*Shader returns (per D3D11 spec). The
+      // converter is invoked asynchronously on a pipeline-compile worker,
+      // so we must take a private copy here. assign() from an iterator
+      // pair avoids the spurious zero-init that resize() + memcpy would do
+      // for a trivially default-constructible element type on libstdc++.
+      const auto* begin = reinterpret_cast<const uint8_t*>(pShaderBytecode);
+      m_dxbc.assign(begin, begin + BytecodeLength);
     }
 
-    ~D3D11ShaderConverter() { }
+    ~D3D11ShaderConverter() = default;
 
     void convertShader(dxbc_spv::ir::Builder& builder) {
       const std::string shaderName = m_key.toString();
@@ -44,6 +51,7 @@ namespace dxvk {
 
       dxbc_spv::dxbc::Converter converter(std::move(container), options);
 
+      // Determine whether to create a regular shader or a pass-through GS
       const bool dstIsGs = m_key.stage() == VK_SHADER_STAGE_GEOMETRY_BIT;
       const bool srcIsGs = shaderInfo.getType() == dxbc_spv::dxbc::ShaderType::eGeometry;
 
@@ -82,9 +90,9 @@ namespace dxvk {
     void dumpSource(const std::string& path) const {
       const auto filePath =
         str::topath(str::format(path, "/", m_key.toString(), ".dxbc").c_str());
-
       std::ofstream file(filePath.c_str(), std::ios_base::trunc | std::ios_base::binary);
-      file.write(reinterpret_cast<const char*>(m_dxbc.data()), m_dxbc.size());
+      file.write(reinterpret_cast<const char*>(m_dxbc.data()),
+                 static_cast<std::streamsize>(m_dxbc.size()));
     }
 
     std::string getDebugName() const {
@@ -92,16 +100,19 @@ namespace dxvk {
     }
 
   private:
+
     std::vector<uint8_t>    m_dxbc;
+
     DxvkShaderHash          m_key;
     DxvkIrShaderCreateInfo  m_info;
+
     bool                    m_lowerIcb = false;
+
   };
 
 
-
-  D3D11CommonShader:: D3D11CommonShader() { }
-  D3D11CommonShader::~D3D11CommonShader() { }
+  D3D11CommonShader:: D3D11CommonShader() = default;
+  D3D11CommonShader::~D3D11CommonShader() = default;
 
 
   D3D11CommonShader::D3D11CommonShader(
@@ -134,7 +145,10 @@ namespace dxvk {
     const D3D11ShaderIcbInfo&     Icb) {
     constexpr size_t MaxEmbeddedIcbSize = 64u;
 
-    const size_t icbSizeInBytes = Icb.size * sizeof(uint32_t);
+    // Create icb if lowering is required. sizeof(*Icb.data) is used (rather
+    // than a hard-coded uint32_t) so the calculation tracks the type of the
+    // ICB element if it is ever changed in the header.
+    const size_t icbSizeInBytes = Icb.size * sizeof(*Icb.data);
 
     if (ModuleInfo.options.flags.test(DxvkShaderCompileFlag::LowerConstantArrays)
      && icbSizeInBytes > MaxEmbeddedIcbSize) {
@@ -155,6 +169,10 @@ namespace dxvk {
       pDevice->InitShaderIcb(this, icbSizeInBytes, Icb.data);
     }
 
+    // Materialise the debug name once and reuse it for both the lookup and
+    // the (possible) insert path. createCachedShader takes the name by
+    // const std::string&, so a single std::string covers both calls and
+    // avoids one heap allocation + one hex-format pass per cache miss.
     const std::string shaderName = ShaderKey.toString();
 
     m_shader = pDevice->GetDXVKDevice()->createCachedShader(
@@ -181,6 +199,7 @@ namespace dxvk {
       return;
 
     dxbc_spv::dxbc::InterfaceChunk ifaceInfo(ifaceChunk);
+
     if (!ifaceInfo)
       return;
 
@@ -194,8 +213,8 @@ namespace dxvk {
     }
 
     for (auto i = slotInfos.first; i != slotInfos.second; i++) {
-      uint32_t slotIndex = i->index;
-      uint32_t slotCount = i->count;
+      const uint32_t slotIndex = i->index;
+      const uint32_t slotCount = i->count;
       for (const auto& e : i->entries)
         m_interfaces.AddSlotInfo(slotIndex, slotCount, e.typeId, e.tableId);
     }
@@ -204,10 +223,10 @@ namespace dxvk {
 
     for (auto i = instances.first; i != instances.second; i++) {
       D3D11_CLASS_INSTANCE_DESC desc = { };
-      desc.ConstantBuffer = i->cbvIndex;
+      desc.ConstantBuffer           = i->cbvIndex;
       desc.BaseConstantBufferOffset = i->cbvOffset;
-      desc.BaseTexture = i->srvIndex & 0x7fu;
-      desc.BaseSampler = i->samplerIndex & 0xfu;
+      desc.BaseTexture              = i->srvIndex & 0x7fu;
+      desc.BaseSampler              = i->samplerIndex & 0xfu;
 
       auto typeName = m_interfaces.GetTypeName(i->typeId);
 
@@ -217,8 +236,8 @@ namespace dxvk {
   }
 
 
-  D3D11ShaderModuleSet:: D3D11ShaderModuleSet() { }
-  D3D11ShaderModuleSet::~D3D11ShaderModuleSet() { }
+  D3D11ShaderModuleSet:: D3D11ShaderModuleSet() = default;
+  D3D11ShaderModuleSet::~D3D11ShaderModuleSet() = default;
 
 
   HRESULT D3D11ShaderModuleSet::GetShaderModule(
@@ -231,7 +250,7 @@ namespace dxvk {
     const D3D11ShaderIcbInfo&     Icb,
     const D3D11BindingMask&       BindingMask,
           D3D11CommonShader*      pShader) {
-    // Use the shader's unique key for the lookup.
+    // Fast path: lookup under the shared cache lock.
     { std::lock_guard<dxvk::mutex> lock(m_mutex);
 
       auto entry = m_modules.find(ShaderKey);
@@ -241,8 +260,9 @@ namespace dxvk {
       }
     }
 
-    // This shader has not been compiled yet, so we have to create a
-    // new module. This takes a while, so we won't lock the structure.
+    // Slow path: this shader has not been compiled yet. Compile outside the
+    // lock so other threads can keep using the cache during the (potentially
+    // long) DXBC -> IR translation.
     D3D11CommonShader module;
 
     try {
@@ -253,10 +273,13 @@ namespace dxvk {
       return E_INVALIDARG;
     }
 
-    // Insert the new module into the lookup table. If another thread
-    // has compiled the same shader in the meantime, we should return
-    // that object instead and discard the newly created module.
+    // Insert the new module. If another thread compiled the same shader
+    // in the meantime we discard ours and return theirs. try_emplace is
+    // guaranteed not to move-from the argument when the key is already
+    // present, so the local 'module' remains valid (and is harmlessly
+    // destroyed at scope exit) in the duplicate-compile case.
     { std::lock_guard<dxvk::mutex> lock(m_mutex);
+
       auto status = m_modules.try_emplace(ShaderKey, std::move(module));
       *pShader = status.first->second;
       return S_OK;
