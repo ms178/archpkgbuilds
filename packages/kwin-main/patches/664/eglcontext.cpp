@@ -193,6 +193,8 @@ bool EglContext::makeCurrent(EGLSurface surface)
     }
 
     if (ret) [[likely]] {
+        Q_ASSERT(m_handle != EGL_NO_CONTEXT);
+        Q_ASSERT(eglGetCurrentContext() == m_handle);
         s_currentContext = this;
         s_currentSurface = surface;
     } else {

@@ -164,9 +164,13 @@ FileDescriptor DrmGpu::createNonMasterFd() const
     free(path);
     if (!fd.isValid()) {
         qCWarning(KWIN_DRM) << "Could not open DRM fd for leasing!" << strerror(errno);
-    } else if (drmIsMaster(fd.get()) && drmDropMaster(fd.get()) != 0) {
-        qCWarning(KWIN_DRM) << "Could not create a non-master DRM fd for leasing!" << strerror(errno);
-        return FileDescriptor{};
+    } else {
+        if (drmIsMaster(fd.get())) {
+            if (drmDropMaster(fd.get()) != 0) {
+                qCWarning(KWIN_DRM) << "Could not create a non-master DRM fd for leasing!" << strerror(errno);
+                return FileDescriptor{};
+            }
+        }
     }
     return fd;
 }
@@ -618,6 +622,8 @@ void DrmGpu::pageFlipHandler(int fd, unsigned int sequence, unsigned int sec, un
         return;
     }
 
+    // The static_cast<long> on usec avoids overflow in the multiplication,
+    // especially on 32-bit architectures. (Custom optimisation kept.)
     std::chrono::nanoseconds timestamp = convertTimestamp(gpu->presentationClock(), CLOCK_MONOTONIC,
                                                           {static_cast<time_t>(sec), static_cast<long>(usec) * 1000L});
     if (timestamp == std::chrono::nanoseconds::zero()) {
@@ -894,7 +900,9 @@ void DrmGpu::doModeset()
             pendingFrame->presented(std::chrono::steady_clock::now().time_since_epoch(), PresentationMode::VSync);
         }
     } else if (err != DrmPipeline::Error::FramePending) {
-        QTimer::singleShot(0, m_platform, &DrmBackend::updateOutputs);
+        QTimer::singleShot(0, m_platform, [backend = m_platform]() {
+            backend->updateOutputs();   // calls updateOutputs(nullptr) to scan all GPUs on error recovery
+        });
     }
     m_pendingModesetFrames.clear();
     m_inModeset = false;

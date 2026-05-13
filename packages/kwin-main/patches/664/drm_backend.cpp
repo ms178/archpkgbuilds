@@ -119,7 +119,7 @@ bool DrmBackend::initialize()
             gpu->setActive(true);
             // the output list might've changed while the device was inactive
             // note that this might delete the gpu!
-            updateOutputs();
+            updateOutputs(gpu);
         }
     });
     connect(m_session, &Session::awoke, this, [this]() {
@@ -164,7 +164,7 @@ bool DrmBackend::initialize()
             m_udevMonitor->enable();
         }
     }
-    updateOutputs();
+    updateOutputs();   // default argument nullptr → update all GPUs on startup
 
     if (m_explicitGpus.empty() && m_gpus.size() > 1) {
         std::ranges::sort(m_gpus, [](const std::unique_ptr<DrmGpu> &gpu1, const std::unique_ptr<DrmGpu> &gpu2) {
@@ -228,8 +228,8 @@ void DrmBackend::handleUdevEvent()
                 qCWarning(KWIN_DRM) << "Received unexpected add udev event for:" << devNode;
                 continue;
             }
-            if (addGpu(devNode)) {
-                updateOutputs();
+            if (DrmGpu *gpu = addGpu(devNode)) {
+                updateOutputs(gpu);
             }
         } else if (action == kActionRemove) {
             if (DrmGpu *const gpu = findGpu(devNum)) {
@@ -239,7 +239,7 @@ void DrmBackend::handleUdevEvent()
                     return;
                 }
                 gpu->setRemoved();
-                updateOutputs();
+                updateOutputs(gpu);
             }
         } else if (action == kActionChange) {
             DrmGpu *gpu = findGpu(devNum);
@@ -248,7 +248,7 @@ void DrmBackend::handleUdevEvent()
             }
             if (gpu && gpu->isActive()) {
                 qCDebug(KWIN_DRM) << "Received change event for monitored drm device" << gpu->drmDevice()->path();
-                updateOutputs();
+                updateOutputs(gpu);
             }
         }
     }
@@ -307,12 +307,12 @@ void DrmBackend::removeOutput(DrmAbstractOutput *o)
     Q_EMIT outputRemoved(o);
 }
 
-void DrmBackend::updateOutputs()
+void DrmBackend::updateOutputs(DrmGpu *onlyUpdate)
 {
     for (auto it = m_gpus.begin(); it != m_gpus.end(); ++it) {
         if ((*it)->isRemoved()) {
             (*it)->removeOutputs();
-        } else {
+        } else if (!onlyUpdate || onlyUpdate == it->get()) {
             (*it)->updateOutputs();
         }
     }
