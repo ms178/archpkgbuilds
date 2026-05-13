@@ -418,7 +418,7 @@ private:
   /// instructions, and returns the replacement; returns nullptr otherwise.
   MachineInstr *foldLoadInto(MachineFunction &MF, MachineInstr &MI,
                              Register FoldReg,
-                             SmallPtrSet<MachineInstr *, 16> &LocalMIs);
+                             SmallPtrSetImpl<MachineInstr *> &LocalMIs);
 
   bool tryFoldLoadAfterCompareElim(Register CmpSrcReg,
                                    SmallPtrSetImpl<MachineInstr *> &LocalMIs);
@@ -1045,7 +1045,6 @@ PeepholeOptimizer::foldLoadInto(MachineFunction &MF, MachineInstr &MI,
   Register Reg = FoldReg;
   MachineInstr *DefMI = nullptr;
   MachineInstr *CopyMI = nullptr;
-
   MachineInstr *FoldMI = TII->optimizeLoadInstr(MI, MRI, Reg, DefMI, CopyMI);
   if (!FoldMI)
     return nullptr;
@@ -1061,7 +1060,6 @@ PeepholeOptimizer::foldLoadInto(MachineFunction &MF, MachineInstr &MI,
     MF.moveAdditionalCallInfo(&MI, FoldMI);
   MI.eraseFromParent();
   DefMI->eraseFromParent();
-
   MRI->markUsesInDebugValueAsUndef(FoldReg);
   ++NumLoadFold;
   return FoldMI;
