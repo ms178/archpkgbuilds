@@ -1,5 +1,787 @@
+--- a/clang/lib/CodeGen/CodeGenModule.h	2026-05-09 00:29:08.901315799 +0200
++++ b/clang/lib/CodeGen/CodeGenModule.h	2026-05-09 00:34:08.553545038 +0200
+@@ -822,7 +822,8 @@ public:
+   }
+ 
+   llvm::Constant *getStaticLocalDeclAddress(const VarDecl *D) {
+-    return StaticLocalDeclMap[D];
++    auto It = StaticLocalDeclMap.find(D);
++    return It == StaticLocalDeclMap.end() ? nullptr : It->second;
+   }
+   void setStaticLocalDeclAddress(const VarDecl *D,
+                                  llvm::Constant *C) {
+@@ -834,7 +835,8 @@ public:
+                            llvm::GlobalValue::LinkageTypes Linkage);
+ 
+   llvm::GlobalVariable *getStaticLocalDeclGuardAddress(const VarDecl *D) {
+-    return StaticLocalDeclGuardMap[D];
++    auto It = StaticLocalDeclGuardMap.find(D);
++    return It == StaticLocalDeclGuardMap.end() ? nullptr : It->second;
+   }
+   void setStaticLocalDeclGuardAddress(const VarDecl *D,
+                                       llvm::GlobalVariable *C) {
+@@ -848,7 +850,8 @@ public:
+                                 GlobalDecl &Result) const;
+ 
+   llvm::Constant *getAtomicSetterHelperFnMap(QualType Ty) {
+-    return AtomicSetterHelperFnMap[Ty];
++    auto It = AtomicSetterHelperFnMap.find(Ty);
++    return It == AtomicSetterHelperFnMap.end() ? nullptr : It->second;
+   }
+   void setAtomicSetterHelperFnMap(QualType Ty,
+                             llvm::Constant *Fn) {
+@@ -856,7 +859,8 @@ public:
+   }
+ 
+   llvm::Constant *getAtomicGetterHelperFnMap(QualType Ty) {
+-    return AtomicGetterHelperFnMap[Ty];
++    auto It = AtomicGetterHelperFnMap.find(Ty);
++    return It == AtomicGetterHelperFnMap.end() ? nullptr : It->second;
+   }
+   void setAtomicGetterHelperFnMap(QualType Ty,
+                             llvm::Constant *Fn) {
+@@ -864,7 +868,8 @@ public:
+   }
+ 
+   llvm::Constant *getTypeDescriptorFromMap(QualType Ty) {
+-    return TypeDescriptorMap[Ty];
++    auto It = TypeDescriptorMap.find(Ty);
++    return It == TypeDescriptorMap.end() ? nullptr : It->second;
+   }
+   void setTypeDescriptorInMap(QualType Ty, llvm::Constant *C) {
+     TypeDescriptorMap[Ty] = C;
+
+
+--- a/clang/lib/CodeGen/CodeGenModule.cpp	2026-05-09 00:29:06.378783978 +0200
++++ b/clang/lib/CodeGen/CodeGenModule.cpp	2026-05-09 00:35:38.255178990 +0200
+@@ -688,8 +688,9 @@ void CodeGenModule::applyReplacements()
+   }
+ }
+ 
+-void CodeGenModule::addGlobalValReplacement(llvm::GlobalValue *GV, llvm::Constant *C) {
+-  GlobalValReplacements.push_back(std::make_pair(GV, C));
++void CodeGenModule::addGlobalValReplacement(llvm::GlobalValue *GV,
++                                            llvm::Constant *C) {
++  GlobalValReplacements.emplace_back(GV, C);
+ }
+ 
+ void CodeGenModule::applyGlobalValReplacements() {
+@@ -697,9 +698,13 @@ void CodeGenModule::applyGlobalValReplac
+     llvm::GlobalValue *GV = I.first;
+     llvm::Constant *C = I.second;
+ 
+-    GV->replaceAllUsesWith(C);
++    // Fast path: no users means no RAUW work.
++    if (!GV->use_empty())
++      GV->replaceAllUsesWith(C);
+     GV->eraseFromParent();
+   }
++
++  GlobalValReplacements.clear();
+ }
+ 
+ // This is only used in aliases that we created and we know they have a
+@@ -6655,108 +6660,94 @@ CodeGenModule::getLLVMLinkageVarDefiniti
+ 
+ /// Replace the uses of a function that was declared with a non-proto type.
+ /// We want to silently drop extra arguments from call sites
+-static void replaceUsesOfNonProtoConstant(llvm::Constant *old,
+-                                          llvm::Function *newFn) {
++static void replaceUsesOfNonProtoConstant(llvm::Constant *Old,
++                                          llvm::Function *NewFn) {
+   // Fast path.
+-  if (old->use_empty())
++  if (Old->use_empty())
+     return;
+ 
+-  llvm::Type *newRetTy = newFn->getReturnType();
+-  SmallVector<llvm::Value *, 4> newArgs;
+-
+-  SmallVector<llvm::CallBase *> callSitesToBeRemovedFromParent;
+-
+-  for (llvm::Value::use_iterator ui = old->use_begin(), ue = old->use_end();
+-       ui != ue; ui++) {
+-    llvm::User *user = ui->getUser();
+-
+-    // Recognize and replace uses of bitcasts.  Most calls to
+-    // unprototyped functions will use bitcasts.
+-    if (auto *bitcast = dyn_cast<llvm::ConstantExpr>(user)) {
+-      if (bitcast->getOpcode() == llvm::Instruction::BitCast)
+-        replaceUsesOfNonProtoConstant(bitcast, newFn);
++  llvm::Type *NewRetTy = NewFn->getReturnType();
++  SmallVector<llvm::Value *, 8> NewArgs;
++  SmallVector<llvm::AttributeSet, 8> NewArgAttrs;
++  SmallVector<llvm::CallBase *, 16> CallSitesToErase;
++  SmallVector<llvm::OperandBundleDef, 1> Bundles;
++
++  for (llvm::Value::use_iterator UI = Old->use_begin(), UE = Old->use_end();
++       UI != UE;) {
++    llvm::Value::use_iterator Cur = UI++;
++    llvm::User *User = Cur->getUser();
++
++    // Recognize and replace uses of bitcasts. Most calls to unprototyped
++    // functions will use bitcasts.
++    if (auto *Bitcast = dyn_cast<llvm::ConstantExpr>(User)) {
++      if (Bitcast->getOpcode() == llvm::Instruction::BitCast)
++        replaceUsesOfNonProtoConstant(Bitcast, NewFn);
+       continue;
+     }
+ 
+     // Recognize calls to the function.
+-    llvm::CallBase *callSite = dyn_cast<llvm::CallBase>(user);
+-    if (!callSite)
++    auto *CallSite = dyn_cast<llvm::CallBase>(User);
++    if (!CallSite)
+       continue;
+-    if (!callSite->isCallee(&*ui))
++    if (!CallSite->isCallee(&*Cur))
+       continue;
+ 
+-    // If the return types don't match exactly, then we can't
+-    // transform this call unless it's dead.
+-    if (callSite->getType() != newRetTy && !callSite->use_empty())
++    // If return types don't match exactly, only transform dead calls.
++    if (CallSite->getType() != NewRetTy && !CallSite->use_empty())
+       continue;
+ 
+-    // Get the call site's attribute list.
+-    SmallVector<llvm::AttributeSet, 8> newArgAttrs;
+-    llvm::AttributeList oldAttrs = callSite->getAttributes();
+-
+     // If the function was passed too few arguments, don't transform.
+-    unsigned newNumArgs = newFn->arg_size();
+-    if (callSite->arg_size() < newNumArgs)
++    const unsigned NewNumFixedArgs = NewFn->arg_size();
++    const unsigned OldNumArgs = CallSite->arg_size();
++    if (OldNumArgs < NewNumFixedArgs)
+       continue;
+ 
+-    // If extra arguments were passed, we silently drop them.
+-    // If any of the types mismatch, we don't transform.
+-    unsigned argNo = 0;
+-    bool dontTransform = false;
+-    for (llvm::Argument &A : newFn->args()) {
+-      if (callSite->getArgOperand(argNo)->getType() != A.getType()) {
+-        dontTransform = true;
+-        break;
+-      }
+-
+-      // Add any parameter attributes.
+-      newArgAttrs.push_back(oldAttrs.getParamAttrs(argNo));
+-      argNo++;
+-    }
+-    if (dontTransform)
+-      continue;
+-
+-    // Okay, we can transform this.  Create the new call instruction and copy
+-    // over the required information.
+-    newArgs.append(callSite->arg_begin(), callSite->arg_begin() + argNo);
+-
+-    // Copy over any operand bundles.
+-    SmallVector<llvm::OperandBundleDef, 1> newBundles;
+-    callSite->getOperandBundlesAsDefs(newBundles);
+-
+-    llvm::CallBase *newCall;
+-    if (isa<llvm::CallInst>(callSite)) {
+-      newCall = llvm::CallInst::Create(newFn, newArgs, newBundles, "",
+-                                       callSite->getIterator());
++    // Build the new arg list: keep all args for varargs, otherwise drop extras.
++    const unsigned NumArgsToPass = NewFn->isVarArg() ? OldNumArgs : NewNumFixedArgs;
++    NewArgs.clear();
++    NewArgAttrs.clear();
++    NewArgs.reserve(NumArgsToPass);
++    NewArgAttrs.reserve(NumArgsToPass);
++
++    for (unsigned I = 0; I < NumArgsToPass; ++I) {
++      NewArgs.push_back(CallSite->getArgOperand(I));
++      NewArgAttrs.push_back(CallSite->getAttributes().getParamAttrs(I));
++    }
++
++    llvm::AttributeList OldAttrs = CallSite->getAttributes();
++    llvm::AttributeList NewAttrs = llvm::AttributeList::get(
++        CallSite->getContext(), OldAttrs.getRetAttrs(), OldAttrs.getFnAttrs(),
++        NewArgAttrs);
++
++    Bundles.clear();
++    CallSite->getOperandBundlesAsDefs(Bundles);
++
++    llvm::CallBase *NewCall = nullptr;
++    if (auto *II = dyn_cast<llvm::InvokeInst>(CallSite)) {
++      NewCall = llvm::InvokeInst::Create(NewFn, II->getNormalDest(),
++                                         II->getUnwindDest(), NewArgs, Bundles,
++                                         "", II->getIterator());
+     } else {
+-      auto *oldInvoke = cast<llvm::InvokeInst>(callSite);
+-      newCall = llvm::InvokeInst::Create(
+-          newFn, oldInvoke->getNormalDest(), oldInvoke->getUnwindDest(),
+-          newArgs, newBundles, "", callSite->getIterator());
++      auto *CI = cast<llvm::CallInst>(CallSite);
++      auto *NewCI =
++          llvm::CallInst::Create(NewFn, NewArgs, Bundles, "", CI->getIterator());
++      NewCI->setTailCallKind(CI->getTailCallKind());
++      NewCall = NewCI;
+     }
+-    newArgs.clear(); // for the next iteration
+-
+-    if (!newCall->getType()->isVoidTy())
+-      newCall->takeName(callSite);
+-    newCall->setAttributes(
+-        llvm::AttributeList::get(newFn->getContext(), oldAttrs.getFnAttrs(),
+-                                 oldAttrs.getRetAttrs(), newArgAttrs));
+-    newCall->setCallingConv(callSite->getCallingConv());
+ 
+-    // Finally, remove the old call, replacing any uses with the new one.
+-    if (!callSite->use_empty())
+-      callSite->replaceAllUsesWith(newCall);
++    NewCall->setCallingConv(CallSite->getCallingConv());
++    NewCall->setAttributes(NewAttrs);
++    cast<llvm::Instruction>(NewCall)->copyMetadata(
++        *cast<llvm::Instruction>(CallSite));
+ 
+-    // Copy debug location attached to CI.
+-    if (callSite->getDebugLoc())
+-      newCall->setDebugLoc(callSite->getDebugLoc());
++    if (!CallSite->use_empty())
++      CallSite->replaceAllUsesWith(NewCall);
+ 
+-    callSitesToBeRemovedFromParent.push_back(callSite);
++    CallSitesToErase.push_back(CallSite);
+   }
+ 
+-  for (auto *callSite : callSitesToBeRemovedFromParent) {
+-    callSite->eraseFromParent();
+-  }
++  for (llvm::CallBase *CallSite : CallSitesToErase)
++    CallSite->eraseFromParent();
+ }
+ 
+ /// ReplaceUsesOfNonProtoTypeWithRealFunction - This function is called when we
+@@ -8159,67 +8150,65 @@ static void EmitGlobalDeclMetadata(CodeG
+ 
+ bool CodeGenModule::CheckAndReplaceExternCIFuncs(llvm::GlobalValue *Elem,
+                                                  llvm::GlobalValue *CppFunc) {
+-  // Store the list of ifuncs we need to replace uses in.
+-  llvm::SmallVector<llvm::GlobalIFunc *> IFuncs;
+-  // List of ConstantExprs that we should be able to delete when we're done
+-  // here.
+-  llvm::SmallVector<llvm::ConstantExpr *> CEs;
++  llvm::SmallVector<llvm::GlobalIFunc *, 8> IFuncs;
++  llvm::SmallVector<llvm::ConstantExpr *, 8> CEs;
+ 
+-  // It isn't valid to replace the extern-C ifuncs if all we find is itself!
+   if (Elem == CppFunc)
+     return false;
+ 
+-  // First make sure that all users of this are ifuncs (or ifuncs via a
+-  // bitcast), and collect the list of ifuncs and CEs so we can work on them
+-  // later.
++  // Validate user graph shape first and collect all affected nodes.
+   for (llvm::User *User : Elem->users()) {
+-    // Users can either be a bitcast ConstExpr that is used by the ifuncs, OR an
+-    // ifunc directly. In any other case, just give up, as we don't know what we
+-    // could break by changing those.
+     if (auto *ConstExpr = dyn_cast<llvm::ConstantExpr>(User)) {
+       if (ConstExpr->getOpcode() != llvm::Instruction::BitCast)
+         return false;
+ 
+       for (llvm::User *CEUser : ConstExpr->users()) {
+-        if (auto *IFunc = dyn_cast<llvm::GlobalIFunc>(CEUser)) {
+-          IFuncs.push_back(IFunc);
+-        } else {
++        auto *IFunc = dyn_cast<llvm::GlobalIFunc>(CEUser);
++        if (!IFunc)
+           return false;
+-        }
++        IFuncs.push_back(IFunc);
+       }
++
+       CEs.push_back(ConstExpr);
+-    } else if (auto *IFunc = dyn_cast<llvm::GlobalIFunc>(User)) {
++      continue;
++    }
++
++    if (auto *IFunc = dyn_cast<llvm::GlobalIFunc>(User)) {
+       IFuncs.push_back(IFunc);
+-    } else {
+-      // This user is one we don't know how to handle, so fail redirection. This
+-      // will result in an ifunc retaining a resolver name that will ultimately
+-      // fail to be resolved to a defined function.
+-      return false;
++      continue;
+     }
++
++    // Unknown use shape; do not attempt redirection.
++    return false;
+   }
+ 
+-  // Now we know this is a valid case where we can do this alias replacement, we
+-  // need to remove all of the references to Elem (and the bitcasts!) so we can
+-  // delete it.
++  // Nothing to do.
++  if (IFuncs.empty())
++    return false;
++
++  // Temporarily clear resolvers so we can drop old references.
+   for (llvm::GlobalIFunc *IFunc : IFuncs)
+     IFunc->setResolver(nullptr);
++
+   for (llvm::ConstantExpr *ConstExpr : CEs)
+     ConstExpr->destroyConstant();
+ 
+-  // We should now be out of uses for the 'old' version of this function, so we
+-  // can erase it as well.
++  // Old element should now be dead.
++  if (!Elem->use_empty())
++    return false;
++
+   Elem->eraseFromParent();
+ 
++  // Rebind all ifunc resolvers to the C++ symbol name.
+   for (llvm::GlobalIFunc *IFunc : IFuncs) {
+-    // The type of the resolver is always just a function-type that returns the
+-    // type of the IFunc, so create that here. If the type of the actual
+-    // resolver doesn't match, it just gets bitcast to the right thing.
+     auto *ResolverTy =
+-        llvm::FunctionType::get(IFunc->getType(), /*isVarArg*/ false);
+-    llvm::Constant *Resolver = GetOrCreateLLVMFunction(
+-        CppFunc->getName(), ResolverTy, {}, /*ForVTable*/ false);
++        llvm::FunctionType::get(IFunc->getType(), /*isVarArg=*/false);
++    llvm::Constant *Resolver =
++        GetOrCreateLLVMFunction(CppFunc->getName(), ResolverTy, {},
++                                /*ForVTable=*/false);
+     IFunc->setResolver(Resolver);
+   }
++
+   return true;
+ }
+ 
+@@ -8231,21 +8220,20 @@ bool CodeGenModule::CheckAndReplaceExter
+ void CodeGenModule::EmitStaticExternCAliases() {
+   if (!getTargetCodeGenInfo().shouldEmitStaticExternCAliases())
+     return;
++
+   for (auto &I : StaticExternCValues) {
+     const IdentifierInfo *Name = I.first;
+     llvm::GlobalValue *Val = I.second;
+ 
+-    // If Val is null, that implies there were multiple declarations that each
+-    // had a claim to the unmangled name. In this case, generation of the alias
+-    // is suppressed. See CodeGenModule::MaybeHandleStaticInExternC.
++    // If Val is null, multiple declarations claimed the same unmangled name.
++    // Suppress this alias only; keep processing other candidates.
+     if (!Val)
+-      break;
++      continue;
+ 
+-    llvm::GlobalValue *ExistingElem =
+-        getModule().getNamedValue(Name->getName());
++    llvm::GlobalValue *ExistingElem = getModule().getNamedValue(Name->getName());
+ 
+-    // If there is either not something already by this name, or we were able to
+-    // replace all uses from IFuncs, create the alias.
++    // If there is either no symbol by this name yet, or we successfully
++    // redirected ifunc users away from ExistingElem, create the alias.
+     if (!ExistingElem || CheckAndReplaceExternCIFuncs(ExistingElem, Val))
+       addCompilerUsedGlobal(llvm::GlobalAlias::create(Name->getName(), Val));
+   }
+@@ -8496,33 +8484,22 @@ CharUnits CodeGenModule::getNaturalTypeA
+   if (TBAAInfo)
+     *TBAAInfo = getTBAAAccessInfo(T);
+ 
+-  // FIXME: This duplicates logic in ASTContext::getTypeAlignIfKnown. But
+-  // that doesn't return the information we need to compute BaseInfo.
+-
+   // Honor alignment typedef attributes even on incomplete types.
+-  // We also honor them straight for C++ class types, even as pointees;
+-  // there's an expressivity gap here.
+-  if (auto TT = T->getAs<TypedefType>()) {
+-    if (auto Align = TT->getDecl()->getMaxAlignment()) {
++  // Also honor them for C++ class pointees.
++  if (const auto *TT = T->getAs<TypedefType>()) {
++    if (unsigned Align = TT->getDecl()->getMaxAlignment()) {
+       if (BaseInfo)
+         *BaseInfo = LValueBaseInfo(AlignmentSource::AttributedType);
+       return getContext().toCharUnitsFromBits(Align);
+     }
+   }
+ 
+-  bool AlignForArray = T->isArrayType();
++  const bool AlignForArray = T->isArrayType();
+ 
+-  // Analyze the base element type, so we don't get confused by incomplete
+-  // array types.
++  // Analyze the base element type so incomplete arrays don't confuse alignment.
+   T = getContext().getBaseElementType(T);
+ 
+   if (T->isIncompleteType()) {
+-    // We could try to replicate the logic from
+-    // ASTContext::getTypeAlignIfKnown, but nothing uses the alignment if the
+-    // type is incomplete, so it's impossible to test. We could try to reuse
+-    // getTypeAlignIfKnown, but that doesn't return the information we need
+-    // to set BaseInfo.  So just ignore the possibility that the alignment is
+-    // greater than one.
+     if (BaseInfo)
+       *BaseInfo = LValueBaseInfo(AlignmentSource::Type);
+     return CharUnits::One();
+@@ -8532,26 +8509,24 @@ CharUnits CodeGenModule::getNaturalTypeA
+     *BaseInfo = LValueBaseInfo(AlignmentSource::Type);
+ 
+   CharUnits Alignment;
+-  const CXXRecordDecl *RD;
+   if (T.getQualifiers().hasUnaligned()) {
+     Alignment = CharUnits::One();
+-  } else if (forPointeeType && !AlignForArray &&
+-             (RD = T->getAsCXXRecordDecl())) {
+-    // For C++ class pointees, we don't know whether we're pointing at a
+-    // base or a complete object, so we generally need to use the
+-    // non-virtual alignment.
+-    Alignment = getClassPointerAlignment(RD);
++  } else if (forPointeeType && !AlignForArray) {
++    if (const auto *RD = T->getAsCXXRecordDecl())
++      Alignment = getClassPointerAlignment(RD);
++    else
++      Alignment = getContext().getTypeAlignInChars(T);
+   } else {
+     Alignment = getContext().getTypeAlignInChars(T);
+   }
+ 
+-  // Cap to the global maximum type alignment unless the alignment
+-  // was somehow explicit on the type.
++  // Cap to global maximum type alignment unless alignment is explicitly required.
+   if (unsigned MaxAlign = getLangOpts().MaxTypeAlign) {
+     if (Alignment.getQuantity() > MaxAlign &&
+         !getContext().isAlignmentRequired(T))
+       Alignment = CharUnits::fromQuantity(MaxAlign);
+   }
++
+   return Alignment;
+ }
+ 
+
+
+--- a/clang/lib/CodeGen/CoverageMappingGen.cpp	2026-05-09 00:05:30.953384724 +0200
++++ b/clang/lib/CodeGen/CoverageMappingGen.cpp	2026-05-11 00:09:52.660116601 +0200
+@@ -371,30 +371,31 @@ public:
+   /// expansion regions.
+   void gatherFileIDs(SmallVectorImpl<unsigned> &Mapping) {
+     FileIDMapping.clear();
++    if (SourceRegions.empty())
++      return;
+ 
+     llvm::SmallSet<FileID, 8> Visited;
+     SmallVector<std::pair<SourceLocation, unsigned>, 8> FileLocs;
++    FileLocs.reserve(SourceRegions.size());
++
+     for (auto &Region : SourceRegions) {
+       SourceLocation Loc = Region.getBeginLoc();
+ 
+-      // Replace Region with its definition if it is in <scratch space>.
+-      auto NonScratchExpansionLoc = getNonScratchExpansionLoc(Loc);
+-      auto EndLoc = NonScratchExpansionLoc.second;
+-      if (EndLoc.has_value()) {
++      const auto NonScratchExpansionLoc = getNonScratchExpansionLoc(Loc);
++      if (NonScratchExpansionLoc.second.has_value()) {
+         Loc = NonScratchExpansionLoc.first;
+         Region.setStartLoc(Loc);
+-        Region.setEndLoc(EndLoc.value());
++        Region.setEndLoc(*NonScratchExpansionLoc.second);
+       }
+ 
+-      // For regions whose spelling is in a system header, remap macro
+-      // tokens to their user-code call site so coverage is attributed to
+-      // the user expression. Drop anything still in a system header
+-      // (e.g. a plain FileID into a -isystem .def file).
+-      if (!SystemHeadersCoverage &&
+-          SM.isInSystemHeader(SM.getSpellingLoc(Loc))) {
++      // For regions whose spelling is in a system header, remap macro tokens to
++      // their user-code call site so coverage is attributed to the user
++      // expression. Drop anything still in a system header (e.g. a plain FileID
++      // into a -isystem .def file).
++      if (!SystemHeadersCoverage && SM.isInSystemHeader(SM.getSpellingLoc(Loc))) {
+         if (Loc.isMacroID()) {
+-          auto BeginLoc = SM.getSpellingLoc(Loc);
+-          auto EndLoc = SM.getSpellingLoc(Region.getEndLoc());
++          const SourceLocation BeginLoc = SM.getSpellingLoc(Loc);
++          const SourceLocation EndLoc = SM.getSpellingLoc(Region.getEndLoc());
+           if (SM.isWrittenInSameFile(BeginLoc, EndLoc)) {
+             Loc = SM.getFileLoc(Loc);
+             Region.setStartLoc(Loc);
+@@ -405,21 +406,24 @@ public:
+           continue;
+       }
+ 
+-      FileID File = SM.getFileID(Loc);
++      const FileID File = SM.getFileID(Loc);
+       if (!Visited.insert(File).second)
+         continue;
+ 
+       unsigned Depth = 0;
+       for (SourceLocation Parent = getIncludeOrExpansionLoc(Loc);
+-           Parent.isValid(); Parent = getIncludeOrExpansionLoc(Parent))
++          Parent.isValid(); Parent = getIncludeOrExpansionLoc(Parent))
+         ++Depth;
+-      FileLocs.push_back(std::make_pair(Loc, Depth));
++
++      FileLocs.emplace_back(Loc, Depth);
+     }
++
+     llvm::stable_sort(FileLocs, llvm::less_second());
+ 
++    Mapping.reserve(Mapping.size() + FileLocs.size());
+     for (const auto &FL : FileLocs) {
+-      SourceLocation Loc = FL.first;
+-      FileID SpellingFile = SM.getDecomposedSpellingLoc(Loc).first;
++      const SourceLocation Loc = FL.first;
++      const FileID SpellingFile = SM.getDecomposedSpellingLoc(Loc).first;
+       auto Entry = SM.getFileEntryRefForID(SpellingFile);
+       if (!Entry)
+         continue;
+@@ -444,114 +448,141 @@ public:
+   /// this returns std::nullopt.
+   /// Note this function can potentially be expensive because
+   /// getSpellingLineNumber uses getLineNumber, which is expensive.
+-  std::optional<SpellingRegion> adjustSkippedRange(SourceManager &SM,
+-                                                   SourceLocation LocStart,
+-                                                   SourceLocation LocEnd,
+-                                                   SourceLocation PrevTokLoc,
+-                                                   SourceLocation NextTokLoc) {
++  std::optional<SpellingRegion>
++  adjustSkippedRange(SourceManager &SM, SourceLocation LocStart,
++                    SourceLocation LocEnd, SourceLocation PrevTokLoc,
++                    SourceLocation NextTokLoc,
++                    llvm::DenseMap<unsigned, unsigned> *LineCache = nullptr) {
++    auto GetLine = [&](SourceLocation Loc) -> unsigned {
++      if (!LineCache)
++        return SM.getSpellingLineNumber(Loc);
++
++      const unsigned Raw = Loc.getRawEncoding();
++      auto It = LineCache->find(Raw);
++      if (It != LineCache->end())
++        return It->second;
++
++      const unsigned Line = SM.getSpellingLineNumber(Loc);
++      LineCache->try_emplace(Raw, Line);
++      return Line;
++    };
++
+     SpellingRegion SR{SM, LocStart, LocEnd};
+     SR.ColumnStart = 1;
++
+     if (PrevTokLoc.isValid() && SM.isWrittenInSameFile(LocStart, PrevTokLoc) &&
+-        SR.LineStart == SM.getSpellingLineNumber(PrevTokLoc))
+-      SR.LineStart++;
++        SR.LineStart == GetLine(PrevTokLoc)) {
++      ++SR.LineStart;
++    }
++
+     if (NextTokLoc.isValid() && SM.isWrittenInSameFile(LocEnd, NextTokLoc) &&
+-        SR.LineEnd == SM.getSpellingLineNumber(NextTokLoc)) {
+-      SR.LineEnd--;
+-      SR.ColumnEnd++;
++        SR.LineEnd == GetLine(NextTokLoc)) {
++      --SR.LineEnd;
++      ++SR.ColumnEnd;
+     }
++
+     if (SR.isInSourceOrder())
+       return SR;
++
+     return std::nullopt;
+   }
+ 
+   /// Gather all the regions that were skipped by the preprocessor
+   /// using the constructs like #if or comments.
+   void gatherSkippedRegions() {
+-    /// An array of the minimum lineStarts and the maximum lineEnds
+-    /// for mapping regions from the appropriate source files.
+-    llvm::SmallVector<std::pair<unsigned, unsigned>, 8> FileLineRanges;
+-    FileLineRanges.resize(
++    llvm::SmallVector<std::pair<unsigned, unsigned>, 8> FileLineRanges(
+         FileIDMapping.size(),
+-        std::make_pair(std::numeric_limits<unsigned>::max(), 0));
++        std::make_pair(std::numeric_limits<unsigned>::max(), 0U));
++
+     for (const auto &R : MappingRegions) {
+-      FileLineRanges[R.FileID].first =
+-          std::min(FileLineRanges[R.FileID].first, R.LineStart);
+-      FileLineRanges[R.FileID].second =
+-          std::max(FileLineRanges[R.FileID].second, R.LineEnd);
++      assert(R.FileID < FileLineRanges.size() && "invalid mapping file id");
++      if (R.FileID >= FileLineRanges.size())
++        continue;
++
++      auto &Range = FileLineRanges[R.FileID];
++      Range.first = std::min(Range.first, R.LineStart);
++      Range.second = std::max(Range.second, R.LineEnd);
+     }
+ 
+-    auto SkippedRanges = CVM.getSourceInfo().getSkippedRanges();
+-    for (auto &I : SkippedRanges) {
+-      SourceRange Range = I.Range;
+-      auto LocStart = Range.getBegin();
+-      auto LocEnd = Range.getEnd();
++    // NOTE: getSkippedRanges() returns non-const vector&, and SkippedRange query
++    // helpers are non-const in the header. Iterate non-const to stay API-neutral.
++    auto &SkippedRanges = CVM.getSourceInfo().getSkippedRanges();
++    llvm::DenseMap<unsigned, unsigned> LineCache;
++    LineCache.reserve(SkippedRanges.size() * 2);
++
++    for (auto &Skipped : SkippedRanges) {
++      const SourceLocation LocStart = Skipped.Range.getBegin();
++      const SourceLocation LocEnd = Skipped.Range.getEnd();
++
+       assert(SM.isWrittenInSameFile(LocStart, LocEnd) &&
+-             "region spans multiple files");
++            "region spans multiple files");
+ 
+       auto CovFileID = getCoverageFileID(LocStart);
+       if (!CovFileID)
+         continue;
++
++      if (*CovFileID >= FileLineRanges.size())
++        continue;
++
+       std::optional<SpellingRegion> SR;
+-      if (I.isComment())
+-        SR = adjustSkippedRange(SM, LocStart, LocEnd, I.PrevTokLoc,
+-                                I.NextTokLoc);
+-      else if (I.isPPIfElse() || I.isEmptyLine())
+-        SR = {SM, LocStart, LocEnd};
++      if (Skipped.isComment()) {
++        SR = adjustSkippedRange(SM, LocStart, LocEnd, Skipped.PrevTokLoc,
++                                Skipped.NextTokLoc, &LineCache);
++      } else if (Skipped.isPPIfElse() || Skipped.isEmptyLine()) {
++        SR = SpellingRegion{SM, LocStart, LocEnd};
++      }
+ 
+       if (!SR)
+         continue;
+-      auto Region = CounterMappingRegion::makeSkipped(
+-          *CovFileID, SR->LineStart, SR->ColumnStart, SR->LineEnd,
+-          SR->ColumnEnd);
+-      // Make sure that we only collect the regions that are inside
+-      // the source code of this function.
+-      if (Region.LineStart >= FileLineRanges[*CovFileID].first &&
+-          Region.LineEnd <= FileLineRanges[*CovFileID].second)
+-        MappingRegions.push_back(Region);
++
++      const auto &Allowed = FileLineRanges[*CovFileID];
++      if (SR->LineStart >= Allowed.first && SR->LineEnd <= Allowed.second) {
++        MappingRegions.push_back(CounterMappingRegion::makeSkipped(
++            *CovFileID, SR->LineStart, SR->ColumnStart, SR->LineEnd,
++            SR->ColumnEnd));
++      }
+     }
+   }
+ 
+   /// Generate the coverage counter mapping regions from collected
+   /// source regions.
+   void emitSourceRegions(const SourceRegionFilter &Filter) {
++    if (SourceRegions.empty())
++      return;
++
++    const bool IgnoreSystemHeaders = !SystemHeadersCoverage;
++    const bool HasFilter = !Filter.empty();
++
+     for (const auto &Region : SourceRegions) {
+       assert(Region.hasEndLoc() && "incomplete region");
+ 
+-      SourceLocation LocStart = Region.getBeginLoc();
++      const SourceLocation LocStart = Region.getBeginLoc();
+       assert(SM.getFileID(LocStart).isValid() && "region in invalid file");
+ 
+-      // Ignore regions from system headers unless collecting coverage from
+-      // system headers is explicitly enabled.
+-      if (!SystemHeadersCoverage &&
++      if (IgnoreSystemHeaders &&
+           SM.isInSystemHeader(SM.getSpellingLoc(LocStart))) {
+         assert(!Region.isMCDCBranch() && !Region.isMCDCDecision() &&
+-               "Don't suppress the condition in system headers");
++              "Don't suppress the condition in system headers");
+         continue;
+       }
+ 
+       auto CovFileID = getCoverageFileID(LocStart);
+-      // Ignore regions that don't have a file, such as builtin macros.
+       if (!CovFileID) {
+         assert(!Region.isMCDCBranch() && !Region.isMCDCDecision() &&
+-               "Don't suppress the condition in non-file regions");
++              "Don't suppress the condition in non-file regions");
+         continue;
+       }
+ 
+-      SourceLocation LocEnd = Region.getEndLoc();
++      const SourceLocation LocEnd = Region.getEndLoc();
+       assert(SM.isWrittenInSameFile(LocStart, LocEnd) &&
+-             "region spans multiple files");
++            "region spans multiple files");
+ 
+-      // Don't add code regions for the area covered by expansion regions.
+-      // This not only suppresses redundant regions, but sometimes prevents
+-      // creating regions with wrong counters if, for example, a statement's
+-      // body ends at the end of a nested macro.
+-      if (Filter.count(std::make_pair(LocStart, LocEnd))) {
++      if (HasFilter && Filter.count(std::make_pair(LocStart, LocEnd))) {
+         assert(!Region.isMCDCBranch() && !Region.isMCDCDecision() &&
+-               "Don't suppress the condition");
++              "Don't suppress the condition");
+         continue;
+       }
+ 
+-      // Find the spelling locations for the mapping region.
+       SpellingRegion SR{SM, LocStart, LocEnd};
+       assert(SR.isInSourceOrder() && "region start and end out of order");
+ 
+@@ -561,8 +592,7 @@ public:
+             SR.LineEnd, SR.ColumnEnd));
+       } else if (Region.isSkipped()) {
+         MappingRegions.push_back(CounterMappingRegion::makeSkipped(
+-            *CovFileID, SR.LineStart, SR.ColumnStart, SR.LineEnd,
+-            SR.ColumnEnd));
++            *CovFileID, SR.LineStart, SR.ColumnStart, SR.LineEnd, SR.ColumnEnd));
+       } else if (Region.isBranch()) {
+         MappingRegions.push_back(CounterMappingRegion::makeBranchRegion(
+             Region.getCounter(), Region.getFalseCounter(), *CovFileID,
+@@ -2181,22 +2211,26 @@ struct CounterCoverageMappingBuilder
+     createBranchRegion(E->getCond(), TrueCount, FalseCount);
+   }
+ 
+-  inline unsigned findMCDCBranchesInSourceRegion(
+-      unsigned Since, std::function<void(SourceMappingRegion &SR)> CB) {
+-    unsigned I = SourceRegions.size() - 1;
++  template <typename CallbackT>
++  unsigned findMCDCBranchesInSourceRegion(unsigned Since, CallbackT &&CB) {
++    assert(Since <= SourceRegions.size() && "invalid start index");
++
+     unsigned Count = 0;
+-    while (I >= Since) {
++    for (unsigned I = SourceRegions.size(); I > Since;) {
++      --I;
+       auto &SR = SourceRegions[I];
++
+       if (SR.isMCDCDecision()) {
+-        // Skip a sub Decision and don't modify records in it.
+-        I = MCDCBuilder.skipSourceRegionIndexForDecisions(I);
+-      } else if (SR.isMCDCBranch()) {
++        const unsigned NewI = MCDCBuilder.skipSourceRegionIndexForDecisions(I);
++        assert(NewI <= I && "decision range skip must not move forward");
++        I = NewI;
++        continue;
++      }
++
++      if (SR.isMCDCBranch()) {
+         ++Count;
+         CB(SR);
+       }
+-
+-      if (I-- <= Since)
+-        break;
+     }
+ 
+     return Count;
+
 --- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp	2026-05-07 18:54:15.234843180 +0200
-+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp	2026-05-08 18:58:14.342812753 +0200
++++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp	2026-05-13 18:58:14.342812753 +0200
 @@ -157,14 +157,16 @@ class SinkStoreInfo {
    PredicatedScalarEvolution &PSE;
    const Loop &L;
@@ -26,14 +808,14 @@
 -    uint64_t SizeA = DL.getTypeStoreSize(TyA);
      Type *TyB = TypeInfo.inferScalarType(B->getOperand(0));
 -    uint64_t SizeB = DL.getTypeStoreSize(TyB);
--
++    uint64_t MaxStoreSize =
++        std::max(DL.getTypeStoreSize(TyA), DL.getTypeStoreSize(TyB));
+ 
 -    // Use the maximum store size to ensure no overlap from either direction.
 -    // Currently only handles fixed sizes, as it is only used for
 -    // replicating VPReplicateRecipes.
 -    uint64_t MaxStoreSize = std::max(SizeA, SizeB);
-+    uint64_t MaxStoreSize =
-+        std::max(DL.getTypeStoreSize(TyA), DL.getTypeStoreSize(TyB));
- 
+-
 -    auto VFs = B->getParent()->getPlan()->vectorFactors();
 -    ElementCount MaxVF = *max_element(VFs, ElementCount::isKnownLT);
 -    if (MaxVF.isScalable())
@@ -378,13 +1160,13 @@
 +      VPSingleDefRecipe *Replacement = nullptr;
 +      for (VPSingleDefRecipe *Cand : Bucket) {
 +        if (!isEquivalent(Cand, Def))
-+          continue;
-+        if (!VPDT.dominates(Cand->getParent(), VPBB))
            continue;
 -        // Only keep flags present on both V and Def.
 -        if (auto *RFlags = dyn_cast<VPRecipeWithIRFlags>(V))
 -          RFlags->intersectFlags(*cast<VPRecipeWithIRFlags>(Def));
 -        Def->replaceAllUsesWith(V);
++        if (!VPDT.dominates(Cand->getParent(), VPBB))
++          continue;
 +        Replacement = Cand;
 +        break;
 +      }
@@ -401,7 +1183,7 @@
      }
    }
  }
-@@ -2452,15 +2560,11 @@ void VPlanTransforms::cse(VPlan &Plan) {
+@@ -2464,15 +2572,11 @@ static bool cannotHoistOrSinkRecipe(VPRe
  /// Move loop-invariant recipes out of the vector loop region in \p Plan.
  static void licm(VPlan &Plan) {
    VPBasicBlock *Preheader = Plan.getVectorPreheader();
@@ -420,7 +1202,7 @@
    for (VPBasicBlock *VPBB : VPBlockUtils::blocksOnly<VPBasicBlock>(
             vp_depth_first_shallow(LoopRegion->getEntry()))) {
      for (VPRecipeBase &R : make_early_inc_range(*VPBB)) {
-@@ -2474,12 +2578,8 @@ static void licm(VPlan &Plan) {
+@@ -2487,12 +2591,8 @@ static void licm(VPlan &Plan) {
      }
    }
  
@@ -434,7 +1216,7 @@
    PostOrderTraversal<VPBlockShallowTraversalWrapper<VPBlockBase *>> POT(
        LoopRegion->getEntry());
    for (VPBasicBlock *VPBB : VPBlockUtils::blocksOnly<VPBasicBlock>(POT)) {
-@@ -2491,46 +2591,54 @@ static void licm(VPlan &Plan) {
+@@ -2504,46 +2604,54 @@ static void licm(VPlan &Plan) {
          assert(!RepR->isPredicated() &&
                 "Expected prior transformation of predicated replicates to "
                 "replicate regions");
@@ -520,7 +1302,7 @@
      }
    }
  }
-@@ -2634,13 +2742,10 @@ void VPlanTransforms::removeBranchOnCons
+@@ -2647,13 +2755,10 @@ void VPlanTransforms::removeBranchOnCons
    if (OnlyLatches)
      VPDT.emplace(Plan);
  
@@ -534,7 +1316,7 @@
      if (VPBB->empty() || !match(&VPBB->back(), m_BranchOnCond(m_VPValue(Cond))))
        continue;
  
-@@ -2649,6 +2754,7 @@ void VPlanTransforms::removeBranchOnCons
+@@ -2662,6 +2767,7 @@ void VPlanTransforms::removeBranchOnCons
  
      assert(VPBB->getNumSuccessors() == 2 &&
             "Two successors expected for BranchOnCond");
@@ -542,7 +1324,7 @@
      unsigned RemovedIdx;
      if (match(Cond, m_True()))
        RemovedIdx = 1;
-@@ -2661,45 +2767,47 @@ void VPlanTransforms::removeBranchOnCons
+@@ -2674,45 +2780,47 @@ void VPlanTransforms::removeBranchOnCons
          cast<VPBasicBlock>(VPBB->getSuccessors()[RemovedIdx]);
      assert(count(RemovedSucc->getPredecessors(), VPBB) == 1 &&
             "There must be a single edge between VPBB and its successor");
@@ -564,7 +1346,7 @@
  
 -  // Detach all unreachable blocks from their successors, removing their recipes
 -  // and incoming values from phi recipes.
-   VPSymbolicValue Tmp;
+   VPSymbolicValue Tmp(nullptr);
 -  for (VPBlockBase *B : AllBlocks) {
 -    if (Reachable.contains(B))
 +  SmallPtrSet<VPBlockBase *, 32> VisitedDead;
@@ -611,7 +1393,7 @@
    RUN_VPLAN_PASS(removeRedundantInductionCasts, Plan);
  
    RUN_VPLAN_PASS(reassociateHeaderMask, Plan);
-@@ -2985,6 +3093,13 @@ void VPlanTransforms::optimizeEVLMasks(V
+@@ -2997,6 +3105,13 @@ void VPlanTransforms::optimizeEVLMasks(V
  
    VPTypeAnalysis TypeInfo(Plan);
    SmallVector<VPRecipeBase *> OldRecipes;
@@ -625,7 +1407,7 @@
    for (VPUser *U : collectUsersRecursively(HeaderMask)) {
      VPRecipeBase *R = cast<VPRecipeBase>(U);
      if (auto *NewR = optimizeMaskToEVL(HeaderMask, *R, TypeInfo, *EVL)) {
-@@ -2992,23 +3107,27 @@ void VPlanTransforms::optimizeEVLMasks(V
+@@ -3004,23 +3119,27 @@ void VPlanTransforms::optimizeEVLMasks(V
        for (auto [Old, New] :
             zip_equal(R->definedValues(), NewR->definedValues()))
          Old->replaceAllUsesWith(New);
@@ -664,7 +1446,7 @@
    }
  
    // Erase old recipes at the end so we don't invalidate TypeInfo.
-@@ -4531,7 +4650,7 @@ void VPlanTransforms::materializeBroadca
+@@ -4543,7 +4662,7 @@ void VPlanTransforms::materializeBroadca
          (isa<VPIRValue>(VPV) && isa<Constant>(VPV->getLiveInIRValue())))
        continue;
  
@@ -673,7 +1455,7 @@
      VPBasicBlock *HoistBlock = VectorPreheader;
      VPBasicBlock::iterator HoistPoint = VectorPreheader->end();
      for (VPUser *User : VPV->users()) {
-@@ -4539,17 +4658,37 @@ void VPlanTransforms::materializeBroadca
+@@ -4551,17 +4670,37 @@ void VPlanTransforms::materializeBroadca
          continue;
        if (cast<VPRecipeBase>(User)->getParent() == VectorPreheader)
          HoistPoint = HoistBlock->begin();
@@ -716,7 +1498,7 @@
                             });
    }
  }
-@@ -4611,6 +4750,15 @@ static VPIRMetadata getCommonMetadata(Ar
+@@ -4575,6 +4714,15 @@ static VPIRMetadata getCommonMetadata(Ar
    return CommonMetadata;
  }
  
@@ -732,7 +1514,7 @@
  template <unsigned Opcode>
  static SmallVector<SmallVector<VPReplicateRecipe *, 4>>
  collectComplementaryPredicatedMemOps(VPlan &Plan,
-@@ -4621,51 +4769,47 @@ collectComplementaryPredicatedMemOps(VPl
+@@ -4585,51 +4733,47 @@ collectComplementaryPredicatedMemOps(VPl
    constexpr bool IsLoad = (Opcode == Instruction::Load);
    VPTypeAnalysis TypeInfo(Plan);
  
@@ -812,7 +1594,35 @@
      }
    }
  
-@@ -6244,9 +6388,6 @@ matchExtendedReductionOperand(VPWidenRec
+@@ -5977,9 +6121,6 @@ static void transformToPartialReduction(
+     ExtendedOp = NegRecipe;
+   }
+ 
+-  assert((Chain.RK != RecurKind::FAddChainWithSubs) &&
+-         "FSub chain reduction isn't supported");
+-
+   // FIXME: Do these transforms before invoking the cost-model.
+   ExtendedOp = optimizeExtendsForPartialReduction(ExtendedOp, TypeInfo);
+ 
+@@ -6009,6 +6150,9 @@ static void transformToPartialReduction(
+     ExitValue->replaceAllUsesWith(PartialRed);
+   WidenRecipe->replaceAllUsesWith(PartialRed);
+ 
++  assert((Chain.RK != RecurKind::FAddChainWithSubs) &&
++         "FSub chain reduction isn't supported");
++
+   // For cost-model purposes, fold this into a VPExpression.
+   VPExpressionRecipe *E = createPartialReductionExpression(PartialRed);
+   E->insertBefore(WidenRecipe);
+@@ -6078,7 +6222,6 @@ getPartialReductionLinkCost(VPCostContex
+       return Link.ReductionBinOp->getOpcode();
+     }
+   };
+-
+   return CostCtx.TTI.getPartialReductionCost(
+       GetLinkOpcode(), ExtendedOp.ExtendA.SrcType, ExtendedOp.ExtendB.SrcType,
+       RdxType, VF, ExtendedOp.ExtendA.Kind, ExtendedOp.ExtendB.Kind, BinOpc,
+@@ -6220,9 +6363,6 @@ matchExtendedReductionOperand(VPWidenRec
  static std::optional<SmallVector<VPPartialReductionChain>>
  getScaledReductions(VPReductionPHIRecipe *RedPhiR, VPCostContext &CostCtx,
                      VFRange &Range) {
@@ -822,7 +1632,7 @@
    auto *RdxResult = vputils::findComputeReductionResult(RedPhiR);
    if (!RdxResult)
      return std::nullopt;
-@@ -6259,7 +6400,6 @@ getScaledReductions(VPReductionPHIRecipe
+@@ -6235,7 +6375,6 @@ getScaledReductions(VPReductionPHIRecipe
    Type *PhiType = TypeInfo.inferScalarType(RedPhiR);
    TypeSize PHISize = PhiType->getPrimitiveSizeInBits();
  
@@ -830,7 +1640,7 @@
    VPValue *CurrentValue = ExitValue;
    while (CurrentValue != RedPhiR) {
      auto *UpdateR = dyn_cast<VPWidenRecipe>(CurrentValue);
-@@ -6269,8 +6409,6 @@ getScaledReductions(VPReductionPHIRecipe
+@@ -6245,8 +6384,6 @@ getScaledReductions(VPReductionPHIRecipe
      VPValue *Op = UpdateR->getOperand(1);
      VPValue *PrevValue = UpdateR->getOperand(0);
  
@@ -839,7 +1649,7 @@
      std::optional<ExtendedReductionOperand> ExtendedOp =
          matchExtendedReductionOperand(UpdateR, Op, TypeInfo);
      if (!ExtendedOp) {
-@@ -6285,19 +6423,13 @@ getScaledReductions(VPReductionPHIRecipe
+@@ -6261,19 +6398,13 @@ getScaledReductions(VPReductionPHIRecipe
      if (!PHISize.hasKnownScalarFactor(ExtSrcSize))
        return std::nullopt;
  
@@ -860,7 +1670,7 @@
    std::reverse(Chain.begin(), Chain.end());
    return Chain;
  }
-@@ -6306,9 +6438,6 @@ getScaledReductions(VPReductionPHIRecipe
+@@ -6282,9 +6413,6 @@ getScaledReductions(VPReductionPHIRecipe
  void VPlanTransforms::createPartialReductions(VPlan &Plan,
                                                VPCostContext &CostCtx,
                                                VFRange &Range) {
@@ -870,7 +1680,7 @@
    MapVector<VPReductionPHIRecipe *, SmallVector<VPPartialReductionChain>>
        ChainsByPhi;
    VPBasicBlock *HeaderVPBB = Plan.getVectorLoopRegion()->getEntryBasicBlock();
-@@ -6324,9 +6453,7 @@ void VPlanTransforms::createPartialReduc
+@@ -6300,9 +6428,7 @@ void VPlanTransforms::createPartialReduc
    if (ChainsByPhi.empty())
      return;
  
@@ -881,7 +1691,7 @@
    DenseMap<VPSingleDefRecipe *, unsigned> ScaledReductionMap;
    for (const auto &[_, Chains] : ChainsByPhi)
      for (const VPPartialReductionChain &Chain : Chains) {
-@@ -6334,9 +6461,6 @@ void VPlanTransforms::createPartialReduc
+@@ -6310,9 +6436,6 @@ void VPlanTransforms::createPartialReduc
        ScaledReductionMap[Chain.ReductionBinOp] = Chain.ScaleFactor;
      }
  
@@ -891,7 +1701,7 @@
    auto ExtendUsersValid = [&](VPValue *Ext) {
      return !isa<VPWidenCastRecipe>(Ext) || all_of(Ext->users(), [&](VPUser *U) {
        return PartialReductionOps.contains(cast<VPRecipeBase>(U));
-@@ -6345,11 +6469,9 @@ void VPlanTransforms::createPartialReduc
+@@ -6321,11 +6444,9 @@ void VPlanTransforms::createPartialReduc
  
    auto IsProfitablePartialReductionChainForVF =
        [&](ArrayRef<VPPartialReductionChain> Chain, ElementCount VF) -> bool {
@@ -905,7 +1715,7 @@
      for (const VPPartialReductionChain &Link : Chain) {
        const ExtendedReductionOperand &ExtendedOp = Link.ExtendedOp;
        InstructionCost LinkCost = getPartialReductionLinkCost(CostCtx, Link, VF);
-@@ -6358,30 +6480,31 @@ void VPlanTransforms::createPartialReduc
+@@ -6334,30 +6455,31 @@ void VPlanTransforms::createPartialReduc
  
        PartialCost += LinkCost;
        RegularCost += Link.ReductionBinOp->computeCost(VF, CostCtx);
@@ -944,7 +1754,7 @@
          auto *R = cast<VPSingleDefRecipe>(U);
          return Chain.ScaleFactor == ScaledReductionMap.lookup_or(R, 0) ||
                 match(R, m_ComputeReductionResult(
-@@ -6390,24 +6513,26 @@ void VPlanTransforms::createPartialReduc
+@@ -6366,24 +6488,26 @@ void VPlanTransforms::createPartialReduc
                                   m_Specific(RedPhiR)));
        };
        if (!all_of(Chain.ReductionBinOp->users(), UseIsValid)) {
@@ -976,7 +1786,7 @@
      if (!LoopVectorizationPlanner::getDecisionAndClampRange(
              [&, &Chains = Chains](ElementCount VF) {
                return IsProfitablePartialReductionChainForVF(Chains, VF);
-@@ -6487,25 +6612,21 @@ void VPlanTransforms::makeScalarizationD
+@@ -6463,25 +6587,21 @@ void VPlanTransforms::makeScalarizationD
          continue;
  
        auto *I = cast_or_null<Instruction>(VPI->getUnderlyingValue());
@@ -1006,7 +1816,7 @@
  
 
 --- a/llvm/lib/CodeGen/PeepholeOptimizer.cpp	2026-05-06 01:01:03.951568731 +0200
-+++ b/llvm/lib/CodeGen/PeepholeOptimizer.cpp	2026-05-06 01:14:22.015734013 +0200
++++ b/llvm/lib/CodeGen/PeepholeOptimizer.cpp	2026-05-13 01:14:22.015734013 +0200
 @@ -26,7 +26,7 @@
  //       cmp r1, 0
  //       bz  L1
@@ -1295,7 +2105,7 @@
    bool optimizeExtInstr(MachineInstr &MI, MachineBasicBlock &MBB,
                          SmallPtrSetImpl<MachineInstr *> &LocalMIs);
    bool optimizeSelect(MachineInstr &MI,
-@@ -456,56 +390,41 @@ private:
+@@ -456,40 +390,25 @@ private:
    bool optimizeUncoalescableCopy(MachineInstr &MI,
                                   SmallPtrSetImpl<MachineInstr *> &LocalMIs);
    bool optimizeRecurrence(MachineInstr &PHI);
@@ -1341,15 +2151,18 @@
  
    bool isLoadFoldable(MachineInstr &MI,
                        SmallSet<Register, 16> &FoldAsLoadDefCandidates);
- 
--  /// Check whether \p MI is understood by the register coalescer
--  /// but may require some rewriting.
-+  MachineInstr *foldLoadInto(MachineInstr &MI, Register FoldReg,
+@@ -499,20 +418,17 @@ private:
+   /// instructions, and returns the replacement; returns nullptr otherwise.
+   MachineInstr *foldLoadInto(MachineFunction &MF, MachineInstr &MI,
+                              Register FoldReg,
+-                             SmallPtrSet<MachineInstr *, 16> &LocalMIs);
 +                             SmallPtrSetImpl<MachineInstr *> &LocalMIs);
 +
 +  bool tryFoldLoadAfterCompareElim(Register CmpSrcReg,
 +                                   SmallPtrSetImpl<MachineInstr *> &LocalMIs);
-+
+ 
+-  /// Check whether \p MI is understood by the register coalescer
+-  /// but may require some rewriting.
    static bool isCoalescableCopy(const MachineInstr &MI) {
 -    // SubregToRegs are not interesting, because they are already register
 -    // coalescer friendly.
@@ -1363,7 +2176,7 @@
    static bool isUncoalescableCopy(const MachineInstr &MI) {
      return MI.isBitcast() || (!DisableAdvCopyOpt && (MI.isRegSequenceLike() ||
                                                       MI.isInsertSubregLike() ||
-@@ -515,12 +434,9 @@ private:
+@@ -522,12 +438,9 @@ private:
    MachineInstr &rewriteSource(MachineInstr &CopyLike, RegSubRegPair Def,
                                RewriteMapTy &RewriteMap);
  
@@ -1377,7 +2190,7 @@
  
    bool getCopySrc(MachineInstr &MI, RegSubRegPair &SrcPair) {
      if (!MI.isCopy())
-@@ -535,8 +451,6 @@ private:
+@@ -542,8 +455,6 @@ private:
      return true;
    }
  
@@ -1386,7 +2199,7 @@
    void deleteChangedCopy(MachineInstr &MI) {
      RegSubRegPair SrcPair;
      if (!getCopySrc(MI, SrcPair))
-@@ -550,13 +464,14 @@ private:
+@@ -557,13 +468,14 @@ private:
    void MF_HandleRemoval(MachineInstr &MI) override { deleteChangedCopy(MI); }
  
    void MF_HandleChangeDesc(MachineInstr &MI, const MCInstrDesc &TID) override {
@@ -1402,7 +2215,7 @@
  
    PeepholeOptimizerLegacy() : MachineFunctionPass(ID) {}
  
-@@ -578,12 +493,6 @@ public:
+@@ -585,12 +497,6 @@ public:
    }
  };
  
@@ -1415,7 +2228,7 @@
  class RecurrenceInstr {
  public:
    using IndexPair = std::pair<unsigned, unsigned>;
-@@ -600,20 +509,13 @@ private:
+@@ -607,20 +513,13 @@ private:
    std::optional<IndexPair> CommutePair;
  };
  
@@ -1436,7 +2249,7 @@
    ValueTrackerResult(Register Reg, unsigned SubReg) { addSource(Reg, SubReg); }
  
    bool isValid() const { return getNumSources() > 0; }
-@@ -652,7 +554,6 @@ public:
+@@ -659,7 +558,6 @@ public:
    bool operator==(const ValueTrackerResult &Other) const {
      if (Other.getInst() != getInst())
        return false;
@@ -1444,7 +2257,7 @@
      if (Other.getNumSources() != getNumSources())
        return false;
  
-@@ -664,76 +565,25 @@ public:
+@@ -671,76 +569,25 @@ public:
    }
  };
  
@@ -1521,7 +2334,7 @@
    ValueTracker(Register Reg, unsigned DefSubReg, const MachineRegisterInfo &MRI,
                 const TargetInstrInfo *TII = nullptr)
        : DefSubReg(DefSubReg), Reg(Reg), MRI(MRI), TII(TII) {
-@@ -743,18 +593,12 @@ public:
+@@ -750,18 +597,12 @@ public:
      }
    }
  
@@ -1540,7 +2353,7 @@
  char &llvm::PeepholeOptimizerLegacyID = PeepholeOptimizerLegacy::ID;
  
  INITIALIZE_PASS_BEGIN(PeepholeOptimizerLegacy, DEBUG_TYPE,
-@@ -764,14 +608,6 @@ INITIALIZE_PASS_DEPENDENCY(MachineLoopIn
+@@ -771,14 +612,6 @@ INITIALIZE_PASS_DEPENDENCY(MachineLoopIn
  INITIALIZE_PASS_END(PeepholeOptimizerLegacy, DEBUG_TYPE,
                      "Peephole Optimizations", false, false)
  
@@ -1555,7 +2368,7 @@
  bool PeepholeOptimizer::optimizeExtInstr(
      MachineInstr &MI, MachineBasicBlock &MBB,
      SmallPtrSetImpl<MachineInstr *> &LocalMIs) {
-@@ -784,34 +620,21 @@ bool PeepholeOptimizer::optimizeExtInstr
+@@ -791,34 +624,21 @@ bool PeepholeOptimizer::optimizeExtInstr
      return false;
  
    if (MRI->hasOneNonDBGUse(SrcReg))
@@ -1590,7 +2403,7 @@
    SmallVector<MachineOperand *, 8> ExtendedUses;
  
    bool ExtendLife = true;
-@@ -825,63 +648,32 @@ bool PeepholeOptimizer::optimizeExtInstr
+@@ -832,63 +652,32 @@ bool PeepholeOptimizer::optimizeExtInstr
        continue;
      }
  
@@ -1654,7 +2467,7 @@
      for (MachineInstr &UI : MRI->use_nodbg_instructions(DstReg))
        if (UI.isPHI())
          PHIBBs.insert(UI.getParent());
-@@ -893,26 +685,11 @@ bool PeepholeOptimizer::optimizeExtInstr
+@@ -900,26 +689,11 @@ bool PeepholeOptimizer::optimizeExtInstr
        if (PHIBBs.count(UseMBB))
          continue;
  
@@ -1681,7 +2494,7 @@
        if (UseSrcSubIdx)
          RC = MRI->getRegClass(UseMI->getOperand(0).getReg());
  
-@@ -920,6 +697,7 @@ bool PeepholeOptimizer::optimizeExtInstr
+@@ -927,6 +701,7 @@ bool PeepholeOptimizer::optimizeExtInstr
        BuildMI(*UseMBB, UseMI, UseMI->getDebugLoc(),
                TII->get(TargetOpcode::COPY), NewVR)
            .addReg(DstReg, {}, SubIdx);
@@ -1689,7 +2502,7 @@
        if (UseSrcSubIdx)
          UseMO->setSubReg(0);
  
-@@ -932,20 +710,21 @@ bool PeepholeOptimizer::optimizeExtInstr
+@@ -939,20 +714,21 @@ bool PeepholeOptimizer::optimizeExtInstr
    return Changed;
  }
  
@@ -1721,7 +2534,7 @@
    LLVM_DEBUG(dbgs() << "Attempting to optimize compare: " << MI);
    if (TII->optimizeCompareInstr(MI, SrcReg, SrcReg2, CmpMask, CmpValue, MRI)) {
      LLVM_DEBUG(dbgs() << "  -> Successfully optimized compare!\n");
-@@ -956,7 +735,6 @@ bool PeepholeOptimizer::optimizeCmpInstr
+@@ -963,7 +739,6 @@ bool PeepholeOptimizer::optimizeCmpInstr
    return false;
  }
  
@@ -1729,7 +2542,7 @@
  bool PeepholeOptimizer::optimizeSelect(
      MachineInstr &MI, SmallPtrSetImpl<MachineInstr *> &LocalMIs) {
    assert(MI.isSelect() && "Should only be called when MI->isSelect() is true");
-@@ -968,32 +746,14 @@ bool PeepholeOptimizer::optimizeSelect(
+@@ -975,32 +750,14 @@ bool PeepholeOptimizer::optimizeSelect(
    return true;
  }
  
@@ -1762,7 +2575,7 @@
    Register Reg = RegSubReg.Reg;
    RegSubRegPair CurSrcPair = RegSubReg;
    SmallVector<RegSubRegPair, 4> SrcToLook = {CurSrcPair};
-@@ -1001,29 +761,20 @@ bool PeepholeOptimizer::findNextSource(c
+@@ -1008,29 +765,20 @@ bool PeepholeOptimizer::findNextSource(c
    unsigned PHICount = 0;
    do {
      CurSrcPair = SrcToLook.pop_back_val();
@@ -1792,7 +2605,7 @@
          if (CurSrcRes.getNumSources() > 1) {
            LLVM_DEBUG(dbgs()
                       << "findNextSource: found PHI cycle, aborting...\n");
-@@ -1032,11 +783,9 @@ bool PeepholeOptimizer::findNextSource(c
+@@ -1039,11 +787,9 @@ bool PeepholeOptimizer::findNextSource(c
          break;
        }
  
@@ -1805,7 +2618,7 @@
          if (PHICount >= RewritePHILimit) {
            LLVM_DEBUG(dbgs() << "findNextSource: PHI limit reached\n");
            return false;
-@@ -1048,38 +797,24 @@ bool PeepholeOptimizer::findNextSource(c
+@@ -1055,38 +801,24 @@ bool PeepholeOptimizer::findNextSource(c
        }
  
        CurSrcPair = Res.getSrc(0);
@@ -1844,7 +2657,7 @@
  static MachineInstr &insertPHI(MachineRegisterInfo &MRI,
                                 const TargetInstrInfo &TII,
                                 const SmallVectorImpl<RegSubRegPair> &SrcRegs,
-@@ -1087,8 +822,6 @@ static MachineInstr &insertPHI(MachineRe
+@@ -1094,8 +826,6 @@ static MachineInstr &insertPHI(MachineRe
    assert(!SrcRegs.empty() && "No sources to create a PHI instruction?");
  
    const TargetRegisterClass *NewRC = MRI.getRegClass(SrcRegs[0].Reg);
@@ -1853,7 +2666,7 @@
    assert(SrcRegs[0].SubReg == 0 && "should not have subreg operand");
    Register NewVR = MRI.createVirtualRegister(NewRC);
    MachineBasicBlock *MBB = OrigPHI.getParent();
-@@ -1099,9 +832,6 @@ static MachineInstr &insertPHI(MachineRe
+@@ -1106,9 +836,6 @@ static MachineInstr &insertPHI(MachineRe
    for (const RegSubRegPair &RegPair : SrcRegs) {
      MIB.addReg(RegPair.Reg, {}, RegPair.SubReg);
      MIB.addMBB(OrigPHI.getOperand(MBBOpIdx).getMBB());
@@ -1863,7 +2676,7 @@
      MRI.clearKillFlags(RegPair.Reg);
      MBBOpIdx += 2;
    }
-@@ -1109,12 +839,6 @@ static MachineInstr &insertPHI(MachineRe
+@@ -1116,12 +843,6 @@ static MachineInstr &insertPHI(MachineRe
    return *MIB;
  }
  
@@ -1876,7 +2689,7 @@
  static RegSubRegPair
  getNewSource(MachineRegisterInfo *MRI, const TargetInstrInfo *TII,
               RegSubRegPair Def,
-@@ -1123,11 +847,9 @@ getNewSource(MachineRegisterInfo *MRI, c
+@@ -1130,11 +851,9 @@ getNewSource(MachineRegisterInfo *MRI, c
    RegSubRegPair LookupSrc(Def.Reg, Def.SubReg);
    while (true) {
      ValueTrackerResult Res = RewriteMap.lookup(LookupSrc);
@@ -1888,7 +2701,7 @@
      unsigned NumSrcs = Res.getNumSources();
      if (NumSrcs == 1) {
        LookupSrc.Reg = Res.getSrcReg(0);
-@@ -1135,12 +857,9 @@ getNewSource(MachineRegisterInfo *MRI, c
+@@ -1142,12 +861,9 @@ getNewSource(MachineRegisterInfo *MRI, c
        continue;
      }
  
@@ -1901,7 +2714,7 @@
      SmallVector<RegSubRegPair, 4> NewPHISrcs;
      for (unsigned i = 0; i < NumSrcs; ++i) {
        RegSubRegPair PHISrc(Res.getSrcReg(i), Res.getSrcSubReg(i));
-@@ -1148,7 +867,6 @@ getNewSource(MachineRegisterInfo *MRI, c
+@@ -1155,7 +871,6 @@ getNewSource(MachineRegisterInfo *MRI, c
            getNewSource(MRI, TII, PHISrc, RewriteMap, HandleMultipleSources));
      }
  
@@ -1909,7 +2722,7 @@
      MachineInstr &OrigPHI = const_cast<MachineInstr &>(*Res.getInst());
      MachineInstr &NewPHI = insertPHI(*MRI, *TII, NewPHISrcs, OrigPHI);
      LLVM_DEBUG(dbgs() << "-- getNewSource\n");
-@@ -1163,30 +881,18 @@ getNewSource(MachineRegisterInfo *MRI, c
+@@ -1170,30 +885,18 @@ getNewSource(MachineRegisterInfo *MRI, c
  
  bool PeepholeOptimizer::optimizeCoalescableCopyImpl(Rewriter &&CpyRewriter) {
    bool Changed = false;
@@ -1941,7 +2754,7 @@
      RegSubRegPair NewSrc = getNewSource(MRI, TII, TrackPair, RewriteMap,
                                          /*HandleMultipleSources=*/false);
      assert(TrackPair.Reg != NewSrc.Reg &&
-@@ -1195,51 +901,29 @@ bool PeepholeOptimizer::optimizeCoalesca
+@@ -1202,51 +905,29 @@ bool PeepholeOptimizer::optimizeCoalesca
        continue;
  
      if (NewSrc.SubReg) {
@@ -1994,7 +2807,7 @@
    if (MODef.getReg().isPhysical())
      return false;
  
-@@ -1253,7 +937,6 @@ bool PeepholeOptimizer::optimizeCoalesca
+@@ -1260,7 +941,6 @@ bool PeepholeOptimizer::optimizeCoalesca
    case TargetOpcode::REG_SEQUENCE:
      return optimizeCoalescableCopyImpl(RegSequenceRewriter(MI));
    default:
@@ -2002,7 +2815,7 @@
      if (MI.isBitcast() || MI.isRegSequenceLike() || MI.isInsertSubregLike() ||
          MI.isExtractSubregLike())
        return optimizeCoalescableCopyImpl(UncoalescableRewriter(MI));
-@@ -1261,20 +944,13 @@ bool PeepholeOptimizer::optimizeCoalesca
+@@ -1268,20 +948,13 @@ bool PeepholeOptimizer::optimizeCoalesca
    }
  }
  
@@ -2023,7 +2836,7 @@
    const TargetRegisterClass *DefRC = MRI->getRegClass(Def.Reg);
    Register NewVReg = MRI->createVirtualRegister(DefRC);
  
-@@ -1282,11 +958,7 @@ MachineInstr &PeepholeOptimizer::rewrite
+@@ -1289,11 +962,7 @@ MachineInstr &PeepholeOptimizer::rewrite
      const TargetRegisterClass *NewSrcRC = MRI->getRegClass(NewSrc.Reg);
      const TargetRegisterClass *WithSubRC =
          TRI->getSubClassWithSubReg(NewSrcRC, NewSrc.SubReg);
@@ -2036,7 +2849,7 @@
        llvm_unreachable("replacement register cannot support subregister");
    }
  
-@@ -1303,101 +975,129 @@ MachineInstr &PeepholeOptimizer::rewrite
+@@ -1310,111 +979,83 @@ MachineInstr &PeepholeOptimizer::rewrite
    LLVM_DEBUG(dbgs() << "-- RewriteSource\n");
    LLVM_DEBUG(dbgs() << "   Replacing: " << CopyLike);
    LLVM_DEBUG(dbgs() << "        With: " << *NewCopy);
@@ -2135,40 +2948,32 @@
    return false;
  }
  
-+MachineInstr *PeepholeOptimizer::foldLoadInto(
-+    MachineInstr &MI, Register FoldReg,
-+    SmallPtrSetImpl<MachineInstr *> &LocalMIs) {
-+  Register FoldedReg = FoldReg;
-+  MachineInstr *DefMI = nullptr;
-+  MachineInstr *CopyMI = nullptr;
+ MachineInstr *
+ PeepholeOptimizer::foldLoadInto(MachineFunction &MF, MachineInstr &MI,
+                                 Register FoldReg,
+-                                SmallPtrSet<MachineInstr *, 16> &LocalMIs) {
++                                SmallPtrSetImpl<MachineInstr *> &LocalMIs) {
+   Register Reg = FoldReg;
+   MachineInstr *DefMI = nullptr;
+   MachineInstr *CopyMI = nullptr;
+   MachineInstr *FoldMI = TII->optimizeLoadInstr(MI, MRI, Reg, DefMI, CopyMI);
+   if (!FoldMI)
+     return nullptr;
 +
-+  MachineInstr *FoldMI =
-+      TII->optimizeLoadInstr(MI, MRI, FoldReg, DefMI, CopyMI);
-+  if (!FoldMI || !DefMI)
-+    return nullptr;
+   LLVM_DEBUG(dbgs() << "Replacing: " << MI << "     With: " << *FoldMI);
+   LocalMIs.erase(&MI);
+   LocalMIs.erase(DefMI);
+   LocalMIs.insert(FoldMI);
+   if (CopyMI)
+     LocalMIs.insert(CopyMI);
 +
-+  LLVM_DEBUG(dbgs() << "Replacing: " << MI);
-+  LLVM_DEBUG(dbgs() << "     With: " << *FoldMI);
-+
-+  LocalMIs.erase(&MI);
-+  LocalMIs.erase(DefMI);
-+  LocalMIs.insert(FoldMI);
-+  if (CopyMI)
-+    LocalMIs.insert(CopyMI);
-+
-+  if (MI.shouldUpdateAdditionalCallInfo())
-+    MI.getMF()->moveAdditionalCallInfo(&MI, FoldMI);
-+
-+  if (DefMI != FoldMI)
-+    DefMI->eraseFromParent();
-+  if (&MI != FoldMI)
-+    MI.eraseFromParent();
-+
-+  MRI->markUsesInDebugValueAsUndef(FoldedReg);
-+  ++NumLoadFold;
-+  return FoldMI;
-+}
-+
+   if (MI.shouldUpdateAdditionalCallInfo())
+     MF.moveAdditionalCallInfo(&MI, FoldMI);
+   MI.eraseFromParent();
+@@ -1424,12 +1065,37 @@ PeepholeOptimizer::foldLoadInto(MachineF
+   return FoldMI;
+ }
+ 
 +bool PeepholeOptimizer::tryFoldLoadAfterCompareElim(
 +    Register CmpSrcReg, SmallPtrSetImpl<MachineInstr *> &LocalMIs) {
 +  if (!CmpSrcReg.isVirtual() || !MRI->hasOneNonDBGUser(CmpSrcReg))
@@ -2189,7 +2994,8 @@
 +  if (!LoadMI->canFoldAsLoad() || !LoadMI->mayLoad())
 +    return false;
 +
-+  return foldLoadInto(*FlagProducer, CmpSrcReg, LocalMIs) != nullptr;
++  return foldLoadInto(*FlagProducer->getMF(), *FlagProducer, CmpSrcReg,
++                      LocalMIs) != nullptr;
 +}
 +
  bool PeepholeOptimizer::isMoveImmediate(
@@ -2202,7 +3008,7 @@
    Register Reg = MI.getOperand(0).getReg();
    if (!Reg.isVirtual())
      return false;
-@@ -1411,9 +1111,6 @@ bool PeepholeOptimizer::isMoveImmediate(
+@@ -1443,9 +1109,6 @@ bool PeepholeOptimizer::isMoveImmediate(
    return true;
  }
  
@@ -2212,7 +3018,7 @@
  bool PeepholeOptimizer::foldImmediate(
      MachineInstr &MI, SmallSet<Register, 4> &ImmDefRegs,
      DenseMap<Register, MachineInstr *> &ImmDefMIs, bool &Deleted) {
-@@ -1422,18 +1119,19 @@ bool PeepholeOptimizer::foldImmediate(
+@@ -1454,18 +1117,19 @@ bool PeepholeOptimizer::foldImmediate(
      MachineOperand &MO = MI.getOperand(i);
      if (!MO.isReg() || MO.isDef())
        continue;
@@ -2223,9 +3029,8 @@
 +
      if (ImmDefRegs.count(Reg) == 0)
        continue;
--    DenseMap<Register, MachineInstr *>::iterator II = ImmDefMIs.find(Reg);
 +
-+    auto II = ImmDefMIs.find(Reg);
+     auto II = ImmDefMIs.find(Reg);
      assert(II != ImmDefMIs.end() && "couldn't find immediate definition");
      if (TII->foldImmediate(MI, *II->second, Reg, MRI)) {
        ++NumImmFold;
@@ -2236,7 +3041,7 @@
        if (MRI->getVRegDef(Reg) &&
            MI.isIdenticalTo(*II->second, MachineInstr::IgnoreVRegDefs)) {
          Register DstReg = MI.getOperand(0).getReg();
-@@ -1448,23 +1146,10 @@ bool PeepholeOptimizer::foldImmediate(
+@@ -1480,23 +1144,10 @@ bool PeepholeOptimizer::foldImmediate(
        return true;
      }
    }
@@ -2261,7 +3066,7 @@
  bool PeepholeOptimizer::foldRedundantCopy(MachineInstr &MI) {
    assert(MI.isCopy() && "expected a COPY machine instruction");
  
-@@ -1476,10 +1161,8 @@ bool PeepholeOptimizer::foldRedundantCop
+@@ -1508,10 +1159,8 @@ bool PeepholeOptimizer::foldRedundantCop
    if (!DstReg.isVirtual())
      return false;
  
@@ -2273,7 +3078,7 @@
  
    MachineInstr *PrevCopy = CopySrcMIs.find(SrcPair)->second;
  
-@@ -1487,17 +1170,10 @@ bool PeepholeOptimizer::foldRedundantCop
+@@ -1519,17 +1168,10 @@ bool PeepholeOptimizer::foldRedundantCop
           "Unexpected mismatching subreg!");
  
    Register PrevDstReg = PrevCopy->getOperand(0).getReg();
@@ -2291,7 +3096,7 @@
    MRI->clearKillFlags(PrevDstReg);
    return true;
  }
-@@ -1515,22 +1191,17 @@ bool PeepholeOptimizer::foldRedundantNAP
+@@ -1547,22 +1189,17 @@ bool PeepholeOptimizer::foldRedundantNAP
  
    Register DstReg = MI.getOperand(0).getReg();
    Register SrcReg = MI.getOperand(1).getReg();
@@ -2316,7 +3121,7 @@
      LLVM_DEBUG(dbgs() << "NAPhysCopy: intervening clobber forbids erasing "
                        << MI);
      return false;
-@@ -1538,51 +1209,38 @@ bool PeepholeOptimizer::foldRedundantNAP
+@@ -1570,51 +1207,38 @@ bool PeepholeOptimizer::foldRedundantNAP
  
    Register PrevDstReg = PrevCopy->second->getOperand(0).getReg();
    if (PrevDstReg == SrcReg) {
@@ -2372,7 +3177,7 @@
    if (MI.getDesc().getNumDefs() != 1)
      return false;
  
-@@ -1590,9 +1248,6 @@ bool PeepholeOptimizer::findTargetRecurr
+@@ -1622,9 +1246,6 @@ bool PeepholeOptimizer::findTargetRecurr
    if (!isVirtualRegisterOperand(DefOp))
      return false;
  
@@ -2382,7 +3187,7 @@
    unsigned TiedUseIdx;
    if (!MI.isRegTiedToUseOperand(0, &TiedUseIdx))
      return false;
-@@ -1600,40 +1255,21 @@ bool PeepholeOptimizer::findTargetRecurr
+@@ -1632,40 +1253,21 @@ bool PeepholeOptimizer::findTargetRecurr
    if (Idx == TiedUseIdx) {
      RC.push_back(RecurrenceInstr(&MI));
      return findTargetRecurrence(DefOp.getReg(), TargetRegs, RC);
@@ -2430,7 +3235,7 @@
      assert(isVirtualRegisterOperand(MO) && "Invalid PHI instruction");
      TargetRegs.insert(MO.getReg());
    }
-@@ -1641,8 +1277,6 @@ bool PeepholeOptimizer::optimizeRecurren
+@@ -1673,8 +1275,6 @@ bool PeepholeOptimizer::optimizeRecurren
    bool Changed = false;
    RecurrenceCycle RC;
    if (findTargetRecurrence(PHI.getOperand(0).getReg(), TargetRegs, RC)) {
@@ -2439,7 +3244,7 @@
      LLVM_DEBUG(dbgs() << "Optimize recurrence chain from " << PHI);
      for (auto &RI : RC) {
        LLVM_DEBUG(dbgs() << "\tInst: " << *(RI.getMI()));
-@@ -1690,7 +1324,6 @@ bool PeepholeOptimizerLegacy::runOnMachi
+@@ -1722,7 +1322,6 @@ bool PeepholeOptimizerLegacy::runOnMachi
  }
  
  bool PeepholeOptimizer::run(MachineFunction &MF) {
@@ -2447,7 +3252,7 @@
    LLVM_DEBUG(dbgs() << "********** PEEPHOLE OPTIMIZER **********\n");
    LLVM_DEBUG(dbgs() << "********** Function: " << MF.getName() << '\n');
  
-@@ -1707,23 +1340,18 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1739,23 +1338,18 @@ bool PeepholeOptimizer::run(MachineFunct
    for (MachineBasicBlock &MBB : MF) {
      bool SeenMoveImm = false;
  
@@ -2477,7 +3282,7 @@
  
      CopySrcMIs.clear();
  
-@@ -1732,16 +1360,10 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1764,16 +1358,10 @@ bool PeepholeOptimizer::run(MachineFunct
      for (MachineBasicBlock::iterator MII = MBB.begin(), MIE = MBB.end();
           MII != MIE;) {
        MachineInstr *MI = &*MII;
@@ -2495,7 +3300,7 @@
          continue;
  
        if (IsLoopHeader && MI->isPHI()) {
-@@ -1753,14 +1375,11 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1785,14 +1373,11 @@ bool PeepholeOptimizer::run(MachineFunct
  
        if (!MI->isCopy()) {
          for (const MachineOperand &MO : MI->operands()) {
@@ -2511,7 +3316,7 @@
                  LLVM_DEBUG(dbgs()
                             << "NAPhysCopy: invalidating because of " << *MI);
                  NAPhysToVirtMIs.erase(Def);
-@@ -1768,13 +1387,17 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1800,13 +1385,17 @@ bool PeepholeOptimizer::run(MachineFunct
              }
            } else if (MO.isRegMask()) {
              const uint32_t *RegMask = MO.getRegMask();
@@ -2536,7 +3341,7 @@
              }
            }
          }
-@@ -1784,22 +1407,35 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1816,22 +1405,35 @@ bool PeepholeOptimizer::run(MachineFunct
          continue;
  
        if (MI->isInlineAsm() || MI->hasUnmodeledSideEffects()) {
@@ -2578,7 +3383,7 @@
          continue;
        }
  
-@@ -1809,7 +1445,6 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1841,7 +1443,6 @@ bool PeepholeOptimizer::run(MachineFunct
        }
  
        if (isCoalescableCopy(*MI) && optimizeCoalescableCopy(*MI)) {
@@ -2586,7 +3391,7 @@
          Changed = true;
          continue;
        }
-@@ -1827,13 +1462,12 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1859,13 +1460,12 @@ bool PeepholeOptimizer::run(MachineFunct
          SeenMoveImm = true;
        } else {
          Changed |= optimizeExtInstr(*MI, MBB, LocalMIs);
@@ -2603,7 +3408,7 @@
            Changed |= foldImmediate(*MI, ImmDefRegs, ImmDefMIs, Deleted);
            if (Deleted) {
              LocalMIs.erase(MI);
-@@ -1842,62 +1476,28 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1874,41 +1474,28 @@ bool PeepholeOptimizer::run(MachineFunct
          }
        }
  
@@ -2630,31 +3435,10 @@
 -          if (FoldAsLoadDefCandidates.count(FoldAsLoadDefReg)) {
 -            // We need to fold load after optimizeCmpInstr, since
 -            // optimizeCmpInstr can enable folding by converting SUB to CMP.
--            // Save FoldAsLoadDefReg because optimizeLoadInstr() resets it and
--            // we need it for markUsesInDebugValueAsUndef().
 -            Register FoldedReg = FoldAsLoadDefReg;
--            MachineInstr *DefMI = nullptr;
--            MachineInstr *CopyMI = nullptr;
--            if (MachineInstr *FoldMI = TII->optimizeLoadInstr(
--                    *MI, MRI, FoldAsLoadDefReg, DefMI, CopyMI)) {
--              // Update LocalMIs since we replaced MI with FoldMI and deleted
--              // DefMI.
--              LLVM_DEBUG(dbgs() << "Replacing: " << *MI);
--              LLVM_DEBUG(dbgs() << "     With: " << *FoldMI);
--              LocalMIs.erase(MI);
--              LocalMIs.erase(DefMI);
--              LocalMIs.insert(FoldMI);
--              if (CopyMI)
--                LocalMIs.insert(CopyMI);
--              // Update the call info.
--              if (MI->shouldUpdateAdditionalCallInfo())
--                MI->getMF()->moveAdditionalCallInfo(MI, FoldMI);
--              MI->eraseFromParent();
--              DefMI->eraseFromParent();
--              MRI->markUsesInDebugValueAsUndef(FoldedReg);
+-            if (MachineInstr *FoldMI =
+-                    foldLoadInto(MF, *MI, FoldAsLoadDefReg, LocalMIs)) {
 -              FoldAsLoadDefCandidates.erase(FoldedReg);
--              ++NumLoadFold;
--
 -              // MI is replaced with FoldMI so we can continue trying to fold
 -              Changed = true;
 -              MI = FoldMI;
@@ -2664,7 +3448,7 @@
 +
 +          // #2 Single helper for repeated fold+bookkeeping mechanics.
 +          if (MachineInstr *FoldMI =
-+                  foldLoadInto(*MI, FoldAsLoadDefReg, LocalMIs)) {
++                  foldLoadInto(MF, *MI, FoldAsLoadDefReg, LocalMIs)) {
 +            FoldAsLoadDefCandidates.erase(FoldAsLoadDefReg);
 +            Changed = true;
 +            MI = FoldMI;
@@ -2678,7 +3462,7 @@
        if (MI->isLoadFoldBarrier()) {
          LLVM_DEBUG(dbgs() << "Encountered load fold barrier on " << *MI);
          FoldAsLoadDefCandidates.clear();
-@@ -1911,16 +1511,11 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1922,16 +1509,11 @@ bool PeepholeOptimizer::run(MachineFunct
  
  ValueTrackerResult ValueTracker::getNextSourceFromCopy() {
    assert(Def->isCopy() && "Invalid definition");
@@ -2695,7 +3479,7 @@
    const MachineOperand &Src = Def->getOperand(1);
    if (Src.isUndef())
      return ValueTrackerResult();
-@@ -1932,13 +1527,11 @@ ValueTrackerResult ValueTracker::getNext
+@@ -1943,13 +1525,11 @@ ValueTrackerResult ValueTracker::getNext
      SubReg = TRI->composeSubRegIndices(SubReg, DefSubReg);
  
      if (SrcReg.isVirtual()) {
@@ -2711,7 +3495,7 @@
      }
    }
  
-@@ -1948,11 +1541,9 @@ ValueTrackerResult ValueTracker::getNext
+@@ -1959,11 +1539,9 @@ ValueTrackerResult ValueTracker::getNext
  ValueTrackerResult ValueTracker::getNextSourceFromBitcast() {
    assert(Def->isBitcast() && "Invalid definition");
  
@@ -2723,7 +3507,7 @@
    if (Def->getDesc().getNumDefs() != 1)
      return ValueTrackerResult();
  
-@@ -1964,25 +1555,18 @@ ValueTrackerResult ValueTracker::getNext
+@@ -1975,25 +1553,18 @@ ValueTrackerResult ValueTracker::getNext
      const MachineOperand &MO = Def->getOperand(OpIdx);
      if (!MO.isReg() || !MO.getReg())
        continue;
@@ -2749,7 +3533,7 @@
    for (const MachineInstr &UseMI : MRI.use_nodbg_instructions(DefOp.getReg())) {
      if (UseMI.isSubregToReg())
        return ValueTrackerResult();
-@@ -1991,41 +1575,29 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2002,41 +1573,29 @@ ValueTrackerResult ValueTracker::getNext
    const MachineOperand &Src = Def->getOperand(SrcIdx);
    if (Src.isUndef())
      return ValueTrackerResult();
@@ -2792,7 +3576,7 @@
      if ((DefMask & ThisOpRegMask) != DefMask)
        continue;
  
-@@ -2037,10 +1609,6 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2048,10 +1607,6 @@ ValueTrackerResult ValueTracker::getNext
      unsigned ComposedDefInSrcReg1 =
          TRI->composeSubRegIndices(RegSeqInput.SubReg, ReverseDefCompose);
  
@@ -2803,7 +3587,7 @@
      const TargetRegisterClass *SrcRC = MRI.getRegClass(RegSeqInput.Reg);
      if (!TRI->isSubRegValidForRegClass(SrcRC, ComposedDefInSrcReg1))
        return ValueTrackerResult();
-@@ -2048,9 +1616,6 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2059,9 +1614,6 @@ ValueTrackerResult ValueTracker::getNext
      return ValueTrackerResult(RegSeqInput.Reg, ComposedDefInSrcReg1);
    }
  
@@ -2813,7 +3597,7 @@
    return ValueTrackerResult();
  }
  
-@@ -2064,47 +1629,27 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2075,47 +1627,27 @@ ValueTrackerResult ValueTracker::getNext
    if (!TII->getInsertSubregInputs(*Def, DefIdx, BaseReg, InsertedReg))
      return ValueTrackerResult();
  
@@ -2864,7 +3648,7 @@
    if (DefSubReg)
      return ValueTrackerResult();
  
-@@ -2112,28 +1657,19 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2123,28 +1655,19 @@ ValueTrackerResult ValueTracker::getNext
    if (!TII->getExtractSubregInputs(*Def, DefIdx, ExtractSubregInputReg))
      return ValueTrackerResult();
  
@@ -2895,7 +3679,7 @@
    if (Def->getOperand(1).getSubReg())
      return ValueTrackerResult();
  
-@@ -2141,17 +1677,13 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2152,17 +1675,13 @@ ValueTrackerResult ValueTracker::getNext
                              Def->getOperand(2).getImm());
  }
  
@@ -2913,7 +3697,7 @@
      if (MO.isUndef())
        return ValueTrackerResult();
      Res.addSource(MO.getReg(), MO.getSubReg());
-@@ -2162,18 +1694,17 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2173,18 +1692,17 @@ ValueTrackerResult ValueTracker::getNext
  
  ValueTrackerResult ValueTracker::getNextSourceImpl() {
    assert(Def && "This method needs a valid definition");
@@ -2934,7 +3718,7 @@
    if (DisableAdvCopyOpt)
      return ValueTrackerResult();
    if (Def->isRegSequence() || Def->isRegSequenceLike())
-@@ -2190,25 +1721,17 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2201,25 +1719,17 @@ ValueTrackerResult ValueTracker::getNext
  }
  
  ValueTrackerResult ValueTracker::getNextSource() {
@@ -2961,7 +3745,7 @@
      if (!Reg.isPhysical() && OneRegSrc) {
        MachineRegisterInfo::def_iterator DI = MRI.def_begin(Reg);
        if (DI != MRI.def_end()) {
-@@ -2221,9 +1744,7 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2232,9 +1742,7 @@ ValueTrackerResult ValueTracker::getNext
        return Res;
      }
    }
@@ -3966,7 +4750,7 @@
  bool X86DAGToDAGISel::SelectInlineAsmMemoryOperand(
 
 --- a/llvm/lib/Target/X86/X86ISelLowering.cpp	2025-08-02 20:50:59.772460740 +0200
-+++ b/llvm/lib/Target/X86/X86ISelLowering.cpp	2026-05-03 11:49:20.796623328 +0200
++++ b/llvm/lib/Target/X86/X86ISelLowering.cpp	2026-05-11 11:49:20.796623328 +0200
 @@ -70,7 +70,7 @@ using namespace llvm;
  #define DEBUG_TYPE "x86-isel"
  
@@ -4351,7 +5135,7 @@
    return DAG.getNode(ISD::ADD, dl, VT, AloBlo, Hi);
  }
  
-@@ -47099,7 +47165,13 @@ static SDValue createPSADBW(SelectionDAG
+@@ -47106,7 +47172,13 @@ static SDValue createPSADBW(SelectionDAG
  // ISD::VECREDUCE_SMIN/SMAX/UMIN/UMAX.
  static SDValue combineMinMaxReduction(SDNode *Extract, SelectionDAG &DAG,
                                        const X86Subtarget &Subtarget) {
@@ -4365,7 +5149,7 @@
    if (!DAG.getTargetLoweringInfo().isTypeLegal(ExtractVT))
      return SDValue();
  
-@@ -47116,20 +47188,11 @@ static SDValue combineMinMaxReduction(SD
+@@ -47123,20 +47195,11 @@ static SDValue combineMinMaxReduction(SD
  
    ISD::NodeType RdxOp;
    switch (BinOp) {
@@ -4391,7 +5175,7 @@
    }
  
    return DAG.getNode(RdxOp, SDLoc(Extract), ExtractVT, Src);
-@@ -50376,50 +50439,65 @@ static SDValue combineMulSpecial(uint64_
+@@ -50383,50 +50446,65 @@ static SDValue combineMulSpecial(uint64_
    default:
      break;
    case 11:
@@ -4474,7 +5258,7 @@
    if (isPowerOf2_64(MulAmt & (MulAmt - 1))) {
      unsigned ScaleShift = llvm::countr_zero(MulAmt);
      if (ScaleShift >= 1 && ScaleShift < 4) {
-@@ -63387,13 +63465,37 @@ void X86TargetLowering::LowerAsmOperandF
+@@ -63394,13 +63472,37 @@ void X86TargetLowering::LowerAsmOperandF
      return;
    }
    case 'i': {
@@ -4517,7 +5301,7 @@
        Result =
            ExtOpc == ISD::ZERO_EXTEND
                ? DAG.getTargetConstant(CST->getZExtValue(), DL, MVT::i64)
-@@ -63973,15 +64075,14 @@ X86TargetLowering::getRegForInlineAsmCon
+@@ -63980,15 +64082,14 @@ X86TargetLowering::getRegForInlineAsmCon
  }
  
  bool X86TargetLowering::isIntDivCheap(EVT VT, AttributeList Attr) const {
