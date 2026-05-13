@@ -1,22 +1,77 @@
 pkgbase=flac
 pkgname=('flac')
 pkgver=1.5.0
-pkgrel=4.1
+pkgrel=5.1
 pkgdesc='Free Lossless Audio Codec'
 url='https://xiph.org/flac/'
 arch=('x86_64')
 license=('BSD' 'GPL')
-depends=('gcc-libs' 'libogg')
-makedepends=('nasm' 'doxygen' 'cmake' 'ninja')
-source=(https://downloads.xiph.org/releases/flac/flac-${pkgver}.tar.xz)
+depends=(
+  'glibc'
+  'libgcc'
+  'libogg'
+  'libstdc++'
+)
+makedepends=(
+  'clang'
+  'cmake'
+  'git'
+  'lld'
+  'llvm'
+  'nasm'
+  'ninja'
+  #'pandoc-cli'
+)
+source=("https://downloads.xiph.org/releases/flac/flac-${pkgver}.tar.xz")
 sha512sums=('4a626e8a1bd126e234c0e5061e3b46f3a27c2065fdfa228fd8cf00d3c7fa2c05fafb5cec36acce7bfce4914bfd7db0b2a27ee15decf2d8c4caad630f62d44ec9')
 
-prepare() {
-  cd flac-${pkgver}
+_setup_llvm_toolchain() {
+  export CC=clang
+  export CXX=clang++
+  export AR=llvm-ar
+  export NM=llvm-nm
+  export RANLIB=llvm-ranlib
+  export STRIP=llvm-strip
 }
 
-build() {
-  cmake -S flac-${pkgver} -B build -G Ninja \
+_merge_profraw_dir() {
+  local out="$1"
+  local dir="$2"
+  local -a files chunk parts
+  local idx=0 chunk_idx=0
+  local tmpdir="${dir}/.merge_tmp"
+
+  rm -rf "$tmpdir"
+  mkdir -p "$tmpdir"
+
+  shopt -s nullglob
+  files=("$dir"/*.profraw)
+  shopt -u nullglob
+  (( ${#files[@]} > 0 )) || return 1
+
+  while (( idx < ${#files[@]} )); do
+    chunk=("${files[@]:idx:400}")
+    llvm-profdata merge -sparse -output="${tmpdir}/part-${chunk_idx}.profdata" "${chunk[@]}"
+    ((idx += 400, chunk_idx++))
+  done
+
+  shopt -s nullglob
+  parts=("${tmpdir}"/*.profdata)
+  shopt -u nullglob
+  (( ${#parts[@]} > 0 )) || return 1
+
+  llvm-profdata merge -sparse -output="$out" "${parts[@]}"
+}
+
+_configure_stage() {
+  local builddir="$1"
+  local extra_cflags="$2"
+  local extra_cxxflags="$3"
+  local extra_ldflags="$4"
+
+  rm -rf "$builddir"
+
+  cmake -S "flac-${pkgver}" -B "$builddir" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_STANDARD=23 \
     -DCMAKE_CXX_STANDARD=23 \
@@ -27,20 +82,180 @@ build() {
     -DBUILD_EXAMPLES=OFF \
     -DINSTALL_MANPAGES=OFF \
     -DWITH_STACK_PROTECTOR=OFF \
-    -DNDEBUG=ON
-  cmake --build build
+    -DNDEBUG=ON \
+    -DCMAKE_C_FLAGS="${_base_cflags} ${extra_cflags}" \
+    -DCMAKE_CXX_FLAGS="${_base_cxxflags} ${extra_cxxflags}" \
+    -DCMAKE_EXE_LINKER_FLAGS="${_base_ldflags} ${extra_ldflags}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${_base_ldflags} ${extra_ldflags}" \
+    -DCMAKE_MODULE_LINKER_FLAGS="${_base_ldflags} ${extra_ldflags}"
+
+  cmake --build "$builddir"
+}
+
+_run_flac_workload() {
+  local builddir="$1"
+  local flac_bin="${builddir}/src/flac/flac"
+  local metaflac_bin="${builddir}/src/metaflac/metaflac"
+  local work="${srcdir}/flac-pgo-work"
+  local raw="${work}/sample.raw"
+  local raw2="${work}/decoded.raw"
+  local f1="${work}/sample-5.flac"
+  local f2="${work}/sample-8.flac"
+
+  [[ -x "$flac_bin" ]] || return 0
+
+  mkdir -p "$work"
+
+  # Deterministic PCM corpus: 2ch, 16-bit LE, 44.1 kHz, 5 seconds.
+  python - "$raw" <<'PY'
+import math, struct, sys
+out = open(sys.argv[1], "wb")
+sr = 44100
+dur = 5
+for n in range(sr * dur):
+    l = int(22000 * math.sin(2 * math.pi * 440 * n / sr))
+    r = int(18000 * math.sin(2 * math.pi * 660 * n / sr))
+    out.write(struct.pack("<hh", l, r))
+out.close()
+PY
+
+  local iter
+  for iter in {1..20}; do
+    "$flac_bin" --force-raw-format --sign=signed --endian=little \
+      --channels=2 --bps=16 --sample-rate=44100 \
+      --compression-level-5 -o "$f1" "$raw" >/dev/null 2>&1 || true
+
+    "$flac_bin" --force-raw-format --sign=signed --endian=little \
+      --channels=2 --bps=16 --sample-rate=44100 \
+      --compression-level-8 -o "$f2" "$raw" >/dev/null 2>&1 || true
+
+    "$flac_bin" -d --force-raw-format -o "$raw2" "$f1" >/dev/null 2>&1 || true
+    "$flac_bin" -t "$f1" >/dev/null 2>&1 || true
+    "$flac_bin" -t "$f2" >/dev/null 2>&1 || true
+
+    if [[ -x "$metaflac_bin" ]]; then
+      "$metaflac_bin" --list "$f1" >/dev/null 2>&1 || true
+      "$metaflac_bin" --show-md5sum "$f1" >/dev/null 2>&1 || true
+      "$metaflac_bin" --show-total-samples "$f1" >/dev/null 2>&1 || true
+    fi
+  done
+
+  rm -rf "$work"
+}
+
+_run_profile_training() {
+  local builddir="$1"
+  local profdir="$2"
+  local label="$3"
+
+  mkdir -p "$profdir"
+  rm -f "${profdir}"/*.profraw
+
+  # LLVM best practice for high-parallel runs: use %m to enable runtime
+  # in-place merging of raw profiles and avoid profile-file explosions.
+  export LLVM_PROFILE_FILE="${profdir}/default_%m.profraw"
+  export LLVM_PROFILE_MERGE_POOL_SIZE=16
+
+  echo "==> ${label}: ctest (parallel)"
+  ctest --test-dir "$builddir" --output-on-failure -j"$(nproc)" || true
+
+  echo "==> ${label}: ctest (serial)"
+  ctest --test-dir "$builddir" --output-on-failure -j1 || true
+
+  echo "==> ${label}: flac/metaflac workload"
+  _run_flac_workload "$builddir"
+  _run_flac_workload "$builddir"
+
+  unset LLVM_PROFILE_FILE LLVM_PROFILE_MERGE_POOL_SIZE
+}
+
+prepare() {
+  cd "flac-${pkgver}"
+}
+
+build() {
+  _setup_llvm_toolchain
+
+  local build_std="build-pgo-gen"
+  local build_cs="build-cspgo-gen"
+  local build_opt="build-opt"
+
+  local pgo_dir="${srcdir}/pgo"
+  local std_raw="${pgo_dir}/standard"
+  local cs_raw="${pgo_dir}/cs"
+  local std_prof="${pgo_dir}/standard.profdata"
+  local cs_prof="${pgo_dir}/cs.profdata"
+  local merged_prof="${pgo_dir}/merged.profdata"
+
+  _base_cflags="${CFLAGS}"
+  _base_cxxflags="${CXXFLAGS}"
+  _base_ldflags="${LDFLAGS}"
+
+  local pgo_common_flags="-fprofile-update=atomic -mllvm -enable-value-profiling"
+  local std_vp_flags="${pgo_common_flags} -mllvm -vp-counters-per-site=16"
+  local cs_vp_flags="${pgo_common_flags} -mllvm -vp-counters-per-site=32"
+  local profile_warn_flags="-Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled"
+
+  rm -rf "$build_std" "$build_cs" "$build_opt" "$pgo_dir"
+  mkdir -p "$std_raw" "$cs_raw"
+
+  echo "=========================================================================="
+  echo " Stage 1/3: Standard IR-PGO instrumentation"
+  echo "=========================================================================="
+  _configure_stage \
+    "$build_std" \
+    "-fprofile-generate=${std_raw} ${std_vp_flags}" \
+    "-fprofile-generate=${std_raw} ${std_vp_flags}" \
+    "-fprofile-generate=${std_raw} -fprofile-update=atomic"
+
+  _run_profile_training "$build_std" "$std_raw" "Stage 1"
+
+  _merge_profraw_dir "$std_prof" "$std_raw" || {
+    echo "ERROR: failed to create standard profile data" >&2
+    return 1
+  }
+
+  echo "=========================================================================="
+  echo " Stage 2/3: Context-sensitive PGO instrumentation"
+  echo "=========================================================================="
+  _configure_stage \
+    "$build_cs" \
+    "-fprofile-use=${std_prof} -fcs-profile-generate=${cs_raw} ${cs_vp_flags} ${profile_warn_flags}" \
+    "-fprofile-use=${std_prof} -fcs-profile-generate=${cs_raw} ${cs_vp_flags} ${profile_warn_flags}" \
+    "-fprofile-use=${std_prof} -fcs-profile-generate=${cs_raw} -fprofile-update=atomic"
+
+  _run_profile_training "$build_cs" "$cs_raw" "Stage 2"
+
+  _merge_profraw_dir "$cs_prof" "$cs_raw" || {
+    echo "ERROR: failed to create context-sensitive profile data" >&2
+    return 1
+  }
+
+  llvm-profdata merge -sparse -output="$merged_prof" "$std_prof" "$cs_prof"
+  [[ -s "$merged_prof" ]] || {
+    echo "ERROR: failed to create merged profile data" >&2
+    return 1
+  }
+
+  echo "=========================================================================="
+  echo " Stage 3/3: Final PGO-optimized build"
+  echo "=========================================================================="
+  _configure_stage \
+    "$build_opt" \
+    "-fprofile-use=${merged_prof} ${profile_warn_flags}" \
+    "-fprofile-use=${merged_prof} ${profile_warn_flags}" \
+    "-fprofile-use=${merged_prof}"
 }
 
 check() {
-  ctest --test-dir build --output-on-failure --stop-on-failure -j1
+  ctest --test-dir build-opt --output-on-failure --stop-on-failure -j1
 }
 
 package_flac() {
   provides=('libFLAC.so' 'libFLAC.so=8-64' 'libFLAC++.so')
 
-  DESTDIR="${pkgdir}" cmake --install build
+  DESTDIR="${pkgdir}" cmake --install build-opt
 
-  install -Dm 644 flac-${pkgver}/src/*/*.m4 -t "${pkgdir}/usr/share/aclocal"
-
-  install -Dm 644 flac-${pkgver}/COPYING.Xiph -t "${pkgdir}/usr/share/licenses/${pkgname}"
+  install -Dm 644 "flac-${pkgver}"/src/*/*.m4 -t "${pkgdir}/usr/share/aclocal"
+  install -Dm 644 "flac-${pkgver}/COPYING.Xiph" -t "${pkgdir}/usr/share/licenses/${pkgname}"
 }
