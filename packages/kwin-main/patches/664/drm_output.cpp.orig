@@ -177,11 +177,26 @@ void DrmOutput::populateModes(State *next) const
         next->modes.append(m_pipeline->connector()->generateMode(custom.size, custom.refreshRate / 1000.0f, custom.flags | OutputMode::Flag::Custom));
     }
 
+    static const bool noCustomModeQuirk = qEnvironmentVariableIntValue("KWIN_DRM_NO_CUSTOM_MODE_QUIRK");
+    if (!noCustomModeQuirk) {
+        if (!next->desiredModeSize.isEmpty() && next->desiredModeRefreshRate && next->desiredModeFlags) {
+            for (const auto &mode : std::as_const(next->modes)) {
+                const auto drmMode = std::static_pointer_cast<DrmConnectorMode>(mode);
+                if (next->desiredModeSize == mode->size() && next->desiredModeRefreshRate == drmMode->refreshRate() && next->desiredModeFlags == drmMode->flags()) {
+                    next->currentMode = drmMode;
+                    break;
+                }
+            }
+        }
+    }
+
     if (!next->currentMode) {
         next->currentMode = next->modes.constFirst();
     } else if (!next->modes.contains(next->currentMode)) {
         const auto it = std::ranges::find_if(next->modes, [&](const auto &mode) {
-            return *static_cast<DrmConnectorMode *>(next->currentMode.get()) == *static_cast<DrmConnectorMode *>(mode.get());
+            return next->currentMode->size() == mode->size()
+                && next->currentMode->refreshRate() == mode->refreshRate()
+                && next->currentMode->flags() == mode->flags();
         });
         if (it != next->modes.end()) {
             next->currentMode = *it;
@@ -340,7 +355,9 @@ void DrmOutput::repairPresentation()
 {
     // read back drm properties, most likely our info is out of date somehow
     // or we need a modeset
-    QTimer::singleShot(0, m_gpu->platform(), &DrmBackend::updateOutputs);
+    QTimer::singleShot(0, m_gpu->platform(), [backend = m_gpu->platform()]() {
+        backend->updateOutputs();
+    });
 }
 
 bool DrmOutput::overlayLayersLikelyBroken() const
@@ -500,6 +517,7 @@ bool DrmOutput::queueChanges(const std::shared_ptr<OutputChangeSet> &props)
     m_nextState->brightnessSetting = props->brightness.value_or(m_state.brightnessSetting);
     m_nextState->desiredModeSize = props->desiredModeSize.value_or(m_state.desiredModeSize);
     m_nextState->desiredModeRefreshRate = props->desiredModeRefreshRate.value_or(m_state.desiredModeRefreshRate);
+    m_nextState->desiredModeFlags = props->desiredModeFlags.value_or(m_state.desiredModeFlags);
     m_nextState->allowSdrSoftwareBrightness = props->allowSdrSoftwareBrightness.value_or(m_state.allowSdrSoftwareBrightness);
     m_nextState->colorPowerTradeoff = props->colorPowerTradeoff.value_or(m_state.colorPowerTradeoff);
     m_nextState->dimming = props->dimming.value_or(m_state.dimming);
