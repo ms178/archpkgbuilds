@@ -1041,7 +1041,7 @@ bool PeepholeOptimizer::isLoadFoldable(
 MachineInstr *
 PeepholeOptimizer::foldLoadInto(MachineFunction &MF, MachineInstr &MI,
                                 Register FoldReg,
-                                SmallPtrSet<MachineInstr *, 16> &LocalMIs) {
+                                SmallPtrSetImpl<MachineInstr *> &LocalMIs) {
   Register Reg = FoldReg;
   MachineInstr *DefMI = nullptr;
   MachineInstr *CopyMI = nullptr;
