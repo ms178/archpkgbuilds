@@ -1,0 +1,278 @@
+pkgname=shaderc
+pkgver=2026.2
+pkgrel=3.1
+pkgdesc='Collection of tools, libraries and tests for shader compilation'
+url='https://github.com/google/shaderc'
+arch=('x86_64')
+license=('Apache-2.0')
+depends=('glibc' 'glslang' 'libgcc' 'libstdc++' 'spirv-tools')
+makedepends=('clang' 'cmake' 'lld' 'llvm' 'ninja' 'python' 'spirv-headers')
+provides=('libshaderc_shared.so')
+source=("https://github.com/google/shaderc/archive/v${pkgver}/${pkgname}-${pkgver}.tar.gz")
+sha512sums=('733f85a83db4b71814c7f251c44e6010b485ed03d7e2389db5c14f8426942bebf6c95a35e5eaef80e51c29f8efa28cc0577226344630a427553200c6a87349ec')
+b2sums=('7110c9153fd109e4c9e30fb2ae2a34afda7af7e439bf4c209063d59248fce0eb78b2a71d8335e97bbe30365bc199b1bb0d1d24c317fee2e225911cc05b94a3df')
+
+_setup_llvm_toolchain() {
+  export CC=clang
+  export CXX=clang++
+  export AR=llvm-ar
+  export NM=llvm-nm
+  export RANLIB=llvm-ranlib
+  export STRIP=llvm-strip
+}
+
+_merge_profraw_dir() {
+  local out="$1"
+  local dir="$2"
+  local -a files chunk parts
+  local idx=0 chunk_idx=0
+  local tmpdir="${dir}/.merge_tmp"
+
+  rm -rf "$tmpdir"
+  mkdir -p "$tmpdir"
+
+  shopt -s nullglob
+  files=("$dir"/*.profraw)
+  shopt -u nullglob
+  (( ${#files[@]} > 0 )) || return 1
+
+  while (( idx < ${#files[@]} )); do
+    chunk=("${files[@]:idx:400}")
+    llvm-profdata merge -sparse -output="${tmpdir}/part-${chunk_idx}.profdata" "${chunk[@]}"
+    (( idx += 400, chunk_idx++ ))
+  done
+
+  shopt -s nullglob
+  parts=("${tmpdir}"/*.profdata)
+  shopt -u nullglob
+  (( ${#parts[@]} > 0 )) || return 1
+
+  llvm-profdata merge -sparse -output="$out" "${parts[@]}"
+}
+
+_configure_stage() {
+  local builddir="$1"
+  local extra_cflags="$2"
+  local extra_cxxflags="$3"
+  local extra_ldflags="$4"
+
+  rm -rf "$builddir"
+
+  cmake \
+    -S "${srcdir}/${pkgname}-${pkgver}" \
+    -B "$builddir" \
+    -GNinja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_C_FLAGS="${_base_cflags} ${extra_cflags}" \
+    -DCMAKE_CXX_FLAGS="${_base_cxxflags} ${extra_cxxflags}" \
+    -DCMAKE_EXE_LINKER_FLAGS="${_base_ldflags} ${extra_ldflags}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${_base_ldflags} ${extra_ldflags}" \
+    -DCMAKE_MODULE_LINKER_FLAGS="${_base_ldflags} ${extra_ldflags}" \
+    -DSHADERC_SKIP_TESTS=ON \
+    -Dglslang_SOURCE_DIR=/usr/include/glslang
+
+  ninja -C "$builddir"
+}
+
+_run_glslc_workload() {
+  local builddir="$1"
+  local glslc="${builddir}/glslc/glslc"
+  local work="${srcdir}/shaderc-pgo-work"
+
+  [[ -x "$glslc" ]] || return 0
+
+  rm -rf "$work"
+  mkdir -p "${work}/out" "${work}/include"
+
+  cat > "${work}/include/common.glsl" <<'EOF'
+vec3 tonemap(vec3 c) { return c / (c + vec3(1.0)); }
+EOF
+
+  cat > "${work}/vert.glsl" <<'EOF'
+#version 450
+#include "common.glsl"
+layout(location=0) in vec3 inPos;
+layout(location=1) in vec3 inColor;
+layout(location=0) out vec3 vColor;
+void main() {
+  gl_Position = vec4(inPos, 1.0);
+  vColor = tonemap(inColor);
+}
+EOF
+
+  cat > "${work}/frag.glsl" <<'EOF'
+#version 450
+layout(location=0) in vec3 vColor;
+layout(location=0) out vec4 outColor;
+void main() {
+  outColor = vec4(vColor, 1.0);
+}
+EOF
+
+  cat > "${work}/comp.glsl" <<'EOF'
+#version 450
+layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
+layout(set=0, binding=0) buffer Data { uint v[]; } dataBuf;
+void main() {
+  uint idx = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 1024u;
+  dataBuf.v[idx] = dataBuf.v[idx] * 1664525u + 1013904223u;
+}
+EOF
+
+  cat > "${work}/geom.glsl" <<'EOF'
+#version 450
+layout(triangles) in;
+layout(triangle_strip, max_vertices=3) out;
+void main() {
+  for (int i = 0; i < 3; ++i) {
+    gl_Position = gl_in[i].gl_Position;
+    EmitVertex();
+  }
+  EndPrimitive();
+}
+EOF
+
+  local iter
+  for iter in {1..30}; do
+    "$glslc" --version >/dev/null 2>&1 || true
+    "$glslc" --help >/dev/null 2>&1 || true
+
+    "$glslc" -I"${work}/include" -fshader-stage=vert --target-env=vulkan1.0 -O \
+      -o "${work}/out/vert_vk10.spv" "${work}/vert.glsl" >/dev/null 2>&1 || true
+    "$glslc" -fshader-stage=frag --target-env=vulkan1.2 -Os \
+      -o "${work}/out/frag_vk12.spv" "${work}/frag.glsl" >/dev/null 2>&1 || true
+    "$glslc" -fshader-stage=comp --target-env=vulkan1.3 -O \
+      -o "${work}/out/comp_vk13.spv" "${work}/comp.glsl" >/dev/null 2>&1 || true
+    "$glslc" -fshader-stage=geom --target-env=opengl4.5 -g \
+      -o "${work}/out/geom_gl45.spv" "${work}/geom.glsl" >/dev/null 2>&1 || true
+
+    "$glslc" -E -I"${work}/include" -fshader-stage=vert "${work}/vert.glsl" >/dev/null 2>&1 || true
+    "$glslc" -DQUALITY=1 -fentry-point=main -fshader-stage=vert --target-env=vulkan1.1 \
+      -o "${work}/out/vert_vk11.spv" "${work}/vert.glsl" >/dev/null 2>&1 || true
+  done
+
+  rm -rf "$work"
+}
+
+_run_profile_training() {
+  local builddir="$1"
+  local profdir="$2"
+  local label="$3"
+
+  mkdir -p "$profdir"
+  rm -f "${profdir}"/*.profraw
+
+  # Prevents profraw explosion and keeps profile integrity on parallel runs.
+  export LLVM_PROFILE_FILE="${profdir}/default_%m.profraw"
+  export LLVM_PROFILE_MERGE_POOL_SIZE=16
+
+  echo "==> ${label}: ctest (if any)"
+  ctest --test-dir "$builddir" --output-on-failure -j"$(nproc)" >/dev/null 2>&1 || true
+
+  echo "==> ${label}: comprehensive glslc workload"
+  _run_glslc_workload "$builddir"
+  _run_glslc_workload "$builddir"
+
+  unset LLVM_PROFILE_FILE LLVM_PROFILE_MERGE_POOL_SIZE
+}
+
+prepare() {
+  cd "${pkgname}-${pkgver}"
+
+  # De-vendor libs and disable git versioning.
+  sed '/examples/d;/third_party/d' -i CMakeLists.txt
+  sed '/build-version/d' -i glslc/CMakeLists.txt
+  cat <<- EOF > glslc/src/build-version.inc
+"${pkgver}\\n"
+"$(pacman -Q spirv-tools | cut -d ' ' -f 2 | sed 's/-.*//')\\n"
+"$(pacman -Q glslang | cut -d ' ' -f 2 | sed 's/-.*//')\\n"
+EOF
+}
+
+build() {
+  _setup_llvm_toolchain
+
+  local build_std="${srcdir}/build-pgo-gen"
+  local build_cs="${srcdir}/build-cspgo-gen"
+  local build_opt="${srcdir}/build-opt"
+
+  local pgo_dir="${srcdir}/pgo"
+  local std_raw="${pgo_dir}/standard"
+  local cs_raw="${pgo_dir}/cs"
+  local std_prof="${pgo_dir}/standard.profdata"
+  local cs_prof="${pgo_dir}/cs.profdata"
+  local merged_prof="${pgo_dir}/merged.profdata"
+
+  _base_cflags="${CFLAGS}"
+  _base_cxxflags="${CXXFLAGS}"
+  _base_ldflags="${LDFLAGS}"
+
+  local pgo_common_flags="-fprofile-update=atomic -mllvm -enable-value-profiling"
+  local std_vp_flags="${pgo_common_flags} -mllvm -vp-counters-per-site=16"
+  local cs_vp_flags="${pgo_common_flags} -mllvm -vp-counters-per-site=32"
+  local profile_warn_flags="-Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled"
+
+  rm -rf "$build_std" "$build_cs" "$build_opt" "$pgo_dir"
+  mkdir -p "$std_raw" "$cs_raw"
+
+  echo "=========================================================================="
+  echo " Stage 1/3: Standard IR-PGO instrumentation"
+  echo "=========================================================================="
+  _configure_stage \
+    "$build_std" \
+    "-fprofile-generate=${std_raw} ${std_vp_flags}" \
+    "-fprofile-generate=${std_raw} ${std_vp_flags}" \
+    "-fprofile-generate=${std_raw} -fprofile-update=atomic"
+
+  _run_profile_training "$build_std" "$std_raw" "Stage 1"
+
+  _merge_profraw_dir "$std_prof" "$std_raw" || {
+    echo "ERROR: failed to create standard profile data" >&2
+    return 1
+  }
+
+  echo "=========================================================================="
+  echo " Stage 2/3: Context-sensitive PGO instrumentation"
+  echo "=========================================================================="
+  _configure_stage \
+    "$build_cs" \
+    "-fprofile-use=${std_prof} -fcs-profile-generate=${cs_raw} ${cs_vp_flags} ${profile_warn_flags}" \
+    "-fprofile-use=${std_prof} -fcs-profile-generate=${cs_raw} ${cs_vp_flags} ${profile_warn_flags}" \
+    "-fprofile-use=${std_prof} -fcs-profile-generate=${cs_raw} -fprofile-update=atomic"
+
+  _run_profile_training "$build_cs" "$cs_raw" "Stage 2"
+
+  _merge_profraw_dir "$cs_prof" "$cs_raw" || {
+    echo "ERROR: failed to create context-sensitive profile data" >&2
+    return 1
+  }
+
+  llvm-profdata merge -sparse -output="$merged_prof" "$std_prof" "$cs_prof"
+  [[ -s "$merged_prof" ]] || {
+    echo "ERROR: failed to create merged profile data" >&2
+    return 1
+  }
+
+  echo "=========================================================================="
+  echo " Stage 3/3: Final PGO-optimized build"
+  echo "=========================================================================="
+  _configure_stage \
+    "$build_opt" \
+    "-fprofile-use=${merged_prof} ${profile_warn_flags}" \
+    "-fprofile-use=${merged_prof} ${profile_warn_flags}" \
+    "-fprofile-use=${merged_prof}"
+}
+
+check() {
+  ctest --test-dir "${srcdir}/build-opt" --output-on-failure || true
+}
+
+package() {
+  DESTDIR="${pkgdir}" cmake --install "${srcdir}/build-opt"
+
+  # Remove unused shaderc_static.pc
+  rm -f "${pkgdir}/usr/lib/pkgconfig/shaderc_static.pc"
+}
+
+# vim: ts=2 sw=2 et:
