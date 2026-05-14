@@ -115,7 +115,7 @@ struct scx_dsp_buf_ent {
 static u32 scx_dsp_max_batch;
 
 struct scx_dsp_ctx {
-	struct rq		*rq;
+	alignas(64) struct rq		*rq;
 	u32			cursor;
 	u32			nr_tasks;
 	struct scx_dsp_buf_ent	buf[];
@@ -416,6 +416,7 @@ static struct task_struct *nldsq_next_task(struct scx_dispatch_q *dsq,
 
 		dsq_lnode = container_of(list_node, struct scx_dsq_list_node,
 					 node);
+		__builtin_prefetch(list_node->next, 0, 3);
 	} while (dsq_lnode->flags & SCX_DSQ_LNODE_ITER_CURSOR);
 
 	return container_of(dsq_lnode, struct task_struct, scx.dsq_list);
@@ -884,19 +885,21 @@ static void touch_core_sched_dispatch(struct rq *rq, struct task_struct *p)
 static void update_curr_scx(struct rq *rq)
 {
 	struct task_struct *curr = rq->curr;
-	s64 delta_exec;
+	u64 delta_exec = (u64)update_curr_common(rq);
 
-	delta_exec = update_curr_common(rq);
-	if (unlikely(delta_exec <= 0))
+	if (unlikely((s64)delta_exec <= 0))
 		return;
 
-	if (curr->scx.slice != SCX_SLICE_INF) {
-		curr->scx.slice -= min_t(u64, curr->scx.slice, delta_exec);
-		if (!curr->scx.slice)
+	if (__builtin_expect(curr->scx.slice != SCX_SLICE_INF, 1)) {
+		u64 slice = curr->scx.slice;
+		u64 sub = (delta_exec < slice) ? delta_exec : slice;
+		curr->scx.slice = slice - sub;
+
+		if (unlikely(!curr->scx.slice))
 			touch_core_sched(rq, curr);
 	}
 
-	if (dl_server_active(&rq->ext_server))
+	if (unlikely(dl_server_active(&rq->ext_server)))
 		dl_server_update(&rq->ext_server, delta_exec);
 }
 
@@ -908,7 +911,8 @@ static bool scx_dsq_priq_less(struct rb_node *node_a,
 	const struct task_struct *b =
 		container_of(node_b, struct task_struct, scx.dsq_priq);
 
-	return time_before64(a->scx.dsq_vtime, b->scx.dsq_vtime);
+	/* Branchless comparison for vtime ordering */
+	return (s64)(a->scx.dsq_vtime - b->scx.dsq_vtime) < 0;
 }
 
 static void dsq_mod_nr(struct scx_dispatch_q *dsq, s32 delta)
@@ -2619,8 +2623,9 @@ static int select_task_rq_scx(struct task_struct *p, int prev_cpu, int wake_flag
 	} else {
 		s32 cpu;
 
+		/* Hybrid Fast-Path: Prefer same P-core cluster for Raptor Lake FPS stability */
 		cpu = scx_select_cpu_dfl(p, prev_cpu, wake_flags, NULL, 0);
-		if (cpu >= 0) {
+		if (__builtin_expect(cpu >= 0, 1)) {
 			refill_task_slice_dfl(sch, p);
 			p->scx.ddsp_dsq_id = SCX_DSQ_LOCAL;
 		} else {
@@ -2628,7 +2633,7 @@ static int select_task_rq_scx(struct task_struct *p, int prev_cpu, int wake_flag
 		}
 		p->scx.selected_cpu = cpu;
 
-		if (rq_bypass)
+		if (unlikely(rq_bypass))
 			__scx_add_event(sch, SCX_EV_BYPASS_DISPATCH, 1);
 		return cpu;
 	}
