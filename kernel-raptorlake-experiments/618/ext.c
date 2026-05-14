@@ -115,11 +115,11 @@ struct scx_dsp_buf_ent {
 static u32 scx_dsp_max_batch;
 
 struct scx_dsp_ctx {
-	alignas(64) struct rq		*rq;
+	struct rq		*rq;
 	u32			cursor;
 	u32			nr_tasks;
 	struct scx_dsp_buf_ent	buf[];
-};
+} __aligned(64);
 
 static struct scx_dsp_ctx __percpu *scx_dsp_ctx;
 
@@ -887,7 +887,7 @@ static void update_curr_scx(struct rq *rq)
 	struct task_struct *curr = rq->curr;
 	u64 delta_exec = (u64)update_curr_common(rq);
 
-	if (unlikely((s64)delta_exec <= 0))
+	if (__builtin_expect((s64)delta_exec <= 0, 0))
 		return;
 
 	if (__builtin_expect(curr->scx.slice != SCX_SLICE_INF, 1)) {
@@ -895,11 +895,11 @@ static void update_curr_scx(struct rq *rq)
 		u64 sub = (delta_exec < slice) ? delta_exec : slice;
 		curr->scx.slice = slice - sub;
 
-		if (unlikely(!curr->scx.slice))
+		if (__builtin_expect(!curr->scx.slice, 0))
 			touch_core_sched(rq, curr);
 	}
 
-	if (unlikely(dl_server_active(&rq->ext_server)))
+	if (__builtin_expect(dl_server_active(&rq->ext_server), 0))
 		dl_server_update(&rq->ext_server, delta_exec);
 }
 
@@ -2633,7 +2633,7 @@ static int select_task_rq_scx(struct task_struct *p, int prev_cpu, int wake_flag
 		}
 		p->scx.selected_cpu = cpu;
 
-		if (unlikely(rq_bypass))
+		if (__builtin_expect(rq_bypass, 0))
 			__scx_add_event(sch, SCX_EV_BYPASS_DISPATCH, 1);
 		return cpu;
 	}
