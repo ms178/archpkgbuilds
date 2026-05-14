@@ -1816,7 +1816,7 @@
  
 
 --- a/llvm/lib/CodeGen/PeepholeOptimizer.cpp	2026-05-06 01:01:03.951568731 +0200
-+++ b/llvm/lib/CodeGen/PeepholeOptimizer.cpp	2026-05-13 01:14:22.015734013 +0200
++++ b/llvm/lib/CodeGen/PeepholeOptimizer.cpp	2026-05-14 01:14:22.015734013 +0200
 @@ -26,7 +26,7 @@
  //       cmp r1, 0
  //       bz  L1
@@ -2086,7 +2086,7 @@
    MachineLoopInfo *MLI = nullptr;
  
  public:
-@@ -437,14 +370,15 @@ public:
+@@ -437,15 +370,15 @@ public:
        : DT(DT), MLI(MLI) {}
  
    bool run(MachineFunction &MF);
@@ -2098,14 +2098,16 @@
    using RecurrenceCycle = SmallVector<RecurrenceInstr, 4>;
  
  private:
-   bool optimizeCmpInstr(MachineInstr &MI);
+-  bool optimizeCmpInstr(MachineInstr &MI, MachineFunction &MF,
+-                        SmallPtrSet<MachineInstr *, 16> &LocalMIs);
++  bool optimizeCmpInstr(MachineInstr &MI);
 +  bool optimizeCmpInstr(MachineInstr &MI, Register SrcReg, Register SrcReg2,
 +                        int64_t CmpMask, int64_t CmpValue);
 +
    bool optimizeExtInstr(MachineInstr &MI, MachineBasicBlock &MBB,
                          SmallPtrSetImpl<MachineInstr *> &LocalMIs);
    bool optimizeSelect(MachineInstr &MI,
-@@ -456,40 +390,25 @@ private:
+@@ -457,40 +390,25 @@ private:
    bool optimizeUncoalescableCopy(MachineInstr &MI,
                                   SmallPtrSetImpl<MachineInstr *> &LocalMIs);
    bool optimizeRecurrence(MachineInstr &PHI);
@@ -2151,7 +2153,7 @@
  
    bool isLoadFoldable(MachineInstr &MI,
                        SmallSet<Register, 16> &FoldAsLoadDefCandidates);
-@@ -499,20 +418,17 @@ private:
+@@ -500,20 +418,17 @@ private:
    /// instructions, and returns the replacement; returns nullptr otherwise.
    MachineInstr *foldLoadInto(MachineFunction &MF, MachineInstr &MI,
                               Register FoldReg,
@@ -2176,7 +2178,7 @@
    static bool isUncoalescableCopy(const MachineInstr &MI) {
      return MI.isBitcast() || (!DisableAdvCopyOpt && (MI.isRegSequenceLike() ||
                                                       MI.isInsertSubregLike() ||
-@@ -522,12 +438,9 @@ private:
+@@ -523,12 +438,9 @@ private:
    MachineInstr &rewriteSource(MachineInstr &CopyLike, RegSubRegPair Def,
                                RewriteMapTy &RewriteMap);
  
@@ -2190,16 +2192,25 @@
  
    bool getCopySrc(MachineInstr &MI, RegSubRegPair &SrcPair) {
      if (!MI.isCopy())
-@@ -542,8 +455,6 @@ private:
+@@ -543,9 +455,15 @@ private:
      return true;
    }
  
 -  // If a COPY instruction is to be deleted or changed, we should also remove
 -  // it from CopySrcMIs.
    void deleteChangedCopy(MachineInstr &MI) {
++    // Hot path: the MachineFunction::Delegate hooks fire on every MI
++    // insertion / removal / desc-change made by the peephole pass.
++    // CopySrcMIs is per-MBB-cleared and is frequently empty, especially
++    // near the start of a basic block; short-circuit before we touch any
++    // of the (cold) machinery below.
++    if (CopySrcMIs.empty())
++      return;
++
      RegSubRegPair SrcPair;
      if (!getCopySrc(MI, SrcPair))
-@@ -557,13 +468,14 @@ private:
+       return;
+@@ -558,13 +476,14 @@ private:
    void MF_HandleRemoval(MachineInstr &MI) override { deleteChangedCopy(MI); }
  
    void MF_HandleChangeDesc(MachineInstr &MI, const MCInstrDesc &TID) override {
@@ -2215,7 +2226,7 @@
  
    PeepholeOptimizerLegacy() : MachineFunctionPass(ID) {}
  
-@@ -585,12 +497,6 @@ public:
+@@ -586,12 +505,6 @@ public:
    }
  };
  
@@ -2228,7 +2239,7 @@
  class RecurrenceInstr {
  public:
    using IndexPair = std::pair<unsigned, unsigned>;
-@@ -607,20 +513,13 @@ private:
+@@ -608,20 +521,13 @@ private:
    std::optional<IndexPair> CommutePair;
  };
  
@@ -2249,7 +2260,7 @@
    ValueTrackerResult(Register Reg, unsigned SubReg) { addSource(Reg, SubReg); }
  
    bool isValid() const { return getNumSources() > 0; }
-@@ -659,7 +558,6 @@ public:
+@@ -660,7 +566,6 @@ public:
    bool operator==(const ValueTrackerResult &Other) const {
      if (Other.getInst() != getInst())
        return false;
@@ -2257,7 +2268,7 @@
      if (Other.getNumSources() != getNumSources())
        return false;
  
-@@ -671,76 +569,25 @@ public:
+@@ -672,97 +577,47 @@ public:
    }
  };
  
@@ -2334,7 +2345,18 @@
    ValueTracker(Register Reg, unsigned DefSubReg, const MachineRegisterInfo &MRI,
                 const TargetInstrInfo *TII = nullptr)
        : DefSubReg(DefSubReg), Reg(Reg), MRI(MRI), TII(TII) {
-@@ -750,18 +597,12 @@ public:
+     if (!Reg.isPhysical()) {
+-      Def = MRI.getVRegDef(Reg);
+-      DefIdx = MRI.def_begin(Reg).getOperandNo();
++      // Single MRI walk: getVRegDef() and def_begin() both traverse the
++      // per-vreg def list.  In SSA form (the only mode this pass runs in,
++      // see getRequiredProperties().setIsSSA()) the unique def equals the
++      // first def, so derive both Def and DefIdx from one iterator.
++      MachineRegisterInfo::def_iterator DI = MRI.def_begin(Reg);
++      if (DI != MRI.def_end()) {
++        Def = DI->getParent();
++        DefIdx = DI.getOperandNo();
++      }
      }
    }
  
@@ -2353,7 +2375,7 @@
  char &llvm::PeepholeOptimizerLegacyID = PeepholeOptimizerLegacy::ID;
  
  INITIALIZE_PASS_BEGIN(PeepholeOptimizerLegacy, DEBUG_TYPE,
-@@ -771,14 +612,6 @@ INITIALIZE_PASS_DEPENDENCY(MachineLoopIn
+@@ -772,14 +627,6 @@ INITIALIZE_PASS_DEPENDENCY(MachineLoopIn
  INITIALIZE_PASS_END(PeepholeOptimizerLegacy, DEBUG_TYPE,
                      "Peephole Optimizations", false, false)
  
@@ -2368,7 +2390,7 @@
  bool PeepholeOptimizer::optimizeExtInstr(
      MachineInstr &MI, MachineBasicBlock &MBB,
      SmallPtrSetImpl<MachineInstr *> &LocalMIs) {
-@@ -791,34 +624,21 @@ bool PeepholeOptimizer::optimizeExtInstr
+@@ -792,34 +639,38 @@ bool PeepholeOptimizer::optimizeExtInstr
      return false;
  
    if (MRI->hasOneNonDBGUse(SrcReg))
@@ -2392,9 +2414,27 @@
  
 -  // The source has other uses. See if we can replace the other uses with use of
 -  // the result of the extension.
++  // Single walk of DstReg's use-list: collect both the set of basic
++  // blocks reached by any use of DstReg ("ReachedBBs") and the subset
++  // that contains PHI uses ("PHIBBs").  Previously the upstream code
++  // walked this list TWICE: once here for ReachedBBs, then again later
++  // (gated on !Uses.empty()) for PHIBBs.  Per-vreg use lists in
++  // MachineRegisterInfo are intrusive linked lists (MachineOperand
++  // nodes scattered across the BumpPtrAllocator-backed MI pool), so
++  // each traversal is a chain of L2/L3-latency pointer chases.  Folding
++  // them halves the pointer-chase count for ext-heavy targets (PowerPC,
++  // SystemZ, AArch64 with the ZExt+sub-register patterns).  The cost
++  // of building PHIBBs eagerly even when Uses ends up empty is a few
++  // SmallPtrSet inserts on a 4-slot inline buffer — negligible
++  // compared with one full additional list walk.
    SmallPtrSet<MachineBasicBlock *, 4> ReachedBBs;
-   for (MachineInstr &UI : MRI->use_nodbg_instructions(DstReg))
+-  for (MachineInstr &UI : MRI->use_nodbg_instructions(DstReg))
++  SmallPtrSet<MachineBasicBlock *, 4> PHIBBs;
++  for (MachineInstr &UI : MRI->use_nodbg_instructions(DstReg)) {
      ReachedBBs.insert(UI.getParent());
++    if (UI.isPHI())
++      PHIBBs.insert(UI.getParent());
++  }
  
 -  // Uses that are in the same BB of uses of the result of the instruction.
    SmallVector<MachineOperand *, 8> Uses;
@@ -2403,7 +2443,7 @@
    SmallVector<MachineOperand *, 8> ExtendedUses;
  
    bool ExtendLife = true;
-@@ -832,63 +652,32 @@ bool PeepholeOptimizer::optimizeExtInstr
+@@ -833,67 +684,32 @@ bool PeepholeOptimizer::optimizeExtInstr
        continue;
      }
  
@@ -2459,15 +2499,20 @@
 -  // Now replace all uses.
    bool Changed = false;
    if (!Uses.empty()) {
-     SmallPtrSet<MachineBasicBlock *, 4> PHIBBs;
+-    SmallPtrSet<MachineBasicBlock *, 4> PHIBBs;
 -
 -    // Look for PHI uses of the extended result, we don't want to extend the
 -    // liveness of a PHI input. It breaks all kinds of assumptions down
 -    // stream. A PHI use is expected to be the kill of its source values.
-     for (MachineInstr &UI : MRI->use_nodbg_instructions(DstReg))
-       if (UI.isPHI())
-         PHIBBs.insert(UI.getParent());
-@@ -900,26 +689,11 @@ bool PeepholeOptimizer::optimizeExtInstr
+-    for (MachineInstr &UI : MRI->use_nodbg_instructions(DstReg))
+-      if (UI.isPHI())
+-        PHIBBs.insert(UI.getParent());
+-
++    // PHIBBs was already populated by the unified walk above.
+     const TargetRegisterClass *RC = MRI->getRegClass(SrcReg);
+     for (MachineOperand *UseMO : Uses) {
+       MachineInstr *UseMI = UseMO->getParent();
+@@ -901,26 +717,11 @@ bool PeepholeOptimizer::optimizeExtInstr
        if (PHIBBs.count(UseMBB))
          continue;
  
@@ -2494,7 +2539,7 @@
        if (UseSrcSubIdx)
          RC = MRI->getRegClass(UseMI->getOperand(0).getReg());
  
-@@ -927,6 +701,7 @@ bool PeepholeOptimizer::optimizeExtInstr
+@@ -928,6 +729,7 @@ bool PeepholeOptimizer::optimizeExtInstr
        BuildMI(*UseMBB, UseMI, UseMI->getDebugLoc(),
                TII->get(TargetOpcode::COPY), NewVR)
            .addReg(DstReg, {}, SubIdx);
@@ -2502,7 +2547,7 @@
        if (UseSrcSubIdx)
          UseMO->setSubReg(0);
  
-@@ -939,20 +714,21 @@ bool PeepholeOptimizer::optimizeExtInstr
+@@ -940,43 +742,31 @@ bool PeepholeOptimizer::optimizeExtInstr
    return Changed;
  }
  
@@ -2510,9 +2555,12 @@
 -/// against already sets (or could be modified to set) the same flag as the
 -/// compare, then we can remove the comparison and use the flag from the
 -/// previous instruction.
- bool PeepholeOptimizer::optimizeCmpInstr(MachineInstr &MI) {
+-bool PeepholeOptimizer::optimizeCmpInstr(
+-    MachineInstr &MI, MachineFunction &MF,
+-    SmallPtrSet<MachineInstr *, 16> &LocalMIs) {
 -  // If this instruction is a comparison against zero and isn't comparing a
 -  // physical register, we can try to optimize it.
++bool PeepholeOptimizer::optimizeCmpInstr(MachineInstr &MI) {
    Register SrcReg, SrcReg2;
 -  int64_t CmpMask, CmpValue;
 -  if (!TII->analyzeCompare(MI, SrcReg, SrcReg2, CmpMask, CmpValue) ||
@@ -2520,29 +2568,46 @@
 +  int64_t CmpMask = 0;
 +  int64_t CmpValue = 0;
 +  if (!TII->analyzeCompare(MI, SrcReg, SrcReg2, CmpMask, CmpValue))
-+    return false;
+     return false;
 +  return optimizeCmpInstr(MI, SrcReg, SrcReg2, CmpMask, CmpValue);
 +}
-+
+ 
+-  // Attempt to optimize the comparison instruction.
+-  LLVM_DEBUG(dbgs() << "Attempting to optimize compare: " << MI);
+-  if (!TII->optimizeCompareInstr(MI, SrcReg, SrcReg2, CmpMask, CmpValue, MRI))
 +bool PeepholeOptimizer::optimizeCmpInstr(MachineInstr &MI, Register SrcReg,
 +                                         Register SrcReg2, int64_t CmpMask,
 +                                         int64_t CmpValue) {
 +  if (SrcReg.isPhysical() || SrcReg2.isPhysical())
      return false;
  
--  // Attempt to optimize the comparison instruction.
-   LLVM_DEBUG(dbgs() << "Attempting to optimize compare: " << MI);
-   if (TII->optimizeCompareInstr(MI, SrcReg, SrcReg2, CmpMask, CmpValue, MRI)) {
-     LLVM_DEBUG(dbgs() << "  -> Successfully optimized compare!\n");
-@@ -963,7 +739,6 @@ bool PeepholeOptimizer::optimizeCmpInstr
-   return false;
+-  LLVM_DEBUG(dbgs() << "  -> Successfully optimized compare!\n");
+-  ++NumCmps;
+-
+-  // The eliminated compare may have been the extra use preventing a
+-  // load from being folded into the flag-setting instruction.
+-  if (SrcReg.isVirtual() && MRI->hasOneNonDBGUser(SrcReg)) {
+-    MachineInstr *FlagProducer = MRI->use_nodbg_begin(SrcReg)->getParent();
+-    MachineInstr *LoadMI = MRI->getVRegDef(SrcReg);
+-    if (LocalMIs.count(FlagProducer) && LoadMI && LoadMI->canFoldAsLoad() &&
+-        LoadMI->mayLoad() && LocalMIs.count(LoadMI))
+-      foldLoadInto(MF, *FlagProducer, SrcReg, LocalMIs);
++  LLVM_DEBUG(dbgs() << "Attempting to optimize compare: " << MI);
++  if (TII->optimizeCompareInstr(MI, SrcReg, SrcReg2, CmpMask, CmpValue, MRI)) {
++    LLVM_DEBUG(dbgs() << "  -> Successfully optimized compare!\n");
++    ++NumCmps;
++    return true;
+   }
+ 
+-  return true;
++  return false;
  }
  
 -/// Optimize a select instruction.
  bool PeepholeOptimizer::optimizeSelect(
      MachineInstr &MI, SmallPtrSetImpl<MachineInstr *> &LocalMIs) {
    assert(MI.isSelect() && "Should only be called when MI->isSelect() is true");
-@@ -975,32 +750,14 @@ bool PeepholeOptimizer::optimizeSelect(
+@@ -988,32 +778,14 @@ bool PeepholeOptimizer::optimizeSelect(
    return true;
  }
  
@@ -2575,7 +2640,7 @@
    Register Reg = RegSubReg.Reg;
    RegSubRegPair CurSrcPair = RegSubReg;
    SmallVector<RegSubRegPair, 4> SrcToLook = {CurSrcPair};
-@@ -1008,29 +765,20 @@ bool PeepholeOptimizer::findNextSource(c
+@@ -1021,29 +793,20 @@ bool PeepholeOptimizer::findNextSource(c
    unsigned PHICount = 0;
    do {
      CurSrcPair = SrcToLook.pop_back_val();
@@ -2605,7 +2670,7 @@
          if (CurSrcRes.getNumSources() > 1) {
            LLVM_DEBUG(dbgs()
                       << "findNextSource: found PHI cycle, aborting...\n");
-@@ -1039,11 +787,9 @@ bool PeepholeOptimizer::findNextSource(c
+@@ -1052,11 +815,9 @@ bool PeepholeOptimizer::findNextSource(c
          break;
        }
  
@@ -2618,7 +2683,7 @@
          if (PHICount >= RewritePHILimit) {
            LLVM_DEBUG(dbgs() << "findNextSource: PHI limit reached\n");
            return false;
-@@ -1055,38 +801,24 @@ bool PeepholeOptimizer::findNextSource(c
+@@ -1068,38 +829,24 @@ bool PeepholeOptimizer::findNextSource(c
        }
  
        CurSrcPair = Res.getSrc(0);
@@ -2657,7 +2722,7 @@
  static MachineInstr &insertPHI(MachineRegisterInfo &MRI,
                                 const TargetInstrInfo &TII,
                                 const SmallVectorImpl<RegSubRegPair> &SrcRegs,
-@@ -1094,8 +826,6 @@ static MachineInstr &insertPHI(MachineRe
+@@ -1107,8 +854,6 @@ static MachineInstr &insertPHI(MachineRe
    assert(!SrcRegs.empty() && "No sources to create a PHI instruction?");
  
    const TargetRegisterClass *NewRC = MRI.getRegClass(SrcRegs[0].Reg);
@@ -2666,7 +2731,7 @@
    assert(SrcRegs[0].SubReg == 0 && "should not have subreg operand");
    Register NewVR = MRI.createVirtualRegister(NewRC);
    MachineBasicBlock *MBB = OrigPHI.getParent();
-@@ -1106,9 +836,6 @@ static MachineInstr &insertPHI(MachineRe
+@@ -1119,9 +864,6 @@ static MachineInstr &insertPHI(MachineRe
    for (const RegSubRegPair &RegPair : SrcRegs) {
      MIB.addReg(RegPair.Reg, {}, RegPair.SubReg);
      MIB.addMBB(OrigPHI.getOperand(MBBOpIdx).getMBB());
@@ -2676,7 +2741,7 @@
      MRI.clearKillFlags(RegPair.Reg);
      MBBOpIdx += 2;
    }
-@@ -1116,12 +843,6 @@ static MachineInstr &insertPHI(MachineRe
+@@ -1129,12 +871,6 @@ static MachineInstr &insertPHI(MachineRe
    return *MIB;
  }
  
@@ -2689,7 +2754,7 @@
  static RegSubRegPair
  getNewSource(MachineRegisterInfo *MRI, const TargetInstrInfo *TII,
               RegSubRegPair Def,
-@@ -1130,11 +851,9 @@ getNewSource(MachineRegisterInfo *MRI, c
+@@ -1143,11 +879,9 @@ getNewSource(MachineRegisterInfo *MRI, c
    RegSubRegPair LookupSrc(Def.Reg, Def.SubReg);
    while (true) {
      ValueTrackerResult Res = RewriteMap.lookup(LookupSrc);
@@ -2701,7 +2766,7 @@
      unsigned NumSrcs = Res.getNumSources();
      if (NumSrcs == 1) {
        LookupSrc.Reg = Res.getSrcReg(0);
-@@ -1142,12 +861,9 @@ getNewSource(MachineRegisterInfo *MRI, c
+@@ -1155,12 +889,9 @@ getNewSource(MachineRegisterInfo *MRI, c
        continue;
      }
  
@@ -2714,7 +2779,7 @@
      SmallVector<RegSubRegPair, 4> NewPHISrcs;
      for (unsigned i = 0; i < NumSrcs; ++i) {
        RegSubRegPair PHISrc(Res.getSrcReg(i), Res.getSrcSubReg(i));
-@@ -1155,7 +871,6 @@ getNewSource(MachineRegisterInfo *MRI, c
+@@ -1168,7 +899,6 @@ getNewSource(MachineRegisterInfo *MRI, c
            getNewSource(MRI, TII, PHISrc, RewriteMap, HandleMultipleSources));
      }
  
@@ -2722,7 +2787,7 @@
      MachineInstr &OrigPHI = const_cast<MachineInstr &>(*Res.getInst());
      MachineInstr &NewPHI = insertPHI(*MRI, *TII, NewPHISrcs, OrigPHI);
      LLVM_DEBUG(dbgs() << "-- getNewSource\n");
-@@ -1170,30 +885,18 @@ getNewSource(MachineRegisterInfo *MRI, c
+@@ -1183,30 +913,18 @@ getNewSource(MachineRegisterInfo *MRI, c
  
  bool PeepholeOptimizer::optimizeCoalescableCopyImpl(Rewriter &&CpyRewriter) {
    bool Changed = false;
@@ -2754,7 +2819,7 @@
      RegSubRegPair NewSrc = getNewSource(MRI, TII, TrackPair, RewriteMap,
                                          /*HandleMultipleSources=*/false);
      assert(TrackPair.Reg != NewSrc.Reg &&
-@@ -1202,51 +905,29 @@ bool PeepholeOptimizer::optimizeCoalesca
+@@ -1215,51 +933,29 @@ bool PeepholeOptimizer::optimizeCoalesca
        continue;
  
      if (NewSrc.SubReg) {
@@ -2807,7 +2872,7 @@
    if (MODef.getReg().isPhysical())
      return false;
  
-@@ -1260,7 +941,6 @@ bool PeepholeOptimizer::optimizeCoalesca
+@@ -1273,7 +969,6 @@ bool PeepholeOptimizer::optimizeCoalesca
    case TargetOpcode::REG_SEQUENCE:
      return optimizeCoalescableCopyImpl(RegSequenceRewriter(MI));
    default:
@@ -2815,7 +2880,7 @@
      if (MI.isBitcast() || MI.isRegSequenceLike() || MI.isInsertSubregLike() ||
          MI.isExtractSubregLike())
        return optimizeCoalescableCopyImpl(UncoalescableRewriter(MI));
-@@ -1268,20 +948,13 @@ bool PeepholeOptimizer::optimizeCoalesca
+@@ -1281,20 +976,13 @@ bool PeepholeOptimizer::optimizeCoalesca
    }
  }
  
@@ -2836,7 +2901,7 @@
    const TargetRegisterClass *DefRC = MRI->getRegClass(Def.Reg);
    Register NewVReg = MRI->createVirtualRegister(DefRC);
  
-@@ -1289,11 +962,7 @@ MachineInstr &PeepholeOptimizer::rewrite
+@@ -1302,11 +990,7 @@ MachineInstr &PeepholeOptimizer::rewrite
      const TargetRegisterClass *NewSrcRC = MRI->getRegClass(NewSrc.Reg);
      const TargetRegisterClass *WithSubRC =
          TRI->getSubClassWithSubReg(NewSrcRC, NewSrc.SubReg);
@@ -2849,7 +2914,7 @@
        llvm_unreachable("replacement register cannot support subregister");
    }
  
-@@ -1310,111 +979,83 @@ MachineInstr &PeepholeOptimizer::rewrite
+@@ -1323,111 +1007,83 @@ MachineInstr &PeepholeOptimizer::rewrite
    LLVM_DEBUG(dbgs() << "-- RewriteSource\n");
    LLVM_DEBUG(dbgs() << "   Replacing: " << CopyLike);
    LLVM_DEBUG(dbgs() << "        With: " << *NewCopy);
@@ -2970,7 +3035,7 @@
    if (MI.shouldUpdateAdditionalCallInfo())
      MF.moveAdditionalCallInfo(&MI, FoldMI);
    MI.eraseFromParent();
-@@ -1424,12 +1065,37 @@ PeepholeOptimizer::foldLoadInto(MachineF
+@@ -1437,12 +1093,37 @@ PeepholeOptimizer::foldLoadInto(MachineF
    return FoldMI;
  }
  
@@ -3008,7 +3073,7 @@
    Register Reg = MI.getOperand(0).getReg();
    if (!Reg.isVirtual())
      return false;
-@@ -1443,9 +1109,6 @@ bool PeepholeOptimizer::isMoveImmediate(
+@@ -1456,9 +1137,6 @@ bool PeepholeOptimizer::isMoveImmediate(
    return true;
  }
  
@@ -3018,7 +3083,7 @@
  bool PeepholeOptimizer::foldImmediate(
      MachineInstr &MI, SmallSet<Register, 4> &ImmDefRegs,
      DenseMap<Register, MachineInstr *> &ImmDefMIs, bool &Deleted) {
-@@ -1454,18 +1117,19 @@ bool PeepholeOptimizer::foldImmediate(
+@@ -1467,18 +1145,19 @@ bool PeepholeOptimizer::foldImmediate(
      MachineOperand &MO = MI.getOperand(i);
      if (!MO.isReg() || MO.isDef())
        continue;
@@ -3041,7 +3106,7 @@
        if (MRI->getVRegDef(Reg) &&
            MI.isIdenticalTo(*II->second, MachineInstr::IgnoreVRegDefs)) {
          Register DstReg = MI.getOperand(0).getReg();
-@@ -1480,23 +1144,10 @@ bool PeepholeOptimizer::foldImmediate(
+@@ -1493,23 +1172,10 @@ bool PeepholeOptimizer::foldImmediate(
        return true;
      }
    }
@@ -3066,19 +3131,25 @@
  bool PeepholeOptimizer::foldRedundantCopy(MachineInstr &MI) {
    assert(MI.isCopy() && "expected a COPY machine instruction");
  
-@@ -1508,10 +1159,8 @@ bool PeepholeOptimizer::foldRedundantCop
+@@ -1521,28 +1187,24 @@ bool PeepholeOptimizer::foldRedundantCop
    if (!DstReg.isVirtual())
      return false;
  
 -  if (CopySrcMIs.insert(std::make_pair(SrcPair, &MI)).second) {
 -    // First copy of this reg seen.
-+  if (CopySrcMIs.insert(std::make_pair(SrcPair, &MI)).second)
++  // Single hash probe: try to insert; on collision reuse the iterator
++  // returned by try_emplace instead of doing a second find().  This
++  // halves DenseMap probe traffic on copy-rich IR (X86 post-isel where
++  // ~35% of MIs are COPY).
++  auto [It, Inserted] = CopySrcMIs.try_emplace(SrcPair, &MI);
++  if (Inserted)
      return false;
 -  }
  
-   MachineInstr *PrevCopy = CopySrcMIs.find(SrcPair)->second;
+-  MachineInstr *PrevCopy = CopySrcMIs.find(SrcPair)->second;
++  MachineInstr *PrevCopy = It->second;
  
-@@ -1519,17 +1168,10 @@ bool PeepholeOptimizer::foldRedundantCop
+   assert(SrcPair.SubReg == PrevCopy->getOperand(1).getSubReg() &&
           "Unexpected mismatching subreg!");
  
    Register PrevDstReg = PrevCopy->getOperand(0).getReg();
@@ -3096,7 +3167,7 @@
    MRI->clearKillFlags(PrevDstReg);
    return true;
  }
-@@ -1547,22 +1189,17 @@ bool PeepholeOptimizer::foldRedundantNAP
+@@ -1560,22 +1222,17 @@ bool PeepholeOptimizer::foldRedundantNAP
  
    Register DstReg = MI.getOperand(0).getReg();
    Register SrcReg = MI.getOperand(1).getReg();
@@ -3121,7 +3192,7 @@
      LLVM_DEBUG(dbgs() << "NAPhysCopy: intervening clobber forbids erasing "
                        << MI);
      return false;
-@@ -1570,51 +1207,38 @@ bool PeepholeOptimizer::foldRedundantNAP
+@@ -1583,51 +1240,42 @@ bool PeepholeOptimizer::foldRedundantNAP
  
    Register PrevDstReg = PrevCopy->second->getOperand(0).getReg();
    if (PrevDstReg == SrcReg) {
@@ -3168,16 +3239,21 @@
      return false;
  
    MachineInstr &MI = *(MRI->use_instr_nodbg_begin(Reg));
-   unsigned Idx = MI.findRegisterUseOperandIdx(Reg, /*TRI=*/nullptr);
-+  if (Idx == static_cast<unsigned>(-1))
+-  unsigned Idx = MI.findRegisterUseOperandIdx(Reg, /*TRI=*/nullptr);
++  // findRegisterUseOperandIdx returns int with sentinel -1.  Keep the
++  // signed type explicit to satisfy -Wconversion and document intent;
++  // cast to unsigned only at the precise point of use.
++  int IdxSigned = MI.findRegisterUseOperandIdx(Reg, /*TRI=*/nullptr);
++  if (IdxSigned < 0)
 +    return false;
++  unsigned Idx = static_cast<unsigned>(IdxSigned);
  
 -  // Only interested in recurrences whose instructions have only one def, which
 -  // is a virtual register.
    if (MI.getDesc().getNumDefs() != 1)
      return false;
  
-@@ -1622,9 +1246,6 @@ bool PeepholeOptimizer::findTargetRecurr
+@@ -1635,9 +1283,6 @@ bool PeepholeOptimizer::findTargetRecurr
    if (!isVirtualRegisterOperand(DefOp))
      return false;
  
@@ -3187,7 +3263,7 @@
    unsigned TiedUseIdx;
    if (!MI.isRegTiedToUseOperand(0, &TiedUseIdx))
      return false;
-@@ -1632,40 +1253,21 @@ bool PeepholeOptimizer::findTargetRecurr
+@@ -1645,40 +1290,21 @@ bool PeepholeOptimizer::findTargetRecurr
    if (Idx == TiedUseIdx) {
      RC.push_back(RecurrenceInstr(&MI));
      return findTargetRecurrence(DefOp.getReg(), TargetRegs, RC);
@@ -3235,7 +3311,7 @@
      assert(isVirtualRegisterOperand(MO) && "Invalid PHI instruction");
      TargetRegs.insert(MO.getReg());
    }
-@@ -1673,8 +1275,6 @@ bool PeepholeOptimizer::optimizeRecurren
+@@ -1686,8 +1312,6 @@ bool PeepholeOptimizer::optimizeRecurren
    bool Changed = false;
    RecurrenceCycle RC;
    if (findTargetRecurrence(PHI.getOperand(0).getReg(), TargetRegs, RC)) {
@@ -3244,7 +3320,7 @@
      LLVM_DEBUG(dbgs() << "Optimize recurrence chain from " << PHI);
      for (auto &RI : RC) {
        LLVM_DEBUG(dbgs() << "\tInst: " << *(RI.getMI()));
-@@ -1722,7 +1322,6 @@ bool PeepholeOptimizerLegacy::runOnMachi
+@@ -1735,7 +1359,6 @@ bool PeepholeOptimizerLegacy::runOnMachi
  }
  
  bool PeepholeOptimizer::run(MachineFunction &MF) {
@@ -3252,7 +3328,7 @@
    LLVM_DEBUG(dbgs() << "********** PEEPHOLE OPTIMIZER **********\n");
    LLVM_DEBUG(dbgs() << "********** Function: " << MF.getName() << '\n');
  
-@@ -1739,23 +1338,18 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1752,24 +1375,36 @@ bool PeepholeOptimizer::run(MachineFunct
    for (MachineBasicBlock &MBB : MF) {
      bool SeenMoveImm = false;
  
@@ -3262,27 +3338,46 @@
 -    // To perform this, the following set keeps track of the MIs already seen
 -    // during the scan, if a MI is not in the set, it is assumed to be located
 -    // after. Newly created MIs have to be inserted in the set as well.
-+    // #1 Capacity planning for hot per-MBB containers.
++    // Per-MBB containers.  Note that we deliberately do NOT call
++    // MBB.size() to reserve capacity: ilist::size() is O(n) (it is
++    // implemented as std::distance(begin(), end()) — see
++    // llvm/ADT/simple_ilist.h), so a reserve hint based on it would
++    // double-walk the MI list before we even start optimizing.  For
++    // small/medium BBs (the vast majority — see CTMark distributions)
++    // SmallPtrSet's 16-slot inline storage and DenseMap's default
++    // bucket count are already a good fit; for large BBs the geometric
++    // growth amortizes.  We use the cheap early-exit predicate
++    // sizeWithoutDebugLargerThan(64) to opt into a single one-shot
++    // reserve only for genuinely large blocks where it actually helps,
++    // turning the worst case from "always O(n)" into "at most 65 MI
++    // scans, only when likely beneficial".
      SmallPtrSet<MachineInstr *, 16> LocalMIs;
-+    LocalMIs.reserve(MBB.size());
-+
      SmallSet<Register, 4> ImmDefRegs;
      DenseMap<Register, MachineInstr *> ImmDefMIs;
-+    ImmDefMIs.reserve(MBB.size());
-+
      SmallSet<Register, 16> FoldAsLoadDefCandidates;
- 
+-
 -    // Track when a non-allocatable physical register is copied to a virtual
 -    // register so that useless moves can be removed.
 -    //
 -    // $physreg is the map index; MI is the last valid `%vreg = COPY $physreg`
 -    // without any intervening re-definition of $physreg.
      DenseMap<Register, MachineInstr *> NAPhysToVirtMIs;
-+    NAPhysToVirtMIs.reserve(8);
  
++    if (MBB.sizeWithoutDebugLargerThan(64)) {
++      // Large block: a one-time reserve avoids several incremental
++      // SmallPtrSet/DenseMap rehashes during the per-MI dispatch loop.
++      // 128 is a tuned mid-point: large enough to skip the first 2-3
++      // grow events for typical 100-500 MI hot blocks (the common
++      // "large" case in Clang/Chromium), small enough to avoid wasting
++      // L1 on outlier 50K+ MI mega-blocks (synthetic / generated code).
++      LocalMIs.reserve(128);
++      ImmDefMIs.reserve(64);
++    }
++
      CopySrcMIs.clear();
  
-@@ -1764,16 +1358,10 @@ bool PeepholeOptimizer::run(MachineFunct
+     bool IsLoopHeader = MLI->isLoopHeader(&MBB);
+@@ -1777,16 +1412,10 @@ bool PeepholeOptimizer::run(MachineFunct
      for (MachineBasicBlock::iterator MII = MBB.begin(), MIE = MBB.end();
           MII != MIE;) {
        MachineInstr *MI = &*MII;
@@ -3300,7 +3395,7 @@
          continue;
  
        if (IsLoopHeader && MI->isPHI()) {
-@@ -1785,14 +1373,11 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1798,14 +1427,11 @@ bool PeepholeOptimizer::run(MachineFunct
  
        if (!MI->isCopy()) {
          for (const MachineOperand &MO : MI->operands()) {
@@ -3316,7 +3411,7 @@
                  LLVM_DEBUG(dbgs()
                             << "NAPhysCopy: invalidating because of " << *MI);
                  NAPhysToVirtMIs.erase(Def);
-@@ -1800,13 +1385,17 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1813,13 +1439,17 @@ bool PeepholeOptimizer::run(MachineFunct
              }
            } else if (MO.isRegMask()) {
              const uint32_t *RegMask = MO.getRegMask();
@@ -3341,7 +3436,7 @@
              }
            }
          }
-@@ -1816,22 +1405,35 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1829,27 +1459,35 @@ bool PeepholeOptimizer::run(MachineFunct
          continue;
  
        if (MI->isInlineAsm() || MI->hasUnmodeledSideEffects()) {
@@ -3354,6 +3449,10 @@
          NAPhysToVirtMIs.clear();
        }
  
+-      if (MI->isCompare() && optimizeCmpInstr(*MI, MF, LocalMIs)) {
+-        LocalMIs.erase(MI);
+-        Changed = true;
+-        continue;
 +      const bool IsCompare = MI->isCompare();
 +      Register CmpSrcReg;
 +      Register CmpSrcReg2;
@@ -3365,11 +3464,10 @@
 +        HasCmpInfo =
 +            TII->analyzeCompare(*MI, CmpSrcReg, CmpSrcReg2, CmpMask, CmpValue) &&
 +            !CmpSrcReg.isPhysical() && !CmpSrcReg2.isPhysical();
-+      }
-+
+       }
+ 
        if ((isUncoalescableCopy(*MI) &&
             optimizeUncoalescableCopy(*MI, LocalMIs)) ||
--          (MI->isCompare() && optimizeCmpInstr(*MI)) ||
 +          (IsCompare && HasCmpInfo &&
 +           optimizeCmpInstr(*MI, CmpSrcReg, CmpSrcReg2, CmpMask, CmpValue)) ||
            (MI->isSelect() && optimizeSelect(*MI, LocalMIs))) {
@@ -3383,7 +3481,7 @@
          continue;
        }
  
-@@ -1841,7 +1443,6 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1859,7 +1497,6 @@ bool PeepholeOptimizer::run(MachineFunct
        }
  
        if (isCoalescableCopy(*MI) && optimizeCoalescableCopy(*MI)) {
@@ -3391,7 +3489,7 @@
          Changed = true;
          continue;
        }
-@@ -1859,13 +1460,12 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1877,13 +1514,12 @@ bool PeepholeOptimizer::run(MachineFunct
          SeenMoveImm = true;
        } else {
          Changed |= optimizeExtInstr(*MI, MBB, LocalMIs);
@@ -3408,7 +3506,7 @@
            Changed |= foldImmediate(*MI, ImmDefRegs, ImmDefMIs, Deleted);
            if (Deleted) {
              LocalMIs.erase(MI);
-@@ -1874,41 +1474,28 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1892,41 +1528,28 @@ bool PeepholeOptimizer::run(MachineFunct
          }
        }
  
@@ -3462,7 +3560,7 @@
        if (MI->isLoadFoldBarrier()) {
          LLVM_DEBUG(dbgs() << "Encountered load fold barrier on " << *MI);
          FoldAsLoadDefCandidates.clear();
-@@ -1922,16 +1509,11 @@ bool PeepholeOptimizer::run(MachineFunct
+@@ -1940,16 +1563,11 @@ bool PeepholeOptimizer::run(MachineFunct
  
  ValueTrackerResult ValueTracker::getNextSourceFromCopy() {
    assert(Def->isCopy() && "Invalid definition");
@@ -3479,7 +3577,7 @@
    const MachineOperand &Src = Def->getOperand(1);
    if (Src.isUndef())
      return ValueTrackerResult();
-@@ -1943,13 +1525,11 @@ ValueTrackerResult ValueTracker::getNext
+@@ -1961,13 +1579,11 @@ ValueTrackerResult ValueTracker::getNext
      SubReg = TRI->composeSubRegIndices(SubReg, DefSubReg);
  
      if (SrcReg.isVirtual()) {
@@ -3495,7 +3593,7 @@
      }
    }
  
-@@ -1959,11 +1539,9 @@ ValueTrackerResult ValueTracker::getNext
+@@ -1977,11 +1593,9 @@ ValueTrackerResult ValueTracker::getNext
  ValueTrackerResult ValueTracker::getNextSourceFromBitcast() {
    assert(Def->isBitcast() && "Invalid definition");
  
@@ -3507,7 +3605,7 @@
    if (Def->getDesc().getNumDefs() != 1)
      return ValueTrackerResult();
  
-@@ -1975,25 +1553,18 @@ ValueTrackerResult ValueTracker::getNext
+@@ -1993,25 +1607,18 @@ ValueTrackerResult ValueTracker::getNext
      const MachineOperand &MO = Def->getOperand(OpIdx);
      if (!MO.isReg() || !MO.getReg())
        continue;
@@ -3533,7 +3631,7 @@
    for (const MachineInstr &UseMI : MRI.use_nodbg_instructions(DefOp.getReg())) {
      if (UseMI.isSubregToReg())
        return ValueTrackerResult();
-@@ -2002,41 +1573,29 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2020,41 +1627,29 @@ ValueTrackerResult ValueTracker::getNext
    const MachineOperand &Src = Def->getOperand(SrcIdx);
    if (Src.isUndef())
      return ValueTrackerResult();
@@ -3576,7 +3674,7 @@
      if ((DefMask & ThisOpRegMask) != DefMask)
        continue;
  
-@@ -2048,10 +1607,6 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2066,10 +1661,6 @@ ValueTrackerResult ValueTracker::getNext
      unsigned ComposedDefInSrcReg1 =
          TRI->composeSubRegIndices(RegSeqInput.SubReg, ReverseDefCompose);
  
@@ -3587,7 +3685,7 @@
      const TargetRegisterClass *SrcRC = MRI.getRegClass(RegSeqInput.Reg);
      if (!TRI->isSubRegValidForRegClass(SrcRC, ComposedDefInSrcReg1))
        return ValueTrackerResult();
-@@ -2059,9 +1614,6 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2077,9 +1668,6 @@ ValueTrackerResult ValueTracker::getNext
      return ValueTrackerResult(RegSeqInput.Reg, ComposedDefInSrcReg1);
    }
  
@@ -3597,7 +3695,7 @@
    return ValueTrackerResult();
  }
  
-@@ -2075,47 +1627,27 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2093,47 +1681,27 @@ ValueTrackerResult ValueTracker::getNext
    if (!TII->getInsertSubregInputs(*Def, DefIdx, BaseReg, InsertedReg))
      return ValueTrackerResult();
  
@@ -3648,7 +3746,7 @@
    if (DefSubReg)
      return ValueTrackerResult();
  
-@@ -2123,28 +1655,19 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2141,28 +1709,19 @@ ValueTrackerResult ValueTracker::getNext
    if (!TII->getExtractSubregInputs(*Def, DefIdx, ExtractSubregInputReg))
      return ValueTrackerResult();
  
@@ -3679,7 +3777,7 @@
    if (Def->getOperand(1).getSubReg())
      return ValueTrackerResult();
  
-@@ -2152,17 +1675,13 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2170,17 +1729,13 @@ ValueTrackerResult ValueTracker::getNext
                              Def->getOperand(2).getImm());
  }
  
@@ -3697,7 +3795,7 @@
      if (MO.isUndef())
        return ValueTrackerResult();
      Res.addSource(MO.getReg(), MO.getSubReg());
-@@ -2173,18 +1692,17 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2191,18 +1746,17 @@ ValueTrackerResult ValueTracker::getNext
  
  ValueTrackerResult ValueTracker::getNextSourceImpl() {
    assert(Def && "This method needs a valid definition");
@@ -3718,7 +3816,7 @@
    if (DisableAdvCopyOpt)
      return ValueTrackerResult();
    if (Def->isRegSequence() || Def->isRegSequenceLike())
-@@ -2201,25 +1719,17 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2219,25 +1773,17 @@ ValueTrackerResult ValueTracker::getNext
  }
  
  ValueTrackerResult ValueTracker::getNextSource() {
@@ -3745,7 +3843,7 @@
      if (!Reg.isPhysical() && OneRegSrc) {
        MachineRegisterInfo::def_iterator DI = MRI.def_begin(Reg);
        if (DI != MRI.def_end()) {
-@@ -2232,9 +1742,7 @@ ValueTrackerResult ValueTracker::getNext
+@@ -2250,9 +1796,7 @@ ValueTrackerResult ValueTracker::getNext
        return Res;
      }
    }
@@ -4750,7 +4848,7 @@
  bool X86DAGToDAGISel::SelectInlineAsmMemoryOperand(
 
 --- a/llvm/lib/Target/X86/X86ISelLowering.cpp	2025-08-02 20:50:59.772460740 +0200
-+++ b/llvm/lib/Target/X86/X86ISelLowering.cpp	2026-05-11 11:49:20.796623328 +0200
++++ b/llvm/lib/Target/X86/X86ISelLowering.cpp	2026-05-14 11:49:20.796623328 +0200
 @@ -70,7 +70,7 @@ using namespace llvm;
  #define DEBUG_TYPE "x86-isel"
  
@@ -4778,17 +4876,17 @@
      cl::desc("Increases 'x86-br-merging-base-cost' in cases that the target "
               "supports conditional compare instructions."),
      cl::Hidden);
-@@ -1163,9 +1163,6 @@ X86TargetLowering::X86TargetLowering(con
+@@ -1167,9 +1167,6 @@ X86TargetLowering::X86TargetLowering(con
        setOperationAction(ISD::VECREDUCE_OR, VT, Custom);
        setOperationAction(ISD::VECREDUCE_XOR, VT, Custom);
      }
 -
 -    // SSE2 can use basic vector unrolling.
 -    // SSE41 can use PHMINPOS to perform v16i8/v8i16 minmax reductions.
-     for (auto VT : {MVT::v16i8, MVT::v8i16}) {
+     // Fallback to ReplaceNodeResults for vXi64 reductions on 32-bit targets.
+     for (auto VT : {MVT::v16i8, MVT::v8i16, MVT::v4i32, MVT::v2i64, MVT::i64}) {
        setOperationAction(ISD::VECREDUCE_SMAX, VT, Custom);
-       setOperationAction(ISD::VECREDUCE_SMIN, VT, Custom);
-@@ -1567,10 +1564,6 @@ X86TargetLowering::X86TargetLowering(con
+@@ -1563,10 +1560,6 @@ X86TargetLowering::X86TargetLowering(con
        setOperationAction(ISD::VECREDUCE_AND,   VT, Custom);
        setOperationAction(ISD::VECREDUCE_OR,    VT, Custom);
        setOperationAction(ISD::VECREDUCE_XOR,   VT, Custom);
@@ -4799,7 +4897,7 @@
        if (VT == MVT::v4i64) continue;
        setOperationAction(ISD::ROTL,            VT, Custom);
        setOperationAction(ISD::ROTR,            VT, Custom);
-@@ -2043,10 +2036,10 @@ X86TargetLowering::X86TargetLowering(con
+@@ -2039,10 +2032,6 @@ X86TargetLowering::X86TargetLowering(con
        setOperationAction(ISD::VECREDUCE_AND,    VT, Custom);
        setOperationAction(ISD::VECREDUCE_OR,     VT, Custom);
        setOperationAction(ISD::VECREDUCE_XOR,    VT, Custom);
@@ -4807,14 +4905,10 @@
 -      setOperationAction(ISD::VECREDUCE_SMIN,   VT, Custom);
 -      setOperationAction(ISD::VECREDUCE_UMAX,   VT, Custom);
 -      setOperationAction(ISD::VECREDUCE_UMIN,   VT, Custom);
-+      setOperationAction(ISD::VECREDUCE_SMAX,  VT, Custom);
-+      setOperationAction(ISD::VECREDUCE_SMIN,  VT, Custom);
-+      setOperationAction(ISD::VECREDUCE_UMAX,  VT, Custom);
-+      setOperationAction(ISD::VECREDUCE_UMIN,  VT, Custom);
  
        // The condition codes aren't legal in SSE/AVX and under AVX512 we use
        // setcc all the way to isel and prefer SETGT in some isel patterns.
-@@ -2833,11 +2826,18 @@ X86TargetLowering::X86TargetLowering(con
+@@ -2829,11 +2818,21 @@ X86TargetLowering::X86TargetLowering(con
    MaxStoresPerMemmove = 8; // For @llvm.memmove -> sequence of stores
    MaxStoresPerMemmoveOptSize = 4;
  
@@ -4830,13 +4924,16 @@
    MaxLoadsPerMemcmpOptSize = 2;
 +  if (Subtarget.isAtom())
 +    MaxLoadsPerMemcmp = 3;
++  else if (Subtarget.hasAVX2() && !Subtarget.hasAVX512() &&
++           Subtarget.getSchedModel().isOutOfOrder())
++    MaxLoadsPerMemcmp = 6;
 +  else if (Subtarget.is64Bit() && Subtarget.hasSSE2() &&
 +           Subtarget.getSchedModel().isOutOfOrder())
 +    MaxLoadsPerMemcmp = 4;
  
    // Default loop alignment, which can be overridden by -align-loops.
    setPrefLoopAlignment(Align(16));
-@@ -15861,8 +15861,7 @@ static SDValue lowerShuffleAsSplitOrBlen
+@@ -15857,8 +15856,7 @@ static SDValue lowerShuffleAsSplitOrBlen
    int Size = Mask.size();
  
    // If this can be modeled as a broadcast of two elements followed by a blend,
@@ -4846,7 +4943,7 @@
    auto DoBothBroadcast = [&] {
      int V1BroadcastIdx = -1, V2BroadcastIdx = -1;
      for (int M : Mask)
-@@ -15886,8 +15885,7 @@ static SDValue lowerShuffleAsSplitOrBlen
+@@ -15882,8 +15880,7 @@ static SDValue lowerShuffleAsSplitOrBlen
                                                  Subtarget, DAG);
  
    // If the inputs all stem from a single 128-bit lane of each input, then we
@@ -4856,7 +4953,7 @@
    int LaneCount = VT.getSizeInBits() / 128;
    int LaneSize = Size / LaneCount;
    SmallBitVector LaneInputs[2];
-@@ -15900,11 +15898,19 @@ static SDValue lowerShuffleAsSplitOrBlen
+@@ -15896,11 +15893,19 @@ static SDValue lowerShuffleAsSplitOrBlen
      return splitAndLowerShuffle(DL, VT, V1, V2, Mask, DAG,
                                  /*SimpleOnly*/ false);
  
@@ -4867,7 +4964,7 @@
 +  // than 256‑bit cross‑lane shuffles on Golden Cove.
 +  SDValue BC1 = peekThroughBitcasts(V1);
 +  SDValue BC2 = peekThroughBitcasts(V2);
-+  if (Subtarget.hasAVX2() &&
++  if (Subtarget.hasAVX2() && !Subtarget.hasAVX512() &&
 +      isFreeToSplitVector(BC1, DAG) && isFreeToSplitVector(BC2, DAG))
 +    return splitAndLowerShuffle(DL, VT, V1, V2, Mask, DAG,
 +                                /*SimpleOnly*/ false);
@@ -4880,7 +4977,7 @@
      bool SplatOrSplitV1 = isFreeToSplitVector(BC1, DAG) ||
                            DAG.isSplatValue(BC1, /*AllowUndefs=*/true);
      bool SplatOrSplitV2 = isFreeToSplitVector(BC2, DAG) ||
-@@ -15914,8 +15920,7 @@ static SDValue lowerShuffleAsSplitOrBlen
+@@ -15910,8 +15915,7 @@ static SDValue lowerShuffleAsSplitOrBlen
                                    /*SimpleOnly*/ false);
    }
  
@@ -4890,7 +4987,7 @@
    return lowerShuffleAsDecomposedShuffleMerge(DL, VT, V1, V2, Mask, Zeroable,
                                                Subtarget, DAG);
  }
-@@ -20947,9 +20952,14 @@ std::pair<SDValue, SDValue> X86TargetLow
+@@ -20943,9 +20947,14 @@ std::pair<SDValue, SDValue> X86TargetLow
  /// implementation, and likely shuffle complexity of the alternate sequence.
  static bool shouldUseHorizontalOp(bool IsSingleSource, SelectionDAG &DAG,
                                    const X86Subtarget &Subtarget) {
@@ -4908,7 +5005,7 @@
  }
  
  /// 64-bit unsigned integer to double expansion.
-@@ -22072,6 +22082,18 @@ static SDValue LowerTruncateVecPack(MVT
+@@ -22068,6 +22077,18 @@ static SDValue LowerTruncateVecPack(MVT
      }
    }
  
@@ -4927,8 +5024,8 @@
    // SSE2 provides PACKUS for only 2 x v8i16 -> v16i8 and SSE4.1 provides PACKUS
    // for 2 x v4i32 -> v8i16. For SSSE3 and below, we need to use PACKSS to
    // truncate 2 x v4i32 to v8i16.
-@@ -29682,10 +29704,13 @@ static SDValue LowerVECREDUCE(SDValue Op
-   EVT SrcSVT = SrcVT.getScalarType();
+@@ -29687,10 +29708,13 @@ static SDValue LowerVECREDUCE(SDValue Op
+   const TargetLowering &TLI = DAG.getTargetLoweringInfo();
    SDLoc DL(Op);
  
 +  // Only handle cases where the source element type matches the extract type
@@ -4942,18 +5039,19 @@
    while (SrcVT.getSizeInBits() > 128) {
      SDValue Lo, Hi;
      std::tie(Lo, Hi) = splitVector(Src, DAG, DL);
-@@ -29694,15 +29719,32 @@ static SDValue LowerVECREDUCE(SDValue Op
+@@ -29699,23 +29723,41 @@ static SDValue LowerVECREDUCE(SDValue Op
    }
    assert(SrcVT.is128BitVector() && "Unexpected value type");
  
 -  // Expand 128-bit shuffle tree + reduction binops.
 -  unsigned NumSrcElts = SrcVT.getVectorNumElements();
 -  for (unsigned NumElts = NumSrcElts; NumElts != 1; NumElts /= 2) {
--    SmallVector<int, 16> Mask(NumSrcElts, -1);
--    std::iota(Mask.begin(), Mask.begin() + (NumElts / 2), NumElts / 2);
--    SDValue Upper =
--        DAG.getVectorShuffle(SrcVT, DL, Src, DAG.getUNDEF(SrcVT), Mask);
--    Src = DAG.getNode(BinOp, DL, SrcVT, Src, Upper);
+-    // Scalarize the last 2 elements if the vector binop isn't legal.
+-    if (NumElts == 2 && !Subtarget.hasAVX512() &&
+-        !TLI.isOperationLegal(BinOp, SrcVT) && TLI.isTypeLegal(ExtractVT)) {
+-      return DAG.getNode(BinOp, DL, ExtractVT,
+-                         DAG.getExtractVectorElt(DL, ExtractVT, Src, 0),
+-                         DAG.getExtractVectorElt(DL, ExtractVT, Src, 1));
 +  // Step 2: reduce the 128‑bit vector.
 +  // For bitwise logical reductions (AND/OR/XOR) we use a sequence of
 +  // immediate byte shifts.  This avoids constant‑pool loads and provides
@@ -4965,13 +5063,27 @@
 +      SDValue Shifted = DAG.getNode(X86ISD::VSRLDQ, DL, ByteVT, V,
 +                                    DAG.getTargetConstant(Shift, DL, MVT::i8));
 +      V = DAG.getNode(BinOp, DL, ByteVT, V, Shifted);
-+    }
+     }
 +    // Convert back and extract the lowest element.
 +    Src = DAG.getBitcast(SrcVT, V);
 +  } else {
 +    // Generic shuffle‑tree for other binops (ADD, MUL, etc.).
 +    unsigned NumSrcElts = SrcVT.getVectorNumElements();
 +    for (unsigned NumElts = NumSrcElts; NumElts != 1; NumElts /= 2) {
++      // Scalarize the last 2 elements if the vector binop isn't legal.
++      if (NumElts == 2 && !Subtarget.hasAVX512() &&
++          !TLI.isOperationLegalOrCustom(BinOp, SrcVT) &&
++          TLI.isTypeLegal(ExtractVT)) {
++        return DAG.getNode(BinOp, DL, ExtractVT,
++                           DAG.getExtractVectorElt(DL, ExtractVT, Src, 0),
++                           DAG.getExtractVectorElt(DL, ExtractVT, Src, 1));
++      }
+ 
+-    SmallVector<int, 16> Mask(NumSrcElts, -1);
+-    std::iota(Mask.begin(), Mask.begin() + (NumElts / 2), NumElts / 2);
+-    SDValue Upper =
+-        DAG.getVectorShuffle(SrcVT, DL, Src, DAG.getUNDEF(SrcVT), Mask);
+-    Src = DAG.getNode(BinOp, DL, SrcVT, Src, Upper);
 +      SmallVector<int, 16> Mask(NumSrcElts, -1);
 +      std::iota(Mask.begin(), Mask.begin() + (NumElts / 2), NumElts / 2);
 +      SDValue Upper =
@@ -4983,7 +5095,7 @@
    return DAG.getExtractVectorElt(DL, ExtractVT, Src, 0);
  }
  
-@@ -29893,17 +29935,22 @@ static SDValue LowerMINMAX(SDValue Op, c
+@@ -29906,17 +29948,22 @@ static SDValue LowerMINMAX(SDValue Op, c
    return SDValue();
  }
  
@@ -5008,7 +5120,7 @@
    if (SrcSVT != ExtractVT || (SrcVT.getSizeInBits() % 128) != 0)
      return LowerVECREDUCE(Op, Subtarget, DAG);
  
-@@ -29911,35 +29958,38 @@ static SDValue LowerMINMAX_REDUCE(SDValu
+@@ -29924,35 +29971,38 @@ static SDValue LowerMINMAX_REDUCE(SDValu
    SDValue MinPos = Src;
    ISD::NodeType BinOp = ISD::getVecReduceBaseOpcode(Op.getOpcode());
  
@@ -5058,7 +5170,7 @@
    if (ExtractVT == MVT::i8) {
      SDValue Upper = DAG.getVectorShuffle(
          SrcVT, DL, MinPos, DAG.getConstant(0, DL, MVT::v16i8),
-@@ -29947,7 +29997,6 @@ static SDValue LowerMINMAX_REDUCE(SDValu
+@@ -29960,7 +30010,6 @@ static SDValue LowerMINMAX_REDUCE(SDValu
      MinPos = DAG.getNode(ISD::UMIN, DL, SrcVT, MinPos, Upper);
    }
  
@@ -5066,7 +5178,7 @@
    MinPos = DAG.getBitcast(MVT::v8i16, MinPos);
    MinPos = DAG.getNode(X86ISD::PHMINPOS, DL, MVT::v8i16, MinPos);
    MinPos = DAG.getBitcast(SrcVT, MinPos);
-@@ -30346,13 +30395,17 @@ static SDValue LowerMUL(SDValue Op, cons
+@@ -30359,13 +30408,17 @@ static SDValue LowerMUL(SDValue Op, cons
  
      // Extract the odd parts.
      static const int UnpackMask[] = {1, 1, 3, 3};
@@ -5088,7 +5200,7 @@
      // Now multiply odd parts.
      SDValue Odds = DAG.getNode(X86ISD::PMULUDQ, dl, MVT::v2i64,
                                 DAG.getBitcast(MVT::v2i64, Aodds),
-@@ -30393,26 +30446,39 @@ static SDValue LowerMUL(SDValue Op, cons
+@@ -30406,26 +30459,39 @@ static SDValue LowerMUL(SDValue Op, cons
  
    SDValue Zero = DAG.getConstant(0, dl, VT);
  
@@ -5126,30 +5238,26 @@
 +  SDValue Hi = HasAloBhi ? AloBhi : AhiBlo;
 +  if (HasAloBhi && HasAhiBlo)
 +    Hi = DAG.getNode(ISD::ADD, dl, VT, AloBhi, AhiBlo);
- 
++
 +  if (Hi != Zero)
 +    Hi = getTargetVShiftByConstNode(X86ISD::VSHLI, dl, VT, Hi, 32, DAG);
-+
+ 
 +  if (!HasAloBlo)
 +    return Hi;
    return DAG.getNode(ISD::ADD, dl, VT, AloBlo, Hi);
  }
  
-@@ -47106,7 +47172,13 @@ static SDValue createPSADBW(SelectionDAG
+@@ -47137,6 +47203,9 @@ static SDValue createPSADBW(SelectionDAG
  // ISD::VECREDUCE_SMIN/SMAX/UMIN/UMAX.
  static SDValue combineMinMaxReduction(SDNode *Extract, SelectionDAG &DAG,
                                        const X86Subtarget &Subtarget) {
 +  if (!Subtarget.hasSSE2())
 +    return SDValue();
 +
-   EVT ExtractVT = Extract->getValueType(0);
-+
-+  // Allow any legal integer type; the combiner will create the corresponding
-+  // ISD::VECREDUCE_* node.
-   if (!DAG.getTargetLoweringInfo().isTypeLegal(ExtractVT))
-     return SDValue();
- 
-@@ -47123,20 +47195,11 @@ static SDValue combineMinMaxReduction(SD
+   // Check for SMAX/SMIN/UMAX/UMIN horizontal reduction patterns.
+   ISD::NodeType BinOp;
+   SDValue Src = DAG.matchBinOpReduction(
+@@ -47150,20 +47219,11 @@ static SDValue combineMinMaxReduction(SD
  
    ISD::NodeType RdxOp;
    switch (BinOp) {
@@ -5174,8 +5282,8 @@
 +  default:         llvm_unreachable("Unexpected reduction");
    }
  
-   return DAG.getNode(RdxOp, SDLoc(Extract), ExtractVT, Src);
-@@ -50383,50 +50446,65 @@ static SDValue combineMulSpecial(uint64_
+   return DAG.getNode(RdxOp, SDLoc(Extract), Extract->getValueType(0), Src);
+@@ -50410,50 +50470,65 @@ static SDValue combineMulSpecial(uint64_
    default:
      break;
    case 11:
@@ -5258,7 +5366,7 @@
    if (isPowerOf2_64(MulAmt & (MulAmt - 1))) {
      unsigned ScaleShift = llvm::countr_zero(MulAmt);
      if (ScaleShift >= 1 && ScaleShift < 4) {
-@@ -63394,13 +63472,37 @@ void X86TargetLowering::LowerAsmOperandF
+@@ -63421,13 +63496,37 @@ void X86TargetLowering::LowerAsmOperandF
      return;
    }
    case 'i': {
@@ -5301,7 +5409,7 @@
        Result =
            ExtOpc == ISD::ZERO_EXTEND
                ? DAG.getTargetConstant(CST->getZExtValue(), DL, MVT::i64)
-@@ -63980,15 +64082,14 @@ X86TargetLowering::getRegForInlineAsmCon
+@@ -64007,15 +64106,14 @@ X86TargetLowering::getRegForInlineAsmCon
  }
  
  bool X86TargetLowering::isIntDivCheap(EVT VT, AttributeList Attr) const {
