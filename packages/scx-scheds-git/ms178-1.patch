@@ -5,7 +5,905 @@
 +++ b/scheds/rust/scx_lavd/src/bpf/introspec.bpf.c	2026-02-25 10:49:58.451727363 +0100
 
 --- a/scheds/rust/scx_lavd/src/bpf/balance.bpf.c	2025-11-23 00:02:31.398412438 +0100
-+++ b/scheds/rust/scx_lavd/src/bpf/balance.bpf.c	2026-02-26 00:03:47.352701017 +0100
++++ b/scheds/rust/scx_lavd/src/bpf/balance.bpf.c	2026-05-14 00:03:47.352701017 +0100
+@@ -16,20 +16,29 @@
+ #include <bpf/bpf_tracing.h>
+ #include <lib/cgroup.h>
+ 
++extern const volatile u8 mig_delta_pct;
++extern const volatile u8 no_fast_lb;
++extern const volatile u64 lb_low_util_wall;
+ 
+-extern const volatile u8	mig_delta_pct;
+-extern const volatile u8	no_fast_lb;
+-extern const volatile u64	lb_low_util_wall;
++static __always_inline int mask_pop_lsb(u64 *mask)
++{
++	u64 val = *mask;
++
++	if (!val)
++		return -1;
++
++	*mask = val & (val - 1);
++	return __builtin_ctzll(val);
++}
+ 
+-u64 __attribute__ ((noinline)) calc_mig_delta(u64 avg_load_invr, int nz_qlen,
++static __always_inline bool dsq_id_valid(u64 dsq_id)
++{
++	return dsq_id != (u64)-ENOENT;
++}
++
++u64 __attribute__((noinline)) calc_mig_delta(u64 avg_load_invr, int nz_qlen,
+ 					      u64 mig_delta_factor)
+ {
+-	/*
+-	 * Note that added "noinline" to make the verifier happy.
+-	 * When mig_delta_factor > 0, the user specified a fixed
+-	 * migration delta percentage; otherwise use the dynamic
+-	 * shift-based heuristic.
+-	 */
+ 	if (mig_delta_factor > 0)
+ 		return avg_load_invr * mig_delta_factor / LAVD_SCALE;
+ 	if (nz_qlen >= sys_stat.nr_active_cpdoms)
+@@ -39,12 +48,6 @@ u64 __attribute__ ((noinline)) calc_mig_
+ 	return avg_load_invr >> LAVD_CPDOM_MIG_SHIFT;
+ }
+ 
+-/*
+- * Classify a single compute domain as stealer, stealee, or neutral.
+- * Returns 1 if the domain became a stealee, 0 otherwise.
+- * Marked noinline so the verifier analyses it separately from the
+- * calling loop, keeping the jump complexity of the caller manageable.
+- */
+ int __attribute__((noinline))
+ classify_cpdom(struct cpdom_ctx *cpdomc, u64 total_load_invr,
+ 	       u64 total_cap_sum, int nz_qlen, u64 mig_delta_factor)
+@@ -52,33 +55,34 @@ classify_cpdom(struct cpdom_ctx *cpdomc,
+ 	u64 x_mig_delta = 0;
+ 	u64 fair_share_invr = 0;
+ 	u64 stealer_threshold = 0;
+-	u64 stealee_threshold = 0;
++	u64 stealee_threshold = U64_MAX;
+ 
+ 	if (!cpdomc)
+ 		return 0;
+ 
+ 	if (no_fast_lb && sys_stat.nr_active_cpdoms) {
+ 		u64 avg = total_load_invr / sys_stat.nr_active_cpdoms;
++
++		fair_share_invr = avg;
+ 		x_mig_delta = calc_mig_delta(avg, nz_qlen, mig_delta_factor);
+-		stealer_threshold = avg - x_mig_delta;
+-		stealee_threshold = avg + x_mig_delta;
++
++		stealer_threshold = avg > x_mig_delta ? avg - x_mig_delta : 0;
++		stealee_threshold = avg > U64_MAX - x_mig_delta ?
++				    U64_MAX : avg + x_mig_delta;
+ 	} else if (cpdomc->nr_active_cpus && total_cap_sum > 0) {
+ 		fair_share_invr = total_load_invr *
+-			     cpdomc->cap_sum_active_cpus /
+-			     total_cap_sum;
++				  cpdomc->cap_sum_active_cpus /
++				  total_cap_sum;
+ 
+-		x_mig_delta = calc_mig_delta(
+-				fair_share_invr, nz_qlen,
+-				mig_delta_factor);
++		x_mig_delta = calc_mig_delta(fair_share_invr, nz_qlen,
++					     mig_delta_factor);
+ 
+-		stealer_threshold = fair_share_invr - x_mig_delta;
+-		stealee_threshold = fair_share_invr + x_mig_delta;
++		stealer_threshold = fair_share_invr > x_mig_delta ?
++				    fair_share_invr - x_mig_delta : 0;
++		stealee_threshold = fair_share_invr > U64_MAX - x_mig_delta ?
++				    U64_MAX : fair_share_invr + x_mig_delta;
+ 	}
+ 
+-	/*
+-	 * Under-loaded active domains become a stealer.
+-	 * Ingress budget = half the deficit below fair share.
+-	 */
+ 	if (cpdomc->nr_active_cpus &&
+ 	    cpdomc->load_invr <= stealer_threshold) {
+ 		u64 stealer_budget = 0;
+@@ -94,22 +98,6 @@ classify_cpdom(struct cpdom_ctx *cpdomc,
+ 		return 0;
+ 	}
+ 
+-	/*
+-	 * Over-loaded or non-active domains become a stealee.
+-	 * Egress budget = half the excess above fair share. Halving
+-	 * (rather than draining the full excess) avoids two failure
+-	 * modes:
+-	 * - Ping-pong: prevent overshooting. Moving everything in one
+-	 *   round may trigger the imbalance and ping-pong effect.
+-	 * - Thundering-herd: without a per-round limit, every stealer
+-	 *   that sees this domain can migrate out the tasks from it and
+-	 *   drain it past the fair share in a single round.
+-	 *
+-	 * Also skip domains with nothing to steal: a domain may appear
+-	 * overloaded due to running task utilization (avg_util_invr_sum)
+-	 * but have an empty DSQ — trying to steal from it would waste
+-	 * cycles and could cause oscillation.
+-	 */
+ 	if (!cpdomc->nr_active_cpus ||
+ 	    cpdomc->load_invr >= stealee_threshold) {
+ 		u64 stealee_budget_invr = 0;
+@@ -151,10 +139,8 @@ int plan_x_cpdom_migration(void)
+ 	u64 total_cap_sum = 0;
+ 	bool overflow_running = false;
+ 	int nz_qlen = 0;
++	u64 mig_delta_factor = 0;
+ 
+-	/*
+-	 * Calculate load for each active compute domain.
+-	 */
+ 	bpf_for(cpdom_id, 0, nr_cpdoms) {
+ 		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
+ 			break;
+@@ -166,19 +152,19 @@ int plan_x_cpdom_migration(void)
+ 			continue;
+ 		}
+ 
+-		util = (cpdomc->avg_util_wall_sum << LAVD_SHIFT) / cpdomc->nr_active_cpus;
++		util = (cpdomc->avg_util_wall_sum << LAVD_SHIFT) /
++		       cpdomc->nr_active_cpus;
+ 		if ((util >> LAVD_SHIFT) > max_avg_util_wall)
+ 			max_avg_util_wall = util >> LAVD_SHIFT;
+ 
+-		/*
+-		 * Domain load combines running load (avg_util_invr_sum)
+-		 * and queued load (qload_invr, tracked atomically via
+-		 * account/unaccount at enqueue/running).
+-		 */
+ 		if (no_fast_lb) {
+ 			u64 qlen = cpdomc->nr_queued_task;
+-			u64 qlen_invr = (qlen << (LAVD_SHIFT * 3)) /
+-					cpdomc->cap_sum_active_cpus;
++			u64 qlen_invr = 0;
++
++			if (cpdomc->cap_sum_active_cpus > 0)
++				qlen_invr = (qlen << (LAVD_SHIFT * 3)) /
++					    cpdomc->cap_sum_active_cpus;
++
+ 			cpdomc->load_invr = util + qlen_invr;
+ 			if (qlen)
+ 				nz_qlen++;
+@@ -188,25 +174,14 @@ int plan_x_cpdom_migration(void)
+ 			if (cpdomc->qload_invr)
+ 				nz_qlen++;
+ 		}
++
+ 		total_load_invr += cpdomc->load_invr;
+ 		total_cap_sum += cpdomc->cap_sum_active_cpus;
+ 	}
+ 
+-	/*
+-	 * When the highest per-CPU utilization among all compute
+-	 * domains is below the low utilization threshold, there is
+-	 * no meaningful workload worth rebalancing across domains.
+-	 */
+ 	if (lb_low_util_wall > 0 && max_avg_util_wall < lb_low_util_wall)
+ 		goto reset_and_skip_lb;
+ 
+-	/*
+-	 * Classify stealer and stealee domains using per-domain
+-	 * capacity-proportional targets. Each domain's target is its
+-	 * fair share of total system load scaled by its capacity
+-	 * proportion.
+-	 */
+-	u64 mig_delta_factor = 0;
+ 	if (mig_delta_pct > 0)
+ 		mig_delta_factor = (mig_delta_pct << LAVD_SHIFT) / 100;
+ 
+@@ -215,7 +190,6 @@ int plan_x_cpdom_migration(void)
+ 			break;
+ 
+ 		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
+-
+ 		nr_stealee += classify_cpdom(cpdomc, total_load_invr,
+ 					     total_cap_sum, nz_qlen,
+ 					     mig_delta_factor);
+@@ -225,7 +199,6 @@ int plan_x_cpdom_migration(void)
+ 		goto reset_and_skip_lb;
+ 
+ 	sys_stat.nr_stealee = nr_stealee;
+-
+ 	return 0;
+ 
+ reset_and_skip_lb:
+@@ -242,22 +215,21 @@ reset_and_skip_lb:
+ 		}
+ 		sys_stat.nr_stealee = 0;
+ 	}
++
+ 	return 0;
+ }
+ 
+-/*
+- * dsq_id: candidate DSQ to consume from, can be per-cpdom or per-cpu.
+- */
+ static bool consume_dsq(struct cpdom_ctx *cpdomc, u64 dsq_id)
+ {
+ 	bool ret;
+ 	u64 before = 0;
+ 
++	if (!dsq_id_valid(dsq_id))
++		return false;
++
+ 	if (is_monitored)
+ 		before = bpf_ktime_get_ns();
+-	/*
+-	 * Try to consume a task on the associated DSQ.
+-	 */
++
+ 	ret = scx_bpf_dsq_move_to_local(dsq_id, 0);
+ 
+ 	if (is_monitored)
+@@ -268,10 +240,15 @@ static bool consume_dsq(struct cpdom_ctx
+ 
+ u64 __attribute__((noinline)) dsq_peek_task_load(u64 dsq_id)
+ {
+-	struct task_struct *peek_p = __COMPAT_scx_bpf_dsq_peek(dsq_id);
++	struct task_struct *peek_p;
++
++	if (!dsq_id_valid(dsq_id))
++		return 0;
+ 
++	peek_p = __COMPAT_scx_bpf_dsq_peek(dsq_id);
+ 	if (peek_p) {
+ 		task_ctx *peek_taskc = get_task_ctx(peek_p);
++
+ 		if (peek_taskc)
+ 			return task_load_metric(peek_taskc);
+ 	}
+@@ -280,44 +257,42 @@ u64 __attribute__((noinline)) dsq_peek_t
+ 
+ u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
+ {
+-	u64 pick_dsq_id = -ENOENT;
++	u64 pick_dsq_id = (u64)-ENOENT;
+ 	s32 highest_queued = -1;
+ 
+ 	if (!cpdomc) {
+ 		scx_bpf_error("Invalid cpdom context");
+-		return -ENOENT;
++		return (u64)-ENOENT;
+ 	}
+ 
+-	/*
+-	 * For simplicity, try to just steal from the (either per-CPU or
+-	 * per-domain) DSQs with the highest number of queued_tasks
+-	 * in this domain.
+-	 */
+ 	if (use_cpdom_dsq()) {
+ 		pick_dsq_id = cpdom_to_dsq(cpdomc->id);
+ 		highest_queued = scx_bpf_dsq_nr_queued(pick_dsq_id);
+ 	}
+ 
+-	/*
+-	 * When tasks on a per-CPU DSQ are not migratable
+-	 * (e.g., pinned_slice_ns is on but per_cpu_dsq is not),
+-	 * there is no need to check per-CPU DSQs.
+-	 */
+ 	if (is_per_cpu_dsq_migratable()) {
+-		int pick_cpu = -ENOENT, cpu, i, j, k;
++		s32 pick_cpu = -ENOENT;
++		s32 word, iter;
++
++		bpf_for(word, 0, LAVD_CPU_ID_MAX / 64) {
++			u64 mask = cpdomc->__cpumask[word];
+ 
+-		bpf_for(i, 0, LAVD_CPU_ID_MAX/64) {
+-			u64 cpumask = cpdomc->__cpumask[i];
+-			bpf_for(k, 0, 64) {
++			bpf_for(iter, 0, 64) {
++				int bit = mask_pop_lsb(&mask);
++				int cpu;
+ 				s32 queued;
+-				j = cpumask_next_set_bit(&cpumask);
+-				if (j < 0)
++
++				if (bit < 0)
+ 					break;
+-				cpu = (i * 64) + j;
+-				if (cpu >= nr_cpu_ids)
++
++				cpu = (word * 64) + bit;
++				if (cpu >= (int)nr_cpu_ids)
+ 					break;
++
+ 				queued = scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)) +
+-					 scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
++					 scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON |
++							       (u64)cpu);
++
+ 				if (queued > highest_queued) {
+ 					highest_queued = queued;
+ 					pick_cpu = cpu;
+@@ -325,10 +300,13 @@ u64 __attribute__((noinline)) pick_most_
+ 			}
+ 		}
+ 
+-		if (pick_cpu != -ENOENT)
++		if (pick_cpu >= 0)
+ 			pick_dsq_id = cpu_to_dsq(pick_cpu);
+ 	}
+ 
++	if (highest_queued <= 0)
++		return (u64)-ENOENT;
++
+ 	return pick_dsq_id;
+ }
+ 
+@@ -337,31 +315,21 @@ static bool try_to_steal_task(struct cpd
+ 	struct cpdom_ctx *cpdomc_pick;
+ 	s64 nr_nbr, cpdom_id;
+ 
+-	/*
+-	 * Only active domains steal the tasks from other domains.
+-	 */
+-	if (!cpdomc->nr_active_cpus)
++	if (!cpdomc || !cpdomc->nr_active_cpus)
+ 		return false;
+ 
+ 	if (no_fast_lb &&
+ 	    !prob_x_out_of_y(1, cpdomc->nr_active_cpus * LAVD_CPDOM_MIG_PROB_FT))
+ 		return false;
+ 
+-	/*
+-	 * Traverse neighbor compute domains in distance order.
+-	 */
+ 	for (int i = 0; i < LAVD_CPDOM_MAX_DIST; i++) {
+ 		nr_nbr = min(cpdomc->nr_neighbors[i], LAVD_CPDOM_MAX_NR);
+ 		if (nr_nbr == 0)
+ 			break;
+ 
+-		/*
+-		 * Traverse neighbors in the same distance in circular distance order.
+-		 */
+-		for (int j = 0; j < LAVD_CPDOM_MAX_NR; j++) {
++		for (int j = 0; j < nr_nbr; j++) {
+ 			u64 dsq_id;
+-			if (j >= nr_nbr)
+-				break;
++			u64 task_load;
+ 
+ 			cpdom_id = get_neighbor_id(cpdomc, i, j);
+ 			if (cpdom_id < 0)
+@@ -369,42 +337,24 @@ static bool try_to_steal_task(struct cpd
+ 
+ 			cpdomc_pick = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
+ 			if (!cpdomc_pick) {
+-				scx_bpf_error("Failed to lookup cpdom_ctx for %llu", cpdom_id);
++				scx_bpf_error("Failed to lookup cpdom_ctx for %llu",
++					      cpdom_id);
+ 				return false;
+ 			}
+ 
+-			if (!READ_ONCE(cpdomc_pick->is_stealee) || !cpdomc_pick->is_valid)
++			if (!READ_ONCE(cpdomc_pick->is_valid) ||
++			    !READ_ONCE(cpdomc_pick->is_stealee))
+ 				continue;
+ 
+-			if (READ_ONCE(cpdomc_pick->stealee_budget_invr) <= 0)
++			if (READ_ONCE(cpdomc_pick->stealee_budget_invr) == 0)
+ 				continue;
+ 
+ 			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
++			if (!dsq_id_valid(dsq_id))
++				continue;
++
++			task_load = no_fast_lb ? 0 : dsq_peek_task_load(dsq_id);
+ 
+-			/*
+-			 * Peek at the head task to get its size for budget
+-			 * accounting. Skip the peek when no_fast_lb is set
+-			 * since the budget path below is bypassed and the
+-			 * value would be unused.
+-			 *
+-			 * TOCTOU: the task peeked here may not be the one
+-			 * actually consumed by consume_dsq() below. To be more
+-			 * specific, another CPU may grab the head first, or the
+-			 * task may become ineligible during the window between
+-			 * the peek and the consume_dsq. The budget is just a
+-			 * hint, and over-debiting will be self-corrected
+-			 * because the next LB round recomputes budgets from
+-			 * scratch.
+-			 */
+-			u64 task_load = no_fast_lb ? 0 : dsq_peek_task_load(dsq_id);
+-
+-			/*
+-			 * On success, decrement both egress and ingress
+-			 * budgets. The stealer stays active for the
+-			 * entire round. Budget exhaustion clears the
+-			 * is_stealee/is_stealer flags via the decrement
+-			 * helpers.
+-			 */
+ 			if (consume_dsq(cpdomc_pick, dsq_id)) {
+ 				if (no_fast_lb) {
+ 					WRITE_ONCE(cpdomc_pick->is_stealee, false);
+@@ -417,15 +367,6 @@ static bool try_to_steal_task(struct cpd
+ 			}
+ 		}
+ 
+-		/*
+-		 * Now, we need to steal a task from a farther neighbor
+-		 * for load balancing. Since task migration from a farther
+-		 * neighbor is more expensive (e.g., crossing a NUMA boundary),
+-		 * we will do this with a lot of hesitation. The chance of
+-		 * further migration will decrease exponentially as distance
+-		 * increases, so, on the other hand, it increases the chance
+-		 * of closer migration.
+-		 */
+ 		if (!prob_x_out_of_y(1, LAVD_CPDOM_MIG_PROB_FT))
+ 			break;
+ 	}
+@@ -438,21 +379,17 @@ static bool force_to_steal_task(struct c
+ 	struct cpdom_ctx *cpdomc_pick;
+ 	s64 nr_nbr, cpdom_id;
+ 
+-	/*
+-	 * Traverse neighbor compute domains in distance order.
+-	 */
++	if (!cpdomc)
++		return false;
++
+ 	for (int i = 0; i < LAVD_CPDOM_MAX_DIST; i++) {
+ 		nr_nbr = min(cpdomc->nr_neighbors[i], LAVD_CPDOM_MAX_NR);
+ 		if (nr_nbr == 0)
+ 			break;
+ 
+-		/*
+-		 * Traverse neighbors in the same distance in circular distance order.
+-		 */
+-		for (int j = 0; j < LAVD_CPDOM_MAX_NR; j++) {
++		for (int j = 0; j < nr_nbr; j++) {
+ 			u64 dsq_id;
+-			if (j >= nr_nbr)
+-				break;
++			u64 task_load;
+ 
+ 			cpdom_id = get_neighbor_id(cpdomc, i, j);
+ 			if (cpdom_id < 0)
+@@ -460,28 +397,20 @@ static bool force_to_steal_task(struct c
+ 
+ 			cpdomc_pick = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
+ 			if (!cpdomc_pick) {
+-				scx_bpf_error("Failed to lookup cpdom_ctx for %llu", cpdom_id);
++				scx_bpf_error("Failed to lookup cpdom_ctx for %llu",
++					      cpdom_id);
+ 				return false;
+ 			}
+ 
+-			if (!cpdomc_pick->is_valid)
++			if (!READ_ONCE(cpdomc_pick->is_valid))
+ 				continue;
+ 
+ 			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
++			if (!dsq_id_valid(dsq_id))
++				continue;
++
++			task_load = no_fast_lb ? 0 : dsq_peek_task_load(dsq_id);
+ 
+-			/*
+-			 * Peek at the head task to get its size. Skip the
+-			 * peek when no_fast_lb is set since the budget
+-			 * accounting below is bypassed and the value would
+-			 * be unused.
+-			 */
+-			u64 task_load = no_fast_lb ? 0 : dsq_peek_task_load(dsq_id);
+-
+-			/*
+-			 * Force steal is unconditional for work
+-			 * conservation. Decrement budgets to keep
+-			 * the accounting consistent.
+-			 */
+ 			if (consume_dsq(cpdomc_pick, dsq_id)) {
+ 				if (!no_fast_lb) {
+ 					decrement_stealee_budget(cpdomc_pick, task_load);
+@@ -503,46 +432,41 @@ bool consume_task(u64 cpu_dsq_id, u64 cp
+ 	u64 cpdom_turb_dsq_id;
+ 	bool turbulent;
+ 	struct dsq_entry dsqs[3];
++	s32 cpdom_nr_queued = 0;
++	s32 turb_nr_queued = 0;
+ 
+ 	cpdomc = MEMBER_VPTR(cpdom_ctxs, [dsq_to_cpdom(cpdom_dsq_id)]);
+ 	if (!cpdomc) {
+-		scx_bpf_error("Failed to lookup cpdom_ctx for %llu", dsq_to_cpdom(cpdom_dsq_id));
++		scx_bpf_error("Failed to lookup cpdom_ctx for %llu",
++			      dsq_to_cpdom(cpdom_dsq_id));
+ 		return false;
+ 	}
+ 
+ 	cpdom_turb_dsq_id = cpdom_to_turb_dsq(dsq_to_cpdom(cpdom_dsq_id));
+ 
+-	/*
+-	 * Determine if this CPU is turbulent (high IRQ/steal time).
+-	 * Non-turbulent CPUs consume from all 3 DSQs.
+-	 * Turbulent CPUs only consume from the turbulent DSQ
+-	 * (which holds non-latency-critical tasks).
+-	 */
+ 	cpuc = get_cpu_ctx();
+ 	if (!cpuc)
+ 		return false;
++
+ 	turbulent = cpuc->lat_headroom < LAVD_LC_LATENCY_SENSITIVE_THRESH;
++	if (turbulent && use_cpdom_dsq()) {
++		cpdom_nr_queued = scx_bpf_dsq_nr_queued(cpdom_dsq_id);
++		turb_nr_queued = scx_bpf_dsq_nr_queued(cpdom_turb_dsq_id);
++	}
+ 
+-	/*
+-	 * If the current compute domain is a stealer, try to steal
+-	 * a task from any of stealee domains probabilistically.
+-	 */
+ 	if (nr_cpdoms > 1 && READ_ONCE(cpdomc->is_stealer) &&
+ 	    try_to_steal_task(cpdomc))
+-		goto x_domain_migration_out;
++		return true;
+ 
+-	/*
+-	 * Collect eligible DSQs and consume in lowest-vtime-first order.
+-	 * Non-turbulent CPUs always see the cpdom DSQ. Turbulent CPUs
+-	 * also see it when it has more queued tasks than the turbulent
+-	 * DSQ (to prevent starvation) or when there are no steady CPUs
+-	 * to drain it.
+-	 */
+-	dsqs[0] = (struct dsq_entry){ cpu_dsq_id,       U64_MAX, use_per_cpu_dsq() };
+-	dsqs[1] = (struct dsq_entry){ cpdom_dsq_id,     U64_MAX, use_cpdom_dsq() &&
+-		(!turbulent ||
+-		 scx_bpf_dsq_nr_queued(cpdom_dsq_id) > scx_bpf_dsq_nr_queued(cpdom_turb_dsq_id) ||
+-		 cpdomc->nr_steady_cpus == 0) };
++	dsqs[0] = (struct dsq_entry){ cpu_dsq_id, U64_MAX, use_per_cpu_dsq() };
++	dsqs[1] = (struct dsq_entry){
++		cpdom_dsq_id,
++		U64_MAX,
++		use_cpdom_dsq() &&
++			(!turbulent ||
++			 cpdom_nr_queued > turb_nr_queued ||
++			 cpdomc->nr_steady_cpus == 0)
++	};
+ 	dsqs[2] = (struct dsq_entry){ cpdom_turb_dsq_id, U64_MAX, use_cpdom_dsq() };
+ 
+ 	if (dsqs[0].eligible)
+@@ -561,20 +485,8 @@ bool consume_task(u64 cpu_dsq_id, u64 cp
+ 	if (dsqs[2].eligible && consume_dsq(cpdomc, dsqs[2].dsq_id))
+ 		return true;
+ 
+-	/*
+-	 * If there is no task in the associated DSQ, traverse neighbor
+-	 * compute domains in distance order -- task stealing.
+-	 * Skip force stealing when mig_delta_pct is set (> 0) to rely
+-	 * only on the is_stealer/is_stealee thresholds.
+-	 */
+ 	if (nr_cpdoms > 1 && mig_delta_pct == 0 && force_to_steal_task(cpdomc))
+-		goto x_domain_migration_out;
++		return true;
+ 
+ 	return false;
+-
+-	/*
+-	 * Task migration across compute domains happens.
+-	 */
+-x_domain_migration_out:
+-	return true;
+ }
+
+--- a/scheds/rust/scx_lavd/src/bpf/intf.h	2026-05-14 15:36:10.903081959 +0200
++++ b/scheds/rust/scx_lavd/src/bpf/intf.h	2026-05-14 15:35:36.754233606 +0200
+@@ -2,6 +2,17 @@
+ /*
+  * Copyright (c) 2023, 2024 Valve Corporation.
+  * Author: Changwoo Min <changwoo@igalia.com>
++ *
++ * Raptor-Lake-tuned cacheline-hygiene pass — see CHANGES.md for the
++ * rationale behind every modification, anchored to the upstream
++ * cache-aware scheduling and BORE work this revision was
++ * cross-pollinated from.
++ *
++ * Layout-stability contract: every reorder/pad in this file is safe
++ * for any consumer that accesses fields by NAME (the standard
++ * BPF skeleton path: `skel->bss->sys_stat.<field>`). Out-of-tree
++ * consumers that read the BSS by hardcoded offset will need to
++ * regenerate against the updated BTF.
+  */
+ #ifndef __INTF_H
+ #define __INTF_H
+@@ -9,129 +20,183 @@
+ #include <limits.h>
+ 
+ #ifndef __VMLINUX_H__
+-typedef unsigned char u8;
+-typedef unsigned short u16;
+-typedef unsigned int u32;
+-typedef unsigned long u64;
+-
+-typedef signed char s8;
+-typedef signed short s16;
+-typedef signed int s32;
+-typedef signed long s64;
++typedef unsigned char		u8;
++typedef unsigned short		u16;
++typedef unsigned int		u32;
++typedef unsigned long		u64;
++
++typedef signed char		s8;
++typedef signed short		s16;
++typedef signed int		s32;
++typedef signed long		s64;
+ 
+ typedef int pid_t;
+ 
+ enum {
+ 	TASK_COMM_LEN = 16,
+ };
++#endif
+ 
++/*
++ * Cacheline geometry.
++ *
++ * Raptor Lake P-cores have 64-byte L1D/L2/L3 line size, so do its
++ * E-cores. Both AMD Zen 4/5 and Apple-Silicon-class arm64 also use
++ * 64-byte lines. We hardcode 64 here for layout determinism; if a
++ * future target uses a larger line, bump this and rebuild.
++ *
++ * Why a macro and not __aligned() directly? Because the same header
++ * is included from BPF *and* userspace .c files — keeping the value
++ * symbolic ensures both sides see exactly the same alignment.
++ */
++#ifndef LAVD_CACHELINE_SIZE
++#define LAVD_CACHELINE_SIZE	64
+ #endif
+ 
++#define __lavd_cacheline_aligned	__attribute__((aligned(LAVD_CACHELINE_SIZE)))
++
+ /*
+  * common constants
+  */
+ enum {
+ 	LAVD_CPU_ID_MAX			= 512,
+-
+-	LAVD_CPDOM_MAX_NR		= 128, /* maximum number of compute domain */
+-	LAVD_CPDOM_MAX_DIST		= 3,  /* maximum distance from one compute domain to another */
+-
+-	LAVD_PCO_STATE_MAX		= 11, /* maximum number of performance vs. CPU order states */
+-
+-	LAVD_STATUS_STR_LEN		= 4,  /* {LR: Latency-critical, Regular}
+-						 {HI: performance-Hungry, performance-Insensitive}
+-						 {BT: Big, liTtle}
+-						 {EG: Eligible, Greedy} */
++	LAVD_CPDOM_MAX_NR		= 128,	/* maximum number of compute domain */
++	LAVD_CPDOM_MAX_DIST		= 3,	/* maximum distance from one compute domain to another */
++	LAVD_PCO_STATE_MAX		= 11,	/* maximum number of performance vs. CPU order states */
++	LAVD_STATUS_STR_LEN		= 4,	/* {LR: Latency-critical, Regular} {HI: performance-Hungry, performance-Insensitive} {BT: Big, liTtle} {EG: Eligible, Greedy} */
+ };
+ 
+ /*
+- * System-wide stats
++ * System-wide stats.
++ *
++ * Layout is split into three contiguous groups, each padded out to a
++ * full cacheline boundary so that:
++ *
++ *   GROUP A (hot, read-mostly):
++ *     The handful of fields that every per-CPU consumer reads on every
++ *     tick — `slice_wall`, `avg_lat_cri`, `avg_perf_cri`,
++ *     `avg_svc_time_iwgt`, `nr_queued_task`, plus the `*_perf_cri`
++ *     and `*_lat_cri` triples used by the slice/deadline calculators.
++ *
++ *   GROUP B (collector-internal):
++ *     Fields touched only by the periodic sys_stat collector and by
++ *     report/dump paths — `last_update_clk`, `avg_util_*`, the
++ *     `nr_active*` and `nr_stealee` summaries.
++ *
++ *   GROUP C (cold, write-mostly counters):
++ *     Pure aggregation counters (`nr_sched`, `nr_preempt`,
++ *     `nr_perf_cri`, `nr_lat_cri`, `nr_x_migration`, `nr_*_on_big`)
++ *     incremented in batch by the collector and read only at
++ *     dump/report time.
++ *
++ * Mixing all three groups on one or two cachelines (the original
++ * layout) means every collector tick invalidates the line that all
++ * 24 Raptor Lake hardware threads are reading on every scheduling
++ * decision — a textbook false-sharing pattern. After this split, the
++ * hot group lives on its own line(s) that the collector touches at
++ * most once per tunable interval, so the per-CPU readers see a
++ * stable line that stays L1/L2-resident.
++ *
++ * The whole struct is cacheline-aligned so it does not share its
++ * first line with neighbouring BSS variables.
++ *
++ * Layout-stability note: every original field is preserved by name;
++ * the only changes are (a) field reordering within the struct and
++ * (b) explicit `_pad*` members. Any consumer that accesses fields by
++ * name (the standard BPF skeleton pattern) is unaffected.
+  */
+ struct sys_stat {
+-	u64	last_update_clk;
+-	u64	avg_util_wall;	/* average of the CPU utilization (based on wall clock time) */
+-	u64	avg_util_invr;	/* average of the scaled CPU utilization,
+-				   which is capacity and frequency invariant */
+-
+-	u64	avg_svc_time_iwgt; /* average service time per task (weighted invariant time) */
++	/* ----- GROUP A: hot, read-mostly (per-CPU on every tick) ----- */
++	u64	slice_wall;		/* base time slice (wall clock time) */
++	u64	avg_svc_time_iwgt;	/* average service time per task (weighted invariant time) */
+ 	u64	nr_queued_task;
+-	u64	slice_wall;	/* base time slice (wall clock time) */
+-
+-	u32	avg_lat_cri;	/* average latency criticality (LC) */
+-	u32	max_lat_cri;	/* maximum latency criticality (LC) */
+-	u32	thr_lat_cri;	/* latency criticality threshold for kicking */
++	u32	avg_lat_cri;		/* average latency criticality (LC) */
++	u32	avg_perf_cri;		/* average performance criticality */
++	u32	max_lat_cri;		/* maximum latency criticality (LC) */
++	u32	thr_lat_cri;		/* latency criticality threshold for kicking */
++	u32	min_perf_cri;		/* minimum performance criticality */
++	u32	max_perf_cri;		/* maximum performance criticality */
++	u32	thr_perf_cri;		/* performance criticality threshold */
++	u8	_pad_a[LAVD_CACHELINE_SIZE -
++		       ((3 * sizeof(u64) + 7 * sizeof(u32)) %
++			LAVD_CACHELINE_SIZE)];
+ 
+-	u32	min_perf_cri;	/* minimum performance criticality */
+-	u32	avg_perf_cri;	/* average performance criticality */
+-	u32	max_perf_cri;	/* maximum performance criticality */
+-	u32	thr_perf_cri;	/* performance criticality threshold */
+-
+-	u32	nr_stealee;	/* number of compute domains to be migrated */
+-	u32	nr_active;	/* number of active CPUs */
+-	u32	nr_active_cpdoms; /* number of active compute domains */
+-
+-	u64	nr_sched;	/* total scheduling so far */
+-	u64	nr_preempt;	/* total number of preemption operations triggered */
+-	u64	nr_perf_cri;	/* number of performance-critical tasks scheduled */
+-	u64	nr_lat_cri;	/* number of latency-critical tasks scheduled */
+-	u64	nr_x_migration; /* number of cross domain migration */
+-	u64	nr_big;		/* scheduled on big core */
+-	u64	nr_pc_on_big;	/* performance-critical tasks scheduled on big core */
+-	u64	nr_lc_on_big;	/* latency-critical tasks scheduled on big core */
+-};
+-
+-/*
+- * Task information for report
++	/* ----- GROUP B: collector-internal & report-only ----- */
++	u64	last_update_clk;
++	u64	avg_util_wall;		/* average CPU utilization (wall clock) */
++	u64	avg_util_invr;		/* scaled CPU utilization (capacity- and frequency-invariant) */
++	u32	nr_stealee;		/* number of compute domains to be migrated */
++	u32	nr_active;		/* number of active CPUs */
++	u32	nr_active_cpdoms;	/* number of active compute domains */
++	u8	_pad_b[LAVD_CACHELINE_SIZE -
++		       ((3 * sizeof(u64) + 3 * sizeof(u32)) %
++			LAVD_CACHELINE_SIZE)];
++
++	/* ----- GROUP C: cold, write-mostly aggregation counters ----- */
++	u64	nr_sched;		/* total scheduling so far */
++	u64	nr_preempt;		/* total number of preemption operations triggered */
++	u64	nr_perf_cri;		/* number of performance-critical tasks scheduled */
++	u64	nr_lat_cri;		/* number of latency-critical tasks scheduled */
++	u64	nr_x_migration;		/* number of cross domain migration */
++	u64	nr_big;			/* scheduled on big core */
++	u64	nr_pc_on_big;		/* performance-critical tasks scheduled on big core */
++	u64	nr_lc_on_big;		/* latency-critical tasks scheduled on big core */
++} __lavd_cacheline_aligned;
++
++/*
++ * Task information for report.
++ *
++ * This is a wire format consumed by the userspace report path
++ * (msg_task_ctx); layout is intentionally untouched. Do not reorder.
+  */
+ struct task_ctx_x {
+-	pid_t	pid;			/* pid for this task */
++	pid_t	pid;				/* pid for this task */
+ 	char	comm[TASK_COMM_LEN + 1];
+ 	char	stat[LAVD_STATUS_STR_LEN + 1];
+-	u32	cpu_id;			/* where a task is running now */
+-	u32	prev_cpu_id;		/* where a task ran last time */
+-	u32	suggested_cpu_id;	/* suggested CPU ID at ops.enqueue() and ops.select_cpu() */
+-	pid_t	waker_pid;		/* last waker's PID */
+-	char	waker_comm[TASK_COMM_LEN + 1]; /* last waker's comm */
+-	u64	slice_wall;		/* base time slice (wall clock time) */
+-	u32	lat_cri;		/* final context-aware latency criticality */
+-	u32	avg_lat_cri;	/* average latency criticality */
+-	u16	static_prio;	/* nice priority */
+-	u64	rerunnable_interval_wall;/* rerunnable interval in ns: [last quiescent, last runnable] */
+-	u64	resched_interval_wall;	/* reschedule interval in ns: [last running, this running] */
+-	u64	run_freq;		/* scheduling frequency in a second */
+-	u64	avg_runtime_wall;	/* average runtime per schedule (wall clock time) */
+-	u64	wait_freq;		/* waiting frequency in a second */
+-	u64	wake_freq;		/* waking-up frequency in a second */
+-	u32	perf_cri;		/* performance criticality of a task */
+-	u32	thr_perf_cri;	/* performance criticality threshold */
+-	u32	cpuperf_cur;	/* CPU's current performance target */
+-	u64	cpu_util_wall;		/* cpu utilization in [0..100] */
+-	u64	cpu_util_invr;		/* scaled cpu utilization in [0..100] */
+-	u64	steal_util_wall;	/* steal utilization in [0..100] */
+-	u64	steal_util_invr;	/* scaled steal utilization in [0..100] */
+-	u64	dom_pinned_util_wall;	/* domain-pinned task utilization in [0..100] */
+-	u64	dom_pinned_util_invr;	/* scaled domain-pinned task utilization in [0..100] */
+-	u32	nr_active;	/* number of active cores */
+-	u64	dsq_id;		/* CPU's associated DSQ */
+-	u64	dsq_consume_lat; /* DSQ's consume latency */
+-	u64	last_slice_used_wall;	/* time(ns) used in last scheduled interval: [last running, last stopping] */
+-	u32	lat_headroom;	/* CPU's latency headroom */
+-	u32	vuln_thresh;	/* preemption vulnerability threshold step */
+-	u32	task_util_est;	/* task's estimated utilization from ravg */
+-	u16	norm_lat_cri;	/* task's normalized latency criticality [0, 1024] */
++	u32	cpu_id;				/* where a task is running now */
++	u32	prev_cpu_id;			/* where a task ran last time */
++	u32	suggested_cpu_id;		/* suggested CPU ID at ops.enqueue() and ops.select_cpu() */
++	pid_t	waker_pid;			/* last waker's PID */
++	char	waker_comm[TASK_COMM_LEN + 1];	/* last waker's comm */
++	u64	slice_wall;			/* base time slice (wall clock time) */
++	u32	lat_cri;			/* final context-aware latency criticality */
++	u32	avg_lat_cri;			/* average latency criticality */
++	u16	static_prio;			/* nice priority */
++	u64	rerunnable_interval_wall;	/* rerunnable interval in ns: [last quiescent, last runnable] */
++	u64	resched_interval_wall;		/* reschedule interval in ns: [last running, this running] */
++	u64	run_freq;			/* scheduling frequency in a second */
++	u64	avg_runtime_wall;		/* average runtime per schedule (wall clock time) */
++	u64	wait_freq;			/* waiting frequency in a second */
++	u64	wake_freq;			/* waking-up frequency in a second */
++	u32	perf_cri;			/* performance criticality of a task */
++	u32	thr_perf_cri;			/* performance criticality threshold */
++	u32	cpuperf_cur;			/* CPU's current performance target */
++	u64	cpu_util_wall;			/* cpu utilization in [0..100] */
++	u64	cpu_util_invr;			/* scaled cpu utilization in [0..100] */
++	u64	steal_util_wall;		/* steal utilization in [0..100] */
++	u64	steal_util_invr;		/* scaled steal utilization in [0..100] */
++	u64	dom_pinned_util_wall;		/* domain-pinned task utilization in [0..100] */
++	u64	dom_pinned_util_invr;		/* scaled domain-pinned task utilization in [0..100] */
++	u32	nr_active;			/* number of active cores */
++	u64	dsq_id;				/* CPU's associated DSQ */
++	u64	dsq_consume_lat;		/* DSQ's consume latency */
++	u64	last_slice_used_wall;		/* time(ns) used in last scheduled interval */
++	u32	lat_headroom;			/* CPU's latency headroom */
++	u32	vuln_thresh;			/* preemption vulnerability threshold step */
++	u32	task_util_est;			/* task's estimated utilization from ravg */
++	u16	norm_lat_cri;			/* task's normalized latency criticality [0, 1024] */
+ };
+ 
+-
+ /*
+- * introspection
++ * Introspection — wire format. Do not reorder.
+  */
+ enum {
+-       LAVD_CMD_NOP		= 0x0,
+-       LAVD_CMD_SCHED_N		= 0x1,
++	LAVD_CMD_NOP		= 0x0,
++	LAVD_CMD_SCHED_N	= 0x1,
+ };
+ 
+ enum {
+-       LAVD_MSG_TASKC		= 0x1
++	LAVD_MSG_TASKC = 0x1
+ };
+ 
+ struct introspec {
+@@ -148,15 +213,13 @@ struct msg_task_ctx {
+ 	struct task_ctx_x	taskc_x;
+ };
+ 
+-
+ /*
+- * BPF syscall
++ * BPF syscall — wire format. Do not reorder.
+  */
+ enum {
+ 	LAVD_PM_PERFORMANCE	= 0,
+ 	LAVD_PM_BALANCED	= 1,
+ 	LAVD_PM_POWERSAVE	= 2,
+-
+ 	LAVD_PM_MAX		= 3
+ };
+ 
 
 --- a/scheds/rust/scx_lavd/src/cpu_order.rs	2025-11-20 17:12:11.591513313 +0100
 +++ b/scheds/rust/scx_lavd/src/cpu_order.rs	2026-05-12 17:18:21.900800396 +0100
