@@ -762,7 +762,8 @@ void alc_fixup_inv_dmic(struct hda_codec *codec,
 {
 	struct alc_spec *spec = codec->spec;
 
-	spec->gen.inv_dmic_split = 1;
+	if (action == HDA_FIXUP_ACT_PRE_PROBE)
+		spec->gen.inv_dmic_split = 1;
 }
 EXPORT_SYMBOL_NS_GPL(alc_fixup_inv_dmic, "SND_HDA_CODEC_REALTEK");
 
@@ -1204,25 +1205,27 @@ EXPORT_SYMBOL_NS_GPL(alc_fixup_dell_xps13, "SND_HDA_CODEC_REALTEK");
 
 static void alc_hp_mute_disable(struct hda_codec *codec, unsigned int delay)
 {
-	if (delay <= 0)
+	if (!delay)
 		delay = 75;
+
 	snd_hda_codec_write(codec, 0x21, 0,
-		    AC_VERB_SET_AMP_GAIN_MUTE, AMP_OUT_MUTE);
+			    AC_VERB_SET_AMP_GAIN_MUTE, AMP_OUT_MUTE);
 	msleep(delay);
 	snd_hda_codec_write(codec, 0x21, 0,
-		    AC_VERB_SET_PIN_WIDGET_CONTROL, 0x0);
+			    AC_VERB_SET_PIN_WIDGET_CONTROL, 0x0);
 	msleep(delay);
 }
 
 static void alc_hp_enable_unmute(struct hda_codec *codec, unsigned int delay)
 {
-	if (delay <= 0)
+	if (!delay)
 		delay = 75;
+
 	snd_hda_codec_write(codec, 0x21, 0,
-		    AC_VERB_SET_PIN_WIDGET_CONTROL, PIN_OUT);
+			    AC_VERB_SET_PIN_WIDGET_CONTROL, PIN_OUT);
 	msleep(delay);
 	snd_hda_codec_write(codec, 0x21, 0,
-		    AC_VERB_SET_AMP_GAIN_MUTE, AMP_OUT_UNMUTE);
+			    AC_VERB_SET_AMP_GAIN_MUTE, AMP_OUT_UNMUTE);
 	msleep(delay);
 }
 
