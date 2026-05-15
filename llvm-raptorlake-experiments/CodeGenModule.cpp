@@ -70,6 +70,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ConvertUTF.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Hash.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/TargetParser/AArch64TargetParser.h"
 #include "llvm/TargetParser/RISCVISAInfo.h"
@@ -77,7 +78,6 @@
 #include "llvm/TargetParser/X86TargetParser.h"
 #include "llvm/Transforms/Instrumentation/KCFI.h"
 #include "llvm/Transforms/Utils/BuildLibCalls.h"
-#include "llvm/Transforms/Utils/KCFIHash.h"
 #include <optional>
 #include <set>
 
@@ -482,6 +482,7 @@ CodeGenModule::CodeGenModule(ASTContext &C,
       llvm::PointerType::get(LLVMContext, DL.getProgramAddressSpace());
   ConstGlobalsPtrTy = llvm::PointerType::get(
       LLVMContext, C.getTargetAddressSpace(GetGlobalConstantAddressSpace()));
+  ASTAllocaAddressSpace = getTargetCodeGenInfo().getASTAllocaAddressSpace();
 
   // Build C++20 Module initializers.
   // TODO: Add Microsoft here once we know the mangling required for the
@@ -693,23 +694,16 @@ void CodeGenModule::addGlobalValReplacement(llvm::GlobalValue *GV,
 }
 
 void CodeGenModule::applyGlobalValReplacements() {
-  if (GlobalValReplacements.empty())
-    return;
-
-  llvm::SmallPtrSet<llvm::GlobalValue *, 16> Replaced;
   for (auto &I : GlobalValReplacements) {
     llvm::GlobalValue *GV = I.first;
     llvm::Constant *C = I.second;
 
-    // A GlobalValue can be queued multiple times through independent paths.
-    // Handle each source value exactly once to avoid touching erased globals.
-    if (!Replaced.insert(GV).second)
-      continue;
-
+    // Fast path: no users means no RAUW work.
     if (!GV->use_empty())
       GV->replaceAllUsesWith(C);
     GV->eraseFromParent();
   }
+
   GlobalValReplacements.clear();
 }
 
@@ -839,72 +833,6 @@ void CodeGenModule::checkAliases() {
                             MangledDeclNames, Range)) {
       Error = true;
       continue;
-    }
-
-    if (!IsIFunc) {
-      GlobalDecl AliaseeGD;
-      if (!lookupRepresentativeDecl(GV->getName(), AliaseeGD) ||
-          !isa<VarDecl, FunctionDecl>(AliaseeGD.getDecl())) {
-        Diags.Report(Location, diag::err_alias_to_undefined)
-            << IsIFunc << IsIFunc;
-        Error = true;
-        continue;
-      }
-
-      bool AliasIsFuncDecl = isa<FunctionDecl>(D);
-      bool AliaseeIsFunc = isa<llvm::Function, llvm::GlobalIFunc>(GV);
-      // Function declarations can only alias functions (including IFUNCs).
-      // Similarly, variable declarations can only alias variables.
-      if (AliasIsFuncDecl != AliaseeIsFunc) {
-        Diags.Report(Location, diag::err_alias_between_function_and_variable)
-            << AliasIsFuncDecl;
-        Diags.Report(AliaseeGD.getDecl()->getLocation(),
-                     diag::note_aliasee_declaration);
-        Error = true;
-        continue;
-      }
-
-      // Only report functions.
-      // Type mismatches for variables can be intentional.
-      if (AliasIsFuncDecl && AliaseeIsFunc) {
-        QualType AliasTy = D->getType();
-        QualType AliaseeTy = cast<ValueDecl>(AliaseeGD.getDecl())->getType();
-        auto shouldReportTypeMismatch = [&]() {
-          const auto *AliasFTy =
-              AliasTy.getCanonicalType()->getAs<FunctionType>();
-          const auto *AliaseeFTy =
-              AliaseeTy.getCanonicalType()->getAs<FunctionType>();
-          assert(AliasFTy && AliaseeFTy);
-          if (!Context.typesAreCompatible(AliasFTy->getReturnType(),
-                                          AliaseeFTy->getReturnType()))
-            return true;
-          const auto *AliasFPTy = dyn_cast<FunctionProtoType>(AliasFTy);
-          const auto *AliaseeFPTy = dyn_cast<FunctionProtoType>(AliaseeFTy);
-          // Report variadic vs no-prototype.
-          if ((AliasFPTy && AliasFPTy->isVariadic() && !AliaseeFPTy) ||
-              (AliaseeFPTy && AliaseeFPTy->isVariadic() && !AliasFPTy))
-            return true;
-          // Do not report aliases with unspecified parameter lists.
-          if (!AliasFPTy || !AliaseeFPTy)
-            return false;
-          // Report if the parameter lists are different. Any other mismatches,
-          // such as in exception specifications, are ignored.
-          if (AliasFPTy->getNumParams() != AliaseeFPTy->getNumParams() ||
-              AliasFPTy->isVariadic() != AliaseeFPTy->isVariadic())
-            return true;
-          for (unsigned i = 0; i < AliasFPTy->getNumParams(); ++i)
-            if (!Context.typesAreCompatible(AliasFPTy->getParamType(i),
-                                            AliaseeFPTy->getParamType(i)))
-              return true;
-          return false;
-        };
-        if (shouldReportTypeMismatch()) {
-          Diags.Report(Location, diag::warn_alias_type_mismatch)
-              << AliasTy << AliaseeTy;
-          Diags.Report(AliaseeGD.getDecl()->getLocation(),
-                       diag::note_aliasee_declaration);
-        }
-      }
     }
 
     if (getContext().getTargetInfo().getTriple().isOSAIX())
@@ -1728,9 +1656,6 @@ void CodeGenModule::Release() {
   if (getCodeGenOpts().StackProtectorGuardOffset != INT_MAX)
     getModule().setStackProtectorGuardOffset(
         getCodeGenOpts().StackProtectorGuardOffset);
-  if (getCodeGenOpts().StackProtectorGuardValueWidth != UINT_MAX)
-    getModule().setStackProtectorGuardValueWidth(
-        getCodeGenOpts().StackProtectorGuardValueWidth);
   if (getCodeGenOpts().StackAlignment)
     getModule().setOverrideStackAlignment(getCodeGenOpts().StackAlignment);
   if (getCodeGenOpts().SkipRaxSetup)
@@ -4571,15 +4496,16 @@ void CodeGenModule::EmitGlobal(GlobalDecl GD) {
 
           bool UnifiedMemoryEnabled =
               getOpenMPRuntime().hasRequiresUnifiedSharedMemory();
-          if (*Res == OMPDeclareTargetDeclAttr::MT_Local ||
-              ((*Res == OMPDeclareTargetDeclAttr::MT_To ||
-                *Res == OMPDeclareTargetDeclAttr::MT_Enter) &&
-               !UnifiedMemoryEnabled)) {
+          if ((*Res == OMPDeclareTargetDeclAttr::MT_To ||
+               *Res == OMPDeclareTargetDeclAttr::MT_Enter ||
+               *Res == OMPDeclareTargetDeclAttr::MT_Local) &&
+              !UnifiedMemoryEnabled) {
             (void)GetAddrOfGlobalVar(VD);
           } else {
             assert(((*Res == OMPDeclareTargetDeclAttr::MT_Link) ||
                     ((*Res == OMPDeclareTargetDeclAttr::MT_To ||
-                      *Res == OMPDeclareTargetDeclAttr::MT_Enter) &&
+                      *Res == OMPDeclareTargetDeclAttr::MT_Enter ||
+                      *Res == OMPDeclareTargetDeclAttr::MT_Local) &&
                      UnifiedMemoryEnabled)) &&
                    "Link clause or to clause with unified memory expected.");
             (void)getOpenMPRuntime().getAddrOfDeclareTargetVar(VD);
@@ -6734,108 +6660,94 @@ CodeGenModule::getLLVMLinkageVarDefinition(const VarDecl *VD) {
 
 /// Replace the uses of a function that was declared with a non-proto type.
 /// We want to silently drop extra arguments from call sites
-static void replaceUsesOfNonProtoConstant(llvm::Constant *old,
-                                          llvm::Function *newFn) {
+static void replaceUsesOfNonProtoConstant(llvm::Constant *Old,
+                                          llvm::Function *NewFn) {
   // Fast path.
-  if (old->use_empty())
+  if (Old->use_empty())
     return;
 
-  llvm::Type *newRetTy = newFn->getReturnType();
-  SmallVector<llvm::Value *, 4> newArgs;
+  llvm::Type *NewRetTy = NewFn->getReturnType();
+  SmallVector<llvm::Value *, 8> NewArgs;
+  SmallVector<llvm::AttributeSet, 8> NewArgAttrs;
+  SmallVector<llvm::CallBase *, 16> CallSitesToErase;
+  SmallVector<llvm::OperandBundleDef, 1> Bundles;
 
-  SmallVector<llvm::CallBase *> callSitesToBeRemovedFromParent;
+  for (llvm::Value::use_iterator UI = Old->use_begin(), UE = Old->use_end();
+       UI != UE;) {
+    llvm::Value::use_iterator Cur = UI++;
+    llvm::User *User = Cur->getUser();
 
-  for (llvm::Value::use_iterator ui = old->use_begin(), ue = old->use_end();
-       ui != ue; ui++) {
-    llvm::User *user = ui->getUser();
-
-    // Recognize and replace uses of bitcasts.  Most calls to
-    // unprototyped functions will use bitcasts.
-    if (auto *bitcast = dyn_cast<llvm::ConstantExpr>(user)) {
-      if (bitcast->getOpcode() == llvm::Instruction::BitCast)
-        replaceUsesOfNonProtoConstant(bitcast, newFn);
+    // Recognize and replace uses of bitcasts. Most calls to unprototyped
+    // functions will use bitcasts.
+    if (auto *Bitcast = dyn_cast<llvm::ConstantExpr>(User)) {
+      if (Bitcast->getOpcode() == llvm::Instruction::BitCast)
+        replaceUsesOfNonProtoConstant(Bitcast, NewFn);
       continue;
     }
 
     // Recognize calls to the function.
-    llvm::CallBase *callSite = dyn_cast<llvm::CallBase>(user);
-    if (!callSite)
+    auto *CallSite = dyn_cast<llvm::CallBase>(User);
+    if (!CallSite)
       continue;
-    if (!callSite->isCallee(&*ui))
-      continue;
-
-    // If the return types don't match exactly, then we can't
-    // transform this call unless it's dead.
-    if (callSite->getType() != newRetTy && !callSite->use_empty())
+    if (!CallSite->isCallee(&*Cur))
       continue;
 
-    // Get the call site's attribute list.
-    SmallVector<llvm::AttributeSet, 8> newArgAttrs;
-    llvm::AttributeList oldAttrs = callSite->getAttributes();
+    // If return types don't match exactly, only transform dead calls.
+    if (CallSite->getType() != NewRetTy && !CallSite->use_empty())
+      continue;
 
     // If the function was passed too few arguments, don't transform.
-    unsigned newNumArgs = newFn->arg_size();
-    if (callSite->arg_size() < newNumArgs)
+    const unsigned NewNumFixedArgs = NewFn->arg_size();
+    const unsigned OldNumArgs = CallSite->arg_size();
+    if (OldNumArgs < NewNumFixedArgs)
       continue;
 
-    // If extra arguments were passed, we silently drop them.
-    // If any of the types mismatch, we don't transform.
-    unsigned argNo = 0;
-    bool dontTransform = false;
-    for (llvm::Argument &A : newFn->args()) {
-      if (callSite->getArgOperand(argNo)->getType() != A.getType()) {
-        dontTransform = true;
-        break;
-      }
+    // Build the new arg list: keep all args for varargs, otherwise drop extras.
+    const unsigned NumArgsToPass = NewFn->isVarArg() ? OldNumArgs : NewNumFixedArgs;
+    NewArgs.clear();
+    NewArgAttrs.clear();
+    NewArgs.reserve(NumArgsToPass);
+    NewArgAttrs.reserve(NumArgsToPass);
 
-      // Add any parameter attributes.
-      newArgAttrs.push_back(oldAttrs.getParamAttrs(argNo));
-      argNo++;
+    for (unsigned I = 0; I < NumArgsToPass; ++I) {
+      NewArgs.push_back(CallSite->getArgOperand(I));
+      NewArgAttrs.push_back(CallSite->getAttributes().getParamAttrs(I));
     }
-    if (dontTransform)
-      continue;
 
-    // Okay, we can transform this.  Create the new call instruction and copy
-    // over the required information.
-    newArgs.append(callSite->arg_begin(), callSite->arg_begin() + argNo);
+    llvm::AttributeList OldAttrs = CallSite->getAttributes();
+    llvm::AttributeList NewAttrs = llvm::AttributeList::get(
+        CallSite->getContext(), OldAttrs.getRetAttrs(), OldAttrs.getFnAttrs(),
+        NewArgAttrs);
 
-    // Copy over any operand bundles.
-    SmallVector<llvm::OperandBundleDef, 1> newBundles;
-    callSite->getOperandBundlesAsDefs(newBundles);
+    Bundles.clear();
+    CallSite->getOperandBundlesAsDefs(Bundles);
 
-    llvm::CallBase *newCall;
-    if (isa<llvm::CallInst>(callSite)) {
-      newCall = llvm::CallInst::Create(newFn, newArgs, newBundles, "",
-                                       callSite->getIterator());
+    llvm::CallBase *NewCall = nullptr;
+    if (auto *II = dyn_cast<llvm::InvokeInst>(CallSite)) {
+      NewCall = llvm::InvokeInst::Create(NewFn, II->getNormalDest(),
+                                         II->getUnwindDest(), NewArgs, Bundles,
+                                         "", II->getIterator());
     } else {
-      auto *oldInvoke = cast<llvm::InvokeInst>(callSite);
-      newCall = llvm::InvokeInst::Create(
-          newFn, oldInvoke->getNormalDest(), oldInvoke->getUnwindDest(),
-          newArgs, newBundles, "", callSite->getIterator());
+      auto *CI = cast<llvm::CallInst>(CallSite);
+      auto *NewCI =
+          llvm::CallInst::Create(NewFn, NewArgs, Bundles, "", CI->getIterator());
+      NewCI->setTailCallKind(CI->getTailCallKind());
+      NewCall = NewCI;
     }
-    newArgs.clear(); // for the next iteration
 
-    if (!newCall->getType()->isVoidTy())
-      newCall->takeName(callSite);
-    newCall->setAttributes(
-        llvm::AttributeList::get(newFn->getContext(), oldAttrs.getFnAttrs(),
-                                 oldAttrs.getRetAttrs(), newArgAttrs));
-    newCall->setCallingConv(callSite->getCallingConv());
+    NewCall->setCallingConv(CallSite->getCallingConv());
+    NewCall->setAttributes(NewAttrs);
+    cast<llvm::Instruction>(NewCall)->copyMetadata(
+        *cast<llvm::Instruction>(CallSite));
 
-    // Finally, remove the old call, replacing any uses with the new one.
-    if (!callSite->use_empty())
-      callSite->replaceAllUsesWith(newCall);
+    if (!CallSite->use_empty())
+      CallSite->replaceAllUsesWith(NewCall);
 
-    // Copy debug location attached to CI.
-    if (callSite->getDebugLoc())
-      newCall->setDebugLoc(callSite->getDebugLoc());
-
-    callSitesToBeRemovedFromParent.push_back(callSite);
+    CallSitesToErase.push_back(CallSite);
   }
 
-  for (auto *callSite : callSitesToBeRemovedFromParent) {
-    callSite->eraseFromParent();
-  }
+  for (llvm::CallBase *CallSite : CallSitesToErase)
+    CallSite->eraseFromParent();
 }
 
 /// ReplaceUsesOfNonProtoTypeWithRealFunction - This function is called when we
@@ -8238,67 +8150,65 @@ static void EmitGlobalDeclMetadata(CodeGenModule &CGM,
 
 bool CodeGenModule::CheckAndReplaceExternCIFuncs(llvm::GlobalValue *Elem,
                                                  llvm::GlobalValue *CppFunc) {
-  // Store the list of ifuncs we need to replace uses in.
-  llvm::SmallVector<llvm::GlobalIFunc *> IFuncs;
-  // List of ConstantExprs that we should be able to delete when we're done
-  // here.
-  llvm::SmallVector<llvm::ConstantExpr *> CEs;
+  llvm::SmallVector<llvm::GlobalIFunc *, 8> IFuncs;
+  llvm::SmallVector<llvm::ConstantExpr *, 8> CEs;
 
-  // It isn't valid to replace the extern-C ifuncs if all we find is itself!
   if (Elem == CppFunc)
     return false;
 
-  // First make sure that all users of this are ifuncs (or ifuncs via a
-  // bitcast), and collect the list of ifuncs and CEs so we can work on them
-  // later.
+  // Validate user graph shape first and collect all affected nodes.
   for (llvm::User *User : Elem->users()) {
-    // Users can either be a bitcast ConstExpr that is used by the ifuncs, OR an
-    // ifunc directly. In any other case, just give up, as we don't know what we
-    // could break by changing those.
     if (auto *ConstExpr = dyn_cast<llvm::ConstantExpr>(User)) {
       if (ConstExpr->getOpcode() != llvm::Instruction::BitCast)
         return false;
 
       for (llvm::User *CEUser : ConstExpr->users()) {
-        if (auto *IFunc = dyn_cast<llvm::GlobalIFunc>(CEUser)) {
-          IFuncs.push_back(IFunc);
-        } else {
+        auto *IFunc = dyn_cast<llvm::GlobalIFunc>(CEUser);
+        if (!IFunc)
           return false;
-        }
+        IFuncs.push_back(IFunc);
       }
+
       CEs.push_back(ConstExpr);
-    } else if (auto *IFunc = dyn_cast<llvm::GlobalIFunc>(User)) {
-      IFuncs.push_back(IFunc);
-    } else {
-      // This user is one we don't know how to handle, so fail redirection. This
-      // will result in an ifunc retaining a resolver name that will ultimately
-      // fail to be resolved to a defined function.
-      return false;
+      continue;
     }
+
+    if (auto *IFunc = dyn_cast<llvm::GlobalIFunc>(User)) {
+      IFuncs.push_back(IFunc);
+      continue;
+    }
+
+    // Unknown use shape; do not attempt redirection.
+    return false;
   }
 
-  // Now we know this is a valid case where we can do this alias replacement, we
-  // need to remove all of the references to Elem (and the bitcasts!) so we can
-  // delete it.
+  // Nothing to do.
+  if (IFuncs.empty())
+    return false;
+
+  // Temporarily clear resolvers so we can drop old references.
   for (llvm::GlobalIFunc *IFunc : IFuncs)
     IFunc->setResolver(nullptr);
+
   for (llvm::ConstantExpr *ConstExpr : CEs)
     ConstExpr->destroyConstant();
 
-  // We should now be out of uses for the 'old' version of this function, so we
-  // can erase it as well.
+  // Old element should now be dead.
+  if (!Elem->use_empty())
+    return false;
+
   Elem->eraseFromParent();
 
+  // Rebind all ifunc resolvers to the C++ symbol name.
   for (llvm::GlobalIFunc *IFunc : IFuncs) {
-    // The type of the resolver is always just a function-type that returns the
-    // type of the IFunc, so create that here. If the type of the actual
-    // resolver doesn't match, it just gets bitcast to the right thing.
     auto *ResolverTy =
-        llvm::FunctionType::get(IFunc->getType(), /*isVarArg*/ false);
-    llvm::Constant *Resolver = GetOrCreateLLVMFunction(
-        CppFunc->getName(), ResolverTy, {}, /*ForVTable*/ false);
+        llvm::FunctionType::get(IFunc->getType(), /*isVarArg=*/false);
+    llvm::Constant *Resolver =
+        GetOrCreateLLVMFunction(CppFunc->getName(), ResolverTy, {},
+                                /*ForVTable=*/false);
     IFunc->setResolver(Resolver);
   }
+
   return true;
 }
 
@@ -8310,21 +8220,20 @@ bool CodeGenModule::CheckAndReplaceExternCIFuncs(llvm::GlobalValue *Elem,
 void CodeGenModule::EmitStaticExternCAliases() {
   if (!getTargetCodeGenInfo().shouldEmitStaticExternCAliases())
     return;
+
   for (auto &I : StaticExternCValues) {
     const IdentifierInfo *Name = I.first;
     llvm::GlobalValue *Val = I.second;
 
-    // If Val is null, that implies there were multiple declarations that each
-    // had a claim to the unmangled name. In this case, generation of the alias
-    // is suppressed. See CodeGenModule::MaybeHandleStaticInExternC.
+    // If Val is null, multiple declarations claimed the same unmangled name.
+    // Suppress this alias only; keep processing other candidates.
     if (!Val)
-      break;
+      continue;
 
-    llvm::GlobalValue *ExistingElem =
-        getModule().getNamedValue(Name->getName());
+    llvm::GlobalValue *ExistingElem = getModule().getNamedValue(Name->getName());
 
-    // If there is either not something already by this name, or we were able to
-    // replace all uses from IFuncs, create the alias.
+    // If there is either no symbol by this name yet, or we successfully
+    // redirected ifunc users away from ExistingElem, create the alias.
     if (!ExistingElem || CheckAndReplaceExternCIFuncs(ExistingElem, Val))
       addCompilerUsedGlobal(llvm::GlobalAlias::create(Name->getName(), Val));
   }
@@ -8575,33 +8484,22 @@ CharUnits CodeGenModule::getNaturalTypeAlignment(QualType T,
   if (TBAAInfo)
     *TBAAInfo = getTBAAAccessInfo(T);
 
-  // FIXME: This duplicates logic in ASTContext::getTypeAlignIfKnown. But
-  // that doesn't return the information we need to compute BaseInfo.
-
   // Honor alignment typedef attributes even on incomplete types.
-  // We also honor them straight for C++ class types, even as pointees;
-  // there's an expressivity gap here.
-  if (auto TT = T->getAs<TypedefType>()) {
-    if (auto Align = TT->getDecl()->getMaxAlignment()) {
+  // Also honor them for C++ class pointees.
+  if (const auto *TT = T->getAs<TypedefType>()) {
+    if (unsigned Align = TT->getDecl()->getMaxAlignment()) {
       if (BaseInfo)
         *BaseInfo = LValueBaseInfo(AlignmentSource::AttributedType);
       return getContext().toCharUnitsFromBits(Align);
     }
   }
 
-  bool AlignForArray = T->isArrayType();
+  const bool AlignForArray = T->isArrayType();
 
-  // Analyze the base element type, so we don't get confused by incomplete
-  // array types.
+  // Analyze the base element type so incomplete arrays don't confuse alignment.
   T = getContext().getBaseElementType(T);
 
   if (T->isIncompleteType()) {
-    // We could try to replicate the logic from
-    // ASTContext::getTypeAlignIfKnown, but nothing uses the alignment if the
-    // type is incomplete, so it's impossible to test. We could try to reuse
-    // getTypeAlignIfKnown, but that doesn't return the information we need
-    // to set BaseInfo.  So just ignore the possibility that the alignment is
-    // greater than one.
     if (BaseInfo)
       *BaseInfo = LValueBaseInfo(AlignmentSource::Type);
     return CharUnits::One();
@@ -8611,26 +8509,24 @@ CharUnits CodeGenModule::getNaturalTypeAlignment(QualType T,
     *BaseInfo = LValueBaseInfo(AlignmentSource::Type);
 
   CharUnits Alignment;
-  const CXXRecordDecl *RD;
   if (T.getQualifiers().hasUnaligned()) {
     Alignment = CharUnits::One();
-  } else if (forPointeeType && !AlignForArray &&
-             (RD = T->getAsCXXRecordDecl())) {
-    // For C++ class pointees, we don't know whether we're pointing at a
-    // base or a complete object, so we generally need to use the
-    // non-virtual alignment.
-    Alignment = getClassPointerAlignment(RD);
+  } else if (forPointeeType && !AlignForArray) {
+    if (const auto *RD = T->getAsCXXRecordDecl())
+      Alignment = getClassPointerAlignment(RD);
+    else
+      Alignment = getContext().getTypeAlignInChars(T);
   } else {
     Alignment = getContext().getTypeAlignInChars(T);
   }
 
-  // Cap to the global maximum type alignment unless the alignment
-  // was somehow explicit on the type.
+  // Cap to global maximum type alignment unless alignment is explicitly required.
   if (unsigned MaxAlign = getLangOpts().MaxTypeAlign) {
     if (Alignment.getQuantity() > MaxAlign &&
         !getContext().isAlignmentRequired(T))
       Alignment = CharUnits::fromQuantity(MaxAlign);
   }
+
   return Alignment;
 }
 
@@ -8710,10 +8606,6 @@ void CodeGenModule::moveLazyEmissionStates(CodeGenModule *NewBuilder) {
   assert(NewBuilder->DeferredVTables.empty() &&
          "Newly created module should not have deferred vtables");
   NewBuilder->DeferredVTables = std::move(DeferredVTables);
-
-  assert(NewBuilder->EmittedVTables.empty() &&
-         "Newly created module should not have defined vtables");
-  NewBuilder->EmittedVTables = std::move(EmittedVTables);
 
   assert(NewBuilder->MangledDeclNames.empty() &&
          "Newly created module should not have mangled decl names");
