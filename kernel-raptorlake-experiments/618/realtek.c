@@ -1090,11 +1090,14 @@ static const struct snd_pcm_chmap_elem asus_pcm_2_1_chmaps[] = {
 void alc_fixup_bass_chmap(struct hda_codec *codec,
 			  const struct hda_fixup *fix, int action)
 {
-	struct alc_spec *spec = codec->spec;
+	struct alc_spec *spec;
 	struct hda_pcm *pcm;
 
-	if (action != HDA_FIXUP_ACT_BUILD || !spec || !spec->gen.pcm_rec ||
-	    !spec->gen.pcm_rec[0])
+	if (action != HDA_FIXUP_ACT_BUILD)
+		return;
+
+	spec = codec->spec;
+	if (!spec || !spec->gen.pcm_rec[0])
 		return;
 
 	pcm = spec->gen.pcm_rec[0];
