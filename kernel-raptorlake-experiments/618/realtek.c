@@ -1091,14 +1091,17 @@ void alc_fixup_bass_chmap(struct hda_codec *codec,
 			  const struct hda_fixup *fix, int action)
 {
 	struct alc_spec *spec = codec->spec;
+	struct hda_pcm *pcm;
 
-	if (action != HDA_FIXUP_ACT_BUILD)
+	if (action != HDA_FIXUP_ACT_BUILD || !spec || !spec->gen.pcm_rec ||
+	    !spec->gen.pcm_rec[0])
 		return;
 
-	if (!spec || !spec->gen.pcm_rec[0] || !spec->gen.pcm_rec[0]->stream)
+	pcm = spec->gen.pcm_rec[0];
+	if (!pcm->stream[SNDRV_PCM_STREAM_PLAYBACK].substreams)
 		return;
 
-	spec->gen.pcm_rec[0]->stream[0].chmap = asus_pcm_2_1_chmaps;
+	pcm->stream[SNDRV_PCM_STREAM_PLAYBACK].chmap = asus_pcm_2_1_chmaps;
 }
 EXPORT_SYMBOL_NS_GPL(alc_fixup_bass_chmap, "SND_HDA_CODEC_REALTEK");
 
