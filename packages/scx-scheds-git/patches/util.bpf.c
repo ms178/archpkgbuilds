@@ -351,6 +351,8 @@ void set_affinity_flags(task_ctx __arg_arena *taskc,
 	}
 
 	bpf_for(cpu, 0, nr) {
+		s32 this_cpdom_id;
+
 		if (cpu >= LAVD_CPU_ID_MAX)
 			break;
 
@@ -370,14 +372,25 @@ void set_affinity_flags(task_ctx __arg_arena *taskc,
 
 		/*
 		 * Track whether the task is domain-pinned: confined to a
-		 * single compute domain. On the first CPU seen, record its
-		 * domain. On any subsequent CPU in a different domain, the
-		 * task spans multiple domains and is not domain-pinned.
+		 * single compute domain.
+		 *
+		 * Snapshot cpuc->cpdom_id once per iteration so the
+		 * "first CPU vs subsequent CPU" comparison cannot observe
+		 * a torn value if a concurrent topology rebuild relabels
+		 * cpdom_id between reads. Pattern mirrors Chen Yu /
+		 * Tim Chen's READ_ONCE(mm->sc_stat.cpu) fix in the
+		 * upstream sched/cache series (see commit message:
+		 * "could operate on different values, allowing a
+		 * negative CPU ID to be used as an index"). Zero-cost
+		 * (register-resident u8 → u32 widen), strict TOCTOU
+		 * elimination.
 		 */
+		this_cpdom_id = (s32)cpuc->cpdom_id;
+
 		if (!dom_pinned_settled) {
 			if (first_cpdom_id < 0)
-				first_cpdom_id = cpuc->cpdom_id;
-			else if (cpuc->cpdom_id != first_cpdom_id) {
+				first_cpdom_id = this_cpdom_id;
+			else if (this_cpdom_id != first_cpdom_id) {
 				dom_pinned = false;
 				dom_pinned_settled = true;
 			}
@@ -553,6 +566,7 @@ u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc,
 		      task_ctx *taskc)
 {
 	struct cpdom_ctx *cpdomc;
+	u32 cpdom_id;
 
 	/*
 	 * On a standard desktop hybrid config (Raptor Lake gaming +
@@ -566,13 +580,35 @@ u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc,
 	if (unlikely(per_cpu_dsq || (pinned_slice_ns && is_pinned(p))))
 		return cpu_to_dsq(cpuc->cpu_id);
 
-	cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
+	/*
+	 * Snapshot cpdom_id once into a local. The upstream pattern
+	 * derefed cpuc->cpdom_id three times (MEMBER_VPTR bound check,
+	 * cpdom_to_dsq, cpdom_to_turb_dsq), which is the exact
+	 * bug-class that Chen Yu / Tim Chen's READ_ONCE(mm->sc_stat.cpu)
+	 * fix in the upstream sched/cache series addresses: a concurrent
+	 * topology rebuild could relabel cpdom_id between the
+	 * MEMBER_VPTR's internal bounds-check and the subsequent
+	 * array access, allowing the verified-OK index to be replaced
+	 * with an OOB one before the actual deref. Single snapshot
+	 * eliminates the TOCTOU window at zero cost (register-resident
+	 * u8 → u32 widen).
+	 *
+	 * It also produces tighter codegen: the three identical reads
+	 * collapse to one, and cpdom_to_dsq()/cpdom_to_turb_dsq() (both
+	 * trivial bit-ops on cpdom_id) are now operating on the same
+	 * register-resident value, enabling the BPF backend to keep
+	 * cpdom_id alive in a callee-saved register across the
+	 * MEMBER_VPTR sequence.
+	 */
+	cpdom_id = (u32)cpuc->cpdom_id;
+
+	cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
 	if (cpdomc &&
 	    preemption_vulnerability(taskc->normalized_lat_cri,
 				     taskc->util_est) >= cpdomc->vuln_thresh)
-		return cpdom_to_dsq(cpuc->cpdom_id);
+		return cpdom_to_dsq(cpdom_id);
 
-	return cpdom_to_turb_dsq(cpuc->cpdom_id);
+	return cpdom_to_turb_dsq(cpdom_id);
 }
 
 /**

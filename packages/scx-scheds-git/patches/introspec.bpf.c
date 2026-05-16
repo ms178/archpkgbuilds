@@ -218,19 +218,38 @@ static void proc_introspec_sched_n(struct task_struct *p,
 __hidden
 void try_proc_introspec_cmd(struct task_struct *p, task_ctx __arg_arena *taskc)
 {
+	u32 cmd;
+
 	/*
 	 * is_monitored is declared `volatile` so this read is already
 	 * a fresh load; READ_ONCE() would be redundant. The branch is
 	 * biased heavily toward "not monitored" in normal operation
 	 * (only set when the user-space tool is actively introspecting),
-	 * so the unlikely() hint keeps the cold path off the BPU's hot
+	 * so the likely() hint keeps the cold path off the BPU's hot
 	 * straight-line layout — important because this is called on
 	 * every scheduling tick (Intel Optimization Manual §3.4.1).
 	 */
 	if (likely(!is_monitored))
 		return;
 
-	switch (intrspc.cmd) {
+	/*
+	 * Snapshot intrspc.cmd once. Although `intrspc` is volatile
+	 * (so each member access is a fresh load), the upstream pattern
+	 * derefs it twice: once for the switch dispatch and once in the
+	 * `default:` error-message format string. Userspace can update
+	 * intrspc.cmd between those two reads, producing a misleading
+	 * "Unknown introspec command: %d" message that names a value
+	 * different from the one that actually triggered the default
+	 * case. This is the exact bug-class that Chen Yu / Tim Chen's
+	 * READ_ONCE(mm->sc_stat.cpu) fix in the upstream sched/cache
+	 * series addresses (see Fixes: 47d8696b95f7 commit message:
+	 * "the validation ... and subsequent use ... could operate on
+	 * different values"). Cost: zero (volatile already forces the
+	 * single load).
+	 */
+	cmd = intrspc.cmd;
+
+	switch (cmd) {
 	case LAVD_CMD_SCHED_N:
 		proc_introspec_sched_n(p, taskc);
 		break;
@@ -238,7 +257,7 @@ void try_proc_introspec_cmd(struct task_struct *p, task_ctx __arg_arena *taskc)
 		/* do nothing */
 		break;
 	default:
-		scx_bpf_error("Unknown introspec command: %d", intrspc.cmd);
+		scx_bpf_error("Unknown introspec command: %d", cmd);
 		break;
 	}
 }
