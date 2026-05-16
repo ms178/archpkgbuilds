@@ -122,9 +122,9 @@ static struct ioapic {
 	/* iomem resource inserted under /proc/iomem */
 	struct resource			*iomem_res;
 
-	/* -------- modernised cache lines -------- */
-	void __iomem			*base;		/* fast MMIO base  */
-	bool				has_eoi;	/* v >= 0x20 EOI ? */
+	/* cached per-ioapic runtime data */
+	void __iomem			*base;
+	bool				has_eoi;
 } ioapics[MAX_IO_APICS];
 
 #define mpc_ioapic_ver(ioapic_idx)	ioapics[ioapic_idx].mp_config.apicver
@@ -325,8 +325,8 @@ static struct IO_APIC_route_entry ioapic_read_entry(int apic, int pin)
  */
 static void __ioapic_write_entry(int apic, int pin, struct IO_APIC_route_entry e)
 {
-	io_apic_write(apic, 0x11 + 2*pin, e.w2);
-	io_apic_write(apic, 0x10 + 2*pin, e.w1);
+	io_apic_write(apic, 0x11 + 2 * pin, e.w2);
+	io_apic_write(apic, 0x10 + 2 * pin, e.w1);
 }
 
 static void ioapic_write_entry(int apic, int pin, struct IO_APIC_route_entry e)
@@ -345,8 +345,8 @@ static void ioapic_mask_entry(int apic, int pin)
 	struct IO_APIC_route_entry e = { .masked = true };
 
 	guard(raw_spinlock_irqsave)(&ioapic_lock);
-	io_apic_write(apic, 0x10 + 2*pin, e.w1);
-	io_apic_write(apic, 0x11 + 2*pin, e.w2);
+	io_apic_write(apic, 0x10 + 2 * pin, e.w1);
+	io_apic_write(apic, 0x11 + 2 * pin, e.w2);
 }
 
 /*
@@ -404,46 +404,12 @@ static void __remove_pin_from_irq(struct mp_chip_data *data, int apic, int pin)
 	}
 }
 
-static void io_apic_modify_irq(struct mp_chip_data *data, bool masked,
-							   void (*final)(struct irq_pin_list *entry))
+static __always_inline struct irq_pin_list *ioapic_first_pin(struct mp_chip_data *data)
 {
-	struct irq_pin_list *entry;
+	if (unlikely(list_empty(&data->irq_2_pin)))
+		return NULL;
 
-	data->entry.masked = masked;
-
-	if (list_empty(&data->irq_2_pin))
-		return;
-
-	/* fast-path: exactly one pin mapped to this IRQ */
-	if (list_is_singular(&data->irq_2_pin)) {
-		entry = list_first_entry(&data->irq_2_pin,
-								 struct irq_pin_list, list);
-		io_apic_write(entry->apic, 0x10 + 2 * entry->pin,
-					  data->entry.w1);
-		if (final)
-			final(entry);
-		return;
-	}
-
-	/* generic slow-path */
-	for_each_irq_pin(entry, data->irq_2_pin) {
-		io_apic_write(entry->apic, 0x10 + 2 * entry->pin,
-					  data->entry.w1);
-		if (final)
-			final(entry);
-	}
-}
-
-/*
- * Synchronize the IO-APIC and the CPU by doing a dummy read from the
- * IO-APIC
- */
-static void io_apic_sync(struct irq_pin_list *entry)
-{
-	struct io_apic __iomem *io_apic;
-
-	io_apic = io_apic_base(entry->apic);
-	readl(&io_apic->data);
+	return list_first_entry(&data->irq_2_pin, struct irq_pin_list, list);
 }
 
 static __always_inline void io_apic_write_pin_low(struct irq_pin_list *entry, u32 w1)
@@ -451,9 +417,9 @@ static __always_inline void io_apic_write_pin_low(struct irq_pin_list *entry, u3
 	io_apic_write(entry->apic, 0x10 + 2 * entry->pin, w1);
 }
 
-static __always_inline void io_apic_sync_pin(struct irq_pin_list *entry)
+static __always_inline void io_apic_sync_apic(unsigned int apic)
 {
-	struct io_apic __iomem *io_apic = io_apic_base(entry->apic);
+	struct io_apic __iomem *io_apic = io_apic_base(apic);
 
 	readl(&io_apic->data);
 }
@@ -461,23 +427,28 @@ static __always_inline void io_apic_sync_pin(struct irq_pin_list *entry)
 static void io_apic_mask_irq(struct mp_chip_data *data)
 {
 	struct irq_pin_list *entry;
+	DECLARE_BITMAP(touched_apics, MAX_IO_APICS);
+	unsigned int apic;
 
 	data->entry.masked = true;
-
-	if (list_empty(&data->irq_2_pin))
+	entry = ioapic_first_pin(data);
+	if (!entry)
 		return;
 
 	if (likely(list_is_singular(&data->irq_2_pin))) {
-		entry = list_first_entry(&data->irq_2_pin, struct irq_pin_list, list);
 		io_apic_write_pin_low(entry, data->entry.w1);
-		io_apic_sync_pin(entry);
+		io_apic_sync_apic(entry->apic);
 		return;
 	}
 
+	bitmap_zero(touched_apics, MAX_IO_APICS);
 	for_each_irq_pin(entry, data->irq_2_pin) {
 		io_apic_write_pin_low(entry, data->entry.w1);
-		io_apic_sync_pin(entry);
+		__set_bit(entry->apic, touched_apics);
 	}
+
+	for_each_set_bit(apic, touched_apics, MAX_IO_APICS)
+		io_apic_sync_apic(apic);
 }
 
 static void io_apic_unmask_irq(struct mp_chip_data *data)
@@ -485,12 +456,11 @@ static void io_apic_unmask_irq(struct mp_chip_data *data)
 	struct irq_pin_list *entry;
 
 	data->entry.masked = false;
-
-	if (list_empty(&data->irq_2_pin))
+	entry = ioapic_first_pin(data);
+	if (!entry)
 		return;
 
 	if (likely(list_is_singular(&data->irq_2_pin))) {
-		entry = list_first_entry(&data->irq_2_pin, struct irq_pin_list, list);
 		io_apic_write_pin_low(entry, data->entry.w1);
 		return;
 	}
@@ -566,12 +536,19 @@ static void eoi_ioapic_pin(int vector, struct mp_chip_data *data)
 
 	if (likely(list_is_singular(&data->irq_2_pin))) {
 		entry = list_first_entry(&data->irq_2_pin, struct irq_pin_list, list);
-		__eoi_ioapic_pin(entry->apic, entry->pin, vector);
+		if (likely(ioapics[entry->apic].has_eoi))
+			io_apic_eoi(entry->apic, vector);
+		else
+			__eoi_ioapic_pin(entry->apic, entry->pin, vector);
 		return;
 	}
 
-	for_each_irq_pin(entry, data->irq_2_pin)
-		__eoi_ioapic_pin(entry->apic, entry->pin, vector);
+	for_each_irq_pin(entry, data->irq_2_pin) {
+		if (likely(ioapics[entry->apic].has_eoi))
+			io_apic_eoi(entry->apic, vector);
+		else
+			__eoi_ioapic_pin(entry->apic, entry->pin, vector);
+	}
 }
 
 static void clear_IO_APIC_pin(unsigned int apic, unsigned int pin)
@@ -618,7 +595,7 @@ static void clear_IO_APIC_pin(unsigned int apic, unsigned int pin)
 		       mpc_ioapic_id(apic), pin);
 }
 
-void clear_IO_APIC (void)
+void clear_IO_APIC(void)
 {
 	int apic, pin;
 
@@ -639,7 +616,7 @@ static int pirq_entries[MAX_PIRQS] = {
 
 static int __init ioapic_pirq_setup(char *str)
 {
-	int i, max, ints[MAX_PIRQS+1];
+	int i, max, ints[MAX_PIRQS + 1];
 
 	get_options(str, ARRAY_SIZE(ints), ints);
 
@@ -652,7 +629,7 @@ static int __init ioapic_pirq_setup(char *str)
 	for (i = 0; i < max; i++) {
 		apic_pr_verbose("... PIRQ%d -> IRQ %d\n", i, ints[i + 1]);
 		/* PIRQs are mapped upside down, usually */
-		pirq_entries[MAX_PIRQS-i-1] = ints[i+1];
+		pirq_entries[MAX_PIRQS - i - 1] = ints[i + 1];
 	}
 	return 1;
 }
@@ -738,8 +715,7 @@ static int find_irq_entry(int ioapic_idx, int pin, int type)
 	return -1;
 }
 
-static int __init find_isa_irq_info(int irq, int type,
-									int *pin_out, int *apic_idx_out)
+static int __init find_isa_irq_info(int irq, int type, int *pin_out, int *apic_idx_out)
 {
 	int i;
 
@@ -752,8 +728,8 @@ static int __init find_isa_irq_info(int irq, int type,
 		int lbus = mp_irqs[i].srcbus;
 
 		if (!test_bit(lbus, mp_bus_not_pci) ||
-			mp_irqs[i].irqtype != type   ||
-			mp_irqs[i].srcbusirq != irq)
+		    mp_irqs[i].irqtype != type ||
+		    mp_irqs[i].srcbusirq != irq)
 			continue;
 
 		if (pin_out)
@@ -762,14 +738,15 @@ static int __init find_isa_irq_info(int irq, int type,
 		if (apic_idx_out) {
 			int apic_idx = -1, j;
 
-			for_each_ioapic(j)
+			for_each_ioapic(j) {
 				if (mpc_ioapic_id(j) == mp_irqs[i].dstapic) {
 					apic_idx = j;
 					break;
 				}
+			}
 
-				if (apic_idx < 0)
-					return -ENODEV;
+			if (apic_idx < 0)
+				return -ENODEV;
 
 			*apic_idx_out = apic_idx;
 		}
@@ -836,7 +813,7 @@ static bool eisa_irq_is_level(int idx, int bus, bool level)
 	return true;
 }
 #else
-static inline int eisa_irq_is_level(int idx, int bus, bool level)
+static inline bool eisa_irq_is_level(int idx, int bus, bool level)
 {
 	return level;
 }
@@ -1116,7 +1093,7 @@ static int pin_2_irq(int idx, int ioapic, int pin, unsigned int flags)
 			if (!pirq_entries[pin - 16]) {
 				apic_pr_verbose("Disabling PIRQ%d\n", pin - 16);
 			} else {
-				int irq = pirq_entries[pin-16];
+				int irq = pirq_entries[pin - 16];
 
 				apic_pr_verbose("Using PIRQ%d -> IRQ %d\n", pin - 16, irq);
 				return irq;
@@ -1125,7 +1102,7 @@ static int pin_2_irq(int idx, int ioapic, int pin, unsigned int flags)
 	}
 #endif
 
-	return  mp_map_pin_to_irq(gsi, idx, ioapic, pin, flags, NULL);
+	return mp_map_pin_to_irq(gsi, idx, ioapic, pin, flags, NULL);
 }
 
 int mp_map_gsi_to_irq(u32 gsi, unsigned int flags, struct irq_alloc_info *info)
@@ -1278,7 +1255,7 @@ static void __init print_IO_APIC(int ioapic_idx)
 	union IO_APIC_reg_02 reg_02;
 	union IO_APIC_reg_03 reg_03;
 
-	scoped_guard (raw_spinlock_irqsave, &ioapic_lock) {
+	scoped_guard(raw_spinlock_irqsave, &ioapic_lock) {
 		reg_00.raw = io_apic_read(ioapic_idx, 0);
 		reg_01.raw = io_apic_read(ioapic_idx, 1);
 		if (reg_01.bits.version >= 0x10)
@@ -1388,17 +1365,17 @@ void __init enable_IO_APIC(void)
 
 		rte = ioapic_read_entry(apic, pin);
 		if (!rte.masked &&
-			rte.delivery_mode == APIC_DELIVERY_MODE_EXTINT) {
+		    rte.delivery_mode == APIC_DELIVERY_MODE_EXTINT) {
 			ioapic_i8259.apic = apic;
-		ioapic_i8259.pin  = pin;
-		break;
-			}
+			ioapic_i8259.pin  = pin;
+			break;
+		}
 	}
 
 	/* Ask the MP-table for the same information */
 	find_isa_irq_info(0, mp_ExtINT, &i8259_pin, &i8259_apic);
 
-	/* Trust firmware if hardware isn’t set up at all */
+	/* Trust firmware if hardware is not set up at all */
 	if (ioapic_i8259.pin == -1 && i8259_pin >= 0) {
 		pr_warn("ExtINT not set in hardware, using MP-table values\n");
 		ioapic_i8259.pin  = i8259_pin;
@@ -1406,9 +1383,9 @@ void __init enable_IO_APIC(void)
 	}
 
 	/* Complain if firmware and hardware disagree */
-	if (ioapic_i8259.pin  >= 0 && i8259_pin  >= 0 &&
-		(ioapic_i8259.pin  != i8259_pin ||
-		ioapic_i8259.apic != i8259_apic))
+	if (ioapic_i8259.pin >= 0 && i8259_pin >= 0 &&
+	    (ioapic_i8259.pin != i8259_pin ||
+	     ioapic_i8259.apic != i8259_apic))
 		pr_warn("ExtINT differs between hardware and MP table\n");
 
 	/*
