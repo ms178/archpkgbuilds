@@ -1250,8 +1250,10 @@ radv_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer, UNUSED VkCommandB
       return;
 
    radv_reset_cmd_stream(device, cs);
-   if (cmd_buffer->gang.cs)
-      radv_reset_cmd_stream(device, cmd_buffer->gang.cs);
+   if (cmd_buffer->gang.cs) {
+      radv_destroy_cmd_stream(device, cmd_buffer->gang.cs);
+      cmd_buffer->gang.cs = NULL;
+   }
 
    list_for_each_entry_safe (struct radv_cmd_buffer_upload, up, &cmd_buffer->upload.list, list) {
       radv_rmv_log_command_buffer_bo_destroy(device, up->upload_bo);
@@ -1279,6 +1281,8 @@ radv_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer, UNUSED VkCommandB
    cmd_buffer->queue_state.sample_positions_needed = false;
    cmd_buffer->gang.sem.leader_value = 0;
    cmd_buffer->gang.sem.emitted_leader_value = 0;
+   cmd_buffer->gang.sem.follower_value = 0;
+   cmd_buffer->gang.sem.emitted_follower_value = 0;
    cmd_buffer->gang.sem.va = 0;
    cmd_buffer->queue_state.shader_upload_seq = 0;
    memset(cmd_buffer->vertex_bindings, 0, sizeof(cmd_buffer->vertex_bindings));
@@ -1979,13 +1983,19 @@ radv_is_sample_shading_enabled(struct radv_cmd_buffer *cmd_buffer, float *min_sa
    if (min_sample_shading)
       *min_sample_shading = 1.0f;
 
+   /* If the PS requires sample shading for inputs,
+    * min_sample_shading is overwritten to 1.0.
+    */
+   if (ps && ps->info.ps.uses_sample_shading)
+      return true;
+
    if (cmd_buffer->state.ms.sample_shading_enable) {
       if (min_sample_shading)
          *min_sample_shading = cmd_buffer->state.ms.min_sample_shading;
       return true;
    }
 
-   return ps ? ps->info.ps.uses_sample_shading : false;
+   return false;
 }
 
 static ALWAYS_INLINE unsigned
@@ -4311,6 +4321,7 @@ radv_emit_fsr_state(struct radv_cmd_buffer *cmd_buffer)
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const struct radv_dynamic_state *d = &cmd_buffer->state.dynamic;
+   const struct radv_rendering_state *render = &cmd_buffer->state.render;
    struct radv_cmd_stream *cs = cmd_buffer->cs;
 
    /* When per-vertex VRS is forced and the dynamic fragment shading rate is a no-op, ignore
@@ -4330,7 +4341,7 @@ radv_emit_fsr_state(struct radv_cmd_buffer *cmd_buffer)
 
    assert(pdev->info.gfx_level >= GFX10_3);
 
-   if (!cmd_buffer->state.render.vrs_att.iview) {
+   if (!render->vrs_att.iview) {
       /* When the current subpass has no VRS attachment, the VRS rates are expected to be 1x1, so we
        * can cheat by tweaking the different combiner modes.
        */
@@ -4352,6 +4363,20 @@ radv_emit_fsr_state(struct radv_cmd_buffer *cmd_buffer)
          FALLTHROUGH;
       case VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR:
          /* Nothing to do here because the SAMPLE_ITER combiner mode should already be passthrough. */
+         break;
+      default:
+         break;
+      }
+   } else if (render->ds_att.iview && radv_image_has_vrs_htile(device, render->ds_att.iview->image) &&
+              !radv_htile_enabled(render->ds_att.iview->image, render->ds_att.iview->vk.base_mip_level)) {
+      /* Otherwise, adjust the combiners to force VRS rate to 1x1 when the depth/stencil view is
+       * incompatible with VRS which can happen with mipmaps.
+       */
+      switch (htile_comb_mode) {
+      case VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MIN_KHR:
+      case VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR:
+         rate_x = rate_y = 0;
+         pipeline_comb_mode = V_028848_SC_VRS_COMB_MODE_PASSTHRU;
          break;
       default:
          break;
@@ -9788,6 +9813,41 @@ radv_handle_depth_fbfetch_output(struct radv_cmd_buffer *cmd_buffer, struct radv
                             att->iview->image, &range);
 }
 
+static void
+radv_invalidate_state(struct radv_cmd_buffer *cmd_buffer)
+{
+   struct radv_rendering_state render_save = cmd_buffer->state.render;
+   uint32_t active_pipeline_queries_save = cmd_buffer->state.active_pipeline_queries;
+   uint32_t active_emulated_pipeline_queries_save = cmd_buffer->state.active_emulated_pipeline_queries;
+   uint32_t active_occlusion_queries_save = cmd_buffer->state.active_occlusion_queries;
+   uint32_t perfect_occlusion_queries_enabled_save = cmd_buffer->state.perfect_occlusion_queries_enabled;
+   bool uses_draw_indirect = cmd_buffer->state.uses_draw_indirect;
+
+   /* From the Vulkan spec 1.4.349:
+    *
+    * "...with the following exception(s):
+    *  If the primary command buffer is inside a render pass instance, then the render pass and
+    *  subpass state is not disturbed by executing secondary command buffers."
+    *
+    * The occlusion/pipeline statistics queries also need to be preserved in case they are inherited
+    * in the secondary command buffer.
+    */
+   memset(&cmd_buffer->state, 0, sizeof(cmd_buffer->state));
+
+   cmd_buffer->state.render = render_save;
+   cmd_buffer->state.active_pipeline_queries = active_pipeline_queries_save;
+   cmd_buffer->state.active_emulated_pipeline_queries = active_emulated_pipeline_queries_save;
+   cmd_buffer->state.active_occlusion_queries = active_occlusion_queries_save;
+   cmd_buffer->state.perfect_occlusion_queries_enabled = perfect_occlusion_queries_enabled_save;
+   cmd_buffer->state.uses_draw_indirect = uses_draw_indirect;
+
+   radv_mark_descriptors_dirty(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   radv_mark_descriptors_dirty(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE);
+   radv_mark_descriptors_dirty(cmd_buffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
+
+   radv_init_default_dynamic_graphics_state(cmd_buffer);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 radv_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCount, const VkCommandBuffer *pCmdBuffers)
 {
@@ -9908,38 +9968,6 @@ radv_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCou
 
       device->ws->cs_execute_secondary(primary_cs->b, secondary_cs->b, allow_ib2);
 
-      primary->state.emitted_graphics_pipeline = secondary->state.emitted_graphics_pipeline;
-      primary->state.emitted_compute_pipeline  = secondary->state.emitted_compute_pipeline;
-      primary->state.emitted_rt_pipeline       = secondary->state.emitted_rt_pipeline;
-
-      primary->state.rb_noncoherent_dirty |= secondary->state.rb_noncoherent_dirty;
-
-      primary->state.ps_epilog = secondary->state.ps_epilog;
-      primary->state.emitted_vs_prolog = secondary->state.emitted_vs_prolog;
-
-      if (secondary->state.last_ia_multi_vgt_param) {
-         primary->state.last_ia_multi_vgt_param = secondary->state.last_ia_multi_vgt_param;
-      }
-
-      if (secondary->state.last_ge_cntl) {
-         primary->state.last_ge_cntl = secondary->state.last_ge_cntl;
-      }
-
-      primary->state.last_num_instances = secondary->state.last_num_instances;
-      primary->state.last_subpass_color_count = secondary->state.last_subpass_color_count;
-
-      if (secondary->state.last_index_type != -1) {
-         primary->state.last_index_type = secondary->state.last_index_type;
-      }
-
-      if (secondary->state.last_primitive_restart_en != -1) {
-         primary->state.last_primitive_restart_en = secondary->state.last_primitive_restart_en;
-      }
-
-      if (secondary->state.last_primitive_restart_index) {
-         primary->state.last_primitive_restart_index = secondary->state.last_primitive_restart_index;
-      }
-
       primary->state.uses_draw_indirect |= secondary->state.uses_draw_indirect;
 
       for (uint32_t reg = 0; reg < AC_NUM_ALL_TRACKED_REGS; reg++) {
@@ -9958,19 +9986,23 @@ radv_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCou
              sizeof(primary_cs->tracked_regs.sx_mrt_blend_opt));
    }
 
-   /* After executing commands from secondary buffers we have to dirty
-    * some states.
+   /* From the Vulkan spec 1.4.349:
+    *
+    * "When a command buffer begins recording, all state in that command buffer is undefined. When
+    *  secondary command buffer(s) are recorded to execute on a primary command buffer, the secondary
+    *  command buffer inherits no state from the primary command buffer, and all state of the primary
+    *  command buffer is undefined after an execute secondary command buffer command is recorded,
+    *  with the following exception(s):
+    *
+    *    - If the primary command buffer is inside a render pass instance, then the render pass and
+    *    subpass state is not disturbed by executing secondary command buffers.
+    *
+    *    - If the primary command buffer has a descriptor heap bound, and the address of that
+    *    descriptor heap is specified in VkCommandBufferInheritanceDescriptorHeapInfoEXT for every
+    *    secondary command buffer, that heap binding is not disturbed by executing secondary command
+    *    buffers."
     */
-   primary->state.dirty_dynamic |= RADV_DYNAMIC_ALL;
-   primary->state.dirty |= RADV_CMD_DIRTY_PIPELINE | RADV_CMD_DIRTY_INDEX_BUFFER | RADV_CMD_DIRTY_GUARDBAND |
-                           RADV_CMD_DIRTY_SHADER_QUERY | RADV_CMD_DIRTY_OCCLUSION_QUERY |
-                           RADV_CMD_DIRTY_DB_SHADER_CONTROL | RADV_CMD_DIRTY_FRAGMENT_OUTPUT;
-   radv_mark_descriptors_dirty(primary, VK_PIPELINE_BIND_POINT_GRAPHICS);
-   radv_mark_descriptors_dirty(primary, VK_PIPELINE_BIND_POINT_COMPUTE);
-
-   primary->state.last_first_instance = -1;
-   primary->state.last_drawid = -1;
-   primary->state.last_vertex_offset_valid = false;
+   radv_invalidate_state(primary);
 }
 
 static void
@@ -12936,6 +12968,7 @@ radv_bind_graphics_shaders(struct radv_cmd_buffer *cmd_buffer)
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    uint32_t push_constant_size = 0, dynamic_offset_count = 0;
+   bool need_dynamic_descriptors_offset_addr = false;
    bool need_indirect_descriptors = false;
    bool need_push_constants_upload = false;
 
@@ -12971,6 +13004,7 @@ radv_bind_graphics_shaders(struct radv_cmd_buffer *cmd_buffer)
 
       /* Compute push constants/indirect descriptors state. */
       need_indirect_descriptors |= radv_shader_need_indirect_descriptors(shader);
+      need_dynamic_descriptors_offset_addr |= radv_shader_need_dynamic_descriptors_offset_addr(shader);
       need_push_constants_upload |= radv_shader_need_push_constants_upload(shader);
       push_constant_size = MAX2(push_constant_size, shader->info.push_constant_size);
       dynamic_offset_count += shader_obj->dynamic_offset_count;
@@ -13014,6 +13048,7 @@ radv_bind_graphics_shaders(struct radv_cmd_buffer *cmd_buffer)
    struct radv_push_constant_state *pc_state = &cmd_buffer->push_constant_state[VK_PIPELINE_BIND_POINT_GRAPHICS];
 
    descriptors_state->need_indirect_descriptors = need_indirect_descriptors;
+   descriptors_state->need_dynamic_descriptors_offset_addr = need_dynamic_descriptors_offset_addr;
    descriptors_state->dynamic_offset_count = dynamic_offset_count;
    pc_state->need_upload = need_push_constants_upload;
    pc_state->size = align(push_constant_size, 4);
@@ -16176,6 +16211,7 @@ radv_bind_compute_shader(struct radv_cmd_buffer *cmd_buffer, struct radv_shader_
    struct radv_push_constant_state *pc_state = &cmd_buffer->push_constant_state[VK_PIPELINE_BIND_POINT_COMPUTE];
 
    descriptors_state->need_indirect_descriptors = radv_shader_need_indirect_descriptors(shader);
+   descriptors_state->need_dynamic_descriptors_offset_addr = radv_shader_need_dynamic_descriptors_offset_addr(shader);
    descriptors_state->dynamic_offset_count = shader_obj->dynamic_offset_count;
    pc_state->need_upload = radv_shader_need_push_constants_upload(shader);
    pc_state->size = align(shader->info.push_constant_size, 4);

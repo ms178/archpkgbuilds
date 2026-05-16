@@ -3551,6 +3551,18 @@ set_timestamp(struct wsi_wl_swapchain *chain,
    return true;
 }
 
+static inline void
+wsi_wl_surface_damage_full(struct wl_surface *surface)
+{
+   assert(surface != NULL);
+
+   if (wl_surface_get_version(surface) >= WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION) {
+      wl_surface_damage_buffer(surface, 0, 0, INT32_MAX, INT32_MAX);
+   } else {
+      wl_surface_damage(surface, 0, 0, INT32_MAX, INT32_MAX);
+   }
+}
+
 static VkResult
 wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
                                uint32_t image_index,
@@ -3561,6 +3573,8 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
    bool timestamped = false;
    bool queue_dispatched = false;
    bool legacy_frame_created = false;
+
+   (void)damage;
 
    MESA_TRACE_FUNC_FLOW(&chain->images[image_index].wayland_buffer.flow);
 
@@ -3599,9 +3613,6 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
       uint64_t acquire_point = image->base.explicit_sync[WSI_ES_ACQUIRE].timeline;
       uint64_t release_point = image->base.explicit_sync[WSI_ES_RELEASE].timeline;
 
-      if (unlikely(chain->wl_syncobj_surface == NULL))
-         return VK_ERROR_OUT_OF_DATE_KHR;
-
       wp_linux_drm_syncobj_surface_v1_set_acquire_point(chain->wl_syncobj_surface,
                                                          image->wl_syncobj_timeline[WSI_ES_ACQUIRE],
                                                          (uint32_t)(acquire_point >> 32),
@@ -3617,22 +3628,7 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
    wl_surface_attach(wsi_wl_surface->wayland_surface.wrapper,
                      chain->images[image_index].wayland_buffer.buffer, 0, 0);
 
-   if (wl_surface_get_version(wsi_wl_surface->wayland_surface.wrapper) >=
-       WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION) {
-      if (damage && damage->pRectangles && damage->rectangleCount > 0) {
-         for (unsigned i = 0; i < damage->rectangleCount; i++) {
-            const VkRectLayerKHR *rect = &damage->pRectangles[i];
-            assert(rect->layer == 0);
-            wl_surface_damage_buffer(wsi_wl_surface->wayland_surface.wrapper,
-                                     rect->offset.x, rect->offset.y,
-                                     rect->extent.width, rect->extent.height);
-         }
-      } else {
-         wl_surface_damage_buffer(wsi_wl_surface->wayland_surface.wrapper, 0, 0, INT32_MAX, INT32_MAX);
-      }
-   } else {
-      wl_surface_damage(wsi_wl_surface->wayland_surface.wrapper, 0, 0, INT32_MAX, INT32_MAX);
-   }
+   wsi_wl_surface_damage_full(wsi_wl_surface->wayland_surface.wrapper);
 
    if (use_legacy_fifo) {
       chain->frame = wl_surface_frame(wsi_wl_surface->wayland_surface.wrapper);
