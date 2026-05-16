@@ -1633,7 +1633,7 @@ drm_syncobj_timeline_signal_ioctl(struct drm_device *dev, void *data,
 	struct drm_syncobj **syncobjs;
 	struct dma_fence_chain **chains;
 	uint64_t *points;
-	uint32_t i, j;
+	uint32_t i;
 	int ret;
 
 	if (!drm_core_check_feature(dev, DRIVER_SYNCOBJ_TIMELINE))
@@ -1666,7 +1666,7 @@ drm_syncobj_timeline_signal_ioctl(struct drm_device *dev, void *data,
 		goto err_points;
 	}
 
-	chains = kmalloc_array(args->count_handles, sizeof(void *), GFP_KERNEL);
+	chains = kmalloc_array(args->count_handles, sizeof(*chains), GFP_KERNEL);
 	if (!chains) {
 		ret = -ENOMEM;
 		goto err_points;
@@ -1674,8 +1674,8 @@ drm_syncobj_timeline_signal_ioctl(struct drm_device *dev, void *data,
 	for (i = 0; i < args->count_handles; i++) {
 		chains[i] = dma_fence_chain_alloc();
 		if (!chains[i]) {
-			for (j = 0; j < i; j++)
-				dma_fence_chain_free(chains[j]);
+			while (i-- > 0)
+				dma_fence_chain_free(chains[i]);
 			ret = -ENOMEM;
 			goto err_chains;
 		}
