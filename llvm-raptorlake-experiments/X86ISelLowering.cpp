@@ -50787,6 +50787,11 @@ static SDValue combineMul(SDNode *N, SelectionDAG &DAG,
   if (C.isAllOnes())
     return DAG.getNegative(N->getOperand(0), DL, VT);
 
+  // Guard against silently truncating large APInt constants when querying
+  // 64-bit helpers below. This keeps transform decisions exact.
+  if (C.ugt(UINT64_MAX))
+    return SDValue();
+
   if (isPowerOf2_64(C.getZExtValue()))
     return SDValue();
 
@@ -50802,6 +50807,7 @@ static SDValue combineMul(SDNode *N, SelectionDAG &DAG,
   if (DCI.isBeforeLegalize() || DCI.isCalledByLegalizer())
     return SDValue();
 
+  // Safe after UINT64_MAX guard above.
   int64_t SignMulAmt = C.getSExtValue();
   assert(SignMulAmt != INT64_MIN && "Int min should have been handled!");
   uint64_t AbsMulAmt = SignMulAmt < 0 ? -SignMulAmt : SignMulAmt;
