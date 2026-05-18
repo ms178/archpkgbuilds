@@ -1113,6 +1113,11 @@ bool PeepholeOptimizer::tryFoldLoadAfterCompareElim(
   if (!LoadMI->canFoldAsLoad() || !LoadMI->mayLoad())
     return false;
 
+  if (llvm::any_of(make_range(std::next(LoadMI->getIterator()),
+                              FlagProducer->getIterator()),
+                   [](const MachineInstr &I) { return I.isLoadFoldBarrier(); }))
+    return false;
+
   return foldLoadInto(*FlagProducer->getMF(), *FlagProducer, CmpSrcReg,
                       LocalMIs) != nullptr;
 }
