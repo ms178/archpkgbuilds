@@ -864,7 +864,7 @@
  	/*
 
 --- a/drivers/gpu/drm/drm_syncobj.c	2025-03-21 21:05:19.110778019 +0100
-+++ b/drivers/gpu/drm/drm_syncobj.c	2026-02-20 09:37:49.753951575 +0100
++++ b/drivers/gpu/drm/drm_syncobj.c	2026-05-16 09:37:49.753951575 +0100
 @@ -252,9 +252,8 @@ struct drm_syncobj *drm_syncobj_find(str
  
  	spin_lock(&file_private->syncobj_table_lock);
@@ -1135,54 +1135,41 @@
  
  	return timeout;
  }
-@@ -1290,13 +1300,26 @@ static int drm_syncobj_array_find(struct
- 				  uint32_t count_handles,
- 				  struct drm_syncobj ***syncobjs_out)
- {
--	uint32_t i, *handles;
--	struct drm_syncobj **syncobjs;
-+	uint32_t i;
+@@ -1294,8 +1304,13 @@ static int drm_syncobj_array_find(struct
+ 	struct drm_syncobj **syncobjs;
  	int ret;
  
--	handles = kmalloc_array(count_handles, sizeof(*handles), GFP_KERNEL);
--	if (handles == NULL)
--		return -ENOMEM;
 +	if (count_handles == 0) {
 +		*syncobjs_out = NULL;
 +		return 0;
 +	}
 +
-+#define MAX_STACK_HANDLES 8
-+	uint32_t stack_handles[MAX_STACK_HANDLES];
-+	uint32_t *handles;
-+	struct drm_syncobj **syncobjs;
-+
-+	if (count_handles <= MAX_STACK_HANDLES) {
-+		handles = stack_handles;
-+	} else {
-+		handles = kmalloc_array(count_handles, sizeof(*handles), GFP_KERNEL);
-+		if (unlikely(!handles))
-+			return -ENOMEM;
-+	}
+ 	handles = kmalloc_array(count_handles, sizeof(*handles), GFP_KERNEL);
+-	if (handles == NULL)
++	if (!handles)
+ 		return -ENOMEM;
  
  	if (copy_from_user(handles, user_handles,
- 			   sizeof(uint32_t) * count_handles)) {
-@@ -1305,20 +1328,26 @@ static int drm_syncobj_array_find(struct
+@@ -1305,18 +1320,27 @@ static int drm_syncobj_array_find(struct
  	}
  
  	syncobjs = kmalloc_array(count_handles, sizeof(*syncobjs), GFP_KERNEL);
 -	if (syncobjs == NULL) {
-+	if (unlikely(!syncobjs)) {
++	if (!syncobjs) {
  		ret = -ENOMEM;
  		goto err_free_handles;
  	}
  
++	/*
++	 * Batch all IDR lookups under a single lock acquisition.
++	 * Reduces lock round-trips from N to 1, critical for multi-semaphore
++	 * Vulkan submits where N=4-8 is common.
++	 */
 +	spin_lock(&file_private->syncobj_table_lock);
  	for (i = 0; i < count_handles; i++) {
 -		syncobjs[i] = drm_syncobj_find(file_private, handles[i]);
--		if (!syncobjs[i]) {
 +		syncobjs[i] = idr_find(&file_private->syncobj_idr, handles[i]);
-+		if (unlikely(!syncobjs[i])) {
+ 		if (!syncobjs[i]) {
 +			spin_unlock(&file_private->syncobj_table_lock);
  			ret = -ENOENT;
  			goto err_put_syncobjs;
@@ -1190,112 +1177,39 @@
 +		drm_syncobj_get(syncobjs[i]);
  	}
 +	spin_unlock(&file_private->syncobj_table_lock);
-+
-+	if (handles != stack_handles)
-+		kfree(handles);
  
--	kfree(handles);
+ 	kfree(handles);
  	*syncobjs_out = syncobjs;
- 	return 0;
+@@ -1609,7 +1633,7 @@ drm_syncobj_timeline_signal_ioctl(struct
+ 	struct drm_syncobj **syncobjs;
+ 	struct dma_fence_chain **chains;
+ 	uint64_t *points;
+-	uint32_t i, j;
++	uint32_t i;
+ 	int ret;
  
-@@ -1327,8 +1356,8 @@ err_put_syncobjs:
- 		drm_syncobj_put(syncobjs[i]);
- 	kfree(syncobjs);
- err_free_handles:
--	kfree(handles);
--
-+	if (handles != stack_handles)
-+		kfree(handles);
- 	return ret;
- }
- 
-@@ -1628,32 +1657,42 @@ drm_syncobj_timeline_signal_ioctl(struct
- 	if (ret < 0)
- 		return ret;
- 
--	points = kmalloc_array(args->count_handles, sizeof(*points),
--			       GFP_KERNEL);
--	if (!points) {
--		ret = -ENOMEM;
--		goto out;
-+#define MAX_STACK_TIMELINE 8
-+	uint64_t stack_points[MAX_STACK_TIMELINE];
-+	struct dma_fence_chain *stack_chains[MAX_STACK_TIMELINE];
-+	bool use_stack = args->count_handles <= MAX_STACK_TIMELINE;
-+
-+	if (use_stack) {
-+		points = stack_points;
-+		chains = stack_chains;
-+	} else {
-+		points = kmalloc_array(args->count_handles, sizeof(*points),
-+				       GFP_KERNEL);
-+		if (!points) {
-+			ret = -ENOMEM;
-+			goto out;
-+		}
-+		chains = kmalloc_array(args->count_handles, sizeof(*chains),
-+				       GFP_KERNEL);
-+		if (!chains) {
-+			ret = -ENOMEM;
-+			goto err_points;
-+		}
- 	}
-+
- 	if (!u64_to_user_ptr(args->points)) {
- 		memset(points, 0, args->count_handles * sizeof(uint64_t));
- 	} else if (copy_from_user(points, u64_to_user_ptr(args->points),
- 				  sizeof(uint64_t) * args->count_handles)) {
- 		ret = -EFAULT;
--		goto err_points;
-+		goto err_chains;
+ 	if (!drm_core_check_feature(dev, DRIVER_SYNCOBJ_TIMELINE))
+@@ -1642,7 +1666,7 @@ drm_syncobj_timeline_signal_ioctl(struct
+ 		goto err_points;
  	}
  
 -	chains = kmalloc_array(args->count_handles, sizeof(void *), GFP_KERNEL);
--	if (!chains) {
--		ret = -ENOMEM;
--		goto err_points;
--	}
++	chains = kmalloc_array(args->count_handles, sizeof(*chains), GFP_KERNEL);
+ 	if (!chains) {
+ 		ret = -ENOMEM;
+ 		goto err_points;
+@@ -1650,8 +1674,8 @@ drm_syncobj_timeline_signal_ioctl(struct
  	for (i = 0; i < args->count_handles; i++) {
  		chains[i] = dma_fence_chain_alloc();
  		if (!chains[i]) {
 -			for (j = 0; j < i; j++)
 -				dma_fence_chain_free(chains[j]);
++			while (i-- > 0)
++				dma_fence_chain_free(chains[i]);
  			ret = -ENOMEM;
--			goto err_chains;
-+			goto err_free_chains;
+ 			goto err_chains;
  		}
- 	}
- 
-@@ -1664,13 +1703,26 @@ drm_syncobj_timeline_signal_ioctl(struct
- 				      fence, points[i]);
- 		dma_fence_put(fence);
- 	}
-+
-+	ret = 0;
-+	goto out_free;
-+
-+err_free_chains:
-+	while (i-- > 0)
-+		dma_fence_chain_free(chains[i]);
- err_chains:
--	kfree(chains);
-+	if (!use_stack)
-+		kfree(chains);
- err_points:
--	kfree(points);
-+	if (!use_stack)
-+		kfree(points);
-+out_free:
-+	if (!use_stack) {
-+		kfree(chains);
-+		kfree(points);
-+	}
- out:
- 	drm_syncobj_array_free(syncobjs, args->count_handles);
--
- 	return ret;
- }
- 
+
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c	2025-09-18 01:33:05.056495913 +0200
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c	2026-04-10 02:04:26.382110242 +0200
 @@ -266,16 +266,15 @@ static u32 dm_vblank_get_counter(struct
