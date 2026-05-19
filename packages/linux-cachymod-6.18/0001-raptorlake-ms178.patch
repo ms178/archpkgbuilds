@@ -8404,7 +8404,7 @@
 
 
 --- a/drivers/cpufreq/intel_pstate.c	2025-04-13 11:40:05.273247310 +0200
-+++ b/drivers/cpufreq/intel_pstate.c	2026-03-22 15:51:11.133723810 +0200
++++ b/drivers/cpufreq/intel_pstate.c	2026-05-19 15:51:11.133723810 +0200
 @@ -9,6 +9,7 @@
  #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
  
@@ -9347,74 +9347,305 @@
  }
  
  static int intel_pstate_set_policy(struct cpufreq_policy *policy)
-@@ -3184,25 +3502,52 @@ static void intel_cpufreq_trace(struct c
+@@ -3182,27 +3500,88 @@ static void intel_cpufreq_trace(struct c
+ }
+ 
  static void intel_cpufreq_hwp_update(struct cpudata *cpu, u32 min, u32 max,
- 				     u32 desired, bool fast_switch)
+-				     u32 desired, bool fast_switch)
++                                      u32 desired, bool fast_switch)
  {
 -	u64 prev = READ_ONCE(cpu->hwp_req_cached), value = prev;
-+	unsigned long flags;
-+	u64 prev, value, write_val;
-+	bool do_write = false;
- 
+-
 -	value &= ~HWP_MIN_PERF(~0L);
 -	value |= HWP_MIN_PERF(min);
-+	raw_spin_lock_irqsave(&cpu->hwp_lock, flags);
- 
+-
 -	value &= ~HWP_MAX_PERF(~0L);
 -	value |= HWP_MAX_PERF(max);
-+	if (unlikely(!cpu->hwp_cache_valid)) {
-+		u64 hwv;
-+		if (!rdmsrq_on_cpu_if_safe(cpu->cpu, MSR_HWP_REQUEST, &hwv)) {
-+			cpu->hwp_req_cached = hwv;
-+			cpu->hwp_cache_valid = true;
-+		}
-+	}
- 
+-
 -	value &= ~HWP_DESIRED_PERF(~0L);
 -	value |= HWP_DESIRED_PERF(desired);
-+	prev = cpu->hwp_req_cached;
-+	value = prev;
- 
+-
 -	if (value == prev)
 -		return;
-+	/* Only modify fields that actually change; avoids meaningless toggles. */
-+	if (((prev & HWP_MIN_PERF(~0ULL)) != HWP_MIN_PERF((u64)min))) {
-+		value &= ~HWP_MIN_PERF(~0ULL);
-+		value |= HWP_MIN_PERF((u64)min);
-+	}
-+	if (((prev & HWP_MAX_PERF(~0ULL)) != HWP_MAX_PERF((u64)max))) {
-+		value &= ~HWP_MAX_PERF(~0ULL);
-+		value |= HWP_MAX_PERF((u64)max);
-+	}
-+	if (((prev & HWP_DESIRED_PERF(~0ULL)) != HWP_DESIRED_PERF((u64)desired))) {
-+		value &= ~HWP_DESIRED_PERF(~0ULL);
-+		value |= HWP_DESIRED_PERF((u64)desired);
-+	}
- 
+-
 -	WRITE_ONCE(cpu->hwp_req_cached, value);
 -	if (fast_switch)
 -		wrmsrq(MSR_HWP_REQUEST, value);
 -	else
 -		wrmsrq_on_cpu(cpu->cpu, MSR_HWP_REQUEST, value);
-+	if (value != prev) {
-+		cpu->hwp_req_cached = value;
-+		write_val = value;
-+		do_write = true;
-+	}
++    /*
++     * Mask covering bits 0..23. EPP (bits 24..31), Activity Window
++     * (bits 32..41), and reserved bits are preserved. Constant-folded
++     * by the compiler.
++     */
++    const u64 hwp_perf_mask   = HWP_MIN_PERF(~0ULL) |
++                                 HWP_MAX_PERF(~0ULL) |
++                                 HWP_DESIRED_PERF(~0ULL);
++    const u64 new_perf_fields = HWP_MIN_PERF((u64)min) |
++                                 HWP_MAX_PERF((u64)max) |
++                                 HWP_DESIRED_PERF((u64)desired);
 +
-+	raw_spin_unlock_irqrestore(&cpu->hwp_lock, flags);
++    unsigned long flags;
++    u64 prev, value;
 +
-+	/* Local write for fast-switch or same-CPU; else safe remote write. */
-+	if (do_write && READ_ONCE(cpu->hwp_req_cached) == write_val) {
-+		if (fast_switch || cpu->cpu == smp_processor_id())
-+			wrmsrq(MSR_HWP_REQUEST, write_val);
-+		else
-+			(void)wrmsrq_on_cpu_if_safe(cpu->cpu, MSR_HWP_REQUEST, write_val);
-+	}
++    /*
++     * Lockless fast path. READ_ONCE of an aligned u64 is atomic on
++     * x86-64. If the cache currently reflects our request, return
++     * without locking.
++     *
++     * The mask-and-compare inspects only bits 0..23; concurrent EPP
++     * writes (bits 24..31) don't affect the comparison.
++     */
++    prev = READ_ONCE(cpu->hwp_req_cached);
++    if (likely((prev & hwp_perf_mask) == new_perf_fields))
++        return;
++
++    raw_spin_lock_irqsave(&cpu->hwp_lock, flags);
++
++    /*
++     * Cold path: first call after CPU online or resume.
++     * hwp_cache_valid transitions false->true exactly once per CPU
++     * lifecycle (or after suspend, which clears it).
++     */
++    if (unlikely(!cpu->hwp_cache_valid)) {
++        u64 hwv;
++
++        if (!rdmsrq_on_cpu_if_safe(cpu->cpu, MSR_HWP_REQUEST, &hwv)) {
++            cpu->hwp_req_cached = hwv;
++            cpu->hwp_cache_valid = true;
++        }
++    }
++
++    /*
++     * Re-read under the lock. A concurrent writer may have updated
++     * the cache between our optimistic READ_ONCE and our lock acquire.
++     */
++    prev = cpu->hwp_req_cached;
++
++    if (unlikely((prev & hwp_perf_mask) == new_perf_fields)) {
++        raw_spin_unlock_irqrestore(&cpu->hwp_lock, flags);
++        return;
++    }
++
++    /*
++     * Rebuild: mask out bits 0..23, OR in new values. Bit-identical to
++     * the original three-branch logic because the HWP perf fields are
++     * disjoint 8-bit ranges.
++     */
++    value = (prev & ~hwp_perf_mask) | new_perf_fields;
++    cpu->hwp_req_cached = value;
++
++    raw_spin_unlock_irqrestore(&cpu->hwp_lock, flags);
++
++    /*
++     * Post-unlock race check: if a concurrent writer updated the cache
++     * between our unlock and our wrmsrq, skip our write. Their write
++     * incorporates our intent (they read the cache we just wrote) or
++     * supersedes it (e.g., suspend). Either way, "last writer wins".
++     *
++     * This check is a correctness requirement preserved from the
++     * original code.
++     */
++    if (unlikely(READ_ONCE(cpu->hwp_req_cached) != value))
++        return;
++
++    if (fast_switch || cpu->cpu == smp_processor_id())
++        wrmsrq(MSR_HWP_REQUEST, value);
++    else
++        (void)wrmsrq_on_cpu_if_safe(cpu->cpu, MSR_HWP_REQUEST, value);
  }
  
  static void intel_cpufreq_perf_ctl_update(struct cpudata *cpu,
-@@ -3411,21 +3756,28 @@ static void intel_cpufreq_cpu_exit(struc
+@@ -3217,28 +3596,52 @@ static void intel_cpufreq_perf_ctl_updat
+ }
+ 
+ static int intel_cpufreq_update_pstate(struct cpufreq_policy *policy,
+-				       int target_pstate, bool fast_switch)
++                                        int target_pstate, bool fast_switch)
+ {
+-	struct cpudata *cpu = all_cpu_data[policy->cpu];
+-	int old_pstate = cpu->pstate.current_pstate;
+-
+-	target_pstate = intel_pstate_prepare_request(cpu, target_pstate);
+-	if (hwp_active) {
+-		int max_pstate = policy->strict_target ?
+-					target_pstate : cpu->max_perf_ratio;
+-
+-		intel_cpufreq_hwp_update(cpu, target_pstate, max_pstate,
+-					 target_pstate, fast_switch);
+-	} else if (target_pstate != old_pstate) {
+-		intel_cpufreq_perf_ctl_update(cpu, target_pstate, fast_switch);
+-	}
+-
+-	cpu->pstate.current_pstate = target_pstate;
++    struct cpudata *cpu = all_cpu_data[policy->cpu];
++    const int old_pstate = READ_ONCE(cpu->pstate.current_pstate);
+ 
+-	intel_cpufreq_trace(cpu, fast_switch ? INTEL_PSTATE_TRACE_FAST_SWITCH :
+-			    INTEL_PSTATE_TRACE_TARGET, old_pstate);
++    if (hwp_active) {
++        /*
++         * Inline prepare_request. READ_ONCE on the ratio fields guards
++         * against compiler reload-tearing when a concurrent sysfs writer
++         * updates them via intel_pstate_update_perf_limits.
++         *
++         * pstate.min_pstate is set once during init and never changed
++         * (immutable after init), so plain access is safe.
++         */
++        const int max_bound     = READ_ONCE(cpu->max_perf_ratio);
++        const int min_bound     = READ_ONCE(cpu->min_perf_ratio);
++        const int phys_min      = cpu->pstate.min_pstate;
++        const int effective_min = (min_bound > phys_min) ? min_bound : phys_min;
++
++        if (target_pstate > max_bound)
++            target_pstate = max_bound;
++        if (target_pstate < effective_min)
++            target_pstate = effective_min;
++
++        {
++            const int max_pstate = policy->strict_target
++                                        ? target_pstate
++                                        : max_bound;
++
++            intel_cpufreq_hwp_update(cpu, (u32)target_pstate,
++                                      (u32)max_pstate,
++                                      (u32)target_pstate, fast_switch);
++        }
++    } else {
++        target_pstate = intel_pstate_prepare_request(cpu, target_pstate);
++        if (target_pstate != old_pstate)
++            intel_cpufreq_perf_ctl_update(cpu, (u32)target_pstate, fast_switch);
++    }
++
++    WRITE_ONCE(cpu->pstate.current_pstate, target_pstate);
++    intel_cpufreq_trace(cpu,
++                        fast_switch ? INTEL_PSTATE_TRACE_FAST_SWITCH
++                                    : INTEL_PSTATE_TRACE_TARGET,
++                        old_pstate);
+ 
+-	return target_pstate;
++    return target_pstate;
+ }
+ 
+ static int intel_cpufreq_target(struct cpufreq_policy *policy,
+@@ -3278,48 +3681,76 @@ static unsigned int intel_cpufreq_fast_s
+ }
+ 
+ static void intel_cpufreq_adjust_perf(unsigned int cpunum,
+-				      unsigned long min_perf,
+-				      unsigned long target_perf,
+-				      unsigned long capacity)
+-{
+-	struct cpudata *cpu = all_cpu_data[cpunum];
+-	u64 hwp_cap = READ_ONCE(cpu->hwp_cap_cached);
+-	int old_pstate = cpu->pstate.current_pstate;
+-	int cap_pstate, min_pstate, max_pstate, target_pstate;
+-
+-	cap_pstate = READ_ONCE(global.no_turbo) ?
+-					HWP_GUARANTEED_PERF(hwp_cap) :
+-					HWP_HIGHEST_PERF(hwp_cap);
+-
+-	/* Optimization: Avoid unnecessary divisions. */
+-
+-	target_pstate = cap_pstate;
+-	if (target_perf < capacity)
+-		target_pstate = DIV_ROUND_UP(cap_pstate * target_perf, capacity);
+-
+-	min_pstate = cap_pstate;
+-	if (min_perf < capacity)
+-		min_pstate = DIV_ROUND_UP(cap_pstate * min_perf, capacity);
+-
+-	if (min_pstate < cpu->pstate.min_pstate)
+-		min_pstate = cpu->pstate.min_pstate;
+-
+-	if (min_pstate < cpu->min_perf_ratio)
+-		min_pstate = cpu->min_perf_ratio;
++                                       unsigned long min_perf,
++                                       unsigned long target_perf,
++                                       unsigned long capacity)
++{
++    struct cpudata *cpu = all_cpu_data[cpunum];
++    const u64 hwp_cap = READ_ONCE(cpu->hwp_cap_cached);
++    int cap_pstate, min_pstate, max_pstate, target_pstate;
++    const int old_pstate = READ_ONCE(cpu->pstate.current_pstate);
++
++    cap_pstate = READ_ONCE(global.no_turbo)
++                    ? HWP_GUARANTEED_PERF(hwp_cap)
++                    : HWP_HIGHEST_PERF(hwp_cap);
++
++    /*
++     * Compute target_pstate. The (unsigned long) cast on cap_pstate
++     * promotes the multiplication; cap_pstate ≤ 255 and target_perf
++     * ≤ capacity ≤ SCHED_CAPACITY_SCALE (1024), so the product fits
++     * comfortably in unsigned long on both 32-bit and 64-bit.
++     */
++    if (likely(target_perf < capacity)) {
++        target_pstate = (int)DIV_ROUND_UP(
++            (unsigned long)cap_pstate * target_perf, capacity);
++        if (target_pstate < cpu->pstate.min_pstate)
++            target_pstate = cpu->pstate.min_pstate;
++    } else {
++        target_pstate = cap_pstate;
++    }
++
++    min_pstate = (min_perf < capacity)
++                    ? (int)DIV_ROUND_UP(
++                        (unsigned long)cap_pstate * min_perf, capacity)
++                    : cap_pstate;
++    if (min_pstate < cpu->pstate.min_pstate)
++        min_pstate = cpu->pstate.min_pstate;
++    if (min_pstate < cpu->min_perf_ratio)
++        min_pstate = cpu->min_perf_ratio;
++    if (min_pstate > cpu->max_perf_ratio)
++        min_pstate = cpu->max_perf_ratio;
++
++    max_pstate = cap_pstate;
++    if (max_pstate > cpu->max_perf_ratio)
++        max_pstate = cpu->max_perf_ratio;
++    if (max_pstate < min_pstate)
++        max_pstate = min_pstate;
++
++    if (target_pstate > max_pstate)
++        target_pstate = max_pstate;
++    /* Defensive clamp: prevents target<min inconsistency in the MSR. */
++    if (target_pstate < min_pstate)
++        target_pstate = min_pstate;
++
++    /*
++     * Exact-match early-exit. All three target values fit in 8 bits
++     * after clamping (HWP performance range is 0..255). READ_ONCE of
++     * aligned u64 is atomic on x86-64.
++     */
++    {
++        const u64 cur = READ_ONCE(cpu->hwp_req_cached);
++
++        if (likely((int)(cur         & 0xffULL) == min_pstate    &&
++                   (int)((cur >>  8) & 0xffULL) == max_pstate    &&
++                   (int)((cur >> 16) & 0xffULL) == target_pstate))
++            return;
++    }
+ 
+-	if (min_pstate > cpu->max_perf_ratio)
+-		min_pstate = cpu->max_perf_ratio;
++    intel_cpufreq_hwp_update(cpu, (u32)min_pstate, (u32)max_pstate,
++                              (u32)target_pstate, true);
+ 
+-	max_pstate = min(cap_pstate, cpu->max_perf_ratio);
+-	if (max_pstate < min_pstate)
+-		max_pstate = min_pstate;
+-
+-	target_pstate = clamp_t(int, target_pstate, min_pstate, max_pstate);
+-
+-	intel_cpufreq_hwp_update(cpu, min_pstate, max_pstate, target_pstate, true);
+-
+-	cpu->pstate.current_pstate = target_pstate;
+-	intel_cpufreq_trace(cpu, INTEL_PSTATE_TRACE_FAST_SWITCH, old_pstate);
++    WRITE_ONCE(cpu->pstate.current_pstate, target_pstate);
++    intel_cpufreq_trace(cpu, INTEL_PSTATE_TRACE_FAST_SWITCH, old_pstate);
+ }
+ 
+ static int intel_cpufreq_cpu_init(struct cpufreq_policy *policy)
+@@ -3411,21 +3842,28 @@ static void intel_cpufreq_cpu_exit(struc
  
  static int intel_cpufreq_suspend(struct cpufreq_policy *policy)
  {
@@ -9456,7 +9687,7 @@
  
  	return 0;
  }
-@@ -3755,25 +4107,46 @@ static const struct x86_cpu_id intel_epp
+@@ -3755,25 +4193,46 @@ static const struct x86_cpu_id intel_epp
  	 * AlderLake Mobile CPUs.
  	 */
  	X86_MATCH_VFM(INTEL_ALDERLAKE_L, HWP_SET_DEF_BALANCE_PERF_EPP(102)),
@@ -9510,7 +9741,7 @@
  	{}
  };
  
-@@ -3919,6 +4292,12 @@ hwp_cpu_matched:
+@@ -3919,6 +4378,12 @@ hwp_cpu_matched:
  			pr_debug("hybrid scaling factor: %d\n", hybrid_scaling_factor);
  		}
  
