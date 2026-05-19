@@ -30102,8 +30102,6 @@ static SDValue LowerMINMAX_REDUCE(SDValue Op, const X86Subtarget &Subtarget,
   EVT ExtractVT = Op.getValueType();
   bool AllowScalarization = !Subtarget.hasAVX512();
 
-  // PHMINPOSUW only helps for SSE4.1 i8/i16 min/max reductions. Everything
-  // else should use the generic vector reduction lowering.
   if (!Subtarget.hasSSE41() || (ExtractVT != MVT::i16 && ExtractVT != MVT::i8))
     return LowerVECREDUCE(Op, Subtarget, DAG, AllowScalarization);
 
@@ -30117,8 +30115,6 @@ static SDValue LowerMINMAX_REDUCE(SDValue Op, const X86Subtarget &Subtarget,
       (SrcVT.getSizeInBits() % 128) != 0)
     return LowerVECREDUCE(Op, Subtarget, DAG, AllowScalarization);
 
-  // If the upper half is identity padding, generic lowering can eliminate the
-  // padded half and avoid forcing PHMINPOS setup.
   unsigned NumElts = SrcVT.getVectorNumElements();
   APInt HiElts = APInt::getHighBitsSet(NumElts, NumElts / 2);
   if (DAG.isIdentityElement(BinOp, SDNodeFlags(), Src, HiElts, 1))
@@ -30133,8 +30129,6 @@ static SDValue LowerMINMAX_REDUCE(SDValue Op, const X86Subtarget &Subtarget,
            TLI.isOperationLegalOrCustom(ISD::EXTRACT_SUBVECTOR, HalfVT);
   };
 
-  // Reduce source down to 128 bits. Use explicit 128-bit extracts on Raptor
-  // Lake AVX2 paths to avoid generic cross-lane shuffle materialization.
   while (SrcVT.getSizeInBits() > 128) {
     EVT HalfVT = SrcVT.getHalfNumVectorElementsVT(*DAG.getContext());
     SDValue Lo, Hi;
@@ -30157,8 +30151,6 @@ static SDValue LowerMINMAX_REDUCE(SDValue Op, const X86Subtarget &Subtarget,
           (SrcVT == MVT::v16i8 && ExtractVT == MVT::i8)) &&
          "Unexpected value type");
 
-  // PHMINPOSUW is unsigned-min on v8i16. Use XOR transforms to map signed min,
-  // signed max, and unsigned max into unsigned-min order.
   SDValue Mask;
   unsigned MaskEltBits = ExtractVT.getSizeInBits();
 
@@ -30167,38 +30159,33 @@ static SDValue LowerMINMAX_REDUCE(SDValue Op, const X86Subtarget &Subtarget,
   else if (BinOp == ISD::SMIN)
     Mask = DAG.getConstant(APInt::getSignedMinValue(MaskEltBits), DL, SrcVT);
   else if (BinOp == ISD::UMAX)
-    Mask = DAG.getAllOnesConstant(DL, SrcVT);
+    Mask = DAG.getConstant(APInt::getAllOnes(MaskEltBits), DL, SrcVT);
 
   if (Mask)
     MinPos = DAG.getNode(ISD::XOR, DL, SrcVT, Mask, MinPos);
 
-  // For v16i8, first reduce adjacent byte pairs into zero-extended words:
-  //   [b0,b1,b2,b3,...] -> [min(b0,b1),0,min(b2,b3),0,...]
   if (ExtractVT == MVT::i8) {
     SDValue Zero = DAG.getConstant(0, DL, MVT::v16i8);
     SDValue OddBytesAsWords = DAG.getVectorShuffle(
         MVT::v16i8, DL, MinPos, Zero,
-        {1, 16, 3, 16, 5, 16, 7, 16,
-         9, 16, 11, 16, 13, 16, 15, 16});
-
+        {1, 16, 3, 16, 5, 16, 7, 16, 9, 16, 11, 16, 13, 16, 15, 16});
     MinPos = DAG.getNode(ISD::UMIN, DL, MVT::v16i8, MinPos, OddBytesAsWords);
   }
 
-  MinPos = DAG.getBitcast(MVT::v8i16, MinPos);
-  MinPos = DAG.getNode(X86ISD::PHMINPOS, DL, MVT::v8i16, MinPos);
-  MinPos = DAG.getBitcast(SrcVT, MinPos);
+  SDValue Rdx = DAG.getNode(X86ISD::PHMINPOS, DL, MVT::v8i16,
+                            DAG.getBitcast(MVT::v8i16, MinPos));
 
-  if (Mask)
-    MinPos = DAG.getNode(ISD::XOR, DL, SrcVT, Mask, MinPos);
+  if (Mask) {
+    SDValue RdxMask = DAG.getBitcast(MVT::v8i16, Mask);
+    Rdx = DAG.getNode(ISD::XOR, DL, MVT::v8i16, Rdx, RdxMask);
+  }
 
   if (ExtractVT == MVT::i8) {
-    SDValue Min16 = DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL, MVT::i16, MinPos,
-                                DAG.getVectorIdxConstant(0, DL));
+    SDValue Min16 = DAG.getExtractVectorElt(DL, MVT::i16, Rdx, 0);
     return DAG.getNode(ISD::TRUNCATE, DL, MVT::i8, Min16);
   }
 
-  return DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL, ExtractVT, MinPos,
-                     DAG.getVectorIdxConstant(0, DL));
+  return DAG.getExtractVectorElt(DL, ExtractVT, Rdx, 0);
 }
 
 static SDValue LowerFMINIMUM_FMAXIMUM(SDValue Op, const X86Subtarget &Subtarget,
@@ -47391,17 +47378,15 @@ static SDValue combineMinMaxReduction(SDNode *Extract, SelectionDAG &DAG,
       ISD::SMAX, ISD::SMIN, ISD::UMAX, ISD::UMIN};
 
   ISD::NodeType BinOp;
-  SDValue Src =
-      DAG.matchBinOpReduction(Extract, BinOp, CandidateBinOps,
-                              /*AllowPartials=*/true);
+  SDValue Src = DAG.matchBinOpReduction(
+      Extract, BinOp, CandidateBinOps, /*AllowPartials=*/true);
   if (!Src)
     return SDValue();
 
   EVT ExtractVT = Extract->getValueType(0);
   EVT SrcVT = Src.getValueType();
 
-  if (!SrcVT.isVector() || SrcVT.getScalarType() != ExtractVT ||
-      (SrcVT.getSizeInBits() % 128) != 0)
+  if (!SrcVT.isVector() || SrcVT.getScalarType() != ExtractVT)
     return SDValue();
 
   ISD::NodeType RdxOp;
