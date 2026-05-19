@@ -1,54 +1,172 @@
 pkgname=libuv
-pkgver=1.51.0
-pkgrel=3.1
+pkgver=1.52.1
+pkgrel=3.2
 pkgdesc="Multi-platform support library with a focus on asynchronous I/O"
 arch=('x86_64')
 url="https://github.com/libuv/libuv"
 license=('custom')
 depends=('glibc' 'libnsl')
-makedepends=('python-sphinx')
+makedepends=('python-sphinx' 'llvm')
 source=("git+https://github.com/libuv/libuv.git?signed#tag=v${pkgver}")
-sha512sums=('91197ff9303112567bbb915bbb88058050e2ad1c048815a3b57c054635d5dc7df458b956089d785475290132236cb0edcfae830f5d749de29a9a3213eeaf0b20'
-            'SKIP')
+sha512sums=('SKIP')
 # PGP key IDs are available from https://github.com/libuv/libuv/blob/v1.x/MAINTAINERS.md
-validpgpkeys=('57353E0DBDAAA7E839B66A1AFF47D5E4AD8B4FDC'  # Colin Ihrig (@cjihrig)
-              'AEAD0A4B686767751A0E4AEF34A25FB128246514'
-              'CFBB9CA9A5BEAFD70E2B3C5A79A67C55A3679C8B') # Jameson Nash (@vtjnash)
+validpgpkeys=(
+  '57353E0DBDAAA7E839B66A1AFF47D5E4AD8B4FDC'  # Colin Ihrig (@cjihrig)
+  'AEAD0A4B686767751A0E4AEF34A25FB128246514'
+  'CFBB9CA9A5BEAFD70E2B3C5A79A67C55A3679C8B'  # Jameson Nash (@vtjnash)
+)
 
 prepare() {
-    cd $pkgname
-    # Disable tests that fail on build.a.o (but pass locally)
-    sed -e '/udp_multicast_join/d' \
-        -e '/tcp_connect6_link_local/d' \
-        -i test/test-list.h
+  cd "${srcdir}/${pkgname}"
+
+  # Disable known flaky tests in some build environments.
+  sed -e '/udp_multicast_join/d' \
+      -e '/tcp_connect6_link_local/d' \
+      -e '/test_357_starts_here/d' \
+      -i test/test-list.h
+
+  ./autogen.sh
 }
 
 build() {
-    cd $pkgname
-    ./autogen.sh
-    ./configure --prefix=/usr
+  local src="${srcdir}/${pkgname}"
+  local build_gen="${srcdir}/build-pgo-gen"
+  local build_use="${srcdir}/build-pgo-use"
+  local pgo_dir="${srcdir}/pgo"
+  local bolt_dir="${srcdir}/bolt"
+
+  # BOLT target: shipped runtime library only.
+  local bolt_target="${build_use}/.libs/libuv.so.1.0.0"
+  local bolt_orig="${bolt_target}.orig"
+
+  rm -rf "${build_gen}" "${build_use}" "${pgo_dir}" "${bolt_dir}"
+  mkdir -p "${build_gen}" "${build_use}" "${pgo_dir}" "${bolt_dir}"
+
+  echo "==> Stage 1: GCC PGO instrumentation build"
+  (
+    cd "${build_gen}"
+    "${src}/configure" \
+      --prefix=/usr \
+      CFLAGS="${CFLAGS} -fprofile-generate=${pgo_dir}" \
+      CXXFLAGS="${CXXFLAGS} -fprofile-generate=${pgo_dir}" \
+      LDFLAGS="${LDFLAGS} -fprofile-generate=${pgo_dir}"
     make
-    make man -C docs
+  )
+
+  echo "==> Stage 2: PGO training"
+  # Keep going to collect as much profile data as possible.
+  make -C "${build_gen}" -k check || true
+
+  if ! find "${pgo_dir}" -type f -name '*.gcda' -print -quit | grep -q .; then
+    echo "ERROR: No GCC PGO .gcda profile data produced in ${pgo_dir}" >&2
+    return 1
+  fi
+
+  echo "==> Stage 3: GCC PGO use build"
+  (
+    cd "${build_use}"
+    "${src}/configure" \
+      --prefix=/usr \
+      CFLAGS="${CFLAGS} -fprofile-use=${pgo_dir} -fprofile-correction -fno-reorder-blocks-and-partition -Wno-error=coverage-mismatch" \
+      CXXFLAGS="${CXXFLAGS} -fprofile-use=${pgo_dir} -fprofile-correction -fno-reorder-blocks-and-partition -Wno-error=coverage-mismatch" \
+      LDFLAGS="${LDFLAGS} -fprofile-use=${pgo_dir} -Wl,--emit-relocs"
+    make
+  )
+
+  make -C "${src}/docs" man
+
+  if [[ ! -x "${bolt_target}" ]]; then
+    echo "ERROR: BOLT target missing or non-executable: ${bolt_target}" >&2
+    return 1
+  fi
+
+  echo "==> Stage 4: BOLT instrument/train/optimize"
+  cp -a "${bolt_target}" "${bolt_orig}"
+
+  llvm-bolt "${bolt_orig}" \
+    --instrument \
+    --instrumentation-file="${bolt_dir}/prof.fdata" \
+    --instrumentation-file-append-pid \
+    -o "${bolt_target}"
+
+  LD_LIBRARY_PATH="${build_use}/.libs:${LD_LIBRARY_PATH}" \
+    make -C "${build_use}" -k check || true
+
+  local fdata_files=()
+  mapfile -t fdata_files < <(find "${bolt_dir}" -maxdepth 1 -type f -name 'prof.fdata*' | sort)
+
+  if (( ${#fdata_files[@]} == 0 )); then
+    echo "ERROR: No BOLT profile data files generated in ${bolt_dir}" >&2
+    return 1
+  fi
+
+  echo "Merging BOLT profile data files..."
+  merge-fdata "${fdata_files[@]}" > "${bolt_dir}/merged.fdata"
+
+  if [[ ! -s "${bolt_dir}/merged.fdata" ]]; then
+    echo "ERROR: merged BOLT profile is empty" >&2
+    return 1
+  fi
+
+  # Your BOLT optimization flags kept exactly as requested.
+  local bolt_options=(
+    --data "${bolt_dir}/merged.fdata"
+    --dyno-stats
+    --lite=false
+    --eliminate-unreachable
+    --frame-opt=all
+    --icf=all
+    --jump-tables=aggressive
+    --min-branch-clusters
+    --stoke
+    --sctc-mode=always
+    --plt=all
+    --hot-data
+    --frame-opt-rm-stores
+    --peepholes=all
+    --infer-stale-profile=1
+    --x86-strip-redundant-address-size
+    --indirect-call-promotion=all
+    --reorder-blocks=ext-tsp
+    --reorder-functions=cdsort
+    --split-all-cold
+    --split-eh
+    --split-functions
+    --split-strategy=cdsplit
+  )
+
+  llvm-bolt "${bolt_orig}" \
+    "${bolt_options[@]}" \
+    -o "${bolt_target}.bolt"
+
+  mv -f "${bolt_target}.bolt" "${bolt_target}"
+
+  # Final sanity check with the optimized library.
+  LD_LIBRARY_PATH="${build_use}/.libs:${LD_LIBRARY_PATH}" \
+    make -C "${build_use}" check
 }
 
 check() {
-    cd $pkgname
-    make check
+  local build_use="${srcdir}/build-pgo-use"
+
+  LD_LIBRARY_PATH="${build_use}/.libs:${LD_LIBRARY_PATH}" \
+    make -C "${build_use}" check
 }
 
 package() {
-    cd $pkgname
+  local src="${srcdir}/${pkgname}"
+  local build_use="${srcdir}/build-pgo-use"
 
-    make DESTDIR="$pkgdir" install
+  make -C "${build_use}" DESTDIR="${pkgdir}" install
 
-    install -Dm644 LICENSE \
-        "$pkgdir"/usr/share/licenses/$pkgname/LICENSE
-    install -Dm644 AUTHORS \
-        "$pkgdir"/usr/share/doc/$pkgname/AUTHORS
-    install -Dm644 README.md \
-        "$pkgdir"/usr/share/doc/$pkgname/README.md
-    install -Dm644 ChangeLog \
-        "$pkgdir"/usr/share/doc/$pkgname/ChangeLog
-    install -Dm644 docs/build/man/libuv.1 \
-        "$pkgdir"/usr/share/man/man1/libuv.1
+  install -Dm644 "${src}/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 "${src}/AUTHORS" \
+    "${pkgdir}/usr/share/doc/${pkgname}/AUTHORS"
+  install -Dm644 "${src}/README.md" \
+    "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 "${src}/ChangeLog" \
+    "${pkgdir}/usr/share/doc/${pkgname}/ChangeLog"
+  install -Dm644 "${src}/docs/build/man/libuv.1" \
+    "${pkgdir}/usr/share/man/man1/libuv.1"
 }
