@@ -434,16 +434,7 @@ namespace dxvk {
 
   DxvkBarrierBatch::DxvkBarrierBatch(const DxvkDevice& device, DxvkCmdBuffer cmdBuffer)
   : m_cmdBuffer(cmdBuffer), m_keepImageBarriers(device.perfHints().preferRenderPassOps) {
-    // Pre-reserve a small inline-friendly capacity to skip the entire
-    // 0->1->2->4->8->16 doubling cascade that std::vector would otherwise
-    // perform during the first frames. The vector lives for the entire
-    // DxvkContext lifetime and is only ::clear()'d (not destroyed) by
-    // flush(), so the storage stays warm for subsequent batches.
-    //
-    // 16 entries (~1.4 KB) covers all but the heaviest layout-transition
-    // bursts (swapchain present, render-pass boundary, mip-chain init);
-    // anything beyond that grows organically by 2x as before.
-    m_imageBarriers.reserve(16);
+    m_imageBarriers.reserve(32);
   }
 
 
@@ -474,8 +465,8 @@ namespace dxvk {
     }
 
     if (barrier.oldLayout != barrier.newLayout
-     || barrier.srcQueueFamilyIndex != barrier.dstQueueFamilyIndex
-     || m_keepImageBarriers) {
+    || barrier.srcQueueFamilyIndex != barrier.dstQueueFamilyIndex
+    || m_keepImageBarriers) {
       auto& entry = m_imageBarriers.emplace_back(barrier);
 
       entry.srcStageMask &= vk::StageDeviceMask;
@@ -483,23 +474,37 @@ namespace dxvk {
       entry.dstStageMask &= vk::StageDeviceMask;
       entry.dstAccessMask &= vk::AccessDeviceMask;
     } else {
-      m_memoryBarrier.srcStageMask |= barrier.srcStageMask & vk::StageDeviceMask;
-      m_memoryBarrier.srcAccessMask |= barrier.srcAccessMask & vk::AccessWriteMask;
-      m_memoryBarrier.dstStageMask |= barrier.dstStageMask & vk::StageDeviceMask;
-      m_memoryBarrier.dstAccessMask |= barrier.dstAccessMask & vk::AccessDeviceMask;
+      VkPipelineStageFlags2 srcStageMask = barrier.srcStageMask;
+      VkAccessFlags2 srcAccessMask = barrier.srcAccessMask;
+      VkPipelineStageFlags2 dstStageMask = barrier.dstStageMask;
+      VkAccessFlags2 dstAccessMask = barrier.dstAccessMask;
+
+      // If this barrier has host access, merge host stages/access now
+      // so the entire barrier fires in one vkCmdPipelineBarrier2 call.
+      if (unlikely(barrier.dstAccessMask & vk::AccessHostMask)) {
+        srcStageMask |= m_hostSrcStages;
+        dstStageMask |= VK_PIPELINE_STAGE_2_HOST_BIT;
+        dstAccessMask |= m_hostDstAccess;
+
+        // Clear deferred host state since we're emitting it now
+        m_hostSrcStages = 0u;
+        m_hostDstAccess = 0u;
+      }
+
+      m_memoryBarrier.srcStageMask |= srcStageMask & vk::StageDeviceMask;
+      m_memoryBarrier.srcAccessMask |= srcAccessMask & vk::AccessWriteMask;
+      m_memoryBarrier.dstStageMask |= dstStageMask & vk::StageDeviceMask;
+      m_memoryBarrier.dstAccessMask |= dstAccessMask & vk::AccessDeviceMask;
     }
   }
 
 
   void DxvkBarrierBatch::flush(
     const Rc<DxvkCommandList>&        list) {
-    // Hoist the no-op early-out above the VkDependencyInfo construction.
-    // flush() is called speculatively from many barrier-emit paths and is
-    // frequently a no-op; in that case we can skip ~32 bytes of zero-init
-    // and a couple of dead branches before bailing.
     const bool hasMemoryBarrier =
       (m_memoryBarrier.srcStageMask | m_memoryBarrier.dstStageMask) != 0u;
     const bool hasImageBarriers = !m_imageBarriers.empty();
+    const bool hasHostBarriers = m_hostDstAccess != 0u;
 
     if (!hasMemoryBarrier && !hasImageBarriers)
       return;
@@ -512,10 +517,6 @@ namespace dxvk {
     }
 
     if (hasImageBarriers) {
-      // Explicit cast: vector::size() returns size_t and
-      // imageMemoryBarrierCount is uint32_t; the bound is well inside
-      // 32 bits in practice (Vulkan barrier batches are tiny) but the
-      // cast keeps the code -Wconversion clean under the project flags.
       depInfo.imageMemoryBarrierCount = uint32_t(m_imageBarriers.size());
       depInfo.pImageMemoryBarriers = m_imageBarriers.data();
     }
