@@ -1749,6 +1749,12 @@ optimizations.extend([
     '!options->lower_fpow'),
 
    (('fexp2(contract)', ('fmul', ('flog2', a), 0.5)), ('fsqrt', a)),
+   # GFX9-optimized: catch lowered fpow with negative/fractional exponents.
+   # When lower_fpow is true, fpow(a,N) becomes fexp2(fmul(flog2(a),N)).
+   # These reduce 3 transcendental ops to 1.
+   (('fexp2(contract)', ('fmul', ('flog2', a), -0.5)), ('frsq', a)),
+   (('fexp2(contract)', ('fmul', ('flog2', a), -1.0)), ('frcp', a)),
+   (('fexp2(contract)', ('fmul', ('flog2', a), -2.0)), ('frcp', ('fmul', a, a))),
    (('fexp2(contract)', ('fmul', ('flog2', a), 2.0)), ('fmul', a, a)),
    (('fexp2(contract)', ('fmul', ('flog2', a), 3.0)), ('fmul', ('fmul', a, a), a)),
    (('fexp2(contract)', ('fmul', ('flog2', a), 4.0)), ('fmul', ('fmul', a, a), ('fmul', a, a))),
@@ -1763,7 +1769,23 @@ optimizations.extend([
    (('fpow(contract)', a, 2.0), ('fmul', a, a)),
    (('~fpow', a, 3.0), ('fmul', ('fmul', a, a), a)),
    (('~fpow', a, 4.0), ('fmul', ('fmul', a, a), ('fmul', a, a))),
+   # GFX9-optimized: higher integer powers common in PBR/Fresnel shaders.
+   # Schlick Fresnel uses pow(x,5); specular uses pow(x,8).
+   (('~fpow', a, 5.0), ('fmul', ('fmul', ('fmul', a, a), ('fmul', a, a)), a)),
+   (('~fpow', a, 6.0), ('fmul', ('fmul', ('fmul', a, a), ('fmul', a, a)), ('fmul', a, a))),
+   (('~fpow', a, 8.0),
+    ('fmul',
+     ('fmul', ('fmul', a, a), ('fmul', a, a)),
+     ('fmul', ('fmul', a, a), ('fmul', a, a)))),
    (('fpow(contract)', 2.0, a), ('fexp2', a)),
+
+   # GFX9-optimized: common fpow exponents -> native transcendental ALU.
+   # Saves 2 transcendental ops each (flog2+fmul+fexp2 chain -> single op).
+   # Reference: AMD GFX9 ISA, V_SQRT_F32/V_RCP_F32/V_RSQ_F32 latencies.
+   (('~fpow', a, 0.5), ('fsqrt', a), '!options->lower_fsqrt'),
+   (('~fpow', a, -0.5), ('frsq', a)),
+   (('~fpow', a, -1.0), ('frcp', a)),
+   (('~fpow', a, -2.0), ('frcp', ('fmul', a, a))),
 
    (('~fpow', ('fpow', a, 2.2), 0.454545), ('fcanonicalize', a)),
    (('~fpow', ('fabs', ('fpow', a, 2.2)), 0.454545), ('fabs', a)),
