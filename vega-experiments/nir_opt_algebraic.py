@@ -105,6 +105,10 @@ optimize_fcanonicalize = [
     (('fcanonicalize(is_only_used_as_float)', a), a),
     (('fcanonicalize', 'a(is_created_as_float)'), a, 'true', TestStatus.UNSUPPORTED),
     (('fcanonicalize', 'a(is_integral)'), a),
+
+    # GFX9-optimized: fsat/fabs already produce canonical +0/sign-cleared results.
+    (('fcanonicalize', ('fsat', a)), ('fsat', a)),
+    (('fcanonicalize', ('fabs', a)), ('fabs', a)),
 ]
 
 optimizations = [
@@ -395,6 +399,12 @@ for s in [16, 32, 64]:
         (('~fadd@{}'.format(s), ('fmul', a, ('fsat', ('fadd', 1.0, ('fneg', c)))), ('fmul', b, ('fsat', c))), ('flrp', a, b, ('fsat', c)), '!options->lower_flrp{}'.format(s)),
         (('~fadd@{}'.format(s), a, ('fmul', c, ('fadd', b, ('fneg', a)))), ('flrp', a, b, c), '!options->lower_flrp{}'.format(s)),
         (('~fadd@{}'.format(s), 1.0, ('fneg', ('fmul', ('fadd', 1.0, ('fneg', a)), ('fadd', 1.0, ('fneg', b))))), ('flrp', b, 1.0, a), '!options->lower_flrp{}'.format(s)),
+        # GFX9-optimized: catch DXVK mix(a,b,t) using fsub instead of fadd+fneg.
+        (('~fadd@{}'.format(s), ('fmul', c, ('fsub', b, a)), a), ('flrp', a, b, c), '!options->lower_flrp{}'.format(s)),
+        (('~fadd@{}'.format(s), a, ('fmul', c, ('fsub', b, a))), ('flrp', a, b, c), '!options->lower_flrp{}'.format(s)),
+        (('~fadd@{}'.format(s), ('fmul', a, ('fsub', 1.0, c)), ('fmul', b, c)), ('flrp', a, b, c), '!options->lower_flrp{}'.format(s)),
+        (('~fadd@{}'.format(s), ('fmul', b, c), ('fmul', a, ('fsub', 1.0, c))), ('flrp', a, b, c), '!options->lower_flrp{}'.format(s)),
+
     ])
 
 optimizations.extend([
@@ -1777,6 +1787,14 @@ optimizations.extend([
     ('fmul',
      ('fmul', ('fmul', a, a), ('fmul', a, a)),
      ('fmul', ('fmul', a, a), ('fmul', a, a)))),
+   # GFX9-optimized: pow(x,10) common in PBR roughness/specular.
+   # Reduces 2 transcendental ops + fmul + fexp2 (~80 cycles) to 4 pipelined FMULs.
+   (('~fpow', a, 10.0),
+    ('fmul',
+     ('fmul',
+      ('fmul', ('fmul', a, a), ('fmul', a, a)),
+      ('fmul', ('fmul', a, a), ('fmul', a, a))),
+     ('fmul', a, a))),
    (('fpow(contract)', 2.0, a), ('fexp2', a)),
 
    # GFX9-optimized: common fpow exponents -> native transcendental ALU.
@@ -1809,6 +1827,20 @@ optimizations.extend([
    (('fmul(contract)', ('fsqrt', a), ('fsqrt', a)), ('fabs', a)),
    (('fmulz(contract)', ('fsqrt', a), ('fsqrt', a)), ('fabs', a)),
 
+   # GFX9-optimized: fdiv by exact powers of two is bit-exact as fmul.
+   # Avoids fdiv -> frcp+fmul expansion (~40 cycles) -> single V_MUL_F32 (4 cycles).
+   (('fdiv', a, 2.0), ('fmul', a, 0.5)),
+   (('fdiv', a, -2.0), ('fmul', a, -0.5)),
+   (('fdiv', a, 4.0), ('fmul', a, 0.25)),
+   (('fdiv', a, -4.0), ('fmul', a, -0.25)),
+   (('fdiv', a, 8.0), ('fmul', a, 0.125)),
+   (('fdiv', a, -8.0), ('fmul', a, -0.125)),
+   (('fdiv', a, 16.0), ('fmul', a, 0.0625)),
+   (('fdiv', a, -16.0), ('fmul', a, -0.0625)),
+   (('fdiv', a, 32.0), ('fmul', a, 0.03125)),
+   (('fdiv', a, -32.0), ('fmul', a, -0.03125)),
+   (('fdiv', a, 64.0), ('fmul', a, 0.015625)),
+   (('fdiv', a, -64.0), ('fmul', a, -0.015625)),
    (('fdiv(contract)', 1.0, a), ('frcp', a)),
    (('fdiv', a, b), ('fmul', a, ('frcp', b)), 'options->lower_fdiv'),
    (('frcp(contract)', ('frcp', a)), ('fcanonicalize', a)),
@@ -4127,6 +4159,16 @@ reassoc_fma_optimizations = [
      ('fadd', ('fneg', a), ('fneg', ('fadd', b, ('fadd', c, ('fneg', d)))))),
     (('~fadd', ('fneg(is_used_once)', ('fadd(is_used_once)', 'a(is_fmul)', 'b(is_fmul)')), 'c(is_not_fmul)'),
      ('fadd', ('fneg', a), ('fadd', ('fneg', b), c))),
+
+    # GFX9-optimized: flatten pure fmul-only trees so nir_opt_peephole_ffma
+    # can fuse every pair into V_FMA_F32.  3-term: 5 ops -> 2 ffma + 1 fmul = 3.
+    # 4-term left-heavy: 7 ops -> 3 ffma + 1 fmul = 4.  Critical for skinning.
+    (('~fadd', ('fadd(is_used_once)', 'a(is_fmul)', 'b(is_fmul)'), 'c(is_fmul)'),
+     ('fadd', a, ('fadd', b, c))),
+    (('~fadd', ('fadd(is_used_once)', 'a(is_fmul)', ('fadd(is_used_once)', 'b(is_fmul)', 'c(is_fmul)')), 'd(is_fmul)'),
+     ('fadd', a, ('fadd', b, ('fadd', c, d)))),
+    (('~fadd', ('fadd(is_used_once)', 'a(is_fmul)', 'b(is_fmul)'), ('fadd(is_used_once)', 'c(is_fmul)', 'd(is_fmul)')),
+     ('fadd', a, ('fadd', b, ('fadd', c, d)))),
 ]
 
 integer_promotion_optimizations = []
