@@ -22514,13 +22514,14 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
   const struct processor_costs *cost
     = speed ? ix86_tune_cost : &ix86_size_cost;
   int src_cost;
+  const unsigned int mode_size = GET_MODE_SIZE (mode);
 
   /* Handling different vternlog variants.  */
-  if ((GET_MODE_SIZE (mode) == 64
+  if ((mode_size == 64
        ? TARGET_AVX512F
        : (TARGET_AVX512VL
 	  || (TARGET_AVX512F && !TARGET_PREFER_AVX256)))
-      && GET_MODE_SIZE (mode) >= 16
+      && mode_size >= 16
       && outer_code_i == SET
       && ternlog_operand (x, mode))
     {
@@ -22617,8 +22618,8 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
 	 it'll probably end up.  Add a penalty for size.  */
       *total = (COSTS_N_INSNS (1)
 		+ (!TARGET_64BIT && flag_pic)
-		+ (GET_MODE_SIZE (mode) <= 4
-		   ? 0 : GET_MODE_SIZE (mode) <= 8 ? 1 : 2));
+		+ (mode_size <= 4
+		   ? 0 : mode_size <= 8 ? 1 : 2));
       return true;
 
     case ZERO_EXTEND:
@@ -22639,7 +22640,7 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
 
     case ASHIFT:
       if (SCALAR_INT_MODE_P (mode)
-	  && GET_MODE_SIZE (mode) < UNITS_PER_WORD
+	  && mode_size < UNITS_PER_WORD
 	  && CONST_INT_P (XEXP (x, 1)))
 	{
 	  HOST_WIDE_INT value = INTVAL (XEXP (x, 1));
@@ -22725,7 +22726,7 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
 	  /* Compute costs correctly for widening multiplication.  */
 	  if ((GET_CODE (op0) == SIGN_EXTEND || GET_CODE (op0) == ZERO_EXTEND)
 	      && GET_MODE_SIZE (GET_MODE (XEXP (op0, 0))) * 2
-	         == GET_MODE_SIZE (mode))
+	         == mode_size)
 	    {
 	      int is_mulwiden = 0;
 	      machine_mode inner_mode = GET_MODE (op0);
@@ -22774,7 +22775,7 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
 
     case PLUS:
       if (GET_MODE_CLASS (mode) == MODE_INT
-	  && GET_MODE_SIZE (mode) <= UNITS_PER_WORD)
+	  && mode_size <= UNITS_PER_WORD)
 	{
 	  if (GET_CODE (XEXP (x, 0)) == PLUS
 	      && GET_CODE (XEXP (XEXP (x, 0), 0)) == MULT
@@ -22835,7 +22836,7 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
     case MINUS:
       /* Subtract with borrow, ignore the cost of subtracting a carry flag.  */
       if (GET_MODE_CLASS (mode) == MODE_INT
-	  && GET_MODE_SIZE (mode) <= UNITS_PER_WORD
+	  && mode_size <= UNITS_PER_WORD
 	  && GET_CODE (XEXP (x, 0)) == MINUS
 	  && (ix86_carry_flag_operator (XEXP (XEXP (x, 0), 1), mode)
 	      || ix86_carry_flag_unset_operator (XEXP (XEXP (x, 0), 1), mode)))
@@ -22856,7 +22857,7 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
 	*total = ix86_vec_cost (mode, cost->addss);
       else if (GET_MODE_CLASS (mode) == MODE_VECTOR_INT)
 	*total = ix86_vec_cost (mode, cost->sse_op);
-      else if (GET_MODE_SIZE (mode) > UNITS_PER_WORD)
+      else if (mode_size > UNITS_PER_WORD)
 	*total = cost->add * 2;
       else
 	*total = cost->add;
@@ -22868,10 +22869,10 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
 	{
 	  /* (ior (not ...) ...) can be a single insn in AVX512.  */
 	  if (GET_CODE (XEXP (x, 0)) == NOT && TARGET_AVX512F
-	      && (GET_MODE_SIZE (mode) == 64
+	      && (mode_size == 64
 		  || (TARGET_AVX512VL
-		      && (GET_MODE_SIZE (mode) == 32
-			  || GET_MODE_SIZE (mode) == 16))))
+		      && (mode_size == 32
+			  || mode_size == 16))))
 	    {
 	      rtx right = GET_CODE (XEXP (x, 1)) != NOT
 			  ? XEXP (x, 1) : XEXP (XEXP (x, 1), 0);
@@ -22927,7 +22928,7 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
 		    : set_src_cost (op, DImode, speed);
 	  return true;
 	}
-      else if (GET_MODE_SIZE (mode) > UNITS_PER_WORD)
+      else if (mode_size > UNITS_PER_WORD)
 	*total = cost->add * 2;
       else
 	*total = cost->add;
@@ -22937,7 +22938,7 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
       if (GET_MODE_CLASS (mode) == MODE_VECTOR_INT
 	  || SSE_FLOAT_MODE_P (mode))
 	*total = ix86_vec_cost (mode, cost->sse_op);
-      else if (GET_MODE_SIZE (mode) > UNITS_PER_WORD)
+      else if (mode_size > UNITS_PER_WORD)
 	*total = cost->add * 2;
       else
 	*total = cost->add;
@@ -22959,10 +22960,10 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
 
 	      /* (and (not ...) (not ...)) can be a single insn in AVX512.  */
 	      if (GET_CODE (right) == NOT && TARGET_AVX512F
-		  && (GET_MODE_SIZE (mode) == 64
+		  && (mode_size == 64
 		      || (TARGET_AVX512VL
-			  && (GET_MODE_SIZE (mode) == 32
-			      || GET_MODE_SIZE (mode) == 16))))
+			  && (mode_size == 32
+			      || mode_size == 16))))
 		right = XEXP (right, 0);
 
 	      *total = ix86_vec_cost (mode, cost->sse_op)
@@ -22982,7 +22983,7 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
 	    }
 	  *total = ix86_vec_cost (mode, cost->sse_op);
 	}
-      else if (GET_MODE_SIZE (mode) > UNITS_PER_WORD)
+      else if (mode_size > UNITS_PER_WORD)
 	{
 	  if (TARGET_BMI && GET_CODE (XEXP (x,0)) == NOT)
 	    {
@@ -23029,10 +23030,10 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
 	{
 	  /* (not (xor ...)) can be a single insn in AVX512.  */
 	  if (GET_CODE (XEXP (x, 0)) == XOR && TARGET_AVX512F
-	      && (GET_MODE_SIZE (mode) == 64
+	      && (mode_size == 64
 		  || (TARGET_AVX512VL
-		      && (GET_MODE_SIZE (mode) == 32
-			  || GET_MODE_SIZE (mode) == 16))))
+		      && (mode_size == 32
+			  || mode_size == 16))))
 	    {
 	      *total = ix86_vec_cost (mode, cost->sse_op)
 		       + rtx_cost (XEXP (XEXP (x, 0), 0), mode,
@@ -23045,7 +23046,7 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
 	  // vnot is pxor -1.
 	  *total = ix86_vec_cost (mode, cost->sse_op) + 1;
 	}
-      else if (GET_MODE_SIZE (mode) > UNITS_PER_WORD)
+      else if (mode_size > UNITS_PER_WORD)
 	*total = cost->add * 2;
       else
 	*total = cost->add;
@@ -23060,7 +23061,7 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
 	*total = ix86_vec_cost (mode, cost->sse_op);
       else if (GET_MODE_CLASS (mode) == MODE_VECTOR_INT)
 	*total = ix86_vec_cost (mode, cost->sse_op);
-      else if (GET_MODE_SIZE (mode) > UNITS_PER_WORD)
+      else if (mode_size > UNITS_PER_WORD)
 	*total = cost->add * 3;
       else
 	*total = cost->add;
@@ -23421,7 +23422,7 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
       /* CONST_VECTOR_DUPLICATE_P in constant_pool is just broadcast.
 	 or variants in ix86_vector_duplicate_simode_const.  */
 
-      if (GET_MODE_SIZE (mode) >= 16
+      if (mode_size >= 16
 	  && VECTOR_MODE_P (mode)
 	  && SYMBOL_REF_P (XEXP (x, 0))
 	  && CONSTANT_POOL_ADDRESS_P (XEXP (x, 0))
@@ -23473,7 +23474,7 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
     case IF_THEN_ELSE:
       if (TARGET_XOP
 	  && VECTOR_MODE_P (mode)
-	  && (GET_MODE_SIZE (mode) == 16 || GET_MODE_SIZE (mode) == 32))
+	  && (mode_size == 16 || mode_size == 32))
 	{
 	  /* vpcmov.  */
 	  *total = speed ? COSTS_N_INSNS (2) : COSTS_N_BYTES (6);
@@ -23487,7 +23488,7 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
 	}
       else if (TARGET_CMOVE
 	       && SCALAR_INT_MODE_P (mode)
-	       && GET_MODE_SIZE (mode) <= UNITS_PER_WORD)
+	       && mode_size <= UNITS_PER_WORD)
 	{
 	  /* cmov.  */
 	  *total = COSTS_N_INSNS (1);
@@ -23508,7 +23509,7 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
     case LTU:
       if (TARGET_SSE2
 	  && GET_MODE_CLASS (mode) == MODE_VECTOR_INT
-	  && GET_MODE_SIZE (mode) >= 8)
+	  && mode_size >= 8)
 	{
 	  /* vpcmpeq */
 	  *total = speed ? COSTS_N_INSNS (1) : COSTS_N_BYTES (4);
@@ -23520,7 +23521,7 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
 	}
       if (TARGET_XOP
 	  && GET_MODE_CLASS (mode) == MODE_VECTOR_INT
-	  && GET_MODE_SIZE (mode) <= 16)
+	  && mode_size <= 16)
 	{
 	  /* vpcomeq */
 	  *total = speed ? COSTS_N_INSNS (1) : COSTS_N_BYTES (6);
@@ -23537,7 +23538,7 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
     case GEU:
       if (TARGET_XOP
 	  && GET_MODE_CLASS (mode) == MODE_VECTOR_INT
-	  && GET_MODE_SIZE (mode) <= 16)
+	  && mode_size <= 16)
 	{
 	  /* vpcomneq */
 	  *total = speed ? COSTS_N_INSNS (1) : COSTS_N_BYTES (6);
@@ -23549,9 +23550,9 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
 	}
       if (TARGET_SSE2
 	  && GET_MODE_CLASS (mode) == MODE_VECTOR_INT
-	  && GET_MODE_SIZE (mode) >= 8)
+	  && mode_size >= 8)
 	{
-	  if (TARGET_AVX512F && GET_MODE_SIZE (mode) >= 16)
+	  if (TARGET_AVX512F && mode_size >= 16)
 	    /* vpcmpeq + vpternlog */
 	    *total = speed ? COSTS_N_INSNS (2) : COSTS_N_BYTES (11);
 	  else

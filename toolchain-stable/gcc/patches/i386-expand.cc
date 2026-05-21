@@ -21774,9 +21774,10 @@ expand_vec_perm_pshufb (struct expand_vec_perm_d *d)
   rtx rperm[64], vperm, target, op0, op1;
 
   nelt = d->nelt;
+  const unsigned int mode_bytes = GET_MODE_SIZE (d->vmode);
 
   if (!d->one_operand_p)
-    switch (GET_MODE_SIZE (d->vmode))
+    switch (mode_bytes)
       {
       case 4:
 	if (!TARGET_XOP)
@@ -21826,7 +21827,7 @@ expand_vec_perm_pshufb (struct expand_vec_perm_d *d)
 	return false;
       }
   else
-    switch (GET_MODE_SIZE (d->vmode))
+    switch (mode_bytes)
       {
       case 4:
 	if (!TARGET_SSSE3)
@@ -22876,7 +22877,7 @@ expand_vec_perm_interleave2 (struct expand_vec_perm_d *d)
   for (i = 0; i < nelt; ++i)
     contents |= HOST_WIDE_INT_1U << d->perm[i];
 
-  memset (remap, 0xff, sizeof (remap));
+  memset (remap, 0xff, 2 * nelt);
   dremap = *d;
 
   if (GET_MODE_SIZE (d->vmode) == 4
@@ -25208,6 +25209,15 @@ expand_vec_perm_vpshufb4_vpermq2 (struct expand_vec_perm_d *d)
 static bool
 ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
 {
+  /* Pre-compute ISA and mode properties checked by trial functions.
+     Many trial functions below immediately return false when their
+     ISA prerequisite is absent or the mode size is wrong.  Guarding
+     the call here avoids function-call overhead on the common failure
+     path.  These values are invariant across the function body.  */
+  const unsigned int mode_size = GET_MODE_SIZE (d->vmode);
+  const bool have_avx = TARGET_AVX;
+  const bool have_avx2 = TARGET_AVX2;
+
   /* Try a single instruction expansion.  */
   if (expand_vec_perm_1 (d))
     return true;
@@ -25226,10 +25236,12 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
   if (expand_vec_perm_broadcast (d))
     return true;
 
-  if (expand_vec_perm_vpermq_perm_1 (d))
+  if (have_avx2 && mode_size == 32
+      && expand_vec_perm_vpermq_perm_1 (d))
     return true;
 
-  if (expand_vec_perm_vperm2f128 (d))
+  if (have_avx && mode_size == 32
+      && expand_vec_perm_vperm2f128 (d))
     return true;
 
   if (expand_vec_perm_pblendv (d))
@@ -25252,7 +25264,8 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
   if (expand_vec_perm_even_odd_pack (d))
     return true;
 
-  if (expand_vec_perm_2vperm2f128_vshuf (d))
+  if (have_avx && mode_size == 32
+      && expand_vec_perm_2vperm2f128_vshuf (d))
     return true;
 
   if (expand_vec_perm_pshufb2 (d))
@@ -25264,7 +25277,8 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
   if (expand_vec_perm_interleave3 (d))
     return true;
 
-  if (expand_vec_perm_vperm2f128_vblend (d))
+  if (have_avx && mode_size == 32
+      && expand_vec_perm_vperm2f128_vblend (d))
     return true;
 
   if (expand_vec_perm_2perm_interleave (d, false))
@@ -25283,7 +25297,8 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
 
   if (expand_vec_perm_even_odd_trunc (d))
     return true;
-  if (expand_vec_perm_vpshufb2_vpermq (d))
+  if (have_avx2 && mode_size == 32
+      && expand_vec_perm_vpshufb2_vpermq (d))
     return true;
 
   if (expand_vec_perm_vpshufb2_vpermq_even_odd (d))
@@ -25310,7 +25325,8 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
     return true;
 
   /* Even longer sequences.  */
-  if (expand_vec_perm_vpshufb4_vpermq2 (d))
+  if (have_avx2 && mode_size == 32
+      && expand_vec_perm_vpshufb4_vpermq2 (d))
     return true;
 
   /* See if we can get the same permutation in different vector integer
@@ -25324,7 +25340,8 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
     }
 
   /* Even longer, including recursion to ix86_expand_vec_perm_const_1.  */
-  if (expand_vec_perm2_vperm2f128_vblend (d))
+  if (have_avx && !have_avx2 && mode_size == 32
+      && expand_vec_perm2_vperm2f128_vblend (d))
     return true;
 
   return false;
