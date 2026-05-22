@@ -210,6 +210,8 @@ struct hash_table *
 _mesa_hash_table_create_u32_keys(void *mem_ctx)
 {
    struct hash_table *ht = _mesa_hash_table_create(mem_ctx, key_u32_hash, key_u32_equals);
+   if (ht == NULL)
+      return NULL;
    _mesa_hash_table_set_deleted_key(ht, (void *)(uintptr_t)UINT32_MAX);
    return ht;
 }
@@ -228,7 +230,6 @@ hash_table_search_pointer(const struct hash_table *ht, uint32_t hash, const void
    const uint32_t start = util_fast_urem32(hash, size, ht->size_magic);
    const uint32_t step = 1 + util_fast_urem32(hash, ht->rehash, ht->rehash_magic);
    struct hash_entry * const table = ht->table;
-   const void * const deleted_key = ht->deleted_key;
    uint32_t addr = start;
 
    do {
@@ -242,10 +243,12 @@ hash_table_search_pointer(const struct hash_table *ht, uint32_t hash, const void
       if (next2 >= size) next2 -= size;
       __builtin_prefetch(table + next2, 0, 2);
 
-      if (likely(entry->key == NULL))
+      const void *entry_key = entry->key;
+
+      if (likely(entry_key == NULL))
          return NULL;
 
-      if (entry->hash == hash && entry->key != deleted_key && entry->key == key)
+      if (entry->hash == hash && entry_key == key)
          return entry;
 
       addr = next1;
@@ -331,8 +334,11 @@ hash_table_insert_rehash(struct hash_table *ht, uint32_t hash,
          return;
       }
       addr += step;
-      if (addr >= size) addr -= size;
-   } while (true);
+      if (addr >= size)
+         addr -= size;
+   } while (addr != start);
+
+   assert(!"hash_table_insert_rehash: table unexpectedly full");
 }
 
 static void
@@ -377,9 +383,10 @@ _mesa_hash_table_rehash(struct hash_table *ht, unsigned new_size_index)
    struct hash_entry *table;
 
    if (ht->size_index == new_size_index && ht->deleted_entries == ht->max_entries) {
-      hash_table_clear_fast(ht);
-      assert(!ht->entries);
-      return;
+      if (ht->entries == 0) {
+         hash_table_clear_fast(ht);
+         return;
+      }
    }
 
    if (new_size_index >= ARRAY_SIZE(hash_sizes))
@@ -537,8 +544,9 @@ _mesa_hash_table_next_entry_unsafe(const struct hash_table *ht,
    else
       entry++;
    struct hash_entry * const end = ht->table + ht->size;
+   const void * const deleted_key = ht->deleted_key;
    while (entry != end) {
-      if (entry->key != NULL)
+      if (entry->key != NULL && entry->key != deleted_key)
          return entry;
       entry++;
    }
