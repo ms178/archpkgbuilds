@@ -1,489 +1,718 @@
 # Maintainer: CachyOS <https://cachyos.org>
-# Auditor: Super-Genius AI
+# Maintainer: Antoine Viallon <antoine@lesviallon.fr>
+# Contributor: ms178
 
 _pkgname=ananicy-cpp
 pkgname=ananicy-cpp-git
 pkgver=1.2.0.r1.ga42a187
-pkgrel=1
-pkgdesc="Ananicy Cpp (PGO+CS-PGO+BOLT optimized) - Full rewrite of Ananicy in C++, featuring lower CPU and RAM usage."
-arch=(x86_64 i386 armv7h)
-url="https://gitlab.com/ananicy-cpp/ananicy-cpp.git"
-license=('GPLv3')
-depends=(fmt spdlog nlohmann-json systemd libelf zlib libbpf)
-makedepends=(cmake ninja clang git nlohmann-json llvm)
-options=(strip)
-optdepends=("ananicy-rules-git: community rules"
-            "ananicy-rules: Rules based for ananicy-cpp"
-            "mimalloc: Optional, potentially improves llvm-bolt performance during build")
-source=("${_pkgname}::git+https://gitlab.com/ananicy-cpp/ananicy-cpp.git"
-        "git+https://gitlab.com/vnepogodin/std-format.git"
-        "patch.patch"
-        "ananicycmake.patch"
-        )
-sha512sums=('SKIP'
-            'SKIP'
-            'SKIP'
-            'SKIP'
-            )
+pkgrel=3
+pkgdesc="Ananicy Cpp with BPF process listener and PGO/BOLT optimization"
+arch=(x86_64)
+url="https://gitlab.com/ananicy-cpp/ananicy-cpp"
+license=('GPL-3.0-or-later')
+depends=(
+  gcc-libs
+  glibc
+  libbpf
+  libelf
+  libfmt.so
+  libspdlog.so
+  pcre2
+  systemd
+  systemd-libs
+  zlib
+)
+makedepends=(
+  bpf
+  clang
+  cmake
+  git
+  llvm
+  ninja
+  nlohmann-json
+  patch
+  pkgconf
+)
+optdepends=(
+  'cachyos-ananicy-rules: CachyOS tuned rules'
+  'cachyos-ananicy-rules-git: development version of CachyOS tuned rules'
+  'mimalloc: optional LD_PRELOAD accelerator for llvm-bolt/merge-fdata during package build'
+)
 provides=('ananicy-cpp')
 conflicts=('ananicy-cpp')
-
-# Error handling function
-die() {
-    local mesg=$1; shift
-    echo -e "\e[1;31m==> ERROR:\e[0m\e[1m ${mesg}\e[0m" "$@" >&2
-    exit 1
-}
-
-# Patching function
-_patch() {
-    local patch_file="$1"
-    local patch_level="${2:-p1}"
-    msg2 "Applying patch: ${patch_file} with level ${patch_level}"
-    patch --forward --strip="${patch_level#p}" --input="${srcdir}/${patch_file}" || die "Failed to apply patch: ${patch_file}"
-}
+options=('!lto' 'strip')
+source=("${_pkgname}::git+https://gitlab.com/ananicy-cpp/ananicy-cpp.git")
+sha512sums=('SKIP')
 
 pkgver() {
   cd "${srcdir}/${_pkgname}"
   git describe --tags --long | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
 }
 
+_die() {
+  error "$*"
+  exit 1
+}
+
+_add_missing_unistd_includes() {
+  # getpid(2) is declared by <unistd.h>.
+  # Patch the source instead of forcing a global compiler include: this is the
+  # correct zero-runtime-cost portability fix and does not pollute all TUs.
+  local _file
+  for _file in \
+    src/platform/systemd/service.cpp \
+    src/platform/linux/debug.cpp \
+    src/platform/linux/process.cpp; do
+    grep -q '^#include <unistd.h>' "${_file}" || sed -i '1i#include <unistd.h>' "${_file}"
+  done
+}
+
+_apply_process_listener_fix() {
+  # Upstreamable correctness/performance fix:
+  # - BPF is the production listener, but keep the netlink fallback safe too.
+  # - Do not resolve /proc/<pid>/cmdline in event-reader callbacks/threads.
+  # - Batch-drain netlink after each blocking recv() and enlarge its receive buffer.
+  # - sched_process_fork must report the child PID, not the current parent PID.
+  if grep -q 'netlink_program_get_pids' libananicycpp_netlink/include/netlink_program_utils.h && \
+     grep -q '^[[:space:]]*u32 pid = ctx->child_pid;' libananicycpp_bpf/src/ananicy_cpp.bpf.c; then
+    msg2 "process-listener overrun fix already present; skipping patch"
+    return 0
+  fi
+
+  patch -Np1 --forward <<'PATCH'
+diff --git a/libananicycpp_bpf/src/ananicy_cpp.bpf.c b/libananicycpp_bpf/src/ananicy_cpp.bpf.c
+index 65e55b9..14f0f21 100644
+--- a/libananicycpp_bpf/src/ananicy_cpp.bpf.c
++++ b/libananicycpp_bpf/src/ananicy_cpp.bpf.c
+@@ -98,8 +98,7 @@ int handle_fork(struct trace_event_raw_sched_process_fork* ctx)
+     static u64 prev_ts;
+     struct event *e;
+
+-    //u32 pid = ctx->child_pid;
+-    u32 pid = bpf_get_current_pid_tgid();
++    u32 pid = ctx->child_pid;
+     e = handle_event(pid, &prev_pid, &prev_ts);
+     if (!e) /* can't happen */
+         return 0;
+diff --git a/libananicycpp_netlink/include/netlink_program_utils.h b/libananicycpp_netlink/include/netlink_program_utils.h
+index e0de241..ad34b0e 100644
+--- a/libananicycpp_netlink/include/netlink_program_utils.h
++++ b/libananicycpp_netlink/include/netlink_program_utils.h
+@@ -2,6 +2,7 @@
+ #define NETLINK_PROGRAM_UTILS_H
+
+ #include <stdint.h>
++#include <stddef.h>
+ #ifndef __cplusplus
+ #include <stdbool.h>
+ #endif
+@@ -22,6 +23,8 @@ void destroy_netlink_program(ananicy_cpp_netlink_t* obj);
+ uint64_t netlink_program_get_timestamp(ananicy_cpp_netlink_t* obj);
+ pid_t netlink_program_get_pid(ananicy_cpp_netlink_t* obj);
+ ssize_t netlink_program_pool_message(ananicy_cpp_netlink_t* obj);
++ssize_t netlink_program_get_pids(ananicy_cpp_netlink_t* obj, pid_t* pids,
++                                 size_t max_pids);
+
+ #ifdef __cplusplus
+ }
+diff --git a/libananicycpp_netlink/include_cpp/netlink_program.hpp b/libananicycpp_netlink/include_cpp/netlink_program.hpp
+index 4c333d3..03eb4b2 100644
+--- a/libananicycpp_netlink/include_cpp/netlink_program.hpp
++++ b/libananicycpp_netlink/include_cpp/netlink_program.hpp
+@@ -2,6 +2,7 @@
+ #define NETLINK_PROGRAM_HPP
+
+ #include <cstdint>
++#include <span>
+
+ #include "netlink_program_utils.h"
+
+@@ -35,6 +36,9 @@ public:
+     m_netlink_program = nullptr;
+   }
+   ssize_t pool_message() noexcept { return netlink_program_pool_message(m_netlink_program); }
++  ssize_t get_pids(std::span<pid_t> pids) noexcept {
++    return netlink_program_get_pids(m_netlink_program, pids.data(), pids.size());
++  }
+
+   pid_t get_pid() const noexcept { return netlink_program_get_pid(m_netlink_program); }
+   uint64_t get_timestamp() const noexcept { return netlink_program_get_timestamp(m_netlink_program); }
+diff --git a/libananicycpp_netlink/src/netlink_program_utils.c b/libananicycpp_netlink/src/netlink_program_utils.c
+index e5d17c1..e84cb5e 100644
+--- a/libananicycpp_netlink/src/netlink_program_utils.c
++++ b/libananicycpp_netlink/src/netlink_program_utils.c
+@@ -6,6 +6,8 @@
+ #include <sys/socket.h>
+ #include <unistd.h>
+
++#include <stddef.h>
++
+ #include <time.h>
+ #include <errno.h>
+ #include <stdio.h>
+@@ -22,6 +24,27 @@ struct ananicy_cpp_netlink {
+   } nl_cn_msg;
+ };
+
++static void tune_netlink_socket(int32_t nl_sock) {
++  /*
++   * The proc connector is a best-effort multicast channel. During login,
++   * builds, browser/game launchers, Wine prefixes, package transactions, etc.
++   * fork/exec/comm events can arrive in bursts that are much larger than the
++   * kernel default receive buffer. If that queue overflows, recv(2) returns
++   * ENOBUFS and at least one process event has already been dropped.
++   *
++   * First try SO_RCVBUFFORCE (not capped by net.core.rmem_max) for units whose
++   * capability policy permits it. If a hardened/unit/capability setup denies
++   * it, fall back to regular SO_RCVBUF. Linux doubles the requested
++   * value internally; the exact resulting size is intentionally not relied on.
++   */
++  const int32_t rcvbuf = 4 * 1024 * 1024;
++  if (setsockopt(nl_sock, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf,
++                 sizeof(rcvbuf)) == -1) {
++    (void)setsockopt(nl_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf,
++                     sizeof(rcvbuf));
++  }
++}
++
+ int32_t connect_netlink_socket() {
+   int32_t nl_sock = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
+   if (nl_sock == -1) {
+@@ -29,6 +52,8 @@ int32_t connect_netlink_socket() {
+     return -1;
+   }
+
++  tune_netlink_socket(nl_sock);
++
+   struct sockaddr_nl sa_nl = {
+       .nl_family = AF_NETLINK,
+       .nl_pid = getpid(),
+@@ -128,3 +153,56 @@ pid_t netlink_program_get_pid(ananicy_cpp_netlink_t* obj) {
+ ssize_t netlink_program_pool_message(ananicy_cpp_netlink_t* obj) {
+   return recv(obj->nl_sock, &obj->nl_cn_msg, sizeof(obj->nl_cn_msg), 0);
+ }
++
++ssize_t netlink_program_get_pids(ananicy_cpp_netlink_t* obj, pid_t* pids,
++                                 size_t max_pids) {
++  if (!obj || !pids || max_pids == 0) {
++    errno = EINVAL;
++    return -1;
++  }
++
++  ssize_t status;
++  do {
++    status = recv(obj->nl_sock, &obj->nl_cn_msg, sizeof(obj->nl_cn_msg), 0);
++  } while (status == -1 && errno == EINTR);
++
++  if (status <= 0) {
++    return status;
++  }
++
++  size_t count = 0;
++  pid_t pid = netlink_program_get_pid(obj);
++  if (pid != 0) {
++    pids[count++] = pid;
++  }
++
++  /*
++   * Drain the receive queue after the blocking read above. This keeps the
++   * kernel socket queue short under fork storms while preserving the normal
++   * 500 ms idle timeout behaviour for the outer event loop.
++   */
++  for (; count < max_pids;) {
++    status = recv(obj->nl_sock, &obj->nl_cn_msg, sizeof(obj->nl_cn_msg),
++                  MSG_DONTWAIT);
++    if (status == -1) {
++      if (errno == EAGAIN || errno == EWOULDBLOCK) {
++        errno = 0;
++        break;
++      }
++      if (errno == EINTR) {
++        continue;
++      }
++      return -1;
++    }
++    if (status == 0) {
++      break;
++    }
++
++    pid = netlink_program_get_pid(obj);
++    if (pid != 0) {
++      pids[count++] = pid;
++    }
++  }
++
++  return (ssize_t)count;
++}
+diff --git a/src/platform/linux/process.cpp b/src/platform/linux/process.cpp
+index d84cecf..91c62d4 100644
+--- a/src/platform/linux/process.cpp
++++ b/src/platform/linux/process.cpp
+@@ -11,7 +11,9 @@
+ #include <cerrno>
+ #endif
+
++#include <array>
+ #include <filesystem> // for path
++#include <span>
+ #include <fstream>    // for ifstream
+ #include <thread>     // for jthread
+
+@@ -57,15 +59,13 @@ extern "C" void handle_event(void *ctx, int32_t cpu, void *data,
+     return;
+   }
+
+-  std::string &&command = get_command_from_pid(e->pid);
+-  if (command.ends_with(".exe")) {
+-    std::replace(command.begin(), command.end(), '\\', '/');
+-    fs::path cmd_path{command.c_str()};
+-    command = cmd_path.filename().string();
+-  }
+-
+-  Process process{
+-      .delta_us = e->delta_us, .pid = e->pid, .name = std::move(command)};
++  /*
++   * Keep the perf-buffer reader hot. /proc command resolution is much slower
++   * than draining events and can make the kernel perf ring drop samples during
++   * fork/exec storms. The worker resolves empty names immediately before rule
++   * lookup.
++   */
++  Process process{.delta_us = e->delta_us, .pid = e->pid, .name = {}};
+   spdlog::trace("Pushing new process: pid = {}", e->pid);
+   g_process_queue->push(std::move(process));
+ }
+@@ -119,14 +119,19 @@ void ProcessQueue::start() {
+ static std::int32_t handle_events(NetlinkProgram              *netlink_program,
+                                   synchronized_queue<Process> *queue,
+                                   const std::stop_token       &stop_token) {
++  static constexpr std::size_t PID_BATCH_SIZE = 256;
++  std::array<pid_t, PID_BATCH_SIZE> pids{};
+   ssize_t status = 0;
++
+   while (!stop_token.stop_requested()) {
+     errno = 0;
+-    status = netlink_program->pool_message();
++    status = netlink_program->get_pids(std::span<pid_t>{pids});
+     const std::int32_t errnum = errno;
++
+     if (status == 0) {
+-      return EXIT_SUCCESS;
+-    } else if (status == -1) {
++      continue;
++    }
++    if (status == -1) {
+       if (errnum == EINTR || errnum == EAGAIN) {
+         continue;
+       }
+@@ -145,15 +150,23 @@ static std::int32_t handle_events(NetlinkProgram              *netlink_program,
+     /// @see: https://gitlab.com/ananicy-cpp/ananicy-cpp/-/issues/20
+     static pid_t prev_pid;
+
+-    const pid_t pid = netlink_program->get_pid();
+-    if (pid == 0 || pid == prev_pid) {
+-      continue;
++    for (ssize_t i = 0; i < status; ++i) {
++      const pid_t pid = pids[static_cast<std::size_t>(i)];
++      if (pid == 0 || pid == prev_pid) {
++        continue;
++      }
++      prev_pid = pid;
++
++      /*
++       * Keep the netlink reader hot. Resolving /proc/<pid>/{cmdline,exe,comm}
++       * here is orders of magnitude slower than recv(2), and doing it in the
++       * socket thread is what lets the proc connector queue overflow. The
++       * worker resolves empty process names immediately before rule lookup.
++       */
++      Process process{.pid = pid, .name = {}};
++      spdlog::trace("Pushing new process: pid = {}", pid);
++      queue->push(std::move(process));
+     }
+-    prev_pid = pid;
+-
+-    Process process{.pid = pid, .name = get_command_from_pid(pid)};
+-    spdlog::trace("Pushing new process: pid = {}", pid);
+-    queue->push(std::move(process));
+   }
+
+   return static_cast<std::int32_t>(status);
+diff --git a/src/worker.cpp b/src/worker.cpp
+index e15e9a0..e459c7e 100644
+--- a/src/worker.cpp
++++ b/src/worker.cpp
+@@ -9,7 +9,9 @@
+ #include "utility/process_info.hpp"
+ #include "version.hpp"
+
++#include <algorithm>
+ #include <chrono>
++#include <filesystem>
+ #include <functional>
+
+ #include <fmt/format.h>
+@@ -76,7 +78,14 @@ void Worker::work(const std::stop_token &stop_token) {
+       control_groups::cgroup_info::v2;
+   while (!stop_token.stop_requested()) {
+     while ((proc = process_queue->poll(500ms)).has_value()) {
+-      const auto &p = proc.value();
++      auto p = std::move(proc.value());
++      if (p.name.empty()) {
++        p.name = get_command_from_pid(p.pid);
++        if (p.name.ends_with(".exe")) {
++          std::replace(p.name.begin(), p.name.end(), '\\', '/');
++          p.name = std::filesystem::path{p.name}.filename().string();
++        }
++      }
+       const auto &rule = rules->get_rule(p.name);
+
+       processed_count++;
+PATCH
+}
+
+_create_training_ruleset() {
+  # Do not call this variable "confdir": makepkg/pacman may expose a readonly
+  # global named confdir, and "local confdir=..." fails inside PKGBUILD funcs.
+  local _training_confdir="${srcdir}/ananicy-cpp-training.d"
+
+  rm -rf "${_training_confdir}"
+  install -dm755 "${_training_confdir}"
+
+  cat > "${_training_confdir}/ananicy.conf" <<'EOF'
+apply_nice = true
+apply_sched = true
+apply_ionice = true
+apply_oom_score_adj = true
+apply_latnice = true
+apply_cgroup = false
+apply_cpuset = false
+cgroup_load = true
+type_load = true
+rule_load = true
+cgroup_realtime_workaround = true
+log_applied_rule = false
+loglevel = error
+check_freq = 60
+x3d_mode = auto
+EOF
+
+  cat > "${_training_confdir}/00-training.types" <<'EOF'
+{ "type": "BG_CPUIntensive", "nice": 19, "latency_nice": 19, "ioclass": "idle", "ionice": 7 }
+{ "type": "LowLatency_RT", "nice": -10, "latency_nice": -10, "ioclass": "best-effort", "ionice": 0 }
+{ "type": "Service", "nice": 5, "latency_nice": 5, "ioclass": "best-effort", "ionice": 4 }
+EOF
+
+  cat > "${_training_confdir}/00-training.rules" <<'EOF'
+{ "name": "ananicy-cpp", "type": "Service" }
+{ "name": "clang", "type": "BG_CPUIntensive" }
+{ "name": "clang++", "type": "BG_CPUIntensive" }
+{ "name": "ld.lld", "type": "BG_CPUIntensive" }
+{ "name": "kwin_wayland", "type": "LowLatency_RT" }
+{ "name": "pipewire", "type": "LowLatency_RT", "name_regex": "^(pipewire|wireplumber)$" }
+EOF
+
+  cat > "${_training_confdir}/00-training.cgroups" <<'EOF'
+{ "cgroup": "ananicy-training", "CPUQuota": 100 }
+EOF
+}
+
 prepare() {
   cd "${srcdir}/${_pkgname}"
-  git submodule init
-  git -c protocol.file.allow=always submodule update --init --recursive
 
-  _patch patch.patch p1
-  #_patch ananicycmake.patch p1
+  _add_missing_unistd_includes
+  _apply_process_listener_fix
+  _create_training_ruleset
 
-  # Define directories
-  _build_dir_base="${srcdir}/${_pkgname}/build"
-  _pgo_dir="${srcdir}/${_pkgname}/pgo-data"
-  _cspgo_dir="${srcdir}/${_pkgname}/cspgo-data"
-  _bolt_data_dir="${srcdir}/${_pkgname}/bolt-data"
-  _bolt_binary_dir="${srcdir}/${_pkgname}/bolt-binary"
+  rm -rf build-* pgo-data cspgo-data bolt-data bolt-binary
+}
 
-  # Clean old directories
-  rm -rf "${_build_dir_base}"* "${_pgo_dir}" "${_cspgo_dir}" "${_bolt_data_dir}" "${_bolt_binary_dir}"
-
-  # Create fresh directories
-  mkdir -p "${_pgo_dir}" "${_cspgo_dir}" "${_bolt_data_dir}" "${_bolt_binary_dir}"
+_env_train() {
+  env \
+    ANANICY_CPP_CONFDIR="${srcdir}/ananicy-cpp-training.d" \
+    ANANICY_CPP_CONF="${srcdir}/ananicy-cpp-training.d/ananicy.conf" \
+    "$@"
 }
 
 _exercise_main_binary() {
-    local binary="$1"
-    local stage_name="${2:-Training}"
+  local binary="$1"
+  local stage_name="${2:-training}"
 
-    [[ -x "$binary" ]] || { msg2 "[$stage_name]: Main binary not found at ${binary}, skipping."; return 0; }
+  [[ -x "$binary" ]] || _die "[$stage_name] binary not found or not executable: $binary"
 
-    msg2 "[$stage_name]: Exercising main ananicy-cpp binary..."
+  msg2 "[$stage_name] exercising ananicy-cpp hot paths"
 
-    # --help: exercises argparse, string formatting, spdlog init
-    "$binary" --help 2>/dev/null || true
+  "$binary" --help >/dev/null 2>&1 || true
 
-    # dump subcommands: exercise the REAL hot paths of the daemon.
-    # These load config, parse rules/types/cgroups from JSON files on disk,
-    # scan /proc, resolve cgroup paths — all without needing root privileges.
-    # Each exercises different code paths in the binary.
-    for _subcmd in rules types cgroups; do
-        msg2 "[$stage_name]: Running: dump ${_subcmd}"
-        "$binary" dump "${_subcmd}" 2>/dev/null || true
-    done
+  local subcmd
+  for subcmd in rules types cgroups proc autogroup rules proc types; do
+    _env_train "$binary" dump "$subcmd" >/dev/null 2>&1 || true
+  done
 
-    # dump proc: scans /proc for all running processes — exercises
-    # parse_proc_status(), pid enumeration, string parsing of /proc/*/status.
-    # This is the heaviest real-world hot path.
-    msg2 "[$stage_name]: Running: dump proc"
-    "$binary" dump proc 2>/dev/null || true
-
-    # dump autogroup: exercises get_autogroup_map(), /proc/*/autogroup parsing
-    msg2 "[$stage_name]: Running: dump autogroup"
-    "$binary" dump autogroup 2>/dev/null || true
-
-    # Brief daemon start: exercises BPF initialization, netlink setup,
-    # the main event loop, and process monitoring.
-    # Even if it fails (no root, no BPF), it profiles the init paths.
-    # Use SIGTERM so atexit/DT_FINI handlers run (writes profraw/fdata).
-    msg2 "[$stage_name]: Running: start (brief, with timeout)"
-    timeout --signal=SIGTERM 4 "$binary" start 2>/dev/null || true
-    timeout --signal=SIGTERM 2 "$binary" start 2>/dev/null || true
-
-    # Second pass of dump commands to increase branch counter depth
-    for _subcmd in rules proc types; do
-        "$binary" dump "${_subcmd}" 2>/dev/null || true
-    done
-
-    msg2 "[$stage_name]: Main binary profiling complete."
+  timeout --signal=SIGTERM 3 env \
+    ANANICY_CPP_CONFDIR="${srcdir}/ananicy-cpp-training.d" \
+    ANANICY_CPP_CONF="${srcdir}/ananicy-cpp-training.d/ananicy.conf" \
+    "$binary" start >/dev/null 2>&1 || true
 }
 
-_run_pgo_training_workload() {
-    local build_dir="$1"
-    local stage_name="${2:-PGO/CS-PGO Training}"
-    local _training_iterations="${3:-3}"
+_configure_stage() {
+  local build_dir="$1"
+  shift
 
-    msg2 "[$stage_name]: Running PGO training workload from: ${build_dir}"
-
-    # --- Exercise the main binary (MOST IMPORTANT for daemon optimization) ---
-    _exercise_main_binary "${build_dir}/ananicy-cpp" "$stage_name"
-
-    local core_test="${build_dir}/src/tests/test-core"
-    local util_test="${build_dir}/src/tests/test-utility"
-    local bench_test="${build_dir}/benchmarks/ananicy_cpp_benchmarks"
-
-    [[ -x "$core_test" ]] || die "[$stage_name]: test-core binary not found or not executable in ${build_dir}"
-    [[ -x "$util_test" ]] || die "[$stage_name]: test-utility binary not found or not executable in ${build_dir}"
-    [[ -x "$bench_test" ]] || die "[$stage_name]: benchmarks binary not found or not executable in ${build_dir}"
-
-    # LLVM_PROFILE_FILE must be set before calling this (uses %m for merge-on-exit)
-    local _i
-    for _i in $(seq 1 "${_training_iterations}"); do
-        msg2 "[$stage_name]: Test iteration ${_i}/${_training_iterations}..."
-        "$core_test" || die "[$stage_name]: core test failed (iteration ${_i})!"
-        "$util_test" || die "[$stage_name]: utility test failed (iteration ${_i})!"
-    done
-
-    msg2 "[$stage_name]: Running benchmarks (with repetitions)..."
-    "$bench_test" --benchmark_repetitions=3 --benchmark_min_warmup_time=0.3 \
-        || die "[$stage_name]: benchmarks failed!"
-
-    msg2 "[$stage_name]: PGO training workload completed."
-    return 0
+  cmake -S . -B "$build_dir" \
+    -G Ninja \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DUSE_EXTERNAL_SPDLOG=ON \
+    -DUSE_EXTERNAL_JSON=ON \
+    -DUSE_EXTERNAL_FMTLIB=ON \
+    -DENABLE_SYSTEMD=ON \
+    -DENABLE_REGEX_SUPPORT=ON \
+    -DUSE_BPF_PROC_IMPL=ON \
+    -DUSE_EXPERIMENTAL_IMPL=OFF \
+    -DBPF_BUILD_LIBBPF=OFF \
+    -DBPF_BUILD_BPFTOOL=OFF \
+    -DENABLE_ANANICY_TESTS=OFF \
+    -DENABLE_ANANICY_BENCHMARKS=OFF \
+    "$@"
 }
 
-_run_bolt_training_workload() {
-    local instrumented_bin_dir="$1"
-    local stage_name="${2:-BOLT Training}"
-
-    msg2 "[$stage_name]: Running instrumented binaries from: ${instrumented_bin_dir}"
-
-    # --- Exercise the instrumented MAIN binary for BOLT ---
-    # This is the MOST IMPORTANT part: fdata from the main binary has
-    # 100% function-name overlap with the BOLT optimization target.
-    _exercise_main_binary "${instrumented_bin_dir}/ananicy-cpp" "$stage_name"
-
-    local core_test_inst="${instrumented_bin_dir}/src/tests/test-core"
-    local util_test_inst="${instrumented_bin_dir}/src/tests/test-utility"
-    local bench_test_inst="${instrumented_bin_dir}/benchmarks/ananicy_cpp_benchmarks"
-
-    # Run tests 3× for better branch frequency data
-    local _i
-    for _i in 1 2 3; do
-        if [[ -x "$core_test_inst" ]]; then
-            msg2 "[$stage_name]: Iteration ${_i}/3 - test-core..."
-            "$core_test_inst" || die "[$stage_name]: Instrumented core test failed (iter ${_i})!"
-        fi
-        if [[ -x "$util_test_inst" ]]; then
-            msg2 "[$stage_name]: Iteration ${_i}/3 - test-utility..."
-            "$util_test_inst" || die "[$stage_name]: Instrumented utility test failed (iter ${_i})!"
-        fi
-    done
-
-    # Run benchmarks with repetitions
-    if [[ -x "$bench_test_inst" ]]; then
-        msg2 "[$stage_name]: Running instrumented benchmarks (with repetitions)..."
-        "$bench_test_inst" --benchmark_repetitions=3 --benchmark_min_warmup_time=0.3 \
-            || die "[$stage_name]: Instrumented benchmarks failed!"
-    fi
-
-    # Ensure all fdata files are flushed to disk
-    sync
-
-    msg2 "[$stage_name]: BOLT training workload completed."
-    return 0
+_build_stage() {
+  local build_dir="$1"
+  cmake --build "$build_dir" --target ananicy-cpp
 }
 
-# Function to instrument a binary for BOLT
-_instrument_binary() {
-    local original_binary="$1"; local instrumentation_file="$2"; local output_file="$3"
-    [[ -f "$original_binary" ]] || die "BOLT Instr: Input '$original_binary' not found."
-    mkdir -p "$(dirname "${output_file}")"; mkdir -p "$(dirname "${instrumentation_file}")"
-    msg2 "BOLT: Instrumenting ${original_binary} -> ${output_file}"
-    local bolt_common_args=( --instrument --instrumentation-file-append-pid --lite=false \
-        --instrumentation-file="${instrumentation_file}" "${original_binary}" -o "${output_file}" )
-    if [[ -f "/usr/lib/mimalloc.so" ]]; then
-      msg2 "BOLT: Using mimalloc for instrumentation."
-      env LD_PRELOAD=/usr/lib/mimalloc.so llvm-bolt "${bolt_common_args[@]}" || die "BOLT Instr failed (mimalloc) for ${original_binary}"
-    else
-      msg2 "BOLT: No mimalloc, instrumenting without LD_PRELOAD."
-      llvm-bolt "${bolt_common_args[@]}" || die "BOLT Instr failed for ${original_binary}"
-    fi
-    [[ -f "$output_file" ]] || die "BOLT Instr: Output file '${output_file}' not created."
-    chmod 755 "${output_file}"
+_merge_profraw() {
+  local profile_dir="$1"
+  local output="$2"
+
+  if ! find "$profile_dir" -name '*.profraw' -print -quit | grep -q .; then
+    warning "no raw profile data found in $profile_dir"
+    return 1
+  fi
+
+  llvm-profdata merge -output="$output" "$profile_dir"/*.profraw || return 1
+  [[ -s "$output" ]] || return 1
+  rm -f "$profile_dir"/*.profraw
 }
 
-# Function to merge BOLT .fdata profiles
-_merge_instrumented_data() {
-    local instrumentation_folder="$1"; local merged_profile="$2"
-    msg2 "BOLT: Merging profiles from ${instrumentation_folder} -> ${merged_profile}"
-    mkdir -p "$(dirname "${merged_profile}")"
-    local fdata_files=(); while IFS= read -r -d $'\0'; do fdata_files+=("$REPLY"); done < <(find "${instrumentation_folder}" -maxdepth 1 -name '*.fdata*' -print0)
-    [[ ${#fdata_files[@]} -gt 0 ]] || die "BOLT Merge: No .fdata files found in ${instrumentation_folder}."
-    msg2 "BOLT Merge: Found ${#fdata_files[@]} fdata files to merge."
-    local temp_profile="${merged_profile}.tmp"
-    if [[ -f "/usr/lib/mimalloc.so" ]]; then
-      msg2 "BOLT Merge: Using mimalloc."; env LD_PRELOAD=/usr/lib/mimalloc.so merge-fdata "${fdata_files[@]}" > "${temp_profile}" || { rm -f "${temp_profile}"; die "BOLT Merge failed (mimalloc)"; }
-    else
-      msg2 "BOLT Merge: No mimalloc."; merge-fdata "${fdata_files[@]}" > "${temp_profile}" || { rm -f "${temp_profile}"; die "BOLT Merge failed"; }
-    fi
-    [[ -s "$temp_profile" ]] || die "BOLT Merge: Merged profile '${temp_profile}' is empty."
-    mv "${temp_profile}" "${merged_profile}"; sync
-    [[ -s "$merged_profile" ]] || die "BOLT Merge: Final merged profile '${merged_profile}' is missing or empty."
-    chmod 644 "${merged_profile}"; msg2 "BOLT Merge: Merged profile size: $(wc -c < "${merged_profile}") bytes"
-    msg2 "BOLT Merge: Cleaning up original fdata files..."
-    find "${instrumentation_folder}" -maxdepth 1 -name '*.fdata*' -not -name "$(basename "${merged_profile}")" -type f -delete
-    msg2 "BOLT Merge: Done."
+_maybe_with_mimalloc() {
+  if [[ -r /usr/lib/mimalloc.so ]]; then
+    env LD_PRELOAD=/usr/lib/mimalloc.so "$@"
+  else
+    "$@"
+  fi
 }
 
+_instrument_bolt_binary() {
+  local input="$1"
+  local fdata="$2"
+  local output="$3"
+
+  install -dm755 "$(dirname "$output")" "$(dirname "$fdata")"
+  _maybe_with_mimalloc llvm-bolt "$input" \
+    --instrument \
+    --instrumentation-file="$fdata" \
+    --instrumentation-file-append-pid \
+    --lite=false \
+    -o "$output"
+  chmod 755 "$output"
+}
+
+_merge_bolt_profiles() {
+  local data_dir="$1"
+  local output="$2"
+  local fdata_files=()
+
+  while IFS= read -r -d $'\0' file; do
+    fdata_files+=("$file")
+  done < <(find "$data_dir" -maxdepth 1 -type f -name '*.fdata*' -print0)
+
+  (( ${#fdata_files[@]} > 0 )) || return 1
+  _maybe_with_mimalloc merge-fdata "${fdata_files[@]}" > "$output"
+  [[ -s "$output" ]]
+}
+
+_optimize_with_bolt() {
+  local input="$1"
+  local profile="$2"
+  local output="$3"
+
+  local bolt_args=(
+    "$input"
+    --data "$profile"
+    -o "$output"
+    --dyno-stats
+    --lite=false
+    --reorder-blocks=ext-tsp
+    --reorder-functions=cdsort
+    --split-functions
+    --split-strategy=cdsplit
+    --split-all-cold
+    --split-eh
+    --icf=all
+    --plt=all
+    --peepholes=all
+    --indirect-call-promotion=all
+    --jump-tables=aggressive
+    --x86-strip-redundant-address-size
+  )
+
+  _maybe_with_mimalloc llvm-bolt "${bolt_args[@]}"
+  [[ -s "$output" ]]
+}
 
 build() {
   cd "${srcdir}/${_pkgname}"
 
-  # Append -Wno-c2y-extensions to fix Clang 19+ error with google/benchmark __COUNTER__
-  local _original_cflags="${CFLAGS} -Wno-c2y-extensions -Wno-error=c2y-extensions"
-  local _original_cxxflags="${CXXFLAGS} -Wno-c2y-extensions -Wno-error=c2y-extensions"
-  local _original_ldflags="${LDFLAGS}"
+  export CC=clang
+  export CXX=clang++
+  export AR=llvm-ar
+  export NM=llvm-nm
+  export RANLIB=llvm-ranlib
 
-  local _pgo_dir="${srcdir}/${_pkgname}/pgo-data"
-  local _cspgo_dir="${srcdir}/${_pkgname}/cspgo-data"
-  local _bolt_data_dir="${srcdir}/${_pkgname}/bolt-data"
-  local _bolt_binary_dir="${srcdir}/${_pkgname}/bolt-binary"
-  local _build_dir_base="${srcdir}/${_pkgname}/build"
+  local base_cflags="${CFLAGS} -Wno-c2y-extensions -Wno-error=c2y-extensions -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
+  local base_cxxflags="${CXXFLAGS} -Wno-c2y-extensions -Wno-error=c2y-extensions -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
+  local base_ldflags="${LDFLAGS}"
+  local instr_mllvm="-mllvm -vp-counters-per-site=150 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
 
-  local _build_dir_stage1="${_build_dir_base}-pgo-instr"
-  local _build_dir_stage2="${_build_dir_base}-cspgo-instr"
-  local _build_dir_stage3="${_build_dir_base}-final"
+  local pgo_dir="${srcdir}/${_pkgname}/pgo-data"
+  local cspgo_dir="${srcdir}/${_pkgname}/cspgo-data"
+  local bolt_data_dir="${srcdir}/${_pkgname}/bolt-data"
+  local bolt_binary_dir="${srcdir}/${_pkgname}/bolt-binary"
+  local build_pgo="${srcdir}/${_pkgname}/build-pgo-instr"
+  local build_cspgo="${srcdir}/${_pkgname}/build-cspgo-instr"
+  local build_final="${srcdir}/${_pkgname}/build-final"
 
-  rm -rf "${_build_dir_stage1}" "${_build_dir_stage2}" "${_build_dir_stage3}"
+  install -dm755 "$pgo_dir" "$cspgo_dir" "$bolt_data_dir" "$bolt_binary_dir"
 
-  local cmake_policy_arg="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+  local pgo_profdata=""
+  local cs_profdata=""
+  local final_profdata=""
 
-  # ============================================================================
-  # FIX [CRITICAL #2]: Increase -vp-counters-per-site from 50 → 150.
-  # The build log showed 10× "Running out of static counters" during CS-PGO
-  # training. 50 is insufficient for this codebase's value profiling sites.
-  # 150 provides ample headroom without significant binary size impact.
-  # ============================================================================
-  local pgo_common_instr_cflags="-g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=150 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
-  # FIX [MODERATE #6]: Linker flags only need value-profiling passthrough for LTO.
-  # Keep -Xclang flags here because LTO backend runs during linking.
-  local pgo_common_instr_ldflags="-g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=150 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
-  local pgo_failed=false
+  msg "Stage 1/7: building instrumentation binary for standard PGO"
+  local pgo_gen="-fprofile-generate=$pgo_dir"
+  _configure_stage "$build_pgo" \
+    "-DCMAKE_C_FLAGS=$base_cflags $pgo_gen $instr_mllvm" \
+    "-DCMAKE_CXX_FLAGS=$base_cxxflags $pgo_gen $instr_mllvm" \
+    "-DCMAKE_EXE_LINKER_FLAGS=$base_ldflags $pgo_gen" \
+    "-DCMAKE_SHARED_LINKER_FLAGS=$base_ldflags $pgo_gen" \
+    "-DCMAKE_MODULE_LINKER_FLAGS=$base_ldflags $pgo_gen"
+  _build_stage "$build_pgo"
 
-  # --- Stages 1-3: PGO Build, Train, Merge ---
-  msg "Stage 1: Building PGO instrumented build..."
-  mkdir -p "${_build_dir_stage1}"
-  local _stage1_pgo_flags="-fprofile-generate=${_pgo_dir}"
-  local _cmake_build_args_stage1=( "-DCMAKE_C_FLAGS=${_original_cflags} ${_stage1_pgo_flags} ${pgo_common_instr_cflags}" "-DCMAKE_CXX_FLAGS=${_original_cxxflags} ${_stage1_pgo_flags} ${pgo_common_instr_cflags}" "-DCMAKE_EXE_LINKER_FLAGS=${_original_ldflags} ${_stage1_pgo_flags} ${pgo_common_instr_ldflags}" "-DCMAKE_SHARED_LINKER_FLAGS=${_original_ldflags} ${_stage1_pgo_flags} ${pgo_common_instr_ldflags}" "-DCMAKE_MODULE_LINKER_FLAGS=${_original_ldflags} ${_stage1_pgo_flags} ${pgo_common_instr_ldflags}" )
-
-  CFLAGS="${_original_cflags}" CXXFLAGS="${_original_cxxflags}" LDFLAGS="${_original_ldflags}" \
-  ./configure.sh --buildtype=Release --builddir="${_build_dir_stage1}" --prefix=/usr --use_clang --enable_benchmarks --enable_tests -- -- "${cmake_policy_arg}" "${_cmake_build_args_stage1[@]}" || { error "Configure failed (Stage 1)"; return 1; }
-  ./build.sh || { error "Build failed (Stage 1)"; return 1; }
-
-  msg "Stage 2: Running PGO training workload..."
-  export LLVM_PROFILE_FILE="${_pgo_dir}/default-%m.profraw"
-  _run_pgo_training_workload "${_build_dir_stage1}" "PGO Training" 3 || { error "PGO training run failed"; pgo_failed=true; }
+  msg "Stage 2/7: training standard PGO"
+  export LLVM_PROFILE_FILE="$pgo_dir/default-%m.profraw"
+  _exercise_main_binary "$build_pgo/ananicy-cpp" "PGO"
   unset LLVM_PROFILE_FILE
 
-  if ! $pgo_failed; then
-      msg "Stage 3: Merging standard PGO profiles..."
-      find "$_pgo_dir" -name '*.profraw' -print -quit | grep -q . || { error "No raw PGO profile data found in ${_pgo_dir}"; pgo_failed=true; }
-      if ! $pgo_failed; then
-          llvm-profdata merge -output="${_pgo_dir}/default.profdata" "${_pgo_dir}"/*.profraw || { error "Failed to merge PGO data"; pgo_failed=true; }
-          [[ -s "${_pgo_dir}/default.profdata" ]] || { error "Merged PGO profile is empty or missing"; pgo_failed=true; }
-          rm -f "${_pgo_dir}"/*.profraw
-      fi
-  fi
-
-  # --- Stages 4-6: CS-PGO Build, Train, Merge ---
-  if ! $pgo_failed; then
-      msg "Stage 4: Building CS-PGO instrumented build..."
-      mkdir -p "${_build_dir_stage2}"
-      local _stage4_pgo_flags="-fprofile-use=${_pgo_dir}/default.profdata -fcs-profile-generate=${_cspgo_dir}"
-      local _cmake_build_args_stage4=( "-DCMAKE_C_FLAGS=${_original_cflags} ${_stage4_pgo_flags} ${pgo_common_instr_cflags}" "-DCMAKE_CXX_FLAGS=${_original_cxxflags} ${_stage4_pgo_flags} ${pgo_common_instr_cflags}" "-DCMAKE_EXE_LINKER_FLAGS=${_original_ldflags} ${_stage4_pgo_flags} ${pgo_common_instr_ldflags}" "-DCMAKE_SHARED_LINKER_FLAGS=${_original_ldflags} ${_stage4_pgo_flags} ${pgo_common_instr_ldflags}" "-DCMAKE_MODULE_LINKER_FLAGS=${_original_ldflags} ${_stage4_pgo_flags} ${pgo_common_instr_ldflags}" )
-      CFLAGS="${_original_cflags}" CXXFLAGS="${_original_cxxflags}" LDFLAGS="${_original_ldflags}" \
-      ./configure.sh --buildtype=Release --builddir="${_build_dir_stage2}" --prefix=/usr --use_clang --enable_benchmarks --enable_tests -- -- "${cmake_policy_arg}" "${_cmake_build_args_stage4[@]}" || { error "Configure failed (Stage 4)"; pgo_failed=true; }
-      if ! $pgo_failed; then ./build.sh || { error "Build failed (Stage 4)"; pgo_failed=true; }; fi
-  fi
-
-  if ! $pgo_failed; then
-      msg "Stage 5: Running training workload for CS-PGO data generation..."
-      export LLVM_PROFILE_FILE="${_cspgo_dir}/cs-%m.profraw"
-      _run_pgo_training_workload "${_build_dir_stage2}" "CS-PGO Training" 3 || { error "CS-PGO training run failed"; pgo_failed=true; }
-      unset LLVM_PROFILE_FILE
-  fi
-
-  if ! $pgo_failed; then
-      msg "Stage 6: Merging CS-PGO profiles..."
-      if ! find "$_cspgo_dir" -name '*.profraw' -print -quit | grep -q .; then
-          warning "No raw CS-PGO profile data found. Using only standard PGO profile for final build."
-          cp "${_pgo_dir}/default.profdata" "${_cspgo_dir}/cs.profdata" || { error "Failed to copy fallback profile data"; pgo_failed=true; }
-      else
-          llvm-profdata merge -output="${_cspgo_dir}/cs.profdata" "${_cspgo_dir}"/*.profraw "${_pgo_dir}/default.profdata" || { error "Failed to merge CS-PGO data"; pgo_failed=true; }
-          [[ -s "${_cspgo_dir}/cs.profdata" ]] || { error "Merged CS-PGO profile is empty or missing"; pgo_failed=true; }
-          rm -f "${_cspgo_dir}"/*.profraw
-      fi
-  fi
-
-  # --- Stage 7: Final Optimized Build ---
-  msg "Stage 7: Building final optimized build..."
-  mkdir -p "${_build_dir_stage3}"
-  local final_profdata_path=""
-  if ! $pgo_failed && [[ -s "${_cspgo_dir}/cs.profdata" ]]; then final_profdata_path="${_cspgo_dir}/cs.profdata"; msg2 "Using merged CS-PGO profile: ${final_profdata_path}";
-  elif ! $pgo_failed && [[ -s "${_pgo_dir}/default.profdata" ]]; then final_profdata_path="${_pgo_dir}/default.profdata"; warning "Using fallback PGO profile: ${final_profdata_path}";
-  else warning "No usable PGO profile data. Building without PGO optimization."; fi
-  local _cmake_build_args_stage7=()
-  if [[ -n "$final_profdata_path" ]]; then
-      local _final_opt_flags="-fprofile-use=${final_profdata_path}"
-      _cmake_build_args_stage7=( "-DCMAKE_C_FLAGS=${_original_cflags} ${_final_opt_flags}" "-DCMAKE_CXX_FLAGS=${_original_cxxflags} ${_final_opt_flags}" "-DCMAKE_EXE_LINKER_FLAGS=${_original_ldflags} ${_final_opt_flags} -Wl,--emit-relocs" "-DCMAKE_SHARED_LINKER_FLAGS=${_original_ldflags} ${_final_opt_flags} -Wl,--emit-relocs" "-DCMAKE_MODULE_LINKER_FLAGS=${_original_ldflags} ${_final_opt_flags} -Wl,--emit-relocs" )
-  else _cmake_build_args_stage7=( "-DCMAKE_C_FLAGS=${_original_cflags}" "-DCMAKE_CXX_FLAGS=${_original_cxxflags}" "-DCMAKE_EXE_LINKER_FLAGS=${_original_ldflags} -Wl,--emit-relocs" "-DCMAKE_SHARED_LINKER_FLAGS=${_original_ldflags} -Wl,--emit-relocs" "-DCMAKE_MODULE_LINKER_FLAGS=${_original_ldflags} -Wl,--emit-relocs" ); fi
-
-  CFLAGS="${_original_cflags}" CXXFLAGS="${_original_cxxflags}" LDFLAGS="${_original_ldflags}" \
-  ./configure.sh --buildtype=Release --builddir="${_build_dir_stage3}" --prefix=/usr --use_clang --enable_relocs --enable_benchmarks --enable_tests -- -- "${cmake_policy_arg}" "${_cmake_build_args_stage7[@]}" || { error "Configure failed (Stage 7)"; return 1; }
-  ./build.sh || { error "Build failed (Stage 7)"; return 1; }
-  local final_binary="${_build_dir_stage3}/ananicy-cpp"
-  [[ -x "$final_binary" ]] || die "Main ananicy-cpp binary not found after final build in ${_build_dir_stage3}"
-
-  # ==========================================================================
-  # BOLT Stages
-  # FIX [CRITICAL #1]: Instrument the MAIN ananicy-cpp binary FIRST,
-  # then also instrument test/benchmark binaries for supplementary data.
-  # Previously only test/benchmark binaries were instrumented, giving 1.5%
-  # function coverage. With the main binary instrumented, we expect >50%.
-  # ==========================================================================
-  msg "Stage 8: Instrumenting binaries for BOLT..."
-
-  # --- FIX: Instrument the MAIN binary (this is the optimization target!) ---
-  _instrument_binary "${_build_dir_stage3}/ananicy-cpp" \
-    "${_bolt_data_dir}/ananicy-cpp.fdata" \
-    "${_bolt_binary_dir}/ananicy-cpp" || pgo_failed=true
-
-  # Also instrument test/benchmark binaries for supplementary profile data
-  # (they share some functions with the main binary: config parsing, JSON, etc.)
-  if ! $pgo_failed; then
-    _instrument_binary "${_build_dir_stage3}/src/tests/test-core" \
-      "${_bolt_data_dir}/test-core.fdata" \
-      "${_bolt_binary_dir}/src/tests/test-core" || pgo_failed=true
-  fi
-
-  if ! $pgo_failed; then
-    _instrument_binary "${_build_dir_stage3}/src/tests/test-utility" \
-      "${_bolt_data_dir}/test-utility.fdata" \
-      "${_bolt_binary_dir}/src/tests/test-utility" || pgo_failed=true
-  fi
-
-  if ! $pgo_failed; then
-    _instrument_binary "${_build_dir_stage3}/benchmarks/ananicy_cpp_benchmarks" \
-      "${_bolt_data_dir}/ananicy_cpp_benchmarks.fdata" \
-      "${_bolt_binary_dir}/benchmarks/ananicy_cpp_benchmarks" || pgo_failed=true
-  fi
-
-  if ! $pgo_failed; then
-      msg "Stage 9: Running instrumented training workload for BOLT data..."
-      _run_bolt_training_workload "${_bolt_binary_dir}" "BOLT Training" || { error "BOLT training run failed"; pgo_failed=true; }
-  fi
-
-  if ! $pgo_failed; then
-      msg "Stage 10: Merging BOLT profiles..."
-      local _merged_bolt_profile="${_bolt_data_dir}/bolt-merged.fdata"
-      _merge_instrumented_data "${_bolt_data_dir}" "${_merged_bolt_profile}" || { error "BOLT profile merging failed"; pgo_failed=true; }
-  fi
-
-  if ! $pgo_failed; then
-      msg "Stage 11: Optimizing main binary with BOLT..."
-      local bolt_optimized_binary="${_bolt_binary_dir}/ananicy-cpp.bolt"
-      mkdir -p "$(dirname "${bolt_optimized_binary}")"
-
-      # ==================================================================
-      # FIX [MAJOR #3]: Removed --stoke (required --stoke-out file, was no-op)
-      # FIX [MODERATE]: Cleaned up flags for clarity
-      # Kept --lite=false for optimization: enables ICF and PLT optimization
-      # on ALL functions regardless of profile (7 ICF folds + 782 PLT calls).
-      # ==================================================================
-      local bolt_optimize_args=(
-          "${final_binary}"
-          --data "${_merged_bolt_profile}"
-          -o "${bolt_optimized_binary}"
-          --dyno-stats
-          --lite=false
-          --cu-processing-batch-size=64
-          # Code layout
-          --reorder-blocks=ext-tsp
-          --reorder-functions=cdsort
-          --split-functions
-          --split-strategy=cdsplit
-          --split-all-cold
-          --split-eh
-          --min-branch-clusters
-          # Function-level optimizations
-          --eliminate-unreachable
-          --icf=all
-          --plt=all
-          --frame-opt=all
-          --frame-opt-rm-stores
-          --peepholes=all
-          --sctc-mode=always
-          # Register and call optimizations
-          --indirect-call-promotion=all
-          --reg-reassign
-          --use-aggr-reg-reassign
-          --jump-tables=aggressive
-          # Data layout
-          --hot-data
-          --hot-text
-          # x86 specific
-          --x86-strip-redundant-address-size
-      )
-
-      local bolt_success=true
-      if [[ -f "/usr/lib/mimalloc.so" ]]; then
-        msg2 "BOLT: Using mimalloc for optimization."
-        env LD_PRELOAD=/usr/lib/mimalloc.so llvm-bolt "${bolt_optimize_args[@]}" || { warning "BOLT optimization failed (with mimalloc), using PGO binary."; bolt_success=false; }
-      else
-        msg2 "BOLT: mimalloc not found, optimizing without LD_PRELOAD."
-        llvm-bolt "${bolt_optimize_args[@]}" || { warning "BOLT optimization failed (without mimalloc), using PGO binary."; bolt_success=false; }
-      fi
-
-      if $bolt_success && [[ -f "$bolt_optimized_binary" ]]; then
-          mv "${bolt_optimized_binary}" "${final_binary}" || die "Failed to move BOLTed binary to final build directory"
-          chmod 755 "${final_binary}"
-          msg "BOLT optimization complete. Final binary at ${final_binary}"
-      else
-           msg "BOLT optimization step failed or output missing. Using PGO/CS-PGO optimized binary."
-      fi
-  fi
-
-  # --- Final Status ---
-  if $pgo_failed; then
-    warning "PGO/BOLT optimization could not be fully applied. Package built with potential fallback."
+  if _merge_profraw "$pgo_dir" "$pgo_dir/default.profdata"; then
+    pgo_profdata="$pgo_dir/default.profdata"
+    msg2 "standard PGO profile ready: $pgo_profdata"
   else
-    msg "CS-PGO+BOLT build process completed successfully."
+    warning "standard PGO profile generation failed; final build can still continue without it"
+  fi
+
+  if [[ -n "$pgo_profdata" ]]; then
+    msg "Stage 3/7: building instrumentation binary for context-sensitive PGO"
+    local cs_gen="-fprofile-use=$pgo_profdata -fcs-profile-generate=$cspgo_dir"
+    if _configure_stage "$build_cspgo" \
+      "-DCMAKE_C_FLAGS=$base_cflags $cs_gen $instr_mllvm" \
+      "-DCMAKE_CXX_FLAGS=$base_cxxflags $cs_gen $instr_mllvm" \
+      "-DCMAKE_EXE_LINKER_FLAGS=$base_ldflags $cs_gen" \
+      "-DCMAKE_SHARED_LINKER_FLAGS=$base_ldflags $cs_gen" \
+      "-DCMAKE_MODULE_LINKER_FLAGS=$base_ldflags $cs_gen" && \
+      _build_stage "$build_cspgo"; then
+
+      msg "Stage 4/7: training context-sensitive PGO"
+      export LLVM_PROFILE_FILE="$cspgo_dir/cs-%m.profraw"
+      _exercise_main_binary "$build_cspgo/ananicy-cpp" "CS-PGO"
+      unset LLVM_PROFILE_FILE
+
+      if _merge_profraw "$cspgo_dir" "$cspgo_dir/cs.profdata"; then
+        cs_profdata="$cspgo_dir/cs.profdata"
+        msg2 "CS-PGO profile ready: $cs_profdata"
+      else
+        warning "CS-PGO profile generation failed; falling back to standard PGO"
+      fi
+    else
+      warning "CS-PGO instrumentation build failed; falling back to standard PGO"
+    fi
+  fi
+
+  if [[ -n "$cs_profdata" ]]; then
+    final_profdata="$cs_profdata"
+  elif [[ -n "$pgo_profdata" ]]; then
+    final_profdata="$pgo_profdata"
+  fi
+
+  msg "Stage 5/7: building final optimized binary"
+  local final_extra_args=(
+    -DBUILD_WITH_RELOCS=ON
+  )
+  if [[ -n "$final_profdata" ]]; then
+    msg2 "using profile: $final_profdata"
+    local pgo_use="-fprofile-use=$final_profdata"
+    final_extra_args+=(
+      "-DCMAKE_C_FLAGS=$base_cflags $pgo_use"
+      "-DCMAKE_CXX_FLAGS=$base_cxxflags $pgo_use"
+      "-DCMAKE_EXE_LINKER_FLAGS=$base_ldflags $pgo_use"
+      "-DCMAKE_SHARED_LINKER_FLAGS=$base_ldflags $pgo_use"
+      "-DCMAKE_MODULE_LINKER_FLAGS=$base_ldflags $pgo_use"
+    )
+  else
+    warning "building final binary without PGO profile"
+    final_extra_args+=(
+      "-DCMAKE_C_FLAGS=$base_cflags"
+      "-DCMAKE_CXX_FLAGS=$base_cxxflags"
+      "-DCMAKE_EXE_LINKER_FLAGS=$base_ldflags"
+      "-DCMAKE_SHARED_LINKER_FLAGS=$base_ldflags"
+      "-DCMAKE_MODULE_LINKER_FLAGS=$base_ldflags"
+    )
+  fi
+  _configure_stage "$build_final" "${final_extra_args[@]}"
+  _build_stage "$build_final"
+
+  local final_binary="$build_final/ananicy-cpp"
+  [[ -x "$final_binary" ]] || _die "final binary missing: $final_binary"
+
+  msg "Stage 6/7: collecting BOLT profile for final binary"
+  if command -v llvm-bolt >/dev/null 2>&1 && command -v merge-fdata >/dev/null 2>&1; then
+    if _instrument_bolt_binary "$final_binary" "$bolt_data_dir/ananicy-cpp.fdata" "$bolt_binary_dir/ananicy-cpp"; then
+      _exercise_main_binary "$bolt_binary_dir/ananicy-cpp" "BOLT"
+      sync
+
+      local merged_bolt_profile="$bolt_data_dir/bolt-merged.fdata"
+      if _merge_bolt_profiles "$bolt_data_dir" "$merged_bolt_profile"; then
+        msg "Stage 7/7: optimizing final binary with BOLT"
+        local bolt_output="$bolt_binary_dir/ananicy-cpp.bolt"
+        if _optimize_with_bolt "$final_binary" "$merged_bolt_profile" "$bolt_output"; then
+          install -m755 "$bolt_output" "$final_binary"
+          msg2 "BOLT optimization applied"
+        else
+          warning "BOLT optimization failed; keeping PGO/non-BOLT final binary"
+        fi
+      else
+        warning "BOLT profile merge failed; keeping PGO/non-BOLT final binary"
+      fi
+    else
+      warning "BOLT instrumentation failed; keeping PGO/non-BOLT final binary"
+    fi
+  else
+    warning "llvm-bolt or merge-fdata not found; skipping BOLT"
   fi
 }
 
 check() {
-  local _build_dir_stage3="${srcdir}/${_pkgname}/build-final"
-
-  [[ -d "${_build_dir_stage3}" ]] || die "Check: Final build directory '${_build_dir_stage3}' not found!"
-  [[ -x "${_build_dir_stage3}/ananicy-cpp" ]] || die "Check: Final ananicy-cpp binary not found in ${_build_dir_stage3}"
-
-  msg "Running checks using final (potentially BOLT-optimized) build artifacts..."
-  _run_pgo_training_workload "${_build_dir_stage3}" "Check" 1
+  cd "${srcdir}/${_pkgname}"
+  _exercise_main_binary "${srcdir}/${_pkgname}/build-final/ananicy-cpp" "check"
 }
 
 package() {
-  local _build_dir_stage3="${srcdir}/${_pkgname}/build-final"
-  if [[ ! -d "${_build_dir_stage3}" ]]; then error "Final build directory '${_build_dir_stage3}' not found for packaging!"; return 1; fi
-  cd "${_build_dir_stage3}"
-  DESTDIR="${pkgdir}" cmake --install . --component Runtime || die "cmake --install failed"
-  install -m755 -d "${pkgdir}/etc/ananicy.d"
+  local build_final="${srcdir}/${_pkgname}/build-final"
 
-  if [[ ! " ${options[@]} " =~ " !strip " ]]; then
-      if ! command -v llvm-strip &> /dev/null; then warning "llvm-strip command not found. Skipping stripping."; else
-          msg "Stripping binaries..."
-          find "$pkgdir" -type f -print0 | while IFS= read -r -d '' file; do
-              if file -b "$file" | grep -qE 'ELF.*(executable|shared object)'; then
-                  if llvm-strip --strip-unneeded "$file" 2>/dev/null; then msg2 "Stripped (unneeded): $file";
-                  elif llvm-strip --strip-all "$file" 2>/dev/null; then msg2 "Stripped (all): $file";
-                  else warning "Failed to strip $file"; fi
-              fi; done; fi; else msg "Skipping stripping due to !strip option."; fi
+  [[ -d "$build_final" ]] || _die "final build directory missing: $build_final"
+  DESTDIR="${pkgdir}" cmake --install "$build_final" --component Runtime
+  install -dm755 "${pkgdir}/etc/ananicy.d"
 }
+
+# vim:set sw=2 sts=2 et:
