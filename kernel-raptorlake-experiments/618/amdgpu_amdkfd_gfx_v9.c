@@ -117,35 +117,57 @@ int kgd_gfx_v9_set_pasid_vmid_mapping(struct amdgpu_device *adev, u32 pasid,
 	 * ATC_VMID0..15 registers are separate from ATC_VMID16..31.
 	 */
 
-	WREG32(SOC15_REG_OFFSET(ATHUB, 0, mmATC_VMID0_PASID_MAPPING) + vmid,
-	       pasid_mapping);
+	{
+		const u32 upd_off = SOC15_REG_OFFSET(ATHUB, 0,
+					mmATC_VMID_PASID_MAPPING_UPDATE_STATUS);
+		/*
+		 * HW completes the PASID mapping update in a few
+		 * microseconds at most.  The dominant per-iteration
+		 * cost is the RREG32 (an MMIO read, hundreds of ns on
+		 * the PCIe path), so a few thousand iterations
+		 * comfortably covers worst-case ATHUB latency plus DPM
+		 * stalls.  100k iterations is a hard ceiling that
+		 * prevents a wedged ATHUB from hanging KFD process
+		 * creation forever.  cpu_relax() issues PAUSE on Raptor
+		 * Lake for SMT-friendly busy wait.
+		 */
+		unsigned int loops;
+		const unsigned int max_loops = 100000;
 
-	while (!(RREG32(SOC15_REG_OFFSET(
-				ATHUB, 0,
-				mmATC_VMID_PASID_MAPPING_UPDATE_STATUS)) &
-		 (1U << vmid)))
-		cpu_relax();
+		WREG32(SOC15_REG_OFFSET(ATHUB, 0, mmATC_VMID0_PASID_MAPPING) + vmid,
+		       pasid_mapping);
 
-	WREG32(SOC15_REG_OFFSET(ATHUB, 0,
-				mmATC_VMID_PASID_MAPPING_UPDATE_STATUS),
-	       1U << vmid);
+		for (loops = 0; loops < max_loops; ++loops) {
+			if (RREG32(upd_off) & (1U << vmid))
+				break;
+			cpu_relax();
+		}
+		if (unlikely(loops == max_loops))
+			dev_warn(adev->dev,
+				 "ATHUB PASID mapping update for vmid %u timed out\n",
+				 vmid);
 
-	/* Mapping vmid to pasid also for IH block */
-	WREG32(SOC15_REG_OFFSET(OSSSYS, 0, mmIH_VMID_0_LUT) + vmid,
-	       pasid_mapping);
+		WREG32(upd_off, 1U << vmid);
 
-	WREG32(SOC15_REG_OFFSET(ATHUB, 0, mmATC_VMID16_PASID_MAPPING) + vmid,
-	       pasid_mapping);
+		/* Mapping vmid to pasid also for IH block */
+		WREG32(SOC15_REG_OFFSET(OSSSYS, 0, mmIH_VMID_0_LUT) + vmid,
+		       pasid_mapping);
 
-	while (!(RREG32(SOC15_REG_OFFSET(
-				ATHUB, 0,
-				mmATC_VMID_PASID_MAPPING_UPDATE_STATUS)) &
-		 (1U << (vmid + 16))))
-		cpu_relax();
+		WREG32(SOC15_REG_OFFSET(ATHUB, 0, mmATC_VMID16_PASID_MAPPING) + vmid,
+		       pasid_mapping);
 
-	WREG32(SOC15_REG_OFFSET(ATHUB, 0,
-				mmATC_VMID_PASID_MAPPING_UPDATE_STATUS),
-	       1U << (vmid + 16));
+		for (loops = 0; loops < max_loops; ++loops) {
+			if (RREG32(upd_off) & (1U << (vmid + 16)))
+				break;
+			cpu_relax();
+		}
+		if (unlikely(loops == max_loops))
+			dev_warn(adev->dev,
+				 "ATHUB PASID mapping update for vmid %u (mmhub) timed out\n",
+				 vmid);
+
+		WREG32(upd_off, 1U << (vmid + 16));
+	}
 
 	/* Mapping vmid to pasid also for IH block */
 	WREG32(SOC15_REG_OFFSET(OSSSYS, 0, mmIH_VMID_0_LUT_MM) + vmid,
@@ -236,10 +258,14 @@ int kgd_gfx_v9_hqd_load(struct amdgpu_device *adev, void *mqd,
 	/* HQD registers extend from CP_MQD_BASE_ADDR to CP_HQD_EOP_WPTR_MEM. */
 	mqd_hqd = &m->cp_mqd_base_addr_lo;
 	hqd_base = SOC15_REG_OFFSET(GC, GET_INST(GC, inst), mmCP_MQD_BASE_ADDR);
+	{
+		const uint32_t hqd_end =
+			SOC15_REG_OFFSET(GC, GET_INST(GC, inst),
+					 mmCP_HQD_PQ_WPTR_HI);
 
-	for (reg = hqd_base;
-	     reg <= SOC15_REG_OFFSET(GC, GET_INST(GC, inst), mmCP_HQD_PQ_WPTR_HI); reg++)
-		WREG32_XCC(reg, mqd_hqd[reg - hqd_base], inst);
+		for (reg = hqd_base; reg <= hqd_end; reg++)
+			WREG32_XCC(reg, mqd_hqd[reg - hqd_base], inst);
+	}
 
 
 	/* Activate doorbell logic before triggering WPTR poll. */
@@ -369,9 +395,17 @@ int kgd_gfx_v9_hqd_dump(struct amdgpu_device *adev,
 
 	kgd_gfx_v9_acquire_queue(adev, pipe_id, queue_id, inst);
 
-	for (reg = SOC15_REG_OFFSET(GC, GET_INST(GC, inst), mmCP_MQD_BASE_ADDR);
-	     reg <= SOC15_REG_OFFSET(GC, GET_INST(GC, inst), mmCP_HQD_PQ_WPTR_HI); reg++)
-		DUMP_REG(reg);
+	{
+		const uint32_t hqd_begin =
+			SOC15_REG_OFFSET(GC, GET_INST(GC, inst),
+					 mmCP_MQD_BASE_ADDR);
+		const uint32_t hqd_end =
+			SOC15_REG_OFFSET(GC, GET_INST(GC, inst),
+					 mmCP_HQD_PQ_WPTR_HI);
+
+		for (reg = hqd_begin; reg <= hqd_end; reg++)
+			DUMP_REG(reg);
+	}
 
 	kgd_gfx_v9_release_queue(adev, inst);
 
@@ -672,23 +706,28 @@ void kgd_gfx_v9_set_wave_launch_stall(struct amdgpu_device *adev,
 					uint32_t vmid,
 					bool stall)
 {
+	const uint32_t wave_cntl_off =
+		SOC15_REG_OFFSET(GC, 0, mmSPI_GDBG_WAVE_CNTL);
+	uint32_t data = RREG32(wave_cntl_off);
 	int i;
-	uint32_t data = RREG32(SOC15_REG_OFFSET(GC, 0, mmSPI_GDBG_WAVE_CNTL));
 
 	if (amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(9, 4, 1))
 		data = REG_SET_FIELD(data, SPI_GDBG_WAVE_CNTL, STALL_VMID,
-							stall ? 1 << vmid : 0);
+				     stall ? 1 << vmid : 0);
 	else
 		data = REG_SET_FIELD(data, SPI_GDBG_WAVE_CNTL, STALL_RA,
-							stall ? 1 : 0);
+				     stall ? 1 : 0);
 
-	WREG32(SOC15_REG_OFFSET(GC, 0, mmSPI_GDBG_WAVE_CNTL), data);
+	WREG32(wave_cntl_off, data);
 
 	if (!stall)
 		return;
 
+	/* Drain SPI: ~32 clocks per read; loop count tuned in the
+	 * KGD_GFX_V9_WAVE_LAUNCH_SPI_DRAIN_LATENCY define above.
+	 */
 	for (i = 0; i < KGD_GFX_V9_WAVE_LAUNCH_SPI_DRAIN_LATENCY; i++)
-		RREG32(SOC15_REG_OFFSET(GC, 0, mmSPI_GDBG_WAVE_CNTL));
+		RREG32(wave_cntl_off);
 }
 
 /*
@@ -851,27 +890,29 @@ uint32_t kgd_gfx_v9_set_address_watch(struct amdgpu_device *adev,
 			VALID,
 			0);
 
-	WREG32_RLC((SOC15_REG_OFFSET(GC, 0, mmTCP_WATCH0_CNTL) +
-			(watch_id * TCP_WATCH_STRIDE)),
-			watch_address_cntl);
+	{
+		const uint32_t cntl_off = SOC15_REG_OFFSET(GC, 0,
+				mmTCP_WATCH0_CNTL) +
+			(watch_id * TCP_WATCH_STRIDE);
+		const uint32_t addr_h_off = SOC15_REG_OFFSET(GC, 0,
+				mmTCP_WATCH0_ADDR_H) +
+			(watch_id * TCP_WATCH_STRIDE);
+		const uint32_t addr_l_off = SOC15_REG_OFFSET(GC, 0,
+				mmTCP_WATCH0_ADDR_L) +
+			(watch_id * TCP_WATCH_STRIDE);
 
-	WREG32_RLC((SOC15_REG_OFFSET(GC, 0, mmTCP_WATCH0_ADDR_H) +
-			(watch_id * TCP_WATCH_STRIDE)),
-			watch_address_high);
+		WREG32_RLC(cntl_off, watch_address_cntl);
+		WREG32_RLC(addr_h_off, watch_address_high);
+		WREG32_RLC(addr_l_off, watch_address_low);
 
-	WREG32_RLC((SOC15_REG_OFFSET(GC, 0, mmTCP_WATCH0_ADDR_L) +
-			(watch_id * TCP_WATCH_STRIDE)),
-			watch_address_low);
+		/* Enable the watch point */
+		watch_address_cntl = REG_SET_FIELD(watch_address_cntl,
+				TCP_WATCH0_CNTL,
+				VALID,
+				1);
 
-	/* Enable the watch point */
-	watch_address_cntl = REG_SET_FIELD(watch_address_cntl,
-			TCP_WATCH0_CNTL,
-			VALID,
-			1);
-
-	WREG32_RLC((SOC15_REG_OFFSET(GC, 0, mmTCP_WATCH0_CNTL) +
-			(watch_id * TCP_WATCH_STRIDE)),
-			watch_address_cntl);
+		WREG32_RLC(cntl_off, watch_address_cntl);
+	}
 
 	return 0;
 }
@@ -1144,7 +1185,7 @@ uint64_t kgd_gfx_v9_hqd_get_pq_addr(struct amdgpu_device *adev,
 	if (!high)
 		goto unlock_out;
 
-	queue_addr = (((queue_addr | high) << 32) | low) << 8;
+	queue_addr = (((uint64_t)high << 32) | low) << 8;
 
 unlock_out:
 	amdgpu_gfx_rlc_exit_safe_mode(adev, inst);
@@ -1192,7 +1233,7 @@ uint64_t kgd_gfx_v9_hqd_reset(struct amdgpu_device *adev,
 	if (!high)
 		goto unlock_out;
 
-	queue_addr = (((queue_addr | high) << 32) | low) << 8;
+	queue_addr = (((uint64_t)high << 32) | low) << 8;
 
 	pr_debug("Attempting queue reset on XCC %i pipe id %i queue id %i\n",
 		 inst, pipe_id, queue_id);

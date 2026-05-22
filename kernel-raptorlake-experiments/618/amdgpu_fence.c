@@ -113,7 +113,6 @@ int amdgpu_fence_emit(struct amdgpu_ring *ring, struct dma_fence **f,
 	struct amdgpu_fence *am_fence;
 	struct dma_fence __rcu **ptr;
 	uint32_t seq;
-	int r;
 
 	if (!af) {
 		/* create a separate hw fence */
