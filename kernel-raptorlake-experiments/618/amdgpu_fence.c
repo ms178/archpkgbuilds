@@ -153,14 +153,19 @@ int amdgpu_fence_emit(struct amdgpu_ring *ring, struct dma_fence **f,
 		rcu_read_unlock();
 
 		if (old) {
-			r = dma_fence_wait(old, false);
+			/*
+			 * Best-effort drain of the previous occupant of this slot.
+			 * The new fence has already been emitted on the ring and we
+			 * must install it; any wait error here (e.g. -ERESTARTSYS)
+			 * must not leak the new fence, the pm_runtime get, or cause
+			 * the caller to re-emit a duplicate sequence on the HW.
+			 */
+			dma_fence_wait(old, false);
 			dma_fence_put(old);
-			if (r)
-				return r;
 		}
 	}
 
-	to_amdgpu_fence(fence)->start_timestamp = ktime_get();
+	am_fence->start_timestamp = ktime_get();
 
 	/* This function can't be called concurrently anyway, otherwise
 	 * emitting the fence would mess up the hardware ring buffer.
@@ -810,9 +815,12 @@ static void amdgpu_ring_backup_unprocessed_command(struct amdgpu_ring *ring,
 	unsigned int last_idx = end_wptr & ring->buf_mask;
 	unsigned int i;
 
-	/* Backup the contents of the ring buffer. */
-	for (i = first_idx; i != last_idx; ++i, i &= ring->buf_mask)
-		ring->ring_backup[ring->ring_backup_entries_to_copy++] = ring->ring[i];
+	/* Backup the contents of the ring buffer.  ring->buf_mask is
+	 * always (power_of_two - 1), so the wrap is a single AND.
+	 */
+	for (i = first_idx; i != last_idx; i = (i + 1) & ring->buf_mask)
+		ring->ring_backup[ring->ring_backup_entries_to_copy++] =
+			ring->ring[i];
 }
 
 void amdgpu_ring_backup_unprocessed_commands(struct amdgpu_ring *ring,
@@ -863,7 +871,13 @@ static const char *amdgpu_fence_get_driver_name(struct dma_fence *fence)
 
 static const char *amdgpu_fence_get_timeline_name(struct dma_fence *f)
 {
-	return (const char *)to_amdgpu_fence(f)->ring->name;
+	/* Callback registered on amdgpu_fence_ops; f->ops is ours by
+	 * construction -- skip the redundant ops-check.
+	 */
+	struct amdgpu_fence *am_fence =
+		container_of(f, struct amdgpu_fence, base);
+
+	return (const char *)am_fence->ring->name;
 }
 
 static const char *amdgpu_job_fence_get_timeline_name(struct dma_fence *f)
@@ -883,8 +897,16 @@ static const char *amdgpu_job_fence_get_timeline_name(struct dma_fence *f)
  */
 static bool amdgpu_fence_enable_signaling(struct dma_fence *f)
 {
-	if (!timer_pending(&to_amdgpu_fence(f)->ring->fence_drv.fallback_timer))
-		amdgpu_fence_schedule_fallback(to_amdgpu_fence(f)->ring);
+	/* Callback registered on amdgpu_fence_ops; f->ops is ours by
+	 * construction.  Resolve the ring once and reuse it; this also
+	 * eliminates the double to_amdgpu_fence() ops-check in the
+	 * fence-queue spinlock context.
+	 */
+	struct amdgpu_ring *ring =
+		container_of(f, struct amdgpu_fence, base)->ring;
+
+	if (!timer_pending(&ring->fence_drv.fallback_timer))
+		amdgpu_fence_schedule_fallback(ring);
 
 	return true;
 }
@@ -917,8 +939,13 @@ static void amdgpu_fence_free(struct rcu_head *rcu)
 {
 	struct dma_fence *f = container_of(rcu, struct dma_fence, rcu);
 
-	/* free fence_slab if it's separated fence*/
-	kfree(to_amdgpu_fence(f));
+	/*
+	 * This callback is only installed by amdgpu_fence_ops, so by
+	 * construction f->ops == &amdgpu_fence_ops here -- we can skip
+	 * to_amdgpu_fence()'s ops-check entirely.  Use container_of
+	 * directly, mirroring amdgpu_job_fence_free().
+	 */
+	kfree(container_of(f, struct amdgpu_fence, base));
 }
 
 /**
