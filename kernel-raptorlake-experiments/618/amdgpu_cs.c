@@ -131,7 +131,10 @@ static int amdgpu_cs_p1_user_fence(struct amdgpu_cs_parser *p,
 	drm_gem_object_put(gobj);
 
 	size = amdgpu_bo_size(p->uf_bo);
-	if (size != PAGE_SIZE || data->offset > (size - 8))
+
+	if (size != PAGE_SIZE ||
+	    data->offset > (size - 8) ||
+	    (data->offset & 7))
 		goto error_unref;
 
 	if (amdgpu_ttm_tt_get_usermm(p->uf_bo->tbo.ttm))
@@ -439,6 +442,30 @@ static int amdgpu_cs_p2_ib(struct amdgpu_cs_parser *p,
 
 	if (job->num_ibs >= amdgpu_ring_max_ibs(chunk_ib->ip_type))
 		return -EINVAL;
+
+	if (!ring->funcs->parse_cs && !ring->funcs->patch_cs_in_place) {
+		if (chunk_ib->va_start == 0) {
+			drm_err_ratelimited(adev_to_drm(p->adev),
+					    "ring %s: IB GPU VA is NULL — submission rejected\n",
+					    ring->name);
+			return -EINVAL;
+		}
+
+		if (chunk_ib->va_start & 3) {
+			drm_err_ratelimited(adev_to_drm(p->adev),
+					    "ring %s: IB GPU VA 0x%016llx is not DWORD-aligned\n",
+					    ring->name, chunk_ib->va_start);
+			return -EINVAL;
+		}
+
+		if (chunk_ib->ib_bytes == 0 &&
+		    !(chunk_ib->flags & AMDGPU_IB_FLAG_EMIT_MEM_SYNC)) {
+			drm_err_ratelimited(adev_to_drm(p->adev),
+					    "ring %s: zero-length IB without MEM_SYNC flag\n",
+					    ring->name);
+			return -EINVAL;
+		}
+	}
 
 	ib = &job->ibs[job->num_ibs];
 
