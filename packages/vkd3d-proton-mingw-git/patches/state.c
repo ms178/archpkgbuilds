@@ -3817,7 +3817,8 @@ static void rs_line_info_from_d3d12(struct d3d12_device *device, VkPipelineRaste
     switch (d3d12_desc->LineRasterizationMode)
     {
         case D3D12_LINE_RASTERIZATION_MODE_ALIASED:
-            /* TODO: I think we're supposed to use bresenham here? That is likely the default anyway. */
+            if (device->device_info.line_rasterization_features.bresenhamLines)
+                vk_line_info->lineRasterizationMode = VK_LINE_RASTERIZATION_MODE_BRESENHAM_EXT;
             break;
 
         case D3D12_LINE_RASTERIZATION_MODE_ALPHA_ANTIALIASED:
@@ -3853,54 +3854,38 @@ static void rs_line_info_from_d3d12(struct d3d12_device *device, VkPipelineRaste
 
 static enum VkStencilOp vk_stencil_op_from_d3d12(D3D12_STENCIL_OP op)
 {
-    switch (op)
-    {
-        case D3D12_STENCIL_OP_KEEP:
-            return VK_STENCIL_OP_KEEP;
-        case D3D12_STENCIL_OP_ZERO:
-            return VK_STENCIL_OP_ZERO;
-        case D3D12_STENCIL_OP_REPLACE:
-            return VK_STENCIL_OP_REPLACE;
-        case D3D12_STENCIL_OP_INCR_SAT:
-            return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
-        case D3D12_STENCIL_OP_DECR_SAT:
-            return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
-        case D3D12_STENCIL_OP_INVERT:
-            return VK_STENCIL_OP_INVERT;
-        case D3D12_STENCIL_OP_INCR:
-            return VK_STENCIL_OP_INCREMENT_AND_WRAP;
-        case D3D12_STENCIL_OP_DECR:
-            return VK_STENCIL_OP_DECREMENT_AND_WRAP;
-        default:
-            FIXME("Unhandled stencil op %#x.\n", op);
-            return VK_STENCIL_OP_KEEP;
-    }
+    /* Branchless LUT — D3D12_STENCIL_OP is contiguous with KEEP=1. */
+    static const enum VkStencilOp table[] = {
+        VK_STENCIL_OP_KEEP,                 /* 0 = invalid */
+        VK_STENCIL_OP_KEEP,                 /* 1 = KEEP */
+        VK_STENCIL_OP_ZERO,                 /* 2 = ZERO */
+        VK_STENCIL_OP_REPLACE,              /* 3 = REPLACE */
+        VK_STENCIL_OP_INCREMENT_AND_CLAMP,  /* 4 = INCR_SAT */
+        VK_STENCIL_OP_DECREMENT_AND_CLAMP,  /* 5 = DECR_SAT */
+        VK_STENCIL_OP_INVERT,               /* 6 = INVERT */
+        VK_STENCIL_OP_INCREMENT_AND_WRAP,   /* 7 = INCR */
+        VK_STENCIL_OP_DECREMENT_AND_WRAP,   /* 8 = DECR */
+    };
+
+    return table[(op > 0 && op < ARRAY_SIZE(table)) ? op : 0];
 }
 
 enum VkCompareOp vk_compare_op_from_d3d12(D3D12_COMPARISON_FUNC op)
 {
-    switch (op)
-    {
-        case D3D12_COMPARISON_FUNC_NEVER:
-            return VK_COMPARE_OP_NEVER;
-        case D3D12_COMPARISON_FUNC_LESS:
-            return VK_COMPARE_OP_LESS;
-        case D3D12_COMPARISON_FUNC_EQUAL:
-            return VK_COMPARE_OP_EQUAL;
-        case D3D12_COMPARISON_FUNC_LESS_EQUAL:
-            return VK_COMPARE_OP_LESS_OR_EQUAL;
-        case D3D12_COMPARISON_FUNC_GREATER:
-            return VK_COMPARE_OP_GREATER;
-        case D3D12_COMPARISON_FUNC_NOT_EQUAL:
-            return VK_COMPARE_OP_NOT_EQUAL;
-        case D3D12_COMPARISON_FUNC_GREATER_EQUAL:
-            return VK_COMPARE_OP_GREATER_OR_EQUAL;
-        case D3D12_COMPARISON_FUNC_ALWAYS:
-            return VK_COMPARE_OP_ALWAYS;
-        default:
-            FIXME("Unhandled compare op %#x.\n", op);
-            return VK_COMPARE_OP_NEVER;
-    }
+    /* Branchless LUT — D3D12_COMPARISON_FUNC is contiguous with NEVER=1. */
+    static const VkCompareOp table[] = {
+        VK_COMPARE_OP_NEVER,           /* 0 = invalid */
+        VK_COMPARE_OP_NEVER,           /* 1 = NEVER */
+        VK_COMPARE_OP_LESS,            /* 2 = LESS */
+        VK_COMPARE_OP_EQUAL,           /* 3 = EQUAL */
+        VK_COMPARE_OP_LESS_OR_EQUAL,   /* 4 = LESS_EQUAL */
+        VK_COMPARE_OP_GREATER,         /* 5 = GREATER */
+        VK_COMPARE_OP_NOT_EQUAL,       /* 6 = NOT_EQUAL */
+        VK_COMPARE_OP_GREATER_OR_EQUAL,/* 7 = GREATER_EQUAL */
+        VK_COMPARE_OP_ALWAYS,          /* 8 = ALWAYS */
+    };
+
+    return table[(op > 0 && op < ARRAY_SIZE(table)) ? op : 0];
 }
 
 static void vk_stencil_op_state_from_d3d12(struct VkStencilOpState *vk_desc,
@@ -4041,22 +4026,17 @@ static enum VkBlendFactor vk_blend_factor_from_d3d12(D3D12_BLEND blend)
 
 static enum VkBlendOp vk_blend_op_from_d3d12(D3D12_BLEND_OP op)
 {
-    switch (op)
-    {
-        case D3D12_BLEND_OP_ADD:
-            return VK_BLEND_OP_ADD;
-        case D3D12_BLEND_OP_SUBTRACT:
-            return VK_BLEND_OP_SUBTRACT;
-        case D3D12_BLEND_OP_REV_SUBTRACT:
-            return VK_BLEND_OP_REVERSE_SUBTRACT;
-        case D3D12_BLEND_OP_MIN:
-            return VK_BLEND_OP_MIN;
-        case D3D12_BLEND_OP_MAX:
-            return VK_BLEND_OP_MAX;
-        default:
-            FIXME("Unhandled blend op %#x.\n", op);
-            return VK_BLEND_OP_ADD;
-    }
+    /* Branchless LUT — D3D12_BLEND_OP is contiguous with ADD=1. */
+    static const enum VkBlendOp table[] = {
+        VK_BLEND_OP_ADD,              /* 0 = invalid */
+        VK_BLEND_OP_ADD,              /* 1 = ADD */
+        VK_BLEND_OP_SUBTRACT,         /* 2 = SUBTRACT */
+        VK_BLEND_OP_REVERSE_SUBTRACT, /* 3 = REV_SUBTRACT */
+        VK_BLEND_OP_MIN,              /* 4 = MIN */
+        VK_BLEND_OP_MAX,              /* 5 = MAX */
+    };
+
+    return table[(op > 0 && op < ARRAY_SIZE(table)) ? op : 0];
 }
 
 static void blend_attachment_from_d3d12(struct d3d12_device *device, struct VkPipelineColorBlendAttachmentState *vk_desc,
