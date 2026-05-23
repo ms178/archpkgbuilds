@@ -340,15 +340,19 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 {
 	u64 slice_wall;
 	u64 avg_runtime_wall;
+	u64 nr_pinned_tasks;
 	u32 avg_lat_cri;
+	u32 task_lat_cri;
 
 	if (!taskc || !cpuc)
 		return LAVD_SLICE_MAX_NS_DFL;
 
 	slice_wall       = READ_ONCE(sys_stat.slice_wall);
 	avg_runtime_wall = READ_ONCE(taskc->avg_runtime_wall);
+	nr_pinned_tasks  = READ_ONCE(cpuc->nr_pinned_tasks);
+	task_lat_cri     = READ_ONCE(taskc->lat_cri);
 
-	if (unlikely(pinned_slice_ns) && cpuc->nr_pinned_tasks) {
+	if (unlikely(pinned_slice_ns) && nr_pinned_tasks) {
 		taskc->slice_wall = min(pinned_slice_ns, slice_wall);
 		reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
 		return taskc->slice_wall;
@@ -371,7 +375,7 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 		}
 	}
 
-	if (!no_slice_boost && !cpuc->nr_pinned_tasks &&
+	if (!no_slice_boost && !nr_pinned_tasks &&
 	    avg_runtime_wall >= slice_wall) {
 
 		if (can_boost_slice()) {
@@ -387,8 +391,7 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 		}
 
 		avg_lat_cri = READ_ONCE(sys_stat.avg_lat_cri);
-		if (READ_ONCE(taskc->lat_cri) > avg_lat_cri) {
-			u32 lat_cri = READ_ONCE(taskc->lat_cri);
+		if (task_lat_cri > avg_lat_cri) {
 			u64 twice_slice = slice_wall > (~0ULL >> 1) ?
 					  ~0ULL : slice_wall << 1;
 			u64 max_slice   = min(avg_runtime_wall, twice_slice);
@@ -400,7 +403,7 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 				u64 cap = max_slice - slice_wall;
 
 				boost = lavd_mul_u64_u32_div_cap(
-						slice_wall, lat_cri,
+						slice_wall, task_lat_cri,
 						(u32)((u64)avg_lat_cri + 1),
 						cap);
 				boosted = slice_wall + boost;
@@ -696,6 +699,8 @@ static __always_inline void unaccount_queued_load(task_ctx *taskc)
 	WRITE_ONCE(taskc->queued_in_cpdom_id, LAVD_CPDOM_MAX_NR);
 }
 
+static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_aside);
+
 s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
@@ -760,9 +765,8 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 			 * it here. unlikely() since the default config
 			 * disables cpu.max bandwidth control.
 			 */
-			if (unlikely(enable_cpu_bw) && (p->pid != lavd_pid) &&
-			    (scx_cgroup_bw_throttled(ictx.taskc->cgrp_id, p,
-						     (u64)ictx.taskc) == -EAGAIN))
+			if (unlikely(enable_cpu_bw) &&
+			    (cgroup_throttled(p, ictx.taskc, false) == -EAGAIN))
 				goto out;
 
 			p->scx.dsq_vtime = calc_when_to_run(p, ictx.taskc);
@@ -782,6 +786,9 @@ out:
 static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_aside)
 {
 	int ret, ret2;
+
+	if (p->pid == lavd_pid)
+		return 0;
 
 	ret = scx_cgroup_bw_throttled(taskc->cgrp_id, p, (u64)taskc);
 	if ((ret == -EAGAIN) && put_aside) {
@@ -848,14 +855,14 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	if (unlikely(test_task_flag_mask(taskc, LAVD_MASK_MIGRATION)))
 		reset_task_flag(taskc, LAVD_MASK_MIGRATION);
 
-	if (unlikely(enable_cpu_bw) && (p->pid != lavd_pid) &&
+	if (unlikely(enable_cpu_bw) &&
 	    (cgroup_throttled(p, taskc, true) == -EAGAIN)) {
 		debugln("Task %s[pid%d/cgid%llu] is throttled.",
 			p->comm, p->pid, taskc->cgrp_id);
 		return;
 	}
 
-	if (is_pinned(p) && (taskc->pinned_cpu_id == -ENOENT)) {
+	if (is_effectively_pinned(taskc) && (taskc->pinned_cpu_id == -ENOENT)) {
 		taskc->pinned_cpu_id = cpu;
 		__sync_fetch_and_add(&cpuc->nr_pinned_tasks, 1);
 		debugln("cpu%d [%d] -- %s:%d -- %s:%d", cpuc->cpu_id,
@@ -881,7 +888,8 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	account_queued_load(taskc, cpuc->cpdom_id);
 
 	if (is_idle) {
-		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		if (scx_bpf_test_and_clear_cpu_idle(cpu))
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 		return;
 	}
 
@@ -893,25 +901,22 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 static
 int enqueue_cb(struct task_struct __arg_trusted *p, task_ctx *taskc)
 {
-	struct cpu_ctx *cpuc, *cpuc_cur;
+	struct cpu_ctx *cpuc;
 	u64 dsq_id;
 	s32 cpu;
 	u32 nr_cpu;
 
-	cpuc_cur = get_cpu_ctx();
-	if (!p || !taskc || !cpuc_cur)
+	if (!p || !taskc)
 		return 0;
 
 	nr_cpu = READ_ONCE(nr_cpu_ids);
 
-	p->scx.dsq_vtime = calc_when_to_run(p, taskc);
-	lavd_apply_bore_deadline(p, taskc);
-
 	cpu = taskc->suggested_cpu_id;
 	if (cpu < 0 || (u32)cpu >= nr_cpu || cpu >= LAVD_CPU_ID_MAX)
 		cpu = scx_bpf_task_cpu(p);
-	if (cpu < 0 || (u32)cpu >= nr_cpu || cpu >= LAVD_CPU_ID_MAX)
-		cpu = (s32)cpuc_cur->cpu_id;
+	if (cpu < 0 || (u32)cpu >= nr_cpu || cpu >= LAVD_CPU_ID_MAX ||
+	    !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+		cpu = scx_bpf_task_cpu(p);
 
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
@@ -922,7 +927,7 @@ int enqueue_cb(struct task_struct __arg_trusted *p, task_ctx *taskc)
 	taskc->suggested_cpu_id = cpu;
 	taskc->cpdom_id         = cpuc->cpdom_id;
 
-	if (is_pinned(p) && taskc->pinned_cpu_id == -ENOENT) {
+	if (is_effectively_pinned(taskc) && taskc->pinned_cpu_id == -ENOENT) {
 		taskc->pinned_cpu_id = cpu;
 		__sync_fetch_and_add(&cpuc->nr_pinned_tasks, 1);
 	}
@@ -931,7 +936,8 @@ int enqueue_cb(struct task_struct __arg_trusted *p, task_ctx *taskc)
 	scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice, p->scx.dsq_vtime, 0);
 	account_queued_load(taskc, cpuc->cpdom_id);
 
-	scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+	if (scx_bpf_test_and_clear_cpu_idle(cpu))
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 	return 0;
 }
 
@@ -969,7 +975,7 @@ void consume_prev(struct task_struct *prev, task_ctx *taskc_prev,
 
 	update_stat_for_refill(prev, taskc_prev, cpuc);
 
-	if (unlikely(enable_cpu_bw) && (prev->pid != lavd_pid) &&
+	if (unlikely(enable_cpu_bw) &&
 		(cgroup_throttled(prev, taskc_prev, false) == -EAGAIN))
 		return;
 
@@ -1041,7 +1047,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	}
 
 	if (prev) {
-		if (is_pinned(prev)) {
+		if (is_permanently_pinned(prev)) {
 			bpf_cpumask_set_cpu(cpu, ovrflw);
 			bpf_rcu_read_unlock();
 			goto consume_out;
@@ -1075,7 +1081,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 		if (!p)
 			continue;
 
-		if (is_pinned(p)) {
+		if (is_permanently_pinned(p)) {
 			new_cpu = scx_bpf_task_cpu(p);
 			if (new_cpu == cpu) {
 				bpf_cpumask_set_cpu(new_cpu, ovrflw);
@@ -1280,15 +1286,11 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
 	}
 	cpuc->flags = 0;
 
-	if (is_pinned(p) && taskc->pinned_cpu_id != -ENOENT) {
-		struct cpu_ctx *pinned_cpuc;
-		s32 pinned_cpu = taskc->pinned_cpu_id;
+	if (is_effectively_pinned(taskc) && taskc->pinned_cpu_id != -ENOENT) {
+		struct cpu_ctx *pinned_cpuc = get_cpu_ctx_id(taskc->pinned_cpu_id);
 
-		pinned_cpuc = get_cpu_ctx_id(pinned_cpu);
 		if (pinned_cpuc)
 			__sync_fetch_and_sub(&pinned_cpuc->nr_pinned_tasks, 1);
-		else
-			__sync_fetch_and_sub(&cpuc->nr_pinned_tasks, 1);
 		taskc->pinned_cpu_id = -ENOENT;
 	}
 
@@ -1844,19 +1846,19 @@ static s32 init_per_cpu_ctx(u64 now)
 			goto unlock_out;
 		}
 
-		err = calloc_cpumask(&cpuc->tmp_a_mask);
+		err = calloc_cpumask(&cpuc->a_mask);
 		if (err) goto unlock_out;
-		err = calloc_cpumask(&cpuc->tmp_o_mask);
+		err = calloc_cpumask(&cpuc->o_mask);
 		if (err) goto unlock_out;
-		err = calloc_cpumask(&cpuc->tmp_l_mask);
+		err = calloc_cpumask(&cpuc->temp_mask);
 		if (err) goto unlock_out;
-		err = calloc_cpumask(&cpuc->tmp_i_mask);
+		err = calloc_cpumask(&cpuc->i_mask);
 		if (err) goto unlock_out;
-		err = calloc_cpumask(&cpuc->tmp_t_mask);
+		err = calloc_cpumask(&cpuc->ia_mask);
 		if (err) goto unlock_out;
-		err = calloc_cpumask(&cpuc->tmp_t2_mask);
+		err = calloc_cpumask(&cpuc->io_mask);
 		if (err) goto unlock_out;
-		err = calloc_cpumask(&cpuc->tmp_t3_mask);
+		err = calloc_cpumask(&cpuc->iat_mask);
 		if (err) goto unlock_out;
 
 		cpuc->cpu_id              = cpu;
@@ -2080,10 +2082,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 {
 	u64 now = scx_bpf_now();
 	int err;
-
-	err = scx_lib_init();
-	if (err)
-		return err;
 
 	err = init_cpdoms(now);
 	if (err)
