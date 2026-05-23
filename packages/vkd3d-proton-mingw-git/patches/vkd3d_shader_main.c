@@ -656,9 +656,21 @@ vkd3d_shader_quirks_t vkd3d_shader_compile_arguments_select_quirks(
     return quirks | compile_args->quirks->default_quirks;
 }
 
-uint64_t vkd3d_shader_get_revision(void)
+uint64_t vkd3d_shader_get_revision(vkd3d_shader_quirks_t *aux_quirks)
 {
     pthread_once(&vkd3d_shader_quirk_once, vkd3d_shader_init_quirk_table);
+
+    if (aux_quirks)
+    {
+        vkd3d_shader_quirks_t quirks = 0;
+        size_t i;
+
+        for (i = 0; i < vkd3d_shader_quirk_entry_count; ++i)
+            quirks |= vkd3d_shader_quirk_entries[i].quirks;
+
+        *aux_quirks = quirks;
+    }
+
     return vkd3d_shader_revision;
 }
 
