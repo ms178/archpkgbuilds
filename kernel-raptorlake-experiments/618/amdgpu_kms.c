@@ -938,12 +938,12 @@ int amdgpu_info_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
 
 	case AMDGPU_INFO_READ_MMR_REG: {
 		unsigned int se_num = (info->read_mmr_reg.instance >>
-				       AMDGPU_INFO_MMR_SE_INDEX_SHIFT) &
-				      AMDGPU_INFO_MMR_SE_INDEX_MASK;
+				   AMDGPU_INFO_MMR_SE_INDEX_SHIFT) &
+				  AMDGPU_INFO_MMR_SE_INDEX_MASK;
 		unsigned int sh_num = (info->read_mmr_reg.instance >>
-				       AMDGPU_INFO_MMR_SH_INDEX_SHIFT) &
-				      AMDGPU_INFO_MMR_SH_INDEX_MASK;
-		uint32_t reg_count = info->read_mmr_reg.count;
+				   AMDGPU_INFO_MMR_SH_INDEX_SHIFT) &
+				  AMDGPU_INFO_MMR_SH_INDEX_MASK;
+		unsigned int reg_count = info->read_mmr_reg.count;
 		/*
 		 * Stack buffer for small reads (16 regs = 64 bytes).
 		 * Avoids kmalloc overhead for common case.
@@ -951,33 +951,21 @@ int amdgpu_info_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
 		uint32_t stack_regs[16];
 		uint32_t *regs;
 		unsigned int alloc_size;
-		unsigned int n;
-		unsigned int reg_idx;
-
-		ret = 0;
-
-		if (!down_read_trylock(&adev->reset_domain->sem))
-			return -ENOENT;
+		int ret;
 
 		/* Set full masks if userspace set all bits */
-		if (se_num == AMDGPU_INFO_MMR_SE_INDEX_MASK) {
+		if (se_num == AMDGPU_INFO_MMR_SE_INDEX_MASK)
 			se_num = 0xffffffff;
-		} else if (unlikely(se_num >= AMDGPU_GFX_MAX_SE)) {
-			ret = -EINVAL;
-			goto out_mmr;
-		}
+		else if (unlikely(se_num >= AMDGPU_GFX_MAX_SE))
+			return -EINVAL;
 
-		if (sh_num == AMDGPU_INFO_MMR_SH_INDEX_MASK) {
+		if (sh_num == AMDGPU_INFO_MMR_SH_INDEX_MASK)
 			sh_num = 0xffffffff;
-		} else if (unlikely(sh_num >= AMDGPU_GFX_MAX_SH_PER_SE)) {
-			ret = -EINVAL;
-			goto out_mmr;
-		}
+		else if (unlikely(sh_num >= AMDGPU_GFX_MAX_SH_PER_SE))
+			return -EINVAL;
 
-		if (unlikely(reg_count == 0 || reg_count > 128)) {
-			ret = -EINVAL;
-			goto out_mmr;
-		}
+		if (unlikely(reg_count == 0 || reg_count > 128))
+			return -EINVAL;
 
 		alloc_size = reg_count * sizeof(*regs);
 
@@ -986,38 +974,36 @@ int amdgpu_info_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
 			regs = stack_regs;
 		} else {
 			regs = kmalloc_array(reg_count, sizeof(*regs), GFP_KERNEL);
-			if (unlikely(!regs)) {
-				ret = -ENOMEM;
-				goto out_mmr;
-			}
+			if (unlikely(!regs))
+				return -ENOMEM;
 		}
 
+		down_read(&adev->reset_domain->sem);
 		amdgpu_gfx_off_ctrl(adev, false);
-		for (reg_idx = 0; reg_idx < reg_count; reg_idx++) {
+		ret = 0;
+		for (i = 0; i < reg_count; i++) {
 			if (amdgpu_asic_read_register(adev, se_num, sh_num,
-						      info->read_mmr_reg.dword_offset + reg_idx,
-						      &regs[reg_idx])) {
+						      info->read_mmr_reg.dword_offset + i,
+						      &regs[i])) {
 				DRM_DEBUG_KMS("unallowed offset %#x\n",
-					      info->read_mmr_reg.dword_offset + reg_idx);
-				amdgpu_gfx_off_ctrl(adev, true);
+					      info->read_mmr_reg.dword_offset + i);
 				ret = -EFAULT;
-				goto out_mmr_free;
+				break;
 			}
 		}
 		amdgpu_gfx_off_ctrl(adev, true);
+		up_read(&adev->reset_domain->sem);
 
-		n = copy_to_user(out, regs, min(size, alloc_size));
-		ret = n ? -EFAULT : 0;
-
-out_mmr_free:
+		if (!ret) {
+			ret = copy_to_user(out, regs, min(size, alloc_size))
+				? -EFAULT : 0;
+		}
 		if (regs != stack_regs)
 			kfree(regs);
-out_mmr:
-		up_read(&adev->reset_domain->sem);
 		return ret;
 	}
 
-	case AMDGPU_INFO_DEV_INFO: {
+		case AMDGPU_INFO_DEV_INFO: {
 		/*
 		 * Stack-allocated for performance - this structure is ~600 bytes
 		 * which is within kernel stack limits and avoids kmalloc overhead.

@@ -173,13 +173,11 @@ struct hrtimer_clock_base *lock_hrtimer_base(const struct hrtimer *timer,
 		raw_spin_lock_irqsave(&base->cpu_base->lock, *flags);
 		if (likely(base == timer->base))
 			return base;
-
-		/* Timer migrated while we acquired the lock. Retry. */
+		/* The timer has migrated to another CPU: */
 		raw_spin_unlock_irqrestore(&base->cpu_base->lock, *flags);
 		cpu_relax();
 	}
 }
-
 
 /*
  * Check if the elected target is suitable considering its next
@@ -333,12 +331,12 @@ s64 __ktime_divns(const ktime_t kt, s64 div)
 		return 0;
 
 	if (WARN_ON_ONCE(div < 0))
-		udiv = (u64)(-(u64)div);
+		udiv = -(u64)div;
 	else
 		udiv = (u64)div;
 
 	dclc = ktime_to_ns(kt);
-	tmp = dclc < 0 ? (u64)(-dclc) : (u64)dclc;
+	tmp = dclc < 0 ? -(u64)dclc : (u64)dclc;
 
 	/* Make sure the divisor is less than 2^32: */
 	while (udiv >> 32) {
@@ -348,7 +346,13 @@ s64 __ktime_divns(const ktime_t kt, s64 div)
 	tmp >>= sft;
 	do_div(tmp, (u32)udiv);
 
-	return dclc < 0 ? -(s64)tmp : (s64)tmp;
+	/*
+	 * Negate in unsigned to avoid s64 UB on INT64_MIN result,
+	 * then cast. The bit pattern is preserved either way.
+	 */
+	if (dclc < 0)
+		tmp = -tmp;
+	return (s64)tmp;
 }
 EXPORT_SYMBOL_GPL(__ktime_divns);
 #endif /* BITS_PER_LONG >= 64 */
@@ -490,17 +494,10 @@ static inline void debug_setup_on_stack(struct hrtimer *timer, clockid_t clockid
 	trace_hrtimer_setup(timer, clockid, mode);
 }
 
-static inline void debug_activate(struct hrtimer *timer,
-				  enum hrtimer_mode mode)
+static inline void debug_activate(struct hrtimer *timer, enum hrtimer_mode mode, bool was_armed)
 {
 	debug_hrtimer_activate(timer, mode);
-	trace_hrtimer_start(timer, mode);
-}
-
-static inline void debug_deactivate(struct hrtimer *timer)
-{
-	debug_hrtimer_deactivate(timer);
-	trace_hrtimer_cancel(timer);
+	trace_hrtimer_start(timer, mode, was_armed);
 }
 
 static struct hrtimer_clock_base *
@@ -549,16 +546,18 @@ static ktime_t __hrtimer_next_event_base(struct hrtimer_cpu_base *cpu_base,
 
 		timer = container_of(next, struct hrtimer, node);
 		if (timer == exclude) {
+			/* Get to the next timer in the queue. */
 			next = timerqueue_iterate_next(next);
 			if (!next)
 				continue;
+
 			timer = container_of(next, struct hrtimer, node);
 		}
-
 		expires = ktime_sub(hrtimer_get_expires(timer), base->offset);
 		if (expires < expires_next) {
 			expires_next = expires;
 
+			/* Skip cpu_base update if a timer is being excluded. */
 			if (exclude)
 				continue;
 
@@ -568,7 +567,11 @@ static ktime_t __hrtimer_next_event_base(struct hrtimer_cpu_base *cpu_base,
 				cpu_base->next_timer = timer;
 		}
 	}
-
+	/*
+	 * clock_was_set() might have changed base->offset of any of
+	 * the clock bases so the result might be negative. Fix it up
+	 * to prevent a false positive in clockevents_program_event().
+	 */
 	if (expires_next < 0)
 		expires_next = 0;
 	return expires_next;
@@ -843,12 +846,22 @@ static void hrtimer_reprogram(struct hrtimer *timer, bool reprogram)
 
 	WARN_ON_ONCE(hrtimer_get_expires_tv64(timer) < 0);
 
+	/*
+	 * CLOCK_REALTIME timer might be requested with an absolute
+	 * expiry time which is less than base->offset. Set it to 0.
+	 */
 	if (expires < 0)
 		expires = 0;
 
 	/*
-	 * Soft timers are less common on non-RT gaming kernels; keep this
-	 * path unlikely and out of the hard-timer fast path.
+	 * Soft timers are less common on non-RT gaming kernels; keep
+	 * this path unlikely and out of the hard-timer fast path.
+	 *
+	 * soft hrtimer could be started on a remote CPU. In this
+	 * case softirq_expires_next needs to be updated on the
+	 * remote CPU. The soft hrtimer will not expire before the
+	 * first hard hrtimer on the remote CPU -
+	 * hrtimer_check_target() prevents this case.
 	 */
 	if (unlikely(timer->is_soft)) {
 		struct hrtimer_cpu_base *timer_cpu_base = base->cpu_base;
@@ -862,18 +875,30 @@ static void hrtimer_reprogram(struct hrtimer *timer, bool reprogram)
 		timer_cpu_base->softirq_next_timer = timer;
 		timer_cpu_base->softirq_expires_next = expires;
 
-		if (!ktime_before(expires, timer_cpu_base->expires_next) || !reprogram)
+		if (!ktime_before(expires, timer_cpu_base->expires_next) ||
+		    !reprogram)
 			return;
 	}
 
+	/*
+	 * If the timer is not on the current cpu, we cannot reprogram
+	 * the other cpus clock event device.
+	 */
 	if (base->cpu_base != cpu_base)
 		return;
+
 	if (expires >= cpu_base->expires_next)
 		return;
+
+	/*
+	 * If the hrtimer interrupt is running, then it will reevaluate the
+	 * clock bases and reprogram the clock event device.
+	 */
 	if (cpu_base->in_hrtirq)
 		return;
 
 	cpu_base->next_timer = timer;
+
 	__hrtimer_reprogram(cpu_base, timer, expires);
 }
 
@@ -884,15 +909,40 @@ static bool update_needs_ipi(struct hrtimer_cpu_base *cpu_base,
 	unsigned int seq;
 	ktime_t expires;
 
+	/*
+	 * Update the base offsets unconditionally so the following
+	 * checks whether the SMP function call is required works.
+	 *
+	 * The update is safe even when the remote CPU is in the hrtimer
+	 * interrupt or the hrtimer soft interrupt and expiring affected
+	 * bases. Either it will see the update before handling a base or
+	 * it will see it when it finishes the processing and reevaluates
+	 * the next expiring timer.
+	 */
 	seq = cpu_base->clock_was_set_seq;
 	hrtimer_update_base(cpu_base);
 
+	/*
+	 * If the sequence did not change over the update then the
+	 * remote CPU already handled it.
+	 */
 	if (seq == cpu_base->clock_was_set_seq)
 		return false;
 
+	/*
+	 * If the remote CPU is currently handling an hrtimer interrupt, it
+	 * will reevaluate the first expiring timer of all clock bases
+	 * before reprogramming. Nothing to do here.
+	 */
 	if (cpu_base->in_hrtirq)
 		return false;
 
+	/*
+	 * Walk the affected clock bases and check whether the first expiring
+	 * timer in a clock base is moving ahead of the first expiring timer of
+	 * @cpu_base. If so, the IPI must be invoked because per CPU clock
+	 * event devices cannot be remotely reprogrammed.
+	 */
 	active &= cpu_base->active_bases;
 	if (!active)
 		return false;
@@ -905,11 +955,11 @@ static bool update_needs_ipi(struct hrtimer_cpu_base *cpu_base,
 			WARN_ON_ONCE(1);
 			continue;
 		}
-
 		expires = ktime_sub(next->expires, base->offset);
 		if (expires < cpu_base->expires_next)
 			return true;
 
+		/* Extra check for softirq clock bases */
 		if (base->index < HRTIMER_BASE_MONOTONIC_SOFT)
 			continue;
 		if (cpu_base->softirq_activated)
@@ -1072,11 +1122,10 @@ EXPORT_SYMBOL_GPL(hrtimer_forward);
  *
  * Returns true when the new timer is the leftmost timer in the tree.
  */
-static bool enqueue_hrtimer(struct hrtimer *timer,
-			    struct hrtimer_clock_base *base,
-			    enum hrtimer_mode mode)
+static bool enqueue_hrtimer(struct hrtimer *timer, struct hrtimer_clock_base *base,
+			    enum hrtimer_mode mode, bool was_armed)
 {
-	debug_activate(timer, mode);
+	debug_activate(timer, mode, was_armed);
 	WARN_ON_ONCE(!base->cpu_base->online);
 
 	base->cpu_base->active_bases |= 1U << base->index;
@@ -1112,6 +1161,14 @@ static void __remove_hrtimer(struct hrtimer *timer,
 	if (!timerqueue_del(&base->active, &timer->node))
 		cpu_base->active_bases &= ~(1U << base->index);
 
+	/*
+	 * Note: If reprogram is false we do not update
+	 * cpu_base->next_timer. This happens when we remove the first
+	 * timer on a remote cpu. No harm as we never dereference
+	 * cpu_base->next_timer. So the worst thing what can happen is
+	 * an superfluous call to hrtimer_force_reprogram() on the
+	 * remote cpu later on if the same timer gets enqueued again.
+	 */
 	if (reprogram && timer == cpu_base->next_timer)
 		hrtimer_force_reprogram(cpu_base, 1);
 }
@@ -1128,6 +1185,8 @@ remove_hrtimer(struct hrtimer *timer, struct hrtimer_clock_base *base,
 	if (state & HRTIMER_STATE_ENQUEUED) {
 		bool reprogram;
 
+		debug_hrtimer_deactivate(timer);
+
 		/*
 		 * Remove the timer and force reprogramming when high
 		 * resolution mode is active and the timer is on the current
@@ -1136,7 +1195,6 @@ remove_hrtimer(struct hrtimer *timer, struct hrtimer_clock_base *base,
 		 * reprogramming happens in the interrupt handler. This is a
 		 * rare case and less expensive than a smp call.
 		 */
-		debug_deactivate(timer);
 		reprogram = base->cpu_base == this_cpu_ptr(&hrtimer_bases);
 
 		/*
@@ -1203,15 +1261,15 @@ static int __hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
 {
 	struct hrtimer_cpu_base *this_cpu_base = this_cpu_ptr(&hrtimer_bases);
 	struct hrtimer_clock_base *new_base;
-	bool force_local, first;
+	bool force_local, first, was_armed;
 
 	/*
 	 * If the timer is on the local cpu base and is the first expiring
 	 * timer then this might end up reprogramming the hardware twice
-	 * (on removal and on enqueue). To avoid that by prevent the
-	 * reprogram on removal, keep the timer local to the current CPU
-	 * and enforce reprogramming after it is queued no matter whether
-	 * it is the new first expiring timer again or not.
+	 * (on removal and on enqueue). To avoid that prevent the reprogram
+	 * on removal, keep the timer local to the current CPU and enforce
+	 * reprogramming after it is queued no matter whether it is the new
+	 * first expiring timer again or not.
 	 */
 	force_local = base->cpu_base == this_cpu_base;
 	force_local &= base->cpu_base->next_timer == timer;
@@ -1233,7 +1291,7 @@ static int __hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
 	 * avoids programming the underlying clock event twice (once at
 	 * removal and once after enqueue).
 	 */
-	remove_hrtimer(timer, base, true, force_local);
+	was_armed = remove_hrtimer(timer, base, true, force_local);
 
 	if (mode & HRTIMER_MODE_REL)
 		tim = ktime_add_safe(tim, __hrtimer_cb_get_time(base->clockid));
@@ -1250,7 +1308,15 @@ static int __hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
 		new_base = base;
 	}
 
-	first = enqueue_hrtimer(timer, new_base, mode);
+	first = enqueue_hrtimer(timer, new_base, mode, was_armed);
+
+	/*
+	 * If the hrtimer interrupt is running, then it will reevaluate the
+	 * clock bases and reprogram the clock event device.
+	 */
+	if (new_base->cpu_base->in_hrtirq)
+		return false;
+
 	if (!force_local) {
 		/*
 		 * If the current CPU base is online, then the timer is
@@ -1333,24 +1399,27 @@ int hrtimer_try_to_cancel(struct hrtimer *timer)
 	unsigned long flags;
 	int ret = -1;
 
+	/*
+	 * Check lockless first. If the timer is not active (neither
+	 * enqueued nor running the callback, nothing to do here.  The
+	 * base lock does not serialize against a concurrent enqueue,
+	 * so we can avoid taking it.
+	 */
 	if (!hrtimer_active(timer))
 		return 0;
 
 	base = lock_hrtimer_base(timer, &flags);
 
-	if (!(timer->state & HRTIMER_STATE_ENQUEUED)) {
-		if (!hrtimer_callback_running(timer))
-			ret = 0;
-		unlock_hrtimer_base(timer, &flags);
-		return ret;
-	}
-
-	if (!hrtimer_callback_running(timer))
+	if (!hrtimer_callback_running(timer)) {
 		ret = remove_hrtimer(timer, base, false, false);
+		if (ret)
+			trace_hrtimer_cancel(timer);
+	}
 
 	unlock_hrtimer_base(timer, &flags);
 
 	return ret;
+
 }
 EXPORT_SYMBOL_GPL(hrtimer_try_to_cancel);
 
@@ -1732,7 +1801,7 @@ static void __run_hrtimer(struct hrtimer_cpu_base *cpu_base,
 
 	lockdep_assert_held(&cpu_base->lock);
 
-	debug_deactivate(timer);
+	debug_hrtimer_deactivate(timer);
 	base->running = timer;
 
 	/*
@@ -1781,7 +1850,7 @@ static void __run_hrtimer(struct hrtimer_cpu_base *cpu_base,
 	 */
 	if (restart != HRTIMER_NORESTART &&
 	    !(timer->state & HRTIMER_STATE_ENQUEUED))
-		enqueue_hrtimer(timer, base, HRTIMER_MODE_ABS);
+		enqueue_hrtimer(timer, base, HRTIMER_MODE_ABS, false);
 
 	/*
 	 * Separate the ->running assignment from the ->state assignment.
@@ -1875,6 +1944,13 @@ void hrtimer_interrupt(struct clock_event_device *dev)
 	entry_time = now = hrtimer_update_base(cpu_base);
 retry:
 	cpu_base->in_hrtirq = 1;
+	/*
+	 * We set expires_next to KTIME_MAX here with cpu_base->lock
+	 * held to prevent that a timer is enqueued in our queue via
+	 * the migration code. This does not affect enqueueing of
+	 * timers which run their callback and need to be requeued on
+	 * this CPU.
+	 */
 	cpu_base->expires_next = KTIME_MAX;
 
 	if (!ktime_before(now, cpu_base->softirq_expires_next)) {
@@ -1885,22 +1961,46 @@ retry:
 
 	__hrtimer_run_queues(cpu_base, now, flags, HRTIMER_ACTIVE_HARD);
 
+	/* Reevaluate the clock bases for the [soft] next expiry */
 	expires_next = hrtimer_update_next_event(cpu_base);
+	/*
+	 * Store the new expiry value so the migration code can verify
+	 * against it.
+	 */
 	cpu_base->expires_next = expires_next;
 	cpu_base->in_hrtirq = 0;
 	raw_spin_unlock_irqrestore(&cpu_base->lock, flags);
 
+	/* Reprogramming necessary ? */
 	if (!tick_program_event(expires_next, 0)) {
 		cpu_base->hang_detected = 0;
 		return;
 	}
 
+	/*
+	 * The next timer was already expired due to:
+	 * - tracing
+	 * - long lasting callbacks
+	 * - being scheduled away when running in a VM
+	 *
+	 * We need to prevent that we loop forever in the hrtimer
+	 * interrupt routine. We give it 3 attempts to avoid
+	 * overreacting on some spurious event.
+	 *
+	 * Acquire base lock for updating the offsets and retrieving
+	 * the current time.
+	 */
 	raw_spin_lock_irqsave(&cpu_base->lock, flags);
 	now = hrtimer_update_base(cpu_base);
 	cpu_base->nr_retries++;
 	if (++retries < 3)
 		goto retry;
-
+	/*
+	 * Give the system a chance to do something else than looping
+	 * here. We stored the entry time, so we know exactly how long
+	 * we spent here. We schedule the next event this amount of
+	 * time away.
+	 */
 	cpu_base->nr_hangs++;
 	cpu_base->hang_detected = 1;
 	raw_spin_unlock_irqrestore(&cpu_base->lock, flags);
@@ -1917,6 +2017,10 @@ retry:
 		if (delta_u64 > cpu_base->max_hang_time)
 			cpu_base->max_hang_time = (unsigned int)min(delta_u64, (u64)U32_MAX);
 
+		/*
+		 * Limit it to a sensible value as we enforce a longer
+		 * delay. Give the CPU at least 100ms to catch up.
+		 */
 		if (delta_u64 > 100ULL * NSEC_PER_MSEC)
 			expires_next = ktime_add_ns(now, 100ULL * NSEC_PER_MSEC);
 		else
@@ -2075,7 +2179,7 @@ static int __sched do_nanosleep(struct hrtimer_sleeper *t, enum hrtimer_mode mod
 	struct restart_block *restart;
 
 	do {
-		set_current_state(TASK_INTERRUPTIBLE | TASK_FREEZABLE);
+		set_current_state(TASK_INTERRUPTIBLE|TASK_FREEZABLE);
 		hrtimer_sleeper_start_expires(t, mode);
 
 		if (likely(t->task))
@@ -2085,10 +2189,10 @@ static int __sched do_nanosleep(struct hrtimer_sleeper *t, enum hrtimer_mode mod
 		 * If the callback fired, it set t->task = NULL and the timer
 		 * is already inactive. Avoid a redundant cancel/lock roundtrip.
 		 */
-		if (likely(t->task))
+		if (unlikely(t->task))
 			hrtimer_cancel(&t->timer);
-
 		mode = HRTIMER_MODE_ABS;
+
 	} while (t->task && !signal_pending(current));
 
 	__set_current_state(TASK_RUNNING);
@@ -2241,7 +2345,7 @@ static void migrate_hrtimer_list(struct hrtimer_clock_base *old_base,
 	while ((node = timerqueue_getnext(&old_base->active))) {
 		timer = container_of(node, struct hrtimer, node);
 		BUG_ON(hrtimer_callback_running(timer));
-		debug_deactivate(timer);
+		debug_hrtimer_deactivate(timer);
 
 		/*
 		 * Mark it as ENQUEUED not INACTIVE otherwise the
@@ -2258,7 +2362,7 @@ static void migrate_hrtimer_list(struct hrtimer_clock_base *old_base,
 		 * sort out already expired timers and reprogram the
 		 * event device.
 		 */
-		enqueue_hrtimer(timer, new_base, HRTIMER_MODE_ABS);
+		enqueue_hrtimer(timer, new_base, HRTIMER_MODE_ABS, true);
 	}
 }
 
