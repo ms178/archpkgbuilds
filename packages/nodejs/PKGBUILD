@@ -1,25 +1,34 @@
+# Maintainer: ms178
+
 pkgname=nodejs
-pkgver=25.8.2
+pkgver=26.2.0
 pkgrel=3.1
-pkgdesc='Evented I/O for V8 JavaScript (PGO optimized)'
-arch=('x86_64')
+pkgdesc='Evented I/O for V8 JavaScript (Clang PGO + ThinLTO optimized)'
+arch=('x86_64' 'x86_64_v3')
 url='https://nodejs.org/'
 license=('MIT')
 options=('!lto')
+
 depends=(
+  ada
   brotli
   c-ares
   icu
-  libuv
+  libffi
   libnghttp2
   libnghttp3
   libngtcp2
+  libuv
   openssl
+  simdjson
   zlib
+  zstd
   ca-certificates
 )
+
 makedepends=(
   git
+  ninja
   python
   clang
   llvm
@@ -27,161 +36,351 @@ makedepends=(
   pkgconf
   compiler-rt
 )
+
+optdepends=('npm: Node.js package manager')
+
 source=("node::git+https://github.com/nodejs/node.git#tag=v$pkgver")
 sha512sums=('SKIP')
 
-_run_node_workload() {
-  local nodebin="$1"
+prepare() {
+  cd "$srcdir/node"
 
-  _rt() {
-    local timeout_sec="$1"
-    local workload_name="$2"
-    local js_code="$3"
+  python3 - <<'PY'
+from pathlib import Path
+import re
 
-    echo "==> Workload ${workload_name} (timeout ${timeout_sec}s)..."
+js2c = Path("tools/js2c.cc")
+src = js2c.read_text()
 
-    timeout -k 5s "${timeout_sec}s" "$nodebin" -e "$js_code"
-    local ec=$?
+# Disable the string-literal js2c path if the guard exists.
+src, _ = re.subn(
+    r'(?m)^(\s*)#\s*(?:ifdef\s+NODE_JS2C_USE_STRING_LITERALS|if\s+defined\s*\(\s*NODE_JS2C_USE_STRING_LITERALS\s*\))\s*$',
+    r'\1#if 0  // CachyOS: deterministic js2c path',
+    src,
+)
 
-    if [[ $ec -ne 0 && $ec -ne 124 ]]; then
-      echo "ERROR: PGO workload ${workload_name} failed (exit $ec)"
-      return $ec
-    fi
-    echo "==> Workload ${workload_name} completed successfully"
-    return 0
+def find_function_span(s: str, sig: str) -> tuple[int, int]:
+    start = s.find(sig)
+    if start < 0:
+        raise SystemExit(f"ERROR: function signature not found: {sig!r}")
+
+    brace = s.find("{", start)
+    if brace < 0:
+        raise SystemExit(f"ERROR: opening brace not found for {sig!r}")
+
+    i = brace
+    depth = 0
+    in_str = None
+    in_lcmt = False
+    in_bcmt = False
+    esc = False
+
+    while i < len(s):
+        c = s[i]
+        nx = s[i + 1] if i + 1 < len(s) else ""
+
+        if in_lcmt:
+            if c == "\n":
+                in_lcmt = False
+            i += 1
+            continue
+
+        if in_bcmt:
+            if c == "*" and nx == "/":
+                in_bcmt = False
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if in_str is not None:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == in_str:
+                in_str = None
+            i += 1
+            continue
+
+        if c == "/" and nx == "/":
+            in_lcmt = True
+            i += 2
+            continue
+
+        if c == "/" and nx == "*":
+            in_bcmt = True
+            i += 2
+            continue
+
+        if c in ("'", '"'):
+            in_str = c
+            i += 1
+            continue
+
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return start, i + 1
+
+        i += 1
+
+    raise SystemExit(f"ERROR: closing brace not found for {sig!r}")
+
+sig = "int WriteFileSync(const std::vector<char>& out, const char* path)"
+a, b = find_function_span(src, sig)
+
+repl = r"""int WriteFileSync(const std::vector<char>& out, const char* path) {
+  Debug("WriteFileSync %zu bytes to %s\n", out.size(), path);
+  uv_fs_t req;
+  uv_file file = uv_fs_open(nullptr,
+                            &req,
+                            path,
+                            UV_FS_O_CREAT | UV_FS_O_WRONLY | UV_FS_O_TRUNC,
+                            S_IWUSR | S_IRUSR,
+                            nullptr);
+  int err = req.result;
+  uv_fs_req_cleanup(&req);
+  if (err < 0) {
+    return err;
   }
 
-  echo "==> Running comprehensive PGO training workloads (V8 + libuv + OpenSSL + streams + WebCrypto)..."
+  size_t written = 0;
+  while (written < out.size()) {
+    uv_buf_t buf = uv_buf_init(const_cast<char*>(out.data()) + written,
+                               out.size() - written);
+    int w = uv_fs_write(nullptr,
+                        &req,
+                        file,
+                        &buf,
+                        1,
+                        static_cast<int64_t>(written),
+                        nullptr);
+    uv_fs_req_cleanup(&req);
+    if (w < 0) {
+      err = w;
+      break;
+    }
+    if (w == 0) {
+      err = UV_EIO;
+      break;
+    }
+    written += static_cast<size_t>(w);
+  }
 
-  # 1. V8 JIT – extremely diverse hot paths
-  _rt 30 "1-V8-JIT" '
-    function hot(o, n) {
+  int r = uv_fs_close(nullptr, &req, file, nullptr);
+  uv_fs_req_cleanup(&req);
+  if (err < 0) {
+    return err;
+  }
+  return written == out.size() ? r : UV_EIO;
+}"""
+
+src = src[:a] + repl + src[b:]
+if "while (written < out.size())" not in src:
+    raise SystemExit("ERROR: js2c short-write fix was not applied")
+
+js2c.write_text(src)
+PY
+
+  if grep -rIl $'\r' --include='*.gyp*' --include='*.py' . >/dev/null; then
+    echo "ERROR: CRLF detected"
+    return 1
+  fi
+}
+
+_check_built_node() {
+  local nodebin="$1"
+  local jsfile
+
+  [[ -x "$nodebin" ]] || {
+    echo "ERROR: built node binary is missing or not executable: $nodebin"
+    return 1
+  }
+
+  "$nodebin" -e '
+    require("node:http");
+    require("node:crypto");
+    require("node:fs");
+    require("node:zlib");
+    new URL("https://nodejs.org/");
+    if (typeof fetch !== "function") process.exit(2);
+  ' >/dev/null || {
+    echo "ERROR: built node failed builtin-module smoke test"
+    return 1
+  }
+
+  # Ninja/GYP output paths are not stable across Node.js versions.
+  jsfile="$(find out/Release -type f -name node_javascript.cc -print -quit)"
+  if [[ -n "$jsfile" ]]; then
+    grep -Eq 'internal_deps_undici|undici' "$jsfile" || {
+      echo "ERROR: js2c output exists but does not contain undici: $jsfile"
+      return 1
+    }
+    echo "==> js2c output verified: $jsfile"
+  else
+    echo "==> js2c source file not found at a stable path; runtime builtin smoke test passed"
+  fi
+}
+
+_run_workload() {
+  local node="$1"
+  local -i pass=0 fail=0
+
+  _rt() {
+    local label="$1"
+    local timeout_sec="$2"
+    local js="$3"
+
+    printf "  -> %-30s" "$label"
+    if timeout -k 5s "${timeout_sec}s" "$node" -e "$js" >/dev/null 2>&1; then
+      echo "OK"
+      # Assignment arithmetic — always exits 0, safe under set -e.
+      pass=$((pass + 1))
+    else
+      echo "skip"
+      fail=$((fail + 1))
+    fi
+  }
+
+  _rt "V8 JIT / IC" 25 '
+    function h(o) {
       let s = 0;
-      for (let i = 0; i < 2e6; i++) s += (i % 3 ? o.x * 1.5 : o.y * 2) | 0;
-      return s + (n ** 2);
+      for (let i = 0; i < 2e6; i++) s += (o.x * 1.5 | 0) + (o.y * 2 | 0);
+      return s;
     }
-    class C { constructor() { this.x = 42; this.y = 1337; } }
-    const o = new C();
-    for (let i = 0; i < 80; i++) { hot(o, i); hot({x:i,y:i*2}, i); }
-    /abc|def|ghi/.test("abcdefghi".repeat(100));
-  ' || return 1
+    class C { constructor() { this.x = 1; this.y = 2; } }
+    for (let i = 0; i < 80; i++) { h(new C); h({ x: i, y: i + 1 }); }
+    /a|b|c/.test("abc".repeat(1e4));
+  '
 
-  # 2. Async / Promise / event-loop stress
-  _rt 35 "2-Async-Promise" '
-    const crypto = require("crypto");
-    class Proc {
-      constructor() { this.buf = Buffer.allocUnsafe(16384); }
-      async run(id) {
-        return new Promise(r => setImmediate(() => {
-          const h = crypto.createHash("sha512");
-          for (let i = 0; i < 1200; i++) h.update(this.buf);
-          r(h.digest("hex"));
-        }));
-      }
+  _rt "crypto async SHA512" 30 '
+    const c = require("crypto");
+    (async () => {
+      const b = Buffer.alloc(16384);
+      await Promise.all(Array.from({ length: 80 }, () => new Promise(r => {
+        setImmediate(() => {
+          for (let i = 0; i < 400; i++) c.createHash("sha512").update(b).digest();
+          r();
+        });
+      })));
+    })().catch(e => { console.error(e); process.exit(1); });
+  '
+
+  _rt "fs.promises" 20 '
+    const f = require("fs").promises;
+    const p = require("path");
+    const o = require("os");
+    (async () => {
+      const d = p.join(o.tmpdir(), "pgo-" + process.pid);
+      await f.mkdir(d, { recursive: true });
+      for (let i = 0; i < 50; i++) await f.writeFile(p.join(d, String(i)), Buffer.alloc(8192));
+      await f.rm(d, { recursive: true, force: true });
+    })().catch(e => { console.error(e); process.exit(1); });
+  '
+
+  _rt "HTTP 150-conn" 30 '
+    const h = require("http");
+    (async () => {
+      const s = h.createServer((q, r) => r.end("x".repeat(1024)));
+      await new Promise(r => s.listen(0, "127.0.0.1", r));
+      const port = s.address().port;
+      await Promise.all(Array.from({ length: 150 }, () => new Promise((resolve, reject) => {
+        const req = h.get({ host: "127.0.0.1", port }, res => {
+          res.resume();
+          res.on("end", resolve);
+        });
+        req.on("error", reject);
+      })));
+      s.close();
+    })().catch(e => { console.error(e); process.exit(1); });
+  '
+
+  _rt "brotli+zlib+JSON+URL" 25 '
+    const z = require("zlib");
+    const b = Buffer.alloc(65536, "x");
+    for (let i = 0; i < 80; i++) {
+      z.gzipSync(b);
+      z.brotliCompressSync(b);
     }
-    (async () => {
-      const p = new Proc();
-      await Promise.all(Array.from({length:120}, (_,i) => p.run(i)));
-    })().catch(() => {});
-  ' || return 1
+    for (let i = 0; i < 1000; i++) JSON.parse(JSON.stringify({ a: i, b: [i] }));
+    new URL("https://nodejs.org/" + "a".repeat(100));
+  '
 
-  # 3. File I/O + fs.promises
-  _rt 30 "3-File-IO" '
-    const fs = require("fs").promises, path = require("path"), os = require("os");
-    (async () => {
-      const d = path.join(os.tmpdir(), "pgo_" + process.pid);
-      await fs.mkdir(d, {recursive:true});
-      for (let i = 0; i < 40; i++) {
-        await fs.writeFile(path.join(d, i+".dat"), "x".repeat(8192));
-      }
-      await fs.rm(d, {recursive:true, force:true});
-    })().catch(() => {});
-  ' || return 1
-
-  # 4. HTTP server + client stress
-  _rt 40 "4-HTTP" '
-    const http = require("http"), {once} = require("events");
-    (async () => {
-      const srv = http.createServer((req, res) => { res.end("ok"); });
-      srv.listen(0, "127.0.0.1");
-      await once(srv, "listening");
-      const port = srv.address().port;
-      await Promise.all(Array.from({length:120}, () =>
-        new Promise(r => http.get({host:"127.0.0.1", port}, res => {
-          res.resume().on("end", r);
-        }))
-      ));
-      srv.close();
-    })().catch(() => {});
-  ' || return 1
-
-  # 5. Crypto + zlib + brotli heavy
-  _rt 30 "5-Crypto-Zlib-Brotli" '
-    const crypto = require("crypto"), zlib = require("zlib");
-    const b = Buffer.allocUnsafe(65536).fill("x");
-    for (let i = 0; i < 5000; i++) crypto.createHash("sha512").update(b).digest();
-    for (let i = 0; i < 120; i++) {
-      zlib.gzipSync(b);
-      zlib.brotliCompressSync(b);
-    }
-    crypto.createHmac("sha512", "key").update(b).digest();
-  ' || return 1
-
-  # 6. VM / context heavy — FIXED: pre-compiled Script + i injected into context
-  _rt 20 "6-VM" '
+  _rt "VM + WASM" 20 '
     const vm = require("vm");
-    const ctx = vm.createContext({ a: 0, b: 0 });
-    const script = new vm.Script("a + b + i * 2");
-    for (let i = 0; i < 1500; i++) {
-      ctx.i = i;
-      script.runInContext(ctx);
-    }
-  ' || return 1
+    (async () => {
+      const ctx = vm.createContext({ a: 1, b: 2 });
+      const script = new vm.Script("a + b");
+      for (let i = 0; i < 1000; i++) script.runInContext(ctx);
+      await WebAssembly.compile(Buffer.from("0061736d01000000", "hex"));
+    })().catch(e => { console.error(e); process.exit(1); });
+  '
 
-  # 7. Streams / pipeline / Transform (safe)
-  _rt 25 "7-Streams" '
+  _rt "streams" 20 '
     const { pipeline } = require("stream/promises");
-    const { Transform, Readable } = require("stream");
+    const { Readable, Transform } = require("stream");
     (async () => {
-      const t = new Transform({ transform(c, e, cb) { this.push(c); cb(); } });
-      const b = Buffer.alloc(1024*1024, "x");
-      await pipeline(Readable.from([b]), t).catch(() => {});
-    })().catch(() => {});
-  ' || return 1
+      await pipeline(
+        Readable.from([Buffer.alloc(2 << 20)]),
+        new Transform({
+          transform(c, e, cb) { cb(null, c); }
+        })
+      );
+    })().catch(e => { console.error(e); process.exit(1); });
+  '
 
-  # 8. Buffer / TypedArray / DataView stress
-  _rt 25 "8-Buffer-TypedArray" '
-    const b = Buffer.allocUnsafe(1024*1024);
-    const ta = new Uint32Array(256*1024);
-    for (let i = 0; i < 120; i++) {
-      b.writeUInt32LE(i, i*4);
-      ta[i] = i * 0xdeadbeef >>> 0;
-    }
-    new DataView(ta.buffer).getUint32(0);
-  ' || return 1
+  _rt "worker_threads" 25 '
+    const { Worker } = require("worker_threads");
+    const code = "const { parentPort } = require(\"worker_threads\"); parentPort.postMessage(1)";
+    Promise.all(Array.from({ length: 8 }, () => new Promise((resolve, reject) => {
+      const w = new Worker(code, { eval: true });
+      w.on("message", resolve);
+      w.on("error", reject);
+    }))).catch(e => { console.error(e); process.exit(1); });
+  '
 
-  # 9. WebCrypto (subtle) full exercise
-  _rt 20 "9-WebCrypto" '
-    const crypto = require("crypto");
-    const subtle = crypto.webcrypto.subtle;
+  _rt "WebCrypto AES" 20 '
+    const subtle = require("crypto").webcrypto.subtle;
     (async () => {
-      const key = await subtle.generateKey({name:"AES-GCM", length:256}, true, ["encrypt","decrypt"]);
-      const iv = crypto.getRandomValues(new Uint8Array(12));
-      const enc = await subtle.encrypt({name:"AES-GCM", iv}, key, Buffer.alloc(1024*64));
-      await subtle.decrypt({name:"AES-GCM", iv}, key, enc);
-    })().catch(() => {});
-  ' || return 1
+      const k = await subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+      const iv = new Uint8Array(12);
+      await subtle.encrypt({ name: "AES-GCM", iv }, k, new Uint8Array(65536));
+    })().catch(e => { console.error(e); process.exit(1); });
+  '
 
-  # 10. JSON / URL / WHATWG heavy parsing
-  _rt 20 "10-JSON-URL" '
-    const u = new URL("https://nodejs.org?foo=bar&baz=quux".repeat(50));
-    for (let i = 0; i < 600; i++) {
-      JSON.stringify({a:i, b:Array(100).fill(i), c:u});
-      JSON.parse("{\"x\":" + i + "}");
-    }
-  ' || return 1
+  _rt "HTTP2" 20 '
+    const h2 = require("http2");
+    (async () => {
+      const s = h2.createServer();
+      s.on("stream", stream => {
+        stream.respond({ ":status": 200 });
+        stream.end("ok");
+      });
+      await new Promise(r => s.listen(0, "127.0.0.1", r));
+      const c = h2.connect(`http://127.0.0.1:${s.address().port}`);
+      await new Promise((resolve, reject) => {
+        const req = c.request({ ":path": "/" });
+        req.on("data", () => {});
+        req.on("end", resolve);
+        req.on("error", reject);
+        req.end();
+      });
+      c.close();
+      s.close();
+    })().catch(e => { console.error(e); process.exit(1); });
+  '
 
-  echo "==> All 10 PGO workloads completed successfully"
+  printf "  workload summary: %d passed, %d skipped\n" "$pass" "$fail"
+
+  # Conditional arithmetic is safe under set -e because the (( )) is on the
+  # left side of `if` and thus guarded.  Still use [[ ]] for clarity.
+  if [[ "$pass" -lt 8 ]]; then
+    echo "ERROR: too many PGO workload steps failed; refusing weak profile"
+    return 1
+  fi
 }
 
 build() {
@@ -194,78 +393,107 @@ build() {
   export RANLIB=llvm-ranlib
   export LD=ld.lld
 
-  local _orig_cflags="${CFLAGS:-}"
-  local _orig_cxxflags="${CXXFLAGS:-}"
-  local _orig_ldflags="${LDFLAGS:-}"
+  local _c="${CFLAGS//_FORTIFY_SOURCE=3/_FORTIFY_SOURCE=1}"
+  local _cxx="${CXXFLAGS//_FORTIFY_SOURCE=3/_FORTIFY_SOURCE=1}"
+  local _ld="${LDFLAGS}"
 
-  local pgo_dir="$srcdir/pgo-data"
-  rm -rf "$pgo_dir" "$srcdir/merged.profdata"
-  mkdir -p "$pgo_dir"
+  _c="${_c//-fno-lto/}"
+  _cxx="${_cxx//-fno-lto/}"
+  _ld="${_ld//-fno-lto/}"
 
-  local configure_opts=(
+  local pgo="$srcdir/pgo"
+  local prof="$srcdir/node.profdata"
+  local build_profile_sink="$srcdir/pgo-build-tools"
+  local vp_counters="-mllvm -vp-counters-per-site=16"
+
+  rm -rf "$pgo" "$prof" "$build_profile_sink" out
+  mkdir -p "$pgo" "$build_profile_sink"
+
+  local cfg=(
+    --ninja
     --prefix=/usr
+    --enable-lto
     --with-intl=system-icu
     --without-npm
-    --openssl-use-def-ca-store
-    --shared-openssl
-    --shared-zlib
+    --shared-ada
+    --shared-brotli
+    --shared-cares
+    --shared-ffi
     --shared-libuv
     --shared-nghttp2
     --shared-nghttp3
     --shared-ngtcp2
-    --shared-cares
-    --shared-brotli
+    --shared-openssl
+    --shared-simdjson
+    --shared-zlib
+    --shared-zstd
+    --openssl-use-def-ca-store
   )
 
-  # =============================================
-  # PASS 1: Instrumented build
-  # =============================================
-  echo "==> PASS 1: PGO instrumentation build"
-  export CFLAGS="${_orig_cflags} -fprofile-generate=${pgo_dir}/%p.profraw"
-  export CXXFLAGS="${_orig_cxxflags} -fprofile-generate=${pgo_dir}/%p.profraw"
-  export LDFLAGS="${_orig_ldflags} -fprofile-generate=${pgo_dir}/%p.profraw -fuse-ld=lld"
+  echo "==> PGO instrumentation"
 
-  ./configure "${configure_opts[@]}"
-  make
+  export CFLAGS="$_c -fprofile-generate $vp_counters"
+  export CXXFLAGS="$_cxx -fprofile-generate $vp_counters"
+  export LDFLAGS="$_ld -fprofile-generate -fuse-ld=lld"
+  export CFLAGS_host="$_c"
+  export CXXFLAGS_host="$_cxx"
+  export LDFLAGS_host="$_ld -fuse-ld=lld"
 
-  echo "==> Running training workloads for best possible profile quality..."
-  _run_node_workload "$srcdir/node/out/Release/node"
+  ./configure "${cfg[@]}"
 
-  echo "==> Merging profiles..."
+  # Build-time helper binaries may be instrumented. Keep their profiles out of
+  # the real training profile so Torque/mksnapshot do not bias final PGO data.
+  LLVM_PROFILE_FILE="$build_profile_sink/build-%m-%p.profraw" ninja -C out/Release node
+  rm -rf "$build_profile_sink"
+
+  _check_built_node "$PWD/out/Release/node"
+
+  echo "==> Training"
+  export LLVM_PROFILE_FILE="$pgo/node-%m-%p.profraw"
+  _run_workload "$PWD/out/Release/node"
+  unset LLVM_PROFILE_FILE
+
   shopt -s nullglob
-  local profraw_files=("$pgo_dir"/*.profraw)
+  local profraw_files=("$pgo"/*.profraw)
   shopt -u nullglob
 
-  if (( ${#profraw_files[@]} == 0 )); then
-    echo "ERROR: No .profraw files generated"
+  # Under set -e, [[ ]] is safer than (( )) for comparisons that may equal 0.
+  if [[ "${#profraw_files[@]}" -eq 0 ]]; then
+    echo "ERROR: no profraw files were generated"
     return 1
   fi
 
-  llvm-profdata merge --output="$srcdir/merged.profdata" "${profraw_files[@]}"
+  echo "==> Merging ${#profraw_files[@]} PGO profile files"
 
-  if [[ ! -s "$srcdir/merged.profdata" ]]; then
-    echo "ERROR: Profile merge failed"
+  # Do not use -sparse for PGO reuse. Dense indexed profiles preserve better
+  # optimization information for -fprofile-use.
+  llvm-profdata merge --compress-all-sections -o "$prof" "${profraw_files[@]}"
+
+  [[ -s "$prof" ]] || {
+    echo "ERROR: profile merge produced an empty profile"
     return 1
-  fi
+  }
 
-  # =============================================
-  # PASS 2: Optimized build
-  # =============================================
-  echo "==> PASS 2: PGO-optimized build"
+  echo "==> PGO + ThinLTO build"
+
   rm -rf out
 
-  export CFLAGS="${_orig_cflags} -fprofile-use=$srcdir/merged.profdata"
-  export CXXFLAGS="${_orig_cxxflags} -fprofile-use=$srcdir/merged.profdata"
-  export LDFLAGS="${_orig_ldflags} -fprofile-use=$srcdir/merged.profdata -fuse-ld=lld"
+  export CFLAGS="$_c -fprofile-use=$prof"
+  export CXXFLAGS="$_cxx -fprofile-use=$prof"
+  export LDFLAGS="$_ld -fprofile-use=$prof -fuse-ld=lld -Wl,--thinlto-cache-dir=$srcdir/lto-cache"
+  export CFLAGS_host="$_c"
+  export CXXFLAGS_host="$_cxx"
+  export LDFLAGS_host="$_ld -fuse-ld=lld"
 
-  ./configure "${configure_opts[@]}"
-  make
+  ./configure "${cfg[@]}"
+  ninja -C out/Release node
 
-  echo "==> PGO build complete"
+  _check_built_node "$PWD/out/Release/node"
 }
 
 package() {
   cd "$srcdir/node"
-  make DESTDIR="$pkgdir" install
-  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+
+  DESTDIR="$pkgdir" ninja -C out/Release install
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
