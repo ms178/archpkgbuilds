@@ -699,7 +699,34 @@ static __always_inline void unaccount_queued_load(task_ctx *taskc)
 	WRITE_ONCE(taskc->queued_in_cpdom_id, LAVD_CPDOM_MAX_NR);
 }
 
-static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_aside);
+static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_aside)
+{
+	int ret, ret2;
+
+	/*
+	 * Never throttle the scheduler process itself, so it can always
+	 * make forward progress.
+	 */
+	if (p->pid == lavd_pid)
+		return 0;
+
+	/*
+	 * Under CPU bandwidth control using cpu.max, we should first check
+	 * if the cgroup is throttled or not. If not, we will go ahead.
+	 * Otherwise, we should put the task aside for later execution.
+	 *
+	 * Note that we cannot use scx_bpf_task_cgroup() here because this can
+	 * be called only from ops.enqueue() and ops.dispatch().
+	 */
+	ret = scx_cgroup_bw_throttled(taskc->cgrp_id, p, (u64)taskc);
+	if ((ret == -EAGAIN) && put_aside) {
+		ret2 = scx_cgroup_bw_put_aside(p, (u64)taskc, p->scx.dsq_vtime,
+					       taskc->cgrp_id);
+		if (ret2)
+			return ret2;
+	}
+	return ret;
+}
 
 s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
@@ -781,23 +808,6 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 	}
 out:
 	return cpu_id;
-}
-
-static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_aside)
-{
-	int ret, ret2;
-
-	if (p->pid == lavd_pid)
-		return 0;
-
-	ret = scx_cgroup_bw_throttled(taskc->cgrp_id, p, (u64)taskc);
-	if ((ret == -EAGAIN) && put_aside) {
-		ret2 = scx_cgroup_bw_put_aside(p, (u64)taskc, p->scx.dsq_vtime,
-					       taskc->cgrp_id);
-		if (ret2)
-			return ret2;
-	}
-	return ret;
 }
 
 void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
