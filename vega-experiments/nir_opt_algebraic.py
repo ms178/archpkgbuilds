@@ -20,6 +20,9 @@ has_fmulz = ('(options->has_fmulz || '
              '(options->has_fmulz_no_denorms && '
              '!nir_is_denorm_preserve(info->float_controls_execution_mode, 32)))')
 
+has_ffmaz = '(options->has_ffmaz_no_denorms && \
+              !nir_is_denorm_preserve(info->float_controls_execution_mode, 32))'
+
 denorm_ftz_16 = 'nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 16)'
 denorm_ftz_32 = 'nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 32)'
 denorm_ftz_64 = 'nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 64)'
@@ -315,14 +318,14 @@ optimizations += [
      ('fmulz', 'ma', b), has_fmulz), {'ma': a}),
 
     *add_fabs_fneg((('ffma@32(nsz)', ('bcsel', ('feq', b, 0.0), 0.0, 'ma'), ('bcsel', ('feq', a, 0.0), 0.0, 'mb'), c),
-     ('ffmaz', 'ma', 'mb', c), has_fmulz), {'ma': a, 'mb': b}),
+     ('ffmaz', 'ma', 'mb', c), has_ffmaz), {'ma' : a, 'mb' : b}),
     *add_fabs_fneg((('ffma@32(nsz)', 'ma', ('bcsel', ('feq', a, 0.0), 0.0, '#b(is_not_const_zero)'), c),
-     ('ffmaz', 'ma', b, c), has_fmulz), {'ma': a}),
+     ('ffmaz', 'ma', b, c), has_ffmaz), {'ma' : a}),
 
     *add_fabs_fneg((('ffma@32(nsz)', ('b2f', ('iand', ('fneu', a, 0.0), b)), ('bcsel', b, 'ma', 0.0), c),
-     ('ffmaz', 'ma', ('b2f', b), c), has_fmulz), {'ma' : a}),
+     ('ffmaz', 'ma', ('b2f', b), c), has_ffmaz), {'ma' : a}),
     *add_fabs_fneg((('ffma@32(nsz)', ('b2f', ('inot', ('ior', ('feq', a, 0.0), b))), ('bcsel', b, 0.0, 'ma'), c),
-     ('ffmaz', 'ma', ('b2f', ('inot', b)), c), has_fmulz), {'ma' : a}),
+     ('ffmaz', 'ma', ('b2f', ('inot', b)), c), has_ffmaz), {'ma' : a}),
 
     *add_fabs_fneg((('bcsel(nsz,nnan,ninf)', ('feq', b, 0.0), 1.0, ('fexp2', ('fmul@32', a, 'mb'))),
      ('fexp2', ('fmulz', a, 'mb')),
@@ -3683,6 +3686,9 @@ for sz in [16, 32, 64]:
 
         option_fmad = f'{option_fuse} && (!{option_has_ffma} ||  {option_prefer_split}) && {option_has_fmad}'
         option_ffma = f'{option_fuse} && (!{option_has_fmad} || !{option_prefer_split}) && {option_has_ffma}'
+
+        if mulz:
+            option_ffma += f' && {has_ffmaz}'
 
         for fmad in ['ffma', 'fmad']:
             option = option_fmad if fmad == 'fmad' else option_ffma
