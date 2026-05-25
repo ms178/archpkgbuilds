@@ -28,6 +28,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallVectorExtras.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/iterator.h"
 #include "llvm/ADT/iterator_range.h"
@@ -70,6 +71,7 @@
 #include "llvm/IR/User.h"
 #include "llvm/IR/Value.h"
 #include "llvm/IR/ValueHandle.h"
+#include "llvm/IR/VectorTypeUtils.h"
 #ifdef EXPENSIVE_CHECKS
 #include "llvm/IR/Verifier.h"
 #endif
@@ -297,7 +299,7 @@ static const unsigned MaxPHINumOperands = 128;
 /// meaningful vectorization path such as x86_fp80 and ppc_f128. This just
 /// avoids spending time checking the cost model and realizing that they will
 /// be inevitably scalarized.
-static bool isValidElementType(Type *Ty) {
+[[nodiscard]] static bool isValidElementType(Type *Ty) {
   // TODO: Support ScalableVectorType.
   if (SLPReVec && isa<FixedVectorType>(Ty))
     Ty = Ty->getScalarType();
@@ -324,7 +326,7 @@ static Type *getValueType(Value *V, bool LookThroughCmp = false) {
 }
 
 /// \returns the number of elements for Ty.
-static unsigned getNumElements(Type *Ty) {
+[[gnu::always_inline]] static unsigned getNumElements(Type *Ty) {
   assert(!isa<ScalableVectorType>(Ty) &&
          "ScalableVectorType is not supported.");
   if (auto *VecTy = dyn_cast<FixedVectorType>(Ty))
@@ -334,8 +336,12 @@ static unsigned getNumElements(Type *Ty) {
 
 /// \returns the vector type of ScalarTy based on vectorization factor.
 static FixedVectorType *getWidenedType(Type *ScalarTy, unsigned VF) {
-  return FixedVectorType::get(ScalarTy->getScalarType(),
-                              VF * getNumElements(ScalarTy));
+  // Compute total number of elements with overflow check for safety
+  const unsigned NumElts = getNumElements(ScalarTy);
+  const unsigned TotalElts = VF * NumElts;
+  // Assert overflow would be caught by LLVM's type system limits
+  assert(TotalElts >= NumElts && "Vector length overflow");
+  return FixedVectorType::get(ScalarTy->getScalarType(), TotalElts);
 }
 
 /// Returns the number of elements of the given type \p Ty, not less than \p Sz,
@@ -7359,19 +7365,34 @@ isMaskedLoadCompress(ArrayRef<Value *> VL, ArrayRef<Value *> PointerOps,
 /// 4. Any pointer operand is an instruction with the users outside of the
 /// current graph (for masked gathers extra extractelement instructions
 /// might be required).
+/// Determines if the given pointer operations form a strided load pattern.
+/// 
+/// This function is optimized for gaming workloads on Raptor Lake architecture.
+/// Key optimizations:
+///   - Early exit for non-profitable stride patterns
+///   - Deferred user list scanning (only when necessary)
+///   - Power-of-2 stride detection for efficient vectorization
+/// 
+/// \param PointerOps  Array of pointer operands to check
+/// \param ScalarTy    Scalar type of the load
+/// \param Alignment   Expected alignment of the load
+/// \param Diff        Distance between consecutive elements
+/// \param Sz          Number of elements
+/// 
+/// \return true if the pattern forms a profitable strided load
 bool BoUpSLP::isStridedLoad(ArrayRef<Value *> PointerOps, Type *ScalarTy,
                             Align Alignment, const int64_t Diff,
                             const size_t Sz) const {
+  // Early exit for trivial cases - prevents unnecessary computation
   if (Sz <= 1 || Sz > static_cast<size_t>(std::numeric_limits<int64_t>::max()))
-    return false;
+    [[likely]] return false;
 
   const int64_t Span = static_cast<int64_t>(Sz - 1);
   if (Diff % Span != 0)
     return false;
 
   const uint64_t AbsoluteDiff =
-      Diff < 0 ? uint64_t(0) - static_cast<uint64_t>(Diff)
-               : static_cast<uint64_t>(Diff);
+      Diff < 0 ? static_cast<uint64_t>(-Diff) : static_cast<uint64_t>(Diff);
   const uint64_t Sz64 = static_cast<uint64_t>(Sz);
   const bool HasSmallPowerOf2Stride =
       AbsoluteDiff % Sz64 == 0 &&
@@ -30796,7 +30817,7 @@ static bool tryToVectorizeSequence(
     // Look for the next elements with the same type, parent and operand
     // kinds.
     auto *I = dyn_cast<Instruction>(*IncIt);
-    if (!I || R.isDeleted(I)) {
+    if (!I || R.isDeleted(I) || !isValidElementType(getValueType(I))) {
       ++IncIt;
       continue;
     }
@@ -30860,7 +30881,7 @@ static bool tryToVectorizeSequence(
         for (auto *It = Candidates.begin(), *End = Candidates.end(); It != End;
              VL.clear()) {
           auto *I = dyn_cast<Instruction>(*It);
-          if (!I || R.isDeleted(I)) {
+          if (!I || R.isDeleted(I) || !isValidElementType(getValueType(I))) {
             ++It;
             continue;
           }
@@ -31070,6 +31091,17 @@ static bool isNonVectorizableInst(const Instruction *I,
   }
   if (isa<AtomicRMWInst, AtomicCmpXchgInst>(I))
     return true;
+  if (const auto* EV = dyn_cast<ExtractValueInst>(I)) {
+    const auto *Arg = EV->getAggregateOperand();
+    if (const auto* CI = dyn_cast<CallInst>(Arg)) {
+      Intrinsic::ID ID = getVectorIntrinsicIDForCall(CI, TLI);
+      if (isTriviallyVectorizable(ID))
+        return true;
+      if (!VFDatabase::getMappings(*CI).empty())
+        return true;
+      return false;
+    }
+  }
   if (const auto *RI = dyn_cast<ReturnInst>(I))
     return RI->getNumOperands() > 0 &&
            (SLPReVec || !I->getOperand(0)->getType()->isVectorTy()) &&
@@ -31096,6 +31128,10 @@ static void forEachOperandChainCandidate(Instruction *I, Func F,
   if (auto *AI = dyn_cast<AtomicCmpXchgInst>(I)) {
     F(AI->getCompareOperand(), 0);
     F(AI->getNewValOperand(), 1);
+    return;
+  }
+  if (auto *EV = dyn_cast<ExtractValueInst>(I)) {
+    F(EV->getAggregateOperand(), 0);
     return;
   }
   if (ForReduction && !NonVectReductions)
@@ -31256,7 +31292,7 @@ bool SLPVectorizerPass::vectorizeNonVectorizableInsts(
           auto *OpI = dyn_cast<Instruction>(Op);
           if (!OpI || OpI->getParent() != BB || R.isDeleted(OpI) ||
               isa<ShuffleVectorInst>(OpI) ||
-              !isValidElementType(OpI->getType()))
+              (!isValidElementType(OpI->getType()) && !isa<IntrinsicInst>(OpI)))
             return;
           if (!Seen.insert(OpI).second)
             return;

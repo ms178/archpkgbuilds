@@ -1380,32 +1380,36 @@ bool PeepholeOptimizer::run(MachineFunction &MF) {
   for (MachineBasicBlock &MBB : MF) {
     bool SeenMoveImm = false;
 
-    // Per-MBB containers.  Note that we deliberately do NOT call
-    // MBB.size() to reserve capacity: ilist::size() is O(n) (it is
-    // implemented as std::distance(begin(), end()) — see
-    // llvm/ADT/simple_ilist.h), so a reserve hint based on it would
-    // double-walk the MI list before we even start optimizing.  For
-    // small/medium BBs (the vast majority — see CTMark distributions)
-    // SmallPtrSet's 16-slot inline storage and DenseMap's default
-    // bucket count are already a good fit; for large BBs the geometric
-    // growth amortizes.  We use the cheap early-exit predicate
-    // sizeWithoutDebugLargerThan(64) to opt into a single one-shot
-    // reserve only for genuinely large blocks where it actually helps,
-    // turning the worst case from "always O(n)" into "at most 65 MI
-    // scans, only when likely beneficial".
+    // Per-MBB containers.  We deliberately do NOT call MBB.size() to size
+    // these: ilist::size() is O(n) (see llvm/ADT/simple_ilist.h), so a
+    // reserve hint based on it would double-walk the MI list before we even
+    // start optimizing.  For small/medium BBs (the vast majority — see
+    // CTMark distributions) SmallPtrSet's 16-slot inline storage and
+    // DenseMap's default bucket count are already a good fit; for large BBs
+    // the geometric growth amortizes.  We use the cheap early-exit predicate
+    // sizeWithoutDebugLargerThan(64) to opt into a single one-shot reserve
+    // only for genuinely large blocks where it actually helps — turning the
+    // worst case from "always O(n)" into "at most 65 MI scans, only when
+    // likely beneficial".
     SmallPtrSet<MachineInstr *, 16> LocalMIs;
     SmallSet<Register, 4> ImmDefRegs;
     DenseMap<Register, MachineInstr *> ImmDefMIs;
     SmallSet<Register, 16> FoldAsLoadDefCandidates;
+
+    // Track when a non-allocatable physical register is copied to a virtual
+    // register so that useless moves can be removed.
+    //
+    // $physreg is the map index; MI is the last valid `%vreg = COPY $physreg`
+    // without any intervening re-definition of $physreg.
     DenseMap<Register, MachineInstr *> NAPhysToVirtMIs;
 
     if (MBB.sizeWithoutDebugLargerThan(64)) {
       // Large block: a one-time reserve avoids several incremental
       // SmallPtrSet/DenseMap rehashes during the per-MI dispatch loop.
-      // 128 is a tuned mid-point: large enough to skip the first 2-3
-      // grow events for typical 100-500 MI hot blocks (the common
-      // "large" case in Clang/Chromium), small enough to avoid wasting
-      // L1 on outlier 50K+ MI mega-blocks (synthetic / generated code).
+      // 128 is a tuned mid-point: large enough to skip the first 2–3 grow
+      // events for typical 100–500 MI hot blocks (the common "large" case
+      // in Clang/Chromium), small enough to avoid wasting L1 on outlier
+      // 50K+ MI mega-blocks (synthetic / generated code).
       LocalMIs.reserve(128);
       ImmDefMIs.reserve(64);
     }
@@ -1417,9 +1421,12 @@ bool PeepholeOptimizer::run(MachineFunction &MF) {
     for (MachineBasicBlock::iterator MII = MBB.begin(), MIE = MBB.end();
          MII != MIE;) {
       MachineInstr *MI = &*MII;
+      // We may be erasing MI below, increment MII now.
       ++MII;
       LocalMIs.insert(MI);
 
+      // Skip debug instructions and positions; they should not affect this
+      // peephole optimization.  Combined into a single branch.
       if (MI->isDebugInstr() || MI->isPosition())
         continue;
 
@@ -1432,11 +1439,14 @@ bool PeepholeOptimizer::run(MachineFunction &MF) {
 
       if (!MI->isCopy()) {
         for (const MachineOperand &MO : MI->operands()) {
+          // Visit all operands: definitions can be implicit or explicit.
           if (MO.isReg()) {
             Register Reg = MO.getReg();
             if (MO.isDef() && isNAPhysCopy(Reg)) {
               auto Def = NAPhysToVirtMIs.find(Reg);
               if (Def != NAPhysToVirtMIs.end()) {
+                // A new definition of the non-allocatable physical register
+                // invalidates previous copies.
                 LLVM_DEBUG(dbgs()
                            << "NAPhysCopy: invalidating because of " << *MI);
                 NAPhysToVirtMIs.erase(Def);
@@ -1444,18 +1454,13 @@ bool PeepholeOptimizer::run(MachineFunction &MF) {
             }
           } else if (MO.isRegMask()) {
             const uint32_t *RegMask = MO.getRegMask();
-            // #3 Two-step erase for map iteration safety/predictability.
-            SmallVector<Register, 4> ClobberedRegs;
-            for (const auto &RegMI : NAPhysToVirtMIs) {
-              Register DefReg = RegMI.first;
-              if (MachineOperand::clobbersPhysReg(RegMask, DefReg))
-                ClobberedRegs.push_back(DefReg);
-            }
-            for (Register DefReg : ClobberedRegs) {
+            NAPhysToVirtMIs.remove_if([&](const auto &RegMI) {
+              if (!MachineOperand::clobbersPhysReg(RegMask, RegMI.first))
+                return false;
               LLVM_DEBUG(dbgs()
                          << "NAPhysCopy: invalidating because of " << *MI);
-              NAPhysToVirtMIs.erase(DefReg);
-            }
+              return true;
+            });
           }
         }
       }
@@ -1464,11 +1469,20 @@ bool PeepholeOptimizer::run(MachineFunction &MF) {
         continue;
 
       if (MI->isInlineAsm() || MI->hasUnmodeledSideEffects()) {
+        // Blow away all non-allocatable physical-register knowledge since we
+        // don't know what's correct anymore.
+        // FIXME: handle explicit asm clobbers.
         LLVM_DEBUG(dbgs() << "NAPhysCopy: blowing away all info due to "
                           << *MI);
         NAPhysToVirtMIs.clear();
       }
 
+      // Pre-extract compare info exactly once so we can:
+      //   (a) feed it into a refactored optimizeCmpInstr() that does not
+      //       re-run TII->analyzeCompare internally, and
+      //   (b) reuse CmpSrcReg for tryFoldLoadAfterCompareElim() on success.
+      // analyzeCompare on x86 touches several operands and walks flag users,
+      // so doing it twice is measurable on flag-heavy code.
       const bool IsCompare = MI->isCompare();
       Register CmpSrcReg;
       Register CmpSrcReg2;
@@ -1478,8 +1492,8 @@ bool PeepholeOptimizer::run(MachineFunction &MF) {
 
       if (IsCompare) {
         HasCmpInfo =
-            TII->analyzeCompare(*MI, CmpSrcReg, CmpSrcReg2, CmpMask, CmpValue) &&
-            !CmpSrcReg.isPhysical() && !CmpSrcReg2.isPhysical();
+            TII->analyzeCompare(*MI, CmpSrcReg, CmpSrcReg2, CmpMask, CmpValue)
+            && !CmpSrcReg.isPhysical() && !CmpSrcReg2.isPhysical();
       }
 
       if ((isUncoalescableCopy(*MI) &&
@@ -1487,9 +1501,13 @@ bool PeepholeOptimizer::run(MachineFunction &MF) {
           (IsCompare && HasCmpInfo &&
            optimizeCmpInstr(*MI, CmpSrcReg, CmpSrcReg2, CmpMask, CmpValue)) ||
           (MI->isSelect() && optimizeSelect(*MI, LocalMIs))) {
+        // MI is deleted.
         LocalMIs.erase(MI);
         Changed = true;
 
+        // If we just eliminated a compare, try to fold a load into its
+        // surviving user.  Reuses the already-computed CmpSrcReg — no
+        // second analyzeCompare.
         if (IsCompare && HasCmpInfo)
           (void)tryFoldLoadAfterCompareElim(CmpSrcReg, LocalMIs);
 
@@ -1502,6 +1520,7 @@ bool PeepholeOptimizer::run(MachineFunction &MF) {
       }
 
       if (isCoalescableCopy(*MI) && optimizeCoalescableCopy(*MI)) {
+        // MI is just rewritten.
         Changed = true;
         continue;
       }
@@ -1519,11 +1538,15 @@ bool PeepholeOptimizer::run(MachineFunction &MF) {
         SeenMoveImm = true;
       } else {
         Changed |= optimizeExtInstr(*MI, MBB, LocalMIs);
-
+        // optimizeExtInstr might have created new instructions after MI and
+        // before the already-incremented MII.  Re-anchor MII so the next
+        // iteration sees the new instructions.
         MII = MI;
         ++MII;
 
         if (SeenMoveImm) {
+          // Defensive: callees in some out-of-tree targets fail to write
+          // Deleted on every path.  Initialize to false.
           bool Deleted = false;
           Changed |= foldImmediate(*MI, ImmDefRegs, ImmDefMIs, Deleted);
           if (Deleted) {
@@ -1533,10 +1556,18 @@ bool PeepholeOptimizer::run(MachineFunction &MF) {
         }
       }
 
+      // Check whether MI is a load candidate for folding into a later
+      // instruction.  If MI is not a candidate, check whether we can fold an
+      // earlier load into MI.
       if (!isLoadFoldable(*MI, FoldAsLoadDefCandidates) &&
           !FoldAsLoadDefCandidates.empty()) {
-        for (unsigned i = MI->getDesc().getNumDefs(); i != MI->getNumOperands();
-             ++i) {
+        // We visit each operand even after successfully folding a previous
+        // one, allowing multiple loads to be folded into a single
+        // instruction.  We assume foldLoadInto / optimizeLoadInstr does not
+        // insert foldable uses earlier in the argument list; since we don't
+        // restart iteration, we'd miss such cases.
+        for (unsigned i = MI->getDesc().getNumDefs(),
+                      e = MI->getNumOperands(); i != e; ++i) {
           const MachineOperand &MOp = MI->getOperand(i);
           if (!MOp.isReg())
             continue;
@@ -1545,7 +1576,8 @@ bool PeepholeOptimizer::run(MachineFunction &MF) {
           if (!FoldAsLoadDefCandidates.count(FoldAsLoadDefReg))
             continue;
 
-          // #2 Single helper for repeated fold+bookkeeping mechanics.
+          // Single helper for repeated fold + bookkeeping mechanics
+          // (LocalMIs / MRI updates, erase-from-parent of the old MI).
           if (MachineInstr *FoldMI =
                   foldLoadInto(MF, *MI, FoldAsLoadDefReg, LocalMIs)) {
             FoldAsLoadDefCandidates.erase(FoldAsLoadDefReg);
@@ -1555,6 +1587,9 @@ bool PeepholeOptimizer::run(MachineFunction &MF) {
         }
       }
 
+      // If we run into an instruction we can't fold across, discard the load
+      // candidates.  Note: we might be able to fold *into* this instruction,
+      // so this must come after the folding logic above.
       if (MI->isLoadFoldBarrier()) {
         LLVM_DEBUG(dbgs() << "Encountered load fold barrier on " << *MI);
         FoldAsLoadDefCandidates.clear();
