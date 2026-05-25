@@ -1916,6 +1916,10 @@ optimizations.extend([
    (('f2u', ('ftrunc', 'a(is_not_negative)')), ('f2u', a)),
    (('f2i', ('ffloor', 'a(is_not_negative)')), ('f2i', a)),
    (('f2u', ('ffloor', a)), ('f2u', a)),
+   (('f2u(contract)', ('fadd', 'a(is_integral_not_negative)', 'b(is_a_number_gt_0_and_lt_1)')), ('f2u', a)),
+   (('f2i(contract)', ('fadd', 'a(is_integral_not_negative)', 'b(is_a_number_gt_0_and_lt_1)')), ('f2i', a)),
+   (('f2u32', ('u2f32', 'a@16')), ('u2u32', a)),
+   (('f2i32', ('u2f32', 'a@16')), ('u2u32', a)),
 
    # Section 3.3.11 (Conversion Instructions) of the SPIR-V 1.6 spec says:
    #
@@ -1973,8 +1977,13 @@ optimizations.extend([
    (('ftrunc', 'a(is_integral)'), a),
    (('fround_even', 'a(is_integral)'), a),
 
+   (('ffract(nnan,contract)', ('fadd', a, 'b(is_integral)')), ('ffract', a)),
+   (('ffloor(nsz,contract)', ('fadd', 'a(is_a_number_gt_0_and_lt_1)', 'b(is_integral)')), b),
+   (('ftrunc(nsz,contract)', ('fadd', 'a(is_a_number_gt_0_and_lt_1)', 'b(is_integral_not_negative)')), b),
+
    # fract(x) = x - floor(x), so fract(NaN/Inf) = NaN
    (('ffract(nnan)', 'a(is_integral)'), 0.0),
+   (('ffract', 'a(is_a_number_gt_0_and_lt_1)'), a),
    (('ffract', ('ffract', a)), ('ffract', a)),
    (('fabs(nsz)', 'a(is_not_negative)'), ('fcanonicalize', a)),
    (('fabs', 'a(is_not_negative_or_negative_zero)'), ('fcanonicalize', a)),
