@@ -138,7 +138,7 @@ radv_init_wsi(struct radv_physical_device *pdev)
       pdev->wsi_device.supports_protected[i] = tmz_enabled;
    }
 
-   wsi_device_setup_syncobj_fd(&pdev->wsi_device, pdev->local_fd);
+   wsi_device_setup_syncobj_fd(&pdev->wsi_device, pdev->ws->get_fd(pdev->ws));
 
    pdev->vk.wsi_device = &pdev->wsi_device;
 
