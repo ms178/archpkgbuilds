@@ -314,7 +314,7 @@
 
 /* This is another arbitrary limit, which tunables can change.  Each
    tcache bin will hold at most this number of chunks.  */
-# define TCACHE_FILL_COUNT 64
+# define TCACHE_FILL_COUNT 16
 
 /* Maximum chunks in tcache bins for tunables.  This value must fit the range
    of tcache->num_slots[] entries, else they may overflow.  */
@@ -3012,16 +3012,10 @@ static __always_inline void
 tcache_put_n (mchunkptr chunk, size_t tc_idx, tcache_entry **ep, bool mangled)
 {
   tcache_entry *e = (tcache_entry *) chunk2mem (chunk);
-  e->key = tcache_key;
 
-  if (!mangled && *ep != NULL)
-    __builtin_prefetch (*ep, 1, 3);
-  else if (mangled)
-    {
-      tcache_entry *head = REVEAL_PTR (*ep);
-      if (head != NULL)
-        __builtin_prefetch (head, 1, 3);
-    }
+  /* Mark this chunk as "in the tcache" so the test in __libc_free will
+     detect a double free.  */
+  e->key = tcache_key;
 
   if (!mangled)
     {
@@ -3078,27 +3072,15 @@ tcache_get (size_t tc_idx)
 
 static __always_inline tcache_entry **
 tcache_location_large (size_t nb, size_t tc_idx,
-                       bool *mangled, tcache_entry **demangled_ptr)
+		       bool *mangled, tcache_entry **demangled_ptr)
 {
   tcache_entry **tep = &(tcache->entries[tc_idx]);
   tcache_entry *te = *tep;
-  *mangled = false;
-
-  while (te != NULL)
+  while (te != NULL
+         && __glibc_unlikely (chunksize (mem2chunk (te)) < nb))
     {
-      if (__glibc_likely (chunksize (mem2chunk (te)) >= nb))
-        break;
-
-      tcache_entry *next_revealed = REVEAL_PTR (te->next);
-
-      if (next_revealed != NULL)
-        {
-          /* PREFETCH: Fetch the NEXT chunk's header to hide chunksize() latency */
-          __builtin_prefetch (mem2chunk (next_revealed), 0, 3);
-        }
-
       tep = & (te->next);
-      te = next_revealed;
+      te = REVEAL_PTR (te->next);
       *mangled = true;
     }
 
@@ -3352,15 +3334,15 @@ tcache_free_init (void *mem)
 void
 __libc_free (void *mem)
 {
-  mchunkptr p;
+  mchunkptr p;                          /* chunk corresponding to mem */
 
-  if (__glibc_unlikely (mem == NULL))
+  if (mem == NULL)                              /* free(0) has no effect */
     return;
 
   /* Quickly check that the freed pointer matches the tag for the memory.
      This gives a useful double-free detection.  */
   if (__glibc_unlikely (mtag_enabled))
-    *(volatile char *) mem;
+    *(volatile char *)mem;
 
   p = mem2chunk (mem);
 
@@ -3370,10 +3352,7 @@ __libc_free (void *mem)
   INTERNAL_SIZE_T size = chunksize (p);
 
   if (__glibc_unlikely (misaligned_chunk (p)))
-    {
-      malloc_printerr_tail ("free(): invalid pointer");
-      return;
-    }
+    return malloc_printerr_tail ("free(): invalid pointer");
 
 #if USE_TCACHE
   if (__glibc_likely (size < mp_.tcache_max_bytes))
@@ -3381,49 +3360,33 @@ __libc_free (void *mem)
       /* Check to see if it's already in the tcache.  */
       tcache_entry *e = (tcache_entry *) chunk2mem (p);
 
+      /* Check for double free - verify if the key matches.  */
       if (__glibc_unlikely (e->key == tcache_key))
-        {
-          tcache_double_free_verify (e);
-          return;
-        }
+        return tcache_double_free_verify (e);
 
       size_t tc_idx = csize2tidx (size);
       if (__glibc_likely (tc_idx < TCACHE_SMALL_BINS))
-        {
+	{
           if (__glibc_likely (tcache->num_slots[tc_idx] != 0))
-            {
-              tcache_put (p, tc_idx);
-              return;
-            }
-        }
+	    return tcache_put (p, tc_idx);
+	}
       else
-        {
-          tc_idx = large_csize2tidx (size);
-          if (__glibc_likely (tc_idx < TCACHE_MAX_BINS))
-            {
-              if (size >= MINSIZE && !chunk_is_mmapped (p)
-                  && __glibc_likely (tcache->num_slots[tc_idx] != 0))
-                {
-                  tcache_put_large (p, tc_idx);
-                  return;
-                }
-            }
-        }
+	{
+	  tc_idx = large_csize2tidx (size);
+	  if (size >= MINSIZE
+              && __glibc_likely (tcache->num_slots[tc_idx] != 0))
+	    return tcache_put_large (p, tc_idx);
+	}
 
       if (__glibc_unlikely (tcache_inactive ()))
-        {
-          tcache_free_init (mem);
-          return;
-        }
+	return tcache_free_init (mem);
     }
 #endif
 
   /* Check size >= MINSIZE and p + size does not overflow.  */
-  if (__glibc_unlikely (INT_ADD_OVERFLOW ((uintptr_t) p, size - MINSIZE)))
-    {
-      malloc_printerr_tail ("free(): invalid size");
-      return;
-    }
+  if (__glibc_unlikely (INT_ADD_OVERFLOW ((uintptr_t) p,
+					  size - MINSIZE)))
+    return malloc_printerr_tail ("free(): invalid size");
 
   _int_free_chunk (arena_for_chunk (p), p, size, 0);
 }
@@ -4426,7 +4389,25 @@ _int_free_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size, int have_lock)
       have_lock = true;
 
     if (!have_lock)
-      __libc_lock_lock (av->mutex);
+      {
+        mchunkptr nextchunk = chunk_at_offset(p, size);
+        
+        /* PREFETCH: Hide L2/L3 memory latency during arena consolidation.
+           By prefetching the adjacent chunk headers before acquiring the atomic lock,
+           we overlap the lock contention latency with the hardware memory fetch. */
+        __builtin_prefetch(nextchunk, 1, 3);
+        
+        if (!prev_inuse(p))
+          {
+            /* prev_inuse() does not read the previous chunk, it reads the current chunk's 
+               flags, so it is O(1) in L1D cache and safe to use as a prefetch gate. */
+            INTERNAL_SIZE_T prevsize = prev_size (p);
+            mchunkptr prevchunk = chunk_at_offset(p, -((long) prevsize));
+            __builtin_prefetch(prevchunk, 1, 3);
+          }
+
+        __libc_lock_lock (av->mutex);
+      }
 
     _int_free_merge_chunk (av, p, size);
 
@@ -4892,31 +4873,15 @@ __malloc_trim (size_t s)
    ------------------------- malloc_usable_size -------------------------
  */
 
-static __always_inline size_t
+static size_t
 musable (void *mem)
 {
   mchunkptr p = mem2chunk (mem);
 
-  /* Single read of the chunk header using the sanctioned macro.
-     The compiler will still optimize this into a single register load. */
-  INTERNAL_SIZE_T msize = chunksize_nomask (p);
-
-  /* Compute the base chunk size by stripping flags. */
-  INTERNAL_SIZE_T csize = msize & ~SIZE_BITS;
-  size_t user_size = csize - CHUNK_HDR_SZ;
-
-  /* MTAG check resolved at compile-time on x86_64, compiling to a single ADD. */
-  if (__MTAG_GRANULE_SIZE <= SIZE_SZ || __glibc_likely (!mtag_enabled))
-    user_size += SIZE_SZ;
-
-  /* Fast path: Mmapped chunks don't have a valid 'next' chunk. */
-  if (__glibc_unlikely (msize & IS_MMAPPED))
-    return user_size;
-
-  /* To check if 'p' is in use, we MUST read the PREV_INUSE bit of the NEXT chunk.
-     Using inuse_bit_at_offset safely bypasses the poison while keeping the math fast. */
-  if (__glibc_likely (inuse_bit_at_offset (p, csize)))
-    return user_size;
+  if (chunk_is_mmapped (p))
+    return memsize (p);
+  else if (inuse (p))
+    return memsize (p);
 
   return 0;
 }
@@ -5425,9 +5390,10 @@ malloc_printerr (const char *str)
 }
 
 #if USE_TCACHE
+
 static volatile int dummy_var;
 
-static __attribute_noinline__ void __attribute__ ((cold))
+static __attribute_noinline__ void
 malloc_printerr_tail (const char *str)
 {
   /* Ensure this cannot be a no-return function.  */
