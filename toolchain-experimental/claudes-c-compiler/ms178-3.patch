@@ -1178,6 +1178,130 @@ index ed3696a..28420aa 100644
              }
              return None;
          }
+diff --git a/src/backend/common.rs b/src/backend/common.rs
+index edb9d97..fc08971 100644
+--- a/src/backend/common.rs
++++ b/src/backend/common.rs
+@@ -1150,7 +1150,13 @@ impl PtrDirective {
+ }
+ 
+ /// Emit all data sections (rodata for string literals, .data and .bss for globals).
+-pub fn emit_data_sections(out: &mut AsmOutput, module: &IrModule, ptr_dir: PtrDirective) {
++///
++/// In PIC/PIE code, const-qualified globals that contain address relocations
++/// are emitted to `.data.rel.ro` instead of `.rodata`.  The dynamic linker must
++/// write those relocations at load time; keeping them in `.rodata` makes GNU ld
++/// create DT_TEXTREL and can fail hardened builds.  `.data.rel.ro` is writable
++/// during relocation and becomes read-only under RELRO.
++pub fn emit_data_sections(out: &mut AsmOutput, module: &IrModule, ptr_dir: PtrDirective, pic_mode: bool) {
+     // String literals in .rodata
+     if !module.string_literals.is_empty() || !module.wide_string_literals.is_empty()
+        || !module.char16_string_literals.is_empty() {
+@@ -1179,7 +1185,7 @@ pub fn emit_data_sections(out: &mut AsmOutput, module: &IrModule, ptr_dir: PtrDi
+     }
+ 
+     // Global variables
+-    emit_globals(out, &module.globals, ptr_dir);
++    emit_globals(out, &module.globals, ptr_dir, pic_mode);
+ }
+ 
+ /// Compute effective alignment for a global, promoting to 16 when size >= 16.
+@@ -1223,6 +1229,9 @@ enum GlobalSection {
+     Custom,
+     /// Const-qualified, non-TLS, initialized, non-zero-size -> `.rodata`.
+     Rodata,
++    /// Const-qualified initialized globals that contain address relocations in
++    /// PIC/PIE mode -> `.data.rel.ro` (relocated then read-only under RELRO).
++    DataRelRo,
+     /// Thread-local, initialized, non-zero-size -> `.tdata`.
+     Tdata,
+     /// Non-const, non-TLS, initialized, non-zero-size -> `.data`.
+@@ -1235,17 +1244,32 @@ enum GlobalSection {
+     Bss,
+ }
+ 
++/// Return true if an initializer contains an address that becomes an ELF
++/// relocation in the object file.  In PIC/PIE shared links, such relocations
++/// must not live in `.rodata` because the dynamic loader has to write them.
++fn global_init_needs_dynamic_reloc(init: &GlobalInit) -> bool {
++    match init {
++        GlobalInit::GlobalAddr(_) | GlobalInit::GlobalAddrOffset(_, _) => true,
++        GlobalInit::Compound(items) => items.iter().any(global_init_needs_dynamic_reloc),
++        // Label differences are assembled as link-time constants for computed
++        // goto/jump-table style data and do not require runtime dynamic writes.
++        GlobalInit::GlobalLabelDiff(_, _, _) => false,
++        _ => false,
++    }
++}
++
+ /// Classify a global variable into the section it should be emitted to.
+ ///
+ /// The classification priority matches GCC behavior:
+ /// 1. Extern symbols get no storage (just visibility directives).
+ /// 2. Custom section overrides all other placement.
+ /// 3. TLS globals go to .tdata (initialized) or .tbss (zero-init).
+-/// 4. Const globals go to .rodata.
+-/// 5. Non-zero initialized non-const globals go to .data.
+-/// 6. Zero-initialized common globals go to .comm.
+-/// 7. Zero-initialized non-common globals go to .bss.
+-fn classify_global(g: &IrGlobal) -> GlobalSection {
++/// 4. Const globals with address relocations go to .data.rel.ro in PIC/PIE.
++/// 5. Other const globals go to .rodata.
++/// 6. Non-zero initialized non-const globals go to .data.
++/// 7. Zero-initialized common globals go to .comm.
++/// 8. Zero-initialized non-common globals go to .bss.
++fn classify_global(g: &IrGlobal, pic_mode: bool) -> GlobalSection {
+     if g.is_extern {
+         return GlobalSection::Extern;
+     }
+@@ -1258,7 +1282,15 @@ fn classify_global(g: &IrGlobal) -> GlobalSection {
+         return if has_nonzero_init { GlobalSection::Tdata } else { GlobalSection::Tbss };
+     }
+     if has_nonzero_init {
+-        return if g.is_const { GlobalSection::Rodata } else { GlobalSection::Data };
++        return if g.is_const {
++            if pic_mode && global_init_needs_dynamic_reloc(&g.init) {
++                GlobalSection::DataRelRo
++            } else {
++                GlobalSection::Rodata
++            }
++        } else {
++            GlobalSection::Data
++        };
+     }
+     // Zero-initialized (or zero-size with init)
+     if g.is_common && is_zero {
+@@ -1272,9 +1304,9 @@ fn classify_global(g: &IrGlobal) -> GlobalSection {
+ /// Classifies each global once via `classify_global`, then emits all globals
+ /// for each section in a fixed order: extern visibility, custom sections,
+ /// .rodata, .tdata, .data, .comm, .tbss, .bss.
+-fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective) {
++fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective, pic_mode: bool) {
+     // Phase 1: classify every global into its target section.
+-    let classified: Vec<GlobalSection> = globals.iter().map(classify_global).collect();
++    let classified: Vec<GlobalSection> = globals.iter().map(|g| classify_global(g, pic_mode)).collect();
+ 
+     // Phase 2: emit each section group in order.
+ 
+@@ -1317,12 +1349,15 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
+         out.emit("");
+     }
+ 
+-    // .rodata: const-qualified initialized globals (matches GCC -fno-PIE behavior;
+-    // the linker handles relocations in .rodata fine, and kernel linker scripts
+-    // don't recognize .data.rel.ro).
++    // .rodata: const-qualified initialized globals with no runtime relocations.
+     emit_section_group(out, globals, &classified, &GlobalSection::Rodata,
+         ".section .rodata", false, ptr_dir);
+ 
++    // .data.rel.ro: const-qualified globals that need runtime relocation in
++    // PIC/PIE mode.  GNU ld places this in RELRO, eliminating DT_TEXTREL.
++    emit_section_group(out, globals, &classified, &GlobalSection::DataRelRo,
++        ".section .data.rel.ro,\"aw\",@progbits", false, ptr_dir);
++
+     // .tdata: thread-local initialized globals
+     emit_section_group(out, globals, &classified, &GlobalSection::Tdata,
+         ".section .tdata,\"awT\",@progbits", false, ptr_dir);
 diff --git a/src/backend/elf/constants.rs b/src/backend/elf/constants.rs
 index 2941509..bcbd12e 100644
 --- a/src/backend/elf/constants.rs
@@ -1191,6 +1315,80 @@ index 2941509..bcbd12e 100644
  pub const DT_VERNEED: i64 = 0x6fff_fffe;
  pub const DT_VERNEEDNUM: i64 = 0x6fff_ffff;
  pub const DT_FLAGS_1: i64 = 0x6fff_fffb;
+diff --git a/src/backend/generation.rs b/src/backend/generation.rs
+index e3271d1..76fa3d9 100644
+--- a/src/backend/generation.rs
++++ b/src/backend/generation.rs
+@@ -569,7 +569,8 @@ pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule, source_mgr:
+     let file_table = build_and_emit_dwarf_file_table(cg, module, source_mgr);
+ 
+     let ptr_dir = cg.ptr_directive();
+-    common::emit_data_sections(&mut cg.state().out, module, ptr_dir);
++    let pic_mode = cg.state_ref().pic_mode;
++    common::emit_data_sections(&mut cg.state().out, module, ptr_dir, pic_mode);
+ 
+     // Emit top-level asm("...") directives verbatim (e.g., musl's _start definition).
+     // Switch to .text first so that labels/code in the asm land in the correct section.
+diff --git a/src/backend/x86/codegen/calls.rs b/src/backend/x86/codegen/calls.rs
+index 762492b..8353e57 100644
+--- a/src/backend/x86/codegen/calls.rs
++++ b/src/backend/x86/codegen/calls.rs
+@@ -175,6 +175,20 @@ impl X86Codegen {
+         sp_adjust
+     }
+ 
++    /// Spill an indirect function pointer before stack argument setup.
++    ///
++    /// The shared call pipeline pushes stack arguments before emitting the call.
++    /// If we reload the function pointer from an RSP-addressed stack slot after
++    /// those pushes, the slot offset is wrong and the indirect call may jump to
++    /// NULL.  Keep the target in r10 instead: r10 is not an ABI argument register
++    /// on SysV x86-64, and caller-saved live values have already been spilled by
++    /// `emit_pre_call_save_caller_regs` before this hook runs.
++    pub(super) fn emit_call_spill_fptr_impl(&mut self, func_ptr: &Operand) {
++        self.operand_to_rax(func_ptr);
++        self.state.emit("    movq %rax, %r10");
++        self.state.reg_cache.invalidate_all();
++    }
++
+     pub(super) fn emit_call_reg_args_impl(&mut self, args: &[Operand], arg_classes: &[CallArgClass],
+                           _arg_types: &[IrType], total_sp_adjust: i64, _f128_temp_space: usize, _stack_arg_space: usize,
+                           _struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) {
+@@ -328,16 +342,15 @@ impl X86Codegen {
+             } else {
+                 self.state.out.emit_call(name);
+             }
+-        } else if let Some(ptr) = func_ptr {
+-            // Load function pointer into rax and call through it.
+-            // Using rax avoids clobbering r10 which may hold a
+-            // register-allocated value.
+-            self.operand_to_rax(ptr);
++        } else if func_ptr.is_some() {
++            // Indirect function pointers are preloaded into r10 by
++            // emit_call_spill_fptr_impl before stack arguments are pushed.  Do
++            // not reload the Operand here: stack argument setup changes %rsp,
++            // so RSP-relative slots would be addressed incorrectly.
+             if self.state.indirect_branch_thunk {
+-                self.state.emit("    movq %rax, %r10");
+                 self.state.emit("    call __x86_indirect_thunk_r10");
+             } else {
+-                self.state.emit("    call *%rax");
++                self.state.emit("    call *%r10");
+             }
+         }
+         self.state.reg_cache.invalidate_all();
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 5319589..68a669c 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -2351,6 +2351,7 @@ impl ArchCodegen for X86Codegen {
+         // calls
+         fn call_abi_config(&self) -> CallAbiConfig => call_abi_config_impl;
+         fn emit_call_compute_stack_space(&self, arg_classes: &[CallArgClass], arg_types: &[IrType]) -> usize => emit_call_compute_stack_space_impl;
++        fn emit_call_spill_fptr(&mut self, func_ptr: &Operand) => emit_call_spill_fptr_impl;
+         fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize) -> i64 => emit_call_stack_args_impl;
+         fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize, struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) => emit_call_reg_args_impl;
+         fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) => emit_call_instruction_impl;
 diff --git a/src/backend/x86/linker/elf.rs b/src/backend/x86/linker/elf.rs
 index a29fae0..c7ec053 100644
 --- a/src/backend/x86/linker/elf.rs
