@@ -1,0 +1,538 @@
+diff --git a/src/backend/x86/assembler/parser.rs b/src/backend/x86/assembler/parser.rs
+index 2160e1c..9ae4e0f 100644
+--- a/src/backend/x86/assembler/parser.rs
++++ b/src/backend/x86/assembler/parser.rs
+@@ -1753,6 +1753,56 @@ fn expand_gas_macros_with_state(
+             continue;
+         }
+ 
++        // .ifb string / .ifnb string / .endif
++        // GAS tests whether the argument text is blank after macro substitution.
++        // Linux/FFmpeg x86 macro code uses these heavily for optional operands.
++        if trimmed == ".ifb" || trimmed.starts_with(".ifb ") || trimmed.starts_with(".ifb	")
++            || trimmed == ".ifnb" || trimmed.starts_with(".ifnb ") || trimmed.starts_with(".ifnb	")
++        {
++            let is_ifnb = trimmed.starts_with(".ifnb");
++            let rest = if is_ifnb {
++                trimmed[".ifnb".len()..].trim()
++            } else {
++                trimmed[".ifb".len()..].trim()
++            };
++            let cond = if is_ifnb { !eval_ifb(rest) } else { eval_ifb(rest) };
++            let mut branches: Vec<(bool, Vec<String>)> = vec![(cond, Vec::new())];
++            let mut current_idx = 0;
++            let mut depth = 1;
++            i += 1;
++            while i < lines.len() {
++                let inner = strip_comment(&lines[i]).trim().to_string();
++                if is_if_start(&inner) {
++                    depth += 1;
++                    branches[current_idx].1.push(lines[i].clone());
++                } else if inner == ".endif" {
++                    depth -= 1;
++                    if depth == 0 { break; }
++                    branches[current_idx].1.push(lines[i].clone());
++                } else if depth == 1 && (inner.starts_with(".elseif ") || inner.starts_with(".elseif	")) {
++                    let elseif_rest = inner[".elseif".len()..].trim();
++                    let elseif_cond = eval_if_expr(elseif_rest, symbols);
++                    branches.push((elseif_cond, Vec::new()));
++                    current_idx += 1;
++                } else if inner == ".else" && depth == 1 {
++                    branches.push((true, Vec::new()));
++                    current_idx += 1;
++                } else {
++                    branches[current_idx].1.push(lines[i].clone());
++                }
++                i += 1;
++            }
++            let empty: Vec<String> = Vec::new();
++            let mut chosen_lines: &Vec<String> = &empty;
++            for (bcond, blines) in &branches {
++                if *bcond { chosen_lines = blines; break; }
++            }
++            let expanded = expand_gas_macros_with_state(chosen_lines, macros, symbols)?;
++            result.extend(expanded);
++            i += 1;
++            continue;
++        }
++
+         // .ifc str1, str2 / .endif
+         if trimmed.starts_with(".ifc ") || trimmed.starts_with(".ifc\t") {
+             let rest = trimmed[".ifc".len()..].trim();
+@@ -2046,6 +2096,17 @@ fn parse_irp_header(rest: &str) -> Result<(String, Vec<String>), String> {
+     Ok((var, items))
+ }
+ 
++/// Evaluate .ifb/.ifnb blank-argument test.  GAS treats an omitted
++/// argument, empty string, or macro argument that expands to nothing as blank.
++fn eval_ifb(rest: &str) -> bool {
++    let t = rest.trim();
++    if t.is_empty() { return true; }
++    if (t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')) {
++        return t.len() <= 2;
++    }
++    false
++}
++
+ /// Evaluate .ifc string comparison: "str1, str2" => true if equal
+ fn eval_ifc(rest: &str) -> bool {
+     if let Some(comma_pos) = rest.find(',') {
+@@ -2115,6 +2176,8 @@ fn is_ident_char(b: u8) -> bool {
+ fn is_if_start(trimmed: &str) -> bool {
+     trimmed.starts_with(".if ") || trimmed.starts_with(".if\t") || trimmed.starts_with(".if(")
+         || trimmed.starts_with(".ifc ") || trimmed.starts_with(".ifc\t")
++        || trimmed == ".ifb" || trimmed.starts_with(".ifb ") || trimmed.starts_with(".ifb\t")
++        || trimmed == ".ifnb" || trimmed.starts_with(".ifnb ") || trimmed.starts_with(".ifnb\t")
+         || trimmed.starts_with(".ifdef ") || trimmed.starts_with(".ifndef ")
+ }
+ 
+diff --git a/src/driver/README.md b/src/driver/README.md
+index 670d780..056efca 100644
+--- a/src/driver/README.md
++++ b/src/driver/README.md
+@@ -80,12 +80,12 @@ populated exclusively by `parse_cli_args()`. The struct is created with
+ 
+ | Field | Type | Default | Description |
+ |-------|------|---------|-------------|
+-| `opt_level` | `u32` | `2` | Internal optimization level (always 2; all levels run the same passes) |
++| `opt_level` | `u32` | `2` | Internal optimization level: 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz |
+ | `optimize` | `bool` | `false` | Whether user passed `-O1` or higher (defines `__OPTIMIZE__`) |
+ | `optimize_size` | `bool` | `false` | Whether `-Os`/`-Oz` (defines `__OPTIMIZE_SIZE__`) |
+ 
+-The internal `opt_level` is always 2 regardless of the CLI flag. The `optimize`
+-and `optimize_size` booleans only control predefined macros (`__OPTIMIZE__`,
++The `opt_level` selects a distinct pass tier. The `optimize` and
++`optimize_size` booleans additionally control predefined macros (`__OPTIMIZE__`,
+ `__OPTIMIZE_SIZE__`), which build systems like the Linux kernel rely on (e.g.,
+ `BUILD_BUG()` uses `__OPTIMIZE__` to select between a noreturn function call
+ and a no-op).
+diff --git a/src/driver/cli.rs b/src/driver/cli.rs
+index b8f9fdc..8be861b 100644
+--- a/src/driver/cli.rs
++++ b/src/driver/cli.rs
+@@ -252,33 +252,41 @@ impl Driver {
+                 "-P" => self.suppress_line_markers = true,
+                 "-dM" => self.dump_defines = true,
+ 
+-                // Optimization levels
+-                //
+-                // IMPORTANT: All optimization levels internally use the same pipeline
+-                // (opt_level=2). This is intentional — see the comment in passes/mod.rs
+-                // for the full rationale. In short: having multiple optimization tiers
+-                // is exponentially harder to test, and while the compiler is maturing,
+-                // running all passes at every level maximizes test coverage and prevents
+-                // hard-to-find bugs that only surface at specific tiers.
+-                //
+-                // The `optimize` and `optimize_size` booleans only control predefined
+-                // macros (__OPTIMIZE__, __OPTIMIZE_SIZE__), which build systems like
+-                // the Linux kernel rely on.
++                // Optimization levels.  Numeric values are interpreted by
++                // passes::run_passes(): 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz.
+                 "-O0" => {
+-                    self.opt_level = 2; // internally always optimize
++                    self.opt_level = 0;
+                     self.optimize = false;
+                     self.optimize_size = false;
+                     self.omit_frame_pointer = false;
+                 }
+-                "-O" | "-O1" | "-O2" | "-O3" => {
+-                    self.opt_level = 2;
++                "-O" | "-O1" => {
++                    self.opt_level = 1;
+                     self.optimize = true;
+                     self.optimize_size = false;
+                     self.omit_frame_pointer = true;
+                 }
+-                "-Os" | "-Oz" => {
++                "-O2" => {
+                     self.opt_level = 2;
+                     self.optimize = true;
++                    self.optimize_size = false;
++                    self.omit_frame_pointer = true;
++                }
++                "-O3" => {
++                    self.opt_level = 3;
++                    self.optimize = true;
++                    self.optimize_size = false;
++                    self.omit_frame_pointer = true;
++                }
++                "-Os" => {
++                    self.opt_level = 4;
++                    self.optimize = true;
++                    self.optimize_size = true;
++                    self.omit_frame_pointer = true;
++                }
++                "-Oz" => {
++                    self.opt_level = 5;
++                    self.optimize = true;
+                     self.optimize_size = true;
+                     self.omit_frame_pointer = true;
+                 }
+diff --git a/src/frontend/preprocessor/pipeline.rs b/src/frontend/preprocessor/pipeline.rs
+index ece3f9b..93d3ae6 100644
+--- a/src/frontend/preprocessor/pipeline.rs
++++ b/src/frontend/preprocessor/pipeline.rs
+@@ -877,8 +877,18 @@ impl Preprocessor {
+                 if keyword.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                     let line_rest = format!("{} {}", keyword, rest);
+                     self.handle_line_directive(&line_rest, line_num);
++                } else {
++                    // Unknown directives are valid preprocessing diagnostics, not
++                    // hard errors.  Warn so typos like `#defin` and `#inclde`
++                    // are visible while preserving compatibility with projects
++                    // that intentionally use vendor-specific directives.
++                    self.warnings.push(PreprocessorDiagnostic {
++                        file: self.current_file(),
++                        line: line_num,
++                        col,
++                        message: format!("unknown preprocessing directive #{}", keyword),
++                    });
+                 }
+-                // Otherwise unknown directive, ignore silently
+             }
+         }
+ 
+diff --git a/src/frontend/preprocessor/predefined_macros.rs b/src/frontend/preprocessor/predefined_macros.rs
+index b39dfd5..0a0a2ca 100644
+--- a/src/frontend/preprocessor/predefined_macros.rs
++++ b/src/frontend/preprocessor/predefined_macros.rs
+@@ -150,8 +150,8 @@ impl Preprocessor {
+             ("__USER_LABEL_PREFIX__", ""),
+             // GNU C attribute macros (strip)
+             ("__LEAF", ""), ("__LEAF_ATTR", ""), ("__wur", ""),
+-            // Date/time
+-            ("__DATE__", "\"Jan  1 2025\""), ("__TIME__", "\"00:00:00\""),
++            // Date/time: __DATE__ and __TIME__ are defined dynamically below
++            // so they reflect either SOURCE_DATE_EPOCH or the current compile time.
+             // GCC atomic lock-free macros
+             ("__GCC_ATOMIC_BOOL_LOCK_FREE", "2"),
+             ("__GCC_ATOMIC_CHAR_LOCK_FREE", "2"),
+@@ -187,6 +187,10 @@ impl Preprocessor {
+             self.define_simple_macro(name, body);
+         }
+ 
++        let (date_macro, time_macro) = Self::current_date_time_macros();
++        self.define_simple_macro("__DATE__", &date_macro);
++        self.define_simple_macro("__TIME__", &time_macro);
++
+         // Function-like predefined macros: (name, params, body)
+         // Note: __builtin_expect is handled as a real builtin (not a macro)
+         // to properly evaluate side effects in the second argument.
+@@ -223,6 +227,54 @@ impl Preprocessor {
+         });
+     }
+ 
++    /// Return C-standard `__DATE__` and `__TIME__` macro replacement lists.
++    ///
++    /// `SOURCE_DATE_EPOCH` is honored for reproducible builds.  Without it we
++    /// use the current system time.  The conversion is UTC-only and uses safe
++    /// `std` code to preserve CCC's zero-dependency / no-new-unsafe policy.
++    fn current_date_time_macros() -> (String, String) {
++        let secs = std::env::var("SOURCE_DATE_EPOCH")
++            .ok()
++            .and_then(|s| s.parse::<i64>().ok())
++            .unwrap_or_else(|| {
++                std::time::SystemTime::now()
++                    .duration_since(std::time::UNIX_EPOCH)
++                    .unwrap_or_default()
++                    .as_secs() as i64
++            });
++        let (year, month, day, hour, min, sec) = Self::unix_utc_to_ymdhms(secs);
++        const MONTHS: [&str; 12] = [
++            "Jan", "Feb", "Mar", "Apr", "May", "Jun",
++            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
++        ];
++        let month_name = MONTHS[(month.saturating_sub(1) as usize).min(11)];
++        (format!("\"{} {:>2} {}\"", month_name, day, year),
++         format!("\"{:02}:{:02}:{:02}\"", hour, min, sec))
++    }
++
++    /// Convert a Unix timestamp to UTC calendar components using Howard
++    /// Hinnant's civil date algorithm.  Handles pre-epoch values too, which is
++    /// useful for SOURCE_DATE_EPOCH test cases.
++    fn unix_utc_to_ymdhms(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
++        let days = secs.div_euclid(86_400);
++        let sod = secs.rem_euclid(86_400);
++        let hour = (sod / 3600) as u32;
++        let min = ((sod % 3600) / 60) as u32;
++        let sec = (sod % 60) as u32;
++
++        let z = days + 719_468;
++        let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
++        let doe = z - era * 146_097;
++        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096).div_euclid(365);
++        let y = yoe + era * 400;
++        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
++        let mp = (5 * doy + 2).div_euclid(153);
++        let d = doy - (153 * mp + 2).div_euclid(5) + 1;
++        let m = mp + if mp < 10 { 3 } else { -9 };
++        let year = y + if m <= 2 { 1 } else { 0 };
++        (year, m as u32, d as u32, hour, min, sec)
++    }
++
+     /// Locate the bundled `include/` directory shipped alongside the binary.
+     ///
+     /// Walks up to 5 parent directories from the canonicalized executable path
+@@ -272,7 +324,10 @@ impl Preprocessor {
+         }
+ 
+         // Dynamically find GCC include directories (highly robust and future-proof)
+-        for gcc_target in &["x86_64-pc-linux-gnu", "x86_64-linux-gnu", "i686-linux-gnu", "aarch64-linux-gnu", "riscv64-linux-gnu"] {
++        for gcc_target in &[
++            "x86_64-pc-linux-gnu", "x86_64-linux-gnu", "x86_64-redhat-linux",
++            "i686-linux-gnu", "i686-redhat-linux", "aarch64-linux-gnu", "riscv64-linux-gnu",
++        ] {
+             let gcc_dir = format!("/usr/lib/gcc/{}", gcc_target);
+             if let Ok(entries) = std::fs::read_dir(&gcc_dir) {
+                 for entry in entries.flatten() {
+@@ -484,10 +539,18 @@ impl Preprocessor {
+                     !s.contains("x86_64")
+                 });
+                 let aarch64_paths = [
+-                    "/usr/lib/gcc-cross/aarch64-linux-gnu/11/include",
+-                    "/usr/lib/gcc-cross/aarch64-linux-gnu/12/include",
+-                    "/usr/lib/gcc-cross/aarch64-linux-gnu/13/include",
++                    "/usr/lib/gcc/aarch64-linux-gnu/16/include",
++                    "/usr/lib/gcc/aarch64-linux-gnu/15/include",
++                    "/usr/lib/gcc/aarch64-linux-gnu/14/include",
++                    "/usr/lib/gcc/aarch64-linux-gnu/13/include",
++                    "/usr/lib/gcc/aarch64-linux-gnu/12/include",
++                    "/usr/lib/gcc/aarch64-linux-gnu/11/include",
++                    "/usr/lib/gcc-cross/aarch64-linux-gnu/16/include",
++                    "/usr/lib/gcc-cross/aarch64-linux-gnu/15/include",
+                     "/usr/lib/gcc-cross/aarch64-linux-gnu/14/include",
++                    "/usr/lib/gcc-cross/aarch64-linux-gnu/13/include",
++                    "/usr/lib/gcc-cross/aarch64-linux-gnu/12/include",
++                    "/usr/lib/gcc-cross/aarch64-linux-gnu/11/include",
+                     "/usr/aarch64-linux-gnu/include",
+                     "/usr/include/aarch64-linux-gnu",
+                 ];
+@@ -538,10 +601,18 @@ impl Preprocessor {
+                     !s.contains("x86_64")
+                 });
+                 let riscv_paths = [
+-                    "/usr/lib/gcc-cross/riscv64-linux-gnu/11/include",
+-                    "/usr/lib/gcc-cross/riscv64-linux-gnu/12/include",
+-                    "/usr/lib/gcc-cross/riscv64-linux-gnu/13/include",
++                    "/usr/lib/gcc/riscv64-linux-gnu/16/include",
++                    "/usr/lib/gcc/riscv64-linux-gnu/15/include",
++                    "/usr/lib/gcc/riscv64-linux-gnu/14/include",
++                    "/usr/lib/gcc/riscv64-linux-gnu/13/include",
++                    "/usr/lib/gcc/riscv64-linux-gnu/12/include",
++                    "/usr/lib/gcc/riscv64-linux-gnu/11/include",
++                    "/usr/lib/gcc-cross/riscv64-linux-gnu/16/include",
++                    "/usr/lib/gcc-cross/riscv64-linux-gnu/15/include",
+                     "/usr/lib/gcc-cross/riscv64-linux-gnu/14/include",
++                    "/usr/lib/gcc-cross/riscv64-linux-gnu/13/include",
++                    "/usr/lib/gcc-cross/riscv64-linux-gnu/12/include",
++                    "/usr/lib/gcc-cross/riscv64-linux-gnu/11/include",
+                     "/usr/riscv64-linux-gnu/include",
+                     "/usr/include/riscv64-linux-gnu",
+                 ];
+@@ -624,14 +695,18 @@ impl Preprocessor {
+                     !s.contains("x86_64")
+                 });
+                 let i686_paths = [
+-                    "/usr/lib/gcc-cross/i686-linux-gnu/11/include",
+-                    "/usr/lib/gcc-cross/i686-linux-gnu/12/include",
+-                    "/usr/lib/gcc-cross/i686-linux-gnu/13/include",
++                    "/usr/lib/gcc-cross/i686-linux-gnu/16/include",
++                    "/usr/lib/gcc-cross/i686-linux-gnu/15/include",
+                     "/usr/lib/gcc-cross/i686-linux-gnu/14/include",
+-                    "/usr/lib/gcc/i686-linux-gnu/11/include",
+-                    "/usr/lib/gcc/i686-linux-gnu/12/include",
+-                    "/usr/lib/gcc/i686-linux-gnu/13/include",
++                    "/usr/lib/gcc-cross/i686-linux-gnu/13/include",
++                    "/usr/lib/gcc-cross/i686-linux-gnu/12/include",
++                    "/usr/lib/gcc-cross/i686-linux-gnu/11/include",
++                    "/usr/lib/gcc/i686-linux-gnu/16/include",
++                    "/usr/lib/gcc/i686-linux-gnu/15/include",
+                     "/usr/lib/gcc/i686-linux-gnu/14/include",
++                    "/usr/lib/gcc/i686-linux-gnu/13/include",
++                    "/usr/lib/gcc/i686-linux-gnu/12/include",
++                    "/usr/lib/gcc/i686-linux-gnu/11/include",
+                     "/usr/i686-linux-gnu/include",
+                     "/usr/include/i386-linux-gnu",
+                 ];
+diff --git a/src/ir/constants.rs b/src/ir/constants.rs
+index cd379e9..b3b24fd 100644
+--- a/src/ir/constants.rs
++++ b/src/ir/constants.rs
+@@ -233,7 +233,17 @@ impl IrConst {
+ 
+     /// Returns true if this constant is one (integer only).
+     pub fn is_one(&self) -> bool {
+-        matches!(self, IrConst::I8(1) | IrConst::I16(1) | IrConst::I32(1) | IrConst::I64(1) | IrConst::I128(1))
++        match self {
++            IrConst::I8(1) | IrConst::I16(1) | IrConst::I32(1)
++            | IrConst::I64(1) | IrConst::I128(1) => true,
++            // These algebraic identities are already used only in the compiler's
++            // non-strict FP model.  Match exact bit-pattern value 1.0; NaNs and
++            // signed zero are unaffected.
++            IrConst::F32(v) => *v == 1.0,
++            IrConst::F64(v) => *v == 1.0,
++            IrConst::LongDouble(v, _) => *v == 1.0,
++            _ => false,
++        }
+     }
+ 
+     /// Returns true if this constant is nonzero (for truthiness checks in const eval).
+diff --git a/src/passes/README.md b/src/passes/README.md
+index 891f782..c99d4ae 100644
+--- a/src/passes/README.md
++++ b/src/passes/README.md
+@@ -5,10 +5,14 @@ pipeline. The pipeline transforms the compiler's intermediate representation (IR
+ to produce better machine code by eliminating redundant computation, simplifying
+ control flow, and replacing expensive operations with cheaper equivalents.
+ 
+-All optimization levels (`-O0` through `-O3`, `-Os`, `-Oz`) run the same full set
+-of passes. While the compiler is still maturing, having separate tiers creates
+-hard-to-find bugs where code works at one level but breaks at another. We always
+-run all passes to maximize test coverage of the optimizer and catch issues early.
++Optimization levels are tiered conservatively:
++
++- `-O0`: skip the optimization pipeline; only mandatory inline-asm symbol resolution runs.
++- `-O1`: mem2reg, constant folding, copy propagation, and DCE.
++- `-O2`: the default full scalar/interprocedural pipeline.
++- `-O3`: `-O2` plus code-size-increasing loop unrolling.
++- `-Os`: `-O2` with code-size-increasing transforms disabled.
++- `-Oz`: `-Os` with inlining disabled.
+ 
+ ## Table of Contents
+ 
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index bd090fa..ab2c9a9 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -3,11 +3,13 @@
+ //! This module contains various optimization passes that transform the IR
+ //! to produce better code.
+ //!
+-//! All optimization levels (-O0 through -O3, -Os, -Oz) run the same full set
+-//! of passes. While the compiler is still maturing, having separate tiers
+-//! creates hard-to-find bugs where code works at one level but breaks at
+-//! another. We always run all passes to maximize test coverage of the
+-//! optimizer and catch issues early.
++//! Optimization levels are distinct but intentionally conservative:
++//! - O0: no optimization pipeline (only inline-asm symbol resolution)
++//! - O1: mem2reg + constant folding + copy propagation + DCE
++//! - O2: the default full pipeline
++//! - O3: O2 plus loop unrolling
++//! - Os: O2 with code-size-increasing transforms disabled
++//! - Oz: Os with inlining disabled
+ 
+ pub(crate) mod cfg_simplify;
+ pub(crate) mod constant_fold;
+@@ -218,11 +220,10 @@ impl DisabledPasses {
+ }
+ 
+ /// Run Phase 0: function inlining and post-inline optimization passes.
+-fn run_inline_phase(module: &mut IrModule, disabled: &str) {
+-    if disabled.contains("inline") {
+-        return;
++fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool) {
++    if allow_inline && !disabled.contains("inline") {
++        inline::run(module);
+     }
+-    inline::run(module);
+ 
+     // After inlining, convert extern inline gnu_inline functions to declarations.
+     // These function bodies were only needed for inlining; they must not be emitted
+@@ -246,40 +247,42 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
+     resolve_asm::resolve_inline_asm_symbols(module);
+ }
+ 
+-/// All optimization levels run the same pipeline with the same number of
+-/// iterations. The `opt_level` parameter is accepted for API compatibility
+-/// but currently ignored -- all levels behave identically.
+-///
+-/// **Why single-level optimization matters for this project:**
+-///
+-/// Having multiple optimization tiers (e.g., -O0 doing minimal work, -O1 doing
+-/// partial work, -O2 doing full work) is exponentially harder to test. Each tier
+-/// is a separate code path through the optimizer, and bugs that only appear at
+-/// one level are extremely difficult to reproduce and diagnose. For a compiler
+-/// that is still maturing and being validated against hundreds of real-world
+-/// projects (Linux kernel, PostgreSQL, Redis, etc.), a single optimization level
+-/// ensures that:
+-///
+-/// 1. Every test run exercises every optimization pass. A bug in GVN or LICM
+-///    will be caught even when testing with `-O0`, rather than hiding until a
+-///    user happens to compile with `-O2`.
+-/// 2. The number of configurations to validate stays linear (N architectures)
+-///    rather than quadratic (N architectures × M optimization levels).
+-/// 3. Build system interactions are predictable — the same code is always
+-///    generated regardless of which `-O` flag a project's Makefile passes.
++/// Run optimization passes for the requested optimization level.
+ ///
+-/// The `optimize` and `optimize_size` booleans on the Driver still control the
+-/// `__OPTIMIZE__` and `__OPTIMIZE_SIZE__` predefined macros, which build systems
+-/// like the Linux kernel depend on (e.g., `BUILD_BUG()` uses `__OPTIMIZE__` to
+-/// select between a noreturn function call and a no-op). The actual pass pipeline
+-/// is unaffected by these flags.
+-pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::backend::Target) {
++/// `opt_level`: 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz.
++pub(crate) fn run_passes(module: &mut IrModule, opt_level: u32, target: crate::backend::Target) {
+     let disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
+     if disabled.contains("all") {
+         return;
+     }
+ 
+-    run_inline_phase(module, &disabled);
++    let time_passes = std::env::var("CCC_TIME_PASSES").is_ok();
++
++    // -O0: preserve the alloca-based IR and skip the optimizer completely.
++    // Inline asm symbol resolution is not an optimization; it is required for
++    // correct backend emission of asm operands.
++    if opt_level == 0 {
++        resolve_asm::resolve_inline_asm_symbols(module);
++        return;
++    }
++
++    // -O1: cheap scalar cleanup only.  This tier is intentionally small and
++    // predictable for faster debug-style builds while still removing obvious
++    // dead/copy/constant IR introduced by lowering.
++    if opt_level == 1 {
++        crate::ir::mem2reg::promote_allocas_with_params(module);
++        if time_passes { eprintln!("[PASS] o1 mem2reg"); }
++        constant_fold::run(module);
++        copy_prop::run(module);
++        module.for_each_function(dce::eliminate_dead_code);
++        resolve_asm::resolve_inline_asm_symbols(module);
++        constant_fold::resolve_remaining_is_constant(module);
++        return;
++    }
++
++    let optimize_for_size = opt_level >= 4;
++    let allow_inline = opt_level != 5;
++    run_inline_phase(module, &disabled, allow_inline);
+     constant_fold::resolve_remaining_is_constant(module);
+ 
+     // Switch case outlining: extract case bodies from large switch statements
+@@ -313,8 +316,6 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+     // `changed` accumulates which functions were modified during each iteration.
+     let mut changed = vec![false; num_funcs];
+ 
+-    let time_passes = std::env::var("CCC_TIME_PASSES").is_ok();
+-
+     // Per-pass change counts from the previous iteration, used for skip decisions.
+     // Pass indices: 0=cfg1, 1=copyprop1, 2=narrow, 3=simplify, 4=constfold,
+     //               5=gvn, 6=licm, 7=ifconv, 8=copyprop2, 9=dce, 10=cfg2
+@@ -404,7 +405,7 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+         // Phase 2b: Loop unrolling — iter 0 only, before GVN/LICM so that
+         // subsequent passes can optimize the unrolled copies.
+         // Pass name for CCC_DISABLE_PASSES: "unroll"
+-        if iter == 0 && !dis.unroll {
++        if iter == 0 && opt_level >= 3 && !optimize_for_size && !dis.unroll {
+             let n = timed_pass!("loop_unroll",
+                 run_on_visited(module, &dirty, &mut changed, loop_unroll::unroll_loops));
+             total_changes += n;
+@@ -414,7 +415,7 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+         // Phase 2b-vec: SSE2 vectorization — iter 0 only, EARLY in pipeline.
+         // Run before GVN/LICM/etc to catch IR in simpler state.
+         // Pass name for CCC_DISABLE_PASSES: "vectorize"
+-        if iter == 0 && !disabled.contains("vectorize") {
++        if iter == 0 && !optimize_for_size && !disabled.contains("vectorize") {
+             let n = timed_pass!("vectorize",
+                 run_on_visited(module, &dirty, &mut changed, vectorize::vectorize_function));
+             total_changes += n;
