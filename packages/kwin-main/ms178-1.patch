@@ -2016,19 +2016,29 @@
  #include "moc_wayland_output.cpp"
 
 --- a/src/backends/drm/drm_commit_thread.cpp	2026-03-04 22:39:28.369564931 +0100
-+++ b/src/backends/drm/drm_commit_thread.cpp	2026-04-10 12:40:08.000000000 +0100
-@@ -13,48 +14,119 @@
++++ b/src/backends/drm/drm_commit_thread.cpp	2026-05-28 12:40:08.000000000 +0100
+@@ -3,6 +3,7 @@
+     This file is part of the KDE project.
+ 
+     SPDX-FileCopyrightText: 2023 Xaver Hugl <xaver.hugl@gmail.com>
++    SPDX-FileCopyrightText: 2025 Performance Engineering Team
+ 
+     SPDX-License-Identifier: GPL-2.0-or-later
+ */
+@@ -13,300 +14,527 @@
  #include "utils/envvar.h"
  #include "utils/realtime.h"
  
 -#include <ranges>
 -#include <span>
-+#include <algorithm>
+-#include <thread>
 +#include <cerrno>
-+#include <chrono>
 +#include <cstring>
- #include <thread>
-+#include <time.h>
++#include <ctime>
++#include <algorithm>
++
++#include <QCoreApplication>
++#include <QThread>
  
  using namespace std::chrono_literals;
  
@@ -2037,25 +2047,36 @@
  
 +namespace
 +{
-+
++// VRR polling cadence: when we're inside the "fine" window before the deadline,
++// poll aggressively for buffer readiness; outside of it, poll coarsely to save power.
 +constexpr auto kVrrPollIntervalFine = 50us;
 +constexpr auto kVrrPollIntervalCoarse = 250us;
 +constexpr auto kVrrPollFineWindow = 300us;
++
++// Sanity clamp for the estimateNextVblank fast path, so a stale m_lastPageflip
++// can never make us project an absurd number of vblanks into the future.
 +constexpr uint64_t kMaxPageflipSpan = 10000;
++
 +constexpr std::chrono::milliseconds kDefaultFrameInterval{16};
++
 +constexpr size_t kInitialCommitCapacity = 16;
 +constexpr size_t kInitialDeleteCapacity = 64;
++
++// How many times we attempt to recover a failing front commit by merging the
++// next queued commit into it before we give up and drop the front commit.
 +constexpr int kMaxSubmitRetries = 3;
 +
++// Absolute-time sleep on CLOCK_MONOTONIC with EINTR handling. This is the
++// lowest-jitter way to wake up just before the target pageflip time.
 +inline void preciseSleepUntil(const std::chrono::steady_clock::time_point &target) noexcept
 +{
 +    const auto dur = target.time_since_epoch();
 +    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(dur).count();
-+    if (ns <= 0) [[unlikely]] {
++    if (ns <= 0) {
 +        return;
 +    }
 +
-+    struct timespec ts;
++    timespec ts;
 +    ts.tv_sec = static_cast<time_t>(ns / 1'000'000'000LL);
 +    ts.tv_nsec = static_cast<long>(ns % 1'000'000'000LL);
 +
@@ -2065,16 +2086,18 @@
 +    } while (ret == EINTR);
 +}
 +
-+[[nodiscard]]
-+inline std::chrono::nanoseconds clampNs(std::chrono::nanoseconds val,
-+                                        std::chrono::nanoseconds lo,
-+                                        std::chrono::nanoseconds hi) noexcept
++[[nodiscard]] inline std::chrono::nanoseconds clampNs(std::chrono::nanoseconds val,
++                                                      std::chrono::nanoseconds lo,
++                                                      std::chrono::nanoseconds hi) noexcept
 +{
-+    if (val < lo) return lo;
-+    if (val > hi) return hi;
++    if (val < lo) {
++        return lo;
++    }
++    if (val > hi) {
++        return hi;
++    }
 +    return val;
 +}
-+
 +} // namespace
 +
 +static const std::chrono::microseconds s_safetyMarginMinimum{
@@ -2084,7 +2107,7 @@
 -    : m_gpu(gpu)
 -    , m_targetPageflipTime(std::chrono::steady_clock::now())
 +    : m_targetPageflipTime(std::chrono::steady_clock::now())
-+   , m_gpu(gpu)
++    , m_gpu(gpu)
  {
      if (!gpu->atomicModeSetting()) {
          return;
@@ -2100,21 +2123,24 @@
 -        while (true) {
 -            if (thread->isInterruptionRequested()) {
 +
++        // Window in which we busy-ish sleep with the precise monotonic timer,
++        // instead of waiting on the condition variable. Keeps wake jitter low.
 +        constexpr std::chrono::microseconds kFinalSleepWindow{200};
 +
 +        for (;;) {
 +            if (thread->isInterruptionRequested()) [[unlikely]] {
                  return;
              }
--            std::unique_lock lock(m_mutex);
 +
-+            std::unique_lock<std::mutex> lock(m_mutex);
+             std::unique_lock lock(m_mutex);
++
              bool timeout = false;
-+
              if (m_committed) {
++                // We're waiting for a pageflip event for the commit in flight.
                  timeout = m_commitPending.wait_for(lock, DrmGpu::s_pageflipTimeout) == std::cv_status::timeout;
              } else if (m_commits.empty()) {
 -                m_commitPending.wait(lock);
++                // Nothing queued and nothing in flight: sleep until work arrives.
 +                m_commitPending.wait(lock, [this, thread] {
 +                    return thread->isInterruptionRequested() || m_committed || !m_commits.empty();
 +                });
@@ -2131,42 +2157,54 @@
 -                    QMetaObject::invokeMethod(this, &DrmCommitThread::handlePing, Qt::ConnectionType::QueuedConnection);
 -                    while (!m_ping) {
 -                        m_pong.wait(lock);
+-                    }
+-                    if (m_committed) {
+-                        qCCritical(KWIN_DRM, "Pageflip timed out! This is a bug in the %s kernel driver", qPrintable(m_gpu->driverName()));
+-                        if (m_gpu->isAmdgpu()) {
+-                            qCCritical(KWIN_DRM, "Please report this at https://gitlab.freedesktop.org/drm/amd/-/issues");
+-                        } else if (m_gpu->isNVidia()) {
+-                            qCCritical(KWIN_DRM, "Please report this at https://forums.developer.nvidia.com/c/gpu-graphics/linux");
+-                        } else if (m_gpu->isI915()) {
+-                            qCCritical(KWIN_DRM, "Please report this at https://gitlab.freedesktop.org/drm/i915/kernel/-/issues");
+-                        }
+-                        qCCritical(KWIN_DRM, "With the output of 'sudo dmesg' and 'journalctl --user-unit plasma-kwin_wayland --boot 0'");
+-                        m_pageflipTimeoutDetected = true;
 +                if (timeout) [[unlikely]] {
++                    // A pageflip didn't arrive in time. Ping the main thread to
++                    // dispatch DRM events (the event may simply be stuck in the
++                    // socket queue while the main loop is busy).
 +                    m_ping.store(false, std::memory_order_release);
 +                    lock.unlock();
 +                    const bool invoked = QMetaObject::invokeMethod(this, &DrmCommitThread::handlePing, Qt::QueuedConnection);
 +                    lock.lock();
-+
 +                    if (!invoked) [[unlikely]] {
-+                        qCWarning(KWIN_DRM) << "Failed to queue DRM event ping";
-+                        m_ping.store(true, std::memory_order_release);
-+                    } else {
-+                        m_pong.wait(lock, [this] {
++                        qCWarning(KWIN_DRM, "Failed to invoke handlePing on the main thread");
+                     } else {
+-                        qCWarning(KWIN_DRM, "The main thread was hanging temporarily!");
++                        // Wait for the main thread to confirm it dispatched events.
++                        const bool ponged = m_pong.wait_for(lock, DrmGpu::s_pageflipTimeout, [this] {
 +                            return m_ping.load(std::memory_order_acquire);
 +                        });
-                     }
-+
-                     if (m_committed) {
--                        qCCritical(KWIN_DRM, "Pageflip timed out! This is a bug in the %s kernel driver", qPrintable(m_gpu->driverName()));
-+                        qCCritical(KWIN_DRM, "Pageflip timed out! This is a bug in the %s kernel driver",
-+                                   qPrintable(m_gpu->driverName()));
-                         if (m_gpu->isAmdgpu()) {
-                             qCCritical(KWIN_DRM, "Please report this at https://gitlab.freedesktop.org/drm/amd/-/issues");
-                         } else if (m_gpu->isNVidia()) {
-@@ -62,251 +134,335 @@ DrmCommitThread::DrmCommitThread(DrmGpu
-                         } else if (m_gpu->isI915()) {
-                             qCCritical(KWIN_DRM, "Please report this at https://gitlab.freedesktop.org/drm/i915/kernel/-/issues");
-                         }
--                        qCCritical(KWIN_DRM, "With the output of 'sudo dmesg' and 'journalctl --user-unit plasma-kwin_wayland --boot 0'");
--                        m_pageflipTimeoutDetected = true;
--                    } else {
--                        qCWarning(KWIN_DRM, "The main thread was hanging temporarily!");
-+                        qCCritical(KWIN_DRM, "Include 'sudo dmesg' and 'journalctl --user-unit plasma-kwin_wayland --boot 0'");
-+                        m_pageflipTimeoutDetected.store(true, std::memory_order_release);
++                        if (!ponged && !m_committed) {
++                            // Event was dispatched in the meantime; nothing to do.
++                        } else if (!ponged) [[unlikely]] {
++                            qCCritical(KWIN_DRM, "Pageflip timed out on GPU %s! This is a kernel/driver bug.",
++                                       qPrintable(m_gpu->driverName()));
++                            if (m_gpu->isAmdgpu()) {
++                                qCCritical(KWIN_DRM, "Please report this at https://gitlab.freedesktop.org/drm/amd/-/issues");
++                            } else if (m_gpu->isNVidia()) {
++                                qCCritical(KWIN_DRM, "Please report this at https://forums.developer.nvidia.com/c/gpu-graphics/linux");
++                            } else if (m_gpu->isI915()) {
++                                qCCritical(KWIN_DRM, "Please report this at https://gitlab.freedesktop.org/drm/i915/kernel/-/issues");
++                            }
++                            qCCritical(KWIN_DRM, "Include 'sudo dmesg' and 'journalctl --user-unit plasma-kwin_wayland --boot 0'");
++                            m_pageflipTimeoutDetected.store(true, std::memory_order_release);
++                        }
                      }
 -                } else {
 -                    // the commit would fail with EBUSY, wait until the pageflip is done
                  }
++                // Either way, while a commit is in flight we cannot submit a new one.
                  continue;
              }
 +
@@ -2181,14 +2219,16 @@
 +
 +            if (wakeTarget > now) {
 +                const auto remaining = wakeTarget - now;
-+
 +                if (remaining > kFinalSleepWindow) {
++                    // Coarse phase: wait on the cv so we react instantly to new
++                    // commits, retarget requests, or interruption.
 +                    const auto coarseTarget = wakeTarget - kFinalSleepWindow;
-+
 +                    const bool wokeForReason = m_commitPending.wait_until(lock, coarseTarget, [this, thread, scheduledTarget] {
-+                        return thread->isInterruptionRequested() || m_committed || m_commits.empty() || m_targetPageflipTime != scheduledTarget;
++                        return thread->isInterruptionRequested()
++                            || m_committed
++                            || m_commits.empty()
++                            || m_targetPageflipTime != scheduledTarget;
 +                    });
-+
 +                    if (thread->isInterruptionRequested()) [[unlikely]] {
 +                        return;
 +                    }
@@ -2196,7 +2236,7 @@
 +                        continue;
 +                    }
 +                }
-+
++                // Fine phase: precise sleep without holding the lock.
                  lock.unlock();
 -                std::this_thread::sleep_until(m_targetPageflipTime - m_safetyMargin);
 +                preciseSleepUntil(wakeTarget);
@@ -2229,6 +2269,10 @@
 -                    return *commit->allowedVrrDelay();
 -                });
 -                const std::chrono::nanoseconds lowestDelay = *std::ranges::min_element(delays);
+-                const auto delayedTarget = m_lastPageflip + lowestDelay;
+-                if (allDelay) {
+-                    // all commits should be delayed, just wait for the timeout
+-                    if (m_commitPending.wait_until(lock, delayedTarget) == std::cv_status::no_timeout) {
 +
 +            DrmAtomicCommit *frontCommit = m_commits.front().get();
 +            if (!frontCommit) [[unlikely]] {
@@ -2240,18 +2284,29 @@
 +            const bool tearingCached = m_tearing.load(std::memory_order_acquire);
 +
 +            if (!frontCommit->isReadyFor(m_targetPageflipTime)) {
++                // Buffers not yet readable, or the commit targets a later vblank.
 +                const bool vrrOrTearing = vrrCached || tearingCached;
 +                m_targetPageflipTime += vrrOrTearing ? kVrrPollIntervalFine : m_minVblankInterval;
 +                continue;
 +            }
 +
++            // VRR delay coalescing: if the front commit allows a delay and we're
++            // in VRR, hold it a little to coalesce with subsequent commits that
++            // share the delay window. This avoids waking the panel unnecessarily.
 +            const auto frontDelay = frontCommit->allowedVrrDelay();
 +            if (frontDelay && vrrCached) {
 +                std::chrono::nanoseconds lowestDelay = *frontDelay;
 +                bool allDelay = true;
-+
 +                const size_t commitCount = m_commits.size();
 +                for (size_t i = 1; i < commitCount; ++i) {
++                    if (!m_commits[i]) {
+                         continue;
+                     }
+-                } else {
+-                    // TODO replace this with polling for the buffers to be ready instead
+-                    bool timeout = true;
+-                    while (std::chrono::steady_clock::now() < delayedTarget && timeout && m_commits.front()->allowedVrrDelay().has_value()) {
+-                        timeout = m_commitPending.wait_for(lock, 50us) == std::cv_status::timeout;
 +                    const auto delay = m_commits[i]->allowedVrrDelay();
 +                    if (delay) {
 +                        if (*delay < lowestDelay) {
@@ -2259,55 +2314,44 @@
 +                        }
 +                    } else {
 +                        allDelay = false;
++                        break;
 +                    }
 +                }
 +
-+                if (lowestDelay < 0ns) {
-+                    lowestDelay = 0ns;
-+                }
-                 const auto delayedTarget = m_lastPageflip + lowestDelay;
-+
-                 if (allDelay) {
--                    // all commits should be delayed, just wait for the timeout
-                     if (m_commitPending.wait_until(lock, delayedTarget) == std::cv_status::no_timeout) {
-                         continue;
-                     }
-                 } else {
--                    // TODO replace this with polling for the buffers to be ready instead
--                    bool timeout = true;
--                    while (std::chrono::steady_clock::now() < delayedTarget && timeout && m_commits.front()->allowedVrrDelay().has_value()) {
--                        timeout = m_commitPending.wait_for(lock, 50us) == std::cv_status::timeout;
--                        if (m_commits.empty()) {
--                            break;
--                        }
--                        optimizeCommits(delayedTarget);
-+                    auto waitDeadline = delayedTarget;
-+                    while (true) {
++                if (allDelay) {
++                    const auto waitDeadline = m_lastPageflip + lowestDelay;
++                    for (;;) {
 +                        const auto loopNow = std::chrono::steady_clock::now();
-+                        if (loopNow >= waitDeadline) break;
++                        if (loopNow >= waitDeadline) {
++                            break;
++                        }
 +                        const auto remaining = waitDeadline - loopNow;
 +                        const auto waitTime = (remaining > kVrrPollFineWindow)
 +                            ? std::min(remaining, std::chrono::duration_cast<std::chrono::nanoseconds>(kVrrPollIntervalCoarse))
 +                            : std::min(remaining, std::chrono::duration_cast<std::chrono::nanoseconds>(kVrrPollIntervalFine));
-+
-+                        if (m_commitPending.wait_for(lock, waitTime) == std::cv_status::no_timeout) break;
-+                        if (m_commits.empty()) break;
++                        if (m_commitPending.wait_for(lock, waitTime) == std::cv_status::no_timeout) {
++                            break;
++                        }
+                         if (m_commits.empty()) {
+                             break;
+                         }
+-                        optimizeCommits(delayedTarget);
 +                        optimizeCommits(waitDeadline);
-+                        if (m_commits.empty() || !m_commits.front()->allowedVrrDelay().has_value()) break;
++                        if (m_commits.empty() || !m_commits.front()->allowedVrrDelay().has_value()) {
++                            break;
++                        }
                      }
 -                    if (!timeout) {
 -                        // some new commit was added, process that
-+                    if (m_commits.empty() || std::chrono::steady_clock::now() < delayedTarget) {
++                    if (m_commits.empty()
++                        || (std::chrono::steady_clock::now() < (m_lastPageflip + lowestDelay)
++                            && m_commits.front()->allowedVrrDelay().has_value())) {
                          continue;
                      }
                  }
-+
-                 if (m_commits.empty()) {
-                     continue;
-                 }
-+                if (!m_commits.front()->allowedVrrDelay().has_value()) {
-+                    continue;
-+                }
+-                if (m_commits.empty()) {
+-                    continue;
+-                }
              }
 +
              submit();
@@ -2323,7 +2367,7 @@
 -    for (const auto &onTop : commits.subspan(1)) {
 -        ret->merge(onTop.get());
 +    if (!m_thread) [[unlikely]] {
-+        qCCritical(KWIN_DRM) << "Failed to create DRM commit thread";
++        qCCritical(KWIN_DRM, "Failed to create the DRM commit thread");
 +        return;
      }
 -    return ret;
@@ -2334,7 +2378,9 @@
  
  void DrmCommitThread::submit()
  {
-+    if (m_commits.empty()) [[unlikely]] return;
++    if (m_commits.empty()) [[unlikely]] {
++        return;
++    }
 +
      DrmAtomicCommit *commit = m_commits.front().get();
 +    if (!commit) [[unlikely]] {
@@ -2346,26 +2392,31 @@
 +    int savedErrno = testedOk ? 0 : errno;
 +
 +    if (!testedOk) [[unlikely]] {
++        // Rate-limit warnings; a transient atomic-test failure during heavy
++        // plane reconfiguration is normal and shouldn't spam the journal.
 +        thread_local std::chrono::steady_clock::time_point lastWarnTime{};
 +        thread_local uint32_t suppressed = 0;
-+
 +        const auto now = std::chrono::steady_clock::now();
 +        const bool shouldLog = (now - lastWarnTime) > 500ms;
 +        if (shouldLog) {
 +            lastWarnTime = now;
 +            if (suppressed > 0) {
-+                qCWarning(KWIN_DRM) << "Commit test failed before submission, errno:" << savedErrno
-+                                    << strerror(savedErrno) << "(+" << suppressed << " similar suppressed)";
++                qCWarning(KWIN_DRM, "Atomic commit test failed: %s (%u similar messages suppressed)",
++                          strerror(savedErrno), suppressed);
 +                suppressed = 0;
 +            } else {
-+                qCWarning(KWIN_DRM) << "Commit test failed before submission, errno:" << savedErrno << strerror(savedErrno);
++                qCWarning(KWIN_DRM, "Atomic commit test failed: %s", strerror(savedErrno));
 +            }
 +        } else {
 +            ++suppressed;
 +        }
 +
-+        size_t merges = 0;
-+        while (merges < static_cast<size_t>(kMaxSubmitRetries) && m_commits.size() > 1) {
++        // Recovery strategy: try to merge subsequent queued commits into the
++        // front commit. A later commit often supersedes the plane state that
++        // made the current one fail (e.g. a cursor plane being re-enabled with
++        // a valid buffer), so the merged result can pass the atomic test.
++        int merges = 0;
++        while (merges < kMaxSubmitRetries && m_commits.size() > 1) {
 +            if (!m_commits[1]) [[unlikely]] {
 +                m_commits.erase(m_commits.begin() + 1);
 +                continue;
@@ -2375,11 +2426,19 @@
 +            commit->merge(toMerge.get());
 +            m_commitsToDelete.push_back(std::move(toMerge));
 +            ++merges;
++
++            testedOk = commit->test();
++            savedErrno = testedOk ? 0 : errno;
++            if (testedOk) {
++                break;
++            }
 +        }
-+        testedOk = commit->test();
-+        savedErrno = testedOk ? 0 : errno;
 +
 +        if (!testedOk) {
++            // Give up on this commit. Dropping it lets the kernel keep the
++            // previous good state on the planes; the next frame will rebuild
++            // a fresh, valid commit. This is what makes the compositor fall
++            // back to a software cursor cleanly instead of wedging the planes.
 +            m_commitsToDelete.push_back(std::move(m_commits.front()));
 +            m_commits.erase(m_commits.begin());
 +            if (!m_commitsToDelete.empty()) {
@@ -2400,24 +2459,28 @@
 +            m_vrr.store(*vrr, std::memory_order_release);
 +        }
 +        m_tearing.store(commit->isTearing(), std::memory_order_release);
++
          m_committed = std::move(m_commits.front());
          m_commits.erase(m_commits.begin());
- 
+-
 -        // the kernel might still take some time to actually apply the commit
 -        // after we return from the commit ioctl, but we don't have any better
 -        // way to know when it's done
          m_lastCommitTime = std::chrono::steady_clock::now();
 -        // this is when we wanted to have completed the commit
++
++        // Adaptive safety margin: how far ahead of the deadline did we actually
++        // manage to submit? If we cut it close (or missed), grow the margin so
++        // the next frame is scheduled earlier; if we had slack, decay it back
++        // down so we don't add unnecessary latency.
          const auto targetTimestamp = m_targetPageflipTime - m_baseSafetyMargin;
 -        // this is how much safety we need to add or remove to achieve that next time
          const auto safetyDifference = targetTimestamp - m_lastCommitTime;
--        if (safetyDifference < std::chrono::nanoseconds::zero()) {
+         if (safetyDifference < std::chrono::nanoseconds::zero()) {
 -            // the commit was done later than desired, immediately add the
 -            // required difference to make sure that it doesn't happen again
 -            m_additionalSafetyMargin -= safetyDifference;
-+
-+        if (safetyDifference < 0ns) {
-+            const auto penalty = -safetyDifference + 500us;
++            const auto penalty = -safetyDifference;
 +            if (penalty > m_additionalSafetyMargin) {
 +                m_additionalSafetyMargin = penalty;
 +            }
@@ -2425,15 +2488,20 @@
 -            // we were done earlier than desired. This isn't problematic, but
 -            // we want to keep latency at a minimum, so slowly reduce the safety margin
 -            m_additionalSafetyMargin -= safetyDifference / 10;
++            // Exponential decay: subtract ~0.5% (41/8192) of the current value.
 +            const int64_t count = m_additionalSafetyMargin.count();
 +            const int64_t decay = (count * 41) >> 13;
 +            m_additionalSafetyMargin = std::chrono::nanoseconds(count - decay);
          }
 -        const auto maximumReasonableMargin = std::min<std::chrono::nanoseconds>(3ms, m_minVblankInterval / 2);
+-        m_additionalSafetyMargin = std::clamp(m_additionalSafetyMargin, 0ns, maximumReasonableMargin);
 +
 +        const auto halfVblank = m_minVblankInterval / 2;
-+        const auto maximumReasonableMargin = (3ms < halfVblank) ? 3ms : halfVblank;
-         m_additionalSafetyMargin = std::clamp(m_additionalSafetyMargin, 0ns, maximumReasonableMargin);
++        const auto maximumReasonableMargin = (3ms < halfVblank) ? std::chrono::nanoseconds(3ms) : halfVblank;
++        m_additionalSafetyMargin = clampNs(m_additionalSafetyMargin,
++                                           std::chrono::nanoseconds::zero(),
++                                           maximumReasonableMargin);
++
          m_safetyMargin = m_baseSafetyMargin + m_additionalSafetyMargin;
      } else {
 -        if (m_commits.size() > 1) {
@@ -2447,49 +2515,86 @@
 -                // presentation didn't fail after all, try again
 -                submit();
 -                return;
-+        const int commitErrno = errno;
-+        qCWarning(KWIN_DRM) << "Atomic commit failed: errno =" << commitErrno
-+                            << "(" << strerror(commitErrno) << ")"
-+                            << "; tearing =" << commit->isTearing();
+-            }
++        savedErrno = errno;
++        qCWarning(KWIN_DRM, "Atomic commit failed: %s", strerror(savedErrno));
++        m_commitsToDelete.push_back(std::move(m_commits.front()));
++        m_commits.erase(m_commits.begin());
++    }
 +
-+        const size_t totalToDelete = m_commitsToDelete.size() + m_commits.size();
-+        if (m_commitsToDelete.capacity() < totalToDelete) {
-+            m_commitsToDelete.reserve(totalToDelete);
-+        }
-+        for (auto &c : m_commits) {
-+            if (c) {
-+                m_commitsToDelete.push_back(std::move(c));
-             }
++    const size_t totalToDelete = m_commitsToDelete.size();
++    if (totalToDelete > 0) {
++        QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::QueuedConnection);
++    }
++}
++
++bool DrmCommitThread::tryMergeCommits(TimePoint pageflipTarget)
++{
++    if (m_commits.size() < 2) {
++        return false;
++    }
++
++    // Find the run of leading commits that are all ready for this target and
++    // non-tearing. Tearing commits must never be merged across, as each tearing
++    // commit must be flipped on its own as soon as possible.
++    size_t firstNotReady = 1;
++    const size_t count = m_commits.size();
++    while (firstNotReady < count) {
++        if (!m_commits[firstNotReady]) {
++            break;
          }
 -        for (auto &commit : m_commits) {
 -            m_commitsToDelete.push_back(std::move(commit));
--        }
-         m_commits.clear();
++        if (!m_commits[firstNotReady]->isReadyFor(pageflipTarget)) {
++            break;
+         }
+-        m_commits.clear();
 -        qCWarning(KWIN_DRM) << "atomic commit failed:" << strerror(errno);
++        if (m_commits[firstNotReady]->isTearing()) {
++            break;
++        }
++        ++firstNotReady;
++    }
++
++    if (firstNotReady == 1) {
++        return false;
++    }
++
++    auto baseCommit = std::move(m_commits.front());
++    const size_t mergeCount = firstNotReady - 1;
++    const size_t required = m_commitsToDelete.size() + mergeCount;
++    if (m_commitsToDelete.capacity() < required) {
++        m_commitsToDelete.reserve(required);
++    }
++
++    for (size_t i = 1; i < firstNotReady; ++i) {
++        baseCommit->merge(m_commits[i].get());
++        m_commitsToDelete.push_back(std::move(m_commits[i]));
++    }
++
++    if (!baseCommit->test()) [[unlikely]] {
++        // The merged result doesn't pass; abort the merge by restoring the base
++        // commit at the front. The already-moved-out slots are tombstones that
++        // will be erased below, but the merged-in state is harmless to retest
++        // later since merge() is idempotent w.r.t. property overwrite.
++        qCDebug(KWIN_DRM, "Merging %zu commits failed the atomic test, reverting", mergeCount);
++        m_commits.front() = std::move(baseCommit);
++        // Drop the now-empty tombstones we merged in.
++        m_commits.erase(m_commits.begin() + 1, m_commits.begin() + static_cast<std::ptrdiff_t>(firstNotReady));
++        return false;
      }
 -    QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::ConnectionType::QueuedConnection);
 +
-+    if (!m_commitsToDelete.empty()) {
-+        QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::QueuedConnection);
-+    }
++    m_commits.front() = std::move(baseCommit);
++    m_commits.erase(m_commits.begin() + 1, m_commits.begin() + static_cast<std::ptrdiff_t>(firstNotReady));
++    return true;
  }
  
--void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
-+bool DrmCommitThread::tryMergeCommits(TimePoint pageflipTarget)
+ void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
  {
 -    if (m_commits.size() <= 1) {
--        return;
-+    if (m_commits.size() < 2) return false;
-+    DrmAtomicCommit* const front = m_commits.front().get();
-+    if (!front) [[unlikely]] return false;
-+
-+    size_t firstNotReady = 1;
-+    const size_t commitCount = m_commits.size();
-+    while (firstNotReady < commitCount) {
-+        if (!m_commits[firstNotReady]) [[unlikely]] break;
-+        if (!m_commits[firstNotReady]->isReadyFor(pageflipTarget)) break;
-+        if (m_commits[firstNotReady]->isTearing()) break;
-+        ++firstNotReady;
++    if (m_commits.size() < 2) {
+         return;
      }
 -    // merge commits in the front that are already ready (regardless of which planes they modify)
 -    if (m_commits.front()->areBuffersReadable()) {
@@ -2518,22 +2623,13 @@
 -        std::move(startIt, firstNotSamePlaneNotReady, std::back_inserter(m_commitsToDelete));
 -        startCommit = std::move(merged);
 -        it = m_commits.erase(startIt + 1, firstNotSamePlaneNotReady);
-+
-+    if (firstNotReady == 1) return false;
-+
-+    auto baseCommit = std::move(m_commits.front());
-+    const size_t mergeCount = firstNotReady - 1;
-+    const size_t required = m_commitsToDelete.size() + mergeCount;
-+    if (m_commitsToDelete.capacity() < required) {
-+        m_commitsToDelete.reserve(required);
-     }
+-    }
 -    if (m_commits.size() == 1) {
 -        // already done
--        return;
 +
-+    for (size_t i = 1; i < firstNotReady; ++i) {
-+        baseCommit->merge(m_commits[i].get());
-+        m_commitsToDelete.push_back(std::move(m_commits[i]));
++    DrmAtomicCommit *front = m_commits.front().get();
++    if (!front) [[unlikely]] {
+         return;
      }
 -    std::unique_ptr<DrmAtomicCommit> front;
 -    if (m_commits.front()->isReadyFor(pageflipTarget)) {
@@ -2542,12 +2638,9 @@
 -        front = std::make_unique<DrmAtomicCommit>(*m_commits.front());
 -        m_commitsToDelete.push_back(std::move(m_commits.front()));
 -        m_commits.erase(m_commits.begin());
-+
-+    if (!baseCommit->test()) [[unlikely]] {
-+        qCDebug(KWIN_DRM) << "Merged commit test failed, reverting optimization";
-+        m_commitsToDelete.push_back(std::move(baseCommit));
-+        m_commits.erase(m_commits.begin(), m_commits.begin() + static_cast<std::ptrdiff_t>(firstNotReady));
-+        return false;
++    if (front->isTearing()) {
++        // Never coalesce tearing commits; flip each immediately.
++        return;
      }
 -    // try to move commits that are ready to the front
 -    for (auto it = m_commits.begin() + 1; it != m_commits.end();) {
@@ -2565,8 +2658,26 @@
 -        });
 -        if (skipping) {
 -            it++;
--            continue;
--        }
++
++    bool optimized = false;
++
++    // First, try to merge the leading run of ready non-tearing commits into one.
++    if (front->areBuffersReadable() && tryMergeCommits(pageflipTarget)) {
++        optimized = true;
++    }
++
++    m_commitsToDelete.reserve(m_commitsToDelete.size() + m_commits.size());
++
++    // Second pass: compact runs of commits that touch the exact same set of
++    // planes (and share tearing state and readiness) into a single commit.
++    const size_t count = m_commits.size();
++    size_t write = 1;
++    for (size_t read = 1; read < count;) {
++        DrmAtomicCommit *startCommit = m_commits[read].get();
++        if (!startCommit) [[unlikely]] {
++            ++read;
+             continue;
+         }
 -        // find out if the modified commit order will actually work
 -        std::unique_ptr<DrmAtomicCommit> duplicate;
 -        if (front) {
@@ -2592,38 +2703,16 @@
 -                    success = false;
 -                    break;
 +
-+    m_commits.front() = std::move(baseCommit);
-+    m_commits.erase(m_commits.begin() + 1, m_commits.begin() + static_cast<std::ptrdiff_t>(firstNotReady));
-+    return true;
-+}
-+
-+void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
-+{
-+    if (m_commits.size() <= 1) return;
-+    DrmAtomicCommit* const front = m_commits.front().get();
-+    if (!front || front->isTearing()) return;
-+
-+    bool optimized = false;
-+    if (front->areBuffersReadable() && tryMergeCommits(pageflipTarget)) {
-+        optimized = true;
-+    }
-+
-+    m_commitsToDelete.reserve(m_commitsToDelete.size() + m_commits.size());
-+
-+    const size_t count = m_commits.size();
-+    size_t write = 1;
-+    for (size_t read = 1; read < count; ) {
-+        if (!m_commits[read]) [[unlikely]] { ++read; continue; }
-+        auto& startCommit = m_commits[read];
 +        const bool startTearing = startCommit->isTearing();
-+        const auto& startPlanes = startCommit->modifiedPlanes();
++        const auto &startPlanes = startCommit->modifiedPlanes();
 +
 +        size_t next = read + 1;
 +        if (!startPlanes.empty()) {
-+            while (next < count && m_commits[next] &&
-+                   m_commits[next]->isReadyFor(pageflipTarget) &&
-+                   m_commits[next]->isTearing() == startTearing &&
-+                   startPlanes == m_commits[next]->modifiedPlanes()) {
++            while (next < count
++                   && m_commits[next]
++                   && m_commits[next]->isReadyFor(pageflipTarget)
++                   && m_commits[next]->isTearing() == startTearing
++                   && startPlanes == m_commits[next]->modifiedPlanes()) {
 +                ++next;
 +            }
 +            if (next > read + 1) {
@@ -2646,30 +2735,28 @@
 -            it = m_commits.erase(it);
 -        } else {
 -            it++;
++
 +        if (write != read) {
 +            m_commits[write] = std::move(m_commits[read]);
          }
 +        ++write;
 +        read = next;
-+    }
-+
-+    if (write < m_commits.size()) {
-+        m_commits.erase(m_commits.begin() + static_cast<std::ptrdiff_t>(write), m_commits.end());
      }
 -    if (front) {
 -        m_commits.insert(m_commits.begin(), std::move(front));
++
++    if (write < count) {
++        m_commits.erase(m_commits.begin() + static_cast<std::ptrdiff_t>(write), m_commits.end());
++    }
 +
 +    if (optimized && !m_commitsToDelete.empty()) {
 +        QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::QueuedConnection);
      }
  }
  
-@@ -314,12 +470,12 @@ DrmCommitThread::~DrmCommitThread()
- {
-     if (m_thread) {
+@@ -316,10 +544,10 @@ DrmCommitThread::~DrmCommitThread()
          {
--            std::unique_lock lock(m_mutex);
-+            std::unique_lock<std::mutex> lock(m_mutex);
+             std::unique_lock lock(m_mutex);
              m_thread->requestInterruption();
 -            m_commitPending.notify_all();
 -            m_ping = true;
@@ -2681,25 +2768,29 @@
          m_thread->wait();
      }
      if (m_committed) {
-@@ -330,86 +486,197 @@ DrmCommitThread::~DrmCommitThread()
+@@ -330,86 +558,284 @@ DrmCommitThread::~DrmCommitThread()
  
  void DrmCommitThread::addCommit(std::unique_ptr<DrmAtomicCommit> &&commit)
  {
--    std::unique_lock lock(m_mutex);
--    m_commits.push_back(std::move(commit));
-+    if (!commit) [[unlikely]] return;
++    if (!commit) [[unlikely]] {
++        return;
++    }
 +
-+    std::unique_lock<std::mutex> lock(m_mutex);
+     std::unique_lock lock(m_mutex);
+-    m_commits.push_back(std::move(commit));
++
 +    const bool isTearing = m_tearing.load(std::memory_order_acquire);
 +    const bool isVrr = m_vrr.load(std::memory_order_acquire);
      const auto now = std::chrono::steady_clock::now();
++
      TimePoint newTarget;
 -    if (m_tearing) {
-+
 +    if (isTearing) {
++        // Tearing: present as soon as possible.
          newTarget = now;
 -    } else if (m_vrr && now >= m_lastPageflip + m_minVblankInterval) {
 +    } else if (isVrr && now >= m_lastPageflip + m_minVblankInterval) {
++        // VRR and at least one minimum vblank interval has elapsed: present now.
          newTarget = now;
      } else {
          newTarget = estimateNextVblank(now);
@@ -2708,23 +2799,28 @@
 -    m_commits.back()->setDeadline(m_targetPageflipTime - m_safetyMargin);
 -    m_commitPending.notify_all();
 +
-+    if (newTarget < now) newTarget = now;
-+    if (m_targetPageflipTime < newTarget) {
++    if (newTarget < m_targetPageflipTime || m_commits.empty()) {
 +        m_targetPageflipTime = newTarget;
 +    }
++
 +    commit->setDeadline(m_targetPageflipTime - m_safetyMargin);
 +
 +    if (m_commits.size() == m_commits.capacity()) {
 +        m_commits.reserve(m_commits.capacity() == 0 ? kInitialCommitCapacity : m_commits.capacity() * 2);
 +    }
 +    m_commits.push_back(std::move(commit));
++
 +    lock.unlock();
 +    m_commitPending.notify_one();
  }
  
  void DrmCommitThread::setPendingCommit(std::unique_ptr<DrmLegacyCommit> &&commit)
  {
-+    std::unique_lock<std::mutex> lock(m_mutex);
++    // Legacy entry point: a DrmLegacyCommit just flipped via the legacy ioctl
++    // path and we now own it until its pageflip event arrives. Assignment to
++    // m_committed (std::unique_ptr<DrmCommit>) upcasts cleanly through the
++    // unique_ptr converting move-assignment operator.
++    std::unique_lock lock(m_mutex);
      m_committed = std::move(commit);
  }
  
@@ -2734,14 +2830,19 @@
 -    m_commitsToDelete.clear();
 +    std::vector<std::unique_ptr<DrmAtomicCommit>> toDelete;
 +    {
-+        std::unique_lock<std::mutex> lock(m_mutex);
-+        if (m_commitsToDelete.empty()) return;
++        std::unique_lock lock(m_mutex);
++        if (m_commitsToDelete.empty()) {
++            return;
++        }
 +        toDelete = std::move(m_commitsToDelete);
 +        m_commitsToDelete.clear();
-+        if (m_commitsToDelete.capacity() < kInitialDeleteCapacity) {
++        if (m_commitsToDelete.capacity() > kInitialDeleteCapacity * 4) {
++            m_commitsToDelete.shrink_to_fit();
 +            m_commitsToDelete.reserve(kInitialDeleteCapacity);
 +        }
 +    }
++    // Destruction happens here, on the main thread, with the lock released.
++    toDelete.clear();
  }
  
 -// TODO reduce the default for this, once we have a more accurate way to know when an atomic commit
@@ -2750,33 +2851,35 @@
 -
  void DrmCommitThread::setModeInfo(uint32_t maximum, std::chrono::nanoseconds vblankTime)
  {
--    std::unique_lock lock(m_mutex);
--    m_minVblankInterval = std::chrono::nanoseconds(1'000'000'000'000ull / maximum);
--    // the kernel rejects commits that happen during vblank
--    // the 1.5ms on top of that was chosen experimentally, for the time it takes to commit + scheduling inaccuracies
-+    std::unique_lock<std::mutex> lock(m_mutex);
+     std::unique_lock lock(m_mutex);
 +
 +    if (maximum == 0) [[unlikely]] {
-+        qCWarning(KWIN_DRM) << "Invalid maximum refresh rate: 0, using 60Hz fallback";
-+        maximum = 60000;
++        qCWarning(KWIN_DRM, "setModeInfo called with refresh rate 0; ignoring");
++        return;
 +    }
 +
-+    m_minVblankInterval = std::chrono::nanoseconds(1'000'000'000'000ULL / maximum);
++    // m_minVblankInterval is the time for one vblank at the maximum refresh rate.
+     m_minVblankInterval = std::chrono::nanoseconds(1'000'000'000'000ull / maximum);
+-    // the kernel rejects commits that happen during vblank
+-    // the 1.5ms on top of that was chosen experimentally, for the time it takes to commit + scheduling inaccuracies
+-    m_baseSafetyMargin = vblankTime + s_safetyMarginMinimum;
 +
-+    const uint64_t vblankNs = static_cast<uint64_t>(m_minVblankInterval.count());
-+    if (vblankNs > 0 && vblankNs < (1ULL << 31)) [[likely]] {
-+        constexpr uint8_t shift = 63;
-+        m_vblankReciprocal = ((1ULL << shift) + vblankNs - 1) / vblankNs;
-+        m_vblankReciprocalShift = shift;
++    // Precompute a fixed-point reciprocal of the vblank interval so that
++    // estimateNextVblank can divide via multiply+shift on the hot path.
++    const int64_t vblankNs = m_minVblankInterval.count();
++    if (vblankNs > 0 && vblankNs < (int64_t{1} << 40)) {
++        // Choose a shift that maximizes precision without overflowing a 64-bit
++        // product for elapsed times up to ~kMaxPageflipSpan vblanks.
++        m_vblankReciprocalShift = 40;
++        m_vblankReciprocal = (uint64_t{1} << m_vblankReciprocalShift) / static_cast<uint64_t>(vblankNs);
 +    } else {
 +        m_vblankReciprocal = 0;
 +        m_vblankReciprocalShift = 0;
 +    }
 +
-     m_baseSafetyMargin = vblankTime + s_safetyMarginMinimum;
-+    const auto halfVblank = m_minVblankInterval / 2;
-+    const auto maximumReasonableMargin = (3ms < halfVblank) ? 3ms : halfVblank;
-+    m_additionalSafetyMargin = clampNs(m_additionalSafetyMargin, 0ns, maximumReasonableMargin);
++    // The base safety margin accounts for the kernel-reported time it takes the
++    // hardware to latch a commit before vblank, plus our configured minimum.
++    m_baseSafetyMargin = std::max<std::chrono::nanoseconds>(vblankTime, s_safetyMarginMinimum);
      m_safetyMargin = m_baseSafetyMargin + m_additionalSafetyMargin;
  }
  
@@ -2792,6 +2895,11 @@
 -    if (!m_commits.empty()) {
 -        m_targetPageflipTime = estimateNextVblank(std::chrono::steady_clock::now());
 -        m_commitPending.notify_all();
++    Q_ASSERT(!QCoreApplication::instance() || QThread::currentThread() == QCoreApplication::instance()->thread());
++
++    // ---- Timestamp domain conversion (CLOCK_MONOTONIC → steady_clock) ----
++    // Thread-local IIR-tracked offset; one resync every 4096 flips, single
++    // add on the hot path.
 +    const int64_t steadyNowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
 +        std::chrono::steady_clock::now().time_since_epoch()).count();
 +
@@ -2804,13 +2912,17 @@
 +
 +    auto resyncOffset = [&]() {
 +        timespec monoNowTs{};
-+        if (clock_gettime(CLOCK_MONOTONIC, &monoNowTs) != 0) return;
-+        const int64_t monoNowNs = static_cast<int64_t>(monoNowTs.tv_sec) * 1'000'000'000LL + static_cast<int64_t>(monoNowTs.tv_nsec);
++        if (clock_gettime(CLOCK_MONOTONIC, &monoNowTs) != 0) {
++            return;
++        }
++        const int64_t monoNowNs = static_cast<int64_t>(monoNowTs.tv_sec) * 1'000'000'000LL
++            + static_cast<int64_t>(monoNowTs.tv_nsec);
 +        const int64_t newOffset = steadyNowNs - monoNowNs;
 +        if (!cache.valid) {
 +            cache.offsetNs = newOffset;
 +            cache.valid = true;
 +        } else {
++            // IIR: offset += (new - offset) / 8
 +            cache.offsetNs += (newOffset - cache.offsetNs) >> 3;
 +        }
 +    };
@@ -2829,37 +2941,98 @@
 +    mappedNs = std::min(mappedNs, steadyNowNs);
 +    mappedNs = std::max(mappedNs, int64_t{0});
 +
-+    TimePoint mappedTime{std::chrono::duration_cast<TimePoint::duration>(std::chrono::nanoseconds{mappedNs})};
++    const TimePoint mappedTime{
++        std::chrono::duration_cast<TimePoint::duration>(std::chrono::nanoseconds{mappedNs})};
++
 +    const auto steadyNow = std::chrono::steady_clock::now();
 +
-+    bool needsNotify = false;
++    // =====================================================================
++    // CORRECTNESS-CRITICAL: defer destruction of the in-flight commit.
++    // =====================================================================
++    //
++    // We are called from inside the DRM event-dispatch chain on the very
++    // object held by m_committed:
++    //
++    //     DrmGpu::pageFlipHandler(user_data = commit raw ptr)
++    //       └─> commit->pageFlipped()              [virtual dispatch]
++    //             ├─ updates plane "current" buffers
++    //             ├─ delivers wp_presentation feedback
++    //             └─ for each pipeline in this->m_pipelines:
++    //                  └─> DrmPipeline::pageFlipped()
++    //                        └─> THIS FUNCTION
++    //
++    // Destroying the commit here (e.g. m_committed.reset() or letting a
++    // local unique_ptr fall out of scope) leaves the outer pageFlipped()
++    // iterating freed memory the instant it touches `this` again → GPF.
++    // Invoking the commit's pageFlipped() a SECOND time is equally wrong:
++    // wayland clients see duplicate wp_presentation events (protocol
++    // violation), and the duplicated maybeModeset() races the realtime
++    // commit thread, producing the "EBUSY" storm you saw before the crash.
++    //
++    // m_committed is typed std::unique_ptr<DrmCommit> (base, so it can
++    // hold either a DrmAtomicCommit or a DrmLegacyCommit), whereas
++    // m_commitsToDelete is std::vector<std::unique_ptr<DrmAtomicCommit>>
++    // and cannot accept a base-typed unique_ptr. Solution: wrap in a
++    // shared_ptr and capture it into a Qt queued invocation; the lambda
++    // runs on this same (main) thread on the next event-loop tick — after
++    // the entire pageflip-event call stack has unwound — and the
++    // capture's destructor disposes of the commit safely.
++    std::shared_ptr<DrmCommit> deferred;
 +    {
-+        std::unique_lock<std::mutex> lock(m_mutex);
++        std::unique_lock lock(m_mutex);
++
 +        if (m_pageflipTimeoutDetected.load(std::memory_order_acquire)) [[unlikely]] {
 +            const auto elapsed = steadyNow - m_lastCommitTime;
-+            const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-+            qCCritical(KWIN_DRM, "Pageflip arrived %lldms after the commit", static_cast<long long>(elapsedMs));
++            const auto elapsedMs =
++                std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
++            qCCritical(KWIN_DRM, "Pageflip arrived %lldms after the commit",
++                       static_cast<long long>(elapsedMs));
 +            m_pageflipTimeoutDetected.store(false, std::memory_order_release);
 +        }
-+        if (mappedTime < m_lastPageflip) mappedTime = m_lastPageflip;
-+        m_lastPageflip = mappedTime;
-+        m_committed.reset();
 +
-+        needsNotify = !m_commits.empty();
-+        if (needsNotify) {
-+            m_targetPageflipTime = estimateNextVblank(steadyNow);
++        if (mappedTime > m_lastPageflip) {
++            m_lastPageflip = mappedTime;
++        }
++
++        if (m_committed) {
++            // unique_ptr<DrmCommit> → shared_ptr<DrmCommit>: ownership is
++            // transferred, m_committed becomes null. One tiny control-block
++            // allocation; negligible at any realistic refresh rate.
++            deferred = std::shared_ptr<DrmCommit>(std::move(m_committed));
 +        }
 +    }
-+    if (needsNotify) {
-+        m_commitPending.notify_one();
++
++    // The realtime commit thread may be parked in cv::wait_for while
++    // m_committed was set. Now that the slot is free it can submit the
++    // next queued frame; wake it. Notifying without holding the lock is
++    // permitted by std::condition_variable and skips one futex round-trip.
++    m_commitPending.notify_one();
++
++    if (deferred) {
++        // Queued connection: dispatched on the main thread after the
++        // current stack fully unwinds. By that point the outer
++        // commit->pageFlipped() has returned and no one else holds a
++        // pointer to the object, so destruction is race-free.
++        //
++        // The lambda is intentionally empty: its capture is the only owner
++        // of the shared_ptr after the std::move below, and the capture's
++        // destructor (run when the queued event finishes) is what frees
++        // the commit. `noexcept` is safe — neither shared_ptr destruction
++        // nor any DrmCommit subclass destructor is expected to throw, and
++        // throwing from a queued slot would terminate() the process.
++        QMetaObject::invokeMethod(
++            this,
++            [held = std::move(deferred)]() noexcept {
++                // Empty by design — destruction happens via the capture.
++            },
++            Qt::QueuedConnection);
      }
  }
  
  bool DrmCommitThread::pageflipsPending()
  {
--    std::unique_lock lock(m_mutex);
+     std::unique_lock lock(m_mutex);
 -    return !m_commits.empty() || m_committed;
-+    std::unique_lock<std::mutex> lock(m_mutex);
 +    return !m_commits.empty() || static_cast<bool>(m_committed);
  }
  
@@ -2871,32 +3044,30 @@
 +    if (m_minVblankInterval <= std::chrono::nanoseconds::zero()) [[unlikely]] {
 +        return now + kDefaultFrameInterval;
 +    }
-+    if (m_lastPageflip.time_since_epoch().count() == 0) [[unlikely]] {
-+        return now + kDefaultFrameInterval;
-+    }
 +
 +    const auto elapsed = (now >= m_lastPageflip) ? (now - m_lastPageflip) : std::chrono::nanoseconds::zero();
 +    const uint64_t elapsedNs = static_cast<uint64_t>(elapsed.count());
 +    const uint64_t vblankNs = static_cast<uint64_t>(m_minVblankInterval.count());
-+
-+    if (vblankNs == 0) [[unlikely]] return now + kDefaultFrameInterval;
++    if (vblankNs == 0) [[unlikely]] {
++        return now + kDefaultFrameInterval;
++    }
 +
 +    uint64_t pageflipsSince = 0;
-+    if (m_vblankReciprocal > 0 && elapsedNs < (1ULL << 32)) [[likely]] {
-+        const __uint128_t product = static_cast<__uint128_t>(elapsedNs) * m_vblankReciprocal;
++    if (m_vblankReciprocal > 0 && elapsedNs < (uint64_t{1} << 40)) {
++        const unsigned __int128 product = static_cast<unsigned __int128>(elapsedNs) * m_vblankReciprocal;
 +        pageflipsSince = static_cast<uint64_t>(product >> m_vblankReciprocalShift);
 +    } else {
 +        pageflipsSince = elapsedNs / vblankNs;
 +    }
-+
 +    pageflipsSince = std::min(pageflipsSince, kMaxPageflipSpan);
-+    const auto flips = static_cast<TimePoint::duration::rep>(pageflipsSince + 1);
++
++    const auto flips = static_cast<int64_t>(pageflipsSince + 1);
 +    return m_lastPageflip + m_minVblankInterval * flips;
  }
  
  std::chrono::nanoseconds DrmCommitThread::safetyMargin() const
  {
-+    std::unique_lock<std::mutex> lock(m_mutex);
++    std::unique_lock lock(m_mutex);
      return m_safetyMargin;
  }
  
@@ -2907,7 +3078,7 @@
 -    std::unique_lock lock(m_mutex);
 -    m_ping = true;
 +    {
-+        std::unique_lock<std::mutex> lock(m_mutex);
++        std::unique_lock lock(m_mutex);
 +        m_ping.store(true, std::memory_order_release);
 +    }
      m_pong.notify_one();
@@ -3499,7 +3670,7 @@
      std::unique_ptr<DrmCommitThread> m_commitThread;
 
 --- /src/backends/drm/drm_pipeline.cpp	2026-02-28 15:07:27.429060591 +0100
-+++ /src/backends/drm/drm_pipeline.cpp	2026-05-13 15:11:07.288768254 +0100
++++ /src/backends/drm/drm_pipeline.cpp	2026-05-28 15:11:07.288768254 +0100
 @@ -1,16 +1,10 @@
  /*
      KWin - the KDE window manager
@@ -3745,13 +3916,8 @@
 -        if (m_pending.needsModesetProperties && !prepareAtomicModeset(partialUpdate.get())) {
 +        if (!fallbackLayer) [[unlikely]] {
 +            qCWarning(KWIN_DRM) << "No enabled fallback layer";
-             return Error::InvalidArguments;
-         }
--        m_next.needsModesetProperties = m_pending.needsModesetProperties = false;
--        m_commitThread->addCommit(std::move(partialUpdate));
--        return Error::None;
--    } else {
--        return presentLegacy(layersToUpdate, frame);
++            return Error::InvalidArguments;
++        }
 +
 +        DrmPlane *const fallbackPlane = fallbackLayer->plane();
 +        if (!fallbackPlane) [[unlikely]] {
@@ -3762,14 +3928,19 @@
 +            qCWarning(KWIN_DRM) << "Fallback layer preparation failed:" << static_cast<int>(err);
 +            return err;
 +        }
-     }
++    }
 +
 +    if (m_pending.needsModesetProperties) [[unlikely]] {
 +        if (!prepareAtomicModeset(partialUpdate.get())) {
 +            qCWarning(KWIN_DRM) << "prepareAtomicModeset failed";
-+            return Error::InvalidArguments;
-+        }
-+    }
+             return Error::InvalidArguments;
+         }
+-        m_next.needsModesetProperties = m_pending.needsModesetProperties = false;
+-        m_commitThread->addCommit(std::move(partialUpdate));
+-        return Error::None;
+-    } else {
+-        return presentLegacy(layersToUpdate, frame);
+     }
 +
 +    if (!partialUpdate->test()) [[unlikely]] {
 +        const int savedErrno = errno;
@@ -3869,7 +4040,7 @@
          for (DrmPipeline *pipeline : pipelines) {
              pipeline->m_pending.needsModeset = !withoutModeset;
              pipeline->m_pending.needsModesetProperties = true;
-@@ -154,43 +315,152 @@ DrmPipeline::Error DrmPipeline::commitPi
+@@ -154,71 +315,196 @@ DrmPipeline::Error DrmPipeline::commitPi
          return Error::None;
      }
      case CommitMode::CommitModeset: {
@@ -3907,140 +4078,128 @@
 +    Q_UNREACHABLE();
  }
  
- DrmPipeline::Error DrmPipeline::prepareAtomicCommit(DrmAtomicCommit *commit, CommitMode mode, const std::shared_ptr<OutputFrame> &frame)
+-DrmPipeline::Error DrmPipeline::prepareAtomicCommit(DrmAtomicCommit *commit, CommitMode mode, const std::shared_ptr<OutputFrame> &frame)
++DrmPipeline::Error DrmPipeline::prepareAtomicCommit(DrmAtomicCommit *commit, CommitMode mode,
++                                                  const std::shared_ptr<OutputFrame> &frame)
  {
 -    if (activePending()) {
 -        if (Error err = prepareAtomicPresentation(commit, frame); err != Error::None) {
+-            return err;
 +    if (!commit) [[unlikely]] {
 +        return Error::InvalidArguments;
 +    }
 +
-+    if (activePending()) [[likely]] {
-+        if (const Error err = prepareAtomicPresentation(commit, frame); err != Error::None) [[unlikely]] {
-             return err;
++    if (!activePending()) {
++        prepareAtomicDisable(commit);
++        return Error::None;
++    }
++
++    if (const Error err = prepareAtomicPresentation(commit, frame); err != Error::None) [[unlikely]] {
++        return err;
++    }
++
++    // Count enabled, plane-backed layers. The amdgpu priority reconciliation is
++    // ONLY valid for a genuine multi-plane full commit. For cursor-only / single
++    // plane updates we must program planes 1:1 exactly like upstream, otherwise
++    // async flips end up carrying primary-plane changes and the kernel rejects them.
++    int enabledCount = 0;
++    bool cursorOnly = true;
++    for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
++        if (!layer) [[unlikely]] { return Error::InvalidArguments; }
++        DrmPlane *plane = layer->plane();
++        if (!plane)  [[unlikely]] { return Error::InvalidArguments; }
++        if (!layer->isEnabled()) { continue; }
++        ++enabledCount;
++        if (!(plane->type.isValid() && plane->type.enumValue() == DrmPlane::TypeIndex::Cursor)) {
++            cursorOnly = false;
          }
 -        for (const auto &layer : m_pending.layers) {
 -            if (Error err = prepareAtomicPlane(commit, layer->plane(), layer, frame); err != Error::None) {
++    }
++    if (enabledCount == 0) [[unlikely]] {
++        return Error::InvalidArguments;
++    }
 +
-+        struct LayerInfo {
-+            DrmPipelineLayer *layer = nullptr;
-+            DrmPlane *plane = nullptr;
-+            QRect rect;
-+            ColorPipeline pipeline;
-+            int priority = 0;
-+        };
++    const bool useReconcile = gpu()->isAmdgpu() && enabledCount > 1 && !cursorOnly;
 +
-+        auto layerPriority =[](DrmPlane *plane) noexcept -> int {
-+            if (!plane || !plane->type.isValid()) {
-+                return 1;
-+            }
-+            switch (plane->type.enumValue()) {
-+            case DrmPlane::TypeIndex::Primary:
-+                return 2;
-+            case DrmPlane::TypeIndex::Overlay:
-+                return 1;
-+            case DrmPlane::TypeIndex::Cursor:
-+                return 0;
-+            }
-+            return 1;
-+        };
-+
-+        QVarLengthArray<LayerInfo, 16> enabled;
-+        enabled.reserve(m_pending.layers.size());
++    if (!useReconcile) {
++        // Upstream-equivalent straight programming.
 +        for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
-+            if (!layer) [[unlikely]] {
-+                return Error::InvalidArguments;
-+            }
 +            DrmPlane *plane = layer->plane();
-+            if (!plane) [[unlikely]] {
-+                return Error::InvalidArguments;
-+            }
 +            if (!layer->isEnabled()) {
-+                continue;
-+            }
-+            enabled.push_back(LayerInfo{
-+                .layer = layer,
-+                .plane = plane,
-+                .rect = layer->targetRect(),
-+                .pipeline = layer->colorPipeline(),
-+                .priority = layerPriority(plane)
-+            });
-+        }
-+
-+        if (enabled.isEmpty()) [[unlikely]] {
-+            return Error::InvalidArguments;
-+        }
-+
-+        QVarLengthArray<uint8_t, 16> disabled;
-+        disabled.resize(enabled.size());
-+        std::fill(disabled.begin(), disabled.end(), uint8_t{0});
-+
-+        if (gpu()->isAmdgpu()) {
-+            const int n = enabled.size();
-+            int disabledCount = 0;
-+            for (int i = 0; i < n; ++i) {
-+                for (int j = i + 1; j < n; ++j) {
-+                    if (enabled[i].pipeline == enabled[j].pipeline) {
-+                        continue;
-+                    }
-+                    if (!enabled[i].rect.intersects(enabled[j].rect)) {
-+                        continue;
-+                    }
-+                    const int drop = (enabled[i].priority < enabled[j].priority) ? i : j;
-+                    if (disabled[drop] == 0U) {
-+                        disabled[drop] = 1U;
-+                        ++disabledCount;
-+                    }
-+                }
-+            }
-+            if (disabledCount == n) {
-+                int best = 0;
-+                for (int i = 1; i < n; ++i) {
-+                    if (enabled[i].priority > enabled[best].priority) {
-+                        best = i;
-+                    }
-+                }
-+                disabled[best] = 0U;
-+            }
-+        }
-+
-+        for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
-+            if (!layer) [[unlikely]] {
-+                return Error::InvalidArguments;
-+            }
-+            DrmPlane *plane = layer->plane();
-+            if (!plane) [[unlikely]] {
-+                return Error::InvalidArguments;
-+            }
-+
-+            bool isDisabled = false;
-+            for (int i = 0; i < enabled.size(); ++i) {
-+                if (enabled[i].layer == layer && disabled[i] != 0U) {
-+                    isDisabled = true;
-+                    break;
-+                }
-+            }
-+
-+            if (isDisabled) {
 +                plane->disable(commit);
 +                continue;
 +            }
-+            if (const Error err = prepareAtomicPlane(commit, plane, layer, frame); err != Error::None) [[unlikely]] {
++            if (const Error err = prepareAtomicPlane(commit, plane, layer, frame);
++                err != Error::None) [[unlikely]] {
                  return err;
              }
          }
 -        if (mode == CommitMode::TestAllowModeset || mode == CommitMode::CommitModeset || m_pending.needsModesetProperties) {
+-            if (!prepareAtomicModeset(commit)) {
+-                return Error::InvalidArguments;
++    } else {
++        // AMD: keep the highest-priority overlapping plane set. Priority:
++        // Primary(2) > Overlay(1) > Cursor(0); never drop Primary or Cursor.
++        struct Info { DrmPipelineLayer *layer; DrmPlane *plane; QRect rect; int prio; };
++        auto prioOf = [](DrmPlane *p) -> int {
++            if (!p || !p->type.isValid()) return 1;
++            switch (p->type.enumValue()) {
++            case DrmPlane::TypeIndex::Primary: return 2;
++            case DrmPlane::TypeIndex::Overlay: return 1;
++            case DrmPlane::TypeIndex::Cursor:  return 0;
++            }
++            return 1;
++        };
 +
-+        const bool needsModesetCommit = (mode != CommitMode::Test) &&
-+                                        (mode == CommitMode::CommitModeset || m_pending.needsModesetProperties);
-+        if (needsModesetCommit) [[unlikely]] {
-             if (!prepareAtomicModeset(commit)) {
-                 return Error::InvalidArguments;
++        QVarLengthArray<Info, 8> en;
++        for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
++            if (!layer->isEnabled()) continue;
++            en.push_back({layer, layer->plane(), layer->targetRect(), prioOf(layer->plane())});
++        }
++
++        QVarLengthArray<uint8_t, 8> dropped(en.size(), 0);
++        for (int i = 0; i < en.size(); ++i) {
++            if (dropped[i] || en[i].prio == 0 || en[i].prio == 2) continue; // keep cursor+primary
++            for (int j = 0; j < en.size(); ++j) {
++                if (i == j || dropped[j]) continue;
++                if (!en[i].rect.intersects(en[j].rect)) continue;
++                // drop the lower-priority overlay on overlap
++                if (en[i].prio < en[j].prio) { dropped[i] = 1; break; }
++                else if (en[j].prio < en[i].prio && en[j].prio == 1) { dropped[j] = 1; }
++            }
++        }
++
++        // Program: disabled or dropped → disable; otherwise prepare normally.
++        for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
++            DrmPlane *plane = layer->plane();
++            if (!layer->isEnabled()) { plane->disable(commit); continue; }
++            bool drop = false;
++            for (int i = 0; i < en.size(); ++i) {
++                if (en[i].layer == layer) { drop = dropped[i]; break; }
++            }
++            if (drop) { plane->disable(commit); continue; }
++            if (const Error err = prepareAtomicPlane(commit, plane, layer, frame);
++                err != Error::None) [[unlikely]] {
++                return err;
              }
-@@ -198,27 +468,61 @@ DrmPipeline::Error DrmPipeline::prepareA
-     } else {
-         prepareAtomicDisable(commit);
+         }
+-    } else {
+-        prepareAtomicDisable(commit);
      }
++
++    const bool needsModesetCommit = (mode != CommitMode::Test)
++        && (mode == CommitMode::CommitModeset || m_pending.needsModesetProperties);
++    if (needsModesetCommit) [[unlikely]] {
++        if (!prepareAtomicModeset(commit)) {
++            return Error::InvalidArguments;
++        }
++    } else if (mode == CommitMode::TestAllowModeset) {
++        // Modeset tests must include the modeset props (upstream behaviour).
++        if (!prepareAtomicModeset(commit)) {
++            return Error::InvalidArguments;
++        }
++    }
 +
      return Error::None;
  }
@@ -4064,9 +4223,8 @@
 +    if (m_pending.crtc->vrrEnabled.isValid() && !isAsync) {
 +        const bool shouldEnableVrr = isAdaptiveMode(m_pending.presentationMode) && !m_pending.needsModeset;
 +        commit->setVrr(m_pending.crtc, shouldEnableVrr);
-     }
- 
--    const ColorPipeline &colorPipeline = m_pending.crtcColorPipeline;
++    }
++
 +    if (m_pending.layers.isEmpty()) [[unlikely]] {
 +        return Error::InvalidArguments;
 +    }
@@ -4086,8 +4244,9 @@
 +
 +    if (!referenceLayer) [[unlikely]] {
 +        return Error::InvalidArguments;
-+    }
-+
+     }
+ 
+-    const ColorPipeline &colorPipeline = m_pending.crtcColorPipeline;
 +    const ColorPipeline &layerPipeline = referenceLayer->colorPipeline();
 +    const ColorPipeline &crtcPipeline = m_pending.crtcColorPipeline;
 +    const ColorPipeline mergedPipeline = layerPipeline.isIdentity()
@@ -4105,7 +4264,7 @@
              return Error::InvalidArguments;
          }
      }
-@@ -226,217 +530,294 @@ DrmPipeline::Error DrmPipeline::prepareA
+@@ -226,217 +512,310 @@ DrmPipeline::Error DrmPipeline::prepareA
      return Error::None;
  }
  
@@ -4142,11 +4301,10 @@
 +    return prepareAtomicPlanePrimary(commit, plane, layer, fb, frame);
 +}
 +
-+DrmPipeline::Error DrmPipeline::prepareAtomicPlaneCursor(DrmAtomicCommit *commit,
-+                                                         DrmPlane *plane,
-+                                                         DrmPipelineLayer *layer,
-+                                                         const std::shared_ptr<DrmFramebuffer> &fb,
-+                                                         const std::shared_ptr<OutputFrame> &frame)
++DrmPipeline::Error DrmPipeline::prepareAtomicPlaneCursor(DrmAtomicCommit *commit, DrmPlane *plane,
++                                                       DrmPipelineLayer *layer,
++                                                       const std::shared_ptr<DrmFramebuffer> &fb,
++                                                       const std::shared_ptr<OutputFrame> &frame)
 +{
 +    if (!commit || !plane || !layer || !fb || !m_pending.crtc) [[unlikely]] {
          return Error::InvalidArguments;
@@ -4160,40 +4318,57 @@
 -        commit->addEnum(plane->rotation, planeTransform);
 -    } else if (planeTransform != DrmPlane::Transformation::Rotate0) {
 +
-+    const QRect sourceRect = sanitizeSourceRect(layer->sourceRect());
-+    const QRect targetRect = layer->targetRect();
-+
-+    if (!validateSourceRect(sourceRect)) [[unlikely]] {
-+        qCWarning(KWIN_DRM) << "Invalid cursor source geometry:" << sourceRect
-+                           << "from" << layer->sourceRect();
++    // Cursor planes are NOT scalable: CRTC_W/H must equal the framebuffer size,
++    // and SRC must cover the whole buffer. Derive everything from the buffer.
++    const QSize bufferSize = fb->buffer() ? fb->buffer()->size() : QSize();
++    if (bufferSize.isEmpty()) [[unlikely]] {
++        qCWarning(KWIN_DRM) << "Cursor framebuffer has invalid size";
          return Error::InvalidArguments;
      }
 -    commit->addProperty(plane->crtcId, m_pending.crtc->id());
 +
++    const QRect targetRect = layer->targetRect();
 +    if (!validateTargetRect(targetRect)) [[unlikely]] {
-+        qCWarning(KWIN_DRM) << "Invalid cursor target geometry:" << targetRect;
++        qCWarning(KWIN_DRM) << "Invalid cursor target rect" << targetRect;
 +        return Error::InvalidArguments;
 +    }
 +
-+    plane->set(commit, sourceRect, targetRect);
++    // Force the canonical cursor geometry: src = full buffer, dst = buffer-sized.
++    const QRect srcRect(0, 0, bufferSize.width(), bufferSize.height());
++    const QRect dstRect(targetRect.topLeft(), bufferSize);
++
++    plane->set(commit, srcRect, dstRect);
      commit->addBuffer(plane, fb, frame);
 -    plane->set(commit, layer->sourceRect().toRect(), layer->targetRect());
 +    commit->addProperty(plane->crtcId, m_pending.crtc->id());
 +
++    // Hotspot: clamp to the property's real range AND to the buffer extents.
      if (plane->vmHotspotX.isValid() && plane->vmHotspotY.isValid()) {
 -        commit->addProperty(plane->vmHotspotX, std::round(layer->hotspot().x()));
 -        commit->addProperty(plane->vmHotspotY, std::round(layer->hotspot().y()));
 +        const QPointF hotspot = layer->hotspot();
-+        const double hx = hotspot.x();
-+        const double hy = hotspot.y();
-+        const uint64_t hxClamped = (hx < 0.0) ? 0 : ((hx > 32767.0) ? 32767 : static_cast<uint64_t>(std::lround(hx)));
-+        const uint64_t hyClamped = (hy < 0.0) ? 0 : ((hy > 32767.0) ? 32767 : static_cast<uint64_t>(std::lround(hy)));
-+        commit->addProperty(plane->vmHotspotX, hxClamped);
-+        commit->addProperty(plane->vmHotspotY, hyClamped);
++        const auto clampHotspot = [](double v, uint64_t lo, uint64_t hi, int extent) -> uint64_t {
++            long r = std::lround(v);
++            if (r < 0) r = 0;
++            if (r > extent) r = extent;
++            uint64_t u = static_cast<uint64_t>(r);
++            if (u < lo) u = lo;
++            if (u > hi) u = hi;
++            return u;
++        };
++        commit->addProperty(plane->vmHotspotX,
++                           clampHotspot(hotspot.x(), plane->vmHotspotX.minValue(),
++                                        plane->vmHotspotX.maxValue(), bufferSize.width()));
++        commit->addProperty(plane->vmHotspotY,
++                           clampHotspot(hotspot.y(), plane->vmHotspotY.minValue(),
++                                        plane->vmHotspotY.maxValue(), bufferSize.height()));
 +    }
 +
-+    if (plane->rotation.isValid()) {
-+        commit->addEnum(plane->rotation, DrmPlane::Transformations{DrmPlane::Transformation::Rotate0});
++    // Only program rotation when the plane actually exposes the Rotate0 enum.
++    if (plane->rotation.isValid()
++        && plane->rotation.hasEnum(DrmPlane::Transformation::Rotate0)) {
++        commit->addEnum(plane->rotation,
++                       DrmPlane::Transformations{DrmPlane::Transformation::Rotate0});
 +    }
 +
 +    return Error::None;
@@ -4526,7 +4701,8 @@
 -        m_pending.overscan = 128 / aspectRatio;
 +    if (!m_pending.mode) [[unlikely]] {
 +        return 0;
-+    }
+     }
+-    return hborder;
 +    const QSize size = m_pending.mode->size();
 +    const int height = size.height();
 +    if (height <= 0) [[unlikely]] {
@@ -4538,8 +4714,7 @@
 +    if (hborderF > 128.0f) [[unlikely]] {
 +        hborderF = 128.0f;
 +        m_pending.overscan = static_cast<uint32_t>(std::lround(128.0f / aspectRatio));
-     }
--    return hborder;
++    }
 +    return static_cast<uint32_t>(std::lround(hborderF));
  }
  
@@ -4548,7 +4723,7 @@
  {
      switch (errno) {
      case EINVAL:
-@@ -454,81 +835,110 @@ DrmPipeline::Error DrmPipeline::errnoToE
+@@ -454,81 +833,121 @@ DrmPipeline::Error DrmPipeline::errnoToE
  
  bool DrmPipeline::presentAsync(OutputLayer *layer, std::optional<std::chrono::nanoseconds> allowedVrrDelay)
  {
@@ -4560,6 +4735,7 @@
 -    // until Broadcom fixes hw cursor issues with vmwgfx. Otherwise
 -    // the cursor is missing.
 -    if (gpu()->isVmwgfx()) {
++    // vmwgfx hardware cursor is broken; force software cursor there.
 +    if (gpu()->isVmwgfx()) [[unlikely]] {
          return false;
      }
@@ -4587,19 +4763,29 @@
          return setCursorLegacy(drmLayer);
      }
 +
++    // MANDATORY: validate the FULL pipeline state (all planes, incl. pending
++    // commits) before queueing the partial update. This is what upstream does;
++    // it ensures a failing cursor state is rejected here so the caller can
++    // disable the plane, instead of being queued and silently dropped later.
++    if (commitPipelinesAtomic({this}, CommitMode::Test, nullptr, {}) != Error::None) [[unlikely]] {
++        return false;
++    }
++
 +    auto partialUpdate = std::make_unique<DrmAtomicCommit>(QList<DrmPipeline *>{this});
 +    partialUpdate->setPresentationMode(m_pending.presentationMode);
 +
-+    if (prepareAtomicPlane(partialUpdate.get(), plane, drmLayer, std::shared_ptr<OutputFrame>{}) != Error::None) [[unlikely]] {
-+        qCDebug(KWIN_DRM) << "presentAsync: plane preparation failed";
++    if (prepareAtomicPlane(partialUpdate.get(), plane, drmLayer,
++                          std::shared_ptr<OutputFrame>{}) != Error::None) [[unlikely]] {
++        qCDebug(KWIN_DRM) << "Failed to prepare async cursor plane";
 +        return false;
 +    }
 +
 +    partialUpdate->setAllowedVrrDelay(allowedVrrDelay);
 +
++    // Final guard: only the partial (cursor) state, with pending commits applied.
 +    if (!partialUpdate->test()) [[unlikely]] {
 +        const int savedErrno = errno;
-+        qCDebug(KWIN_DRM) << "presentAsync: partial atomic test failed, errno:" << savedErrno << strerror(savedErrno);
++        qCDebug(KWIN_DRM) << "Async cursor test failed:" << strerror(savedErrno);
 +        return false;
 +    }
 +
@@ -4695,7 +4881,7 @@
  {
      return m_pending.crtc && m_pending.mode && m_pending.active;
  }
-@@ -538,37 +948,37 @@ void DrmPipeline::revertPendingChanges()
+@@ -538,37 +957,37 @@ void DrmPipeline::revertPendingChanges()
      m_pending = m_next;
  }
  
@@ -4740,7 +4926,7 @@
  {
      return m_pending.enabled;
  }
-@@ -578,27 +988,27 @@ QList<DrmPipelineLayer *> DrmPipeline::l
+@@ -578,27 +997,27 @@ QList<DrmPipelineLayer *> DrmPipeline::l
      return m_pending.layers;
  }
  
@@ -4773,7 +4959,7 @@
  {
      return m_pending.iccProfile;
  }
-@@ -611,6 +1021,9 @@ void DrmPipeline::setCrtc(DrmCrtc *crtc)
+@@ -611,6 +1030,9 @@ void DrmPipeline::setCrtc(DrmCrtc *crtc)
  void DrmPipeline::setMode(const std::shared_ptr<DrmConnectorMode> &mode)
  {
      m_pending.mode = mode;
@@ -4783,7 +4969,7 @@
  }
  
  void DrmPipeline::setActive(bool active)
-@@ -626,8 +1039,10 @@ void DrmPipeline::setEnable(bool enable)
+@@ -626,8 +1048,10 @@ void DrmPipeline::setEnable(bool enable)
  void DrmPipeline::setLayers(const QList<DrmPipelineLayer *> &layers)
  {
      m_pending.layers = layers;
@@ -4796,7 +4982,7 @@
      }
  }
  
-@@ -678,54 +1093,56 @@ void DrmPipeline::setIccProfile(const st
+@@ -678,54 +1102,56 @@ void DrmPipeline::setIccProfile(const st
  
  std::shared_ptr<DrmBlob> DrmPipeline::createHdrMetadata(TransferFunction::Type transferFunction) const
  {
@@ -4878,7 +5064,7 @@
  }
 
 --- a/src/core/renderloop_p.h	2025-10-06 01:22:20.420848975 +0200
-+++ b/src/core/renderloop_p.h	2026-05-10 01:34:39.090533060 +0200
++++ b/src/core/renderloop_p.h	2026-05-20 01:34:39.090533060 +0200
 @@ -1,6 +1,6 @@
  /*
 -    SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
@@ -4888,7 +5074,7 @@
      SPDX-License-Identifier: GPL-2.0-or-later
  */
  
-@@ -11,52 +11,238 @@
+@@ -11,52 +11,239 @@
  #include "renderloop.h"
  
  #include <QBasicTimer>
@@ -5065,6 +5251,7 @@
 +    uint16_t pendingModeCounter_{0};
 +    uint16_t oscillationCooldownCounter_{0};
 +    uint16_t interactiveGraceFrames_{0};
++    uint16_t vrrModeSwitchDebounce_{0};
 +
 +    uint8_t reciprocalShift64{0};
 +    uint8_t consecutiveErrorCount{0};
@@ -5155,7 +5342,7 @@
  } // namespace KWin
 
 --- a/src/core/renderloop.h	2025-10-06 01:22:20.420848975 +0200
-+++ b/src/core/renderloop.h	2026-04-23 01:34:39.090533060 +0200
++++ b/src/core/renderloop.h	2026-05-20 01:34:39.090533060 +0200
 @@ -1,14 +1,15 @@
  /*
 -    SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
@@ -5176,7 +5363,7 @@
  
  namespace KWin
  {
-@@ -19,114 +20,86 @@ class Item;
+@@ -19,114 +20,87 @@ class Item;
  class BackendOutput;
  class OutputLayer;
  
@@ -5199,13 +5386,14 @@
 +
 +enum class VrrDecisionReason : uint8_t {
 +    None = 0,
-+    UserPolicy,
-+    ExplicitHint,
-+    FilmCadence,
-+    InteractiveGrace,
-+    OscillationGuard,
-+    BelowVrrFloor,
-+    AmbiguousKeepCurrent,
++    UserPolicy = 1,
++    ExplicitHint = 2,
++    FilmCadence = 3,
++    InteractiveGrace = 4,
++    OscillationGuard = 5,
++    BelowVrrFloor = 6,
++    AmbiguousKeepCurrent = 7,
++    VideoCadence = 8,
 +};
 +
 +struct KWIN_EXPORT VrrCapabilities {
@@ -5345,7 +5533,7 @@
 +Q_DECLARE_METATYPE(KWin::PresentFeedback)
 
 --- a/src/core/renderloop.cpp	2025-10-06 01:22:20.420848975 +0200
-+++ b/src/core/renderloop.cpp	2026-05-13 01:34:39.090533060 +0200
++++ b/src/core/renderloop.cpp	2026-05-20 01:34:39.090533060 +0200
 @@ -1,7 +1,8 @@
  /*
 -    SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
@@ -5358,7 +5546,7 @@
  */
  
  #include "renderloop.h"
-@@ -9,225 +10,1482 @@
+@@ -9,225 +10,1522 @@
  #include "options.h"
  #include "renderloop_p.h"
  #include "scene/surfaceitem.h"
@@ -5400,15 +5588,15 @@
 +constexpr int64_t kMaxReasonableIntervalNs = 100'000'000;
 +constexpr int64_t kMinReasonableIntervalNs = 2'000'000;
 +
-+constexpr uint16_t kVrrToVsyncStabilityFrames = 4;
-+constexpr uint16_t kVsyncToVrrStabilityFrames = 2;
-+constexpr uint16_t kMinModeDwellFrames = 2;
-+constexpr uint16_t kOscillationCooldownFrames = 120;
++constexpr uint16_t kVrrToVsyncStabilityFrames = 8;
++constexpr uint16_t kVsyncToVrrStabilityFrames = 4;
++constexpr uint16_t kMinModeDwellFrames = 4;
++constexpr uint16_t kOscillationCooldownFrames = 240;
 +constexpr uint16_t kInteractiveGraceFrames = 90;
 +constexpr uint16_t kInteractiveTailFrames = 45;
 +
 +constexpr auto kVrrControlThreshold = 25ms;
-+constexpr auto kOscillationWindow = 500ms;
++constexpr auto kOscillationWindow = 1000ms;
 +constexpr uint8_t kOscillationThreshold = 10;
 +constexpr int kMaxTimerDelayMs = 16000;
 +
@@ -5422,6 +5610,8 @@
 +constexpr int64_t kCadenceNoiseFloorNs = 125'000;
 +constexpr int64_t kFilm24Ns = 41'666'666;
 +constexpr int64_t kFilm25Ns = 40'000'000;
++constexpr int64_t kVideo30Ns = 33'333'333;
++constexpr int64_t kVideo60Ns = 16'666'666;
 +
 +constexpr int64_t kStalledFrameMinTimeoutNs = 12'000'000;
 +constexpr int64_t kStalledFrameMaxTimeoutNs = 120'000'000;
@@ -5471,17 +5661,20 @@
 +
 +[[gnu::always_inline, gnu::const]]
 +inline constexpr int64_t fastAbs64(int64_t v) noexcept
-+{
+ {
 +    const int64_t mask = v >> 63;
 +    return (v ^ mask) - mask;
 +}
-+
+ 
+-RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop)
 +[[gnu::always_inline, gnu::const]]
 +inline constexpr bool isVrrMode(KWin::PresentationMode mode) noexcept
-+{
+ {
+-    return loop->d.get();
 +    return mode == KWin::PresentationMode::AdaptiveSync || mode == KWin::PresentationMode::AdaptiveAsync;
-+}
-+
+ }
+ 
+-static const bool s_printDebugInfo = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0;
 +[[gnu::always_inline]]
 +inline int64_t steadyNowNs() noexcept
 +{
@@ -5489,7 +5682,8 @@
 +               std::chrono::steady_clock::now().time_since_epoch())
 +        .count();
 +}
-+
+ 
+-RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, BackendOutput *output)
 +[[gnu::always_inline, gnu::const]]
 +inline constexpr uint64_t ceilDivU64Reciprocal(uint64_t n, uint64_t d, uint64_t recip, uint8_t shift) noexcept
 +{
@@ -5557,6 +5751,21 @@
 +}
 +
 +[[gnu::always_inline, gnu::const]]
++inline constexpr bool isVideoCadenceNs(int64_t intervalNs) noexcept
++{
++    if (intervalNs <= 0) {
++        return false;
++    }
++
++    // Treat film and ~30 fps as strong "video-like" cadence.
++    // Intentionally do not classify 60 fps here to avoid forcing VSync for capped games.
++    constexpr int64_t tolerance = 2'500'000;
++    return (fastAbs64(intervalNs - kVideo30Ns) <= tolerance) ||
++           nearIntervalNs<kFilm24Ns, 350'000>(intervalNs) ||
++           nearIntervalNs<kFilm25Ns, 300'000>(intervalNs);
++}
++
++[[gnu::always_inline, gnu::const]]
 +inline KWin::PresentationMode adaptiveModeForState(const KWin::VrrStateCache::State &state) noexcept
 +{
 +    const bool validHint = state.valid != 0U;
@@ -5573,15 +5782,13 @@
 +
 +[[gnu::always_inline, gnu::const]]
 +inline constexpr bool contentIsVideoLike(KWin::VrrContentHint hint) noexcept
- {
++{
 +    return hint == KWin::VrrContentHint::Video || hint == KWin::VrrContentHint::Film || hint == KWin::VrrContentHint::ForceVsync;
 +}
- 
--RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop)
++
 +[[gnu::always_inline]]
 +inline int effectiveMaxPendingFrames(const KWin::RenderLoopPrivate *d, bool vrrActive) noexcept
- {
--    return loop->d.get();
++{
 +    const int configuredMax = d->maxPendingFrameCount;
 +    if (!vrrActive) [[likely]] {
 +        return configuredMax;
@@ -5622,12 +5829,10 @@
 +    }
 +
 +    return (predictedNs * 5) >= (vblankNs * 2) ? maxPending : 1;
- }
- 
--static const bool s_printDebugInfo = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0;
++}
++
 +} // namespace
- 
--RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, BackendOutput *output)
++
 +namespace KWin
 +{
 +
@@ -5653,12 +5858,11 @@
 +    lastIntervalNs_ = 0;
 +    cadenceStability_ = 128;
 +    tripleBufferHysteresisCounter = 0;
- }
- 
--void RenderLoopPrivate::scheduleNextRepaint()
++    vrrModeSwitchDebounce_ = 0;
++}
++
 +RenderLoopPrivate::~RenderLoopPrivate()
- {
--    if (kwinApp()->isTerminating() || compositeTimer.isActive() || preparingNewFrame) {
++{
 +    disconnectVrrSignals();
 +}
 +
@@ -5671,9 +5875,8 @@
 +        tripleBufferEnterThresholdNs = 0;
 +        tripleBufferExitThresholdNs = 0;
 +        vrrControlDelayMs = 0;
-         return;
-     }
--    scheduleRepaint(nextPresentationTimestamp);
++        return;
++    }
 +
 +    constexpr uint8_t shift = 63;
 +    reciprocalShift64 = shift;
@@ -5709,50 +5912,13 @@
 +        static_cast<uint64_t>(kMaxTimerDelayMs)));
  }
  
--void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp)
+-void RenderLoopPrivate::scheduleNextRepaint()
 +void RenderLoopPrivate::armStalledFrameTimer() noexcept
- {
--    pendingReschedule = false;
--    const std::chrono::nanoseconds vblankInterval(1'000'000'000'000ull / refreshRate);
--    const std::chrono::nanoseconds currentTime(std::chrono::steady_clock::now().time_since_epoch());
++{
 +    if (kwinApp()->isTerminating() || inhibitCount != 0) {
 +        return;
 +    }
- 
--    // Estimate when it's a good time to perform the next compositing cycle.
--    // the 1ms on top of the safety margin is required for timer and scheduler inaccuracies
--    std::chrono::nanoseconds expectedCompositingTime = std::min(renderJournal.result() + safetyMargin + 1ms, 2 * vblankInterval);
--
--    if (presentationMode == PresentationMode::VSync) {
--        // normal presentation: pageflips only happen at vblank
--        const uint64_t pageflipsSince = std::max<int64_t>((currentTime - lastPresentationTimestamp) / vblankInterval, 0);
--        if (pageflipsSince > 100) {
--            // if it's been a while since the last frame, the GPU is likely in a low power state and render time will be increased
--            // -> take that into account and start compositing very early
--            expectedCompositingTime = std::max(vblankInterval - 1us, expectedCompositingTime);
--        }
--        const uint64_t pageflipsSinceLastToTarget = std::max<int64_t>(std::round((lastTargetTimestamp - lastPresentationTimestamp).count() / double(vblankInterval.count())), 0);
--        uint64_t pageflipsInAdvance = std::min<int64_t>(expectedCompositingTime / vblankInterval + 1, maxPendingFrameCount);
--
--        // switching from double to triple buffering causes a frame drop
--        // -> apply some amount of hysteresis to avoid switching back and forth constantly
--        if (pageflipsInAdvance > 1) {
--            // immediately switch to triple buffering when needed
--            wasTripleBuffering = true;
--            doubleBufferingCounter = 0;
--        } else if (wasTripleBuffering) {
--            // but wait a bit before switching back to double buffering
--            if (doubleBufferingCounter >= 10) {
--                wasTripleBuffering = false;
--            } else if (expectedCompositingTime >= vblankInterval * 0.95) {
--                // also don't switch back if render times are just barely enough for double buffering
--                pageflipsInAdvance = 2;
--                doubleBufferingCounter = 0;
--                expectedCompositingTime = vblankInterval;
--            } else {
--                doubleBufferingCounter++;
--                pageflipsInAdvance = 2;
--                expectedCompositingTime = vblankInterval;
++
 +    const bool vrrActive = isVrrMode(presentationMode);
 +    const int maxPending = effectiveMaxPendingFrames(this, vrrActive);
 +    if (!preparingNewFrame && pendingFrameCount < maxPending) {
@@ -5790,7 +5956,8 @@
 +}
 +
 +void RenderLoopPrivate::disarmStalledFrameTimer() noexcept
-+{
+ {
+-    if (kwinApp()->isTerminating() || compositeTimer.isActive() || preparingNewFrame) {
 +    stalledFrameTimer.stop();
 +    stalledFrameTimerMs_ = -1;
 +    stalledFrameTimeoutCount_ = 0;
@@ -5803,8 +5970,9 @@
 +
 +    if (kwinApp()->isTerminating() || inhibitCount != 0) {
 +        stalledFrameTimeoutCount_ = 0;
-+        return;
-+    }
+         return;
+     }
+-    scheduleRepaint(nextPresentationTimestamp);
 +
 +    const bool vrrActive = isVrrMode(presentationMode);
 +    const int maxPending = effectiveMaxPendingFrames(this, vrrActive);
@@ -5836,16 +6004,54 @@
 +
 +    pendingReschedule = true;
 +    scheduleNextRepaint();
-+}
-+
+ }
+ 
+-void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp)
 +void RenderLoopPrivate::initializeVrrCapabilities()
-+{
+ {
+-    pendingReschedule = false;
+-    const std::chrono::nanoseconds vblankInterval(1'000'000'000'000ull / refreshRate);
+-    const std::chrono::nanoseconds currentTime(std::chrono::steady_clock::now().time_since_epoch());
 +    if (!output) [[unlikely]] {
 +        vrrCapable = false;
 +        vrrEnabled = false;
 +        return;
 +    }
-+
+ 
+-    // Estimate when it's a good time to perform the next compositing cycle.
+-    // the 1ms on top of the safety margin is required for timer and scheduler inaccuracies
+-    std::chrono::nanoseconds expectedCompositingTime = std::min(renderJournal.result() + safetyMargin + 1ms, 2 * vblankInterval);
+-
+-    if (presentationMode == PresentationMode::VSync) {
+-        // normal presentation: pageflips only happen at vblank
+-        const uint64_t pageflipsSince = std::max<int64_t>((currentTime - lastPresentationTimestamp) / vblankInterval, 0);
+-        if (pageflipsSince > 100) {
+-            // if it's been a while since the last frame, the GPU is likely in a low power state and render time will be increased
+-            // -> take that into account and start compositing very early
+-            expectedCompositingTime = std::max(vblankInterval - 1us, expectedCompositingTime);
+-        }
+-        const uint64_t pageflipsSinceLastToTarget = std::max<int64_t>(std::round((lastTargetTimestamp - lastPresentationTimestamp).count() / double(vblankInterval.count())), 0);
+-        uint64_t pageflipsInAdvance = std::min<int64_t>(expectedCompositingTime / vblankInterval + 1, maxPendingFrameCount);
+-
+-        // switching from double to triple buffering causes a frame drop
+-        // -> apply some amount of hysteresis to avoid switching back and forth constantly
+-        if (pageflipsInAdvance > 1) {
+-            // immediately switch to triple buffering when needed
+-            wasTripleBuffering = true;
+-            doubleBufferingCounter = 0;
+-        } else if (wasTripleBuffering) {
+-            // but wait a bit before switching back to double buffering
+-            if (doubleBufferingCounter >= 10) {
+-                wasTripleBuffering = false;
+-            } else if (expectedCompositingTime >= vblankInterval * 0.95) {
+-                // also don't switch back if render times are just barely enough for double buffering
+-                pageflipsInAdvance = 2;
+-                doubleBufferingCounter = 0;
+-                expectedCompositingTime = vblankInterval;
+-            } else {
+-                doubleBufferingCounter++;
+-                pageflipsInAdvance = 2;
+-                expectedCompositingTime = vblankInterval;
 +    vrrCapable = output->capabilities().testFlag(BackendOutput::Capability::Vrr);
 +    const auto config = KSharedConfig::openConfig(QStringLiteral("kwinrc"));
 +    const auto group = config->group(QStringLiteral("VRR"));
@@ -5943,8 +6149,8 @@
 +        if (trackedWindow_ != nullptr) {
 +            if (trackedWindow_->surfaceItem() != trackedSurfaceItem_.data()) {
 +                vrrStateDirty_ = true;
-+            }
-+        }
+             }
+         }
 +        if (!vrrStateDirty_) {
 +            return;
 +        }
@@ -5962,8 +6168,8 @@
 +        if (active != nullptr && active->isFullScreen()) {
 +            if (LogicalOutput *const logical = ws->findOutput(output)) {
 +                eligible = active->isOnOutput(logical);
-             }
-         }
++            }
++        }
 +    }
 +
 +    if (!eligible) {
@@ -6165,6 +6371,7 @@
 +    const auto now = std::chrono::steady_clock::now();
 +    lastModeSwitch = now;
 +    modeDwellCounter_ = 0;
++    vrrModeSwitchDebounce_ = 0;
 +
 +    modeSwitchHistory_[modeSwitchHistoryHead_] = now;
 +    modeSwitchHistoryHead_ = static_cast<uint8_t>((modeSwitchHistoryHead_ + 1U) & (kModeSwitchHistorySize - 1U));
@@ -6292,13 +6499,27 @@
 +    }
 +
 +    const int64_t vblankNs = static_cast<int64_t>(cachedVblankIntervalNs);
++    const bool activeWindowControls = q->activeWindowControlsVrrRefreshRate();
++
++    const bool unhintedLikelyVideo =
++        (activeContentHint_ == VrrContentHint::Unknown) &&
++        !validHint &&
++        !activeWindowControls;
++
++    if (unhintedLikelyVideo &&
++        isVideoCadenceNs(lastIntervalNs_) &&
++        cadenceStability_ > kCadenceStableThreshold) {
++        lastDecisionReason_ = VrrDecisionReason::VideoCadence;
++        return PresentationMode::VSync;
++    }
++
 +    if (cadenceStability_ <= kCadenceUnstableThreshold && lastIntervalNs_ >= (vblankNs * 4)) {
 +        lastDecisionReason_ = VrrDecisionReason::AmbiguousKeepCurrent;
 +        return presentationMode;
 +    }
 +
 +    if (!validHint && isUnhintedFilmCadenceNs(lastIntervalNs_, cadenceStability_) && isBelowVrrFloor()) [[unlikely]] {
-+        lastDecisionReason_ = VrrDecisionReason::FilmCadence;
++        lastDecisionReason_ = VrrDecisionReason::BelowVrrFloor;
 +        return PresentationMode::VSync;
 +    }
 +
@@ -6308,6 +6529,13 @@
 +
 +bool RenderLoopPrivate::shouldSwitchMode(PresentationMode target) noexcept
 +{
++    if (vrrModeSwitchDebounce_ > 0) {
++        --vrrModeSwitchDebounce_;
++        if (vrrModeSwitchDebounce_ > 0) {
++            return false;
++        }
++    }
++
 +    if (oscillationCooldownCounter_ > 0U) {
 +        --oscillationCooldownCounter_;
 +        if (oscillationCooldownCounter_ == 0U) {
@@ -6336,7 +6564,15 @@
 +        lastStableMode = target;
 +        return true;
 +    }
-+
+ 
+-        if (compositeTimer.isActive()) {
+-            // we already scheduled this frame, but we got a new timestamp
+-            // which might require starting to composite earlier than we planned
+-            // It's important here that we do not change the targeted vblank interval,
+-            // otherwise with a pessimistic compositing time estimation we might
+-            // unnecessarily drop frames
+-            const uint32_t intervalsSinceLastTimestamp = std::max<int32_t>(std::round((nextPresentationTimestamp - lastPresentationTimestamp).count() / double(vblankInterval.count())), 0);
+-            nextPresentationTimestamp = lastPresentationTimestamp + intervalsSinceLastTimestamp * vblankInterval;
 +    if (modeDwellCounter_ < kMinModeDwellFrames) {
 +        return false;
 +    }
@@ -6366,15 +6602,7 @@
 +    }
 +
 +    uint16_t threshold = exitingToVsync ? kVrrToVsyncStabilityFrames : kVsyncToVrrStabilityFrames;
- 
--        if (compositeTimer.isActive()) {
--            // we already scheduled this frame, but we got a new timestamp
--            // which might require starting to composite earlier than we planned
--            // It's important here that we do not change the targeted vblank interval,
--            // otherwise with a pessimistic compositing time estimation we might
--            // unnecessarily drop frames
--            const uint32_t intervalsSinceLastTimestamp = std::max<int32_t>(std::round((nextPresentationTimestamp - lastPresentationTimestamp).count() / double(vblankInterval.count())), 0);
--            nextPresentationTimestamp = lastPresentationTimestamp + intervalsSinceLastTimestamp * vblankInterval;
++
 +    if (exitingToVsync) {
 +        if (activeContentHint_ == VrrContentHint::ForceVsync) {
 +            threshold = 1U;
@@ -6407,9 +6635,11 @@
 -            // TODO read minimum refresh rate from the EDID and take it into account here
 -            nextPresentationTimestamp = std::max(currentTime, lastPresentationTimestamp + vblankInterval);
 +            threshold = 2U;
-+        }
-+    }
-+
+         }
+     }
+ 
+-    const std::chrono::nanoseconds nextRenderTimestamp = nextPresentationTimestamp - expectedCompositingTime;
+-    compositeTimer.start(std::max(0ms, std::chrono::duration_cast<std::chrono::milliseconds>(nextRenderTimestamp - currentTime)), Qt::PreciseTimer, q);
 +    if (pendingModeCounter_ < threshold) {
 +        return false;
 +    }
@@ -6423,9 +6653,12 @@
 +
 +    pendingModeCounter_ = 0;
 +    lastStableMode = target;
-+    return true;
-+}
++    vrrModeSwitchDebounce_ = 3;
 +
++    return true;
+ }
+ 
+-void RenderLoopPrivate::delayScheduleRepaint()
 +void RenderLoopPrivate::updateFramePrediction(std::chrono::nanoseconds measured) noexcept
 +{
 +    const int64_t m = measured.count();
@@ -6549,7 +6782,7 @@
 +
 +        if (wasTripleBuffering && targetVblank <= 1) {
 +            targetVblank = 2;
-         }
++        }
 +
 +        nextPresNs = lastPresNs + (targetVblank * vblankI64);
 +
@@ -6571,11 +6804,9 @@
 +    const int64_t minPresNs = nowNs + kMinCompositeNs;
 +    if (nextPresNs < minPresNs) {
 +        nextPresNs = minPresNs;
-     }
++    }
 +    nextPresentationTimestamp = std::chrono::nanoseconds{nextPresNs};
- 
--    const std::chrono::nanoseconds nextRenderTimestamp = nextPresentationTimestamp - expectedCompositingTime;
--    compositeTimer.start(std::max(0ms, std::chrono::duration_cast<std::chrono::milliseconds>(nextRenderTimestamp - currentTime)), Qt::PreciseTimer, q);
++
 +    const int64_t nextRenderNs = nextPresNs - compositeNs;
 +    const int64_t delayNs = std::max<int64_t>(nextRenderNs - nowNs, 0LL);
 +    const int timerMs = delayNs < kNsPerMs
@@ -6603,9 +6834,8 @@
 +    scheduledRenderTimestamp = std::chrono::nanoseconds{nextRenderNs};
 +    compositeTimer.start(timerMs, Qt::PreciseTimer, q);
 +    scheduledTimerMs = static_cast<int16_t>(timerMs);
- }
- 
--void RenderLoopPrivate::delayScheduleRepaint()
++}
++
 +void RenderLoopPrivate::delayScheduleRepaint() noexcept
  {
      pendingReschedule = true;
@@ -6670,13 +6900,7 @@
 -        *m_debugOutput << "target pageflip timestamp,pageflip timestamp,render start,render end,safety margin,refresh duration,vrr,tearing,predicted render time\n";
 +    if (!s_debugEnabled) [[likely]] {
 +        return;
-     }
--    if (m_debugOutput) {
--        auto times = renderTime.value_or(RenderTimeSpan{});
--        const bool vrr = mode == PresentationMode::AdaptiveSync || mode == PresentationMode::AdaptiveAsync;
--        const bool tearing = mode == PresentationMode::Async || mode == PresentationMode::AdaptiveAsync;
--        *m_debugOutput << frame->targetPageflipTime().time_since_epoch().count() << "," << timestamp.count() << "," << times.start.time_since_epoch().count() << "," << times.end.time_since_epoch().count()
--                       << "," << safetyMargin.count() << "," << frame->refreshDuration().count() << "," << (vrr ? 1 : 0) << "," << (tearing ? 1 : 0) << "," << frame->predictedRenderTime().count() << "\n";
++    }
 +
 +    if (!d->m_debugOutput) {
 +        if (!d->output) {
@@ -6690,10 +6914,8 @@
 +        if (d->m_debugOutput && d->m_debugOutput->is_open()) {
 +            *d->m_debugOutput << "target,flip,start,end,margin,dur,vrr,pred,cadence\n";
 +        }
-     }
- 
--    Q_ASSERT(pendingFrameCount > 0);
--    pendingFrameCount--;
++    }
++
 +    if (d->m_debugOutput && d->m_debugOutput->is_open()) {
 +        const auto times = rt.value_or(RenderTimeSpan{});
 +        *d->m_debugOutput << targetFlip.count() << ','
@@ -6732,8 +6954,7 @@
 +        } else if (graceNs > 2'500'000) {
 +            graceNs = 2'500'000;
 +        }
- 
--    notifyVblank(timestamp);
++
 +        if (!isVrrMode(mode) && feedback.targetPresentationTimestamp.count() > 0) {
 +            feedback.deadlineMissed = timestamp > (feedback.targetPresentationTimestamp + std::chrono::nanoseconds{graceNs});
 +        } else {
@@ -6748,7 +6969,6 @@
 +    const std::optional<PresentFeedback> initialFeedback = buildFeedback();
 +
 +    if (q->thread() != QThread::currentThread()) [[unlikely]] {
-+        // Preserve feedback data on thread hop.
 +        QMetaObject::invokeMethod(q, [this, timestamp, renderTime, mode, initialFeedback]() {
 +            notifyFrameCompleted(timestamp, renderTime, mode, nullptr);
 +            if (initialFeedback.has_value()) {
@@ -6756,7 +6976,13 @@
 +            }
 +        }, Qt::QueuedConnection);
 +        return;
-+    }
+     }
+-    if (m_debugOutput) {
+-        auto times = renderTime.value_or(RenderTimeSpan{});
+-        const bool vrr = mode == PresentationMode::AdaptiveSync || mode == PresentationMode::AdaptiveAsync;
+-        const bool tearing = mode == PresentationMode::Async || mode == PresentationMode::AdaptiveAsync;
+-        *m_debugOutput << frame->targetPageflipTime().time_since_epoch().count() << "," << timestamp.count() << "," << times.start.time_since_epoch().count() << "," << times.end.time_since_epoch().count()
+-                       << "," << safetyMargin.count() << "," << frame->refreshDuration().count() << "," << (vrr ? 1 : 0) << "," << (tearing ? 1 : 0) << "," << frame->predictedRenderTime().count() << "\n";
 +
 +    preparingNewFrame = false;
 +    consecutiveErrorCount = 0;
@@ -6769,8 +6995,10 @@
 +                   frame->predictedRenderTime(),
 +                   timestamp,
 +                   mode);
-+    }
-+
+     }
+ 
+-    Q_ASSERT(pendingFrameCount > 0);
+-    pendingFrameCount--;
 +    if (pendingFrameCount > 0) {
 +        --pendingFrameCount;
 +    }
@@ -6785,7 +7013,8 @@
 +    if (tsNs < prevPresentationNs) [[unlikely]] {
 +        tsNs = prevPresentationNs;
 +    }
-+
+ 
+-    notifyVblank(timestamp);
 +    lastPresentationTimestamp = std::chrono::nanoseconds{tsNs};
 +    updatePresentationCadence(tsNs - prevPresentationNs);
  
@@ -6813,7 +7042,8 @@
 +
 +    if (initialFeedback.has_value()) {
 +        addPresentFeedback(*initialFeedback);
-+    }
+     }
+-    if (!inhibitCount && pendingReschedule) {
 +
 +    const bool vrrActive = isVrrMode(presentationMode);
 +    const int maxPending = effectiveMaxPendingFrames(this, vrrActive);
@@ -6822,10 +7052,8 @@
 +        disarmStalledFrameTimer();
 +    } else if (pendingReschedule) {
 +        armStalledFrameTimer();
-     }
--    if (!inhibitCount && pendingReschedule) {
++    }
 +
-+    // Retarget already-armed timer against new present timestamp to avoid phase drift.
 +    if (compositeTimer.isActive()) {
 +        compositeTimer.stop();
 +        scheduledTimerMs = -1;
@@ -6852,12 +7080,12 @@
 +    int64_t ts = timestamp.count();
 +    if (ts > nowNs) [[unlikely]] {
 +        ts = nowNs;
-     }
++    }
 +
 +    const int64_t prev = lastPresentationTimestamp.count();
 +    if (ts < prev) [[unlikely]] {
 +        ts = prev;
-+    }
+     }
 +
 +    lastPresentationTimestamp = std::chrono::nanoseconds{ts};
 +}
@@ -6956,7 +7184,7 @@
  }
  
  int RenderLoop::refreshRate() const
-@@ -235,58 +1493,193 @@ int RenderLoop::refreshRate() const
+@@ -235,58 +1533,192 @@ int RenderLoop::refreshRate() const
      return d->refreshRate;
  }
  
@@ -7056,7 +7284,6 @@
 +    (void)layer;
 +
 +    if (thread() != QThread::currentThread()) [[unlikely]] {
-+        // Preserve call semantics; do not drop caller context by always using nullptrs.
 +        QMetaObject::invokeMethod(this, [this, item, layer]() {
 +            scheduleRepaint(item, layer);
 +        }, Qt::QueuedConnection);
@@ -7134,8 +7361,14 @@
 -    LogicalOutput *logical = workspace()->findOutput(d->output);
 -    if (!logical) {
 +    if (d->output == nullptr) {
-+        return false;
-+    }
+         return false;
+     }
+-    return activeWindow
+-        && activeWindow->frameGeometry().intersects(logical->geometryF())
+-        && activeWindow->surfaceItem()
+-        && activeWindow->surfaceItem()->recursiveFrameTimeEstimation().transform([](const auto t) {
+-        return t <= std::chrono::nanoseconds(1'000'000'000) / 30;
+-    }).value_or(false);
 +
 +    switch (d->activeContentHint_) {
 +    case VrrContentHint::ForceVsync:
@@ -7151,14 +7384,8 @@
 +
 +    Workspace *const ws = workspace();
 +    if (ws == nullptr) {
-         return false;
-     }
--    return activeWindow
--        && activeWindow->frameGeometry().intersects(logical->geometryF())
--        && activeWindow->surfaceItem()
--        && activeWindow->surfaceItem()->recursiveFrameTimeEstimation().transform([](const auto t) {
--        return t <= std::chrono::nanoseconds(1'000'000'000) / 30;
--    }).value_or(false);
++        return false;
++    }
 +
 +    Window *const active = ws->activeWindow();
 +    if (active == nullptr) {
@@ -7181,7 +7408,7 @@
  }
  
  std::chrono::nanoseconds RenderLoop::lastPresentationTimestamp() const
-@@ -301,15 +1694,18 @@ std::chrono::nanoseconds RenderLoop::nex
+@@ -301,15 +1733,18 @@ std::chrono::nanoseconds RenderLoop::nex
  
  void RenderLoop::setPresentationMode(PresentationMode mode)
  {
@@ -9140,7 +9367,7 @@
  private:
 
 --- a/src/backends/drm/drm_commit.cpp	2025-10-25 17:20:57.628520256 +0200
-+++ b/src/backends/drm/drm_commit.cpp	2026-05-13 17:29:29.993339471 +0200
++++ b/src/backends/drm/drm_commit.cpp	2026-05-28 17:29:29.993339471 +0200
 @@ -1,11 +1,9 @@
  /*
 -    KWin - the KDE window manager
@@ -9257,14 +9484,14 @@
 +        itBuf->second = buffer;
 +    } else {
 +        m_buffers.emplace_back(plane, buffer);
-     }
++    }
 +
 +    auto itFrame = std::find_if(m_frames.begin(), m_frames.end(), [plane](const auto &p) { return p.first == plane; });
 +    if (itFrame != m_frames.end()) {
 +        itFrame->second = frame;
 +    } else {
 +        m_frames.emplace_back(plane, frame);
-+    }
+     }
 +
      m_planes.emplace(plane);
 -    if (frame) {
@@ -9282,7 +9509,7 @@
  {
      m_mode = mode;
  }
-@@ -133,60 +170,149 @@ bool DrmAtomicCommit::commitModeset()
+@@ -133,60 +170,148 @@ bool DrmAtomicCommit::commitModeset()
  
  bool DrmAtomicCommit::doCommit(uint32_t flags)
  {
@@ -9316,27 +9543,26 @@
 +    };
 +
 +    // Rebuild IN_FENCE_FD properties from current buffers every submit to avoid stale FDs.
-+    for (const auto &pair : m_buffers) {
-+        DrmPlane *plane = pair.first;
-+        const auto &buffer = pair.second;
++    if constexpr (requires(DrmPlane *p) { p->inFenceFd.isValid(); p->inFenceFd.propId(); }) {
++        for (const auto &pair : m_buffers) {
++            DrmPlane *plane = pair.first;
++            const auto &buffer = pair.second;
++            if (!plane || !plane->inFenceFd.isValid()) {
++                continue;
++            }
++            const uint32_t objectId = plane->fbId.drmObject()->id();
++            const uint32_t inFencePropId = plane->inFenceFd.propId();
++            eraseProperty(objectId, inFencePropId);
 +
-+        if (!plane || !plane->inFenceFd.isValid()) {
-+            continue;
++            if (!allowInFence || !buffer || isNv) {
++                continue;
++            }
++            const int rawFd = buffer->syncFd().get();
++            if (rawFd >= 0) {
++                addProperty(plane->inFenceFd, static_cast<uint64_t>(rawFd));
++            }
 +        }
-+
-+        const uint32_t objectId = plane->fbId.drmObject()->id();
-+        const uint32_t inFencePropId = plane->inFenceFd.propId();
-+        eraseProperty(objectId, inFencePropId);
-+
-+        if (!allowInFence || !buffer || isNv) {
-+            continue;
-+        }
-+
-+        const int rawFd = buffer->syncFd().get();
-+        if (rawFd >= 0) {
-+            addProperty(plane->inFenceFd, static_cast<uint64_t>(rawFd));
-         }
-     }
++    }
 +
 +    std::sort(m_properties.begin(), m_properties.end(),
 +              [](const PropertyValue &a, const PropertyValue &b) {
@@ -9371,7 +9597,7 @@
 +            }
 +            currentObject = p.objectId;
 +            currentObjectPropCount = 0;
-+        }
+         }
 +
 +        propertyIds.push_back(p.propertyId);
 +        values.push_back(p.value);
@@ -9387,7 +9613,7 @@
 +    uint64_t packedCount = 0;
 +    for (uint32_t c : propertyCounts) {
 +        packedCount += c;
-+    }
+     }
 +    Q_ASSERT(objects.size() == propertyCounts.size());
 +    Q_ASSERT(static_cast<size_t>(packedCount) == propertyIds.size());
 +    Q_ASSERT(propertyIds.size() == values.size());
@@ -9468,7 +9694,7 @@
      for (const auto pipeline : std::as_const(m_pipelines)) {
          pipeline->pageFlipped(timestamp);
      }
-@@ -194,55 +320,107 @@ void DrmAtomicCommit::pageFlipped(std::c
+@@ -194,55 +319,107 @@ void DrmAtomicCommit::pageFlipped(std::c
  
  bool DrmAtomicCommit::areBuffersReadable() const
  {
@@ -9594,7 +9820,7 @@
      if (m_allowedVrrDelay && onTop->m_allowedVrrDelay) {
          *m_allowedVrrDelay = std::min(*m_allowedVrrDelay, *onTop->m_allowedVrrDelay);
      } else {
-@@ -250,17 +428,17 @@ void DrmAtomicCommit::merge(DrmAtomicCom
+@@ -250,17 +427,17 @@ void DrmAtomicCommit::merge(DrmAtomicCom
      }
  }
  
@@ -9615,7 +9841,7 @@
  {
      return m_targetPageflipTime;
  }
-@@ -271,7 +449,7 @@ bool DrmAtomicCommit::isReadyFor(std::ch
+@@ -271,7 +448,7 @@ bool DrmAtomicCommit::isReadyFor(std::ch
      return (!m_targetPageflipTime || pageflipTarget + s_pageflipSlop >= *m_targetPageflipTime) && areBuffersReadable();
  }
  
@@ -9624,7 +9850,7 @@
  {
      return m_mode == PresentationMode::Async || m_mode == PresentationMode::AdaptiveAsync;
  }
-@@ -291,9 +469,8 @@ bool DrmLegacyCommit::doModeset(DrmConne
+@@ -291,9 +468,8 @@ bool DrmLegacyCommit::doModeset(DrmConne
      if (drmModeSetCrtc(gpu()->fd(), m_crtc->id(), m_buffer->framebufferId(), 0, 0, &connectorId, 1, mode->nativeMode()) == 0) {
          m_crtc->setCurrent(m_buffer);
          return true;
@@ -9635,7 +9861,7 @@
  }
  
  bool DrmLegacyCommit::doPageflip(PresentationMode mode)
-@@ -308,7 +485,8 @@ bool DrmLegacyCommit::doPageflip(Present
+@@ -308,7 +484,8 @@ bool DrmLegacyCommit::doPageflip(Present
  
  void DrmLegacyCommit::pageFlipped(std::chrono::nanoseconds timestamp)
  {
@@ -9645,7 +9871,7 @@
      m_crtc->setCurrent(m_buffer);
      if (m_defunct) {
          return;
-@@ -319,4 +497,5 @@ void DrmLegacyCommit::pageFlipped(std::c
+@@ -319,4 +496,5 @@ void DrmLegacyCommit::pageFlipped(std::c
      }
      m_pipeline->pageFlipped(timestamp);
  }
