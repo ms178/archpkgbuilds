@@ -182,25 +182,24 @@ bool DrmAtomicCommit::doCommit(uint32_t flags)
     };
 
     // Rebuild IN_FENCE_FD properties from current buffers every submit to avoid stale FDs.
-    for (const auto &pair : m_buffers) {
-        DrmPlane *plane = pair.first;
-        const auto &buffer = pair.second;
+    if constexpr (requires(DrmPlane *p) { p->inFenceFd.isValid(); p->inFenceFd.propId(); }) {
+        for (const auto &pair : m_buffers) {
+            DrmPlane *plane = pair.first;
+            const auto &buffer = pair.second;
+            if (!plane || !plane->inFenceFd.isValid()) {
+                continue;
+            }
+            const uint32_t objectId = plane->fbId.drmObject()->id();
+            const uint32_t inFencePropId = plane->inFenceFd.propId();
+            eraseProperty(objectId, inFencePropId);
 
-        if (!plane || !plane->inFenceFd.isValid()) {
-            continue;
-        }
-
-        const uint32_t objectId = plane->fbId.drmObject()->id();
-        const uint32_t inFencePropId = plane->inFenceFd.propId();
-        eraseProperty(objectId, inFencePropId);
-
-        if (!allowInFence || !buffer || isNv) {
-            continue;
-        }
-
-        const int rawFd = buffer->syncFd().get();
-        if (rawFd >= 0) {
-            addProperty(plane->inFenceFd, static_cast<uint64_t>(rawFd));
+            if (!allowInFence || !buffer || isNv) {
+                continue;
+            }
+            const int rawFd = buffer->syncFd().get();
+            if (rawFd >= 0) {
+                addProperty(plane->inFenceFd, static_cast<uint64_t>(rawFd));
+            }
         }
     }
 

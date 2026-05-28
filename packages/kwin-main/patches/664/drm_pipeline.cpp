@@ -339,134 +339,116 @@ DrmPipeline::Error DrmPipeline::commitPipelinesAtomic(const QList<DrmPipeline *>
     Q_UNREACHABLE();
 }
 
-DrmPipeline::Error DrmPipeline::prepareAtomicCommit(DrmAtomicCommit *commit, CommitMode mode, const std::shared_ptr<OutputFrame> &frame)
+DrmPipeline::Error DrmPipeline::prepareAtomicCommit(DrmAtomicCommit *commit, CommitMode mode,
+                                                  const std::shared_ptr<OutputFrame> &frame)
 {
     if (!commit) [[unlikely]] {
         return Error::InvalidArguments;
     }
 
-    if (activePending()) [[likely]] {
-        if (const Error err = prepareAtomicPresentation(commit, frame); err != Error::None) [[unlikely]] {
-            return err;
+    if (!activePending()) {
+        prepareAtomicDisable(commit);
+        return Error::None;
+    }
+
+    if (const Error err = prepareAtomicPresentation(commit, frame); err != Error::None) [[unlikely]] {
+        return err;
+    }
+
+    // Count enabled, plane-backed layers. The amdgpu priority reconciliation is
+    // ONLY valid for a genuine multi-plane full commit. For cursor-only / single
+    // plane updates we must program planes 1:1 exactly like upstream, otherwise
+    // async flips end up carrying primary-plane changes and the kernel rejects them.
+    int enabledCount = 0;
+    bool cursorOnly = true;
+    for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
+        if (!layer) [[unlikely]] { return Error::InvalidArguments; }
+        DrmPlane *plane = layer->plane();
+        if (!plane)  [[unlikely]] { return Error::InvalidArguments; }
+        if (!layer->isEnabled()) { continue; }
+        ++enabledCount;
+        if (!(plane->type.isValid() && plane->type.enumValue() == DrmPlane::TypeIndex::Cursor)) {
+            cursorOnly = false;
         }
+    }
+    if (enabledCount == 0) [[unlikely]] {
+        return Error::InvalidArguments;
+    }
 
-        struct LayerInfo {
-            DrmPipelineLayer *layer = nullptr;
-            DrmPlane *plane = nullptr;
-            QRect rect;
-            ColorPipeline pipeline;
-            int priority = 0;
-        };
+    const bool useReconcile = gpu()->isAmdgpu() && enabledCount > 1 && !cursorOnly;
 
-        auto layerPriority =[](DrmPlane *plane) noexcept -> int {
-            if (!plane || !plane->type.isValid()) {
-                return 1;
+    if (!useReconcile) {
+        // Upstream-equivalent straight programming.
+        for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
+            DrmPlane *plane = layer->plane();
+            if (!layer->isEnabled()) {
+                plane->disable(commit);
+                continue;
             }
-            switch (plane->type.enumValue()) {
-            case DrmPlane::TypeIndex::Primary:
-                return 2;
-            case DrmPlane::TypeIndex::Overlay:
-                return 1;
-            case DrmPlane::TypeIndex::Cursor:
-                return 0;
+            if (const Error err = prepareAtomicPlane(commit, plane, layer, frame);
+                err != Error::None) [[unlikely]] {
+                return err;
+            }
+        }
+    } else {
+        // AMD: keep the highest-priority overlapping plane set. Priority:
+        // Primary(2) > Overlay(1) > Cursor(0); never drop Primary or Cursor.
+        struct Info { DrmPipelineLayer *layer; DrmPlane *plane; QRect rect; int prio; };
+        auto prioOf = [](DrmPlane *p) -> int {
+            if (!p || !p->type.isValid()) return 1;
+            switch (p->type.enumValue()) {
+            case DrmPlane::TypeIndex::Primary: return 2;
+            case DrmPlane::TypeIndex::Overlay: return 1;
+            case DrmPlane::TypeIndex::Cursor:  return 0;
             }
             return 1;
         };
 
-        QVarLengthArray<LayerInfo, 16> enabled;
-        enabled.reserve(m_pending.layers.size());
+        QVarLengthArray<Info, 8> en;
         for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
-            if (!layer) [[unlikely]] {
-                return Error::InvalidArguments;
-            }
-            DrmPlane *plane = layer->plane();
-            if (!plane) [[unlikely]] {
-                return Error::InvalidArguments;
-            }
-            if (!layer->isEnabled()) {
-                continue;
-            }
-            enabled.push_back(LayerInfo{
-                .layer = layer,
-                .plane = plane,
-                .rect = layer->targetRect(),
-                .pipeline = layer->colorPipeline(),
-                .priority = layerPriority(plane)
-            });
+            if (!layer->isEnabled()) continue;
+            en.push_back({layer, layer->plane(), layer->targetRect(), prioOf(layer->plane())});
         }
 
-        if (enabled.isEmpty()) [[unlikely]] {
-            return Error::InvalidArguments;
-        }
-
-        QVarLengthArray<uint8_t, 16> disabled;
-        disabled.resize(enabled.size());
-        std::fill(disabled.begin(), disabled.end(), uint8_t{0});
-
-        if (gpu()->isAmdgpu()) {
-            const int n = enabled.size();
-            int disabledCount = 0;
-            for (int i = 0; i < n; ++i) {
-                for (int j = i + 1; j < n; ++j) {
-                    if (enabled[i].pipeline == enabled[j].pipeline) {
-                        continue;
-                    }
-                    if (!enabled[i].rect.intersects(enabled[j].rect)) {
-                        continue;
-                    }
-                    const int drop = (enabled[i].priority < enabled[j].priority) ? i : j;
-                    if (disabled[drop] == 0U) {
-                        disabled[drop] = 1U;
-                        ++disabledCount;
-                    }
-                }
-            }
-            if (disabledCount == n) {
-                int best = 0;
-                for (int i = 1; i < n; ++i) {
-                    if (enabled[i].priority > enabled[best].priority) {
-                        best = i;
-                    }
-                }
-                disabled[best] = 0U;
+        QVarLengthArray<uint8_t, 8> dropped(en.size(), 0);
+        for (int i = 0; i < en.size(); ++i) {
+            if (dropped[i] || en[i].prio == 0 || en[i].prio == 2) continue; // keep cursor+primary
+            for (int j = 0; j < en.size(); ++j) {
+                if (i == j || dropped[j]) continue;
+                if (!en[i].rect.intersects(en[j].rect)) continue;
+                // drop the lower-priority overlay on overlap
+                if (en[i].prio < en[j].prio) { dropped[i] = 1; break; }
+                else if (en[j].prio < en[i].prio && en[j].prio == 1) { dropped[j] = 1; }
             }
         }
 
+        // Program: disabled or dropped → disable; otherwise prepare normally.
         for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
-            if (!layer) [[unlikely]] {
-                return Error::InvalidArguments;
-            }
             DrmPlane *plane = layer->plane();
-            if (!plane) [[unlikely]] {
-                return Error::InvalidArguments;
+            if (!layer->isEnabled()) { plane->disable(commit); continue; }
+            bool drop = false;
+            for (int i = 0; i < en.size(); ++i) {
+                if (en[i].layer == layer) { drop = dropped[i]; break; }
             }
-
-            bool isDisabled = false;
-            for (int i = 0; i < enabled.size(); ++i) {
-                if (enabled[i].layer == layer && disabled[i] != 0U) {
-                    isDisabled = true;
-                    break;
-                }
-            }
-
-            if (isDisabled) {
-                plane->disable(commit);
-                continue;
-            }
-            if (const Error err = prepareAtomicPlane(commit, plane, layer, frame); err != Error::None) [[unlikely]] {
+            if (drop) { plane->disable(commit); continue; }
+            if (const Error err = prepareAtomicPlane(commit, plane, layer, frame);
+                err != Error::None) [[unlikely]] {
                 return err;
             }
         }
+    }
 
-        const bool needsModesetCommit = (mode != CommitMode::Test) &&
-                                        (mode == CommitMode::CommitModeset || m_pending.needsModesetProperties);
-        if (needsModesetCommit) [[unlikely]] {
-            if (!prepareAtomicModeset(commit)) {
-                return Error::InvalidArguments;
-            }
+    const bool needsModesetCommit = (mode != CommitMode::Test)
+        && (mode == CommitMode::CommitModeset || m_pending.needsModesetProperties);
+    if (needsModesetCommit) [[unlikely]] {
+        if (!prepareAtomicModeset(commit)) {
+            return Error::InvalidArguments;
         }
-    } else {
-        prepareAtomicDisable(commit);
+    } else if (mode == CommitMode::TestAllowModeset) {
+        // Modeset tests must include the modeset props (upstream behaviour).
+        if (!prepareAtomicModeset(commit)) {
+            return Error::InvalidArguments;
+        }
     }
 
     return Error::None;
@@ -558,46 +540,62 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPlane(DrmAtomicCommit *commit,
     return prepareAtomicPlanePrimary(commit, plane, layer, fb, frame);
 }
 
-DrmPipeline::Error DrmPipeline::prepareAtomicPlaneCursor(DrmAtomicCommit *commit,
-                                                         DrmPlane *plane,
-                                                         DrmPipelineLayer *layer,
-                                                         const std::shared_ptr<DrmFramebuffer> &fb,
-                                                         const std::shared_ptr<OutputFrame> &frame)
+DrmPipeline::Error DrmPipeline::prepareAtomicPlaneCursor(DrmAtomicCommit *commit, DrmPlane *plane,
+                                                       DrmPipelineLayer *layer,
+                                                       const std::shared_ptr<DrmFramebuffer> &fb,
+                                                       const std::shared_ptr<OutputFrame> &frame)
 {
     if (!commit || !plane || !layer || !fb || !m_pending.crtc) [[unlikely]] {
         return Error::InvalidArguments;
     }
 
-    const QRect sourceRect = sanitizeSourceRect(layer->sourceRect());
+    // Cursor planes are NOT scalable: CRTC_W/H must equal the framebuffer size,
+    // and SRC must cover the whole buffer. Derive everything from the buffer.
+    const QSize bufferSize = fb->buffer() ? fb->buffer()->size() : QSize();
+    if (bufferSize.isEmpty()) [[unlikely]] {
+        qCWarning(KWIN_DRM) << "Cursor framebuffer has invalid size";
+        return Error::InvalidArguments;
+    }
+
     const QRect targetRect = layer->targetRect();
-
-    if (!validateSourceRect(sourceRect)) [[unlikely]] {
-        qCWarning(KWIN_DRM) << "Invalid cursor source geometry:" << sourceRect
-                           << "from" << layer->sourceRect();
-        return Error::InvalidArguments;
-    }
-
     if (!validateTargetRect(targetRect)) [[unlikely]] {
-        qCWarning(KWIN_DRM) << "Invalid cursor target geometry:" << targetRect;
+        qCWarning(KWIN_DRM) << "Invalid cursor target rect" << targetRect;
         return Error::InvalidArguments;
     }
 
-    plane->set(commit, sourceRect, targetRect);
+    // Force the canonical cursor geometry: src = full buffer, dst = buffer-sized.
+    const QRect srcRect(0, 0, bufferSize.width(), bufferSize.height());
+    const QRect dstRect(targetRect.topLeft(), bufferSize);
+
+    plane->set(commit, srcRect, dstRect);
     commit->addBuffer(plane, fb, frame);
     commit->addProperty(plane->crtcId, m_pending.crtc->id());
 
+    // Hotspot: clamp to the property's real range AND to the buffer extents.
     if (plane->vmHotspotX.isValid() && plane->vmHotspotY.isValid()) {
         const QPointF hotspot = layer->hotspot();
-        const double hx = hotspot.x();
-        const double hy = hotspot.y();
-        const uint64_t hxClamped = (hx < 0.0) ? 0 : ((hx > 32767.0) ? 32767 : static_cast<uint64_t>(std::lround(hx)));
-        const uint64_t hyClamped = (hy < 0.0) ? 0 : ((hy > 32767.0) ? 32767 : static_cast<uint64_t>(std::lround(hy)));
-        commit->addProperty(plane->vmHotspotX, hxClamped);
-        commit->addProperty(plane->vmHotspotY, hyClamped);
+        const auto clampHotspot = [](double v, uint64_t lo, uint64_t hi, int extent) -> uint64_t {
+            long r = std::lround(v);
+            if (r < 0) r = 0;
+            if (r > extent) r = extent;
+            uint64_t u = static_cast<uint64_t>(r);
+            if (u < lo) u = lo;
+            if (u > hi) u = hi;
+            return u;
+        };
+        commit->addProperty(plane->vmHotspotX,
+                           clampHotspot(hotspot.x(), plane->vmHotspotX.minValue(),
+                                        plane->vmHotspotX.maxValue(), bufferSize.width()));
+        commit->addProperty(plane->vmHotspotY,
+                           clampHotspot(hotspot.y(), plane->vmHotspotY.minValue(),
+                                        plane->vmHotspotY.maxValue(), bufferSize.height()));
     }
 
-    if (plane->rotation.isValid()) {
-        commit->addEnum(plane->rotation, DrmPlane::Transformations{DrmPlane::Transformation::Rotate0});
+    // Only program rotation when the plane actually exposes the Rotate0 enum.
+    if (plane->rotation.isValid()
+        && plane->rotation.hasEnum(DrmPlane::Transformation::Rotate0)) {
+        commit->addEnum(plane->rotation,
+                       DrmPlane::Transformations{DrmPlane::Transformation::Rotate0});
     }
 
     return Error::None;
@@ -838,6 +836,7 @@ bool DrmPipeline::presentAsync(OutputLayer *layer, std::optional<std::chrono::na
     if (!layer || needsModeset() || !m_pending.crtc || !m_pending.active) [[unlikely]] {
         return false;
     }
+    // vmwgfx hardware cursor is broken; force software cursor there.
     if (gpu()->isVmwgfx()) [[unlikely]] {
         return false;
     }
@@ -852,19 +851,29 @@ bool DrmPipeline::presentAsync(OutputLayer *layer, std::optional<std::chrono::na
         return setCursorLegacy(drmLayer);
     }
 
+    // MANDATORY: validate the FULL pipeline state (all planes, incl. pending
+    // commits) before queueing the partial update. This is what upstream does;
+    // it ensures a failing cursor state is rejected here so the caller can
+    // disable the plane, instead of being queued and silently dropped later.
+    if (commitPipelinesAtomic({this}, CommitMode::Test, nullptr, {}) != Error::None) [[unlikely]] {
+        return false;
+    }
+
     auto partialUpdate = std::make_unique<DrmAtomicCommit>(QList<DrmPipeline *>{this});
     partialUpdate->setPresentationMode(m_pending.presentationMode);
 
-    if (prepareAtomicPlane(partialUpdate.get(), plane, drmLayer, std::shared_ptr<OutputFrame>{}) != Error::None) [[unlikely]] {
-        qCDebug(KWIN_DRM) << "presentAsync: plane preparation failed";
+    if (prepareAtomicPlane(partialUpdate.get(), plane, drmLayer,
+                          std::shared_ptr<OutputFrame>{}) != Error::None) [[unlikely]] {
+        qCDebug(KWIN_DRM) << "Failed to prepare async cursor plane";
         return false;
     }
 
     partialUpdate->setAllowedVrrDelay(allowedVrrDelay);
 
+    // Final guard: only the partial (cursor) state, with pending commits applied.
     if (!partialUpdate->test()) [[unlikely]] {
         const int savedErrno = errno;
-        qCDebug(KWIN_DRM) << "presentAsync: partial atomic test failed, errno:" << savedErrno << strerror(savedErrno);
+        qCDebug(KWIN_DRM) << "Async cursor test failed:" << strerror(savedErrno);
         return false;
     }
 
