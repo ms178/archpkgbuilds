@@ -34,37 +34,11 @@
 # define SINCOSF_FUNC SINCOSF
 #endif
 
-static void
-SECTION
-__attribute__ ((noinline))
-sincosf_large_finite (float y, const sincos_t *p, float *sinp, float *cosp)
-{
-  uint32_t xi = asuint (y);
-  int sign = (int) (xi >> 31);
-  int n;
-  double x = reduce_large (xi, &n);
+static void SECTION __attribute__ ((noinline, cold))
+sincosf_large_finite (float y, const sincos_t *p, float *sinp, float *cosp);
 
-  /* Setup signs for sin and cos - include original sign.  */
-  double s = p->sign[(n + sign) & 3];
-  p = &__sincosf_table[((uint32_t) (n + sign) >> 1) & 1u];
-
-  sincosf_poly (x * s, x * x, p, n, sinp, cosp);
-}
-
-static void
-SECTION
-__attribute__ ((noinline, cold))
-sincosf_invalid (float y, float *sinp, float *cosp)
-{
-  /* Return NaN if Inf or NaN for both sin and cos.  */
-  *sinp = *cosp = y - y;
-#if WANT_ERRNO
-  /* Needed to set errno for +-Inf, the add is a hack to work
-     around a gcc register allocation issue: just passing y
-     affects code generation in the fast path (PR86901).  */
-  __math_invalidf (y + y);
-#endif
-}
+static void SECTION __attribute__ ((noinline, cold))
+sincosf_invalid (float y, float *sinp, float *cosp);
 
 /* Fast sincosf implementation.  Worst-case ULP is 0.5607, maximum relative
    error is 0.5303 * 2^-23.  A single-step range reduction is used for
@@ -97,20 +71,67 @@ SINCOSF_FUNC (float y, float *sinp, float *cosp)
     }
   else if (abstop12 (y) < abstop12 (120.0f))
     {
+      float sx;
+      float cx;
       x = reduce_fast (x, p, &n);
+      sincosf_poly (x, x * x, p, 0, &sx, &cx);
 
-      /* Setup the signs for sin and cos.  */
-      s = p->sign[n & 3];
-
-      if (n & 2)
-	p = &__sincosf_table[1];
-
-      sincosf_poly (x * s, x * x, p, n, sinp, cosp);
+      switch (n & 3)
+	{
+	case 0:
+	  *sinp = sx;
+	  *cosp = cx;
+	  break;
+	case 1:
+	  *sinp = cx;
+	  *cosp = -sx;
+	  break;
+	case 2:
+	  *sinp = -sx;
+	  *cosp = -cx;
+	  break;
+	default:
+	  *sinp = -cx;
+	  *cosp = sx;
+	  break;
+	}
     }
   else if (__glibc_likely (abstop12 (y) < abstop12 (INFINITY)))
     sincosf_large_finite (y, p, sinp, cosp);
   else
     sincosf_invalid (y, sinp, cosp);
+}
+
+static void
+SECTION
+__attribute__ ((noinline, cold))
+sincosf_large_finite (float y, const sincos_t *p, float *sinp, float *cosp)
+{
+  uint32_t xi = asuint (y);
+  int sign = (int) (xi >> 31);
+  int n;
+  double x = reduce_large (xi, &n);
+
+  /* Setup signs for sin and cos - include original sign.  */
+  double s = p->sign[(n + sign) & 3];
+  p = &__sincosf_table[((uint32_t) (n + sign) >> 1) & 1u];
+
+  sincosf_poly (x * s, x * x, p, n, sinp, cosp);
+}
+
+static void
+SECTION
+__attribute__ ((noinline, cold))
+sincosf_invalid (float y, float *sinp, float *cosp)
+{
+  /* Return NaN if Inf or NaN for both sin and cos.  */
+  *sinp = *cosp = y - y;
+#if WANT_ERRNO
+  /* Needed to set errno for +-Inf, the add is a hack to work
+     around a gcc register allocation issue: just passing y
+     affects code generation in the fast path (PR86901).  */
+  __math_invalidf (y + y);
+#endif
 }
 
 #ifndef SINCOSF
