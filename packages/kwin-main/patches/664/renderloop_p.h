@@ -73,25 +73,10 @@ public:
     static_assert(sizeof(State) == 1);
     static_assert(std::is_trivially_copyable_v<State>);
 
-    constexpr void setState(State s) noexcept
-    {
-        m_state = s.toRaw();
-    }
-
-    [[nodiscard]] constexpr State getState() const noexcept
-    {
-        return State::fromRaw(m_state);
-    }
-
-    [[nodiscard]] constexpr uint8_t raw() const noexcept
-    {
-        return m_state;
-    }
-
-    constexpr void setRaw(uint8_t v) noexcept
-    {
-        m_state = v;
-    }
+    constexpr void setState(State s) noexcept { m_state = s.toRaw(); }
+    [[nodiscard]] constexpr State getState() const noexcept { return State::fromRaw(m_state); }
+    [[nodiscard]] constexpr uint8_t raw() const noexcept { return m_state; }
+    constexpr void setRaw(uint8_t v) noexcept { m_state = v; }
 
 private:
     uint8_t m_state{0};
@@ -104,14 +89,9 @@ public:
     static constexpr size_t kPresentHistorySize = 16;
     static_assert((kModeSwitchHistorySize & (kModeSwitchHistorySize - 1U)) == 0U, "Must be power of two");
     static_assert((kPresentHistorySize & (kPresentHistorySize - 1U)) == 0U, "Must be power of two");
-
     static constexpr uint16_t kStarvationRecoveryFrames = 4;
 
-    enum class VrrMode : uint8_t {
-        Automatic = 0,
-        Always = 1,
-        Never = 2
-    };
+    enum class VrrMode : uint8_t { Automatic = 0, Always = 1, Never = 2 };
 
     struct PresentSample {
         std::chrono::nanoseconds timestamp{0};
@@ -139,6 +119,16 @@ public:
     int64_t tripleBufferEnterThresholdNs{0};
     int64_t tripleBufferExitThresholdNs{0};
 
+    // ---- Cadence phase-locked loop (PLL) ----
+    // The render loop models periodic content as an oscillator. contentPeriodNs_
+    // is the locked frame period; contentPhaseNs_ is the timestamp of the last
+    // accepted on-grid content frame. Off-grid presents (cursor / extra damage)
+    // are recognized and rejected, so the lock survives mouse motion. The PLL
+    // drives lastIntervalNs_ and cadenceStability_ so all existing consumers see
+    // a clean, jitter-immune cadence estimate.
+    int64_t contentPhaseNs_{0};
+    int64_t contentPeriodNs_{0};
+
     QBasicTimer compositeTimer;
     QBasicTimer delayedVrrTimer;
     QBasicTimer stalledFrameTimer;
@@ -158,7 +148,8 @@ public:
     uint16_t pendingModeCounter_{0};
     uint16_t oscillationCooldownCounter_{0};
     uint16_t interactiveGraceFrames_{0};
-    uint16_t videoLockFrames_{0}; // sticky VSync-for-video lock; immune to mouse jitter
+    uint16_t videoLockFrames_{0};
+    uint16_t earlyPresentRun_{0}; // consecutive off-grid (early) presents; PLL re-lock trigger
 
     uint8_t reciprocalShift64{0};
     uint8_t consecutiveErrorCount{0};
@@ -233,7 +224,7 @@ public:
     [[nodiscard]] bool detectVrrOscillation() noexcept;
 
     void updateFramePrediction(std::chrono::nanoseconds measured) noexcept;
-    void updatePresentationCadence(int64_t intervalNs) noexcept;
+    void updatePresentationCadence(int64_t presentTimestampNs) noexcept;
     void dispatch();
     void delayScheduleRepaint() noexcept;
     void scheduleNextRepaint();
