@@ -58,9 +58,6 @@ constexpr auto kOscillationWindow = 500ms;
 constexpr uint8_t kOscillationThreshold = 10;
 constexpr int kMaxTimerDelayMs = 16000;
 
-// Hard anti-flap backstop: VRR mode may toggle at most once per this interval.
-constexpr auto kMinModeSwitchInterval = 500ms;
-
 constexpr int kTripleBufferEnterPct = 90;
 constexpr int kTripleBufferExitPct = 70;
 constexpr uint8_t kTripleBufferHysteresisLimit = 5;
@@ -70,21 +67,7 @@ constexpr int kMaxErrorBackoffMs = 50;
 constexpr int64_t kTimerJitterFilterNs = 250'000;
 constexpr int64_t kCadenceNoiseFloorNs = 125'000;
 
-constexpr int64_t kFilm24Ns  = 41'666'666;
-constexpr int64_t kFilm25Ns  = 40'000'000;
-constexpr int64_t kVideo30Ns = 33'333'333;
-constexpr int64_t kVideo48Ns = 20'833'333;
-constexpr int64_t kVideo50Ns = 20'000'000;
-constexpr int64_t kVideo60Ns = 16'666'666;
-
-constexpr int64_t kFallbackVrrFloormHz = 48'000;
-
-// Sticky video-VSync lock (frames). Backstop that bridges brief confidence dips.
-constexpr uint16_t kVideoLockFrames = 120;
-
-// Consecutive off-grid (early) presents that force the PLL to re-acquire. Below
-// this, early presents (sparse cursor / extra damage) preserve the lock.
-constexpr uint16_t kMaxEarlyPresentRun = 4;
+constexpr uint8_t kPanelRefreshFloorStableFrames = 3;
 
 constexpr int64_t kStalledFrameMinTimeoutNs = 12'000'000;
 constexpr int64_t kStalledFrameMaxTimeoutNs = 120'000'000;
@@ -145,7 +128,8 @@ inline constexpr bool isVrrMode(KWin::PresentationMode mode) noexcept
 inline int64_t steadyNowNs() noexcept
 {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch()).count();
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
 [[gnu::always_inline, gnu::const]]
@@ -183,14 +167,6 @@ inline constexpr bool nearIntervalNs(int64_t value, int64_t target, int64_t minT
     return fastAbs64(value - target) <= tolerance;
 }
 
-template<int64_t Target, int64_t MinToleranceNs>
-[[gnu::always_inline, gnu::const]]
-inline constexpr bool nearIntervalNs(int64_t value) noexcept
-{
-    constexpr int64_t tolerance = (Target / 64) > MinToleranceNs ? (Target / 64) : MinToleranceNs;
-    return fastAbs64(value - Target) <= tolerance;
-}
-
 [[gnu::always_inline, gnu::const]]
 inline constexpr bool isExplicitVsyncHint(uint8_t hintRaw, bool valid) noexcept
 {
@@ -201,22 +177,6 @@ inline constexpr bool isExplicitVsyncHint(uint8_t hintRaw, bool valid) noexcept
 inline constexpr bool isExplicitAsyncHint(uint8_t hintRaw, bool valid) noexcept
 {
     return valid && static_cast<KWin::PresentationModeHint>(hintRaw) == KWin::PresentationModeHint::Async;
-}
-
-// Direct cadence match on the PLL-locked period. No harmonics. The stability
-// gate demands the PLL is fully locked (>= 224/256), which only steady periodic
-// content achieves; jittery game frame-timing never reaches it because the PLL
-// tolerance (period/8) shrinks with rate.
-[[gnu::always_inline, gnu::const]]
-inline constexpr bool isUnhintedVideoOrFilmCadenceNs(int64_t intervalNs, int16_t stability) noexcept
-{
-    if (intervalNs <= 0 || stability < kCadenceStableThreshold) { return false; }
-    return nearIntervalNs<kFilm24Ns, 2'000'000>(intervalNs)
-        || nearIntervalNs<kFilm25Ns, 1'500'000>(intervalNs)
-        || nearIntervalNs<kVideo30Ns, 1'500'000>(intervalNs)
-        || nearIntervalNs<kVideo48Ns, 1'000'000>(intervalNs)
-        || nearIntervalNs<kVideo50Ns, 1'000'000>(intervalNs)
-        || nearIntervalNs<kVideo60Ns, 800'000>(intervalNs);
 }
 
 [[gnu::always_inline, gnu::const]]
@@ -238,6 +198,22 @@ inline constexpr bool contentIsInteractive(KWin::VrrContentHint hint) noexcept
 inline constexpr bool contentIsVideoLike(KWin::VrrContentHint hint) noexcept
 {
     return hint == KWin::VrrContentHint::Video || hint == KWin::VrrContentHint::Film || hint == KWin::VrrContentHint::ForceVsync;
+}
+
+// Map the Wayland contenttype-v1 enum onto the 2-bit ContentTypeBits stored
+// in the VrrStateCache.  Returns std::nullopt if no value is reported, so the
+// cache can correctly mark contentTypeValid=0.
+[[gnu::always_inline]]
+inline std::optional<KWin::VrrStateCache::ContentTypeBits>
+mapContentType(KWin::ContentType ct) noexcept
+{
+    switch (ct) {
+    case KWin::ContentType::None:  return KWin::VrrStateCache::ContentTypeBits::None;
+    case KWin::ContentType::Photo: return KWin::VrrStateCache::ContentTypeBits::Photo;
+    case KWin::ContentType::Video: return KWin::VrrStateCache::ContentTypeBits::Video;
+    case KWin::ContentType::Game:  return KWin::VrrStateCache::ContentTypeBits::Game;
+    }
+    return std::nullopt;
 }
 
 [[gnu::always_inline]]
@@ -267,10 +243,7 @@ inline int effectiveMaxPendingFrames(const KWin::RenderLoopPrivate *d, bool vrrA
     }
     const int64_t vblankNs = static_cast<int64_t>(d->cachedVblankIntervalNs);
     int64_t predictedNs = d->framePrediction.count();
-    if (predictedNs <= 0) {
-        predictedNs = d->renderJournal.result().count();
-        if (predictedNs <= 0) { predictedNs = vblankNs >> 1; }
-    }
+    if (predictedNs <= 0) { predictedNs = d->renderJournal.result().count(); if (predictedNs <= 0) { predictedNs = vblankNs >> 1; } }
     return (predictedNs * 5) >= (vblankNs * 2) ? maxPending : 1;
 }
 
@@ -281,10 +254,7 @@ namespace KWin
 
 static const bool s_debugEnabled = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0;
 
-RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop) noexcept
-{
-    return loop ? loop->d.get() : nullptr;
-}
+RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop) noexcept { return loop ? loop->d.get() : nullptr; }
 
 RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, BackendOutput *output)
     : q(q)
@@ -294,6 +264,7 @@ RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, BackendOutput *output)
     vrrCaps_.maxRefreshRate = refreshRate;
     updateReciprocal();
     initializeVrrCapabilities();
+    filteredPanelRefreshRateMhz_ = static_cast<uint32_t>(refreshRate);
     const auto now = std::chrono::steady_clock::now();
     lastModeSwitch = now;
     lastPresentationTimestamp = now.time_since_epoch();
@@ -308,11 +279,8 @@ void RenderLoopPrivate::updateReciprocal() noexcept
 {
     const uint64_t interval = cachedVblankIntervalNs;
     if (interval == 0) [[unlikely]] {
-        vblankIntervalReciprocal64 = 0;
-        reciprocalShift64 = 0;
-        tripleBufferEnterThresholdNs = 0;
-        tripleBufferExitThresholdNs = 0;
-        vrrControlDelayMs = 0;
+        vblankIntervalReciprocal64 = 0; reciprocalShift64 = 0;
+        tripleBufferEnterThresholdNs = 0; tripleBufferExitThresholdNs = 0; vrrControlDelayMs = 0;
         return;
     }
     constexpr uint8_t shift = 63;
@@ -348,8 +316,7 @@ void RenderLoopPrivate::armStalledFrameTimer() noexcept
     }
     const int64_t vblankNs = static_cast<int64_t>(cachedVblankIntervalNs);
     const int64_t timeoutNs = std::clamp(
-        std::max<int64_t>(vblankNs * kStalledFrameVblankMultiplier,
-                          predictedNs + safetyMargin.count() + kStalledFrameExtraTimeoutNs),
+        std::max<int64_t>(vblankNs * kStalledFrameVblankMultiplier, predictedNs + safetyMargin.count() + kStalledFrameExtraTimeoutNs),
         kStalledFrameMinTimeoutNs, kStalledFrameMaxTimeoutNs);
     const int timerMs = static_cast<int>(std::clamp((timeoutNs + kNsPerMs - 1) / kNsPerMs, int64_t{1}, int64_t{kMaxTimerDelayMs}));
     if (stalledFrameTimer.isActive() && stalledFrameTimerMs_ >= 0 && stalledFrameTimerMs_ <= timerMs) { return; }
@@ -366,16 +333,14 @@ void RenderLoopPrivate::disarmStalledFrameTimer() noexcept
 
 void RenderLoopPrivate::handleStalledFrameTimeout()
 {
-    stalledFrameTimer.stop();
-    stalledFrameTimerMs_ = -1;
+    stalledFrameTimer.stop(); stalledFrameTimerMs_ = -1;
     if (kwinApp()->isTerminating() || inhibitCount != 0) { stalledFrameTimeoutCount_ = 0; return; }
     const bool vrrActive = isVrrMode(presentationMode);
     const int maxPending = effectiveMaxPendingFrames(this, vrrActive);
     const bool blocked = preparingNewFrame || pendingFrameCount >= maxPending;
     if (!blocked || (!pendingReschedule && !preparingNewFrame)) { stalledFrameTimeoutCount_ = 0; return; }
     if ((stalledFrameTimeoutCount_ + 1U) < kStalledFrameRecoveryThreshold) { ++stalledFrameTimeoutCount_; armStalledFrameTimer(); return; }
-    stalledFrameTimeoutCount_ = 0;
-    delayedVrrTimer.stop();
+    stalledFrameTimeoutCount_ = 0; delayedVrrTimer.stop();
     if (preparingNewFrame) { preparingNewFrame = false; }
     if (pendingFrameCount > 0) { --pendingFrameCount; }
     if (consecutiveErrorCount < std::numeric_limits<uint8_t>::max()) { ++consecutiveErrorCount; }
@@ -398,29 +363,44 @@ void RenderLoopPrivate::initializeVrrCapabilities()
 
 void RenderLoopPrivate::connectVrrSignals(Window *window)
 {
-    if (!window || !vrrEnabled) { return; }
+    if (!window || !vrrEnabled) {
+        return;
+    }
     SurfaceInterface *const surface = resolvePresentationSurface(window);
-    if (trackedWindow_ == window && trackedSurface_ == surface) { return; }
+    if (trackedWindow_ == window && trackedSurface_ == surface) {
+        return;
+    }
     disconnectVrrSignals();
     trackedWindow_ = window;
     trackedSurfaceItem_ = window->surfaceItem();
     trackedSurface_ = surface;
     vrrConnectionCount_ = 0;
+
     const uint8_t capacity = static_cast<uint8_t>(vrrConnections_.size());
-    auto store = [this, capacity](QMetaObject::Connection c) { if (c && vrrConnectionCount_ < capacity) { vrrConnections_[vrrConnectionCount_++] = c; } };
+    auto store = [this, capacity](QMetaObject::Connection c) {
+        if (c && vrrConnectionCount_ < capacity) {
+            vrrConnections_[vrrConnectionCount_++] = c;
+        }
+    };
+
     store(QObject::connect(window, &QObject::destroyed, q, [this]() { vrrStateDirty_ = true; }));
     store(QObject::connect(window, &Window::fullScreenChanged, q, [this]() { vrrStateDirty_ = true; }));
     store(QObject::connect(window, &Window::outputChanged, q, [this]() { vrrStateDirty_ = true; }));
-    if (surface != nullptr) { store(QObject::connect(surface, &SurfaceInterface::presentationModeHintChanged, q, [this]() { vrrStateDirty_ = true; })); }
+
+    if (surface != nullptr) {
+        store(QObject::connect(surface, &SurfaceInterface::presentationModeHintChanged, q,
+                               [this]() { vrrStateDirty_ = true; }));
+
+        store(QObject::connect(surface, &SurfaceInterface::committed, q,
+                               [this]() { vrrStateDirty_ = true; }));
+    }
 }
 
 void RenderLoopPrivate::disconnectVrrSignals() noexcept
 {
     for (uint8_t i = 0; i < vrrConnectionCount_; ++i) { QObject::disconnect(vrrConnections_[i]); vrrConnections_[i] = {}; }
     vrrConnectionCount_ = 0;
-    trackedWindow_ = nullptr;
-    trackedSurfaceItem_ = nullptr;
-    trackedSurface_ = nullptr;
+    trackedWindow_ = nullptr; trackedSurfaceItem_ = nullptr; trackedSurface_ = nullptr;
 }
 
 void RenderLoopPrivate::invalidateVrrState() noexcept { vrrStateDirty_ = true; }
@@ -456,7 +436,17 @@ void RenderLoopPrivate::updateVrrState() noexcept
     connectVrrSignals(active);
     state.isOnOutput = 1U;
     state.isFullScreen = 1U;
-    if (SurfaceInterface *const surface = trackedSurface_.data()) { state.hint = static_cast<uint8_t>(surface->presentationModeHint()) & 0x3U; state.valid = 1U; }
+    if (SurfaceInterface *const surface = trackedSurface_.data()) {
+        state.hint = static_cast<uint8_t>(surface->presentationModeHint()) & 0x3U;
+        state.valid = 1U;
+
+        // wp_content_type_v1 readout. The mapping helper returns nullopt only
+        // if the surface enum ever grows new variants we don't recognise.
+        if (auto ct = mapContentType(surface->contentType()); ct.has_value()) {
+            state.contentType = static_cast<uint8_t>(*ct) & 0x3U;
+            state.contentTypeValid = 1U;
+        }
+    }
     if (oldRaw != state.toRaw()) { vrrStateCache_.setState(state); }
 }
 
@@ -473,9 +463,8 @@ void RenderLoopPrivate::setActiveContentHint(VrrContentHint hint, std::optional<
 {
     const VrrContentHint oldHint = activeContentHint_;
     activeContentHint_ = hint;
-    if (nominalFrameInterval && nominalFrameInterval->count() > 0) {
-        nominalContentFrameInterval = std::chrono::nanoseconds{std::clamp(nominalFrameInterval->count(), kMinReasonableIntervalNs, kMaxReasonableIntervalNs)};
-    } else { nominalContentFrameInterval = std::chrono::nanoseconds{0}; }
+    if (nominalFrameInterval && nominalFrameInterval->count() > 0) { nominalContentFrameInterval = std::chrono::nanoseconds{std::clamp(nominalFrameInterval->count(), kMinReasonableIntervalNs, kMaxReasonableIntervalNs)}; }
+    else { nominalContentFrameInterval = std::chrono::nanoseconds{0}; }
     if (hint == VrrContentHint::Interactive || hint == VrrContentHint::ForceVrr) { interactiveGraceFrames_ = std::max<uint16_t>(interactiveGraceFrames_, kInteractiveGraceFrames); }
     else if (hint == VrrContentHint::Unknown && contentIsInteractive(oldHint)) { interactiveGraceFrames_ = std::max<uint16_t>(interactiveGraceFrames_, kInteractiveTailFrames); }
     else if (contentIsVideoLike(hint)) { interactiveGraceFrames_ = 0; delayedVrrTimer.stop(); }
@@ -489,8 +478,7 @@ void RenderLoopPrivate::addPresentFeedback(const PresentFeedback &feedback) noex
     if (ts.count() <= 0) { ts = std::chrono::nanoseconds{steadyNowNs()}; }
     PresentSample sample{};
     sample.timestamp = ts;
-    sample.refresh = static_cast<uint32_t>(std::clamp<int64_t>(
-        feedback.refreshDuration.count() > 0 ? feedback.refreshDuration.count() : static_cast<int64_t>(cachedVblankIntervalNs), 0LL, 4'000'000'000LL));
+    sample.refresh = static_cast<uint32_t>(std::clamp<int64_t>(feedback.refreshDuration.count() > 0 ? feedback.refreshDuration.count() : static_cast<int64_t>(cachedVblankIntervalNs), 0LL, 4'000'000'000LL));
     sample.deadlineMissed = feedback.deadlineMissed;
     sample.directScanout = feedback.directScanout;
     sample.valid = true;
@@ -533,26 +521,24 @@ bool RenderLoopPrivate::cadenceMatchesNominal() const noexcept
     return nearIntervalNs(avgNs, nominalNs, toleranceNs) && found >= (kPresentHistorySize >> 2);
 }
 
-// Strict below-floor test. KWin presents on surface damage, so it measures the
-// CONTENT cadence directly (33 ms for 30 fps), not the LFC-doubled panel rate.
-// Therefore strict `>` correctly forces VSync only for genuinely sub-floor
-// content (the LFC-flicker case) and leaves steady at/above-floor content (e.g.
-// 60 fps) on VRR, where a constant in-range rate produces no flicker and avoids
-// non-integer VSync judder.
 bool RenderLoopPrivate::isBelowVrrFloor() const noexcept
 {
+    uint32_t effectiveRateMhz = filteredPanelRefreshRateMhz_;
+    if (effectiveRateMhz == 0) {
+        effectiveRateMhz = static_cast<uint32_t>(refreshRate);
+    }
     int64_t floormHz = vrrCaps_.minRefreshRate;
-    if (floormHz <= 0) { floormHz = kFallbackVrrFloormHz; }
-    const int64_t intervalNs = nominalContentFrameInterval.count() > 0 ? nominalContentFrameInterval.count() : lastIntervalNs_;
-    if (intervalNs <= 0) { return false; }
-    return static_cast<__uint128_t>(intervalNs) * static_cast<uint64_t>(floormHz) > static_cast<__uint128_t>(1'000'000'000'000ULL);
+    if (floormHz <= 0) {
+        floormHz = 48'000;
+    }
+    return effectiveRateMhz > 0
+        && static_cast<uint64_t>(effectiveRateMhz) <= static_cast<uint64_t>(floormHz);
 }
 
 void RenderLoopPrivate::recordModeSwitch() noexcept
 {
     const auto now = std::chrono::steady_clock::now();
-    lastModeSwitch = now;
-    modeDwellCounter_ = 0;
+    lastModeSwitch = now; modeDwellCounter_ = 0;
     modeSwitchHistory_[modeSwitchHistoryHead_] = now;
     modeSwitchHistoryHead_ = static_cast<uint8_t>((modeSwitchHistoryHead_ + 1U) & (kModeSwitchHistorySize - 1U));
     modeSwitchHistoryCount_ += static_cast<uint8_t>(modeSwitchHistoryCount_ < kModeSwitchHistorySize ? 1U : 0U);
@@ -563,159 +549,145 @@ void RenderLoopPrivate::recordModeSwitch() noexcept
     if (modeSwitchHistory_[idx] >= cutoff) [[unlikely]] { vrrOscillationLockout = true; oscillationCooldownCounter_ = kOscillationCooldownFrames; }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// updatePresentationCadence — cadence phase-locked loop.
-//
-// Takes the ABSOLUTE present timestamp (ns). Models periodic content as an
-// oscillator with period contentPeriodNs_ and phase contentPhaseNs_.
-//
-//   * Early presents (cursor / extra damage, arriving before the next grid
-//     point minus tolerance) are recognized and DISCARDED for estimation, so
-//     the lock survives mouse motion — this is the core fix for the flap.
-//   * A sustained run of early presents (kMaxEarlyPresentRun) means the true
-//     rate is faster than the lock (a high-FPS source); the PLL re-acquires and
-//     drops stability below the video threshold, retaining VRR for gaming.
-//   * On-grid presents apply gentle PLL phase (1/4) and frequency (1/8)
-//     correction and a fast stability attack (1/2).
-//   * Off-grid presents slew the period (1/4) and apply a slow stability
-//     release (1/8). Long gaps re-bootstrap cleanly.
-//
-// Output: lastIntervalNs_ = locked period; cadenceStability_ = lock strength.
-// Tolerance = period/8, so it self-calibrates: generous for 24-60 fps video
-// (locks), tiny for 100+ fps gaming (never locks → VRR retained).
-// ─────────────────────────────────────────────────────────────────────────────
-void RenderLoopPrivate::updatePresentationCadence(int64_t presentTimestampNs) noexcept
+void RenderLoopPrivate::updatePresentationCadence(int64_t intervalNs) noexcept
 {
-    const int64_t tsNs = presentTimestampNs;
-
-    // Cold start: establish the phase reference.
-    if (contentPhaseNs_ <= 0) [[unlikely]] {
-        contentPhaseNs_ = tsNs;
-        return;
-    }
-
-    // Unlocked: acquire a period from the first plausible interval.
-    if (contentPeriodNs_ <= 0) {
-        const int64_t interval = tsNs - contentPhaseNs_;
-        contentPhaseNs_ = tsNs;
-        if (interval >= kMinReasonableIntervalNs && interval <= kMaxReasonableIntervalNs) {
-            contentPeriodNs_ = interval;
-            lastIntervalNs_ = interval;
-            cadenceStability_ = 128;
-            earlyPresentRun_ = 0;
-        } else {
-            cadenceStability_ = 128;
-            lastIntervalNs_ = 0;
-        }
-        return;
-    }
-
-    const int64_t period = contentPeriodNs_;
-    const int64_t tolerance = std::max<int64_t>(period >> 3, kCadenceNoiseFloorNs);
-    const int64_t expectedNext = contentPhaseNs_ + period;
-
-    // Early present (cursor / extra damage): preserve the lock entirely.
-    if (tsNs < expectedNext - tolerance) {
-        if (++earlyPresentRun_ >= kMaxEarlyPresentRun) {
-            const int64_t interval = tsNs - contentPhaseNs_;
-            contentPhaseNs_ = tsNs;
-            earlyPresentRun_ = 0;
-            if (interval >= kMinReasonableIntervalNs && interval <= kMaxReasonableIntervalNs) {
-                contentPeriodNs_ = interval;
-                lastIntervalNs_ = interval;
-            } else {
-                contentPeriodNs_ = 0;
-                lastIntervalNs_ = 0;
-            }
-            if (cadenceStability_ > kCadenceUnstableThreshold) { cadenceStability_ = kCadenceUnstableThreshold; }
-        }
-        return;
-    }
-    earlyPresentRun_ = 0;
-
-    const int64_t elapsed = tsNs - contentPhaseNs_;
-
-    // Discontinuity (idle, occlusion, mode change): re-bootstrap cleanly.
-    if (elapsed > kMaxReasonableIntervalNs || elapsed > (period << 3)) [[unlikely]] {
-        contentPhaseNs_ = tsNs;
-        contentPeriodNs_ = 0;
-        lastIntervalNs_ = 0;
-        cadenceStability_ = 128;
-        earlyPresentRun_ = 0;
-        return;
-    }
-
-    // On-or-late present: evaluate against the predicted content grid.
-    int64_t n = (elapsed + (period >> 1)) / period;
-    if (n < 1) { n = 1; }
-    const int64_t predicted = contentPhaseNs_ + n * period;
-    const int64_t phaseError = tsNs - predicted;
-
-    if (fastAbs64(phaseError) <= tolerance) {
-        contentPhaseNs_ = predicted + (phaseError >> 2);
-        const int64_t freqCorr = (phaseError / n) >> 3;
-        contentPeriodNs_ = std::clamp(period + freqCorr, kMinReasonableIntervalNs, kMaxReasonableIntervalNs);
-        lastIntervalNs_ = contentPeriodNs_;
-        const int32_t s = static_cast<int32_t>(cadenceStability_);
-        cadenceStability_ = static_cast<int16_t>(s + ((256 - s) >> 1)); // fast attack
-    } else {
-        contentPhaseNs_ = tsNs;
-        const int64_t interval = elapsed / n;
-        if (interval >= kMinReasonableIntervalNs && interval <= kMaxReasonableIntervalNs) {
-            contentPeriodNs_ = std::clamp(period + ((interval - period) >> 2), kMinReasonableIntervalNs, kMaxReasonableIntervalNs);
-            lastIntervalNs_ = contentPeriodNs_;
-        }
-        const int32_t s = static_cast<int32_t>(cadenceStability_);
-        cadenceStability_ = static_cast<int16_t>(s - (s >> 3)); // slow release
-    }
+    if (intervalNs < kMinReasonableIntervalNs || intervalNs > kMaxReasonableIntervalNs) [[unlikely]] { cadenceStability_ = 128; lastIntervalNs_ = 0; return; }
+    const int64_t prev = lastIntervalNs_;
+    if (prev <= 0) [[unlikely]] { lastIntervalNs_ = intervalNs; return; }
+    const int64_t maxStepNs = std::max<int64_t>(prev >> 1, 250'000LL);
+    const int64_t filtered = std::clamp(intervalNs, std::max<int64_t>(prev - maxStepNs, kMinReasonableIntervalNs), std::min<int64_t>(prev + maxStepNs, kMaxReasonableIntervalNs));
+    lastIntervalNs_ = filtered;
+    const int64_t rawDiff = fastAbs64(filtered - prev);
+    const int64_t diff = rawDiff > kCadenceNoiseFloorNs ? (rawDiff - kCadenceNoiseFloorNs) : 0LL;
+    const int64_t relativeDeviation = std::min<int64_t>((diff << 8) / std::max<int64_t>(prev, 1LL), 256LL);
+    const int32_t sample = static_cast<int32_t>(256LL - relativeDeviation);
+    const int32_t current = static_cast<int32_t>(cadenceStability_);
+    const int32_t isGreater = static_cast<int32_t>(sample > current);
+    const int32_t shift = 1 + (isGreater << 2);
+    const int32_t weight = (1 << shift) - 1;
+    cadenceStability_ = static_cast<int16_t>((current * weight + sample) >> shift);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// selectPresentationMode — wp_content_type_v1 first, hardware truth second
+//
+// THE GODLIKE INSIGHT (finally correct):
+// `wp_content_type_v1` is a stable Wayland protocol that lets the app tell the
+// compositor exactly what kind of content it's showing.  Chromium/Firefox set
+// `video` on fullscreen video surfaces; games typically set `game`.  This is
+// the authoritative signal we've been trying to reverse-engineer all along.
+//
+// Decision priority:
+//   1. capability / policy / fullscreen gates
+//   2. explicit content-hint overrides           (ForceVsync / ForceVrr)
+//   3. explicit presentation-mode hint           (VSync / Async)
+//   4. *** wp_content_type_v1 == Video ***       → VSync   (NEW, top-priority)
+//   5. *** wp_content_type_v1 == Game  ***       → VRR     (NEW, top-priority)
+//   6. active content hint                       (Video/Film/Interactive)
+//   7. interactive grace
+//   8. oscillation guard
+//   9. fallback: panel refresh ≤ floor (stable) → VSync   (un-hinted apps)
+//  10. default                                   → VRR
+// ─────────────────────────────────────────────────────────────────────────────
 
 PresentationMode RenderLoopPrivate::selectPresentationMode() noexcept
 {
     lastDecisionReason_ = VrrDecisionReason::None;
 
-    if (!vrrEnabled || !vrrCapable) [[unlikely]] { videoLockFrames_ = 0; lastDecisionReason_ = VrrDecisionReason::UserPolicy; return PresentationMode::VSync; }
-    if (vrrMode == VrrMode::Never) [[unlikely]] { videoLockFrames_ = 0; lastDecisionReason_ = VrrDecisionReason::UserPolicy; return PresentationMode::VSync; }
+    if (!vrrEnabled || !vrrCapable) [[unlikely]] {
+        lastDecisionReason_ = VrrDecisionReason::UserPolicy;
+        return PresentationMode::VSync;
+    }
+
+    if (vrrMode == VrrMode::Never) [[unlikely]] {
+        lastDecisionReason_ = VrrDecisionReason::UserPolicy;
+        return PresentationMode::VSync;
+    }
 
     const VrrStateCache::State state = vrrStateCache_.getState();
-    if (state.isOnOutput == 0U || state.isFullScreen == 0U) [[unlikely]] { videoLockFrames_ = 0; lastDecisionReason_ = VrrDecisionReason::UserPolicy; return PresentationMode::VSync; }
+    if (state.isOnOutput == 0U || state.isFullScreen == 0U) [[unlikely]] {
+        lastDecisionReason_ = VrrDecisionReason::UserPolicy;
+        return PresentationMode::VSync;
+    }
 
     const PresentationMode adaptive = adaptiveModeForState(state);
     const bool validHint = state.valid != 0U;
-    if (vrrMode == VrrMode::Always) { videoLockFrames_ = 0; lastDecisionReason_ = VrrDecisionReason::UserPolicy; return adaptive; }
 
-    // Tier 2: explicit content-hint overrides
-    if (activeContentHint_ == VrrContentHint::ForceVsync) [[unlikely]] { videoLockFrames_ = 0; lastDecisionReason_ = VrrDecisionReason::ExplicitHint; return PresentationMode::VSync; }
-    if (activeContentHint_ == VrrContentHint::ForceVrr) [[likely]] { videoLockFrames_ = 0; lastDecisionReason_ = VrrDecisionReason::ExplicitHint; return adaptive; }
+    if (vrrMode == VrrMode::Always) {
+        lastDecisionReason_ = VrrDecisionReason::UserPolicy;
+        return adaptive;
+    }
 
-    // Tier 3: explicit surface hints
-    if (isExplicitVsyncHint(state.hint, validHint)) [[unlikely]] { lastDecisionReason_ = VrrDecisionReason::ExplicitHint; return PresentationMode::VSync; }
-    if (isExplicitAsyncHint(state.hint, validHint)) { videoLockFrames_ = 0; lastDecisionReason_ = VrrDecisionReason::ExplicitHint; return PresentationMode::AdaptiveAsync; }
+    // Tier 2: explicit content-hint overrides (set by external APIs)
+    if (activeContentHint_ == VrrContentHint::ForceVsync) [[unlikely]] {
+        lastDecisionReason_ = VrrDecisionReason::ExplicitHint;
+        return PresentationMode::VSync;
+    }
+    if (activeContentHint_ == VrrContentHint::ForceVrr) [[likely]] {
+        lastDecisionReason_ = VrrDecisionReason::ExplicitHint;
+        return adaptive;
+    }
 
-    // Tier 4: explicit Video/Film content hint
-    if (activeContentHint_ == VrrContentHint::Video || activeContentHint_ == VrrContentHint::Film) [[unlikely]] { videoLockFrames_ = kVideoLockFrames; lastDecisionReason_ = VrrDecisionReason::ExplicitHint; return PresentationMode::VSync; }
+    // Tier 3: explicit surface presentation-mode hint (VSync/Async)
+    if (isExplicitVsyncHint(state.hint, validHint)) [[unlikely]] {
+        lastDecisionReason_ = VrrDecisionReason::ExplicitHint;
+        return PresentationMode::VSync;
+    }
+    if (isExplicitAsyncHint(state.hint, validHint)) {
+        lastDecisionReason_ = VrrDecisionReason::ExplicitHint;
+        return PresentationMode::AdaptiveAsync;
+    }
 
-    // Tier 5: confirmed sub-floor video cadence (PLL-locked)
-    if (!validHint && isUnhintedVideoOrFilmCadenceNs(lastIntervalNs_, cadenceStability_) && isBelowVrrFloor()) [[unlikely]] {
-        videoLockFrames_ = kVideoLockFrames;
+    // Tier 4: wp_content_type_v1 == Video  → VSync
+    // The browser/video-player has authoritatively told us this is video.
+    // No inference. No jitter sensitivity. Mouse movement is irrelevant.
+    if (state.isVideoContent()) {
+        lastDecisionReason_ = VrrDecisionReason::ExplicitHint;
+        return PresentationMode::VSync;
+    }
+
+    // Tier 5: wp_content_type_v1 == Game → VRR
+    // The game has authoritatively asked for VRR/tearing.
+    if (state.isGameContent()) {
+        lastDecisionReason_ = VrrDecisionReason::ExplicitHint;
+        return adaptive;
+    }
+
+    // Tier 6: active content hint (Video/Film/Interactive)
+    if (activeContentHint_ == VrrContentHint::Video || activeContentHint_ == VrrContentHint::Film) [[unlikely]] {
+        lastDecisionReason_ = VrrDecisionReason::ExplicitHint;
+        return PresentationMode::VSync;
+    }
+
+    // Tier 7: interactive / grace
+    if (activeContentHint_ == VrrContentHint::Interactive || interactiveGraceFrames_ > 0U) [[likely]] {
+        lastDecisionReason_ = VrrDecisionReason::InteractiveGrace;
+        return adaptive;
+    }
+
+    // Tier 8: oscillation guard
+    if (vrrOscillationLockout && oscillationCooldownCounter_ > 0U) [[unlikely]] {
+        lastDecisionReason_ = VrrDecisionReason::OscillationGuard;
+        return PresentationMode::VSync;
+    }
+
+    // Tier 9: fallback for unhinted apps — panel-refresh-rate floor protection.
+    // This catches old apps that don't set wp_content_type_v1.  The panel rate
+    // is hardware ground truth from wp_presentation_feedback, so it's immune
+    // to mouse jitter.  Stability counter prevents false triggers.
+    if (isBelowVrrFloor() && panelRefreshStableCount_ >= kPanelRefreshFloorStableFrames) {
         lastDecisionReason_ = VrrDecisionReason::BelowVrrFloor;
         return PresentationMode::VSync;
     }
 
-    // Tier 5.5: sticky video lock (decrement atomic with the read)
-    if (videoLockFrames_ > 0U) { --videoLockFrames_; lastDecisionReason_ = VrrDecisionReason::BelowVrrFloor; return PresentationMode::VSync; }
-
-    // Tier 6: interactive / grace
-    if (activeContentHint_ == VrrContentHint::Interactive || interactiveGraceFrames_ > 0U) [[likely]] { lastDecisionReason_ = VrrDecisionReason::InteractiveGrace; return adaptive; }
-
-    // Tier 7: oscillation guard
-    if (vrrOscillationLockout && oscillationCooldownCounter_ > 0U) [[unlikely]] { lastDecisionReason_ = VrrDecisionReason::OscillationGuard; return PresentationMode::VSync; }
-
-    // Tier 8: ambiguous
+    // Tier 10: ambiguous, keep current
     const int64_t vblankNs = static_cast<int64_t>(cachedVblankIntervalNs);
-    if (cadenceStability_ < kCadenceUnstableThreshold && lastIntervalNs_ <= (vblankNs * 4)) { lastDecisionReason_ = VrrDecisionReason::AmbiguousKeepCurrent; return presentationMode; }
+    if (cadenceStability_ < kCadenceUnstableThreshold && lastIntervalNs_ <= (vblankNs * 4)) {
+        lastDecisionReason_ = VrrDecisionReason::AmbiguousKeepCurrent;
+        return presentationMode;
+    }
 
-    // Tier 9: default
+    // Tier 11: default adaptive
     lastDecisionReason_ = VrrDecisionReason::AmbiguousKeepCurrent;
     return adaptive;
 }
@@ -731,42 +703,35 @@ bool RenderLoopPrivate::shouldSwitchMode(PresentationMode target) noexcept
     const bool validHint = state.valid != 0U;
     const bool explicitVsync = isExplicitVsyncHint(state.hint, validHint);
     const bool explicitAsync = isExplicitAsyncHint(state.hint, validHint);
-    const bool filmFallback = (lastDecisionReason_ == VrrDecisionReason::BelowVrrFloor);
+    const bool explicitVideoCT = state.isVideoContent();
+    const bool explicitGameCT  = state.isGameContent();
+    const bool floorTriggered  = (lastDecisionReason_ == VrrDecisionReason::BelowVrrFloor);
 
-    // Immediate, un-rate-limited exit when VRR can't apply (window closed etc.).
-    if (exitingToVsync && (!vrrEnabled || !vrrCapable || vrrMode == VrrMode::Never || !fullscreenOnOutput)) {
-        pendingModeCounter_ = 0; pendingTargetMode_ = target; lastStableMode = target; return true;
-    }
-
+    if (exitingToVsync && (!vrrEnabled || !vrrCapable || vrrMode == VrrMode::Never || !fullscreenOnOutput)) { pendingModeCounter_ = 0; pendingTargetMode_ = target; lastStableMode = target; return true; }
     if (modeDwellCounter_ < kMinModeDwellFrames) { return false; }
 
     if (pendingTargetMode_ == target) { if (pendingModeCounter_ < std::numeric_limits<uint16_t>::max()) { ++pendingModeCounter_; } }
     else { pendingTargetMode_ = target; pendingModeCounter_ = 1; }
 
     uint16_t threshold = exitingToVsync ? kVrrToVsyncStabilityFrames : kVsyncToVrrStabilityFrames;
+
     if (exitingToVsync) {
         if (activeContentHint_ == VrrContentHint::ForceVsync) { threshold = 1U; }
+        else if (explicitVideoCT) { threshold = 1U; }                                 // wp_content_type=Video → instant
         else if (activeContentHint_ == VrrContentHint::Video || activeContentHint_ == VrrContentHint::Film) { threshold = cadenceMatchesNominal() ? 2U : 3U; }
         else if (explicitVsync) { threshold = 2U; }
-        else if (filmFallback) { threshold = 3U; }
+        else if (floorTriggered) { threshold = 1U; }                                  // panel-rate fallback already stable
         else { return false; }
     } else {
         if (activeContentHint_ == VrrContentHint::ForceVrr) { threshold = 1U; }
+        else if (explicitGameCT) { threshold = 1U; }                                  // wp_content_type=Game → instant
         else if (activeContentHint_ == VrrContentHint::Interactive || interactiveGraceFrames_ > 0U) { threshold = 1U; }
         else if (explicitAsync) { threshold = 1U; }
         else if (q->activeWindowControlsVrrRefreshRate()) { threshold = 1U; }
         else { threshold = 2U; }
     }
 
-    if (pendingModeCounter_ >= threshold) {
-        // Hard anti-flap backstop: never toggle VRR more than once per
-        // kMinModeSwitchInterval. pendingModeCounter_ keeps accumulating, so the
-        // switch is only delayed (never lost) until the interval elapses.
-        if ((std::chrono::steady_clock::now() - lastModeSwitch) < kMinModeSwitchInterval) { return false; }
-        pendingModeCounter_ = 0;
-        lastStableMode = target;
-        return true;
-    }
+    if (pendingModeCounter_ >= threshold) { pendingModeCounter_ = 0; lastStableMode = target; return true; }
     return false;
 }
 
@@ -800,6 +765,9 @@ void RenderLoopPrivate::scheduleRepaint()
 {
     if (q->thread() != QThread::currentThread()) [[unlikely]] { QMetaObject::invokeMethod(q, [this]() { scheduleRepaint(); }, Qt::QueuedConnection); return; }
     pendingReschedule = false;
+
+    if (directScanoutActive_) { return; }
+
     const uint64_t vblankNs = cachedVblankIntervalNs;
     if (vblankNs == 0) [[unlikely]] { return; }
     const int64_t nowNs = steadyNowNs();
@@ -823,7 +791,9 @@ void RenderLoopPrivate::scheduleRepaint()
     const int maxPending = effectiveMaxPendingFrames(this, vrrActive);
     if (pendingFrameCount >= maxPending) {
         if (!vrrActive && delayedVrrTimer.isActive()) { delayedVrrTimer.stop(); }
-        pendingReschedule = true; armStalledFrameTimer(); return;
+        pendingReschedule = true;
+        armStalledFrameTimer();
+        return;
     }
     disarmStalledFrameTimer();
     const int64_t vblankI64 = static_cast<int64_t>(vblankNs);
@@ -906,6 +876,7 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
                                              OutputFrame *frame)
 {
     const bool directScanout = frame != nullptr && !renderTime.has_value();
+
     auto buildFeedback = [this, timestamp, frame, mode, directScanout]() -> std::optional<PresentFeedback> {
         if (!frame) { return std::nullopt; }
         PresentFeedback feedback{};
@@ -921,32 +892,91 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
         feedback.valid = true;
         return feedback;
     };
+
     const std::optional<PresentFeedback> initialFeedback = buildFeedback();
+
     if (q->thread() != QThread::currentThread()) [[unlikely]] {
-        QMetaObject::invokeMethod(q, [this, timestamp, renderTime, mode, initialFeedback]() { notifyFrameCompleted(timestamp, renderTime, mode, nullptr); if (initialFeedback.has_value()) { addPresentFeedback(*initialFeedback); } }, Qt::QueuedConnection);
+        QMetaObject::invokeMethod(q, [this, timestamp, renderTime, mode, initialFeedback]() {
+            notifyFrameCompleted(timestamp, renderTime, mode, nullptr);
+            if (initialFeedback.has_value()) { addPresentFeedback(*initialFeedback); }
+        }, Qt::QueuedConnection);
         return;
     }
+
     preparingNewFrame = false;
     consecutiveErrorCount = 0;
-    if (s_debugEnabled && frame) [[unlikely]] { writeDebug(this, renderTime, std::chrono::duration_cast<std::chrono::nanoseconds>(frame->targetPageflipTime().time_since_epoch()), frame->refreshDuration(), frame->predictedRenderTime(), timestamp, mode); }
+
+    if (s_debugEnabled && frame) [[unlikely]] {
+        writeDebug(this, renderTime, std::chrono::duration_cast<std::chrono::nanoseconds>(frame->targetPageflipTime().time_since_epoch()),
+            frame->refreshDuration(), frame->predictedRenderTime(), timestamp, mode);
+    }
+
     if (pendingFrameCount > 0) { --pendingFrameCount; }
+
     const int64_t prevPresentationNs = lastPresentationTimestamp.count();
     const int64_t nowNs = steadyNowNs();
     int64_t tsNs = timestamp.count();
     if (tsNs > nowNs) [[unlikely]] { tsNs = nowNs; }
     if (tsNs < prevPresentationNs) [[unlikely]] { tsNs = prevPresentationNs; }
+
     lastPresentationTimestamp = std::chrono::nanoseconds{tsNs};
-    updatePresentationCadence(tsNs); // PLL consumes the absolute timestamp
-    if (renderTime) { const auto dur = renderTime->end - renderTime->start; renderJournal.add(dur, timestamp); updateFramePrediction(dur); }
+    updatePresentationCadence(tsNs - prevPresentationNs);
+
+    // Panel-rate ground truth from wp_presentation_feedback.
+    // IIR-filter (weight = 7/8) absorbs single-frame hiccups but tracks real
+    // mode changes within ~6 frames (100 ms at 60 Hz).
+    if (frame && frame->refreshDuration().count() > 0) {
+        const int64_t refreshDurNs = frame->refreshDuration().count();
+        currentPanelRefreshRateMhz_ = static_cast<uint32_t>(1'000'000'000'000ULL / static_cast<uint64_t>(refreshDurNs));
+        if (filteredPanelRefreshRateMhz_ == 0) { filteredPanelRefreshRateMhz_ = currentPanelRefreshRateMhz_; }
+        else {
+            filteredPanelRefreshRateMhz_ = (7U * filteredPanelRefreshRateMhz_ + currentPanelRefreshRateMhz_ + 4U) / 8U;
+        }
+    }
+
+    directScanoutActive_ = directScanout;
+
+    if (renderTime && !directScanout) {
+        const auto dur = renderTime->end - renderTime->start;
+        renderJournal.add(dur, timestamp);
+        updateFramePrediction(dur);
+    }
+
     if (interactiveGraceFrames_ > 0U) { --interactiveGraceFrames_; }
-    if (isVrrMode(mode)) { if (starvationRecoveryCounter < kStarvationRecoveryFrames) { ++starvationRecoveryCounter; } } else { starvationRecoveryCounter = 0; }
+
+    if (isVrrMode(mode)) { if (starvationRecoveryCounter < kStarvationRecoveryFrames) { ++starvationRecoveryCounter; } }
+    else { starvationRecoveryCounter = 0; }
+
     if (initialFeedback.has_value()) { addPresentFeedback(*initialFeedback); }
+
+    // Stability counter for the unhinted-fallback floor check.
+    {
+        uint32_t effectiveRateMhz = filteredPanelRefreshRateMhz_;
+        if (effectiveRateMhz == 0) { effectiveRateMhz = static_cast<uint32_t>(refreshRate); }
+        int64_t floormHz = vrrCaps_.minRefreshRate;
+        if (floormHz <= 0) { floormHz = 48'000; }
+        const bool atOrBelowFloor = effectiveRateMhz > 0 && effectiveRateMhz <= static_cast<uint32_t>(floormHz);
+        if (atOrBelowFloor) {
+            if (panelRefreshStableCount_ < 255U) { ++panelRefreshStableCount_; }
+        } else {
+            panelRefreshStableCount_ = 0;
+        }
+    }
+
     const bool vrrActive = isVrrMode(presentationMode);
     const int maxPending = effectiveMaxPendingFrames(this, vrrActive);
     if (!preparingNewFrame && pendingFrameCount < maxPending) { disarmStalledFrameTimer(); }
     else if (pendingReschedule) { armStalledFrameTimer(); }
-    if (compositeTimer.isActive()) { compositeTimer.stop(); scheduledTimerMs = -1; scheduleRepaint(); }
-    else if (inhibitCount == 0 && (pendingReschedule || pendingFrameCount == 0)) { pendingReschedule = false; scheduleNextRepaint(); }
+
+    if (compositeTimer.isActive()) {
+        compositeTimer.stop();
+        scheduledTimerMs = -1;
+        scheduleRepaint();
+    } else if (inhibitCount == 0 && (pendingReschedule || pendingFrameCount == 0)) {
+        pendingReschedule = false;
+        scheduleNextRepaint();
+    }
+
     Q_EMIT q->framePresented(q, timestamp, mode);
 }
 

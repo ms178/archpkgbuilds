@@ -30,32 +30,58 @@ class SurfaceInterface;
 class OutputFrame;
 class Window;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// VrrStateCache
+//
+// 1-byte cache of the per-frame VRR decision inputs.  The wp_content_type_v1
+// content type (video/game/none) is now persisted alongside the presentation
+// mode hint and fullscreen state; both fit in the previously-reserved bits.
+//
+// Layout (still exactly 1 byte):
+//   bits 0-1 : hint           (PresentationModeHint VSync=0, Async=1)
+//   bit  2   : isOnOutput
+//   bit  3   : isFullScreen
+//   bit  4   : valid          (hint is valid)
+//   bits 5-6 : contentType    (0=None, 1=Photo, 2=Video, 3=Game)
+//   bit  7   : contentTypeValid
+// ─────────────────────────────────────────────────────────────────────────────
 class VrrStateCache final
 {
 public:
+    enum class ContentTypeBits : uint8_t {
+        None = 0,
+        Photo = 1,
+        Video = 2,
+        Game = 3,
+    };
+
     struct State {
         uint8_t hint : 2;
         uint8_t isOnOutput : 1;
         uint8_t isFullScreen : 1;
         uint8_t valid : 1;
-        uint8_t reserved : 3;
+        uint8_t contentType : 2;
+        uint8_t contentTypeValid : 1;
 
         constexpr State() noexcept
             : hint(0)
             , isOnOutput(0)
             , isFullScreen(0)
             , valid(0)
-            , reserved(0)
+            , contentType(0)
+            , contentTypeValid(0)
         {
         }
 
         [[nodiscard]] constexpr uint8_t toRaw() const noexcept
         {
-            const uint8_t h = static_cast<uint8_t>(hint & 0x3U);
-            const uint8_t on = static_cast<uint8_t>((isOnOutput != 0U) ? 1U : 0U);
-            const uint8_t fs = static_cast<uint8_t>((isFullScreen != 0U) ? 1U : 0U);
-            const uint8_t v = static_cast<uint8_t>((valid != 0U) ? 1U : 0U);
-            return static_cast<uint8_t>(h | (on << 2) | (fs << 3) | (v << 4));
+            return static_cast<uint8_t>(
+                  (hint & 0x3U)
+                | ((isOnOutput & 0x1U) << 2)
+                | ((isFullScreen & 0x1U) << 3)
+                | ((valid & 0x1U) << 4)
+                | ((contentType & 0x3U) << 5)
+                | ((contentTypeValid & 0x1U) << 7));
         }
 
         [[nodiscard]] static constexpr State fromRaw(uint8_t raw) noexcept
@@ -65,12 +91,25 @@ public:
             s.isOnOutput = static_cast<uint8_t>((raw >> 2) & 0x1U);
             s.isFullScreen = static_cast<uint8_t>((raw >> 3) & 0x1U);
             s.valid = static_cast<uint8_t>((raw >> 4) & 0x1U);
-            s.reserved = 0U;
+            s.contentType = static_cast<uint8_t>((raw >> 5) & 0x3U);
+            s.contentTypeValid = static_cast<uint8_t>((raw >> 7) & 0x1U);
             return s;
+        }
+
+        [[nodiscard]] constexpr bool isVideoContent() const noexcept
+        {
+            return contentTypeValid != 0U
+                && static_cast<ContentTypeBits>(contentType) == ContentTypeBits::Video;
+        }
+
+        [[nodiscard]] constexpr bool isGameContent() const noexcept
+        {
+            return contentTypeValid != 0U
+                && static_cast<ContentTypeBits>(contentType) == ContentTypeBits::Game;
         }
     };
 
-    static_assert(sizeof(State) == 1);
+    static_assert(sizeof(State) == 1, "VrrStateCache::State must remain 1 byte");
     static_assert(std::is_trivially_copyable_v<State>);
 
     constexpr void setState(State s) noexcept { m_state = s.toRaw(); }
@@ -119,16 +158,6 @@ public:
     int64_t tripleBufferEnterThresholdNs{0};
     int64_t tripleBufferExitThresholdNs{0};
 
-    // ---- Cadence phase-locked loop (PLL) ----
-    // The render loop models periodic content as an oscillator. contentPeriodNs_
-    // is the locked frame period; contentPhaseNs_ is the timestamp of the last
-    // accepted on-grid content frame. Off-grid presents (cursor / extra damage)
-    // are recognized and rejected, so the lock survives mouse motion. The PLL
-    // drives lastIntervalNs_ and cadenceStability_ so all existing consumers see
-    // a clean, jitter-immune cadence estimate.
-    int64_t contentPhaseNs_{0};
-    int64_t contentPeriodNs_{0};
-
     QBasicTimer compositeTimer;
     QBasicTimer delayedVrrTimer;
     QBasicTimer stalledFrameTimer;
@@ -148,8 +177,15 @@ public:
     uint16_t pendingModeCounter_{0};
     uint16_t oscillationCooldownCounter_{0};
     uint16_t interactiveGraceFrames_{0};
-    uint16_t videoLockFrames_{0};
-    uint16_t earlyPresentRun_{0}; // consecutive off-grid (early) presents; PLL re-lock trigger
+
+    // Panel-refresh-rate ground truth (from wp_presentation_feedback).
+    uint32_t currentPanelRefreshRateMhz_{0};
+    uint32_t filteredPanelRefreshRateMhz_{0};
+    uint8_t  panelRefreshStableCount_{0};
+
+    // Direct scanout guard: when true, scheduleRepaint() returns early so we
+    // don't waste GPU cycles compositing during a client's direct scanout.
+    bool directScanoutActive_{false};
 
     uint8_t reciprocalShift64{0};
     uint8_t consecutiveErrorCount{0};
@@ -189,7 +225,10 @@ public:
     QPointer<Window> trackedWindow_{nullptr};
     QPointer<SurfaceItem> trackedSurfaceItem_{nullptr};
     QPointer<SurfaceInterface> trackedSurface_{nullptr};
-    std::array<QMetaObject::Connection, 4> vrrConnections_{};
+
+    // One extra connection slot for SurfaceInterface::contentTypeChanged.
+    // The array grows from 4 to 5 — still tiny, still cache-friendly.
+    std::array<QMetaObject::Connection, 5> vrrConnections_{};
 
     std::optional<std::fstream> m_debugOutput;
 
@@ -224,7 +263,7 @@ public:
     [[nodiscard]] bool detectVrrOscillation() noexcept;
 
     void updateFramePrediction(std::chrono::nanoseconds measured) noexcept;
-    void updatePresentationCadence(int64_t presentTimestampNs) noexcept;
+    void updatePresentationCadence(int64_t intervalNs) noexcept;
     void dispatch();
     void delayScheduleRepaint() noexcept;
     void scheduleNextRepaint();
