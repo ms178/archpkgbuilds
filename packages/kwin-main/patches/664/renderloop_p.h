@@ -158,6 +158,7 @@ public:
     uint16_t pendingModeCounter_{0};
     uint16_t oscillationCooldownCounter_{0};
     uint16_t interactiveGraceFrames_{0};
+    uint16_t videoLockFrames_{0}; // sticky VSync-for-video lock; immune to mouse jitter
 
     uint8_t reciprocalShift64{0};
     uint8_t consecutiveErrorCount{0};

@@ -67,16 +67,13 @@ constexpr int kMaxErrorBackoffMs = 50;
 constexpr int64_t kTimerJitterFilterNs = 250'000;
 constexpr int64_t kCadenceNoiseFloorNs = 125'000;
 
-// Standard broadcast/film/web frame periods (ns).
 constexpr int64_t kFilm24Ns  = 41'666'666; // 23.976 / 24 fps
 constexpr int64_t kFilm25Ns  = 40'000'000; // 25 fps (PAL)
 constexpr int64_t kVideo30Ns = 33'333'333; // 29.97 / 30 fps
 constexpr int64_t kVideo50Ns = 20'000'000; // 50 fps (PAL)
 constexpr int64_t kVideo60Ns = 16'666'666; // 59.94 / 60 fps
-
-// Fallback VRR floor (mHz) used only if the panel capability is unknown.
-// 48 Hz is the most common FreeSync floor and is safely above 24/25/30 fps.
 constexpr int64_t kFallbackVrrFloormHz = 48'000;
+constexpr uint16_t kVideoLockFrames = 120;
 
 constexpr int64_t kStalledFrameMinTimeoutNs = 12'000'000;
 constexpr int64_t kStalledFrameMaxTimeoutNs = 120'000'000;
@@ -861,39 +858,26 @@ void RenderLoopPrivate::updatePresentationCadence(int64_t intervalNs) noexcept
     cadenceStability_ = static_cast<int16_t>((current * weight + sample) >> shift);
 }
 
-// VRR presentation-mode decision.
-//
-// Tier order (red-team corrected):
-//   1. capability / policy / fullscreen gates
-//   2. explicit content-hint overrides (ForceVsync/ForceVrr)
-//   3. explicit surface hints (VSync/Async)
-//   4. explicit Video/Film content hint -> VSync
-//   5. *** sub-floor video/film cadence latch -> VSync ***  (moved ABOVE grace)
-//   6. interactive / grace -> adaptive
-//   7. oscillation guard
-//   8. ambiguous keep-current
-//   9. default adaptive
-//
-// Tier 5 is the YouTube fix: a stable standard cadence (24/25/30/50/60 fps)
-// that is below the panel VRR floor is forced to fixed-refresh VSync. The
-// below-floor gate makes this provably safe for gaming: a 144 fps game never
-// matches a video cadence, and a 60 fps game (== floor, not below) keeps VRR.
 PresentationMode RenderLoopPrivate::selectPresentationMode() noexcept
 {
     lastDecisionReason_ = VrrDecisionReason::None;
 
     if (!vrrEnabled || !vrrCapable) [[unlikely]] {
+        videoLockFrames_ = 0;
         lastDecisionReason_ = VrrDecisionReason::UserPolicy;
         return PresentationMode::VSync;
     }
 
     if (vrrMode == VrrMode::Never) [[unlikely]] {
+        videoLockFrames_ = 0;
         lastDecisionReason_ = VrrDecisionReason::UserPolicy;
         return PresentationMode::VSync;
     }
 
     const VrrStateCache::State state = vrrStateCache_.getState();
     if (state.isOnOutput == 0U || state.isFullScreen == 0U) [[unlikely]] {
+        // Not fullscreen on this output: any video lock is irrelevant.
+        videoLockFrames_ = 0;
         lastDecisionReason_ = VrrDecisionReason::UserPolicy;
         return PresentationMode::VSync;
     }
@@ -902,68 +886,81 @@ PresentationMode RenderLoopPrivate::selectPresentationMode() noexcept
     const bool validHint = state.valid != 0U;
 
     if (vrrMode == VrrMode::Always) {
+        videoLockFrames_ = 0;
         lastDecisionReason_ = VrrDecisionReason::UserPolicy;
         return adaptive;
     }
 
-    // Tier 2: explicit content-hint overrides
+    // Tier 2: explicit content-hint overrides.
     if (activeContentHint_ == VrrContentHint::ForceVsync) [[unlikely]] {
         lastDecisionReason_ = VrrDecisionReason::ExplicitHint;
         return PresentationMode::VSync;
     }
 
     if (activeContentHint_ == VrrContentHint::ForceVrr) [[likely]] {
+        videoLockFrames_ = 0; // explicit VRR intent dissolves any video lock
         lastDecisionReason_ = VrrDecisionReason::ExplicitHint;
         return adaptive;
     }
 
-    // Tier 3: explicit surface hints
+    // Tier 3: explicit surface hints.
     if (isExplicitVsyncHint(state.hint, validHint)) [[unlikely]] {
         lastDecisionReason_ = VrrDecisionReason::ExplicitHint;
         return PresentationMode::VSync;
     }
 
     if (isExplicitAsyncHint(state.hint, validHint)) {
+        videoLockFrames_ = 0; // explicit async/tearing intent dissolves the lock
         lastDecisionReason_ = VrrDecisionReason::ExplicitHint;
         return PresentationMode::AdaptiveAsync;
     }
 
-    // Tier 4: explicit Video/Film content hint
+    // Tier 4: explicit Video/Film content hint -> VSync (and arm the lock).
     if (activeContentHint_ == VrrContentHint::Video || activeContentHint_ == VrrContentHint::Film) [[unlikely]] {
+        videoLockFrames_ = kVideoLockFrames;
         lastDecisionReason_ = VrrDecisionReason::ExplicitHint;
         return PresentationMode::VSync;
     }
 
-    // Tier 5: sub-floor video/film cadence latch (YouTube 30 fps flicker fix).
-    // Evaluated BEFORE interactive grace so a recently-moved mouse cannot keep
-    // flickering VRR active over fixed-rate fullscreen video.
+    // Tier 5: confirmed sub-or-equal-floor video cadence -> VSync (arm the lock).
     if (!validHint
         && isUnhintedVideoOrFilmCadenceNs(lastIntervalNs_, cadenceStability_)
         && isBelowVrrFloor()) [[unlikely]] {
+        videoLockFrames_ = kVideoLockFrames;
         lastDecisionReason_ = VrrDecisionReason::BelowVrrFloor;
         return PresentationMode::VSync;
     }
 
-    // Tier 6: interactive / grace
+    // Tier 5.5: STICKY VIDEO LOCK.
+    // The cadence reading is transiently broken (e.g. by mouse-driven repaints),
+    // but a genuine video stream was confirmed within the lock window. Hold VSync
+    // so the mode cannot flap. The lock is NOT refreshed here; it decays via
+    // notifyFrameCompleted and is renewed only by a real Tier 4/5 video frame.
+    if (videoLockFrames_ > 0U) {
+        lastDecisionReason_ = VrrDecisionReason::BelowVrrFloor;
+        return PresentationMode::VSync;
+    }
+
+    // Tier 6: interactive / grace.
     if (activeContentHint_ == VrrContentHint::Interactive || interactiveGraceFrames_ > 0U) [[likely]] {
         lastDecisionReason_ = VrrDecisionReason::InteractiveGrace;
         return adaptive;
     }
 
-    // Tier 7: oscillation guard
+    // Tier 7: oscillation guard.
     if (vrrOscillationLockout && oscillationCooldownCounter_ > 0U) [[unlikely]] {
         lastDecisionReason_ = VrrDecisionReason::OscillationGuard;
         return PresentationMode::VSync;
     }
 
-    // Tier 8: ambiguous, cadence too unstable -> keep current
+    // Tier 8: ambiguous, keep current.
     const int64_t vblankNs = static_cast<int64_t>(cachedVblankIntervalNs);
     if (cadenceStability_ < kCadenceUnstableThreshold && lastIntervalNs_ <= (vblankNs * 4)) {
         lastDecisionReason_ = VrrDecisionReason::AmbiguousKeepCurrent;
         return presentationMode;
     }
 
-    // Tier 9: default -> keep VRR active
+    // Tier 9: default adaptive.
     lastDecisionReason_ = VrrDecisionReason::AmbiguousKeepCurrent;
     return adaptive;
 }
@@ -1416,6 +1413,10 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
         --interactiveGraceFrames_;
     }
 
+    if (videoLockFrames_ > 0U) {
+        --videoLockFrames_;
+    }
+
     if (isVrrMode(mode)) {
         if (starvationRecoveryCounter < kStarvationRecoveryFrames) {
             ++starvationRecoveryCounter;
@@ -1728,9 +1729,23 @@ bool RenderLoop::activeWindowControlsVrrRefreshRate() const
         return false;
     }
 
+    // A surface presenting faster than 30fps is necessary but NOT sufficient to
+    // be a game: steady 60fps video also passes that bar and would flicker in
+    // VRR. The distinguishing signature of a game is frame-rate *variability*
+    // (it renders as-fast-as-possible with jitter), whereas video is metronomic
+    // with very high cadence stability. Require sub-maximal stability so that a
+    // perfectly steady fixed cadence (video) is NOT treated as a game and stays
+    // on flicker-free VSync, while a jittery game is correctly given VRR.
     constexpr auto k30HzFrame = std::chrono::nanoseconds{1'000'000'000LL / 30LL};
     const auto estimate = surface->recursiveFrameTimeEstimation();
-    return durationEstimateAtMost(estimate, k30HzFrame);
+    if (!durationEstimateAtMost(estimate, k30HzFrame)) {
+        return false;
+    }
+
+    // kCadenceStableThreshold (224) ~= "metronomic". Video sits at/above it;
+    // games sit below it. This is the same metric the scheduler already
+    // maintains, so it costs nothing extra and adds no state.
+    return d->cadenceStability_ < kCadenceStableThreshold;
 }
 
 std::chrono::nanoseconds RenderLoop::lastPresentationTimestamp() const
