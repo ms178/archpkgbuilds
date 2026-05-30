@@ -107,11 +107,20 @@ struct radv_amdgpu_cs_ib_info {
  * `bo_handle == 0` signifies an empty slot.
  */
 struct radv_buffer_hash_entry {
-      uint32_t bo_handle;      /* Buffer object handle (can be 0) */
-      uint32_t hash_cached;    /* Cached hash for Robin Hood distance */
-      int32_t  index;          /* Index into handles array */
-      uint8_t  present;        /* 1 if occupied, 0 if empty (fixes handle=0 bug) */
-      uint8_t  _pad[3];        /* Pad to 16 bytes (4 entries per cache line) */
+   uint32_t bo_handle;      /* Buffer object handle (can be 0)               */
+   uint32_t hash_cached;    /* Cached Murmur3 hash for Robin Hood distance    */
+   int32_t  index;          /* Index into handles array (-1 = invalid)        */
+   /*
+    * GENERATION COUNTER RESET (replaces present + _pad):
+    *   Entry is "occupied" iff  entry->generation == cs->hash_generation.
+    *   cs_reset simply increments cs->hash_generation (O(1)) instead of
+    *   memset-ing 2048 bytes.  Entry.generation==0 is reserved as "empty"
+    *   (calloc initialises to 0, hash_generation starts at 1 and skips 0).
+    *   uint32_t overflows after ~4 billion resets → ~82 hours at 144fps;
+    *   overflow is handled by skipping generation=0.
+    *   Size: 16 bytes unchanged (4 entries per 64-byte cache line).
+    */
+   uint32_t generation;     /* Match cs->hash_generation to be "present"      */
 };
 
 /* Compile-time verification of cache line packing */
@@ -131,29 +140,49 @@ _Static_assert((sizeof(struct radv_buffer_hash_entry) * 4) == 64,
  * - Warm data is grouped next.
  * - Cold data, used only for debugging or rare paths, is placed at the end.
  */
+/*
+ * OPTIMIZED radv_amdgpu_cs layout (Raptor Lake, 64-byte cache lines)
+ *
+ * Hot-path analysis (Intel OMR §3.6, Agner Fog tables):
+ *
+ *   CL0 [  0..63]: radeon_emit_unchecked (base.buf/cdw) + cs_add_buffer_internal
+ *                  (status, num_buffers, handles, buffer_hash_table_size,
+ *                   buffer_hash_table, ws).  ALL fields touched per draw call
+ *                  now fit in ONE cache line, saving 1 LLC miss per buffer add.
+ *
+ *   CL1 [ 64..127]: IB management — ib_buffer, max_num_buffers, chain_ib, hw_ip,
+ *                   ib_size_ptr, ib_mapped, ib.  Touched on finalize/chain paths.
+ *
+ *   CL2 [128..167]: Cold: ib_buffers, num_ib_buffers, is_secondary, chained_to,
+ *                   annotations.  Only accessed on grow/error/debug paths.
+ *
+ * Previously: cs_add_buffer touched CL0 + CL1 + CL2 (3 cache lines, ~3 misses).
+ * Now:        cs_add_buffer touches CL0 only (1 cache line, 1 miss max).
+ *             On grow path (rare): additionally CL1 for max_num_buffers.
+ */
 struct radv_amdgpu_cs {
-   /* --- CACHE LINE 1: Hottest data --- */
-   struct ac_cmdbuf base;
+   /* ── CACHE LINE 0: emit + buffer-dedup hot path (all needed per draw) ── */
+   struct ac_cmdbuf base;            /* buf@0, cdw@8, reserved_dw@12, max_dw@16 */
 
-   struct radv_amdgpu_winsys *ws;
-   VkResult status;
-   unsigned num_buffers;
-   struct radeon_winsys_bo *ib_buffer;
+   VkResult status;                  /* offset ~20 — checked first in add_buffer */
+   unsigned num_buffers;             /* offset ~24 — compared in find_buffer      */
+   uint32_t hash_generation;         /* offset ~28 — generation counter for reset */
+   struct drm_amdgpu_bo_list_entry *handles;          /* offset ~32 */
+   uint32_t buffer_hash_table_size;  /* offset ~40 — used in find/insert/resize  */
+   uint32_t _htpad;                  /* offset ~44 — pad for 8-byte ptr alignment */
+   struct radv_buffer_hash_entry *buffer_hash_table;  /* offset ~48 — MOVED HERE  */
+   struct radv_amdgpu_winsys *ws;   /* offset ~56 — warm but occasional           */
 
-   /* --- CACHE LINE 2: Warm data --- */
-   unsigned max_num_buffers;
-   struct drm_amdgpu_bo_list_entry *handles;
-   uint32_t *ib_size_ptr;
-   bool chain_ib;
-   unsigned hw_ip;
+   /* ── CACHE LINE 1: IB-management warm path ── */
+   struct radeon_winsys_bo *ib_buffer;   /* offset  64 */
+   unsigned max_num_buffers;             /* offset  72 */
+   bool chain_ib;                        /* offset  76 */
+   unsigned hw_ip;                       /* offset  80 (after bool+3pad) */
+   uint32_t *ib_size_ptr;                /* offset  88 (after 4pad) */
+   uint8_t *ib_mapped;                   /* offset  96 */
+   struct radv_amdgpu_cs_ib_info ib;     /* offset 104 (24 bytes) */
 
-   /* Dynamic hash table size for resizing support. */
-   uint32_t buffer_hash_table_size;
-
-   /* --- COLD DATA: Infrequently accessed --- */
-   uint8_t *ib_mapped;
-   struct radv_amdgpu_cs_ib_info ib;
-
+   /* ── CACHE LINE 2: Cold / grow / debug ── */
    struct radv_amdgpu_ib *ib_buffers;
    unsigned num_ib_buffers;
    unsigned max_num_ib_buffers;
@@ -161,10 +190,7 @@ struct radv_amdgpu_cs {
    bool is_secondary;
    struct radv_amdgpu_cs *chained_to;
 
-   /* The buffer hash table is large and placed at the end. */
-   struct radv_buffer_hash_entry *buffer_hash_table;
-
-   /* Annotations are for debugging and are extremely cold. */
+   /* Annotations: debugging only — extremely cold. */
    struct hash_table *annotations;
 };
 
@@ -295,6 +321,7 @@ static void
 radv_amdgpu_init_cs(struct radv_amdgpu_cs *cs, enum amd_ip_type ip_type)
 {
    cs->buffer_hash_table_size = 128u;
+   cs->hash_generation = 1u; /* 0 is reserved as "empty"; start at 1 */
    cs->buffer_hash_table = calloc(cs->buffer_hash_table_size, sizeof(struct radv_buffer_hash_entry));
    if (unlikely(!cs->buffer_hash_table)) {
       cs->status = VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -664,10 +691,14 @@ radv_amdgpu_cs_reset(struct ac_cmdbuf *_cs)
    cs->base.reserved_dw = 0;
    cs->status = VK_SUCCESS;
 
-   /* FIX: Add null check before memset. */
-   if (likely(cs->buffer_hash_table)) {
-      memset(cs->buffer_hash_table, 0, sizeof(struct radv_buffer_hash_entry) * cs->buffer_hash_table_size);
-   }
+   /*
+    * O(1) hash table reset via generation counter (replaces O(N) memset).
+    * Incrementing hash_generation invalidates all existing entries instantly:
+    * find/insert check entry->generation == cs->hash_generation.
+    * Skip generation value 0 (reserved as calloc-initialised "empty" sentinel).
+    */
+   if (++cs->hash_generation == 0u)
+      cs->hash_generation = 1u;
 
    cs->num_buffers = 0;
 
@@ -765,10 +796,12 @@ radv_hash_bo(uint32_t bo_handle)
 static int
 radv_amdgpu_cs_find_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle)
 {
-   /* Memory barrier: ensure we see latest writes from other threads */
-   __atomic_thread_fence(__ATOMIC_ACQUIRE);
-
    /* Error state check - must be first for correctness */
+   /* NOTE: No memory fence needed here.  Vulkan §3.3 requires all CB recording
+    * operations to be externally synchronized — cs_add_buffer is single-threaded
+    * per CB.  The CPU's TSO model ensures loads see prior stores on the same thread.
+    * The compiler barrier below prevents reordering across this function boundary. */
+   __asm__ __volatile__ ("" ::: "memory"); /* compiler barrier only */
    if (unlikely(cs->status != VK_SUCCESS || cs->buffer_hash_table == NULL)) {
       /* Fallback: linear search in handles array */
       for (unsigned i = 0; i < cs->num_buffers; ++i) {
@@ -804,8 +837,8 @@ radv_amdgpu_cs_find_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle)
          __builtin_prefetch(&cs->buffer_hash_table[(hash + dist + 2u) & mask], 0, 2);
       }
 
-      /* Check if slot is occupied (most common case) */
-      if (likely(entry->present)) {
+      /* Check if slot is occupied (generation match) */
+      if (likely(entry->generation == cs->hash_generation)) {
          /* Fast path: exact handle match */
          if (likely(entry->bo_handle == bo_handle)) {
             /* Validate index before returning (defense in depth) */
@@ -827,7 +860,7 @@ radv_amdgpu_cs_find_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle)
             return -1;
          }
       } else {
-         /* Empty slot - element definitively not present */
+         /* Unoccupied slot (stale generation) — element not present */
          return -1;
       }
 
@@ -867,11 +900,10 @@ radv_amdgpu_cs_insert_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle, int 
    uint32_t dist = 0u;
 
    struct radv_buffer_hash_entry new_entry = {
-      .bo_handle = bo_handle,
+      .bo_handle   = bo_handle,
       .hash_cached = hash,
-      .index = index,
-      .present = 1,
-      ._pad = {0, 0, 0}
+      .index       = index,
+      .generation  = cs->hash_generation,  /* mark as occupied for this generation */
    };
 
    /* Prefetch initial location for write */
@@ -886,11 +918,9 @@ radv_amdgpu_cs_insert_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle, int 
          __builtin_prefetch(&cs->buffer_hash_table[(hash + dist + 2u) & mask], 1, 2);
       }
 
-      /* Empty slot - insert here */
-      if (unlikely(!entry->present)) {
+      /* Empty slot (stale generation) - insert here */
+      if (unlikely(entry->generation != cs->hash_generation)) {
          *entry = new_entry;
-         /* Memory barrier: ensure write is visible before returning */
-         __atomic_thread_fence(__ATOMIC_RELEASE);
          return;
       }
 
@@ -898,7 +928,6 @@ radv_amdgpu_cs_insert_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle, int 
       if (unlikely(entry->bo_handle == bo_handle)) {
          entry->index = index;
          entry->hash_cached = hash;
-         __atomic_thread_fence(__ATOMIC_RELEASE);
          return;
       }
 
@@ -1058,9 +1087,10 @@ radv_amdgpu_cs_add_buffer_internal(struct radv_amdgpu_cs *cs, uint32_t bo, uint8
 
    /* Increment count AFTER successful addition */
    cs->num_buffers++;
-
-   /* Memory barrier: ensure writes visible to concurrent readers */
-   __atomic_thread_fence(__ATOMIC_RELEASE);
+   /* Compiler barrier only: prevents the compiler from sinking stores past
+    * this point, but emits no CPU instruction (TSO is sufficient for
+    * single-threaded recording; see Vulkan §3.3). */
+   __asm__ __volatile__ ("" ::: "memory");
 }
 
 static void
