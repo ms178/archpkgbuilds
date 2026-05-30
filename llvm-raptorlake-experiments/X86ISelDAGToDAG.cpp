@@ -5636,7 +5636,7 @@ case ISD::AND: {
       }
     }
 
-    if (NVT.isVector() && NVT.getVectorElementType() == MVT::i1) {
+    if (NVT.isVectorOf(MVT::i1)) {
       // Try to form a masked VPTESTM. Operands can be in either order.
       SDValue N0 = Node->getOperand(0);
       SDValue N1 = Node->getOperand(1);
