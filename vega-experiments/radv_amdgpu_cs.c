@@ -146,9 +146,9 @@ _Static_assert((sizeof(struct radv_buffer_hash_entry) * 4) == 64,
  * Hot-path analysis (Intel OMR §3.6, Agner Fog tables):
  *
  *   CL0 [  0..63]: radeon_emit_unchecked (base.buf/cdw) + cs_add_buffer_internal
- *                  (status, num_buffers, handles, buffer_hash_table_size,
- *                   buffer_hash_table, ws).  ALL fields touched per draw call
- *                  now fit in ONE cache line, saving 1 LLC miss per buffer add.
+ *                  (status, num_buffers, buffer_hash_table_size, handles,
+ *                   hash_generation, buffer_hash_table, ws).  ALL fields touched
+ *                  per draw call fit in ONE cache line.
  *
  *   CL1 [ 64..127]: IB management — ib_buffer, max_num_buffers, chain_ib, hw_ip,
  *                   ib_size_ptr, ib_mapped, ib.  Touched on finalize/chain paths.
@@ -166,10 +166,11 @@ struct radv_amdgpu_cs {
 
    VkResult status;                  /* offset ~20 — checked first in add_buffer */
    unsigned num_buffers;             /* offset ~24 — compared in find_buffer      */
-   uint32_t hash_generation;         /* offset ~28 — generation counter for reset */
+   uint32_t buffer_hash_table_size;  /* offset ~28 — used in find/insert/resize   */
    struct drm_amdgpu_bo_list_entry *handles;          /* offset ~32 */
-   uint32_t buffer_hash_table_size;  /* offset ~40 — used in find/insert/resize  */
-   uint32_t _htpad;                  /* offset ~44 — pad for 8-byte ptr alignment */
+   /* offset ~40: natural 4B gap */
+   uint32_t hash_generation;         /* offset ~40 — generation counter for reset;
+                                      *              natural 4-byte pad before ptr */
    struct radv_buffer_hash_entry *buffer_hash_table;  /* offset ~48 — MOVED HERE  */
    struct radv_amdgpu_winsys *ws;   /* offset ~56 — warm but occasional           */
 
@@ -940,11 +941,14 @@ radv_amdgpu_cs_insert_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle, int 
       const uint32_t entry_dist = (pos - (entry_hash & mask) + cs->buffer_hash_table_size) & mask;
 
       if (unlikely(dist > entry_dist)) {
-         /* Swap: new entry takes this slot, continue with displaced */
+         /* Swap: new entry takes this slot, continue inserting displaced entry.
+          * CRITICAL: update hash to displaced entry's hash so subsequent probes
+          * compute correct positions for the displaced entry, not the original. */
          const struct radv_buffer_hash_entry tmp = *entry;
          *entry = new_entry;
          new_entry = tmp;
          dist = entry_dist;
+         hash = new_entry.hash_cached;  /* probe from displaced entry's home slot */
       }
 
       dist++;
@@ -995,7 +999,7 @@ radv_amdgpu_cs_resize_buffer_hash_table(struct radv_amdgpu_cs *cs)
 
    /* Rehash all valid entries */
    for (uint32_t i = 0; i < old_size; ++i) {
-      if (old_table[i].present) {
+      if (old_table[i].generation == cs->hash_generation) {
          radv_amdgpu_cs_insert_buffer(cs, old_table[i].bo_handle, old_table[i].index);
 
          /* Check for insertion failure during rehash */
