@@ -7,20 +7,20 @@
 #include "radv_pipeline_cache.h"
 
 #include "util/macros.h"
-#include "util/mesa-blake3.h"
 #include "util/u_atomic.h"
 #include "nir.h"
 #include "nir_serialize.h"
-
-#include "radv_debug.h"
 #include "radv_descriptor_set.h"
+#include "radv_device.h"
+#include "radv_instance.h"
+#include "radv_physical_device.h"
 #include "radv_pipeline.h"
 #include "radv_pipeline_binary.h"
 #include "radv_pipeline_compute.h"
 #include "radv_pipeline_graphics.h"
 #include "radv_pipeline_rt.h"
 #include "radv_shader.h"
-
+#include "vk_alloc.h"
 #include "vk_pipeline.h"
 
 #include "aco_interface.h"
