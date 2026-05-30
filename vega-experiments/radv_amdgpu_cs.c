@@ -890,14 +890,18 @@ radv_amdgpu_cs_insert_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle, int 
       return;
    }
 
-   /* Validate index bounds (prevent corruption) */
-   if (unlikely(index < 0 || (unsigned)index >= cs->num_buffers)) {
+   /* Validate index bounds (prevent corruption).
+    * Use max_num_buffers (allocated capacity), NOT num_buffers (current count):
+    * insert_buffer is called with index == cs->num_buffers when adding a NEW entry
+    * (before cs->num_buffers is incremented), so checking >= num_buffers would
+    * wrongly reject every valid new insertion. */
+   if (unlikely(index < 0 || (unsigned)index >= cs->max_num_buffers)) {
       cs->status = VK_ERROR_UNKNOWN;
       return;
    }
 
    const uint32_t mask = cs->buffer_hash_table_size - 1u;
-   const uint32_t hash = radv_hash_bo(bo_handle);
+   uint32_t hash = radv_hash_bo(bo_handle); /* mutable: updated after Robin Hood displacement */
    uint32_t dist = 0u;
 
    struct radv_buffer_hash_entry new_entry = {
