@@ -151,25 +151,46 @@ static __always_inline bool ixgbe_is_primary_thread(unsigned int cpu)
 	return !sibs || cpu == cpumask_first(sibs);
 }
 
-static __always_inline unsigned long ixgbe_cpu_capacity(unsigned int cpu)
+struct ixgbe_cpuid_info {
+	u32 eax;
+};
+
+static void ixgbe_query_core_type(void *info)
 {
-	return topology_get_cpu_scale(cpu);
+#ifdef CONFIG_X86
+	struct ixgbe_cpuid_info *ci = info;
+	ci->eax = cpuid_eax(0x1A);
+#endif
+}
+
+static __always_inline bool ixgbe_cpu_is_pcore(unsigned int cpu)
+{
+#ifdef CONFIG_X86
+	struct ixgbe_cpuid_info ci = { .eax = 0 };
+	int err;
+
+	err = smp_call_function_single(cpu, ixgbe_query_core_type, &ci, 1);
+	if (err == 0) {
+		u8 core_type = (ci.eax >> 24) & 0xFF;
+		if (core_type == 0x40)
+			return true;
+		if (core_type == 0x20)
+			return false;
+	}
+#endif
+	/* Fallback if non-x86 or smp_call fails: check SMT primary */
+	return ixgbe_is_primary_thread(cpu);
 }
 
 static int ixgbe_build_pcore_mask(struct ixgbe_adapter *adapter,
 				  cpumask_var_t pcore_mask)
 {
-	cpumask_var_t node_cpus, primaries;
+	cpumask_var_t node_cpus;
 	unsigned int cpu;
-	unsigned long max_cap = 0, threshold;
 	int node;
 
 	if (!zalloc_cpumask_var(&node_cpus, GFP_KERNEL))
 		return -ENOMEM;
-	if (!zalloc_cpumask_var(&primaries, GFP_KERNEL)) {
-		free_cpumask_var(node_cpus);
-		return -ENOMEM;
-	}
 
 	node = dev_to_node(&adapter->pdev->dev);
 	if (node != NUMA_NO_NODE)
@@ -180,37 +201,24 @@ static int ixgbe_build_pcore_mask(struct ixgbe_adapter *adapter,
 	if (cpumask_empty(node_cpus))
 		cpumask_copy(node_cpus, cpu_online_mask);
 
-	cpumask_clear(primaries);
-	for_each_cpu(cpu, node_cpus) {
-		if (ixgbe_is_primary_thread(cpu))
-			cpumask_set_cpu(cpu, primaries);
-	}
-
-	for_each_cpu(cpu, primaries) {
-		unsigned long cap = ixgbe_cpu_capacity(cpu);
-		if (cap > max_cap)
-			max_cap = cap;
-	}
-
 	cpumask_clear(pcore_mask);
-	if (max_cap > 0) {
-		/* Select CPUs within 90% of max capacity to isolate P-cores */
-		threshold = (max_cap * 9) / 10;
-		for_each_cpu(cpu, primaries) {
-			if (ixgbe_cpu_capacity(cpu) >= threshold)
+	for_each_cpu(cpu, node_cpus) {
+		if (ixgbe_cpu_is_pcore(cpu))
+			cpumask_set_cpu(cpu, pcore_mask);
+	}
+
+	/* Fallback if no P-cores were mapped (e.g. SMT disabled on non-hybrid) */
+	if (cpumask_empty(pcore_mask)) {
+		for_each_cpu(cpu, node_cpus) {
+			if (ixgbe_is_primary_thread(cpu))
 				cpumask_set_cpu(cpu, pcore_mask);
 		}
 	}
 
-	if (cpumask_empty(pcore_mask)) {
-		if (!cpumask_empty(primaries))
-			cpumask_copy(pcore_mask, primaries);
-		else
-			cpumask_copy(pcore_mask, node_cpus);
-	}
+	if (cpumask_empty(pcore_mask))
+		cpumask_copy(pcore_mask, node_cpus);
 
 	free_cpumask_var(node_cpus);
-	free_cpumask_var(primaries);
 	return 0;
 }
 
@@ -330,6 +338,13 @@ static void ixgbe_gaming_atr_clear_filters(struct ixgbe_adapter *adapter)
 	u16 old_count;
 	int i;
 
+
+
+	/* Clear all 128 L3/L4 immediate interrupt filters to avoid stale LLI state */
+	for (i = 0; i < 128; i++) {
+		IXGBE_WRITE_REG(hw, IXGBE_L34T_IMIR(i), 0);
+	}
+
 	/* Snapshot and clear state under lock */
 	spin_lock_bh(&adapter->gaming_fdir_lock);
 	memcpy(old_filters, adapter->gaming_filters, sizeof(old_filters));
@@ -441,13 +456,15 @@ static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter)
 
 			if (!ixgbe_fdir_write_perfect_filter_82599(hw, &input,
 					IXGBE_GAMING_IPV4_BASE + ipv4_count, queue)) {
-				struct ixgbe_gaming_filter *gf =
-					&adapter->gaming_filters[adapter->gaming_filter_count++];
-				gf->port = port;
-				gf->ip_version = 4;
-				gf->soft_id = IXGBE_GAMING_IPV4_BASE + ipv4_count;
-				gf->active = true;
-				ipv4_count++;
+				if (adapter->gaming_filter_count < IXGBE_MAX_GAMING_FILTERS) {
+					struct ixgbe_gaming_filter *gf =
+						&adapter->gaming_filters[adapter->gaming_filter_count++];
+					gf->port = port;
+					gf->ip_version = 4;
+					gf->soft_id = IXGBE_GAMING_IPV4_BASE + ipv4_count;
+					gf->active = true;
+					ipv4_count++;
+				}
 			}
 		}
 
@@ -458,16 +475,33 @@ static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter)
 
 			if (!ixgbe_fdir_write_perfect_filter_82599(hw, &input,
 					IXGBE_GAMING_IPV6_BASE + ipv6_count, queue)) {
-				struct ixgbe_gaming_filter *gf =
-					&adapter->gaming_filters[adapter->gaming_filter_count++];
-				gf->port = port;
-				gf->ip_version = 6;
-				gf->soft_id = IXGBE_GAMING_IPV6_BASE + ipv6_count;
-				gf->active = true;
-				ipv6_count++;
+				if (adapter->gaming_filter_count < IXGBE_MAX_GAMING_FILTERS) {
+					struct ixgbe_gaming_filter *gf =
+						&adapter->gaming_filters[adapter->gaming_filter_count++];
+					gf->port = port;
+					gf->ip_version = 6;
+					gf->soft_id = IXGBE_GAMING_IPV6_BASE + ipv6_count;
+					gf->active = true;
+					ipv6_count++;
+				}
 			}
 		}
 	}
+
+
+	/* Program L34T_IMIR filters for immediate, hardware-level port-based low latency interrupts */
+	for (i = 0; i < num_ports && i < 128; i++) {
+		u16 port = parsed_ports[i];
+		/* Bit layout for IXGBE_L34T_IMIR:
+		 * - Bits 15:0: Destination Port
+		 * - Bits 27:21: RX Queue Index
+		 * - Bit 28: LLI Enable (0x10000000)
+		 * - Bit 29: Protocol Type (1 = UDP, 0 = TCP)
+		 */
+		u32 l34timir = (u32)port | ((u32)queue << 21) | 0x10000000 | 0x20000000;
+		IXGBE_WRITE_REG(hw, IXGBE_L34T_IMIR(i), l34timir);
+	}
+
 	adapter->gaming_atr_enabled = (adapter->gaming_filter_count > 0);
 	spin_unlock_bh(&adapter->gaming_fdir_lock);
 	spin_unlock(&adapter->fdir_perfect_lock);
@@ -3328,6 +3362,9 @@ void ixgbe_write_eitr(struct ixgbe_q_vector *q_vector)
 		break;
 	}
 
+	if (gaming_mode && v_idx == 0 && hw->mac.type == ixgbe_mac_X540)
+		itr_reg |= IXGBE_EITR_LLI_EN;
+
 	IXGBE_WRITE_REG(hw, IXGBE_EITR(v_idx), itr_reg);
 }
 
@@ -5024,6 +5061,8 @@ void ixgbe_configure_rx_ring(struct ixgbe_adapter *adapter,
 		IXGBE_WRITE_REG(hw, IXGBE_DCA_RXCTRL(reg_idx), rxctrl);
 	}
 
+
+
 	rxdctl |= IXGBE_RXDCTL_ENABLE;
 	IXGBE_WRITE_REG(hw, IXGBE_RXDCTL(reg_idx), rxdctl);
 
@@ -6593,7 +6632,10 @@ static void ixgbe_setup_gpie(struct ixgbe_adapter *adapter)
 	}
 
 	/* XXX: to interrupt immediately for EICS writes, enable this */
-	/* gpie |= IXGBE_GPIE_EIMEN; */
+	if (gaming_mode)
+		gpie |= IXGBE_GPIE_EIMEN;
+	else
+		gpie |= 0;
 
 	if (adapter->flags & IXGBE_FLAG_SRIOV_ENABLED) {
 		gpie &= ~IXGBE_GPIE_VTMODE_MASK;
@@ -6740,6 +6782,7 @@ static void ixgbe_x540_enable_lli(struct ixgbe_adapter *adapter)
 {
     struct ixgbe_hw *hw = &adapter->hw;
     u32 eitr;
+    u32 imir, imirext;
 
     if (!gaming_mode)
         return;
@@ -6749,6 +6792,19 @@ static void ixgbe_x540_enable_lli(struct ixgbe_adapter *adapter)
     /* 128 bytes covers CS2/Valorant, datasheet 7.3.2.2 */
     IXGBE_WRITE_REG(hw, IXGBE_LLITHRESH(0), 128);
 
+    /* Configure IMIR(0) and IMIREXT(0) for packet-size-based LLI on queue 0:
+     * - Clear IXGBE_IMIREXT_SIZE_BP to enable packet size check.
+     * - Set IXGBE_IMIREXT_CTRL_BP to ignore TCP/UDP control flags.
+     * - Set IXGBE_IMIR_PORT_BP to ignore TCP/UDP port.
+     * - Set IXGBE_IMIR_LLI_EN_82599 to enable LLI for filter 0.
+     */
+    imirext = IXGBE_IMIREXT_CTRL_BP; /* Clear bit 12 (SIZE_BP) */
+    IXGBE_WRITE_REG(hw, IXGBE_IMIREXT(0), imirext);
+
+    imir = IXGBE_IMIR_PORT_BP | IXGBE_IMIR_LLI_EN_82599;
+    /* Target queue index is 0, (0 << IXGBE_IMIR_RX_QUEUE_SHIFT_82599) is 0 */
+    IXGBE_WRITE_REG(hw, IXGBE_IMIR(0), imir);
+
     eitr = IXGBE_READ_REG(hw, IXGBE_EITR(0));
     eitr |= IXGBE_EITR_LLI_EN;
     eitr &= ~IXGBE_EITR_CNT_WDIS;  /* immediate interrupt */
@@ -6757,96 +6813,23 @@ static void ixgbe_x540_enable_lli(struct ixgbe_adapter *adapter)
     IXGBE_WRITE_REG(hw, IXGBE_EITR(0), eitr);
 }
 
-static void ixgbe_x540_setup_gaming_fdir(struct ixgbe_adapter *adapter)
-{
-    struct ixgbe_hw *hw = &adapter->hw;
-    union ixgbe_atr_input input;
 
-    if (!gaming_mode)
-        return;
-    if (!(adapter->flags & IXGBE_FLAG_FDIR_PERFECT_CAPABLE))
-        return;
-    if (hw->mac.type < ixgbe_mac_82599EB)
-        return;
 
-    memset(&input, 0, sizeof(input));
-    input.formatted.dst_port = htons(27015);
-    input.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
-    ixgbe_fdir_write_perfect_filter_82599(hw, &input, 0, 0);
 
-    memset(&input, 0, sizeof(input));
-    input.formatted.dst_port = htons(7000);
-    input.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
-    ixgbe_fdir_write_perfect_filter_82599(hw, &input, 1, 0);
-}
 
-static void ixgbe_x540_enable_dca(struct ixgbe_adapter *adapter)
-{
-#ifdef CONFIG_IXGBE_DCA
-    struct ixgbe_hw *hw = &adapter->hw;
-    u32 dca;
 
-    if (!gaming_mode)
-        return;
-    if (!boot_cpu_has(X86_FEATURE_DCA))
-        return;
-    if (hw->mac.type != ixgbe_mac_X540)
-        return;
 
-    /* CPU 0 = 14700KF P-core, enable prefetch to L2 */
-    dca = (0 & 0xFF) | IXGBE_DCA_RXCTRL_ENABLE;
-    IXGBE_WRITE_REG(hw, IXGBE_DCA_RXCTRL(0), dca);
-#endif
-}
 
-static void ixgbe_x540_disable_rsc_gaming(struct ixgbe_adapter *adapter)
-{
-    struct ixgbe_hw *hw = &adapter->hw;
-    u32 rscctl;
-
-    if (!gaming_mode)
-        return;
-    if (!(adapter->flags2 & IXGBE_FLAG2_RSC_CAPABLE))
-        return;
-
-    rscctl = IXGBE_READ_REG(hw, IXGBE_RSCCTL(0));
-    rscctl &= ~IXGBE_RSCCTL_RSCEN;
-    IXGBE_WRITE_REG(hw, IXGBE_RSCCTL(0), rscctl);
-}
-
-static void ixgbe_x540_tune_tx_wthresh(struct ixgbe_adapter *adapter)
-{
-    struct ixgbe_hw *hw = &adapter->hw;
-    u32 txdctl;
-
-    if (!gaming_mode)
-        return;
-    if (hw->mac.type != ixgbe_mac_X540)
-        return;
-
-    txdctl = IXGBE_READ_REG(hw, IXGBE_TXDCTL(0));
-    txdctl &= ~IXGBE_TXDCTL_WTHRESH_MASK;
-    txdctl |= (8 << IXGBE_TXDCTL_WTHRESH_SHIFT);  /* batch 8 */
-    IXGBE_WRITE_REG(hw, IXGBE_TXDCTL(0), txdctl);
-
-    /* PCIe Relaxed Ordering reduces root-port contention with GPU */
-    pcie_capability_set_word(adapter->pdev, PCI_EXP_DEVCTL,
-                             PCI_EXP_DEVCTL_RELAX_EN);
-}
 
 void ixgbe_up(struct ixgbe_adapter *adapter)
 {
-    ixgbe_configure(adapter);
+	ixgbe_configure(adapter);
 
-    if (gaming_mode) {
-        ixgbe_x540_enable_lli(adapter);
-        ixgbe_x540_setup_gaming_fdir(adapter);
-        ixgbe_x540_enable_dca(adapter);
-        ixgbe_x540_disable_rsc_gaming(adapter);
-        ixgbe_x540_tune_tx_wthresh(adapter);
-    }
+	if (gaming_mode) {
+		ixgbe_x540_enable_lli(adapter);
+	}
 
-    ixgbe_up_complete(adapter);
+	ixgbe_up_complete(adapter);
 }
 
 static unsigned long ixgbe_get_completion_timeout(struct ixgbe_adapter *adapter)
@@ -7425,7 +7408,12 @@ static int ixgbe_sw_init(struct ixgbe_adapter *adapter,
 		}
 	}
 	adapter->ring_feature[RING_F_RSS].limit = rss;
-	adapter->flags2 |= IXGBE_FLAG2_RSC_CAPABLE;
+	if (gaming_mode) {
+		adapter->flags2 &= ~IXGBE_FLAG2_RSC_CAPABLE;
+		adapter->flags2 &= ~IXGBE_FLAG2_RSC_ENABLED;
+	} else {
+		adapter->flags2 |= IXGBE_FLAG2_RSC_CAPABLE;
+	}
 	adapter->max_q_vectors = MAX_Q_VECTORS_82599;
 	adapter->atr_sample_rate = 20;
 	fdir = min_t(int, IXGBE_MAX_FDIR_INDICES, num_online_cpus());
@@ -11010,6 +10998,21 @@ static void ixgbe_reset_l2fw_offload(struct ixgbe_adapter *adapter)
 	int rss = min_t(int, ixgbe_max_rss_indices(adapter),
 			num_online_cpus());
 
+	if (gaming_mode) {
+		cpumask_var_t pcore_mask;
+
+		if (zalloc_cpumask_var(&pcore_mask, GFP_KERNEL)) {
+			if (!ixgbe_build_pcore_mask(adapter, pcore_mask)) {
+				unsigned int p_cores;
+
+				p_cores = cpumask_weight(pcore_mask);
+				if (p_cores > 0)
+					rss = min_t(unsigned int, rss, p_cores);
+			}
+			free_cpumask_var(pcore_mask);
+		}
+	}
+
 	/* go back to full RSS if we're not running SR-IOV */
 	if (!adapter->ring_feature[RING_F_VMDQ].offset)
 		adapter->flags &= ~(IXGBE_FLAG_VMDQ_ENABLED |
@@ -11025,8 +11028,13 @@ static int ixgbe_set_features(struct net_device *netdev,
 			      netdev_features_t features)
 {
 	struct ixgbe_adapter *adapter = ixgbe_from_netdev(netdev);
-	netdev_features_t changed = netdev->features ^ features;
+	netdev_features_t changed;
 	bool need_reset = false;
+
+	if (gaming_mode)
+		features &= ~NETIF_F_LRO;
+
+	changed = netdev->features ^ features;
 
 	/* Make sure RSC matches LRO, reset if change */
 	if (!(features & NETIF_F_LRO)) {
@@ -11500,7 +11508,7 @@ void ixgbe_xdp_ring_update_tail(struct ixgbe_ring *ring)
 	/* Force memory writes to complete before letting h/w know there
 	 * are new descriptors to fetch.
 	 */
-	wmb();
+	dma_wmb();
 	writel(ring->next_to_use, ring->tail);
 }
 
