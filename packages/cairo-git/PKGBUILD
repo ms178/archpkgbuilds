@@ -1,10 +1,14 @@
+# Maintainer: CachyOS Team
+# Triple-stage PGO+BOLT build: IR PGO → CS-PGO → BOLT
+# Uses LLVM IR-level PGO (-fprofile-generate/-fprofile-use) — NOT frontend
+# instrumentation (-fprofile-instr-generate). IR PGO is the only mode that
+# composes correctly with -fcs-profile-generate for context-sensitive PGO.
+
 pkgbase=cairo
-pkgname=(
-  cairo-git
-)
-pkgver=1.18.4+94+gc85d74aa5
-pkgrel=5
-pkgdesc="2D graphics library with multi-stage IR PGO + CS-PGO + BOLT optimization"
+pkgname=(cairo-git)
+pkgver=1.18.4+109+g8e3ac5e40
+pkgrel=1
+pkgdesc="2D graphics library with IR PGO + CS-PGO + BOLT optimization"
 url="https://cairographics.org/"
 arch=(x86_64)
 license=(LGPL MPL)
@@ -30,53 +34,115 @@ makedepends=(
   lld
   pkgconf
 )
-provides=(cairo)
+provides=(
+  cairo
+  libcairo.so
+  libcairo-gobject.so
+  libcairo-script-interpreter.so
+)
 conflicts=(cairo)
 options=(!strip)
 source=("git+https://gitlab.freedesktop.org/cairo/cairo.git")
 sha256sums=('SKIP')
 
+# ─────────────────────────────────────────────────────────────────────────────
+# pkgver() — dynamic version from git
+# ─────────────────────────────────────────────────────────────────────────────
 pkgver() {
   cd "${srcdir}/cairo"
   git describe --tags | sed 's/-/+/g'
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# meson_array() — quote args into meson-compatible Python list string
+# ─────────────────────────────────────────────────────────────────────────────
 meson_array() {
   local out="["
-  local arg
-  for arg in "$@"; do
-    arg=${arg//\\/\\\\}
-    arg=${arg//\'/\\\'}
+  local arg i
+  for i in "$@"; do
+    arg="${i//\\/\\\\}"
+    arg="${arg//\'/\\\'}"
     out+="'$arg',"
   done
   out="${out%,}]"
   printf "%s" "$out"
 }
 
-filter_workload_flags() {
-  local -n in="$1"
-  local -n out="$2"
-  out=()
-  local f
-  for f in "${in[@]}"; do
+# ─────────────────────────────────────────────────────────────────────────────
+# filter_profiling_flags() — strip ALL PGO/coverage flags from a flag array
+# (used to build the workload runner so the runner itself is NOT instrumented;
+#  we only want to profile libcairo, not the harness).
+#
+# Handles:
+#   * Bare and =VALUE forms of generate/use flags
+#   * Both frontend (-fprofile-instr-*) and IR (-fprofile-*) variants
+#   * Paired "-mllvm -enable-value-profiling" / "-mllvm -vp-counters-per-site=N"
+# ─────────────────────────────────────────────────────────────────────────────
+filter_profiling_flags() {
+  local out=()
+  local args=("$@")
+  local n=${#args[@]} i
+  for (( i = 0; i < n; i++ )); do
+    local f="${args[i]}"
     case "$f" in
-      -fprofile-generate*|-fprofile-use*|-fcs-profile-generate*|-fprofile-correction|-fprofile-instr-generate*|-fprofile-instr-use*|-fcoverage-mapping)
+      -fprofile-generate|-fprofile-generate=*|\
+      -fprofile-use|-fprofile-use=*|\
+      -fcs-profile-generate|-fcs-profile-generate=*|\
+      -fprofile-instr-generate|-fprofile-instr-generate=*|\
+      -fprofile-instr-use|-fprofile-instr-use=*|\
+      -fprofile-correction|-fcoverage-mapping|\
+      -fprofile-update=*|-fprofile-sample-use=*)
         continue
         ;;
+      -mllvm)
+        if (( i + 1 < n )); then
+          local next="${args[i+1]}"
+          case "$next" in
+            -enable-value-profiling|-vp-counters-per-site=*|\
+            -instrprof-atomic-counter-update-all|\
+            -pgo-warn-missing-function)
+              ((i++))
+              continue
+              ;;
+          esac
+        fi
+        out+=("$f")
+        ;;
+      *)
+        out+=("$f")
+        ;;
     esac
-    out+=("$f")
   done
+  printf "%s\n" "${out[@]}"
 }
 
-prepare() {
-  cd "${srcdir}/cairo"
-
-  cat > "${srcdir}/cairo_workload.c" << 'EOF'
+# ─────────────────────────────────────────────────────────────────────────────
+# write_workload_source() — comprehensive cairo training workload.
+#
+# Exercises ALL cairo subsystems for maximum profile coverage:
+#   - All 29 compositing operators (CLEAR → HSL_LUMINOSITY)
+#   - Image surfaces in all 4 formats (ARGB32, RGB24, A8, RGB16_565)
+#   - File backends (PDF, SVG, PS) with metadata
+#   - Recording surfaces with ink extents
+#   - Linear, radial, mesh, and surface patterns
+#   - Text rendering with toy & scaled fonts, glyph paths, glyph extents
+#     (properly converted via cairo_scaled_font_text_to_glyphs)
+#   - All font options (antialias, hint style, hint metrics, subpixel order)
+#   - Transforms (translate, scale, rotate, arbitrary matrix, user↔device)
+#   - Groups (push_group, push_group_with_content, pop_group_to_source)
+#   - Clipping (clip, clip_preserve, clip_extents, copy_clip_rectangle_list)
+#   - Dash patterns with variable lengths
+#   - Masks (pattern mask, surface mask)
+#   - Backend-similar surface fallbacks (via cairo_surface_create_similar)
+#   - Path operations (copy_path, append_path, copy_path_flat, extents, in_fill/stroke)
+#   - Surface pattern with extend/filter/matrix transforms
+# ─────────────────────────────────────────────────────────────────────────────
+write_workload_source() {
+  cat > "${srcdir}/cairo_workload.c" << 'WORKLOAD_EOF'
 #include <cairo/cairo.h>
 #include <cairo/cairo-pdf.h>
 #include <cairo/cairo-ps.h>
 #include <cairo/cairo-svg.h>
-
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,193 +151,696 @@ prepare() {
 
 #define W 2560
 #define H 1440
+#define TAU (2.0 * M_PI)
 
+/* ─── splitmix64 RNG ─── */
 static uint64_t rng_state = 0x9E3779B97F4A7C15ULL;
 
 static inline uint32_t rng_u32(void) {
   uint64_t x = rng_state;
-  x ^= x >> 12;
-  x ^= x << 25;
-  x ^= x >> 27;
-  rng_state = x;
-  return (uint32_t)((x * 0x2545F4914F6CDD1DULL) >> 32);
+  x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+  rng_state = x * 0x2545F4914F6CDD1DULL;
+  return (uint32_t)(rng_state >> 32);
 }
 
 static inline double frand(double lo, double hi) {
   return lo + (hi - lo) * ((double)rng_u32() / (double)UINT32_MAX);
 }
 
+/* ─── Helpers ─── */
 static void paint_bg(cairo_t *cr) {
   cairo_set_source_rgb(cr, 0.08, 0.09, 0.10);
   cairo_paint(cr);
 }
 
-static void mode_stroke_fill(cairo_t *cr, int n) {
-  for (int i = 0; i < n; i++) {
-    cairo_set_line_width(cr, frand(0.4, 8.0));
-    cairo_set_operator(cr, (cairo_operator_t)(rng_u32() % 13));
-    cairo_set_source_rgba(cr, frand(0, 1), frand(0, 1), frand(0, 1), frand(0.25, 1.0));
-
-    int t = (int)(rng_u32() % 4);
-    if (t == 0) {
-      cairo_rectangle(cr, frand(0, W), frand(0, H), frand(6, 400), frand(6, 300));
-    } else if (t == 1) {
-      cairo_arc(cr, frand(0, W), frand(0, H), frand(4, 180), 0.0, 2.0 * M_PI);
-    } else if (t == 2) {
-      cairo_move_to(cr, frand(0, W), frand(0, H));
-      for (int j = 0; j < 6; j++) {
-        cairo_curve_to(cr, frand(0, W), frand(0, H), frand(0, W), frand(0, H), frand(0, W), frand(0, H));
-      }
-      cairo_close_path(cr);
-    } else {
-      cairo_move_to(cr, frand(0, W), frand(0, H));
-      for (int j = 0; j < 10; j++) {
-        cairo_line_to(cr, frand(0, W), frand(0, H));
-      }
-      cairo_close_path(cr);
-    }
-
-    if (rng_u32() & 1) {
-      cairo_fill(cr);
-    } else {
-      cairo_stroke(cr);
-    }
+static void set_random_source(cairo_t *cr) {
+  int type = (int)(rng_u32() % 3);
+  if (type == 0) {
+    cairo_set_source_rgba(cr, frand(0,1), frand(0,1), frand(0,1), frand(0.2,1));
+  } else if (type == 1) {
+    cairo_pattern_t *p = cairo_pattern_create_linear(
+      frand(0,W), frand(0,H), frand(0,W), frand(0,H));
+    int stops = 2 + (int)(rng_u32() % 4);
+    for (int s = 0; s < stops; s++)
+      cairo_pattern_add_color_stop_rgba(p, (double)s/(stops-1),
+        frand(0,1), frand(0,1), frand(0,1), frand(0.3,1));
+    cairo_set_source(cr, p);
+    cairo_pattern_destroy(p);
+  } else {
+    cairo_pattern_t *p = cairo_pattern_create_radial(
+      frand(0,W), frand(0,H), frand(5,40),
+      frand(0,W), frand(0,H), frand(80,500));
+    int stops = 2 + (int)(rng_u32() % 4);
+    for (int s = 0; s < stops; s++)
+      cairo_pattern_add_color_stop_rgba(p, (double)s/(stops-1),
+        frand(0,1), frand(0,1), frand(0,1), frand(0.3,1));
+    cairo_set_source(cr, p);
+    cairo_pattern_destroy(p);
   }
 }
 
+static void make_random_path(cairo_t *cr) {
+  int type = (int)(rng_u32() % 6);
+  switch (type) {
+  case 0:
+    cairo_rectangle(cr, frand(0,W), frand(0,H), frand(10,400), frand(10,300));
+    break;
+  case 1:
+    cairo_arc(cr, frand(0,W), frand(0,H), frand(4,200), 0, TAU);
+    break;
+  case 2:
+    cairo_arc(cr, frand(0,W), frand(0,H), frand(4,200), frand(0,M_PI), frand(M_PI,TAU));
+    break;
+  case 3: {
+    cairo_move_to(cr, frand(0,W), frand(0,H));
+    int n = 3 + (int)(rng_u32() % 8);
+    for (int j = 0; j < n; j++)
+      cairo_curve_to(cr, frand(0,W),frand(0,H), frand(0,W),frand(0,H), frand(0,W),frand(0,H));
+    cairo_close_path(cr);
+    break;
+  }
+  case 4: {
+    cairo_move_to(cr, frand(0,W), frand(0,H));
+    int n = 4 + (int)(rng_u32() % 12);
+    for (int j = 0; j < n; j++)
+      cairo_line_to(cr, frand(0,W), frand(0,H));
+    cairo_close_path(cr);
+    break;
+  }
+  default: {
+    double cx = frand(0,W), cy = frand(0,H), r = frand(20,150);
+    int pts = 5 + (int)(rng_u32() % 6);
+    cairo_move_to(cr, cx + r, cy);
+    for (int k = 1; k < pts*2; k++) {
+      double a = (double)k * M_PI / pts;
+      double rr = (k & 1) ? r*0.4 : r;
+      cairo_line_to(cr, cx + rr*cos(a), cy + rr*sin(a));
+    }
+    cairo_close_path(cr);
+    break;
+  }
+  }
+}
+
+/* ─── Rendering Modes ─── */
+
+/* stroke + fill with all line styles */
+static void mode_stroke_fill(cairo_t *cr, int n) {
+  for (int i = 0; i < n; i++) {
+    cairo_set_line_width(cr, frand(0.4, 8.0));
+    cairo_set_operator(cr, (cairo_operator_t)(rng_u32() % 29));
+    cairo_set_line_join(cr, (cairo_line_join_t)(rng_u32() % 3));
+    cairo_set_line_cap(cr, (cairo_line_cap_t)(rng_u32() % 3));
+    set_random_source(cr);
+    make_random_path(cr);
+    if (rng_u32() & 1) cairo_fill(cr);
+    else               cairo_stroke(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+  }
+}
+
+/* linear, radial, and image-surface patterns */
 static void mode_patterns(cairo_t *cr, int n) {
   for (int i = 0; i < n; i++) {
     cairo_pattern_t *p;
-    if (rng_u32() & 1) {
-      p = cairo_pattern_create_linear(frand(0, W), frand(0, H), frand(0, W), frand(0, H));
+    int ext = rng_u32() % 3;
+    if (ext == 0) {
+      p = cairo_pattern_create_linear(frand(0,W), frand(0,H), frand(0,W), frand(0,H));
+    } else if (ext == 1) {
+      p = cairo_pattern_create_radial(frand(0,W), frand(0,H), frand(5,40),
+                                       frand(0,W), frand(0,H), frand(80,500));
     } else {
-      p = cairo_pattern_create_radial(frand(0, W), frand(0, H), frand(10, 60), frand(0, W), frand(0, H), frand(80, 600));
+      p = cairo_pattern_create_for_surface(
+        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 32, 32));
+      cairo_pattern_set_extend(p, CAIRO_EXTEND_REPEAT);
     }
-
-    int stops = 2 + (rng_u32() % 5);
+    int stops = 2 + (int)(rng_u32() % 4);
     for (int s = 0; s < stops; s++) {
       double t = (double)s / (double)(stops - 1);
-      cairo_pattern_add_color_stop_rgba(p, t, frand(0, 1), frand(0, 1), frand(0, 1), frand(0.25, 1.0));
+      cairo_pattern_add_color_stop_rgba(p, t,
+        frand(0,1), frand(0,1), frand(0,1), frand(0.2,1));
     }
-
     cairo_set_source(cr, p);
-    cairo_rectangle(cr, frand(0, W), frand(0, H), frand(20, 900), frand(20, 700));
+    make_random_path(cr);
     cairo_fill(cr);
     cairo_pattern_destroy(p);
   }
 }
 
+/* text rendering: toy fonts, font options, glyph extents (via proper conversion),
+   text paths */
 static void mode_text(cairo_t *cr, int n) {
-  const char *fonts[] = { "Sans", "Serif", "Monospace", "Arial", "Helvetica" };
-  const char *words[] = { "cairo", "pgo", "cs-pgo", "vector", "raster", "glyph", "blend" };
-
+  const char *fonts[] = {"Sans", "Serif", "Monospace"};
+  const char *words[] = {"cairo","pgo","cs-pgo","bolt","vector","raster",
+                          "glyph","blend","render","compositing","subpixel",
+                          "hinting","antialias","path","stroke","fill"};
+  int nfonts = sizeof(fonts)/sizeof(fonts[0]);
+  int nwords = sizeof(words)/sizeof(words[0]);
   for (int i = 0; i < n; i++) {
-    cairo_select_font_face(
-      cr,
-      fonts[rng_u32() % 5],
+    cairo_select_font_face(cr, fonts[rng_u32() % nfonts],
       (rng_u32() & 1) ? CAIRO_FONT_SLANT_ITALIC : CAIRO_FONT_SLANT_NORMAL,
-      (rng_u32() & 1) ? CAIRO_FONT_WEIGHT_BOLD : CAIRO_FONT_WEIGHT_NORMAL
-    );
+      (rng_u32() & 1) ? CAIRO_FONT_WEIGHT_BOLD  : CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, frand(8.0, 96.0));
-    cairo_set_source_rgba(cr, frand(0, 1), frand(0, 1), frand(0, 1), frand(0.35, 1.0));
-    cairo_move_to(cr, frand(0, W), frand(0, H));
-    cairo_show_text(cr, words[rng_u32() % 7]);
+    set_random_source(cr);
+
+    cairo_font_options_t *fo = cairo_font_options_create();
+    cairo_font_options_set_antialias(fo, (cairo_antialias_t)(rng_u32() % 5));
+    cairo_font_options_set_hint_style(fo, (cairo_hint_style_t)(rng_u32() % 5));
+    cairo_font_options_set_hint_metrics(fo, (cairo_hint_metrics_t)(rng_u32() % 4));
+    cairo_font_options_set_subpixel_order(fo, (cairo_subpixel_order_t)(rng_u32() % 5));
+    cairo_set_font_options(cr, fo);
+
+    double tx = frand(0, W), ty = frand(0, H);
+    cairo_move_to(cr, tx, ty);
+    const char *word = words[rng_u32() % nwords];
+    cairo_show_text(cr, word);
+
+    if ((rng_u32() % 4) == 0) {
+      cairo_text_path(cr, word);
+      cairo_fill(cr);
+    }
+
+    /* String-based extents */
+    cairo_text_extents_t te;
+    cairo_text_extents(cr, word, &te);
+
+    /* Glyph-based extents — properly convert string → glyph array first.
+       cairo_glyph_extents() requires (cairo_t*, const cairo_glyph_t*, int, ...). */
+    {
+      cairo_scaled_font_t *csf = cairo_get_scaled_font(cr);
+      cairo_glyph_t *glyphs = NULL;
+      int num_glyphs = 0;
+      cairo_status_t st = cairo_scaled_font_text_to_glyphs(
+        csf, tx, ty, word, -1, &glyphs, &num_glyphs,
+        NULL, NULL, NULL);
+      if (st == CAIRO_STATUS_SUCCESS && glyphs && num_glyphs > 0) {
+        cairo_glyph_extents(cr, glyphs, num_glyphs, &te);
+      }
+      if (glyphs) cairo_glyph_free(glyphs);
+    }
+
+    cairo_font_options_destroy(fo);
   }
 }
 
+/* clipping: clip, clip_preserve, clip_extents, copy_clip_rectangle_list, fill rules */
+static void mode_clip(cairo_t *cr, int n) {
+  for (int i = 0; i < n; i++) {
+    cairo_save(cr);
+    cairo_set_fill_rule(cr, (rng_u32() & 1) ? CAIRO_FILL_RULE_EVEN_ODD : CAIRO_FILL_RULE_WINDING);
+    make_random_path(cr);
+    if (rng_u32() & 1) make_random_path(cr);
+    cairo_clip(cr);
+    double x1, y1, x2, y2;
+    cairo_clip_extents(cr, &x1, &y1, &x2, &y2);
+    cairo_rectangle_list_t *rl = cairo_copy_clip_rectangle_list(cr);
+    cairo_rectangle_list_destroy(rl);
+    mode_stroke_fill(cr, n/4 + 1);
+    mode_patterns(cr, n/6 + 1);
+    cairo_restore(cr);
+
+    cairo_save(cr);
+    make_random_path(cr);
+    cairo_clip_preserve(cr);
+    set_random_source(cr);
+    cairo_fill_preserve(cr);
+    cairo_stroke(cr);
+    cairo_restore(cr);
+  }
+}
+
+/* transforms: translate, scale, rotate, arbitrary matrix, user↔device */
+static void mode_transform(cairo_t *cr, int n) {
+  for (int i = 0; i < n; i++) {
+    cairo_save(cr);
+    int tt = (int)(rng_u32() % 6);
+    switch (tt) {
+    case 0: cairo_translate(cr, frand(-W/2,W/2), frand(-H/2,H/2)); break;
+    case 1: cairo_scale(cr, frand(0.2,3.0), frand(0.2,3.0)); break;
+    case 2: cairo_rotate(cr, frand(0,TAU)); break;
+    case 3: {
+      cairo_matrix_t m;
+      cairo_matrix_init(&m, frand(0.5,2), frand(-0.3,0.3),
+                             frand(-0.3,0.3), frand(0.5,2), frand(0,W), frand(0,H));
+      cairo_set_matrix(cr, &m);
+      break;
+    }
+    case 4:
+      cairo_translate(cr, frand(0,W), frand(0,H));
+      cairo_scale(cr, frand(0.5,2), frand(0.5,2));
+      cairo_rotate(cr, frand(0,M_PI));
+      break;
+    default: {
+      double ux = frand(0,W), uy = frand(0,H);
+      double dx = ux, dy = uy;
+      cairo_user_to_device(cr, &dx, &dy);
+      cairo_device_to_user(cr, &dx, &dy);
+      break;
+    }
+    }
+    mode_stroke_fill(cr, n/5 + 1);
+    cairo_restore(cr);
+  }
+}
+
+/* dash patterns with variable segment counts and offsets */
+static void mode_dash(cairo_t *cr, int n) {
+  for (int i = 0; i < n; i++) {
+    int nd = 2 + (int)(rng_u32() % 6);
+    double dashes[8];
+    for (int d = 0; d < nd; d++) dashes[d] = frand(2.0, 40.0);
+    cairo_set_dash(cr, dashes, nd, frand(0,60.0));
+    cairo_set_line_width(cr, frand(1.0, 12.0));
+    cairo_set_line_cap(cr,  (cairo_line_cap_t) (rng_u32() % 3));
+    cairo_set_line_join(cr, (cairo_line_join_t)(rng_u32() % 3));
+    cairo_set_miter_limit(cr, frand(1.0, 10.0));
+    set_random_source(cr);
+    make_random_path(cr);
+    cairo_stroke(cr);
+    cairo_set_dash(cr, NULL, 0, 0);
+  }
+}
+
+/* masks: pattern masks + surface masks */
+static void mode_mask(cairo_t *cr, int n) {
+  for (int i = 0; i < n; i++) {
+    cairo_pattern_t *mp = cairo_pattern_create_radial(
+      frand(0,W), frand(0,H), frand(10,50),
+      frand(0,W), frand(0,H), frand(100,400));
+    cairo_pattern_add_color_stop_rgba(mp, 0, 0,0,0,1);
+    cairo_pattern_add_color_stop_rgba(mp, 1, 0,0,0,0);
+    set_random_source(cr);
+    cairo_mask(cr, mp);
+    cairo_pattern_destroy(mp);
+
+    cairo_surface_t *ms = cairo_image_surface_create(CAIRO_FORMAT_A8, 256, 256);
+    if (cairo_surface_status(ms) == CAIRO_STATUS_SUCCESS) {
+      cairo_t *mcr = cairo_create(ms);
+      cairo_set_source_rgba(mcr, 0,0,0,0); cairo_paint(mcr);
+      cairo_set_source_rgba(mcr, 0,0,0,1);
+      cairo_arc(mcr, 128, 128, frand(20,100), 0, TAU);
+      cairo_fill(mcr);
+      cairo_destroy(mcr);
+      set_random_source(cr);
+      cairo_mask_surface(cr, ms, frand(0,W-256), frand(0,H-256));
+    }
+    cairo_surface_destroy(ms);
+  }
+}
+
+/* groups: push_group, push_group_with_content, pop_group_to_source */
+static void mode_push_group(cairo_t *cr, int n) {
+  cairo_content_t cts[] = {
+    CAIRO_CONTENT_COLOR, CAIRO_CONTENT_ALPHA, CAIRO_CONTENT_COLOR_ALPHA
+  };
+  for (int i = 0; i < n; i++) {
+    cairo_push_group_with_content(cr, cts[rng_u32() % 3]);
+    mode_stroke_fill(cr, n/4 + 2);
+    mode_patterns(cr, n/6 + 1);
+    cairo_pattern_t *grp = cairo_pop_group(cr);
+    cairo_set_source(cr, grp);
+    cairo_set_operator(cr, (cairo_operator_t)(rng_u32() % 29));
+    cairo_paint_with_alpha(cr, frand(0.2, 1.0));
+    cairo_pattern_destroy(grp);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+  }
+}
+
+/* all 29 compositing operators exercised per iteration */
+static void mode_all_ops(cairo_t *cr, int n) {
+  for (int i = 0; i < n; i++) {
+    for (int op = 0; op <= 28; op++) {
+      cairo_set_operator(cr, (cairo_operator_t)op);
+      set_random_source(cr);
+      make_random_path(cr);
+      if (rng_u32() & 1) cairo_fill(cr); else cairo_stroke(cr);
+    }
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+  }
+}
+
+/* all 4 image surface formats: ARGB32, RGB24, A8, RGB16_565 */
+static void mode_formats(cairo_t *cr, int n) {
+  cairo_format_t fmts[] = {
+    CAIRO_FORMAT_ARGB32, CAIRO_FORMAT_RGB24,
+    CAIRO_FORMAT_A8,     CAIRO_FORMAT_RGB16_565
+  };
+  for (int i = 0; i < n; i++) {
+    cairo_format_t fmt = fmts[rng_u32() % 4];
+    int sw = 128 + (int)(rng_u32() % 384);
+    int sh = 128 + (int)(rng_u32() % 256);
+    cairo_surface_t *surf = cairo_image_surface_create(fmt, sw, sh);
+    if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
+      cairo_surface_destroy(surf); continue;
+    }
+    cairo_t *fcr = cairo_create(surf);
+    cairo_set_source_rgba(fcr, frand(0,1), frand(0,1), frand(0,1), 1);
+    cairo_paint(fcr);
+    mode_stroke_fill(fcr, 8);
+    mode_text(fcr, 4);
+    cairo_destroy(fcr);
+    cairo_surface_flush(surf);
+    if (fmt == CAIRO_FORMAT_ARGB32) {
+      unsigned char *data = cairo_image_surface_get_data(surf);
+      int stride = cairo_image_surface_get_stride(surf);
+      if (data) {
+        for (int py = 0; py < sh; py += 16) {
+          volatile uint32_t *row = (uint32_t *)(void *)(data + py * stride);
+          (void)row[0];
+        }
+      }
+    }
+    cairo_surface_mark_dirty(surf);
+    cairo_set_source_surface(cr, surf, frand(0,W-sw), frand(0,H-sh));
+    cairo_set_operator(cr, (cairo_operator_t)(rng_u32() % 13));
+    cairo_paint(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+    cairo_surface_destroy(surf);
+  }
+}
+
+/* scaled fonts: toy font face → scaled font → show text + glyphs + glyph path */
+static void mode_scaled_font(cairo_t *cr, int n) {
+  const char *families[] = {"Sans", "Serif", "Monospace"};
+  const char *texts[] = {"CachyOS PGO BOLT", "Hello World", "cairo 2D graphics",
+                          "performance opt", "LLVM profile guided"};
+  for (int i = 0; i < n; i++) {
+    cairo_font_face_t *face = cairo_toy_font_face_create(
+      families[rng_u32() % 3],
+      (cairo_font_slant_t) (rng_u32() % 3),
+      (cairo_font_weight_t)(rng_u32() % 2));
+    cairo_matrix_t fmat, ctm;
+    double sz = frand(8, 72);
+    cairo_matrix_init_scale(&fmat, sz, sz);
+    cairo_get_matrix(cr, &ctm);
+    cairo_font_options_t *opts = cairo_font_options_create();
+    cairo_font_options_set_antialias(opts,      (cairo_antialias_t)    (rng_u32() % 5));
+    cairo_font_options_set_hint_style(opts,     (cairo_hint_style_t)   (rng_u32() % 5));
+    cairo_font_options_set_hint_metrics(opts,   (cairo_hint_metrics_t) (rng_u32() % 3));
+    cairo_font_options_set_subpixel_order(opts, (cairo_subpixel_order_t)(rng_u32() % 5));
+    cairo_scaled_font_t *sf = cairo_scaled_font_create(face, &fmat, &ctm, opts);
+    if (cairo_scaled_font_status(sf) == CAIRO_STATUS_SUCCESS) {
+      cairo_set_scaled_font(cr, sf);
+      set_random_source(cr);
+      cairo_move_to(cr, frand(0,W), frand(0,H));
+      const char *txt = texts[rng_u32() % 5];
+      cairo_show_text(cr, txt);
+      cairo_glyph_t glyphs[32];
+      int ng = 4 + (int)(rng_u32() % 24);
+      for (int g = 0; g < ng; g++) {
+        glyphs[g].index = 32 + rng_u32() % 64;
+        glyphs[g].x = frand(0, W);
+        glyphs[g].y = frand(0, H);
+      }
+      cairo_show_glyphs(cr, glyphs, ng);
+      int npg = ng < 8 ? ng : 8;
+      cairo_glyph_path(cr, glyphs, npg);
+      cairo_fill(cr);
+      cairo_font_extents_t fext; cairo_font_extents(cr, &fext);
+      cairo_text_extents_t text_ext; cairo_text_extents(cr, txt, &text_ext);
+    }
+    cairo_scaled_font_destroy(sf);
+    cairo_font_options_destroy(opts);
+    cairo_font_face_destroy(face);
+  }
+}
+
+/* surface patterns: extend modes × filter modes × matrix transforms */
+static void mode_surface_pattern(cairo_t *cr, int n) {
+  cairo_extend_t exts[] = {
+    CAIRO_EXTEND_NONE, CAIRO_EXTEND_REPEAT,
+    CAIRO_EXTEND_REFLECT, CAIRO_EXTEND_PAD
+  };
+  cairo_filter_t filts[] = {
+    CAIRO_FILTER_FAST, CAIRO_FILTER_GOOD, CAIRO_FILTER_BEST,
+    CAIRO_FILTER_NEAREST, CAIRO_FILTER_BILINEAR
+  };
+  for (int i = 0; i < n; i++) {
+    int sw = 64 + (int)(rng_u32() % 256);
+    int sh = 64 + (int)(rng_u32() % 256);
+    cairo_surface_t *src = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, sw, sh);
+    if (cairo_surface_status(src) != CAIRO_STATUS_SUCCESS) {
+      cairo_surface_destroy(src); continue;
+    }
+    cairo_t *scr = cairo_create(src);
+    mode_stroke_fill(scr, 6);
+    mode_text(scr, 3);
+    cairo_destroy(scr);
+    cairo_pattern_t *pat = cairo_pattern_create_for_surface(src);
+    cairo_pattern_set_extend(pat, exts[rng_u32() % 4]);
+    cairo_pattern_set_filter(pat, filts[rng_u32() % 5]);
+    cairo_matrix_t m;
+    cairo_matrix_init_scale(&m, frand(0.25, 3.0), frand(0.25, 3.0));
+    cairo_matrix_rotate(&m, frand(0, M_PI/2));
+    cairo_pattern_set_matrix(pat, &m);
+    cairo_set_source(cr, pat);
+    cairo_set_operator(cr, (cairo_operator_t)(rng_u32() % 29));
+    make_random_path(cr);
+    cairo_fill(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+    cairo_pattern_destroy(pat);
+    cairo_surface_destroy(src);
+  }
+}
+
+/* mesh patterns: multi-patch Bézier mesh with corner colors + control points */
+static void mode_mesh(cairo_t *cr, int n) {
+  for (int i = 0; i < n; i++) {
+    cairo_pattern_t *mesh = cairo_pattern_create_mesh();
+    if (cairo_pattern_status(mesh) != CAIRO_STATUS_SUCCESS) {
+      cairo_pattern_destroy(mesh); continue;
+    }
+    int patches = 1 + (int)(rng_u32() % 3);
+    for (int p = 0; p < patches; p++) {
+      cairo_mesh_pattern_begin_patch(mesh);
+      cairo_mesh_pattern_move_to(mesh, frand(0,W), frand(0,H));
+      for (int side = 0; side < 4; side++)
+        cairo_mesh_pattern_curve_to(mesh,
+          frand(0,W), frand(0,H),
+          frand(0,W), frand(0,H),
+          frand(0,W), frand(0,H));
+      for (int c = 0; c < 4; c++)
+        cairo_mesh_pattern_set_corner_color_rgba(mesh, c,
+          frand(0,1), frand(0,1), frand(0,1), frand(0.3,1));
+      if (rng_u32() & 1) {
+        cairo_mesh_pattern_set_control_point(mesh, 0, frand(0,W), frand(0,H));
+        cairo_mesh_pattern_set_control_point(mesh, 2, frand(0,W), frand(0,H));
+      }
+      cairo_mesh_pattern_end_patch(mesh);
+    }
+    cairo_set_source(cr, mesh);
+    cairo_set_operator(cr, (cairo_operator_t)(rng_u32() % 13));
+    cairo_rectangle(cr, 0, 0, W, H);
+    cairo_fill(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+    cairo_pattern_destroy(mesh);
+  }
+}
+
+/* path operations: copy/append/flatten, extents, hit testing */
+static void mode_path_ops(cairo_t *cr, int n) {
+  for (int i = 0; i < n; i++) {
+    cairo_new_path(cr);
+    make_random_path(cr);
+    if (rng_u32() & 1) make_random_path(cr);
+    cairo_path_t *path = cairo_copy_path(cr);
+    cairo_new_path(cr);
+    cairo_append_path(cr, path);
+    cairo_path_destroy(path);
+    cairo_path_t *flat = cairo_copy_path_flat(cr);
+    double x1, y1, x2, y2;
+    cairo_path_extents(cr, &x1, &y1, &x2, &y2);
+    cairo_fill_extents(cr, &x1, &y1, &x2, &y2);
+    cairo_stroke_extents(cr, &x1, &y1, &x2, &y2);
+    int inf = cairo_in_fill(cr, frand(0,W), frand(0,H));
+    int ins = cairo_in_stroke(cr, frand(0,W), frand(0,H));
+    (void)inf; (void)ins;
+    cairo_new_path(cr);
+    cairo_append_path(cr, flat);
+    cairo_path_destroy(flat);
+    set_random_source(cr);
+    if (rng_u32() & 1) cairo_fill(cr); else cairo_stroke(cr);
+  }
+}
+
+/* recording surface replay: record commands, query ink extents, replay */
 static void mode_recording_replay(cairo_t *dst, int n) {
-  cairo_rectangle_t ext = { 0, 0, W, H };
+  cairo_rectangle_t ext = {0, 0, W, H};
   cairo_surface_t *rec = cairo_recording_surface_create(CAIRO_CONTENT_COLOR_ALPHA, &ext);
   cairo_t *rcr = cairo_create(rec);
-
   paint_bg(rcr);
   mode_stroke_fill(rcr, n);
-  mode_patterns(rcr, n / 2);
-  mode_text(rcr, n / 3);
-
+  mode_patterns(rcr, n/2);
+  mode_text(rcr, n/3);
+  mode_clip(rcr, n/4);
+  mode_dash(rcr, n/4);
+  cairo_destroy(rcr);
+  double ix, iy, iw, ih;
+  cairo_recording_surface_ink_extents(rec, &ix, &iy, &iw, &ih);
   cairo_set_source_surface(dst, rec, 0, 0);
   cairo_paint(dst);
-
-  cairo_destroy(rcr);
+  cairo_pattern_t *rp = cairo_pattern_create_for_surface(rec);
+  cairo_matrix_t m;
+  cairo_matrix_init_translate(&m, frand(-100,100), frand(-100,100));
+  cairo_pattern_set_matrix(rp, &m);
+  cairo_set_source(dst, rp);
+  cairo_set_operator(dst, CAIRO_OPERATOR_ADD);
+  cairo_rectangle(dst, frand(0,W/2), frand(0,H/2), frand(100,W/2), frand(100,H/2));
+  cairo_fill(dst);
+  cairo_set_operator(dst, CAIRO_OPERATOR_OVER);
+  cairo_pattern_destroy(rp);
   cairo_surface_destroy(rec);
 }
 
-static void render_mode(cairo_t *cr, const char *mode, int rounds) {
+/* backend-similar surface fallback (correct API: cairo_surface_create_similar) */
+static void mode_device_fallback(cairo_t *cr, int n) {
+  cairo_surface_t *sim = cairo_surface_create_similar(
+    cairo_get_target(cr), CAIRO_CONTENT_COLOR_ALPHA, W, H);
+  if (cairo_surface_status(sim) != CAIRO_STATUS_SUCCESS) {
+    cairo_surface_destroy(sim);
+    return;
+  }
+  cairo_t *sim_cr = cairo_create(sim);
+  for (int i = 0; i < n; i++) {
+    paint_bg(sim_cr);
+    mode_stroke_fill(sim_cr, 200);
+    mode_patterns(sim_cr, 100);
+    cairo_set_source_surface(cr, sim, 0, 0);
+    cairo_paint(cr);
+    cairo_surface_flush(sim);
+    cairo_surface_mark_dirty(sim);
+  }
+  cairo_destroy(sim_cr);
+  cairo_surface_destroy(sim);
+}
+
+/* ─── Backend: file output (PDF, SVG, PS) ─── */
+static void run_backend_files(const char *base, int rounds) {
+  char path[512];
+
+  /* PDF */
+  snprintf(path, sizeof(path), "%s.pdf", base);
+  cairo_surface_t *pdf = cairo_pdf_surface_create(path, W, H);
+  if (cairo_surface_status(pdf) == CAIRO_STATUS_SUCCESS) {
+    cairo_pdf_surface_set_metadata(pdf, CAIRO_PDF_METADATA_TITLE, "Cairo PGO Training");
+    cairo_pdf_surface_set_metadata(pdf, CAIRO_PDF_METADATA_CREATOR, "cairo-pgo-bolt");
+    cairo_t *pcr = cairo_create(pdf);
+    paint_bg(pcr);
+    mode_stroke_fill(pcr, rounds * 200);
+    mode_patterns(pcr, rounds * 150);
+    mode_text(pcr, rounds * 200);
+    mode_clip(pcr, rounds * 30);
+    mode_transform(pcr, rounds * 40);
+    cairo_show_page(pcr);
+    mode_scaled_font(pcr, rounds * 50);
+    mode_surface_pattern(pcr, rounds * 30);
+    cairo_show_page(pcr);
+    mode_mesh(pcr, rounds * 10);
+    mode_path_ops(pcr, rounds * 20);
+    cairo_show_page(pcr);
+    cairo_destroy(pcr);
+  }
+  cairo_surface_destroy(pdf);
+
+  /* SVG */
+  snprintf(path, sizeof(path), "%s.svg", base);
+  cairo_surface_t *svg = cairo_svg_surface_create(path, W, H);
+  if (cairo_surface_status(svg) == CAIRO_STATUS_SUCCESS) {
+    cairo_svg_surface_set_document_unit(svg, CAIRO_SVG_UNIT_PX);
+    cairo_t *scr = cairo_create(svg);
+    paint_bg(scr);
+    mode_stroke_fill(scr, rounds * 200);
+    mode_patterns(scr, rounds * 150);
+    mode_text(scr, rounds * 200);
+    cairo_show_page(scr);
+    cairo_destroy(scr);
+  }
+  cairo_surface_destroy(svg);
+
+  /* PS */
+  snprintf(path, sizeof(path), "%s.ps", base);
+  cairo_surface_t *ps = cairo_ps_surface_create(path, W, H);
+  if (cairo_surface_status(ps) == CAIRO_STATUS_SUCCESS) {
+    cairo_ps_surface_set_eps(ps, 0);
+    cairo_ps_surface_restrict_to_level(ps, CAIRO_PS_LEVEL_3);
+    cairo_t *qcr = cairo_create(ps);
+    paint_bg(qcr);
+    mode_stroke_fill(qcr, rounds * 200);
+    mode_patterns(qcr, rounds * 150);
+    mode_text(qcr, rounds * 200);
+    cairo_show_page(qcr);
+    cairo_destroy(qcr);
+  }
+  cairo_surface_destroy(ps);
+}
+
+/* ─── Full composite: all subsystems per round ─── */
+static void render_full(cairo_t *cr, int rounds) {
   for (int i = 0; i < rounds; i++) {
     paint_bg(cr);
-
-    if (strcmp(mode, "stroke") == 0) {
-      mode_stroke_fill(cr, 1200);
-    } else if (strcmp(mode, "patterns") == 0) {
-      mode_patterns(cr, 900);
-    } else if (strcmp(mode, "text") == 0) {
-      mode_text(cr, 1800);
-    } else if (strcmp(mode, "record") == 0) {
-      mode_recording_replay(cr, 900);
-    } else if (strcmp(mode, "image") == 0) {
-      mode_stroke_fill(cr, 800);
-      mode_patterns(cr, 500);
-      mode_text(cr, 700);
-    } else {
-      mode_stroke_fill(cr, 600);
-      mode_patterns(cr, 400);
-      mode_text(cr, 500);
-      mode_recording_replay(cr, 450);
-    }
-
+    mode_stroke_fill(cr,     600);
+    mode_patterns(cr,        400);
+    mode_text(cr,            500);
+    mode_clip(cr,             60);
+    mode_transform(cr,        80);
+    mode_dash(cr,            200);
+    mode_mask(cr,             40);
+    mode_push_group(cr,       30);
+    mode_all_ops(cr,           2);
+    mode_formats(cr,          20);
+    mode_scaled_font(cr,      60);
+    mode_surface_pattern(cr,  50);
+    mode_mesh(cr,             20);
+    mode_recording_replay(cr, 100);
+    mode_path_ops(cr,         80);
     cairo_surface_flush(cairo_get_target(cr));
   }
 }
 
-static int run_backend_files(const char *base, int rounds) {
-  char path[512];
-
-  snprintf(path, sizeof(path), "%s.pdf", base);
-  cairo_surface_t *pdf = cairo_pdf_surface_create(path, W, H);
-  cairo_t *pcr = cairo_create(pdf);
-  render_mode(pcr, "all", rounds);
-  cairo_show_page(pcr);
-  cairo_destroy(pcr);
-  cairo_surface_destroy(pdf);
-
-  snprintf(path, sizeof(path), "%s.svg", base);
-  cairo_surface_t *svg = cairo_svg_surface_create(path, W, H);
-  cairo_t *scr = cairo_create(svg);
-  render_mode(scr, "all", rounds);
-  cairo_show_page(scr);
-  cairo_destroy(scr);
-  cairo_surface_destroy(svg);
-
-  snprintf(path, sizeof(path), "%s.ps", base);
-  cairo_surface_t *ps = cairo_ps_surface_create(path, W, H);
-  cairo_t *qcr = cairo_create(ps);
-  render_mode(qcr, "all", rounds);
-  cairo_show_page(qcr);
-  cairo_destroy(qcr);
-  cairo_surface_destroy(ps);
-
-  return 0;
+/* ─── Mode dispatcher ─── */
+static void render_mode(cairo_t *cr, const char *mode, int rounds) {
+  for (int i = 0; i < rounds; i++) {
+    paint_bg(cr);
+    if      (!strcmp(mode, "stroke"))       mode_stroke_fill(cr,   1500);
+    else if (!strcmp(mode, "patterns"))     mode_patterns(cr,      1200);
+    else if (!strcmp(mode, "text"))         mode_text(cr,          2500);
+    else if (!strcmp(mode, "record"))       mode_recording_replay(cr, 1000);
+    else if (!strcmp(mode, "clip"))         mode_clip(cr,           200);
+    else if (!strcmp(mode, "transform"))    mode_transform(cr,      300);
+    else if (!strcmp(mode, "dash"))         mode_dash(cr,           400);
+    else if (!strcmp(mode, "mask"))         mode_mask(cr,           120);
+    else if (!strcmp(mode, "push_group"))   mode_push_group(cr,      80);
+    else if (!strcmp(mode, "all_ops"))      mode_all_ops(cr,           5);
+    else if (!strcmp(mode, "formats"))      mode_formats(cr,          60);
+    else if (!strcmp(mode, "scaled_font"))  mode_scaled_font(cr,    150);
+    else if (!strcmp(mode, "surf_pattern")) mode_surface_pattern(cr, 100);
+    else if (!strcmp(mode, "mesh"))         mode_mesh(cr,             60);
+    else if (!strcmp(mode, "path_ops"))     mode_path_ops(cr,        200);
+    else if (!strcmp(mode, "image")) {
+      mode_stroke_fill(cr, 1000);
+      mode_patterns(cr,     600);
+      mode_text(cr,         900);
+    } else if (!strcmp(mode, "device")) {
+      mode_device_fallback(cr, 600);
+    } else {
+      render_full(cr, 1);
+    }
+    cairo_surface_flush(cairo_get_target(cr));
+  }
 }
 
+/* ─── Main ─── */
 int main(int argc, char **argv) {
   const char *mode = "all";
   int rounds = 2;
   uint64_t seed = 0x123456789ULL;
 
   for (int i = 1; i < argc; i++) {
-    if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
-      mode = argv[++i];
-    } else if (!strcmp(argv[i], "--rounds") && i + 1 < argc) {
-      rounds = atoi(argv[++i]);
-    } else if (!strcmp(argv[i], "--seed") && i + 1 < argc) {
-      seed = strtoull(argv[++i], NULL, 10);
-    }
+    if      (!strcmp(argv[i], "--mode")   && i+1 < argc) mode   = argv[++i];
+    else if (!strcmp(argv[i], "--rounds") && i+1 < argc) rounds = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--seed")   && i+1 < argc) seed   = strtoull(argv[++i], NULL, 16);
   }
-
-  if (rounds < 1) {
-    rounds = 1;
-  }
-
+  if (rounds < 1) rounds = 1;
   rng_state = seed;
 
   cairo_surface_t *img = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, W, H);
@@ -279,7 +848,6 @@ int main(int argc, char **argv) {
     fprintf(stderr, "failed to create image surface\n");
     return 1;
   }
-
   cairo_t *cr = cairo_create(img);
   if (cairo_status(cr) != CAIRO_STATUS_SUCCESS) {
     fprintf(stderr, "failed to create cairo context\n");
@@ -287,44 +855,163 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (!strcmp(mode, "backend")) {
+  if (!strcmp(mode, "backend"))
     run_backend_files("/tmp/cairo-pgo-backend", rounds);
-  } else {
+  else
     render_mode(cr, mode, rounds);
-  }
 
   cairo_destroy(cr);
   cairo_surface_destroy(img);
   return 0;
 }
-EOF
+WORKLOAD_EOF
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# build_workload_runner() — compile the training workload binary.
+# Preserves all user CFLAGS/LDFLAGS from makepkg.conf (minus profiling flags
+# that would cause recursive profile emission). Adds -O3 for a fast runner.
+# ─────────────────────────────────────────────────────────────────────────────
+build_workload_runner() {
+  local install_root="$1"
+  local out_bin="$2"
+  shift 2
+
+  # Split args at "--" into cflags vs ldflags
+  local -a in_cflags=()
+  local -a in_ldflags=()
+  local mode=0 arg
+  for arg in "$@"; do
+    if [[ "$arg" == "--" ]]; then mode=1; continue; fi
+    if (( mode == 0 )); then
+      in_cflags+=("$arg")
+    else
+      in_ldflags+=("$arg")
+    fi
+  done
+
+  # Strip profiling flags; keep optimization (-O3 etc.) from makepkg.conf
+  local -a clean_cflags
+  mapfile -t clean_cflags < <(filter_profiling_flags "${in_cflags[@]}")
+  local -a clean_ldflags
+  mapfile -t clean_ldflags < <(filter_profiling_flags "${in_ldflags[@]}")
+
+  clang -O3 "${clean_cflags[@]}" \
+        "${srcdir}/cairo_workload.c" -o "${out_bin}" \
+        -I"${install_root}/usr/include" \
+        -L"${install_root}/usr/lib" \
+        -Wl,-rpath,"${install_root}/usr/lib" \
+        -lcairo -lm \
+        "${clean_ldflags[@]}" || {
+    error "Failed to build workload runner"
+    return 1
+  }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# run_workload_mode() — execute one workload mode, verify profraw output.
+# Uses LLVM_PROFILE_FILE for clang IR-PGO instrumentation runtime.
+# ─────────────────────────────────────────────────────────────────────────────
+run_workload_mode() {
+  local runner="$1"
+  local install_root="$2"
+  local raw_dir="$3"
+  local phase="$4"
+  local mode="$5"
+  local rounds="$6"
+  local seed="$7"
+
+  mkdir -p "${raw_dir}" || return 1
+
+  local before after
+  before=$(find "${raw_dir}" -maxdepth 1 -name '*.profraw' 2>/dev/null | wc -l)
+
+  LD_LIBRARY_PATH="${install_root}/usr/lib:${LD_LIBRARY_PATH}" \
+  LLVM_PROFILE_FILE="${raw_dir}/${phase}-${mode}-%4m-%p.profraw" \
+  "${runner}" --mode "${mode}" --rounds "${rounds}" --seed "${seed}" || return 1
+
+  after=$(find "${raw_dir}" -maxdepth 1 -name '*.profraw' 2>/dev/null | wc -l)
+  (( after > before )) || {
+    error "No profraw files generated for ${phase}-${mode}"
+    return 1
+  }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# merge_raw_to_profdata() — merge profraw → profdata with validation.
+# ─────────────────────────────────────────────────────────────────────────────
+merge_raw_to_profdata() {
+  local raw_dir="$1"
+  local out_prof="$2"
+
+  shopt -s nullglob
+  local raws=( "${raw_dir}"/*.profraw )
+  shopt -u nullglob
+
+  (( ${#raws[@]} > 0 )) || {
+    error "No profraw files found in ${raw_dir}"
+    return 1
+  }
+
+  llvm-profdata merge -sparse=true -output="${out_prof}" "${raws[@]}" || return 1
+  [[ -s "${out_prof}" ]] || {
+    error "Merged profdata is empty: ${out_prof}"
+    return 1
+  }
+  msg2 "  Merged ${#raws[@]} profraw → ${out_prof} ($(stat -c%s "${out_prof}") bytes)"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# prepare() — write the workload source before any build stages.
+# ─────────────────────────────────────────────────────────────────────────────
+prepare() {
+  cd "${srcdir}/cairo"
+  write_workload_source
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# build() — 7-stage PGO+BOLT pipeline.
+#   1. IR-PGO instrumented build              (-fprofile-generate)
+#   2. IR-PGO training                        (writes profraw via runtime)
+#   3. IR profdata merge
+#   4. CS-PGO instrumented build              (-fprofile-use + -fcs-profile-generate)
+#   5. CS-PGO training + merge with IR
+#   6. Final optimized build                  (-fprofile-use only; clean binary)
+#   7. BOLT instrument → train → optimize     (in package())
+# ─────────────────────────────────────────────────────────────────────────────
 build() {
   cd "${srcdir}/cairo"
 
+  # Preserve user flags from makepkg.conf
   local -a orig_cflags=()
   local -a orig_cxxflags=()
   local -a orig_ldflags=()
-  read -r -a orig_cflags <<< "${CFLAGS:-}"
+  read -r -a orig_cflags   <<< "${CFLAGS:-}"
   read -r -a orig_cxxflags <<< "${CXXFLAGS:-}"
-  read -r -a orig_ldflags <<< "${LDFLAGS:-}"
+  read -r -a orig_ldflags  <<< "${LDFLAGS:-}"
+
+  # -fno-semantic-interposition: critical for shared-library PGO. Prevents
+  # runtime symbol interposition, enabling direct call inlining and better
+  # devirtualization. Must be in BOTH compile and link stages.
+  local -a base_extra=(-fno-semantic-interposition)
 
   local PGO_DIR="${srcdir}/pgo-data"
-  local IR_RAW_DIR="${PGO_DIR}/raw/ir"
-  local CS_RAW_DIR="${PGO_DIR}/raw/cs"
+  local IR_HOT="${PGO_DIR}/raw/ir/hot"
+  local IR_BROAD="${PGO_DIR}/raw/ir/broad"
+  local IR_BACK="${PGO_DIR}/raw/ir/backend"
+  local CS_HOT="${PGO_DIR}/raw/cs/hot"
+  local CS_BROAD="${PGO_DIR}/raw/cs/broad"
+  local CS_BACK="${PGO_DIR}/raw/cs/backend"
   local PROF_DIR="${PGO_DIR}/profdata"
   local TEMP_INSTALL="${srcdir}/temp_install"
 
-  rm -rf "${PGO_DIR}" "${TEMP_INSTALL}" "${srcdir}/build-ir" "${srcdir}/build-cs" "${srcdir}/build"
+  rm -rf "${PGO_DIR}" "${TEMP_INSTALL}" \
+         "${srcdir}/build-ir" "${srcdir}/build-cs" "${srcdir}/build"
   mkdir -p \
-    "${IR_RAW_DIR}/hot" "${IR_RAW_DIR}/broad" "${IR_RAW_DIR}/backend" \
-    "${CS_RAW_DIR}/hot" "${CS_RAW_DIR}/broad" \
+    "${IR_HOT}" "${IR_BROAD}" "${IR_BACK}" \
+    "${CS_HOT}" "${CS_BROAD}" "${CS_BACK}" \
     "${PROF_DIR}"
 
-  # Root-cause fix:
-  # CS-PGO + LTO + static /usr/lib/liblzo2.a can trigger LLVM ProfileSummary conflicts.
-  # Disable optional lzo backend to avoid linking static liblzo2 into LTO/CS-PGO stages.
   local -a meson_opts=(
     --buildtype=release
     -Ddefault_library=shared
@@ -334,228 +1021,264 @@ build() {
     -Dlzo=disabled
   )
 
-  build_workload_runner() {
-    local install_root="$1"
-    local out_bin="$2"
-    shift 2
+  # =====================================================================
+  # STAGE 1/7: IR PGO instrumented build  (-fprofile-generate, LLVM IR PGO)
+  # =====================================================================
+  msg2 "Stage 1/7: IR PGO instrumented build"
 
-    local -a in_cflags=()
-    local -a in_ldflags=()
-    local mode=0
-    local arg
-    for arg in "$@"; do
-      if [[ "$arg" == "--" ]]; then
-        mode=1
-        continue
-      fi
-      if (( mode == 0 )); then
-        in_cflags+=("$arg")
-      else
-        in_ldflags+=("$arg")
-      fi
-    done
-
-    local -a workload_cflags=()
-    local -a workload_ldflags=()
-    filter_workload_flags in_cflags workload_cflags
-    filter_workload_flags in_ldflags workload_ldflags
-
-    CFLAGS= CXXFLAGS= LDFLAGS= \
-    clang "${workload_cflags[@]}" "${srcdir}/cairo_workload.c" -o "${out_bin}" \
-      -I"${install_root}/usr/include" \
-      -L"${install_root}/usr/lib" \
-      -Wl,-rpath,"${install_root}/usr/lib" \
-      -lcairo -lm "${workload_ldflags[@]}"
-  }
-
-  run_workload_mode() {
-    local runner="$1"
-    local install_root="$2"
-    local raw_dir="$3"
-    local phase="$4"
-    local mode="$5"
-    local rounds="$6"
-    local seed="$7"
-
-    mkdir -p "${raw_dir}" || return 1
-
-    local before after
-    before=$(find "${raw_dir}" -maxdepth 1 -name '*.profraw' 2>/dev/null | wc -l)
-
-    LD_LIBRARY_PATH="${install_root}/usr/lib:${LD_LIBRARY_PATH}" \
-    LLVM_PROFILE_FILE="${raw_dir}/${phase}-${mode}-%4m.profraw" \
-    "${runner}" --mode "${mode}" --rounds "${rounds}" --seed "${seed}" || return 1
-
-    after=$(find "${raw_dir}" -maxdepth 1 -name '*.profraw' 2>/dev/null | wc -l)
-    (( after > before )) || return 1
-  }
-
-  merge_raw_to_profdata() {
-    local raw_dir="$1"
-    local out_prof="$2"
-
-    shopt -s nullglob
-    local raws=( "${raw_dir}"/*.profraw )
-    shopt -u nullglob
-
-    (( ${#raws[@]} > 0 )) || {
-      error "No profraw files found in ${raw_dir}"
-      return 1
-    }
-
-    llvm-profdata merge -sparse=true -output="${out_prof}" "${raws[@]}" || return 1
-    [[ -s "${out_prof}" ]] || return 1
-  }
-
-  msg2 "Stage 1/6: IR PGO instrumented build"
-
-  local -a ir_pgo_flags=(
-    -fprofile-generate="${IR_RAW_DIR}/fallback"
+  local -a ir_gen=(
+    -fprofile-generate="${IR_HOT}"
     -fprofile-update=atomic
     -mllvm -enable-value-profiling
     -mllvm -vp-counters-per-site=16
   )
-  local -a stage1_cflags=( "${orig_cflags[@]}" "${ir_pgo_flags[@]}" )
-  local -a stage1_cxxflags=( "${orig_cxxflags[@]}" "${ir_pgo_flags[@]}" )
-  local -a stage1_ldflags=( "${orig_ldflags[@]}" -fprofile-generate="${IR_RAW_DIR}/fallback" )
 
+  local -a s1c=("${orig_cflags[@]}"   "${base_extra[@]}" "${ir_gen[@]}")
+  local -a s1x=("${orig_cxxflags[@]}" "${base_extra[@]}" "${ir_gen[@]}")
+  local -a s1l=("${orig_ldflags[@]}"  "${base_extra[@]}"
+                -fprofile-generate="${IR_HOT}")
+
+  CC=clang CXX=clang++ \
   arch-meson . "${srcdir}/build-ir" "${meson_opts[@]}" \
-    -Dc_args="$(meson_array "${stage1_cflags[@]}")" \
-    -Dcpp_args="$(meson_array "${stage1_cxxflags[@]}")" \
-    -Dc_link_args="$(meson_array "${stage1_ldflags[@]}")" || return 1
+    -Dc_args="$(meson_array "${s1c[@]}")" \
+    -Dcpp_args="$(meson_array "${s1x[@]}")" \
+    -Dc_link_args="$(meson_array "${s1l[@]}")" || return 1
 
   meson compile -C "${srcdir}/build-ir" || return 1
   DESTDIR="${TEMP_INSTALL}" meson install -C "${srcdir}/build-ir" || return 1
 
-  msg2 "Stage 2/6: IR PGO workload training"
-  local ir_runner="${srcdir}/cairo_workload_runner_ir"
-  build_workload_runner "${TEMP_INSTALL}" "${ir_runner}" "${stage1_cflags[@]}" -- "${stage1_ldflags[@]}" || return 1
+  # =====================================================================
+  # STAGE 2/7: IR PGO workload training
+  # Hot tier (50% weight): image, text, stroke, scaled_font, all_ops
+  # Broad tier (35% weight): clip, transform, dash, mask, push_group, formats
+  # Backend tier (15% weight): backend file output, surface-similar fallback
+  # =====================================================================
+  msg2 "Stage 2/7: IR PGO workload training"
 
-  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_RAW_DIR}/hot" "ir" "image"   3 1111 || return 1
-  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_RAW_DIR}/hot" "ir" "text"    3 2222 || return 1
-  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_RAW_DIR}/broad" "ir" "stroke"   2 3333 || return 1
-  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_RAW_DIR}/broad" "ir" "patterns" 2 4444 || return 1
-  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_RAW_DIR}/broad" "ir" "record"   2 5555 || return 1
-  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_RAW_DIR}/backend" "ir" "backend" 2 6666 || return 1
+  local ir_runner="${srcdir}/cairo_workload_runner_ir"
+  build_workload_runner "${TEMP_INSTALL}" "${ir_runner}" \
+    "${orig_cflags[@]}" -- "${orig_ldflags[@]}" || return 1
+
+  # Hot paths
+  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_HOT}" \
+    "ir" "image"       4 0x1111 || return 1
+  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_HOT}" \
+    "ir" "text"        4 0x2222 || return 1
+  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_HOT}" \
+    "ir" "stroke"      3 0x3333 || return 1
+  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_HOT}" \
+    "ir" "scaled_font" 3 0x5555 || return 1
+  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_HOT}" \
+    "ir" "all_ops"     2 0x6666 || return 1
+
+  # Broad paths
+  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_BROAD}" \
+    "ir" "clip"        2 0x7777 || return 1
+  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_BROAD}" \
+    "ir" "transform"   2 0x8888 || return 1
+  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_BROAD}" \
+    "ir" "dash"        2 0x9999 || return 1
+  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_BROAD}" \
+    "ir" "mask"        2 0xAAAA || return 1
+  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_BROAD}" \
+    "ir" "push_group"  2 0xBBBB || return 1
+  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_BROAD}" \
+    "ir" "formats"     2 0xCCCC || return 1
+
+  # Backend paths
+  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_BACK}" \
+    "ir" "backend" 3 0xDDDD || return 1
+  run_workload_mode "${ir_runner}" "${TEMP_INSTALL}" "${IR_BACK}" \
+    "ir" "device"  2 0xEEEE || return 1
 
   rm -f "${ir_runner}"
 
-  msg2 "Stage 3/6: IR profdata merge"
+  # =====================================================================
+  # STAGE 3/7: IR profdata merge (weighted: hot 5, broad 3, backend 1)
+  # =====================================================================
+  msg2 "Stage 3/7: IR profdata merge"
+
   local ir_hot_prof="${PROF_DIR}/ir_hot.profdata"
   local ir_broad_prof="${PROF_DIR}/ir_broad.profdata"
-  local ir_backend_prof="${PROF_DIR}/ir_backend.profdata"
+  local ir_back_prof="${PROF_DIR}/ir_backend.profdata"
   local ir_prof="${PROF_DIR}/ir.profdata"
 
-  merge_raw_to_profdata "${IR_RAW_DIR}/hot" "${ir_hot_prof}" || return 1
-  merge_raw_to_profdata "${IR_RAW_DIR}/broad" "${ir_broad_prof}" || return 1
-  merge_raw_to_profdata "${IR_RAW_DIR}/backend" "${ir_backend_prof}" || return 1
+  merge_raw_to_profdata "${IR_HOT}"   "${ir_hot_prof}"   || return 1
+  merge_raw_to_profdata "${IR_BROAD}" "${ir_broad_prof}" || return 1
+  merge_raw_to_profdata "${IR_BACK}"  "${ir_back_prof}"  || return 1
 
   llvm-profdata merge -sparse=true \
     -output="${ir_prof}" \
-    --weighted-input=7,"${ir_hot_prof}" \
+    --weighted-input=5,"${ir_hot_prof}" \
     --weighted-input=3,"${ir_broad_prof}" \
-    --weighted-input=2,"${ir_backend_prof}" || return 1
+    --weighted-input=1,"${ir_back_prof}" || return 1
 
   [[ -s "${ir_prof}" ]] || {
     error "IR merged profdata is empty"
     return 1
   }
+  msg2 "  IR profdata: $(stat -c%s "${ir_prof}") bytes"
 
-  msg2 "Stage 4/6: CS-PGO instrumented build + training"
+  # =====================================================================
+  # STAGE 4/7: CS-PGO instrumented build
+  # Consumes IR profile, generates CS (context-sensitive) profile.
+  # =====================================================================
+  msg2 "Stage 4/7: CS-PGO instrumented build"
+
   rm -rf "${TEMP_INSTALL}"
 
-  local -a cs_pgo_flags=(
+  local -a cs_gen=(
     -fprofile-use="${ir_prof}"
-    -fcs-profile-generate="${CS_RAW_DIR}/fallback"
+    -fcs-profile-generate="${CS_HOT}"
     -fprofile-update=atomic
     -mllvm -enable-value-profiling
     -mllvm -vp-counters-per-site=16
   )
-  local -a stage2_cflags=( "${orig_cflags[@]}" "${cs_pgo_flags[@]}" )
-  local -a stage2_cxxflags=( "${orig_cxxflags[@]}" "${cs_pgo_flags[@]}" )
-  local -a stage2_ldflags=(
-    "${orig_ldflags[@]}"
-    -fprofile-use="${ir_prof}"
-    -fcs-profile-generate="${CS_RAW_DIR}/fallback"
-  )
 
+  local -a s2c=("${orig_cflags[@]}"   "${base_extra[@]}" "${cs_gen[@]}")
+  local -a s2x=("${orig_cxxflags[@]}" "${base_extra[@]}" "${cs_gen[@]}")
+  local -a s2l=("${orig_ldflags[@]}"  "${base_extra[@]}"
+                -fprofile-use="${ir_prof}"
+                -fcs-profile-generate="${CS_HOT}")
+
+  CC=clang CXX=clang++ \
   arch-meson . "${srcdir}/build-cs" "${meson_opts[@]}" \
-    -Dc_args="$(meson_array "${stage2_cflags[@]}")" \
-    -Dcpp_args="$(meson_array "${stage2_cxxflags[@]}")" \
-    -Dc_link_args="$(meson_array "${stage2_ldflags[@]}")" || return 1
+    -Dc_args="$(meson_array "${s2c[@]}")" \
+    -Dcpp_args="$(meson_array "${s2x[@]}")" \
+    -Dc_link_args="$(meson_array "${s2l[@]}")" || return 1
 
   meson compile -C "${srcdir}/build-cs" || return 1
   DESTDIR="${TEMP_INSTALL}" meson install -C "${srcdir}/build-cs" || return 1
 
-  local cs_runner="${srcdir}/cairo_workload_runner_cs"
-  build_workload_runner "${TEMP_INSTALL}" "${cs_runner}" "${stage2_cflags[@]}" -- "${stage2_ldflags[@]}" || return 1
+  # =====================================================================
+  # STAGE 5/7: CS-PGO workload training
+  # =====================================================================
+  msg2 "Stage 5/7: CS-PGO workload training"
 
-  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_RAW_DIR}/hot" "cs" "image" 2 7777 || return 1
-  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_RAW_DIR}/hot" "cs" "text"  2 8888 || return 1
-  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_RAW_DIR}/broad" "cs" "record"  1 9999 || return 1
-  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_RAW_DIR}/broad" "cs" "backend" 1 1010 || return 1
+  local cs_runner="${srcdir}/cairo_workload_runner_cs"
+  build_workload_runner "${TEMP_INSTALL}" "${cs_runner}" \
+    "${orig_cflags[@]}" -- "${orig_ldflags[@]}" || return 1
+
+  # Hot
+  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_HOT}" \
+    "cs" "image"       4 0x1111 || return 1
+  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_HOT}" \
+    "cs" "text"        4 0x2222 || return 1
+  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_HOT}" \
+    "cs" "stroke"      3 0x3333 || return 1
+  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_HOT}" \
+    "cs" "scaled_font" 3 0x5555 || return 1
+  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_HOT}" \
+    "cs" "all_ops"     2 0x6666 || return 1
+
+  # Broad
+  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_BROAD}" \
+    "cs" "clip"        2 0x7777 || return 1
+  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_BROAD}" \
+    "cs" "transform"   2 0x8888 || return 1
+  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_BROAD}" \
+    "cs" "dash"        2 0x9999 || return 1
+  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_BROAD}" \
+    "cs" "mask"        2 0xAAAA || return 1
+  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_BROAD}" \
+    "cs" "push_group"  2 0xBBBB || return 1
+  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_BROAD}" \
+    "cs" "formats"     2 0xCCCC || return 1
+
+  # Backend
+  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_BACK}" \
+    "cs" "backend" 3 0xDDDD || return 1
+  run_workload_mode "${cs_runner}" "${TEMP_INSTALL}" "${CS_BACK}" \
+    "cs" "device"  2 0xEEEE || return 1
 
   rm -f "${cs_runner}"
 
+  # =====================================================================
+  # STAGE 5b/7: Merge CS profdata + combine with IR
+  # =====================================================================
+  msg2 "Stage 5b/7: Merge CS profdata"
+
   local cs_only_prof="${PROF_DIR}/cs_only.profdata"
   local cs_prof="${PROF_DIR}/cs.profdata"
-  merge_raw_to_profdata "${CS_RAW_DIR}/hot" "${PROF_DIR}/cs_hot.profdata" || return 1
-  merge_raw_to_profdata "${CS_RAW_DIR}/broad" "${PROF_DIR}/cs_broad.profdata" || return 1
+
+  merge_raw_to_profdata "${CS_HOT}"   "${PROF_DIR}/cs_hot.profdata"     || return 1
+  merge_raw_to_profdata "${CS_BROAD}" "${PROF_DIR}/cs_broad.profdata"   || return 1
+  merge_raw_to_profdata "${CS_BACK}"  "${PROF_DIR}/cs_backend.profdata" || return 1
 
   llvm-profdata merge -sparse=true \
     -output="${cs_only_prof}" \
-    --weighted-input=6,"${PROF_DIR}/cs_hot.profdata" \
-    --weighted-input=2,"${PROF_DIR}/cs_broad.profdata" || return 1
+    --weighted-input=5,"${PROF_DIR}/cs_hot.profdata" \
+    --weighted-input=3,"${PROF_DIR}/cs_broad.profdata" \
+    --weighted-input=1,"${PROF_DIR}/cs_backend.profdata" || return 1
 
-  llvm-profdata merge -sparse=true -output="${cs_prof}" "${ir_prof}" "${cs_only_prof}" || return 1
+  # Combined: IR + CS profiles
+  llvm-profdata merge -sparse=true \
+    -output="${cs_prof}" \
+    "${ir_prof}" "${cs_only_prof}" || return 1
+
   [[ -s "${cs_prof}" ]] || {
     error "CS merged profdata is empty"
     return 1
   }
+  msg2 "  CS profdata: $(stat -c%s "${cs_prof}") bytes"
 
-  msg2 "Stage 5/6: Final CS-PGO optimized build"
+  # =====================================================================
+  # STAGE 6/7: Final optimized build (clean — no instrumentation, BOLT-ready)
+  # Uses combined IR+CS profile.  Adds --emit-relocs so BOLT can rewrite.
+  # =====================================================================
+  msg2 "Stage 6/7: Final CS-PGO optimized build"
 
-  local -a final_flags=( -fprofile-use="${cs_prof}" )
-  local -a stage3_cflags=( "${orig_cflags[@]}" "${final_flags[@]}" )
-  local -a stage3_cxxflags=( "${orig_cxxflags[@]}" "${final_flags[@]}" )
-  local -a stage3_ldflags=( "${orig_ldflags[@]}" "${final_flags[@]}" -Wl,--emit-relocs )
+  local -a final_cflags=(
+    "${orig_cflags[@]}" "${base_extra[@]}"
+    -fprofile-use="${cs_prof}"
+  )
+  local -a final_cxxflags=(
+    "${orig_cxxflags[@]}" "${base_extra[@]}"
+    -fprofile-use="${cs_prof}"
+  )
+  local -a final_ldflags=(
+    "${orig_ldflags[@]}" "${base_extra[@]}"
+    -fprofile-use="${cs_prof}"
+    -Wl,--emit-relocs
+  )
 
+  CC=clang CXX=clang++ \
   arch-meson . "${srcdir}/build" "${meson_opts[@]}" \
-    -Dc_args="$(meson_array "${stage3_cflags[@]}")" \
-    -Dcpp_args="$(meson_array "${stage3_cxxflags[@]}")" \
-    -Dc_link_args="$(meson_array "${stage3_ldflags[@]}")" || return 1
+    -Dc_args="$(meson_array "${final_cflags[@]}")" \
+    -Dcpp_args="$(meson_array "${final_cxxflags[@]}")" \
+    -Dc_link_args="$(meson_array "${final_ldflags[@]}")" || return 1
 
   meson compile -C "${srcdir}/build" || return 1
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# package() — install + BOLT optimize.
+# ─────────────────────────────────────────────────────────────────────────────
 package() {
-  provides=(
-    libcairo-gobject.so
-    libcairo-script-interpreter.so
-    libcairo.so
-    cairo
-    cairo-git
-  )
-
   cd "${srcdir}/cairo"
   DESTDIR="${pkgdir}" meson install -C "${srcdir}/build" || return 1
 
+  # Find the shared library
   local lib_path
-  lib_path="$(find "${pkgdir}/usr/lib" -maxdepth 1 -type f -name 'libcairo.so.*' | sort -V | tail -n1)"
+  lib_path="$(find "${pkgdir}/usr/lib" -maxdepth 1 -type f \
+              -name 'libcairo.so.*' | sort -V | tail -n1)"
   if [[ -z "${lib_path}" ]]; then
     error "Could not find installed libcairo shared object"
     return 1
   fi
-
   local lib_dir
   lib_dir="$(dirname "${lib_path}")"
 
+  # =====================================================================
+  # STAGE 7/7: BOLT optimize final libcairo
+  # =====================================================================
   local BOLT_DIR="${srcdir}/bolt-data"
   rm -rf "${BOLT_DIR}"
   mkdir -p "${BOLT_DIR}"
 
-  msg2 "Stage 6/6: BOLT optimize final libcairo"
+  msg2 "Stage 7/7: BOLT optimize final libcairo"
 
+  # --- Step 1: Instrument the library ---
   cp -f "${lib_path}" "${lib_path}.prebolt"
 
   if ! llvm-bolt "${lib_path}.prebolt" \
@@ -564,103 +1287,118 @@ package() {
       --instrumentation-file="${BOLT_DIR}/bolt.fdata" \
       -o "${lib_path}.inst"; then
     warning "BOLT instrumentation failed, keeping CS-PGO binary"
-    rm -f "${lib_path}.inst"
+    rm -f "${lib_path}.inst" "${lib_path}.prebolt"
     return 0
   fi
 
   mv -f "${lib_path}.inst" "${lib_path}"
 
+  # --- Step 2: Build BOLT workload runner (clean, non-instrumented) ---
   local -a pkg_cflags=()
   local -a pkg_ldflags=()
-  read -r -a pkg_cflags <<< "${CFLAGS:-}"
+  read -r -a pkg_cflags  <<< "${CFLAGS:-}"
   read -r -a pkg_ldflags <<< "${LDFLAGS:-}"
 
   local -a wl_cflags=()
   local -a wl_ldflags=()
-  filter_workload_flags pkg_cflags wl_cflags
-  filter_workload_flags pkg_ldflags wl_ldflags
+  mapfile -t wl_cflags  < <(filter_profiling_flags "${pkg_cflags[@]}")
+  mapfile -t wl_ldflags < <(filter_profiling_flags "${pkg_ldflags[@]}")
 
-  CFLAGS= CXXFLAGS= LDFLAGS= \
-  clang "${wl_cflags[@]}" "${srcdir}/cairo_workload.c" -o "${srcdir}/cairo_workload_runner_bolt" \
-    -I"${pkgdir}/usr/include" \
-    -L"${lib_dir}" \
-    -Wl,-rpath,"${lib_dir}" \
-    -lcairo -lm "${wl_ldflags[@]}" || {
+  clang -O3 "${wl_cflags[@]}" \
+        "${srcdir}/cairo_workload.c" \
+        -o "${srcdir}/cairo_workload_runner_bolt" \
+        -I"${pkgdir}/usr/include" \
+        -L"${lib_dir}" \
+        -Wl,-rpath,"${lib_dir}" \
+        -lcairo -lm \
+        "${wl_ldflags[@]}" || {
     warning "BOLT workload build failed, restoring CS-PGO binary"
     mv -f "${lib_path}.prebolt" "${lib_path}"
+    rm -f "${srcdir}/cairo_workload_runner_bolt" "${lib_path}.prebolt"
     return 0
   }
 
+  # --- Step 3: Run comprehensive workload to collect BOLT fdata ---
+  # BOLT runtime writes ${BOLT_DIR}/bolt.fdata.<pid> directly.
   local run_failed=0
   local mode
-  for mode in image text stroke patterns record backend; do
+  for mode in image text stroke patterns record clip transform dash mask \
+              push_group all_ops formats scaled_font surf_pattern mesh \
+              path_ops device backend; do
     if ! LD_LIBRARY_PATH="${lib_dir}:${LD_LIBRARY_PATH}" \
-         BOLT_PROFILE_FILE="${BOLT_DIR}/bolt.fdata" \
-         "${srcdir}/cairo_workload_runner_bolt" --mode "${mode}" --rounds 2 --seed 424242; then
+         "${srcdir}/cairo_workload_runner_bolt" \
+         --mode "${mode}" --rounds 3 --seed 424242; then
       run_failed=1
       break
     fi
   done
-
   rm -f "${srcdir}/cairo_workload_runner_bolt"
 
   if (( run_failed != 0 )); then
     warning "BOLT training run failed, restoring CS-PGO binary"
     mv -f "${lib_path}.prebolt" "${lib_path}"
+    rm -f "${lib_path}.prebolt"
     return 0
   fi
 
+  # --- Step 4: Collect BOLT fdata files ---
   shopt -s nullglob
   local fdata_files=( "${BOLT_DIR}"/bolt.fdata.* )
   shopt -u nullglob
-  if (( ${#fdata_files[@]} == 0 )); then
+
+  local -a real_fdata=()
+  local f
+  for f in "${fdata_files[@]}"; do
+    if [[ "$f" =~ \.fdata\.[0-9]+$ ]]; then
+      real_fdata+=("$f")
+    fi
+  done
+
+  if (( ${#real_fdata[@]} == 0 )); then
     warning "No BOLT profile files generated, restoring CS-PGO binary"
     mv -f "${lib_path}.prebolt" "${lib_path}"
+    rm -f "${lib_path}.prebolt"
     return 0
   fi
 
-  if ! command -v merge-fdata >/dev/null 2>&1; then
-    warning "merge-fdata not found, restoring CS-PGO binary"
-    mv -f "${lib_path}.prebolt" "${lib_path}"
-    return 0
-  fi
+  msg2 "  Found ${#real_fdata[@]} BOLT profile files"
 
-  if ! merge-fdata "${fdata_files[@]}" > "${BOLT_DIR}/bolt_merged.fdata" 2>/dev/null; then
-    warning "BOLT profile merge failed, restoring CS-PGO binary"
-    mv -f "${lib_path}.prebolt" "${lib_path}"
-    return 0
-  fi
-
-  if [[ ! -s "${BOLT_DIR}/bolt_merged.fdata" ]]; then
-    warning "Merged BOLT profile is empty, restoring CS-PGO binary"
-    mv -f "${lib_path}.prebolt" "${lib_path}"
-    return 0
-  fi
+  # --- Step 5: Apply BOLT optimizations directly ---
+  local -a bolt_data_args=()
+  for f in "${real_fdata[@]}"; do
+    bolt_data_args+=(--data "$f")
+  done
 
   if ! llvm-bolt "${lib_path}.prebolt" \
-      --data "${BOLT_DIR}/bolt_merged.fdata" \
+      "${bolt_data_args[@]}" \
       -o "${lib_path}" \
       --dyno-stats \
-      --lite=false \
+      --use-gnu-stack=false \
       --icf=all \
       --plt=all \
       --peepholes=all \
-      --x86-strip-redundant-address-size \
+      --x86-align-branch=auto \
+      --x86-padded-align \
       --indirect-call-promotion=all \
       --reorder-blocks=ext-tsp \
       --reorder-functions=cdsort \
       --split-all-cold \
       --split-eh \
       --split-functions \
-      --split-strategy=cdsplit; then
+      --split-strategy=cdsplit \
+      --lite=false; then
     warning "BOLT optimize failed, restoring CS-PGO binary"
     mv -f "${lib_path}.prebolt" "${lib_path}"
+    rm -f "${lib_path}.prebolt"
     return 0
   fi
 
   rm -f "${lib_path}.prebolt"
 
-  find "${pkgdir}" -type f \( -name '*.so*' -o -name '*.a' -o -perm -111 \) -print0 | while IFS= read -r -d '' file; do
-    llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null || true
+  # --- Step 6: Strip all binaries with llvm-strip ---
+  find "${pkgdir}" -type f \( -name '*.so*' -o -name '*.a' -o -perm -111 \) \
+    -print0 | while IFS= read -r -d '' file; do
+    llvm-strip --strip-unneeded "$file" 2>/dev/null || \
+    llvm-strip --strip-all "$file" 2>/dev/null || true
   done
 }
