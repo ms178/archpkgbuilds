@@ -1254,20 +1254,23 @@ build() {
 # ─────────────────────────────────────────────────────────────────────────────
 # package() — install + BOLT optimize.
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# package() — install + BOLT optimize (FIXED)
+# ─────────────────────────────────────────────────────────────────────────────
 package() {
   cd "${srcdir}/cairo"
   DESTDIR="${pkgdir}" meson install -C "${srcdir}/build" || return 1
 
-  # Find the shared library
-  local lib_path
-  lib_path="$(find "${pkgdir}/usr/lib" -maxdepth 1 -type f \
-              -name 'libcairo.so.*' | sort -V | tail -n1)"
-  if [[ -z "${lib_path}" ]]; then
-    error "Could not find installed libcairo shared object"
+  # Find the REAL shared object (not symlinks)
+  local real_lib
+  real_lib="$(find "${pkgdir}/usr/lib" -maxdepth 1 -type f -name 'libcairo.so.*' \
+              ! -name '*.so' | sort -V | tail -n1)"
+  if [[ -z "${real_lib}" ]]; then
+    error "Could not locate real libcairo shared object"
     return 1
   fi
   local lib_dir
-  lib_dir="$(dirname "${lib_path}")"
+  lib_dir="$(dirname "${real_lib}")"
 
   # =====================================================================
   # STAGE 7/7: BOLT optimize final libcairo
@@ -1278,22 +1281,33 @@ package() {
 
   msg2 "Stage 7/7: BOLT optimize final libcairo"
 
-  # --- Step 1: Instrument the library ---
-  cp -f "${lib_path}" "${lib_path}.prebolt"
-
-  if ! llvm-bolt "${lib_path}.prebolt" \
-      --instrument \
-      --instrumentation-file-append-pid \
-      --instrumentation-file="${BOLT_DIR}/bolt.fdata" \
-      -o "${lib_path}.inst"; then
-    warning "BOLT instrumentation failed, keeping CS-PGO binary"
-    rm -f "${lib_path}.inst" "${lib_path}.prebolt"
+  # --- Verify relocations exist (BOLT prerequisite) ---
+  if ! llvm-readelf -S "${real_lib}" 2>/dev/null | grep -qE '\.rela?\.text'; then
+    warning "No .rela.text — BOLT skipped, shipping PGO-only binary"
+    _final_strip
     return 0
   fi
 
-  mv -f "${lib_path}.inst" "${lib_path}"
+  cp -f "${real_lib}" "${real_lib}.prebolt"
 
-  # --- Step 2: Build BOLT workload runner (clean, non-instrumented) ---
+  # --- Step 1: Instrument ---
+  # CRITICAL: Use ABSOLUTE path for instrumentation file
+  local bolt_inst_file="${BOLT_DIR}/bolt.fdata"
+
+  if ! llvm-bolt "${real_lib}.prebolt" \
+      --instrument \
+      --instrumentation-file="${bolt_inst_file}" \
+      --instrumentation-file-append-pid \
+      -o "${real_lib}.inst" 2>&1 | tee "${BOLT_DIR}/bolt-instrument.log"; then
+    warning "BOLT instrumentation failed; shipping PGO-only binary"
+    rm -f "${real_lib}.inst" "${real_lib}.prebolt"
+    _final_strip
+    return 0
+  fi
+
+  mv -f "${real_lib}.inst" "${real_lib}"
+
+  # --- Step 2: Build BOLT workload runner ---
   local -a pkg_cflags=()
   local -a pkg_ldflags=()
   read -r -a pkg_cflags  <<< "${CFLAGS:-}"
@@ -1312,93 +1326,118 @@ package() {
         -Wl,-rpath,"${lib_dir}" \
         -lcairo -lm \
         "${wl_ldflags[@]}" || {
-    warning "BOLT workload build failed, restoring CS-PGO binary"
-    mv -f "${lib_path}.prebolt" "${lib_path}"
-    rm -f "${srcdir}/cairo_workload_runner_bolt" "${lib_path}.prebolt"
+    warning "BOLT workload build failed; restoring PGO-only binary"
+    mv -f "${real_lib}.prebolt" "${real_lib}"
+    rm -f "${srcdir}/cairo_workload_runner_bolt" "${real_lib}.prebolt"
+    _final_strip
     return 0
   }
 
-  # --- Step 3: Run comprehensive workload to collect BOLT fdata ---
-  # BOLT runtime writes ${BOLT_DIR}/bolt.fdata.<pid> directly.
+  # --- Step 3: Run comprehensive workload with BOLT_PROFILE_FILE set ---
+  msg2 "  Running BOLT training workload..."
+
   local run_failed=0
   local mode
-  for mode in image text stroke patterns record clip transform dash mask \
-              push_group all_ops formats scaled_font surf_pattern mesh \
-              path_ops device backend; do
-    if ! LD_LIBRARY_PATH="${lib_dir}:${LD_LIBRARY_PATH}" \
+  local modes=(image text stroke patterns record clip transform dash mask \
+               push_group all_ops formats scaled_font surf_pattern mesh \
+               path_ops device backend)
+
+  for mode in "${modes[@]}"; do
+    # Each invocation is a separate process → separate PID → separate fdata file
+    if ! BOLT_PROFILE_FILE="${bolt_inst_file}" \
+         LD_LIBRARY_PATH="${lib_dir}:${LD_LIBRARY_PATH}" \
          "${srcdir}/cairo_workload_runner_bolt" \
-         --mode "${mode}" --rounds 3 --seed 424242; then
+         --mode "${mode}" --rounds 3 --seed 424242 2>&1; then
+      warning "BOLT mode '${mode}' failed"
       run_failed=1
-      break
+      # Don't break — collect partial profiles from successful modes
     fi
   done
+
   rm -f "${srcdir}/cairo_workload_runner_bolt"
 
-  if (( run_failed != 0 )); then
-    warning "BOLT training run failed, restoring CS-PGO binary"
-    mv -f "${lib_path}.prebolt" "${lib_path}"
-    rm -f "${lib_path}.prebolt"
-    return 0
-  fi
-
-  # --- Step 4: Collect BOLT fdata files ---
+  # --- Step 4: Verify profile files were created ---
+  # With --instrumentation-file-append-pid, files are named: bolt.fdata.<pid>
   shopt -s nullglob
-  local fdata_files=( "${BOLT_DIR}"/bolt.fdata.* )
+  local fdata_files=( "${bolt_inst_file}".* )
   shopt -u nullglob
 
-  local -a real_fdata=()
-  local f
-  for f in "${fdata_files[@]}"; do
-    if [[ "$f" =~ \.fdata\.[0-9]+$ ]]; then
-      real_fdata+=("$f")
-    fi
-  done
+  msg2 "  Found ${#fdata_files[@]} BOLT profile file(s)"
 
-  if (( ${#real_fdata[@]} == 0 )); then
-    warning "No BOLT profile files generated, restoring CS-PGO binary"
-    mv -f "${lib_path}.prebolt" "${lib_path}"
-    rm -f "${lib_path}.prebolt"
+  # Debug: list what we found
+  if (( ${#fdata_files[@]} > 0 )); then
+    msg2 "  Profile files:"
+    for f in "${fdata_files[@]}"; do
+      msg2 "    $(basename "$f") ($(stat -c%s "$f" 2>/dev/null || echo 0) bytes)"
+    done
+  fi
+
+  if (( ${#fdata_files[@]} == 0 )); then
+    warning "No BOLT profile files generated"
+    msg2 "  Checking ${BOLT_DIR} for any fdata files..."
+    ls -la "${BOLT_DIR}" 2>/dev/null || true
+    mv -f "${real_lib}.prebolt" "${real_lib}"
+    _final_strip
     return 0
   fi
 
-  msg2 "  Found ${#real_fdata[@]} BOLT profile files"
+  # --- Step 5: Merge fdata files (multiple PIDs → single profile) ---
+  local merged="${BOLT_DIR}/merged.fdata"
+  if (( ${#fdata_files[@]} == 1 )); then
+    cp -f "${fdata_files[0]}" "${merged}"
+  else
+    if ! merge-fdata "${fdata_files[@]}" -o "${merged}" 2>/dev/null; then
+      warning "merge-fdata failed; using largest single file"
+      local largest
+      largest="$(ls -S "${fdata_files[@]}" 2>/dev/null | head -n1)"
+      cp -f "${largest}" "${merged}"
+    fi
+  fi
 
-  # --- Step 5: Apply BOLT optimizations directly ---
-  local -a bolt_data_args=()
-  for f in "${real_fdata[@]}"; do
-    bolt_data_args+=(--data "$f")
-  done
+  if [[ ! -s "${merged}" ]]; then
+    warning "Merged BOLT profile is empty; restoring PGO-only binary"
+    mv -f "${real_lib}.prebolt" "${real_lib}"
+    _final_strip
+    return 0
+  fi
 
-  if ! llvm-bolt "${lib_path}.prebolt" \
-      "${bolt_data_args[@]}" \
-      -o "${lib_path}" \
+  msg2 "  Merged profile: $(stat -c%s "${merged}") bytes"
+
+  # --- Step 6: Apply BOLT optimizations ---
+  msg2 "  Applying BOLT optimizations..."
+
+  if ! llvm-bolt "${real_lib}.prebolt" \
+      --data "${merged}" \
+      -o "${real_lib}" \
       --dyno-stats \
       --use-gnu-stack=false \
       --icf=all \
       --plt=all \
       --peepholes=all \
-      --x86-align-branch=auto \
-      --x86-padded-align \
       --indirect-call-promotion=all \
       --reorder-blocks=ext-tsp \
       --reorder-functions=cdsort \
+      --split-functions \
       --split-all-cold \
       --split-eh \
-      --split-functions \
       --split-strategy=cdsplit \
-      --lite=false; then
-    warning "BOLT optimize failed, restoring CS-PGO binary"
-    mv -f "${lib_path}.prebolt" "${lib_path}"
-    rm -f "${lib_path}.prebolt"
+      --lite=false 2>&1 | tee "${BOLT_DIR}/bolt-optimize.log"; then
+    warning "BOLT optimize failed; restoring PGO-only binary"
+    mv -f "${real_lib}.prebolt" "${real_lib}"
+    _final_strip
     return 0
   fi
 
-  rm -f "${lib_path}.prebolt"
+  rm -f "${real_lib}.prebolt"
+  _final_strip
 
-  # --- Step 6: Strip all binaries with llvm-strip ---
-  find "${pkgdir}" -type f \( -name '*.so*' -o -name '*.a' -o -perm -111 \) \
-    -print0 | while IFS= read -r -d '' file; do
-    llvm-strip --strip-unneeded "$file" 2>/dev/null || \
-    llvm-strip --strip-all "$file" 2>/dev/null || true
-  done
+  msg2 "  BOLT optimization complete"
+}
+
+# Strip everything with llvm-strip
+_final_strip() {
+  find "${pkgdir}/usr/lib" -type f \( -name '*.so*' -o -name '*.a' \) -print0 \
+    | while IFS= read -r -d '' f; do
+        llvm-strip --strip-unneeded "$f" 2>/dev/null || true
+      done
 }
