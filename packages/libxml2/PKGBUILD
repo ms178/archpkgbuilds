@@ -1,12 +1,12 @@
-# Maintainer: Jan Alexander Steffens (heftig) <heftig@archlinux.org>
-# Maintainer: Levente Polyak <anthraxx[at]archlinux[dot]org>
-# Contributor: Jan de Groot <jgc@archlinux.org>
-# Contributor: Tom Gundersen <teg@jklm.no>
-# Contributor: John Proctor <jproctor@prium.net>
+# Maintainer: ms178
+# Based on Arch Linux PKGBUILD by:
+#   Jan Alexander Steffens (heftig) <heftig@archlinux.org>
+#   Levente Polyak <anthraxx[at]archlinux[dot]org>
+# Contributors: Jan de Groot, Tom Gundersen, John Proctor
 
 pkgname=libxml2
 pkgver=2.15.3
-pkgrel=4.1
+pkgrel=6.1
 pkgdesc="XML C parser and toolkit"
 url="https://gitlab.gnome.org/GNOME/libxml2/-/wikis/home"
 arch=(x86_64)
@@ -19,219 +19,584 @@ depends=(
   zlib
 )
 makedepends=(
+  clang
   git
+  lld
   llvm
   meson
-  python
 )
+provides=(libxml2.so)
+
 source=(
-  "git+https://gitlab.gnome.org/GNOME/libxml2.git#tag=v$pkgver"
+  "git+https://gitlab.gnome.org/GNOME/libxml2.git#tag=v${pkgver}"
   https://www.w3.org/XML/Test/xmlts20130923.tar.gz
 )
-b2sums=('bcf3ac7f06fb875d20f62b6f1ecb4c406d28d86e8124e9781a8d6fae8b3815062a6fa152fc4c570fb5c2d162b1eee4b9cf3ac5c17f434d71b72807fce0d57e41'
-        '63a47bc69278ef510cd0b3779aed729e1b309e30efa0015d28ed051cc03f9dfddb447ab57b07b3393e8f47393d15473b0e199c34cb1f5f746b15ddfaa55670be')
+b2sums=(
+  'bcf3ac7f06fb875d20f62b6f1ecb4c406d28d86e8124e9781a8d6fae8b3815062a6fa152fc4c570fb5c2d162b1eee4b9cf3ac5c17f434d71b72807fce0d57e41'
+  '63a47bc69278ef510cd0b3779aed729e1b309e30efa0015d28ed051cc03f9dfddb447ab57b07b3393e8f47393d15473b0e199c34cb1f5f746b15ddfaa55670be'
+)
 
-_optimized_builddir="build-opt"
+# ── Build-directory names (plain names — never full paths at global scope) ─────
+_builddir_pgo1="build-pgo1"   # Standard PGO instrumentation
+_builddir_pgo2="build-pgo2"   # Context-sensitive PGO instrumentation
+_builddir_opt="build-opt"     # Final PGO+BOLT optimised build
 
+# ── Common instrumentation flags (PGO stages only) ────────────────────────────
+_pgo_instrument_cflags=(
+  "-g3"
+  "-fno-omit-frame-pointer"
+  "-mllvm" "-vp-counters-per-site=16"
+  "-mllvm" "-runtime-counter-relocation"
+  "-mllvm" "-enable-value-profiling"
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
 prepare() {
   cd libxml2
 
-  # Use xmlconf from conformance test suite.
-  ln -sfn ../xmlconf xmlconf
+  # Symlink the W3C XML conformance test suite so xmlconf tests resolve.
+  ln -s ../xmlconf xmlconf
 }
 
+# ──────────────────────────────────────────────────────────────────────────────
+# _configure_libxml2 <builddir_name>
+#   Configures libxml2 using arch-meson with the build directory at
+#   "${srcdir}/<builddir_name>".
+#
+#   The caller exports CFLAGS / CXXFLAGS / LDFLAGS in a subshell before
+#   calling this function; arch-meson reads those variables directly from
+#   the environment — no Meson native-file required.
+#
+#   IMPORTANT: receives a plain NAME, not a full path.
+#   The function builds "${srcdir}/${builddir_name}" exactly once internally.
+#   If a full path were passed, any "${srcdir}/${builddir_name}" construction
+#   inside would double the srcdir prefix (e.g. /src//src/build-pgo1).
+# ──────────────────────────────────────────────────────────────────────────────
 _configure_libxml2() {
-  local builddir="$1"
-  local meson_options=(
+  local builddir_name="$1"
+  local builddir="${srcdir}/${builddir_name}"
+
+  # Options identical across ALL stages:
+  #   - docs=disabled:   avoids doxygen/docbook overhead.
+  #   - python=disabled: generator.py → pyexpat → libexpat.so; if libexpat
+  #                      was BOLT-optimised with an exec-stack flag, Python
+  #                      3.14+ (W^X enforcement) refuses to load it → crash.
+  local -a meson_opts=(
     -D icu=enabled
     -D legacy=enabled
     -D docs=disabled
+    -D python=disabled
   )
 
-  arch-meson libxml2 "$builddir" "${meson_options[@]}"
+  arch-meson libxml2 "${builddir}" "${meson_opts[@]}"
 }
 
-_build_with_flags() {
-  local builddir="$1"
-  local cflags_extra="$2"
-  local cxxflags_extra="$3"
-  local ldflags_extra="$4"
+# ──────────────────────────────────────────────────────────────────────────────
+# _run_pgo_workload <builddir_name>
+#   Full training workload for PGO stages (includes meson test suite).
+#   Called during Stages 1 and 2 where the libxml2.so is PGO-instrumented
+#   (not BOLT-instrumented) so test binaries load it cleanly.
+# ──────────────────────────────────────────────────────────────────────────────
+_run_pgo_workload() {
+  local builddir="${srcdir}/${1}"
+  local xmllint="${builddir}/xmllint"
+  local xmlcatalog="${builddir}/xmlcatalog"
+  local workdir="${srcdir}/pgo-work"
 
-  (
-    export CFLAGS+=" $cflags_extra"
-    export CXXFLAGS+=" $cxxflags_extra"
-    export LDFLAGS+=" $ldflags_extra"
+  # ── Official meson test suite ────────────────────────────────────────────────
+  # Safe here: the SO is PGO-instrumented (not BOLT-instrumented), so test
+  # binaries load it without crashing. This exercises C-level code paths that
+  # xmllint cannot reach (internal parsers, allocation paths, etc.).
+  meson test -C "${builddir}" --print-errorlogs --no-rebuild -q || true
 
-    _configure_libxml2 "$builddir"
-    meson compile -C "$builddir"
+  [[ -x "${xmllint}" ]] || {
+    echo "WARNING: xmllint not found at ${xmllint}" >&2
+    return 0
+  }
+
+  _run_xmllint_workload "${1}"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _run_bolt_workload <builddir_name>
+#   Lightweight workload for the BOLT training stage.
+#   Does NOT run meson test because:
+#     (a) The test binaries in build-opt/ were compiled with -fprofile-use
+#         and may have "function control flow hash mismatch" issues that
+#         cause SIGSEGV at startup.
+#     (b) The BOLT-instrumented libxml2.so uses a custom DT_INIT hook; if
+#         a crashing test binary dlopen()s it, the profile data is lost.
+#   Instead we exercise the library exclusively via xmllint/xmlcatalog,
+#   which are simpler executables and survive the BOLT instrumentation.
+# ──────────────────────────────────────────────────────────────────────────────
+_run_bolt_workload() {
+  local builddir="${srcdir}/${1}"
+  local xmllint="${builddir}/xmllint"
+
+  [[ -x "${xmllint}" ]] || {
+    echo "WARNING: xmllint not found at ${xmllint}" >&2
+    return 0
+  }
+
+  _run_xmllint_workload "${1}"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _run_xmllint_workload <builddir_name>
+#   xmllint/xmlcatalog-based training corpus.
+#   Shared by both PGO and BOLT training stages.
+# ──────────────────────────────────────────────────────────────────────────────
+_run_xmllint_workload() {
+  local builddir="${srcdir}/${1}"
+  local xmllint="${builddir}/xmllint"
+  local xmlcatalog="${builddir}/xmlcatalog"
+  local workdir="${srcdir}/pgo-work"
+
+  [[ -x "${xmllint}" ]] || return 0
+
+  # ── Collect XML corpus ───────────────────────────────────────────────────────
+  local -a xml_files=()
+  mapfile -t xml_files < <(
+    find \
+      "${srcdir}/libxml2/test" \
+      "${srcdir}/xmlconf" \
+      -type f \
+      \( -name '*.xml' -o -name '*.xhtml' -o -name '*.svg' \
+         -o -name '*.rdf' -o -name '*.html' \) \
+    | sort
   )
+
+  local -a html_files=()
+  mapfile -t html_files < <(
+    find "${srcdir}/libxml2/test" -type f -name '*.html' | sort
+  )
+
+  # ── Multi-pass file corpus ───────────────────────────────────────────────────
+  local xml
+  for xml in "${xml_files[@]}"; do
+    "${xmllint}" --nonet --noout "${xml}" >/dev/null 2>&1 || true
+  done
+  for xml in "${xml_files[@]:0:700}"; do
+    "${xmllint}" --nonet --recover --noout "${xml}" >/dev/null 2>&1 || true
+  done
+  for xml in "${xml_files[@]:0:500}"; do
+    "${xmllint}" --nonet --stream --noout "${xml}" >/dev/null 2>&1 || true
+  done
+  for xml in "${xml_files[@]:0:300}"; do
+    "${xmllint}" --nonet --push --noout "${xml}" >/dev/null 2>&1 || true
+  done
+  for xml in "${xml_files[@]:0:200}"; do
+    "${xmllint}" --nonet --sax    --noout "${xml}" >/dev/null 2>&1 || true
+    "${xmllint}" --nonet --format --noout "${xml}" >/dev/null 2>&1 || true
+  done
+  for xml in "${xml_files[@]:0:300}"; do
+    "${xmllint}" --nonet --noent  --noout "${xml}" >/dev/null 2>&1 || true
+  done
+  for xml in "${xml_files[@]:0:200}"; do
+    "${xmllint}" --nonet --valid  --noout "${xml}" >/dev/null 2>&1 || true
+  done
+
+  # ── HTML parser ──────────────────────────────────────────────────────────────
+  for xml in "${html_files[@]}"; do
+    "${xmllint}" --html --noout    "${xml}" >/dev/null 2>&1 || true
+    "${xmllint}" --html --recover --noout "${xml}" >/dev/null 2>&1 || true
+  done
+
+  # ── XPath ────────────────────────────────────────────────────────────────────
+  local -a xpath_exprs=(
+    "/*" "//*[@id]" "//*[local-name()='a']" "count(//*)"
+    "string(//title[1])" "//*[contains(@class,'item')]"
+    "//node()[not(self::text())]"
+    "substring-before(normalize-space(//text()[1]),' ')"
+  )
+  local xpath_src="${srcdir}/libxml2/test/XPath"
+  if [[ -d "${xpath_src}" ]]; then
+    local -a xpath_files=()
+    mapfile -t xpath_files < <(find "${xpath_src}" -name '*.xml' | sort)
+    local xfile expr
+    for xfile in "${xpath_files[@]}"; do
+      for expr in "${xpath_exprs[@]}"; do
+        "${xmllint}" --nonet --xpath "${expr}" --noout \
+          "${xfile}" >/dev/null 2>&1 || true
+      done
+    done
+  fi
+  for xml in "${xml_files[@]:0:100}"; do
+    "${xmllint}" --nonet --xpath '/*'         --noout "${xml}" >/dev/null 2>&1 || true
+    "${xmllint}" --nonet --xpath 'count(//*)'  --noout "${xml}" >/dev/null 2>&1 || true
+  done
+
+  # ── XInclude ─────────────────────────────────────────────────────────────────
+  local xinclude_dir="${srcdir}/libxml2/test/XInclude"
+  if [[ -d "${xinclude_dir}" ]]; then
+    find "${xinclude_dir}" -name '*.xml' | while read -r xfile; do
+      "${xmllint}" --nonet --xinclude --noout "${xfile}" >/dev/null 2>&1 || true
+    done
+  fi
+
+  # ── Schema / RelaxNG validation ──────────────────────────────────────────────
+  local schema_dir="${srcdir}/libxml2/test/schemas"
+  local relaxng_dir="${srcdir}/libxml2/test/relaxng"
+  if [[ -d "${schema_dir}" ]]; then
+    find "${schema_dir}" -name '*.xsd' | while read -r xsd; do
+      local instance="${xsd%.xsd}.xml"
+      [[ -f "${instance}" ]] || \
+        instance="${srcdir}/libxml2/test/valid/REC-xml-19980210.xml"
+      "${xmllint}" --nonet --schema "${xsd}" --noout \
+        "${instance}" >/dev/null 2>&1 || true
+    done
+  fi
+  if [[ -d "${relaxng_dir}" ]]; then
+    find "${relaxng_dir}" -name '*.rng' | while read -r rng; do
+      local instance="${rng%.rng}.xml"
+      [[ -f "${instance}" ]] || continue
+      "${xmllint}" --nonet --relaxng "${rng}" --noout \
+        "${instance}" >/dev/null 2>&1 || true
+    done
+  fi
+
+  # ── XML catalog operations ───────────────────────────────────────────────────
+  rm -rf "${workdir}"; mkdir -p "${workdir}"
+  cat > "${workdir}/catalog.xml" << 'CATEOF'
+<?xml version="1.0"?>
+<!DOCTYPE catalog PUBLIC "-//OASIS//DTD Entity Resolution XML Catalog V1.0//EN"
+  "http://www.oasis-open.org/committees/entity/release/1.0/catalog.dtd">
+<catalog xmlns="urn:oasis:names:tc:entity:xmlns:xml:catalog">
+  <system systemId="https://pgo.invalid/doc.dtd" uri="doc.dtd"/>
+  <public publicId="-//PGO//DTD Test//EN" uri="doc.dtd"/>
+  <rewriteURI uriStartString="https://pgo.invalid/" rewritePrefix="./"/>
+</catalog>
+CATEOF
+  cat > "${workdir}/doc.dtd" << 'DTDEOF'
+<!ELEMENT root (section+, footer?)>
+<!ELEMENT section (#PCDATA|em|code|link)*>
+<!ELEMENT footer (#PCDATA)>
+<!ELEMENT em (#PCDATA)>
+<!ELEMENT code (#PCDATA)>
+<!ELEMENT link EMPTY>
+<!ATTLIST root lang CDATA #IMPLIED id ID #IMPLIED>
+<!ATTLIST link href CDATA #REQUIRED>
+DTDEOF
+  cat > "${workdir}/doc.xml" << 'XMLEOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE root SYSTEM "https://pgo.invalid/doc.dtd">
+<root lang="en" id="r1">
+  <section>Introduction with <em>emphasis</em> and <code>code</code>.</section>
+  <section>Second section. <link href="https://example.org/"/></section>
+  <footer>Copyright 2025</footer>
+</root>
+XMLEOF
+  if [[ -x "${xmlcatalog}" ]]; then
+    "${xmlcatalog}" --noout "${workdir}/catalog.xml" >/dev/null 2>&1 || true
+    "${xmlcatalog}" "${workdir}/catalog.xml" "https://pgo.invalid/doc.dtd" \
+      >/dev/null 2>&1 || true
+    "${xmlcatalog}" "${workdir}/catalog.xml" "-//PGO//DTD Test//EN" \
+      >/dev/null 2>&1 || true
+    XML_CATALOG_FILES="${workdir}/catalog.xml" \
+      "${xmllint}" --nonet --valid --noout "${workdir}/doc.xml" \
+      >/dev/null 2>&1 || true
+  fi
+
+  # ── Encoding coverage ────────────────────────────────────────────────────────
+  printf '\xff\xfe' > "${workdir}/utf16le.xml"
+  printf '<r a="1"><c>text</c></r>' | iconv -f UTF-8 -t UTF-16LE \
+    >> "${workdir}/utf16le.xml" 2>/dev/null || true
+  "${xmllint}" --nonet --noout "${workdir}/utf16le.xml" >/dev/null 2>&1 || true
+  "${xmllint}" --nonet --encode UTF-8 --noout \
+    "${workdir}/utf16le.xml" >/dev/null 2>&1 || true
+
+  printf '\xef\xbb\xbf<?xml version="1.0"?><r/>' > "${workdir}/bom_utf8.xml"
+  "${xmllint}" --nonet --noout "${workdir}/bom_utf8.xml" >/dev/null 2>&1 || true
+
+  cat > "${workdir}/latin1.xml" << 'LATEOF'
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<root><elem>Caf</elem></root>
+LATEOF
+  "${xmllint}" --nonet --noout "${workdir}/latin1.xml" >/dev/null 2>&1 || true
+
+  # ── Writer / serialization roundtrip ─────────────────────────────────────────
+  for xml in "${xml_files[@]:0:150}"; do
+    "${xmllint}" --nonet --format "${xml}" 2>/dev/null \
+      | "${xmllint}" --nonet --noout - 2>/dev/null || true
+  done
+
+  # ── Pattern matching ─────────────────────────────────────────────────────────
+  local -a patterns=("//section" "//item[@id]" "//*/text()" "/root/child")
+  for xml in "${xml_files[@]:0:100}"; do
+    for pat in "${patterns[@]}"; do
+      "${xmllint}" --nonet --pattern "${pat}" --noout \
+        "${xml}" >/dev/null 2>&1 || true
+    done
+  done
+
+  # ── W3C conformance suite ────────────────────────────────────────────────────
+  if [[ -f "${srcdir}/xmlconf/xmlconf.xml" ]]; then
+    "${xmllint}" --nonet --noout \
+      --xpath 'count(//TEST)' \
+      "${srcdir}/xmlconf/xmlconf.xml" >/dev/null 2>&1 || true
+    find "${srcdir}/xmlconf" -name '*.xml' -not -name 'xmlconf.xml' \
+    | sort | while read -r f; do
+      "${xmllint}" --nonet --noout    "${f}" >/dev/null 2>&1 || true
+      "${xmllint}" --nonet --recover --noout "${f}" >/dev/null 2>&1 || true
+    done
+  fi
+
+  # ── Large synthetic document ──────────────────────────────────────────────────
+  python3 - << 'PYEOF' > "${workdir}/large.xml" 2>/dev/null || true
+print('<?xml version="1.0" encoding="UTF-8"?>')
+print('<catalog xmlns:meta="http://meta.example.org">')
+for i in range(3000):
+    cat = (i % 20) + 1
+    print(f'  <item id="item{i}" category="cat{cat}" priority="{i%5}">')
+    print(f'    <meta:name lang="en">Product {i}</meta:name>')
+    print(f'    <description>Item {i}: &amp; &#65;&#x42;&#x43;</description>')
+    print(f'    <price currency="USD">{i*99//100}.{i%100:02d}</price>')
+    print( '    <tags>')
+    print(f'      <tag>tag{i%10}</tag><tag>group{i%5}</tag>')
+    print( '    </tags>')
+    if i % 3 == 0:
+        print(f'    <![CDATA[Raw {i} with <special> & chars]]>')
+    print( '  </item>')
+print('</catalog>')
+PYEOF
+  for mode in "" "--stream" "--push" "--format"; do
+    "${xmllint}" --nonet ${mode:+${mode}} --noout \
+      "${workdir}/large.xml" >/dev/null 2>&1 || true
+  done
+  "${xmllint}" --nonet --xpath 'count(//item)' --noout \
+    "${workdir}/large.xml" >/dev/null 2>&1 || true
+  "${xmllint}" --nonet --xpath '//item[@priority="0"]/@id' --noout \
+    "${workdir}/large.xml" >/dev/null 2>&1 || true
+
+  # ── Additional xmllint modes ──────────────────────────────────────────────────
+  for xml in "${xml_files[@]:0:200}"; do
+    "${xmllint}" --nonet --noblanks --noout "${xml}" >/dev/null 2>&1 || true
+    "${xmllint}" --nonet --nsclean  --noout "${xml}" >/dev/null 2>&1 || true
+    "${xmllint}" --nonet --dropdtd  --noout "${xml}" >/dev/null 2>&1 || true
+    "${xmllint}" --nonet --dtdattr  --noout "${xml}" >/dev/null 2>&1 || true
+    "${xmllint}" --nonet --nocdata  --noout "${xml}" >/dev/null 2>&1 || true
+    "${xmllint}" --nonet --loaddtd  --noout "${xml}" >/dev/null 2>&1 || true
+  done
+  for xml in "${xml_files[@]:0:100}"; do
+    "${xmllint}" --nonet --postvalid --noout "${xml}" >/dev/null 2>&1 || true
+  done
 }
 
-_merge_llvm_profraw() {
-  local profdata_tool="$1"
-  local profile_dir="$2"
-  local output_file="$3"
-  local -a profile_files=()
+# ──────────────────────────────────────────────────────────────────────────────
+# _merge_profraw <profile_dir> <output_file>
+# ──────────────────────────────────────────────────────────────────────────────
+_merge_profraw() {
+  local profile_dir="$1"
+  local output_file="$2"
 
+  local -a profraw_files=()
   shopt -s nullglob
-  profile_files=("$profile_dir"/*.profraw)
+  profraw_files=("${profile_dir}"/*.profraw)
   shopt -u nullglob
 
-  if (( ${#profile_files[@]} == 0 )); then
-    printf '%s\n' "error: no .profraw files found in $profile_dir" >&2
+  if (( ${#profraw_files[@]} == 0 )); then
+    echo "ERROR: No .profraw files found in ${profile_dir}" >&2
     return 1
   fi
 
-  "$profdata_tool" merge -output="$output_file" "${profile_files[@]}"
+  llvm-profdata merge \
+    --output="${output_file}" \
+    "${profraw_files[@]}"
 }
 
-_run_pgo_workload() {
-  local builddir="$1"
-  local xmllint="$builddir/xmllint"
-  local xmlcatalog="$builddir/xmlcatalog"
-  local workdir="$srcdir/pgo-work"
-  local -a xml_files=()
-
-  # Exercise official tests first for broad real-world path coverage.
-  meson test -C "$builddir" --print-errorlogs --no-rebuild
-
-  if [[ -x "$xmllint" ]]; then
-    mapfile -t xml_files < <(
-      find \
-        "$srcdir/libxml2/test" \
-        "$srcdir/xmlconf" \
-        -type f \
-        \( -name '*.xml' -o -name '*.xhtml' -o -name '*.svg' -o -name '*.rdf' -o -name '*.html' \) \
-        | sort
-    )
-
-    local xml
-    for xml in "${xml_files[@]}"; do
-      "$xmllint" --nonet --noout "$xml" >/dev/null 2>&1 || true
-    done
-
-    for xml in "${xml_files[@]:0:700}"; do
-      "$xmllint" --nonet --recover --noout "$xml" >/dev/null 2>&1 || true
-    done
-
-    for xml in "${xml_files[@]:0:500}"; do
-      "$xmllint" --nonet --stream --noout "$xml" >/dev/null 2>&1 || true
-    done
-
-    if [[ -f "$srcdir/xmlconf/xmlconf.xml" ]]; then
-      "$xmllint" --nonet --xpath 'count(//TEST)' "$srcdir/xmlconf/xmlconf.xml" >/dev/null 2>&1 || true
-    fi
-  fi
-
-  if [[ -x "$xmlcatalog" && -x "$xmllint" ]]; then
-    rm -rf "$workdir"
-    mkdir -p "$workdir"
-
-    cat >"$workdir/catalog.xml" <<'EOF'
-<?xml version="1.0"?>
-<catalog xmlns="urn:oasis:names:tc:entity:xmlns:xml:catalog">
-  <system systemId="https://example.invalid/pgo.dtd" uri="pgo.dtd"/>
-</catalog>
-EOF
-
-    cat >"$workdir/pgo.dtd" <<'EOF'
-<!ELEMENT root (#PCDATA)>
-EOF
-
-    cat >"$workdir/pgo.xml" <<'EOF'
-<?xml version="1.0"?>
-<!DOCTYPE root SYSTEM "https://example.invalid/pgo.dtd">
-<root>profile-guided</root>
-EOF
-
-    "$xmlcatalog" --noout "$workdir/catalog.xml"
-    "$xmlcatalog" "$workdir/catalog.xml" "https://example.invalid/pgo.dtd" >/dev/null
-    XML_CATALOG_FILES="$workdir/catalog.xml" \
-      "$xmllint" --nonet --valid --noout "$workdir/pgo.xml" >/dev/null
-  fi
-}
-
+# ──────────────────────────────────────────────────────────────────────────────
 build() {
-  local compiler_version
-  compiler_version="$(${CC:-cc} --version 2>/dev/null | head -n 1)"
+  export CC=clang
+  export CXX=clang++
 
-  local pgo_root="$srcdir/pgo"
-  local ir_profile_dir="$pgo_root/ir"
-  local cs_profile_dir="$pgo_root/cs"
-  local ir_profile_data="$pgo_root/ir.profdata"
-  local cs_profile_data="$pgo_root/cs.profdata"
-  local merged_profile_data="$pgo_root/merged.profdata"
-  local profdata_tool
-  local clang_vp_flags="-mllvm -vp-counters-per-site=8"
+  # Save makepkg.conf flags — only PGO/BOLT deltas are added per stage
+  local _base_cflags="${CFLAGS}"
+  local _base_cxxflags="${CXXFLAGS}"
+  local _base_ldflags="${LDFLAGS}"
 
-  rm -rf "$pgo_root" "$srcdir/pgo-work" build-pgo-gen build-pgo-cs "$_optimized_builddir"
-  mkdir -p "$ir_profile_dir" "$cs_profile_dir"
+  # --emit-relocs: required for BOLT function reordering
+  # No -fno-reorder-blocks-and-partition: that is GCC-only; Clang doesn't need it
+  local _bolt_ldflags="-Wl,--emit-relocs"
 
-  if [[ "$compiler_version" == *clang* ]]; then
-    if ! profdata_tool="$(command -v llvm-profdata)"; then
-      printf '%s\n' "error: clang CS-PGO requires llvm-profdata from llvm" >&2
-      return 1
-    fi
+  local pgo_root="${srcdir}/pgo"
+  local ir_dir="${pgo_root}/ir"
+  local cs_dir="${pgo_root}/cs"
+  local ir_data="${pgo_root}/ir.profdata"
+  local cs_data="${pgo_root}/cs.profdata"
+  local merged_data="${pgo_root}/merged.profdata"
+  local _bolt_fdata_dir="${srcdir}/bolt-profiles"
 
-    _build_with_flags \
-      build-pgo-gen \
-      "-fprofile-generate=$ir_profile_dir $clang_vp_flags" \
-      "-fprofile-generate=$ir_profile_dir $clang_vp_flags" \
-      "-fprofile-generate=$ir_profile_dir"
+  rm -rf "${pgo_root}" "${srcdir}/pgo-work" \
+         "${srcdir}/${_builddir_pgo1}" \
+         "${srcdir}/${_builddir_pgo2}" \
+         "${srcdir}/${_builddir_opt}" \
+         "${_bolt_fdata_dir}"
+  mkdir -p "${ir_dir}" "${cs_dir}" "${_bolt_fdata_dir}"
 
-    LLVM_PROFILE_FILE="$ir_profile_dir/default_%m.profraw" \
-      _run_pgo_workload build-pgo-gen
+  # Suppress "function control flow hash mismatch" warnings that appear when the
+  # code layout changes between profiling and optimised stages.  These warnings
+  # are non-fatal — clang simply omits PGO for the affected functions — but
+  # if too many functions are skipped the linker may emit corrupt metadata that
+  # causes linked test binaries to SIGSEGV at startup.
+  local -a _warn_suppress=(
+    "-Wno-profile-instr-out-of-date"
+    "-Wno-profile-instr-unprofiled"
+  )
 
-    _merge_llvm_profraw "$profdata_tool" "$ir_profile_dir" "$ir_profile_data"
+  local -a _pgo1_cflags=(
+    "-fprofile-generate=${ir_dir}"
+    "${_pgo_instrument_cflags[@]}"
+    "${_warn_suppress[@]}"
+  )
+  local -a _pgo2_cflags=(
+    "-fprofile-use=${ir_data}"
+    "-fcs-profile-generate=${cs_dir}"
+    "${_pgo_instrument_cflags[@]}"
+    "${_warn_suppress[@]}"
+  )
+  local -a _opt_cflags=(
+    "-fprofile-use=${merged_data}"
+    "${_warn_suppress[@]}"
+  )
 
-    _build_with_flags \
-      build-pgo-cs \
-      "-fprofile-use=$ir_profile_data -fcs-profile-generate=$cs_profile_dir $clang_vp_flags -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled" \
-      "-fprofile-use=$ir_profile_data -fcs-profile-generate=$cs_profile_dir $clang_vp_flags -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled" \
-      "-fprofile-use=$ir_profile_data -fcs-profile-generate=$cs_profile_dir"
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 1 — Standard PGO instrumentation
+  # ═══════════════════════════════════════════════════════════════════════════
+  echo ">>> [PGO Stage 1] Instrumented build"
+  (
+    export CFLAGS="${_base_cflags} ${_pgo1_cflags[*]}"
+    export CXXFLAGS="${_base_cxxflags} ${_pgo1_cflags[*]}"
+    export LDFLAGS="${_base_ldflags} ${_bolt_ldflags} -fprofile-generate=${ir_dir}"
+    _configure_libxml2 "${_builddir_pgo1}"
+  )
+  meson compile -C "${srcdir}/${_builddir_pgo1}"
 
-    LLVM_PROFILE_FILE="$cs_profile_dir/default_%m.profraw" \
-      _run_pgo_workload build-pgo-cs
+  echo ">>> [PGO Stage 1] Training workload"
+  LLVM_PROFILE_FILE="${ir_dir}/default_%m.profraw" \
+    _run_pgo_workload "${_builddir_pgo1}"
+  _merge_profraw "${ir_dir}" "${ir_data}"
 
-    _merge_llvm_profraw "$profdata_tool" "$cs_profile_dir" "$cs_profile_data"
-    "$profdata_tool" merge -output="$merged_profile_data" \
-      "$cs_profile_data" \
-      "$ir_profile_data"
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 2 — Context-Sensitive PGO instrumentation
+  # ═══════════════════════════════════════════════════════════════════════════
+  echo ">>> [PGO Stage 2] CS-instrumented build"
+  (
+    export CFLAGS="${_base_cflags} ${_pgo2_cflags[*]}"
+    export CXXFLAGS="${_base_cxxflags} ${_pgo2_cflags[*]}"
+    export LDFLAGS="${_base_ldflags} ${_bolt_ldflags} -fprofile-use=${ir_data} -fcs-profile-generate=${cs_dir}"
+    _configure_libxml2 "${_builddir_pgo2}"
+  )
+  meson compile -C "${srcdir}/${_builddir_pgo2}"
 
-    _build_with_flags \
-      "$_optimized_builddir" \
-      "-fprofile-use=$merged_profile_data -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled" \
-      "-fprofile-use=$merged_profile_data -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled" \
-      "-fprofile-use=$merged_profile_data"
-  else
-    _build_with_flags \
-      build-pgo-gen \
-      "-fprofile-generate=$ir_profile_dir -fprofile-update=atomic" \
-      "-fprofile-generate=$ir_profile_dir -fprofile-update=atomic" \
-      "-fprofile-generate=$ir_profile_dir"
+  echo ">>> [PGO Stage 2] CS training workload"
+  LLVM_PROFILE_FILE="${cs_dir}/default_%m.profraw" \
+    _run_pgo_workload "${_builddir_pgo2}"
+  _merge_profraw "${cs_dir}" "${cs_data}"
 
-    _run_pgo_workload build-pgo-gen
+  # CS first (richer context), then IR as fallback coverage
+  llvm-profdata merge \
+    --output="${merged_data}" \
+    "${cs_data}" \
+    "${ir_data}"
 
-    _build_with_flags \
-      "$_optimized_builddir" \
-      "-fprofile-use=$ir_profile_dir -fprofile-correction" \
-      "-fprofile-use=$ir_profile_dir -fprofile-correction" \
-      "-fprofile-use=$ir_profile_dir"
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 3 — Final PGO-optimised build (BOLT-ready)
+  # ═══════════════════════════════════════════════════════════════════════════
+  echo ">>> [PGO Stage 3] Final optimised build"
+  (
+    export CFLAGS="${_base_cflags} ${_opt_cflags[*]}"
+    export CXXFLAGS="${_base_cxxflags} ${_opt_cflags[*]}"
+    export LDFLAGS="${_base_ldflags} ${_bolt_ldflags} -fprofile-use=${merged_data}"
+    _configure_libxml2 "${_builddir_opt}"
+  )
+  meson compile -C "${srcdir}/${_builddir_opt}"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 4 — BOLT instrumentation of libxml2.so
+  # ═══════════════════════════════════════════════════════════════════════════
+  echo ">>> [BOLT Stage 4] Instrumenting libxml2.so"
+  local _libxml2_so
+  _libxml2_so=$(readlink -f \
+    "${srcdir}/${_builddir_opt}/libxml2.so" 2>/dev/null || \
+    find "${srcdir}/${_builddir_opt}" -name 'libxml2.so.*' -not -type l \
+         -print -quit 2>/dev/null)
+
+  if [[ -z "${_libxml2_so}" || ! -f "${_libxml2_so}" ]]; then
+    echo "ERROR: Cannot locate built libxml2.so in ${srcdir}/${_builddir_opt}" >&2
+    return 1
   fi
+
+  llvm-bolt "${_libxml2_so}" \
+    -instrument \
+    -instrumentation-file-append-pid \
+    -instrumentation-file="${_bolt_fdata_dir}/prof" \
+    -o "${_libxml2_so}.bolt-instrumented"
+
+  cp -a "${_libxml2_so}" "${_libxml2_so}.bolt-backup"
+  cp "${_libxml2_so}.bolt-instrumented" "${_libxml2_so}"
+
+  echo ">>> [BOLT Stage 4] BOLT training workload"
+  # Use _run_bolt_workload (no meson test) — the BOLT-instrumented SO causes
+  # meson test binaries to SIGSEGV because those binaries were compiled with
+  # -fprofile-use and have control-flow hash mismatches that produce broken
+  # startup code. xmllint/xmlcatalog are simpler and survive the instrumentation.
+  _run_bolt_workload "${_builddir_opt}"
+
+  cp "${_libxml2_so}.bolt-backup" "${_libxml2_so}"
+
+  local -a fdata_files=()
+  shopt -s nullglob
+  fdata_files=("${_bolt_fdata_dir}"/*.fdata)
+  shopt -u nullglob
+
+  if (( ${#fdata_files[@]} == 0 )); then
+    echo "ERROR: No BOLT .fdata profiles generated" >&2
+    return 1
+  fi
+
+  echo ">>> [BOLT Stage 4] Merging ${#fdata_files[@]} BOLT profile(s)"
+  merge-fdata "${fdata_files[@]}" > "${srcdir}/bolt-merged.fdata"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STAGE 5 — BOLT optimisation of libxml2.so
+  # ═══════════════════════════════════════════════════════════════════════════
+  echo ">>> [BOLT Stage 5] Optimising libxml2.so"
+  llvm-bolt "${_libxml2_so}" \
+    -data="${srcdir}/bolt-merged.fdata" \
+    -o "${_libxml2_so}.bolt" \
+    -reorder-blocks=ext-tsp \
+    -reorder-functions=cdsort \
+    -split-functions \
+    -split-all-cold \
+    -dyno-stats \
+    -use-gnu-stack \
+    -update-debug-sections
+
+  mv "${_libxml2_so}.bolt" "${_libxml2_so}"
+  echo ">>> [BOLT Stage 5] Complete"
 }
 
+# ──────────────────────────────────────────────────────────────────────────────
 check() {
-  meson test -C "$_optimized_builddir" --print-errorlogs --no-rebuild
+  meson test -C "${srcdir}/${_builddir_opt}" --print-errorlogs --no-rebuild
 }
 
+# ──────────────────────────────────────────────────────────────────────────────
 package() {
   depends+=(libicuuc.so)
-  optdepends=('python: Python bindings')
-  provides=(libxml2.so)
+  provides+=(libxml2.so)
 
-  meson install -C "$_optimized_builddir" --destdir "$pkgdir"
-  install -Dm644 libxml2/libxml.m4 -t "$pkgdir/usr/share/aclocal"
-  install -Dm644 libxml2/Copyright -t "$pkgdir/usr/share/licenses/$pkgname"
+  meson install -C "${srcdir}/${_builddir_opt}" --destdir "${pkgdir}"
+  install -Dm644 libxml2/libxml.m4 -t "${pkgdir}/usr/share/aclocal"
+
+  # Strip now that BOLT is done (no makepkg auto-strip needed)
+  strip --strip-unneeded "${pkgdir}"/usr/lib/libxml2.so.* 2>/dev/null || true
+
+  # Remove docs and Python bindings (disabled at configure time, but clean up
+  # any residual files meson may install under /usr/share/doc)
+  rm -rf "${pkgdir}/usr/share/doc"
+
+  install -Dm644 libxml2/Copyright -t "${pkgdir}/usr/share/licenses/${pkgname}"
 }
 
 # vim:set sw=2 sts=-1 et:
