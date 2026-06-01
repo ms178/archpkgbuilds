@@ -1026,6 +1026,14 @@ void ac_fill_bug_info(struct radeon_info *info)
    info->never_stop_sq_perf_counters = info->gfx_level == GFX10 ||
                                        info->gfx_level == GFX10_3;
    info->never_send_perfcounter_stop = info->gfx_level == GFX11;
+
+   /* A partially out-of-bounds SMEM load can hang when the out-of-bounds
+    * portion crosses into an unmapped page. Observed on Vega10; not observed
+    * on Renoir or Raven2.
+    */
+   info->has_smem_partial_oob_access_bug = info->gfx_level == GFX9 &&
+                                           info->family != CHIP_RENOIR &&
+                                           info->family != CHIP_RAVEN2;
 }
 
 void ac_fill_feature_info(struct radeon_info *info, const struct drm_amdgpu_info_device *device_info)
@@ -1648,6 +1656,8 @@ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    ac_fill_bug_info(info);
    ac_fill_tess_info(info);
 
+   ac_fill_compiler_info(info, &device_info, compiler_compat_mode);
+
    if (info->compiler_info.has_smem_with_null_prt_bug) {
       /* Query the PRT control bit that determines whether a VA is in the
        * "LOW" or "HIGH" address space. This is needed to implement the SMEM
@@ -1660,8 +1670,6 @@ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
          return AC_QUERY_GPU_INFO_FAIL;
       }
    }
-
-   ac_fill_compiler_info(info, &device_info, compiler_compat_mode);
 
    ac_fill_video_info(info, dev);
 
@@ -1942,6 +1950,7 @@ void ac_print_gpu_info(FILE *f, const struct radeon_info *info, int fd)
    fprintf(f, "    has_set_sh_pairs = %i\n", info->has_set_sh_pairs);
    fprintf(f, "    has_set_sh_pairs_packed = %i\n", info->has_set_sh_pairs_packed);
    fprintf(f, "    has_set_uconfig_pairs = %i\n", info->has_set_uconfig_pairs);
+   fprintf(f, "    has_smem_partial_oob_access_bug = %i\n", info->has_smem_partial_oob_access_bug);
 
    if (info->gfx_level < GFX12) {
       fprintf(f, "Display features:\n");

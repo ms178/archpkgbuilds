@@ -1,6 +1,6 @@
 /*
  * Copyright © 2016 Red Hat.
- * Copyright © 2016 Bas Nieuwenhuisen
+ * Copyright © 2016 Bas Nieuwenhuizen
  *
  * based in part on anv driver which is:
  * Copyright © 2015 Intel Corporation

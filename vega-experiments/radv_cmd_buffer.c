@@ -141,6 +141,12 @@ radv_cmd_set_primitive_restart_enable(struct radv_cmd_buffer *cmd_buffer, bool p
    state->dirty_dynamic |= RADV_DYNAMIC_PRIMITIVE_RESTART_ENABLE;
 }
 
+ALWAYS_INLINE static void
+radv_cmd_set_primitive_restart_index(struct radv_cmd_buffer *cmd_buffer, uint32_t primitive_restart_index)
+{
+   cmd_buffer->state.primitive_restart_index = primitive_restart_index;
+}
+
 struct radv_cmd_set_depth_bias_info {
    float constant_factor;
    float clamp;
@@ -1163,6 +1169,16 @@ radv_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
       if (cmd_buffer->upload.upload_bo) {
          radv_rmv_log_command_buffer_bo_destroy(device, cmd_buffer->upload.upload_bo);
          radv_bo_destroy(device, &cmd_buffer->vk.base, cmd_buffer->upload.upload_bo);
+      }
+
+      if (cmd_buffer->gfx9_fence_bo_tmz) {
+         radv_rmv_log_command_buffer_bo_destroy(device, cmd_buffer->gfx9_fence_bo_tmz);
+         radv_bo_destroy(device, &cmd_buffer->vk.base, cmd_buffer->gfx9_fence_bo_tmz);
+      }
+
+      if (cmd_buffer->gfx9_eop_bug_bo_tmz) {
+         radv_rmv_log_command_buffer_bo_destroy(device, cmd_buffer->gfx9_eop_bug_bo_tmz);
+         radv_bo_destroy(device, &cmd_buffer->vk.base, cmd_buffer->gfx9_eop_bug_bo_tmz);
       }
 
       if (cmd_buffer->cs)
@@ -4409,16 +4425,14 @@ radv_emit_fsr_state(struct radv_cmd_buffer *cmd_buffer)
 }
 
 static uint32_t
-radv_get_primitive_reset_index(const struct radv_cmd_buffer *cmd_buffer)
+radv_get_primitive_restart_index(VkIndexType type)
 {
-   const uint32_t index_type = G_028A7C_INDEX_TYPE(cmd_buffer->state.index_type);
-
-   switch (index_type) {
-   case V_028A7C_VGT_INDEX_8:
+   switch (type) {
+   case VK_INDEX_TYPE_UINT8:
       return 0xffu;
-   case V_028A7C_VGT_INDEX_16:
+   case VK_INDEX_TYPE_UINT16:
       return 0xffffu;
-   case V_028A7C_VGT_INDEX_32:
+   case VK_INDEX_TYPE_UINT32:
       return 0xffffffffu;
    default:
       UNREACHABLE("invalid index type");
@@ -5882,11 +5896,6 @@ radv_emit_index_buffer(struct radv_cmd_buffer *cmd_buffer)
    uint32_t max_index_count = state->max_index_count;
    uint64_t index_va = state->index_va;
 
-   /* With indirect generated commands the index buffer bind may be part of the
-    * indirect command buffer, in which case the app may not have bound any yet. */
-   if (state->index_type < 0)
-      return;
-
    /* Handle indirect draw calls with NULL index buffer if the GPU doesn't support them. */
    if (!max_index_count && pdev->info.has_zero_index_buffer_bug) {
       radv_handle_zero_index_buffer_bug(cmd_buffer, &index_va, &max_index_count);
@@ -7102,7 +7111,7 @@ radv_prims_for_vertices(const struct radv_prim_vertex_count *info, unsigned num)
    case 2:  return 1 + (n >> 1);
    case 3:  return 1 + (unsigned)(((uint64_t)n * 0xAAAAAAABull) >> 33);
    case 4:  return 1 + (n >> 2);
-   case 6:  return 1 + (unsigned)(((uint64_t)n * 0x2AAAAAABull) >> 32);
+   case 6:  return 1 + (unsigned)(((uint64_t)n * 0xAAAAAAABull) >> 34);
    default: return 1 + (n / info->incr);
    }
 }
@@ -7433,17 +7442,14 @@ radv_emit_draw_registers(struct radv_cmd_buffer *cmd_buffer, const struct radv_d
    }
 
    const bool needs_restart_index = primitive_restart_en && pdev->info.gfx_level <= GFX7;
-   uint32_t primitive_reset_index = state->last_primitive_restart_index;
-
-   if (needs_restart_index)
-      primitive_reset_index = radv_get_primitive_reset_index(cmd_buffer);
+   const uint32_t primitive_restart_index = state->primitive_restart_index;
 
    if (primitive_restart_en != state->last_primitive_restart_en ||
-       (needs_restart_index && primitive_reset_index != state->last_primitive_restart_index)) {
-      radv_emit_primitive_restart(cmd_buffer, primitive_restart_en, primitive_reset_index);
+       (needs_restart_index && primitive_restart_index != state->last_primitive_restart_index)) {
+      radv_emit_primitive_restart(cmd_buffer, primitive_restart_en, primitive_restart_index);
       state->last_primitive_restart_en = primitive_restart_en;
       if (needs_restart_index)
-         state->last_primitive_restart_index = primitive_reset_index;
+         state->last_primitive_restart_index = primitive_restart_index;
    }
 }
 
@@ -7518,9 +7524,11 @@ can_skip_buffer_l2_flushes(struct radv_device *device)
  * images. However, given the existence of memory barriers which do not specify
  * the image/buffer it often devolves to just VRAM/GTT anyway.
  *
- * To help reducing the invalidations for GPUs that have L2 coherency between the
- * RB and the shader caches, we always invalidate L2 on the src side, as we can
- * use our knowledge of past usage to optimize flushes away.
+ * On GFX9 and coherent later GPUs, buffer writes can remain resident and visible
+ * in L2 for subsequent GPU consumers; source-side visibility only needs a
+ * writeback when the resource is not L2-coherent for the later consumer class.
+ * Destination-side cache invalidations still make scalar/vector shader caches
+ * observe the L2-resident data.
  */
 
 enum radv_cmd_flush_bits
@@ -7671,9 +7679,6 @@ radv_dst_access_flush(struct radv_cmd_buffer *cmd_buffer, VkPipelineStageFlags2 
       if (!image_is_coherent)
          flush_bits |= RADV_CMD_FLAG_INV_L2;
    }
-
-   if (dst_flags & VK_ACCESS_2_DESCRIPTOR_BUFFER_READ_BIT_EXT)
-      flush_bits |= RADV_CMD_FLAG_INV_SCACHE;
 
    if (dst_flags & (VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_BINDING_TABLE_READ_BIT_KHR |
                     VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)) {
@@ -7905,32 +7910,86 @@ radv_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBegi
 
    if (pdev->info.gfx_level >= GFX9 && cmd_buffer->qf == RADV_QUEUE_GENERAL) {
       unsigned num_db = pdev->info.max_render_backends;
-      unsigned fence_offset, eop_bug_offset;
-      void *fence_ptr;
+      bool is_secure = cmd_buffer->vk.pool->flags & VK_COMMAND_POOL_CREATE_PROTECTED_BIT;
 
-      if (!radv_cmd_buffer_upload_alloc(cmd_buffer, 8, &fence_offset, &fence_ptr)) {
-         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
-         return VK_ERROR_OUT_OF_HOST_MEMORY;
-      }
-      memset(fence_ptr, 0, 8);
+      if (!is_secure) {
+         unsigned fence_offset;
+         void *fence_ptr;
 
-      cmd_buffer->gfx9_fence_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo);
-      cmd_buffer->gfx9_fence_va += fence_offset;
-
-      radv_emit_clear_data(cmd_buffer, V_371_PREFETCH_PARSER, cmd_buffer->gfx9_fence_va, 8);
-
-      if (pdev->info.gfx_level == GFX9) {
-         /* Allocate a buffer for the EOP bug on GFX9. */
-         if (!radv_cmd_buffer_upload_alloc(cmd_buffer, 16 * num_db, &eop_bug_offset, &fence_ptr)) {
+         if (!radv_cmd_buffer_upload_alloc(cmd_buffer, 8, &fence_offset, &fence_ptr)) {
             vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
             return VK_ERROR_OUT_OF_HOST_MEMORY;
          }
 
-         memset(fence_ptr, 0, 16 * num_db);
-         cmd_buffer->gfx9_eop_bug_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo);
-         cmd_buffer->gfx9_eop_bug_va += eop_bug_offset;
+         memset(fence_ptr, 0, 8);
+         cmd_buffer->gfx9_fence_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + fence_offset;
+      } else if (!cmd_buffer->gfx9_fence_bo_tmz) {
+         struct radeon_winsys_bo *fence_bo = NULL;
 
-         radv_emit_clear_data(cmd_buffer, V_371_PREFETCH_PARSER, cmd_buffer->gfx9_eop_bug_va, 16 * num_db);
+         result = radv_bo_create(device, &cmd_buffer->vk.base, 8, 4096, device->ws->cs_domain(device->ws),
+                                 RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_32BIT |
+                                    RADEON_FLAG_GTT_WC | RADEON_FLAG_ENCRYPTED,
+                                 RADV_BO_PRIORITY_UPLOAD_BUFFER, 0, true, &fence_bo);
+         if (result != VK_SUCCESS) {
+            vk_command_buffer_set_error(&cmd_buffer->vk, result);
+            return result;
+         }
+
+         cmd_buffer->gfx9_fence_bo_tmz = fence_bo;
+         cmd_buffer->gfx9_fence_va = radv_buffer_get_va(fence_bo);
+
+         radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, fence_bo);
+         radv_rmv_log_command_buffer_bo_create(device, fence_bo, 0, 8, 0);
+      }
+
+      radv_emit_clear_data(cmd_buffer, V_371_PREFETCH_PARSER, cmd_buffer->gfx9_fence_va, 8);
+
+      if (pdev->info.gfx_level == GFX9) {
+         const uint32_t eop_bug_bo_size = 16 * num_db;
+
+         if (!is_secure) {
+            unsigned eop_bug_offset;
+            void *eop_bug_ptr;
+
+            if (!radv_cmd_buffer_upload_alloc(cmd_buffer, eop_bug_bo_size, &eop_bug_offset, &eop_bug_ptr)) {
+               vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+               return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+
+            memset(eop_bug_ptr, 0, eop_bug_bo_size);
+            cmd_buffer->gfx9_eop_bug_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + eop_bug_offset;
+         } else if (!cmd_buffer->gfx9_eop_bug_bo_tmz) {
+            struct radeon_winsys_bo *eop_bug_bo = NULL;
+
+            result =
+               radv_bo_create(device, &cmd_buffer->vk.base, eop_bug_bo_size, 4096, device->ws->cs_domain(device->ws),
+                              RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_32BIT |
+                                 RADEON_FLAG_GTT_WC | RADEON_FLAG_ENCRYPTED,
+                              RADV_BO_PRIORITY_UPLOAD_BUFFER, 0, true, &eop_bug_bo);
+            if (result != VK_SUCCESS) {
+               vk_command_buffer_set_error(&cmd_buffer->vk, result);
+               return result;
+            }
+
+            cmd_buffer->gfx9_eop_bug_bo_tmz = eop_bug_bo;
+            cmd_buffer->gfx9_eop_bug_va = radv_buffer_get_va(eop_bug_bo);
+
+            radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, eop_bug_bo);
+            radv_rmv_log_command_buffer_bo_create(device, eop_bug_bo, 0, eop_bug_bo_size, 0);
+         }
+
+         radv_emit_clear_data(cmd_buffer, V_371_PREFETCH_PARSER, cmd_buffer->gfx9_eop_bug_va, eop_bug_bo_size);
+      }
+   }
+
+   if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
+      const VkCommandBufferInheritanceDescriptorHeapInfoEXT *heap_info =
+         vk_find_struct_const(pBeginInfo->pInheritanceInfo->pNext, COMMAND_BUFFER_INHERITANCE_DESCRIPTOR_HEAP_INFO_EXT);
+      if (heap_info) {
+         if (heap_info->pSamplerHeapBindInfo)
+            radv_CmdBindSamplerHeapEXT(commandBuffer, heap_info->pSamplerHeapBindInfo);
+         if (heap_info->pResourceHeapBindInfo)
+            radv_CmdBindResourceHeapEXT(commandBuffer, heap_info->pResourceHeapBindInfo);
       }
    }
 
@@ -8194,12 +8253,14 @@ radv_CmdBindIndexBuffer3KHR(VkCommandBuffer commandBuffer, const VkBindIndexBuff
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
 
-   cmd_buffer->state.index_type = vk_to_index_type(pInfo->indexType);
+   const uint32_t index_type = vk_to_index_type(pInfo->indexType);
+   cmd_buffer->state.index_type = index_type;
+   cmd_buffer->state.primitive_restart_index = radv_get_primitive_restart_index(pInfo->indexType);
 
    if (pInfo->addressRange.size) {
       cmd_buffer->state.index_va = pInfo->addressRange.address;
 
-      int index_size = radv_get_vgt_index_size(vk_to_index_type(pInfo->indexType));
+      const uint32_t index_size = radv_get_vgt_index_size(index_type);
       cmd_buffer->state.max_index_count = pInfo->addressRange.size / index_size;
    } else {
       cmd_buffer->state.index_va = 0;
@@ -9398,6 +9459,13 @@ radv_CmdSetPrimitiveRestartEnable(VkCommandBuffer commandBuffer, VkBool32 primit
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
    radv_cmd_set_primitive_restart_enable(cmd_buffer, primitiveRestartEnable);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+radv_CmdSetPrimitiveRestartIndexEXT(VkCommandBuffer commandBuffer, uint32_t primitiveRestartIndex)
+{
+   VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+   radv_cmd_set_primitive_restart_index(cmd_buffer, primitiveRestartIndex);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -16190,9 +16258,10 @@ radv_bind_descriptor_heap(struct radv_cmd_buffer *cmd_buffer, uint32_t heap_idx,
 
    cmd_buffer->descriptor_heaps[heap_idx] = address;
 
+   const uint32_t heap_bit = 1u << heap_idx;
    for (unsigned i = 0; i < MAX_BIND_POINTS; i++) {
-      cmd_buffer->descriptors[i].dirty_heaps |= 1u << heap_idx;
-      cmd_buffer->descriptors[i].valid_heaps |= 1u << heap_idx;
+      cmd_buffer->descriptors[i].dirty_heaps |= heap_bit;
+      cmd_buffer->descriptors[i].valid_heaps |= heap_bit;
    }
 }
 
@@ -16222,9 +16291,16 @@ radv_set_descriptor_buffer_offsets(struct radv_cmd_buffer *cmd_buffer,
    for (unsigned i = 0; i < pSetDescriptorBufferOffsetsInfo->setCount; i++) {
       const uint32_t buffer_idx = pSetDescriptorBufferOffsetsInfo->pBufferIndices[i];
       const uint64_t offset = pSetDescriptorBufferOffsetsInfo->pOffsets[i];
-      unsigned idx = i + pSetDescriptorBufferOffsetsInfo->firstSet;
+      const unsigned idx = i + pSetDescriptorBufferOffsetsInfo->firstSet;
+      const uint32_t set_bit = 1u << idx;
+      const uint64_t descriptor_va = cmd_buffer->descriptor_buffers[buffer_idx] + offset;
 
-      descriptors_state->descriptor_buffers[idx] = cmd_buffer->descriptor_buffers[buffer_idx] + offset;
+      if (descriptors_state->descriptor_buffers[idx] == descriptor_va &&
+          descriptors_state->sets[idx] == NULL &&
+          (descriptors_state->valid & set_bit))
+         continue;
+
+      descriptors_state->descriptor_buffers[idx] = descriptor_va;
 
       radv_set_descriptor_set(cmd_buffer, bind_point, NULL, idx);
    }
