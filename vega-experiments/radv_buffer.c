@@ -43,7 +43,6 @@ VkResult
 radv_create_buffer(struct radv_device *device, const VkBufferCreateInfo *pCreateInfo,
                    const VkAllocationCallbacks *pAllocator, VkBuffer *pBuffer, bool is_internal)
 {
-   const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_buffer *buffer;
 
    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
@@ -65,18 +64,21 @@ radv_create_buffer(struct radv_device *device, const VkBufferCreateInfo *pCreate
    buffer->range = 0;
 
    if (pCreateInfo->flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) {
+      const struct radv_physical_device *pdev = radv_device_physical(device);
+      const VkBufferCreateFlags create_flags = buffer->vk.create_flags;
+      const VkBufferUsageFlags2 usage = buffer->vk.usage;
       enum radeon_bo_flag flags = RADEON_FLAG_VIRTUAL;
       uint64_t replay_address = 0;
 
       if (pdev->info.compiler_info.has_smem_with_null_prt_bug &&
-          (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT) &&
-          (buffer->vk.usage & (VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_UNIFORM_BUFFER_BIT |
-                               VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT))) {
+          (create_flags & VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT) &&
+          (usage & (VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_UNIFORM_BUFFER_BIT |
+                    VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT))) {
          /* Emulate sparse residency for sparse buffers that might use SMEM reads. */
          flags |= RADEON_FLAG_EMULATE_SPARSE_RESIDENCY;
       }
 
-      if (pCreateInfo->flags & VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) {
+      if (create_flags & VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) {
          flags |= RADEON_FLAG_REPLAYABLE;
 
          const VkBufferOpaqueCaptureAddressCreateInfo *opaque_addr_info =
@@ -85,7 +87,7 @@ radv_create_buffer(struct radv_device *device, const VkBufferCreateInfo *pCreate
             replay_address = opaque_addr_info->opaqueCaptureAddress;
       }
 
-      if (buffer->vk.create_flags & VK_BUFFER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT) {
+      if (create_flags & VK_BUFFER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT) {
          flags |= RADEON_FLAG_REPLAYABLE;
 
          const VkOpaqueCaptureDescriptorDataCreateInfoEXT *opaque_info =
@@ -94,7 +96,7 @@ radv_create_buffer(struct radv_device *device, const VkBufferCreateInfo *pCreate
             replay_address = *((const uint64_t *)opaque_info->opaqueCaptureDescriptorData);
       }
 
-      if (buffer->vk.usage &
+      if (usage &
           (VK_BUFFER_USAGE_2_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT | VK_BUFFER_USAGE_2_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT))
          flags |= RADEON_FLAG_32BIT;
 
@@ -135,6 +137,33 @@ radv_DestroyBuffer(VkDevice _device, VkBuffer _buffer, const VkAllocationCallbac
    radv_destroy_buffer(device, pAllocator, buffer);
 }
 
+static VkDeviceSize
+radv_get_buffer_memory_requirement_alignment(struct radv_device *device, VkBufferCreateFlags flags,
+                                             VkBufferUsageFlags2 usage)
+{
+   VkDeviceSize alignment;
+
+   if (flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) {
+      alignment = 4096;
+   } else if (usage & VK_BUFFER_USAGE_2_PREPROCESS_BUFFER_BIT_EXT) {
+      alignment = radv_dgc_get_buffer_alignment(device);
+   } else {
+      alignment = 16;
+   }
+
+   if (usage & VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR)
+      alignment = MAX2(alignment, 64);
+
+   return alignment;
+}
+
+static VkDeviceSize
+radv_get_buffer_memory_requirement_size(struct radv_device *device, VkDeviceSize size, VkBufferCreateFlags flags,
+                                        VkBufferUsageFlags2 usage)
+{
+   return align64(size, radv_get_buffer_memory_requirement_alignment(device, flags, usage));
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 radv_BindBufferMemory2(VkDevice _device, uint32_t bindInfoCount, const VkBindBufferMemoryInfo *pBindInfos)
 {
@@ -150,27 +179,19 @@ radv_BindBufferMemory2(VkDevice _device, uint32_t bindInfoCount, const VkBindBuf
       if (status)
          *status->pResult = VK_SUCCESS;
 
-      VkBufferMemoryRequirementsInfo2 info = {
-         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2,
-         .buffer = pBindInfos[i].buffer,
-      };
-      VkMemoryRequirements2 reqs = {
-         .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
-      };
+      const VkDeviceSize required_size = radv_get_buffer_memory_requirement_size(
+         device, buffer->vk.size, buffer->vk.create_flags, buffer->vk.usage);
+      const VkDeviceSize memory_offset = pBindInfos[i].memoryOffset;
 
-      vk_common_GetBufferMemoryRequirements2(_device, &info, &reqs);
-
-      if (mem->alloc_size) {
-         if (pBindInfos[i].memoryOffset + reqs.memoryRequirements.size > mem->alloc_size) {
-            if (status)
-               *status->pResult = VK_ERROR_UNKNOWN;
-            return vk_errorf(device, VK_ERROR_UNKNOWN, "Device memory object too small for the buffer.\n");
-         }
+      if (mem->alloc_size && (memory_offset > mem->alloc_size || required_size > mem->alloc_size - memory_offset)) {
+         if (status)
+            *status->pResult = VK_ERROR_UNKNOWN;
+         return vk_errorf(device, VK_ERROR_UNKNOWN, "Device memory object too small for the buffer.\n");
       }
 
       buffer->bo = mem->bo;
-      buffer->vk.device_address = radv_buffer_get_va(mem->bo) + pBindInfos[i].memoryOffset;
-      buffer->range = reqs.memoryRequirements.size;
+      buffer->vk.device_address = radv_buffer_get_va(mem->bo) + memory_offset;
+      buffer->range = required_size;
 
       radv_rmv_log_buffer_bind(device, pBindInfos[i].buffer);
 
@@ -185,9 +206,10 @@ radv_get_buffer_memory_requirements(struct radv_device *device, VkDeviceSize siz
                                     VkBufferUsageFlags2 usage, VkMemoryRequirements2 *pMemoryRequirements)
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
+   const uint32_t memory_type_count = pdev->memory_properties.memoryTypeCount;
+   const uint32_t all_memory_types = memory_type_count >= 32 ? ~0u : ((1u << memory_type_count) - 1u);
 
-   pMemoryRequirements->memoryRequirements.memoryTypeBits =
-      ((1u << pdev->memory_properties.memoryTypeCount) - 1u) & ~pdev->memory_types_32bit;
+   pMemoryRequirements->memoryRequirements.memoryTypeBits = all_memory_types & ~pdev->memory_types_32bit;
 
    /* Force 32-bit address-space for descriptor buffers usage because they are passed to shaders
     * through 32-bit pointers.
@@ -200,22 +222,8 @@ radv_get_buffer_memory_requirements(struct radv_device *device, VkDeviceSize siz
    if (flags & VK_BUFFER_CREATE_PROTECTED_BIT)
       pMemoryRequirements->memoryRequirements.memoryTypeBits &= pdev->memory_types_protected;
 
-   if (flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) {
-      pMemoryRequirements->memoryRequirements.alignment = 4096;
-   } else {
-      if (usage & VK_BUFFER_USAGE_2_PREPROCESS_BUFFER_BIT_EXT)
-         pMemoryRequirements->memoryRequirements.alignment = radv_dgc_get_buffer_alignment(device);
-      else
-         pMemoryRequirements->memoryRequirements.alignment = 16;
-   }
-
-   /* Top level acceleration structures need the bottom 6 bits to store
-    * the root ids of instances. The hardware also needs bvh nodes to
-    * be 64 byte aligned.
-    */
-   if (usage & VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR)
-      pMemoryRequirements->memoryRequirements.alignment = MAX2(pMemoryRequirements->memoryRequirements.alignment, 64);
-
+   pMemoryRequirements->memoryRequirements.alignment =
+      radv_get_buffer_memory_requirement_alignment(device, flags, usage);
    pMemoryRequirements->memoryRequirements.size = align64(size, pMemoryRequirements->memoryRequirements.alignment);
 
    vk_foreach_struct (ext, pMemoryRequirements->pNext) {
@@ -232,7 +240,7 @@ radv_get_buffer_memory_requirements(struct radv_device *device, VkDeviceSize siz
    }
 }
 
-static const VkBufferUsageFlagBits2
+static VkBufferUsageFlags2
 radv_get_buffer_usage_flags(const VkBufferCreateInfo *pCreateInfo)
 {
    const VkBufferUsageFlags2CreateInfo *flags2 =
@@ -245,7 +253,7 @@ radv_GetDeviceBufferMemoryRequirements(VkDevice _device, const VkDeviceBufferMem
                                        VkMemoryRequirements2 *pMemoryRequirements)
 {
    VK_FROM_HANDLE(radv_device, device, _device);
-   const VkBufferUsageFlagBits2 usage_flags = radv_get_buffer_usage_flags(pInfo->pCreateInfo);
+   const VkBufferUsageFlags2 usage_flags = radv_get_buffer_usage_flags(pInfo->pCreateInfo);
 
    radv_get_buffer_memory_requirements(device, pInfo->pCreateInfo->size, pInfo->pCreateInfo->flags, usage_flags,
                                        pMemoryRequirements);
