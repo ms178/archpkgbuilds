@@ -1,5 +1,6 @@
 #include <iomanip>
 
+#include "../util/util_env.h"
 #include "../util/util_time.h"
 
 #include "dxvk_device.h"
@@ -7,6 +8,19 @@
 #include "dxvk_pipemanager.h"
 
 namespace dxvk {
+
+  static bool useAsyncGraphicsPipelineCompilation(
+          DxvkDevice*                     device,
+          bool                            async) {
+    static const bool envEnabled = env::getEnvVar("DXVK_ASYNC") != "0";
+    const auto& config = device->config();
+
+    return async
+        && config.enableAsync
+        && envEnabled
+        && config.enableGraphicsPipelineLibrary != Tristate::True;
+  }
+
 
   VkPrimitiveTopology determineGsInputTopology(
           VkPrimitiveTopology            shader,
@@ -82,6 +96,11 @@ namespace dxvk {
 
     uint32_t attrMask = shaders.vs->metadata().inputs.computeMask();
     uint32_t bindingMask = 0;
+
+    if (!attrMask) {
+      viUseDynamicVertexStrides = state.useDynamicVertexStrides();
+      return;
+    }
 
     // Find out which bindings are used based on the attribute mask
     for (uint32_t i = 0; i < state.il.attributeCount(); i++) {
@@ -369,7 +388,9 @@ namespace dxvk {
     // Alpha to coverage is not supported with sample mask exports.
     cbUseDynamicAlphaToCoverage = !shaders.fs || !shaders.fs->metadata().flags.test(DxvkShaderFlag::ExportsSampleMask);
 
-    msSampleMask                  = state.ms.sampleMask() & ((1u << msInfo.rasterizationSamples) - 1);
+    uint32_t sampleCount          = uint32_t(msInfo.rasterizationSamples);
+    uint32_t sampleMask           = sampleCount >= 32u ? ~0u : ((1u << sampleCount) - 1u);
+    msSampleMask                  = state.ms.sampleMask() & sampleMask;
     msInfo.pSampleMask            = &msSampleMask;
     msInfo.alphaToCoverageEnable  = state.ms.enableAlphaToCoverage() && cbUseDynamicAlphaToCoverage;
 
@@ -429,6 +450,8 @@ namespace dxvk {
     hash.add(uint32_t(cbInfo.logicOp));
     hash.add(uint32_t(cbInfo.attachmentCount));
     hash.add(uint32_t(msInfo.rasterizationSamples));
+    hash.add(uint32_t(msInfo.sampleShadingEnable));
+    hash.add(bit::cast<uint32_t>(msInfo.minSampleShading));
     hash.add(uint32_t(msInfo.alphaToCoverageEnable));
     hash.add(uint32_t(msInfo.alphaToOneEnable));
     hash.add(uint32_t(msSampleMask));
@@ -688,8 +711,8 @@ namespace dxvk {
 
 
   DxvkGraphicsPipelineFragmentShaderState::DxvkGraphicsPipelineFragmentShaderState(
-    const DxvkDevice*                     device,
-    const DxvkGraphicsPipelineStateInfo&  state) {
+    const DxvkDevice*,
+    const DxvkGraphicsPipelineStateInfo&) {
 
   }
 
@@ -892,10 +915,13 @@ namespace dxvk {
 
     // Deal with undefined shader inputs
     if (shaderMeta.stage == VK_SHADER_STAGE_VERTEX_BIT) {
+      const uint32_t inputMask = shaderMeta.inputs.computeMask();
       uint32_t attributeMask = 0u;
 
-      for (uint32_t i = 0; i < state.il.attributeCount(); i++)
-        attributeMask |= 1u << state.ilAttributes[i].location();
+      for (uint32_t i = 0; i < state.il.attributeCount() && attributeMask != inputMask; i++) {
+        uint32_t locationBit = 1u << state.ilAttributes[i].location();
+        attributeMask |= inputMask & locationBit;
+      }
 
       info.prevStageOutputs = DxvkShaderIo::forVertexBindings(attributeMask);
     } else {
@@ -1076,7 +1102,8 @@ namespace dxvk {
 
 
   DxvkGraphicsPipelineHandle DxvkGraphicsPipeline::getPipelineHandle(
-    const DxvkGraphicsPipelineStateInfo& state) {
+    const DxvkGraphicsPipelineStateInfo& state,
+          bool                           async) {
     DxvkGraphicsPipelineInstance* instance = this->findInstance(state);
 
     if (unlikely(!instance)) {
@@ -1084,11 +1111,24 @@ namespace dxvk {
       if (!this->validatePipelineState(state, true))
         return DxvkGraphicsPipelineHandle();
 
+      const bool useAsync = useAsyncGraphicsPipelineCompilation(m_device, async);
+
       // Prevent other threads from adding new instances and check again
       std::unique_lock<dxvk::mutex> lock(m_mutex);
       instance = this->findInstance(state);
 
       if (!instance) {
+        if (useAsync) {
+          m_stats->numGraphicsPipelines += 1;
+          instance = m_pipelines.add(state,
+            VK_NULL_HANDLE, VK_NULL_HANDLE, computeAttachmentMask(state));
+
+          lock.unlock();
+
+          m_workers->compileGraphicsPipeline(this, state, DxvkPipelinePriority::High);
+          return DxvkGraphicsPipelineHandle();
+        }
+
         // Keep pipeline object locked, at worst we're going to stall
         // a state cache worker and the current thread needs priority.
         bool canCreateBasePipeline = this->canCreateBasePipeline(state);
@@ -1104,7 +1144,28 @@ namespace dxvk {
       }
     }
 
-    return instance->getHandle();
+    DxvkGraphicsPipelineHandle handle = instance->getHandle();
+
+    if (unlikely(!handle.handle)) {
+      if (useAsyncGraphicsPipelineCompilation(m_device, async))
+        return handle;
+
+      VkPipeline pipeline = VK_NULL_HANDLE;
+
+      if (!instance->isCompiling.exchange(VK_TRUE, std::memory_order_acquire)) {
+        pipeline = this->getOptimizedPipeline(state);
+
+        if (!pipeline)
+          this->logPipelineState(LogLevel::Error, state);
+      } else {
+        pipeline = this->getOptimizedPipeline(state);
+      }
+
+      instance->fastHandle.store(pipeline, std::memory_order_release);
+      handle = instance->getHandle();
+    }
+
+    return handle;
   }
 
 
@@ -1240,13 +1301,17 @@ namespace dxvk {
 
     // If the vertex shader uses any input locations not provided by
     // the input layout, we need to patch the shader.
-    uint32_t ilAttributeMask = 0u;
+    if (m_vsIn) {
+      uint32_t ilAttributeMask = 0u;
 
-    for (uint32_t i = 0; i < state.il.attributeCount(); i++)
-      ilAttributeMask |= 1u << state.ilAttributes[i].location();
+      for (uint32_t i = 0; i < state.il.attributeCount() && ilAttributeMask != m_vsIn; i++) {
+        uint32_t locationBit = 1u << state.ilAttributes[i].location();
+        ilAttributeMask |= m_vsIn & locationBit;
+      }
 
-    if ((m_vsIn & ilAttributeMask) != m_vsIn)
-      return false;
+      if (ilAttributeMask != m_vsIn)
+        return false;
+    }
 
     if (m_shaders.gs != nullptr) {
       // If the geometry shader's input topology is not compatible with
@@ -1405,15 +1470,18 @@ namespace dxvk {
       std::tuple(key),
       std::tuple(VK_NOT_READY, VK_NULL_HANDLE));
 
+    DxvkGraphicsPipelineFastInstanceObject* object = &entry.first->second;
+    bool needsCompile = entry.second;
+
     lock.unlock();
 
-    if (entry.second) {
+    if (needsCompile) {
       // Pipeline doesn't exist yet. Compile it and write the status back last
       // so that other threads can safely read the pipeline handle.
       auto [status, handle] = createOptimizedPipeline(key);
 
-      entry.first->second.pipeline = handle;
-      entry.first->second.status.store(status, std::memory_order_release);
+      object->pipeline = handle;
+      object->status.store(status, std::memory_order_release);
 
       return handle;
     } else {
@@ -1421,12 +1489,12 @@ namespace dxvk {
       // other than VK_NOT_READY in order to avoid compiling the same pipeline
       // on multiple threads in parallel, which is problematic on some drivers.
       // This should be quite rare anyway.
-      sync::spin(1000u, [&entry] {
-        auto status = entry.first->second.status.load(std::memory_order_acquire);
+      sync::spin(1000u, [object] {
+        auto status = object->status.load(std::memory_order_acquire);
         return status != VK_NOT_READY;
       });
 
-      return entry.first->second.pipeline;
+      return object->pipeline;
     }
   }
 
@@ -1801,25 +1869,28 @@ namespace dxvk {
 
 
   std::string DxvkGraphicsPipeline::createDebugName() const {
-    std::stringstream name;
+    std::string name;
+    name.reserve(5u * 13u);
 
-    std::array<Rc<DxvkShader>, 5> shaders = {{
-      m_shaders.vs,
-      m_shaders.tcs,
-      m_shaders.tes,
-      m_shaders.gs,
-      m_shaders.fs,
+    std::array<const Rc<DxvkShader>*, 5> shaders = {{
+      &m_shaders.vs,
+      &m_shaders.tcs,
+      &m_shaders.tes,
+      &m_shaders.gs,
+      &m_shaders.fs,
     }};
 
-    for (const auto& shader : shaders) {
-      if (shader) {
-        std::string shaderName = shader->debugName();
+    for (const auto* shader : shaders) {
+      if (*shader) {
+        std::string shaderName = (*shader)->debugName();
         size_t len = std::min(shaderName.size(), size_t(10));
-        name << "[" << shaderName.substr(0, len) << "] ";
+        name.push_back('[');
+        name.append(shaderName.data(), len);
+        name.append("] ");
       }
     }
 
-    return name.str();
+    return name;
   }
 
 }

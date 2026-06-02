@@ -6780,7 +6780,8 @@ namespace dxvk {
                          DxvkContextFlag::GpDirtyDepthBias));
 
     // Retrieve and bind actual Vulkan pipeline handle
-    auto pipelineInfo = m_state.gp.pipeline->getPipelineHandle(m_state.gp.state);
+    auto pipelineInfo = m_state.gp.pipeline->getPipelineHandle(m_state.gp.state,
+      this->checkAsyncCompilationCompat());
 
     if (unlikely(!pipelineInfo.handle))
       return false;
@@ -7491,7 +7492,7 @@ namespace dxvk {
   }
 
 
-  void DxvkContext::updateRenderTargets() {
+  void DxvkContext::updateRenderTargets(bool isDraw) {
     if (m_flags.test(DxvkContextFlag::GpDirtyRenderTargets)) {
       m_flags.clr(DxvkContextFlag::GpDirtyRenderTargets);
 
@@ -7527,6 +7528,17 @@ namespace dxvk {
         m_state.gp.state.omSwizzle[i] = DxvkOmAttachmentSwizzle(mapping);
       }
 
+      if (isDraw) {
+        const uint32_t frameId = m_device->getCurrentFrameId();
+
+        for (uint32_t i = 0; i < fbInfo.numAttachments(); i++) {
+          const auto& attachment = fbInfo.getAttachment(i);
+
+          if (attachment.view)
+            attachment.view->setRtBindingFrameId(frameId);
+        }
+      }
+
       m_state.om.framebufferInfo = std::move(fbInfo);
 
       m_flags.set(DxvkContextFlag::GpDirtyPipelineState);
@@ -7534,6 +7546,35 @@ namespace dxvk {
       // End render pass to flush pending resolves
       this->endCurrentPass(true);
     }
+  }
+
+
+  void DxvkContext::updateRenderTargetAsyncCompilationFrameIds() {
+    const uint32_t frameId = m_device->getCurrentFrameId();
+
+    for (uint32_t i = 0; i < m_state.om.framebufferInfo.numAttachments(); i++) {
+      const auto& attachment = m_state.om.framebufferInfo.getAttachment(i);
+
+      if (attachment.view)
+        attachment.view->setRtBindingFrameId(frameId);
+    }
+  }
+
+
+  bool DxvkContext::checkAsyncCompilationCompat() const {
+    uint32_t attachmentCount = m_state.om.framebufferInfo.numAttachments();
+
+    if (!attachmentCount)
+      return false;
+
+    for (uint32_t i = 0; i < attachmentCount; i++) {
+      const auto& attachment = m_state.om.framebufferInfo.getAttachment(i);
+
+      if (!attachment.view || !attachment.view->getRtBindingAsyncCompilationCompat())
+        return false;
+    }
+
+    return true;
   }
 
 
@@ -8187,7 +8228,9 @@ namespace dxvk {
     // End render pass if there are pending resolves
     if (m_flags.any(DxvkContextFlag::GpDirtyRenderTargets,
                     DxvkContextFlag::GpRenderPassNeedsFlush))
-      this->updateRenderTargets();
+      this->updateRenderTargets(true);
+
+    this->updateRenderTargetAsyncCompilationFrameIds();
 
     if (m_flags.test(DxvkContextFlag::GpXfbActive)) {
       // If transform feedback is active and there is a chance that we might

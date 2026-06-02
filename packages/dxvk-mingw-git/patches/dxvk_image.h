@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "dxvk_descriptor_pool.h"
 #include "dxvk_fence.h"
 #include "dxvk_format.h"
@@ -285,6 +287,39 @@ namespace dxvk {
     }
 
     /**
+     * \brief Sets render target usage frame number
+     *
+     * Tracks consecutive frames in which this image view has been bound as
+     * a render target. This is used as a conservative heuristic for async
+     * first-use graphics pipeline compilation. Relaxed atomics avoid data
+     * races when multiple contexts record against the same view; no memory
+     * ordering is required because this does not publish rendering data.
+     * \param [in] frameId Current frame number
+     */
+    void setRtBindingFrameId(uint32_t frameId) {
+      uint32_t oldFrameId = m_rtBindingFrameId.load(std::memory_order_relaxed);
+
+      if (frameId != oldFrameId) {
+        uint32_t oldCount = m_rtBindingFrameCount.load(std::memory_order_relaxed);
+        uint32_t newCount = frameId == oldFrameId + 1u ? oldCount + 1u : 0u;
+
+        m_rtBindingFrameCount.store(newCount, std::memory_order_relaxed);
+        m_rtBindingFrameId.store(frameId, std::memory_order_relaxed);
+      }
+    }
+
+    /**
+     * \brief Checks for async pipeline compatibility
+     *
+     * Asynchronous graphics pipeline compilation is allowed only after the
+     * render target has been observed for several consecutive frames.
+     * \returns \c true if async compilation is supported
+     */
+    bool getRtBindingAsyncCompilationCompat() const {
+      return m_rtBindingFrameCount.load(std::memory_order_relaxed) >= 5u;
+    }
+
+    /**
      * \brief Checks whether this view overlaps with another one
      *
      * Two views overlap if they were created for the same
@@ -336,6 +371,9 @@ namespace dxvk {
     DxvkImageViewImageProperties m_properties = { };
 
     std::array<const DxvkDescriptor*, ViewCount> m_views = { };
+
+    std::atomic<uint32_t> m_rtBindingFrameId    = { 0u };
+    std::atomic<uint32_t> m_rtBindingFrameCount = { 0u };
 
     const DxvkDescriptor* createView(VkImageViewType type) const;
 
