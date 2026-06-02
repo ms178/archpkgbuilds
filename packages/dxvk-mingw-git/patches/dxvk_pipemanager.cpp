@@ -1,10 +1,12 @@
+#include <algorithm>
 #include <optional>
+#include <utility>
 
 #include "dxvk_device.h"
 #include "dxvk_pipemanager.h"
 
 namespace dxvk {
-
+  
   DxvkPipelineWorkers::DxvkPipelineWorkers(
           DxvkDevice*                     device)
   : m_device(device) {
@@ -23,9 +25,9 @@ namespace dxvk {
     std::unique_lock lock(m_lock);
     this->startWorkers();
 
+    m_buckets[uint32_t(priority)].queue.emplace(library);
     m_tasksTotal += 1;
 
-    m_buckets[uint32_t(priority)].queue.emplace(library);
     notifyWorkers(priority);
   }
 
@@ -34,16 +36,20 @@ namespace dxvk {
           DxvkGraphicsPipeline*           pipeline,
     const DxvkGraphicsPipelineStateInfo&  state,
           DxvkPipelinePriority            priority) {
-    // Keep lock scope minimal: refcount operation is independent of queue state.
     pipeline->acquirePipeline();
 
-    std::unique_lock lock(m_lock);
-    this->startWorkers();
+    try {
+      std::unique_lock lock(m_lock);
+      this->startWorkers();
 
-    m_tasksTotal += 1;
+      m_buckets[uint32_t(priority)].queue.emplace(pipeline, state);
+      m_tasksTotal += 1;
 
-    m_buckets[uint32_t(priority)].queue.emplace(pipeline, state);
-    notifyWorkers(priority);
+      notifyWorkers(priority);
+    } catch (...) {
+      pipeline->releasePipeline();
+      throw;
+    }
   }
 
 
@@ -63,13 +69,29 @@ namespace dxvk {
       worker.join();
 
     m_workers.clear();
+
+    std::vector<DxvkGraphicsPipeline*> discardedGraphicsPipelines;
+
+    { std::unique_lock lock(m_lock);
+      for (auto& bucket : m_buckets) {
+        while (!bucket.queue.empty()) {
+          PipelineEntry entry = std::move(bucket.queue.front());
+          bucket.queue.pop();
+
+          if (entry.graphicsPipeline)
+            discardedGraphicsPipelines.push_back(entry.graphicsPipeline);
+        }
+      }
+    }
+
+    for (auto* pipeline : discardedGraphicsPipelines)
+      pipeline->releasePipeline();
   }
 
 
   void DxvkPipelineWorkers::notifyWorkers(DxvkPipelinePriority priority) {
     const uint32_t index = uint32_t(priority);
 
-    // Fast path for exact bucket to avoid scanning in the common case.
     if (m_buckets[index].idleWorkers) {
       m_buckets[index].cond.notify_one();
       return;
@@ -78,7 +100,7 @@ namespace dxvk {
     // If any workers are idle in a suitable set, notify the corresponding
     // condition variable. If all workers are busy anyway, we know that the
     // job is going to be picked up at some point anyway.
-    for (uint32_t i = index + 1; i < m_buckets.size(); i++) {
+    for (uint32_t i = index + 1u; i < m_buckets.size(); i++) {
       if (m_buckets[i].idleWorkers) {
         m_buckets[i].cond.notify_one();
         break;
@@ -88,26 +110,29 @@ namespace dxvk {
 
 
   void DxvkPipelineWorkers::startWorkers() {
-    if (!m_workersRunning) {
-      m_workersRunning = true;
+    if (!std::exchange(m_workersRunning, true)) {
+      // Determine number of available CPU cores, and clamp to a useful
+      // range. DXVK is not tested on extremely high core counts, and
+      // parallelism may be limited past a certain point.
+      uint32_t coreCount = dxvk::thread::hardware_concurrency();
+      coreCount = std::clamp(coreCount, 1u, 64u);
 
-      // Use all available cores by default.
-      uint32_t workerCount = dxvk::thread::hardware_concurrency();
-
-      if (workerCount <  1) workerCount =  1;
-      if (workerCount > 64) workerCount = 64;
+      if (m_device->config().numCompilerThreads > 0)
+        coreCount = uint32_t(m_device->config().numCompilerThreads);
 
       // Reduce worker count on 32-bit to save address space.
+      uint32_t workerCount = coreCount;
+
       if (env::is32BitHostPlatform())
         workerCount = std::min(workerCount, 16u);
 
-      if (m_device->config().numCompilerThreads > 0)
-        workerCount = m_device->config().numCompilerThreads;
-
       // Number of workers that can process pipeline pipelines with normal
       // priority. Any other workers can only build high-priority pipelines.
-      const uint32_t npWorkerCount = std::max(((workerCount - 1) * 5) / 7, 1u);
-      const uint32_t lpWorkerCount = std::max(((workerCount - 1) * 2) / 7, 1u);
+      // Base this on the available core count, not the worker count, since
+      // that is what determines the impact of having multiple threads do
+      // heavy CPU work.
+      const uint32_t npWorkerCount = std::clamp(((coreCount - 1u) * 5u) / 7u, 1u, workerCount);
+      const uint32_t lpWorkerCount = std::clamp(((coreCount - 1u) * 2u) / 7u, 1u, workerCount);
 
       m_workers.reserve(workerCount);
 
@@ -122,7 +147,7 @@ namespace dxvk {
         auto& worker = m_workers.emplace_back([this, priority] {
           runWorker(priority);
         });
-
+        
         worker.set_priority(ThreadPriority::Lowest);
       }
 
@@ -145,6 +170,9 @@ namespace dxvk {
 
         bucket.idleWorkers += 1;
         bucket.cond.wait(lock, [this, maxPriorityIndex, &entry] {
+          if (!m_workersRunning)
+            return true;
+
           // Attempt to fetch a work item from the
           // highest-priority queue that is not empty.
           for (uint32_t i = 0; i <= maxPriorityIndex; i++) {
@@ -155,7 +183,7 @@ namespace dxvk {
             }
           }
 
-          return !m_workersRunning;
+          return false;
         });
 
         bucket.idleWorkers -= 1;
@@ -187,20 +215,20 @@ namespace dxvk {
 
     createNullFsPipelineLibrary()->compilePipeline();
   }
-
-
+  
+  
   DxvkPipelineManager::~DxvkPipelineManager() {
-
+    
   }
-
-
+  
+  
   DxvkComputePipeline* DxvkPipelineManager::createComputePipeline(
     const DxvkComputePipelineShaders& shaders) {
     if (shaders.cs == nullptr)
       return nullptr;
-
+    
     std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
-
+    
     auto pair = m_computePipelines.find(shaders);
     if (pair != m_computePipelines.end())
       return &pair->second;
@@ -210,19 +238,17 @@ namespace dxvk {
 
     auto library = findPipelineLibraryLocked(key);
 
-    auto iter = m_computePipelines.emplace(
-      std::piecewise_construct,
-      std::tuple(shaders),
-      std::tuple(m_device, this, shaders, library));
+    auto iter = m_computePipelines.try_emplace(
+      shaders, m_device, this, shaders, library);
     return &iter.first->second;
   }
-
-
+  
+  
   DxvkGraphicsPipeline* DxvkPipelineManager::createGraphicsPipeline(
     const DxvkGraphicsPipelineShaders& shaders) {
     if (shaders.vs == nullptr)
       return nullptr;
-
+    
     std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
 
     auto pair = m_graphicsPipelines.find(shaders);
@@ -253,14 +279,12 @@ namespace dxvk {
 
     DxvkShaderPipelineLibrary* fsLibrary = findPipelineLibraryLocked(fsKey);
 
-    auto iter = m_graphicsPipelines.emplace(
-      std::piecewise_construct,
-      std::tuple(shaders),
-      std::tuple(m_device, this, shaders, vsLibrary, fsLibrary));
+    auto iter = m_graphicsPipelines.try_emplace(
+      shaders, m_device, this, shaders, vsLibrary, fsLibrary);
     return &iter.first->second;
   }
 
-
+  
   DxvkShaderPipelineLibrary* DxvkPipelineManager::createShaderPipelineLibrary(
     const DxvkShaderPipelineLibraryKey& key) {
     std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
@@ -272,10 +296,8 @@ namespace dxvk {
     const DxvkGraphicsPipelineVertexInputState& state) {
     std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
 
-    auto iter = m_vertexInputLibraries.emplace(
-      std::piecewise_construct,
-      std::tuple(state),
-      std::tuple(m_device, state));
+    auto iter = m_vertexInputLibraries.try_emplace(
+      state, m_device, state);
     return &iter.first->second;
   }
 
@@ -284,14 +306,12 @@ namespace dxvk {
     const DxvkGraphicsPipelineFragmentOutputState& state) {
     std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
 
-    auto iter = m_fragmentOutputLibraries.emplace(
-      std::piecewise_construct,
-      std::tuple(state),
-      std::tuple(m_device, state));
+    auto iter = m_fragmentOutputLibraries.try_emplace(
+      state, m_device, state);
     return &iter.first->second;
   }
-
-
+  
+  
   void DxvkPipelineManager::registerShader(
     const Rc<DxvkShader>&         shader) {
     DxvkShaderPipelineLibraryKey key;
@@ -338,10 +358,8 @@ namespace dxvk {
     const DxvkDescriptorSetLayoutKey& key) {
     std::lock_guard<dxvk::mutex> lock(m_layoutMutex);
 
-    auto iter = m_descriptorSetLayouts.emplace(
-      std::piecewise_construct,
-      std::tuple(key),
-      std::tuple(m_device, key));
+    auto iter = m_descriptorSetLayouts.try_emplace(
+      key, m_device, key);
     return &iter.first->second;
   }
 
@@ -350,20 +368,16 @@ namespace dxvk {
     const DxvkPipelineLayoutKey& key) {
     std::lock_guard<dxvk::mutex> lock(m_layoutMutex);
 
-    auto iter = m_pipelineLayouts.emplace(
-      std::piecewise_construct,
-      std::tuple(key),
-      std::tuple(m_device, key));
+    auto iter = m_pipelineLayouts.try_emplace(
+      key, m_device, key);
     return &iter.first->second;
   }
 
 
   DxvkShaderPipelineLibrary* DxvkPipelineManager::createPipelineLibraryLocked(
     const DxvkShaderPipelineLibraryKey& key) {
-    auto iter = m_shaderLibraries.emplace(
-      std::piecewise_construct,
-      std::tuple(key),
-      std::tuple(m_device, this, key));
+    auto iter = m_shaderLibraries.try_emplace(
+      key, m_device, this, key);
     return &iter.first->second;
   }
 
@@ -372,10 +386,8 @@ namespace dxvk {
     std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
     DxvkShaderPipelineLibraryKey key;
 
-    auto iter = m_shaderLibraries.emplace(
-      std::piecewise_construct,
-      std::tuple(key),
-      std::tuple(m_device, this, key));
+    auto iter = m_shaderLibraries.try_emplace(
+      key, m_device, this, key);
     return &iter.first->second;
   }
 

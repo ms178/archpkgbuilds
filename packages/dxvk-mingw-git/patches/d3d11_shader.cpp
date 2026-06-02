@@ -13,19 +13,20 @@ namespace dxvk {
 
     D3D11ShaderConverter(
       const DxvkShaderHash&         ShaderKey,
-      const DxvkIrShaderCreateInfo& ModuleInfo,
       const void*                   pShaderBytecode,
             size_t                  BytecodeLength,
             bool                    LowerIcb)
-    : m_key(ShaderKey), m_info(ModuleInfo), m_lowerIcb(LowerIcb) {
+    : m_key(ShaderKey), m_lowerIcb(LowerIcb) {
       // The DXBC bytecode pointer is owned by the caller and may be freed
       // immediately after Create*Shader returns (per D3D11 spec). The
       // converter is invoked asynchronously on a pipeline-compile worker,
       // so we must take a private copy here. assign() from an iterator
       // pair avoids the spurious zero-init that resize() + memcpy would do
       // for a trivially default-constructible element type on libstdc++.
-      const auto* begin = reinterpret_cast<const uint8_t*>(pShaderBytecode);
-      m_dxbc.assign(begin, begin + BytecodeLength);
+      if (BytecodeLength) {
+        const auto* begin = reinterpret_cast<const uint8_t*>(pShaderBytecode);
+        m_dxbc.assign(begin, begin + BytecodeLength);
+      }
     }
 
     ~D3D11ShaderConverter() = default;
@@ -104,7 +105,6 @@ namespace dxvk {
     std::vector<uint8_t>    m_dxbc;
 
     DxvkShaderHash          m_key;
-    DxvkIrShaderCreateInfo  m_info;
 
     bool                    m_lowerIcb = false;
 
@@ -180,7 +180,7 @@ namespace dxvk {
 
     if (m_shader == nullptr) {
       Rc<D3D11ShaderConverter> converter = new D3D11ShaderConverter(
-        ShaderKey, ModuleInfo, pShaderBytecode, BytecodeLength, m_buffer != nullptr);
+        ShaderKey, pShaderBytecode, BytecodeLength, m_buffer != nullptr);
 
       m_shader = pDevice->GetDXVKDevice()->createCachedShader(
         shaderName, ModuleInfo, std::move(converter));
