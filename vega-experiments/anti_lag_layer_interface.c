@@ -11,10 +11,21 @@
 #include "vk_alloc.h"
 #include "vk_util.h"
 
-static uintptr_t
+/* ------------------------------------------------------------------ */
+/* GNU23 branch-hint helpers                                          */
+/* ------------------------------------------------------------------ */
+#define LIKELY(x)   __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+
+/* The first machine word of every dispatchable Vulkan handle is the
+ * loader-private dispatch pointer.  We read it with memcpy to avoid a
+ * strict-aliasing violation under -Wstrict-aliasing.                  */
+static inline uintptr_t
 object_to_key(const void *object)
 {
-   return (uintptr_t)*(uintptr_t *)object;
+   uintptr_t key;
+   memcpy(&key, object, sizeof(key));
+   return key;
 }
 
 typedef struct instance_data {
@@ -34,8 +45,8 @@ typedef struct instance_data {
 #undef DECLARE_HOOK
    } vtable;
 
-   VkInstance instance;
-   uint32_t apiVersion;
+   VkInstance            instance;
+   uint32_t              apiVersion;
    VkAllocationCallbacks alloc;
    struct instance_data *next;
 } instance_data;
@@ -58,17 +69,15 @@ init_instance_vtable(instance_data *ctx, PFN_vkGetInstanceProcAddr gpa)
 #undef INIT_HOOK
 }
 
-static simple_mtx_t instance_mtx = SIMPLE_MTX_INITIALIZER;
+static simple_mtx_t   instance_mtx  = SIMPLE_MTX_INITIALIZER;
 static instance_data *instance_list = NULL;
 
 static void
 add_instance(instance_data *instance)
 {
    simple_mtx_lock(&instance_mtx);
-   instance_data **ptr = &instance_list;
-   while (*ptr != NULL)
-      ptr = &(*ptr)->next;
-   *ptr = instance;
+   instance->next = instance_list;
+   instance_list  = instance;
    simple_mtx_unlock(&instance_mtx);
 }
 
@@ -82,7 +91,8 @@ remove_instance(const void *object)
       ptr = &(*ptr)->next;
 
    instance_data *ctx = *ptr;
-   *ptr = ctx ? ctx->next : NULL;
+   if (ctx)
+      *ptr = ctx->next;
    simple_mtx_unlock(&instance_mtx);
    return ctx;
 }
@@ -114,7 +124,7 @@ anti_lag_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
       chain_info->u.pLayerInfo->pfnNextGetInstanceProcAddr;
    PFN_vkCreateInstance fpCreateInstance =
       (PFN_vkCreateInstance)fpGetInstanceProcAddr(NULL, "vkCreateInstance");
-   if (fpCreateInstance == NULL)
+   if (UNLIKELY(fpCreateInstance == NULL))
       return VK_ERROR_INITIALIZATION_FAILED;
 
    /* Advance the link info for the next element on the chain. */
@@ -122,14 +132,14 @@ anti_lag_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    /* Create Instance. */
    VkResult result = fpCreateInstance(pCreateInfo, pAllocator, pInstance);
-   if (result != VK_SUCCESS)
+   if (UNLIKELY(result != VK_SUCCESS))
       return result;
 
    /* Create Instance context. */
    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : vk_default_allocator();
    void *buf = vk_alloc(alloc, sizeof(instance_data), alignof(instance_data),
                         VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
-   if (!buf) {
+   if (UNLIKELY(!buf)) {
       PFN_vkDestroyInstance fpDestroyInstance =
          (PFN_vkDestroyInstance)fpGetInstanceProcAddr(*pInstance, "vkDestroyInstance");
       fpDestroyInstance(*pInstance, alloc);
@@ -140,8 +150,8 @@ anti_lag_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
                         ? pCreateInfo->pApplicationInfo->apiVersion
                         : VK_API_VERSION_1_0;
    ctx->instance = *pInstance;
-   ctx->alloc = *alloc;
-   ctx->next = NULL;
+   ctx->alloc    = *alloc;
+   ctx->next     = NULL;
    init_instance_vtable(ctx, fpGetInstanceProcAddr);
    add_instance(ctx);
 
@@ -152,17 +162,17 @@ static VKAPI_ATTR void VKAPI_CALL
 anti_lag_DestroyInstance(VkInstance instance, const VkAllocationCallbacks *pAllocator)
 {
    instance_data *ctx = remove_instance(instance);
-   if (ctx) {
+   if (LIKELY(ctx)) {
       ctx->vtable.DestroyInstance(instance, pAllocator);
       vk_free(&ctx->alloc, ctx);
    }
 }
 
 typedef struct device_data {
-   VkDevice device;
+   VkDevice                device;
    PFN_vkGetDeviceProcAddr GetDeviceProcAddr;
-   device_context *ctx; /* NULL if anti-lag ext is not enabled. */
-   struct device_data *next;
+   device_context         *ctx;  /* NULL if anti-lag ext is not enabled. */
+   struct device_data     *next;
 } device_data;
 
 static void
@@ -170,11 +180,11 @@ init_device_vtable(device_context *ctx, PFN_vkGetDeviceProcAddr gpa, PFN_vkSetDe
                    bool calibrated_timestamps_khr, bool host_query_reset_ext,
                    bool timeline_semaphore_khr)
 {
-   ctx->vtable.GetDeviceProcAddr = gpa;
+   ctx->vtable.GetDeviceProcAddr   = gpa;
    ctx->vtable.SetDeviceLoaderData = sld;
 #define INIT_HOOK(fn) ctx->vtable.fn = (PFN_vk##fn)gpa(ctx->device, "vk" #fn)
 #define INIT_HOOK_ALIAS(fn, alias, cond)                                                           \
-   ctx->vtable.fn = (PFN_vk##fn)gpa(ctx->device, cond ? "vk" #alias : "vk" #fn)
+   ctx->vtable.fn = (PFN_vk##fn)gpa(ctx->device, (cond) ? "vk" #alias : "vk" #fn)
    INIT_HOOK(DestroyDevice);
    INIT_HOOK(QueueSubmit);
    INIT_HOOK(QueueSubmit2);
@@ -201,17 +211,15 @@ init_device_vtable(device_context *ctx, PFN_vkGetDeviceProcAddr gpa, PFN_vkSetDe
 #undef INIT_HOOK_ALIAS
 }
 
-static simple_mtx_t device_mtx = SIMPLE_MTX_INITIALIZER;
+static simple_mtx_t device_mtx  = SIMPLE_MTX_INITIALIZER;
 static device_data *device_list = NULL;
 
 static void
 add_device(device_data *device)
 {
    simple_mtx_lock(&device_mtx);
-   device_data **ptr = &device_list;
-   while (*ptr != NULL)
-      ptr = &(*ptr)->next;
-   *ptr = device;
+   device->next = device_list;
+   device_list  = device;
    simple_mtx_unlock(&device_mtx);
 }
 
@@ -225,7 +233,8 @@ remove_device(const void *object)
       ptr = &(*ptr)->next;
 
    device_data *ctx = *ptr;
-   *ptr = ctx ? ctx->next : NULL;
+   if (ctx)
+      *ptr = ctx->next;
    simple_mtx_unlock(&device_mtx);
    return ctx;
 }
@@ -269,11 +278,10 @@ should_enable_layer(instance_data *ctx, VkPhysicalDevice physicalDevice,
    if (!ext_feature.antiLag)
       return false;
 
-   /* Ensure that the underlying implementation does not expose VK_AMD_anti_lag itself. */
+   /* Probe the implementation: layer should only attach when the
+    * driver does NOT already expose VK_AMD_anti_lag itself.        */
    ext_feature.antiLag = false;
-
-   /* Don't clobber unrelated pNext chains passed in at device creation time. */
-   ext_feature.pNext = NULL;
+   ext_feature.pNext   = NULL;
 
    VkPhysicalDeviceFeatures2 features = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
@@ -299,15 +307,21 @@ check_calibrated_timestamps(instance_data *data, VkPhysicalDevice physicalDevice
    VkResult res;
    uint32_t count = 0;
    res = data->vtable.EnumerateDeviceExtensionProperties(physicalDevice, NULL, &count, NULL);
+   if (res != VK_SUCCESS || count == 0) {
+      *has_khr = false;
+      return false;
+   }
    VkExtensionProperties *extensions =
       vk_alloc(&data->alloc, count * sizeof(VkExtensionProperties), alignof(VkExtensionProperties),
                VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
-   if (!extensions)
+   if (!extensions) {
+      *has_khr = false;
       return false;
+   }
 
    res |= data->vtable.EnumerateDeviceExtensionProperties(physicalDevice, NULL, &count, extensions);
 
-   *has_khr = false;
+   *has_khr     = false;
    bool has_ext = false;
    if (res == VK_SUCCESS) {
       for (unsigned i = 0; i < count; i++) {
@@ -322,26 +336,23 @@ check_calibrated_timestamps(instance_data *data, VkPhysicalDevice physicalDevice
    return *has_khr || has_ext;
 }
 
-/* Initialize per-queue context:
- *
- * This includes creating one CommandPool and one QueryPool per Queue as well as
- * recording one CommandBuffer per timestamp query.
- */
+/* Initialize per-queue context: one CommandPool, one QueryPool, and one
+ * pre-recorded CommandBuffer per timestamp query.                     */
 static VkResult
 init_queue_context(device_context *ctx, queue_context *queue_ctx)
 {
-#define CHECK_RESULT(res, label)                                                                   \
-   if (res != VK_SUCCESS) {                                                                        \
-      goto label;                                                                                  \
+#define CHECK_RESULT(res, label) \
+   if (res != VK_SUCCESS) {      \
+      goto label;                \
    }
 
    VkResult result;
 
    /* Create command pool */
    struct VkCommandPoolCreateInfo pool_info = {
-      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-      .pNext = NULL,
-      .flags = 0,
+      .sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .pNext            = NULL,
+      .flags            = 0,
       .queueFamilyIndex = queue_ctx->queue_family_idx,
    };
    result =
@@ -350,8 +361,8 @@ init_queue_context(device_context *ctx, queue_context *queue_ctx)
 
    /* Create query pool */
    VkQueryPoolCreateInfo query_pool_info = {
-      .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-      .queryType = VK_QUERY_TYPE_TIMESTAMP,
+      .sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+      .queryType  = VK_QUERY_TYPE_TIMESTAMP,
       .queryCount = MAX_QUERIES,
    };
    result = ctx->vtable.CreateQueryPool(ctx->device, &query_pool_info, &ctx->alloc,
@@ -362,10 +373,10 @@ init_queue_context(device_context *ctx, queue_context *queue_ctx)
 
    /* Create timeline semaphore */
    VkSemaphoreTypeCreateInfo timelineCreateInfo = {
-      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
-      .pNext = NULL,
+      .sType         = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+      .pNext         = NULL,
       .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
-      .initialValue = 0,
+      .initialValue  = 0,
    };
    VkSemaphoreCreateInfo createInfo = {
       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
@@ -381,9 +392,9 @@ init_queue_context(device_context *ctx, queue_context *queue_ctx)
 
       /* Allocate commandBuffer for timestamp. */
       VkCommandBufferAllocateInfo buffer_info = {
-         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-         .commandPool = queue_ctx->cmdPool,
-         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+         .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+         .commandPool        = queue_ctx->cmdPool,
+         .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
          .commandBufferCount = 1,
       };
       result = ctx->vtable.AllocateCommandBuffers(ctx->device, &buffer_info, &query->cmdbuffer);
@@ -398,7 +409,7 @@ init_queue_context(device_context *ctx, queue_context *queue_ctx)
 
       result = ctx->vtable.BeginCommandBuffer(query->cmdbuffer, &beginInfo);
       CHECK_RESULT(result, fail)
-      if (j % 2 == 0)
+      if ((j & 1u) == 0u)
          ctx->vtable.CmdWriteTimestamp(query->cmdbuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                        queue_ctx->queryPool, j);
       else
@@ -421,6 +432,7 @@ fail_cmdpool:
    for (queue_context *qctx = ctx->queues; qctx != queue_ctx; qctx++) {
       ctx->vtable.DestroyQueryPool(ctx->device, qctx->queryPool, &ctx->alloc);
       ctx->vtable.DestroyCommandPool(ctx->device, qctx->cmdPool, &ctx->alloc);
+      ctx->vtable.DestroySemaphore(ctx->device, qctx->semaphore, &ctx->alloc);
    }
 
    return result;
@@ -437,17 +449,17 @@ anti_lag_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo 
       chain_info->u.pLayerInfo->pfnNextGetInstanceProcAddr;
    PFN_vkCreateDevice fpCreateDevice =
       (PFN_vkCreateDevice)fpGetInstanceProcAddr(instance_ctx->instance, "vkCreateDevice");
-   if (fpCreateDevice == NULL)
+   if (UNLIKELY(fpCreateDevice == NULL))
       return VK_ERROR_INITIALIZATION_FAILED;
 
    /* Advance the link info for the next element on the chain. */
    chain_info->u.pLayerInfo = chain_info->u.pLayerInfo->pNext;
 
    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &instance_ctx->alloc;
-   device_data *data;
+   device_data *data = NULL;
    VkResult result;
 
-   /*  Only allocate a context and add to dispatch if the extension is enabled. */
+   /* Only allocate a context and add to dispatch if the extension is enabled. */
    const VkPhysicalDeviceAntiLagFeaturesAMD *ext_features =
       vk_find_struct_const(pCreateInfo->pNext, PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD);
    bool enable = ext_features && should_enable_layer(instance_ctx, physicalDevice, *ext_features);
@@ -455,7 +467,7 @@ anti_lag_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo 
       /* Count queues with sufficient timestamp valid bits. */
       // TODO: make it work with less than 64 valid bits
       unsigned num_queue_families = 0;
-      unsigned num_queues = 0;
+      unsigned num_queues         = 0;
       for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++)
          num_queue_families =
             MAX2(num_queue_families, pCreateInfo->pQueueCreateInfos[i].queueFamilyIndex + 1);
@@ -478,29 +490,30 @@ anti_lag_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo 
 
       /* Allocate the context. */
       device_context *ctx;
-      queue_context *queues;
+      queue_context  *queues;
       VK_MULTIALLOC(ma);
-      vk_multialloc_add(&ma, &data, device_data, 1);
-      vk_multialloc_add(&ma, &ctx, struct device_context, 1);
-      vk_multialloc_add(&ma, &queues, queue_context, num_queues);
+      vk_multialloc_add(&ma, &data,   device_data,           1);
+      vk_multialloc_add(&ma, &ctx,    struct device_context, 1);
+      vk_multialloc_add(&ma, &queues, queue_context,         num_queues);
       void *buf = vk_multialloc_zalloc(&ma, alloc, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
       if (!buf) {
          vk_free(alloc, queue_family_props);
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
+      (void)queues; /* placement via VK_MULTIALLOC; addressed through ctx->queues[] */
 
       VkPhysicalDeviceProperties properties;
       instance_ctx->vtable.GetPhysicalDeviceProperties(physicalDevice, &properties);
 
       /* Ensure that calibrated timestamps and host query reset extensions are enabled. */
-      bool has_calibrated_timestamps = false;
-      bool has_calibrated_timestamps_khr = false;
-      bool has_vk12 = instance_ctx->apiVersion >= VK_API_VERSION_1_2 &&
-                      properties.apiVersion >= VK_API_VERSION_1_2;
-      bool has_host_query_reset = has_vk12;
-      bool has_host_query_reset_ext = false;
-      bool has_timeline_semaphore = has_vk12;
-      bool has_timeline_semaphore_khr = false;
+      bool has_calibrated_timestamps      = false;
+      bool has_calibrated_timestamps_khr  = false;
+      bool has_vk12                       = instance_ctx->apiVersion >= VK_API_VERSION_1_2 &&
+                                            properties.apiVersion    >= VK_API_VERSION_1_2;
+      bool has_host_query_reset           = has_vk12;
+      bool has_host_query_reset_ext       = false;
+      bool has_timeline_semaphore         = has_vk12;
+      bool has_timeline_semaphore_khr     = false;
       for (unsigned i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
          if (strcmp(pCreateInfo->ppEnabledExtensionNames[i],
                     VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0)
@@ -559,12 +572,12 @@ anti_lag_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo 
          vk_find_struct_const(pCreateInfo->pNext, PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES);
       const VkPhysicalDeviceTimelineSemaphoreFeatures *timeline_semaphore =
          vk_find_struct_const(pCreateInfo->pNext, PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES);
-      uint32_t prev_hostQueryReset;
-      uint32_t prev_timelineSemaphore;
+      uint32_t prev_hostQueryReset    = VK_FALSE;
+      uint32_t prev_timelineSemaphore = VK_FALSE;
       if (vk12) {
-         prev_hostQueryReset = vk12->hostQueryReset;
+         prev_hostQueryReset    = vk12->hostQueryReset;
          prev_timelineSemaphore = vk12->timelineSemaphore;
-         ((VkPhysicalDeviceVulkan12Features *)vk12)->hostQueryReset = VK_TRUE;
+         ((VkPhysicalDeviceVulkan12Features *)vk12)->hostQueryReset    = VK_TRUE;
          ((VkPhysicalDeviceVulkan12Features *)vk12)->timelineSemaphore = VK_TRUE;
       } else {
          if (query_reset) {
@@ -574,8 +587,8 @@ anti_lag_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo 
             VkPhysicalDeviceHostQueryResetFeatures *feat =
                alloca(sizeof(VkPhysicalDeviceHostQueryResetFeatures));
             *feat = (VkPhysicalDeviceHostQueryResetFeatures){
-               .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES,
-               .pNext = (void *)create_info.pNext,
+               .sType          = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES,
+               .pNext          = (void *)create_info.pNext,
                .hostQueryReset = VK_TRUE,
             };
             create_info.pNext = feat;
@@ -588,8 +601,8 @@ anti_lag_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo 
             VkPhysicalDeviceTimelineSemaphoreFeatures *feat =
                alloca(sizeof(VkPhysicalDeviceTimelineSemaphoreFeatures));
             *feat = (VkPhysicalDeviceTimelineSemaphoreFeatures){
-               .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
-               .pNext = (void *)create_info.pNext,
+               .sType             = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
+               .pNext             = (void *)create_info.pNext,
                .timelineSemaphore = VK_TRUE,
             };
             create_info.pNext = feat;
@@ -600,7 +613,7 @@ anti_lag_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo 
       result = fpCreateDevice(physicalDevice, &create_info, pAllocator, pDevice);
 
       if (vk12) {
-         ((VkPhysicalDeviceVulkan12Features *)vk12)->hostQueryReset = prev_hostQueryReset;
+         ((VkPhysicalDeviceVulkan12Features *)vk12)->hostQueryReset    = prev_hostQueryReset;
          ((VkPhysicalDeviceVulkan12Features *)vk12)->timelineSemaphore = prev_timelineSemaphore;
       } else {
          if (query_reset)
@@ -617,28 +630,31 @@ anti_lag_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo 
          goto fail;
 
       /* Initialize Context. */
-      data->ctx = ctx;
-      ctx->device = *pDevice;
-      chain_info = get_device_chain_info(pCreateInfo, VK_LOADER_DATA_CALLBACK);
+      data->ctx                       = ctx;
+      ctx->device                     = *pDevice;
+      chain_info                      = get_device_chain_info(pCreateInfo, VK_LOADER_DATA_CALLBACK);
       PFN_vkSetDeviceLoaderData fpSetDeviceLoaderData =
          (PFN_vkSetDeviceLoaderData)chain_info->u.pfnSetDeviceLoaderData;
       init_device_vtable(ctx, fpGetDeviceProcAddr, fpSetDeviceLoaderData,
                          has_calibrated_timestamps_khr, has_host_query_reset_ext,
                          has_timeline_semaphore_khr);
       simple_mtx_init(&ctx->mtx, mtx_plain);
-      ctx->num_queues = num_queues;
-      ctx->alloc = *alloc;
-      ctx->calibration.timestamp_period = properties.limits.timestampPeriod;
+      ctx->num_queues                 = num_queues;
+      ctx->alloc                      = *alloc;
+      /* Explicit cast silences -Wdouble-promotion (float → double). */
+      ctx->calibration.timestamp_period = (double)properties.limits.timestampPeriod;
+      ctx->avg_frame_time             = (uint64_t)ONE_MS;
       ringbuffer_init(ctx->frames);
 
       /* Initialize Queue contexts. */
       unsigned idx = 0;
       for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
          /* Skip queue families without sufficient timestamp valid bits.
-          * Also skip queue families which cannot do GRAPHICS or COMPUTE since they
-          * always heavily async in nature (DMA transfers and sparse for example).
-          * Video is also irrelvant here since it should never be a critical path
-          * in a game that wants anti-lag. */
+          * Also skip queue families which cannot do GRAPHICS or COMPUTE
+          * since they are always heavily async in nature (DMA transfers
+          * and sparse for example).  Video is also irrelevant here since
+          * it should never be a critical path in a game that wants
+          * anti-lag.                                                  */
          uint32_t queue_family_idx = pCreateInfo->pQueueCreateInfos[i].queueFamilyIndex;
          if (queue_family_props[queue_family_idx].timestampValidBits != 64 ||
              !(queue_family_props[queue_family_idx].queueFlags &
@@ -648,7 +664,7 @@ anti_lag_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo 
          for (unsigned j = 0; j < pCreateInfo->pQueueCreateInfos[i].queueCount; j++) {
             VkQueue queue;
             ctx->vtable.GetDeviceQueue(*pDevice, queue_family_idx, j, &queue);
-            ctx->queues[idx].queue = queue;
+            ctx->queues[idx].queue            = queue;
             ctx->queues[idx].queue_family_idx = queue_family_idx;
             result = init_queue_context(ctx, &ctx->queues[idx]);
             idx++;
@@ -664,14 +680,14 @@ anti_lag_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo 
                                      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
       if (!data)
          return VK_ERROR_OUT_OF_HOST_MEMORY;
-      result = fpCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
-      data->ctx = NULL;
+      result        = fpCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
+      data->ctx     = NULL;
    }
 
    if (result == VK_SUCCESS) {
-      data->device = *pDevice;
+      data->device            = *pDevice;
       data->GetDeviceProcAddr = fpGetDeviceProcAddr;
-      data->next = NULL;
+      data->next              = NULL;
       add_device(data);
    } else {
       vk_free(alloc, data);
@@ -688,8 +704,7 @@ anti_lag_DestroyDevice(VkDevice pDevice, const VkAllocationCallbacks *pAllocator
    device_context *ctx = data->ctx;
 
    /* Destroy per-queue context.
-    * The application must ensure that no work is active on the device.
-    */
+    * The application must ensure that no work is active on the device. */
    for (unsigned i = 0; i < ctx->num_queues; i++) {
       queue_context *queue_ctx = &ctx->queues[i];
       ctx->vtable.DestroyQueryPool(ctx->device, queue_ctx->queryPool, &ctx->alloc);
@@ -707,7 +722,7 @@ is_anti_lag_supported(VkPhysicalDevice physicalDevice)
    instance_data *data = get_instance_data(physicalDevice);
    VkPhysicalDeviceProperties properties;
    data->vtable.GetPhysicalDeviceProperties(physicalDevice, &properties);
-   if (properties.limits.timestampPeriod == 0.0 || !properties.limits.timestampComputeAndGraphics)
+   if (properties.limits.timestampPeriod == 0.0f || !properties.limits.timestampComputeAndGraphics)
       return false;
 
    /* Check whether calibrated timestamps are supported. */
@@ -717,12 +732,12 @@ is_anti_lag_supported(VkPhysicalDevice physicalDevice)
 
    /* Check whether timeline semaphores and host query reset are supported. */
    VkPhysicalDeviceTimelineSemaphoreFeatures timeline_semaphore = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
+      .sType             = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
       .timelineSemaphore = VK_FALSE,
    };
    VkPhysicalDeviceHostQueryResetFeatures query_reset = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES,
-      .pNext = &timeline_semaphore,
+      .sType          = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES,
+      .pNext          = &timeline_semaphore,
       .hostQueryReset = VK_FALSE,
    };
    VkPhysicalDeviceFeatures2 features = {
@@ -743,16 +758,18 @@ is_anti_lag_supported(VkPhysicalDevice physicalDevice)
       has_khr ? data->vtable.GetPhysicalDeviceCalibrateableTimeDomainsKHR
               : data->vtable.GetPhysicalDeviceCalibrateableTimeDomainsEXT;
    res = ctd(physicalDevice, &count, NULL);
+   if (res != VK_SUCCESS || count == 0)
+      return false;
    VkTimeDomainKHR *time_domains = alloca(count * sizeof(VkTimeDomainKHR));
    res |= ctd(physicalDevice, &count, time_domains);
    if (res != VK_SUCCESS)
       return false;
 
    bool has_device_domain = false;
-   bool has_host_domain = false;
+   bool has_host_domain   = false;
    for (unsigned i = 0; i < count; i++) {
       has_device_domain |= time_domains[i] == VK_TIME_DOMAIN_DEVICE_KHR;
-      has_host_domain |= time_domains[i] == VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+      has_host_domain   |= time_domains[i] == VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
    }
 
    return has_device_domain && has_host_domain;
@@ -820,7 +837,7 @@ anti_lag_GetDeviceProcAddr(VkDevice device, const char *pName);
 
 #define ADD_HOOK(fn) {"vk" #fn, (PFN_vkVoidFunction)anti_lag_##fn}
 static const struct {
-   const char *name;
+   const char       *name;
    PFN_vkVoidFunction ptr;
 } instance_funcptr_map[] = {
    ADD_HOOK(GetInstanceProcAddr),
@@ -833,7 +850,7 @@ static const struct {
 };
 
 static const struct {
-   const char *name;
+   const char       *name;
    PFN_vkVoidFunction ptr;
 } device_funcptr_map[] = {
    ADD_HOOK(GetDeviceProcAddr),
@@ -849,7 +866,7 @@ static const struct {
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 anti_lag_GetInstanceProcAddr(VkInstance instance, const char *pName)
 {
-   if (!pName)
+   if (UNLIKELY(!pName))
       return NULL;
 
    PFN_vkVoidFunction result = NULL;
@@ -860,8 +877,7 @@ anti_lag_GetInstanceProcAddr(VkInstance instance, const char *pName)
    }
 
    /* Only hook instance functions which are exposed by the underlying impl.
-    * Ignore instance parameter for vkCreateInstance and vkCreateDevice.
-    */
+    * Ignore instance parameter for vkCreateInstance and vkCreateDevice.   */
    if (result || strcmp(pName, "vkCreateInstance") == 0 || strcmp(pName, "vkCreateDevice") == 0) {
       for (uint32_t i = 0; i < ARRAY_SIZE(instance_funcptr_map); i++) {
          if (strcmp(pName, instance_funcptr_map[i].name) == 0)
@@ -875,7 +891,7 @@ anti_lag_GetInstanceProcAddr(VkInstance instance, const char *pName)
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 anti_lag_GetDeviceProcAddr(VkDevice device, const char *pName)
 {
-   if (!pName || !device)
+   if (UNLIKELY(!pName || !device))
       return NULL;
 
    device_data *data = get_device_data(device);
@@ -900,8 +916,8 @@ anti_lag_NegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface *pVersio
 
    if (pVersionStruct->loaderLayerInterfaceVersion >= 2) {
       pVersionStruct->loaderLayerInterfaceVersion = 2;
-      pVersionStruct->pfnGetInstanceProcAddr = anti_lag_GetInstanceProcAddr;
-      pVersionStruct->pfnGetDeviceProcAddr = anti_lag_GetDeviceProcAddr;
+      pVersionStruct->pfnGetInstanceProcAddr      = anti_lag_GetInstanceProcAddr;
+      pVersionStruct->pfnGetDeviceProcAddr        = anti_lag_GetDeviceProcAddr;
       pVersionStruct->pfnGetPhysicalDeviceProcAddr = NULL;
    }
 
