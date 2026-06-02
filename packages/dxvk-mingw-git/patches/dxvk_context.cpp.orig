@@ -2340,12 +2340,17 @@ namespace dxvk {
 
       // Enable tracking so that we don't unnecessarily hit slow paths in the future
       if (dstImage->info().stages & graphicsStages)
-        dstImage->trackGfxStores();
+        needsNewBackingStorage |= !dstImage->trackGfxStores();
 
       if (needsNewBackingStorage) {
         auto imageSubresource = dstImage->getAvailableSubresources();
 
         if (dstSubresource != imageSubresource || !isFullWrite || !dstImage->canRelocate())
+          continue;
+
+        // On desktop there's no real point in allocating extra memory, just do
+        // the resolve late instead.
+        if (!m_device->perfHints().preferRenderPassOps)
           continue;
 
         // Allocate and assign new backing storage. Deliberately don't go through
@@ -4256,7 +4261,7 @@ namespace dxvk {
       auto& dstAccess = accessBatch.emplace_back(*dstImage, dstSubresourceRange, dstImageLayout,
         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
         dstImage->isFullSubresource(dstSubresource, extent));
-      dstAccess.imageOffset = srcOffset;
+      dstAccess.imageOffset = dstOffset;
       dstAccess.imageExtent = extent;
 
       auto& srcAccess = accessBatch.emplace_back(*srcImage, srcSubresourceRange, srcImageLayout,
