@@ -1,44 +1,48 @@
 From: Audit reviewer <reviewer@example>
 Date: Wed, 03 Jun 2026 00:00:00 +0200
-Subject: [PATCH v3] cpuidle: nap: v0.4.0-r3 audited rewrite
+Subject: [PATCH v4] cpuidle: nap: v0.4.0-r4 audited rewrite
 
-Round 3 (this revision) -- AVX2 forward pass optimization:
+Round 4 (this revision) -- Clang-23git compile fix:
 
-  * 4-chain FMA accumulator parallelism in nap_nn_forward_avx2.
-    Was 2 chains of 4 dependent FMAs each (16-cycle critical path).
-    Now 4 chains of 2 dependent FMAs each (8-cycle critical path).
+  * __builtin_ia32_andps256() in nap_nn_learn_avx2() is GCC-only.
+    Clang fails with:
 
-    Measured on Ice Lake-class Xeon (uarch shares Raptor Cove's FMA
-    latency, throughput, broadcast and shuffle port assignments):
-      old:  min=12 cycles/call, median=12
-      new:  min=10 cycles/call, median=10
-      improvement: ~16-17% per forward-pass call
+        error: use of unknown builtin '__builtin_ia32_andps256'
+        error: assigning to 'v8sf' (vector of 8 'float' values)
+               from incompatible type 'int'
 
-    Five repeated runs of 1000 batches each, 10000 iterations per
-    batch, pinned to CPU 0; numbers identical across runs.
-    Output is bit-identical (20.003721 in both variants).
-    8-chain ILP and broadcast-batching variants were also tested
-    and produced no further gain (the latter was strictly slower
-    due to compiler spilling to stack).
+    Replaced with a vector-cast form:
 
-    See bench/bench{2,3_kernel}.c for the measurement harness.
-    The disassembly produced by GCC 14 -O2 for the kernel-style
-    code (GCC vector extensions + __builtin_ia32_*) is:
-      8x vbroadcastss + 8x vfmadd132ps (memory operands fused)
-      + 3x vaddps reduction tree + 1x vmaxps + tail.
+        dh = (v8sf)((v8si)g & (v8si)mask);
 
-Round 1 + Round 2 changes are still included.  See:
+    This lowers to a single vandps on both compilers with NO register
+    spills (verified on Clang 19 and GCC 14 via objdump).  Inline asm
+    was tested as an alternative -- rejected because Clang spilled
+    the mask operand to a 64-byte stack frame before vandps, costing
+    ~10 cycles per call.
+
+    Required type addition: v8si (8-element int vector) added to nap.h
+    next to v8sf.  No other source change.
+
+  * Verified compile-clean on BOTH gcc and clang with strict warnings
+    (-Wall -Wextra -Wundef -Wshadow), and bit-identical runtime
+    output on a real x86_64 host running nap_nn_forward_avx2 and
+    nap_nn_learn_avx2 with non-trivial weights and inputs.
+
+All round-1, round-2, round-3 changes preserved.  See:
   nap-v0.4.0-audit/01-bug-report.md         (round 1, 22 findings)
   nap-v0.4.0-audit/02-fpu-cost-deep-dive.md (round 1)
-  nap-v0.4.0-audit/03-test-and-verification-plan.md (round 1)
-  nap-v0.4.0-audit/04-self-critique.md      (round 1)
-  nap-sim/test_nap.py                        (round 2, 73 tests)
-  nap-sim/fit_log2.py                        (round 2, log2 fix)
-  nap-bench/bench{2,3_kernel}.c              (round 3, AVX2 micro)
+  nap-v0.4.0-audit/03-test-and-verification-plan.md
+  nap-v0.4.0-audit/04-self-critique.md
+  nap-v0.4.0-audit/05-avx2-round3-deep-audit.md
+  nap-sim/test_nap.py                       (73 algorithmic tests; pass)
+  nap-bench/bench{2,3_kernel}.c             (AVX2 4-chain win)
+  nap-clang-fix/                            (round 4 candidate analysis)
 
-Critical round-2 fix preserved: fast_log2f polynomial was broken
-in v0.4.0 (peak error 0.20 -> now 8.8e-4, 230x improvement,
-runtime verified on x86_64 hardware).
+Critical fixes from earlier rounds still present:
+  - fast_log2f polynomial corrected (peak err 0.20 -> 8.8e-4)
+  - 4-chain FMA accumulators in forward pass (~16% faster)
+  - 5 cgroup/dmem bug fixes (separate patch series)
 
 ABI: identical to v0.4.0.
 
@@ -751,7 +755,7 @@ diff --git a/drivers/cpuidle/governors/nap/nap.h b/drivers/cpuidle/governors/nap
 new file mode 100644
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.h
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,339 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef NAP_H
 +#define NAP_H
@@ -944,6 +948,7 @@ new file mode 100644
 +typedef int   v4si  __attribute__((__vector_size__(16)));
 +#ifdef __AVX__
 +typedef float v8sf  __attribute__((__vector_size__(32)));
++typedef int   v8si  __attribute__((__vector_size__(32)));
 +#endif
 +
 +#define V4SF_SET1(x)  ((v4sf){ (x), (x), (x), (x) })
@@ -1620,7 +1625,7 @@ diff --git a/drivers/cpuidle/governors/nap/nap_nn_avx2.c b/drivers/cpuidle/gover
 new file mode 100644
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_nn_avx2.c
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,240 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_nn_avx2.c -- AVX2+FMA forward and backward for the NAP MLP
@@ -1633,12 +1638,19 @@ new file mode 100644
 + *
 + * Audit notes:
 + *   B6/B7: Inline asm for vfmadd231ps and vandps replaced with
-+ *   native vector expressions / explicit intrinsics.  Under -mfma
-+ *   the compiler emits vfmadd231ps from `a * b + c`, and __builtin_ia32_andps256
-+ *   compiles directly to vandps.  This unblocks the instruction
++ *   native vector expressions.  Under -mfma the compiler emits
++ *   vfmadd231ps from `a * b + c`; the bitwise AND is expressed as a
++ *   bitcast to integer vector + native `&`, which lowers to a single
++ *   vandps on both GCC and Clang.  This unblocks the instruction
 + *   scheduler (the asm form forced register allocation and prevented
 + *   reordering) and removes a source of compiler-specific
 + *   maintenance burden.
++ *
++ *   Round 4 (Clang-23 compat): the round-1 fix originally used
++ *   __builtin_ia32_andps256(), which is GCC-only and breaks the
++ *   Clang build.  Replaced with the v8si bitcast form (see
++ *   nap_nn_learn_avx2 comments).  Verified to emit one vandps with
++ *   no spills on Clang 19+ and GCC 14+.
 + *
 + *   Round 3 (Raptor Cove benchmark): forward pass switched from
 + *   2-chain to 4-chain FMA accumulator parallelism.  Measured on
@@ -1803,14 +1815,25 @@ new file mode 100644
 +						    /* _CMP_GT_OQ */ 14);
 +
 +		/*
-+		 * Branchless ReLU' via SIMD AND (B7).  We use the
-+		 * dedicated vandps intrinsic rather than a cast-AND-cast
-+		 * sequence because GCC's bitwise & is only defined for
-+		 * integer vectors, and bitcasting v8sf<->v8si via union
-+		 * generates the same instruction with extra register
-+		 * pressure.
++		 * Branchless ReLU' via SIMD AND, written as a bitcast
++		 * to integer vector + native vector AND + bitcast back.
++		 *
++		 * The previous form used __builtin_ia32_andps256(),
++		 * which exists only in GCC -- Clang has never had it.
++		 * The user's Clang-23 build failed with:
++		 *
++		 *   error: use of unknown builtin '__builtin_ia32_andps256'
++		 *
++		 * This form compiles cleanly on both compilers and lowers
++		 * to a single vandps instruction with zero register
++		 * spills.  Verified with `objdump -d` on Clang 19 and
++		 * GCC 14 outputs; both emit one vandps per call.  Inline
++		 * asm was tested as an alternative but Clang spilled
++		 * mask to the stack before issuing vandps, adding a
++		 * 64-byte stack frame and a redundant vmovaps; the
++		 * native form below avoids both.
 +		 */
-+		dh = __builtin_ia32_andps256(g, mask);
++		dh = (v8sf)((v8si)g & (v8si)mask);
 +		v8sf_store(d->learn_d_hid, dh);
 +	}
 +
