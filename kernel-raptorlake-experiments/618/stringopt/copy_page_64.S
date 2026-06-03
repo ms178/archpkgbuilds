@@ -2,10 +2,10 @@
 /*
  * copy_page - 4 KiB page copy
  *
- * Raptor Lake policy:
- *  - Public fast path uses REP MOVSB when X86_FEATURE_REP_GOOD patches out
- *    the fallback branch.  On the i7-14700KF this routes the fixed 4096-byte
- *    copy through the enhanced fast-string engine without using SIMD/FPU state.
+ * Raptor Lake v5 policy:
+ *  - Public fast path uses REP MOVSQ when X86_FEATURE_REP_GOOD patches out
+ *    the fallback branch.  User P/E-core measurements did not show a win for
+ *    changing the vanilla page-copy fast path to REP MOVSB.
  *  - The scalar fallback is only for CPUs without REP_GOOD.  It avoids stack
  *    traffic and callee-saved registers, using only caller-saved temporaries.
  */
@@ -21,8 +21,8 @@
 	ALIGN
 SYM_TYPED_FUNC_START(copy_page)
 	ALTERNATIVE "jmp copy_page_regs", "", X86_FEATURE_REP_GOOD
-	movl	$4096, %ecx
-	rep	movsb
+	movl	$4096/8, %ecx
+	rep	movsq
 	RET
 SYM_FUNC_END(copy_page)
 EXPORT_SYMBOL(copy_page)

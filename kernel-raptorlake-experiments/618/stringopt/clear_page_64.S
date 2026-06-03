@@ -8,14 +8,14 @@
 /*
  * x86-64 page clearing and clear_user backend.
  *
- * Raptor Lake notes:
+ * Raptor Lake final notes:
  *  - clear_page_erms remains REP STOSB for the ERMS fast-string path.
  *  - clear_page_rep remains REP STOSQ for the legacy fast-string selector.
  *  - clear_page_orig is stackless and uses only caller-saved registers.
- *  - rep_stos_alternative keeps precise clear_user residual semantics while
- *    reducing branch overhead for the common 16..63 byte range with a safe
- *    two-qword loop.  Fault fixups intentionally fall back to byte probing;
- *    bytes may be cleared twice, but RCX is precise on exit.
+ *  - rep_stos_alternative intentionally keeps the vanilla low-latency scalar
+ *    logic.  Multiple measured custom attempts regressed E-core short clears;
+ *    the best production optimization is therefore to leave this sensitive
+ *    clear_user residual-accounting helper on the measured no-regression path.
  */
 
 /*
@@ -73,13 +73,9 @@ SYM_FUNC_START(rep_stos_alternative)
 	cmpq	$64, %rcx
 	jae	.Lunrolled
 
-	cmpq	$8, %rcx
-	jb	.Lmaybe_tail
-	cmpq	$16, %rcx
-	jae	.Lword2
-	jmp	.Lword
+	cmp	$8, %ecx
+	jae	.Lword
 
-.Lmaybe_tail:
 	testl	%ecx, %ecx
 	je	.Lexit
 
@@ -93,25 +89,13 @@ SYM_FUNC_START(rep_stos_alternative)
 
 	_ASM_EXTABLE_UA(0b, .Lexit)
 
-	.p2align 4
-.Lword2:
-2:	movq	%rax, (%rdi)
-3:	movq	%rax, 8(%rdi)
-	addq	$16, %rdi
-	subq	$16, %rcx
-	cmpq	$16, %rcx
-	jae	.Lword2
-	cmpq	$8, %rcx
-	jae	.Lword
-	testl	%ecx, %ecx
-	jne	.Lclear_user_tail
-	RET
-
 .Lword:
 1:	movq	%rax, (%rdi)
 	addq	$8, %rdi
-	subq	$8, %rcx
+	sub	$8, %ecx
 	je	.Lexit
+	cmp	$8, %ecx
+	jae	.Lword
 	jmp	.Lclear_user_tail
 
 	.p2align 4
@@ -128,23 +112,19 @@ SYM_FUNC_START(rep_stos_alternative)
 	subq	$64, %rcx
 	cmpq	$64, %rcx
 	jae	.Lunrolled
-	cmpq	$16, %rcx
-	jae	.Lword2
-	cmpq	$8, %rcx
+	cmpl	$8, %ecx
 	jae	.Lword
 	testl	%ecx, %ecx
 	jne	.Lclear_user_tail
 	RET
 
 	/*
-	 * If we take an exception on any of the word stores, RCX still
-	 * describes the not-yet-accounted range for the current chunk.  Fall
-	 * back to byte probing for an exact residual.  Some already-cleared
-	 * bytes can be stored twice; this matches the original semantics.
+	 * If we take an exception on any of the word stores, we know that
+	 * %rcx is non-zero, so fall back to byte clearing for the exact count.
+	 * The unrolled case may clear some bytes twice; this is the original
+	 * helper's documented/accepted behavior.
 	 */
 	_ASM_EXTABLE_UA(1b, .Lclear_user_tail)
-	_ASM_EXTABLE_UA(2b, .Lclear_user_tail)
-	_ASM_EXTABLE_UA(3b, .Lclear_user_tail)
 	_ASM_EXTABLE_UA(10b, .Lclear_user_tail)
 	_ASM_EXTABLE_UA(11b, .Lclear_user_tail)
 	_ASM_EXTABLE_UA(12b, .Lclear_user_tail)

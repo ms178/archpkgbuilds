@@ -6,12 +6,13 @@
  * Functions to copy from and to user space.
  *
  * Raptor Lake notes:
+ *  - 0..15 bytes are laid out as the vanilla tiny path: the 8..15 byte
+ *    qword copy is fall-through after the size tests, avoiding the extra
+ *    taken branch that showed up as an 8-byte regression on E-cores.
+ *  - 16..63 bytes use a correct 2xqword loop.  The steady-state loop keeps
+ *    pointer/count state precise after each committed 16-byte chunk.
  *  - >=64 bytes uses the existing ERMS alternative and is patched to
  *    REP MOVSB on the i7-14700KF.
- *  - 16..63 bytes use a correct 2xqword loop.  Each memory access has an
- *    exception-table entry that falls back to byte probing with RCX still
- *    describing the not-yet-committed chunk, preserving precise residuals.
- *  - 8..15 bytes use the upstream single-qword path to avoid over-reading.
  */
 
 #include <linux/export.h>
@@ -41,28 +42,17 @@
  */
 SYM_FUNC_START(rep_movs_alternative)
 	ANNOTATE_NOENDBR
-	cmpq	$64, %rcx
-	jae	.Llarge
-
+	cmp	$8, %ecx
+	jb	.Llt8
 	cmpq	$16, %rcx
-	jb	.Lword_or_tail
+	jae	.Lge16
 
-	.p2align 4
-.Lqword2:
-0:	movq	(%rsi), %rax
-1:	movq	%rax, (%rdi)
-2:	movq	8(%rsi), %rax
-3:	movq	%rax, 8(%rdi)
-	addq	$16, %rsi
-	addq	$16, %rdi
-	subq	$16, %rcx
-	cmpq	$16, %rcx
-	jae	.Lqword2
-
-.Lword_or_tail:
-	cmpq	$8, %rcx
-	jae	.Lword
-	testl	%ecx, %ecx
+	/* 8..15 bytes: vanilla-shaped qword + byte tail path. */
+6:	movq	(%rsi), %rax
+7:	movq	%rax, (%rdi)
+	addq	$8, %rsi
+	addq	$8, %rdi
+	subq	$8, %rcx
 	je	.Lexit
 
 .Lcopy_user_tail:
@@ -75,23 +65,38 @@ SYM_FUNC_START(rep_movs_alternative)
 .Lexit:
 	RET
 
+.Llt8:
+	testl	%ecx, %ecx
+	jne	.Lcopy_user_tail
+	RET
+
+	.p2align 4
+.Lge16:
+	cmpq	$64, %rcx
+	jae	.Llarge
+
+.Lqword2:
+0:	movq	(%rsi), %rax
+1:	movq	%rax, (%rdi)
+2:	movq	8(%rsi), %rax
+3:	movq	%rax, 8(%rdi)
+	addq	$16, %rsi
+	addq	$16, %rdi
+	subq	$16, %rcx
+	cmpq	$16, %rcx
+	jae	.Lqword2
+	cmpq	$8, %rcx
+	jae	6b
+	testl	%ecx, %ecx
+	jne	.Lcopy_user_tail
+	RET
+
 	_ASM_EXTABLE_UA(0b, .Lcopy_user_tail)
 	_ASM_EXTABLE_UA(1b, .Lcopy_user_tail)
 	_ASM_EXTABLE_UA(2b, .Lcopy_user_tail)
 	_ASM_EXTABLE_UA(3b, .Lcopy_user_tail)
 	_ASM_EXTABLE_UA(4b, .Lexit)
 	_ASM_EXTABLE_UA(5b, .Lexit)
-
-	.p2align 4
-.Lword:
-6:	movq	(%rsi), %rax
-7:	movq	%rax, (%rdi)
-	addq	$8, %rsi
-	addq	$8, %rdi
-	subq	$8, %rcx
-	je	.Lexit
-	jmp	.Lcopy_user_tail
-
 	_ASM_EXTABLE_UA(6b, .Lcopy_user_tail)
 	_ASM_EXTABLE_UA(7b, .Lcopy_user_tail)
 

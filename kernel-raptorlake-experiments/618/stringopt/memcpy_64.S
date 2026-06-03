@@ -14,9 +14,10 @@
  *   rdi = dst, rsi = src, rdx = len, returns rax = dst
  *
  * Raptor Lake FSRM path:
- *   - <=32 bytes use bounded first/last scalar copies to avoid REP startup.
- *   - >32 bytes use REP MOVSB, preserving the enhanced fast-string path for
- *     the sizes where the hardware engine wins.
+ *   - <=64 bytes use bounded first/last scalar copies.  The user's P/E-core
+ *     measurements showed scalar copies beating REP MOVSB through 64 bytes.
+ *   - >64 bytes use REP MOVSB, preserving the enhanced fast-string path for
+ *     larger copies.
  * memcpy overlap remains undefined, as required by the C API.
  */
 SYM_TYPED_FUNC_START(__memcpy)
@@ -26,9 +27,11 @@ SYM_TYPED_FUNC_START(__memcpy)
 	movq	%rdi, %rax
 	testq	%rdx, %rdx
 	je	.Lmemcpy_done
-	cmpq	$32, %rdx
+	cmpq	$64, %rdx
 	ja	.Lmemcpy_rep
 
+	cmpq	$32, %rdx
+	ja	.Lmemcpy_33_64
 	cmpq	$16, %rdx
 	ja	.Lmemcpy_17_32
 	cmpq	$8, %rdx
@@ -75,6 +78,25 @@ SYM_TYPED_FUNC_START(__memcpy)
 	movq	-8(%rsi,%rdx), %r10
 	movq	%rcx, (%rdi)
 	movq	%r8, 8(%rdi)
+	movq	%r9, -16(%rdi,%rdx)
+	movq	%r10, -8(%rdi,%rdx)
+	RET
+
+.Lmemcpy_33_64:
+	movq	(%rsi), %rcx
+	movq	8(%rsi), %r8
+	movq	16(%rsi), %r9
+	movq	24(%rsi), %r10
+	movq	%rcx, (%rdi)
+	movq	%r8, 8(%rdi)
+	movq	%r9, 16(%rdi)
+	movq	%r10, 24(%rdi)
+	movq	-32(%rsi,%rdx), %rcx
+	movq	-24(%rsi,%rdx), %r8
+	movq	-16(%rsi,%rdx), %r9
+	movq	-8(%rsi,%rdx), %r10
+	movq	%rcx, -32(%rdi,%rdx)
+	movq	%r8, -24(%rdi,%rdx)
 	movq	%r9, -16(%rdi,%rdx)
 	movq	%r10, -8(%rdi,%rdx)
 	RET
