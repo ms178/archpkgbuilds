@@ -1,113 +1,137 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * rep_movs_alternative - fast user copy with precise exceptions
+ * Copyright 2008 Vitaly Mayatskikh <vmayatsk@redhat.com>
+ * Copyright 2002 Andi Kleen, SuSE Labs.
  *
- * Tuned for Intel Raptor Lake (i7-14700KF, 8P+8E, ERMS+FSRM)
- *  - Input:  rdi=dst, rsi=src, rcx=len  (rcx returned = bytes not copied)
- *  - Gaming workload: 70% of calls are 16-128B (amdgpu command buffers)
- *  - No FPU/SIMD: runs in atomic context, must not corrupt XMM/YMM
- *  - DF=0 on entry/exit (kernel ABI)
+ * Functions to copy from and to user space.
+ *
+ * Raptor Lake notes:
+ *  - >=64 bytes uses the existing ERMS alternative and is patched to
+ *    REP MOVSB on the i7-14700KF.
+ *  - 16..63 bytes use a correct 2xqword loop.  Each memory access has an
+ *    exception-table entry that falls back to byte probing with RCX still
+ *    describing the not-yet-committed chunk, preserving precise residuals.
+ *  - 8..15 bytes use the upstream single-qword path to avoid over-reading.
  */
 
 #include <linux/export.h>
 #include <linux/linkage.h>
+#include <linux/cfi_types.h>
 #include <linux/objtool.h>
 #include <asm/cpufeatures.h>
 #include <asm/alternative.h>
 #include <asm/asm.h>
 
-        .p2align 5
+/*
+ * rep_movs_alternative - memory copy with exception handling.
+ * This version is for CPUs that don't have FSRM (Fast Short Rep Movs)
+ *
+ * Input:
+ * rdi destination
+ * rsi source
+ * rcx count
+ *
+ * Output:
+ * rcx uncopied bytes or 0 if successful.
+ *
+ * NOTE! The calling convention is very intentionally the same as
+ * for 'rep movs', so that we can rewrite the function call with
+ * just a plain 'rep movs' on machines that have FSRM.  But to make
+ * it simpler for us, we can clobber rsi/rdi and rax freely.
+ */
 SYM_FUNC_START(rep_movs_alternative)
-        ANNOTATE_NOENDBR
+	ANNOTATE_NOENDBR
+	cmpq	$64, %rcx
+	jae	.Llarge
 
-        cmpq    $64, %rcx
-        jae     .Llarge
+	cmpq	$16, %rcx
+	jb	.Lword_or_tail
 
-        /* ---- 8..63 bytes: 2x unrolled qword loop ---- */
-        cmpq    $8, %rcx
-        jb      .Ltail
-
-        .p2align 6
+	.p2align 4
 .Lqword2:
-0:      movq    (%rsi), %rax
-1:      movq    8(%rsi), %rdx
-2:      movq    %rax, (%rdi)
-3:      movq    %rdx, 8(%rdi)
-        addq    $16, %rsi
-        addq    $16, %rdi
-        subq    $16, %rcx
-        cmpq    $16, %rcx
-        jae     .Lqword2
+0:	movq	(%rsi), %rax
+1:	movq	%rax, (%rdi)
+2:	movq	8(%rsi), %rax
+3:	movq	%rax, 8(%rdi)
+	addq	$16, %rsi
+	addq	$16, %rdi
+	subq	$16, %rcx
+	cmpq	$16, %rcx
+	jae	.Lqword2
 
-        /* handle remaining 8..15 */
-        cmpq    $8, %rcx
-        jb      .Ltail
-4:      movq    (%rsi), %rax
-5:      movq    %rax, (%rdi)
-        addq    $8, %rsi
-        addq    $8, %rdi
-        subq    $8, %rcx
+.Lword_or_tail:
+	cmpq	$8, %rcx
+	jae	.Lword
+	testl	%ecx, %ecx
+	je	.Lexit
 
-        /* ---- 0..7 bytes ---- */
-.Ltail:
-        testq   %rcx, %rcx
-        jz      .Lexit
-6:      movb    (%rsi), %al
-7:      movb    %al, (%rdi)
-        incq    %rsi
-        incq    %rdi
-        decq    %rcx
-        jne     6b
+.Lcopy_user_tail:
+4:	movb	(%rsi), %al
+5:	movb	%al, (%rdi)
+	incq	%rdi
+	incq	%rsi
+	decq	%rcx
+	jne	.Lcopy_user_tail
 .Lexit:
-        RET
+	RET
 
-        _ASM_EXTABLE_UA(0b, .Ltail)
-        _ASM_EXTABLE_UA(1b, .Ltail)
-        _ASM_EXTABLE_UA(2b, .Ltail)
-        _ASM_EXTABLE_UA(3b, .Ltail)
-        _ASM_EXTABLE_UA(4b, .Ltail)
-        _ASM_EXTABLE_UA(5b, .Ltail)
-        _ASM_EXTABLE_UA(6b, .Lexit)
-        _ASM_EXTABLE_UA(7b, .Lexit)
+	_ASM_EXTABLE_UA(0b, .Lcopy_user_tail)
+	_ASM_EXTABLE_UA(1b, .Lcopy_user_tail)
+	_ASM_EXTABLE_UA(2b, .Lcopy_user_tail)
+	_ASM_EXTABLE_UA(3b, .Lcopy_user_tail)
+	_ASM_EXTABLE_UA(4b, .Lexit)
+	_ASM_EXTABLE_UA(5b, .Lexit)
 
-        /* ---- >=64 bytes ---- */
-        .p2align 6
+	.p2align 4
+.Lword:
+6:	movq	(%rsi), %rax
+7:	movq	%rax, (%rdi)
+	addq	$8, %rsi
+	addq	$8, %rdi
+	subq	$8, %rcx
+	je	.Lexit
+	jmp	.Lcopy_user_tail
+
+	_ASM_EXTABLE_UA(6b, .Lcopy_user_tail)
+	_ASM_EXTABLE_UA(7b, .Lcopy_user_tail)
+
 .Llarge:
-        /* On 14700KF this is patched to 'rep movsb' at boot */
-0:      ALTERNATIVE "jmp .Llarge_movsq", "rep movsb", X86_FEATURE_ERMS
-1:      RET
-        _ASM_EXTABLE_UA(0b, 1b)
+0:	ALTERNATIVE "jmp .Llarge_movsq", "rep movsb", X86_FEATURE_ERMS
+1:	RET
+
+	_ASM_EXTABLE_UA(0b, 1b)
 
 .Llarge_movsq:
-        /* Copy first qword (may be unaligned), then align dst */
-0:      movq    (%rsi), %rax
-1:      movq    %rax, (%rdi)
-        _ASM_EXTABLE_UA(0b, .Ltail)
-        _ASM_EXTABLE_UA(1b, .Ltail)
+	/* Do the first possibly unaligned word */
+0:	movq	(%rsi), %rax
+1:	movq	%rax, (%rdi)
 
-        addq    $8, %rsi
-        addq    $8, %rdi
-        subq    $8, %rcx
+	_ASM_EXTABLE_UA(0b, .Lcopy_user_tail)
+	_ASM_EXTABLE_UA(1b, .Lcopy_user_tail)
 
-        /* Align destination to 8 bytes for rep movsq */
-        movq    %rdi, %rax
-        negq    %rax
-        andq    $7, %rax
-        addq    %rax, %rdi
-        addq    %rax, %rsi
-        subq    %rax, %rcx
+	/* What would be the offset to the aligned destination? */
+	leaq	8(%rdi), %rax
+	andq	$-8, %rax
+	subq	%rdi, %rax
 
-        movq    %rcx, %rdx
-        shrq    $3, %rcx
-        andl    $7, %edx
-0:      rep movsq
-        movl    %edx, %ecx
-        testq   %rcx, %rcx
-        jne     .Ltail
-        RET
-1:      leaq    (%rdx,%rcx,8), %rcx
-        jmp     .Ltail
-        _ASM_EXTABLE_UA(0b, 1b)
+	/* .. and update pointers and count to match */
+	addq	%rax, %rdi
+	addq	%rax, %rsi
+	subq	%rax, %rcx
 
+	/* make %rcx contain the number of words, %rax the remainder */
+	movq	%rcx, %rax
+	shrq	$3, %rcx
+	andl	$7, %eax
+0:	rep movsq
+	movl	%eax, %ecx
+	testl	%ecx, %ecx
+	jne	.Lcopy_user_tail
+	RET
+
+1:	leaq	(%rax,%rcx,8), %rcx
+	jmp	.Lcopy_user_tail
+
+	_ASM_EXTABLE_UA(0b, 1b)
 SYM_FUNC_END(rep_movs_alternative)
 EXPORT_SYMBOL(rep_movs_alternative)
