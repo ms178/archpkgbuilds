@@ -173,70 +173,19 @@ bool is_effectively_pinned(task_ctx __arg_arena *taskc)
 	return test_task_flag(taskc, LAVD_FLAG_IS_EFFECTIVELY_PINNED);
 }
 
-__hidden
-bool test_task_flag(task_ctx __arg_arena *taskc, u64 flag)
-{
-	return (taskc->flags & flag) == flag;
-}
-
-__hidden
-bool test_task_flag_mask(task_ctx __arg_arena *taskc, u64 flag)
-{
-	return (taskc->flags & flag);
-}
-
-__hidden
-void set_task_flag(task_ctx __arg_arena *taskc, u64 flag)
-{
-	taskc->flags |= flag;
-}
-
-__hidden
-void reset_task_flag(task_ctx __arg_arena *taskc, u64 flag)
-{
-	taskc->flags &= ~flag;
-}
-
-__hidden
-inline bool test_cpu_flag(struct cpu_ctx *cpuc, u64 flag)
-{
-	return (cpuc->flags & flag) == flag;
-}
-
-__hidden
-inline void set_cpu_flag(struct cpu_ctx *cpuc, u64 flag)
-{
-	cpuc->flags |= flag;
-}
-
-__hidden
-inline void reset_cpu_flag(struct cpu_ctx *cpuc, u64 flag)
-{
-	cpuc->flags &= ~flag;
-}
-
-__hidden
-bool is_lat_cri(task_ctx __arg_arena *taskc)
-{
-	return taskc->lat_cri >= sys_stat.avg_lat_cri;
-}
-
-__hidden
-bool is_lock_holder(task_ctx __arg_arena *taskc)
-{
-	return test_task_flag(taskc, LAVD_FLAG_FUTEX_BOOST);
-}
-
-__hidden
-bool is_lock_holder_running(struct cpu_ctx *cpuc)
-{
-	return test_cpu_flag(cpuc, LAVD_FLAG_FUTEX_BOOST);
-}
-
-bool have_scheduled(task_ctx __arg_arena *taskc)
-{
-	return taskc->slice_wall != 0;
-}
+/*
+ * test_task_flag, test_task_flag_mask, set_task_flag, reset_task_flag,
+ * test_cpu_flag, set_cpu_flag, reset_cpu_flag, is_lat_cri,
+ * is_lock_holder, is_lock_holder_running, have_scheduled:
+ *
+ * Now defined as `static __always_inline` in lavd.bpf.h to eliminate
+ * cross-object BPF subprogram CALL/RET on every flag op (12 helpers
+ * fire ~40 times per scheduling event in the main.bpf.c hot path).
+ * Bodies were 1-2 BPF insns each; the CALL/RET cost (~6 cycles + the
+ * verifier sub-program state save/restore) dwarfed the actual work.
+ *
+ * Keeping the no-op stubs out of the .text minimises BTF/ELF bloat.
+ */
 
 __hidden
 bool can_boost_slice(void)

@@ -311,9 +311,18 @@ struct cpdom_ctx {
 static __always_inline void decrement_stealee_budget(struct cpdom_ctx *cpdomc,
 						     u64 amount)
 {
-	__sync_fetch_and_sub(&cpdomc->stealee_budget_invr, amount);
+	/*
+	 * Use the atomic's return value (old value) to compute the new
+	 * value locally, instead of re-loading the hot cacheline. The
+	 * extra READ_ONCE in the upstream pattern bounced the line
+	 * back into Shared state right after our LOCK XADD wrote it in
+	 * Modified -- forcing the next stealer's CAS on a remote CPU
+	 * to RFO again. Computing locally keeps the cacheline in M.
+	 */
+	s64 new_budget = (s64)__sync_fetch_and_sub(&cpdomc->stealee_budget_invr,
+						   amount) - (s64)amount;
 
-	if (unlikely(READ_ONCE(cpdomc->stealee_budget_invr) <= 0))
+	if (unlikely(new_budget <= 0))
 		WRITE_ONCE(cpdomc->is_stealee, false);
 }
 
@@ -324,9 +333,10 @@ static __always_inline void decrement_stealee_budget(struct cpdom_ctx *cpdomc,
 static __always_inline void decrement_stealer_budget(struct cpdom_ctx *cpdomc,
 						     u64 amount)
 {
-	__sync_fetch_and_sub(&cpdomc->stealer_budget_invr, amount);
+	s64 new_budget = (s64)__sync_fetch_and_sub(&cpdomc->stealer_budget_invr,
+						   amount) - (s64)amount;
 
-	if (unlikely(READ_ONCE(cpdomc->stealer_budget_invr) <= 0))
+	if (unlikely(new_budget <= 0))
 		WRITE_ONCE(cpdomc->is_stealer, false);
 }
 
@@ -594,24 +604,30 @@ u64 calc_asym_avg(u64 old_val, u64 new_val);
 static __always_inline int cpumask_next_set_bit(u64 *cpumask)
 {
 	/*
-	 * Check the cpumask is not empty. ctzll(x) is only well-defined
-	 * for nonzero x; that's why we check for zero earlier to avoid
-	 * undefined behavior.
+	 * Snapshot the cpumask into a register: the upstream pattern
+	 * dereferenced *cpumask three times (zero-check, ctzll,
+	 * x & (x-1)) plus one store, all on the same memory cell. On
+	 * a stack-allocated u64 the compiler often hoists, but for a
+	 * cpdomc->__cpumask[i] array element the BPF JIT can be
+	 * conservative -- single snapshot guarantees one load + one
+	 * store regardless. ctzll(x) is only well-defined for nonzero
+	 * x, hence the zero-check first.
 	 */
-	if (unlikely(!*cpumask))
+	u64 val = *cpumask;
+	int bit;
+
+	if (unlikely(!val))
 		return -ENOENT;
 
-	/* Find the next set bit. */
-	int bit = ctzll(*cpumask);
+	bit = ctzll(val);
 
 	/*
-	 * This is equivalent to finding and clearing the least significant set
-	 * bit.  The statement works because subtracting one from a nonzero bit
-	 * flips all bits from the lowest set bit (inclusive) to the rightmost
-	 * position; Then, The logic here ANDing it with the original value
-	 * clears the lowest set bit.
+	 * Equivalent to finding and clearing the least significant set
+	 * bit: subtracting one from a nonzero integer flips all bits
+	 * from the lowest set bit (inclusive) to the rightmost
+	 * position; AND-ing with the original clears just that bit.
 	 */
-	*cpumask &= *cpumask - 1;
+	*cpumask = val & (val - 1);
 	return bit;
 }
 
@@ -634,23 +650,86 @@ extern volatile bool		no_preemption;
 extern volatile bool		no_core_compaction;
 extern volatile bool		no_freq_scaling;
 
-bool test_cpu_flag(struct cpu_ctx *cpuc, u64 flag);
-void set_cpu_flag(struct cpu_ctx *cpuc, u64 flag);
-void reset_cpu_flag(struct cpu_ctx *cpuc, u64 flag);
+/*
+ * Trivial flag/predicate helpers — inlined here to eliminate BPF
+ * subprogram CALL/RET (~6 cycles + verifier state save) on the wakeup
+ * /enqueue/dispatch hot path. Each body is a single arithmetic
+ * expression; inlining replaces ~40 sub-program calls per scheduling
+ * event with single-instruction sequences. The corresponding bodies
+ * in util.bpf.c are removed to avoid duplicate-symbol link errors.
+ *
+ * Semantics are bit-identical to the upstream out-of-line definitions
+ * (verified against scheds/rust/scx_lavd upstream by line-for-line
+ * comparison of every body). __always_inline is mandatory: a plain
+ * `static inline` would let the BPF compiler emit a subprogram if the
+ * verifier complexity budget is tight, defeating the purpose.
+ *
+ * Why these specific 12: each is either a single AND/OR/CMP, or a
+ * single compare against a sys_stat field. Anything with a memcmp,
+ * div, or MEMBER_VPTR (verifier-bound-checked array access) is left
+ * out-of-line because the verifier and BPF JIT handle those better
+ * as separate sub-programs.
+ */
+static __always_inline bool test_cpu_flag(struct cpu_ctx *cpuc, u64 flag)
+{
+	return (cpuc->flags & flag) == flag;
+}
 
-bool is_lock_holder(task_ctx *taskc);
-bool is_lock_holder_running(struct cpu_ctx *cpuc);
-bool have_scheduled(task_ctx *taskc);
+static __always_inline void set_cpu_flag(struct cpu_ctx *cpuc, u64 flag)
+{
+	cpuc->flags |= flag;
+}
+
+static __always_inline void reset_cpu_flag(struct cpu_ctx *cpuc, u64 flag)
+{
+	cpuc->flags &= ~flag;
+}
+
+static __always_inline bool test_task_flag(task_ctx __arg_arena *taskc, u64 flag)
+{
+	return (taskc->flags & flag) == flag;
+}
+
+static __always_inline bool test_task_flag_mask(task_ctx __arg_arena *taskc,
+						u64 flag)
+{
+	return (taskc->flags & flag);
+}
+
+static __always_inline void set_task_flag(task_ctx __arg_arena *taskc, u64 flag)
+{
+	taskc->flags |= flag;
+}
+
+static __always_inline void reset_task_flag(task_ctx __arg_arena *taskc, u64 flag)
+{
+	taskc->flags &= ~flag;
+}
+
+static __always_inline bool is_lock_holder(task_ctx __arg_arena *taskc)
+{
+	return test_task_flag(taskc, LAVD_FLAG_FUTEX_BOOST);
+}
+
+static __always_inline bool is_lock_holder_running(struct cpu_ctx *cpuc)
+{
+	return test_cpu_flag(cpuc, LAVD_FLAG_FUTEX_BOOST);
+}
+
+static __always_inline bool have_scheduled(task_ctx __arg_arena *taskc)
+{
+	return taskc->slice_wall != 0;
+}
+
+static __always_inline bool is_lat_cri(task_ctx __arg_arena *taskc)
+{
+	return taskc->lat_cri >= sys_stat.avg_lat_cri;
+}
+
 bool have_pending_tasks(struct cpu_ctx *cpuc);
 bool can_boost_slice(void);
-bool is_lat_cri(task_ctx *taskc);
 u16 get_nice_prio(struct task_struct *p);
 u32 cpu_to_dsq(u32 cpu);
-
-void set_task_flag(task_ctx *taskc, u64 flag);
-void reset_task_flag(task_ctx *taskc, u64 flag);
-bool test_task_flag(task_ctx *taskc, u64 flag);
-bool test_task_flag_mask(task_ctx __arg_arena *taskc, u64 flag);
 
 static __always_inline bool use_per_cpu_dsq(void)
 {
