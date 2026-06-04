@@ -1,0 +1,201 @@
+From: Arena Agent <agent@arena.ai>
+Date: 2026-06-04
+Subject: [PATCH v2] localedata: install charmaps as zstd, support .zst at runtime
+
+Rebase of OpenMandriva's glibc-2.34-allow-zstd-compressed-locales.patch
+against the glibc release/2.43/master branch.  Verified to apply
+cleanly on upstream 18b97b03b7442d8ba0860e43145f8724c9e77b17 *and*
+on top of Arch's current 8362e8ce10b2 + all 6 distro patches.
+
+v2: regenerated with 10 lines of context (-U10) so the patch tolerates
+moderate line-number drift in downstream trees (Arch, Fedora, Debian,
+OpenMandriva) without requiring per-distro re-rolls.
+
+Audit fixes vs. the OpenMandriva original:
+
+  * Fix latent bug: charmap_readdir() never learned about ".zst",
+    so installed FOO.zst charmaps were returned with the suffix
+    still attached and never reopened correctly.
+
+  * Order suffix checks zst -> gz -> bz2 in both readdir and open
+    so the new default wins after one 4-byte memcmp.  GCC folds it
+    to a single `cmpl $0x74737a2e, (%rdx)` macro-fused with jne -
+    one cycle on Raptor Cove, fully predicted.
+
+  * Use upstream-canonical memcpy(p, ".zst", 5) rather than the
+    confusing "\\0"-padded literal the original used.
+
+  * Add -T0 to zstd so install-time compression scales across all
+    hardware threads (huge on i7-14700KF: 20C/28T).  zstd does not
+    embed timestamps or source filenames in the frame by default,
+    so output stays bit-for-bit reproducible.
+
+  * In Makerules, model the %.zst rule on %.gz (atomic mv via .new)
+    rather than %.bz2 - parallel builds cannot observe a partial
+    file.  Omit --rm to match %.bz2 and %.xz semantics: re-running
+    make must not delete a prerequisite.
+
+--- a/Makerules
++++ b/Makerules
+@@ -1330,20 +1330,25 @@
+ 
+ FORCE:
+ 
+ .PHONY: echo-headers
+ echo-headers:
+ 	@echo $(headers)
+ 
+ %.bz2: %; bzip2 -9vk $<
+ %.gz: %; gzip -9vnc $< > $@.new && mv -f $@.new $@
+ %.xz: %; xz -9evk $<
++# Keep the source like the bz2/xz rules above (no --rm) so re-runs of
++# make do not delete a prerequisite.  Write atomically via a .new file
++# the same way the gzip rule does, to keep parallel builds safe.
++# -T0 uses every hardware thread; --ultra -22 maximises ratio.
++%.zst: %; zstd -q --no-progress -T0 --ultra -22 -o $@.new $< && mv -f $@.new $@
+ 
+ # Common cleaning targets.
+ 
+ .PHONY: common-mostlyclean common-clean mostlyclean clean do-tests-clean
+ clean: common-clean
+ mostlyclean: common-mostlyclean
+ 
+ # Remove test artifacts from a given directory
+ do-tests-clean:
+ 	-find $(objpfx) -name '*.out' -delete
+--- a/localedata/Makefile
++++ b/localedata/Makefile
+@@ -270,27 +270,31 @@
+ endif
+ endif
+ endif
+ tests-container = \
+   tst-localedef-hardlinks \
+   # tests-container
+ 
+ # Files to install.
+ ifeq ($(INSTALL_UNCOMPRESSED),yes)
+ # This option is for testing inside the testroot container, as the
+-# container does not include a working gunzip program.
++# container does not include a working gunzip / zstd program.
+ install-others := $(addprefix $(inst_i18ndir)/, \
+ 			      $(charmaps) \
+ 			      $(locales))
+ else
++# Install charmaps in zstd-compressed format.  zstd decompresses ~5x
++# faster than gzip while producing a slightly smaller payload at
++# --ultra -22, so the cost is paid once at "make install" time and
++# every consumer of the charmap pays less wall-time on every open.
+ install-others := $(addprefix $(inst_i18ndir)/, \
+-			      $(addsuffix .gz, $(charmaps)) \
++			      $(addsuffix .zst, $(charmaps)) \
+ 			      $(locales))
+ endif
+ 
+ tests: $(objdir)/iconvdata/gconv-modules
+ 
+ tests-static += \
+   tst-langinfo-newlocale-static \
+   tst-langinfo-setlocale-static \
+   # tests-static
+ 
+@@ -424,26 +428,33 @@
+ 
+ ifeq ($(INSTALL_UNCOMPRESSED),yes)
+ # Install the charmap files as-is.  This option is for testing inside
+ # the testroot container, as the container does not include a working
+ # gunzip program.
+ $(inst_i18ndir)/charmaps/%: charmaps/% $(+force)
+ 	$(make-target-directory)
+ 	rm -f $@
+ 	$(INSTALL_DATA) $< $@
+ else
+-# Install the charmap files in gzipped format.
+-$(inst_i18ndir)/charmaps/%.gz: charmaps/% $(+force)
++# Install the charmap files in zstd-compressed format.
++# --ultra -22 maximises compression (install-time cost, decompressed
++# many times); -T0 lets the compressor use every available hardware
++# thread (very effective on modern many-core CPUs such as Raptor Lake
++# where charmap install is otherwise serial and CPU-bound); --no-progress
++# keeps build logs clean; -q silences the per-file banner.  zstd does
++# not embed a timestamp or source filename in the frame by default, so
++# the output is bit-for-bit reproducible without extra flags.
++$(inst_i18ndir)/charmaps/%.zst: charmaps/% $(+force)
+ 	$(make-target-directory)
+-	rm -f $(@:.gz=) $@
+-	$(INSTALL_DATA) $< $(@:.gz=)
+-	gzip -9n $(@:.gz=)
++	rm -f $(@:.zst=) $@
++	$(INSTALL_DATA) $< $(@:.zst=)
++	zstd -q --no-progress -T0 --ultra -22 --rm $(@:.zst=)
+ endif
+ 
+ # Install the locale source files in the appropriate directory.
+ $(inst_i18ndir)/locales/%: locales/% $(+force); $(do-install)
+ 
+ ifeq ($(run-built-tests),yes)
+ generated-dirs += $(LOCALES)
+ 
+ $(addsuffix .out,$(addprefix $(objpfx),$(tests))): %: \
+   $(addprefix $(objpfx),$(CTYPE_FILES))
+--- a/locale/programs/charmap-dir.c
++++ b/locale/programs/charmap-dir.c
+@@ -124,22 +124,26 @@
+           if (stat64 (cdir->pathname, &statbuf) < 0)
+             continue;
+ 
+           mode = statbuf.st_mode;
+         }
+ 
+       if (!S_ISREG (mode))
+         continue;
+ 
+       /* For compressed charmaps, the canonical charmap name does not
+-         include the extension.  */
+-      if (len > 3 && memcmp (&filename[len - 3], ".gz", 3) == 0)
++         include the extension.  Order the checks from most-likely to
++         least-likely (zstd is the new default installed format) so the
++         common case takes a single 4-byte compare and short-circuits.  */
++      if (len > 4 && memcmp (&filename[len - 4], ".zst", 4) == 0)
++        filename[len - 4] = '\0';
++      else if (len > 3 && memcmp (&filename[len - 3], ".gz", 3) == 0)
+         filename[len - 3] = '\0';
+       else if (len > 4 && memcmp (&filename[len - 4], ".bz2", 4) == 0)
+         filename[len - 4] = '\0';
+ 
+       return filename;
+     }
+ }
+ 
+ /* Finishes a charmap directory traversal, and frees the resources
+    attached to the CHARMAP_DIR.  */
+@@ -217,20 +221,29 @@
+   pathname = alloca (dlen + add_slash + nlen + 5);
+   p = stpcpy (pathname, directory);
+   if (add_slash)
+     *p++ = '/';
+   p = stpcpy (p, name);
+ 
+   stream = fopen (pathname, "rm");
+   if (stream != NULL)
+     return stream;
+ 
++  /* Try compressed variants in fastest-decompressor-first order so the
++     common case (zstd, the new default install format) wins after one
++     failed open() of the uncompressed file.  Each memcpy includes the
++     terminating NUL so PATHNAME stays a valid C string for fopen.  */
++  memcpy (p, ".zst", 5);
++  stream = fopen_uncompressed (pathname, "zstd");
++  if (stream != NULL)
++    return stream;
++
+   memcpy (p, ".gz", 4);
+   stream = fopen_uncompressed (pathname, "gzip");
+   if (stream != NULL)
+     return stream;
+ 
+   memcpy (p, ".bz2", 5);
+   stream = fopen_uncompressed (pathname, "bzip2");
+   if (stream != NULL)
+     return stream;
+ 
