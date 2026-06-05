@@ -103,14 +103,15 @@ function bolt_optimize_binary --argument-names Name BinPath
     log "  [$Name] optimizing..."
     run "$BOLT" "$Real" -o "$Opt" \
         --data "$Prof" \
+        --lite=false \
         --dyno-stats \
         --reorder-blocks=ext-tsp \
         --reorder-functions=cdsort \
-        --split-functions --split-all-cold --split-eh \
-        --icf=safe \
+        --split-functions --split-strategy=cdsplit --split-all-cold --split-eh \
+        --icf=all --peepholes=all --plt=all \
         --jump-tables=move \
         --use-gnu-stack \
-        --update-debug-sections=0
+        --update-debug-sections=1
 
     run mv -f "$Opt" "$Real"
     rm -f "$Inst" "$Prof"
