@@ -19,6 +19,7 @@
  * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
  * OTHER DEALINGS IN THE SOFTWARE.
+ *
  */
 
 #include <stdlib.h>
@@ -31,7 +32,9 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/time.h>
-#include <alloca.h>
+#if HAVE_ALLOCA_H
+# include <alloca.h>
+#endif
 
 #include "libdrm_macros.h"
 #include "xf86drm.h"
@@ -39,8 +42,12 @@
 #include "amdgpu_internal.h"
 #include "util_math.h"
 
+#ifndef likely
 #define likely(x)   __builtin_expect(!!(x), 1)
+#endif
+#ifndef unlikely
 #define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
 
 #define BO_LIST_STACK_THRESHOLD_BYTES 2048
 
@@ -289,179 +296,135 @@ drm_public int amdgpu_bo_import(amdgpu_device_handle dev,
 				struct amdgpu_bo_import_result *output)
 {
 	struct drm_gem_open open_arg;
-	struct amdgpu_bo *bo;
-	uint32_t handle, flink_name;
-	uint64_t alloc_size, dma_buf_size;
-	int r;
+	struct amdgpu_bo *bo = NULL;
+	uint32_t handle = 0;
+	uint32_t flink_name = 0;
+	uint32_t flink_handle = 0;
+	uint64_t alloc_size = 0;
+	bool close_handle = false;
+	bool close_flink_handle = false;
 	int dma_fd;
+	int r = 0;
 
-	if (unlikely(!dev || !output)) {
+	if (unlikely(!dev || !output))
 		return -EINVAL;
-	}
 
-	bo = NULL;
-	handle = 0;
-	flink_name = 0;
-	alloc_size = 0;
-	dma_buf_size = 0;
-	r = 0;
+	if (type == amdgpu_bo_handle_type_kms ||
+	    type == amdgpu_bo_handle_type_kms_noimport)
+		return -EPERM;
+
+	if (type != amdgpu_bo_handle_type_gem_flink_name &&
+	    type != amdgpu_bo_handle_type_dma_buf_fd)
+		return -EINVAL;
 
 	pthread_mutex_lock(&dev->bo_table_mutex);
+	if (type == amdgpu_bo_handle_type_gem_flink_name)
+		bo = handle_table_lookup(&dev->bo_flink_names, shared_handle);
+	pthread_mutex_unlock(&dev->bo_table_mutex);
+
+	if (bo) {
+		atomic_inc(&bo->refcount);
+		output->buf_handle = bo;
+		output->alloc_size = bo->alloc_size;
+		return 0;
+	}
 
 	if (type == amdgpu_bo_handle_type_dma_buf_fd) {
 		off_t size;
 
-		pthread_mutex_unlock(&dev->bo_table_mutex);
-
 		r = drmPrimeFDToHandle(dev->fd, shared_handle, &handle);
-		if (unlikely(r)) {
+		if (unlikely(r))
 			return r;
-		}
+		close_handle = true;
 
 		size = lseek(shared_handle, 0, SEEK_END);
 		if (unlikely(size == (off_t)-1)) {
 			r = -errno;
-			drmCloseBufferHandle(dev->fd, handle);
-			return r;
+			goto free_handles;
 		}
-		lseek(shared_handle, 0, SEEK_SET);
-
-		dma_buf_size = (uint64_t)size;
-		shared_handle = handle;
-
-		pthread_mutex_lock(&dev->bo_table_mutex);
-	}
-
-	switch (type) {
-	case amdgpu_bo_handle_type_gem_flink_name:
-		bo = handle_table_lookup(&dev->bo_flink_names, shared_handle);
-		break;
-
-	case amdgpu_bo_handle_type_dma_buf_fd:
-		bo = handle_table_lookup(&dev->bo_handles, shared_handle);
-		break;
-
-	case amdgpu_bo_handle_type_kms:
-	case amdgpu_bo_handle_type_kms_noimport:
-		pthread_mutex_unlock(&dev->bo_table_mutex);
-		return -EPERM;
-
-	default:
-		pthread_mutex_unlock(&dev->bo_table_mutex);
-		return -EINVAL;
-	}
-
-	if (likely(bo)) {
-		atomic_inc(&bo->refcount);
-		pthread_mutex_unlock(&dev->bo_table_mutex);
-
-		output->buf_handle = bo;
-		output->alloc_size = bo->alloc_size;
-		return 0;
-	}
-
-	pthread_mutex_unlock(&dev->bo_table_mutex);
-
-	switch (type) {
-	case amdgpu_bo_handle_type_gem_flink_name:
+		(void)lseek(shared_handle, 0, SEEK_SET);
+		alloc_size = (uint64_t)size;
+	} else {
 		memset(&open_arg, 0, sizeof(open_arg));
 		open_arg.name = shared_handle;
 
 		r = drmIoctl(dev->flink_fd, DRM_IOCTL_GEM_OPEN, &open_arg);
-		if (unlikely(r)) {
+		if (unlikely(r))
 			return r;
-		}
 
 		flink_name = shared_handle;
-		handle = open_arg.handle;
+		flink_handle = open_arg.handle;
 		alloc_size = open_arg.size;
 
 		if (dev->flink_fd != dev->fd) {
-			r = drmPrimeHandleToFD(dev->flink_fd, handle,
+			close_flink_handle = true;
+			r = drmPrimeHandleToFD(dev->flink_fd, flink_handle,
 					       DRM_CLOEXEC, &dma_fd);
-			if (unlikely(r)) {
-				goto free_bo_handle;
-			}
+			if (unlikely(r))
+				goto free_handles;
 
 			r = drmPrimeFDToHandle(dev->fd, dma_fd, &handle);
 			close(dma_fd);
-			if (unlikely(r)) {
-				goto free_bo_handle;
-			}
+			if (unlikely(r))
+				goto free_handles;
+			close_handle = true;
 
-			r = drmCloseBufferHandle(dev->flink_fd, open_arg.handle);
-			if (unlikely(r)) {
-				goto free_bo_handle;
-			}
+			r = drmCloseBufferHandle(dev->flink_fd, flink_handle);
+			if (unlikely(r))
+				goto free_handles;
+			close_flink_handle = false;
+			flink_handle = 0;
+		} else {
+			handle = flink_handle;
+			close_handle = true;
+			flink_handle = 0;
 		}
-		open_arg.handle = 0;
-		break;
-
-	case amdgpu_bo_handle_type_dma_buf_fd:
-		handle = shared_handle;
-		alloc_size = dma_buf_size;
-		break;
-
-	case amdgpu_bo_handle_type_kms:
-	case amdgpu_bo_handle_type_kms_noimport:
-		return -EINVAL;
 	}
 
 	pthread_mutex_lock(&dev->bo_table_mutex);
-
-	if (type == amdgpu_bo_handle_type_gem_flink_name && flink_name) {
+	if (type == amdgpu_bo_handle_type_gem_flink_name)
 		bo = handle_table_lookup(&dev->bo_flink_names, flink_name);
-	} else if (type == amdgpu_bo_handle_type_dma_buf_fd) {
+	else
 		bo = handle_table_lookup(&dev->bo_handles, handle);
-	}
 
-	if (unlikely(bo)) {
+	if (bo) {
 		atomic_inc(&bo->refcount);
 		pthread_mutex_unlock(&dev->bo_table_mutex);
-
-		if (flink_name && open_arg.handle) {
-			drmCloseBufferHandle(dev->flink_fd, open_arg.handle);
-		} else if (type == amdgpu_bo_handle_type_dma_buf_fd) {
-			drmCloseBufferHandle(dev->fd, handle);
-		}
-
 		output->buf_handle = bo;
 		output->alloc_size = bo->alloc_size;
-		return 0;
+		goto free_handles_success;
 	}
 
 	r = amdgpu_bo_create(dev, alloc_size, handle, &bo);
 	if (unlikely(r)) {
 		pthread_mutex_unlock(&dev->bo_table_mutex);
-		goto free_bo_handle;
+		goto free_handles;
 	}
+	close_handle = false;
 
 	if (flink_name) {
 		bo->flink_name = flink_name;
 		r = handle_table_insert(&dev->bo_flink_names, flink_name, bo);
 		if (unlikely(r)) {
 			pthread_mutex_unlock(&dev->bo_table_mutex);
-			goto free_bo_handle;
+			amdgpu_bo_free(bo);
+			bo = NULL;
+			goto free_handles;
 		}
 	}
-
 	pthread_mutex_unlock(&dev->bo_table_mutex);
 
 	output->buf_handle = bo;
 	output->alloc_size = bo->alloc_size;
 	return 0;
 
-free_bo_handle:
-	if (flink_name && open_arg.handle) {
-		drmCloseBufferHandle(dev->flink_fd, open_arg.handle);
-	}
-
-	if (bo) {
-		amdgpu_bo_free(bo);
-	} else {
+free_handles_success:
+	r = 0;
+free_handles:
+	if (close_flink_handle)
+		drmCloseBufferHandle(dev->flink_fd, flink_handle);
+	if (close_handle)
 		drmCloseBufferHandle(dev->fd, handle);
-	}
-
 	return r;
 }
 
@@ -627,92 +590,97 @@ drm_public int amdgpu_find_bo_by_cpu_mapping(amdgpu_device_handle dev,
 					     amdgpu_bo_handle *buf_handle,
 					     uint64_t *offset_in_bo)
 {
-	struct amdgpu_bo **bo_list;
-	uint32_t num_bos, i;
-	int r;
+	struct amdgpu_bo **bo_list = NULL;
+	uintptr_t cpu_start;
+	uintptr_t cpu_end;
+	uint32_t capacity;
+	uint32_t num_bos;
+	int r = -ENXIO;
 
 	if (unlikely(!dev || !cpu || size == 0 ||
-		     !buf_handle || !offset_in_bo)) {
+		     !buf_handle || !offset_in_bo))
 		return -EINVAL;
-	}
 
-	bo_list = NULL;
-	num_bos = 0;
-	r = -ENXIO;
+	cpu_start = (uintptr_t)cpu;
+	if (unlikely(__builtin_add_overflow(cpu_start, size, &cpu_end)))
+		return -EINVAL;
 
+retry:
 	pthread_mutex_lock(&dev->bo_table_mutex);
-
-	if (dev->bo_handles.max_key > 0) {
-		if (unlikely(dev->bo_handles.max_key >
-			     SIZE_MAX / sizeof(struct amdgpu_bo*))) {
-			pthread_mutex_unlock(&dev->bo_table_mutex);
-			return -ENOMEM;
-		}
-
-		bo_list = malloc(dev->bo_handles.max_key *
-				 sizeof(struct amdgpu_bo*));
-		if (unlikely(!bo_list)) {
-			pthread_mutex_unlock(&dev->bo_table_mutex);
-			return -ENOMEM;
-		}
-
-		for (i = 0; i < dev->bo_handles.max_key; i++) {
-			struct amdgpu_bo *bo;
-
-			bo = handle_table_lookup(&dev->bo_handles, i);
-			if (likely(bo && bo->cpu_ptr)) {
-				atomic_inc(&bo->refcount);
-				bo_list[num_bos++] = bo;
-			}
-		}
-	}
-
+	capacity = dev->bo_handles.max_key;
 	pthread_mutex_unlock(&dev->bo_table_mutex);
 
-	if (!bo_list) {
-		*buf_handle = NULL;
-		*offset_in_bo = 0;
-		return -ENXIO;
+	if (!capacity)
+		goto out_not_found;
+
+	if (unlikely((size_t)capacity > SIZE_MAX / sizeof(*bo_list)))
+		return -ENOMEM;
+
+	bo_list = malloc((size_t)capacity * sizeof(*bo_list));
+	if (unlikely(!bo_list))
+		return -ENOMEM;
+
+	num_bos = 0;
+	pthread_mutex_lock(&dev->bo_table_mutex);
+	if (unlikely(dev->bo_handles.max_key > capacity)) {
+		pthread_mutex_unlock(&dev->bo_table_mutex);
+		free(bo_list);
+		bo_list = NULL;
+		goto retry;
 	}
 
-	for (i = 0; i < num_bos; i++) {
-		struct amdgpu_bo *bo;
-		uintptr_t bo_start, bo_end;
-		uintptr_t cpu_start, cpu_end;
+	for (uint32_t i = 0; i < dev->bo_handles.max_key; i++) {
+		struct amdgpu_bo *bo = handle_table_lookup(&dev->bo_handles, i);
 
-		bo = bo_list[i];
+		if (!bo)
+			continue;
+
+		pthread_mutex_lock(&bo->cpu_access_mutex);
+		if (bo->cpu_ptr) {
+			atomic_inc(&bo->refcount);
+			bo_list[num_bos++] = bo;
+		}
+		pthread_mutex_unlock(&bo->cpu_access_mutex);
+	}
+	pthread_mutex_unlock(&dev->bo_table_mutex);
+
+	for (uint32_t i = 0; i < num_bos; i++) {
+		struct amdgpu_bo *bo = bo_list[i];
+		uintptr_t bo_start;
+		uintptr_t bo_end;
+
+		pthread_mutex_lock(&bo->cpu_access_mutex);
 		bo_start = (uintptr_t)bo->cpu_ptr;
-		bo_end = bo_start + bo->alloc_size;
-		cpu_start = (uintptr_t)cpu;
-		cpu_end = cpu_start + size;
-
-		if (unlikely(cpu_end < cpu_start)) {
+		if (!bo_start ||
+		    __builtin_add_overflow(bo_start, bo->alloc_size, &bo_end)) {
+			pthread_mutex_unlock(&bo->cpu_access_mutex);
 			continue;
 		}
 
 		if (cpu_start >= bo_start && cpu_end <= bo_end) {
 			*buf_handle = bo;
 			*offset_in_bo = cpu_start - bo_start;
-			r = 0;
 			bo_list[i] = NULL;
+			r = 0;
+			pthread_mutex_unlock(&bo->cpu_access_mutex);
 			break;
 		}
+		pthread_mutex_unlock(&bo->cpu_access_mutex);
 	}
 
-	for (i = 0; i < num_bos; i++) {
-		if (bo_list[i]) {
+	for (uint32_t i = 0; i < num_bos; i++) {
+		if (bo_list[i])
 			amdgpu_bo_free(bo_list[i]);
-		}
 	}
-
 	free(bo_list);
 
-	if (r == -ENXIO) {
-		*buf_handle = NULL;
-		*offset_in_bo = 0;
-	}
+	if (!r)
+		return 0;
 
-	return r;
+out_not_found:
+	*buf_handle = NULL;
+	*offset_in_bo = 0;
+	return -ENXIO;
 }
 
 drm_public int amdgpu_create_bo_from_user_mem(amdgpu_device_handle dev,
@@ -968,6 +936,8 @@ drm_public int amdgpu_bo_va_op(amdgpu_bo_handle bo,
 			       uint32_t ops)
 {
 	amdgpu_device_handle dev;
+
+	(void)flags;
 
 	if (unlikely(!bo)) {
 		return -EINVAL;
