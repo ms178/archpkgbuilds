@@ -286,14 +286,10 @@ drm_public int amdgpu_cs_query_reset_state2(amdgpu_context_handle context,
 static int amdgpu_cs_submit_one(amdgpu_context_handle context,
 				struct amdgpu_cs_request *ibs_request)
 {
-	struct drm_amdgpu_cs_chunk chunks_stack[AMDGPU_CS_STACK_CHUNKS];
-	struct drm_amdgpu_cs_chunk_data chunk_data_stack[AMDGPU_CS_STACK_CHUNKS];
-	struct drm_amdgpu_cs_chunk_dep dependencies_stack[AMDGPU_CS_STACK_DEPS];
-	struct drm_amdgpu_cs_chunk_dep sem_deps_stack[AMDGPU_CS_STACK_DEPS];
-	struct drm_amdgpu_cs_chunk *chunks = chunks_stack;
-	struct drm_amdgpu_cs_chunk_data *chunk_data = chunk_data_stack;
-	struct drm_amdgpu_cs_chunk_dep *dependencies = dependencies_stack;
-	struct drm_amdgpu_cs_chunk_dep *sem_dependencies = sem_deps_stack;
+	struct drm_amdgpu_cs_chunk *chunks;
+	struct drm_amdgpu_cs_chunk_data *chunk_data;
+	struct drm_amdgpu_cs_chunk_dep *dependencies = NULL;
+	struct drm_amdgpu_cs_chunk_dep *sem_dependencies = NULL;
 	amdgpu_device_handle dev = context->dev;
 	struct list_head *sem_list;
 	amdgpu_semaphore_handle sem, tmp;
@@ -328,20 +324,28 @@ static int amdgpu_cs_submit_one(amdgpu_context_handle context,
 	max_chunks = ibs_request->number_of_ibs + (user_fence ? 3U : 2U);
 	chunk_data_count = ibs_request->number_of_ibs + (user_fence ? 1U : 0U);
 
-	if (max_chunks > AMDGPU_CS_STACK_CHUNKS) {
+	if (max_chunks <= AMDGPU_CS_STACK_CHUNKS) {
+		chunks = alloca((size_t)max_chunks * sizeof(*chunks));
+	} else {
+#if UINT32_MAX > SIZE_MAX
 		if (unlikely((size_t)max_chunks > SIZE_MAX / sizeof(*chunks)))
 			return -EINVAL;
+#endif
 		chunks = malloc((size_t)max_chunks * sizeof(*chunks));
 		if (unlikely(!chunks))
 			return -ENOMEM;
 		chunks_on_heap = true;
 	}
 
-	if (chunk_data_count > AMDGPU_CS_STACK_CHUNKS) {
+	if (chunk_data_count <= AMDGPU_CS_STACK_CHUNKS) {
+		chunk_data = alloca((size_t)chunk_data_count * sizeof(*chunk_data));
+	} else {
+#if UINT32_MAX > SIZE_MAX
 		if (unlikely((size_t)chunk_data_count > SIZE_MAX / sizeof(*chunk_data))) {
 			r = -EINVAL;
 			goto out_free;
 		}
+#endif
 		chunk_data = malloc((size_t)chunk_data_count * sizeof(*chunk_data));
 		if (unlikely(!chunk_data)) {
 			r = -ENOMEM;
@@ -350,19 +354,26 @@ static int amdgpu_cs_submit_one(amdgpu_context_handle context,
 		chunk_data_on_heap = true;
 	}
 
-	if (ibs_request->number_of_dependencies > AMDGPU_CS_STACK_DEPS) {
-		if (unlikely((size_t)ibs_request->number_of_dependencies >
+	if (ibs_request->number_of_dependencies) {
+		if (ibs_request->number_of_dependencies <= AMDGPU_CS_STACK_DEPS) {
+			dependencies = alloca((size_t)ibs_request->number_of_dependencies *
+					     sizeof(*dependencies));
+		} else {
+#if UINT32_MAX > SIZE_MAX
+			if (unlikely((size_t)ibs_request->number_of_dependencies >
 			     SIZE_MAX / sizeof(*dependencies))) {
-			r = -EINVAL;
-			goto out_free;
+				r = -EINVAL;
+				goto out_free;
+			}
+#endif
+			dependencies = malloc((size_t)ibs_request->number_of_dependencies *
+					      sizeof(*dependencies));
+			if (unlikely(!dependencies)) {
+				r = -ENOMEM;
+				goto out_free;
+			}
+			dependencies_on_heap = true;
 		}
-		dependencies = malloc((size_t)ibs_request->number_of_dependencies *
-				      sizeof(*dependencies));
-		if (unlikely(!dependencies)) {
-			r = -ENOMEM;
-			goto out_free;
-		}
-		dependencies_on_heap = true;
 	}
 
 	if (ibs_request->resources)
@@ -429,11 +440,16 @@ static int amdgpu_cs_submit_one(amdgpu_context_handle context,
 	}
 
 	if (sem_count) {
-		if (sem_count > AMDGPU_CS_STACK_DEPS) {
+		if (sem_count <= AMDGPU_CS_STACK_DEPS) {
+			sem_dependencies = alloca((size_t)sem_count *
+						 sizeof(*sem_dependencies));
+		} else {
+#if UINT32_MAX > SIZE_MAX
 			if (unlikely((size_t)sem_count > SIZE_MAX / sizeof(*sem_dependencies))) {
 				r = -EINVAL;
 				goto error_unlock;
 			}
+#endif
 			sem_dependencies = malloc((size_t)sem_count *
 						  sizeof(*sem_dependencies));
 			if (unlikely(!sem_dependencies)) {
@@ -1023,8 +1039,7 @@ static int amdgpu_cs_submit_raw_common(amdgpu_device_handle dev,
 					   struct drm_amdgpu_cs_chunk *chunks,
 					   uint64_t *seq_no)
 {
-	uint64_t chunk_array_stack[AMDGPU_CS_STACK_CHUNKS];
-	uint64_t *chunk_array = chunk_array_stack;
+	uint64_t *chunk_array;
 	union drm_amdgpu_cs cs;
 	bool chunk_array_on_heap = false;
 	int r;
@@ -1032,9 +1047,13 @@ static int amdgpu_cs_submit_raw_common(amdgpu_device_handle dev,
 	if (!dev || !context || !chunks || num_chunks <= 0)
 		return -EINVAL;
 
-	if ((uint32_t)num_chunks > AMDGPU_CS_STACK_CHUNKS) {
+	if ((uint32_t)num_chunks <= AMDGPU_CS_STACK_CHUNKS) {
+		chunk_array = alloca((size_t)num_chunks * sizeof(*chunk_array));
+	} else {
+#if UINT32_MAX > SIZE_MAX
 		if (unlikely((size_t)num_chunks > SIZE_MAX / sizeof(*chunk_array)))
 			return -EINVAL;
+#endif
 		chunk_array = malloc((size_t)num_chunks * sizeof(*chunk_array));
 		if (unlikely(!chunk_array))
 			return -ENOMEM;

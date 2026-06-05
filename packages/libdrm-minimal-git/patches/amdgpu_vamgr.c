@@ -257,7 +257,8 @@ retry:
 
 			ret = amdgpu_vamgr_subtract_hole(hole, offset, end_va, &spare);
 			pthread_mutex_unlock(&mgr->bo_va_mutex);
-			free(spare);
+			if (spare)
+				free(spare);
 			if (unlikely(ret))
 				return ret;
 
@@ -300,7 +301,8 @@ retry:
 
 			ret = amdgpu_vamgr_subtract_hole(hole, offset, end_va, &spare);
 			pthread_mutex_unlock(&mgr->bo_va_mutex);
-			free(spare);
+			if (spare)
+				free(spare);
 			if (unlikely(ret))
 				return ret;
 
@@ -358,13 +360,17 @@ retry:
 		if (unlikely(__builtin_add_overflow(lower->offset, lower->size,
 							&lower_end))) {
 			pthread_mutex_unlock(&mgr->bo_va_mutex);
-			free(new_hole);
+			if (new_hole)
+				if (new_hole)
+				free(new_hole);
 			return;
 		}
 
 		if (unlikely(lower_end > va)) {
 			pthread_mutex_unlock(&mgr->bo_va_mutex);
-			free(new_hole);
+			if (new_hole)
+				if (new_hole)
+				free(new_hole);
 			return;
 		}
 	}
@@ -372,7 +378,9 @@ retry:
 	if (upper) {
 		if (unlikely(va_end > upper->offset)) {
 			pthread_mutex_unlock(&mgr->bo_va_mutex);
-			free(new_hole);
+			if (new_hole)
+				if (new_hole)
+				free(new_hole);
 			return;
 		}
 
@@ -403,7 +411,9 @@ retry:
 			}
 
 			pthread_mutex_unlock(&mgr->bo_va_mutex);
-			free(new_hole);
+			if (new_hole)
+				if (new_hole)
+				free(new_hole);
 			return;
 		}
 	}
@@ -414,13 +424,16 @@ retry:
 		if (unlikely(__builtin_add_overflow(lower->size, aligned_size,
 							&lower_size))) {
 			pthread_mutex_unlock(&mgr->bo_va_mutex);
-			free(new_hole);
+			if (new_hole)
+				if (new_hole)
+				free(new_hole);
 			return;
 		}
 
 		lower->size = lower_size;
 		pthread_mutex_unlock(&mgr->bo_va_mutex);
-		free(new_hole);
+		if (new_hole)
+			free(new_hole);
 		return;
 	}
 

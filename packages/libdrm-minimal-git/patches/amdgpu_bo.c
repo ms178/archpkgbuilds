@@ -613,8 +613,10 @@ retry:
 	if (!capacity)
 		goto out_not_found;
 
+#if UINT32_MAX > SIZE_MAX
 	if (unlikely((size_t)capacity > SIZE_MAX / sizeof(*bo_list)))
 		return -ENOMEM;
+#endif
 
 	bo_list = malloc((size_t)capacity * sizeof(*bo_list));
 	if (unlikely(!bo_list))
