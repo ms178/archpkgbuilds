@@ -1,0 +1,171 @@
+# Maintainer: ms178
+pkgname=kcgroups-dmemcg-suite
+_tag=dmemcg-experimental
+pkgver=0.1
+pkgrel=15
+pkgdesc="KDE cgroups library and foreground booster - ROCm/Ollama Optimized"
+arch=('i686' 'x86_64')
+url="https://github.com/pixelcluster/kcgroups"
+license=('LGPL-2.1-or-later')
+makedepends=('qt6-base' 'plasma-workspace' 'kwindowsystem' 'kconfig' 'kdbusaddons' 'cmake' 'extra-cmake-modules' 'git')
+provides=('kcgroups' 'plasma-foreground-booster')
+conflicts=('kcgroups' 'plasma-foreground-booster' 'kcgroups-git')
+source=("kcgroups::git+https://github.com/pixelcluster/kcgroups.git#tag=kcgroups-${_tag}"
+        "plasma-foreground-booster::git+https://github.com/pixelcluster/kcgroups.git#tag=booster-${_tag}")
+sha256sums=('SKIP' 'SKIP')
+
+prepare() {
+  cd "$srcdir/plasma-foreground-booster"
+
+  # 1. Inject robust Header
+  cat > foregroundbooster.h <<'EOF'
+#ifndef FOREGROUNDBOOSTER_H
+#define FOREGROUNDBOOSTER_H
+#include "boostersettings.h"
+#include <QHash>
+#include <QObject>
+#include <tasksmodel.h>
+#include <KApplicationScope>
+
+class ForegroundBooster : public QObject {
+    Q_OBJECT
+public:
+    ForegroundBooster(QObject *parent = nullptr);
+    ~ForegroundBooster();
+public Q_SLOTS:
+    void onActiveWindowChanged();
+    void onWindowRemoved(const QModelIndex &parent, int first, int last);
+    void promoteCriticalInfrastructure();
+private:
+    TaskManager::TasksModel *m_tasksModel;
+    BoosterSettings *m_settings;
+    uint m_currentPid = 0;
+    QString m_currentAppid;
+    QHash<uint, KApplicationScope *> m_appsByPid;
+    CGroupDeviceMemoryLimitList m_boostedGPUMemoryLimit;
+    CGroupDeviceMemoryLimitList m_nonBoostedGPUMemoryLimit;
+    CGroupDeviceMemoryLimitList m_criticalGPUMemoryLimit;
+    CGroupDeviceMemoryLimitList m_warmUIProtectionLimit;
+};
+#endif
+EOF
+
+  # 2. Inject high-performance Implementation
+  cat > foregroundbooster.cpp <<'EOF'
+#include "foregroundbooster.h"
+#include <QtCore>
+#include <abstracttasksmodel.h>
+#include <fstream>
+
+using namespace TaskManager;
+
+static const unsigned long DMEM_WARM_UI_FLOOR = 64 * 1024 * 1024;
+static const unsigned long DMEM_CRITICAL_BASELINE = 256 * 1024 * 1024;
+static const QStringList CRITICAL_APPS = {
+    QStringLiteral("kwin_wayland"), QStringLiteral("kwin_x11"),
+    QStringLiteral("org.kde.kwin"), QStringLiteral("plasma-kwin")
+};
+
+ForegroundBooster::ForegroundBooster(QObject *parent)
+    : QObject(parent), m_tasksModel(new TasksModel(this)), m_settings(new BoosterSettings(this)) {
+    connect(m_tasksModel, &TasksModel::activeTaskChanged, this, &ForegroundBooster::onActiveWindowChanged);
+    connect(m_tasksModel, &TasksModel::dataChanged, this, [this](const QModelIndex&, const QModelIndex&, const QList<int> &roles) {
+        if (roles.contains(AbstractTasksModel::IsWindow) || roles.isEmpty()) onActiveWindowChanged();
+    });
+
+    CGroupDeviceMemoryLimit limit;
+    std::ifstream capacityStream("/sys/fs/cgroup/dmem.capacity");
+    if (capacityStream.is_open()) {
+        for (std::string line; std::getline(capacityStream, line); ) {
+            auto pos = line.find(' ');
+            if (pos == std::string::npos) continue;
+            limit.path = QString::fromStdString(line.substr(0, pos));
+            unsigned long val = std::stoul(line.substr(pos + 1));
+            limit.limit = val; m_boostedGPUMemoryLimit.push_back(limit);
+            limit.limit = 0; m_nonBoostedGPUMemoryLimit.push_back(limit);
+            limit.limit = DMEM_CRITICAL_BASELINE; m_criticalGPUMemoryLimit.push_back(limit);
+            limit.limit = DMEM_WARM_UI_FLOOR; m_warmUIProtectionLimit.push_back(limit);
+        }
+    }
+    QTimer *timer = new QTimer(this);
+    connect(timer, &QTimer::timeout, this, &ForegroundBooster::promoteCriticalInfrastructure);
+    timer->start(5000);
+    QTimer::singleShot(1000, this, [this]() { promoteCriticalInfrastructure(); });
+}
+
+ForegroundBooster::~ForegroundBooster() {}
+
+void ForegroundBooster::promoteCriticalInfrastructure() {
+    QDir proc(QStringLiteral("/proc"));
+    for (const auto &entry : proc.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        bool ok; uint pid = entry.toUInt(&ok);
+        if (!ok) continue;
+        QFile f(QStringLiteral("/proc/%1/comm").arg(pid));
+        if (f.open(QIODevice::ReadOnly)) {
+            QString comm = QString::fromUtf8(f.readAll()).trimmed();
+            bool critical = false;
+            for (const auto &name : CRITICAL_APPS) if (comm.contains(name, Qt::CaseInsensitive)) { critical = true; break; }
+            if (critical) {
+                if (!m_appsByPid.contains(pid)) m_appsByPid[pid] = KApplicationScope::fromPid(pid, this);
+                if (m_appsByPid[pid]) m_appsByPid[pid]->setDeviceMemoryLow(m_criticalGPUMemoryLimit);
+            }
+        }
+    }
+}
+
+void ForegroundBooster::onWindowRemoved(const QModelIndex &parent, int first, int last) {
+    for (int i = first; i <= last; ++i) {
+        uint pid = m_tasksModel->data(m_tasksModel->index(i, 0, parent), AbstractTasksModel::AppPid).toUInt();
+        if (m_appsByPid.contains(pid)) {
+            KApplicationScope *app = m_appsByPid[pid];
+            bool critical = false;
+            for (const auto &name : CRITICAL_APPS) if (app && app->id().contains(name, Qt::CaseInsensitive)) { critical = true; break; }
+            if (!critical) { delete app; m_appsByPid.remove(pid); }
+        }
+    }
+}
+
+void ForegroundBooster::onActiveWindowChanged() {
+    promoteCriticalInfrastructure();
+    QModelIndex idx = m_tasksModel->activeTask();
+    if (idx == QModelIndex()) return;
+    uint pid = m_tasksModel->data(idx, AbstractTasksModel::AppPid).toUInt();
+    if (pid == m_currentPid || pid == 0) return;
+
+    KApplicationScope *prev = m_appsByPid.value(m_currentPid);
+    KApplicationScope *curr = m_appsByPid.contains(pid) ? m_appsByPid[pid] : (m_appsByPid[pid] = KApplicationScope::fromPid(pid, this));
+
+    if (prev && prev != curr) {
+        bool critical = false;
+        for (const auto &name : CRITICAL_APPS) if (prev->id().contains(name, Qt::CaseInsensitive)) { critical = true; break; }
+        if (!critical) {
+            prev->setCpuWeight(OptionalQULongLong());
+            if (prev->id().contains(QStringLiteral("ollama"), Qt::CaseInsensitive) || prev->id().contains(QStringLiteral("llama"), Qt::CaseInsensitive)) {
+                prev->setDeviceMemoryLow(m_boostedGPUMemoryLimit);
+            } else {
+                prev->setDeviceMemoryLow(m_warmUIProtectionLimit);
+            }
+        }
+    }
+    if (curr) {
+        curr->setCpuWeight(m_settings->boostedCpuWeight());
+        curr->setDeviceMemoryLow(m_boostedGPUMemoryLimit);
+    }
+    m_currentPid = pid;
+}
+EOF
+}
+
+build () {
+    mkdir -p kcgroups-build && cd kcgroups-build
+    cmake ../kcgroups -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_QT6=ON
+    make && mkdir -p ../kcgroups-install && make DESTDIR="../kcgroups-install" install
+    cd .. && mkdir -p plasma-foreground-booster-build && cd plasma-foreground-booster-build
+    CMAKE_PREFIX_PATH="$srcdir/kcgroups-install/usr" cmake ../plasma-foreground-booster -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release
+    make
+}
+
+package() {
+    make -C kcgroups-build DESTDIR="${pkgdir}" install
+    make -C plasma-foreground-booster-build DESTDIR="${pkgdir}" install
+}
