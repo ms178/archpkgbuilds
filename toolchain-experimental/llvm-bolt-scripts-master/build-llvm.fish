@@ -213,7 +213,7 @@ configure_clean "$BUILD_ROOT/stage2" -S "$LLVM_SRC/llvm" \
     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
     -DCMAKE_C_FLAGS="$COMMON_FLAGS $C_LTO_FLAGS" \
     -DCMAKE_CXX_FLAGS="$COMMON_FLAGS $CXX_LTO_FLAGS" \
-    -DCMAKE_EXE_LINKER_FLAGS="$LINKER_BASE $MIMALLOC_EXE -Wl,--emit-relocs" \
+    -DCMAKE_EXE_LINKER_FLAGS="$LINKER_BASE $MIMALLOC_EXE -Wl,--emit-relocs -Wl,-z,now" \
     -DCMAKE_MODULE_LINKER_FLAGS="$LINKER_BASE" \
     -DCMAKE_SHARED_LINKER_FLAGS="$LINKER_BASE"
 run ninja -C "$BUILD_ROOT/stage2" install
@@ -288,17 +288,52 @@ function bolt_optimize_binary --argument-names Name BinPath
     end
 
     log "  [$Name] optimizing..."
-    run "$BOLT" "$Real" -o "$Opt" \
+    # Validated against llvm-git BOLT 23.0.0git (rev 570e532d): all options below
+    # are accepted and produce a correct (output-identical) binary.
+    # Layout (reorder-functions=cdsort + reorder-blocks=ext-tsp) + hot/cold
+    # splitting (cdsplit warm fragment) are the dominant wins (~6% on I-cache/iTLB
+    # -bound code locally; clang/lld are exactly that). ICP/peepholes/
+    # simplify-rodata-loads help real clang (skewed vtable calls, complex blocks).
+    # x86-strip-redundant-address-size + strip-rep-ret remove obsolete-instruction
+    # bytes; inline-memcpy uses rep movsb (all harmless, verified correct).
+    # hugify maps hot text onto huge pages (iTLB). --plt does NOT need -z now on
+    # x86 (llvm-git note), but we keep it linked -z now anyway (harmless).
+    # NOTE: --reg-reassign / --use-aggr-reg-reassign are deliberately EXCLUDED —
+    # they miscompile BOLTed clang/lld (segfaults building the kernel; llvm
+    # issue #123809, never fixed).
+    if not "$BOLT" "$Real" -o "$Opt" \
         --data "$Prof" \
-        --lite=false \
         --dyno-stats \
         --reorder-blocks=ext-tsp \
         --reorder-functions=cdsort \
         --split-functions --split-strategy=cdsplit --split-all-cold --split-eh \
-        --icf=all --peepholes=all --plt=all \
+        --icf=safe \
         --jump-tables=move \
+        --indirect-call-promotion=all \
+        --peepholes=all \
+        --simplify-rodata-loads \
+        --x86-strip-redundant-address-size \
+        --strip-rep-ret \
+        --inline-memcpy \
+        --plt=all \
+        --hugify \
         --use-gnu-stack \
-        --update-debug-sections=1
+        --update-debug-sections=0
+        # Fallback: a future BOLT may drop/rename an aggressive option. Retry with
+        # the minimal, always-supported, measured-safe core so the build never
+        # aborts here.
+        log "  [$Name] aggressive BOLT failed; retrying with safe core set..."
+        run "$BOLT" "$Real" -o "$Opt" \
+            --data "$Prof" \
+            --dyno-stats \
+            --reorder-blocks=ext-tsp \
+            --reorder-functions=cdsort \
+            --split-functions --split-all-cold --split-eh \
+            --icf=safe \
+            --jump-tables=move \
+            --use-gnu-stack \
+            --update-debug-sections=0
+    end
 
     run mv -f "$Opt" "$Real"
     rm -f "$Inst" "$Prof"

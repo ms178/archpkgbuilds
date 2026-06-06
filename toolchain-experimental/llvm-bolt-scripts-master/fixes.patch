@@ -1,3 +1,268 @@
+From 6c1462d045581faccedd0470b091bf806cb6b926 Mon Sep 17 00:00:00 2001
+From: Kazu Hirata <kazu@google.com>
+Date: Fri, 5 Jun 2026 11:07:53 -0700
+Subject: [PATCH] [ProfileData] Lazy-load fixed-length MD5 name table
+
+When reading extensible binary format profiles with fixed-length MD5
+name tables, the reader eagerly allocates and populates a
+std::vector<FunctionId> to store the name table.  This eager loading
+is particularly wasteful when ProfileIsCS is false, as we populate the
+entire name table just to support lookups during profile ingestion,
+even though we may only use a subset of the profile.  Since FunctionId
+is 16 bytes on 64-bit systems, a name table containing 10 million MD5
+hash values would consume 160MB of heap memory.
+
+This patch implements lazy loading for the name table in extensible
+binary format profiles when the fixed-length MD5 layout is used.
+
+Specifically, this patch introduces SampleProfileNameTable to
+encapsulate the name table representation, supporting both lazy
+loading (pointing directly to the memory-mapped buffer) and eager
+loading (using a vector).  Eager loading is retained as a fallback for
+layouts that do not support O(1) random access (such as
+variable-length string tables).
+
+The reader transitions between these modes using setLazy and
+resetToEager.  The getNameTable interface is updated to return an
+iterator_range of SampleProfileNameTable::iterator, which reads the
+MD5 values directly from the buffer on-demand when lazy-loaded.
+
+- Heap consumption: Saves 16 bytes of heap memory for each name table
+  entry by avoiding the std::vector allocation.
+
+- Compilation performance: Saves about 4% on ThinLTO pre-link and 10%
+  on ThinLTO backend on shared and non-shared profiles.
+---
+ .../llvm/ProfileData/SampleProfReader.h       | 124 +++++++++++++++---
+ llvm/lib/ProfileData/SampleProfReader.cpp     |  23 ++--
+ 2 files changed, 111 insertions(+), 36 deletions(-)
+
+diff --git a/llvm/include/llvm/ProfileData/SampleProfReader.h b/llvm/include/llvm/ProfileData/SampleProfReader.h
+index 71140af3b25e3..d6e684e332546 100644
+--- a/llvm/include/llvm/ProfileData/SampleProfReader.h
++++ b/llvm/include/llvm/ProfileData/SampleProfReader.h
+@@ -344,27 +344,107 @@ class SampleProfileReaderItaniumRemapper {
+ /// is useful for debugging and testing, while the binary format is more
+ /// compact and I/O efficient. They can both be used interchangeably.
+ 
+-/// NameTableIterator is a lightweight, self-contained input iterator designed
+-/// to stream FunctionId symbols from an eagerly populated contiguous buffer
+-/// of FunctionId objects.
+-class NameTableIterator
+-    : public llvm::iterator_facade_base<
+-          NameTableIterator, std::input_iterator_tag, FunctionId,
+-          std::ptrdiff_t, const FunctionId *, FunctionId> {
+-  const FunctionId *Ptr = nullptr;
++/// Manages the sample profile name table, supporting both an eagerly loaded
++/// std::vector of FunctionId objects and lazy-loaded MD5 hashes read directly
++/// from the memory-mapped buffer. It enforces the exclusivity of these
++/// two formats and provides a unified read-only container interface.
++class SampleProfileNameTable {
++  const uint8_t *Start = nullptr;
++  size_t Size = 0;
++  std::vector<FunctionId> Vec;
++
++  /// Helper function to read a FunctionId (MD5 hash) from a raw buffer.
++  static FunctionId readFunctionIdFromMD5(const uint8_t *Ptr) {
++    using namespace support;
++    return FunctionId(
++        endian::read<uint64_t, unaligned>(Ptr, endianness::little));
++  }
+ 
+ public:
+-  NameTableIterator() = default;
+-  NameTableIterator(const FunctionId *P) : Ptr(P) {}
++  /// iterator is a lightweight, self-contained input iterator designed
++  /// to stream FunctionId symbols from either the memory-mapped
++  /// file buffer (lazy loading from the FixedMD5 layout) or from an eagerly
++  /// loaded vector of FunctionId objects (fallback).
++  class iterator
++      : public llvm::iterator_facade_base<iterator, std::input_iterator_tag,
++                                          FunctionId, std::ptrdiff_t,
++                                          const FunctionId *, FunctionId> {
++  public:
++    // Tag type to indicate the lazy name table layout.
++    struct UseLazy_t {};
++    static constexpr UseLazy_t UseLazy{};
++    iterator() = default;
++
++    // Constructor for lazy loading.
++    iterator(const uint8_t *P, UseLazy_t) : Ptr(P), IsLazy(true) {}
++
++    // Constructor for eagerly loaded name table.
++    iterator(const FunctionId *P)
++        : Ptr(reinterpret_cast<const uint8_t *>(P)), IsLazy(false) {}
++
++    bool operator==(const iterator &RHS) const { return Ptr == RHS.Ptr; }
++
++    iterator &operator++() {
++      Ptr += IsLazy ? sizeof(uint64_t) : sizeof(FunctionId);
++      return *this;
++    }
+ 
+-  bool operator==(const NameTableIterator &RHS) const { return Ptr == RHS.Ptr; }
++    FunctionId operator*() const {
++      return IsLazy ? readFunctionIdFromMD5(Ptr)
++                    : *reinterpret_cast<const FunctionId *>(Ptr);
++    }
++
++  private:
++    const uint8_t *Ptr = nullptr;
++    bool IsLazy = false;
++  };
++
++  using const_iterator = iterator;
++
++  SampleProfileNameTable() = default;
++
++  void clear() {
++    Start = nullptr;
++    Size = 0;
++    Vec.clear();
++  }
+ 
+-  NameTableIterator &operator++() {
+-    ++Ptr;
+-    return *this;
++  /// Transitions the table to lazy-loading mode, pointing directly to a
++  /// contiguous buffer of little-endian 64-bit MD5 hashes.
++  void setLazy(const uint8_t *S, size_t Sz) {
++    clear();
++    Start = S;
++    Size = Sz;
+   }
+ 
+-  FunctionId operator*() const { return *Ptr; }
++  /// Transitions the table to eager-loading mode by clearing previous state and
++  /// returning a mutable reference to the underlying vector for population.
++  std::vector<FunctionId> &resetToEager() {
++    clear();
++    return Vec;
++  }
++
++  size_t size() const { return Start ? Size : Vec.size(); }
++  bool empty() const { return size() == 0; }
++
++  FunctionId operator[](size_t Idx) const {
++    assert(Idx < size());
++    if (Start)
++      return readFunctionIdFromMD5(Start + Idx * sizeof(uint64_t));
++    return Vec[Idx];
++  }
++
++  iterator begin() const {
++    if (Start)
++      return {Start, iterator::UseLazy};
++    return {Vec.data()};
++  }
++
++  iterator end() const {
++    if (Start)
++      return {Start + Size * sizeof(uint64_t), iterator::UseLazy};
++    return {Vec.data() + Vec.size()};
++  }
+ };
+ 
+ class SampleProfileReader {
+@@ -520,8 +600,10 @@ class SampleProfileReader {
+ 
+   /// It includes all the names that have samples either in outline instance
+   /// or inline instance.
+-  virtual llvm::iterator_range<NameTableIterator> getNameTable() const {
+-    return {NameTableIterator(), NameTableIterator()};
++  virtual llvm::iterator_range<SampleProfileNameTable::iterator>
++  getNameTable() const {
++    return {SampleProfileNameTable::iterator(),
++            SampleProfileNameTable::iterator()};
+   }
+   virtual bool dumpSectionInfo(raw_ostream &OS = dbgs()) { return false; };
+ 
+@@ -676,9 +758,9 @@ class LLVM_ABI SampleProfileReaderBinary : public SampleProfileReader {
+ 
+   /// It includes all the names that have samples either in outline instance
+   /// or inline instance.
+-  llvm::iterator_range<NameTableIterator> getNameTable() const override {
+-    return {NameTableIterator(NameTable.data()),
+-            NameTableIterator(NameTable.data() + NameTable.size())};
++  llvm::iterator_range<SampleProfileNameTable::iterator>
++  getNameTable() const override {
++    return {NameTable.begin(), NameTable.end()};
+   }
+ 
+ protected:
+@@ -748,7 +830,7 @@ class LLVM_ABI SampleProfileReaderBinary : public SampleProfileReader {
+   const uint8_t *End = nullptr;
+ 
+   /// Function name table.
+-  std::vector<FunctionId> NameTable;
++  SampleProfileNameTable NameTable;
+ 
+   /// CSNameTable is used to save full context vectors. It is the backing buffer
+   /// for SampleContextFrames.
+diff --git a/llvm/lib/ProfileData/SampleProfReader.cpp b/llvm/lib/ProfileData/SampleProfReader.cpp
+index 766c0814ca067..0e956876b25cd 100644
+--- a/llvm/lib/ProfileData/SampleProfReader.cpp
++++ b/llvm/lib/ProfileData/SampleProfReader.cpp
+@@ -1241,8 +1241,8 @@ std::error_code SampleProfileReaderBinary::readNameTable() {
+   // because optimization passes can only handle either type.
+   bool UseMD5 = useMD5();
+ 
+-  NameTable.clear();
+-  NameTable.reserve(*Size);
++  auto &TableVec = NameTable.resetToEager();
++  TableVec.reserve(*Size);
+   if (!ProfileIsCS) {
+     MD5SampleContextTable.clear();
+     if (UseMD5)
+@@ -1261,9 +1261,9 @@ std::error_code SampleProfileReaderBinary::readNameTable() {
+       FunctionId FID(*Name);
+       if (!ProfileIsCS)
+         MD5SampleContextTable.emplace_back(FID.getHashCode());
+-      NameTable.emplace_back(FID);
++      TableVec.emplace_back(FID);
+     } else
+-      NameTable.push_back(FunctionId(*Name));
++      TableVec.push_back(FunctionId(*Name));
+   }
+   if (!ProfileIsCS)
+     MD5SampleContextStart = MD5SampleContextTable.data();
+@@ -1286,14 +1286,7 @@ SampleProfileReaderExtBinaryBase::readNameTableSec(bool IsMD5,
+     if (Data + (*Size) * sizeof(uint64_t) > End)
+       return sampleprof_error::truncated;
+ 
+-    NameTable.clear();
+-    NameTable.reserve(*Size);
+-    for (size_t I = 0; I < *Size; ++I) {
+-      using namespace support;
+-      uint64_t FID = endian::read<uint64_t, unaligned>(
+-          Data + I * sizeof(uint64_t), endianness::little);
+-      NameTable.emplace_back(FunctionId(FID));
+-    }
++    NameTable.setLazy(Data, *Size);
+     if (!ProfileIsCS)
+       MD5SampleContextStart = reinterpret_cast<const uint64_t *>(Data);
+     Data = Data + (*Size) * sizeof(uint64_t);
+@@ -1306,8 +1299,8 @@ SampleProfileReaderExtBinaryBase::readNameTableSec(bool IsMD5,
+     if (std::error_code EC = Size.getError())
+       return EC;
+ 
+-    NameTable.clear();
+-    NameTable.reserve(*Size);
++    auto &TableVec = NameTable.resetToEager();
++    TableVec.reserve(*Size);
+     if (!ProfileIsCS)
+       MD5SampleContextTable.resize(*Size);
+     for (size_t I = 0; I < *Size; ++I) {
+@@ -1316,7 +1309,7 @@ SampleProfileReaderExtBinaryBase::readNameTableSec(bool IsMD5,
+         return EC;
+       if (!ProfileIsCS)
+         support::endian::write64le(&MD5SampleContextTable[I], *FID);
+-      NameTable.emplace_back(FunctionId(*FID));
++      TableVec.emplace_back(FunctionId(*FID));
+     }
+     if (!ProfileIsCS)
+       MD5SampleContextStart = MD5SampleContextTable.data();
+
 diff --git a/bolt/include/bolt/Core/MCPlusBuilder.h b/bolt/include/bolt/Core/MCPlusBuilder.h
 index 69e45ca32..12bee5009 100644
 --- a/bolt/include/bolt/Core/MCPlusBuilder.h
