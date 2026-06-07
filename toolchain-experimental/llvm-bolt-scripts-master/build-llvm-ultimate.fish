@@ -36,9 +36,16 @@ set -q BOLT_BEST_EFFORT; or set -g BOLT_BEST_EFFORT 0
 set -q FULL_TRAIN; or set -g FULL_TRAIN 1
 set -q DO_CSPGO; or set -g DO_CSPGO 1
 set -q USE_MIMALLOC; or set -g USE_MIMALLOC 1
+# Keep the post-BOLT backup of the pre-BOLT binary on disk (~200 MB each).
+# Default 0 = remove after successful BOLT; set to 1 to keep for forensics.
+set -q KEEP_PRE_BOLT_BACKUP; or set -g KEEP_PRE_BOLT_BACKUP 0
 
 set -g NPROC (nproc)
-set -g LTO_JOBS (math -s0 "max(2, round($NPROC / 4))")
+# ThinLTO parallel link jobs. Default: NPROC/4 (conservative; sized for
+# ~8 GB peak per link job on a 32 GB host). Override via env to push
+# higher on machines with more RAM (a 14700KF + 32 GB can typically do
+# NPROC/3 or NPROC/2; 64 GB easily handles NPROC/2).
+set -q LTO_JOBS; or set -g LTO_JOBS (math -s0 "max(2, round($NPROC / 4))")
 
 # Identical VP for PGO and CSPGO (critical to avoid ProfileSummary ID conflicts)
 set -g VP_COUNTERS_PER_SITE 8
@@ -96,8 +103,12 @@ end
 # === Copy source to /tmp + clean non-essential parts (EXPLICITLY PRESERVE docs + bolt/polly) ===
 set -g LLVM_SRC_TMP "/tmp/llvm-project-src-$USER"
 log "Copying source to /tmp for build: $LLVM_SRC_TMP (deleting old tmp source first)"
-rm -rf "$LLVM_SRC_TMP"
-cp -a "$PWD" "$LLVM_SRC_TMP" || die "Failed to copy source to /tmp"
+rm -rf "$LLVM_SRC_TMP" "$LLVM_SRC_TMP.partial"
+cp -a "$PWD" "$LLVM_SRC_TMP.partial" || begin
+    rm -rf "$LLVM_SRC_TMP.partial"
+    die "Failed to copy source to /tmp"
+end
+mv "$LLVM_SRC_TMP.partial" "$LLVM_SRC_TMP" || die "Failed to atomically install /tmp source tree"
 
 
 set -g LLVM_SRC "$LLVM_SRC_TMP"
@@ -114,12 +125,17 @@ set -g PATCHES 01-corecount.patch 02-fixes.patch 04-polly.patch 05-raptorlake.pa
 set -g STAMP "$LLVM_SRC/.ms178-patches-applied"
 
 function find_patch --argument-names name
+    # Search order:
+    #   1. $PATCH_DIR    (env override; same as SCRIPT_DIR by default)
+    #   2. $SCRIPT_DIR   (next to this build script)
+    #   3. $PWD          (caller's working directory)
+    #   4. ~/Downloads/llvm-bolt-scripts-master  (ms178 convention)
+    #   5. literal $name (so absolute paths work)
     set -l candidates \
         "$PATCH_DIR/$name" \
         "$SCRIPT_DIR/$name" \
         "$PWD/$name" \
         "$HOME/Downloads/llvm-bolt-scripts-master/$name" \
-        "/home/marcus/Downloads/llvm-bolt-scripts-master/$name" \
         "$name"
     for cand in $candidates
         if test -f "$cand"
@@ -139,30 +155,62 @@ if not test -f "$STAMP"
             die "patch file missing: $p (searched: $searched). Put patches next to the script or in Downloads/llvm-bolt-scripts-master"
         end
 
-        # Dry-run first for every patch. This catches rebase issues early (especially for custom raptorlake.patch or x86isellowcpp.patch on latest master).
+        # Strict dry-run: zero offset, zero fuzz. All shipped patches are
+        # verified to apply cleanly against today's llvm-project main with
+        # --fuzz=0 -F0; if any drift creeps in we want to know IMMEDIATELY.
         set -l dry_log "/tmp/patch-$p-dry.log"
-        if not patch --dry-run -p1 -d "$LLVM_SRC" --fuzz=3 --no-backup-if-mismatch < "$pf" > "$dry_log" 2>&1
+        if not patch --dry-run -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch < "$pf" > "$dry_log" 2>&1
             log "  - $p from $pf would NOT apply cleanly!"
             log "  --- DRY RUN OUTPUT ---"
             cat "$dry_log"
             log "  ----------------------"
             die "Patch $p failed --dry-run. The tree may need to be rebased or the patch updated for current llvm-project master. Aborting before any changes."
         end
+
+        # Count files the patch will touch for the success banner below.
+        set -l n_files (grep -c '^patching file ' "$dry_log")
         rm -f "$dry_log"
-        log "  + $p from $pf (dry-run OK)"
+        log "  + $p from $pf (dry-run OK, $n_files files)"
     end
 
     log "All patches passed dry-run. Applying for real..."
     for p in $PATCHES
         set -l pf (find_patch $p)
         log "  + applying $p from $pf"
-        # Apply and capture real exit status (the pipe to tail would hide patch's status)
-        patch -p1 -d "$LLVM_SRC" --fuzz=3 --no-backup-if-mismatch < "$pf" > /tmp/patch-$p.log 2>&1
+
+        # Apply and capture real exit status (the pipe to tail would hide
+        # patch's status). Real output is preserved per-patch in
+        # /tmp/patch-<name>.log for forensics if anything goes wrong.
+        set -l real_log "/tmp/patch-$p.log"
+        patch -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch < "$pf" > "$real_log" 2>&1
         set -l patch_status $status
-        tail -5 /tmp/patch-$p.log
+
+        # SHOW THE FULL LIST OF PATCHED FILES — no truncation.
+        grep -E '^patching file |^Hunk |reject|FAILED|offset|fuzz' "$real_log" \
+            | sed 's/^/      /'
+
         if test $patch_status -ne 0
-            die "Failed to apply $p (exit status $patch_status). See /tmp/patch-$p.log for details. (This should not happen after successful dry-run.)"
+            log "  --- FULL PATCH LOG ---"
+            cat "$real_log"
+            log "  ----------------------"
+            die "Failed to apply $p (exit status $patch_status). See $real_log for details. (This should not happen after successful dry-run.)"
         end
+
+        # Defence-in-depth: even with rc=0, scan the tree for stray .rej
+        # files in case `patch` ever silently dropped a hunk. Under
+        # --fuzz=0 -F0 this should be impossible, but if it ever happens
+        # we want a hard stop rather than a corrupt source tree.
+        set -l rej_count (find "$LLVM_SRC" -name '*.rej' 2>/dev/null | count)
+        if test $rej_count -gt 0
+            log "  --- REJECT FILES FOUND ---"
+            find "$LLVM_SRC" -name '*.rej' 2>/dev/null
+            die "Patch $p left $rej_count .rej files behind. Bailing out."
+        end
+
+        # Per-patch summary so the apply section's bookkeeping matches the
+        # dry-run section's bookkeeping at a glance.
+        set -l n_files (grep -c '^patching file ' "$real_log")
+        log "    -> $n_files files patched, log: $real_log"
     end
     date > "$STAMP"
     log "All patches applied successfully to $LLVM_SRC"
@@ -233,14 +281,16 @@ set -g TRAIN_FILES \
 
 for f in $TRAIN_FILES
     if test -f "$f"
-        set -l ext (string split . $f)[-1]
-        if test "$ext" = "cpp"; or test "$ext" = "cc"
+        set -l ext (path extension -- $f)
+        if test "$ext" = ".cpp"; or test "$ext" = ".cc"; or test "$ext" = ".cxx"
             "$BUILD_ROOT/stage1/bin/clang++" $COMMON_FLAGS -fno-lto -fuse-ld=lld \
                 -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" \
                 -std=c++17 -c "$f" -o /dev/null 2>/dev/null
-        else
+        else if test "$ext" = ".c"
             "$BUILD_ROOT/stage1/bin/clang" $COMMON_FLAGS -fno-lto -fuse-ld=lld \
                 -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$f" -o /dev/null 2>/dev/null
+        else
+            log "    skipping training of $f (unknown extension '$ext')"
         end
     end
 end
@@ -257,14 +307,22 @@ if test "$FULL_TRAIN" = "1"
 end
 
 set -e LLVM_PROFILE_FILE
-$PROFDATA merge -output="$BUILD_ROOT/clang.profdata" "$BUILD_ROOT/profiles"/pgo-*.profraw
-log "PGO profdata ready"
+
+# Explicit glob expansion via `path filter` so a missing-profile scenario
+# (training produced zero .profraw files for some reason) hard-fails with a
+# clear message instead of fish's generic "No matches for wildcard" error.
+set -l _pgo_raw (path filter -- "$BUILD_ROOT/profiles"/pgo-*.profraw)
+test (count $_pgo_raw) -gt 0; or die "PGO training produced no .profraw files in $BUILD_ROOT/profiles (check stage1 + train compiler output)"
+$PROFDATA merge -output="$BUILD_ROOT/clang.profdata" $_pgo_raw; or die "llvm-profdata merge (PGO) failed"
+log "PGO profdata ready ("(count $_pgo_raw)" raw profile fragments merged)"
 set -g FINAL_PROFDATA "$BUILD_ROOT/clang.profdata"
 
 # CSPGO (identical VP=8)
 if test "$DO_CSPGO" = "1"
     log ">>> CSPGO: Context sensitive..."
-    set -g csd "$BUILD_ROOT/stage-cs-instr"
+    # Use block-local scope: csd is only referenced inside this if-block,
+    # so promoting it to global needlessly pollutes the global namespace.
+    set -l csd "$BUILD_ROOT/stage-cs-instr"
     configure_clean "$csd" -S "$LLVM_SRC/llvm" \
         -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS="clang;lld" -DLLVM_TARGETS_TO_BUILD="X86;BPF" \
         -DLLVM_USE_LINKER=lld -DLLVM_BUILD_INSTRUMENTED=CSIR -DLLVM_PROFDATA_FILE="$BUILD_ROOT/clang.profdata" \
@@ -275,10 +333,10 @@ if test "$DO_CSPGO" = "1"
     set -gx LLVM_PROFILE_FILE "$BUILD_ROOT/profiles/cs-%m.profraw"
     for f in $TRAIN_FILES
         if test -f "$f"
-            set -l ext (string split . $f)[-1]
-            if test "$ext" = "cpp"; or test "$ext" = "cc"
+            set -l ext (path extension -- $f)
+            if test "$ext" = ".cpp"; or test "$ext" = ".cc"; or test "$ext" = ".cxx"
                 "$csd/bin/clang++" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -std=c++17 -c "$f" -o /dev/null 2>/dev/null
-            else
+            else if test "$ext" = ".c"
                 "$csd/bin/clang" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$f" -o /dev/null 2>/dev/null
             end
         end
@@ -296,8 +354,12 @@ if test "$DO_CSPGO" = "1"
     end
 
     set -e LLVM_PROFILE_FILE
-    $PROFDATA merge -output="$BUILD_ROOT/cs.profdata" "$BUILD_ROOT/profiles"/cs-*.profraw
-    $PROFDATA merge -output="$BUILD_ROOT/final.profdata" "$BUILD_ROOT/clang.profdata" "$BUILD_ROOT/cs.profdata"
+
+    set -l _cs_raw (path filter -- "$BUILD_ROOT/profiles"/cs-*.profraw)
+    test (count $_cs_raw) -gt 0; or die "CSPGO training produced no .profraw files in $BUILD_ROOT/profiles"
+    $PROFDATA merge -output="$BUILD_ROOT/cs.profdata" $_cs_raw; or die "llvm-profdata merge (CSPGO) failed"
+    $PROFDATA merge -output="$BUILD_ROOT/final.profdata" "$BUILD_ROOT/clang.profdata" "$BUILD_ROOT/cs.profdata"; or die "llvm-profdata final merge failed"
+    log "CSPGO profdata ready ("(count $_cs_raw)" raw profile fragments merged into final.profdata)"
     set -g FINAL_PROFDATA "$BUILD_ROOT/final.profdata"
 end
 
@@ -314,7 +376,7 @@ configure_clean "$BUILD_ROOT/stage2" -S "$LLVM_SRC/llvm" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
     -DLLVM_ENABLE_PROJECTS="clang;lld;bolt;polly" -DLLVM_ENABLE_RUNTIMES="compiler-rt" -DLLVM_TARGETS_TO_BUILD="X86;BPF" \
     -DLLVM_USE_LINKER=lld -DCLANG_DEFAULT_LINKER=lld -DLLVM_ENABLE_LTO=Thin -DLLVM_PROFDATA_FILE="$FINAL_PROFDATA" \
-    -DLLVM_THINLTO_CACHE_PATH="$THINLTO_CACHE" -DLLVM_OPTIMIZED_TABLEGEN=ON -DLLVM_INCLUDE_TESTS=OFF \
+    -DLLVM_THINLTO_CACHE_PATH="$THINLTO_CACHE" -DLLVM_INCLUDE_TESTS=OFF \
     -DLLVM_TABLEGEN="$BUILD_ROOT/stage1/bin/llvm-tblgen" \
     -DCLANG_TABLEGEN="$BUILD_ROOT/stage1/bin/clang-tblgen" \
     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_FLAGS="$COMMON_FLAGS $C_LTO_FLAGS" -DCMAKE_CXX_FLAGS="$COMMON_FLAGS $CXX_LTO_FLAGS" \
@@ -344,16 +406,20 @@ if not llvm-readelf -S "$clang_real" 2>/dev/null | grep -q '\.rela\.text'
     log " Stage 2 must have been linked with -Wl,--emit-relocs."
 end
 
-# Detect if a binary has already been processed by BOLT (prevents "input file was processed by BOLT. Cannot re-optimize")
+# Detect if a binary has already been processed by BOLT (prevents
+# "input file was processed by BOLT. Cannot re-optimize"). Matches what
+# upstream bolt/README.md documents: every BOLT output gets a section
+# named exactly `.note.bolt_info` carrying the BOLT revision string.
 function is_already_bolted --argument-names BinPath
     set -l f (realpath "$BinPath")
     test -f "$f"; or return 1
 
-    # Readelf is the only 100% reliable way to detect a BOLT-processed binary,
-    # because BOLT explicitly injects a .note.bolt section.
-    # `strings | grep BOLT` is highly dangerous because LLVM/Clang binaries
-    # inherently contain the string "BOLT" (they literally contain the bolt source path and references).
-    llvm-readelf -S "$f" 2>/dev/null | grep -q '\.note\.bolt'; and return 0
+    # Use the exact section name to avoid coincidental substring matches
+    # against any future `.note.bolt*` section. `strings | grep BOLT` is
+    # NOT safe — every LLVM/clang binary embeds source paths containing
+    # the literal "BOLT" string (e.g. .../bolt/Rewrite/RewriteInstance.cpp).
+    # `\b` word-boundary anchor pins the match to the documented name.
+    llvm-readelf -S "$f" 2>/dev/null | grep -qE '\.note\.bolt_info\b'; and return 0
     return 1
 end
 
@@ -366,9 +432,11 @@ function bolt_optimize_binary --argument-names Name BinPath
 
     test -f "$Real"; or return 0
 
-    # NEW: Skip gracefully if already BOLTed (allows re-running the script or recovering from partial BOLT runs)
+    # Skip gracefully if already BOLTed (allows re-running the script or
+    # recovering from partial BOLT runs without llvm-bolt's "Cannot
+    # re-optimize" error).
     if is_already_bolted "$Real"
-        log "  [$Name] already BOLT-processed (detected .note.bolt section), skipping."
+        log "  [$Name] already BOLT-processed (detected .note.bolt_info section), skipping."
         return 0
     end
 
@@ -429,6 +497,17 @@ function bolt_optimize_binary --argument-names Name BinPath
 
     mv -f "$Opt" "$Real"
     rm -f "$Inst" "$Prof"
+
+    # By default, drop the pre-BOLT backup once the BOLTed binary is in
+    # place. clang is ~200 MB and ld.lld ~60 MB; keeping the backup permanently
+    # silently doubles the install footprint. Set KEEP_PRE_BOLT_BACKUP=1 to
+    # preserve them (e.g. for A/B perf testing).
+    if test "$KEEP_PRE_BOLT_BACKUP" = "1"
+        log "  [$Name] keeping pre-BOLT backup at $Backup (KEEP_PRE_BOLT_BACKUP=1)"
+    else
+        rm -f "$Backup"
+        log "  [$Name] removed pre-BOLT backup (set KEEP_PRE_BOLT_BACKUP=1 to keep)"
+    end
 end
 
 function bolt_train_clang --argument-names Bin
@@ -471,8 +550,14 @@ else if test -e "$INSTALL_PREFIX/bin/lld"
     bolt_optimize_binary lld "$INSTALL_PREFIX/bin/lld"
 end
 
-# Final clean of bolt work dirs (fdata cleaned inside bolt_optimize)
-rm -rf "$BUILD_ROOT/bolt"* 2>/dev/null || true
+# Final clean of bolt work dirs (fdata cleaned inside bolt_optimize).
+# Pattern-expand explicitly with `path filter` so fish doesn't error out
+# with "No matches for wildcard" when the dirs are already gone. The old
+# `rm -rf "$BUILD_ROOT/bolt"* 2>/dev/null || true` failed quiet-AND-noisy:
+# fish's wildcard expansion fires before the redirect, so stderr leaked
+# and the rc landed at 124 even with `|| true`.
+set -l _bolt_leftovers (path filter -- "$BUILD_ROOT"/bolt*)
+test (count $_bolt_leftovers) -gt 0; and rm -rf $_bolt_leftovers
 
 log "ULTIMATE build finished. Toolchain at: $INSTALL_PREFIX"
 log "Source was fresh cloned, copied to /tmp ($LLVM_SRC), non-essential parts cleaned while preserving docs/bolt/polly."
