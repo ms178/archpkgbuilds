@@ -28,7 +28,9 @@ set -q INSTALL_PREFIX; or set -g INSTALL_PREFIX "$HOME/toolchain/llvm-ultimate"
 set -q BUILD_ROOT; or set -g BUILD_ROOT "/tmp/llvm-build-$USER"
 set -q THINLTO_CACHE; or set -g THINLTO_CACHE "$BUILD_ROOT/thinlto-cache"
 
-set -q PATCH_DIR; or set -g PATCH_DIR (dirname (status filename))
+# Robust script directory (absolute) so patches are found reliably no matter how the script is invoked
+set -g SCRIPT_DIR (dirname (realpath (status --current-filename)))
+set -q PATCH_DIR; or set -g PATCH_DIR "$SCRIPT_DIR"
 
 set -q BOLT_BEST_EFFORT; or set -g BOLT_BEST_EFFORT 0
 set -q FULL_TRAIN; or set -g FULL_TRAIN 1
@@ -40,7 +42,6 @@ set -g LTO_JOBS (math -s0 "max(2, round($NPROC / 4))")
 
 # Identical VP for PGO and CSPGO (critical to avoid ProfileSummary ID conflicts)
 set -g VP_COUNTERS_PER_SITE 8
-
 set -g COMMON_FLAGS "-O3 -march=native -mtune=native -fno-semantic-interposition -falign-functions=32 -falign-loops=32 -fcf-protection=none -mharden-sls=none -fno-plt"
 set -g C_LTO_FLAGS "-flto=thin -fsplit-lto-unit"
 set -g CXX_LTO_FLAGS "-flto=thin -fwhole-program-vtables"
@@ -83,7 +84,6 @@ end
 
 log "Cloning ( --filter=blob:none --depth=1 )..."
 git clone --filter=blob:none --depth=1 https://github.com/llvm/llvm-project.git || die "Clone failed"
-
 cd llvm-project || die "cd llvm-project failed"
 
 # lld ELF-only patch (applied to home tree before copy so copy gets it)
@@ -99,11 +99,6 @@ log "Copying source to /tmp for build: $LLVM_SRC_TMP (deleting old tmp source fi
 rm -rf "$LLVM_SRC_TMP"
 cp -a "$PWD" "$LLVM_SRC_TMP" || die "Failed to copy source to /tmp"
 
-log "Cleaning non-essential parts from /tmp source copy to save space (tests, unittests, mlir, flang tests, test-suite etc. -- ALL docs dirs + bolt/polly trees EXPLICITLY PRESERVED)"
-for sub in llvm/test llvm/unittests clang/test clang/unittests lld/test lld/unittests flang/test flang/unittests test-suite mlir
-    rm -rf "$LLVM_SRC_TMP/$sub" 2>/dev/null || true
-end
-# Note: do NOT rm docs, llvm/docs, clang/docs, lld/docs, bolt/, polly/ etc. -- CMake requires them
 
 set -g LLVM_SRC "$LLVM_SRC_TMP"
 log "Source for build now at $LLVM_SRC on /tmp (docs + bolt/polly preserved)"
@@ -114,13 +109,14 @@ for t in cmake ninja clang clang++ ld.lld llvm-profdata
     command -q $t; or die "missing $t"
 end
 
-# === Robust patch handling for ms178 patches (works from script dir or /home/marcus/Downloads/... etc) ===
-set -g PATCHES corecount.patch fixes.patch polly.patch raptorlake.patch x86isellowcpp.patch optimizations.patch
+# === Robust patch handling for ms178 patches ===
+set -g PATCHES 01-corecount.patch 02-fixes.patch 04-polly.patch 05-raptorlake.patch 06-x86isellowcpp.patch 03-optimizations.patch
 set -g STAMP "$LLVM_SRC/.ms178-patches-applied"
 
 function find_patch --argument-names name
     set -l candidates \
         "$PATCH_DIR/$name" \
+        "$SCRIPT_DIR/$name" \
         "$PWD/$name" \
         "$HOME/Downloads/llvm-bolt-scripts-master/$name" \
         "/home/marcus/Downloads/llvm-bolt-scripts-master/$name" \
@@ -135,19 +131,48 @@ function find_patch --argument-names name
 end
 
 if not test -f "$STAMP"
-    log "Applying raptorlake etc patches (robust search)..."
+    log "Pre-checking all patches with --dry-run (to avoid partial application on failure)..."
     for p in $PATCHES
         set -l pf (find_patch $p)
         if test -z "$pf"
-            set -l searched "$PATCH_DIR, $PWD, ~/Downloads/llvm-bolt-scripts-master, /home/marcus/Downloads/llvm-bolt-scripts-master, current dir"
+            set -l searched "$PATCH_DIR ($SCRIPT_DIR), $PWD, ~/Downloads/llvm-bolt-scripts-master, /home/marcus/Downloads/llvm-bolt-scripts-master, current dir"
             die "patch file missing: $p (searched: $searched). Put patches next to the script or in Downloads/llvm-bolt-scripts-master"
         end
-        log "  + $p from $pf"
-        patch -p1 -d "$LLVM_SRC" --fuzz=3 --no-backup-if-mismatch < "$pf" 2>&1 | tail -1
+
+        # Dry-run first for every patch. This catches rebase issues early (especially for custom raptorlake.patch or x86isellowcpp.patch on latest master).
+        set -l dry_log "/tmp/patch-$p-dry.log"
+        if not patch --dry-run -p1 -d "$LLVM_SRC" --fuzz=3 --no-backup-if-mismatch < "$pf" > "$dry_log" 2>&1
+            log "  - $p from $pf would NOT apply cleanly!"
+            log "  --- DRY RUN OUTPUT ---"
+            cat "$dry_log"
+            log "  ----------------------"
+            die "Patch $p failed --dry-run. The tree may need to be rebased or the patch updated for current llvm-project master. Aborting before any changes."
+        end
+        rm -f "$dry_log"
+        log "  + $p from $pf (dry-run OK)"
+    end
+
+    log "All patches passed dry-run. Applying for real..."
+    for p in $PATCHES
+        set -l pf (find_patch $p)
+        log "  + applying $p from $pf"
+        # Apply and capture real exit status (the pipe to tail would hide patch's status)
+        patch -p1 -d "$LLVM_SRC" --fuzz=3 --no-backup-if-mismatch < "$pf" > /tmp/patch-$p.log 2>&1
+        set -l patch_status $status
+        tail -5 /tmp/patch-$p.log
+        if test $patch_status -ne 0
+            die "Failed to apply $p (exit status $patch_status). See /tmp/patch-$p.log for details. (This should not happen after successful dry-run.)"
+        end
     end
     date > "$STAMP"
-    log "All patches applied to $LLVM_SRC"
+    log "All patches applied successfully to $LLVM_SRC"
 end
+
+log "Cleaning non-essential parts from /tmp source copy to save space (tests, unittests, mlir, flang tests, test-suite etc. -- ALL docs dirs + bolt/polly trees EXPLICITLY PRESERVED)"
+for sub in llvm/test llvm/unittests clang/test clang/unittests lld/test lld/unittests flang/test flang/unittests test-suite mlir
+    rm -rf "$LLVM_SRC_TMP/$sub" 2>/dev/null || true
+end
+# Note: do NOT rm docs, llvm/docs, clang/docs, lld/docs, bolt/, polly/ etc. -- CMake requires them
 
 # configure_clean helper
 set -g CMAKE_FRESH ""
@@ -190,7 +215,6 @@ run ninja -C "$BUILD_ROOT/stage1" clang lld llvm-profdata llvm-tblgen llvm-min-t
 
 test -x "$BUILD_ROOT/stage1/bin/llvm-tblgen" || die "stage1 llvm-tblgen missing"
 test -x "$BUILD_ROOT/stage1/bin/clang-tblgen" || die "stage1 clang-tblgen missing"
-
 set -g PROFDATA "$BUILD_ROOT/stage1/bin/llvm-profdata"
 test -x "$PROFDATA"; or set -g PROFDATA (command -v llvm-profdata)
 
@@ -210,7 +234,7 @@ set -g TRAIN_FILES \
 for f in $TRAIN_FILES
     if test -f "$f"
         set -l ext (string split . $f)[-1]
-        if test "$ext" = "cpp" -o "$ext" = "cc"
+        if test "$ext" = "cpp"; or test "$ext" = "cc"
             "$BUILD_ROOT/stage1/bin/clang++" $COMMON_FLAGS -fno-lto -fuse-ld=lld \
                 -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" \
                 -std=c++17 -c "$f" -o /dev/null 2>/dev/null
@@ -252,7 +276,7 @@ if test "$DO_CSPGO" = "1"
     for f in $TRAIN_FILES
         if test -f "$f"
             set -l ext (string split . $f)[-1]
-            if test "$ext" = "cpp" -o "$ext" = "cc"
+            if test "$ext" = "cpp"; or test "$ext" = "cc"
                 "$csd/bin/clang++" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -std=c++17 -c "$f" -o /dev/null 2>/dev/null
             else
                 "$csd/bin/clang" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$f" -o /dev/null 2>/dev/null
@@ -314,7 +338,6 @@ set -g MERGE "$INSTALL_PREFIX/bin/merge-fdata"
 function is_already_bolted --argument-names BinPath
     set -l f (realpath "$BinPath")
     test -f "$f"; or return 1
-
     # BOLT leaves these markers after successful processing
     nm -D "$f" 2>/dev/null | grep -q __bolt_runtime_start; and return 0
     strings "$f" 2>/dev/null | grep -q __bolt_runtime_start; and return 0
@@ -327,6 +350,7 @@ function bolt_optimize_binary --argument-names Name BinPath
     set -l Prof "$BUILD_ROOT/$Name.bolt.fdata"
     set -l Inst "$Real.inst"
     set -l Opt "$Real.bolt"
+
     test -f "$Real"; or return 0
 
     # NEW: Skip gracefully if already BOLTed (allows re-running the script or recovering from partial BOLT runs)
@@ -380,6 +404,7 @@ function bolt_optimize_binary --argument-names Name BinPath
         --icf=safe --jump-tables=move --indirect-call-promotion=all --peepholes=all \
         --simplify-rodata-loads --x86-strip-redundant-address-size --strip-rep-ret --inline-memcpy \
         --plt=all --hugify --use-gnu-stack --update-debug-sections=0
+
         log "  [$Name] aggressive BOLT failed; retrying with safe core set..."
         run "$BOLT" "$Real" -o "$Opt" \
             --data "$Prof" --dyno-stats --reorder-blocks=ext-tsp --reorder-functions=cdsort \
