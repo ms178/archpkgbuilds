@@ -319,7 +319,7 @@ configure_clean "$BUILD_ROOT/stage2" -S "$LLVM_SRC/llvm" \
     -DCLANG_TABLEGEN="$BUILD_ROOT/stage1/bin/clang-tblgen" \
     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_FLAGS="$COMMON_FLAGS $C_LTO_FLAGS" -DCMAKE_CXX_FLAGS="$COMMON_FLAGS $CXX_LTO_FLAGS" \
     -DCMAKE_EXE_LINKER_FLAGS="$LINKER_BASE $ALLOCATOR_LINK -Wl,--emit-relocs -Wl,-z,now" \
-    -DCMAKE_MODULE_LINKER_FLAGS="$LINKER_BASE" -DCMAKE_SHARED_LINKER_FLAGS="$LINKER_BASE"
+    -DCMAKE_MODULE_LINKER_FLAGS="$LINKER_BASE -Wl,--emit-relocs" -DCMAKE_SHARED_LINKER_FLAGS="$LINKER_BASE -Wl,--emit-relocs"
 
 run ninja -C "$BUILD_ROOT/stage2" install
 
@@ -334,14 +334,26 @@ rm -rf "$BUILD_ROOT/stage1" 2>/dev/null || true
 set -g BOLT "$INSTALL_PREFIX/bin/llvm-bolt"
 set -g MERGE "$INSTALL_PREFIX/bin/merge-fdata"
 
+test -x "$BOLT"; or die "llvm-bolt not found at $BOLT (run the main build through Stage 2 first)"
+test -x "$INSTALL_PREFIX/bin/clang"; or die "clang not found at $INSTALL_PREFIX/bin/clang"
+
+# Warn if relocations are missing (BOLT works much better with them)
+set -l clang_real (realpath "$INSTALL_PREFIX/bin/clang")
+if not llvm-readelf -S "$clang_real" 2>/dev/null | grep -q '\.rela\.text'
+    log "WARNING: $clang_real appears to lack .rela.text sections."
+    log " Stage 2 must have been linked with -Wl,--emit-relocs."
+end
+
 # Detect if a binary has already been processed by BOLT (prevents "input file was processed by BOLT. Cannot re-optimize")
 function is_already_bolted --argument-names BinPath
     set -l f (realpath "$BinPath")
     test -f "$f"; or return 1
-    # BOLT leaves these markers after successful processing
-    nm -D "$f" 2>/dev/null | grep -q __bolt_runtime_start; and return 0
-    strings "$f" 2>/dev/null | grep -q __bolt_runtime_start; and return 0
-    strings "$f" 2>/dev/null | grep -q 'BOLT'; and return 0
+
+    # Readelf is the only 100% reliable way to detect a BOLT-processed binary,
+    # because BOLT explicitly injects a .note.bolt section.
+    # `strings | grep BOLT` is highly dangerous because LLVM/Clang binaries
+    # inherently contain the string "BOLT" (they literally contain the bolt source path and references).
+    llvm-readelf -S "$f" 2>/dev/null | grep -q '\.note\.bolt'; and return 0
     return 1
 end
 
@@ -350,14 +362,19 @@ function bolt_optimize_binary --argument-names Name BinPath
     set -l Prof "$BUILD_ROOT/$Name.bolt.fdata"
     set -l Inst "$Real.inst"
     set -l Opt "$Real.bolt"
+    set -l Backup "$Real.pre-bolt.bak"
 
     test -f "$Real"; or return 0
 
     # NEW: Skip gracefully if already BOLTed (allows re-running the script or recovering from partial BOLT runs)
     if is_already_bolted "$Real"
-        log "  [$Name] already BOLT-processed (detected BOLT markers like __bolt_runtime_start), skipping."
+        log "  [$Name] already BOLT-processed (detected .note.bolt section), skipping."
         return 0
     end
+
+    log "  [$Name] Creating backup before BOLTing: $Backup"
+    cp -a "$Real" "$Backup"
+
 
     set -l Stale $Prof $Prof.*
     test (count $Stale) -gt 0; and rm -f $Stale
@@ -404,7 +421,6 @@ function bolt_optimize_binary --argument-names Name BinPath
         --icf=safe --jump-tables=move --indirect-call-promotion=all --peepholes=all \
         --simplify-rodata-loads --x86-strip-redundant-address-size --strip-rep-ret --inline-memcpy \
         --plt=all --hugify --use-gnu-stack --update-debug-sections=0
-
         log "  [$Name] aggressive BOLT failed; retrying with safe core set..."
         run "$BOLT" "$Real" -o "$Opt" \
             --data "$Prof" --dyno-stats --reorder-blocks=ext-tsp --reorder-functions=cdsort \
@@ -442,19 +458,17 @@ function bolt_train_lld --argument-names Bin
     return 0
 end
 
-if test -x "$BOLT"
-    log ">>> STAGE 3: BOLT post-link (clang + ld.lld)..."
-    bolt_optimize_binary clang "$INSTALL_PREFIX/bin/clang"
+log ">>> STAGE 3: BOLT post-link (clang + ld.lld)..."
+bolt_optimize_binary clang "$INSTALL_PREFIX/bin/clang"
 
-    # Explicitly BOLT the actual ELF linker (ld.lld is what `clang -fuse-ld=lld` invokes at runtime).
-    # We pass Name="lld" so the function uses the correct instrumentation mode for lld
-    # (the sleep-time watcher + no append-pid, because lld exits via _exit() without flushing).
-    # This also drives training via the bolt_train_lld logic that sets up ld.lld in -B.
-    if test -e "$INSTALL_PREFIX/bin/ld.lld"
-        bolt_optimize_binary lld "$INSTALL_PREFIX/bin/ld.lld"
-    else if test -e "$INSTALL_PREFIX/bin/lld"
-        bolt_optimize_binary lld "$INSTALL_PREFIX/bin/lld"
-    end
+# Explicitly BOLT the actual ELF linker (ld.lld is what `clang -fuse-ld=lld` invokes at runtime).
+# We pass Name="lld" so the function uses the correct instrumentation mode for lld
+# (the sleep-time watcher + no append-pid, because lld exits via _exit() without flushing).
+# This also drives training via the bolt_train_lld logic that sets up ld.lld in -B.
+if test -e "$INSTALL_PREFIX/bin/ld.lld"
+    bolt_optimize_binary lld "$INSTALL_PREFIX/bin/ld.lld"
+else if test -e "$INSTALL_PREFIX/bin/lld"
+    bolt_optimize_binary lld "$INSTALL_PREFIX/bin/lld"
 end
 
 # Final clean of bolt work dirs (fdata cleaned inside bolt_optimize)
