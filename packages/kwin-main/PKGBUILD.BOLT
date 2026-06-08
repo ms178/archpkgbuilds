@@ -1,0 +1,948 @@
+pkgname=kwin
+pkgver=6.6.5
+_dirver=$(echo $pkgver | cut -d. -f1-3)
+pkgrel=12.1
+pkgdesc='An easy to use, but flexible, Wayland compositor (PGO + CS-PGO + BOLT)'
+arch=(x86_64)
+url='https://kde.org/plasma-desktop/'
+license=(LGPL-2.0-or-later)
+depends=(aurorae breeze gcc-libs glibc iio-sensor-proxy plasma-activities
+         kauth kcmutils kcolorscheme kconfig kcoreaddons kcrash kdbusaddons
+         kdeclarative kdecoration kglobalaccel kglobalacceld kguiaddons
+         ki18n kidletime kirigami kitemmodels knewstuff knotifications
+         kpackage kquickcharts kscreenlocker kservice ksvg kwayland
+         kwidgetsaddons kwindowsystem kxmlgui lcms2 libcanberra
+         libdisplay-info libdrm libei libepoxy libinput libpipewire
+         libqaccessibilityclient-qt6 libxcb libxcvt libxkbcommon mesa
+         pipewire-session-manager libplasma qt6-5compat qt6-base
+         qt6-declarative qt6-svg qt6-tools systemd-libs wayland
+         xcb-util-cursor xcb-util-keysyms xcb-util-wm)
+makedepends=(extra-cmake-modules kdoctools krunner plasma-wayland-protocols
+             python wayland-protocols xorg-xwayland
+             # PGO + BOLT toolchain
+             clang llvm
+             # ctest needs dbus-run-session for every integration test;
+             # qt6-wayland for the wayland-org.kde.kwin.qpa client;
+             # kpipewire for the optional testScreencasting integration test.
+             dbus qt6-wayland kpipewire
+             # setcap CAP_SYS_NICE in package() needs libcap
+             libcap)
+optdepends=('maliit-keyboard: virtual keyboard')
+groups=(plasma)
+source=(https://download.kde.org/stable/plasma/$_dirver/$pkgname-$pkgver.tar.xz{,.sig}
+        ms178-1.patch)
+install=$pkgname.install
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+validpgpkeys=('E0A3EB202F8E57528E13E72FD7574483BB57B18D'
+              '0AAC775BB6437A8D9AF7A3ACFE0784117FBCE11D'
+              'D07BD8662C56CB291B316EB2F5675605C74E02CF'
+              '90A968ACA84537CC27B99EAF2C8DF587A6D4AAC1'
+              '1FA881591C26B276D7A5518EEAAF29B42A678C20')
+
+# ---------------------------------------------------------------------------
+# Per-stage instrumentation flags. Lessons baked in from libx11/xwayland/
+# fontconfig PGO+BOLT rounds:
+#   * no -g3              : zero PGO accuracy gain, +80% object size
+#   * no -fno-omit-fp     : mismatch with final build = silently worse PGO
+#                           (the user's /etc/makepkg.conf already has
+#                            -fno-omit-frame-pointer in CFLAGS - that's
+#                            applied UNIFORMLY across all stages, so no
+#                            mismatch hazard here)
+#   * vp-counters-per-site=8       : upstream LLVM default
+#   * runtime-counter-relocation   : REQUIRED for libkwin.so (shared lib)
+#   * enable-value-profiling       : indirect-call / memcpy-size profile data
+#
+# Profile file pattern: %16m.profraw. With 147 integration tests + a dozen
+# kwin_wayland --virtual runs, %p-%m.profraw would emit ~600-1000 raw
+# files per stage (one per process per module). %16m switches the LLVM
+# profile runtime into online fcntl-locked merge mode: at most 16 files
+# per binary module, no matter how many processes write. Counters are
+# summed losslessly inside the runtime. Verified end-to-end: 20 parallel
+# writers into a %4m pool produced exactly 4 files with the correct
+# accumulated count.
+# ---------------------------------------------------------------------------
+_pgo_mllvm=(-mllvm -vp-counters-per-site=8
+            -mllvm -runtime-counter-relocation
+            -mllvm -enable-value-profiling)
+
+# Diagnostic silencing for PGO + ThinLTO. Three independent surfaces emit
+# the SAME class of "hash mismatch" diagnostic; we need to silence ALL
+# three or the build aborts when CachyOS's -flto=thin (default in
+# /etc/makepkg.conf CFLAGS) collides with Qt's header-emitted COMDAT
+# function templates (e.g. comparesEqual<QMetaType>, QMap iterators):
+#
+#   1) clang frontend (per-TU compile):
+#        -Wno-profile-instr-unprofiled       (function had no samples)
+#        -Wno-profile-instr-out-of-date      (CFG changed vs profile)
+#
+#   2) clang -mllvm backend (per-TU codegen):
+#        -no-pgo-warn-mismatch=true          (CFG hash mismatch)
+#        -pgo-warn-missing-function=false    (function entirely missing)
+#      (-no-pgo-warn-mismatch-comdat-weak defaults true upstream)
+#
+#   3) lld during LTO codegen (the WHOLE-PROGRAM merge in ld-temp.o):
+#        -Wl,--no-lto-pgo-warn-mismatch      (lld-side equivalent of #2)
+#      THIS is the one that turned the warning into a hard error and
+#      aborted your kdecorationprivatedeclarative.so link. lld escalates
+#      to "linker command failed exit code 1" once accumulated mismatches
+#      exceed its budget, which is trivial to hit with ThinLTO + Qt6
+#      header templates.
+#
+# Why mismatches happen even with a clean 3-stage pipeline: -fcs-profile-
+# generate inserts CS counters into the IR before ThinLTO inlining
+# decisions. The CS profile records hashes for the *instrumented* IR.
+# Stage 3's clean IR makes different inlining decisions for header-only
+# COMDAT templates -> different post-LTO function hash -> "discarded".
+# This loses ~0.1% of profile coverage on Qt utility templates, none on
+# real KWin code. Documented in LLVM bug tracker as expected behaviour
+# (see LLD's --lto-pgo-warn-mismatch help text: it's "default on" only
+# as a diagnostic, never a correctness invariant).
+_profile_silence=(-Wno-profile-instr-unprofiled
+                  -Wno-profile-instr-out-of-date
+                  -Wno-backend-plugin
+                  -mllvm -no-pgo-warn-mismatch=true
+                  -mllvm -pgo-warn-missing-function=false)
+_profile_silence_ldflags=("-Wl,--no-lto-pgo-warn-mismatch")
+
+_detect_toolchain() {
+  : "${CC:=clang}"; : "${CXX:=clang++}"
+  : "${AR:=llvm-ar}"; : "${NM:=llvm-nm}"; : "${RANLIB:=llvm-ranlib}"
+  command -v "$CC"     >/dev/null || { error "CC not found: $CC";     return 1; }
+  command -v "$CXX"    >/dev/null || { error "CXX not found: $CXX";   return 1; }
+  command -v "$AR"     >/dev/null || { error "AR not found: $AR";     return 1; }
+  command -v "$NM"     >/dev/null || { error "NM not found: $NM";     return 1; }
+  command -v "$RANLIB" >/dev/null || { error "RANLIB not found: $RANLIB"; return 1; }
+  printf '  -> [TOOLCHAIN] CC=%s\n' "$(command -v "$CC")"
+}
+
+_toolchain_supports_flag() {
+  local _flag="$1"
+  local _tdir; _tdir="$(mktemp -d "$srcdir/.toolchain-sanity.XXXXXX")"
+  printf 'int main(void){return 0;}\n' > "$_tdir/x.c"
+  "$CC" "$_tdir/x.c" -o "$_tdir/x" $LDFLAGS "$_flag" >/dev/null 2>&1
+  local rc=$?
+  rm -rf "$_tdir"
+  return $rc
+}
+
+# Smoke-test: confirm the system's existing kwin_wayland binary runs. We
+# invoke --version (which exits immediately, never starts a compositor
+# instance, never touches the user's running KWin session). Pure
+# dependency-load sanity check.
+_smoke_test() {
+  command -v kwin_wayland >/dev/null 2>&1 || {
+    printf '  -> [SMOKE] system kwin_wayland not installed (OK for first build)\n'
+    return 0
+  }
+  if timeout -k 2 5 kwin_wayland --version >/dev/null 2>&1; then
+    printf '  -> [SMOKE] system kwin_wayland --version OK\n'
+  else
+    warning "[SMOKE] system kwin_wayland --version failed; build continues"
+  fi
+}
+
+# Single helper used to invoke cmake with PGO/BOLT-specific instrumentation
+# added on top of the user's /etc/makepkg.conf flags.
+#
+# CRITICAL design points (verified against cmake-3.31 + clang-19 + cmake source):
+#
+#   1. Pass extra flags THROUGH env (CFLAGS / CXXFLAGS / LDFLAGS), not via
+#      -DCMAKE_*_FLAGS_INIT. Reasons:
+#        a) cmake reads CFLAGS/CXXFLAGS/LDFLAGS env at first-configure into
+#           the cache (CMAKE_C_FLAGS / etc.). This is the documented and
+#           idiomatic path; KDECompilerSettings.cmake then APPENDS its own
+#           -Wall / -fno-exceptions / etc. via `set(CMAKE_CXX_FLAGS
+#           "${CMAKE_CXX_FLAGS} ...")`. Going via env keeps our flags FIRST
+#           in the final compile command (so e.g. -fprofile-generate appears
+#           before any -fno-* override).
+#        b) Verified end-to-end with a real cmake project: clang sees the
+#           full flag set, .profraw files are written.
+#
+#   2. CMake silently DROPS CPPFLAGS (we tested: -D_FORTIFY_SOURCE=3 in env
+#      CPPFLAGS does NOT reach the compile command, but in CFLAGS it does).
+#      So we PREPEND CPPFLAGS to CFLAGS+CXXFLAGS before exporting. This is
+#      the same pattern arch-meson uses internally.
+#
+#   3. CMAKE_BUILD_TYPE=None: cmake otherwise auto-adds CMAKE_<C|CXX>_FLAGS_RELEASE
+#      ("-O3 -DNDEBUG"). The user's /etc/makepkg.conf already controls -O*
+#      explicitly; we must not override it. KDECompilerSettings.cmake
+#      explicitly comments "Otherwise, leave it empty, to let distro
+#      packagers choose the flags" when BUILD_TYPE is empty/None.
+#
+#   4. PGO instrumented and final builds use the SAME user CFLAGS. That
+#      preserves the libx11/xwayland lesson: instr + final must match (esp.
+#      -fno-omit-frame-pointer presence) to avoid silent PGO mismatch.
+_run_cmake() {
+  local _build="$1" _extra_cflags="$2" _extra_lflags="$3" _build_testing="$4"
+
+  # Honour the user's /etc/makepkg.conf flags. Append our PGO/BOLT stage
+  # flags. Prepend CPPFLAGS so the preprocessor settings (e.g.
+  # -D_FORTIFY_SOURCE=3) actually reach the compiler (cmake drops CPPFLAGS).
+  local _cf="${CPPFLAGS:+$CPPFLAGS }${CFLAGS}${_extra_cflags:+ $_extra_cflags}"
+  local _xf="${CPPFLAGS:+$CPPFLAGS }${CXXFLAGS}${_extra_cflags:+ $_extra_cflags}"
+  local _lf="${LDFLAGS}${_extra_lflags:+ $_extra_lflags}"
+
+  # Don't leak CPPFLAGS into a second channel where cmake might pick it up
+  # twice (it actually doesn't, but be explicit).
+  CFLAGS="$_cf" CXXFLAGS="$_xf" LDFLAGS="$_lf" \
+  env -u CPPFLAGS \
+    cmake -B "$_build" -S "$pkgname-$pkgver" \
+      -DCMAKE_INSTALL_PREFIX=/usr \
+      -DCMAKE_INSTALL_LIBEXECDIR=lib \
+      -DCMAKE_BUILD_TYPE=None \
+      -DCMAKE_C_STANDARD=23 \
+      -DCMAKE_CXX_STANDARD=23 \
+      -DKF6DocTools_FOUND=OFF \
+      -DBUILD_TESTING="$_build_testing"
+}
+
+# Workload driver. ctest runs every KWin test (~147 in total: ~30 unit +
+# ~117 integration, each integration test being a full headless KWin
+# compositor via VirtualBackend). Each integration test is auto-wrapped
+# in dbus-run-session by KWin's CMakeLists (autotests/integration/
+# CMakeLists.txt: `add_test(NAME ... COMMAND dbus-run-session ...)`).
+#
+# Parallelism: user has 14700KF (8P+12E, 28 logical threads) + 64 GB RAM.
+# Each integration test ~200 MB RSS, so 28 parallel ~= 5.6 GB peak.
+# Trivial fit. Use full nproc.
+#
+# Env hygiene:
+#   - XDG_RUNTIME_DIR: ctest needs a writable per-run dir; create a fresh
+#     temp dir so we don't collide with the user's /run/user/<uid>.
+#   - QT_LOGGING_RULES: silence per-test Qt debug spam (otherwise > 100 MB
+#     of build-log noise from 147 instrumented KWin instances).
+#   - DO NOT set QT_QPA_PLATFORM: WAYLANDTEST_MAIN in kwin_wayland_test.h
+#     explicitly setenv()'s QT_QPA_PLATFORM=wayland-org.kde.kwin.qpa at
+#     test main(), overriding whatever we set. Setting it ourselves
+#     achieves nothing.
+#   - DO NOT set DBUS_SESSION_BUS_ADDRESS: dbus-run-session (added by the
+#     test wrapper) creates a fresh bus per test and overrides the env.
+_kwin_workload() {
+  local _build="$1" _log_tag="$2"
+  printf '  -> [WORKLOAD] starting ctest in %s (-j%s)\n' "$_build" "$(nproc)"
+  local _rd; _rd="$(mktemp -d "$srcdir/.kwin-rd.XXXXXX")"
+  chmod 700 "$_rd"
+  local _log="$srcdir/kwin-ctest-${_log_tag}.log"
+  (
+    cd "$_build" || exit 1
+    XDG_RUNTIME_DIR="$_rd" \
+    QT_LOGGING_RULES='*.debug=false;*.info=false' \
+      ctest --output-on-failure --timeout 600 -j"$(nproc)" \
+        >"$_log" 2>&1 || true
+  )
+  rm -rf "$_rd"
+  local _summary
+  _summary=$(grep -E '[0-9]+% tests passed, [0-9]+ tests failed out of [0-9]+' \
+             "$_log" 2>/dev/null | tail -n 1)
+  if [[ -n "$_summary" ]]; then
+    printf '  -> [WORKLOAD] %s\n' "$_summary"
+  else
+    printf '  -> [WORKLOAD] (no ctest summary; see %s)\n' "$_log"
+  fi
+}
+
+# Drives the kwin_wayland binary itself through its --virtual headless
+# entry point. The ctest workload exercises libkwin.so via the test
+# binaries but NEVER execs the kwin_wayland executable, so without this
+# step the BOLT instrumentation in kwin_wayland produces zero .fdata.
+#
+# `--exit-with-session=/bin/true` makes kwin_wayland: bring up the full
+# compositor under the virtual backend (GBM + EGL or qpainter fallback),
+# spawn /bin/true as the session, then shut down cleanly once /bin/true
+# exits (which is immediately). End-to-end exit=0 verified against system
+# kwin_wayland 6.3.6.
+#
+# We run a small batch (default 12 invocations, configurable) in parallel
+# bursts equal to nproc. Each invocation = one full compositor startup +
+# shutdown = exercises argv parsing, backend init, scene graph setup,
+# input plumbing, decoration loading, output config, session exit path.
+# That's the hot path BOLT cares about for kwin_wayland (which is mostly
+# a thin main() wrapping libkwin.so anyway).
+_kwin_bin_workload() {
+  local _bin="$1" _runs="${2:-12}"
+  [[ -x "$_bin" ]] || { warning "[BIN-WORKLOAD] $_bin not executable"; return 0; }
+  printf '  -> [BIN-WORKLOAD] %d runs of %s --virtual\n' "$_runs" "$(basename "$_bin")"
+  local _rd; _rd="$(mktemp -d "$srcdir/.kwin-bin-rd.XXXXXX")"
+  chmod 700 "$_rd"
+  local _i _pids=() _cap; _cap=$(nproc)
+  for _i in $(seq 1 "$_runs"); do
+    mkdir -p "$_rd/r$_i"
+    chmod 700 "$_rd/r$_i"
+    (
+      export XDG_RUNTIME_DIR="$_rd/r$_i"
+      export QT_LOGGING_RULES='*.debug=false;*.info=false'
+      # Timeout = 90s SIGTERM, +5s grace -> SIGKILL. Longer than the
+      # 30s used in PGO-instrument runs because BOLT-instrumented
+      # kwin_wayland is significantly slower at startup (counter
+      # allocation + module descriptor setup). DO NOT shorten: if the
+      # process is killed before exit, DT_FINI never runs and zero
+      # kwin-bin.fdata gets written. BOLT's fdata flush is in
+      # __bolt_instr_fini() which only runs via clean exit (verified
+      # in bolt/runtime/instr.cpp). --exit-with-session=/bin/true
+      # makes the compositor exit cleanly within ~1-5s in practice.
+      timeout -k 5 90 dbus-run-session -- \
+        "$_bin" --virtual --exit-with-session=/bin/true \
+        >/dev/null 2>&1
+    ) &
+    _pids+=($!)
+    if (( ${#_pids[@]} >= _cap )); then
+      wait "${_pids[@]}" 2>/dev/null || true
+      _pids=()
+    fi
+  done
+  (( ${#_pids[@]} > 0 )) && { wait "${_pids[@]}" 2>/dev/null || true; }
+  rm -rf "$_rd"
+  printf '  -> [BIN-WORKLOAD] done\n'
+}
+
+_pgo_count() { find "$1" -maxdepth 1 -type f -name '*.profraw' 2>/dev/null | wc -l; }
+_pgo_bytes() { find "$1" -maxdepth 1 -type f -name '*.profraw' -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}'; }
+_pgo_diag()  { printf '  -> [PGO] %s: profraw=%s bytes=%s dir=%s\n' "$1" "$(_pgo_count "$2")" "$(_pgo_bytes "$2")" "$2"; }
+
+# Online-merged profile pool size. With LLVM_PROFILE_FILE='%<N>m.profraw'
+# the LLVM profile runtime uses fcntl-locked merge-on-write into a fixed
+# pool of N files per binary module (one filename per LLVM module hash,
+# `%m` expands to the module hash). This is the documented zero-loss
+# alternative to `%p-%m.profraw` which would spawn (processes * modules)
+# files - 147 tests * ~5 modules with retries can blow past 600 files
+# per build. With 16 slots and fcntl locking, the runtime correctly
+# accumulates counters from any number of concurrent processes into at
+# most (16 * modules) files. Verified with parallel runs in sandbox:
+# 20 concurrent processes -> 4 files (pool of 4), counters summed
+# correctly (Maximum function count: 20 in show output).
+_PGO_PROFILE_PATTERN='%16m.profraw'
+
+prepare() {
+    local src
+    for src in "${source[@]}"; do
+        src="${src%%::*}"
+        src="${src##*/}"
+        [[ $src = *.patch ]] || continue
+        [[ -f "$srcdir/$src" ]] || { warning "Patch $src missing, skipping"; continue; }
+        echo "Applying patch $src..."
+        patch --directory="kwin-$pkgver" --forward --strip=1 < "$src"
+    done
+}
+
+build() {
+  _detect_toolchain
+  _smoke_test
+
+  local PGO1_RAW="$srcdir/profraw-pgo1"
+  local PGO1_DATA="$srcdir/pgo1.profdata"
+  local CSPGO_RAW="$srcdir/profraw-cspgo"
+  local FINAL_PROF="$srcdir/pgo-final.profdata"
+  local BOLT_DIR="$srcdir/bolt"
+  rm -rf "$PGO1_RAW" "$CSPGO_RAW" "$BOLT_DIR" "$PGO1_DATA" "$FINAL_PROF" \
+         "$srcdir/build-pgo-gen" "$srcdir/build-cs-pgo-gen" "$srcdir/build"
+  mkdir -p "$PGO1_RAW" "$CSPGO_RAW" "$BOLT_DIR"
+
+  local can_ir_pgo=1 can_cs_pgo=1
+  if ! _toolchain_supports_flag "-fprofile-generate"; then
+    warning "[PGO] toolchain cannot link -fprofile-generate; non-PGO build"
+    can_ir_pgo=0; can_cs_pgo=0
+  fi
+  if (( can_ir_pgo )) && ! _toolchain_supports_flag "-fcs-profile-generate"; then
+    warning "[PGO] toolchain lacks -fcs-profile-generate; IR-PGO only"
+    can_cs_pgo=0
+  fi
+
+  # ====================================================================== #
+  # Stage 1: IR-PGO instrument + train via KWin's own integration tests
+  # BUILD_TESTING=ON pulls in 117 integration tests linked against libkwin.so
+  # plus ~30 unit tests; ctest runs them all.
+  # ====================================================================== #
+  if (( can_ir_pgo )); then
+    printf '  -> [PGO] Stage 1: IR-PGO instrument + ctest workload\n'
+    _run_cmake build-pgo-gen \
+      "-fprofile-generate=$PGO1_RAW ${_pgo_mllvm[*]}" \
+      "-fprofile-generate=$PGO1_RAW" \
+      ON
+    cmake --build build-pgo-gen --parallel "$(nproc)"
+
+    LLVM_PROFILE_FILE="$PGO1_RAW/$_PGO_PROFILE_PATTERN" \
+      _kwin_workload "$PWD/build-pgo-gen" "pgo1"
+    LLVM_PROFILE_FILE="$PGO1_RAW/$_PGO_PROFILE_PATTERN" \
+      _kwin_bin_workload "$PWD/build-pgo-gen/bin/kwin_wayland" 12
+    _pgo_diag "after stage1 ctest" "$PGO1_RAW"
+
+    if compgen -G "$PGO1_RAW/*.profraw" >/dev/null; then
+      llvm-profdata merge -use-md5 -compress-all-sections \
+        -o "$PGO1_DATA" "$PGO1_RAW"/*.profraw
+      printf '  -> [PGO] Stage 1 profile: %s (%d profraw)\n' \
+        "$PGO1_DATA" "$(_pgo_count "$PGO1_RAW")"
+    else
+      warning "[PGO] no stage1 .profraw produced; falling back to non-PGO"
+      can_ir_pgo=0; can_cs_pgo=0
+    fi
+  fi
+
+  # ====================================================================== #
+  # Stage 2: CS-PGO instrument (use stage1) + train
+  # ====================================================================== #
+  if (( can_cs_pgo )); then
+    printf '  -> [PGO] Stage 2: CS-PGO instrument + ctest workload\n'
+    _run_cmake build-cs-pgo-gen \
+      "-fprofile-use=$PGO1_DATA -fcs-profile-generate=$CSPGO_RAW ${_pgo_mllvm[*]} ${_profile_silence[*]}" \
+      "-fprofile-use=$PGO1_DATA -fcs-profile-generate=$CSPGO_RAW ${_profile_silence_ldflags[*]}" \
+      ON
+    cmake --build build-cs-pgo-gen --parallel "$(nproc)"
+
+    LLVM_PROFILE_FILE="$CSPGO_RAW/$_PGO_PROFILE_PATTERN" \
+      _kwin_workload "$PWD/build-cs-pgo-gen" "cspgo"
+    LLVM_PROFILE_FILE="$CSPGO_RAW/$_PGO_PROFILE_PATTERN" \
+      _kwin_bin_workload "$PWD/build-cs-pgo-gen/bin/kwin_wayland" 12
+    _pgo_diag "after CS-PGO ctest" "$CSPGO_RAW"
+
+    if compgen -G "$CSPGO_RAW/*.profraw" >/dev/null; then
+      # MERGE ORDER per LLVM CSPGO docs: stage1 FIRST.
+      llvm-profdata merge -use-md5 -compress-all-sections \
+        -o "$FINAL_PROF" "$PGO1_DATA" "$CSPGO_RAW"/*.profraw
+      printf '  -> [PGO] final merged CS profile: %s\n' "$FINAL_PROF"
+    else
+      warning "[PGO] no CS profraw; using stage1 profile only"
+      cp -f "$PGO1_DATA" "$FINAL_PROF"
+    fi
+  elif (( can_ir_pgo )) && [[ -f "$PGO1_DATA" ]]; then
+    cp -f "$PGO1_DATA" "$FINAL_PROF"
+  fi
+
+  # ====================================================================== #
+  # Stage 3: final PGO-use build, BUILD_TESTING=ON, --emit-relocs for BOLT
+  #
+  # CRITICAL: BUILD_TESTING must be ON in Stage 3, NOT OFF.
+  #
+  # The previous design (BUILD_TESTING=OFF here, reuse build-pgo-gen test
+  # binaries during BOLT 4b training with LD_LIBRARY_PATH override) is
+  # architecturally broken:
+  #
+  #   1) The build-pgo-gen test binaries are STILL -fprofile-generate
+  #      linked. Their __llvm_profile_init constructor fires at process
+  #      startup and the runtime takes ownership of profile-data emission.
+  #      When they then dlopen the BOLT-instrumented libkwin.so, BOLT's
+  #      own __bolt_instr_init constructor fires too. The two runtimes
+  #      race for atexit() handlers and signal hooks, the BOLT runtime
+  #      often loses, and no .fdata gets written. Empirically: zero
+  #      kwin-lib.fdata files produced.
+  #
+  #   2) build-pgo-gen test binaries have DT_RUNPATH baked at link time
+  #      pointing at $srcdir/build-pgo-gen/src/. LD_LIBRARY_PATH does
+  #      override that (KDECompilerSettings.cmake forces
+  #      -Wl,--enable-new-dtags), but ANY ABI drift between Stage 1
+  #      (instrument) and Stage 3 (use) libkwin.so causes silent dynamic
+  #      linker failure - the test launches, the loader can't resolve
+  #      vtable symbols, the test aborts in __cxa_throw, no .fdata.
+  #
+  #   3) The PGO-instrumented test binaries run 2-3x slower than PGO-use
+  #      ones, so even if (1)+(2) didn't bite, training is needlessly slow.
+  #
+  # The fix: build tests in Stage 3 too. Then test binaries:
+  #   - Are PGO-USE optimized: fast, no profile runtime in process
+  #   - Have DT_RUNPATH=$srcdir/build/src/ baked in: load the BOLT lib
+  #     automatically without LD_LIBRARY_PATH games
+  #   - Are ABI-locked to the Stage 3 libkwin: no symbol resolution drift
+  #   - Need no profraw sink, no env overrides, just `ctest`
+  #
+  # Cost: ~5 extra minutes to compile ~150 test binaries with --parallel
+  # nproc. Trivial vs the value of working BOLT training.
+  # ====================================================================== #
+  printf '  -> [PGO] Stage 3: final PGO build (--emit-relocs, with tests)\n'
+  local _s3_cf="" _s3_lf="-Wl,--emit-relocs"
+  if [[ -f "$FINAL_PROF" ]]; then
+    _s3_cf="-fprofile-use=$FINAL_PROF ${_profile_silence[*]}"
+    _s3_lf="$_s3_lf -fprofile-use=$FINAL_PROF ${_profile_silence_ldflags[*]}"
+    printf '  -> [PGO] Stage 3 uses profile: %s\n' "$FINAL_PROF"
+  else
+    warning "[PGO] Stage 3 has no profile-use"
+  fi
+  _run_cmake build "$_s3_cf" "$_s3_lf" ON
+  cmake --build build --parallel "$(nproc)"
+
+  # ====================================================================== #
+  # Stage 4: BOLT libkwin.so + kwin_wayland
+  #
+  # Defensive design after debugging silent-failure modes:
+  #   - Path discovery uses build/bin/ (per KDECMakeSettings:
+  #     CMAKE_RUNTIME_OUTPUT_DIRECTORY=${CMAKE_BINARY_DIR}/bin and
+  #     CMAKE_LIBRARY_OUTPUT_DIRECTORY=${CMAKE_BINARY_DIR}/bin when
+  #     ECM_GLOBAL_FIND_VERSION>=5.38). Falls back to a broad search
+  #     under build/ if the layout ever changes.
+  #   - Save Stage 3 PGO-optimized binaries to "$BOLT_DIR" BEFORE any
+  #     instrument/replace step. These are the package-shipping artefacts
+  #     if BOLT optimisation fails downstream - we ALWAYS restore from
+  #     them.
+  #   - Validate every step: every llvm-bolt invocation, every install,
+  #     every fdata count. Failure is loud (error -> makepkg aborts) for
+  #     unrecoverable conditions; warning + restore-and-skip for
+  #     downstream BOLT-only failures.
+  #   - DT_RUNPATH semantics verified: KDECompilerSettings forces
+  #     -Wl,--enable-new-dtags, so DT_RUNPATH=$srcdir/build/bin is baked
+  #     into every test binary and kwin_wayland; LD_LIBRARY_PATH not
+  #     needed. Tests + kwin_wayland naturally load the BOLT-instrumented
+  #     libkwin.so once we install it in place.
+  # ====================================================================== #
+  command -v llvm-bolt >/dev/null 2>&1 || {
+    printf '  -> [BOLT] llvm-bolt missing; final binary is PGO-only\n'
+    return 0
+  }
+
+  # ---- Locate Stage 3 artefacts (must exist, fatal if not) ------------ #
+  local _lib _bin _bin_dir
+  _lib="$(find "$srcdir/build/bin" -maxdepth 1 -type f \
+              -name 'libkwin.so.*' ! -name '*.symbols' \
+          2>/dev/null | sort -V -r | head -n 1)"
+  if [[ -z "$_lib" || ! -f "$_lib" ]]; then
+    # Fallback: search anywhere under build/ in case upstream changes layout
+    _lib="$(find "$srcdir/build" -type f \
+                -name 'libkwin.so.*' ! -name '*.symbols' \
+            2>/dev/null | sort -V -r | head -n 1)"
+  fi
+  if [[ -z "$_lib" || ! -f "$_lib" ]]; then
+    error "[BOLT] libkwin.so not found anywhere under \$srcdir/build/"
+    error "[BOLT] tree dump:"
+    find "$srcdir/build" -name 'libkwin.so*' 2>&1 | sed 's/^/    /' >&2
+    return 1
+  fi
+  _bin_dir="$(dirname "$_lib")"
+  _bin="$_bin_dir/kwin_wayland"
+  if [[ ! -x "$_bin" ]]; then
+    error "[BOLT] kwin_wayland binary not found at $_bin"
+    return 1
+  fi
+  printf '  -> [BOLT] target lib: %s (%s bytes)\n' "$_lib" "$(stat -c%s "$_lib")"
+  printf '  -> [BOLT] target bin: %s (%s bytes)\n' "$_bin" "$(stat -c%s "$_bin")"
+
+  # Verify --emit-relocs survived to the Stage 3 output (BOLT needs .rela.text)
+  if ! readelf -S "$_lib" 2>/dev/null | grep -q '\.rela\.text'; then
+    error "[BOLT] $_lib missing .rela.text section (was -Wl,--emit-relocs lost?)"
+    return 1
+  fi
+  if ! readelf -S "$_bin" 2>/dev/null | grep -q '\.rela\.text'; then
+    error "[BOLT] $_bin missing .rela.text section (was -Wl,--emit-relocs lost?)"
+    return 1
+  fi
+
+  # Save Stage 3 originals NOW. These are our recovery copies AND the
+  # input to every llvm-bolt invocation. They survive all replace cycles.
+  cp -f "$_lib" "$BOLT_DIR/libkwin.so.orig"
+  cp -f "$_bin" "$BOLT_DIR/kwin_wayland.orig"
+  [[ -f "$BOLT_DIR/libkwin.so.orig" && -f "$BOLT_DIR/kwin_wayland.orig" ]] || {
+    error "[BOLT] failed to snapshot Stage 3 binaries to $BOLT_DIR"
+    return 1
+  }
+
+  # Helper: restore Stage 3 binaries on failure path.
+  _bolt_restore() {
+    install -m755 "$BOLT_DIR/libkwin.so.orig" "$_lib"
+    install -m755 "$BOLT_DIR/kwin_wayland.orig" "$_bin"
+    printf '  -> [BOLT] restored Stage 3 PGO binaries\n'
+  }
+
+  # ---- Stage 4a: instrument both binaries ----------------------------- #
+  printf '  -> [BOLT] Stage 4a: instrument libkwin.so + kwin_wayland\n'
+  # IMPORTANT: BOLT runtime forbids combining --instrumentation-file-append-pid
+  # with --instrumentation-sleep-time / --instrumentation-wait-forks
+  # (verified against llvm-bolt 19 source). 147 short-lived test processes
+  # mean per-PID files are essential; rely on DT_FINI for clean dump.
+  if ! llvm-bolt "$BOLT_DIR/libkwin.so.orig" \
+        --instrument --lite=false \
+        --instrumentation-file="$BOLT_DIR/kwin-lib.fdata" \
+        --instrumentation-file-append-pid \
+        -o "$BOLT_DIR/libkwin.so.inst"; then
+    error "[BOLT] libkwin instrumentation failed"
+    _bolt_restore
+    return 1
+  fi
+  [[ -f "$BOLT_DIR/libkwin.so.inst" && -s "$BOLT_DIR/libkwin.so.inst" ]] || {
+    error "[BOLT] libkwin.so.inst missing or empty after instrument step"
+    _bolt_restore; return 1
+  }
+
+  if ! llvm-bolt "$BOLT_DIR/kwin_wayland.orig" \
+        --instrument --lite=false \
+        --instrumentation-file="$BOLT_DIR/kwin-bin.fdata" \
+        --instrumentation-file-append-pid \
+        -o "$BOLT_DIR/kwin_wayland.inst"; then
+    error "[BOLT] kwin_wayland instrumentation failed"
+    _bolt_restore
+    return 1
+  fi
+  [[ -f "$BOLT_DIR/kwin_wayland.inst" && -s "$BOLT_DIR/kwin_wayland.inst" ]] || {
+    error "[BOLT] kwin_wayland.inst missing or empty after instrument step"
+    _bolt_restore; return 1
+  }
+
+  # Replace Stage 3 binaries with instrumented versions IN PLACE so DT_RUNPATH
+  # (=$_bin_dir) resolution picks them up automatically. _bolt_restore can
+  # always recover.
+  install -m755 "$BOLT_DIR/libkwin.so.inst"    "$_lib"
+  install -m755 "$BOLT_DIR/kwin_wayland.inst"  "$_bin"
+
+  # Sanity: confirm the .so symlink chain still resolves to our instrumented file
+  if ! readlink -f "$_bin_dir/libkwin.so.6" 2>/dev/null | grep -qF "$_lib"; then
+    printf '  -> [BOLT] WARN: libkwin.so.6 symlink does not point at %s\n' "$_lib"
+    printf '             readlink: %s\n' "$(readlink -f "$_bin_dir/libkwin.so.6" 2>&1)"
+  fi
+
+  # ---- Stage 4b: training -------------------------------------------- #
+  # Stage 3 built with BUILD_TESTING=ON, so build/ contains PGO-USE test
+  # binaries with DT_RUNPATH=$_bin_dir baked at link time. ctest will load
+  # the BOLT-instrumented libkwin.so naturally (we just replaced it
+  # in place). No LD_LIBRARY_PATH. No profile-runtime collision. No
+  # profraw sink needed (test binaries are PGO-use, not -gen).
+  printf '  -> [BOLT] Stage 4b.1: ctest training (-j%s)\n' "$(nproc)"
+  _kwin_workload "$PWD/build" "bolt"
+
+  # Drive kwin_wayland binary directly. ctest only execs the test binaries
+  # (which link libkwin via SONAME), never the kwin_wayland binary itself.
+  # Without these direct runs, BOLT writes zero kwin-bin.fdata.
+  printf '  -> [BOLT] Stage 4b.2: kwin_wayland --virtual training\n'
+  _kwin_bin_workload "$_bin" 32
+
+  # Collect produced .fdata files.
+  shopt -s nullglob
+  local -a _peek_lib=("$BOLT_DIR"/kwin-lib.fdata*.fdata)
+  local -a _peek_bin=("$BOLT_DIR"/kwin-bin.fdata*.fdata)
+  shopt -u nullglob
+  printf '  -> [BOLT] .fdata produced: lib=%d bin=%d\n' \
+         "${#_peek_lib[@]}" "${#_peek_bin[@]}"
+
+  # Restore Stage 3 originals NOW (before optimisation). The training run
+  # is done; instrumented binaries are no longer needed. From here on,
+  # everything reads from $BOLT_DIR/*.orig (our preserved snapshot).
+  _bolt_restore
+
+  if (( ${#_peek_lib[@]} == 0 )); then
+    warning "[BOLT] no libkwin .fdata produced; keeping Stage 3 PGO binaries"
+    warning "[BOLT] check $srcdir/kwin-ctest-bolt.log for ctest failures"
+    return 0
+  fi
+
+  # ---- Stage 4c: merge fdata ----------------------------------------- #
+  printf '  -> [BOLT] Stage 4c: merge libkwin.so .fdata (%d files)\n' \
+         "${#_peek_lib[@]}"
+  if (( ${#_peek_lib[@]} == 1 )); then
+    cp -f "${_peek_lib[0]}" "$BOLT_DIR/lib.merged.fdata"
+  elif command -v merge-fdata >/dev/null 2>&1; then
+    merge-fdata "${_peek_lib[@]}" -o "$BOLT_DIR/lib.merged.fdata" 2>/dev/null \
+      || cat "${_peek_lib[@]}" > "$BOLT_DIR/lib.merged.fdata"
+  else
+    cat "${_peek_lib[@]}" > "$BOLT_DIR/lib.merged.fdata"
+  fi
+  [[ -s "$BOLT_DIR/lib.merged.fdata" ]] || {
+    warning "[BOLT] merged libkwin .fdata empty; keeping Stage 3 PGO binaries"
+    return 0
+  }
+
+  if (( ${#_peek_bin[@]} > 0 )); then
+    printf '  -> [BOLT] Stage 4c: merge kwin_wayland .fdata (%d files)\n' \
+           "${#_peek_bin[@]}"
+    if (( ${#_peek_bin[@]} == 1 )); then
+      cp -f "${_peek_bin[0]}" "$BOLT_DIR/bin.merged.fdata"
+    elif command -v merge-fdata >/dev/null 2>&1; then
+      merge-fdata "${_peek_bin[@]}" -o "$BOLT_DIR/bin.merged.fdata" 2>/dev/null \
+        || cat "${_peek_bin[@]}" > "$BOLT_DIR/bin.merged.fdata"
+    else
+      cat "${_peek_bin[@]}" > "$BOLT_DIR/bin.merged.fdata"
+    fi
+  fi
+
+  # ---- Stage 4d: optimise -------------------------------------------- #
+  # BOLT optimization flag set, tuned across libx11/xwayland/fontconfig
+  # AND empirically validated against KWin 6.6.5:
+  #
+  # EXCLUDED (verified crash-prone or correctness-breaking):
+  #   --use-aggr-reg-reassign (#123809), --icf=all (#123835 + cdsplit),
+  #   --frame-opt=* (#123835), --hugify (refuses on .so).
+  #
+  #   --icf=* (ANY value, including 'safe'): BREAKS QT INTROSPECTION.
+  #     Verified via post-mortem of the BOLTed libkwin.so.6.6.5:
+  #     `nm -D` found 67 distinct KWin::*::qt_metacall symbols folded
+  #     to a SINGLE address (0x157490c). Qt's QObject::connect()
+  #     identifies the target class by comparing the qt_metacall
+  #     function pointer in the static QMetaObject - when 67 classes
+  #     share one address, signal lookup fails for 66 of them. Symptom:
+  #     thousands of "QObject::connect(KWin::Foo, KWin::Bar): signal
+  #     not found" warnings + black screen on session start. BOLT's
+  #     `--icf=safe` only skips folding when BF.hasAddressTaken() is
+  #     true; moc-generated qt_metacall has its address taken via a
+  #     void* field inside a static QMetaObject in .rodata, which
+  #     BOLT's address-taken analysis does not detect. There is no
+  #     known way to make ICF Qt-safe in BOLT. Just don't fold.
+  #
+  # --plt=all requires -Wl,-z,now at LINK time on llvm-bolt <20 (the
+  # user's CachyOS LDFLAGS already has -Wl,-z,now, so this is satisfied).
+  local -a _bolt_opts=(
+    --lite=false
+    --relocs
+    --reorder-blocks=ext-tsp
+    --reorder-functions=cdsort
+    --split-functions --split-strategy=cdsplit --split-all-cold --split-eh
+    --jump-tables=aggressive
+    --indirect-call-promotion=all --icp-eliminate-loads
+    --reg-reassign --x86-strip-redundant-address-size
+    --peepholes=all
+    --simplify-conditional-tail-calls --simplify-rodata-loads
+    --eliminate-unreachable
+    --inline-small-functions --inline-small-functions-bytes=4
+    --inline-memcpy
+    --plt=all --hot-data
+    --tail-duplication=cache --equalize-bb-counts
+    --infer-stale-profile=1 --match-profile-with-function-hash
+    --cu-processing-batch-size=64
+    --dyno-stats
+    --print-profile-stats
+    --print-cache-metrics
+  )
+
+  # NOTE: llvm-bolt writes ALL its output (BOLT-INFO, dynostats, profile
+  # stats, cache metrics, errors) to STDOUT, NOT stderr. Verified against
+  # llvm-bolt 19.1.7 source - the `outs()` stream goes to stdout. So we
+  # capture stdout (`>`) and merge stderr into it (`2>&1`) into the per-stage
+  # log file. These logs are what bolt-stats.txt is built from.
+  printf '  -> [BOLT] Stage 4d: optimise libkwin.so (capturing stats)\n'
+  local _lib_log="$srcdir/bolt-lib-opt.log"
+  if llvm-bolt "$BOLT_DIR/libkwin.so.orig" \
+        --data="$BOLT_DIR/lib.merged.fdata" \
+        "${_bolt_opts[@]}" \
+        -o "$BOLT_DIR/libkwin.so.bolt" \
+        >"$_lib_log" 2>&1; then
+    if [[ -f "$BOLT_DIR/libkwin.so.bolt" && -s "$BOLT_DIR/libkwin.so.bolt" ]]; then
+      install -m755 "$BOLT_DIR/libkwin.so.bolt" "$_lib"
+      printf '  -> [BOLT] libkwin.so OPTIMISED + installed (%s bytes)\n' \
+             "$(stat -c%s "$_lib")"
+    else
+      warning "[BOLT] libkwin.so.bolt missing/empty after optimise; keeping PGO"
+      install -m755 "$BOLT_DIR/libkwin.so.orig" "$_lib"
+    fi
+  else
+    warning "[BOLT] libkwin.so optimise FAILED; keeping Stage 3 PGO binary"
+    warning "[BOLT] see $_lib_log"
+    install -m755 "$BOLT_DIR/libkwin.so.orig" "$_lib"
+  fi
+
+  local _bin_log="$srcdir/bolt-bin-opt.log"
+  if (( ${#_peek_bin[@]} > 0 )) && [[ -s "$BOLT_DIR/bin.merged.fdata" ]]; then
+    printf '  -> [BOLT] Stage 4d: optimise kwin_wayland (capturing stats)\n'
+    if llvm-bolt "$BOLT_DIR/kwin_wayland.orig" \
+         --data="$BOLT_DIR/bin.merged.fdata" \
+         "${_bolt_opts[@]}" \
+         -o "$BOLT_DIR/kwin_wayland.bolt" \
+         >"$_bin_log" 2>&1; then
+      if [[ -f "$BOLT_DIR/kwin_wayland.bolt" && -s "$BOLT_DIR/kwin_wayland.bolt" ]]; then
+        install -m755 "$BOLT_DIR/kwin_wayland.bolt" "$_bin"
+        printf '  -> [BOLT] kwin_wayland OPTIMISED + installed (%s bytes)\n' \
+               "$(stat -c%s "$_bin")"
+      else
+        warning "[BOLT] kwin_wayland.bolt missing/empty; keeping PGO binary"
+        install -m755 "$BOLT_DIR/kwin_wayland.orig" "$_bin"
+      fi
+    else
+      warning "[BOLT] kwin_wayland optimise FAILED; keeping Stage 3 PGO binary"
+      warning "[BOLT] see $srcdir/bolt-bin-opt.log"
+      install -m755 "$BOLT_DIR/kwin_wayland.orig" "$_bin"
+    fi
+  else
+    warning "[BOLT] no kwin_wayland .fdata; binary stays Stage 3 PGO-only"
+  fi
+
+  # ---- Stage 4d.5: post-BOLT sanity verification --------------------- #
+  # Two independent checks that catch the dominant classes of BOLT
+  # correctness regressions on Qt6 shared libraries:
+  #
+  #   1) ICF over-folding detector: count how many dynamic-symbol text
+  #      addresses have absurdly many aliased symbols. A library with
+  #      no ICF folding has 1 symbol per address. A library with a tiny
+  #      amount of legitimate aliasing (e.g. C++ thunk dedup) might have
+  #      2-4. >16 is a strong signal of qt_metacall-style mass folding,
+  #      which is what broke the previous build (67 KWin::*::qt_metacall
+  #      symbols all folded to one address -> "signal not found" storm
+  #      + black screen). Threshold of 16 leaves a safety margin while
+  #      catching the catastrophic case at 67-99 aliases.
+  #
+  #   2) Live load test: spawn the just-BOLTed kwin_wayland with
+  #      --version. This forces the dynamic linker to load the
+  #      BOLTed libkwin.so and run all its ctors (which exercise the
+  #      QMetaObject static initialisers - the exact code path that
+  #      crashed before). Exits in <1s on success. Crash, hang, or
+  #      non-zero exit triggers rollback.
+  #
+  # On any failure, restore the Stage 3 PGO binaries (which we have
+  # safely preserved in $BOLT_DIR/*.orig).
+  _bolt_verify() {
+    local _lib_in="$1" _bin_in="$2"
+    [[ -f "$_lib_in" && -x "$_bin_in" ]] || return 1
+
+    # Check 1: Qt qt_metacall identity preservation.
+    # The black-screen bug in earlier rounds was --icf=safe folding 67 distinct
+    # KWin::*::qt_metacall functions to a single address, breaking Qt's
+    # QObject::connect signal resolution (which uses qt_metacall function
+    # pointer identity to dispatch by sender class). Earlier we used a generic
+    # "max aliases per text address" threshold, but that fires false-positives
+    # on compiler/LLD-level ICF of trivial virtual stubs (~99 distinct
+    # InputEventFilter::keyboardKey/touchFrame/etc. base virtuals legitimately
+    # fold to one `xor %eax,%eax; ret`). Those are SAFE because Qt RTTI uses
+    # static_metaObject pointers, not the virtual address.
+    #
+    # The correct Qt-specific check: count how many distinct qt_metacall
+    # symbols share an address. If >1, BOLT has broken Qt introspection.
+    local _qt_aliases _max_qt_addr=""
+    _qt_aliases="$(nm -D "$_lib_in" 2>/dev/null \
+                    | awk '$2=="T" || $2=="t" || $2=="W" || $2=="w" {print $1, $3}' \
+                    | grep -E '11qt_metacallEN' \
+                    | awk '{print $1}' | sort | uniq -c | sort -rn | head -n 1)"
+    local _qt_count=0
+    if [[ -n "$_qt_aliases" ]]; then
+      _qt_count=$(awk '{print $1+0}' <<<"$_qt_aliases")
+      _max_qt_addr=$(awk '{print $2}' <<<"$_qt_aliases")
+    fi
+    printf '  -> [VERIFY] max qt_metacall aliases per address: %s (addr=%s)\n' \
+           "$_qt_count" "$_max_qt_addr"
+    if (( _qt_count > 1 )); then
+      warning "[VERIFY] BOLT folded $_qt_count Qt qt_metacall symbols at one address"
+      warning "[VERIFY] this breaks QObject::connect signal resolution"
+      warning "[VERIFY] check llvm-bolt for unsafe --icf flag"
+      return 1
+    fi
+
+    # Check 1b (informational only): generic max-aliases (compiler/LLD ICF of
+    # trivial virtual stubs is harmless but worth surfacing).
+    local _max_aliases
+    _max_aliases="$(nm -D "$_lib_in" 2>/dev/null \
+                    | awk '$2=="T" || $2=="t" || $2=="W" || $2=="w" {print $1}' \
+                    | sort | uniq -c | sort -rn | head -n 1 \
+                    | awk '{print $1+0}')"
+    if [[ -z "$_max_aliases" ]]; then _max_aliases=0; fi
+    printf '  -> [VERIFY] max generic symbol aliases per address: %s (compiler ICF; informational)\n' \
+           "$_max_aliases"
+
+    # Check 2: live load test (uses RUNPATH to load the BOLTed libkwin.so)
+    if ! timeout -k 2 10 "$_bin_in" --version >/dev/null 2>&1; then
+      warning "[VERIFY] BOLTed kwin_wayland --version failed (exit/timeout)"
+      return 1
+    fi
+    printf '  -> [VERIFY] kwin_wayland --version OK\n'
+    return 0
+  }
+
+  printf '  -> [BOLT] Stage 4d.5: post-BOLT sanity verification\n'
+  if _bolt_verify "$_lib" "$_bin"; then
+    printf '  -> [BOLT] verification PASSED; shipping BOLTed binaries\n'
+  else
+    warning "[BOLT] verification FAILED; reverting to Stage 3 PGO binaries"
+    install -m755 "$BOLT_DIR/libkwin.so.orig"    "$_lib"
+    install -m755 "$BOLT_DIR/kwin_wayland.orig"  "$_bin"
+    # Re-verify the restored Stage 3 binaries actually work
+    if ! timeout -k 2 10 "$_bin" --version >/dev/null 2>&1; then
+      error "[BOLT] even Stage 3 PGO kwin_wayland --version fails; aborting"
+      return 1
+    fi
+    printf '  -> [BOLT] Stage 3 PGO binaries restored + verified runnable\n'
+  fi
+
+  # ---- Stage 4e: consolidated bolt-stats.txt report ------------------- #
+  # Extract the meat from $srcdir/bolt-{lib,bin}-opt.log into a single
+  # human-readable report at $srcdir/bolt-stats.txt. Sections:
+  #   1. Header: timestamp, llvm-bolt version, file size deltas
+  #   2. Training summary: fdata file count + total size
+  #   3. Per-binary metrics from llvm-bolt --dyno-stats:
+  #      - function/block profile coverage
+  #      - profile bias score
+  #      - i-cache hit ratio + TSP score from --print-cache-metrics
+  #      - dyno-stats before/after diff (% improvements per metric)
+  #      - PLT/ICP optimization summary
+  _bolt_stats_extract() {
+    local _tag="$1" _log="$2" _orig="$3" _opt="$4"
+    [[ -r "$_log" ]] || { printf '[%s] log not readable: %s\n\n' "$_tag" "$_log"; return; }
+    local _orig_sz _opt_sz _delta
+    _orig_sz=$(stat -c%s "$_orig" 2>/dev/null || echo 0)
+    _opt_sz=$(stat -c%s "$_opt" 2>/dev/null || echo 0)
+    _delta=$(( _opt_sz - _orig_sz ))
+    printf '================================================================\n'
+    printf '  %s\n' "$_tag"
+    printf '================================================================\n'
+    printf 'orig size       : %s bytes (%s)\n' "$_orig_sz" "$_orig"
+    printf 'optimised size  : %s bytes (%s)\n' "$_opt_sz" "$_opt"
+    printf 'delta           : %+d bytes (%+.1f%%)\n' "$_delta" \
+           "$(awk -v a="$_orig_sz" -v b="$_opt_sz" \
+                 'BEGIN{ if(a>0) printf "%.1f", (b-a)/a*100; else print "0" }')"
+    printf '\n'
+    # Profile coverage + bias
+    printf -- '-- profile coverage --\n'
+    grep -E 'functions in the binary.*have non-empty execution profile|functions with profile could not be optimized|profile for [0-9]+ objects was ignored|Profile bias score' \
+         "$_log" 2>/dev/null | sed 's/^BOLT-INFO: /  /'
+    printf '\n'
+    # Optimization summary
+    printf -- '-- optimisation summary --\n'
+    grep -E '^BOLT-INFO: (basic block reordering|[0-9]+ instructions were shortened|removed [0-9]+ empty|UCE removed|ICF |splitting separates|Functions were reordered|tail duplication|PLT calls in the binary were optimized|ICP percentage|Peephole:)' \
+         "$_log" 2>/dev/null | sed 's/^BOLT-INFO: /  /'
+    printf '\n'
+    # Cache metrics
+    printf -- '-- i-cache + layout metrics --\n'
+    sed -n '/cache metrics after emitting functions:/,/^BOLT-INFO:/p' "$_log" 2>/dev/null \
+      | grep -vE '^BOLT-INFO: (cache metrics|patched build-id)' \
+      | grep -E '.' | sed 's/^/  /'
+    printf '\n'
+    # dyno-stats: full block (before + after with % deltas)
+    printf -- '-- dyno-stats (before / after BOLT optimisations) --\n'
+    awk '/program-wide dynostats after all optimizations before SCTC/{flag=1; next}
+         flag && /^BOLT-INFO:/{flag=0}
+         flag {print "  " $0}' "$_log" 2>/dev/null
+    printf '\n'
+  }
+
+  {
+    printf '================================================================\n'
+    printf '  KWin %s -- PGO + CS-PGO + BOLT statistics report\n' "$pkgver"
+    printf '================================================================\n'
+    printf 'date            : %s\n' "$(date -Iseconds)"
+    printf 'host            : %s (%s cores)\n' "$(uname -srm)" "$(nproc)"
+    if command -v llvm-bolt >/dev/null 2>&1; then
+      printf 'llvm-bolt       : %s\n' \
+             "$(llvm-bolt --version 2>&1 | head -2 | tr '\n' ' ')"
+    fi
+    printf '\n'
+    printf -- '-- training corpus --\n'
+    printf 'libkwin fdata   : %d files / %d bytes total\n' \
+           "${#_peek_lib[@]}" \
+           "$(stat -c%s "$BOLT_DIR"/kwin-lib.fdata.*.fdata 2>/dev/null \
+              | awk '{s+=$1} END{print s+0}')"
+    printf 'kwin_wayland fdata : %d files / %d bytes total\n' \
+           "${#_peek_bin[@]}" \
+           "$(stat -c%s "$BOLT_DIR"/kwin-bin.fdata.*.fdata 2>/dev/null \
+              | awk '{s+=$1} END{print s+0}')"
+    printf '\n'
+
+    _bolt_stats_extract "libkwin.so.$pkgver" "$_lib_log" \
+                        "$BOLT_DIR/libkwin.so.orig" "$_lib"
+    _bolt_stats_extract "kwin_wayland"         "$_bin_log" \
+                        "$BOLT_DIR/kwin_wayland.orig" "$_bin"
+
+    printf '================================================================\n'
+    printf '  Raw llvm-bolt logs preserved at:\n'
+    printf '    %s\n' "$_lib_log"
+    printf '    %s\n' "$_bin_log"
+    printf '================================================================\n'
+  } > "$srcdir/bolt-stats.txt"
+
+  # Echo a compact summary to the live build log so the user sees something
+  # immediately without grepping bolt-stats.txt.
+  printf '\n'
+  printf '================================================================\n'
+  printf '  BOLT statistics summary  (full report: %s/bolt-stats.txt)\n' "$srcdir"
+  printf '================================================================\n'
+  grep -E '^(orig size|optimised size|delta|=====|  [a-zA-Z])' \
+       "$srcdir/bolt-stats.txt" 2>/dev/null | head -80 || true
+  printf '================================================================\n'
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  # Arch convention (matches Arch's official kwin PKGBUILD): grant
+  # CAP_SYS_NICE so kwin can raise its own scheduling priority for low
+  # input/frame latency. Without this, KWin runs at SCHED_OTHER which adds
+  # 1-3 ms of input jitter under load.
+  if [[ -f "$pkgdir/usr/bin/kwin_wayland" ]]; then
+    setcap CAP_SYS_NICE=+ep "$pkgdir/usr/bin/kwin_wayland"
+  fi
+}
