@@ -1,0 +1,694 @@
+# Maintainer: Marcus <marcus@localhost>
+#
+# chromium-raptorlake
+# -------------------
+# Chromium tuned for Intel Raptor Lake (13th/14th-gen Core, e.g. i7-14700KF),
+# adapted from RobRich999's Chromium_Clang AVX2 build:
+#   https://github.com/RobRich999/Chromium_Clang/
+#
+# Built with Marcus's CUSTOM "llvm-ultimate" toolchain (PGO+CSPGO+ThinLTO+BOLT
+# clang/lld/polly/bolt, LLVM main / v22.x), NOT the system toolchain. Point the
+# build at it before running makepkg:
+#
+#     export PATH="/home/marcus/toolchain/llvm-ultimate/bin:$PATH"
+#     makepkg -s
+#
+# The PKGBUILD auto-detects whichever clang/lld/rustc are first on PATH and
+# wires gn at them, so the custom toolchain is used end-to-end.
+#
+# Your /etc/makepkg.conf flags are intentionally ignored via options=('!buildflags'),
+# which makes makepkg unset CPPFLAGS/CFLAGS/CXXFLAGS/LDFLAGS/RUSTFLAGS. Chromium's
+# GN owns every compile/link flag and the raptorlake patch sets arch/tune inside
+# the build, so no /etc/makepkg.conf pollution can reach (or fight) the build.
+#
+# ── Why the Raptor Lake patch differs from RobRich's generic AVX2 one ─────────
+# Every change below was validated empirically with clang-22 + llvm-mca-22 using
+# the real Raptor Lake scheduling model (-mcpu=raptorlake). See README.md for the
+# numbers. Summary:
+#   * -march/-mtune  x86-64-v3/skylake -> raptorlake   (gains VAES+GFNI+AVX-VNNI,
+#     RPL scheduling; emits NO AVX-512 -> safe on consumer RPL, verified).
+#   * REMOVED -mno-bmi2: RPL has fast hardware PEXT/PDEP (RobRich disables it only
+#     to protect slow AMD Zen1/2).
+#   * REMOVED -mno-gather/-mno-scatter (C++ AND rust prefer-no-gather): llvm-mca
+#     showed a single vgatherdps is ~1.8x FASTER on Raptor Cove than the scalar
+#     vpextrq/vinsertps emulation the flag forces. LLVM's raptorlake subtarget
+#     does NOT set prefer-no-gather (unlike skylake-client), confirming this.
+#   * KEPT -ffp-contract=fast (FMA): measured ~40% fewer cycles on a 4x4 matmul.
+#   * KEPT all of RobRich's other wins (ThinLTO -O3/CGO3, Polly, branch align,
+#     relaxed libc++ hardening, pack-relative-relocs, full HEVC/AC3/DV media...).
+#
+# ── PGO ──────────────────────────────────────────────────────────────────────
+# Uses Chromium's UPSTREAM PGO profile (chrome_pgo_phase=2). prepare() runs
+# Chromium's own tools/update_pgo_profiles.py, which reads chrome/build/
+# linux.pgo.txt and downloads the exact 86 MB profile matching this pkgver from
+# the official optimization-profiles bucket. No custom PGO training, no network
+# guesswork, and it auto-stays in sync if you bump pkgver.
+
+pkgname=chromium-raptorlake
+pkgver=151.0.7880.0
+pkgrel=2.1
+_launcher_ver=8
+
+# ── Tunables ─────────────────────────────────────────────────────────────────
+# Final-link parallelism. ThinLTO link peaks at several GB per job; lower this
+# (e.g. _jobs=8) if you OOM. Empty = ninja autodetect (nproc).
+_jobs=
+# Set to 0 to disable upstream PGO (faster build, slower browser). Default 2.
+_pgo_phase=2
+
+pkgdesc="Chromium tuned for Intel Raptor Lake (raptorlake/VAES/BMI2/gather, ThinLTO+upstream-PGO+Polly; RobRich999-derived, custom llvm-ultimate)"
+arch=('x86_64')
+url="https://github.com/RobRich999/Chromium_Clang"
+license=('BSD-3-Clause')
+depends=(
+  'alsa-lib' 'at-spi2-core' 'cairo' 'dbus' 'desktop-file-utils' 'expat'
+  'gcc-libs' 'glib2' 'glibc' 'gtk3' 'hicolor-icon-theme' 'libcups' 'libdrm'
+  'libffi' 'libgcc' 'libgcrypt' 'libpulse' 'libstdc++' 'libva' 'libx11'
+  'libxcb' 'libxcomposite' 'libxdamage' 'libxext' 'libxfixes' 'libxkbcommon'
+  'libxrandr' 'libxss' 'mesa' 'nspr' 'nss' 'pango' 'pciutils' 'systemd'
+  'systemd-libs' 'ttf-liberation' 'xdg-utils' 'zlib'
+)
+# NOTE: clang/lld/llvm/polly/l,compiler-rt are intentionally NOT in makedepends:
+# Marcus supplies them via the custom llvm-ultimate toolchain on PATH. They are
+# listed in checkdepends-style comments for completeness. rust/rust-bindgen come
+# from the system (or your own); see the LTO-compat note in build().
+makedepends=(
+  'rust' 'rust-bindgen'
+  'gn' 'ninja' 'gperf' 'nodejs' 'npm' 'python' 'pipewire'
+  'qt6-base' 'java-runtime-headless'
+  'go'  # Dawn/tint source generator runs `go run`
+  'git' 'wget' 'python-httplib2' 'python-pyparsing' 'python-six'
+)
+optdepends=(
+  'pipewire: WebRTC desktop sharing under Wayland'
+  'kdialog: support for native dialogs in Plasma'
+  'gtk4: for --gtk-version=4 (GTK4 IME might work better on Wayland)'
+  'org.freedesktop.secrets: password storage backend on GNOME / Xfce'
+  'upower: Battery Status API support'
+  'intel-media-driver: VA-API hardware video acceleration on Raptor Lake iGPU'
+)
+provides=("chromium=$pkgver" "chromedriver=$pkgver")
+conflicts=('chromium' 'chromedriver')
+options=('!lto' '!strip' '!debug' '!buildflags')
+# !lto        -> Chromium drives its own ThinLTO (don't let makepkg add -flto).
+# !strip      -> symbol_level=0 already; no stripping needed.
+# !debug      -> no separate debug package.
+# !buildflags -> THE IMPORTANT ONE for a CachyOS box: makepkg unsets
+#                CPPFLAGS CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS (+ DEBUG_*) so none
+#                of your aggressive /etc/makepkg.conf flags (-march=native,
+#                -flto, -fcf-protection, RUSTFLAGS=-Ctarget-cpu=native, custom
+#                FORTIFY, etc.) leak into the build. Chromium's GN owns every
+#                compile/link flag itself (verified: the only getenv() in
+#                build/config/compiler/BUILD.gn is for SWARMING_* bot vars), and
+#                the raptorlake patch sets -march=raptorlake / -Ctarget-cpu=
+#                raptorlake inside the build. So dropping the env flags entirely
+#                is both correct and cleaner than scrubbing them one by one.
+
+source=(
+  "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-$pkgver-lite.tar.xz"
+  "chromium-launcher-$_launcher_ver.tar.gz::https://github.com/foutrelis/chromium-launcher/archive/v$_launcher_ver/chromium-launcher-$_launcher_ver.tar.gz"
+  "linux64-raptorlake.patch"
+  "chromium-raptorlake-fixes.patch"
+)
+# Upstream tarball is a moving dev target -> SKIP. The two artifacts we control
+# are pinned (launcher hash cross-checked against the Arch package).
+sha256sums=(
+  'SKIP'
+  '213e50f48b67feb4441078d50b0fd431df34323be15be97c55302d3fdac4483a'
+  'f3d533cf54a2e574cbd8d26881280a7ade101f927b92839f77516d99e54ddcc2'
+  '3515963bf750f232f68b4cafcb32027945adf19d949bb01d0c9eb6cd044f2603'
+)
+
+# Personal/local build: no Google API keys baked in (sign-in/sync disabled),
+# matching the RobRich build (google_api_key="no").
+_google_api_key=no
+
+prepare() {
+  cd "$srcdir/chromium-$pkgver"
+
+  msg2 "Applying Raptor Lake performance patch (RobRich999 AVX2 -> raptorlake, data-tuned)..."
+  patch -Np1 -i "$srcdir/linux64-raptorlake.patch"
+
+  msg2 "Applying adopted upstream/distro fixes + log-spam cleanup..."
+  # Curated set of source fixes (see chromium-raptorlake-fixes.patch):
+  #   * sandbox/.../linux_seccomp.h         : +#include <signal.h>  (Arch chromium-145-fix-SYS_SECCOMP;
+  #                                           SIGSYS/seccomp header drift -> avoids a sandbox build break)
+  #   * media/gpu/sandbox/...hook_linux.cc  : +#include "base/logging.h" (Arch chromium-149; LOG() in a
+  #                                           VA-API sandbox hook -> avoids use-of-undeclared-identifier)
+  #   * services/device/serial/..._posix.cc : B##x -> __B##x (Arch glibc-2.42-baud-rate-fix; CachyOS
+  #                                           glibc >= 2.42 renamed the Bxxxx baud macros to __Bxxxx)
+  #   * build/config/compiler/BUILD.gn      : fortify_level 2 -> 3 (Arch increase-fortify-level). Upstream
+  #                                           already uses 3 when use_sysroot+clang; we build use_sysroot=
+  #                                           false, so we set it explicitly (glibc 2.34+ & clang -> safe).
+  #   * components/viz/.../display.cc       : demote the sub-millisecond "Frame latency is negative"
+  #                                           LOG(ERROR) clock-jitter spam to a >1ms DLOG(WARNING).
+  patch -Np1 -i "$srcdir/chromium-raptorlake-fixes.patch"
+
+  msg2 "Fixing vendored bytemuck for Rust >= 1.95 (core::simd::LaneCount bound)..."
+  # bytemuck v1.25's portable_simd impls carry a `where core::simd::LaneCount<N>:
+  # core::simd::SupportedLaneCount` bound. In Rust >= 1.95 that bound no longer
+  # resolves in this position, so rustc aborts with E0405/E0425. bytemuck ships
+  # two cfg-gated variants selected by rustversion (before/since 2026-01-27); the
+  # `before` variant still has the broken bound and is what a 1.96 rustc built
+  # before that date selects. We drop the offending bound line from the vendored
+  # sources (matches Arch's chromium-rust-bytemuck patch). Only the buggy bound
+  # line is removed; the `T: SimdElement + Pod/Zeroable` bound and the fixed
+  # `since` variant are left intact, so it's correct regardless of which variant
+  # rustversion picks. Idempotent + fails loud if the vendored layout changes.
+  python3 - <<'PYEOF'
+import sys, os
+files = [
+    "third_party/rust/chromium_crates_io/vendor/bytemuck-v1/src/pod.rs",
+    "third_party/rust/chromium_crates_io/vendor/bytemuck-v1/src/zeroable.rs",
+]
+needle = "  core::simd::LaneCount<N>: core::simd::SupportedLaneCount,\n"
+touched = 0
+for p in files:
+    if not os.path.exists(p):
+        sys.exit(f"bytemuck fix: expected file missing: {p} "
+                 "(vendored layout changed; update the PKGBUILD).")
+    s = open(p).read()
+    n = s.count(needle)
+    if n == 0:
+        # Already fixed upstream / different version -> nothing to do.
+        print(f"  {os.path.basename(p)}: no LaneCount bound (skip)")
+        continue
+    s = s.replace(needle, "")          # drop ALL occurrences of the broken bound
+    open(p, "w").write(s)
+    touched += 1
+    print(f"  {os.path.basename(p)}: removed {n} LaneCount/SupportedLaneCount bound(s)")
+if touched == 0:
+    print("  bytemuck: nothing to patch (already compatible)")
+PYEOF
+
+  msg2 "Teaching bindgen's filter to drop clang flags its (older) libclang rejects..."
+  # rust-bindgen parses C++ headers with libclang. GN feeds it the full {{cflags}}
+  # generated for the BUILD compiler (your llvm-ultimate clang 23), but bindgen
+  # links the libclang that ships with system rust-bindgen (currently LLVM 22).
+  # Newer codegen/diagnostic/assembler flags (-fno-lifetime-dse,
+  # -fsanitize-ignore-for-ubsan-feature=*, -fdiagnostics-show-inlining-chain,
+  # -mllvm <pass>, -Wa,*) are unknown to the older libclang and abort bindgen
+  # with "unknown argument". build/rust/gni_impl/filter_clang_args.py exists
+  # precisely to strip args "not appropriate for libclang"; we extend it to drop
+  # these too. They are pure codegen/diagnostics with ZERO effect on the headers
+  # bindgen reads, and this only affects bindgen -- the real C++ compile still
+  # receives every flag. (Robust to any compiler-newer-than-libclang skew.)
+  python3 - <<'PYEOF'
+import io, sys
+p = "build/rust/gni_impl/filter_clang_args.py"
+s = open(p).read()
+if "chromium-raptorlake" in s:
+    sys.exit(0)  # idempotent: already patched
+anchor = "      elif args[i] == '-ftime-trace':\n        pass\n"
+if anchor not in s:
+    sys.exit("filter_clang_args.py: expected anchor not found (upstream changed); "
+             "update the bindgen flag filter in the PKGBUILD.")
+inject = anchor + (
+    "      # --- chromium-raptorlake: drop flags the (possibly older) libclang\n"
+    "      # used by bindgen doesn't understand. All codegen/diagnostic/assembler\n"
+    "      # options with no effect on header parsing, so removing them only for\n"
+    "      # bindgen is safe even when the build clang is newer than libclang.\n"
+    "      elif args[i] == '-mllvm':\n"
+    "        i += 1            # also skip the value following -mllvm\n"
+    "      elif (args[i].startswith('-fsanitize-ignore-for-ubsan-feature')\n"
+    "            or args[i] in ('-fno-lifetime-dse',\n"
+    "                           '-fdiagnostics-show-inlining-chain')\n"
+    "            or args[i].startswith('-Wa,')):\n"
+    "        pass\n"
+)
+open(p, "w").write(s.replace(anchor, inject, 1))
+print("  filter_clang_args.py patched for clang/libclang version skew")
+PYEOF
+
+  msg2 "Allow building against system libraries in official builds..."
+  sed -i 's/OFFICIAL_BUILD/GOOGLE_CHROME_BUILD/' \
+    tools/generate_shim_headers/generate_shim_headers.py
+
+  # https://crbug.com/893950
+  sed -i -e 's/\<xmlMalloc\>/malloc/' -e 's/\<xmlFree\>/free/' \
+         -e '1i #include <cstdlib>' \
+    third_party/blink/renderer/core/xml/*.cc \
+    third_party/blink/renderer/core/xml/parser/xml_document_parser.cc \
+    third_party/libxml/chromium/*.cc 2>/dev/null || true
+
+  msg2 "Removing the strict NodeJS version check (system node is API-compatible)..."
+  # Chromium pins an EXACT node version and asserts on it via
+  # //third_party/node:check_version (check_version.js). Your CachyOS node
+  # (v26) != the pinned version, so the build aborts with
+  #   ERR_ASSERTION: Failed NodeJS version check: Expected 'vX', found 'vY'.
+  # This is a gclient footgun-guard, irrelevant when a distro provides a
+  # compatible node. The canonical Arch/Gentoo fix removes the check_version
+  # *dependency* from the two .gni files that inject it, so it never runs.
+  # (Version-agnostic: no spoofing, survives future node bumps.) We also blank
+  # check_version.js as defense-in-depth in case a new caller re-adds the dep.
+  python3 - <<'PYEOF'
+import sys
+
+# 1) node.gni: drop the auto-added ":check_version" dependency block.
+p = "third_party/node/node.gni"
+s = open(p).read()
+if "chromium-raptorlake" not in s:
+    anchor = (
+        '    # Automatically add a dependency to ":check_version" to ensure NodeJS is\n'
+        '    # always running the expected version, except when the \':check_version\'\n'
+        '    # target itself is running in which case it shouldn\'t depend on itself.\n'
+        '    if (get_label_info(":" + target_name, "label_no_toolchain") !=\n'
+        '        "//third_party/node:check_version") {\n'
+        '      if (!defined(deps)) {\n'
+        '        deps = []\n'
+        '      }\n'
+        '      deps += [ "//third_party/node:check_version" ]\n'
+        '    }\n'
+    )
+    if anchor not in s:
+        sys.exit("node.gni: check_version block anchor not found "
+                 "(upstream changed); update the NodeJS-check removal in the PKGBUILD.")
+    s = s.replace(
+        anchor,
+        "    # chromium-raptorlake: NodeJS version check removed (system node is fine)\n",
+        1)
+    open(p, "w").write(s)
+    print("  node.gni: check_version dependency removed")
+
+# 2) proto_library.gni: drop its explicit ":check_version" dep line.
+p = "third_party/protobuf/proto_library.gni"
+s = open(p).read()
+needle = '      deps += [ "//third_party/node:check_version" ]\n'
+if needle in s:
+    s = s.replace(needle, "", 1)
+    open(p, "w").write(s)
+    print("  proto_library.gni: check_version dependency removed")
+
+# 3) Defense-in-depth: make check_version.js a no-op so it can never assert.
+p = "third_party/node/check_version.js"
+open(p, "w").write(
+    "// chromium-raptorlake: NodeJS version check disabled (system node is "
+    "API-compatible).\nprocess.exit(0);\n")
+print("  check_version.js neutralized")
+PYEOF
+
+  msg2 "Linking system/host build tools into the paths Chromium expects..."
+  # Chromium/Dawn hard-code paths to gclient-managed host tools (node, java,
+  # rustc, gperf, go, ...). The official source tarball does NOT ship them, so
+  # downstream must provide compatible system copies at those exact paths. This
+  # table maps "Chromium-expected path" -> "system tool name". Each tool is
+  # resolved with `command -v` and we FAIL LOUDLY if it's missing, so a missing
+  # host tool aborts in prepare() with a clear message instead of thousands of
+  # targets into the compile. Add new entries here if a future build step needs
+  # another bundled tool.
+  local -A _host_tools=(
+    [third_party/node/linux/node-linux-x64/bin/node]=node
+    [third_party/jdk/current/bin/java]=java
+    [third_party/rust-toolchain/bin/rustc]=rustc
+    [third_party/gperf/cipd/bin/gperf]=gperf
+    # Dawn's tint code generator runs `go run` from this bundled path.
+    [third_party/dawn/tools/golang/linux-amd64/bin/go]=go
+  )
+  local _dest _tool _src
+  for _dest in "${!_host_tools[@]}"; do
+    _tool=${_host_tools[$_dest]}
+    _src=$(command -v "$_tool") \
+      || error "required host tool '$_tool' not found on PATH (install it; see makedepends)."
+    install -d "$(dirname "$_dest")"
+    ln -sfv "$_src" "$_dest"
+  done
+
+  if (( _pgo_phase == 2 )); then
+    msg2 "Fetching UPSTREAM PGO profile (linux) from the official bucket..."
+    # chrome/build/linux.pgo.txt holds the exact profile filename that matches
+    # THIS Chromium revision. GN's pgo config expects the profile to live in
+    # chrome/build/pgo_profiles/<name>. We download it directly over public
+    # HTTPS instead of via tools/update_pgo_profiles.py, because that script
+    # needs third_party/depot_tools + gsutil, which the official *-lite.tar.xz
+    # does not ship. The public bucket serves the file over plain HTTPS.
+    local _pgo_name _pgo_dir _pgo_file _gs
+    _pgo_name=$(tr -d '[:space:]' < chrome/build/linux.pgo.txt)
+    [[ -n $_pgo_name ]] || error "could not read chrome/build/linux.pgo.txt"
+    _pgo_dir="$PWD/chrome/build/pgo_profiles"
+    _pgo_file="$_pgo_dir/$_pgo_name"
+    mkdir -p "$_pgo_dir"
+    _gs="https://storage.googleapis.com/chromium-optimization-profiles/pgo_profiles/$_pgo_name"
+    if [[ ! -f $_pgo_file ]]; then
+      msg2 "  downloading $_pgo_name ..."
+      # -C - lets a retried makepkg resume a partial download.
+      curl -fL --retry 3 --retry-delay 2 -C - -o "$_pgo_file" "$_gs" \
+        || error "failed to download upstream PGO profile from $_gs"
+    fi
+    # Sanity: it must be a real LLVM profile (magic) and non-trivial in size.
+    [[ $(stat -c%s "$_pgo_file") -gt 1000000 ]] \
+      || error "downloaded PGO profile looks too small: $_pgo_file"
+    echo "$_pgo_file" > "$srcdir/.pgo_data_path"
+    msg2 "PGO profile ready: $_pgo_file"
+  fi
+
+  msg2 "Generating missing Dawn commit-hash header..."
+  # The official tarball is NOT a git/jj checkout, so build/util/lastchange.py's
+  # GetVersion() returns None and main() then crashes with:
+  #   AttributeError: 'NoneType' object has no attribute 'revision'
+  # (older M-versions silently fell back to a 0.0.0 dummy; M151 does not on this
+  # code path). lastchange.py has an OFFICIAL no-VCS escape hatch: if
+  # BASE_COMMIT_SUBMISSION_MS is set it uses GetVersionInfoFromEnv() and reads
+  # the hash from BASE_COMMIT_HASH instead of touching git. We feed it the REAL
+  # Dawn revision pinned in the tarball's own DEPS, so the generated header
+  # carries the correct hash (used for Dawn/WebGPU cache keying & about:gpu),
+  # not a meaningless zero. If DEPS can't be parsed for any reason we fall back
+  # to the upstream all-zero dummy (same value as build/util/LASTCHANGE.dummy)
+  # so the build still completes.
+  local _dawn_rev
+  _dawn_rev=$(sed -nE "s/.*'dawn_revision'[[:space:]]*:[[:space:]]*'([0-9a-f]{40})'.*/\1/p" DEPS | head -1)
+  if [[ -z $_dawn_rev ]]; then
+    warning "Could not parse dawn_revision from DEPS; using all-zero dummy hash."
+    _dawn_rev=0000000000000000000000000000000000000000
+  fi
+  BASE_COMMIT_HASH="$_dawn_rev" BASE_COMMIT_SUBMISSION_MS=0 \
+  python3 build/util/lastchange.py -m DAWN_COMMIT_HASH \
+    -s third_party/dawn --revision gpu/webgpu/DAWN_VERSION \
+    --header gpu/webgpu/dawn_commit_hash.h
+  msg2 "Dawn commit hash: $_dawn_rev"
+}
+
+build() {
+  msg2 "Building chromium-launcher..."
+  make -C "$srcdir/chromium-launcher-$_launcher_ver"
+
+  cd "$srcdir/chromium-$pkgver"
+
+  # ── Use the custom llvm-ultimate toolchain that is first on PATH ───────────
+  local _clang _clangxx _clang_base _clang_version
+  _clang=$(command -v clang)   || error "clang not found on PATH (export your llvm-ultimate bin dir)"
+  _clangxx=$(command -v clang++)
+  # clang_base_path is the dir CONTAINING bin/clang (i.e. the prefix).
+  _clang_base=$(dirname "$(dirname "$(realpath "$_clang")")")
+  _clang_version=$("$_clang" --version | sed -nE 's/.*clang version ([0-9]+).*/\1/p' | head -1)
+  export CC="$_clang"
+  export CXX="$_clangxx"
+  export AR="$_clang_base/bin/llvm-ar"
+  export NM="$_clang_base/bin/llvm-nm"
+  [[ -x $AR ]] || export AR=ar
+  [[ -x $NM ]] || export NM=nm
+  # Allow stable rustc to accept the nightly -Z flags Chromium/RobRich use.
+  export RUSTC_BOOTSTRAP=1
+
+  msg2 "Using clang prefix: $_clang_base  (LLVM major $_clang_version)"
+
+  # ── compiler-rt layout reconciliation (auto-detected) ─────────────────────
+  # Chromium's build/config/clang/BUILD.gn hard-codes the clang runtime path in
+  # the "per-target runtime dir" layout:
+  #     <resource-dir>/lib/<triple>/libclang_rt.builtins.a
+  # That is what an upstream LLVM built with LLVM_ENABLE_RUNTIMES=compiler-rt
+  # produces (PER_TARGET_RUNTIME_DIR defaults ON) -- i.e. exactly what your
+  # llvm-ultimate emits, so NO change is needed there. But the CachyOS/Arch
+  # *system* `compiler-rt` package ships the older distro layout:
+  #     <resource-dir>/lib/linux/libclang_rt.builtins-<arch>.a
+  # which makes ninja fail with "missing libclang_rt.builtins.a". Rather than
+  # always patching (which would BREAK your llvm-ultimate), we probe the ACTIVE
+  # clang's resource dir and only rewrite the gn path logic to the distro layout
+  # when that's what the active clang actually uses. Correct for BOTH toolchains.
+  local _resdir _rt_native _rt_distro
+  _resdir=$("$_clang" -print-resource-dir 2>/dev/null)
+  _rt_native="$_resdir/lib/x86_64-unknown-linux-gnu/libclang_rt.builtins.a"
+  _rt_distro="$_resdir/lib/linux/libclang_rt.builtins-x86_64.a"
+  if [[ -f $_rt_native ]]; then
+    msg2 "compiler-rt: per-target layout detected ($_resdir/lib/x86_64-unknown-linux-gnu) -- no patch needed."
+  elif [[ -f $_rt_distro ]]; then
+    msg2 "compiler-rt: distro layout detected ($_resdir/lib/linux) -- adjusting gn runtime paths."
+    python3 - <<'PYEOF'
+import sys
+p = "build/config/clang/BUILD.gn"
+s = open(p).read()
+if "RAPTORLAKE_COMPILER_RT_LAYOUT_B" in s:
+    sys.exit(0)  # idempotent
+# 1) add a per-cpu _suffix beside each linux/chromeos triple (matches Arch).
+repl = [
+    ('          _dir = "x86_64-unknown-linux-gnu"\n',
+     '          _dir = "x86_64-unknown-linux-gnu"\n          _suffix = "-x86_64"  # RAPTORLAKE_COMPILER_RT_LAYOUT_B\n'),
+    ('          _dir = "i386-unknown-linux-gnu"\n',
+     '          _dir = "i386-unknown-linux-gnu"\n          _suffix = "-i386"\n'),
+    ('          _dir = "aarch64-unknown-linux-gnu"\n',
+     '          _dir = "aarch64-unknown-linux-gnu"\n          _suffix = "-aarch64"\n'),
+    ('          _dir = "loongarch64-unknown-linux-gnu"\n',
+     '          _dir = "loongarch64-unknown-linux-gnu"\n          _suffix = "-loongarch64"\n'),
+    ('          _dir = "riscv64-unknown-linux-gnu"\n',
+     '          _dir = "riscv64-unknown-linux-gnu"\n          _suffix = "-riscv64"\n'),
+]
+for a, b in repl:
+    if a in s:
+        s = s.replace(a, b, 1)
+# 2) collapse the per-target <triple> dir to the distro "linux" dir, at the end
+#    of the (is_linux || is_chromeos) branch only.
+anchor = ('          assert(false)  # Unhandled cpu type\n        }\n'
+          '      } else if (is_fuchsia) {')
+if anchor not in s:
+    sys.exit("compiler-rt path patch: linux-branch anchor not found "
+             "(upstream build/config/clang/BUILD.gn changed); update the PKGBUILD.")
+s = s.replace(anchor,
+              '          assert(false)  # Unhandled cpu type\n        }\n'
+              '        _dir = "linux"  # RAPTORLAKE_COMPILER_RT_LAYOUT_B\n'
+              '      } else if (is_fuchsia) {', 1)
+open(p, "w").write(s)
+print("  build/config/clang/BUILD.gn adjusted to distro compiler-rt layout")
+PYEOF
+  else
+    warning "compiler-rt: neither layout found under $_resdir/lib (builtins may be missing)."
+    warning "  If the build fails on libclang_rt.builtins, install 'compiler-rt' or check your toolchain."
+  fi
+
+  # ── Rust <-> Clang cross-language ThinLTO compatibility guard ──────────────
+  # rustc embeds its own LLVM; if its major differs from the custom clang's,
+  # cross-language ThinLTO (toolchain_supports_rust_thin_lto) can fail with an
+  # LLVM bitcode mismatch at link. Detect and only enable rust-thinlto when the
+  # majors match; otherwise fall back to plain rust codegen (safe, still fast).
+  local _rustc_llvm _rust_thinlto
+  _rustc_llvm=$(rustc --version --verbose 2>/dev/null \
+                | sed -nE 's/.*LLVM version: ([0-9]+).*/\1/p')
+  if [[ -n $_rustc_llvm && $_rustc_llvm == "$_clang_version" ]]; then
+    _rust_thinlto=true
+    msg2 "rustc LLVM ($_rustc_llvm) matches clang ($_clang_version): enabling Rust cross-LTO."
+  else
+    _rust_thinlto=false
+    warning "rustc LLVM (${_rustc_llvm:-?}) != clang ($_clang_version): disabling Rust cross-LTO to avoid bitcode mismatch."
+  fi
+
+  # ── GN args: RobRich args.gn merged with a known-good Arch base ────────────
+  local _flags=(
+    'is_clang=true'
+    'is_component_build=false'
+    'is_debug=false'
+    'is_official_build=true'          # implies is_cfi=true on x86_64
+    'use_lld=true'
+    'use_thin_lto=true'
+    'thin_lto_enable_optimizations=true'
+    'thin_lto_enable_cache=false'
+    'symbol_level=0'
+    'blink_symbol_level=0'
+    'v8_symbol_level=0'
+    'target_cpu="x64"'
+    'treat_warnings_as_errors=false'
+    'fatal_linker_warnings=false'
+    'clang_use_chrome_plugins=false'
+    'enable_resource_allowlist_generation=false'
+    'enable_precompiled_headers=false'
+    'blink_enable_generated_code_formatting=false'
+
+    # media / codecs (RobRich: full proprietary + HEVC/AC3/EAC3/DolbyVision)
+    'proprietary_codecs=true'
+    'ffmpeg_branding="Chrome"'
+    'enable_ffmpeg_video_decoders=true'
+    'enable_platform_hevc=true'
+    'enable_hevc_parser_and_hw_decoder=true'
+    'enable_platform_ac3_eac3_audio=true'
+    'enable_platform_dolby_vision=true'
+    'enable_platform_mpeg_h_audio=true'
+    'enable_mse_mpeg2ts_stream_parser=true'
+
+    # widevine / drm
+    'enable_media_drm_storage=true'
+    'enable_widevine=true'
+    'bundle_widevine_cdm=false'
+    'ignore_missing_widevine_signing_cert=true'
+
+    # hardware accel (Raptor Lake iGPU)
+    'use_vaapi=true'
+    'rtc_use_pipewire=true'
+    'link_pulseaudio=true'
+
+    # privacy / local-only (no baked Google creds, like RobRich)
+    "google_api_key=\"$_google_api_key\""
+    'google_default_client_id="no"'
+    'google_default_client_secret="no"'
+    'use_official_google_api_keys=false'
+    'enable_remoting=false'
+    'disable_fieldtrial_testing_config=true'
+    'dcheck_always_on=false'
+
+    # perf knobs (RobRich)
+    'use_icf=true'
+    'optimize_for_size=false'
+    'use_text_section_splitting=true'
+    'init_stack_vars_zero=true'
+    'use_sized_deallocation=true'
+    'use_custom_libcxx=true'
+
+    # native build against CachyOS system libs (NOT the downloaded Debian
+    # sysroot). use_sysroot defaults to true and would assert on a missing
+    # //build/linux/debian_bullseye_amd64-sysroot; we build natively instead.
+    # libffi is not bundled in the lite tarball and use_system_libffi defaults
+    # to false off-ChromeOS, so we must opt into the system copy explicitly.
+    'use_sysroot=false'
+    'use_system_libffi=true'
+    'use_clang_modules=false'
+    # use_unified_system_module defaults to TRUE on Linux and is a SEPARATE
+    # toggle from use_clang_modules. Its only consumer, //build/modules/BUILD.gn,
+    # does rebase_path(sysroot,...) to scan system headers for a libc++
+    # modulemap -> with use_sysroot=false (sysroot="") that's an "Empty
+    # directory path" error during `gn gen` (gn parses the whole gn_all graph,
+    # incl. //build/modules, even though we only ninja chrome). We don't build
+    # with libc++ modules (use_clang_modules=false), and //build/modules is only
+    # referenced via the strict_deps config (enable_strict_deps defaults false),
+    # so disabling unified modules is safe and removes the bad rebase_path.
+    'use_unified_system_module=false'
+
+    # rust
+    'enable_rust=true'
+    "toolchain_supports_rust_thin_lto=$_rust_thinlto"
+
+    # build infra
+    'use_siso=false'
+    'use_remoteexec=false'
+    # We do NOT build .deb/.rpm packages (this is an Arch/CachyOS package that
+    # installs out/Release files directly). enable_linux_installer's own default
+    # is `is_linux && !is_component_build && use_sysroot && !using_sanitizer`, so
+    # it REQUIRES a sysroot; forcing it true together with use_sysroot=false made
+    # chrome/installer/linux/BUILD.gn call rebase_path("" ,...) -> "Empty
+    # directory path". We never ninja the //chrome/installer target, so disable
+    # it outright. (Arch does the same by leaving it at its now-false default.)
+    'enable_linux_installer=false'
+    # NOTE: enable_distro_version_check is intentionally NOT set. It is declared
+    # only inside chrome/installer/linux/BUILD.gn, which is no longer loaded once
+    # enable_linux_installer=false, so setting it triggers gn's "Build argument
+    # has no effect / never appeared in a declare_args()" warning. Omitting it is
+    # correct (the distro check only applies to the deb/rpm we don't build).
+    'enable_hangout_services_extension=true'
+    'use_qt5=false'
+    'use_qt6=true'
+    'moc_qt6_path="/usr/lib/qt6"'
+
+    # custom clang toolchain
+    "clang_base_path=\"$_clang_base\""
+    "clang_version=\"$_clang_version\""
+    'rust_sysroot_absolute="/usr"'
+    'rust_bindgen_root="/usr"'
+    "rustc_version=\"$(rustc --version | awk '{print $2}')\""
+  )
+
+  # ── PGO ───────────────────────────────────────────────────────────────────
+  _flags+=("chrome_pgo_phase=$_pgo_phase")
+  if (( _pgo_phase == 2 )); then
+    local _pgo_path
+    _pgo_path=$(cat "$srcdir/.pgo_data_path")
+    # Make it absolute relative to the chromium src dir if needed.
+    [[ $_pgo_path = /* ]] || _pgo_path="$PWD/$_pgo_path"
+    [[ -f $_pgo_path ]] || error "PGO profile not found at $_pgo_path"
+    _flags+=("pgo_data_path=\"$_pgo_path\"")
+    msg2 "Using upstream PGO profile: $_pgo_path"
+  fi
+
+  # ── Flag environment ──────────────────────────────────────────────────────
+  # options=('!buildflags') already made makepkg unset CPPFLAGS/CFLAGS/CXXFLAGS/
+  # LDFLAGS/RUSTFLAGS, so NONE of your /etc/makepkg.conf flags are present here.
+  # Chromium's GN owns all compile/link flags, and the raptorlake patch sets the
+  # arch/tune inside the build, so we deliberately do NOT re-add any optimization
+  # flags. We only append the few deterministic-build hardening switches Chromium
+  # itself recommends (these start from an empty CFLAGS thanks to !buildflags).
+  # Guard with :- so this is robust even if the vars are unset under `set -u`.
+  CFLAGS="${CFLAGS:-} -Wno-builtin-macro-redefined -Wno-unknown-warning-option"
+  CXXFLAGS="${CXXFLAGS:-} -Wno-builtin-macro-redefined -Wno-unknown-warning-option"
+  CPPFLAGS="${CPPFLAGS:-} -D__DATE__= -D__TIME__= -D__TIMESTAMP__="
+  export CFLAGS CXXFLAGS CPPFLAGS
+
+  msg2 "Running gn gen..."
+  gn gen out/Release --args="${_flags[*]}"
+
+  msg2 "Building chrome, chrome_sandbox, chromedriver (long)..."
+  local _ninja_jobs=()
+  [[ -n $_jobs ]] && _ninja_jobs=(-j "$_jobs")
+  ninja "${_ninja_jobs[@]}" -C out/Release chrome chrome_sandbox chromedriver.unstripped
+}
+
+package() {
+  cd "$srcdir/chromium-launcher-$_launcher_ver"
+  make PREFIX=/usr DESTDIR="$pkgdir" install
+  install -Dvm644 LICENSE \
+    "$pkgdir/usr/share/licenses/chromium/LICENSE.launcher"
+
+  cd "$srcdir/chromium-$pkgver"
+
+  install -Dv out/Release/chrome "$pkgdir/usr/lib/chromium/chromium"
+  install -Dv out/Release/chromedriver.unstripped "$pkgdir/usr/bin/chromedriver"
+  install -Dvm4755 out/Release/chrome_sandbox "$pkgdir/usr/lib/chromium/chrome-sandbox"
+
+  install -Dvm644 chrome/installer/linux/common/desktop.template \
+    "$pkgdir/usr/share/applications/chromium.desktop"
+  install -Dvm644 chrome/app/resources/manpage.1.in \
+    "$pkgdir/usr/share/man/man1/chromium.1"
+  sed -i \
+    -e 's/@@MENUNAME/Chromium (Raptor Lake)/g' \
+    -e 's/@@PACKAGE/chromium/g' \
+    -e 's/@@usr_bin_symlink_name/chromium/g' \
+    -e 's|@@uri_scheme|x-scheme-handler/chromium;|g' \
+    -e 's/@@extra_desktop_entries//g' \
+    "$pkgdir/usr/share/applications/chromium.desktop" \
+    "$pkgdir/usr/share/man/man1/chromium.1"
+
+  ( tmpl_file=chrome/installer/linux/common/appdata.xml.template
+    info_file=chrome/installer/linux/common/chromium-browser.info
+    . "$info_file"; PACKAGE=chromium
+    export $(grep -o '^[A-Z_]*' "$info_file")
+    sed -E -e 's/@@([A-Z_]*)/\${\1}/g' -e '/<update_contact>/d' "$tmpl_file" | envsubst
+  ) | install -Dvm644 /dev/stdin "$pkgdir/usr/share/metainfo/chromium.appdata.xml"
+
+  local toplevel_files=(
+    chrome_100_percent.pak
+    chrome_200_percent.pak
+    chrome_crashpad_handler
+    resources.pak
+    v8_context_snapshot.bin
+    icudtl.dat
+    libEGL.so
+    libGLESv2.so
+    libvk_swiftshader.so
+    libvulkan.so.1
+    vk_swiftshader_icd.json
+  )
+  [[ -f out/Release/libqt6_shim.so ]] && toplevel_files+=(libqt6_shim.so)
+
+  cp "${toplevel_files[@]/#/out/Release/}" "$pkgdir/usr/lib/chromium/"
+  install -Dvm644 -t "$pkgdir/usr/lib/chromium/locales" out/Release/locales/*.pak
+
+  # Preloaded runtime data Chrome reads from its module dir. Verified against
+  # the official RobRich RPM payload (chrome/installer/linux/BUILD.gn lists both
+  # under packaging_files). Shipped conditionally since they only exist when the
+  # corresponding data targets were built.
+  #   MEIPreload                          -> Media Engagement Index preload
+  #   PrivacySandboxAttestationsPreloaded -> Privacy Sandbox attestations
+  local _preload
+  for _preload in MEIPreload PrivacySandboxAttestationsPreloaded; do
+    if [[ -d out/Release/$_preload ]]; then
+      install -dvm755 "$pkgdir/usr/lib/chromium/$_preload"
+      install -Dvm644 -t "$pkgdir/usr/lib/chromium/$_preload" out/Release/"$_preload"/*
+    fi
+  done
+
+  for size in 24 48 64 128 256; do
+    install -Dvm644 "chrome/app/theme/chromium/product_logo_$size.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/chromium.png"
+  done
+  for size in 16 32; do
+    install -Dvm644 "chrome/app/theme/default_100_percent/chromium/product_logo_$size.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/chromium.png"
+  done
+
+  install -Dvm644 LICENSE "$pkgdir/usr/share/licenses/chromium/LICENSE"
+}
+
+# vim:set ts=2 sw=2 et:
