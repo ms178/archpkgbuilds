@@ -15,7 +15,7 @@ index eac72b0..dca9111 100644
  
  QDebug operator<<(QDebug dbg, const KWin::Rect &rect)
 diff --git a/src/backends/drm/drm_backend.cpp b/src/backends/drm/drm_backend.cpp
-index a6fabc6..1772fe6 100644
+index a6fabc6..e8a4d60 100644
 --- a/src/backends/drm/drm_backend.cpp
 +++ b/src/backends/drm/drm_backend.cpp
 @@ -53,19 +53,28 @@ namespace KWin
@@ -148,7 +148,7 @@ index a6fabc6..1772fe6 100644
 +        const QString action = device->action();
 +
 +        if (action == kActionAdd) {
-+            if (DrmGpu *const gpu = findGpu(devNum)) {
++            if (findGpu(devNum)) {
 +                qCWarning(KWIN_DRM) << "Received unexpected add udev event for:" << devNode;
                  continue;
              }
@@ -975,10 +975,10 @@ index 337ea46..792f49f 100644
  
  private:
 diff --git a/src/backends/drm/drm_commit_thread.cpp b/src/backends/drm/drm_commit_thread.cpp
-index 7e16489..e4cf43d 100644
+index 7e16489..eb39d14 100644
 --- a/src/backends/drm/drm_commit_thread.cpp
 +++ b/src/backends/drm/drm_commit_thread.cpp
-@@ -13,300 +13,577 @@
+@@ -13,300 +13,588 @@
  #include "utils/envvar.h"
  #include "utils/realtime.h"
  
@@ -1009,6 +1009,7 @@ index 7e16489..e4cf43d 100644
 +// Sanity clamp for the estimateNextVblank fast path, so a stale m_lastPageflip
 +// can never make us project an absurd number of vblanks into the future.
 +constexpr uint64_t kMaxPageflipSpan = 10000;
++constexpr int kVblankReciprocalShift = 63;
 +
 +constexpr std::chrono::milliseconds kDefaultFrameInterval{16};
 +
@@ -1361,8 +1362,14 @@ index 7e16489..e4cf43d 100644
 +    }
 +
      DrmAtomicCommit *commit = m_commits.front().get();
+-    const auto vrr = commit->isVrr();
+-    const bool success = commit->commit();
+-    if (success) {
+-        m_vrr = vrr.value_or(m_vrr);
+-        m_tearing = commit->isTearing();
+-        m_committed = std::move(m_commits.front());
 +    if (!commit) [[unlikely]] {
-+        m_commits.erase(m_commits.begin());
+         m_commits.erase(m_commits.begin());
 +        return;
 +    }
 +
@@ -1373,14 +1380,12 @@ index 7e16489..e4cf43d 100644
 +    // realtime commit thread for no functional benefit on the happy path.
 +    // Recovery via merge() still uses test() (cheap, no PAGE_FLIP_EVENT side
 +    // effect) to gate before re-trying commit().
-     const auto vrr = commit->isVrr();
--    const bool success = commit->commit();
--    if (success) {
--        m_vrr = vrr.value_or(m_vrr);
--        m_tearing = commit->isTearing();
 +    bool success = commit->commit();
 +    int savedErrno = success ? 0 : errno;
-+
+ 
+-        // the kernel might still take some time to actually apply the commit
+-        // after we return from the commit ioctl, but we don't have any better
+-        // way to know when it's done
 +    if (!success) [[unlikely]] {
 +        // Rate-limit warnings; a transient atomic commit failure during heavy
 +        // plane reconfiguration is normal and shouldn't spam the journal.
@@ -1401,34 +1406,44 @@ index 7e16489..e4cf43d 100644
 +            ++suppressed;
 +        }
 +
-+        // Recovery: merge later queued commits into the front commit and try
-+        // again. Each candidate is gated by test() to keep the per-attempt cost
-+        // bounded and to avoid registering a PAGE_FLIP_EVENT we then have to
-+        // wait out. The accepted merged state is submitted via commit().
++        // Recovery: never mutate the queued front commit until a merged copy
++        // has passed TEST_ONLY. A failed merge is not reversible because DRM
++        // property updates overwrite earlier values, and mixing sync and async
++        // commits can tear a primary update that was queued for vblank.
 +        int merges = 0;
 +        while (merges < kMaxSubmitRetries && m_commits.size() > 1) {
-+            if (!m_commits[1]) [[unlikely]] {
++            DrmAtomicCommit *nextCommit = m_commits[1].get();
++            if (!nextCommit) [[unlikely]] {
 +                m_commits.erase(m_commits.begin() + 1);
 +                continue;
 +            }
-+            auto toMerge = std::move(m_commits[1]);
-+            m_commits.erase(m_commits.begin() + 1);
-+            commit->merge(toMerge.get());
-+            m_commitsToDelete.push_back(std::move(toMerge));
++            if (commit->isTearing() != nextCommit->isTearing()) {
++                break;
++            }
++
++            auto merged = std::make_unique<DrmAtomicCommit>(*commit);
++            merged->merge(nextCommit);
 +            ++merges;
 +
-+            // Dead errno stores during retries are intentionally omitted: we
-+            // already logged the initial failure once (rate-limited) and the
-+            // final outcome is the only thing the user cares about. Saves a
-+            // few register writes per retry iteration.
-+            const bool testedOk = commit->test();
-+            if (!testedOk) {
-+                continue;
++            if (!merged->test()) {
++                m_commitsToDelete.push_back(std::move(merged));
++                break;
 +            }
++
++            m_commitsToDelete.push_back(std::move(m_commits.front()));
++            m_commitsToDelete.push_back(std::move(m_commits[1]));
++            m_commits.front() = std::move(merged);
++            m_commits.erase(m_commits.begin() + 1);
++            commit = m_commits.front().get();
++            if (!commit) [[unlikely]] {
++                break;
++            }
++
 +            success = commit->commit();
 +            if (success) {
 +                break;
 +            }
++            savedErrno = errno;
 +        }
 +
 +        if (!success) {
@@ -1446,17 +1461,14 @@ index 7e16489..e4cf43d 100644
 +    }
 +
 +    if (success) [[likely]] {
++        const auto vrr = commit->isVrr();
 +        if (vrr.has_value()) {
 +            m_vrr.store(*vrr, std::memory_order_release);
 +        }
 +        m_tearing.store(commit->isTearing(), std::memory_order_release);
 +
-         m_committed = std::move(m_commits.front());
-         m_commits.erase(m_commits.begin());
--
--        // the kernel might still take some time to actually apply the commit
--        // after we return from the commit ioctl, but we don't have any better
--        // way to know when it's done
++        m_committed = std::move(m_commits.front());
++        m_commits.erase(m_commits.begin());
          m_lastCommitTime = std::chrono::steady_clock::now();
 -        // this is when we wanted to have completed the commit
 +
@@ -1550,7 +1562,8 @@ index 7e16489..e4cf43d 100644
 +    const size_t required = m_commitsToDelete.size() + mergeCount + 1;
 +    if (m_commitsToDelete.capacity() < required) {
 +        m_commitsToDelete.reserve(required);
-+    }
+     }
+-    QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::ConnectionType::QueuedConnection);
 +
 +    // Build the merged candidate as a fresh COPY of the front commit, mirroring
 +    // upstream's mergeCommits(): the original front commit must remain pristine
@@ -1574,8 +1587,7 @@ index 7e16489..e4cf43d 100644
 +    m_commitsToDelete.push_back(std::move(m_commits.front()));
 +    for (size_t i = 1; i < firstNotReady; ++i) {
 +        m_commitsToDelete.push_back(std::move(m_commits[i]));
-     }
--    QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::ConnectionType::QueuedConnection);
++    }
 +    m_commits.front() = std::move(merged);
 +    m_commits.erase(m_commits.begin() + 1, m_commits.begin() + static_cast<std::ptrdiff_t>(firstNotReady));
 +    return true;
@@ -1757,7 +1769,7 @@ index 7e16489..e4cf43d 100644
      }
  }
  
-@@ -316,10 +593,10 @@ DrmCommitThread::~DrmCommitThread()
+@@ -316,10 +604,10 @@ DrmCommitThread::~DrmCommitThread()
          {
              std::unique_lock lock(m_mutex);
              m_thread->requestInterruption();
@@ -1771,7 +1783,7 @@ index 7e16489..e4cf43d 100644
          m_thread->wait();
      }
      if (m_committed) {
-@@ -330,86 +607,317 @@ DrmCommitThread::~DrmCommitThread()
+@@ -330,86 +618,298 @@ DrmCommitThread::~DrmCommitThread()
  
  void DrmCommitThread::addCommit(std::unique_ptr<DrmAtomicCommit> &&commit)
  {
@@ -1788,12 +1800,9 @@ index 7e16489..e4cf43d 100644
 +
      TimePoint newTarget;
 -    if (m_tearing) {
-+    if (isTearing) {
-+        // Tearing: present as soon as possible.
-         newTarget = now;
+-        newTarget = now;
 -    } else if (m_vrr && now >= m_lastPageflip + m_minVblankInterval) {
-+    } else if (isVrr && now >= m_lastPageflip + m_minVblankInterval) {
-+        // VRR and at least one minimum vblank interval has elapsed: present now.
++    if (isTearing || (isVrr && now >= m_lastPageflip + m_minVblankInterval)) {
          newTarget = now;
      } else {
          newTarget = estimateNextVblank(now);
@@ -1807,9 +1816,7 @@ index 7e16489..e4cf43d 100644
 +    // also need to seed the target from `newTarget` (otherwise we would carry
 +    // a stale m_targetPageflipTime from the last frame that was already
 +    // committed and pageFlipped()).
-+    if (m_commits.empty()) {
-+        m_targetPageflipTime = newTarget;
-+    } else if (newTarget > m_targetPageflipTime) {
++    if (m_commits.empty() || newTarget > m_targetPageflipTime) {
 +        m_targetPageflipTime = newTarget;
 +    }
 +
@@ -1879,15 +1886,10 @@ index 7e16489..e4cf43d 100644
 +    // Precompute a fixed-point reciprocal of the vblank interval so that
 +    // estimateNextVblank can divide via multiply+shift on the hot path.
 +    const int64_t vblankNs = m_minVblankInterval.count();
-+    if (vblankNs > 0 && vblankNs < (int64_t{1} << 40)) {
-+        // Choose a shift that maximizes precision without overflowing a 64-bit
-+        // product for elapsed times up to ~kMaxPageflipSpan vblanks.
-+        // Use a ceiling reciprocal. Together with the correction term in
-+        // estimateNextVblank(), this yields the exact integer floor while
-+        // avoiding a hardware divide on the per-frame hot path.
-+        constexpr uint8_t reciprocalShift = 40;
-+        m_vblankReciprocal = ((uint64_t{1} << reciprocalShift) + static_cast<uint64_t>(vblankNs) - 1)
-+                             / static_cast<uint64_t>(vblankNs);
++    if (vblankNs > 0 && static_cast<uint64_t>(vblankNs) < (uint64_t{1} << kVblankReciprocalShift)) {
++        const auto numerator = static_cast<unsigned __int128>(1) << kVblankReciprocalShift;
++        m_vblankReciprocal = static_cast<uint64_t>((numerator + static_cast<uint64_t>(vblankNs) - 1)
++                                                   / static_cast<uint64_t>(vblankNs));
 +    } else {
 +        m_vblankReciprocal = 0;
 +    }
@@ -2078,17 +2080,9 @@ index 7e16489..e4cf43d 100644
 +    }
 +
 +    uint64_t pageflipsSince = 0;
-+    // setModeInfo() is the only writer of m_vblankReciprocal and it uses
-+    // a fixed shift of 40 whenever the reciprocal is non-zero. Folding the
-+    // shift to the constant 40 here turns the 3-uOp / 5c-latency
-+    // shrdq %cl,%rsi,%rdx sequence (variable shift + testb/cmovneq spill) on
-+    // Raptor Lake into a single 1-uOp / 3c-latency shrdq $40,%rsi,%rdx (and
-+    // a paired shrq $40,%rsi for the back-correction multiply), measured at
-+    // 26 cycles/call vs 29 (~10% improvement on the per-frame hot path).
-+    // The fallback divq remains for the (unlikely) range-overflow case.
-+    if (m_vblankReciprocal > 0 && elapsedNs < (uint64_t{1} << 40)) [[likely]] {
++    if (m_vblankReciprocal > 0 && elapsedNs < (uint64_t{1} << kVblankReciprocalShift)) [[likely]] {
 +        const unsigned __int128 product = static_cast<unsigned __int128>(elapsedNs) * m_vblankReciprocal;
-+        const uint64_t q = static_cast<uint64_t>(product >> 40);
++        const uint64_t q = static_cast<uint64_t>(product >> kVblankReciprocalShift);
 +        pageflipsSince = q - static_cast<uint64_t>(q * vblankNs > elapsedNs);
 +    } else {
 +        pageflipsSince = elapsedNs / vblankNs;
@@ -3278,7 +3272,7 @@ index 0f06f8e..32ca208 100644
      DrmBackend *const m_platform;
      std::optional<Version> m_nvidiaDriverVersion;
 diff --git a/src/backends/drm/drm_output.cpp b/src/backends/drm/drm_output.cpp
-index 14a30b6..89422fc 100644
+index 14a30b6..4a3a556 100644
 --- a/src/backends/drm/drm_output.cpp
 +++ b/src/backends/drm/drm_output.cpp
 @@ -118,12 +118,10 @@ bool DrmOutput::shouldDisableNonPrimaryPlanes() const
@@ -3296,7 +3290,7 @@ index 14a30b6..89422fc 100644
          return false;
      }
      return m_pipeline->presentAsync(layer, allowedVrrDelay);
-@@ -174,15 +172,22 @@ void DrmOutput::populateModes(State *next) const
+@@ -174,16 +172,22 @@ void DrmOutput::populateModes(State *next) const
      }
  
      for (const auto &custom : next->customModes) {
@@ -3311,17 +3305,20 @@ index 14a30b6..89422fc 100644
 +    // This avoids a mismatch when the mode list is rebuilt after a hotplug.
      static const bool noCustomModeQuirk = qEnvironmentVariableIntValue("KWIN_DRM_NO_CUSTOM_MODE_QUIRK");
      if (!noCustomModeQuirk) {
-         if (!next->desiredModeSize.isEmpty() && next->desiredModeRefreshRate && next->desiredModeFlags) {
+-        if (!next->desiredModeSize.isEmpty() && next->desiredModeRefreshRate && next->desiredModeFlags) {
++        if (!next->desiredModeSize.isEmpty() && next->desiredModeRefreshRate != 0 && next->desiredModeFlags.has_value()) {
              for (const auto &mode : std::as_const(next->modes)) {
-                 const auto drmMode = std::static_pointer_cast<DrmConnectorMode>(mode);
+-                const auto drmMode = std::static_pointer_cast<DrmConnectorMode>(mode);
 -                if (next->desiredModeSize == mode->size() && next->desiredModeRefreshRate == drmMode->refreshRate() && next->desiredModeFlags == drmMode->flags()) {
+-                    next->currentMode = drmMode;
 +                if (next->desiredModeSize == mode->size()
-+                    && next->desiredModeRefreshRate == drmMode->refreshRate()
-+                    && next->desiredModeFlags == drmMode->flags()) {
-                     next->currentMode = drmMode;
++                    && next->desiredModeRefreshRate == mode->refreshRate()
++                    && next->desiredModeFlags.value() == static_cast<uint32_t>(mode->flags().toInt())) {
++                    next->currentMode = mode;
                      break;
                  }
-@@ -193,6 +198,8 @@ void DrmOutput::populateModes(State *next) const
+             }
+@@ -193,6 +197,8 @@ void DrmOutput::populateModes(State *next) const
      if (!next->currentMode) {
          next->currentMode = next->modes.constFirst();
      } else if (!next->modes.contains(next->currentMode)) {
@@ -3330,7 +3327,7 @@ index 14a30b6..89422fc 100644
          const auto it = std::ranges::find_if(next->modes, [&](const auto &mode) {
              return next->currentMode->size() == mode->size()
                  && next->currentMode->refreshRate() == mode->refreshRate()
-@@ -213,33 +220,44 @@ static const bool s_allowColorspaceNVidia = qEnvironmentVariableIntValue("KWIN_D
+@@ -213,33 +219,44 @@ static const bool s_allowColorspaceNVidia = qEnvironmentVariableIntValue("KWIN_D
  BackendOutput::Capabilities DrmOutput::computeCapabilities() const
  {
      Capabilities capabilities = Capability::Dpms | Capability::IccProfile | Capability::CustomModes;
@@ -3385,7 +3382,7 @@ index 14a30b6..89422fc 100644
          capabilities |= Capability::AutoRotation;
      }
      if (m_state.highDynamicRange || m_state.brightnessDevice || m_state.allowSdrSoftwareBrightness) {
-@@ -251,19 +269,19 @@ BackendOutput::Capabilities DrmOutput::computeCapabilities() const
+@@ -251,19 +268,19 @@ BackendOutput::Capabilities DrmOutput::computeCapabilities() const
              capabilities |= Capability::AutomaticBrightness;
          }
      }
@@ -3408,7 +3405,7 @@ index 14a30b6..89422fc 100644
          capabilities |= Capability::SharpnessControl;
      }
      return capabilities;
-@@ -289,41 +307,45 @@ void DrmOutput::updateInformation()
+@@ -289,41 +306,45 @@ void DrmOutput::updateInformation()
  
  bool DrmOutput::testPresentation(const std::shared_ptr<OutputFrame> &frame)
  {
@@ -3478,7 +3475,7 @@ index 14a30b6..89422fc 100644
      return err == DrmPipeline::Error::None;
  }
  
-@@ -332,17 +354,16 @@ bool DrmOutput::present(const QList<OutputLayer *> &layersToUpdate, const std::s
+@@ -332,17 +353,16 @@ bool DrmOutput::present(const QList<OutputLayer *> &layersToUpdate, const std::s
      m_desiredPresentationMode = frame->presentationMode();
      const bool needsModeset = m_gpu->needsModeset();
      bool success;
@@ -3498,18 +3495,46 @@ index 14a30b6..89422fc 100644
          return false;
      }
      updateBrightness(frame->brightness().value_or(m_state.currentBrightness.value_or(m_state.brightnessSetting)),
-@@ -589,7 +610,9 @@ void DrmOutput::applyQueuedChanges(const std::shared_ptr<OutputChangeSet> &props
+@@ -585,26 +605,32 @@ bool DrmOutput::queueChanges(const std::shared_ptr<OutputChangeSet> &props)
+ 
+ void DrmOutput::applyQueuedChanges(const std::shared_ptr<OutputChangeSet> &props)
+ {
++    if (!m_nextState.has_value()) [[unlikely]] {
++        return;
++    }
++    State &next = m_nextState.value();
++
+     Q_EMIT aboutToChange(props.get());
      m_pipeline->applyPendingChanges();
  
-     tryKmsColorOffloading(*m_nextState);
+-    tryKmsColorOffloading(*m_nextState);
 -    maybeScheduleRepaints(*m_nextState);
-+    // Removed redundant maybeScheduleRepaints(*m_nextState) call.
-+    // tryKmsColorOffloading already schedules repaints safely via qScopeGuard.
+-    const bool nextOff = m_nextState->dpmsMode != DpmsMode::On;
++    tryKmsColorOffloading(next);
++    maybeScheduleRepaints(next);
 +
-     const bool nextOff = m_nextState->dpmsMode != DpmsMode::On;
++    const bool nextOff = next.dpmsMode != DpmsMode::On;
      const bool currentOff = m_state.dpmsMode != DpmsMode::On;
      if (nextOff != currentOff) {
-@@ -640,11 +663,16 @@ void DrmOutput::unsetBrightnessDevice()
+-        if (m_nextState->dpmsMode == DpmsMode::On) {
++        if (next.dpmsMode == DpmsMode::On) {
+             m_renderLoop->uninhibit();
+         } else {
+             // NOTE that legacy modesetting applies dpms in the "test" before this
+             // method gets called, so we have to special case legacy vs. atomic here
+             if (m_state.dpmsMode == DpmsMode::On && m_gpu->atomicModeSetting()) {
+-                m_nextState->dpmsMode = DpmsMode::TurningOff;
++                next.dpmsMode = DpmsMode::TurningOff;
+             }
+             m_renderLoop->inhibit();
+         }
+     }
+-    setState(*m_nextState);
++    setState(next);
+     m_nextState.reset();
+ 
+     // allowSdrSoftwareBrightness, the brightness device or detectedDdcCi might change our capabilities
+@@ -640,11 +666,16 @@ void DrmOutput::unsetBrightnessDevice()
  
  void DrmOutput::updateBrightness(double newBrightness, double newArtificialHdrHeadroom, double newDimming)
  {
@@ -3529,7 +3554,7 @@ index 14a30b6..89422fc 100644
      if (m_state.brightnessDevice && !m_state.highDynamicRange) {
          double brightnessFactor = newBrightness;
          // With DDC/CI, dimming should be applied in software only,
-@@ -656,6 +684,7 @@ void DrmOutput::updateBrightness(double newBrightness, double newArtificialHdrHe
+@@ -656,6 +687,7 @@ void DrmOutput::updateBrightness(double newBrightness, double newArtificialHdrHe
          const double effectiveBrightness = (minLuminance + brightnessFactor) * newArtificialHdrHeadroom - minLuminance;
          m_state.brightnessDevice->setBrightness(effectiveBrightness);
      }
@@ -3537,7 +3562,7 @@ index 14a30b6..89422fc 100644
      State next = m_state;
      next.currentBrightness = newBrightness;
      next.artificialHdrHeadroom = newArtificialHdrHeadroom;
-@@ -768,12 +797,16 @@ void DrmOutput::tryKmsColorOffloading(State &next)
+@@ -768,12 +800,16 @@ void DrmOutput::tryKmsColorOffloading(State &next)
  
  void DrmOutput::maybeScheduleRepaints(const State &next)
  {
@@ -3561,7 +3586,7 @@ index 14a30b6..89422fc 100644
  }
  
 diff --git a/src/backends/drm/drm_pipeline.cpp b/src/backends/drm/drm_pipeline.cpp
-index 856be8c..ed18911 100644
+index 856be8c..43ba073 100644
 --- a/src/backends/drm/drm_pipeline.cpp
 +++ b/src/backends/drm/drm_pipeline.cpp
 @@ -1,16 +1,9 @@
@@ -3581,7 +3606,7 @@ index 856be8c..ed18911 100644
  #include "core/iccprofile.h"
  #include "core/session.h"
  #include "drm_backend.h"
-@@ -24,75 +17,225 @@
+@@ -24,75 +17,232 @@
  #include "drm_layer.h"
  #include "drm_logging.h"
  #include "drm_output.h"
@@ -3690,6 +3715,8 @@ index 856be8c..ed18911 100644
 +    const int h = (srcF.height() < 1.0) ? 1 : static_cast<int>(std::ceil(srcF.height()));
 +    return QRect(x, y, w, h);
 +}
++
++const bool s_preemptiveDrmTest = environmentVariableBoolValue("KWIN_DRM_PREEMPTIVE_TEST").value_or(false);
 +
 +const auto s_forceScalingMode =[]() -> std::optional<DrmConnector::ScalingMode> {
 +    const auto env = qEnvironmentVariable("KWIN_DRM_FORCE_SCALING_MODE");
@@ -3819,7 +3846,7 @@ index 856be8c..ed18911 100644
 +            qCWarning(KWIN_DRM) << "Fallback layer preparation failed:" << static_cast<int>(err);
 +            return err;
 +        }
-     }
++    }
 +
 +    if (m_pending.needsModesetProperties) [[unlikely]] {
 +        if (!prepareAtomicModeset(partialUpdate.get())) {
@@ -3828,12 +3855,17 @@ index 856be8c..ed18911 100644
 +        }
 +    }
 +
-+    // No preemptive test() on the render thread: the commit thread already
-+    // gates submission via commit() with merge-based recovery, and the prior
-+    // testPresentation() call established that the full pipeline state is
-+    // valid. Doing an additional DRM_IOCTL_MODE_ATOMIC here was adding
-+    // ~5-15 us per frame to the input-to-photon path on amdgpu for no
-+    // functional benefit.
++    if (s_preemptiveDrmTest && !partialUpdate->test()) [[unlikely]] {
++        const int savedErrno = errno;
++        qCWarning(KWIN_DRM) << "Preemptive atomic presentation test failed:" << savedErrno << strerror(savedErrno);
++        return errnoToError();
+     }
++
++    // By default, skip the preemptive TEST_ONLY ioctl on the render thread: the
++    // prior full-state test established validity, and the commit thread has a
++    // tested merge-recovery path. Set KWIN_DRM_PREEMPTIVE_TEST=1 for hardware or
++    // color-pipeline debugging where catching rejection before queueing is worth
++    // the extra per-frame ioctl.
 +    m_next.needsModesetProperties = false;
 +    m_pending.needsModesetProperties = false;
 +    m_commitThread->addCommit(std::move(partialUpdate));
@@ -3841,7 +3873,7 @@ index 856be8c..ed18911 100644
  }
  
  void DrmPipeline::maybeModeset(const std::shared_ptr<OutputFrame> &frame)
-@@ -104,49 +247,60 @@ void DrmPipeline::maybeModeset(const std::shared_ptr<OutputFrame> &frame)
+@@ -104,49 +254,60 @@ void DrmPipeline::maybeModeset(const std::shared_ptr<OutputFrame> &frame)
  DrmPipeline::Error DrmPipeline::commitPipelines(const QList<DrmPipeline *> &pipelines, CommitMode mode, const QList<DrmObject *> &unusedObjects)
  {
      Q_ASSERT(!pipelines.isEmpty());
@@ -3925,7 +3957,7 @@ index 856be8c..ed18911 100644
          for (DrmPipeline *pipeline : pipelines) {
              pipeline->m_pending.needsModeset = !withoutModeset;
              pipeline->m_pending.needsModesetProperties = true;
-@@ -154,71 +308,129 @@ DrmPipeline::Error DrmPipeline::commitPipelinesAtomic(const QList<DrmPipeline *>
+@@ -154,71 +315,127 @@ DrmPipeline::Error DrmPipeline::commitPipelinesAtomic(const QList<DrmPipeline *>
          return Error::None;
      }
      case CommitMode::CommitModeset: {
@@ -3935,6 +3967,9 @@ index 856be8c..ed18911 100644
 -        // fashion without page flip events and trigger the pageflip notification directly
 -        if (!commit->commitModeset()) {
 -            qCCritical(KWIN_DRM) << "Atomic modeset commit failed!" << strerror(errno);
++        // The kernel fails commits with DRM_MODE_PAGE_FLIP_EVENT when a CRTC is disabled in the commit
++        // and already was disabled before, to work around quirks in old userspace.
++        // Do the modeset synchronously without page flip events and trigger the pageflip notification directly.
 +        if (!commit->commitModeset()) [[unlikely]] {
 +            const int savedErrno = errno;
 +            qCCritical(KWIN_DRM) << "Atomic modeset commit failed! errno:" << savedErrno << strerror(savedErrno);
@@ -3969,6 +4004,7 @@ index 856be8c..ed18911 100644
  {
 -    if (activePending()) {
 -        if (Error err = prepareAtomicPresentation(commit, frame); err != Error::None) {
+-            return err;
 +    if (!commit) [[unlikely]] {
 +        return Error::InvalidArguments;
 +    }
@@ -3992,29 +4028,24 @@ index 856be8c..ed18911 100644
 +        if (!layer->isEnabled()) {
 +            plane->disable(commit);
 +            continue;
-+        }
-+        if (const Error err = prepareAtomicPlane(commit, plane, layer, frame);
-+            err != Error::None) [[unlikely]] {
-             return err;
          }
 -        for (const auto &layer : m_pending.layers) {
 -            if (Error err = prepareAtomicPlane(commit, layer->plane(), layer, frame); err != Error::None) {
 -                return err;
 -            }
-+    }
-+
-+    const bool needsModesetCommit = (mode != CommitMode::Test)
-+        && (mode == CommitMode::CommitModeset || m_pending.needsModesetProperties);
-+    if (needsModesetCommit) [[unlikely]] {
-+        if (!prepareAtomicModeset(commit)) {
-+            return Error::InvalidArguments;
++        if (const Error err = prepareAtomicPlane(commit, plane, layer, frame);
++            err != Error::None) [[unlikely]] {
++            return err;
          }
 -        if (mode == CommitMode::TestAllowModeset || mode == CommitMode::CommitModeset || m_pending.needsModesetProperties) {
 -            if (!prepareAtomicModeset(commit)) {
 -                return Error::InvalidArguments;
 -            }
-+    } else if (mode == CommitMode::TestAllowModeset) {
-+        // Modeset tests must include the modeset props (upstream behaviour).
++    }
++
++    const bool needsModesetCommit = (mode != CommitMode::Test)
++        && (mode == CommitMode::CommitModeset || m_pending.needsModesetProperties);
++    if (needsModesetCommit || mode == CommitMode::TestAllowModeset) [[unlikely]] {
 +        if (!prepareAtomicModeset(commit)) {
 +            return Error::InvalidArguments;
          }
@@ -4059,13 +4090,13 @@ index 856be8c..ed18911 100644
 +        if (!referenceLayer) {
 +            referenceLayer = layer;
 +        }
-+    }
-+
-+    if (!referenceLayer) [[unlikely]] {
-+        return Error::InvalidArguments;
      }
  
 -    const ColorPipeline &colorPipeline = m_pending.crtcColorPipeline;
++    if (!referenceLayer) [[unlikely]] {
++        return Error::InvalidArguments;
++    }
++
 +    const ColorPipeline &layerPipeline = referenceLayer->colorPipeline();
 +    const ColorPipeline &crtcPipeline = m_pending.crtcColorPipeline;
 +    const ColorPipeline mergedPipeline = layerPipeline.isIdentity()
@@ -4083,7 +4114,7 @@ index 856be8c..ed18911 100644
              return Error::InvalidArguments;
          }
      }
-@@ -226,217 +438,310 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commi
+@@ -226,217 +443,309 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commi
      return Error::None;
  }
  
@@ -4282,14 +4313,29 @@ index 856be8c..ed18911 100644
 -    case YUVMatrixCoefficients::Identity:
 -        if (layer->colorDescription()->range() == EncodingRange::Limited) {
 -            return Error::InvalidArguments;
--        }
++
++    const bool isYuv = isYuvFormat(attrs->format);
++
++    if (plane->colorEncoding.isValid() && isYuv) {
++        std::optional<DrmPlane::ColorEncoding> encoding;
++        const auto &colorDesc = layer->colorDescription();
++        if (colorDesc) {
++            const auto matrix = colorDesc->yuvCoefficients();
++            if (matrix == YUVMatrixCoefficients::BT601 && plane->colorEncoding.hasEnum(DrmPlane::ColorEncoding::BT601_YCbCr)) {
++                encoding = DrmPlane::ColorEncoding::BT601_YCbCr;
++            } else if (matrix == YUVMatrixCoefficients::BT2020 && plane->colorEncoding.hasEnum(DrmPlane::ColorEncoding::BT2020_YCbCr)) {
++                encoding = DrmPlane::ColorEncoding::BT2020_YCbCr;
++            }
+         }
 -        // Workaround for the proprietary NVIDIA driver, which defaults to
 -        // limited color range (16-235) when COLOR_RANGE is not explicitly
 -        // set, even for RGB content. This makes the desktop look washed out.
 -        // See https://github.com/NVIDIA/open-gpu-kernel-modules/discussions/1105
 -        if (gpu()->isNVidia() && plane->colorRange.isValid()) {
 -            commit->addEnum(plane->colorRange, DrmPlane::ColorRange::Full_YCbCr);
--        }
++        if (!encoding && plane->colorEncoding.hasEnum(DrmPlane::ColorEncoding::BT709_YCbCr)) {
++            encoding = DrmPlane::ColorEncoding::BT709_YCbCr;
+         }
 -        break;
 -    case YUVMatrixCoefficients::BT601:
 -        if (!plane->colorEncoding.isValid() || !plane->colorRange.isValid()) {
@@ -4301,26 +4347,8 @@ index 856be8c..ed18911 100644
 -    case YUVMatrixCoefficients::BT709:
 -        if (!plane->colorEncoding.isValid() || !plane->colorRange.isValid()) {
 -            return Error::InvalidArguments;
-+
-+    const bool isYuv = isYuvFormat(attrs->format);
-+
-+    if (plane->colorEncoding.isValid()) {
-+        if (isYuv) {
-+            const auto colorDesc = layer->colorDescription();
-+            if (colorDesc) {
-+                const auto matrix = colorDesc->yuvCoefficients();
-+                if (matrix == YUVMatrixCoefficients::BT709 && plane->colorEncoding.hasEnum(DrmPlane::ColorEncoding::BT709_YCbCr)) {
-+                    commit->addEnum(plane->colorEncoding, DrmPlane::ColorEncoding::BT709_YCbCr);
-+                } else if (matrix == YUVMatrixCoefficients::BT601 && plane->colorEncoding.hasEnum(DrmPlane::ColorEncoding::BT601_YCbCr)) {
-+                    commit->addEnum(plane->colorEncoding, DrmPlane::ColorEncoding::BT601_YCbCr);
-+                } else if (matrix == YUVMatrixCoefficients::BT2020 && plane->colorEncoding.hasEnum(DrmPlane::ColorEncoding::BT2020_YCbCr)) {
-+                    commit->addEnum(plane->colorEncoding, DrmPlane::ColorEncoding::BT2020_YCbCr);
-+                } else if (plane->colorEncoding.hasEnum(DrmPlane::ColorEncoding::BT709_YCbCr)) {
-+                    commit->addEnum(plane->colorEncoding, DrmPlane::ColorEncoding::BT709_YCbCr);
-+                }
-+            } else if (plane->colorEncoding.hasEnum(DrmPlane::ColorEncoding::BT709_YCbCr)) {
-+                commit->addEnum(plane->colorEncoding, DrmPlane::ColorEncoding::BT709_YCbCr);
-+            }
++        if (encoding) {
++            commit->addEnum(plane->colorEncoding, *encoding);
          }
 -        commit->addEnum(plane->colorEncoding, DrmPlane::ColorEncoding::BT709_YCbCr);
 -        commit->addEnum(plane->colorRange, range);
@@ -4332,7 +4360,7 @@ index 856be8c..ed18911 100644
 +
 +    if (plane->colorRange.isValid()) {
 +        if (isYuv) {
-+            const auto colorDesc = layer->colorDescription();
++            const auto &colorDesc = layer->colorDescription();
 +            DrmPlane::ColorRange range = DrmPlane::ColorRange::Limited_YCbCr;
 +            if (colorDesc && colorDesc->range() == EncodingRange::Full) {
 +                range = DrmPlane::ColorRange::Full_YCbCr;
@@ -4540,7 +4568,7 @@ index 856be8c..ed18911 100644
  {
      switch (errno) {
      case EINVAL:
-@@ -454,81 +759,125 @@ DrmPipeline::Error DrmPipeline::errnoToError()
+@@ -454,81 +763,125 @@ DrmPipeline::Error DrmPipeline::errnoToError()
  
  bool DrmPipeline::presentAsync(OutputLayer *layer, std::optional<std::chrono::nanoseconds> allowedVrrDelay)
  {
@@ -4702,7 +4730,7 @@ index 856be8c..ed18911 100644
  {
      return m_pending.crtc && m_pending.mode && m_pending.active;
  }
-@@ -538,37 +887,37 @@ void DrmPipeline::revertPendingChanges()
+@@ -538,37 +891,37 @@ void DrmPipeline::revertPendingChanges()
      m_pending = m_next;
  }
  
@@ -4747,7 +4775,7 @@ index 856be8c..ed18911 100644
  {
      return m_pending.enabled;
  }
-@@ -578,27 +927,27 @@ QList<DrmPipelineLayer *> DrmPipeline::layers() const
+@@ -578,27 +931,27 @@ QList<DrmPipelineLayer *> DrmPipeline::layers() const
      return m_pending.layers;
  }
  
@@ -4780,7 +4808,7 @@ index 856be8c..ed18911 100644
  {
      return m_pending.iccProfile;
  }
-@@ -611,6 +960,9 @@ void DrmPipeline::setCrtc(DrmCrtc *crtc)
+@@ -611,6 +964,9 @@ void DrmPipeline::setCrtc(DrmCrtc *crtc)
  void DrmPipeline::setMode(const std::shared_ptr<DrmConnectorMode> &mode)
  {
      m_pending.mode = mode;
@@ -4790,7 +4818,7 @@ index 856be8c..ed18911 100644
  }
  
  void DrmPipeline::setActive(bool active)
-@@ -626,8 +978,10 @@ void DrmPipeline::setEnable(bool enable)
+@@ -626,8 +982,10 @@ void DrmPipeline::setEnable(bool enable)
  void DrmPipeline::setLayers(const QList<DrmPipelineLayer *> &layers)
  {
      m_pending.layers = layers;
@@ -4803,7 +4831,7 @@ index 856be8c..ed18911 100644
      }
  }
  
-@@ -678,54 +1032,56 @@ void DrmPipeline::setIccProfile(const std::shared_ptr<IccProfile> &profile)
+@@ -678,54 +1036,56 @@ void DrmPipeline::setIccProfile(const std::shared_ptr<IccProfile> &profile)
  
  std::shared_ptr<DrmBlob> DrmPipeline::createHdrMetadata(TransferFunction::Type transferFunction) const
  {
@@ -5275,7 +5303,7 @@ index 7ede035..341ec1a 100644
  
      // TODO: this is currently non-functional even on DRM. Needs orientation() override there.
 diff --git a/src/backends/wayland/wayland_egl_backend.cpp b/src/backends/wayland/wayland_egl_backend.cpp
-index 66ae1b2..3f8aed8 100644
+index 66ae1b2..56854e6 100644
 --- a/src/backends/wayland/wayland_egl_backend.cpp
 +++ b/src/backends/wayland/wayland_egl_backend.cpp
 @@ -43,9 +43,7 @@ WaylandEglLayer::WaylandEglLayer(WaylandOutput *output, WaylandEglBackend *backe
@@ -5289,7 +5317,7 @@ index 66ae1b2..3f8aed8 100644
  
  GLFramebuffer *WaylandEglLayer::fbo() const
  {
-@@ -54,30 +52,51 @@ GLFramebuffer *WaylandEglLayer::fbo() const
+@@ -54,30 +52,61 @@ GLFramebuffer *WaylandEglLayer::fbo() const
  
  std::optional<OutputLayerBeginFrameInfo> WaylandEglLayer::doBeginFrame()
  {
@@ -5321,31 +5349,41 @@ index 66ae1b2..3f8aed8 100644
 +                                               m_lastFormat.modifiers);
 +            if (!m_swapchain) {
 +                m_lastFormat = {0, {}};
++            }
++        }
++
++        if (!m_swapchain) {
++            const auto createFromFormats = [this, &nativeSize](const QHash<uint32_t, QList<uint64_t>> &formats) {
++                const auto suitableFormats = filterAndSortFormats(formats, m_requiredAlphaBits, m_output->colorPowerTradeoff());
++                for (const auto &candidate : suitableFormats) {
++                    auto it = formats.constFind(candidate.drmFormat);
++                    if (it == formats.constEnd()) {
++                        continue;
++                    }
++                    m_swapchain = EglSwapchain::create(m_backend->drmDevice()->allocator(),
++                                                       m_backend->openglContext(),
++                                                       nativeSize,
++                                                       it.key(),
++                                                       it.value());
++                    if (m_swapchain) {
++                        m_lastFormat = {it.key(), it.value()};
++                        return true;
++                    }
++                }
++                return false;
++            };
++
++            if (m_cachedFormats.isEmpty()) {
++                m_cachedFormats = m_backend->backend()->display()->linuxDmabuf()->formats();
              }
 -            m_swapchain = EglSwapchain::create(m_backend->drmDevice()->allocator(), m_backend->openglContext(), nativeSize, it.key(), it.value());
 -            if (m_swapchain) {
 -                break;
-+        }
-+
-+        if (!m_swapchain) {
-+            if (m_cachedFormats.isEmpty()) {
-+                m_cachedFormats = m_backend->backend()->display()->linuxDmabuf()->formats();
-+            }
-+
-+            const auto suitableFormats = filterAndSortFormats(m_cachedFormats, m_requiredAlphaBits, m_output->colorPowerTradeoff());
-+            for (const auto &candidate : suitableFormats) {
-+                auto it = m_cachedFormats.constFind(candidate.drmFormat);
-+                if (it == m_cachedFormats.constEnd()) {
-+                    continue;
-+                }
-+                m_swapchain = EglSwapchain::create(m_backend->drmDevice()->allocator(),
-+                                                   m_backend->openglContext(),
-+                                                   nativeSize,
-+                                                   it.key(),
-+                                                   it.value());
-+                if (m_swapchain) {
-+                    m_lastFormat = {it.key(), it.value()};
-+                    break;
++            if (!createFromFormats(m_cachedFormats)) {
++                const auto freshFormats = m_backend->backend()->display()->linuxDmabuf()->formats();
++                if (freshFormats != m_cachedFormats) {
++                    m_cachedFormats = freshFormats;
++                    createFromFormats(m_cachedFormats);
 +                }
              }
          }
@@ -5353,7 +5391,7 @@ index 66ae1b2..3f8aed8 100644
          if (!m_swapchain) {
              qCWarning(KWIN_WAYLAND_BACKEND) << "Could not find a suitable render format";
              return std::nullopt;
-@@ -98,11 +117,11 @@ std::optional<OutputLayerBeginFrameInfo> WaylandEglLayer::doBeginFrame()
+@@ -98,22 +127,32 @@ std::optional<OutputLayerBeginFrameInfo> WaylandEglLayer::doBeginFrame()
      };
  }
  
@@ -5367,7 +5405,21 @@ index 66ae1b2..3f8aed8 100644
      glFlush();
      EGLNativeFence releaseFence{m_backend->eglDisplayObject()};
  
-@@ -113,7 +132,7 @@ bool WaylandEglLayer::doEndFrame(const Region &renderedDeviceRegion, const Regio
+-    setBuffer(m_backend->backend()->importBuffer(m_buffer->buffer()), damagedDeviceRegion);
++    wl_buffer *const presentationBuffer = m_backend->backend()->importBuffer(m_buffer->buffer());
++    if (!presentationBuffer) [[unlikely]] {
++        m_swapchain->release(m_buffer, releaseFence.takeFileDescriptor());
++        m_buffer.reset();
++        m_swapchain.reset();
++        m_cachedFormats.clear();
++        m_lastFormat = {0, {}};
++        return false;
++    }
++
++    setBuffer(presentationBuffer, damagedDeviceRegion);
+     m_swapchain->release(m_buffer, releaseFence.takeFileDescriptor());
+ 
+     m_damageJournal.add(damagedDeviceRegion);
      return true;
  }
  
@@ -5376,7 +5428,7 @@ index 66ae1b2..3f8aed8 100644
  {
      if (!test()) {
          return false;
-@@ -140,6 +159,8 @@ void WaylandEglLayer::releaseBuffers()
+@@ -140,6 +179,8 @@ void WaylandEglLayer::releaseBuffers()
  {
      m_buffer.reset();
      m_swapchain.reset();
@@ -5385,7 +5437,7 @@ index 66ae1b2..3f8aed8 100644
  }
  
  WaylandEglCursorLayer::WaylandEglCursorLayer(WaylandOutput *output, WaylandEglBackend *backend)
-@@ -155,25 +176,47 @@ WaylandEglCursorLayer::~WaylandEglCursorLayer()
+@@ -155,25 +196,57 @@ WaylandEglCursorLayer::~WaylandEglCursorLayer()
  
  std::optional<OutputLayerBeginFrameInfo> WaylandEglCursorLayer::doBeginFrame()
  {
@@ -5412,31 +5464,41 @@ index 66ae1b2..3f8aed8 100644
 +                                               m_lastFormat.modifiers);
 +            if (!m_swapchain) {
 +                m_lastFormat = {0, {}};
-+            }
-+        }
-+
-+        if (!m_swapchain) {
-+            if (m_cachedFormats.isEmpty()) {
-+                m_cachedFormats = m_backend->backend()->display()->linuxDmabuf()->formats();
              }
 -            m_swapchain = EglSwapchain::create(m_backend->drmDevice()->allocator(), m_backend->openglContext(), bufferSize, it.key(), it.value());
 -            if (m_swapchain) {
 -                break;
++        }
 +
-+            const auto suitableFormats = filterAndSortFormats(m_cachedFormats, m_requiredAlphaBits, m_output->colorPowerTradeoff());
-+            for (const auto &candidate : suitableFormats) {
-+                auto it = m_cachedFormats.constFind(candidate.drmFormat);
-+                if (it == m_cachedFormats.constEnd()) {
-+                    continue;
++        if (!m_swapchain) {
++            const auto createFromFormats = [this, &bufferSize](const QHash<uint32_t, QList<uint64_t>> &formats) {
++                const auto suitableFormats = filterAndSortFormats(formats, m_requiredAlphaBits, m_output->colorPowerTradeoff());
++                for (const auto &candidate : suitableFormats) {
++                    auto it = formats.constFind(candidate.drmFormat);
++                    if (it == formats.constEnd()) {
++                        continue;
++                    }
++                    m_swapchain = EglSwapchain::create(m_backend->drmDevice()->allocator(),
++                                                       m_backend->openglContext(),
++                                                       bufferSize,
++                                                       it.key(),
++                                                       it.value());
++                    if (m_swapchain) {
++                        m_lastFormat = {it.key(), it.value()};
++                        return true;
++                    }
 +                }
-+                m_swapchain = EglSwapchain::create(m_backend->drmDevice()->allocator(),
-+                                                   m_backend->openglContext(),
-+                                                   bufferSize,
-+                                                   it.key(),
-+                                                   it.value());
-+                if (m_swapchain) {
-+                    m_lastFormat = {it.key(), it.value()};
-+                    break;
++                return false;
++            };
++
++            if (m_cachedFormats.isEmpty()) {
++                m_cachedFormats = m_backend->backend()->display()->linuxDmabuf()->formats();
++            }
++            if (!createFromFormats(m_cachedFormats)) {
++                const auto freshFormats = m_backend->backend()->display()->linuxDmabuf()->formats();
++                if (freshFormats != m_cachedFormats) {
++                    m_cachedFormats = freshFormats;
++                    createFromFormats(m_cachedFormats);
 +                }
              }
          }
@@ -5444,7 +5506,7 @@ index 66ae1b2..3f8aed8 100644
          if (!m_swapchain) {
              return std::nullopt;
          }
-@@ -192,21 +235,20 @@ std::optional<OutputLayerBeginFrameInfo> WaylandEglCursorLayer::doBeginFrame()
+@@ -192,21 +265,27 @@ std::optional<OutputLayerBeginFrameInfo> WaylandEglCursorLayer::doBeginFrame()
      };
  }
  
@@ -5459,8 +5521,17 @@ index 66ae1b2..3f8aed8 100644
      glFlush();
 +    EGLNativeFence releaseFence{m_backend->eglDisplayObject()};
  
-     wl_buffer *buffer = m_backend->backend()->importBuffer(m_buffer->buffer());
-     Q_ASSERT(buffer);
+-    wl_buffer *buffer = m_backend->backend()->importBuffer(m_buffer->buffer());
+-    Q_ASSERT(buffer);
++    wl_buffer *const buffer = m_backend->backend()->importBuffer(m_buffer->buffer());
++    if (!buffer) [[unlikely]] {
++        m_swapchain->release(m_buffer, releaseFence.takeFileDescriptor());
++        m_buffer.reset();
++        m_swapchain.reset();
++        m_cachedFormats.clear();
++        m_lastFormat = {0, {}};
++        return false;
++    }
  
      static_cast<WaylandOutput *>(m_output.get())->cursor()->update(buffer, m_buffer->buffer()->size() / m_output->scale(), (hotspot() / m_output->scale()).toPoint());
  
@@ -5468,7 +5539,7 @@ index 66ae1b2..3f8aed8 100644
      m_swapchain->release(m_buffer, releaseFence.takeFileDescriptor());
      return true;
  }
-@@ -225,13 +267,14 @@ void WaylandEglCursorLayer::releaseBuffers()
+@@ -225,13 +304,14 @@ void WaylandEglCursorLayer::releaseBuffers()
  {
      m_buffer.reset();
      m_swapchain.reset();
@@ -5484,7 +5555,7 @@ index 66ae1b2..3f8aed8 100644
      b->setEglBackend(this);
  }
  
-@@ -262,6 +305,8 @@ void WaylandEglBackend::createOutputLayers(BackendOutput *output)
+@@ -262,6 +342,8 @@ void WaylandEglBackend::createOutputLayers(BackendOutput *output)
  {
      const auto waylandOutput = static_cast<WaylandOutput *>(output);
      std::vector<std::unique_ptr<OutputLayer>> layers;
@@ -5493,7 +5564,7 @@ index 66ae1b2..3f8aed8 100644
      auto primary = std::make_unique<WaylandEglLayer>(waylandOutput, this, OutputLayerType::Primary, 0);
      primary->subSurface()->placeAbove(waylandOutput->surface());
      layers.push_back(std::move(primary));
-@@ -285,7 +330,6 @@ bool WaylandEglBackend::initializeEgl()
+@@ -285,7 +367,6 @@ bool WaylandEglBackend::initializeEgl()
                  return false;
              }
          }
@@ -5501,7 +5572,7 @@ index 66ae1b2..3f8aed8 100644
          m_backend->setEglDisplay(EglDisplay::create(eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR, m_backend->drmDevice()->gbmDevice(), nullptr)));
      }
  
-@@ -307,7 +351,6 @@ void WaylandEglBackend::init()
+@@ -307,7 +388,6 @@ void WaylandEglBackend::init()
          setFailed("Could not initialize rendering context");
          return;
      }
@@ -5509,7 +5580,7 @@ index 66ae1b2..3f8aed8 100644
      initWayland();
  }
  
-@@ -318,8 +361,6 @@ bool WaylandEglBackend::initRenderingContext()
+@@ -318,8 +398,6 @@ bool WaylandEglBackend::initRenderingContext()
      }
  
      auto waylandOutputs = m_backend->waylandOutputs();
@@ -5575,10 +5646,18 @@ index 18fd69f..c6e4d28 100644
  {
      Q_OBJECT
 diff --git a/src/backends/wayland/wayland_output.cpp b/src/backends/wayland/wayland_output.cpp
-index e435266..e5cba69 100644
+index e435266..bc7ace5 100644
 --- a/src/backends/wayland/wayland_output.cpp
 +++ b/src/backends/wayland/wayland_output.cpp
-@@ -111,7 +111,9 @@ void WaylandCursor::sync()
+@@ -35,6 +35,7 @@
+ 
+ #include <KLocalizedString>
+ 
++#include <QMetaObject>
+ #include <QPainter>
+ 
+ #include <cmath>
+@@ -111,7 +112,9 @@ void WaylandCursor::sync()
  
  void WaylandOutput::handleFractionalScaleChanged(void *data, struct wp_fractional_scale_v1 *wp_fractional_scale_v1, uint32_t scale120)
  {
@@ -5589,7 +5668,7 @@ index e435266..e5cba69 100644
  }
  
  const wp_fractional_scale_v1_listener WaylandOutput::s_fractionalScaleListener{
-@@ -127,34 +129,46 @@ WaylandOutput::WaylandOutput(const QString &name, WaylandBackend *backend)
+@@ -127,34 +130,46 @@ WaylandOutput::WaylandOutput(const QString &name, WaylandBackend *backend)
      , m_cursor(std::make_unique<WaylandCursor>(backend))
  {
      m_renderLoop->setMaxPendingFrameCount(2);
@@ -5647,7 +5726,7 @@ index e435266..e5cba69 100644
  
      m_configureThrottleTimer.setSingleShot(true);
      connect(&m_configureThrottleTimer, &QTimer::timeout, this, [this]() {
-@@ -162,6 +176,7 @@ WaylandOutput::WaylandOutput(const QString &name, WaylandBackend *backend)
+@@ -162,6 +177,7 @@ WaylandOutput::WaylandOutput(const QString &name, WaylandBackend *backend)
      });
  
      updateWindowTitle();
@@ -5655,7 +5734,7 @@ index e435266..e5cba69 100644
      if (auto toplevelIconManager = backend->display()->toplevelIconManager()) {
          auto toplevelIcon = xdg_toplevel_icon_manager_v1_create_icon(toplevelIconManager);
          xdg_toplevel_icon_v1_set_name(toplevelIcon, "kwin");
-@@ -223,11 +238,21 @@ static void handlePresented(void *data,
+@@ -223,11 +239,21 @@ static void handlePresented(void *data,
                              uint32_t seq_lo,
                              uint32_t flags)
  {
@@ -5681,7 +5760,7 @@ index e435266..e5cba69 100644
      reinterpret_cast<WaylandOutput *>(data)->framePresented(timestamp, refreshRate);
  }
  
-@@ -244,12 +269,12 @@ static constexpr struct wp_presentation_feedback_listener s_presentationListener
+@@ -244,12 +270,12 @@ static constexpr struct wp_presentation_feedback_listener s_presentationListener
  
  void WaylandOutput::handleFrame(void *data, wl_callback *callback, uint32_t time)
  {
@@ -5696,7 +5775,7 @@ index e435266..e5cba69 100644
          it->frameCallbackTime = std::chrono::steady_clock::now();
      }
  }
-@@ -260,12 +285,16 @@ const wl_callback_listener WaylandOutput::s_frameCallbackListener{
+@@ -260,12 +286,16 @@ const wl_callback_listener WaylandOutput::s_frameCallbackListener{
  
  bool WaylandOutput::testPresentation(const std::shared_ptr<OutputFrame> &frame)
  {
@@ -5713,7 +5792,7 @@ index e435266..e5cba69 100644
      return true;
  }
  
-@@ -299,38 +328,64 @@ bool WaylandOutput::present(const QList<OutputLayer *> &layersToUpdate, const st
+@@ -299,38 +329,70 @@ bool WaylandOutput::present(const QList<OutputLayer *> &layersToUpdate, const st
      auto cursorLayers = layersToUpdate | std::views::filter([](OutputLayer *layer) {
          return layer->type() == OutputLayerType::CursorOnly;
      });
@@ -5781,7 +5860,13 @@ index e435266..e5cba69 100644
 +        if (frameCallback != nullptr) {
 +            wl_callback_destroy(frameCallback);
 +        }
-+        return false;
++        m_surface->commit(KWayland::Client::Surface::CommitFlag::None);
++        if (frame) {
++            QMetaObject::invokeMethod(m_renderLoop.get(), [frame] {
++                frame->presented(std::chrono::steady_clock::now().time_since_epoch(), PresentationMode::VSync);
++            }, Qt::QueuedConnection);
++        }
++        return true;
 +    }
 +
 +    FrameData frameData{frame, presentationFeedback, frameCallback};
@@ -5791,7 +5876,7 @@ index e435266..e5cba69 100644
      m_surface->commit(KWayland::Client::Surface::CommitFlag::None);
      m_frames.push_back(std::move(frameData));
      return true;
-@@ -338,12 +393,19 @@ bool WaylandOutput::present(const QList<OutputLayer *> &layersToUpdate, const st
+@@ -338,12 +400,19 @@ bool WaylandOutput::present(const QList<OutputLayer *> &layersToUpdate, const st
  
  void WaylandOutput::frameDiscarded()
  {
@@ -5812,7 +5897,7 @@ index e435266..e5cba69 100644
          m_refreshRate = refreshRate;
          const auto mode = std::make_shared<OutputMode>(pixelSize(), m_refreshRate);
          State next = m_state;
-@@ -352,15 +414,16 @@ void WaylandOutput::framePresented(std::chrono::nanoseconds timestamp, uint32_t
+@@ -352,15 +421,16 @@ void WaylandOutput::framePresented(std::chrono::nanoseconds timestamp, uint32_t
          setState(next);
          m_renderLoop->setRefreshRate(m_refreshRate);
      }
@@ -5837,7 +5922,7 @@ index e435266..e5cba69 100644
      frame.outputFrame->presented(timestamp, PresentationMode::VSync);
      m_frames.pop_front();
  }
-@@ -422,8 +485,8 @@ RenderLoop *WaylandOutput::renderLoop() const
+@@ -422,8 +492,8 @@ RenderLoop *WaylandOutput::renderLoop() const
  
  bool WaylandOutput::presentAsync(OutputLayer *layer, std::optional<std::chrono::nanoseconds> allowedVrrDelay)
  {
@@ -5848,7 +5933,7 @@ index e435266..e5cba69 100644
  }
  
  void WaylandOutput::init(const QSize &pixelSize, qreal scale, bool fullscreen)
-@@ -444,35 +507,48 @@ void WaylandOutput::init(const QSize &pixelSize, qreal scale, bool fullscreen)
+@@ -444,35 +514,48 @@ void WaylandOutput::init(const QSize &pixelSize, qreal scale, bool fullscreen)
  
  void WaylandOutput::handleConfigure(const QSize &size, XdgShellSurface::States states, quint32 serial)
  {
@@ -5914,7 +5999,7 @@ index e435266..e5cba69 100644
  }
  
  void WaylandOutput::updateWindowTitle()
-@@ -492,15 +568,16 @@ void WaylandOutput::updateWindowTitle()
+@@ -492,15 +575,16 @@ void WaylandOutput::updateWindowTitle()
      } else if (dpmsMode() != DpmsMode::On) {
          title += i18n("- Output dimmed");
      } else if (!grab.isEmpty()) {
@@ -5933,7 +6018,7 @@ index e435266..e5cba69 100644
          m_pointerLock.reset();
          m_hasPointerLock = false;
          if (surfaceWasLocked) {
-@@ -511,12 +588,18 @@ void WaylandOutput::lockPointer(Pointer *pointer, bool lock)
+@@ -511,12 +595,18 @@ void WaylandOutput::lockPointer(Pointer *pointer, bool lock)
          return;
      }
  
@@ -5954,7 +6039,7 @@ index e435266..e5cba69 100644
      connect(m_pointerLock.get(), &LockedPointer::locked, this, [this]() {
          m_hasPointerLock = true;
          inhibitShortcuts(true);
-@@ -558,9 +641,14 @@ void WaylandOutput::setOutputLayers(std::vector<std::unique_ptr<OutputLayer>> &&
+@@ -558,9 +648,14 @@ void WaylandOutput::setOutputLayers(std::vector<std::unique_ptr<OutputLayer>> &&
  
  QList<OutputLayer *> WaylandOutput::outputLayers() const
  {
@@ -6327,6 +6412,18 @@ index 1643031..c4f9017 100644
              // re-render without direct scanout
              if (prepareRendering(primary.view, logicalOutput, output, primary.requiredAlphaBits)
                  && renderLayer(primary.view, logicalOutput, output, frame, primary.surfaceDamage)) {
+diff --git a/src/compositor.h b/src/compositor.h
+index ddfb71f..544f555 100644
+--- a/src/compositor.h
++++ b/src/compositor.h
+@@ -16,6 +16,7 @@
+ #include <QObject>
+ 
+ #include <memory>
++#include <unordered_set>
+ 
+ namespace KWin
+ {
 diff --git a/src/core/renderjournal.cpp b/src/core/renderjournal.cpp
 index 39b075f..098435e 100644
 --- a/src/core/renderjournal.cpp
@@ -9491,10 +9588,18 @@ index 29118bd..a93c01d 100644
  
  QStringList KWIN_EXPORT atomToMimeTypes(xcb_atom_t atom);
 diff --git a/src/wayland/transaction.cpp b/src/wayland/transaction.cpp
-index 967b22b..24501f6 100644
+index 967b22b..5b5892a 100644
 --- a/src/wayland/transaction.cpp
 +++ b/src/wayland/transaction.cpp
-@@ -147,11 +147,14 @@ static SurfaceInterface *mainSurface(SurfaceInterface *surface)
+@@ -96,6 +96,7 @@ void Transaction::add(SurfaceInterface *surface)
+         .surface = surface,
+         .buffer = GraphicsBufferRef(state->buffer),
+         .state = std::move(state),
++        .fences = {},
+     });
+ }
+ 
+@@ -147,11 +148,14 @@ static SurfaceInterface *mainSurface(SurfaceInterface *surface)
  void Transaction::apply()
  {
      // Sort surfaces so descendants come first, then their ancestors.
@@ -9511,7 +9616,7 @@ index 967b22b..24501f6 100644
              return true;
          }
  
-@@ -191,6 +194,10 @@ void Transaction::apply()
+@@ -191,6 +195,10 @@ void Transaction::apply()
          }
      }
  
@@ -9522,7 +9627,7 @@ index 967b22b..24501f6 100644
      delete this;
  }
  
-@@ -204,7 +211,7 @@ void Transaction::tryApply()
+@@ -204,7 +212,7 @@ void Transaction::tryApply()
  void Transaction::commit()
  {
      for (TransactionEntry &entry : m_entries) {
@@ -9531,7 +9636,7 @@ index 967b22b..24501f6 100644
              continue;
          }
  
-@@ -274,6 +281,7 @@ void Transaction::watchDmaBuf(TransactionEntry *entry)
+@@ -274,6 +282,7 @@ void Transaction::watchDmaBuf(TransactionEntry *entry)
  
      for (int i = 0; i < attributes->planeCount; ++i) {
          const FileDescriptor &fileDescriptor = attributes->fd[i];
@@ -9602,10 +9707,25 @@ index 986a604..f4f61f3 100644
  
      if (event->target == atoms->targets) {
 diff --git a/src/xwayland/xwayland.cpp b/src/xwayland/xwayland.cpp
-index bddc7e9..debac90 100644
+index bddc7e9..fa2748a 100644
 --- a/src/xwayland/xwayland.cpp
 +++ b/src/xwayland/xwayland.cpp
-@@ -47,6 +47,8 @@
+@@ -32,6 +32,7 @@
+ #include "xwayland_logging.h"
+ 
+ #include <KSelectionOwner>
++#include <wayland/clientconnection.h>
+ #include <wayland/keyboard.h>
+ #include <wayland/pointer.h>
+ #include <wayland/seat.h>
+@@ -41,12 +42,15 @@
+ #include <QDataStream>
+ #include <QDir>
+ #include <QFile>
++#include <QPointer>
+ #include <QRandomGenerator>
+ #include <QScopeGuard>
+ #include <QSocketNotifier>
  #include <QTimer>
  #include <QtConcurrentRun>
  
@@ -9614,7 +9734,7 @@ index bddc7e9..debac90 100644
  #include <cerrno>
  #include <cstring>
  #include <input_event.h>
-@@ -92,19 +94,29 @@ public:
+@@ -92,19 +96,29 @@ public:
          connect(waylandServer()->seat(), &SeatInterface::focusedKeyboardSurfaceAboutToChange,
                  this, [this](SurfaceInterface *newSurface) {
              auto keyboard = waylandServer()->seat()->keyboard();
@@ -9651,7 +9771,7 @@ index bddc7e9..debac90 100644
              }
          });
      }
-@@ -117,97 +129,95 @@ public:
+@@ -117,97 +131,95 @@ public:
              Qt::MetaModifier,
          };
  
@@ -9836,7 +9956,7 @@ index bddc7e9..debac90 100644
          };
  
          switch (mode) {
-@@ -217,13 +227,13 @@ public:
+@@ -217,13 +229,13 @@ public:
              break;
          case NonCharacterKeys:
              m_filterKey = [](int key, Qt::KeyboardModifiers) {
@@ -9852,7 +9972,7 @@ index bddc7e9..debac90 100644
              };
              m_filterMouse = eavesdropsMouse;
              break;
-@@ -239,69 +249,79 @@ public:
+@@ -239,69 +251,79 @@ public:
      bool keyboardKey(KWin::KeyboardKeyEvent *event) override
      {
          ClientConnection *xwaylandClient = waylandServer()->xWaylandConnection();
@@ -9861,7 +9981,7 @@ index bddc7e9..debac90 100644
              return false;
          }
 +
-+        if (m_cachedFocusedClient == xwaylandClient) [[likely]] {
++        if (m_cachedFocusedClient.data() == xwaylandClient) [[likely]] {
 +            return false;
 +        }
 +
@@ -9951,7 +10071,7 @@ index bddc7e9..debac90 100644
                                  xkb->currentLayout(),
                                  xwaylandClient);
          return false;
-@@ -310,12 +330,14 @@ public:
+@@ -310,12 +332,14 @@ public:
      bool pointerButton(KWin::PointerButtonEvent *event) override
      {
          ClientConnection *xwaylandClient = waylandServer()->xWaylandConnection();
@@ -9967,7 +10087,7 @@ index bddc7e9..debac90 100644
          if (event->button == Qt::MouseButton::LeftButton
              || event->button == Qt::MouseButton::RightButton
              || event->button == Qt::MouseButton::MiddleButton) {
-@@ -323,29 +345,63 @@ public:
+@@ -323,29 +347,63 @@ public:
          }
  
          auto pointer = waylandServer()->seat()->pointer();
@@ -9995,7 +10115,7 @@ index bddc7e9..debac90 100644
 +private:
 +    static constexpr size_t MaxScanCode = 0x300;
 +
-+    bool isPressed(quint32 scancode) const noexcept
++    [[gnu::always_inline]] inline bool isPressed(quint32 scancode) const noexcept
 +    {
 +        if (scancode < MaxScanCode) [[likely]] {
 +            return m_pressed[scancode] != 0;
@@ -10003,7 +10123,7 @@ index bddc7e9..debac90 100644
 +        return m_pressedOverflow.contains(scancode);
 +    }
 +
-+    bool setPressed(quint32 scancode, bool pressed) noexcept
++    [[gnu::always_inline]] inline bool setPressed(quint32 scancode, bool pressed) noexcept
 +    {
 +        if (scancode < MaxScanCode) [[likely]] {
 +            const uint8_t old = m_pressed[scancode];
@@ -10036,11 +10156,11 @@ index bddc7e9..debac90 100644
 +
 +    alignas(64) std::function<bool(int key, Qt::KeyboardModifiers)> m_filterKey;
      bool m_filterMouse = false;
-+    ClientConnection *m_cachedFocusedClient = nullptr;
++    QPointer<ClientConnection> m_cachedFocusedClient;
  };
  
  Xwayland::Xwayland(Application *app)
-@@ -396,11 +452,18 @@ void Xwayland::dispatchEvents(DispatchEventsMode mode)
+@@ -396,11 +454,18 @@ void Xwayland::dispatchEvents(DispatchEventsMode mode)
  
      auto pollEventFunc = mode == DispatchEventsMode::Poll ? xcb_poll_for_event : xcb_poll_for_queued_event;
  
