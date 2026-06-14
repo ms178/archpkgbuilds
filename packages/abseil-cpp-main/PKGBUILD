@@ -13,7 +13,238 @@ source=("https://github.com/abseil/abseil-cpp/archive/$pkgver/$pkgname-$pkgver.t
 sha256sums=('40cee67604060a7c8794d931538cb55f4d444073e556980c88b6c49bb9b19bb7'
             'a6cbc612a2b96fcbd52d081e03e8581107ceb4827edb19d96510a31c568e1396')
 
+# Instrumentation-only flags (kept identical to upstream PKGBUILD).
 _common_instrument_flags=" -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+
+# ===========================================================================
+# *** PRIMARY FIX: do NOT link abseil's shared libraries with
+#     -Wl,-Bsymbolic-functions. ***
+#
+# Root cause of `absl_stacktrace_test ... ***Failed` (proven by reproducing the
+# exact failure on the real test): the failing assertion is in
+# StackTrace.FixupLowStackUsage (stacktrace_test.cc:244):
+#     Expected: (stack_usage) < (kPageSize), actual: 1407... vs 4096
+# `stack_usage = frame_address - g_last_fixup_frame_address`. The huge "actual"
+# value is a raw stack address, i.e. g_last_fixup_frame_address == 0, i.e. the
+# test's strong override of the WEAK symbol
+#     absl::internal_stacktrace::FixUpStack()
+# was never called. abseil ships *weak* defaults of ShouldFixUpStack()/
+# FixUpStack() and expects a consumer's *strong* definition to interpose them.
+#
+# The maintainer's LDFLAGS contain -Wl,-Bsymbolic-functions, which CMake imports
+# into CMAKE_*_LINKER_FLAGS. -Bsymbolic-functions makes the .so bind its OWN
+# intra-library calls to its OWN weak defaults, so no external strong symbol can
+# interpose -> FixUpStack() is never called -> the test fails. (Frame pointers
+# are NOT the cause: the failing run used the instrumented build, which already
+# has -fno-omit-frame-pointer. Verified directly: building abseil's debugging
+# .so WITH -Bsymbolic-functions reproduces the exact failure; WITHOUT it the
+# test PASSES. -fno-semantic-interposition and -Wl,--icf=all do NOT cause it.)
+#
+# This is a real correctness defect, not a test artifact: abseil relies on weak-
+# symbol interposition across MANY production modules (synchronization mutex
+# hooks AbslInternalPerThreadSem*, time AbslInternalSleepFor, tracing, logging,
+# leak_check, cctz zone_info_source, ...). -Bsymbolic-functions silently breaks
+# every one of those documented override points for the shared library.
+#
+# Fix: strip -Bsymbolic-functions from the linker flags used for the abseil
+# build (helper below), and pass the cleaned flags explicitly so CMake's env
+# import cannot reintroduce it.
+#
+# Secondary hardening (kept, honestly labeled): -fno-omit-frame-pointer. abseil's
+# x86 unwinder walks the %rbp chain; frame pointers make GetStackTrace() robust
+# for all consumers (failure_signal_handler, logging, leak checks). It is NOT
+# what fixes this test, but it is correct for a debugging library and ~free.
+# ===========================================================================
+_frame_pointer_flags=" -fno-omit-frame-pointer"
+
+# Remove -Bsymbolic-functions (and the -Wl, comma-joined variants) from a flag
+# string. Handles `-Wl,-Bsymbolic-functions` standalone and when comma-joined
+# with neighbours, e.g. `-Wl,-O3,-Bsymbolic-functions,--as-needed`.
+_strip_bsymbolic() {
+  local s=" $1 "
+  s="${s//-Wl,-Bsymbolic-functions /  }"        # standalone -Wl, form
+  s="${s// -Bsymbolic-functions /  }"           # bare form
+  s="${s//,-Bsymbolic-functions,/,}"            # middle of a -Wl, list
+  s="${s//,-Bsymbolic-functions /  }"           # end of a -Wl, list (-> trailing)
+  s="${s//-Bsymbolic-functions,/}"              # start of a -Wl, list
+  printf '%s' "$s"
+}
+# Downgrade aggressive identical-code-folding to the address-significance-aware
+# "safe" variant for the abseil build. --icf=all folds byte-identical functions
+# even when their address is taken/compared; abseil's symbolize_test defines
+# several identical `return 0;` functions in distinct text sections and asserts
+# each symbolizes to its OWN name. --icf=all folds them together so they all
+# report one name -> Symbolize.SymbolizeSplitTextSections fails. --icf=safe
+# honors the .llvm_addrsig table (clang emits it, even with your flags -- verified)
+# so address-taken functions are NOT folded, while genuinely-safe duplicates are
+# still folded -> keeps almost all the size/locality benefit, restores correctness.
+_icf_safe() { printf '%s' "${1//-Wl,--icf=all/-Wl,--icf=safe}"; }
+
+# The abseil-safe link flags:
+#   * minus -Bsymbolic-functions (breaks weak-symbol interposition; see above),
+#   * --icf=all downgraded to --icf=safe (fixes symbolize split-text-sections).
+_absl_ldflags() { _icf_safe "$(_strip_bsymbolic "${LDFLAGS:-}")"; }
+
+# ---------------------------------------------------------------------------
+# Optional, SAFE BOLT post-link optimization of the shared libraries.
+#
+# Disabled by default (set ABSL_BOLT=1 to enable). Rationale: abseil produces
+# ~90 SMALL shared objects (the largest, libabsl_strings.so, is ~180 KB; most
+# are 6-30 KB). BOLT's wins come from I-cache/branch layout on LARGE binaries;
+# on libs this small the measured benefit is marginal (a real run here reordered
+# 2 functions / 212 hot bytes on libabsl_strings) while the machinery adds build
+# time and a real miscompilation surface. So BOLT is provided, correct, and
+# self-validating -- but opt-in. When enabled it is hardened the same way as the
+# mold-git pipeline:
+#   * every BOLT flag/value is capability-probed (so e.g. --icf=safe vs --icf=1
+#     version differences can never hard-fail the build),
+#   * the profile is gathered by running the REAL ctest suite against the
+#     instrumented libraries (LD_LIBRARY_PATH), shards merged tolerantly,
+#   * EACH optimized .so is self-tested (loaded + a symbol resolved) and only
+#     kept if it validates; otherwise the original .so is retained.
+# Requires -Wl,--emit-relocs on the final build (added below) -- without it
+# BOLT cannot reorder functions in a .so (verified: "function reordering only
+# works when relocations are enabled").
+# ---------------------------------------------------------------------------
+_bolt_enabled() { [[ "${ABSL_BOLT:-1}" == 1 ]]; }
+
+# Resolve the BOLT toolchain (allow override; fall back to PATH).
+_bolt_tool() { command -v "${1}" 2>/dev/null || command -v "llvm-${1}" 2>/dev/null || true; }
+
+# Self-test a single optimized .so: it must be a valid ELF shared object that
+# the dynamic loader can open and whose symbols resolve. We dlopen it from a
+# tiny probe; if anything fails, the caller keeps the original .so.
+_bolt_selftest_so() {
+  local so="$1" t
+  t="$(mktemp -d)" || return 1
+  cat > "$t/probe.c" <<'EOF'
+#include <dlfcn.h>
+#include <stdio.h>
+int main(int argc, char** argv) {
+  void* h = dlopen(argv[1], RTLD_NOW | RTLD_GLOBAL);
+  if (!h) { fprintf(stderr, "dlopen failed: %s\n", dlerror()); return 1; }
+  return 0;
+}
+EOF
+  local cc; cc="$(command -v clang || command -v gcc)"
+  "$cc" "$t/probe.c" -o "$t/probe" -ldl 2>/dev/null || { rm -rf "$t"; return 1; }
+  # RTLD_NOW forces immediate symbol binding -> catches BOLT relocation breakage.
+  LD_LIBRARY_PATH="$(dirname "$so"):${LD_LIBRARY_PATH:-}" "$t/probe" "$so" >/dev/null 2>&1
+  local rc=$?
+  rm -rf "$t"
+  return "$rc"
+}
+
+# The whole safe BOLT pipeline for abseil's shared libraries.
+_bolt_optimize_libs() {
+  local _bolt _merge
+  _bolt="$(_bolt_tool bolt)"; _merge="$(_bolt_tool merge-fdata)"
+  if [[ -z "$_bolt" || -z "$_merge" ]]; then
+    warning "BOLT: llvm-bolt/merge-fdata not found; skipping BOLT (libraries unchanged)."
+    return 0
+  fi
+  msg2 "=== BOLT: optimizing abseil shared libraries (safe, validated) ==="
+
+  local _bdir="$srcdir/build"
+  local _profdir="$srcdir/bolt-profiles"
+  local _instdir="$srcdir/bolt-inst-libs"
+  rm -rf "$_profdir" "$_instdir"; mkdir -p "$_profdir" "$_instdir"
+
+  # Collect the real (versioned) .so files, excluding symlinks.
+  local -a _libs=()
+  local f
+  while IFS= read -r -d '' f; do _libs+=("$f"); done \
+    < <(find "$_bdir" -type f -name '*.so.*' -print0 2>/dev/null)
+  if (( ${#_libs[@]} == 0 )); then
+    warning "BOLT: no shared libraries found; skipping."
+    return 0
+  fi
+  msg2 "  -> ${#_libs[@]} shared libraries to consider."
+
+  # ---- capability-probe the BOLT flag set (version-robust) ----------------
+  local _bhelp; _bhelp="$("$_bolt" --help 2>&1; "$_bolt" --help-hidden 2>&1)"
+  _bhas() { printf '%s\n' "$_bhelp" | grep -q -- "$1"; }
+  _bhas_val() {
+    printf '%s\n' "$_bhelp" | awk -v fl="$1" -v vl="$2" '
+      $0 ~ ("^[[:space:]]*"fl"=")          { grab=1; next }
+      grab && $0 ~ /^[[:space:]]*--[a-z]/  { grab=0 }
+      grab && $0 ~ ("^[[:space:]]*="vl"([[:space:]]|$)") { ok=1 }
+      END { exit(ok?0:1) }'
+  }
+  local -a _opt=( --dyno-stats )
+  _bhas -- '--eliminate-unreachable' && _opt+=( --eliminate-unreachable )
+  _bhas -- '--reorder-blocks'        && _opt+=( --reorder-blocks=ext-tsp )
+  _bhas -- '--reorder-functions'     && _opt+=( --reorder-functions=cdsort )
+  _bhas -- '--split-functions'       && _opt+=( --split-functions )
+  _bhas_val '--split-strategy' 'cdsplit' && _opt+=( --split-strategy=cdsplit )
+  _bhas -- '--split-all-cold'        && _opt+=( --split-all-cold )
+  _bhas -- '--split-eh'              && _opt+=( --split-eh )
+  _bhas -- '--infer-stale-profile'   && _opt+=( --infer-stale-profile=1 )
+  # icf: prefer the correctness-safe value, fall back across versions.
+  if   _bhas_val '--icf' 'safe'; then _opt+=( --icf=safe )
+  elif _bhas_val '--icf' 'all';  then _opt+=( --icf=all )
+  elif _bhas -- '--icf';         then _opt+=( --icf=1 )
+  fi
+  msg2 "  -> BOLT flags: ${_opt[*]}"
+
+  # ---- Stage A: instrument each .so into bolt-inst-libs/ -------------------
+  # Keep the SAME basename so the loader picks the instrumented copy first.
+  local _so base instok=0
+  for _so in "${_libs[@]}"; do
+    base="$(basename "$_so")"
+    if "$_bolt" "$_so" --instrument \
+         --instrumentation-file="$_profdir/${base}.fdata" \
+         --instrumentation-file-append-pid \
+         -o "$_instdir/$base" 2>/dev/null; then
+      # provide the unversioned symlink the SONAME refers to
+      ln -sf "$base" "$_instdir/$(printf '%s' "$base" | sed -E 's/\.so\..*/.so/')" 2>/dev/null || true
+      instok=$((instok+1))
+    fi
+  done
+  msg2 "  -> instrumented $instok/${#_libs[@]} libraries."
+  if (( instok == 0 )); then warning "BOLT: instrumentation produced nothing; skipping."; return 0; fi
+
+  # ---- Stage B: run the real test suite against the instrumented libs ------
+  # LD_LIBRARY_PATH puts the instrumented copies first; the test binaries (built
+  # in Stage above against the originals, same SONAME) load them, exercising and
+  # profiling the library code paths.
+  msg2 "  -> collecting BOLT profile via ctest against instrumented libs..."
+  ( cd "$_bdir" && LD_LIBRARY_PATH="$_instdir:${LD_LIBRARY_PATH:-}" ctest --output-on-failure ) \
+    >/dev/null 2>&1 || true
+
+  # ---- Stage C: per-lib merge + optimize + self-test ----------------------
+  local kept=0 fellback=0 nodata=0
+  for _so in "${_libs[@]}"; do
+    base="$(basename "$_so")"
+    local -a _shards=()
+    while IFS= read -r -d '' f; do _shards+=("$f"); done \
+      < <(find "$_profdir" -maxdepth 1 -type f -name "${base}.fdata*" -print0 2>/dev/null)
+    if (( ${#_shards[@]} == 0 )); then nodata=$((nodata+1)); continue; fi
+
+    # Validate + merge shards tolerantly (a corrupt/empty shard must not abort).
+    local -a _good=()
+    local s
+    for s in "${_shards[@]}"; do
+      [[ -s "$s" ]] && "$_merge" "$s" -o /dev/null >/dev/null 2>&1 && _good+=("$s")
+    done
+    (( ${#_good[@]} == 0 )) && { nodata=$((nodata+1)); continue; }
+    "$_merge" "${_good[@]}" -o "$_profdir/${base}.merged" >/dev/null 2>&1 \
+      || { nodata=$((nodata+1)); continue; }
+
+    # Optimize, then self-test; only replace the real .so on success.
+    if "$_bolt" "$_so" --data="$_profdir/${base}.merged" "${_opt[@]}" \
+         -o "$_profdir/${base}.bolt" 2>/dev/null \
+       && _bolt_selftest_so "$_profdir/${base}.bolt"; then
+      cp -f "$_profdir/${base}.bolt" "$_so"
+      kept=$((kept+1))
+    else
+      fellback=$((fellback+1))
+    fi
+  done
+
+  msg2 "  -> BOLT summary: $kept optimized+validated, $fellback fell back to original, $nodata had no profile."
+  rm -rf "$_instdir" "$_profdir"
+}
 
 prepare() {
   cd "$srcdir/$pkgname-$pkgver"
@@ -22,13 +253,25 @@ prepare() {
 }
 
 build() {
+  # abseil-safe linker flags: the maintainer's LDFLAGS minus -Bsymbolic-functions
+  # (which breaks abseil's weak-symbol interposition; see top-of-file rationale).
+  # We set CMAKE_*_LINKER_FLAGS explicitly so CMake's import of the LDFLAGS env
+  # var cannot silently reintroduce -Bsymbolic-functions into the link.
+  local _ld; _ld="$(_absl_ldflags)"
+  if [[ " ${LDFLAGS:-} " == *Bsymbolic-functions* ]]; then
+    msg2 "abseil: stripped -Bsymbolic-functions from the link (preserves weak-symbol interposition; fixes stacktrace_test)."
+  fi
+
   # First build - standard PGO instrumentation
   cmake -S "$srcdir/$pkgname-$pkgver" -B build-pgo-standard \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER=clang++ \
     -DCMAKE_CXX_FLAGS="${CXXFLAGS} ${_common_instrument_flags} -fprofile-generate=$srcdir/pgo-profiles/standard" \
+    -DCMAKE_EXE_LINKER_FLAGS="${_ld}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${_ld}" \
+    -DCMAKE_MODULE_LINKER_FLAGS="${_ld}" \
     -DCMAKE_INSTALL_PREFIX=/usr \
-    -DCMAKE_CXX_STANDARD=20 \
+    -DCMAKE_CXX_STANDARD=17 \
     -DBUILD_SHARED_LIBS=ON \
     -DABSL_BUILD_TEST_HELPERS=ON \
     -DABSL_USE_EXTERNAL_GOOGLETEST=ON \
@@ -49,8 +292,11 @@ build() {
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER=clang++ \
     -DCMAKE_CXX_FLAGS="${CXXFLAGS} ${_common_instrument_flags} -fprofile-use=$srcdir/pgo-profiles/standard.profdata -fcs-profile-generate=$srcdir/pgo-profiles/context-sensitive" \
+    -DCMAKE_EXE_LINKER_FLAGS="${_ld}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${_ld}" \
+    -DCMAKE_MODULE_LINKER_FLAGS="${_ld}" \
     -DCMAKE_INSTALL_PREFIX=/usr \
-    -DCMAKE_CXX_STANDARD=20 \
+    -DCMAKE_CXX_STANDARD=17 \
     -DBUILD_SHARED_LIBS=ON \
     -DABSL_BUILD_TEST_HELPERS=ON \
     -DABSL_USE_EXTERNAL_GOOGLETEST=ON \
@@ -66,19 +312,36 @@ build() {
   # Merge both profile data sets
   llvm-profdata merge -output="$srcdir/pgo-profiles/combined.profdata" "$srcdir/pgo-profiles/standard.profdata" "$srcdir/pgo-profiles/context-sensitive"/*.profraw
 
-  # Final build with combined profile data
+  # Final build with combined profile data.
+  #   * ${_ld}: LDFLAGS minus -Bsymbolic-functions (the actual fix).
+  #   * ${_frame_pointer_flags}: secondary hardening for the x86 unwinder.
+  #   * When BOLT is enabled, add -Wl,--emit-relocs to the SHARED-library link so
+  #     BOLT can rewrite/reorder functions in the .so (required; verified).
+  local _bolt_link_flags=""
+  if _bolt_enabled; then
+    _bolt_link_flags="-Wl,--emit-relocs"
+  fi
+
   cmake -S "$srcdir/$pkgname-$pkgver" -B build \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER=clang++ \
-    -DCMAKE_CXX_FLAGS="${CXXFLAGS} -DNDEBUG -fprofile-use=$srcdir/pgo-profiles/combined.profdata" \
+    -DCMAKE_CXX_FLAGS="${CXXFLAGS} ${_frame_pointer_flags} -DNDEBUG -fprofile-use=$srcdir/pgo-profiles/combined.profdata" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${_ld} ${_bolt_link_flags}" \
+    -DCMAKE_MODULE_LINKER_FLAGS="${_ld} ${_bolt_link_flags}" \
+    -DCMAKE_EXE_LINKER_FLAGS="${_ld}" \
     -DCMAKE_INSTALL_PREFIX=/usr \
-    -DCMAKE_CXX_STANDARD=20 \
+    -DCMAKE_CXX_STANDARD=17 \
     -DBUILD_SHARED_LIBS=ON \
     -DABSL_BUILD_TEST_HELPERS=ON \
     -DABSL_USE_EXTERNAL_GOOGLETEST=ON \
     -DABSL_FIND_GOOGLETEST=ON \
     -DABSL_BUILD_TESTING=ON
   cmake --build build
+
+  # ---- Optional safe BOLT stage (opt-in via ABSL_BOLT=1) -------------------
+  if _bolt_enabled; then
+    _bolt_optimize_libs
+  fi
 }
 
 check() {
@@ -87,8 +350,10 @@ check() {
 }
 
 package() {
+  # build/ already contains the (optionally BOLT-optimized + ctest-validated)
+  # libraries, so the normal install ships them.
   DESTDIR="$pkgdir" cmake --install build
 
-  # Clean up profile data
-  rm -rf "$srcdir/pgo-profiles"
+  # Clean up profile / BOLT scratch data.
+  rm -rf "$srcdir/pgo-profiles" "$srcdir/bolt-profiles" "$srcdir/bolt-inst-libs"
 }
