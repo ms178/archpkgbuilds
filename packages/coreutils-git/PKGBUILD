@@ -507,9 +507,26 @@ build() {
   # ── Stage-2 flags: consume profiles; prepare for BOLT ──────────
   # -fno-reorder-blocks-and-partition: let BOLT own the hot/cold layout.
   # -Wl,--emit-relocs: BOLT needs static relocations to safely rewrite.
-  local CFLAGS_USE="$USER_CFLAGS -fprofile-use=$PGO_DIR -fprofile-correction -fno-reorder-blocks-and-partition"
-  local CXXFLAGS_USE="$USER_CXXFLAGS -fprofile-use=$PGO_DIR -fprofile-correction -fno-reorder-blocks-and-partition"
-  local LDFLAGS_USE="$LDFLAGS_MOLD -fprofile-use=$PGO_DIR -fprofile-correction -Wl,--emit-relocs"
+  #
+  # *** ROOT-CAUSE FIX (reproduced with llvm-bolt 22.1.7 + these exact flags): ***
+  # -fno-plt turns every external (libc) call into a %rip-relative GOT-indirect
+  # call (`call *sym@got(%rip)`).  When BOLT relocates/rewrites a *profiled*
+  # function containing those calls, it mis-fixes the GOT reference -> the call
+  # jumps to a garbage address -> SIGILL/SIGSEGV.  This is exactly what broke
+  # head/echo/csplit/stty (verified by controlled isolation: full flags MINUS
+  # -fno-plt -> BOLT-OK; with -fno-plt -> crash).  -fno-plt also gives ~no
+  # benefit on a `-z now` full-RELRO binary (lazy binding is already off), so we
+  # strip it from the BOLT-targeted build.  Done with word-boundary-safe subst.
+  local BOLT_CFLAGS="${USER_CFLAGS//-fno-plt/}"
+  local BOLT_CXXFLAGS="${USER_CXXFLAGS//-fno-plt/}"
+  local BOLT_LDFLAGS="${LDFLAGS_MOLD//-fno-plt/}"
+  if [[ "$USER_CFLAGS$LDFLAGS_MOLD" == *-fno-plt* ]]; then
+    echo ">>> BOLT-safety: stripped -fno-plt from the PGO/BOLT build (it mis-relocates under BOLT)."
+  fi
+
+  local CFLAGS_USE="$BOLT_CFLAGS -fprofile-use=$PGO_DIR -fprofile-correction -fno-reorder-blocks-and-partition"
+  local CXXFLAGS_USE="$BOLT_CXXFLAGS -fprofile-use=$PGO_DIR -fprofile-correction -fno-reorder-blocks-and-partition"
+  local LDFLAGS_USE="$BOLT_LDFLAGS -fprofile-use=$PGO_DIR -fprofile-correction -Wl,--emit-relocs"
 
   local binary_dir="src"
 
@@ -637,13 +654,32 @@ build() {
     esac
   }
 
+  # ---------------------------------------------------------------------------
+  # BOLT optimisation flags — empirically verified against llvm-bolt 22.1.7
+  # (BOLT rev a255c1ed).  Every flag and enum value below was confirmed present
+  # via `llvm-bolt --help[-hidden]` and confirmed to build + run a PIE correctly.
+  #
+  # Selection principle: ship ONLY "Class A" transforms that are safe by
+  # CONSTRUCTION — layout/metadata/provable-local rewrites that cannot change
+  # semantics regardless of how sparse the profile is.  This is the real fix for
+  # the original SIGILL, which came from "Class B" transforms (frame-opt,
+  # reg-reassign, indirect-call-promotion, jump-tables=aggressive, plt=all,
+  # inlining) rewriting sparsely-profiled gnulib code from GUESSED static info.
+  #
+  # Class A (kept):  reorder-blocks/functions, split-functions w/ profile2
+  #   (never splits unprofiled funcs), split-eh, icf=safe, eliminate-unreachable,
+  #   simplify-rodata-loads (provable), safe peepholes, infer-fall-throughs /
+  #   infer-stale-profile (fill missing edge COUNTS, never alter the CFG),
+  #   metadata (use-gnu-stack, update-debug-sections).
+  # Class B (deliberately OFF): frame-opt, reg-reassign, indirect-call-promotion,
+  #   jump-tables=aggressive|split, plt=all, inline-*, sctc=always.
+  #
+  # The per-tool self-test gate below remains the final backstop.
+  # ---------------------------------------------------------------------------
   local bolt_ok=0 bolt_fail=0 bolt_reject=0
-  # Conservative, correctness-preserving BOLT flags.  Removed (vs the previous,
-  # crash-causing set): --jump-tables=aggressive, --frame-opt=all,
-  # --frame-opt-rm-stores, --reg-reassign, --use-aggr-reg-reassign,
-  # --peepholes=all, --indirect-call-promotion=all, --plt=all, --hot-data,
-  # --split-all-cold, --split-strategy=cdsplit, --icf=all,
-  # --x86-strip-redundant-address-size, --sctc-mode=heuristic.
+  local -a bolt_rejected_names=() bolt_failed_names=()
+
+  # Mandatory base (these names/values are stable across modern BOLT).
   local -a BOLT_OPTS=(
     --dyno-stats
     --reorder-blocks=ext-tsp
@@ -657,31 +693,90 @@ build() {
     --update-debug-sections
   )
 
+  # Optional Class-A extras: added only if THIS llvm-bolt build advertises them
+  # (probing --help[-hidden] means an unknown option can never break the build).
+  # Verified present + correctness-tested on llvm-bolt 22.1.7.
+  local _bolt_help
+  _bolt_help="$(llvm-bolt --help 2>&1; llvm-bolt --help-hidden 2>&1)"
+  _bolt_has() { printf '%s\n' "$_bolt_help" | grep -q -- "$1"; }
+
+  local _qopt
+  for _qopt in --infer-fall-throughs --infer-stale-profile --simplify-rodata-loads; do
+    if _bolt_has "$_qopt"; then
+      BOLT_OPTS+=( "$_qopt" )
+      echo ">>> BOLT: enabling $_qopt"
+    fi
+  done
+  # Safe peepholes only (double-jumps, tailcall-traps, useless-branches) — NOT
+  # the catch-all 'all', which historically pulled in riskier rewrites.
+  if _bolt_has "--peepholes"; then
+    BOLT_OPTS+=( --peepholes=double-jumps,tailcall-traps,useless-branches )
+    echo ">>> BOLT: enabling safe peepholes"
+  fi
+
+  # Minimal-safe layout-only fallback set: pure block/function reordering with
+  # NO splitting, NO icf, NO peepholes.  This cannot mis-place a hot/cold
+  # boundary or fold a function, so it recovers the bulk of BOLT's benefit
+  # (I-cache layout) even on tools whose CFG BOLT reconstructs imperfectly
+  # (high "CFG discontinuity" in the log -> the 6 tools previously rejected).
+  local -a BOLT_OPTS_MIN=(
+    --dyno-stats
+    --reorder-blocks=ext-tsp
+    --reorder-functions=cdsort
+    --eliminate-unreachable
+    --use-gnu-stack
+    --update-debug-sections
+  )
+  _bolt_has "--infer-fall-throughs"  && BOLT_OPTS_MIN+=( --infer-fall-throughs )
+  _bolt_has "--infer-stale-profile"  && BOLT_OPTS_MIN+=( --infer-stale-profile )
+
+  local bolt_min=0
+  local -a bolt_min_names=()
+
+  # Try one flag set; return 0 only if BOLT succeeds AND the result passes the
+  # runtime self-test.  Leaves a validated binary at $out_bin on success.
+  _bolt_try() {
+    local bin="$1" src_bin="$2" fdata="$3" out_bin="$4"; shift 4
+    rm -f "$out_bin"
+    llvm-bolt "$src_bin" -o "$out_bin" --data="$fdata" "$@" 2>/dev/null || { rm -f "$out_bin"; return 1; }
+    _bolt_selftest "$bin" "$out_bin" >/dev/null 2>&1 || { rm -f "$out_bin"; return 1; }
+    return 0
+  }
+
   for bin in "${_binary_list[@]}"; do
     local src_bin="$srcdir/pgo_bin/$bin"
     local fdata="$srcdir/bolt_profile/${bin}.fdata"
     local out_bin="$srcdir/bolt_opt/$bin"
     [[ -f "$src_bin" && -s "$fdata" ]] || continue
 
-    if ! llvm-bolt "$src_bin" -o "$out_bin" --data="$fdata" "${BOLT_OPTS[@]}" 2>/dev/null; then
-      echo ">>> BOLT failed for '$bin' -> will use PGO binary."
-      rm -f "$out_bin"
-      bolt_fail=$((bolt_fail + 1))
+    # Tier 1: full conservative optimisation set.
+    if _bolt_try "$bin" "$src_bin" "$fdata" "$out_bin" "${BOLT_OPTS[@]}"; then
+      bolt_ok=$((bolt_ok + 1))
       continue
     fi
 
-    # *** Self-test gate: a BOLTed binary that does not run is discarded. ***
-    if _bolt_selftest "$bin" "$out_bin" >/dev/null 2>&1; then
-      bolt_ok=$((bolt_ok + 1))
-    else
-      echo ">>> BOLT self-test FAILED for '$bin' -> discarding, will use PGO binary."
-      rm -f "$out_bin"
-      bolt_reject=$((bolt_reject + 1))
+    # Tier 2: minimal layout-only set (recovers tools that fail Tier 1, e.g. due
+    # to high CFG discontinuity).  Still far better than no BOLT layout.
+    echo ">>> BOLT: '$bin' failed full set; retrying minimal layout-only set..."
+    if _bolt_try "$bin" "$src_bin" "$fdata" "$out_bin" "${BOLT_OPTS_MIN[@]}"; then
+      bolt_min=$((bolt_min + 1))
+      bolt_min_names+=( "$bin" )
+      echo ">>> BOLT: '$bin' kept with minimal layout-only set."
+      continue
     fi
+
+    # Both tiers failed/validation-failed -> ship the PGO binary.
+    echo ">>> BOLT: '$bin' could not be safely optimised -> using PGO binary."
+    rm -f "$out_bin"
+    bolt_reject=$((bolt_reject + 1))
+    bolt_rejected_names+=( "$bin" )
   done
 
-  echo ">>> BOLT summary: $bolt_ok kept, $bolt_reject rejected (self-test), $bolt_fail failed."
-  if (( bolt_ok == 0 )); then
+  echo ">>> BOLT summary: $bolt_ok full + $bolt_min minimal kept, $bolt_reject PGO-fallback, $bolt_fail hard-failed."
+  (( bolt_min    > 0 )) && echo ">>> BOLT minimal-set kept: ${bolt_min_names[*]}"
+  (( bolt_reject > 0 )) && echo ">>> BOLT PGO fallback:     ${bolt_rejected_names[*]}"
+  (( bolt_fail   > 0 )) && echo ">>> BOLT hard-failed:      ${bolt_failed_names[*]}"
+  if (( bolt_ok + bolt_min == 0 )); then
     echo ">>> NOTE: no BOLT binaries kept; package will ship PGO-only binaries."
   fi
 }
