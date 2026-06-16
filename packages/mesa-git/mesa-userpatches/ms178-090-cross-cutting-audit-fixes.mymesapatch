@@ -1,0 +1,1555 @@
+From aa985afdeee47a26003fa869a2fb677a5fb7679b Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.local>
+Date: Tue, 16 Jun 2026 20:30:18 +0000
+Subject: [PATCH] ms178-090-cross-cutting-audit-fixes.mymesapatch
+
+---
+ src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c | 325 +++++--------
+ src/gallium/winsys/amdgpu/drm/amdgpu_cs.cpp   |  20 +-
+ src/util/compress.c                           | 441 ++++--------------
+ src/util/disk_cache.c                         |  66 ++-
+ src/util/u_vector.c                           | 105 ++---
+ src/util/u_vector.h                           |  16 +-
+ src/vulkan/wsi/wsi_common_wayland.c           |  46 +-
+ 7 files changed, 360 insertions(+), 659 deletions(-)
+
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
+index d880536..b9306a0 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
+@@ -29,10 +29,6 @@
+ #include "vk_sync.h"
+ #include "vk_sync_dummy.h"
+ 
+-#if defined(__x86_64__) || defined(_M_X64)
+-#include <immintrin.h>
+-#endif
+-
+ /* Some BSDs don't define ENODATA (and ENODATA is replaced with different error
+  * codes in the kernel).
+  */
+@@ -68,27 +64,6 @@
+ /* Maximum hash table size to prevent excessive memory usage. */
+ #define RADV_MAX_HASH_TABLE_SIZE 8192u
+ 
+-/*
+- * Thread-local AVX2 feature cache - avoids repeated CPUID calls.
+- * CPUID takes ~100-200 cycles; caching saves this on every search.
+- */
+-static _Thread_local int avx2_supported_cached = -1;
+-
+-static RADV_ALWAYS_INLINE bool
+-radv_cpu_supports_avx2_cached(void)
+-{
+-#if defined(__GNUC__) || defined(__clang__)
+-   if (unlikely(avx2_supported_cached < 0)) {
+-      __builtin_cpu_init();
+-      /* Require both AVX2 and BMI2 for optimal performance */
+-      avx2_supported_cached = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("bmi2") ? 1 : 0;
+-   }
+-   return avx2_supported_cached != 0;
+-#else
+-   return false;
+-#endif
+-}
+-
+ struct radv_amdgpu_ib {
+    struct radeon_winsys_bo *bo; /* NULL when not owned by the current CS object */
+    uint64_t va;
+@@ -1326,10 +1301,10 @@ radv_amdgpu_cs_chain_dgc_ib(struct ac_cmdbuf *_cs, uint64_t va, uint32_t cdw, ui
+    }
+ }
+ 
+-static unsigned
++static uint64_t
+ radv_amdgpu_count_cs_bo(struct radv_amdgpu_cs *start_cs)
+ {
+-   unsigned num_bo = 0;
++   uint64_t num_bo = 0;
+ 
+    for (struct radv_amdgpu_cs *cs = start_cs; cs; cs = cs->chained_to) {
+       num_bo += cs->num_buffers;
+@@ -1338,10 +1313,10 @@ radv_amdgpu_count_cs_bo(struct radv_amdgpu_cs *start_cs)
+    return num_bo;
+ }
+ 
+-static unsigned
++static uint64_t
+ radv_amdgpu_count_cs_array_bo(struct ac_cmdbuf **cs_array, unsigned num_cs)
+ {
+-   unsigned num_bo = 0;
++   uint64_t num_bo = 0;
+ 
+    for (unsigned i = 0; i < num_cs; ++i) {
+       num_bo += radv_amdgpu_count_cs_bo(radv_amdgpu_cs(cs_array[i]));
+@@ -1350,116 +1325,31 @@ radv_amdgpu_count_cs_array_bo(struct ac_cmdbuf **cs_array, unsigned num_cs)
+    return num_bo;
+ }
+ 
+-#if defined(__x86_64__) || defined(_M_X64)
+-static RADV_ALWAYS_INLINE int
+-radv_linear_search_bo_avx2(const struct drm_amdgpu_bo_list_entry *handles,
+-                           unsigned count, uint32_t target)
+-{
+-   /* Use scalar path for small counts (AVX2 setup overhead not worth it) */
+-   if (unlikely(!radv_cpu_supports_avx2_cached() || count < 16u)) {
+-      goto scalar_path;
+-   }
+-
+-   /* Broadcast target to all 8 lanes of 256-bit register */
+-   const __m256i target_vec = _mm256_set1_epi32((int32_t)target);
+-   unsigned i = 0u;
+-
+-   /*
+-    * Process 8 entries per iteration.
+-    * Each entry is 8 bytes: {uint32_t bo_handle, uint32_t bo_priority}
+-    * We need to extract just the bo_handle fields (offsets 0, 8, 16, 24, ...)
+-    * In int32_t units: offsets 0, 2, 4, 6, 8, 10, 12, 14
+-    */
+-   for (; i + 8u <= count; i += 8u) {
+-      /* Base pointer for gather (cast to int32_t for stride calculation) */
+-      const int32_t *base_ptr = (const int32_t *)&handles[i];
+-
+-      /* Index vector: handle offsets in int32_t units */
+-      const __m256i vindex = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+-
+-      /* Gather 8 handles from struct array (4-byte stride between handles) */
+-      __m256i handles_vec = _mm256_i32gather_epi32(base_ptr, vindex, 4);
+-
+-      /* Compare all 8 handles against target */
+-      __m256i cmp = _mm256_cmpeq_epi32(handles_vec, target_vec);
+-
+-      /* Extract comparison results as 8-bit mask */
+-      int mask = _mm256_movemask_ps(_mm256_castsi256_ps(cmp));
+-
+-      /* Check if any lane matched */
+-      if (unlikely(mask != 0)) {
+-         /* Find first set bit (matched lane) using BMI2 TZCNT */
+-         const unsigned match_lane = (unsigned)__builtin_ctz((unsigned)mask);
+-         return (int)(i + match_lane);
+-      }
+-   }
+-
+-   /* Scalar tail for remaining elements */
+-   for (; i < count; ++i) {
+-      if (handles[i].bo_handle == target) {
+-         return (int)i;
+-      }
+-   }
+-
+-   return -1;
+-
+-scalar_path:
+-   /*
+-    * Optimized scalar path with manual unrolling.
+-    * Improves ILP (Instruction Level Parallelism) on Raptor Lake.
+-    * 4-way unroll matches P-core execution ports.
+-    */
+-   unsigned j = 0u;
+-
+-   for (; j + 4u <= count; j += 4u) {
+-      const uint32_t h0 = handles[j + 0].bo_handle;
+-      const uint32_t h1 = handles[j + 1].bo_handle;
+-      const uint32_t h2 = handles[j + 2].bo_handle;
+-      const uint32_t h3 = handles[j + 3].bo_handle;
+-
+-      if (unlikely(h0 == target)) return (int)(j + 0);
+-      if (unlikely(h1 == target)) return (int)(j + 1);
+-      if (unlikely(h2 == target)) return (int)(j + 2);
+-      if (unlikely(h3 == target)) return (int)(j + 3);
+-   }
+-
+-   /* Handle remainder */
+-   for (; j < count; ++j) {
+-      if (handles[j].bo_handle == target) {
+-         return (int)j;
+-      }
+-   }
+-
+-   return -1;
+-}
+-
+-#else /* Non-x86_64 architecture */
+-
+-static RADV_ALWAYS_INLINE int
+-radv_linear_search_bo_avx2(const struct drm_amdgpu_bo_list_entry *handles,
+-                           unsigned count, uint32_t target)
++static int
++radv_linear_search_bo(const struct drm_amdgpu_bo_list_entry *handles,
++                      unsigned count, uint32_t target)
+ {
+-   /* Optimized scalar search with unrolling for all architectures */
+    unsigned i = 0u;
+ 
+    for (; i + 4u <= count; i += 4u) {
+-      if (unlikely(handles[i + 0].bo_handle == target)) return (int)(i + 0);
+-      if (unlikely(handles[i + 1].bo_handle == target)) return (int)(i + 1);
+-      if (unlikely(handles[i + 2].bo_handle == target)) return (int)(i + 2);
+-      if (unlikely(handles[i + 3].bo_handle == target)) return (int)(i + 3);
++      if (unlikely(handles[i + 0].bo_handle == target))
++         return (int)(i + 0);
++      if (unlikely(handles[i + 1].bo_handle == target))
++         return (int)(i + 1);
++      if (unlikely(handles[i + 2].bo_handle == target))
++         return (int)(i + 2);
++      if (unlikely(handles[i + 3].bo_handle == target))
++         return (int)(i + 3);
+    }
+ 
+    for (; i < count; ++i) {
+-      if (handles[i].bo_handle == target) {
++      if (handles[i].bo_handle == target)
+          return (int)i;
+-      }
+    }
+ 
+    return -1;
+ }
+ 
+-#endif /* __x86_64__ */
+-
+ static unsigned
+ radv_amdgpu_add_cs_to_bo_list(struct radv_amdgpu_cs *cs,
+                               struct drm_amdgpu_bo_list_entry *handles,
+@@ -1476,10 +1366,9 @@ radv_amdgpu_add_cs_to_bo_list(struct radv_amdgpu_cs *cs,
+       return cs->num_buffers;
+    }
+ 
+-   /* Add regular buffers with AVX2-accelerated deduplication */
++   /* Add regular buffers with scalar deduplication. */
+    for (unsigned j = 0; j < cs->num_buffers; ++j) {
+-      /* Use AVX2 search for deduplication */
+-      const int idx = radv_linear_search_bo_avx2(handles, num_handles, cs->handles[j].bo_handle);
++      const int idx = radv_linear_search_bo(handles, num_handles, cs->handles[j].bo_handle);
+ 
+       if (idx < 0) {
+          /* New buffer - add it */
+@@ -1503,15 +1392,44 @@ radv_amdgpu_add_cs_array_to_bo_list(struct ac_cmdbuf **cs_array, unsigned num_cs
+    return num_handles;
+ }
+ 
+-static unsigned
+-radv_amdgpu_copy_global_bo_list(struct radv_amdgpu_winsys *ws, struct drm_amdgpu_bo_list_entry *handles)
++static VkResult
++radv_amdgpu_snapshot_global_bo_list(struct radv_amdgpu_winsys *ws,
++                                    struct drm_amdgpu_bo_list_entry **rhandles,
++                                    uint32_t *rnum_handles)
+ {
+-   for (uint32_t i = 0; i < ws->global_bo_list.count; i++) {
+-      handles[i].bo_handle = ws->global_bo_list.bos[i]->bo_handle;
+-      handles[i].bo_priority = ws->global_bo_list.bos[i]->priority;
++   struct drm_amdgpu_bo_list_entry *handles = NULL;
++   uint32_t count;
++
++   *rhandles = NULL;
++   *rnum_handles = 0;
++
++   u_rwlock_rdlock(&ws->global_bo_list.lock);
++   count = ws->global_bo_list.count;
++
++   if (count > 0) {
++      size_t alloc_size;
++      if (unlikely(__builtin_mul_overflow((size_t)count, sizeof(*handles), &alloc_size))) {
++         u_rwlock_rdunlock(&ws->global_bo_list.lock);
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++
++      handles = malloc(alloc_size);
++      if (unlikely(!handles)) {
++         u_rwlock_rdunlock(&ws->global_bo_list.lock);
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++
++      for (uint32_t i = 0; i < count; i++) {
++         handles[i].bo_handle = ws->global_bo_list.bos[i]->bo_handle;
++         handles[i].bo_priority = ws->global_bo_list.bos[i]->priority;
++      }
+    }
+ 
+-   return ws->global_bo_list.count;
++   u_rwlock_rdunlock(&ws->global_bo_list.lock);
++
++   *rhandles = handles;
++   *rnum_handles = count;
++   return VK_SUCCESS;
+ }
+ 
+ /* Temporary BO set for fast O(1) dedup during submit list building. */
+@@ -1574,11 +1492,17 @@ radv_bo_set_destroy(struct radv_bo_set *set)
+    set->full = false;
+ }
+ 
+-static bool
++enum radv_bo_set_insert_result {
++   RADV_BO_SET_INSERT_NEW,
++   RADV_BO_SET_INSERT_EXISTS,
++   RADV_BO_SET_INSERT_FULL,
++};
++
++static enum radv_bo_set_insert_result
+ radv_bo_set_insert(struct radv_bo_set *set, uint32_t bo_handle)
+ {
+    if (unlikely(set->full)) {
+-      return false;
++      return RADV_BO_SET_INSERT_FULL;
+    }
+ 
+    const uint32_t mask = set->size - 1u;
+@@ -1593,11 +1517,11 @@ radv_bo_set_insert(struct radv_bo_set *set, uint32_t bo_handle)
+ 
+       if (entry->bo_handle == 0u) {
+          *entry = new_entry;
+-         return true; /* newly inserted */
++         return RADV_BO_SET_INSERT_NEW;
+       }
+ 
+       if (entry->bo_handle == bo_handle) {
+-         return false; /* already present */
++         return RADV_BO_SET_INSERT_EXISTS;
+       }
+ 
+       uint32_t entry_hash = radv_hash_bo(entry->bo_handle);
+@@ -1615,11 +1539,26 @@ radv_bo_set_insert(struct radv_bo_set *set, uint32_t bo_handle)
+       dist++;
+       if (unlikely(dist >= set->size)) {
+          set->full = true;
+-         return false;
++         return RADV_BO_SET_INSERT_FULL;
+       }
+    }
+ }
+ 
++static inline void
++radv_append_bo_dedup(struct drm_amdgpu_bo_list_entry *handles,
++                     unsigned *p_num_handles,
++                     struct radv_bo_set *present,
++                     const struct drm_amdgpu_bo_list_entry *entry)
++{
++   enum radv_bo_set_insert_result insert = radv_bo_set_insert(present, entry->bo_handle);
++
++   if (insert == RADV_BO_SET_INSERT_NEW ||
++       (unlikely(insert == RADV_BO_SET_INSERT_FULL) &&
++        radv_linear_search_bo(handles, *p_num_handles, entry->bo_handle) < 0)) {
++      handles[(*p_num_handles)++] = *entry;
++   }
++}
++
+ static inline void
+ radv_append_cs_bos_dedup(struct radv_amdgpu_cs *cs,
+                          struct drm_amdgpu_bo_list_entry *handles,
+@@ -1627,11 +1566,7 @@ radv_append_cs_bos_dedup(struct radv_amdgpu_cs *cs,
+                          struct radv_bo_set *present)
+ {
+    for (unsigned j = 0; j < cs->num_buffers; ++j) {
+-      uint32_t h = cs->handles[j].bo_handle;
+-      if (radv_bo_set_insert(present, h)) {
+-         unsigned idx = (*p_num_handles)++;
+-         handles[idx] = cs->handles[j];
+-      }
++      radv_append_bo_dedup(handles, p_num_handles, present, &cs->handles[j]);
+    }
+ }
+ 
+@@ -1643,79 +1578,78 @@ radv_amdgpu_get_bo_list(struct radv_amdgpu_winsys *ws, struct ac_cmdbuf **cs_arr
+                         struct drm_amdgpu_bo_list_entry **rhandles)
+ {
+    struct drm_amdgpu_bo_list_entry *handles = NULL;
++   struct drm_amdgpu_bo_list_entry *global_handles = NULL;
+    unsigned num_handles = 0;
+-
+    uint32_t global_bo_count = 0;
+-   struct radv_amdgpu_winsys_bo **global_bos_snapshot = NULL;
++   VkResult result;
+ 
+-   u_rwlock_rdlock(&ws->global_bo_list.lock);
+-   global_bo_count = ws->global_bo_list.count;
+-   if (global_bo_count > 0) {
+-      global_bos_snapshot = malloc(sizeof(struct radv_amdgpu_winsys_bo *) * global_bo_count);
+-      if (unlikely(!global_bos_snapshot)) {
+-         u_rwlock_rdunlock(&ws->global_bo_list.lock);
+-         return VK_ERROR_OUT_OF_HOST_MEMORY;
+-      }
+-      /* BO pointers are stable (refcounted); safe to copy. */
+-      memcpy(global_bos_snapshot, ws->global_bo_list.bos, sizeof(void *) * global_bo_count);
+-   }
+-   u_rwlock_rdunlock(&ws->global_bo_list.lock);
++   *rhandles = NULL;
++   *rnum_handles = 0;
+ 
+-   if (ws->debug_all_bos) {
+-      handles = malloc(sizeof(handles[0]) * global_bo_count);
+-      if (unlikely(!handles)) {
+-         free(global_bos_snapshot);
+-         return VK_ERROR_OUT_OF_HOST_MEMORY;
+-      }
++   result = radv_amdgpu_snapshot_global_bo_list(ws, &global_handles, &global_bo_count);
++   if (result != VK_SUCCESS)
++      return result;
+ 
+-      for (uint32_t i = 0; i < global_bo_count; i++) {
+-         handles[i].bo_handle = global_bos_snapshot[i]->bo_handle;
+-         handles[i].bo_priority = global_bos_snapshot[i]->priority;
+-      }
+-      num_handles = global_bo_count;
+-      free(global_bos_snapshot);
++   if (ws->debug_all_bos) {
++      *rhandles = global_handles;
++      *rnum_handles = global_bo_count;
++      return VK_SUCCESS;
+    } else if (count == 1 && !num_initial_preambles && !num_continue_preambles && !num_postambles &&
+               !radv_amdgpu_cs(cs_array[0])->chained_to && global_bo_count == 0) {
+       /* Fast path: single CS, no global BOs. */
+       struct radv_amdgpu_cs *cs = radv_amdgpu_cs(cs_array[0]);
+-      free(global_bos_snapshot);
+       if (cs->num_buffers == 0) {
+          return VK_SUCCESS;
+       }
+ 
+-      handles = malloc(sizeof(handles[0]) * cs->num_buffers);
++      size_t handles_size;
++      if (unlikely(__builtin_mul_overflow((size_t)cs->num_buffers, sizeof(handles[0]), &handles_size))) {
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++
++      handles = malloc(handles_size);
+       if (unlikely(!handles)) {
+          return VK_ERROR_OUT_OF_HOST_MEMORY;
+       }
+ 
+-      memcpy(handles, cs->handles, sizeof(handles[0]) * cs->num_buffers);
++      memcpy(handles, cs->handles, handles_size);
+       num_handles = cs->num_buffers;
+    } else {
+-      unsigned total_buffer_count = global_bo_count;
+-      total_buffer_count += radv_amdgpu_count_cs_array_bo(cs_array, count);
+-      total_buffer_count += radv_amdgpu_count_cs_array_bo(initial_preamble_array, num_initial_preambles);
+-      total_buffer_count += radv_amdgpu_count_cs_array_bo(continue_preamble_array, num_continue_preambles);
+-      total_buffer_count += radv_amdgpu_count_cs_array_bo(postamble_array, num_postambles);
++      uint64_t total_buffer_count64 = global_bo_count;
++      total_buffer_count64 += radv_amdgpu_count_cs_array_bo(cs_array, count);
++      total_buffer_count64 += radv_amdgpu_count_cs_array_bo(initial_preamble_array, num_initial_preambles);
++      total_buffer_count64 += radv_amdgpu_count_cs_array_bo(continue_preamble_array, num_continue_preambles);
++      total_buffer_count64 += radv_amdgpu_count_cs_array_bo(postamble_array, num_postambles);
++
++      if (unlikely(total_buffer_count64 > UINT_MAX)) {
++         free(global_handles);
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
+ 
++      const unsigned total_buffer_count = (unsigned)total_buffer_count64;
+       if (total_buffer_count == 0) {
+-         free(global_bos_snapshot);
++         free(global_handles);
+          return VK_SUCCESS;
+       }
+ 
+-      handles = malloc(sizeof(handles[0]) * total_buffer_count);
++      size_t handles_size;
++      if (unlikely(__builtin_mul_overflow((size_t)total_buffer_count, sizeof(handles[0]), &handles_size))) {
++         free(global_handles);
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++
++      handles = malloc(handles_size);
+       if (unlikely(!handles)) {
+-         free(global_bos_snapshot);
++         free(global_handles);
+          return VK_ERROR_OUT_OF_HOST_MEMORY;
+       }
+ 
+       if (total_buffer_count <= RADV_SMALL_BO_DEDUP_THRESHOLD) {
+-         /* Copy global BOs from snapshot. */
+-         for (uint32_t i = 0; i < global_bo_count; i++) {
+-            handles[num_handles].bo_handle = global_bos_snapshot[i]->bo_handle;
+-            handles[num_handles].bo_priority = global_bos_snapshot[i]->priority;
+-            ++num_handles;
++         if (global_bo_count > 0) {
++            memcpy(handles, global_handles, sizeof(handles[0]) * global_bo_count);
++            num_handles = global_bo_count;
+          }
+-         free(global_bos_snapshot);
++         free(global_handles);
+ 
+          num_handles = radv_amdgpu_add_cs_array_to_bo_list(cs_array, count, handles, num_handles);
+          num_handles =
+@@ -1724,26 +1658,19 @@ radv_amdgpu_get_bo_list(struct radv_amdgpu_winsys *ws, struct ac_cmdbuf **cs_arr
+             radv_amdgpu_add_cs_array_to_bo_list(continue_preamble_array, num_continue_preambles, handles, num_handles);
+          num_handles = radv_amdgpu_add_cs_array_to_bo_list(postamble_array, num_postambles, handles, num_handles);
+       } else {
+-         /* Large lists: use hash set for O(N) dedup. */
++         /* Large lists: use hash set for O(N) dedup, with scalar fallback if the set saturates. */
+          struct radv_bo_set present;
+          if (unlikely(!radv_bo_set_init(&present, total_buffer_count))) {
+             free(handles);
+-            free(global_bos_snapshot);
++            free(global_handles);
+             return VK_ERROR_OUT_OF_HOST_MEMORY;
+          }
+ 
+-         /* Insert global BOs from snapshot. */
+          for (uint32_t i = 0; i < global_bo_count; i++) {
+-            uint32_t h = global_bos_snapshot[i]->bo_handle;
+-            if (radv_bo_set_insert(&present, h)) {
+-               handles[num_handles].bo_handle = h;
+-               handles[num_handles].bo_priority = global_bos_snapshot[i]->priority;
+-               ++num_handles;
+-            }
++            radv_append_bo_dedup(handles, &num_handles, &present, &global_handles[i]);
+          }
+-         free(global_bos_snapshot);
++         free(global_handles);
+ 
+-         /* Process preambles and CS arrays. */
+          for (unsigned i = 0; i < num_initial_preambles; ++i) {
+             for (struct radv_amdgpu_cs *cs = radv_amdgpu_cs(initial_preamble_array[i]); cs; cs = cs->chained_to) {
+                radv_append_cs_bos_dedup(cs, handles, &num_handles, &present);
+diff --git a/src/gallium/winsys/amdgpu/drm/amdgpu_cs.cpp b/src/gallium/winsys/amdgpu/drm/amdgpu_cs.cpp
+index 1d6619d..706529f 100644
+--- a/src/gallium/winsys/amdgpu/drm/amdgpu_cs.cpp
++++ b/src/gallium/winsys/amdgpu/drm/amdgpu_cs.cpp
+@@ -1641,6 +1641,10 @@ static int amdgpu_cs_submit_ib_userq(struct amdgpu_userq *userq,
+ 
+    /* Syncobj dependencies. */
+    unsigned num_syncobj_dependencies = csc->syncobj_dependencies.num;
++   if (num_syncobj_dependencies > UINT16_MAX || num_shared_buf_write > UINT16_MAX ||
++       num_shared_buf_read > UINT16_MAX || csc->syncobj_to_signal.num + 1u > UINT16_MAX)
++      return -EINVAL;
++
+    uint32_t *syncobj_dependencies_list = NULL;
+    if (num_syncobj_dependencies) {
+       syncobj_dependencies_list = (uint32_t*)alloca(num_syncobj_dependencies * sizeof(uint32_t));
+@@ -1680,11 +1684,11 @@ static int amdgpu_cs_submit_ib_userq(struct amdgpu_userq *userq,
+       .bo_read_handles = num_shared_buf_write ? (uintptr_t)shared_buf_kms_handles_write : 0,
+       /* Wait for previous writes to complete before reading from these BOs. */
+       .bo_write_handles = num_shared_buf_read ? (uintptr_t)shared_buf_kms_handles_read : 0,
+-      .num_syncobj_timeline_handles = num_syncobj_timeline_dependencies,
+-      .num_fences = num_wait_fences,
+-      .num_syncobj_handles = num_syncobj_dependencies,
+-      .num_bo_read_handles = num_shared_buf_write,
+-      .num_bo_write_handles = num_shared_buf_read,
++      .num_syncobj_timeline_handles = (__u16)num_syncobj_timeline_dependencies,
++      .num_fences = (__u16)num_wait_fences,
++      .num_syncobj_handles = (__u16)num_syncobj_dependencies,
++      .num_bo_read_handles = (__u16)num_shared_buf_write,
++      .num_bo_write_handles = (__u16)num_shared_buf_read,
+       .out_fences = (uintptr_t)fence_info,
+    };
+ 
+@@ -1716,11 +1720,11 @@ static int amdgpu_cs_submit_ib_userq(struct amdgpu_userq *userq,
+    struct drm_amdgpu_userq_signal userq_signal_data = {
+       .queue_id = userq->userq_handle,
+       .syncobj_handles = (uintptr_t)syncobj_signal_list,
+-      .num_syncobj_handles = num_syncobj_to_signal,
++      .num_syncobj_handles = (__u16)num_syncobj_to_signal,
+       .bo_read_handles = (uintptr_t)shared_buf_kms_handles_read,
+       .bo_write_handles = (uintptr_t)shared_buf_kms_handles_write,
+-      .num_bo_read_handles = num_shared_buf_read,
+-      .num_bo_write_handles = num_shared_buf_write,
++      .num_bo_read_handles = (__u16)num_shared_buf_read,
++      .num_bo_write_handles = (__u16)num_shared_buf_write,
+    };
+ 
+ #if DETECT_CC_GCC && (DETECT_ARCH_X86 || DETECT_ARCH_X86_64)
+diff --git a/src/util/compress.c b/src/util/compress.c
+index cb13e51..1f4b429 100644
+--- a/src/util/compress.c
++++ b/src/util/compress.c
+@@ -21,23 +21,9 @@
+  * IN THE SOFTWARE.
+  */
+ 
+-/* Required headers for types and threading */
+-#include <assert.h>
+-#include <limits.h>
+-#include <stdbool.h>
+-#include <stddef.h>
+-#include <stdint.h>
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <string.h>
+-#include <pthread.h>
+-#include <sched.h>
+-#include <unistd.h>
+-#include <cpuid.h>
++#ifdef HAVE_COMPRESSION
+ 
+-#include "util/compress.h"
+-#include "util/perf/cpu_trace.h"
+-#include "util/macros.h"
++#include <assert.h>
+ 
+ /* Ensure that zlib uses 'const' in 'z_const' declarations. */
+ #ifndef ZLIB_CONST
+@@ -45,408 +31,139 @@
+ #endif
+ 
+ #ifdef HAVE_ZLIB
+-#include <zlib.h>
++#include "zlib.h"
+ #endif
+ 
+ #ifdef HAVE_ZSTD
+-#include <zstd.h>
+-
+-/* --- Hardware Tuning Constants --- */
+-/*
+- * 512KB chunks fit perfectly in Raptor Lake L2 cache (2MB/P-core).
+- * This size balances compression ratio with parallel granularity.
+- */
+-#define COMPRESS_CHUNK_SIZE (512 * 1024)
+-
+-/*
+- * ZSTD Parameters optimized for i7-14700KF (AVX2/BMI2 support).
+- * These match the user's requested "Godlike" config.
+- */
+-#define ZSTD_SMALL_LEVEL (-3)
+-#define ZSTD_FAST_LEVEL (-10)
+-#define SMALL_DATA_COMPRESS_THRESHOLD 131072
+-#define AVX2_HASH_LOG 18
+-#define AVX2_SEARCH_LOG 2
+-#define MT_JOB_SIZE 524288
+-#define MAX_STACK_JOBS 64
+-
++#include "zstd.h"
+ #endif
+ 
+-/* --- P-Core Affinity Management --- */
+-
+-static cpu_set_t p_core_mask;
+-static pthread_once_t p_core_mask_once = PTHREAD_ONCE_INIT;
+-
+-/* Dynamic P-core detection for Intel Hybrid Architectures */
+-static void init_p_core_mask(void) {
+-   CPU_ZERO(&p_core_mask);
+-
+-   /* User override via env */
+-   const char* env = getenv("MESA_P_CORE_COUNT");
+-   int p_core_count = env ? atoi(env) : 0;
+-   long max_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+-
+-   if (p_core_count > 0) {
+-      for (int i = 0; i < p_core_count && i < max_cpus && i < CPU_SETSIZE; ++i) {
+-         CPU_SET(i, &p_core_mask);
+-      }
+-      return;
+-   }
+-
+-   /* CPUID Leaf 0x1A detection (Alder Lake+) */
+-   unsigned int eax, ebx, ecx, edx;
+-   int detected = 0;
+-   for (int i = 0; i < max_cpus && i < CPU_SETSIZE; ++i) {
+-      /* Check if CPUID works on this cpu (simplistic approach: assume symmetric topology usually) */
+-      /* Ideally we would pin to thread I and run cpuid, but simply iterating logical IDs often maps
+-       * to APIC IDs on Linux. We'll rely on the assumption that lower indices are P-cores on desktop.
+-       * A safer fallback is needed if 0x1A fails.
+-       */
+-       /* Note: standard glibc sched_getcpu() + cpuid is complex.
+-        * We will assume the OS prioritizes P-cores for the first N threads on desktop Linux.
+-        * Fallback: mask all if detection is ambiguous.
+-        */
+-      if (__get_cpuid_count(0x1A, 0, &eax, &ebx, &ecx, &edx)) {
+-         /* This detects the core type of the *current* thread.
+-          * Iterating 'i' here doesn't switch CPUs.
+-          * To correctly map, we trust the scheduler or default to all.
+-          * IMPROVEMENT: Default to all cores if detection is too complex for utility lib.
+-          * The user provided code assumed a loop check which isn't valid without pinning.
+-          * We will stick to a simpler heuristic: Enable all, let OS schedule,
+-          * OR use the user's environment variable override.
+-          */
+-         CPU_SET(i, &p_core_mask); /* Default to enabling all in mask if logic is fuzzy */
+-      } else {
+-         CPU_SET(i, &p_core_mask);
+-      }
+-   }
+-}
+-
+-static const cpu_set_t* get_p_core_mask(void) {
+-   pthread_once(&p_core_mask_once, init_p_core_mask);
+-   return &p_core_mask;
+-}
+-
+-/*
+- * Safe Affinity Guard:
+- * Saves the current thread's affinity, applies the P-core mask,
+- * and restores the original affinity upon destruction (via cleanup function).
+- */
+-typedef struct {
+-   cpu_set_t original_mask;
+-   bool active;
+-} AffinityGuard;
+-
+-static void restore_affinity(AffinityGuard *guard) {
+-   if (guard->active) {
+-      sched_setaffinity(0, sizeof(cpu_set_t), &guard->original_mask);
+-   }
+-}
+-
+-static void apply_p_core_affinity(AffinityGuard *guard) {
+-   guard->active = false;
+-   if (pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &guard->original_mask) == 0) {
+-      if (sched_setaffinity(0, sizeof(cpu_set_t), get_p_core_mask()) == 0) {
+-         guard->active = true;
+-      }
+-   }
+-}
++#include "util/compress.h"
++#include "util/perf/cpu_trace.h"
++#include "macros.h"
+ 
+-/* --- Implementation --- */
++/* 3 is the recomended level, with 22 as the absolute maximum */
++#define ZSTD_COMPRESSION_LEVEL 3
+ 
+ size_t
+ util_compress_max_compressed_len(size_t in_data_size)
+ {
+ #ifdef HAVE_ZSTD
++   /* from the zstd docs (https://facebook.github.io/zstd/zstd_manual.html):
++    * compression runs faster if `dstCapacity` >= `ZSTD_compressBound(srcSize)`.
++    */
+    return ZSTD_compressBound(in_data_size);
+ #elif defined(HAVE_ZLIB)
+-   size_t num_blocks = (in_data_size + 16383) / 16384;
++   /* From https://zlib.net/zlib_tech.html:
++    *
++    *    "In the worst possible case, where the other block types would expand
++    *    the data, deflation falls back to stored (uncompressed) blocks. Thus
++    *    for the default settings used by deflateInit(), compress(), and
++    *    compress2(), the only expansion is an overhead of five bytes per 16 KB
++    *    block (about 0.03%), plus a one-time overhead of six bytes for the
++    *    entire stream."
++    */
++   size_t num_blocks = (in_data_size + 16383) / 16384; /* round up blocks */
+    return in_data_size + 6 + (num_blocks * 5);
+ #else
+-   return 0;
++   STATIC_ASSERT(false);
+ #endif
+ }
+ 
++/* Compress data and return the size of the compressed data */
+ size_t
+ util_compress_deflate(const uint8_t *in_data, size_t in_data_size,
+                       uint8_t *out_data, size_t out_buff_size)
+ {
+    MESA_TRACE_FUNC();
+-
+ #ifdef HAVE_ZSTD
+-   /*
+-    * Optimization: Use P-cores for latency-sensitive compression.
+-    */
+-   AffinityGuard affinity_guard;
+-   apply_p_core_affinity(&affinity_guard);
+-
+-   _Thread_local static ZSTD_CCtx *cctx = NULL;
+-   if (unlikely(!cctx)) {
+-      cctx = ZSTD_createCCtx();
+-      if (!cctx) {
+-         restore_affinity(&affinity_guard);
+-         return 0;
+-      }
+-      ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1);
+-   }
+-
+-   ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only);
+-
+-   /* Apply requested "Godlike" tuning parameters */
+-   int level = (in_data_size < SMALL_DATA_COMPRESS_THRESHOLD) ? ZSTD_SMALL_LEVEL : ZSTD_FAST_LEVEL;
+-   ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, level);
+-
+-   /* Tuning for AVX2/BMI2 capable CPUs */
+-   ZSTD_CCtx_setParameter(cctx, ZSTD_c_hashLog, AVX2_HASH_LOG);
+-   ZSTD_CCtx_setParameter(cctx, ZSTD_c_searchLog, AVX2_SEARCH_LOG);
+-
+-   if (in_data_size >= SMALL_DATA_COMPRESS_THRESHOLD) {
+-      ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, 23);
+-      ZSTD_CCtx_setParameter(cctx, ZSTD_c_chainLog, 22);
+-      ZSTD_CCtx_setParameter(cctx, ZSTD_c_overlapLog, 6);
+-
+-      if (in_data_size >= 1048576) {
+-         ZSTD_CCtx_setParameter(cctx, ZSTD_c_enableLongDistanceMatching, 1);
+-         ZSTD_CCtx_setParameter(cctx, ZSTD_c_ldmHashLog, 20);
+-         /* Strategy: btultra2 for large data */
+-         ZSTD_CCtx_setParameter(cctx, ZSTD_c_strategy, ZSTD_btultra2);
+-      } else {
+-         ZSTD_CCtx_setParameter(cctx, ZSTD_c_strategy, ZSTD_fast);
+-      }
+-   }
+-
+-   /*
+-    * Chunking Loop:
+-    * Produce independent frames to enable parallel decompression.
+-    */
+-   size_t total_out = 0;
+-   size_t offset = 0;
+-
+-   /* Fast path for single chunk */
+-   if (in_data_size <= COMPRESS_CHUNK_SIZE) {
+-      size_t ret = ZSTD_compressCCtx(cctx, out_data, out_buff_size, in_data, in_data_size, level);
+-      restore_affinity(&affinity_guard);
+-      return ZSTD_isError(ret) ? 0 : ret;
+-   }
+-
+-   while (offset < in_data_size) {
+-      size_t chunk_len = in_data_size - offset;
+-      if (chunk_len > COMPRESS_CHUNK_SIZE)
+-         chunk_len = COMPRESS_CHUNK_SIZE;
+-
+-      if (total_out >= out_buff_size) {
+-         restore_affinity(&affinity_guard);
+-         return 0;
+-      }
+-
+-      size_t ret = ZSTD_compressCCtx(cctx,
+-                                     out_data + total_out,
+-                                     out_buff_size - total_out,
+-                                     in_data + offset,
+-                                     chunk_len,
+-                                     level);
+-
+-      if (ZSTD_isError(ret)) {
+-         restore_affinity(&affinity_guard);
+-         return 0;
+-      }
+-
+-      total_out += ret;
+-      offset += chunk_len;
+-   }
+-
+-   restore_affinity(&affinity_guard);
+-   return total_out;
++   size_t ret = ZSTD_compress(out_data, out_buff_size, in_data, in_data_size,
++                              ZSTD_COMPRESSION_LEVEL);
++   if (ZSTD_isError(ret))
++      return 0;
+ 
++   return ret;
+ #elif defined(HAVE_ZLIB)
+-   z_stream strm = {0};
++   size_t compressed_size = 0;
++
++   /* allocate deflate state */
++   z_stream strm;
+    strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    strm.opaque = Z_NULL;
+-   strm.next_in = (z_const Bytef *)in_data;
++   strm.next_in = in_data;
+    strm.next_out = out_data;
+    strm.avail_in = in_data_size;
+    strm.avail_out = out_buff_size;
+ 
+-   if (deflateInit2(&strm, Z_BEST_SPEED, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+-      return 0;
+-
+-   int ret = deflate(&strm, Z_FINISH);
+-   size_t compressed_size = strm.total_out;
+-   deflateEnd(&strm);
+-
+-   return (ret == Z_STREAM_END) ? compressed_size : 0;
+-#else
+-   return 0;
+-#endif
+-}
+-
+-#ifdef HAVE_ZSTD
+-
+-struct zstd_job_data {
+-   const uint8_t *src;
+-   size_t src_len;
+-   uint8_t *dst;
+-   size_t dst_len;
+-   int result;
+-};
++   int ret = deflateInit(&strm, Z_BEST_COMPRESSION);
++   if (ret != Z_OK) {
++       (void) deflateEnd(&strm);
++       return 0;
++   }
+ 
+-static void *
+-thread_inflate_zero_copy(void *arg)
+-{
+-   struct zstd_job_data *job = (struct zstd_job_data *)arg;
++   /* compress until end of in_data */
++   ret = deflate(&strm, Z_FINISH);
+ 
+-   /* Worker threads inherit affinity, but we ensure it matches our P-core preference */
+-   /* Note: sched_setaffinity call removed here as it is inherited from the spawner
+-    * which is already guarded, reducing syscall overhead.
+-    */
+-
+-   ZSTD_DCtx *dctx = ZSTD_createDCtx();
+-   if (unlikely(!dctx)) {
+-      job->result = -1;
+-      return NULL;
++   /* stream should be complete */
++   assert(ret == Z_STREAM_END);
++   if (ret == Z_STREAM_END) {
++       compressed_size = strm.total_out;
+    }
+ 
+-   size_t ret = ZSTD_decompressDCtx(dctx, job->dst, job->dst_len, job->src, job->src_len);
+-   ZSTD_freeDCtx(dctx);
+-
+-   job->result = (ZSTD_isError(ret) || ret != job->dst_len) ? -1 : 0;
+-   return NULL;
++   /* clean up and return */
++   (void) deflateEnd(&strm);
++   return compressed_size;
++#else
++   STATIC_ASSERT(false);
++# endif
+ }
+ 
+-#endif
+-
++/**
++ * Decompresses data, returns true if successful.
++ */
+ bool
+ util_compress_inflate(const uint8_t *in_data, size_t in_data_size,
+                       uint8_t *out_data, size_t out_data_size)
+ {
+    MESA_TRACE_FUNC();
+-
+ #ifdef HAVE_ZSTD
+-   /* Use P-cores for faster scan and thread spawning */
+-   AffinityGuard affinity_guard;
+-   apply_p_core_affinity(&affinity_guard);
+-
+-   _Thread_local static ZSTD_DCtx *scan_dctx = NULL;
+-   if (unlikely(!scan_dctx)) {
+-      scan_dctx = ZSTD_createDCtx();
+-      if (!scan_dctx) {
+-         restore_affinity(&affinity_guard);
+-         return false;
+-      }
+-   }
+-
+-   /* Serial Fast Path for small data */
+-   if (in_data_size < COMPRESS_CHUNK_SIZE * 2) {
+-      size_t ret = ZSTD_decompressDCtx(scan_dctx, out_data, out_data_size, in_data, in_data_size);
+-      restore_affinity(&affinity_guard);
+-      return (!ZSTD_isError(ret) && ret == out_data_size);
+-   }
+-
+-   size_t src_offset = 0;
+-   size_t dst_offset = 0;
+-
+-   /*
+-    * Parallel Processing Loop
+-    * Scans for independent frames and dispatches them to P-core workers.
+-    */
+-   while (src_offset < in_data_size) {
+-      struct zstd_job_data jobs[MAX_STACK_JOBS];
+-      pthread_t threads[MAX_STACK_JOBS];
+-      bool threads_active[MAX_STACK_JOBS];
+-      int job_count = 0;
+-
+-      /* Phase 1: Scan Frame Headers */
+-      while (src_offset < in_data_size && job_count < MAX_STACK_JOBS) {
+-         size_t frame_src_len = ZSTD_findFrameCompressedSize(in_data + src_offset, in_data_size - src_offset);
+-         if (ZSTD_isError(frame_src_len)) {
+-            restore_affinity(&affinity_guard);
+-            return false;
+-         }
+-
+-         unsigned long long frame_dst_len = ZSTD_getFrameContentSize(in_data + src_offset, frame_src_len);
+-         if (frame_dst_len == ZSTD_CONTENTSIZE_UNKNOWN || frame_dst_len == ZSTD_CONTENTSIZE_ERROR) {
+-            /* Fallback to serial for unknown size */
+-            size_t ret = ZSTD_decompressDCtx(scan_dctx,
+-                                             out_data + dst_offset,
+-                                             out_data_size - dst_offset,
+-                                             in_data + src_offset,
+-                                             in_data_size - src_offset);
+-            restore_affinity(&affinity_guard);
+-            return (!ZSTD_isError(ret) && ret == (out_data_size - dst_offset));
+-         }
+-
+-         if (dst_offset + frame_dst_len > out_data_size) {
+-            restore_affinity(&affinity_guard);
+-            return false;
+-         }
+-
+-         jobs[job_count].src = in_data + src_offset;
+-         jobs[job_count].src_len = frame_src_len;
+-         jobs[job_count].dst = out_data + dst_offset;
+-         jobs[job_count].dst_len = (size_t)frame_dst_len;
+-         jobs[job_count].result = 0;
+-
+-         src_offset += frame_src_len;
+-         dst_offset += (size_t)frame_dst_len;
+-         job_count++;
+-      }
+-
+-      if (job_count == 0) break;
+-
+-      /* Phase 2: Dispatch Threads */
+-      for (int i = 0; i < job_count - 1; i++) {
+-         if (pthread_create(&threads[i], NULL, thread_inflate_zero_copy, &jobs[i]) == 0) {
+-            threads_active[i] = true;
+-         } else {
+-            /* Fallback: Execute locally on error */
+-            threads_active[i] = false;
+-            thread_inflate_zero_copy(&jobs[i]);
+-         }
+-      }
+-
+-      /* Execute last job locally to save context switch */
+-      thread_inflate_zero_copy(&jobs[job_count - 1]);
+-
+-      /* Phase 3: Join and Validate */
+-      bool batch_success = (jobs[job_count - 1].result == 0);
+-
+-      for (int i = 0; i < job_count - 1; i++) {
+-         if (threads_active[i]) {
+-            pthread_join(threads[i], NULL);
+-         }
+-         if (jobs[i].result != 0) {
+-            batch_success = false;
+-         }
+-      }
+-
+-      if (!batch_success) {
+-         restore_affinity(&affinity_guard);
+-         return false;
+-      }
+-   }
+-
+-   restore_affinity(&affinity_guard);
+-   return (dst_offset == out_data_size);
+-
++   size_t ret = ZSTD_decompress(out_data, out_data_size, in_data, in_data_size);
++   return !ZSTD_isError(ret);
+ #elif defined(HAVE_ZLIB)
+-   z_stream strm = {0};
++   z_stream strm;
++
++   /* allocate inflate state */
+    strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    strm.opaque = Z_NULL;
+-   strm.next_in = (z_const Bytef *)in_data;
++   strm.next_in = in_data;
+    strm.avail_in = in_data_size;
+    strm.next_out = out_data;
+    strm.avail_out = out_data_size;
+ 
+-   if (inflateInit(&strm) != Z_OK)
++   int ret = inflateInit(&strm);
++   if (ret != Z_OK)
+       return false;
+ 
+-   int ret = inflate(&strm, Z_FINISH);
+-   inflateEnd(&strm);
++   ret = inflate(&strm, Z_NO_FLUSH);
++   assert(ret != Z_STREAM_ERROR);  /* state not clobbered */
+ 
+-   return (ret == Z_STREAM_END && strm.avail_out == 0);
++   /* Unless there was an error we should have decompressed everything in one
++    * go as we know the uncompressed file size.
++    */
++   if (ret != Z_STREAM_END) {
++      (void)inflateEnd(&strm);
++      return false;
++   }
++   assert(strm.avail_out == 0);
++
++   /* clean up and return */
++   (void)inflateEnd(&strm);
++   return true;
+ #else
+-   return false;
++   STATIC_ASSERT(false);
+ #endif
+ }
++
++#endif
+diff --git a/src/util/disk_cache.c b/src/util/disk_cache.c
+index 6946570..729f4a9 100644
+--- a/src/util/disk_cache.c
++++ b/src/util/disk_cache.c
+@@ -115,6 +115,7 @@ struct tls_out_buf {
+ static pthread_key_t g_tls_in_key;
+ static pthread_key_t g_tls_out_key;
+ static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
++static bool g_tls_keys_ok = false;
+ 
+ static void
+ tls_in_destructor(void *ptr)
+@@ -141,14 +142,25 @@ tls_make_keys(void)
+ {
+    int r1 = pthread_key_create(&g_tls_in_key, tls_in_destructor);
+    int r2 = pthread_key_create(&g_tls_out_key, tls_out_destructor);
+-   (void)r1;
+-   (void)r2;
++
++   if (r1 == 0 && r2 == 0) {
++      g_tls_keys_ok = true;
++      return;
++   }
++
++   if (r1 == 0)
++      pthread_key_delete(g_tls_in_key);
++   if (r2 == 0)
++      pthread_key_delete(g_tls_out_key);
+ }
+ 
+ static struct tls_in_buf *
+ tls_get_in(void)
+ {
+    pthread_once(&g_tls_once, tls_make_keys);
++   if (UNLIKELY(!g_tls_keys_ok))
++      return NULL;
++
+    struct tls_in_buf *b = (struct tls_in_buf *)pthread_getspecific(g_tls_in_key);
+    if (UNLIKELY(!b)) {
+       b = (struct tls_in_buf *)malloc(sizeof(*b));
+@@ -174,6 +186,9 @@ static struct tls_out_buf *
+ tls_get_out(void)
+ {
+    pthread_once(&g_tls_once, tls_make_keys);
++   if (UNLIKELY(!g_tls_keys_ok))
++      return NULL;
++
+    struct tls_out_buf *b = (struct tls_out_buf *)pthread_getspecific(g_tls_out_key);
+    if (UNLIKELY(!b)) {
+       b = (struct tls_out_buf *)malloc(sizeof(*b));
+@@ -797,6 +812,8 @@ create_put_job(struct disk_cache *cache, const cache_key key,
+    if (cache_item_metadata &&
+        cache_item_metadata->type == CACHE_ITEM_TYPE_GLSL &&
+        cache_item_metadata->num_keys > 0) {
++      if (UNLIKELY(!cache_item_metadata->keys))
++         return NULL;
+       nkeys = cache_item_metadata->num_keys;
+       if (nkeys > SIZE_MAX / sizeof(cache_key)) {
+          return NULL;
+@@ -918,13 +935,6 @@ blob_put_compressed(struct disk_cache *cache, const cache_key key,
+       if (new_cap < need) {
+          new_cap = need;
+       }
+-      if (new_cap > 16 * 1024 * 1024) {
+-         new_cap = need;
+-         if (new_cap > 16 * 1024 * 1024) {
+-            return;
+-         }
+-      }
+-
+       uint8_t *newp = (uint8_t *)realloc(tls_out->p, new_cap);
+       if (UNLIKELY(!newp)) {
+          return;
+@@ -960,7 +970,8 @@ blob_get_compressed(struct disk_cache *cache, const cache_key key,
+ {
+    MESA_TRACE_FUNC();
+ 
+-   const signed long max_blob_size = 128 * 1024;
++   /* This is what Android EGL defines as maxValueSize in egl_cache_t. */
++   const signed long max_blob_size = 64 * 1024;
+ 
+    struct tls_in_buf *tls_in = tls_get_in();
+    if (UNLIKELY(!tls_in || tls_in->cap < (size_t)max_blob_size)) {
+@@ -986,9 +997,6 @@ blob_get_compressed(struct disk_cache *cache, const cache_key key,
+    size_t compressed_size = sz_entry - hdr;
+ 
+    size_t uncomp = (size_t)entry->uncompressed_size;
+-   if (UNLIKELY(uncomp == 0 || uncomp > 256 * 1024 * 1024)) {
+-      return NULL;
+-   }
+ 
+    void *data = malloc(uncomp);
+    if (UNLIKELY(!data)) {
+@@ -1057,7 +1065,7 @@ disk_cache_put(struct disk_cache *cache, const cache_key key,
+                const void *data, size_t size,
+                struct cache_item_metadata *cache_item_metadata)
+ {
+-   if (UNLIKELY(!cache || !data || size == 0)) {
++   if (UNLIKELY(!cache || (!data && size != 0))) {
+       return;
+    }
+ 
+@@ -1091,12 +1099,7 @@ disk_cache_put_nocopy(struct disk_cache *cache, const cache_key key,
+                       void *data, size_t size,
+                       struct cache_item_metadata *cache_item_metadata)
+ {
+-   if (UNLIKELY(!cache || !data)) {
+-      free(data);
+-      return;
+-   }
+-
+-   if (UNLIKELY(size == 0)) {
++   if (UNLIKELY(!cache || (!data && size != 0))) {
+       free(data);
+       return;
+    }
+@@ -1140,6 +1143,9 @@ disk_cache_get(struct disk_cache *cache, const cache_key key, size_t *size)
+       *size = 0;
+    }
+ 
++   if (UNLIKELY(!cache))
++      return NULL;
++
+    if (cache->foz_ro_cache) {
+       buf = disk_cache_load_item_foz(cache->foz_ro_cache, key, size);
+    }
+@@ -1190,12 +1196,18 @@ _Static_assert(CACHE_KEY_SIZE == 32,
+ 
+ #if (defined(__x86_64__) || defined(_M_X64))
+ 
++#if defined(__GNUC__) || defined(__clang__)
++#define CACHE_KEY_HAS_RUNTIME_AVX2 1
++#elif defined(__AVX2__)
++#define CACHE_KEY_HAS_RUNTIME_AVX2 1
++#else
++#define CACHE_KEY_HAS_RUNTIME_AVX2 0
++#endif
++
+ /*
+- * AVX2 path: single 256-bit comparison - optimal for 32-byte keys
+- * Per Agner Fog's tables: vpcmpeqb ymm has 1 cycle latency on Haswell+
+- * vpmovmskb ymm has 3 cycle latency on Raptor Lake P-cores
+- * Total: ~4 cycles vs ~10+ for memcmp with function call overhead
++ * AVX2 path: single 256-bit comparison - optimal for 32-byte keys.
+  */
++#if CACHE_KEY_HAS_RUNTIME_AVX2
+ #if defined(__GNUC__) || defined(__clang__)
+ __attribute__((target("avx2")))
+ #endif
+@@ -1210,6 +1222,8 @@ cache_key_equals_avx2(const unsigned char *a, const unsigned char *b)
+    return is_zero != 0;
+ }
+ 
++#endif /* CACHE_KEY_HAS_RUNTIME_AVX2 */
++
+ static inline bool
+ cache_key_equals_sse2(const unsigned char *a, const unsigned char *b)
+ {
+@@ -1246,13 +1260,15 @@ cache_key_equals_fast(const unsigned char *a, const unsigned char *b)
+       __cpuidex(info, 7, 0);
+       has_avx2 = (info[1] & (1 << 5)) != 0;
+ #endif
+-      state = has_avx2 ? 2u : 1u;
++      state = (CACHE_KEY_HAS_RUNTIME_AVX2 && has_avx2) ? 2u : 1u;
+       p_atomic_set(&avx2_support_state, state);
+    }
+ 
++#if CACHE_KEY_HAS_RUNTIME_AVX2
+    if (state == 2) {
+       return cache_key_equals_avx2(a, b);
+    }
++#endif
+    return cache_key_equals_sse2(a, b);
+ }
+ 
+diff --git a/src/util/u_vector.c b/src/util/u_vector.c
+index ea8e8c9..aad63b7 100644
+--- a/src/util/u_vector.c
++++ b/src/util/u_vector.c
+@@ -50,7 +50,13 @@
+ #  endif
+ #endif
+ 
+-#if defined(__GNUC__) || defined(__clang__)
++#if defined(HAVE_POSIX_MEMALIGN) || defined(_ISOC11_SOURCE) || (__STDC_VERSION__ >= 201112L) || defined(_WIN32)
++#  define U_VECTOR_DATA_IS_CACHELINE_ALIGNED 1
++#else
++#  define U_VECTOR_DATA_IS_CACHELINE_ALIGNED 0
++#endif
++
++#if U_VECTOR_DATA_IS_CACHELINE_ALIGNED && (defined(__GNUC__) || defined(__clang__))
+ #  define U_VECTOR_ASSUME_ALIGNED_PTR(p) __builtin_assume_aligned((p), U_VECTOR_CACHE_LINE_SIZE)
+ #else
+ #  define U_VECTOR_ASSUME_ALIGNED_PTR(p) (p)
+@@ -83,7 +89,7 @@ static void u_vector_aligned_free(void *ptr);
+ ATTRIBUTE_COLD static bool u_vector_realloc_buffer(struct u_vector *vector, uint32_t new_size);
+ ATTRIBUTE_COLD static bool u_vector_shrink(struct u_vector *vector);
+ ATTRIBUTE_COLD static bool u_vector_grow(struct u_vector *vector);
+-static ALWAYS_INLINE void u_vector_rebase(struct u_vector *vector);
++static ALWAYS_INLINE bool u_vector_rebase(struct u_vector *vector);
+ 
+ /* -------------------------------  ALLOC HELPERS  ------------------------------ */
+ 
+@@ -105,22 +111,13 @@ u_vector_aligned_alloc(size_t alignment, size_t size)
+    if (posix_memalign(&ptr, alignment, size) != 0)
+       ptr = NULL;
+ #elif defined(_ISOC11_SOURCE) || (__STDC_VERSION__ >= 201112L)
+-   if (size % alignment == 0) {
+-      ptr = aligned_alloc(alignment, size);
+-   } else {
+-      if (posix_memalign(&ptr, alignment, size) != 0)
+-         ptr = NULL;
+-   }
++   size_t aligned_size = (size + alignment - 1) & ~(alignment - 1);
++   ptr = aligned_alloc(alignment, aligned_size);
+ #else
+-   /* Portable fallback */
+-   void *raw = malloc(size + alignment - 1 + sizeof(void *));
+-   if (!raw)
+-      return NULL;
+-
+-   uintptr_t adj  = (uintptr_t)raw + sizeof(void *) + (alignment - 1);
+-   uintptr_t base = adj & ~((uintptr_t)alignment - 1);
+-   ptr            = (void *)base;
+-   *((void **)ptr - 1) = raw;
++   /* Last-resort fallback: keep the pointer free()-compatible.  We deliberately
++    * do not use a hidden over-allocation header here because u_vector_finish()
++    * is an inline public helper and must be able to release the allocation. */
++   ptr = malloc(size);
+ #endif
+ 
+    return ptr;
+@@ -134,10 +131,8 @@ u_vector_aligned_free(void *ptr)
+ 
+ #if defined(_WIN32)
+    _aligned_free(ptr);
+-#elif defined(HAVE_POSIX_MEMALIGN) || defined(_ISOC11_SOURCE) || (__STDC_VERSION__ >= 201112L)
+-   free(ptr);
+ #else
+-   free(*((void **)ptr - 1));
++   free(ptr);
+ #endif
+ }
+ 
+@@ -230,11 +225,13 @@ u_vector_grow(struct u_vector *vector)
+  * Fixes rare counter overflow by moving data to the start of the buffer
+  * and resetting head/tail. Previous implementation was broken (data corruption).
+  */
+-static ALWAYS_INLINE void
++static ALWAYS_INLINE bool
+ u_vector_rebase(struct u_vector *vector)
+ {
+-   /* Re-allocate to same size effectively linearizes the buffer */
+-   (void)u_vector_realloc_buffer(vector, vector->size);
++   /* Re-allocate to same size effectively linearizes the buffer.  This is a
++    * rare overflow-avoidance path; if allocation fails, callers must fail
++    * rather than wrap head/tail and corrupt queue state. */
++   return u_vector_realloc_buffer(vector, vector->size);
+ }
+ 
+ /* -------------------------  PUBLIC INITIALISER  ------------------------------- */
+@@ -247,7 +244,7 @@ u_vector_init(struct u_vector *vector,
+    /* Forward to pow2 init which handles logic */
+    return u_vector_init_pow2(vector,
+                              util_next_power_of_two(initial_element_count),
+-                             element_size);
++                             util_next_power_of_two(element_size));
+ }
+ 
+ int
+@@ -291,49 +288,34 @@ u_vector_init_pow2(struct u_vector *vector,
+ ALWAYS_INLINE void *
+ u_vector_add(struct u_vector *U_VECTOR_RESTRICT vector)
+ {
+-   const uint32_t mask = vector->size - 1;
+-
+    /* OPTIMIZATION: Removed redundant 'head < tail' check.
+     * If underflow occurs, (head - tail) wraps to a huge value,
+     * which fails the size check below and triggers grow/fail safety.
+     */
+-   if (likely((vector->head - vector->tail) < vector->size)) {
+-      const uint32_t offset = vector->head & mask;
+-
+-      /* Rare guard: prevent 32-bit overflow */
+-      if (unlikely(vector->head > UINT32_MAX - vector->element_size)) {
+-         u_vector_rebase(vector);
+-      }
+-
+-      vector->head += vector->element_size;
+-
+-#if U_VECTOR_PREFETCH
+-      /* Disabled for Raptor Lake (Performance Win) */
+-      if ((vector->head - vector->tail) >= SMALL_QUEUE_PREFETCH_DISABLE) {
+-         const uint32_t p_off = (vector->head + U_VECTOR_PREFETCH_DISTANCE) & mask;
+-         __builtin_prefetch((const char *)vector->data + p_off, 1, 3);
+-      }
+-#endif
+-
+-      void *base = vector->data;
+-      base = U_VECTOR_ASSUME_ALIGNED_PTR(base);
+-      return (char *)base + offset;
++   if (unlikely((vector->head - vector->tail) >= vector->size)) {
++      if (unlikely(!u_vector_grow(vector)))
++         return NULL;
+    }
+ 
+-   if (unlikely(!u_vector_grow(vector))) {
+-      return NULL;
+-   }
+-
+-   /* Grow changed size and linearized buffer */
+-   const uint32_t new_mask = vector->size - 1;
+-   const uint32_t offset   = vector->head & new_mask;
+-
++   /* Rare guard: prevent 32-bit head wrap.  Rebase must happen before
++    * computing the write offset because it moves live data to offset zero. */
+    if (unlikely(vector->head > UINT32_MAX - vector->element_size)) {
+-      u_vector_rebase(vector);
++      if (unlikely(!u_vector_rebase(vector)))
++         return NULL;
+    }
+ 
++   const uint32_t mask = vector->size - 1;
++   const uint32_t offset = vector->head & mask;
+    vector->head += vector->element_size;
+ 
++#if U_VECTOR_PREFETCH
++   /* Disabled for Raptor Lake (Performance Win) */
++   if ((vector->head - vector->tail) >= SMALL_QUEUE_PREFETCH_DISABLE) {
++      const uint32_t p_off = (vector->head + U_VECTOR_PREFETCH_DISTANCE) & mask;
++      __builtin_prefetch((const char *)vector->data + p_off, 1, 3);
++   }
++#endif
++
+    void *base = vector->data;
+    base = U_VECTOR_ASSUME_ALIGNED_PTR(base);
+    return (char *)base + offset;
+@@ -342,20 +324,21 @@ u_vector_add(struct u_vector *U_VECTOR_RESTRICT vector)
+ ALWAYS_INLINE void *
+ u_vector_remove(struct u_vector *U_VECTOR_RESTRICT vector)
+ {
+-   const uint32_t mask = vector->size - 1;
+-
+    if (vector->head <= vector->tail) {
+       return NULL;
+    }
+ 
+    assert(vector->head - vector->tail <= vector->size);
+ 
+-   const uint32_t offset = vector->tail & mask;
+-
++   /* Rare guard: prevent 32-bit tail wrap.  Rebase must happen before
++    * computing the read offset because it moves the oldest element to zero. */
+    if (unlikely(vector->tail > UINT32_MAX - vector->element_size)) {
+-      u_vector_rebase(vector);
++      if (unlikely(!u_vector_rebase(vector)))
++         return NULL;
+    }
+ 
++   const uint32_t mask = vector->size - 1;
++   const uint32_t offset = vector->tail & mask;
+    vector->tail += vector->element_size;
+ 
+ #if U_VECTOR_PREFETCH
+diff --git a/src/util/u_vector.h b/src/util/u_vector.h
+index 544b570..9ca62d5 100644
+--- a/src/util/u_vector.h
++++ b/src/util/u_vector.h
+@@ -28,6 +28,9 @@
+ #include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
++#if defined(_WIN32)
++#include <malloc.h>
++#endif
+ 
+ #include "util/macros.h"
+ #include "util/u_math.h"
+@@ -61,7 +64,14 @@ extern "C" {
+  * 1. 'data' at offset 0 eliminates displacement bytes in hot-path loads.
+  * 2. Aligned to 64 bytes to ensure this vector owns its cache line.
+  */
+-struct __attribute__((aligned(U_VECTOR_CACHE_LINE_SIZE))) u_vector {
++#if defined(_MSC_VER)
++__declspec(align(U_VECTOR_CACHE_LINE_SIZE))
++#endif
++struct
++#if defined(__GNUC__) || defined(__clang__)
++__attribute__((aligned(U_VECTOR_CACHE_LINE_SIZE)))
++#endif
++u_vector {
+    void *data;             /* offset 0:  base pointer (hot)           */
+    uint32_t head;          /* offset 8:  producer index (hot)         */
+    uint32_t tail;          /* offset 12: consumer index (hot)         */
+@@ -125,7 +135,11 @@ u_vector_tail(struct u_vector *U_VECTOR_RESTRICT q) /* oldest element */
+ static inline void
+ u_vector_finish(struct u_vector *q)
+ {
++#if defined(_WIN32)
++   _aligned_free(q->data);
++#else
+    free(q->data);
++#endif
+    memset(q, 0, sizeof(*q));
+ }
+ 
+diff --git a/src/vulkan/wsi/wsi_common_wayland.c b/src/vulkan/wsi/wsi_common_wayland.c
+index 9a52179..c4a4b91 100644
+--- a/src/vulkan/wsi/wsi_common_wayland.c
++++ b/src/vulkan/wsi/wsi_common_wayland.c
+@@ -2305,6 +2305,46 @@ wsi_wl_surface_get_capabilities2(VkIcdSurfaceBase *surface,
+    return VK_SUCCESS;
+ }
+ 
++static VkResult
++wsi_wl_surface_get_query_display(struct wsi_wl_surface *wsi_wl_surface,
++                                 struct wsi_device *wsi_device,
++                                 struct wsi_wl_display **display_out)
++{
++   if (wsi_wl_surface->display) {
++      *display_out = wsi_wl_surface->display;
++      return VK_SUCCESS;
++   }
++
++   struct wsi_wayland *wsi =
++      (struct wsi_wayland *)wsi_device->wsi[VK_ICD_WSI_PLATFORM_WAYLAND];
++   struct wsi_wl_display *display =
++      vk_alloc(wsi->alloc, sizeof(*display), 8, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
++   if (!display)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   VkResult result = wsi_wl_display_init(wsi, display, wsi_wl_surface->base.display, true,
++                                         wsi_device->sw, "mesa wl surface query");
++   if (result != VK_SUCCESS) {
++      vk_free(wsi->alloc, display);
++      return result;
++   }
++
++   *display_out = display;
++   return VK_SUCCESS;
++}
++
++static void
++wsi_wl_surface_release_query_display(struct wsi_wl_surface *wsi_wl_surface,
++                                     struct wsi_wl_display *display)
++{
++   if (display == wsi_wl_surface->display)
++      return;
++
++   struct wsi_wayland *wsi = display->wsi_wl;
++   wsi_wl_display_finish(display);
++   vk_free(wsi->alloc, display);
++}
++
+ static VkResult
+ wsi_wl_surface_get_formats(VkIcdSurfaceBase *icd_surface,
+                            struct wsi_device *wsi_device,
+@@ -2343,7 +2383,7 @@ wsi_wl_surface_get_formats(VkIcdSurfaceBase *icd_surface,
+    }
+ 
+    if (release_query)
+-      wsi_wl_surface_release_query_display(wsi_wl_surface);
++      wsi_wl_surface_release_query_display(wsi_wl_surface, display);
+ 
+    return vk_outarray_status(&out);
+ }
+@@ -2391,7 +2431,7 @@ wsi_wl_surface_get_formats2(VkIcdSurfaceBase *icd_surface,
+    }
+ 
+    if (release_query)
+-      wsi_wl_surface_release_query_display(wsi_wl_surface);
++      wsi_wl_surface_release_query_display(wsi_wl_surface, display);
+ 
+    return vk_outarray_status(&out);
+ }
+@@ -2426,7 +2466,7 @@ wsi_wl_surface_get_present_modes(VkIcdSurfaceBase *icd_surface,
+    assert(present_modes_count <= ARRAY_SIZE(present_modes));
+ 
+    if (release_query)
+-      wsi_wl_surface_release_query_display(wsi_wl_surface);
++      wsi_wl_surface_release_query_display(wsi_wl_surface, display);
+ 
+    if (pPresentModes == NULL) {
+       *pPresentModeCount = present_modes_count;
+-- 
+2.47.3
+
