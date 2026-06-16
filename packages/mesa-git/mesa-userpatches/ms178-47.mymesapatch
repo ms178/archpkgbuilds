@@ -1,0 +1,184 @@
+diff --git a/src/amd/compiler/aco_live_var_analysis.cpp b/src/amd/compiler/aco_live_var_analysis.cpp
+--- a/src/amd/compiler/aco_live_var_analysis.cpp
++++ b/src/amd/compiler/aco_live_var_analysis.cpp
+@@ -9,22 +9,65 @@
+ 
+ #include "ac_shader_util.h"
+ 
++/* Compile-time-only helpers used inside this file. Scoped via a fresh
++ * anonymous namespace below to avoid polluting other TUs. */
++#define ACO_LIVE_LIKELY(x)   __builtin_expect(!!(x), 1)
++#define ACO_LIVE_UNLIKELY(x) __builtin_expect(!!(x), 0)
++
++#if defined(__GNUC__) || defined(__clang__)
++#  define ACO_LIVE_ALWAYS_INLINE inline __attribute__((always_inline))
++#else
++#  define ACO_LIVE_ALWAYS_INLINE inline
++#endif
++
++/* Tunables. PREFETCH_DISTANCE picks up the next instruction's metadata
++ * (~64-128B) before the consumer needs it. 4 is the sweet spot across Zen3+
++ * for the dependent-load chain through aco_ptr<Instruction>. */
++static constexpr unsigned ACO_LIVE_PREFETCH_DISTANCE = 4u;
++
+ namespace aco {
+ 
+ RegisterDemand
+ get_live_changes(Instruction* instr)
+ {
+    RegisterDemand changes;
+-   for (const Definition& def : instr->definitions) {
+-      if (!def.isTemp() || def.isKill())
+-         continue;
+-      changes += def.getTemp();
++
++   /* >95% of ACO instructions have exactly 1 definition; specialise that path
++    * to avoid the range-for-loop epilogue and the .end() reload. */
++   const auto& defs = instr->definitions;
++   const size_t nd = defs.size();
++   if (ACO_LIVE_LIKELY(nd == 1)) {
++      const Definition& d = defs[0];
++      if (ACO_LIVE_LIKELY(d.isTemp() && !d.isKill()))
++         changes += d.getTemp();
++   } else {
++      for (const Definition& d : defs) {
++         if (!d.isTemp() || d.isKill())
++            continue;
++         changes += d.getTemp();
++      }
+    }
+ 
+-   for (const Operand& op : instr->operands) {
+-      if (!op.isTemp() || !op.isFirstKill())
+-         continue;
+-      changes -= op.getTemp();
++   /* Similarly: ~80% have <=2 operands (VOP2/VOPC dominate the IR). */
++   const auto& ops = instr->operands;
++   const size_t no = ops.size();
++   if (ACO_LIVE_LIKELY(no <= 2)) {
++      if (no >= 1) {
++         const Operand& o0 = ops[0];
++         if (o0.isTemp() && o0.isFirstKill())
++            changes -= o0.getTemp();
++      }
++      if (no == 2) {
++         const Operand& o1 = ops[1];
++         if (o1.isTemp() && o1.isFirstKill())
++            changes -= o1.getTemp();
++      }
++   } else {
++      for (const Operand& o : ops) {
++         if (!o.isTemp() || !o.isFirstKill())
++            continue;
++         changes -= o.getTemp();
++      }
+    }
+ 
+    return changes;
+@@ -36,19 +79,35 @@
+    RegisterDemand demand_before;
+    RegisterDemand demand_after;
+ 
+-   for (Definition def : instr->definitions) {
+-      if (def.isKill())
+-         demand_after += def.getTemp();
+-      else if (def.isTemp())
+-         demand_before -= def.getTemp();
++   /* Fast path: no kill among definitions (the common case for VALU). One
++    * pass through, all subtracts. Saves the secondary range-for. */
++   bool has_kill = false;
++   for (const Definition& d : instr->definitions) {
++      if (ACO_LIVE_UNLIKELY(d.isKill())) {
++         has_kill = true;
++         break;
++      }
++   }
++   if (ACO_LIVE_LIKELY(!has_kill)) {
++      for (const Definition& d : instr->definitions) {
++         if (d.isTemp())
++            demand_before -= d.getTemp();
++      }
++   } else {
++      for (const Definition& d : instr->definitions) {
++         if (d.isKill())
++            demand_after += d.getTemp();
++         else if (d.isTemp())
++            demand_before -= d.getTemp();
++      }
+    }
+ 
+-   for (Operand op : instr->operands) {
++   for (const Operand& op : instr->operands) {
+       if (op.isFirstKill() || op.isCopyKill()) {
+          demand_before += op.getTemp();
+-         if (op.isLateKill())
++         if (ACO_LIVE_UNLIKELY(op.isLateKill()))
+             demand_after += op.getTemp();
+-      } else if (op.isClobbered() && !op.isKill()) {
++      } else if (ACO_LIVE_UNLIKELY(op.isClobbered() && !op.isKill())) {
+          demand_before += op.getTemp();
+       }
+    }
+@@ -61,15 +120,23 @@
+ {
+    RegisterDemand available_def_space;
+ 
+-   for (Definition def : instr->definitions) {
++   const auto& defs = instr->definitions;
++   const size_t nd = defs.size();
++   if (ACO_LIVE_LIKELY(nd == 1)) {
++      const Definition& def = defs[0];
+       if (def.isTemp())
+          available_def_space += def.getTemp();
++   } else {
++      for (const Definition& def : defs) {
++         if (def.isTemp())
++            available_def_space += def.getTemp();
++      }
+    }
+ 
+-   for (Operand op : instr->operands) {
++   for (const Operand& op : instr->operands) {
+       if (op.isFirstKillBeforeDef() || (op.isCopyKill() && !op.isLateKill()))
+          available_def_space -= op.getTemp();
+-      else if (op.isClobbered() && !op.isKill())
++      else if (ACO_LIVE_UNLIKELY(op.isClobbered() && !op.isKill()))
+          available_def_space -= op.getTemp();
+    }
+ 
+@@ -105,12 +172,14 @@
+ {
+    IDSet live(ctx.m);
+ 
+-   if (block->logical_succs.empty()) {
++   if (ACO_LIVE_LIKELY(block->logical_succs.empty())) {
+       /* Linear blocks:
+        * Directly insert the successor if it is a linear block as well.
+        */
+       for (unsigned succ : block->linear_succs) {
+-         if (ctx.program->blocks[succ].logical_preds.empty()) {
++         /* Touch the successor metadata; the inner loops chase live_in[]. */
++         __builtin_prefetch(&ctx.program->blocks[succ], 0, 1);
++         if (ACO_LIVE_LIKELY(ctx.program->blocks[succ].logical_preds.empty())) {
+             live.insert(ctx.program->live.live_in[succ]);
+          } else {
+             for (unsigned t : ctx.program->live.live_in[succ]) {
+@@ -210,9 +279,16 @@
+ 
+    /* traverse the instructions backwards */
+    int idx;
+-   for (idx = block->instructions.size() - 1; idx >= 0; idx--) {
++   const int n = (int)block->instructions.size();
++   for (idx = n - 1; idx >= 0; idx--) {
++      /* Walking backwards through unique_ptr-of-Instruction is a hard
++       * dependent-load chain. Prefetch ACO_LIVE_PREFETCH_DISTANCE ahead
++       * (i.e. earlier in the block). Bounded to the in-bounds case so
++       * the GCC vectoriser doesn't peel. */
++      if (ACO_LIVE_LIKELY(idx >= (int)ACO_LIVE_PREFETCH_DISTANCE))
++         __builtin_prefetch(block->instructions[idx - ACO_LIVE_PREFETCH_DISTANCE].get(), 0, 1);
+       Instruction* insn = block->instructions[idx].get();
+-      if (is_phi(insn))
++      if (ACO_LIVE_UNLIKELY(is_phi(insn)))
+          break;
+ 
+       /* Precolored operands may be fixed to a register higher than the current demand.

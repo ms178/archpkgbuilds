@@ -1,0 +1,337 @@
+diff --git a/src/amd/common/nir/ac_nir_lower_image_tex.c b/src/amd/common/nir/ac_nir_lower_image_tex.c
+index ace8d15..d18bd89 100644
+--- a/src/amd/common/nir/ac_nir_lower_image_tex.c
++++ b/src/amd/common/nir/ac_nir_lower_image_tex.c
+@@ -25,12 +25,36 @@
+ #include "ac_nir.h"
+ #include "nir_builder.h"
+ 
++static inline bool
++is_supported_buffer_image_load_intrinsic(nir_intrinsic_op op)
++{
++   return op == nir_intrinsic_image_deref_load ||
++          op == nir_intrinsic_image_deref_sparse_load ||
++          op == nir_intrinsic_bindless_image_load ||
++          op == nir_intrinsic_bindless_image_sparse_load ||
++          op == nir_intrinsic_image_heap_load ||
++          op == nir_intrinsic_image_heap_sparse_load;
++}
++
++static inline bool
++is_sparse_buffer_image_load_intrinsic(nir_intrinsic_op op)
++{
++   return op == nir_intrinsic_image_deref_sparse_load ||
++          op == nir_intrinsic_bindless_image_sparse_load ||
++          op == nir_intrinsic_image_heap_sparse_load;
++}
++
+ static void
+ replace_with_formatted_load_buffer_amd(nir_builder *b, nir_def *old_def, nir_deref_instr *deref,
+                                        nir_def *handle, nir_def *heap_offset, nir_def *vindex,
+                                        unsigned access, nir_variable_mode mode,
+                                        unsigned backend_flags, nir_alu_type dest_type)
+ {
++   assert(old_def);
++   assert(vindex);
++   assert(vindex->num_components == 1);
++   assert(deref || handle || heap_offset);
++
+    nir_def *zero = nir_imm_int(b, 0);
+ 
+    nir_def *desc = nir_build_tex(b, nir_texop_descriptor_amd,
+@@ -43,8 +67,6 @@ replace_with_formatted_load_buffer_amd(nir_builder *b, nir_def *old_def, nir_der
+                                  .backend_flags = backend_flags);
+    desc->num_components = 4; /* buffer descriptors have 4 components */
+ 
+-   assert(vindex->num_components == 1);
+-
+    /* Buffers don't support 16-bit vindex. */
+    if (vindex->bit_size == 16)
+       vindex = nir_u2u32(b, vindex);
+@@ -54,14 +76,18 @@ replace_with_formatted_load_buffer_amd(nir_builder *b, nir_def *old_def, nir_der
+     */
+    access |= ACCESS_CAN_SPECULATE;
+ 
+-   bool is_sparse = access & ACCESS_SPARSE;
+-   unsigned dest_comp_mask = nir_def_components_read(old_def);
+-   unsigned sparse_comp_bit = is_sparse ? BITFIELD_BIT(old_def->num_components - 1) : 0;
+-   unsigned data_comp_mask = dest_comp_mask & ~sparse_comp_bit;
+-   bool sparse_used = dest_comp_mask & sparse_comp_bit;
++   const bool is_sparse = (access & ACCESS_SPARSE) != 0;
++   const unsigned dest_comp_mask = nir_def_components_read(old_def);
++   const unsigned sparse_comp_bit = is_sparse ? BITFIELD_BIT(old_def->num_components - 1) : 0;
++   const unsigned data_comp_mask = dest_comp_mask & ~sparse_comp_bit;
++   const bool sparse_used = (dest_comp_mask & sparse_comp_bit) != 0;
++   const unsigned sparse_tail_components = (unsigned)(is_sparse && sparse_used);
++   const unsigned data_out_components = old_def->num_components - (unsigned)is_sparse;
++
+    /* buffer_load_format must return at least 1 component. */
+-   unsigned num_data_components = MAX2(util_last_bit(data_comp_mask), 1);
+-   unsigned num_total_components, bit_size;
++   const unsigned num_data_components = MAX2(util_last_bit(data_comp_mask), 1);
++   unsigned num_total_components;
++   unsigned bit_size;
+ 
+    access |= ACCESS_USES_FORMAT_AMD;
+    if (is_sparse && !sparse_used)
+@@ -79,7 +105,7 @@ replace_with_formatted_load_buffer_amd(nir_builder *b, nir_def *old_def, nir_der
+     * So we need 2 32-bit data components if X is needed, and 4 32-bit data components if W is needed.
+     */
+    if (old_def->bit_size == 64) {
+-      num_total_components = (num_data_components < 4 ? 2 : 4) + (is_sparse && sparse_used);
++      num_total_components = (num_data_components < 4 ? 2 : 4) + sparse_tail_components;
+       bit_size = 32;
+ 
+       assert(dest_type & 64);
+@@ -88,37 +114,39 @@ replace_with_formatted_load_buffer_amd(nir_builder *b, nir_def *old_def, nir_der
+       dest_type |= 32;
+    } else {
+       /* This eliminates unused components between the result data and the sparse flag. */
+-      num_total_components = num_data_components + (is_sparse && sparse_used);
++      num_total_components = num_data_components + sparse_tail_components;
+       bit_size = old_def->bit_size;
+    }
+ 
+-   nir_def *result = nir_load_buffer_amd(b, num_total_components, bit_size, desc, zero, zero,
+-                                         vindex,
++   nir_def *result = nir_load_buffer_amd(b, num_total_components, bit_size, desc, zero, zero, vindex,
+                                          .memory_modes = mode,
+                                          .access = access,
+                                          .dest_type = dest_type);
+ 
+    if (old_def->bit_size == 64) {
+-      nir_def **vec = alloca(sizeof(nir_def*) * old_def->num_components);
++      nir_def *vec[NIR_MAX_VEC_COMPONENTS];
+       nir_def *undef64 = nir_undef(b, 1, 64);
+ 
++      assert(old_def->num_components <= NIR_MAX_VEC_COMPONENTS);
++
+       /* The 64-bit result is: (xy, 0, 0, zw, sparse). */
+-      if (0 < old_def->num_components - is_sparse) {
+-         if (2 <= result->num_components - is_sparse)
++      if (0 < data_out_components) {
++         if (2 <= result->num_components - sparse_tail_components)
+             vec[0] = nir_pack_64_2x32(b, nir_channels(b, result, BITFIELD_MASK(2)));
+          else
+             vec[0] = undef64;
+       }
+-      if (1 < old_def->num_components - is_sparse)
++      if (1 < data_out_components)
+          vec[1] = nir_imm_int64(b, 0);
+-      if (2 < old_def->num_components - is_sparse)
++      if (2 < data_out_components)
+          vec[2] = vec[1];
+-      if (3 < old_def->num_components - is_sparse) {
+-         if (4 <= result->num_components)
++      if (3 < data_out_components) {
++         if (4 <= result->num_components - sparse_tail_components)
+             vec[3] = nir_pack_64_2x32(b, nir_channels(b, result, BITFIELD_RANGE(2, 2)));
+          else
+             vec[3] = undef64;
+       }
++
+       if (is_sparse) {
+          if (sparse_used)
+             vec[old_def->num_components - 1] = nir_u2u64(b, nir_channel(b, result, num_total_components - 1));
+@@ -133,14 +161,16 @@ replace_with_formatted_load_buffer_amd(nir_builder *b, nir_def *old_def, nir_der
+       /* We removed unused components between the last used data component and the sparse flag.
+        * Add the unused components back as undef.
+        */
+-      nir_def **vec = alloca(sizeof(nir_def*) * old_def->num_components);
++      nir_def *vec[NIR_MAX_VEC_COMPONENTS];
+       nir_def *undef = nir_undef(b, 1, old_def->bit_size);
+       unsigned i = 0;
+ 
++      assert(old_def->num_components <= NIR_MAX_VEC_COMPONENTS);
++
+       for (; i < num_data_components; i++)
+          vec[i] = nir_channel(b, result, i);
+ 
+-      for (; i < old_def->num_components - is_sparse; i++)
++      for (; i < data_out_components; i++)
+          vec[i] = undef;
+ 
+       if (is_sparse) {
+@@ -157,108 +187,99 @@ replace_with_formatted_load_buffer_amd(nir_builder *b, nir_def *old_def, nir_der
+ }
+ 
+ static bool
+-lower_tex(nir_builder *b, nir_tex_instr *tex, const ac_nir_lower_image_tex_options *options)
++lower_tex(nir_builder *b, nir_tex_instr *tex)
+ {
++   if (tex->sampler_dim != GLSL_SAMPLER_DIM_BUF || tex->op != nir_texop_txf)
++      return false;
++
+    b->cursor = nir_before_instr(&tex->instr);
+ 
+-   if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF && tex->op == nir_texop_txf) {
+-      nir_deref_instr *deref = NULL;
+-      nir_def *handle = NULL;
+-      nir_def *vindex = NULL;
+-      nir_def *heap_offset = NULL;
+-
+-      for (unsigned i = 0; i < tex->num_srcs; i++) {
+-         switch (tex->src[i].src_type) {
+-         case nir_tex_src_texture_deref:
+-            deref = nir_instr_as_deref(nir_def_instr(tex->src[i].src.ssa));
+-            break;
+-         case nir_tex_src_texture_handle:
+-            handle = tex->src[i].src.ssa;
+-            break;
+-         case nir_tex_src_coord:
+-            vindex = tex->src[i].src.ssa;
+-            break;
+-         case nir_tex_src_offset:
+-         case nir_tex_src_texture_offset:
+-            UNREACHABLE("unexpected tex src for buffer loads");
+-         case nir_tex_src_texture_heap_offset:
+-            heap_offset = tex->src[i].src.ssa;
+-            break;
+-         default:
+-            break;
+-         }
++   nir_deref_instr *deref = NULL;
++   nir_def *handle = NULL;
++   nir_def *vindex = NULL;
++   nir_def *heap_offset = NULL;
++
++   for (unsigned i = 0; i < tex->num_srcs; i++) {
++      switch (tex->src[i].src_type) {
++      case nir_tex_src_texture_deref:
++         deref = nir_instr_as_deref(nir_def_instr(tex->src[i].src.ssa));
++         break;
++      case nir_tex_src_texture_handle:
++         handle = tex->src[i].src.ssa;
++         break;
++      case nir_tex_src_coord:
++         vindex = tex->src[i].src.ssa;
++         break;
++      case nir_tex_src_offset:
++      case nir_tex_src_texture_offset:
++         UNREACHABLE("unexpected tex src for buffer loads");
++      case nir_tex_src_texture_heap_offset:
++         heap_offset = tex->src[i].src.ssa;
++         break;
++      default:
++         break;
+       }
+-
+-      replace_with_formatted_load_buffer_amd(b, &tex->def, deref, handle, heap_offset, vindex,
+-                                             ACCESS_RESTRICT | ACCESS_NON_WRITEABLE |
+-                                             ACCESS_CAN_REORDER |
+-                                             (tex->can_speculate ? ACCESS_CAN_SPECULATE : 0) |
+-                                             (tex->texture_non_uniform ? ACCESS_NON_UNIFORM : 0) |
+-                                             (tex->skip_helpers ? ACCESS_SKIP_HELPERS : 0) |
+-                                             (tex->is_sparse ? ACCESS_SPARSE : 0),
+-                                             nir_var_uniform /* nir_var_texture? */, 0,
+-                                             tex->dest_type);
+-      return true;
+    }
+ 
+-   return false;
++   assert(vindex);
++
++   replace_with_formatted_load_buffer_amd(b, &tex->def, deref, handle, heap_offset, vindex,
++                                          ACCESS_RESTRICT | ACCESS_NON_WRITEABLE |
++                                          ACCESS_CAN_REORDER |
++                                          (tex->can_speculate ? ACCESS_CAN_SPECULATE : 0) |
++                                          (tex->texture_non_uniform ? ACCESS_NON_UNIFORM : 0) |
++                                          (tex->skip_helpers ? ACCESS_SKIP_HELPERS : 0) |
++                                          (tex->is_sparse ? ACCESS_SPARSE : 0),
++                                          nir_var_uniform /* nir_var_texture? */, 0,
++                                          tex->dest_type);
++   return true;
+ }
+ 
+ static bool
+-lower_image(nir_builder *b, nir_intrinsic_instr *intr, const ac_nir_lower_image_tex_options *options)
++lower_image(nir_builder *b, nir_intrinsic_instr *intr)
+ {
+-   /* unexpected intrinsics */
+-   assert(intr->intrinsic != nir_intrinsic_image_load &&
+-          intr->intrinsic != nir_intrinsic_image_sparse_load);
+-
+-   if (nir_intrinsic_has_image_dim(intr) &&
+-       nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF &&
+-       (intr->intrinsic == nir_intrinsic_image_deref_load ||
+-        intr->intrinsic == nir_intrinsic_image_deref_sparse_load ||
+-        intr->intrinsic == nir_intrinsic_bindless_image_load ||
+-        intr->intrinsic == nir_intrinsic_bindless_image_sparse_load ||
+-        intr->intrinsic == nir_intrinsic_image_heap_load ||
+-        intr->intrinsic == nir_intrinsic_image_heap_sparse_load)) {
+-      b->cursor = nir_before_instr(&intr->instr);
+-
+-      nir_deref_instr *deref = NULL;
+-      nir_def *handle = NULL;
+-      nir_def *heap_offset = NULL;
+-
+-      if (intr->intrinsic == nir_intrinsic_image_deref_load ||
+-          intr->intrinsic == nir_intrinsic_image_deref_sparse_load)
+-         deref = nir_instr_as_deref(nir_def_instr(intr->src[0].ssa));
+-      else if (intr->intrinsic == nir_intrinsic_image_heap_load ||
+-               intr->intrinsic == nir_intrinsic_image_heap_sparse_load)
+-         heap_offset = intr->src[0].ssa;
+-      else
+-         handle = intr->src[0].ssa;
+-
+-      bool is_sparse = intr->intrinsic == nir_intrinsic_image_deref_sparse_load ||
+-                       intr->intrinsic == nir_intrinsic_bindless_image_sparse_load ||
+-                       intr->intrinsic == nir_intrinsic_image_heap_sparse_load;
+-      unsigned access = nir_intrinsic_access(intr) | (is_sparse ? ACCESS_SPARSE : 0);
+-      nir_def *vindex = nir_channel(b, intr->src[1].ssa, 0);
+-
+-      replace_with_formatted_load_buffer_amd(b, &intr->def, deref, handle, heap_offset, vindex, access,
+-                                             nir_var_image, AC_NIR_TEX_BACKEND_FLAG_IS_IMAGE,
+-                                             nir_intrinsic_dest_type(intr));
+-      return true;
+-   }
+-
+-   return false;
++   if (!nir_intrinsic_has_image_dim(intr) ||
++       nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_BUF)
++      return false;
++
++   if (!is_supported_buffer_image_load_intrinsic(intr->intrinsic))
++      return false;
++
++   b->cursor = nir_before_instr(&intr->instr);
++
++   nir_deref_instr *deref = NULL;
++   nir_def *handle = NULL;
++   nir_def *heap_offset = NULL;
++
++   if (intr->intrinsic == nir_intrinsic_image_deref_load ||
++       intr->intrinsic == nir_intrinsic_image_deref_sparse_load)
++      deref = nir_instr_as_deref(nir_def_instr(intr->src[0].ssa));
++   else if (intr->intrinsic == nir_intrinsic_image_heap_load ||
++            intr->intrinsic == nir_intrinsic_image_heap_sparse_load)
++      heap_offset = intr->src[0].ssa;
++   else
++      handle = intr->src[0].ssa;
++
++   const bool is_sparse = is_sparse_buffer_image_load_intrinsic(intr->intrinsic);
++   const unsigned access = nir_intrinsic_access(intr) | (is_sparse ? ACCESS_SPARSE : 0);
++   nir_def *vindex = nir_channel(b, intr->src[1].ssa, 0);
++
++   replace_with_formatted_load_buffer_amd(b, &intr->def, deref, handle, heap_offset, vindex, access,
++                                          nir_var_image, AC_NIR_TEX_BACKEND_FLAG_IS_IMAGE,
++                                          nir_intrinsic_dest_type(intr));
++   return true;
+ }
+ 
+ static bool
+ lower_image_tex(nir_builder *b, nir_instr *instr, void *options_)
+ {
+-   const ac_nir_lower_image_tex_options *options = options_;
++   (void)options_;
+ 
+    if (instr->type == nir_instr_type_tex)
+-      return lower_tex(b, nir_instr_as_tex(instr), options);
++      return lower_tex(b, nir_instr_as_tex(instr));
+ 
+    if (instr->type == nir_instr_type_intrinsic)
+-      return lower_image(b, nir_instr_as_intrinsic(instr), options);
++      return lower_image(b, nir_instr_as_intrinsic(instr));
+ 
+    return false;
+ }
