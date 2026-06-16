@@ -1,0 +1,223 @@
+diff --git a/src/amd/compiler/aco_optimizer.cpp b/src/amd/compiler/aco_optimizer.cpp
+index ac2c2f9..d4aee09 100644
+--- a/src/amd/compiler/aco_optimizer.cpp
++++ b/src/amd/compiler/aco_optimizer.cpp
+@@ -4204,6 +4204,194 @@ check_constant(opt_ctx& ctx, alu_opt_info& info, unsigned idx, uint32_t expected
+    return op_info_get_constant(ctx, info.operands[idx], type, &constant) && constant == expected;
+ }
+ 
++static bool
++get_u32_constant(opt_ctx& ctx, const alu_opt_op& op, uint32_t* value)
++{
++   uint64_t constant = 0;
++   aco_type type = {aco_base_type_uint, 1, 32};
++   if (!op_info_get_constant(ctx, op, type, &constant))
++      return false;
++
++   *value = (uint32_t)constant;
++   return true;
++}
++
++static bool
++is_low_mask(uint32_t mask, unsigned* bits)
++{
++   if (!mask || mask == UINT32_MAX)
++      return false;
++
++   unsigned width = util_bitcount(mask);
++   if (width >= 32)
++      return false;
++
++   if (mask != BITFIELD_MASK(width))
++      return false;
++
++   *bits = width;
++   return true;
++}
++
++static bool
++can_fold_plain_vop2_bitwise(const Instruction* instr, aco_opcode opcode)
++{
++   if (!instr || instr->opcode != opcode || instr->operands.size() != 2 ||
++       instr->definitions.empty() || instr->isDPP() || instr->isSDWA())
++      return false;
++
++   if (instr->isVALU() && instr->valu().usesModifiers())
++      return false;
++
++   return true;
++}
++
++/* v_or_b32(v_lshlrev_b32(k, a), v_lshrrev_b32(32-k, b))
++ *    -> v_alignbit_b32(b, a, k)
++ * v_alignbit_b32(src0, src1, s) computes (src1 << s) | (src0 >> (32 - s)).
++ * This is a single VOP3 on Vega and avoids one VALU instruction in funnel-shift idioms.
++ */
++static bool
++fold_lshl_lshr_to_alignbit_cb(opt_ctx& ctx, alu_opt_info& info)
++{
++   if (ctx.program->gfx_level != GFX9 || info.operands.size() != 3 ||
++       !info.operands[0].op.isTemp())
++      return false;
++
++   uint32_t lshl_shift = 0;
++   if (!get_u32_constant(ctx, info.operands[1], &lshl_shift) || lshl_shift == 0 ||
++       lshl_shift >= 32)
++      return false;
++
++   Instruction* lshr = ctx.info[info.operands[0].op.tempId()].parent_instr;
++   if (!can_fold_plain_vop2_bitwise(lshr, aco_opcode::v_lshrrev_b32))
++      return false;
++
++   alu_opt_op lshr_shift = {lshr->operands[0]};
++   uint32_t rshift = 0;
++   if (!get_u32_constant(ctx, lshr_shift, &rshift) || rshift == 0 || rshift >= 32 ||
++       lshl_shift + rshift != 32)
++      return false;
++
++   info.opcode = aco_opcode::v_alignbit_b32;
++   info.operands[0] = {lshr->operands[1]}; /* src0: value shifted right. */
++   info.operands[1] = info.operands[2];    /* src1: value shifted left. */
++   info.operands[2] = {Operand::c32(lshl_shift)};
++   return true;
++}
++
++static bool
++fold_lshr_lshl_to_alignbit_cb(opt_ctx& ctx, alu_opt_info& info)
++{
++   if (ctx.program->gfx_level != GFX9 || info.operands.size() != 3 ||
++       !info.operands[0].op.isTemp())
++      return false;
++
++   uint32_t lshr_shift = 0;
++   if (!get_u32_constant(ctx, info.operands[1], &lshr_shift) || lshr_shift == 0 ||
++       lshr_shift >= 32)
++      return false;
++
++   Instruction* lshl = ctx.info[info.operands[0].op.tempId()].parent_instr;
++   if (!can_fold_plain_vop2_bitwise(lshl, aco_opcode::v_lshlrev_b32))
++      return false;
++
++   alu_opt_op lshl_shift = {lshl->operands[0]};
++   uint32_t lshift = 0;
++   if (!get_u32_constant(ctx, lshl_shift, &lshift) || lshift == 0 || lshift >= 32 ||
++       lshift + lshr_shift != 32)
++      return false;
++
++   info.opcode = aco_opcode::v_alignbit_b32;
++   info.operands[0] = info.operands[2];    /* src0: value shifted right. */
++   info.operands[1] = {lshl->operands[1]}; /* src1: value shifted left. */
++   info.operands[2] = {Operand::c32(lshift)};
++   return true;
++}
++
++/* v_and_b32(v_lshrrev_b32(shift, x), (1 << width) - 1) -> v_bfe_u32(x, shift, width).
++ * LLVM uses the same BFE idiom for GCN.  Restrict to constant, non-trivial extractions so the
++ * transform is a clear Vega code-size and VALU-count win rather than a questionable identity fold.
++ */
++static bool
++fold_lshr_and_to_bfe_u32_cb(opt_ctx& ctx, alu_opt_info& info)
++{
++   if (ctx.program->gfx_level != GFX9 || info.operands.size() != 3)
++      return false;
++
++   uint32_t mask = 0;
++   unsigned width = 0;
++   if (!get_u32_constant(ctx, info.operands[2], &mask) || !is_low_mask(mask, &width))
++      return false;
++
++   uint32_t shift = 0;
++   if (!get_u32_constant(ctx, info.operands[1], &shift) || shift >= 32 || shift + width > 32)
++      return false;
++
++   info.opcode = aco_opcode::v_bfe_u32;
++   info.operands[1] = {Operand::c32(shift)};
++   info.operands[2] = {Operand::c32(width)};
++   return true;
++}
++
++/* v_or_b32(v_and_b32(a, mask), v_and_b32(b, ~mask)) -> v_bfi_b32(mask, a, b).
++ * v_bfi_b32 computes (mask & src1) | (~mask & src2).  Require the non-folded AND to have
++ * a single use so the transformation actually removes an instruction and does not merely trade
++ * an OR for a VOP3 with higher pressure.
++ */
++static bool
++fold_complementary_and_or_to_bfi_cb(opt_ctx& ctx, alu_opt_info& info)
++{
++   if (ctx.program->gfx_level != GFX9 || info.operands.size() != 3 ||
++       !info.operands[0].op.isTemp())
++      return false;
++
++   uint32_t mask = 0;
++   unsigned data_a_idx = 0;
++   if (get_u32_constant(ctx, info.operands[1], &mask)) {
++      data_a_idx = 2;
++   } else if (get_u32_constant(ctx, info.operands[2], &mask)) {
++      data_a_idx = 1;
++   } else {
++      return false;
++   }
++
++   if (mask == 0 || mask == UINT32_MAX)
++      return false;
++
++   const Temp other_tmp = info.operands[0].op.getTemp();
++   if (ctx.uses[other_tmp.id()] != 1)
++      return false;
++
++   Instruction* other_and = ctx.info[other_tmp.id()].parent_instr;
++   if (!can_fold_plain_vop2_bitwise(other_and, aco_opcode::v_and_b32) ||
++       other_and->definitions[0].getTemp() != other_tmp)
++      return false;
++
++   Operand data_b;
++   bool found = false;
++   const uint32_t inv_mask = ~mask;
++   for (unsigned i = 0; i < 2; i++) {
++      alu_opt_op op = {other_and->operands[i]};
++      uint32_t other_mask = 0;
++      if (get_u32_constant(ctx, op, &other_mask) && other_mask == inv_mask) {
++         data_b = other_and->operands[1 - i];
++         found = true;
++         break;
++      }
++   }
++
++   if (!found)
++      return false;
++
++   info.opcode = aco_opcode::v_bfi_b32;
++   const Operand data_a = info.operands[data_a_idx].op;
++   info.operands[0] = {Operand::c32(mask)};
++   info.operands[1] = {data_a}; /* selected where mask bit is 1 */
++   info.operands[2] = {data_b}; /* selected where mask bit is 0 */
++   return true;
++}
++
+ template <unsigned idx, uint32_t expected>
+ bool
+ check_const_cb(opt_ctx& ctx, alu_opt_info& info)
+@@ -4512,6 +4700,14 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+          add_opt(s_lshl_b32, v_lshl_or_b32, 0x3, "120", nullptr, true);
+          add_opt(v_and_b32, v_and_or_b32, 0x3, "120", nullptr, true);
+          add_opt(s_and_b32, v_and_or_b32, 0x3, "120", nullptr, true);
++         if (ctx.program->gfx_level == GFX9) {
++            add_opt(v_lshlrev_b32, v_alignbit_b32, 0x3, "012",
++                    fold_lshl_lshr_to_alignbit_cb, true);
++            add_opt(v_lshrrev_b32, v_alignbit_b32, 0x3, "012",
++                    fold_lshr_lshl_to_alignbit_cb, true);
++            add_opt(v_and_b32, v_bfi_b32, 0x3, "012",
++                    fold_complementary_and_or_to_bfi_cb, true);
++         }
+       }
+    } else if (info.opcode == aco_opcode::v_xor_b32 && ctx.program->gfx_level >= GFX10) {
+       add_opt(v_xor_b32, v_xor3_b32, 0x3, "012", nullptr, true);
+@@ -4627,6 +4823,8 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+       add_opt(s_add_u32, v_add_lshl_u32, 0x2, "120", nullptr, true);
+       add_opt(s_add_i32, v_add_lshl_u32, 0x2, "120", nullptr, true);
+    } else if (info.opcode == aco_opcode::v_and_b32) {
++      if (ctx.program->gfx_level == GFX9)
++         add_opt(v_lshrrev_b32, v_bfe_u32, 0x3, "210", fold_lshr_and_to_bfe_u32_cb, true);
+       add_opt(v_not_b32, v_bfi_b32, 0x3, "10", insert_const_cb<1, 0>, true);
+       add_opt(s_not_b32, v_bfi_b32, 0x3, "10", insert_const_cb<1, 0>, true);
+    } else if (info.opcode == aco_opcode::s_and_b32) {
