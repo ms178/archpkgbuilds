@@ -1,0 +1,495 @@
+From b0220fb1577b029be3ff986dff8af121d316377e Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@example.invalid>
+Date: Wed, 17 Jun 2026 10:45:34 +0000
+Subject: [PATCH] dxvk: apply Intel performance pattern optimizations
+
+---
+ src/dxvk/dxvk_compute.cpp         |   2 +-
+ src/dxvk/dxvk_gpl_async_cache.cpp |  21 ++++-
+ src/dxvk/dxvk_graphics.cpp        |   4 +-
+ src/dxvk/dxvk_pipemanager.cpp     | 138 +++++++++++++++++++++++-------
+ src/dxvk/dxvk_pipemanager.h       |  12 +--
+ src/dxvk/dxvk_queue.cpp           |  40 +++++----
+ src/dxvk/dxvk_shader.cpp          |   4 +-
+ 7 files changed, 160 insertions(+), 61 deletions(-)
+
+diff --git a/src/dxvk/dxvk_compute.cpp b/src/dxvk/dxvk_compute.cpp
+index b08d9fd..00c13ee 100644
+--- a/src/dxvk/dxvk_compute.cpp
++++ b/src/dxvk/dxvk_compute.cpp
+@@ -78,7 +78,7 @@ namespace dxvk {
+     const DxvkComputePipelineStateInfo& state) {
+     VkPipeline newPipelineHandle = this->createPipeline(state);
+ 
+-    m_stats->numComputePipelines += 1;
++    m_stats->numComputePipelines.fetch_add(1u, std::memory_order_relaxed);
+     return m_pipelines.add(state, newPipelineHandle);
+   }
+ 
+diff --git a/src/dxvk/dxvk_gpl_async_cache.cpp b/src/dxvk/dxvk_gpl_async_cache.cpp
+index bb41c90..ee6ff39 100644
+--- a/src/dxvk/dxvk_gpl_async_cache.cpp
++++ b/src/dxvk/dxvk_gpl_async_cache.cpp
+@@ -95,6 +95,7 @@ namespace dxvk {
+       return;
+ 
+     std::vector<WorkerItem> readyPipelines;
++    std::unordered_set<DxvkGplAsyncPipelineKey, KeyHash, KeyEq> readyKeys;
+ 
+     { std::lock_guard<dxvk::mutex> lock(m_entryLock);
+       m_shaderMap.insert_or_assign(shaderKey, shader);
+@@ -102,6 +103,9 @@ namespace dxvk {
+       auto range = m_pipelineMap.equal_range(shaderKey);
+ 
+       for (auto i = range.first; i != range.second; i++) {
++        if (!readyKeys.insert(i->second).second)
++          continue;
++
+         WorkerItem item;
+         item.key = i->second;
+ 
+@@ -130,7 +134,7 @@ namespace dxvk {
+     }
+ 
+     if (queued)
+-      m_workerCond.notify_all();
++      m_workerCond.notify_one();
+   }
+ 
+ 
+@@ -261,6 +265,21 @@ namespace dxvk {
+       return false;
+     }
+ 
++    const std::streamoff dataBegin = std::streamoff(file.tellg());
++    file.seekg(0, std::ios_base::end);
++    const std::streamoff dataEnd = std::streamoff(file.tellg());
++    file.seekg(dataBegin, std::ios_base::beg);
++
++    if (dataBegin >= 0 && dataEnd > dataBegin) {
++      constexpr std::streamoff RecordSize = std::streamoff(
++        sizeof(DxvkGplAsyncCacheRecordHeader) + sizeof(DxvkGplAsyncCacheEntry));
++      const size_t estimatedEntries = size_t((dataEnd - dataBegin) / RecordSize);
++
++      m_entries.reserve(m_entries.size() + estimatedEntries);
++      m_entryMap.reserve(m_entryMap.size() + estimatedEntries);
++      m_pipelineMap.reserve(m_pipelineMap.size() + 5u * estimatedEntries);
++    }
++
+     uint32_t invalidEntries = 0u;
+ 
+     while (file) {
+diff --git a/src/dxvk/dxvk_graphics.cpp b/src/dxvk/dxvk_graphics.cpp
+index 62a13a2..6468928 100644
+--- a/src/dxvk/dxvk_graphics.cpp
++++ b/src/dxvk/dxvk_graphics.cpp
+@@ -1120,7 +1120,7 @@ namespace dxvk {
+         if (useAsync) {
+           instance = m_pipelines.add(state,
+             VK_NULL_HANDLE, VK_NULL_HANDLE, computeAttachmentMask(state));
+-          m_stats->numGraphicsPipelines += 1;
++          m_stats->numGraphicsPipelines.fetch_add(1u, std::memory_order_relaxed);
+           m_manager->addGraphicsPipelineToCache(m_shaders, state);
+ 
+           lock.unlock();
+@@ -1261,7 +1261,7 @@ namespace dxvk {
+     if (!fastHandle && !baseHandle)
+       this->logPipelineState(LogLevel::Error, state);
+ 
+-    m_stats->numGraphicsPipelines += 1;
++    m_stats->numGraphicsPipelines.fetch_add(1u, std::memory_order_relaxed);
+     m_manager->addGraphicsPipelineToCache(m_shaders, state);
+     return m_pipelines.add(state, baseHandle, fastHandle, computeAttachmentMask(state));
+   }
+diff --git a/src/dxvk/dxvk_pipemanager.cpp b/src/dxvk/dxvk_pipemanager.cpp
+index 51cbb0c..f320972 100644
+--- a/src/dxvk/dxvk_pipemanager.cpp
++++ b/src/dxvk/dxvk_pipemanager.cpp
+@@ -21,13 +21,20 @@ namespace dxvk {
+   void DxvkPipelineWorkers::compilePipelineLibrary(
+           DxvkShaderPipelineLibrary*      library,
+           DxvkPipelinePriority            priority) {
+-    std::unique_lock lock(m_lock);
+-    this->startWorkers();
++    dxvk::condition_variable* notify = nullptr;
+ 
+-    m_buckets[uint32_t(priority)].queue.emplace(library);
+-    m_tasksTotal += 1;
++    {
++      std::unique_lock lock(m_lock);
++      this->startWorkers();
++
++      m_buckets[uint32_t(priority)].queue.emplace(library);
++      m_tasksTotal.fetch_add(1u, std::memory_order_relaxed);
++
++      notify = notifyWorkerLocked(priority);
++    }
+ 
+-    notifyWorkers(priority);
++    if (notify)
++      notify->notify_one();
+   }
+ 
+ 
+@@ -37,18 +44,23 @@ namespace dxvk {
+           DxvkPipelinePriority            priority) {
+     pipeline->acquirePipeline();
+ 
++    dxvk::condition_variable* notify = nullptr;
++
+     try {
+       std::unique_lock lock(m_lock);
+       this->startWorkers();
+ 
+       m_buckets[uint32_t(priority)].queue.emplace(pipeline, state);
+-      m_tasksTotal += 1;
++      m_tasksTotal.fetch_add(1u, std::memory_order_relaxed);
+ 
+-      notifyWorkers(priority);
++      notify = notifyWorkerLocked(priority);
+     } catch (...) {
+       pipeline->releasePipeline();
+       throw;
+     }
++
++    if (notify)
++      notify->notify_one();
+   }
+ 
+ 
+@@ -88,23 +100,21 @@ namespace dxvk {
+   }
+ 
+ 
+-  void DxvkPipelineWorkers::notifyWorkers(DxvkPipelinePriority priority) {
++  dxvk::condition_variable* DxvkPipelineWorkers::notifyWorkerLocked(DxvkPipelinePriority priority) {
+     const uint32_t index = uint32_t(priority);
+ 
+-    if (m_buckets[index].idleWorkers) {
+-      m_buckets[index].cond.notify_one();
+-      return;
+-    }
++    if (m_buckets[index].idleWorkers)
++      return &m_buckets[index].cond;
+ 
+     // If any workers are idle in a suitable set, notify the corresponding
+     // condition variable. If all workers are busy anyway, we know that the
+     // job is going to be picked up at some point anyway.
+     for (uint32_t i = index + 1u; i < m_buckets.size(); i++) {
+-      if (m_buckets[i].idleWorkers) {
+-        m_buckets[i].cond.notify_one();
+-        break;
+-      }
++      if (m_buckets[i].idleWorkers)
++        return &m_buckets[i].cond;
+     }
++
++    return nullptr;
+   }
+ 
+ 
+@@ -200,7 +210,7 @@ namespace dxvk {
+         entry.graphicsPipeline->releasePipeline();
+       }
+ 
+-      m_tasksCompleted += 1;
++      m_tasksCompleted.fetch_add(1u, std::memory_order_relaxed);
+     }
+   }
+ 
+@@ -232,9 +242,17 @@ namespace dxvk {
+     const DxvkComputePipelineShaders& shaders) {
+     if (shaders.cs == nullptr)
+       return nullptr;
+-    
+-    std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
+-    
++
++    {
++      std::shared_lock<dxvk::shared_mutex> lock(m_pipelineMutex);
++
++      auto pair = m_computePipelines.find(shaders);
++      if (pair != m_computePipelines.end())
++        return &pair->second;
++    }
++
++    std::unique_lock<dxvk::shared_mutex> lock(m_pipelineMutex);
++
+     auto pair = m_computePipelines.find(shaders);
+     if (pair != m_computePipelines.end())
+       return &pair->second;
+@@ -254,8 +272,16 @@ namespace dxvk {
+     const DxvkGraphicsPipelineShaders& shaders) {
+     if (shaders.vs == nullptr)
+       return nullptr;
+-    
+-    std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
++
++    {
++      std::shared_lock<dxvk::shared_mutex> lock(m_pipelineMutex);
++
++      auto pair = m_graphicsPipelines.find(shaders);
++      if (pair != m_graphicsPipelines.end())
++        return &pair->second;
++    }
++
++    std::unique_lock<dxvk::shared_mutex> lock(m_pipelineMutex);
+ 
+     auto pair = m_graphicsPipelines.find(shaders);
+     if (pair != m_graphicsPipelines.end())
+@@ -293,14 +319,30 @@ namespace dxvk {
+   
+   DxvkShaderPipelineLibrary* DxvkPipelineManager::createShaderPipelineLibrary(
+     const DxvkShaderPipelineLibraryKey& key) {
+-    std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
++    {
++      std::shared_lock<dxvk::shared_mutex> lock(m_pipelineMutex);
++
++      auto pair = m_shaderLibraries.find(key);
++      if (pair != m_shaderLibraries.end())
++        return &pair->second;
++    }
++
++    std::unique_lock<dxvk::shared_mutex> lock(m_pipelineMutex);
+     return createPipelineLibraryLocked(key);
+   }
+ 
+ 
+   DxvkGraphicsPipelineVertexInputLibrary* DxvkPipelineManager::createVertexInputLibrary(
+     const DxvkGraphicsPipelineVertexInputState& state) {
+-    std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
++    {
++      std::shared_lock<dxvk::shared_mutex> lock(m_pipelineMutex);
++
++      auto pair = m_vertexInputLibraries.find(state);
++      if (pair != m_vertexInputLibraries.end())
++        return &pair->second;
++    }
++
++    std::unique_lock<dxvk::shared_mutex> lock(m_pipelineMutex);
+ 
+     auto iter = m_vertexInputLibraries.try_emplace(
+       state, m_device, state);
+@@ -310,7 +352,15 @@ namespace dxvk {
+ 
+   DxvkGraphicsPipelineFragmentOutputLibrary* DxvkPipelineManager::createFragmentOutputLibrary(
+     const DxvkGraphicsPipelineFragmentOutputState& state) {
+-    std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
++    {
++      std::shared_lock<dxvk::shared_mutex> lock(m_pipelineMutex);
++
++      auto pair = m_fragmentOutputLibraries.find(state);
++      if (pair != m_fragmentOutputLibraries.end())
++        return &pair->second;
++    }
++
++    std::unique_lock<dxvk::shared_mutex> lock(m_pipelineMutex);
+ 
+     auto iter = m_fragmentOutputLibraries.try_emplace(
+       state, m_device, state);
+@@ -350,9 +400,9 @@ namespace dxvk {
+ 
+   DxvkPipelineCount DxvkPipelineManager::getPipelineCount() const {
+     DxvkPipelineCount result;
+-    result.numGraphicsPipelines = m_stats.numGraphicsPipelines.load();
+-    result.numGraphicsLibraries = m_stats.numGraphicsLibraries.load();
+-    result.numComputePipelines  = m_stats.numComputePipelines.load();
++    result.numGraphicsPipelines = m_stats.numGraphicsPipelines.load(std::memory_order_relaxed);
++    result.numGraphicsLibraries = m_stats.numGraphicsLibraries.load(std::memory_order_relaxed);
++    result.numComputePipelines  = m_stats.numComputePipelines.load(std::memory_order_relaxed);
+     return result;
+   }
+ 
+@@ -365,7 +415,15 @@ namespace dxvk {
+ 
+   const DxvkDescriptorSetLayout* DxvkPipelineManager::createDescriptorSetLayout(
+     const DxvkDescriptorSetLayoutKey& key) {
+-    std::lock_guard<dxvk::mutex> lock(m_layoutMutex);
++    {
++      std::shared_lock<dxvk::shared_mutex> lock(m_layoutMutex);
++
++      auto pair = m_descriptorSetLayouts.find(key);
++      if (pair != m_descriptorSetLayouts.end())
++        return &pair->second;
++    }
++
++    std::unique_lock<dxvk::shared_mutex> lock(m_layoutMutex);
+ 
+     auto iter = m_descriptorSetLayouts.try_emplace(
+       key, m_device, key);
+@@ -375,7 +433,15 @@ namespace dxvk {
+ 
+   const DxvkPipelineLayout* DxvkPipelineManager::createPipelineLayout(
+     const DxvkPipelineLayoutKey& key) {
+-    std::lock_guard<dxvk::mutex> lock(m_layoutMutex);
++    {
++      std::shared_lock<dxvk::shared_mutex> lock(m_layoutMutex);
++
++      auto pair = m_pipelineLayouts.find(key);
++      if (pair != m_pipelineLayouts.end())
++        return &pair->second;
++    }
++
++    std::unique_lock<dxvk::shared_mutex> lock(m_layoutMutex);
+ 
+     auto iter = m_pipelineLayouts.try_emplace(
+       key, m_device, key);
+@@ -399,7 +465,7 @@ namespace dxvk {
+ 
+ 
+   DxvkShaderPipelineLibrary* DxvkPipelineManager::createNullFsPipelineLibrary() {
+-    std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
++    std::unique_lock<dxvk::shared_mutex> lock(m_pipelineMutex);
+     DxvkShaderPipelineLibraryKey key;
+ 
+     auto iter = m_shaderLibraries.try_emplace(
+@@ -410,7 +476,15 @@ namespace dxvk {
+ 
+   DxvkShaderPipelineLibrary* DxvkPipelineManager::findPipelineLibrary(
+     const DxvkShaderPipelineLibraryKey& key) {
+-    std::lock_guard<dxvk::mutex> lock(m_pipelineMutex);
++    {
++      std::shared_lock<dxvk::shared_mutex> lock(m_pipelineMutex);
++
++      auto pair = m_shaderLibraries.find(key);
++      if (pair != m_shaderLibraries.end())
++        return &pair->second;
++    }
++
++    std::unique_lock<dxvk::shared_mutex> lock(m_pipelineMutex);
+     return findPipelineLibraryLocked(key);
+   }
+ 
+diff --git a/src/dxvk/dxvk_pipemanager.h b/src/dxvk/dxvk_pipemanager.h
+index 35346bc..49ed876 100644
+--- a/src/dxvk/dxvk_pipemanager.h
++++ b/src/dxvk/dxvk_pipemanager.h
+@@ -71,7 +71,7 @@ namespace dxvk {
+      */
+     DxvkPipelineWorkerStats getStats() const {
+       DxvkPipelineWorkerStats result;
+-      result.tasksCompleted = m_tasksCompleted.load(std::memory_order_acquire);
++      result.tasksCompleted = m_tasksCompleted.load(std::memory_order_relaxed);
+       result.tasksTotal = m_tasksTotal.load(std::memory_order_relaxed);
+       return result;
+     }
+@@ -133,8 +133,8 @@ namespace dxvk {
+ 
+     DxvkDevice*                       m_device;
+ 
+-    std::atomic<uint64_t>             m_tasksTotal     = { 0ull };
+-    std::atomic<uint64_t>             m_tasksCompleted = { 0ull };
++    alignas(64) std::atomic<uint64_t> m_tasksTotal     = { 0ull };
++    alignas(64) std::atomic<uint64_t> m_tasksCompleted = { 0ull };
+ 
+     dxvk::mutex                       m_lock;
+     std::array<PipelineBucket, 3>     m_buckets;
+@@ -142,7 +142,7 @@ namespace dxvk {
+     bool                              m_workersRunning = false;
+     std::vector<dxvk::thread>         m_workers;
+ 
+-    void notifyWorkers(DxvkPipelinePriority priority);
++    dxvk::condition_variable* notifyWorkerLocked(DxvkPipelinePriority priority);
+ 
+     void startWorkers();
+ 
+@@ -299,7 +299,7 @@ namespace dxvk {
+ 
+     VkDescriptorSetLayout     m_specLayout = VK_NULL_HANDLE;
+ 
+-    dxvk::mutex               m_layoutMutex;
++    dxvk::shared_mutex        m_layoutMutex;
+ 
+     std::unordered_map<
+       DxvkDescriptorSetLayoutKey,
+@@ -311,7 +311,7 @@ namespace dxvk {
+       DxvkPipelineLayout,
+       DxvkHash, DxvkEq> m_pipelineLayouts;
+ 
+-    dxvk::mutex m_pipelineMutex;
++    dxvk::shared_mutex m_pipelineMutex;
+ 
+     std::unordered_map<
+       DxvkGraphicsPipelineVertexInputState,
+diff --git a/src/dxvk/dxvk_queue.cpp b/src/dxvk/dxvk_queue.cpp
+index 6d2d153..2a2675d 100644
+--- a/src/dxvk/dxvk_queue.cpp
++++ b/src/dxvk/dxvk_queue.cpp
+@@ -46,19 +46,22 @@ namespace dxvk {
+           DxvkSubmitInfo            submitInfo,
+           DxvkLatencyInfo           latencyInfo,
+           DxvkSubmitStatus*         status) {
+-    std::unique_lock<dxvk::mutex> lock(m_mutex);
++    {
++      std::unique_lock<dxvk::mutex> lock(m_mutex);
+ 
+-    m_finishCond.wait(lock, [this] {
+-      return m_submitQueue.size() + m_finishQueue.size() <= MaxNumQueuedCommandBuffers;
+-    });
++      m_finishCond.wait(lock, [this] {
++        return m_submitQueue.size() + m_finishQueue.size() <= MaxNumQueuedCommandBuffers;
++      });
+ 
+-    DxvkSubmitEntry entry = { };
+-    entry.status = status;
+-    entry.submit = std::move(submitInfo);
+-    entry.latency = std::move(latencyInfo);
++      DxvkSubmitEntry entry = { };
++      entry.status = status;
++      entry.submit = std::move(submitInfo);
++      entry.latency = std::move(latencyInfo);
+ 
+-    m_submitQueue.push(std::move(entry));
+-    m_appendCond.notify_all();
++      m_submitQueue.push(std::move(entry));
++    }
++
++    m_appendCond.notify_one();
+   }
+ 
+ 
+@@ -66,15 +69,18 @@ namespace dxvk {
+           DxvkPresentInfo           presentInfo,
+           DxvkLatencyInfo           latencyInfo,
+           DxvkSubmitStatus*         status) {
+-    std::unique_lock<dxvk::mutex> lock(m_mutex);
++    {
++      std::unique_lock<dxvk::mutex> lock(m_mutex);
+ 
+-    DxvkSubmitEntry entry = { };
+-    entry.status  = status;
+-    entry.present = std::move(presentInfo);
+-    entry.latency = std::move(latencyInfo);
++      DxvkSubmitEntry entry = { };
++      entry.status  = status;
++      entry.present = std::move(presentInfo);
++      entry.latency = std::move(latencyInfo);
+ 
+-    m_submitQueue.push(std::move(entry));
+-    m_appendCond.notify_all();
++      m_submitQueue.push(std::move(entry));
++    }
++
++    m_appendCond.notify_one();
+   }
+ 
+ 
+diff --git a/src/dxvk/dxvk_shader.cpp b/src/dxvk/dxvk_shader.cpp
+index 74046ed..c08936b 100644
+--- a/src/dxvk/dxvk_shader.cpp
++++ b/src/dxvk/dxvk_shader.cpp
+@@ -280,9 +280,9 @@ namespace dxvk {
+ 
+     if (!compiledBefore) {
+       if (m_shaders.findShader(VK_SHADER_STAGE_COMPUTE_BIT))
+-        m_manager->m_stats.numComputePipelines += 1;
++        m_manager->m_stats.numComputePipelines.fetch_add(1u, std::memory_order_relaxed);
+       else
+-        m_manager->m_stats.numGraphicsLibraries += 1;
++        m_manager->m_stats.numGraphicsLibraries.fetch_add(1u, std::memory_order_relaxed);
+     }
+ 
+     if (!canCreatePipelineLibrary())
+-- 
+2.47.3
+
