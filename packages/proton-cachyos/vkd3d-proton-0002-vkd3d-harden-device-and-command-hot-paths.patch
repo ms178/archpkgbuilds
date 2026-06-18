@@ -1,0 +1,501 @@
+From caf2a580b34e027fad540c36489ad4096043973c Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@example.invalid>
+Date: Wed, 17 Jun 2026 13:41:10 +0000
+Subject: [PATCH 2/4] vkd3d: harden device and command hot paths
+
+---
+ libs/vkd3d/command.c          |  92 ++++++++++++++-----
+ libs/vkd3d/device.c           | 167 ++++++++++++++++++++--------------
+ libs/vkd3d/device_vkd3d_ext.c |  15 ++-
+ 3 files changed, 182 insertions(+), 92 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index cb6d5e3..13fb52f 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -123,7 +123,7 @@ HRESULT vkd3d_queue_create(struct d3d12_device *device, uint32_t family_index, u
+     struct vkd3d_queue *object;
+     VkDependencyInfo dep_info;
+     VkResult vr;
+-    HRESULT hr;
++    HRESULT hr = S_OK;
+     int rc;
+ 
+     if (!(object = vkd3d_malloc(sizeof(*object))))
+@@ -208,7 +208,11 @@ HRESULT vkd3d_queue_create(struct d3d12_device *device, uint32_t family_index, u
+         /* It's not very meaningful to rebuild this command buffer over and over. */
+         begin_info.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+         begin_info.pInheritanceInfo = NULL;
+-        VK_CALL(vkBeginCommandBuffer(object->barrier_command_buffer, &begin_info));
++        if ((vr = VK_CALL(vkBeginCommandBuffer(object->barrier_command_buffer, &begin_info))) < 0)
++        {
++            hr = hresult_from_vk_result(vr);
++            goto fail_free_barrier_cmd;
++        }
+ 
+         /* To avoid unnecessary tracking, just emit a host barrier on every submit. */
+         memset(&memory_barrier, 0, sizeof(memory_barrier));
+@@ -224,22 +228,32 @@ HRESULT vkd3d_queue_create(struct d3d12_device *device, uint32_t family_index, u
+         dep_info.pMemoryBarriers = &memory_barrier;
+ 
+         VK_CALL(vkCmdPipelineBarrier2(object->barrier_command_buffer, &dep_info));
+-        VK_CALL(vkEndCommandBuffer(object->barrier_command_buffer));
++        if ((vr = VK_CALL(vkEndCommandBuffer(object->barrier_command_buffer))) < 0)
++        {
++            hr = hresult_from_vk_result(vr);
++            goto fail_free_barrier_cmd;
++        }
+     }
+ 
+     if (FAILED(hr = vkd3d_create_timeline_semaphore(device, 0, false, &object->submission_timeline)))
+-        goto fail_free_command_pool;
++        goto fail_free_barrier_cmd;
+ 
+     *queue = object;
+-    return hr;
++    return S_OK;
+ 
++fail_free_barrier_cmd:
++    if (object->barrier_command_buffer)
++        VK_CALL(vkFreeCommandBuffers(device->vk_device, object->barrier_pool, 1,
++                &object->barrier_command_buffer));
+ fail_free_command_pool:
+-    VK_CALL(vkDestroyCommandPool(device->vk_device, object->barrier_pool, NULL));
++    if (object->barrier_pool)
++        VK_CALL(vkDestroyCommandPool(device->vk_device, object->barrier_pool, NULL));
+ fail_destroy_mutex:
+     pthread_mutex_destroy(&object->mutex);
+     pthread_mutex_destroy(&object->command_queue_mutex);
+     pthread_mutex_destroy(&object->fence_mutex);
+     pthread_cond_destroy(&object->fence_cond);
++    vkd3d_free(object);
+     return hr;
+ }
+ 
+@@ -265,6 +279,7 @@ void vkd3d_queue_drain(struct vkd3d_queue *queue, struct d3d12_device *device)
+     VkSemaphoreSubmitInfo signal_semaphore;
+     VkSubmitInfo2 submit_desc;
+     VkResult vr = VK_SUCCESS;
++    VkResult wait_vr;
+     VkQueue vk_queue;
+ 
+     if (!(vk_queue = vkd3d_queue_acquire(queue)))
+@@ -295,8 +310,8 @@ void vkd3d_queue_drain(struct vkd3d_queue *queue, struct d3d12_device *device)
+ 
+     if (vr == VK_SUCCESS)
+     {
+-        if ((VK_CALL(vkQueueWaitIdle(vk_queue))))
+-            WARN("Failed to wait for queue, vr %d.\n", vr);
++        if ((wait_vr = VK_CALL(vkQueueWaitIdle(vk_queue))) != VK_SUCCESS)
++            WARN("Failed to wait for queue, vr %d.\n", wait_vr);
+     }
+ 
+     queue->wait_count = 0u;
+@@ -1791,15 +1806,23 @@ HRESULT d3d12_fence_create(struct d3d12_device *device,
+     struct d3d12_fence *object;
+     HRESULT hr;
+ 
++    if (!fence)
++        return E_INVALIDARG;
++
++    *fence = NULL;
++
+     if (!(object = vkd3d_malloc(sizeof(*object))))
+         return E_OUTOFMEMORY;
+ 
+     if (SUCCEEDED(hr = d3d12_fence_init(object, device, initial_value, flags)))
++    {
+         TRACE("Created fence %p.\n", object);
+-    else
+-        ERR("Failed to create fence.\n");
++        *fence = object;
++        return S_OK;
++    }
+ 
+-    *fence = object;
++    ERR("Failed to create fence.\n");
++    vkd3d_free(object);
+     return hr;
+ }
+ 
+@@ -3502,7 +3525,12 @@ bool d3d12_command_allocator_allocate_query_from_type_index(
+         struct d3d12_command_allocator *allocator,
+         uint32_t type_index, VkQueryPool *query_pool, uint32_t *query_index)
+ {
+-    struct vkd3d_query_pool *pool = d3d12_command_allocator_get_active_query_pool_from_type_index(allocator, type_index);
++    struct vkd3d_query_pool *pool;
++
++    if (type_index >= ARRAY_SIZE(allocator->active_query_pools))
++        return false;
++
++    pool = d3d12_command_allocator_get_active_query_pool_from_type_index(allocator, type_index);
+     assert(pool);
+ 
+     if (pool->next_index >= pool->query_count)
+@@ -3526,6 +3554,10 @@ static bool d3d12_command_allocator_allocate_query_from_heap_type(struct d3d12_c
+         D3D12_QUERY_HEAP_TYPE heap_type, VkQueryPool *query_pool, uint32_t *query_index)
+ {
+     uint32_t type_index = d3d12_query_heap_type_to_type_index(heap_type);
++
++    if (type_index == UINT32_MAX)
++        return false;
++
+     return d3d12_command_allocator_allocate_query_from_type_index(allocator, type_index, query_pool, query_index);
+ }
+ 
+@@ -5267,20 +5299,27 @@ static void d3d12_command_list_handle_active_queries(struct d3d12_command_list *
+     }
+ }
+ 
+-int vkd3d_compare_pending_query(const void* query_a, const void* query_b)
++int vkd3d_compare_pending_query(const void *query_a, const void *query_b)
+ {
+     const struct vkd3d_active_query *a = query_a;
+     const struct vkd3d_active_query *b = query_b;
++    uintptr_t a_heap = (uintptr_t)a->heap;
++    uintptr_t b_heap = (uintptr_t)b->heap;
++    uintptr_t a_pool = (uintptr_t)a->vk_pool;
++    uintptr_t b_pool = (uintptr_t)b->vk_pool;
++
++    /* Sort by D3D12 heap since we need to do one compute dispatch per buffer. */
++    if (a_heap < b_heap) return -1;
++    if (a_heap > b_heap) return 1;
+ 
+-    // Sort by D3D12 heap since we need to do one compute dispatch per buffer
+-    if (a->heap < b->heap) return -1;
+-    if (a->heap > b->heap) return 1;
++    /* Sort by Vulkan query pool and index to batch query resolves. */
++    if (a_pool > b_pool) return -1;
++    if (a_pool < b_pool) return 1;
+ 
+-    // Sort by Vulkan query pool and index to batch query resolves
+-    if (a->vk_pool > b->vk_pool) return -1;
+-    if (a->vk_pool < b->vk_pool) return 1;
++    if (a->vk_index < b->vk_index) return -1;
++    if (a->vk_index > b->vk_index) return 1;
+ 
+-    return (int)(a->vk_index - b->vk_index);
++    return 0;
+ }
+ 
+ static size_t get_query_heap_stride(D3D12_QUERY_HEAP_TYPE heap_type)
+@@ -6390,7 +6429,10 @@ void d3d12_command_list_invalidate_root_parameters(struct d3d12_command_list *li
+     if (invalidate_legacy_descriptor_sets)
+     {
+         struct d3d12_device *device = bindings->root_signature->device;
+-        bindings->legacy_descriptor_set_dirty_mask = (1ull << device->bindless_state.legacy.set_count) - 1;
++        if (device->bindless_state.legacy.set_count >= 64)
++            bindings->legacy_descriptor_set_dirty_mask = UINT64_MAX;
++        else
++            bindings->legacy_descriptor_set_dirty_mask = (1ull << device->bindless_state.legacy.set_count) - 1ull;
+     }
+ }
+ 
+@@ -9508,6 +9550,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
+             "src_offset %#"PRIx64", byte_count %#"PRIx64".\n",
+             iface, dst, dst_offset, src, src_offset, byte_count);
+ 
++    if (!byte_count)
++        return;
++
+     d3d12_command_list_check_render_pass_validation(list, "CopyBufferRegion called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+ 
+@@ -11249,6 +11294,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTiles(d3d12_command_list_if
+             iface, tiled_resource, region_coord, region_size,
+             buffer, buffer_offset, flags);
+ 
++    if (!region_size || !region_size->NumTiles)
++        return;
++
+     d3d12_command_list_check_render_pass_validation(list, "CopyTiles called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+ 
+@@ -11443,7 +11491,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTiles(d3d12_command_list_if
+         copy_info.sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2;
+         copy_info.pNext = NULL;
+         copy_info.srcBuffer = copy_to_buffer ? tiled_res->res.vk_buffer : linear_res->res.vk_buffer;
+-        copy_info.dstBuffer = copy_to_buffer ? linear_res->res.vk_buffer : tiled_res->res.vk_buffer,
++        copy_info.dstBuffer = copy_to_buffer ? linear_res->res.vk_buffer : tiled_res->res.vk_buffer;
+         copy_info.regionCount = 1;
+         copy_info.pRegions = &buffer_copy;
+ 
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index cde6841..3387802 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -185,14 +185,24 @@ static unsigned int get_spec_version(const VkExtensionProperties *extensions,
+     return 0;
+ }
+ 
++static char vkd3d_disabled_extensions[VKD3D_PATH_MAX];
++static bool vkd3d_has_disabled_extensions;
++static pthread_once_t vkd3d_disabled_extensions_once = PTHREAD_ONCE_INIT;
++
++static void vkd3d_init_disabled_extensions_once(void)
++{
++    vkd3d_has_disabled_extensions = vkd3d_get_env_var("VKD3D_DISABLE_EXTENSIONS",
++            vkd3d_disabled_extensions, sizeof(vkd3d_disabled_extensions));
++}
++
+ static bool is_extension_disabled(const char *extension_name)
+ {
+-    char disabled_extensions[VKD3D_PATH_MAX];
++    pthread_once(&vkd3d_disabled_extensions_once, vkd3d_init_disabled_extensions_once);
+ 
+-    if (!vkd3d_get_env_var("VKD3D_DISABLE_EXTENSIONS", disabled_extensions, sizeof(disabled_extensions)))
++    if (!vkd3d_has_disabled_extensions)
+         return false;
+ 
+-    return vkd3d_debug_list_has_member(disabled_extensions, extension_name);
++    return vkd3d_debug_list_has_member(vkd3d_disabled_extensions, extension_name);
+ }
+ 
+ static bool has_extension(const VkExtensionProperties *extensions,
+@@ -200,13 +210,14 @@ static bool has_extension(const VkExtensionProperties *extensions,
+ {
+     unsigned int i;
+ 
++    if (is_extension_disabled(extension_name))
++    {
++        WARN("Extension %s is disabled.\n", debugstr_a(extension_name));
++        return false;
++    }
++
+     for (i = 0; i < count; ++i)
+     {
+-        if (is_extension_disabled(extension_name))
+-        {
+-            WARN("Extension %s is disabled.\n", debugstr_a(extension_name));
+-            continue;
+-        }
+         if (!strcmp(extensions[i].extensionName, extension_name) &&
+                 (extensions[i].specVersion >= minimum_spec_version))
+             return true;
+@@ -336,16 +347,15 @@ static unsigned int vkd3d_enable_extensions(const char *extensions[],
+     unsigned int i;
+ 
+     for (i = 0; i < required_extension_count; ++i)
+-    {
+-        extensions[extension_count++] = required_extensions[i];
+-    }
++        extension_count = vkd3d_append_extension(extensions, extension_count, required_extensions[i]);
+     for (i = 0; i < optional_extension_count; ++i)
+     {
+         ptrdiff_t offset = optional_extensions[i].vulkan_info_offset;
+         const bool *supported = (void *)((uintptr_t)vulkan_info + offset);
+ 
+         if (*supported)
+-            extensions[extension_count++] = optional_extensions[i].extension_name;
++            extension_count = vkd3d_append_extension(extensions, extension_count,
++                    optional_extensions[i].extension_name);
+     }
+ 
+     for (i = 0; i < user_extension_count; ++i)
+@@ -425,35 +435,45 @@ static HRESULT vkd3d_init_instance_caps(struct vkd3d_instance *instance,
+     memset(vulkan_info, 0, sizeof(*vulkan_info));
+     *instance_extension_count = 0;
+ 
+-    if ((vr = vk_procs->vkEnumerateInstanceExtensionProperties(NULL, &count, NULL)) < 0)
++    for (;;)
+     {
+-        ERR("Failed to enumerate instance extensions, vr %d.\n", vr);
+-        return hresult_from_vk_result(vr);
+-    }
+-    if (!count)
+-        return S_OK;
++        if ((vr = vk_procs->vkEnumerateInstanceExtensionProperties(NULL, &count, NULL)) < 0)
++        {
++            ERR("Failed to enumerate instance extensions, vr %d.\n", vr);
++            return hresult_from_vk_result(vr);
++        }
++        if (!count)
++            return S_OK;
+ 
+-    if (!(vk_extensions = vkd3d_calloc(count, sizeof(*vk_extensions))))
+-        return E_OUTOFMEMORY;
++        if (!(vk_extensions = vkd3d_calloc(count, sizeof(*vk_extensions))))
++            return E_OUTOFMEMORY;
+ 
+-    TRACE("Enumerating %u instance extensions.\n", count);
+-    if ((vr = vk_procs->vkEnumerateInstanceExtensionProperties(NULL, &count, vk_extensions)) < 0)
+-    {
+-        ERR("Failed to enumerate instance extensions, vr %d.\n", vr);
+-        vkd3d_free(vk_extensions);
+-        return hresult_from_vk_result(vr);
+-    }
++        TRACE("Enumerating %u instance extensions.\n", count);
++        vr = vk_procs->vkEnumerateInstanceExtensionProperties(NULL, &count, vk_extensions);
++        if (vr == VK_INCOMPLETE)
++        {
++            WARN("Instance extension list changed during enumeration, retrying.\n");
++            vkd3d_free(vk_extensions);
++            continue;
++        }
++        if (vr < 0)
++        {
++            ERR("Failed to enumerate instance extensions, vr %d.\n", vr);
++            vkd3d_free(vk_extensions);
++            return hresult_from_vk_result(vr);
++        }
+ 
+-    *instance_extension_count = vkd3d_check_extensions(vk_extensions, count, NULL, 0,
+-            optional_instance_extensions, ARRAY_SIZE(optional_instance_extensions),
+-            create_info->instance_extensions,
+-            create_info->instance_extension_count,
+-            create_info->optional_instance_extensions,
+-            create_info->optional_instance_extension_count,
+-            user_extension_supported, vulkan_info, "instance");
++        *instance_extension_count = vkd3d_check_extensions(vk_extensions, count, NULL, 0,
++                optional_instance_extensions, ARRAY_SIZE(optional_instance_extensions),
++                create_info->instance_extensions,
++                create_info->instance_extension_count,
++                create_info->optional_instance_extensions,
++                create_info->optional_instance_extension_count,
++                user_extension_supported, vulkan_info, "instance");
+ 
+-    vkd3d_free(vk_extensions);
+-    return S_OK;
++        vkd3d_free(vk_extensions);
++        return S_OK;
++    }
+ }
+ 
+ static HRESULT vkd3d_init_vk_global_procs(struct vkd3d_instance *instance,
+@@ -3016,42 +3036,52 @@ static HRESULT vkd3d_init_device_extensions(struct d3d12_device *device,
+ 
+     *device_extension_count = 0;
+ 
+-    if ((vr = VK_CALL(vkEnumerateDeviceExtensionProperties(physical_device, NULL, &count, NULL))) < 0)
++    for (;;)
+     {
+-        ERR("Failed to enumerate device extensions, vr %d.\n", vr);
+-        return hresult_from_vk_result(vr);
+-    }
+-    if (!count)
+-        return S_OK;
++        if ((vr = VK_CALL(vkEnumerateDeviceExtensionProperties(physical_device, NULL, &count, NULL))) < 0)
++        {
++            ERR("Failed to enumerate device extensions, vr %d.\n", vr);
++            return hresult_from_vk_result(vr);
++        }
++        if (!count)
++            return S_OK;
+ 
+-    if (!(vk_extensions = vkd3d_calloc(count, sizeof(*vk_extensions))))
+-        return E_OUTOFMEMORY;
++        if (!(vk_extensions = vkd3d_calloc(count, sizeof(*vk_extensions))))
++            return E_OUTOFMEMORY;
+ 
+-    TRACE("Enumerating %u device extensions.\n", count);
+-    if ((vr = VK_CALL(vkEnumerateDeviceExtensionProperties(physical_device, NULL, &count, vk_extensions))) < 0)
+-    {
+-        ERR("Failed to enumerate device extensions, vr %d.\n", vr);
+-        vkd3d_free(vk_extensions);
+-        return hresult_from_vk_result(vr);
+-    }
++        TRACE("Enumerating %u device extensions.\n", count);
++        vr = VK_CALL(vkEnumerateDeviceExtensionProperties(physical_device, NULL, &count, vk_extensions));
++        if (vr == VK_INCOMPLETE)
++        {
++            WARN("Device extension list changed during enumeration, retrying.\n");
++            vkd3d_free(vk_extensions);
++            continue;
++        }
++        if (vr < 0)
++        {
++            ERR("Failed to enumerate device extensions, vr %d.\n", vr);
++            vkd3d_free(vk_extensions);
++            return hresult_from_vk_result(vr);
++        }
+ 
+-    *device_extension_count = vkd3d_check_extensions(vk_extensions, count, NULL, 0,
+-            optional_device_extensions, ARRAY_SIZE(optional_device_extensions),
+-            create_info->device_extensions,
+-            create_info->device_extension_count,
+-            create_info->optional_device_extensions,
+-            create_info->optional_device_extension_count,
+-            user_extension_supported, vulkan_info, "device");
++        *device_extension_count = vkd3d_check_extensions(vk_extensions, count, NULL, 0,
++                optional_device_extensions, ARRAY_SIZE(optional_device_extensions),
++                create_info->device_extensions,
++                create_info->device_extension_count,
++                create_info->optional_device_extensions,
++                create_info->optional_device_extension_count,
++                user_extension_supported, vulkan_info, "device");
+ 
+-    if (get_spec_version(vk_extensions, count, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) < 3)
+-        vulkan_info->EXT_vertex_attribute_divisor = false;
++        if (get_spec_version(vk_extensions, count, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) < 3)
++            vulkan_info->EXT_vertex_attribute_divisor = false;
+ 
+-    vulkan_info->supports_cubin_64bit = vulkan_info->NVX_binary_import && vulkan_info->NVX_image_view_handle &&
+-            get_spec_version(vk_extensions, count, VK_NVX_BINARY_IMPORT_EXTENSION_NAME) >= 2 &&
+-            get_spec_version(vk_extensions, count, VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME) >= 3;
++        vulkan_info->supports_cubin_64bit = vulkan_info->NVX_binary_import && vulkan_info->NVX_image_view_handle &&
++                get_spec_version(vk_extensions, count, VK_NVX_BINARY_IMPORT_EXTENSION_NAME) >= 2 &&
++                get_spec_version(vk_extensions, count, VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME) >= 3;
+ 
+-    vkd3d_free(vk_extensions);
+-    return S_OK;
++        vkd3d_free(vk_extensions);
++        return S_OK;
++    }
+ }
+ 
+ static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
+@@ -3077,7 +3107,12 @@ static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
+         return false;
+     }
+ 
+-    props = vkd3d_calloc(count, sizeof(*props));
++    if (!count)
++        return false;
++
++    if (!(props = vkd3d_calloc(count, sizeof(*props))))
++        return false;
++
+     for (i = 0; i < count; i++)
+         props[i].sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+ 
+diff --git a/libs/vkd3d/device_vkd3d_ext.c b/libs/vkd3d/device_vkd3d_ext.c
+index 17395c5..a252b8d 100644
+--- a/libs/vkd3d/device_vkd3d_ext.c
++++ b/libs/vkd3d/device_vkd3d_ext.c
+@@ -1325,11 +1325,18 @@ static HRESULT STDMETHODCALLTYPE d3d12_amd_ext_anti_lag_UpdateAntiLagState(
+     {
+         struct vkd3d_queue_timeline_trace_cookie cookie = { 0 };
+         VkAntiLagDataAMD anti_lag;
++        uint32_t max_fps;
++        bool mode;
++
++        spinlock_acquire(&device->low_latency_swapchain_spinlock);
++        mode = device->swapchain_info.mode;
++        max_fps = device->swapchain_info.max_fps;
++        spinlock_release(&device->low_latency_swapchain_spinlock);
+ 
+         memset(&anti_lag, 0, sizeof(anti_lag));
+         anti_lag.sType = VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD;
+-        anti_lag.mode = device->swapchain_info.mode ? VK_ANTI_LAG_MODE_ON_AMD : VK_ANTI_LAG_MODE_OFF_AMD;
+-        anti_lag.maxFPS = device->swapchain_info.max_fps;
++        anti_lag.mode = mode ? VK_ANTI_LAG_MODE_ON_AMD : VK_ANTI_LAG_MODE_OFF_AMD;
++        anti_lag.maxFPS = max_fps;
+ 
+         /* The AntiLag API has no useful present IDs we can correlate with.
+          * The Vulkan API allows not passing down presentation information at all, which
+@@ -1341,10 +1348,10 @@ static HRESULT STDMETHODCALLTYPE d3d12_amd_ext_anti_lag_UpdateAntiLagState(
+          * and end up with INPUT -> INPUT -> PRESENT -> PRESENT patterns which just break.
+          * Even if we try to keep track of this, INPUT and PRESENT can get out of sync, which is terrible too. */
+ 
+-        if (device->swapchain_info.mode)
++        if (mode)
+             cookie = vkd3d_queue_timeline_trace_register_low_latency_sleep(&device->queue_timeline_trace, 0);
+         VK_CALL(vkAntiLagUpdateAMD(device->vk_device, &anti_lag));
+-        if (device->swapchain_info.mode)
++        if (mode)
+             vkd3d_queue_timeline_trace_complete_low_latency_sleep(&device->queue_timeline_trace, cookie);
+     }
+     else if (v1->uiVersion == 1)
+-- 
+2.47.3
+

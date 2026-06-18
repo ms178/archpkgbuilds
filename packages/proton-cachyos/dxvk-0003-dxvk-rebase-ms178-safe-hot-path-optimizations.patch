@@ -1,0 +1,1052 @@
+From 9ad9c5ef7dcd82ca10ffb9318363729d292a80fa Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@example.invalid>
+Date: Wed, 17 Jun 2026 11:10:55 +0000
+Subject: [PATCH] dxvk: rebase ms178 safe hot-path optimizations
+
+---
+ src/d3d11/d3d11_features.cpp   |  25 +++---
+ src/dxvk/dxvk_buffer.cpp       |  15 +---
+ src/dxvk/dxvk_buffer.h         |  15 ++--
+ src/dxvk/dxvk_cmdlist.cpp      | 114 +++++++++++++-------------
+ src/dxvk/dxvk_compute.cpp      |  19 +++--
+ src/dxvk/dxvk_cs.cpp           |  11 ++-
+ src/dxvk/dxvk_graphics.h       |   2 +-
+ src/dxvk/dxvk_graphics_state.h | 101 +++++++++++++----------
+ src/dxvk/dxvk_image.cpp        | 141 +++++++++++++++------------------
+ src/dxvk/dxvk_image.h          |  36 +++++++--
+ src/dxvk/dxvk_memory.cpp       |  11 +--
+ src/dxvk/dxvk_shader.cpp       |  38 +++++----
+ 12 files changed, 293 insertions(+), 235 deletions(-)
+
+diff --git a/src/d3d11/d3d11_features.cpp b/src/d3d11/d3d11_features.cpp
+index 7fb0cfa..e383158 100644
+--- a/src/d3d11/d3d11_features.cpp
++++ b/src/d3d11/d3d11_features.cpp
+@@ -184,9 +184,6 @@ namespace dxvk {
+ 
+ 
+   D3D_FEATURE_LEVEL D3D11DeviceFeatures::GetMaxFeatureLevel(const DxvkDevice& Device) {
+-    D3D11Options config(Device.instance()->config());
+-    D3D11DeviceFeatures options(Device, config, D3D_FEATURE_LEVEL_12_1);
+-
+     const auto& features = Device.features();
+ 
+     // Check Feature Level 11_0 features
+@@ -196,19 +193,25 @@ namespace dxvk {
+      || !features.core.features.tessellationShader)
+       return D3D_FEATURE_LEVEL_10_1;
+ 
+-    // Check Feature Level 11_1 features
+-    if (!options.m_d3d11Options.OutputMergerLogicOp
++    // Check Feature Level 11_1 features. The full feature table mirrors
++    // VkPhysicalDeviceFeatures::logicOp for this field at FL >= 10_0.
++    if (!features.core.features.logicOp
+      || !features.core.features.vertexPipelineStoresAndAtomics)
+       return D3D_FEATURE_LEVEL_11_0;
+ 
+-    // Check Feature Level 12_0 features
+-    if (options.m_d3d11Options2.TiledResourcesTier < D3D11_TILED_RESOURCES_TIER_2
+-     || !options.m_d3d11Options2.TypedUAVLoadAdditionalFormats)
++    D3D11DeviceFeatures probe;
++
++    // Check Feature Level 12_0 features without constructing the full
++    // D3D11 feature table and without running unrelated shared-resource
++    // format probes.
++    if (probe.DetermineTiledResourcesTier(Device, D3D_FEATURE_LEVEL_12_1) < D3D11_TILED_RESOURCES_TIER_2
++     || !probe.DetermineUavExtendedTypedLoadSupport(Device, D3D_FEATURE_LEVEL_12_1))
+       return D3D_FEATURE_LEVEL_11_1;
+ 
+-    // Check Feature Level 12_1 features
+-    if (!options.m_d3d11Options2.ConservativeRasterizationTier
+-     || !options.m_d3d11Options2.ROVsSupported)
++    // Check Feature Level 12_1 features. ROV support in the full table is
++    // just the fragment-shader interlock feature when FL >= 11_1.
++    if (!probe.DetermineConservativeRasterizationTier(Device, D3D_FEATURE_LEVEL_12_1)
++     || !features.extFragmentShaderInterlock.fragmentShaderPixelInterlock)
+       return D3D_FEATURE_LEVEL_12_0;
+ 
+     return D3D_FEATURE_LEVEL_12_1;
+diff --git a/src/dxvk/dxvk_buffer.cpp b/src/dxvk/dxvk_buffer.cpp
+index 907b318..a879c5c 100644
+--- a/src/dxvk/dxvk_buffer.cpp
++++ b/src/dxvk/dxvk_buffer.cpp
+@@ -53,11 +53,7 @@ namespace dxvk {
+     DxvkAllocationInfo allocationInfo = { };
+     allocationInfo.resourceCookie = cookie();
+ 
+-    VkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+-    info.flags = m_info.flags;
+-    info.usage = m_info.usage;
+-    info.size = m_info.size;
+-    m_sharingMode.fill(info);
++    VkBufferCreateInfo info = getBufferCreateInfo();
+ 
+     assignStorage(allocator.importBufferResource(info, allocationInfo, importInfo));
+   }
+@@ -78,8 +74,7 @@ namespace dxvk {
+     const DxvkBufferViewKey& info) {
+     std::unique_lock lock(m_viewMutex);
+ 
+-    auto entry = m_views.emplace(std::piecewise_construct,
+-      std::make_tuple(info), std::make_tuple(this, info));
++    auto entry = m_views.try_emplace(info, this, info);
+ 
+     return &entry.first->second;
+   }
+@@ -102,11 +97,7 @@ namespace dxvk {
+     allocationInfo.properties = m_properties;
+     allocationInfo.mode = mode;
+ 
+-    VkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+-    info.flags = m_info.flags;
+-    info.usage = m_info.usage;
+-    info.size = m_info.size;
+-    m_sharingMode.fill(info);
++    VkBufferCreateInfo info = getBufferCreateInfo();
+ 
+     return m_allocator->createBufferResource(info, allocationInfo, nullptr);
+   }
+diff --git a/src/dxvk/dxvk_buffer.h b/src/dxvk/dxvk_buffer.h
+index 003fb74..dd24f13 100644
+--- a/src/dxvk/dxvk_buffer.h
++++ b/src/dxvk/dxvk_buffer.h
+@@ -281,11 +281,7 @@ namespace dxvk {
+       allocationInfo.resourceCookie = cookie();
+       allocationInfo.properties = m_properties;
+ 
+-      VkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+-      info.flags = m_info.flags;
+-      info.usage = m_info.usage;
+-      info.size = m_info.size;
+-      m_sharingMode.fill(info);
++      VkBufferCreateInfo info = getBufferCreateInfo();
+ 
+       return m_allocator->createBufferResource(info, allocationInfo, cache);
+     }
+@@ -399,6 +395,15 @@ namespace dxvk {
+ 
+   private:
+ 
++    VkBufferCreateInfo getBufferCreateInfo() const {
++      VkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
++      info.flags = m_info.flags;
++      info.usage = m_info.usage;
++      info.size = m_info.size;
++      m_sharingMode.fill(info);
++      return info;
++    }
++
+     Rc<vk::DeviceFn>            m_vkd;
+     VkMemoryPropertyFlags       m_properties    = 0u;
+     VkShaderStageFlags          m_shaderStages  = 0u;
+diff --git a/src/dxvk/dxvk_cmdlist.cpp b/src/dxvk/dxvk_cmdlist.cpp
+index 26dd159..828acf7 100644
+--- a/src/dxvk/dxvk_cmdlist.cpp
++++ b/src/dxvk/dxvk_cmdlist.cpp
+@@ -53,35 +53,28 @@ namespace dxvk {
+           DxvkDevice*           device,
+           VkQueue               queue,
+           uint64_t              frameId) {
++    if (this->isEmpty()) {
++      this->reset();
++      return VK_SUCCESS;
++    }
++
+     auto vk = device->vkd();
+ 
+     VkLatencySubmissionPresentIdNV latencyInfo = { VK_STRUCTURE_TYPE_LATENCY_SUBMISSION_PRESENT_ID_NV };
+     latencyInfo.presentID = frameId;
+ 
+     VkSubmitInfo2 submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+-
+-    if (!m_semaphoreWaits.empty()) {
+-      submitInfo.waitSemaphoreInfoCount = m_semaphoreWaits.size();
+-      submitInfo.pWaitSemaphoreInfos = m_semaphoreWaits.data();
+-    }
+-
+-    if (!m_commandBuffers.empty()) {
+-      submitInfo.commandBufferInfoCount = m_commandBuffers.size();
+-      submitInfo.pCommandBufferInfos = m_commandBuffers.data();
+-    }
+-
+-    if (!m_semaphoreSignals.empty()) {
+-      submitInfo.signalSemaphoreInfoCount = m_semaphoreSignals.size();
+-      submitInfo.pSignalSemaphoreInfos = m_semaphoreSignals.data();
+-    }
++    submitInfo.waitSemaphoreInfoCount   = uint32_t(m_semaphoreWaits.size());
++    submitInfo.pWaitSemaphoreInfos      = m_semaphoreWaits.data();
++    submitInfo.commandBufferInfoCount   = uint32_t(m_commandBuffers.size());
++    submitInfo.pCommandBufferInfos      = m_commandBuffers.data();
++    submitInfo.signalSemaphoreInfoCount = uint32_t(m_semaphoreSignals.size());
++    submitInfo.pSignalSemaphoreInfos    = m_semaphoreSignals.data();
+ 
+     if (frameId && device->features().nvLowLatency2)
+       latencyInfo.pNext = std::exchange(submitInfo.pNext, &latencyInfo);
+ 
+-    VkResult vr = VK_SUCCESS;
+-
+-    if (!this->isEmpty())
+-      vr = vk->vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
++    VkResult vr = vk->vkQueueSubmit2(queue, 1u, &submitInfo, VK_NULL_HANDLE);
+ 
+     this->reset();
+     return vr;
+@@ -261,6 +254,8 @@ namespace dxvk {
+ 
+     m_commandSubmission.reset();
+ 
++    const bool hasDedicatedTransferQueue = m_device->hasDedicatedTransferQueue();
++
+     for (size_t i = 0; i < m_cmdSubmissions.size(); i++) {
+       bool isFirst = i == 0;
+       bool isLast  = i == m_cmdSubmissions.size() - 1;
+@@ -273,9 +268,9 @@ namespace dxvk {
+ 
+       if (isFirst) {
+         // Wait for per-command list semaphores on first submission
+-        for (size_t i = 0; i < m_waitSemaphores.size(); i++) {
+-          m_commandSubmission.waitSemaphore(m_waitSemaphores[i].fence->handle(),
+-            m_waitSemaphores[i].value, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
++        for (size_t j = 0u; j < m_waitSemaphores.size(); j++) {
++          m_commandSubmission.waitSemaphore(m_waitSemaphores[j].fence->handle(),
++            m_waitSemaphores[j].value, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
+         }
+       }
+ 
+@@ -302,7 +297,7 @@ namespace dxvk {
+ 
+       // If we had either a transfer command or a semaphore wait, submit to the
+       // transfer queue so that all subsequent commands get stalled as necessary.
+-      if (m_device->hasDedicatedTransferQueue() && !m_commandSubmission.isEmpty()) {
++      if (hasDedicatedTransferQueue && !m_commandSubmission.isEmpty()) {
+         m_commandSubmission.signalSemaphore(semaphores.transfer,
+           ++timelines.transfer, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+ 
+@@ -332,9 +327,9 @@ namespace dxvk {
+ 
+       if (isLast) {
+         // Signal per-command list semaphores on the final submission
+-        for (size_t i = 0; i < m_signalSemaphores.size(); i++) {
+-          m_commandSubmission.signalSemaphore(m_signalSemaphores[i].fence->handle(),
+-            m_signalSemaphores[i].value, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
++        for (size_t j = 0u; j < m_signalSemaphores.size(); j++) {
++          m_commandSubmission.signalSemaphore(m_signalSemaphores[j].fence->handle(),
++            m_signalSemaphores[j].value, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+         }
+ 
+         // Signal WSI semaphore on the final submission
+@@ -495,10 +490,13 @@ namespace dxvk {
+     const DxvkDescriptorWrite*          descriptorInfos,
+           size_t                        pushDataSize,
+     const void*                         pushData) {
+-    if (m_device->canUseDescriptorHeap()) {
++    const bool useDescriptorHeap   = m_device->canUseDescriptorHeap();
++    const bool useDescriptorBuffer = m_device->canUseDescriptorBuffer();
++
++    if (useDescriptorHeap) {
+       bindResourcesDescriptorHeap(cmdBuffer, layout,
+         descriptorCount, descriptorInfos, pushDataSize, pushData);
+-    } else if (m_device->canUseDescriptorBuffer()) {
++    } else if (useDescriptorBuffer) {
+       bindResourcesDescriptorBuffer(cmdBuffer, layout,
+         descriptorCount, descriptorInfos, pushDataSize, pushData);
+     } else {
+@@ -522,6 +520,7 @@ namespace dxvk {
+       VkDescriptorSet set = m_descriptorPool->alloc(m_trackingId, setLayout);
+ 
+       small_vector<DxvkLegacyDescriptor, 16u> descriptors;
++      descriptors.reserve(descriptorCount);
+ 
+       for (uint32_t i = 0u; i < descriptorCount; i++) {
+         const auto& info = descriptorInfos[i];
+@@ -566,6 +565,7 @@ namespace dxvk {
+ 
+       // Bind set as well as the global sampler heap, if requested
+       small_vector<VkDescriptorSet, 2u> sets;
++      sets.reserve(2u);
+ 
+       if (layout->usesSamplerHeap())
+         sets.push_back(m_device->getSamplerDescriptorSet().set);
+@@ -576,7 +576,7 @@ namespace dxvk {
+       bindInfo.stageFlags = layout->getShaderStageMask();
+       bindInfo.layout = layout->getPipelineLayout();
+       bindInfo.firstSet = 0u;
+-      bindInfo.descriptorSetCount = sets.size();
++      bindInfo.descriptorSetCount = uint32_t(sets.size());
+       bindInfo.pDescriptorSets = sets.data();
+ 
+       this->cmdBindDescriptorSets(cmdBuffer, &bindInfo);
+@@ -586,10 +586,13 @@ namespace dxvk {
+     DxvkPushDataBlock pushDataBlock = layout->getPushData();
+ 
+     if (pushDataSize && !pushDataBlock.isEmpty()) {
+-      std::array<char, MaxTotalPushDataSize> dataCopy;
+-      std::memcpy(dataCopy.data(), pushData,
++      std::array<char, MaxTotalPushDataSize> dataCopy = { };
++      const size_t copySize = std::min(size_t(pushDataBlock.getSize()),
+         std::min(dataCopy.size(), pushDataSize));
+ 
++      if (copySize)
++        std::memcpy(dataCopy.data(), pushData, copySize);
++
+       VkPushConstantsInfo pushInfo = { VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO };
+       pushInfo.layout = layout->getPipelineLayout();
+       pushInfo.stageFlags = pushDataBlock.getStageMask();
+@@ -624,7 +627,7 @@ namespace dxvk {
+       VkPushDataInfoEXT pushInfo = { VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT };
+       pushInfo.offset = 0u;
+       pushInfo.data.address = pushData;
+-      pushInfo.data.size = pushDataSize;
++      pushInfo.data.size = std::min(size_t(pushDataBlock.getSize()), pushDataSize);
+ 
+       this->cmdPushData(cmdBuffer, &pushInfo);
+     }
+@@ -638,39 +641,40 @@ namespace dxvk {
+         createDescriptorRange();
+ 
+       // Need to pre-allocate arrays with a fixed size so pointers remain valid
+-      small_vector<DxvkDescriptor, 8u> buffers(descriptorCount);
+-      small_vector<VkHostAddressRangeEXT, 8u> hostRanges(descriptorCount);
+-      small_vector<VkDeviceAddressRangeEXT, 8u> bufferRanges(descriptorCount);
+-      small_vector<VkResourceDescriptorInfoEXT, 8u> writes(descriptorCount);
++      small_vector<DxvkDescriptor, 8u> buffers;
++      small_vector<VkHostAddressRangeEXT, 8u> hostRanges;
++      small_vector<VkDeviceAddressRangeEXT, 8u> bufferRanges;
++      small_vector<VkResourceDescriptorInfoEXT, 8u> writes;
++
++      buffers.reserve(descriptorCount);
++      hostRanges.reserve(descriptorCount);
++      bufferRanges.reserve(descriptorCount);
++      writes.reserve(descriptorCount);
+ 
+       // Populate descriptor arrays with necessary information
+       small_vector<const DxvkDescriptor*, 8u> descriptors;
+       descriptors.reserve(descriptorCount);
+ 
+-      uint32_t writeCount = 0u;
+-
+       for (uint32_t i = 0u; i < descriptorCount; i++) {
+         const auto& info = descriptorInfos[i];
+ 
+         switch (info.descriptorType) {
+           case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+           case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
+-            auto& descriptor = buffers[writeCount];
++            auto& descriptor = buffers.emplace_back();
+             descriptors.push_back(&descriptor);
+ 
+-            auto& hostRange = hostRanges[writeCount];
++            auto& hostRange = hostRanges.emplace_back();
+             hostRange = descriptor.getHostAddressRange();
+ 
+-            auto& bufferRange = bufferRanges[writeCount];
++            auto& bufferRange = bufferRanges.emplace_back();
+             bufferRange.address = info.buffer.gpuAddress;
+             bufferRange.size = info.buffer.size;
+ 
+-            auto& write = writes[writeCount];
++            auto& write = writes.emplace_back();
+             write.sType = VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT;
+             write.type = info.descriptorType;
+             write.data.pAddressRange = &bufferRange;
+-
+-            writeCount += 1u;
+           } break;
+ 
+           case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+@@ -692,13 +696,12 @@ namespace dxvk {
+       }
+ 
+       // Write out buffer descriptors
+-      if (writeCount) {
++      if (!writes.empty()) {
+         vk->vkWriteResourceDescriptorsEXT(vk->device(),
+-          writeCount, writes.data(), hostRanges.data());
++          uint32_t(writes.size()), writes.data(), hostRanges.data());
+       }
+ 
+       // Allocate descriptor storage and update the set
+-      auto setLayout = layout->getDescriptorSetLayout(0u);
+       auto storage = allocateDescriptors(setLayout);
+ 
+       setLayout->update(storage.mapPtr, descriptors.data());
+@@ -788,7 +791,6 @@ namespace dxvk {
+       }
+ 
+       // Allocate descriptor storage and update the set
+-      auto setLayout = layout->getDescriptorSetLayout(0u);
+       auto storage = allocateDescriptors(setLayout);
+ 
+       setLayout->update(storage.mapPtr, descriptors.data());
+@@ -824,10 +826,13 @@ namespace dxvk {
+     DxvkPushDataBlock pushDataBlock = layout->getPushData();
+ 
+     if (pushDataSize && !pushDataBlock.isEmpty()) {
+-      std::array<char, MaxTotalPushDataSize> dataCopy;
+-      std::memcpy(dataCopy.data(), pushData,
++      std::array<char, MaxTotalPushDataSize> dataCopy = { };
++      const size_t copySize = std::min(size_t(pushDataBlock.getSize()),
+         std::min(dataCopy.size(), pushDataSize));
+ 
++      if (copySize)
++        std::memcpy(dataCopy.data(), pushData, copySize);
++
+       VkPushConstantsInfo pushInfo = { VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO };
+       pushInfo.layout = layout->getPipelineLayout();
+       pushInfo.stageFlags = pushDataBlock.getStageMask();
+@@ -1004,7 +1009,7 @@ namespace dxvk {
+     resourceHeap.address = resourceInfo.gpuAddress;
+     resourceHeap.usage = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT;
+ 
+-    vk->vkCmdBindDescriptorBuffersEXT(cmdBuffer, heaps.size(), heaps.data());
++    vk->vkCmdBindDescriptorBuffersEXT(cmdBuffer, uint32_t(heaps.size()), heaps.data());
+   }
+ 
+ 
+@@ -1024,12 +1029,15 @@ namespace dxvk {
+       ? m_transferPool->getCommandBuffer(type)
+       : m_graphicsPool->getCommandBuffer(type);
+ 
+-    if (type <= DxvkCmdBuffer::InitBarriers && m_device->canUseDescriptorHeap()) {
++    const bool useDescriptorHeap   = m_device->canUseDescriptorHeap();
++    const bool useDescriptorBuffer = m_device->canUseDescriptorBuffer();
++
++    if (type <= DxvkCmdBuffer::InitBarriers && useDescriptorHeap) {
+       bindSamplerHeap(cmdBuffer);
+       bindResourceHeap(cmdBuffer);
+     }
+ 
+-    if (type <= DxvkCmdBuffer::InitBuffer && m_device->canUseDescriptorBuffer())
++    if (type <= DxvkCmdBuffer::InitBuffer && useDescriptorBuffer)
+       bindDescriptorBuffers(cmdBuffer);
+ 
+     return cmdBuffer;
+diff --git a/src/dxvk/dxvk_compute.cpp b/src/dxvk/dxvk_compute.cpp
+index a1ce755..b08d9fd 100644
+--- a/src/dxvk/dxvk_compute.cpp
++++ b/src/dxvk/dxvk_compute.cpp
+@@ -44,9 +44,7 @@ namespace dxvk {
+       m_libraryHandle = m_library->acquirePipelineHandle().handle;
+     }
+ 
+-    if (*m_libraryHandle) {
+-      // Compute pipelines without spec constants are always
+-      // pre-compiled, so we'll almost always hit this path
++    if (likely(*m_libraryHandle)) {
+       return *m_libraryHandle;
+     } else {
+       // Slow path for compute shaders that do use spec constants
+@@ -67,7 +65,7 @@ namespace dxvk {
+ 
+   void DxvkComputePipeline::compilePipeline(
+     const DxvkComputePipelineStateInfo& state) {
+-    if (!m_library) {
++    if (unlikely(!m_library)) {
+       std::lock_guard<dxvk::mutex> lock(m_mutex);
+ 
+       if (!this->findInstance(state))
+@@ -164,10 +162,15 @@ namespace dxvk {
+ 
+ 
+   std::string DxvkComputePipeline::createDebugName() const {
+-    std::string shaderName = m_shaders.cs->debugName();
+-    size_t len = std::min(shaderName.size(), size_t(10));
+-
+-    return str::format("[", shaderName.substr(0, len), "]");
++    const std::string shaderName = m_shaders.cs->debugName();
++    const size_t len = std::min(shaderName.size(), size_t(10));
++
++    std::string result;
++    result.reserve(len + 2u);
++    result.push_back('[');
++    result.append(shaderName, 0u, len);
++    result.push_back(']');
++    return result;
+   }
+ 
+ }
+diff --git a/src/dxvk/dxvk_cs.cpp b/src/dxvk/dxvk_cs.cpp
+index 7f8bd2d..08eb440 100644
+--- a/src/dxvk/dxvk_cs.cpp
++++ b/src/dxvk/dxvk_cs.cpp
+@@ -25,6 +25,10 @@ namespace dxvk {
+       
+       while (cmd != nullptr) {
+         auto next = cmd->next();
++
++        if (next != nullptr)
++          __builtin_prefetch(next, 0, 1);
++
+         cmd->exec(ctx);
+         cmd->~DxvkCsCmd();
+         cmd = next;
+@@ -34,8 +38,13 @@ namespace dxvk {
+       m_next = &m_head;
+     } else {
+       while (cmd != nullptr) {
++        auto next = cmd->next();
++
++        if (next != nullptr)
++          __builtin_prefetch(next, 0, 1);
++
+         cmd->exec(ctx);
+-        cmd = cmd->next();
++        cmd = next;
+       }
+     }
+   }
+diff --git a/src/dxvk/dxvk_graphics.h b/src/dxvk/dxvk_graphics.h
+index 31ccad6..743fa89 100644
+--- a/src/dxvk/dxvk_graphics.h
++++ b/src/dxvk/dxvk_graphics.h
+@@ -382,7 +382,7 @@ namespace dxvk {
+       result.type = DxvkGraphicsPipelineType::FastPipeline;
+       result.attachments = attachments;
+ 
+-      if (likely(fastHandle))
++      if (likely(result.handle))
+         return result;
+ 
+       result.handle = baseHandle.load(std::memory_order_acquire);
+diff --git a/src/dxvk/dxvk_graphics_state.h b/src/dxvk/dxvk_graphics_state.h
+index b467e8d..27f54c1 100644
+--- a/src/dxvk/dxvk_graphics_state.h
++++ b/src/dxvk/dxvk_graphics_state.h
+@@ -413,6 +413,17 @@ namespace dxvk {
+ 
+     uint64_t m_packedData;
+ 
++    static constexpr uint32_t Range0Start = uint32_t(VK_FORMAT_UNDEFINED);
++    static constexpr uint32_t Range0End   = uint32_t(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32);
++    static constexpr uint32_t Range1Start = uint32_t(VK_FORMAT_A4R4G4B4_UNORM_PACK16);
++    static constexpr uint32_t Range1End   = uint32_t(VK_FORMAT_A4B4G4R4_UNORM_PACK16);
++    static constexpr uint32_t Range2Start = uint32_t(VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR);
++    static constexpr uint32_t Range2End   = uint32_t(VK_FORMAT_A8_UNORM_KHR);
++
++    static constexpr uint32_t Range0Size  = Range0End - Range0Start + 1u;
++    static constexpr uint32_t Range1Size  = Range1End - Range1Start + 1u;
++    static constexpr uint32_t Range2Size  = Range2End - Range2Start + 1u;
++
+     static uint64_t encodeDepthStencilAspects(VkImageAspectFlags aspects) {
+       return uint64_t(aspects) << 61;
+     }
+@@ -424,18 +435,17 @@ namespace dxvk {
+     }
+ 
+     static uint64_t encodeColorFormat(VkFormat format, uint32_t index) {
+-      uint64_t value = 0u;
+-
+-      for (const auto& p : s_colorFormatRanges) {
+-        if (format >= p.first && format <= p.second) {
+-          value += uint32_t(format) - uint32_t(p.first);
+-          break;
+-        }
++      const uint32_t f = uint32_t(format);
++      uint32_t value = 0u;
+ 
+-        value += uint32_t(p.second) - uint32_t(p.first) + 1u;
+-      }
++      if (f <= Range0End)
++        value = f - Range0Start;
++      else if (f >= Range1Start && f <= Range1End)
++        value = Range0Size + (f - Range1Start);
++      else if (f >= Range2Start && f <= Range2End)
++        value = Range0Size + Range1Size + (f - Range2Start);
+ 
+-      return value << (7 * index);
++      return uint64_t(value) << (7u * index);
+     }
+ 
+     static VkImageAspectFlags decodeDepthStencilAspects(uint64_t value) {
+@@ -451,26 +461,24 @@ namespace dxvk {
+     }
+ 
+     static VkFormat decodeColorFormat(uint64_t value, uint32_t index) {
+-      value = (value >> (7 * index)) & 0x7F;
++      uint32_t code = uint32_t((value >> (7u * index)) & 0x7Fu);
+ 
+-      for (const auto& p : s_colorFormatRanges) {
+-        uint32_t rangeSize = uint32_t(p.second) - uint32_t(p.first) + 1u;
++      if (code < Range0Size)
++        return VkFormat(Range0Start + code);
+ 
+-        if (value < rangeSize)
+-          return VkFormat(uint32_t(p.first) + uint32_t(value));
++      code -= Range0Size;
+ 
+-        value -= rangeSize;
+-      }
++      if (code < Range1Size)
++        return VkFormat(Range1Start + code);
++
++      code -= Range1Size;
++
++      if (code < Range2Size)
++        return VkFormat(Range2Start + code);
+ 
+       return VK_FORMAT_UNDEFINED;
+     }
+ 
+-    static constexpr std::array<std::pair<VkFormat, VkFormat>, 3> s_colorFormatRanges = {{
+-      { VK_FORMAT_UNDEFINED,                  VK_FORMAT_E5B9G9R9_UFLOAT_PACK32  },  /*   0 - 123 */
+-      { VK_FORMAT_A4R4G4B4_UNORM_PACK16,      VK_FORMAT_A4B4G4R4_UNORM_PACK16   },  /* 124 - 125 */
+-      { VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR,  VK_FORMAT_A8_UNORM_KHR            },  /* 126 - 127 */
+-    }};
+-
+   };
+ 
+ 
+@@ -665,29 +673,37 @@ namespace dxvk {
+     }
+ 
+     bool useDynamicVertexStrides() const {
+-      if (!il.bindingCount())
+-        return false;
++      const uint32_t count = il.bindingCount();
+ 
+-      bool result = true;
++      if (!count)
++        return false;
+ 
+-      for (uint32_t i = 0; i < il.bindingCount() && result; i++)
+-        result = !ilBindings[i].stride();
++      for (uint32_t i = 0u; i < count; i++) {
++        if (ilBindings[i].stride())
++          return false;
++      }
+ 
+-      return result;
++      return true;
+     }
+ 
+     bool useDynamicBlendConstants() const {
+-      bool result = false;
+-      
+-      for (uint32_t i = 0; i < MaxNumRenderTargets && !result; i++) {
+-        result |= rt.getColorFormat(i) && omBlend[i].blendEnable()
+-         && (util::isBlendConstantBlendFactor(omBlend[i].srcColorBlendFactor())
+-          || util::isBlendConstantBlendFactor(omBlend[i].dstColorBlendFactor())
+-          || util::isBlendConstantBlendFactor(omBlend[i].srcAlphaBlendFactor())
+-          || util::isBlendConstantBlendFactor(omBlend[i].dstAlphaBlendFactor()));
++      for (uint32_t i = 0u; i < DxvkLimits::MaxNumRenderTargets; i++) {
++        if (!rt.getColorFormat(i))
++          continue;
++
++        const auto& blend = omBlend[i];
++
++        if (!blend.blendEnable())
++          continue;
++
++        if (util::isBlendConstantBlendFactor(blend.srcColorBlendFactor())
++         || util::isBlendConstantBlendFactor(blend.dstColorBlendFactor())
++         || util::isBlendConstantBlendFactor(blend.srcAlphaBlendFactor())
++         || util::isBlendConstantBlendFactor(blend.dstAlphaBlendFactor()))
++          return true;
+       }
+ 
+-      return result;
++      return false;
+     }
+ 
+     bool useDualSourceBlending() const {
+@@ -703,13 +719,14 @@ namespace dxvk {
+           && rs.sampleCount() == VK_SAMPLE_COUNT_1_BIT;
+     }
+ 
+-    bool writesRenderTarget(
+-            uint32_t                        target) const {
++    bool writesRenderTarget(uint32_t target) const {
++      if (unlikely(target >= DxvkLimits::MaxNumRenderTargets))
++        return false;
++
+       if (!omBlend[target].colorWriteMask())
+         return false;
+ 
+-      VkFormat rtFormat = rt.getColorFormat(target);
+-      return rtFormat != VK_FORMAT_UNDEFINED;
++      return rt.getColorFormat(target) != VK_FORMAT_UNDEFINED;
+     }
+ 
+ 
+diff --git a/src/dxvk/dxvk_image.cpp b/src/dxvk/dxvk_image.cpp
+index 3b5b739..86c1f83 100644
+--- a/src/dxvk/dxvk_image.cpp
++++ b/src/dxvk/dxvk_image.cpp
+@@ -2,6 +2,9 @@
+ 
+ #include "dxvk_device.h"
+ 
++#include <algorithm>
++#include <cstring>
++
+ namespace dxvk {
+   
+   DxvkKeyedMutex::DxvkKeyedMutex(
+@@ -260,9 +263,7 @@ namespace dxvk {
+     const DxvkImageViewKey& info) {
+     std::unique_lock lock(m_viewMutex);
+ 
+-    auto entry = m_views.emplace(std::piecewise_construct,
+-      std::make_tuple(info), std::make_tuple(this, info));
+-
++    auto entry = m_views.try_emplace(info, this, info);
+     return &entry.first->second;
+   }
+ 
+@@ -425,76 +426,75 @@ namespace dxvk {
+   }
+ 
+ 
+-  bool DxvkImage::isInitialized(const VkImageSubresourceRange& subresources) const {
+-    if (m_globalLayout != VK_IMAGE_LAYOUT_MAX_ENUM) {
+-      return m_globalLayout != VK_IMAGE_LAYOUT_UNDEFINED
+-          && m_globalLayout != VK_IMAGE_LAYOUT_PREINITIALIZED;
+-    } else {
+-      // Check each individual subresource layout
+-      VkImageAspectFlags aspects = subresources.aspectMask;
+-
+-      while (aspects) {
+-        VkImageSubresource subresource = { };
+-        subresource.aspectMask = vk::getNextAspect(aspects);
+-        subresource.mipLevel = subresources.baseMipLevel;
+-        subresource.arrayLayer = subresources.baseArrayLayer;
++  bool DxvkImage::isInitializedSlow(const VkImageSubresourceRange& subresources) const {
++    const VkImageLayout* const layouts = m_localLayouts.data();
++    VkImageAspectFlags aspects = subresources.aspectMask;
+ 
+-        for (uint32_t m = 0u; m < subresources.levelCount; m++) {
+-          uint32_t index = computeSubresourceIndex(subresource);
++    while (aspects) {
++      VkImageSubresource subresource = { };
++      subresource.aspectMask = vk::getNextAspect(aspects);
++      subresource.mipLevel = subresources.baseMipLevel;
++      subresource.arrayLayer = subresources.baseArrayLayer;
+ 
+-          for (uint32_t l = 0u; l < subresources.layerCount; l++) {
+-            VkImageLayout layout = m_localLayouts[index + l];
++      for (uint32_t m = 0u; m < subresources.levelCount; m++) {
++        const uint32_t base = computeSubresourceIndex(subresource);
++        const VkImageLayout* p = layouts + base;
+ 
+-            if (layout == VK_IMAGE_LAYOUT_UNDEFINED
+-             || layout == VK_IMAGE_LAYOUT_PREINITIALIZED)
+-              return false;
+-          }
++        uint32_t bad = 0u;
+ 
+-          subresource.mipLevel += 1u;
++        for (uint32_t l = 0u; l < subresources.layerCount; l++) {
++          const uint32_t v = uint32_t(p[l]);
++          bad |= uint32_t(v == uint32_t(VK_IMAGE_LAYOUT_UNDEFINED))
++               | uint32_t(v == uint32_t(VK_IMAGE_LAYOUT_PREINITIALIZED));
+         }
+-      }
+ 
+-      return true;
++        if (bad)
++          return false;
++
++        subresource.mipLevel += 1u;
++      }
+     }
+-  }
+ 
++    return true;
++  }
+ 
+-  VkImageLayout DxvkImage::queryLayout(const VkImageSubresourceRange& subresources) const {
+-    // Check whether the entire resource is in the same layout
+-    if (m_globalLayout != VK_IMAGE_LAYOUT_MAX_ENUM)
+-      return m_globalLayout;
+ 
++  VkImageLayout DxvkImage::queryLayoutSlow(const VkImageSubresourceRange& subresources) const {
+     VkImageSubresource subresource = { };
+     subresource.aspectMask = subresources.aspectMask & (subresources.aspectMask - 1u);
+     subresource.mipLevel = subresources.baseMipLevel;
+     subresource.arrayLayer = subresources.baseArrayLayer;
+ 
+-    VkImageLayout baseLayout = queryLayout(subresource);
++    const VkImageLayout baseLayout = queryLayout(subresource);
+ 
+-    // If only one subresource is included in the range, return its layout
+-    VkImageAspectFlags nonplanarAspects = VK_IMAGE_ASPECT_COLOR_BIT
+-                                        | VK_IMAGE_ASPECT_DEPTH_BIT
+-                                        | VK_IMAGE_ASPECT_STENCIL_BIT;
++    constexpr VkImageAspectFlags nonplanarAspects = VK_IMAGE_ASPECT_COLOR_BIT
++                                                  | VK_IMAGE_ASPECT_DEPTH_BIT
++                                                  | VK_IMAGE_ASPECT_STENCIL_BIT;
+ 
+     if (subresources.levelCount == 1u
+      && subresources.layerCount == 1u
+      && (subresources.aspectMask & nonplanarAspects))
+       return baseLayout;
+ 
+-    // Otherwise, check whether all subresources have the same layout
++    const VkImageLayout* const layouts = m_localLayouts.data();
+     VkImageAspectFlags aspects = subresources.aspectMask;
+ 
+     while (aspects) {
+       subresource.aspectMask = vk::getNextAspect(aspects);
++      subresource.arrayLayer = subresources.baseArrayLayer;
+       subresource.mipLevel = subresources.baseMipLevel;
+ 
+       for (uint32_t m = 0u; m < subresources.levelCount; m++) {
+-        uint32_t index = computeSubresourceIndex(subresource);
++        const uint32_t base = computeSubresourceIndex(subresource);
++        const VkImageLayout* p = layouts + base;
+ 
+-        for (uint32_t l = 0u; l < subresources.layerCount; l++) {
+-          if (m_localLayouts[index + l] != baseLayout)
+-            return VK_IMAGE_LAYOUT_MAX_ENUM;
+-        }
++        uint32_t mismatch = 0u;
++
++        for (uint32_t l = 0u; l < subresources.layerCount; l++)
++          mismatch |= uint32_t(p[l] != baseLayout);
++
++        if (mismatch)
++          return VK_IMAGE_LAYOUT_MAX_ENUM;
+ 
+         subresource.mipLevel += 1u;
+       }
+@@ -504,44 +504,33 @@ namespace dxvk {
+   }
+ 
+ 
+-  void DxvkImage::trackLayout(const VkImageSubresourceRange& subresources, VkImageLayout layout) {
+-    // Nothing to do if the layout doesn't change
+-    if (m_globalLayout == layout)
+-      return;
+-
++  void DxvkImage::trackLayoutSlow(const VkImageSubresourceRange& subresources, VkImageLayout layout) {
+     if (subresources == getAvailableSubresources()) {
+-      // Entire resource is in the same layout
+       m_globalLayout = layout;
+-    } else {
+-      if (m_globalLayout != VK_IMAGE_LAYOUT_MAX_ENUM) {
+-        // If previously the entire resource was in the same layout,
+-        // we need to update all subresource entries to that layout
+-        if (m_localLayouts.empty())
+-          m_localLayouts.resize(computeSubresourceCount());
+-
+-        for (size_t i = 0u; i < m_localLayouts.size(); i++)
+-          m_localLayouts[i] = m_globalLayout;
+-
+-        m_globalLayout = VK_IMAGE_LAYOUT_MAX_ENUM;
+-      }
++      return;
++    }
+ 
+-      // Update entries contained in the subresource range
+-      VkImageAspectFlags aspects = subresources.aspectMask;
++    if (m_globalLayout != VK_IMAGE_LAYOUT_MAX_ENUM) {
++      if (m_localLayouts.empty())
++        m_localLayouts.resize(computeSubresourceCount());
+ 
+-      while (aspects) {
+-        VkImageSubresource subresource;
+-        subresource.aspectMask = vk::getNextAspect(aspects);
+-        subresource.mipLevel = subresources.baseMipLevel;
+-        subresource.arrayLayer = subresources.baseArrayLayer;
++      std::fill_n(m_localLayouts.data(), m_localLayouts.size(), m_globalLayout);
++      m_globalLayout = VK_IMAGE_LAYOUT_MAX_ENUM;
++    }
+ 
+-        for (uint32_t m = 0u; m < subresources.levelCount; m++) {
+-          uint32_t index = computeSubresourceIndex(subresource);
++    VkImageLayout* const layouts = m_localLayouts.data();
++    VkImageAspectFlags aspects = subresources.aspectMask;
+ 
+-          for (uint32_t l = 0u; l < subresources.layerCount; l++)
+-            m_localLayouts[index + l] = layout;
++    while (aspects) {
++      VkImageSubresource subresource;
++      subresource.aspectMask = vk::getNextAspect(aspects);
++      subresource.mipLevel = subresources.baseMipLevel;
++      subresource.arrayLayer = subresources.baseArrayLayer;
+ 
+-          subresource.mipLevel += 1u;
+-        }
++      for (uint32_t m = 0u; m < subresources.levelCount; m++) {
++        const uint32_t base = computeSubresourceIndex(subresource);
++        std::fill_n(layouts + base, subresources.layerCount, layout);
++        subresource.mipLevel += 1u;
+       }
+     }
+   }
+@@ -597,8 +586,8 @@ namespace dxvk {
+   void DxvkImage::copyFormatList(uint32_t formatCount, const VkFormat* formats) {
+     m_viewFormats.resize(formatCount);
+ 
+-    for (uint32_t i = 0; i < formatCount; i++)
+-      m_viewFormats[i] = formats[i];
++    if (formatCount)
++      std::memcpy(m_viewFormats.data(), formats, formatCount * sizeof(VkFormat));
+ 
+     m_info.viewFormats = m_viewFormats.data();
+   }
+diff --git a/src/dxvk/dxvk_image.h b/src/dxvk/dxvk_image.h
+index a90a942..9be2f4a 100644
+--- a/src/dxvk/dxvk_image.h
++++ b/src/dxvk/dxvk_image.h
+@@ -203,7 +203,7 @@ namespace dxvk {
+      * \brief Image view properties
+      * \returns Image view properties
+      */
+-    DxvkImageViewKey info() const {
++    const DxvkImageViewKey& info() const {
+       return m_key;
+     }
+ 
+@@ -828,8 +828,14 @@ namespace dxvk {
+      * \param [in] subresources Subresource range
+      * \returns \c true if the subresources are initialized
+      */
+-    bool isInitialized(
+-      const VkImageSubresourceRange& subresources) const;
++    bool isInitialized(const VkImageSubresourceRange& subresources) const {
++      if (likely(m_globalLayout != VK_IMAGE_LAYOUT_MAX_ENUM)) {
++        return m_globalLayout != VK_IMAGE_LAYOUT_UNDEFINED
++            && m_globalLayout != VK_IMAGE_LAYOUT_PREINITIALIZED;
++      }
++
++      return isInitializedSlow(subresources);
++    }
+ 
+     /**
+      * \brief Queries current layout of an image subresource
+@@ -854,7 +860,12 @@ namespace dxvk {
+      * \param [in] subresources Subresource range to query
+      * \returns Current layout of the subresource range
+      */
+-    VkImageLayout queryLayout(const VkImageSubresourceRange& subresources) const;
++    VkImageLayout queryLayout(const VkImageSubresourceRange& subresources) const {
++      if (likely(m_globalLayout != VK_IMAGE_LAYOUT_MAX_ENUM))
++        return m_globalLayout;
++
++      return queryLayoutSlow(subresources);
++    }
+ 
+     /**
+      * \brief Updates per-subresource layout tracking
+@@ -862,7 +873,12 @@ namespace dxvk {
+      * \param [in] subresources Subresource range to transition
+      * \param [in] layout New layout for the subresource range
+      */
+-    void trackLayout(const VkImageSubresourceRange& subresources, VkImageLayout layout);
++    void trackLayout(const VkImageSubresourceRange& subresources, VkImageLayout layout) {
++      if (likely(m_globalLayout == layout))
++        return;
++
++      trackLayoutSlow(subresources, layout);
++    }
+ 
+     /**
+      * \brief Sets debug name for the backing resource
+@@ -928,6 +944,16 @@ namespace dxvk {
+ 
+     bool canUseUnifiedLayout(const DxvkDevice& device) const;
+ 
++    bool isInitializedSlow(
++      const VkImageSubresourceRange& subresources) const;
++
++    VkImageLayout queryLayoutSlow(
++      const VkImageSubresourceRange& subresources) const;
++
++    void trackLayoutSlow(
++      const VkImageSubresourceRange& subresources,
++            VkImageLayout             layout);
++
+     uint32_t computeSubresourceIndex(const VkImageSubresource& subresource) const {
+       return subresource.arrayLayer
+         + m_info.numLayers * (subresource.mipLevel
+diff --git a/src/dxvk/dxvk_memory.cpp b/src/dxvk/dxvk_memory.cpp
+index f6cd408..75b681d 100644
+--- a/src/dxvk/dxvk_memory.cpp
++++ b/src/dxvk/dxvk_memory.cpp
+@@ -691,16 +691,17 @@ namespace dxvk {
+     for (uint32_t i = 0; i < count; i++) {
+       auto iter = m_entries.begin();
+ 
+-      if (totalSize && totalSize + iter->first.size > size)
+-        break;
++      const VkDeviceSize effectiveSize = iter->second.mode == DxvkAllocationMode::NoDeviceMemory
++        ? iter->first.size * 16u
++        : iter->first.size;
+ 
+       // Reduce number of resource evictions performed per request by
+       // overestimating the amount of memory moved. May reduce stutter
+       // in high-ish frame rate scenarios.
+-      totalSize += iter->second.mode == DxvkAllocationMode::NoDeviceMemory
+-        ? iter->first.size * 16u
+-        : iter->first.size;
++      if (totalSize && totalSize + effectiveSize > size)
++        break;
+ 
++      totalSize += effectiveSize;
+       result.push_back(std::move(iter->second));
+       m_entries.erase(iter);
+     }
+diff --git a/src/dxvk/dxvk_shader.cpp b/src/dxvk/dxvk_shader.cpp
+index 74046ed..9a0302d 100644
+--- a/src/dxvk/dxvk_shader.cpp
++++ b/src/dxvk/dxvk_shader.cpp
+@@ -313,33 +313,39 @@ namespace dxvk {
+           VkPipelineCreateFlags2                flags) {
+     DxvkShaderStageInfo stageInfo(m_device, getPipelineLibraryLayout());
+     VkShaderStageFlags stageMask = getShaderStages();
++    VkShaderStageFlags stages = stageMask;
+ 
+-    { std::lock_guard lock(m_identifierMutex);
+-      VkShaderStageFlags stages = stageMask;
++    while (stages) {
++      auto stage = VkShaderStageFlagBits(stages & -stages);
+ 
+-      while (stages) {
+-        auto stage = VkShaderStageFlagBits(stages & -stages);
++      if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) {
++        std::lock_guard lock(m_identifierMutex);
+         auto identifier = getShaderIdentifier(stage);
+ 
+-        if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) {
+-          // Fail if we have no idenfitier for whatever reason, caller
+-          // should fall back to the slow path if this happens
+-          if (!identifier->identifierSize)
+-            return { VK_NULL_HANDLE, 0 };
++        // Fail if we have no identifier for whatever reason, caller
++        // should fall back to the slow path if this happens.
++        if (!identifier->identifierSize)
++          return { VK_NULL_HANDLE, 0 };
++
++        stageInfo.addStage(stage, *identifier, nullptr);
++      } else {
++        // Decompress code outside the identifier mutex. This can be costly
++        // during parallel state-cache warmup, and the identifier generation
++        // itself is still serialized below.
++        SpirvCodeBuffer spirvCode = this->getShaderCode(stage);
+ 
+-          stageInfo.addStage(stage, *identifier, nullptr);
+-        } else {
+-          // Decompress code and generate identifier as needed
+-          SpirvCodeBuffer spirvCode = this->getShaderCode(stage);
++        {
++          std::lock_guard lock(m_identifierMutex);
++          auto identifier = getShaderIdentifier(stage);
+ 
+           if (!identifier->identifierSize)
+             this->generateModuleIdentifierLocked(identifier, spirvCode);
+-
+-          stageInfo.addStage(stage, std::move(spirvCode), nullptr);
+         }
+ 
+-        stages &= stages - 1;
++        stageInfo.addStage(stage, std::move(spirvCode), nullptr);
+       }
++
++      stages &= stages - 1;
+     }
+ 
+     VkPipeline pipeline = VK_NULL_HANDLE;
+-- 
+2.47.3
+
