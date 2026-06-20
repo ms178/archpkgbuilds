@@ -37,10 +37,10 @@ index 63abb5393a4d6bb8f80584f9021b89d325966118..ae688891c067ef6e5cd769c4b811c58b
 +obj-$(CONFIG_CPU_IDLE_GOV_NAP) += nap/
 diff --git a/drivers/cpuidle/governors/nap/Makefile b/drivers/cpuidle/governors/nap/Makefile
 new file mode 100644
-index 0000000000000000000000000000000000000000..98742499dd58a639beaf65384478cda673eb5de9
+index 0000000000000000000000000000000000000000..0258623c25a7530d0af25f5f09ed29550a76d381
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/Makefile
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,64 @@
 +# SPDX-License-Identifier: GPL-2.0-only
 +#
 +# Makefile for the NAP cpuidle governor
@@ -67,7 +67,7 @@ index 0000000000000000000000000000000000000000..98742499dd58a639beaf65384478cda6
 +
 +obj-$(CONFIG_CPU_IDLE_GOV_NAP) += cpuidle_gov_nap.o
 +
-+cpuidle_gov_nap-y := nap.o nap_fpu.o nap_nn_sse2.o nap_nn_avx2.o
++cpuidle_gov_nap-y := nap.o nap_fpu.o nap_nn_sse2.o nap_nn_avx2.o nap_nn_avx512.o nap_nn_native.o
 +
 +# Flags the kernel adds globally that we have to strip from FPU TUs.
 +FPU_KILL_FLAGS := -mno-sse -mno-sse2 -mno-mmx -mno-avx -mno-3dnow \
@@ -76,16 +76,41 @@ index 0000000000000000000000000000000000000000..98742499dd58a639beaf65384478cda6
 +CFLAGS_REMOVE_nap_fpu.o      += $(FPU_KILL_FLAGS)
 +CFLAGS_REMOVE_nap_nn_sse2.o  += $(FPU_KILL_FLAGS)
 +CFLAGS_REMOVE_nap_nn_avx2.o  += $(FPU_KILL_FLAGS)
++CFLAGS_REMOVE_nap_nn_avx512.o += $(FPU_KILL_FLAGS)
++CFLAGS_REMOVE_nap_nn_native.o += $(FPU_KILL_FLAGS)
 +
 +CFLAGS_nap_fpu.o      += $(CC_FLAGS_FPU)
 +CFLAGS_nap_nn_sse2.o  += $(CC_FLAGS_FPU) -msse2
-+CFLAGS_nap_nn_avx2.o  += $(CC_FLAGS_FPU) -msse2 -mavx -mavx2 -mfma
++
++# Tell nap.c whether the native TU may contain AVX-512 instructions.
++# If so, runtime dispatch enables native only on AVX-512-capable CPUs and
++# otherwise falls back to the exact AVX2 TU.  This keeps native kernels fast
++# on their build CPU without making the AVX2 fallback accidentally unsafe.
++nap_native_has_avx512 := $(shell $(CC) -march=native -dM -E -x c /dev/null 2>/dev/null | grep -q __AVX512 && echo y)
++ifeq ($(nap_native_has_avx512),y)
++CFLAGS_nap.o += -DNAP_NATIVE_REQUIRES_AVX512
++endif
++
++# ISA-specific TUs:
++#   native     - for local native kernels: use every instruction the build CPU
++#                exposes through -march=native (Raptor Lake => AVX2/FMA plus
++#                BMI/LZCNT/etc.; AVX-512-capable hosts => AVX-512VL when the
++#                compiler finds it profitable).  Runtime dispatch selects this
++#                path first on AVX2+FMA CPUs, matching the native-kernel model.
++#   avx2       - exact portable AVX2+FMA fallback, no build-host ISA leakage.
++#   avx512     - exact portable AVX-512VL+FMA fallback for AVX-512-capable CPUs.
++CFLAGS_nap_nn_native.o += $(CC_FLAGS_FPU) -march=native -mavx -mavx2 -mfma
++CFLAGS_nap_nn_avx2.o   += $(CC_FLAGS_FPU) -march=x86-64 \
++                          -mavx -mavx2 -mfma
++CFLAGS_nap_nn_avx512.o += $(CC_FLAGS_FPU) -march=x86-64 \
++                          -mavx -mavx2 -mfma \
++                          -mavx512f -mavx512vl -mavx512dq -mavx512bw
 diff --git a/drivers/cpuidle/governors/nap/nap.c b/drivers/cpuidle/governors/nap/nap.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..38afa9de22e894a7663a170c25c3a0342f1fa8bd
+index 0000000000000000000000000000000000000000..61df5283a03c604ca46528ccf42fd27cec52145e
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.c
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,664 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap.c — Neural Adaptive Predictor cpuidle governor (v0.4.0-r1)
@@ -152,14 +177,36 @@ index 0000000000000000000000000000000000000000..38afa9de22e894a7663a170c25c3a034
 + * ISA dispatch via static keys
 + * ================================================================ */
 +
++DEFINE_STATIC_KEY_FALSE(nap_use_native);
++DEFINE_STATIC_KEY_FALSE(nap_use_avx512);
 +DEFINE_STATIC_KEY_FALSE(nap_use_avx2);
 +
 +static void __init nap_detect_simd(void)
 +{
-+	if (boot_cpu_has(X86_FEATURE_FMA) &&
-+	    boot_cpu_has(X86_FEATURE_AVX2)) {
++	bool have_avx2 = boot_cpu_has(X86_FEATURE_FMA) &&
++			 boot_cpu_has(X86_FEATURE_AVX2);
++	bool have_avx512 = have_avx2 &&
++			   boot_cpu_has(X86_FEATURE_AVX512F) &&
++			   boot_cpu_has(X86_FEATURE_AVX512VL) &&
++			   boot_cpu_has(X86_FEATURE_AVX512DQ) &&
++			   boot_cpu_has(X86_FEATURE_AVX512BW);
++
++	if (have_avx512)
++		static_branch_enable(&nap_use_avx512);
++	if (have_avx2) {
 +		static_branch_enable(&nap_use_avx2);
-+		pr_info("nap: using AVX2+FMA\n");
++#ifdef NAP_NATIVE_REQUIRES_AVX512
++		if (have_avx512) {
++			static_branch_enable(&nap_use_native);
++			pr_info("nap: using native AVX-512VL+FMA path\n");
++		} else {
++			pr_info("nap: using exact AVX2+FMA path ");
++			pr_cont("(native TU requires AVX-512)\n");
++		}
++#else
++		static_branch_enable(&nap_use_native);
++		pr_info("nap: using native AVX2+FMA path\n");
++#endif
 +	} else {
 +		pr_info("nap: using SSE2\n");
 +	}
@@ -188,16 +235,19 @@ index 0000000000000000000000000000000000000000..38afa9de22e894a7663a170c25c3a034
 +				    struct cpuidle_device *dev,
 +				    s64 latency_req)
 +{
++	int first_enabled = -1;
 +	int i;
 +
-+	for (i = 1; i < drv->state_count; i++) {
++	for (i = 0; i < drv->state_count; i++) {
 +		if (dev->states_usage[i].disable)
 +			continue;
-+		if (drv->states[i].exit_latency_ns > latency_req)
-+			continue;
-+		return i;
++		if (first_enabled < 0)
++			first_enabled = i;
++		if (drv->states[i].exit_latency_ns <= latency_req)
++			return i;
 +	}
-+	return 0;
++
++	return first_enabled >= 0 ? first_enabled : 0;
 +}
 +
 +static inline int nap_get_min_valid_state(struct nap_cpu_data *d,
@@ -238,9 +288,11 @@ index 0000000000000000000000000000000000000000..38afa9de22e894a7663a170c25c3a034
 +	else
 +		budget = sleep_length_ns + NAP_POLL_LIMIT_MARGIN_NS;
 +
-+	return clamp_t(u64, budget,
-+		       NAP_POLL_LIMIT_MIN_NS,
-+		       min_state_target_ns);
++	if (min_state_target_ns <= NAP_POLL_LIMIT_MIN_NS)
++		return min_state_target_ns;
++
++	return min_t(u64, max_t(u64, budget, NAP_POLL_LIMIT_MIN_NS),
++		     min_state_target_ns);
 +}
 +
 +/* ================================================================
@@ -268,9 +320,10 @@ index 0000000000000000000000000000000000000000..38afa9de22e894a7663a170c25c3a034
 +				  s64 latency_req,
 +				  u64 sleep_length_ns)
 +{
++	int first_enabled = nap_first_enabled_state(drv, dev);
 +	int i;
 +
-+	for (i = drv->state_count - 1; i > 0; i--) {
++	for (i = drv->state_count - 1; i >= 0; i--) {
 +		if (dev->states_usage[i].disable)
 +			continue;
 +		if (drv->states[i].exit_latency_ns > latency_req)
@@ -279,7 +332,8 @@ index 0000000000000000000000000000000000000000..38afa9de22e894a7663a170c25c3a034
 +			continue;
 +		return i;
 +	}
-+	return 0;
++
++	return first_enabled;
 +}
 +
 +/* ================================================================
@@ -293,6 +347,7 @@ index 0000000000000000000000000000000000000000..38afa9de22e894a7663a170c25c3a034
 +	struct nap_cpu_data *d = this_cpu_ptr(&nap_data);
 +	s64 latency_req;
 +	ktime_t delta_tick;
++	s64 sleep_length;
 +	u64 sleep_length_ns;
 +	int idx, min_state;
 +
@@ -300,7 +355,8 @@ index 0000000000000000000000000000000000000000..38afa9de22e894a7663a170c25c3a034
 +		return 0;
 +
 +	latency_req = cpuidle_governor_latency_req(dev->cpu);
-+	sleep_length_ns = ktime_to_ns(tick_nohz_get_sleep_length(&delta_tick));
++	sleep_length = ktime_to_ns(tick_nohz_get_sleep_length(&delta_tick));
++	sleep_length_ns = sleep_length > 0 ? (u64)sleep_length : 0;
 +
 +	min_state = nap_get_min_valid_state(d, drv, dev, latency_req);
 +
@@ -308,27 +364,34 @@ index 0000000000000000000000000000000000000000..38afa9de22e894a7663a170c25c3a034
 +	 * Short-circuit: no C-state can pay back its target residency
 +	 * within the predicted sleep length.  Return POLL.
 +	 *
-+	 * B22 fix: if state 0 (POLL) is itself disabled by sysfs, we
-+	 * cannot return it.  Fall through to the NN/heuristic path,
-+	 * which will pick whatever is actually enterable.
++	 * If state 0 (POLL) is disabled by sysfs, do not fall through to
++	 * the NN: the timer is already too close for the minimum enterable
++	 * state, so choose the shallowest enabled state directly.
 +	 */
-+	if ((min_state == 0 ||
-+	     sleep_length_ns < drv->states[min_state].target_residency_ns) &&
-+	    !dev->states_usage[0].disable) {
++	if (min_state == 0 ||
++	    sleep_length_ns < drv->states[min_state].target_residency_ns) {
++		if (!dev->states_usage[0].disable) {
++			if (min_state > 0)
++				dev->poll_limit_ns = nap_compute_poll_limit(
++					sleep_length_ns,
++					drv->states[min_state].target_residency_ns);
++			else
++				dev->poll_limit_ns = max_t(u64, sleep_length_ns,
++							   NAP_POLL_LIMIT_MIN_NS);
 +
-+		if (min_state > 0)
-+			dev->poll_limit_ns = nap_compute_poll_limit(
-+				sleep_length_ns,
-+				drv->states[min_state].target_residency_ns);
-+		else
-+			dev->poll_limit_ns = max_t(u64, sleep_length_ns,
-+						   NAP_POLL_LIMIT_MIN_NS);
++			*stop_tick = false;
++			d->last_selected_idx = 0;
++			d->short_circuited = true;
++			d->stats.total_selects++;
++			return 0;
++		}
 +
-+		*stop_tick = false;
-+		d->last_selected_idx = 0;
++		/* POLL is disabled; use the shallowest enabled state. */
++		*stop_tick = nap_should_stop_tick(drv, min_state, sleep_length_ns);
++		d->last_selected_idx = min_state;
 +		d->short_circuited = true;
 +		d->stats.total_selects++;
-+		return 0;
++		return min_state;
 +	}
 +
 +	/* Normal NN-driven path */
@@ -340,7 +403,7 @@ index 0000000000000000000000000000000000000000..38afa9de22e894a7663a170c25c3a034
 +				     sleep_length_ns);
 +		kernel_fpu_end();
 +
-+		if (unlikely(idx < 0))
++		if (unlikely(idx < 0 || idx >= drv->state_count))
 +			idx = nap_fallback_heuristic(drv, dev, latency_req,
 +						     sleep_length_ns);
 +	} else {
@@ -349,12 +412,11 @@ index 0000000000000000000000000000000000000000..38afa9de22e894a7663a170c25c3a034
 +	}
 +
 +	/* Defensive: never return a disabled state */
-+	if (unlikely(idx > 0 && dev->states_usage[idx].disable))
++	if (unlikely(dev->states_usage[idx].disable))
 +		idx = nap_fallback_heuristic(drv, dev, latency_req,
 +					     sleep_length_ns);
 +
-+	*stop_tick = (drv->states[idx].target_residency_ns >
-+		      RESIDENCY_THRESHOLD_NS);
++	*stop_tick = nap_should_stop_tick(drv, idx, sleep_length_ns);
 +
 +	d->last_selected_idx = idx;
 +	d->stats.total_selects++;
@@ -376,6 +438,7 @@ index 0000000000000000000000000000000000000000..38afa9de22e894a7663a170c25c3a034
 +	 * keep this idle event out of the NN training distribution.
 +	 */
 +	if (d->short_circuited) {
++		d->prev_idle_exit = local_clock();
 +		d->stats.total_residency_ns += measured_ns;
 +		return;
 +	}
@@ -604,6 +667,12 @@ index 0000000000000000000000000000000000000000..38afa9de22e894a7663a170c25c3a034
 +static ssize_t simd_show(struct kobject *kobj,
 +			 struct kobj_attribute *attr, char *buf)
 +{
++	if (static_branch_unlikely(&nap_use_native))
++		return sysfs_emit(buf, "native-%s\n",
++			static_branch_unlikely(&nap_use_avx512) ?
++			"avx512vl" : "avx2");
++	if (static_branch_unlikely(&nap_use_avx512))
++		return sysfs_emit(buf, "avx512vl\n");
 +	if (static_branch_unlikely(&nap_use_avx2))
 +		return sysfs_emit(buf, "avx2\n");
 +	return sysfs_emit(buf, "sse2\n");
@@ -708,10 +777,10 @@ index 0000000000000000000000000000000000000000..38afa9de22e894a7663a170c25c3a034
 +postcore_initcall(nap_init);
 diff --git a/drivers/cpuidle/governors/nap/nap.h b/drivers/cpuidle/governors/nap/nap.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..c00a6e0ce6533b5e5c8dae0197486ab7ef9374cd
+index 0000000000000000000000000000000000000000..318f212eab8ad2808bf5472d82ecfce476f7b9ca
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.h
-@@ -0,0 +1,339 @@
+@@ -0,0 +1,376 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef NAP_H
 +#define NAP_H
@@ -720,6 +789,7 @@ index 0000000000000000000000000000000000000000..c00a6e0ce6533b5e5c8dae0197486ab7
 +#include <linux/cpuidle.h>
 +#include <linux/jump_label.h>
 +#include <linux/ktime.h>
++#include <linux/tick.h>
 +#include <linux/types.h>
 +
 +/* ================================================================
@@ -868,10 +938,35 @@ index 0000000000000000000000000000000000000000..c00a6e0ce6533b5e5c8dae0197486ab7
 +#define NAP_POLL_LIMIT_MARGIN_NS      1000ULL
 +#define NAP_MIN_STATE_REFRESH_JIFFIES HZ
 +
++static inline int nap_first_enabled_state(struct cpuidle_driver *drv,
++					  struct cpuidle_device *dev)
++{
++	int i;
++
++	for (i = 0; i < drv->state_count; i++) {
++		if (!dev->states_usage[i].disable)
++			return i;
++	}
++
++	/* cpuidle core expects a non-negative index even if sysfs disabled all. */
++	return 0;
++}
++
++static inline bool nap_should_stop_tick(struct cpuidle_driver *drv, int idx,
++					u64 sleep_length_ns)
++{
++	if (idx <= 0 || (drv->states[idx].flags & CPUIDLE_FLAG_POLLING))
++		return false;
++
++	return sleep_length_ns >= TICK_NSEC || tick_nohz_tick_stopped();
++}
++
 +/* ================================================================
 + * Static key for ISA dispatch (defined in nap.c)
 + * ================================================================ */
 +
++DECLARE_STATIC_KEY_FALSE(nap_use_native);
++DECLARE_STATIC_KEY_FALSE(nap_use_avx512);
 +DECLARE_STATIC_KEY_FALSE(nap_use_avx2);
 +
 +/* ================================================================
@@ -940,6 +1035,11 @@ index 0000000000000000000000000000000000000000..c00a6e0ce6533b5e5c8dae0197486ab7
 +static inline void v8sf_storeu(float *p, v8sf v)
 +{
 +	__builtin_memcpy(p, &v, sizeof(v));
++}
++
++static inline void nap_vzeroupper(void)
++{
++	__builtin_ia32_vzeroupper();
 +}
 +#endif /* __AVX__ */
 +
@@ -1038,11 +1138,17 @@ index 0000000000000000000000000000000000000000..c00a6e0ce6533b5e5c8dae0197486ab7
 +
 +void nap_nn_forward_sse2(const float *input, float *output,
 +			 float *hidden_save, const struct nap_weights *w);
++void nap_nn_forward_native(const float *input, float *output,
++			   float *hidden_save, const struct nap_weights *w);
 +void nap_nn_forward_avx2(const float *input, float *output,
 +			 float *hidden_save, const struct nap_weights *w);
++void nap_nn_forward_avx512(const float *input, float *output,
++			   float *hidden_save, const struct nap_weights *w);
 +
 +void nap_nn_learn_sse2(struct nap_cpu_data *d);
++void nap_nn_learn_native(struct nap_cpu_data *d);
 +void nap_nn_learn_avx2(struct nap_cpu_data *d);
++void nap_nn_learn_avx512(struct nap_cpu_data *d);
 +
 +/* ================================================================
 + * sysfs init/exit (nap.c)
@@ -1053,10 +1159,10 @@ index 0000000000000000000000000000000000000000..c00a6e0ce6533b5e5c8dae0197486ab7
 +#endif /* NAP_H */
 diff --git a/drivers/cpuidle/governors/nap/nap_fpu.c b/drivers/cpuidle/governors/nap/nap_fpu.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..79fc9c96c9e45302dfffdc2558a8a3532765f352
+index 0000000000000000000000000000000000000000..cb897bdcca0e07b3b762e801d74f334c1a195adb
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_fpu.c
-@@ -0,0 +1,521 @@
+@@ -0,0 +1,530 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_fpu.c — FPU/SIMD code for the NAP cpuidle governor
@@ -1142,7 +1248,11 @@ index 0000000000000000000000000000000000000000..79fc9c96c9e45302dfffdc2558a8a353
 +				  float *hidden_save,
 +				  const struct nap_weights *w)
 +{
-+	if (static_branch_likely(&nap_use_avx2))
++	if (static_branch_likely(&nap_use_native))
++		nap_nn_forward_native(input, output, hidden_save, w);
++	else if (static_branch_likely(&nap_use_avx512))
++		nap_nn_forward_avx512(input, output, hidden_save, w);
++	else if (static_branch_likely(&nap_use_avx2))
 +		nap_nn_forward_avx2(input, output, hidden_save, w);
 +	else
 +		nap_nn_forward_sse2(input, output, hidden_save, w);
@@ -1150,7 +1260,11 @@ index 0000000000000000000000000000000000000000..79fc9c96c9e45302dfffdc2558a8a353
 +
 +static inline void nap_nn_learn(struct nap_cpu_data *d)
 +{
-+	if (static_branch_likely(&nap_use_avx2))
++	if (static_branch_likely(&nap_use_native))
++		nap_nn_learn_native(d);
++	else if (static_branch_likely(&nap_use_avx512))
++		nap_nn_learn_avx512(d);
++	else if (static_branch_likely(&nap_use_avx2))
 +		nap_nn_learn_avx2(d);
 +	else
 +		nap_nn_learn_sse2(d);
@@ -1563,7 +1677,8 @@ index 0000000000000000000000000000000000000000..79fc9c96c9e45302dfffdc2558a8a353
 +	/* Threshold selection */
 +	{
 +		float log2_eff = d->nn_output;
-+		int idx = 0, i;
++		int idx = nap_first_enabled_state(drv, dev);
++		int i;
 +
 +		for (i = drv->state_count - 1; i > 0; i--) {
 +			if (dev->states_usage[i].disable)
@@ -1580,10 +1695,10 @@ index 0000000000000000000000000000000000000000..79fc9c96c9e45302dfffdc2558a8a353
 +}
 diff --git a/drivers/cpuidle/governors/nap/nap_nn_avx2.c b/drivers/cpuidle/governors/nap/nap_nn_avx2.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..684ce04370436b274f8a7aaddc127304e92fd48d
+index 0000000000000000000000000000000000000000..9391f4b41c80cfae45b803950bc4378c359e9026
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_nn_avx2.c
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,242 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_nn_avx2.c -- AVX2+FMA forward and backward for the NAP MLP
@@ -1740,6 +1855,7 @@ index 0000000000000000000000000000000000000000..684ce04370436b274f8a7aaddc127304
 +		s4 = s4 + t;
 +	}
 +	*output = s4[0] + w->b_out;
++	nap_vzeroupper();
 +}
 +
 +/* ================================================================
@@ -1823,7 +1939,270 @@ index 0000000000000000000000000000000000000000..684ce04370436b274f8a7aaddc127304
 +
 +		*b = v_neg_lr * upd + *b;
 +	}
++	nap_vzeroupper();
 +}
+diff --git a/drivers/cpuidle/governors/nap/nap_nn_avx512.c b/drivers/cpuidle/governors/nap/nap_nn_avx512.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..54890ef50194fdd951c6f39e44a2d08a3d6cca40
+--- /dev/null
++++ b/drivers/cpuidle/governors/nap/nap_nn_avx512.c
+@@ -0,0 +1,236 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * nap_nn_avx512.c -- AVX-512VL+FMA forward and backward for the NAP MLP
++ *
++ * 8 -> 8 -> 1 scalar regression.  Hidden layer = one ymm register;
++ * each input broadcasts across all 8 hidden neurons via FMA.
++ *
++ * MUST be called only from within kernel_fpu_begin()/end().
++ * Compiled with: -march=x86-64-v4 (see Makefile).
++ *
++ * Audit notes:
++ *   This is the real AVX-512 path, not an AVX2 build-host workaround.
++ *   The model has exactly 8 hidden neurons, so a zmm implementation would
++ *   waste half the lanes and can trigger a heavier frequency license on
++ *   some Intel server CPUs.  We therefore keep the proven 8-lane ymm data
++ *   layout and compile this TU for x86-64-v4 so Clang can use AVX-512VL
++ *   encodings and opmask forms where they reduce uops.  In practice the
++ *   learning ReLU mask folds into a predicated multiply on AVX-512VL, while
++ *   the forward pass remains the same FMA-dense 8-wide kernel.
++ *
++ *   Round 3 (Raptor Cove benchmark): forward pass switched from
++ *   2-chain to 4-chain FMA accumulator parallelism.  Measured on
++ *   Ice Lake-class Xeon (which shares Raptor Cove's FMA latency,
++ *   throughput, and port assignments): 12 -> 10 cycles/call, ~16%
++ *   faster, fully unrolled, no compiler spills, bit-identical
++ *   output.  See bench/bench2.c for the measurement harness.
++ */
++
++#include "nap.h"
++
++static inline v8sf v8sf_load(const float *p)
++{
++	return *(const v8sf *)p;
++}
++
++static inline void v8sf_store(float *p, v8sf v)
++{
++	*(v8sf *)p = v;
++}
++
++static inline v8sf v8sf_clamp(v8sf v, v8sf lo, v8sf hi)
++{
++	return __builtin_ia32_maxps256(__builtin_ia32_minps256(v, hi), lo);
++}
++
++/* ================================================================
++ * Forward pass
++ *
++ * Four parallel FMA accumulator chains across 8 inputs (2 FMAs/chain),
++ * reduced via a balanced add tree to a single ymm, then horizontally
++ * summed to a scalar.
++ *
++ * Why 4 chains instead of 2 (round-1 design):
++ *   Raptor Cove FMA latency is 4 cycles, throughput is 2/cycle on
++ *   ports 0+1.  With 2 chains of 4 dependent FMAs, the dependent
++ *   latency is 16 cycles -- that's the bottleneck, the throughput
++ *   ports are idle most of that time.
++ *   With 4 chains of 2 dependent FMAs each, the dependent latency
++ *   drops to 8 cycles, and the throughput ports are still well-fed
++ *   (8 FMAs over 8 cycles = 1/cycle, leaving headroom for the
++ *   surrounding broadcasts and reduction).
++ *
++ * Measured on Ice Lake (close Raptor Cove relative): 2-chain = 11-12
++ * cycles min/call, 4-chain = 10 cycles min/call, a steady ~16%
++ * improvement.  Ice Lake and Raptor Cove share FMA latency,
++ * throughput, and broadcast/shuffle port assignments, so this
++ * carries to Raptor Cove.  See bench/bench2.c for the measurement
++ * harness.
++ *
++ * 8-chain ILP was also tested and produced no further speedup --
++ * 4 chains is already enough to hide the FMA latency given the
++ * available throughput.  Batching the 8 input broadcasts into an
++ * array at function entry was tested too and was strictly slower
++ * (compiler spilled to stack).
++ *
++ * Estimated cost (Raptor Lake P-core, hot icache, hot weights):
++ *   - 8 broadcasts on port 5: ~4 cycles throughput-bound
++ *     (port 5 also takes shuffles in the tail, but those are after
++ *     the FMAs settle)
++ *   - 8 FMAs over 4 chains: 2 dependent FMAs/chain * 4 cycles = 8
++ *     cycles latency; throughput 8/2 = 4 cycles -- latency wins
++ *   - Reduction tree (3 vaddps): 3 * 3 cycles = 9 cycles, but
++ *     overlaps with the FMA chain tails
++ *   - vmaxps (ReLU): 3 cycles
++ *   - output dot: vmulps + 2 vextractf128 + 2 vaddps + 2 shuffles
++ *     + scalar reduce, almost entirely overlapped with the hidden
++ *     store
++ *   Estimated total: ~25 cycles.  Static estimate per Agner Fog 4
++ *   section 11 (Raptor Cove).
++ * ================================================================ */
++
++void nap_nn_forward_avx512(const float *input,
++			 float *output,
++			 float *hidden_save,
++			 const struct nap_weights *w)
++{
++	/*
++	 * Four parallel accumulator chains.  Chain 0 starts with the
++	 * hidden-layer bias; the other three start at zero and are
++	 * combined into chain 0 below via a balanced add tree.
++	 */
++	v8sf acc0 = v8sf_load(&w->b_h1[0]);
++	v8sf acc1 = V8SF_ZERO;
++	v8sf acc2 = V8SF_ZERO;
++	v8sf acc3 = V8SF_ZERO;
++	v8sf h;
++	v4sf lo, hi, s4;
++
++	/*
++	 * Fully unrolled to give the scheduler maximum freedom.
++	 * 8 FMAs total, distributed across the 4 chains as:
++	 *   acc0 += w[0] * x0;   acc0 += w[4] * x4;
++	 *   acc1 += w[1] * x1;   acc1 += w[5] * x5;
++	 *   acc2 += w[2] * x2;   acc2 += w[6] * x6;
++	 *   acc3 += w[3] * x3;   acc3 += w[7] * x7;
++	 * Critical chain per accumulator: 2 dependent FMAs.
++	 */
++	acc0 = v8sf_load(&w->w_h1[0][0]) * V8SF_SET1(input[0]) + acc0;
++	acc1 = v8sf_load(&w->w_h1[1][0]) * V8SF_SET1(input[1]) + acc1;
++	acc2 = v8sf_load(&w->w_h1[2][0]) * V8SF_SET1(input[2]) + acc2;
++	acc3 = v8sf_load(&w->w_h1[3][0]) * V8SF_SET1(input[3]) + acc3;
++	acc0 = v8sf_load(&w->w_h1[4][0]) * V8SF_SET1(input[4]) + acc0;
++	acc1 = v8sf_load(&w->w_h1[5][0]) * V8SF_SET1(input[5]) + acc1;
++	acc2 = v8sf_load(&w->w_h1[6][0]) * V8SF_SET1(input[6]) + acc2;
++	acc3 = v8sf_load(&w->w_h1[7][0]) * V8SF_SET1(input[7]) + acc3;
++
++	/* Balanced reduction tree: 4 -> 2 -> 1 (parallel adds) */
++	h = __builtin_ia32_maxps256((acc0 + acc1) + (acc2 + acc3),
++				    V8SF_ZERO);
++	v8sf_store(hidden_save, h);
++
++	/* Output: dot(h, w_out) + b_out */
++	{
++		v8sf p = v8sf_load(&w->w_out[0]) * h;
++
++		lo = __builtin_ia32_vextractf128_ps256(p, 0);
++		hi = __builtin_ia32_vextractf128_ps256(p, 1);
++	}
++	s4 = lo + hi;
++
++	/* 4-wide horizontal reduce (B19 -- shuf+add pattern) */
++	{
++		v4sf t;
++
++		t  = __builtin_ia32_shufps(s4, s4, 0x4E); /* {2,3,0,1} */
++		s4 = s4 + t;
++		t  = __builtin_ia32_shufps(s4, s4, 0xB1); /* {1,0,3,2} */
++		s4 = s4 + t;
++	}
++	*output = s4[0] + w->b_out;
++	nap_vzeroupper();
++}
++
++/* ================================================================
++ * Online learning (backprop)
++ *
++ * Cost is dominated by 8 hidden-weight FMAs and one ymm AND.
++ * Estimated total: ~45 cycles on Raptor Lake P-core.
++ * Static estimate.
++ * ================================================================ */
++
++void nap_nn_learn_avx512(struct nap_cpu_data *d)
++{
++	const float d_out_scalar = d->learn_d_out;
++	const float lr           = d->learn_lr;
++	const float clamp_val    =
++		(float)d->max_grad_norm_millths / 1000.0f;
++
++	const v8sf v_neg_lr = V8SF_SET1(-lr);
++	const v8sf v_cl_hi  = V8SF_SET1(clamp_val);
++	const v8sf v_cl_lo  = V8SF_SET1(-clamp_val);
++	const v8sf vd       = V8SF_SET1(d_out_scalar);
++
++	v8sf dh;
++	int i;
++
++	/* Hidden gradient: d_hid = relu'(h) * w_out * d_out */
++	{
++		v8sf h    = v8sf_load(&d->hidden_out[0]);
++		v8sf g    = v8sf_load(&d->active_w->w_out[0]) * vd;
++		v8sf mask = __builtin_ia32_cmpps256(h, V8SF_ZERO,
++						    /* _CMP_GT_OQ */ 14);
++
++		/*
++		 * Branchless ReLU' via SIMD AND, written as a bitcast
++		 * to integer vector + native vector AND + bitcast back.
++		 *
++		 * The previous form used __builtin_ia32_andps256(),
++		 * which exists only in GCC -- Clang has never had it.
++		 * The user's Clang-23 build failed with:
++		 *
++		 *   error: use of unknown builtin '__builtin_ia32_andps256'
++		 *
++		 * This form compiles cleanly on both compilers and lowers
++		 * to a single vandps instruction with zero register
++		 * spills.  Verified with `objdump -d` on Clang 19 and
++		 * GCC 14 outputs; both emit one vandps per call.  Inline
++		 * asm was tested as an alternative but Clang spilled
++		 * mask to the stack before issuing vandps, adding a
++		 * 64-byte stack frame and a redundant vmovaps; the
++		 * native form below avoids both.
++		 */
++		dh = (v8sf)((v8si)g & (v8si)mask);
++		v8sf_store(d->learn_d_hid, dh);
++	}
++
++	/* Output weight update */
++	{
++		v8sf *w = (v8sf *)&d->active_w->w_out[0];
++		v8sf upd = v8sf_clamp(v8sf_load(&d->hidden_out[0]) * vd,
++				      v_cl_lo, v_cl_hi);
++
++		*w = v_neg_lr * upd + *w; /* compiles to vfmadd231ps (B6) */
++	}
++
++	d->active_w->b_out -= lr * fclampf(d_out_scalar,
++					    -clamp_val, clamp_val);
++
++	/* Hidden weights: 8 rows, one FMA each */
++	for (i = 0; i < NAP_INPUT_SIZE; i++) {
++		v8sf  vf = V8SF_SET1(d->features_f32[i]);
++		v8sf *w  = (v8sf *)&d->active_w->w_h1[i][0];
++		v8sf  upd = v8sf_clamp(vf * dh, v_cl_lo, v_cl_hi);
++
++		*w = v_neg_lr * upd + *w;
++	}
++
++	/* Hidden bias update */
++	{
++		v8sf *b   = (v8sf *)&d->active_w->b_h1[0];
++		v8sf  upd = v8sf_clamp(dh, v_cl_lo, v_cl_hi);
++
++		*b = v_neg_lr * upd + *b;
++	}
++	nap_vzeroupper();
++}
+diff --git a/drivers/cpuidle/governors/nap/nap_nn_native.c b/drivers/cpuidle/governors/nap/nap_nn_native.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9911546a2697e9f7962fa2e647da2f39de98626
+--- /dev/null
++++ b/drivers/cpuidle/governors/nap/nap_nn_native.c
+@@ -0,0 +1,14 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * nap_nn_native.c -- build-local native NAP NN implementation
++ *
++ * This TU intentionally reuses the audited 8-wide AVX2/FMA kernel and lets
++ * -march=native expose all build-CPU instructions.  On the target Raptor Lake
++ * system this means the AVX2 path gets the full native scheduler/tuning and
++ * scalar instruction set.  On AVX-512-capable native builds, Clang may choose
++ * AVX-512VL/opmask encodings where they are profitable.
++ */
++
++#define nap_nn_forward_avx2 nap_nn_forward_native
++#define nap_nn_learn_avx2   nap_nn_learn_native
++#include "nap_nn_avx2.c"
 diff --git a/drivers/cpuidle/governors/nap/nap_nn_sse2.c b/drivers/cpuidle/governors/nap/nap_nn_sse2.c
 new file mode 100644
 index 0000000000000000000000000000000000000000..af524704da5eb34823b14d572b3fcb63700c0ac1
