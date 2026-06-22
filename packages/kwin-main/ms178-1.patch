@@ -977,7 +977,7 @@ index 337ea46..792f49f 100644
  
  private:
 diff --git a/src/backends/drm/drm_commit_thread.cpp b/src/backends/drm/drm_commit_thread.cpp
-index deafa26..de6bf3e 100644
+index deafa26..3ff138b 100644
 --- a/src/backends/drm/drm_commit_thread.cpp
 +++ b/src/backends/drm/drm_commit_thread.cpp
 @@ -13,300 +13,588 @@
@@ -1374,7 +1374,10 @@ index deafa26..de6bf3e 100644
          m_commits.erase(m_commits.begin());
 +        return;
 +    }
-+
+ 
+-        // the kernel might still take some time to actually apply the commit
+-        // after we return from the commit ioctl, but we don't have any better
+-        // way to know when it's done
 +    // Vanilla compositors call commit() directly without a preceding test().
 +    // commit() registers a PAGE_FLIP_EVENT and, on success, atomically applies
 +    // the state in the same ioctl. Doing test()+commit() unconditionally added
@@ -1384,10 +1387,7 @@ index deafa26..de6bf3e 100644
 +    // effect) to gate before re-trying commit().
 +    bool success = commit->commit();
 +    int savedErrno = success ? 0 : errno;
- 
--        // the kernel might still take some time to actually apply the commit
--        // after we return from the commit ioctl, but we don't have any better
--        // way to know when it's done
++
 +    if (!success) [[unlikely]] {
 +        // Rate-limit warnings; a transient atomic commit failure during heavy
 +        // plane reconfiguration is normal and shouldn't spam the journal.
@@ -1581,15 +1581,15 @@ index deafa26..de6bf3e 100644
 +        qCDebug(KWIN_DRM, "Merging %zu commits failed the atomic test, reverting", mergeCount);
 +        m_commitsToDelete.push_back(std::move(merged));
 +        return false;
-+    }
+     }
+-    QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::ConnectionType::QueuedConnection);
 +
 +    // Accepted: drop the originals into the delete-on-main-thread queue and
 +    // splice the merged candidate into the front slot.
 +    m_commitsToDelete.push_back(std::move(m_commits.front()));
 +    for (size_t i = 1; i < firstNotReady; ++i) {
 +        m_commitsToDelete.push_back(std::move(m_commits[i]));
-     }
--    QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::ConnectionType::QueuedConnection);
++    }
 +    m_commits.front() = std::move(merged);
 +    m_commits.erase(m_commits.begin() + 1, m_commits.begin() + static_cast<std::ptrdiff_t>(firstNotReady));
 +    return true;
@@ -1758,20 +1758,20 @@ index deafa26..de6bf3e 100644
          }
 +        ++write;
 +        read = next;
-+    }
-+
-+    if (write < count) {
-+        m_commits.erase(m_commits.begin() + static_cast<std::ptrdiff_t>(write), m_commits.end());
      }
 -    if (front) {
 -        m_commits.insert(m_commits.begin(), std::move(front));
++
++    if (write < count) {
++        m_commits.erase(m_commits.begin() + static_cast<std::ptrdiff_t>(write), m_commits.end());
++    }
 +
 +    if (optimized && !m_commitsToDelete.empty()) {
 +        QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::QueuedConnection);
      }
  }
  
-@@ -316,10 +604,10 @@ DrmCommitThread::~DrmCommitThread()
+@@ -316,10 +604,13 @@ DrmCommitThread::~DrmCommitThread()
          {
              std::unique_lock lock(m_mutex);
              m_thread->requestInterruption();
@@ -1780,12 +1780,15 @@ index deafa26..de6bf3e 100644
 -            m_pong.notify_all();
 +            m_ping.store(true, std::memory_order_release);
          }
-+        m_commitPending.notify_all();
-+        m_pong.notify_all();
++        // [PERF intel-perf-skills §1.6 thundering-herd] Each CV has exactly
++        // one waiter (m_commitPending: commit thread; m_pong: main thread).
++        // notify_one() avoids the overhead of notify_all() on single-waiter CVs.
++        m_commitPending.notify_one();
++        m_pong.notify_one();
          m_thread->wait();
      }
      if (m_committed) {
-@@ -330,87 +618,298 @@ DrmCommitThread::~DrmCommitThread()
+@@ -330,87 +621,298 @@ DrmCommitThread::~DrmCommitThread()
  
  void DrmCommitThread::addCommit(std::unique_ptr<DrmAtomicCommit> &&commit)
  {
@@ -1908,12 +1911,6 @@ index deafa26..de6bf3e 100644
 -    if (m_pageflipTimeoutDetected) {
 -        qCCritical(KWIN_DRM, "Pageflip arrived after all, %lums after the commit", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_lastCommitTime).count());
 -        m_pageflipTimeoutDetected = false;
--    }
--    m_lastPageflip = TimePoint(timestamp);
--    m_committed.reset();
--    if (!m_commits.empty()) {
--        m_targetPageflipTime = estimateNextVblank(std::chrono::steady_clock::now());
--        m_commitPending.notify_all();
 +    Q_ASSERT(!QCoreApplication::instance() || QThread::currentThread() == QCoreApplication::instance()->thread());
 +
 +    // ---- Timestamp domain conversion (CLOCK_MONOTONIC → steady_clock) ----
@@ -1956,7 +1953,12 @@ index deafa26..de6bf3e 100644
 +    int64_t mappedNs = 0;
 +    if (__builtin_add_overflow(timestamp.count(), cache.offsetNs, &mappedNs)) [[unlikely]] {
 +        mappedNs = steadyNowNs;
-+    }
+     }
+-    m_lastPageflip = TimePoint(timestamp);
+-    m_committed.reset();
+-    if (!m_commits.empty()) {
+-        m_targetPageflipTime = estimateNextVblank(std::chrono::steady_clock::now());
+-        m_commitPending.notify_all();
 +
 +    // Relaxed clamp: allow the kernel timestamp (converted) to be slightly in the
 +    // "future" relative to now (event dispatch delay) or in the past. Clipping to
@@ -2119,7 +2121,7 @@ index deafa26..de6bf3e 100644
 -}
 +} // namespace KWin
 diff --git a/src/backends/drm/drm_commit_thread.h b/src/backends/drm/drm_commit_thread.h
-index 0ca394e..6cc2a52 100644
+index 0ca394e..29c4df1 100644
 --- a/src/backends/drm/drm_commit_thread.h
 +++ b/src/backends/drm/drm_commit_thread.h
 @@ -10,7 +10,12 @@
@@ -2135,7 +2137,7 @@ index 0ca394e..6cc2a52 100644
  #include <mutex>
  #include <vector>
  
-@@ -30,46 +35,49 @@ class DrmCommitThread : public QObject
+@@ -30,46 +35,54 @@ class DrmCommitThread : public QObject
  
  public:
      explicit DrmCommitThread(DrmGpu *gpu, const QString &name);
@@ -2180,10 +2182,15 @@ index 0ca394e..6cc2a52 100644
 +    std::chrono::nanoseconds m_additionalSafetyMargin{std::chrono::milliseconds{1}};
 +    uint64_t m_vblankReciprocal{0};
 +
++    // [PERF intel-perf-skills §1.1 false-sharing] Each atomic is written by
++    // the commit thread and read by the main thread.  Without alignas(64),
++    // m_tearing/m_ping/m_pageflipTimeoutDetected share a cache line with m_vrr
++    // → false sharing on every VRR/tearing state change.  Padding each to its
++    // own cache line eliminates the cross-thread coherence traffic.
 +    alignas(64) std::atomic<bool> m_vrr{false};
-+    std::atomic<bool> m_tearing{false};
-+    std::atomic<bool> m_ping{false};
-+    std::atomic<bool> m_pageflipTimeoutDetected{false};
++    alignas(64) std::atomic<bool> m_tearing{false};
++    alignas(64) std::atomic<bool> m_ping{false};
++    alignas(64) std::atomic<bool> m_pageflipTimeoutDetected{false};
 +
      DrmGpu *const m_gpu;
      std::unique_ptr<DrmCommit> m_committed;
@@ -5253,6 +5260,95 @@ index 1a644d2..0046075 100644
  
      // TODO: this is currently non-functional even on DRM. Needs orientation() override there.
      device->setOrientation(Qt::PrimaryOrientation);
+diff --git a/src/compositor.cpp b/src/compositor.cpp
+index 2ba4f18..2eeba3a 100644
+--- a/src/compositor.cpp
++++ b/src/compositor.cpp
+@@ -315,10 +315,13 @@ void Compositor::stop()
+         static_cast<EglBackend *>(m_backend.get())->openglContext()->makeCurrent();
+     }
+ 
+-    const auto loops = m_primaryViews | std::views::transform([](const auto &pair) {
+-        return pair.first;
+-    }) | std::ranges::to<QList>();
+-    for (RenderLoop *loop : loops) {
++    // [PERF] Manual loop with reserve avoids std::views + ranges::to allocation overhead.
++    QList<RenderLoop *> loops;
++    loops.reserve(static_cast<qsizetype>(m_primaryViews.size()));
++    for (const auto &pair : std::as_const(m_primaryViews)) {
++        loops.append(pair.first);
++    }
++    for (RenderLoop *loop : std::as_const(loops)) {
+         removeOutput(findOutput(loop));
+     }
+ 
+@@ -336,10 +339,16 @@ static bool isTearingRequested(const Item *item)
+         return true;
+     }
+ 
++    // [PERF] Manual loop: std::ranges::any_of prevents full inlining of the
++    // recursive lambda due to iterator abstraction overhead. A plain for-loop
++    // allows the compiler to collapse the recursion into a tight branch tree.
+     const auto childItems = item->childItems();
+-    return std::ranges::any_of(childItems, [](const Item *childItem) {
+-        return isTearingRequested(childItem);
+-    });
++    for (const Item *childItem : childItems) {
++        if (isTearingRequested(childItem)) {
++            return true;
++        }
++    }
++    return false;
+ }
+ 
+ static Rect mapGlobalLogicalToOutputDeviceCoordinates(const RectF &logicalGeometry, LogicalOutput *logicalOutput, BackendOutput *backendOutput)
+@@ -440,10 +449,14 @@ static bool renderLayer(RenderView *view, LogicalOutput *logicalOutput, BackendO
+ 
+ static OutputLayer *findLayer(std::span<OutputLayer *const> layers, OutputLayerType type)
+ {
+-    const auto it = std::ranges::find_if(layers, [type](OutputLayer *layer) {
+-        return layer->type() == type;
+-    });
+-    return it == layers.end() ? nullptr : *it;
++    // [PERF] Manual loop avoids std::ranges::find_if iterator abstraction
++    // overhead on this per-frame hot path.
++    for (OutputLayer *layer : layers) {
++        if (layer->type() == type) {
++            return layer;
++        }
++    }
++    return nullptr;
+ }
+ 
+ /**
+@@ -478,14 +491,22 @@ static std::optional<std::unordered_map<OutputLayer *, Item *>> assignLayers(Ren
+             const bool compositingAllowed = qobject_cast<CursorItem *>(item) != nullptr;
+             const RectF sceneRect = item->mapToView(compositingAllowed ?  item->boundingRect() : item->rect(), sceneView);
+             const Rect deviceRect = sceneRect.translated(-sceneView->viewport().topLeft()).scaled(sceneView->scale()).rounded();
+-            const bool hasFittingSize = std::ranges::any_of(recommendedSizes, [compositingAllowed, deviceRect](const QSize &size) {
++            // [PERF] Manual loop with early break for better inlining.
++            bool hasFittingSize = false;
++            for (const QSize &size : recommendedSizes) {
+                 if (compositingAllowed) {
+-                    return deviceRect.size().width() <= size.width()
+-                        && deviceRect.size().height() <= size.height();
++                    if (deviceRect.size().width() <= size.width()
++                        && deviceRect.size().height() <= size.height()) {
++                        hasFittingSize = true;
++                        break;
++                    }
+                 } else {
+-                    return deviceRect.size() == size;
++                    if (deviceRect.size() == size) {
++                        hasFittingSize = true;
++                        break;
++                    }
+                 }
+-            });
++            }
+             if (!hasFittingSize) {
+                 layerIt++;
+                 continue;
 diff --git a/src/compositor.h b/src/compositor.h
 index 6294c65..ccf65ac 100644
 --- a/src/compositor.h
@@ -5445,10 +5541,10 @@ index 764516a..eedda65 100644
  
  } // namespace KWin
 diff --git a/src/core/renderloop.cpp b/src/core/renderloop.cpp
-index f7c5a9f..f5fbb62 100644
+index f7c5a9f..e1a87fc 100644
 --- a/src/core/renderloop.cpp
 +++ b/src/core/renderloop.cpp
-@@ -9,314 +9,1346 @@
+@@ -9,314 +9,1359 @@
  #include "options.h"
  #include "renderloop_p.h"
  #include "scene/surfaceitem.h"
@@ -5584,7 +5680,7 @@ index f7c5a9f..f5fbb62 100644
 +
 +[[gnu::always_inline]]
 +inline int64_t steadyNowNs() noexcept
- {
++{
 +    return std::chrono::duration_cast<std::chrono::nanoseconds>(
 +               std::chrono::steady_clock::now().time_since_epoch())
 +        .count();
@@ -5600,16 +5696,13 @@ index f7c5a9f..f5fbb62 100644
 +    const auto q = static_cast<uint64_t>(prod >> 63);
 +    return q + static_cast<uint64_t>(static_cast<__uint128_t>(q) * d < n);
 +}
- 
--RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop)
++
 +[[nodiscard]] consteval uint64_t reciprocalForInterval(uint64_t interval) noexcept
- {
--    return loop->d.get();
++{
 +    constexpr uint8_t shift = 63;
 +    return ((static_cast<__uint128_t>(1) << shift) + interval - 1) / interval;
- }
- 
--static const bool s_printDebugInfo = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0;
++}
++
 +constexpr uint64_t kRecip60Hz  = reciprocalForInterval(16'666'666ULL);
 +constexpr uint64_t kRecip120Hz = reciprocalForInterval( 8'333'333ULL);
 +constexpr uint64_t kRecip144Hz = reciprocalForInterval( 6'944'444ULL);
@@ -5647,13 +5740,15 @@ index f7c5a9f..f5fbb62 100644
 +
 +[[gnu::always_inline, gnu::const]]
 +inline constexpr bool contentIsInteractive(KWin::VrrContentHint hint) noexcept
-+{
+ {
 +    return hint == KWin::VrrContentHint::Interactive || hint == KWin::VrrContentHint::ForceVrr;
 +}
-+
+ 
+-RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop)
 +[[gnu::always_inline, gnu::const]]
 +inline constexpr bool contentIsVideoLike(KWin::VrrContentHint hint) noexcept
-+{
+ {
+-    return loop->d.get();
 +    return hint == KWin::VrrContentHint::Video || hint == KWin::VrrContentHint::Film || hint == KWin::VrrContentHint::ForceVsync;
 +}
 +
@@ -5702,8 +5797,9 @@ index f7c5a9f..f5fbb62 100644
 +    int64_t predictedNs = d->framePrediction.count();
 +    if (predictedNs <= 0) { predictedNs = d->renderJournal.result().count(); if (predictedNs <= 0) { predictedNs = vblankNs >> 1; } }
 +    return (predictedNs * 5) >= (vblankNs * 2) ? maxPending : 1;
-+}
-+
+ }
+ 
+-static const bool s_printDebugInfo = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0;
 +} // namespace
 +
 +namespace KWin
@@ -5736,49 +5832,23 @@ index f7c5a9f..f5fbb62 100644
 +            handleCompositeTfdReady();
 +        });
 +    }
-+}
-+
+ }
+ 
+-void RenderLoopPrivate::scheduleNextRepaint()
 +RenderLoopPrivate::~RenderLoopPrivate()
-+{
+ {
+-    if (kwinApp()->isTerminating() || compositeTimer.isActive() || preparingNewFrame) {
+-        return;
 +    disconnectVrrSignals();
 +    delete m_compositeTfdNotifier;
 +    if (m_compositeTfd >= 0) {
 +        close(m_compositeTfd);
-+    }
- }
- 
--void RenderLoopPrivate::scheduleNextRepaint()
-+void RenderLoopPrivate::updateReciprocal() noexcept
- {
--    if (kwinApp()->isTerminating() || compositeTimer.isActive() || preparingNewFrame) {
-+    const uint64_t interval = cachedVblankIntervalNs;
-+    if (interval == 0) [[unlikely]] {
-+        vblankIntervalReciprocal64 = 0;
-+        tripleBufferEnterThresholdNs = 0; tripleBufferExitThresholdNs = 0; vrrControlDelayMs = 0;
-         return;
      }
 -    scheduleRepaint(nextPresentationTimestamp);
-+    constexpr uint8_t shift = 63;
-+    switch (interval) {
-+    case 16'666'666ULL: vblankIntervalReciprocal64 = kRecip60Hz;  break;
-+    case  8'333'333ULL: vblankIntervalReciprocal64 = kRecip120Hz; break;
-+    case  6'944'444ULL: vblankIntervalReciprocal64 = kRecip144Hz; break;
-+    case  6'060'606ULL: vblankIntervalReciprocal64 = kRecip165Hz; break;
-+    case  4'166'666ULL: vblankIntervalReciprocal64 = kRecip240Hz; break;
-+    default: {
-+        const __uint128_t num = static_cast<__uint128_t>(1) << shift;
-+        vblankIntervalReciprocal64 = static_cast<uint64_t>((num + interval - 1) / interval);
-+        break;
-+    }
-+    }
-+    tripleBufferEnterThresholdNs = static_cast<int64_t>((interval * kTripleBufferEnterPct) / 100);
-+    tripleBufferExitThresholdNs = static_cast<int64_t>((interval * kTripleBufferExitPct) / 100);
-+    vrrControlDelayMs = static_cast<int16_t>(std::clamp(
-+        interval / static_cast<uint64_t>(kNsPerMs), uint64_t{1}, static_cast<uint64_t>(kMaxTimerDelayMs)));
  }
  
 -void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp)
-+void RenderLoopPrivate::armStalledFrameTimer() noexcept
++void RenderLoopPrivate::updateReciprocal() noexcept
  {
 -    pendingReschedule = false;
 -    const std::chrono::nanoseconds vblankInterval(1'000'000'000'000ull / refreshRate);
@@ -5820,7 +5890,31 @@ index f7c5a9f..f5fbb62 100644
 -                expectedCompositingTime = vblankInterval;
 -            }
 -        }
--
++    const uint64_t interval = cachedVblankIntervalNs;
++    if (interval == 0) [[unlikely]] {
++        vblankIntervalReciprocal64 = 0;
++        tripleBufferEnterThresholdNs = 0; tripleBufferExitThresholdNs = 0; vrrControlDelayMs = 0;
++        return;
++    }
++    constexpr uint8_t shift = 63;
++    switch (interval) {
++    case 16'666'666ULL: vblankIntervalReciprocal64 = kRecip60Hz;  break;
++    case  8'333'333ULL: vblankIntervalReciprocal64 = kRecip120Hz; break;
++    case  6'944'444ULL: vblankIntervalReciprocal64 = kRecip144Hz; break;
++    case  6'060'606ULL: vblankIntervalReciprocal64 = kRecip165Hz; break;
++    case  4'166'666ULL: vblankIntervalReciprocal64 = kRecip240Hz; break;
++    default: {
++        const __uint128_t num = static_cast<__uint128_t>(1) << shift;
++        vblankIntervalReciprocal64 = static_cast<uint64_t>((num + interval - 1) / interval);
++        break;
++    }
++    }
++    tripleBufferEnterThresholdNs = static_cast<int64_t>((interval * kTripleBufferEnterPct) / 100);
++    tripleBufferExitThresholdNs = static_cast<int64_t>((interval * kTripleBufferExitPct) / 100);
++    vrrControlDelayMs = static_cast<int16_t>(std::clamp(
++        interval / static_cast<uint64_t>(kNsPerMs), uint64_t{1}, static_cast<uint64_t>(kMaxTimerDelayMs)));
++}
+ 
 -        if (compositeTimer.isActive()) {
 -            // we already scheduled this frame, but we got a new timestamp
 -            // which might require starting to composite earlier than we planned
@@ -5843,6 +5937,8 @@ index f7c5a9f..f5fbb62 100644
 -            // TODO read minimum refresh rate from the EDID and take it into account here
 -            nextPresentationTimestamp = std::max(currentTime, lastPresentationTimestamp + vblankInterval);
 -        }
++void RenderLoopPrivate::armStalledFrameTimer() noexcept
++{
 +    if (kwinApp()->isTerminating() || inhibitCount != 0) { return; }
 +    const bool vrrActive = isVrrMode(presentationMode);
 +    const int maxPending = effectiveMaxPendingFrames(this, vrrActive);
@@ -6065,7 +6161,7 @@ index f7c5a9f..f5fbb62 100644
 +        if (trackedWindow_ != nullptr) { disconnectVrrSignals(); }
 +        if (oldRaw != state.toRaw()) { vrrStateCache_.setState(state); }
 +        return;
-     }
++    }
 +    connectVrrSignals(active);
 +    state.isOnOutput = 1U;
 +    state.isFullScreen = 1U;
@@ -6084,7 +6180,7 @@ index f7c5a9f..f5fbb62 100644
 +            state.contentType = static_cast<uint8_t>(*ct) & 0x3U;
 +            state.contentTypeValid = 1U;
 +        }
-+    }
+     }
 +    if (oldRaw != state.toRaw()) { vrrStateCache_.setState(state); }
  }
  
@@ -6212,20 +6308,17 @@ index f7c5a9f..f5fbb62 100644
 +    // and browser apps stay flicker-free while games enjoy the full range.
 +    if (vrrQualityFloorHz_ <= 0) {
 +        return false;
-     }
++    }
 +    const int64_t intervalNs = lastIntervalNs_;
 +    if (intervalNs <= 0) {
 +        return false;
-+    }
+     }
 +    const int64_t maxIntervalNs = 1'000'000'000'000LL / vrrQualityFloorHz_;
 +    return intervalNs >= maxIntervalNs;
- }
- 
--void RenderLoop::uninhibit()
++}
++
 +void RenderLoopPrivate::recordModeSwitch() noexcept
- {
--    Q_ASSERT(d->inhibitCount > 0);
--    d->inhibitCount--;
++{
 +    const auto now = std::chrono::steady_clock::now();
 +    lastModeSwitch = now; modeDwellCounter_ = 0;
 +    modeSwitchHistory_[modeSwitchHistoryHead_] = now;
@@ -6236,12 +6329,13 @@ index f7c5a9f..f5fbb62 100644
 +    const auto cutoff = now - kOscillationWindow;
 +    const uint8_t idx = static_cast<uint8_t>((modeSwitchHistoryHead_ + kModeSwitchHistorySize - required) & (kModeSwitchHistorySize - 1U));
 +    if (modeSwitchHistory_[idx] >= cutoff) [[unlikely]] { vrrOscillationLockout = true; oscillationCooldownCounter_ = kOscillationCooldownFrames; }
-+}
+ }
  
--    if (d->inhibitCount == 0) {
--        d->scheduleNextRepaint();
+-void RenderLoop::uninhibit()
 +void RenderLoopPrivate::updatePresentationCadence(int64_t intervalNs) noexcept
-+{
+ {
+-    Q_ASSERT(d->inhibitCount > 0);
+-    d->inhibitCount--;
 +    if (intervalNs < kMinReasonableIntervalNs || intervalNs > kMaxReasonableIntervalNs) [[unlikely]] { cadenceStability_ = 128; lastIntervalNs_ = 0; return; }
 +    const int64_t prev = lastIntervalNs_;
 +    if (prev <= 0) [[unlikely]] { lastIntervalNs_ = intervalNs; return; }
@@ -6335,7 +6429,7 @@ index f7c5a9f..f5fbb62 100644
 +        }
 +        lastDecisionReason_ = VrrDecisionReason::UserPolicy;
 +        return adaptive;
-     }
++    }
 +
 +    // Tier 2: explicit content-hint overrides (set by external APIs)
 +    if (activeContentHint_ == VrrContentHint::ForceVsync) [[unlikely]] {
@@ -6386,7 +6480,9 @@ index f7c5a9f..f5fbb62 100644
 +        lastDecisionReason_ = VrrDecisionReason::OscillationGuard;
 +        return PresentationMode::VSync;
 +    }
-+
+ 
+-    if (d->inhibitCount == 0) {
+-        d->scheduleNextRepaint();
 +    // Tier 9: fallback for unhinted apps — panel-refresh-rate floor protection.
 +    // This catches old apps that don't set wp_content_type_v1.  The panel rate
 +    // is hardware ground truth from wp_presentation_feedback, so it's immune
@@ -6399,7 +6495,7 @@ index f7c5a9f..f5fbb62 100644
 +    if (belowFloor || belowQuality) {
 +        lastDecisionReason_ = belowQuality ? VrrDecisionReason::QualityFloor : VrrDecisionReason::BelowVrrFloor;
 +        return PresentationMode::VSync;
-+    }
+     }
 +
 +    // Tier 10: ambiguous, keep current
 +    const int64_t vblankNs = static_cast<int64_t>(cachedVblankIntervalNs);
@@ -6608,7 +6704,7 @@ index f7c5a9f..f5fbb62 100644
 +    if (predNs <= 0) { predNs = renderJournal.result().count(); if (predNs <= 0) { predNs = static_cast<int64_t>(vblankNs >> 1); } }
 +    const int64_t stabilityBonus = (static_cast<int64_t>(cadenceStability_) * kRenderSlackNs) >> 9;
 +    const int64_t effectiveSlack = std::max<int64_t>(kRenderSlackNs - stabilityBonus, 0LL);
-+    const int64_t compositeNs = std::clamp(predNs + safetyMargin.count() + effectiveSlack, kMinCompositeNs, kMaxCompositeNs);
++    int64_t compositeNs = std::clamp(predNs + safetyMargin.count() + effectiveSlack, kMinCompositeNs, kMaxCompositeNs);
 +    updateVrrState();
 +    const PresentationMode targetMode = selectPresentationMode();
 +    const VrrDecisionReason decisionReason = lastDecisionReason_;
@@ -6630,6 +6726,19 @@ index f7c5a9f..f5fbb62 100644
 +    const int64_t vblankI64 = static_cast<int64_t>(vblankNs);
 +    int64_t nextPresNs = nowNs + compositeNs;
 +    if (presentationMode == PresentationMode::VSync) [[likely]] {
++        // Cap the compositing budget at 2*vblank (vanilla safeguard) so a
++        // transient prediction spike can't push targetVblank from 1 to 2 and
++        // skip a frame — the root cause of VSync ON micro-stutters.  Also
++        // apply the idle boost: when we've been idle (pageflipsSince > 100),
++        // the GPU is likely in a low power state and needs the full vblank
++        // to render, so never schedule compositing for less than one vblank.
++        // These safeguards are inside the VSync branch only, so VSync OFF
++        // (VRR/Adaptive/AdaptiveAsync) is completely unaffected.
++        compositeNs = std::min(compositeNs, 2 * vblankI64);
++        const int64_t pageflipsSince = std::max<int64_t>((nowNs - lastPresNs) / vblankI64, 0);
++        if (pageflipsSince > 100) {
++            compositeNs = std::max(vblankI64 - 1'000, compositeNs);
+         }
 +        const int64_t earliestReadyNs = nowNs + compositeNs;
 +        const int64_t nsFromLastPres = std::max<int64_t>(earliestReadyNs - lastPresNs, 1LL);
 +        int64_t targetVblank = static_cast<int64_t>(ceilDivU64Reciprocal(static_cast<uint64_t>(nsFromLastPres), vblankNs, vblankIntervalReciprocal64));
@@ -6651,7 +6760,7 @@ index f7c5a9f..f5fbb62 100644
 +            if (wasTripleBuffering && tripleBufferHysteresisCounter == 0) {
 +                wasTripleBuffering = false;
 +            }
-         }
++        }
 +    } else { wasTripleBuffering = false; tripleBufferHysteresisCounter = 0; }
 +    const int64_t minPresNs = nowNs + kMinCompositeNs;
 +    if (nextPresNs < minPresNs) { nextPresNs = minPresNs; }
@@ -6877,9 +6986,8 @@ index f7c5a9f..f5fbb62 100644
 +    if (id == d->delayedVrrTimer.timerId()) [[unlikely]] { d->delayedVrrTimer.stop(); scheduleRepaint(nullptr, nullptr); }
 +    else if (id == d->stalledFrameTimer.timerId()) [[unlikely]] { d->handleStalledFrameTimeout(); }
 +    else { QObject::timerEvent(event); }
- }
- 
--std::chrono::nanoseconds RenderLoop::predictedRenderTime() const
++}
++
 +RenderLoop::RenderLoop(BackendOutput *output) : d(std::make_unique<RenderLoopPrivate>(this, output)) {}
 +RenderLoop::~RenderLoop() = default;
 +
@@ -6926,8 +7034,9 @@ index f7c5a9f..f5fbb62 100644
 +void RenderLoop::notifyPresentFeedback(const PresentFeedback &feedback) {
 +    if (thread() != QThread::currentThread()) [[unlikely]] { QMetaObject::invokeMethod(this, [this, feedback]() { notifyPresentFeedback(feedback); }, Qt::QueuedConnection); return; }
 +    d->addPresentFeedback(feedback);
-+}
-+
+ }
+ 
+-std::chrono::nanoseconds RenderLoop::predictedRenderTime() const
 +void RenderLoop::scheduleRepaint(Item *item, OutputLayer *layer) {
 +    (void)layer;
 +    if (thread() != QThread::currentThread()) [[unlikely]] { QMetaObject::invokeMethod(this, [this, item, layer]() { scheduleRepaint(item, layer); }, Qt::QueuedConnection); return; }
@@ -7869,6 +7978,38 @@ index d682700..7047d3d 100644
  
 -}
 +} // namespace KWin
+diff --git a/src/opengl/eglcontext.cpp b/src/opengl/eglcontext.cpp
+index 4d35774..060a4e1 100644
+--- a/src/opengl/eglcontext.cpp
++++ b/src/opengl/eglcontext.cpp
+@@ -173,6 +173,13 @@ bool EglContext::makeCurrent()
+ 
+ bool EglContext::makeCurrent(EGLSurface surface)
+ {
++    // [PERF] Fast path: if this context is already current on the requested
++    // surface, skip the eglMakeCurrent call entirely.  This is the common
++    // case in the per-frame compositing loop and saves a driver round-trip.
++    if (s_currentContext == this && surface == EGL_NO_SURFACE
++        && eglGetCurrentContext() == m_handle) [[likely]] {
++        return true;
++    }
+     if (QOpenGLContext *context = QOpenGLContext::currentContext()) {
+         // Workaround to tell Qt that no QOpenGLContext is current
+         context->doneCurrent();
+@@ -392,9 +399,10 @@ bool EglContext::isOpenGLES() const
+ 
+ bool EglContext::hasOpenglExtension(QByteArrayView name) const
+ {
+-    return std::any_of(m_extensions.cbegin(), m_extensions.cend(), [name](const auto &string) {
+-        return string == name;
+-    });
++    // [PERF] QSet::contains is O(1) average (hash lookup) vs std::any_of's
++    // O(N) linear scan.  m_extensions is a QSet<QByteArray>, so we construct
++    // a QByteArray from the view once (cheap) for the hash lookup.
++    return m_extensions.contains(QByteArray(name.data(), name.size()));
+ }
+ 
+ bool EglContext::isSoftwareRenderer() const
 diff --git a/src/opengl/glrendertimequery.cpp b/src/opengl/glrendertimequery.cpp
 index 438a97d..0d4e667 100644
 --- a/src/opengl/glrendertimequery.cpp
@@ -7960,6 +8101,45 @@ index 7d30417..8951025 100644
 +}
  
  #include "moc_placeholderoutput.cpp"
+diff --git a/src/plugins/krunner-integration/org.kde.krunner1.xml b/src/plugins/krunner-integration/org.kde.krunner1.xml
+index b9d39a1..f47c549 100644
+--- a/src/plugins/krunner-integration/org.kde.krunner1.xml
++++ b/src/plugins/krunner-integration/org.kde.krunner1.xml
+@@ -51,5 +51,15 @@
+       <annotation name="org.qtproject.QtDBus.QtTypeName.Out0" value="RemoteMatches"/>
+       <arg name="matches" type="a(sssuda{sv})" direction="out"/>
+     </method>
++
++    <!--
++        Called by KRunner when the runner is no longer needed (e.g. when the
++        KRunner dialog is dismissed).  WindowsRunner has no persistent state
++        to clean up — it queries the workspace on-demand per Match() call —
++        so this is a no-op.  The method MUST exist, however, so that the D-Bus
++        call resolves cleanly instead of emitting
++        "couldn't handle call to Teardown, no slot matched" warnings.
++    -->
++    <method name="Teardown"/>
+   </interface>
+ </node>
+diff --git a/src/plugins/krunner-integration/windowsrunnerinterface.h b/src/plugins/krunner-integration/windowsrunnerinterface.h
+index 8e7c1b3..0ce797a 100644
+--- a/src/plugins/krunner-integration/windowsrunnerinterface.h
++++ b/src/plugins/krunner-integration/windowsrunnerinterface.h
+@@ -40,6 +40,14 @@ public:
+     RemoteMatches Match(const QString &searchTerm);
+     void Run(const QString &id, const QString &actionId);
+ 
++public Q_SLOTS:
++    // Called by KRunner via D-Bus when the runner is dismissed.  WindowsRunner
++    // has no persistent state, so this is a no-op — but the slot must exist so
++    // the org.kde.krunner1.Teardown call resolves cleanly.
++    void Teardown()
++    {
++    }
++
+ private:
+     enum WindowsRunnerAction {
+         // Windows related actions
 diff --git a/src/scene/item.cpp b/src/scene/item.cpp
 index 73221d9..805600e 100644
 --- a/src/scene/item.cpp
