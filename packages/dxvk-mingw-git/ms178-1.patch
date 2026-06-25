@@ -1,7 +1,11 @@
-From dc8c7ece5c3fa4f960e4fc4bb38479a1b6ad1b8a Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@example.invalid>
-Date: Tue, 23 Jun 2026 19:57:08 +0000
-Subject: [PATCH] ms178: apply unified DXVK mingw performance stack v3
+From: ms178 <ms178@local>
+Subject: [PATCH] ms178: apply unified DXVK mingw performance stack v3 (folded)
+
+This is the unified, non-stacked v3 of the ms178 DXVK performance patch
+set. It contains everything ms178-1.patch had, plus the audit-driven
+refinements to dxvk_gpl_async_cache.{cpp,h} (cookie-memoised SHA1, single
+multimap traversal, linear-scan dedup, shutdown-ordering comment, periodic
+crash-safe flush). Each touched file appears exactly once.
 
 ---
  build-win32.txt                       |  10 +-
@@ -14,14 +18,14 @@ Subject: [PATCH] ms178: apply unified DXVK mingw performance stack v3
  src/dxvk/dxvk_context.cpp             |  43 ++-
  src/dxvk/dxvk_context.h               |   7 +-
  src/dxvk/dxvk_cs.cpp                  |  10 +-
- src/dxvk/dxvk_descriptor_pool.cpp     |  37 +-
+ src/dxvk/dxvk_descriptor_pool.cpp     |  37 ++-
  src/dxvk/dxvk_device_info.cpp         |  15 +-
  src/dxvk/dxvk_device_info.h           |   2 +
  src/dxvk/dxvk_fence.cpp               |  23 +-
- src/dxvk/dxvk_gpl_async_cache.cpp     | 516 ++++++++++++++++++++++++++
- src/dxvk/dxvk_gpl_async_cache.h       | 126 +++++++
- src/dxvk/dxvk_gpl_async_cache_types.h |  99 +++++
- src/dxvk/dxvk_graphics.cpp            | 101 +++--
+ src/dxvk/dxvk_gpl_async_cache.cpp     | 575 ++++++++++++++++++++++++++++++++++
+ src/dxvk/dxvk_gpl_async_cache.h       | 132 ++++++++
+ src/dxvk/dxvk_gpl_async_cache_types.h |  99 ++++++
+ src/dxvk/dxvk_graphics.cpp            | 101 ++++--
  src/dxvk/dxvk_graphics.h              |   5 +-
  src/dxvk/dxvk_graphics_state.h        |  62 ++--
  src/dxvk/dxvk_image.cpp               |  22 +-
@@ -30,29 +34,26 @@ Subject: [PATCH] ms178: apply unified DXVK mingw performance stack v3
  src/dxvk/dxvk_memory.cpp              |  13 +-
  src/dxvk/dxvk_options.cpp             |   3 +
  src/dxvk/dxvk_options.h               |   6 +
- src/dxvk/dxvk_pipemanager.cpp         |  77 ++--
+ src/dxvk/dxvk_pipemanager.cpp         |  77 +++--
  src/dxvk/dxvk_pipemanager.h           |  14 +-
- src/dxvk/dxvk_presenter.cpp           | 124 ++++++-
+ src/dxvk/dxvk_presenter.cpp           | 124 +++++++-
  src/dxvk/dxvk_presenter.h             |   8 +
- src/dxvk/dxvk_queue.cpp               |  38 +-
- src/dxvk/dxvk_shader.cpp              |  37 +-
+ src/dxvk/dxvk_queue.cpp               |  38 ++-
+ src/dxvk/dxvk_shader.cpp              |  37 +--
  src/dxvk/dxvk_shader_cache.cpp        |   5 +-
  src/dxvk/meson.build                  |   1 +
- src/util/config/config.cpp            |  18 +
+ src/util/config/config.cpp            |  18 ++
  src/util/rc/util_rc.h                 |   7 +-
  src/util/sync/sync_signal.h           |  20 +-
  src/util/sync/sync_spinlock.h         |   2 +-
  src/util/sync/sync_ticketlock.h       |  15 +-
  src/util/thread.h                     |   4 +-
- src/util/util_bit.h                   | 115 +++++-
+ src/util/util_bit.h                   | 115 ++++++-
  src/util/util_file.h                  |   6 +-
  src/util/util_sleep.cpp               |   2 +-
  src/util/util_string.h                |  14 +-
  src/vulkan/vulkan_loader.h            |   7 +
- 45 files changed, 1474 insertions(+), 262 deletions(-)
- create mode 100644 src/dxvk/dxvk_gpl_async_cache.cpp
- create mode 100644 src/dxvk/dxvk_gpl_async_cache.h
- create mode 100644 src/dxvk/dxvk_gpl_async_cache_types.h
+ 45 files changed, 1539 insertions(+), 262 deletions(-)
 
 diff --git a/build-win32.txt b/build-win32.txt
 index 40e9d47..d8e76a1 100644
@@ -571,10 +572,10 @@ index 8485c40..4b621cf 100644
      }
 diff --git a/src/dxvk/dxvk_gpl_async_cache.cpp b/src/dxvk/dxvk_gpl_async_cache.cpp
 new file mode 100644
-index 0000000..b181424
+index 0000000..d2a29bc
 --- /dev/null
 +++ b/src/dxvk/dxvk_gpl_async_cache.cpp
-@@ -0,0 +1,516 @@
+@@ -0,0 +1,575 @@
 +#include "dxvk_device.h"
 +#include "dxvk_gpl_async_cache.h"
 +#include "dxvk_pipemanager.h"
@@ -674,27 +675,40 @@ index 0000000..b181424
 +    if (shaderKey.isNull())
 +      return;
 +
++    // Linear-scan dedup on the small readyPipelines vector instead of
++    // allocating a fresh unordered_set every call. The typical pipeline
++    // count per shader is 0-4; for n<=16 a linear scan over cache-resident
++    // 100-byte keys beats hash-set lookup overhead.
 +    std::vector<WorkerItem> readyPipelines;
-+    // Deduplicate: a shader may be mapped to the same pipeline key via
-+    // multiple slots (e.g. vs slot and fs slot share the same multimap key).
-+    std::unordered_set<DxvkGplAsyncPipelineKey, KeyHash, KeyEq> readyKeys;
 +
 +    { std::lock_guard<dxvk::mutex> lock(m_entryLock);
 +      m_shaderMap.insert_or_assign(shaderKey, shader);
 +
 +      const size_t pipelineCount = m_pipelineMap.count(shaderKey);
++
++      if (!pipelineCount)
++        return;
++
 +      readyPipelines.reserve(pipelineCount);
-+      readyKeys.reserve(pipelineCount);
 +
 +      auto range = m_pipelineMap.equal_range(shaderKey);
 +
 +      for (auto i = range.first; i != range.second; i++) {
-+        // Skip duplicate pipeline keys already in the ready list.
-+        if (!readyKeys.insert(i->second).second)
++        const auto& candidateKey = i->second;
++
++        bool duplicate = false;
++        for (const auto& existing : readyPipelines) {
++          if (existing.key.eq(candidateKey)) {
++            duplicate = true;
++            break;
++          }
++        }
++
++        if (duplicate)
 +          continue;
 +
 +        WorkerItem item;
-+        item.key = i->second;
++        item.key = candidateKey;
 +
 +        if (!getShaderByKeyLocked(item.key.vs,  item.shaders.vs)
 +         || !getShaderByKeyLocked(item.key.tcs, item.shaders.tcs)
@@ -726,6 +740,11 @@ index 0000000..b181424
 +
 +
 +  void DxvkGplAsyncCache::stopWorkers() {
++    // This method must be called while m_pipeManager and m_pipeWorkers are
++    // still alive. Today that is guaranteed because DxvkPipelineManager owns
++    // this object and tears down its own workers before its destructor
++    // returns. Do NOT move this object into a container whose destruction
++    // order is not strict-LIFO with the pipeline manager.
 +    if (m_stopThreads.exchange(true, std::memory_order_acq_rel))
 +      return;
 +
@@ -760,6 +779,19 @@ index 0000000..b181424
 +    if (shader == nullptr)
 +      return key;
 +
++    // Memoise SHA1(debugName) on the per-process shader cookie. debugName()
++    // allocates an std::string and the SHA1 runs over ~30-80 bytes; both are
++    // wasted when the same shader is queried repeatedly (which is the common
++    // case from getPipelineKey, which calls this 5x per pipeline).
++    const size_t cookie = shader->getCookie();
++
++    if (cookie != 0u) {
++      std::lock_guard<dxvk::mutex> lock(m_shaderKeyCacheLock);
++      auto it = m_shaderKeyCache.find(cookie);
++      if (it != m_shaderKeyCache.end())
++        return it->second;
++    }
++
 +    std::string name = shader->debugName();
 +
 +    if (name.empty())
@@ -767,6 +799,12 @@ index 0000000..b181424
 +
 +    Sha1Hash hash = Sha1Hash::compute(name.data(), name.size());
 +    std::memcpy(key.hash.data(), hash.digest(), key.hash.size());
++
++    if (cookie != 0u) {
++      std::lock_guard<dxvk::mutex> lock(m_shaderKeyCacheLock);
++      m_shaderKeyCache.emplace(cookie, key);
++    }
++
 +    return key;
 +  }
 +
@@ -824,9 +862,12 @@ index 0000000..b181424
 +    std::vector<DxvkGraphicsPipelineStateInfo> states;
 +
 +    { std::lock_guard<dxvk::mutex> lock(m_entryLock);
-+      states.reserve(m_entryMap.count(item.key));
-+
++      // Avoid the redundant unordered_multimap::count() pass over the
++      // bucket. count() walks the linked bucket once just to size the
++      // reservation, then equal_range walks it again. A small reserve
++      // covers the common 1-4-entry bucket; growth amortises.
 +      auto range = m_entryMap.equal_range(item.key);
++      states.reserve(4u);
 +
 +      for (auto i = range.first; i != range.second; i++)
 +        states.push_back(m_entries[i->second].state);
@@ -982,19 +1023,33 @@ index 0000000..b181424
 +
 +    std::ofstream file;
 +
++    // Periodic flush so crashes don't lose more than a handful of entries.
++    // std::ofstream in binary|app mode is fully buffered; without a flush
++    // the kernel only sees data on close, which never happens on SIGKILL.
++    uint32_t unflushedEntries = 0u;
++    constexpr uint32_t FlushInterval = 8u;
++
 +    while (true) {
 +      DxvkGplAsyncCacheEntry entry;
++      bool drainStop = false;
 +
 +      { std::unique_lock<dxvk::mutex> lock(m_writerLock);
 +        m_writerCond.wait(lock, [this] {
 +          return m_stopThreads.load(std::memory_order_acquire) || !m_writerQueue.empty();
 +        });
 +
-+        if (m_writerQueue.empty())
-+          break;
++        if (m_writerQueue.empty()) {
++          drainStop = true;
++        } else {
++          entry = std::move(m_writerQueue.front());
++          m_writerQueue.pop();
++        }
++      }
 +
-+        entry = std::move(m_writerQueue.front());
-+        m_writerQueue.pop();
++      if (drainStop) {
++        if (file && unflushedEntries)
++          file.flush();
++        break;
 +      }
 +
 +      { std::lock_guard<dxvk::mutex> lock(m_entryLock);
@@ -1015,8 +1070,13 @@ index 0000000..b181424
 +      if (!file.is_open())
 +        file = openCacheFileForWrite(false);
 +
-+      if (file)
++      if (file) {
 +        writeCacheEntry(file, entry);
++        if (++unflushedEntries >= FlushInterval) {
++          file.flush();
++          unflushedEntries = 0u;
++        }
++      }
 +    }
 +  }
 +
@@ -1094,10 +1154,10 @@ index 0000000..b181424
 \ No newline at end of file
 diff --git a/src/dxvk/dxvk_gpl_async_cache.h b/src/dxvk/dxvk_gpl_async_cache.h
 new file mode 100644
-index 0000000..ed45c78
+index 0000000..6fc0bb6
 --- /dev/null
 +++ b/src/dxvk/dxvk_gpl_async_cache.h
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,132 @@
 +#pragma once
 +
 +#include <atomic>
@@ -1183,6 +1243,12 @@ index 0000000..ed45c78
 +    std::unordered_multimap<DxvkGplAsyncPipelineKey, size_t,       KeyHash,       KeyEq>       m_entryMap;
 +    std::unordered_multimap<DxvkGplAsyncShaderKey,   DxvkGplAsyncPipelineKey, ShaderKeyHash, ShaderKeyEq> m_pipelineMap;
 +    std::unordered_map     <DxvkGplAsyncShaderKey,   Rc<DxvkShader>,          ShaderKeyHash, ShaderKeyEq> m_shaderMap;
++
++    // Memoise SHA1(debugName) per shader cookie. The cookie is a per-process
++    // monotonic identity (DxvkShader::s_cookie); the SHA1 of debugName() is
++    // what we persist to disk, so the on-disk format is unchanged.
++    mutable dxvk::mutex                                              m_shaderKeyCacheLock;
++    mutable std::unordered_map<size_t, DxvkGplAsyncShaderKey>        m_shaderKeyCache;
 +
 +    dxvk::mutex              m_workerLock;
 +    dxvk::condition_variable m_workerCond;
@@ -2502,10 +2568,10 @@ index 40f4cc0..4d4ee99 100644
    'dxvk_implicit_resolve.cpp',
    'dxvk_instance.cpp',
 diff --git a/src/util/config/config.cpp b/src/util/config/config.cpp
-index 8d9c210..c1f12d6 100644
+index a64554c..b4ff2e6 100644
 --- a/src/util/config/config.cpp
 +++ b/src/util/config/config.cpp
-@@ -1738,6 +1738,24 @@ namespace dxvk {
+@@ -1745,6 +1745,24 @@ namespace dxvk {
      // Open the file if it exists
      std::ifstream stream(str::topath(filePath.c_str()).c_str());
  
