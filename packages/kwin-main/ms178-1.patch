@@ -1108,10 +1108,10 @@ index 337ea46..792f49f 100644
  
  private:
 diff --git a/src/backends/drm/drm_commit_thread.cpp b/src/backends/drm/drm_commit_thread.cpp
-index deafa26..8eb444e 100644
+index deafa26..b66eb8e 100644
 --- a/src/backends/drm/drm_commit_thread.cpp
 +++ b/src/backends/drm/drm_commit_thread.cpp
-@@ -13,300 +13,592 @@
+@@ -13,300 +13,608 @@
  #include "utils/envvar.h"
  #include "utils/realtime.h"
  
@@ -1209,6 +1209,22 @@ index deafa26..8eb444e 100644
 +        return hi;
 +    }
 +    return val;
++}
++
++[[nodiscard]] inline bool isFramelessSinglePlaneCommit(const DrmAtomicCommit *commit) noexcept
++{
++    return commit
++        && !commit->targetPageflipTime().has_value()
++        && commit->modifiedPlanes().size() == 1;
++}
++
++[[nodiscard]] inline bool touchesSamePlane(const DrmAtomicCommit *left, const DrmAtomicCommit *right) noexcept
++{
++    if (!isFramelessSinglePlaneCommit(left) || !isFramelessSinglePlaneCommit(right)) {
++        return false;
++    }
++    DrmPlane *const plane = *left->modifiedPlanes().begin();
++    return right->modifiedPlanes().contains(plane);
 +}
 +} // namespace
 +
@@ -1505,10 +1521,7 @@ index deafa26..8eb444e 100644
          m_commits.erase(m_commits.begin());
 +        return;
 +    }
- 
--        // the kernel might still take some time to actually apply the commit
--        // after we return from the commit ioctl, but we don't have any better
--        // way to know when it's done
++
 +    // Vanilla compositors call commit() directly without a preceding test().
 +    // commit() registers a PAGE_FLIP_EVENT and, on success, atomically applies
 +    // the state in the same ioctl. Doing test()+commit() unconditionally added
@@ -1592,7 +1605,10 @@ index deafa26..8eb444e 100644
 +            return;
 +        }
 +    }
-+
+ 
+-        // the kernel might still take some time to actually apply the commit
+-        // after we return from the commit ioctl, but we don't have any better
+-        // way to know when it's done
 +    if (success) [[likely]] {
 +        const auto vrr = commit->isVrr();
 +        if (vrr.has_value()) {
@@ -1677,30 +1693,30 @@ index deafa26..8eb444e 100644
 +    while (firstNotReady < count) {
 +        if (!m_commits[firstNotReady]) {
 +            break;
++        }
++        if (!m_commits[firstNotReady]->isReadyFor(pageflipTarget)) {
++            break;
          }
 -        for (auto &commit : m_commits) {
 -            m_commitsToDelete.push_back(std::move(commit));
-+        if (!m_commits[firstNotReady]->isReadyFor(pageflipTarget)) {
++        if (m_commits[firstNotReady]->isTearing()) {
 +            break;
          }
 -        m_commits.clear();
 -        qCWarning(KWIN_DRM) << "atomic commit failed:" << strerror(errno);
-+        if (m_commits[firstNotReady]->isTearing()) {
-+            break;
-+        }
 +        ++firstNotReady;
 +    }
 +
 +    if (firstNotReady == 1) {
 +        return false;
-     }
--    QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::ConnectionType::QueuedConnection);
++    }
 +
 +    const size_t mergeCount = firstNotReady - 1;
 +    const size_t required = m_commitsToDelete.size() + mergeCount + 1;
 +    if (m_commitsToDelete.capacity() < required) {
 +        m_commitsToDelete.reserve(required);
-+    }
+     }
+-    QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::ConnectionType::QueuedConnection);
 +
 +    // Build the merged candidate as a fresh COPY of the front commit, mirroring
 +    // upstream's mergeCommits(): the original front commit must remain pristine
@@ -1893,20 +1909,20 @@ index deafa26..8eb444e 100644
          }
 +        ++write;
 +        read = next;
-     }
--    if (front) {
--        m_commits.insert(m_commits.begin(), std::move(front));
++    }
 +
 +    if (write < count) {
 +        m_commits.erase(m_commits.begin() + static_cast<std::ptrdiff_t>(write), m_commits.end());
-+    }
+     }
+-    if (front) {
+-        m_commits.insert(m_commits.begin(), std::move(front));
 +
 +    if (optimized && !m_commitsToDelete.empty()) {
 +        QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::QueuedConnection);
      }
  }
  
-@@ -316,10 +608,10 @@ DrmCommitThread::~DrmCommitThread()
+@@ -316,10 +624,10 @@ DrmCommitThread::~DrmCommitThread()
          {
              std::unique_lock lock(m_mutex);
              m_thread->requestInterruption();
@@ -1920,7 +1936,7 @@ index deafa26..8eb444e 100644
          m_thread->wait();
      }
      if (m_committed) {
-@@ -330,87 +622,312 @@ DrmCommitThread::~DrmCommitThread()
+@@ -330,87 +638,333 @@ DrmCommitThread::~DrmCommitThread()
  
  void DrmCommitThread::addCommit(std::unique_ptr<DrmAtomicCommit> &&commit)
  {
@@ -1957,7 +1973,28 @@ index deafa26..8eb444e 100644
 +        m_targetPageflipTime = newTarget;
 +    }
 +
++    const bool canCoalesce = isFramelessSinglePlaneCommit(commit.get());
 +    commit->setDeadline(m_targetPageflipTime - m_safetyMargin);
++
++    if (canCoalesce) {
++        for (auto it = m_commits.rbegin(); it != m_commits.rend(); ++it) {
++            DrmAtomicCommit *queued = it->get();
++            if (!queued) [[unlikely]] {
++                continue;
++            }
++            if (queued->isTearing() != commit->isTearing()) {
++                continue;
++            }
++            if (!touchesSamePlane(queued, commit.get())) {
++                continue;
++            }
++            m_commitsToDelete.push_back(std::move(*it));
++            *it = std::move(commit);
++            lock.unlock();
++            m_commitPending.notify_one();
++            return;
++        }
++    }
 +
 +    // std::vector::push_back already amortises capacity growth via doubling;
 +    // the constructor pre-reserves kInitialCommitCapacity, so push_back is
@@ -2099,12 +2136,7 @@ index deafa26..8eb444e 100644
 +    int64_t mappedNs = 0;
 +    if (__builtin_add_overflow(timestamp.count(), cache.offsetNs, &mappedNs)) [[unlikely]] {
 +        mappedNs = steadyNowNs;
-     }
--    m_lastPageflip = TimePoint(timestamp);
--    m_committed.reset();
--    if (!m_commits.empty()) {
--        m_targetPageflipTime = estimateNextVblank(std::chrono::steady_clock::now());
--        m_commitPending.notify_all();
++    }
 +
 +    // Relaxed clamp: allow the kernel timestamp (converted) to be slightly in the
 +    // "future" relative to now (event dispatch delay) or in the past. Clipping to
@@ -2116,7 +2148,12 @@ index deafa26..8eb444e 100644
 +        : 2000000LL;  // 2ms fallback
 +    if (mappedNs > steadyNowNs + maxReasonableFuture || mappedNs < 0) [[unlikely]] {
 +        mappedNs = steadyNowNs;
-+    }
+     }
+-    m_lastPageflip = TimePoint(timestamp);
+-    m_committed.reset();
+-    if (!m_commits.empty()) {
+-        m_targetPageflipTime = estimateNextVblank(std::chrono::steady_clock::now());
+-        m_commitPending.notify_all();
 +
 +    const TimePoint mappedTime{
 +        std::chrono::duration_cast<TimePoint::duration>(std::chrono::nanoseconds{mappedNs})};
@@ -3869,7 +3906,7 @@ index 22a4e09..bbe8425 100644
  }
  
 diff --git a/src/backends/drm/drm_pipeline.cpp b/src/backends/drm/drm_pipeline.cpp
-index ba947a1..e79246a 100644
+index ba947a1..d858a4a 100644
 --- a/src/backends/drm/drm_pipeline.cpp
 +++ b/src/backends/drm/drm_pipeline.cpp
 @@ -1,17 +1,9 @@
@@ -4184,7 +4221,7 @@ index ba947a1..e79246a 100644
  }
  
  void DrmPipeline::maybeModeset(const std::shared_ptr<OutputFrame> &frame)
-@@ -104,49 +281,60 @@ void DrmPipeline::maybeModeset(const std::shared_ptr<OutputFrame> &frame)
+@@ -104,49 +281,65 @@ void DrmPipeline::maybeModeset(const std::shared_ptr<OutputFrame> &frame)
  DrmPipeline::Error DrmPipeline::commitPipelines(const QList<DrmPipeline *> &pipelines, CommitMode mode, const QList<DrmObject *> &unusedObjects)
  {
      Q_ASSERT(!pipelines.isEmpty());
@@ -4227,7 +4264,12 @@ index ba947a1..e79246a 100644
      for (DrmPipeline *pipeline : pipelines) {
 -        if (Error err = pipeline->prepareAtomicCommit(commit.get(), mode, frame); err != Error::None) {
 +        if (const Error err = pipeline->prepareAtomicCommit(commit.get(), mode, frame); err != Error::None) [[unlikely]] {
-+            qCWarning(KWIN_DRM) << "prepareAtomicCommit failed for pipeline:" << static_cast<int>(err);
++            static std::atomic<int> s_prepareWarnCount{0};
++            const int warnCount = s_prepareWarnCount.fetch_add(1, std::memory_order_relaxed);
++            if (warnCount < 8 || (warnCount & 255) == 0) {
++                qCWarning(KWIN_DRM) << "prepareAtomicCommit failed with error" << static_cast<int>(err)
++                                    << "for connector" << pipeline->connector()->connectorName();
++            }
              return err;
          }
      }
@@ -4268,7 +4310,7 @@ index ba947a1..e79246a 100644
          for (DrmPipeline *pipeline : pipelines) {
              pipeline->m_pending.needsModeset = !withoutModeset;
              pipeline->m_pending.needsModesetProperties = true;
-@@ -154,71 +342,127 @@ DrmPipeline::Error DrmPipeline::commitPipelinesAtomic(const QList<DrmPipeline *>
+@@ -154,71 +347,127 @@ DrmPipeline::Error DrmPipeline::commitPipelinesAtomic(const QList<DrmPipeline *>
          return Error::None;
      }
      case CommitMode::CommitModeset: {
@@ -4384,9 +4426,8 @@ index ba947a1..e79246a 100644
 -        commit->setVrr(m_pending.crtc, m_pending.presentationMode == PresentationMode::AdaptiveSync || m_pending.presentationMode == PresentationMode::AdaptiveAsync);
 +        const bool shouldEnableVrr = isAdaptiveMode(m_pending.presentationMode) && !m_pending.needsModeset;
 +        commit->setVrr(m_pending.crtc, shouldEnableVrr);
-     }
- 
--    const ColorPipeline &colorPipeline = m_pending.crtcColorPipeline;
++    }
++
 +    if (m_pending.layers.isEmpty()) [[unlikely]] {
 +        return Error::InvalidArguments;
 +    }
@@ -4402,8 +4443,9 @@ index ba947a1..e79246a 100644
 +        if (!referenceLayer) {
 +            referenceLayer = layer;
 +        }
-+    }
-+
+     }
+ 
+-    const ColorPipeline &colorPipeline = m_pending.crtcColorPipeline;
 +    if (!referenceLayer) [[unlikely]] {
 +        return Error::InvalidArguments;
 +    }
@@ -4425,7 +4467,7 @@ index ba947a1..e79246a 100644
              return Error::InvalidArguments;
          }
      }
-@@ -226,44 +470,182 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commi
+@@ -226,44 +475,182 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commi
      return Error::None;
  }
  
@@ -4625,7 +4667,7 @@ index ba947a1..e79246a 100644
      if (plane->zpos.isValid() && !plane->zpos.isImmutable()) {
          commit->addProperty(plane->zpos, layer->zpos());
      }
-@@ -271,194 +653,166 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPlane(DrmAtomicCommit *commit, DrmP
+@@ -271,194 +658,166 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPlane(DrmAtomicCommit *commit, DrmP
          commit->addProperty(plane->fbDamage, 0);
      }
  
@@ -4914,13 +4956,13 @@ index ba947a1..e79246a 100644
 -        m_pending.overscan = 128 / aspectRatio;
 +    if (!m_pending.mode) [[unlikely]] {
 +        return 0;
-     }
--    return hborder;
++    }
 +    const QSize size = m_pending.mode->size();
 +    const int height = size.height();
 +    if (height <= 0) [[unlikely]] {
 +        return 0;
-+    }
+     }
+-    return hborder;
 +    const int width = size.width();
 +    const float aspectRatio = static_cast<float>(width) / static_cast<float>(height);
 +    float hborderF = static_cast<float>(m_pending.overscan) * aspectRatio;
@@ -4936,7 +4978,7 @@ index ba947a1..e79246a 100644
  {
      switch (errno) {
      case EINVAL:
-@@ -476,81 +830,125 @@ DrmPipeline::Error DrmPipeline::errnoToError()
+@@ -476,81 +835,124 @@ DrmPipeline::Error DrmPipeline::errnoToError()
  
  bool DrmPipeline::presentAsync(OutputLayer *layer, std::optional<std::chrono::nanoseconds> allowedVrrDelay)
  {
@@ -4995,13 +5037,12 @@ index ba947a1..e79246a 100644
 +
 +    partialUpdate->setAllowedVrrDelay(allowedVrrDelay);
 +
-+    // Final guard: only the partial (cursor) state, with pending commits applied.
-+    if (!partialUpdate->test()) [[unlikely]] {
-+        const int savedErrno = errno;
-+        qCDebug(KWIN_DRM) << "Async cursor test failed:" << strerror(savedErrno);
-+        return false;
-+    }
-+
++    // The full-state TEST_ONLY above already validated this cursor state while
++    // accounting for queued commits. Re-testing the extracted cursor-only
++    // update here costs one extra DRM_IOCTL_MODE_ATOMIC per pointer sample on
++    // the render thread; with a high-rate mouse and a 165 Hz VSync target that
++    // is enough CPU-side jitter to miss the next vblank. The commit thread has
++    // tested merge recovery and will drop a genuinely stale partial update.
 +    m_commitThread->addCommit(std::move(partialUpdate));
 +    return true;
  }
@@ -5098,7 +5139,7 @@ index ba947a1..e79246a 100644
  {
      return m_pending.crtc && m_pending.mode && m_pending.active;
  }
-@@ -560,37 +958,37 @@ void DrmPipeline::revertPendingChanges()
+@@ -560,37 +962,37 @@ void DrmPipeline::revertPendingChanges()
      m_pending = m_next;
  }
  
@@ -5143,7 +5184,7 @@ index ba947a1..e79246a 100644
  {
      return m_pending.enabled;
  }
-@@ -600,27 +998,27 @@ QList<DrmPipelineLayer *> DrmPipeline::layers() const
+@@ -600,27 +1002,27 @@ QList<DrmPipelineLayer *> DrmPipeline::layers() const
      return m_pending.layers;
  }
  
@@ -5176,7 +5217,7 @@ index ba947a1..e79246a 100644
  {
      return m_pending.iccProfile;
  }
-@@ -633,6 +1031,9 @@ void DrmPipeline::setCrtc(DrmCrtc *crtc)
+@@ -633,6 +1035,9 @@ void DrmPipeline::setCrtc(DrmCrtc *crtc)
  void DrmPipeline::setMode(const std::shared_ptr<DrmConnectorMode> &mode)
  {
      m_pending.mode = mode;
@@ -5186,7 +5227,7 @@ index ba947a1..e79246a 100644
  }
  
  void DrmPipeline::setActive(bool active)
-@@ -648,8 +1049,10 @@ void DrmPipeline::setEnable(bool enable)
+@@ -648,8 +1053,10 @@ void DrmPipeline::setEnable(bool enable)
  void DrmPipeline::setLayers(const QList<DrmPipelineLayer *> &layers)
  {
      m_pending.layers = layers;
@@ -5199,7 +5240,7 @@ index ba947a1..e79246a 100644
      }
  }
  
-@@ -700,53 +1103,54 @@ void DrmPipeline::setIccProfile(const std::shared_ptr<IccProfile> &profile)
+@@ -700,53 +1107,54 @@ void DrmPipeline::setIccProfile(const std::shared_ptr<IccProfile> &profile)
  
  std::shared_ptr<DrmBlob> DrmPipeline::createHdrMetadata(TransferFunction::Type transferFunction) const
  {
@@ -10340,6 +10381,3 @@ index 464caca..3c55e97 100644
      while (xcb_generic_event_t *event = pollEventFunc(connection)) {
          if (!m_dataBridge->dispatchEvent(event)) {
              kwinApp()->dispatchEvent(event);
--- 
-2.47.3
-
