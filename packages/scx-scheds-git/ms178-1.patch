@@ -870,6 +870,73 @@ index 81c734b..4c5b9fb 100644
 -x_domain_migration_out:
 -	return true;
  }
+diff --git a/scheds/rust/scx_lavd/src/bpf/idle.bpf.c b/scheds/rust/scx_lavd/src/bpf/idle.bpf.c
+index 401f7e7..4390949 100644
+--- a/scheds/rust/scx_lavd/src/bpf/idle.bpf.c
++++ b/scheds/rust/scx_lavd/src/bpf/idle.bpf.c
+@@ -756,6 +756,62 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool *is_idle)
+ 	ctx->is_task_big = is_perf_cri(ctx->taskc);
+ 	sticky_cpu = find_sticky_cpu_and_cpdom(ctx, &sticky_cpdom);
+ 
++	/*
++	 * Process-level cache-domain affinity bias.
++	 *
++	 * On Raptor Lake (i7-14700KF), L2 cluster locality matters: P-core
++	 * and E-core clusters share a 2 MB L2 (~40-cycle hits) while a
++	 * cross-cluster access costs ~20-30 extra cycles over the ring bus.
++	 * When sibling threads of this process (same tgid) have already
++	 * established a preferred compute domain, bias placement toward it
++	 * to improve L2 hit rates for shared data.
++	 *
++	 * ------------------------------------------------------------------
++	 * v1 BUG (load failure): v1 called pick_idle_cpu_at_cpdom() *here* to
++	 * fast-return an idle CPU in the sibling domain. That was unsound:
++	 * pick_idle_cpu_at_cpdom() dereferences the idle-intersection scratch
++	 * masks ctx->{ia,io,iat,temp}_mask and gates on their *_empty flags,
++	 * but those are NOT populated until init_idle_ato_masks() runs far
++	 * below (idle.bpf.c ~808/844). On this path the masks are still NULL
++	 * and the *_empty flags are 0, so the verifier hit:
++	 *
++	 *     bpf_cpumask_and(ctx->temp_mask, ...) at idle.bpf.c:237
++	 *     -> "Possibly NULL pointer passed to trusted arg0" -> -EACCES
++	 *
++	 * and scx_lavd refused to load (5/5 retries failed).
++	 *
++	 * v2 FIX: do not search here. Bias the *sticky domain* toward the
++	 * sibling cpdom and invalidate sticky_cpu; the established,
++	 * mask-initialized search below then targets the new sticky domain.
++	 * can_run_on_domain() only needs the active/overflow sets, which are
++	 * already built above by init_active_ovrflw_masks()/init_ao_masks(),
++	 * so it is safe here. The cache-affinity intent is preserved; only the
++	 * broken pre-init mask access is removed. Work-conservation is intact:
++	 * if the sibling domain has no idle CPU, the normal fall-through logic
++	 * (neighbor migration, etc.) still applies.
++	 *
++	 * Only applied to user tasks with actual sibling threads
++	 * (tgid != pid means we are not the only thread).
++	 * ------------------------------------------------------------------
++	 */
++	if (likely(!is_kernel_task((struct task_struct *)ctx->p)) &&
++	    ctx->p->tgid != 0 && ctx->p->tgid != (u32)ctx->p->pid) {
++		u8 sib_cpdom = tgid_get_cpdom((u32)ctx->p->tgid);
++
++		if (sib_cpdom < LAVD_CPDOM_MAX_NR &&
++		    (s64)sib_cpdom != sticky_cpdom &&
++		    can_run_on_domain(ctx, (s64)sib_cpdom)) {
++			sticky_cpdom = (s64)sib_cpdom;
++			/*
++			 * sticky_cpu belonged to the previous sticky domain;
++			 * force a re-derive in the search below (it falls
++			 * back to find_sticky_cpu_at_cpdom() when no CPU is
++			 * idle, so a valid CPU is always produced).
++			 */
++			sticky_cpu = -ENOENT;
++		}
++	}
++
+ 	/*
+ 	 * If failed to find a sticky domain -- i.e., @p cannot run on previous
+ 	 * CPU's compute domain, choose an arbitrary CPU from the active and
 diff --git a/scheds/rust/scx_lavd/src/bpf/intf.h b/scheds/rust/scx_lavd/src/bpf/intf.h
 index 94eef46..3850d49 100644
 --- a/scheds/rust/scx_lavd/src/bpf/intf.h
@@ -2203,7 +2270,7 @@ index a9f6214..d150867 100644
  
  extern struct bpf_cpumask __kptr *turbo_cpumask; /* CPU mask for turbo CPUs */
 diff --git a/scheds/rust/scx_lavd/src/bpf/main.bpf.c b/scheds/rust/scx_lavd/src/bpf/main.bpf.c
-index 4e81f21..ed4e2e5 100644
+index 4e81f21..322d694 100644
 --- a/scheds/rust/scx_lavd/src/bpf/main.bpf.c
 +++ b/scheds/rust/scx_lavd/src/bpf/main.bpf.c
 @@ -1,192 +1,27 @@
@@ -2925,7 +2992,7 @@ index 4e81f21..ed4e2e5 100644
  
  	/*
  	 * Mark the task as running in the duty-cycle ravg immediately,
-@@ -420,12 +543,13 @@ static void update_stat_for_running(struct task_struct *p,
+@@ -420,18 +543,26 @@ static void update_stat_for_running(struct task_struct *p,
  	/*
  	 * Collect additional information when the scheduler is monitored.
  	 */
@@ -2941,7 +3008,23 @@ index 4e81f21..ed4e2e5 100644
  
  	/*
  	 * Update task state when starts running.
-@@ -461,9 +585,9 @@ static void update_stat_for_running(struct task_struct *p,
+-	 */
+-	reset_task_flag(taskc, LAVD_FLAG_IS_WAKEUP);
+-	reset_task_flag(taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
++	 *
++	 * Bulk-clear two wakeup flags in one RMW instead of two: each
++	 * reset_task_flag() is a volatile load + AND + store on the
++	 * arena-backed flags word; merging the masks halves the memory
++	 * traffic on this hot path (fires on every scheduling event).
++	 * Equivalent to two separate clears by De Morgan's law.
++	 */
++	reset_task_flag(taskc,
++		(u64)LAVD_FLAG_IS_WAKEUP |
++		(u64)LAVD_FLAG_IS_SYNC_WAKEUP);
+ 	taskc->last_running_clk = now;
+ 	taskc->last_measured_wall_clk = now;
+ 	taskc->last_measured_exec = p->se.sum_exec_runtime;
+@@ -461,9 +592,9 @@ static void update_stat_for_running(struct task_struct *p,
  	 * measurement is bounded to at most one tick (or the task's run length,
  	 * whichever is shorter).
  	 */
@@ -2954,7 +3037,7 @@ index 4e81f21..ed4e2e5 100644
  	}
  	taskc->last_measured_task_clk = task_clk;
  	taskc->last_measured_pelt_clk = pelt_clk;
-@@ -477,47 +601,58 @@ static void update_stat_for_running(struct task_struct *p,
+@@ -477,47 +608,58 @@ static void update_stat_for_running(struct task_struct *p,
  				now, LAVD_RAVG_HALFLIFE_NS) >>
  				RAVG_FRAC_BITS);
  
@@ -3039,7 +3122,7 @@ index 4e81f21..ed4e2e5 100644
  	if (is_perf_cri(taskc))
  		cpuc->nr_perf_cri++;
  
-@@ -533,6 +668,7 @@ static void account_task_runtime(struct task_struct *p,
+@@ -533,6 +675,7 @@ static void account_task_runtime(struct task_struct *p,
  {
  	u64 task_time_wall, task_time_iwgt, task_time_invr, exec_now, exec_delta;
  	u64 now_task, now_pelt;
@@ -3047,7 +3130,7 @@ index 4e81f21..ed4e2e5 100644
  
  	/*
  	 * Since task execution can span one or more sys_stat intervals,
-@@ -541,8 +677,8 @@ static void account_task_runtime(struct task_struct *p,
+@@ -541,8 +684,8 @@ static void account_task_runtime(struct task_struct *p,
  	 * the load of long-running tasks properly. So, we add up only the
  	 * execution duration since the last measured time.
  	 */
@@ -3058,7 +3141,7 @@ index 4e81f21..ed4e2e5 100644
  
  	/*
  	 * When last_measured_*_clk == 0, it means that ops.running() was
-@@ -595,7 +731,7 @@ static void account_task_runtime(struct task_struct *p,
+@@ -595,7 +738,7 @@ static void account_task_runtime(struct task_struct *p,
  	 * Under CPU bandwidth control using cpu.max, we also need to report
  	 * how much time was actually consumed compared to the reserved time.
  	 */
@@ -3067,7 +3150,7 @@ index 4e81f21..ed4e2e5 100644
  		scx_cgroup_bw_consume(taskc->cgrp_id, task_time_wall, (u64)taskc);
  }
  
-@@ -604,10 +740,9 @@ static void update_stat_for_stopping(struct task_struct *p,
+@@ -604,10 +747,9 @@ static void update_stat_for_stopping(struct task_struct *p,
  				     struct cpu_ctx *cpuc)
  {
  	u64 now = scx_bpf_now();
@@ -3080,7 +3163,7 @@ index 4e81f21..ed4e2e5 100644
  	account_task_runtime(p, taskc, cpuc, now);
  
  	taskc->avg_runtime_wall = calc_avg(taskc->avg_runtime_wall,
-@@ -623,21 +758,32 @@ static void update_stat_for_stopping(struct task_struct *p,
+@@ -623,21 +765,32 @@ static void update_stat_for_stopping(struct task_struct *p,
  	cpuc->util_est = (u32)(ravg_read(&cpuc->avg_util_ravg, now,
  				  LAVD_RAVG_HALFLIFE_NS) >> RAVG_FRAC_BITS);
  
@@ -3124,7 +3207,7 @@ index 4e81f21..ed4e2e5 100644
  	reset_lock_futex_boost(taskc, cpuc);
  }
  
-@@ -647,15 +793,8 @@ static void update_stat_for_refill(struct task_struct *p,
+@@ -647,15 +800,8 @@ static void update_stat_for_refill(struct task_struct *p,
  {
  	u64 now = scx_bpf_now();
  
@@ -3140,7 +3223,7 @@ index 4e81f21..ed4e2e5 100644
  	taskc->avg_runtime_wall = calc_avg(taskc->avg_runtime_wall,
  					   taskc->acc_runtime_wall);
  	taskc->avg_runtime_invr = calc_avg(taskc->avg_runtime_invr,
-@@ -670,11 +809,9 @@ static bool can_direct_dispatch(struct cpu_ctx *cpuc, bool is_cpu_idle)
+@@ -670,11 +816,9 @@ static bool can_direct_dispatch(struct cpu_ctx *cpuc, bool is_cpu_idle)
  }
  
  /*
@@ -3155,7 +3238,7 @@ index 4e81f21..ed4e2e5 100644
   * steal time; a sys_stat snapshot would be up to one interval (10 ms)
   * stale and could misclassify a domain that just drained or absorbed
   * a burst.
-@@ -683,26 +820,66 @@ static __always_inline void account_queued_load(task_ctx *taskc,
+@@ -683,26 +827,66 @@ static __always_inline void account_queued_load(task_ctx *taskc,
  						u8 cpdom_id)
  {
  	struct cpdom_ctx *cpdomc;
@@ -3234,7 +3317,7 @@ index 4e81f21..ed4e2e5 100644
  	taskc->queued_load_snapshot = load;
  	WRITE_ONCE(taskc->queued_in_cpdom_id, cpdom_id);
  }
-@@ -711,50 +888,25 @@ static __always_inline void unaccount_queued_load(task_ctx *taskc)
+@@ -711,50 +895,25 @@ static __always_inline void unaccount_queued_load(task_ctx *taskc)
  {
  	struct cpdom_ctx *cpdomc;
  	u8 cpdom_id = READ_ONCE(taskc->queued_in_cpdom_id);
@@ -3299,7 +3382,7 @@ index 4e81f21..ed4e2e5 100644
  }
  
  static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_aside)
-@@ -791,10 +943,10 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
+@@ -791,10 +950,10 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
  {
  	struct cpu_ctx *cpuc_cur = get_cpu_ctx();
  	struct pick_ctx ictx = {
@@ -3314,7 +3397,7 @@ index 4e81f21..ed4e2e5 100644
  		.wake_flags = wake_flags,
  	};
  	struct task_struct *waker;
-@@ -804,41 +956,43 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
+@@ -804,41 +963,43 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
  	if (!ictx.taskc || !ictx.cpuc_cur)
  		return prev_cpu;
  
@@ -3384,7 +3467,7 @@ index 4e81f21..ed4e2e5 100644
  	cpu_id = pick_idle_cpu(&ictx, &found_idle);
  	cpu_id = cpu_id >= 0 ? cpu_id : prev_cpu;
  	ictx.taskc->suggested_cpu_id = cpu_id;
-@@ -848,10 +1002,6 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
+@@ -848,10 +1009,6 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
  
  		set_task_flag(ictx.taskc, LAVD_FLAG_IDLE_CPU_PICKED);
  
@@ -3395,7 +3478,7 @@ index 4e81f21..ed4e2e5 100644
  		cpuc = get_cpu_ctx_id(cpu_id);
  		if (!cpuc) {
  			scx_bpf_error("Failed to lookup cpu_ctx: %d", cpu_id);
-@@ -860,19 +1010,19 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
+@@ -860,19 +1017,19 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
  
  		if (can_direct_dispatch(cpuc, true)) {
  			/*
@@ -3422,7 +3505,7 @@ index 4e81f21..ed4e2e5 100644
  			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, p->scx.slice, 0);
  			goto out;
  		}
-@@ -892,19 +1042,12 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
+@@ -892,19 +1049,12 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
  	u64 dsq_id;
  
  	cpuc_cur = get_cpu_ctx();
@@ -3443,7 +3526,7 @@ index 4e81f21..ed4e2e5 100644
  	if (!(enq_flags & SCX_ENQ_REENQ)) {
  		if (enq_flags & SCX_ENQ_WAKEUP)
  			set_task_flag(taskc, LAVD_FLAG_IS_WAKEUP);
-@@ -912,30 +1055,23 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
+@@ -912,30 +1062,23 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
  			reset_task_flag(taskc, LAVD_FLAG_IS_WAKEUP);
  
  		p->scx.dsq_vtime = calc_when_to_run(p, taskc);
@@ -3481,7 +3564,7 @@ index 4e81f21..ed4e2e5 100644
  		is_idle = test_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
  		reset_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
  	}
-@@ -945,84 +1081,54 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
+@@ -945,84 +1088,54 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
  		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
  		return;
  	}
@@ -3581,7 +3664,7 @@ index 4e81f21..ed4e2e5 100644
  }
  
  static
-@@ -1031,52 +1137,17 @@ int enqueue_cb(struct task_struct __arg_trusted *p, task_ctx *taskc)
+@@ -1031,52 +1144,17 @@ int enqueue_cb(struct task_struct __arg_trusted *p, task_ctx *taskc)
  	struct cpu_ctx *cpuc;
  	u64 dsq_id;
  	s32 cpu;
@@ -3640,7 +3723,7 @@ index 4e81f21..ed4e2e5 100644
  	    !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
  		cpu = scx_bpf_task_cpu(p);
  
-@@ -1085,45 +1156,19 @@ int enqueue_cb(struct task_struct __arg_trusted *p, task_ctx *taskc)
+@@ -1085,45 +1163,19 @@ int enqueue_cb(struct task_struct __arg_trusted *p, task_ctx *taskc)
  		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
  		return 0;
  	}
@@ -3689,7 +3772,7 @@ index 4e81f21..ed4e2e5 100644
  	if (scx_bpf_test_and_clear_cpu_idle(cpu))
  		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
  	return 0;
-@@ -1140,26 +1185,19 @@ void BPF_STRUCT_OPS(lavd_dequeue, struct task_struct *p, u64 deq_flags)
+@@ -1140,26 +1192,19 @@ void BPF_STRUCT_OPS(lavd_dequeue, struct task_struct *p, u64 deq_flags)
  		return;
  	}
  
@@ -3720,7 +3803,7 @@ index 4e81f21..ed4e2e5 100644
  {
  	if (!prev || !(prev->scx.flags & SCX_TASK_QUEUED))
  		return;
-@@ -1168,36 +1206,17 @@ void consume_prev(struct task_struct *prev, task_ctx *taskc_prev, struct cpu_ctx
+@@ -1168,36 +1213,17 @@ void consume_prev(struct task_struct *prev, task_ctx *taskc_prev, struct cpu_ctx
  	if (!taskc_prev)
  		return;
  
@@ -3759,7 +3842,7 @@ index 4e81f21..ed4e2e5 100644
  	cpuc->flags = taskc_prev->flags;
  }
  
-@@ -1209,48 +1228,35 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
+@@ -1209,48 +1235,35 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
  	bool try_consume = false;
  	struct task_struct *p;
  	struct cpu_ctx *cpuc;
@@ -3815,7 +3898,7 @@ index 4e81f21..ed4e2e5 100644
  	active = active_cpumask;
  	ovrflw = ovrflw_cpumask;
  	if (!active || !ovrflw) {
-@@ -1259,26 +1265,14 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
+@@ -1259,26 +1272,14 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
  		return;
  	}
  
@@ -3844,7 +3927,7 @@ index 4e81f21..ed4e2e5 100644
  	if (use_per_cpu_dsq() && scx_bpf_dsq_nr_queued(cpu_dsq_id)) {
  		bpf_cpumask_set_cpu(cpu, ovrflw);
  		bpf_rcu_read_unlock();
-@@ -1286,12 +1280,6 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
+@@ -1286,12 +1287,6 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
  	}
  
  	if (prev) {
@@ -3857,7 +3940,7 @@ index 4e81f21..ed4e2e5 100644
  		if (is_permanently_pinned(prev)) {
  			bpf_cpumask_set_cpu(cpu, ovrflw);
  			bpf_rcu_read_unlock();
-@@ -1301,10 +1289,6 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
+@@ -1301,10 +1296,6 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
  			goto consume_out;
  		}
  
@@ -3868,7 +3951,7 @@ index 4e81f21..ed4e2e5 100644
  		taskc_prev = get_task_ctx(prev);
  		if (taskc_prev &&
  		    test_task_flag(taskc_prev, LAVD_FLAG_IS_AFFINITIZED) &&
-@@ -1317,44 +1301,19 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
+@@ -1317,44 +1308,19 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
  		}
  	}
  
@@ -3914,7 +3997,7 @@ index 4e81f21..ed4e2e5 100644
  		if (is_permanently_pinned(p)) {
  			new_cpu = scx_bpf_task_cpu(p);
  			if (new_cpu == cpu) {
-@@ -1363,7 +1322,9 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
+@@ -1363,7 +1329,9 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
  				try_consume = true;
  				break;
  			}
@@ -3925,7 +4008,7 @@ index 4e81f21..ed4e2e5 100644
  				scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
  			bpf_task_release(p);
  			continue;
-@@ -1378,26 +1339,18 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
+@@ -1378,26 +1346,18 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
  			continue;
  		}
  
@@ -3958,7 +4041,7 @@ index 4e81f21..ed4e2e5 100644
  			if (new_cpu == cpu) {
  				bpf_cpumask_set_cpu(new_cpu, ovrflw);
  				bpf_task_release(p);
-@@ -1409,25 +1362,15 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
+@@ -1409,25 +1369,15 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
  		}
  		bpf_task_release(p);
  	}
@@ -3984,7 +4067,7 @@ index 4e81f21..ed4e2e5 100644
  	consume_prev(prev, taskc_prev, cpuc);
  }
  
-@@ -1438,61 +1381,41 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
+@@ -1438,61 +1388,41 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
  	u64 now, interval;
  	int i;
  
@@ -4058,7 +4141,7 @@ index 4e81f21..ed4e2e5 100644
  	if (rt_or_dl_task(waker))
  		set_task_flag(p_taskc, LAVD_FLAG_WOKEN_BY_RT_DL);
  	else
-@@ -1500,19 +1423,10 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
+@@ -1500,19 +1430,10 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
  
  	waker_taskc = get_task_ctx(waker);
  	if (!waker_taskc) {
@@ -4079,7 +4162,7 @@ index 4e81f21..ed4e2e5 100644
  	now = scx_bpf_now();
  	interval = time_delta(now, READ_ONCE(waker_taskc->last_runnable_clk));
  	if (interval >= LAVD_LC_WAKE_INTERVAL_MIN) {
-@@ -1521,27 +1435,11 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
+@@ -1521,27 +1442,11 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
  		WRITE_ONCE(waker_taskc->last_runnable_clk, now);
  	}
  
@@ -4108,7 +4191,7 @@ index 4e81f21..ed4e2e5 100644
  		p_taskc->waker_pid = waker->pid;
  		for (i = 0; i < TASK_COMM_LEN && can_loop; i++)
  			p_taskc->waker_comm[i] = waker->comm[i];
-@@ -1554,15 +1452,7 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
+@@ -1554,15 +1459,7 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
  	task_ctx *taskc;
  	u64 now = scx_bpf_now();
  
@@ -4125,7 +4208,7 @@ index 4e81f21..ed4e2e5 100644
  	taskc = get_task_ctx(p);
  	if (!cpuc || !taskc) {
  		scx_bpf_error("Failed to lookup context for task %d", p->pid);
-@@ -1570,47 +1460,16 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
+@@ -1570,47 +1467,16 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
  	}
  
  	unaccount_queued_load(taskc);
@@ -4173,7 +4256,7 @@ index 4e81f21..ed4e2e5 100644
  	try_proc_introspec_cmd(p, taskc);
  }
  
-@@ -1620,17 +1479,7 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
+@@ -1620,17 +1486,7 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
  	task_ctx *taskc;
  	u64 now;
  
@@ -4192,7 +4275,7 @@ index 4e81f21..ed4e2e5 100644
  	taskc = get_task_ctx(p);
  	if (!cpuc || !taskc) {
  		scx_bpf_error("Failed to lookup context for task %d", p->pid);
-@@ -1640,18 +1489,12 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
+@@ -1640,18 +1496,12 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
  	now = scx_bpf_now();
  	account_task_runtime(p, taskc, cpuc, now);
  
@@ -4213,7 +4296,7 @@ index 4e81f21..ed4e2e5 100644
  	if (cpuc->nr_pinned_tasks)
  		shrink_slice_at_tick(p, cpuc, now);
  }
-@@ -1661,17 +1504,7 @@ void BPF_STRUCT_OPS(lavd_stopping, struct task_struct *p, bool runnable)
+@@ -1661,17 +1511,7 @@ void BPF_STRUCT_OPS(lavd_stopping, struct task_struct *p, bool runnable)
  	struct cpu_ctx *cpuc;
  	task_ctx *taskc;
  
@@ -4232,7 +4315,34 @@ index 4e81f21..ed4e2e5 100644
  	taskc = get_task_ctx(p);
  	if (!cpuc || !taskc) {
  		scx_bpf_error("Failed to lookup context for task %d", p->pid);
-@@ -1687,14 +1520,7 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
+@@ -1679,6 +1519,26 @@ void BPF_STRUCT_OPS(lavd_stopping, struct task_struct *p, bool runnable)
+ 	}
+ 
+ 	update_stat_for_stopping(p, taskc, cpuc);
++
++	/*
++	 * Process-level cache-domain affinity (CAS transplant).
++	 *
++	 * Publish this task's cpdom_id under the process's tgid so that
++	 * sibling threads can prefer the same cluster when selecting an
++	 * idle CPU. Only update for multi-threaded user tasks: kernel
++	 * threads and single-threaded processes don't benefit from
++	 * co-location tracking.
++	 *
++	 * We write in lavd_stopping (task just ran) rather than
++	 * lavd_running (task starts running) so the cpdom_id reflects a
++	 * COMPLETED execution on that cluster, not a speculative pick.
++	 * This mirrors the kernel CAS task_cache_work() epoch semantics.
++	 *
++	 * p->tgid is the thread-group leader's pid (same for all threads).
++	 * Only user-space tasks have a tgid != pid that's meaningful here.
++	 */
++	if (likely(!is_kernel_task(p)) && p->tgid != 0)
++		tgid_set_cpdom((u32)p->tgid, (u8)cpuc->cpdom_id);
+ }
+ 
+ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
+@@ -1687,14 +1547,7 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
  	task_ctx *taskc;
  	u64 now, interval;
  
@@ -4248,7 +4358,7 @@ index 4e81f21..ed4e2e5 100644
  	taskc = get_task_ctx(p);
  	if (!cpuc || !taskc) {
  		scx_bpf_error("Failed to lookup context for task %d", p->pid);
-@@ -1702,63 +1528,35 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
+@@ -1702,63 +1555,37 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
  	}
  	cpuc->flags = 0;
  
@@ -4292,7 +4402,7 @@ index 4e81f21..ed4e2e5 100644
 -	 * Read fields individually to ensure the compiler goes through
 -	 * the arena-cast pointer for each access.
 -	 */
- 	now = scx_bpf_now();
+-	now = scx_bpf_now();
 -	struct ravg_data local_ravg;
 -	local_ravg.val = taskc->avg_util_ravg.val;
 -	local_ravg.val_at = taskc->avg_util_ravg.val_at;
@@ -4305,6 +4415,16 @@ index 4e81f21..ed4e2e5 100644
 -	taskc->avg_util_ravg.old = local_ravg.old;
 -	taskc->avg_util_ravg.cur = local_ravg.cur;
 -	taskc->util_est = (u32)(avg_util_fp >> RAVG_FRAC_BITS);
++	reset_task_flag(taskc, LAVD_FLAG_BORE_APPLIED);
+ 
+-	/*
+-	 * When a task @p goes to sleep, its associated wait_freq is updated.
+-	 * wait_freq measures how often a task sleeps waiting for external
+-	 * events (I/O completion, timers, network packets, user input). These
+-	 * events arrive at a rate fixed by the external world, not by CPU
+-	 * speed, so wall clock time is the correct basis.
+-	 */
+ 	now = scx_bpf_now();
 +	{
 +		struct ravg_data local_ravg;
 +		u64 avg_util_fp;
@@ -4321,19 +4441,11 @@ index 4e81f21..ed4e2e5 100644
 +		taskc->avg_util_ravg.cur    = local_ravg.cur;
 +		taskc->util_est = (u32)(avg_util_fp >> RAVG_FRAC_BITS);
 +	}
- 
--	/*
--	 * When a task @p goes to sleep, its associated wait_freq is updated.
--	 * wait_freq measures how often a task sleeps waiting for external
--	 * events (I/O completion, timers, network packets, user input). These
--	 * events arrive at a rate fixed by the external world, not by CPU
--	 * speed, so wall clock time is the correct basis.
--	 */
--	now = scx_bpf_now();
++
  	interval = time_delta(now, taskc->last_quiescent_clk);
  	if (interval > 0) {
  		taskc->wait_freq = calc_avg_freq(taskc->wait_freq, interval);
-@@ -1778,16 +1576,15 @@ static void cpu_ctx_init_online(struct cpu_ctx *cpuc, u32 cpu_id)
+@@ -1778,16 +1605,15 @@ static void cpu_ctx_init_online(struct cpu_ctx *cpuc, u32 cpu_id)
  unlock_out:
  	bpf_rcu_read_unlock();
  
@@ -4358,7 +4470,7 @@ index 4e81f21..ed4e2e5 100644
  	cpuc->is_online = true;
  }
  
-@@ -1803,22 +1600,17 @@ static void cpu_ctx_init_offline(struct cpu_ctx *cpuc, u32 cpu_id)
+@@ -1803,22 +1629,17 @@ static void cpu_ctx_init_offline(struct cpu_ctx *cpuc, u32 cpu_id)
  unlock_out:
  	bpf_rcu_read_unlock();
  
@@ -4385,7 +4497,7 @@ index 4e81f21..ed4e2e5 100644
  	struct cpu_ctx *cpuc;
  
  	cpuc = get_cpu_ctx_id(cpu);
-@@ -1827,12 +1619,6 @@ void BPF_STRUCT_OPS(lavd_cpu_online, s32 cpu)
+@@ -1827,12 +1648,6 @@ void BPF_STRUCT_OPS(lavd_cpu_online, s32 cpu)
  		return;
  	}
  
@@ -4398,7 +4510,7 @@ index 4e81f21..ed4e2e5 100644
  	if (cpuc->max_capacity == 0) {
  		scx_bpf_exit(SCX_ECODE_ACT_RESTART,
  			"RESTART: cpu %d becomes online. Restart the scheduler.",
-@@ -1841,19 +1627,15 @@ void BPF_STRUCT_OPS(lavd_cpu_online, s32 cpu)
+@@ -1841,19 +1656,15 @@ void BPF_STRUCT_OPS(lavd_cpu_online, s32 cpu)
  	}
  
  	cpu_ctx_init_online(cpuc, cpu);
@@ -4419,7 +4531,7 @@ index 4e81f21..ed4e2e5 100644
  	struct cpu_ctx *cpuc;
  
  	cpuc = get_cpu_ctx_id(cpu);
-@@ -1863,21 +1645,15 @@ void BPF_STRUCT_OPS(lavd_cpu_offline, s32 cpu)
+@@ -1863,21 +1674,15 @@ void BPF_STRUCT_OPS(lavd_cpu_offline, s32 cpu)
  	}
  
  	cpu_ctx_init_offline(cpuc, cpu);
@@ -4442,7 +4554,7 @@ index 4e81f21..ed4e2e5 100644
  	struct cpu_ctx *cpuc;
  	u64 now;
  
-@@ -1889,51 +1665,23 @@ void BPF_STRUCT_OPS(lavd_update_idle, s32 cpu, bool idle)
+@@ -1889,51 +1694,23 @@ void BPF_STRUCT_OPS(lavd_update_idle, s32 cpu, bool idle)
  
  	now = scx_bpf_now();
  
@@ -4497,7 +4609,7 @@ index 4e81f21..ed4e2e5 100644
  				__sync_fetch_and_add(&cpuc->idle_total_wall,
  						     duration_wall);
  				break;
-@@ -1967,11 +1715,6 @@ void BPF_STRUCT_OPS(lavd_cpu_acquire, s32 cpu,
+@@ -1967,11 +1744,6 @@ void BPF_STRUCT_OPS(lavd_cpu_acquire, s32 cpu,
  		return;
  	}
  
@@ -4509,7 +4621,7 @@ index 4e81f21..ed4e2e5 100644
  	cpuc->cpuperf_cur = scx_bpf_cpuperf_cur(cpu);
  }
  
-@@ -1985,23 +1728,10 @@ void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
+@@ -1985,23 +1757,10 @@ void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
  		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
  		return;
  	}
@@ -4534,7 +4646,7 @@ index 4e81f21..ed4e2e5 100644
  	reset_cpuperf_target(cpuc);
  }
  
-@@ -2009,9 +1739,6 @@ void BPF_STRUCT_OPS(lavd_enable, struct task_struct *p)
+@@ -2009,9 +1768,6 @@ void BPF_STRUCT_OPS(lavd_enable, struct task_struct *p)
  {
  	task_ctx *taskc;
  
@@ -4544,7 +4656,7 @@ index 4e81f21..ed4e2e5 100644
  	taskc = get_task_ctx(p);
  	if (!taskc) {
  		scx_bpf_error("task_ctx_stor first lookup failed");
-@@ -2021,24 +1748,100 @@ void BPF_STRUCT_OPS(lavd_enable, struct task_struct *p)
+@@ -2021,24 +1777,100 @@ void BPF_STRUCT_OPS(lavd_enable, struct task_struct *p)
  	taskc->svc_time_iwgt = READ_ONCE(cur_svc_time_iwgt);
  }
  
@@ -4654,7 +4766,7 @@ index 4e81f21..ed4e2e5 100644
  	if (!p) {
  		scx_bpf_error("NULL task_struct pointer received");
  		return -ESRCH;
-@@ -2050,46 +1853,60 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
+@@ -2050,46 +1882,60 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
  		return -ENOMEM;
  	}
  
@@ -4744,7 +4856,7 @@ index 4e81f21..ed4e2e5 100644
  
  	bpf_rcu_read_lock();
  	set_affinity_flags(taskc, p->cpus_ptr);
-@@ -2100,6 +1917,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
+@@ -2100,6 +1946,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
  
  	if (parent)
  		bpf_task_release(parent);
@@ -4753,7 +4865,7 @@ index 4e81f21..ed4e2e5 100644
  	return 0;
  }
  
-@@ -2107,15 +1926,15 @@ s32 BPF_STRUCT_OPS(lavd_exit_task, struct task_struct *p,
+@@ -2107,15 +1955,15 @@ s32 BPF_STRUCT_OPS(lavd_exit_task, struct task_struct *p,
  		   struct scx_exit_task_args *args)
  {
  	struct cpu_ctx *cpuc = get_cpu_ctx();
@@ -4773,7 +4885,7 @@ index 4e81f21..ed4e2e5 100644
  		cpuc->cached_pid = 0;
  
  	/*
-@@ -2123,10 +1942,8 @@ s32 BPF_STRUCT_OPS(lavd_exit_task, struct task_struct *p,
+@@ -2123,10 +1971,22 @@ s32 BPF_STRUCT_OPS(lavd_exit_task, struct task_struct *p,
  	 * still be queued. Unaccount its load. If running,
  	 * lavd_running() already unaccounted it.
  	 */
@@ -4782,10 +4894,24 @@ index 4e81f21..ed4e2e5 100644
  		unaccount_queued_load(taskc);
 -		unaccount_queued_load_pcpu(taskc);
 -	}
++
++	/*
++	 * Clean up the tgid_cpdom_map entry when the thread group leader
++	 * exits (p->pid == p->tgid). This avoids stale entries after
++	 * process termination. For non-leader threads exiting while
++	 * siblings still run, we leave the entry intact so remaining
++	 * siblings continue benefiting from the cached cpdom affinity.
++	 * The entry will be naturally replaced by the last running thread
++	 * or cleaned up when the leader exits.
++	 *
++	 * tgid == 0 is a sentinel for kernel threads; skip those.
++	 */
++	if (!is_kernel_task(p) && p->tgid != 0 && p->pid == p->tgid)
++		tgid_clear_cpdom((u32)p->tgid);
  
  	scx_task_free(p);
  	return 0;
-@@ -2134,12 +1951,8 @@ s32 BPF_STRUCT_OPS(lavd_exit_task, struct task_struct *p,
+@@ -2134,12 +1994,8 @@ s32 BPF_STRUCT_OPS(lavd_exit_task, struct task_struct *p,
  
  void BPF_STRUCT_OPS(lavd_dump, struct scx_dump_ctx *dctx)
  {
@@ -4799,7 +4925,7 @@ index 4e81f21..ed4e2e5 100644
  }
  
  void BPF_STRUCT_OPS(lavd_dump_task, struct scx_dump_ctx *dctx,
-@@ -2195,22 +2008,17 @@ static s32 init_cpdoms(u64 now)
+@@ -2195,22 +2051,17 @@ static s32 init_cpdoms(u64 now)
  	int err;
  
  	for (int i = 0; i < LAVD_CPDOM_MAX_NR; i++) {
@@ -4823,7 +4949,7 @@ index 4e81f21..ed4e2e5 100644
  		if (use_cpdom_dsq()) {
  			err = scx_bpf_create_dsq(cpdom_to_dsq(cpdomc->id),
  						 cpdomc->numa_id);
-@@ -2220,11 +2028,6 @@ static s32 init_cpdoms(u64 now)
+@@ -2220,11 +2071,6 @@ static s32 init_cpdoms(u64 now)
  				return err;
  			}
  
@@ -4835,7 +4961,7 @@ index 4e81f21..ed4e2e5 100644
  			err = scx_bpf_create_dsq(cpdom_to_turb_dsq(cpdomc->id),
  						 cpdomc->numa_id);
  			if (err) {
-@@ -2234,9 +2037,6 @@ static s32 init_cpdoms(u64 now)
+@@ -2234,9 +2080,6 @@ static s32 init_cpdoms(u64 now)
  			}
  		}
  
@@ -4845,7 +4971,7 @@ index 4e81f21..ed4e2e5 100644
  		nr_cpdoms = i + 1;
  	}
  
-@@ -2246,6 +2046,7 @@ static s32 init_cpdoms(u64 now)
+@@ -2246,6 +2089,7 @@ static s32 init_cpdoms(u64 now)
  static int calloc_cpumask(struct bpf_cpumask **p_cpumask)
  {
  	struct bpf_cpumask *cpumask;
@@ -4853,7 +4979,7 @@ index 4e81f21..ed4e2e5 100644
  	cpumask = bpf_cpumask_create();
  	if (!cpumask)
  		return -ENOMEM;
-@@ -2253,7 +2054,6 @@ static int calloc_cpumask(struct bpf_cpumask **p_cpumask)
+@@ -2253,7 +2097,6 @@ static int calloc_cpumask(struct bpf_cpumask **p_cpumask)
  	cpumask = bpf_kptr_xchg(p_cpumask, cpumask);
  	if (cpumask)
  		bpf_cpumask_release(cpumask);
@@ -4861,7 +4987,7 @@ index 4e81f21..ed4e2e5 100644
  	return 0;
  }
  
-@@ -2264,34 +2064,26 @@ static int init_cpumasks(void)
+@@ -2264,34 +2107,26 @@ static int init_cpumasks(void)
  	int err = 0;
  
  	bpf_rcu_read_lock();
@@ -4899,7 +5025,7 @@ index 4e81f21..ed4e2e5 100644
  	err = calloc_cpumask(&steady_cpumask);
  	if (err)
  		goto out;
-@@ -2313,23 +2105,18 @@ static s32 init_per_cpu_ctx(u64 now)
+@@ -2313,23 +2148,18 @@ static s32 init_per_cpu_ctx(u64 now)
  	bpf_rcu_read_lock();
  	online_cpumask = scx_bpf_get_online_cpumask();
  
@@ -4928,7 +5054,7 @@ index 4e81f21..ed4e2e5 100644
  	bpf_for(cpu, 0, nr_cpu_ids) {
  		if (cpu >= LAVD_CPU_ID_MAX)
  			break;
-@@ -2342,128 +2129,108 @@ static s32 init_per_cpu_ctx(u64 now)
+@@ -2342,128 +2172,108 @@ static s32 init_per_cpu_ctx(u64 now)
  		}
  
  		err = calloc_cpumask(&cpuc->a_mask);
@@ -5101,7 +5227,7 @@ index 4e81f21..ed4e2e5 100644
  	bpf_for(cpu, 0, nr_cpu_ids) {
  		cpuc = get_cpu_ctx_id(cpu);
  		if (!cpuc) {
-@@ -2483,7 +2250,6 @@ unlock_out:
+@@ -2483,7 +2293,6 @@ unlock_out:
  	return err;
  }
  
@@ -5109,7 +5235,7 @@ index 4e81f21..ed4e2e5 100644
  static int init_per_cpu_dsqs(void)
  {
  	struct cpdom_ctx *cpdomc;
-@@ -2491,18 +2257,15 @@ static int init_per_cpu_dsqs(void)
+@@ -2491,18 +2300,15 @@ static int init_per_cpu_dsqs(void)
  	int cpu, err = 0;
  
  	bpf_for(cpu, 0, nr_cpu_ids) {
@@ -5130,7 +5256,7 @@ index 4e81f21..ed4e2e5 100644
  			return -ESRCH;
  		}
  
-@@ -2530,7 +2293,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_cgroup_init, struct cgroup *cgrp,
+@@ -2530,7 +2336,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_cgroup_init, struct cgroup *cgrp,
  
  	ret = scx_cgroup_bw_init(cgrp, args);
  	if (ret)
@@ -5139,7 +5265,7 @@ index 4e81f21..ed4e2e5 100644
  	return ret;
  }
  
-@@ -2543,7 +2306,7 @@ void BPF_STRUCT_OPS(lavd_cgroup_exit, struct cgroup *cgrp)
+@@ -2543,7 +2349,7 @@ void BPF_STRUCT_OPS(lavd_cgroup_exit, struct cgroup *cgrp)
  
  	ret = scx_cgroup_bw_exit(cgrp);
  	if (ret)
@@ -5148,7 +5274,7 @@ index 4e81f21..ed4e2e5 100644
  }
  
  void BPF_STRUCT_OPS(lavd_cgroup_move, struct task_struct *p,
-@@ -2557,12 +2320,18 @@ void BPF_STRUCT_OPS(lavd_cgroup_move, struct task_struct *p,
+@@ -2557,12 +2363,18 @@ void BPF_STRUCT_OPS(lavd_cgroup_move, struct task_struct *p,
  		scx_bpf_error("Failed to get a task context: %d", p->pid);
  		return;
  	}
@@ -5171,7 +5297,7 @@ index 4e81f21..ed4e2e5 100644
  	}
  }
  
-@@ -2576,7 +2345,7 @@ void BPF_STRUCT_OPS(lavd_cgroup_set_bandwidth, struct cgroup *cgrp,
+@@ -2576,7 +2388,7 @@ void BPF_STRUCT_OPS(lavd_cgroup_set_bandwidth, struct cgroup *cgrp,
  
  	ret = scx_cgroup_bw_set(cgrp, period_us, quota_us, burst_us);
  	if (ret)
@@ -5180,7 +5306,7 @@ index 4e81f21..ed4e2e5 100644
  }
  
  int lavd_enqueue_cb(struct task_struct *p __arg_trusted, u64 ctx)
-@@ -2586,11 +2355,6 @@ int lavd_enqueue_cb(struct task_struct *p __arg_trusted, u64 ctx)
+@@ -2586,11 +2398,6 @@ int lavd_enqueue_cb(struct task_struct *p __arg_trusted, u64 ctx)
  	if (!enable_cpu_bw)
  		return 0;
  
@@ -5192,7 +5318,7 @@ index 4e81f21..ed4e2e5 100644
  	enqueue_cb(p, taskc);
  	return 0;
  }
-@@ -2601,63 +2365,33 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
+@@ -2601,63 +2408,33 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
  	u64 now = scx_bpf_now();
  	int err;
  
@@ -5256,7 +5382,7 @@ index 4e81f21..ed4e2e5 100644
  	if (enable_cpu_bw) {
  		struct scx_cgroup_bw_config bw_config = {
  			.verbose = verbose > 2,
-@@ -2665,9 +2399,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
+@@ -2665,9 +2442,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
  		err = scx_cgroup_bw_lib_init(&bw_config);
  	}
  
@@ -5266,7 +5392,7 @@ index 4e81f21..ed4e2e5 100644
  	lavd_pid = (u32)bpf_get_current_pid_tgid();
  
  	return err;
-@@ -2685,31 +2416,27 @@ int set_aggressive_migration(void)
+@@ -2685,31 +2459,27 @@ int set_aggressive_migration(void)
  	struct cpdom_ctx *cpdc;
  	struct cpu_ctx *cpuc;
  	task_ctx *taskc;
@@ -6369,7 +6495,7 @@ index e87e964..03ce450 100644
  	if (err) {
  		scx_bpf_error("Failed to arm update timer");
 diff --git a/scheds/rust/scx_lavd/src/bpf/util.bpf.c b/scheds/rust/scx_lavd/src/bpf/util.bpf.c
-index 65a7e99..76ca43f 100644
+index 65a7e99..1fef85e 100644
 --- a/scheds/rust/scx_lavd/src/bpf/util.bpf.c
 +++ b/scheds/rust/scx_lavd/src/bpf/util.bpf.c
 @@ -1,7 +1,12 @@
@@ -6426,17 +6552,31 @@ index 65a7e99..76ca43f 100644
  const volatile bool	no_wake_sync;
  const volatile bool	no_slice_boost;
  const volatile bool	per_cpu_dsq;
-@@ -47,9 +46,6 @@ const volatile bool	enable_cpu_bw;
+@@ -47,10 +46,21 @@ const volatile bool	enable_cpu_bw;
  const volatile bool	is_autopilot_on;
  const volatile u8	verbose;
  
--/*
++UEI_DEFINE(uei);
++
+ /*
 - * Exit information
-- */
- UEI_DEFINE(uei);
++ * Process-level cache-domain affinity map.
++ *
++ * Stores tgid -> preferred cpdom_id for sibling-thread co-location.
++ * Single definition here; extern declaration + inline helpers in util.bpf.h.
+  */
+-UEI_DEFINE(uei);
++struct {
++	__uint(type, BPF_MAP_TYPE_HASH);
++	__type(key, u32);
++	__type(value, u8);
++	__uint(max_entries, 4096);
++	__uint(map_flags, BPF_F_NO_PREALLOC);
++} tgid_cpdom_map SEC(".maps");
  
  /*
-@@ -67,7 +63,6 @@ u64 __get_task_ctx_slowpath(struct task_struct __arg_trusted *p,
+  * per-CPU globals
+@@ -67,7 +77,6 @@ u64 __get_task_ctx_slowpath(struct task_struct __arg_trusted *p,
  			    struct cpu_ctx *cpuc)
  {
  	u64 raw = (u64)scx_task_data(p);
@@ -6444,7 +6584,7 @@ index 65a7e99..76ca43f 100644
  	if (cpuc && raw) {
  		cpuc->cached_task = (u64)p;
  		cpuc->cached_pid = p->pid;
-@@ -80,18 +75,34 @@ __hidden
+@@ -80,18 +89,34 @@ __hidden
  struct cpu_ctx *get_cpu_ctx(void)
  {
  	const u32 idx = 0;
@@ -6482,7 +6622,7 @@ index 65a7e99..76ca43f 100644
  {
  	return get_cpu_ctx_id(scx_bpf_task_cpu(p));
  }
-@@ -99,29 +110,18 @@ struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p)
+@@ -99,29 +124,18 @@ struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p)
  __hidden
  u32 __attribute__ ((noinline)) calc_avg32(u32 old_val, u32 new_val)
  {
@@ -6512,7 +6652,7 @@ index 65a7e99..76ca43f 100644
  	if (old_val < new_val)
  		return __calc_avg(new_val, old_val, 2);
  	else
-@@ -133,10 +133,9 @@ u64 __attribute__ ((noinline)) calc_avg_freq(u64 old_freq, u64 interval)
+@@ -133,10 +147,9 @@ u64 __attribute__ ((noinline)) calc_avg_freq(u64 old_freq, u64 interval)
  {
  	u64 new_freq, ewma_freq;
  
@@ -6526,7 +6666,7 @@ index 65a7e99..76ca43f 100644
  	new_freq = LAVD_TIME_ONE_SEC / interval;
  	ewma_freq = __calc_avg(old_freq, new_freq, 3);
  	return ewma_freq;
-@@ -157,7 +156,9 @@ bool is_kernel_worker(struct task_struct *p)
+@@ -157,7 +170,9 @@ bool is_kernel_worker(struct task_struct *p)
  __hidden
  bool is_ksoftirqd(struct task_struct *p)
  {
@@ -6537,7 +6677,7 @@ index 65a7e99..76ca43f 100644
  }
  
  __hidden
-@@ -172,93 +173,39 @@ bool is_effectively_pinned(task_ctx __arg_arena *taskc)
+@@ -172,93 +187,39 @@ bool is_effectively_pinned(task_ctx __arg_arena *taskc)
  	return test_task_flag(taskc, LAVD_FLAG_IS_EFFECTIVELY_PINNED);
  }
  
@@ -6655,7 +6795,7 @@ index 65a7e99..76ca43f 100644
  }
  
  __hidden
-@@ -275,6 +222,7 @@ void set_affinity_flags(task_ctx __arg_arena *taskc,
+@@ -275,6 +236,7 @@ void set_affinity_flags(task_ctx __arg_arena *taskc,
  	bool on_big = false, on_little = false;
  	s32 first_cpdom_id = -ENOENT;
  	struct cpu_ctx *cpuc;
@@ -6663,7 +6803,7 @@ index 65a7e99..76ca43f 100644
  	u32 weight;
  	int cpu;
  
-@@ -282,11 +230,13 @@ void set_affinity_flags(task_ctx __arg_arena *taskc,
+@@ -282,11 +244,13 @@ void set_affinity_flags(task_ctx __arg_arena *taskc,
  		return;
  
  	weight = bpf_cpumask_weight(cpumask);
@@ -6678,7 +6818,7 @@ index 65a7e99..76ca43f 100644
  	if (nr_cpdoms == 1) {
  		dom_pinned = false;
  		dom_pinned_settled = true;
-@@ -295,10 +245,10 @@ void set_affinity_flags(task_ctx __arg_arena *taskc,
+@@ -295,10 +259,10 @@ void set_affinity_flags(task_ctx __arg_arena *taskc,
  		dom_pinned_settled = !is_affinitized;
  	}
  
@@ -6692,7 +6832,7 @@ index 65a7e99..76ca43f 100644
  		if (!bpf_cpumask_test_cpu(cpu, cpumask))
  			continue;
  
-@@ -307,27 +257,20 @@ void set_affinity_flags(task_ctx __arg_arena *taskc,
+@@ -307,27 +271,20 @@ void set_affinity_flags(task_ctx __arg_arena *taskc,
  			scx_bpf_error("Failed to look up cpu_ctx: %d", cpu);
  			return;
  		}
@@ -6723,7 +6863,7 @@ index 65a7e99..76ca43f 100644
  		if (on_big && on_little && dom_pinned_settled)
  			break;
  	}
-@@ -336,17 +279,14 @@ void set_affinity_flags(task_ctx __arg_arena *taskc,
+@@ -336,17 +293,14 @@ void set_affinity_flags(task_ctx __arg_arena *taskc,
  		set_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
  	else
  		reset_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
@@ -6741,7 +6881,7 @@ index 65a7e99..76ca43f 100644
  	if (dom_pinned)
  		set_task_flag(taskc, LAVD_FLAG_DOMAIN_PINNED);
  	else
-@@ -357,33 +297,31 @@ __hidden
+@@ -357,33 +311,31 @@ __hidden
  bool __attribute__ ((noinline)) prob_x_out_of_y(u32 x, u32 y)
  {
  	u32 r;
@@ -6786,7 +6926,7 @@ index 65a7e99..76ca43f 100644
  	return ((cpu < *sibling) ? cpu : *sibling);
  }
  
-@@ -396,18 +334,31 @@ u32 cpu_to_dsq(u32 cpu)
+@@ -396,18 +348,31 @@ u32 cpu_to_dsq(u32 cpu)
  __hidden
  bool queued_on_cpu(struct cpu_ctx *cpuc)
  {
@@ -6826,7 +6966,7 @@ index 65a7e99..76ca43f 100644
  	return false;
  }
  
-@@ -415,69 +366,58 @@ __hidden
+@@ -415,69 +380,58 @@ __hidden
  u64 peek_dsq_vtime(u64 dsq_id)
  {
  	struct task_struct *p;
@@ -6918,6 +7058,50 @@ index 65a7e99..76ca43f 100644
 +	num = (u32)lat_cri << LAVD_SHIFT;
 +	return (u16)(num / max);
  }
+diff --git a/scheds/rust/scx_lavd/src/bpf/util.bpf.h b/scheds/rust/scx_lavd/src/bpf/util.bpf.h
+index c8c1840..624b180 100644
+--- a/scheds/rust/scx_lavd/src/bpf/util.bpf.h
++++ b/scheds/rust/scx_lavd/src/bpf/util.bpf.h
+@@ -83,5 +83,39 @@ __get_task_ctx_curcpu(struct task_struct *p, struct cpu_ctx *cpuc)
+ 	((task_ctx *)__get_task_ctx_curcpu((p), (cpuc)))
+ #define get_task_ctx(p)	get_task_ctx_curcpu((p), get_cpu_ctx())
+ 
++/*
++ * Process-level cache-domain affinity helpers.
++ * Declared here so idle.bpf.c and main.bpf.c can use them without
++ * re-declaring the map. The actual map lives in util.bpf.c (SEC(".maps")).
++ */
++/*
++ * Process-level cache-domain affinity map (CAS transplant).
++ * Defined in the header so every BPF compilation unit that includes
++ * util.bpf.h gets both the map reference and the inline helpers.
++ * The BPF linker deduplicates maps by name across object files.
++ */
++extern struct {
++	__uint(type, BPF_MAP_TYPE_HASH);
++	__type(key, u32);
++	__type(value, u8);
++	__uint(max_entries, 4096);
++	__uint(map_flags, BPF_F_NO_PREALLOC);
++} tgid_cpdom_map;
++
++static __always_inline u8 tgid_get_cpdom(u32 tgid)
++{
++	u8 *val = bpf_map_lookup_elem(&tgid_cpdom_map, &tgid);
++	return val ? *val : (u8)LAVD_CPDOM_MAX_NR;
++}
++
++static __always_inline void tgid_set_cpdom(u32 tgid, u8 cpdom_id)
++{
++	bpf_map_update_elem(&tgid_cpdom_map, &tgid, &cpdom_id, BPF_ANY);
++}
++
++static __always_inline void tgid_clear_cpdom(u32 tgid)
++{
++	bpf_map_delete_elem(&tgid_cpdom_map, &tgid);
++}
+ 
+ #endif /* __UTIL_H */
 diff --git a/scheds/rust/scx_lavd/src/cpu_order.rs b/scheds/rust/scx_lavd/src/cpu_order.rs
 index 5afdfa5..bae1222 100644
 --- a/scheds/rust/scx_lavd/src/cpu_order.rs
