@@ -42,37 +42,16 @@ prepare() {
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/wait.h>
 
-typedef void *pointer;
-typedef pointer (*ModuleSetupProc)(pointer, pointer, int*, int*);
-typedef struct {
-    void *vers;
-    ModuleSetupProc setup;
-    void (*teardown)(pointer);
-} XF86ModuleData;
-
-static void errcpy(char *dst, size_t n) {
+static void
+errcpy(char *dst, size_t n)
+{
     const char *e = dlerror();
-    if (!dst || !n || !e) return;
+
+    if (!dst || n == 0 || !e)
+        return;
+
     snprintf(dst, n, "%s", e);
-}
-
-static int call_setup_isolated(void *h) {
-    XF86ModuleData *md = (XF86ModuleData *)dlsym(h, "amdgpuModuleData");
-    if (!md || !md->setup) return 0;
-
-    pid_t p = fork();
-    if (p < 0) return 0;
-    if (p == 0) {
-        int a = 0, b = 0;
-        (void)md->setup(NULL, NULL, &a, &b);
-        _exit(0);
-    }
-
-    int st = 0;
-    if (waitpid(p, &st, 0) < 0) return 0;
-    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
 }
 
 int main(int argc, char **argv) {
@@ -86,8 +65,7 @@ int main(int argc, char **argv) {
     int rounds = atoi(argv[3]);
     if (rounds < 1) rounds = 1;
 
-    int do_setup = getenv("AMDGPU_CALL_SETUP") ? 1 : 0;
-    int ok_open = 0, fail_open = 0, ok_setup = 0, fail_setup = 0;
+    int ok_open = 0, fail_open = 0, ok_sym = 0, fail_sym = 0;
     char first_err[1024] = {0};
 
     dlerror();
@@ -107,22 +85,22 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        (void)dlsym(h, "amdgpuModuleData");
+        dlerror();
+        void *module_data = dlsym(h, "amdgpuModuleData");
+        const char *symerr = dlerror();
+        if (module_data && !symerr) ok_sym++;
+        else fail_sym++;
+
         (void)dlsym(h, "AMDGPU");
         ok_open++;
-
-        if (do_setup) {
-            if (call_setup_isolated(h)) ok_setup++;
-            else fail_setup++;
-        }
 
         dlclose(h);
     }
 
     dlclose(hs);
 
-    fprintf(stderr, "loader: open_ok=%d open_fail=%d setup_ok=%d setup_fail=%d\n",
-            ok_open, fail_open, ok_setup, fail_setup);
+    fprintf(stderr, "loader: open_ok=%d open_fail=%d moduledata_ok=%d moduledata_fail=%d\n",
+            ok_open, fail_open, ok_sym, fail_sym);
     if (first_err[0]) fprintf(stderr, "loader first error: %s\n", first_err);
 
     return ok_open > 0 ? 0 : 3;
@@ -163,6 +141,18 @@ _profile_diag() {
   read -r c b < <(_profile_stats "${dir}")
   msg2 "${tag}: profraw files=${c}, total_bytes=${b}"
   find "${dir}" -maxdepth 1 -type f -name '*.profraw' -printf '%s %f\n' 2>/dev/null | sort -nr | head -10 | sed 's/^/  /' || true
+}
+
+_require_profile_corpus() {
+  local dir="$1" tag="$2" min_files="${3:-1}" min_bytes="${4:-8192}"
+  local c b
+
+  read -r c b < <(_profile_stats "${dir}")
+  if (( c < min_files || b < min_bytes )); then
+    echo "ERROR: ${tag} profile corpus too small: files=${c}/${min_files}, bytes=${b}/${min_bytes}."
+    echo "ERROR: Safe loader training must compile and produce at least one real profraw; refusing unprofiled final build."
+    return 1
+  fi
 }
 
 _validate_profdata() {
@@ -310,7 +300,8 @@ _run_loader_training() {
   _generate_resolved_stub_shim "${drv}" "${shim}" || return 1
 
   local runner="${srcdir}/amdgpu_loader_runner"
-  "${CC:-clang}" -O2 "${srcdir}/amdgpu_loader.c" -ldl -o "${runner}" || return 1
+  "${CC:-clang}" -O2 -Wall -Wextra -Werror=implicit-function-declaration \
+    "${srcdir}/amdgpu_loader.c" -ldl -o "${runner}" || return 1
 
   local log="${srcdir}/${tag}-loader.log"
   : > "${log}"
@@ -322,13 +313,14 @@ _run_loader_training() {
       "${runner}" "${drv}" "${shim}" "${n}" >> "${log}" 2>&1 || true
   done
 
-  # Setup path corpus (fork-isolated)
-  for n in 200 400 700; do
-    AMDGPU_CALL_SETUP=1 \
-    LLVM_PROFILE_FILE="${out_dir}/${tag}-loader-setup-%h-%p-%m.profraw" LLVM_PROFILE_MERGE_POOL_SIZE=8 \
-      LD_LIBRARY_PATH="/usr/lib:/usr/lib/xorg/modules:/usr/lib/xorg/modules/extensions:${LD_LIBRARY_PATH}" \
-      "${runner}" "${drv}" "${shim}" "${n}" >> "${log}" 2>&1 || true
-  done
+  # Deliberately do not call amdgpuModuleData.setup() here.
+  # The setup hook is an Xorg-loader ABI entry point and is only valid inside
+  # a real Xorg server with real loader/scrn/platform state. Calling it from
+  # a synthetic dlopen runner with generated stubs can execute object stubs as
+  # code and caused repeatable amdgpu_xorg_stub.so SIGSEGV storms during PGO.
+  # Real setup-path training is covered by _run_xorg_training() when Xorg and
+  # hardware/session access are available; this runner is restricted to safe
+  # relocation/dlopen/module-data discovery.
 
   msg2 "Loader diagnostics (${tag}):"
   tail -50 "${log}" | sed 's/^/  /' || true
@@ -368,7 +360,7 @@ _compile_with_diag() {
   while kill -0 "${pid}" 2>/dev/null; do
     sleep 20
     msg2 "[diag:${tag}] compile still running..."
-    pgrep -a -f 'ninja|clang|ld.lld' | sed 's/^/  /' || true
+    pgrep -a -f '(^|/)(ninja|clang|ld\.lld)( |$)' | sed 's/^/  /' || true
   done
 
   wait "${pid}"
@@ -402,7 +394,7 @@ build() {
 
   local s1c s1b
   read -r s1c s1b < <(_profile_stats "${PGO_DIR}")
-  (( s1c >= 2 && s1b >= 8192 )) || { echo "ERROR: Stage 1 profile corpus too small."; return 1; }
+  _require_profile_corpus "${PGO_DIR}" "Stage 1" 1 8192 || return 1
   _merge_raw_profiles "${PGO_DIR}" "${PGO_DIR}/default.profdata" || return 1
 
   msg2 "Stage 2/3: CS-PGO instrumentation build"
@@ -424,7 +416,7 @@ build() {
 
   local s2c s2b
   read -r s2c s2b < <(_profile_stats "${CSPGO_DIR}")
-  (( s2c >= 2 && s2b >= 8192 )) || { echo "ERROR: Stage 2 CS profile corpus too small."; return 1; }
+  _require_profile_corpus "${CSPGO_DIR}" "Stage 2 CS" 1 8192 || return 1
 
   mapfile -t s2raw < <(find "${CSPGO_DIR}" -maxdepth 1 -type f -name '*.profraw' -size +1024c | sort)
   (( ${#s2raw[@]} > 0 )) || return 1
