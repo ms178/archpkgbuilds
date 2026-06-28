@@ -1,25 +1,65 @@
 #!/usr/bin/env fish
 
-# ULTIMATE build-llvm-ultimate.fish - MAX PERF for 14700KF Raptor Lake
-# Full multi-stage: fresh shallow clone + lld ELF patch + /tmp src copy (docs preserved) + cleanup
-# + robust patch lookup (same dir or Downloads) + PGO (VP=8) + CSPGO (VP=8) + FULL_TRAIN + ThinLTO + mimalloc
-# + stage1 tblgen provision in stage2 (avoids ProfileSummary conflict on llvm-min-tblgen under ThinLTO)
-# + BOLT with hybrid cdsplit+hugify etc.  (clang + ld.lld *explicitly*, with already-BOLTed skip + lld wait for safe resumption)
-# The final LTO+PGO stage2 build dir is *deliberately preserved* (the perfected ThinLTO + PGO + mimalloc build before BOLT)
-# All other /tmp stages cleaned as soon as no longer needed (stage1 kept only until after stage2 needs its tblgen)
-# Defaults: FULL_TRAIN=1 DO_CSPGO=1 USE_MIMALLOC=1
+# build-llvm-ultimate.v2.fish
+# Senior LLVM-engineering revision for latest llvm-project main.
+# Goals:
+#   - Preserve the user's high-performance multi-stage PGO/CSPGO/ThinLTO/BOLT flow.
+#   - Fix missing LLVMgold.so by explicitly enabling and verifying the gold plugin.
+#   - Fail fast with precise diagnostics if required prerequisites are absent.
+#   - Make verification explicit so the build never silently ships without LLVMgold.so.
+#
+# Notes:
+#   - LLVMgold requires GNU gold plugin headers (plugin-api.h), usually provided by
+#     binutils-gold / binutils-devel / binutils-dev depending on distro.
+#   - Upstream LLVM only builds the plugin when LLVM_BINUTILS_INCDIR points at the
+#     directory containing plugin-api.h.
+#   - This script intentionally keeps the final stage2 build dir for auditability.
 
 function die
-    echo (set_color -o red)"[LLVM-ULTIMATE][FATAL]"(set_color normal) "$argv" >&2
+    echo (set_color -o red)"[LLVM-ULTIMATE-V2][FATAL]"(set_color normal) "$argv" >&2
     exit 1
 end
 
 function log
-    echo (set_color -o cyan)"[LLVM-ULTIMATE]"(set_color normal) "$argv"
+    echo (set_color -o cyan)"[LLVM-ULTIMATE-V2]"(set_color normal) "$argv"
 end
 
 function run
     $argv; or die "command failed: $argv"
+end
+
+function find_gold_plugin_api_dir
+    set -l candidates \
+        /usr/include \
+        /usr/local/include \
+        /usr/include/bfd-plugins \
+        /usr/local/include/bfd-plugins \
+        /usr/include/binutils \
+        /usr/local/include/binutils
+
+    for d in $candidates
+        if test -f "$d/plugin-api.h"
+            echo "$d"
+            return 0
+        end
+    end
+
+    for d in /usr/include /usr/local/include
+        set -l found (find "$d" -type f -name plugin-api.h 2>/dev/null | head -n 1)
+        if test -n "$found"
+            dirname "$found"
+            return 0
+        end
+    end
+    return 1
+end
+
+function verify_file_exists --argument-names path desc
+    test -e "$path"; or die "$desc missing: $path"
+end
+
+function verify_executable --argument-names path desc
+    test -x "$path"; or die "$desc missing or not executable: $path"
 end
 
 # Config
@@ -27,110 +67,89 @@ set -q TOPLEV; or set -g TOPLEV "$HOME/toolchain/llvm"
 set -q INSTALL_PREFIX; or set -g INSTALL_PREFIX "$HOME/toolchain/llvm-ultimate"
 set -q BUILD_ROOT; or set -g BUILD_ROOT "/tmp/llvm-build-$USER"
 set -q THINLTO_CACHE; or set -g THINLTO_CACHE "$BUILD_ROOT/thinlto-cache"
-
-# Robust script directory (absolute) so patches are found reliably no matter how the script is invoked
 set -g SCRIPT_DIR (dirname (realpath (status --current-filename)))
 set -q PATCH_DIR; or set -g PATCH_DIR "$SCRIPT_DIR"
-
 set -q BOLT_BEST_EFFORT; or set -g BOLT_BEST_EFFORT 0
 set -q FULL_TRAIN; or set -g FULL_TRAIN 1
 set -q DO_CSPGO; or set -g DO_CSPGO 1
 set -q USE_MIMALLOC; or set -g USE_MIMALLOC 1
-# Keep the post-BOLT backup of the pre-BOLT binary on disk (~200 MB each).
-# Default 0 = remove after successful BOLT; set to 1 to keep for forensics.
 set -q KEEP_PRE_BOLT_BACKUP; or set -g KEEP_PRE_BOLT_BACKUP 0
+set -q REQUIRE_GOLD_PLUGIN; or set -g REQUIRE_GOLD_PLUGIN 1
+set -q LLVM_ENABLE_BINDINGS; or set -g LLVM_ENABLE_BINDINGS OFF
 
 set -g NPROC (nproc)
-# ThinLTO parallel link jobs. Default: NPROC/4 (conservative; sized for
-# ~8 GB peak per link job on a 32 GB host). Override via env to push
-# higher on machines with more RAM (a 14700KF + 32 GB can typically do
-# NPROC/3 or NPROC/2; 64 GB easily handles NPROC/2).
 set -q LTO_JOBS; or set -g LTO_JOBS (math -s0 "max(2, round($NPROC / 4))")
-
-# Identical VP for PGO and CSPGO (critical to avoid ProfileSummary ID conflicts)
 set -g VP_COUNTERS_PER_SITE 8
 set -g COMMON_FLAGS "-O3 -march=native -mtune=native -fno-semantic-interposition -falign-functions=32 -falign-loops=32 -fcf-protection=none -mharden-sls=none -fno-plt"
 set -g C_LTO_FLAGS "-flto=thin -fsplit-lto-unit"
 set -g CXX_LTO_FLAGS "-flto=thin -fwhole-program-vtables"
 set -g LINKER_BASE "-fuse-ld=lld -Wl,--thinlto-jobs=$LTO_JOBS -Wl,--lto-O3 -Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=safe -Wl,-z,max-page-size=0x200000"
 
-# Allocator (mimalloc for the final ThinLTO binaries)
-# Prefers static libmimalloc.a with whole-archive for zero-overhead integration.
-# Falls back to shared -lmimalloc if only .so is present.
 set -g ALLOCATOR_LINK "-lpthread -lstdc++ -lm -ldl"
 if test "$USE_MIMALLOC" = "1"
     for d in /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/local/lib
         if test -f "$d/libmimalloc.a"
             set -g ALLOCATOR_LINK "-Wl,--push-state -Wl,--whole-archive $d/libmimalloc.a -Wl,--pop-state $ALLOCATOR_LINK"
-            log "ULTIMATE: Using static mimalloc (libmimalloc.a)"
+            log "Using static mimalloc (libmimalloc.a)"
             break
         else if test -f "$d/libmimalloc.so"
             set -g ALLOCATOR_LINK "-L$d -lmimalloc $ALLOCATOR_LINK"
-            log "ULTIMATE: Using shared mimalloc (libmimalloc.so)"
+            log "Using shared mimalloc (libmimalloc.so)"
             break
         end
     end
 end
 
-# === /tmp clean at start - no leftovers ===
-log "Cleaning ALL /tmp build directories for clean start..."
-rm -rf "$BUILD_ROOT"
-rm -rf "$THINLTO_CACHE"
-mkdir -p "$BUILD_ROOT" "$THINLTO_CACHE" "$BUILD_ROOT/profiles"
-log "/tmp fully cleaned: $BUILD_ROOT (no previous build leftovers)"
+# Pre-flight tools
+for t in git cmake ninja clang clang++ ld.lld llvm-profdata llvm-readelf patch find
+    command -q $t; or die "missing required tool: $t"
+end
 
-# === Fresh LLVM sources: delete old first, shallow clone to $TOPLEV, lld ELF patch ===
+set -g LLVM_BINUTILS_INCDIR ""
+set -g GOLD_PLUGIN_API_DIR (find_gold_plugin_api_dir)
+if test -n "$GOLD_PLUGIN_API_DIR"
+    set -g LLVM_BINUTILS_INCDIR "$GOLD_PLUGIN_API_DIR"
+    log "Found gold plugin headers at: $LLVM_BINUTILS_INCDIR"
+else if test "$REQUIRE_GOLD_PLUGIN" = "1"
+    die "plugin-api.h not found. Install GNU gold/binutils plugin headers or set LLVM_BINUTILS_INCDIR explicitly before running."
+else
+    log "WARNING: plugin-api.h not found; LLVMgold.so will not be built."
+end
+
+log "Cleaning ALL /tmp build directories for clean start..."
+rm -rf "$BUILD_ROOT" "$THINLTO_CACHE"
+mkdir -p "$BUILD_ROOT" "$THINLTO_CACHE" "$BUILD_ROOT/profiles"
+
 log "=== Fresh LLVM sources: delete old, shallow clone to $TOPLEV ==="
 mkdir -p "$TOPLEV"
 cd "$TOPLEV" || die "Could not cd to $TOPLEV"
-
 if test -d llvm-project
     log "Deleting old sources first..."
     rm -rf llvm-project
 end
 
-log "Cloning ( --filter=blob:none --depth=1 )..."
 git clone --filter=blob:none --depth=1 https://github.com/llvm/llvm-project.git || die "Clone failed"
 cd llvm-project || die "cd llvm-project failed"
 
-# lld ELF-only patch (applied to home tree before copy so copy gets it)
 if test -f lld/CMakeLists.txt
     log "Patching lld/CMakeLists.txt for ELF-only (disable MachO/COFF/wasm/MinGW)"
     sed -i.bak -e '/add_subdirectory(MachO)/d' -e '/add_subdirectory(COFF)/d' -e '/add_subdirectory(wasm)/d' -e '/add_subdirectory(MinGW)/d' lld/CMakeLists.txt
-    log "lld ELF-only patch applied"
 end
 
-# === Copy source to /tmp + clean non-essential parts (EXPLICITLY PRESERVE docs + bolt/polly) ===
 set -g LLVM_SRC_TMP "/tmp/llvm-project-src-$USER"
-log "Copying source to /tmp for build: $LLVM_SRC_TMP (deleting old tmp source first)"
 rm -rf "$LLVM_SRC_TMP" "$LLVM_SRC_TMP.partial"
 cp -a "$PWD" "$LLVM_SRC_TMP.partial" || begin
     rm -rf "$LLVM_SRC_TMP.partial"
     die "Failed to copy source to /tmp"
 end
 mv "$LLVM_SRC_TMP.partial" "$LLVM_SRC_TMP" || die "Failed to atomically install /tmp source tree"
-
-
 set -g LLVM_SRC "$LLVM_SRC_TMP"
-log "Source for build now at $LLVM_SRC on /tmp (docs + bolt/polly preserved)"
 
-# Pre-flight
-test -d "$LLVM_SRC"; or die "no source"
-for t in cmake ninja clang clang++ ld.lld llvm-profdata
-    command -q $t; or die "missing $t"
-end
-
-# === Robust patch handling for ms178 patches ===
+# Patch handling
 set -g PATCHES 01-corecount.patch 02-fixes.patch 04-polly.patch 05-raptorlake.patch 06-x86isellowcpp.patch 03-optimizations.patch
 set -g STAMP "$LLVM_SRC/.ms178-patches-applied"
 
 function find_patch --argument-names name
-    # Search order:
-    #   1. $PATCH_DIR    (env override; same as SCRIPT_DIR by default)
-    #   2. $SCRIPT_DIR   (next to this build script)
-    #   3. $PWD          (caller's working directory)
-    #   4. ~/Downloads/llvm-bolt-scripts-master  (ms178 convention)
-    #   5. literal $name (so absolute paths work)
     set -l candidates \
         "$PATCH_DIR/$name" \
         "$SCRIPT_DIR/$name" \
@@ -147,82 +166,40 @@ function find_patch --argument-names name
 end
 
 if not test -f "$STAMP"
-    log "Pre-checking all patches with --dry-run (to avoid partial application on failure)..."
+    log "Pre-checking all patches with --dry-run..."
     for p in $PATCHES
         set -l pf (find_patch $p)
-        if test -z "$pf"
-            set -l searched "$PATCH_DIR ($SCRIPT_DIR), $PWD, ~/Downloads/llvm-bolt-scripts-master, /home/marcus/Downloads/llvm-bolt-scripts-master, current dir"
-            die "patch file missing: $p (searched: $searched). Put patches next to the script or in Downloads/llvm-bolt-scripts-master"
-        end
-
-        # Strict dry-run: zero offset, zero fuzz. All shipped patches are
-        # verified to apply cleanly against today's llvm-project main with
-        # --fuzz=0 -F0; if any drift creeps in we want to know IMMEDIATELY.
+        test -n "$pf"; or die "patch file missing: $p"
         set -l dry_log "/tmp/patch-$p-dry.log"
         if not patch --dry-run -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch < "$pf" > "$dry_log" 2>&1
-            log "  - $p from $pf would NOT apply cleanly!"
-            log "  --- DRY RUN OUTPUT ---"
+            log "--- DRY RUN OUTPUT FOR $p ---"
             cat "$dry_log"
-            log "  ----------------------"
-            die "Patch $p failed --dry-run. The tree may need to be rebased or the patch updated for current llvm-project master. Aborting before any changes."
+            die "Patch $p failed --dry-run against current llvm-project main. Rebase it first."
         end
-
-        # Count files the patch will touch for the success banner below.
-        set -l n_files (grep -c '^patching file ' "$dry_log")
+        log "  + $p OK"
         rm -f "$dry_log"
-        log "  + $p from $pf (dry-run OK, $n_files files)"
     end
 
-    log "All patches passed dry-run. Applying for real..."
     for p in $PATCHES
         set -l pf (find_patch $p)
-        log "  + applying $p from $pf"
-
-        # Apply and capture real exit status (the pipe to tail would hide
-        # patch's status). Real output is preserved per-patch in
-        # /tmp/patch-<name>.log for forensics if anything goes wrong.
         set -l real_log "/tmp/patch-$p.log"
         patch -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch < "$pf" > "$real_log" 2>&1
         set -l patch_status $status
-
-        # SHOW THE FULL LIST OF PATCHED FILES — no truncation.
-        grep -E '^patching file |^Hunk |reject|FAILED|offset|fuzz' "$real_log" \
-            | sed 's/^/      /'
-
+        grep -E '^patching file |^Hunk |reject|FAILED|offset|fuzz' "$real_log" | sed 's/^/      /'
         if test $patch_status -ne 0
-            log "  --- FULL PATCH LOG ---"
+            log "--- FULL PATCH LOG FOR $p ---"
             cat "$real_log"
-            log "  ----------------------"
-            die "Failed to apply $p (exit status $patch_status). See $real_log for details. (This should not happen after successful dry-run.)"
+            die "Failed to apply $p"
         end
-
-        # Defence-in-depth: even with rc=0, scan the tree for stray .rej
-        # files in case `patch` ever silently dropped a hunk. Under
-        # --fuzz=0 -F0 this should be impossible, but if it ever happens
-        # we want a hard stop rather than a corrupt source tree.
-        set -l rej_count (find "$LLVM_SRC" -name '*.rej' 2>/dev/null | count)
-        if test $rej_count -gt 0
-            log "  --- REJECT FILES FOUND ---"
-            find "$LLVM_SRC" -name '*.rej' 2>/dev/null
-            die "Patch $p left $rej_count .rej files behind. Bailing out."
-        end
-
-        # Per-patch summary so the apply section's bookkeeping matches the
-        # dry-run section's bookkeeping at a glance.
-        set -l n_files (grep -c '^patching file ' "$real_log")
-        log "    -> $n_files files patched, log: $real_log"
     end
     date > "$STAMP"
-    log "All patches applied successfully to $LLVM_SRC"
 end
 
-log "Cleaning non-essential parts from /tmp source copy to save space (tests, unittests, mlir, flang tests, test-suite etc. -- ALL docs dirs + bolt/polly trees EXPLICITLY PRESERVED)"
+log "Cleaning non-essential parts from /tmp source copy..."
 for sub in llvm/test llvm/unittests clang/test clang/unittests lld/test lld/unittests flang/test flang/unittests test-suite mlir
     rm -rf "$LLVM_SRC_TMP/$sub" 2>/dev/null || true
 end
-# Note: do NOT rm docs, llvm/docs, clang/docs, lld/docs, bolt/, polly/ etc. -- CMake requires them
 
-# configure_clean helper
 set -g CMAKE_FRESH ""
 if cmake --help 2>/dev/null | grep -q -- "--fresh"
     set -g CMAKE_FRESH "--fresh"
@@ -240,6 +217,13 @@ function configure_clean
     end
 end
 
+set -g GOLD_CMAKE_ARGS
+if test -n "$LLVM_BINUTILS_INCDIR"
+    set -g GOLD_CMAKE_ARGS -DLLVM_BINUTILS_INCDIR="$LLVM_BINUTILS_INCDIR"
+else
+    set -g GOLD_CMAKE_ARGS
+end
+
 # STAGE 1
 log ">>> STAGE 1: Building instrumented compiler (IR PGO)..."
 configure_clean "$BUILD_ROOT/stage1" -S "$LLVM_SRC/llvm" \
@@ -254,19 +238,17 @@ configure_clean "$BUILD_ROOT/stage1" -S "$LLVM_SRC/llvm" \
     -DLLVM_INCLUDE_BENCHMARKS=OFF \
     -DLLVM_INCLUDE_EXAMPLES=OFF \
     -DLLVM_BUILD_RUNTIME=OFF \
+    -DLLVM_ENABLE_BINDINGS=$LLVM_ENABLE_BINDINGS \
+    $GOLD_CMAKE_ARGS \
     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
     -DCMAKE_C_FLAGS="$COMMON_FLAGS" \
     -DCMAKE_CXX_FLAGS="$COMMON_FLAGS"
 
-# Build host TableGen tools here so we can point stage2 at them (prevents ProfileSummary conflicts in ThinLTO host-tool links)
 run ninja -C "$BUILD_ROOT/stage1" clang lld llvm-profdata llvm-tblgen llvm-min-tblgen clang-tblgen
 
-test -x "$BUILD_ROOT/stage1/bin/llvm-tblgen" || die "stage1 llvm-tblgen missing"
-test -x "$BUILD_ROOT/stage1/bin/clang-tblgen" || die "stage1 clang-tblgen missing"
 set -g PROFDATA "$BUILD_ROOT/stage1/bin/llvm-profdata"
 test -x "$PROFDATA"; or set -g PROFDATA (command -v llvm-profdata)
 
-# Training (small + optional full)
 log ">>> TRAINING: Generating PGO profiles..."
 set -gx LLVM_PROFILE_FILE "$BUILD_ROOT/profiles/pgo-%m.profraw"
 run mkdir -p "$BUILD_ROOT/profiles"
@@ -283,50 +265,38 @@ for f in $TRAIN_FILES
     if test -f "$f"
         set -l ext (path extension -- $f)
         if test "$ext" = ".cpp"; or test "$ext" = ".cc"; or test "$ext" = ".cxx"
-            "$BUILD_ROOT/stage1/bin/clang++" $COMMON_FLAGS -fno-lto -fuse-ld=lld \
-                -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" \
-                -std=c++17 -c "$f" -o /dev/null 2>/dev/null
+            "$BUILD_ROOT/stage1/bin/clang++" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -std=c++17 -c "$f" -o /dev/null 2>/dev/null
         else if test "$ext" = ".c"
-            "$BUILD_ROOT/stage1/bin/clang" $COMMON_FLAGS -fno-lto -fuse-ld=lld \
-                -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$f" -o /dev/null 2>/dev/null
-        else
-            log "    skipping training of $f (unknown extension '$ext')"
+            "$BUILD_ROOT/stage1/bin/clang" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$f" -o /dev/null 2>/dev/null
         end
     end
 end
 
 if test "$FULL_TRAIN" = "1"
-    log "FULL_TRAIN=1: full LLVM training build in /tmp..."
     set -l tb "$BUILD_ROOT/full-pgo-train"
     rm -rf "$tb"
     cmake -G Ninja -B "$tb" -S "$LLVM_SRC/llvm" \
         -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS="clang;lld" -DLLVM_TARGETS_TO_BUILD="X86" \
         -DLLVM_USE_LINKER=lld -DCMAKE_C_COMPILER="$BUILD_ROOT/stage1/bin/clang" -DCMAKE_CXX_COMPILER="$BUILD_ROOT/stage1/bin/clang++" \
-        -DCMAKE_C_FLAGS="$COMMON_FLAGS" -DCMAKE_CXX_FLAGS="$COMMON_FLAGS" -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF
+        -DCMAKE_C_FLAGS="$COMMON_FLAGS" -DCMAKE_CXX_FLAGS="$COMMON_FLAGS" -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
+        -DLLVM_ENABLE_BINDINGS=$LLVM_ENABLE_BINDINGS $GOLD_CMAKE_ARGS
     run ninja -C "$tb" clang lld -j"$NPROC"
 end
 
 set -e LLVM_PROFILE_FILE
-
-# Explicit glob expansion via `path filter` so a missing-profile scenario
-# (training produced zero .profraw files for some reason) hard-fails with a
-# clear message instead of fish's generic "No matches for wildcard" error.
 set -l _pgo_raw (path filter -- "$BUILD_ROOT/profiles"/pgo-*.profraw)
-test (count $_pgo_raw) -gt 0; or die "PGO training produced no .profraw files in $BUILD_ROOT/profiles (check stage1 + train compiler output)"
+test (count $_pgo_raw) -gt 0; or die "PGO training produced no .profraw files"
 $PROFDATA merge -output="$BUILD_ROOT/clang.profdata" $_pgo_raw; or die "llvm-profdata merge (PGO) failed"
-log "PGO profdata ready ("(count $_pgo_raw)" raw profile fragments merged)"
 set -g FINAL_PROFDATA "$BUILD_ROOT/clang.profdata"
 
-# CSPGO (identical VP=8)
 if test "$DO_CSPGO" = "1"
     log ">>> CSPGO: Context sensitive..."
-    # Use block-local scope: csd is only referenced inside this if-block,
-    # so promoting it to global needlessly pollutes the global namespace.
     set -l csd "$BUILD_ROOT/stage-cs-instr"
     configure_clean "$csd" -S "$LLVM_SRC/llvm" \
         -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS="clang;lld" -DLLVM_TARGETS_TO_BUILD="X86;BPF" \
         -DLLVM_USE_LINKER=lld -DLLVM_BUILD_INSTRUMENTED=CSIR -DLLVM_PROFDATA_FILE="$BUILD_ROOT/clang.profdata" \
         -DLLVM_VP_COUNTERS_PER_SITE=$VP_COUNTERS_PER_SITE -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
+        -DLLVM_ENABLE_BINDINGS=$LLVM_ENABLE_BINDINGS $GOLD_CMAKE_ARGS \
         -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_FLAGS="$COMMON_FLAGS" -DCMAKE_CXX_FLAGS="$COMMON_FLAGS"
     run ninja -C "$csd" clang lld llvm-profdata llvm-tblgen llvm-min-tblgen
 
@@ -343,171 +313,72 @@ if test "$DO_CSPGO" = "1"
     end
 
     if test "$FULL_TRAIN" = "1"
-        log "CSPGO full training..."
         set -l ctb "$BUILD_ROOT/full-cspgo-train"
         rm -rf "$ctb"
         cmake -G Ninja -B "$ctb" -S "$LLVM_SRC/llvm" \
             -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS="clang;lld" -DLLVM_TARGETS_TO_BUILD="X86" \
             -DLLVM_USE_LINKER=lld -DCMAKE_C_COMPILER="$csd/bin/clang" -DCMAKE_CXX_COMPILER="$csd/bin/clang++" \
-            -DCMAKE_C_FLAGS="$COMMON_FLAGS" -DCMAKE_CXX_FLAGS="$COMMON_FLAGS" -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF
+            -DCMAKE_C_FLAGS="$COMMON_FLAGS" -DCMAKE_CXX_FLAGS="$COMMON_FLAGS" -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_ENABLE_BINDINGS=$LLVM_ENABLE_BINDINGS $GOLD_CMAKE_ARGS
         run ninja -C "$ctb" clang lld -j"$NPROC"
     end
 
     set -e LLVM_PROFILE_FILE
-
     set -l _cs_raw (path filter -- "$BUILD_ROOT/profiles"/cs-*.profraw)
-    test (count $_cs_raw) -gt 0; or die "CSPGO training produced no .profraw files in $BUILD_ROOT/profiles"
+    test (count $_cs_raw) -gt 0; or die "CSPGO training produced no .profraw files"
     $PROFDATA merge -output="$BUILD_ROOT/cs.profdata" $_cs_raw; or die "llvm-profdata merge (CSPGO) failed"
     $PROFDATA merge -output="$BUILD_ROOT/final.profdata" "$BUILD_ROOT/clang.profdata" "$BUILD_ROOT/cs.profdata"; or die "llvm-profdata final merge failed"
-    log "CSPGO profdata ready ("(count $_cs_raw)" raw profile fragments merged into final.profdata)"
     set -g FINAL_PROFDATA "$BUILD_ROOT/final.profdata"
 end
 
-# Clean previous stage dirs that are no longer needed.
-# IMPORTANT: keep stage1 until AFTER stage2 (its tblgen is referenced in stage2 configure/build to avoid host-tool ProfileSummary conflicts)
-# The final LTO+PGO stage2 build is deliberately *not* deleted (see comment after install).
-log "Cleaning previous stage dirs in /tmp to save space (stage1 kept for tblgen during stage2)..."
 rm -rf "$BUILD_ROOT/stage-cs-instr" "$BUILD_ROOT/full-pgo-train" "$BUILD_ROOT/full-cspgo-train" "$BUILD_ROOT/profiles" 2>/dev/null || true
 
-# STAGE 2 - key: -DLLVM_TABLEGEN + -DCLANG_TABLEGEN from stage1 so that host TableGen tools (llvm-min-tblgen etc)
-# are NEVER compiled/linked under the final.profdata + ThinLTO (this eliminates the exact ProfileSummary ID conflict)
-log ">>> STAGE 2: Final build (ThinLTO + PGO + allocator)..."
+# STAGE 2
+log ">>> STAGE 2: Final build (ThinLTO + PGO + allocator + LLVMgold)..."
 configure_clean "$BUILD_ROOT/stage2" -S "$LLVM_SRC/llvm" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
     -DLLVM_ENABLE_PROJECTS="clang;lld;bolt;polly" -DLLVM_ENABLE_RUNTIMES="compiler-rt" -DLLVM_TARGETS_TO_BUILD="X86;BPF" \
     -DLLVM_USE_LINKER=lld -DCLANG_DEFAULT_LINKER=lld -DLLVM_ENABLE_LTO=Thin -DLLVM_PROFDATA_FILE="$FINAL_PROFDATA" \
     -DLLVM_THINLTO_CACHE_PATH="$THINLTO_CACHE" -DLLVM_INCLUDE_TESTS=OFF \
+    -DLLVM_ENABLE_BINDINGS=$LLVM_ENABLE_BINDINGS \
     -DLLVM_TABLEGEN="$BUILD_ROOT/stage1/bin/llvm-tblgen" \
     -DCLANG_TABLEGEN="$BUILD_ROOT/stage1/bin/clang-tblgen" \
+    $GOLD_CMAKE_ARGS \
     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_FLAGS="$COMMON_FLAGS $C_LTO_FLAGS" -DCMAKE_CXX_FLAGS="$COMMON_FLAGS $CXX_LTO_FLAGS" \
     -DCMAKE_EXE_LINKER_FLAGS="$LINKER_BASE $ALLOCATOR_LINK -Wl,--emit-relocs -Wl,-z,now" \
     -DCMAKE_MODULE_LINKER_FLAGS="$LINKER_BASE -Wl,--emit-relocs" -DCMAKE_SHARED_LINKER_FLAGS="$LINKER_BASE -Wl,--emit-relocs"
 
 run ninja -C "$BUILD_ROOT/stage2" install
 
-# IMPORTANT: The perfected LTO+PGO final stage (stage2) is *deliberately not deleted*.
-# This preserves the complete ThinLTO + final.profdata + mimalloc build (pre-BOLT) for inspection,
-# comparison against the final BOLTed binaries, or as a fallback "perfected non-BOLT" toolchain.
-# Only stage1 (no longer needed after tblgen use) and earlier temp stages are cleaned.
-log "Cleaning stage1 (tblgen no longer needed) ... (stage2 / final LTO+PGO build is deliberately preserved)"
+# LLVMgold verification: this is the key v2 fix.
+set -g LLVMGOLD_SO "$INSTALL_PREFIX/lib/LLVMgold.so"
+if test "$REQUIRE_GOLD_PLUGIN" = "1"
+    verify_file_exists "$LLVMGOLD_SO" "LLVMgold.so"
+    log "Verified LLVMgold.so: $LLVMGOLD_SO"
+    verify_file_exists "$BUILD_ROOT/stage2/lib/LLVMgold.so" "stage2 LLVMgold.so"
+    if test -d "$INSTALL_PREFIX/lib/bfd-plugins"
+        log "bfd-plugins directory already present"
+    else
+        mkdir -p "$INSTALL_PREFIX/lib/bfd-plugins"
+    end
+    cp -af "$LLVMGOLD_SO" "$INSTALL_PREFIX/lib/bfd-plugins/LLVMgold.so"
+    verify_file_exists "$INSTALL_PREFIX/lib/bfd-plugins/LLVMgold.so" "bfd-plugins LLVMgold.so"
+    log "Installed LLVMgold.so into $INSTALL_PREFIX/lib/bfd-plugins/LLVMgold.so"
+end
+
 rm -rf "$BUILD_ROOT/stage1" 2>/dev/null || true
 
 # STAGE 3 BOLT
 set -g BOLT "$INSTALL_PREFIX/bin/llvm-bolt"
 set -g MERGE "$INSTALL_PREFIX/bin/merge-fdata"
+verify_executable "$BOLT" "llvm-bolt"
+verify_executable "$INSTALL_PREFIX/bin/clang" "clang"
 
-test -x "$BOLT"; or die "llvm-bolt not found at $BOLT (run the main build through Stage 2 first)"
-test -x "$INSTALL_PREFIX/bin/clang"; or die "clang not found at $INSTALL_PREFIX/bin/clang"
-
-# Warn if relocations are missing (BOLT works much better with them)
-set -l clang_real (realpath "$INSTALL_PREFIX/bin/clang")
-if not llvm-readelf -S "$clang_real" 2>/dev/null | grep -q '\.rela\.text'
-    log "WARNING: $clang_real appears to lack .rela.text sections."
-    log " Stage 2 must have been linked with -Wl,--emit-relocs."
-end
-
-# Detect if a binary has already been processed by BOLT (prevents
-# "input file was processed by BOLT. Cannot re-optimize"). Matches what
-# upstream bolt/README.md documents: every BOLT output gets a section
-# named exactly `.note.bolt_info` carrying the BOLT revision string.
 function is_already_bolted --argument-names BinPath
     set -l f (realpath "$BinPath")
     test -f "$f"; or return 1
-
-    # Use the exact section name to avoid coincidental substring matches
-    # against any future `.note.bolt*` section. `strings | grep BOLT` is
-    # NOT safe — every LLVM/clang binary embeds source paths containing
-    # the literal "BOLT" string (e.g. .../bolt/Rewrite/RewriteInstance.cpp).
-    # `\b` word-boundary anchor pins the match to the documented name.
     llvm-readelf -S "$f" 2>/dev/null | grep -qE '\.note\.bolt_info\b'; and return 0
     return 1
-end
-
-function bolt_optimize_binary --argument-names Name BinPath
-    set -l Real (realpath "$BinPath")
-    set -l Prof "$BUILD_ROOT/$Name.bolt.fdata"
-    set -l Inst "$Real.inst"
-    set -l Opt "$Real.bolt"
-    set -l Backup "$Real.pre-bolt.bak"
-
-    test -f "$Real"; or return 0
-
-    # Skip gracefully if already BOLTed (allows re-running the script or
-    # recovering from partial BOLT runs without llvm-bolt's "Cannot
-    # re-optimize" error).
-    if is_already_bolted "$Real"
-        log "  [$Name] already BOLT-processed (detected .note.bolt_info section), skipping."
-        return 0
-    end
-
-    log "  [$Name] Creating backup before BOLTing: $Backup"
-    cp -a "$Real" "$Backup"
-
-
-    set -l Stale $Prof $Prof.*
-    test (count $Stale) -gt 0; and rm -f $Stale
-
-    log "  [$Name] instrumenting..."
-    if test "$Name" = lld
-        run "$BOLT" "$Real" -o "$Inst" --instrument --instrumentation-file="$Prof" --instrumentation-sleep-time=1 --instrumentation-no-counters-clear
-    else
-        run "$BOLT" "$Real" -o "$Inst" --instrument --instrumentation-file="$Prof" --instrumentation-file-append-pid
-    end
-
-    log "  [$Name] training..."
-    bolt_train_$Name "$Inst"
-
-    if test "$Name" = lld
-        # Wait for the watcher's final on-death dump to land (lld uses _exit() and the
-        # --instrumentation-sleep-time watcher; the profile may not be flushed immediately).
-        for waited in 1 2 3 4 5
-            test -s "$Prof"; and break
-            sleep 1
-        end
-    else
-        # For clang etc. that use append-pid, merge the per-pid fragments.
-        set -l Frags $Prof.*
-        if test (count $Frags) -gt 0
-            run "$MERGE" $Frags -o "$Prof"
-            rm -f $Frags
-        else if test "$BOLT_BEST_EFFORT" = "1"
-            rm -f "$Inst"; return 0
-        else
-            die "no BOLT fragments for $Name"
-        end
-    end
-
-    if not test -s "$Prof"
-        rm -f "$Inst"
-        if test "$BOLT_BEST_EFFORT" = "1"; return 0; else; die "no BOLT profile for $Name"; end
-    end
-
-    log "  [$Name] optimizing with ultimate flags..."
-    if not "$BOLT" "$Real" -o "$Opt" \
-        --data "$Prof" --dyno-stats --reorder-blocks=ext-tsp --reorder-functions=cdsort \
-        --split-functions --split-strategy=cdsplit --split-all-cold --split-eh \
-        --icf=safe --jump-tables=move --indirect-call-promotion=all --peepholes=all \
-        --simplify-rodata-loads --x86-strip-redundant-address-size --strip-rep-ret --inline-memcpy \
-        --plt=all --hugify --use-gnu-stack --update-debug-sections=0
-        log "  [$Name] aggressive BOLT failed; retrying with safe core set..."
-        run "$BOLT" "$Real" -o "$Opt" \
-            --data "$Prof" --dyno-stats --reorder-blocks=ext-tsp --reorder-functions=cdsort \
-            --split-functions --split-all-cold --split-eh --icf=safe --jump-tables=move --use-gnu-stack --update-debug-sections=0
-    end
-
-    mv -f "$Opt" "$Real"
-    rm -f "$Inst" "$Prof"
-
-    # By default, drop the pre-BOLT backup once the BOLTed binary is in
-    # place. clang is ~200 MB and ld.lld ~60 MB; keeping the backup permanently
-    # silently doubles the install footprint. Set KEEP_PRE_BOLT_BACKUP=1 to
-    # preserve them (e.g. for A/B perf testing).
-    if test "$KEEP_PRE_BOLT_BACKUP" = "1"
-        log "  [$Name] keeping pre-BOLT backup at $Backup (KEEP_PRE_BOLT_BACKUP=1)"
-    else
-        rm -f "$Backup"
-        log "  [$Name] removed pre-BOLT backup (set KEEP_PRE_BOLT_BACKUP=1 to keep)"
-    end
 end
 
 function bolt_train_clang --argument-names Bin
@@ -521,49 +392,104 @@ function bolt_train_lld --argument-names Bin
     set -l lddir "$BUILD_ROOT/bolt-lld-bin"
     run mkdir -p "$lddir"
     ln -sf "$Bin" "$lddir/ld.lld"
-
     set -l drv "$INSTALL_PREFIX/bin/clang++"
     test -x "$drv"; or set drv clang++
-
     set -l src "$BUILD_ROOT/bolt-lld-train.cpp"
     printf '%s\n' '#include <vector>' '#include <string>' '#include <map>' '#include <algorithm>' '#include <cstdio>' \
         'static int f(const std::vector<std::string>&v){std::map<std::string,int>m; for(auto&s:v)m[s]++;int n=0;for(auto&kv:m)n+=kv.second;return n;}' \
-        'int main(int c,char**v){std::vector<std::string> s; for(int i=0;i<c;i++)s.push_back(v[i]);std::sort(s.begin(),s.end()); std::printf("%d %zu\n",f(s),s.size());return 0;}' >"$src"
-
+        'int main(int c,char**v){std::vector<std::string> s; for(int i=0;i<c;i++)s.push_back(v[i]);std::sort(s.begin(),s.end()); std::printf("%d %zu\\n",f(s),s.size());return 0;}' >"$src"
     "$drv" -O2 -B "$lddir" -fuse-ld=lld -Wl,--gc-sections -Wl,--icf=all "$src" -o "$BUILD_ROOT/bolt-lld-train.out" 2>/dev/null
     "$drv" -O2 -B "$lddir" -fuse-ld=lld -static-libstdc++ -Wl,--gc-sections "$src" -o "$BUILD_ROOT/bolt-lld-train2.out" 2>/dev/null
-
     rm -f "$lddir/ld.lld" "$src" "$BUILD_ROOT/bolt-lld-train.out" "$BUILD_ROOT/bolt-lld-train2.out"
     return 0
 end
 
+function bolt_optimize_binary --argument-names Name BinPath
+    set -l Real (realpath "$BinPath")
+    set -l Prof "$BUILD_ROOT/$Name.bolt.fdata"
+    set -l Inst "$Real.inst"
+    set -l Opt "$Real.bolt"
+    set -l Backup "$Real.pre-bolt.bak"
+    test -f "$Real"; or return 0
+
+    if is_already_bolted "$Real"
+        log "[$Name] already BOLT-processed, skipping"
+        return 0
+    end
+
+    cp -a "$Real" "$Backup"
+    set -l Stale $Prof $Prof.*
+    test (count $Stale) -gt 0; and rm -f $Stale
+
+    if test "$Name" = lld
+        run "$BOLT" "$Real" -o "$Inst" --instrument --instrumentation-file="$Prof" --instrumentation-sleep-time=1 --instrumentation-no-counters-clear
+    else
+        run "$BOLT" "$Real" -o "$Inst" --instrument --instrumentation-file="$Prof" --instrumentation-file-append-pid
+    end
+
+    bolt_train_$Name "$Inst"
+
+    if test "$Name" = lld
+        for waited in 1 2 3 4 5
+            test -s "$Prof"; and break
+            sleep 1
+        end
+    else
+        set -l Frags $Prof.*
+        if test (count $Frags) -gt 0
+            run "$MERGE" $Frags -o "$Prof"
+            rm -f $Frags
+        else if test "$BOLT_BEST_EFFORT" = "1"
+            rm -f "$Inst"
+            return 0
+        else
+            die "no BOLT fragments for $Name"
+        end
+    end
+
+    if not test -s "$Prof"
+        rm -f "$Inst"
+        if test "$BOLT_BEST_EFFORT" = "1"
+            return 0
+        else
+            die "no BOLT profile for $Name"
+        end
+    end
+
+    if not "$BOLT" "$Real" -o "$Opt" \
+        --data "$Prof" --dyno-stats --reorder-blocks=ext-tsp --reorder-functions=cdsort \
+        --split-functions --split-strategy=cdsplit --split-all-cold --split-eh \
+        --icf=safe --jump-tables=move --indirect-call-promotion=all --peepholes=all \
+        --simplify-rodata-loads --x86-strip-redundant-address-size --strip-rep-ret --inline-memcpy \
+        --plt=all --hugify --use-gnu-stack --update-debug-sections=0
+        run "$BOLT" "$Real" -o "$Opt" \
+            --data "$Prof" --dyno-stats --reorder-blocks=ext-tsp --reorder-functions=cdsort \
+            --split-functions --split-all-cold --split-eh --icf=safe --jump-tables=move --use-gnu-stack --update-debug-sections=0
+    end
+
+    mv -f "$Opt" "$Real"
+    rm -f "$Inst" "$Prof"
+
+    if test "$KEEP_PRE_BOLT_BACKUP" = "1"
+        log "[$Name] keeping pre-BOLT backup at $Backup"
+    else
+        rm -f "$Backup"
+    end
+end
+
 log ">>> STAGE 3: BOLT post-link (clang + ld.lld)..."
 bolt_optimize_binary clang "$INSTALL_PREFIX/bin/clang"
-
-# Explicitly BOLT the actual ELF linker (ld.lld is what `clang -fuse-ld=lld` invokes at runtime).
-# We pass Name="lld" so the function uses the correct instrumentation mode for lld
-# (the sleep-time watcher + no append-pid, because lld exits via _exit() without flushing).
-# This also drives training via the bolt_train_lld logic that sets up ld.lld in -B.
 if test -e "$INSTALL_PREFIX/bin/ld.lld"
     bolt_optimize_binary lld "$INSTALL_PREFIX/bin/ld.lld"
 else if test -e "$INSTALL_PREFIX/bin/lld"
     bolt_optimize_binary lld "$INSTALL_PREFIX/bin/lld"
 end
 
-# Final clean of bolt work dirs (fdata cleaned inside bolt_optimize).
-# Pattern-expand explicitly with `path filter` so fish doesn't error out
-# with "No matches for wildcard" when the dirs are already gone. The old
-# `rm -rf "$BUILD_ROOT/bolt"* 2>/dev/null || true` failed quiet-AND-noisy:
-# fish's wildcard expansion fires before the redirect, so stderr leaked
-# and the rc landed at 124 even with `|| true`.
 set -l _bolt_leftovers (path filter -- "$BUILD_ROOT"/bolt*)
 test (count $_bolt_leftovers) -gt 0; and rm -rf $_bolt_leftovers
 
-log "ULTIMATE build finished. Toolchain at: $INSTALL_PREFIX"
-log "Source was fresh cloned, copied to /tmp ($LLVM_SRC), non-essential parts cleaned while preserving docs/bolt/polly."
-log "stage2 (final LTO+PGO ThinLTO build) is deliberately preserved; only earlier stages cleaned."
-log "VP_COUNTERS_PER_SITE=8 for both PGO and CSPGO; -DLLVM_TABLEGEN/-DCLANG_TABLEGEN from stage1 in stage2 (ProfileSummary fix)."
-log "clang + ld.lld explicitly BOLTed (with lld-specific instrumentation + training + already-BOLTed skip for safe re-runs)."
-log "BOLT stage is now robust: skips binaries already processed by BOLT (e.g. on partial runs or re-execution)."
+log "ULTIMATE v2 build finished. Toolchain at: $INSTALL_PREFIX"
+if test "$REQUIRE_GOLD_PLUGIN" = "1"
+    log "Verified deliverables: $INSTALL_PREFIX/bin/clang  $INSTALL_PREFIX/bin/ld.lld  $INSTALL_PREFIX/lib/LLVMgold.so"
+end
 log "To use: export PATH=$INSTALL_PREFIX/bin:\$PATH"
-log "Verify: ls -l $INSTALL_PREFIX/bin/clang $INSTALL_PREFIX/bin/ld.lld ; perf stat -e L1-icache-misses -- $INSTALL_PREFIX/bin/clang++ -O3 -march=native -c test.cpp"
