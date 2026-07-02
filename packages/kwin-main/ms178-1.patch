@@ -5443,7 +5443,7 @@ index ba947a1..eefb365 100644
      return m_commitThread->safetyMargin();
  }
 diff --git a/src/backends/drm/drm_pipeline.h b/src/backends/drm/drm_pipeline.h
-index 8666edc..3903b0b 100644
+index 8666edc..c3b9224 100644
 --- a/src/backends/drm/drm_pipeline.h
 +++ b/src/backends/drm/drm_pipeline.h
 @@ -6,16 +6,8 @@
@@ -5590,7 +5590,7 @@ index 8666edc..3903b0b 100644
      Error presentLegacy(const QList<OutputLayer *> &layersToUpdate, const std::shared_ptr<OutputFrame> &frame);
      Error legacyModeset();
      Error setLegacyGamma();
-@@ -131,14 +135,16 @@ private:
+@@ -131,44 +135,49 @@ private:
      bool setCursorLegacy(DrmPipelineLayer *layer);
      static Error commitPipelinesLegacy(const QList<DrmPipeline *> &pipelines, CommitMode mode, const QList<DrmObject *> &unusedObjects);
  
@@ -5612,7 +5612,11 @@ index 8666edc..3903b0b 100644
      DrmOutput *m_output = nullptr;
      DrmConnector *m_connector = nullptr;
  
-@@ -148,27 +154,28 @@ private:
+     bool m_modesetPresentPending = false;
++    bool m_legacyCursorVisible = false;
++    uint32_t m_legacyCursorFramebufferId = 0;
+     ColorPipeline m_currentLegacyGamma;
+ 
      struct State
      {
          DrmCrtc *crtc = nullptr;
@@ -5653,6 +5657,58 @@ index 8666edc..3903b0b 100644
      State m_next;
  
      std::unique_ptr<DrmCommitThread> m_commitThread;
+diff --git a/src/backends/drm/drm_pipeline_legacy.cpp b/src/backends/drm/drm_pipeline_legacy.cpp
+index 3be67ea..27eaa6c 100644
+--- a/src/backends/drm/drm_pipeline_legacy.cpp
++++ b/src/backends/drm/drm_pipeline_legacy.cpp
+@@ -228,10 +228,35 @@ DrmPipeline::Error DrmPipeline::setLegacyGamma()
+ 
+ bool DrmPipeline::setCursorLegacy(DrmPipelineLayer *layer)
+ {
++    if (!layer || !m_pending.crtc) [[unlikely]] {
++        return false;
++    }
++
+     const auto bo = layer->currentBuffer();
++    const bool visible = bo && bo->buffer() && layer->isEnabled();
++    const uint32_t framebufferId = visible ? bo->framebufferId() : 0;
++    const bool bufferChanged = visible
++        ? m_legacyCursorFramebufferId != framebufferId
++        : m_legacyCursorVisible;
++
++    if (!bufferChanged) {
++        struct drm_mode_cursor2 moveArg = {
++            .flags = DRM_MODE_CURSOR_MOVE,
++            .crtc_id = m_pending.crtc->id(),
++            .x = int32_t(layer->targetRect().x()),
++            .y = int32_t(layer->targetRect().y()),
++            .hot_x = int32_t(layer->hotspot().x()),
++            .hot_y = int32_t(layer->hotspot().y()),
++        };
++        return drmIoctl(gpu()->fd(), DRM_IOCTL_MODE_CURSOR2, &moveArg) == 0;
++    }
++
+     uint32_t handle = 0;
+-    if (bo && bo->buffer() && layer->isEnabled()) {
++    if (visible) {
+         const DmaBufAttributes *attributes = bo->buffer()->dmabufAttributes();
++        if (!attributes || !attributes->fd[0].isValid()) [[unlikely]] {
++            return false;
++        }
+         if (drmPrimeFDToHandle(gpu()->fd(), attributes->fd[0].get(), &handle) != 0) {
+             qCWarning(KWIN_DRM) << "drmPrimeFDToHandle() failed";
+             return false;
+@@ -254,6 +279,10 @@ bool DrmPipeline::setCursorLegacy(DrmPipelineLayer *layer)
+     if (handle != 0) {
+         drmCloseBufferHandle(gpu()->fd(), handle);
+     }
++    if (ret == 0) {
++        m_legacyCursorVisible = visible;
++        m_legacyCursorFramebufferId = framebufferId;
++    }
+     return ret == 0;
+ }
+ 
 diff --git a/src/backends/drm/drm_plane.cpp b/src/backends/drm/drm_plane.cpp
 index ca2104a..49f285c 100644
 --- a/src/backends/drm/drm_plane.cpp
@@ -6295,6 +6351,34 @@ index a8f8de8..173b041 100644
              // not a render node, should be ignored
              continue;
          }
+diff --git a/src/core/outputlayer.cpp b/src/core/outputlayer.cpp
+index 66247e0..80cb455 100644
+--- a/src/core/outputlayer.cpp
++++ b/src/core/outputlayer.cpp
+@@ -79,10 +79,21 @@ void OutputLayer::scheduleRepaint(Item *item)
+         return;
+     }
+     m_repaintScheduled = true;
+-    if (m_renderLoop) {
++
++    // Give async layer users (most importantly the hardware cursor path) the
++    // first chance to consume this repaint. With the old order, every 1000+ Hz
++    // pointer sample called RenderLoop::scheduleRepaint() before the cursor
++    // repaintScheduled handler could move the hardware cursor and reset the
++    // layer. In fixed-VSync games that injects avoidable main-thread scheduling
++    // work into the render deadline path and is exactly why mouse movement still
++    // hurts CPU frame time even after cursor commits were removed from the DRM
++    // queue. If the async handler succeeds it calls resetRepaints(), so no full
++    // compositing repaint is scheduled. If it doesn't, needsRepaint() remains
++    // true and the normal render-loop fallback is preserved.
++    Q_EMIT repaintScheduled();
++    if (m_renderLoop && needsRepaint()) {
+         m_renderLoop->scheduleRepaint(item, this);
+     }
+-    Q_EMIT repaintScheduled();
+ }
+ 
+ void OutputLayer::addDeviceRepaint(const Region &region)
 diff --git a/src/core/renderjournal.cpp b/src/core/renderjournal.cpp
 index 39b075f..4c382a2 100644
 --- a/src/core/renderjournal.cpp
@@ -6485,10 +6569,10 @@ index 764516a..c0930bc 100644
  
  } // namespace KWin
 diff --git a/src/core/renderloop.cpp b/src/core/renderloop.cpp
-index 2efaa95..4d36b49 100644
+index 2efaa95..c1c84ba 100644
 --- a/src/core/renderloop.cpp
 +++ b/src/core/renderloop.cpp
-@@ -9,318 +9,1445 @@
+@@ -9,318 +9,1444 @@
  #include "options.h"
  #include "renderloop_p.h"
  #include "scene/surfaceitem.h"
@@ -7970,15 +8054,14 @@ index 2efaa95..4d36b49 100644
 +void RenderLoopPrivate::dispatch()
  {
 -    return d->nextPresentationTimestamp;
-+    // Only deliver queued cross-thread work that was already posted before this
-+    // composite wakeup. Running a nested QEventLoop::AllEvents pass here drains
-+    // socket notifiers and timers too, so high-rate pointer motion can turn the
-+    // VSync path into an unbounded input-processing loop immediately before the
-+    // render deadline. That is exactly the CPU-side fps dip seen in games when
-+    // VSync is enabled. Posted MetaCall delivery keeps the useful libinput
-+    // eventsRead handoff latency benefit without re-entering the whole event
-+    // dispatcher or recursively consuming future input.
-+    QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
++    // Do not drain posted MetaCall events here. Libinput hands pointer bursts to
++    // the main thread through a queued signal, which is also a MetaCall; pulling
++    // that queue immediately before frameRequested() moves high-rate mouse
++    // processing into the fixed-VSync render deadline. With 1000+ Hz mice this
++    // is enough CPU-side work to miss vblank even though the actual scene frame
++    // would have fit. Let the normal Qt event loop process input before/after
++    // compositing instead of explicitly prioritising it at the worst possible
++    // point in the frame.
 +    Q_EMIT q->frameRequested(q);
  }
  
