@@ -4820,10 +4820,187 @@ index 414ded1c0d1bcba0d1af0aa5557fd4599135c7fa..dd4de20d4b21133a43bdbb28b2d16670
           if (a->operands[i].isConstant()) {
              if (!b->operands[i].isConstant())
 diff --git a/src/amd/compiler/aco_optimizer.cpp b/src/amd/compiler/aco_optimizer.cpp
-index ac2c2f9a4f293fa527da7df30bd7da57b48fe09b..3b505f37f420038e73d4b8f9249ef20b38c9c65c 100644
+index ac2c2f9a4f293fa527da7df30bd7da57b48fe09b..e91f7ac8a3065cd7739bb4e0d68c4f7de7efceca 100644
 --- a/src/amd/compiler/aco_optimizer.cpp
 +++ b/src/amd/compiler/aco_optimizer.cpp
-@@ -4204,6 +4204,180 @@ check_constant(opt_ctx& ctx, alu_opt_info& info, unsigned idx, uint32_t expected
+@@ -383,6 +383,53 @@ struct alu_opt_info {
+    }
+ };
+ 
++Operand
++get_constant_op(opt_ctx& ctx, ssa_info info, uint32_t bits)
++{
++   if (bits == 64)
++      return Operand::c32_or_c64(info.val, true);
++   return Operand::get_const(ctx.program->gfx_level, info.val, bits / 8u);
++}
++
++unsigned
++original_temp_id(opt_ctx& ctx, Temp tmp)
++{
++   if (ctx.info[tmp.id()].is_temp())
++      return ctx.info[tmp.id()].temp.id();
++   else
++      return tmp.id();
++}
++
++bool
++is_operand_constant(opt_ctx& ctx, Operand op, unsigned bit_size, uint64_t* value)
++{
++   if (op.isConstant()) {
++      *value = op.constantValue64();
++      return true;
++   } else if (op.isTemp()) {
++      unsigned id = original_temp_id(ctx, op.getTemp());
++      if (!ctx.info[id].is_constant())
++         return false;
++      *value = get_constant_op(ctx, ctx.info[id], bit_size).constantValue64();
++      return true;
++   }
++   return false;
++}
++
++bool
++op_info_get_constant(opt_ctx& ctx, alu_opt_op op_info, aco_type type, uint64_t* res)
++{
++   if (op_info.op.isTemp()) {
++      unsigned id = original_temp_id(ctx, op_info.op.getTemp());
++      if (ctx.info[id].is_constant())
++         op_info.op = get_constant_op(ctx, ctx.info[id], type.bytes() * 8);
++   }
++   if (!op_info.op.isConstant())
++      return false;
++   *res = op_info.constant_after_mods(ctx, type);
++   return true;
++}
++
+ bool
+ at_most_6lsb_used(aco_opcode op, unsigned idx)
+ {
+@@ -764,9 +811,20 @@ alu_opt_info_is_valid(opt_ctx& ctx, alu_opt_info& info)
+          info.opcode = aco_opcode::s_pack_lh_b32_b16;
+       } else if (info.operands[0].extract[0].offset() == 2 &&
+                  info.operands[1].extract[0].offset() == 0) {
+-         if (ctx.program->gfx_level < GFX11) /* TODO try shifting constant */
+-            return false;
+-         info.opcode = aco_opcode::s_pack_hl_b32_b16;
++         if (ctx.program->gfx_level < GFX11) {
++            /* GFX9 has s_pack_{ll,lh,hh}_b32_b16 but not s_pack_hl_b32_b16. If the high-half
++             * source is constant, materialize that high half as a normal low-half constant and
++             * keep using s_pack_ll. This salvages scalar packing idioms generated from constant
++             * p_extract without adding SALU shifts.
++             */
++            uint64_t constant = 0;
++            aco_type type = {aco_base_type_uint, 1, 32};
++            if (!op_info_get_constant(ctx, info.operands[0], type, &constant))
++               return false;
++            info.operands[0] = {Operand::c32((uint32_t)constant)};
++         } else {
++            info.opcode = aco_opcode::s_pack_hl_b32_b16;
++         }
+       }
+       info.operands[0].extract[0] = SubdwordSel::dword;
+       info.operands[1].extract[0] = SubdwordSel::dword;
+@@ -1984,14 +2042,6 @@ smem_combine(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+       skip_smem_offset_align(ctx, &instr->smem(), align);
+ }
+ 
+-Operand
+-get_constant_op(opt_ctx& ctx, ssa_info info, uint32_t bits)
+-{
+-   if (bits == 64)
+-      return Operand::c32_or_c64(info.val, true);
+-   return Operand::get_const(ctx.program->gfx_level, info.val, bits / 8u);
+-}
+-
+ bool
+ fixed_to_exec(Operand op)
+ {
+@@ -3085,6 +3135,30 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+       }
+       break;
+    case aco_opcode::p_extract: {
++      if (instr->operands.size() >= 4 && instr->operands[0].isTemp() &&
++          instr->operands[1].isConstant() && instr->operands[2].isConstant() &&
++          instr->operands[3].isConstant()) {
++         unsigned src_bits = instr->operands[0].bytes() * 8;
++         uint64_t src_constant = 0;
++         if (is_operand_constant(ctx, instr->operands[0], src_bits, &src_constant)) {
++            uint64_t index = instr->operands[1].constantValue();
++            unsigned bits = instr->operands[2].constantValue();
++            uint64_t offset = index * bits;
++
++            if (bits && bits <= 64 && offset < src_bits && bits <= src_bits - offset) {
++               uint64_t mask = bits == 64 ? UINT64_MAX : BITFIELD64_MASK(bits);
++               uint64_t constant = (src_constant >> offset) & mask;
++
++               if (instr->operands[3].constantEquals(1) && bits < 64 &&
++                   (constant & BITFIELD64_BIT(bits - 1)))
++                  constant |= ~mask;
++
++               ctx.info[instr->definitions[0].tempId()].set_constant(constant);
++               break;
++            }
++         }
++      }
++
+       ctx.info[instr->definitions[0].tempId()].set_extract();
+       break;
+    }
+@@ -3103,31 +3177,6 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+       ctx.info[def.tempId()].parent_instr = instr.get();
+ }
+ 
+-unsigned
+-original_temp_id(opt_ctx& ctx, Temp tmp)
+-{
+-   if (ctx.info[tmp.id()].is_temp())
+-      return ctx.info[tmp.id()].temp.id();
+-   else
+-      return tmp.id();
+-}
+-
+-bool
+-is_operand_constant(opt_ctx& ctx, Operand op, unsigned bit_size, uint64_t* value)
+-{
+-   if (op.isConstant()) {
+-      *value = op.constantValue64();
+-      return true;
+-   } else if (op.isTemp()) {
+-      unsigned id = original_temp_id(ctx, op.getTemp());
+-      if (!ctx.info[id].is_constant())
+-         return false;
+-      *value = get_constant_op(ctx, ctx.info[id], bit_size).constantValue64();
+-      return true;
+-   }
+-   return false;
+-}
+-
+ /* This function attempts to propagate (potential) input modifers from the consuming
+  * instruction backwards to the producing instruction.
+  * Because inbetween swizzles are resolved,
+@@ -3795,20 +3844,6 @@ apply_f2f16(opt_ctx& ctx, aco_ptr<Instruction>& instr, Instruction* parent)
+    return alu_opt_info_to_instr(ctx, parent_info, parent);
+ }
+ 
+-bool
+-op_info_get_constant(opt_ctx& ctx, alu_opt_op op_info, aco_type type, uint64_t* res)
+-{
+-   if (op_info.op.isTemp()) {
+-      unsigned id = original_temp_id(ctx, op_info.op.getTemp());
+-      if (ctx.info[id].is_constant())
+-         op_info.op = get_constant_op(ctx, ctx.info[id], type.bytes() * 8);
+-   }
+-   if (!op_info.op.isConstant())
+-      return false;
+-   *res = op_info.constant_after_mods(ctx, type);
+-   return true;
+-}
+-
+ /* neg(mul(a, b)) -> mul(neg(a), b), abs(mul(a, b)) -> mul(abs(a), abs(b)) */
+ Instruction*
+ apply_output_mul(opt_ctx& ctx, aco_ptr<Instruction>& instr, Instruction* parent)
+@@ -4204,6 +4239,180 @@ check_constant(opt_ctx& ctx, alu_opt_info& info, unsigned idx, uint32_t expected
     return op_info_get_constant(ctx, info.operands[idx], type, &constant) && constant == expected;
  }
  
@@ -5004,7 +5181,7 @@ index ac2c2f9a4f293fa527da7df30bd7da57b48fe09b..3b505f37f420038e73d4b8f9249ef20b
  template <unsigned idx, uint32_t expected>
  bool
  check_const_cb(opt_ctx& ctx, alu_opt_info& info)
-@@ -4508,6 +4682,12 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+@@ -4508,6 +4717,12 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
        if (ctx.program->gfx_level >= GFX9) {
           add_opt(v_or_b32, v_or3_b32, 0x3, "012", nullptr, true);
           add_opt(s_or_b32, v_or3_b32, 0x3, "012", nullptr, true);
@@ -5017,7 +5194,7 @@ index ac2c2f9a4f293fa527da7df30bd7da57b48fe09b..3b505f37f420038e73d4b8f9249ef20b
           add_opt(v_lshlrev_b32, v_lshl_or_b32, 0x3, "210", nullptr, true);
           add_opt(s_lshl_b32, v_lshl_or_b32, 0x3, "120", nullptr, true);
           add_opt(v_and_b32, v_and_or_b32, 0x3, "120", nullptr, true);
-@@ -4626,7 +4806,12 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+@@ -4626,7 +4841,12 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
        add_opt(v_add_u32, v_add_lshl_u32, 0x2, "120", nullptr, true);
        add_opt(s_add_u32, v_add_lshl_u32, 0x2, "120", nullptr, true);
        add_opt(s_add_i32, v_add_lshl_u32, 0x2, "120", nullptr, true);
@@ -5030,7 +5207,7 @@ index ac2c2f9a4f293fa527da7df30bd7da57b48fe09b..3b505f37f420038e73d4b8f9249ef20b
        add_opt(v_not_b32, v_bfi_b32, 0x3, "10", insert_const_cb<1, 0>, true);
        add_opt(s_not_b32, v_bfi_b32, 0x3, "10", insert_const_cb<1, 0>, true);
     } else if (info.opcode == aco_opcode::s_and_b32) {
-@@ -4859,6 +5044,152 @@ insert_replacement_instr(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+@@ -4859,6 +5079,253 @@ insert_replacement_instr(opt_ctx& ctx, aco_ptr<Instruction>& instr)
     }
  }
  
@@ -5086,12 +5263,39 @@ index ac2c2f9a4f293fa527da7df30bd7da57b48fe09b..3b505f37f420038e73d4b8f9249ef20b
 +   }
 +}
 +
-+/* Vega-targeted duplicate-operand peepholes.
++static bool
++operand_is_u32_constant(const Operand& op, uint32_t value)
++{
++   return op.isConstant() && op.constantValue() == value;
++}
++
++static bool
++copy_if_operand_is_constant(aco_ptr<Instruction>& instr, uint32_t constant, unsigned value_idx)
++{
++   if (operand_is_u32_constant(instr->operands[0], constant) && !instr->operands[1].isConstant())
++      return value_idx == 1;
++   if (operand_is_u32_constant(instr->operands[1], constant) && !instr->operands[0].isConstant())
++      return value_idx == 0;
++   return false;
++}
++
++static bool
++constant_if_any_operand(aco_ptr<Instruction>& instr, uint32_t constant)
++{
++   return operand_is_u32_constant(instr->operands[0], constant) ||
++          operand_is_u32_constant(instr->operands[1], constant);
++}
++
++/* Vega-targeted late VALU peepholes.
 + *
 + * Keep these transforms semantics-proof. Bitwise identities, cndmask(a, a, cond), unsigned/integer
-+ * subtraction x - x, and integer min/max/median duplicate collapses are exact. Avoid floating-point
-+ * x - x/min/max/median folds here: NaN and signed-zero preservation require more context than this
-+ * late peephole has.
++ * subtraction x - x, integer min/max/median duplicate collapses, and bitwise/shift/add/multiply
++ * identities with constants are exact. Avoid floating-point x - x/min/max/median folds here: NaN and
++ * signed-zero preservation require more context than this late peephole has.
++ *
++ * On Vega/GFX9 this is more than cosmetic: v_mul_{lo,hi}_u32 are quarter-rate VALU instructions,
++ * while the bitwise/shift/add identities remove ordinary VALU issue pressure and free VGPR live
++ * ranges before RA.
 + */
 +static void
 +try_peephole_redundant(opt_ctx& ctx, aco_ptr<Instruction>& instr)
@@ -5107,27 +5311,102 @@ index ac2c2f9a4f293fa527da7df30bd7da57b48fe09b..3b505f37f420038e73d4b8f9249ef20b
 +      return;
 +
 +   auto no_mod = [&](unsigned idx) { return !valu.neg[idx] && !valu.abs[idx]; };
++   auto all_no_mod = [&]() {
++      for (unsigned i = 0; i < instr->operands.size(); ++i) {
++         if (!no_mod(i))
++            return false;
++      }
++      return true;
++   };
++
++   if (!all_no_mod())
++      return;
 +
 +   switch (instr->opcode) {
 +   case aco_opcode::v_and_b32:
-+   case aco_opcode::v_or_b32:
-+      if (instr->operands.size() == 2 && instr->operands[0] == instr->operands[1] &&
-+          no_mod(0) && no_mod(1))
++      if (instr->operands.size() == 2 && instr->operands[0] == instr->operands[1]) {
 +         replace_with_copy(ctx, instr, instr->operands[0]);
++      } else if (instr->operands.size() == 2 && constant_if_any_operand(instr, 0)) {
++         replace_with_copy(ctx, instr, Operand::zero(instr->definitions[0].bytes()));
++      } else if (instr->operands.size() == 2 && copy_if_operand_is_constant(instr, UINT32_MAX, 0)) {
++         replace_with_copy(ctx, instr, instr->operands[0]);
++      } else if (instr->operands.size() == 2 && copy_if_operand_is_constant(instr, UINT32_MAX, 1)) {
++         replace_with_copy(ctx, instr, instr->operands[1]);
++      }
++      break;
++
++   case aco_opcode::v_or_b32:
++      if (instr->operands.size() == 2 && instr->operands[0] == instr->operands[1]) {
++         replace_with_copy(ctx, instr, instr->operands[0]);
++      } else if (instr->operands.size() == 2 && constant_if_any_operand(instr, UINT32_MAX)) {
++         replace_with_copy(ctx, instr, Operand::c32(UINT32_MAX));
++      } else if (instr->operands.size() == 2 && copy_if_operand_is_constant(instr, 0, 0)) {
++         replace_with_copy(ctx, instr, instr->operands[0]);
++      } else if (instr->operands.size() == 2 && copy_if_operand_is_constant(instr, 0, 1)) {
++         replace_with_copy(ctx, instr, instr->operands[1]);
++      }
 +      break;
 +
 +   case aco_opcode::v_xor_b32:
++      if (instr->operands.size() == 2 && instr->operands[0] == instr->operands[1]) {
++         replace_with_copy(ctx, instr, Operand::zero(instr->definitions[0].bytes()));
++      } else if (instr->operands.size() == 2 && copy_if_operand_is_constant(instr, 0, 0)) {
++         replace_with_copy(ctx, instr, instr->operands[0]);
++      } else if (instr->operands.size() == 2 && copy_if_operand_is_constant(instr, 0, 1)) {
++         replace_with_copy(ctx, instr, instr->operands[1]);
++      }
++      break;
++
++   case aco_opcode::v_add_u32:
++      if (instr->operands.size() == 2 && copy_if_operand_is_constant(instr, 0, 0)) {
++         replace_with_copy(ctx, instr, instr->operands[0]);
++      } else if (instr->operands.size() == 2 && copy_if_operand_is_constant(instr, 0, 1)) {
++         replace_with_copy(ctx, instr, instr->operands[1]);
++      }
++      break;
++
 +   case aco_opcode::v_sub_u32:
++      if (instr->operands.size() == 2 && instr->operands[0] == instr->operands[1]) {
++         replace_with_copy(ctx, instr, Operand::zero(instr->definitions[0].bytes()));
++      } else if (instr->operands.size() == 2 && operand_is_u32_constant(instr->operands[1], 0)) {
++         replace_with_copy(ctx, instr, instr->operands[0]);
++      }
++      break;
++
 +   case aco_opcode::v_subrev_u32:
-+      if (instr->operands.size() == 2 && instr->operands[0] == instr->operands[1] &&
-+          no_mod(0) && no_mod(1))
++      if (instr->operands.size() == 2 && instr->operands[0] == instr->operands[1]) {
++         replace_with_copy(ctx, instr, Operand::zero(instr->definitions[0].bytes()));
++      } else if (instr->operands.size() == 2 && operand_is_u32_constant(instr->operands[0], 0)) {
++         replace_with_copy(ctx, instr, instr->operands[1]);
++      }
++      break;
++
++   case aco_opcode::v_lshlrev_b32:
++   case aco_opcode::v_lshrrev_b32:
++   case aco_opcode::v_ashrrev_i32:
++      if (instr->operands.size() == 2 && operand_is_u32_constant(instr->operands[0], 0))
++         replace_with_copy(ctx, instr, instr->operands[1]);
++      break;
++
++   case aco_opcode::v_mul_lo_u32:
++      if (instr->operands.size() == 2 && constant_if_any_operand(instr, 0)) {
++         replace_with_copy(ctx, instr, Operand::zero(instr->definitions[0].bytes()));
++      } else if (instr->operands.size() == 2 && copy_if_operand_is_constant(instr, 1, 0)) {
++         replace_with_copy(ctx, instr, instr->operands[0]);
++      } else if (instr->operands.size() == 2 && copy_if_operand_is_constant(instr, 1, 1)) {
++         replace_with_copy(ctx, instr, instr->operands[1]);
++      }
++      break;
++
++   case aco_opcode::v_mul_hi_u32:
++      if (instr->operands.size() == 2 &&
++          (constant_if_any_operand(instr, 0) || constant_if_any_operand(instr, 1)))
 +         replace_with_copy(ctx, instr, Operand::zero(instr->definitions[0].bytes()));
 +      break;
 +
 +   case aco_opcode::v_cndmask_b32:
 +   case aco_opcode::v_cndmask_b16:
-+      if (instr->operands.size() == 3 && instr->operands[0] == instr->operands[1] &&
-+          no_mod(0) && no_mod(1))
++      if (instr->operands.size() == 3 && instr->operands[0] == instr->operands[1])
 +         replace_with_copy(ctx, instr, instr->operands[0]);
 +      break;
 +
@@ -5135,8 +5414,7 @@ index ac2c2f9a4f293fa527da7df30bd7da57b48fe09b..3b505f37f420038e73d4b8f9249ef20b
 +   case aco_opcode::v_max_u32:
 +   case aco_opcode::v_min_i32:
 +   case aco_opcode::v_max_i32:
-+      if (instr->operands.size() == 2 && instr->operands[0] == instr->operands[1] &&
-+          no_mod(0) && no_mod(1))
++      if (instr->operands.size() == 2 && instr->operands[0] == instr->operands[1])
 +         replace_with_copy(ctx, instr, instr->operands[0]);
 +      break;
 +
@@ -5144,7 +5422,7 @@ index ac2c2f9a4f293fa527da7df30bd7da57b48fe09b..3b505f37f420038e73d4b8f9249ef20b
 +   case aco_opcode::v_max3_u32:
 +   case aco_opcode::v_min3_i32:
 +   case aco_opcode::v_max3_i32: {
-+      if (instr->operands.size() != 3 || !no_mod(0) || !no_mod(1) || !no_mod(2))
++      if (instr->operands.size() != 3)
 +         break;
 +
 +      if (instr->operands[0] == instr->operands[1] && instr->operands[0] == instr->operands[2]) {
@@ -5166,7 +5444,7 @@ index ac2c2f9a4f293fa527da7df30bd7da57b48fe09b..3b505f37f420038e73d4b8f9249ef20b
 +
 +   case aco_opcode::v_med3_u32:
 +   case aco_opcode::v_med3_i32:
-+      if (instr->operands.size() != 3 || !no_mod(0) || !no_mod(1) || !no_mod(2))
++      if (instr->operands.size() != 3)
 +         break;
 +      if (instr->operands[0] == instr->operands[1] || instr->operands[0] == instr->operands[2]) {
 +         replace_with_copy(ctx, instr, instr->operands[0]);
@@ -5183,7 +5461,7 @@ index ac2c2f9a4f293fa527da7df30bd7da57b48fe09b..3b505f37f420038e73d4b8f9249ef20b
  void
  select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
  {
-@@ -4869,6 +5200,10 @@ select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+@@ -4869,6 +5336,10 @@ select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
        return;
     }
  
@@ -7204,10 +7482,41 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..846d884ce71ce96a419d63a69d84fecc
        nir_pop_loop(nb, NULL);
        //>> BB6
 diff --git a/src/amd/compiler/tests/test_optimizer.cpp b/src/amd/compiler/tests/test_optimizer.cpp
-index 159fea6a948d03e346cea6a466da471392248b63..90c248a1de23f4a7de390d6aa5fb182f3a75d3f1 100644
+index 159fea6a948d03e346cea6a466da471392248b63..292c64c07972e15ae20c6e5eb191e900eb5693f9 100644
 --- a/src/amd/compiler/tests/test_optimizer.cpp
 +++ b/src/amd/compiler/tests/test_optimizer.cpp
-@@ -2401,3 +2401,95 @@ BEGIN_TEST(optimizer.dotc_dpp)
+@@ -1999,6 +1999,30 @@ BEGIN_TEST(optimize.s_pack)
+    finish_opt_test();
+ END_TEST
+ 
++BEGIN_TEST(optimize.s_pack_hl_constant_gfx9)
++   //>> s1: %a:s[0] = p_startpgm
++   if (!setup_cs("s1", GFX9))
++      return;
++
++   Temp constant = bld.copy(bld.def(s1), Operand::c32(0x12345678u));
++   Temp hi_const = bld.pseudo(aco_opcode::p_extract, bld.def(s1), bld.def(s1, scc), constant,
++                              Operand::c32(1), Operand::c32(16u), Operand::c32(false));
++
++   //! s1: %res0 = s_pack_ll_b32_b16 0x1234, %a
++   //! p_unit_test 0, %res0
++   writeout(0, bld.sop2(aco_opcode::s_pack_ll_b32_b16, bld.def(s1), hi_const, inputs[0]));
++
++   Temp neg_constant = bld.copy(bld.def(s1), Operand::c32(0xffff8001u));
++   Temp signed_hi = bld.pseudo(aco_opcode::p_extract, bld.def(s1), bld.def(s1, scc), neg_constant,
++                               Operand::c32(1), Operand::c32(16u), Operand::c32(true));
++
++   //! s1: %res1 = s_pack_ll_b32_b16 -1, %a
++   //! p_unit_test 1, %res1
++   writeout(1, bld.sop2(aco_opcode::s_pack_ll_b32_b16, bld.def(s1), signed_hi, inputs[0]));
++
++   finish_opt_test();
++END_TEST
++
+ BEGIN_TEST(optimizer.trans_inline_constant)
+    if (!setup_cs("", GFX12))
+       return;
+@@ -2401,3 +2425,228 @@ BEGIN_TEST(optimizer.dotc_dpp)
  
     finish_opt_test();
  END_TEST
@@ -7300,6 +7609,139 @@ index 159fea6a948d03e346cea6a466da471392248b63..90c248a1de23f4a7de390d6aa5fb182f
 +   //! v1: %res9 = v_med3_f32 %a, %b, %a
 +   //! p_unit_test 9, %res9
 +   writeout(9, bld.vop3(aco_opcode::v_med3_f32, bld.def(v1), a, b, a));
++
++   finish_opt_test();
++END_TEST
++
++BEGIN_TEST(optimizer.p_extract_constant)
++   //>> s1: %a:s[0] = p_startpgm
++   if (!setup_cs("s1", GFX9))
++      return;
++
++   Temp constant = bld.copy(bld.def(s1), Operand::c32(0x89abcdefu));
++
++   //! p_unit_test 0, 0xcdef
++   writeout(0, bld.pseudo(aco_opcode::p_extract, bld.def(s1), bld.def(s1, scc), constant,
++                          Operand::c32(0), Operand::c32(16u), Operand::c32(false)));
++
++   //! p_unit_test 1, 0xffff89ab
++   writeout(1, bld.pseudo(aco_opcode::p_extract, bld.def(s1), bld.def(s1, scc), constant,
++                          Operand::c32(1), Operand::c32(16u), Operand::c32(true)));
++
++   //! p_unit_test 2, 0xab
++   writeout(2, bld.pseudo(aco_opcode::p_extract, bld.def(s1), bld.def(s1, scc), constant,
++                          Operand::c32(2), Operand::c32(8u), Operand::c32(false)));
++
++   finish_opt_test();
++END_TEST
++
++BEGIN_TEST(optimizer.gfx9_integer_identity_constants)
++   //>> v1: %a:v[0], v1: %b:v[1] = p_startpgm
++   if (!setup_cs("v1 v1", GFX9))
++      return;
++
++   Temp a = inputs[0];
++   Temp b = inputs[1];
++
++   //! v1: %res0 = p_parallelcopy %b
++   //! p_unit_test 0, %res0
++   writeout(0, bld.vop2(aco_opcode::v_add_u32, bld.def(v1), Operand::zero(), b));
++
++   //! v1: %res1 = p_parallelcopy %b
++   //! p_unit_test 1, %res1
++   writeout(1, bld.vop2(aco_opcode::v_subrev_u32, bld.def(v1), Operand::zero(), b));
++
++   //! v1: %res2 = p_parallelcopy %a
++   //! p_unit_test 2, %res2
++   writeout(2, bld.vop2(aco_opcode::v_lshlrev_b32, bld.def(v1), Operand::zero(), a));
++
++   //! v1: %res3 = p_parallelcopy %a
++   //! p_unit_test 3, %res3
++   writeout(3, bld.vop2(aco_opcode::v_lshrrev_b32, bld.def(v1), Operand::zero(), a));
++
++   //! v1: %res4 = p_parallelcopy %a
++   //! p_unit_test 4, %res4
++   writeout(4, bld.vop2(aco_opcode::v_ashrrev_i32, bld.def(v1), Operand::zero(), a));
++
++   //! v1: %res5 = p_parallelcopy 0
++   //! p_unit_test 5, %res5
++   writeout(5, bld.vop2(aco_opcode::v_and_b32, bld.def(v1), Operand::zero(), a));
++
++   //! v1: %res6 = p_parallelcopy %a
++   //! p_unit_test 6, %res6
++   writeout(6, bld.vop2(aco_opcode::v_and_b32, bld.def(v1), Operand::c32(UINT32_MAX), a));
++
++   //! v1: %res7 = p_parallelcopy %a
++   //! p_unit_test 7, %res7
++   writeout(7, bld.vop2(aco_opcode::v_or_b32, bld.def(v1), Operand::zero(), a));
++
++   //! v1: %res8 = p_parallelcopy -1
++   //! p_unit_test 8, %res8
++   writeout(8, bld.vop2(aco_opcode::v_or_b32, bld.def(v1), Operand::c32(UINT32_MAX), a));
++
++   //! v1: %res9 = p_parallelcopy %a
++   //! p_unit_test 9, %res9
++   writeout(9, bld.vop2(aco_opcode::v_xor_b32, bld.def(v1), Operand::zero(), a));
++
++   //! v1: %res10 = v_sub_u32 0, %a
++   //! p_unit_test 10, %res10
++   writeout(10, bld.vop2(aco_opcode::v_sub_u32, bld.def(v1), Operand::zero(), a));
++
++   //! v1: %res11 = v_lshlrev_b32 1, %a
++   //! p_unit_test 11, %res11
++   writeout(11, bld.vop2(aco_opcode::v_lshlrev_b32, bld.def(v1), Operand::c32(1), a));
++
++   finish_opt_test();
++END_TEST
++
++
++BEGIN_TEST(optimizer.gfx9_quarter_rate_mul_identity)
++   //>> v1: %a:v[0], v1: %b:v[1] = p_startpgm
++   if (!setup_cs("v1 v1", GFX9))
++      return;
++
++   Temp a = inputs[0];
++   Temp b = inputs[1];
++
++   //! v1: %res0 = p_parallelcopy 0
++   //! p_unit_test 0, %res0
++   writeout(0, bld.vop3(aco_opcode::v_mul_lo_u32, bld.def(v1), a, Operand::zero()));
++
++   //! v1: %res1 = p_parallelcopy 0
++   //! p_unit_test 1, %res1
++   writeout(1, bld.vop3(aco_opcode::v_mul_lo_u32, bld.def(v1), Operand::zero(), b));
++
++   //! v1: %res2 = p_parallelcopy %a
++   //! p_unit_test 2, %res2
++   writeout(2, bld.vop3(aco_opcode::v_mul_lo_u32, bld.def(v1), a, Operand::c32(1)));
++
++   //! v1: %res3 = p_parallelcopy %b
++   //! p_unit_test 3, %res3
++   writeout(3, bld.vop3(aco_opcode::v_mul_lo_u32, bld.def(v1), Operand::c32(1), b));
++
++   //! v1: %res4 = p_parallelcopy 0
++   //! p_unit_test 4, %res4
++   writeout(4, bld.vop3(aco_opcode::v_mul_hi_u32, bld.def(v1), a, Operand::zero()));
++
++   //! v1: %res5 = p_parallelcopy 0
++   //! p_unit_test 5, %res5
++   writeout(5, bld.vop3(aco_opcode::v_mul_hi_u32, bld.def(v1), Operand::zero(), b));
++
++   //! v1: %res6 = p_parallelcopy 0
++   //! p_unit_test 6, %res6
++   writeout(6, bld.vop3(aco_opcode::v_mul_hi_u32, bld.def(v1), a, Operand::c32(1)));
++
++   //! v1: %res7 = p_parallelcopy 0
++   //! p_unit_test 7, %res7
++   writeout(7, bld.vop3(aco_opcode::v_mul_hi_u32, bld.def(v1), Operand::c32(1), b));
++
++   //! v1: %res8 = v_mul_lo_u32 2, %a
++   //! p_unit_test 8, %res8
++   writeout(8, bld.vop3(aco_opcode::v_mul_lo_u32, bld.def(v1), Operand::c32(2), a));
++
++   //! v1: %res9 = v_mul_hi_u32 2, %b
++   //! p_unit_test 9, %res9
++   writeout(9, bld.vop3(aco_opcode::v_mul_hi_u32, bld.def(v1), Operand::c32(2), b));
 +
 +   finish_opt_test();
 +END_TEST
