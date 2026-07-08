@@ -231,10 +231,10 @@ index e0859e23a36481269dd0f67bfae80c8883a0e2d8..1f70a3ff0564ad4b3c731d0ef058151d
  
  #if defined(__cplusplus)
 diff --git a/meson.build b/meson.build
-index ae2242e2c5ec21286cfdef2310bafb84aab706f7..b5e75f06540172cec42833b061cbe7dbe265dbc8 100644
+index 954afdef03e903c6b4a11e2aa5f50f572564b960..0860de7c298c10825c4177238d8e036cef287c55 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -1984,7 +1984,6 @@ _shared_llvm = get_option('shared-llvm') \
+@@ -1985,7 +1985,6 @@ _shared_llvm = get_option('shared-llvm') \
  
  dep_llvm = dependency(
    'llvm',
@@ -4750,6 +4750,47 @@ index 186cafaaa35861e47a7adf29ef6c8f1965c75455..5232c9f4b06dcdf312ee1c4d09899798
              else
                 est_cycles = num_scalar * 4 + num_vector * 4;
  
+diff --git a/src/amd/compiler/aco_lower_to_hw_instr.cpp b/src/amd/compiler/aco_lower_to_hw_instr.cpp
+index 337e296ad310279b6aa8e8d96e355d9e049a2acd..a3a9224e4b2ead2447666d73fa86d58da2d90243 100644
+--- a/src/amd/compiler/aco_lower_to_hw_instr.cpp
++++ b/src/amd/compiler/aco_lower_to_hw_instr.cpp
+@@ -2352,7 +2352,8 @@ lower_to_hw_instr(Program* program)
+                std::map<PhysReg, copy_operation> copy_operations;
+                PhysReg reg = instr->definitions[0].physReg();
+ 
+-               for (const Operand& op : instr->operands) {
++               for (unsigned op_idx = 0; op_idx < instr->operands.size(); ++op_idx) {
++                  const Operand& op = instr->operands[op_idx];
+                   RegClass rc = RegClass::get(instr->definitions[0].regClass().type(), op.bytes());
+                   if (op.isConstant()) {
+                      const Definition def = Definition(reg, rc);
+@@ -2361,7 +2362,25 @@ lower_to_hw_instr(Program* program)
+                      continue;
+                   }
+                   if (op.isUndefined()) {
+-                     // TODO: coalesce subdword copies if dst byte is 0
++                     /* If an undefined low sub-dword lane is immediately followed by a constant,
++                      * materialize the undef lane as zero only when the existing copy coalescer can
++                      * merge both lanes into a single representable constant. This preserves all
++                      * defined bits while avoiding byte/word insert sequences on GFX9.
++                      */
++                     const Operand* next = op_idx + 1 < instr->operands.size()
++                                              ? &instr->operands[op_idx + 1]
++                                              : nullptr;
++                     if (reg.byte() == 0 && next && next->isConstant()) {
++                        unsigned new_size = op.bytes() + next->bytes();
++                        uint64_t val = next->constantValue64() << (op.bytes() * 8u);
++                        if (util_is_power_of_two_or_zero(new_size) && new_size <= 4 &&
++                            Operand::is_constant_representable(
++                               val, new_size, true,
++                               instr->definitions[0].regClass().type() == RegType::vgpr)) {
++                           const Definition def = Definition(reg, rc);
++                           copy_operations[reg] = {Operand::zero(op.bytes()), def, op.bytes()};
++                        }
++                     }
+                      reg.reg_b += op.bytes();
+                      continue;
+                   }
 diff --git a/src/amd/compiler/aco_opt_value_numbering.cpp b/src/amd/compiler/aco_opt_value_numbering.cpp
 index 414ded1c0d1bcba0d1af0aa5557fd4599135c7fa..dd4de20d4b21133a43bdbb28b2d1667066a65248 100644
 --- a/src/amd/compiler/aco_opt_value_numbering.cpp
@@ -7745,6 +7786,43 @@ index 159fea6a948d03e346cea6a466da471392248b63..292c64c07972e15ae20c6e5eb191e900
 +
 +   finish_opt_test();
 +END_TEST
+diff --git a/src/amd/compiler/tests/test_to_hw_instr.cpp b/src/amd/compiler/tests/test_to_hw_instr.cpp
+index 52c58f890602ce8e5eb6e09a4f4e3234c747a9ef..f78ff5ddfde4f911e15cbc83ca939a907e1e6843 100644
+--- a/src/amd/compiler/tests/test_to_hw_instr.cpp
++++ b/src/amd/compiler/tests/test_to_hw_instr.cpp
+@@ -374,6 +374,32 @@ BEGIN_TEST(to_hw_instr.subdword_constant)
+    }
+ END_TEST
+ 
++BEGIN_TEST(to_hw_instr.create_vector_undef_constant_coalesce)
++   PhysReg v0_lo{256};
++
++   for (amd_gfx_level lvl : {GFX9, GFX10, GFX11}) {
++      if (!setup_cs(NULL, lvl))
++         continue;
++
++      //>> p_unit_test 0
++      //~gfx9! v1: %0:v[0] = v_and_b32 0xffff0000, %0:v[0]
++      //~gfx9! v1: %0:v[0] = v_or_b32 0x4200, %0:v[0]
++      //~gfx10! v2b: %0:v[0][0:16] = v_add_u16_e64 0x4200, 0
++      //~gfx11! v2b: %0:v[0][0:16] = v_mov_b16 0x4200
++      bld.pseudo(aco_opcode::p_unit_test, Operand::zero());
++      bld.pseudo(aco_opcode::p_create_vector, Definition(v0_lo, v2b), Operand(v1b),
++                 Operand::c8(0x42));
++
++      //! p_unit_test 1
++      //! v1: %0:v[0] = v_mov_b32 0x42050000
++      bld.pseudo(aco_opcode::p_unit_test, Operand::c32(1));
++      bld.pseudo(aco_opcode::p_create_vector, Definition(v0_lo, v4b), Operand(v2b),
++                 Operand::c16(0x4205));
++
++      finish_to_hw_instr_test();
++   }
++END_TEST
++
+ BEGIN_TEST(to_hw_instr.self_intersecting_swap)
+    if (!setup_cs(NULL, GFX9))
+       return;
 diff --git a/src/amd/packets/parse_cp_pm4_table_data_json.py b/src/amd/packets/parse_cp_pm4_table_data_json.py
 index 7ee2909b53fbc74874e1959cef35d0bc8bca9720..fe85f370464529a231cc1a965d1e92ff468e6036 100644
 --- a/src/amd/packets/parse_cp_pm4_table_data_json.py
