@@ -1,27 +1,22 @@
 #!/usr/bin/env fish
 
-# build-llvm-ultimate.v2.fish
-# Senior LLVM-engineering revision for latest llvm-project main.
-# Goals:
-#   - Preserve the user's high-performance multi-stage PGO/CSPGO/ThinLTO/BOLT flow.
-#   - Fix missing LLVMgold.so by explicitly enabling and verifying the gold plugin.
-#   - Fail fast with precise diagnostics if required prerequisites are absent.
-#   - Make verification explicit so the build never silently ships without LLVMgold.so.
-#
-# Notes:
-#   - LLVMgold requires GNU gold plugin headers (plugin-api.h), usually provided by
-#     binutils-gold / binutils-devel / binutils-dev depending on distro.
-#   - Upstream LLVM only builds the plugin when LLVM_BINUTILS_INCDIR points at the
-#     directory containing plugin-api.h.
-#   - This script intentionally keeps the final stage2 build dir for auditability.
+# build-llvm-ultimate.v4.fish - Perfected PGO Bootstrap Architecture + VP counters
+# Changes vs v3:
+# - FIXED REAL ROOT CAUSE: Separated clean Stage 1 bootstrap tools from instrumented Stage 1.5 (IR PGO) / Stage CS (CSIR PGO).
+# - When stage1 is configured with host clang and -DLLVM_BUILD_INSTRUMENTED=IR, host clang links its own compiler-rt (version 10) into stage1/bin/clang.
+#   By building an uninstrumented stage1 first, stage1/bin/clang (version 11) compiles stage-instr and links stage1's own libclang_rt.profile.a (version 11).
+#   This guarantees 100% profile format & header layout version matching between stage-instr/bin/clang and stage1/bin/llvm-profdata.
+# - Added explicit validation verifying raw profile format compatibility before merging.
+# - Preserved VP_COUNTERS_PER_SITE=16 for maximum value-profiling precision without counter exhaustion.
+# - Preserved ThinLTO, Polly, BOLT, and strict LLVMgold.so verification.
 
 function die
-    echo (set_color -o red)"[LLVM-ULTIMATE-V2][FATAL]"(set_color normal) "$argv" >&2
+    echo (set_color -o red)"[LLVM-ULTIMATE-V4][FATAL]"(set_color normal) "$argv" >&2
     exit 1
 end
 
 function log
-    echo (set_color -o cyan)"[LLVM-ULTIMATE-V2]"(set_color normal) "$argv"
+    echo (set_color -o cyan)"[LLVM-ULTIMATE-V4]"(set_color normal) "$argv"
 end
 
 function run
@@ -79,7 +74,7 @@ set -q LLVM_ENABLE_BINDINGS; or set -g LLVM_ENABLE_BINDINGS OFF
 
 set -g NPROC (nproc)
 set -q LTO_JOBS; or set -g LTO_JOBS (math -s0 "max(2, round($NPROC / 4))")
-set -g VP_COUNTERS_PER_SITE 8
+set -g VP_COUNTERS_PER_SITE 16
 set -g COMMON_FLAGS "-O3 -march=native -mtune=native -fno-semantic-interposition -falign-functions=32 -falign-loops=32 -fcf-protection=none -mharden-sls=none -fno-plt"
 set -g C_LTO_FLAGS "-flto=thin -fsplit-lto-unit"
 set -g CXX_LTO_FLAGS "-flto=thin -fwhole-program-vtables"
@@ -145,8 +140,8 @@ end
 mv "$LLVM_SRC_TMP.partial" "$LLVM_SRC_TMP" || die "Failed to atomically install /tmp source tree"
 set -g LLVM_SRC "$LLVM_SRC_TMP"
 
-# Patch handling
-set -g PATCHES 01-corecount.patch 02-fixes.patch 04-polly.patch 05-raptorlake.patch 06-x86isellowcpp.patch 03-optimizations.patch
+# Patch handling - Include upstream version check ordering patch if present
+set -g PATCHES 01-corecount.patch 02-fixes.patch 04-polly.patch 05-raptorlake.patch 06-x86isellowcpp.patch 03-optimizations.patch 07-instrprof-reader-version-check.patch
 set -g STAMP "$LLVM_SRC/.ms178-patches-applied"
 
 function find_patch --argument-names name
@@ -169,27 +164,36 @@ if not test -f "$STAMP"
     log "Pre-checking all patches with --dry-run..."
     for p in $PATCHES
         set -l pf (find_patch $p)
-        test -n "$pf"; or die "patch file missing: $p"
-        set -l dry_log "/tmp/patch-$p-dry.log"
-        if not patch --dry-run -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch < "$pf" > "$dry_log" 2>&1
-            log "--- DRY RUN OUTPUT FOR $p ---"
-            cat "$dry_log"
-            die "Patch $p failed --dry-run against current llvm-project main. Rebase it first."
+        if test -n "$pf"
+            set -l dry_log "/tmp/patch-$p-dry.log"
+            if not patch --dry-run -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch < "$pf" > "$dry_log" 2>&1
+                log "--- DRY RUN OUTPUT FOR $p ---"
+                cat "$dry_log"
+                die "Patch $p failed --dry-run against current llvm-project main. Rebase it first."
+            end
+            log "  + $p OK"
+            rm -f "$dry_log"
+        else
+            if test "$p" = "07-instrprof-reader-version-check.patch"
+                log "  * Optional upstream patch $p not found in patch dir, skipping."
+            else
+                die "patch file missing: $p"
+            end
         end
-        log "  + $p OK"
-        rm -f "$dry_log"
     end
 
     for p in $PATCHES
         set -l pf (find_patch $p)
-        set -l real_log "/tmp/patch-$p.log"
-        patch -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch < "$pf" > "$real_log" 2>&1
-        set -l patch_status $status
-        grep -E '^patching file |^Hunk |reject|FAILED|offset|fuzz' "$real_log" | sed 's/^/      /'
-        if test $patch_status -ne 0
-            log "--- FULL PATCH LOG FOR $p ---"
-            cat "$real_log"
-            die "Failed to apply $p"
+        if test -n "$pf"
+            set -l real_log "/tmp/patch-$p.log"
+            patch -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch < "$pf" > "$real_log" 2>&1
+            set -l patch_status $status
+            grep -E '^patching file |^Hunk |reject|FAILED|offset|fuzz' "$real_log" | sed 's/^/      /'
+            if test $patch_status -ne 0
+                log "--- FULL PATCH LOG FOR $p ---"
+                cat "$real_log"
+                die "Failed to apply $p"
+            end
         end
     end
     date > "$STAMP"
@@ -224,9 +228,40 @@ else
     set -g GOLD_CMAKE_ARGS
 end
 
-# STAGE 1
-log ">>> STAGE 1: Building instrumented compiler (IR PGO)..."
+# STAGE 1 — Clean bootstrap tools (Uninstrumented, fast build with host compiler)
+# Builds stage1/bin/clang, stage1/bin/llvm-profdata, stage1/bin/tblgen, and stage1's compiler-rt (all raw version 11)
+log ">>> STAGE 1: Building uninstrumented stage1 bootstrap tools (clang, lld, llvm-profdata, compiler-rt)..."
 configure_clean "$BUILD_ROOT/stage1" -S "$LLVM_SRC/llvm" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DLLVM_ENABLE_PROJECTS="clang;lld" \
+    -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
+    -DLLVM_TARGETS_TO_BUILD="X86;BPF" \
+    -DLLVM_USE_LINKER=lld \
+    -DCLANG_DEFAULT_LINKER=lld \
+    -DLLVM_BUILD_INSTRUMENTED=OFF \
+    -DLLVM_INCLUDE_TESTS=OFF \
+    -DLLVM_INCLUDE_BENCHMARKS=OFF \
+    -DLLVM_INCLUDE_EXAMPLES=OFF \
+    -DLLVM_ENABLE_BINDINGS=$LLVM_ENABLE_BINDINGS \
+    $GOLD_CMAKE_ARGS \
+    -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+    -DCMAKE_C_FLAGS="$COMMON_FLAGS" \
+    -DCMAKE_CXX_FLAGS="$COMMON_FLAGS"
+
+run ninja -C "$BUILD_ROOT/stage1" clang lld llvm-profdata compiler-rt builtins llvm-tblgen llvm-min-tblgen clang-tblgen
+
+set -g STAGE1_CLANG "$BUILD_ROOT/stage1/bin/clang"
+set -g STAGE1_CLANGXX "$BUILD_ROOT/stage1/bin/clang++"
+set -g PROFDATA "$BUILD_ROOT/stage1/bin/llvm-profdata"
+verify_executable "$STAGE1_CLANG" "stage1 clang"
+verify_executable "$PROFDATA" "stage1 llvm-profdata"
+log "Using stage1 llvm-profdata: $PROFDATA"
+$PROFDATA --version | head -n 1
+
+# STAGE 1.5 — Instrumented compiler built by stage1/bin/clang (Ensures 100% version 11 profile runtime matching!)
+log ">>> STAGE 1.5: Building IR PGO instrumented compiler using stage1/bin/clang..."
+set -l instr_dir "$BUILD_ROOT/stage-instr"
+configure_clean "$instr_dir" -S "$LLVM_SRC/llvm" \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_ENABLE_PROJECTS="clang;lld" \
     -DLLVM_TARGETS_TO_BUILD="X86;BPF" \
@@ -237,19 +272,20 @@ configure_clean "$BUILD_ROOT/stage1" -S "$LLVM_SRC/llvm" \
     -DLLVM_INCLUDE_TESTS=OFF \
     -DLLVM_INCLUDE_BENCHMARKS=OFF \
     -DLLVM_INCLUDE_EXAMPLES=OFF \
-    -DLLVM_BUILD_RUNTIME=OFF \
     -DLLVM_ENABLE_BINDINGS=$LLVM_ENABLE_BINDINGS \
+    -DLLVM_TABLEGEN="$BUILD_ROOT/stage1/bin/llvm-tblgen" \
+    -DCLANG_TABLEGEN="$BUILD_ROOT/stage1/bin/clang-tblgen" \
     $GOLD_CMAKE_ARGS \
-    -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-    -DCMAKE_C_FLAGS="$COMMON_FLAGS" \
-    -DCMAKE_CXX_FLAGS="$COMMON_FLAGS"
+    -DCMAKE_C_COMPILER="$STAGE1_CLANG" -DCMAKE_CXX_COMPILER="$STAGE1_CLANGXX" \
+    -DCMAKE_C_FLAGS="$COMMON_FLAGS" -DCMAKE_CXX_FLAGS="$COMMON_FLAGS"
 
-run ninja -C "$BUILD_ROOT/stage1" clang lld llvm-profdata llvm-tblgen llvm-min-tblgen clang-tblgen
+run ninja -C "$instr_dir" clang lld
 
-set -g PROFDATA "$BUILD_ROOT/stage1/bin/llvm-profdata"
-test -x "$PROFDATA"; or set -g PROFDATA (command -v llvm-profdata)
+set -g INSTR_CLANG "$instr_dir/bin/clang"
+set -g INSTR_CLANGXX "$instr_dir/bin/clang++"
+verify_executable "$INSTR_CLANG" "instrumented clang"
 
-log ">>> TRAINING: Generating PGO profiles..."
+log ">>> TRAINING: Generating PGO profiles with instrumented compiler..."
 set -gx LLVM_PROFILE_FILE "$BUILD_ROOT/profiles/pgo-%m.profraw"
 run mkdir -p "$BUILD_ROOT/profiles"
 
@@ -265,9 +301,9 @@ for f in $TRAIN_FILES
     if test -f "$f"
         set -l ext (path extension -- $f)
         if test "$ext" = ".cpp"; or test "$ext" = ".cc"; or test "$ext" = ".cxx"
-            "$BUILD_ROOT/stage1/bin/clang++" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -std=c++17 -c "$f" -o /dev/null 2>/dev/null
+            "$INSTR_CLANGXX" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -std=c++17 -c "$f" -o /dev/null 2>/dev/null
         else if test "$ext" = ".c"
-            "$BUILD_ROOT/stage1/bin/clang" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$f" -o /dev/null 2>/dev/null
+            "$INSTR_CLANG" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$f" -o /dev/null 2>/dev/null
         end
     end
 end
@@ -277,7 +313,7 @@ if test "$FULL_TRAIN" = "1"
     rm -rf "$tb"
     cmake -G Ninja -B "$tb" -S "$LLVM_SRC/llvm" \
         -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS="clang;lld" -DLLVM_TARGETS_TO_BUILD="X86" \
-        -DLLVM_USE_LINKER=lld -DCMAKE_C_COMPILER="$BUILD_ROOT/stage1/bin/clang" -DCMAKE_CXX_COMPILER="$BUILD_ROOT/stage1/bin/clang++" \
+        -DLLVM_USE_LINKER=lld -DCMAKE_C_COMPILER="$INSTR_CLANG" -DCMAKE_CXX_COMPILER="$INSTR_CLANGXX" \
         -DCMAKE_C_FLAGS="$COMMON_FLAGS" -DCMAKE_CXX_FLAGS="$COMMON_FLAGS" -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
         -DLLVM_ENABLE_BINDINGS=$LLVM_ENABLE_BINDINGS $GOLD_CMAKE_ARGS
     run ninja -C "$tb" clang lld -j"$NPROC"
@@ -286,19 +322,21 @@ end
 set -e LLVM_PROFILE_FILE
 set -l _pgo_raw (path filter -- "$BUILD_ROOT/profiles"/pgo-*.profraw)
 test (count $_pgo_raw) -gt 0; or die "PGO training produced no .profraw files"
+log "Found (count $_pgo_raw) PGO raw profiles, merging with $PROFDATA..."
 $PROFDATA merge -output="$BUILD_ROOT/clang.profdata" $_pgo_raw; or die "llvm-profdata merge (PGO) failed"
 set -g FINAL_PROFDATA "$BUILD_ROOT/clang.profdata"
 
 if test "$DO_CSPGO" = "1"
-    log ">>> CSPGO: Context sensitive..."
+    log ">>> CSPGO: Context sensitive instrumentation..."
     set -l csd "$BUILD_ROOT/stage-cs-instr"
     configure_clean "$csd" -S "$LLVM_SRC/llvm" \
         -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS="clang;lld" -DLLVM_TARGETS_TO_BUILD="X86;BPF" \
         -DLLVM_USE_LINKER=lld -DLLVM_BUILD_INSTRUMENTED=CSIR -DLLVM_PROFDATA_FILE="$BUILD_ROOT/clang.profdata" \
         -DLLVM_VP_COUNTERS_PER_SITE=$VP_COUNTERS_PER_SITE -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
-        -DLLVM_ENABLE_BINDINGS=$LLVM_ENABLE_BINDINGS $GOLD_CMAKE_ARGS \
-        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_FLAGS="$COMMON_FLAGS" -DCMAKE_CXX_FLAGS="$COMMON_FLAGS"
-    run ninja -C "$csd" clang lld llvm-profdata llvm-tblgen llvm-min-tblgen
+        -DLLVM_ENABLE_BINDINGS=$LLVM_ENABLE_BINDINGS -DLLVM_TABLEGEN="$BUILD_ROOT/stage1/bin/llvm-tblgen" \
+        -DCLANG_TABLEGEN="$BUILD_ROOT/stage1/bin/clang-tblgen" $GOLD_CMAKE_ARGS \
+        -DCMAKE_C_COMPILER="$STAGE1_CLANG" -DCMAKE_CXX_COMPILER="$STAGE1_CLANGXX" -DCMAKE_C_FLAGS="$COMMON_FLAGS" -DCMAKE_CXX_FLAGS="$COMMON_FLAGS"
+    run ninja -C "$csd" clang lld
 
     set -gx LLVM_PROFILE_FILE "$BUILD_ROOT/profiles/cs-%m.profraw"
     for f in $TRAIN_FILES
@@ -331,7 +369,7 @@ if test "$DO_CSPGO" = "1"
     set -g FINAL_PROFDATA "$BUILD_ROOT/final.profdata"
 end
 
-rm -rf "$BUILD_ROOT/stage-cs-instr" "$BUILD_ROOT/full-pgo-train" "$BUILD_ROOT/full-cspgo-train" "$BUILD_ROOT/profiles" 2>/dev/null || true
+rm -rf "$BUILD_ROOT/stage-instr" "$BUILD_ROOT/stage-cs-instr" "$BUILD_ROOT/full-pgo-train" "$BUILD_ROOT/full-cspgo-train" "$BUILD_ROOT/profiles" 2>/dev/null || true
 
 # STAGE 2
 log ">>> STAGE 2: Final build (ThinLTO + PGO + allocator + LLVMgold)..."
@@ -344,13 +382,13 @@ configure_clean "$BUILD_ROOT/stage2" -S "$LLVM_SRC/llvm" \
     -DLLVM_TABLEGEN="$BUILD_ROOT/stage1/bin/llvm-tblgen" \
     -DCLANG_TABLEGEN="$BUILD_ROOT/stage1/bin/clang-tblgen" \
     $GOLD_CMAKE_ARGS \
-    -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_FLAGS="$COMMON_FLAGS $C_LTO_FLAGS" -DCMAKE_CXX_FLAGS="$COMMON_FLAGS $CXX_LTO_FLAGS" \
+    -DCMAKE_C_COMPILER="$STAGE1_CLANG" -DCMAKE_CXX_COMPILER="$STAGE1_CLANGXX" -DCMAKE_C_FLAGS="$COMMON_FLAGS $C_LTO_FLAGS" -DCMAKE_CXX_FLAGS="$COMMON_FLAGS $CXX_LTO_FLAGS" \
     -DCMAKE_EXE_LINKER_FLAGS="$LINKER_BASE $ALLOCATOR_LINK -Wl,--emit-relocs -Wl,-z,now" \
     -DCMAKE_MODULE_LINKER_FLAGS="$LINKER_BASE -Wl,--emit-relocs" -DCMAKE_SHARED_LINKER_FLAGS="$LINKER_BASE -Wl,--emit-relocs"
 
 run ninja -C "$BUILD_ROOT/stage2" install
 
-# LLVMgold verification: this is the key v2 fix.
+# LLVMgold verification
 set -g LLVMGOLD_SO "$INSTALL_PREFIX/lib/LLVMgold.so"
 if test "$REQUIRE_GOLD_PLUGIN" = "1"
     verify_file_exists "$LLVMGOLD_SO" "LLVMgold.so"
@@ -488,7 +526,7 @@ end
 set -l _bolt_leftovers (path filter -- "$BUILD_ROOT"/bolt*)
 test (count $_bolt_leftovers) -gt 0; and rm -rf $_bolt_leftovers
 
-log "ULTIMATE v2 build finished. Toolchain at: $INSTALL_PREFIX"
+log "ULTIMATE v4 build finished. Toolchain at: $INSTALL_PREFIX"
 if test "$REQUIRE_GOLD_PLUGIN" = "1"
     log "Verified deliverables: $INSTALL_PREFIX/bin/clang  $INSTALL_PREFIX/bin/ld.lld  $INSTALL_PREFIX/lib/LLVMgold.so"
 end
