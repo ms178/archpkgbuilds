@@ -1,102 +1,67 @@
-From 05ad86e510232cc6c7c9963cb586c37a78e63b25 Mon Sep 17 00:00:00 2001
-From: Fangrui Song <i@maskray.me>
-Date: Sat, 27 Jun 2026 21:14:54 -0700
-Subject: [PATCH] [SmallPtrSet] Optimize Grow and inline FindBucketFor. NFC
-
-During rehashing every key is known absent, so skip the equal-key comparison.
-DenseMap got a similar optimization in #200595
-
-FindBucketFor is then only used by insert_imp_big; inline its probe loop
-there. The loop takes 7 inst instead of 9 in the clang-generated
-assembly after removing the two `LLVM_LIKELY`.
----
- llvm/include/llvm/ADT/SmallPtrSet.h |  1 -
- llvm/lib/Support/SmallPtrSet.cpp    | 46 ++++++++++++++---------------
- 2 files changed, 22 insertions(+), 25 deletions(-)
-
-diff --git a/llvm/include/llvm/ADT/SmallPtrSet.h b/llvm/include/llvm/ADT/SmallPtrSet.h
-index d7b4bbf6bd64f..d685279d3c31b 100644
---- a/llvm/include/llvm/ADT/SmallPtrSet.h
-+++ b/llvm/include/llvm/ADT/SmallPtrSet.h
-@@ -245,7 +245,6 @@ class SmallPtrSetImplBase : public DebugEpochBase {
-   LLVM_ABI std::pair<const void *const *, bool> insert_imp_big(const void *Ptr);
- 
-   LLVM_ABI const void *const *doFind(const void *Ptr) const;
--  const void *const *FindBucketFor(const void *Ptr) const;
-   LLVM_ABI void shrink_and_clear();
- 
- protected:
-diff --git a/llvm/lib/Support/SmallPtrSet.cpp b/llvm/lib/Support/SmallPtrSet.cpp
-index d8e66b9c89c74..265b8eba4076d 100644
---- a/llvm/lib/Support/SmallPtrSet.cpp
-+++ b/llvm/lib/Support/SmallPtrSet.cpp
-@@ -44,16 +44,21 @@ SmallPtrSetImplBase::insert_imp_big(const void *Ptr) {
-     Grow(CurArraySize < 64 ? 128 : CurArraySize * 2);
-   }
- 
--  // Okay, we know we have space.  Find a hash bucket.
--  const void **Bucket = const_cast<const void**>(FindBucketFor(Ptr));
--  if (*Bucket == Ptr)
--    return {Bucket, false}; // Already inserted, good.
-+  // Find the first empty bucket or Ptr itself on the probe chain.
-+  unsigned Mask = CurArraySize - 1;
-+  unsigned I = DenseMapInfo<void *>::getHashValue(Ptr) & Mask;
-+  const void **Array = CurArray;
-+  while (Array[I] != getEmptyMarker()) {
-+    if (Array[I] == Ptr)
-+      return {Array + I, false};
-+    I = (I + 1) & Mask;
-+  }
- 
--  // Otherwise, insert it.
-+  // Insert into the empty bucket.
-   ++NumEntries;
--  *Bucket = Ptr;
-+  Array[I] = Ptr;
-   incrementEpoch();
--  return {Bucket, true};
-+  return {Array + I, true};
+diff --git a/llvm/lib/Target/X86/X86InstrArithmetic.td b/llvm/lib/Target/X86/X86InstrArithmetic.td
+index c91600525..2276c736f 100644
+--- a/llvm/lib/Target/X86/X86InstrArithmetic.td
++++ b/llvm/lib/Target/X86/X86InstrArithmetic.td
+@@ -1394,6 +1394,14 @@ defm ANDN64 : AndN<Xi64, null_frag, "_NF">, EVEX, EVEX_NF, Requires<[In64BitMode
  }
  
- const void *const *SmallPtrSetImplBase::doFind(const void *Ptr) const {
-@@ -69,19 +74,6 @@ const void *const *SmallPtrSetImplBase::doFind(const void *Ptr) const {
-   }
- }
+ multiclass Andn_Pats<string suffix> {
++  // ANDN has only GR32/GR64 forms; widen i8 inputs to i32 and extract the low
++  // byte. Upper bits are ignored by the result extraction.
++  def : Pat<(and (not GR8:$src1), GR8:$src2),
++            (EXTRACT_SUBREG
++              (!cast<Instruction>(ANDN32rr#suffix)
++                (INSERT_SUBREG (i32 (IMPLICIT_DEF)), GR8:$src1, sub_8bit),
++                (INSERT_SUBREG (i32 (IMPLICIT_DEF)), GR8:$src2, sub_8bit)),
++              sub_8bit)>;
+   def : Pat<(and (not GR32:$src1), GR32:$src2),
+             (!cast<Instruction>(ANDN32rr#suffix) GR32:$src1, GR32:$src2)>;
+   def : Pat<(and (not GR64:$src1), GR64:$src2),
+diff --git a/llvm/lib/Target/X86/X86LoadValueInjectionLoadHardening.cpp b/llvm/lib/Target/X86/X86LoadValueInjectionLoadHardening.cpp
+index 871081e32..43918ee6d 100644
+--- a/llvm/lib/Target/X86/X86LoadValueInjectionLoadHardening.cpp
++++ b/llvm/lib/Target/X86/X86LoadValueInjectionLoadHardening.cpp
+@@ -365,9 +365,9 @@ X86LoadValueInjectionLoadHardeningImpl::getGadgetGraph(
+           rdf::NodeSet Uses;
+           RegisterRef DefReg = Def.Addr->getRegRef(DFG);
+           for (auto UseID : L.getAllReachedUses(DefReg, Def)) {
+-            auto Use = DFG.addr<UseNode *>(UseID);
+-            if (Use.Addr->getFlags() & NodeAttrs::PhiRef) { // phi node
+-              NodeAddr<PhiNode *> Phi = Use.Addr->getOwner(DFG);
++            auto UseNodeAddr = DFG.addr<UseNode *>(UseID);
++            if (UseNodeAddr.Addr->getFlags() & NodeAttrs::PhiRef) { // phi node
++              NodeAddr<PhiNode *> Phi = UseNodeAddr.Addr->getOwner(DFG);
+               for (const auto& I : L.getRealUses(Phi.Id)) {
+                 if (DFG.getPRI().alias(RegisterRef(I.first), DefReg)) {
+                   for (const auto &UA : I.second)
+@@ -386,9 +386,9 @@ X86LoadValueInjectionLoadHardeningImpl::getGadgetGraph(
+             if (!UsesVisited.insert(UseID).second)
+               continue; // Already visited this use of `Def`
  
--const void *const *SmallPtrSetImplBase::FindBucketFor(const void *Ptr) const {
--  unsigned Mask = CurArraySize - 1;
--  unsigned Bucket = DenseMapInfo<void *>::getHashValue(Ptr) & Mask;
--  const void *const *Array = CurArray;
--  while (true) {
--    if (LLVM_LIKELY(Array[Bucket] == getEmptyMarker()))
--      return Array + Bucket;
--    if (LLVM_LIKELY(Array[Bucket] == Ptr))
--      return Array + Bucket;
--    Bucket = (Bucket + 1) & Mask;
--  }
--}
--
- void SmallPtrSetImplBase::eraseFromBucket(const void **Bucket) {
-   // Knuth TAOCP 6.4 Algorithm R: walk forward sliding each following entry
-   // whose probe path crosses the hole.
-@@ -114,10 +106,16 @@ void SmallPtrSetImplBase::Grow(unsigned NewSize) {
-   memset(CurArray, -1, NewSize*sizeof(void*));
+-            auto Use = DFG.addr<UseNode *>(UseID);
+-            assert(!(Use.Addr->getFlags() & NodeAttrs::PhiRef));
+-            MachineOperand &UseMO = Use.Addr->getOp();
++            auto UseNodeAddr = DFG.addr<UseNode *>(UseID);
++            assert(!(UseNodeAddr.Addr->getFlags() & NodeAttrs::PhiRef));
++            MachineOperand &UseMO = UseNodeAddr.Addr->getOp();
+             MachineInstr &UseMI = *UseMO.getParent();
+             assert(UseMO.isReg());
  
-   // Copy over all valid entries.
--  for (const void *&Bucket : OldBuckets) {
--    // Copy over the element if it is valid.
--    if (Bucket != getEmptyMarker())
--      *const_cast<void **>(FindBucketFor(Bucket)) = const_cast<void *>(Bucket);
-+  unsigned Mask = CurArraySize - 1;
-+  for (const void *Ptr : OldBuckets) {
-+    if (Ptr == getEmptyMarker())
-+      continue;
-+    // Find the first empty bucket on this key's probe chain; there is no equal
-+    // key, so nothing to compare against.
-+    unsigned I = DenseMapInfo<void *>::getHashValue(Ptr) & Mask;
-+    while (NewBuckets[I] != getEmptyMarker())
-+      I = (I + 1) & Mask;
-+    NewBuckets[I] = Ptr;
-   }
+@@ -403,7 +403,7 @@ X86LoadValueInjectionLoadHardeningImpl::getGadgetGraph(
+             if (instrUsesRegToAccessMemory(UseMI, UseMO.getReg()) ||
+                 (!NoConditionalBranches &&
+                  instrUsesRegToBranch(UseMI, UseMO.getReg()))) {
+-              Transmitters[Def.Id].push_back(Use.Addr->getOwner(DFG).Id);
++              Transmitters[Def.Id].push_back(UseNodeAddr.Addr->getOwner(DFG).Id);
+               if (UseMI.mayLoad())
+                 continue; // Found a transmitting load -- no need to continue
+                           // traversing its defs (i.e., this load will become
+@@ -411,7 +411,7 @@ X86LoadValueInjectionLoadHardeningImpl::getGadgetGraph(
+             }
  
-   if (!WasSmall)
+             // Check whether the use propagates to more defs.
+-            NodeAddr<InstrNode *> Owner{Use.Addr->getOwner(DFG)};
++            NodeAddr<InstrNode *> Owner{UseNodeAddr.Addr->getOwner(DFG)};
+             for (const auto &ChildDef :
+                  Owner.Addr->members_if(DataFlowGraph::IsDef, DFG)) {
+               if (!DefsVisited.insert(ChildDef.Id).second)
