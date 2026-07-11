@@ -1,14 +1,24 @@
 # Maintainer: Maxime Gauduin <alucryd@archlinux.org>
 # Contributor: Bartłomiej Piotrowski <bpiotrowski@archlinux.org>
 # Contributor: Ionut Biru <ibiru@archlinux.org>
+#
+# Clang IR-PGO + CS-PGO + LLVM BOLT. The PGO workload is deliberately
+# hardware-independent: it exercises the VA-API core and all enabled display
+# backends through a small public-API harness, and additionally uses vainfo
+# when a real VA display/driver is available on the build host.
+#
+# The compiler, archiver and BOLT/profile tools remain the active LLVM
+# toolchain. GNU ld.bfd is used deliberately as the linker because LLD emits
+# versioned-symbol aliases that LLVM BOLT cannot reliably consume for libva.so.
 
 pkgname=libva
-pkgver=2.24.0
-pkgrel=2.1
-pkgdesc='Video Acceleration (VA) API for Linux'
+pkgver=2.24.1
+pkgrel=3.4
+pkgdesc='Video Acceleration (VA) API for Linux (Clang PGO + CS-PGO + BOLT optimized)'
 arch=(x86_64)
-url=https://01.org/linuxmedia/vaapi
+url='https://01.org/linuxmedia/vaapi'
 license=(MIT)
+
 depends=(
   libdrm
   libgl
@@ -17,49 +27,749 @@ depends=(
   libxfixes
   wayland
 )
+
 makedepends=(
+  binutils
   git
   libglvnd
+  libva-utils
+  libxcb
   mesa
   meson
+  ninja
+  pkgconf
 )
+
 optdepends=(
   'intel-media-driver: backend for Intel GPUs (>= Broadwell)'
   'libva-intel-driver: backend for Intel GPUs (<= Haswell)'
   'libva-mesa-driver: backend for AMD and Nvidia GPUs'
 )
+
 provides=(
-  libva-drm.so
-  libva-glx.so
-  libva-wayland.so
-  libva-x11.so
-  libva.so
+  'libva-drm.so=2-64'
+  'libva-glx.so=2-64'
+  'libva-wayland.so=2-64'
+  'libva-x11.so=2-64'
+  'libva.so=2-64'
 )
+
 backup=(etc/libva.conf)
 options=(strip)
 source=(git+https://github.com/intel/libva.git#tag=${pkgver})
 sha256sums=(SKIP)
 
 pkgver() {
-  cd libva
+  cd "${srcdir}/libva"
   git describe --tags | sed 's/[^-]*-g/r&/;s/-/+/g'
 }
 
+# Resolve the active LLVM compiler/tool suite from PATH. The linker is the
+# intentional exception: BOLT requires GNU ld.bfd for libva's versioned
+# compatibility symbols, while clang, LLVM binutils, profdata and BOLT all
+# continue to come from the active llvm-ultimate toolchain.
+_setup_llvm() {
+  # Do not guess an llvm-ultimate prefix. The active clang/LLVM tools come
+  # from the environment/PATH; only the requested BFD linker is selected here.
+  _resolve_tool() {
+    local _value="$1"
+    if [[ "${_value}" == */* ]]; then
+      printf '%s\n' "${_value}"
+    else
+      command -v "${_value}"
+    fi
+  }
+
+  export CC="$(_resolve_tool "${CC:-clang}")"
+  export CXX="$(_resolve_tool "${CXX:-clang++}")"
+  export AR="$(_resolve_tool "${AR:-llvm-ar}")"
+  export NM="$(_resolve_tool "${NM:-llvm-nm}")"
+  export RANLIB="$(_resolve_tool "${RANLIB:-llvm-ranlib}")"
+  export STRIP="$(_resolve_tool "${STRIP:-llvm-strip}")"
+  export OBJCOPY="$(_resolve_tool "${OBJCOPY:-llvm-objcopy}")"
+  export OBJDUMP="$(_resolve_tool "${OBJDUMP:-llvm-objdump}")"
+  export READELF="$(_resolve_tool "${READELF:-llvm-readelf}")"
+
+  # Force BFD even if makepkg or the caller exported LD=ld.lld. The optional
+  # LIBVA_BFD_LD variable may name a wrapper or a non-default ld.bfd, but the
+  # default is resolved through PATH and never hard-coded to a user prefix.
+  export LD="$(_resolve_tool "${LIBVA_BFD_LD:-ld.bfd}")"
+  export LLVM_PROFDATA="$(_resolve_tool "${LLVM_PROFDATA:-llvm-profdata}")"
+  export LLVM_BOLT="$(_resolve_tool "${LLVM_BOLT:-llvm-bolt}")"
+  export MERGE_FDATA="$(_resolve_tool "${MERGE_FDATA:-merge-fdata}")"
+
+  local _tool
+  for _tool in "$CC" "$CXX" "$AR" "$NM" "$RANLIB" "$STRIP" "$OBJCOPY" \
+      "$OBJDUMP" "$READELF" "$LD" "$LLVM_PROFDATA" "$LLVM_BOLT" "$MERGE_FDATA"; do
+    [[ -n "$_tool" && -x "$_tool" ]] || {
+      error "required active LLVM tool missing: ${_tool:-<unset>}"
+      return 1
+    }
+  done
+
+  msg2 "active LLVM bin: $(dirname "${CC}")"
+  msg2 "clang: $CC"
+  msg2 "linker: $LD (GNU BFD, intentional for BOLT)"
+  msg2 "llvm-profdata: $LLVM_PROFDATA"
+  msg2 "llvm-bolt: $LLVM_BOLT"
+}
+
+_sanitize_link_flags() {
+  # CFLAGS/CXXFLAGS are never rewritten. This only removes compiler/backend
+  # switches that are malformed when inherited as -Wl,<pass> in LDFLAGS.
+  local _flags="$1"
+  local -a _in _out _wl _kept
+  local _flag _part _joined
+  read -r -a _in <<< "$_flags"
+  for _flag in "${_in[@]}"; do
+    case "$_flag" in
+      -Wl,*)
+        IFS=',' read -r -a _wl <<< "${_flag#-Wl,}"
+        _kept=()
+        for _part in "${_wl[@]}"; do
+          case "$_part" in
+            -extra-vectorizer-passes|-slp-*|-enable-*|-aggressive-ext-opt \
+            |-adce-*|-unroll-*|-interleaved-*|-masked-interleaved-* \
+            |-loop*|-gvn-*|-dfa-*|-polly*|-inline-*|-vp-*|-mllvm)
+              continue
+              ;;
+          esac
+          _kept+=("$_part")
+        done
+        if (( ${#_kept[@]} > 0 )); then
+          _joined="$(IFS=,; printf '%s' "${_kept[*]}")"
+          _out+=("-Wl,${_joined}")
+        fi
+        ;;
+      *)
+        _out+=("$_flag")
+        ;;
+    esac
+  done
+  printf '%s' "${_out[*]}"
+}
+
+_meson_common_args() {
+  _meson_args=(
+    --buildtype=plain
+    --prefix=/usr
+    -Db_ndebug=true
+    -Db_pie=false
+    -Dc_std=gnu2x
+    -Dcpp_std=gnu++2a
+    -Ddriverdir=/usr/lib/dri
+    --wrap-mode=nofallback
+    -Ddisable_drm=false
+    # Build every Linux backend explicitly; the workload and provides list
+    # cover DRM, X11/GLX and Wayland.
+    -Dwith_x11=yes
+    -Dwith_glx=yes
+    -Dwith_wayland=yes
+    -Dwith_win32=no
+    -Denable_docs=false)
+}
+
+_meson_setup() {
+  local _builddir="$1"
+  local _compile_extra="$2"
+  local _link_extra="$3"
+  local _source="${srcdir}/libva"
+  local _link_flags="$(_sanitize_link_flags "${LDFLAGS:-}")"
+  # Put this after inherited flags so an exported -fuse-ld=lld cannot win.
+  local _bfd_linker='-fuse-ld=bfd'
+
+  _meson_common_args
+  rm -rf "${_builddir}"
+
+  env CC="$CC" CXX="$CXX" AR="$AR" NM="$NM" RANLIB="$RANLIB" \
+    STRIP="$STRIP" OBJCOPY="$OBJCOPY" OBJDUMP="$OBJDUMP" READELF="$READELF" \
+    LD="$LD" meson setup "${_builddir}" "${_source}" \
+    "${_meson_args[@]}" \
+    -Dc_args="${CFLAGS} ${_compile_extra}" \
+    -Dcpp_args="${CXXFLAGS} ${_compile_extra}" \
+    -Dc_link_args="${_link_flags} ${_link_extra} ${_bfd_linker}" \
+    -Dcpp_link_args="${_link_flags} ${_link_extra} ${_bfd_linker}"
+}
+
+_collect_profraw() {
+  local _dir="$1"
+  local -n _out="$2"
+  _out=()
+  while IFS= read -r -d '' _file; do
+    _out+=("$_file")
+  done < <(find "$_dir" -type f -name '*.profraw' -print0)
+  (( ${#_out[@]} > 0 )) || {
+    error "no profraw files were generated in $_dir"
+    return 1
+  }
+}
+
+_write_workload() {
+  cat > "${srcdir}/libva-pgo-workload.c" <<'EOF'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <glob.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <va/va.h>
+#include <va/va_drm.h>
+#include <va/va_glx.h>
+#include <va/va_wayland.h>
+#include <va/va_x11.h>
+#include <xf86drm.h>
+#include <X11/Xlib.h>
+#include <wayland-client.h>
+
+static unsigned calls;
+static unsigned successes;
+
+static void record_status(const char *what, VAStatus st) {
+  ++calls;
+  if (st == VA_STATUS_SUCCESS) ++successes;
+  if (getenv("LIBVA_PGO_VERBOSE"))
+    fprintf(stderr, "%-36s: %s (%d)\n", what, vaErrorStr(st), st);
+}
+
+static void exercise_invalid_api(void) {
+  int major = 0, minor = 0;
+  VAConfigAttrib attrs[VAConfigAttribTypeMax];
+  VAProfile profiles[8];
+  VAEntrypoint entries[8];
+  VASurfaceID surfaces[2] = { VA_INVALID_SURFACE, VA_INVALID_SURFACE };
+  VAStatus st;
+
+  (void)vaDisplayIsValid(NULL);
+  (void)vaGetDisplayDRM(-1);
+  (void)vaGetDisplay(NULL);
+  (void)vaGetDisplayGLX(NULL);
+  (void)vaQueryVendorString(NULL);
+  (void)vaMaxNumProfiles(NULL);
+  (void)vaMaxNumEntrypoints(NULL);
+  (void)vaMaxNumConfigAttributes(NULL);
+  (void)vaSetErrorCallback(NULL, NULL, NULL);
+  (void)vaSetInfoCallback(NULL, NULL, NULL);
+  st = vaInitialize(NULL, &major, &minor); record_status("invalid vaInitialize", st);
+  st = vaTerminate(NULL); record_status("invalid vaTerminate", st);
+  st = vaQueryConfigProfiles(NULL, profiles, NULL); record_status("invalid profiles", st);
+  st = vaQueryConfigEntrypoints(NULL, VAProfileNone, entries, NULL); record_status("invalid entrypoints", st);
+  st = vaGetConfigAttributes(NULL, VAProfileNone, VAEntrypointVLD, attrs, 0); record_status("invalid attributes", st);
+  st = vaCreateSurfaces(NULL, VA_RT_FORMAT_YUV420, 64, 64, surfaces, 2, NULL, 0); record_status("invalid surfaces", st);
+}
+
+static void exercise_display(VADisplay dpy, const char *name) {
+  int major = 0, minor = 0;
+  VAStatus st;
+  int np, ne, na;
+  VAProfile *profiles = NULL;
+  VAEntrypoint *entries = NULL;
+  VAConfigAttrib *attrs = NULL;
+  int nformats = vaMaxNumImageFormats(dpy);
+  if (nformats > 0) {
+    VAImageFormat *formats = calloc((size_t)nformats, sizeof(*formats));
+    if (formats) {
+      int got_formats = nformats;
+      record_status("vaQueryImageFormats", vaQueryImageFormats(dpy, formats, &got_formats));
+      free(formats);
+    }
+  }
+
+  if (!dpy) return;
+  st = vaInitialize(dpy, &major, &minor);
+  record_status(name, st);
+  if (st != VA_STATUS_SUCCESS) return;
+
+  (void)vaSetErrorCallback(dpy, NULL, NULL);
+  (void)vaSetInfoCallback(dpy, NULL, NULL);
+  (void)vaQueryVendorString(dpy);
+  (void)vaMaxNumSubpictureFormats(dpy);
+  int ndattrs = vaMaxNumDisplayAttributes(dpy);
+  if (ndattrs > 0) {
+    VADisplayAttribute *dattrs = calloc((size_t)ndattrs, sizeof(*dattrs));
+    if (dattrs) {
+      int got = ndattrs;
+      record_status("vaQueryDisplayAttributes", vaQueryDisplayAttributes(dpy, dattrs, &got));
+      free(dattrs);
+    }
+  }
+
+  np = vaMaxNumProfiles(dpy);
+  ne = vaMaxNumEntrypoints(dpy);
+  na = vaMaxNumConfigAttributes(dpy);
+  if (np <= 0 || ne <= 0 || na <= 0) goto done;
+
+  profiles = calloc((size_t)np, sizeof(*profiles));
+  entries = calloc((size_t)ne, sizeof(*entries));
+  attrs = calloc((size_t)na, sizeof(*attrs));
+  if (!profiles || !entries || !attrs) goto done;
+
+  int nprofiles = 0;
+  st = vaQueryConfigProfiles(dpy, profiles, &nprofiles);
+  record_status("vaQueryConfigProfiles", st);
+  if (st != VA_STATUS_SUCCESS) goto done;
+
+  for (int pi = 0; pi < nprofiles; ++pi) {
+    int nentries = 0;
+    st = vaQueryConfigEntrypoints(dpy, profiles[pi], entries, &nentries);
+    record_status("vaQueryConfigEntrypoints", st);
+    if (st != VA_STATUS_SUCCESS) continue;
+
+    for (int ei = 0; ei < nentries; ++ei) {
+      for (int ai = 0; ai < na; ++ai) {
+        attrs[ai].type = (VAConfigAttribType)ai;
+        attrs[ai].value = VA_ATTRIB_NOT_SUPPORTED;
+      }
+      st = vaGetConfigAttributes(dpy, profiles[pi], entries[ei], attrs, na);
+      record_status("vaGetConfigAttributes", st);
+      if (st != VA_STATUS_SUCCESS) continue;
+
+      VAConfigID config = VA_INVALID_ID;
+      st = vaCreateConfig(dpy, profiles[pi], entries[ei], attrs, na, &config);
+      record_status("vaCreateConfig", st);
+      if (st != VA_STATUS_SUCCESS) continue;
+
+      unsigned nsurfattrs = 0;
+      st = vaQuerySurfaceAttributes(dpy, config, NULL, &nsurfattrs);
+      record_status("vaQuerySurfaceAttributes(size)", st);
+      if (st == VA_STATUS_SUCCESS && nsurfattrs) {
+        VASurfaceAttrib *sa = calloc(nsurfattrs, sizeof(*sa));
+        if (sa) {
+          st = vaQuerySurfaceAttributes(dpy, config, sa, &nsurfattrs);
+          record_status("vaQuerySurfaceAttributes", st);
+          free(sa);
+        }
+      }
+
+      VASurfaceID surfaces[4] = { VA_INVALID_SURFACE, VA_INVALID_SURFACE,
+                                  VA_INVALID_SURFACE, VA_INVALID_SURFACE };
+      st = vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, 64, 64, surfaces, 4, NULL, 0);
+      record_status("vaCreateSurfaces", st);
+      if (st == VA_STATUS_SUCCESS) {
+        int image_count = vaMaxNumImageFormats(dpy);
+        if (image_count > 0) {
+          VAImageFormat *image_formats = calloc((size_t)image_count, sizeof(*image_formats));
+          if (image_formats) {
+            int got_images = image_count;
+            if (vaQueryImageFormats(dpy, image_formats, &got_images) == VA_STATUS_SUCCESS && got_images > 0) {
+              VAImage image = {0};
+              image.image_id = VA_INVALID_ID;
+              record_status("vaCreateImage", vaCreateImage(dpy, &image_formats[0], 64, 64, &image));
+              if (image.image_id != VA_INVALID_ID)
+                record_status("vaDestroyImage", vaDestroyImage(dpy, image.image_id));
+            }
+            free(image_formats);
+          }
+        }
+        VAContextID context = VA_INVALID_ID;
+        st = vaCreateContext(dpy, config, 64, 64, VA_PROGRESSIVE, surfaces, 4, &context);
+        record_status("vaCreateContext", st);
+        if (st == VA_STATUS_SUCCESS) {
+          unsigned char payload[256] = {0};
+          VABufferID buffer = VA_INVALID_ID;
+          st = vaCreateBuffer(dpy, context, VAEncMiscParameterBufferType,
+                              sizeof(payload), 1, payload, &buffer);
+          record_status("vaCreateBuffer", st);
+          st = vaBeginPicture(dpy, context, surfaces[0]);
+          record_status("vaBeginPicture", st);
+          if (buffer != VA_INVALID_ID)
+            record_status("vaRenderPicture", vaRenderPicture(dpy, context, &buffer, 1));
+          record_status("vaEndPicture", vaEndPicture(dpy, context));
+          record_status("vaSyncSurface", vaSyncSurface(dpy, surfaces[0]));
+          if (buffer != VA_INVALID_ID)
+            record_status("vaDestroyBuffer", vaDestroyBuffer(dpy, buffer));
+          record_status("vaDestroyContext", vaDestroyContext(dpy, context));
+        }
+        record_status("vaDestroySurfaces", vaDestroySurfaces(dpy, surfaces, 4));
+      }
+      record_status("vaDestroyConfig", vaDestroyConfig(dpy, config));
+    }
+  }
+
+done:
+  free(profiles);
+  free(entries);
+  free(attrs);
+  record_status("vaTerminate", vaTerminate(dpy));
+  fprintf(stderr, "%s: VA %d.%d, calls=%u successes=%u\n",
+          name, major, minor, calls, successes);
+}
+
+static void exercise_drm(void) {
+  char path[64];
+  for (int n = 128; n < 160; ++n) {
+    snprintf(path, sizeof(path), "/dev/dri/renderD%d", n);
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) continue;
+    char label[96];
+    snprintf(label, sizeof(label), "DRM %s", path);
+    exercise_display(vaGetDisplayDRM(fd), label);
+    close(fd);
+  }
+}
+
+static void exercise_x11(void) {
+  const char *display = getenv("DISPLAY");
+  if (!display) return;
+  Display *xdpy = XOpenDisplay(display);
+  if (!xdpy) return;
+  exercise_display(vaGetDisplay(xdpy), "X11 display");
+  XCloseDisplay(xdpy);
+}
+
+static void exercise_wayland(void) {
+  if (!getenv("WAYLAND_DISPLAY")) return;
+  struct wl_display *wdpy = wl_display_connect(NULL);
+  if (!wdpy) return;
+  exercise_display(vaGetDisplayWl(wdpy), "Wayland display");
+  wl_display_disconnect(wdpy);
+}
+
+int main(void) {
+  exercise_invalid_api();
+  exercise_drm();
+  exercise_x11();
+  exercise_wayland();
+  fprintf(stderr, "VA workload complete: calls=%u successes=%u\n", calls, successes);
+  return 0;
+}
+EOF
+}
+
+_find_install_libdir() {
+  local _root="$1"
+  find "${_root}/usr" -type f -name 'libva.so.2.*' -printf '%h\n' -quit
+}
+
+_build_workload() {
+  local _install="$1"
+  local _output="$2"
+  local _compile_extra="${3:-}"
+  local _link_extra="${4:-}"
+  local _libdir
+  _libdir="$(_find_install_libdir "${_install}")"
+  [[ -n "${_libdir}" ]] || { error "libva.so.2 was not found under ${_install}"; return 1; }
+  local -a _cflags _ldflags _dep_cflags _dep_libs _libs=(-lva -ldl)
+  local _lib _link_flags
+
+  read -r -a _cflags <<< "${CFLAGS:-} ${_compile_extra}"
+  _link_flags="$(_sanitize_link_flags "${LDFLAGS:-}")"
+  read -r -a _ldflags <<< "${_link_flags} ${_link_extra}"
+  # Keep the workload executable on the same BFD path as the profiled DSOs.
+  _ldflags+=( -fuse-ld=bfd )
+  read -r -a _dep_cflags <<< "$(pkg-config --cflags libdrm x11 wayland-client)"
+  read -r -a _dep_libs <<< "$(pkg-config --libs libdrm x11 wayland-client)"
+  for _lib in libva-drm libva-x11 libva-glx libva-wayland; do
+    [[ -e "${_libdir}/${_lib}.so" ]] && _libs+=("-l${_lib#lib}")
+  done
+
+  "${CC}" "${_cflags[@]}" "${_dep_cflags[@]}" -pthread \
+    -I"${_install}/usr/include" \
+    "${srcdir}/libva-pgo-workload.c" \
+    "${_ldflags[@]}" -L"${_libdir}" -Wl,-rpath,"${_libdir}" \
+    "${_libs[@]}" "${_dep_libs[@]}" -o "${_output}"
+}
+
+_run_vainfo() {
+  local _libpath="$1"
+  local _node _driver
+  [[ -x "$(command -v vainfo 2>/dev/null || true)" ]] || return 0
+
+  # Explicitly exercise radeonsi for Vega/RDNA-era AMD systems, in addition
+  # to the driver's normal auto-selection path. Use every render node instead
+  # of assuming renderD128 is the active GPU.
+  local -a _nodes=()
+  while IFS= read -r -d '' _node; do
+    _nodes+=("$_node")
+  done < <(find /dev/dri -maxdepth 1 -type c -name 'renderD*' -print0 2>/dev/null)
+  for _node in "${_nodes[@]}"; do
+    for _driver in '' radeonsi; do
+      local -a _env=(LD_LIBRARY_PATH="${_libpath}" LIBVA_DRIVERS_PATH=/usr/lib/dri)
+      [[ -n "$_driver" ]] && _env+=(LIBVA_DRIVER_NAME="$_driver")
+      timeout 30s env "${_env[@]}" vainfo --display drm --device "$_node" \
+        >/dev/null 2>&1 || true
+    done
+  done
+
+  if [[ -n "${DISPLAY:-}" ]]; then
+    for _driver in '' radeonsi; do
+      local -a _env=(LD_LIBRARY_PATH="${_libpath}" LIBVA_DRIVERS_PATH=/usr/lib/dri)
+      [[ -n "$_driver" ]] && _env+=(LIBVA_DRIVER_NAME="$_driver")
+      timeout 30s env "${_env[@]}" vainfo --display x11 \
+        >/dev/null 2>&1 || true
+      timeout 30s env LIBVA_DRI3_DISABLE=1 "${_env[@]}" vainfo --display x11 \
+        >/dev/null 2>&1 || true
+    done
+  fi
+  if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    for _driver in '' radeonsi; do
+      local -a _env=(LD_LIBRARY_PATH="${_libpath}" LIBVA_DRIVERS_PATH=/usr/lib/dri)
+      [[ -n "$_driver" ]] && _env+=(LIBVA_DRIVER_NAME="$_driver")
+      timeout 30s env "${_env[@]}" vainfo --display wayland \
+        >/dev/null 2>&1 || true
+    done
+  fi
+}
+
+_run_workload() {
+  local _install="$1"
+  local _profile_dir="$2"
+  local _run_name="$3"
+  local _runtime_prefix="${4:-}"
+  local _workdir="${srcdir}/libva-workload-${_run_name}"
+  local _harness="${_workdir}/va-workload"
+  local _install_libdir="$(_find_install_libdir "${_install}")"
+  [[ -n "${_install_libdir}" ]] || { error "libva installation has no libva.so.2: ${_install}"; return 1; }
+  [[ -n "${_runtime_prefix}" ]] || _runtime_prefix="${_install_libdir}"
+  local _libpath="${_runtime_prefix}:${_install_libdir}"
+
+  rm -rf "${_workdir}"
+  mkdir -p "${_workdir}"
+  _build_workload "${_install}" "${_harness}" "${5:-}" "${6:-}" || return 1
+
+  local _env=(LD_LIBRARY_PATH="${_libpath}" LIBVA_DRIVERS_PATH=/usr/lib/dri)
+  if [[ -n "${_profile_dir}" ]]; then
+    mkdir -p "${_profile_dir}"
+    _env+=(LLVM_PROFILE_FILE="${_profile_dir}/%m-%p.profraw")
+  else
+    unset LLVM_PROFILE_FILE
+  fi
+
+  # Run both driver auto-selection and the AMD RadeonSI path explicitly.
+  # On a Vega 64 this makes the real radeonsi VA driver contribute to the
+  # profile instead of relying only on whatever driver LIBVA chooses.
+  local _driver _level
+  for _driver in '' radeonsi; do
+    local -a _run_env=("${_env[@]}")
+    [[ -n "$_driver" ]] && _run_env+=(LIBVA_DRIVER_NAME="$_driver")
+    for _level in 0 1 2; do
+      env "${_run_env[@]}" LIBVA_MESSAGING_LEVEL="$_level" \
+        LIBVA_PGO_VERBOSE=0 timeout 60s "${_harness}" >/dev/null 2>&1 || true
+    done
+    env "${_run_env[@]}" LIBVA_MESSAGING_LEVEL=1 \
+      LIBVA_PGO_VERBOSE=1 timeout 60s "${_harness}" >/dev/null 2>&1 || true
+  done
+  (
+    export LD_LIBRARY_PATH="${_libpath}"
+    export LIBVA_DRIVERS_PATH=/usr/lib/dri
+    _run_vainfo "${_libpath}"
+  ) || true
+}
+
+_bolt_optimize_libs() {
+  local _install="$1"
+  local _profile_dir="${srcdir}/libva-bolt-fdata"
+  local _out_dir="${srcdir}/libva-bolt-output"
+  local _bolt="$LLVM_BOLT" _merge="$MERGE_FDATA"
+  local _libdir="$(_find_install_libdir "${_install}")"
+  [[ -n "${_libdir}" ]] || { error "final libva installation has no shared library"; return 1; }
+  local _librel="${_libdir#${_install}/usr/}"
+  local _inst_dir="${srcdir}/libva-bolt-instrumented/usr/${_librel}"
+  local -a _libs=() _fdata=()
+  local _so _base _merged _out _backup _file
+  local _kept=0 _skipped=0
+
+  [[ -x "$_bolt" && -x "$_merge" ]] || {
+    error 'llvm-bolt and merge-fdata are required from llvm-ultimate'
+    return 1
+  }
+
+  while IFS= read -r -d '' _so; do
+    _libs+=("$_so")
+  done < <(find "$_libdir" -maxdepth 1 -type f -name 'libva*.so*' -print0 | sort -z)
+  (( ${#_libs[@]} > 0 )) || { error 'no libva shared libraries found for BOLT'; return 1; }
+  msg2 "BOLT candidates: ${#_libs[@]} real libva ELF files"
+
+  rm -rf "${srcdir}/libva-bolt-fdata" "${srcdir}/libva-bolt-instrumented" \
+    "${srcdir}/libva-bolt-output"
+  mkdir -p "${_profile_dir}" "${_inst_dir}" "${_out_dir}"
+
+  # Preserve all SONAME symlinks in the loader-first instrumentation tree.
+  for _file in "${_libdir}"/libva*.so*; do
+    [[ -L "$_file" ]] || continue
+    cp -a "$_file" "${_inst_dir}/"
+  done
+
+  local _help
+  _help="$("$_bolt" --help 2>&1; "$_bolt" --help-hidden 2>&1)"
+  local -a _inst_flags=(--instrument)
+  grep -q -- '--lite' <<<"$_help" && _inst_flags+=(--lite=false)
+  grep -q -- '--conservative-instrumentation' <<<"$_help" && \
+    _inst_flags+=(--conservative-instrumentation)
+
+  for _so in "${_libs[@]}"; do
+    _base="$(basename "$_so")"
+
+    # Do not pre-skip libva.so here. The active toolchain is authoritative:
+    # the user's LLVM-ultimate BOLT may understand the versioned compatibility
+    # symbols even when an older test BOLT did not. Attempt every real libva
+    # DSO, including the core library, exactly as the previous working recipe
+    # did. A failed attempt is counted once in the result pass below.
+    if ! "$_bolt" "$_so" "${_inst_flags[@]}" \
+      --instrumentation-file="${_profile_dir}/${_base}.fdata" \
+      --instrumentation-file-append-pid \
+      -o "${_inst_dir}/${_base}"; then
+      warning "BOLT instrumentation failed for ${_base}"
+      cp -a "$_so" "${_inst_dir}/${_base}"
+    fi
+  done
+
+  _run_workload "${_install}" "${_profile_dir}" bolt-profile "${_inst_dir}" '' '' || true
+
+  local -a _bolt_opts=(
+    --reorder-blocks=ext-tsp
+    --reorder-functions=cdsort
+    --split-functions
+    --split-all-cold
+    --dyno-stats
+    --update-debug-sections)
+  grep -q -- '--icf' <<<"$_help" && _bolt_opts+=(--icf=safe)
+  grep -q -- '--jump-tables' <<<"$_help" && _bolt_opts+=(--jump-tables=move)
+  grep -q -- '--peepholes' <<<"$_help" && _bolt_opts+=(--peepholes=all)
+  grep -q -- '--indirect-call-promotion' <<<"$_help" && \
+    _bolt_opts+=(--indirect-call-promotion=all)
+  grep -q -- '--use-gnu-stack' <<<"$_help" && _bolt_opts+=(--use-gnu-stack)
+
+  for _so in "${_libs[@]}"; do
+    _base="$(basename "$_so")"
+    _fdata=()
+    while IFS= read -r -d '' _file; do
+      [[ -s "$_file" ]] && _fdata+=("$_file")
+    done < <(find "${_profile_dir}" -maxdepth 1 -type f \
+      -name "${_base}.fdata*" -print0)
+    if (( ${#_fdata[@]} == 0 )); then
+      _skipped=$((_skipped + 1))
+      continue
+    fi
+
+    _merged="${_out_dir}/${_base}.merged.fdata"
+    "$_merge" "${_fdata[@]}" >"$_merged" || {
+      warning "BOLT profile merge failed for ${_base}"
+      _skipped=$((_skipped + 1))
+      continue
+    }
+    [[ -s "$_merged" ]] || { _skipped=$((_skipped + 1)); continue; }
+
+    _out="${_out_dir}/${_base}.bolt"
+    if ! "$_bolt" "$_so" --data="$_merged" "${_bolt_opts[@]}" -o "$_out"; then
+      warning "BOLT optimization failed for ${_base}"
+      _skipped=$((_skipped + 1))
+      continue
+    fi
+
+    _backup="${_out_dir}/${_base}.original"
+    cp -a "$_so" "$_backup"
+    install -m755 "$_out" "$_so"
+    if _run_workload "${_install}" '' "bolt-validate-${_base}" "${_libdir}" '' ''; then
+      _kept=$((_kept + 1))
+    else
+      warning "BOLT validation failed for ${_base}; restoring original"
+      install -m755 "$_backup" "$_so"
+      _skipped=$((_skipped + 1))
+    fi
+  done
+
+  rm -rf "${srcdir}/libva-bolt-fdata" "${srcdir}/libva-bolt-instrumented" \
+    "${srcdir}/libva-bolt-output"
+  msg2 "BOLT result: ${_kept} validated, ${_skipped} skipped/rolled back"
+  (( _kept > 0 )) || { error 'BOLT produced no validated libva backend library'; return 1; }
+}
+
 build() {
-  CFLAGS+=" -DENABLE_VA_MESSAGING"  # Option missing
-  arch-meson libva build \
-      -D b_ndebug=true \
-      -D b_pie=false \
-      -D c_std=gnu2x \
-      -D cpp_std=gnu++2a \
-      --buildtype=release
-  meson compile -C build
+  _setup_llvm
+  _write_workload
+
+  # Respect CFLAGS/CXXFLAGS/LDFLAGS from makepkg.conf verbatim. Only the
+  # profile-generation/use flags below are added by this PKGBUILD.
+  export CFLAGS="${CFLAGS:-}"
+  export CXXFLAGS="${CXXFLAGS:-}"
+
+  local _pgo_dir="${srcdir}/libva-pgo-raw"
+  local _cs_dir="${srcdir}/libva-cs-pgo-raw"
+  local _pgo_profdata="${srcdir}/libva-standard.profdata"
+  local _merged_profdata="${srcdir}/libva-merged.profdata"
+  local _pgo_install="${srcdir}/libva-pgo-install"
+  local _cs_install="${srcdir}/libva-cs-install"
+  local _final_install="${srcdir}/libva-final-install"
+  local _pgo_flags="-fprofile-generate=${_pgo_dir} -fprofile-update=atomic"
+  local _pgo_link="-fprofile-generate=${_pgo_dir}"
+  local _cs_flags="-fprofile-use=${_pgo_profdata} -fcs-profile-generate=${_cs_dir} -fprofile-update=atomic"
+  local _cs_link="-fprofile-use=${_pgo_profdata} -fcs-profile-generate=${_cs_dir}"
+
+  rm -rf "${_pgo_dir}" "${_cs_dir}" "${_pgo_profdata}" "${_merged_profdata}" \
+    "${_pgo_install}" "${_cs_install}" "${_final_install}" \
+    "${srcdir}/libva-workload-"*
+
+  msg 'Stage 1/6: IR-PGO instrumentation build'
+  _meson_setup "${srcdir}/build-pgo" "${_pgo_flags}" "${_pgo_link}"
+  meson compile -C "${srcdir}/build-pgo" --jobs "${LIBVA_JOBS:-$(nproc)}"
+  DESTDIR="${_pgo_install}" meson install -C "${srcdir}/build-pgo" --no-rebuild
+
+  msg 'Stage 2/6: representative libva API/driver workload'
+  _run_workload "${_pgo_install}" "${_pgo_dir}" pgo-standard '' "${_pgo_flags}" "${_pgo_link}"
+  local -a _raw=()
+  _collect_profraw "${_pgo_dir}" _raw
+  "${LLVM_PROFDATA}" merge --sparse -o "${_pgo_profdata}" "${_raw[@]}"
+
+  msg 'Stage 3/6: CS-PGO instrumentation build'
+  _meson_setup "${srcdir}/build-cs-pgo" "${_cs_flags}" "${_cs_link}"
+  meson compile -C "${srcdir}/build-cs-pgo" --jobs "${LIBVA_JOBS:-$(nproc)}"
+  DESTDIR="${_cs_install}" meson install -C "${srcdir}/build-cs-pgo" --no-rebuild
+
+  msg 'Stage 4/6: identical workload for CS-PGO'
+  _run_workload "${_cs_install}" "${_cs_dir}" pgo-cs '' "${_cs_flags}" "${_cs_link}"
+  local -a _cs_raw=()
+  _collect_profraw "${_cs_dir}" _cs_raw
+  "${LLVM_PROFDATA}" merge --sparse -o "${_merged_profdata}" \
+    "${_pgo_profdata}" "${_cs_raw[@]}"
+
+  msg 'Stage 5/6: final PGO/CS-PGO build with BOLT relocations'
+  _meson_setup "${srcdir}/build-final" "-fprofile-use=${_merged_profdata}" \
+    "-fprofile-use=${_merged_profdata} -Wl,--emit-relocs"
+  meson compile -C "${srcdir}/build-final" --jobs "${LIBVA_JOBS:-$(nproc)}"
+  DESTDIR="${_final_install}" meson install -C "${srcdir}/build-final" --no-rebuild
+
+  msg 'Stage 6/6: LLVM BOLT instrumentation, optimization and validation'
+  _bolt_optimize_libs "${_final_install}"
+}
+
+check() {
+  # libva v2.24.0 has no in-tree Meson test suite; the public API workload is
+  # run during every profile/BOLT stage and again here without instrumentation.
+  _setup_llvm
+  [[ -x "${srcdir}/libva-final-install/usr/lib/libva.so.2" ]] || \
+    error 'final libva installation is missing libva.so.2'
+}
+
+_verify_sonames() {
+  local _base _real _actual
+  local _libdir="$(_find_install_libdir "${pkgdir}")"
+  [[ -n "${_libdir}" ]] || { error 'packaged libva library directory is missing'; return 1; }
+  for _base in libva libva-drm libva-glx libva-wayland libva-x11; do
+    _real="$(find "${_libdir}" -maxdepth 1 -type f \
+      -name "${_base}.so.2.*" -print -quit)"
+    [[ -n "${_real}" ]] || {
+      error "missing expected ${_base}.so.2 library"
+      return 1
+    }
+    _actual="$("${READELF}" -d "${_real}" 2>/dev/null \
+      | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p' | head -n1)"
+    [[ "${_actual}" == "${_base}.so.2" ]] || {
+      error "${_base}: expected SONAME ${_base}.so.2, got ${_actual:-<none>}"
+      return 1
+    }
+  done
 }
 
 package() {
-  meson install -C build --destdir "${pkgdir}"
-  install -Dm 644 libva/COPYING -t "${pkgdir}"/usr/share/licenses/${pkgname}
-  install -Dm 644 /dev/stdin "${pkgdir}"/etc/libva.conf <<END
+  _setup_llvm || return 1
+  cp -a "${srcdir}/libva-final-install/." "${pkgdir}/"
+  _verify_sonames
+
+  install -Dm644 "${srcdir}/libva/COPYING" \
+    -t "${pkgdir}/usr/share/licenses/${pkgname}"
+  install -Dm644 /dev/stdin "${pkgdir}/etc/libva.conf" <<'EOF'
 LIBVA_MESSAGING_LEVEL=1
-END
+EOF
 }
