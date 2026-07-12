@@ -7538,7 +7538,7 @@ index 6459a6ab2bd3d4dfc43c68554fd253e13a3fa4c8..3d1ff867fc98f39a18d6947b84a83b58
              program->statistics.smem++;
           } else {
 diff --git a/src/amd/compiler/instruction_selection/aco_instruction_selection.h b/src/amd/compiler/instruction_selection/aco_instruction_selection.h
-index 6b21a3e532cb4bb835f523248ad978209ed45630..9f6bc072ab01a1ca76e0773c2785c66c9145f05e 100644
+index 6b21a3e532cb4bb835f523248ad978209ed45630..f0d45de65d43b2f851165b8d32eb4715265cf4d3 100644
 --- a/src/amd/compiler/instruction_selection/aco_instruction_selection.h
 +++ b/src/amd/compiler/instruction_selection/aco_instruction_selection.h
 @@ -109,8 +109,8 @@ struct if_context {
@@ -7552,11 +7552,94 @@ index 6b21a3e532cb4bb835f523248ad978209ed45630..9f6bc072ab01a1ca76e0773c2785c66c
     Block BB_invert;
     Block BB_endif;
  };
+@@ -153,8 +153,10 @@ struct isel_context {
+    std::vector<if_context> if_stack;
+    std::vector<loop_context> loop_stack;
+ 
+-   /* NIR range analysis. */
++   /* NIR range analysis. Each bound kind has a dedicated cache. */
+    struct hash_table* range_ht;
++   struct hash_table* signed_upper_ht;
++   struct hash_table* signed_lower_ht;
+    nir_fp_analysis_state fp_class_ht;
+ 
+    Temp arg_temps[AC_MAX_ARGS];
+diff --git a/src/amd/compiler/instruction_selection/aco_isel_setup.cpp b/src/amd/compiler/instruction_selection/aco_isel_setup.cpp
+index cb9a2b1996611138d46d101ec1bfa990ca6acd4d..fa83318c89a2f1db909a5387b957837aa22b4954 100644
+--- a/src/amd/compiler/instruction_selection/aco_isel_setup.cpp
++++ b/src/amd/compiler/instruction_selection/aco_isel_setup.cpp
+@@ -373,8 +373,11 @@ init_context(isel_context* ctx, nir_shader* shader)
+    shader->info.max_subgroup_size = ctx->program->wave_size;
+    shader->info.min_subgroup_size = ctx->program->wave_size;
+ 
+-   /* Init NIR range analysis. */
++   /* Init NIR range analysis. Signed caches are created lazily because they
++    * are needed only by signed-range instruction-selection opportunities. */
+    ctx->range_ht = _mesa_pointer_hash_table_create(NULL);
++   ctx->signed_upper_ht = NULL;
++   ctx->signed_lower_ht = NULL;
+    ctx->fp_class_ht = nir_create_fp_analysis_state(impl);
+ 
+    uint32_t options =
+@@ -732,6 +735,10 @@ void
+ cleanup_context(isel_context* ctx)
+ {
+    _mesa_hash_table_destroy(ctx->range_ht, NULL);
++   if (ctx->signed_upper_ht)
++      _mesa_hash_table_destroy(ctx->signed_upper_ht, NULL);
++   if (ctx->signed_lower_ht)
++      _mesa_hash_table_destroy(ctx->signed_lower_ht, NULL);
+    nir_free_fp_analysis_state(&ctx->fp_class_ht);
+ }
+ 
 diff --git a/src/amd/compiler/instruction_selection/aco_select_nir_alu.cpp b/src/amd/compiler/instruction_selection/aco_select_nir_alu.cpp
-index d509130f4d8ce69362ceabf5fcc9539a1a5a3c04..599465b4ccb7f56abd4234ca8b92011eed043ce6 100644
+index d509130f4d8ce69362ceabf5fcc9539a1a5a3c04..d21cf8639e0fdfd0e4ddd9a61947958a1c8298b1 100644
 --- a/src/amd/compiler/instruction_selection/aco_select_nir_alu.cpp
 +++ b/src/amd/compiler/instruction_selection/aco_select_nir_alu.cpp
-@@ -3324,6 +3324,16 @@ visit_alu_instr(isel_context* ctx, nir_alu_instr* instr)
+@@ -170,6 +170,26 @@ get_alu_src_ub(isel_context* ctx, nir_alu_instr* instr, int src_idx)
+    return nir_unsigned_upper_bound(ctx->shader, ctx->range_ht, scalar);
+ }
+ 
++static int32_t
++get_alu_src_signed_upper_bound(isel_context* ctx, nir_alu_instr* instr, int src_idx)
++{
++   if (!ctx->signed_upper_ht)
++      ctx->signed_upper_ht = _mesa_pointer_hash_table_create(NULL);
++
++   nir_scalar scalar = nir_scalar{instr->src[src_idx].src.ssa, instr->src[src_idx].swizzle[0]};
++   return nir_signed_upper_bound(ctx->shader, ctx->signed_upper_ht, scalar);
++}
++
++static int32_t
++get_alu_src_signed_lower_bound(isel_context* ctx, nir_alu_instr* instr, int src_idx)
++{
++   if (!ctx->signed_lower_ht)
++      ctx->signed_lower_ht = _mesa_pointer_hash_table_create(NULL);
++
++   nir_scalar scalar = nir_scalar{instr->src[src_idx].src.ssa, instr->src[src_idx].swizzle[0]};
++   return nir_signed_lower_bound(ctx->shader, ctx->signed_lower_ht, scalar);
++}
++
+ void
+ emit_sop2_instruction(isel_context* ctx, nir_alu_instr* instr, aco_opcode op, Temp dst,
+                       bool writes_scc, uint8_t uses_ub = 0)
+@@ -1748,6 +1768,15 @@ visit_alu_instr(isel_context* ctx, nir_alu_instr* instr)
+             bool nuw_16bit = src0_ub <= 0xffff && src1_ub <= 0xffff && src0_ub * src1_ub <= 0xffff;
+             emit_vop2_instruction(ctx, instr, aco_opcode::v_mul_u32_u24, dst,
+                                   true /* commutative */, false, false, nuw_16bit, 0x3);
++         } else if (get_alu_src_signed_lower_bound(ctx, instr, 0) >= -0x800000 &&
++                    get_alu_src_signed_upper_bound(ctx, instr, 0) <= 0x7fffff &&
++                    get_alu_src_signed_lower_bound(ctx, instr, 1) >= -0x800000 &&
++                    get_alu_src_signed_upper_bound(ctx, instr, 1) <= 0x7fffff) {
++            /* v_mul_i32_i24 sign-extends each source's low 24 bits. The
++             * signed range proof makes those bits equal to the NIR sources,
++             * so the low 32 product bits are identical to imul. */
++            emit_vop2_instruction(ctx, instr, aco_opcode::v_mul_i32_i24, dst,
++                                  true /* commutative */);
+          } else if (nir_src_is_const(instr->src[0].src)) {
+             bld.v_mul_imm(Definition(dst), get_alu_src(ctx, instr->src[1]),
+                           nir_src_as_uint(instr->src[0].src), src1_ub <= 0xffffff,
+@@ -3324,6 +3353,16 @@ visit_alu_instr(isel_context* ctx, nir_alu_instr* instr)
              if (camount == 16 && ctx->program->gfx_level >= GFX11) {
                 bld.sop2(aco_opcode::s_pack_hl_b32_b16, Definition(dst), src1, src0);
                 break;
@@ -7781,10 +7864,44 @@ index 6fcd59ee2bcd29ad0955f33d1fbf2d6d3359f08d..b39e3585fb391d0c32f230cc0be4dbbb
     pipeline_layout_info.pNext = NULL;
     pipeline_layout_info.flags = 0;
 diff --git a/src/amd/compiler/tests/test_isel.cpp b/src/amd/compiler/tests/test_isel.cpp
-index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638f7482cce 100644
+index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..1e73fc943a5546c68611e2bcb827cf120f288530 100644
 --- a/src/amd/compiler/tests/test_isel.cpp
 +++ b/src/amd/compiler/tests/test_isel.cpp
-@@ -243,7 +243,7 @@ BEGIN_TEST(isel.cf.deep_traversal)
+@@ -41,6 +41,33 @@ BEGIN_TEST(isel.interp.simple)
+    pbld.print_ir(VK_SHADER_STAGE_FRAGMENT_BIT, "ACO IR");
+ END_TEST
+ 
++BEGIN_TEST(isel.gfx9_signed_mul24_range)
++   if (!set_variant(GFX9))
++      return;
++
++   QoShaderModuleCreateInfo cs = qoShaderModuleCreateInfoGLSL(COMPUTE,
++      layout(local_size_x = 64) in;
++      layout(std430, binding = 0) readonly buffer In {
++         int value[];
++      } src;
++      layout(std430, binding = 1) buffer Out {
++         int value[];
++      } dst;
++      void main() {
++         uint index = gl_LocalInvocationID.x;
++         int x = clamp(src.value[2 * index], -32, 32);
++         int y = clamp(src.value[2 * index + 1], -32, 32);
++         //>> v1: %mul = v_mul_i32_i24 (kill)%_, (kill)%_
++         dst.value[index] = x * y;
++      }
++   );
++
++   PipelineBuilder pbld(get_vk_device(GFX9));
++   pbld.add_cs(cs);
++   pbld.print_ir(VK_SHADER_STAGE_COMPUTE_BIT, "ACO IR", true);
++   pbld.print_ir(VK_SHADER_STAGE_COMPUTE_BIT, "Assembly", true);
++END_TEST
++
+ BEGIN_TEST(isel.compute.simple)
+    for (unsigned i = GFX7; i <= GFX8; i++) {
+       if (!set_variant((amd_gfx_level)i))
+@@ -243,7 +270,7 @@ BEGIN_TEST(isel.cf.deep_traversal)
     if (!setup_nir_cs(GFX11))
        return;
  
@@ -7793,7 +7910,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
     auto depth = 10000;
  
-@@ -254,7 +254,7 @@ BEGIN_TEST(isel.cf.deep_traversal)
+@@ -254,7 +281,7 @@ BEGIN_TEST(isel.cf.deep_traversal)
     }
  
     nir_def *val = nir_imm_int(nb, 0);
@@ -7802,7 +7919,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
     for (int i = 0; i < depth; i++) {
        nir_pop_if(nb, NULL);
-@@ -282,8 +282,8 @@ BEGIN_TEST(isel.cf.unreachable_continue.uniform_break)
+@@ -282,8 +309,8 @@ BEGIN_TEST(isel.cf.unreachable_continue.uniform_break)
  
     //>> s1: %init0 = p_unit_test 0
     //>> v1: %init1 = p_unit_test 1
@@ -7813,7 +7930,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
     nir_phi_instr *phi[2];
  
     nir_loop *loop = nir_push_loop(nb);
-@@ -299,7 +299,7 @@ BEGIN_TEST(isel.cf.unreachable_continue.uniform_break)
+@@ -299,7 +326,7 @@ BEGIN_TEST(isel.cf.unreachable_continue.uniform_break)
        nir_phi_instr_add_src(phi[0], nir_def_block(init0), init0);
        nir_phi_instr_add_src(phi[1], nir_def_block(init1), init1);
  
@@ -7822,7 +7939,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        {
           //>> BB2
           //! /* logical preds: BB1, / linear preds: BB1, / kind: uniform, break, */
-@@ -313,13 +313,13 @@ BEGIN_TEST(isel.cf.unreachable_continue.uniform_break)
+@@ -313,13 +340,13 @@ BEGIN_TEST(isel.cf.unreachable_continue.uniform_break)
           //! p_logical_start
           //! s1: %_ = p_unit_test 5
           //! p_logical_end
@@ -7839,7 +7956,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
        nir_phi_instr_add_src(phi[0], nir_loop_last_block(loop), cont0);
        nir_phi_instr_add_src(phi[1], nir_loop_last_block(loop), cont1);
-@@ -351,8 +351,8 @@ BEGIN_TEST(isel.cf.unreachable_continue.divergent_break)
+@@ -351,8 +378,8 @@ BEGIN_TEST(isel.cf.unreachable_continue.divergent_break)
  
     //>> s1: %init0 = p_unit_test 0
     //>> v1: %init1 = p_unit_test 1
@@ -7850,7 +7967,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
     nir_phi_instr *phi[2];
  
     nir_loop *loop = nir_push_loop(nb);
-@@ -368,7 +368,7 @@ BEGIN_TEST(isel.cf.unreachable_continue.divergent_break)
+@@ -368,7 +395,7 @@ BEGIN_TEST(isel.cf.unreachable_continue.divergent_break)
        nir_phi_instr_add_src(phi[0], nir_def_block(init0), init0);
        nir_phi_instr_add_src(phi[1], nir_def_block(init1), init1);
  
@@ -7859,7 +7976,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        {
           //>> BB2
           //! /* logical preds: BB1, / linear preds: BB1, / kind: break, */
-@@ -382,13 +382,13 @@ BEGIN_TEST(isel.cf.unreachable_continue.divergent_break)
+@@ -382,13 +409,13 @@ BEGIN_TEST(isel.cf.unreachable_continue.divergent_break)
           //! p_logical_start
           //! s1: %_ = p_unit_test 5
           //! p_logical_end
@@ -7876,7 +7993,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
        nir_phi_instr_add_src(phi[0], nir_loop_last_block(loop), cont0);
        nir_phi_instr_add_src(phi[1], nir_loop_last_block(loop), cont1);
-@@ -444,7 +444,7 @@ BEGIN_TEST(isel.cf.unreachable_break.uniform_continue)
+@@ -444,7 +471,7 @@ BEGIN_TEST(isel.cf.unreachable_break.uniform_continue)
     {
        //>> BB1
        //! /* logical preds: BB0, BB6, / linear preds: BB0, BB6, / kind: uniform, loop-header, */
@@ -7885,7 +8002,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        {
           //>> BB2
           //! /* logical preds: BB1, / linear preds: BB1, / kind: uniform, */
-@@ -456,7 +456,7 @@ BEGIN_TEST(isel.cf.unreachable_break.uniform_continue)
+@@ -456,7 +483,7 @@ BEGIN_TEST(isel.cf.unreachable_break.uniform_continue)
           //! /* logical preds: BB1, / linear preds: BB1, / kind: uniform, */
           //! p_logical_start
           //! s1: %_ = p_unit_test 5
@@ -7894,7 +8011,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
           nir_jump(nb, nir_jump_continue);
        }
        nir_pop_if(nb, NULL);
-@@ -485,8 +485,8 @@ BEGIN_TEST(isel.cf.unreachable_break.uniform_continue)
+@@ -485,8 +512,8 @@ BEGIN_TEST(isel.cf.unreachable_break.uniform_continue)
  
     //>> p_unit_test 0, %val0
     //! p_unit_test 1, %val1
@@ -7905,7 +8022,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
     finish_isel_test();
  END_TEST
-@@ -511,8 +511,8 @@ BEGIN_TEST(isel.cf.unreachable_continue.mixed_break)
+@@ -511,8 +538,8 @@ BEGIN_TEST(isel.cf.unreachable_continue.mixed_break)
  
     //>> s1: %init0 = p_unit_test 0
     //>> v1: %init1 = p_unit_test 1
@@ -7916,7 +8033,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
     nir_phi_instr *phi[2];
  
     nir_loop *loop = nir_push_loop(nb);
-@@ -528,7 +528,7 @@ BEGIN_TEST(isel.cf.unreachable_continue.mixed_break)
+@@ -528,7 +555,7 @@ BEGIN_TEST(isel.cf.unreachable_continue.mixed_break)
        nir_phi_instr_add_src(phi[0], nir_def_block(init0), init0);
        nir_phi_instr_add_src(phi[1], nir_def_block(init1), init1);
  
@@ -7925,7 +8042,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        {
           //>> BB2
           //! /* logical preds: BB1, / linear preds: BB1, / kind: uniform, break, */
-@@ -543,7 +543,7 @@ BEGIN_TEST(isel.cf.unreachable_continue.mixed_break)
+@@ -543,7 +570,7 @@ BEGIN_TEST(isel.cf.unreachable_continue.mixed_break)
           //! s2: %cond = p_unit_test 5
           //! p_logical_end
           //! p_cbranch_z %cond
@@ -7934,7 +8051,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
           {
              //>> BB4
              //! /* logical preds: BB3, / linear preds: BB3, / kind: break, */
-@@ -556,15 +556,15 @@ BEGIN_TEST(isel.cf.unreachable_continue.mixed_break)
+@@ -556,15 +583,15 @@ BEGIN_TEST(isel.cf.unreachable_continue.mixed_break)
              //! /* logical preds: BB3, / linear preds: BB6, BB7, / kind: uniform, break, merge, */
              //! p_logical_start
              //! s1: %_ = p_unit_test 6
@@ -7953,7 +8070,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
        nir_phi_instr_add_src(phi[0], nir_loop_last_block(loop), cont0);
        nir_phi_instr_add_src(phi[1], nir_loop_last_block(loop), cont1);
-@@ -606,8 +606,8 @@ BEGIN_TEST(isel.cf.unreachable_continue.nested_mixed_break)
+@@ -606,8 +633,8 @@ BEGIN_TEST(isel.cf.unreachable_continue.nested_mixed_break)
  
     //>> s1: %init0 = p_unit_test 0
     //>> v1: %init1 = p_unit_test 1
@@ -7964,7 +8081,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
     nir_phi_instr *phi[2];
  
     nir_loop *loop = nir_push_loop(nb);
-@@ -623,7 +623,7 @@ BEGIN_TEST(isel.cf.unreachable_continue.nested_mixed_break)
+@@ -623,7 +650,7 @@ BEGIN_TEST(isel.cf.unreachable_continue.nested_mixed_break)
        nir_phi_instr_add_src(phi[0], nir_def_block(init0), init0);
        nir_phi_instr_add_src(phi[1], nir_def_block(init1), init1);
  
@@ -7973,7 +8090,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        {
           //>> BB2
           //! /* logical preds: BB1, / linear preds: BB1, / kind: uniform, break, */
-@@ -639,7 +639,7 @@ BEGIN_TEST(isel.cf.unreachable_continue.nested_mixed_break)
+@@ -639,7 +666,7 @@ BEGIN_TEST(isel.cf.unreachable_continue.nested_mixed_break)
           //! s2: %_,  s1: %_:scc = s_and_b64 %cond1, %0:exec
           //! p_logical_end
           //! p_cbranch_z %_:scc
@@ -7982,7 +8099,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
           {
              //>> BB4
              //! /* logical preds: BB3, / linear preds: BB3, / kind: uniform, break, */
-@@ -654,7 +654,7 @@ BEGIN_TEST(isel.cf.unreachable_continue.nested_mixed_break)
+@@ -654,7 +681,7 @@ BEGIN_TEST(isel.cf.unreachable_continue.nested_mixed_break)
              //! s2: %cond2 = p_unit_test 5
              //! p_logical_end
              //! p_cbranch_z %cond2
@@ -7991,7 +8108,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
              {
                 //>> BB6
                 //! /* logical preds: BB5, / linear preds: BB5, / kind: break, */
-@@ -673,8 +673,8 @@ BEGIN_TEST(isel.cf.unreachable_continue.nested_mixed_break)
+@@ -673,8 +700,8 @@ BEGIN_TEST(isel.cf.unreachable_continue.nested_mixed_break)
        }
        nir_pop_if(nb, NULL);
  
@@ -8002,7 +8119,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
        nir_phi_instr_add_src(phi[0], nir_loop_last_block(loop), cont0);
        nir_phi_instr_add_src(phi[1], nir_loop_last_block(loop), cont1);
-@@ -713,7 +713,7 @@ BEGIN_TEST(isel.cf.unreachable_loop_exit)
+@@ -713,7 +740,7 @@ BEGIN_TEST(isel.cf.unreachable_loop_exit)
        //! /* logical preds: BB1, / linear preds: BB1, / kind: uniform, break, */
        //>> BB3
        //! /* logical preds: BB1, / linear preds: BB1, / kind: uniform, */
@@ -8011,7 +8128,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        nir_jump(nb, nir_jump_continue);
     }
     nir_pop_loop(nb, loop);
-@@ -738,7 +738,7 @@ BEGIN_TEST(isel.cf.divergent_if_branch_use)
+@@ -738,7 +765,7 @@ BEGIN_TEST(isel.cf.divergent_if_branch_use)
     nir_push_loop(nb);
     {
        nir_def *val;
@@ -8020,7 +8137,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        {
           //>> BB2
           //! /* logical preds: BB1, / linear preds: BB1, / kind: break, */
-@@ -751,12 +751,12 @@ BEGIN_TEST(isel.cf.divergent_if_branch_use)
+@@ -751,12 +778,12 @@ BEGIN_TEST(isel.cf.divergent_if_branch_use)
           //! /* logical preds: BB1, / linear preds: BB4, BB5, / kind: uniform, merge, */
           //! p_logical_start
           //! s1: %val = p_unit_test 0
@@ -8035,7 +8152,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
     }
     nir_pop_loop(nb, NULL);
  
-@@ -799,7 +799,7 @@ BEGIN_TEST(isel.cf.uniform_if_branch_use)
+@@ -799,7 +826,7 @@ BEGIN_TEST(isel.cf.uniform_if_branch_use)
        //>> BB1
        //! /* logical preds: BB0, BB15, / linear preds: BB0, BB15, / kind: loop-header, branch, */
        //>> s2: %_ = p_unit_test 3
@@ -8044,7 +8161,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        {
           nir_jump(nb, nir_jump_continue);
        }
-@@ -814,7 +814,7 @@ BEGIN_TEST(isel.cf.uniform_if_branch_use)
+@@ -814,7 +841,7 @@ BEGIN_TEST(isel.cf.uniform_if_branch_use)
        //! p_logical_end
        //! p_cbranch_z %_:scc
        nir_def *val;
@@ -8053,7 +8170,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        {
           //>> BB6
           //! /* logical preds: BB5, / linear preds: BB5, / kind: break, */
-@@ -831,11 +831,11 @@ BEGIN_TEST(isel.cf.uniform_if_branch_use)
+@@ -831,11 +858,11 @@ BEGIN_TEST(isel.cf.uniform_if_branch_use)
           //! p_logical_start
           //! s1: %val = p_unit_test 0
           //! p_unit_test 1, %val
@@ -8067,7 +8184,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
        //>> BB15
        //! /* logical preds: BB2, BB13, / linear preds: BB13, BB14, / kind: uniform, merge, */
-@@ -873,7 +873,7 @@ BEGIN_TEST(isel.cf.hidden_continue)
+@@ -873,7 +900,7 @@ BEGIN_TEST(isel.cf.hidden_continue)
        return;
  
     //>> s1: %init = p_unit_test 0
@@ -8076,7 +8193,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
     nir_phi_instr* phi;
  
     nir_loop *loop = nir_push_loop(nb);
-@@ -891,13 +891,13 @@ BEGIN_TEST(isel.cf.hidden_continue)
+@@ -891,13 +918,13 @@ BEGIN_TEST(isel.cf.hidden_continue)
        //>> p_cbranch_z %inverse_cond
        //>> BB2
        //! /* logical preds: BB1, / linear preds: BB1, / kind: break, */
@@ -8092,7 +8209,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
           nir_phi_instr_add_src(phi, nir_loop_first_continue_block(loop), cont);
           nir_jump(nb, nir_jump_continue);
        }
-@@ -928,12 +928,12 @@ BEGIN_TEST(isel.cf.divergent_if_undef.basic_then)
+@@ -928,12 +955,12 @@ BEGIN_TEST(isel.cf.divergent_if_undef.basic_then)
     if (!setup_nir_cs(GFX11))
        return;
  
@@ -8107,7 +8224,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
     nir_pop_if(nb, NULL);
  
     //>> BB3
-@@ -944,7 +944,7 @@ BEGIN_TEST(isel.cf.divergent_if_undef.basic_then)
+@@ -944,7 +971,7 @@ BEGIN_TEST(isel.cf.divergent_if_undef.basic_then)
     //! s1: %phi2 = p_linear_phi %phi, %phi
     //! p_logical_start
     //! p_unit_test 1, %phi2
@@ -8116,7 +8233,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
     finish_isel_test();
  END_TEST
-@@ -961,7 +961,7 @@ BEGIN_TEST(isel.cf.divergent_if_undef.basic_else)
+@@ -961,7 +988,7 @@ BEGIN_TEST(isel.cf.divergent_if_undef.basic_else)
     if (!setup_nir_cs(GFX11))
        return;
  
@@ -8125,7 +8242,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
     nir_push_else(nb, NULL);
     //>> BB3
     //! /* logical preds: / linear preds: BB1, BB2, / kind: invert, */
-@@ -969,7 +969,7 @@ BEGIN_TEST(isel.cf.divergent_if_undef.basic_else)
+@@ -969,7 +996,7 @@ BEGIN_TEST(isel.cf.divergent_if_undef.basic_else)
     //! /* logical preds: BB0, / linear preds: BB3, / kind: uniform, */
     //! p_logical_start
     //! s1: %val = p_unit_test 0
@@ -8134,7 +8251,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
     nir_pop_if(nb, NULL);
  
     //>> BB6
-@@ -977,7 +977,7 @@ BEGIN_TEST(isel.cf.divergent_if_undef.basic_else)
+@@ -977,7 +1004,7 @@ BEGIN_TEST(isel.cf.divergent_if_undef.basic_else)
     //! s1: %phi = p_linear_phi %val, s1: undef
     //! p_logical_start
     //! p_unit_test 1, %phi
@@ -8143,7 +8260,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
     finish_isel_test();
  END_TEST
-@@ -1003,8 +1003,8 @@ BEGIN_TEST(isel.cf.divergent_if_phi.break)
+@@ -1003,8 +1030,8 @@ BEGIN_TEST(isel.cf.divergent_if_phi.break)
        //! p_logical_start
        //! s1: %val = p_unit_test 0
        //! s2: %_ = p_unit_test 2
@@ -8154,7 +8271,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        {
           //>> BB2
           //! /* logical preds: BB1, / linear preds: BB1, / kind: break, */
-@@ -1025,7 +1025,7 @@ BEGIN_TEST(isel.cf.divergent_if_phi.break)
+@@ -1025,7 +1052,7 @@ BEGIN_TEST(isel.cf.divergent_if_phi.break)
  
        //! p_logical_start
        //! p_unit_test 1, %phi
@@ -8163,7 +8280,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
     }
     nir_pop_loop(nb, NULL);
  
-@@ -1043,12 +1043,12 @@ BEGIN_TEST(isel.cf.divergent_if_undef.both)
+@@ -1043,12 +1070,12 @@ BEGIN_TEST(isel.cf.divergent_if_undef.both)
     if (!setup_nir_cs(GFX11))
        return;
  
@@ -8178,7 +8295,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
     finish_isel_test();
  END_TEST
-@@ -1065,21 +1065,21 @@ BEGIN_TEST(isel.cf.empty_exec.uniform_if)
+@@ -1065,21 +1092,21 @@ BEGIN_TEST(isel.cf.empty_exec.uniform_if)
     //>> BB0
     //>> s2: %_ = p_unit_test 0
     //>> p_cbranch_z %_:scc
@@ -8204,7 +8321,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
     finish_isel_test();
  END_TEST
-@@ -1101,40 +1101,40 @@ BEGIN_TEST(isel.cf.empty_exec.nested_uniform_if)
+@@ -1101,40 +1128,40 @@ BEGIN_TEST(isel.cf.empty_exec.nested_uniform_if)
     //>> BB0
     //>> s2: %_ = p_unit_test 0
     //>> p_cbranch_z %_
@@ -8252,7 +8369,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
     finish_isel_test();
  END_TEST
-@@ -1160,30 +1160,30 @@ BEGIN_TEST(isel.cf.empty_exec.divergent_if)
+@@ -1160,30 +1187,30 @@ BEGIN_TEST(isel.cf.empty_exec.divergent_if)
     //>> BB0
     //>> s2: %_ = p_unit_test 0
     //>> p_cbranch_z %_
@@ -8290,7 +8407,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        }
        nir_push_else(nb, NULL);
        {
-@@ -1191,11 +1191,11 @@ BEGIN_TEST(isel.cf.empty_exec.divergent_if)
+@@ -1191,11 +1218,11 @@ BEGIN_TEST(isel.cf.empty_exec.divergent_if)
           //>> s2: %_ = p_unit_test 8
           //>> p_discard_if %_
           //>> p_cbranch_z %0:exec rarely_taken
@@ -8305,7 +8422,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        }
        nir_pop_if(nb, NULL);
        //>> BB14
-@@ -1207,7 +1207,7 @@ BEGIN_TEST(isel.cf.empty_exec.divergent_if)
+@@ -1207,7 +1234,7 @@ BEGIN_TEST(isel.cf.empty_exec.divergent_if)
        //>> p_cbranch_z %0:exec rarely_taken
  
        //>> p_unit_test 10, %_
@@ -8314,7 +8431,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
     }
     nir_pop_if(nb, NULL);
  
-@@ -1215,7 +1215,7 @@ BEGIN_TEST(isel.cf.empty_exec.divergent_if)
+@@ -1215,7 +1242,7 @@ BEGIN_TEST(isel.cf.empty_exec.divergent_if)
     //! /* logical preds: BB19, BB22, / linear preds: BB22, BB23, / kind: uniform, top-level, merge, */
     //! p_logical_start
     //! p_unit_test 11, %_
@@ -8323,7 +8440,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
     finish_isel_test();
  END_TEST
-@@ -1238,23 +1238,23 @@ BEGIN_TEST(isel.cf.empty_exec.loop_break)
+@@ -1238,23 +1265,23 @@ BEGIN_TEST(isel.cf.empty_exec.loop_break)
     {
        //>> BB1
        //>> p_unit_test 0, %_
@@ -8351,7 +8468,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        }
        nir_pop_if(nb, NULL);
        //>> BB15
-@@ -1262,7 +1262,7 @@ BEGIN_TEST(isel.cf.empty_exec.loop_break)
+@@ -1262,7 +1289,7 @@ BEGIN_TEST(isel.cf.empty_exec.loop_break)
        //! p_logical_start
  
        //! p_unit_test 4, %_
@@ -8360,7 +8477,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
     }
     nir_pop_loop(nb, NULL);
     //>> BB16
-@@ -1270,7 +1270,7 @@ BEGIN_TEST(isel.cf.empty_exec.loop_break)
+@@ -1270,7 +1297,7 @@ BEGIN_TEST(isel.cf.empty_exec.loop_break)
     //! p_logical_start
  
     //! p_unit_test 5, %_
@@ -8369,7 +8486,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
     finish_isel_test();
  END_TEST
-@@ -1316,12 +1316,12 @@ BEGIN_TEST(isel.cf.empty_exec.loop_continue)
+@@ -1316,12 +1343,12 @@ BEGIN_TEST(isel.cf.empty_exec.loop_continue)
        //>> BB3
        //>> p_unit_test 0, %_
        //>> s2: %_ = p_unit_test 1
@@ -8385,7 +8502,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
           {
              //>> BB5
              //! /* logical preds: BB4, / linear preds: BB4, / kind: uniform, */
-@@ -1337,7 +1337,7 @@ BEGIN_TEST(isel.cf.empty_exec.loop_continue)
+@@ -1337,7 +1364,7 @@ BEGIN_TEST(isel.cf.empty_exec.loop_continue)
           //>> BB10
           //! /* logical preds: BB5, BB8, / linear preds: BB8, BB9, / kind: uniform, merge, */
           //! s2: %cont2 = p_linear_phi %cont1, %cont1
@@ -8394,7 +8511,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        }
        nir_pop_if(nb, NULL);
        //>> BB12
-@@ -1351,7 +1351,7 @@ BEGIN_TEST(isel.cf.empty_exec.loop_continue)
+@@ -1351,7 +1378,7 @@ BEGIN_TEST(isel.cf.empty_exec.loop_continue)
        //>> BB19
        //! /* logical preds: BB15, / linear preds: BB18, / kind: uniform, */
        //>> p_unit_test 4, %_
@@ -8403,7 +8520,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        //>> BB21
        //! /* logical preds: BB16, BB19, / linear preds: BB19, BB20, / kind: uniform, merge, */
     }
-@@ -1361,7 +1361,7 @@ BEGIN_TEST(isel.cf.empty_exec.loop_continue)
+@@ -1361,7 +1388,7 @@ BEGIN_TEST(isel.cf.empty_exec.loop_continue)
     //! p_logical_start
  
     //! p_unit_test 5, %_
@@ -8412,7 +8529,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
     finish_isel_test();
  END_TEST
-@@ -1399,10 +1399,10 @@ BEGIN_TEST(isel.cf.empty_exec.loop_continue_then_break)
+@@ -1399,10 +1426,10 @@ BEGIN_TEST(isel.cf.empty_exec.loop_continue_then_break)
        //>> BB1
        //! /* logical preds: BB0, BB15, / linear preds: BB0, BB15, / kind: loop-header, branch, */
        //>> p_unit_test 0, %_
@@ -8425,7 +8542,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        {
           //>> BB2
           //! /* logical preds: BB1, / linear preds: BB1, / kind: uniform, */
-@@ -1415,12 +1415,12 @@ BEGIN_TEST(isel.cf.empty_exec.loop_continue_then_break)
+@@ -1415,12 +1442,12 @@ BEGIN_TEST(isel.cf.empty_exec.loop_continue_then_break)
        //>> BB5
        //! /* logical preds: BB1, / linear preds: BB4, / kind: branch, */
        //>> p_unit_test 2, %_
@@ -8440,7 +8557,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        //>> BB10
        //! /* logical preds: BB5, / linear preds: BB8, BB9, / kind: uniform, merge, */
        //>> p_cbranch_z %0:exec rarely_taken
-@@ -1428,7 +1428,7 @@ BEGIN_TEST(isel.cf.empty_exec.loop_continue_then_break)
+@@ -1428,7 +1455,7 @@ BEGIN_TEST(isel.cf.empty_exec.loop_continue_then_break)
        //>> BB11
        //! /* logical preds: BB10, / linear preds: BB10, / kind: uniform, */
        //>> p_unit_test 4, %_
@@ -8449,7 +8566,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
        //>> BB15
        //! /* logical preds: BB2, BB13, / linear preds: BB13, BB14, / kind: uniform, merge, */
-@@ -1439,7 +1439,7 @@ BEGIN_TEST(isel.cf.empty_exec.loop_continue_then_break)
+@@ -1439,7 +1466,7 @@ BEGIN_TEST(isel.cf.empty_exec.loop_continue_then_break)
     //! p_logical_start
  
     //! p_unit_test 5, %_
@@ -8458,7 +8575,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
     finish_isel_test();
  END_TEST
-@@ -1460,26 +1460,26 @@ BEGIN_TEST(isel.cf.empty_exec.terminate_then_uniform_if)
+@@ -1460,26 +1487,26 @@ BEGIN_TEST(isel.cf.empty_exec.terminate_then_uniform_if)
     //>> BB0
     //>> s2: %_ = p_unit_test 0
     //>> p_cbranch_z %_
@@ -8490,7 +8607,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
        //>> BB6
        //! /* logical preds: / linear preds: BB1, / kind: uniform, */
-@@ -1504,14 +1504,14 @@ BEGIN_TEST(isel.cf.empty_exec.terminate_then_divergent_if)
+@@ -1504,14 +1531,14 @@ BEGIN_TEST(isel.cf.empty_exec.terminate_then_divergent_if)
     //>> BB0
     //>> s2: %_ = p_unit_test 0
     //>> p_cbranch_z %_
@@ -8508,7 +8625,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        //>> p_cbranch_z %0:exec rarely_taken
  
        //>> p_cbranch_z %_
-@@ -1521,12 +1521,12 @@ BEGIN_TEST(isel.cf.empty_exec.terminate_then_divergent_if)
+@@ -1521,12 +1548,12 @@ BEGIN_TEST(isel.cf.empty_exec.terminate_then_divergent_if)
           //! /* logical preds: BB2, / linear preds: BB2, / kind: uniform, */
           //! p_logical_start
           //! p_unit_test 3, %_
@@ -8523,7 +8640,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
  
        //>> BB9
        //! /* logical preds: / linear preds: BB1, / kind: uniform, */
-@@ -1552,12 +1552,12 @@ BEGIN_TEST(isel.cf.empty_exec.terminate_then_loop)
+@@ -1552,12 +1579,12 @@ BEGIN_TEST(isel.cf.empty_exec.terminate_then_loop)
     //>> BB0
     //>> s2: %_ = p_unit_test 0
     //>> p_cbranch_z %_
@@ -8538,7 +8655,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        //>> p_cbranch_z %0:exec rarely_taken
  
        //>> BB2
-@@ -1569,7 +1569,7 @@ BEGIN_TEST(isel.cf.empty_exec.terminate_then_loop)
+@@ -1569,7 +1596,7 @@ BEGIN_TEST(isel.cf.empty_exec.terminate_then_loop)
           //>> BB5
           //! /* logical preds: BB3, / linear preds: BB3, / kind: uniform, */
           //>> p_unit_test 2, %1
@@ -8547,7 +8664,7 @@ index b81591a78e489b3bfeaac07383d3c1a0cc2618f8..d20e3d187396ca25e5c1f782eca41638
        }
        nir_pop_loop(nb, NULL);
        //>> BB6
-@@ -1578,3 +1578,31 @@ BEGIN_TEST(isel.cf.empty_exec.terminate_then_loop)
+@@ -1578,3 +1605,31 @@ BEGIN_TEST(isel.cf.empty_exec.terminate_then_loop)
  
     finish_isel_test();
  END_TEST
@@ -23648,6 +23765,154 @@ index 8b297b4830ff650ab7c650d5c16d485aec05cbf7..9327d8b5a0ca1f74c6c000f3bed81db2
            flags=[CAN_ELIMINATE, CAN_REORDER])
  store("scalar_arg_amd", [], [BASE])
  store("vector_arg_amd", [], [BASE])
+diff --git a/src/compiler/nir/nir_loop_analyze.c b/src/compiler/nir/nir_loop_analyze.c
+index ea5aa9ea1e5e25585fe8e430bd2b99c06f4d8371..738eb94fc2efc4c06e0f6e1a4beafbaed18f967f 100644
+--- a/src/compiler/nir/nir_loop_analyze.c
++++ b/src/compiler/nir/nir_loop_analyze.c
+@@ -41,6 +41,8 @@ typedef struct {
+    bool force_unroll_sampler_indirect;
+ 
+    struct hash_table *range_ht;
++   struct hash_table *signed_upper_ht;
++   struct hash_table *signed_lower_ht;
+ } loop_info_state;
+ 
+ static nir_loop_induction_variable *
+@@ -574,26 +576,49 @@ try_find_limit(nir_scalar limit, nir_const_value *limit_val, nir_op alu_op,
+             }
+          }
+       }
+-   } else {
+-      /* Use NIR range analysis to find a limit of the trip count -- this covers
+-       * cases that minmax above doesn't, but doesn't cover its >= cases.
+-       */
+-      if ((alu_op == nir_op_ilt || alu_op == nir_op_ult) && limit.def->bit_size <= 32) {
+-         nir_function_impl *impl = nir_cf_node_get_function(&state->loop->cf_node);
+-         unsigned uub = nir_unsigned_upper_bound(impl->function->shader,
+-                                                 state->range_ht, limit);
++   }
+ 
+-         /* If the unsigned upper bound for our signed comparison is negative as
+-          * an integer, then we don't know the non-negative upper bound.
+-          */
+-         if (alu_op == nir_op_ilt && util_sign_extend(uub, limit.def->bit_size) < 0)
+-            return false;
++   /* For an ilt terminator, choose the bound which maximizes the number
++    * of iterations: an upper bound for limit < induction and a lower bound
++    * for induction < limit. The subsequent first-iteration check accounts for
++    * a bound on the other side of the initial value. Unlike the unsigned
++    * analysis below, this also accepts an ALU limit because signed transfer
++    * functions are restricted to exact output domains and moves/min/max/select
++    * composition. */
++   if (alu_op == nir_op_ilt && limit.def->bit_size <= 32) {
++      nir_function_impl *impl = nir_cf_node_get_function(&state->loop->cf_node);
++      const int32_t bound =
++         terminator->induction_rhs
++            ? nir_signed_upper_bound(impl->function->shader, state->signed_upper_ht, limit)
++            : nir_signed_lower_bound(impl->function->shader, state->signed_lower_ht, limit);
++      const int32_t default_bound = terminator->induction_rhs ? INT32_MAX : INT32_MIN;
++
++      if (bound != default_bound) {
++         *limit_val = nir_const_value_for_int(bound, limit.def->bit_size);
++         terminator->exact_trip_count_unknown = true;
++         return true;
++      }
++   }
+ 
+-         if (uub != ~0) {
+-            *limit_val = nir_const_value_for_uint(uub, limit.def->bit_size);
+-            terminator->exact_trip_count_unknown = true;
+-            return true;
+-         }
++   /* Preserve the pre-existing unsigned path for non-ALU limits. Min/max ALU
++    * limits were handled above, while arbitrary ALU limits remain exclusive
++    * to the conservative signed path. */
++   if (!nir_scalar_is_alu(limit) &&
++       (alu_op == nir_op_ilt || alu_op == nir_op_ult) && limit.def->bit_size <= 32) {
++      nir_function_impl *impl = nir_cf_node_get_function(&state->loop->cf_node);
++      unsigned uub = nir_unsigned_upper_bound(impl->function->shader,
++                                              state->range_ht, limit);
++
++      /* If the unsigned upper bound for our signed comparison is negative as
++       * an integer, then we don't know the non-negative upper bound.
++       */
++      if (alu_op == nir_op_ilt && util_sign_extend(uub, limit.def->bit_size) < 0)
++         return false;
++
++      if (uub != ~0) {
++         *limit_val = nir_const_value_for_uint(uub, limit.def->bit_size);
++         terminator->exact_trip_count_unknown = true;
++         return true;
+       }
+    }
+ 
+@@ -1538,7 +1563,8 @@ initialize_loop_info(nir_loop *loop)
+ 
+ static void
+ process_loops(nir_cf_node *cf_node, nir_variable_mode indirect_mask,
+-              bool force_unroll_sampler_indirect, struct hash_table *range_ht)
++              bool force_unroll_sampler_indirect, struct hash_table *range_ht,
++              struct hash_table *signed_upper_ht, struct hash_table *signed_lower_ht)
+ {
+    switch (cf_node->type) {
+    case nir_cf_node_block:
+@@ -1546,9 +1572,11 @@ process_loops(nir_cf_node *cf_node, nir_variable_mode indirect_mask,
+    case nir_cf_node_if: {
+       nir_if *if_stmt = nir_cf_node_as_if(cf_node);
+       foreach_list_typed(nir_cf_node, nested_node, node, &if_stmt->then_list)
+-         process_loops(nested_node, indirect_mask, force_unroll_sampler_indirect, range_ht);
++         process_loops(nested_node, indirect_mask, force_unroll_sampler_indirect, range_ht,
++                       signed_upper_ht, signed_lower_ht);
+       foreach_list_typed(nir_cf_node, nested_node, node, &if_stmt->else_list)
+-         process_loops(nested_node, indirect_mask, force_unroll_sampler_indirect, range_ht);
++         process_loops(nested_node, indirect_mask, force_unroll_sampler_indirect, range_ht,
++                       signed_upper_ht, signed_lower_ht);
+       return;
+    }
+    case nir_cf_node_loop: {
+@@ -1556,7 +1584,8 @@ process_loops(nir_cf_node *cf_node, nir_variable_mode indirect_mask,
+       assert(!nir_loop_has_continue_construct(loop));
+ 
+       foreach_list_typed(nir_cf_node, nested_node, node, &loop->body)
+-         process_loops(nested_node, indirect_mask, force_unroll_sampler_indirect, range_ht);
++         process_loops(nested_node, indirect_mask, force_unroll_sampler_indirect, range_ht,
++                       signed_upper_ht, signed_lower_ht);
+       break;
+    }
+    default:
+@@ -1570,6 +1599,8 @@ process_loops(nir_cf_node *cf_node, nir_variable_mode indirect_mask,
+       .indirect_mask = indirect_mask,
+       .force_unroll_sampler_indirect = force_unroll_sampler_indirect,
+       .range_ht = range_ht,
++      .signed_upper_ht = signed_upper_ht,
++      .signed_lower_ht = signed_lower_ht,
+    };
+ 
+    initialize_loop_info(loop);
+@@ -1582,6 +1613,8 @@ nir_loop_analyze_impl(nir_function_impl *impl,
+                       bool force_unroll_sampler_indirect)
+ {
+    struct hash_table *range_ht = _mesa_pointer_hash_table_create(NULL);
++   struct hash_table *signed_upper_ht = _mesa_pointer_hash_table_create(NULL);
++   struct hash_table *signed_lower_ht = _mesa_pointer_hash_table_create(NULL);
+    nir_metadata_require(impl, nir_metadata_block_index);
+ 
+    /* Clear pass_flags before using it for memoization */
+@@ -1589,10 +1622,13 @@ nir_loop_analyze_impl(nir_function_impl *impl,
+    nir_shader_clear_pass_flags(shader);
+ 
+    foreach_list_typed(nir_cf_node, node, node, &impl->body)
+-      process_loops(node, indirect_mask, force_unroll_sampler_indirect, range_ht);
++      process_loops(node, indirect_mask, force_unroll_sampler_indirect, range_ht,
++                    signed_upper_ht, signed_lower_ht);
+ 
+    impl->loop_analysis_indirect_mask = indirect_mask;
+    impl->loop_analysis_force_unroll_sampler_indirect = force_unroll_sampler_indirect;
+ 
+    ralloc_free(range_ht);
++   ralloc_free(signed_upper_ht);
++   ralloc_free(signed_lower_ht);
+ }
 diff --git a/src/compiler/nir/nir_lower_workgroup_size.c b/src/compiler/nir/nir_lower_workgroup_size.c
 index 60586b128cdbc8ab41dfbdca8ea508df84a0dd45..1eda8a188168ff84a27d420ce1b9b90b9c09c117 100644
 --- a/src/compiler/nir/nir_lower_workgroup_size.c
@@ -26888,7 +27153,7 @@ index fc416c49bda7bb5248e86b01001db7e9f6431f21..5e31c257f611358822efcd2dd20096e7
     return progress;
  }
 diff --git a/src/compiler/nir/nir_opt_uub.c b/src/compiler/nir/nir_opt_uub.c
-index 19d50f5f72e10c66be2e6b9450e0b816ce4c4304..cd527aecba76ee48d7a3743e3c48a34809f1bcf7 100644
+index 19d50f5f72e10c66be2e6b9450e0b816ce4c4304..50bdc5e0053aaf645508fc2cd0192b74d2cf1660 100644
 --- a/src/compiler/nir/nir_opt_uub.c
 +++ b/src/compiler/nir/nir_opt_uub.c
 @@ -10,6 +10,8 @@ typedef struct {
@@ -26923,8 +27188,79 @@ index 19d50f5f72e10c66be2e6b9450e0b816ce4c4304..cd527aecba76ee48d7a3743e3c48a348
  static void
  get_srcs(nir_alu_instr *alu, nir_scalar *srcs)
  {
-@@ -126,13 +144,27 @@ opt_uub_cmp(nir_builder *b, nir_alu_instr *alu, opt_uub_state *state)
-    nir_op op = const_src_idx == 0 ? invert_cmp(alu->op) : alu->op;
+@@ -102,12 +120,17 @@ invert_cmp(nir_op op)
+  *                 if uub(src) >= 0 && cmp >= 0 -> ult src, const
+  * ige src, const: if uub(src) >= 0 && cmp <  0 -> true
+  *                 if uub(src) >= 0 && cmp >= 0 -> uge src, const
++ *
++ * For signed comparisons, signed bounds also prove relations between two
++ * non-constant operands.  ieq/ine use the same bounds to prove that ranges
++ * are disjoint or are the same singleton.
+  */
+ static bool
+ opt_uub_cmp(nir_builder *b, nir_alu_instr *alu, opt_uub_state *state)
+ {
+    assert(alu->op == nir_op_ult || alu->op == nir_op_uge ||
+-          alu->op == nir_op_ilt || alu->op == nir_op_ige);
++          alu->op == nir_op_ilt || alu->op == nir_op_ige ||
++          alu->op == nir_op_ieq || alu->op == nir_op_ine);
+ 
+    if (nir_src_bit_size(alu->src[0].src) > 32)
+       return false;
+@@ -115,24 +138,74 @@ opt_uub_cmp(nir_builder *b, nir_alu_instr *alu, opt_uub_state *state)
+    nir_scalar src, cmp;
+    unsigned const_src_idx;
+ 
+-   if (!get_src_and_const(alu, &src, &cmp, &const_src_idx))
+-      return false;
++   if (!get_src_and_const(alu, &src, &cmp, &const_src_idx)) {
++      if (alu->op != nir_op_ilt && alu->op != nir_op_ige &&
++          alu->op != nir_op_ieq && alu->op != nir_op_ine)
++         return false;
+ 
+-   uint32_t src_uub = uub(state, src);
++      nir_scalar srcs[2];
++      get_srcs(alu, srcs);
++      const int32_t src0_upper = sub(state, srcs[0]);
++      const int32_t src0_lower = slb(state, srcs[0]);
++      const int32_t src1_upper = sub(state, srcs[1]);
++      const int32_t src1_lower = slb(state, srcs[1]);
++      const bool definitely_less = src0_upper < src1_lower;
++      const bool definitely_greater_equal = src0_lower >= src1_upper;
++      const bool disjoint = definitely_less || definitely_greater_equal;
++      const bool equal_singleton = src0_lower == src0_upper &&
++                                   src0_lower == src1_lower &&
++                                   src0_lower == src1_upper;
++      bool replacement;
++
++      if (alu->op == nir_op_ilt || alu->op == nir_op_ige) {
++         if (!disjoint)
++            return false;
++         replacement = alu->op == nir_op_ilt ? definitely_less : definitely_greater_equal;
++      } else {
++         if (!disjoint && !equal_singleton)
++            return false;
++         replacement = alu->op == nir_op_ieq ? equal_singleton : !equal_singleton;
++      }
++
++      b->cursor = nir_after_instr(&alu->instr);
++      nir_def_replace(&alu->def, nir_imm_bool(b, replacement));
++      return true;
++   }
+ 
+    /* To make the code below more uniform, make sure the constant is always
+-    * the RHS operand by inverting the opcode when it isn't.
++    * the RHS operand by inverting the opcode when it isn't. Equality is
++    * commutative, so its operand order does not matter.
+     */
+-   nir_op op = const_src_idx == 0 ? invert_cmp(alu->op) : alu->op;
++   nir_op op = const_src_idx == 0 && alu->op != nir_op_ieq && alu->op != nir_op_ine
++                  ? invert_cmp(alu->op)
++                  : alu->op;
++
++   /* Equality uses only signed bounds. Avoid populating the unsigned cache for
++    * it, because the result can be proven for entirely negative ranges. */
++   const uint32_t src_uub = op == nir_op_ieq || op == nir_op_ine ? 0 : uub(state, src);
  
     if (op == nir_op_ilt || op == nir_op_ige) {
 -      /* If src could be negative, there's nothing we can prove. */
@@ -26955,7 +27291,67 @@ index 19d50f5f72e10c66be2e6b9450e0b816ce4c4304..cd527aecba76ee48d7a3743e3c48a348
           b->cursor = nir_after_instr(&alu->instr);
           nir_def_replace(&alu->def, nir_imm_bool(b, replacement));
           return true;
-@@ -174,19 +206,37 @@ opt_uub_minmax(nir_builder *b, nir_alu_instr *alu, opt_uub_state *state)
+@@ -140,6 +213,20 @@ opt_uub_cmp(nir_builder *b, nir_alu_instr *alu, opt_uub_state *state)
+ 
+       /* src >= 0 && cmp >= 0: same as unsigned cmp. */
+       op = op == nir_op_ilt ? nir_op_ult : nir_op_uge;
++   } else if (op == nir_op_ieq || op == nir_op_ine) {
++      const int32_t src_upper = sub(state, src);
++      const int32_t src_lower = slb(state, src);
++      const int32_t cmp_value = nir_scalar_as_int(cmp);
++      const bool disjoint = src_upper < cmp_value || src_lower > cmp_value;
++      const bool equal_singleton = src_lower == cmp_value && src_upper == cmp_value;
++
++      if (!disjoint && !equal_singleton)
++         return false;
++
++      const bool replacement = op == nir_op_ieq ? equal_singleton : !equal_singleton;
++      b->cursor = nir_after_instr(&alu->instr);
++      nir_def_replace(&alu->def, nir_imm_bool(b, replacement));
++      return true;
+    }
+ 
+    if (src_uub >= nir_scalar_as_uint(cmp))
+@@ -167,26 +254,74 @@ opt_uub_minmax(nir_builder *b, nir_alu_instr *alu, opt_uub_state *state)
+ 
+    nir_scalar src, const_src;
+ 
+-   if (!get_src_and_const(alu, &src, &const_src, NULL))
+-      return false;
++   if (!get_src_and_const(alu, &src, &const_src, NULL)) {
++      if (alu->op != nir_op_imin && alu->op != nir_op_imax)
++         return false;
++
++      nir_scalar srcs[2];
++      get_srcs(alu, srcs);
++      const int32_t src0_upper = sub(state, srcs[0]);
++      const int32_t src0_lower = slb(state, srcs[0]);
++      const int32_t src1_upper = sub(state, srcs[1]);
++      const int32_t src1_lower = slb(state, srcs[1]);
++      nir_scalar replacement;
++
++      if (alu->op == nir_op_imin) {
++         if (src0_upper <= src1_lower)
++            replacement = srcs[0];
++         else if (src0_lower >= src1_upper)
++            replacement = srcs[1];
++         else
++            return false;
++      } else {
++         if (src0_lower >= src1_upper)
++            replacement = srcs[0];
++         else if (src0_upper <= src1_lower)
++            replacement = srcs[1];
++         else
++            return false;
++      }
++
++      b->cursor = nir_after_instr(&alu->instr);
++      nir_def_replace(&alu->def, nir_mov_scalar(b, replacement));
++      return true;
++   }
+ 
+    uint32_t src_uub = uub(state, src);
     nir_op op = alu->op;
  
     if (op == nir_op_imin || op == nir_op_imax) {
@@ -26997,7 +27393,16 @@ index 19d50f5f72e10c66be2e6b9450e0b816ce4c4304..cd527aecba76ee48d7a3743e3c48a348
        op = op == nir_op_imin ? nir_op_umin : nir_op_umax;
     }
  
-@@ -324,5 +374,9 @@ nir_opt_uub(nir_shader *shader, const nir_opt_uub_options *options)
+@@ -295,6 +430,8 @@ opt_uub(nir_builder *b, nir_alu_instr *alu, void *data)
+    case nir_op_uge:
+    case nir_op_ilt:
+    case nir_op_ige:
++   case nir_op_ieq:
++   case nir_op_ine:
+       return opt_uub_cmp(b, alu, state);
+    case nir_op_umin:
+    case nir_op_umax:
+@@ -324,5 +461,9 @@ nir_opt_uub(nir_shader *shader, const nir_opt_uub_options *options)
        nir_shader_alu_pass(shader, opt_uub, nir_metadata_control_flow, &state);
  
     _mesa_hash_table_destroy(state.range_ht, NULL);
@@ -27029,10 +27434,10 @@ index 0e42b425ee0750d478e94207fc2a19393f31392b..40118166f309d0d9edb560d960977926
  {
     struct linkage_info *linkage = MALLOC_STRUCT(linkage_info);
 diff --git a/src/compiler/nir/nir_range_analysis.c b/src/compiler/nir/nir_range_analysis.c
-index 058480342b44735ff7a2ef676a95ef252bb5f873..a1297916ecb9b4b7c8fe46a91ff52d2d4823ce0a 100644
+index 058480342b44735ff7a2ef676a95ef252bb5f873..7cd7b644c738f992d04424aee0ae137be36e198a 100644
 --- a/src/compiler/nir/nir_range_analysis.c
 +++ b/src/compiler/nir/nir_range_analysis.c
-@@ -2133,6 +2133,189 @@ get_phi_uub(struct analysis_state *state, struct scalar_query q, uint32_t *resul
+@@ -2133,6 +2133,299 @@ get_phi_uub(struct analysis_state *state, struct scalar_query q, uint32_t *resul
     get_phi_query(state, q, result, src, max2, bitmask(q.scalar.def->bit_size));
  }
  
@@ -27059,6 +27464,22 @@ index 058480342b44735ff7a2ef676a95ef252bb5f873..a1297916ecb9b4b7c8fe46a91ff52d2d
 +   return (int32_t)a > (int32_t)b ? a : b;
 +}
 +
++static bool
++get_alu_const_src(nir_scalar scalar, nir_scalar *constant)
++{
++   const nir_op op = nir_scalar_alu_op(scalar);
++
++   for (unsigned i = 0; i < nir_op_infos[op].num_inputs; i++) {
++      nir_scalar src = nir_scalar_chase_alu_src(scalar, i);
++      if (nir_scalar_is_const(src)) {
++         *constant = src;
++         return true;
++      }
++   }
++
++   return false;
++}
++
 +/* Conservative signed one-sided bounds.  Keep this deliberately small: every
 + * transfer function below is exact under NIR's integer semantics, while an
 + * unsupported operation returns the signed type extrema. */
@@ -27069,17 +27490,88 @@ index 058480342b44735ff7a2ef676a95ef252bb5f873..a1297916ecb9b4b7c8fe46a91ff52d2d
 +   const nir_op op = nir_scalar_alu_op(q.scalar);
 +
 +   switch (op) {
++   case nir_op_mov:
 +   case nir_op_imin:
 +   case nir_op_imax:
 +   case nir_op_bcsel:
 +   case nir_op_b32csel:
 +      break;
++   case nir_op_extract_u8:
++      if (q.scalar.def->bit_size > 8)
++         *result = upper ? UINT8_MAX : 0;
++      return;
 +   case nir_op_extract_i8:
 +      *result = (uint32_t)signed_bound_default(8, upper);
++      return;
++   case nir_op_extract_u16:
++      if (q.scalar.def->bit_size > 16)
++         *result = upper ? UINT16_MAX : 0;
 +      return;
 +   case nir_op_extract_i16:
 +      *result = (uint32_t)signed_bound_default(16, upper);
 +      return;
++   case nir_op_isign:
++      *result = upper ? 1 : -1;
++      return;
++   case nir_op_uadd_carry:
++   case nir_op_usub_borrow:
++      *result = upper ? 1 : 0;
++      return;
++   case nir_op_udiv_aligned_4:
++      *result = upper ? bitmask(q.scalar.def->bit_size > 2 ? q.scalar.def->bit_size - 2 : 0) : 0;
++      return;
++   case nir_op_ubitfield_extract:
++   case nir_op_ibitfield_extract: {
++      nir_scalar bits_src = nir_scalar_chase_alu_src(q.scalar, 2);
++      if (!nir_scalar_is_const(bits_src))
++         return;
++
++      const int32_t bits = nir_scalar_as_int(bits_src);
++      if (bits <= 0) {
++         *result = 0;
++      } else if ((unsigned)bits < q.scalar.def->bit_size) {
++         *result = op == nir_op_ubitfield_extract
++                      ? (upper ? bitmask(bits) : 0)
++                      : (uint32_t)signed_bound_default(bits, upper);
++      }
++      return;
++   }
++   case nir_op_bit_count:
++   case nir_op_uclz:
++      *result = upper ? nir_scalar_chase_alu_src(q.scalar, 0).def->bit_size : 0;
++      return;
++   case nir_op_ufind_msb:
++   case nir_op_find_lsb:
++      *result = upper ? nir_scalar_chase_alu_src(q.scalar, 0).def->bit_size - 1 : -1;
++      return;
++   case nir_op_ifind_msb:
++      *result = upper ? q.scalar.def->bit_size - 2 : -1;
++      return;
++   case nir_op_ifind_msb_rev:
++      *result = upper ? q.scalar.def->bit_size - 1 : -1;
++      return;
++   case nir_op_iand: {
++      nir_scalar constant;
++      if (!get_alu_const_src(q.scalar, &constant))
++         return;
++
++      const uint32_t mask = nir_scalar_as_uint(constant);
++      if (!(mask & (1u << (q.scalar.def->bit_size - 1))) &&
++          q.scalar.def->bit_size > 1) {
++         *result = upper ? mask : 0;
++      }
++      return;
++   }
++   case nir_op_ior: {
++      nir_scalar constant;
++      if (!get_alu_const_src(q.scalar, &constant))
++         return;
++
++      const uint32_t mask = nir_scalar_as_uint(constant);
++      if (mask & (1u << (q.scalar.def->bit_size - 1)))
++         *result = upper ? -1 : util_sign_extend(mask, q.scalar.def->bit_size);
++      return;
++   }
 +   case nir_op_b2i8:
 +   case nir_op_b2i16:
 +   case nir_op_b2i32:
@@ -27110,6 +27602,26 @@ index 058480342b44735ff7a2ef676a95ef252bb5f873..a1297916ecb9b4b7c8fe46a91ff52d2d
 +      *result = bits ? (uint32_t)signed_bound_default(bits, upper) : 0;
 +      return;
 +   }
++   case nir_op_ubfe: {
++      nir_scalar bits_src = nir_scalar_chase_alu_src(q.scalar, 2);
++      if (!nir_scalar_is_const(bits_src))
++         return;
++
++      /* SM5 ubfe uses only the low five bits of its width operand. */
++      const unsigned bits = nir_scalar_as_uint(bits_src) & 0x1f;
++      *result = upper ? bitmask(bits) : 0;
++      return;
++   }
++   case nir_op_ushr: {
++      nir_scalar shift_src = nir_scalar_chase_alu_src(q.scalar, 1);
++      if (!nir_scalar_is_const(shift_src))
++         return;
++
++      const unsigned shift = nir_scalar_as_uint(shift_src) & (q.scalar.def->bit_size - 1);
++      if (shift)
++         *result = upper ? bitmask(q.scalar.def->bit_size - shift) : 0;
++      return;
++   }
 +   case nir_op_ishr: {
 +      nir_scalar shift_src = nir_scalar_chase_alu_src(q.scalar, 1);
 +      if (!nir_scalar_is_const(shift_src))
@@ -27130,6 +27642,9 @@ index 058480342b44735ff7a2ef676a95ef252bb5f873..a1297916ecb9b4b7c8fe46a91ff52d2d
 +   }
 +
 +   switch (op) {
++   case nir_op_mov:
++      *result = src[0];
++      break;
 +   case nir_op_imin:
 +      *result = signed_min(src[0], src[1]);
 +      break;
@@ -27222,7 +27737,7 @@ index 058480342b44735ff7a2ef676a95ef252bb5f873..a1297916ecb9b4b7c8fe46a91ff52d2d
  static void
  process_uub_query(struct analysis_state *state, struct analysis_query *aq, uint32_t *result,
                    const uint32_t *src)
-@@ -2490,6 +2673,15 @@ get_intrinsic_num_lsb(struct analysis_state *state, struct scalar_query q, uint3
+@@ -2490,6 +2783,15 @@ get_intrinsic_num_lsb(struct analysis_state *state, struct scalar_query q, uint3
           *result = src[0];
        }
        break;
@@ -27238,7 +27753,7 @@ index 058480342b44735ff7a2ef676a95ef252bb5f873..a1297916ecb9b4b7c8fe46a91ff52d2d
     default:
        break;
     }
-@@ -2518,6 +2710,7 @@ get_alu_num_lsb(struct analysis_state *state, struct scalar_query q, uint32_t *r
+@@ -2518,6 +2820,7 @@ get_alu_num_lsb(struct analysis_state *state, struct scalar_query q, uint32_t *r
     case nir_op_iadd:
     case nir_op_iand:
     case nir_op_imul:
@@ -27246,7 +27761,7 @@ index 058480342b44735ff7a2ef676a95ef252bb5f873..a1297916ecb9b4b7c8fe46a91ff52d2d
        if (!q.head.pushed_queries) {
           push_scalar_query(state, nir_scalar_chase_alu_src(q.scalar, 0));
           push_scalar_query(state, nir_scalar_chase_alu_src(q.scalar, 1));
-@@ -2525,6 +2718,7 @@ get_alu_num_lsb(struct analysis_state *state, struct scalar_query q, uint32_t *r
+@@ -2525,6 +2828,7 @@ get_alu_num_lsb(struct analysis_state *state, struct scalar_query q, uint32_t *r
        }
        break;
     case nir_op_ishl:
@@ -27254,7 +27769,7 @@ index 058480342b44735ff7a2ef676a95ef252bb5f873..a1297916ecb9b4b7c8fe46a91ff52d2d
        if (!q.head.pushed_queries) {
           push_scalar_query(state, nir_scalar_chase_alu_src(q.scalar, 0));
           return;
-@@ -2582,6 +2776,14 @@ get_alu_num_lsb(struct analysis_state *state, struct scalar_query q, uint32_t *r
+@@ -2582,6 +2886,14 @@ get_alu_num_lsb(struct analysis_state *state, struct scalar_query q, uint32_t *r
        *result = MIN2(src[0], src[1]);
        break;
     }
@@ -27269,8 +27784,135 @@ index 058480342b44735ff7a2ef676a95ef252bb5f873..a1297916ecb9b4b7c8fe46a91ff52d2d
     default:
        UNREACHABLE("Unknown opcode");
     }
+diff --git a/src/compiler/nir/tests/loop_analyze_tests.cpp b/src/compiler/nir/tests/loop_analyze_tests.cpp
+index b4ca8c0d44695791d9c2245b2e7fa040246c949a..e18c0a7d834a801e2ef7a2b5988766fcac6a914b 100644
+--- a/src/compiler/nir/tests/loop_analyze_tests.cpp
++++ b/src/compiler/nir/tests/loop_analyze_tests.cpp
+@@ -2011,6 +2011,122 @@ TWO_TERMINATOR_INEXACT_COUNT_TEST(input_unsigned_limit_j_limit, false, true, fal
+  */
+ TWO_TERMINATOR_INEXACT_COUNT_TEST(input_unsigned_j_limit2, false, true, true, false, uge, 4, 30, 6, 4)
+ 
++static nir_loop *
++loop_builder_signed_range_limit(nir_builder *b)
++{
++   /*
++    * int i = 0;
++    * int limit = int8_t(load_global());
++    * while (true) {
++    *    if (limit < i)
++    *       break;
++    *    i++;
++    * }
++    */
++   nir_def *zero = nir_imm_int(b, 0);
++   nir_def *one = nir_imm_int(b, 1);
++   nir_def *unknown8 = nir_load_global(b, 1, 8, nir_undef(b, 1, 64));
++   nir_def *limit = nir_i2i32(b, unknown8);
++   nir_phi_instr *phi = nir_phi_instr_create(b->shader);
++
++   nir_loop *loop = nir_push_loop(b);
++   {
++      nir_def_init(&phi->instr, &phi->def, 1, 32);
++      nir_phi_instr_add_src(phi, nir_def_block(zero), zero);
++
++      nir_def *i = &phi->def;
++      nir_def *cond = nir_ilt(b, limit, i);
++      nir_if *nif = nir_push_if(b, cond);
++      {
++         nir_jump_instr *jump =
++            nir_jump_instr_create(b->shader, nir_jump_break);
++         nir_builder_instr_insert(b, &jump->instr);
++      }
++      nir_pop_if(b, nif);
++
++      nir_def *next = nir_iadd(b, i, one);
++      nir_phi_instr_add_src(phi, nir_def_block(next), next);
++   }
++   nir_pop_loop(b, loop);
++
++   b->cursor = nir_before_block(nir_loop_first_block(loop));
++   nir_builder_instr_insert(b, &phi->instr);
++
++   return loop;
++}
++
++TEST_F(nir_loop_analyze_test, signed_range_limit)
++{
++   nir_loop *loop = loop_builder_signed_range_limit(&b);
++
++   nir_validate_shader(b.shader, "input");
++   nir_loop_analyze_impl(b.impl, nir_var_all, false);
++
++   ASSERT_NE((void *)0, loop->info);
++   ASSERT_NE((void *)0, loop->info->limiting_terminator);
++   EXPECT_EQ(128, loop->info->max_trip_count);
++   EXPECT_FALSE(loop->info->exact_trip_count_known);
++   EXPECT_TRUE(loop->info->limiting_terminator->exact_trip_count_unknown);
++}
++
++static nir_loop *
++loop_builder_signed_lower_range_limit(nir_builder *b)
++{
++   /*
++    * int i = 8;
++    * int limit = int8_t(load_global());
++    * while (true) {
++    *    if (i < limit)
++    *       break;
++    *    i--;
++    * }
++    */
++   nir_def *eight = nir_imm_int(b, 8);
++   nir_def *minus_one = nir_imm_int(b, -1);
++   nir_def *unknown8 = nir_load_global(b, 1, 8, nir_undef(b, 1, 64));
++   nir_def *limit = nir_i2i32(b, unknown8);
++   nir_phi_instr *phi = nir_phi_instr_create(b->shader);
++
++   nir_loop *loop = nir_push_loop(b);
++   {
++      nir_def_init(&phi->instr, &phi->def, 1, 32);
++      nir_phi_instr_add_src(phi, nir_def_block(eight), eight);
++
++      nir_def *i = &phi->def;
++      nir_def *cond = nir_ilt(b, i, limit);
++      nir_if *nif = nir_push_if(b, cond);
++      {
++         nir_jump_instr *jump =
++            nir_jump_instr_create(b->shader, nir_jump_break);
++         nir_builder_instr_insert(b, &jump->instr);
++      }
++      nir_pop_if(b, nif);
++
++      nir_def *next = nir_iadd(b, i, minus_one);
++      nir_phi_instr_add_src(phi, nir_def_block(next), next);
++   }
++   nir_pop_loop(b, loop);
++
++   b->cursor = nir_before_block(nir_loop_first_block(loop));
++   nir_builder_instr_insert(b, &phi->instr);
++
++   return loop;
++}
++
++TEST_F(nir_loop_analyze_test, signed_lower_range_limit)
++{
++   nir_loop *loop = loop_builder_signed_lower_range_limit(&b);
++
++   nir_validate_shader(b.shader, "input");
++   nir_loop_analyze_impl(b.impl, nir_var_all, false);
++
++   ASSERT_NE((void *)0, loop->info);
++   ASSERT_NE((void *)0, loop->info->limiting_terminator);
++   EXPECT_EQ(137, loop->info->max_trip_count);
++   EXPECT_FALSE(loop->info->exact_trip_count_known);
++   EXPECT_TRUE(loop->info->limiting_terminator->exact_trip_count_unknown);
++}
++
+ static nir_loop *
+ loop_builder_guessed_trip_count(nir_builder *b, bool array_access)
+ {
 diff --git a/src/compiler/nir/tests/range_analysis_tests.cpp b/src/compiler/nir/tests/range_analysis_tests.cpp
-index 2bbf1ca1d332e716bdb5e57eea80df6ac7c33fc6..c3e486bcb00338460c6387c9cad638c86dc6e9b2 100644
+index 2bbf1ca1d332e716bdb5e57eea80df6ac7c33fc6..790d58036f2f077919f813469485471e4b18da6b 100644
 --- a/src/compiler/nir/tests/range_analysis_tests.cpp
 +++ b/src/compiler/nir/tests/range_analysis_tests.cpp
 @@ -41,6 +41,14 @@ protected:
@@ -27288,7 +27930,7 @@ index 2bbf1ca1d332e716bdb5e57eea80df6ac7c33fc6..c3e486bcb00338460c6387c9cad638c8
  static bool
  is_used_once(const nir_def *def)
  {
-@@ -254,6 +262,180 @@ TEST_F(ssa_def_bits_used_test, extract_u8_with_const_index)
+@@ -254,6 +262,306 @@ TEST_F(ssa_def_bits_used_test, extract_u8_with_const_index)
     }
  }
  
@@ -27367,6 +28009,71 @@ index 2bbf1ca1d332e716bdb5e57eea80df6ac7c33fc6..c3e486bcb00338460c6387c9cad638c8
 +   _mesa_hash_table_destroy(lower_ht, NULL);
 +}
 +
++TEST_F(signed_bound_test, additional_signed_output_domains)
++{
++   nir_def *unknown = nir_load_global(b, 1, 32, nir_undef(b, 1, 64));
++   nir_def *sign = nir_isign(b, unknown);
++   nir_def *move = nir_mov(b, sign);
++   nir_def *byte = nir_extract_u8_imm(b, unknown, 0);
++   nir_def *halfword = nir_extract_u16(b, unknown, nir_imm_int(b, 0));
++   nir_def *ubfe = nir_ubfe_imm(b, unknown, 0, 7);
++   nir_def *ubitfield = nir_ubitfield_extract_imm(b, unknown, 0, 7);
++   nir_def *ibitfield = nir_ibitfield_extract_imm(b, unknown, 0, 7);
++   nir_def *shift = nir_ushr_imm(b, unknown, 1);
++   nir_def *aligned_div = nir_udiv_aligned_4(b, unknown);
++   nir_def *carry = nir_uadd_carry(b, unknown, unknown);
++   nir_def *borrow = nir_usub_borrow(b, unknown, unknown);
++   nir_def *count = nir_bit_count(b, unknown);
++   nir_def *clz = nir_uclz(b, unknown);
++   nir_def *msb = nir_ufind_msb(b, unknown);
++   nir_def *signed_msb = nir_ifind_msb(b, unknown);
++   nir_def *lsb = nir_find_lsb(b, unknown);
++   nir_def *masked = nir_iand_imm(b, unknown, 0x7fff);
++   nir_def *negative = nir_ior_imm(b, unknown, 0x80001000);
++
++   struct hash_table *upper_ht = _mesa_pointer_hash_table_create(NULL);
++   struct hash_table *lower_ht = _mesa_pointer_hash_table_create(NULL);
++
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(move, 0)), -1);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(move, 0)), 1);
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(byte, 0)), 0);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(byte, 0)), UINT8_MAX);
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(halfword, 0)), 0);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(halfword, 0)), UINT16_MAX);
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(ubfe, 0)), 0);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(ubfe, 0)), 127);
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(ubitfield, 0)), 0);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(ubitfield, 0)), 127);
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(ibitfield, 0)), -64);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(ibitfield, 0)), 63);
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(shift, 0)), 0);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(shift, 0)), INT32_MAX);
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(aligned_div, 0)), 0);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(aligned_div, 0)), 0x3fffffff);
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(carry, 0)), 0);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(carry, 0)), 1);
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(borrow, 0)), 0);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(borrow, 0)), 1);
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(count, 0)), 0);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(count, 0)), 32);
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(clz, 0)), 0);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(clz, 0)), 32);
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(msb, 0)), -1);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(msb, 0)), 31);
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(signed_msb, 0)), -1);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(signed_msb, 0)), 30);
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(lsb, 0)), -1);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(lsb, 0)), 31);
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(masked, 0)), 0);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(masked, 0)), 0x7fff);
++   EXPECT_EQ(nir_signed_lower_bound(b->shader, lower_ht, nir_get_scalar(negative, 0)),
++             INT32_MIN + 0x1000);
++   EXPECT_EQ(nir_signed_upper_bound(b->shader, upper_ht, nir_get_scalar(negative, 0)), -1);
++
++   _mesa_hash_table_destroy(upper_ht, NULL);
++   _mesa_hash_table_destroy(lower_ht, NULL);
++}
++
 +TEST_F(signed_bound_test, signed_and_unsigned_widening)
 +{
 +   nir_def *unknown8 = nir_load_global(b, 1, 8, nir_undef(b, 1, 64));
@@ -27428,6 +28135,25 @@ index 2bbf1ca1d332e716bdb5e57eea80df6ac7c33fc6..c3e486bcb00338460c6387c9cad638c8
 +   EXPECT_EQ(nir_src_as_uint(ge_result_alu->src[0].src), 1u);
 +}
 +
++TEST_F(signed_bound_test, opt_uub_signed_boolean_output_domain)
++{
++   nir_def *unknown = nir_load_global(b, 1, 32, nir_undef(b, 1, 64));
++   nir_def *carry = nir_uadd_carry(b, unknown, unknown);
++   nir_def *lt = nir_ilt(b, carry, nir_imm_int(b, 2));
++   nir_def *equal = nir_ieq(b, carry, nir_imm_int(b, 2));
++   nir_def *lt_result = nir_bcsel(b, lt, nir_imm_int(b, 1), nir_imm_int(b, 0));
++   nir_def *equal_result = nir_bcsel(b, equal, nir_imm_int(b, 1), nir_imm_int(b, 0));
++   nir_alu_instr *lt_result_alu = nir_def_as_alu(lt_result);
++   nir_alu_instr *equal_result_alu = nir_def_as_alu(equal_result);
++
++   nir_opt_uub_options options = {};
++   EXPECT_TRUE(nir_opt_uub(b->shader, &options));
++   EXPECT_TRUE(nir_src_is_const(lt_result_alu->src[0].src));
++   EXPECT_EQ(nir_src_as_uint(lt_result_alu->src[0].src), 1u);
++   EXPECT_TRUE(nir_src_is_const(equal_result_alu->src[0].src));
++   EXPECT_EQ(nir_src_as_uint(equal_result_alu->src[0].src), 0u);
++}
++
 +TEST_F(signed_bound_test, opt_uub_signed_minmax)
 +{
 +   nir_def *unknown = nir_load_global(b, 1, 32, nir_undef(b, 1, 64));
@@ -27464,6 +28190,48 @@ index 2bbf1ca1d332e716bdb5e57eea80df6ac7c33fc6..c3e486bcb00338460c6387c9cad638c8
 +   EXPECT_EQ(nir_src_as_uint(lt_result_alu->src[0].src), 1u);
 +   EXPECT_TRUE(nir_src_is_const(ge_result_alu->src[0].src));
 +   EXPECT_EQ(nir_src_as_uint(ge_result_alu->src[0].src), 1u);
++}
++
++TEST_F(signed_bound_test, opt_uub_signed_operand_relations)
++{
++   nir_def *unknown8 = nir_load_global(b, 1, 8, nir_undef(b, 1, 64));
++   nir_def *unknown32 = nir_load_global(b, 1, 32, nir_undef(b, 1, 64));
++   nir_def *low = nir_i2i32(b, unknown8);
++   nir_def *high = nir_imax(b, unknown32, nir_imm_int(b, 256));
++   nir_def *higher = nir_imax(b, unknown32, nir_imm_int(b, 2));
++   nir_def *sign = nir_isign(b, unknown32);
++   nir_def *less = nir_ilt(b, low, high);
++   nir_def *greater_equal = nir_ige(b, high, low);
++   nir_def *equal = nir_ieq(b, sign, higher);
++   nir_def *not_equal = nir_ine(b, sign, higher);
++   nir_def *minimum = nir_imin(b, low, high);
++   nir_def *maximum = nir_imax(b, low, high);
++   nir_def *less_result = nir_bcsel(b, less, nir_imm_int(b, 1), nir_imm_int(b, 0));
++   nir_def *greater_equal_result =
++      nir_bcsel(b, greater_equal, nir_imm_int(b, 1), nir_imm_int(b, 0));
++   nir_def *equal_result = nir_bcsel(b, equal, nir_imm_int(b, 1), nir_imm_int(b, 0));
++   nir_def *not_equal_result = nir_bcsel(b, not_equal, nir_imm_int(b, 1), nir_imm_int(b, 0));
++   nir_def *minimum_use = nir_iadd_imm(b, minimum, 1);
++   nir_def *maximum_use = nir_iadd_imm(b, maximum, 1);
++   nir_alu_instr *less_result_alu = nir_def_as_alu(less_result);
++   nir_alu_instr *greater_equal_result_alu = nir_def_as_alu(greater_equal_result);
++   nir_alu_instr *equal_result_alu = nir_def_as_alu(equal_result);
++   nir_alu_instr *not_equal_result_alu = nir_def_as_alu(not_equal_result);
++   nir_alu_instr *minimum_use_alu = nir_def_as_alu(minimum_use);
++   nir_alu_instr *maximum_use_alu = nir_def_as_alu(maximum_use);
++
++   nir_opt_uub_options options = {};
++   EXPECT_TRUE(nir_opt_uub(b->shader, &options));
++   EXPECT_TRUE(nir_src_is_const(less_result_alu->src[0].src));
++   EXPECT_EQ(nir_src_as_uint(less_result_alu->src[0].src), 1u);
++   EXPECT_TRUE(nir_src_is_const(greater_equal_result_alu->src[0].src));
++   EXPECT_EQ(nir_src_as_uint(greater_equal_result_alu->src[0].src), 1u);
++   EXPECT_TRUE(nir_src_is_const(equal_result_alu->src[0].src));
++   EXPECT_EQ(nir_src_as_uint(equal_result_alu->src[0].src), 0u);
++   EXPECT_TRUE(nir_src_is_const(not_equal_result_alu->src[0].src));
++   EXPECT_EQ(nir_src_as_uint(not_equal_result_alu->src[0].src), 1u);
++   EXPECT_EQ(minimum_use_alu->src[0].src.ssa, low);
++   EXPECT_EQ(maximum_use_alu->src[0].src.ssa, high);
 +}
 +
  /* Unsigned upper bound analysis should look through a bcsel which uses the phi. */
