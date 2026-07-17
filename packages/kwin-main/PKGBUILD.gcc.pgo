@@ -1,19 +1,12 @@
 # Maintainer: Felix Yan <felixonmars@archlinux.org>
 # Maintainer: Antonio Rojas <arojas@archlinux.org>
 # Contributor: Andrea Scarpino <andrea@archlinux.org>
-# PGO (GCC) variant by ms178 — perfected for CachyOS /etc/makepkg.conf
-#
-# Only PGO-related flags are set here. The user's CFLAGS / CXXFLAGS /
-# LDFLAGS / CPPFLAGS from /etc/makepkg.conf are honoured verbatim
-# (including CachyOS's -march=, -O3, -fno-omit-frame-pointer, -flto=auto,
-# -fno-fat-lto-objects, FORTIFY_SOURCE, etc.). Any attempt by the previous
-# PKGBUILD to hard-code -O3 / -march=native / -g1 / -flto=auto was a bug
-# that silently clobbered the system-wide tuning — it is gone.
+# PGO (GCC) variant by ms178 — perfected for CachyOS
 
 pkgname=kwin
 pkgver=6.7.3
 _dirver=$(echo $pkgver | cut -d. -f1-3)
-pkgrel=4.1
+pkgrel=3.2
 pkgdesc='An easy to use, but flexible, Wayland compositor (GCC PGO, CachyOS-tuned)'
 arch=(x86_64)
 url='https://kde.org/plasma-desktop/'
@@ -146,8 +139,6 @@ validpgpkeys=('E0A3EB202F8E57528E13E72FD7574483BB57B18D'  # Jonathan Esk-Riddell
 #   - -flto=auto / -fno-fat-lto-objects                    → makepkg.conf
 #   - -fno-omit-frame-pointer                              → makepkg.conf
 #   - -D_FORTIFY_SOURCE=3                                  → CPPFLAGS
-# Overriding any of the above inside the PKGBUILD was the root cause of
-# the original "doesn't respect my makepkg.conf" bug.
 # ---------------------------------------------------------------------------
 
 _pgo_gen_flags=('-fprofile-generate=$PGO_DIR'
@@ -270,20 +261,51 @@ _run_cmake() {
 }
 
 # Training driver: the KWin test suite. Each integration test is a fully
-# fledged headless KWin compositor through the VirtualBackend; KWin's
-# autotests wrap each test in dbus-run-session for us.
+# fledged headless KWin compositor through the VirtualBackend.
+#
+# Environment hardening (the combination matters):
+#   * dbus-run-session wraps the ENTIRE ctest, not just individual tests —
+#     this keeps stray test-spawned Qt/KDE helpers (kcminit,
+#     kactivitymanagerd, Qt accessibility bridge) from attaching to your
+#     live session bus and spewing "database is locked" / xcb_connect
+#     errors into journalctl.
+#   * XDG_RUNTIME_DIR points at a fresh per-invocation tmpdir so the
+#     nested KWin instances don't see your live wayland-0 / pipewire-0 /
+#     Pulse / X11 sockets.
+#   * DISPLAY / WAYLAND_DISPLAY / XAUTHORITY are UNSET — without this, Qt
+#     platform plugins from forked test helpers try to connect to the
+#     live desktop (which is what produced the "could not connect to
+#     display :9" kcminit spam in your log).
+#   * KWIN_DRM_DEVICES=/dev/dri/renderD128 is NOT set; leaving it empty
+#     makes DRM-backend tests self-skip instead of crashing against the
+#     already-mastered GPU. The integration tests we care about use
+#     VirtualBackend, not DRM.
+#   * Tests that require exclusive hardware (Drm*/Libinput*/Udev* backends)
+#     are excluded via -E — they cannot run safely inside an active
+#     desktop session and they don't add useful profile coverage for
+#     the Wayland/Virtual path we're tuning anyway.
+#   * QT_LOGGING_RULES silences the per-test Qt debug flood.
 _kwin_workload() {
   local _build="$1" _log_tag="$2"
-  printf '  -> [WORKLOAD] ctest in %s (-j%s)\n' "$_build" "$(nproc)"
+  printf '  -> [WORKLOAD] ctest in %s (-j%s, isolated)\n' "$_build" "$(nproc)"
   local _rd _log
   _rd="$(mktemp -d "${srcdir:-.}/.kwin-rd.XXXXXX")"
   chmod 700 "$_rd"
   _log="${srcdir:-.}/kwin-ctest-${_log_tag}.log"
   ( cd "$_build" || exit 1
+    unset DISPLAY WAYLAND_DISPLAY XAUTHORITY
     XDG_RUNTIME_DIR="$_rd" \
-    QT_LOGGING_RULES='*.debug=false;*.info=false' \
-      ctest --output-on-failure --timeout 600 -j"$(nproc)" \
-        >"$_log" 2>&1 || true )
+    QT_QPA_PLATFORM=offscreen \
+    QT_LOGGING_RULES='*.debug=false;*.info=false;kf.*.debug=false;qt.*.debug=false' \
+    KWIN_DRM_DEVICES="" \
+    KDE_FULL_SESSION="" \
+    XDG_CURRENT_DESKTOP="" \
+      dbus-run-session -- \
+        ctest --output-on-failure \
+              --timeout 180 \
+              -j"$(nproc)" \
+              -E '(Drm|drm|Libinput|libinput|Udev|udev|Glx|Vulkan)' \
+          >"$_log" 2>&1 || true )
   rm -rf "$_rd"
   local _sum
   _sum="$(grep -E '[0-9]+% tests passed, [0-9]+ tests failed out of [0-9]+' \
@@ -298,6 +320,10 @@ _kwin_workload() {
 # ctest exercises libkwin.so through test binaries but never exec()s the
 # kwin_wayland executable itself. Run kwin_wayland --virtual to make sure
 # the kwin_wayland binary and the late-init code paths are profiled too.
+#
+# Same isolation as _kwin_workload(): private XDG_RUNTIME_DIR, no DISPLAY/
+# WAYLAND_DISPLAY leak from the user's live session, wrapped in its own
+# dbus-run-session so it doesn't spam the real session bus.
 _kwin_bin_workload() {
   local _bin="$1" _runs="${2:-12}"
   [[ -x "$_bin" ]] || { warning "[BIN-WORKLOAD] $_bin not executable"; return 0; }
@@ -309,8 +335,11 @@ _kwin_bin_workload() {
   _cap="$(nproc)"
   for _i in $(seq 1 "$_runs"); do
     mkdir -p "$_rd/r$_i" && chmod 700 "$_rd/r$_i"
-    ( export XDG_RUNTIME_DIR="$_rd/r$_i"
+    ( unset DISPLAY WAYLAND_DISPLAY XAUTHORITY
+      export XDG_RUNTIME_DIR="$_rd/r$_i"
+      export QT_QPA_PLATFORM=offscreen
       export QT_LOGGING_RULES='*.debug=false;*.info=false'
+      export KWIN_DRM_DEVICES=""
       timeout -k 5 90 dbus-run-session -- \
         "$_bin" --virtual --exit-with-session=/bin/true \
         >/dev/null 2>&1 ) &
