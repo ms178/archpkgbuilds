@@ -67,7 +67,7 @@ and echo "note: running interactively; keep an eye on stage failures"
 #   LLVM_VERSION is displayed to the user but is not used for the tag
 #   lookup; LLVM_REF is what actually gets checked out.
 set --global LLVM_VERSION      "22.99.0-92f01b2"        # snapshot ahead of 22.1.8
-set --global LLVM_REF          "4d5856669efa7a1271d2f5201bb3ebf32420ffde"
+set --global LLVM_REF          "ccd0e982a02fa3be39a98dd98ea6cc1ccaf24d13"
 set --global LLVM_REPO         "https://github.com/llvm/llvm-project.git"
 
 # ms178 performance patch set applied on top of the pinned commit.
