@@ -1,20 +1,21 @@
-From 380eeec6f0a497a71d9524260a93434551c248fe Mon Sep 17 00:00:00 2001
-From: audit <audit@local>
-Date: Wed, 8 Jul 2026 20:16:28 +0000
-Subject: [PATCH] custom 0001-6.18.35-nap-v0.4.0.patch
+From 7d5cf4c7686e6199fa8400b25c70740b32623de0 Mon Sep 17 00:00:00 2001
+From: Arena-Agent <agent@arena.ai>
+Date: Sun, 19 Jul 2026 22:07:15 +0000
+Subject: [PATCH] Rebase NAP v0.4.0 onto Linux v6.18.39 with ring and
+ state-cache fixes
 
 ---
  drivers/cpuidle/Kconfig                       |  17 +
  drivers/cpuidle/governors/Makefile            |   1 +
  drivers/cpuidle/governors/nap/Makefile        |  64 ++
- drivers/cpuidle/governors/nap/nap.c           | 679 ++++++++++++++++++
+ drivers/cpuidle/governors/nap/nap.c           | 682 ++++++++++++++++++
  drivers/cpuidle/governors/nap/nap.h           | 376 ++++++++++
- drivers/cpuidle/governors/nap/nap_fpu.c       | 530 ++++++++++++++
+ drivers/cpuidle/governors/nap/nap_fpu.c       | 542 ++++++++++++++
  drivers/cpuidle/governors/nap/nap_nn_avx2.c   | 242 +++++++
  drivers/cpuidle/governors/nap/nap_nn_avx512.c | 236 ++++++
  drivers/cpuidle/governors/nap/nap_nn_native.c |  14 +
  drivers/cpuidle/governors/nap/nap_nn_sse2.c   | 150 ++++
- 10 files changed, 2309 insertions(+)
+ 10 files changed, 2324 insertions(+)
  create mode 100644 drivers/cpuidle/governors/nap/Makefile
  create mode 100644 drivers/cpuidle/governors/nap/nap.c
  create mode 100644 drivers/cpuidle/governors/nap/nap.h
@@ -133,10 +134,10 @@ index 0000000000000000000000000000000000000000..0258623c25a7530d0af25f5f09ed2955
 +                          -mavx512f -mavx512vl -mavx512dq -mavx512bw
 diff --git a/drivers/cpuidle/governors/nap/nap.c b/drivers/cpuidle/governors/nap/nap.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..20bb8610e9c4780d06361eb19060846d2f98d5ac
+index 0000000000000000000000000000000000000000..26fd377b54179638d0f7883e92366626495e6edd
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.c
-@@ -0,0 +1,679 @@
+@@ -0,0 +1,682 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap.c — Neural Adaptive Predictor cpuidle governor (v0.4.0-r1)
@@ -175,6 +176,7 @@ index 0000000000000000000000000000000000000000..20bb8610e9c4780d06361eb19060846d
 +#include <linux/printk.h>
 +#include <linux/sched/clock.h>
 +#include <linux/string.h>
++#include <linux/smp.h>
 +#include <linux/sysfs.h>
 +#include <linux/tick.h>
 +
@@ -597,7 +599,7 @@ index 0000000000000000000000000000000000000000..20bb8610e9c4780d06361eb19060846d
 +	len += sysfs_emit_at(buf, len, "overshoot_count: %llu\n", total_under);
 +	len += sysfs_emit_at(buf, len, "overshoot_rate_permil: %llu\n",
 +			     total_sel ?
-+			     div_u64(total_under * 1000, total_sel) : 0);
++			     mul_u64_u64_div_u64(total_under, 1000, total_sel) : 0);
 +	len += sysfs_emit_at(buf, len, "learn_count: %llu\n", total_learn);
 +	return len;
 +}
@@ -687,15 +689,17 @@ index 0000000000000000000000000000000000000000..20bb8610e9c4780d06361eb19060846d
 +	return count;
 +}
 +
++static void nap_reset_stats_cpu(void *unused)
++{
++	memset(&this_cpu_ptr(&nap_data)->stats, 0,
++	       sizeof(struct nap_stats));
++}
++
 +static ssize_t reset_stats_store(struct kobject *kobj,
 +				 struct kobj_attribute *attr,
 +				 const char *buf, size_t count)
 +{
-+	int cpu;
-+
-+	for_each_online_cpu(cpu)
-+		memset(&per_cpu(nap_data, cpu).stats, 0,
-+		       sizeof(struct nap_stats));
++	on_each_cpu(nap_reset_stats_cpu, NULL, 1);
 +	return count;
 +}
 +
@@ -1200,10 +1204,10 @@ index 0000000000000000000000000000000000000000..318f212eab8ad2808bf5472d82ecfce4
 +#endif /* NAP_H */
 diff --git a/drivers/cpuidle/governors/nap/nap_fpu.c b/drivers/cpuidle/governors/nap/nap_fpu.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..cb897bdcca0e07b3b762e801d74f334c1a195adb
+index 0000000000000000000000000000000000000000..a67798cad1ede555f7b32083a0a30a3cae43b2c2
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_fpu.c
-@@ -0,0 +1,530 @@
+@@ -0,0 +1,542 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_fpu.c — FPU/SIMD code for the NAP cpuidle governor
@@ -1363,7 +1367,8 @@ index 0000000000000000000000000000000000000000..cb897bdcca0e07b3b762e801d74f334c
 + * hash changes we recompute log2_cost[] and the expert boundaries.
 + * ================================================================ */
 +
-+static u32 nap_driver_hash(struct cpuidle_driver *drv)
++static u32 nap_driver_hash(struct cpuidle_driver *drv,
++				   struct cpuidle_device *dev)
 +{
 +	u32 h = 0x811C9DC5u;	/* FNV-1a seed */
 +	int i;
@@ -1371,15 +1376,23 @@ index 0000000000000000000000000000000000000000..cb897bdcca0e07b3b762e801d74f334c
 +	h = (h ^ (u32)drv->state_count) * 0x01000193u;
 +	for (i = 0; i < drv->state_count; i++) {
 +		u64 tr = (u64)drv->states[i].target_residency_ns;
++		u64 el = (u64)drv->states[i].exit_latency_ns;
++		u32 flags = drv->states[i].flags;
++		u32 disabled = dev->states_usage[i].disable;
 +
 +		h = (h ^ (u32)tr) * 0x01000193u;
 +		h = (h ^ (u32)(tr >> 32)) * 0x01000193u;
++		h = (h ^ (u32)el) * 0x01000193u;
++		h = (h ^ (u32)(el >> 32)) * 0x01000193u;
++		h = (h ^ flags) * 0x01000193u;
++		h = (h ^ disabled) * 0x01000193u;
 +	}
 +	return h;
 +}
 +
 +static void nap_init_log2_cost(struct nap_cpu_data *d,
-+			       struct cpuidle_driver *drv)
++			       struct cpuidle_driver *drv,
++			       struct cpuidle_device *dev)
 +{
 +	float log2_tick;
 +	int long_start, deep_idx;
@@ -1423,7 +1436,7 @@ index 0000000000000000000000000000000000000000..cb897bdcca0e07b3b762e801d74f334c
 +		d->expert_deep = d->expert_mid;
 +	}
 +
-+	d->driver_hash = nap_driver_hash(drv);
++	d->driver_hash = nap_driver_hash(drv, dev);
 +}
 +
 +/* ================================================================
@@ -1484,12 +1497,15 @@ index 0000000000000000000000000000000000000000..cb897bdcca0e07b3b762e801d74f334c
 +		s->min = pmin[0];
 +		s->max = pmax[0];
 +	} else {
-+		sum    = d->log_history[0];
++		int first = (d->hist_idx - n) & NAP_HISTORY_MASK;
++
++		sum    = d->log_history[first];
 +		s->min = sum;
 +		s->max = sum;
 +
 +		for (i = 1; i < n; i++) {
-+			float val = d->log_history[i];
++			int pos = (first + i) & NAP_HISTORY_MASK;
++			float val = d->log_history[pos];
 +
 +			sum += val;
 +			s->min = float_min(s->min, val);
@@ -1641,7 +1657,7 @@ index 0000000000000000000000000000000000000000..cb897bdcca0e07b3b762e801d74f334c
 +
 +		for (e = 0; e < NAP_NUM_EXPERTS; e++)
 +			nap_init_weights(&d->expert_weights[e], cpu, e);
-+		nap_init_log2_cost(d, drv);
++		nap_init_log2_cost(d, drv, dev);
 +		d->stats.learn_count = 0;
 +		d->needs_learn = false;
 +		WRITE_ONCE(d->reset_pending, false);
@@ -1652,8 +1668,8 @@ index 0000000000000000000000000000000000000000..cb897bdcca0e07b3b762e801d74f334c
 +	 * log2_cost[] / expert boundaries.  Cheap — FNV-1a over at
 +	 * most CPUIDLE_STATE_MAX (= 10) state entries.
 +	 */
-+	if (unlikely(d->driver_hash != nap_driver_hash(drv)))
-+		nap_init_log2_cost(d, drv);
++	if (unlikely(d->driver_hash != nap_driver_hash(drv, dev)))
++		nap_init_log2_cost(d, drv, dev);
 +
 +	/* Deferred learning */
 +	if (d->needs_learn) {
