@@ -1,0 +1,553 @@
+pkgname=libxcb-git
+pkgver=1.17.0.r20.g4d6e1c8
+pkgrel=1
+pkgdesc='X11 client-side library (PGO + CS-PGO optimized, git version)'
+arch=(i686 x86_64)
+url='http://xcb.freedesktop.org'
+depends=(xcb-proto-git libxdmcp libxau)
+makedepends=(
+  git
+  libxslt
+  python
+  xorg-util-macros
+  xorgproto
+  clang             # PGO compiler
+  llvm              # llvm-profdata
+  xorg-server-xvfb  # Headless X server for PGO training
+)
+conflicts=(libxcb)
+provides=("libxcb=$pkgver")
+license=(custom)
+options=(strip)
+source=('git+https://gitlab.freedesktop.org/xorg/lib/libxcb.git')
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/${pkgname%-*}" || return 1
+  git describe --tags | sed 's/libxcb-//;s/-/.r/;s/-/./g'
+}
+
+prepare() {
+  cd "$srcdir/${pkgname%-*}" || return 1
+
+  cat > "$srcdir/xcb_workload.c" <<'EOF'
+#include <xcb/xcb.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+/* Tuned for ~3s wall time at zero pacing: pure libxcb-path coverage. */
+#define WORKLOAD_FRAMES        300
+#define RECTS_PER_FRAME         64
+#define INPUT_BURST_EVERY        5
+#define INPUT_BURST_SIZE        16
+#define WINDOW_W              1280
+#define WINDOW_H               720
+
+static const char *EXTENSIONS[] = {
+    "RANDR",  "Present", "GLX",     "XFIXES", "XInputExtension",
+    "XKEYBOARD", "DAMAGE", "MIT-SHM", "RENDER", "Composite",
+    "DPMS",   "XINERAMA", "Xv",     "DOUBLE-BUFFER",
+};
+#define EXT_COUNT (sizeof(EXTENSIONS) / sizeof(EXTENSIONS[0]))
+
+typedef struct { int16_t x, y; uint16_t w, h; uint32_t color; } Rect;
+
+static void init_rects(Rect *r, int n) {
+    for (int i = 0; i < n; ++i) {
+        r[i].x     = (int16_t)(rand() % WINDOW_W);
+        r[i].y     = (int16_t)(rand() % WINDOW_H);
+        r[i].w     = (uint16_t)(20 + rand() % 100);
+        r[i].h     = (uint16_t)(20 + rand() % 100);
+        r[i].color = (uint32_t)(rand() & 0xFFFFFF);
+    }
+}
+
+static void step_rects(Rect *r, int n) {
+    for (int i = 0; i < n; ++i) {
+        r[i].x = (int16_t)((r[i].x + (rand() % 11 - 5) + WINDOW_W) % WINDOW_W);
+        r[i].y = (int16_t)((r[i].y + (rand() % 11 - 5) + WINDOW_H) % WINDOW_H);
+    }
+}
+
+/* Cookie-based extension query exercises libxcb's synchronous wire path. */
+static int query_extension(xcb_connection_t *c, const char *name) {
+    xcb_query_extension_cookie_t k =
+        xcb_query_extension(c, (uint16_t)strlen(name), name);
+    xcb_query_extension_reply_t *r = xcb_query_extension_reply(c, k, NULL);
+    int present = r && r->present;
+    free(r);
+    return present;
+}
+
+/* Synthetic event burst — exercises xcb_send_event() and the
+ * sequence-number bookkeeping that wraps it. */
+static void inject_input(xcb_connection_t *c, xcb_window_t w, int n) {
+    for (int i = 0; i < n; ++i) {
+        if (i % 2 == 0) {
+            xcb_key_press_event_t e = {
+                .response_type = (uint8_t)((i % 4 == 0) ? XCB_KEY_PRESS
+                                                        : XCB_KEY_RELEASE),
+                .detail = (xcb_keycode_t)(30 + (i % 4)),
+                .time   = XCB_CURRENT_TIME,
+                .event  = w,
+                .event_x = (int16_t)(rand() % WINDOW_W),
+                .event_y = (int16_t)(rand() % WINDOW_H),
+                .same_screen = 1,
+            };
+            xcb_send_event(c, 0, w,
+                XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE,
+                (const char *)&e);
+        } else {
+            xcb_motion_notify_event_t e = {
+                .response_type = XCB_MOTION_NOTIFY,
+                .time          = XCB_CURRENT_TIME,
+                .event         = w,
+                .event_x       = (int16_t)(rand() % WINDOW_W),
+                .event_y       = (int16_t)(rand() % WINDOW_H),
+                .same_screen   = 1,
+            };
+            xcb_send_event(c, 0, w, XCB_EVENT_MASK_POINTER_MOTION,
+                           (const char *)&e);
+        }
+    }
+    xcb_flush(c);
+}
+
+int main(void) {
+    /* Deterministic seed — stable profile across PGO runs. */
+    srand(0xC0FFEE);
+
+    int screen_num = 0;
+    xcb_connection_t *c = xcb_connect(NULL, &screen_num);
+    if (xcb_connection_has_error(c)) {
+        fprintf(stderr, "[workload] cannot connect to X (DISPLAY=%s)\n",
+                getenv("DISPLAY") ? getenv("DISPLAY") : "(unset)");
+        return 1;
+    }
+
+    /* Exercise extension-query path against a wide set of names. */
+    for (size_t i = 0; i < EXT_COUNT; ++i)
+        (void)query_extension(c, EXTENSIONS[i]);
+
+    const xcb_setup_t *setup = xcb_get_setup(c);
+    xcb_screen_iterator_t it = xcb_setup_roots_iterator(setup);
+    for (int i = 0; i < screen_num; ++i) xcb_screen_next(&it);
+    xcb_screen_t *screen = it.data;
+    if (!screen) { xcb_disconnect(c); return 1; }
+
+    xcb_window_t win = xcb_generate_id(c);
+    uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
+    uint32_t vals[2] = {
+        screen->black_pixel,
+        XCB_EVENT_MASK_EXPOSURE        | XCB_EVENT_MASK_BUTTON_PRESS    |
+        XCB_EVENT_MASK_BUTTON_RELEASE  | XCB_EVENT_MASK_POINTER_MOTION  |
+        XCB_EVENT_MASK_KEY_PRESS       | XCB_EVENT_MASK_KEY_RELEASE     |
+        XCB_EVENT_MASK_STRUCTURE_NOTIFY,
+    };
+    xcb_create_window(c, XCB_COPY_FROM_PARENT, win, screen->root,
+                      0, 0, WINDOW_W, WINDOW_H, 0,
+                      XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual,
+                      mask, vals);
+
+    /* Window-property roundtrip exercises ChangeProperty + intern-atom paths
+     * libxcb is asked about by every real X11 client at startup. */
+    const char title[] = "xcb-pgo-workload";
+    xcb_change_property(c, XCB_PROP_MODE_REPLACE, win,
+                        XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8,
+                        (uint32_t)(sizeof(title) - 1), title);
+
+    xcb_gcontext_t gc = xcb_generate_id(c);
+    uint32_t gc_mask = XCB_GC_FOREGROUND | XCB_GC_GRAPHICS_EXPOSURES;
+    uint32_t gc_vals[2] = { screen->white_pixel, 0 };
+    xcb_create_gc(c, gc, win, gc_mask, gc_vals);
+
+    xcb_map_window(c, win);
+    xcb_flush(c);
+
+    Rect rects[RECTS_PER_FRAME];
+    init_rects(rects, RECTS_PER_FRAME);
+
+    /* Main loop — no usleep(), the workload is CPU-bound on libxcb itself.
+     * For PGO we want maximum call-site coverage per second, not realtime. */
+    for (int f = 0; f < WORKLOAD_FRAMES &&
+                    !xcb_connection_has_error(c); ++f) {
+        /* Drain events with xcb_poll_for_event (the async path). */
+        xcb_generic_event_t *e;
+        while ((e = xcb_poll_for_event(c)) != NULL) {
+            switch (e->response_type & ~0x80u) {
+                case XCB_EXPOSE:
+                case XCB_BUTTON_PRESS:
+                case XCB_BUTTON_RELEASE:
+                case XCB_MOTION_NOTIFY:
+                case XCB_KEY_PRESS:
+                case XCB_KEY_RELEASE:
+                case XCB_CONFIGURE_NOTIFY:
+                    break;
+            }
+            free(e);
+        }
+
+        step_rects(rects, RECTS_PER_FRAME);
+
+        /* One big batch of GC-change + fill-rect requests — the typical
+         * 2D-clear-and-redraw pattern of any X11 client. */
+        for (int i = 0; i < RECTS_PER_FRAME; ++i) {
+            xcb_change_gc(c, gc, XCB_GC_FOREGROUND, &rects[i].color);
+            xcb_rectangle_t r = { rects[i].x, rects[i].y,
+                                  rects[i].w, rects[i].h };
+            xcb_poly_fill_rectangle(c, win, gc, 1, &r);
+        }
+
+        if (f % INPUT_BURST_EVERY == 0)
+            inject_input(c, win, INPUT_BURST_SIZE);
+
+        xcb_flush(c);
+
+        /* Round-trip via xcb_get_geometry every ~30 frames — exercises the
+         * reply-matching hot path that real clients hit on resize. */
+        if (f % 30 == 0) {
+            xcb_get_geometry_cookie_t gk = xcb_get_geometry(c, win);
+            xcb_get_geometry_reply_t *gr = xcb_get_geometry_reply(c, gk, NULL);
+            free(gr);
+        }
+    }
+
+    xcb_free_gc(c, gc);
+    xcb_destroy_window(c, win);
+    xcb_disconnect(c);
+    return 0;
+}
+EOF
+
+  autoreconf -vfi
+}
+
+# ===========================================================================
+# Helper: build and run the PGO training workload against the in-progress
+# libxcb build tree. Returns 0 on success, non-zero if the workload could
+# not even be linked (which indicates a real packaging bug, not a PGO
+# fluke — caller should treat as fatal). Returns 0 even if the workload
+# itself crashes; profile data is still useful in that case.
+# ===========================================================================
+_run_xcb_workload() {
+  local build_dir="$1"
+  local pgo_flags="$2"
+  local libxcb_la="${build_dir}/src/libxcb.la"
+
+  if [[ ! -f "$libxcb_la" ]]; then
+    echo "ERROR: libxcb.la not found at ${libxcb_la}"
+    return 1
+  fi
+
+  # Link the workload against the just-built (instrumented) libxcb via
+  # libtool so the .libs/.so version with __llvm_prf_* sections is used.
+  # The instrumentation flags are passed verbatim so the workload binary
+  # itself is also instrumented (its libxcb calls are credited correctly).
+  echo "Compiling PGO training workload..."
+  if ! libtool --tag=CC --mode=link clang \
+        ${CPPFLAGS:-} ${_original_cflags} ${pgo_flags} \
+        ${_original_ldflags} ${pgo_flags} \
+        "$srcdir/xcb_workload.c" \
+        -I"${build_dir}/src" \
+        "$libxcb_la" \
+        -Wl,-rpath,"${build_dir}/src/.libs" \
+        -o "$srcdir/xcb_workload_runner"; then
+    echo "ERROR: workload link failed"
+    return 1
+  fi
+
+  # Run the workload against the Xvfb display we set up in build().
+  # We DO NOT abort the whole PGO pipeline on non-zero exit: a partial
+  # profile is still vastly better than no profile.
+  echo "Running PGO training workload against DISPLAY=${DISPLAY}..."
+  if ! "$srcdir/xcb_workload_runner"; then
+    echo "WARNING: workload exited non-zero (profile data still usable)"
+  fi
+  rm -f "$srcdir/xcb_workload_runner"
+  return 0
+}
+
+# ===========================================================================
+# Helper: start a private Xvfb on a unique display and export DISPLAY.
+# Uses :99..:199 search range to avoid clobbering user/CI sessions.
+# ===========================================================================
+_start_xvfb() {
+  local d
+  for d in $(seq 99 199); do
+    if [[ ! -e "/tmp/.X${d}-lock" ]]; then
+      Xvfb ":${d}" -screen 0 1280x720x24 -nolisten tcp >/dev/null 2>&1 &
+      _xvfb_pid=$!
+      sleep 0.3   # let the server bind its socket
+      if kill -0 "$_xvfb_pid" 2>/dev/null && [[ -e "/tmp/.X${d}-lock" ]]; then
+        export DISPLAY=":${d}"
+        echo "Started Xvfb on ${DISPLAY} (pid ${_xvfb_pid})"
+        return 0
+      fi
+    fi
+  done
+  echo "ERROR: could not start Xvfb on any of :99..:199"
+  return 1
+}
+
+_stop_xvfb() {
+  if [[ -n "${_xvfb_pid:-}" ]] && kill -0 "$_xvfb_pid" 2>/dev/null; then
+    kill "$_xvfb_pid" 2>/dev/null || true
+    wait "$_xvfb_pid" 2>/dev/null || true
+  fi
+  unset _xvfb_pid DISPLAY
+}
+
+build() {
+  cd "$srcdir/${pkgname%-*}" || return 1
+
+  # ============================================================================
+  # /etc/makepkg.conf compliance: capture distro-provided flags VERBATIM.
+  # We only ever APPEND PGO-related flags below; -O/-march/-mtune/-flto/etc.
+  # come from /etc/makepkg.conf and remain unmodified. The final binary is
+  # built with the original flags only (PGO instrumentation removed).
+  # ============================================================================
+  export CC=clang
+  export CXX=clang++
+  local _original_cflags="$CFLAGS"
+  local _original_cxxflags="$CXXFLAGS"
+  local _original_ldflags="$LDFLAGS"
+
+  # PGO scratch directories. Kept under $srcdir so they vanish with the
+  # build root; explicitly NOT cleaned via trap EXIT, because that fires
+  # on successful exit too and destroys evidence the user might want.
+  local _pgo_dir="${srcdir}/pgo-stage1"
+  local _cspgo_dir="${srcdir}/pgo-stage2-cs"
+  mkdir -p "$_pgo_dir" "$_cspgo_dir"
+
+  # PGO instrumentation flag chain — same for IR and CS stages.
+  #
+  #   -fprofile-generate=DIR    enable IR-level PGO instrumentation
+  #   -mllvm -vp-counters-per-site=8
+  #         8 value-profile counters per indirect-call/memop site is the
+  #         LLVM upstream default and plenty for a ~50-call-site library
+  #         like libxcb. The previous value of 50 just inflated profraw
+  #         files (~6x) without measurable profile-quality improvement.
+  #   -mllvm -runtime-counter-relocation
+  #         Required when instrumented code is loaded as a position-
+  #         independent shared library and counters need address-fixup
+  #         at dlopen() time. libxcb IS shipped as a PIC .so, so this is
+  #         load-bearing, not cosmetic.
+  #   -mllvm -enable-value-profiling
+  #         Turn on indirect-call / memcpy-size / divisor value profiling.
+  #
+  # NOTE: we DELIBERATELY do NOT pass -g3 or -fno-omit-frame-pointer here.
+  #   * -g3 adds ~80% to object size and has zero effect on profile
+  #     accuracy (profile counters live in their own __llvm_prf_* sections
+  #     completely independent of DWARF).
+  #   * -fno-omit-frame-pointer in the instrumented build but NOT in the
+  #     final build causes profile mismatch (different inlining/regalloc),
+  #     which is silently worse than no PGO. If your /etc/makepkg.conf
+  #     provides FP-preservation, it's already in $CFLAGS and applies
+  #     uniformly across all three stages.
+  local _pgo_common_mllvm=(
+    -mllvm -vp-counters-per-site=8
+    -mllvm -runtime-counter-relocation
+    -mllvm -enable-value-profiling
+  )
+
+  local _configure_opts=(
+    --prefix=/usr
+    --enable-xinput
+    --enable-xkb
+    --with-doxygen=no
+    --disable-devel-docs
+    --disable-unit-tests
+    --disable-static
+  )
+
+  local _pgo_failed=false
+
+  # --------------------------------------------------------------------------
+  # Headless Xvfb for the training workload. Set up once, used by both
+  # Stage 1 and Stage 2 training runs.
+  # --------------------------------------------------------------------------
+  if ! _start_xvfb; then
+    echo "WARNING: no Xvfb — PGO training will be skipped, building w/o PGO"
+    _pgo_failed=true
+  fi
+  trap '_stop_xvfb' EXIT
+
+  # ==========================================================================
+  # STAGE 1 — IR-level PGO instrumentation build + training
+  # ==========================================================================
+  if ! $_pgo_failed; then
+    echo "=== Stage 1: PGO instrumented build ==="
+    local _s1_flags="-fprofile-generate=${_pgo_dir} ${_pgo_common_mllvm[*]}"
+    CFLAGS="${_original_cflags} ${_s1_flags}"
+    CXXFLAGS="${_original_cxxflags} ${_s1_flags}"
+    LDFLAGS="${_original_ldflags} ${_s1_flags}"
+    export CFLAGS CXXFLAGS LDFLAGS
+
+    ./configure "${_configure_opts[@]}" \
+      || { echo "configure (stage 1) failed"; _pgo_failed=true; }
+
+    # Full parallel build — the previous PKGBUILD used -j1 here, almost
+    # certainly a debug leftover that cost ~10x wall time on a 14700KF.
+    $_pgo_failed || make -j"$(nproc)" \
+      || { echo "make (stage 1) failed"; _pgo_failed=true; }
+  fi
+
+  if ! $_pgo_failed; then
+    echo "=== Stage 1: PGO training ==="
+    # %p (pid) keeps per-process profraw separate even if the workload
+    # ever fork()s. %m (binary signature) keeps libxcb and the workload
+    # runner's own profile data distinct.
+    export LLVM_PROFILE_FILE="${_pgo_dir}/libxcb-%p-%m.profraw"
+    _run_xcb_workload "$PWD" "${_s1_flags}" \
+      || { echo "PGO training (stage 1) failed"; _pgo_failed=true; }
+    unset LLVM_PROFILE_FILE
+  fi
+
+  if ! $_pgo_failed; then
+    echo "=== Stage 1: merging .profraw -> default.profdata ==="
+    shopt -s nullglob 2>/dev/null || true
+    local _raw1=("${_pgo_dir}"/*.profraw)
+    if (( ${#_raw1[@]} == 0 )); then
+      echo "ERROR: no .profraw produced in Stage 1"
+      _pgo_failed=true
+    elif ! llvm-profdata merge \
+              -output="${_pgo_dir}/default.profdata" "${_raw1[@]}"; then
+      echo "ERROR: llvm-profdata merge (Stage 1) failed"
+      _pgo_failed=true
+    elif [[ ! -s "${_pgo_dir}/default.profdata" ]]; then
+      echo "ERROR: merged Stage 1 profile is empty"
+      _pgo_failed=true
+    else
+      echo "Stage 1 OK: merged ${#_raw1[@]} raw fragments"
+      rm -f "${_pgo_dir}"/*.profraw
+    fi
+  fi
+
+  # ==========================================================================
+  # STAGE 2 — CS-PGO instrumentation (uses Stage 1 profile) + training
+  # ==========================================================================
+  if ! $_pgo_failed; then
+    echo "=== Stage 2: CS-PGO instrumented build ==="
+    # `make clean` (not distclean) preserves configure cache. ./configure
+    # re-detects flag changes via CFLAGS env anyway, so a fresh
+    # autoreconf+configure cycle would just be wasted I/O.
+    make clean >/dev/null 2>&1 || true
+
+    local _s2_flags="-fprofile-use=${_pgo_dir}/default.profdata \
+-fcs-profile-generate=${_cspgo_dir} ${_pgo_common_mllvm[*]}"
+    CFLAGS="${_original_cflags} ${_s2_flags}"
+    CXXFLAGS="${_original_cxxflags} ${_s2_flags}"
+    LDFLAGS="${_original_ldflags} ${_s2_flags}"
+    export CFLAGS CXXFLAGS LDFLAGS
+
+    ./configure "${_configure_opts[@]}" \
+      || { echo "configure (stage 2) failed"; _pgo_failed=true; }
+    $_pgo_failed || make -j"$(nproc)" \
+      || { echo "make (stage 2) failed"; _pgo_failed=true; }
+  fi
+
+  if ! $_pgo_failed; then
+    echo "=== Stage 2: CS-PGO training ==="
+    export LLVM_PROFILE_FILE="${_cspgo_dir}/libxcb-cs-%p-%m.profraw"
+    _run_xcb_workload "$PWD" "${_s2_flags}" \
+      || { echo "CS-PGO training (stage 2) failed"; _pgo_failed=true; }
+    unset LLVM_PROFILE_FILE
+  fi
+
+  if ! $_pgo_failed; then
+    echo "=== Stage 2: merging CS-PGO + Stage 1 -> cs.profdata ==="
+    local _raw2=("${_cspgo_dir}"/*.profraw)
+    if (( ${#_raw2[@]} == 0 )); then
+      echo "WARNING: no CS-PGO .profraw produced; falling back to Stage 1 profile only"
+      cp "${_pgo_dir}/default.profdata" "${_cspgo_dir}/cs.profdata" \
+        || _pgo_failed=true
+    elif ! llvm-profdata merge \
+              -output="${_cspgo_dir}/cs.profdata" \
+              "${_raw2[@]}" "${_pgo_dir}/default.profdata"; then
+      echo "ERROR: llvm-profdata merge (Stage 2) failed"
+      _pgo_failed=true
+    elif [[ ! -s "${_cspgo_dir}/cs.profdata" ]]; then
+      echo "ERROR: merged Stage 2 profile is empty"
+      _pgo_failed=true
+    else
+      echo "Stage 2 OK: merged ${#_raw2[@]} CS raw + Stage 1 profile"
+      rm -f "${_cspgo_dir}"/*.profraw
+    fi
+  fi
+
+  # Xvfb no longer needed; release it before the big final build so the
+  # extra ~30 MB RSS doesn't compete with concurrent gcc/clang jobs.
+  _stop_xvfb
+  trap - EXIT
+
+  # ==========================================================================
+  # STAGE 3 — Final optimized build using the merged CS profile.
+  # All distro flags from /etc/makepkg.conf are restored verbatim; only
+  # -fprofile-use is added.
+  # ==========================================================================
+  echo "=== Stage 3: final optimized build ==="
+  make clean >/dev/null 2>&1 || true
+
+  CFLAGS="$_original_cflags"
+  CXXFLAGS="$_original_cxxflags"
+  LDFLAGS="$_original_ldflags"
+
+  if ! $_pgo_failed && [[ -s "${_cspgo_dir}/cs.profdata" ]]; then
+    echo "Applying merged CS-PGO profile to final build"
+    local _final_flags="-fprofile-use=${_cspgo_dir}/cs.profdata"
+    CFLAGS+=" $_final_flags"
+    CXXFLAGS+=" $_final_flags"
+    LDFLAGS+=" $_final_flags"
+  elif ! $_pgo_failed && [[ -s "${_pgo_dir}/default.profdata" ]]; then
+    echo "Applying Stage 1 PGO profile (CS data unavailable)"
+    local _final_flags="-fprofile-use=${_pgo_dir}/default.profdata"
+    CFLAGS+=" $_final_flags"
+    CXXFLAGS+=" $_final_flags"
+    LDFLAGS+=" $_final_flags"
+  else
+    echo "Building without PGO (training pipeline failed; see above)"
+  fi
+  export CFLAGS CXXFLAGS LDFLAGS
+
+  ./configure "${_configure_opts[@]}" \
+    || { echo "configure (stage 3) failed"; return 1; }
+  make -j"$(nproc)" \
+    || { echo "make (stage 3) failed"; return 1; }
+
+  if $_pgo_failed; then
+    echo "NOTE: package built without PGO (see warnings above)"
+  else
+    echo "Done: 3-stage PGO + CS-PGO build succeeded"
+  fi
+}
+
+check() {
+  # libxcb's own test suite is disabled via --disable-unit-tests for build
+  # time; we still want a smoke test that the final .so loads and resolves
+  # its key entry points (catches a broken -fprofile-use that produced a
+  # binary referencing missing __llvm_prf_* symbols, for example).
+  cd "$srcdir/${pkgname%-*}" || return 1
+  local so="src/.libs/libxcb.so"
+  if [[ -f "$so" ]]; then
+    if ldd "$so" 2>&1 | grep -q 'not found'; then
+      echo "WARNING: libxcb.so has unresolved dependencies:"
+      ldd "$so" | grep 'not found'
+    fi
+    if nm -D --defined-only "$so" 2>/dev/null \
+         | grep -q ' T xcb_connect$'; then
+      echo "Smoke test: xcb_connect symbol present in final .so"
+    else
+      echo "ERROR: xcb_connect missing from final .so" >&2
+      return 1
+    fi
+  fi
+}
+
+package() {
+  cd "$srcdir/${pkgname%-*}" || return 1
+  make DESTDIR="$pkgdir" install
+  install -Dm644 COPYING "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}
