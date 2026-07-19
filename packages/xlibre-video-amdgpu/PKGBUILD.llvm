@@ -1,0 +1,447 @@
+_basename="xf86-video-amdgpu"
+pkgname="xlibre-xf86-video-amdgpu"
+pkgver=25.1.1
+pkgrel=2.1
+pkgdesc="XLibre amdgpu video driver (Meson + PGO/CS-PGO optimized, hardened training)"
+arch=('x86_64')
+url="https://github.com/X11Libre/${_basename}"
+license=('MIT')
+depends=('glibc' 'libdrm' 'mesa' 'systemd-libs')
+makedepends=(
+  'systemd' 'xlibre-xserver-devel' 'xorgproto-git' 'X-ABI-VIDEODRV_VERSION=28.0'
+  'clang' 'llvm' 'lld' 'meson' 'ninja' 'binutils'
+  'xorg-xdpyinfo' 'xorg-xrandr' 'xorg-xset' 'glmark2'
+)
+provides=("${_basename}=${pkgver}")
+conflicts=("${_basename}" 'xorg-server<1.20.0' 'X-ABI-VIDEODRV_VERSION<28' 'X-ABI-VIDEODRV_VERSION>=29')
+groups=('xlibre-drivers')
+source=("${url}/archive/refs/tags/xlibre-${_basename}-${pkgver}.tar.gz" "ms178-1.patch")
+b2sums=('2a9a67b1963980d8b6efa172c705e7a9c372de7a81c93f39df0f0bb4392d34eecb352c2de7404abaebd62f9d7fd3ababc3763b15549b0ff62d357ea09ffbb543'
+        'SKIP')
+
+prepare() {
+  local srcroot="" cand
+  while IFS= read -r cand; do
+    local d
+    d="$(dirname "${cand}")"
+    if [[ -d "${d}/src" && -d "${d}/man" && -d "${d}/conf" ]]; then
+      srcroot="${d}"
+      break
+    fi
+  done < <(find "${srcdir}" -maxdepth 5 -type f -name 'meson.build' | sort)
+
+  [[ -n "${srcroot}" ]] || { echo "ERROR: meson.build project root not found"; return 1; }
+
+  cd "${srcroot}"
+  patch -Np1 -i "${srcdir}/ms178-1.patch"
+  echo "${srcroot}" > "${srcdir}/.srcroot"
+
+  cat > "${srcdir}/amdgpu_loader.c" << 'EOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+static void
+errcpy(char *dst, size_t n)
+{
+    const char *e = dlerror();
+
+    if (!dst || n == 0 || !e)
+        return;
+
+    snprintf(dst, n, "%s", e);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 4) {
+        fprintf(stderr, "usage: %s <driver.so> <shim.so> <rounds>\n", argv[0]);
+        return 1;
+    }
+
+    const char *drv = argv[1];
+    const char *shim = argv[2];
+    int rounds = atoi(argv[3]);
+    if (rounds < 1) rounds = 1;
+
+    int ok_open = 0, fail_open = 0, ok_sym = 0, fail_sym = 0;
+    char first_err[1024] = {0};
+
+    dlerror();
+    void *hs = dlopen(shim, RTLD_NOW | RTLD_GLOBAL);
+    if (!hs) {
+        errcpy(first_err, sizeof(first_err));
+        fprintf(stderr, "shim load failed: %s\n", first_err[0] ? first_err : "(unknown)");
+        return 2;
+    }
+
+    for (int i = 0; i < rounds; ++i) {
+        dlerror();
+        void *h = dlopen(drv, RTLD_NOW | RTLD_GLOBAL);
+        if (!h) {
+            fail_open++;
+            if (!first_err[0]) errcpy(first_err, sizeof(first_err));
+            continue;
+        }
+
+        dlerror();
+        void *module_data = dlsym(h, "amdgpuModuleData");
+        const char *symerr = dlerror();
+        if (module_data && !symerr) ok_sym++;
+        else fail_sym++;
+
+        (void)dlsym(h, "AMDGPU");
+        ok_open++;
+
+        dlclose(h);
+    }
+
+    dlclose(hs);
+
+    fprintf(stderr, "loader: open_ok=%d open_fail=%d moduledata_ok=%d moduledata_fail=%d\n",
+            ok_open, fail_open, ok_sym, fail_sym);
+    if (first_err[0]) fprintf(stderr, "loader first error: %s\n", first_err);
+
+    return ok_open > 0 ? 0 : 3;
+}
+EOF
+}
+
+_strip_profile_flags() {
+  local in="$1"
+  in="$(sed -E \
+    -e 's/(^|[[:space:]])-f(profile|cs-profile)[^[:space:]]*//g' \
+    -e 's/(^|[[:space:]])-W(no-)?profile[^[:space:]]*//g' \
+    -e 's/[[:space:]]+/ /g' <<< "${in}")"
+  echo "${in#"${in%%[![:space:]]*}"}"
+}
+
+_supports_flags() {
+  local flags="$1"
+  printf 'int main(void){return 0;}\n' | "${CC:-clang}" ${flags} -x c - -o /dev/null >/dev/null 2>&1
+}
+
+_find_driver_so() {
+  local bdir="$1"
+  find "${bdir}" -type f -name 'amdgpu_drv.so' | head -1
+}
+
+_profile_stats() {
+  local dir="$1"
+  local count bytes
+  count="$(find "${dir}" -maxdepth 1 -type f -name '*.profraw' | wc -l)"
+  bytes="$(find "${dir}" -maxdepth 1 -type f -name '*.profraw' -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+  echo "${count} ${bytes}"
+}
+
+_profile_diag() {
+  local dir="$1" tag="$2"
+  local c b
+  read -r c b < <(_profile_stats "${dir}")
+  msg2 "${tag}: profraw files=${c}, total_bytes=${b}"
+  find "${dir}" -maxdepth 1 -type f -name '*.profraw' -printf '%s %f\n' 2>/dev/null | sort -nr | head -10 | sed 's/^/  /' || true
+}
+
+_require_profile_corpus() {
+  local dir="$1" tag="$2" min_files="${3:-1}" min_bytes="${4:-8192}"
+  local c b
+
+  read -r c b < <(_profile_stats "${dir}")
+  if (( c < min_files || b < min_bytes )); then
+    echo "ERROR: ${tag} profile corpus too small: files=${c}/${min_files}, bytes=${b}/${min_bytes}."
+    echo "ERROR: Safe loader training must compile and produce at least one real profraw; refusing unprofiled final build."
+    return 1
+  fi
+}
+
+_validate_profdata() {
+  local prof="$1"
+  [[ -s "${prof}" ]] || return 1
+  llvm-profdata show "${prof}" >/dev/null 2>&1
+}
+
+_merge_raw_profiles() {
+  local raw_dir="$1" out_prof="$2"
+  mapfile -t _raw < <(find "${raw_dir}" -maxdepth 1 -type f -name '*.profraw' -size +1024c | sort)
+  (( ${#_raw[@]} > 0 )) || return 1
+  llvm-profdata merge -o "${out_prof}" "${_raw[@]}" || return 1
+  _validate_profdata "${out_prof}"
+}
+
+_make_xorg_conf() {
+  local cfg="$1" modules_root="$2"
+  cat > "${cfg}" << EOF
+Section "Module"
+    Load "amdgpu"
+EndSection
+Section "Files"
+    ModulePath "${modules_root}"
+    ModulePath "/usr/lib/xorg/modules"
+EndSection
+Section "ServerFlags"
+    Option "AllowEmptyInput" "on"
+EndSection
+Section "Device"
+    Identifier "GPU0"
+    Driver "amdgpu"
+EndSection
+Section "Screen"
+    Identifier "Screen0"
+    Device "GPU0"
+    DefaultDepth 24
+EndSection
+EOF
+}
+
+_generate_resolved_stub_shim() {
+  local drv="$1" out_so="$2"
+  local src="${srcdir}/amdgpu_xorg_stub.c"
+  local undef="${srcdir}/_ldd_undef.txt"
+  local typed="${srcdir}/_typed_undef.txt"
+
+  ldd -r "${drv}" 2>&1 | sed -n 's/.*undefined symbol: \([^ ]*\).*/\1/p' | sort -u > "${undef}"
+
+  if [[ ! -s "${undef}" ]]; then
+    cat > "${src}" << 'EOF'
+#define VIS __attribute__((visibility("default")))
+VIS void amdgpu_stub_anchor(void) {}
+EOF
+    "${CC:-clang}" -shared -fPIC "${src}" -o "${out_so}" || return 1
+    return 0
+  fi
+
+  awk '
+    NR==FNR { need[$1]=1; next }
+    $7=="UND" {
+      t=$4; n=$8; sub(/@.*/, "", n);
+      if (need[n]) {
+        if (!(n in typ) || t=="FUNC" || t=="IFUNC") typ[n]=t;
+      }
+    }
+    END {
+      for (n in typ) print typ[n], n;
+    }
+  ' "${undef}" <(readelf -Ws "${drv}" 2>/dev/null) | sort -u > "${typed}"
+
+  cat > "${src}" << 'EOF'
+#include <stddef.h>
+#define VIS __attribute__((visibility("default")))
+EOF
+
+  while read -r typ name; do
+    [[ -z "${name}" ]] && continue
+    case "${typ}" in
+      FUNC|IFUNC)
+        echo "VIS void ${name}(void) {}" >> "${src}"
+        ;;
+      *)
+        echo "VIS void *${name} = 0;" >> "${src}"
+        ;;
+    esac
+  done < "${typed}"
+
+  "${CC:-clang}" -shared -fPIC "${src}" -o "${out_so}" || return 1
+}
+
+_run_xorg_training() {
+  local build_dir="$1" out_dir="$2" tag="$3" rounds="${4:-8}"
+
+  local drv
+  drv="$(_find_driver_so "${build_dir}")"
+  [[ -n "${drv}" && -f "${drv}" ]] || return 1
+  command -v Xorg >/dev/null 2>&1 || return 1
+
+  local modroot="${srcdir}/_amdgpu_modroot"
+  local conf="${srcdir}/xorg-amdgpu-training.conf"
+  local log="${srcdir}/xorg-amdgpu-training.log"
+
+  rm -rf "${modroot}"
+  mkdir -p "${modroot}/drivers"
+  ln -sf "${drv}" "${modroot}/drivers/amdgpu_drv.so"
+  _make_xorg_conf "${conf}" "${modroot}"
+
+  local hits=0
+  for i in $(seq 1 "${rounds}"); do
+    local d=":$((95 + (i % 3)))"
+    env LLVM_PROFILE_FILE="${out_dir}/${tag}-xorg-${i}-%p-%m.profraw" LLVM_PROFILE_MERGE_POOL_SIZE=8 \
+      timeout 20s Xorg "${d}" -noreset -nolisten tcp -verbose 6 \
+      -config "${conf}" -modulepath "${modroot}:/usr/lib/xorg/modules" \
+      -logfile "${log}" >/dev/null 2>&1 || true
+
+    if [[ -f "${log}" ]] && grep -Eq 'LoadModule: "amdgpu"|Loading .*amdgpu_drv\.so|amdgpu_drv\.so' "${log}" 2>/dev/null; then
+      hits=$((hits + 1))
+    fi
+
+    DISPLAY="${d}" xdpyinfo >/dev/null 2>&1 || true
+    DISPLAY="${d}" xrandr -q >/dev/null 2>&1 || true
+    DISPLAY="${d}" xset q >/dev/null 2>&1 || true
+    DISPLAY="${d}" timeout 4s glmark2 -b build:duration=1 >/dev/null 2>&1 || true
+  done
+
+  msg2 "Xorg amdgpu load hits: ${hits}/${rounds}"
+  if [[ -f "${log}" ]]; then
+    grep -E 'LoadModule|amdgpu|EE|WW' "${log}" | tail -80 | sed 's/^/  /' || true
+  else
+    msg2 "No Xorg log created."
+  fi
+
+  (( hits > 0 ))
+}
+
+_run_loader_training() {
+  local build_dir="$1" out_dir="$2" tag="$3"
+
+  local drv
+  drv="$(_find_driver_so "${build_dir}")"
+  [[ -n "${drv}" && -f "${drv}" ]] || return 1
+
+  local shim="${srcdir}/amdgpu_xorg_stub.so"
+  _generate_resolved_stub_shim "${drv}" "${shim}" || return 1
+
+  local runner="${srcdir}/amdgpu_loader_runner"
+  "${CC:-clang}" -O2 -Wall -Wextra -Werror=implicit-function-declaration \
+    "${srcdir}/amdgpu_loader.c" -ldl -o "${runner}" || return 1
+
+  local log="${srcdir}/${tag}-loader.log"
+  : > "${log}"
+
+  # Open-heavy corpus
+  for n in 1000 2500 5000; do
+    LLVM_PROFILE_FILE="${out_dir}/${tag}-loader-open-%h-%p-%m.profraw" LLVM_PROFILE_MERGE_POOL_SIZE=8 \
+      LD_LIBRARY_PATH="/usr/lib:/usr/lib/xorg/modules:/usr/lib/xorg/modules/extensions:${LD_LIBRARY_PATH}" \
+      "${runner}" "${drv}" "${shim}" "${n}" >> "${log}" 2>&1 || true
+  done
+
+  # Deliberately do not call amdgpuModuleData.setup() here.
+  # The setup hook is an Xorg-loader ABI entry point and is only valid inside
+  # a real Xorg server with real loader/scrn/platform state. Calling it from
+  # a synthetic dlopen runner with generated stubs can execute object stubs as
+  # code and caused repeatable amdgpu_xorg_stub.so SIGSEGV storms during PGO.
+  # Real setup-path training is covered by _run_xorg_training() when Xorg and
+  # hardware/session access are available; this runner is restricted to safe
+  # relocation/dlopen/module-data discovery.
+
+  msg2 "Loader diagnostics (${tag}):"
+  tail -50 "${log}" | sed 's/^/  /' || true
+
+  rm -f "${runner}" "${shim}" "${srcdir}/amdgpu_xorg_stub.c" "${srcdir}/_ldd_undef.txt" "${srcdir}/_typed_undef.txt"
+}
+
+_run_training_suite() {
+  local build_dir="$1" out_dir="$2" tag="$3"
+  _run_xorg_training "${build_dir}" "${out_dir}" "${tag}" 8 || true
+  _run_loader_training "${build_dir}" "${out_dir}" "${tag}" || true
+  _profile_diag "${out_dir}" "${tag}"
+}
+
+_setup_meson_stage() {
+  local srcroot="$1" builddir="$2" cargs="$3" clink="$4"
+  rm -rf "${builddir}"
+  meson setup "${builddir}" "${srcroot}" \
+    --prefix /usr \
+    --buildtype release \
+    -Dpython.bytecompile=2 \
+    -Dglamor=enabled \
+    -Dudev=enabled \
+    -Dmoduledir=xorg/modules \
+    -Dconfigdir=share/X11/xorg.conf.d \
+    -Dc_args="${cargs}" \
+    -Dc_link_args="${clink}"
+}
+
+_compile_with_diag() {
+  local builddir="$1" tag="$2"
+  local log="${srcdir}/${tag}-compile.log"
+
+  : > "${log}"
+  meson compile -C "${builddir}" --verbose > >(tee -a "${log}") 2> >(tee -a "${log}" >&2) &
+  local pid=$!
+
+  while kill -0 "${pid}" 2>/dev/null; do
+    sleep 20
+    msg2 "[diag:${tag}] compile still running..."
+    pgrep -a -f '(^|/)(ninja|clang|ld\.lld)( |$)' | sed 's/^/  /' || true
+  done
+
+  wait "${pid}"
+}
+
+build() {
+  export CC=clang
+  export CXX=clang++
+
+  local srcroot
+  srcroot="$(cat "${srcdir}/.srcroot")"
+
+  local base_cflags base_ldflags
+  base_cflags="$(_strip_profile_flags "${CFLAGS}")"
+  base_ldflags="$(_strip_profile_flags "${LDFLAGS}")"
+
+  local PGO_DIR="${srcdir}/pgo-profiles"
+  local CSPGO_DIR="${srcdir}/cspgo-profiles"
+  mkdir -p "${PGO_DIR}" "${CSPGO_DIR}"
+  rm -f "${PGO_DIR}"/*.profraw "${CSPGO_DIR}"/*.profraw \
+        "${PGO_DIR}/default.profdata" "${CSPGO_DIR}/cs.profdata"
+
+  trap 'rm -rf "${srcdir}/_amdgpu_modroot" "${srcdir}/xorg-amdgpu-training.conf" "${srcdir}/xorg-amdgpu-training.log" "${srcdir}/amdgpu_loader_runner" "${srcdir}/amdgpu_xorg_stub.so" "${srcdir}/amdgpu_xorg_stub.c" "${srcdir}/_ldd_undef.txt" "${srcdir}/_typed_undef.txt"' EXIT
+
+  msg2 "Stage 1/3: PGO instrumentation build"
+  local s1_cargs="${base_cflags} -fprofile-generate=${PGO_DIR}"
+  local s1_clink="${base_ldflags} -fprofile-generate=${PGO_DIR}"
+  _setup_meson_stage "${srcroot}" "${srcroot}/build-pgo" "${s1_cargs}" "${s1_clink}" || return 1
+  _compile_with_diag "${srcroot}/build-pgo" "stage1" || return 1
+  _run_training_suite "${srcroot}/build-pgo" "${PGO_DIR}" "stage1"
+
+  local s1c s1b
+  read -r s1c s1b < <(_profile_stats "${PGO_DIR}")
+  _require_profile_corpus "${PGO_DIR}" "Stage 1" 1 8192 || return 1
+  _merge_raw_profiles "${PGO_DIR}" "${PGO_DIR}/default.profdata" || return 1
+
+  msg2 "Stage 2/3: CS-PGO instrumentation build"
+  local csgen=""
+  if _supports_flags "-fprofile-generate=${CSPGO_DIR} -fcs-profile-generate"; then
+    csgen="-fprofile-generate=${CSPGO_DIR} -fcs-profile-generate"
+  elif _supports_flags "-fprofile-instr-generate -fcs-profile-generate"; then
+    csgen="-fprofile-instr-generate -fcs-profile-generate"
+  else
+    echo "ERROR: compiler does not support usable CS-PGO generation flags"
+    return 1
+  fi
+
+  local s2_cargs="${base_cflags} ${csgen}"
+  local s2_clink="${base_ldflags} ${csgen}"
+  _setup_meson_stage "${srcroot}" "${srcroot}/build-cspgo" "${s2_cargs}" "${s2_clink}" || return 1
+  _compile_with_diag "${srcroot}/build-cspgo" "stage2" || return 1
+  _run_training_suite "${srcroot}/build-cspgo" "${CSPGO_DIR}" "stage2"
+
+  local s2c s2b
+  read -r s2c s2b < <(_profile_stats "${CSPGO_DIR}")
+  _require_profile_corpus "${CSPGO_DIR}" "Stage 2 CS" 1 8192 || return 1
+
+  mapfile -t s2raw < <(find "${CSPGO_DIR}" -maxdepth 1 -type f -name '*.profraw' -size +1024c | sort)
+  (( ${#s2raw[@]} > 0 )) || return 1
+  llvm-profdata merge -o "${CSPGO_DIR}/cs.profdata" "${s2raw[@]}" "${PGO_DIR}/default.profdata" || return 1
+  _validate_profdata "${CSPGO_DIR}/cs.profdata" || return 1
+
+  msg2 "Stage 3/3: final optimized build"
+  local s3_cargs="${base_cflags} -fprofile-use=${CSPGO_DIR}/cs.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled"
+  local s3_clink="${base_ldflags}"
+  _setup_meson_stage "${srcroot}" "${srcroot}/build-final" "${s3_cargs}" "${s3_clink}" || return 1
+  _compile_with_diag "${srcroot}/build-final" "stage3" || return 1
+
+  msg "PGO/CS-PGO build completed successfully."
+}
+
+check() {
+  local srcroot
+  srcroot="$(cat "${srcdir}/.srcroot")"
+  meson test -C "${srcroot}/build-final" --print-errorlogs || true
+}
+
+package() {
+  local srcroot
+  srcroot="$(cat "${srcdir}/.srcroot")"
+  DESTDIR="${pkgdir}" meson install -C "${srcroot}/build-final" --no-rebuild
+  install -vDm644 "${srcroot}/COPYING" "${pkgdir}/usr/share/licenses/${pkgname}/COPYING"
+}
