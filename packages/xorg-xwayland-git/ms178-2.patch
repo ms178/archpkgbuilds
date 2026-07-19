@@ -1,30 +1,51 @@
-xwayland: fix NULL-pointer dereference / SIGSEGV when libxcvt_gen_mode_info() fails (ms178-2)
+xwayland: survive libxcvt_gen_mode_info() returning NULL (fix deterministic crash)
 
-Root cause of the deterministic Xwayland crash seen in the journal:
+SYMPTOM (two forms, same root cause)
+  Older form: (EE) Segmentation fault at address 0x10, backtrace through
+              ffi_call -> wl_display_dispatch -> xwayland_modeinfo_from_cvt.
+  Current form (after the partial fix that only added a NULL check in cvt.c):
+              (EE) Fatal server error:
+              (EE) Failed to allocate memory for list of RR modes
+              kwin_wayland: Stopping Xwayland ... crashed 4 times over 10 minutes
 
-    (EE)  3: /usr/bin/Xwayland (xwayland_modeinfo_from_cvt)
-    (EE)  7: /usr/lib/libffi.so.8 (ffi_call+0x166)
-    (EE)  8: /usr/lib/libwayland-client.so.0 (wl_display_dispatch...)
-    (EE) Segmentation fault at address 0x10
-    (EE) Caught signal 11 (Segmentation fault). Server aborting
+ROOT CAUSE
+  Xwayland builds its RandR mode list from the Wayland output geometry via
+  libxcvt_gen_mode_info() (hw/xwayland/xwayland-cvt.c, called from
+  output_get_rr_modes() in hw/xwayland/xwayland-output.c).
 
-The symbolicated, GCC-built backtrace shows the faulting instruction is
-`mov 0x10(%rax),%rdx` in xwayland_modeinfo_from_cvt(): %rax is the return value
-of libxcvt_gen_mode_info(), and offset 0x10 is the `dot_clock` member of
-`struct libxcvt_mode_info`. The fault address 0x10 therefore proves
-libxcvt_gen_mode_info() returned NULL and Xwayland dereferenced it unchecked
-(hw/xwayland/xwayland-cvt.c). This is NOT a toolchain miscompile of
-libffi/libwayland (those merely marshal the Wayland output/mode event that
-drives the code path); it is a missing NULL check in Xwayland's own source.
+  Since libxcvt 0.1.3 (commits 410ef8f "Add bounds checking...", 23c30d4
+  "Avoid potential division by zero", 049b79b "Add input validation...")
+  libxcvt_gen_mode_info() now returns NULL for out-of-range input:
+      hdisplay <= 0 || hdisplay > 1048576 ||
+      vdisplay <= 0 || vdisplay > 1048576 ||
+      vrefresh < 0  || vrefresh > 10000
+  Older libxcvt (<= 0.1.2) never returned NULL for bad geometry, so Xwayland
+  24.1 never handled it.
 
-libffi/libwayland appear in the backtrace only because the mode is created in
-response to a Wayland output "mode" event, dispatched through libffi's ffi_call.
+  apply_output_change() feeds xwl_output->{width,height,refresh} straight into
+  output_get_rr_modes() on every wl_output/xdg_output "done" event. During
+  early output setup, hotplug, or VRR / adaptive-sync mode-flapping, that
+  geometry can be transiently 0 (e.g. xdg_output logical_size not yet received).
+  libxcvt then returns NULL, and Xwayland either dereferenced it (SIGSEGV at
+  0x10 = ->dot_clock) or, once cvt.c returns NULL, hit the FatalError() in
+  output_get_rr_modes(). Either way the server aborts and KWin gives up after
+  4 restarts.
 
-Fix: make xwayland_modeinfo_from_cvt() return Bool and propagate failure out of
-xwayland_cvt() as a NULL RRModePtr. Every existing caller of xwayland_cvt()
-(output_get_rr_modes(), xwl_output_get_xrandr_modes()) already checks for a NULL
-return and handles it correctly (skip the fake mode, or FatalError on genuine
-OOM for the primary mode), so no caller changes are required.
+FIX (two layers, both in Xwayland; no libxcvt change required)
+  1) hw/xwayland/xwayland-cvt.c: xwayland_modeinfo_from_cvt() returns Bool and
+     xwayland_cvt() returns NULL on libxcvt failure instead of dereferencing a
+     NULL pointer. (Prevents the SIGSEGV-at-0x10 form.)
+  2) hw/xwayland/xwayland-output.c: output_get_rr_modes() now
+       - clamps invalid primary geometry (width/height <= 0) to a 1024x768
+         fallback and an out-of-range refresh to 60Hz, so the *actual* output
+         mode can always be generated; and
+       - treats the optional fake/emulated CVT modes as best-effort: if libxcvt
+         rejects one, it is skipped rather than aborting the server.
+     The FatalError() now only triggers on a genuine primary allocation
+     failure, which is the original intent.
+
+  Net effect: a transient bad output event degrades gracefully (a fallback mode
+  is advertised) instead of killing Xwayland and the session.
 
 Signed-off-by: ms178
 --- a/hw/xwayland/xwayland-cvt.c
@@ -42,12 +63,12 @@ Signed-off-by: ms178
      libxcvt_mode_info =
          libxcvt_gen_mode_info(hdisplay, vdisplay, vrefresh, reduced, interlaced);
  
-+    /* libxcvt_gen_mode_info() can return NULL (e.g. allocation failure). The
-+     * result was previously dereferenced unconditionally, causing a NULL
-+     * dereference at offset 0x10 (->dot_clock) — a hard SIGSEGV that aborts the
-+     * whole Xwayland server. This is reached from a Wayland output/mode event
-+     * via wl_display_dispatch, so a transient failure would kill the session.
-+     * Fail gracefully instead and let the caller decide what to do. */
++    /* libxcvt_gen_mode_info() returns NULL on allocation failure and, since
++     * libxcvt 0.1.3+ (input-validation commits 410ef8f/23c30d4/049b79b), also
++     * when the requested geometry/refresh is out of range (hdisplay/vdisplay
++     * <= 0 or > 1048576, vrefresh < 0 or > 10000). Xwayland used to dereference
++     * the result unconditionally -> SIGSEGV at 0x10 (->dot_clock). Fail
++     * gracefully and let the caller decide instead of crashing the server. */
 +    if (!libxcvt_mode_info)
 +        return FALSE;
 +
@@ -76,3 +97,80 @@ Signed-off-by: ms178
  
      /* Horizontal granularity in libxcvt is 8, so if our horizontal size is not
       * divisible by 8, libxcvt will round it up, and we will advertise a wrong
+--- a/hw/xwayland/xwayland-output.c
++++ b/hw/xwayland/xwayland-output.c
+@@ -353,14 +353,34 @@
+ {
+     struct xwl_screen *xwl_screen = xwl_output->xwl_screen;
+     RRModePtr *rr_modes;
++    float vrefresh;
+     int i;
+ 
+     rr_modes = xallocarray(ARRAY_SIZE(xwl_output_fake_modes) + 1, sizeof(RRModePtr));
+     if (!rr_modes)
+         goto err;
+ 
++    /* The output geometry can be transiently invalid (zero or negative) while
++     * the wl_output / xdg_output state is still being assembled, or during a
++     * hotplug / mode change (e.g. VRR / adaptive-sync mode-flapping). Since
++     * libxcvt 0.1.3+ strictly rejects such input and returns NULL, feeding it
++     * unchecked previously aborted the whole server. Clamp to a sane fallback
++     * so the actual mode can always be generated. */
++    if (width <= 0 || height <= 0) {
++        ErrorF("XWAYLAND: ignoring invalid output size %dx%d, "
++               "using 1024x768 fallback\n", width, height);
++        width = 1024;
++        height = 768;
++    }
++
++    /* refresh is in mHz; libxcvt wants Hz. A zero/absent refresh is fine
++     * (libxcvt defaults it to 60Hz); guard only against out-of-range values. */
++    vrefresh = xwl_output->refresh / 1000.0;
++    if (vrefresh <= 0.0f || vrefresh > 10000.0f)
++        vrefresh = 60.0f;
++
+     /* Add actual output mode */
+-    rr_modes[0] = xwayland_cvt(width, height, xwl_output->refresh / 1000.0, 0, 0);
++    rr_modes[0] = xwayland_cvt(width, height, vrefresh, 0, 0);
+     if (!rr_modes[0])
+         goto err;
+ 
+@@ -371,6 +391,8 @@
+ 
+     /* Add fake modes */
+     for (i = 0; i < ARRAY_SIZE(xwl_output_fake_modes); i++) {
++        RRModePtr fake;
++
+         /* Skip actual output mode, already added */
+         if (xwl_output_fake_modes[i][0] == width &&
+             xwl_output_fake_modes[i][1] == height)
+@@ -381,12 +403,16 @@
+             xwl_output_fake_modes[i][1] > height)
+             continue;
+ 
+-        rr_modes[*count] = xwayland_cvt(xwl_output_fake_modes[i][0],
+-                                        xwl_output_fake_modes[i][1],
+-                                        xwl_output->refresh / 1000.0, 0, 0);
+-        if (!rr_modes[*count])
+-            goto err;
++        fake = xwayland_cvt(xwl_output_fake_modes[i][0],
++                            xwl_output_fake_modes[i][1],
++                            vrefresh, 0, 0);
++        /* A fake/emulated mode is optional: if libxcvt rejects it, just skip
++         * it rather than aborting the server. The real mode (rr_modes[0]) is
++         * already present, so XRandR emulation degrades gracefully. */
++        if (!fake)
++            continue;
+ 
++        rr_modes[*count] = fake;
+         (*count)++;
+     }
+ 
+@@ -395,6 +421,7 @@
+     FatalError("Failed to allocate memory for list of RR modes");
+ }
+ 
++
+ RRModePtr
+ xwl_output_find_mode(struct xwl_output *xwl_output,
+                      int32_t width, int32_t height)
