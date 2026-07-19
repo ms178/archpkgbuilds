@@ -1,35 +1,38 @@
-libx11: fix -Wmaybe-uninitialized / -Werror=array-bounds under LTO and two
-        latent correctness bugs uncovered by them.
+libx11: fix LTO -Werror diagnostics (array-bounds / stringop-overflow /
+        maybe-uninitialized) and two latent correctness bugs they exposed.
 
-This patch resolves the diagnostics that abort the GCC LTO build of libX11 and,
-in doing so, fixes two genuine bugs (not merely warning suppressions):
+Builds under the clang/GCC "llvm-ultimate"-style aggressive LTO configuration
+abort in several translation units. This patch resolves every diagnostic at the
+source and, in doing so, fixes two genuine bugs (not mere warning suppression):
 
 1) src/xlibi18n/XDefaultOMIF.c  (_XmbDefaultTextExtents)
-   -Wmaybe-uninitialized on overall.{lbearing,rbearing,width,ascent,descent}.
-   XTextExtents() always fully initialises 'overall' (glyph loop, or its
-   nfound==0 zeroing branch), so this is a genuine LTO false positive: the
-   optimiser cannot see through the call. Zero-initialise the aggregate at
-   declaration; the store is elided wherever the compiler can prove it dead.
+   -Wmaybe-uninitialized on overall.*: XTextExtents() always fully initialises
+   'overall' (glyph loop, or its nfound==0 zeroing branch); LTO just cannot see
+   through the call. Zero-initialise the aggregate; the store is elided when the
+   optimiser can prove it dead.
 
 2) src/XlibInt.c  (_XGetHostname, inlined into XSetWMProperties)
-   -Werror=array-bounds: strncpy() copies strlen(name.nodename) bytes, and when
-   inlined with the caller's maxlen (256) the array-bounds pass cannot prove the
-   read stays within nodename[65]. Clamp the length to sizeof(name.nodename)
-   BEFORE the maxlen clamp, making the source read provably in-range, and use
-   memcpy() for the exact (now bounded) length. Behaviour is unchanged for all
-   valid hostnames.
+   -Werror=array-bounds: clamp the copy length to sizeof(name.nodename) BEFORE
+   the maxlen clamp so the source read is provably within nodename[65], and use
+   memcpy() for the exact length. Behaviour unchanged for valid hostnames.
 
 3) modules/im/ximcp/imDefIm.c  (_XimProtoSetIMValues, XIM_OVERFLOW path)
-   -Wmaybe-uninitialized on preply. This exposed a REAL bug: on XIM_OVERFLOW the
-   oversized reply is re-read into the small fixed BUFSIZE *stack* buffer 'reply'
-   instead of the freshly Xmalloc()'d 'preply' sized for 'len'. That both
-   overflowed the stack buffer (len > BUFSIZE by definition here) and left
-   'preply' uninitialised before it is dereferenced. Read into 'preply' and
+   -Wmaybe-uninitialized on preply exposed a REAL bug: the oversized reply was
+   re-read into the fixed BUFSIZE stack buffer 'reply' instead of the freshly
+   Xmalloc()'d 'preply' (len > BUFSIZE by definition), overflowing the stack and
+   leaving 'preply' uninitialised before dereference. Read into 'preply' and
    guard the allocation, exactly as the sibling _XimProtoGetIMValues() does.
 
+4) src/GetHints.c  (XGetClassHint)
+   -Werror=array-bounds / -Werror=stringop-overflow: strcpy() into buffers just
+   sized with Xmalloc(len+1). Under LTO the pass cannot prove strcpy()'s implicit
+   strlen() equals the computed len and reports an out-of-bounds write into the
+   malloc'd region. Replace both copies with bounded memcpy(len+1) (NUL included)
+   — provably in-range and semantically identical.
+
 Signed-off-by: ms178
---- a/src/xlibi18n/XDefaultOMIF.c	2026-07-19 12:55:04.549634259 +0000
-+++ b/src/xlibi18n/XDefaultOMIF.c	2026-07-19 12:56:29.041634259 +0000
+--- a/src/xlibi18n/XDefaultOMIF.c	2026-07-19 14:44:25.386448717 +0000
++++ b/src/xlibi18n/XDefaultOMIF.c	2026-07-19 14:44:25.482448717 +0000
 @@ -632,7 +632,12 @@
  		       XRectangle *overall_ink, XRectangle *overall_logical)
  {
@@ -44,8 +47,8 @@ Signed-off-by: ms178
  
      XTextExtents(*oc->core.font_info.font_struct_list, text, length, &direction,
  		 &logical_ascent, &logical_descent, &overall);
---- a/src/XlibInt.c	2026-07-19 12:55:04.553634259 +0000
-+++ b/src/XlibInt.c	2026-07-19 12:57:31.321634259 +0000
+--- a/src/XlibInt.c	2026-07-19 14:44:25.394448717 +0000
++++ b/src/XlibInt.c	2026-07-19 14:44:25.482448717 +0000
 @@ -1723,8 +1723,16 @@
  
      uname (&name);
@@ -64,8 +67,8 @@ Signed-off-by: ms178
      buf[len] = '\0';
  #else
      if (maxlen <= 0 || buf == NULL)
---- a/modules/im/ximcp/imDefIm.c	2026-07-19 12:55:04.541634259 +0000
-+++ b/modules/im/ximcp/imDefIm.c	2026-07-19 12:56:44.581634259 +0000
+--- a/modules/im/ximcp/imDefIm.c	2026-07-19 14:44:25.374448717 +0000
++++ b/modules/im/ximcp/imDefIm.c	2026-07-19 14:44:25.482448717 +0000
 @@ -1358,7 +1358,15 @@
  	} else {
  	    buf_size = (int)len;
@@ -83,3 +86,31 @@ Signed-off-by: ms178
  					_XimSetIMValuesCheck, 0);
  	    if(ret_code != XIM_TRUE) {
  		Xfree(preply);
+--- a/src/GetHints.c	2026-07-19 14:44:25.382448717 +0000
++++ b/src/GetHints.c	2026-07-19 14:44:37.006448717 +0000
+@@ -320,8 +320,13 @@
+ 	    Xfree(data);
+ 	    return (0);
+ 	}
+-	strcpy(classhint->res_name, (char *) data);
+-	if (len_name == nitems) len_name--;
++	/* Copy exactly len_name+1 bytes (the NUL is included) into the buffer we
++	 * just sized to len_name+1. Under LTO the array-bounds/stringop-overflow
++	 * pass cannot prove strcpy()'s implicit strlen(data) equals len_name and
++	 * reports a spurious out-of-bounds write into the malloc'd region; the
++	 * explicit, bounded memcpy() is provably in-range and identical in effect. */
++	memcpy(classhint->res_name, (char *) data, (size_t) len_name + 1);
++	if (len_name == (int) nitems) len_name--;
+ 	len_class = (int) strlen((char *) (data+len_name+1));
+ 	if (! (classhint->res_class = Xmalloc(len_class + 1))) {
+ 	    Xfree(classhint->res_name);
+@@ -329,7 +334,8 @@
+ 	    Xfree(data);
+ 	    return (0);
+ 	}
+-	strcpy(classhint->res_class, (char *) (data+len_name+1));
++	/* Same rationale as res_name above: bounded, provably in-range copy. */
++	memcpy(classhint->res_class, (char *) (data+len_name+1), (size_t) len_class + 1);
+ 	Xfree( (char *) data);
+ 	return(1);
+ 	}
