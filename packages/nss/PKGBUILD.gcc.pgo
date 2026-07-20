@@ -1,0 +1,413 @@
+pkgbase=nss
+pkgname=(
+  nss
+  ca-certificates-mozilla
+)
+pkgver=3.126
+pkgrel=3.9
+pkgdesc="Network Security Services"
+url="https://developer.mozilla.org/en-US/docs/Mozilla/Projects/NSS"
+arch=(x86_64)
+license=(MPL-2.0)
+depends=(
+  glibc
+  nspr
+  p11-kit
+  sqlite
+  zlib
+  ca-certificates-mozilla
+)
+makedepends=(
+  gyp
+  mercurial
+  perl
+  python
+  # GCC toolchain (the system gcc/g++ from base-devel; listed for explicitness).
+  # 'binutils' provides gcc-ar/gcc-nm/gcc-ranlib used by the LTO-aware wrappers.
+  gcc
+  binutils
+)
+source=(
+  "hg+https://hg.mozilla.org/projects/nss#tag=NSS_${pkgver//./_}_RTM"
+  bundle.sh
+  certdata2pem.py
+)
+b2sums=(
+  'SKIP'
+  '4be5dd836c844fdd7b63302a6994d62149082c3bc81eef70f373f416fed80a61a923960e4390d1c391b81ab01b409370d788818a30ffdd3a4ed467b670f990f6'
+  '6bb59dcc9289916dcbf8fb6d73db0c0cd7582dc12a3aa4e8be19ec62c9ede65fdd9470a2d92ec5a114506b78d2d21b8ae0a1b45a17dc1f90f7d75434a93da510'
+)
+
+# =============================================================================
+# GCC 2-stage PGO rebuild of NSS  (transformed from the clang IR-PGO/CS-PGO set)
+# -----------------------------------------------------------------------------
+# WHY GCC, and WHY 2 STAGES (not 3):
+#   * NSS's build.sh natively supports --gcc (exports CC=gcc CCC=g++ CXX=g++).
+#   * GCC has NO context-sensitive PGO (-fcs-profile-generate is LLVM-only) and
+#     NO -mllvm value-profiling knobs. The correct, stable GCC equivalent is a
+#     clean 2-stage PGO: -fprofile-generate -> representative training ->
+#     -fprofile-use, hardened with -fprofile-correction (tolerate flow
+#     inconsistencies from parallel/multi-process test writers) and
+#     -fprofile-partial-training (don't pessimise functions the training run
+#     never exercised). The clang CS-PGO stage is therefore intentionally
+#     DROPPED, not faked.
+#
+# FLAG HANDLING / makepkg.conf:
+#   The user's /etc/makepkg.conf CFLAGS/CXXFLAGS/LDFLAGS are honored verbatim
+#   (snapshotted below); this PKGBUILD appends ONLY PGO-related flags. It does
+#   NOT inject -march/-O/-fuse-ld/LTO/hardening — those come from makepkg.conf.
+#   Because the toolchain is pinned to GCC, those flags must be GCC-compatible
+#   (no clang-only -mllvm/-Xclang/-flto=thin tokens).
+#
+# PROFILE DATA LOCATION:
+#   Profiles are written OUT OF TREE via -fprofile-generate=<abs dir> so they
+#   survive `build.sh -c`, which wipes out/ and dist/ between stages. GCC mangles
+#   the (identical, stable) source paths into the .gcda names, so stage 2 finds
+#   them.
+#
+# MULTI-THREAD SAFETY:
+#   NSS's ssl_gtests/gtests spawn many concurrent client/server processes and
+#   threads that share the instrumented .so, so -fprofile-update=atomic is
+#   REQUIRED to avoid torn counter increments corrupting the profile.
+#
+# -Werror:
+#   NSS force-enables -Werror -Wall -Wshadow via coreconf/werror.py. PGO
+#   instrumentation and profile-use both perturb codegen and can surface new
+#   -Werror= promotions (e.g. -Wmaybe-uninitialized / -Wmissing-profile) on
+#   otherwise-correct code. We pass -Ddisable_werror=1 to build.sh for BOTH PGO
+#   stages so a warning can never abort the profiling/optimized build. The final
+#   objects are still fully optimized; only the error-promotion is relaxed.
+# =============================================================================
+
+prepare() {
+  mkdir -p certs
+  for file in nss/lib/ckfw/builtins/{certdata.txt,nssckbi.h}; do
+    if [[ ! -f "$file" ]]; then
+      error "Required file $file not found"
+      return 1
+    fi
+  done
+  ln -srft certs nss/lib/ckfw/builtins/{certdata.txt,nssckbi.h}
+
+  # NSS 3.123.1 regression: ssl_gtests.sh used cwd-relative helper.
+  local gtest_script="nss/tests/ssl_gtests/ssl_gtests.sh"
+  [[ -f "$gtest_script" ]] || {
+    error "Missing $gtest_script"
+    return 1
+  }
+
+  if ! grep -q '^SSL_GTESTS_DIR=' "$gtest_script"; then
+    sed -i '/^ssl_gtest_certs() {/i SSL_GTESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n' "$gtest_script"
+  fi
+
+  sed -i \
+    's|^\([[:space:]]*\)\./ssl_gtest_db\.sh "\${SSLGTESTDIR}" "\${BINDIR}/certutil" "\${R_NOISE_FILE}"|\1"${SSL_GTESTS_DIR}/ssl_gtest_db.sh" "${SSLGTESTDIR}" "${BINDIR}/certutil" "${R_NOISE_FILE}"|' \
+    "$gtest_script"
+
+  sed -i \
+    's|^cd "$(dirname "$0")"$|cd "${SSL_GTESTS_DIR}"|' \
+    "$gtest_script"
+}
+
+build() {
+  # Base build options. --gcc replaces the original --clang: NSS build.sh sets
+  # CC=gcc CCC=g++ CXX=g++ for us. Everything else is unchanged from upstream.
+  local buildopts=(
+    --enable-libpkix
+    --opt
+    --system-nspr
+    --system-sqlite
+    --target=x64
+    --gcc
+  )
+  # During the PGO instrument + profile-use stages, relax NSS's forced -Werror
+  # (see header) by passing gyp's disable_werror. Kept out of the final validation
+  # rebuild's option list only conceptually — we reuse the same array since the
+  # final build also benefits from not failing on a profile-use warning.
+  local buildopts_pgo=("${buildopts[@]}" -Ddisable_werror=1)
+
+  cd certs
+  ../certdata2pem.py
+  cd ..
+  ./bundle.sh
+
+  # -------------------------------------------------------------------------
+  # GCC toolchain pin + LTO-safe binutils wrappers.
+  # gcc-ar/gcc-nm/gcc-ranlib are required if the user's makepkg.conf enables
+  # -flto so the LTO plugin is picked up for static archives.
+  # -------------------------------------------------------------------------
+  export CC=gcc CXX=g++ CCC=g++
+  command -v gcc-ar     >/dev/null && export AR="$(command -v gcc-ar)"
+  command -v gcc-nm     >/dev/null && export NM="$(command -v gcc-nm)"
+  command -v gcc-ranlib >/dev/null && export RANLIB="$(command -v gcc-ranlib)"
+  export CCACHE_DISABLE=1
+
+  local pgo_dir="$srcdir/pgo-data"
+  local raw="$pgo_dir/gcda"          # out-of-tree .gcda from stage 1 training
+  mkdir -p "$raw"
+
+  # Snapshot the user's flags verbatim; append ONLY PGO flags below.
+  local orig_cflags="${CFLAGS:-}"
+  local orig_cxxflags="${CXXFLAGS:-}"
+  local orig_ldflags="${LDFLAGS:-}"
+
+  # GCC PGO instrumentation flags (stage 1):
+  #   -fprofile-generate=<dir>   out-of-tree .gcda (survives build.sh -c)
+  #   -fprofile-update=atomic    REQUIRED: multi-thread/-process training
+  #   -fprofile-values           value profiling (indirect-call / div-by-const),
+  #                              the GCC analogue of the dropped -mllvm value-prof
+  #   -Wno-error                 belt-and-suspenders on top of -Ddisable_werror=1
+  local gen_flags="-fprofile-generate=${raw} -fprofile-update=atomic -fprofile-values -Wno-error"
+
+  # GCC PGO profile-use flags (stage 2 / final):
+  #   -fprofile-correction       tolerate inconsistent counts from parallel runs
+  #   -fprofile-partial-training don't pessimise never-trained functions
+  #   -Wno-missing-profile / -Wno-coverage-mismatch / -Wno-error : silence the
+  #                              legitimate diagnostics profile-use can raise.
+  local use_flags="-fprofile-use=${raw} -fprofile-correction -fprofile-partial-training -Wno-missing-profile -Wno-coverage-mismatch -Wno-error"
+
+  # Reusable training driver (unchanged logic from the original, minus the
+  # LLVM_PROFILE_FILE plumbing — GCC .gcda location is fixed by -fprofile-generate).
+  pick_free_port_block() {
+    local block_size="${1:-32}"
+    python - "$block_size" <<'PY'
+import random, socket, sys
+b = int(sys.argv[1])
+
+def ok(p):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", p))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+ports = list(range(20000, 55000))
+random.shuffle(ports)
+for base in ports:
+    if base + b >= 65535:
+        continue
+    if all(ok(p) for p in range(base, base + b)):
+        print(base)
+        sys.exit(0)
+sys.exit(1)
+PY
+  }
+
+  count_gcda() { find "$1" -name '*.gcda' 2>/dev/null | wc -l; }
+
+  run_fast_gtests_bundle() {
+    # phase label + whether new .gcda must appear afterwards.
+    local phase="$1"        # ir | final
+    local need_profile="$2" # 1 or 0
+
+    local port
+    port="$(pick_free_port_block 32)" || {
+      error "Could not allocate test port block"
+      return 1
+    }
+
+    local t_home="$srcdir/nss-test-home/$phase"
+    mkdir -p "$t_home" || return 1
+
+    local before=0 after=0
+    if [[ "$need_profile" -eq 1 ]]; then
+      before="$(count_gcda "$raw")"
+    fi
+
+    cd "$srcdir/nss/tests" || return 1
+
+    # 1) Run almost all ssl_gtests (exclude flaky KeyLogFile* from this pass).
+    (
+      unset SSLKEYLOGFILE NSS_SSLKEYLOGFILE MOZ_SSLKEYLOGFILE SSLKEYLOG_FILE SSLKEYLOGFILE_PATH
+      export HOME="$t_home" HOST="localhost" DOMSUF="localdomain" PORT="$port"
+      export NSS_CYCLES="standard" NSS_DEFAULT_DB_TYPE="sql" LANG=C LC_ALL=C
+      export GTESTFILTER="-KeyLogFile*"
+      bash ./ssl_gtests/ssl_gtests.sh
+    ) || return 1
+
+    # 2) Run only KeyLogFile* tests isolated (serial by filter path in script).
+    (
+      unset SSLKEYLOGFILE NSS_SSLKEYLOGFILE MOZ_SSLKEYLOGFILE SSLKEYLOG_FILE SSLKEYLOGFILE_PATH
+      export HOME="$t_home" HOST="localhost" DOMSUF="localdomain" PORT="$port"
+      export NSS_CYCLES="standard" NSS_DEFAULT_DB_TYPE="sql" LANG=C LC_ALL=C
+      export GTESTFILTER="KeyLogFile*"
+      bash ./ssl_gtests/ssl_gtests.sh
+    ) || return 1
+
+    # 3) Run non-SSL gtests.
+    (
+      unset SSLKEYLOGFILE NSS_SSLKEYLOGFILE MOZ_SSLKEYLOGFILE SSLKEYLOG_FILE SSLKEYLOGFILE_PATH
+      export HOME="$t_home" HOST="localhost" DOMSUF="localdomain" PORT="$port"
+      export NSS_CYCLES="standard" NSS_DEFAULT_DB_TYPE="sql" LANG=C LC_ALL=C
+      bash ./gtests/gtests.sh
+    ) || return 1
+
+    cd "$srcdir/nss" || return 1
+
+    if [[ "$need_profile" -eq 1 ]]; then
+      after="$(count_gcda "$raw")"
+      if (( after <= before )); then
+        error "No new .gcda files generated for phase ${phase} in ${raw}"
+        return 1
+      fi
+    fi
+  }
+
+  cd nss
+
+  # -------------------------------------------------------------------------
+  # Stage 1: GCC PGO-instrumented build
+  # -------------------------------------------------------------------------
+  msg2 "== Stage 1: GCC PGO-instrumented build (-fprofile-generate)"
+  export CFLAGS="${orig_cflags} ${gen_flags}"
+  export CXXFLAGS="${orig_cxxflags} ${gen_flags}"
+  export LDFLAGS="${orig_ldflags} -fprofile-generate=${raw} -fprofile-update=atomic"
+
+  ./build.sh -c "${buildopts_pgo[@]}" || return 1
+  ./build.sh "${buildopts_pgo[@]}" || {
+    error "PGO-instrumented build failed"
+    return 1
+  }
+  [[ -d "$srcdir/dist/Release/bin" ]] || {
+    error "Missing build output after instrumented stage"
+    return 1
+  }
+
+  # -------------------------------------------------------------------------
+  # Stage 2 (training): exercise the instrumented libraries
+  # -------------------------------------------------------------------------
+  msg2 "== Stage 2: PGO training (ssl_gtests + gtests)"
+  run_fast_gtests_bundle "ir" 1 || {
+    error "PGO training failed"
+    return 1
+  }
+
+  (( $(count_gcda "$raw") > 0 )) || {
+    error "PGO is mandatory but no .gcda profile data was produced in ${raw}"
+    return 1
+  }
+  msg2 "PGO: $(count_gcda "$raw") .gcda profile file(s) collected."
+
+  # -------------------------------------------------------------------------
+  # Stage 3: final PGO-optimized build (-fprofile-use)
+  # -------------------------------------------------------------------------
+  msg2 "== Stage 3: Final GCC PGO-optimized build (-fprofile-use)"
+  export CFLAGS="${orig_cflags} ${use_flags}"
+  export CXXFLAGS="${orig_cxxflags} ${use_flags}"
+  # -fprofile-use is needed at link time too so the optimizer/LTO plugin reads
+  # the profile; the warning-silencing flags are compile-only but harmless here.
+  export LDFLAGS="${orig_ldflags} -fprofile-use=${raw} -fprofile-correction -fprofile-partial-training"
+
+  ./build.sh -c "${buildopts_pgo[@]}" || return 1
+  ./build.sh "${buildopts_pgo[@]}" || {
+    error "Final optimized build failed"
+    return 1
+  }
+  [[ -d "$srcdir/dist/Release/bin" ]] || {
+    error "Missing final build output"
+    return 1
+  }
+
+  # -------------------------------------------------------------------------
+  # Stage 4: final validation (no profiling) — end-to-end test the shipped libs
+  # -------------------------------------------------------------------------
+  msg2 "== Stage 4: Final validation"
+  run_fast_gtests_bundle "final" 0 || {
+    error "Final validation failed"
+    return 1
+  }
+
+  # Restore the user's pristine flags for package().
+  export CFLAGS="${orig_cflags}"
+  export CXXFLAGS="${orig_cxxflags}"
+  export LDFLAGS="${orig_ldflags}"
+}
+
+package_nss() {
+  local nsprver
+  nsprver="$(pkg-config --modversion nspr)"
+  local libdir=/usr/lib
+  local includedir=/usr/include/nss
+
+  if [[ ! -f nss/pkg/pkg-config/nss.pc.in ]]; then
+    error "nss.pc.in not found"
+    return 1
+  fi
+  sed nss/pkg/pkg-config/nss.pc.in \
+    -e "s,%prefix%,/usr,g" \
+    -e "s,%exec_prefix%,\${prefix},g" \
+    -e "s,%libdir%,$libdir,g" \
+    -e "s,%includedir%,$includedir,g" \
+    -e "s,%NSPR_VERSION%,$nsprver,g" \
+    -e "s,%NSS_VERSION%,$pkgver,g" |
+    install -Dm644 /dev/stdin "$pkgdir$libdir/pkgconfig/nss.pc"
+
+  ln -s nss.pc "$pkgdir$libdir/pkgconfig/mozilla-nss.pc"
+
+  if [[ ! -d dist/Release/lib ]]; then
+    error "dist/Release/lib not found"
+    return 1
+  fi
+  install -Dt "$pkgdir$libdir" dist/Release/lib/*.so
+
+  local vmajor vminor vpatch
+  if [[ ! -f nss/lib/nss/nss.h ]]; then
+    error "nss.h not found"
+    return 1
+  fi
+  { read -r vmajor; read -r vminor; read -r vpatch; } \
+    < <(awk '/#define.*NSS_V(MAJOR|MINOR|PATCH)/ {print $3}' nss/lib/nss/nss.h)
+
+  if [[ ! -f nss/pkg/pkg-config/nss-config.in ]]; then
+    error "nss-config.in not found"
+    return 1
+  fi
+  sed nss/pkg/pkg-config/nss-config.in \
+    -e "s,@prefix@,/usr,g" \
+    -e "s,@exec_prefix@,/usr,g" \
+    -e "s,@libdir@,$libdir,g" \
+    -e "s,@includedir@,$includedir,g" \
+    -e "s,@MOD_MAJOR_VERSION@,$vmajor,g" \
+    -e "s,@MOD_MINOR_VERSION@,$vminor,g" \
+    -e "s,@MOD_PATCH_VERSION@,$vpatch,g" |
+    install -D /dev/stdin "$pkgdir/usr/bin/nss-config"
+
+  if [[ ! -d dist/Release/bin ]]; then
+    error "dist/Release/bin not found"
+    return 1
+  fi
+  install -Dt "$pkgdir/usr/bin" \
+    dist/Release/bin/{*util,shlibsign,signtool,signver,ssltap}
+
+  if [[ ! -d dist/public/nss ]]; then
+    error "dist/public/nss not found"
+    return 1
+  fi
+  install -Dt "$pkgdir$includedir" -m644 dist/public/nss/*.h
+
+  if [[ ! -d nss/doc/nroff ]]; then
+    error "nss/doc/nroff not found"
+    return 1
+  fi
+  install -Dt "$pkgdir/usr/share/man/man1" -m644 \
+    nss/doc/nroff/{*util,signtool,signver,ssltap}.1
+
+  ln -s /usr/lib/pkcs11/p11-kit-trust.so "$pkgdir$libdir/p11-kit-trust.so"
+  ln -sf p11-kit-trust.so "$pkgdir$libdir/libnssckbi.so"
+}
+
+package_ca-certificates-mozilla() {
+  pkgdesc="Mozilla's set of trusted CA certificates"
+  depends=('ca-certificates-utils>=20181109-3')
+
+  if [[ ! -f ca-bundle.trust.p11-kit ]]; then
+    error "ca-bundle.trust.p11-kit not found"
+    return 1
+  fi
+  install -Dm644 ca-bundle.trust.p11-kit \
+    "$pkgdir/usr/share/ca-certificates/trust-source/mozilla.trust.p11-kit"
+}
