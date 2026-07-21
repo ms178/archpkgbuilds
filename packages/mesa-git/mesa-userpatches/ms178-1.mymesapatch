@@ -7667,6 +7667,117 @@ index fa6f8e45b41ece46d3de714af32d1c1a17a942bb..044036e1d4da18ff0d9d14f0bdaf6621
     }
  
     if (!ctx.replacement_instr.empty()) {
+diff --git a/src/amd/compiler/aco_optimizer_postRA.cpp b/src/amd/compiler/aco_optimizer_postRA.cpp
+index b2cb6388235abc9ec4722f83ac873387fceb8d1b..d3a8194f16e4bd962ceb7566b8fcb47d734ee67f 100644
+--- a/src/amd/compiler/aco_optimizer_postRA.cpp
++++ b/src/amd/compiler/aco_optimizer_postRA.cpp
+@@ -1026,9 +1026,55 @@ try_optimize_branching_sequence(pr_opt_ctx& ctx, aco_ptr<Instruction>& exec_copy
+    if (!exec_val_idx.found() || exec_val_idx.block != ctx.current_block->index)
+       return false;
+ 
+-   if (is_overwritten_since(ctx, exec, ctx.program->lane_mask, exec_val_idx)) {
+-      // TODO: in case nothing needs the previous exec mask, just remove it
+-      return false;
++   const bool exec_overwritten =
++      is_overwritten_since(ctx, exec, ctx.program->lane_mask, exec_val_idx);
++   auto can_remove_intermediate_exec_write = [&](const Instruction* instr) {
++      if (!instr->writes_exec())
++         return false;
++
++      /* Removing an instruction with memory, control-flow or non-EXEC
++       * register effects would not be semantics-preserving. The only pseudo
++       * instruction accepted here is a parallel copy, which is a pure
++       * register move at this point of the pipeline.
++       */
++      if (!instr->isSALU() && !instr->isVALU() && instr->opcode != aco_opcode::p_parallelcopy)
++         return false;
++
++      for (const Definition& def : instr->definitions) {
++         const bool def_is_exec = def.physReg() >= exec &&
++                                  def.physReg() + def.size() <= exec + ctx.program->lane_mask.size();
++         const bool def_is_dead = def.isKill() || (def.isTemp() && ctx.uses[def.tempId()] == 0);
++         if (!def_is_exec && !def_is_dead)
++            return false;
++      }
++      return true;
++   };
++
++   bool deleted_non_exec_def = false;
++   if (exec_overwritten) {
++      /* The final copy must replace the complete lane mask. A partial EXEC
++       * write would retain bits from an intermediate write and cannot be
++       * replaced by v_cmpx.
++       */
++      if (exec_copy->opcode != aco_opcode::p_parallelcopy || exec_copy->operands.size() != 1 ||
++          exec_copy->definitions.size() != 1 || exec_copy->reads_exec() ||
++          exec_copy->definitions[0].physReg() != exec ||
++          exec_copy->definitions[0].regClass() != ctx.program->lane_mask)
++         return false;
++
++      for (unsigned i = exec_val_idx.instr + 1; i < ctx.current_instr_idx; i++) {
++         const Instruction* instr = ctx.current_block->instructions[i].get();
++         if (!instr || !instr->writes_exec())
++            continue;
++         if (!can_remove_intermediate_exec_write(instr))
++            return false;
++
++         for (const Definition& def : instr->definitions) {
++            const bool def_is_exec = def.physReg() >= exec &&
++                                     def.physReg() + def.size() <= exec + ctx.program->lane_mask.size();
++            deleted_non_exec_def |= !def_is_exec;
++         }
++      }
+    }
+ 
+    Instruction* exec_val = ctx.get(exec_val_idx);
+@@ -1083,7 +1129,9 @@ try_optimize_branching_sequence(pr_opt_ctx& ctx, aco_ptr<Instruction>& exec_copy
+    /* Ensure that nothing needs a previous exec between exec_val_idx and the current exec write. */
+    for (unsigned i = exec_val_idx.instr + 1; i < ctx.current_instr_idx; i++) {
+       Instruction* instr = ctx.current_block->instructions[i].get();
+-      if (instr && needs_exec_mask(instr) && !is_nop_copy(instr))
++      const bool removable_exec_write =
++         exec_overwritten && instr && can_remove_intermediate_exec_write(instr);
++      if (instr && needs_exec_mask(instr) && !is_nop_copy(instr) && !removable_exec_write)
+          return false;
+ 
+       /* If the successor has phis, copies might have to be inserted at p_logical_end. */
+@@ -1180,6 +1228,36 @@ try_optimize_branching_sequence(pr_opt_ctx& ctx, aco_ptr<Instruction>& exec_copy
+       }
+    }
+ 
++   /* The final copy overwrites EXEC, and all intervening instructions that
++    * wrote EXEC were proven to have no other effect above. Remove them now so
++    * later post-RA cleanup does not have to rediscover the same dead writes.
++    */
++   if (exec_overwritten) {
++      for (unsigned i = exec_val_idx.instr + 1; i < ctx.current_instr_idx; i++) {
++         aco_ptr<Instruction>& instr = ctx.current_block->instructions[i];
++         if (!instr || !instr->writes_exec())
++            continue;
++
++         for (const Operand& op : instr->operands) {
++            if (op.isTemp())
++               ctx.uses[op.tempId()]--;
++         }
++         instr.reset();
++      }
++
++      /* A removed dead SCC/VCC definition would otherwise remain in the
++       * physical-register writer map. Rebuild the current block's state from
++       * its predecessors and replay the surviving instructions before the
++       * current copy.
++       */
++      if (deleted_non_exec_def) {
++         const unsigned current_idx = ctx.current_instr_idx;
++         ctx.reset_block(ctx.current_block);
++         ctx.current_instr_idx = current_idx;
++         fixup_reg_writes(ctx, 0);
++      }
++   }
++
+    if (can_remove_copy) {
+       /* Remove the copy. */
+       exec_copy.reset();
 diff --git a/src/amd/compiler/aco_register_allocation.cpp b/src/amd/compiler/aco_register_allocation.cpp
 index 8acc881992205a273773b3f8804a51b79e2395bb..9078515440870fa39636e0a825faba793489a3d8 100644
 --- a/src/amd/compiler/aco_register_allocation.cpp
@@ -11144,6 +11255,139 @@ index 6b7884d1234ae6ec4012d4ddea576e24ad34140e..a33c3b51c8966adc81655c9ce8b40370
 +   //! p_unit_test 2, %res2
 +   writeout(2, bld.sop2(aco_opcode::s_mul_i32, bld.def(s1), a, Operand::c32(3)));
 +   finish_opt_test();
++END_TEST
+diff --git a/src/amd/compiler/tests/test_optimizer_postRA.cpp b/src/amd/compiler/tests/test_optimizer_postRA.cpp
+index f924a7e24218b699dd08af1cbbb20fda3b837265..6ee9361675907b274144089e849428d7d53aafe5 100644
+--- a/src/amd/compiler/tests/test_optimizer_postRA.cpp
++++ b/src/amd/compiler/tests/test_optimizer_postRA.cpp
+@@ -910,3 +910,128 @@ BEGIN_TEST(optimizer_postRA.scc_nocmp_across_cf_partially_overwritten)
+ 
+    finish_optimizer_postRA_test();
+ END_TEST
++
++BEGIN_TEST(optimizer_postRA.dead_exec_writes)
++   for (amd_gfx_level lvl : {GFX9, GFX10}) {
++      PhysReg reg_v0(256);
++
++      //>> v1: %a:v[0] = p_startpgm
++      if (!setup_cs("v1", lvl))
++         continue;
++
++      Temp v_in = inputs[0];
++
++      {
++         /* Multiple EXEC-only writes are dead before the full VCC-to-EXEC copy. */
++         //~gfx9! s2: %b:vcc, s2: %0:exec = v_cmpx_eq_u32 0, %a:v[0]
++         //~gfx10! s2: %0:exec = v_cmpx_eq_u32 0, %a:v[0]
++         //~gfx10! s2: %b:vcc = p_parallelcopy %0:exec
++         //! p_cbranch_z %0:exec
++         //! p_unit_test 0
++         auto vcmp = bld.vopc(aco_opcode::v_cmp_eq_u32, bld.def(bld.lm, vcc), Operand::zero(),
++                              Operand(v_in, reg_v0));
++         bld.sop1(Builder::s_mov, Definition(exec, bld.lm), Operand::c32(42u));
++         bld.sop1(Builder::s_mov, Definition(exec, bld.lm), Operand::c32(17u));
++         bld.pseudo(aco_opcode::p_parallelcopy, Definition(exec, bld.lm), bld.vcc(vcmp));
++         bld.branch(aco_opcode::p_cbranch_z, Operand(exec, bld.lm));
++         writeout(0);
++      }
++
++      //; del b
++
++      {
++         /* An EXEC copy that reads EXEC cannot discard the intervening write. */
++         //! s2: %b:vcc = v_cmp_eq_u32 0, %a:v[0]
++         //! s2: %0:exec = s_mov_b64 42
++         //! s2: %0:exec, s2: %c:s[0-1] = p_parallelcopy %b:vcc, %0:exec
++         //! p_cbranch_z %0:exec
++         //! p_unit_test 1
++         auto vcmp = bld.vopc(aco_opcode::v_cmp_eq_u32, bld.def(bld.lm, vcc), Operand::zero(),
++                              Operand(v_in, reg_v0));
++         bld.sop1(Builder::s_mov, Definition(exec, bld.lm), Operand::c32(42u));
++         bld.pseudo(aco_opcode::p_parallelcopy, Definition(exec, bld.lm),
++                    bld.def(bld.lm, PhysReg(0)), bld.vcc(vcmp), Operand(exec, bld.lm));
++         bld.branch(aco_opcode::p_cbranch_z, Operand(exec, bld.lm));
++         writeout(1);
++      }
++
++      //; del b, c
++
++      {
++         /* A dead SCC side definition can be removed together with its EXEC write. */
++         //~gfx9! s2: %b:vcc, s2: %0:exec = v_cmpx_eq_u32 0, %a:v[0]
++         //~gfx10! s2: %0:exec = v_cmpx_eq_u32 0, %a:v[0]
++         //~gfx10! s2: %b:vcc = p_parallelcopy %0:exec
++         //! p_cbranch_z %0:exec
++         //! p_unit_test 2
++         auto vcmp = bld.vopc(aco_opcode::v_cmp_eq_u32, bld.def(bld.lm, vcc), Operand::zero(),
++                              Operand(v_in, reg_v0));
++         bld.sop2(Builder::s_and, Definition(exec, bld.lm), bld.def(s1, scc), Operand::c32(3u),
++                  Operand::c32(5u));
++         bld.pseudo(aco_opcode::p_parallelcopy, Definition(exec, bld.lm), bld.vcc(vcmp));
++         bld.branch(aco_opcode::p_cbranch_z, Operand(exec, bld.lm));
++         writeout(2);
++      }
++
++      //; del b
++
++      {
++         /* A live SCC side definition must retain its EXEC-writing instruction. */
++         //! s2: %b:vcc = v_cmp_eq_u32 0, %a:v[0]
++         //! s2: %0:exec, s1: %c:scc = s_and_b64 3, 5
++         //! s1: %d:s[4] = p_parallelcopy %c:scc
++         //! s2: %0:exec = p_parallelcopy %b:vcc
++         //! p_cbranch_z %0:exec
++         //! p_unit_test 5, %d
++         Temp scc_val = bld.tmp(s1);
++         auto vcmp = bld.vopc(aco_opcode::v_cmp_eq_u32, bld.def(bld.lm, vcc), Operand::zero(),
++                              Operand(v_in, reg_v0));
++         bld.sop2(Builder::s_and, Definition(exec, bld.lm), Definition(scc_val, scc), Operand::c32(3u),
++                  Operand::c32(5u));
++         Temp saved_scc = bld.tmp(s1);
++         bld.pseudo(aco_opcode::p_parallelcopy, Definition(saved_scc, PhysReg(4)), Operand(scc_val, scc));
++         bld.pseudo(aco_opcode::p_parallelcopy, Definition(exec, bld.lm), bld.vcc(vcmp));
++         bld.branch(aco_opcode::p_cbranch_z, Operand(exec, bld.lm));
++         writeout(5, saved_scc);
++      }
++
++      //; del b
++
++      {
++         /* A partial EXEC write cannot be replaced by a full EXEC write. */
++         //! s1: %b:s[4] = s_mov_b32 1
++         //! s2: %0:exec = s_mov_b64 42
++         //! s1: %0:exec_lo = p_parallelcopy %b:s[4]
++         //! p_cbranch_z %0:exec
++         //! p_unit_test 3
++         Temp s_val = bld.tmp(s1);
++         bld.sop1(aco_opcode::s_mov_b32, Definition(s_val, PhysReg(4)), Operand::c32(1u));
++         bld.sop1(Builder::s_mov, Definition(exec, bld.lm), Operand::c32(42u));
++         bld.pseudo(aco_opcode::p_parallelcopy, Definition(exec_lo, s1), Operand(s_val, PhysReg(4)));
++         bld.branch(aco_opcode::p_cbranch_z, Operand(exec, bld.lm));
++         writeout(3);
++      }
++
++      //; del b, c
++
++      {
++         /* A live explicit EXEC read between the writes inhibits the rewrite. */
++         //! s2: %b:vcc = v_cmp_eq_u32 0, %a:v[0]
++         //! s2: %0:exec = s_mov_b64 42
++         //! s2: %c:s[4-5] = s_mov_b64 %0:exec
++         //! s2: %0:exec = p_parallelcopy %b:vcc
++         //! p_cbranch_z %0:exec
++         //! p_unit_test 4, %c
++         auto vcmp = bld.vopc(aco_opcode::v_cmp_eq_u32, bld.def(bld.lm, vcc), Operand::zero(),
++                              Operand(v_in, reg_v0));
++         bld.sop1(Builder::s_mov, Definition(exec, bld.lm), Operand::c32(42u));
++         Temp saved_exec = bld.tmp(bld.lm);
++         bld.sop1(Builder::s_mov, Definition(saved_exec, PhysReg(4)), Operand(exec, bld.lm));
++         bld.pseudo(aco_opcode::p_parallelcopy, Definition(exec, bld.lm), bld.vcc(vcmp));
++         bld.branch(aco_opcode::p_cbranch_z, Operand(exec, bld.lm));
++         writeout(4, saved_exec);
++      }
++
++      finish_optimizer_postRA_test();
++   }
 +END_TEST
 diff --git a/src/amd/compiler/tests/test_scheduler.cpp b/src/amd/compiler/tests/test_scheduler.cpp
 index 314007f999a2e91c4903df211f598a77b42ed34b..2043aada63acdf8c5262ee549615536aeb1d83b8 100644
@@ -42903,10 +43147,10 @@ index 94681b78b31de68c748b91d4ab5d820f7ff0c8fa..b6cbc7beae10d6113fa49f0898078ddd
 -#endif /* CACHE_H */
 +#endif /* DISK_CACHE_H */
 diff --git a/src/util/driconf.h b/src/util/driconf.h
-index 2aa5488ef3f28323abe92c96676dc3a53d6780d0..00e7b7843318d8a1cf7d4609ac1818f6eddf10ac 100644
+index 5ff608eaff7541d786082abf705c9e1ab8333df8..232744de40f58bd1c91b9b0473b8c04eebbf7922 100644
 --- a/src/util/driconf.h
 +++ b/src/util/driconf.h
-@@ -410,6 +410,10 @@
+@@ -414,6 +414,10 @@
     DRI_CONF_OPT_B(block_on_depleted_buffers, def, \
                    "Block clients using buffer backpressure until new buffer is available to reduce latency")
  
@@ -49491,7 +49735,7 @@ index c1e9535315f4c4dea7a7b0a9e4bdead42be869c6..3de24365bcfaf2349e8f688d8e58366e
 +   }
  }
 diff --git a/src/vulkan/runtime/vk_pipeline.c b/src/vulkan/runtime/vk_pipeline.c
-index d469b621c1e19d1c30ed42abfe06b3d723cd8d07..71dee20a4311df21a9c168223cef08a261ccd946 100644
+index 4c06e7db9067394192dd44f554a95f1c161e0855..70a0f5b6eae6daf28a2c32dac9e77a4a29d62ece 100644
 --- a/src/vulkan/runtime/vk_pipeline.c
 +++ b/src/vulkan/runtime/vk_pipeline.c
 @@ -2758,7 +2758,7 @@ vk_rt_shader_group_destroy(struct vk_device *device,
