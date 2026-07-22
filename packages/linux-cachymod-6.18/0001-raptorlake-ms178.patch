@@ -1,22 +1,22 @@
-From ad27f39a2b52e497ac2328250fbba9c1fd8796b9 Mon Sep 17 00:00:00 2001
+From b4bf02c69dacf50ba90b018f997b6d946452cd4f Mon Sep 17 00:00:00 2001
 From: Arena-Agent <agent@arena.ai>
-Date: Wed, 22 Jul 2026 19:42:15 +0000
-Subject: [PATCH] ixgbe: harden X540 gaming steering and perfect PCIe
- optimizations
+Date: Wed, 22 Jul 2026 21:02:36 +0000
+Subject: [PATCH] ixgbe: implement perfected FDIR low-latency payload matching
+ and PCIe optimizations
 
 ---
  arch/x86/kernel/apic/io_apic.c                |  706 +++---
  arch/x86/mm/pat/set_memory.c                  |  108 +-
  drivers/cpufreq/intel_pstate.c                | 1011 ++++++---
- drivers/net/ethernet/intel/ixgbe/ixgbe.h      |   20 +
- .../net/ethernet/intel/ixgbe/ixgbe_common.c   |   26 +-
- drivers/net/ethernet/intel/ixgbe/ixgbe_main.c | 1915 ++++++++++-------
+ drivers/net/ethernet/intel/ixgbe/ixgbe.h      |   16 +
+ .../net/ethernet/intel/ixgbe/ixgbe_common.c   |   20 +-
+ drivers/net/ethernet/intel/ixgbe/ixgbe_main.c | 1964 ++++++++++-------
  drivers/net/ethernet/intel/ixgbe/ixgbe_type.h |    7 +
- drivers/pci/msi/msi.c                         |  362 ++--
+ drivers/pci/msi/msi.c                         |  362 +--
  drivers/pci/msi/msi.h                         |   41 +-
  drivers/pci/pci.c                             |   26 +-
  drivers/usb/host/xhci.c                       |  102 +-
- kernel/irq/affinity.c                         | 1087 +++++++++-
+ kernel/irq/affinity.c                         | 1087 ++++++++-
  kernel/irq/msi.c                              |  213 +-
  kernel/irq/proc.c                             |  102 +-
  kernel/locking/rwsem.c                        |  196 +-
@@ -28,7 +28,7 @@ Subject: [PATCH] ixgbe: harden X540 gaming steering and perfect PCIe
  lib/xxhash.c                                  |  622 +++---
  sound/hda/codecs/realtek/realtek.c            |   87 +-
  sound/hda/controllers/intel.c                 |  132 +-
- 23 files changed, 4924 insertions(+), 2923 deletions(-)
+ 23 files changed, 4964 insertions(+), 2922 deletions(-)
 
 diff --git a/arch/x86/kernel/apic/io_apic.c b/arch/x86/kernel/apic/io_apic.c
 index 5ba2feb2c04c6d7a7fa4cbe64847db433773102d..cd77a46406271012a161175d29675eaf22532661 100644
@@ -2702,17 +2702,15 @@ index 4f9b6580610ede6e993a3f08dc8492a83068fccf..9f698b57ad1e93a3de30a68447414240
  
  	mutex_lock(&intel_pstate_driver_lock);
 diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe.h b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
-index 047f04045585a14b8701195c1d7c75f2e9fe8d8d..d69c895b65ae1bb5fc208993a61e500521e5061b 100644
+index 047f04045585a14b8701195c1d7c75f2e9fe8d8d..a7c1c1d42dc65883166a4624cb7d7f2a61b49544 100644
 --- a/drivers/net/ethernet/intel/ixgbe/ixgbe.h
 +++ b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
-@@ -612,6 +612,19 @@ struct ixgbe_mac_addr {
+@@ -612,6 +612,17 @@ struct ixgbe_mac_addr {
  #define IXGBE_PRIMARY_ABORT_LIMIT	5
  
  /* board specific private data structure */
 +/* The X540 exposes 128 FTQF and L34TIMIR entries. */
 +#define IXGBE_MAX_GAMING_FILTERS	IXGBE_MAX_FTQF_FILTERS
-+
-+extern bool gaming_mode;
 +
 +struct ixgbe_gaming_saved_filter {
 +	u32 ftqf;
@@ -2725,38 +2723,23 @@ index 047f04045585a14b8701195c1d7c75f2e9fe8d8d..d69c895b65ae1bb5fc208993a61e5005
  struct ixgbe_adapter {
  	unsigned long active_vlans[BITS_TO_LONGS(VLAN_N_VID)];
  	/* OS defined structs */
-@@ -769,6 +782,13 @@ struct ixgbe_adapter {
+@@ -769,6 +780,11 @@ struct ixgbe_adapter {
  	u32 fdir_pballoc;
  	u32 atr_sample_rate;
  	spinlock_t fdir_perfect_lock;
-+	/* Gaming ATR - X540 low-latency UDP port steering */
++	/* Gaming FDIR Low-Latency Payload Inspection */
 +	spinlock_t gaming_lock;
-+	struct ixgbe_gaming_saved_filter
-+		gaming_saved_filters[IXGBE_MAX_GAMING_FILTERS];
-+	u16 gaming_5tuple_count;
-+	bool gaming_5tuple_saved;
++	u16 gaming_fdir_count;
++	u16 gaming_ports[IXGBE_MAX_GAMING_FILTERS];
 +
  
  	bool fw_emp_reset_disabled;
  
 diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_common.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
-index 3ea6765f9c5d83691b7c01db3dca68e88ce8e174..647fb537dda6e3b385bb3ebdf2a18a5dbaf9eed3 100644
+index 3ea6765f9c5d83691b7c01db3dca68e88ce8e174..dcbc2e4695d430bf59a6d160a304f670f05b9ba7 100644
 --- a/drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
 +++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
-@@ -290,7 +290,11 @@ int ixgbe_start_hw_generic(struct ixgbe_hw *hw)
- 
- 	/* Set No Snoop Disable */
- 	ctrl_ext = IXGBE_READ_REG(hw, IXGBE_CTRL_EXT);
--	ctrl_ext |= IXGBE_CTRL_EXT_NS_DIS;
-+	if (gaming_mode) {
-+		ctrl_ext &= ~(IXGBE_CTRL_EXT_NS_DIS | IXGBE_CTRL_EXT_RO_DIS);
-+	} else {
-+		ctrl_ext |= IXGBE_CTRL_EXT_NS_DIS;
-+	}
- 	IXGBE_WRITE_REG(hw, IXGBE_CTRL_EXT, ctrl_ext);
- 	IXGBE_WRITE_FLUSH(hw);
- 
-@@ -2540,7 +2544,7 @@ static int ixgbe_disable_pcie_primary(struct ixgbe_hw *hw)
+@@ -2540,7 +2540,7 @@ static int ixgbe_disable_pcie_primary(struct ixgbe_hw *hw)
  
  	/* Poll for primary request bit to clear */
  	for (i = 0; i < IXGBE_PCI_PRIMARY_DISABLE_TIMEOUT; i++) {
@@ -2765,7 +2748,7 @@ index 3ea6765f9c5d83691b7c01db3dca68e88ce8e174..647fb537dda6e3b385bb3ebdf2a18a5d
  		if (!(IXGBE_READ_REG(hw, IXGBE_STATUS) & IXGBE_STATUS_GIO))
  			return 0;
  	}
-@@ -2566,7 +2570,7 @@ static int ixgbe_disable_pcie_primary(struct ixgbe_hw *hw)
+@@ -2566,7 +2566,7 @@ static int ixgbe_disable_pcie_primary(struct ixgbe_hw *hw)
  	 */
  	poll = ixgbe_pcie_timeout_poll(hw);
  	for (i = 0; i < poll; i++) {
@@ -2774,7 +2757,7 @@ index 3ea6765f9c5d83691b7c01db3dca68e88ce8e174..647fb537dda6e3b385bb3ebdf2a18a5d
  		value = ixgbe_read_pci_cfg_word(hw, IXGBE_PCI_DEVICE_STATUS);
  		if (ixgbe_removed(hw->hw_addr))
  			return 0;
-@@ -2696,7 +2700,7 @@ int ixgbe_disable_rx_buff_generic(struct ixgbe_hw *hw)
+@@ -2696,7 +2696,7 @@ int ixgbe_disable_rx_buff_generic(struct ixgbe_hw *hw)
  			break;
  		else
  			/* Use interrupt-safe sleep just in case */
@@ -2783,7 +2766,7 @@ index 3ea6765f9c5d83691b7c01db3dca68e88ce8e174..647fb537dda6e3b385bb3ebdf2a18a5d
  	}
  
  	/* For informational purposes only */
-@@ -3745,9 +3749,15 @@ int ixgbe_host_interface_command(struct ixgbe_hw *hw, void *buffer,
+@@ -3745,9 +3745,15 @@ int ixgbe_host_interface_command(struct ixgbe_hw *hw, void *buffer,
  	dword_len = (buf_len + 3) >> 2;
  
  	/* Pull in the rest of the buffer (bi is where we left off) */
@@ -2802,7 +2785,7 @@ index 3ea6765f9c5d83691b7c01db3dca68e88ce8e174..647fb537dda6e3b385bb3ebdf2a18a5d
  	}
  
  rel_out:
-@@ -3850,7 +3860,7 @@ void ixgbe_clear_tx_pending(struct ixgbe_hw *hw)
+@@ -3850,7 +3856,7 @@ void ixgbe_clear_tx_pending(struct ixgbe_hw *hw)
  	 */
  	poll = ixgbe_pcie_timeout_poll(hw);
  	for (i = 0; i < poll; i++) {
@@ -2812,7 +2795,7 @@ index 3ea6765f9c5d83691b7c01db3dca68e88ce8e174..647fb537dda6e3b385bb3ebdf2a18a5d
  		if (ixgbe_removed(hw->hw_addr))
  			break;
 diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
-index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f5140f198 100644
+index 240f7cc3f213f07784e9032aa539e88b27e634f5..4ee085e660e90284dd4c11e41bc5e8bd08f53fb5 100644
 --- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
 +++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
 @@ -1,7 +1,13 @@
@@ -2848,7 +2831,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  #include "ixgbe.h"
  #include "ixgbe_common.h"
  #include "ixgbe_e610.h"
-@@ -52,6 +70,312 @@
+@@ -52,6 +70,363 @@
  #include "ixgbe_txrx_common.h"
  #include "devlink/devlink.h"
  
@@ -2863,13 +2846,17 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
 + * global FDIR table from ATR and ethtool perfect filters.
 + */
 +
++#define IXGBE_FDIR_PBALLOC_64K          0x00000001
++#define IXGBE_FDIR_CMD_COMPLETE_POLL    1000
++#define UDP_PAYLOAD_FLEX_OFFSET         14    /* 14 words = 28 bytes (IP + UDP headers) */
++#define GAMING_FLEX_BYTE_SIGNATURE     0xFFFF 
++
 +static int ixgbe_parse_gaming_ports(const char *ranges, u16 *ports, int max_ports);
-+static void ixgbe_gaming_atr_init(struct ixgbe_adapter *adapter);
-+static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter);
-+static void ixgbe_gaming_atr_clear_filters(struct ixgbe_adapter *adapter);
-+static void ixgbe_gaming_5tuple_clear(struct ixgbe_adapter *adapter);
-+static int ixgbe_gaming_5tuple_program(struct ixgbe_adapter *adapter,
-+                                       u16 *ports, int num_ports, u8 queue);
++static void ixgbe_gaming_fdir_init(struct ixgbe_adapter *adapter);
++static int ixgbe_gaming_fdir_program_filters(struct ixgbe_adapter *adapter);
++static void ixgbe_gaming_fdir_clear_filters(struct ixgbe_adapter *adapter);
++static int ixgbe_gaming_fdir_configure_global(struct ixgbe_adapter *adapter);
++static int ixgbe_gaming_fdir_program_filter(struct ixgbe_adapter *adapter, u16 port, u8 queue, u16 filter_index);
 +
 +/* EITR values are encoded in bits 11:3; 8, 16 and 32 are 2.048, 4.096 and
 + * 8.192 us at 1/10 GbE (X540 datasheet 8.2.4.5.16). */
@@ -3018,117 +3005,157 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
 +	return count;
 +}
 +
-+static void ixgbe_gaming_atr_init(struct ixgbe_adapter *adapter)
++static s32 ixgbe_gaming_fdir_poll_complete(struct ixgbe_hw *hw)
 +{
-+	spin_lock_init(&adapter->gaming_lock);
-+	memset(adapter->gaming_saved_filters, 0,
-+	       sizeof(adapter->gaming_saved_filters));
-+	adapter->gaming_5tuple_count = 0;
-+	adapter->gaming_5tuple_saved = false;
++	u32 fdircmd;
++	int i;
++
++	for (i = 0; i < IXGBE_FDIR_CMD_COMPLETE_POLL; i++) {
++		fdircmd = IXGBE_READ_REG(hw, IXGBE_FDIRCMD);
++		if (!(fdircmd & IXGBE_FDIRCMD_CMD_MASK))
++			return 0;
++		cpu_relax();
++	}
++	return -ETIMEDOUT;
 +}
 +
-+static void ixgbe_gaming_5tuple_clear(struct ixgbe_adapter *adapter)
++static void ixgbe_gaming_fdir_init(struct ixgbe_adapter *adapter)
++{
++	spin_lock_init(&adapter->gaming_lock);
++	adapter->gaming_fdir_count = 0;
++	memset(adapter->gaming_ports, 0, sizeof(adapter->gaming_ports));
++}
++
++static void ixgbe_gaming_fdir_clear_filters(struct ixgbe_adapter *adapter)
 +{
 +	struct ixgbe_hw *hw = &adapter->hw;
 +	unsigned long flags;
-+	unsigned int i, count;
++	u16 count, i;
++	s32 err;
++
++	if (hw->mac.type < ixgbe_mac_82599EB)
++		return;
 +
 +	spin_lock_irqsave(&adapter->gaming_lock, flags);
-+	count = adapter->gaming_5tuple_count;
++	count = adapter->gaming_fdir_count;
 +	if (!count) {
 +		spin_unlock_irqrestore(&adapter->gaming_lock, flags);
 +		return;
 +	}
 +
-+	/* Disable each owned filter before restoring its dependent registers. */
-+	for (i = 0; i < count; i++)
-+		IXGBE_WRITE_REG(hw, IXGBE_FTQF(i), IXGBE_FTQF_POOL_MASK_EN);
++	for (i = 0; i < count; i++) {
++		err = ixgbe_gaming_fdir_poll_complete(hw);
++		if (err)
++			break;
 +
-+	if (adapter->gaming_5tuple_saved) {
-+		for (i = 0; i < count; i++) {
-+			struct ixgbe_gaming_saved_filter *saved =
-+				&adapter->gaming_saved_filters[i];
-+
-+			IXGBE_WRITE_REG(hw, IXGBE_SAQF(i), saved->saqf);
-+			IXGBE_WRITE_REG(hw, IXGBE_DAQF(i), saved->daqf);
-+			IXGBE_WRITE_REG(hw, IXGBE_SDPQF(i), saved->sdpqf);
-+			IXGBE_WRITE_REG(hw, IXGBE_L34T_IMIR(i), saved->l34timir);
-+			IXGBE_WRITE_REG(hw, IXGBE_FTQF(i), saved->ftqf);
-+		}
++		IXGBE_WRITE_REG(hw, IXGBE_FDIRHASH, i | (1u << IXGBE_FDIRHASH_SIG_SW_INDEX_SHIFT));
++		IXGBE_WRITE_REG(hw, IXGBE_FDIRCMD, IXGBE_FDIRCMD_CMD_REMOVE_FLOW);
 +	}
 +
-+	adapter->gaming_5tuple_count = 0;
-+	adapter->gaming_5tuple_saved = false;
++	adapter->gaming_fdir_count = 0;
++	memset(adapter->gaming_ports, 0, sizeof(adapter->gaming_ports));
 +	spin_unlock_irqrestore(&adapter->gaming_lock, flags);
 +}
 +
-+static void ixgbe_gaming_atr_clear_filters(struct ixgbe_adapter *adapter)
-+{
-+	ixgbe_gaming_5tuple_clear(adapter);
-+}
-+
-+static int ixgbe_gaming_5tuple_program(struct ixgbe_adapter *adapter,
-+                                       u16 *ports, int num_ports, u8 queue)
++static int ixgbe_gaming_fdir_configure_global(struct ixgbe_adapter *adapter)
 +{
 +	struct ixgbe_hw *hw = &adapter->hw;
-+	unsigned long flags;
-+	int i, programmed;
++	u32 fdirctrl, fdirmsk;
++	s32 err;
 +
-+	if (hw->mac.type < ixgbe_mac_82599EB || num_ports <= 0)
-+		return 0;
++	if (hw->mac.type < ixgbe_mac_82599EB)
++		return -EOPNOTSUPP;
 +
-+	programmed = min_t(int, num_ports, IXGBE_GAMING_5TUPLE_MAX);
++	fdirctrl = IXGBE_READ_REG(hw, IXGBE_FDIRCTRL);
++	fdirctrl &= ~IXGBE_FDIRCTRL_PERFECT_MATCH;
++	IXGBE_WRITE_REG(hw, IXGBE_FDIRCTRL, fdirctrl);
++	IXGBE_WRITE_FLUSH(hw);
 +
-+	spin_lock_irqsave(&adapter->gaming_lock, flags);
-+	for (i = 0; i < programmed; i++) {
-+		u32 ftqf, l34timir;
-+		u16 port = ports[i];
-+
-+		if (!adapter->gaming_5tuple_saved) {
-+			adapter->gaming_saved_filters[i].ftqf =
-+				IXGBE_READ_REG(hw, IXGBE_FTQF(i));
-+			adapter->gaming_saved_filters[i].saqf =
-+				IXGBE_READ_REG(hw, IXGBE_SAQF(i));
-+			adapter->gaming_saved_filters[i].daqf =
-+				IXGBE_READ_REG(hw, IXGBE_DAQF(i));
-+			adapter->gaming_saved_filters[i].sdpqf =
-+				IXGBE_READ_REG(hw, IXGBE_SDPQF(i));
-+			adapter->gaming_saved_filters[i].l34timir =
-+				IXGBE_READ_REG(hw, IXGBE_L34T_IMIR(i));
-+		}
-+
-+		ftqf = IXGBE_FTQF_POOL_MASK_EN |
-+		       (IXGBE_GAMING_5TUPLE_PRIO << IXGBE_FTQF_PRIORITY_SHIFT) |
-+		       (IXGBE_FTQF_5TUPLE_MASK_DPORT_PROTO <<
-+			IXGBE_FTQF_5TUPLE_MASK_SHIFT) |
-+		       IXGBE_FTQF_QUEUE_ENABLE | IXGBE_FTQF_PROTOCOL_UDP;
-+		l34timir = IXGBE_IMIR_LLI_EN_82599 |
-+			   IXGBE_IMIR_SIZE_BP_82599 |
-+			   IXGBE_IMIR_CTRL_BP_82599 |
-+			   ((u32)queue << IXGBE_IMIR_RX_QUEUE_SHIFT_82599);
-+
-+		/* Program the action register first and enable the filter last. */
-+		IXGBE_WRITE_REG(hw, IXGBE_SAQF(i), 0);
-+		IXGBE_WRITE_REG(hw, IXGBE_DAQF(i), 0);
-+		IXGBE_WRITE_REG(hw, IXGBE_SDPQF(i), (u32)swab16(port) << 16);
-+		IXGBE_WRITE_REG(hw, IXGBE_L34T_IMIR(i), l34timir);
-+		IXGBE_WRITE_REG(hw, IXGBE_FTQF(i), ftqf);
++	err = ixgbe_gaming_fdir_poll_complete(hw);
++	if (err) {
++		e_err(drv, "FDIR flush timed out during re-initialization\n");
++		return err;
 +	}
 +
-+	adapter->gaming_5tuple_saved = true;
-+	adapter->gaming_5tuple_count = programmed;
-+	spin_unlock_irqrestore(&adapter->gaming_lock, flags);
++	fdirctrl = IXGBE_FDIRCTRL_PERFECT_MATCH |
++		   IXGBE_FDIRCTRL_PBALLOC_64K |
++		   IXGBE_FDIRCTRL_REPORT_STATUS |
++		   UDP_PAYLOAD_FLEX_OFFSET << IXGBE_FDIRCTRL_FLEX_SHIFT;
 +
-+	return programmed;
++	IXGBE_WRITE_REG(hw, IXGBE_FDIRCTRL, fdirctrl);
++
++	fdirmsk = IXGBE_FDIRM_POOL | IXGBE_FDIRM_VLANID | IXGBE_FDIRM_VLANP | IXGBE_FDIRM_DIPv6;
++	IXGBE_WRITE_REG(hw, IXGBE_FDIRM, fdirmsk);
++
++	IXGBE_WRITE_REG(hw, IXGBE_FDIRTCPM, 0xFFFF0000);
++	IXGBE_WRITE_REG(hw, IXGBE_FDIRUDPM, 0xFFFF0000);
++
++	IXGBE_WRITE_REG(hw, IXGBE_FDIRSIP4M, 0xFFFFFFFF);
++	IXGBE_WRITE_REG(hw, IXGBE_FDIRDIP4M, 0xFFFFFFFF);
++
++	IXGBE_WRITE_FLUSH(hw);
++	usleep_range(100, 150);
++
++	return 0;
 +}
 +
-+static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter)
++static int ixgbe_gaming_fdir_program_filter(struct ixgbe_adapter *adapter,
++					     u16 port, u8 queue, u16 filter_index)
++{
++	struct ixgbe_hw *hw = &adapter->hw;
++	u32 fdirport, fdirvlan, fdircmd, fdirhash;
++	s32 err;
++
++	if (unlikely(filter_index >= IXGBE_MAX_GAMING_FILTERS))
++		return -EINVAL;
++
++	err = ixgbe_gaming_fdir_poll_complete(hw);
++	if (err)
++		return err;
++
++	IXGBE_WRITE_REG(hw, IXGBE_FDIRIPSA, 0);
++	IXGBE_WRITE_REG(hw, IXGBE_FDIRIPDA, 0);
++
++	fdirport = (u32)swab16(port) << IXGBE_FDIRPORT_DESTINATION_SHIFT;
++	IXGBE_WRITE_REG(hw, IXGBE_FDIRPORT, fdirport);
++
++	fdirvlan = GAMING_FLEX_BYTE_SIGNATURE << IXGBE_FDIRVLAN_FLEX_SHIFT;
++	IXGBE_WRITE_REG(hw, IXGBE_FDIRVLAN, fdirvlan);
++
++	fdirhash = (u32)filter_index | (1u << IXGBE_FDIRHASH_BUCKET_VALID_SHIFT);
++	IXGBE_WRITE_REG(hw, IXGBE_FDIRHASH, fdirhash);
++
++	fdircmd = IXGBE_FDIRCMD_CMD_ADD_FLOW |
++		  IXGBE_FDIRCMD_L4TYPE_UDP |
++		  IXGBE_FDIRCMD_INT |
++		  IXGBE_FDIRCMD_LAST |
++		  IXGBE_FDIRCMD_QUEUE_EN |
++		  ((u32)queue << IXGBE_FDIRCMD_RX_QUEUE_SHIFT);
++
++	wmb();
++
++	IXGBE_WRITE_REG(hw, IXGBE_FDIRCMD, fdircmd);
++	IXGBE_WRITE_FLUSH(hw);
++
++	err = ixgbe_gaming_fdir_poll_complete(hw);
++	if (err) {
++		e_err(drv, "Failed to program FDIR Perfect Filter %d on port %u\n",
++		      filter_index, port);
++		return err;
++	}
++
++	return 0;
++}
++
++static int ixgbe_gaming_fdir_program_filters(struct ixgbe_adapter *adapter)
 +{
 +	u16 ports[IXGBE_MAX_GAMING_FILTERS];
++	struct ixgbe_hw *hw = &adapter->hw;
++	unsigned long flags;
 +	int num_ports, i, ret;
 +	u8 queue = 0;
 +
-+	if (adapter->hw.mac.type < ixgbe_mac_82599EB ||
++	if (hw->mac.type < ixgbe_mac_82599EB ||
 +	    !gaming_atr_ranges || !*gaming_atr_ranges ||
 +	    (adapter->flags & IXGBE_FLAG_SRIOV_ENABLED))
 +		return 0;
@@ -3138,22 +3165,29 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
 +	if (num_ports <= 0)
 +		return num_ports;
 +
-+	ixgbe_gaming_atr_clear_filters(adapter);
++	ret = ixgbe_gaming_fdir_configure_global(adapter);
++	if (ret)
++		return ret;
++
 +	for (i = 0; i < adapter->num_rx_queues; i++) {
 +		if (adapter->rx_ring[i]) {
 +			queue = adapter->rx_ring[i]->reg_idx;
 +			break;
 +		}
 +	}
-+	if (i == adapter->num_rx_queues)
-+		return -ENODEV;
 +
-+	ret = ixgbe_gaming_5tuple_program(adapter, ports, num_ports, queue);
-+	if (ret < 0)
-+		return ret;
++	spin_lock_irqsave(&adapter->gaming_lock, flags);
++	for (i = 0; i < num_ports; i++) {
++		ret = ixgbe_gaming_fdir_program_filter(adapter, ports[i], queue, i);
++		if (ret)
++			break;
++		adapter->gaming_ports[i] = ports[i];
++	}
++	adapter->gaming_fdir_count = i;
++	spin_unlock_irqrestore(&adapter->gaming_lock, flags);
 +
-+	pr_info("ixgbe: Gaming 5-tuple LLI programmed %d of %d requested ports on queue %u\n",
-+		adapter->gaming_5tuple_count, num_ports, queue);
++	pr_info("ixgbe: Gaming FDIR LLI programmed %d of %d requested ports on queue %u\n",
++		adapter->gaming_fdir_count, num_ports, queue);
 +	return 0;
 +}
 +
@@ -3161,7 +3195,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  char ixgbe_driver_name[] = "ixgbe";
  static const char ixgbe_driver_string[] =
  			      "Intel(R) 10 Gigabit PCI Express Network Driver";
-@@ -289,6 +613,7 @@ static void ixgbe_service_event_schedule(struct ixgbe_adapter *adapter)
+@@ -289,6 +664,7 @@ static void ixgbe_service_event_schedule(struct ixgbe_adapter *adapter)
  {
  	if (!test_bit(__IXGBE_DOWN, &adapter->state) &&
  	    !test_bit(__IXGBE_REMOVING, &adapter->state) &&
@@ -3169,7 +3203,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	    !test_and_set_bit(__IXGBE_SERVICE_SCHED, &adapter->state))
  		queue_work(ixgbe_wq, &adapter->service_task);
  }
-@@ -1121,9 +1446,11 @@ static void ixgbe_tx_timeout_reset(struct ixgbe_adapter *adapter)
+@@ -1121,9 +1497,11 @@ static void ixgbe_tx_timeout_reset(struct ixgbe_adapter *adapter)
  
  	/* Do the reset outside of interrupt context */
  	if (!test_bit(__IXGBE_DOWN, &adapter->state)) {
@@ -3184,7 +3218,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	}
  }
  
-@@ -1367,42 +1694,33 @@ static bool ixgbe_clean_tx_irq(struct ixgbe_q_vector *q_vector,
+@@ -1367,42 +1745,33 @@ static bool ixgbe_clean_tx_irq(struct ixgbe_q_vector *q_vector,
  	do {
  		union ixgbe_adv_tx_desc *eop_desc = tx_buffer->next_to_watch;
  
@@ -3230,7 +3264,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		while (tx_desc != eop_desc) {
  			tx_buffer++;
  			tx_desc++;
-@@ -1413,17 +1731,15 @@ static bool ixgbe_clean_tx_irq(struct ixgbe_q_vector *q_vector,
+@@ -1413,17 +1782,15 @@ static bool ixgbe_clean_tx_irq(struct ixgbe_q_vector *q_vector,
  				tx_desc = IXGBE_TX_DESC(tx_ring, 0);
  			}
  
@@ -3251,7 +3285,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		tx_buffer++;
  		tx_desc++;
  		i++;
-@@ -1433,10 +1749,7 @@ static bool ixgbe_clean_tx_irq(struct ixgbe_q_vector *q_vector,
+@@ -1433,10 +1800,7 @@ static bool ixgbe_clean_tx_irq(struct ixgbe_q_vector *q_vector,
  			tx_desc = IXGBE_TX_DESC(tx_ring, 0);
  		}
  
@@ -3262,7 +3296,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		budget--;
  	} while (likely(budget));
  
-@@ -1449,6 +1762,7 @@ static bool ixgbe_clean_tx_irq(struct ixgbe_q_vector *q_vector,
+@@ -1449,6 +1813,7 @@ static bool ixgbe_clean_tx_irq(struct ixgbe_q_vector *q_vector,
  	if (ring_is_xdp(tx_ring))
  		return !!budget;
  
@@ -3270,7 +3304,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	if (check_for_tx_hang(tx_ring) && ixgbe_check_tx_hang(tx_ring)) {
  		if (adapter->hw.mac.type == ixgbe_mac_e610)
  			ixgbe_handle_mdd_event(adapter, tx_ring);
-@@ -1459,10 +1773,7 @@ static bool ixgbe_clean_tx_irq(struct ixgbe_q_vector *q_vector,
+@@ -1459,10 +1824,7 @@ static bool ixgbe_clean_tx_irq(struct ixgbe_q_vector *q_vector,
  		       "tx hang %d detected on queue %d, resetting adapter\n",
  			adapter->tx_timeout_count + 1, tx_ring->queue_index);
  
@@ -3281,7 +3315,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		return true;
  	}
  
-@@ -1921,9 +2232,108 @@ void ixgbe_process_skb_fields(struct ixgbe_ring *rx_ring,
+@@ -1921,9 +2283,108 @@ void ixgbe_process_skb_fields(struct ixgbe_ring *rx_ring,
  	skb->protocol = eth_type_trans(skb, dev);
  }
  
@@ -3292,7 +3326,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
 + * fragmented header.  pskb_may_pull() is used so non-linear skb layouts are
 + * handled without dereferencing data outside the linear head. */
 +static __always_inline bool ixgbe_is_tiny_udp(struct sk_buff *skb)
- {
++{
 +	unsigned int offset;
 +	u8 nexthdr;
 +	int i;
@@ -3383,7 +3417,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
 +
 +
 +void ixgbe_rx_skb(struct ixgbe_q_vector *q_vector, struct sk_buff *skb)
-+{
+ {
 +	if (gaming_mode && ixgbe_is_tiny_udp(skb)) {
 +		netif_receive_skb(skb);
 +		return;
@@ -3392,7 +3426,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	napi_gro_receive(&q_vector->napi, skb);
  }
  
-@@ -2494,8 +2904,8 @@ static void ixgbe_rx_buffer_flip(struct ixgbe_ring *rx_ring,
+@@ -2494,8 +2955,8 @@ static void ixgbe_rx_buffer_flip(struct ixgbe_ring *rx_ring,
   * Returns amount of work completed
   **/
  static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
@@ -3403,7 +3437,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  {
  	unsigned int total_rx_bytes = 0, total_rx_packets = 0, frame_sz = 0;
  	struct ixgbe_adapter *adapter = q_vector->adapter;
-@@ -2507,9 +2917,7 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
+@@ -2507,9 +2968,7 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
  	unsigned int offset = rx_ring->rx_offset;
  	unsigned int xdp_xmit = 0;
  	struct xdp_buff xdp;
@@ -3413,7 +3447,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  #if (PAGE_SIZE < 8192)
  	frame_sz = ixgbe_rx_frame_truesize(rx_ring, 0);
  #endif
-@@ -2521,8 +2929,8 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
+@@ -2521,8 +2980,8 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
  		struct sk_buff *skb;
  		int rx_buffer_pgcnt;
  		unsigned int size;
@@ -3423,7 +3457,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		if (cleaned_count >= IXGBE_RX_BUFFER_WRITE) {
  			ixgbe_alloc_rx_buffers(rx_ring, cleaned_count);
  			cleaned_count = 0;
-@@ -2533,15 +2941,11 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
+@@ -2533,15 +2992,11 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
  		if (!size)
  			break;
  
@@ -3441,7 +3475,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		if (!skb) {
  			unsigned char *hard_start;
  
-@@ -2550,7 +2954,6 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
+@@ -2550,7 +3005,6 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
  			xdp_prepare_buff(&xdp, hard_start, offset, size, true);
  			xdp_buff_clear_frags_flag(&xdp);
  #if (PAGE_SIZE > 4096)
@@ -3449,7 +3483,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  			xdp.frame_sz = ixgbe_rx_frame_truesize(rx_ring, size);
  #endif
  			xdp_res = ixgbe_run_xdp(adapter, rx_ring, &xdp);
-@@ -2568,14 +2971,11 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
+@@ -2568,14 +3022,11 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
  		} else if (skb) {
  			ixgbe_add_rx_frag(rx_ring, rx_buffer, skb, size);
  		} else if (ring_uses_build_skb(rx_ring)) {
@@ -3466,7 +3500,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		if (!xdp_res && !skb) {
  			rx_ring->rx_stats.alloc_rx_buff_failed++;
  			rx_buffer->pagecnt_bias++;
-@@ -2585,48 +2985,39 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
+@@ -2585,48 +3036,39 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
  		ixgbe_put_rx_buffer(rx_ring, rx_buffer, skb, rx_buffer_pgcnt);
  		cleaned_count++;
  
@@ -3519,7 +3553,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		total_rx_packets++;
  	}
  
-@@ -2655,22 +3046,25 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
+@@ -2655,22 +3097,25 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
  static void ixgbe_configure_msix(struct ixgbe_adapter *adapter)
  {
  	struct ixgbe_q_vector *q_vector;
@@ -3552,7 +3586,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  
  		ixgbe_for_each_ring(ring, q_vector->rx)
  			ixgbe_set_ivar(adapter, 0, ring->reg_idx, v_idx);
-@@ -2678,13 +3072,17 @@ static void ixgbe_configure_msix(struct ixgbe_adapter *adapter)
+@@ -2678,13 +3123,17 @@ static void ixgbe_configure_msix(struct ixgbe_adapter *adapter)
  		ixgbe_for_each_ring(ring, q_vector->tx)
  			ixgbe_set_ivar(adapter, 1, ring->reg_idx, v_idx);
  
@@ -3572,7 +3606,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		break;
  	case ixgbe_mac_82599EB:
  	case ixgbe_mac_X540:
-@@ -2692,23 +3090,24 @@ static void ixgbe_configure_msix(struct ixgbe_adapter *adapter)
+@@ -2692,23 +3141,24 @@ static void ixgbe_configure_msix(struct ixgbe_adapter *adapter)
  	case ixgbe_mac_X550EM_x:
  	case ixgbe_mac_x550em_a:
  	case ixgbe_mac_e610:
@@ -3606,7 +3640,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  }
  
  /**
-@@ -2727,174 +3126,114 @@ static void ixgbe_configure_msix(struct ixgbe_adapter *adapter)
+@@ -2727,174 +3177,114 @@ static void ixgbe_configure_msix(struct ixgbe_adapter *adapter)
  static void ixgbe_update_itr(struct ixgbe_q_vector *q_vector,
  			     struct ixgbe_ring_container *ring_container)
  {
@@ -3856,7 +3890,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	ring_container->total_bytes = 0;
  	ring_container->total_packets = 0;
  }
-@@ -2909,15 +3248,25 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *q_vector,
+@@ -2909,15 +3299,25 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *q_vector,
   */
  void ixgbe_write_eitr(struct ixgbe_q_vector *q_vector)
  {
@@ -3889,7 +3923,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		break;
  	case ixgbe_mac_82599EB:
  	case ixgbe_mac_X540:
-@@ -2925,36 +3274,54 @@ void ixgbe_write_eitr(struct ixgbe_q_vector *q_vector)
+@@ -2925,36 +3325,54 @@ void ixgbe_write_eitr(struct ixgbe_q_vector *q_vector)
  	case ixgbe_mac_X550EM_x:
  	case ixgbe_mac_x550em_a:
  	case ixgbe_mac_e610:
@@ -3947,16 +3981,16 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
 +	/* Keep practical low-latency limits to avoid pathological extremes. */
 +	if (gaming_mode)
 +		new_itr = clamp_t(u32, new_itr, IXGBE_GAMING_ITR_MIN, IXGBE_GAMING_ITR_MAX);
- 
-+	old_itr = q_vector->itr;
 +
++	old_itr = q_vector->itr;
+ 
 +	if (new_itr != old_itr &&
 +	    (!gaming_mode || abs((int)new_itr - (int)old_itr) >= 4)) {
 +		q_vector->itr = (u16)new_itr;
  		ixgbe_write_eitr(q_vector);
  	}
  }
-@@ -3646,12 +4013,29 @@ int ixgbe_poll(struct napi_struct *napi, int budget)
+@@ -3646,12 +4064,29 @@ int ixgbe_poll(struct napi_struct *napi, int budget)
  static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
  {
  	struct net_device *netdev = adapter->netdev;
@@ -3986,7 +4020,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  
  		if (q_vector->tx.ring && q_vector->rx.ring) {
  			snprintf(q_vector->name, sizeof(q_vector->name),
-@@ -3664,45 +4048,71 @@ static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
+@@ -3664,45 +4099,71 @@ static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
  			snprintf(q_vector->name, sizeof(q_vector->name),
  				 "%s-tx-%u", netdev->name, ti++);
  		} else {
@@ -4072,7 +4106,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	return err;
  }
  
-@@ -3827,16 +4237,14 @@ static void ixgbe_free_irq(struct ixgbe_adapter *adapter)
+@@ -3827,16 +4288,14 @@ static void ixgbe_free_irq(struct ixgbe_adapter *adapter)
  		struct ixgbe_q_vector *q_vector = adapter->q_vector[vector];
  		struct msix_entry *entry = &adapter->msix_entries[vector];
  
@@ -4090,7 +4124,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	free_irq(adapter->msix_entries[vector].vector, adapter);
  }
  
-@@ -3846,34 +4254,38 @@ static void ixgbe_free_irq(struct ixgbe_adapter *adapter)
+@@ -3846,34 +4305,38 @@ static void ixgbe_free_irq(struct ixgbe_adapter *adapter)
   **/
  static inline void ixgbe_irq_disable(struct ixgbe_adapter *adapter)
  {
@@ -4157,7 +4191,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  }
  
  /**
-@@ -3907,6 +4319,7 @@ void ixgbe_configure_tx_ring(struct ixgbe_adapter *adapter,
+@@ -3907,6 +4370,7 @@ void ixgbe_configure_tx_ring(struct ixgbe_adapter *adapter,
  	u64 tdba = ring->dma;
  	int wait_loop = 10;
  	u32 txdctl = IXGBE_TXDCTL_ENABLE;
@@ -4165,7 +4199,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	u8 reg_idx = ring->reg_idx;
  
  	ring->xsk_pool = NULL;
-@@ -3926,29 +4339,17 @@ void ixgbe_configure_tx_ring(struct ixgbe_adapter *adapter,
+@@ -3926,29 +4390,17 @@ void ixgbe_configure_tx_ring(struct ixgbe_adapter *adapter,
  	IXGBE_WRITE_REG(hw, IXGBE_TDT(reg_idx), 0);
  	ring->tail = adapter->io_addr + IXGBE_TDT(reg_idx);
  
@@ -4204,7 +4238,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	if (adapter->flags & IXGBE_FLAG_FDIR_HASH_CAPABLE) {
  		ring->atr_sample_rate = adapter->atr_sample_rate;
  		ring->atr_count = 0;
-@@ -3957,7 +4358,6 @@ void ixgbe_configure_tx_ring(struct ixgbe_adapter *adapter,
+@@ -3957,7 +4409,6 @@ void ixgbe_configure_tx_ring(struct ixgbe_adapter *adapter,
  		ring->atr_sample_rate = 0;
  	}
  
@@ -4212,7 +4246,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	if (!test_and_set_bit(__IXGBE_TX_XPS_INIT_DONE, &ring->state)) {
  		struct ixgbe_q_vector *q_vector = ring->q_vector;
  
-@@ -3969,23 +4369,31 @@ void ixgbe_configure_tx_ring(struct ixgbe_adapter *adapter,
+@@ -3969,23 +4420,29 @@ void ixgbe_configure_tx_ring(struct ixgbe_adapter *adapter,
  
  	clear_bit(__IXGBE_HANG_CHECK_ARMED, &ring->state);
  
@@ -4225,8 +4259,6 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
 +
 +		txctrl |= IXGBE_DCA_TXCTRL_DESC_RRO_EN |
 +			  IXGBE_DCA_TXCTRL_DATA_RRO_EN;
-+		if (gaming_mode)
-+			txctrl |= IXGBE_DCA_TXCTRL_DESC_WRO_EN;
 +		IXGBE_WRITE_REG(hw, IXGBE_DCA_TXCTRL_82599(reg_idx), txctrl);
 +	}
 +
@@ -4247,7 +4279,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	if (!wait_loop)
  		hw_dbg(hw, "Could not enable Tx Queue %d\n", reg_idx);
  }
-@@ -4368,6 +4776,7 @@ static void ixgbe_setup_mrqc(struct ixgbe_adapter *adapter)
+@@ -4368,6 +4825,7 @@ static void ixgbe_setup_mrqc(struct ixgbe_adapter *adapter)
  	struct ixgbe_hw *hw = &adapter->hw;
  	u32 mrqc = 0, rss_field = 0, vfmrqc = 0;
  	u32 rxcsum;
@@ -4255,7 +4287,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  
  	/* Disable indicating checksum in descriptor, enables RSS hash */
  	rxcsum = IXGBE_READ_REG(hw, IXGBE_RXCSUM);
-@@ -4382,18 +4791,15 @@ static void ixgbe_setup_mrqc(struct ixgbe_adapter *adapter)
+@@ -4382,18 +4840,15 @@ static void ixgbe_setup_mrqc(struct ixgbe_adapter *adapter)
  
  		if (adapter->flags & IXGBE_FLAG_SRIOV_ENABLED) {
  			if (tcs > 4)
@@ -4276,7 +4308,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  			if (hw->mac.type >= ixgbe_mac_X550)
  				mrqc |= IXGBE_MRQC_L3L4TXSWEN;
  		} else {
-@@ -4412,20 +4818,25 @@ static void ixgbe_setup_mrqc(struct ixgbe_adapter *adapter)
+@@ -4412,20 +4867,25 @@ static void ixgbe_setup_mrqc(struct ixgbe_adapter *adapter)
  		     IXGBE_MRQC_RSS_FIELD_IPV6 |
  		     IXGBE_MRQC_RSS_FIELD_IPV6_TCP;
  
@@ -4306,7 +4338,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		ixgbe_setup_vfreta(adapter);
  		vfmrqc = IXGBE_MRQC_RSSEN;
  		vfmrqc |= rss_field;
-@@ -4515,11 +4926,9 @@ void ixgbe_configure_rx_ring(struct ixgbe_adapter *adapter,
+@@ -4515,11 +4975,9 @@ void ixgbe_configure_rx_ring(struct ixgbe_adapter *adapter,
  						   MEM_TYPE_PAGE_SHARED, NULL));
  	}
  
@@ -4318,7 +4350,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	IXGBE_WRITE_REG(hw, IXGBE_RXDCTL(reg_idx), rxdctl);
  	IXGBE_WRITE_FLUSH(hw);
  
-@@ -4527,7 +4936,6 @@ void ixgbe_configure_rx_ring(struct ixgbe_adapter *adapter,
+@@ -4527,7 +4985,6 @@ void ixgbe_configure_rx_ring(struct ixgbe_adapter *adapter,
  	IXGBE_WRITE_REG(hw, IXGBE_RDBAH(reg_idx), (rdba >> 32));
  	IXGBE_WRITE_REG(hw, IXGBE_RDLEN(reg_idx),
  			ring->count * sizeof(union ixgbe_adv_rx_desc));
@@ -4326,7 +4358,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	IXGBE_WRITE_FLUSH(hw);
  
  	IXGBE_WRITE_REG(hw, IXGBE_RDH(reg_idx), 0);
-@@ -4538,25 +4946,13 @@ void ixgbe_configure_rx_ring(struct ixgbe_adapter *adapter,
+@@ -4538,25 +4995,13 @@ void ixgbe_configure_rx_ring(struct ixgbe_adapter *adapter,
  	ixgbe_configure_rscctl(adapter, ring);
  
  	if (hw->mac.type == ixgbe_mac_82598EB) {
@@ -4352,7 +4384,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		if (ring_uses_build_skb(ring) &&
  		    !test_bit(__IXGBE_RX_3K_BUFFER, &ring->state))
  			rxdctl |= IXGBE_MAX_2K_FRAME_BUILD_SKB |
-@@ -4576,15 +4972,30 @@ void ixgbe_configure_rx_ring(struct ixgbe_adapter *adapter,
+@@ -4576,15 +5021,30 @@ void ixgbe_configure_rx_ring(struct ixgbe_adapter *adapter,
  		ring->rx_buf_len = xsk_buf_len;
  	}
  
@@ -4386,7 +4418,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	rxdctl |= IXGBE_RXDCTL_ENABLE;
  	IXGBE_WRITE_REG(hw, IXGBE_RXDCTL(reg_idx), rxdctl);
  
-@@ -4723,6 +5134,8 @@ static void ixgbe_set_rx_buffer_len(struct ixgbe_adapter *adapter)
+@@ -4723,6 +5183,8 @@ static void ixgbe_set_rx_buffer_len(struct ixgbe_adapter *adapter)
  	hlreg0 = IXGBE_READ_REG(hw, IXGBE_HLREG0);
  	/* set jumbo enable since MHADD.MFS is keeping size locked at max_frame */
  	hlreg0 |= IXGBE_HLREG0_JUMBOEN;
@@ -4395,7 +4427,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	IXGBE_WRITE_REG(hw, IXGBE_HLREG0, hlreg0);
  
  	/*
-@@ -5882,10 +6295,6 @@ static void ixgbe_configure(struct ixgbe_adapter *adapter)
+@@ -5882,10 +6344,6 @@ static void ixgbe_configure(struct ixgbe_adapter *adapter)
  #ifdef CONFIG_IXGBE_DCB
  	ixgbe_configure_dcb(adapter);
  #endif
@@ -4406,12 +4438,12 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	ixgbe_configure_virtualization(adapter);
  
  	ixgbe_set_rx_mode(adapter->netdev);
-@@ -5919,17 +6328,16 @@ static void ixgbe_configure(struct ixgbe_adapter *adapter)
+@@ -5919,17 +6377,16 @@ static void ixgbe_configure(struct ixgbe_adapter *adapter)
  		break;
  	}
  
 +	if (gaming_atr_ranges && *gaming_atr_ranges)
-+		ixgbe_gaming_atr_program_filters(adapter);
++		ixgbe_gaming_fdir_program_filters(adapter);
 +
  #ifdef CONFIG_IXGBE_DCA
 -	/* configure DCA */
@@ -4429,7 +4461,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	ixgbe_configure_tx(adapter);
  	ixgbe_configure_rx(adapter);
  	ixgbe_configure_dfwd(adapter);
-@@ -6159,7 +6567,10 @@ static void ixgbe_setup_gpie(struct ixgbe_adapter *adapter)
+@@ -6159,7 +6616,10 @@ static void ixgbe_setup_gpie(struct ixgbe_adapter *adapter)
  	}
  
  	/* XXX: to interrupt immediately for EICS writes, enable this */
@@ -4441,7 +4473,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  
  	if (adapter->flags & IXGBE_FLAG_SRIOV_ENABLED) {
  		gpie &= ~IXGBE_GPIE_VTMODE_MASK;
-@@ -6304,7 +6715,6 @@ void ixgbe_reinit_locked(struct ixgbe_adapter *adapter)
+@@ -6304,7 +6764,6 @@ void ixgbe_reinit_locked(struct ixgbe_adapter *adapter)
  
  void ixgbe_up(struct ixgbe_adapter *adapter)
  {
@@ -4449,7 +4481,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	ixgbe_configure(adapter);
  
  	ixgbe_up_complete(adapter);
-@@ -6605,9 +7015,9 @@ static void ixgbe_clean_tx_ring(struct ixgbe_ring *tx_ring)
+@@ -6605,9 +7064,9 @@ static void ixgbe_clean_tx_ring(struct ixgbe_ring *tx_ring)
  
  		/* unmap skb header data */
  		dma_unmap_single(tx_ring->dev,
@@ -4462,7 +4494,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  
  		/* check for eop_desc to determine the end of the packet */
  		eop_desc = tx_buffer->next_to_watch;
-@@ -6627,9 +7037,9 @@ static void ixgbe_clean_tx_ring(struct ixgbe_ring *tx_ring)
+@@ -6627,9 +7086,9 @@ static void ixgbe_clean_tx_ring(struct ixgbe_ring *tx_ring)
  			/* unmap any remaining paged data */
  			if (dma_unmap_len(tx_buffer, len))
  				dma_unmap_page(tx_ring->dev,
@@ -4475,7 +4507,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		}
  
  		/* move us one more past the eop_desc for start of next pkt */
-@@ -6700,26 +7110,23 @@ void ixgbe_down(struct ixgbe_adapter *adapter)
+@@ -6700,26 +7159,23 @@ void ixgbe_down(struct ixgbe_adapter *adapter)
  	struct ixgbe_hw *hw = &adapter->hw;
  	int i;
  
@@ -4501,12 +4533,12 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	ixgbe_irq_disable(adapter);
  
 +	/* Clear Gaming ATR filters here while IRQs are off */
-+	ixgbe_gaming_atr_clear_filters(adapter);
++	ixgbe_gaming_fdir_clear_filters(adapter);
 +
  	ixgbe_napi_disable_all(adapter);
  
  	clear_bit(__IXGBE_RESET_REQUESTED, &adapter->state);
-@@ -6729,29 +7136,23 @@ void ixgbe_down(struct ixgbe_adapter *adapter)
+@@ -6729,29 +7185,23 @@ void ixgbe_down(struct ixgbe_adapter *adapter)
  	timer_delete_sync(&adapter->service_timer);
  
  	if (adapter->num_vfs) {
@@ -4537,7 +4569,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	if (adapter->hw.mac.type == ixgbe_mac_e610)
  		ixgbe_disable_link_status_events(adapter);
  }
-@@ -6880,8 +7281,27 @@ static int ixgbe_sw_init(struct ixgbe_adapter *adapter,
+@@ -6880,8 +7330,27 @@ static int ixgbe_sw_init(struct ixgbe_adapter *adapter,
  
  	/* Set common capability flags and settings */
  	rss = min_t(int, ixgbe_max_rss_indices(adapter), num_online_cpus());
@@ -4566,7 +4598,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	adapter->max_q_vectors = MAX_Q_VECTORS_82599;
  	adapter->atr_sample_rate = 20;
  	fdir = min_t(int, IXGBE_MAX_FDIR_INDICES, num_online_cpus());
-@@ -6927,6 +7347,12 @@ static int ixgbe_sw_init(struct ixgbe_adapter *adapter,
+@@ -6927,6 +7396,12 @@ static int ixgbe_sw_init(struct ixgbe_adapter *adapter,
  	if (!adapter->af_xdp_zc_qps)
  		return -ENOMEM;
  
@@ -4579,7 +4611,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	/* Set MAC specific capability flags and exceptions */
  	switch (hw->mac.type) {
  	case ixgbe_mac_82598EB:
-@@ -7012,8 +7438,13 @@ static int ixgbe_sw_init(struct ixgbe_adapter *adapter,
+@@ -7012,8 +7487,13 @@ static int ixgbe_sw_init(struct ixgbe_adapter *adapter,
  	ixgbe_init_ipsec_offload(adapter);
  
  	/* default flow control settings */
@@ -4595,7 +4627,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	ixgbe_pbthresh_setup(adapter);
  	hw->fc.pause_time = IXGBE_DEFAULT_FCPAUSE;
  	hw->fc.send_xon = true;
-@@ -8087,7 +8518,6 @@ static void ixgbe_watchdog_link_is_up(struct ixgbe_adapter *adapter)
+@@ -8087,7 +8567,6 @@ static void ixgbe_watchdog_link_is_up(struct ixgbe_adapter *adapter)
  	const char *speed_str;
  	bool flow_rx, flow_tx;
  
@@ -4603,7 +4635,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	if (netif_carrier_ok(netdev))
  		return;
  
-@@ -8158,13 +8588,8 @@ static void ixgbe_watchdog_link_is_up(struct ixgbe_adapter *adapter)
+@@ -8158,13 +8637,8 @@ static void ixgbe_watchdog_link_is_up(struct ixgbe_adapter *adapter)
  	if (adapter->num_vfs && hw->mac.ops.enable_mdd)
  		hw->mac.ops.enable_mdd(hw);
  
@@ -4617,7 +4649,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	ixgbe_ping_all_vfs(adapter);
  }
  
-@@ -8558,24 +8983,36 @@ static void ixgbe_reset_subtask(struct ixgbe_adapter *adapter)
+@@ -8558,24 +9032,36 @@ static void ixgbe_reset_subtask(struct ixgbe_adapter *adapter)
  static int ixgbe_check_fw_api_mismatch(struct ixgbe_adapter *adapter)
  {
  	struct ixgbe_hw *hw = &adapter->hw;
@@ -4660,7 +4692,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		e_dev_info("The driver for the device detected an older version of the NVM image than expected. Please update the NVM image.\n");
  		adapter->flags2 |= IXGBE_FLAG2_API_MISMATCH;
  	}
-@@ -8595,26 +9032,24 @@ static bool ixgbe_check_fw_error(struct ixgbe_adapter *adapter)
+@@ -8595,26 +9081,24 @@ static bool ixgbe_check_fw_error(struct ixgbe_adapter *adapter)
  	u32 fwsm;
  	int err;
  
@@ -4692,7 +4724,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	if (adapter->flags2 & IXGBE_FLAG2_FW_ROLLBACK)
  		return false;
  
-@@ -8622,19 +9057,17 @@ static bool ixgbe_check_fw_error(struct ixgbe_adapter *adapter)
+@@ -8622,19 +9106,17 @@ static bool ixgbe_check_fw_error(struct ixgbe_adapter *adapter)
  		struct ixgbe_nvm_info *nvm_info = &adapter->hw.flash.nvm;
  		char ver_buff[64] = "";
  
@@ -4722,7 +4754,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  			   ver_buff);
  
  		adapter->flags2 |= IXGBE_FLAG2_FW_ROLLBACK;
-@@ -8864,34 +9297,23 @@ static void ixgbe_tx_csum(struct ixgbe_ring *tx_ring,
+@@ -8864,34 +9346,23 @@ static void ixgbe_tx_csum(struct ixgbe_ring *tx_ring,
  	ixgbe_tx_ctxtdesc(tx_ring, vlan_macip_lens, fceof_saidx, type_tucmd, 0);
  }
  
@@ -4770,7 +4802,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  }
  
  static void ixgbe_tx_olinfo_status(union ixgbe_adv_tx_desc *tx_desc,
-@@ -8899,28 +9321,14 @@ static void ixgbe_tx_olinfo_status(union ixgbe_adv_tx_desc *tx_desc,
+@@ -8899,28 +9370,14 @@ static void ixgbe_tx_olinfo_status(union ixgbe_adv_tx_desc *tx_desc,
  {
  	u32 olinfo_status = paylen << IXGBE_ADVTXD_PAYLEN_SHIFT;
  
@@ -4807,7 +4839,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  
  	tx_desc->read.olinfo_status = cpu_to_le32(olinfo_status);
  }
-@@ -8952,13 +9360,12 @@ static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
+@@ -8952,13 +9409,12 @@ static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
  	union ixgbe_adv_tx_desc *tx_desc;
  	skb_frag_t *frag;
  	dma_addr_t dma;
@@ -4822,7 +4854,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	ixgbe_tx_olinfo_status(tx_desc, tx_flags, skb->len - hdr_len);
  
  	size = skb_headlen(skb);
-@@ -8973,50 +9380,46 @@ static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
+@@ -8973,50 +9429,46 @@ static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
  			data_len -= sizeof(struct fcoe_crc_eof);
  		}
  	}
@@ -4884,7 +4916,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		}
  		tx_desc->read.olinfo_status = 0;
  
-@@ -9027,65 +9430,60 @@ static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
+@@ -9027,65 +9479,60 @@ static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
  #endif
  		data_len -= size;
  
@@ -4976,7 +5008,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		i--;
  	}
  
-@@ -9093,8 +9491,7 @@ static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
+@@ -9093,8 +9540,7 @@ static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
  	first->skb = NULL;
  
  	tx_ring->next_to_use = i;
@@ -4986,7 +5018,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  }
  
  static void ixgbe_atr(struct ixgbe_ring *ring,
-@@ -9103,145 +9500,131 @@ static void ixgbe_atr(struct ixgbe_ring *ring,
+@@ -9103,145 +9549,131 @@ static void ixgbe_atr(struct ixgbe_ring *ring,
  	struct ixgbe_q_vector *q_vector = ring->q_vector;
  	union ixgbe_atr_hash_dword input = { .dword = 0 };
  	union ixgbe_atr_hash_dword common = { .dword = 0 };
@@ -5224,7 +5256,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  }
  
  #ifdef IXGBE_FCOE
-@@ -9343,6 +9726,7 @@ int ixgbe_xmit_xdp_ring(struct ixgbe_ring *ring,
+@@ -9343,6 +9775,7 @@ int ixgbe_xmit_xdp_ring(struct ixgbe_ring *ring,
  		len = skb_frag_size(&sinfo->frags[i]);
  		i++;
  	}
@@ -5232,7 +5264,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	/* put descriptor type bits */
  	tx_desc->read.cmd_type_len |= cpu_to_le32(IXGBE_TXD_CMD);
  
-@@ -9357,11 +9741,14 @@ int ixgbe_xmit_xdp_ring(struct ixgbe_ring *ring,
+@@ -9357,11 +9790,14 @@ int ixgbe_xmit_xdp_ring(struct ixgbe_ring *ring,
  unmap:
  	for (;;) {
  		tx_buff = &ring->tx_buffer_info[index];
@@ -5251,7 +5283,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		if (tx_buff == tx_head)
  			break;
  
-@@ -9784,17 +10171,16 @@ static void ixgbe_validate_rtr(struct ixgbe_adapter *adapter, u8 tc)
+@@ -9784,17 +10220,16 @@ static void ixgbe_validate_rtr(struct ixgbe_adapter *adapter, u8 tc)
  	rsave = reg;
  
  	for (i = 0; i < MAX_TRAFFIC_CLASS; i++) {
@@ -5273,7 +5305,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  }
  
  /**
-@@ -10013,7 +10399,7 @@ static int ixgbe_configure_clsu32_add_hnode(struct ixgbe_adapter *adapter,
+@@ -10013,7 +10448,7 @@ static int ixgbe_configure_clsu32_add_hnode(struct ixgbe_adapter *adapter,
  {
  	u32 uhtid = TC_U32_USERHTID(cls->hnode.handle);
  
@@ -5282,7 +5314,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		return -EINVAL;
  
  	/* This ixgbe devices do not support hash tables at the moment
-@@ -10031,7 +10417,7 @@ static int ixgbe_configure_clsu32_del_hnode(struct ixgbe_adapter *adapter,
+@@ -10031,7 +10466,7 @@ static int ixgbe_configure_clsu32_del_hnode(struct ixgbe_adapter *adapter,
  {
  	u32 uhtid = TC_U32_USERHTID(cls->hnode.handle);
  
@@ -5291,7 +5323,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		return -EINVAL;
  
  	clear_bit(uhtid - 1, &adapter->tables);
-@@ -10210,6 +10596,7 @@ static int ixgbe_configure_clsu32(struct ixgbe_adapter *adapter,
+@@ -10210,6 +10645,7 @@ static int ixgbe_configure_clsu32(struct ixgbe_adapter *adapter,
  	int i, err = -EINVAL;
  	u8 queue;
  	u32 uhtid, link_uhtid;
@@ -5299,7 +5331,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  
  	uhtid = TC_U32_USERHTID(cls->knode.handle);
  	link_uhtid = TC_U32_USERHTID(cls->knode.link_handle);
-@@ -10254,7 +10641,6 @@ static int ixgbe_configure_clsu32(struct ixgbe_adapter *adapter,
+@@ -10254,7 +10690,6 @@ static int ixgbe_configure_clsu32(struct ixgbe_adapter *adapter,
  	 * a handle that does not exist is invalid and the same for adding
  	 * rules to handles that don't exist.
  	 */
@@ -5307,7 +5339,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	if (link_uhtid) {
  		struct ixgbe_nexthdr *nexthdr = ixgbe_ipv4_jumps;
  
-@@ -10281,21 +10667,24 @@ static int ixgbe_configure_clsu32(struct ixgbe_adapter *adapter,
+@@ -10281,21 +10716,24 @@ static int ixgbe_configure_clsu32(struct ixgbe_adapter *adapter,
  			    nexthdr[i].s != cls->knode.sel->offshift ||
  			    nexthdr[i].m !=
  			    (__force u32)cls->knode.sel->offmask)
@@ -5337,7 +5369,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  			jump->input = input;
  			jump->mask = mask;
  			jump->link_hdl = cls->knode.handle;
-@@ -10305,14 +10694,19 @@ static int ixgbe_configure_clsu32(struct ixgbe_adapter *adapter,
+@@ -10305,14 +10743,19 @@ static int ixgbe_configure_clsu32(struct ixgbe_adapter *adapter,
  			if (!err) {
  				jump->mat = nexthdr[i].jump;
  				adapter->jump_tables[link_uhtid] = jump;
@@ -5362,7 +5394,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	}
  
  	input = kzalloc(sizeof(*input), GFP_KERNEL);
-@@ -10346,6 +10740,7 @@ static int ixgbe_configure_clsu32(struct ixgbe_adapter *adapter,
+@@ -10346,6 +10789,7 @@ static int ixgbe_configure_clsu32(struct ixgbe_adapter *adapter,
  			}
  		}
  	}
@@ -5370,7 +5402,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	err = ixgbe_clsu32_build_input(input, mask, cls, field_ptr, NULL);
  	if (err)
  		goto err_out;
-@@ -10383,14 +10778,13 @@ static int ixgbe_configure_clsu32(struct ixgbe_adapter *adapter,
+@@ -10383,14 +10827,13 @@ static int ixgbe_configure_clsu32(struct ixgbe_adapter *adapter,
  
  	kfree(mask);
  	return err;
@@ -5386,7 +5418,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	return err;
  }
  
-@@ -10503,6 +10897,21 @@ static void ixgbe_reset_l2fw_offload(struct ixgbe_adapter *adapter)
+@@ -10503,6 +10946,21 @@ static void ixgbe_reset_l2fw_offload(struct ixgbe_adapter *adapter)
  	int rss = min_t(int, ixgbe_max_rss_indices(adapter),
  			num_online_cpus());
  
@@ -5408,7 +5440,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	/* go back to full RSS if we're not running SR-IOV */
  	if (!adapter->ring_feature[RING_F_VMDQ].offset)
  		adapter->flags &= ~(IXGBE_FLAG_VMDQ_ENABLED |
-@@ -10518,9 +10927,14 @@ static int ixgbe_set_features(struct net_device *netdev,
+@@ -10518,9 +10976,14 @@ static int ixgbe_set_features(struct net_device *netdev,
  			      netdev_features_t features)
  {
  	struct ixgbe_adapter *adapter = ixgbe_from_netdev(netdev);
@@ -5424,7 +5456,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	/* Make sure RSC matches LRO, reset if change */
  	if (!(features & NETIF_F_LRO)) {
  		if (adapter->flags2 & IXGBE_FLAG2_RSC_ENABLED)
-@@ -10582,7 +10996,7 @@ static int ixgbe_set_features(struct net_device *netdev,
+@@ -10582,7 +11045,7 @@ static int ixgbe_set_features(struct net_device *netdev,
  			    NETIF_F_HW_VLAN_CTAG_FILTER))
  		ixgbe_set_rx_mode(netdev);
  
@@ -5433,7 +5465,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  }
  
  static int ixgbe_ndo_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
-@@ -10934,10 +11348,16 @@ static int ixgbe_xdp_setup(struct net_device *dev, struct bpf_prog *prog)
+@@ -10934,10 +11397,16 @@ static int ixgbe_xdp_setup(struct net_device *dev, struct bpf_prog *prog)
  		if (!prog)
  			/* Wait until ndo_xsk_wakeup completes. */
  			synchronize_rcu();
@@ -5452,7 +5484,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		if (!prog)
  			xdp_features_clear_redirect_target(dev);
  	} else {
-@@ -10987,7 +11407,7 @@ void ixgbe_xdp_ring_update_tail(struct ixgbe_ring *ring)
+@@ -10987,7 +11456,7 @@ void ixgbe_xdp_ring_update_tail(struct ixgbe_ring *ring)
  	/* Force memory writes to complete before letting h/w know there
  	 * are new descriptors to fetch.
  	 */
@@ -5461,7 +5493,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	writel(ring->next_to_use, ring->tail);
  }
  
-@@ -11200,24 +11620,26 @@ static void ixgbe_irq_disable_single(struct ixgbe_adapter *adapter, u32 ring)
+@@ -11200,24 +11669,26 @@ static void ixgbe_irq_disable_single(struct ixgbe_adapter *adapter, u32 ring)
  	switch (adapter->hw.mac.type) {
  	case ixgbe_mac_82598EB:
  		mask = qmask & IXGBE_EIMC_RTX_QUEUE;
@@ -5492,7 +5524,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	if (adapter->flags & IXGBE_FLAG_MSIX_ENABLED)
  		synchronize_irq(adapter->msix_entries[ring].vector);
  	else
-@@ -11543,9 +11965,6 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11543,9 +12014,6 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  #endif
  	u32 eec;
  
@@ -5502,7 +5534,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	if (pdev->is_virtfn) {
  		WARN(1, KERN_ERR "%s (%hx:%hx) should not be a VF!\n",
  		     pci_name(pdev), pdev->vendor, pdev->device);
-@@ -11553,20 +11972,17 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11553,20 +12021,17 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  	}
  
  	err = pci_enable_device_mem(pdev);
@@ -5526,7 +5558,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		goto err_pci_reg;
  	}
  
-@@ -11575,7 +11991,6 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11575,7 +12040,6 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  
  	if (ii->mac == ixgbe_mac_82598EB) {
  #ifdef CONFIG_IXGBE_DCB
@@ -5534,7 +5566,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		indices = 4 * MAX_TRAFFIC_CLASS;
  #else
  		indices = IXGBE_MAX_RSS_INDICES;
-@@ -11607,36 +12022,29 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11607,36 +12071,29 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  	hw->back = adapter;
  	adapter->msg_enable = netif_msg_init(debug, DEFAULT_MSG_ENABLE);
  
@@ -5576,14 +5608,14 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	hw->phy.mdio.prtad = MDIO_PRTAD_NONE;
  	hw->phy.mdio.mmds = 0;
  	hw->phy.mdio.mode_support = MDIO_SUPPORTS_C45 | MDIO_EMULATE_C22;
-@@ -11649,10 +12057,11 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11649,10 +12106,11 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  	netdev->watchdog_timeo = 5 * HZ;
  	strscpy(netdev->name, pci_name(pdev), sizeof(netdev->name));
  
 -	/* setup the private structure */
 +	/* Initialize this before ixgbe_sw_init() so every probe error path can
-+	 * safely call ixgbe_gaming_atr_clear_filters(). */
-+	ixgbe_gaming_atr_init(adapter);
++	 * safely call ixgbe_gaming_fdir_clear_filters(). */
++	ixgbe_gaming_fdir_init(adapter);
  	err = ixgbe_sw_init(adapter, ii);
 -	if (err)
 -		goto err_sw_init;
@@ -5591,7 +5623,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  
  	if (ixgbe_check_fw_error(adapter)) {
  		err = ixgbe_recovery_probe(adapter);
-@@ -11664,12 +12073,9 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11664,12 +12122,9 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  
  	if (adapter->hw.mac.type == ixgbe_mac_e610) {
  		err = ixgbe_get_caps(&adapter->hw);
@@ -5606,7 +5638,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	}
  
  	if (adapter->hw.mac.type == ixgbe_mac_82599EB)
-@@ -11688,7 +12094,6 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11688,7 +12143,6 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  		break;
  	}
  
@@ -5614,7 +5646,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	switch (adapter->hw.mac.type) {
  	case ixgbe_mac_82599EB:
  	case ixgbe_mac_X540:
-@@ -11702,10 +12107,6 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11702,10 +12156,6 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  		break;
  	}
  
@@ -5625,7 +5657,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	if (adapter->flags & IXGBE_FLAG_FAN_FAIL_CAPABLE) {
  		u32 esdp = IXGBE_READ_REG(hw, IXGBE_ESDP);
  		if (esdp & IXGBE_ESDP_SDP1)
-@@ -11715,7 +12116,6 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11715,7 +12165,6 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  	if (allow_unsupported_sfp)
  		hw->allow_unsupported_sfp = allow_unsupported_sfp;
  
@@ -5633,7 +5665,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	hw->phy.reset_if_overtemp = true;
  	err = hw->mac.ops.reset_hw(hw);
  	hw->phy.reset_if_overtemp = false;
-@@ -11723,8 +12123,7 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11723,8 +12172,7 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  	if (err == -ENOENT) {
  		err = 0;
  	} else if (err == -EOPNOTSUPP) {
@@ -5643,7 +5675,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  		goto err_sw_init;
  	} else if (err) {
  		e_dev_err("HW Init failed: %d\n", err);
-@@ -11732,23 +12131,15 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11732,23 +12180,15 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  	}
  
  #ifdef CONFIG_PCI_IOV
@@ -5670,7 +5702,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  
  #define IXGBE_GSO_PARTIAL_FEATURES (NETIF_F_GSO_GRE | \
  				    NETIF_F_GSO_GRE_CSUM | \
-@@ -11758,21 +12149,16 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11758,21 +12198,16 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  				    NETIF_F_GSO_UDP_TUNNEL_CSUM)
  
  	netdev->gso_partial_features = IXGBE_GSO_PARTIAL_FEATURES;
@@ -5696,7 +5728,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	netdev->hw_features |= netdev->features |
  			       NETIF_F_HW_VLAN_CTAG_FILTER |
  			       NETIF_F_HW_VLAN_CTAG_RX |
-@@ -11781,84 +12167,54 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11781,84 +12216,54 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  			       NETIF_F_HW_L2FW_DOFFLOAD;
  
  	if (hw->mac.type >= ixgbe_mac_82599EB)
@@ -5794,7 +5826,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	ether_addr_copy(hw->mac.addr, hw->mac.perm_addr);
  	ixgbe_mac_set_default_filter(adapter);
  
-@@ -11873,40 +12229,23 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11873,40 +12278,23 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  	clear_bit(__IXGBE_SERVICE_SCHED, &adapter->state);
  
  	err = ixgbe_init_interrupt_scheme(adapter);
@@ -5843,7 +5875,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	switch (hw->mac.type) {
  	case ixgbe_mac_82598EB:
  		expected_gts = min(ixgbe_enumerate_functions(adapter) * 10, 16);
-@@ -11916,33 +12255,22 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11916,33 +12304,22 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  		break;
  	}
  
@@ -5881,7 +5913,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	}
  	strcpy(netdev->name, "eth%d");
  	pci_set_drvdata(pdev, adapter);
-@@ -11952,15 +12280,9 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11952,15 +12329,9 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  	SET_NETDEV_DEVLINK_PORT(adapter->netdev, &adapter->devlink_port);
  
  	err = register_netdev(netdev);
@@ -5899,7 +5931,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	netif_carrier_off(netdev);
  
  #ifdef CONFIG_IXGBE_DCA
-@@ -11975,35 +12297,26 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -11975,35 +12346,26 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  			ixgbe_vf_configuration(pdev, (i | 0x10000000));
  	}
  
@@ -5939,15 +5971,15 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  
  	ixgbe_devlink_init_regions(adapter);
  	devl_register(adapter->devlink);
-@@ -12025,6 +12338,7 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -12025,6 +12387,7 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  	if (hw->mac.type == ixgbe_mac_e610)
  		mutex_destroy(&adapter->hw.aci.lock);
  	ixgbe_disable_sriov(adapter);
-+	ixgbe_gaming_atr_clear_filters(adapter);
++	ixgbe_gaming_fdir_clear_filters(adapter);
  	adapter->flags2 &= ~IXGBE_FLAG2_SEARCH_FOR_SFP;
  	iounmap(adapter->io_addr);
  	kfree(adapter->jump_tables[0]);
-@@ -12040,8 +12354,7 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -12040,8 +12403,7 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
  err_devlink:
  err_pci_reg:
  err_dma:
@@ -5957,7 +5989,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  	return err;
  }
  
-@@ -12061,9 +12374,7 @@ static void ixgbe_remove(struct pci_dev *pdev)
+@@ -12061,9 +12423,7 @@ static void ixgbe_remove(struct pci_dev *pdev)
  	bool disable_dev;
  	int i;
  
@@ -5968,7 +6000,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  
  	netdev  = adapter->netdev;
  	devl_lock(adapter->devlink);
-@@ -12085,21 +12396,20 @@ static void ixgbe_remove(struct pci_dev *pdev)
+@@ -12085,21 +12445,20 @@ static void ixgbe_remove(struct pci_dev *pdev)
  	if (adapter->flags & IXGBE_FLAG_DCA_ENABLED) {
  		adapter->flags &= ~IXGBE_FLAG_DCA_ENABLED;
  		dca_remove_requester(&pdev->dev);
@@ -5989,12 +6021,12 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  #ifdef CONFIG_PCI_IOV
  	ixgbe_disable_sriov(adapter);
  #endif
-+	ixgbe_gaming_atr_clear_filters(adapter);
++	ixgbe_gaming_fdir_clear_filters(adapter);
 +
  	if (netdev->reg_state == NETREG_REGISTERED)
  		unregister_netdev(netdev);
  
-@@ -12108,13 +12418,11 @@ static void ixgbe_remove(struct pci_dev *pdev)
+@@ -12108,13 +12467,11 @@ static void ixgbe_remove(struct pci_dev *pdev)
  
  	ixgbe_stop_ipsec_offload(adapter);
  	ixgbe_clear_interrupt_scheme(adapter);
@@ -6008,7 +6040,7 @@ index 240f7cc3f213f07784e9032aa539e88b27e634f5..8966476e476c2e1bfd5350aee777069f
  #endif
  	iounmap(adapter->io_addr);
  	pci_release_mem_regions(pdev);
-@@ -12138,8 +12446,7 @@ static void ixgbe_remove(struct pci_dev *pdev)
+@@ -12138,8 +12495,7 @@ static void ixgbe_remove(struct pci_dev *pdev)
  	if (adapter->hw.mac.type == ixgbe_mac_e610)
  		mutex_destroy(&adapter->hw.aci.lock);
  
