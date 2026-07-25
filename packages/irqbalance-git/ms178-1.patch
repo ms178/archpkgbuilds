@@ -1,123 +1,130 @@
 From: ms178 irqbalance tuning
-Subject: [PATCH v2] irqbalance: correct adaptive interval, O(n) stats, de-UB fls()
+Subject: [PATCH v2] irqbalance: fix UB and uninitialised reads, remove two
+ O(n^2) hot paths, hardware popcount, working adaptive interval
 
-Replaces ms178.patch v1. Rationale for every change, with the evidence that
-motivated it, is in AUDIT.md. Summary:
+Supersedes ms178-1.patch v1. Every change below is backed by a measurement or
+a proof; see AUDIT-v2.md for the commands and the raw numbers.
 
-KEPT from v1 (these were genuinely good):
-  * get_irq_data()/get_object_stat() rewritten on GString. Upstream does
-    strlen() + realloc() once per IRQ while building the "stats" reply,
-    which is quadratic in the interrupt count. GString amortises it.
+============================ CORRECTNESS ============================
 
-FIXED (v1 features that did not work):
-  * Adaptive scan interval was DEAD CODE. v1 did:
-        int user_min = sleep_interval;
-        if (sleep_interval > adaptive) sleep_interval = adaptive;
-        if (sleep_interval < user_min) sleep_interval = user_min;
-    user_min is captured FROM sleep_interval, so the second clamp always
-    restores the original value. Verified over the full input domain: the
-    interval never changed, in any of 20 (start, max_diff) combinations.
-    Now implemented correctly, with -t / "settings sleep" as a real floor.
+1. sock_handle(): recvmsg() does not NUL-terminate, but every command is
+   parsed with g_str_has_prefix()/strlen(), i.e. as a C string. The 16 KiB
+   buffer is uninitialised stack, so the parser ran past the received data.
+   Demonstrated: a 5-byte "stats" message yields strlen(buff) == 70.
+   Fixed by terminating at recv_size (and rejecting recv_size >= sizeof).
 
-  * The 1024-entry diff cache was both unreachable and wrong.
-      - collect_diff() only increments idx while idx < 1024, so idx can
-        never exceed 1024 and the "if (idx <= 1024)" guard is always true;
-        the overflow/invalidate branch was dead.
-      - The validity test "last_cycle == cycle_count - 1" is true on every
-        cycle (cycle_count++ happens after the block), so the cache was
-        reused forever. Modelled: with a live max of 90000 the daemon
-        reported 100. It acted on stale interrupt load.
-    Removed entirely; replaced with a single allocation-free pass.
+2. sock_handle(): the three "settings ..." handlers compute
+       malloc(recv_size - strlen(prefix) + 1)
+       strncpy(dst, src, recv_size - strlen(prefix))
+   with no check that recv_size >= strlen(prefix). Because the prefix test
+   reads the buffer as a C string it can succeed while recv_size is shorter,
+   and the subtraction then wraps: for recv_size 13 vs prefix 14 the copy
+   length becomes 18446744073709551615. Guarded explicitly.
+   NOTE: I could not trigger this empirically (the stack usually happens to
+   contain a NUL), so it is fixed as defence in depth rather than a
+   demonstrated live exploit. Bug 1 above IS demonstrated.
 
-  * sleep_interval default was changed 10 -> 60 unconditionally. That is a
-    6x slower reaction to load changes and it is not what "-t" documents.
-    Restored to SLEEP_INTERVAL (10); 60 is now the ADAPTIVE CEILING, which
-    is where the intent actually belonged.
+3. bitmap.h fls(): shifted a signed int into the sign bit -- undefined
+   behaviour. UBSan on the running daemon reports
+     "left shift of 805306368 by 2 places cannot be represented in 'int'".
+   Reproduced on unpatched upstream, absent after the fix. Reimplemented on
+   __builtin_clz: proven identical over 1,376,188 inputs, and it lowers to a
+   single BSR instead of five dependent compare-and-shift steps.
 
-  * The "Raptor Lake L2 prefetch" in build_object_tree() emitted ZERO
-    prefetch instructions (verified: objdump of the built object contains
-    no prefetch opcode). It also prefetched the GList head pointer, not the
-    tree, and ran once at startup rather than in any hot path. Removed.
+4. procinterrupts.c: isblank()/isdigit() were passed a plain char. char is
+   signed on x86-64, so any byte >= 0x80 becomes negative and the ctype
+   lookup indexes out of bounds -- undefined behaviour. Four call sites cast
+   to unsigned char.
 
-NEW:
-  * fls() in bitmap.h shifted a signed int into the sign bit -- undefined
-    behaviour, reported by UBSan as
-      "left shift of 805306368 by 2 places cannot be represented in 'int'".
-    Now uses an unsigned temporary. Proven equivalent over 1.38M inputs.
+============================ PERFORMANCE ============================
 
-  * IRQBALANCE_NO_ADAPTIVE=1 pins the interval, for deterministic
-    interaction with an external IRQ-pinning tool.
+Measured with callgrind on a steady-state daemon (not a one-shot run: a
+one-shot is dominated by process startup and hides all of this).
 
-Validation: 0 ASan errors and 0 UBSan findings across 22 socket commands
-(including oversized and binary payloads); valgrind reports 0 definitely-lost
-bytes and 0 errors.
+5. get_irq_info() was a g_list_find_custom() linear walk over the whole
+   interrupt database, called once per line of /proc/interrupts on every
+   scan -- O(n^2) per cycle. Added a GHashTable index kept in exact sync
+   with both interrupts_db and banned_irqs, including the removal path
+   (leaving a stale entry would hand out a pointer to freed memory) and
+   free_irq_db().
+   Isolated benchmark, identical workload:
+       n=5    list 37,000 Ir   hash 63,000 Ir   (hash loses, tiny n)
+       n=40   list 1,416,000   hash 504,000     (2.8x faster)
+       n=128  list 13,542,400  hash 1,612,800   (8.4x)
+       n=256  list 53,299,200  hash 3,225,600   (16.5x)
+   The fallback linear search is retained, so behaviour is unchanged if the
+   index cannot be allocated.
+
+6. parse_proc_interrupts() called strdup()+free() for EVERY interrupt on
+   EVERY scan, but only the hotplug path (a cache miss on get_irq_info)
+   ever reads the copy. Moved into that branch. Note the copy must be taken
+   before the ':' is overwritten with a NUL, or strdup() truncates the line
+   -- my first attempt got this wrong and the test caught it.
+
+7. bitmap.h hweight*(): replaced the SWAR popcount with
+   __builtin_popcount*(). __bitmap_weight() is the hottest own-code function
+   in a steady-state profile (1.04% of all instructions, worst I1 miss rate
+   of any own-code function). llvm-mca -mcpu=raptorlake, 1000 iterations:
+   12015 -> 2005 cycles for the 64-bit case. Confirmed 6 POPCNT instructions
+   are emitted once the build passes an arch flag; the builtin degrades to an
+   equivalent sequence on targets without POPCNT, so it is never worse.
+   Measured in situ: __bitmap_weight -44% instructions per scan cycle.
+
+8. get_irq_data()/get_object_stat(): the UI "stats" reply was assembled with
+   strlen()+realloc() once per IRQ, which is quadratic in the interrupt
+   count. Rebuilt on GString. (This part was already right in v1 and is
+   carried over.)
+
+============================ BEHAVIOUR ============================
+
+9. Adaptive scan interval, implemented correctly this time. v1 shipped:
+       int user_min = sleep_interval;
+       if (sleep_interval > adaptive) sleep_interval = adaptive;
+       if (sleep_interval < user_min) sleep_interval = user_min;
+   user_min is captured FROM sleep_interval, so the second clamp always
+   restored the original: verified inert across all 20 tested
+   (start, max_diff) combinations. v1's 1024-entry cache was also dead code
+   (its overflow branch was unreachable) and served stale load on alternating
+   cycles.
+   Now: one allocation-free pass, no cache, interval 60 -> 5 -> 2 -> 1 s as
+   load rises, clamped to [-t floor, 60]. Observed effect on an idle machine:
+   ~12x fewer wakeups than a fixed 1 s interval.
+   -t and the UI "settings sleep" both raise the floor.
+   IRQBALANCE_NO_ADAPTIVE=1 pins the interval for deterministic interaction
+   with an external IRQ-pinning tool.
+
+10. v1 changed the default sleep_interval from 10 to 60 unconditionally.
+    Reverted; 60 is now the adaptive ceiling, which is where that intent
+    belonged.
+
+11. v1's "Raptor Lake L2 prefetch" in build_object_tree() emitted ZERO
+    prefetch instructions (verified with objdump on the built object), and
+    prefetched a GList head pointer rather than the tree, in a function that
+    runs once at startup. Dropped.
+
+============================ VALIDATION ============================
+
+  patch applies to pristine upstream 16844fb : clean, 0 fuzz
+  clang 19 build                             : 0 errors, 0 warnings
+  valgrind memcheck                          : 0 errors, 0 definitely-lost
+  ASan, 22 socket commands + 8 underflow     : 0 errors
+  UBSan, same                                : 0 findings (1 before the fix)
+  fls() equivalence                          : 1,376,188 inputs, 0 mismatches
+  hash index vs linear search                : identical DB, deterministic
 ---
-diff --git a/bitmap.h b/bitmap.h
-index 9eca1af..80c1d1c 100644
---- a/bitmap.h
-+++ b/bitmap.h
-@@ -42,28 +42,35 @@ static inline unsigned long hweight64(uint64_t w)
- 
- static inline int fls(int x)
- {
-+        /*
-+         * Operate on an unsigned copy: shifting a signed int into or past
-+         * the sign bit is undefined behaviour (caught by UBSan as
-+         * "left shift of N by 2 places cannot be represented in type 'int'").
-+         * The result is identical, the UB is not.
-+         */
-+        unsigned int u = (unsigned int)x;
-         int r = 32;
- 
--        if (!x)
-+        if (!u)
-                 return 0;
--        if (!(x & 0xffff0000u)) {
--                x <<= 16;
-+        if (!(u & 0xffff0000u)) {
-+                u <<= 16;
-                 r -= 16;
-         }
--        if (!(x & 0xff000000u)) {
--                x <<= 8;
-+        if (!(u & 0xff000000u)) {
-+                u <<= 8;
-                 r -= 8;
-         }
--        if (!(x & 0xf0000000u)) {
--                x <<= 4;
-+        if (!(u & 0xf0000000u)) {
-+                u <<= 4;
-                 r -= 4;
-         }
--        if (!(x & 0xc0000000u)) {
--                x <<= 2;
-+        if (!(u & 0xc0000000u)) {
-+                u <<= 2;
-                 r -= 2;
-         }
--        if (!(x & 0x80000000u)) {
--                x <<= 1;
-+        if (!(u & 0x80000000u)) {
-+                u <<= 1;
-                 r -= 1;
-         }
-         return r;
-diff --git a/irqbalance.c b/irqbalance.c
-index f80244c..546a7ff 100644
 --- a/irqbalance.c
 +++ b/irqbalance.c
-@@ -62,6 +62,9 @@ char *pidfile = NULL;
+@@ -62,6 +62,9 @@
  char *polscript = NULL;
  long HZ;
  int sleep_interval = SLEEP_INTERVAL;
-+/* Lower bound for the adaptive interval; never goes below the user's -t. */
++/* Floor for the adaptive interval: never faster than the user asked for. */
 +static int min_sleep_interval = SLEEP_INTERVAL;
 +static int adaptive_interval_enabled = 1;
  int last_interval;
  GMainLoop *main_loop;
  
-@@ -176,6 +179,7 @@ static void parse_command_line(int argc, char **argv)
+@@ -176,6 +179,7 @@
  				break;
  			case 't':
  				sleep_interval = strtol(optarg, &endptr, 10);
@@ -125,7 +132,7 @@ index f80244c..546a7ff 100644
  				if (optarg == endptr || sleep_interval < 1) {
  					usage();
  					exit(1);
-@@ -270,6 +274,54 @@ gboolean force_rescan(gpointer data __attribute__((unused)))
+@@ -270,6 +274,54 @@
  	return TRUE;
  }
  
@@ -133,13 +140,13 @@ index f80244c..546a7ff 100644
 +/*
 + * Adaptive scan interval.
 + *
-+ * Track the largest per-IRQ delta observed this cycle and shorten the scan
-+ * interval when the system is interrupt-busy, lengthen it when idle. This is
-+ * a single pass with no allocation and no cache: caching the deltas made the
-+ * daemon act on stale data on alternating cycles.
++ * Shorten the interval when interrupts are churning, lengthen it when the
++ * machine is quiet. Single allocation-free pass; deliberately NOT cached --
++ * the whole purpose is to react to CHANGING load, and a cache of the previous
++ * cycle's deltas makes the daemon act on stale data.
 + *
-+ * The result is always clamped to [min_sleep_interval, SLEEP_ADAPT_MAX] so an
-+ * explicit -t / socket setting is respected as a floor.
++ * Always clamped to [min_sleep_interval, SLEEP_ADAPT_MAX] so an explicit -t
++ * or a "settings sleep" from the UI socket is respected as a floor.
 + */
 +#define SLEEP_ADAPT_MAX 60
 +
@@ -148,7 +155,7 @@ index f80244c..546a7ff 100644
 +	uint64_t *max_diff = (uint64_t *)data;
 +	uint64_t diff;
 +
-+	/* Counters are monotonic, but a rebuild can reset them; clamp. */
++	/* Counters are monotonic, but a rebuild resets them; ignore wraps. */
 +	if (info->irq_count < info->last_irq_count)
 +		return;
 +
@@ -180,7 +187,7 @@ index f80244c..546a7ff 100644
  gboolean scan(gpointer data __attribute__((unused)))
  {
  	log(TO_CONSOLE, LOG_INFO, "\n\n\n-----------------------------------------------------------------------------\n");
-@@ -312,6 +364,13 @@ gboolean scan(gpointer data __attribute__((unused)))
+@@ -312,6 +364,13 @@
  	calculate_placement();
  	activate_mappings();
  
@@ -194,7 +201,7 @@ index f80244c..546a7ff 100644
  out:
  	if (debug_mode)
  		dump_tree();
-@@ -336,65 +395,58 @@ out:
+@@ -336,65 +395,64 @@
  
  void get_irq_data(struct irq_info *irq, void *data)
  {
@@ -228,20 +235,17 @@ index f80244c..546a7ff 100644
 -	char *irq_data = NULL;
 -	char *newptr = NULL;
 -	size_t irqdlen;
+-
+-	if (g_list_length(object->interrupts) > 0) {
+-		for_each_irq(object->interrupts, get_irq_data, &irq_data);
+-	}
 +	char **stats = (char **)data;
 +	GString *irq_str;
 +	GString *obj_str;
 +	char *merged;
  
--	if (g_list_length(object->interrupts) > 0) {
--		for_each_irq(object->interrupts, get_irq_data, &irq_data);
--	}
-+	irq_str = g_string_new(NULL);
-+	if (!irq_str)
-+		return;
- 
 -	irqdlen = irq_data ? strlen(irq_data) : 0;
--	/*
+ 	/*
 -	 * Note, the size in both conditional branches below is made up as follows:
 -	 * strlen(irq_data) - self explanitory
 -	 * 31 - The size of "TYPE  NUMBER  LOAD  SAVE_MODE  "
@@ -249,17 +253,25 @@ index f80244c..546a7ff 100644
 -	 * 20 - The maximal size of a %lu printout
 -	 * 1 - The trailing string terminator
 -	 * This should be adjusted if the string in the sprintf is changed
--	 */
++	 * Upstream built this reply with strlen() + realloc() once per IRQ,
++	 * which is quadratic in the interrupt count. GString amortises the
++	 * growth and removes the repeated strlen() walk of the accumulated
++	 * buffer.
+ 	 */
 -	if (!*stats) {
 -		newptr = calloc(irqdlen + 31 + 11 + 20 + 11 + 1, 1);
 -	} else {
 -		newptr = realloc(*stats, strlen(*stats) + irqdlen + 31 + 11 + 20 + 11 + 1);
 -	}
-+	if (g_list_length(object->interrupts) > 0)
-+		for_each_irq(object->interrupts, get_irq_data, &irq_str);
++	irq_str = g_string_new(NULL);
++	if (!irq_str)
++		return;
  
 -	if (!newptr) {
 -		free(irq_data);
++	if (g_list_length(object->interrupts) > 0)
++		for_each_irq(object->interrupts, get_irq_data, &irq_str);
++
 +	obj_str = g_string_new(NULL);
 +	if (!obj_str) {
 +		g_string_free(irq_str, TRUE);
@@ -271,13 +283,7 @@ index f80244c..546a7ff 100644
 +		"TYPE %d NUMBER %d LOAD %" PRIu64 " SAVE_MODE %d %s",
 +		object->obj_type, object->number, object->load,
 +		object->powersave_mode, irq_str->str);
- 
--	sprintf(*stats + strlen(*stats), "TYPE %d NUMBER %d LOAD %" PRIu64 " SAVE_MODE %d %s",
--			object->obj_type, object->number, object->load,
--			object->powersave_mode, irq_data ? irq_data : "");
--	free(irq_data);
--	if (object->obj_type != OBJ_TYPE_CPU) {
--		for_each_object(object->children, get_object_stat, data);
++
 +	if (*stats && **stats) {
 +		merged = g_strconcat(*stats, obj_str->str, NULL);
 +		if (merged) {
@@ -287,17 +293,55 @@ index f80244c..546a7ff 100644
 +	} else {
 +		free(*stats);
 +		*stats = g_strdup(obj_str->str);
- 	}
++	}
 +
 +	g_string_free(irq_str, TRUE);
 +	g_string_free(obj_str, TRUE);
-+
+ 
+-	sprintf(*stats + strlen(*stats), "TYPE %d NUMBER %d LOAD %" PRIu64 " SAVE_MODE %d %s",
+-			object->obj_type, object->number, object->load,
+-			object->powersave_mode, irq_data ? irq_data : "");
+-	free(irq_data);
+-	if (object->obj_type != OBJ_TYPE_CPU) {
 +	if (object->obj_type != OBJ_TYPE_CPU)
-+		for_each_object(object->children, get_object_stat, data);
+ 		for_each_object(object->children, get_object_stat, data);
+-	}
  }
  
  #ifdef HAVE_IRQBALANCEUI
-@@ -466,6 +518,7 @@ gboolean sock_handle(gint fd, GIOCondition condition, gpointer user_data __attri
+@@ -426,10 +484,17 @@
+ 			log(TO_ALL, LOG_WARNING, "Error while receiving data.\n");
+ 			goto out_close;
+ 		}
+-		if (recv_size == sizeof(buff)) {
++		if (recv_size >= (int)sizeof(buff)) {
+ 			log(TO_ALL, LOG_WARNING, "Received command too long.\n");
+ 			goto out_close;
+ 		}
++		/*
++		 * recvmsg() does not NUL-terminate. Every command below is
++		 * parsed with g_str_has_prefix()/strlen(), i.e. as a C string,
++		 * so without this the parser runs off the end of the received
++		 * data and into uninitialised stack.
++		 */
++		buff[recv_size] = '\0';
+ 		cmsg = CMSG_FIRSTHDR(&msg);
+ 		if (!cmsg) {
+ 			log(TO_ALL, LOG_WARNING, "Connection no memory.\n");
+@@ -455,6 +520,12 @@
+ 		}
+ 		if (g_str_has_prefix(buff, "settings ")) {
+ 			if (g_str_has_prefix(buff + strlen("settings "), "sleep ")) {
++				/* recv_size may be shorter than the prefix: the prefix
++				 * test above works on the NUL-terminated buffer, so a
++				 * short read would underflow every length below. */
++				if (recv_size < (int)strlen("settings sleep "))
++					goto out_close;
++
+ 				char *sleep_string = malloc(
+ 						sizeof(char) * (recv_size - strlen("settings sleep ") + 1));
+ 
+@@ -466,9 +537,16 @@
  				int new_iterval = strtoul(sleep_string, NULL, 10);
  				if (new_iterval >= 1) {
  					sleep_interval = new_iterval;
@@ -305,7 +349,29 @@ index f80244c..546a7ff 100644
  				}
  				free(sleep_string);
  			} else if (g_str_has_prefix(buff + strlen("settings "), "ban irqs ")) {
-@@ -520,8 +573,18 @@ gboolean sock_handle(gint fd, GIOCondition condition, gpointer user_data __attri
++				/* recv_size may be shorter than the prefix: the prefix
++				 * test above works on the NUL-terminated buffer, so a
++				 * short read would underflow every length below. */
++				if (recv_size < (int)strlen("settings ban irqs "))
++					goto out_close;
++
+ 				char *end;
+ 				char *irq_string = malloc(
+ 						sizeof(char) * (recv_size - strlen("settings ban irqs ") + 1));
+@@ -491,6 +569,12 @@
+ 				} while((irq = strtoul(end, &end, 10)));
+ 				free(irq_string);
+ 			} else if (g_str_has_prefix(buff + strlen("settings "), "cpus ")) {
++				/* recv_size may be shorter than the prefix: the prefix
++				 * test above works on the NUL-terminated buffer, so a
++				 * short read would underflow every length below. */
++				if (recv_size < (int)strlen("settings cpus "))
++					goto out_close;
++
+ 				banned_cpumask_from_ui = NULL;
+ 				free(cpu_ban_string);
+ 				cpu_ban_string = NULL;
+@@ -520,8 +604,18 @@
  			if (!setup)
  				goto out_close;
  			snprintf(setup, strlen("SLEEP  ") + 11 + 1, "SLEEP %d ", sleep_interval);
@@ -326,7 +392,7 @@ index f80244c..546a7ff 100644
  			}
  			cpumask_scnprintf(banned, 512, banned_cpus);
  			newptr = realloc(setup, strlen(setup) + strlen(banned) + 7 + 1);
-@@ -616,6 +679,9 @@ int main(int argc, char** argv)
+@@ -616,6 +710,9 @@
   	 */
  	openlog(argv[0], 0, LOG_DAEMON);
  
@@ -336,3 +402,262 @@ index f80244c..546a7ff 100644
  	if (getenv("IRQBALANCE_ONESHOT")) 
  		one_shot_mode=1;
  
+--- a/procinterrupts.c
++++ b/procinterrupts.c
+@@ -235,10 +235,10 @@
+ 
+ 		/* lines with letters in front are special, like NMI count. Ignore */
+ 		c = line;
+-		while (isblank(*(c)))
++		while (isblank((unsigned char)*c))
+ 			c++;
+ 
+-		if (!isdigit(*c))
++		if (!isdigit((unsigned char)*c))
+ 			break;
+ 		c = strchr(line, ':');
+ 		if (!c)
+@@ -297,34 +297,47 @@
+ 
+ 		/* lines with letters in front are special, like NMI count. Ignore */
+ 		c = line;
+-		while (isblank(*(c)))
++		while (isblank((unsigned char)*c))
+ 			c++;
+ 			
+-		if (!isdigit(*c))
++		if (!isdigit((unsigned char)*c))
+ 			break;
+ 		c = strchr(line, ':');
+ 		if (!c)
+ 			continue;
+ 
+-		savedline = strdup(line);
+-		if (!savedline)
+-			break;
+-		*c = 0;
+-		c++;
+ 		number = strtoul(line, NULL, 10);
+ 
+ 		info = get_irq_info(number);
+ 		if (!info) {
++			/*
++			 * Only the hotplug path needs a copy of the line.
++			 * Duplicating it for every IRQ on every scan cost one
++			 * malloc+free per interrupt per cycle for data that is
++			 * discarded unread in the common case.
++			 *
++			 * The copy must be taken BEFORE the ':' is replaced by a
++			 * NUL, otherwise strdup() stops at the colon and
++			 * proc_irq_hotplug() receives a truncated line.
++			 */
++			savedline = strdup(line);
++			if (!savedline)
++				break;
++			*c = 0;
++			c++;
+ 			ret = proc_irq_hotplug(savedline, number, &info);
++			free(savedline);
++			savedline = NULL;
+ 			if (ret < 0) {
+ 				/* hotplug fail, need to rescan */
+ 				need_rescan = 1;
+-				free(savedline);
+ 				break;
+ 			}
++		} else {
++			*c = 0;
++			c++;
+ 		}
+ 		info->existing = 1;
+-		free(savedline);
+ 
+ 		count = 0;
+ 		cpunr = 0;
+--- a/classify.c
++++ b/classify.c
+@@ -37,6 +37,35 @@
+ 
+ static GList *interrupts_db = NULL;
+ static GList *banned_irqs = NULL;
++/*
++ * O(1) lookup index over interrupts_db + banned_irqs.
++ *
++ * get_irq_info() is called once per line of /proc/interrupts on every scan,
++ * and each call was a g_list_find_custom() linear walk of the whole database
++ * -- O(n^2) per scan in the number of interrupts. Measured on a steady-state
++ * profile it accounted for 0.80% of all indirect branches, and the cost grows
++ * quadratically: ~800 node visits at 40 IRQs, ~32,768 at 256.
++ *
++ * The hash mirrors the lists exactly; every insertion and removal below keeps
++ * the two in step, and free_irq_db() tears both down together.
++ */
++static GHashTable *irq_index = NULL;
++
++static void irq_index_insert(struct irq_info *info)
++{
++	if (!info)
++		return;
++	if (!irq_index)
++		irq_index = g_hash_table_new(g_direct_hash, g_direct_equal);
++	if (irq_index)
++		g_hash_table_insert(irq_index, GINT_TO_POINTER(info->irq), info);
++}
++
++static void irq_index_remove(int irq)
++{
++	if (irq_index)
++		g_hash_table_remove(irq_index, GINT_TO_POINTER(irq));
++}
+ GList *cl_banned_irqs = NULL;
+ static GList *cl_banned_modules = NULL;
+ 
+@@ -280,6 +309,8 @@
+ 	new->flags |= IRQ_FLAG_BANNED;
+ 
+ 	*list = g_list_append(*list, new);
++	if (list == &banned_irqs)
++		irq_index_insert(new);
+ 	log(TO_CONSOLE, LOG_INFO, "IRQ %d was BANNED.\n", irq);
+ }
+ 
+@@ -341,6 +372,7 @@
+ 	new->class = hint->class;
+ 
+ 	interrupts_db = g_list_append(interrupts_db, new);
++	irq_index_insert(new);
+ 
+  	/* Some special irqs have NULL devpath */
+ 	if (devpath != NULL) {
+@@ -691,6 +723,11 @@
+ 
+ void free_irq_db(void)
+ {
++	/* Index first: it points at the irq_info objects freed below. */
++	if (irq_index) {
++		g_hash_table_destroy(irq_index);
++		irq_index = NULL;
++	}
+ 	for_each_irq(NULL, free_irq, NULL);
+ 	g_list_free(interrupts_db);
+ 	interrupts_db = NULL;
+@@ -800,6 +837,14 @@
+ 	GList *entry;
+ 	struct irq_info find;
+ 
++	/* Fast path: O(1) index kept in sync with both lists. */
++	if (irq_index) {
++		gpointer v = g_hash_table_lookup(irq_index,
++						 GINT_TO_POINTER(irq));
++		if (v)
++			return (struct irq_info *)v;
++	}
++
+ 	find.irq = irq;
+ 	entry = g_list_find_custom(interrupts_db, &find, compare_ints);
+ 
+@@ -863,6 +908,12 @@
+ 		return;
+ 	}
+ 
++	/*
++	 * Drop the index entry first: leaving it behind would make
++	 * get_irq_info() hand out a pointer to a freed irq_info.
++	 */
++	irq_index_remove(info->irq);
++
+ 	entry = g_list_find_custom(interrupts_db, info, compare_ints);
+ 	if (entry) {
+ 		interrupts_db = g_list_delete_link(interrupts_db, entry);
+--- a/bitmap.h
++++ b/bitmap.h
+@@ -19,54 +19,52 @@
+ 
+ #include "non-atomic.h"
+ 
++/*
++ * Population count.
++ *
++ * __bitmap_weight() is the hottest function in this daemon's own code
++ * (measured: 1.04% of all instructions in a steady-state profile, with the
++ * worst I1 miss rate of any own-code function). The SWAR fallback below costs
++ * ~12 dependent operations per word; x86-64 has had a single-cycle POPCNT
++ * instruction since Nehalem.
++ *
++ * __builtin_popcount*() lowers to POPCNT when the target supports it and to
++ * an equivalent (or better) sequence otherwise, so this is strictly not worse
++ * on any target. Measured with llvm-mca -mcpu=raptorlake over 1000
++ * iterations: 12015 cycles -> 2005 cycles for the 64-bit case.
++ */
+ static inline unsigned int hweight32(unsigned int w)
+ {
+-        unsigned int res = w - ((w >> 1) & 0x55555555);
+-        res = (res & 0x33333333) + ((res >> 2) & 0x33333333);
+-        res = (res + (res >> 4)) & 0x0F0F0F0F;
+-        res = res + (res >> 8);
+-        return (res + (res >> 16)) & 0x000000FF;
++        return (unsigned int)__builtin_popcount(w);
+ }
+ 
+-static inline unsigned long hweight64(uint64_t w)
++static inline unsigned int hweight16(unsigned int w)
+ {
+-	if (BITS_PER_LONG == 32) 
+-	        return hweight32((unsigned int)(w >> 32)) + hweight32((unsigned int)w);
++        return (unsigned int)__builtin_popcount(w & 0xffffu);
++}
+ 
+-        w -= (w >> 1) & 0x5555555555555555ull;
+-        w =  (w & 0x3333333333333333ull) + ((w >> 2) & 0x3333333333333333ull);
+-        w =  (w + (w >> 4)) & 0x0f0f0f0f0f0f0f0full;
+-        return (w * 0x0101010101010101ull) >> 56;
++static inline unsigned int hweight8(unsigned int w)
++{
++        return (unsigned int)__builtin_popcount(w & 0xffu);
+ }
+ 
++static inline unsigned long hweight64(uint64_t w)
++{
++        return (unsigned long)__builtin_popcountll(w);
++}
+ 
++/*
++ * Find last (most-significant) set bit, 1-based; 0 when x == 0.
++ *
++ * Upstream shifted a signed int into the sign bit, which is undefined
++ * behaviour -- UBSan on a live daemon reports
++ *   "left shift of 805306368 by 2 places cannot be represented in type 'int'".
++ * Using the compiler builtin both removes the UB and lowers to a single BSR/
++ * LZCNT instead of five dependent compare-and-shift steps.
++ */
+ static inline int fls(int x)
+ {
+-        int r = 32;
+-
+-        if (!x)
+-                return 0;
+-        if (!(x & 0xffff0000u)) {
+-                x <<= 16;
+-                r -= 16;
+-        }
+-        if (!(x & 0xff000000u)) {
+-                x <<= 8;
+-                r -= 8;
+-        }
+-        if (!(x & 0xf0000000u)) {
+-                x <<= 4;
+-                r -= 4;
+-        }
+-        if (!(x & 0xc0000000u)) {
+-                x <<= 2;
+-                r -= 2;
+-        }
+-        if (!(x & 0x80000000u)) {
+-                x <<= 1;
+-                r -= 1;
+-        }
+-        return r;
++        return x ? (32 - __builtin_clz((unsigned int)x)) : 0;
+ }
+ 
+ static inline unsigned long hweight_long(unsigned long w)

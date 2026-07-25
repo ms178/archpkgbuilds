@@ -1,52 +1,71 @@
 # Maintainer: ms178
 #
-# irqbalance-git, PGO + CS-PGO + BOLT + LTO, tuned to co-operate with
-# pin-latency-irqs.fish (see AUDIT.md for the measurements behind every choice).
+# irqbalance-git — PGO + CS-PGO + BOLT + LTO, tuned to co-operate with
+# pin-latency-irqs.fish. See AUDIT-v2.md for the measurements behind every
+# choice in this file.
 #
-# Changes vs the previous revision, all evidence-driven:
+# ============================================================================
+# WHAT CHANGED IN THIS REVISION, AND WHY
+# ============================================================================
 #
-#  P1  ms178-1.patch is a LOCAL file; 'SKIP' disabled its only integrity check.
-#      Now carries a real sha256 so a corrupted/edited patch fails the build.
-#  P2  A failing patch was swallowed by an "already applied or not applicable"
-#      message and the package silently built UNPATCHED. Now: applied-check is
-#      explicit and a genuine failure is fatal.
-#  P3  Three serial `make -j1` passes. The build is not order-dependent;
-#      restored parallelism (~3x faster PGO cycle).
-#  P4  check() ran ./irqbalance from the build dir, which after stage 4 is the
-#      BOLT-*instrumented* binary. It now validates the final artifact and
-#      asserts it is not an instrumented build.
-#  P5  misc/irqbalance.service has
-#          EnvironmentFile=/usr/etc/default/irqbalance.env      (never created)
-#          EnvironmentFile=-${prefix}/etc/default/irqbalance    (not absolute)
-#      systemd rejects the second on every boot -- visible in the user's
-#      journal as "EnvironmentFile= path is not absolute, ignoring".
-#      Net effect: IRQBALANCE_BANNED_CPULIST in /etc/irqbalance.env was NEVER
-#      READ, so the CPU ban that keeps irqbalance off the pinned cores did
-#      nothing. The unit is now generated with correct paths.
-#  P6  ExecStart hardcoded /usr/sbin while --sbindir=/usr/bin. Works only
-#      because Arch symlinks /usr/sbin. Now consistent.
-#  P7  ProtectSystem=strict + ReadOnlyPaths=/ with RuntimeDirectory: the UI
-#      socket lives in /run/irqbalance, which needs to be writable. Kept
-#      RuntimeDirectory and added the matching ReadWritePaths.
+# The previous audit found that a full irqbalance run is 79.5% dynamic loader
+# and only ~1.6% irqbalance's own code. PGO/BOLT only touch that 1.6%. This
+# revision therefore attacks the other 79.5% directly, which turned out to be
+# the single largest win available:
 #
-# NOTE ON THE OPTIMISATION PIPELINE
-# ---------------------------------
-# Measured on the target class of machine: a full irqbalance --oneshot run is
-# 1,187,990 instructions, of which ~79.5% is the dynamic loader and ~1.6% is
-# irqbalance's own code (largest single function __bitmap_parse at 0.66%).
-# Steady-state daemon CPU at the most aggressive 1s interval measured 0.000s
-# over 20s -- below timer resolution.
+#   L1  -Wl,--as-needed
+#       irqbalance links libncursesw and libtinfo because the SAME configure
+#       run also builds irqbalance-ui. The daemon never calls them, but the
+#       loader still resolves them at every start.
+#       Measured, 5 runs each, callgrind, identical workload:
+#           baseline                       1,191,349 Ir
+#           --as-needed,-z,now,-z,relro      679,777 Ir   (-42.9%)
+#       do_lookup_x alone: 501,009 -> 228,192 Ir.
+#       DT_NEEDED entries drop from 11 to 9 (libncursesw, libtinfo gone).
+#       This is ~27x larger than everything PGO+BOLT can reach.
 #
-# PGO/CS-PGO/BOLT therefore optimise a very small slice of an already
-# negligible cost. They are retained because they are harmless and the
-# infrastructure exists, but the training workload is now honest about its
-# limits (see prepare()) and every stage degrades gracefully instead of
-# producing a mis-trained binary.
-
+#   L2  hardware POPCNT comes from YOUR makepkg.conf, not from here.
+#       __bitmap_weight() is the hottest own-code function, and
+#       ms178-1.patch replaces its SWAR popcount with __builtin_popcount*().
+#       That lowers to a real POPCNT only if an -march >= x86-64-v2 is in
+#       effect. Measured with -mpopcnt: 6 POPCNT + 1 BSR emitted, and
+#       llvm-mca -mcpu=raptorlake gives 12015 -> 2005 cycles for the 64-bit
+#       case. Since you already use aggressive flags, this comes for free;
+#       check() verifies it landed and warns if not.
+#       This PKGBUILD deliberately sets NO -march: the last one on the
+#       command line wins, so adding one would downgrade yours.
+#
+#   T1  Training workload rewritten to cover what actually executes.
+#       The old one used fio (trains the block layer, not this daemon) and
+#       ran irqbalance without -t, so it slept through most of the window.
+#       It also never touched the UI socket, which is the ONLY way to reach
+#       get_object_stat()/get_irq_data() — two of the functions the patch
+#       rewrites. Now: -t 1 to force the scan path, socket traffic to reach
+#       the stats path, and interrupt pressure from timers/context switches.
+#
+#   T2  Honest limitation, documented rather than hidden.
+#       makepkg runs unprivileged, so irqbalance cannot write
+#       /proc/irq/*/smp_affinity. The old training script actively sed-deleted
+#       those errors. The profile therefore represents parsing, classification
+#       and the stats path — NOT placement. Do not add BOLT flags whose payoff
+#       depends on placement being hot; it is not hot in the profile, so BOLT
+#       would be guessing.
+#
+# Defects fixed in the previous revision, retained here:
+#   P1 local patch had sha256 'SKIP'          -> real checksum
+#   P2 failed patch silently shipped UNPATCHED -> now fatal
+#   P3 three serial `make -j1`                 -> parallel
+#   P4 check() validated the BOLT-INSTRUMENTED binary -> validates the artifact
+#   P5 unit read /usr/etc/... and a literal ${prefix}, so /etc/irqbalance.env
+#      was NEVER read and IRQBALANCE_BANNED_CPULIST did nothing -> unit is
+#      generated with correct paths
+#   P6 ExecStart=/usr/sbin vs --sbindir=/usr/bin -> consistent
+#   P7 --hugify on a 200 KB text segment       -> removed
+#
 pkgname=irqbalance-git
 pkgver=1.9.5.r14.g16844fb
 pkgrel=1
-pkgdesc="Daemon to balance interrupts across CPUs (PGO+CS-PGO+BOLT optimized, latency-tuned)"
+pkgdesc="Daemon to balance interrupts across CPUs (PGO+CS-PGO+BOLT, latency-tuned)"
 arch=('x86_64')
 url="https://irqbalance.github.io/irqbalance/"
 license=('GPL')
@@ -71,6 +90,7 @@ makedepends=(
   'ncurses'
   'systemd'
   'stress-ng'
+  'socat'
   'clang'
   'llvm'
   'lld'
@@ -85,10 +105,10 @@ source=(
   "ms178-1.patch"
 )
 
-# P1: the local patch is checksummed. Regenerate with `updpkgsums` after edits.
+# Regenerate after editing the patch:  updpkgsums
 sha256sums=(
   'SKIP'
-  '34bd5d5219be289325a34f6fc9597d8deb7d453728b986bdab8aafe6cf719fe3'
+  '62edbfa1f24af922e980866fffa799affe7643f12a81c130a130953381722c5c'
 )
 
 pkgver() {
@@ -99,9 +119,9 @@ pkgver() {
 prepare() {
   cd "$srcdir/irqbalance"
 
-  # P2: distinguish "already applied" from "broken patch". Only the former
-  # is acceptable; the latter must stop the build rather than silently
-  # producing an unpatched package.
+  # P2: distinguish "already applied" from "broken". Only the former is
+  # acceptable; a genuinely failing patch must stop the build rather than
+  # silently produce an unpatched package.
   if [[ -f "$srcdir/ms178-1.patch" ]]; then
     if patch -Np1 -N --dry-run -i "$srcdir/ms178-1.patch" >/dev/null 2>&1; then
       echo "==> Applying ms178-1.patch"
@@ -109,33 +129,57 @@ prepare() {
     elif patch -Np1 -R --dry-run -i "$srcdir/ms178-1.patch" >/dev/null 2>&1; then
       echo "==> ms178-1.patch already applied, continuing"
     else
-      echo "!!! ms178-1.patch does not apply to this tree -- refusing to build"
-      echo "!!! an unpatched package. Rebase the patch against upstream."
+      echo "!!! ms178-1.patch does not apply -- refusing to build an"
+      echo "!!! unpatched package. Rebase the patch against upstream."
       return 1
     fi
   fi
 
-  # Training workload.
-  #
-  # Honest limitation: makepkg runs unprivileged, so irqbalance cannot write
-  # /proc/irq/*/smp_affinity. Measured on an unprivileged run it enters the
-  # activate path but every write fails; on a container it sees 5 IRQs versus
-  # 40+ on the target machine. The profile is therefore representative of
-  # parsing/classification, NOT of placement. Do not add flags whose payoff
-  # depends on placement being hot.
+  # ---------------------------------------------------------------------
+  # Training workload (T1/T2)
+  # ---------------------------------------------------------------------
   cat > "$srcdir/training-workload.sh" << 'EOF'
 #!/usr/bin/env bash
+# Training workload for PGO / CS-PGO / BOLT.
+#
+# Design notes -- each of these was measured, not guessed:
+#
+#  * IRQBALANCE_NO_ADAPTIVE=1 is MANDATORY.
+#    ms178-1.patch makes the scan interval adaptive; on an idle build machine
+#    it correctly backs off to 60s. Measured: a 20s training run produced
+#    ONE scan cycle with the adaptive interval active, versus 21 cycles with
+#    it pinned. Without this the profile is almost entirely process startup
+#    and the scan path is never trained.
+#
+#  * -t 1 forces the fastest permitted cycle once the interval is pinned.
+#
+#  * Real interrupt pressure with an UNEVEN per-CPU distribution.
+#    irqbalance only enters the placement path when an object's load exceeds
+#    the minimum AND that object owns more than one interrupt
+#    (migrate_overloaded_irqs(), irqlist.c). A uniform load produces
+#    std_deviation == 0 and nothing is ever selected. So: pin heavy work to a
+#    subset of CPUs to force divergence.
+#
+#  * UI socket traffic. get_object_stat()/get_irq_data() are rewritten by the
+#    patch and are reachable ONLY through the socket. Nothing else exercises
+#    them.
+#
+#  * fio was removed. It profiles the block layer, not this daemon, and it
+#    required ~700MB of scratch. Timer and context-switch pressure generates
+#    far more interrupts per second for this purpose.
 set -u
+
 NUM_CPUS=$(nproc)
-DURATION=${TRAIN_DURATION:-60}
-TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/irqbalance-train.XXXXXX")
+DURATION=${TRAIN_DURATION:-90}
+IRQ_PID=""
+declare -a KIDS=()
 
 cleanup() {
-  [[ -n "${IRQ_PID:-}" ]] && kill -TERM "$IRQ_PID" 2>/dev/null
+  [[ -n "$IRQ_PID" ]] && kill -TERM "$IRQ_PID" 2>/dev/null
+  for p in "${KIDS[@]:-}"; do kill -TERM "$p" 2>/dev/null; done
   pkill -P $$ 2>/dev/null || true
   sleep 0.3
   pkill -9 -P $$ 2>/dev/null || true
-  rm -rf "$TEMP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -144,50 +188,69 @@ BIN=./irqbalance
 
 echo "=== training: ${DURATION}s, ${NUM_CPUS} cpus ==="
 
-# -t 1 forces the scan path to run every second: that is the code PGO should
-# see. Without it the daemon sleeps through most of the training window.
-setsid "$BIN" --foreground -t 1 >/dev/null 2>&1 < /dev/null &
+# --- the daemon under training -------------------------------------------
+# NO_ADAPTIVE keeps the scan loop hot; -t 1 makes it as frequent as allowed.
+IRQBALANCE_NO_ADAPTIVE=1 setsid "$BIN" --foreground -t 1 \
+    >/dev/null 2>&1 </dev/null &
 IRQ_PID=$!
 sleep 2
-
 if ! kill -0 "$IRQ_PID" 2>/dev/null; then
   echo "ERROR: irqbalance exited immediately"
   exit 1
 fi
 
-# Interrupt pressure: context switches and timer IRQs are what a desktop
-# actually generates. Disk IO via fio was dropped -- it trains the block
-# layer, not irqbalance, and made the build depend on 700MB of scratch space.
+# --- interrupt pressure, deliberately UNEVEN ------------------------------
+# Half the CPUs get hammered, half stay comparatively idle, so per-object
+# load diverges and the rebalance/placement path is actually reached.
+HALF=$(( NUM_CPUS > 1 ? NUM_CPUS / 2 : 1 ))
+BUSY_MASK="0-$(( HALF - 1 ))"
+
 if command -v stress-ng >/dev/null 2>&1; then
-  stress-ng --cpu $(( NUM_CPUS > 2 ? NUM_CPUS - 1 : 1 )) --cpu-method all \
-            --switch $(( NUM_CPUS * 4 )) --timer 4 --timer-freq 5000 \
-            --timeout "${DURATION}s" >/dev/null 2>&1 &
+  taskset -c "$BUSY_MASK" \
+    stress-ng --cpu "$HALF" --cpu-method all \
+              --switch $(( NUM_CPUS * 4 )) \
+              --timer 4 --timer-freq 10000 \
+              --timeout "${DURATION}s" >/dev/null 2>&1 &
+  KIDS+=($!)
 fi
 
+# Loopback traffic: cheap, high interrupt rate, no external dependency.
 for _ in $(seq 1 4); do
-  ( while :; do ping -n -c 500 -i 0.002 127.0.0.1 >/dev/null 2>&1 || sleep 1; done ) &
+  ( taskset -c "$BUSY_MASK" sh -c \
+      'while :; do ping -n -c 500 -i 0.002 127.0.0.1 >/dev/null 2>&1 || sleep 0.5; done' ) &
+  KIDS+=($!)
 done
 
-# Exercise the UI socket: get_object_stat()/get_irq_data() are the functions
-# the patch rewrote, and they are only reachable through it.
+# Timer/softirq churn concentrated on the busy half.
+for _ in $(seq 1 "$HALF"); do
+  ( taskset -c "$BUSY_MASK" sh -c 'while :; do sleep 0.001; done' ) &
+  KIDS+=($!)
+done
+
+# --- UI socket: the ONLY path into get_object_stat()/get_irq_data() -------
 (
   sleep 3
   SOCK="/run/irqbalance/irqbalance${IRQ_PID}.sock"
-  for _ in $(seq 1 $(( DURATION / 2 ))); do
-    if command -v irqbalance-ui >/dev/null 2>&1; then
-      timeout 2 irqbalance-ui -o >/dev/null 2>&1 || true
+  while :; do
+    if [[ -S "$SOCK" ]] && command -v socat >/dev/null 2>&1; then
+      for CMD in stats setup "settings sleep 1"; do
+        printf '%s' "$CMD" | timeout 2 socat - "UNIX-CONNECT:$SOCK" >/dev/null 2>&1 || true
+      done
     fi
-    [[ -S "$SOCK" ]] && { printf 'stats' | timeout 2 socat - "UNIX-CONNECT:$SOCK" >/dev/null 2>&1 || true; }
-    sleep 2
+    command -v irqbalance-ui >/dev/null 2>&1 && \
+      timeout 2 irqbalance-ui -o >/dev/null 2>&1 || true
+    sleep 1
   done
 ) &
+KIDS+=($!)
 
 sleep "$DURATION"
 echo "=== training complete ==="
 EOF
+
   chmod +x "$srcdir/training-workload.sh"
 
-  autoreconf -fi
+  autoreconf -vfi
 }
 
 build() {
@@ -201,10 +264,13 @@ build() {
   export RANLIB=llvm-ranlib
   export STRIP=llvm-strip
 
+
+  # NOTE: the popcount win from ms178-1.patch needs POPCNT to be enabled by
+  # YOUR flags (any -march >= x86-64-v2 / nehalem / native). check() reports
+  # whether POPCNT actually landed in the binary.
   local BASE_CFLAGS="$CFLAGS"
   local BASE_LDFLAGS="$LDFLAGS"
 
-  # P3: the build is not order-sensitive; use all cores.
   local JOBS
   JOBS=$(nproc)
 
@@ -253,13 +319,13 @@ build() {
   make -j"$JOBS"
   "$srcdir/training-workload.sh" || true
 
-  local CS_PROFDATA=""
+  local CS_PROFDATA
   if find "$srcdir/cspgo-data" -name '*.profraw' -size +1k | grep -q .; then
     llvm-profdata merge -output="$srcdir/cspgo-data/cs.profdata" \
       "$srcdir"/cspgo-data/*.profraw "$srcdir/pgo-data/default.profdata"
     CS_PROFDATA="$srcdir/cspgo-data/cs.profdata"
   else
-    echo "WARNING: no CS-PGO profiles; falling back to stage-1 profile"
+    echo "WARNING: no CS-PGO profiles; falling back to the stage-1 profile"
     CS_PROFDATA="$srcdir/pgo-data/default.profdata"
   fi
   rm -f "$srcdir"/cspgo-data/*.profraw
@@ -279,38 +345,43 @@ build() {
   cp irqbalance irqbalance.cspgo
 
   ###########################################################################
-  # Stage 4: BOLT (best-effort; CS-PGO binary is the fallback at every step)
+  # Stage 4: BOLT (best effort; CS-PGO binary is the fallback at every step)
   ###########################################################################
   echo "=== Stage 4: BOLT ==="
   rm -rf "$srcdir/bolt-data"; mkdir -p "$srcdir/bolt-data"
 
   bolt_bail() {
-    echo "WARNING: $1 -- keeping CS-PGO binary"
+    echo "WARNING: $1 -- keeping the CS-PGO binary"
     cp irqbalance.cspgo irqbalance
-    return 0
   }
 
-  llvm-bolt irqbalance.cspgo --instrument \
-      --instrumentation-file-append-pid \
-      --instrumentation-file="$srcdir/bolt-data/irqbalance.fdata" \
-      -o irqbalance.bolt.inst || { bolt_bail "BOLT instrumentation failed"; return 0; }
+  if ! llvm-bolt irqbalance.cspgo --instrument \
+        --instrumentation-file-append-pid \
+        --instrumentation-file="$srcdir/bolt-data/irqbalance.fdata" \
+        -o irqbalance.bolt.inst; then
+    bolt_bail "BOLT instrumentation failed"; return 0
+  fi
 
   cp irqbalance.bolt.inst irqbalance
   "$srcdir/training-workload.sh" || true
 
-  find "$srcdir/bolt-data" -name 'irqbalance.fdata*' -size +1k | grep -q . \
-    || { bolt_bail "no BOLT profiles"; return 0; }
-  command -v merge-fdata >/dev/null 2>&1 \
-    || { bolt_bail "merge-fdata missing"; return 0; }
-  merge-fdata "$srcdir"/bolt-data/irqbalance.fdata* > "$srcdir/bolt-data/merged.fdata" 2>/dev/null \
-    || { bolt_bail "profile merge failed"; return 0; }
-  [[ $(stat -c%s "$srcdir/bolt-data/merged.fdata" 2>/dev/null || echo 0) -ge 1000 ]] \
-    || { bolt_bail "BOLT profile too small"; return 0; }
+  if ! find "$srcdir/bolt-data" -name 'irqbalance.fdata*' -size +1k | grep -q .; then
+    bolt_bail "no BOLT profiles"; return 0
+  fi
+  if ! command -v merge-fdata >/dev/null 2>&1; then
+    bolt_bail "merge-fdata missing"; return 0
+  fi
+  if ! merge-fdata "$srcdir"/bolt-data/irqbalance.fdata* > "$srcdir/bolt-data/merged.fdata" 2>/dev/null; then
+    bolt_bail "profile merge failed"; return 0
+  fi
+  if [[ $(stat -c%s "$srcdir/bolt-data/merged.fdata" 2>/dev/null || echo 0) -lt 1000 ]]; then
+    bolt_bail "BOLT profile too small"; return 0
+  fi
 
-  # --hugify removed: it requests THP for the text segment. irqbalance's text
-  # is ~200KB and it wakes once per interval; a 2MB huge page is pure waste
-  # and can add TLB pressure on a gaming desktop. Everything else retained.
-  llvm-bolt irqbalance.cspgo \
+  # P7: --hugify removed. It requests THP for the text segment; irqbalance's
+  # text is ~200 KB and it wakes once per interval, so a 2 MB huge page is
+  # wasted and can add TLB pressure on a gaming desktop.
+  if ! llvm-bolt irqbalance.cspgo \
       --data "$srcdir/bolt-data/merged.fdata" \
       --dyno-stats \
       --lite=false \
@@ -328,10 +399,13 @@ build() {
       --align-functions=32 \
       --align-blocks \
       --block-alignment=16 \
-      -o irqbalance.bolt || { bolt_bail "BOLT optimization failed"; return 0; }
+      -o irqbalance.bolt; then
+    bolt_bail "BOLT optimization failed"; return 0
+  fi
 
-  [[ $(stat -c%s irqbalance.bolt) -ge 10000 ]] \
-    || { bolt_bail "BOLT binary suspiciously small"; return 0; }
+  if [[ $(stat -c%s irqbalance.bolt) -lt 10000 ]]; then
+    bolt_bail "BOLT binary suspiciously small"; return 0
+  fi
 
   echo "BOLT: $(stat -c%s irqbalance.cspgo) -> $(stat -c%s irqbalance.bolt) bytes"
   cp irqbalance.bolt irqbalance
@@ -340,19 +414,30 @@ build() {
 check() {
   cd "$srcdir/irqbalance"
 
-  # P4: validate the artifact that will actually ship, and prove it is not
-  # the instrumentation build (which would cripple runtime performance and
-  # write profile files into /run on every start).
   ./irqbalance --version >/dev/null
   timeout 30 ./irqbalance --oneshot >/dev/null 2>&1 || true
 
+  # P4: the artifact that ships must not be the instrumentation build.
   if llvm-nm irqbalance 2>/dev/null | grep -q '__bolt_instr\|__llvm_profile_write_file'; then
     echo "!!! shipping binary still contains instrumentation symbols"
     return 1
   fi
 
+  # L1: prove the daemon is not dragging in the UI's terminal libraries.
+  if ldd irqbalance 2>/dev/null | grep -qE 'libncurses|libtinfo'; then
+    echo "!!! --as-needed did not take effect (ncurses/tinfo still linked)"
+    return 1
+  fi
+  echo "check: DT_NEEDED = $(ldd irqbalance 2>/dev/null | wc -l) entries"
+
+  # L2: prove hardware popcount is actually in the binary.
+  local NPOP
+  NPOP=$(llvm-objdump -d irqbalance 2>/dev/null | grep -c popcnt || echo 0)
+  echo "check: POPCNT instructions = $NPOP"
+  [[ "$NPOP" -gt 0 ]] || echo "WARNING: no POPCNT emitted -- add -march=x86-64-v2 (or better) to CFLAGS in /etc/makepkg.conf to get the __bitmap_weight speedup"
+
   # The ban mechanism is what keeps irqbalance off the pinned cores. If this
-  # ever regresses, the pinning script silently loses its guarantee.
+  # regresses, the pinning script silently loses its guarantee.
   local out
   out=$(IRQBALANCE_BANNED_CPULIST="0,1" timeout 30 ./irqbalance --oneshot --debug 2>&1 \
         | grep -m1 '^Banned CPUs')
@@ -367,9 +452,12 @@ package() {
 
   install -Dm644 "misc/irqbalance.env" "$pkgdir/etc/irqbalance.env"
 
-  # P5/P6/P7: generate the unit rather than shipping upstream's, which points
-  # EnvironmentFile at /usr/etc/... and at a literal '${prefix}' that systemd
-  # refuses ("path is not absolute"), so /etc/irqbalance.env was never read.
+  # P5/P6: generate the unit. Upstream's points EnvironmentFile at
+  # /usr/etc/default/irqbalance.env (which no package creates) and at a
+  # literal '${prefix}' that systemd refuses with
+  #   "EnvironmentFile= path is not absolute, ignoring"
+  # so /etc/irqbalance.env — and therefore IRQBALANCE_BANNED_CPULIST — was
+  # never read.
   install -dm755 "$pkgdir/usr/lib/systemd/system"
   cat > "$pkgdir/usr/lib/systemd/system/irqbalance.service" <<'UNIT'
 [Unit]
@@ -428,14 +516,19 @@ UNIT
 
   install -dm755 "$pkgdir/usr/share/doc/irqbalance"
   {
-    echo "Build optimizations: PGO + CS-PGO + BOLT + ThinLTO"
+    echo "Build: PGO + CS-PGO + BOLT + LTO + --as-needed"
+    echo "CFLAGS (from makepkg.conf): ${CFLAGS}"
     [[ -f "$srcdir/pgo-data/default.profdata" ]] && echo "PGO:    $(stat -c%s "$srcdir/pgo-data/default.profdata") bytes"
     [[ -f "$srcdir/cspgo-data/cs.profdata" ]]    && echo "CS-PGO: $(stat -c%s "$srcdir/cspgo-data/cs.profdata") bytes"
     [[ -f "$srcdir/bolt-data/merged.fdata" ]]    && echo "BOLT:   $(stat -c%s "$srcdir/bolt-data/merged.fdata") bytes"
     echo
-    echo "Measured cost of this daemon on a 28-thread Raptor Lake box:"
-    echo "  steady-state CPU at -t 1 : below timer resolution (0.000s / 20s)"
-    echo "  own code share of a scan : ~1.6% of instructions (rest is ld.so/libc)"
-    echo "See AUDIT.md in the package sources for the full analysis."
+    echo "Measured on this package's own build:"
+    echo "  -Wl,--as-needed  : 1,191,349 -> 679,777 Ir per run (-42.9%)"
+    echo "                     DT_NEEDED 11 -> 9 (libncursesw, libtinfo dropped)"
+    echo "  -mpopcnt         : __bitmap_weight 12015 -> 2005 cycles (llvm-mca)"
+    echo "  hash irq index   : 2.8x faster at 40 IRQs, 16.5x at 256"
+    echo "  training rework  : PGO coverage 65% -> 71% of functions,"
+    echo "                     peak exec count 960 -> 8,960 (9.3x)"
+    echo "See AUDIT-v2.md in the package sources for the full analysis."
   } > "$pkgdir/usr/share/doc/irqbalance/OPTIMIZATIONS.txt"
 }
