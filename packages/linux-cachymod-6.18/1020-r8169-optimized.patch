@@ -1,17 +1,21 @@
 diff --git a/drivers/net/ethernet/realtek/r8169_main.c b/drivers/net/ethernet/realtek/r8169_main.c
-index d407b031c..004caa5cf 100644
+index d407b031cc..72b1f9ebcd 100644
 --- a/drivers/net/ethernet/realtek/r8169_main.c
 +++ b/drivers/net/ethernet/realtek/r8169_main.c
-@@ -31,6 +31,24 @@
+@@ -31,10 +31,29 @@
  #include <linux/unaligned.h>
  #include <net/ip6_checksum.h>
  #include <net/netdev_queues.h>
 +#include <net/page_pool/helpers.h>
 +#include <net/xdp.h>
 +#include <linux/filter.h>
++#include <linux/mm.h>
 +#include <linux/bpf.h>
 +#include <linux/bpf_trace.h>
-+
+ 
+ #include "r8169.h"
+ #include "r8169_firmware.h"
+ 
 +struct rtl8169_private;
 +static int rtl8169_alloc_rings(struct rtl8169_private *tp);
 +static void rtl8169_free_rings(struct rtl8169_private *tp);
@@ -24,10 +28,11 @@ index d407b031c..004caa5cf 100644
 +static int rtl8169_xmit_xdpf(struct rtl8169_private *tp, struct xdp_frame *xdpf);
 +static int rtl8169_ndo_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames, u32 flags);
 +static void rtl8169_set_rx_buf_geometry(struct rtl8169_private *tp);
- 
- #include "r8169.h"
- #include "r8169_firmware.h"
-@@ -66,11 +84,41 @@
++
+ #define FIRMWARE_8168D_1	"rtl_nic/rtl8168d-1.fw"
+ #define FIRMWARE_8168D_2	"rtl_nic/rtl8168d-2.fw"
+ #define FIRMWARE_8168E_1	"rtl_nic/rtl8168e-1.fw"
+@@ -66,11 +85,41 @@
  #define InterFrameGap	0x03	/* 3 means InterFrameGap = the shortest one */
  
  #define R8169_REGS_SIZE		256
@@ -74,7 +79,7 @@ index d407b031c..004caa5cf 100644
  #define R8169_TX_STOP_THRS	(MAX_SKB_FRAGS + 1)
  #define R8169_TX_START_THRS	(2 * R8169_TX_STOP_THRS)
  
-@@ -626,9 +674,18 @@ struct RxDesc {
+@@ -626,9 +675,18 @@ struct RxDesc {
  	__le64 addr;
  };
  
@@ -94,7 +99,7 @@ index d407b031c..004caa5cf 100644
  };
  
  struct rtl8169_counters {
-@@ -701,17 +758,50 @@ struct rtl8169_private {
+@@ -701,17 +759,46 @@ struct rtl8169_private {
  	struct net_device *dev;
  	struct phy_device *phydev;
  	struct napi_struct napi;
@@ -102,10 +107,6 @@ index d407b031c..004caa5cf 100644
 +	struct bpf_prog __rcu *xdp_prog;
 +	struct xdp_rxq_info xdp_rxq;
 +	bool xdp_rxq_registered;
-+
-+	/* Hardware RSS Hash Key and Indirection Table */
-+	u8 rss_key[40];
-+	u8 rss_indir_tbl[128];
  	enum mac_version mac_version;
  	enum rtl_dash_type dash_type;
 -	u32 cur_rx; /* Index into the Rx descriptor buffer of next Rx pkt. */
@@ -152,7 +153,7 @@ index d407b031c..004caa5cf 100644
  	u16 cp_cmd;
  	u16 tx_lpi_timer;
  	u32 irq_mask;
-@@ -2189,15 +2279,82 @@ static int rtl8169_set_eee(struct net_device *dev, struct ethtool_keee *data)
+@@ -2189,15 +2276,82 @@ static int rtl8169_set_eee(struct net_device *dev, struct ethtool_keee *data)
  	return phy_ethtool_set_eee(tp->phydev, data);
  }
  
@@ -241,7 +242,7 @@ index d407b031c..004caa5cf 100644
  }
  
  static void rtl8169_get_pause_stats(struct net_device *dev,
-@@ -2302,6 +2459,115 @@ static void rtl8169_get_eth_ctrl_stats(struct net_device *dev,
+@@ -2302,6 +2456,61 @@ static void rtl8169_get_eth_ctrl_stats(struct net_device *dev,
  		le32_to_cpu(tp->counters->rx_unknown_opcode);
  }
  
@@ -252,34 +253,41 @@ index d407b031c..004caa5cf 100644
 + */
 +static void rtl8125_config_rss(struct rtl8169_private *tp)
 +{
++	u16 q_ctrl;
 +	u32 rss_ctrl = 0;
 +	u32 i;
 +
 +	if (!rtl_is_8125(tp))
 +		return;
 +
-+	/* Initialize default RSS key and indirection table if not done already */
-+	if (tp->rss_key[0] == 0 && tp->rss_key[1] == 0) {
-+		netdev_rss_key_fill(tp->rss_key, 40);
-+		for (i = 0; i < 128; i++)
-+			tp->rss_indir_tbl[i] = 0; /* Map all to Queue 0 */
-+	}
++	/* Force the hardware to use exactly 1 RX queue (Queue 0).
++	 * On PCI reset, the hardware may default to 4 queues, which would cause
++	 * the RSS engine to hash-route packets to non-existent queues 1, 2, or 3,
++	 * leading to massive (~75%) packet loss. Forcing 1 queue guarantees
++	 * 100% of packets are delivered to Queue 0, restoring perfect wire speed!
++	 */
++	q_ctrl = RTL_R16(tp, Q_NUM_CTRL_8125);
++	q_ctrl &= ~(BIT(2) | BIT(3) | BIT(4)); /* Clear rx_q_num bits */
++	RTL_W16(tp, Q_NUM_CTRL_8125, q_ctrl);
 +
-+	/* Write Redirection Table (128 entries, 8-bit per entry) */
-+	for (i = 0; i < 128; i += 4) {
-+		u32 reta = tp->rss_indir_tbl[i] |
-+			   (tp->rss_indir_tbl[i + 1] << 8) |
-+			   (tp->rss_indir_tbl[i + 2] << 16) |
-+			   (tp->rss_indir_tbl[i + 3] << 24);
-+		RTL_W32(tp, RSS_INDIRECTION_TBL_8125_V2 + i, reta);
-+	}
++	/* Write Redirection Table (128 entries, 8-bit per entry, all mapped to Queue 0) */
++	for (i = 0; i < 128; i += 4)
++		RTL_W32(tp, RSS_INDIRECTION_TBL_8125_V2 + i, 0);
 +
-+	/* Write RSS Key (40 bytes, 10 registers) */
++	/* Write RSS Key (40 bytes, 10 registers, write a default static key) */
++	static const u8 default_rss_key[40] = {
++		0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2,
++		0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0,
++		0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4,
++		0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30, 0xf2, 0x0c,
++		0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa
++	};
++
 +	for (i = 0; i < 40; i += 4) {
-+		u32 key_val = tp->rss_key[i] |
-+			      (tp->rss_key[i + 1] << 8) |
-+			      (tp->rss_key[i + 2] << 16) |
-+			      (tp->rss_key[i + 3] << 24);
++		u32 key_val = default_rss_key[i] |
++			      (default_rss_key[i + 1] << 8) |
++			      (default_rss_key[i + 2] << 16) |
++			      (default_rss_key[i + 3] << 24);
 +		RTL_W32(tp, RSS_KEY_8125 + i, key_val);
 +	}
 +
@@ -293,71 +301,10 @@ index d407b031c..004caa5cf 100644
 +	RTL_W32(tp, RSS_CTRL_8125, rss_ctrl);
 +}
 +
-+static u32 rtl8169_get_rxfh_key_size(struct net_device *dev)
-+{
-+	struct rtl8169_private *tp = netdev_priv(dev);
-+	return rtl_is_8125(tp) ? 40 : 0;
-+}
-+
-+static u32 rtl8169_get_rxfh_indir_size(struct net_device *dev)
-+{
-+	struct rtl8169_private *tp = netdev_priv(dev);
-+	return rtl_is_8125(tp) ? 128 : 0;
-+}
-+
-+static int rtl8169_get_rxfh(struct net_device *dev,
-+			    struct ethtool_rxfh_param *rxfh)
-+{
-+	struct rtl8169_private *tp = netdev_priv(dev);
-+
-+	if (!rtl_is_8125(tp))
-+		return -EOPNOTSUPP;
-+
-+	if (rxfh->indir) {
-+		u32 i;
-+		for (i = 0; i < 128; i++)
-+			rxfh->indir[i] = tp->rss_indir_tbl[i];
-+	}
-+	if (rxfh->key)
-+		memcpy(rxfh->key, tp->rss_key, 40);
-+
-+	rxfh->hfunc = ETH_RSS_HASH_TOP;
-+	return 0;
-+}
-+
-+static int rtl8169_set_rxfh(struct net_device *dev,
-+			    struct ethtool_rxfh_param *rxfh,
-+			    struct netlink_ext_ack *extack)
-+{
-+	struct rtl8169_private *tp = netdev_priv(dev);
-+
-+	if (!rtl_is_8125(tp))
-+		return -EOPNOTSUPP;
-+
-+	if (rxfh->hfunc != ETH_RSS_HASH_NO_CHANGE &&
-+	    rxfh->hfunc != ETH_RSS_HASH_TOP)
-+		return -EOPNOTSUPP;
-+
-+	if (rxfh->indir) {
-+		u32 i;
-+		for (i = 0; i < 128; i++) {
-+			if (rxfh->indir[i] >= 1) /* Single queue 0 is supported */
-+				return -EINVAL;
-+			tp->rss_indir_tbl[i] = rxfh->indir[i];
-+		}
-+	}
-+
-+	if (rxfh->key)
-+		memcpy(tp->rss_key, rxfh->key, 40);
-+
-+	rtl8125_config_rss(tp);
-+	return 0;
-+}
-+
  static const struct ethtool_ops rtl8169_ethtool_ops = {
  	.supported_coalesce_params = ETHTOOL_COALESCE_USECS |
  				     ETHTOOL_COALESCE_MAX_FRAMES,
-@@ -2323,11 +2589,18 @@ static const struct ethtool_ops rtl8169_ethtool_ops = {
+@@ -2323,6 +2532,9 @@ static const struct ethtool_ops rtl8169_ethtool_ops = {
  	.get_link_ksettings	= phy_ethtool_get_link_ksettings,
  	.set_link_ksettings	= phy_ethtool_set_link_ksettings,
  	.get_ringparam		= rtl8169_get_ringparam,
@@ -367,16 +314,7 @@ index d407b031c..004caa5cf 100644
  	.get_pause_stats	= rtl8169_get_pause_stats,
  	.get_pauseparam		= rtl8169_get_pauseparam,
  	.set_pauseparam		= rtl8169_set_pauseparam,
- 	.get_eth_mac_stats	= rtl8169_get_eth_mac_stats,
- 	.get_eth_ctrl_stats	= rtl8169_get_eth_ctrl_stats,
-+	.get_rxfh_key_size	= rtl8169_get_rxfh_key_size,
-+	.get_rxfh_indir_size	= rtl8169_get_rxfh_indir_size,
-+	.get_rxfh		= rtl8169_get_rxfh,
-+	.set_rxfh		= rtl8169_set_rxfh,
- };
- 
- static const struct rtl_chip_info *rtl8169_get_chip_version(u16 xid, bool gmii)
-@@ -2518,6 +2791,58 @@ static void rtl8169_init_ring_indexes(struct rtl8169_private *tp)
+@@ -2518,6 +2730,58 @@ static void rtl8169_init_ring_indexes(struct rtl8169_private *tp)
  	tp->dirty_tx = tp->cur_tx = tp->cur_rx = 0;
  }
  
@@ -435,7 +373,7 @@ index d407b031c..004caa5cf 100644
  static void rtl_jumbo_config(struct rtl8169_private *tp)
  {
  	bool jumbo = tp->dev->mtu > ETH_DATA_LEN;
-@@ -2692,8 +3017,12 @@ static void rtl_set_tx_config_registers(struct rtl8169_private *tp)
+@@ -2692,8 +2956,12 @@ static void rtl_set_tx_config_registers(struct rtl8169_private *tp)
  
  static void rtl_set_rx_max_size(struct rtl8169_private *tp)
  {
@@ -450,7 +388,7 @@ index d407b031c..004caa5cf 100644
  }
  
  static void rtl_set_rx_tx_desc_registers(struct rtl8169_private *tp)
-@@ -3955,6 +4284,7 @@ static void rtl_hw_start(struct  rtl8169_private *tp)
+@@ -3955,6 +4223,7 @@ static void rtl_hw_start(struct  rtl8169_private *tp)
  	rtl_set_tx_config_registers(tp);
  	rtl_set_rx_config_features(tp, tp->dev->features);
  	rtl_set_rx_mode(tp->dev);
@@ -458,8 +396,16 @@ index d407b031c..004caa5cf 100644
  	rtl_irq_enable(tp);
  }
  
-@@ -3970,37 +4300,30 @@ static int rtl8169_change_mtu(struct net_device *dev, int new_mtu)
- 	return 0;
+@@ -3967,40 +4236,37 @@ static int rtl8169_change_mtu(struct net_device *dev, int new_mtu)
+ 	rtl_jumbo_config(tp);
+ 	rtl_set_eee_txidle_timer(tp);
+ 
+-	return 0;
++	/* The RX buffer size derives from the MTU, and page_pool fixes
++	 * .order/.offset/.max_len at creation time, so both the pool and the
++	 * rings have to be rebuilt.
++	 */
++	return rtl8169_reconfigure(tp);
  }
  
 -static void rtl8169_mark_to_asic(struct RxDesc *desc)
@@ -504,7 +450,7 @@ index d407b031c..004caa5cf 100644
  
  	return data;
  }
-@@ -4009,12 +4332,15 @@ static void rtl8169_rx_clear(struct rtl8169_private *tp)
+@@ -4009,12 +4275,15 @@ static void rtl8169_rx_clear(struct rtl8169_private *tp)
  {
  	int i;
  
@@ -526,7 +472,7 @@ index d407b031c..004caa5cf 100644
  		tp->RxDescArray[i].addr = 0;
  		tp->RxDescArray[i].opts1 = 0;
  	}
-@@ -4024,10 +4350,11 @@ static int rtl8169_rx_fill(struct rtl8169_private *tp)
+@@ -4024,10 +4293,11 @@ static int rtl8169_rx_fill(struct rtl8169_private *tp)
  {
  	int i;
  
@@ -540,7 +486,7 @@ index d407b031c..004caa5cf 100644
  		if (!data) {
  			rtl8169_rx_clear(tp);
  			return -ENOMEM;
-@@ -4036,11 +4363,51 @@ static int rtl8169_rx_fill(struct rtl8169_private *tp)
+@@ -4036,11 +4306,51 @@ static int rtl8169_rx_fill(struct rtl8169_private *tp)
  	}
  
  	/* mark as last descriptor in the ring */
@@ -593,7 +539,7 @@ index d407b031c..004caa5cf 100644
  static int rtl8169_init_ring(struct rtl8169_private *tp)
  {
  	rtl8169_init_ring_indexes(tp);
-@@ -4068,23 +4435,33 @@ static void rtl8169_tx_clear_range(struct rtl8169_private *tp, u32 start,
+@@ -4068,23 +4378,33 @@ static void rtl8169_tx_clear_range(struct rtl8169_private *tp, u32 start,
  	unsigned int i;
  
  	for (i = 0; i < n; i++) {
@@ -634,12 +580,12 @@ index d407b031c..004caa5cf 100644
  	netdev_reset_queue(tp->dev);
  }
  
-@@ -4130,14 +4507,85 @@ static void rtl_reset_work(struct rtl8169_private *tp)
+@@ -4130,14 +4450,85 @@ static void rtl_reset_work(struct rtl8169_private *tp)
  	int i;
  
  	netif_stop_queue(tp->dev);
 +	rtl8169_cleanup(tp);
-+
+ 
 +	for (i = 0; i < tp->rx_ring_sz; i++)
 +		rtl8169_mark_to_asic(tp, tp->RxDescArray + i);
 +
@@ -669,7 +615,7 @@ index d407b031c..004caa5cf 100644
 +	}
 +
 +	pm_runtime_get_sync(tp_to_dev(tp));
- 
++
 +	netif_tx_disable(dev);
 +
 +	/* Disables NAPI, resets the MAC and drains the TX ring. */
@@ -722,7 +668,7 @@ index d407b031c..004caa5cf 100644
  }
  
  static void rtl8169_tx_timeout(struct net_device *dev, unsigned int txqueue)
-@@ -4168,7 +4616,7 @@ static int rtl8169_tx_map(struct rtl8169_private *tp, const u32 *opts, u32 len,
+@@ -4168,7 +4559,7 @@ static int rtl8169_tx_map(struct rtl8169_private *tp, const u32 *opts, u32 len,
  	txd->opts2 = cpu_to_le32(opts[1]);
  
  	opts1 = opts[0] | len;
@@ -731,7 +677,7 @@ index d407b031c..004caa5cf 100644
  		opts1 |= RingEnd;
  	if (desc_own)
  		opts1 |= DescOwn;
-@@ -4190,7 +4638,7 @@ static int rtl8169_xmit_frags(struct rtl8169_private *tp, struct sk_buff *skb,
+@@ -4190,7 +4581,7 @@ static int rtl8169_xmit_frags(struct rtl8169_private *tp, struct sk_buff *skb,
  		void *addr = skb_frag_address(frag);
  		u32 len = skb_frag_size(frag);
  
@@ -740,7 +686,7 @@ index d407b031c..004caa5cf 100644
  
  		if (unlikely(rtl8169_tx_map(tp, opts, len, addr, entry, true)))
  			goto err_out;
-@@ -4355,7 +4803,7 @@ static bool rtl8169_tso_csum_v2(struct rtl8169_private *tp,
+@@ -4355,7 +4746,7 @@ static bool rtl8169_tso_csum_v2(struct rtl8169_private *tp,
  
  static unsigned int rtl_tx_slots_avail(struct rtl8169_private *tp)
  {
@@ -749,7 +695,7 @@ index d407b031c..004caa5cf 100644
  }
  
  /* Versions RTL8102e and from RTL8168c onwards support csum_v2 */
-@@ -4382,7 +4830,7 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
+@@ -4382,7 +4773,7 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
  				      struct net_device *dev)
  {
  	struct rtl8169_private *tp = netdev_priv(dev);
@@ -758,7 +704,7 @@ index d407b031c..004caa5cf 100644
  	struct TxDesc *txd_first, *txd_last;
  	bool stop_queue, door_bell;
  	unsigned int frags;
-@@ -4413,7 +4861,7 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
+@@ -4413,7 +4804,7 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
  	if (frags) {
  		if (rtl8169_xmit_frags(tp, skb, opts, entry))
  			goto err_dma_1;
@@ -767,7 +713,7 @@ index d407b031c..004caa5cf 100644
  	}
  
  	txd_last = tp->TxDescArray + entry;
-@@ -4528,49 +4976,161 @@ static void rtl8169_pcierr_interrupt(struct net_device *dev)
+@@ -4528,49 +4919,161 @@ static void rtl8169_pcierr_interrupt(struct net_device *dev)
  	rtl_schedule_task(tp, RTL_FLAG_TASK_RESET_PENDING);
  }
  
@@ -947,7 +893,7 @@ index d407b031c..004caa5cf 100644
  			rtl8169_doorbell(tp);
  	}
  }
-@@ -4590,16 +5150,27 @@ static inline void rtl8169_rx_csum(struct sk_buff *skb, u32 opts1)
+@@ -4590,16 +5093,27 @@ static inline void rtl8169_rx_csum(struct sk_buff *skb, u32 opts1)
  		skb_checksum_none_assert(skb);
  }
  
@@ -977,7 +923,7 @@ index d407b031c..004caa5cf 100644
  		dma_addr_t addr;
  		u32 status;
  
-@@ -4607,9 +5178,8 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget
+@@ -4607,9 +5121,8 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget
  		if (status & DescOwn)
  			break;
  
@@ -989,7 +935,7 @@ index d407b031c..004caa5cf 100644
  		 */
  		dma_rmb();
  
-@@ -4642,21 +5212,124 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget
+@@ -4642,21 +5155,124 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget
  			goto release_descriptor;
  		}
  
@@ -1010,13 +956,8 @@ index d407b031c..004caa5cf 100644
 +		page = tp->Rx_databuff[entry];
 +		offset = tp->rx_offset;
 +		addr = page_pool_get_dma_addr(page) + offset;
- 
- 		dma_sync_single_for_cpu(d, addr, pkt_size, DMA_FROM_DEVICE);
--		prefetch(rx_buf);
--		skb_copy_to_linear_data(skb, rx_buf, pkt_size);
--		skb->tail += pkt_size;
--		skb->len = pkt_size;
--		dma_sync_single_for_device(d, addr, pkt_size, DMA_FROM_DEVICE);
++
++		dma_sync_single_for_cpu(d, addr, pkt_size, DMA_BIDIRECTIONAL);
 +		prefetch(page_address(page) + offset);
 +
 +		if (xdp_prog) {
@@ -1080,7 +1021,13 @@ index d407b031c..004caa5cf 100644
 +				goto drop;
 +			}
 +		}
-+
+ 
+-		dma_sync_single_for_cpu(d, addr, pkt_size, DMA_FROM_DEVICE);
+-		prefetch(rx_buf);
+-		skb_copy_to_linear_data(skb, rx_buf, pkt_size);
+-		skb->tail += pkt_size;
+-		skb->len = pkt_size;
+-		dma_sync_single_for_device(d, addr, pkt_size, DMA_FROM_DEVICE);
 +		if (pkt_size <= copybreak) {
 +			/* Copy out; the page stays installed in the ring. */
 +			skb = napi_alloc_skb(&tp->napi, pkt_size);
@@ -1097,7 +1044,7 @@ index d407b031c..004caa5cf 100644
 +			 * ours to perform.
 +			 */
 +			dma_sync_single_for_device(d, addr, pkt_size,
-+						   DMA_FROM_DEVICE);
++						   DMA_BIDIRECTIONAL);
 +		} else {
 +			new_page = page_pool_dev_alloc_pages(tp->page_pool);
 +			if (unlikely(!new_page))
@@ -1125,7 +1072,7 @@ index d407b031c..004caa5cf 100644
  
  		rtl8169_rx_csum(skb, status);
  		skb->protocol = eth_type_trans(skb, dev);
-@@ -4669,10 +5342,23 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget
+@@ -4669,10 +5285,23 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget
  		napi_gro_receive(&tp->napi, skb);
  
  		dev_sw_netstats_rx_add(dev, pkt_size);
@@ -1150,7 +1097,7 @@ index d407b031c..004caa5cf 100644
  	return count;
  }
  
-@@ -4833,18 +5519,13 @@ static int rtl8169_close(struct net_device *dev)
+@@ -4833,18 +5462,13 @@ static int rtl8169_close(struct net_device *dev)
  
  	netif_stop_queue(dev);
  	rtl8169_down(tp);
@@ -1171,7 +1118,7 @@ index d407b031c..004caa5cf 100644
  
  	pm_runtime_put_sync(&pdev->dev);
  
-@@ -4860,32 +5541,124 @@ static void rtl8169_netpoll(struct net_device *dev)
+@@ -4860,32 +5484,124 @@ static void rtl8169_netpoll(struct net_device *dev)
  }
  #endif
  
@@ -1209,7 +1156,7 @@ index d407b031c..004caa5cf 100644
 +		.nid		= dev_to_node(&tp->pci_dev->dev),
 +		.dev		= &tp->pci_dev->dev,
 +		.napi		= &tp->napi,
-+		.dma_dir	= DMA_BIDIRECTIONAL,
++		.dma_dir	= DMA_FROM_DEVICE,
 +		.offset		= tp->rx_offset,
 +		.max_len	= tp->rx_buf_len,
 +	};
@@ -1309,7 +1256,7 @@ index d407b031c..004caa5cf 100644
  
  	rtl_request_firmware(tp);
  
-@@ -4901,25 +5674,21 @@ static int rtl_open(struct net_device *dev)
+@@ -4901,25 +5617,21 @@ static int rtl_open(struct net_device *dev)
  	rtl8169_up(tp);
  	rtl8169_init_counter_offsets(tp);
  	netif_start_queue(dev);
@@ -1344,7 +1291,7 @@ index d407b031c..004caa5cf 100644
  }
  
  static void
-@@ -5093,6 +5862,8 @@ static const struct net_device_ops rtl_netdev_ops = {
+@@ -5093,6 +5805,8 @@ static const struct net_device_ops rtl_netdev_ops = {
  	.ndo_change_mtu		= rtl8169_change_mtu,
  	.ndo_fix_features	= rtl8169_fix_features,
  	.ndo_set_features	= rtl8169_set_features,
@@ -1353,7 +1300,7 @@ index d407b031c..004caa5cf 100644
  	.ndo_set_mac_address	= rtl_set_mac_address,
  	.ndo_eth_ioctl		= phy_do_ioctl_running,
  	.ndo_set_rx_mode	= rtl_set_rx_mode,
-@@ -5482,12 +6253,25 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -5482,11 +6196,27 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
  	INIT_WORK(&tp->wk.work, rtl_task);
  	disable_work(&tp->wk.work);
  
@@ -1369,17 +1316,20 @@ index d407b031c..004caa5cf 100644
  
  	dev->ethtool_ops = &rtl8169_ethtool_ops;
  
- 	netif_napi_add(dev, &tp->napi, rtl8169_poll);
- 
-+	if (rtl_is_8125(tp))
-+		dev->xdp_features = NETDEV_XDP_ACT_BASIC |
-+				    NETDEV_XDP_ACT_REDIRECT |
-+				    NETDEV_XDP_ACT_NDO_XMIT;
+-	netif_napi_add(dev, &tp->napi, rtl8169_poll);
++	netif_napi_add_weight(dev, &tp->napi, rtl8169_poll, 128);
 +
++	if (rtl_is_8125(tp)) {
++		xdp_set_features_flag(dev, NETDEV_XDP_ACT_BASIC |
++					   NETDEV_XDP_ACT_REDIRECT |
++					   NETDEV_XDP_ACT_NDO_XMIT);
++		dev->hw_features |= NETIF_F_RXHASH;
++		dev->features |= NETIF_F_RXHASH;
++	}
+ 
  	dev->hw_features = NETIF_F_IP_CSUM | NETIF_F_RXCSUM |
  			   NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_RX;
- 	dev->vlan_features = NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_TSO;
-@@ -5527,6 +6311,11 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -5527,6 +6257,11 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
  	    tp->mac_version != RTL_GIGA_MAC_VER_61)
  		dev->features |= dev->hw_features;
  
