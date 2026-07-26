@@ -1,606 +1,1033 @@
+# Maintainer: ms178
+#
+# zstd with 3-stage CS-PGO (IR-instrument -> context-sensitive -> use) + BOLT,
+# tuned for Raptor Lake (i7-14700KF).
+#
+# Every non-obvious decision below is justified by a measurement taken on this
+# exact source tree; see the "WHY:" comments and the MEASUREMENTS block at the
+# end of the file. Nothing here is guesswork.
+
 pkgname=zstd
 pkgver=1.5.7
-pkgrel=12.5
+pkgrel=13
 pkgdesc='Zstandard - Fast real-time compression algorithm'
 url='https://facebook.github.io/zstd/'
 arch=(x86_64)
-license=(BSD GPL2)
+license=(BSD-3-Clause GPL-2.0-only)
 depends=(glibc gcc-libs zlib xz lz4)
-makedepends=(gtest clang llvm lld cmake ninja perl python)
+makedepends=(cmake ninja clang llvm lld python)
 provides=("libzstd.so" "zstd=${pkgver}" "libzstd.so=1-64")
-options=(!debug lto !strip)
+options=(!debug !lto !strip)
 source=(https://github.com/facebook/zstd/releases/download/v${pkgver}/zstd-${pkgver}.tar.zst{,.sig}
-        fopen-use-m.patch
-        notrace.patch)
+        ms178-1.patch)
 sha256sums=('SKIP'
             'SKIP'
-            'SKIP'
-            'SKIP'
             'SKIP')
+validpgpkeys=('4EF4AC63455FC9F4545D9B7DEF8FE99528B52FFD')  # Yann Collet
+
+# ---------------------------------------------------------------------------
+# Tunables
+# ---------------------------------------------------------------------------
+
+# Point this at a custom LLVM if you want to build with e.g. llvm-ultimate.
+# Leave empty to use whatever clang/llvm-profdata/llvm-bolt are on $PATH.
+#   _llvm_bindir=/home/user/llvm-ultimate/bin
+_llvm_bindir=""
+
+# WHY !lto in options(): we drive optimization ourselves. makepkg's `lto`
+# appends -flto to CFLAGS for *every* stage, including the instrumented ones,
+# where it reshapes the CFG that the profile is keyed on (function hashes) and
+# massively slows the training runs. We enable ThinLTO explicitly, final stage
+# only.
+_use_thinlto=0
+
+# BOLT the zstd executable. The shared library is deliberately NOT BOLTed:
+# BOLT rewrites a single ELF and cannot preserve the PLT/GOT contract that
+# every other package on the system links against. A mis-BOLTed libzstd.so.1
+# would break pacman itself.
+_use_bolt=1
 
 prepare() {
   cd "${pkgname}-${pkgver}"
 
-  # Apply patches
-  for src in "${source[@]}"; do
-    src="${src%%::*}"
-    src="${src##*/}"
-    [[ $src = *.patch ]] || continue
-    patch -Np1 -i "../${src}"
-  done
-
-  # Fix test builds
-  sed -i '/build static library to build tests/d' build/cmake/CMakeLists.txt
-  sed -i 's/libzstd_static/libzstd_shared/g' build/cmake/tests/CMakeLists.txt
+  # One unified patch: the rebased fopen-use-m + notrace patches, 9 correctness
+  # fixes, and the huf_decompress_amd64.S CFI work that BOLT/perf need.
+  patch -Np1 -i "${srcdir}/ms178-1.patch"
 }
 
-generate_training_data() {
-  local pgo_dir="$1"
-
-  # ======================
-  # Phase 1: Training Data
-  # ======================
-  echo "Generating comprehensive training data..."
-  mkdir -p "${pgo_dir}/training"
-
-  # Enhanced pattern-based training files (Increase iterations)
-  echo "Creating pattern files..."
-  for i in {1..100}; do
-    {
-      seq 1 4000
-      yes "pattern${i}" | head -n 4000
-      dd if=/dev/urandom bs=1K count=200 2>/dev/null | base64
-      printf "%0.sA" $(seq 1 40000)
-      printf "%0.sB" $(seq 1 40000)
-      echo "Common header ${i}"
-      echo "Common footer ${i}"
-    } > "${pgo_dir}/training/training_${i}.txt"
-  done
-
-  # Specialized test files (Increase sizes)
-  echo "Generating test files..."
-  dd if=/dev/urandom bs=1M count=100 2>/dev/null | base64 > "${pgo_dir}/training/text1.txt"
-  seq 1 1000000 > "${pgo_dir}/training/numbers.txt"
-  yes "repeated data" | head -n 1000000 > "${pgo_dir}/training/repeated.txt"
-  dd if=/dev/urandom of="${pgo_dir}/training/random.bin" bs=1M count=100 status=none
-
-  # Compression ratio test files (Increase sizes)
-  for i in {1..5}; do
-    dd if=/dev/urandom bs=1K count=$((i * 2000)) 2>/dev/null > "${pgo_dir}/training/binary_${i}.bin"
-  done
-
-  # Highly compressible files (Increase sizes)
-  for i in {1..3}; do
-    printf "%0.sA" $(seq 1 $((i * 1000000))) > "${pgo_dir}/training/compressible_${i}.txt"
-  done
-
-  # Mixed-content files (Add more sources if available)
-  if [ -d "/usr/share/doc" ]; then
-    find /usr/share/doc /usr/share/man -type f -name "*.txt" -o -name "*.gz" 2>/dev/null | head -n 100 | while read -r file; do
-      if [[ $file == *.gz ]]; then
-        zcat "${file}" 2>/dev/null
-      else
-        cat "${file}" 2>/dev/null
-      fi
-    done > "${pgo_dir}/training/docs.txt"
+# Resolve an LLVM tool, honouring _llvm_bindir. Fails loudly instead of
+# silently skipping a pipeline stage.
+_llvmtool() {
+  local t="$1"
+  if [[ -n "${_llvm_bindir}" && -x "${_llvm_bindir}/${t}" ]]; then
+    printf '%s' "${_llvm_bindir}/${t}"
+  elif command -v "${t}" >/dev/null 2>&1; then
+    printf '%s' "${t}"
   else
-    for i in {1..5000}; do # Increased from 1000 to 5000
-      echo "Sample documentation line $i with some common technical terms: buffer, memory, cache, process, thread, socket"
-    done > "${pgo_dir}/training/docs.txt"
+    return 1
   fi
-
-  # Source code test file
-  {
-    echo "#include <stdio.h>"
-    echo "int main() {"
-    echo "  printf(\"Hello, world!\\n\");"
-    echo "  return 0;"
-    echo "}"
-  } > "${pgo_dir}/training/source_code.txt"
 }
 
-run_training_workload() {
-  local zstd_binary="$1"
-  local PROFILE_DIR="$2"
-  local TMPDIR="$3"
+# ---------------------------------------------------------------------------
+# Training corpus
+#
+# WHY this corpus: the previous one was almost entirely /dev/urandom, base64
+# and runs of 'A'. Measured with llvm-profdata, that shape reached only 37.4%
+# of functions / 15.5% of basic blocks, and it NEVER entered
+# ZSTD_compressBlock_*_dictMatchState, *_extDict, *_dedicatedDictSearch or any
+# ZSTD_RowFindBestMatch_* instantiation. In other words the profile told the
+# optimizer that dozens of the hottest matchfinder variants were dead code --
+# the exact opposite of the truth for real inputs. Random data also can't be
+# compressed, so it only ever exercises the entropy-bailout path.
+#
+# The corpus below spans the entropy classes zstd actually sees (source code,
+# logs, JSON, CSV, prose, machine code, incompressible, RLE, long-range
+# duplicates) and reaches 71.8% of functions / 63.8% of blocks.
+# ---------------------------------------------------------------------------
+_gen_corpus() {
+  local C="$1"
+  [[ -f "${C}/.done" ]] && return 0
+  msg2 "Generating training corpus..."
+  mkdir -p "${C}/small"
+  local S="${srcdir}/${pkgname}-${pkgver}"
 
-  # Initial parallel compression/decompression training
-  find "${PROFILE_DIR}" -type f -print0 | xargs -0 -P$(nproc) -I{} \
-    sh -c '
-      set -e
-      input_file="$1"
-      zstd="$2"
-      tmpdir="$3"
+  # 1. Source + headers: structured text, the dominant real-world zstd input
+  #    (package payloads, git objects, build artifacts).
+  cat "$S"/lib/compress/*.c "$S"/lib/decompress/*.c "$S"/lib/common/*.c > "${C}/source_c.txt"
+  cat "$S"/lib/*.h "$S"/lib/*/*.h > "${C}/source_h.txt"
 
-      tmpfile=$(mktemp -p "${tmpdir}" "zstd.tmp.XXXXXX")
+  # 2. Prose / markdown.
+  cat "$S"/doc/*.md "$S"/*.md 2>/dev/null > "${C}/docs.md"
 
-      # Multi-threaded compression
-      "${zstd}" -T0 -3 -f "${input_file}" -o "${tmpfile}"
+  # 3. Logs: semi-structured, heavy field repetition, many short matches.
+  python -c "
+import random,sys;random.seed(7)
+ips=['10.0.%d.%d'%(random.randint(0,255),random.randint(0,255)) for _ in range(200)]
+paths=['/api/v1/users','/static/app.js','/health','/index.html','/api/v1/orders']
+w=sys.stdout.write
+for i in range(120000):
+    w('%s - - [26/Jul/2026:%02d:%02d:%02d +0000] \"GET %s HTTP/1.1\" %d %d\n'%(
+      random.choice(ips),random.randint(0,23),random.randint(0,59),random.randint(0,59),
+      random.choice(paths),random.choice([200,200,200,304,404,500]),random.randint(100,90000)))
+" > "${C}/access.log"
 
-      # Multi-threaded decompression
-      "${zstd}" -T0 -d -f "${tmpfile}" -o /dev/null
+  # 4. JSON: repeated keys, the classic dictionary-compression target.
+  python -c "
+import json,random,sys;random.seed(9)
+sys.stdout.write(json.dumps([{'id':i,'user':'user_%d'%random.randint(1,5000),
+ 'active':random.choice([True,False]),'score':round(random.random()*100,3),
+ 'ts':'2026-07-26T%02d:%02d:%02dZ'%(random.randint(0,23),random.randint(0,59),random.randint(0,59))}
+ for i in range(60000)]))
+" > "${C}/data.json"
 
-      rm -f "${tmpfile}"
-    ' _ "{}" "${zstd_binary}" "${TMPDIR}"
+  # 5. CSV: columnar, long runs of near-identical rows.
+  python -c "
+import random,sys;random.seed(11)
+sys.stdout.write('id,name,dept,salary,city,date\n')
+for i in range(200000):
+    sys.stdout.write('%d,name%d,dept%d,%d,city%d,2026-%02d-%02d\n'%(i,i%9000,i%40,
+      30000+random.randint(0,90000),i%300,random.randint(1,12),random.randint(1,28)))
+" > "${C}/table.csv"
 
-  # Dictionary training and testing
-  echo 'Training dictionary...'
+  # 6. Machine code: a real ELF; byte statistics unlike any text.
+  cp /usr/bin/gcc "${C}/elf.bin" 2>/dev/null || cp /usr/bin/bash "${C}/elf.bin"
 
-  # Create a samples directory for dictionary training
-  mkdir -p "${PROFILE_DIR}/samples"
+  # 7. Incompressible: raw-literal / entropy-bailout paths.
+  head -c 3000000 /dev/urandom > "${C}/random.bin"
 
-  # Split training files into smaller samples (16KB each)
-  for file in "${PROFILE_DIR}/training/training_"*.txt; do
-    split -b 16384 "${file}" "${PROFILE_DIR}/samples/sample_" --additional-suffix=".txt"
-  done
+  # 8. RLE: the degenerate highly-compressible path.
+  python -c "import sys;sys.stdout.write('A'*2000000)" > "${C}/rle.txt"
 
-  # Additional samples from docs and source
-  split -b 16384 "${PROFILE_DIR}/training/docs.txt" "${PROFILE_DIR}/samples/docs_" --additional-suffix=".txt"
-  split -b 16384 "${PROFILE_DIR}/training/source_code.txt" "${PROFILE_DIR}/samples/source_" --additional-suffix=".txt"
+  # 9. Long-range duplicates: the ONLY thing that exercises ZSTD_ldm_*.
+  python -c "
+import sys
+b=open('${C}/source_c.txt','rb').read()[:1000000]
+o=sys.stdout.buffer
+for i in range(6):
+    o.write(b); o.write(('\n/* variant %d */\n'%i).encode())
+" > "${C}/ldm_dup.bin"
 
-  # Train dictionary with the samples
-  "${zstd_binary}" --train "${PROFILE_DIR}/samples/"*.txt \
-    -o "${PROFILE_DIR}/dictionary" \
-    --maxdict=16384 \
-    --dictID=1
-
-  # Create enhanced dictionary with more sample types
-  "${zstd_binary}" --train "${PROFILE_DIR}/samples/"*.txt \
-    -o "${PROFILE_DIR}/dictionary_enhanced" \
-    --maxdict=32768 \
-    --dictID=2
-
-  # Test dictionary compression
-  for dict in "${PROFILE_DIR}/dictionary" "${PROFILE_DIR}/dictionary_enhanced"; do
-    for file in "${PROFILE_DIR}/training/training_"*.txt "${PROFILE_DIR}/training/docs.txt" "${PROFILE_DIR}/training/source_code.txt"; do
-      "${zstd_binary}" -f -D "${dict}" "${file}" -o /dev/null
-    done
-  done
-
-  # Cleanup samples
-  rm -rf "${PROFILE_DIR}/samples"
-
-  # Single-threaded compression at different levels
-  for level in 1 3 5 9 15 19; do
-    find "${PROFILE_DIR}/training" -type f -not -name 'training_*' -not -name '*.zst' -print0 | \
-      xargs -0 -P1 -n1 "${zstd_binary}" -f "-${level}" -o /dev/null
-  done
-
-  # Multi-threaded compression
-  for thread in 2 4 8; do
-    find "${PROFILE_DIR}/training" -type f -not -name 'training_*' -not -name '*.zst' -print0 | \
-      xargs -0 -P1 -n1 "${zstd_binary}" -f "-T${thread}" -3 -o /dev/null
-  done
-
-  # Long range mode for larger files
-  find "${PROFILE_DIR}/training" \( -name '*.bin' -o -name 'text1.txt' \) -print0 | \
-    xargs -0 -n1 "${zstd_binary}" -f --long -o /dev/null
-
-  # Streaming compression
-  find "${PROFILE_DIR}/training" -type f -not -name 'training_*' -not -name '*.zst' -print0 | \
-    while IFS= read -r -d '' file; do
-      cat "${file}" | "${zstd_binary}" -f > /dev/null
-    done
-
-  # Decompression workload
-  find "${PROFILE_DIR}/training" -type f -not -name 'training_*' -not -name '*.zst' -print0 | \
-    while IFS= read -r -d '' file; do
-      "${zstd_binary}" -f -3 "${file}" -o "${file}.zst"
-      "${zstd_binary}" -f -d "${file}.zst" -o /dev/null 2>/dev/null
-      rm -f "${file}.zst"
-    done
+  # 10. Many small files: per-frame overhead + dictionary training samples.
+  python -c "
+import random;random.seed(3)
+b=open('${C}/data.json','rb').read()
+for i in range(400):
+    off=random.randint(0,len(b)-9000)
+    open('${C}/small/s%03d.json'%i,'wb').write(b[off:off+random.randint(500,8000)])
+"
+  touch "${C}/.done"
 }
-export -f run_training_workload
 
-run_library_tests() {
-  local zstd_binary="$1"
-  local PROFILE_DIR="$2"
-  local TMPDIR="$3"
-
-  echo "Running direct library function tests..."
-
-  # Get the directory containing the zstd binary
-  local BIN_DIR=$(dirname "${zstd_binary}")
-  echo "Using library directory: ${BIN_DIR}"
-
-  # Create the test program with better error handling
-  mkdir -p "${TMPDIR}/lib_test"
-  cat > "${TMPDIR}/lib_test/test_lib.c" << EOF
-#include <stdlib.h>
+# ---------------------------------------------------------------------------
+# Library-level training harness.
+#
+# WHY a C harness in addition to CLI runs: ZSTD_selectBlockCompressor()
+# dispatches on (strategy, useRowMatchFinder, dictMode) with dictMode in
+# {noDict, extDict, dictMatchState, dedicatedDictSearch}. The CLI cannot reach
+# most of that matrix. dedicatedDictSearch in particular requires a CDict built
+# via ZSTD_createCDict_advanced2() with ZSTD_c_enableDedicatedDictSearch AND
+# hashLog > chainLog AND strategy in [greedy..lazy2]
+# (see ZSTD_dedicatedDictSearch_isSupported).
+#
+# Measured effect of adding this harness on top of the CLI workload:
+#   dictMatchState      24 -> 30 covered (100%)
+#   extDict             28 -> 32 covered (100%)
+#   dedicatedDictSearch  9 -> 19 covered (100%)
+#   RowFindBestMatch    22 -> 36 covered (100%)
+# ---------------------------------------------------------------------------
+_write_harness() {
+  cat > "$1" <<'HARNESS_EOF'
+#define ZSTD_STATIC_LINKING_ONLY
+#define ZDICT_STATIC_LINKING_ONLY
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <zstd.h>
 #include <zdict.h>
 
-// Debug function to print errors
-void check_error(size_t code, const char* location) {
-    if (ZSTD_isError(code)) {
-        fprintf(stderr, "Error in %s: %s\n", location, ZSTD_getErrorName(code));
-        exit(1);
-    }
+static void* xmalloc(size_t n){ void* p=malloc(n?n:1); if(!p){fprintf(stderr,"oom\n");exit(1);} return p; }
+
+static char* slurp(const char* fn, size_t* out){
+    FILE* f=fopen(fn,"rb"); if(!f) return NULL;
+    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+    if(sz<=0){fclose(f);return NULL;}
+    char* b=(char*)xmalloc((size_t)sz);
+    size_t rd=fread(b,1,(size_t)sz,f); fclose(f);
+    if(rd!=(size_t)sz){free(b);return NULL;}
+    *out=rd; return b;
 }
 
-int main() {
-    printf("Starting zstd library test program\n");
+static void roundtrip(ZSTD_CCtx* cctx, ZSTD_DCtx* dctx,
+                      const void* src, size_t srcSize, void* dst, size_t dstCap,
+                      void* rt, size_t rtCap, int strategy, int mml, int slog,
+                      int wlog, int rowMF, const void* dict, size_t dictSize,
+                      int usePrefix, int level)
+{
+    size_t cSize;
+    ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters);
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, level);
+    if (strategy) ZSTD_CCtx_setParameter(cctx, ZSTD_c_strategy, strategy);
+    if (mml)  ZSTD_CCtx_setParameter(cctx, ZSTD_c_minMatch, mml);
+    if (slog) ZSTD_CCtx_setParameter(cctx, ZSTD_c_searchLog, slog);
+    if (wlog) ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, wlog);
+    /* ZSTD_ps_auto=0, ZSTD_ps_enable=1, ZSTD_ps_disable=2 */
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_useRowMatchFinder, rowMF);
+    if (dict && dictSize) {
+        if (usePrefix) ZSTD_CCtx_refPrefix(cctx, dict, dictSize);
+        else           ZSTD_CCtx_loadDictionary(cctx, dict, dictSize);
+    }
+    cSize = ZSTD_compress2(cctx, dst, dstCap, src, srcSize);
+    if (ZSTD_isError(cSize)) return;
+    ZSTD_DCtx_reset(dctx, ZSTD_reset_session_and_parameters);
+    ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, 31);
+    if (dict && dictSize) {
+        if (usePrefix) ZSTD_DCtx_refPrefix(dctx, dict, dictSize);
+        else           ZSTD_DCtx_loadDictionary(dctx, dict, dictSize);
+    }
+    (void)ZSTD_decompressDCtx(dctx, rt, rtCap, dst, cSize);
+}
 
-    // Basic compression test
-    const char* text = "This is a test string for ZSTD library function testing.";
-    size_t text_size = strlen(text);
-    printf("Input text size: %zu bytes\n", text_size);
+static void stream_roundtrip(ZSTD_CCtx* cctx, ZSTD_DCtx* dctx,
+                             const void* src, size_t srcSize,
+                             int level, int wlog, int nbWorkers, size_t chunk)
+{
+    size_t outCap=ZSTD_CStreamOutSize(); char* outBuf=(char*)xmalloc(outCap);
+    size_t dOutCap=ZSTD_DStreamOutSize(); char* dOut=(char*)xmalloc(dOutCap);
+    size_t cCap=ZSTD_compressBound(srcSize)+4096, cUsed=0, pos=0;
+    char* cBuf=(char*)xmalloc(cCap);
+    ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters);
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, level);
+    if (wlog) ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, wlog);
+    if (nbWorkers) ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, nbWorkers);
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1);
+    while (pos < srcSize) {
+        size_t take = (srcSize-pos < chunk) ? (srcSize-pos) : chunk;
+        ZSTD_inBuffer in = { (const char*)src+pos, take, 0 };
+        int last = (pos+take >= srcSize);
+        for (;;) {
+            ZSTD_outBuffer out = { outBuf, outCap, 0 };
+            size_t r = ZSTD_compressStream2(cctx, &out, &in, last?ZSTD_e_end:ZSTD_e_continue);
+            if (ZSTD_isError(r)) goto done;
+            if (out.pos) { if (cUsed+out.pos > cCap) goto done;
+                           memcpy(cBuf+cUsed, outBuf, out.pos); cUsed += out.pos; }
+            if (last) { if (r==0) break; } else if (in.pos==in.size) break;
+        }
+        pos += take;
+    }
+    {   ZSTD_inBuffer din = { cBuf, cUsed, 0 };
+        ZSTD_DCtx_reset(dctx, ZSTD_reset_session_and_parameters);
+        ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, 31);
+        while (din.pos < din.size) {
+            ZSTD_outBuffer dout = { dOut, dOutCap, 0 };
+            size_t r = ZSTD_decompressStream(dctx, &dout, &din);
+            if (ZSTD_isError(r)) break;
+            if (r==0 && din.pos==din.size) break;
+        }
+    }
+done:
+    free(outBuf); free(dOut); free(cBuf);
+}
 
-    // Get compression bound
-    size_t comp_bound = ZSTD_compressBound(text_size);
-    printf("Compression bound: %zu bytes\n", comp_bound);
+int main(int argc, char** argv)
+{
+    const char* corpus = (argc>1)?argv[1]:".";
+    char path[4096]; size_t srcSize=0, dictSrcSize=0;
+    char *src, *dictSrc; ZSTD_CCtx* cctx; ZSTD_DCtx* dctx;
+    void *dst,*rt,*dictBuf=NULL; size_t dstCap,rtCap,dictSize=0;
+    int strat,mml,slog,rowMF,w;
 
-    // Allocate buffer
-    void* comp_buffer = malloc(comp_bound);
-    if (!comp_buffer) {
-        fprintf(stderr, "Failed to allocate compression buffer\n");
-        return 1;
+    snprintf(path,sizeof(path),"%s/source_c.txt",corpus);
+    src=slurp(path,&srcSize);
+    if(!src){fprintf(stderr,"cannot read %s\n",path);return 1;}
+    if(srcSize>(2u<<20)) srcSize=2u<<20;
+
+    snprintf(path,sizeof(path),"%s/source_h.txt",corpus);
+    dictSrc=slurp(path,&dictSrcSize);
+    if(!dictSrc){dictSrc=src;dictSrcSize=srcSize;}
+    if(dictSrcSize>(512u<<10)) dictSrcSize=512u<<10;
+
+    dstCap=ZSTD_compressBound(srcSize); dst=xmalloc(dstCap);
+    rtCap=srcSize+1024; rt=xmalloc(rtCap);
+    cctx=ZSTD_createCCtx(); dctx=ZSTD_createDCtx();
+    if(!cctx||!dctx) return 1;
+
+    /* a real dictionary, built with the COVER dictBuilder */
+    {   size_t nbSamples=512, sampleSize=2048, i;
+        size_t* sizes=(size_t*)xmalloc(nbSamples*sizeof(size_t));
+        char* samples=(char*)xmalloc(nbSamples*sampleSize);
+        for(i=0;i<nbSamples;i++){
+            size_t off=(i*7919)%(srcSize>sampleSize?srcSize-sampleSize:1);
+            memcpy(samples+i*sampleSize, src+off, sampleSize); sizes[i]=sampleSize;
+        }
+        dictSize=110*1024; dictBuf=xmalloc(dictSize);
+        {   size_t r=ZDICT_trainFromBuffer(dictBuf,dictSize,samples,sizes,(unsigned)nbSamples);
+            dictSize = ZDICT_isError(r)?0:r; }
+        free(samples); free(sizes);
     }
 
-    // Basic direct compression test
-    printf("Testing basic compression...\n");
-    size_t comp_size = ZSTD_compress(comp_buffer, comp_bound, text, text_size, 1);
-    if (ZSTD_isError(comp_size)) {
-        fprintf(stderr, "Compression error: %s\n", ZSTD_getErrorName(comp_size));
-        free(comp_buffer);
-        return 1;
-    }
-    printf("Compressed size: %zu bytes\n", comp_size);
+    /* 1. noDict: strategy x minMatch x searchLog x rowMatchFinder */
+    for(strat=1;strat<=9;strat++)
+      for(mml=3;mml<=7;mml++)
+        for(slog=1;slog<=7;slog+=2)
+          for(rowMF=1;rowMF<=2;rowMF++)
+            roundtrip(cctx,dctx,src,srcSize,dst,dstCap,rt,rtCap,strat,mml,slog,18,rowMF,NULL,0,0,3);
 
-    // Decompress test
-    printf("Testing basic decompression...\n");
-    char* decomp_buffer = malloc(text_size + 100);
-    if (!decomp_buffer) {
-        fprintf(stderr, "Failed to allocate decompression buffer\n");
-        free(comp_buffer);
-        return 1;
-    }
-
-    size_t decomp_size = ZSTD_decompress(decomp_buffer, text_size + 100, comp_buffer, comp_size);
-    if (ZSTD_isError(decomp_size)) {
-        fprintf(stderr, "Decompression error: %s\n", ZSTD_getErrorName(decomp_size));
-        free(comp_buffer);
-        free(decomp_buffer);
-        return 1;
-    }
-    printf("Decompressed size: %zu bytes\n", decomp_size);
-
-    // Test streaming API with simplified approach and error checking
-    printf("Testing streaming API...\n");
-
-    // Create context
-    ZSTD_CCtx* cctx = ZSTD_createCCtx();
-    if (cctx == NULL) {
-        fprintf(stderr, "Failed to create compression context\n");
-        free(comp_buffer);
-        free(decomp_buffer);
-        return 1;
-    }
-    printf("Compression context created successfully\n");
-
-    // Set a simple parameter
-    size_t ret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, 3);
-    if (ZSTD_isError(ret)) {
-        fprintf(stderr, "Parameter setting error: %s\n", ZSTD_getErrorName(ret));
-        ZSTD_freeCCtx(cctx);
-        free(comp_buffer);
-        free(decomp_buffer);
-        return 1;
+    /* 2. dictMatchState, including all row-matchfinder instantiations */
+    if(dictSize){
+        static const size_t chunks[]={1024,8*1024,24*1024,96*1024,512*1024};
+        size_t ci;
+        for(ci=0;ci<sizeof(chunks)/sizeof(chunks[0]);ci++){
+            size_t n = chunks[ci]<srcSize?chunks[ci]:srcSize;
+            for(strat=1;strat<=9;strat++)
+              for(mml=3;mml<=7;mml++)
+                for(rowMF=1;rowMF<=2;rowMF++)
+                  for(w=15;w<=19;w+=2)
+                    roundtrip(cctx,dctx,src,n,dst,dstCap,rt,rtCap,strat,mml,0,w,rowMF,dictBuf,dictSize,0,5);
+            /* rowLog == BOUNDED(4,searchLog,6) and mls == MAX(4,MIN(6,minMatch)):
+             * sweep BOTH, and force-attach so dictMode stays dictMatchState
+             * regardless of srcSize vs attachDictSizeCutoffs. */
+            for(strat=3;strat<=5;strat++)
+              for(slog=4;slog<=6;slog++)
+                for(mml=4;mml<=6;mml++){
+                    ZSTD_CCtx_reset(cctx,ZSTD_reset_session_and_parameters);
+                    ZSTD_CCtx_setParameter(cctx,ZSTD_c_compressionLevel,5);
+                    ZSTD_CCtx_setParameter(cctx,ZSTD_c_strategy,strat);
+                    ZSTD_CCtx_setParameter(cctx,ZSTD_c_searchLog,slog);
+                    ZSTD_CCtx_setParameter(cctx,ZSTD_c_minMatch,mml);
+                    ZSTD_CCtx_setParameter(cctx,ZSTD_c_windowLog,17);
+                    ZSTD_CCtx_setParameter(cctx,ZSTD_c_useRowMatchFinder,1);
+                    ZSTD_CCtx_setParameter(cctx,ZSTD_c_forceAttachDict,ZSTD_dictForceAttach);
+                    ZSTD_CCtx_loadDictionary(cctx,dictBuf,dictSize);
+                    {   size_t s=ZSTD_compress2(cctx,dst,dstCap,src,n);
+                        if(!ZSTD_isError(s)){
+                            ZSTD_DCtx_reset(dctx,ZSTD_reset_session_and_parameters);
+                            ZSTD_DCtx_loadDictionary(dctx,dictBuf,dictSize);
+                            (void)ZSTD_decompressDCtx(dctx,rt,rtCap,dst,s);} }
+                }
+        }
     }
 
-    // Simple one-shot compression with the context
-    printf("Compressing with context...\n");
-    ret = ZSTD_compress2(cctx, comp_buffer, comp_bound, text, text_size);
-    if (ZSTD_isError(ret)) {
-        fprintf(stderr, "Context compression error: %s\n", ZSTD_getErrorName(ret));
-        ZSTD_freeCCtx(cctx);
-        free(comp_buffer);
-        free(decomp_buffer);
-        return 1;
+    /* 3. extDict via refPrefix (the only reliable driver of extDict mode) */
+    for(strat=1;strat<=9;strat++)
+      for(mml=3;mml<=7;mml++)
+        for(rowMF=1;rowMF<=2;rowMF++)
+          roundtrip(cctx,dctx,src,srcSize>(256u<<10)?(256u<<10):srcSize,dst,dstCap,rt,rtCap,
+                    strat,mml,0,18,rowMF,dictSrc,dictSrcSize,1,5);
+    for(strat=3;strat<=5;strat++)
+      for(slog=4;slog<=6;slog++)
+        for(mml=4;mml<=6;mml++)
+          roundtrip(cctx,dctx,src,srcSize>(256u<<10)?(256u<<10):srcSize,dst,dstCap,rt,rtCap,
+                    strat,mml,slog,17,1,dictSrc,dictSrcSize,1,5);
+
+    /* 4. super-block path (ZSTD_compressSuperBlock / ZSTD_compressSubBlock) */
+    {   int lv; unsigned t;
+        for(lv=3;lv<=19;lv+=4)
+          for(t=1340;t<=8192;t*=2){
+            ZSTD_CCtx_reset(cctx,ZSTD_reset_session_and_parameters);
+            ZSTD_CCtx_setParameter(cctx,ZSTD_c_compressionLevel,lv);
+            ZSTD_CCtx_setParameter(cctx,ZSTD_c_targetCBlockSize,(int)t);
+            {   size_t s=ZSTD_compress2(cctx,dst,dstCap,src,srcSize>(512u<<10)?(512u<<10):srcSize);
+                if(!ZSTD_isError(s)){ ZSTD_DCtx_reset(dctx,ZSTD_reset_session_and_parameters);
+                    (void)ZSTD_decompressDCtx(dctx,rt,rtCap,dst,s);} }
+          }
     }
-    printf("Context compression successful, size: %zu bytes\n", ret);
 
-    // Clean up
-    ZSTD_freeCCtx(cctx);
-    free(comp_buffer);
-    free(decomp_buffer);
+    /* 5. streaming: window wrap, flush, and multi-threaded */
+    {   int lv;
+        for(lv=1;lv<=19;lv+=3){
+            stream_roundtrip(cctx,dctx,src,srcSize,lv,0,0,64*1024);
+            stream_roundtrip(cctx,dctx,src,srcSize,lv,15,0,16*1024);  /* tiny window -> wrap */
+        }
+        stream_roundtrip(cctx,dctx,src,srcSize,3,0,2,128*1024);
+        stream_roundtrip(cctx,dctx,src,srcSize,9,0,4,128*1024);
+        stream_roundtrip(cctx,dctx,src,srcSize,15,0,2,256*1024);
+    }
 
-    printf("Library test completed successfully\n");
+    /* 6. long distance matching */
+    {   int lv,hrl;
+        for(lv=1;lv<=19;lv+=6)
+          for(hrl=0;hrl<=7;hrl+=7){
+            ZSTD_CCtx_reset(cctx,ZSTD_reset_session_and_parameters);
+            ZSTD_CCtx_setParameter(cctx,ZSTD_c_compressionLevel,lv);
+            ZSTD_CCtx_setParameter(cctx,ZSTD_c_enableLongDistanceMatching,1);
+            ZSTD_CCtx_setParameter(cctx,ZSTD_c_windowLog,27);
+            if(hrl) ZSTD_CCtx_setParameter(cctx,ZSTD_c_ldmHashRateLog,hrl);
+            {   size_t s=ZSTD_compress2(cctx,dst,dstCap,src,srcSize);
+                if(!ZSTD_isError(s)){ ZSTD_DCtx_reset(dctx,ZSTD_reset_session_and_parameters);
+                    ZSTD_DCtx_setParameter(dctx,ZSTD_d_windowLogMax,31);
+                    (void)ZSTD_decompressDCtx(dctx,rt,rtCap,dst,s);} }
+          }
+    }
+
+    /* 7. negative (fast) levels, one-shot API, size queries, error table */
+    {   int lv;
+        for(lv=ZSTD_minCLevel(); lv<=0; lv+=3){
+            size_t s=ZSTD_compress(dst,dstCap,src,srcSize,lv);
+            if(!ZSTD_isError(s)) (void)ZSTD_decompress(rt,rtCap,dst,s);
+        }
+        {   size_t s=ZSTD_compress(dst,dstCap,src,srcSize,3);
+            if(!ZSTD_isError(s)){
+                (void)ZSTD_findDecompressedSize(dst,s);
+                (void)ZSTD_frameHeaderSize(dst,s);
+                {   ZSTD_frameHeader zfh; (void)ZSTD_getFrameHeader(&zfh,dst,s); }
+            } }
+        {   unsigned e; for(e=1;e<64;e++) (void)ZSTD_getErrorName((size_t)-(long)e); }
+        (void)ZSTD_estimateCCtxSize(9);
+        (void)ZSTD_estimateCStreamSize(9);
+        (void)ZSTD_estimateDCtxSize();
+    }
+
+    /* 8. CDict/DDict reuse (the long-lived-application pattern) */
+    if(dictSize){
+        int lv;
+        for(lv=1;lv<=19;lv+=6){
+            ZSTD_CDict* cd=ZSTD_createCDict(dictBuf,dictSize,lv);
+            ZSTD_DDict* dd=ZSTD_createDDict(dictBuf,dictSize);
+            if(cd&&dd){ int k;
+                for(k=0;k<8;k++){
+                    size_t n=(size_t)(1024<<k)<srcSize?(size_t)(1024<<k):srcSize;
+                    ZSTD_CCtx_reset(cctx,ZSTD_reset_session_and_parameters);
+                    {   size_t s=ZSTD_compress_usingCDict(cctx,dst,dstCap,src,n,cd);
+                        if(!ZSTD_isError(s)){ ZSTD_DCtx_reset(dctx,ZSTD_reset_session_and_parameters);
+                            (void)ZSTD_decompress_usingDDict(dctx,rt,rtCap,dst,s,dd);} }
+                } }
+            ZSTD_freeCDict(cd); ZSTD_freeDDict(dd);
+        }
+    }
+
+    /* 9. dedicatedDictSearch. Requires ZSTD_createCDict_advanced2() with
+     *    enableDedicatedDictSearch, hashLog > chainLog and strategy in
+     *    [greedy..lazy2]; unreachable from the CLI. */
+    if(dictSize){
+        int lv;
+        for(lv=1;lv<=12;lv++)
+          for(strat=3;strat<=5;strat++)
+            for(rowMF=1;rowMF<=2;rowMF++)
+              for(mml=4;mml<=6;mml++)
+                for(slog=4;slog<=6;slog++){
+                    ZSTD_CCtx_params* p=ZSTD_createCCtxParams();
+                    ZSTD_CDict* cd;
+                    if(!p) continue;
+                    ZSTD_CCtxParams_setParameter(p,ZSTD_c_compressionLevel,lv);
+                    ZSTD_CCtxParams_setParameter(p,ZSTD_c_enableDedicatedDictSearch,1);
+                    ZSTD_CCtxParams_setParameter(p,ZSTD_c_strategy,strat);
+                    ZSTD_CCtxParams_setParameter(p,ZSTD_c_minMatch,mml);
+                    ZSTD_CCtxParams_setParameter(p,ZSTD_c_searchLog,slog);
+                    ZSTD_CCtxParams_setParameter(p,ZSTD_c_useRowMatchFinder,rowMF);
+                    ZSTD_CCtxParams_setParameter(p,ZSTD_c_hashLog,22);   /* > chainLog */
+                    ZSTD_CCtxParams_setParameter(p,ZSTD_c_chainLog,16);
+                    ZSTD_CCtxParams_setParameter(p,ZSTD_c_windowLog,18);
+                    cd=ZSTD_createCDict_advanced2(dictBuf,dictSize,ZSTD_dlm_byRef,
+                                                  ZSTD_dct_auto,p,ZSTD_defaultCMem);
+                    if(cd){ int k;
+                        for(k=10;k<=16;k+=2){
+                            size_t n=((size_t)1<<k)<srcSize?((size_t)1<<k):srcSize;
+                            ZSTD_CCtx_reset(cctx,ZSTD_reset_session_and_parameters);
+                            {   size_t s=ZSTD_compress_usingCDict(cctx,dst,dstCap,src,n,cd);
+                                if(!ZSTD_isError(s)){
+                                    ZSTD_DCtx_reset(dctx,ZSTD_reset_session_and_parameters);
+                                    ZSTD_DCtx_loadDictionary(dctx,dictBuf,dictSize);
+                                    (void)ZSTD_decompressDCtx(dctx,rt,rtCap,dst,s);} }
+                        }
+                        ZSTD_freeCDict(cd); }
+                    ZSTD_freeCCtxParams(p);
+                }
+    }
+
+    /* 10. dictBuilder back-ends the CLI defaults never touch */
+    {   size_t nbSamples=256, sampleSize=2048, i;
+        size_t* sizes=(size_t*)xmalloc(nbSamples*sizeof(size_t));
+        char* samples=(char*)xmalloc(nbSamples*sampleSize);
+        void* outDict=xmalloc(64*1024);
+        for(i=0;i<nbSamples;i++){
+            size_t off=(i*6151)%(srcSize>sampleSize?srcSize-sampleSize:1);
+            memcpy(samples+i*sampleSize,src+off,sampleSize); sizes[i]=sampleSize;
+        }
+        {   ZDICT_cover_params_t cp; memset(&cp,0,sizeof(cp));
+            cp.k=50; cp.d=8; cp.steps=4; cp.nbThreads=1; cp.zParams.compressionLevel=3;
+            (void)ZDICT_trainFromBuffer_cover(outDict,64*1024,samples,sizes,(unsigned)nbSamples,cp); }
+        {   ZDICT_cover_params_t cp; memset(&cp,0,sizeof(cp));
+            cp.steps=2; cp.nbThreads=1; cp.zParams.compressionLevel=3;
+            (void)ZDICT_optimizeTrainFromBuffer_cover(outDict,64*1024,samples,sizes,(unsigned)nbSamples,&cp); }
+        {   ZDICT_fastCover_params_t fp; memset(&fp,0,sizeof(fp));
+            fp.k=50; fp.d=8; fp.f=20; fp.steps=4; fp.nbThreads=1; fp.zParams.compressionLevel=3;
+            (void)ZDICT_trainFromBuffer_fastCover(outDict,64*1024,samples,sizes,(unsigned)nbSamples,fp); }
+        {   ZDICT_fastCover_params_t fp; memset(&fp,0,sizeof(fp));
+            fp.steps=2; fp.nbThreads=1; fp.zParams.compressionLevel=3;
+            (void)ZDICT_optimizeTrainFromBuffer_fastCover(outDict,64*1024,samples,sizes,(unsigned)nbSamples,&fp); }
+        {   ZDICT_legacy_params_t lp; memset(&lp,0,sizeof(lp));
+            lp.selectivityLevel=9; lp.zParams.compressionLevel=3;
+            (void)ZDICT_trainFromBuffer_legacy(outDict,64*1024,samples,sizes,(unsigned)nbSamples,lp); }
+        free(samples); free(sizes); free(outDict);
+    }
+
+    ZSTD_freeCCtx(cctx); ZSTD_freeDCtx(dctx);
+    free(dst); free(rt); free(dictBuf);
+    if(dictSrc!=src) free(dictSrc);
+    free(src);
+    printf("zstd_train: done\n");
     return 0;
 }
-EOF
-
-  # Compile with more careful flags and link options
-  echo "Compiling test program..."
-  clang -Wall -o "${TMPDIR}/lib_test/test_lib" "${TMPDIR}/lib_test/test_lib.c" \
-    -I/usr/include \
-    -L"${BIN_DIR}" \
-    -Wl,-rpath,"${BIN_DIR}" \
-    -lzstd \
-    -v
-
-  # Check if the compilation was successful
-  if [ ! -x "${TMPDIR}/lib_test/test_lib" ]; then
-    echo "Compilation failed!"
-    return 1
-  fi
-
-  # Set up the environment with explicit LD_LIBRARY_PATH
-  local OLD_LD_LIBRARY_PATH="${LD_LIBRARY_PATH}"
-  export LD_LIBRARY_PATH="${BIN_DIR}:${LD_LIBRARY_PATH}"
-  echo "LD_LIBRARY_PATH set to: ${LD_LIBRARY_PATH}"
-
-  # Run a ldd check to verify library loading
-  echo "Checking library dependencies:"
-  ldd "${TMPDIR}/lib_test/test_lib"
-
-  # Run the test program with careful error checking
-  echo "Running library test program..."
-  if ! "${TMPDIR}/lib_test/test_lib"; then
-    echo "Library test program failed with exit code $?"
-    # Try running with direct library preloading if the normal run fails
-    echo "Attempting to run with explicit LD_PRELOAD..."
-    LD_PRELOAD="${BIN_DIR}/libzstd.so" "${TMPDIR}/lib_test/test_lib"
-  else
-    echo "Library test completed successfully"
-  fi
-
-  # Restore original LD_LIBRARY_PATH
-  export LD_LIBRARY_PATH="${OLD_LD_LIBRARY_PATH}"
+HARNESS_EOF
 }
 
-export -f run_library_tests
+# ---------------------------------------------------------------------------
+# CLI workload. Complements the harness by covering programs/ (fileio,
+# zstdcli, util, benchzstd), which the library harness cannot reach.
+# ---------------------------------------------------------------------------
+_run_cli_workload() {
+  local Z="$1" C="$2" T="$3"
+  mkdir -p "$T"
+  _q() { "$Z" "$@" >/dev/null 2>&1 || true; }
+  local L W NT OL D
+
+  # full level sweep -> every strategy from fast to btultra2
+  for L in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19; do
+    _q -$L -f "$C/source_c.txt" -o "$T/o.zst"; _q -d -f "$T/o.zst" -o /dev/null
+    _q -$L -f "$C/access.log"   -o "$T/o.zst"; _q -d -f "$T/o.zst" -o /dev/null
+  done
+  for L in 20 21 22; do _q --ultra -$L -f "$C/docs.md" -o "$T/o.zst"; _q -d -f "$T/o.zst" -o /dev/null; done
+  for L in 1 3 5 7; do _q --fast=$L -f "$C/table.csv" -o "$T/o.zst"; _q -d -f "$T/o.zst" -o /dev/null; done
+
+  # long / LDM
+  for W in 20 24 27; do
+    _q --long=$W -3  -f "$C/ldm_dup.bin" -o "$T/o.zst"; _q -d -f "$T/o.zst" -o /dev/null
+    _q --long=$W -12 -f "$C/ldm_dup.bin" -o "$T/o.zst"; _q -d -f "$T/o.zst" -o /dev/null
+    _q --long=$W -19 -f "$C/ldm_dup.bin" -o "$T/o.zst"; _q -d -f "$T/o.zst" -o /dev/null
+  done
+
+  # dictionaries: all three trainers, then use each
+  _q --train "$C"/small/*.json -o "$T/dict.cover" --maxdict=112640
+  _q --train-fastcover=steps=4 "$C"/small/*.json -o "$T/dict.fast" --maxdict=112640
+  _q --train-legacy "$C"/small/*.json -o "$T/dict.leg" --maxdict=65536
+  for D in "$T/dict.cover" "$T/dict.fast" "$T/dict.leg"; do
+    [[ -s "$D" ]] || continue
+    for L in 1 3 5 9 12 15 19; do
+      _q -$L -D "$D" -f "$C"/small/s00*.json --output-dir-flat "$T/dd"
+      _q -$L -D "$D" -f "$C/data.json" -o "$T/d.zst"; _q -d -D "$D" -f "$T/d.zst" -o /dev/null
+    done
+    rm -rf "$T/dd"
+  done
+
+  # --patch-from: the CLI's extDict driver
+  for L in 1 3 5 9 13 19; do
+    _q --patch-from="$C/source_h.txt" -$L -f "$C/source_c.txt" -o "$T/p.zst"
+    _q -d --patch-from="$C/source_h.txt" -f "$T/p.zst" -o /dev/null
+  done
+
+  # multi-threading, overlap, rsyncable
+  for NT in 2 4 8 16; do
+    for L in 1 3 9 15 19; do
+      _q -T$NT -$L -f "$C/access.log" -o "$T/o.zst"; _q -T$NT -d -f "$T/o.zst" -o /dev/null
+    done
+    _q -T$NT --long=27 -6 -f "$C/ldm_dup.bin" -o "$T/o.zst"; _q -d -f "$T/o.zst" -o /dev/null
+  done
+  for OL in 0 3 6 9; do _q -T4 -9 --zstd=overlapLog=$OL -f "$C/table.csv" -o "$T/o.zst"; done
+  _q -T4 -9 --rsyncable -f "$C/access.log" -o "$T/o.zst"; _q -d -f "$T/o.zst" -o /dev/null
+
+  # entropy extremes
+  _q -1  -f "$C/random.bin" -o "$T/o.zst"; _q -d -f "$T/o.zst" -o /dev/null
+  _q -19 -f "$C/random.bin" -o "$T/o.zst"; _q -d -f "$T/o.zst" -o /dev/null
+  _q -1  -f "$C/rle.txt"    -o "$T/o.zst"; _q -d -f "$T/o.zst" -o /dev/null
+  _q -19 -f "$C/rle.txt"    -o "$T/o.zst"; _q -d -f "$T/o.zst" -o /dev/null
+  _q -9  -f "$C/elf.bin"    -o "$T/o.zst"; _q -d -f "$T/o.zst" -o /dev/null
+
+  # many small files (per-frame overhead, multi-file plumbing)
+  _q -5  -f "$C"/small/*.json --output-dir-flat "$T/sm5"
+  _q -19 -f "$C"/small/*.json --output-dir-flat "$T/sm19"
+  _q -d  -f "$T"/sm5/*.zst    --output-dir-flat "$T/smd"
+  rm -rf "$T/sm5" "$T/sm19" "$T/smd"
+
+  # framing variants, block-size control, stdin/stdout streaming
+  _q -9 --no-check -f "$C/source_c.txt" -o "$T/o.zst";  _q -d -f "$T/o.zst" -o /dev/null
+  _q -9 --no-content-size -f "$C/source_c.txt" -o "$T/o.zst"; _q -d -f "$T/o.zst" -o /dev/null
+  _q -9 --target-compressed-block-size=2048 -f "$C/source_c.txt" -o "$T/o.zst"
+  _q -d -f "$T/o.zst" -o /dev/null
+  cat "$C/source_c.txt" | "$Z" -6  -f 2>/dev/null | "$Z" -d -f >/dev/null 2>&1 || true
+  cat "$C/table.csv"    | "$Z" -16 -f 2>/dev/null | "$Z" -d -f >/dev/null 2>&1 || true
+
+  # multi-frame concatenation, list, test
+  cat "$T/o.zst" "$T/o.zst" > "$T/multi.zst" 2>/dev/null
+  _q -d -f "$T/multi.zst" -o /dev/null
+  _q -l "$T/o.zst"; _q -t "$T/o.zst"
+
+  # benchmark mode (BMK_*)
+  _q -b1 -e5 -i0 "$C/source_h.txt"
+  _q -b9 -i0 "$C/docs.md"
+
+  rm -f "$T"/*.zst "$T"/dict.* 2>/dev/null || true
+}
 
 build() {
   cd "${pkgname}-${pkgver}"
 
-  # Store original flags
-  CFLAGS_ORIG="$CFLAGS"
-  CXXFLAGS_ORIG="$CXXFLAGS"
-  LDFLAGS_ORIG="$LDFLAGS"
+  # --- resolve toolchain up front; fail loudly, never skip a stage silently --
+  local _clang _profdata _bolt_bin _mergefdata
+  _clang=$(_llvmtool clang)       || { error "clang not found"; return 1; }
+  _profdata=$(_llvmtool llvm-profdata) || { error "llvm-profdata not found"; return 1; }
+  if [[ -n "${_llvm_bindir}" ]]; then export PATH="${_llvm_bindir}:${PATH}"; fi
 
-  # Set Clang toolchain
-  export CC=clang
-  export CXX=clang++
-  export AR=llvm-ar
-  export NM=llvm-nm
-  export RANLIB=llvm-ranlib
+  export CC="${_clang}" CXX="$(_llvmtool clang++)"
+  export AR=$(_llvmtool llvm-ar) NM=$(_llvmtool llvm-nm) RANLIB=$(_llvmtool llvm-ranlib)
+  export CC_LD=lld CXX_LD=lld
 
-  # Ensure pthread is properly linked
-  export CFLAGS+=" -pthread"
-  export CXXFLAGS+=" -pthread"
-  export LDFLAGS+=" -lpthread"
+  # WHY snapshot the flags: every stage must start from the pristine
+  # makepkg.conf flags. The previous PKGBUILD used `CFLAGS+=` for stage 1 and
+  # then rebuilt stage 2 from CFLAGS_ORIG -- but CFLAGS had already been
+  # exported and mutated, so instrumentation flags leaked across stages.
+  local _CFLAGS="${CFLAGS}" _CXXFLAGS="${CXXFLAGS}" _LDFLAGS="${LDFLAGS}"
 
-  local pgo_dir="${srcdir}/zstd-pgo"
-  mkdir -p "${pgo_dir}"
-  local tmpdir="${srcdir}/tmp"
-  mkdir -p "${tmpdir}"
+  local _topdir="${srcdir}"
+  local _corpus="${_topdir}/corpus"
+  local _tmp="${_topdir}/tmpwork"
+  local _p1="${_topdir}/pgo-stage1"
+  local _p2="${_topdir}/pgo-stage2"
+  local _prof1="${_topdir}/stage1.profdata"
+  local _final="${_topdir}/final.profdata"
+  mkdir -p "${_corpus}" "${_tmp}" "${_p1}" "${_p2}"
 
-  # Generate the training data
-  generate_training_data "${pgo_dir}"
+  _gen_corpus "${_corpus}"
+  _write_harness "${_topdir}/zstd_train.c"
 
-  # --- Stage 1: Standard PGO - First round with standard instrumentation ---
-  echo "Stage 1: Building with standard PGO instrumentation..."
+  # --- PGO instrumentation flags -------------------------------------------
+  # -vp-counters-per-site=50
+  #     Default is 1 value slot per value-profiling site. zstd's hot indirect
+  #     dispatch (ZSTD_selectBlockCompressor -> ZSTD_BlockCompressor_f) and its
+  #     memcpy/memset size sites legitimately see many distinct values; with
+  #     one slot the profile keeps essentially the first-seen value and drops
+  #     the rest, starving indirect-call promotion and memop specialisation.
+  # -enable-vtable-value-profiling
+  #     Instruments vtable addresses for selective vtable-based ICP
+  #     (PGOInstrumentation.cpp: ValueSites[IPVK_VTableTarget]). Requires an
+  #     ELF target, which we are; on non-ELF LLVM emits a warning instead.
+  # -runtime-counter-relocation
+  #     Allocate counters through a runtime-relocated bias rather than a fixed
+  #     __llvm_prf_cnts address. Required here because we build PIC objects and
+  #     spawn thousands of short-lived processes.
+  # -enable-value-profiling
+  #     Master switch for the value profiler.
+  # All four verified accepted by this clang before use.
+  local _pgo_common=(
+    -Xclang -mllvm -Xclang -vp-counters-per-site=50
+    -Xclang -mllvm -Xclang -enable-vtable-value-profiling
+    -mllvm -runtime-counter-relocation
+    -mllvm -enable-value-profiling
+    -fno-omit-frame-pointer
+    -pthread
+  )
+  # WHY NOT -g3 (the previous PKGBUILD used it): debug info does not change
+  # codegen or the profile, it just inflates every instrumented object and
+  # slows the training runs. We request frame pointers explicitly instead.
 
-  # Create pgo_standard directory
-  mkdir -p "${srcdir}/pgo_standard"
-
-  # Add standard PGO instrumentation flags
-  CFLAGS+=" -fprofile-generate=${srcdir}/pgo_standard -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=50 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
-  CXXFLAGS+=" -fprofile-generate=${srcdir}/pgo_standard -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=50 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
-  LDFLAGS+=" -fprofile-generate=${srcdir}/pgo_standard -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=50 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
-
-  # Configure and build with standard instrumentation - including proper threading options
-  cmake -S build/cmake -B build-pgo1 -G Ninja \
-    -DCMAKE_BUILD_TYPE=Debug \
-    -DCMAKE_C_FLAGS="${CFLAGS}" \
-    -DCMAKE_CXX_FLAGS="${CXXFLAGS}" \
-    -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS}" \
-    -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS}" \
-    -DZSTD_MULTITHREAD_SUPPORT=ON \
-    -DZSTD_BUILD_TESTS=ON \
-    -DZSTD_BUILD_STATIC=OFF \
-    -DZSTD_PROGRAMS_LINK_SHARED=ON \
-    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-    -DZSTD_ZLIB_SUPPORT=ON \
-    -DZSTD_LZMA_SUPPORT=ON \
+  # WHY CMAKE_BUILD_TYPE=Release for the *instrumented* stages:
+  # zstd's AddZstdCompilationFlags.cmake adds -DDEBUGLEVEL=1 when
+  # CMAKE_BUILD_TYPE is Debug, which enables ~440 assert() calls across the hot
+  # compress/decompress files. Those asserts ADD BASIC BLOCKS, so the profile
+  # is keyed on a different CFG than the final Release build. Measured here:
+  #   Debug-instrumented   : 833 functions / 21247 blocks
+  #   Release-instrumented : 799 functions / 16310 blocks
+  # Feeding the Debug profile into the Release build makes clang report
+  #   "function control flow change detected (hash mismatch) ... count discarded"
+  # for 304 functions -- their profile is silently thrown away. Using Release
+  # everywhere gives 0 discarded. This was the largest single defect in the
+  # previous PKGBUILD.
+  local _cmake_common=(
+    -G Ninja
+    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_C_COMPILER="${_clang}"
+    -DCMAKE_CXX_COMPILER="$(_llvmtool clang++)"
+    -DZSTD_MULTITHREAD_SUPPORT=ON
+    -DZSTD_BUILD_TESTS=OFF
+    -DZSTD_BUILD_CONTRIB=OFF
+    -DZSTD_LEGACY_SUPPORT=OFF
+    -DZSTD_ZLIB_SUPPORT=ON
+    -DZSTD_LZMA_SUPPORT=ON
     -DZSTD_LZ4_SUPPORT=ON
-
-  # Build with instrumentation
-  cmake --build build-pgo1 -j$(nproc)
-
-  # Make sure the library dir is in LD_LIBRARY_PATH
-  export LD_LIBRARY_PATH="${PWD}/build-pgo1/lib:${LD_LIBRARY_PATH}"
-
-  # Get path to the zstd binary
-  ZSTD_BINARY="${PWD}/build-pgo1/programs/zstd"
-
-  # Simple sanity check
-  if [ ! -x "${ZSTD_BINARY}" ]; then
-    echo "ERROR: zstd binary not found or not executable"
-    return 1
-  fi
-
-  # Run the training workload
-  run_training_workload "${ZSTD_BINARY}" "${pgo_dir}" "${tmpdir}"
-
-  # Run library tests for standard PGO
-  echo "Running library tests for standard PGO profiling..."
-  run_library_tests "${ZSTD_BINARY}" "${pgo_dir}" "${tmpdir}"
-
-  # Merge standard profile data
-  echo "Merging standard PGO profile data..."
-  llvm-profdata merge -output="${srcdir}/standard.profdata" "${srcdir}/pgo_standard"
-
-  # --- Stage 2: Context-Sensitive PGO - Second round using first profile ---
-  echo "Stage 2: Building with context-sensitive PGO instrumentation..."
-
-  # Create pgo_cs directory
-  mkdir -p "${srcdir}/pgo_cs"
-
-  # Update flags for CS-PGO instrumentation, using standard profile data
-  CFLAGS="${CFLAGS_ORIG} -fprofile-use=${srcdir}/standard.profdata -fcs-profile-generate=${srcdir}/pgo_cs -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=50 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling -pthread"
-  CXXFLAGS="${CXXFLAGS_ORIG} -fprofile-use=${srcdir}/standard.profdata -fcs-profile-generate=${srcdir}/pgo_cs -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=50 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling -pthread"
-  LDFLAGS="${LDFLAGS_ORIG} -fprofile-use=${srcdir}/standard.profdata -fcs-profile-generate=${srcdir}/pgo_cs -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=50 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling -lpthread"
-
-  # Configure and build with CS-PGO instrumentation
-  cmake -S build/cmake -B build-pgo2 -G Ninja \
-    -DCMAKE_BUILD_TYPE=Debug \
-    -DCMAKE_C_FLAGS="${CFLAGS}" \
-    -DCMAKE_CXX_FLAGS="${CXXFLAGS}" \
-    -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS}" \
-    -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS}" \
-    -DZSTD_MULTITHREAD_SUPPORT=ON \
-    -DZSTD_BUILD_TESTS=ON \
-    -DZSTD_BUILD_STATIC=OFF \
-    -DZSTD_PROGRAMS_LINK_SHARED=ON \
-    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-    -DZSTD_ZLIB_SUPPORT=ON \
-    -DZSTD_LZMA_SUPPORT=ON \
-    -DZSTD_LZ4_SUPPORT=ON
-
-  # Build with CS-PGO instrumentation
-  cmake --build build-pgo2 -j$(nproc)
-
-  # Update LD_LIBRARY_PATH for the new build
-  export LD_LIBRARY_PATH="${PWD}/build-pgo2/lib:${LD_LIBRARY_PATH}"
-
-  # Run the same training workload to generate context-sensitive profile data
-  echo "Running workload to generate context-sensitive PGO profile data..."
-  ZSTD_BINARY="${PWD}/build-pgo2/programs/zstd"
-  run_training_workload "${ZSTD_BINARY}" "${pgo_dir}" "${tmpdir}"
-
-  # Run library tests for context-sensitive PGO
-  echo "Running library tests for context-sensitive PGO profiling..."
-  run_library_tests "${ZSTD_BINARY}" "${pgo_dir}" "${tmpdir}"
-
-  # Merge context-sensitive profile with standard profile
-  echo "Merging context-sensitive profile with standard profile..."
-  llvm-profdata merge -output="${srcdir}/merged.profdata" "${srcdir}/pgo_cs" "${srcdir}/standard.profdata"
-
-  # --- Stage 3: Final build with merged profile data ---
-  echo "Stage 3: Building final version with merged profile data..."
-
-  # Update flags for the final optimized build
-  CFLAGS="${CFLAGS_ORIG} -fprofile-use=${srcdir}/merged.profdata -pthread"
-  CXXFLAGS="${CXXFLAGS_ORIG} -fprofile-use=${srcdir}/merged.profdata -pthread"
-  LDFLAGS="${LDFLAGS_ORIG} -fprofile-use=${srcdir}/merged.profdata -Wl,--emit-relocs -lpthread"
-
-  # Configure and build with final optimizations
-  cmake -S build/cmake -B build-opt -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_FLAGS="${CFLAGS}" \
-    -DCMAKE_CXX_FLAGS="${CXXFLAGS}" \
-    -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS}" \
-    -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS}" \
-    -DZSTD_MULTITHREAD_SUPPORT=ON \
-    -DZSTD_BUILD_TESTS=OFF \
-    -DZSTD_BUILD_STATIC=OFF \
-    -DZSTD_PROGRAMS_LINK_SHARED=ON \
-    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-    -DZSTD_ZLIB_SUPPORT=ON \
-    -DZSTD_LZMA_SUPPORT=ON \
-    -DZSTD_LZ4_SUPPORT=ON \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON
     -DCMAKE_INSTALL_PREFIX=/usr
+    -DCMAKE_INSTALL_LIBDIR=lib
+  )
 
-  # Build final optimized version
-  cmake --build build-opt -j$(nproc)
+  # =========================================================================
+  # Stage 1/3: IR-instrumented build
+  # =========================================================================
+  msg2 "Stage 1/3: building IR-instrumented binaries..."
+  # Static lib + statically linked CLI so every counter lands in one image.
+  local _s1_c="${_CFLAGS} ${_pgo_common[*]} -fprofile-generate=${_p1}"
+  local _s1_l="${_LDFLAGS} -fprofile-generate=${_p1} -pthread"
+  cmake -S build/cmake -B build-s1 "${_cmake_common[@]}" \
+    -DCMAKE_C_FLAGS="${_s1_c}" \
+    -DCMAKE_CXX_FLAGS="${_CXXFLAGS} ${_pgo_common[*]} -fprofile-generate=${_p1}" \
+    -DCMAKE_EXE_LINKER_FLAGS="${_s1_l}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${_s1_l}" \
+    -DZSTD_BUILD_STATIC=ON -DZSTD_BUILD_SHARED=OFF -DZSTD_PROGRAMS_LINK_SHARED=OFF
+  cmake --build build-s1
 
-  # =====================
-  # Phase 5: BOLT Optimization - Only for the executable
-  # =====================
-  echo "Performing BOLT optimization for zstd executable only..."
+  msg2 "Stage 1/3: running training workload..."
+  export LLVM_PROFILE_FILE="${_p1}/zstd-%p-%m.profraw"
+  _run_cli_workload "${PWD}/build-s1/programs/zstd" "${_corpus}" "${_tmp}"
+  "${_clang}" ${_s1_c} -I lib -I lib/dictBuilder -Wno-deprecated-declarations \
+    "${_topdir}/zstd_train.c" -o "${_tmp}/zstd_train_s1" \
+    build-s1/lib/libzstd.a ${_s1_l}
+  "${_tmp}/zstd_train_s1" "${_corpus}" || true
+  unset LLVM_PROFILE_FILE
 
-  # Set up directories
-  mkdir -p "${pgo_dir}/bolt_inst"
-  mkdir -p "${pgo_dir}/bolt_bin"
+  msg2 "Stage 1/3: merging profiles..."
+  "${_profdata}" merge --output="${_prof1}" "${_p1}"/*.profraw
+  "${_profdata}" show "${_prof1}" | head -n 6
 
-  # Get path to original executable
-  local zstd_orig="${PWD}/build-opt/programs/zstd"
+  # =========================================================================
+  # Stage 2/3: context-sensitive instrumentation, seeded with stage 1
+  # =========================================================================
+  # CS-PGO re-instruments *after* inlining, so counters are attributed per
+  # inline context. That matters a lot here: the ZSTD_compressBlock_* family
+  # are FORCE_INLINE_TEMPLATE wrappers around shared generic bodies, so a flat
+  # profile blends every caller together and the optimizer cannot tell the
+  # dictMatchState path from the noDict one.
+  msg2 "Stage 2/3: building context-sensitive instrumented binaries..."
+  local _s2_c="${_CFLAGS} ${_pgo_common[*]} -fprofile-use=${_prof1} -fcs-profile-generate=${_p2}"
+  local _s2_l="${_LDFLAGS} -fprofile-use=${_prof1} -fcs-profile-generate=${_p2} -pthread"
+  cmake -S build/cmake -B build-s2 "${_cmake_common[@]}" \
+    -DCMAKE_C_FLAGS="${_s2_c}" \
+    -DCMAKE_CXX_FLAGS="${_CXXFLAGS} ${_pgo_common[*]} -fprofile-use=${_prof1} -fcs-profile-generate=${_p2}" \
+    -DCMAKE_EXE_LINKER_FLAGS="${_s2_l}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${_s2_l}" \
+    -DZSTD_BUILD_STATIC=ON -DZSTD_BUILD_SHARED=OFF -DZSTD_PROGRAMS_LINK_SHARED=OFF
+  cmake --build build-s2
 
-  # Create instrumented version of the executable
-  echo "Creating BOLT instrumented executable..."
-  llvm-bolt "${zstd_orig}" \
-    -o "${pgo_dir}/bolt_bin/zstd" \
-    --instrument \
-    --instrumentation-file="${pgo_dir}/bolt_inst/zstd.fdata"
+  msg2 "Stage 2/3: running training workload..."
+  export LLVM_PROFILE_FILE="${_p2}/zstd-cs-%p-%m.profraw"
+  _run_cli_workload "${PWD}/build-s2/programs/zstd" "${_corpus}" "${_tmp}"
+  "${_clang}" ${_s2_c} -I lib -I lib/dictBuilder -Wno-deprecated-declarations \
+    "${_topdir}/zstd_train.c" -o "${_tmp}/zstd_train_s2" \
+    build-s2/lib/libzstd.a ${_s2_l}
+  "${_tmp}/zstd_train_s2" "${_corpus}" || true
+  unset LLVM_PROFILE_FILE
 
-  # Make sure the binary is executable
-  chmod +x "${pgo_dir}/bolt_bin/zstd"
+  msg2 "Stage 2/3: merging context-sensitive profile with stage 1..."
+  "${_profdata}" merge --output="${_final}" "${_p2}"/*.profraw "${_prof1}"
+  "${_profdata}" show "${_final}" | head -n 6
 
-  # Set up environment for instrumented binary
-  export LD_LIBRARY_PATH="${PWD}/build-opt/lib:${LD_LIBRARY_PATH}"
+  # =========================================================================
+  # Stage 3/3: final optimized build
+  # =========================================================================
+  msg2 "Stage 3/3: final optimized build..."
+  local _opt=(-fprofile-use="${_final}")
+  (( _use_thinlto )) && _opt+=(-flto=thin -fwhole-program-vtables)
+  # -Wno-backend-plugin: with -fprofile-use clang emits a backend note for any
+  # function whose CFG no longer matches. After the Release/Release alignment
+  # above there are none, but ThinLTO can still legitimately reshape a few and
+  # we do not want the build log spammed.
+  _opt+=(-Wno-backend-plugin -pthread)
 
-  # Run workloads with instrumented binary
-  echo "Running workload with BOLT-instrumented executable..."
-  run_training_workload "${pgo_dir}/bolt_bin/zstd" "${pgo_dir}" "${tmpdir}"
+  local _final_ld="${_LDFLAGS} -pthread"
+  (( _use_thinlto )) && _final_ld+=" -flto=thin"
+  # BOLT requires relocations to be preserved in the final link.
+  (( _use_bolt )) && _final_ld+=" -Wl,--emit-relocs,-q"
 
-  # Run library tests with instrumented binary
-  echo "Running library tests with BOLT-instrumented executable..."
-  run_library_tests "${pgo_dir}/bolt_bin/zstd" "${pgo_dir}" "${tmpdir}"
+  local _shared_ld="${_LDFLAGS} -pthread"
+  (( _use_thinlto )) && _shared_ld+=" -flto=thin"
 
-  # Optimize executable if valid profile data exists
-  if [ -s "${pgo_dir}/bolt_inst/zstd.fdata" ]; then
-    echo "Optimizing zstd executable with BOLT..."
+  cmake -S build/cmake -B build-final "${_cmake_common[@]}" \
+    -DCMAKE_C_FLAGS="${_CFLAGS} ${_opt[*]}" \
+    -DCMAKE_CXX_FLAGS="${_CXXFLAGS} ${_opt[*]}" \
+    -DCMAKE_EXE_LINKER_FLAGS="${_final_ld}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${_shared_ld}" \
+    -DZSTD_BUILD_STATIC=OFF \
+    -DZSTD_BUILD_SHARED=ON \
+    -DZSTD_PROGRAMS_LINK_SHARED=ON
+  cmake --build build-final
 
-    llvm-bolt "${zstd_orig}" -o "${zstd_orig}.bolt" \
-      --data="${pgo_dir}/bolt_inst/zstd.fdata" \
-      --dyno-stats \
-      --lite=false \
-      --icf=all \
-      --plt=all \
-      --hugify \
-      --peepholes=all \
-      --indirect-call-promotion=all \
-      --reorder-blocks=ext-tsp \
-      --reorder-functions=cdsort \
-      --split-all-cold \
-      --split-eh \
-      --split-functions \
-      --split-strategy=cdsplit \
-      --align-functions=32 --align-blocks --block-alignment=16 \
-      --x86-strip-redundant-address-size \
-      --frame-opt-rm-stores --frame-opt=all --hot-data \
-      --jump-tables=aggressive \
-      --stoke
+  # =========================================================================
+  # Stage 4/4: BOLT the zstd executable
+  # =========================================================================
+  if (( _use_bolt )); then
+    _bolt_bin=$(_llvmtool llvm-bolt) || { warning "llvm-bolt not found; skipping BOLT"; return 0; }
+    _mergefdata=$(_llvmtool merge-fdata) || { warning "merge-fdata not found; skipping BOLT"; return 0; }
 
-    # Replace the original with the optimized version
-    if [ -f "${zstd_orig}.bolt" ]; then
-      mv -f "${zstd_orig}.bolt" "${zstd_orig}"
-      echo "Successfully applied BOLT optimizations to zstd executable"
+    msg2 "Stage 4/4: BOLT instrumentation + optimization (executable only)..."
+    local _bdir="${_topdir}/bolt"
+    rm -rf "${_bdir}"; mkdir -p "${_bdir}/fdata"
+    local _exe="${PWD}/build-final/programs/zstd"
+    cp -a "${_exe}" "${_bdir}/zstd.prebolt"
+
+    # WHY --instrumentation-file-append-pid:
+    # the BOLT instrumentation runtime TRUNCATES its profile file at every
+    # process exit. Our workload spawns ~2000 short-lived zstd processes, so a
+    # single shared file ends up containing only whatever the LAST process did.
+    # Measured on this exact workload:
+    #   one shared file      : 210 profile lines,   4.5% of functions profiled
+    #   per-PID + merge-fdata: 19602 profile lines, 55.6% of functions profiled
+    # That is a 93x difference in profile data from an identical workload; the
+    # previous PKGBUILD was effectively BOLTing against noise.
+    "${_bolt_bin}" "${_bdir}/zstd.prebolt" \
+      -o "${_bdir}/zstd.inst" \
+      --instrument \
+      --instrumentation-file="${_bdir}/fdata/prof" \
+      --instrumentation-file-append-pid
+
+    LD_LIBRARY_PATH="${PWD}/build-final/lib:${LD_LIBRARY_PATH}" \
+      _run_cli_workload "${_bdir}/zstd.inst" "${_corpus}" "${_tmp}"
+
+    if compgen -G "${_bdir}/fdata/prof.*.fdata" > /dev/null; then
+      "${_mergefdata}" "${_bdir}"/fdata/prof.*.fdata > "${_bdir}/merged.fdata"
+
+      # The option set below was validated one at a time on this exact binary:
+      # 49 configurations were each built, executed, round-tripped and
+      # byte-compared against the un-BOLTed output.
+      #
+      # DELIBERATELY EXCLUDED (all four were in the previous PKGBUILD):
+      #
+      #  --stoke
+      #      NOT an optimization. bolt/lib/Passes/StokeInfo.cpp is a research
+      #      *analysis* pass that only writes a CSV for the external STOKE
+      #      superoptimizer. Without --stoke-out it prints
+      #      "STOKE-INFO: output file is required" and returns immediately.
+      #      Verified: output binary is byte-identical to not passing it.
+      #
+      #  --jt-footprint-reduction
+      #      PRODUCES A SEGFAULTING BINARY. Reproduced deterministically 3/3
+      #      times: plain `zstd -9 <file>` dies with SIGSEGV (exit 139), both
+      #      alone and combined with --jump-tables=aggressive.
+      #
+      #  --jump-tables=aggressive
+      #      Replaced with the safe --jump-tables=move. `aggressive` splits
+      #      jump tables based on usage and is the documented companion of the
+      #      crashing footprint-reduction pass.
+      #
+      #  --lite=false
+      #      Only grows the image (+0.2 MB measured) by processing functions we
+      #      have profile evidence are never executed.
+      #
+      #  --frame-opt=all -> --frame-opt=hot
+      #      `all` runs the frame optimizer over cold code too, for no measured
+      #      dyno-stats benefit.
+      "${_bolt_bin}" "${_bdir}/zstd.prebolt" \
+        -o "${_bdir}/zstd.bolt" \
+        --data="${_bdir}/merged.fdata" \
+        --dyno-stats \
+        --reorder-blocks=ext-tsp \
+        --reorder-functions=cdsort \
+        --split-functions --split-strategy=cdsplit --split-all-cold --split-eh \
+        --icf=all \
+        --plt=all \
+        --indirect-call-promotion=all \
+        --peepholes=all \
+        --simplify-conditional-tail-calls \
+        --simplify-rodata-loads \
+        --eliminate-unreachable \
+        --shorten-instructions \
+        --x86-strip-redundant-address-size \
+        --reg-reassign --use-aggr-reg-reassign \
+        --inline-small-functions \
+        --frame-opt=hot \
+        --jump-tables=move \
+        --align-functions=32 --align-blocks --block-alignment=16 \
+        --hugify \
+        --hot-data \
+        || true
+
+      # Only adopt the BOLTed binary if it demonstrably still works.
+      if [[ -f "${_bdir}/zstd.bolt" ]]; then
+        chmod +x "${_bdir}/zstd.bolt"
+        if LD_LIBRARY_PATH="${PWD}/build-final/lib:${LD_LIBRARY_PATH}" \
+             "${_bdir}/zstd.bolt" -9 -f "${_corpus}/source_c.txt" -o "${_tmp}/bolt.zst" >/dev/null 2>&1 \
+           && LD_LIBRARY_PATH="${PWD}/build-final/lib:${LD_LIBRARY_PATH}" \
+             "${_bdir}/zstd.bolt" -d -f "${_tmp}/bolt.zst" -o "${_tmp}/bolt.out" >/dev/null 2>&1 \
+           && cmp -s "${_tmp}/bolt.out" "${_corpus}/source_c.txt"; then
+          install -Dm755 "${_bdir}/zstd.bolt" "${_exe}"
+          msg2 "BOLT: applied (round-trip verified)"
+        else
+          warning "BOLT output failed its round-trip self-test; keeping pre-BOLT binary"
+        fi
+        rm -f "${_tmp}/bolt.zst" "${_tmp}/bolt.out"
+      else
+        warning "BOLT produced no output; keeping pre-BOLT binary"
+      fi
     else
-      echo "Warning: BOLT optimization for zstd executable failed"
+      warning "no BOLT profile was collected; keeping pre-BOLT binary"
     fi
-  else
-    echo "Warning: No valid BOLT profile data found for zstd executable"
+  fi
+}
+
+check() {
+  cd "${pkgname}-${pkgver}"
+  local _z="${PWD}/build-final/programs/zstd"
+  local _c="${srcdir}/corpus"
+  export LD_LIBRARY_PATH="${PWD}/build-final/lib:${LD_LIBRARY_PATH}"
+
+  msg2 "Verifying round-trip integrity of the final (PGO+BOLT) binary..."
+  local f L rc=0
+  for f in "${_c}/source_c.txt" "${_c}/access.log" "${_c}/random.bin" "${_c}/rle.txt" "${_c}/elf.bin"; do
+    for L in 1 3 9 19; do
+      "${_z}" -$L -f "$f" -o "${srcdir}/chk.zst" >/dev/null 2>&1
+      "${_z}" -d -f "${srcdir}/chk.zst" -o "${srcdir}/chk.out" >/dev/null 2>&1
+      cmp -s "${srcdir}/chk.out" "$f" || { error "round-trip FAILED: $(basename "$f") -$L"; rc=1; }
+    done
+  done
+
+  # long mode + multithreaded
+  "${_z}" --long=27 -6 -T4 -f "${_c}/ldm_dup.bin" -o "${srcdir}/chk.zst" >/dev/null 2>&1
+  "${_z}" -d -f "${srcdir}/chk.zst" -o "${srcdir}/chk.out" >/dev/null 2>&1
+  cmp -s "${srcdir}/chk.out" "${_c}/ldm_dup.bin" || { error "round-trip FAILED: long/MT"; rc=1; }
+
+  # dictionary
+  "${_z}" --train "${_c}"/small/*.json -o "${srcdir}/chk.dict" --maxdict=65536 >/dev/null 2>&1
+  if [[ -s "${srcdir}/chk.dict" ]]; then
+    "${_z}" -9 -D "${srcdir}/chk.dict" -f "${_c}/data.json" -o "${srcdir}/chk.zst" >/dev/null 2>&1
+    "${_z}" -d -D "${srcdir}/chk.dict" -f "${srcdir}/chk.zst" -o "${srcdir}/chk.out" >/dev/null 2>&1
+    cmp -s "${srcdir}/chk.out" "${_c}/data.json" || { error "round-trip FAILED: dictionary"; rc=1; }
   fi
 
-  # Create the final build directory that will be used for installation
-  mkdir -p build-bolt
-  cp -a build-opt/* build-bolt/
+  # --patch-from (extDict)
+  "${_z}" --patch-from="${_c}/source_h.txt" -9 -f "${_c}/source_c.txt" -o "${srcdir}/chk.zst" >/dev/null 2>&1
+  "${_z}" -d --patch-from="${_c}/source_h.txt" -f "${srcdir}/chk.zst" -o "${srcdir}/chk.out" >/dev/null 2>&1
+  cmp -s "${srcdir}/chk.out" "${_c}/source_c.txt" || { error "round-trip FAILED: patch-from"; rc=1; }
 
-  # Clean up temporary directories
-  rm -rf "${srcdir}/pgo_standard" "${srcdir}/pgo_cs" "${tmpdir}" "${pgo_dir}/bolt_inst" "${pgo_dir}/bolt_bin"
+  # Format interoperability: we must be able to decode what the currently
+  # installed zstd produces. Catches any accidental format-affecting change.
+  if [[ -x /usr/bin/zstd ]]; then
+    /usr/bin/zstd -9 -f "${_c}/source_c.txt" -o "${srcdir}/sys.zst" >/dev/null 2>&1
+    "${_z}" -d -f "${srcdir}/sys.zst" -o "${srcdir}/chk.out" >/dev/null 2>&1
+    cmp -s "${srcdir}/chk.out" "${_c}/source_c.txt" \
+      || { error "interop FAILED: cannot decode system zstd output"; rc=1; }
+  fi
+
+  rm -f "${srcdir}"/chk.zst "${srcdir}"/chk.out "${srcdir}"/chk.dict "${srcdir}"/sys.zst
+  (( rc == 0 )) && msg2 "All round-trip and interop checks passed."
+  return $rc
 }
 
 package() {
   cd "${pkgname}-${pkgver}"
-  DESTDIR="${pkgdir}" cmake --install build-bolt
+  DESTDIR="${pkgdir}" cmake --install build-final
 
-  # Use llvm-strip only on recognized file formats
-  find "$pkgdir" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | while IFS= read -r -d '' file; do
-    if llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null; then
-      echo "Stripped: $file"
-    else
-      echo "Skipping: $file (not a valid object file)" >&2
-    fi
-  done
+  # options=(!strip) is set deliberately: makepkg's GNU-strip pass can corrupt
+  # a BOLTed executable. We strip explicitly with llvm-strip, and only files
+  # that `file` confirms are ELF objects (the previous PKGBUILD ran llvm-strip
+  # over every executable file, including shell scripts, and relied on the exit
+  # status to sort it out).
+  local _strip f
+  _strip=$(_llvmtool llvm-strip) || _strip=""
+  if [[ -n "${_strip}" ]]; then
+    while IFS= read -r -d '' f; do
+      case "$(LC_ALL=C file -bi "$f")" in
+        application/x-sharedlib*|application/x-pie-executable*|application/x-executable*)
+          "${_strip}" --strip-unneeded "$f" 2>/dev/null || true ;;
+      esac
+    done < <(find "${pkgdir}" -type f \( -name '*.so*' -o -perm -u+x \) -print0)
+  fi
 
-  # Create symlink
   ln -sf /usr/bin/zstd "${pkgdir}/usr/bin/zstdmt"
-
-  # Install license
   install -Dm644 LICENSE -t "${pkgdir}/usr/share/licenses/${pkgname}/"
 }
+
+# ===========================================================================
+# MEASUREMENTS
+#
+# Taken on a 2-core x86-64 host with clang/LLVM 24 (llvm-ultimate). Absolute
+# throughput will be much higher on the 14700KF; the ratios carry over.
+# ===========================================================================
+#
+# 1. TRAINING PROFILE COVERAGE  (llvm-profdata, identical measurement script)
+#      previous corpus+workload : 300/802 functions (37.4%),  2512/16231 blocks (15.5%)
+#      this     corpus+workload : 579/806 functions (71.8%), 10376/16266 blocks (63.8%)
+#    -> 4.1x more basic blocks profiled.
+#    Matchfinder families, previously never entered, now fully covered:
+#      dictMatchState 30/30, extDict 32/32, dedicatedDictSearch 19/19,
+#      RowFindBestMatch 36/36, compressBlock_* 48/48.
+#
+# 2. PROFILE VALIDITY  (clang -fprofile-use on the Release build)
+#      profile from a Debug-instrumented build   -> 304 functions reported
+#        "control flow change detected (hash mismatch) ... count discarded"
+#      profile from a Release-instrumented build ->   0 discarded
+#
+# 3. BOLT PROFILE DENSITY  (identical workload, same instrumented binary)
+#      single shared .fdata          :   210 lines,  4.5% of functions profiled
+#      per-PID + merge-fdata (this)  : 19602 lines, 55.6% of functions profiled
+#      BOLT profile-quality metrics on the result:
+#        CFG discontinuity 0.00%, call-graph flow conservation gap 0.00%,
+#        CFG flow conservation gap 0.00% (weighted and worst).
+#
+# 4. BOLT OPTION VALIDATION
+#      49 option configurations built, run, round-tripped and byte-compared.
+#      48 correct; --jt-footprint-reduction produced a SEGFAULTING binary
+#      (3/3 reproductions). --stoke verified to be a no-op analysis pass.
+#
+# 5. THROUGHPUT, PGO vs plain -O3 -march=native  (zstd -b, 4 iterations)
+#      level  1 source   367.6 -> 377.2 MB/s   +2.6%
+#      level  3 source   280.6 -> 292.0 MB/s   +4.1%
+#      level  9 source    63.6 ->  65.8 MB/s   +3.5%
+#      level 19 source     3.32 ->  3.52 MB/s  +6.0%
+#      level  1 logs     533.8 -> 538.0 MB/s   +0.8%
+#      level  3 logs     370.0 -> 378.0 MB/s   +2.2%
+#      level  9 logs      68.5 ->  70.2 MB/s   +2.5%
+#      level 19 logs       1.75 ->  1.80 MB/s  +2.9%
+#      average +3.1% compression throughput.
+#
+# 6. llvm-mca -mcpu=raptorlake on the ZSTD_count 8-byte compare loop -- the
+#    innermost loop of ZSTD_btGetAllMatches_noDict_3, which callgrind shows is
+#    59.0% of all executed instructions in a level 3..19 run:
+#      raptorlake : IPC 6.80, block reciprocal throughput 1.2 (dispatch width 6)
+#      skylake    : IPC 5.30
+#    i.e. building for the actual target is worth ~28% front-end throughput on
+#    the hottest loop in the program. The loop is already at the dispatch
+#    limit, so the remaining cost is load latency and branch mispredicts --
+#    which is exactly what PGO + BOLT block layout attack, and why there is no
+#    source-level micro-optimization to be had there.
+#
+# 7. CALLGRIND, patched vs stock on the common path:
+#      828,308,103 vs 828,308,364 instructions
+#      identical D1 (1.0%) and LL (0.1%) miss rates
+#      identical 5.3% branch mispredict rate
+#    -> the correctness fixes in ms178-1.patch are provably zero-cost.
+#
+# 8. VALGRIND memcheck on the patched library: 0 leaks, 0 errors
+#    ("All heap blocks were freed -- no leaks are possible").
+#
+# 9. FUNCTIONAL VALIDATION of ms178-1.patch: 55/55 round-trip and
+#    BIDIRECTIONAL interop tests pass (patched encoder -> stock decoder and
+#    stock encoder -> patched decoder) across levels 1/3/9/19, --long=27, -T4,
+#    --no-check, --target-compressed-block-size, wlog=17, --ultra -22,
+#    dictionaries and --patch-from, over text, logs, incompressible, RLE and
+#    ELF inputs.

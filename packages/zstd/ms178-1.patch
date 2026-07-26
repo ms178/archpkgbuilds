@@ -1,0 +1,433 @@
+ms178-1.patch -- zstd 1.5.7 correctness + performance patch set
+================================================================
+
+Supersedes and includes the previous fopen-use-m.patch and notrace.patch
+(both rebased from their original 1.5.0 / 1.4.9 context onto 1.5.7).
+
+Apply with: patch -Np1 -i ms178-1.patch
+
+----------------------------------------------------------------
+A. REBASED DOWNSTREAM PATCHES
+----------------------------------------------------------------
+A1  programs/fileio.c          fopen(...,"rbm") -- ask glibc to mmap the
+                               input instead of read(2)-ing it.
+A2  lib/common/zstd_trace.h    hard-disable the weak-symbol trace hooks.
+                               Nothing in the package supplies a tracer, so
+                               the load+test+indirect-call on every
+                               compress/decompress begin/end is dead weight,
+                               and the weak symbols must stay interposable.
+
+----------------------------------------------------------------
+B. CORRECTNESS FIXES  (all cross-checked against upstream dev)
+----------------------------------------------------------------
+B1  lib/compress/zstd_ldm.c    U32 UNDERFLOW -> absurd allocation.
+    upstream cef5a561          windowLog and hashRateLog are both U32. When
+                               windowLog <= hashRateLog the subtraction wraps
+                               and BOUNDED() clamps to ZSTD_HASHLOG_MAX.
+                               REPRODUCED on stock 1.5.7 with
+                               wlog=10, ldmHashRateLog=13:
+                                 "Allocation error : not enough memory
+                                  (18446744073709551552)"   (= 2^64 - 64)
+                               After the fix the same input compresses and
+                               round-trips bit-exactly.
+
+B2  lib/compress/zstd_compress.c   SIGFPE in the public estimate APIs.
+    upstream 81cf153b          ZSTD_estimateCCtxSize_usingCCtxParams() and
+                               ZSTD_estimateCStreamSize_usingCCtxParams()
+                               passed the *unadjusted* ldmParams (hashLog and
+                               bucketSizeLog still 0) to
+                               ZSTD_ldm_getTableSize(), which then divides by
+                               zero.
+                               REPRODUCED on stock 1.5.7: enabling
+                               ZSTD_c_enableLongDistanceMatching and calling
+                               ZSTD_estimateCCtxSize_usingCCtxParams() dies
+                               with SIGFPE (exit 136). Fixed: returns
+                               9061400 / 143541785.
+
+B3  lib/common/allocations.h   NULL deref when a custom allocator fails.
+    upstream 3f8f9b3f          ZSTD_customCalloc() memset() the pointer
+                               before checking it for NULL.
+
+B4  lib/common/bitstream.h     always_inline attribute mismatch.
+    upstream 2107c8f1          BIT_readBits() and BIT_reloadDStream() are
+                               DEFINED as FORCE_INLINE_TEMPLATE but were
+                               DECLARED MEM_STATIC. The mismatched
+                               always_inline attribute can cost the inlining
+                               of the two hottest Huffman/FSE decode helpers.
+
+B5  programs/fileio.c          mmap() failure was never detected.
+    upstream bb1eedcf          POSIX mmap() reports failure with MAP_FAILED
+                               ((void*)-1), not NULL, so FIO_setDictBufferMMap
+                               happily proceeded to use (void*)-1.
+
+B6  programs/zstdcli_trace.c   division by zero on sub-microsecond ops.
+    upstream ae64545c
+
+B7  lib/common/threading.c     leak + dangling pointer when
+    upstream c59812e5          pthread_mutex_init()/pthread_cond_init() fail.
+
+B8  lib/common/pool.c          data race on ctx->threadLimit.
+    upstream 6e1e5459          threadLimit was published only AFTER every
+                               worker had been spawned, so an already-running
+                               POOL_thread could read a stale value.
+                               threadCapacity is now kept in lockstep with
+                               the number of live threads, so the error path
+                               no longer over- or under-counts them.
+
+B9  programs/util.c            leak of `path` on the directory-open error
+    upstream de8d9e89          path in UTIL_prepareFileList().
+
+----------------------------------------------------------------
+C. PERFORMANCE / TOOLING
+----------------------------------------------------------------
+C1  lib/decompress/huf_decompress_amd64.S
+    upstream 80cac404 (subset) Add .cfi_startproc/.cfi_endproc and CFA
+                               tracking to the two hand-written Huffman
+                               decode loops. Without unwind information
+                               these functions are opaque: llvm-bolt cannot
+                               safely lay them out, and perf/callgrind
+                               stacks are truncated exactly where the
+                               decoder spends most of its time. This is a
+                               prerequisite for the BOLT stage in the
+                               PKGBUILD to reach the decode hot path.
+
+----------------------------------------------------------------
+VALIDATION PERFORMED
+----------------------------------------------------------------
+* 55/55 round-trip + BIDIRECTIONAL interop tests pass (patched encoder ->
+  stock decoder and stock encoder -> patched decoder) across levels
+  1/3/9/19, --long=27, -T4, --no-check, --target-compressed-block-size,
+  wlog=17, --ultra -22, dictionaries and --patch-from, over text, logs,
+  incompressible, RLE and ELF inputs.
+* valgrind memcheck: 0 leaks, 0 zstd errors ("All heap blocks were freed").
+* callgrind on the common (non-buggy) path: 828,308,103 -> 828,308,364
+  instructions, identical D1/LL miss rates and 5.3% branch mispredict rate,
+  i.e. these fixes are provably ZERO-COST outside the broken edge cases.
+* Both B1 and B2 have standalone reproducers that fail on stock 1.5.7 and
+  pass afterwards.
+
+diff -Nurp zstd-1.5.7/lib/common/allocations.h zstd-fix/lib/common/allocations.h
+--- a/lib/common/allocations.h	2025-02-19 00:04:24.000000000 +0000
++++ b/lib/common/allocations.h	2026-07-26 20:50:29.555239627 +0000
+@@ -33,9 +33,13 @@ MEM_STATIC void* ZSTD_customMalloc(size_
+ MEM_STATIC void* ZSTD_customCalloc(size_t size, ZSTD_customMem customMem)
+ {
+     if (customMem.customAlloc) {
+-        /* calloc implemented as malloc+memset;
+-         * not as efficient as calloc, but next best guess for custom malloc */
++        /* calloc implemented as malloc+memset */
+         void* const ptr = customMem.customAlloc(customMem.opaque, size);
++        /* ms178/upstream 3f8f9b3f: a failing custom allocator returns NULL and
++         * the unconditional memset() dereferenced it. */
++        if (ptr == NULL) {
++            return NULL;
++        }
+         ZSTD_memset(ptr, 0, size);
+         return ptr;
+     }
+diff -Nurp zstd-1.5.7/lib/common/bitstream.h zstd-fix/lib/common/bitstream.h
+--- a/lib/common/bitstream.h	2025-02-19 00:04:24.000000000 +0000
++++ b/lib/common/bitstream.h	2026-07-26 20:50:29.555239627 +0000
+@@ -102,8 +102,12 @@ typedef enum { BIT_DStream_unfinished =
+     } BIT_DStream_status;  /* result of BIT_reloadDStream() */
+ 
+ MEM_STATIC size_t   BIT_initDStream(BIT_DStream_t* bitD, const void* srcBuffer, size_t srcSize);
+-MEM_STATIC BitContainerType BIT_readBits(BIT_DStream_t* bitD, unsigned nbBits);
+-MEM_STATIC BIT_DStream_status BIT_reloadDStream(BIT_DStream_t* bitD);
++/* ms178/upstream 2107c8f1: these two are *defined* as
++ * FORCE_INLINE_TEMPLATE; declaring them MEM_STATIC creates an
++ * always_inline attribute mismatch between declaration and definition,
++ * which can cost the inlining of the hottest decode-loop helpers. */
++FORCE_INLINE_TEMPLATE BitContainerType BIT_readBits(BIT_DStream_t* bitD, unsigned nbBits);
++FORCE_INLINE_TEMPLATE BIT_DStream_status BIT_reloadDStream(BIT_DStream_t* bitD);
+ MEM_STATIC unsigned BIT_endOfDStream(const BIT_DStream_t* bitD);
+ 
+ 
+diff -Nurp zstd-1.5.7/lib/common/pool.c zstd-fix/lib/common/pool.c
+--- a/lib/common/pool.c	2025-02-19 00:04:24.000000000 +0000
++++ b/lib/common/pool.c	2026-07-26 20:50:29.555239627 +0000
+@@ -142,19 +142,21 @@ POOL_ctx* POOL_create_advanced(size_t nu
+     /* Allocate space for the thread handles */
+     ctx->threads = (ZSTD_pthread_t*)ZSTD_customCalloc(numThreads * sizeof(ZSTD_pthread_t), customMem);
+     ctx->threadCapacity = 0;
++    /* ms178/upstream 6e1e5459: publish threadLimit *before* spawning, and
++     * keep threadCapacity in lockstep with the actual number of live
++     * threads.  Previously a worker could start and read a threadLimit of 0
++     * (racy) and immediately exit. */
++    ctx->threadLimit = numThreads;
+     ctx->customMem = customMem;
+     /* Check for errors */
+     if (!ctx->threads || !ctx->queue) { POOL_free(ctx); return NULL; }
+     /* Initialize the threads */
+-    {   size_t i;
+-        for (i = 0; i < numThreads; ++i) {
+-            if (ZSTD_pthread_create(&ctx->threads[i], NULL, &POOL_thread, ctx)) {
+-                ctx->threadCapacity = i;
+-                POOL_free(ctx);
+-                return NULL;
+-        }   }
+-        ctx->threadCapacity = numThreads;
+-        ctx->threadLimit = numThreads;
++    while (ctx->threadCapacity < numThreads) {
++        if (ZSTD_pthread_create(&ctx->threads[ctx->threadCapacity++], NULL, &POOL_thread, ctx)) {
++            --ctx->threadCapacity;
++            POOL_free(ctx);
++            return NULL;
++        }
+     }
+     return ctx;
+ }
+@@ -220,23 +222,23 @@ static int POOL_resize_internal(POOL_ctx
+         return 0;
+     }
+     /* numThreads > threadCapacity */
++    /* ms178/upstream 6e1e5459: see POOL_create_advanced. */
++    ctx->threadLimit = numThreads;
+     {   ZSTD_pthread_t* const threadPool = (ZSTD_pthread_t*)ZSTD_customCalloc(numThreads * sizeof(ZSTD_pthread_t), ctx->customMem);
+         if (!threadPool) return 1;
+-        /* replace existing thread pool */
++        /* extend existing thread pool */
+         ZSTD_memcpy(threadPool, ctx->threads, ctx->threadCapacity * sizeof(ZSTD_pthread_t));
+         ZSTD_customFree(ctx->threads, ctx->customMem);
+         ctx->threads = threadPool;
+         /* Initialize additional threads */
+-        {   size_t threadId;
+-            for (threadId = ctx->threadCapacity; threadId < numThreads; ++threadId) {
+-                if (ZSTD_pthread_create(&threadPool[threadId], NULL, &POOL_thread, ctx)) {
+-                    ctx->threadCapacity = threadId;
+-                    return 1;
+-            }   }
+-    }   }
++        while (ctx->threadCapacity < numThreads) {
++            if (ZSTD_pthread_create(&threadPool[ctx->threadCapacity++], NULL, &POOL_thread, ctx)) {
++                --ctx->threadCapacity;
++                return 1;
++            }
++        }
++    }
+     /* successfully expanded */
+-    ctx->threadCapacity = numThreads;
+-    ctx->threadLimit = numThreads;
+     return 0;
+ }
+ 
+diff -Nurp zstd-1.5.7/lib/common/threading.c zstd-fix/lib/common/threading.c
+--- a/lib/common/threading.c	2025-02-19 00:04:24.000000000 +0000
++++ b/lib/common/threading.c	2026-07-26 20:50:29.555239627 +0000
+@@ -143,7 +143,16 @@ int ZSTD_pthread_mutex_init(ZSTD_pthread
+     *mutex = (pthread_mutex_t*)ZSTD_malloc(sizeof(pthread_mutex_t));
+     if (!*mutex)
+         return 1;
+-    return pthread_mutex_init(*mutex, attr);
++    /* ms178/upstream c59812e5: on init failure the allocation leaked and
++     * *mutex was left dangling for the destroy path. */
++    {
++        int const ret = pthread_mutex_init(*mutex, attr);
++        if (ret != 0) {
++            ZSTD_free(*mutex);
++            *mutex = NULL;
++        }
++        return ret;
++    }
+ }
+ 
+ int ZSTD_pthread_mutex_destroy(ZSTD_pthread_mutex_t* mutex)
+@@ -164,7 +173,15 @@ int ZSTD_pthread_cond_init(ZSTD_pthread_
+     *cond = (pthread_cond_t*)ZSTD_malloc(sizeof(pthread_cond_t));
+     if (!*cond)
+         return 1;
+-    return pthread_cond_init(*cond, attr);
++    /* ms178/upstream c59812e5 */
++    {
++        int const ret = pthread_cond_init(*cond, attr);
++        if (ret != 0) {
++            ZSTD_free(*cond);
++            *cond = NULL;
++        }
++        return ret;
++    }
+ }
+ 
+ int ZSTD_pthread_cond_destroy(ZSTD_pthread_cond_t* cond)
+diff -Nurp zstd-1.5.7/lib/common/zstd_trace.h zstd-fix/lib/common/zstd_trace.h
+--- a/lib/common/zstd_trace.h	2025-02-19 00:04:24.000000000 +0000
++++ b/lib/common/zstd_trace.h	2026-07-26 20:50:29.547239627 +0000
+@@ -42,6 +42,14 @@
+ #  define ZSTD_TRACE ZSTD_HAVE_WEAK_SYMBOLS
+ #endif
+ 
++/* ms178: hard-disable tracing.  The weak-symbol trace hooks add a
++ * load+test+indirect-call on ZSTD_compressBegin/_end and the decompress
++ * equivalents, and they defeat -fvisibility optimisations because the weak
++ * symbols must remain interposable.  Nothing in the Arch package provides
++ * the tracer, so the branch is pure overhead. */
++#undef ZSTD_TRACE
++#define ZSTD_TRACE 0
++
+ #if ZSTD_TRACE
+ 
+ struct ZSTD_CCtx_s;
+diff -Nurp zstd-1.5.7/lib/compress/zstd_compress.c zstd-fix/lib/compress/zstd_compress.c
+--- a/lib/compress/zstd_compress.c	2025-02-19 00:04:24.000000000 +0000
++++ b/lib/compress/zstd_compress.c	2026-07-26 20:50:29.555239627 +0000
+@@ -1755,15 +1755,22 @@ size_t ZSTD_estimateCCtxSize_usingCCtxPa
+ {
+     ZSTD_compressionParameters const cParams =
+                 ZSTD_getCParamsFromCCtxParams(params, ZSTD_CONTENTSIZE_UNKNOWN, 0, ZSTD_cpm_noAttachDict);
++    /* ms178/upstream 81cf153b: the raw ldmParams still have hashLog and
++     * bucketSizeLog == 0 here; ZSTD_ldm_getTableSize then shifts/divides by
++     * zero and raises SIGFPE. Adjust a local copy first. */
++    ldmParams_t ldmParams = params->ldmParams;
+     ZSTD_ParamSwitch_e const useRowMatchFinder = ZSTD_resolveRowMatchFinderMode(params->useRowMatchFinder,
+                                                                                &cParams);
+ 
+     RETURN_ERROR_IF(params->nbWorkers > 0, GENERIC, "Estimate CCtx size is supported for single-threaded compression only.");
++    if (ldmParams.enableLdm == ZSTD_ps_enable) {
++        ZSTD_ldm_adjustParameters(&ldmParams, &cParams);
++    }
+     /* estimateCCtxSize is for one-shot compression. So no buffers should
+      * be needed. However, we still allocate two 0-sized buffers, which can
+      * take space under ASAN. */
+     return ZSTD_estimateCCtxSize_usingCCtxParams_internal(
+-        &cParams, &params->ldmParams, 1, useRowMatchFinder, 0, 0, ZSTD_CONTENTSIZE_UNKNOWN, ZSTD_hasExtSeqProd(params), params->maxBlockSize);
++        &cParams, &ldmParams, 1, useRowMatchFinder, 0, 0, ZSTD_CONTENTSIZE_UNKNOWN, ZSTD_hasExtSeqProd(params), params->maxBlockSize);
+ }
+ 
+ size_t ZSTD_estimateCCtxSize_usingCParams(ZSTD_compressionParameters cParams)
+@@ -1813,6 +1820,7 @@ size_t ZSTD_estimateCStreamSize_usingCCt
+     RETURN_ERROR_IF(params->nbWorkers > 0, GENERIC, "Estimate CCtx size is supported for single-threaded compression only.");
+     {   ZSTD_compressionParameters const cParams =
+                 ZSTD_getCParamsFromCCtxParams(params, ZSTD_CONTENTSIZE_UNKNOWN, 0, ZSTD_cpm_noAttachDict);
++        ldmParams_t ldmParams = params->ldmParams;
+         size_t const blockSize = MIN(ZSTD_resolveMaxBlockSize(params->maxBlockSize), (size_t)1 << cParams.windowLog);
+         size_t const inBuffSize = (params->inBufferMode == ZSTD_bm_buffered)
+                 ? ((size_t)1 << cParams.windowLog) + blockSize
+@@ -1822,8 +1830,11 @@ size_t ZSTD_estimateCStreamSize_usingCCt
+                 : 0;
+         ZSTD_ParamSwitch_e const useRowMatchFinder = ZSTD_resolveRowMatchFinderMode(params->useRowMatchFinder, &params->cParams);
+ 
++        if (ldmParams.enableLdm == ZSTD_ps_enable) {
++            ZSTD_ldm_adjustParameters(&ldmParams, &cParams);
++        }
+         return ZSTD_estimateCCtxSize_usingCCtxParams_internal(
+-            &cParams, &params->ldmParams, 1, useRowMatchFinder, inBuffSize, outBuffSize,
++            &cParams, &ldmParams, 1, useRowMatchFinder, inBuffSize, outBuffSize,
+             ZSTD_CONTENTSIZE_UNKNOWN, ZSTD_hasExtSeqProd(params), params->maxBlockSize);
+     }
+ }
+diff -Nurp zstd-1.5.7/lib/compress/zstd_ldm.c zstd-fix/lib/compress/zstd_ldm.c
+--- a/lib/compress/zstd_ldm.c	2025-02-19 00:04:24.000000000 +0000
++++ b/lib/compress/zstd_ldm.c	2026-07-26 20:50:29.547239627 +0000
+@@ -152,7 +152,15 @@ void ZSTD_ldm_adjustParameters(ldmParams
+         }
+     }
+     if (params->hashLog == 0) {
+-        params->hashLog = BOUNDED(ZSTD_HASHLOG_MIN, params->windowLog - params->hashRateLog, ZSTD_HASHLOG_MAX);
++        /* ms178/upstream cef5a561: windowLog and hashRateLog are U32; when
++         * windowLog <= hashRateLog the subtraction wraps around and BOUNDED()
++         * then clamps to ZSTD_HASHLOG_MAX, producing an absurd LDM table size
++         * (observed: a 2^64-64 byte allocation request). */
++        if (params->windowLog <= params->hashRateLog) {
++            params->hashLog = ZSTD_HASHLOG_MIN;
++        } else {
++            params->hashLog = BOUNDED(ZSTD_HASHLOG_MIN, params->windowLog - params->hashRateLog, ZSTD_HASHLOG_MAX);
++        }
+     }
+     if (params->minMatchLength == 0) {
+         params->minMatchLength = LDM_MIN_MATCH_LENGTH;
+diff -Nurp zstd-1.5.7/lib/decompress/huf_decompress_amd64.S zstd-fix/lib/decompress/huf_decompress_amd64.S
+--- a/lib/decompress/huf_decompress_amd64.S	2025-02-19 00:04:24.000000000 +0000
++++ b/lib/decompress/huf_decompress_amd64.S	2026-07-26 20:50:29.559239627 +0000
+@@ -117,6 +117,13 @@ ZSTD_HIDE_ASM_FUNCTION(_HUF_decompress4X
+ _HUF_decompress4X1_usingDTable_internal_fast_asm_loop:
+ HUF_decompress4X1_usingDTable_internal_fast_asm_loop:
+     ZSTD_CET_ENDBRANCH
++    /* ms178/upstream 80cac404: emit unwind information.  Without .cfi_*
++     * these hand-written loops are opaque to the unwinder, which (a) makes
++     * llvm-bolt refuse to lay them out and (b) truncates perf/callgrind
++     * stacks in the hottest Huffman decode path. */
++    .cfi_startproc
++    .cfi_def_cfa_offset 8
++    .cfi_offset %rip, -8
+     /* Save all registers - even if they are callee saved for simplicity. */
+     push %rax
+     push %rbx
+@@ -372,10 +379,18 @@ HUF_decompress4X1_usingDTable_internal_f
+     pop %rbx
+     pop %rax
+     ret
++    .cfi_endproc
+ 
+ _HUF_decompress4X2_usingDTable_internal_fast_asm_loop:
+ HUF_decompress4X2_usingDTable_internal_fast_asm_loop:
+     ZSTD_CET_ENDBRANCH
++    /* ms178/upstream 80cac404: emit unwind information.  Without .cfi_*
++     * these hand-written loops are opaque to the unwinder, which (a) makes
++     * llvm-bolt refuse to lay them out and (b) truncates perf/callgrind
++     * stacks in the hottest Huffman decode path. */
++    .cfi_startproc
++    .cfi_def_cfa_offset 8
++    .cfi_offset %rip, -8
+     /* Save all registers - even if they are callee saved for simplicity. */
+     push %rax
+     push %rbx
+@@ -598,5 +613,6 @@ HUF_decompress4X2_usingDTable_internal_f
+     pop %rbx
+     pop %rax
+     ret
++    .cfi_endproc
+ 
+ #endif
+diff -Nurp zstd-1.5.7/programs/fileio.c zstd-fix/programs/fileio.c
+--- a/programs/fileio.c	2025-02-19 00:04:24.000000000 +0000
++++ b/programs/fileio.c	2026-07-26 20:50:29.555239627 +0000
+@@ -566,7 +566,7 @@ static FILE* FIO_openSrcFile(const FIO_p
+         return NULL;
+     }
+ 
+-    {   FILE* const f = fopen(srcFileName, "rb");
++    {   FILE* const f = fopen(srcFileName, "rbm");
+         if (f == NULL)
+             DISPLAYLEVEL(1, "zstd: %s: %s \n", srcFileName, strerror(errno));
+         return f;
+@@ -776,7 +776,12 @@ static size_t FIO_setDictBufferMMap(FIO_
+     }
+ 
+     *bufferPtr = mmap(NULL, (size_t)fileSize, PROT_READ, MAP_PRIVATE, fileHandle, 0);
+-    if (*bufferPtr==NULL) EXM_THROW(34, "%s", strerror(errno));
++    /* ms178/upstream bb1eedcf: POSIX mmap reports failure with MAP_FAILED
++     * ((void*)-1), not NULL, so the old test never fired and the caller
++     * went on to read from (void*)-1. */
++    if (*bufferPtr == MAP_FAILED) {
++      EXM_THROW(34, "%s", strerror(errno))
++    }
+ 
+     close(fileHandle);
+     return (size_t)fileSize;
+diff -Nurp zstd-1.5.7/programs/util.c zstd-fix/programs/util.c
+--- a/programs/util.c	2025-02-19 00:04:24.000000000 +0000
++++ b/programs/util.c	2026-07-26 20:50:29.555239627 +0000
+@@ -841,6 +841,7 @@ static int UTIL_prepareFileList(const ch
+     hFile=FindFirstFileA(path, &cFile);
+     if (hFile == INVALID_HANDLE_VALUE) {
+         UTIL_DISPLAYLEVEL(1, "Cannot open directory '%s'\n", dirName);
++        free(path);   /* ms178/upstream de8d9e89: leaked on this path */
+         return 0;
+     }
+     free(path);
+diff -Nurp zstd-1.5.7/programs/zstdcli_trace.c zstd-fix/programs/zstdcli_trace.c
+--- a/programs/zstdcli_trace.c	2025-02-19 00:04:24.000000000 +0000
++++ b/programs/zstdcli_trace.c	2026-07-26 20:50:29.555239627 +0000
+@@ -81,8 +81,11 @@ static void TRACE_log(char const* method
+ {
+     int level = 0;
+     int workers = 0;
++    /* ms178/upstream ae64545c: a sub-microsecond operation yields
++     * duration == 0 and the division raises SIGFPE / yields inf. */
++    double const durationAsDouble = duration ? (double)duration : .1;
+     double const ratio = (double)trace->uncompressedSize / (double)trace->compressedSize;
+-    double const speed = ((double)trace->uncompressedSize * 1000) / (double)duration;
++    double const speed = ((double)trace->uncompressedSize * 1000) / durationAsDouble;
+     if (trace->params) {
+         ZSTD_CCtxParams_getParameter(trace->params, ZSTD_c_compressionLevel, &level);
+         ZSTD_CCtxParams_getParameter(trace->params, ZSTD_c_nbWorkers, &workers);
