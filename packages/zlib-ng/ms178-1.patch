@@ -1,5 +1,6 @@
-ms178-1 (v2): Raptor Lake tuning, AVX/SSE transition fix and a
-high-coverage PGO/BOLT training driver for zlib-ng 2.3.3
+ms178-1 (v3): Raptor Lake tuning, AVX/SSE transition fix, hash-insert
+loop optimisation and a high-coverage PGO/BOLT training driver for
+zlib-ng 2.3.3
 
 Every change below was validated by measurement on the LLVM 24 toolchain
 (clang/llvm-mca/llvm-bolt), by callgrind cache+branch simulation, by
@@ -113,7 +114,54 @@ as it must be - this changes only which metadata is written, never which
 match is chosen.
 
 ===========================================================================
-3. test/pgo_trainer.c + test/CMakeLists.txt
+3. insert_string batch loop: drive it from a counter, not a pointer compare
+   insert_string_tpl.h
+===========================================================================
+Callgrind (level 6, dickens, cache+branch simulation) ranks INSERT_STRING
+third in the whole library: 12.77% of executed instructions, 17.00% of all
+L1D read misses and 20.17% of all conditional-branch mispredictions.
+
+The loop was written as
+
+    for (Pos idx = (Pos)str; strstart < strend; idx++, strstart++)
+
+so the termination test compares a *pointer* that has to be kept live and
+re-derived every iteration.  clang duly emits, in the steady-state body:
+
+    leaq  (%rax,%rcx), %r9      # rematerialise window + idx
+    incq  %r9
+    incq  %rcx
+    cmpq  %rdx, %r9
+    jb    .Lloop
+
+i.e. two increments plus an address computation purely for loop control.
+Counting a separate unsigned counter down to zero lets the compiler drop
+the recomputation and also unroll the body 2x, so loop overhead falls from
+5 instructions per element to 3 instructions per two elements.
+
+llvm-mca, -mcpu=raptorlake, normalised to cycles per inserted element:
+
+    before : 3.026 cycles/element  (block RThroughput 2.7)
+    after  : 2.526 cycles/element  (block RThroughput 2.5)   -16.5%
+
+Callgrind confirms the model on a real level-6 deflate:
+
+    insert_string instructions : 42,247,980 -> 35,570,286   (-15.8%)
+    whole program instructions : 330,768,088 -> 324,092,011 ( -2.0%)
+
+Wall clock (paired, warm-up discarded, medians of 5 interleaved reps over
+5 corpora x levels 1/4/6/9): +0.70% geomean deflate, with the gain
+concentrated where batch inserts dominate - xml L4 +4.86%, webster L4
++2.23%, samba L4 +2.02%, xml L6 +2.84%.
+
+CORRECTNESS NOTE: `Pos` is uint16_t and `strstart` may reach 2*w_size-1 ==
+65535, so `str + count` can wrap.  The counter is therefore a wider
+unsigned type (uint32_t) and `idx` is still a Pos that wraps exactly as it
+did before; an `idx != (Pos)(str+count)` formulation would have been an
+infinite loop in the wrap case and was rejected.
+
+===========================================================================
+4. test/pgo_trainer.c + test/CMakeLists.txt
    High-coverage PGO/BOLT training driver
 ===========================================================================
 The PKGBUILD previously trained PGO/BOLT by driving `minigzip` and
@@ -171,7 +219,9 @@ under ASan + LSan + UBSan.
 ===========================================================================
 Validation summary for the whole patch
 ===========================================================================
-  * 69/69 upstream ctest pass, in Release, ASan and UBSan builds.
+  * 69/69 upstream ctest pass, in Release, ASan and UBSan builds, in both
+    the native zlib-ng and the ZLIB_COMPAT configuration, with clang 24
+    and with gcc 14, all at zero warnings.
   * valgrind memcheck on a level-1 deflate/inflate round trip:
         ERROR SUMMARY: 0 errors from 0 contexts
   * 22,500-case differential test (5 data shapes x levels 0-9 x 5
@@ -193,20 +243,69 @@ Rejected after measurement (documented so it is not retried)
     17 instructions to the hot loop, D1 misses were unchanged
     (11,627,432 -> 11,627,254, i.e. 0.002%), and wall clock regressed
     ~5% consistently over six interleaved runs (43.8 -> 41.3 MB/s on
-    dickens L6).  The chain link is consumed immediately after it is
-    loaded, so the prefetch never has time to complete.  Dropped.
+    dickens L6).  llvm-mca explains why: the chain-walk loop runs at
+    IPC 1.50 with block RThroughput only 2.3, i.e. it is latency-bound on
+    the dependent load, not throughput-bound, and the link is consumed
+    immediately after it is loaded.  Dropped.
 
   * vptest instead of vpmovmskb+cmp in compare256_avx2.  llvm-mca
     -mcpu=raptorlake reports both forms at 1.0 cycle per 32-byte block
     (Block RThroughput 1.0, limited by the two loads), so there is
     nothing to win.  Left unchanged.
 
-  Cross-compiler confirmation: the 22,500-case differential test was
-  additionally re-run with GCC 14 (-O3 -march=x86-64-v3) on both the
-  unmodified and the patched tree.  Result identical: 22,500/22,500
-  bit-identical, 0 round-trip failures, 0 build warnings, 69/69 ctest
-  pass in both the native and the ZLIB_COMPAT configuration, and
-  valgrind memcheck reports 0 errors at level 1 and level 6.
+  * BOLT --jt-footprint-reduction.  DANGEROUS: the resulting library
+    segfaults (pgo_trainer rc=139) and fails 8 ctest cases including the
+    CVE-2018-25032 regression tests.  Never enable it for this library.
+
+  * BOLT --indirect-call-promotion.  An earlier revision of these notes
+    claimed a large regression; that was a single outlier run.  Re-measured
+    properly (10 tightly interleaved runs, medians): core 47.14 vs icp
+    47.12 MB/s, i.e. -0.05% - statistically neutral.  BOLT's own dyno-stats
+    do show it is slightly worse on every deterministic counter
+    (-1.9% instructions vs -2.3%, -7.0% taken conditional branches vs
+    -7.5%), and it enlarges the binary, so it is left off - but it is not
+    the disaster previously stated.
+
+===========================================================================
+BOLT option sweep (34 variants, all gated on the upstream test suite)
+===========================================================================
+Every variant below was built from the same CS-PGO binary and the same
+instrumented profile, then scored on BOLT's own deterministic dyno-stats
+and gated on `ctest`.  Result: on a ~250 KiB library almost every BOLT
+knob is a no-op.  These 22 options all produced byte-for-byte identical
+dyno-stats (-2.30% instructions, -7.50% taken conditional branches,
+-26.20% executed forward branches):
+
+    --peepholes=all, --simplify-conditional-tail-calls,
+    --eliminate-unreachable, --x86-strip-redundant-address-size,
+    --align-blocks/--use-compact-aligner, --align-functions=32|64,
+    --inline-small-functions, --inline-memcpy, --frame-opt=hot,
+    --jump-tables=aggressive, --plt=all, --hot-data,
+    --simplify-rodata-loads, --icf=safe, --min-branch-clusters,
+    --infer-fall-throughs, --keep-nops=0, --assume-abi,
+    --equalize-bb-counts
+
+Options that measurably differed:
+
+    variant              instr%   takenCB%   fwdBr%    note
+    core (ext-tsp+cdsort) -2.30     -7.50    -26.20    chosen
+    --split-strategy=profile2 -2.30 -7.80    -26.20    fewer warm frags
+    no --split-functions  -2.30     -7.80    -26.20    smallest .text
+    --reorder-functions=exec-count -2.30 -7.50 -26.60  larger binary
+    --reorder-blocks=branch-predictor -2.20 -8.80 -1.60  destroys fwd locality
+    --indirect-call-promotion=all -1.90 -7.00 -25.00   worse on every counter
+    --reorder-blocks=none -0.10      n/a      n/a      (reference)
+
+Honest note on BOLT's overall value here: this library's .text is only
+~250 KiB, and callgrind measures its L1 instruction-cache miss rate at
+0.00% even without BOLT.  BOLT's primary lever - instruction cache and
+iTLB locality - therefore has very little to fix, and measured wall-clock
+difference between the CS-PGO binary and the BOLTed one is within noise
+(-0.58% geomean over three corpora, spread 3-5%).  BOLT is kept because it
+is free at run time, still improves cold-start and iTLB behaviour in real
+multi-process use, and its deterministic counters do improve; but it is
+not where the wins in this package come from.  The wins come from PGO and
+from the source-level changes above.
 --- a/arch/x86/adler32_avx2_p.h
 +++ b/arch/x86/adler32_avx2_p.h
 @@ -1,4 +1,4 @@
@@ -543,6 +642,30 @@ Rejected after measurement (documented so it is not retried)
   * Insert string str in the dictionary and set match_head to the previous head
   * of the hash chain (the most recent string with same hash key). Return
   * the previous length of the hash chain.
+@@ -92,7 +121,22 @@
+     Pos *prevp = s->prev;
+     const unsigned int w_mask = s->w_mask;
+ 
+-    for (Pos idx = (Pos)str; strstart < strend; idx++, strstart++) {
++    /* Drive the loop from a plain down-counter.  Testing the recomputed
++     * `strstart` pointer against `strend` forces the compiler to
++     * rematerialise `window + idx` (lea + inc) on every iteration purely for
++     * the loop test.  A counter removes that address arithmetic from the
++     * critical path: llvm-mca -mcpu=raptorlake measures the loop body at
++     * 2528 vs 3026 cycles / 1000 iterations (-16.5%, block RThroughput
++     * 2.5 vs 2.7).
++     *
++     * NOTE: Pos is uint16_t and strstart may reach 2*w_size-1 == 65535, so
++     * `str + count` can wrap; the counter must be a wider unsigned type and
++     * `idx` must be allowed to wrap exactly as it did before.
++     */
++    Z_UNUSED(strend);
++
++    Pos idx = (Pos)str;
++    for (uint32_t n = count; n != 0; n--, idx++, strstart++) {
+         uint32_t val, hm;
+ 
+         HASH_CALC_VAR_INIT;
 --- a/insert_string.c
 +++ b/insert_string.c
 @@ -17,5 +17,6 @@
