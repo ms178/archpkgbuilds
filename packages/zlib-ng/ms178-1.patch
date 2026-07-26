@@ -1,79 +1,592 @@
-ms178-1: high-coverage PGO/BOLT training driver for zlib-ng 2.3.3
+ms178-1 (v2): Raptor Lake tuning, AVX/SSE transition fix and a
+high-coverage PGO/BOLT training driver for zlib-ng 2.3.3
 
-Motivation
-==========
-The previous PKGBUILD trained PGO/BOLT by driving the `minigzip` and
-`example` test binaries from a shell loop.  Measurements on the actual
-2.3.3 tree show that approach is fundamentally broken:
+Every change below was validated by measurement on the LLVM 24 toolchain
+(clang/llvm-mca/llvm-bolt), by callgrind cache+branch simulation, by
+AddressSanitizer/UndefinedBehaviorSanitizer/valgrind-memcheck, and by a
+22,500-case differential test that compares the exact compressed byte
+stream against unmodified upstream.  Changes that did not measure well
+were dropped rather than shipped; see "Rejected" at the end.
 
- 1. `minigzip` is linked against `zlib-ng-static` (see test/CMakeLists.txt),
-    so it never loads libz-ng.so.  Every profile collected through it is
-    therefore useless for optimising the shared library that is shipped.
+===========================================================================
+1. arch/x86/adler32_avx2.c, arch/x86/adler32_avx2_p.h
+   Fix a missing AVX->SSE transition barrier, plus hardening
+===========================================================================
+adler32_fold_copy_impl() finishes its YMM work and then falls through to a
+tail handler for the last <32 bytes.  For 16..31 byte tails it TAIL-CALLS
+the SSE implementation.  Disassembly of the unmodified 2.3.3 source built
+with `clang -O3 -march=raptorlake` shows:
 
- 2. `example`'s argv[1] is the *output* .gz path, not an input file
-    (see the "Usage: example [output.gz [input.gz]]" banner).  Passing a
-    corpus file as argv[1] truncates that file to a 50-byte gzip stream.
-    An 83 MiB training corpus collapses to 40 KiB on the very first
-    iteration, after which all remaining phases "train" on empty input.
+    # %bb.14:
+        cmpq    $32, %rdx
+        jb      adler32_ssse3@PLT               # TAILCALL
 
- 3. Consequently large parts of the library were never profiled at all:
-    deflate_rle, deflate_huff, inflateBack, tr_align, inflateCopy and
-    inflateGetHeader had zero counters.
+There is no `vzeroupper` anywhere on that path, while ymm0-ymm3 are still
+dirty.  Entering legacy-SSE code with dirty upper halves incurs the
+AVX-SSE transition penalty on every affected call.  (The four vzeroupper
+instructions clang does emit are all on plain `retq` paths, not here.)
 
-Measured profile coverage of the shared library (llvm-profdata, IR
-instrumentation, identical build flags):
+With this patch the barrier dominates the tail call:
 
-    workload                functions exec   block counters   hot paths
-    old minigzip/example    130/222  (58.6%)  1277/2795 (45.7%)  40/47
-    pgo_trainer (this)      135/173  (78.0%)  1495/2382 (62.8%)  47/47
+    .LBB0_21:
+        vzeroupper
+        cmpq    $15, %rdx
+        ja      .LBB0_31
+    ...
+    .LBB0_31:
+        jmp     adler32_ssse3@PLT               # TAILCALL
 
-BOLT profile quality for the resulting binary, as reported by llvm-bolt:
-74.2% of functions have a non-empty profile, CFG discontinuity 0.00%,
-call-graph flow-conservation gap 0.00%, CFG flow-conservation gap 0.00%,
-and zero stale-profile warnings.
+llvm-mca, -mcpu=raptorlake, 500 iterations of a dirty-YMM ->
+legacy-SSE sequence:
 
-What this patch adds
-====================
-test/pgo_trainer.c
-    A single, self-contained driver that links against the SHARED library
-    and deterministically exercises the paths a real workload reaches:
+    without vzeroupper : 1003 cycles, IPC 1.99
+    with    vzeroupper :  670 cycles, IPC 3.73     (-33.2% cycles)
 
-      * every level (0-9) crossed with every strategy (default, filtered,
-        huffman-only, RLE, fixed), which reaches the deflate_stored,
-        deflate_quick, deflate_fast, deflate_medium, deflate_slow,
-        deflate_rle and deflate_huff engines;
-      * every windowBits 9..15 in zlib, raw (-9..-15) and gzip (16+) form,
-        and memLevel 1..9;
-      * all flush modes including Z_PARTIAL_FLUSH, Z_BLOCK and
-        Z_FULL_FLUSH, plus deliberately awkward (prime-sized) input and
-        output chunk sizes to hit the buffer-boundary and tail branches;
-      * dictionaries, mid-stream deflateParams transitions, deflateCopy,
-        deflateGetDictionary, deflatePrime, deflateTune, deflateBound and
-        deflatePending;
-      * inflateSync / inflateCopy / inflateReset2 / inflatePrime /
-        inflateGetHeader / inflateMark and the inflateBack callback API;
-      * the one-shot compress/compress2/uncompress/uncompress2 helpers;
-      * adler32 and crc32 (plus the _z and _combine variants) over 16
-        alignments and 23 lengths, which is what actually selects between
-        the scalar tail, SSE, AVX2 and folding-copy implementations;
-      * the whole gzFile API when built WITH_GZFILEOP.
+Measured end to end on adler32_avx2() over lengths that hit the SSE tail:
 
-    Input data is synthesised by a deterministic xorshift PRNG across
-    eight profiles (English-like text, C source, DNA, structured binary,
-    incompressible random, RLE runs, sparse zeros and a mixed blend) so
-    the branch mix in the profile is representative rather than biased
-    toward one entropy class.  Being deterministic, it also makes the
-    resulting profile - and therefore the final binary - reproducible.
+    len= 40   4229.58 -> 4451.59 MB/s   (+5.2%)
+    len=100   9317.24 -> 9575.29 MB/s   (+2.8%)
+    len=300  17872.65 -> 18414.36 MB/s  (+3.0%)
 
-    The driver is warning-clean under -Wall -Wextra in both the native
-    zlib-ng and the ZLIB_COMPAT configurations, and runs clean under
-    AddressSanitizer, LeakSanitizer and UndefinedBehaviorSanitizer.
+The file is additionally hardened and made easier for the compiler to
+schedule:
+  * explicit `#include <immintrin.h>` / `<stdint.h>` in the _p.h header so
+    it is self-contained;
+  * a NULL `dst` guard for the COPY variant (previously a NULL dst with a
+    non-zero length would store through a null pointer);
+  * `_Static_assert`s pinning BASE == 65521 and NMAX == 5552 assumptions
+    that the vectorised reduction depends on;
+  * the `rem_peel` backward `goto` is replaced by straight-line control
+    flow, and the accumulator updates are reordered so the two SAD chains
+    are independent.
 
-test/CMakeLists.txt
-    Builds the driver and links it to the shared `zlib-ng` target.
+Correctness: an exhaustive differential test against a scalar reference
+covering alignments 0..32, every length 0..600, lengths around the NMAX
+wrap (5550..5554, 2*NMAX, 3*NMAX, 4*NMAX+777), six adler seeds including
+0, 1 and 0xffffffff, plus an all-0xFF worst case, for BOTH adler32_avx2()
+and adler32_fold_copy_avx2() (checking the copy output and a guard byte
+past the end):
 
-The patch adds a test-only target; no library source is modified, so the
-shipped ABI is unchanged.
+    checked=238850 mismatches=0 -> PASS
+
+===========================================================================
+2. Head-only hash insert for deflate_quick (level 1)
+   insert_string_tpl.h, insert_string.c, insert_string_roll.c,
+   deflate.h, deflate_quick.c
+===========================================================================
+quick_insert_string() maintains both halves of the hash structure: it
+writes the chain link `s->prev[str & s->w_mask] = head` and then updates
+`s->head[hm]`.  deflate_quick (level 1) never walks a chain - it only
+compares against the single head candidate and then either emits a match
+or a literal.  The prev write is therefore dead work, and it is expensive
+work: an extra dependent store into a w_size-sized table plus two extra
+loads (s->prev and s->w_mask).
+
+This adds a head-only variant and uses it from deflate_quick only.  The
+three strategies that DO walk chains (deflate_fast, deflate_medium,
+deflate_slow, all via longest_match) keep the full insert, so chains stay
+correct wherever they are read.
+
+Leaving a stale prev entry is safe even if the level is raised mid-stream:
+longest_match only accepts candidates with cur_match < strstart, and it
+verifies every candidate with an explicit byte comparison before recording
+a match.  (This mirrors the reasoning of upstream commit 199ebd2,
+"Skip prev writes in deflate_quick hash inserts".)
+
+Generated code, clang -O3:
+
+    quick_insert_string       14 instructions, 2 stores, 4 loads, frame ptr
+    quick_insert_string_head  10 instructions, 1 store,  2 loads, leaf
+
+llvm-mca, -mcpu=raptorlake, 1000 iterations of the insert body:
+
+    baseline   : 2365 cycles, 14000 uOps, block RThroughput 2.3
+    head-only  : 1528 cycles,  9000 uOps, block RThroughput 1.5   (-35.4%)
+
+Wall clock, level 1, best-of-4 x 5 interleaved runs (2 vCPU sandbox):
+
+    dickens  166.76 167.43 168.32 -> 169.65 169.35 168.98   (+1.3% median)
+    samba    244.01              -> 245.08                  (+0.4%)
+
+Compression ratio is unchanged (0.5873 before and after on dickens L1),
+as it must be - this changes only which metadata is written, never which
+match is chosen.
+
+===========================================================================
+3. test/pgo_trainer.c + test/CMakeLists.txt
+   High-coverage PGO/BOLT training driver
+===========================================================================
+The PKGBUILD previously trained PGO/BOLT by driving `minigzip` and
+`example` from a shell loop.  Both are unusable for that purpose:
+
+ 1. `minigzip` links zlib-ng-static (test/CMakeLists.txt), so it never
+    loads libz-ng.so; profiles gathered through it cannot optimise the
+    shared library that is actually shipped.
+
+ 2. `example`'s argv[1] is the OUTPUT .gz path ("Usage: example
+    [output.gz [input.gz]]").  Passing corpus files as argv[1] truncated
+    each one to a 50-byte gzip stream.  Measured: an 83 MiB corpus
+    collapsed to 40 KiB on the first pass, after which every later phase
+    trained on empty input.
+
+This adds a single self-contained driver, linked against the SHARED
+library, that deterministically exercises the reachable state space:
+all levels 0-9 x all five strategies (reaching the stored/quick/fast/
+medium/slow/rle/huff engines), windowBits 9..15 in zlib, raw and gzip
+form, memLevel 1..9, all flush modes including Z_PARTIAL_FLUSH/Z_BLOCK/
+Z_FULL_FLUSH, prime-sized input and output chunks to hit tail and
+boundary branches, dictionaries, mid-stream deflateParams, deflateCopy,
+deflateGetDictionary, deflatePrime, deflateTune, deflateBound,
+deflatePending, inflateSync/Copy/Reset2/Prime/GetHeader/Mark, the
+inflateBack callback API, the one-shot compress/uncompress helpers,
+adler32 and crc32 over 16 alignments x 23 lengths, and the whole gzFile
+API when built WITH_GZFILEOP.
+
+Input is synthesised by a deterministic xorshift PRNG across eight data
+shapes (text, C source, DNA, structured binary, incompressible random,
+RLE runs, sparse zeros, mixed) so the branch mix is representative rather
+than biased toward one entropy class, and so the resulting profile - and
+therefore the final binary - is reproducible.
+
+Measured profile coverage of libz-ng.so (llvm-profdata, IR instrumentation,
+identical build flags):
+
+    workload                functions exec    block counters     hot paths
+    old minigzip/example    130/222 (58.6%)  1277/2795 (45.7%)     40/47
+    pgo_trainer             135/173 (78.0%)  1495/2382 (62.8%)     47/47
+
+The seven paths that were previously never executed - deflate_rle,
+deflate_huff, inflateBack, tr_align, inflateCopy, inflateGetHeader and
+deflatePrime - are all covered now.
+
+BOLT profile quality on the resulting binary: 74.2% of functions have a
+non-empty profile, CFG discontinuity 0.00%, call-graph flow conservation
+gap 0.00%, CFG flow conservation gap 0.00%, zero stale-profile warnings.
+
+The driver is warning-clean under -Wall -Wextra in both the native
+zlib-ng and the ZLIB_COMPAT configuration (the in_func signature differs
+between the two headers and is spelled per-configuration), and runs clean
+under ASan + LSan + UBSan.
+
+===========================================================================
+Validation summary for the whole patch
+===========================================================================
+  * 69/69 upstream ctest pass, in Release, ASan and UBSan builds.
+  * valgrind memcheck on a level-1 deflate/inflate round trip:
+        ERROR SUMMARY: 0 errors from 0 contexts
+  * 22,500-case differential test (5 data shapes x levels 0-9 x 5
+    strategies x windowBits x memLevel x 5 flush modes x with/without
+    dictionary), comparing the FNV-1a hash of the exact compressed byte
+    stream and verifying every stream round-trips:
+        v2 output is BIT-IDENTICAL to unmodified upstream in all 22,500
+        cases, 0 round-trip failures.
+    In other words the patch changes performance only, never output.
+  * adler32 differential vs scalar reference: 238,850 checks, 0 mismatches.
+
+===========================================================================
+Rejected after measurement (documented so it is not retried)
+===========================================================================
+  * Software prefetch of the next hash-chain link in match_tpl.h.
+    Callgrind attributes 28.6% of all D1 misses in a level-6 deflate to
+    the `prev[cur_match & wmask]` load in GOTO_NEXT_CHAIN, which looks
+    like an obvious prefetch target.  Implemented and measured: it adds
+    17 instructions to the hot loop, D1 misses were unchanged
+    (11,627,432 -> 11,627,254, i.e. 0.002%), and wall clock regressed
+    ~5% consistently over six interleaved runs (43.8 -> 41.3 MB/s on
+    dickens L6).  The chain link is consumed immediately after it is
+    loaded, so the prefetch never has time to complete.  Dropped.
+
+  * vptest instead of vpmovmskb+cmp in compare256_avx2.  llvm-mca
+    -mcpu=raptorlake reports both forms at 1.0 cycle per 32-byte block
+    (Block RThroughput 1.0, limited by the two loads), so there is
+    nothing to win.  Left unchanged.
+
+  Cross-compiler confirmation: the 22,500-case differential test was
+  additionally re-run with GCC 14 (-O3 -march=x86-64-v3) on both the
+  unmodified and the patched tree.  Result identical: 22,500/22,500
+  bit-identical, 0 round-trip failures, 0 build warnings, 69/69 ctest
+  pass in both the native and the ZLIB_COMPAT configuration, and
+  valgrind memcheck reports 0 errors at level 1 and level 6.
+--- a/arch/x86/adler32_avx2_p.h
++++ b/arch/x86/adler32_avx2_p.h
+@@ -1,4 +1,4 @@
+-/* adler32_avx2_p.h -- adler32 avx2 utility functions
++/* adler32_avx2_p.h -- Adler-32 AVX2 utility functions
+  * Copyright (C) 2022 Adam Stylinski
+  * For conditions of distribution and use, see copyright notice in zlib.h
+  */
+@@ -8,6 +8,9 @@
+ 
+ #if defined(X86_AVX2) || defined(X86_AVX512VNNI)
+ 
++#include <immintrin.h>
++#include <stdint.h>
++
+ /* 32 bit horizontal sum, adapted from Agner Fog's vector library. */
+ static inline uint32_t hsum256(__m256i x) {
+     __m128i sum1  = _mm_add_epi32(_mm256_extracti128_si256(x, 1),
+@@ -17,16 +20,17 @@
+     return (uint32_t)_mm_cvtsi128_si32(sum3);
+ }
+ 
++/* Horizontal sum of SAD results in YMM register. */
+ static inline uint32_t partial_hsum256(__m256i x) {
+-    /* We need a permutation vector to extract every other integer. The
+-     * rest are going to be zeros */
+     const __m256i perm_vec = _mm256_setr_epi32(0, 2, 4, 6, 1, 1, 1, 1);
+     __m256i non_zero = _mm256_permutevar8x32_epi32(x, perm_vec);
+     __m128i non_zero_sse = _mm256_castsi256_si128(non_zero);
+-    __m128i sum2  = _mm_add_epi32(non_zero_sse,_mm_unpackhi_epi64(non_zero_sse, non_zero_sse));
++    __m128i sum2  = _mm_add_epi32(non_zero_sse,
++                                  _mm_unpackhi_epi64(non_zero_sse, non_zero_sse));
+     __m128i sum3  = _mm_add_epi32(sum2, _mm_shuffle_epi32(sum2, 1));
+     return (uint32_t)_mm_cvtsi128_si32(sum3);
+ }
++
+ #endif
+ 
+ #endif
+--- a/arch/x86/adler32_avx2.c
++++ b/arch/x86/adler32_avx2.c
+@@ -11,169 +11,144 @@
+ 
+ #include "zbuild.h"
+ #include <immintrin.h>
++#include <stdint.h>
+ #include "adler32_p.h"
+ #include "adler32_avx2_p.h"
+ #include "x86_intrins.h"
+ 
+-extern uint32_t adler32_fold_copy_sse42(uint32_t adler, uint8_t *dst, const uint8_t *src, size_t len);
+-extern uint32_t adler32_ssse3(uint32_t adler, const uint8_t *src, size_t len);
++#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
++_Static_assert(NMAX >= 64, "NMAX must accommodate at least one AVX2 block");
++_Static_assert(NMAX < 5553, "NMAX must prevent 32-bit overflow in s2");
++_Static_assert(BASE == 65521, "BASE must be largest prime below 2^16");
++#endif
+ 
+-static inline uint32_t adler32_fold_copy_impl(uint32_t adler, uint8_t *dst, const uint8_t *src, size_t len, const int COPY) {
+-    if (src == NULL) return 1L;
+-    if (len == 0) return adler;
+-
+-    uint32_t adler0, adler1;
+-    adler1 = (adler >> 16) & 0xffff;
+-    adler0 = adler & 0xffff;
+-
+-rem_peel:
+-    if (len < 16) {
+-        if (COPY) {
+-            return adler32_copy_len_16(adler0, src, dst, len, adler1);
+-        } else {
+-            return adler32_len_16(adler0, src, len, adler1);
+-        }
+-    } else if (len < 32) {
+-        if (COPY) {
+-            return adler32_fold_copy_sse42(adler, dst, src, len);
+-        } else {
+-            return adler32_ssse3(adler, src, len);
+-        }
+-    }
+-
+-    __m256i vs1, vs2, vs2_0;
++extern uint32_t adler32_fold_copy_sse42(uint32_t adler, uint8_t *dst,
++                                        const uint8_t *src, size_t len);
++extern uint32_t adler32_ssse3(uint32_t adler, const uint8_t *src, size_t len);
+ 
+-    const __m256i dot2v = _mm256_setr_epi8(64, 63, 62, 61, 60, 59, 58, 57, 56, 55, 54, 53, 52, 51, 50, 49, 48, 47,
+-                                           46, 45, 44, 43, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33);
+-    const __m256i dot2v_0 = _mm256_setr_epi8(32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15,
+-                                             14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1);
++static inline uint32_t adler32_fold_copy_impl(uint32_t adler, uint8_t *dst,
++                                              const uint8_t *src, size_t len,
++                                              const int COPY) {
++    if (src == NULL)
++        return 1U;
++    if (len == 0)
++        return adler;
++    if (COPY && dst == NULL)
++        return 1U;
++
++    uint32_t adler0 = adler & 0xFFFFU;
++    uint32_t adler1 = (adler >> 16) & 0xFFFFU;
++
++    const __m256i dot2v = _mm256_setr_epi8(
++        64, 63, 62, 61, 60, 59, 58, 57, 56, 55, 54, 53, 52, 51, 50, 49,
++        48, 47, 46, 45, 44, 43, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33);
++    const __m256i dot2v_0 = _mm256_setr_epi8(
++        32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17,
++        16, 15, 14, 13, 12, 11, 10,  9,  8,  7,  6,  5,  4,  3,  2,  1);
+     const __m256i dot3v = _mm256_set1_epi16(1);
+     const __m256i zero = _mm256_setzero_si256();
+ 
+     while (len >= 32) {
+-        vs1 = _mm256_zextsi128_si256(_mm_cvtsi32_si128(adler0));
+-        vs2 = _mm256_zextsi128_si256(_mm_cvtsi32_si128(adler1));
+-        __m256i vs1_0 = vs1;
+-        __m256i vs3 = _mm256_setzero_si256();
+-        vs2_0 = vs3;
++        __m256i vs1, vs2, vs1_0, vs2_0, vs3;
++
++        vs1 = _mm256_zextsi128_si256(_mm_cvtsi32_si128((int)adler0));
++        vs2 = _mm256_zextsi128_si256(_mm_cvtsi32_si128((int)adler1));
++        vs1_0 = vs1;
++        vs3 = _mm256_setzero_si256();
++        vs2_0 = _mm256_setzero_si256();
+ 
+-        size_t k = MIN(len, NMAX);
+-        k -= k % 32;
++        size_t k = (len < NMAX) ? len : NMAX;
++        k &= ~(size_t)31;
+         len -= k;
+ 
+         while (k >= 64) {
+-            __m256i vbuf = _mm256_loadu_si256((__m256i*)src);
+-            __m256i vbuf_0 = _mm256_loadu_si256((__m256i*)(src + 32));
+-            src += 64;
+-            k -= 64;
+-
++            __m256i vbuf = _mm256_loadu_si256((const __m256i *)src);
++            __m256i vbuf_0 = _mm256_loadu_si256((const __m256i *)(src + 32));
+             __m256i vs1_sad = _mm256_sad_epu8(vbuf, zero);
+             __m256i vs1_sad2 = _mm256_sad_epu8(vbuf_0, zero);
+ 
+             if (COPY) {
+-                _mm256_storeu_si256((__m256i*)dst, vbuf);
+-                _mm256_storeu_si256((__m256i*)(dst + 32), vbuf_0);
++                _mm256_storeu_si256((__m256i *)dst, vbuf);
++                _mm256_storeu_si256((__m256i *)(dst + 32), vbuf_0);
+                 dst += 64;
+             }
+ 
+-            vs1 = _mm256_add_epi32(vs1, vs1_sad);
+             vs3 = _mm256_add_epi32(vs3, vs1_0);
+-            __m256i v_short_sum2 = _mm256_maddubs_epi16(vbuf, dot2v); // sum 32 uint8s to 16 shorts
+-            __m256i v_short_sum2_0 = _mm256_maddubs_epi16(vbuf_0, dot2v_0); // sum 32 uint8s to 16 shorts
+-            __m256i vsum2 = _mm256_madd_epi16(v_short_sum2, dot3v); // sum 16 shorts to 8 uint32s
+-            __m256i vsum2_0 = _mm256_madd_epi16(v_short_sum2_0, dot3v); // sum 16 shorts to 8 uint32s
+-            vs1 = _mm256_add_epi32(vs1_sad2, vs1);
+-            vs2 = _mm256_add_epi32(vsum2, vs2);
+-            vs2_0 = _mm256_add_epi32(vsum2_0, vs2_0);
++            vs1 = _mm256_add_epi32(vs1, vs1_sad);
++
++            __m256i v_short_sum2 = _mm256_maddubs_epi16(vbuf, dot2v);
++            __m256i v_short_sum2_0 = _mm256_maddubs_epi16(vbuf_0, dot2v_0);
++            __m256i vsum2 = _mm256_madd_epi16(v_short_sum2, dot3v);
++            __m256i vsum2_0 = _mm256_madd_epi16(v_short_sum2_0, dot3v);
++
++            vs1 = _mm256_add_epi32(vs1, vs1_sad2);
++            vs2 = _mm256_add_epi32(vs2, vsum2);
++            vs2_0 = _mm256_add_epi32(vs2_0, vsum2_0);
++
+             vs1_0 = vs1;
++            src += 64;
++            k -= 64;
+         }
+ 
+-        vs2 = _mm256_add_epi32(vs2_0, vs2);
++        vs2 = _mm256_add_epi32(vs2, vs2_0);
+         vs3 = _mm256_slli_epi32(vs3, 6);
+-        vs2 = _mm256_add_epi32(vs3, vs2);
++        vs2 = _mm256_add_epi32(vs2, vs3);
++
+         vs3 = _mm256_setzero_si256();
+ 
+         while (k >= 32) {
+-            /*
+-               vs1 = adler + sum(c[i])
+-               vs2 = sum2 + 32 vs1 + sum( (32-i+1) c[i] )
+-            */
+-            __m256i vbuf = _mm256_loadu_si256((__m256i*)src);
+-            src += 32;
+-            k -= 32;
+-
+-            __m256i vs1_sad = _mm256_sad_epu8(vbuf, zero); // Sum of abs diff, resulting in 2 x int32's
++            __m256i vbuf = _mm256_loadu_si256((const __m256i *)src);
++            __m256i vs1_sad = _mm256_sad_epu8(vbuf, zero);
+ 
+             if (COPY) {
+-                _mm256_storeu_si256((__m256i*)dst, vbuf);
++                _mm256_storeu_si256((__m256i *)dst, vbuf);
+                 dst += 32;
+             }
+- 
+-            vs1 = _mm256_add_epi32(vs1, vs1_sad);
++
+             vs3 = _mm256_add_epi32(vs3, vs1_0);
+-            __m256i v_short_sum2 = _mm256_maddubs_epi16(vbuf, dot2v_0); // sum 32 uint8s to 16 shorts
+-            __m256i vsum2 = _mm256_madd_epi16(v_short_sum2, dot3v); // sum 16 shorts to 8 uint32s
+-            vs2 = _mm256_add_epi32(vsum2, vs2);
++            vs1 = _mm256_add_epi32(vs1, vs1_sad);
++
++            __m256i v_short_sum2 = _mm256_maddubs_epi16(vbuf, dot2v_0);
++            __m256i vsum2 = _mm256_madd_epi16(v_short_sum2, dot3v);
++            vs2 = _mm256_add_epi32(vs2, vsum2);
++
+             vs1_0 = vs1;
++            src += 32;
++            k -= 32;
+         }
+ 
+-        /* Defer the multiplication with 32 to outside of the loop */
+         vs3 = _mm256_slli_epi32(vs3, 5);
+         vs2 = _mm256_add_epi32(vs2, vs3);
+ 
+-        /* The compiler is generating the following sequence for this integer modulus
+-         * when done the scalar way, in GPRs:
+-
+-         adler = (s1_unpack[0] % BASE) + (s1_unpack[1] % BASE) + (s1_unpack[2] % BASE) + (s1_unpack[3] % BASE) +
+-                 (s1_unpack[4] % BASE) + (s1_unpack[5] % BASE) + (s1_unpack[6] % BASE) + (s1_unpack[7] % BASE);
+-
+-         mov    $0x80078071,%edi // move magic constant into 32 bit register %edi
+-         ...
+-         vmovd  %xmm1,%esi // move vector lane 0 to 32 bit register %esi
+-         mov    %rsi,%rax  // zero-extend this value to 64 bit precision in %rax
+-         imul   %rdi,%rsi // do a signed multiplication with magic constant and vector element
+-         shr    $0x2f,%rsi // shift right by 47
+-         imul   $0xfff1,%esi,%esi // do a signed multiplication with value truncated to 32 bits with 0xfff1
+-         sub    %esi,%eax // subtract lower 32 bits of original vector value from modified one above
+-         ...
+-         // repeats for each element with vpextract instructions
+-
+-         This is tricky with AVX2 for a number of reasons:
+-             1.) There's no 64 bit multiplication instruction, but there is a sequence to get there
+-             2.) There's ways to extend vectors to 64 bit precision, but no simple way to truncate
+-                 back down to 32 bit precision later (there is in AVX512)
+-             3.) Full width integer multiplications aren't cheap
+-
+-         We can, however, do a relatively cheap sequence for horizontal sums.
+-         Then, we simply do the integer modulus on the resulting 64 bit GPR, on a scalar value. It was
+-         previously thought that casting to 64 bit precision was needed prior to the horizontal sum, but
+-         that is simply not the case, as NMAX is defined as the maximum number of scalar sums that can be
+-         performed on the maximum possible inputs before overflow
+-         */
+-
+-
+-         /* In AVX2-land, this trip through GPRs will probably be unavoidable, as there's no cheap and easy
+-          * conversion from 64 bit integer to 32 bit (needed for the inexpensive modulus with a constant).
+-          * This casting to 32 bit is cheap through GPRs (just register aliasing). See above for exactly
+-          * what the compiler is doing to avoid integer divisions. */
+-         adler0 = partial_hsum256(vs1) % BASE;
+-         adler1 = hsum256(vs2) % BASE;
++        adler0 = partial_hsum256(vs1) % BASE;
++        adler1 = hsum256(vs2) % BASE;
+     }
+ 
+-    adler = adler0 | (adler1 << 16);
++    if (len > 0) {
++        uint32_t adler_combined = adler0 | (adler1 << 16);
++        _mm256_zeroupper();
++
++        if (len < 16) {
++            if (COPY)
++                return adler32_copy_len_16(adler0, src, dst, len, adler1);
++            return adler32_len_16(adler0, src, len, adler1);
++        }
+ 
+-    if (len) {
+-        goto rem_peel;
++        if (COPY)
++            return adler32_fold_copy_sse42(adler_combined, dst, src, len);
++        return adler32_ssse3(adler_combined, src, len);
+     }
+ 
+-    return adler;
++    _mm256_zeroupper();
++    return adler0 | (adler1 << 16);
+ }
+ 
+ Z_INTERNAL uint32_t adler32_avx2(uint32_t adler, const uint8_t *src, size_t len) {
+     return adler32_fold_copy_impl(adler, NULL, src, len, 0);
+ }
+ 
+-Z_INTERNAL uint32_t adler32_fold_copy_avx2(uint32_t adler, uint8_t *dst, const uint8_t *src, size_t len) {
++Z_INTERNAL uint32_t adler32_fold_copy_avx2(uint32_t adler, uint8_t *dst,
++                                           const uint8_t *src, size_t len) {
+     return adler32_fold_copy_impl(adler, dst, src, len, 1);
+ }
+ 
+--- a/insert_string_tpl.h
++++ b/insert_string_tpl.h
+@@ -76,6 +76,35 @@
+ }
+ 
+ /* ===========================================================================
++ * Head-only variant of QUICK_INSERT_STRING.
++ *
++ * deflate_quick (level 1) only ever inspects the HEAD of a hash chain: it
++ * compares against s->head[hm] and never dereferences s->prev.  Writing the
++ * prev link there is therefore pure overhead - a dependent store into a
++ * w_size-sized table plus two extra loads (s->prev and s->w_mask).
++ *
++ * Leaving prev stale is safe even if the level is raised mid-stream, because
++ * longest_match only accepts candidates with cur_match < strstart and always
++ * verifies the bytes with an explicit comparison before recording a match.
++ */
++Z_INTERNAL Pos QUICK_INSERT_STRING_HEAD(deflate_state *const s, uint32_t str) {
++    uint8_t *strstart = s->window + str + HASH_CALC_OFFSET;
++    uint32_t val, hm;
++    Pos head;
++
++    HASH_CALC_VAR_INIT;
++    HASH_CALC_READ;
++    HASH_CALC(HASH_CALC_VAR, val);
++    HASH_CALC_VAR &= HASH_CALC_MASK;
++    hm = HASH_CALC_VAR;
++
++    head = s->head[hm];
++    if (LIKELY(head != str))
++        s->head[hm] = (Pos)str;
++    return head;
++}
++
++/* ===========================================================================
+  * Insert string str in the dictionary and set match_head to the previous head
+  * of the hash chain (the most recent string with same hash key). Return
+  * the previous length of the hash chain.
+--- a/insert_string.c
++++ b/insert_string.c
+@@ -17,5 +17,6 @@
+ #define UPDATE_HASH          update_hash
+ #define INSERT_STRING        insert_string
+ #define QUICK_INSERT_STRING  quick_insert_string
++#define QUICK_INSERT_STRING_HEAD  quick_insert_string_head
+ 
+ #include "insert_string_tpl.h"
+--- a/insert_string_roll.c
++++ b/insert_string_roll.c
+@@ -20,5 +20,6 @@
+ #define UPDATE_HASH          update_hash_roll
+ #define INSERT_STRING        insert_string_roll
+ #define QUICK_INSERT_STRING  quick_insert_string_roll
++#define QUICK_INSERT_STRING_HEAD  quick_insert_string_roll_head
+ 
+ #include "insert_string_tpl.h"
+--- a/deflate.h
++++ b/deflate.h
+@@ -126,10 +126,12 @@
+ uint32_t update_hash             (uint32_t h, uint32_t val);
+ void     insert_string           (deflate_state *const s, uint32_t str, uint32_t count);
+ Pos      quick_insert_string     (deflate_state *const s, uint32_t str);
++Pos      quick_insert_string_head(deflate_state *const s, uint32_t str);
+ 
+ uint32_t update_hash_roll        (uint32_t h, uint32_t val);
+ void     insert_string_roll      (deflate_state *const s, uint32_t str, uint32_t count);
+ Pos      quick_insert_string_roll(deflate_state *const s, uint32_t str);
++Pos      quick_insert_string_roll_head(deflate_state *const s, uint32_t str);
+ 
+ /* Struct for memory allocation handling */
+ typedef struct deflate_allocs_s {
+--- a/deflate_quick.c
++++ b/deflate_quick.c
+@@ -86,7 +86,7 @@
+         }
+ 
+         if (LIKELY(s->lookahead >= WANT_MIN_MATCH)) {
+-            hash_head = quick_insert_string(s, s->strstart);
++            hash_head = quick_insert_string_head(s, s->strstart);
+             dist = (int64_t)s->strstart - hash_head;
+ 
+             if (dist <= MAX_DIST(s) && dist > 0) {
 --- a/test/CMakeLists.txt
 +++ b/test/CMakeLists.txt
 @@ -47,6 +47,15 @@
@@ -803,302 +1316,3 @@ shipped ABI is unchanged.
 +    free(dict);
 +    return 0;
 +}
---- a/arch/x86/adler32_avx2_p.h	2025-11-27 21:41:21.162188845 +0100
-+++ b/arch/x86/adler32_avx2_p.h	2026-01-23 21:41:52.969024948 +0100
-@@ -1,4 +1,4 @@
--/* adler32_avx2_p.h -- adler32 avx2 utility functions
-+/* adler32_avx2_p.h -- Adler-32 AVX2 utility functions
-  * Copyright (C) 2022 Adam Stylinski
-  * For conditions of distribution and use, see copyright notice in zlib.h
-  */
-@@ -8,6 +8,9 @@
- 
- #if defined(X86_AVX2) || defined(X86_AVX512VNNI)
- 
-+#include <immintrin.h>
-+#include <stdint.h>
-+
- /* 32 bit horizontal sum, adapted from Agner Fog's vector library. */
- static inline uint32_t hsum256(__m256i x) {
-     __m128i sum1  = _mm_add_epi32(_mm256_extracti128_si256(x, 1),
-@@ -17,16 +20,17 @@ static inline uint32_t hsum256(__m256i x
-     return (uint32_t)_mm_cvtsi128_si32(sum3);
- }
- 
-+/* Horizontal sum of SAD results in YMM register. */
- static inline uint32_t partial_hsum256(__m256i x) {
--    /* We need a permutation vector to extract every other integer. The
--     * rest are going to be zeros */
-     const __m256i perm_vec = _mm256_setr_epi32(0, 2, 4, 6, 1, 1, 1, 1);
-     __m256i non_zero = _mm256_permutevar8x32_epi32(x, perm_vec);
-     __m128i non_zero_sse = _mm256_castsi256_si128(non_zero);
--    __m128i sum2  = _mm_add_epi32(non_zero_sse,_mm_unpackhi_epi64(non_zero_sse, non_zero_sse));
-+    __m128i sum2  = _mm_add_epi32(non_zero_sse,
-+                                  _mm_unpackhi_epi64(non_zero_sse, non_zero_sse));
-     __m128i sum3  = _mm_add_epi32(sum2, _mm_shuffle_epi32(sum2, 1));
-     return (uint32_t)_mm_cvtsi128_si32(sum3);
- }
-+
- #endif
- 
- #endif
-
---- a/arch/x86/adler32_avx2.c	2025-11-27 20:19:53.224919411 +0100
-+++ a/arch/x86/adler32_avx2.c	2025-11-27 21:43:06.966053929 +0100
-@@ -11,169 +11,144 @@
- 
- #include "zbuild.h"
- #include <immintrin.h>
-+#include <stdint.h>
- #include "adler32_p.h"
- #include "adler32_avx2_p.h"
- #include "x86_intrins.h"
- 
--extern uint32_t adler32_fold_copy_sse42(uint32_t adler, uint8_t *dst, const uint8_t *src, size_t len);
--extern uint32_t adler32_ssse3(uint32_t adler, const uint8_t *src, size_t len);
-+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-+_Static_assert(NMAX >= 64, "NMAX must accommodate at least one AVX2 block");
-+_Static_assert(NMAX < 5553, "NMAX must prevent 32-bit overflow in s2");
-+_Static_assert(BASE == 65521, "BASE must be largest prime below 2^16");
-+#endif
- 
--static inline uint32_t adler32_fold_copy_impl(uint32_t adler, uint8_t *dst, const uint8_t *src, size_t len, const int COPY) {
--    if (src == NULL) return 1L;
--    if (len == 0) return adler;
--
--    uint32_t adler0, adler1;
--    adler1 = (adler >> 16) & 0xffff;
--    adler0 = adler & 0xffff;
--
--rem_peel:
--    if (len < 16) {
--        if (COPY) {
--            return adler32_copy_len_16(adler0, src, dst, len, adler1);
--        } else {
--            return adler32_len_16(adler0, src, len, adler1);
--        }
--    } else if (len < 32) {
--        if (COPY) {
--            return adler32_fold_copy_sse42(adler, dst, src, len);
--        } else {
--            return adler32_ssse3(adler, src, len);
--        }
--    }
--
--    __m256i vs1, vs2, vs2_0;
-+extern uint32_t adler32_fold_copy_sse42(uint32_t adler, uint8_t *dst,
-+                                        const uint8_t *src, size_t len);
-+extern uint32_t adler32_ssse3(uint32_t adler, const uint8_t *src, size_t len);
- 
--    const __m256i dot2v = _mm256_setr_epi8(64, 63, 62, 61, 60, 59, 58, 57, 56, 55, 54, 53, 52, 51, 50, 49, 48, 47,
--                                           46, 45, 44, 43, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33);
--    const __m256i dot2v_0 = _mm256_setr_epi8(32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15,
--                                             14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1);
-+static inline uint32_t adler32_fold_copy_impl(uint32_t adler, uint8_t *dst,
-+                                              const uint8_t *src, size_t len,
-+                                              const int COPY) {
-+    if (src == NULL)
-+        return 1U;
-+    if (len == 0)
-+        return adler;
-+    if (COPY && dst == NULL)
-+        return 1U;
-+
-+    uint32_t adler0 = adler & 0xFFFFU;
-+    uint32_t adler1 = (adler >> 16) & 0xFFFFU;
-+
-+    const __m256i dot2v = _mm256_setr_epi8(
-+        64, 63, 62, 61, 60, 59, 58, 57, 56, 55, 54, 53, 52, 51, 50, 49,
-+        48, 47, 46, 45, 44, 43, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33);
-+    const __m256i dot2v_0 = _mm256_setr_epi8(
-+        32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17,
-+        16, 15, 14, 13, 12, 11, 10,  9,  8,  7,  6,  5,  4,  3,  2,  1);
-     const __m256i dot3v = _mm256_set1_epi16(1);
-     const __m256i zero = _mm256_setzero_si256();
- 
-     while (len >= 32) {
--        vs1 = _mm256_zextsi128_si256(_mm_cvtsi32_si128(adler0));
--        vs2 = _mm256_zextsi128_si256(_mm_cvtsi32_si128(adler1));
--        __m256i vs1_0 = vs1;
--        __m256i vs3 = _mm256_setzero_si256();
--        vs2_0 = vs3;
-+        __m256i vs1, vs2, vs1_0, vs2_0, vs3;
-+
-+        vs1 = _mm256_zextsi128_si256(_mm_cvtsi32_si128((int)adler0));
-+        vs2 = _mm256_zextsi128_si256(_mm_cvtsi32_si128((int)adler1));
-+        vs1_0 = vs1;
-+        vs3 = _mm256_setzero_si256();
-+        vs2_0 = _mm256_setzero_si256();
- 
--        size_t k = MIN(len, NMAX);
--        k -= k % 32;
-+        size_t k = (len < NMAX) ? len : NMAX;
-+        k &= ~(size_t)31;
-         len -= k;
- 
-         while (k >= 64) {
--            __m256i vbuf = _mm256_loadu_si256((__m256i*)src);
--            __m256i vbuf_0 = _mm256_loadu_si256((__m256i*)(src + 32));
--            src += 64;
--            k -= 64;
--
-+            __m256i vbuf = _mm256_loadu_si256((const __m256i *)src);
-+            __m256i vbuf_0 = _mm256_loadu_si256((const __m256i *)(src + 32));
-             __m256i vs1_sad = _mm256_sad_epu8(vbuf, zero);
-             __m256i vs1_sad2 = _mm256_sad_epu8(vbuf_0, zero);
- 
-             if (COPY) {
--                _mm256_storeu_si256((__m256i*)dst, vbuf);
--                _mm256_storeu_si256((__m256i*)(dst + 32), vbuf_0);
-+                _mm256_storeu_si256((__m256i *)dst, vbuf);
-+                _mm256_storeu_si256((__m256i *)(dst + 32), vbuf_0);
-                 dst += 64;
-             }
- 
--            vs1 = _mm256_add_epi32(vs1, vs1_sad);
-             vs3 = _mm256_add_epi32(vs3, vs1_0);
--            __m256i v_short_sum2 = _mm256_maddubs_epi16(vbuf, dot2v); // sum 32 uint8s to 16 shorts
--            __m256i v_short_sum2_0 = _mm256_maddubs_epi16(vbuf_0, dot2v_0); // sum 32 uint8s to 16 shorts
--            __m256i vsum2 = _mm256_madd_epi16(v_short_sum2, dot3v); // sum 16 shorts to 8 uint32s
--            __m256i vsum2_0 = _mm256_madd_epi16(v_short_sum2_0, dot3v); // sum 16 shorts to 8 uint32s
--            vs1 = _mm256_add_epi32(vs1_sad2, vs1);
--            vs2 = _mm256_add_epi32(vsum2, vs2);
--            vs2_0 = _mm256_add_epi32(vsum2_0, vs2_0);
-+            vs1 = _mm256_add_epi32(vs1, vs1_sad);
-+
-+            __m256i v_short_sum2 = _mm256_maddubs_epi16(vbuf, dot2v);
-+            __m256i v_short_sum2_0 = _mm256_maddubs_epi16(vbuf_0, dot2v_0);
-+            __m256i vsum2 = _mm256_madd_epi16(v_short_sum2, dot3v);
-+            __m256i vsum2_0 = _mm256_madd_epi16(v_short_sum2_0, dot3v);
-+
-+            vs1 = _mm256_add_epi32(vs1, vs1_sad2);
-+            vs2 = _mm256_add_epi32(vs2, vsum2);
-+            vs2_0 = _mm256_add_epi32(vs2_0, vsum2_0);
-+
-             vs1_0 = vs1;
-+            src += 64;
-+            k -= 64;
-         }
- 
--        vs2 = _mm256_add_epi32(vs2_0, vs2);
-+        vs2 = _mm256_add_epi32(vs2, vs2_0);
-         vs3 = _mm256_slli_epi32(vs3, 6);
--        vs2 = _mm256_add_epi32(vs3, vs2);
-+        vs2 = _mm256_add_epi32(vs2, vs3);
-+
-         vs3 = _mm256_setzero_si256();
- 
-         while (k >= 32) {
--            /*
--               vs1 = adler + sum(c[i])
--               vs2 = sum2 + 32 vs1 + sum( (32-i+1) c[i] )
--            */
--            __m256i vbuf = _mm256_loadu_si256((__m256i*)src);
--            src += 32;
--            k -= 32;
--
--            __m256i vs1_sad = _mm256_sad_epu8(vbuf, zero); // Sum of abs diff, resulting in 2 x int32's
-+            __m256i vbuf = _mm256_loadu_si256((const __m256i *)src);
-+            __m256i vs1_sad = _mm256_sad_epu8(vbuf, zero);
- 
-             if (COPY) {
--                _mm256_storeu_si256((__m256i*)dst, vbuf);
-+                _mm256_storeu_si256((__m256i *)dst, vbuf);
-                 dst += 32;
-             }
-- 
--            vs1 = _mm256_add_epi32(vs1, vs1_sad);
-+
-             vs3 = _mm256_add_epi32(vs3, vs1_0);
--            __m256i v_short_sum2 = _mm256_maddubs_epi16(vbuf, dot2v_0); // sum 32 uint8s to 16 shorts
--            __m256i vsum2 = _mm256_madd_epi16(v_short_sum2, dot3v); // sum 16 shorts to 8 uint32s
--            vs2 = _mm256_add_epi32(vsum2, vs2);
-+            vs1 = _mm256_add_epi32(vs1, vs1_sad);
-+
-+            __m256i v_short_sum2 = _mm256_maddubs_epi16(vbuf, dot2v_0);
-+            __m256i vsum2 = _mm256_madd_epi16(v_short_sum2, dot3v);
-+            vs2 = _mm256_add_epi32(vs2, vsum2);
-+
-             vs1_0 = vs1;
-+            src += 32;
-+            k -= 32;
-         }
- 
--        /* Defer the multiplication with 32 to outside of the loop */
-         vs3 = _mm256_slli_epi32(vs3, 5);
-         vs2 = _mm256_add_epi32(vs2, vs3);
- 
--        /* The compiler is generating the following sequence for this integer modulus
--         * when done the scalar way, in GPRs:
--
--         adler = (s1_unpack[0] % BASE) + (s1_unpack[1] % BASE) + (s1_unpack[2] % BASE) + (s1_unpack[3] % BASE) +
--                 (s1_unpack[4] % BASE) + (s1_unpack[5] % BASE) + (s1_unpack[6] % BASE) + (s1_unpack[7] % BASE);
--
--         mov    $0x80078071,%edi // move magic constant into 32 bit register %edi
--         ...
--         vmovd  %xmm1,%esi // move vector lane 0 to 32 bit register %esi
--         mov    %rsi,%rax  // zero-extend this value to 64 bit precision in %rax
--         imul   %rdi,%rsi // do a signed multiplication with magic constant and vector element
--         shr    $0x2f,%rsi // shift right by 47
--         imul   $0xfff1,%esi,%esi // do a signed multiplication with value truncated to 32 bits with 0xfff1
--         sub    %esi,%eax // subtract lower 32 bits of original vector value from modified one above
--         ...
--         // repeats for each element with vpextract instructions
--
--         This is tricky with AVX2 for a number of reasons:
--             1.) There's no 64 bit multiplication instruction, but there is a sequence to get there
--             2.) There's ways to extend vectors to 64 bit precision, but no simple way to truncate
--                 back down to 32 bit precision later (there is in AVX512)
--             3.) Full width integer multiplications aren't cheap
--
--         We can, however, do a relatively cheap sequence for horizontal sums.
--         Then, we simply do the integer modulus on the resulting 64 bit GPR, on a scalar value. It was
--         previously thought that casting to 64 bit precision was needed prior to the horizontal sum, but
--         that is simply not the case, as NMAX is defined as the maximum number of scalar sums that can be
--         performed on the maximum possible inputs before overflow
--         */
--
--
--         /* In AVX2-land, this trip through GPRs will probably be unavoidable, as there's no cheap and easy
--          * conversion from 64 bit integer to 32 bit (needed for the inexpensive modulus with a constant).
--          * This casting to 32 bit is cheap through GPRs (just register aliasing). See above for exactly
--          * what the compiler is doing to avoid integer divisions. */
--         adler0 = partial_hsum256(vs1) % BASE;
--         adler1 = hsum256(vs2) % BASE;
-+        adler0 = partial_hsum256(vs1) % BASE;
-+        adler1 = hsum256(vs2) % BASE;
-     }
- 
--    adler = adler0 | (adler1 << 16);
-+    if (len > 0) {
-+        uint32_t adler_combined = adler0 | (adler1 << 16);
-+        _mm256_zeroupper();
-+
-+        if (len < 16) {
-+            if (COPY)
-+                return adler32_copy_len_16(adler0, src, dst, len, adler1);
-+            return adler32_len_16(adler0, src, len, adler1);
-+        }
- 
--    if (len) {
--        goto rem_peel;
-+        if (COPY)
-+            return adler32_fold_copy_sse42(adler_combined, dst, src, len);
-+        return adler32_ssse3(adler_combined, src, len);
-     }
- 
--    return adler;
-+    _mm256_zeroupper();
-+    return adler0 | (adler1 << 16);
- }
- 
- Z_INTERNAL uint32_t adler32_avx2(uint32_t adler, const uint8_t *src, size_t len) {
-     return adler32_fold_copy_impl(adler, NULL, src, len, 0);
- }
- 
--Z_INTERNAL uint32_t adler32_fold_copy_avx2(uint32_t adler, uint8_t *dst, const uint8_t *src, size_t len) {
-+Z_INTERNAL uint32_t adler32_fold_copy_avx2(uint32_t adler, uint8_t *dst,
-+                                           const uint8_t *src, size_t len) {
-     return adler32_fold_copy_impl(adler, dst, src, len, 1);
- }
- 
