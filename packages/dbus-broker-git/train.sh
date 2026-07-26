@@ -32,6 +32,15 @@ LAUNCH="$B/src/dbus-broker-launch"
 BROKER="$B/src/dbus-broker"
 [[ -x $SESSION && -x $LAUNCH && -x $BROKER ]] || exit 0
 
+# The broker charges FDs against per-user quotas and the benchmarks open a
+# large number of connections. A low soft RLIMIT_NOFILE silently truncates the
+# heaviest benchmark iterations, which is exactly the profile weight we want.
+# Raise it to the hard limit (this mirrors what util_bump_nofile() does in the
+# broker itself after ms178-1.patch).
+if [[ -n ${BASH_VERSION:-} ]]; then
+        ulimit -n "$(ulimit -Hn)" 2>/dev/null || :
+fi
+
 WORK="$(mktemp -d)"
 cleanup() {
         # SIGTERM (not SIGKILL): BOLT's instrumentation and the LLVM profile
@@ -229,19 +238,45 @@ DBUS_BROKER_TEST_BROKER="$BROKER" timeout 900 meson test -C "$B" --no-rebuild \
 #
 # Coverage (which functions are touched) and weight (how hot each one is) are
 # different things, and BOLT's block/function ordering is driven by weight.
-# Measured on dbus-broker: sections 1-4 together contribute ~1.1e7 executed
-# instructions, bench-message alone contributes ~1.9e10 - three orders of
-# magnitude more, concentrated in exactly the message/match/queue paths that
-# dominate real broker load. Skipping this would leave BOLT ordering the hot
-# loops on almost no evidence.
-# ---------------------------------------------------------------------------
-for gen in bench-message bench-connect tool-flood; do
-        [[ -x "$B/test/dbus/$gen" ]] || continue
-        DBUS_BROKER_TEST_BROKER="$BROKER" timeout 600 \
-                "$B/test/dbus/$gen" >/dev/null 2>&1 || :
+# Measured on dbus-broker with an instrumented build:
+#     sections 1-4 together : ~1.1e7  executed instructions
+#     bench-message         : ~1.92e10 executed instructions  (~1750x)
+#     bench-connect         : ~1.91e8  executed instructions
+# Skipping these would leave BOLT ordering the hot loops on almost no evidence.
+#
+# tool-flood is deliberately NOT used, for three measured reasons:
+#   1. main() does `assert(argc == 2)` - invoked with no argument it dies with
+#      SIGABRT (exit 134, "Aborted"/"Abgebrochen"). This is the crash seen in
+#      the build log; it is harmless (the `|| :` swallows it) but pointless.
+#   2. It hardcodes a connect() to /run/dbus/system_bus_socket and ignores
+#      DBUS_BROKER_TEST_BROKER entirely, so it never even starts the broker we
+#      are profiling. Measured contribution: 0 executions, 0 profile weight.
+#   3. test_flood() is `noreturn` - an endless ping loop with no exit
+#      condition. Given an argument on a host that does have a system bus, it
+#      would burn the entire timeout while flooding the build host's real
+#      system bus. Unacceptable in a package build.
+#
+# Each generator is verified to have actually produced its profile: a silent
+# partial run (OOM-killer, RLIMIT_NOFILE exhaustion, timeout) would otherwise
+# cost most of the profile weight without any visible error.
+for gen in bench-message bench-connect; do
+        bin="$B/test/dbus/$gen"
+        [[ -x $bin ]] || continue
+
+        # Generous but bounded: bench-message needs ~80s against an
+        # instrumented broker on a slow 2-core box, far less on real hardware.
+        start=$(date +%s)
+        DBUS_BROKER_TEST_BROKER="$BROKER" timeout 900 "$bin" >/dev/null 2>&1
+        rc=$?
+        dur=$(( $(date +%s) - start ))
+
+        case $rc in
+        0)   ;;
+        124) printf 'train.sh: WARNING: %s timed out after %ss - profile weight will be low\n' "$gen" "$dur" >&2 ;;
+        *)   printf 'train.sh: WARNING: %s exited %s after %ss - profile weight will be low\n' "$gen" "$rc" "$dur" >&2 ;;
+        esac
 done
 
-# ---------------------------------------------------------------------------
 # 6) Cheap CLI surfaces of the two C programs, including arg-parse errors.
 # ---------------------------------------------------------------------------
 for round in $(seq 1 12); do
