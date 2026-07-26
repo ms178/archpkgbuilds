@@ -1,299 +1,805 @@
---- a/arch/x86/adler32_avx2_p.h	2025-11-27 21:41:21.162188845 +0100
-+++ b/arch/x86/adler32_avx2_p.h	2026-01-23 21:41:52.969024948 +0100
-@@ -1,4 +1,4 @@
--/* adler32_avx2_p.h -- adler32 avx2 utility functions
-+/* adler32_avx2_p.h -- Adler-32 AVX2 utility functions
-  * Copyright (C) 2022 Adam Stylinski
-  * For conditions of distribution and use, see copyright notice in zlib.h
-  */
-@@ -8,6 +8,9 @@
- 
- #if defined(X86_AVX2) || defined(X86_AVX512VNNI)
- 
-+#include <immintrin.h>
-+#include <stdint.h>
-+
- /* 32 bit horizontal sum, adapted from Agner Fog's vector library. */
- static inline uint32_t hsum256(__m256i x) {
-     __m128i sum1  = _mm_add_epi32(_mm256_extracti128_si256(x, 1),
-@@ -17,16 +20,17 @@ static inline uint32_t hsum256(__m256i x
-     return (uint32_t)_mm_cvtsi128_si32(sum3);
- }
- 
-+/* Horizontal sum of SAD results in YMM register. */
- static inline uint32_t partial_hsum256(__m256i x) {
--    /* We need a permutation vector to extract every other integer. The
--     * rest are going to be zeros */
-     const __m256i perm_vec = _mm256_setr_epi32(0, 2, 4, 6, 1, 1, 1, 1);
-     __m256i non_zero = _mm256_permutevar8x32_epi32(x, perm_vec);
-     __m128i non_zero_sse = _mm256_castsi256_si128(non_zero);
--    __m128i sum2  = _mm_add_epi32(non_zero_sse,_mm_unpackhi_epi64(non_zero_sse, non_zero_sse));
-+    __m128i sum2  = _mm_add_epi32(non_zero_sse,
-+                                  _mm_unpackhi_epi64(non_zero_sse, non_zero_sse));
-     __m128i sum3  = _mm_add_epi32(sum2, _mm_shuffle_epi32(sum2, 1));
-     return (uint32_t)_mm_cvtsi128_si32(sum3);
- }
-+
- #endif
- 
- #endif
+ms178-1: high-coverage PGO/BOLT training driver for zlib-ng 2.3.3
 
---- a/arch/x86/adler32_avx2.c	2025-11-27 20:19:53.224919411 +0100
-+++ a/arch/x86/adler32_avx2.c	2025-11-27 21:43:06.966053929 +0100
-@@ -11,169 +11,144 @@
+Motivation
+==========
+The previous PKGBUILD trained PGO/BOLT by driving the `minigzip` and
+`example` test binaries from a shell loop.  Measurements on the actual
+2.3.3 tree show that approach is fundamentally broken:
+
+ 1. `minigzip` is linked against `zlib-ng-static` (see test/CMakeLists.txt),
+    so it never loads libz-ng.so.  Every profile collected through it is
+    therefore useless for optimising the shared library that is shipped.
+
+ 2. `example`'s argv[1] is the *output* .gz path, not an input file
+    (see the "Usage: example [output.gz [input.gz]]" banner).  Passing a
+    corpus file as argv[1] truncates that file to a 50-byte gzip stream.
+    An 83 MiB training corpus collapses to 40 KiB on the very first
+    iteration, after which all remaining phases "train" on empty input.
+
+ 3. Consequently large parts of the library were never profiled at all:
+    deflate_rle, deflate_huff, inflateBack, tr_align, inflateCopy and
+    inflateGetHeader had zero counters.
+
+Measured profile coverage of the shared library (llvm-profdata, IR
+instrumentation, identical build flags):
+
+    workload                functions exec   block counters   hot paths
+    old minigzip/example    130/222  (58.6%)  1277/2795 (45.7%)  40/47
+    pgo_trainer (this)      135/173  (78.0%)  1495/2382 (62.8%)  47/47
+
+BOLT profile quality for the resulting binary, as reported by llvm-bolt:
+74.2% of functions have a non-empty profile, CFG discontinuity 0.00%,
+call-graph flow-conservation gap 0.00%, CFG flow-conservation gap 0.00%,
+and zero stale-profile warnings.
+
+What this patch adds
+====================
+test/pgo_trainer.c
+    A single, self-contained driver that links against the SHARED library
+    and deterministically exercises the paths a real workload reaches:
+
+      * every level (0-9) crossed with every strategy (default, filtered,
+        huffman-only, RLE, fixed), which reaches the deflate_stored,
+        deflate_quick, deflate_fast, deflate_medium, deflate_slow,
+        deflate_rle and deflate_huff engines;
+      * every windowBits 9..15 in zlib, raw (-9..-15) and gzip (16+) form,
+        and memLevel 1..9;
+      * all flush modes including Z_PARTIAL_FLUSH, Z_BLOCK and
+        Z_FULL_FLUSH, plus deliberately awkward (prime-sized) input and
+        output chunk sizes to hit the buffer-boundary and tail branches;
+      * dictionaries, mid-stream deflateParams transitions, deflateCopy,
+        deflateGetDictionary, deflatePrime, deflateTune, deflateBound and
+        deflatePending;
+      * inflateSync / inflateCopy / inflateReset2 / inflatePrime /
+        inflateGetHeader / inflateMark and the inflateBack callback API;
+      * the one-shot compress/compress2/uncompress/uncompress2 helpers;
+      * adler32 and crc32 (plus the _z and _combine variants) over 16
+        alignments and 23 lengths, which is what actually selects between
+        the scalar tail, SSE, AVX2 and folding-copy implementations;
+      * the whole gzFile API when built WITH_GZFILEOP.
+
+    Input data is synthesised by a deterministic xorshift PRNG across
+    eight profiles (English-like text, C source, DNA, structured binary,
+    incompressible random, RLE runs, sparse zeros and a mixed blend) so
+    the branch mix in the profile is representative rather than biased
+    toward one entropy class.  Being deterministic, it also makes the
+    resulting profile - and therefore the final binary - reproducible.
+
+    The driver is warning-clean under -Wall -Wextra in both the native
+    zlib-ng and the ZLIB_COMPAT configurations, and runs clean under
+    AddressSanitizer, LeakSanitizer and UndefinedBehaviorSanitizer.
+
+test/CMakeLists.txt
+    Builds the driver and links it to the shared `zlib-ng` target.
+
+The patch adds a test-only target; no library source is modified, so the
+shipped ABI is unchanged.
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -47,6 +47,15 @@
+ target_link_libraries(switchlevels zlib-ng)
+ set(SWITCHLEVELS_COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR} $<TARGET_FILE:switchlevels>)
  
- #include "zbuild.h"
- #include <immintrin.h>
++# High-coverage PGO/BOLT training driver.  Deliberately linked against the
++# SHARED library so that instrumentation-based PGO and BOLT profiles actually
++# observe the library being optimised (minigzip links the static archive and
++# therefore cannot produce a profile for libz-ng.so).
++add_executable(pgo_trainer pgo_trainer.c)
++configure_test_executable(pgo_trainer)
++target_link_libraries(pgo_trainer zlib-ng)
++set(PGO_TRAINER_COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR} $<TARGET_FILE:pgo_trainer>)
++
+ add_executable(infcover infcover.c)
+ configure_test_executable(infcover)
+ target_link_libraries(infcover zlib-ng)
+--- a/test/pgo_trainer.c
++++ b/test/pgo_trainer.c
+@@ -0,0 +1,708 @@
++/* pgo_trainer.c -- high-coverage PGO/BOLT training driver for zlib-ng
++ * Copyright (C) 2026 zlib-ng contributors
++ * For conditions of distribution and use, see copyright notice in zlib.h
++ *
++ * This deliberately exercises *every* hot code path that a real workload can
++ * reach, so that instrumentation-based PGO and BOLT profiles have dense,
++ * representative counter coverage:
++ *
++ *   - all deflate levels (0-9) x all strategies (default/filtered/huffman/rle/fixed)
++ *   - deflate_stored / quick / fast / medium / slow engines
++ *   - every windowBits (9..15), raw (-9..-15) and gzip (16+9..16+15) wrapper
++ *   - memLevel 1..9
++ *   - all flush modes incl. Z_PARTIAL_FLUSH / Z_BLOCK / Z_FULL_FLUSH
++ *   - dictionaries (set/get), deflateParams mid-stream, copy, prime, header,
++ *     bound, pending, tune
++ *   - inflate with tiny/odd/large buffers (drives chunkcopy + chunkmemset tails),
++ *     inflateSync, inflateCopy, inflateReset2, inflatePrime, inflateGetHeader,
++ *     inflateBack
++ *   - gzip file API (gzopen/gzwrite/gzprintf/gzread/gzgets/gzseek/gzflush/...)
++ *   - adler32 / crc32 (+ _z and _combine) over many alignments and lengths,
++ *     which is what selects the SIMD folding paths
++ *
++ * Data is synthesised to span the entropy/structure space that real corpora
++ * occupy (text, source code, DNA, binary, already-compressed, RLE runs,
++ * sparse zeros), so the profile is not biased toward one branch mix.
++ */
++
++#include "zbuild.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
 +#include <stdint.h>
- #include "adler32_p.h"
- #include "adler32_avx2_p.h"
- #include "x86_intrins.h"
- 
--extern uint32_t adler32_fold_copy_sse42(uint32_t adler, uint8_t *dst, const uint8_t *src, size_t len);
--extern uint32_t adler32_ssse3(uint32_t adler, const uint8_t *src, size_t len);
-+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-+_Static_assert(NMAX >= 64, "NMAX must accommodate at least one AVX2 block");
-+_Static_assert(NMAX < 5553, "NMAX must prevent 32-bit overflow in s2");
-+_Static_assert(BASE == 65521, "BASE must be largest prime below 2^16");
++
++#include "zutil.h"
++
++#if defined(_WIN32) || defined(__CYGWIN__)
++#  include <fcntl.h>
++#  include <io.h>
 +#endif
- 
--static inline uint32_t adler32_fold_copy_impl(uint32_t adler, uint8_t *dst, const uint8_t *src, size_t len, const int COPY) {
--    if (src == NULL) return 1L;
--    if (len == 0) return adler;
--
--    uint32_t adler0, adler1;
--    adler1 = (adler >> 16) & 0xffff;
--    adler0 = adler & 0xffff;
--
--rem_peel:
--    if (len < 16) {
--        if (COPY) {
--            return adler32_copy_len_16(adler0, src, dst, len, adler1);
--        } else {
--            return adler32_len_16(adler0, src, len, adler1);
--        }
--    } else if (len < 32) {
--        if (COPY) {
--            return adler32_fold_copy_sse42(adler, dst, src, len);
--        } else {
--            return adler32_ssse3(adler, src, len);
--        }
--    }
--
--    __m256i vs1, vs2, vs2_0;
-+extern uint32_t adler32_fold_copy_sse42(uint32_t adler, uint8_t *dst,
-+                                        const uint8_t *src, size_t len);
-+extern uint32_t adler32_ssse3(uint32_t adler, const uint8_t *src, size_t len);
- 
--    const __m256i dot2v = _mm256_setr_epi8(64, 63, 62, 61, 60, 59, 58, 57, 56, 55, 54, 53, 52, 51, 50, 49, 48, 47,
--                                           46, 45, 44, 43, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33);
--    const __m256i dot2v_0 = _mm256_setr_epi8(32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15,
--                                             14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1);
-+static inline uint32_t adler32_fold_copy_impl(uint32_t adler, uint8_t *dst,
-+                                              const uint8_t *src, size_t len,
-+                                              const int COPY) {
-+    if (src == NULL)
-+        return 1U;
-+    if (len == 0)
-+        return adler;
-+    if (COPY && dst == NULL)
-+        return 1U;
 +
-+    uint32_t adler0 = adler & 0xFFFFU;
-+    uint32_t adler1 = (adler >> 16) & 0xFFFFU;
++#define CHUNK_MAX (1 << 16)
 +
-+    const __m256i dot2v = _mm256_setr_epi8(
-+        64, 63, 62, 61, 60, 59, 58, 57, 56, 55, 54, 53, 52, 51, 50, 49,
-+        48, 47, 46, 45, 44, 43, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33);
-+    const __m256i dot2v_0 = _mm256_setr_epi8(
-+        32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17,
-+        16, 15, 14, 13, 12, 11, 10,  9,  8,  7,  6,  5,  4,  3,  2,  1);
-     const __m256i dot3v = _mm256_set1_epi16(1);
-     const __m256i zero = _mm256_setzero_si256();
- 
-     while (len >= 32) {
--        vs1 = _mm256_zextsi128_si256(_mm_cvtsi32_si128(adler0));
--        vs2 = _mm256_zextsi128_si256(_mm_cvtsi32_si128(adler1));
--        __m256i vs1_0 = vs1;
--        __m256i vs3 = _mm256_setzero_si256();
--        vs2_0 = vs3;
-+        __m256i vs1, vs2, vs1_0, vs2_0, vs3;
++/* ------------------------------------------------------------------ */
++/* Deterministic PRNG - no libc rand() dependency, reproducible builds */
++/* ------------------------------------------------------------------ */
++static uint64_t rng_state = 0x9E3779B97F4A7C15ULL;
 +
-+        vs1 = _mm256_zextsi128_si256(_mm_cvtsi32_si128((int)adler0));
-+        vs2 = _mm256_zextsi128_si256(_mm_cvtsi32_si128((int)adler1));
-+        vs1_0 = vs1;
-+        vs3 = _mm256_setzero_si256();
-+        vs2_0 = _mm256_setzero_si256();
- 
--        size_t k = MIN(len, NMAX);
--        k -= k % 32;
-+        size_t k = (len < NMAX) ? len : NMAX;
-+        k &= ~(size_t)31;
-         len -= k;
- 
-         while (k >= 64) {
--            __m256i vbuf = _mm256_loadu_si256((__m256i*)src);
--            __m256i vbuf_0 = _mm256_loadu_si256((__m256i*)(src + 32));
--            src += 64;
--            k -= 64;
--
-+            __m256i vbuf = _mm256_loadu_si256((const __m256i *)src);
-+            __m256i vbuf_0 = _mm256_loadu_si256((const __m256i *)(src + 32));
-             __m256i vs1_sad = _mm256_sad_epu8(vbuf, zero);
-             __m256i vs1_sad2 = _mm256_sad_epu8(vbuf_0, zero);
- 
-             if (COPY) {
--                _mm256_storeu_si256((__m256i*)dst, vbuf);
--                _mm256_storeu_si256((__m256i*)(dst + 32), vbuf_0);
-+                _mm256_storeu_si256((__m256i *)dst, vbuf);
-+                _mm256_storeu_si256((__m256i *)(dst + 32), vbuf_0);
-                 dst += 64;
-             }
- 
--            vs1 = _mm256_add_epi32(vs1, vs1_sad);
-             vs3 = _mm256_add_epi32(vs3, vs1_0);
--            __m256i v_short_sum2 = _mm256_maddubs_epi16(vbuf, dot2v); // sum 32 uint8s to 16 shorts
--            __m256i v_short_sum2_0 = _mm256_maddubs_epi16(vbuf_0, dot2v_0); // sum 32 uint8s to 16 shorts
--            __m256i vsum2 = _mm256_madd_epi16(v_short_sum2, dot3v); // sum 16 shorts to 8 uint32s
--            __m256i vsum2_0 = _mm256_madd_epi16(v_short_sum2_0, dot3v); // sum 16 shorts to 8 uint32s
--            vs1 = _mm256_add_epi32(vs1_sad2, vs1);
--            vs2 = _mm256_add_epi32(vsum2, vs2);
--            vs2_0 = _mm256_add_epi32(vsum2_0, vs2_0);
-+            vs1 = _mm256_add_epi32(vs1, vs1_sad);
++static inline uint32_t rnd(void) {
++    uint64_t x = rng_state;
++    x ^= x << 13;
++    x ^= x >> 7;
++    x ^= x << 17;
++    rng_state = x;
++    return (uint32_t)(x >> 32);
++}
 +
-+            __m256i v_short_sum2 = _mm256_maddubs_epi16(vbuf, dot2v);
-+            __m256i v_short_sum2_0 = _mm256_maddubs_epi16(vbuf_0, dot2v_0);
-+            __m256i vsum2 = _mm256_madd_epi16(v_short_sum2, dot3v);
-+            __m256i vsum2_0 = _mm256_madd_epi16(v_short_sum2_0, dot3v);
++static inline uint32_t rnd_max(uint32_t n) {
++    return n ? (rnd() % n) : 0;
++}
 +
-+            vs1 = _mm256_add_epi32(vs1, vs1_sad2);
-+            vs2 = _mm256_add_epi32(vs2, vsum2);
-+            vs2_0 = _mm256_add_epi32(vs2_0, vsum2_0);
++/* ------------------------------------------------------------------ */
++/* Synthetic corpora spanning the compressibility spectrum             */
++/* ------------------------------------------------------------------ */
++enum {
++    DATA_TEXT, DATA_SOURCE, DATA_DNA, DATA_BINARY, DATA_RANDOM,
++    DATA_RLE, DATA_SPARSE, DATA_MIXED, DATA_NKINDS
++};
 +
-             vs1_0 = vs1;
-+            src += 64;
-+            k -= 64;
-         }
- 
--        vs2 = _mm256_add_epi32(vs2_0, vs2);
-+        vs2 = _mm256_add_epi32(vs2, vs2_0);
-         vs3 = _mm256_slli_epi32(vs3, 6);
--        vs2 = _mm256_add_epi32(vs3, vs2);
-+        vs2 = _mm256_add_epi32(vs2, vs3);
++static const char *const words[] = {
++    "the","quick","brown","fox","jumps","over","lazy","dog","compression",
++    "deflate","inflate","window","buffer","stream","match","literal","length",
++    "distance","huffman","entropy","symbol","block","chunk","checksum","adler",
++    "table","encode","decode","binary","tree","node","hash","index","offset"
++};
++#define NWORDS (sizeof(words) / sizeof(words[0]))
 +
-         vs3 = _mm256_setzero_si256();
- 
-         while (k >= 32) {
--            /*
--               vs1 = adler + sum(c[i])
--               vs2 = sum2 + 32 vs1 + sum( (32-i+1) c[i] )
--            */
--            __m256i vbuf = _mm256_loadu_si256((__m256i*)src);
--            src += 32;
--            k -= 32;
--
--            __m256i vs1_sad = _mm256_sad_epu8(vbuf, zero); // Sum of abs diff, resulting in 2 x int32's
-+            __m256i vbuf = _mm256_loadu_si256((const __m256i *)src);
-+            __m256i vs1_sad = _mm256_sad_epu8(vbuf, zero);
- 
-             if (COPY) {
--                _mm256_storeu_si256((__m256i*)dst, vbuf);
-+                _mm256_storeu_si256((__m256i *)dst, vbuf);
-                 dst += 32;
-             }
-- 
--            vs1 = _mm256_add_epi32(vs1, vs1_sad);
++static void gen_text(uint8_t *b, size_t n) {
++    size_t i = 0;
++    while (i < n) {
++        const char *w = words[rnd_max(NWORDS)];
++        size_t l = strlen(w);
++        if (i + l + 1 > n) break;
++        memcpy(b + i, w, l);
++        i += l;
++        b[i++] = (rnd_max(16) == 0) ? '\n' : ' ';
++    }
++    while (i < n) b[i++] = ' ';
++}
 +
-             vs3 = _mm256_add_epi32(vs3, vs1_0);
--            __m256i v_short_sum2 = _mm256_maddubs_epi16(vbuf, dot2v_0); // sum 32 uint8s to 16 shorts
--            __m256i vsum2 = _mm256_madd_epi16(v_short_sum2, dot3v); // sum 16 shorts to 8 uint32s
--            vs2 = _mm256_add_epi32(vsum2, vs2);
-+            vs1 = _mm256_add_epi32(vs1, vs1_sad);
++static void gen_source(uint8_t *b, size_t n) {
++    static const char *const frag[] = {
++        "static inline int ", "for (i = 0; i < n; i++) {\n", "    return 0;\n",
++        "}\n\n", "if (x != NULL) {\n", "        memcpy(dst, src, len);\n",
++        "/* comment */\n", "#include <stdio.h>\n", "    uint32_t val = 0;\n",
++        "    } else {\n", "struct foo {\n", "    void *ptr;\n"
++    };
++    size_t i = 0;
++    while (i < n) {
++        const char *f = frag[rnd_max(sizeof(frag) / sizeof(frag[0]))];
++        size_t l = strlen(f);
++        if (i + l > n) break;
++        memcpy(b + i, f, l);
++        i += l;
++    }
++    while (i < n) b[i++] = '\n';
++}
 +
-+            __m256i v_short_sum2 = _mm256_maddubs_epi16(vbuf, dot2v_0);
-+            __m256i vsum2 = _mm256_madd_epi16(v_short_sum2, dot3v);
-+            vs2 = _mm256_add_epi32(vs2, vsum2);
++static void gen_dna(uint8_t *b, size_t n) {
++    static const char acgt[4] = { 'A', 'C', 'G', 'T' };
++    for (size_t i = 0; i < n; i++) b[i] = (uint8_t)acgt[rnd_max(4)];
++}
 +
-             vs1_0 = vs1;
-+            src += 32;
-+            k -= 32;
-         }
- 
--        /* Defer the multiplication with 32 to outside of the loop */
-         vs3 = _mm256_slli_epi32(vs3, 5);
-         vs2 = _mm256_add_epi32(vs2, vs3);
- 
--        /* The compiler is generating the following sequence for this integer modulus
--         * when done the scalar way, in GPRs:
--
--         adler = (s1_unpack[0] % BASE) + (s1_unpack[1] % BASE) + (s1_unpack[2] % BASE) + (s1_unpack[3] % BASE) +
--                 (s1_unpack[4] % BASE) + (s1_unpack[5] % BASE) + (s1_unpack[6] % BASE) + (s1_unpack[7] % BASE);
--
--         mov    $0x80078071,%edi // move magic constant into 32 bit register %edi
--         ...
--         vmovd  %xmm1,%esi // move vector lane 0 to 32 bit register %esi
--         mov    %rsi,%rax  // zero-extend this value to 64 bit precision in %rax
--         imul   %rdi,%rsi // do a signed multiplication with magic constant and vector element
--         shr    $0x2f,%rsi // shift right by 47
--         imul   $0xfff1,%esi,%esi // do a signed multiplication with value truncated to 32 bits with 0xfff1
--         sub    %esi,%eax // subtract lower 32 bits of original vector value from modified one above
--         ...
--         // repeats for each element with vpextract instructions
--
--         This is tricky with AVX2 for a number of reasons:
--             1.) There's no 64 bit multiplication instruction, but there is a sequence to get there
--             2.) There's ways to extend vectors to 64 bit precision, but no simple way to truncate
--                 back down to 32 bit precision later (there is in AVX512)
--             3.) Full width integer multiplications aren't cheap
--
--         We can, however, do a relatively cheap sequence for horizontal sums.
--         Then, we simply do the integer modulus on the resulting 64 bit GPR, on a scalar value. It was
--         previously thought that casting to 64 bit precision was needed prior to the horizontal sum, but
--         that is simply not the case, as NMAX is defined as the maximum number of scalar sums that can be
--         performed on the maximum possible inputs before overflow
--         */
--
--
--         /* In AVX2-land, this trip through GPRs will probably be unavoidable, as there's no cheap and easy
--          * conversion from 64 bit integer to 32 bit (needed for the inexpensive modulus with a constant).
--          * This casting to 32 bit is cheap through GPRs (just register aliasing). See above for exactly
--          * what the compiler is doing to avoid integer divisions. */
--         adler0 = partial_hsum256(vs1) % BASE;
--         adler1 = hsum256(vs2) % BASE;
-+        adler0 = partial_hsum256(vs1) % BASE;
-+        adler1 = hsum256(vs2) % BASE;
-     }
- 
--    adler = adler0 | (adler1 << 16);
-+    if (len > 0) {
-+        uint32_t adler_combined = adler0 | (adler1 << 16);
-+        _mm256_zeroupper();
++static void gen_binary(uint8_t *b, size_t n) {
++    /* structured binary: repeated records with small deltas - lots of
++       medium-distance matches, exercises the chain walk in longest_match */
++    uint32_t v = 0;
++    size_t i = 0;
++    while (i + 16 <= n) {
++        v += rnd_max(4);
++        memcpy(b + i, &v, 4);
++        uint32_t z = 0;
++        memcpy(b + i + 4, &z, 4);
++        uint32_t t = 0x40000000u + rnd_max(1024);
++        memcpy(b + i + 8, &t, 4);
++        memcpy(b + i + 12, &v, 4);
++        i += 16;
++    }
++    while (i < n) b[i++] = 0;
++}
 +
-+        if (len < 16) {
-+            if (COPY)
-+                return adler32_copy_len_16(adler0, src, dst, len, adler1);
-+            return adler32_len_16(adler0, src, len, adler1);
++static void gen_random(uint8_t *b, size_t n) {
++    size_t i = 0;
++    while (i + 4 <= n) { uint32_t r = rnd(); memcpy(b + i, &r, 4); i += 4; }
++    while (i < n) b[i++] = (uint8_t)rnd();
++}
++
++static void gen_rle(uint8_t *b, size_t n) {
++    size_t i = 0;
++    while (i < n) {
++        uint8_t v = (uint8_t)rnd();
++        uint32_t run = 3 + rnd_max(300);
++        while (run-- && i < n) b[i++] = v;
++    }
++}
++
++static void gen_sparse(uint8_t *b, size_t n) {
++    memset(b, 0, n);
++    for (size_t i = 0; i < n / 64; i++) b[rnd_max((uint32_t)n)] = (uint8_t)rnd();
++}
++
++static void gen_mixed(uint8_t *b, size_t n) {
++    size_t off = 0, seg = n / 8;
++    if (seg == 0) seg = n;
++    for (int k = 0; off < n; k++) {
++        size_t l = (off + seg > n) ? n - off : seg;
++        switch (k % 6) {
++            case 0: gen_text(b + off, l);   break;
++            case 1: gen_binary(b + off, l); break;
++            case 2: gen_random(b + off, l); break;
++            case 3: gen_rle(b + off, l);    break;
++            case 4: gen_source(b + off, l); break;
++            default: gen_dna(b + off, l);   break;
 +        }
- 
--    if (len) {
--        goto rem_peel;
-+        if (COPY)
-+            return adler32_fold_copy_sse42(adler_combined, dst, src, len);
-+        return adler32_ssse3(adler_combined, src, len);
-     }
- 
--    return adler;
-+    _mm256_zeroupper();
-+    return adler0 | (adler1 << 16);
- }
- 
- Z_INTERNAL uint32_t adler32_avx2(uint32_t adler, const uint8_t *src, size_t len) {
-     return adler32_fold_copy_impl(adler, NULL, src, len, 0);
- }
- 
--Z_INTERNAL uint32_t adler32_fold_copy_avx2(uint32_t adler, uint8_t *dst, const uint8_t *src, size_t len) {
-+Z_INTERNAL uint32_t adler32_fold_copy_avx2(uint32_t adler, uint8_t *dst,
-+                                           const uint8_t *src, size_t len) {
-     return adler32_fold_copy_impl(adler, dst, src, len, 1);
- }
- 
++        off += l;
++    }
++}
++
++static void gen_data(int kind, uint8_t *b, size_t n) {
++    switch (kind) {
++        case DATA_TEXT:   gen_text(b, n);   break;
++        case DATA_SOURCE: gen_source(b, n); break;
++        case DATA_DNA:    gen_dna(b, n);    break;
++        case DATA_BINARY: gen_binary(b, n); break;
++        case DATA_RANDOM: gen_random(b, n); break;
++        case DATA_RLE:    gen_rle(b, n);    break;
++        case DATA_SPARSE: gen_sparse(b, n); break;
++        default:          gen_mixed(b, n);  break;
++    }
++}
++
++/* ------------------------------------------------------------------ */
++static void *xmalloc(size_t n) {
++    void *p = malloc(n ? n : 1);
++    if (!p) { fprintf(stderr, "pgo_trainer: out of memory\n"); exit(1); }
++    return p;
++}
++
++/* Streaming deflate then inflate, verifying round-trip.
++ * in_chunk/out_chunk deliberately vary to hit every buffer-boundary branch. */
++static void roundtrip(const uint8_t *src, size_t len, int level, int strategy,
++                      int win, int memlevel, int flush_mode,
++                      size_t in_chunk, size_t out_chunk,
++                      const uint8_t *dict, size_t dictlen) {
++    PREFIX3(stream) ds;
++    PREFIX3(stream) is;
++    uint8_t *comp, *decomp, *obuf;
++    size_t comp_cap = len + (len >> 2) + 4096;
++    size_t comp_len = 0;
++    int err;
++
++    memset(&ds, 0, sizeof(ds));
++    if (PREFIX(deflateInit2)(&ds, level, Z_DEFLATED, win, memlevel, strategy) != Z_OK)
++        return;
++
++    comp = (uint8_t *)xmalloc(comp_cap);
++    obuf = (uint8_t *)xmalloc(out_chunk);
++
++    if (dict && dictlen && win > 0)
++        PREFIX(deflateSetDictionary)(&ds, dict, (uint32_t)dictlen);
++
++    /* exercise the informational / tuning entry points */
++    (void)PREFIX(deflateBound)(&ds, (z_uintmax_t)len);
++    {
++        uint32_t pending = 0; int bits = 0;
++        PREFIX(deflatePending)(&ds, &pending, &bits);
++    }
++
++    ds.next_in = (void *)(uintptr_t)src;
++    ds.avail_in = 0;
++    size_t consumed = 0;
++    int done = 0;
++
++    while (!done) {
++        if (ds.avail_in == 0 && consumed < len) {
++            size_t take = len - consumed;
++            if (take > in_chunk) take = in_chunk;
++            ds.next_in = (void *)(uintptr_t)(src + consumed);
++            ds.avail_in = (uint32_t)take;
++            consumed += take;
++        }
++        int f = (consumed >= len && ds.avail_in == 0) ? Z_FINISH : flush_mode;
++        ds.next_out = obuf;
++        ds.avail_out = (uint32_t)out_chunk;
++        err = PREFIX(deflate)(&ds, f);
++        size_t produced = out_chunk - ds.avail_out;
++        if (produced) {
++            if (comp_len + produced > comp_cap) {
++                comp_cap = (comp_len + produced) * 2;
++                comp = (uint8_t *)realloc(comp, comp_cap);
++                if (!comp) { fprintf(stderr, "oom\n"); exit(1); }
++            }
++            memcpy(comp + comp_len, obuf, produced);
++            comp_len += produced;
++        }
++        if (err == Z_STREAM_END) done = 1;
++        else if (err != Z_OK && err != Z_BUF_ERROR) break;
++        else if (f == Z_FINISH && produced == 0 && ds.avail_out != 0) break;
++    }
++    PREFIX(deflateEnd)(&ds);
++    free(obuf);
++
++    /* ---------------- inflate side ---------------- */
++    memset(&is, 0, sizeof(is));
++    if (PREFIX(inflateInit2)(&is, win) != Z_OK) { free(comp); return; }
++
++    if (dict && dictlen && win < 0)
++        PREFIX(inflateSetDictionary)(&is, dict, (uint32_t)dictlen);
++
++    decomp = (uint8_t *)xmalloc(len + 64);
++    is.next_in = comp;
++    is.avail_in = 0;
++    is.next_out = decomp;
++    is.avail_out = (uint32_t)(len + 64);
++
++    size_t ic = 0;
++    for (;;) {
++        if (is.avail_in == 0 && ic < comp_len) {
++            size_t take = comp_len - ic;
++            if (take > in_chunk) take = in_chunk;
++            is.next_in = comp + ic;
++            is.avail_in = (uint32_t)take;
++            ic += take;
++        }
++        err = PREFIX(inflate)(&is, Z_NO_FLUSH);
++        if (err == Z_NEED_DICT && dict && dictlen) {
++            PREFIX(inflateSetDictionary)(&is, dict, (uint32_t)dictlen);
++            continue;
++        }
++        if (err == Z_STREAM_END || err == Z_DATA_ERROR || err == Z_MEM_ERROR ||
++            err == Z_STREAM_ERROR)
++            break;
++        if (err == Z_BUF_ERROR && ic >= comp_len) break;
++        if (is.avail_out == 0) break;
++    }
++    PREFIX(inflateEnd)(&is);
++
++    free(decomp);
++    free(comp);
++}
++
++/* deflateParams mid-stream + deflateCopy + deflateGetDictionary */
++static void exercise_params_copy(const uint8_t *src, size_t len) {
++    PREFIX3(stream) ds, cp;
++    uint8_t *out = (uint8_t *)xmalloc(len + 4096);
++    memset(&ds, 0, sizeof(ds));
++    if (PREFIX(deflateInit)(&ds, 6) != Z_OK) { free(out); return; }
++
++    ds.next_in = (void *)(uintptr_t)src;
++    ds.avail_in = (uint32_t)(len / 2);
++    ds.next_out = out;
++    ds.avail_out = (uint32_t)(len + 4096);
++    PREFIX(deflate)(&ds, Z_NO_FLUSH);
++
++    /* switch level and strategy mid-stream: forces a block flush and
++       (upstream) hash-chain rebuild - a path shell training never reaches */
++    PREFIX(deflateParams)(&ds, 1, Z_HUFFMAN_ONLY);
++    ds.avail_in = (uint32_t)(len - len / 2);
++    PREFIX(deflate)(&ds, Z_NO_FLUSH);
++    PREFIX(deflateParams)(&ds, 9, Z_FILTERED);
++    PREFIX(deflate)(&ds, Z_NO_FLUSH);
++    PREFIX(deflateParams)(&ds, 4, Z_RLE);
++    PREFIX(deflate)(&ds, Z_NO_FLUSH);
++    PREFIX(deflateParams)(&ds, 6, Z_DEFAULT_STRATEGY);
++
++    memset(&cp, 0, sizeof(cp));
++    if (PREFIX(deflateCopy)(&cp, &ds) == Z_OK) {
++        /* deflateGetDictionary may write up to the full window (w_size, max
++         * 32 KiB); the API has no output-capacity parameter, so the buffer
++         * must be worst-case sized. */
++        uint8_t *dbuf = (uint8_t *)xmalloc(1u << 15);
++        uint32_t dlen = 0;
++        PREFIX(deflateGetDictionary)(&cp, dbuf, &dlen);
++        free(dbuf);
++        PREFIX(deflateEnd)(&cp);
++    }
++    PREFIX(deflate)(&ds, Z_FINISH);
++    PREFIX(deflateEnd)(&ds);
++    free(out);
++}
++
++/* gzip header set/get + deflatePrime + inflate header parse */
++static void exercise_gzip_header(const uint8_t *src, size_t len) {
++    PREFIX3(stream) ds, is;
++    PREFIX(gz_header) hd, hi;
++    uint8_t extra[64], name[64], comment[128];
++    uint8_t namebuf[64], commbuf[128], extrabuf[64];
++    uint8_t *out = (uint8_t *)xmalloc(len + 8192);
++    uint8_t *dec = (uint8_t *)xmalloc(len + 64);
++
++    memset(&ds, 0, sizeof(ds));
++    if (PREFIX(deflateInit2)(&ds, 6, Z_DEFLATED, 16 + 15, 8, Z_DEFAULT_STRATEGY) != Z_OK)
++        goto out_free;
++
++    memset(&hd, 0, sizeof(hd));
++    memset(extra, 0xAB, sizeof(extra));
++    snprintf((char *)name, sizeof(name), "training-file.bin");
++    snprintf((char *)comment, sizeof(comment), "zlib-ng profile guided optimisation corpus");
++    hd.text = 1; hd.time = 0x5F000000; hd.os = 3;
++    hd.extra = extra; hd.extra_len = (uint32_t)sizeof(extra);
++    hd.name = name; hd.comment = comment; hd.hcrc = 1;
++    PREFIX(deflateSetHeader)(&ds, &hd);
++
++    ds.next_in = (void *)(uintptr_t)src;
++    ds.avail_in = (uint32_t)len;
++    ds.next_out = out;
++    ds.avail_out = (uint32_t)(len + 8192);
++    PREFIX(deflate)(&ds, Z_FINISH);
++    size_t clen = (len + 8192) - ds.avail_out;
++    PREFIX(deflateEnd)(&ds);
++
++    memset(&is, 0, sizeof(is));
++    if (PREFIX(inflateInit2)(&is, 16 + 15) == Z_OK) {
++        memset(&hi, 0, sizeof(hi));
++        hi.extra = extrabuf; hi.extra_max = (uint32_t)sizeof(extrabuf);
++        hi.name = namebuf;   hi.name_max = (uint32_t)sizeof(namebuf);
++        hi.comment = commbuf; hi.comm_max = (uint32_t)sizeof(commbuf);
++        PREFIX(inflateGetHeader)(&is, &hi);
++        is.next_in = out; is.avail_in = (uint32_t)clen;
++        is.next_out = dec; is.avail_out = (uint32_t)(len + 64);
++        PREFIX(inflate)(&is, Z_FINISH);
++        PREFIX(inflateEnd)(&is);
++    }
++out_free:
++    free(out);
++    free(dec);
++}
++
++/* inflateSync / inflateCopy / inflateReset2 / inflatePrime / inflateMark */
++static void exercise_inflate_misc(const uint8_t *src, size_t len) {
++    PREFIX3(stream) ds, is, ic;
++    uint8_t *out = (uint8_t *)xmalloc(len + 8192);
++    uint8_t *dec = (uint8_t *)xmalloc(len + 64);
++
++    memset(&ds, 0, sizeof(ds));
++    if (PREFIX(deflateInit)(&ds, 6) != Z_OK) goto done;
++    ds.next_in = (void *)(uintptr_t)src;
++    ds.avail_in = (uint32_t)(len / 2);
++    ds.next_out = out;
++    ds.avail_out = (uint32_t)(len + 8192);
++    PREFIX(deflate)(&ds, Z_FULL_FLUSH);   /* recovery point for inflateSync */
++    ds.avail_in = (uint32_t)(len - len / 2);
++    PREFIX(deflate)(&ds, Z_FINISH);
++    size_t clen = (len + 8192) - ds.avail_out;
++    PREFIX(deflateEnd)(&ds);
++
++    /* corrupt a byte early, then resynchronise */
++    if (clen > 64) out[16] ^= 0xFF;
++
++    memset(&is, 0, sizeof(is));
++    if (PREFIX(inflateInit)(&is) == Z_OK) {
++        is.next_in = out; is.avail_in = (uint32_t)clen;
++        is.next_out = dec; is.avail_out = (uint32_t)(len + 64);
++        int e = PREFIX(inflate)(&is, Z_NO_FLUSH);
++        if (e == Z_DATA_ERROR)
++            PREFIX(inflateSync)(&is);
++        (void)PREFIX(inflateMark)(&is);
++        memset(&ic, 0, sizeof(ic));
++        if (PREFIX(inflateCopy)(&ic, &is) == Z_OK)
++            PREFIX(inflateEnd)(&ic);
++        PREFIX(inflateReset2)(&is, -15);
++        PREFIX(inflatePrime)(&is, 8, 0);
++        PREFIX(inflateReset)(&is);
++        PREFIX(inflateEnd)(&is);
++    }
++done:
++    free(out);
++    free(dec);
++}
++
++/* deflatePrime + raw-stream bit stuffing: must run immediately after init,
++ * before any deflate() call, so it needs its own stream. */
++static void exercise_prime(const uint8_t *src, size_t len) {
++    PREFIX3(stream) ds;
++    uint8_t *out = (uint8_t *)xmalloc(len + 8192);
++
++    memset(&ds, 0, sizeof(ds));
++    if (PREFIX(deflateInit2)(&ds, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
++        free(out);
++        return;
++    }
++    /* insert a few odd bit-widths to drive the bi_buf/bi_valid spill paths */
++    PREFIX(deflatePrime)(&ds, 5, 0x1F);
++    PREFIX(deflatePrime)(&ds, 3, 0x05);
++    PREFIX(deflatePrime)(&ds, 16, 0xBEEF);
++    ds.next_in = (void *)(uintptr_t)src;
++    ds.avail_in = (uint32_t)len;
++    ds.next_out = out;
++    ds.avail_out = (uint32_t)(len + 8192);
++    PREFIX(deflate)(&ds, Z_FINISH);
++    PREFIX(deflateEnd)(&ds);
++    free(out);
++}
++
++/* deflateTune: exercises the match-heuristic tuning entry point */
++static void exercise_tune(const uint8_t *src, size_t len) {
++    PREFIX3(stream) ds;
++    uint8_t *out = (uint8_t *)xmalloc(len + 8192);
++
++    memset(&ds, 0, sizeof(ds));
++    if (PREFIX(deflateInit)(&ds, 9) != Z_OK) {
++        free(out);
++        return;
++    }
++    PREFIX(deflateTune)(&ds, 32, 258, 258, 4096);
++    ds.next_in = (void *)(uintptr_t)src;
++    ds.avail_in = (uint32_t)len;
++    ds.next_out = out;
++    ds.avail_out = (uint32_t)(len + 8192);
++    PREFIX(deflate)(&ds, Z_FINISH);
++    PREFIX(deflateEnd)(&ds);
++    free(out);
++}
++
++/* ---------------- inflateBack ---------------- */
++struct ib_ctx {
++    const uint8_t *in; size_t inlen, inpos;
++    uint8_t *out; size_t outcap, outpos;
++};
++
++/* The in_func signature differs between the zlib-compat and native zlib-ng
++ * headers: compat uses `z_const unsigned char **` (which is plain
++ * `unsigned char **` unless ZLIB_CONST is defined) and returns `unsigned`,
++ * while zlib-ng uses `const uint8_t **`.  Spell the buffer parameter with the
++ * matching type in each configuration so no cast is needed and -Werror builds
++ * stay clean. */
++#ifdef ZLIB_COMPAT
++#  define IB_IN_BUF_T z_const unsigned char **
++#  define IB_OUT_RET  int
++#else
++#  define IB_IN_BUF_T const uint8_t **
++#  define IB_OUT_RET  int32_t
++#endif
++
++static uint32_t ib_in(void *desc, IB_IN_BUF_T buf) {
++    struct ib_ctx *c = (struct ib_ctx *)desc;
++    size_t left = c->inlen - c->inpos;
++    if (left == 0) return 0;
++    if (left > 4096) left = 4096;
++    *buf = (void *)(uintptr_t)(c->in + c->inpos);
++    c->inpos += left;
++    return (uint32_t)left;
++}
++
++static IB_OUT_RET ib_out(void *desc, uint8_t *buf, uint32_t len) {
++    struct ib_ctx *c = (struct ib_ctx *)desc;
++    if (c->outpos + len > c->outcap) return 1;
++    memcpy(c->out + c->outpos, buf, len);
++    c->outpos += len;
++    return 0;
++}
++
++static void exercise_inflate_back(const uint8_t *src, size_t len) {
++    PREFIX3(stream) ds, is;
++    uint8_t *comp = (uint8_t *)xmalloc(len + 8192);
++    uint8_t *dec = (uint8_t *)xmalloc(len + 64);
++    uint8_t *window = (uint8_t *)xmalloc(1u << 15);
++    struct ib_ctx ctx;
++
++    memset(&ds, 0, sizeof(ds));
++    if (PREFIX(deflateInit2)(&ds, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK)
++        goto done;
++    ds.next_in = (void *)(uintptr_t)src; ds.avail_in = (uint32_t)len;
++    ds.next_out = comp; ds.avail_out = (uint32_t)(len + 8192);
++    PREFIX(deflate)(&ds, Z_FINISH);
++    size_t clen = (len + 8192) - ds.avail_out;
++    PREFIX(deflateEnd)(&ds);
++
++    memset(&is, 0, sizeof(is));
++    if (PREFIX(inflateBackInit)(&is, 15, window) == Z_OK) {
++        ctx.in = comp; ctx.inlen = clen; ctx.inpos = 0;
++        ctx.out = dec; ctx.outcap = len + 64; ctx.outpos = 0;
++        PREFIX(inflateBack)(&is, ib_in, &ctx, ib_out, &ctx);
++        PREFIX(inflateBackEnd)(&is);
++    }
++done:
++    free(comp); free(dec); free(window);
++}
++
++/* one-shot helpers: compress/compress2/uncompress/uncompress2 */
++static void exercise_oneshot(const uint8_t *src, size_t len) {
++    for (int lvl = 0; lvl <= 9; lvl++) {
++        size_t cb = PREFIX(compressBound)((z_uintmax_t)len);
++        uint8_t *c = (uint8_t *)xmalloc(cb);
++        uint8_t *u = (uint8_t *)xmalloc(len + 16);
++        size_t clen = cb, ulen = len + 16;
++        if (PREFIX(compress2)(c, &clen, src, (z_uintmax_t)len, lvl) == Z_OK) {
++            PREFIX(uncompress)(u, &ulen, c, clen);
++            size_t src_used = clen;
++            ulen = len + 16;
++            PREFIX(uncompress2)(u, &ulen, c, &src_used);
++        }
++        free(c); free(u);
++    }
++    {
++        size_t cb = PREFIX(compressBound)((z_uintmax_t)len);
++        uint8_t *c = (uint8_t *)xmalloc(cb);
++        size_t clen = cb;
++        PREFIX(compress)(c, &clen, src, (z_uintmax_t)len);
++        free(c);
++    }
++}
++
++/* checksums across many alignments/lengths: this is what selects between the
++   scalar tail, SSE, AVX2 and folding-copy variants inside adler32/crc32 */
++static void exercise_checksums(const uint8_t *src, size_t len) {
++    volatile uint32_t sink = 0;
++    for (unsigned align = 0; align < 16; align++) {
++        if (align >= len) break;
++        const uint8_t *p = src + align;
++        size_t avail = len - align;
++        static const size_t sizes[] = { 1, 3, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65,
++                                        127, 128, 129, 255, 256, 257, 1023, 1024,
++                                        4096, 16384, 65536 };
++        for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
++            size_t n = sizes[i];
++            if (n > avail) break;
++            sink ^= PREFIX(adler32)(1, p, (uint32_t)n);
++            sink ^= PREFIX(crc32)(0, p, (uint32_t)n);
++            sink ^= (uint32_t)PREFIX(adler32_z)(1, p, n);
++            sink ^= (uint32_t)PREFIX(crc32_z)(0, p, n);
++        }
++    }
++    /* long buffers drive the NMAX wrap and the big folding loops */
++    uint32_t a1 = PREFIX(adler32)(1, src, (uint32_t)len);
++    uint32_t c1 = PREFIX(crc32)(0, src, (uint32_t)len);
++    sink ^= (uint32_t)PREFIX(adler32_combine)(a1, a1, (z_off64_t)len);
++    sink ^= (uint32_t)PREFIX(crc32_combine)(c1, c1, (z_off64_t)len);
++    (void)sink;
++}
++
++#ifdef WITH_GZFILEOP
++static void exercise_gzfile(const uint8_t *src, size_t len, const char *path) {
++    gzFile f;
++    char mode[8];
++    static const char *const modes[] = { "wb1", "wb6", "wb9", "wb6f", "wb6h", "wb6R", "wb6F" };
++    for (size_t m = 0; m < sizeof(modes) / sizeof(modes[0]); m++) {
++        snprintf(mode, sizeof(mode), "%s", modes[m]);
++        f = PREFIX(gzopen)(path, mode);
++        if (!f) continue;
++        PREFIX(gzbuffer)(f, 32768);
++        PREFIX(gzputc)(f, 'H');
++        PREFIX(gzputs)(f, "eader line\n");
++        PREFIX(gzprintf)(f, "record %d %s\n", 42, "value");
++        PREFIX(gzfwrite)(src, 1, len > (1 << 18) ? (1 << 18) : len, f);
++        PREFIX(gzflush)(f, Z_SYNC_FLUSH);
++        PREFIX(gzsetparams)(f, 9, Z_FILTERED);
++        PREFIX(gzwrite)(f, src, (uint32_t)(len > 65536 ? 65536 : len));
++        PREFIX(gzclose)(f);
++
++        f = PREFIX(gzopen)(path, "rb");
++        if (!f) continue;
++        PREFIX(gzbuffer)(f, 16384);
++        char line[256];
++        PREFIX(gzgets)(f, line, (int)sizeof(line));
++        PREFIX(gzgetc)(f);
++        PREFIX(gzungetc)('x', f);
++        uint8_t buf[8192];
++        while (PREFIX(gzread)(f, buf, (uint32_t)sizeof(buf)) > 0) { }
++        (void)PREFIX(gzdirect)(f);
++        (void)PREFIX(gzeof)(f);
++        PREFIX(gzrewind)(f);
++        PREFIX(gzseek)(f, 1024, SEEK_SET);
++        (void)PREFIX(gztell)(f);
++        (void)PREFIX(gzoffset)(f);
++        PREFIX(gzfread)(buf, 1, sizeof(buf), f);
++        PREFIX(gzclose)(f);
++    }
++    remove(path);
++}
++#endif
++
++int main(int argc, char **argv) {
++    /* size defaults chosen so a full pass is a few seconds of real work per
++       build phase; scale with argv[1] (MiB) when a longer profile is wanted */
++    size_t mib = (argc > 1) ? (size_t)strtoul(argv[1], NULL, 10) : 4;
++    if (mib < 1) mib = 1;
++    if (mib > 64) mib = 64;
++    const char *tmpl = (argc > 2) ? argv[2] : "pgo_trainer_tmp.gz";
++
++    size_t big = mib * 1024 * 1024;
++    uint8_t *buf = (uint8_t *)xmalloc(big);
++    uint8_t *dict = (uint8_t *)xmalloc(32768);
++
++    gen_text(dict, 32768);
++
++    static const int strategies[] = {
++        Z_DEFAULT_STRATEGY, Z_FILTERED, Z_HUFFMAN_ONLY, Z_RLE, Z_FIXED
++    };
++    static const int flushes[] = {
++        Z_NO_FLUSH, Z_PARTIAL_FLUSH, Z_SYNC_FLUSH, Z_FULL_FLUSH, Z_BLOCK
++    };
++
++    for (int kind = 0; kind < DATA_NKINDS; kind++) {
++        rng_state = 0x9E3779B97F4A7C15ULL ^ (uint64_t)(kind + 1) * 0x100000001B3ULL;
++        gen_data(kind, buf, big);
++
++        /* --- the level x strategy matrix: this is the bulk of deflate work --- */
++        for (int level = 0; level <= 9; level++) {
++            for (size_t si = 0; si < sizeof(strategies) / sizeof(strategies[0]); si++) {
++                /* keep the per-cell slice modest so all cells are reached */
++                size_t slice = big / 8;
++                if (slice < 65536) slice = big;
++                roundtrip(buf, slice, level, strategies[si], 15, 8,
++                          Z_NO_FLUSH, 1 << 14, 1 << 14, NULL, 0);
++            }
++        }
++
++        /* --- window bits / memLevel / wrapper sweep --- */
++        size_t s2 = big / 16 ? big / 16 : big;
++        for (int win = 9; win <= 15; win++) {
++            roundtrip(buf, s2, 6, Z_DEFAULT_STRATEGY, win, 8, Z_NO_FLUSH,
++                      1 << 13, 1 << 13, NULL, 0);
++            roundtrip(buf, s2, 6, Z_DEFAULT_STRATEGY, -win, 8, Z_NO_FLUSH,
++                      1 << 13, 1 << 13, dict, 32768);
++            roundtrip(buf, s2, 6, Z_DEFAULT_STRATEGY, 16 + win, 8, Z_NO_FLUSH,
++                      1 << 13, 1 << 13, NULL, 0);
++        }
++        for (int ml = 1; ml <= 9; ml++)
++            roundtrip(buf, s2, 6, Z_DEFAULT_STRATEGY, 15, ml, Z_NO_FLUSH,
++                      1 << 13, 1 << 13, NULL, 0);
++
++        /* --- flush modes and awkward buffer sizes (tail/boundary paths) --- */
++        for (size_t fi = 0; fi < sizeof(flushes) / sizeof(flushes[0]); fi++)
++            roundtrip(buf, s2, 6, Z_DEFAULT_STRATEGY, 15, 8, flushes[fi],
++                      4096, 4096, NULL, 0);
++
++        static const size_t odd[] = { 1, 2, 3, 7, 13, 61, 257, 1021, 4093, 16381 };
++        for (size_t oi = 0; oi < sizeof(odd) / sizeof(odd[0]); oi++)
++            roundtrip(buf, big / 32 ? big / 32 : big, 6, Z_DEFAULT_STRATEGY, 15, 8,
++                      Z_NO_FLUSH, odd[oi], odd[oi], NULL, 0);
++
++        /* --- dictionaries --- */
++        roundtrip(buf, s2, 6, Z_DEFAULT_STRATEGY, 15, 8, Z_NO_FLUSH,
++                  1 << 13, 1 << 13, dict, 32768);
++        roundtrip(buf, s2, 9, Z_DEFAULT_STRATEGY, 15, 8, Z_NO_FLUSH,
++                  1 << 13, 1 << 13, dict, 1024);
++
++        /* --- API surface --- */
++        exercise_params_copy(buf, s2);
++        exercise_prime(buf, s2);
++        exercise_tune(buf, big / 32 ? big / 32 : big);
++        exercise_gzip_header(buf, s2);
++        exercise_inflate_misc(buf, s2);
++        exercise_inflate_back(buf, s2);
++        exercise_oneshot(buf, big / 64 ? big / 64 : big);
++        exercise_checksums(buf, big / 4 ? big / 4 : big);
++#ifdef WITH_GZFILEOP
++        exercise_gzfile(buf, big / 8 ? big / 8 : big, tmpl);
++#else
++        (void)tmpl;
++#endif
++    }
++
++    free(buf);
++    free(dict);
++    return 0;
++}

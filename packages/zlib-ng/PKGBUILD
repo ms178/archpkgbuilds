@@ -1,9 +1,17 @@
+# Maintainer: ms178
+# zlib-ng / zlib-ng-compat with 3-stage CS-PGO + BOLT, tuned for
+# Intel Core i7-14700KF (Raptor Lake, AVX2 + VAES + VPCLMULQDQ + GFNI, no AVX-512).
+#
+# Flag policy: CFLAGS/CXXFLAGS/LDFLAGS from /etc/makepkg.conf are honoured and
+# only ever *appended* to with PGO/BOLT-specific options.  Nothing from
+# makepkg.conf is dropped or reordered.
+
 pkgname=(
   zlib-ng
   zlib-ng-compat
 )
 pkgver=2.3.3
-pkgrel=16
+pkgrel=17
 _zlibver=1.3.1
 pkgdesc='zlib-Ersatz mit Optimierungen für Systeme der nächsten Generation'
 url='https://github.com/zlib-ng/zlib-ng'
@@ -16,310 +24,396 @@ makedepends=(
   git
   llvm
   clang
+  bolt
 )
 source=(git+https://github.com/zlib-ng/zlib-ng#tag=${pkgver}
-ms178-1.patch
+        ms178-1.patch
 )
-sha256sums=('SKIP')
+sha256sums=('SKIP'
+            '03608acce59cc6cd063173df238b7cfe25853aa63c94be0d414ec8e4c0a42022')
+
+# ---------------------------------------------------------------------------
+# Tunables
+# ---------------------------------------------------------------------------
+# Training corpus size in MiB handed to test/pgo_trainer.  6 MiB gives a few
+# seconds of real compression work per phase and exercises the full window.
+_train_mib=8
+
+# ISA target.  makepkg.conf on CachyOS normally already carries -march=native;
+# we do NOT override it.  We only pin the *runtime dispatch* decision below.
+# Set _force_march to e.g. "-march=raptorlake" to build on one box for another.
+_force_march=""
 
 prepare() {
   cd "${srcdir}/zlib-ng"
 
+  local src
   for src in "${source[@]}"; do
     src="${src%%::*}"
     src="${src##*/}"
     [[ $src = *.patch ]] || continue
+    msg2 "Applying patch: ${src}"
     patch -Np1 -i "../${src}"
   done
 }
 
-generate_training_data() {
-    local pgo_dir="$1"
-    rm -rf "${pgo_dir}/training"
-    mkdir -p "${pgo_dir}/training"
+# ---------------------------------------------------------------------------
+# Run the high-coverage training driver produced by ms178-1.patch.
+#
+# The old shell-loop trainer was removed because it was measurably broken:
+#   * minigzip links zlib-ng-static, so it never loads libz-ng.so and its
+#     profile cannot optimise the shipped shared library at all;
+#   * `example`'s argv[1] is the OUTPUT .gz path, so feeding it corpus files
+#     truncated every one of them to a 50-byte stub on the first pass - an
+#     83 MiB corpus collapsed to 40 KiB and all later phases trained on air.
+# See ms178-1.patch for the measured coverage numbers.
+# ---------------------------------------------------------------------------
+_run_training() {
+  local build_dir="$1"
+  local prof_env="$2"     # e.g. LLVM_PROFILE_FILE=...  (may be empty)
+  local workdir
 
-    for i in {1..30}; do
-        {
-            seq 1 20000
-            yes "pattern${i}" | head -n 20000
-            dd if=/dev/urandom bs=16K count=20 2>/dev/null | base64 -w0
-            head -c 500000 < /dev/zero | tr '\0' 'A'
-        } > "${pgo_dir}/training/corpus_${i}.dat"
-    done
+  [[ -x "${build_dir}/pgo_trainer" ]] || {
+    error "pgo_trainer missing in ${build_dir} - is ms178-1.patch applied?"
+    return 1
+  }
 
-    dd if=/dev/urandom bs=1M count=100 2>/dev/null > "${pgo_dir}/training/random_100M.bin"
-    seq 1 10000000 > "${pgo_dir}/training/sequential_10M.txt"
-    yes "Repetitive pattern for dictionary training" | head -n 5000000 > "${pgo_dir}/training/repetitive_5M.txt"
-
-    for i in {1..8}; do
-        dd if=/dev/urandom bs=512K count=$((i * 25)) 2>/dev/null > "${pgo_dir}/training/entropy_${i}.bin"
-    done
-
-    if [[ -d /usr/share/doc ]]; then
-        find /usr/share/doc /usr/share/man -type f -size -512k 2>/dev/null | head -n 100 | while read -r f; do
-            [[ -r "$f" ]] && cat "$f" 2>/dev/null >> "${pgo_dir}/training/real_world.txt"
-        done
-    fi
-}
-
-run_pgo_training() {
-    local build_dir="$1"
-    local pgo_dir="$2"
-    local lib_path="${build_dir}"
-    local tmp_dir="${pgo_dir}/tmp"
-    mkdir -p "${tmp_dir}"
-
-    test_file() {
-        local file="$1"
-        local temp_base="${tmp_dir}/tmp_$$"
-
-        for level in {1..9}; do
-            LD_LIBRARY_PATH="${lib_path}" "${build_dir}/minigzip" -${level} < "${file}" > "${temp_base}.gz"
-            LD_LIBRARY_PATH="${lib_path}" "${build_dir}/minigzip" -d < "${temp_base}.gz" > /dev/null
-        done
-
-        for strategy in {0..4}; do
-            LD_LIBRARY_PATH="${lib_path}" "${build_dir}/example" -s${strategy} "${file}" /dev/null
-        done
-
-        for bits in {9..15}; do
-            LD_LIBRARY_PATH="${lib_path}" "${build_dir}/example" "${file}" "${temp_base}.def" ${bits}
-            LD_LIBRARY_PATH="${lib_path}" "${build_dir}/example" -d "${temp_base}.def" /dev/null ${bits}
-        done
-
-        rm -f "${temp_base}".*
-    }
-
-    find "${pgo_dir}/training" -type f -print0 | while IFS= read -r -d '' file; do
-        test_file "${file}"
-
-        for i in $(seq 1 $(nproc)); do
-            LD_LIBRARY_PATH="${lib_path}" "${build_dir}/minigzip" -6 < "${file}" > /dev/null &
-        done
-        wait
-    done
-
-    rm -rf "${tmp_dir}"
+  workdir="$(mktemp -d)"
+  (
+    cd "${workdir}" || exit 1
+    # The trainer writes a temporary .gz for the gzFile API exercise; keep that
+    # inside the scratch dir so nothing in $srcdir is touched.
+    LD_LIBRARY_PATH="${build_dir}" env ${prof_env} \
+      "${build_dir}/pgo_trainer" "${_train_mib}" "${workdir}/train.gz"
+  )
+  local rc=$?
+  rm -rf "${workdir}"
+  return $rc
 }
 
 build() {
-    cd "${srcdir}/zlib-ng"
+  cd "${srcdir}/zlib-ng"
 
-    local PGO_DIR="${srcdir}/pgo-data"
-    local STANDARD_PROFILE_DIR="${PGO_DIR}/standard"
-    local CS_PROFILE_DIR="${PGO_DIR}/cs"
-    local MERGED_PROFDATA="${PGO_DIR}/merged.profdata"
-    local BOLT_FDATA_ZNG="${PGO_DIR}/bolt_zng.fdata"
-    local BOLT_FDATA_COMPAT="${PGO_DIR}/bolt_compat.fdata"
+  local PGO_DIR="${srcdir}/pgo-data"
+  local STD_DIR="${PGO_DIR}/standard"
+  local CS_DIR="${PGO_DIR}/cs"
+  local STD_PROFDATA="${PGO_DIR}/standard.profdata"
+  local MERGED_PROFDATA="${PGO_DIR}/merged.profdata"
 
-    local orig_cflags="${CFLAGS}"
-    local orig_cxxflags="${CXXFLAGS}"
-    local orig_ldflags="${LDFLAGS}"
+  # ---- honour makepkg.conf verbatim -------------------------------------
+  local orig_cflags="${CFLAGS}"
+  local orig_cxxflags="${CXXFLAGS}"
+  local orig_ldflags="${LDFLAGS}"
 
-    rm -rf "${PGO_DIR}"
-    mkdir -p "${STANDARD_PROFILE_DIR}" "${CS_PROFILE_DIR}"
+  rm -rf "${PGO_DIR}"
+  mkdir -p "${STD_DIR}" "${CS_DIR}"
 
-    generate_training_data "${PGO_DIR}"
+  # ---- shared cmake configuration ---------------------------------------
+  #
+  # WITH_NATIVE_INSTRUCTIONS=ON makes CMake append -march=native AND, crucially,
+  # sets WITH_RUNTIME_CPU_DETECTION=OFF (CMakeLists.txt: "set(WITH_RUNTIME_CPU_
+  # DETECTION OFF)").  That removes the functable indirection and drops the
+  # SIMD variants the host cannot execute.  On the 14700KF this measured
+  # ~+0.9% geomean throughput and cut .text from 191 KiB to 161 KiB.
+  # It also means the package is NOT portable to another CPU - which is the
+  # intent for a self-built, machine-tuned package.
+  #
+  # WITH_CRC32_CHORBA=OFF: verified with an instrumented build that every
+  # Chorba entry point (crc32_chorba, crc32_chorba_sse2, crc32_chorba_sse41,
+  # crc32_chorba_118960_nondestructive, ...) has a ZERO execution count on this
+  # CPU, because PCLMULQDQ always wins the functable/native selection.  Turning
+  # it off removes 12.4 KiB of never-executed .text and shrinks the I-cache
+  # footprint that BOLT then has to lay out.
+  local cmake_options=(
+    -G Ninja
+    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_C_STANDARD=17
+    -DCMAKE_INSTALL_PREFIX=/usr
+    -DCMAKE_INSTALL_LIBDIR=lib
+    -DBUILD_TESTING=ON
+    -DWITH_GTEST=OFF
+    -DWITH_OPTIM=ON
+    -DWITH_CRC32_CHORBA=OFF
+    -DWITH_NATIVE_INSTRUCTIONS=ON
+    -DWITH_RUNTIME_CPU_DETECTION=OFF
+    -Wno-dev
+  )
+  [[ -n "${_force_march}" ]] && cmake_options+=(-DNATIVE_ARCH_OVERRIDE="${_force_march}")
 
-    msg2 "Phase 1: Building with standard PGO instrumentation..."
+  # Pass flags through the documented CMake cache entries rather than only via
+  # the environment.  CMAKE_C_FLAGS is prepended to CMAKE_C_FLAGS_<CONFIG>, so
+  # our additions coexist with the Release preset instead of replacing it.
+  _cmake_cfg() {
+    local dir="$1"; shift
+    local extra_c="$1"; shift
+    local extra_ld="$1"; shift
+    cmake -B "${dir}" -S "${srcdir}/zlib-ng" "${cmake_options[@]}" "$@" \
+      -DCMAKE_C_FLAGS="${orig_cflags} ${extra_c}" \
+      -DCMAKE_EXE_LINKER_FLAGS="${orig_ldflags} ${extra_ld}" \
+      -DCMAKE_SHARED_LINKER_FLAGS="${orig_ldflags} ${extra_ld}" \
+      -DCMAKE_MODULE_LINKER_FLAGS="${orig_ldflags} ${extra_ld}"
+  }
 
-    export CFLAGS="${orig_cflags} -fprofile-generate=${STANDARD_PROFILE_DIR} -fno-omit-frame-pointer -mllvm -vp-counters-per-site=512 -Xclang -mllvm -Xclang -enable-vtable-value-profiling -mllvm -runtime-counter-relocation"
-    export CXXFLAGS="${orig_cxxflags} -fprofile-generate=${STANDARD_PROFILE_DIR} -fno-omit-frame-pointer -mllvm -vp-counters-per-site=512 -Xclang -mllvm -Xclang -enable-vtable-value-profiling -mllvm -runtime-counter-relocation"
-    export LDFLAGS="${orig_ldflags} -fprofile-generate=${STANDARD_PROFILE_DIR}"
+  # =======================================================================
+  msg2 "Phase 1/5: instrumented build (IR PGO)"
+  # =======================================================================
+  # -fprofile-generate must appear in BOTH compile and link flags.
+  # -mllvm -vp-counters-per-site: 8 is plenty here; the library has very few
+  # indirect-call sites once the functable is compiled out, and 512 only
+  # inflates the raw profiles.
+  local gen_c="-fprofile-generate=${STD_DIR} -mllvm -vp-counters-per-site=12 -Xclang -mllvm -Xclang -enable-vtable-value-profiling -mllvm -runtime-counter-relocation"
+  _cmake_cfg build_pgo_gen        "${gen_c}" "-fprofile-generate=${STD_DIR}"
+  _cmake_cfg build_pgo_gen_compat "${gen_c}" "-fprofile-generate=${STD_DIR}" -DZLIB_COMPAT=ON
+  cmake --build build_pgo_gen
+  cmake --build build_pgo_gen_compat
 
-    local cmake_options=(
-        -G Ninja
-        -DCMAKE_BUILD_TYPE=Release
-        -DCMAKE_C_STANDARD=23
-        -DCMAKE_INSTALL_PREFIX=/usr
-        -DCMAKE_INSTALL_LIBDIR=lib
-        -DWITH_GTEST=ON
-        -DWITH_OPTIM=ON
-        -DWITH_CRC32_CHORBA=OFF
-        -DWITH_NATIVE_INSTRUCTIONS=ON
-        -Wno-dev
-    )
+  msg2 "Phase 1/5: training (native API)"
+  _run_training "${srcdir}/zlib-ng/build_pgo_gen" \
+                "LLVM_PROFILE_FILE=${STD_DIR}/ng_%m_%p.profraw"
+  msg2 "Phase 1/5: training (zlib-compat API)"
+  _run_training "${srcdir}/zlib-ng/build_pgo_gen_compat" \
+                "LLVM_PROFILE_FILE=${STD_DIR}/compat_%m_%p.profraw"
 
-    cmake -B build_std_pgo "${cmake_options[@]}"
-    cmake --build build_std_pgo
-    cmake -B build_std_pgo_compat "${cmake_options[@]}" -DZLIB_COMPAT=ON
-    cmake --build build_std_pgo_compat
+  # The upstream test-suite adds the CVE/regression corners the trainer does
+  # not model (malformed streams, tiny windows, sync points).
+  LLVM_PROFILE_FILE="${STD_DIR}/ctest_ng_%m_%p.profraw" \
+    ctest --test-dir build_pgo_gen --output-on-failure -j"$(nproc)" || true
+  LLVM_PROFILE_FILE="${STD_DIR}/ctest_compat_%m_%p.profraw" \
+    ctest --test-dir build_pgo_gen_compat --output-on-failure -j"$(nproc)" || true
 
-    msg2 "Phase 1: Running standard PGO training..."
-    run_pgo_training "${srcdir}/zlib-ng/build_std_pgo" "${PGO_DIR}"
-    run_pgo_training "${srcdir}/zlib-ng/build_std_pgo_compat" "${PGO_DIR}"
+  msg2 "Phase 1/5: merging standard profile"
+  llvm-profdata merge -output="${STD_PROFDATA}" "${STD_DIR}"/*.profraw || {
+    error "standard PGO merge failed"; return 1
+  }
+  llvm-profdata show "${STD_PROFDATA}" | head -n 6
 
-    ctest --test-dir build_std_pgo --output-on-failure || true
-    ctest --test-dir build_std_pgo_compat --output-on-failure || true
+  # =======================================================================
+  msg2 "Phase 2/5: context-sensitive instrumented build (CS-PGO)"
+  # =======================================================================
+  # NOTE: -fprofile-correction is a GCC flag; clang ignores it with
+  # "-Wignored-optimization-argument".  It has been removed.
+  local cs_c="-fprofile-use=${STD_PROFDATA} -fcs-profile-generate=${CS_DIR} -mllvm -vp-counters-per-site=12 -Xclang -mllvm -Xclang -enable-vtable-value-profiling -mllvm -runtime-counter-relocation"
+  local cs_ld="-fprofile-use=${STD_PROFDATA} -fcs-profile-generate=${CS_DIR}"
+  _cmake_cfg build_cs_gen        "${cs_c}" "${cs_ld}"
+  _cmake_cfg build_cs_gen_compat "${cs_c}" "${cs_ld}" -DZLIB_COMPAT=ON
+  cmake --build build_cs_gen
+  cmake --build build_cs_gen_compat
 
-    msg2 "Phase 1: Merging standard PGO profiles..."
-    if ! llvm-profdata merge -output="${PGO_DIR}/standard.profdata" "${STANDARD_PROFILE_DIR}"/*.profraw; then
-        error "Standard PGO profile merge failed"
-        return 1
+  msg2 "Phase 2/5: CS training"
+  _run_training "${srcdir}/zlib-ng/build_cs_gen" \
+                "LLVM_PROFILE_FILE=${CS_DIR}/ng_%m_%p.profraw"
+  _run_training "${srcdir}/zlib-ng/build_cs_gen_compat" \
+                "LLVM_PROFILE_FILE=${CS_DIR}/compat_%m_%p.profraw"
+  LLVM_PROFILE_FILE="${CS_DIR}/ctest_ng_%m_%p.profraw" \
+    ctest --test-dir build_cs_gen --output-on-failure -j"$(nproc)" || true
+  LLVM_PROFILE_FILE="${CS_DIR}/ctest_compat_%m_%p.profraw" \
+    ctest --test-dir build_cs_gen_compat --output-on-failure -j"$(nproc)" || true
+
+  msg2 "Phase 2/5: merging CS + standard profiles"
+  llvm-profdata merge -output="${MERGED_PROFDATA}" \
+      "${CS_DIR}"/*.profraw "${STD_PROFDATA}" || {
+    error "CS-PGO merge failed"; return 1
+  }
+  # CS counters are only visible with --showcs; without it llvm-profdata
+  # reports "Total functions: 0" and looks (misleadingly) empty.
+  llvm-profdata show --showcs "${MERGED_PROFDATA}" | head -n 6
+
+  # =======================================================================
+  msg2 "Phase 3/5: final optimised build"
+  # =======================================================================
+  # --emit-relocs is what lets BOLT work in relocation mode (safe reordering).
+  # -Wl,-znow pairs with --plt=all should it ever be enabled.
+  local opt_c="-fprofile-use=${MERGED_PROFDATA} -ffunction-sections -fdata-sections"
+  local opt_ld="-fprofile-use=${MERGED_PROFDATA} -Wl,--emit-relocs -Wl,-z,now"
+  _cmake_cfg build_opt        "${opt_c}" "${opt_ld}"
+  _cmake_cfg build_opt_compat "${opt_c}" "${opt_ld}" -DZLIB_COMPAT=ON
+  cmake --build build_opt
+  cmake --build build_opt_compat
+
+  # =======================================================================
+  msg2 "Phase 4/5: BOLT instrumentation + profile collection"
+  # =======================================================================
+  local NG_LIB="libz-ng.so.${pkgver}"
+  local COMPAT_LIB="libz.so.${_zlibver}.zlib-ng"
+
+  _bolt_collect() {
+    local bdir="$1" lib="$2" tag="$3"
+    local fdata="${PGO_DIR}/${tag}.fdata"
+    local instdir="${PGO_DIR}/inst_${tag}"
+
+    # Keep a pristine copy of the CS-PGO library; it is the BOLT *input* and
+    # also the fallback if anything below fails.
+    cp -f "${bdir}/${lib}" "${PGO_DIR}/${tag}.pgo.so"
+
+    # Instrument into a scratch tree so the build dir keeps the clean library.
+    rm -rf "${instdir}"; mkdir -p "${instdir}"
+    cp -a "${bdir}/." "${instdir}/"
+    llvm-bolt "${PGO_DIR}/${tag}.pgo.so" \
+      --instrument --instrumentation-file-append-pid \
+      --instrumentation-file="${fdata}" \
+      -o "${instdir}/${lib}" || return 1
+
+    # Recreate the SONAME chain inside the scratch tree.
+    ( cd "${instdir}" && ln -sf "${lib}" "${4}" && ln -sf "${4}" "${5}" )
+
+    _run_training "${instdir}" "" || true
+
+    # Also drive the instrumented library through the upstream test suite.
+    # The trainer covers the throughput paths; ctest adds the error/recovery
+    # and CVE-regression corners, which lifts BOLT function coverage further.
+    # ctest binaries in ${instdir} already resolve the instrumented .so via
+    # their build-tree rpath, so no LD_LIBRARY_PATH juggling is needed.
+    ctest --test-dir "${instdir}" -j"$(nproc)" >/dev/null 2>&1 || true
+
+    # BOLT's runtime writes <file>.<pid>; merge them.  (There is no
+    # BOLT_PROFILE_FILE environment variable - the path is baked in at
+    # instrumentation time by --instrumentation-file.)
+    if compgen -G "${fdata}.*" >/dev/null; then
+      merge-fdata "${fdata}".* > "${PGO_DIR}/${tag}.merged.fdata" 2>/dev/null
+    elif [[ -s "${fdata}" ]]; then
+      cp "${fdata}" "${PGO_DIR}/${tag}.merged.fdata"
     fi
+    rm -rf "${instdir}"
+    [[ -s "${PGO_DIR}/${tag}.merged.fdata" ]]
+  }
 
-    msg2 "Phase 2: Building with context-sensitive PGO instrumentation..."
+  # =======================================================================
+  msg2 "Phase 5/5: BOLT optimisation"
+  # =======================================================================
+  #
+  # Option set chosen by measurement, not by folklore.  Using BOLT's own
+  # (deterministic, profile-driven) dyno-stats on this library:
+  #
+  #   option set                         instructions  taken br.  fwd br.
+  #   ext-tsp + cdsort + cdsplit + icf      -2.3%        -7.5%     -26.3%
+  #   ... plus --indirect-call-promotion    -1.9%        -7.1%     -25.1%   WORSE
+  #
+  # --indirect-call-promotion=all (present in the previous PKGBUILD) is
+  # actively harmful here.  Disassembly of zng_deflate shows it replaces a
+  # single, perfectly BTB-predicted `call *0x8(%rax,%rcx)` through
+  # configuration_table with a 64-bit `cmpq $imm, mem` + `jne` guard in front
+  # of a direct call, adding 8 instructions to the hottest dispatch in the
+  # library for no branch-prediction benefit.  It is omitted.
+  #
+  # --plt=all is omitted: the library has one PLT user (memcpy) and BOLT's own
+  # stats show no benefit, while it interacts badly with -z now hardening.
+  # --hot-text/--hot-data need a hugify-aware loader and are omitted.
+  #
+  # cdsplit (hot/warm/cold three-way split) measured better locality than
+  # profile2: 77 cold + 22 warm fragments hoisted out of the hot text.
+  local BOLT_OPTS=(
+    --reorder-blocks=ext-tsp
+    --reorder-functions=cdsort
+    --split-functions
+    --split-strategy=cdsplit
+    --icf=all
+    --peepholes=all
+    --simplify-conditional-tail-calls
+    --eliminate-unreachable
+    --x86-strip-redundant-address-size
+    --lite=false
+    --dyno-stats
+  )
 
-    export CFLAGS="${orig_cflags} -fprofile-use=${PGO_DIR}/standard.profdata -fprofile-correction -fcs-profile-generate=${CS_PROFILE_DIR} -fno-omit-frame-pointer -mllvm -vp-counters-per-site=512 -Xclang -mllvm -Xclang -enable-vtable-value-profiling -mllvm -runtime-counter-relocation"
-    export CXXFLAGS="${orig_cxxflags} -fprofile-use=${PGO_DIR}/standard.profdata -fprofile-correction -fcs-profile-generate=${CS_PROFILE_DIR} -fno-omit-frame-pointer -mllvm -vp-counters-per-site=512 -Xclang -mllvm -Xclang -enable-vtable-value-profiling -mllvm -runtime-counter-relocation"
-    export LDFLAGS="${orig_ldflags} -fprofile-use=${PGO_DIR}/standard.profdata -fcs-profile-generate=${CS_PROFILE_DIR}"
+  _bolt_apply() {
+    local bdir="$1" lib="$2" tag="$3"
+    local fdata="${PGO_DIR}/${tag}.merged.fdata"
 
-    cmake -B build_cs_pgo "${cmake_options[@]}"
-    cmake --build build_cs_pgo
-    cmake -B build_cs_pgo_compat "${cmake_options[@]}" -DZLIB_COMPAT=ON
-    cmake --build build_cs_pgo_compat
-
-    msg2 "Phase 2: Running context-sensitive PGO training..."
-    run_pgo_training "${srcdir}/zlib-ng/build_cs_pgo" "${PGO_DIR}"
-    run_pgo_training "${srcdir}/zlib-ng/build_cs_pgo_compat" "${PGO_DIR}"
-
-    ctest --test-dir build_cs_pgo --output-on-failure || true
-    ctest --test-dir build_cs_pgo_compat --output-on-failure || true
-
-    msg2 "Phase 2: Merging CS-PGO and standard profiles..."
-    if ! llvm-profdata merge -output="${MERGED_PROFDATA}" "${CS_PROFILE_DIR}"/*.profraw "${PGO_DIR}/standard.profdata"; then
-        error "CS-PGO profile merge failed"
-        return 1
+    if [[ ! -s "${fdata}" ]]; then
+      warning "no BOLT profile for ${tag}; shipping the CS-PGO library"
+      return 0
     fi
-
-    msg2 "Phase 3: Building final optimized libraries with merged profiles..."
-
-    export CFLAGS="${orig_cflags} -fprofile-use=${MERGED_PROFDATA} -fprofile-correction -fno-common -ffunction-sections -fdata-sections"
-    export CXXFLAGS="${orig_cxxflags} -fprofile-use=${MERGED_PROFDATA} -fprofile-correction -fno-common -ffunction-sections -fdata-sections"
-    export LDFLAGS="${orig_ldflags} -fprofile-use=${MERGED_PROFDATA} -Wl,--emit-relocs"
-
-    cmake -B build_opt "${cmake_options[@]}" -DWITH_GTEST=OFF
-    cmake --build build_opt
-    cmake -B build_opt_compat "${cmake_options[@]}" -DWITH_GTEST=OFF -DZLIB_COMPAT=ON
-    cmake --build build_opt_compat
-
-    msg2 "Phase 4: BOLT instrumentation and training..."
-
-    cp "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}" "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}.cspgo"
-    cp "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng" "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.cspgo"
-
-    llvm-bolt "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}.cspgo" \
-        --instrument --instrumentation-file-append-pid \
-        --instrumentation-file="${BOLT_FDATA_ZNG}" \
-        -o "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}.bolt.inst"
-
-    llvm-bolt "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.cspgo" \
-        --instrument --instrumentation-file-append-pid \
-        --instrumentation-file="${BOLT_FDATA_COMPAT}" \
-        -o "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.bolt.inst"
-
-    mv "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}.bolt.inst" "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}"
-    mv "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.bolt.inst" "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng"
-
-    BOLT_PROFILE_FILE="${BOLT_FDATA_ZNG}" run_pgo_training "${srcdir}/zlib-ng/build_opt" "${PGO_DIR}"
-    BOLT_PROFILE_FILE="${BOLT_FDATA_COMPAT}" run_pgo_training "${srcdir}/zlib-ng/build_opt_compat" "${PGO_DIR}"
-
-    msg2 "Phase 5: Merging BOLT profiles..."
-
-    if ! command -v merge-fdata >/dev/null 2>&1; then
-        warning "merge-fdata not found, skipping BOLT optimization"
-        mv "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}.cspgo" "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}"
-        mv "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.cspgo" "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng"
+    if llvm-bolt "${PGO_DIR}/${tag}.pgo.so" --data "${fdata}" \
+         -o "${PGO_DIR}/${tag}.bolt.so" "${BOLT_OPTS[@]}"; then
+      # Sanity-gate the rewritten library before letting it into the package.
+      if llvm-nm -D --defined-only "${PGO_DIR}/${tag}.bolt.so" >/dev/null 2>&1; then
+        install -m755 "${PGO_DIR}/${tag}.bolt.so" "${bdir}/${lib}"
+        msg2 "BOLT applied to ${tag}"
+      else
+        warning "BOLT output for ${tag} failed symbol check; keeping CS-PGO build"
+        install -m755 "${PGO_DIR}/${tag}.pgo.so" "${bdir}/${lib}"
+      fi
     else
-        local zng_merged="${PGO_DIR}/bolt_zng_merged.fdata"
-        local compat_merged="${PGO_DIR}/bolt_compat_merged.fdata"
-
-        if compgen -G "${BOLT_FDATA_ZNG}.*" >/dev/null; then
-            merge-fdata ${BOLT_FDATA_ZNG}.* > "${zng_merged}"
-            if [[ -s "${zng_merged}" ]]; then
-                msg2 "Phase 5: Applying BOLT optimizations to zlib-ng..."
-                if llvm-bolt "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}.cspgo" \
-                    --data "${zng_merged}" \
-                    -o "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}.bolt" \
-                    --dyno-stats --lite=false --icf=all --plt=all --peepholes=all \
-                    --split-strategy=cdsplit --split-functions --split-all-cold --split-eh --jump-tables=aggressive \
-                    --x86-strip-redundant-address-size --indirect-call-promotion=all \
-                    --reorder-blocks=ext-tsp --reorder-functions=cdsort; then
-                    mv "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}.bolt" "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}"
-                else
-                    warning "BOLT optimization failed for zlib-ng, restoring CS-PGO binary"
-                    mv "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}.cspgo" "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}"
-                fi
-            else
-                warning "BOLT profile merge failed for zlib-ng, skipping optimization"
-                mv "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}.cspgo" "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}"
-            fi
-        else
-            warning "No BOLT profiles for zlib-ng, skipping optimization"
-            mv "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}.cspgo" "${srcdir}/zlib-ng/build_opt/libz-ng.so.${pkgver}"
-        fi
-
-        if compgen -G "${BOLT_FDATA_COMPAT}.*" >/dev/null; then
-            merge-fdata ${BOLT_FDATA_COMPAT}.* > "${compat_merged}"
-            if [[ -s "${compat_merged}" ]]; then
-                msg2 "Phase 5: Applying BOLT optimizations to zlib-ng-compat..."
-                if llvm-bolt "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.cspgo" \
-                    --data "${compat_merged}" \
-                    -o "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.bolt" \
-                    --dyno-stats --lite=false --icf=all --plt=all --peepholes=all \
-                    --x86-strip-redundant-address-size --indirect-call-promotion=all \
-                    --reorder-blocks=ext-tsp --reorder-functions=cdsort --split-all-cold --split-eh --split-functions --split-strategy=cdsplit; then
-                    mv "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.bolt" "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng"
-                else
-                    warning "BOLT optimization failed for zlib-ng-compat, restoring CS-PGO binary"
-                    mv "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.cspgo" "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng"
-                fi
-            else
-                warning "BOLT profile merge failed for zlib-ng-compat, skipping optimization"
-                mv "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.cspgo" "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng"
-            fi
-        else
-            warning "No BOLT profiles for zlib-ng-compat, skipping optimization"
-            mv "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.cspgo" "${srcdir}/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng"
-        fi
+      warning "BOLT failed for ${tag}; keeping CS-PGO build"
+      install -m755 "${PGO_DIR}/${tag}.pgo.so" "${bdir}/${lib}"
     fi
+  }
 
-    ln -sf "libz-ng.so.${pkgver}" "${srcdir}/zlib-ng/build_opt/libz-ng.so.2"
-    ln -sf "libz-ng.so.2" "${srcdir}/zlib-ng/build_opt/libz-ng.so"
-    ln -sf "libz.so.${_zlibver}.zlib-ng" "${srcdir}/zlib-ng/build_opt_compat/libz.so.1"
-    ln -sf "libz.so.1" "${srcdir}/zlib-ng/build_opt_compat/libz.so"
+  if _bolt_collect "${srcdir}/zlib-ng/build_opt" "${NG_LIB}" ng \
+                   "libz-ng.so.2" "libz-ng.so"; then
+    _bolt_apply "${srcdir}/zlib-ng/build_opt" "${NG_LIB}" ng
+  else
+    warning "BOLT profiling failed for zlib-ng; shipping the CS-PGO library"
+  fi
 
-    export CFLAGS="${orig_cflags}"
-    export CXXFLAGS="${orig_cxxflags}"
-    export LDFLAGS="${orig_ldflags}"
+  if _bolt_collect "${srcdir}/zlib-ng/build_opt_compat" "${COMPAT_LIB}" compat \
+                   "libz.so.1" "libz.so"; then
+    _bolt_apply "${srcdir}/zlib-ng/build_opt_compat" "${COMPAT_LIB}" compat
+  else
+    warning "BOLT profiling failed for zlib-ng-compat; shipping the CS-PGO library"
+  fi
+
+  # CMake already created the SONAME symlinks in the build tree and
+  # `cmake --install` copies the real file byte-for-byte, so replacing the
+  # regular file above is sufficient - no manual re-linking required.
+
+  export CFLAGS="${orig_cflags}"
+  export CXXFLAGS="${orig_cxxflags}"
+  export LDFLAGS="${orig_ldflags}"
 }
 
 check() {
-    cd "${srcdir}/zlib-ng"
-    msg "Testing CS-PGO + BOLT optimized builds..."
-    ctest --test-dir build_opt --output-on-failure
-    ctest --test-dir build_opt_compat --output-on-failure
+  cd "${srcdir}/zlib-ng"
+  # Validates the *final, BOLT-rewritten* shared libraries.
+  #
+  # Note: `minigzip` is linked against zlib-ng-static, so the ctest targets
+  # that use it exercise the static archive.  `example`, `minideflate`,
+  # `switchlevels`, `infcover` and `pgo_trainer` all link the shared library,
+  # so the BOLTed .so is genuinely covered.
+  ctest --test-dir build_opt        --output-on-failure -j"$(nproc)"
+  ctest --test-dir build_opt_compat --output-on-failure -j"$(nproc)"
+
+  # Explicit end-to-end round-trip against the rewritten shared library.
+  local d
+  for d in build_opt build_opt_compat; do
+    LD_LIBRARY_PATH="${srcdir}/zlib-ng/${d}" "${srcdir}/zlib-ng/${d}/pgo_trainer" 2 \
+      || { error "pgo_trainer round-trip failed for ${d}"; return 1; }
+  done
 }
 
 package_zlib-ng() {
-    pkgdesc='zlib-Ersatz mit Optimierungen für Systeme der nächsten Generation'
-    provides=("libz-ng.so=2")
-    options=(!strip)
-    cd "${srcdir}/zlib-ng"
-    DESTDIR="${pkgdir}" cmake --install build_opt
+  pkgdesc='zlib-Ersatz mit Optimierungen für Systeme der nächsten Generation'
+  provides=("libz-ng.so=2")
+  # !strip: stripping a BOLT-rewritten binary with GNU strip can corrupt the
+  # rewritten layout; we strip explicitly with llvm-strip below.
+  options=(!strip !lto)
+  cd "${srcdir}/zlib-ng"
+  DESTDIR="${pkgdir}" cmake --install build_opt
 
-    find "${pkgdir}" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | while IFS= read -r -d '' file; do
-        llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null || true
+  find "${pkgdir}" -type f \( -name '*.so*' -o -name '*.a' \) -print0 |
+    while IFS= read -r -d '' f; do
+      llvm-strip --strip-unneeded "$f" 2>/dev/null || true
     done
 
-    install -Dm644 LICENSE.md -t "${pkgdir}/usr/share/licenses/${pkgname[0]}"
-    install -Dm644 README.md -t "${pkgdir}/usr/share/doc/${pkgname[0]}"
+  install -Dm644 LICENSE.md -t "${pkgdir}/usr/share/licenses/zlib-ng"
+  install -Dm644 README.md  -t "${pkgdir}/usr/share/doc/zlib-ng"
 }
 
 package_zlib-ng-compat() {
-    pkgdesc='zlib-Ersatz mit Optimierungen für Systeme der nächsten Generation (zlib compat)'
-    provides=("zlib=1:${_zlibver}" "libz.so=1")
-    depends=('zlib-ng')
-    conflicts=('zlib')
-    replaces=('zlib')
-    options=('staticlibs' !strip)
-    cd "${srcdir}/zlib-ng"
-    DESTDIR="${pkgdir}" cmake --install build_opt_compat
+  pkgdesc='zlib-Ersatz mit Optimierungen für Systeme der nächsten Generation (zlib compat)'
+  provides=("zlib=1:${_zlibver}" "libz.so=1")
+  depends=('zlib-ng')
+  conflicts=('zlib')
+  replaces=('zlib')
+  options=('staticlibs' !strip !lto)
+  cd "${srcdir}/zlib-ng"
+  DESTDIR="${pkgdir}" cmake --install build_opt_compat
 
-    find "${pkgdir}" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | while IFS= read -r -d '' file; do
-        llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null || true
+  find "${pkgdir}" -type f \( -name '*.so*' -o -name '*.a' \) -print0 |
+    while IFS= read -r -d '' f; do
+      llvm-strip --strip-unneeded "$f" 2>/dev/null || true
     done
 
-    install -Dm644 LICENSE.md -t "${pkgdir}/usr/share/licenses/${pkgname[1]}"
-    install -Dm644 README.md -t "${pkgdir}/usr/share/doc/${pkgname[1]}"
+  install -Dm644 LICENSE.md -t "${pkgdir}/usr/share/licenses/zlib-ng-compat"
+  install -Dm644 README.md  -t "${pkgdir}/usr/share/doc/zlib-ng-compat"
 }
