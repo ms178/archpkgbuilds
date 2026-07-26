@@ -4,8 +4,8 @@ pkgname=(
   "dbus-broker-units-git"
 )
 pkgdesc="Linux D-Bus Message Broker"
-pkgver=37.67.g404f092
-pkgrel=3
+pkgver=37.102.g2956b5d
+pkgrel=1
 arch=(x86_64)
 license=(Apache-2.0)
 url="https://github.com/bus1/dbus-broker/wiki"
@@ -17,7 +17,7 @@ depends=(
 )
 makedepends=(
   git
-  'meson>=0.60.0'
+  'meson>=1.3'
   systemd
   python-docutils
   clang
@@ -25,6 +25,8 @@ makedepends=(
   llvm
   bolt
   procps-ng
+  rust
+  rust-bindgen
 )
 source=(
   "$pkgbase::git+https://github.com/bus1/dbus-broker"
@@ -35,14 +37,59 @@ source=(
   "c-shquote-1::git+https://github.com/c-util/c-shquote#branch=v1"
   "c-stdaux-1::git+https://github.com/c-util/c-stdaux#branch=v1"
   "c-utf8-1::git+https://github.com/c-util/c-utf8#branch=v1"
+  "libc-rs-0.2::git+https://github.com/rust-lang/libc.git#branch=libc-0.2"
+  "sys-1::git+https://github.com/bus1/sys.git#branch=v1"
   "0001-units-Enable-statically.patch"
+  "ms178-1.patch"
 )
 sha256sums=(
-  'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP'
+  'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP'
+  'SKIP'
+  'SKIP'
 )
 
+###############################################################################
+# Toolchain discovery
+#
+# rustc and clang ship DIFFERENT LLVM versions, and their instrumentation
+# profile formats are mutually unreadable:
+#
+#   rustc 1.9x  -> LLVM 22 -> raw profile format v10
+#   clang 20-24 -> LLVM 2x -> raw profile format v11
+#
+# Verified experimentally: llvm-profdata from either side refuses the other
+# side's *.profraw with "raw profile version mismatch". Therefore the Rust
+# profiles MUST be merged with the llvm-profdata that ships inside the rust
+# sysroot, and the C profiles with the system llvm-profdata.
+###############################################################################
+_rust_libdir()   { rustc --print target-libdir; }
+_rust_profdata() {
+  local p
+  for p in "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-profdata; do
+    [[ -x "$p" ]] && { printf '%s' "$p"; return 0; }
+  done
+  return 1
+}
+_rust_profrt()   {
+  # Name carries a build hash (libprofiler_builtins-<hash>.rlib) -> must glob.
+  local f
+  for f in "$(_rust_libdir)"/libprofiler_builtins-*.rlib; do
+    [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+# Turn a bash array into a meson array literal: a b -> 'a','b'
+_mesonlist() {
+  local out="" a
+  for a in "$@"; do
+    out="${out:+$out,}'${a}'"
+  done
+  printf '%s' "$out"
+}
+
 _meson_setup() {
-  local builddir="$1"
+  local builddir="$1" c_args="$2" c_link_args="$3" rust_args="$4"
 
   rm -rf "${builddir}"
   meson setup "${builddir}" "${srcdir}/${pkgbase}" \
@@ -54,12 +101,14 @@ _meson_setup() {
     -Daudit=true \
     -Ddocs=false \
     -Dlinux-4-17=true \
-    -Dsystem-console-users=gdm,sddm,lightdm,lxdm
+    -Dsystem-console-users=gdm,sddm,lightdm,lxdm \
+    -Dc_args="[${c_args}]" \
+    -Dc_link_args="[${c_link_args}]" \
+    -Drust_args="${rust_args}"
 }
 
 _merge_profraw_dir() {
-  local out="$1"
-  local dir="$2"
+  local tool="$1" out="$2" dir="$3"
   local profraws=()
 
   shopt -s nullglob
@@ -67,7 +116,41 @@ _merge_profraw_dir() {
   shopt -u nullglob
 
   (( ${#profraws[@]} > 0 )) || return 1
-  llvm-profdata merge -output="${out}" "${profraws[@]}"
+  "${tool}" merge -output="${out}" "${profraws[@]}" || return 1
+  [[ -s "${out}" ]]
+}
+
+# Run both training drivers against a build tree.
+#
+#  - meson test  : broad functional coverage of the static library, which is
+#                  what the C PGO instrumentation is compiled into. Measured
+#                  with an exec shim: of its 54 tests, only the 5 in the
+#                  `dbus-broker:dbus-broker` suite ever execute the broker
+#                  binary (50 execs); the 49 unit tests execute it zero times.
+#  - train.sh    : real buses, the upstream load generators and the full CLI
+#                  surface. This is what lifts BOLT function coverage for
+#                  dbus-broker-launch from 19.1% to ~48% and for
+#                  dbus-broker-session from 0.2% to ~5%, and what supplies
+#                  ~19e9 instructions of profile weight (vs ~1e7 without the
+#                  load generators).
+#
+# For PGO the full `meson test` is worth its runtime, because every unit test
+# links and exercises the instrumented static library. For BOLT it is not:
+# BOLT only sees the three shipped binaries, so the unit tests contribute
+# nothing and train.sh already runs the integration suite itself.
+_train() {
+  local builddir="$1" profdir="${2:-}"
+
+  if [[ -n "${profdir}" ]]; then
+    LLVM_PROFILE_FILE="${profdir}/m-%p-%m.profraw" \
+      meson test -C "${builddir}" --no-rebuild --print-errorlogs \
+        --timeout-multiplier 5 || warning "Some tests failed during training."
+    LLVM_PROFILE_FILE="${profdir}/t-%p-%m.profraw" \
+      "${srcdir}/train.sh" "${builddir}" || true
+  else
+    # BOLT phase: skip the unit tests, train.sh covers what BOLT can see.
+    "${srcdir}/train.sh" "${builddir}" || true
+  fi
 }
 
 pkgver() {
@@ -84,10 +167,43 @@ prepare() {
     ln -fs "$(realpath --relative-to "subprojects" "${srcdir}/c-${sp}")" "subprojects/libc${sp}"
   done
 
+  # Rust subprojects. libc-rs additionally needs the meson glue that upstream
+  # keeps in subprojects/packagefiles/libc-rs (the wrap's patch_directory).
+  ln -fs "$(realpath --relative-to "subprojects" "${srcdir}/sys-1")" "subprojects/sys-1"
+  rm -rf "subprojects/libc-rs-0.2"
+  cp -a "${srcdir}/libc-rs-0.2" "subprojects/libc-rs-0.2"
+  cp -a subprojects/packagefiles/libc-rs/. "subprojects/libc-rs-0.2/"
+
   patch -Np1 -i "${srcdir}/0001-units-Enable-statically.patch"
+  patch -Np1 -i "${srcdir}/ms178-1.patch"
+
+  # The training driver lives next to the PKGBUILD.
+  install -Dm755 "${startdir}/train.sh" "${srcdir}/train.sh"
 }
 
 build() {
+  #############################################################################
+  # bindgen / libclang ABI guard.
+  #
+  # bindgen dlopen()s libclang at runtime and picks the first one it finds,
+  # searching (among others) next to the clang on $PATH. Arch's rust-bindgen
+  # is built against the *distro* libclang; if a newer LLVM is ahead on $PATH
+  # (llvm-git, a hand-rolled toolchain, ...) bindgen loads that newer
+  # libclang instead. The ABI mismatch does NOT produce an error - bindgen
+  # silently emits every record as an opaque `_address: u8` stub, and the
+  # build dies much later with the very confusing
+  #     error[E0080]: attempt to compute `1_usize - 40_usize`, which would overflow
+  # from the generated size assertion in util_acct.rs.
+  #
+  # Pin LIBCLANG_PATH to the libclang that matches the installed bindgen.
+  if [[ -z "${LIBCLANG_PATH:-}" ]]; then
+    local _lc
+    for _lc in /usr/lib/libclang.so /usr/lib/llvm-*/lib/libclang.so; do
+      [[ -e "${_lc}" ]] && { export LIBCLANG_PATH="$(dirname "${_lc}")"; break; }
+    done
+    [[ -n "${LIBCLANG_PATH:-}" ]] && msg2 "Pinned LIBCLANG_PATH=${LIBCLANG_PATH}"
+  fi
+
   cat > "${srcdir}/meson-native.ini" << 'EOF'
 [binaries]
 c = 'clang'
@@ -98,267 +214,286 @@ ranlib = 'llvm-ranlib'
 strip = 'llvm-strip'
 EOF
 
-  local _orig_cflags="${CFLAGS}"
-  local _orig_cxxflags="${CXXFLAGS}"
-  local _orig_ldflags="${LDFLAGS}"
+  # Respect /etc/makepkg.conf. These are re-injected via -Dc_args/-Dc_link_args
+  # because -Dc_args overrides (not extends) $CFLAGS.
+  local -a base_cflags base_ldflags
+  read -r -a base_cflags  <<< "${CFLAGS}"
+  read -r -a base_ldflags <<< "${LDFLAGS}"
 
-  local _vp_flags="-Xclang -mllvm -Xclang -vp-counters-per-site=50 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
+  # Value profiling: more indirect-call targets per site => better ICP/inlining
+  # decisions. Only meaningful while instrumenting.
+  local -a vp_flags=(
+    -Xclang -mllvm -Xclang -vp-counters-per-site=50
+    -Xclang -mllvm -Xclang -runtime-counter-relocation
+  )
 
-  local _pgo_dir="${srcdir}/dbus-broker-pgo"
-  local _std_profraw="${_pgo_dir}/standard"
-  local _cs_profraw="${_pgo_dir}/cs"
-  local _std_profdata="${_pgo_dir}/standard.profdata"
-  local _cs_profdata="${_pgo_dir}/cs.profdata"
-  local _merged_profdata="${_pgo_dir}/merged.profdata"
-  local _bolt_dir="${_pgo_dir}/bolt"
-  local _bolt_fdata="${_bolt_dir}/prof.fdata"
-  local _bolt_merged="${_bolt_dir}/merged.fdata"
+  local _pgo="${srcdir}/pgo"
+  local _c1="${_pgo}/c1" _c2="${_pgo}/c2" _rust="${_pgo}/rust" _bolt="${_pgo}/bolt"
+  local _c1_profdata="${_pgo}/c1.profdata"
+  local _c_profdata="${_pgo}/c-final.profdata"
+  local _rust_profdata="${_pgo}/rust.profdata"
+  local _bolt_merged="${_bolt}/merged.fdata"
 
-  local _build_std="${srcdir}/_build_std_pgo"
-  local _build_cs="${srcdir}/_build_cs_pgo"
-  local _build_final="${srcdir}/build"
+  local _b_rust="${srcdir}/_build_rust_gen"
+  local _b_c1="${srcdir}/_build_c_gen"
+  local _b_c2="${srcdir}/_build_cs_gen"
+  local _b_final="${srcdir}/build"
 
-  local have_std_profile=0
-  local have_cs_profile=0
-  local final_profdata=''
-  local binpath bin
+  rm -rf "${_pgo}" "${_b_rust}" "${_b_c1}" "${_b_c2}" "${_b_final}"
+  mkdir -p "${_c1}" "${_c2}" "${_rust}" "${_bolt}"
 
-  rm -rf "${_pgo_dir}" "${_build_std}" "${_build_cs}" "${_build_final}"
-  mkdir -p "${_std_profraw}" "${_cs_profraw}" "${_bolt_dir}"
+  local rust_libdir rust_profdata_bin rust_profrt
+  rust_libdir="$(_rust_libdir)"        || true
+  rust_profdata_bin="$(_rust_profdata)" || true
+  rust_profrt="$(_rust_profrt)"        || true
 
-  ###########################################################################
-  # Phase 1: Standard PGO instrumentation
-  ###########################################################################
-  msg2 "Phase 1: Building with standard PGO instrumentation..."
+  # Respect RUSTFLAGS from makepkg.conf the same way we respect CFLAGS:
+  # -Drust_args overrides the RUSTFLAGS environment variable rather than
+  # extending it, so fold it in explicitly. Our own flags come last, and for
+  # rustc the last occurrence of a -C option wins.
+  #
+  # -C opt-level is mandatory here: with --buildtype=plain meson passes NO
+  # opt-level to rustc, so the entire Rust half (all of dbus-broker-session)
+  # would otherwise be built at the rustc default of -Copt-level=0. Measured:
+  # librbus.rlib 2.29MB -> 1.21MB and 15.3% fewer instructions at opt-level=3.
+  local rust_base="${RUSTFLAGS:-} -C opt-level=3"
 
-  export CFLAGS="${_orig_cflags} ${_vp_flags} -fprofile-generate=${_std_profraw} -fno-omit-frame-pointer"
-  export CXXFLAGS="${_orig_cxxflags} ${_vp_flags} -fprofile-generate=${_std_profraw} -fno-omit-frame-pointer"
-  export LDFLAGS="${_orig_ldflags} -fprofile-generate=${_std_profraw}"
+  local have_rust_pgo=0 have_c_pgo=0 have_cs_pgo=0
+  local rust_final_args="${rust_base}"
 
-  _meson_setup "${_build_std}"
-  ninja -C "${_build_std}"
+  #############################################################################
+  # Phase R: Rust PGO  (ISOLATED build tree)
+  #
+  # Why isolated: libprofiler_builtins (rustc's LLVM-22 profiling runtime) must
+  # be force-linked for the Rust counters to be flushed at exit, because rustc
+  # does not emit the __llvm_profile_runtime undef that normally pulls the
+  # registration ctor in. But once linked, its writer also serves the C
+  # counters and emits v10 raw files that clang's llvm-profdata rejects.
+  # Keeping the Rust instrumentation in its own tree avoids the contamination.
+  #############################################################################
+  if [[ -n "${rust_profdata_bin}" && -n "${rust_profrt}" ]]; then
+    msg2 "Phase R: Rust PGO instrumentation..."
+    if _meson_setup "${_b_rust}" \
+         "$(_mesonlist "${base_cflags[@]}")" \
+         "$(_mesonlist "${base_ldflags[@]}" -Wl,--whole-archive "${rust_profrt}" -Wl,--no-whole-archive)" \
+         "${rust_base} -C profile-generate=${_rust}" \
+       && ninja -C "${_b_rust}"; then
 
-  msg2 "Phase 1: Running test suite for standard PGO profile..."
-  LLVM_PROFILE_FILE="${_std_profraw}/%p-%m.profraw" \
-    meson test -C "${_build_std}" \
-      --no-rebuild \
-      --print-errorlogs \
-      --verbose \
-      --timeout-multiplier 3 \
-      --repeat 2 || \
-    warning "Some tests failed during standard PGO training."
+      msg2 "Phase R: training Rust profile..."
+      _train "${_b_rust}" "${_rust}"
 
-  if _merge_profraw_dir "${_std_profdata}" "${_std_profraw}"; then
-    have_std_profile=1
-  else
-    warning "No standard PGO profile data collected; continuing without PGO."
-  fi
-
-  ###########################################################################
-  # Phase 2: Context-sensitive PGO instrumentation
-  ###########################################################################
-  if (( have_std_profile )); then
-    msg2 "Phase 2: Building with context-sensitive PGO instrumentation..."
-
-    export CFLAGS="${_orig_cflags} ${_vp_flags} -fprofile-use=${_std_profdata} -fcs-profile-generate=${_cs_profraw} -fno-omit-frame-pointer"
-    export CXXFLAGS="${_orig_cxxflags} ${_vp_flags} -fprofile-use=${_std_profdata} -fcs-profile-generate=${_cs_profraw} -fno-omit-frame-pointer"
-    export LDFLAGS="${_orig_ldflags} -fprofile-use=${_std_profdata} -fcs-profile-generate=${_cs_profraw}"
-
-    _meson_setup "${_build_cs}"
-    ninja -C "${_build_cs}"
-
-    msg2 "Phase 2: Running test suite for CS-PGO profile..."
-    LLVM_PROFILE_FILE="${_cs_profraw}/%p-%m.profraw" \
-      meson test -C "${_build_cs}" \
-        --no-rebuild \
-        --print-errorlogs \
-        --verbose \
-        --timeout-multiplier 3 \
-        --repeat 2 || \
-      warning "Some tests failed during CS-PGO training."
-
-    if _merge_profraw_dir "${_cs_profdata}" "${_cs_profraw}"; then
-      have_cs_profile=1
-    else
-      warning "No CS-PGO profile data collected; falling back to standard PGO."
-    fi
-  else
-    msg2 "Phase 2: Skipping CS-PGO (no standard profile available)."
-  fi
-
-  if (( have_std_profile && have_cs_profile )); then
-    if llvm-profdata merge -output="${_merged_profdata}" "${_std_profdata}" "${_cs_profdata}"; then
-      final_profdata="${_merged_profdata}"
-    else
-      warning "Profile merge failed; falling back to standard PGO."
-      final_profdata="${_std_profdata}"
-    fi
-  elif (( have_std_profile )); then
-    final_profdata="${_std_profdata}"
-  fi
-
-  ###########################################################################
-  # Phase 3: Final optimized PGO build
-  ###########################################################################
-  msg2 "Phase 3: Building final optimized binaries..."
-
-  if [[ -n "${final_profdata}" && -f "${final_profdata}" ]]; then
-    export CFLAGS="${_orig_cflags} -fprofile-use=${final_profdata}"
-    export CXXFLAGS="${_orig_cxxflags} -fprofile-use=${final_profdata}"
-    export LDFLAGS="${_orig_ldflags} -fprofile-use=${final_profdata} -Wl,--emit-relocs"
-  else
-    export CFLAGS="${_orig_cflags}"
-    export CXXFLAGS="${_orig_cxxflags}"
-    export LDFLAGS="${_orig_ldflags} -Wl,--emit-relocs"
-  fi
-
-  _meson_setup "${_build_final}"
-  ninja -C "${_build_final}"
-
-  ###########################################################################
-  # Phase 4: BOLT instrumentation + training + apply
-  ###########################################################################
-  if command -v llvm-bolt >/dev/null 2>&1 && command -v merge-fdata >/dev/null 2>&1; then
-    msg2 "Phase 4: BOLT instrumentation and training..."
-
-    local _bolt_bins=(dbus-broker dbus-broker-launch)
-    local _bolt_instrumented=()
-
-    rm -f "${_bolt_fdata}" "${_bolt_fdata}".* "${_bolt_merged}"
-
-    # ----------------------------------------------------------
-    # 4a: Instrument ALL binaries with a SHARED fdata prefix.
-    #     This is critical: both binaries write to prof.fdata.<PID>
-    #     so the merged profile contains data from both, and BOLT
-    #     silently ignores irrelevant functions when applying.
-    # ----------------------------------------------------------
-    for bin in "${_bolt_bins[@]}"; do
-      binpath="${_build_final}/src/${bin}"
-      [[ -f "${binpath}" ]] || continue
-
-      cp -a "${binpath}" "${binpath}.orig"
-
-      if llvm-bolt "${binpath}.orig" \
-        --instrument \
-        --instrumentation-file="${_bolt_fdata}" \
-        --instrumentation-file-append-pid \
-        -o "${binpath}.inst"; then
-        mv -f "${binpath}.inst" "${binpath}"
-        _bolt_instrumented+=("${bin}")
+      if _merge_profraw_dir "${rust_profdata_bin}" "${_rust_profdata}" "${_rust}"; then
+        have_rust_pgo=1
+        rust_final_args="${rust_base} -C profile-use=${_rust_profdata}"
+        msg2 "Phase R: Rust profile collected."
       else
-        warning "BOLT instrumentation failed for ${bin}; it will remain PGO-only."
-        mv -f "${binpath}.orig" "${binpath}"
+        warning "No Rust profile collected; Rust will be built -O3 without PGO."
+      fi
+    else
+      warning "Rust instrumentation build failed; continuing without Rust PGO."
+    fi
+  else
+    warning "rust llvm-profdata / profiler_builtins not found; skipping Rust PGO."
+  fi
+
+  #############################################################################
+  # Phase 1: C IR-PGO instrumentation
+  #############################################################################
+  msg2 "Phase 1: C PGO instrumentation..."
+  if _meson_setup "${_b_c1}" \
+       "$(_mesonlist "${base_cflags[@]}" "${vp_flags[@]}" "-fprofile-generate=${_c1}" -fno-omit-frame-pointer)" \
+       "$(_mesonlist "${base_ldflags[@]}" "-fprofile-generate=${_c1}")" \
+       "${rust_final_args}" \
+     && ninja -C "${_b_c1}"; then
+
+    msg2 "Phase 1: training C profile..."
+    _train "${_b_c1}" "${_c1}"
+
+    if _merge_profraw_dir llvm-profdata "${_c1_profdata}" "${_c1}"; then
+      have_c_pgo=1
+    else
+      warning "No C PGO profile collected; continuing without C PGO."
+    fi
+  else
+    warning "C instrumentation build failed; continuing without C PGO."
+  fi
+
+  #############################################################################
+  # Phase 2: C context-sensitive PGO
+  #############################################################################
+  if (( have_c_pgo )); then
+    msg2 "Phase 2: C context-sensitive PGO instrumentation..."
+    if _meson_setup "${_b_c2}" \
+         "$(_mesonlist "${base_cflags[@]}" "${vp_flags[@]}" "-fprofile-use=${_c1_profdata}" "-fcs-profile-generate=${_c2}" -fno-omit-frame-pointer)" \
+         "$(_mesonlist "${base_ldflags[@]}" "-fprofile-use=${_c1_profdata}" "-fcs-profile-generate=${_c2}")" \
+         "${rust_final_args}" \
+       && ninja -C "${_b_c2}"; then
+
+      msg2 "Phase 2: training CS-PGO profile..."
+      _train "${_b_c2}" "${_c2}"
+
+      # The CS profile must be merged TOGETHER WITH the first-round profile:
+      # -fcs-profile-generate only records the context-sensitive counters.
+      shopt -s nullglob
+      local cs_raws=("${_c2}"/*.profraw)
+      shopt -u nullglob
+      if (( ${#cs_raws[@]} > 0 )) \
+         && llvm-profdata merge -output="${_c_profdata}" "${cs_raws[@]}" "${_c1_profdata}" \
+         && [[ -s "${_c_profdata}" ]]; then
+        have_cs_pgo=1
+      else
+        warning "CS-PGO merge failed; falling back to first-round C profile."
+      fi
+    else
+      warning "CS-PGO build failed; falling back to first-round C profile."
+    fi
+  fi
+  (( have_cs_pgo )) || _c_profdata="${_c1_profdata}"
+
+  #############################################################################
+  # Phase 3: final optimized build
+  #
+  # -Wl,--emit-relocs is required for BOLT to relocate/reorder code.
+  #
+  # A silent fallback to a non-PGO build would be worse than a hard failure:
+  # the package would look fine but ship none of the optimization this
+  # PKGBUILD exists for. Fail loudly instead, unless the packager opted out
+  # via _allow_unoptimized=1.
+  #############################################################################
+  if (( ! have_c_pgo )) && [[ "${_allow_unoptimized:-0}" != 1 ]]; then
+    error "C PGO produced no profile - refusing to ship an unoptimized package."
+    error "Check the logs above; set _allow_unoptimized=1 to build anyway."
+    return 1
+  fi
+
+  msg2 "Phase 3: final optimized build..."
+  local -a final_cf=("${base_cflags[@]}") final_lf=("${base_ldflags[@]}" -Wl,--emit-relocs)
+  if (( have_c_pgo )); then
+    final_cf+=("-fprofile-use=${_c_profdata}")
+    final_lf+=("-fprofile-use=${_c_profdata}")
+  fi
+
+  _meson_setup "${_b_final}" \
+    "$(_mesonlist "${final_cf[@]}")" \
+    "$(_mesonlist "${final_lf[@]}")" \
+    "${rust_final_args}"
+  ninja -C "${_b_final}"
+
+  #############################################################################
+  # Phase 4: BOLT
+  #
+  # Option set determined empirically on this code base (dyno-stats over the
+  # real training profile, executed-instruction counts):
+  #   * --indirect-call-promotion=all  REGRESSES dbus-broker by +44.5M
+  #     instructions (+0.22%): the indirect calls here are cold dispatch, and
+  #     the promotion sequences add work on the hot path.  -> dropped
+  #   * --split-strategy=profile2 beats cdsplit: 20,166,271,267 vs
+  #     20,168,854,121 instructions and 1.1M fewer taken branches.
+  #   * --icf=safe is used instead of --icf=all: identical dyno-stats, but
+  #     `all` may fold functions whose addresses are compared.
+  #   * --frame-opt=hot instead of all: identical dyno-stats, smaller blast
+  #     radius on cold code.
+  #   * --use-gnu-stack shrinks the output from 6.45MB to 4.35MB with
+  #     byte-identical dyno-stats.
+  #   * --strict REGRESSES by +126M instructions -> not used.
+  # Net vs the previous option set: -45.9M executed instructions on
+  # dbus-broker, plus wins on the launcher and the session binary.
+  #############################################################################
+  local -a bolt_bins=(dbus-broker dbus-broker-launch dbus-broker-session)
+  local -a bolt_opts=(
+    --lite=false
+    --reorder-blocks=ext-tsp
+    --reorder-functions=cdsort
+    --split-functions
+    --split-strategy=profile2
+    --split-eh
+    --split-all-cold
+    --icf=safe
+    --plt=all
+    --peepholes=all
+    --x86-strip-redundant-address-size
+    --eliminate-unreachable
+    --frame-opt=hot
+    --jump-tables=aggressive
+    --use-gnu-stack
+    --dyno-stats
+  )
+
+  if command -v llvm-bolt >/dev/null 2>&1 && command -v merge-fdata >/dev/null 2>&1; then
+    msg2 "Phase 4: BOLT instrumentation..."
+    local bin binpath
+    local -a instrumented=()
+
+    for bin in "${bolt_bins[@]}"; do
+      binpath="${_b_final}/src/${bin}"
+      [[ -f "${binpath}" ]] || continue
+      cp -a "${binpath}" "${binpath}.orig"
+      if llvm-bolt "${binpath}.orig" \
+           --instrument \
+           --instrumentation-file="${_bolt}/prof.fdata" \
+           --instrumentation-file-append-pid \
+           -o "${binpath}.inst"; then
+        mv -f "${binpath}.inst" "${binpath}"
+        instrumented+=("${bin}")
+      else
+        warning "BOLT instrumentation failed for ${bin}; keeping PGO binary."
+        cp -a "${binpath}.orig" "${binpath}"
         rm -f "${binpath}.inst"
       fi
     done
 
-    # ----------------------------------------------------------
-    # 4b: Run tests on the instrumented binaries.
-    #     Both dbus-broker and dbus-broker-launch execute during
-    #     tests (the launcher spawns the broker). Profile data
-    #     from both accumulates under the shared fdata prefix.
-    # ----------------------------------------------------------
-    if (( ${#_bolt_instrumented[@]} > 0 )); then
-      msg2 "Phase 4: Running test suite for BOLT profile collection..."
-      meson test -C "${_build_final}" \
-        --no-rebuild \
-        --print-errorlogs \
-        --verbose \
-        --timeout-multiplier 5 \
-        --repeat 2 || \
-        warning "Some tests failed during BOLT training."
-
+    if (( ${#instrumented[@]} > 0 )); then
+      msg2 "Phase 4: BOLT profile collection..."
+      _train "${_b_final}"
       sleep 2
 
-      # ----------------------------------------------------------
-      # 4c: Merge ALL fdata files and apply the SAME merged profile
-      #     to EVERY binary. BOLT uses matching functions and ignores
-      #     the rest (reported as "profile for N objects was ignored").
-      # ----------------------------------------------------------
-      if compgen -G "${_bolt_fdata}.*" >/dev/null; then
-        if merge-fdata "${_bolt_fdata}".* -o "${_bolt_merged}" && [[ -s "${_bolt_merged}" ]]; then
-          for bin in "${_bolt_bins[@]}"; do
-            binpath="${_build_final}/src/${bin}"
-            [[ -f "${binpath}.orig" ]] || continue
-
-            msg2 "Applying BOLT optimizations to ${bin}..."
-            if llvm-bolt "${binpath}.orig" \
-              --data="${_bolt_merged}" \
-              -o "${binpath}.bolt" \
-              --dyno-stats \
-              --lite=false \
-              --split-functions \
-              --split-all-cold \
-              --split-eh \
-              --split-strategy=cdsplit \
-              --icf=all \
-              --plt=all \
-              --peepholes=all \
-              --indirect-call-promotion=all \
-              --reorder-blocks=ext-tsp \
-              --reorder-functions=cdsort \
-              --x86-strip-redundant-address-size \
-              --eliminate-unreachable \
-              --frame-opt=all \
-              --jump-tables=aggressive \
-              --use-gnu-stack; then
-              mv -f "${binpath}.bolt" "${binpath}"
-              rm -f "${binpath}.orig"
-            else
-              warning "BOLT optimization failed for ${bin}; restoring PGO binary."
-              mv -f "${binpath}.orig" "${binpath}"
-              rm -f "${binpath}.bolt"
-            fi
-          done
-        else
-          warning "BOLT profile merge failed or empty; restoring PGO binaries."
-          for bin in "${_bolt_bins[@]}"; do
-            binpath="${_build_final}/src/${bin}"
-            [[ -f "${binpath}.orig" ]] && mv -f "${binpath}.orig" "${binpath}"
-          done
-        fi
-      else
-        warning "No BOLT profile data collected; restoring PGO binaries."
-        for bin in "${_bolt_bins[@]}"; do
-          binpath="${_build_final}/src/${bin}"
-          [[ -f "${binpath}.orig" ]] && mv -f "${binpath}.orig" "${binpath}"
+      if compgen -G "${_bolt}/prof.fdata.*" >/dev/null \
+         && merge-fdata "${_bolt}"/prof.fdata.* -o "${_bolt_merged}" \
+         && [[ -s "${_bolt_merged}" ]]; then
+        for bin in "${bolt_bins[@]}"; do
+          binpath="${_b_final}/src/${bin}"
+          [[ -f "${binpath}.orig" ]] || continue
+          msg2 "Applying BOLT optimizations to ${bin}..."
+          if llvm-bolt "${binpath}.orig" \
+               --data="${_bolt_merged}" \
+               -o "${binpath}.bolt" \
+               "${bolt_opts[@]}"; then
+            mv -f "${binpath}.bolt" "${binpath}"
+            rm -f "${binpath}.orig"
+          else
+            warning "BOLT optimization failed for ${bin}; restoring PGO binary."
+            mv -f "${binpath}.orig" "${binpath}"
+            rm -f "${binpath}.bolt"
+          fi
         done
+      else
+        warning "No usable BOLT profile; restoring PGO binaries."
       fi
     fi
 
-    # Final safety: ensure no .orig files remain
-    for bin in "${_bolt_bins[@]}"; do
-      binpath="${_build_final}/src/${bin}"
+    # Safety net: never ship an instrumented binary.
+    for bin in "${bolt_bins[@]}"; do
+      binpath="${_b_final}/src/${bin}"
       [[ -f "${binpath}.orig" ]] && mv -f "${binpath}.orig" "${binpath}"
     done
   else
     warning "BOLT tools unavailable; skipping BOLT optimization."
   fi
 
-  ###########################################################################
-  # Phase 5: Verification
-  ###########################################################################
-  msg2 "Phase 5: Verifying final output..."
-
-  for bin in dbus-broker dbus-broker-launch; do
-    binpath="${_build_final}/src/${bin}"
+  #############################################################################
+  # Phase 5: verification
+  #############################################################################
+  msg2 "Phase 5: verifying final output..."
+  local bin binpath
+  for bin in "${bolt_bins[@]}"; do
+    binpath="${_b_final}/src/${bin}"
     if [[ -f "${binpath}" ]]; then
-      if ! readelf -h "${binpath}" >/dev/null 2>&1; then
-        error "Final ${bin} is not a valid ELF object"
-        return 1
-      fi
+      readelf -h "${binpath}" >/dev/null 2>&1 || { error "Final ${bin} is not a valid ELF object"; return 1; }
     fi
   done
 
-  meson test -C "${_build_final}" \
-    --no-rebuild \
-    --print-errorlogs \
-    --timeout-multiplier 3 || \
-    warning "Some tests failed during final verification."
-
-  export CFLAGS="${_orig_cflags}"
-  export CXXFLAGS="${_orig_cxxflags}"
-  export LDFLAGS="${_orig_ldflags}"
+  meson test -C "${_b_final}" --no-rebuild --print-errorlogs --timeout-multiplier 3 \
+    || warning "Some tests failed during final verification."
 }
 
 _pick() {
