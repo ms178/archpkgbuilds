@@ -1,14 +1,13 @@
 pkgname=lz4
 pkgver=1.10.0
-pkgrel=4
+pkgrel=6
 epoch=1
 pkgdesc='Extremely fast compression algorithm'
 arch=('x86_64')
 url='https://lz4.github.io/lz4/'
 license=('GPL-2.0-or-later')
 depends=('glibc')
-makedepends=('git' 'meson' 'ninja' 'clang' 'llvm' 'lld')
-checkdepends=('diffutils')
+makedepends=('git' 'meson' 'ninja' 'clang' 'llvm' 'lld' 'mimalloc' 'diffutils')
 provides=('liblz4.so')
 source=(
   "git+https://github.com/lz4/lz4.git#tag=v$pkgver"
@@ -16,17 +15,15 @@ source=(
 )
 sha256sums=(
   '487f9bc24fdaf589e2f4bb23dd98b1f21a71b643db09251145616587c9468555'
-  '32b776dbd1ceca57aeb0adaaa2bb878ea0c70f20745fe4de6775bc2e9ceab96f'
+  'ebf61cb54543ddb80d16265fb207245bb6346f2cd9864e91eec1158a2a9025ca'
 )
 options=('strip')
 
-_setup_llvm_ultimate() {
-  local llvm_root=${LLVM_ULTIMATE_ROOT:-/home/user/llvm-ultimate}
-  if [[ -x $llvm_root/bin/clang ]]; then
-    export PATH="$llvm_root/bin:$PATH"
-    export LD_LIBRARY_PATH="$llvm_root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  fi
-
+# Respect the caller's PATH. With no override this selects Arch's LLVM; exporting
+# a custom toolchain's bin directory before makepkg selects that toolchain.
+# BOLT is optional because Arch's official llvm package doesn't ship it.
+_bolt_available=0
+_setup_llvm_toolchain() {
   export CC=clang
   export CXX=clang++
   export AR=llvm-ar
@@ -38,28 +35,93 @@ _setup_llvm_ultimate() {
   export STRIP=llvm-strip
 
   local tool
-  for tool in clang clang++ ld.lld llvm-ar llvm-profdata llvm-bolt merge-fdata; do
+  local required_tools=(
+    clang clang++ ld.lld llvm-ar llvm-nm llvm-ranlib llvm-readelf
+    llvm-objcopy llvm-objdump llvm-strip llvm-profdata
+  )
+  for tool in "${required_tools[@]}"; do
     command -v "$tool" >/dev/null || {
-      error "llvm-ultimate tool '$tool' is unavailable"
+      error "required LLVM tool '$tool' is unavailable in PATH"
       return 1
     }
   done
+
+  # Fail before the expensive profile run if PATH mixes incompatible releases.
+  local clang_major llvm_major lld_major bolt_major tool_major
+  clang_major=$(clang -dumpversion | cut -d. -f1)
+  llvm_major=$(llvm-profdata --version | sed -nE 's/.*LLVM version ([0-9]+).*/\1/p' | head -n1)
+  lld_major=$(ld.lld --version | sed -nE 's/.*LLD ([0-9]+).*/\1/p' | head -n1)
+  [[ $clang_major =~ ^[0-9]+$ && $llvm_major =~ ^[0-9]+$ && $lld_major =~ ^[0-9]+$ ]] || {
+    error 'could not determine LLVM toolchain versions'
+    return 1
+  }
+  [[ $clang_major == "$llvm_major" && $clang_major == "$lld_major" ]] || {
+    error "mixed LLVM toolchain in PATH (clang=$clang_major, llvm-profdata=$llvm_major, lld=$lld_major)"
+    return 1
+  }
+  for tool in llvm-ar llvm-nm llvm-ranlib llvm-readelf llvm-objcopy llvm-objdump llvm-strip; do
+    tool_major=$("$tool" --version | sed -nE 's/.*LLVM version ([0-9]+).*/\1/p' | head -n1)
+    [[ $tool_major == "$clang_major" ]] || {
+      error "$tool major version $tool_major doesn't match clang $clang_major"
+      return 1
+    }
+  done
+
+  _bolt_available=0
+  if command -v llvm-bolt >/dev/null && command -v merge-fdata >/dev/null; then
+    local bolt_dir merge_dir
+    bolt_dir=$(dirname "$(command -v llvm-bolt)")
+    merge_dir=$(dirname "$(command -v merge-fdata)")
+    [[ $bolt_dir == "$merge_dir" ]] || {
+      error "mixed BOLT tools in PATH (llvm-bolt=$bolt_dir, merge-fdata=$merge_dir)"
+      return 1
+    }
+    bolt_major=$(llvm-bolt --version | sed -nE 's/.*LLVM version ([0-9]+).*/\1/p' | head -n1)
+    [[ $bolt_major == "$clang_major" ]] || {
+      error "llvm-bolt major version $bolt_major doesn't match clang $clang_major"
+      return 1
+    }
+    local bolt_help bolt_option
+    local required_bolt_options=(
+      instrument instrumentation-file instrumentation-file-append-pid
+      instrumentation-binpath data no-huge-pages reorder-blocks
+      reorder-functions split-functions split-all-cold split-eh icf plt
+      reg-reassign frame-opt dyno-stats print-profile-stats verify-cfg
+    )
+    bolt_help=$(llvm-bolt --help-hidden)
+    for bolt_option in "${required_bolt_options[@]}"; do
+      grep -q -- "--$bolt_option" <<< "$bolt_help" || {
+        error "llvm-bolt lacks required option '--$bolt_option'"
+        return 1
+      }
+    done
+    _bolt_available=1
+  elif command -v llvm-bolt >/dev/null || command -v merge-fdata >/dev/null; then
+    error 'incomplete BOLT installation: llvm-bolt and merge-fdata must both be in PATH'
+    return 1
+  fi
+
+  msg "Using LLVM $clang_major from $(command -v clang)"
+  ((_bolt_available)) || msg 'llvm-bolt not found; building CS-PGO package without optional BOLT stage'
 }
 
 # Configure a fresh Meson tree. CFLAGS/CXXFLAGS/LDFLAGS from makepkg.conf are
-# retained verbatim; each stage appends only the instrumentation/profile flags
-# it needs. --buildtype=plain prevents Meson from overriding the user's -O and
-# debug policy.
+# retained verbatim; PGO flags are appended only to C because all shipped
+# optimized targets are C (instrumenting unrelated C++ helper targets would
+# create hash-mismatch noise). --buildtype=plain prevents Meson from overriding
+# the user's -O and debug policy.
 _setup_stage() {
   local build_dir=$1
   local stage_cflags=$2
-  local stage_ldflags=$3
-  local build_tests=$4
+  local stage_cxxflags=$3
+  local stage_ldflags=$4
+  local build_tests=$5
 
   CC="$CC" CXX="$CXX" AR="$AR" NM="$NM" RANLIB="$RANLIB" \
-  CFLAGS="$stage_cflags" CXXFLAGS="$CXXFLAGS" LDFLAGS="$stage_ldflags" \
+  CFLAGS="$stage_cflags" CXXFLAGS="$stage_cxxflags" LDFLAGS="$stage_ldflags" \
     meson setup \
       --prefix=/usr \
+      --libdir=lib \
       --buildtype=plain \
       --wrap-mode=nofallback \
       -Db_lto=false \
@@ -74,11 +136,15 @@ _setup_stage() {
 _compile_training_targets() {
   local build_dir=$1
   meson compile -C "$build_dir" --jobs "$(nproc)" \
-    meson/programs/lz4 \
+    meson/lib/lz4:shared_library \
+    meson/programs/lz4:executable \
+    meson/tests/abiTest \
+    meson/tests/checkTag \
     meson/tests/datagen \
     meson/tests/fuzzer \
     meson/tests/frametest \
     meson/tests/fullbench \
+    meson/tests/roundTripTest \
     meson/tests/decompress-partial.c \
     meson/tests/decompress-partial-usingDict.c \
     meson/tests/checkFrame
@@ -91,24 +157,32 @@ _compile_training_targets() {
 _generate_training_corpus() {
   local datagen=$1
   local corpus=$2
+  local corpus_revision="ms178-workload-v3-$pkgver"
+  local tmp="${corpus}.tmp.$$"
 
-  [[ -e $corpus/.ready ]] && return 0
-  mkdir -p "$corpus"
+  if [[ -f $corpus/.ready ]] && [[ $(<"$corpus/.ready") == "$corpus_revision" ]]; then
+    return 0
+  fi
+  # Never accept a stale or half-written corpus from an interrupted rebuild.
+  rm -rf "$corpus" "${corpus}.tmp."*
+  mkdir -p "$tmp"
   local p
   for p in 0 20 40 60 80 100; do
-    "$datagen" -g8M -P"$p" -s"$((1789 + p))" > "$corpus/p${p}.bin"
+    "$datagen" -g8M -P"$p" -s"$((1789 + p))" > "$tmp/p${p}.bin"
   done
-  tar -cf "$corpus/source-tree.tar" -C "$srcdir/lz4" \
+  tar --sort=name --format=gnu --mtime='@0' --owner=0 --group=0 \
+    --numeric-owner -cf "$tmp/source-tree.tar" -C "$srcdir/lz4" \
     lib programs tests build/cmake build/meson
-  head -c 65536 "$corpus/source-tree.tar" > "$corpus/dictionary.bin"
-  : > "$corpus/empty"
-  printf 'x' > "$corpus/one-byte"
+  head -c 65536 "$tmp/source-tree.tar" > "$tmp/dictionary.bin"
+  : > "$tmp/empty"
+  printf 'x' > "$tmp/one-byte"
   printf 'The quick brown fox jumps over the lazy dog. %.0s' {1..2000} \
-    > "$corpus/small-text"
-  truncate -s 32M "$corpus/sparse.bin"
-  printf 'sparse-tail\n' | dd of="$corpus/sparse.bin" bs=1 \
+    > "$tmp/small-text"
+  truncate -s 32M "$tmp/sparse.bin"
+  printf 'sparse-tail\n' | dd of="$tmp/sparse.bin" bs=1 \
     seek=$((32 * 1024 * 1024 - 12)) conv=notrunc status=none
-  touch "$corpus/.ready"
+  printf '%s\n' "$corpus_revision" > "$tmp/.ready"
+  mv "$tmp" "$corpus"
 }
 
 _run_training_workload() {
@@ -123,6 +197,15 @@ _run_training_workload() {
   _generate_training_corpus "$datagen" "$corpus"
   rm -rf "$out" "$roundtrip"
   mkdir -p "$out" "$roundtrip"
+
+  _run_logged() {
+    local log=$1
+    shift
+    if ! "$@" > "$log" 2>&1; then
+      cat "$log" >&2
+      return 1
+    fi
+  }
 
   _run_pair() {
     local tag=$1 input=$2
@@ -149,6 +232,11 @@ _run_training_workload() {
     "$lz4" -q -dc "$out/fast-p60-$pass.lz4" > /dev/null
     "$lz4" -q -dc "$out/mt-auto-$pass.lz4" > /dev/null
   done
+  # Literal-only/incompressible and near-RLE extremes exercise opposite hash,
+  # incompressible-block and memcpy decisions important for 10 GbE traffic.
+  _run_pair fast-p0 "$corpus/p0.bin" -1 -T1
+  _run_pair fast-p100 "$corpus/p100.bin" -1 -T1
+  _run_pair ultra32-p0 "$corpus/p0.bin" --fast=32 -T1
 
   # Frame/block variants and edge inputs.
   _run_pair b4 "$corpus/p40.bin" -1 -B4 -BI
@@ -165,19 +253,25 @@ _run_training_workload() {
   # Every materially different HC strategy, plus decompression-speed bias.
   _run_pair hc3 "$corpus/p40.bin" -3 -T1
   _run_pair hc4 "$corpus/p60.bin" -4 -T1
-  _run_pair hc6 "$corpus/p40.bin" -6 -T1
-  _run_pair hc9 "$corpus/p60.bin" -9 -T1
-  _run_pair hc10 "$corpus/p40.bin" -10 -T1
-  _run_pair hc11 "$corpus/p60.bin" -11 -T1
-  _run_pair hc12 "$corpus/p40.bin" -12 -T1
+  _run_pair hc5 "$corpus/p40.bin" -5 -T1
+  _run_pair hc6 "$corpus/p60.bin" -6 -T1
+  _run_pair hc7 "$corpus/p40.bin" -7 -T1
+  _run_pair hc8 "$corpus/p60.bin" -8 -T1
+  _run_pair hc9 "$corpus/p40.bin" -9 -T1
+  _run_pair hc10 "$corpus/p60.bin" -10 -T1
+  _run_pair hc11 "$corpus/p40.bin" -11 -T1
+  _run_pair hc12 "$corpus/p60.bin" -12 -T1
   _run_pair hc12-dec-speed "$corpus/p60.bin" -12 --favor-decSpeed -T1
 
-  "$lz4" -q -f -1 -D "$corpus/dictionary.bin" \
-    "$corpus/source-tree.tar" "$out/dict.lz4"
-  "$lz4" -q -t -D "$corpus/dictionary.bin" "$out/dict.lz4"
-  "$lz4" -q -d -f -D "$corpus/dictionary.bin" \
-    "$out/dict.lz4" "$roundtrip/dict"
-  cmp -s "$corpus/source-tree.tar" "$roundtrip/dict"
+  local level
+  for level in 1 9 12; do
+    "$lz4" -q -f "-$level" -D "$corpus/dictionary.bin" \
+      "$corpus/source-tree.tar" "$out/dict-$level.lz4"
+    "$lz4" -q -t -D "$corpus/dictionary.bin" "$out/dict-$level.lz4"
+    "$lz4" -q -d -f -D "$corpus/dictionary.bin" \
+      "$out/dict-$level.lz4" "$roundtrip/dict-$level"
+    cmp -s "$corpus/source-tree.tar" "$roundtrip/dict-$level"
+  done
 
   "$lz4" -q -1 < "$corpus/p40.bin" > "$out/pipe.lz4"
   "$lz4" -q -dc "$out/pipe.lz4" > "$roundtrip/pipe"
@@ -185,22 +279,96 @@ _run_training_workload() {
   cat "$out/fast-p20-1.lz4" "$out/fast-p80-1.lz4" > "$out/concatenated.lz4"
   "$lz4" -q -t "$out/concatenated.lz4"
   "$lz4" -q -dc "$out/concatenated.lz4" > /dev/null
+  "$lz4" --list "$out/fast-p20-1.lz4" > /dev/null
+  "$lz4" --list "$out/b6-checksums.lz4" > /dev/null
   "$lz4" --list "$out/content-size.lz4" > /dev/null
+  "$lz4" --list "$out/concatenated.lz4" > /dev/null
+  head -c 5 "$out/content-size.lz4" > "$out/truncated-header.lz4"
+  if "$lz4" --list "$out/truncated-header.lz4" > "$root/truncated-list.log" 2>&1; then
+    error 'lz4 --list unexpectedly accepted a truncated frame header'
+    return 1
+  fi
+
+  # Custom byte-sized blocks hit parser/buffer boundaries not covered by B4-B7.
+  # checkFrame previously ran without arguments and silently did no work.
+  if "$lz4" -q -f -B31 "$corpus/p40.bin" "$out/invalid-b31.lz4" \
+      > "$root/invalid-b31.log" 2>&1; then
+    error 'lz4 unexpectedly accepted invalid block size -B31'
+    return 1
+  fi
+  local spec block_size block_id expected_block_size sample_size custom_input
+  for spec in \
+      32:4:32 65535:4:65535 65536:4:65536 \
+      65537:5:65537 262143:5:262143 262144:5:262144 \
+      262145:6:262145 1048575:6:1048575 1048576:6:1048576 \
+      1048577:7:1048577 4194303:7:4194303 4194304:7:4194304 \
+      4194305:7:4194304 10485760:7:4194304; do
+    IFS=: read -r block_size block_id expected_block_size <<< "$spec"
+    # Two-plus blocks are sufficient for boundary correctness. Cap/min the
+    # sample so pathological -B32 does not dominate profile weights.
+    sample_size=$((block_size * 2 + 17))
+    ((sample_size < 4096)) && sample_size=4096
+    ((sample_size > 8388608)) && sample_size=8388608
+    custom_input="$root/custom-input-$block_size"
+    head -c "$sample_size" "$corpus/p40.bin" > "$custom_input"
+    "$lz4" -q -f -B"$block_size" "$custom_input" \
+      "$out/custom-$block_size.lz4"
+    "$tests_dir/checkFrame" -B"$expected_block_size" -b"$block_id" \
+      "$out/custom-$block_size.lz4" > /dev/null 2>&1
+    "$lz4" -q -d -f "$out/custom-$block_size.lz4" \
+      "$roundtrip/custom-$block_size"
+    cmp -s "$custom_input" "$roundtrip/custom-$block_size"
+  done
+  # Cover the linked-block dispatch boundary: sub-64-KiB blocks correctly use
+  # the sequential stream, while larger custom blocks retain MT job grouping.
+  for spec in 32:4 65535:4 65537:5 262145:6; do
+    IFS=: read -r block_size block_id <<< "$spec"
+    sample_size=$((block_size * 2 + 17))
+    ((sample_size < 4096)) && sample_size=4096
+    custom_input="$root/custom-dependent-input-$block_size"
+    head -c "$sample_size" "$corpus/p40.bin" > "$custom_input"
+    "$lz4" -q -f -BD -B"$block_size" "$custom_input" \
+      "$out/custom-dependent-$block_size.lz4"
+    "$tests_dir/checkFrame" -B"$block_size" -b"$block_id" \
+      "$out/custom-dependent-$block_size.lz4" > /dev/null 2>&1
+    "$lz4" -q -d -f "$out/custom-dependent-$block_size.lz4" \
+      "$roundtrip/custom-dependent-$block_size"
+    cmp -s "$custom_input" "$roundtrip/custom-dependent-$block_size"
+  done
 
   "$lz4" -V > /dev/null
   "$lz4" -H > /dev/null 2>&1
-  "$lz4" -b1 -e4 -i1 "$corpus/p40.bin" > /dev/null 2>&1
-  "$lz4" -b9 -e10 -i1 "$corpus/p60.bin" > /dev/null 2>&1
+  # Avoid time-budgeted CLI benchmarks here: their iteration counts depend on
+  # ambient system load and distort profile weights. The regression suite covers
+  # benchmark CLI dispatch, while fullbench below runs every codec exactly once.
 
   # These executables cover raw blocks, streaming dictionaries, partial decode,
   # malformed input, frame state transitions and every public codec family.
   if [[ ${BOLT_TRAIN_ONLY:-0} != 1 ]]; then
-    "$tests_dir/fuzzer" -i12000 -s1789 > /dev/null
-    "$tests_dir/frametest" -i6000 -s1789 > /dev/null
-    "$tests_dir/fullbench" --no-prompt -i1 "$corpus/p40.bin" > /dev/null
-    "$tests_dir/decompress-partial.c" > /dev/null
-    "$tests_dir/decompress-partial-usingDict.c" > /dev/null
-    "$tests_dir/checkFrame" > /dev/null
+    _run_logged "$root/fuzzer.log" \
+      "$tests_dir/fuzzer" -i12000 -s1789
+    _run_logged "$root/frametest.log" \
+      "$tests_dir/frametest" -i6000 -s1789
+    _run_logged "$root/fullbench.log" \
+      "$tests_dir/fullbench" --no-prompt -i1 "$corpus/p40.bin"
+    _run_logged "$root/decompress-partial.log" \
+      "$tests_dir/decompress-partial.c"
+    _run_logged "$root/decompress-partial-dict.log" \
+      "$tests_dir/decompress-partial-usingDict.c"
+    _run_logged "$root/roundtrip-p0.log" \
+      "$tests_dir/roundTripTest" "$corpus/p0.bin"
+    _run_logged "$root/roundtrip-p40.log" \
+      "$tests_dir/roundTripTest" "$corpus/p40.bin"
+    _run_logged "$root/roundtrip-p100.log" \
+      "$tests_dir/roundTripTest" "$corpus/p100.bin"
+    _run_logged "$root/abi.log" \
+      "$tests_dir/abiTest" "$corpus/p40.bin"
+    _run_logged "$root/checkTag-valid.log" \
+      "$tests_dir/checkTag" "v$pkgver"
+    if "$tests_dir/checkTag" > "$root/checkTag-invalid.log" 2>&1; then
+      error 'checkTag unexpectedly accepted a missing tag'
+      return 1
+    fi
   fi
 }
 
@@ -212,11 +380,15 @@ _run_cli_regression_suite() {
   local datagen=$2
   local work=$3
   local tools="$work/tools"
-  mkdir -p "$tools"
+  mkdir -p "$tools" "$work/logs"
   ln -sfn "$lz4" "$tools/lz4"
   ln -sfn "$lz4" "$tools/lz4cat"
   ln -sfn "$lz4" "$tools/unlz4"
   ln -sfn "$datagen" "$tools/datagen"
+
+  # Remove artifacts left by an interrupted prior run; every selected upstream
+  # script reserves only the tmp-* namespace in this directory.
+  find "$srcdir/lz4/tests" -maxdepth 1 -name 'tmp-*' -exec rm -rf -- {} +
 
   local test
   local tests=(
@@ -232,19 +404,52 @@ _run_cli_regression_suite() {
     test-lz4-opt-parser.sh
   )
   for test in "${tests[@]}"; do
-    (cd "$srcdir/lz4/tests" && PATH="$tools:$PATH" "./$test")
+    if [[ $test == test-lz4-testmode.sh ]]; then
+      msg "Running $test (its 'Unrecognized header' diagnostics are expected negative tests)"
+    else
+      msg "Running $test"
+    fi
+    # Upstream scripts use POSIX `set -e` but not pipefail. Bash+pipefail makes
+    # an early datagen/compressor failure fatal instead of trusting only the
+    # final pipeline process. Expected-negative pipelines remain guarded by &&.
+    if ! (cd "$srcdir/lz4/tests" && \
+          PATH="$tools:$PATH" bash -o pipefail "./$test") \
+          > "$work/logs/$test.log" 2>&1; then
+      error "$test failed; complete log follows"
+      cat "$work/logs/$test.log" >&2
+      return 1
+    fi
   done
 }
 
 _merge_profraw() {
   local input_dir=$1 output=$2
   local profiles=()
-  mapfile -d '' profiles < <(find "$input_dir" -type f -name '*.profraw' -print0)
+  mapfile -d '' profiles < <(find "$input_dir" -type f -name '*.profraw' -print0 | sort -z)
   ((${#profiles[@]})) || {
     error "no raw profiles were produced in $input_dir"
     return 1
   }
-  llvm-profdata merge -sparse "${profiles[@]}" -o "$output"
+  # Keep zero-count function records. Sparse profiles save little here and lose
+  # the compiler's proof that unexecuted functions are genuinely cold.
+  llvm-profdata merge "${profiles[@]}" -o "$output"
+}
+
+_validate_profdata() {
+  local profile=$1 label=$2
+  local report="$srcdir/$label-profdata-summary.log"
+  local total_functions maximum_count
+  llvm-profdata show --detailed-summary --counts "$profile" | tee "$report"
+  total_functions=$(awk '$1=="Total" && $2=="functions:" {print $3}' "$report")
+  maximum_count=$(awk '$1=="Maximum" && $2=="function" && $3=="count:" {print $4}' "$report")
+  [[ $total_functions =~ ^[0-9]+$ && $maximum_count =~ ^[0-9]+$ ]] || {
+    error "could not parse $label profile summary"
+    return 1
+  }
+  ((total_functions >= 100 && maximum_count > 0)) || {
+    error "$label profile is implausibly weak ($total_functions functions, max count $maximum_count)"
+    return 1
+  }
 }
 
 prepare() {
@@ -253,27 +458,48 @@ prepare() {
 }
 
 build() {
-  _setup_llvm_ultimate
+  _setup_llvm_toolchain
 
   local user_cflags=$CFLAGS
+  local user_cxxflags=$CXXFLAGS
   local user_ldflags="$LDFLAGS -fuse-ld=lld"
+  local strict_profile_flags='-Werror=profile-instr-unprofiled -Werror=profile-instr-out-of-date -Werror=backend-plugin'
+  local bolt_ldflags=
+  ((_bolt_available)) && bolt_ldflags=' -Wl,--emit-relocs'
   local pgo_dir="$srcdir/pgo"
   local cs_dir="$srcdir/cspgo"
   local pgo_profile="$srcdir/pgo.profdata"
   local combined_profile="$srcdir/combined.profdata"
+  local final_profile="$pgo_profile"
+  local use_cspgo=1 lto_enabled=0 flag
+  local user_cflag_words=()
+  read -r -a user_cflag_words <<< "$user_cflags"
+  for flag in "${user_cflag_words[@]}"; do
+    case $flag in
+      -flto|-flto=*) lto_enabled=1 ;;
+      -fno-lto) lto_enabled=0 ;;
+    esac
+  done
+  ((lto_enabled)) && use_cspgo=0
   local pgo_build="$srcdir/build-pgo"
   local cs_build="$srcdir/build-cspgo"
   local final_build="$srcdir/build"
 
   rm -rf "$pgo_dir" "$cs_dir" "$pgo_build" "$cs_build" "$final_build" \
     "$srcdir/training-work-pgo" "$srcdir/training-work-cs" \
-    "$srcdir/training-work-bolt" "$srcdir/bolt-prof"
+    "$srcdir/training-work-bolt" "$srcdir/bolt-prof" \
+    "$srcdir/final-check-logs" "$srcdir/final-cli-tests"
+  rm -f "$pgo_profile" "$combined_profile" "$srcdir/lz4.fdata" \
+    "$srcdir/lz4.bolt" "$srcdir/lz4.bolt.instrumented" \
+    "$srcdir/bolt-opt.log" "$srcdir/final-build-check.lz4" \
+    "$srcdir/pgo-profdata-summary.log" "$srcdir/combined-profdata-summary.log"
   mkdir -p "$pgo_dir" "$cs_dir"
 
   msg 'Building IR-PGO instrumentation stage'
   _setup_stage "$pgo_build" \
-    "$user_cflags -fprofile-generate=$pgo_dir -Xclang -mllvm -Xclang -runtime-counter-relocation" \
-    "$user_ldflags -fprofile-generate=$pgo_dir -Xclang -mllvm -Xclang -runtime-counter-relocation" true
+    "$user_cflags -fprofile-generate=$pgo_dir -fprofile-update=atomic" \
+    "$user_cxxflags" \
+    "$user_ldflags -fprofile-generate=$pgo_dir" true
   _compile_training_targets "$pgo_build"
   LLVM_PROFILE_FILE="$pgo_dir/%m_%p.profraw" \
     _run_training_workload \
@@ -285,46 +511,58 @@ build() {
       "$pgo_build/meson/programs/lz4" \
       "$pgo_build/meson/tests/datagen" "$srcdir/training-work-pgo/cli-tests"
   _merge_profraw "$pgo_dir" "$pgo_profile"
-  llvm-profdata show --detailed-summary "$pgo_profile"
+  _validate_profdata "$pgo_profile" pgo
 
-  msg 'Building context-sensitive PGO instrumentation stage'
-  _setup_stage "$cs_build" \
-    "$user_cflags -fprofile-use=$pgo_profile -fcs-profile-generate=$cs_dir -Xclang -mllvm -Xclang -runtime-counter-relocation" \
-    "$user_ldflags -fprofile-use=$pgo_profile -fcs-profile-generate=$cs_dir -Xclang -mllvm -Xclang -runtime-counter-relocation" true
-  _compile_training_targets "$cs_build"
-  LLVM_PROFILE_FILE="$cs_dir/%m_%p.profraw" \
-    _run_training_workload \
-      "$cs_build/meson/programs/lz4" \
-      "$cs_build/meson/tests/datagen" \
-      "$cs_build/meson/tests" "$srcdir/training-work-cs"
-  LLVM_PROFILE_FILE="$cs_dir/%m_%p.profraw" \
-    _run_cli_regression_suite \
-      "$cs_build/meson/programs/lz4" \
-      "$cs_build/meson/tests/datagen" "$srcdir/training-work-cs/cli-tests"
+  if ((use_cspgo)); then
+    msg 'Building context-sensitive PGO instrumentation stage'
+    _setup_stage "$cs_build" \
+      "$user_cflags -fprofile-use=$pgo_profile -fcs-profile-generate=$cs_dir -fprofile-update=atomic $strict_profile_flags" \
+      "$user_cxxflags" \
+      "$user_ldflags -fprofile-use=$pgo_profile -fcs-profile-generate=$cs_dir $strict_profile_flags" true
+    _compile_training_targets "$cs_build"
+    LLVM_PROFILE_FILE="$cs_dir/%m_%p.profraw" \
+      _run_training_workload \
+        "$cs_build/meson/programs/lz4" \
+        "$cs_build/meson/tests/datagen" \
+        "$cs_build/meson/tests" "$srcdir/training-work-cs"
+    LLVM_PROFILE_FILE="$cs_dir/%m_%p.profraw" \
+      _run_cli_regression_suite \
+        "$cs_build/meson/programs/lz4" \
+        "$cs_build/meson/tests/datagen" "$srcdir/training-work-cs/cli-tests"
 
-  local cs_profiles=()
-  mapfile -d '' cs_profiles < <(find "$cs_dir" -type f -name '*.profraw' -print0)
-  ((${#cs_profiles[@]})) || {
-    error 'CS-PGO did not produce any raw profiles'
-    return 1
-  }
-  llvm-profdata merge -sparse "$pgo_profile" "${cs_profiles[@]}" \
-    -o "$combined_profile"
-  llvm-profdata show --detailed-summary "$combined_profile"
+    local cs_profiles=()
+    mapfile -d '' cs_profiles < <(find "$cs_dir" -type f -name '*.profraw' -print0 | sort -z)
+    ((${#cs_profiles[@]})) || {
+      error 'CS-PGO did not produce any raw profiles'
+      return 1
+    }
+    llvm-profdata merge "$pgo_profile" "${cs_profiles[@]}" \
+      -o "$combined_profile"
+    _validate_profdata "$combined_profile" combined
+    final_profile=$combined_profile
+  else
+    # With LTO, Clang consumes profile data again in the linker. CS profiles can
+    # legitimately change pre-link control flow and produce discarded hash
+    # records (observed and reproduced with ThinLTO). A clean IR-PGO profile is
+    # preferable to silently dropping CS counts, and retains all user LTO flags.
+    msg 'LTO detected in makepkg flags; using validated IR-PGO profile and skipping hash-unstable CS-PGO'
+  fi
 
-  msg 'Building the final CS-PGO optimized binaries'
+  msg 'Building the final profile-guided binaries'
   _setup_stage "$final_build" \
-    "$user_cflags -fprofile-use=$combined_profile" \
-    "$user_ldflags -fprofile-use=$combined_profile -Wl,--emit-relocs" false
-  meson compile -C "$final_build" --jobs "$(nproc)"
+    "$user_cflags -fprofile-use=$final_profile $strict_profile_flags" \
+    "$user_cxxflags" \
+    "$user_ldflags -fprofile-use=$final_profile $strict_profile_flags$bolt_ldflags" true
+  _compile_training_targets "$final_build"
 
   local final_lz4="$final_build/meson/programs/lz4"
-  local bolt_dir="$srcdir/bolt-prof"
-  local instrumented="$srcdir/lz4.bolt.instrumented"
-  local bolt_profile="$srcdir/lz4.fdata"
-  mkdir -p "$bolt_dir"
+  if ((_bolt_available)); then
+    local bolt_dir="$srcdir/bolt-prof"
+    local instrumented="$srcdir/lz4.bolt.instrumented"
+    local bolt_profile="$srcdir/lz4.fdata"
+    mkdir -p "$bolt_dir"
 
-  msg 'Instrumenting and training the final executable for BOLT'
+    msg 'Instrumenting and training the final executable for BOLT'
   llvm-bolt "$final_lz4" -o "$instrumented" \
     --instrument \
     --instrumentation-file="$bolt_dir/lz4.fdata" \
@@ -338,7 +576,7 @@ build() {
     "$srcdir/training-work-bolt/cli-tests"
 
   local fdata=()
-  mapfile -d '' fdata < <(find "$bolt_dir" -type f -name '*.fdata' -print0)
+  mapfile -d '' fdata < <(find "$bolt_dir" -type f -name '*.fdata' -print0 | sort -z)
   ((${#fdata[@]})) || {
     error 'BOLT instrumentation did not produce any profiles'
     return 1
@@ -348,51 +586,110 @@ build() {
     error 'merged BOLT profile is empty'
     return 1
   }
+  (($(wc -l < "$bolt_profile") >= 100)) || {
+    error 'merged BOLT profile is implausibly small'
+    return 1
+  }
 
   # The executable is far smaller than a huge page, hence --no-huge-pages.
-  # The remaining passes all changed code/layout in llvm-ultimate testing and
+  # The remaining passes all changed code/layout in the audited BOLT matrix and
   # survived the complete round-trip/regression workload. Risky ICP, aggressive
   # ICF, jump-table footprint reduction, hugify and speculative inlining were
   # measured or rejected rather than enabled blindly.
   msg 'Applying validated BOLT post-link optimizations'
-  llvm-bolt "$final_lz4" -o "$srcdir/lz4.bolt" \
-    --data="$bolt_profile" \
-    --no-huge-pages \
-    --reorder-blocks=ext-tsp \
-    --reorder-functions=cdsort \
-    --split-functions \
-    --split-all-cold \
-    --split-eh \
-    --icf=safe \
-    --plt=hot \
-    --reg-reassign \
-    --frame-opt=hot \
-    --dyno-stats \
-    --print-profile-stats \
-    --verify-cfg
-  chmod --reference="$final_lz4" "$srcdir/lz4.bolt"
-  mv -f "$srcdir/lz4.bolt" "$final_lz4"
+  local bolt_opt_log="$srcdir/bolt-opt.log"
+  if ! llvm-bolt "$final_lz4" -o "$srcdir/lz4.bolt" \
+      --data="$bolt_profile" \
+      --no-huge-pages \
+      --reorder-blocks=ext-tsp \
+      --reorder-functions=cdsort \
+      --split-functions \
+      --split-all-cold \
+      --split-eh \
+      --icf=safe \
+      --plt=hot \
+      --reg-reassign \
+      --frame-opt=hot \
+      --dyno-stats \
+      --print-profile-stats \
+      --verify-cfg > "$bolt_opt_log" 2>&1; then
+    cat "$bolt_opt_log" >&2
+    return 1
+  fi
+  cat "$bolt_opt_log"
+  grep -q 'Profile bias score:' "$bolt_opt_log" || {
+    error 'BOLT did not report profile-quality metrics'
+    return 1
+  }
+  local profile_bias
+  profile_bias=$(sed -nE 's/.*Profile bias score: ([0-9.]+)%.*/\1/p' "$bolt_opt_log" | tail -n1)
+  [[ $profile_bias =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+    error 'could not parse BOLT profile-bias score'
+    return 1
+  }
+  awk -v bias="$profile_bias" 'BEGIN { exit !(bias <= 1.0) }' || {
+    error "BOLT profile bias is too high ($profile_bias%)"
+    return 1
+  }
+  local profile_counts profiled_functions total_functions
+  profile_counts=$(sed -nE \
+    's/.* ([0-9]+) out of ([0-9]+) functions in the binary.*/\1 \2/p' \
+    "$bolt_opt_log" | tail -n1)
+  read -r profiled_functions total_functions <<< "$profile_counts"
+  [[ -n ${profiled_functions:-} && -n ${total_functions:-} ]] || {
+    error 'could not parse BOLT function coverage'
+    return 1
+  }
+  ((profiled_functions * 100 >= total_functions * 55)) || {
+    error "BOLT function coverage below 55% ($profiled_functions/$total_functions)"
+    return 1
+  }
+    chmod --reference="$final_lz4" "$srcdir/lz4.bolt"
+    mv -f "$srcdir/lz4.bolt" "$final_lz4"
+  fi
 
   "$final_lz4" -q -f -1 "$srcdir/training-corpus/p40.bin" \
-    "$srcdir/bolt-final-check.lz4"
-  "$final_lz4" -q -t "$srcdir/bolt-final-check.lz4"
-  "$final_lz4" -q -dc "$srcdir/bolt-final-check.lz4" | \
+    "$srcdir/final-build-check.lz4"
+  "$final_lz4" -q -t "$srcdir/final-build-check.lz4"
+  "$final_lz4" -q -dc "$srcdir/final-build-check.lz4" | \
     cmp -s - "$srcdir/training-corpus/p40.bin"
 }
 
 check() {
-  _setup_llvm_ultimate
+  _setup_llvm_toolchain
+  local tests_dir="$srcdir/build/meson/tests"
   local lz4="$srcdir/build/meson/programs/lz4"
-  local datagen="$srcdir/build-pgo/meson/tests/datagen"
+  local datagen="$tests_dir/datagen"
+  local corpus="$srcdir/training-corpus"
+  local check_logs="$srcdir/final-check-logs"
   [[ -x $lz4 && -x $datagen ]]
+  mkdir -p "$check_logs"
 
   _run_cli_regression_suite "$lz4" "$datagen" "$srcdir/final-cli-tests"
-  "$srcdir/build-pgo/meson/tests/fuzzer" -i20000 -s1789 > /dev/null
-  "$srcdir/build-pgo/meson/tests/frametest" -i10000 -s1789 > /dev/null
+  if ! "$tests_dir/fuzzer" -i20000 -s1789 > "$check_logs/fuzzer.log" 2>&1; then
+    cat "$check_logs/fuzzer.log" >&2
+    return 1
+  fi
+  if ! "$tests_dir/frametest" -i10000 -s1789 > "$check_logs/frametest.log" 2>&1; then
+    cat "$check_logs/frametest.log" >&2
+    return 1
+  fi
+  "$tests_dir/roundTripTest" "$corpus/p0.bin" > /dev/null
+  "$tests_dir/roundTripTest" "$corpus/p100.bin" > /dev/null
+  "$tests_dir/abiTest" "$corpus/p40.bin" > /dev/null
+  "$tests_dir/checkTag" "v$pkgver" > /dev/null
+  if "$tests_dir/checkTag" > "$check_logs/checkTag-invalid.log" 2>&1; then
+    error 'checkTag unexpectedly accepted a missing tag'
+    return 1
+  fi
+  grep -q 'incorrect usage' "$check_logs/checkTag-invalid.log"
 }
 
 package() {
-  meson install -C "$srcdir/build" --destdir "$pkgdir"
+  # Every installable target was built explicitly in build(). Avoid Meson's
+  # default rebuild of non-installed test-only targets (notably freestanding,
+  # which intentionally uses a different -O1 control-flow hash).
+  meson install -C "$srcdir/build" --no-rebuild --destdir "$pkgdir"
 }
 
 # vim:set ts=2 sw=2 et:
