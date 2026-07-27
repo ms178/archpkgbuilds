@@ -1,6 +1,6 @@
 pkgname=lz4
 pkgver=1.10.0
-pkgrel=6
+pkgrel=7
 epoch=1
 pkgdesc='Extremely fast compression algorithm'
 arch=('x86_64')
@@ -15,7 +15,7 @@ source=(
 )
 sha256sums=(
   '487f9bc24fdaf589e2f4bb23dd98b1f21a71b643db09251145616587c9468555'
-  'ebf61cb54543ddb80d16265fb207245bb6346f2cd9864e91eec1158a2a9025ca'
+  'ff67ca1ecae45129ed8b664e9bab59ff6a29afa45a81e70db7ae66fc032d349f'
 )
 options=('strip')
 
@@ -105,20 +105,18 @@ _setup_llvm_toolchain() {
   ((_bolt_available)) || msg 'llvm-bolt not found; building CS-PGO package without optional BOLT stage'
 }
 
-# Configure a fresh Meson tree. CFLAGS/CXXFLAGS/LDFLAGS from makepkg.conf are
-# retained verbatim; PGO flags are appended only to C because all shipped
-# optimized targets are C (instrumenting unrelated C++ helper targets would
-# create hash-mismatch noise). --buildtype=plain prevents Meson from overriding
-# the user's -O and debug policy.
+# Configure a fresh Meson tree. Capture makepkg.conf's flags once, then pass
+# every compiler/linker flag explicitly through Meson's c_args/c_link_args
+# built-ins. Emptying the environment prevents Meson from adding a second copy.
+# The project and every selected target are C-only.
 _setup_stage() {
   local build_dir=$1
   local stage_cflags=$2
-  local stage_cxxflags=$3
-  local stage_ldflags=$4
-  local build_tests=$5
+  local stage_ldflags=$3
+  local build_tests=$4
 
   CC="$CC" CXX="$CXX" AR="$AR" NM="$NM" RANLIB="$RANLIB" \
-  CFLAGS="$stage_cflags" CXXFLAGS="$stage_cxxflags" LDFLAGS="$stage_ldflags" \
+  CPPFLAGS='' CFLAGS='' CXXFLAGS='' LDFLAGS='' \
     meson setup \
       --prefix=/usr \
       --libdir=lib \
@@ -130,24 +128,35 @@ _setup_stage() {
       -Dossfuzz=false \
       -Dprograms=true \
       -Dtests="$build_tests" \
+      "-Dc_args=$stage_cflags" \
+      "-Dc_link_args=$stage_ldflags" \
       "$srcdir/lz4/build/meson" "$build_dir"
 }
 
 _compile_training_targets() {
   local build_dir=$1
-  meson compile -C "$build_dir" --jobs "$(nproc)" \
-    meson/lib/lz4:shared_library \
-    meson/programs/lz4:executable \
-    meson/tests/abiTest \
-    meson/tests/checkTag \
-    meson/tests/datagen \
-    meson/tests/fuzzer \
-    meson/tests/frametest \
-    meson/tests/fullbench \
-    meson/tests/roundTripTest \
-    meson/tests/decompress-partial.c \
-    meson/tests/decompress-partial-usingDict.c \
-    meson/tests/checkFrame
+  local compile_log="$build_dir/compile.log"
+  if ! meson compile -C "$build_dir" --jobs "$(nproc)" \
+      meson/lib/lz4:shared_library \
+      meson/programs/lz4:executable \
+      meson/tests/abiTest \
+      meson/tests/checkTag \
+      meson/tests/datagen \
+      meson/tests/fuzzer \
+      meson/tests/frametest \
+      meson/tests/fullbench \
+      meson/tests/roundTripTest \
+      meson/tests/decompress-partial.c \
+      meson/tests/decompress-partial-usingDict.c \
+      meson/tests/checkFrame > "$compile_log" 2>&1; then
+    cat "$compile_log" >&2
+    return 1
+  fi
+  cat "$compile_log"
+  if grep -Eqi 'hash mismatch|count(s)? discarded|profile data (may be|is) out of date' "$compile_log"; then
+    error "profile mismatch detected while compiling $build_dir"
+    return 1
+  fi
 }
 
 # Deterministic corpus with six compressibility bands, source/build data,
@@ -157,7 +166,9 @@ _compile_training_targets() {
 _generate_training_corpus() {
   local datagen=$1
   local corpus=$2
-  local corpus_revision="ms178-workload-v3-$pkgver"
+  local patch_hash corpus_revision
+  patch_hash=$(sha256sum "$srcdir/ms178-1.patch" | cut -d' ' -f1)
+  corpus_revision="ms178-workload-v4-$pkgver-$patch_hash"
   local tmp="${corpus}.tmp.$$"
 
   if [[ -f $corpus/.ready ]] && [[ $(<"$corpus/.ready") == "$corpus_revision" ]]; then
@@ -452,6 +463,23 @@ _validate_profdata() {
   }
 }
 
+_validate_cs_profdata() {
+  local profile=$1
+  local report="$srcdir/cs-profdata-summary.log"
+  local total_functions maximum_count
+  llvm-profdata show --showcs --detailed-summary --counts "$profile" | tee "$report"
+  total_functions=$(awk '$1=="Total" && $2=="functions:" {print $3}' "$report")
+  maximum_count=$(awk '$1=="Maximum" && $2=="function" && $3=="count:" {print $4}' "$report")
+  [[ $total_functions =~ ^[0-9]+$ && $maximum_count =~ ^[0-9]+$ ]] || {
+    error 'could not parse context-sensitive profile summary'
+    return 1
+  }
+  ((total_functions >= 100 && maximum_count > 0)) || {
+    error "context-sensitive profile is missing or weak ($total_functions functions, max count $maximum_count)"
+    return 1
+  }
+}
+
 prepare() {
   cd "$srcdir/lz4" || return
   patch -Np1 -i "$srcdir/ms178-1.patch"
@@ -460,9 +488,12 @@ prepare() {
 build() {
   _setup_llvm_toolchain
 
-  local user_cflags=$CFLAGS
-  local user_cxxflags=$CXXFLAGS
-  local user_ldflags="$LDFLAGS -fuse-ld=lld"
+  # Full LTO is explicit and last, so it wins over any generic makepkg LTO mode.
+  local common_cflags="${CPPFLAGS:-} $CFLAGS -flto=full"
+  # LTO code generation happens in the linker, so target/optimization options
+  # from CFLAGS must also reach c_link_args (otherwise Clang falls back to the
+  # generic x86-64 CPU during Full-LTO codegen).
+  local common_ldflags="$CFLAGS $LDFLAGS -fuse-ld=lld -flto=full"
   local strict_profile_flags='-Werror=profile-instr-unprofiled -Werror=profile-instr-out-of-date -Werror=backend-plugin'
   local bolt_ldflags=
   ((_bolt_available)) && bolt_ldflags=' -Wl,--emit-relocs'
@@ -470,17 +501,6 @@ build() {
   local cs_dir="$srcdir/cspgo"
   local pgo_profile="$srcdir/pgo.profdata"
   local combined_profile="$srcdir/combined.profdata"
-  local final_profile="$pgo_profile"
-  local use_cspgo=1 lto_enabled=0 flag
-  local user_cflag_words=()
-  read -r -a user_cflag_words <<< "$user_cflags"
-  for flag in "${user_cflag_words[@]}"; do
-    case $flag in
-      -flto|-flto=*) lto_enabled=1 ;;
-      -fno-lto) lto_enabled=0 ;;
-    esac
-  done
-  ((lto_enabled)) && use_cspgo=0
   local pgo_build="$srcdir/build-pgo"
   local cs_build="$srcdir/build-cspgo"
   local final_build="$srcdir/build"
@@ -492,14 +512,14 @@ build() {
   rm -f "$pgo_profile" "$combined_profile" "$srcdir/lz4.fdata" \
     "$srcdir/lz4.bolt" "$srcdir/lz4.bolt.instrumented" \
     "$srcdir/bolt-opt.log" "$srcdir/final-build-check.lz4" \
-    "$srcdir/pgo-profdata-summary.log" "$srcdir/combined-profdata-summary.log"
+    "$srcdir/pgo-profdata-summary.log" "$srcdir/combined-profdata-summary.log" \
+    "$srcdir/cs-profdata-summary.log"
   mkdir -p "$pgo_dir" "$cs_dir"
 
   msg 'Building IR-PGO instrumentation stage'
   _setup_stage "$pgo_build" \
-    "$user_cflags -fprofile-generate=$pgo_dir -fprofile-update=atomic" \
-    "$user_cxxflags" \
-    "$user_ldflags -fprofile-generate=$pgo_dir" true
+    "$common_cflags -fprofile-generate=$pgo_dir -fprofile-update=atomic -Xclang -mllvm -Xclang -runtime-counter-relocation" \
+    "$common_ldflags -fprofile-generate=$pgo_dir" true
   _compile_training_targets "$pgo_build"
   LLVM_PROFILE_FILE="$pgo_dir/%m_%p.profraw" \
     _run_training_workload \
@@ -513,46 +533,41 @@ build() {
   _merge_profraw "$pgo_dir" "$pgo_profile"
   _validate_profdata "$pgo_profile" pgo
 
-  if ((use_cspgo)); then
-    msg 'Building context-sensitive PGO instrumentation stage'
-    _setup_stage "$cs_build" \
-      "$user_cflags -fprofile-use=$pgo_profile -fcs-profile-generate=$cs_dir -fprofile-update=atomic $strict_profile_flags" \
-      "$user_cxxflags" \
-      "$user_ldflags -fprofile-use=$pgo_profile -fcs-profile-generate=$cs_dir $strict_profile_flags" true
-    _compile_training_targets "$cs_build"
-    LLVM_PROFILE_FILE="$cs_dir/%m_%p.profraw" \
-      _run_training_workload \
-        "$cs_build/meson/programs/lz4" \
-        "$cs_build/meson/tests/datagen" \
-        "$cs_build/meson/tests" "$srcdir/training-work-cs"
-    LLVM_PROFILE_FILE="$cs_dir/%m_%p.profraw" \
-      _run_cli_regression_suite \
-        "$cs_build/meson/programs/lz4" \
-        "$cs_build/meson/tests/datagen" "$srcdir/training-work-cs/cli-tests"
+  msg 'Building Full-LTO context-sensitive PGO instrumentation stage'
+  # With LTO, regular profile use belongs in c_args while c_link_args requests
+  # only post-inline CS instrumentation. Re-passing -fprofile-use at link time
+  # incorrectly treats the regular profile as an LTO CS-use profile.
+  _setup_stage "$cs_build" \
+    "$common_cflags -fprofile-use=$pgo_profile -fcs-profile-generate=$cs_dir -fprofile-update=atomic $strict_profile_flags -Xclang -mllvm -Xclang -runtime-counter-relocation" \
+    "$common_ldflags -fcs-profile-generate=$cs_dir $strict_profile_flags" true
+  _compile_training_targets "$cs_build"
+  LLVM_PROFILE_FILE="$cs_dir/%m_%p.profraw" \
+    _run_training_workload \
+      "$cs_build/meson/programs/lz4" \
+      "$cs_build/meson/tests/datagen" \
+      "$cs_build/meson/tests" "$srcdir/training-work-cs"
+  LLVM_PROFILE_FILE="$cs_dir/%m_%p.profraw" \
+    _run_cli_regression_suite \
+      "$cs_build/meson/programs/lz4" \
+      "$cs_build/meson/tests/datagen" "$srcdir/training-work-cs/cli-tests"
 
-    local cs_profiles=()
-    mapfile -d '' cs_profiles < <(find "$cs_dir" -type f -name '*.profraw' -print0 | sort -z)
-    ((${#cs_profiles[@]})) || {
-      error 'CS-PGO did not produce any raw profiles'
-      return 1
-    }
-    llvm-profdata merge "$pgo_profile" "${cs_profiles[@]}" \
-      -o "$combined_profile"
-    _validate_profdata "$combined_profile" combined
-    final_profile=$combined_profile
-  else
-    # With LTO, Clang consumes profile data again in the linker. CS profiles can
-    # legitimately change pre-link control flow and produce discarded hash
-    # records (observed and reproduced with ThinLTO). A clean IR-PGO profile is
-    # preferable to silently dropping CS counts, and retains all user LTO flags.
-    msg 'LTO detected in makepkg flags; using validated IR-PGO profile and skipping hash-unstable CS-PGO'
-  fi
+  local cs_profiles=()
+  mapfile -d '' cs_profiles < <(find "$cs_dir" -type f -name '*.profraw' -print0 | sort -z)
+  ((${#cs_profiles[@]})) || {
+    error 'Full-LTO CS-PGO did not produce any raw profiles'
+    return 1
+  }
+  llvm-profdata merge "$pgo_profile" "${cs_profiles[@]}" \
+    -o "$combined_profile"
+  _validate_profdata "$combined_profile" combined
+  _validate_cs_profdata "$combined_profile"
 
-  msg 'Building the final profile-guided binaries'
+  msg 'Building final Full-LTO + CS-PGO binaries'
+  # The combined profile is attached to bitcode via c_args. Do not pass generic
+  # -fprofile-use again at the LTO link: that caused proven CFG-hash discards.
   _setup_stage "$final_build" \
-    "$user_cflags -fprofile-use=$final_profile $strict_profile_flags" \
-    "$user_cxxflags" \
-    "$user_ldflags -fprofile-use=$final_profile $strict_profile_flags$bolt_ldflags" true
+    "$common_cflags -fprofile-use=$combined_profile $strict_profile_flags" \
+    "$common_ldflags $strict_profile_flags$bolt_ldflags" true
   _compile_training_targets "$final_build"
 
   local final_lz4="$final_build/meson/programs/lz4"
@@ -563,87 +578,87 @@ build() {
     mkdir -p "$bolt_dir"
 
     msg 'Instrumenting and training the final executable for BOLT'
-  llvm-bolt "$final_lz4" -o "$instrumented" \
-    --instrument \
-    --instrumentation-file="$bolt_dir/lz4.fdata" \
-    --instrumentation-file-append-pid \
-    --instrumentation-binpath="$instrumented"
-  BOLT_TRAIN_ONLY=1 _run_training_workload \
-    "$instrumented" "$pgo_build/meson/tests/datagen" \
-    "$pgo_build/meson/tests" "$srcdir/training-work-bolt"
-  _run_cli_regression_suite \
-    "$instrumented" "$pgo_build/meson/tests/datagen" \
-    "$srcdir/training-work-bolt/cli-tests"
+    llvm-bolt "$final_lz4" -o "$instrumented" \
+      --instrument \
+      --instrumentation-file="$bolt_dir/lz4.fdata" \
+      --instrumentation-file-append-pid \
+      --instrumentation-binpath="$instrumented"
+    BOLT_TRAIN_ONLY=1 _run_training_workload \
+      "$instrumented" "$pgo_build/meson/tests/datagen" \
+      "$pgo_build/meson/tests" "$srcdir/training-work-bolt"
+    _run_cli_regression_suite \
+      "$instrumented" "$pgo_build/meson/tests/datagen" \
+      "$srcdir/training-work-bolt/cli-tests"
 
-  local fdata=()
-  mapfile -d '' fdata < <(find "$bolt_dir" -type f -name '*.fdata' -print0 | sort -z)
-  ((${#fdata[@]})) || {
-    error 'BOLT instrumentation did not produce any profiles'
-    return 1
-  }
-  merge-fdata "${fdata[@]}" > "$bolt_profile"
-  [[ -s $bolt_profile ]] || {
-    error 'merged BOLT profile is empty'
-    return 1
-  }
-  (($(wc -l < "$bolt_profile") >= 100)) || {
-    error 'merged BOLT profile is implausibly small'
-    return 1
-  }
+    local fdata=()
+    mapfile -d '' fdata < <(find "$bolt_dir" -type f -name '*.fdata' -print0 | sort -z)
+    ((${#fdata[@]})) || {
+      error 'BOLT instrumentation did not produce any profiles'
+      return 1
+    }
+    merge-fdata "${fdata[@]}" > "$bolt_profile"
+    [[ -s $bolt_profile ]] || {
+      error 'merged BOLT profile is empty'
+      return 1
+    }
+    (($(wc -l < "$bolt_profile") >= 100)) || {
+      error 'merged BOLT profile is implausibly small'
+      return 1
+    }
 
-  # The executable is far smaller than a huge page, hence --no-huge-pages.
-  # The remaining passes all changed code/layout in the audited BOLT matrix and
-  # survived the complete round-trip/regression workload. Risky ICP, aggressive
-  # ICF, jump-table footprint reduction, hugify and speculative inlining were
-  # measured or rejected rather than enabled blindly.
-  msg 'Applying validated BOLT post-link optimizations'
-  local bolt_opt_log="$srcdir/bolt-opt.log"
-  if ! llvm-bolt "$final_lz4" -o "$srcdir/lz4.bolt" \
-      --data="$bolt_profile" \
-      --no-huge-pages \
-      --reorder-blocks=ext-tsp \
-      --reorder-functions=cdsort \
-      --split-functions \
-      --split-all-cold \
-      --split-eh \
-      --icf=safe \
-      --plt=hot \
-      --reg-reassign \
-      --frame-opt=hot \
-      --dyno-stats \
-      --print-profile-stats \
-      --verify-cfg > "$bolt_opt_log" 2>&1; then
-    cat "$bolt_opt_log" >&2
-    return 1
-  fi
-  cat "$bolt_opt_log"
-  grep -q 'Profile bias score:' "$bolt_opt_log" || {
-    error 'BOLT did not report profile-quality metrics'
-    return 1
-  }
-  local profile_bias
-  profile_bias=$(sed -nE 's/.*Profile bias score: ([0-9.]+)%.*/\1/p' "$bolt_opt_log" | tail -n1)
-  [[ $profile_bias =~ ^[0-9]+([.][0-9]+)?$ ]] || {
-    error 'could not parse BOLT profile-bias score'
-    return 1
-  }
-  awk -v bias="$profile_bias" 'BEGIN { exit !(bias <= 1.0) }' || {
-    error "BOLT profile bias is too high ($profile_bias%)"
-    return 1
-  }
-  local profile_counts profiled_functions total_functions
-  profile_counts=$(sed -nE \
-    's/.* ([0-9]+) out of ([0-9]+) functions in the binary.*/\1 \2/p' \
-    "$bolt_opt_log" | tail -n1)
-  read -r profiled_functions total_functions <<< "$profile_counts"
-  [[ -n ${profiled_functions:-} && -n ${total_functions:-} ]] || {
-    error 'could not parse BOLT function coverage'
-    return 1
-  }
-  ((profiled_functions * 100 >= total_functions * 55)) || {
-    error "BOLT function coverage below 55% ($profiled_functions/$total_functions)"
-    return 1
-  }
+    # The executable is far smaller than a huge page, hence --no-huge-pages.
+    # The remaining passes all changed code/layout in the audited BOLT matrix and
+    # survived the complete round-trip/regression workload. Risky ICP, aggressive
+    # ICF, jump-table footprint reduction, hugify and speculative inlining were
+    # measured or rejected rather than enabled blindly.
+    msg 'Applying validated BOLT post-link optimizations'
+    local bolt_opt_log="$srcdir/bolt-opt.log"
+    if ! llvm-bolt "$final_lz4" -o "$srcdir/lz4.bolt" \
+        --data="$bolt_profile" \
+        --no-huge-pages \
+        --reorder-blocks=ext-tsp \
+        --reorder-functions=cdsort \
+        --split-functions \
+        --split-all-cold \
+        --split-eh \
+        --icf=safe \
+        --plt=hot \
+        --reg-reassign \
+        --frame-opt=hot \
+        --dyno-stats \
+        --print-profile-stats \
+        --verify-cfg > "$bolt_opt_log" 2>&1; then
+      cat "$bolt_opt_log" >&2
+      return 1
+    fi
+    cat "$bolt_opt_log"
+    grep -q 'Profile bias score:' "$bolt_opt_log" || {
+      error 'BOLT did not report profile-quality metrics'
+      return 1
+    }
+    local profile_bias
+    profile_bias=$(sed -nE 's/.*Profile bias score: ([0-9.]+)%.*/\1/p' "$bolt_opt_log" | tail -n1)
+    [[ $profile_bias =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+      error 'could not parse BOLT profile-bias score'
+      return 1
+    }
+    awk -v bias="$profile_bias" 'BEGIN { exit !(bias <= 1.0) }' || {
+      error "BOLT profile bias is too high ($profile_bias%)"
+      return 1
+    }
+    local profile_counts profiled_functions total_functions
+    profile_counts=$(sed -nE \
+      's/.* ([0-9]+) out of ([0-9]+) functions in the binary.*/\1 \2/p' \
+      "$bolt_opt_log" | tail -n1)
+    read -r profiled_functions total_functions <<< "$profile_counts"
+    [[ -n ${profiled_functions:-} && -n ${total_functions:-} ]] || {
+      error 'could not parse BOLT function coverage'
+      return 1
+    }
+    ((profiled_functions * 100 >= total_functions * 55)) || {
+      error "BOLT function coverage below 55% ($profiled_functions/$total_functions)"
+      return 1
+    }
     chmod --reference="$final_lz4" "$srcdir/lz4.bolt"
     mv -f "$srcdir/lz4.bolt" "$final_lz4"
   fi
