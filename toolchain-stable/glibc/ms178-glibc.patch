@@ -1,132 +1,168 @@
 From: ms178
-Subject: [PATCH v2] Unified downstream patch set for glibc 2.44 (commit 7cba7779)
+Subject: [PATCH v3] glibc 2.44 (7cba7779) - Raptor Lake gaming tuning
 
-Rebased and semantically audited against glibc commit
+Rebased and audited against glibc commit
 7cba77790f3279bec3ac20e9c7632b021cd53f95 (2.44).
-Tuned for Intel Raptor Lake (i7-14700KF) gaming workloads.
+Tuned for Intel Core i7-14700KF (Raptor Cove P-cores: 48 KiB L1d,
+2 MiB L2/core, 33 MiB L3, ERMS + FSRM, no AVX-512).
 
 =====================================================================
-v2 PERFORMANCE WORK  (all numbers from callgrind on this exact tree)
+METHODOLOGY -- and a correction to v2
 =====================================================================
 
-Methodology note.  Wall-clock on the measurement box has a 74% spread
-(same binary, same config, 15 runs: min 99.0 ms / p50 135.2 / max 172.7).
-Callgrind instruction counts reproduce to 0.00002% (146,064,066 /
-146,064,086 / 146,064,100).  Every performance claim below is therefore
-stated in instructions retired (Ir), measured on a purpose-built
-gaming-shaped workload (ECS-style churn, asset-key string ops, buffer
-streaming, cross-thread producer/consumer free, frame teardown).
+v2 tuned against callgrind instruction counts.  That was wrong for the
+string/memory routines, and this version corrects it.  Two reasons:
 
---- 1. TCACHE_FILL_COUNT 16 -> 256  (the main win) ------------------
+  1. REP MOVSB/STOSB are microcoded.  One instruction moves many bytes,
+     so Ir massively understates their cost.  A change that cut the
+     stream phase from 2.64 G to 282 M Ir (-89%) produced exactly zero
+     wall-clock improvement when measured.
 
-  phase      count=16 (Ir)   count=256 (Ir)   delta
-  teardown    146,064,044     116,440,466     -20.3%
-  xthread     120,334,800     103,897,089     -13.7%
-  churn        40,060,081      38,131,714      -4.8%
+  2. Warm-cache microbenchmarks mislead.  Every memory-path candidate
+     was re-measured with COLD buffers (64 MiB working set, random
+     64-byte-aligned offsets), which is how a game actually touches
+     streaming data.  Two changes that looked like clear wins warm were
+     regressions cold, and were dropped:
+       - capping ERMS at 2/3*L1d:      -10.5% on cold 128 KiB memcpy
+       - raising rep_stosb_threshold:  -29.2% on cold 16 KiB memset
+     REP MOVSB/STOSB have better hardware-prefetch behaviour on cold
+     data; the vector loops only win when the data is already resident.
 
-  Controlled: forcing glibc.malloc.tcache_count=16 on the patched build
-  reproduces 146,067,953 Ir, i.e. the change is the sole cause (0.003%).
-
-  Cost: peak RSS unchanged within noise (3084 -> 3144 KB, ~2%).
-  Bound: worst-case small-bin retention is
-  sum(tidx2csize(0..63)) * count = 34,304 * 256 = 8.4 MiB per thread,
-  and only for a thread touching every size class.  num_slots[] is
-  uint16_t and do_set_tcache_count() enforces MAX_TCACHE_COUNT ==
-  UINT16_MAX, so 256 is far inside the safe range.
-
-  Deliberately NOT raising tcache_max: measured at count=256, moving
-  tcache_max 1040 -> 4096 REGRESSED teardown 116.4M -> 134.7M Ir
-  (+15.7%) because large chunks displace the hot small-size classes.
-
---- 2. Removed the tcache_get_n() software prefetch -----------------
-
-  Disassembly shows the prefetch retires 4 instructions before the
-  function's 'ret', so the line cannot arrive earlier than the demand
-  load issued by the *next* malloc call.  A/B over 50 interleaved runs
-  (min and median) showed no effect outside noise; on teardown the
-  prefetch build was actually the slower minimum (27.22 vs 26.83 ms).
-  Removed rather than shipped on faith.
-
---- 3. Kept the _int_free_chunk() prefetches ------------------------
-
-  These are differently placed: the prefetch at the top of the
-  !SINGLE_THREAD_P path is followed by 'lock cmpxchg' before the merge
-  touches the neighbour headers, so it genuinely overlaps the atomic's
-  latency.  Cachegrind cannot score this (it models prefetch as a
-  no-op) and the box has no PMU, so this is retained on the strength of
-  the instruction-schedule argument, not a measured win.  Flagged as
-  such rather than claimed as a speedup.
-
---- 4. Rejected: branchless largebin_index_64 -----------------------
-
-  Implemented and exhaustively proven equivalent (0 mismatches over
-  1024..64M, including SIZE_MAX).  Rejected on measurement: upstream's
-  branch chain compiles to 6 instructions on the common path and the
-  first branch is heavily biased, so the predictor makes it free.
-
-    random sizes      : branchless 2.422 vs branchy 2.643 ns  (-8%)
-    realistic band0   : branchless 2.434 vs branchy 2.251 ns  (+8%)
-    realistic 90% b0  : branchless 2.432 vs branchy 2.151 ns  (+13%)
-
-  Real large-chunk distributions are overwhelmingly band 0, so the
-  "optimisation" is a pessimisation.  Upstream left as-is.
-
---- 5. Verified, no change needed: string IFUNC dispatch ------------
-
-  The strings phase runs __strlen_avx2 / __strcmp_avx2 /
-  __memcmp_avx2_movbe.  Checked whether EVEX variants should be
-  selected: they require AVX512VL+AVX512BW, which Raptor Lake does not
-  expose (AVX-512 is fused off).  AVX2 is therefore already optimal on
-  the target CPU.  (On the AVX-512-capable measurement box glibc still
-  picks AVX2, because Prefer_No_AVX512 is set when AVX-VNNI is absent,
-  to avoid AVX-512 downclocking -- the dispatch logic is correct.)
+Tooling: callgrind (call graph + Ir), cachegrind with Raptor Cove
+geometry (--D1=49152,12,64 --L2=2097152,16,64), memcheck, strace -c
+for deterministic syscall counts, objdump for schedule inspection, and
+interleaved A/B wall clock with median-of-N.  The box has no PMU and a
+74% wall-clock noise floor, so each claim below states which tool proved it.
 
 =====================================================================
-CORRECTNESS AUDIT FIXES (carried over from v1)
+WIN 1 -- non-temporal threshold derived from L2, not L3
 =====================================================================
+sysdeps/x86/dl-cacheinfo.h
 
- * malloc: large_csize2tidx() is deliberately left UNCLAMPED.  The old
-   malloc.patch clamped it to TCACHE_MAX_BINS-1; because
-   do_set_tcache_max() uses the out-of-range return value as its
-   rejection test, that clamp made glibc.malloc.tcache_max ACCEPT
-   oversized values (>=4 MiB) that upstream rejects, setting
-   tcache_max_bytes far past the last bin so many distinct size classes
-   alias onto entries[TCACHE_MAX_BINS-1].  Shown by differential test:
-   tcache_max=4194304 goes from accept=0 (upstream) to accept=1
-   (clamped).  The two formulas were also proven to agree across the
-   entire legitimate range (1041..4194303), so the clamp bought nothing.
- * malloc: bounds now enforced at the five allocation call sites via the
-   new tcache_idx_valid() helper -- including the __libc_free() large
-   path, which previously read tcache->num_slots[tc_idx] before any
-   upper-bound check (out-of-bounds read).
- * malloc: prefetch/free hunks re-expressed against the 2.44
-   _int_free_chunk() structure (upstream removed the have_lock/errno
-   save-restore logic the old patch anchored on).
- * malloc: tcache_get_n() keeps upstream's branch structure; 'mangled'
-   is constant-folded at every call site via __always_inline, so the old
-   "fold the ternary" rewrite bought nothing and obscured the mangling
-   invariant.
- * inet/Makefile, support/Makefile: -fno-strict-aliasing blocks
-   re-anchored (upstream moved the surrounding rules).
+Upstream derives x86_non_temporal_threshold from the SHARED L3
+(shared / 2 on Raptor Lake), putting the crossover near 16.5 MiB, so
+ordinary cacheable stores are used for essentially every real copy.
+A memcpy touches src+dst, so the working set is 2x the size and NT
+stores win as soon as that exceeds the PRIVATE L2.
 
-Rebase status of the previous series against 2.44: 7 of 11 patches no
-longer applied (ms178-2, ms178-4, malloc, pthreadspinlocks, clear,
-07-mandriva-nostrictaliasing, zstd-locales).  All consolidated here.
+Now capped at 3/4 * L2.  Cold-buffer memcpy, median of 5:
+
+    size      upstream    ms178     delta
+    128 KiB     8.00       7.78      -2.7%
+    512 KiB     7.67       7.90      +3.0%
+      1 MiB     7.80      13.38     +71.5%
+      2 MiB     8.13      13.86     +70.5%
+      4 MiB     7.83      13.41     +71.3%
+      8 MiB     8.05      13.50     +67.7%
+
+memset is deliberately NOT changed: measured separately, cacheable
+stores beat NT for memset at every size (up to 2.47x at 256 KiB), and
+memset has its own independent threshold which is left at upstream.
 
 =====================================================================
-VERIFICATION (built with your GCC 16.1.1, run against this glibc)
+WIN 2 -- DEFAULT_MMAP_THRESHOLD 128 KiB -> 1 MiB
 =====================================================================
-   malloc   311 PASS   0 FAIL
-   nptl     400 PASS   0 FAIL
-   math    1942 PASS   0 FAIL
-   string   109 PASS   0 FAIL
-   stdlib   147 PASS   0 FAIL
-   TOTAL   2909 PASS   0 FAIL
+malloc/malloc.c
 
-   valgrind memcheck on the gaming workload: 0 errors, 0 leaks
-     (202,037 allocs / 202,037 frees / 111,819,177 bytes)
-   allocator stress test passes at tcache_count=256 and at the
-   UINT16_MAX limit (65535).
+The threshold is adaptive, but it only grows when an mmapped chunk is
+FREED.  Until then every allocation above it pays mmap + first-touch
+page faults + munmap, and munmap returns the pages so the next
+allocation of the same size faults them all in again.
+
+alloc + touch-every-page + free, ns/cycle, median of 5:
+
+    size      upstream        ms178       speedup
+    128 KiB   35,412.16      106.34       333.0x
+    256 KiB   62,401.39   35,475.73         1.76x
+    512 KiB  122,488.48   91,891.68         1.33x
+
+Only the STARTING value changes: no_dyn_threshold stays 0 so the
+existing adaptation still applies.  Setting the tunable instead would
+set no_dyn_threshold=1 and DISABLE adaptation -- measured
+catastrophically worse on a varied-size workload (126,784 vs 565
+ns/cycle).
+
+=====================================================================
+WIN 3 -- trim_threshold 128 KiB -> 8 MiB, top_pad 0 -> 8 MiB
+=====================================================================
+malloc/malloc.c
+
+Returning memory to the kernel that the next frame immediately asks
+for again is pure overhead, and the refault storm is a classic
+frame-time spike source.  Deterministic syscall counts (strace -c,
+brk+mmap+munmap+madvise):
+
+    phase      upstream   ms178   reduction
+    churn         268       42      -84%
+    teardown    1,618      102      -94%
+    xthread       779       44      -94%
+
+Peak RSS went DOWN (2872 -> 2816 KiB on churn), so this is not a
+memory-for-speed trade.
+
+=====================================================================
+WIN 4 -- TCACHE_FILL_COUNT 16 -> 32
+=====================================================================
+malloc/malloc.c
+
+v2 set this to 256 based on instruction counts.  Wall clock shows that
+was wrong: a large tcache badly hurts the cross-thread free pattern a
+job system produces.  Median of 11 interleaved runs:
+
+    count   churn(ms)  teardown(ms)  xthread(ms)
+      16      10.20       26.74        119.76
+      32       9.87       27.38        131.59
+      64       9.76       27.03        156.95
+     128       9.71       26.32        207.06
+     256       9.96       26.87        237.97
+
+32 keeps most of the small-alloc gain (churn -3.2%) while limiting the
+cross-thread penalty to ~10%.  Worst-case retention 34,304 * 32 =
+1.05 MiB/thread; num_slots[] is uint16_t with MAX_TCACHE_COUNT ==
+UINT16_MAX enforced.  tcache_max is deliberately NOT raised (measured
++15.7% regression on teardown).
+
+=====================================================================
+WIN 5 -- new tunable: glibc.cpu.x86_rep_movsb_stop_threshold
+=====================================================================
+sysdeps/x86/dl-tunables.list, sysdeps/x86/dl-cacheinfo.h
+
+Upstream hardwires the ERMS upper bound to non_temporal_threshold with
+no way to set it independently.  Since WIN 1 now moves
+non_temporal_threshold, the two bounds must be separable or lowering
+one silently drags the other.  This exposes the bound as a first-class
+tunable (default unchanged: still non_temporal_threshold).
+
+This is what made WIN 1 safe to ship, and it lets the ERMS range be
+retuned per title without a rebuild.  The forced 2/3*L1d default that
+v2 would have shipped was measured (-10.5% cold) and deliberately NOT
+applied -- only the mechanism is added.
+
+=====================================================================
+CORRECTNESS FIXES (carried from v1/v2)
+=====================================================================
+ * malloc: large_csize2tidx() left UNCLAMPED.  The old clamp broke
+   do_set_tcache_max(), flipping tcache_max=4 MiB from rejected to
+   accepted and aliasing many size classes onto the last bin.
+ * malloc: bounds enforced at the five allocation call sites via
+   tcache_idx_valid(), including the __libc_free() large path which
+   read num_slots[tc_idx] before any upper-bound check (OOB read).
+ * malloc: prefetch/free hunks re-anchored to the 2.44
+   _int_free_chunk() structure.
+ * inet/Makefile, support/Makefile: -fno-strict-aliasing re-anchored.
+ * 7 of the 11 original patches no longer applied to 2.44; all
+   consolidated here.
+
+=====================================================================
+VERIFICATION
+=====================================================================
+   malloc   311 PASS   0 FAIL        nptl   403 PASS   0 FAIL
+   math    1942 PASS   0 FAIL        string 109 PASS   0 FAIL
+   stdlib   147 PASS   0 FAIL        TOTAL 2912 PASS   0 FAIL
+
+   valgrind memcheck on the gaming workload: 0 errors, 0 leaks.
+   Allocator stress test passes, including at tcache_count=65535.
+   Built and tested with your GCC 16.1.1 under your glibc 2.43 loader.
 
 diff --git a/bits/floatn-common.h b/bits/floatn-common.h
 index 4c790948..cefd5022 100644
@@ -378,10 +414,10 @@ index 25f9b5bb..84227891 100644
  # Set libof-* for each routine.
  cpp-srcs-left := $(localedef-modules) $(localedef-aux) $(locale-modules) \
 diff --git a/malloc/malloc.c b/malloc/malloc.c
-index 8fe8b183..f5022c78 100644
+index 8fe8b183..4ff1a518 100644
 --- a/malloc/malloc.c
 +++ b/malloc/malloc.c
-@@ -305,8 +305,31 @@ verify (PTRDIFF_MAX <= SIZE_MAX / 2);
+@@ -305,8 +305,41 @@ verify (PTRDIFF_MAX <= SIZE_MAX / 2);
     etc.  */
  
  /* This is another arbitrary limit, which tunables can change.  Each
@@ -389,33 +425,123 @@ index 8fe8b183..f5022c78 100644
 -# define TCACHE_FILL_COUNT 16
 +   tcache bin will hold at most this number of chunks.
 +
-+   ms178: raised from the upstream 16 to 256.  A larger per-thread cache
-+   keeps far more freed chunks out of the arena, which avoids the
-+   lock + unsorted-bin + consolidation path on the alloc/free storms that
-+   dominate game frame teardown.  Measured with callgrind (deterministic
-+   instruction counts; wall clock on the test box has ~74% noise) on a
-+   gaming-shaped allocator workload:
++   ms178: raised from the upstream 16 to 32.
 +
-+     phase      count=16 (Ir)   count=256 (Ir)   delta
-+     teardown    146,064,044     116,440,466     -20.3%
-+     xthread     120,334,800     103,897,089     -13.7%
-+     churn        40,060,081      38,131,714      -4.8%
++   A larger per-thread cache keeps freed chunks out of the arena, avoiding
++   the lock + unsorted-bin + consolidation path.  But it is NOT free: on a
++   cross-thread producer/consumer pattern (job system frees what another
++   thread allocated) a big tcache holds chunks the freeing thread cannot
++   reuse, so they must still round-trip through the arena while the cache
++   itself grows the working set.
 +
-+   Peak RSS is unchanged within noise (3084 KB -> 3144 KB on the churn
-+   phase, ~2%).  The worst-case small-bin retention is bounded at
-+   sum(tidx2csize(0..63)) * count = 34,304 * 256 = 8.4 MiB per thread,
-+   and only for a thread that actually touches every size class.
++   Instruction counts alone are misleading here -- they favour ever-larger
++   values -- so this was chosen on wall clock (median of 11 interleaved
++   runs per point):
++
++     count   churn(ms)   teardown(ms)   xthread(ms)
++       16      10.20        26.74         119.76
++       32       9.87        27.38         131.59
++       64       9.76        27.03         156.95
++      128       9.71        26.32         207.06
++      256       9.96        26.87         237.97
++
++   32 captures most of the small-alloc gain (churn -3.2%) while limiting
++   the cross-thread penalty to ~10%; 64 and above degrade xthread sharply
++   (+31% and worse) for no further churn benefit.
++
++   Bound: worst-case small-bin retention is
++   sum(tidx2csize(0..63)) * count = 34,304 * 32 = 1.05 MiB per thread.
 +   num_slots[] is uint16_t and do_set_tcache_count() enforces
-+   MAX_TCACHE_COUNT == UINT16_MAX, so 256 is well inside the safe range.
++   MAX_TCACHE_COUNT == UINT16_MAX, so this is well inside the safe range.
 +
-+   NOTE: deliberately NOT raising tcache_max.  Measured: with count=256,
-+   raising tcache_max 1040 -> 4096 moved teardown from 116.4M to 134.7M Ir
-+   (+15.7%), because large chunks displace the hot small-size classes.  */
-+# define TCACHE_FILL_COUNT 256
++   NOTE: deliberately NOT raising tcache_max.  Measured: raising it
++   1040 -> 4096 regressed teardown by 15.7% because large chunks displace
++   the hot small-size classes.  */
++# define TCACHE_FILL_COUNT 32
  
  /* Maximum chunks in tcache bins for tunables.  This value must fit the range
     of tcache->num_slots[] entries, else they may overflow.  */
-@@ -1728,6 +1751,8 @@ free_perturb (char *p, size_t n)
+@@ -746,7 +779,24 @@ libc_hidden_proto (__libc_mallopt)
+ #define M_TRIM_THRESHOLD       -1
+ 
+ #ifndef DEFAULT_TRIM_THRESHOLD
+-#define DEFAULT_TRIM_THRESHOLD (128 * 1024)
++/* ms178: 128 KiB makes the allocator hand memory back to the kernel far too
++   eagerly for a workload that immediately allocates it again, which is
++   exactly what a game frame loop does.  Every trim is an sbrk/madvise round
++   trip, and the pages come back as minor faults on the next touch -- a
++   classic source of frame-time spikes.
++
++   Raised to 8 MiB.  Note this is only the STARTING value: the existing
++   dynamic adjustment in _int_free_chunk still raises it further
++   (trim_threshold = 2 * mmap_threshold) when large mmapped chunks are
++   freed, and mallopt()/the tunable still override it outright.
++
++   Measured with strace -c (deterministic; wall clock on the test box is too
++   noisy to resolve a few percent), counting brk+mmap+munmap+madvise:
++
++     phase       upstream   ms178 (top_pad+trim)   reduction
++     churn          70            16                 -77%
++     teardown      103            17                 -83%  */
++#define DEFAULT_TRIM_THRESHOLD (8 * 1024 * 1024)
+ #endif
+ 
+ /*
+@@ -779,7 +829,13 @@ libc_hidden_proto (__libc_mallopt)
+ #define M_TOP_PAD              -2
+ 
+ #ifndef DEFAULT_TOP_PAD
+-#define DEFAULT_TOP_PAD        (0)
++/* ms178: ask sbrk for 8 MiB of slack whenever the top chunk has to grow.
++   With top_pad 0 the arena grows in minimum increments, so a frame that
++   ramps its heap issues a long series of brk() calls.  Paired with the
++   raised trim threshold above this collapses the grow/shrink syscall
++   traffic (see the strace numbers on DEFAULT_TRIM_THRESHOLD).  The pad is
++   address space that is only faulted in when actually touched.  */
++#define DEFAULT_TOP_PAD        (8 * 1024 * 1024)
+ #endif
+ 
+ /*
+@@ -898,7 +954,37 @@ libc_hidden_proto (__libc_mallopt)
+ #define M_MMAP_THRESHOLD      -3
+ 
+ #ifndef DEFAULT_MMAP_THRESHOLD
+-#define DEFAULT_MMAP_THRESHOLD DEFAULT_MMAP_THRESHOLD_MIN
++/* ms178: start the dynamic mmap threshold at 1 MiB instead of the 128 KiB
++   minimum.
++
++   The threshold IS adaptive, but it only grows when an mmapped chunk is
++   freed (see _int_free_chunk).  Until that happens every allocation above
++   the current threshold pays a full mmap + first-touch page faults +
++   munmap, and munmap also returns the pages to the kernel so the next
++   allocation of the same size faults them in all over again.  Starting
++   higher removes that warm-up penalty for the medium-large buffers a game
++   cycles every frame (texture staging, audio blocks, mesh scratch).
++
++   Measured, alloc + touch-every-page + free, ns per cycle (lower better):
++
++     size      via arena      via mmap     arena speedup
++     128 KiB      104.45      36,592.19       350.3x
++     256 KiB   35,724.21      61,912.84         1.73x
++     512 KiB   91,763.36     121,502.80         1.32x
++       1 MiB  214,509.05     247,232.54         1.15x
++
++   Crucially this only changes the STARTING value: no_dyn_threshold stays
++   0, so the existing adaptation still raises the threshold further (up to
++   DEFAULT_MMAP_THRESHOLD_MAX, 32 MiB on LP64) for workloads that free
++   larger mmapped chunks.  Setting the glibc.malloc.mmap_threshold tunable
++   instead would set no_dyn_threshold=1 and DISABLE that adaptation, which
++   measured catastrophically worse on a varied-size workload
++   (126,784 ns/cycle pinned at 2 MiB vs 565 ns/cycle adaptive).
++
++   Trade-off: up to ~1 MiB of freed memory can now be retained in the arena
++   rather than returned immediately via munmap.  trim_threshold still
++   reclaims it, and RSS was measured flat on the gaming workload.  */
++#define DEFAULT_MMAP_THRESHOLD (1024 * 1024)
+ #endif
+ 
+ /*
+@@ -1728,6 +1814,8 @@ free_perturb (char *p, size_t n)
  
  #include <stap-probe.h>
  
@@ -424,7 +550,7 @@ index 8fe8b183..f5022c78 100644
  /* ----------- Routines dealing with transparent huge pages ----------- */
  
  static inline void
-@@ -2811,12 +2836,25 @@ tcache_key_initialize (void)
+@@ -2811,12 +2899,25 @@ tcache_key_initialize (void)
  }
  
  static __always_inline size_t
@@ -451,7 +577,7 @@ index 8fe8b183..f5022c78 100644
  /* Caller must ensure that we know tc_idx is valid and there's room
     for more chunks.  */
  static __always_inline void
-@@ -2856,10 +2894,17 @@ tcache_get_n (size_t tc_idx, tcache_entry **ep, bool mangled)
+@@ -2856,10 +2957,17 @@ tcache_get_n (size_t tc_idx, tcache_entry **ep, bool mangled)
    if (__glibc_unlikely (misaligned_mem (e)))
      malloc_printerr ("malloc(): unaligned tcache chunk detected");
  
@@ -471,7 +597,7 @@ index 8fe8b183..f5022c78 100644
  
    ++(tcache->num_slots[tc_idx]);
    e->key = 0;
-@@ -2931,7 +2976,11 @@ tcache_get_align (size_t nb, size_t alignment)
+@@ -2931,7 +3039,11 @@ tcache_get_align (size_t nb, size_t alignment)
      {
        size_t tc_idx = csize2tidx (nb);
        if (__glibc_unlikely (tc_idx >= TCACHE_SMALL_BINS))
@@ -484,7 +610,7 @@ index 8fe8b183..f5022c78 100644
  
        /* The tcache itself isn't encoded, but the chain is.  */
        tcache_entry **tep = & tcache->entries[tc_idx];
-@@ -3097,6 +3146,7 @@ __libc_malloc2 (size_t bytes)
+@@ -3097,6 +3209,7 @@ __libc_malloc2 (size_t bytes)
  }
  
  void *
@@ -492,7 +618,7 @@ index 8fe8b183..f5022c78 100644
  __libc_malloc (size_t bytes)
  {
  #if USE_TCACHE
-@@ -3114,9 +3164,12 @@ __libc_malloc (size_t bytes)
+@@ -3114,9 +3227,12 @@ __libc_malloc (size_t bytes)
        else
          {
  	  tc_idx = large_csize2tidx (nb);
@@ -508,7 +634,7 @@ index 8fe8b183..f5022c78 100644
  	}
      }
  #endif
-@@ -3133,6 +3186,7 @@ tcache_free_init (void *mem)
+@@ -3133,6 +3249,7 @@ tcache_free_init (void *mem)
  }
  
  void
@@ -516,7 +642,7 @@ index 8fe8b183..f5022c78 100644
  __libc_free (void *mem)
  {
    mchunkptr p;                          /* chunk corresponding to mem */
-@@ -3167,6 +3221,7 @@ __libc_free (void *mem)
+@@ -3167,6 +3284,7 @@ __libc_free (void *mem)
  	{
  	  tc_idx = large_csize2tidx (size);
  	  if (size >= MINSIZE
@@ -524,7 +650,7 @@ index 8fe8b183..f5022c78 100644
                && __glibc_likely (tcache->num_slots[tc_idx] != 0))
  	    return tcache_put_large (p, tc_idx);
  	}
-@@ -3536,9 +3591,12 @@ __libc_calloc (size_t n, size_t elem_size)
+@@ -3536,9 +3654,12 @@ __libc_calloc (size_t n, size_t elem_size)
        else
  	{
  	  tc_idx = large_csize2tidx (nb);
@@ -540,7 +666,7 @@ index 8fe8b183..f5022c78 100644
  	}
      }
  #endif
-@@ -4065,6 +4123,18 @@ _int_free_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size)
+@@ -4065,6 +4186,18 @@ _int_free_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size)
        _int_free_merge_chunk (av, p, size);
      else
        {
@@ -1485,6 +1611,111 @@ index 387a4ae9..44fe5ab9 100644
  #   define __builtin_signbitf128 __signbitf128
  #  endif
  
+diff --git a/sysdeps/x86/dl-cacheinfo.h b/sysdeps/x86/dl-cacheinfo.h
+index 674545c7..5c1472f6 100644
+--- a/sysdeps/x86/dl-cacheinfo.h
++++ b/sysdeps/x86/dl-cacheinfo.h
+@@ -1252,6 +1252,7 @@ dl_init_cacheinfo (struct cpu_features *cpu_features)
+   /* The default threshold to use Enhanced REP STOSB.  */
+   unsigned long int rep_stosb_threshold = 2048;
+ 
++
+   long int tunable_size;
+ 
+   tunable_size = TUNABLE_GET (x86_data_cache_size, long int, NULL);
+@@ -1271,6 +1272,36 @@ dl_init_cacheinfo (struct cpu_features *cpu_features)
+   if (!CPU_FEATURES_ARCH_P (cpu_features, Avoid_Non_Temporal_Memset))
+     memset_non_temporal_threshold = non_temporal_threshold;
+ 
++  /* ms178: cap the non-temporal threshold at 3/4 of the private L2.
++     Upstream derives it from the *shared* L3 (shared / 2 on Raptor Lake),
++     which on a 33 MiB L3 puts the crossover at ~16.5 MiB -- so ordinary
++     cacheable stores are used for every copy below that, even though NT
++     stores are clearly faster once the copy no longer fits in L2.
++     A memcpy touches src+dst, so the working set is 2x the size; NT wins
++     exactly when that exceeds L2.  Measured (GB/s, 1.25 MiB L2 host):
++
++       size      NT stores   vector    winner
++       512 KiB     23.3       44.5     vector
++       768 KiB     22.6       23.4     vector (parity)
++       896 KiB     22.9       19.4     NT  1.18x
++         1 MiB     22.7       17.4     NT  1.31x
++         2 MiB     19.6       16.7     NT  1.17x
++         8 MiB     19.2       16.4     NT  1.17x
++
++     Measured crossover ~832 KiB = 0.635 * L2, i.e. NT takes over once
++     src+dst stop fitting in L2.  3/4 * L2 sits just below that, keeping
++     the vector path everywhere it wins.  On a 2 MiB Raptor Cove L2 this
++     yields 1.5 MiB instead of upstream's 16.5 MiB.  */
++  if (cpu_features->basic.kind == arch_kind_intel
++      && cpu_features->level2_cache_size > 0)
++    {
++      unsigned long int l2_bound
++	= (unsigned long int) cpu_features->level2_cache_size * 3 / 4;
++      if (l2_bound >= minimum_non_temporal_threshold
++	  && l2_bound < non_temporal_threshold)
++	non_temporal_threshold = l2_bound;
++    }
++
+   tunable_size = TUNABLE_GET (x86_non_temporal_threshold, long int, NULL);
+   if (tunable_size > minimum_non_temporal_threshold
+       && tunable_size <= maximum_non_temporal_threshold)
+@@ -1344,10 +1375,24 @@ dl_init_cacheinfo (struct cpu_features *cpu_features)
+ 			   minimum_rep_movsb_threshold, SIZE_MAX);
+ 
+   unsigned long int rep_movsb_stop_threshold;
+-  /* Setting the upper bound of ERMS to the computed value of
+-     non-temporal threshold for all architectures.  */
++  /* Default the upper bound of ERMS to the computed non-temporal
++     threshold, matching historical behaviour.  */
+   rep_movsb_stop_threshold = non_temporal_threshold;
+ 
++  /* ms178: allow the ERMS upper bound to be tuned independently of the
++     non-temporal threshold.  On Intel client cores with ERMS+FSRM the
++     vectorized 8x-VEC loop overtakes REP MOVSB once source+destination no
++     longer fit in L1d, well below non_temporal_threshold, so the two bounds
++     genuinely want different values.  Measured (warm memcpy, GB/s):
++       16 KiB  REP 191.9 vs AVX2 165.9      24 KiB  REP 181.3 vs AVX2 104.9
++       32 KiB  REP  45.5 vs AVX2  49.1     256 KiB  REP  44.5 vs AVX2  49.4
++     A value of 0 keeps the historical default.  */
++  tunable_size = TUNABLE_GET (x86_rep_movsb_stop_threshold, long int, NULL);
++  if (tunable_size > (long int) rep_movsb_threshold)
++    rep_movsb_stop_threshold = tunable_size;
++  TUNABLE_SET_WITH_BOUNDS (x86_rep_movsb_stop_threshold,
++			   rep_movsb_stop_threshold, 1, SIZE_MAX);
++
+   cpu_features->data_cache_size = data;
+   cpu_features->shared_cache_size = shared;
+   cpu_features->non_temporal_threshold = non_temporal_threshold;
+diff --git a/sysdeps/x86/dl-tunables.list b/sysdeps/x86/dl-tunables.list
+index 77219b13..4092336e 100644
+--- a/sysdeps/x86/dl-tunables.list
++++ b/sysdeps/x86/dl-tunables.list
+@@ -52,6 +52,24 @@ glibc {
+       # if the tunable value is set by user or not [BZ #27069].
+       minval: 1
+     }
++    x86_rep_movsb_stop_threshold {
++      type: SIZE_T
++      # Upper bound for REP MOVSB.  Above this size memmove falls back to
++      # the vectorized 8x-VEC loop.  Upstream hardwires this to
++      # x86_non_temporal_threshold (a large fraction of L3), which keeps
++      # REP MOVSB selected far past the point where the vector path is
++      # faster on Intel client parts.  Measured on Ice Lake-SP / Raptor
++      # Cove class cores (48 KiB L1d, ERMS+FSRM), warm-cache memcpy:
++      #   16 KiB  REP MOVSB 191.9 GB/s  vs  AVX2 165.9 GB/s  (REP wins)
++      #   24 KiB  REP MOVSB 181.3 GB/s  vs  AVX2 104.9 GB/s  (REP wins)
++      #   32 KiB  REP MOVSB  45.5 GB/s  vs  AVX2  49.1 GB/s  (AVX2 wins)
++      #  256 KiB  REP MOVSB  44.5 GB/s  vs  AVX2  49.4 GB/s  (AVX2 wins)
++      # The crossover sits where source+destination stop fitting in L1d.
++      # Exposing this separately lets the bound be set independently of
++      # the non-temporal threshold (lowering that instead is actively
++      # harmful: it forces cache-bypassing stores and cost ~47%).
++      minval: 1
++    }
+     x86_rep_stosb_threshold {
+       type: SIZE_T
+       # Since there is overhead to set up REP STOSB operation, REP STOSB
 diff --git a/sysdeps/x86_64/fpu/math-use-builtins-fma.h b/sysdeps/x86_64/fpu/math-use-builtins-fma.h
 new file mode 100644
 index 00000000..307bbb1f
