@@ -1,0 +1,715 @@
+# Maintainer: ms178
+# Contributor: Tobias Powalowski <tpowa@archlinux.org>
+# Contributor: judd <jvinet@zeroflux.org>
+# Contributor: Michael Hansen <zrax0111 gmail com>
+# Contributor: Marco A Rojas <marquicus at gmail.com>
+# Contributor: Netanel Shine <netanel at archlinux.org.il>
+# Contributor: ngoonee <ngoonee.talk@gmail.com>
+# Contributor: Adam Russell <adamlr6+arch@gmail.com>
+# Contributor: Dhananjay Sathe <dhananjaysathe@gmail.com>
+
+# Focused desktop/file-server build:
+# - SMB2/SMB3 server, client tools, ADS member support and winbind
+# - io_uring, Windows ACL/streams, macOS fruit/catia and snapshot/Btrfs VFS
+# - no AD domain controller, SMB1 server, GlusterFS, CephFS or Spotlight
+# - three-stage GCC PGO (instrument -> train -> PGO+LTO rebuild)
+
+pkgbase=samba
+pkgname=(libwbclient ldb smbclient samba)
+pkgver=4.24.5
+pkgrel=3.1
+epoch=2
+arch=(x86_64)
+url='https://www.samba.org'
+license=('GPL-3.0-or-later')
+# LTO is applied only to the final PGO build; !lto keeps the instrumented
+# stage free of makepkg's global LTO injection.
+options=('!lto' '!debug')
+makedepends=(
+  acl
+  avahi
+  dbus
+  docbook-xsl
+  gnutls
+  icu
+  jansson
+  krb5
+  libarchive
+  libbsd
+  libcap
+  libcups
+  libldap
+  libnsl
+  libtirpc
+  liburing
+  lmdb
+  pam
+  perl-json
+  perl-parse-yapp
+  pkg-config
+  popt
+  python
+  readline
+  rpcsvc-proto
+  systemd
+  talloc
+  tdb
+  tevent
+)
+source=(
+  "https://download.samba.org/samba/ftp/stable/${pkgbase}-${pkgver}.tar.gz"
+  "https://download.samba.org/samba/ftp/stable/${pkgbase}-${pkgver}.tar.asc"
+  samba.logrotate
+  samba.pam
+  samba.tmpfiles
+)
+validpgpkeys=('81F5E2832BD2545A1897B713AA99442FB680B620') # Samba Distribution Verification Key
+b2sums=('4796e3ae5e70c1d11d9326566677f0909423c5aad140309bfd9b3f8a3dedefe49660d0a0d502a681726ed7a961779587c33c9da29ecf69664b00a2ca958e64af'
+        'SKIP'
+        '72ecb413ca3499af984a0bb391f96e678a24a19d8e5c96050ba227878f0770f03466ac7a0ee328416e08204e92e9d16ec22d63ef25b53c20d957a17221cd3a98'
+        '3eab84d332d96678fe6e435ee243c8f1a82b838f601d61d3604d11e918aed7a62202edca5e476c4b9031ed284570e6fcd6c659cfdbd9624aa0019d3233755f81'
+        'e1f49e14d34cf1a48378cad9f427215101ff55b2461340e0dc2376192f07c45fc238463a07672348c0823e3aa7892c83a939a7d358aabac818e2108ca2c1900f')
+
+_pkgsrc() {
+  printf '%s/samba-pkg' "$srcdir"
+}
+
+_configure_samba() {
+  # !DEFAULT is what actually removes Samba's large default VFS module set.
+  # Forced idmap modules remain enabled by Samba itself.
+  local modules='!DEFAULT,idmap_ad,idmap_rid,idmap_hash,idmap_tdb2'
+  modules+=',pdb_tdbsam,pdb_ldapsam,pdb_smbpasswd'
+  modules+=',auth_unix'
+  modules+=',vfs_io_uring,vfs_acl_xattr,vfs_streams_xattr,vfs_catia,vfs_fruit'
+  modules+=',vfs_shadow_copy2,vfs_btrfs'
+
+  ./configure \
+    --enable-fhs \
+    --prefix=/usr \
+    --sysconfdir=/etc \
+    --sbindir=/usr/bin \
+    --libdir=/usr/lib \
+    --libexecdir=/usr/lib/samba \
+    --localstatedir=/var \
+    --with-configdir=/etc/samba \
+    --with-lockdir=/var/cache/samba \
+    --with-sockets-dir=/run/samba \
+    --with-piddir=/run \
+    --without-ad-dc \
+    --without-smb1-server \
+    --with-system-mitkrb5 \
+    --with-ads \
+    --with-ldap \
+    --with-winbind \
+    --with-acl-support \
+    --with-systemd \
+    --systemd-install-services \
+    --with-pam \
+    --with-pammodulesdir=/usr/lib/security \
+    --with-quotas \
+    --with-syslog \
+    --with-utmp \
+    --enable-cups \
+    --enable-avahi \
+    --disable-glusterfs \
+    --disable-cephfs \
+    --disable-spotlight \
+    --without-profiling-data \
+    --private-libraries='!ldb' \
+    --bundled-libraries='!tdb,!talloc,!pytalloc-util,!tevent,!popt,!pyldb-util' \
+    --with-shared-modules="$modules" \
+    --disable-rpath-install
+}
+
+_train_pgo() {
+  local root=$PWD
+  local train=$root/pgo-train
+  local conf=$train/smb.conf
+  local port=1445
+  local user pass='PgoTrain42'
+  local ldb ldif filter suite share dialect protection sub cmd pid
+  local smbd_pid ready=0 local_ok=0 client_ok=0 torture_ok=0
+  local -a parallel_pids=()
+  user=$(id -un)
+
+  rm -rf "$train"
+  mkdir -p "$train"/{private,lock,state,cache,pid,ncalrpc,winbindd,logs,base,compat,mac,client}
+  chmod 700 "$train/private"
+
+  cat > "$conf" <<EOF
+[global]
+    workgroup = PGO
+    netbios name = PGOSERVER
+    server role = standalone server
+    security = user
+    passdb backend = tdbsam:${train}/private/passdb.tdb
+    private dir = ${train}/private
+    lock directory = ${train}/lock
+    state directory = ${train}/state
+    cache directory = ${train}/cache
+    pid directory = ${train}/pid
+    ncalrpc dir = ${train}/ncalrpc
+    winbindd socket directory = ${train}/winbindd
+    log file = ${train}/logs/log.%m
+    logging = file
+    log level = 1
+    smb ports = ${port}
+    interfaces = 127.0.0.1
+    bind interfaces only = yes
+    hosts allow = 127.
+    map to guest = Never
+    load printers = no
+    disable spoolss = yes
+    server min protocol = SMB2_02
+    server signing = auto
+    server smb encrypt = desired
+    ea support = yes
+    store dos attributes = yes
+    fruit:aapl = yes
+
+[base]
+    path = ${train}/base
+    read only = no
+    vfs objects = io_uring
+
+[compat]
+    path = ${train}/compat
+    read only = no
+    vfs objects = acl_xattr streams_xattr catia io_uring
+    acl_xattr:ignore system acls = yes
+
+[mac]
+    path = ${train}/mac
+    read only = no
+    vfs objects = catia fruit streams_xattr io_uring
+    fruit:metadata = stream
+    fruit:resource = stream
+EOF
+
+  # Configuration parsing and command dispatch.
+  for _ in {1..5}; do
+    bin/testparm -s "$conf" >/dev/null 2>&1
+    bin/net -s "$conf" getlocalsid >/dev/null 2>&1 || true
+    bin/net -s "$conf" conf list >/dev/null 2>&1 || true
+  done
+
+  # LDB/TDB parsing, indexing, filters, transactions and mutations.
+  ldb=$train/training.ldb
+  ldif=$train/bulk.ldif
+  {
+    printf 'dn: dc=pgo,dc=test\nobjectClass: top\nobjectClass: domain\ndc: pgo\n\n'
+    for ((i = 1; i <= 800; i++)); do
+      printf 'dn: uid=user%04d,dc=pgo,dc=test\nobjectClass: person\ncn: Profile User %04d\nsn: User%04d\ndescription: desktop-game-file-%04d\n\n' \
+        "$i" "$i" "$i" "$i"
+    done
+  } > "$ldif"
+  bin/ldbadd -H "$ldb" "$ldif" >/dev/null
+  for filter in \
+    '(objectClass=*)' '(sn=User0400)' '(cn=Profile User 07*)' \
+    '(|(sn=User0001)(sn=User0800))' \
+    '(&(objectClass=person)(cn=*User*))'; do
+    bin/ldbsearch -H "$ldb" -b 'dc=pgo,dc=test' "$filter" \
+      dn cn sn description >/dev/null
+  done
+  cat > "$train/modify.ldif" <<EOF
+dn: uid=user0400,dc=pgo,dc=test
+changetype: modify
+replace: description
+description: hot-profile-path
+EOF
+  bin/ldbmodify -H "$ldb" "$train/modify.ldif" >/dev/null
+  bin/ldbrename -H "$ldb" \
+    'uid=user0800,dc=pgo,dc=test' 'uid=renamed0800,dc=pgo,dc=test' >/dev/null
+  bin/ldbdel -H "$ldb" 'uid=user0001,dc=pgo,dc=test' >/dev/null
+
+  # In-process crypto, NDR, charset, authentication, registry, event-loop,
+  # database and allocator coverage.  Some suites are platform-dependent;
+  # require a large successful subset instead of masking a no-op run.
+  local -a local_suites=(
+    local.ntlmssp local.smbencrypt local.str local.time local.datablob
+    local.binsearch local.asn1 local.strlist local.strv local.strv_util local.util
+    local.idtree local.genrand local.iconv local.ndr local.tdr local.share
+    local.loadparm local.charset local.convert_string_handle local.convert_string
+    local.string_case_handle local.util_unistr local.event local.tevent_req
+    local.torture local.dbspeed local.ldb local.registry local.verif_trailer
+    local.util_str_escape local.smbtorture local.talloc local.replace
+    local.crypto.md4 local.crypto.md5 local.crypto.hmacmd5 local.crypto.sha1
+    local.crypto.sha256 local.crypto.sha512 local.crypto.aes local.crypto.gnutls
+  )
+  for suite in "${local_suites[@]}"; do
+    if timeout 90 bin/smbtorture -s "$conf" ncalrpc:localhost "$suite" \
+        >/dev/null 2>&1; then
+      local_ok=$((local_ok + 1))
+    fi
+  done
+  ((local_ok >= 24)) || {
+    error "PGO training: only $local_ok local suites succeeded"
+    return 1
+  }
+
+  # A deterministic desktop/game-like corpus: large streams plus many assets.
+  dd if=/dev/zero of="$train/client/zeros.bin" bs=1M count=48 status=none
+  python - "$train/client" <<'PY'
+import pathlib
+import random
+import sys
+p = pathlib.Path(sys.argv[1])
+r = random.Random(0x53414D4241)
+(p / 'pattern.bin').write_bytes(r.randbytes(24 * 1024 * 1024))
+for d in range(16):
+    q = p / f'dir{d:02d}'
+    q.mkdir()
+    for i in range(48):
+        size = 1024 + (i * 97) % 8192
+        q.joinpath(f'asset-{i:03d}.dat').write_bytes(
+            bytes((d * 17 + i * 13 + j) & 255 for j in range(size)))
+for name in ('space name.txt', 'unicodé-äöü.txt', 'Mixed.Case',
+             'very-long-' + 'x' * 120 + '.dat'):
+    (p / name).write_text(name * 32)
+PY
+
+  printf '%s\n%s\n' "$pass" "$pass" | \
+    bin/pdbedit -s "$conf" -a -u "$user" -t >/dev/null
+
+  bin/smbd --foreground --no-process-group -s "$conf" \
+    > "$train/logs/smbd.stdout" 2>&1 &
+  smbd_pid=$!
+  _stop_training_smbd() {
+    local server_pid=$1
+    kill -TERM "$server_pid" 2>/dev/null || true
+    for _ in {1..100}; do
+      kill -0 "$server_pid" 2>/dev/null || break
+      sleep .1
+    done
+    kill -KILL "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+  }
+  trap "_stop_training_smbd $smbd_pid" EXIT
+
+  for _ in {1..100}; do
+    if bin/smbclient -s "$conf" -p "$port" -m SMB3_11 \
+        -U "$user%$pass" //127.0.0.1/base -c 'ls' >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    kill -0 "$smbd_pid" 2>/dev/null || break
+    sleep .1
+  done
+  ((ready)) || {
+    cat "$train/logs/smbd.stdout" >&2
+    error 'PGO training smbd did not start'
+    _stop_training_smbd
+    trap - EXIT
+    return 1
+  }
+
+  # Dialect negotiation, signing/encryption, bulk I/O, xattrs/streams, ACLs,
+  # filename mapping and every selected hot VFS stack.
+  for share in base compat mac; do
+    for dialect in SMB2_02 SMB2_10 SMB3_00 SMB3_11; do
+      protection=sign
+      [[ $dialect == SMB3_* ]] && protection=encrypt
+      sub="corpus-$dialect"
+      cmd="mkdir $sub; cd $sub; lcd $train/client; prompt OFF; mput *.bin *.txt; ls; allinfo zeros.bin; get zeros.bin $train/download-$share-$dialect.bin; rename pattern.bin pattern-renamed.bin; del *; cd ..; rmdir $sub"
+      if timeout 180 bin/smbclient -s "$conf" -p "$port" -m "$dialect" \
+          --client-protection="$protection" -U "$user%$pass" \
+          "//127.0.0.1/$share" -c "$cmd" >/dev/null 2>&1; then
+        client_ok=$((client_ok + 1))
+      fi
+    done
+  done
+  ((client_ok >= 8)) || {
+    error "PGO training: only $client_ok protocol workloads succeeded"
+    _stop_training_smbd
+    trap - EXIT
+    return 1
+  }
+
+  # Concurrent encrypted transfers exercise smbd's process and async-I/O paths.
+  for i in {1..6}; do
+    timeout 180 bin/smbclient -s "$conf" -p "$port" -m SMB3_11 \
+      --client-protection=encrypt -U "$user%$pass" //127.0.0.1/base \
+      -c "put $train/client/pattern.bin parallel-$i.bin; get parallel-$i.bin $train/parallel-$i.out; del parallel-$i.bin" \
+      >/dev/null 2>&1 &
+    parallel_pids+=("$!")
+  done
+  for pid in "${parallel_pids[@]}"; do
+    wait "$pid" || true
+  done
+
+  # State-machine and error-path coverage beyond ordinary desktop copies.
+  local -a torture_suites=(
+    smb2.connect smb2.getinfo smb2.lock smb2.read smb2.create smb2.dir
+    smb2.compound smb2.streams smb2.ioctl smb2.rename smb2.rw smb2.charset
+    smb2.ea smb2.mkdir smb2.setinfo smb2.timestamps smb2.name-mangling
+    smb2.session-require-signing
+  )
+  for suite in "${torture_suites[@]}"; do
+    if timeout 120 bin/smbtorture -s "$conf" -p "$port" -m SMB3_11 \
+        -U "$user%$pass" //127.0.0.1/base "$suite" >/dev/null 2>&1; then
+      torture_ok=$((torture_ok + 1))
+    fi
+  done
+  ((torture_ok >= 3)) || {
+    error "PGO training: only $torture_ok SMB2 suites succeeded"
+    _stop_training_smbd
+    trap - EXIT
+    return 1
+  }
+
+  timeout 60 bin/rpcclient -s "$conf" -p "$port" -U "$user%$pass" \
+    127.0.0.1 -c \
+    'srvinfo;netshareenumall;enumdomains;lsaquery;getusername;dsroledominfo' \
+    >/dev/null 2>&1 || true
+  timeout 60 bin/smbcacls -s "$conf" -p "$port" -U "$user%$pass" \
+    //127.0.0.1/compat / >/dev/null 2>&1 || true
+  timeout 60 bin/smbcquotas -s "$conf" -p "$port" -U "$user%$pass" \
+    //127.0.0.1/base >/dev/null 2>&1 || true
+
+  _stop_training_smbd
+  trap - EXIT
+  printf 'PGO training: local=%d protocol=%d torture=%d\n' \
+    "$local_ok" "$client_ok" "$torture_ok"
+}
+
+_validate_profiles() {
+  local profdir=$1
+  local count bytes objects ratio pattern
+  count=$(find "$profdir" -type f -name '*.gcda' | wc -l)
+  bytes=$(find "$profdir" -type f -name '*.gcda' -printf '%s\n' | \
+    awk '{s += $1} END {print s + 0}')
+  objects=$(find bin/default -type f -name '*.o' | wc -l)
+  ratio=$((count * 100 / objects))
+
+  printf 'PGO profiles: %d/%d objects (%d%%), %d bytes\n' \
+    "$count" "$objects" "$ratio" "$bytes"
+  ((count >= 800 && bytes >= 1000000 && ratio >= 45)) || {
+    error 'PGO profile coverage is below the validated floor'
+    return 1
+  }
+
+  # Validate every header against this exact GCC profile format and reject
+  # truncated/mixed-toolchain data before the expensive final build.
+  python - "$profdir" <<'PY'
+import pathlib
+import sys
+root = pathlib.Path(sys.argv[1])
+files = list(root.rglob('*.gcda'))
+for f in files:
+    h = f.read_bytes()[:12]
+    if len(h) != 12 or h[:4] != b'adcg' or h[4:8] != b'*16B':
+        raise SystemExit(f'invalid GCC 16 profile: {f}')
+print(f'validated {len(files)} GCC 16 profile headers')
+PY
+
+  # Require profiles for the actual desktop/server hot paths, not merely
+  # command-line startup code.
+  for pattern in \
+    'source3/smbd/smb2_server.c' \
+    'source3/client/client.c' \
+    'source3/libsmb/clireadwrite.c' \
+    'source3/modules/vfs_io_uring.c' \
+    'source3/modules/vfs_acl_xattr.c' \
+    'source3/modules/vfs_streams_xattr.c' \
+    'source3/modules/vfs_catia.c' \
+    'source3/modules/vfs_fruit.c' \
+    'lib/ldb/common/ldb.c'; do
+    find "$profdir" -type f -path "*$pattern*.gcda" -print -quit | grep -q . || {
+      error "Missing hot-path PGO data for $pattern"
+      return 1
+    }
+  done
+}
+
+_final_smoke_test() {
+  local train=$PWD/pgo-train
+  local conf=$train/smb.conf
+  local port=1445
+  local user pass='PgoTrain42' pid ready=0
+  user=$(id -un)
+
+  bin/smbd --foreground --no-process-group -s "$conf" \
+    > "$train/logs/final-smbd.stdout" 2>&1 &
+  pid=$!
+  _stop_final_smbd() {
+    local server_pid=$1
+    kill -TERM "$server_pid" 2>/dev/null || true
+    for _ in {1..100}; do
+      kill -0 "$server_pid" 2>/dev/null || break
+      sleep .1
+    done
+    kill -KILL "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+  }
+  trap "_stop_final_smbd $pid" EXIT
+
+  for _ in {1..100}; do
+    if bin/smbclient -s "$conf" -p "$port" -m SMB3_11 \
+        --client-protection=encrypt -U "$user%$pass" //127.0.0.1/base \
+        -c 'ls' >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep .1
+  done
+  ((ready)) || {
+    cat "$train/logs/final-smbd.stdout" >&2
+    error 'Final PGO+LTO smbd smoke test failed to start'
+    _stop_final_smbd
+    trap - EXIT
+    return 1
+  }
+
+  if ! bin/smbclient -s "$conf" -p "$port" -m SMB3_11 \
+      --client-protection=encrypt -U "$user%$pass" //127.0.0.1/mac \
+      -c "put $conf final-smoke.dat; get final-smoke.dat $train/final-smoke.out; del final-smoke.dat" \
+      >/dev/null || ! cmp "$conf" "$train/final-smoke.out"; then
+    error 'Final encrypted SMB3 transfer verification failed'
+    _stop_final_smbd
+    trap - EXIT
+    return 1
+  fi
+  _stop_final_smbd
+  trap - EXIT
+}
+
+build() {
+
+  local profdir=$srcdir/samba-pgo
+  local base_cflags="$CFLAGS"
+  local base_cxxflags="$CXXFLAGS"
+  local base_ldflags=$LDFLAGS
+  local pgo_gen="-fprofile-generate=$profdir -fprofile-update=atomic"
+  local pgo_use="-fprofile-use=$profdir -fprofile-correction -fprofile-partial-training"
+  pgo_use+=' -Werror=coverage-mismatch -Wno-error=missing-profile -Wno-missing-profile'
+  pgo_use+=' -flto=auto -fuse-linker-plugin'
+
+  rm -rf "$(_pkgsrc)" "$profdir"
+  cd "$pkgbase-$pkgver" || return
+
+  # Stage 1: production-identical configuration and instrumented build.
+  export CFLAGS=$base_cflags CXXFLAGS=$base_cxxflags LDFLAGS=$base_ldflags
+  export ADDITIONAL_CFLAGS=$pgo_gen ADDITIONAL_LDFLAGS=$pgo_gen
+  _configure_samba
+  make
+
+  # Stage 2: discard configure-probe counters, run representative training,
+  # then validate both breadth and the exact GCC profile format.
+  rm -rf "$profdir"
+  mkdir -p "$profdir"
+  _train_pgo
+  _validate_profiles "$profdir"
+
+  # Stage 3: clean reconfiguration plus corrected/partial PGO and full LTO.
+  # ADDITIONAL_* keeps PGO out of configure feature probes; otherwise
+  # -Wmissing-profile can change config.h and invalidate the collected CFGs.
+  make distclean
+  export CFLAGS=$base_cflags CXXFLAGS=$base_cxxflags LDFLAGS=$base_ldflags
+  export ADDITIONAL_CFLAGS=$pgo_use ADDITIONAL_LDFLAGS=$pgo_use
+  _configure_samba
+  make
+
+  # The final compiler is itself the authoritative profile parser.  Any stale
+  # or corrupt matched profile is fatal through -Werror=coverage-mismatch.
+  readelf -p .comment bin/smbd | grep -Fq 'GCC: (GNU) 16.1.1 20260728'
+  ! nm -D bin/smbd | grep -q '__gcov'
+  bin/smbd --version | grep -Fxq "Version $pkgver"
+  bin/smbclient --version | grep -Fxq "Version $pkgver"
+  _final_smoke_test
+
+  make DESTDIR="$(_pkgsrc)/" install
+
+  # Installed RUNPATH=/usr/lib/samba is intentional and required for Samba's
+  # private libraries.  Reject only build-tree/toolchain path leakage.
+  local f
+  while IFS= read -r -d '' f; do
+    if readelf -h "$f" >/dev/null 2>&1; then
+      ! readelf -d "$f" 2>/dev/null | \
+        grep -E '(RPATH|RUNPATH).*(/home/|/build/|gcc-old-toolchain)'
+    fi
+  done < <(find "$(_pkgsrc)" -type f -print0)
+
+  if [[ ! -e "$(_pkgsrc)/usr/bin/smbtar" ]]; then
+    install -m755 "$srcdir/$pkgbase-$pkgver/source3/script/smbtar" \
+      "$(_pkgsrc)/usr/bin/"
+  fi
+
+  rm -rf "$profdir" "$PWD/pgo-train"
+}
+
+package_libwbclient() {
+  pkgdesc='Winbind client library'
+  depends=(libbsd)
+  provides=(libwbclient.so)
+
+  local pkgsrc
+  pkgsrc=$(_pkgsrc)
+  install -d "$pkgdir/usr/lib" "$pkgdir/usr/lib/pkgconfig" \
+    "$pkgdir/usr/include/samba-4.0"
+  mv "$pkgsrc"/usr/lib/libwbclient.so* "$pkgdir/usr/lib/"
+  mv "$pkgsrc/usr/lib/pkgconfig/wbclient.pc" "$pkgdir/usr/lib/pkgconfig/"
+  mv "$pkgsrc/usr/include/samba-4.0/wbclient.h" \
+    "$pkgdir/usr/include/samba-4.0/"
+}
+
+package_ldb() {
+  pkgdesc='Schema-less, LDAP-like API and database'
+  url='https://ldb.samba.org/'
+  depends=(libtevent.so lmdb popt talloc tdb libtdb.so)
+  optdepends=('python: Python bindings')
+  provides=(libldb.so)
+
+  local pkgsrc site_packages py_ldb bin header
+  local -a ldb_bins=(ldbadd ldbdel ldbedit ldbmodify ldbrename ldbsearch)
+  local -a ldb_headers=(ldb.h ldb_errors.h ldb_handlers.h ldb_module.h ldb_version.h)
+  pkgsrc=$(_pkgsrc)
+  py_ldb=$(find "$pkgsrc/usr/lib" -type f -name _ldb_text.py -print -quit)
+  [[ -n $py_ldb ]]
+  site_packages=${py_ldb#"$pkgsrc"}
+  site_packages=${site_packages%/_ldb_text.py}
+
+  install -d "$pkgdir/usr/bin" "$pkgdir/usr/lib" "$pkgdir/usr/lib/samba" \
+    "$pkgdir/usr/lib/pkgconfig" "$pkgdir/usr/include/samba-4.0" \
+    "$pkgdir$site_packages" "$pkgdir/usr/share/man/man1"
+  for bin in "${ldb_bins[@]}"; do
+    mv "$pkgsrc/usr/bin/$bin" "$pkgdir/usr/bin/"
+  done
+  mv "$pkgsrc"/usr/lib/libldb* "$pkgdir/usr/lib/"
+  mv "$pkgsrc/usr/lib/samba/ldb" "$pkgdir/usr/lib/samba/"
+  mv "$pkgsrc/usr/lib/pkgconfig/ldb.pc" "$pkgdir/usr/lib/pkgconfig/"
+  for header in "${ldb_headers[@]}"; do
+    mv "$pkgsrc/usr/include/samba-4.0/$header" \
+      "$pkgdir/usr/include/samba-4.0/"
+  done
+  mv "$pkgsrc$site_packages/_ldb_text.py" \
+    "$pkgsrc$site_packages"/ldb.*.so "$pkgdir$site_packages/"
+  for bin in "${ldb_bins[@]}"; do
+    mv "$pkgsrc/usr/share/man/man1/$bin.1" "$pkgdir/usr/share/man/man1/"
+  done
+  mv "$pkgsrc/usr/share/man/man3" "$pkgdir/usr/share/man/"
+}
+
+package_smbclient() {
+  pkgdesc="Tools to access a server's files and printers over SMB"
+  depends=(
+    cifs-utils
+    gnutls
+    icu
+    jansson
+    krb5
+    ldb
+    libarchive
+    libbsd
+    libcups
+    libldap
+    libldb.so
+    libnsl
+    libreadline.so
+    libtdb.so
+    libtevent.so
+    libwbclient
+    popt
+    python
+    readline
+    talloc
+    tdb
+    tevent
+  )
+  provides=(libsmbclient.so libnetapi.so)
+
+  local pkgsrc bin
+  local -a client_bins=(
+    smbclient rpcclient smbspool smbtree smbcacls smbcquotas
+    smbget net nmblookup smbtar
+  )
+  pkgsrc=$(_pkgsrc)
+
+  install -d "$pkgdir/usr/bin" "$pkgdir/usr/lib" "$pkgdir/usr/lib/samba" \
+    "$pkgdir/usr/lib/pkgconfig" "$pkgdir/usr/share/man"/{man1,man7,man8} \
+    "$pkgdir/usr/include/samba-4.0" "$pkgdir/usr/lib/cups/backend"
+  for bin in "${client_bins[@]}"; do
+    mv "$pkgsrc/usr/bin/$bin" "$pkgdir/usr/bin/"
+  done
+  mv "$pkgsrc"/usr/lib/lib*.so* "$pkgdir/usr/lib/"
+  mv "$pkgsrc"/usr/lib/samba/lib*.so* "$pkgdir/usr/lib/samba/"
+  mv "$pkgsrc/usr/lib/pkgconfig/smbclient.pc" \
+    "$pkgsrc/usr/lib/pkgconfig/netapi.pc" "$pkgdir/usr/lib/pkgconfig/"
+  for bin in "${client_bins[@]}"; do
+    [[ ! -e $pkgsrc/usr/share/man/man1/$bin.1 ]] || \
+      mv "$pkgsrc/usr/share/man/man1/$bin.1" "$pkgdir/usr/share/man/man1/"
+    [[ ! -e $pkgsrc/usr/share/man/man8/$bin.8 ]] || \
+      mv "$pkgsrc/usr/share/man/man8/$bin.8" "$pkgdir/usr/share/man/man8/"
+  done
+  mv "$pkgsrc/usr/share/man/man7/libsmbclient.7" "$pkgdir/usr/share/man/man7/"
+  mv "$pkgsrc/usr/include/samba-4.0/libsmbclient.h" \
+    "$pkgsrc/usr/include/samba-4.0/netapi.h" "$pkgdir/usr/include/samba-4.0/"
+  ln -s /usr/bin/smbspool "$pkgdir/usr/lib/cups/backend/smb"
+}
+
+package_samba() {
+  pkgdesc='SMB file server, winbind and administration tools (no AD DC)'
+  depends=(
+    acl
+    avahi
+    "gcc-libs>=16.1.1"
+    "gnutls>=2.4.1"
+    krb5
+    ldb
+    libbsd
+    libcups
+    "libcap>=2.16"
+    libldb.so
+    libtdb.so
+    libtevent.so
+    liburing
+    libwbclient
+    pam
+    popt
+    python
+    "smbclient>=${epoch}:${pkgver}"
+    talloc
+    tdb
+  )
+  optdepends=(
+    'python-dnspython: DNS management helpers'
+    'python-markdown: schema documentation helpers'
+    'python-cryptography: group-policy and certificate helpers'
+  )
+  backup=(etc/logrotate.d/samba etc/pam.d/samba etc/conf.d/samba)
+  install=samba.install
+
+  local pkgsrc site_packages samba_py script
+  pkgsrc=$(_pkgsrc)
+  samba_py=$(find "$pkgsrc/usr/lib" -type d -path '*/site-packages/samba' -print -quit)
+  [[ -n $samba_py ]]
+  site_packages=${samba_py#"$pkgsrc"}
+  site_packages=${site_packages%/samba}
+
+  cp -a "$pkgsrc/." "$pkgdir/"
+  rm -rf "$pkgsrc"
+
+  for script in samba_dnsupdate samba_kcc samba_spnupdate samba_upgradedns samba-tool; do
+    [[ -e $pkgdir/usr/bin/$script ]] || continue
+    sed -i "/^sys\.path\.insert/ a sys.path.insert(0, '$site_packages')" \
+      "$pkgdir/usr/bin/$script"
+  done
+
+  sed -i '/^EnvironmentFile/ s|sysconfig|conf.d|' \
+    "$pkgdir"/usr/lib/systemd/system/*.service
+  install -d "$pkgdir/etc/conf.d"
+  install -m644 "$srcdir/$pkgbase-$pkgver/packaging/systemd/samba.sysconfig" \
+    "$pkgdir/etc/conf.d/samba"
+  install -Dm644 "$srcdir/samba.tmpfiles" \
+    "$pkgdir/usr/lib/tmpfiles.d/samba.conf"
+
+  install -d "$pkgdir/etc/samba"
+  install -d -m700 "$pkgdir/etc/samba/private"
+  install -d -m1777 "$pkgdir/var/spool/samba"
+  install -Dm644 "$srcdir/samba.logrotate" "$pkgdir/etc/logrotate.d/samba"
+  install -Dm644 "$srcdir/samba.pam" "$pkgdir/etc/pam.d/samba"
+  rm -rf "$pkgdir"/{run,var/run,etc/sysconfig}
+
+  install -Dm644 "$srcdir/$pkgbase-$pkgver/examples/LDAP/samba.schema" \
+    "$pkgdir/usr/share/doc/samba/examples/LDAP/samba.schema"
+}
