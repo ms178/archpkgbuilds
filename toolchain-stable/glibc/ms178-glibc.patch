@@ -1,26 +1,39 @@
-From 9ae0431ffb7f82bcc8128325b0e3f412902c06f8 Mon Sep 17 00:00:00 2001
+From f30e2946628e385473cd66ab276a7f849d39ba55 Mon Sep 17 00:00:00 2001
 From: ms178 GLIBC audit <noreply@example.invalid>
-Date: Wed, 29 Jul 2026 09:14:24 +0000
-Subject: [PATCH] glibc: empirical Raptor tuning with pow identity fast path
+Date: Wed, 29 Jul 2026 10:50:40 +0000
+Subject: [PATCH] glibc: fix NSS, resolver, libio, spawn, loader and locale
+ issues
 
-Keep the audited v7 Raptor, allocator, math, Zstd, Clang, configure, and
-child-reaping fixes. Add an exact early pow(1,y) path which preserves
-signaling-NaN behavior.
+Keep the audited v8 tuning and fix confirmed defects in previously under-audited
+subsystems: preserve the NSS line terminator, make resolver configuration OOM
+and realloc-safe, avoid NULL pointer subtraction in libio backup paths, grow
+spawn actions geometrically with overflow checks, compare arbitrary-length
+ld.so.cache numbers without signed overflow, bound localedef suffix scans, and
+make tunables whitespace trimming linear.
 
-Empirical Old-GCC/Raptor-code testing rejects the former broad pthread
-hot/cold annotations, allocator prefetches, malloc/free hot attributes, and
-extra tcache bounds/load rewrites. Retain the v7 allocator defaults after
-compile-time sweeps showed severe page-fault and medium-allocation regressions
-with upstream defaults.
+Add focused NSS and spawn regression tests.
 ---
  Makerules                                  |   3 +
  benchtests/Makefile                        |   1 +
  bits/floatn-common.h                       |  36 ++---
+ elf/dl-cache.c                             |  28 ++--
+ elf/tunconf.c                              |  19 ++-
+ libio/genops.c                             |   4 +-
+ libio/wgenops.c                            |   6 +-
  locale/programs/charmap-dir.c              | 104 ++++++++++++-
+ locale/programs/charmap.c                  |  15 +-
+ locale/programs/repertoire.c               |  15 +-
  localedata/Makefile                        |  20 ++-
  malloc/malloc.c                            |  53 ++++---
  math/math.h                                |   8 +-
  misc/sys/cdefs.h                           |  10 +-
+ nss/Makefile                               |   1 +
+ nss/nss_readline.c                         |   6 +-
+ nss/tst-nss-readline.c                     |  22 +++
+ posix/Makefile                             |   1 +
+ posix/spawn_faction_init.c                 |  23 ++-
+ posix/tst-spawn-actions-growth.c           |  16 ++
+ resolv/res_hconf.c                         |  37 ++++-
  sysdeps/ieee754/dbl-64/e_pow.c             |   2 +
  sysdeps/ieee754/flt-32/e_atan2f.c          | 169 ++++++++++++---------
  sysdeps/ieee754/flt-32/e_powf.c            |   2 +
@@ -35,7 +48,9 @@ with upstream defaults.
  sysdeps/x86_64/fpu/math-use-builtins-fma.h |  43 ++++++
  sysdeps/x86_64/fpu/multiarch/s_fma.c       |  34 +++--
  sysdeps/x86_64/fpu/multiarch/s_fmaf.c      |  21 ++-
- 22 files changed, 494 insertions(+), 214 deletions(-)
+ 35 files changed, 642 insertions(+), 259 deletions(-)
+ create mode 100644 nss/tst-nss-readline.c
+ create mode 100644 posix/tst-spawn-actions-growth.c
  create mode 100644 sysdeps/x86_64/fpu/math-use-builtins-fma.h
 
 diff --git a/Makerules b/Makerules
@@ -202,6 +217,109 @@ index 4c790948..cefd5022 100644
  #   define __builtin_huge_valf128x() ((_Float128x) __builtin_huge_val ())
  #   define __builtin_inff128x() ((_Float128x) __builtin_inf ())
  #   define __builtin_nanf128x(x) ((_Float128x) __builtin_nan (x))
+diff --git a/elf/dl-cache.c b/elf/dl-cache.c
+index c6820a9f..ad15ba22 100644
+--- a/elf/dl-cache.c
++++ b/elf/dl-cache.c
+@@ -355,17 +355,27 @@ _dl_cache_libcmp (const char *p1, const char *p2)
+           if (*p2 >= '0' && *p2 <= '9')
+             {
+ 	      /* Must compare this numerically.  */
+-	      int val1;
+-	      int val2;
+-
+-	      val1 = *p1++ - '0';
+-	      val2 = *p2++ - '0';
++	      const char *digits1 = p1;
++	      const char *digits2 = p2;
+ 	      while (*p1 >= '0' && *p1 <= '9')
+-	        val1 = val1 * 10 + *p1++ - '0';
++		++p1;
+ 	      while (*p2 >= '0' && *p2 <= '9')
+-	        val2 = val2 * 10 + *p2++ - '0';
+-	      if (val1 != val2)
+-		return val1 - val2;
++		++p2;
++
++	      /* Compare without converting to int: arbitrarily long numeric
++		 components must not trigger signed overflow.  Leading zeroes do
++		 not affect the numeric value, matching the previous behavior.  */
++	      while (digits1 < p1 && *digits1 == '0')
++		++digits1;
++	      while (digits2 < p2 && *digits2 == '0')
++		++digits2;
++	      size_t length1 = p1 - digits1;
++	      size_t length2 = p2 - digits2;
++	      if (length1 != length2)
++		return length1 < length2 ? -1 : 1;
++	      int result = memcmp (digits1, digits2, length1);
++	      if (result != 0)
++		return result;
+ 	    }
+ 	  else
+             return 1;
+diff --git a/elf/tunconf.c b/elf/tunconf.c
+index c27b50b1..f1658eb5 100644
+--- a/elf/tunconf.c
++++ b/elf/tunconf.c
+@@ -299,14 +299,17 @@ add_tunable (char *line, const char *filename, int lineno)
+ 
+   /* VALUE now points to the start of the value.  */
+ 
+-  /* Split the string into name and value c-strings.  */
+-  *eq = 0;
+-  /* Trim trailing whitespace off NAME.  */
+-  while (*name && isspace (name[strlen(name)-1]))
+-    name[strlen(name)-1] = 0;
+-  /* Trim trailing whitespace off VALUE.  */
+-  while (*value && isspace (value[strlen(value)-1]))
+-    value[strlen(value)-1] = 0;
++  /* Split the string into name and value c-strings.  Trim each suffix in one
++     backwards pass; repeatedly calling strlen here made long lines quadratic.  */
++  char *name_end = eq;
++  while (name_end > name && isspace ((unsigned char) name_end[-1]))
++    --name_end;
++  *name_end = '\0';
++
++  char *value_end = value + strlen (value);
++  while (value_end > value && isspace ((unsigned char) value_end[-1]))
++    --value_end;
++  *value_end = '\0';
+ 
+   id = -1;
+   for (i = 0; i < array_length (tunable_list); i ++)
+diff --git a/libio/genops.c b/libio/genops.c
+index 90e08e65..e58a5cad 100644
+--- a/libio/genops.c
++++ b/libio/genops.c
+@@ -237,8 +237,8 @@ save_for_backup (FILE *fp, char *end_p)
+   ssize_t least_mark = _IO_least_marker (fp, end_p);
+   /* needed_size is how much space we need in the backup area. */
+   size_t needed_size = (end_p - fp->_IO_read_base) - least_mark;
+-  /* FIXME: Dubious arithmetic if pointers are NULL */
+-  size_t current_Bsize = fp->_IO_save_end - fp->_IO_save_base;
++  size_t current_Bsize = (fp->_IO_save_base == NULL
++                          ? 0 : fp->_IO_save_end - fp->_IO_save_base);
+   size_t avail; /* Extra space available for future expansion. */
+   ssize_t delta;
+   struct _IO_marker *mark;
+diff --git a/libio/wgenops.c b/libio/wgenops.c
+index c2a8541b..db7f0e02 100644
+--- a/libio/wgenops.c
++++ b/libio/wgenops.c
+@@ -430,9 +430,9 @@ save_for_wbackup (FILE *fp, wchar_t *end_p)
+   /* needed_size is how much space we need in the backup area. */
+   size_t needed_size = ((end_p - fp->_wide_data->_IO_read_base)
+                         - least_mark);
+-  /* FIXME: Dubious arithmetic if pointers are NULL */
+-  size_t current_Bsize = (fp->_wide_data->_IO_save_end
+-                          - fp->_wide_data->_IO_save_base);
++  size_t current_Bsize = (fp->_wide_data->_IO_save_base == NULL
++                          ? 0 : (fp->_wide_data->_IO_save_end
++                                 - fp->_wide_data->_IO_save_base));
+   size_t avail; /* Extra space available for future expansion. */
+   ssize_t delta;
+   struct _IO_marker *mark;
 diff --git a/locale/programs/charmap-dir.c b/locale/programs/charmap-dir.c
 index fdf60a45..957f7b85 100644
 --- a/locale/programs/charmap-dir.c
@@ -363,6 +481,78 @@ index fdf60a45..957f7b85 100644
    memcpy (p, ".gz", 4);
    stream = fopen_uncompressed (pathname, "gzip");
    if (stream != NULL)
+diff --git a/locale/programs/charmap.c b/locale/programs/charmap.c
+index d4339556..f6a733d6 100644
+--- a/locale/programs/charmap.c
++++ b/locale/programs/charmap.c
+@@ -999,22 +999,25 @@ charmap_new_char (struct linereader *lr, struct charmap_t *cm,
+       return;
+     }
+ 
+-  cp = &from[len1 - 1];
++  /* Find the first digit in the trailing numeric suffix.  Test the bound
++     before dereferencing so empty/all-numeric names cannot read before FROM.  */
++  cp = &from[len1];
+   if (decimal_ellipsis)
+-    while (isdigit (*cp) && cp >= from)
++    while (cp > from && isdigit ((unsigned char) cp[-1]))
+       --cp;
+   else
+-    while (isxdigit (*cp) && cp >= from)
++    while (cp > from && isxdigit ((unsigned char) cp[-1]))
+       {
+-	if (!isdigit (*cp) && !isupper (*cp))
++	if (!isdigit ((unsigned char) cp[-1])
++	    && !isupper ((unsigned char) cp[-1]))
+ 	  lr_error (lr, _("\
+ hexadecimal range format should use only capital characters"));
+ 	--cp;
+       }
+ 
+-  prefix_len = (cp - from) + 1;
++  prefix_len = cp - from;
+ 
+-  if (cp == &from[len1 - 1] || strncmp (from, to, prefix_len) != 0)
++  if (prefix_len == len1 || strncmp (from, to, prefix_len) != 0)
+     goto illegal_range;
+ 
+   errno = 0;
+diff --git a/locale/programs/repertoire.c b/locale/programs/repertoire.c
+index 93a92620..0c9227f1 100644
+--- a/locale/programs/repertoire.c
++++ b/locale/programs/repertoire.c
+@@ -418,22 +418,25 @@ repertoire_new_char (struct linereader *lr, hash_table *ht, hash_table *rt,
+       return;
+     }
+ 
+-  cp = &from[len1 - 1];
++  /* Find the first digit in the trailing numeric suffix.  Test the bound
++     before dereferencing so empty/all-numeric names cannot read before FROM.  */
++  cp = &from[len1];
+   if (decimal_ellipsis)
+-    while (isdigit (*cp) && cp >= from)
++    while (cp > from && isdigit ((unsigned char) cp[-1]))
+       --cp;
+   else
+-    while (isxdigit (*cp) && cp >= from)
++    while (cp > from && isxdigit ((unsigned char) cp[-1]))
+       {
+-	if (!isdigit (*cp) && !isupper (*cp))
++	if (!isdigit ((unsigned char) cp[-1])
++	    && !isupper ((unsigned char) cp[-1]))
+ 	  lr_error (lr, _("\
+ hexadecimal range format should use only capital characters"));
+ 	--cp;
+       }
+ 
+-  prefix_len = (cp - from) + 1;
++  prefix_len = cp - from;
+ 
+-  if (cp == &from[len1 - 1] || strncmp (from, to, prefix_len) != 0)
++  if (prefix_len == len1 || strncmp (from, to, prefix_len) != 0)
+     goto invalid_range;
+ 
+   errno = 0;
 diff --git a/localedata/Makefile b/localedata/Makefile
 index 0fb1d78c..57dd3333 100644
 --- a/localedata/Makefile
@@ -614,6 +804,212 @@ index 8d27f26d..f2ad15f6 100644
  /* Designates dealloc as a function to call to deallocate objects
     allocated by the declared function.  */
  # define __attr_dealloc(dealloc, argno) \
+diff --git a/nss/Makefile b/nss/Makefile
+index b1f25f0d..89fee972 100644
+--- a/nss/Makefile
++++ b/nss/Makefile
+@@ -306,6 +306,7 @@ tests-static            = tst-field
+ 
+ tests-internal := \
+   tst-field \
++  tst-nss-readline \
+   tst-rfc3484 \
+   tst-rfc3484-2 \
+   tst-rfc3484-3 \
+diff --git a/nss/nss_readline.c b/nss/nss_readline.c
+index 08583e9d..7bd606b2 100644
+--- a/nss/nss_readline.c
++++ b/nss/nss_readline.c
+@@ -65,13 +65,15 @@ __nss_readline (FILE *fp, char *buf, size_t len, off64_t *poffset)
+ 
+       /* Remove leading whitespace.  */
+       char *p = buf;
+-      while (isspace (*p))
++      while (isspace ((unsigned char) *p))
+         ++p;
+       if (*p == '\0' || *p == '#')
+         /* Skip empty lines and comments.  */
+         continue;
+       if (p != buf)
+-        memmove (buf, p, strlen (p));
++        /* Include the terminator.  Otherwise bytes before P remain after the
++           logical line and callers observe duplicated trailing contents.  */
++        memmove (buf, p, strlen (p) + 1);
+ 
+       /* Return line to the caller.  */
+       return 0;
+diff --git a/nss/tst-nss-readline.c b/nss/tst-nss-readline.c
+new file mode 100644
+index 00000000..deab1a5f
+--- /dev/null
++++ b/nss/tst-nss-readline.c
+@@ -0,0 +1,22 @@
++/* Verify leading-space removal in __nss_readline.  */
++#include "nss_files.h"
++#include <stdio.h>
++#include <string.h>
++#include <support/check.h>
++
++static int
++do_test (void)
++{
++  char input[] = "  abc\n";
++  FILE *fp = fmemopen (input, strlen (input), "r");
++  TEST_VERIFY_EXIT (fp != NULL);
++  char buffer[32];
++  memset (buffer, 'X', sizeof (buffer));
++  off64_t offset;
++  TEST_COMPARE (__nss_readline (fp, buffer, sizeof (buffer), &offset), 0);
++  TEST_COMPARE_STRING (buffer, "abc\n");
++  TEST_COMPARE (buffer[4], '\0');
++  TEST_COMPARE (fclose (fp), 0);
++  return 0;
++}
++#include <support/test-driver.c>
+diff --git a/posix/Makefile b/posix/Makefile
+index 10d70ae0..38e1a9c5 100644
+--- a/posix/Makefile
++++ b/posix/Makefile
+@@ -305,6 +305,7 @@ tests := \
+   tst-posix_fadvise64 \
+   tst-posix_spawn-fd \
+   tst-posix_spawn-setsid \
++  tst-spawn-actions-growth \
+   tst-preadwrite \
+   tst-preadwrite64 \
+   tst-regcomp-bracket-free \
+diff --git a/posix/spawn_faction_init.c b/posix/spawn_faction_init.c
+index 2eee2037..dc539b92 100644
+--- a/posix/spawn_faction_init.c
++++ b/posix/spawn_faction_init.c
+@@ -16,6 +16,7 @@
+    <https://www.gnu.org/licenses/>.  */
+ 
+ #include <errno.h>
++#include <limits.h>
+ #include <spawn.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -28,9 +29,25 @@
+ int
+ __posix_spawn_file_actions_realloc (posix_spawn_file_actions_t *file_actions)
+ {
+-  int newalloc = file_actions->__allocated + 8;
+-  void *newmem = realloc (file_actions->__actions,
+-			  newalloc * sizeof (struct __spawn_action));
++  int oldalloc = file_actions->__allocated;
++  if (oldalloc == INT_MAX)
++    return ENOMEM;
++
++  /* Geometric growth avoids quadratic realloc/copy behavior for launchers
++     which install many descriptor actions.  Saturate before signed overflow.  */
++  int newalloc;
++  if (oldalloc == 0)
++    newalloc = 8;
++  else if (oldalloc > INT_MAX / 2)
++    newalloc = INT_MAX;
++  else
++    newalloc = oldalloc * 2;
++
++  size_t bytes;
++  if (__builtin_mul_overflow ((size_t) newalloc,
++                              sizeof (struct __spawn_action), &bytes))
++    return ENOMEM;
++  void *newmem = realloc (file_actions->__actions, bytes);
+ 
+   if (newmem == NULL)
+     /* Not enough memory.  */
+diff --git a/posix/tst-spawn-actions-growth.c b/posix/tst-spawn-actions-growth.c
+new file mode 100644
+index 00000000..9df308b0
+--- /dev/null
++++ b/posix/tst-spawn-actions-growth.c
+@@ -0,0 +1,16 @@
++/* Verify geometric spawn file-action growth.  */
++#include <spawn.h>
++#include <support/check.h>
++static int
++do_test (void)
++{
++  posix_spawn_file_actions_t actions;
++  TEST_COMPARE (posix_spawn_file_actions_init (&actions), 0);
++  for (int i = 0; i < 17; ++i)
++    TEST_COMPARE (posix_spawn_file_actions_addclose (&actions, 0), 0);
++  TEST_COMPARE (actions.__used, 17);
++  TEST_VERIFY (actions.__allocated >= 32);
++  TEST_COMPARE (posix_spawn_file_actions_destroy (&actions), 0);
++  return 0;
++}
++#include <support/test-driver.c>
+diff --git a/resolv/res_hconf.c b/resolv/res_hconf.c
+index 46bd26cf..950b9034 100644
+--- a/resolv/res_hconf.c
++++ b/resolv/res_hconf.c
+@@ -80,6 +80,17 @@ static const struct cmd
+ /* Structure containing the state.  */
+ struct hconf _res_hconf;
+ 
++static void
++clear_trimdomains (void)
++{
++  for (int i = 0; i < _res_hconf.num_trimdomains; ++i)
++    {
++      free ((char *) _res_hconf.trimdomain[i]);
++      _res_hconf.trimdomain[i] = NULL;
++    }
++  _res_hconf.num_trimdomains = 0;
++}
++
+ /* Skip white space.  */
+ static const char *
+ skip_ws (const char *str)
+@@ -125,8 +136,10 @@ arg_trimdomain_list (const char *fname, int line_num, const char *args)
+ 	  free (buf);
+ 	  return NULL;
+ 	}
+-      _res_hconf.trimdomain[_res_hconf.num_trimdomains++] =
+-	__strndup (start, len);
++      char *copy = __strndup (start, len);
++      if (copy == NULL)
++        return NULL;
++      _res_hconf.trimdomain[_res_hconf.num_trimdomains++] = copy;
+       args = skip_ws (args);
+       switch (*args)
+ 	{
+@@ -309,7 +322,7 @@ do_init (void)
+   envval = getenv (ENV_TRIM_OVERR);
+   if (envval)
+     {
+-      _res_hconf.num_trimdomains = 0;
++      clear_trimdomains ();
+       arg_trimdomain_list (ENV_TRIM_OVERR, 1, envval);
+     }
+ 
+@@ -435,9 +448,21 @@ _res_hconf_reorder_addrs (struct hostent *hp)
+ 	      /* Now we're committed to this entry.  */
+ 	      ++new_num_ifs;
+ 	    }
+-	  /* Just keep enough memory to hold all the interfaces we want.  */
+-	  ifaddrs = realloc (ifaddrs, new_num_ifs * sizeof (ifaddrs[0]));
+-	  assert (ifaddrs != NULL);
++	  /* Keep enough memory for the usable interfaces.  realloc (P, 0)
++	     may free P and return NULL, and a shrinking realloc may fail while
++	     leaving P valid.  Neither case is fatal for this cache.  */
++	  if (new_num_ifs == 0)
++	    {
++	      free (ifaddrs);
++	      ifaddrs = NULL;
++	    }
++	  else
++	    {
++	      struct netaddr *shrunk
++		= realloc (ifaddrs, new_num_ifs * sizeof (ifaddrs[0]));
++	      if (shrunk != NULL)
++		ifaddrs = shrunk;
++	    }
+ 
+ 	cleanup1:
+ 	  __if_freereq (ifr, num);
 diff --git a/sysdeps/ieee754/dbl-64/e_pow.c b/sysdeps/ieee754/dbl-64/e_pow.c
 index 56c393e9..3b9ee8d7 100644
 --- a/sysdeps/ieee754/dbl-64/e_pow.c
