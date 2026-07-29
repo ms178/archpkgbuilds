@@ -75,10 +75,18 @@ set -q LLVM_ENABLE_BINDINGS; or set -g LLVM_ENABLE_BINDINGS OFF
 set -g NPROC (nproc)
 set -q LTO_JOBS; or set -g LTO_JOBS (math -s0 "max(2, round($NPROC / 4))")
 set -g VP_COUNTERS_PER_SITE 16
-set -g COMMON_FLAGS "-O3 -march=native -mtune=native -fno-semantic-interposition -falign-functions=32 -falign-loops=32 -fcf-protection=none -mharden-sls=none -fno-plt"
-set -g C_LTO_FLAGS "-flto=thin -fsplit-lto-unit"
-set -g CXX_LTO_FLAGS "-flto=thin -fwhole-program-vtables"
-set -g LINKER_BASE "-fuse-ld=lld -Wl,--thinlto-jobs=$LTO_JOBS -Wl,--lto-O3 -Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=safe -Wl,-z,max-page-size=0x200000"
+# Keep flags as fish lists for direct compiler invocations.  Fish does not
+# split scalar variables on spaces, so using a string such as
+# "-O3 -march=native" directly as `$COMMON_FLAGS` passes one invalid argument
+# to clang.  String mirrors are only used for CMake cache variables.
+set -g COMMON_FLAGS_LIST     -O3     -march=native     -mtune=native     -fno-semantic-interposition     -falign-functions=32     -falign-loops=32     -fcf-protection=none     -mharden-sls=none     -fno-plt
+set -g C_LTO_FLAGS_LIST -flto=thin -fsplit-lto-unit
+set -g CXX_LTO_FLAGS_LIST -flto=thin -fwhole-program-vtables
+set -g LINKER_BASE_LIST     -fuse-ld=lld     -Wl,--thinlto-jobs=$LTO_JOBS     -Wl,--lto-O3     -Wl,--lto-CGO3     -Wl,--gc-sections     -Wl,--icf=safe     -Wl,-z,max-page-size=0x200000
+set -g COMMON_FLAGS (string join ' ' -- $COMMON_FLAGS_LIST)
+set -g C_LTO_FLAGS (string join ' ' -- $C_LTO_FLAGS_LIST)
+set -g CXX_LTO_FLAGS (string join ' ' -- $CXX_LTO_FLAGS_LIST)
+set -g LINKER_BASE (string join ' ' -- $LINKER_BASE_LIST)
 
 set -g ALLOCATOR_LINK "-lpthread -lstdc++ -lm -ldl"
 if test "$USE_MIMALLOC" = "1"
@@ -95,10 +103,174 @@ if test "$USE_MIMALLOC" = "1"
     end
 end
 
+# A user-provided LD_PRELOAD applies to CMake, compiler, linker, and test
+# processes.  That can make host compiler probes fail before diagnostics are
+# printed (observed as empty host-probe.log).  Keep the final-toolchain allocator
+# linkage, but use a deterministic process environment unless explicitly
+# requested otherwise.
+set -g USER_LD_PRELOAD ""
+if set -q LD_PRELOAD
+    set -g USER_LD_PRELOAD "$LD_PRELOAD"
+    if not set -q ALLOW_BUILD_LD_PRELOAD; or test "$ALLOW_BUILD_LD_PRELOAD" != "1"
+        log "Clearing LD_PRELOAD for deterministic bootstrap subprocesses (was: $USER_LD_PRELOAD). Set ALLOW_BUILD_LD_PRELOAD=1 to override."
+        set -e LD_PRELOAD
+    else
+        log "Keeping user LD_PRELOAD for all subprocesses: $LD_PRELOAD"
+    end
+end
+
+function absolute_tool_path --argument-names ToolPath
+    if string match -q '/*' -- "$ToolPath"
+        echo "$ToolPath"
+    else
+        set -l Dir (dirname "$ToolPath")
+        set -l Base (basename "$ToolPath")
+        echo (cd "$Dir"; and pwd -P)/$Base
+    end
+end
+
+function choose_host_tool --argument-names VarName ToolName SystemPath
+    if set -q $VarName
+        set -l Value $$VarName
+        test -x "$Value"; or die "$VarName is set but not executable: $Value"
+        absolute_tool_path "$Value"
+        return 0
+    end
+    if test -x "$SystemPath"
+        absolute_tool_path "$SystemPath"
+        return 0
+    end
+    set -l Found (command -v $ToolName); or die "missing required tool: $ToolName"
+    absolute_tool_path "$Found"
+end
+
+function clangxx_for_clang --argument-names CCompiler
+    set -l Dir (dirname "$CCompiler")
+    set -l Base (basename "$CCompiler")
+    set -l CxxCandidate ""
+    if test "$Base" = "clang"
+        set CxxCandidate "$Dir/clang++"
+    else if string match -qr '^clang-[0-9]+(\.[0-9]+)*$' -- "$Base"
+        set -l Suffix (string replace 'clang' '' -- "$Base")
+        set CxxCandidate "$Dir/clang++$Suffix"
+    else
+        return 1
+    end
+
+    if test -x "$CxxCandidate"
+        absolute_tool_path "$CxxCandidate"
+        return 0
+    end
+    return 1
+end
+
+function choose_default_host_clang_pair
+    for ver in 22 21 20 19 18 17
+        set -l c "/usr/bin/clang-$ver"
+        set -l cxx "/usr/bin/clang++-$ver"
+        if test -x "$c"; and test -x "$cxx"
+            absolute_tool_path "$c"
+            absolute_tool_path "$cxx"
+            return 0
+        end
+    end
+
+    if test -x /usr/bin/clang; and test -x /usr/bin/clang++
+        absolute_tool_path /usr/bin/clang
+        absolute_tool_path /usr/bin/clang++
+        return 0
+    end
+
+    set -l c (command -v clang 2>/dev/null)
+    set -l cxx (command -v clang++ 2>/dev/null)
+    if test -n "$c"; and test -n "$cxx"; and test -x "$c"; and test -x "$cxx"
+        realpath "$c"
+        realpath "$cxx"
+        return 0
+    end
+    return 1
+end
+
+if set -q HOST_CLANG
+    set -g HOST_CLANG (choose_host_tool HOST_CLANG clang /usr/bin/clang)
+    if set -q HOST_CLANGXX
+        set -g HOST_CLANGXX (choose_host_tool HOST_CLANGXX clang++ /usr/bin/clang++)
+    else
+        set -l DerivedCXX (clangxx_for_clang "$HOST_CLANG")
+        test -n "$DerivedCXX"; or die "HOST_CLANG=$HOST_CLANG was set but no matching clang++ was found. Set HOST_CLANGXX explicitly."
+        set -g HOST_CLANGXX "$DerivedCXX"
+    end
+else
+    set -l HostPair (choose_default_host_clang_pair)
+    test (count $HostPair) -eq 2; or die "could not find a usable clang/clang++ host compiler pair"
+    set -g HOST_CLANG "$HostPair[1]"
+    set -g HOST_CLANGXX "$HostPair[2]"
+end
+set -g HOST_LD_LLD (choose_host_tool HOST_LD_LLD ld.lld /usr/bin/ld.lld)
+
+verify_executable "$HOST_CLANG" "host clang"
+verify_executable "$HOST_CLANGXX" "host clang++"
+verify_executable "$HOST_LD_LLD" "host ld.lld"
+
+string match -q "*clang++*" (basename "$HOST_CLANGXX"); or die "HOST_CLANGXX must be invoked through a clang++ driver path, got: $HOST_CLANGXX"
+
+if string match -q "$INSTALL_PREFIX/*" "$HOST_CLANG"; or string match -q "$INSTALL_PREFIX/*" "$HOST_CLANGXX"
+    die "Refusing to bootstrap with clang from INSTALL_PREFIX ($INSTALL_PREFIX). Set HOST_CLANG/HOST_CLANGXX to a clean system compiler."
+end
+set -gx PATH (dirname "$HOST_LD_LLD") (dirname "$HOST_CLANG") $PATH
+log "Host bootstrap C compiler: $HOST_CLANG"
+log "Host bootstrap C++ compiler: $HOST_CLANGXX"
+log "Host lld linker: $HOST_LD_LLD"
+
+set -l _host_probe_dir "$BUILD_ROOT/host-probe"
+set -l _host_probe_log "$SCRIPT_DIR/host-probe.log"
+rm -rf "$_host_probe_dir"
+mkdir -p "$_host_probe_dir"
+set -l _host_lld_dir (dirname "$HOST_LD_LLD")
+: > "$_host_probe_log"
+printf '%s\n' 'int main(void) { return 0; }' > "$_host_probe_dir/probe.c"
+printf '%s\n' '#include <type_traits>' 'int main() { static_assert(std::is_same_v<int,int>); return 0; }' > "$_host_probe_dir/probe.cpp"
+{
+    echo "HOST_CLANG=$HOST_CLANG"
+    "$HOST_CLANG" --version
+    echo "HOST_CLANGXX=$HOST_CLANGXX"
+    "$HOST_CLANGXX" --version
+    echo "HOST_LD_LLD=$HOST_LD_LLD"
+    "$HOST_LD_LLD" --version
+    echo "COMMON_FLAGS_LIST:" $COMMON_FLAGS_LIST
+    if set -q LD_PRELOAD
+        echo "LD_PRELOAD=$LD_PRELOAD"
+    else
+        echo "LD_PRELOAD=<unset>"
+    end
+    echo "--- C probe ---"
+    echo "$HOST_CLANG" $COMMON_FLAGS_LIST -fuse-ld=lld -B"$_host_lld_dir" "$_host_probe_dir/probe.c" -o "$_host_probe_dir/probe-c"
+} >>"$_host_probe_log" 2>&1
+"$HOST_CLANG" $COMMON_FLAGS_LIST -fuse-ld=lld -B"$_host_lld_dir" "$_host_probe_dir/probe.c" -o "$_host_probe_dir/probe-c" >>"$_host_probe_log" 2>&1
+set -l _probe_c_status $status
+{
+    echo "--- C++ probe ---"
+    echo "$HOST_CLANGXX" $COMMON_FLAGS_LIST -fuse-ld=lld -B"$_host_lld_dir" "$_host_probe_dir/probe.cpp" -o "$_host_probe_dir/probe-cxx"
+} >>"$_host_probe_log" 2>&1
+"$HOST_CLANGXX" $COMMON_FLAGS_LIST -fuse-ld=lld -B"$_host_lld_dir" "$_host_probe_dir/probe.cpp" -o "$_host_probe_dir/probe-cxx" >>"$_host_probe_log" 2>&1
+set -l _probe_cxx_status $status
+if test $_probe_c_status -ne 0; or test $_probe_cxx_status -ne 0
+    log "--- host compiler probe failed; full command log: $_host_probe_log ---"
+    cat "$_host_probe_log" >&2
+    die "host compiler cannot compile/link with COMMON_FLAGS_LIST and lld"
+end
+rm -rf "$_host_probe_dir"
+
+set -g CMAKE_POLICY_ARGS
+if cmake --help-policy CMP0219 >/dev/null 2>&1
+    set -g CMAKE_POLICY_ARGS -DCMAKE_POLICY_DEFAULT_CMP0219=NEW
+end
+
 # Pre-flight tools
-for t in git cmake ninja clang clang++ ld.lld llvm-profdata llvm-readelf patch find
+for t in git cmake ninja patch find llvm-readelf
     command -q $t; or die "missing required tool: $t"
 end
+command -q llvm-profdata; or log "WARNING: host llvm-profdata not found; stage1 will build and use its own."
 
 set -g LLVM_BINUTILS_INCDIR ""
 set -g GOLD_PLUGIN_API_DIR (find_gold_plugin_api_dir)
@@ -141,7 +313,7 @@ mv "$LLVM_SRC_TMP.partial" "$LLVM_SRC_TMP" || die "Failed to atomically install 
 set -g LLVM_SRC "$LLVM_SRC_TMP"
 
 # Patch handling - Include upstream version check ordering patch if present
-set -g PATCHES 01-corecount.patch 02-fixes.patch 04-polly.patch 05-raptorlake.patch 06-x86isellowcpp.patch 03-optimizations.patch 07-instrprof-reader-version-check.patch
+set -g PATCHES 01-corecount.patch 02-fixes.patch 04-polly.patch 05-raptorlake.patch 06-x86isellowcpp.patch 03-optimizations.patch
 set -g STAMP "$LLVM_SRC/.ms178-patches-applied"
 
 function find_patch --argument-names name
@@ -174,11 +346,7 @@ if not test -f "$STAMP"
             log "  + $p OK"
             rm -f "$dry_log"
         else
-            if test "$p" = "07-instrprof-reader-version-check.patch"
-                log "  * Optional upstream patch $p not found in patch dir, skipping."
-            else
-                die "patch file missing: $p"
-            end
+            die "patch file missing: $p"
         end
     end
 
@@ -212,12 +380,20 @@ end
 function configure_clean
     set -l bdir $argv[1]
     set -e argv[1]
+    set -l cmake_log "$bdir/configure.log"
     run mkdir -p "$bdir"
+    set -l cmake_args $CMAKE_POLICY_ARGS $argv
     if test -n "$CMAKE_FRESH"
-        run cmake $CMAKE_FRESH -G Ninja -B "$bdir" $argv
+        cmake $CMAKE_FRESH -G Ninja -B "$bdir" $cmake_args 2>&1 | tee "$cmake_log"
     else
         rm -rf "$bdir/CMakeCache.txt" "$bdir/CMakeFiles"
-        run cmake -G Ninja -B "$bdir" $argv
+        cmake -G Ninja -B "$bdir" $cmake_args 2>&1 | tee "$cmake_log"
+    end
+    set -l cmake_status $pipestatus[1]
+    if test $cmake_status -ne 0
+        log "--- CMake configure failed for $bdir; last 160 lines of $cmake_log ---"
+        tail -n 160 "$cmake_log" >&2
+        die "cmake configure failed for $bdir (full log: $cmake_log)"
     end
 end
 
@@ -244,7 +420,7 @@ configure_clean "$BUILD_ROOT/stage1" -S "$LLVM_SRC/llvm" \
     -DLLVM_INCLUDE_EXAMPLES=OFF \
     -DLLVM_ENABLE_BINDINGS=$LLVM_ENABLE_BINDINGS \
     $GOLD_CMAKE_ARGS \
-    -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+    -DCMAKE_C_COMPILER="$HOST_CLANG" -DCMAKE_CXX_COMPILER="$HOST_CLANGXX" \
     -DCMAKE_C_FLAGS="$COMMON_FLAGS" \
     -DCMAKE_CXX_FLAGS="$COMMON_FLAGS"
 
@@ -301,9 +477,9 @@ for f in $TRAIN_FILES
     if test -f "$f"
         set -l ext (path extension -- $f)
         if test "$ext" = ".cpp"; or test "$ext" = ".cc"; or test "$ext" = ".cxx"
-            "$INSTR_CLANGXX" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -std=c++17 -c "$f" -o /dev/null 2>/dev/null
+            "$INSTR_CLANGXX" $COMMON_FLAGS_LIST -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -std=c++17 -c "$f" -o /dev/null 2>/dev/null
         else if test "$ext" = ".c"
-            "$INSTR_CLANG" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$f" -o /dev/null 2>/dev/null
+            "$INSTR_CLANG" $COMMON_FLAGS_LIST -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$f" -o /dev/null 2>/dev/null
         end
     end
 end
@@ -343,9 +519,9 @@ if test "$DO_CSPGO" = "1"
         if test -f "$f"
             set -l ext (path extension -- $f)
             if test "$ext" = ".cpp"; or test "$ext" = ".cc"; or test "$ext" = ".cxx"
-                "$csd/bin/clang++" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -std=c++17 -c "$f" -o /dev/null 2>/dev/null
+                "$csd/bin/clang++" $COMMON_FLAGS_LIST -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -std=c++17 -c "$f" -o /dev/null 2>/dev/null
             else if test "$ext" = ".c"
-                "$csd/bin/clang" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$f" -o /dev/null 2>/dev/null
+                "$csd/bin/clang" $COMMON_FLAGS_LIST -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$f" -o /dev/null 2>/dev/null
             end
         end
     end
@@ -420,9 +596,9 @@ function is_already_bolted --argument-names BinPath
 end
 
 function bolt_train_clang --argument-names Bin
-    "$Bin" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -std=c++17 -c "$LLVM_SRC/llvm/lib/Support/APFloat.cpp" -o /dev/null 2>/dev/null
-    "$Bin" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -std=c++17 -c "$LLVM_SRC/llvm/lib/CodeGen/SelectionDAG/SelectionDAG.cpp" -o /dev/null 2>/dev/null
-    "$Bin" $COMMON_FLAGS -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$LLVM_SRC/llvm/lib/Support/regcomp.c" -o /dev/null 2>/dev/null
+    "$Bin" $COMMON_FLAGS_LIST -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -I "$LLVM_SRC/clang/include" -std=c++17 -c "$LLVM_SRC/llvm/lib/Support/APFloat.cpp" -o /dev/null 2>/dev/null
+    "$Bin" $COMMON_FLAGS_LIST -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -std=c++17 -c "$LLVM_SRC/llvm/lib/CodeGen/SelectionDAG/SelectionDAG.cpp" -o /dev/null 2>/dev/null
+    "$Bin" $COMMON_FLAGS_LIST -fno-lto -fuse-ld=lld -I "$LLVM_SRC/llvm/include" -std=gnu17 -c "$LLVM_SRC/llvm/lib/Support/regcomp.c" -o /dev/null 2>/dev/null
     return 0
 end
 
