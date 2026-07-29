@@ -1,169 +1,69 @@
-From: ms178
-Subject: [PATCH v3] glibc 2.44 (7cba7779) - Raptor Lake gaming tuning
+From 9ae0431ffb7f82bcc8128325b0e3f412902c06f8 Mon Sep 17 00:00:00 2001
+From: ms178 GLIBC audit <noreply@example.invalid>
+Date: Wed, 29 Jul 2026 09:14:24 +0000
+Subject: [PATCH] glibc: empirical Raptor tuning with pow identity fast path
 
-Rebased and audited against glibc commit
-7cba77790f3279bec3ac20e9c7632b021cd53f95 (2.44).
-Tuned for Intel Core i7-14700KF (Raptor Cove P-cores: 48 KiB L1d,
-2 MiB L2/core, 33 MiB L3, ERMS + FSRM, no AVX-512).
+Keep the audited v7 Raptor, allocator, math, Zstd, Clang, configure, and
+child-reaping fixes. Add an exact early pow(1,y) path which preserves
+signaling-NaN behavior.
 
-=====================================================================
-METHODOLOGY -- and a correction to v2
-=====================================================================
+Empirical Old-GCC/Raptor-code testing rejects the former broad pthread
+hot/cold annotations, allocator prefetches, malloc/free hot attributes, and
+extra tcache bounds/load rewrites. Retain the v7 allocator defaults after
+compile-time sweeps showed severe page-fault and medium-allocation regressions
+with upstream defaults.
+---
+ Makerules                                  |   3 +
+ benchtests/Makefile                        |   1 +
+ bits/floatn-common.h                       |  36 ++---
+ locale/programs/charmap-dir.c              | 104 ++++++++++++-
+ localedata/Makefile                        |  20 ++-
+ malloc/malloc.c                            |  53 ++++---
+ math/math.h                                |   8 +-
+ misc/sys/cdefs.h                           |  10 +-
+ sysdeps/ieee754/dbl-64/e_pow.c             |   2 +
+ sysdeps/ieee754/flt-32/e_atan2f.c          | 169 ++++++++++++---------
+ sysdeps/ieee754/flt-32/e_powf.c            |   2 +
+ sysdeps/ieee754/flt-32/s_sincosf.c         |  56 ++++---
+ sysdeps/ieee754/flt-32/s_tanf.c            |  63 ++++----
+ sysdeps/ieee754/ldbl-128/bits/floatn.h     |   6 +-
+ sysdeps/x86/bits/floatn.h                  |   2 +-
+ sysdeps/x86/configure                      |   8 +-
+ sysdeps/x86/configure.ac                   |   6 +-
+ sysdeps/x86/dl-cacheinfo.h                 |  50 +++++-
+ sysdeps/x86/dl-tunables.list               |  11 ++
+ sysdeps/x86_64/fpu/math-use-builtins-fma.h |  43 ++++++
+ sysdeps/x86_64/fpu/multiarch/s_fma.c       |  34 +++--
+ sysdeps/x86_64/fpu/multiarch/s_fmaf.c      |  21 ++-
+ 22 files changed, 494 insertions(+), 214 deletions(-)
+ create mode 100644 sysdeps/x86_64/fpu/math-use-builtins-fma.h
 
-v2 tuned against callgrind instruction counts.  That was wrong for the
-string/memory routines, and this version corrects it.  Two reasons:
-
-  1. REP MOVSB/STOSB are microcoded.  One instruction moves many bytes,
-     so Ir massively understates their cost.  A change that cut the
-     stream phase from 2.64 G to 282 M Ir (-89%) produced exactly zero
-     wall-clock improvement when measured.
-
-  2. Warm-cache microbenchmarks mislead.  Every memory-path candidate
-     was re-measured with COLD buffers (64 MiB working set, random
-     64-byte-aligned offsets), which is how a game actually touches
-     streaming data.  Two changes that looked like clear wins warm were
-     regressions cold, and were dropped:
-       - capping ERMS at 2/3*L1d:      -10.5% on cold 128 KiB memcpy
-       - raising rep_stosb_threshold:  -29.2% on cold 16 KiB memset
-     REP MOVSB/STOSB have better hardware-prefetch behaviour on cold
-     data; the vector loops only win when the data is already resident.
-
-Tooling: callgrind (call graph + Ir), cachegrind with Raptor Cove
-geometry (--D1=49152,12,64 --L2=2097152,16,64), memcheck, strace -c
-for deterministic syscall counts, objdump for schedule inspection, and
-interleaved A/B wall clock with median-of-N.  The box has no PMU and a
-74% wall-clock noise floor, so each claim below states which tool proved it.
-
-=====================================================================
-WIN 1 -- non-temporal threshold derived from L2, not L3
-=====================================================================
-sysdeps/x86/dl-cacheinfo.h
-
-Upstream derives x86_non_temporal_threshold from the SHARED L3
-(shared / 2 on Raptor Lake), putting the crossover near 16.5 MiB, so
-ordinary cacheable stores are used for essentially every real copy.
-A memcpy touches src+dst, so the working set is 2x the size and NT
-stores win as soon as that exceeds the PRIVATE L2.
-
-Now capped at 3/4 * L2.  Cold-buffer memcpy, median of 5:
-
-    size      upstream    ms178     delta
-    128 KiB     8.00       7.78      -2.7%
-    512 KiB     7.67       7.90      +3.0%
-      1 MiB     7.80      13.38     +71.5%
-      2 MiB     8.13      13.86     +70.5%
-      4 MiB     7.83      13.41     +71.3%
-      8 MiB     8.05      13.50     +67.7%
-
-memset is deliberately NOT changed: measured separately, cacheable
-stores beat NT for memset at every size (up to 2.47x at 256 KiB), and
-memset has its own independent threshold which is left at upstream.
-
-=====================================================================
-WIN 2 -- DEFAULT_MMAP_THRESHOLD 128 KiB -> 1 MiB
-=====================================================================
-malloc/malloc.c
-
-The threshold is adaptive, but it only grows when an mmapped chunk is
-FREED.  Until then every allocation above it pays mmap + first-touch
-page faults + munmap, and munmap returns the pages so the next
-allocation of the same size faults them all in again.
-
-alloc + touch-every-page + free, ns/cycle, median of 5:
-
-    size      upstream        ms178       speedup
-    128 KiB   35,412.16      106.34       333.0x
-    256 KiB   62,401.39   35,475.73         1.76x
-    512 KiB  122,488.48   91,891.68         1.33x
-
-Only the STARTING value changes: no_dyn_threshold stays 0 so the
-existing adaptation still applies.  Setting the tunable instead would
-set no_dyn_threshold=1 and DISABLE adaptation -- measured
-catastrophically worse on a varied-size workload (126,784 vs 565
-ns/cycle).
-
-=====================================================================
-WIN 3 -- trim_threshold 128 KiB -> 8 MiB, top_pad 0 -> 8 MiB
-=====================================================================
-malloc/malloc.c
-
-Returning memory to the kernel that the next frame immediately asks
-for again is pure overhead, and the refault storm is a classic
-frame-time spike source.  Deterministic syscall counts (strace -c,
-brk+mmap+munmap+madvise):
-
-    phase      upstream   ms178   reduction
-    churn         268       42      -84%
-    teardown    1,618      102      -94%
-    xthread       779       44      -94%
-
-Peak RSS went DOWN (2872 -> 2816 KiB on churn), so this is not a
-memory-for-speed trade.
-
-=====================================================================
-WIN 4 -- TCACHE_FILL_COUNT 16 -> 32
-=====================================================================
-malloc/malloc.c
-
-v2 set this to 256 based on instruction counts.  Wall clock shows that
-was wrong: a large tcache badly hurts the cross-thread free pattern a
-job system produces.  Median of 11 interleaved runs:
-
-    count   churn(ms)  teardown(ms)  xthread(ms)
-      16      10.20       26.74        119.76
-      32       9.87       27.38        131.59
-      64       9.76       27.03        156.95
-     128       9.71       26.32        207.06
-     256       9.96       26.87        237.97
-
-32 keeps most of the small-alloc gain (churn -3.2%) while limiting the
-cross-thread penalty to ~10%.  Worst-case retention 34,304 * 32 =
-1.05 MiB/thread; num_slots[] is uint16_t with MAX_TCACHE_COUNT ==
-UINT16_MAX enforced.  tcache_max is deliberately NOT raised (measured
-+15.7% regression on teardown).
-
-=====================================================================
-WIN 5 -- new tunable: glibc.cpu.x86_rep_movsb_stop_threshold
-=====================================================================
-sysdeps/x86/dl-tunables.list, sysdeps/x86/dl-cacheinfo.h
-
-Upstream hardwires the ERMS upper bound to non_temporal_threshold with
-no way to set it independently.  Since WIN 1 now moves
-non_temporal_threshold, the two bounds must be separable or lowering
-one silently drags the other.  This exposes the bound as a first-class
-tunable (default unchanged: still non_temporal_threshold).
-
-This is what made WIN 1 safe to ship, and it lets the ERMS range be
-retuned per title without a rebuild.  The forced 2/3*L1d default that
-v2 would have shipped was measured (-10.5% cold) and deliberately NOT
-applied -- only the mechanism is added.
-
-=====================================================================
-CORRECTNESS FIXES (carried from v1/v2)
-=====================================================================
- * malloc: large_csize2tidx() left UNCLAMPED.  The old clamp broke
-   do_set_tcache_max(), flipping tcache_max=4 MiB from rejected to
-   accepted and aliasing many size classes onto the last bin.
- * malloc: bounds enforced at the five allocation call sites via
-   tcache_idx_valid(), including the __libc_free() large path which
-   read num_slots[tc_idx] before any upper-bound check (OOB read).
- * malloc: prefetch/free hunks re-anchored to the 2.44
-   _int_free_chunk() structure.
- * inet/Makefile, support/Makefile: -fno-strict-aliasing re-anchored.
- * 7 of the 11 original patches no longer applied to 2.44; all
-   consolidated here.
-
-=====================================================================
-VERIFICATION
-=====================================================================
-   malloc   311 PASS   0 FAIL        nptl   403 PASS   0 FAIL
-   math    1942 PASS   0 FAIL        string 109 PASS   0 FAIL
-   stdlib   147 PASS   0 FAIL        TOTAL 2912 PASS   0 FAIL
-
-   valgrind memcheck on the gaming workload: 0 errors, 0 leaks.
-   Allocator stress test passes, including at tcache_count=65535.
-   Built and tested with your GCC 16.1.1 under your glibc 2.43 loader.
-
+diff --git a/Makerules b/Makerules
+index 6bef57ec..a6fabea3 100644
+--- a/Makerules
++++ b/Makerules
+@@ -1374,6 +1374,9 @@ echo-headers:
+ %.bz2: %; bzip2 -9vk $<
+ %.gz: %; gzip -9vnc $< > $@.new && mv -f $@.new $@
+ %.xz: %; xz -9evk $<
++# Keep the source like the bz2/xz rules above (no --rm), and publish
++# atomically like the gzip rule.  Use the requested maximum-ratio settings.
++%.zst: %; rm -f $@.new; zstd -q --no-progress -T0 --ultra -22 -f -o $@.new $< && mv -f $@.new $@
+ 
+ # Common cleaning targets.
+ 
+diff --git a/benchtests/Makefile b/benchtests/Makefile
+index f407e492..16cc951d 100644
+--- a/benchtests/Makefile
++++ b/benchtests/Makefile
+@@ -622,6 +622,7 @@ $(bench-link-targets): %: %.o $(objpfx)json-lib.o \
+ $(bench-link-targets): LDFLAGS += $(link-bench-bind-now)
+ 
+ $(objpfx)bench-%.c: %-inputs $(bench-deps)
++	$(make-target-directory)
+ 	{ if [ -n "$($*-INCLUDE)" ]; then \
+ 	  cat $($*-INCLUDE); \
+ 	fi; \
 diff --git a/bits/floatn-common.h b/bits/floatn-common.h
 index 4c790948..cefd5022 100644
 --- a/bits/floatn-common.h
@@ -302,122 +202,240 @@ index 4c790948..cefd5022 100644
  #   define __builtin_huge_valf128x() ((_Float128x) __builtin_huge_val ())
  #   define __builtin_inff128x() ((_Float128x) __builtin_inf ())
  #   define __builtin_nanf128x(x) ((_Float128x) __builtin_nan (x))
-diff --git a/csu/Makefile b/csu/Makefile
-index 2afb70b6..1e2efd36 100644
---- a/csu/Makefile
-+++ b/csu/Makefile
-@@ -166,7 +166,7 @@ endif
- asm-CPPFLAGS += -I$(objpfx).
+diff --git a/locale/programs/charmap-dir.c b/locale/programs/charmap-dir.c
+index fdf60a45..957f7b85 100644
+--- a/locale/programs/charmap-dir.c
++++ b/locale/programs/charmap-dir.c
+@@ -24,6 +24,7 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <sys/stat.h>
++#include <sys/wait.h>
  
- # Enable unwinding so backtrace unwinds to __libc_start_main
--CFLAGS-libc-start.c += -funwind-tables
-+CFLAGS-libc-start.c += -funwind-tables -fno-strict-aliasing
+ #include "localedef.h"
+ #include "charmap-dir.h"
+@@ -131,8 +132,12 @@ charmap_readdir (CHARMAP_DIR *cdir)
+         continue;
  
- include ../Rules
+       /* For compressed charmaps, the canonical charmap name does not
+-         include the extension.  */
+-      if (len > 3 && memcmp (&filename[len - 3], ".gz", 3) == 0)
++         include the extension.  Order the checks from most-likely to
++         least-likely (zstd is the new default installed format) so the
++         common case takes a single 4-byte compare and short-circuits.  */
++      if (len > 4 && memcmp (&filename[len - 4], ".zst", 4) == 0)
++        filename[len - 4] = '\0';
++      else if (len > 3 && memcmp (&filename[len - 3], ".gz", 3) == 0)
+         filename[len - 3] = '\0';
+       else if (len > 4 && memcmp (&filename[len - 4], ".bz2", 4) == 0)
+         filename[len - 4] = '\0';
+@@ -154,8 +159,73 @@ charmap_closedir (CHARMAP_DIR *cdir)
+   return closedir (dir);
+ }
  
-diff --git a/debug/Makefile b/debug/Makefile
-index c6c1069b..57752555 100644
---- a/debug/Makefile
-+++ b/debug/Makefile
-@@ -170,6 +170,7 @@ CFLAGS-pread_chk.c += -fexceptions -fasynchronous-unwind-tables
- CFLAGS-pread64_chk.c += -fexceptions -fasynchronous-unwind-tables
- CFLAGS-recv_chk.c += -fexceptions -fasynchronous-unwind-tables
- CFLAGS-recvfrom_chk.c += -fexceptions -fasynchronous-unwind-tables
-+CFLAGS-longjmp_chk.c += -fno-strict-aliasing
- 
- # Need to make sure the settings here override what configure might have
- # set up for us, so keep the CFLAGS/CPPFLAGS split logical as the order is:
-diff --git a/inet/Makefile b/inet/Makefile
-index e8dfac1b..948d0f42 100644
---- a/inet/Makefile
-+++ b/inet/Makefile
-@@ -128,6 +128,20 @@ CFLAGS-either_hton.c += -fexceptions
- CFLAGS-tst-checks-posix.c += -std=c99
- CFLAGS-tst-sockaddr.c += -fno-strict-aliasing
- 
-+CFLAGS-gethstbyad_r.c += -fno-strict-aliasing
-+CFLAGS-gethstbynm.c += -fno-strict-aliasing
-+CFLAGS-gethstbynm2.c += -fno-strict-aliasing
-+CFLAGS-gethstbynm2_r.c += -fno-strict-aliasing
-+CFLAGS-gethstbynm_r.c += -fno-strict-aliasing
-+CFLAGS-getnetbyad_r.c += -fno-strict-aliasing
-+CFLAGS-getnetbynm_r.c += -fno-strict-aliasing
-+CFLAGS-rcmd.c += -fno-strict-aliasing
-+CFLAGS-rexec.c += -fno-strict-aliasing
-+CFLAGS-ifaddrs.c += -fno-strict-aliasing
-+CFLAGS-check_pf.c += -fno-strict-aliasing
-+CFLAGS-check_native.c += -fno-strict-aliasing
-+CFLAGS-netlink_assert_response.c += -fno-strict-aliasing
++struct decompressor_cookie
++{
++  int fd;
++  pid_t pid;
++};
 +
++static ssize_t
++decompressor_read (void *cookie, char *buffer, size_t length)
++{
++  struct decompressor_cookie *state = cookie;
++  ssize_t result;
++  do
++    result = read (state->fd, buffer, length);
++  while (result < 0 && errno == EINTR);
++  return result;
++}
++
++static int
++wait_for_decompressor (pid_t pid)
++{
++  int status;
++  pid_t result;
++  do
++    result = waitpid (pid, &status, 0);
++  while (result < 0 && errno == EINTR);
++
++  if (result < 0)
++    return -1;
++  if (!WIFEXITED (status) || WEXITSTATUS (status) != 0)
++    {
++      errno = EIO;
++      return -1;
++    }
++  return 0;
++}
++
++static int
++decompressor_close (void *cookie)
++{
++  struct decompressor_cookie *state = cookie;
++  int saved_errno = 0;
++
++  if (close (state->fd) < 0)
++    saved_errno = errno;
++  if (wait_for_decompressor (state->pid) < 0 && saved_errno == 0)
++    saved_errno = errno;
++  free (state);
++
++  if (saved_errno != 0)
++    {
++      errno = saved_errno;
++      return -1;
++    }
++  return 0;
++}
++
++static const cookie_io_functions_t decompressor_io =
++  {
++    .read = decompressor_read,
++    .write = NULL,
++    .seek = NULL,
++    .close = decompressor_close
++  };
++
+ /* Creates a subprocess decompressing the given pathname, and returns
+-   a stream reading its output (the decompressed data).  */
++   a stream reading its output (the decompressed data).  The cookie close
++   callback reaps the child, avoiding one zombie per compressed charmap.  */
+ static
+ FILE *
+ fopen_uncompressed (const char *pathname, const char *compressor)
+@@ -175,9 +245,12 @@ fopen_uncompressed (const char *pathname, const char *compressor)
+           char *argv[4]
+ 	    = { (char *) compressor, (char *) "-d", (char *) "-c", NULL };
+           posix_spawn_file_actions_t actions;
++          struct decompressor_cookie *cookie = malloc (sizeof (*cookie));
+ 
+-          if (posix_spawn_file_actions_init (&actions) == 0)
++          if (cookie != NULL
++              && posix_spawn_file_actions_init (&actions) == 0)
+             {
++              cookie->fd = fd[0];
+               if (posix_spawn_file_actions_adddup2 (&actions,
+                                                     fd[1], STDOUT_FILENO) == 0
+                   && posix_spawn_file_actions_addclose (&actions, fd[1]) == 0
+@@ -185,16 +258,26 @@ fopen_uncompressed (const char *pathname, const char *compressor)
+                   && posix_spawn_file_actions_adddup2 (&actions,
+                                                        pfd, STDIN_FILENO) == 0
+                   && posix_spawn_file_actions_addclose (&actions, pfd) == 0
+-                  && posix_spawnp (NULL, compressor, &actions, NULL,
++                  && posix_spawnp (&cookie->pid, compressor, &actions, NULL,
+                                    argv, environ) == 0)
+                 {
+                   posix_spawn_file_actions_destroy (&actions);
+                   close (fd[1]);
+                   close (pfd);
+-                  return fdopen (fd[0], "r");
++                  FILE *stream = fopencookie (cookie, "r", decompressor_io);
++                  if (stream != NULL)
++                    return stream;
++
++                  int saved_errno = errno;
++                  close (fd[0]);
++                  wait_for_decompressor (cookie->pid);
++                  free (cookie);
++                  errno = saved_errno;
++                  return NULL;
+                 }
+               posix_spawn_file_actions_destroy (&actions);
+             }
++          free (cookie);
+           close (fd[1]);
+           close (fd[0]);
+         }
+@@ -224,6 +307,15 @@ charmap_open (const char *directory, const char *name)
+   if (stream != NULL)
+     return stream;
+ 
++  /* Try compressed variants in fastest-decompressor-first order so the
++     common case (zstd, the new default install format) wins after one
++     failed open() of the uncompressed file.  Each memcpy includes the
++     terminating NUL so PATHNAME stays a valid C string for fopen.  */
++  memcpy (p, ".zst", 5);
++  stream = fopen_uncompressed (pathname, "zstd");
++  if (stream != NULL)
++    return stream;
++
+   memcpy (p, ".gz", 4);
+   stream = fopen_uncompressed (pathname, "gzip");
+   if (stream != NULL)
+diff --git a/localedata/Makefile b/localedata/Makefile
+index 0fb1d78c..57dd3333 100644
+--- a/localedata/Makefile
++++ b/localedata/Makefile
+@@ -277,13 +277,15 @@ tests-container = \
+ # Files to install.
+ ifeq ($(INSTALL_UNCOMPRESSED),yes)
+ # This option is for testing inside the testroot container, as the
+-# container does not include a working gunzip program.
++# container does not include working decompressor programs.
+ install-others := $(addprefix $(inst_i18ndir)/, \
+ 			      $(charmaps) \
+ 			      $(locales))
+ else
++# Zstandard reduces installed size and decompression time.  Compression uses
++# the requested maximum-ratio, all-hardware-thread settings.
+ install-others := $(addprefix $(inst_i18ndir)/, \
+-			      $(addsuffix .gz, $(charmaps)) \
++			      $(addsuffix .zst, $(charmaps)) \
+ 			      $(locales))
  endif
  
- # Install the rpc database file.
-diff --git a/libio/Makefile b/libio/Makefile
-index 616107ee..d7bffaec 100644
---- a/libio/Makefile
-+++ b/libio/Makefile
-@@ -255,6 +255,18 @@ CFLAGS-iofopen.c += -fexceptions
- CFLAGS-iofopen64.c += -fexceptions
- CFLAGS-oldtmpfile.c += -fexceptions
- # XXX Do we need filedoalloc and wfiledoalloc?  Others?
-+CFLAGS-iofopncook.c += -fno-strict-aliasing
-+CFLAGS-iopopen.c += -fno-strict-aliasing
-+CFLAGS-vswprintf.c += -fno-strict-aliasing
-+CFLAGS-wmemstream.c += -fno-strict-aliasing
-+CFLAGS-memstream.c += -fno-strict-aliasing
-+CFLAGS-obprintf.c += -fno-strict-aliasing
-+CFLAGS-stdfiles.c += -fno-strict-aliasing
-+CFLAGS-stdio.c += -fno-strict-aliasing
-+CFLAGS-oldiofopen.c += -fno-strict-aliasing
-+CFLAGS-oldiofdopen.c += -fno-strict-aliasing
-+CFLAGS-oldiopopen.c += -fno-strict-aliasing
-+CFLAGS-oldstdfiles.c += -fno-strict-aliasing
+@@ -432,12 +434,16 @@ $(inst_i18ndir)/charmaps/%: charmaps/% $(+force)
+ 	rm -f $@
+ 	$(INSTALL_DATA) $< $@
+ else
+-# Install the charmap files in gzipped format.
+-$(inst_i18ndir)/charmaps/%.gz: charmaps/% $(+force)
++# Install charmaps in Zstandard format.  Keep an installed-mode temporary
++# input so permissions match the former gzip path.  Compress to .new and
++# rename only after success; interrupted installs never expose a partial file.
++$(inst_i18ndir)/charmaps/%.zst: charmaps/% $(+force)
+ 	$(make-target-directory)
+-	rm -f $(@:.gz=) $@
+-	$(INSTALL_DATA) $< $(@:.gz=)
+-	gzip -9n $(@:.gz=)
++	rm -f $(@:.zst=) $@ $@.new
++	$(INSTALL_DATA) $< $(@:.zst=)
++	zstd -q --no-progress -T0 --ultra -22 -f -o $@.new $(@:.zst=)
++	mv -f $@.new $@
++	rm -f $(@:.zst=)
+ endif
  
- # Prevent fortification as these are built with -O0
- CFLAGS-tst-bz24051.c += $(no-fortify-source)
-diff --git a/libio/libioP.h b/libio/libioP.h
-index 78e8ee68..db86bf19 100644
---- a/libio/libioP.h
-+++ b/libio/libioP.h
-@@ -957,8 +957,8 @@ extern struct _IO_FILE_plus _IO_stderr_;
- static inline bool
- _IO_legacy_file (FILE *fp)
- {
--  return fp == (FILE *) &_IO_stdin_ || fp == (FILE *) &_IO_stdout_
--    || fp == (FILE *) &_IO_stderr_;
-+  return (void*)fp == &_IO_stdin_ || (void*)fp == &_IO_stdout_
-+    || (void*)fp == &_IO_stderr_;
- }
- #endif
- 
-@@ -968,8 +968,8 @@ static inline void
- _IO_deallocate_file (FILE *fp)
- {
-   /* The current stream variables.  */
--  if (fp == (FILE *) &_IO_2_1_stdin_ || fp == (FILE *) &_IO_2_1_stdout_
--      || fp == (FILE *) &_IO_2_1_stderr_)
-+  if ((void*)fp == &_IO_2_1_stdin_ || (void*)fp == &_IO_2_1_stdout_
-+      || (void*)fp == &_IO_2_1_stderr_)
-     return;
- #if SHLIB_COMPAT (libc, GLIBC_2_0, GLIBC_2_1)
-   if (_IO_legacy_file (fp))
-diff --git a/locale/Makefile b/locale/Makefile
-index 25f9b5bb..84227891 100644
---- a/locale/Makefile
-+++ b/locale/Makefile
-@@ -183,6 +183,7 @@ CPPFLAGS-locale-programs = -DLOCALE_PATH='$(localepath)' \
- CFLAGS-charmap.c += -Wno-write-strings -Wno-char-subscripts
- CFLAGS-locfile.c += -Wno-write-strings -Wno-char-subscripts
- CFLAGS-charmap-dir.c += -Wno-write-strings
-+CFLAGS-C-ctype.c += -fno-strict-aliasing
- 
- # Set libof-* for each routine.
- cpp-srcs-left := $(localedef-modules) $(localedef-aux) $(locale-modules) \
+ # Install the locale source files in the appropriate directory.
 diff --git a/malloc/malloc.c b/malloc/malloc.c
-index 8fe8b183..4ff1a518 100644
+index 8fe8b183..f4679cf6 100644
 --- a/malloc/malloc.c
 +++ b/malloc/malloc.c
-@@ -305,8 +305,41 @@ verify (PTRDIFF_MAX <= SIZE_MAX / 2);
+@@ -55,8 +55,8 @@
+     allocator, that maintains pools of quickly recycled chunks.
+   * In between, and for combinations of large and small requests, it does
+     the best it can trying to meet both goals at once.
+-  * For very large requests (>= 128KB by default), it relies on system
+-    memory mapping facilities, if supported.
++  * For very large requests (>= 1 MiB initially in this tuned build), it
++    relies on system memory mapping facilities, if supported.
+ 
+   For a longer but slightly out of date high-level description, see
+      http://gee.cs.oswego.edu/dl/html/malloc.html
+@@ -190,9 +190,9 @@
+ 
+     Tuning options that are also dynamically changeable via mallopt:
+ 
+-    DEFAULT_TRIM_THRESHOLD     128 * 1024
+-    DEFAULT_TOP_PAD            0
+-    DEFAULT_MMAP_THRESHOLD     128 * 1024
++    DEFAULT_TRIM_THRESHOLD     8 * 1024 * 1024
++    DEFAULT_TOP_PAD            8 * 1024 * 1024
++    DEFAULT_MMAP_THRESHOLD     1024 * 1024
+     DEFAULT_MMAP_MAX           65536
+ 
+     There are several other #defined constants and macros that you
+@@ -305,8 +305,13 @@ verify (PTRDIFF_MAX <= SIZE_MAX / 2);
     etc.  */
  
  /* This is another arbitrary limit, which tunables can change.  Each
@@ -425,266 +443,88 @@ index 8fe8b183..4ff1a518 100644
 -# define TCACHE_FILL_COUNT 16
 +   tcache bin will hold at most this number of chunks.
 +
-+   ms178: raised from the upstream 16 to 32.
-+
-+   A larger per-thread cache keeps freed chunks out of the arena, avoiding
-+   the lock + unsorted-bin + consolidation path.  But it is NOT free: on a
-+   cross-thread producer/consumer pattern (job system frees what another
-+   thread allocated) a big tcache holds chunks the freeing thread cannot
-+   reuse, so they must still round-trip through the arena while the cache
-+   itself grows the working set.
-+
-+   Instruction counts alone are misleading here -- they favour ever-larger
-+   values -- so this was chosen on wall clock (median of 11 interleaved
-+   runs per point):
-+
-+     count   churn(ms)   teardown(ms)   xthread(ms)
-+       16      10.20        26.74         119.76
-+       32       9.87        27.38         131.59
-+       64       9.76        27.03         156.95
-+      128       9.71        26.32         207.06
-+      256       9.96        26.87         237.97
-+
-+   32 captures most of the small-alloc gain (churn -3.2%) while limiting
-+   the cross-thread penalty to ~10%; 64 and above degrade xthread sharply
-+   (+31% and worse) for no further churn benefit.
-+
-+   Bound: worst-case small-bin retention is
-+   sum(tidx2csize(0..63)) * count = 34,304 * 32 = 1.05 MiB per thread.
-+   num_slots[] is uint16_t and do_set_tcache_count() enforces
-+   MAX_TCACHE_COUNT == UINT16_MAX, so this is well inside the safe range.
-+
-+   NOTE: deliberately NOT raising tcache_max.  Measured: raising it
-+   1040 -> 4096 regressed teardown by 15.7% because large chunks displace
-+   the hot small-size classes.  */
++   The gaming-tuned default of 32 reduces arena lock/bin traffic for
++   same-thread small-allocation churn while keeping worst-case retention near
++   1 MiB per thread.  Workloads dominated by cross-thread frees can override
++   it with glibc.malloc.tcache_count.  */
 +# define TCACHE_FILL_COUNT 32
  
  /* Maximum chunks in tcache bins for tunables.  This value must fit the range
     of tcache->num_slots[] entries, else they may overflow.  */
-@@ -746,7 +779,24 @@ libc_hidden_proto (__libc_mallopt)
+@@ -674,9 +679,9 @@ int      __posix_memalign(void **, size_t, size_t);
+ 
+   Symbol            param #   default    allowed param values
+   M_MXFAST          1         64         0-80  (deprecated)
+-  M_TRIM_THRESHOLD -1         128*1024   any   (-1U disables trimming)
+-  M_TOP_PAD        -2         0          any
+-  M_MMAP_THRESHOLD -3         128*1024   any   (or 0 if no MMAP support)
++  M_TRIM_THRESHOLD -1         8*1024*1024 any   (-1U disables trimming)
++  M_TOP_PAD        -2         8*1024*1024 any
++  M_MMAP_THRESHOLD -3         1024*1024   any   (or 0 if no MMAP support)
+   M_MMAP_MAX       -4         65536      any   (0 disables use of mmap)
+ */
+ int      __libc_mallopt(int, int);
+@@ -746,7 +751,9 @@ libc_hidden_proto (__libc_mallopt)
  #define M_TRIM_THRESHOLD       -1
  
  #ifndef DEFAULT_TRIM_THRESHOLD
 -#define DEFAULT_TRIM_THRESHOLD (128 * 1024)
-+/* ms178: 128 KiB makes the allocator hand memory back to the kernel far too
-+   eagerly for a workload that immediately allocates it again, which is
-+   exactly what a game frame loop does.  Every trim is an sbrk/madvise round
-+   trip, and the pages come back as minor faults on the next touch -- a
-+   classic source of frame-time spikes.
-+
-+   Raised to 8 MiB.  Note this is only the STARTING value: the existing
-+   dynamic adjustment in _int_free_chunk still raises it further
-+   (trim_threshold = 2 * mmap_threshold) when large mmapped chunks are
-+   freed, and mallopt()/the tunable still override it outright.
-+
-+   Measured with strace -c (deterministic; wall clock on the test box is too
-+   noisy to resolve a few percent), counting brk+mmap+munmap+madvise:
-+
-+     phase       upstream   ms178 (top_pad+trim)   reduction
-+     churn          70            16                 -77%
-+     teardown      103            17                 -83%  */
++/* Avoid repeated trim/page-fault cycles in bursty frame workloads.  This is
++   still the initial adaptive value; mallopt and tunables remain available.  */
 +#define DEFAULT_TRIM_THRESHOLD (8 * 1024 * 1024)
  #endif
  
  /*
-@@ -779,7 +829,13 @@ libc_hidden_proto (__libc_mallopt)
+@@ -769,17 +776,18 @@ libc_hidden_proto (__libc_mallopt)
+   after trimming) will invoke sbrk, which needlessly wastes
+   time.
+ 
+-  Automatic rounding-up to page-size units is normally sufficient
+-  to avoid measurable overhead, so the default is 0.  However, in
+-  systems where sbrk is relatively slow, it can pay to increase
+-  this value, at the expense of carrying around more memory than
+-  the program needs.
++  Automatic rounding-up to page-size units is normally sufficient for
++  general workloads.  This gaming-tuned build uses 8 MiB to amortize sbrk
++  activity in bursty workloads, at the expense of retaining more address
++  space and potentially more resident memory.
+ */
+ 
  #define M_TOP_PAD              -2
  
  #ifndef DEFAULT_TOP_PAD
 -#define DEFAULT_TOP_PAD        (0)
-+/* ms178: ask sbrk for 8 MiB of slack whenever the top chunk has to grow.
-+   With top_pad 0 the arena grows in minimum increments, so a frame that
-+   ramps its heap issues a long series of brk() calls.  Paired with the
-+   raised trim threshold above this collapses the grow/shrink syscall
-+   traffic (see the strace numbers on DEFAULT_TRIM_THRESHOLD).  The pad is
-+   address space that is only faulted in when actually touched.  */
++/* Amortize arena growth syscalls during allocation bursts.  The address space
++   is demand-paged, and unused top space remains reclaimable by trimming.  */
 +#define DEFAULT_TOP_PAD        (8 * 1024 * 1024)
  #endif
  
  /*
-@@ -898,7 +954,37 @@ libc_hidden_proto (__libc_mallopt)
+@@ -876,9 +884,9 @@ libc_hidden_proto (__libc_mallopt)
+   3) transient allocations should use brk() to avoid forcing the kernel
+      having to zero memory over and over again
+ 
+-  The implementation works with a sliding threshold, which is by default
+-  limited to go between 128Kb and 32Mb (64Mb for 64 bit machines) and starts
+-  out at 128Kb as per the 2001 default.
++  The implementation works with a sliding threshold, limited to between
++  128Kb and 32Mb (64Mb for 64 bit machines).  This tuned build starts at
++  1 MiB while retaining the same adaptive range and update algorithm.
+ 
+   This allows us to satisfy requirement 1) under the assumption that long
+   lived allocations are made early in the process' lifespan, before it has
+@@ -898,7 +906,10 @@ libc_hidden_proto (__libc_mallopt)
  #define M_MMAP_THRESHOLD      -3
  
  #ifndef DEFAULT_MMAP_THRESHOLD
 -#define DEFAULT_MMAP_THRESHOLD DEFAULT_MMAP_THRESHOLD_MIN
-+/* ms178: start the dynamic mmap threshold at 1 MiB instead of the 128 KiB
-+   minimum.
-+
-+   The threshold IS adaptive, but it only grows when an mmapped chunk is
-+   freed (see _int_free_chunk).  Until that happens every allocation above
-+   the current threshold pays a full mmap + first-touch page faults +
-+   munmap, and munmap also returns the pages to the kernel so the next
-+   allocation of the same size faults them in all over again.  Starting
-+   higher removes that warm-up penalty for the medium-large buffers a game
-+   cycles every frame (texture staging, audio blocks, mesh scratch).
-+
-+   Measured, alloc + touch-every-page + free, ns per cycle (lower better):
-+
-+     size      via arena      via mmap     arena speedup
-+     128 KiB      104.45      36,592.19       350.3x
-+     256 KiB   35,724.21      61,912.84         1.73x
-+     512 KiB   91,763.36     121,502.80         1.32x
-+       1 MiB  214,509.05     247,232.54         1.15x
-+
-+   Crucially this only changes the STARTING value: no_dyn_threshold stays
-+   0, so the existing adaptation still raises the threshold further (up to
-+   DEFAULT_MMAP_THRESHOLD_MAX, 32 MiB on LP64) for workloads that free
-+   larger mmapped chunks.  Setting the glibc.malloc.mmap_threshold tunable
-+   instead would set no_dyn_threshold=1 and DISABLE that adaptation, which
-+   measured catastrophically worse on a varied-size workload
-+   (126,784 ns/cycle pinned at 2 MiB vs 565 ns/cycle adaptive).
-+
-+   Trade-off: up to ~1 MiB of freed memory can now be retained in the arena
-+   rather than returned immediately via munmap.  trim_threshold still
-+   reclaims it, and RSS was measured flat on the gaming workload.  */
++/* Keep medium, repeatedly-used buffers in arenas instead of paying an early
++   mmap/munmap/page-fault cycle.  Unlike setting the runtime tunable, changing
++   this initial value preserves the existing adaptive threshold algorithm.  */
 +#define DEFAULT_MMAP_THRESHOLD (1024 * 1024)
  #endif
  
  /*
-@@ -1728,6 +1814,8 @@ free_perturb (char *p, size_t n)
- 
- #include <stap-probe.h>
- 
-+
-+
- /* ----------- Routines dealing with transparent huge pages ----------- */
- 
- static inline void
-@@ -2811,12 +2899,25 @@ tcache_key_initialize (void)
- }
- 
- static __always_inline size_t
--large_csize2tidx(size_t nb)
-+large_csize2tidx (size_t nb)
- {
-+  /* NOTE(ms178): deliberately UNCLAMPED.  do_set_tcache_max() relies on this
-+     returning an out-of-range index for oversized values so that it can
-+     reject them.  Clamping here would make the tunable accept e.g. 4M and
-+     set tcache_max_bytes far beyond the last bin, causing many distinct
-+     size classes to alias onto entries[TCACHE_MAX_BINS-1].  Bounds are
-+     enforced at the allocation call sites instead (tcache_idx_valid).  */
-   size_t idx = stdc_bit_width (nb) - stdc_bit_width (MAX_TCACHE_SMALL_SIZE);
-   return idx + TCACHE_SMALL_BINS;
- }
- 
-+/* Defense-in-depth bound check for the large-tcache index.  */
-+static __always_inline bool
-+tcache_idx_valid (size_t tc_idx)
-+{
-+  return tc_idx < TCACHE_MAX_BINS;
-+}
-+
- /* Caller must ensure that we know tc_idx is valid and there's room
-    for more chunks.  */
- static __always_inline void
-@@ -2856,10 +2957,17 @@ tcache_get_n (size_t tc_idx, tcache_entry **ep, bool mangled)
-   if (__glibc_unlikely (misaligned_mem (e)))
-     malloc_printerr ("malloc(): unaligned tcache chunk detected");
- 
-+  tcache_entry *next_e = REVEAL_PTR (e->next);
-+
-+  /* ms178: a software prefetch of NEXT_E was tried here and removed.  The
-+     prefetch retires only 4 instructions before the function's 'ret', so the
-+     line cannot arrive any earlier than the demand load issued by the *next*
-+     malloc call; A/B over 50 interleaved runs showed no effect outside noise.
-+     Left as a plain load so the hardware prefetcher / OoO window handle it.  */
-   if (!mangled)
--    *ep = REVEAL_PTR (e->next);
-+    *ep = next_e;
-   else
--    *ep = PROTECT_PTR (ep, REVEAL_PTR (e->next));
-+    *ep = PROTECT_PTR (ep, next_e);
- 
-   ++(tcache->num_slots[tc_idx]);
-   e->key = 0;
-@@ -2931,7 +3039,11 @@ tcache_get_align (size_t nb, size_t alignment)
-     {
-       size_t tc_idx = csize2tidx (nb);
-       if (__glibc_unlikely (tc_idx >= TCACHE_SMALL_BINS))
--        tc_idx = large_csize2tidx (nb);
-+        {
-+          tc_idx = large_csize2tidx (nb);
-+          if (__glibc_unlikely (!tcache_idx_valid (tc_idx)))
-+            return NULL;
-+        }
- 
-       /* The tcache itself isn't encoded, but the chain is.  */
-       tcache_entry **tep = & tcache->entries[tc_idx];
-@@ -3097,6 +3209,7 @@ __libc_malloc2 (size_t bytes)
- }
- 
- void *
-+__attribute__ ((hot))
- __libc_malloc (size_t bytes)
- {
- #if USE_TCACHE
-@@ -3114,9 +3227,12 @@ __libc_malloc (size_t bytes)
-       else
-         {
- 	  tc_idx = large_csize2tidx (nb);
--	  void *victim = tcache_get_large (tc_idx, nb);
--	  if (victim != NULL)
--	    return victim;
-+	  if (__glibc_likely (tcache_idx_valid (tc_idx)))
-+	    {
-+	      void *victim = tcache_get_large (tc_idx, nb);
-+	      if (victim != NULL)
-+		return victim;
-+	    }
- 	}
-     }
- #endif
-@@ -3133,6 +3249,7 @@ tcache_free_init (void *mem)
- }
- 
- void
-+__attribute__ ((hot))
- __libc_free (void *mem)
- {
-   mchunkptr p;                          /* chunk corresponding to mem */
-@@ -3167,6 +3284,7 @@ __libc_free (void *mem)
- 	{
- 	  tc_idx = large_csize2tidx (size);
- 	  if (size >= MINSIZE
-+	      && __glibc_likely (tcache_idx_valid (tc_idx))
-               && __glibc_likely (tcache->num_slots[tc_idx] != 0))
- 	    return tcache_put_large (p, tc_idx);
- 	}
-@@ -3536,9 +3654,12 @@ __libc_calloc (size_t n, size_t elem_size)
-       else
- 	{
- 	  tc_idx = large_csize2tidx (nb);
--	  void *mem = tcache_get_large (tc_idx, nb);
--	  if (mem != NULL)
--	    return memset (mem, 0, memsize (mem2chunk (mem)));
-+	  if (__glibc_likely (tcache_idx_valid (tc_idx)))
-+	    {
-+	      void *mem = tcache_get_large (tc_idx, nb);
-+	      if (mem != NULL)
-+		return memset (mem, 0, memsize (mem2chunk (mem)));
-+	    }
- 	}
-     }
- #endif
-@@ -4065,6 +4186,18 @@ _int_free_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size)
-       _int_free_merge_chunk (av, p, size);
-     else
-       {
-+	/* Overlap the lock-acquire latency with the fetch of the adjacent
-+	   chunk headers that _int_free_merge_chunk is about to touch.  */
-+	__builtin_prefetch (chunk_at_offset (p, size), 1, 3);
-+
-+	if (!prev_inuse (p))
-+	  {
-+	    /* prev_inuse() reads p's own header (hot in L1D), so it is a
-+	       safe gate for the backward prefetch.  */
-+	    INTERNAL_SIZE_T prevsize = prev_size (p);
-+	    __builtin_prefetch (chunk_at_offset (p, -((long) prevsize)), 1, 3);
-+	  }
-+
- 	__libc_lock_lock (av->mutex);
- 	_int_free_merge_chunk (av, p, size);
- 	__libc_lock_unlock (av->mutex);
 diff --git a/math/math.h b/math/math.h
 index 75830d76..4f24e84a 100644
 --- a/math/math.h
@@ -725,19 +565,6 @@ index 75830d76..4f24e84a 100644
  template<> struct __iseqsig_type<_Float64x>
  {
    static int __call (_Float64x __x, _Float64x __y) throw ()
-diff --git a/misc/Makefile b/misc/Makefile
-index 3937b5d5..797a146d 100644
---- a/misc/Makefile
-+++ b/misc/Makefile
-@@ -357,6 +357,8 @@ CFLAGS-mmap.op = $(no-stack-protector)
- CFLAGS-mmap64.o = $(no-stack-protector)
- CFLAGS-mmap64.op = $(no-stack-protector)
- 
-+CFLAGS-tsearch.c += -fno-strict-aliasing
-+
- include ../Rules
- 
- $(objpfx)libg.a: $(dep-dummy-lib); $(make-dummy-lib)
 diff --git a/misc/sys/cdefs.h b/misc/sys/cdefs.h
 index 8d27f26d..f2ad15f6 100644
 --- a/misc/sys/cdefs.h
@@ -787,347 +614,27 @@ index 8d27f26d..f2ad15f6 100644
  /* Designates dealloc as a function to call to deallocate objects
     allocated by the declared function.  */
  # define __attr_dealloc(dealloc, argno) \
-diff --git a/nis/Makefile b/nis/Makefile
-index 39074d11..97e9509e 100644
---- a/nis/Makefile
-+++ b/nis/Makefile
-@@ -52,6 +52,7 @@ endif # have-GLIBC_2.28
+diff --git a/sysdeps/ieee754/dbl-64/e_pow.c b/sysdeps/ieee754/dbl-64/e_pow.c
+index 56c393e9..3b9ee8d7 100644
+--- a/sysdeps/ieee754/dbl-64/e_pow.c
++++ b/sysdeps/ieee754/dbl-64/e_pow.c
+@@ -291,6 +291,8 @@ __pow (double x, double y)
  
- include ../Rules
- 
-+CFLAGS-nis_callback.c += -fno-strict-aliasing
- 
- libnsl-libc = $(common-objpfx)linkobj/libc.so
- # Target-specific variable setting to link objects using deprecated
-diff --git a/nptl/Makefile b/nptl/Makefile
-index 97a0fb7f..0a5f8cd5 100644
---- a/nptl/Makefile
-+++ b/nptl/Makefile
-@@ -259,6 +259,22 @@ CFLAGS-sem_clockwait.c = -fexceptions -fasynchronous-unwind-tables
- 
- CFLAGS-futex-internal.c += -fexceptions -fasynchronous-unwind-tables
- 
-+CFLAGS-pthread_create.c += -fno-strict-aliasing
-+CFLAGS-sem_clockwait.c += -fno-strict-aliasing
-+CFLAGS-sem_wait.c += -fno-strict-aliasing
-+CFLAGS-sem_waitcommon.c += -fno-strict-aliasing
-+CFLAGS-sem_timedwait.c += -fno-strict-aliasing
-+CFLAGS-sem_post.c += -fno-strict-aliasing
-+CFLAGS-unwind.c += -fno-strict-aliasing
-+CFLAGS-pthread_attr_copy.c += -fno-strict-aliasing
-+CFLAGS-pthread_cond_common.c += -fno-strict-aliasing
-+CFLAGS-pthread_cond_destroy.c += -fno-strict-aliasing
-+CFLAGS-pthread_cond_wait.c += -fno-strict-aliasing
-+CFLAGS-pthread_cond_signal.c += -fno-strict-aliasing
-+CFLAGS-pthread_cond_broadcast.c += -fno-strict-aliasing
-+CFLAGS-pthread_setattr_default_np.c += -fno-strict-aliasing
-+CFLAGS-pthread_getattr_default_np.c += -fno-strict-aliasing
-+
- LDLIBS-tst-once5 = -lstdc++
- CFLAGS-tst-thread_local1.o = -std=gnu++11
- LDLIBS-tst-thread_local1 = -lstdc++
-diff --git a/nptl/pthread_cond_broadcast.c b/nptl/pthread_cond_broadcast.c
-index f51d5148..72a6b762 100644
---- a/nptl/pthread_cond_broadcast.c
-+++ b/nptl/pthread_cond_broadcast.c
-@@ -35,6 +35,7 @@
-    G1.  We don't need to do all these steps if there are no waiters in G1
-    and/or G2.  See __pthread_cond_signal for further details.  */
- int
-+__attribute__ ((hot))
- ___pthread_cond_broadcast (pthread_cond_t *cond)
- {
-   LIBC_PROBE (cond_broadcast, 1, cond);
-diff --git a/nptl/pthread_cond_signal.c b/nptl/pthread_cond_signal.c
-index 3f6ae04a..c1f46ebe 100644
---- a/nptl/pthread_cond_signal.c
-+++ b/nptl/pthread_cond_signal.c
-@@ -31,6 +31,7 @@
- 
- /* See __pthread_cond_wait for a high-level description of the algorithm.  */
- int
-+__attribute__ ((hot))
- ___pthread_cond_signal (pthread_cond_t *cond)
- {
-   LIBC_PROBE (cond_signal, 1, cond);
-diff --git a/nptl/pthread_cond_wait.c b/nptl/pthread_cond_wait.c
-index cd27a2be..9e21cd38 100644
---- a/nptl/pthread_cond_wait.c
-+++ b/nptl/pthread_cond_wait.c
-@@ -447,6 +447,7 @@ __pthread_cond_wait_common (pthread_cond_t *cond, pthread_mutex_t *mutex,
- 
- /* See __pthread_cond_wait_common.  */
- int
-+__attribute__ ((hot))
- ___pthread_cond_wait (pthread_cond_t *cond, pthread_mutex_t *mutex)
- {
-   /* clockid is unused when abstime is NULL. */
-diff --git a/nptl/pthread_mutex_lock.c b/nptl/pthread_mutex_lock.c
-index a697f2b6..8b976b1b 100644
---- a/nptl/pthread_mutex_lock.c
-+++ b/nptl/pthread_mutex_lock.c
-@@ -64,9 +64,10 @@ lll_mutex_lock_optimized (pthread_mutex_t *mutex)
- #endif
- 
- static int __pthread_mutex_lock_full (pthread_mutex_t *mutex)
--     __attribute_noinline__;
-+     __attribute_noinline__ __attribute__ ((cold));
- 
- int
-+__attribute__ ((hot))
- PTHREAD_MUTEX_LOCK (pthread_mutex_t *mutex)
- {
-   /* See concurrency notes regarding mutex type which is loaded from __kind
-diff --git a/nptl/pthread_mutex_unlock.c b/nptl/pthread_mutex_unlock.c
-index fc1c9512..564f471f 100644
---- a/nptl/pthread_mutex_unlock.c
-+++ b/nptl/pthread_mutex_unlock.c
-@@ -26,7 +26,7 @@
- 
- static int
- __pthread_mutex_unlock_full (pthread_mutex_t *mutex, int decr)
--     __attribute_noinline__;
-+     __attribute_noinline__ __attribute__ ((cold));
- 
- /* lll_lock with single-thread optimization.  */
- static inline void
-@@ -44,6 +44,7 @@ lll_mutex_unlock_optimized (pthread_mutex_t *mutex)
- }
- 
- int
-+__attribute__ ((hot))
- __pthread_mutex_unlock_usercnt (pthread_mutex_t *mutex, int decr)
- {
-   /* See concurrency notes regarding mutex type which is loaded from __kind
-@@ -353,6 +354,7 @@ __pthread_mutex_unlock_full (pthread_mutex_t *mutex, int decr)
- 
- 
- int
-+__attribute__ ((hot))
- ___pthread_mutex_unlock (pthread_mutex_t *mutex)
- {
-   return __pthread_mutex_unlock_usercnt (mutex, 1);
-diff --git a/nptl/pthread_rwlock_rdlock.c b/nptl/pthread_rwlock_rdlock.c
-index 6277b9fe..e418d733 100644
---- a/nptl/pthread_rwlock_rdlock.c
-+++ b/nptl/pthread_rwlock_rdlock.c
-@@ -19,6 +19,7 @@
- 
- /* See pthread_rwlock_common.c.  */
- int
-+__attribute__ ((hot))
- ___pthread_rwlock_rdlock (pthread_rwlock_t *rwlock)
- {
-   LIBC_PROBE (rdlock_entry, 1, rwlock);
-diff --git a/nptl/pthread_rwlock_wrlock.c b/nptl/pthread_rwlock_wrlock.c
-index 777c2fc6..939d5a0c 100644
---- a/nptl/pthread_rwlock_wrlock.c
-+++ b/nptl/pthread_rwlock_wrlock.c
-@@ -19,6 +19,7 @@
- 
- /* See pthread_rwlock_common.c.  */
- int
-+__attribute__ ((hot))
- ___pthread_rwlock_wrlock (pthread_rwlock_t *rwlock)
- {
-   LIBC_PROBE (wrlock_entry, 1, rwlock);
-diff --git a/nscd/Makefile b/nscd/Makefile
-index 64911248..086df93f 100644
---- a/nscd/Makefile
-+++ b/nscd/Makefile
-@@ -82,6 +82,14 @@ CFLAGS-nscd_gethst_r.c += -fexceptions
- CFLAGS-nscd_getai.c += -fexceptions
- CFLAGS-nscd_initgroups.c += -fexceptions
- 
-+CFLAGS-nscd_helper.c += -fno-strict-aliasing
-+CFLAGS-nscd.c += -fno-strict-aliasing
-+CFLAGS-connections.c += -fno-strict-aliasing
-+CFLAGS-gethstbyad_r.c += -fno-strict-aliasing
-+CFLAGS-gethstbynm3_r.c += -fno-strict-aliasing
-+CFLAGS-aicache.c += -fno-strict-aliasing
-+CFLAGS-gai.c += -fno-strict-aliasing
-+
- ifeq (yesyes,$(have-fpie)$(build-shared))
- CFLAGS-nscd += $(pie-ccflag)
- endif
-diff --git a/nss/Makefile b/nss/Makefile
-index b1f25f0d..dc0155b8 100644
---- a/nss/Makefile
-+++ b/nss/Makefile
-@@ -528,6 +528,9 @@ $(objpfx)mtrace-tst-nss-gai-hv2-canonname.out: \
- 
- $(objpfx)tst-nss-action-parse.out: $(gen-locales)
- 
-+CFLAGS-getnssent_r.c += -fno-strict-aliasing
-+CFLAGS-digits_dots.c += -fno-strict-aliasing
-+
- # Disable DT_RUNPATH on NSS tests so that the glibc internal NSS
- # functions can load testing NSS modules via DT_RPATH.
- LDFLAGS-tst-nss-test1 = -Wl,--disable-new-dtags
-diff --git a/posix/Makefile b/posix/Makefile
-index 10d70ae0..088f7634 100644
---- a/posix/Makefile
-+++ b/posix/Makefile
-@@ -612,6 +612,12 @@ CFLAGS-execvp.os = -fomit-frame-pointer
- CFLAGS-execlp.os = -fomit-frame-pointer
- CFLAGS-nanosleep.c += -fexceptions -fasynchronous-unwind-tables
- CFLAGS-fork.c = $(libio-mtsafe)
-+CFLAGS-glob.c += -fno-strict-aliasing
-+CFLAGS-glob-lstat-compat.c += -fno-strict-aliasing
-+CFLAGS-glob64.c += -fno-strict-aliasing
-+CFLAGS-glob64-lstat-compat.c += -fno-strict-aliasing
-+CFLAGS-oldglob.c += -fno-strict-aliasing
-+CFLAGS-getaddrinfo.c += -fno-strict-aliasing
- 
- tstgetopt-ARGS = -a -b -cfoobar --required foobar --optional=bazbug \
- 		--none random --col --color --colour
-diff --git a/resolv/Makefile b/resolv/Makefile
-index 28f6ba6c..f93b1c14 100644
---- a/resolv/Makefile
-+++ b/resolv/Makefile
-@@ -254,6 +254,18 @@ LOCALES := en_US.UTF-8 en_US.ISO-8859-1
- include ../gen-locales.mk
- 
- CFLAGS-res_hconf.c += -fexceptions
-+CFLAGS-gethstbyad_r.c += -fno-strict-aliasing
-+CFLAGS-res-close.c += -fno-strict-aliasing
-+CFLAGS-resolv_context.c += -fno-strict-aliasing
-+CFLAGS-resolv_conf.c += -fno-strict-aliasing
-+CFLAGS-res_mkquery.c += -fno-strict-aliasing
-+CFLAGS-res_query.c += -fno-strict-aliasing
-+CFLAGS-res_send.c += -fno-strict-aliasing
-+CFLAGS-compat-hnamaddr.c += -fno-strict-aliasing
-+CFLAGS-compat-gethnamaddr.c += -fno-strict-aliasing
-+CFLAGS-dns-host.c += -fno-strict-aliasing
-+CFLAGS-dns-network.c += -fno-strict-aliasing
-+CFLAGS-dns-canon.c += -fno-strict-aliasing
- 
- # The DNS NSS modules needs the resolver.
- $(objpfx)libnss_dns.so: $(objpfx)libresolv.so
-diff --git a/rt/Makefile b/rt/Makefile
-index f39e9674..7d7ac663 100644
---- a/rt/Makefile
-+++ b/rt/Makefile
-@@ -99,6 +99,8 @@ CFLAGS-aio_suspend.c += -fexceptions
- CFLAGS-mq_timedreceive.c += -fexceptions -fasynchronous-unwind-tables
- CFLAGS-mq_timedsend.c += -fexceptions -fasynchronous-unwind-tables
- 
-+CFLAGS-timer_create.c += -fno-strict-aliasing
-+
- # Exclude fortified routines from being built with _FORTIFY_SOURCE
- routines_no_fortify += \
-   mq_open \
-diff --git a/setjmp/Makefile b/setjmp/Makefile
-index 499cda47..45a53695 100644
---- a/setjmp/Makefile
-+++ b/setjmp/Makefile
-@@ -36,6 +36,10 @@ tests-internal  := \
- 
- gen-as-const-headers += jmp_buf-macros.sym
- 
-+CFLAGS-sigjmp.c += -fno-strict-aliasing
-+CFLAGS-longjmp.c += -fno-strict-aliasing
-+CFLAGS-longjmp_chk.c += -fno-strict-aliasing
-+
- include ../Rules
- 
- # This test messes the stack on purpose, which triggers longjump fortify
-diff --git a/stdio-common/Makefile b/stdio-common/Makefile
-index a948bfde..4d1286de 100644
---- a/stdio-common/Makefile
-+++ b/stdio-common/Makefile
-@@ -698,6 +698,10 @@ $(objpfx)tst-errno-manual.out: tst-errno-manual.py \
- 
- CFLAGS-vfprintf.c += -Wno-uninitialized
- CFLAGS-vfwprintf.c += -Wno-uninitialized
-+CFLAGS-vfscanf-internal.c += -fno-strict-aliasing
-+CFLAGS-vfwscanf-internal.c += -fno-strict-aliasing
-+CFLAGS-vfprintf-internal.c += -fno-strict-aliasing
-+CFLAGS-vfwprintf-internal.c += -fno-strict-aliasing
- 
- CFLAGS-tmpfile.c += -fexceptions
- CFLAGS-tmpfile64.c += -fexceptions
-diff --git a/sunrpc/Makefile b/sunrpc/Makefile
-index 63c90874..ba4b630c 100644
---- a/sunrpc/Makefile
-+++ b/sunrpc/Makefile
-@@ -104,6 +104,21 @@ CFLAGS-pmap_rmt.c += -fexceptions
- CFLAGS-clnt_perr.c += -fexceptions
- CFLAGS-openchild.c += -fexceptions
- 
-+CFLAGS-authuxprot.c += -fno-strict-aliasing
-+CFLAGS-pmap_rmt.c += -fno-strict-aliasing
-+CFLAGS-rpc_prot.c += -fno-strict-aliasing
-+CFLAGS-rpc_cmsg.c += -fno-strict-aliasing
-+CFLAGS-authdes_prot.c += -fno-strict-aliasing
-+CFLAGS-rtime.c += -fno-strict-aliasing
-+CFLAGS-svcauth_des.c += -fno-strict-aliasing
-+CFLAGS-svc_unix.c += -fno-strict-aliasing
-+CFLAGS-auth_des.c += -fno-strict-aliasing
-+CFLAGS-clnt_udp.c += -fno-strict-aliasing
-+CFLAGS-key_call.c += -fno-strict-aliasing
-+CFLAGS-pm_getport.c += -fno-strict-aliasing
-+CFLAGS-svc_tcp.c += -fno-strict-aliasing
-+CFLAGS-svc_udp.c += -fno-strict-aliasing
-+
- $(objpfx)tst-getmyaddr: $(common-objpfx)linkobj/libc.so
- $(objpfx)tst-xdrmem: $(common-objpfx)linkobj/libc.so
- $(objpfx)tst-xdrmem2: $(common-objpfx)linkobj/libc.so
-diff --git a/support/Makefile b/support/Makefile
-index 87eeb819..5d6fb24d 100644
---- a/support/Makefile
-+++ b/support/Makefile
-@@ -262,6 +262,8 @@ ifeq ($(build-shared),yes)
- libsupport-inhibit-o += .o
- endif
- 
-+CFLAGS-resolv_test.c = -fno-strict-aliasing
-+
- CFLAGS-support_paths.c = \
- 		-DSRCDIR_PATH=\"`cd .. ; pwd`\" \
- 		-DOBJDIR_PATH=\"`cd $(objpfx)/..; pwd`\" \
-diff --git a/sysdeps/aarch64/fpu/bits/math-vector.h b/sysdeps/aarch64/fpu/bits/math-vector.h
-index db218eed..2169d66e 100644
---- a/sysdeps/aarch64/fpu/bits/math-vector.h
-+++ b/sysdeps/aarch64/fpu/bits/math-vector.h
-@@ -191,7 +191,7 @@
- # define __DECL_SIMD_tanpif __DECL_SIMD_aarch64
- #endif
- 
--#if __GNUC_PREREQ(9, 0)
-+#if __GNUC_PREREQ(9, 0) && !defined(__clang__)
- #  define __ADVSIMD_VEC_MATH_SUPPORTED
- typedef __Float32x4_t __f32x4_t;
- typedef __Float64x2_t __f64x2_t;
-diff --git a/sysdeps/aarch64/fpu/fpu_control.h b/sysdeps/aarch64/fpu/fpu_control.h
-index a9fafa53..90ae0689 100644
---- a/sysdeps/aarch64/fpu/fpu_control.h
-+++ b/sysdeps/aarch64/fpu/fpu_control.h
-@@ -24,7 +24,7 @@
- 
- /* Macros for accessing the FPCR and FPSR.  */
- 
--#if __GNUC_PREREQ (6,0)
-+#if __GNUC_PREREQ (6,0) && !defined (__clang__)
- # define _FPU_GETCW(fpcr) (fpcr = __builtin_aarch64_get_fpcr ())
- # define _FPU_SETCW(fpcr) __builtin_aarch64_set_fpcr (fpcr)
- # define _FPU_GETFPSR(fpsr) (fpsr = __builtin_aarch64_get_fpsr ())
+   ix = asuint64 (x);
+   iy = asuint64 (y);
++  if (__glibc_unlikely (ix == asuint64 (1.0)))
++    return issignaling (y) ? x + y : 1.0;
+   topx = top12 (x);
+   topy = top12 (y);
+   if (__glibc_unlikely (topx - 0x001 >= 0x7ff - 0x001
 diff --git a/sysdeps/ieee754/flt-32/e_atan2f.c b/sysdeps/ieee754/flt-32/e_atan2f.c
-index 03070e01..161dda56 100644
+index 03070e01..df6d8c76 100644
 --- a/sysdeps/ieee754/flt-32/e_atan2f.c
 +++ b/sysdeps/ieee754/flt-32/e_atan2f.c
-@@ -88,9 +88,101 @@ cr_atan2f_tiny (float y, float x)
- 	t -= 1;
-     }
-   double r = asdouble (t);
--  float rf = r;
-+  float rf = (float) r;
-   if (__glibc_unlikely (rf == 0.0f))
--    return __math_uflowf (t >> 63);
-+    return __math_uflowf ((uint32_t) (t >> 63));
-+  return rf;
-+}
-+
+@@ -94,6 +94,98 @@ cr_atan2f_tiny (float y, float x)
+   return rf;
+ }
+ 
 +static float __attribute__ ((noinline))
 +atan2f_boundary_correct (float y, float x, uint32_t ay, uint32_t ax,
 +                         uint32_t gt, uint32_t i,
@@ -1198,7 +705,7 @@ index 03070e01..161dda56 100644
 +  ph = muldd (zh, zl, ph, pl, &pl);
 +  double sh = ph + off[i];
 +  double sl = ((off[i] - sh) + ph) + pl + offl[i];
-+  float rf = (float) sh;
++  float rf = sh;
 +  double th = rf;
 +  double dh = sh - th;
 +  double tm = dh + sl;
@@ -1214,54 +721,16 @@ index 03070e01..161dda56 100644
 +    }
 +
 +  double r = th + tm;
-+  rf = (float) r;
++  rf = r;
 +  if (__glibc_unlikely (rf == 0.0f))
 +    return __math_uflowf (asuint (rf) >> 1);
-   return rf;
- }
- 
-@@ -136,19 +228,19 @@ __atan2f (float y, float x)
-       if (yinf & xinf)
- 	{
- 	  if (ux >> 31)
--	    return 0x1.2d97c7f3321d2p+1 * sgn[uy >> 31]; /* +/-3pi/4 */
-+	    return (float) (0x1.2d97c7f3321d2p+1 * sgn[uy >> 31]); /* +/-3pi/4 */
- 	  else
--	    return 0x1.921fb54442d18p-1 * sgn[uy >> 31]; /* +/-pi/4 */
-+	    return (float) (0x1.921fb54442d18p-1 * sgn[uy >> 31]); /* +/-pi/4 */
- 	}
-       if (xinf)
- 	{
- 	  if (ux >> 31)
--	    return pi * sgn[uy >> 31];
-+	    return (float) (pi * sgn[uy >> 31]);
- 	  else
--	    return 0.0 * sgn[uy >> 31];
-+	    return (float) (0.0 * sgn[uy >> 31]);
- 	}
-       if (yinf)
--	return pi2 * sgn[uy >> 31];
-+	return (float) (pi2 * sgn[uy >> 31]);
-     }
-   if (__glibc_unlikely (ay == 0))
-     {
-@@ -156,12 +248,12 @@ __atan2f (float y, float x)
- 	{
- 	  uint32_t i = (uy >> 31) * 4 + (ux >> 31) * 2;
- 	  if (ux >> 31)
--	    return off[i] + offl[i];
-+	    return (float) (off[i] + offl[i]);
- 	  else
--	    return off[i];
-+	    return (float) off[i];
- 	}
-       if (!(ux >> 31))
--	return 0.0 * sgn[uy >> 31];
-+	return (float) (0.0 * sgn[uy >> 31]);
-     }
-   uint32_t gt = ay > ax;
-   uint32_t i = (uy >> 31) * 4 + (ux >> 31) * 2 + gt;
-@@ -199,83 +291,8 @@ __atan2f (float y, float x)
++  return rf;
++}
++
+ float
+ __atan2f (float y, float x)
+ {
+@@ -199,82 +291,7 @@ __atan2f (float y, float x)
    z *= sgn[gt];
    r = z * r + off[i];
    if (__glibc_unlikely (((asuint64 (r) + 8) & 0xfffffff) <= 16))
@@ -1341,12 +810,10 @@ index 03070e01..161dda56 100644
 -	}
 -      r = th + tm;
 -    }
--  float rf = r;
 +    return atan2f_boundary_correct (y, x, ay, ax, gt, i, off, offl);
-+  float rf = (float) r;
+   float rf = r;
    if (__glibc_unlikely (rf == 0.0f))
      return __math_uflowf (asuint (rf) >> 1);
-   return rf;
 diff --git a/sysdeps/ieee754/flt-32/e_powf.c b/sysdeps/ieee754/flt-32/e_powf.c
 index d2558ad1..b96d2cf3 100644
 --- a/sysdeps/ieee754/flt-32/e_powf.c
@@ -1361,7 +828,7 @@ index d2558ad1..b96d2cf3 100644
  			|| zeroinfnan (iy)))
      {
 diff --git a/sysdeps/ieee754/flt-32/s_sincosf.c b/sysdeps/ieee754/flt-32/s_sincosf.c
-index fd49d20b..2b9d77ea 100644
+index fd49d20b..67ccc759 100644
 --- a/sysdeps/ieee754/flt-32/s_sincosf.c
 +++ b/sysdeps/ieee754/flt-32/s_sincosf.c
 @@ -34,6 +34,12 @@
@@ -1377,42 +844,8 @@ index fd49d20b..2b9d77ea 100644
  /* Fast sincosf implementation.  Worst-case ULP is 0.5607, maximum relative
     error is 0.5303 * 2^-23.  A single-step range reduction is used for
     small values.  Large inputs have their range reduced using fast integer
-@@ -65,42 +71,67 @@ SINCOSF_FUNC (float y, float *sinp, float *cosp)
-     }
-   else if (abstop12 (y) < abstop12 (120.0f))
-     {
-+      float sx;
-+      float cx;
-       x = reduce_fast (x, p, &n);
--
--      /* Setup the signs for sin and cos.  */
--      s = p->sign[n & 3];
--
--      if (n & 2)
--	p = &__sincosf_table[1];
--
--      sincosf_poly (x * s, x * x, p, n, sinp, cosp);
-+      sincosf_poly (x, x * x, p, 0, &sx, &cx);
-+
-+      switch (n & 3)
-+	{
-+	case 0:
-+	  *sinp = sx;
-+	  *cosp = cx;
-+	  break;
-+	case 1:
-+	  *sinp = cx;
-+	  *cosp = -sx;
-+	  break;
-+	case 2:
-+	  *sinp = -sx;
-+	  *cosp = -cx;
-+	  break;
-+	default:
-+	  *sinp = -cx;
-+	  *cosp = sx;
-+	  break;
-+	}
+@@ -76,31 +82,43 @@ SINCOSF_FUNC (float y, float *sinp, float *cosp)
+       sincosf_poly (x * s, x * x, p, n, sinp, cosp);
      }
    else if (__glibc_likely (abstop12 (y) < abstop12 (INFINITY)))
 -    {
@@ -1430,7 +863,7 @@ index fd49d20b..2b9d77ea 100644
 +sincosf_large_finite (float y, const sincos_t *p, float *sinp, float *cosp)
 +{
 +  uint32_t xi = asuint (y);
-+  int sign = (int) (xi >> 31);
++  int sign = xi >> 31;
 +  int n;
 +  double x = reduce_large (xi, &n);
  
@@ -1438,12 +871,11 @@ index fd49d20b..2b9d77ea 100644
 -      s = p->sign[(n + sign) & 3];
 +  /* Setup signs for sin and cos - include original sign.  */
 +  double s = p->sign[(n + sign) & 3];
-+  p = &__sincosf_table[((uint32_t) (n + sign) >> 1) & 1u];
  
 -      if ((n + sign) & 2)
 -	p = &__sincosf_table[1];
-+  sincosf_poly (x * s, x * x, p, n, sinp, cosp);
-+}
++  if ((n + sign) & 2)
++    p = &__sincosf_table[1];
  
 -      sincosf_poly (x * s, x * x, p, n, sinp, cosp);
 -    }
@@ -1451,6 +883,9 @@ index fd49d20b..2b9d77ea 100644
 -    {
 -      /* Return NaN if Inf or NaN for both sin and cos.  */
 -      *sinp = *cosp = y - y;
++  sincosf_poly (x * s, x * x, p, n, sinp, cosp);
++}
++
 +static void
 +SECTION
 +__attribute__ ((noinline, cold))
@@ -1473,7 +908,7 @@ index fd49d20b..2b9d77ea 100644
  
  #ifndef SINCOSF
 diff --git a/sysdeps/ieee754/flt-32/s_tanf.c b/sysdeps/ieee754/flt-32/s_tanf.c
-index 5ee1d6f3..b8b87adb 100644
+index 5ee1d6f3..7bed074c 100644
 --- a/sysdeps/ieee754/flt-32/s_tanf.c
 +++ b/sysdeps/ieee754/flt-32/s_tanf.c
 @@ -95,6 +95,39 @@ rbig (uint32_t u, int *q)
@@ -1503,12 +938,12 @@ index 5ee1d6f3..b8b87adb 100644
 +  for (int j = 0; j < array_length (st); j++)
 +    {
 +      if (__glibc_unlikely (asuint (st[j].arg) == ax))
-+	{
-+	  if (sgn)
-+	    return -st[j].rh - st[j].rl;
-+	  else
-+	    return st[j].rh + st[j].rl;
-+	}
++        {
++          if (sgn)
++            return -st[j].rh - st[j].rl;
++          else
++            return st[j].rh + st[j].rl;
++        }
 +    }
 +  return r1;
 +}
@@ -1584,20 +1019,6 @@ index e0c5fd82..1a6b7258 100644
  typedef long double _Float128;
  #  endif
  
-diff --git a/sysdeps/powerpc/powerpc32/power4/multiarch/init-arch.h b/sysdeps/powerpc/powerpc32/power4/multiarch/init-arch.h
-index 9aab67a5..80684192 100644
---- a/sysdeps/powerpc/powerpc32/power4/multiarch/init-arch.h
-+++ b/sysdeps/powerpc/powerpc32/power4/multiarch/init-arch.h
-@@ -16,6 +16,9 @@
-    <https://www.gnu.org/licenses/>.  */
- 
- #include <ldsodefs.h>
-+
-+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
-+
- #include <cpu-features.h>
- 
- /* The code checks if _rtld_global_ro was realocated before trying to access
 diff --git a/sysdeps/x86/bits/floatn.h b/sysdeps/x86/bits/floatn.h
 index 387a4ae9..44fe5ab9 100644
 --- a/sysdeps/x86/bits/floatn.h
@@ -1611,47 +1032,93 @@ index 387a4ae9..44fe5ab9 100644
  #   define __builtin_signbitf128 __signbitf128
  #  endif
  
+diff --git a/sysdeps/x86/configure b/sysdeps/x86/configure
+index 0798f194..c9bc4474 100644
+--- a/sysdeps/x86/configure
++++ b/sysdeps/x86/configure
+@@ -85,12 +85,12 @@ then :
+   printf %s "(cached) " >&6
+ else case e in #(
+   e)     libc_cv_have_x86_lahf_sahf=no
+-    if { ac_try='${CC-cc} $CFLAGS $CPPFLAGS -fverbose-asm -S -o - -x c /dev/null'
++    if { ac_try='${CC-cc} $CFLAGS $CPPFLAGS -dM -E -x c /dev/null'
+   { { eval echo "\"\$as_me\":${as_lineno-$LINENO}: \"$ac_try\""; } >&5
+   (eval $ac_try) 2>&5
+   ac_status=$?
+   printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
+-  test $ac_status = 0; }; } | grep -qE '(-msahf\b|-march=x86-64-v)'; then
++  test $ac_status = 0; }; } | grep -q '^#define __LAHF_SAHF__ 1$'; then
+       libc_cv_have_x86_lahf_sahf=yes
+     fi ;;
+ esac
+@@ -109,12 +109,12 @@ then :
+   printf %s "(cached) " >&6
+ else case e in #(
+   e)     libc_cv_have_x86_movbe=no
+-    if { ac_try='${CC-cc} $CFLAGS $CPPFLAGS -fverbose-asm -S -o - -x c /dev/null'
++    if { ac_try='${CC-cc} $CFLAGS $CPPFLAGS -dM -E -x c /dev/null'
+   { { eval echo "\"\$as_me\":${as_lineno-$LINENO}: \"$ac_try\""; } >&5
+   (eval $ac_try) 2>&5
+   ac_status=$?
+   printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
+-  test $ac_status = 0; }; } | grep -qE '(-mmovbe\b|-march=x86-64-v([3-9]|[1-9][0-9]))'; then
++  test $ac_status = 0; }; } | grep -q '^#define __MOVBE__ 1$'; then
+       libc_cv_have_x86_movbe=yes
+     fi ;;
+ esac
+diff --git a/sysdeps/x86/configure.ac b/sysdeps/x86/configure.ac
+index 1e9c4d86..fc5b6679 100644
+--- a/sysdeps/x86/configure.ac
++++ b/sysdeps/x86/configure.ac
+@@ -67,7 +67,8 @@ if test $libc_cv_include_x86_isa_level = yes; then
+   AC_CACHE_CHECK([for LAHF/SAHF instruction support],
+ 		 libc_cv_have_x86_lahf_sahf, [dnl
+     libc_cv_have_x86_lahf_sahf=no
+-    if AC_TRY_COMMAND(${CC-cc} $CFLAGS $CPPFLAGS -fverbose-asm -S -o - -x c /dev/null) | grep -qE '(-msahf\b|-march=x86-64-v)'; then
++    if AC_TRY_COMMAND(${CC-cc} $CFLAGS $CPPFLAGS -dM -E -x c /dev/null) \
++       | grep -q '^#define __LAHF_SAHF__ 1$'; then
+       libc_cv_have_x86_lahf_sahf=yes
+     fi])
+   if test $libc_cv_have_x86_lahf_sahf = yes; then
+@@ -77,7 +78,8 @@ if test $libc_cv_include_x86_isa_level = yes; then
+   AC_CACHE_CHECK([for MOVBE instruction support],
+ 		 libc_cv_have_x86_movbe, [dnl
+     libc_cv_have_x86_movbe=no
+-    if AC_TRY_COMMAND(${CC-cc} $CFLAGS $CPPFLAGS -fverbose-asm -S -o - -x c /dev/null) | grep -qE '(-mmovbe\b|-march=x86-64-v(@<:@3-9@:>@|@<:@1-9@:>@@<:@0-9@:>@))'; then
++    if AC_TRY_COMMAND(${CC-cc} $CFLAGS $CPPFLAGS -dM -E -x c /dev/null) \
++       | grep -q '^#define __MOVBE__ 1$'; then
+       libc_cv_have_x86_movbe=yes
+     fi])
+   if test $libc_cv_have_x86_movbe = yes; then
 diff --git a/sysdeps/x86/dl-cacheinfo.h b/sysdeps/x86/dl-cacheinfo.h
-index 674545c7..5c1472f6 100644
+index 674545c7..37593f45 100644
 --- a/sysdeps/x86/dl-cacheinfo.h
 +++ b/sysdeps/x86/dl-cacheinfo.h
-@@ -1252,6 +1252,7 @@ dl_init_cacheinfo (struct cpu_features *cpu_features)
-   /* The default threshold to use Enhanced REP STOSB.  */
-   unsigned long int rep_stosb_threshold = 2048;
- 
-+
-   long int tunable_size;
- 
-   tunable_size = TUNABLE_GET (x86_data_cache_size, long int, NULL);
-@@ -1271,6 +1272,36 @@ dl_init_cacheinfo (struct cpu_features *cpu_features)
+@@ -1271,6 +1271,32 @@ dl_init_cacheinfo (struct cpu_features *cpu_features)
    if (!CPU_FEATURES_ARCH_P (cpu_features, Avoid_Non_Temporal_Memset))
      memset_non_temporal_threshold = non_temporal_threshold;
  
-+  /* ms178: cap the non-temporal threshold at 3/4 of the private L2.
-+     Upstream derives it from the *shared* L3 (shared / 2 on Raptor Lake),
-+     which on a 33 MiB L3 puts the crossover at ~16.5 MiB -- so ordinary
-+     cacheable stores are used for every copy below that, even though NT
-+     stores are clearly faster once the copy no longer fits in L2.
-+     A memcpy touches src+dst, so the working set is 2x the size; NT wins
-+     exactly when that exceeds L2.  Measured (GB/s, 1.25 MiB L2 host):
++  /* Raptor Lake client parts have a large shared L3 but substantially
++     smaller per-core L2 caches.  For copies which exceed the private L2,
++     retaining every destination line is usually counterproductive.  Cap the
++     memcpy/memmove non-temporal threshold at 3/4 of L2 on family-6 models
++     0xb7, 0xba and 0xbf.  Keep upstream policy on every other processor and
++     let glibc.cpu.x86_non_temporal_threshold override this default below.
 +
-+       size      NT stores   vector    winner
-+       512 KiB     23.3       44.5     vector
-+       768 KiB     22.6       23.4     vector (parity)
-+       896 KiB     22.9       19.4     NT  1.18x
-+         1 MiB     22.7       17.4     NT  1.31x
-+         2 MiB     19.6       16.7     NT  1.17x
-+         8 MiB     19.2       16.4     NT  1.17x
-+
-+     Measured crossover ~832 KiB = 0.635 * L2, i.e. NT takes over once
-+     src+dst stop fitting in L2.  3/4 * L2 sits just below that, keeping
-+     the vector path everywhere it wins.  On a 2 MiB Raptor Cove L2 this
-+     yields 1.5 MiB instead of upstream's 16.5 MiB.  */
-+  if (cpu_features->basic.kind == arch_kind_intel
++     Check the sentinel explicitly: cache sizes are unsigned and a failed
++     query is represented by (unsigned long int) -1, which also compares
++     greater than zero.  Divide before multiplying to avoid overflow.  */
++  bool raptor_lake = cpu_features->basic.kind == arch_kind_intel
++		     && cpu_features->basic.family == 6
++		     && (cpu_features->basic.model == 0xb7
++			 || cpu_features->basic.model == 0xba
++			 || cpu_features->basic.model == 0xbf);
++  if (raptor_lake
++      && cpu_features->level2_cache_size != (unsigned long int) -1
 +      && cpu_features->level2_cache_size > 0)
 +    {
 +      unsigned long int l2_bound
-+	= (unsigned long int) cpu_features->level2_cache_size * 3 / 4;
++	= cpu_features->level2_cache_size / 4 * 3;
 +      if (l2_bound >= minimum_non_temporal_threshold
 +	  && l2_bound < non_temporal_threshold)
 +	non_temporal_threshold = l2_bound;
@@ -1660,7 +1127,7 @@ index 674545c7..5c1472f6 100644
    tunable_size = TUNABLE_GET (x86_non_temporal_threshold, long int, NULL);
    if (tunable_size > minimum_non_temporal_threshold
        && tunable_size <= maximum_non_temporal_threshold)
-@@ -1344,10 +1375,24 @@ dl_init_cacheinfo (struct cpu_features *cpu_features)
+@@ -1344,10 +1370,30 @@ dl_init_cacheinfo (struct cpu_features *cpu_features)
  			   minimum_rep_movsb_threshold, SIZE_MAX);
  
    unsigned long int rep_movsb_stop_threshold;
@@ -1670,14 +1137,20 @@ index 674545c7..5c1472f6 100644
 +     threshold, matching historical behaviour.  */
    rep_movsb_stop_threshold = non_temporal_threshold;
  
-+  /* ms178: allow the ERMS upper bound to be tuned independently of the
-+     non-temporal threshold.  On Intel client cores with ERMS+FSRM the
-+     vectorized 8x-VEC loop overtakes REP MOVSB once source+destination no
-+     longer fit in L1d, well below non_temporal_threshold, so the two bounds
-+     genuinely want different values.  Measured (warm memcpy, GB/s):
-+       16 KiB  REP 191.9 vs AVX2 165.9      24 KiB  REP 181.3 vs AVX2 104.9
-+       32 KiB  REP  45.5 vs AVX2  49.1     256 KiB  REP  44.5 vs AVX2  49.4
-+     A value of 0 keeps the historical default.  */
++  /* Raptor Lake's FSRM engine is excellent for small copies, while its
++     vector loop is preferable for cache-resident copies once the combined
++     source and destination footprint leaves L1d.  Use a conservative 32 KiB
++     crossover on the requested family when ERMS and FSRM are usable.  */
++  if (raptor_lake
++      && CPU_FEATURE_USABLE_P (cpu_features, ERMS)
++      && CPU_FEATURE_USABLE_P (cpu_features, FSRM)
++      && rep_movsb_threshold < 32 * 1024
++      && 32 * 1024 < non_temporal_threshold)
++    rep_movsb_stop_threshold = 32 * 1024;
++
++  /* Expose the upper bound independently from the non-temporal threshold.
++     This makes all defaults observable and permits workload-specific tuning
++     without forcing cache-bypassing stores at the same crossover.  */
 +  tunable_size = TUNABLE_GET (x86_rep_movsb_stop_threshold, long int, NULL);
 +  if (tunable_size > (long int) rep_movsb_threshold)
 +    rep_movsb_stop_threshold = tunable_size;
@@ -1688,29 +1161,22 @@ index 674545c7..5c1472f6 100644
    cpu_features->shared_cache_size = shared;
    cpu_features->non_temporal_threshold = non_temporal_threshold;
 diff --git a/sysdeps/x86/dl-tunables.list b/sysdeps/x86/dl-tunables.list
-index 77219b13..4092336e 100644
+index 77219b13..7f766bfe 100644
 --- a/sysdeps/x86/dl-tunables.list
 +++ b/sysdeps/x86/dl-tunables.list
-@@ -52,6 +52,24 @@ glibc {
+@@ -52,6 +52,17 @@ glibc {
        # if the tunable value is set by user or not [BZ #27069].
        minval: 1
      }
 +    x86_rep_movsb_stop_threshold {
 +      type: SIZE_T
-+      # Upper bound for REP MOVSB.  Above this size memmove falls back to
-+      # the vectorized 8x-VEC loop.  Upstream hardwires this to
-+      # x86_non_temporal_threshold (a large fraction of L3), which keeps
-+      # REP MOVSB selected far past the point where the vector path is
-+      # faster on Intel client parts.  Measured on Ice Lake-SP / Raptor
-+      # Cove class cores (48 KiB L1d, ERMS+FSRM), warm-cache memcpy:
-+      #   16 KiB  REP MOVSB 191.9 GB/s  vs  AVX2 165.9 GB/s  (REP wins)
-+      #   24 KiB  REP MOVSB 181.3 GB/s  vs  AVX2 104.9 GB/s  (REP wins)
-+      #   32 KiB  REP MOVSB  45.5 GB/s  vs  AVX2  49.1 GB/s  (AVX2 wins)
-+      #  256 KiB  REP MOVSB  44.5 GB/s  vs  AVX2  49.4 GB/s  (AVX2 wins)
-+      # The crossover sits where source+destination stop fitting in L1d.
-+      # Exposing this separately lets the bound be set independently of
-+      # the non-temporal threshold (lowering that instead is actively
-+      # harmful: it forces cache-bypassing stores and cost ~47%).
++      # Upper bound for REP MOVSB.  Above this size, non-overlapping
++      # memcpy/memmove uses the vector loop until it reaches the separate
++      # x86_non_temporal_threshold.  Keeping the bounds independent allows
++      # cache-resident and streaming-copy crossovers to be tuned without
++      # forcing both decisions to the same size.  The run-time default is
++      # processor-specific; no static default is specified so the loader can
++      # distinguish an explicit user value.
 +      minval: 1
 +    }
      x86_rep_stosb_threshold {
@@ -1718,10 +1184,10 @@ index 77219b13..4092336e 100644
        # Since there is overhead to set up REP STOSB operation, REP STOSB
 diff --git a/sysdeps/x86_64/fpu/math-use-builtins-fma.h b/sysdeps/x86_64/fpu/math-use-builtins-fma.h
 new file mode 100644
-index 00000000..307bbb1f
+index 00000000..87e17136
 --- /dev/null
 +++ b/sysdeps/x86_64/fpu/math-use-builtins-fma.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,43 @@
 +/* USE_FMA*_BUILTIN selection for x86_64.
 +   Copyright (C) 2026 Free Software Foundation, Inc.
 +   This file is part of the GNU C Library.
@@ -1741,18 +1207,15 @@ index 00000000..307bbb1f
 +   <https://www.gnu.org/licenses/>.  */
 +
 +/* When the translation unit is compiled with -mfma (i.e. __FMA__ is
-+   defined), GCC and clang lower __builtin_fma / __builtin_fmaf to a
-+   single vfmadd* instruction.  In that case the 1200+ byte software
-+   implementation in sysdeps/ieee754/dbl-64/s_fma.c is pure dead code:
-+   collapse it to the builtin so the function shrinks from ~1.2 KiB to
-+   6 bytes (one vfmadd213sd + ret).
++   defined), the compiler lowers __builtin_fma / __builtin_fmaf to a single
++   vfmadd* instruction.  In that case the software implementation in
++   sysdeps/ieee754/dbl-64/s_fma.c is dead code: collapse it to a six-byte
++   vfmadd-plus-return leaf.
 +
-+   The condition is per-translation-unit safe.  Multiarch wrappers such
-+   as sysdeps/x86_64/fpu/multiarch/s_fma.c that build a __fma_sse2
-+   fallback do so without -mfma in their per-file CFLAGS, so __FMA__
-+   is undefined for that TU and USE_FMA_BUILTIN evaluates to 0 — the
-+   software path is kept for hardware that lacks FMA, exactly as
-+   today.
++   The condition is per-translation-unit safe.  The multiarch wrappers keep
++   the software fallback and IFUNC resolver in a baseline build.  In an
++   x86-64-v3-or-higher build, FMA is part of the minimum ISA, so the wrappers
++   below omit that unreachable fallback and use this builtin implementation.
 +
 +   Pattern modelled on the existing
 +   sysdeps/x86_64/fpu/math-use-builtins-trunc.h header which gates
@@ -1769,10 +1232,10 @@ index 00000000..307bbb1f
 +#define USE_FMAL_BUILTIN     0
 +#define USE_FMAF128_BUILTIN  0
 diff --git a/sysdeps/x86_64/fpu/multiarch/s_fma.c b/sysdeps/x86_64/fpu/multiarch/s_fma.c
-index d7f9652e..ca21f3e8 100644
+index d7f9652e..0e023394 100644
 --- a/sysdeps/x86_64/fpu/multiarch/s_fma.c
 +++ b/sysdeps/x86_64/fpu/multiarch/s_fma.c
-@@ -16,16 +16,28 @@
+@@ -16,16 +16,27 @@
     License along with the GNU C Library; if not, see
     <https://www.gnu.org/licenses/>.  */
  
@@ -1791,12 +1254,11 @@ index d7f9652e..ca21f3e8 100644
 +/* The IFUNC dispatcher is only needed for builds that may run on
 +   pre-FMA hardware.  When the build targets x86-64-v3 or higher, FMA
 +   is guaranteed at run time, the per-TU USE_FMA_BUILTIN selector in
-+   sysdeps/x86_64/fpu/math-use-builtins-fma.h sees __FMA__ and the
-+   generic dbl-64/s_fma.c collapses to a single __builtin_fma -> one
-+   vfmadd213sd.  In that case we fall straight through to the
-+   #include below so __fma is emitted as a 6-byte leaf with no IFUNC
-+   resolver indirection at all.  This mirrors how e_sinh.c et al.
-+   handle the same situation upstream.  */
++   sysdeps/x86_64/fpu/math-use-builtins-fma.h sees __FMA__ and the generic
++   dbl-64/s_fma.c collapses to a single hardware FMA.  We therefore fall
++   through to the #include below, emitting __fma as a six-byte leaf without
++   IFUNC resolver indirection.  This mirrors how e_sinh.c et al. handle the
++   same situation upstream.  */
 +
 +# define NO_MATH_REDIRECT
 +# include <config.h>
@@ -1811,7 +1273,7 @@ index d7f9652e..ca21f3e8 100644
  
  extern double __fma_sse2 (double x, double y, double z) attribute_hidden;
  
-@@ -52,6 +64,7 @@ libm_ifunc (__fma, CPU_FEATURE_USABLE (FMA)
+@@ -52,6 +63,7 @@ libm_ifunc (__fma, CPU_FEATURE_USABLE (FMA)
  libm_alias_double (__fma, fma)
  libm_alias_double_narrow (__fma, fma)
  
@@ -1821,7 +1283,7 @@ index d7f9652e..ca21f3e8 100644
  
  #include <sysdeps/ieee754/dbl-64/s_fma.c>
 diff --git a/sysdeps/x86_64/fpu/multiarch/s_fmaf.c b/sysdeps/x86_64/fpu/multiarch/s_fmaf.c
-index 13f4f56f..af21da92 100644
+index 13f4f56f..f7ee28f7 100644
 --- a/sysdeps/x86_64/fpu/multiarch/s_fmaf.c
 +++ b/sysdeps/x86_64/fpu/multiarch/s_fmaf.c
 @@ -16,11 +16,19 @@
@@ -1838,7 +1300,7 @@ index 13f4f56f..af21da92 100644
 +/* See sysdeps/x86_64/fpu/multiarch/s_fma.c for the rationale of the
 +   ISA-level guard.  On x86-64-v3 and higher, __FMA__ is defined, the
 +   per-TU USE_FMAF_BUILTIN selector picks __builtin_fmaf, the generic
-+   dbl-64/s_fmaf.c collapses to a single vfmadd213ss, and the IFUNC
++   dbl-64/s_fmaf.c collapses to a single hardware FMA, and the IFUNC
 +   dispatcher below is unnecessary.  */
 +
 +# define NO_MATH_REDIRECT
