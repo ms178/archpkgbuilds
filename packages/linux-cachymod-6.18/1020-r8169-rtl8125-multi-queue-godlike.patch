@@ -1,163 +1,19 @@
-From: r8125 multi-queue rework
-Subject: [PATCH v7] r8169: multi-queue support for RTL8125BG
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CachyMod Rebase <rebase@cachymod.local>
+Date: Thu, 30 Jul 2026 18:20:07 +0000
+Subject: [PATCH 26/26] ms178/cachymod:
+ 1020-r8169-rtl8125-multi-queue-godlike.patch
 
-Add optional multi-queue, RSS and XDP support for the RTL8125B
-(RTL_GIGA_MAC_VER_63/64, PCI 10ec:8125), plus a page_pool based receive path.
+Rebased from v6.18.40 to v6.18.41.
+Original: ms178/archpkgbuilds linux-cachymod-6.18
 
-Hardware capability was taken from the audited Realtek out-of-tree driver
-r8125-9.018.00. RTL8125B is CFG_METHOD_4/5 there and reports
-HwSuppNumRxQueues = 8, HwSuppNumTxQueues = 2 (r8125_n.c:15673-15674),
-HwSuppRssVer = 5 with a 128 entry redirection table (r8125_n.c:15764-15765)
-and HwSuppIsrVer = 2 (r8125_n.c:15705-15708).
-
-Multi-queue, RSS and the type 3 receive descriptor are ENABLED BY DEFAULT on
-RTL8125B. The num_queues module parameter exists only as an override: 0
-(default) uses the full hardware capability, 1 forces the legacy single-queue
-path for bisecting, and any other value caps the RX ring count.
-
-Summary:
-
- - Per-queue state.  struct rtl8169_rx_ring and struct rtl8169_tx_ring hold
-   the descriptor ring, shadow array, page_pool, NAPI context, xdp_rxq and
-   MSI-X vector for one queue.  cur_tx and dirty_tx are separated by an
-   explicit L1_CACHE_BYTES pad because netdev_priv() is only NETDEV_ALIGN
-   aligned.  Shadow arrays are sized at runtime.
-
- - MSI-X and ISR v2 (num_queues > 1).  ISR v2 addresses sources by ISR bit
-   index and link change is bit 21, so fewer than 22 vectors silently
-   demotes the chip to ISR v1 (r8125_n.c:15732-15735); the driver requests
-   22..32.  RX queue i owns vector i, TX queue 0 owns vector 16 and TX queue
-   1 owns vector 18 (r8125_n.c:17993-17998), so every source armed in
-   rtl_set_irq_mask() has a handler.  INT_CFG0_ENABLE_8125 selects the ISR
-   v2 block and tracks the interrupt model actually armed.
-
- - Every hardirq handler masks its own vector before acknowledging it.
-   ISR v2 re-raises a source while its IMR bit is set, so a handler that
-   only acks and schedules NAPI is re-entered before the softirq can run:
-   the CPU spins in hardirq and no packet is processed while the carrier
-   stays up.  IMR_V2_SET/CLEAR are per-bit, so masking one source needs no
-   lock.  The poll routines unmask; the link vector, which has no NAPI
-   behind it, re-enables itself.
-
- - All hard interrupt handlers keep IRQF_NO_THREAD, so "threadirqs" cannot
-   defer them into a kthread where irq_default_primary_handler() would
-   leave ISR unacked and the interrupt line asserted.
-
- - Receive configuration is complete before the receiver is switched on.
-   EnableRxDescV3 (in RxConfig) selects the descriptor layout and RSS_CTRL
-   arms the hash engine; programming either after CmdRxEnb leaves a window
-   in which the MAC writes a layout the driver is not parsing, and those
-   frames are silently dropped.  The vendor has the same ordering:
-   rtl8125_hw_config() does this work and rtl8125_hw_start() only afterwards
-   writes CmdTxEnb | CmdRxEnb (r8125_n.c:18860-18915, 19164-19172).
-
- - Ring resize applies the new geometry only after the old rings are drained
-   and freed.  rtl8169_cleanup() walks the TX ring using tp->tx_ring_sz and
-   tp->tx_ring_mask, so publishing a smaller geometry first truncates the
-   drain, leaves live skbs and DMA mappings in the tail of the old ring and
-   yields a refcount underflow and use-after-free reachable from
-   "ethtool -G" while traffic is running.
-
- - The TX doorbell addresses the ring being kicked: on RTL8125 the poll
-   register carries one bit per TX ring, so a fixed BIT(0) never polls queue
-   1 and trips the netdev watchdog.
-
- - The transmit descriptor format matches the stride the driver indexes the
-   ring with. The MAC selects its stride from MAC OCP 0xEB58 bit 0: upstream
-   clears it and uses a 16 byte descriptor, which is correct for one ring,
-   while the vendor sets it and uses a 32 byte descriptor for the multi-ring
-   design (r8125.h:2029-2037, r8125_n.c:18922-18925, r8125_n.c:18445).
-   Arming the second ring through TNPDS_Q1_LOW_8125 while the MAC walks
-   descriptors with the legacy stride makes it read every ring-1 descriptor
-   from the wrong offset: the link stays up and the counters move, but the
-   frames are malformed, so TCP retransmits endlessly and throughput
-   collapses. rtl8169_set_tx_desc_type() picks the layout from the number of
-   rings actually armed, the ring is indexed through a shift accessor, and
-   0xEB58[0] is programmed to match.
-
- - MAC OCP 0xE63E[5:4] is programmed to 2 when a second TX ring is armed.
-   rtl_hw_start_8125_common() leaves this field at 0 for
-   RTL_GIGA_MAC_VER_63, which is correct for the single-queue configuration
-   upstream supports, but the vendor driver writes 2 unconditionally right
-   after setting the TX queue count (r8125_n.c:18936-18941) and TX queue 1
-   does not fetch descriptors reliably without it. The field is only
-   overridden when num_tx_queues > 1, so the single-queue path keeps
-   byte-for-byte upstream behaviour.
-
- - Type 3 descriptor decoding.  Status bits sit at different positions than
-   the legacy layout (r8125.h:1595-1598,1859-1860,1922-1930); decoding is
-   done through a per-layout bit table resolved once per NAPI poll, so a V3
-   descriptor is never parsed with V1 constants.
-
- - page_pool is mapped DMA_BIDIRECTIONAL because XDP_TX transmits the very
-   page the MAC wrote into.  Replacement buffers are always allocated before
-   a page is handed away, so a refill failure is a clean drop and can never
-   leave a descriptor unarmed or a page owned twice.  One xdp_rxq per queue,
-   the program lives in tp->xdp_prog, all five verdicts are handled and
-   xdp_do_flush() is issued once per poll.
-
- - NAPI is balanced across every error path, including the ring rebuild used
-   by MTU and ring size changes.  Per-queue weight is NAPI_POLL_WEIGHT.
-
- - RECEIVE DESCRIPTOR RE-ARM (v7, fixes the "works then dies" regression).
-   The type 3 receive descriptor keeps the buffer address in a union with the
-   receive timestamp (RxDescTimeStamp, r8125.h:2045-2091): bytes 16..23 hold
-   the address the driver programmed until the MAC completes a frame, and
-   then hold a timestamp.  The address is therefore destroyed by hardware on
-   every completion, and a descriptor re-armed without rewriting it points
-   the engine at a stale timestamp value.  The 16 byte layout does not behave
-   this way -- there the address is at 8..15 and writeback only touches 0..7
-   -- so this only affects the multi-queue configuration.
-   The failure is invisible for exactly one pass through the rings, because
-   until a descriptor is re-armed a second time it still holds what fill time
-   wrote.  With 8 queues x 512 descriptors that is 4096 packets of healthy
-   traffic: enough for link, DHCP, ARP, DNS and a validation run to pass
-   before every queue simultaneously starts receiving into unowned memory.
-   rtl8169_mark_to_asic() now takes the mapping of the buffer that is
-   installed in the slot at that moment and re-publishes it, exactly as
-   rtl8125_set_desc_dma_addr() does (r8125_n.c:21429-21437).  The address is
-   read back from the page via page_pool_get_dma_addr(), so no shadow array
-   is added and the drop, error, copybreak, page-flip, XDP and reset paths
-   are all correct by construction.
-
- - TRANSMIT COMPLETION / TxNoClose (v7, fixes the remaining stall).
-   The 32 byte transmit descriptor and TxNoClose are one hardware feature,
-   not two.  Selecting the new format with MAC OCP 0xEB58 bit 0 makes the MAC
-   stop writing DescOwn back into the descriptor: it reports progress through
-   a free-running count of closed descriptors in HW_CLO_PTR instead, and the
-   driver publishes its producer index in SW_TAIL_PTR rather than ringing
-   TxPoll.  The vendor driver never runs one without the other -- it sets
-   0xEB58 bit 0 unconditionally (r8125_n.c:18922-18925) and enables TxNoClose
-   for every chip with HwSuppTxNoCloseVer > 0, which for RTL8125B is version
-   3 (r8125_n.c:15550-15554, 15585-15586).
-   Arming the new format while still polling DescOwn means no transmit is
-   ever seen to complete.  The ring fills once and stops: the link stays up,
-   small amounts of traffic get out while the ring drains after a reset, and
-   then throughput collapses -- ping is lost entirely while the interface
-   reports no errors at all.
-   rtl_tx() now bounds its reclaim by the masked HW_CLO_PTR delta when
-   TxNoClose is armed (rtl8125_tx_interrupt_noclose(), r8125_n.c:20760-20800)
-   and keeps the DescOwn walk for the legacy layout.  TxConfig bit 6 is set
-   in lockstep with the descriptor type, the per-queue 0x2800/0x2802 pointer
-   pair is programmed with the version 3 stride (r8125_n.c:15204-15212), and
-   begin_hw_clo_ptr is reset with the ring indexes because the MAC zeroes the
-   pointer on reset (r8125_n.c:5025-5026).
-   The TX NAPI re-arm check also had to change: "cur_tx != dirty_tx" is true
-   for every descriptor legitimately in flight under TxNoClose, so using it
-   to decide whether to reschedule would spin the TX NAPI at 100% of a core.
-   It now asks the MAC whether anything has actually closed.
-
- - ethtool -l reports the queue configuration (get_channels).  Without it the
-   queue count could only be inferred from /proc/interrupts.  The setter is
-   deliberately not provided: the RX queue count is fixed at probe time by
-   the MSI-X allocation, the RSS table, the descriptor layout and the NAPI
-   contexts.
-
-Legacy chips are unaffected: everything above is gated on rtl_is_8125(), on
-num_queues, or on the number of MSI-X vectors actually granted.
+Signed-off-by: CachyMod Rebase <rebase@cachymod.local>
+---
+ drivers/net/ethernet/realtek/r8169_main.c | 2941 +++++++++++++++++++--
+ 1 file changed, 2672 insertions(+), 269 deletions(-)
 
 diff --git a/drivers/net/ethernet/realtek/r8169_main.c b/drivers/net/ethernet/realtek/r8169_main.c
-index d407b031cc2a..3179cc7cae4c 100644
+index d407b031cc2ae416eeb3bab2cedc9c861b150d6b..3179cc7cae4c1ba08e2b39fb66bf1270501d897e 100644
 --- a/drivers/net/ethernet/realtek/r8169_main.c
 +++ b/drivers/net/ethernet/realtek/r8169_main.c
 @@ -31,10 +31,38 @@
@@ -337,7 +193,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  #define R8169_TX_STOP_THRS	(MAX_SKB_FRAGS + 1)
  #define R8169_TX_START_THRS	(2 * R8169_TX_STOP_THRS)
  
-@@ -262,6 +411,11 @@
+@@ -262,6 +411,11 @@ enum rtl_registers {
  #define	RX_FIFO_THRESH			(7 << RXCFG_FIFO_SHIFT)
  #define	RX_EARLY_OFF			(1 << 11)
  #define	RX_PAUSE_SLOT_ON		(1 << 11)	/* 8125b and later */
@@ -349,7 +205,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  #define	RXCFG_DMA_SHIFT			8
  					/* Unlimited maximum PCI burst. */
  #define	RX_DMA_BURST			(7 << RXCFG_DMA_SHIFT)
-@@ -408,8 +562,6 @@
+@@ -408,8 +562,6 @@ enum rtl8125_registers {
  	TxPoll_8125		= 0x90,
  	LEDSEL3			= 0x96,
  	MAC0_BKP		= 0x19e0,
@@ -358,7 +214,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	EEE_TXIDLE_TIMER_8125	= 0x6048,
  };
  
-@@ -620,15 +772,101 @@
+@@ -620,15 +772,101 @@ struct TxDesc {
  	__le64 addr;
  };
  
@@ -461,7 +317,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  };
  
  struct rtl8169_counters {
-@@ -695,23 +933,116 @@
+@@ -695,23 +933,116 @@ enum rtl_dash_type {
  	RTL_DASH_25_BP,
  };
  
@@ -588,7 +444,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	u16 cp_cmd;
  	u16 tx_lpi_timer;
  	u32 irq_mask;
-@@ -744,6 +1075,21 @@
+@@ -744,6 +1075,21 @@ struct rtl8169_private {
  
  typedef void (*rtl_generic_fct)(struct rtl8169_private *tp);
  
@@ -610,7 +466,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  MODULE_AUTHOR("Realtek and the Linux r8169 crew <netdev@vger.kernel.org>");
  MODULE_DESCRIPTION("RealTek RTL-8169 Gigabit Ethernet driver");
  MODULE_SOFTDEP("pre: realtek");
-@@ -1567,7 +1913,12 @@
+@@ -1567,7 +1913,12 @@ static void rtl_ack_events(struct rtl8169_private *tp, u32 bits)
  
  static void rtl_irq_disable(struct rtl8169_private *tp)
  {
@@ -624,7 +480,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  		RTL_W32(tp, IntrMask_8125, 0);
  	else
  		RTL_W16(tp, IntrMask, 0);
-@@ -1575,7 +1926,9 @@
+@@ -1575,7 +1926,9 @@ static void rtl_irq_disable(struct rtl8169_private *tp)
  
  static void rtl_irq_enable(struct rtl8169_private *tp)
  {
@@ -635,7 +491,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  		RTL_W32(tp, IntrMask_8125, tp->irq_mask);
  	else
  		RTL_W16(tp, IntrMask, tp->irq_mask);
-@@ -1584,7 +1937,10 @@
+@@ -1584,7 +1937,10 @@ static void rtl_irq_enable(struct rtl8169_private *tp)
  static void rtl8169_irq_mask_and_ack(struct rtl8169_private *tp)
  {
  	rtl_irq_disable(tp);
@@ -647,7 +503,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	rtl_pci_commit(tp);
  }
  
-@@ -1783,9 +2139,15 @@
+@@ -1783,9 +2139,15 @@ static inline u32 rtl8169_tx_vlan_tag(struct sk_buff *skb)
  		TxVlanTag | swab16(skb_vlan_tag_get(skb)) : 0x00;
  }
  
@@ -665,7 +521,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  
  	if (opts2 & RxVlanTag)
  		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), swab16(opts2 & 0xffff));
-@@ -2189,15 +2551,92 @@
+@@ -2189,15 +2551,92 @@ static int rtl8169_set_eee(struct net_device *dev, struct ethtool_keee *data)
  	return phy_ethtool_set_eee(tp->phydev, data);
  }
  
@@ -764,7 +620,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  }
  
  static void rtl8169_get_pause_stats(struct net_device *dev,
-@@ -2302,7 +2741,195 @@
+@@ -2302,7 +2741,195 @@ static void rtl8169_get_eth_ctrl_stats(struct net_device *dev,
  		le32_to_cpu(tp->counters->rx_unknown_opcode);
  }
  
@@ -960,7 +816,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	.supported_coalesce_params = ETHTOOL_COALESCE_USECS |
  				     ETHTOOL_COALESCE_MAX_FRAMES,
  	.get_drvinfo		= rtl8169_get_drvinfo,
-@@ -2323,11 +2950,19 @@
+@@ -2323,11 +2950,19 @@ static const struct ethtool_ops rtl8169_ethtool_ops = {
  	.get_link_ksettings	= phy_ethtool_get_link_ksettings,
  	.set_link_ksettings	= phy_ethtool_set_link_ksettings,
  	.get_ringparam		= rtl8169_get_ringparam,
@@ -980,7 +836,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  };
  
  static const struct rtl_chip_info *rtl8169_get_chip_version(u16 xid, bool gmii)
-@@ -2504,8 +3139,14 @@
+@@ -2504,8 +3139,14 @@ static void rtl_init_rxcfg(struct rtl8169_private *tp)
  		RTL_W32(tp, RxConfig, RX_FETCH_DFLT_8125 | RX_DMA_BURST);
  		break;
  	case RTL_GIGA_MAC_VER_63 ... RTL_GIGA_MAC_VER_LAST:
@@ -996,7 +852,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  		break;
  	default:
  		RTL_W32(tp, RxConfig, RX128_INT_EN | RX_DMA_BURST);
-@@ -2515,7 +3156,110 @@
+@@ -2515,7 +3156,110 @@ static void rtl_init_rxcfg(struct rtl8169_private *tp)
  
  static void rtl8169_init_ring_indexes(struct rtl8169_private *tp)
  {
@@ -1108,7 +964,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  }
  
  static void rtl_jumbo_config(struct rtl8169_private *tp)
-@@ -2687,13 +3431,25 @@
+@@ -2687,13 +3431,25 @@ static void rtl_set_tx_config_registers(struct rtl8169_private *tp)
  	if (rtl_is_8168evl_up(tp))
  		val |= TXCFG_AUTO_FIFO;
  
@@ -1136,7 +992,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  }
  
  static void rtl_set_rx_tx_desc_registers(struct rtl8169_private *tp)
-@@ -2703,10 +3459,79 @@
+@@ -2703,11 +3459,80 @@ static void rtl_set_rx_tx_desc_registers(struct rtl8169_private *tp)
  	 * register to be written before TxDescAddrLow to work.
  	 * Switching from MMIO to I/O access fixes the issue as well.
  	 */
@@ -1144,6 +1000,7 @@ index d407b031cc2a..3179cc7cae4c 100644
 -	RTL_W32(tp, TxDescStartAddrLow, ((u64) tp->TxPhyAddr) & DMA_BIT_MASK(32));
 -	RTL_W32(tp, RxDescAddrHigh, ((u64) tp->RxPhyAddr) >> 32);
 -	RTL_W32(tp, RxDescAddrLow, ((u64) tp->RxPhyAddr) & DMA_BIT_MASK(32));
+-}
 +	unsigned int i;
 +
 +	RTL_W32(tp, TxDescStartAddrHigh, ((u64)tp->tx_ring[0].TxPhyAddr) >> 32);
@@ -1217,10 +1074,11 @@ index d407b031cc2a..3179cc7cae4c 100644
 +	}
 +
 +	r8168_mac_ocp_write(tp, 0xE63E, mac_ocp_data);
- }
++}
  
  static void rtl8169_set_magic_reg(struct rtl8169_private *tp)
-@@ -3697,8 +4522,13 @@
+ {
+@@ -3697,8 +4522,13 @@ static void rtl_hw_start_8125_common(struct rtl8169_private *tp)
  	r8168_mac_ocp_modify(tp, 0xd3e4, 0x00ff, 0x0000);
  	r8168_mac_ocp_modify(tp, 0xe860, 0x0000, 0x0080);
  
@@ -1236,7 +1094,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  
  	if (tp->mac_version == RTL_GIGA_MAC_VER_70 ||
  	    tp->mac_version == RTL_GIGA_MAC_VER_80)
-@@ -3863,7 +4693,15 @@
+@@ -3863,7 +4693,15 @@ static void rtl_hw_start_8125(struct rtl8169_private *tp)
  {
  	int i;
  
@@ -1253,7 +1111,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  
  	/* disable interrupt coalescing */
  	switch (tp->mac_version) {
-@@ -3942,6 +4780,11 @@
+@@ -3942,6 +4780,11 @@ static void rtl_hw_start(struct  rtl8169_private *tp)
  	rtl_enable_exit_l1(tp);
  	rtl_hw_aspm_clkreq_enable(tp, true);
  	rtl_set_rx_max_size(tp);
@@ -1265,7 +1123,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	rtl_set_rx_tx_desc_registers(tp);
  	rtl_lock_config_regs(tp);
  
-@@ -3950,11 +4793,32 @@
+@@ -3950,11 +4793,32 @@ static void rtl_hw_start(struct  rtl8169_private *tp)
  	/* Initially a 10 us delay. Turned it into a PCI commit. - FR */
  	rtl_pci_commit(tp);
  
@@ -1300,7 +1158,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	rtl_irq_enable(tp);
  }
  
-@@ -3967,94 +4831,301 @@
+@@ -3967,94 +4831,301 @@ static int rtl8169_change_mtu(struct net_device *dev, int new_mtu)
  	rtl_jumbo_config(tp);
  	rtl_set_eee_txidle_timer(tp);
  
@@ -1310,9 +1168,8 @@ index d407b031cc2a..3179cc7cae4c 100644
 +	 * rings have to be rebuilt.
 +	 */
 +	return rtl8169_reconfigure(tp);
- }
- 
--static void rtl8169_mark_to_asic(struct RxDesc *desc)
++}
++
 +/* An explicit, non-elidable prefetch.
 + *
 + * include/linux/prefetch.h only maps prefetch() to the architecture
@@ -1364,8 +1221,7 @@ index d407b031cc2a..3179cc7cae4c 100644
 +}
 +
 +static __le32 *rtl8169_rx_opts1(struct rtl8169_private *tp, void *desc)
- {
--	u32 eor = le32_to_cpu(desc->opts1) & RingEnd;
++{
 +	if (tp->rx_desc_v3)
 +		return &((struct RxDescV3 *)desc)->opts1;
 +	return &((struct RxDesc *)desc)->opts1;
@@ -1383,12 +1239,14 @@ index d407b031cc2a..3179cc7cae4c 100644
 +	if (tp->rx_desc_v3)
 +		return &((struct RxDescV3 *)desc)->addr;
 +	return &((struct RxDesc *)desc)->addr;
-+}
-+
+ }
+ 
+-static void rtl8169_mark_to_asic(struct RxDesc *desc)
 +/* Report the hardware RSS hash. Only meaningful with the type 3 layout. */
 +static void rtl8169_rx_hash(struct rtl8169_private *tp, void *desc,
 +			    struct sk_buff *skb)
-+{
+ {
+-	u32 eor = le32_to_cpu(desc->opts1) & RingEnd;
 +	struct RxDescV3 *v3 = desc;
 +	u16 info;
 +
@@ -1496,6 +1354,12 @@ index d407b031cc2a..3179cc7cae4c 100644
 -	int i;
 +	struct rtl8169_private *tp = ring->tp;
 +	unsigned int i;
++
++	if (!ring->RxDescArray || !ring->page_pool || !ring->Rx_databuff)
++		return;
++
++	for (i = 0; i < tp->rx_ring_sz; i++) {
++		void *desc = rtl8169_rx_desc(ring, i);
  
 -	for (i = 0; i < NUM_RX_DESC && tp->Rx_databuff[i]; i++) {
 -		dma_unmap_page(tp_to_dev(tp),
@@ -1505,12 +1369,6 @@ index d407b031cc2a..3179cc7cae4c 100644
 -		tp->Rx_databuff[i] = NULL;
 -		tp->RxDescArray[i].addr = 0;
 -		tp->RxDescArray[i].opts1 = 0;
-+	if (!ring->RxDescArray || !ring->page_pool || !ring->Rx_databuff)
-+		return;
-+
-+	for (i = 0; i < tp->rx_ring_sz; i++) {
-+		void *desc = rtl8169_rx_desc(ring, i);
-+
 +		if (ring->Rx_databuff[i]) {
 +			page_pool_put_full_page(ring->page_pool,
 +						ring->Rx_databuff[i], false);
@@ -1645,7 +1503,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  
  	dma_unmap_single(tp_to_dev(tp), le64_to_cpu(desc->addr), tx_skb->len,
  			 DMA_TO_DEVICE);
-@@ -4062,35 +5133,78 @@
+@@ -4062,35 +5133,78 @@ static void rtl8169_unmap_tx_skb(struct rtl8169_private *tp, unsigned int entry)
  	memset(tx_skb, 0, sizeof(*tx_skb));
  }
  
@@ -1665,12 +1523,13 @@ index d407b031cc2a..3179cc7cae4c 100644
  
  		if (len) {
 -			struct sk_buff *skb = tx_skb->skb;
-+			if (tx_skb->tx_type == RTL_TX_XDP) {
-+				struct xdp_frame *xdpf = tx_skb->xdpf;
- 
+-
 -			rtl8169_unmap_tx_skb(tp, entry);
 -			if (skb)
 -				dev_consume_skb_any(skb);
++			if (tx_skb->tx_type == RTL_TX_XDP) {
++				struct xdp_frame *xdpf = tx_skb->xdpf;
++
 +				/* Read the frame out before the unmap helper
 +				 * clears the slot.
 +				 */
@@ -1733,7 +1592,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  
  	/* Give a racing hard_start_xmit a few cycles to complete. */
  	synchronize_net();
-@@ -4127,17 +5241,143 @@
+@@ -4127,17 +5241,143 @@ static void rtl8169_cleanup(struct rtl8169_private *tp)
  
  static void rtl_reset_work(struct rtl8169_private *tp)
  {
@@ -1775,7 +1634,8 @@ index d407b031cc2a..3179cc7cae4c 100644
 +	rtl_hw_start(tp);
 +	netif_tx_wake_all_queues(tp->dev);
 +}
-+
+ 
+-	netif_stop_queue(tp->dev);
 +/* Rebuild the descriptor rings and the RX buffer pool after a geometry
 + * change (MTU or ring size). Must be called under RTNL.
 + *
@@ -1796,8 +1656,7 @@ index d407b031cc2a..3179cc7cae4c 100644
 +{
 +	struct net_device *dev = tp->dev;
 +	int rc;
- 
--	netif_stop_queue(tp->dev);
++
 +	ASSERT_RTNL();
  
 +	if (!netif_running(dev)) {
@@ -1826,14 +1685,14 @@ index d407b031cc2a..3179cc7cae4c 100644
 -		rtl8169_mark_to_asic(tp->RxDescArray + i);
 +	rtl8169_free_rx_resources(tp);
 +	rtl8169_free_rings(tp);
- 
--	napi_enable(&tp->napi);
++
 +	/* Safe to publish now: nothing references the old rings any more. */
 +	tp->rx_ring_sz = new_rx_sz;
 +	tp->rx_ring_mask = new_rx_sz - 1;
 +	tp->tx_ring_sz = new_tx_sz;
 +	tp->tx_ring_mask = new_tx_sz - 1;
-+
+ 
+-	napi_enable(&tp->napi);
 +	rtl8169_set_rx_buf_geometry(tp);
 +
 +	rc = rtl8169_alloc_rings(tp);
@@ -1882,7 +1741,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  }
  
  static void rtl8169_tx_timeout(struct net_device *dev, unsigned int txqueue)
-@@ -4147,10 +5387,12 @@
+@@ -4147,10 +5387,12 @@ static void rtl8169_tx_timeout(struct net_device *dev, unsigned int txqueue)
  	rtl_schedule_task(tp, RTL_FLAG_TASK_TX_TIMEOUT);
  }
  
@@ -1898,7 +1757,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	struct device *d = tp_to_dev(tp);
  	dma_addr_t mapping;
  	u32 opts1;
-@@ -4168,21 +5410,23 @@
+@@ -4168,21 +5410,23 @@ static int rtl8169_tx_map(struct rtl8169_private *tp, const u32 *opts, u32 len,
  	txd->opts2 = cpu_to_le32(opts[1]);
  
  	opts1 = opts[0] | len;
@@ -1925,7 +1784,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	unsigned int cur_frag;
  
  	for (cur_frag = 0; cur_frag < info->nr_frags; cur_frag++) {
-@@ -4190,16 +5434,17 @@
+@@ -4190,16 +5434,17 @@ static int rtl8169_xmit_frags(struct rtl8169_private *tp, struct sk_buff *skb,
  		void *addr = skb_frag_address(frag);
  		u32 len = skb_frag_size(frag);
  
@@ -1946,7 +1805,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	return -EIO;
  }
  
-@@ -4353,9 +5598,10 @@
+@@ -4353,9 +5598,10 @@ static bool rtl8169_tso_csum_v2(struct rtl8169_private *tp,
  	return true;
  }
  
@@ -1959,7 +1818,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  }
  
  /* Versions RTL8102e and from RTL8168c onwards support csum_v2 */
-@@ -4370,10 +5616,64 @@
+@@ -4370,10 +5616,64 @@ static bool rtl_chip_supports_csum_v2(struct rtl8169_private *tp)
  	}
  }
  
@@ -1972,9 +1831,7 @@ index d407b031cc2a..3179cc7cae4c 100644
 + * (rtl8125_fast_mod_mask(), r8125_n.c:20574).
 + */
 +static u32 rtl8169_tx_closed(struct rtl8169_tx_ring *ring)
- {
--	if (rtl_is_8125(tp))
--		RTL_W16(tp, TxPoll_8125, BIT(0));
++{
 +	struct rtl8169_private *tp = ring->tp;
 +	u32 hw_clo;
 +
@@ -1991,7 +1848,9 @@ index d407b031cc2a..3179cc7cae4c 100644
 + * TX NAPI forever and burn a core.
 + */
 +static bool rtl8169_tx_pending_work(struct rtl8169_tx_ring *ring)
-+{
+ {
+-	if (rtl_is_8125(tp))
+-		RTL_W16(tp, TxPoll_8125, BIT(0));
 +	struct rtl8169_private *tp = ring->tp;
 +
 +	if (READ_ONCE(ring->cur_tx) == READ_ONCE(ring->dirty_tx))
@@ -2027,7 +1886,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	else
  		RTL_W8(tp, TxPoll, NPQ);
  }
-@@ -4382,16 +5682,22 @@
+@@ -4382,16 +5682,22 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
  				      struct net_device *dev)
  {
  	struct rtl8169_private *tp = netdev_priv(dev);
@@ -2054,7 +1913,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  		return NETDEV_TX_BUSY;
  	}
  
-@@ -4403,47 +5709,50 @@
+@@ -4403,47 +5709,50 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
  	else if (!rtl8169_tso_csum_v2(tp, skb, opts))
  		goto err_dma_0;
  
@@ -2117,48 +1976,88 @@ index d407b031cc2a..3179cc7cae4c 100644
  err_dma_0:
  	dev_kfree_skb_any(skb);
  	dev->stats.tx_dropped++;
-@@ -4528,104 +5837,347 @@
+@@ -4528,104 +5837,347 @@ static void rtl8169_pcierr_interrupt(struct net_device *dev)
  	rtl_schedule_task(tp, RTL_FLAG_TASK_RESET_PENDING);
  }
  
 -static void rtl_tx(struct net_device *dev, struct rtl8169_private *tp,
+-		   int budget)
 +static int rtl8169_xmit_xdpf(struct rtl8169_tx_ring *ring,
 +			     struct xdp_frame *xdpf)
-+{
+ {
+-	unsigned int dirty_tx, bytes_compl = 0, pkts_compl = 0;
+-	struct sk_buff *skb;
 +	struct rtl8169_private *tp = ring->tp;
 +	struct device *d = tp_to_dev(tp);
 +	unsigned int entry;
 +	struct TxDesc *txd;
 +	dma_addr_t mapping;
 +	u32 opts1;
-+
+ 
+-	dirty_tx = tp->dirty_tx;
 +	if (unlikely(xdpf->len > tp->rx_buf_len))
 +		return -EOVERFLOW;
-+
+ 
+-	while (READ_ONCE(tp->cur_tx) != dirty_tx) {
+-		unsigned int entry = dirty_tx % NUM_TX_DESC;
+-		u32 status;
 +	/* Leave room for the normal transmit path: XDP frames bypass BQL and
 +	 * the queue-stop threshold.
 +	 */
 +	if (unlikely(rtl_tx_slots_avail(ring) <= R8169_TX_STOP_THRS))
 +		return -EBUSY;
-+
+ 
+-		status = le32_to_cpu(READ_ONCE(tp->TxDescArray[entry].opts1));
+-		if (status & DescOwn)
+-			break;
 +	mapping = dma_map_single(d, xdpf->data, xdpf->len, DMA_TO_DEVICE);
 +	if (unlikely(dma_mapping_error(d, mapping)))
 +		return -ENOMEM;
-+
+ 
+-		skb = tp->tx_skb[entry].skb;
+-		rtl8169_unmap_tx_skb(tp, entry);
 +	entry = ring->cur_tx & tp->tx_ring_mask;
 +	txd = rtl8169_tx_desc(ring, entry);
-+
+ 
+-		if (skb) {
+-			pkts_compl++;
+-			bytes_compl += skb->len;
+-			napi_consume_skb(skb, budget);
+-		}
+-		dirty_tx++;
+-	}
 +	ring->tx_skb[entry].xdpf    = xdpf;
 +	ring->tx_skb[entry].len     = xdpf->len;
 +	ring->tx_skb[entry].tx_type = RTL_TX_XDP;
-+
+ 
+-	if (tp->dirty_tx != dirty_tx) {
+-		dev_sw_netstats_tx_add(dev, pkts_compl, bytes_compl);
+-		WRITE_ONCE(tp->dirty_tx, dirty_tx);
 +	txd->addr  = cpu_to_le64(mapping);
 +	txd->opts2 = 0;
-+
+ 
+-		netif_subqueue_completed_wake(dev, 0, pkts_compl, bytes_compl,
+-					      rtl_tx_slots_avail(tp),
+-					      R8169_TX_START_THRS);
+-		/*
+-		 * 8168 hack: TxPoll requests are lost when the Tx packets are
+-		 * too close. Let's kick an extra TxPoll request when a burst
+-		 * of start_xmit activity is detected (if it is not detected,
+-		 * it is slow enough). -- FR
+-		 * If skb is NULL then we come here again once a tx irq is
+-		 * triggered after the last fragment is marked transmitted.
+-		 */
+-		if (READ_ONCE(tp->cur_tx) != dirty_tx && skb)
+-			rtl8169_doorbell(tp);
+-	}
+-}
 +	opts1 = DescOwn | FirstFrag | LastFrag | xdpf->len;
 +	if (entry == tp->tx_ring_mask)
 +		opts1 |= RingEnd;
-+
+ 
+-static inline int rtl8169_fragmented_frame(u32 status)
+-{
+-	return (status & (FirstFrag | LastFrag)) != (FirstFrag | LastFrag);
 +	/* Publish the descriptor before handing ownership to the MAC. */
 +	dma_wmb();
 +	WRITE_ONCE(txd->opts1, cpu_to_le32(opts1));
@@ -2168,8 +2067,9 @@ index d407b031cc2a..3179cc7cae4c 100644
 +	WRITE_ONCE(ring->cur_tx, ring->cur_tx + 1);
 +
 +	return 0;
-+}
-+
+ }
+ 
+-static inline void rtl8169_rx_csum(struct sk_buff *skb, u32 opts1)
 +/* Pick the TX ring an XDP transmit should use.
 + *
 + * Using the current CPU keeps the XDP transmit on the same core that ran the
@@ -2178,35 +2078,56 @@ index d407b031cc2a..3179cc7cae4c 100644
 + */
 +static struct rtl8169_tx_ring *rtl8169_xdp_txring(struct rtl8169_private *tp,
 +						  unsigned int *qidx)
-+{
+ {
+-	u32 status = opts1 & (RxProtoMask | RxCSFailMask);
 +	unsigned int q = 0;
-+
+ 
+-	if (status == RxProtoTCP || status == RxProtoUDP)
+-		skb->ip_summed = CHECKSUM_UNNECESSARY;
+-	else
+-		skb_checksum_none_assert(skb);
 +	if (tp->num_tx_queues > 1)
 +		q = raw_smp_processor_id() % tp->num_tx_queues;
 +
 +	*qidx = q;
 +	return &tp->tx_ring[q];
-+}
-+
+ }
+ 
+-static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget)
 +/* XDP_TX: bounce the frame straight back out of this device.
 + *
 + * On failure the buffer is still owned by the RX ring and the caller
 + * re-arms the descriptor, so the frame must NOT be returned here.
 + */
 +static int rtl8169_xdp_tx(struct rtl8169_private *tp, struct xdp_buff *xdp)
-+{
+ {
+-	struct device *d = tp_to_dev(tp);
+-	int count;
 +	struct xdp_frame *xdpf = xdp_convert_buff_to_frame(xdp);
 +	struct rtl8169_tx_ring *ring;
 +	struct netdev_queue *txq;
 +	unsigned int qidx;
 +	int rc;
-+
+ 
+-	for (count = 0; count < budget; count++, tp->cur_rx++) {
+-		unsigned int pkt_size, entry = tp->cur_rx % NUM_RX_DESC;
+-		struct RxDesc *desc = tp->RxDescArray + entry;
+-		struct sk_buff *skb;
+-		const void *rx_buf;
+-		dma_addr_t addr;
+-		u32 status;
 +	if (unlikely(!xdpf))
 +		return -EFAULT;
-+
+ 
+-		status = le32_to_cpu(READ_ONCE(desc->opts1));
+-		if (status & DescOwn)
+-			break;
 +	ring = rtl8169_xdp_txring(tp, &qidx);
 +	txq = netdev_get_tx_queue(tp->dev, qidx);
-+
+ 
+-		/* This barrier is needed to keep us from reading
+-		 * any other fields out of the Rx descriptor until
+-		 * we know the status of DescOwn
 +	__netif_tx_lock(txq, smp_processor_id());
 +	rc = rtl8169_xmit_xdpf(ring, xdpf);
 +	if (likely(!rc))
@@ -2252,19 +2173,14 @@ index d407b031cc2a..3179cc7cae4c 100644
 +}
 +
 +static void rtl_tx(struct net_device *dev, struct rtl8169_tx_ring *ring,
- 		   int budget)
- {
- 	unsigned int dirty_tx, bytes_compl = 0, pkts_compl = 0;
--	struct sk_buff *skb;
++		   int budget)
++{
++	unsigned int dirty_tx, bytes_compl = 0, pkts_compl = 0;
 +	struct rtl8169_private *tp = ring->tp;
 +	u32 tx_left;
- 
--	dirty_tx = tp->dirty_tx;
++
 +	dirty_tx = ring->dirty_tx;
- 
--	while (READ_ONCE(tp->cur_tx) != dirty_tx) {
--		unsigned int entry = dirty_tx % NUM_TX_DESC;
--		u32 status;
++
 +	/* Two completely different completion protocols.
 +	 *
 +	 * Legacy (16 byte descriptor): the MAC clears DescOwn in each
@@ -2284,18 +2200,13 @@ index d407b031cc2a..3179cc7cae4c 100644
 +	if (tp->tx_no_close) {
 +		tx_left = min(READ_ONCE(ring->cur_tx) - dirty_tx,
 +			      rtl8169_tx_closed(ring));
- 
--		status = le32_to_cpu(READ_ONCE(tp->TxDescArray[entry].opts1));
--		if (status & DescOwn)
--			break;
++
 +		/* Consume this many closed descriptors; the MAC keeps
 +		 * counting from where it is now.
 +		 */
 +		ring->begin_hw_clo_ptr = (ring->begin_hw_clo_ptr + tx_left) &
 +					 TX_NO_CLOSE_PTR_MASK_8125;
- 
--		skb = tp->tx_skb[entry].skb;
--		rtl8169_unmap_tx_skb(tp, entry);
++
 +		/* The closed-pointer read must be ordered before the
 +		 * descriptor payload reads it authorises.
 +		 */
@@ -2304,11 +2215,7 @@ index d407b031cc2a..3179cc7cae4c 100644
 +	} else {
 +		tx_left = READ_ONCE(ring->cur_tx) - dirty_tx;
 +	}
- 
--		if (skb) {
--			pkts_compl++;
--			bytes_compl += skb->len;
--			napi_consume_skb(skb, budget);
++
 +	for (; tx_left > 0; tx_left--) {
 +		unsigned int entry = dirty_tx & tp->tx_ring_mask;
 +
@@ -2343,16 +2250,10 @@ index d407b031cc2a..3179cc7cae4c 100644
 +				bytes_compl += skb->len;
 +				napi_consume_skb(skb, budget);
 +			}
- 		}
- 		dirty_tx++;
- 	}
- 
--	if (tp->dirty_tx != dirty_tx) {
--		dev_sw_netstats_tx_add(dev, pkts_compl, bytes_compl);
--		WRITE_ONCE(tp->dirty_tx, dirty_tx);
--
--		netif_subqueue_completed_wake(dev, 0, pkts_compl, bytes_compl,
--					      rtl_tx_slots_avail(tp),
++		}
++		dirty_tx++;
++	}
++
 +	if (ring->dirty_tx != dirty_tx) {
 +		if (pkts_compl)
 +			dev_sw_netstats_tx_add(dev, pkts_compl, bytes_compl);
@@ -2361,27 +2262,17 @@ index d407b031cc2a..3179cc7cae4c 100644
 +		netif_subqueue_completed_wake(dev, ring->index, pkts_compl,
 +					      bytes_compl,
 +					      rtl_tx_slots_avail(ring),
- 					      R8169_TX_START_THRS);
--		/*
--		 * 8168 hack: TxPoll requests are lost when the Tx packets are
--		 * too close. Let's kick an extra TxPoll request when a burst
--		 * of start_xmit activity is detected (if it is not detected,
--		 * it is slow enough). -- FR
--		 * If skb is NULL then we come here again once a tx irq is
--		 * triggered after the last fragment is marked transmitted.
++					      R8169_TX_START_THRS);
 +		/* Re-kick only in the legacy mode. With TxNoClose the MAC
 +		 * already knows the producer index -- it was written to
 +		 * SW_TAIL_PTR by the transmit path -- and re-writing it here
 +		 * from the completion context would race that write.
- 		 */
--		if (READ_ONCE(tp->cur_tx) != dirty_tx && skb)
--			rtl8169_doorbell(tp);
++		 */
 +		if (!tp->tx_no_close && READ_ONCE(ring->cur_tx) != dirty_tx)
 +			rtl8169_doorbell(ring);
- 	}
- }
- 
--static inline int rtl8169_fragmented_frame(u32 status)
++	}
++}
++
 +/* Status-bit positions differ between the legacy and the type 3 receive
 + * descriptor, so they are resolved once per ring geometry into this table
 + * rather than branched on per packet.
@@ -2415,20 +2306,16 @@ index d407b031cc2a..3179cc7cae4c 100644
 +
 +static inline const struct rtl8169_rx_bits *
 +rtl8169_rx_bits(const struct rtl8169_private *tp)
- {
--	return (status & (FirstFrag | LastFrag)) != (FirstFrag | LastFrag);
++{
 +	return tp->rx_desc_v3 ? &rtl8169_rx_bits_v3 : &rtl8169_rx_bits_v1;
- }
- 
--static inline void rtl8169_rx_csum(struct sk_buff *skb, u32 opts1)
++}
++
 +static inline int rtl8169_fragmented_frame(const struct rtl8169_rx_bits *b,
 +					   u32 status)
- {
--	u32 status = opts1 & (RxProtoMask | RxCSFailMask);
++{
 +	return (status & b->first_last) != b->first_last;
 +}
- 
--	if (status == RxProtoTCP || status == RxProtoUDP)
++
 +/* The legacy layout encodes the protocol as a 2-bit field, the type 3 layout
 + * uses one flag per protocol plus a separate failure flag
 + * (r8125_n.c:20988-21000).
@@ -2447,26 +2334,22 @@ index d407b031cc2a..3179cc7cae4c 100644
 +
 +	if ((opts1 & (RxProtoMask | RxCSFailMask)) == RxProtoTCP ||
 +	    (opts1 & (RxProtoMask | RxCSFailMask)) == RxProtoUDP)
- 		skb->ip_summed = CHECKSUM_UNNECESSARY;
- 	else
- 		skb_checksum_none_assert(skb);
- }
- 
--static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget)
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
++	else
++		skb_checksum_none_assert(skb);
++}
++
 +static int rtl_rx(struct net_device *dev, struct rtl8169_rx_ring *ring,
 +		  int budget)
- {
++{
 +	struct rtl8169_private *tp = ring->tp;
 +	const struct rtl8169_rx_bits *bits = rtl8169_rx_bits(tp);
 +	struct bpf_prog *xdp_prog = rcu_dereference_bh(tp->xdp_prog);
 +	u32 copybreak = READ_ONCE(tp->rx_copybreak);
- 	struct device *d = tp_to_dev(tp);
++	struct device *d = tp_to_dev(tp);
 +	bool xdp_redirected = false;
- 	int count;
- 
--	for (count = 0; count < budget; count++, tp->cur_rx++) {
--		unsigned int pkt_size, entry = tp->cur_rx % NUM_RX_DESC;
--		struct RxDesc *desc = tp->RxDescArray + entry;
++	int count;
++
 +	for (count = 0; count < budget; count++, ring->cur_rx++) {
 +		unsigned int entry = ring->cur_rx & tp->rx_ring_mask;
 +		void *desc = rtl8169_rx_desc(ring, entry);
@@ -2474,19 +2357,14 @@ index d407b031cc2a..3179cc7cae4c 100644
 +		unsigned int pkt_size, offset;
 +		struct page *cur_page;
 +		struct page *page;
- 		struct sk_buff *skb;
--		const void *rx_buf;
- 		dma_addr_t addr;
- 		u32 status;
- 
--		status = le32_to_cpu(READ_ONCE(desc->opts1));
++		struct sk_buff *skb;
++		dma_addr_t addr;
++		u32 status;
++
 +		status = le32_to_cpu(READ_ONCE(*rtl8169_rx_opts1(tp, desc)));
- 		if (status & DescOwn)
- 			break;
- 
--		/* This barrier is needed to keep us from reading
--		 * any other fields out of the Rx descriptor until
--		 * we know the status of DescOwn
++		if (status & DescOwn)
++			break;
++
 +		/* Do not read the rest of the descriptor before DescOwn has
 +		 * been observed clear.
  		 */
@@ -2513,7 +2391,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  				goto release_descriptor;
  		}
  
-@@ -4636,43 +6188,204 @@
+@@ -4636,43 +6188,204 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget
  		/* The driver does not support incoming fragmented frames.
  		 * They are seen as a symptom of over-mtu sized frames.
  		 */
@@ -2667,15 +2545,15 @@ index d407b031cc2a..3179cc7cae4c 100644
 +							new_page, true);
 +				goto drop;
 +			}
- 
--		rtl8169_rx_csum(skb, status);
++
 +			skb_mark_for_recycle(skb);
 +			skb_reserve(skb, offset);
 +			skb_put(skb, pkt_size);
 +
 +			ring->Rx_databuff[entry] = new_page;
 +		}
-+
+ 
+-		rtl8169_rx_csum(skb, status);
 +		rtl8169_rx_csum(tp, skb, status,
 +				le32_to_cpu(*rtl8169_rx_opts2(tp, desc)));
 +		rtl8169_rx_hash(tp, desc, skb);
@@ -2735,7 +2613,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	return count;
  }
  
-@@ -4695,7 +6408,7 @@
+@@ -4695,7 +6408,7 @@ static irqreturn_t rtl8169_interrupt(int irq, void *dev_instance)
  		phy_mac_interrupt(tp->phydev);
  
  	rtl_irq_disable(tp);
@@ -2744,7 +2622,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  out:
  	rtl_ack_events(tp, status);
  
-@@ -4730,19 +6443,49 @@
+@@ -4730,19 +6443,49 @@ static void rtl_task(struct work_struct *work)
  	if (test_and_clear_bit(RTL_FLAG_TASK_RESET_PENDING, tp->wk.flags)) {
  reset:
  		rtl_reset_work(tp);
@@ -2798,7 +2676,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  
  	if (work_done < budget && napi_complete_done(napi, work_done))
  		rtl_irq_enable(tp);
-@@ -4750,6 +6493,128 @@
+@@ -4750,6 +6493,128 @@ static int rtl8169_poll(struct napi_struct *napi, int budget)
  	return work_done;
  }
  
@@ -2927,7 +2805,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  static void r8169_phylink_handler(struct net_device *ndev)
  {
  	struct rtl8169_private *tp = netdev_priv(ndev);
-@@ -4817,7 +6682,7 @@
+@@ -4817,7 +6682,7 @@ static void rtl8169_up(struct rtl8169_private *tp)
  	phy_init_hw(tp->phydev);
  	phy_resume(tp->phydev);
  	rtl8169_init_phy(tp);
@@ -2936,7 +2814,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	enable_work(&tp->wk.work);
  	rtl_reset_work(tp);
  
-@@ -4831,20 +6696,15 @@
+@@ -4831,20 +6696,15 @@ static int rtl8169_close(struct net_device *dev)
  
  	pm_runtime_get_sync(&pdev->dev);
  
@@ -2961,18 +2839,18 @@ index d407b031cc2a..3179cc7cae4c 100644
  
  	pm_runtime_put_sync(&pdev->dev);
  
-@@ -4855,42 +6715,145 @@
+@@ -4855,42 +6715,145 @@ static int rtl8169_close(struct net_device *dev)
  static void rtl8169_netpoll(struct net_device *dev)
  {
  	struct rtl8169_private *tp = netdev_priv(dev);
 +	unsigned int i;
- 
--	rtl8169_interrupt(tp->irq, tp);
++
 +	if (tp->isr_ver < 2) {
 +		rtl8169_interrupt(tp->irq, tp);
 +		return;
 +	}
-+
+ 
+-	rtl8169_interrupt(tp->irq, tp);
 +	for (i = 0; i < tp->num_rx_queues; i++)
 +		rtl8169_interrupt_msix(tp->rx_ring[i].irq, &tp->rx_ring[i]);
  }
@@ -3124,7 +3002,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	if (retval < 0)
  		goto err_release_fw_2;
  
-@@ -4899,27 +6862,24 @@
+@@ -4899,27 +6862,24 @@ static int rtl_open(struct net_device *dev)
  		goto err_free_irq;
  
  	rtl8169_up(tp);
@@ -3164,7 +3042,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  }
  
  static void
-@@ -4972,7 +6932,7 @@
+@@ -4972,7 +6932,7 @@ static int rtl8169_runtime_resume(struct device *dev)
  	rtl_rar_set(tp, tp->dev->dev_addr);
  	__rtl8169_set_wol(tp, tp->saved_wolopts);
  
@@ -3173,7 +3051,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  		rtl8169_up(tp);
  
  	netif_device_attach(tp->dev);
-@@ -5012,7 +6972,7 @@
+@@ -5012,7 +6972,7 @@ static int rtl8169_runtime_suspend(struct device *device)
  {
  	struct rtl8169_private *tp = dev_get_drvdata(device);
  
@@ -3182,7 +3060,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  		netif_device_detach(tp->dev);
  		return 0;
  	}
-@@ -5073,6 +7033,8 @@
+@@ -5073,6 +7033,8 @@ static void rtl_remove_one(struct pci_dev *pdev)
  
  	unregister_netdev(tp->dev);
  
@@ -3191,7 +3069,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	if (tp->dash_type != RTL_DASH_NONE)
  		rtl8168_driver_stop(tp);
  
-@@ -5093,6 +7055,8 @@
+@@ -5093,6 +7055,8 @@ static const struct net_device_ops rtl_netdev_ops = {
  	.ndo_change_mtu		= rtl8169_change_mtu,
  	.ndo_fix_features	= rtl8169_fix_features,
  	.ndo_set_features	= rtl8169_set_features,
@@ -3200,7 +3078,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	.ndo_set_mac_address	= rtl_set_mac_address,
  	.ndo_eth_ioctl		= phy_do_ioctl_running,
  	.ndo_set_rx_mode	= rtl_set_rx_mode,
-@@ -5104,15 +7068,190 @@
+@@ -5104,15 +7068,190 @@ static const struct net_device_ops rtl_netdev_ops = {
  
  static void rtl_set_irq_mask(struct rtl8169_private *tp)
  {
@@ -3391,7 +3269,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  
  	switch (tp->mac_version) {
  	case RTL_GIGA_MAC_VER_02 ... RTL_GIGA_MAC_VER_06:
-@@ -5128,7 +7267,235 @@
+@@ -5128,7 +7267,235 @@ static int rtl_alloc_irq(struct rtl8169_private *tp)
  		break;
  	}
  
@@ -3628,7 +3506,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  }
  
  static void rtl_read_mac_address(struct rtl8169_private *tp,
-@@ -5392,7 +7759,13 @@
+@@ -5392,7 +7759,13 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
  	u32 txconfig;
  	u16 xid;
  
@@ -3643,7 +3521,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	if (!dev)
  		return -ENOMEM;
  
-@@ -5479,15 +7852,25 @@
+@@ -5479,15 +7852,25 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
  
  	tp->irq = pci_irq_vector(pdev, 0);
  
@@ -3671,7 +3549,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	dev->hw_features = NETIF_F_IP_CSUM | NETIF_F_RXCSUM |
  			   NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_RX;
  	dev->vlan_features = NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_TSO;
-@@ -5527,6 +7910,24 @@
+@@ -5527,6 +7910,24 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
  	    tp->mac_version != RTL_GIGA_MAC_VER_61)
  		dev->features |= dev->hw_features;
  
@@ -3696,7 +3574,7 @@ index d407b031cc2a..3179cc7cae4c 100644
  	dev->hw_features |= NETIF_F_RXALL;
  	dev->hw_features |= NETIF_F_RXFCS;
  
-@@ -5563,8 +7964,10 @@
+@@ -5563,8 +7964,10 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
  		return rc;
  
  	rc = register_netdev(dev);
