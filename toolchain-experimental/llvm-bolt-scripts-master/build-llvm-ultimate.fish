@@ -1,6 +1,6 @@
 #!/usr/bin/env fish
 
-# build-llvm-ultimate.v25.fish
+# build-llvm-ultimate.v26.fish
 #
 # Modernized multi-stage LLVM build pipeline for the ms178 patch stack.
 #
@@ -194,6 +194,25 @@
 #      checks immediately after install, before compiler-rt final runtime work.
 #    • PCH policy remains untouched.
 #
+# v26 / perfected-v2 sanitizer-resource installation fix:
+#    • Root cause: compiler-rt/lib/CMakeLists.txt adds the independent
+#      sanitizer_ignorelists component only inside COMPILER_RT_BUILD_SANITIZERS.
+#      This script deliberately defaults that option to OFF, so a normal
+#      `ninja install` omitted share/{asan,cfi,hwasan,msan}_ignorelist.txt even
+#      though Clang unconditionally requires the matching system ignorelist
+#      whenever that sanitizer is enabled. Chromium official CFI therefore
+#      failed before its first C++ object was compiled.
+#    • Install all four canonical ignorelists directly from the exact checked-out
+#      compiler-rt source revision into every relevant Clang resource directory.
+#      This is exactly the data-only upstream install rule; it does not enable or
+#      link sanitizer runtimes and has no build-time/runtime performance cost.
+#    • Byte-compare every installed list with its source, and compile a real
+#      Raptor Lake ThinLTO+CFI translation unit with stage1, final, and post-BOLT
+#      Clang. Empty files, -fno-sanitize-ignorelist, and disabling CFI are rejected.
+#    • Final resource installation is unconditional on BUILD_COMPILER_RT, because
+#      the ignorelists are Clang driver resources, not runtime libraries.
+#    • Correct stale version labels and always print the compiler-rt summary.
+#
 # ============================================================================
 # Pipeline overview:
 #   Stage 0: sanitize environment, select a clean host clang/clang++ pair,
@@ -210,12 +229,12 @@
 # ============================================================================
 
 function die
-    echo (set_color -o red)"[LLVM-ULTIMATE-V25][FATAL]"(set_color normal) "$argv" >&2
+    echo (set_color -o red)"[LLVM-ULTIMATE-V26][FATAL]"(set_color normal) "$argv" >&2
     exit 1
 end
 
 function log
-    echo (set_color -o cyan)"[LLVM-ULTIMATE-V25]"(set_color normal) "$argv"
+    echo (set_color -o cyan)"[LLVM-ULTIMATE-V26]"(set_color normal) "$argv"
 end
 
 function run
@@ -294,12 +313,83 @@ function verify_compiler_rt_profile_runtime --argument-names ClangPath Triple De
     log "$Desc: verified compiler-rt profile runtime: $profile_lib"
 end
 
+# Install Clang's mandatory implicit sanitizer system ignorelists independently
+# of COMPILER_RT_BUILD_SANITIZERS. Upstream currently gates the data-only CMake
+# component behind that runtime option, although the files are compiler-driver
+# resources and are required even for CFI's trap mode (which needs no runtime).
+function install_sanitizer_ignorelists --argument-names ResourceDir Desc
+    test -n "$LLVM_SRC"; or die "$Desc: LLVM_SRC is empty"
+    test -d "$ResourceDir"; or die "$Desc: clang resource directory missing: $ResourceDir"
+    set -l source_dir "$LLVM_SRC/compiler-rt/lib/sanitizer_ignorelists"
+    test -d "$source_dir"; or die "$Desc: upstream sanitizer ignorelist source directory missing: $source_dir"
+
+    set -l names \
+        asan_ignorelist.txt \
+        cfi_ignorelist.txt \
+        hwasan_ignorelist.txt \
+        msan_ignorelist.txt
+    set -l destination_dir "$ResourceDir/share"
+    command mkdir -p "$destination_dir"; or die "$Desc: cannot create $destination_dir"
+
+    for name in $names
+        set -l source_file "$source_dir/$name"
+        set -l destination_file "$destination_dir/$name"
+        test -s "$source_file"; or die "$Desc: canonical upstream ignorelist missing or empty: $source_file"
+        command install -m 0644 "$source_file" "$destination_file"; or die "$Desc: failed to install $destination_file"
+        test -s "$destination_file"; or die "$Desc: installed ignorelist missing or empty: $destination_file"
+        command cmp -s "$source_file" "$destination_file"; or die "$Desc: installed ignorelist differs from checked-out source: $destination_file"
+    end
+    log "$Desc: installed and byte-verified Clang sanitizer ignorelists in $destination_dir"
+end
+
+function verify_sanitizer_ignorelists --argument-names ResourceDir Desc
+    set -l source_dir "$LLVM_SRC/compiler-rt/lib/sanitizer_ignorelists"
+    for name in asan_ignorelist.txt cfi_ignorelist.txt hwasan_ignorelist.txt msan_ignorelist.txt
+        set -l source_file "$source_dir/$name"
+        set -l destination_file "$ResourceDir/share/$name"
+        test -s "$destination_file"; or die "$Desc: required Clang sanitizer ignorelist missing or empty: $destination_file"
+        command cmp -s "$source_file" "$destination_file"; or die "$Desc: sanitizer ignorelist is not from the checked-out LLVM revision: $destination_file"
+    end
+end
+
+# Exercise the exact driver path that exposed the packaging defect. This is a
+# compile-only CFI test: it requires the implicit cfi_ignorelist.txt but does not
+# require a CFI runtime library because Clang's Linux CFI defaults to trap mode.
+function smoke_test_clang_cfi_resources --argument-names ClangPath Triple Desc
+    verify_executable "$ClangPath" "$Desc clang"
+    test -n "$Triple"; or die "$Desc: empty target triple for CFI resource smoke test"
+    set -l resource_dir (env -u LD_PRELOAD "$ClangPath" -print-resource-dir)
+    test -n "$resource_dir"; or die "$Desc: clang did not report a resource directory"
+    verify_sanitizer_ignorelists "$resource_dir" "$Desc"
+
+    set -l smoke_dir "$BUILD_ROOT/cfi-resource-smoke"
+    rm -rf "$smoke_dir"
+    mkdir -p "$smoke_dir"
+    printf '%s\n' \
+        'struct Base { virtual int f(); };' \
+        'struct Final final : Base { int f() override { return 26; } };' \
+        'int Base::f() { return 0; }' \
+        'int call(Base *p) { return p->f(); }' >"$smoke_dir/probe.cc"
+
+    env -u LD_PRELOAD "$ClangPath" \
+        --target="$Triple" -march=raptorlake -O2 -flto=thin \
+        -fvisibility=hidden -fsanitize=cfi-vcall -fsanitize=cfi-icall \
+        -c "$smoke_dir/probe.cc" -o "$smoke_dir/probe.o" >"$smoke_dir/probe.log" 2>&1
+    if test $status -ne 0
+        cat "$smoke_dir/probe.log" >&2; or true
+        die "$Desc: Raptor Lake ThinLTO+CFI resource smoke test failed (log: $smoke_dir/probe.log)"
+    end
+    test -s "$smoke_dir/probe.o"; or die "$Desc: CFI smoke test produced no object"
+    rm -rf "$smoke_dir"
+    log "$Desc: Raptor Lake ThinLTO+CFI resource smoke test passed"
+end
+
 function verify_no_mimalloc_dependency --argument-names BinPath Desc
     verify_executable "$BinPath" "$Desc"
     if command -q ldd
         set -l deps (ldd "$BinPath" 2>/dev/null | string collect)
         if string match -qi '*mimalloc*' -- "$deps"
-            if test "$ALLOW_TOOLCHAIN_MIMALLOC_DEP" = "1"
+            if test "$ALLOW_TOOLCHAIN_MIMALLOC_DEP" = 1
                 warn "$Desc has a mimalloc runtime dependency and ALLOW_TOOLCHAIN_MIMALLOC_DEP=1 is set. This is unsafe."
             else
                 echo "$deps" >&2
@@ -377,7 +467,7 @@ end
 
 function configure_lto_pgo_mismatch_policy --argument-names ClangPath LldDir
     set -g LTO_PGO_MISMATCH_LINKER_FLAGS
-    if test "$ALLOW_LTO_PGO_HASH_MISMATCH" != "1"
+    if test "$ALLOW_LTO_PGO_HASH_MISMATCH" != 1
         log "Strict LTO PGO profile mismatch mode requested: hash mismatch warnings are not suppressed."
         return 0
     end
@@ -388,7 +478,7 @@ function configure_lto_pgo_mismatch_policy --argument-names ClangPath LldDir
     set -l probe_dir "$BUILD_ROOT/probe-lto-pgo-mismatch-flag"
     rm -rf "$probe_dir"
     mkdir -p "$probe_dir"
-    printf 'int main(void) { return 0; }\n' > "$probe_dir/probe.c"
+    printf 'int main(void) { return 0; }\n' >"$probe_dir/probe.c"
 
     set -l flag -Wl,--no-lto-pgo-warn-mismatch
     if "$ClangPath" -fuse-ld=lld -B"$LldDir" $flag "$probe_dir/probe.c" -o "$probe_dir/probe" >/dev/null 2>"$probe_dir/probe.err"
@@ -435,8 +525,8 @@ set -g LLVM_COMMON_DISABLE_CMAKE_ARGS \
 
 # CSIR-PGO is mandatory in this pipeline.
 set -q DO_CSPGO; or set -g DO_CSPGO 1
-if test "$DO_CSPGO" != "1"
-    die "DO_CSPGO=0 is no longer supported: CSIR-PGO is mandatory in build-llvm-ultimate.v25.fish"
+if test "$DO_CSPGO" != 1
+    die "DO_CSPGO=0 is no longer supported: CSIR-PGO is mandatory in build-llvm-ultimate.v26.fish"
 end
 
 # Obsolete kill-switch: the only correct final CSPGO profile for this pipeline
@@ -522,9 +612,9 @@ set -g LTO_STAGE_LINK_FLAGS (string join ' ' -- $LTO_STAGE_LINK_FLAGS_LIST)
 # and training builds MUST equal the set used by the final Stage 5 build so
 # that PGO CFG hashes match at consume time (no "hash mismatch ... discarded").
 # ---------------------------------------------------------------------------
-set -g C_PGO_MATCH_FLAGS_LIST   $COMMON_FLAGS_LIST $C_LTO_FLAGS_LIST
+set -g C_PGO_MATCH_FLAGS_LIST $COMMON_FLAGS_LIST $C_LTO_FLAGS_LIST
 set -g CXX_PGO_MATCH_FLAGS_LIST $COMMON_FLAGS_LIST $CXX_LTO_FLAGS_LIST
-set -g C_PGO_MATCH_FLAGS   (string join ' ' -- $C_PGO_MATCH_FLAGS_LIST)
+set -g C_PGO_MATCH_FLAGS (string join ' ' -- $C_PGO_MATCH_FLAGS_LIST)
 set -g CXX_PGO_MATCH_FLAGS (string join ' ' -- $CXX_PGO_MATCH_FLAGS_LIST)
 
 set -g ALLOCATOR_LINK "-lpthread -lstdc++ -lm -ldl"
@@ -534,7 +624,7 @@ set -g ALLOCATOR_LINK "-lpthread -lstdc++ -lm -ldl"
 # main(), even when LD_PRELOAD is cleared.  This is exactly what the V24 log
 # showed.  Keep allocator tuning outside the compiler binary unless explicitly
 # and consciously requested.
-if test "$USE_MIMALLOC" = "1"
+if test "$USE_MIMALLOC" = 1
     set -l found_static ""
     set -l found_shared ""
     for d in /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/local/lib
@@ -551,7 +641,7 @@ if test "$USE_MIMALLOC" = "1"
         set -g ALLOCATOR_LINK "-Wl,--push-state -Wl,--whole-archive $found_static -Wl,--pop-state $ALLOCATOR_LINK"
         log "Using explicitly requested static mimalloc ($found_static)."
     else if test -n "$found_shared"
-        if test "$ALLOW_UNSAFE_SHARED_MIMALLOC_LINK" = "1"
+        if test "$ALLOW_UNSAFE_SHARED_MIMALLOC_LINK" = 1
             set -l d (dirname "$found_shared")
             set -g ALLOCATOR_LINK "-L$d -lmimalloc $ALLOCATOR_LINK"
             warn "Using UNSAFE shared mimalloc link ($found_shared); final clang will be checked for crashes."
@@ -567,7 +657,7 @@ end
 
 if set -q LD_PRELOAD
     set -g USER_LD_PRELOAD "$LD_PRELOAD"
-    if not set -q ALLOW_BUILD_LD_PRELOAD; or test "$ALLOW_BUILD_LD_PRELOAD" != "1"
+    if not set -q ALLOW_BUILD_LD_PRELOAD; or test "$ALLOW_BUILD_LD_PRELOAD" != 1
         log "Clearing LD_PRELOAD for deterministic bootstrap subprocesses (was: $USER_LD_PRELOAD). Set ALLOW_BUILD_LD_PRELOAD=1 to override."
         set -e LD_PRELOAD
     else
@@ -607,7 +697,7 @@ function clangxx_for_clang --argument-names CCompiler
     set -l Dir (dirname "$CCompiler")
     set -l Base (basename "$CCompiler")
     set -l CxxCandidate ""
-    if test "$Base" = "clang"
+    if test "$Base" = clang
         set CxxCandidate "$Dir/clang++"
     else if string match -qr '^clang-[0-9]+(\.[0-9]+)*$' -- "$Base"
         set -l Suffix (string replace 'clang' '' -- "$Base")
@@ -704,10 +794,10 @@ set -l _host_probe_log "$SCRIPT_DIR/host-probe.log"
 rm -rf "$_host_probe_dir"
 mkdir -p "$_host_probe_dir"
 set -l _host_lld_dir (dirname "$HOST_LD_LLD")
-: > "$_host_probe_log"
+: >"$_host_probe_log"
 
-printf '%s\n' 'int main(void) { return 0; }' > "$_host_probe_dir/probe.c"
-printf '%s\n' '#include <type_traits>' 'int main() { static_assert(std::is_same_v<int,int>); return 0; }' > "$_host_probe_dir/probe.cpp"
+printf '%s\n' 'int main(void) { return 0; }' >"$_host_probe_dir/probe.c"
+printf '%s\n' '#include <type_traits>' 'int main() { static_assert(std::is_same_v<int,int>); return 0; }' >"$_host_probe_dir/probe.cpp"
 
 begin
     echo "HOST_CLANG=$HOST_CLANG"
@@ -753,7 +843,7 @@ end
 # fatal under STRICT_CMAKE_WARNINGS=1.
 set -g CMAKE_WARNING_MODE_ARGS -Wno-author
 
-if set -q LLVM_ULTIMATE_SELF_TEST; and test "$LLVM_ULTIMATE_SELF_TEST" = "1"
+if set -q LLVM_ULTIMATE_SELF_TEST; and test "$LLVM_ULTIMATE_SELF_TEST" = 1
     log "Self-test completed: validate_profdata defined, matching-hash PGO flags configured, stage1 binutils pinning helpers present, mandatory CSIR-PGO policy, one-step raw-CSIR + first-pass-IR final profile merge policy, default LTO PGO hash-mismatch tolerant policy, complete-lld/no-sed source policy, LLVMgold-safe no-semantic-interposition policy, uniform split-LTO-unit policy, strict CMake warning gate, verbose Ninja failure diagnostics, host compiler pairing, fish flag splitting, linker probing, LD_PRELOAD sanitization, and CMake policy defaults validated."
     exit 0
 end
@@ -771,7 +861,7 @@ set -g GOLD_PLUGIN_API_DIR (find_gold_plugin_api_dir)
 if test -n "$GOLD_PLUGIN_API_DIR"
     set -g LLVM_BINUTILS_INCDIR "$GOLD_PLUGIN_API_DIR"
     log "Found gold plugin headers at: $LLVM_BINUTILS_INCDIR"
-else if test "$REQUIRE_GOLD_PLUGIN" = "1"
+else if test "$REQUIRE_GOLD_PLUGIN" = 1
     die "plugin-api.h not found. Install GNU gold/binutils plugin headers or set LLVM_BINUTILS_INCDIR explicitly before running."
 else
     log "WARNING: plugin-api.h not found; LLVMgold.so will not be built."
@@ -833,7 +923,7 @@ if not test -f "$STAMP"
         set -l pf (find_patch $p)
         if test -n "$pf"
             set -l dry_log "/tmp/patch-$p-dry.log"
-            if not patch --dry-run -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch < "$pf" > "$dry_log" 2>&1
+            if not patch --dry-run -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch <"$pf" >"$dry_log" 2>&1
                 log "--- DRY RUN OUTPUT FOR $p ---"
                 cat "$dry_log"
                 die "Patch $p failed --dry-run against current llvm-project main. Rebase it first."
@@ -848,7 +938,7 @@ if not test -f "$STAMP"
         set -l pf (find_patch $p)
         if test -n "$pf"
             set -l real_log "/tmp/patch-$p.log"
-            patch -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch < "$pf" > "$real_log" 2>&1
+            patch -p1 -d "$LLVM_SRC" --fuzz=0 -F0 --no-backup-if-mismatch <"$pf" >"$real_log" 2>&1
             set -l patch_status $status
             grep -E '^patching file |^Hunk |reject|FAILED|offset|fuzz' "$real_log" | sed 's/^/      /'
             if test $patch_status -ne 0
@@ -858,14 +948,14 @@ if not test -f "$STAMP"
             end
         end
     end
-    date > "$STAMP"
+    date >"$STAMP"
 end
 
 log "Keeping upstream test/unittest source directories intact; CMake disables test targets instead."
 
 set -g CMAKE_FRESH ""
-if cmake --help 2>/dev/null | grep -q -- "--fresh"
-    set -g CMAKE_FRESH "--fresh"
+if cmake --help 2>/dev/null | grep -q -- --fresh
+    set -g CMAKE_FRESH --fresh
 end
 
 function emit_cmake_warning_diagnostics --argument-names CMakeLog BuildDir
@@ -878,7 +968,7 @@ end
 
 function assert_clean_cmake_log --argument-names CMakeLog BuildDir
     test -s "$CMakeLog"; or die "missing CMake configure log for $BuildDir: $CMakeLog"
-    if test "$STRICT_CMAKE_WARNINGS" = "1"
+    if test "$STRICT_CMAKE_WARNINGS" = 1
         if grep -qE '(^CMake Warning|Policy CMP[0-9]+|Manually-specified variables were not used|Using std::regex with exceptions disabled)' "$CMakeLog"
             emit_cmake_warning_diagnostics "$CMakeLog" "$BuildDir"
             die "CMake warning detected for $BuildDir (full log: $CMakeLog). Fix the configure, do not ignore it. Set STRICT_CMAKE_WARNINGS=0 only for deliberate local triage."
@@ -911,7 +1001,7 @@ function run_ninja_logged --argument-names BuildDir
         end
         echo "==================== ERROR-LIKE DIAGNOSTICS ====================" >&2
         grep -nE 'FAILED:|(^|[: ])error:|ld\.lld: error|clang(\+\+)?: error|Killed|signal [0-9]+|Segmentation fault|No space left|Permission denied|fatal:' "$ninja_log" | head -n 160 >&2; or true
-        if grep -q 'runtimes/builtins-stamps/builtins-configure' "$ninja_log"; and grep -q 'Builtin supported architectures:[[:space:]]*$' "$ninja_log"
+        if grep -q runtimes/builtins-stamps/builtins-configure "$ninja_log"; and grep -q 'Builtin supported architectures:[[:space:]]*$' "$ninja_log"
             die "compiler-rt builtins configure failed with zero supported architectures. This is a runtime bootstrap/configuration failure, not a PGO hash mismatch. v19 avoids it by building compiler-rt in a separate post-install runtimes stage with installed clang and clean runtime flags. Full log: $ninja_log"
         end
         die "ninja failed for $BuildDir target(s): $argv (full verbose log: $ninja_log)"
@@ -963,12 +1053,12 @@ set -g STAGE1_BINUTILS_CMAKE_ARGS
 
 function activate_stage1_binutils
     set -g STAGE1_BIN "$BUILD_ROOT/stage1/bin"
-    set -g STAGE1_AR      "$STAGE1_BIN/llvm-ar"
-    set -g STAGE1_RANLIB  "$STAGE1_BIN/llvm-ranlib"
-    set -g STAGE1_NM      "$STAGE1_BIN/llvm-nm"
+    set -g STAGE1_AR "$STAGE1_BIN/llvm-ar"
+    set -g STAGE1_RANLIB "$STAGE1_BIN/llvm-ranlib"
+    set -g STAGE1_NM "$STAGE1_BIN/llvm-nm"
     set -g STAGE1_OBJCOPY "$STAGE1_BIN/llvm-objcopy"
     set -g STAGE1_OBJDUMP "$STAGE1_BIN/llvm-objdump"
-    set -g STAGE1_STRIP   "$STAGE1_BIN/llvm-strip"
+    set -g STAGE1_STRIP "$STAGE1_BIN/llvm-strip"
     # llvm-readelf is often a symlink/driver of llvm-readobj
     if test -x "$STAGE1_BIN/llvm-readelf"
         set -g STAGE1_READELF "$STAGE1_BIN/llvm-readelf"
@@ -988,12 +1078,12 @@ function activate_stage1_binutils
 
     # Export for any build step that reads the environment (some ninja
     # response paths, external scripts, BOLT helpers).
-    set -gx AR      "$STAGE1_AR"
-    set -gx RANLIB  "$STAGE1_RANLIB"
-    set -gx NM      "$STAGE1_NM"
+    set -gx AR "$STAGE1_AR"
+    set -gx RANLIB "$STAGE1_RANLIB"
+    set -gx NM "$STAGE1_NM"
     set -gx OBJCOPY "$STAGE1_OBJCOPY"
     set -gx OBJDUMP "$STAGE1_OBJDUMP"
-    set -gx STRIP   "$STAGE1_STRIP"
+    set -gx STRIP "$STAGE1_STRIP"
     set -gx LLVM_AR "$STAGE1_AR"
     set -gx LLVM_NM "$STAGE1_NM"
     set -gx LLVM_RANLIB "$STAGE1_RANLIB"
@@ -1039,7 +1129,7 @@ function assert_cmake_ar_pinned --argument-names BuildDir Context
         set -l cached_ar (grep -E "^$_ar_key:" "$BuildDir/CMakeCache.txt" 2>/dev/null | string replace -r '.*=' '')
         if test -z "$cached_ar"
             # Some CMake versions omit COMPILER_AR until first LTO compile; CMAKE_AR must exist.
-            if test "$_ar_key" = "CMAKE_AR"
+            if test "$_ar_key" = CMAKE_AR
                 die "$Context: $_ar_key missing from CMakeCache.txt — cannot guarantee bitcode tool match"
             end
             continue
@@ -1059,7 +1149,6 @@ configure_clean "$BUILD_ROOT/stage1" -S "$LLVM_SRC/llvm" \
     -DCMAKE_BUILD_TYPE=Release \
     $LLVM_COMMON_DISABLE_CMAKE_ARGS \
     -DLLVM_ENABLE_PROJECTS="clang;lld" \
-    \
     -DLLVM_TARGETS_TO_BUILD="X86;BPF" \
     -DLLVM_USE_LINKER=lld \
     -DCLANG_DEFAULT_LINKER=lld \
@@ -1095,7 +1184,7 @@ configure_lto_pgo_mismatch_policy "$STAGE1_CLANG" "$STAGE1_BIN"
 # there is no top-level `compiler-rt` Ninja target there.  Build compiler-rt as
 # a separate runtimes configure into the stage1 prefix, then prove stage1 clang
 # can link instrumented binaries before entering PGO stages.
-if test "$BUILD_STAGE1_COMPILER_RT" = "1"
+if test "$BUILD_STAGE1_COMPILER_RT" = 1
     set -g STAGE1_RT_DIR "$BUILD_ROOT/stage1-compiler-rt"
     set -g STAGE1_TARGET_TRIPLE ("$STAGE1_CLANG" -dumpmachine)
     test -n "$STAGE1_TARGET_TRIPLE"; or die "stage1 clang did not report a target triple"
@@ -1144,6 +1233,10 @@ if test "$BUILD_STAGE1_COMPILER_RT" = "1"
         -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -B$STAGE1_BIN" \
         -DCMAKE_MODULE_LINKER_FLAGS="-fuse-ld=lld -B$STAGE1_BIN"
     run_ninja_logged "$STAGE1_RT_DIR" install
+    # COMPILER_RT_BUILD_SANITIZERS=OFF intentionally avoids building sanitizer
+    # runtimes, but Clang's driver data must still be installed independently.
+    install_sanitizer_ignorelists "$STAGE1_RESOURCE_DIR" "stage1 clang resources"
+    smoke_test_clang_cfi_resources "$STAGE1_CLANG" "$STAGE1_TARGET_TRIPLE" "stage1 clang"
     verify_compiler_rt_profile_runtime "$STAGE1_CLANG" "$STAGE1_TARGET_TRIPLE" "stage1 compiler-rt"
 else
     log "BUILD_STAGE1_COMPILER_RT=0: skipping stage1 compiler-rt runtime install; profile-runtime probe must still pass via host/system runtime."
@@ -1152,7 +1245,7 @@ end
 set -l _pgo_probe "$BUILD_ROOT/stage1-profile-runtime-probe"
 rm -rf "$_pgo_probe"
 mkdir -p "$_pgo_probe"
-printf '%s\n' 'int main(void) { return 0; }' > "$_pgo_probe/probe.c"
+printf '%s\n' 'int main(void) { return 0; }' >"$_pgo_probe/probe.c"
 "$STAGE1_CLANG" -fprofile-instr-generate -fuse-ld=lld -B"$STAGE1_BIN" "$_pgo_probe/probe.c" -o "$_pgo_probe/probe" >"$_pgo_probe/probe.log" 2>&1
 if test $status -ne 0
     cat "$_pgo_probe/probe.log" >&2
@@ -1167,8 +1260,8 @@ log "Stage1 compiler-rt/profile runtime probe passed."
 set -l _lto_probe "$BUILD_ROOT/lto-tls-probe"
 rm -rf "$_lto_probe"
 mkdir -p "$_lto_probe"
-printf '%s\n' 'extern "C" thread_local int plugin_tls;' 'extern "C" thread_local int plugin_tls = 7;' 'extern "C" int plugin_get() { return plugin_tls; }' > "$_lto_probe/plugin.cpp"
-printf '%s\n' 'struct B { virtual ~B() = default; virtual int f() const = 0; };' 'struct D final : B { int f() const override { return 0; } };' 'int main() { D d; B *b = &d; return b->f(); }' > "$_lto_probe/main.cpp"
+printf '%s\n' 'extern "C" thread_local int plugin_tls;' 'extern "C" thread_local int plugin_tls = 7;' 'extern "C" int plugin_get() { return plugin_tls; }' >"$_lto_probe/plugin.cpp"
+printf '%s\n' 'struct B { virtual ~B() = default; virtual int f() const = 0; };' 'struct D final : B { int f() const override { return 0; } };' 'int main() { D d; B *b = &d; return b->f(); }' >"$_lto_probe/main.cpp"
 begin
     "$STAGE1_CLANGXX" $COMMON_FLAGS_LIST $CXX_LTO_FLAGS_LIST -fPIC -std=c++17 -c "$_lto_probe/plugin.cpp" -o "$_lto_probe/plugin.o"
     and "$STAGE1_CLANGXX" $COMMON_FLAGS_LIST $CXX_LTO_FLAGS_LIST -std=c++17 -c "$_lto_probe/main.cpp" -o "$_lto_probe/main.o"
@@ -1243,7 +1336,7 @@ for f in $TRAIN_FILES
     end
 end
 
-if test "$FULL_TRAIN" = "1"
+if test "$FULL_TRAIN" = 1
     set -l tb "$BUILD_ROOT/full-pgo-train"
     rm -rf "$tb"
     configure_clean "$tb" -S "$LLVM_SRC/llvm" \
@@ -1304,7 +1397,7 @@ for f in $TRAIN_FILES
     end
 end
 
-if test "$FULL_TRAIN" = "1"
+if test "$FULL_TRAIN" = 1
     set -l ctb "$BUILD_ROOT/full-cspgo-train"
     rm -rf "$ctb"
     configure_clean "$ctb" -S "$LLVM_SRC/llvm" \
@@ -1373,6 +1466,18 @@ assert_cmake_ar_pinned "$BUILD_ROOT/stage2" "stage5 final"
 verify_bitcode_tool_pair "$STAGE1_CLANG" "$STAGE1_AR" "stage5 final"
 run_ninja_logged "$BUILD_ROOT/stage2" install
 
+# Sanitizer ignorelists are Clang driver resources, not sanitizer runtime
+# libraries. Install them unconditionally, including when BUILD_COMPILER_RT=0 or
+# COMPILER_RT_BUILD_SANITIZERS=OFF, and prove official-build CFI can compile.
+set -g INSTALLED_FINAL_CLANG "$INSTALL_PREFIX/bin/clang"
+verify_executable "$INSTALLED_FINAL_CLANG" "installed final clang"
+set -g INSTALLED_FINAL_TRIPLE (env -u LD_PRELOAD "$INSTALLED_FINAL_CLANG" -dumpmachine)
+test -n "$INSTALLED_FINAL_TRIPLE"; or die "installed final clang did not report a target triple"
+set -g INSTALLED_FINAL_RESOURCE_DIR (env -u LD_PRELOAD "$INSTALLED_FINAL_CLANG" -print-resource-dir)
+test -n "$INSTALLED_FINAL_RESOURCE_DIR"; or die "installed final clang did not report a resource directory"
+install_sanitizer_ignorelists "$INSTALLED_FINAL_RESOURCE_DIR" "final clang resources"
+smoke_test_clang_cfi_resources "$INSTALLED_FINAL_CLANG" "$INSTALLED_FINAL_TRIPLE" "final clang before compiler-rt/BOLT"
+
 # ===========================================================================
 # Stage 5b — compiler-rt post-install runtime build
 # ===========================================================================
@@ -1381,7 +1486,7 @@ run_ninja_logged "$BUILD_ROOT/stage2" install
 # directory.  Do not use LLVM_ENABLE_RUNTIMES inside the final PGO+ThinLTO LLVM
 # build: compiler-rt's nested builtins configure must not use an in-progress
 # final compiler or PGO/LTO/WPD flags.
-if test "$BUILD_COMPILER_RT" = "1"
+if test "$BUILD_COMPILER_RT" = 1
     set -g FINAL_CLANG "$INSTALL_PREFIX/bin/clang"
     set -g FINAL_CLANGXX "$INSTALL_PREFIX/bin/clang++"
     set -g FINAL_LLD "$INSTALL_PREFIX/bin/ld.lld"
@@ -1459,11 +1564,14 @@ if test "$BUILD_COMPILER_RT" = "1"
         -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -B$STAGE1_BIN" \
         -DCMAKE_MODULE_LINKER_FLAGS="-fuse-ld=lld -B$STAGE1_BIN"
     run_ninja_logged "$RUNTIME_DIR" install
+    # If sanitizer runtimes were enabled, upstream installs these files too;
+    # verify that the runtime install preserved the exact source-revision data.
+    verify_sanitizer_ignorelists "$FINAL_RESOURCE_DIR" "final clang after compiler-rt install"
     verify_compiler_rt_profile_runtime "$FINAL_CLANG" "$FINAL_TARGET_TRIPLE" "final compiler-rt"
     set -l _final_pgo_probe "$BUILD_ROOT/final-profile-runtime-probe"
     rm -rf "$_final_pgo_probe"
     mkdir -p "$_final_pgo_probe"
-    printf '%s\n' 'int main(void) { return 0; }' > "$_final_pgo_probe/probe.c"
+    printf '%s\n' 'int main(void) { return 0; }' >"$_final_pgo_probe/probe.c"
     "$FINAL_CLANG" -fprofile-instr-generate -fuse-ld=lld -B"$INSTALL_PREFIX/bin" "$_final_pgo_probe/probe.c" -o "$_final_pgo_probe/probe" >"$_final_pgo_probe/probe.log" 2>&1
     if test $status -ne 0
         cat "$_final_pgo_probe/probe.log" >&2
@@ -1477,7 +1585,7 @@ end
 
 # LLVMgold verification
 set -g LLVMGOLD_SO "$INSTALL_PREFIX/lib/LLVMgold.so"
-if test "$REQUIRE_GOLD_PLUGIN" = "1"
+if test "$REQUIRE_GOLD_PLUGIN" = 1
     verify_file_exists "$LLVMGOLD_SO" "LLVMgold.so"
     log "Verified LLVMgold.so: $LLVMGOLD_SO"
     verify_file_exists "$BUILD_ROOT/stage2/lib/LLVMgold.so" "stage2 LLVMgold.so"
@@ -1513,8 +1621,8 @@ set -gx PATH "$INSTALL_PREFIX/bin" $PATH
 # ===========================================================================
 set -g BOLT "$INSTALL_PREFIX/bin/llvm-bolt"
 set -g MERGE "$INSTALL_PREFIX/bin/merge-fdata"
-verify_executable "$BOLT" "llvm-bolt"
-verify_executable "$INSTALL_PREFIX/bin/clang" "clang"
+verify_executable "$BOLT" llvm-bolt
+verify_executable "$INSTALL_PREFIX/bin/clang" clang
 
 # Prefer install-tree readelf; fall back to whatever is on PATH.
 set -g READELF_BIN "$INSTALL_PREFIX/bin/llvm-readelf"
@@ -1586,7 +1694,7 @@ function bolt_optimize_binary --argument-names Name BinPath
         if test (count $Frags) -gt 0
             run "$MERGE" $Frags -o "$Prof"
             rm -f $Frags
-        else if test "$BOLT_BEST_EFFORT" = "1"
+        else if test "$BOLT_BEST_EFFORT" = 1
             rm -f "$Inst"
             return 0
         else
@@ -1595,25 +1703,25 @@ function bolt_optimize_binary --argument-names Name BinPath
     end
     if not test -s "$Prof"
         rm -f "$Inst"
-        if test "$BOLT_BEST_EFFORT" = "1"
+        if test "$BOLT_BEST_EFFORT" = 1
             return 0
         else
             die "no BOLT profile for $Name"
         end
     end
     if not "$BOLT" "$Real" -o "$Opt" \
-        --data "$Prof" --dyno-stats --reorder-blocks=ext-tsp --reorder-functions=cdsort \
-        --split-functions --split-strategy=cdsplit --split-all-cold --split-eh \
-        --icf=safe --jump-tables=move --indirect-call-promotion=all --peepholes=all \
-        --simplify-rodata-loads --x86-strip-redundant-address-size --strip-rep-ret --inline-memcpy \
-        --plt=all --hugify --use-gnu-stack --update-debug-sections=0
+            --data "$Prof" --dyno-stats --reorder-blocks=ext-tsp --reorder-functions=cdsort \
+            --split-functions --split-strategy=cdsplit --split-all-cold --split-eh \
+            --icf=safe --jump-tables=move --indirect-call-promotion=all --peepholes=all \
+            --simplify-rodata-loads --x86-strip-redundant-address-size --strip-rep-ret --inline-memcpy \
+            --plt=all --hugify --use-gnu-stack --update-debug-sections=0
         run "$BOLT" "$Real" -o "$Opt" \
             --data "$Prof" --dyno-stats --reorder-blocks=ext-tsp --reorder-functions=cdsort \
             --split-functions --split-all-cold --split-eh --icf=safe --jump-tables=move --use-gnu-stack --update-debug-sections=0
     end
     mv -f "$Opt" "$Real"
     rm -f "$Inst" "$Prof"
-    if test "$KEEP_PRE_BOLT_BACKUP" = "1"
+    if test "$KEEP_PRE_BOLT_BACKUP" = 1
         log "[$Name] keeping pre-BOLT backup at $Backup"
     else
         rm -f "$Backup"
@@ -1631,9 +1739,17 @@ end
 set -l _bolt_leftovers (path filter -- "$BUILD_ROOT"/bolt*)
 test (count $_bolt_leftovers) -gt 0; and rm -rf $_bolt_leftovers
 
-log "ULTIMATE v11 build finished. Toolchain at: $INSTALL_PREFIX"
-if test "$REQUIRE_GOLD_PLUGIN" = "1"
+# BOLT rewrites the actual installed executables. Re-run both generic driver and
+# CFI-resource smoke tests on the deliverable, not merely the pre-BOLT binary.
+verify_no_mimalloc_dependency "$INSTALL_PREFIX/bin/clang" "post-BOLT final clang"
+smoke_test_clang_driver "$INSTALL_PREFIX/bin/clang" "post-BOLT final clang"
+set -l _post_bolt_triple (env -u LD_PRELOAD "$INSTALL_PREFIX/bin/clang" -dumpmachine)
+smoke_test_clang_cfi_resources "$INSTALL_PREFIX/bin/clang" "$_post_bolt_triple" "post-BOLT final clang"
+
+log "ULTIMATE v26 build finished. Toolchain at: $INSTALL_PREFIX"
+if test "$REQUIRE_GOLD_PLUGIN" = 1
     log "Verified deliverables: $INSTALL_PREFIX/bin/clang  $INSTALL_PREFIX/bin/ld.lld  $INSTALL_PREFIX/lib/LLVMgold.so"
-log "compiler-rt : stage1=$BUILD_STAGE1_COMPILER_RT final=$BUILD_COMPILER_RT sanitizers=$COMPILER_RT_BUILD_SANITIZERS profile=$COMPILER_RT_BUILD_PROFILE resource-dir layout verified; final compiler-rt compiled by stage1; mimalloc dependency forbidden by default"
 end
+log "compiler-rt: stage1=$BUILD_STAGE1_COMPILER_RT final=$BUILD_COMPILER_RT sanitizers=$COMPILER_RT_BUILD_SANITIZERS profile=$COMPILER_RT_BUILD_PROFILE; resource-dir layout and sanitizer ignorelists verified; final compiler-rt compiled by stage1; mimalloc dependency forbidden by default"
+log "Sanitizer resources: canonical asan/cfi/hwasan/msan ignorelists installed and Raptor Lake ThinLTO+CFI tested after BOLT"
 log "To use: export PATH=$INSTALL_PREFIX/bin:\$PATH"
