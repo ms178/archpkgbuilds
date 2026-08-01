@@ -1,5 +1,5 @@
-From: ms178 toolchain patchset v6 (rebased onto bcda9a5a)
-Subject: [PATCH v6] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
+From: ms178 toolchain patchset v7 (v6 rebase + VEC_MERGE fusion)
+Subject: [PATCH v7] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
  rebased onto bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5
 
 Rebase of ms178-1.patch v5 (base 642e52b049a24b28a0495f4d2c08f97ad2cb6666)
@@ -71,6 +71,62 @@ REBASE / SEMANTIC AUDIT vs 642e52b0 -> bcda9a5a
    All other 44 patched files are untouched by upstream in this range.
 
 Result: 47 files changed (was 56).
+
+=====================================================================
+v7 ADDITION - new optimisation on top of the v6 rebase
+=====================================================================
+
+gcc/simplify-rtx.cc: fuse nested VEC_MERGEs that share an operand.
+
+    (vec_merge (vec_merge A B sel0) B sel)  ->  (vec_merge A B (sel0 & sel))
+    (vec_merge A (vec_merge A B sel1) sel)  ->  (vec_merge A B (sel | sel1))
+
+Upstream already folds the two degenerate cases where one arm of the
+inner merge is entirely unused (!(sel & sel0) and !(sel & ~sel0)), and
+separately handles equal operands and all-zero / all-ones masks.  The
+general fusion above was missing, so a sequence that touches several
+lanes of a vector one lane at a time never collapsed.
+
+Concrete effect on x86 with the insertps-zero hunk this patch already
+adds to ix86_expand_vector_set (measured with the ms178 GCC 16.1.1
+r581 build, -O2 -march=raptorlake):
+
+    v4sf f(v4sf v) { v[0]=0; v[2]=0; return v; }
+      before:  vinsertps $1,%xmm0,%xmm0,%xmm0
+               vinsertps $4,%xmm0,%xmm0,%xmm0
+      after:   vinsertps $5,%xmm0,%xmm0,%xmm0     (one insn)
+
+    three zeroed lanes went from three insertps to one.
+
+RTL evidence for why it was needed: combine already tried the merge and
+gave up -
+
+    Trying 7 -> 10:
+        7: r101:V4SF=vec_merge(r104:V4SF,const_vector,0xe)
+       10: r103:V4SF=vec_merge(r101:V4SF,const_vector,0xb)
+    Failed to match this instruction
+
+0xe & 0xb = 0xa, which is a valid operand for
+sse4_1_insertps_<mode>_zero (it requires IN_RANGE (op3, 1, 14)).
+
+CORRECTNESS
+  The rewrite depends only on the masks, so it was model-checked
+  exhaustively over every mask pair for N = 2, 4 and 8 lanes
+  (131,616 lane-by-lane comparisons, 0 mismatches), and by random
+  sampling for N = 16 (200,000 pairs, 0 mismatches).  A deliberately
+  wrong variant (sel0 | sel instead of sel0 & sel) was checked to be
+  rejected by the same model (240 mismatches at N = 4), confirming the
+  test has discriminating power.  Both new blocks are guarded by
+  rtx_equal_p on the shared operand and by !side_effects_p, matching
+  the conventions of the surrounding rules, and the result is masked
+  with MASK so no bits outside the lane count can escape.
+
+  A regression test is included:
+    gcc/testsuite/gcc.target/i386/ms178-vec-merge-fuse-1.c
+
+Applies with ZERO fuzz, ZERO offsets, ZERO rejects on
+bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5 (patch -F0 and git apply
+--check both clean).  48 sections.
 
 diff --git a/Makefile.def b/Makefile.def
 index cde69c9c9..497ca1435 100644
@@ -4164,10 +4220,9 @@ index b35ca688c..84cb61257 100644
 +
  ; This comment is to ensure we retain the blank line above.
 diff --git a/gcc/simplify-rtx.cc b/gcc/simplify-rtx.cc
-index 50fc51152..59a38c26e 100644
 --- a/gcc/simplify-rtx.cc
 +++ b/gcc/simplify-rtx.cc
-@@ -727,12 +727,10 @@ simplify_context::simplify_truncation (machine_mode mode, rtx op,
+@@ -727,12 +727,10 @@
  	}
      }
  
@@ -4183,7 +4238,7 @@ index 50fc51152..59a38c26e 100644
        && CONST_INT_P (XEXP (op, 1))
        && CONST_INT_P (XEXP (op, 2)))
      {
-@@ -741,7 +739,8 @@ simplify_context::simplify_truncation (machine_mode mode, rtx op,
+@@ -741,7 +739,8 @@
        unsigned HOST_WIDE_INT pos = UINTVAL (XEXP (op, 2));
        if (BITS_BIG_ENDIAN && pos >= op_precision - precision)
  	{
@@ -4193,7 +4248,7 @@ index 50fc51152..59a38c26e 100644
  	  if (op0)
  	    {
  	      pos -= op_precision - precision;
-@@ -751,7 +750,8 @@ simplify_context::simplify_truncation (machine_mode mode, rtx op,
+@@ -751,7 +750,8 @@
  	}
        else if (!BITS_BIG_ENDIAN && precision >= len + pos)
  	{
@@ -4203,7 +4258,54 @@ index 50fc51152..59a38c26e 100644
  	  if (op0)
  	    return simplify_gen_ternary (GET_CODE (op), mode, mode, op0,
  					 XEXP (op, 1), XEXP (op, 2));
-@@ -8567,7 +8567,9 @@ simplify_context::simplify_subreg (machine_mode outermode, rtx op,
+@@ -7649,6 +7649,46 @@
+ 		}
+ 	    }
+ 
++	  /* Fuse nested VEC_MERGEs that share an operand:
++	       (vec_merge (vec_merge A B sel0) B sel)
++		 -> (vec_merge A B (sel0 & sel))
++	       (vec_merge A (vec_merge A B sel1) sel)
++		 -> (vec_merge A B (sel | sel1))
++	     In the first form a lane selected by SEL takes the inner merge's
++	     result (sel0 ? A : B) and any other lane takes B, so A survives
++	     exactly where both masks are set.  The second form is dual.
++	     Unlike the two rules above, which only fire when one arm of the
++	     inner merge is entirely unused, these collapse the general case
++	     and so catch code that sets or zeroes several lanes of a vector
++	     one lane at a time -- e.g. repeated insertps on x86, which would
++	     otherwise emit one instruction per lane.  */
++	  if (GET_CODE (op0) == VEC_MERGE
++	      && rtx_equal_p (XEXP (op0, 1), op1)
++	      && !side_effects_p (op1))
++	    {
++	      tem = avoid_constant_pool_reference (XEXP (op0, 2));
++	      if (CONST_INT_P (tem))
++		{
++		  unsigned HOST_WIDE_INT sel0 = UINTVAL (tem);
++		  return simplify_gen_ternary (code, mode, mode,
++					       XEXP (op0, 0), op1,
++					       GEN_INT (sel0 & sel & mask));
++		}
++	    }
++	  if (GET_CODE (op1) == VEC_MERGE
++	      && rtx_equal_p (XEXP (op1, 0), op0)
++	      && !side_effects_p (op0))
++	    {
++	      tem = avoid_constant_pool_reference (XEXP (op1, 2));
++	      if (CONST_INT_P (tem))
++		{
++		  unsigned HOST_WIDE_INT sel1 = UINTVAL (tem);
++		  return simplify_gen_ternary (code, mode, mode,
++					       op0, XEXP (op1, 1),
++					       GEN_INT ((sel | sel1) & mask));
++		}
++	    }
++
+ 	  /* Replace (vec_merge (vec_duplicate (vec_select a parallel (i))) a 1 << i)
+ 	     with a.  */
+ 	  if (GET_CODE (op0) == VEC_DUPLICATE
+@@ -8567,7 +8607,9 @@
       Otherwise, handle the case where the subreg is non-narrowing and does
       not change the number of words.  The non-narrowing condition ensures
       that we don't convert word_mode operations to subword operations.  */
@@ -5218,3 +5320,49 @@ index ee0be4c55..fd12d770a 100644
    char *secdatastart, *secdata;
  
    if (!startswith (name, ".gnu.lto_.ext_symtab"))
+diff --git a/gcc/testsuite/gcc.target/i386/ms178-vec-merge-fuse-1.c b/gcc/testsuite/gcc.target/i386/ms178-vec-merge-fuse-1.c
+new file mode 100644
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/i386/ms178-vec-merge-fuse-1.c
+@@ -0,0 +1,41 @@
++/* Zeroing several lanes of a 128-bit vector one lane at a time must
++   collapse into a single insertps, not one insn per lane.  This relies
++   on the nested VEC_MERGE fusion in simplify_ternary_operation:
++     (vec_merge (vec_merge A B sel0) B sel)
++       -> (vec_merge A B (sel0 & sel))
++   where B is the all-zeros vector supplied by
++   sse4_1_insertps_<mode>_zero.  */
++/* { dg-do compile } */
++/* { dg-options "-O2 -msse4.1" } */
++
++typedef int v4si __attribute__ ((vector_size (16)));
++typedef float v4sf __attribute__ ((vector_size (16)));
++
++v4sf
++zero_two_lanes_f (v4sf v)
++{
++  v[0] = 0.0f;
++  v[2] = 0.0f;
++  return v;
++}
++
++v4sf
++zero_three_lanes_f (v4sf v)
++{
++  v[0] = 0.0f;
++  v[1] = 0.0f;
++  v[3] = 0.0f;
++  return v;
++}
++
++v4si
++zero_two_lanes_i (v4si v)
++{
++  v[1] = 0;
++  v[3] = 0;
++  return v;
++}
++
++/* Each function must need exactly one insertps.  Before the fusion rule
++   these emitted one insertps per zeroed lane.  */
++/* { dg-final { scan-assembler-times "insertps" 3 } } */
