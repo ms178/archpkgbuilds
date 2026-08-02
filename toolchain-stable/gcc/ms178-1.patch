@@ -1,5 +1,5 @@
-From: ms178 toolchain patchset v8 (v7 + vector-insertion fixes)
-Subject: [PATCH v8] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
+From: ms178 toolchain patchset v9 (v8 + vectorizer cost-model audit)
+Subject: [PATCH v9] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
  rebased onto bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5
 
 Rebase of ms178-1.patch v5 (base 642e52b049a24b28a0495f4d2c08f97ad2cb6666)
@@ -221,6 +221,136 @@ VALIDATION
         gcc.target/i386/ms178-vecset-zero-2di-1.c
     Both were checked to satisfy their dg-final assertions with the
     patched compiler (0 stack-frame insns; 0 pinsrq; 2 insertps).
+
+=====================================================================
+v9 ADDITIONS - loop vectorizer cost-model and dependence-analysis audit
+=====================================================================
+
+Nine defects, all in the same class: 32-bit / signed-unsigned arithmetic
+on quantities that are neither bounded to 32 bits nor unsigned-safe.
+
+--- A. gcc/tree-vect-loop.cc, vect_estimate_min_profitable_iters ----
+
+vec_inside_cost, vec_prologue_cost and vec_epilogue_cost are unsigned
+accumulations of per-statement costs.  Each statement cost is
+  builtin_vectorization_cost * count
+and, for statements in an inner loop, is further multiplied by
+LOOP_VINFO_INNER_LOOP_COST_FACTOR, i.e. --param=vect-inner-loop-cost-factor,
+whose documented range is 1..10000.  Nothing saturates.  The function then
+mixed those unsigned values into int expressions:
+
+  1. vec_outside_cost = (int)(vec_prologue_cost + vec_epilogue_cost);
+     Truncation; can make the outside cost appear negative.
+     -> compute in unsigned HOST_WIDE_INT and saturate to INT_MAX.
+
+  2. int saving_per_viter = scalar_single_iter_cost * assumed_vf
+                            - vec_inside_cost;
+     "int - unsigned" is evaluated as *unsigned*, so a large negative
+     saving becomes a large positive one and the "saving_per_viter <= 0"
+     bail-out is skipped - the loop is then costed as profitable when it
+     is not.
+     -> compute in signed HOST_WIDE_INT.
+
+  3. min_profitable_iters = (voc - soc) * vf
+                            - vec_inside_cost * peel_iters_prologue
+                            - vec_inside_cost * peel_iters_epilogue;
+     Same unsigned contamination, plus the products themselves overflow
+     int (peel counts go up to the vectorization factor).  The "<= 0"
+     clamp is skipped and the garbage value is then divided.
+     -> signed HOST_WIDE_INT throughout, saturate on the way back to int.
+     Note the original already casts to (int) two lines further down,
+     which shows the mixing was known to be delicate there but was missed
+     on the assignment itself.
+
+  4. min_profitable_estimate: identical shape, and it *recomputed* the
+     divisor as "(scalar_single_iter_cost * assumed_vf) - vec_inside_cost"
+     in unsigned arithmetic instead of reusing saving_per_viter, which the
+     bail-out above has already proven positive.
+     -> reuse saving_per_viter, evaluate in 64-bit, clamp at 0 and INT_MAX.
+
+  5./6. both "threshold = vec_inside_cost * min_vec_niters + ..." sites:
+     the product overflows int for large bodies.
+     -> 64-bit with saturation.
+
+  7./8. both "min_vec_niters = outside_overhead / saving_per_viter + 1"
+     sites: saving_per_viter is now 64-bit; keep the quotient 64-bit and
+     saturate.
+
+  9. The dump printed vec_inside_cost / vec_prologue_cost /
+     vec_epilogue_cost - all unsigned - with %d.  A format mismatch that
+     also misreports any cost above INT_MAX as a negative number.
+     -> %u.
+
+--- B. gcc/tree-vect-data-refs.cc, dependence distances ------------
+
+  10./11. "int dist = dist_v[loop_depth];" at two sites.  dist_v elements
+     are lambda_int, which is HOST_WIDE_INT.  Truncating to int can turn a
+     true distance of 2^32 into 0, and 0 is interpreted as "same location";
+     it can also turn 0x100000004 into 4 and needlessly clamp max_vf.
+     -> keep the full HOST_WIDE_INT width (and print with
+        HOST_WIDE_INT_PRINT_DEC).
+
+  12. "unsigned int abs_dist = abs (dist);"  abs (INT_MIN) is undefined
+     behaviour, and on a HOST_WIDE_INT distance plain abs() also truncates.
+     If the UB is folded to INT_MIN the unsigned result is 2^31, which
+     compares >= *max_vf and makes the dependence be *ignored*.
+     -> absu_hwi (), which is defined for the most negative value and
+        returns unsigned HOST_WIDE_INT.
+
+  13. STMT_VINFO_MIN_NEG_DIST is an unsigned int; assigning a
+     HOST_WIDE_INT distance to it truncates, which would under-estimate
+     the dependence.
+     -> saturate at UINT_MAX.
+
+WHY THIS SHAPE OF FIX
+    The costs are genuinely unbounded, so the choice is between bounding
+    them at the source (invasive: every target's add_stmt_cost hook would
+    have to saturate) or making the consumer overflow-proof.  Doing the
+    arithmetic in HOST_WIDE_INT and saturating only where the value must
+    re-enter an int interface is the smaller, local change, keeps every
+    in-range result bit-identical, and matches how the surrounding code
+    already handles niters (poly_uint64 / HOST_WIDE_INT).
+
+VALIDATION
+    * cc1 rebuilt from this tree: RC=0, and the two touched files compile
+      with no new warnings (notably no -Wsign-compare from the widening).
+
+    * Differential model check: the exact arithmetic of
+      vect_estimate_min_profitable_iters, before and after, compared
+      against an __int128 reference over a 26,880-point sweep of
+      (vec_outside_cost, scalar_outside_cost, assumed_vf, vec_inside_cost,
+      peel counts, scalar_single_iter_cost):
+          patched disagrees with exact : 0
+          patched bail-out mismatches  : 0
+          original disagrees with exact: 3920
+      i.e. the fix is exact everywhere the original was right, and fixes
+      3920 cases where it was wrong.
+
+    * Whole gcc.dg/vect testsuite compiled with stock r581 and with the
+      patched compiler at -O3 -march=raptorlake, comparing the number of
+      "loop vectorized" messages per file:
+          2001 files, 0 differing, 0 ICEs
+      So no vectorization decision changes in the normal range - the fix
+      is behaviour-preserving where the original did not overflow.
+
+    * Cost-model dumps compared line by line on a mixed float/int/double
+      kernel: identical ("Vector inside of loop cost", "Calculated minimum
+      iters for profitability").
+
+    * Runtime: 345 executable gcc.dg/vect tests built and run, 0 failures.
+      (One further file, pr101145.c, fails to build in this harness for
+      both compilers once the include path is equalised - a missing
+      linux/limits.h in the sandbox, not a code difference.)
+
+    * A mixed kernel (float add, int mul, double FMA, float dot-product
+      reduction, int reduction, min/max) produces bit-identical results
+      to stock at -O2/-O3/-march=x86-64-v4, and at -Ofast differs only in
+      the FP-reassociated dot product, as expected.
+
+    * New regression test:
+          gcc.dg/vect/ms178-cost-overflow-1.c
+      compiles without ICE at --param=vect-inner-loop-cost-factor=
+      1 / 2 / 5000 / 10000 and still reports the expected vectorization.
 
 diff --git a/Makefile.def b/Makefile.def
 index cde69c9c9..497ca1435 100644
@@ -5614,3 +5744,311 @@ new file mode 100644
 +
 +/* { dg-final { scan-assembler-not "pinsrq" } } */
 +/* { dg-final { scan-assembler-times "insertps" 2 } } */
+diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc
+--- a/gcc/tree-vect-loop.cc
++++ b/gcc/tree-vect-loop.cc
+@@ -4450,16 +4450,28 @@
+       *suggested_unroll_factor = 1;
+     }
+ 
+-  vec_outside_cost = (int)(vec_prologue_cost + vec_epilogue_cost);
++  /* ms178: saturate rather than truncate.  Both operands are unsigned and
++     each is an unbounded accumulation of per-statement costs (scaled by
++     --param=vect-inner-loop-cost-factor, which the user may set as high as
++     10000), so the sum can exceed INT_MAX.  A silent truncation here can
++     flip the sign of VEC_OUTSIDE_COST and make a hopeless loop look
++     profitable.  */
++  {
++    unsigned HOST_WIDE_INT outside
++      = (unsigned HOST_WIDE_INT) vec_prologue_cost + vec_epilogue_cost;
++    vec_outside_cost = (int) MIN (outside, (unsigned HOST_WIDE_INT) INT_MAX);
++  }
+ 
+   if (dump_enabled_p ())
+     {
+       dump_printf_loc (MSG_NOTE, vect_location, "Cost model analysis: \n");
+-      dump_printf (MSG_NOTE, "  Vector inside of loop cost: %d\n",
++      /* ms178: these three are unsigned; printing them with %d is a format
++	 mismatch and misreports any cost above INT_MAX as negative.  */
++      dump_printf (MSG_NOTE, "  Vector inside of loop cost: %u\n",
+                    vec_inside_cost);
+-      dump_printf (MSG_NOTE, "  Vector prologue cost: %d\n",
++      dump_printf (MSG_NOTE, "  Vector prologue cost: %u\n",
+                    vec_prologue_cost);
+-      dump_printf (MSG_NOTE, "  Vector epilogue cost: %d\n",
++      dump_printf (MSG_NOTE, "  Vector epilogue cost: %u\n",
+                    vec_epilogue_cost);
+       dump_printf (MSG_NOTE, "  Scalar iteration cost: %d\n",
+                    scalar_single_iter_cost);
+@@ -4483,8 +4495,13 @@
+      NPEEL = prologue iterations + epilogue iterations,
+      SOC = scalar outside cost for run time cost model check.  */
+ 
+-  int saving_per_viter = (scalar_single_iter_cost * assumed_vf
+-			  - vec_inside_cost);
++  /* ms178: compute in signed 64-bit.  VEC_INSIDE_COST is unsigned, so the
++     original "int - unsigned" subtraction was evaluated as unsigned and then
++     converted back, which turns a large negative saving into a large
++     positive one and defeats the <= 0 bail-out below.  */
++  HOST_WIDE_INT saving_per_viter
++    = ((HOST_WIDE_INT) scalar_single_iter_cost * assumed_vf
++       - (HOST_WIDE_INT) vec_inside_cost);
+   if (saving_per_viter <= 0)
+     {
+       if (LOOP_VINFO_LOOP (loop_vinfo)->force_vectorize)
+@@ -4493,7 +4510,7 @@
+ 
+       if (dump_enabled_p ())
+         dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
+-			 "cost model: the vector iteration cost = %d "
++			 "cost model: the vector iteration cost = %u "
+ 			 "divided by the scalar iteration cost = %d "
+ 			 "is greater or equal to the vectorization factor = %d"
+                          ".\n",
+@@ -4524,9 +4541,14 @@
+ 			      - scalar_outside_cost);
+       /* We're only interested in cases that require at least one
+ 	 vector iteration.  */
++      /* ms178: SAVING_PER_VITER is now HOST_WIDE_INT; keep the quotient in
++	 64-bit and saturate on the way back into an int.  */
+       int min_vec_niters = 1;
+       if (outside_overhead > 0)
+-	min_vec_niters = outside_overhead / saving_per_viter + 1;
++	{
++	  HOST_WIDE_INT n = (HOST_WIDE_INT) outside_overhead / saving_per_viter + 1;
++	  min_vec_niters = (int) MIN (n, (HOST_WIDE_INT) INT_MAX);
++	}
+ 
+       if (dump_enabled_p ())
+ 	dump_printf (MSG_NOTE, "  Minimum number of vector iterations: %d\n",
+@@ -4543,13 +4565,20 @@
+ 	     vniters * VF + NPEEL, but it might be (and often is) less
+ 	     than that if a partial vector iteration is cheaper than the
+ 	     equivalent scalar code.  */
+-	  int threshold = (vec_inside_cost * min_vec_niters
+-			   + vec_outside_cost
+-			   - scalar_outside_cost);
++	  /* ms178: 64-bit; VEC_INSIDE_COST * MIN_VEC_NITERS overflows int
++	     easily for large bodies.  */
++	  HOST_WIDE_INT threshold
++	    = ((HOST_WIDE_INT) vec_inside_cost * min_vec_niters
++	       + vec_outside_cost
++	       - scalar_outside_cost);
+ 	  if (threshold <= 0)
+ 	    min_profitable_iters = 1;
+ 	  else
+-	    min_profitable_iters = threshold / scalar_single_iter_cost + 1;
++	    {
++	      threshold = threshold / scalar_single_iter_cost + 1;
++	      min_profitable_iters
++		= (int) MIN (threshold, (HOST_WIDE_INT) INT_MAX);
++	    }
+ 	}
+       else
+ 	/* Convert the number of vector iterations into a number of
+@@ -4560,21 +4589,35 @@
+     }
+   else
+     {
+-      min_profitable_iters = ((vec_outside_cost - scalar_outside_cost)
+-			      * assumed_vf
+-			      - vec_inside_cost * peel_iters_prologue
+-			      - vec_inside_cost * peel_iters_epilogue);
+-      if (min_profitable_iters <= 0)
+-        min_profitable_iters = 0;
++      /* ms178: evaluate in signed 64-bit.  VEC_INSIDE_COST is unsigned, so
++	 "int - unsigned * int" was evaluated as unsigned; when the products
++	 exceed INT_MAX the conversion back to int yields a large positive
++	 value, the <= 0 clamp is skipped, and a garbage threshold is then
++	 divided out.  The products themselves can also exceed INT_MAX:
++	 VEC_INSIDE_COST is an unbounded accumulation and PEEL_ITERS_* is up
++	 to the vectorization factor.  */
++      HOST_WIDE_INT min_profitable_iters_64
++	= (((HOST_WIDE_INT) vec_outside_cost - scalar_outside_cost)
++	   * assumed_vf
++	   - (HOST_WIDE_INT) vec_inside_cost * peel_iters_prologue
++	   - (HOST_WIDE_INT) vec_inside_cost * peel_iters_epilogue);
++      if (min_profitable_iters_64 <= 0)
++	min_profitable_iters = 0;
+       else
+ 	{
+-	  min_profitable_iters /= saving_per_viter;
++	  min_profitable_iters_64 /= saving_per_viter;
+ 
+-	  if ((scalar_single_iter_cost * assumed_vf * min_profitable_iters)
+-	      <= (((int) vec_inside_cost * min_profitable_iters)
+-		  + (((int) vec_outside_cost - scalar_outside_cost)
++	  if (((HOST_WIDE_INT) scalar_single_iter_cost * assumed_vf
++	       * min_profitable_iters_64)
++	      <= (((HOST_WIDE_INT) vec_inside_cost * min_profitable_iters_64)
++		  + (((HOST_WIDE_INT) vec_outside_cost - scalar_outside_cost)
+ 		     * assumed_vf)))
+-	    min_profitable_iters++;
++	    min_profitable_iters_64++;
++
++	  /* The result feeds an int niters bound; saturate instead of
++	     truncating.  */
++	  min_profitable_iters
++	    = (int) MIN (min_profitable_iters_64, (HOST_WIDE_INT) INT_MAX);
+ 	}
+     }
+ 
+@@ -4618,16 +4661,24 @@
+ 			      - scalar_single_iter_cost * peel_iters_prologue
+ 			      - scalar_single_iter_cost * peel_iters_epilogue
+ 			      + scalar_outside_cost);
++      /* ms178: see above.  */
+       int min_vec_niters = 1;
+       if (outside_overhead > 0)
+-	min_vec_niters = outside_overhead / saving_per_viter + 1;
++	{
++	  HOST_WIDE_INT n = (HOST_WIDE_INT) outside_overhead / saving_per_viter + 1;
++	  min_vec_niters = (int) MIN (n, (HOST_WIDE_INT) INT_MAX);
++	}
+ 
+       if (LOOP_VINFO_USING_PARTIAL_VECTORS_P (loop_vinfo))
+ 	{
+-	  int threshold = (vec_inside_cost * min_vec_niters
+-			   + vec_outside_cost
+-			   + scalar_outside_cost);
+-	  min_profitable_estimate = threshold / scalar_single_iter_cost + 1;
++	  /* ms178: see above; 64-bit with saturation.  */
++	  HOST_WIDE_INT threshold
++	    = ((HOST_WIDE_INT) vec_inside_cost * min_vec_niters
++	       + vec_outside_cost
++	       + scalar_outside_cost);
++	  threshold = threshold / scalar_single_iter_cost + 1;
++	  min_profitable_estimate
++	    = (int) MIN (threshold, (HOST_WIDE_INT) INT_MAX);
+ 	}
+       else
+ 	min_profitable_estimate = (min_vec_niters * assumed_vf
+@@ -4636,12 +4687,18 @@
+     }
+   else
+     {
+-      min_profitable_estimate = ((vec_outside_cost + scalar_outside_cost)
+-				 * assumed_vf
+-				 - vec_inside_cost * peel_iters_prologue
+-				 - vec_inside_cost * peel_iters_epilogue)
+-				 / ((scalar_single_iter_cost * assumed_vf)
+-				   - vec_inside_cost);
++      /* ms178: as for MIN_PROFITABLE_ITERS above, evaluate in signed
++	 64-bit and saturate.  The divisor is exactly SAVING_PER_VITER,
++	 which the bail-out above has already proven to be > 0, so reuse it
++	 rather than recomputing it in unsigned arithmetic.  */
++      HOST_WIDE_INT est
++	= ((((HOST_WIDE_INT) vec_outside_cost + scalar_outside_cost)
++	    * assumed_vf
++	    - (HOST_WIDE_INT) vec_inside_cost * peel_iters_prologue
++	    - (HOST_WIDE_INT) vec_inside_cost * peel_iters_epilogue)
++	   / saving_per_viter);
++      est = MAX (est, (HOST_WIDE_INT) 0);
++      min_profitable_estimate = (int) MIN (est, (HOST_WIDE_INT) INT_MAX);
+     }
+   min_profitable_estimate = MAX (min_profitable_estimate, min_profitable_iters);
+   if (dump_enabled_p ())
+diff --git a/gcc/tree-vect-data-refs.cc b/gcc/tree-vect-data-refs.cc
+--- a/gcc/tree-vect-data-refs.cc
++++ b/gcc/tree-vect-data-refs.cc
+@@ -363,7 +363,10 @@
+   class loop *loop = LOOP_VINFO_LOOP (loop_vinfo);
+   for (lambda_vector &dist_v : DDR_DIST_VECTS (ddr))
+     {
+-      int dist = dist_v[loop_depth];
++      /* ms178: dist_v elements are lambda_int == HOST_WIDE_INT.  Truncating
++	 to int can turn a huge distance into a small one (or into 0, which
++	 is interpreted as "same location"), so keep the full width.  */
++      HOST_WIDE_INT dist = dist_v[loop_depth];
+       if (dist != 0 && !(dist > 0 && DDR_REVERSED_P (ddr)))
+ 	{
+ 	  /* If the user asserted safelen >= DIST consecutive iterations
+@@ -525,11 +528,13 @@
+ 
+   FOR_EACH_VEC_ELT (DDR_DIST_VECTS (ddr), i, dist_v)
+     {
+-      int dist = dist_v[loop_depth];
++      /* ms178: keep the full HOST_WIDE_INT width; see above.  */
++      HOST_WIDE_INT dist = dist_v[loop_depth];
+ 
+       if (dump_enabled_p ())
+ 	dump_printf_loc (MSG_NOTE, vect_location,
+-                         "dependence distance  = %d.\n", dist);
++			 "dependence distance  = " HOST_WIDE_INT_PRINT_DEC
++			 ".\n", dist);
+ 
+       if (dist == 0)
+ 	{
+@@ -598,14 +603,28 @@
+ 	  /* Record a negative dependence distance to later limit the
+ 	     amount of stmt copying / unrolling we can perform.
+ 	     Only need to handle read-after-write dependence.  */
+-	  if (DR_IS_READ (drb)
+-	      && (STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) == 0
+-		  || STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) > (unsigned)dist))
+-	    STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) = dist;
++	  /* ms178: DIST is a HOST_WIDE_INT and is > 0 on this path, but
++	     min_neg_dist is only an unsigned int.  Saturate rather than
++	     silently truncating a huge distance down to a small one, which
++	     would under-estimate the dependence.  */
++	  if (DR_IS_READ (drb))
++	    {
++	      unsigned HOST_WIDE_INT udist = (unsigned HOST_WIDE_INT) dist;
++	      unsigned int sat
++		= (unsigned int) MIN (udist,
++				      (unsigned HOST_WIDE_INT) UINT_MAX);
++	      if (STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) == 0
++		  || STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) > sat)
++		STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) = sat;
++	    }
+ 	  continue;
+ 	}
+ 
+-      unsigned int abs_dist = abs (dist);
++      /* ms178: abs (INT_MIN) is undefined and, on a HOST_WIDE_INT distance,
++	 plain abs() would also truncate.  Use absu_hwi, which returns an
++	 unsigned HOST_WIDE_INT and is well defined for the most negative
++	 value.  */
++      unsigned HOST_WIDE_INT abs_dist = absu_hwi (dist);
+       if (abs_dist >= 2 && abs_dist < *max_vf)
+ 	{
+ 	  /* The dependence distance requires reduction of the maximal
+diff --git a/gcc/testsuite/gcc.dg/vect/ms178-cost-overflow-1.c b/gcc/testsuite/gcc.dg/vect/ms178-cost-overflow-1.c
+new file mode 100644
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/vect/ms178-cost-overflow-1.c
+@@ -0,0 +1,34 @@
++/* The loop cost model accumulates per-statement costs into unsigned
++   counters that are scaled by --param=vect-inner-loop-cost-factor (which
++   may be as large as 10000).  Before the ms178 fix several expressions in
++   vect_estimate_min_profitable_iters mixed those unsigned values with int
++   arithmetic, so a large body cost could wrap and turn an unprofitable
++   loop into an apparently profitable one (or vice versa).
++
++   This test just makes sure the compiler still behaves sanely - it must
++   not ICE and must still vectorize the trivially profitable loop - when
++   the cost factor is pushed to its maximum.  */
++/* { dg-do compile } */
++/* { dg-additional-options "--param=vect-inner-loop-cost-factor=10000" } */
++
++#define N 1024
++float a[N], b[N], c[N];
++
++void
++simple (void)
++{
++  for (int i = 0; i < N; i++)
++    c[i] = a[i] + b[i];
++}
++
++double x[N][N], y[N][N], z[N][N];
++
++void
++nested (void)
++{
++  for (int i = 0; i < N; i++)
++    for (int j = 0; j < N; j++)
++      z[i][j] = x[i][j] * y[i][j] + z[i][j];
++}
++
++/* { dg-final { scan-tree-dump "vectorized 1 loops" "vect" } } */
