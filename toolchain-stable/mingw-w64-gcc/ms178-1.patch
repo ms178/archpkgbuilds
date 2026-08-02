@@ -1,5 +1,5 @@
-From: ms178 toolchain patchset v9 (v8 + vectorizer cost-model audit)
-Subject: [PATCH v9] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
+From: ms178 toolchain patchset v11 (v10 + SSE/AVX/BMI2/scalar codegen audit)
+Subject: [PATCH v11] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
  rebased onto bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5
 
 Rebase of ms178-1.patch v5 (base 642e52b049a24b28a0495f4d2c08f97ad2cb6666)
@@ -351,6 +351,337 @@ VALIDATION
           gcc.dg/vect/ms178-cost-overflow-1.c
       compiles without ICE at --param=vect-inner-loop-cost-factor=
       1 / 2 / 5000 / 10000 and still reports the expected vectorization.
+
+=====================================================================
+v10 ADDITIONS - peeling-for-alignment audit
+=====================================================================
+
+Two further defects in gcc/tree-vect-data-refs.cc, both of the same
+family as the v9 cost-model findings: a value of one type stored or
+compared as another.
+
+--- 14. vect_peeling_hash_choose_best_peeling: wrong sentinel --------
+
+    res.inside_cost  = INT_MAX;
+    res.outside_cost = INT_MAX;
+
+_vect_peel_extended_info::inside_cost and ::outside_cost are
+"unsigned int".  Seeding the running minimum with INT_MAX (2^31-1)
+rather than UINT_MAX means any peeling candidate whose cost lands in
+(INT_MAX, UINT_MAX] loses the
+
+    if (inside_cost < min->inside_cost || ...)
+
+comparison unconditionally - even when it is the only candidate.  The
+traversal then leaves res.peel_info.dr_info == NULL and the caller
+concludes that no peeling option exists, silently giving up on aligning
+the accesses.  Costs are unbounded accumulations (see the v9 notes on
+--param=vect-inner-loop-cost-factor, range 1..10000), so this is the
+same reachability argument as before.
+
+    -> seed with UINT_MAX, which is the maximum of the field's actual
+       type.  Note the fix cannot be "make the fields int": they are
+       compared against, and assigned from, unsigned cost accumulators.
+
+--- 15. vect_peeling_supportable: DR_STEP kept in an unsigned int ----
+
+    unsigned int dr0_step = tree_to_shwi (DR_STEP (dr0_info->dr));
+    ...
+    if (tree_to_shwi (DR_STEP (dr)) != dr0_step)
+      return peeling_unsupported;
+
+DR_STEP is signed and is not bounded to 32 bits.  Storing it in an
+unsigned int does two wrong things at once:
+
+  * a negative step becomes a huge positive number, so the comparison
+    against the signed tree_to_shwi () value on the other side is false
+    even when both references have exactly the same step.  Descending
+    loops therefore reported "different alignment steps" and returned
+    PEELING_UNSUPPORTED - a missed optimisation, not a miscompile.
+    Demonstrated: step -8 stored as 4294967288, compared against -8.
+
+  * a step wider than 32 bits truncates (0x100000008 -> 8).
+
+    -> keep it as HOST_WIDE_INT, matching what tree_to_shwi () returns
+       and what DR_STEP actually is.
+
+REACHABILITY - stated honestly
+    Both sites sit behind "supportable_dr_alignment ==
+    dr_unaligned_unsupported".  x86 reports unaligned accesses as
+    supported almost everywhere, so I could not construct an x86 test
+    that reaches the divergent comparison: instrumenting the compiler
+    and running the whole gcc.dg/vect suite hit the comparison 40 times,
+    all with small positive steps, and 0 of those diverged between the
+    old and new expressions.  These are therefore latent defects - they
+    matter for strict-alignment targets and for any future x86 path that
+    returns dr_unaligned_unsupported - and the fixes are provably
+    behaviour-neutral for the cases that do occur today.  I am not
+    claiming a user-visible x86 speedup for them.
+
+    I also audited and explicitly did NOT change:
+      * epilog->nb_iterations_upper_bound -= lowest_vf
+        (tree-vect-loop-manip.cc).  Potential unsigned underflow, but
+        instrumenting the subtraction and scanning all 2002 gcc.dg/vect
+        files produced 0 underflow events, so the documented invariant
+        ("the vector loop covered at least VF scalar iterations") holds.
+        No change made.
+      * misal += npeel * TREE_INT_CST_LOW (DR_STEP (...)) at three sites.
+        The following "&= alignment - 1" makes the result correct
+        regardless of any wrapping.  No change made.
+      * int inside_cost/prologue_cost in vect_model_simple_cost and
+        vect_model_promotion_demotion_cost.  These feed only dump output,
+        not a decision.  No change made.
+      * (group_size * cvf - gap) % cnunits with ceil_log2 (0): ceil_log2
+        is defined to return 0 for 0, so cpart_size becomes 1.  Handled.
+        No change made.
+
+VALIDATION
+    * cc1 rebuilt: RC=0, no new warnings from the touched file.
+    * Whole gcc.dg/vect suite compiled stock vs patched at
+      -O3 -march=native, comparing "loop vectorized" counts per file:
+          2002 files, 0 differing, 0 ICEs.
+    * Runtime: 855 executable gcc.dg/vect tests built and run, 0 failures.
+      (An earlier sweep at -march=raptorlake showed 6 "Illegal
+      instruction" failures; the stock r581 compiler fails those 6
+      identically, and all 6 pass at -march=native - the sandbox host
+      lacks AVX-VNNI.  Not a code difference.)
+    * Sentinel and step-comparison mechanics each demonstrated in a
+      standalone model: candidate cost 3000000000 is rejected with the
+      INT_MAX sentinel and accepted with UINT_MAX; step -8 compares
+      unequal to itself through an unsigned int and equal through
+      HOST_WIDE_INT.
+    * New regression test gcc.dg/vect/ms178-peel-sentinel-1.c: no ICE at
+      --param=vect-inner-loop-cost-factor=1 and 10000, still vectorizes.
+
+=====================================================================
+v11 ADDITIONS - SSE / AVX / AVX2 / BMI2 / scalar codegen audit
+=====================================================================
+
+Two defects, one of them a dead pattern shipped by v10 itself.  Both
+were found empirically (compile a corpus of idioms, read the asm, then
+instrument the compiler to prove reachability) rather than by reading
+code, and both are validated by differential sweeps whose *control is
+the v10 compiler*, so every number below is attributable to v11 alone.
+
+---------------------------------------------------------------------
+16. gcc/expmed.cc, store_bit_field_1: insert a whole SUB-VECTOR with
+    vec_init instead of spilling the vector to the stack.
+---------------------------------------------------------------------
+
+SYMPTOM
+
+    Writing a 128-bit value into one half of a 256-bit vector - the
+    single most common shape in hand-written SIMD code, and the shape
+    the vectorizer itself emits whenever it builds a wide vector out of
+    two half-width results - generated a full stack round-trip:
+
+        __m256i f (__m256i r, __m128i hi)
+        { memcpy ((char *) &r + 16, &hi, 16); return r; }
+
+          push  %rbp                 <- frame, only to get 32-byte
+          mov   %rsp,%rbp               alignment for the spill slot
+          and   $-32,%rsp
+          vmovdqa %ymm0,-32(%rsp)
+          vmovdqa %xmm1,-16(%rsp)
+          vmovdqa -32(%rsp),%ymm0
+          leave
+          ret
+
+    where the machine has exactly one instruction for this:
+
+          vinserti128 $0x1,%xmm1,%ymm0,%ymm0
+
+ROOT CAUSE
+
+    store_bit_field_1 has a vec_set path, but vec_set only takes a
+    *scalar* field, so a vector-valued field skips it and falls through
+    to the generic "store a full-size field with a SUBREG" path.  That
+    path emits
+
+        (set (subreg:V4SI (reg:V8SI R) 16) X)
+
+    i.e. a partial write to a multi-lane vector register.  There is no
+    mov alternative that can satisfy such an operand, so LRA resolves it
+    the only way it can - it spills the whole vector, stores the lane to
+    memory and reloads.  Confirmed in the LRA dump:
+
+        Considering alt=3 of insn 8: (0) v (1) vm
+           Cycle danger: overall += LRA_MAX_REJECT
+        Choosing alt 4 in insn 8: (0) m (1) v {movv4si_internal}
+
+    The "v"->"v" register alternative is rejected outright and the
+    memory alternative wins.  The frame setup is pure collateral: the
+    spill slot needs 32-byte alignment, which forces and $-32,%rsp and
+    therefore a frame pointer, in a function that otherwise needs no
+    stack at all.
+
+FIX
+
+    Recognise the case before the subreg path and rebuild the value with
+    vec_init from its two halves: extract the half that is being kept
+    with vec_extract, then vec_init the kept half and the new half into
+    a fresh register.  On x86 the extraction of the low half is free (a
+    subreg) and of the high half is one vextracti128, and the vec_init
+    is the single vinsert the machine wanted all along.
+
+    Deliberately restricted to the exactly-two-pieces case
+    (GET_MODE_SIZE (outer) == 2 * GET_MODE_SIZE (field)).  With three or
+    more pieces the extractions could cost more than the spill they
+    replace, so that case is left to the existing code.  Also gated on
+    !reverse (storage-order flips must not silently go through a lane
+    shuffle) and on GET_MODE_INNER (field) == GET_MODE_INNER (outer), so
+    the two modes are genuinely the same vector cut in half.  If the
+    vec_init fails to expand, delete_insns_since () unwinds cleanly and
+    the old path still runs.
+
+MEASURED (-O2 -march=native, instructions per function)
+
+        idiom                                    v10   v11
+        memcpy into upper half of __m256i         8     1
+        memcpy into lower half of __m256i         8     1
+        memcpy into upper half of __m256d         8     1
+        (__m128 *) &v256)[1] = x                  8     1
+        memcpy into upper half of __m512i         8     1
+        two vpmovsxwd halves -> __m256i          11     4
+
+    In every case the stack frame disappears entirely.  Note the last
+    row: that is the shape the vectorizer produces for a plain widening
+    loop body, so this is not only an intrinsics fix.
+
+CORRECTNESS
+
+    gcc.target/i386/ms178-subvec-insert-1.c is included, and a runtime
+    harness checks 21 distinct insertion shapes - {256,512}-bit outer
+    with {128,256}-bit fields, plus 128-bit outer with 64-bit fields,
+    for int / float / double / long long / short / char element types,
+    both halves - against a byte-exact memcpy reference, 200 random
+    vectors each.  All pass at -O0, -O1, -O2, -O3, -Os, and at
+    -march=native, x86-64-v3, x86-64-v2 and -mprefer-vector-width=512.
+
+    An earlier revision of this hunk emitted a write-back move after the
+    insert; it was caught by the same harness and removed.
+
+---------------------------------------------------------------------
+17. gcc/config/i386/i386.md: the v10 MULX highpart pattern was DEAD
+    CODE.  Reach it from the optab expander.
+---------------------------------------------------------------------
+
+v10 added
+
+    (define_insn "*bmi2_umul<mode>3_highpart" ...)
+
+intending to get MULX for an unsigned highpart-only multiply.  It never
+matched even once.  A "*"-prefixed define_insn has no generator function
+and is only ever found by recog () on RTL that some other pass already
+built - and nothing in the compiler ever builds a bare umul_highpart
+whose operand 1 is already sitting in RDX.  The optab-named pattern
+<s>mul<mode>3_highpart is what expand actually calls, and it hardcodes
+the RAX/RDX MUL form, so that is what was always emitted:
+
+        u64 hi (u64 a, u64 b) { return (unsigned __int128) a * b >> 64; }
+          mov %rdi,%rax ; mul %rsi ; mov %rdx,%rax      <- v10, 3 insns
+
+Verified by grepping the generated insn-recog.cc / insn-output.cc of a
+v10 build and by compiling the idiom at -march=raptorlake, x86-64-v3
+and x86-64-v2: no MULX at any of them.
+
+FIX
+
+    Turn <s>mul<mode>3_highpart into a define_expand that, for the
+    unsigned case with TARGET_BMI2, emits a *non*-starred
+    bmi2_umul<mode>3_highpart; the old MUL insn is renamed
+    *<s>mul<mode>3_highpart_1 and keeps serving everything else.  Now
+    register allocation is responsible for getting operand 1 into RDX,
+    which it does with exactly the one move that MUL's "%a" constraint
+    would have required anyway - so the eliminated "mov %rdx,%dst" is
+    pure profit.  The u_bool code attribute is extended to the
+    {s,u}mul_highpart codes so the expander can distinguish them; the
+    signed case has no MULX equivalent and continues to use IMUL.
+
+    MULX also writes no flags, so the result is one fewer EFLAGS
+    clobber in the middle of a dependence chain.
+
+MEASURED
+
+        (unsigned __int128) a * b >> 64        3 insns -> 2
+        a * *p >> 64            (memory rhs)   3 insns -> 2
+        (__int128) a * b >> 64  (signed)       unchanged, still IMUL
+
+    In the testsuite, gcc.target/i386/mult-highpart.c drops from 160 to
+    153 instructions, and gcc.dg/vect/vect-div-bitmask-3.c loses one
+    instruction from its inner loop (3 -> 1 there) while the cold
+    epilogue grows by the same amount, netting zero on static count but
+    winning where it is executed.
+
+CORRECTNESS
+
+    gcc.target/i386/ms178-mulx-highpart-1.c is included.  A runtime
+    harness cross-checks hi64, hi32, signed hi64, a memory-operand form,
+    a both-halves form, a highpart feeding a flags-consuming compare and
+    a highpart feeding an add-with-overflow chain against __int128
+    references: all 121 pairs of interesting edge values (0, 1, 2, ~0,
+    2^63, 2^32, ...) plus 3,000,000 random pairs per function - about 18
+    million comparisons - with 0 mismatches, at -O0, -O1, -O2, -O3, -Os,
+    at -march=raptorlake / native / x86-64, and with -mno-bmi2.
+
+    MULX's "both destinations equal yields the high half" behaviour was
+    not taken on trust; it was verified directly on the host with inline
+    asm over the same edge cases and 2,000,000 random pairs.
+
+---------------------------------------------------------------------
+v11 VALIDATION - control is the v10 compiler, not stock
+---------------------------------------------------------------------
+
+A complete v10 cc1 and a complete v11 cc1 were built from the same tree
+(only expmed.cc and i386.md differing) so that every delta below is
+caused by v11 and nothing else.  Both built with RC=0 and produced no
+new warnings.
+
+  * gcc.dg/vect, -O3 -march=native, 1949 files compiled by both:
+        0 ICEs, 0 instruction-count changes, 1 file textually different
+        (vect-div-bitmask-3, the MULX win described above).
+  * gcc.target/i386, -O2 -march=native, 8618 files compiled by both:
+        0 ICEs.  14 files textually different; net +1 instruction
+        overall, with mult-highpart.c -7 and the rest register-naming
+        churn of +-3 around the freed RDX.
+  * gcc.c-torture/execute, built and run at -O3 -march=native and again
+        at -O2 -march=native -mprefer-vector-width=512:
+        1559 tests pass, 0 NEW failures at either setting.  (11 tests
+        fail identically under v10 and v11 - pre-existing, unrelated to
+        this patch.)
+  * gcc.dg/vect vectorization-decision check: "loop vectorized" /
+        "basic block vectorized" counts compared per file over all 2003
+        files - 0 regressions and 0 gains, i.e. v11 changes no
+        vectorization decision anywhere.
+  * The two new dg tests were each checked to satisfy all six of their
+        dg-final assertions.
+
+AUDITED AND DELIBERATELY NOT CHANGED (v11)
+
+  * 3-or-more-piece vector insertion in store_bit_field_1: the extra
+    vec_extracts can cost more than the spill they would replace.  Left
+    to the existing code.
+  * A union-based 128+128 -> 256 build still spills.  It reaches
+    expansion as an addressable local, not as a BIT_INSERT_EXPR, so it
+    never gets to store_bit_field_1; fixing it belongs in SRA, not here.
+    Not touched - out of scope and higher risk than reward.
+  * Signed highpart multiply: MULX has no signed form.  Unchanged.
+  * 32x32->high-32 (mulhi32): already expands to a single 64-bit imul
+    plus a shift, which is better than MULX would be.  Unchanged.
+  * BMI/BMI2 scalar idiom coverage was swept in full - blsi, blsr,
+    blsmsk, andn, bzhi, shlx, shrx, sarx, rorx, tzcnt, lzcnt, popcnt,
+    pdep, pext and their flag-consuming variants all already select the
+    single-instruction form at -march=raptorlake.  No gap found, so
+    nothing was invented to "fix".
+  * The v10 avx-vpalignr-1 code-size difference versus stock was
+    re-examined with an instrumented compiler: the new v11 path is never
+    reached in that test, the difference is pre-existing v10 behaviour,
+    and the test passes at runtime under both.  No change made.
+
+Result: 56 sections.  Applies with ZERO fuzz, ZERO offsets, ZERO
+rejects on bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5 (patch -p1 -F0
+--dry-run and git apply --check both clean), and the resulting tree is
+byte-identical to the tree all of the above was measured on.
 
 diff --git a/Makefile.def b/Makefile.def
 index cde69c9c9..497ca1435 100644
@@ -2850,7 +3181,6 @@ index 4dfb90acf..e1b3b2541 100644
  	    *total = speed ? COSTS_N_INSNS (2) : COSTS_N_BYTES (11);
  	  else
 diff --git a/gcc/config/i386/i386.md b/gcc/config/i386/i386.md
-index 8407af948..a8bad90c1 100644
 --- a/gcc/config/i386/i386.md
 +++ b/gcc/config/i386/i386.md
 @@ -1006,6 +1006,10 @@
@@ -2864,7 +3194,17 @@ index 8407af948..a8bad90c1 100644
  ;; Describe a user's asm statement.
  (define_asm_attributes
    [(set_attr "length" "128")
-@@ -6008,6 +6012,39 @@
+@@ -1109,7 +1113,8 @@
+ (define_code_attr u [(sign_extend "") (zero_extend "u")
+ 		     (div "") (udiv "u")])
+ (define_code_attr u_bool [(sign_extend "false") (zero_extend "true")
+-			  (div "false") (udiv "true")])
++			  (div "false") (udiv "true")
++			  (smul_highpart "false") (umul_highpart "true")])
+ 
+ ;; Used in signed and unsigned truncations.
+ (define_code_iterator any_truncate [ss_truncate truncate us_truncate])
+@@ -6008,6 +6013,39 @@
     (set_attr "amdfam10_decode" "double,double")
     (set_attr "bdver1_decode" "double,double")])
  
@@ -2904,15 +3244,50 @@ index 8407af948..a8bad90c1 100644
  ;; Avoid vector decoded forms of the instruction.
  (define_peephole2
    [(match_scratch:MODEF 2 "x")
-@@ -11513,6 +11550,21 @@
+@@ -11513,8 +11551,58 @@
  	      (set (match_dup 5)
  		   (umul_highpart:DWIH (match_dup 2) (match_dup 3)))])])
  
-+;; BMI2 MULX highpart-only pattern.  Uses MULX to get only the high part.
-+;; When both output operands are identical, MULX writes the high half to that
-+;; register, so no scratch register is needed.  This avoids the mov from rdx
-+;; after mulq when only the high part is needed.
-+(define_insn "*bmi2_umul<mode>3_highpart"
++;; ms178: BMI2 MULX for an unsigned highpart-only multiply.
++;;
++;; MULX writes {high, low} into its two destination registers and, unlike
++;; MUL, clobbers neither EFLAGS nor a fixed RAX/RDX output pair -- only the
++;; *source* operand 1 is fixed to RDX.  When both destinations name the same
++;; register the CPU leaves the high half there, so a highpart-only multiply
++;; needs no scratch register and no "mov %rdx,%dst" fixup afterwards.
++;;
++;; This has to be reached from the *optab-named expander*.  A standalone
++;; "*"-named define_insn is only ever consulted by recog () on RTL that some
++;; other pass already built, and nothing in the compiler builds a bare
++;; umul_highpart whose operand 1 already sits in RDX -- so as a separate
++;; pattern it is unreachable dead code.  Going through the expander instead
++;; hands the RDX placement to register allocation, which satisfies it with
++;; exactly the one move that MUL's "%a" constraint would have required
++;; anyway; the saved MOV of the result is then pure profit.
++;;
++;; The signed case has no MULX equivalent and keeps using IMUL.
++(define_expand "<s>mul<mode>3_highpart"
++  [(parallel
++     [(set (match_operand:DWIH 0 "register_operand")
++	   (any_mul_highpart:DWIH
++	     (match_operand:DWIH 1 "register_operand")
++	     (match_operand:DWIH 2 "nonimmediate_operand")))
++      (clobber (match_scratch:DWIH 3))
++      (clobber (reg:CC FLAGS_REG))])]
++  ""
++{
++  if (TARGET_BMI2 && <u_bool>)
++    {
++      operands[1] = force_reg (<MODE>mode, operands[1]);
++      if (!nonimmediate_operand (operands[2], <MODE>mode))
++	operands[2] = force_reg (<MODE>mode, operands[2]);
++      emit_insn (gen_bmi2_umul<mode>3_highpart (operands[0], operands[1],
++						operands[2]));
++      DONE;
++    }
++})
++
++(define_insn "bmi2_umul<mode>3_highpart"
 +  [(set (match_operand:DWIH 0 "register_operand" "=r")
 +	(umul_highpart:DWIH
 +	  (match_operand:DWIH 1 "register_operand" "d")
@@ -2924,9 +3299,12 @@ index 8407af948..a8bad90c1 100644
 +   (set_attr "mode" "<MODE>")])
 +
  ;; Highpart multiplication patterns
- (define_insn "<s>mul<mode>3_highpart"
+-(define_insn "<s>mul<mode>3_highpart"
++(define_insn "*<s>mul<mode>3_highpart_1"
    [(set (match_operand:DWIH 0 "register_operand" "=d")
-@@ -14082,6 +14134,46 @@
+ 	(any_mul_highpart:DWIH
+ 	  (match_operand:DWIH 1 "register_operand" "%a")
+@@ -14082,6 +14170,46 @@
    operands[5] = gen_reg_rtx (<MODE>mode);
  })
  
@@ -2973,7 +3351,7 @@ index 8407af948..a8bad90c1 100644
  (define_insn "*<code>qi_1_zext<mode><nf_name>"
    [(set (match_operand:SWI248x 0 "register_operand" "=r,r")
  	(zero_extend:SWI248x
-@@ -19132,12 +19224,14 @@
+@@ -19132,12 +19260,14 @@
     (set_attr "mode" "<MODE>")])
  
  (define_split
@@ -2992,7 +3370,7 @@ index 8407af948..a8bad90c1 100644
  
  ;; Rotations through carry flag
  (define_insn "rcrsi2"
-@@ -23030,8 +23124,10 @@
+@@ -23030,8 +23160,10 @@
     (set_attr "mode" "<MODE>")])
  
  (define_expand "bswaphi2"
@@ -3005,7 +3383,7 @@ index 8407af948..a8bad90c1 100644
    ""
  {
    if (!TARGET_MOVBE)
-@@ -23039,100 +23135,82 @@
+@@ -23039,100 +23171,82 @@
  })
  
  (define_insn "*bswaphi2_movbe"
@@ -4051,7 +4429,7 @@ index 31b04688c..bfb1f8840 100644
 diff --git a/gcc/expmed.cc b/gcc/expmed.cc
 --- a/gcc/expmed.cc
 +++ b/gcc/expmed.cc
-@@ -792,6 +792,52 @@
+@@ -792,6 +792,116 @@
  	return true;
      }
  
@@ -4101,10 +4479,74 @@ diff --git a/gcc/expmed.cc b/gcc/expmed.cc
 +	}
 +    }
 +
++  /* ms178: inserting a whole *sub-vector* into a vector register -- the
++     128-bit-lane-of-a-256-bit-vector idiom (_mm256_insertf128_si256,
++     __builtin_memcpy ((char *) &v256 + 16, &v128, 16), and, importantly,
++     every BIT_INSERT_EXPR the vectorizer emits when it builds a wide
++     vector out of two half-width results, e.g. a V8SI produced by two
++     vpmovsxwd).
++
++     There is no vec_set optab for a vector-valued field, and the plain
++     (set (subreg:V4SI (reg:V8SI R) 16) X) form that the generic subreg
++     path below produces is *not* something LRA can satisfy: a partial
++     write to a multi-lane vector register has no matching mov
++     alternative, so LRA resolves it by spilling the whole vector to an
++     aligned stack slot, storing the lane, and reloading.  That costs a
++     frame set-up (push %rbp / and $-32,%rsp), two stores and a load
++     where the machine has a single vinserti128.
++
++     Rebuild the value with vec_init from the two halves instead.  Only
++     the exactly-two-pieces case is handled: then the single other piece
++     is obtained with vec_extract, which on x86 is free for the low half
++     (a subreg) and one vextracti128 for the high half, and the vec_init
++     is one vinsert[fi]128 / vinsert[fi]32x4.  With three or more pieces
++     the extractions could cost more than the spill, so that case is
++     deliberately left alone.  */
++  if (VECTOR_MODE_P (outermode)
++      && !MEM_P (op0)
++      && VECTOR_MODE_P (fieldmode)
++      && !reverse
++      && GET_MODE_INNER (fieldmode) == innermode
++      && known_eq (bitsize, GET_MODE_BITSIZE (fieldmode))
++      && known_eq (GET_MODE_SIZE (outermode), 2 * GET_MODE_SIZE (fieldmode))
++      && multiple_p (bitnum, GET_MODE_BITSIZE (fieldmode), &pos)
++      && known_lt (pos, 2U)
++      && (convert_optab_handler (vec_init_optab, outermode, fieldmode)
++	  != CODE_FOR_nothing))
++    {
++      enum insn_code icode
++	= convert_optab_handler (vec_init_optab, outermode, fieldmode);
++      rtx_insn *last = get_last_insn ();
++      /* POS is 0 or 1, so this is a plain unsigned index.  */
++      unsigned HOST_WIDE_INT ipos = pos.to_constant ();
++      unsigned HOST_WIDE_INT other = 1 - ipos;
++      rtx keep = extract_bit_field (op0, GET_MODE_BITSIZE (fieldmode),
++				    other * GET_MODE_BITSIZE (fieldmode),
++				    /*unsignedp=*/true, NULL_RTX,
++				    fieldmode, fieldmode,
++				    /*reverse=*/false, NULL);
++      if (keep)
++	{
++	  rtvec v = rtvec_alloc (2);
++	  RTVEC_ELT (v, ipos) = value;
++	  RTVEC_ELT (v, other) = keep;
++	  rtx tmp = gen_reg_rtx (outermode);
++	  class expand_operand ops[2];
++	  create_output_operand (&ops[0], tmp, outermode);
++	  create_fixed_operand (&ops[1], gen_rtx_PARALLEL (outermode, v));
++	  if (maybe_expand_insn (icode, 2, ops))
++	    {
++	      emit_move_insn (op0, ops[0].value);
++	      return true;
++	    }
++	}
++      delete_insns_since (last);
++    }
++
    /* If the target is a register, overwriting the entire object, or storing
       a full-word or multi-word field can be done with just a SUBREG.  */
    if (!MEM_P (op0)
-@@ -1821,7 +1867,9 @@
+@@ -1821,7 +1931,9 @@
    /* Make sure we are playing with integral modes.  Pun with subregs
       if we aren't.  */
    opt_scalar_int_mode op0_mode = int_mode_for_mode (GET_MODE (op0));
@@ -4672,6 +5114,70 @@ index 000000000..5e2e58193
 +/* { dg-final { scan-tree-dump-times {\(unsigned char\) c_[0-9]+\(D\)} 3 "optimized" } } */
 +/* { dg-final { scan-tree-dump-times {MEM[^;\n\r]*= _[0-9]+;} 3 "optimized" } } */
 +/* { dg-final { scan-tree-dump-times {MEM[^;\n\r]*= 7;} 1 "optimized" } } */
+diff --git a/gcc/testsuite/gcc.target/i386/ms178-mulx-highpart-1.c b/gcc/testsuite/gcc.target/i386/ms178-mulx-highpart-1.c
+new file mode 100644
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/i386/ms178-mulx-highpart-1.c
+@@ -0,0 +1,23 @@
++/* An unsigned highpart-only multiply must use BMI2 MULX with both
++   destinations equal, which needs no scratch register and no move of the
++   result out of %rdx.  The signed case has no MULX form and must keep
++   using IMUL.  */
++/* { dg-do compile { target { ! ia32 } } } */
++/* { dg-options "-O2 -mbmi2" } */
++
++typedef unsigned long long u64;
++
++u64 hi64 (u64 a, u64 b)
++{ return (unsigned __int128) a * b >> 64; }
++
++u64 hi64m (u64 a, const u64 *p)
++{ return (unsigned __int128) a * *p >> 64; }
++
++long long shi64 (long long a, long long b)
++{ return (__int128) a * b >> 64; }
++
++/* Two MULX, one for each unsigned highpart.  */
++/* { dg-final { scan-assembler-times "mulx\[ \t\]" 2 } } */
++/* The unsigned MUL form must be gone; only the signed IMUL remains.  */
++/* { dg-final { scan-assembler-not "\[ \t\]mulq" } } */
++/* { dg-final { scan-assembler-times "imulq" 1 } } */
+diff --git a/gcc/testsuite/gcc.target/i386/ms178-subvec-insert-1.c b/gcc/testsuite/gcc.target/i386/ms178-subvec-insert-1.c
+new file mode 100644
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/i386/ms178-subvec-insert-1.c
+@@ -0,0 +1,31 @@
++/* Inserting a 128-bit sub-vector into a 256-bit vector, or a 256-bit one
++   into a 512-bit vector, must use a single vinsert[fi]128 / vinsert*x4 /
++   vinsert*x8 rather than spilling the whole vector to the stack.  */
++/* { dg-do compile { target { ! ia32 } } } */
++/* { dg-options "-O2 -mavx2" } */
++
++#include <string.h>
++
++typedef int v4si __attribute__((vector_size(16)));
++typedef int v8si __attribute__((vector_size(32)));
++typedef float v4sf __attribute__((vector_size(16)));
++typedef float v8sf __attribute__((vector_size(32)));
++typedef double v2df __attribute__((vector_size(16)));
++typedef double v4df __attribute__((vector_size(32)));
++
++v8si set_hi (v8si r, v4si hi)
++{ memcpy ((char *) &r + 16, &hi, 16); return r; }
++
++v8si set_lo (v8si r, v4si lo)
++{ memcpy (&r, &lo, 16); return r; }
++
++v8sf set_hif (v8sf r, v4sf hi)
++{ memcpy ((char *) &r + 16, &hi, 16); return r; }
++
++v4df set_hid (v4df r, v2df hi)
++{ memcpy ((char *) &r + 16, &hi, 16); return r; }
++
++/* No stack frame and no spill of the vector may remain.  */
++/* { dg-final { scan-assembler-not "and\[lq\]?\[ \t\]*\\\$-32" } } */
++/* { dg-final { scan-assembler-not "%rbp" } } */
++/* { dg-final { scan-assembler-times "vinsert" 4 } } */
 diff --git a/gcc/testsuite/gcc.target/i386/pr27827.c b/gcc/testsuite/gcc.target/i386/pr27827.c
 index 3b337444a..fe678437f 100644
 --- a/gcc/testsuite/gcc.target/i386/pr27827.c
@@ -6013,6 +6519,35 @@ diff --git a/gcc/tree-vect-data-refs.cc b/gcc/tree-vect-data-refs.cc
        if (abs_dist >= 2 && abs_dist < *max_vf)
  	{
  	  /* The dependence distance requires reduction of the maximal
+@@ -2132,8 +2151,13 @@
+ 
+    if (!unlimited_cost_model (LOOP_VINFO_LOOP (loop_vinfo)))
+      {
+-       res.inside_cost = INT_MAX;
+-       res.outside_cost = INT_MAX;
++       /* ms178: inside_cost/outside_cost are unsigned int, so the sentinel
++	  has to be UINT_MAX.  With INT_MAX any candidate costing more than
++	  2^31-1 could never win the "cost < min->cost" comparison, so no
++	  peeling option was recorded at all and peel_info.dr_info stayed
++	  NULL -- the caller then concluded that peeling is impossible.  */
++       res.inside_cost = UINT_MAX;
++       res.outside_cost = UINT_MAX;
+        peeling_htab->traverse <_vect_peel_extended_info *,
+ 	   		       vect_peeling_hash_get_lowest_cost> (&res);
+      }
+@@ -2163,7 +2187,11 @@
+     = known_alignment_for_access_p (dr0_info,
+ 				    STMT_VINFO_VECTYPE (dr0_info->stmt));
+   bool has_unsupported_dr_p = false;
+-  unsigned int dr0_step = tree_to_shwi (DR_STEP (dr0_info->dr));
++  /* ms178: DR_STEP is signed and can exceed 32 bits; storing it in an
++     unsigned int both truncates it and breaks the comparison against
++     tree_to_shwi () below, so two accesses with the same negative step
++     compared unequal and peeling was needlessly rejected.  */
++  HOST_WIDE_INT dr0_step = tree_to_shwi (DR_STEP (dr0_info->dr));
+   int known_unsupported_misalignment = DR_MISALIGNMENT_UNKNOWN;
+ 
+   /* Check if each data ref can be vectorized after peeling.  */
 diff --git a/gcc/testsuite/gcc.dg/vect/ms178-cost-overflow-1.c b/gcc/testsuite/gcc.dg/vect/ms178-cost-overflow-1.c
 new file mode 100644
 --- /dev/null
@@ -6049,6 +6584,45 @@ new file mode 100644
 +  for (int i = 0; i < N; i++)
 +    for (int j = 0; j < N; j++)
 +      z[i][j] = x[i][j] * y[i][j] + z[i][j];
++}
++
++/* { dg-final { scan-tree-dump "vectorized 1 loops" "vect" } } */
+diff --git a/gcc/testsuite/gcc.dg/vect/ms178-peel-sentinel-1.c b/gcc/testsuite/gcc.dg/vect/ms178-peel-sentinel-1.c
+new file mode 100644
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/vect/ms178-peel-sentinel-1.c
+@@ -0,0 +1,34 @@
++/* vect_peeling_hash_choose_best_peeling() stores candidate costs in
++   unsigned int fields but seeded the running minimum with INT_MAX.  Any
++   peeling candidate costing more than 2^31-1 therefore lost the
++   "cost < min->cost" comparison unconditionally, so no candidate was
++   recorded and peel_info.dr_info stayed NULL - the caller then behaved as
++   if no peeling option existed at all.
++
++   Separately, vect_peeling_supportable() kept DR_STEP in an unsigned int
++   while comparing it against tree_to_shwi (), so two references with the
++   same negative step compared unequal and peeling was rejected.
++
++   This test only checks that the compiler still vectorizes these loops
++   and does not ICE; the fixes are validated numerically elsewhere.  */
++/* { dg-do compile } */
++/* { dg-additional-options "--param=vect-inner-loop-cost-factor=10000" } */
++
++void
++descending (float *__restrict x, float *__restrict y,
++	    float *__restrict z, int n)
++{
++  for (int i = n - 1; i >= 0; i--)
++    z[i] = x[i] * y[i] + z[i];
++}
++
++struct three { int a, b, c; };
++
++void
++strided_descending (struct three *s, int n)
++{
++  for (int i = n - 1; i >= 0; i--)
++    s[i].a = s[i].b + s[i].c;
 +}
 +
 +/* { dg-final { scan-tree-dump "vectorized 1 loops" "vect" } } */
