@@ -1,5 +1,5 @@
-From: ms178 toolchain patchset v9 (v8 + vectorizer cost-model audit)
-Subject: [PATCH v9] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
+From: ms178 toolchain patchset v10 (v9 + peeling-for-alignment audit)
+Subject: [PATCH v10] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
  rebased onto bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5
 
 Rebase of ms178-1.patch v5 (base 642e52b049a24b28a0495f4d2c08f97ad2cb6666)
@@ -351,6 +351,107 @@ VALIDATION
           gcc.dg/vect/ms178-cost-overflow-1.c
       compiles without ICE at --param=vect-inner-loop-cost-factor=
       1 / 2 / 5000 / 10000 and still reports the expected vectorization.
+
+=====================================================================
+v10 ADDITIONS - peeling-for-alignment audit
+=====================================================================
+
+Two further defects in gcc/tree-vect-data-refs.cc, both of the same
+family as the v9 cost-model findings: a value of one type stored or
+compared as another.
+
+--- 14. vect_peeling_hash_choose_best_peeling: wrong sentinel --------
+
+    res.inside_cost  = INT_MAX;
+    res.outside_cost = INT_MAX;
+
+_vect_peel_extended_info::inside_cost and ::outside_cost are
+"unsigned int".  Seeding the running minimum with INT_MAX (2^31-1)
+rather than UINT_MAX means any peeling candidate whose cost lands in
+(INT_MAX, UINT_MAX] loses the
+
+    if (inside_cost < min->inside_cost || ...)
+
+comparison unconditionally - even when it is the only candidate.  The
+traversal then leaves res.peel_info.dr_info == NULL and the caller
+concludes that no peeling option exists, silently giving up on aligning
+the accesses.  Costs are unbounded accumulations (see the v9 notes on
+--param=vect-inner-loop-cost-factor, range 1..10000), so this is the
+same reachability argument as before.
+
+    -> seed with UINT_MAX, which is the maximum of the field's actual
+       type.  Note the fix cannot be "make the fields int": they are
+       compared against, and assigned from, unsigned cost accumulators.
+
+--- 15. vect_peeling_supportable: DR_STEP kept in an unsigned int ----
+
+    unsigned int dr0_step = tree_to_shwi (DR_STEP (dr0_info->dr));
+    ...
+    if (tree_to_shwi (DR_STEP (dr)) != dr0_step)
+      return peeling_unsupported;
+
+DR_STEP is signed and is not bounded to 32 bits.  Storing it in an
+unsigned int does two wrong things at once:
+
+  * a negative step becomes a huge positive number, so the comparison
+    against the signed tree_to_shwi () value on the other side is false
+    even when both references have exactly the same step.  Descending
+    loops therefore reported "different alignment steps" and returned
+    PEELING_UNSUPPORTED - a missed optimisation, not a miscompile.
+    Demonstrated: step -8 stored as 4294967288, compared against -8.
+
+  * a step wider than 32 bits truncates (0x100000008 -> 8).
+
+    -> keep it as HOST_WIDE_INT, matching what tree_to_shwi () returns
+       and what DR_STEP actually is.
+
+REACHABILITY - stated honestly
+    Both sites sit behind "supportable_dr_alignment ==
+    dr_unaligned_unsupported".  x86 reports unaligned accesses as
+    supported almost everywhere, so I could not construct an x86 test
+    that reaches the divergent comparison: instrumenting the compiler
+    and running the whole gcc.dg/vect suite hit the comparison 40 times,
+    all with small positive steps, and 0 of those diverged between the
+    old and new expressions.  These are therefore latent defects - they
+    matter for strict-alignment targets and for any future x86 path that
+    returns dr_unaligned_unsupported - and the fixes are provably
+    behaviour-neutral for the cases that do occur today.  I am not
+    claiming a user-visible x86 speedup for them.
+
+    I also audited and explicitly did NOT change:
+      * epilog->nb_iterations_upper_bound -= lowest_vf
+        (tree-vect-loop-manip.cc).  Potential unsigned underflow, but
+        instrumenting the subtraction and scanning all 2002 gcc.dg/vect
+        files produced 0 underflow events, so the documented invariant
+        ("the vector loop covered at least VF scalar iterations") holds.
+        No change made.
+      * misal += npeel * TREE_INT_CST_LOW (DR_STEP (...)) at three sites.
+        The following "&= alignment - 1" makes the result correct
+        regardless of any wrapping.  No change made.
+      * int inside_cost/prologue_cost in vect_model_simple_cost and
+        vect_model_promotion_demotion_cost.  These feed only dump output,
+        not a decision.  No change made.
+      * (group_size * cvf - gap) % cnunits with ceil_log2 (0): ceil_log2
+        is defined to return 0 for 0, so cpart_size becomes 1.  Handled.
+        No change made.
+
+VALIDATION
+    * cc1 rebuilt: RC=0, no new warnings from the touched file.
+    * Whole gcc.dg/vect suite compiled stock vs patched at
+      -O3 -march=native, comparing "loop vectorized" counts per file:
+          2002 files, 0 differing, 0 ICEs.
+    * Runtime: 855 executable gcc.dg/vect tests built and run, 0 failures.
+      (An earlier sweep at -march=raptorlake showed 6 "Illegal
+      instruction" failures; the stock r581 compiler fails those 6
+      identically, and all 6 pass at -march=native - the sandbox host
+      lacks AVX-VNNI.  Not a code difference.)
+    * Sentinel and step-comparison mechanics each demonstrated in a
+      standalone model: candidate cost 3000000000 is rejected with the
+      INT_MAX sentinel and accepted with UINT_MAX; step -8 compares
+      unequal to itself through an unsigned int and equal through
+      HOST_WIDE_INT.
+    * New regression test gcc.dg/vect/ms178-peel-sentinel-1.c: no ICE at
+      --param=vect-inner-loop-cost-factor=1 and 10000, still vectorizes.
 
 diff --git a/Makefile.def b/Makefile.def
 index cde69c9c9..497ca1435 100644
@@ -6013,6 +6114,35 @@ diff --git a/gcc/tree-vect-data-refs.cc b/gcc/tree-vect-data-refs.cc
        if (abs_dist >= 2 && abs_dist < *max_vf)
  	{
  	  /* The dependence distance requires reduction of the maximal
+@@ -2132,8 +2151,13 @@
+ 
+    if (!unlimited_cost_model (LOOP_VINFO_LOOP (loop_vinfo)))
+      {
+-       res.inside_cost = INT_MAX;
+-       res.outside_cost = INT_MAX;
++       /* ms178: inside_cost/outside_cost are unsigned int, so the sentinel
++	  has to be UINT_MAX.  With INT_MAX any candidate costing more than
++	  2^31-1 could never win the "cost < min->cost" comparison, so no
++	  peeling option was recorded at all and peel_info.dr_info stayed
++	  NULL -- the caller then concluded that peeling is impossible.  */
++       res.inside_cost = UINT_MAX;
++       res.outside_cost = UINT_MAX;
+        peeling_htab->traverse <_vect_peel_extended_info *,
+ 	   		       vect_peeling_hash_get_lowest_cost> (&res);
+      }
+@@ -2163,7 +2187,11 @@
+     = known_alignment_for_access_p (dr0_info,
+ 				    STMT_VINFO_VECTYPE (dr0_info->stmt));
+   bool has_unsupported_dr_p = false;
+-  unsigned int dr0_step = tree_to_shwi (DR_STEP (dr0_info->dr));
++  /* ms178: DR_STEP is signed and can exceed 32 bits; storing it in an
++     unsigned int both truncates it and breaks the comparison against
++     tree_to_shwi () below, so two accesses with the same negative step
++     compared unequal and peeling was needlessly rejected.  */
++  HOST_WIDE_INT dr0_step = tree_to_shwi (DR_STEP (dr0_info->dr));
+   int known_unsupported_misalignment = DR_MISALIGNMENT_UNKNOWN;
+ 
+   /* Check if each data ref can be vectorized after peeling.  */
 diff --git a/gcc/testsuite/gcc.dg/vect/ms178-cost-overflow-1.c b/gcc/testsuite/gcc.dg/vect/ms178-cost-overflow-1.c
 new file mode 100644
 --- /dev/null
@@ -6049,6 +6179,45 @@ new file mode 100644
 +  for (int i = 0; i < N; i++)
 +    for (int j = 0; j < N; j++)
 +      z[i][j] = x[i][j] * y[i][j] + z[i][j];
++}
++
++/* { dg-final { scan-tree-dump "vectorized 1 loops" "vect" } } */
+diff --git a/gcc/testsuite/gcc.dg/vect/ms178-peel-sentinel-1.c b/gcc/testsuite/gcc.dg/vect/ms178-peel-sentinel-1.c
+new file mode 100644
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/vect/ms178-peel-sentinel-1.c
+@@ -0,0 +1,34 @@
++/* vect_peeling_hash_choose_best_peeling() stores candidate costs in
++   unsigned int fields but seeded the running minimum with INT_MAX.  Any
++   peeling candidate costing more than 2^31-1 therefore lost the
++   "cost < min->cost" comparison unconditionally, so no candidate was
++   recorded and peel_info.dr_info stayed NULL - the caller then behaved as
++   if no peeling option existed at all.
++
++   Separately, vect_peeling_supportable() kept DR_STEP in an unsigned int
++   while comparing it against tree_to_shwi (), so two references with the
++   same negative step compared unequal and peeling was rejected.
++
++   This test only checks that the compiler still vectorizes these loops
++   and does not ICE; the fixes are validated numerically elsewhere.  */
++/* { dg-do compile } */
++/* { dg-additional-options "--param=vect-inner-loop-cost-factor=10000" } */
++
++void
++descending (float *__restrict x, float *__restrict y,
++	    float *__restrict z, int n)
++{
++  for (int i = n - 1; i >= 0; i--)
++    z[i] = x[i] * y[i] + z[i];
++}
++
++struct three { int a, b, c; };
++
++void
++strided_descending (struct three *s, int n)
++{
++  for (int i = n - 1; i >= 0; i--)
++    s[i].a = s[i].b + s[i].c;
 +}
 +
 +/* { dg-final { scan-tree-dump "vectorized 1 loops" "vect" } } */
