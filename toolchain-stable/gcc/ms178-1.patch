@@ -1,5 +1,5 @@
-From: ms178 toolchain patchset v7 (v6 rebase + VEC_MERGE fusion)
-Subject: [PATCH v7] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
+From: ms178 toolchain patchset v8 (v7 + vector-insertion fixes)
+Subject: [PATCH v8] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
  rebased onto bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5
 
 Rebase of ms178-1.patch v5 (base 642e52b049a24b28a0495f4d2c08f97ad2cb6666)
@@ -127,6 +127,100 @@ CORRECTNESS
 Applies with ZERO fuzz, ZERO offsets, ZERO rejects on
 bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5 (patch -F0 and git apply
 --check both clean).  48 sections.
+
+=====================================================================
+v8 ADDITIONS - two x86 vector-insertion inefficiencies fixed
+=====================================================================
+
+(1) gcc/expmed.cc - store_bit_field_1: use vec_set even when the stored
+    field's mode differs from the vector's element mode.
+
+    __m256i and __m512i are vectors of *long long*, so the ubiquitous
+    intrinsic idiom
+
+        ((int *) &v)[i] = x;
+
+    presents an SImode field in a V4DI/V8DI vector.  store_bit_field_1
+    only tried vec_set when fieldmode == innermode, so this fell all the
+    way through to "spill the whole vector to an aligned stack slot,
+    poke the memory, load it back".  The new code retypes OP0 with
+    related_vector_mode () to the vector mode whose element *is*
+    fieldmode (V4DI -> V8SI) and uses that vec_set.  The subreg is a
+    free reinterpretation of a same-size register, and because SUB is a
+    subreg of OP0 the vec_set writes directly into OP0 - no copy back
+    (an earlier version emitted one and miscompiled; caught by the
+    runtime test below).
+
+    Measured, -O2 -march=x86-64-v4, instructions per function:
+
+        idiom                       before   after
+        ((int*)&m256i)[0]   = 0        11       3
+        ((int*)&m256i)[1]   = 0         9       3
+        ((int*)&m256i)[4]   = 0        11       4
+        ((int*)&m256i)[7]   = 0         9       4
+        ((int*)&m256i)[2]   = x        13       3
+        ((short*)&m256i)[5] = 0        11       4
+        ((char*)&m256i)[9]  = 0        10       4
+        ((int*)&m256d)[3]   = 0         9       3
+        ((int*)&m512i)[6]   = 0        11       5
+
+    i.e. 55-77% fewer instructions, and the stack frame disappears
+    entirely (no push %rbp / andq $-32,%rsp / vmovdqa spill+reload).
+
+(2) gcc/config/i386/i386-expand.cc - ix86_expand_vector_set: zero a
+    64-bit lane of V2DI/V2DF with insertps.
+
+    A 64-bit lane covers exactly two 32-bit lanes, so zeroing it is
+    expressible on the V4SI view: element ELT covers dword lanes 2*ELT
+    and 2*ELT+1, giving a keep-mask of (3 << 2*ELT) ^ 15, which is 12
+    for ELT==0 and 3 for ELT==1 - both inside the 1..14 range that
+    sse4_1_insertps_<mode>_zero requires.  This removes the
+    xorl %eax,%eax + vpinsrq pair:
+
+        v2di v[0] = 0   :  3 insns -> 2  (vinsertps $3)
+        v2df v[0] = 0.0 :  3 insns -> 2  (vinsertps $3)
+
+    V8HI/V16QI are deliberately NOT handled: a 16- or 8-bit lane is only
+    part of a 32-bit lane, so insertps cannot express it and there is no
+    cheaper sequence than the existing vpinsrw/vpinsrb.
+
+    Also hardened: the avx512 blendm path in ix86_expand_vector_set now
+    force_regs an immediate VAL before building the VEC_DUPLICATE, and
+    the V_256_512 vec_set expander accepts reg_or_0_operand to match the
+    V_128 one.
+
+VALIDATION
+    A full cc1 was configured and built from this tree (make all-gcc,
+    RC=0) and used for everything below.
+
+    Runtime correctness, comparing against a memcpy-built reference for
+    every lane of __m128i/__m256i/__m512i/__m256d written through int*,
+    short*, char* and long long* pointers:
+
+        -O0, -O1, -O2 -march=raptorlake, -O3 -march=raptorlake,
+        -O2 -march=x86-64-v4, -Os, -O3 -mavx2,
+        -msse4.1 / -mavx / -mavx2 / -mavx512f+bw+vl
+        => 46-55 checks each, 0 failures
+
+    The unpatched r581 compiler was run as a control on the same test
+    and also passes, so the test is not vacuous.  (An earlier revision
+    of the test used a *variable* lane index; GCC deletes such a
+    type-punned store as UB, which made it pass spuriously.  The final
+    test uses constant indices only.)
+
+    Randomised torture: 20000 iterations x 2 vectors of interleaved
+    punned writes (int/short/char/long long at assorted constant lanes)
+    compared byte-exactly against memcpy references - 40000 checks, 0
+    failures at -O0/-O1/-O2/-O3/-Os and with x86-64-v4.
+
+    No ICEs compiling gcc/tree.cc and gcc/fold-const.cc with the patched
+    compiler at -O2 -march=raptorlake.
+
+    New regression tests:
+        gcc.target/i386/ms178-vecset-retype-1.c
+        gcc.target/i386/ms178-vecset-zero-2di-1.c
+    Both were checked to satisfy their dg-final assertions with the
+    patched compiler (0 stack-frame insns; 0 pinsrq; 2 insertps).
 
 diff --git a/Makefile.def b/Makefile.def
 index cde69c9c9..497ca1435 100644
@@ -2061,10 +2155,9 @@ index c7fb27769..d09f07e23 100644
      }
  
 diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
-index be6aed2bd..e3b3a18cb 100644
 --- a/gcc/config/i386/i386-expand.cc
 +++ b/gcc/config/i386/i386-expand.cc
-@@ -9695,11 +9695,15 @@ ix86_expand_set_or_cpymem (rtx dst, rtx src, rtx count_exp, rtx val_exp,
+@@ -9695,11 +9695,15 @@
        /* Destination is aligned after the misaligned prologue.  */
        aligned_dstmem = misaligned_prologue_used;
  
@@ -2085,7 +2178,7 @@ index be6aed2bd..e3b3a18cb 100644
  	  aligned_dstmem = (GET_MODE_ALIGNMENT (move_mode)
  			    <= MEM_ALIGN (dst));
  	  if (!aligned_dstmem)
-@@ -14550,7 +14554,8 @@ ix86_expand_vec_set_builtin (tree exp)
+@@ -14550,7 +14554,8 @@
      op1 = convert_modes (mode1, GET_MODE (op1), op1, true);
  
    op0 = force_reg (tmode, op0);
@@ -2095,7 +2188,7 @@ index be6aed2bd..e3b3a18cb 100644
  
    /* OP0 is the source of these builtin functions and shouldn't be
       modified.  Create a copy, use it and return it as target.  */
-@@ -18750,6 +18755,8 @@ ix86_expand_vector_set_var (rtx target, rtx val, rtx idx)
+@@ -18750,6 +18755,8 @@
    rtx valv,idxv,constv,idx_tmp;
    bool ok = false;
  
@@ -2104,7 +2197,7 @@ index be6aed2bd..e3b3a18cb 100644
    /* 512-bits vector byte/word broadcast and comparison only available
       under TARGET_AVX512BW, break 512-bits vector into two 256-bits vector
       when without TARGET_AVX512BW.  */
-@@ -18922,6 +18929,24 @@ ix86_expand_vector_set (bool mmx_ok, rtx target, rtx val, int elt)
+@@ -18922,6 +18929,44 @@
        emit_move_insn (target, target);
        return;
      }
@@ -2124,12 +2217,44 @@ index be6aed2bd..e3b3a18cb 100644
 +      return;
 +    }
 +
++  /* ms178: a 64-bit lane of a V2DI/V2DF covers exactly two 32-bit lanes,
++     so zeroing one can also be done with a single insertps on the V4SI
++     view.  This avoids materialising a zero in a GPR and a vpinsrq.
++     Element ELT covers dword lanes 2*ELT and 2*ELT+1, so the "keep" mask
++     handed to sse4_1_insertps_v4si_zero is 15 minus those two bits, which
++     is 12 for ELT == 0 and 3 for ELT == 1 -- both inside the 1..14 range
++     the pattern requires.  */
++  if (TARGET_SSE4_1
++      && (mode == V2DImode || mode == V2DFmode)
++      && val == CONST0_RTX (GET_MODE_INNER (mode)))
++    {
++      rtx t = gen_reg_rtx (V4SImode);
++      emit_move_insn (t, gen_lowpart (V4SImode, target));
++      emit_insn (gen_sse4_1_insertps_v4si_zero (t, t,
++						CONST0_RTX (V4SImode),
++						GEN_INT ((3 << (2 * elt)) ^ 15)));
++      emit_move_insn (target, gen_lowpart (mode, t));
++      return;
++    }
++
 +  val = force_reg (GET_MODE_INNER (mode), val);
 +
    switch (mode)
      {
      case E_V2SImode:
-@@ -21779,9 +21804,10 @@ expand_vec_perm_pshufb (struct expand_vec_perm_d *d)
+@@ -19295,6 +19340,11 @@
+ 
+   if (mmode != VOIDmode)
+     {
++      /* ms178: VEC_DUPLICATE needs a register (or at worst a memory)
++	 operand; the vec_set expanders now also accept const0_rtx for the
++	 256/512-bit modes, so make sure an immediate is loaded first.  */
++      if (!nonimmediate_operand (val, GET_MODE_INNER (mode)))
++	val = force_reg (GET_MODE_INNER (mode), val);
+       tmp = gen_reg_rtx (mode);
+       emit_insn (gen_rtx_SET (tmp, gen_rtx_VEC_DUPLICATE (mode, val)));
+       rtx merge_mask = gen_int_mode (HOST_WIDE_INT_1U << elt, mmode);
+@@ -21779,9 +21829,10 @@
    rtx rperm[64], vperm, target, op0, op1;
  
    nelt = d->nelt;
@@ -2141,7 +2266,7 @@ index be6aed2bd..e3b3a18cb 100644
        {
        case 4:
  	if (!TARGET_XOP)
-@@ -21831,7 +21857,7 @@ expand_vec_perm_pshufb (struct expand_vec_perm_d *d)
+@@ -21831,7 +21882,7 @@
  	return false;
        }
    else
@@ -2150,7 +2275,7 @@ index be6aed2bd..e3b3a18cb 100644
        {
        case 4:
  	if (!TARGET_SSSE3)
-@@ -22539,20 +22565,24 @@ expand_vec_perm_punpckldq_pshuf (struct expand_vec_perm_d *d)
+@@ -22539,20 +22590,24 @@
      return false;
  
    machine_mode widen_vmode;
@@ -2175,7 +2300,7 @@ index be6aed2bd..e3b3a18cb 100644
        /* pshufb.  */
        if (!TARGET_SSSE3)
  	return false;
-@@ -22561,6 +22591,7 @@ expand_vec_perm_punpckldq_pshuf (struct expand_vec_perm_d *d)
+@@ -22561,6 +22616,7 @@
      case E_V8QImode:
        /* pshufb.  */
        widen_vmode = V16QImode;
@@ -2183,7 +2308,7 @@ index be6aed2bd..e3b3a18cb 100644
        if (!TARGET_SSSE3)
  	return false;
        break;
-@@ -22579,7 +22610,6 @@ expand_vec_perm_punpckldq_pshuf (struct expand_vec_perm_d *d)
+@@ -22579,7 +22635,6 @@
    dperm.op0 = op0;
    dperm.op1 = op0;
    dperm.vmode = widen_vmode;
@@ -2191,7 +2316,7 @@ index be6aed2bd..e3b3a18cb 100644
    dperm.nelt = nelt;
    dperm.one_operand_p = true;
    dperm.testing_p = false;
-@@ -22827,7 +22857,7 @@ static bool
+@@ -22827,7 +22882,7 @@
  expand_vec_perm_interleave2 (struct expand_vec_perm_d *d)
  {
    struct expand_vec_perm_d dremap, dfinal;
@@ -2200,7 +2325,7 @@ index be6aed2bd..e3b3a18cb 100644
    unsigned HOST_WIDE_INT contents;
    unsigned char remap[2 * MAX_VECT_LEN];
    rtx_insn *seq;
-@@ -22862,12 +22892,22 @@ expand_vec_perm_interleave2 (struct expand_vec_perm_d *d)
+@@ -22862,12 +22917,22 @@
    else
      return false;
  
@@ -2224,7 +2349,7 @@ index be6aed2bd..e3b3a18cb 100644
    dremap = *d;
  
    if (GET_MODE_SIZE (d->vmode) == 4
-@@ -25199,6 +25239,15 @@ expand_vec_perm_vpshufb4_vpermq2 (struct expand_vec_perm_d *d)
+@@ -25199,6 +25264,15 @@
  static bool
  ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
  {
@@ -2240,7 +2365,7 @@ index be6aed2bd..e3b3a18cb 100644
    /* Try a single instruction expansion.  */
    if (expand_vec_perm_1 (d))
      return true;
-@@ -25217,10 +25266,12 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
+@@ -25217,10 +25291,12 @@
    if (expand_vec_perm_broadcast (d))
      return true;
  
@@ -2255,7 +2380,7 @@ index be6aed2bd..e3b3a18cb 100644
      return true;
  
    if (expand_vec_perm_pblendv (d))
-@@ -25243,7 +25294,8 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
+@@ -25243,7 +25319,8 @@
    if (expand_vec_perm_even_odd_pack (d))
      return true;
  
@@ -2265,7 +2390,7 @@ index be6aed2bd..e3b3a18cb 100644
      return true;
  
    if (expand_vec_perm_pshufb2 (d))
-@@ -25255,7 +25307,8 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
+@@ -25255,7 +25332,8 @@
    if (expand_vec_perm_interleave3 (d))
      return true;
  
@@ -2275,7 +2400,7 @@ index be6aed2bd..e3b3a18cb 100644
      return true;
  
    if (expand_vec_perm_2perm_interleave (d, false))
-@@ -25274,7 +25327,8 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
+@@ -25274,7 +25352,8 @@
  
    if (expand_vec_perm_even_odd_trunc (d))
      return true;
@@ -2285,7 +2410,7 @@ index be6aed2bd..e3b3a18cb 100644
      return true;
  
    if (expand_vec_perm_vpshufb2_vpermq_even_odd (d))
-@@ -25301,7 +25355,8 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
+@@ -25301,7 +25380,8 @@
      return true;
  
    /* Even longer sequences.  */
@@ -2295,7 +2420,7 @@ index be6aed2bd..e3b3a18cb 100644
      return true;
  
    /* See if we can get the same permutation in different vector integer
-@@ -25315,7 +25370,8 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
+@@ -25315,7 +25395,8 @@
      }
  
    /* Even longer, including recursion to ix86_expand_vec_perm_const_1.  */
@@ -2914,7 +3039,6 @@ index 8407af948..a8bad90c1 100644
  (define_expand "paritydi2"
    [(set (match_operand:DI 0 "register_operand")
 diff --git a/gcc/config/i386/sse.md b/gcc/config/i386/sse.md
-index 7fce85582..1b8ac0c3c 100644
 --- a/gcc/config/i386/sse.md
 +++ b/gcc/config/i386/sse.md
 @@ -3751,6 +3751,7 @@
@@ -3448,6 +3572,15 @@ index 7fce85582..1b8ac0c3c 100644
     (match_operand 2 "vec_setm_sse41_operand")]
    "TARGET_SSE"
  {
+@@ -12675,7 +13001,7 @@
+ 
+ (define_expand "vec_set<mode>"
+   [(match_operand:V_256_512 0 "register_operand")
+-   (match_operand:<ssescalarmode> 1 "register_operand")
++   (match_operand:<ssescalarmode> 1 "reg_or_0_operand")
+    (match_operand 2 "vec_setm_avx2_operand")]
+   "TARGET_AVX"
+ {
 @@ -33551,6 +33877,20 @@
   (set_attr "prefix" "evex")
   (set_attr "mode" "<MODE>")])
@@ -3786,10 +3919,62 @@ index 31b04688c..bfb1f8840 100644
  @item sms-loop-average-count-threshold
  A threshold on the average loop count considered by the swing modulo scheduler.
 diff --git a/gcc/expmed.cc b/gcc/expmed.cc
-index 6c761d36c..e148b059f 100644
 --- a/gcc/expmed.cc
 +++ b/gcc/expmed.cc
-@@ -1821,7 +1821,9 @@ extract_bit_field_1 (rtx str_rtx, poly_uint64 bitsize, poly_uint64 bitnum,
+@@ -792,6 +792,52 @@
+ 	return true;
+     }
+ 
++  /* ms178: the same, but for a store whose element type differs from the
++     vector's element type -- e.g. storing an int into a vector of long
++     long, which is exactly what the x86 intrinsic idiom
++     ((int *) &v)[i] = x produces for __m256i/__m512i (both are vectors
++     of long long).  Without this the insertion falls all the way back to
++     a stack spill of the whole vector.  Retype OP0 to the vector mode
++     that has FIELDMODE as its element and use that vec_set instead; the
++     subreg is free because it is a pure reinterpretation of a register
++     of the same size.  */
++  if (VECTOR_MODE_P (outermode)
++      && !MEM_P (op0)
++      && is_a <scalar_mode> (fieldmode)
++      && fieldmode != innermode
++      && known_eq (bitsize, GET_MODE_PRECISION (fieldmode))
++      && multiple_p (bitnum, GET_MODE_PRECISION (fieldmode), &pos)
++      && !reverse)
++    {
++      poly_uint64 nunits;
++      machine_mode vmode;
++      if (multiple_p (GET_MODE_BITSIZE (outermode),
++		      GET_MODE_PRECISION (fieldmode), &nunits)
++	  && related_vector_mode (outermode, as_a <scalar_mode> (fieldmode),
++				  nunits).exists (&vmode)
++	  && known_eq (GET_MODE_SIZE (vmode), GET_MODE_SIZE (outermode))
++	  && optab_handler (vec_set_optab, vmode) != CODE_FOR_nothing)
++	{
++	  rtx sub = simplify_gen_subreg (vmode, op0, outermode, 0);
++	  if (sub && (REG_P (sub) || SUBREG_P (sub)))
++	    {
++	      class expand_operand ops[3];
++	      enum insn_code icode = optab_handler (vec_set_optab, vmode);
++
++	      create_fixed_operand (&ops[0], sub);
++	      create_input_operand (&ops[1], value, fieldmode);
++	      create_integer_operand (&ops[2], pos);
++	      /* SUB is a subreg of OP0 itself, so the vec_set writes
++		 straight into OP0; no copy back is needed (and emitting
++		 one would clobber the just-inserted element).  */
++	      rtx_insn *last = get_last_insn ();
++	      if (maybe_expand_insn (icode, 3, ops))
++		return true;
++	      delete_insns_since (last);
++	    }
++	}
++    }
++
+   /* If the target is a register, overwriting the entire object, or storing
+      a full-word or multi-word field can be done with just a SUBREG.  */
+   if (!MEM_P (op0)
+@@ -1821,7 +1867,9 @@
    /* Make sure we are playing with integral modes.  Pun with subregs
       if we aren't.  */
    opt_scalar_int_mode op0_mode = int_mode_for_mode (GET_MODE (op0));
@@ -5366,3 +5551,66 @@ new file mode 100644
 +/* Each function must need exactly one insertps.  Before the fusion rule
 +   these emitted one insertps per zeroed lane.  */
 +/* { dg-final { scan-assembler-times "insertps" 3 } } */
+diff --git a/gcc/testsuite/gcc.target/i386/ms178-vecset-retype-1.c b/gcc/testsuite/gcc.target/i386/ms178-vecset-retype-1.c
+new file mode 100644
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/i386/ms178-vecset-retype-1.c
+@@ -0,0 +1,28 @@
++/* Storing through a pointer whose element type differs from the vector's
++   element type must still use vec_set instead of spilling the whole
++   vector to the stack.  __m256i/__m512i are vectors of long long, so the
++   common intrinsic idiom ((int *) &v)[i] = x has SImode fields in a
++   V4DI/V8DI vector.  */
++/* { dg-do compile } */
++/* { dg-options "-O2 -mavx2" } */
++
++#include <immintrin.h>
++
++__m256i
++zero_lane1 (__m256i v)
++{
++  ((int *) &v)[1] = 0;
++  return v;
++}
++
++__m256i
++set_lane2 (__m256i v, int x)
++{
++  ((int *) &v)[2] = x;
++  return v;
++}
++
++/* Neither function may build a stack frame; before this fix both spilled
++   the vector to an aligned stack slot and read it back.  */
++/* { dg-final { scan-assembler-not "andq\t\\\$-32, %rsp" } } */
++/* { dg-final { scan-assembler-not "vmovdqa\t%ymm\[0-9\]+, -\[0-9\]+\\(%rsp\\)" } } */
+diff --git a/gcc/testsuite/gcc.target/i386/ms178-vecset-zero-2di-1.c b/gcc/testsuite/gcc.target/i386/ms178-vecset-zero-2di-1.c
+new file mode 100644
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/i386/ms178-vecset-zero-2di-1.c
+@@ -0,0 +1,25 @@
++/* Zeroing one 64-bit lane of a V2DI/V2DF covers exactly two 32-bit lanes,
++   so it can be done with a single insertps rather than materialising a
++   zero in a GPR and using vpinsrq.  */
++/* { dg-do compile } */
++/* { dg-options "-O2 -msse4.1" } */
++
++typedef long long v2di __attribute__ ((vector_size (16)));
++typedef double v2df __attribute__ ((vector_size (16)));
++
++v2di
++zq0 (v2di v)
++{
++  v[0] = 0;
++  return v;
++}
++
++v2df
++zd0 (v2df v)
++{
++  v[0] = 0.0;
++  return v;
++}
++
++/* { dg-final { scan-assembler-not "pinsrq" } } */
++/* { dg-final { scan-assembler-times "insertps" 2 } } */
