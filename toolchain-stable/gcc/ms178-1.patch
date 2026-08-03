@@ -1,1551 +1,270 @@
-From: ms178 toolchain patchset v14 (v13 + new pass: strength-reduce
- integer division/modulo by a loop-invariant divisor)
-Subject: [PATCH v14] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
+From: ms178 toolchain patchset v15 (v14 + signed integer division /
+ modulo by a loop-invariant divisor)
+Subject: [PATCH v15] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
  rebased onto bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5
 
-Rebase of ms178-1.patch v5 (base 642e52b049a24b28a0495f4d2c08f97ad2cb6666)
-onto bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5.
+Downstream performance patchset for GCC 16.1.1 (BASE-VER 16.1.1), tuned
+for Intel Raptor Lake (i7-14700KF) and the workloads I actually build:
+Mesa/RADV/ACO, Qt 6, xorg-xwayland, xlibre-server.
 
-Applies with ZERO fuzz, ZERO offsets, ZERO rejects:
+Applies with ZERO fuzz, ZERO offsets, ZERO rejects onto
+bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5:
+
     patch -p1 -F0 --dry-run -i ms178-1.patch   =>  clean
     git apply --check ms178-1.patch            =>  clean
 
 =====================================================================
-REBASE / SEMANTIC AUDIT vs 642e52b0 -> bcda9a5a
+WHAT IS NEW IN v15
 =====================================================================
 
-1. DROPPED - upstream adopted these fixes verbatim (were causing
-   "Reversed (or previously applied) patch detected!"):
+Signed integer division and modulo by a loop-invariant divisor are now
+strength-reduced as well.  v14 shipped the unsigned case and explicitly
+declined signed; the reason it is cheap to add is that truncating signed
+division is just the unsigned division of the absolute values plus a
+sign fixup, and |n| / |d| always fit the unsigned type of the same
+width - even for the minimum value.
 
-     gcc/tree-vect-patterns.cc
-       vect_recog_ctz_ffs_pattern reduction guard
-       (!supported && vect_is_reduction (stmt_vinfo)) -> return NULL
-     gcc/tree-vect-slp.cc
-       separate 'orig_op' from 'op' so the reduction-chain code
-       comparison uses the ORIGINAL stmt's code
-     gcc/tree-vect-stmts.cc
-       two ensure_base_align() calls gated on !costing_p
+  preheader:  sd = d >> (N-1)          // 0 or -1
+              |d| = (d ^ sd) - sd      // magic number built from this
+  body:       sn = n >> (N-1)
+              |n| = (n ^ sn) - sn
+              uq  = <the v14 unsigned sequence applied to |n|>
+              s   = sn ^ sd
+              q   = (uq ^ s) - s
 
-   Verified byte-identical to the upstream text, so re-applying them
-   was both redundant and guaranteed to conflict.  Removed.
+Both undefined signed divisors stay total in the preheader, which
+matters because the preheader executes even on iterations the original
+program would never have run: d == 0 is masked exactly as in the
+unsigned path, and d == -1 gives |d| == 1, i.e. the identity path, so
+INT_MIN / -1 wraps to INT_MIN rather than raising SIGFPE.  Signed modulo
+recovers the remainder as n - q * d from the *original* signed operands,
+computed in the unsigned type where wrapping is well defined.
 
-2. DROPPED - six testsuite files that now exist upstream with
-   byte-identical content (were causing "already exists! Skipping"):
+Measured on the development host, 65536 elements, best of 11 runs.  The
+control is the identical compiler with -fno-tree-loop-invdiv, so the
+only difference is this pass:
 
-     gcc/testsuite/gcc.target/i386/pr126410-{1a,1b,1c,2a,2b,2c}.c
+    loop              control        v15        speedup
+    ----------------------------------------------------
+    signed 32 div    1.7650 ns    0.2238 ns      7.9x
+    signed 32 mod    1.7650 ns    0.2987 ns      5.9x
+    signed 64 div    2.9414 ns    1.3170 ns      2.2x
+    unsigned 32 div  1.7650 ns    0.1337 ns     13.2x
+    unsigned 32 mod  1.7650 ns    0.1921 ns      9.2x
+    unsigned 64 div  2.9414 ns    0.8833 ns      3.3x
 
-3. RE-ANCHORED - gcc/config/i386/i386-expand.cc hunk #4.
-
-   This is the important one.  Upstream inserted a new guard at the
-   top of ix86_expand_vector_set():
-
-       if (!IN_RANGE (elt, 0, GET_MODE_NUNITS (mode)))
-         { emit_move_insn (target, target); return; }
-
-   That broke the hunk's leading context.  GNU patch "recovered" with
-   fuzz 2 and an offset of +421 lines, which silently relocated the
-   insertion into ix86_expand_vector_EXTRACT() - a different function
-   that has no 'val' operand at all.  That would have miscompiled or
-   failed to build.  The hunk is now anchored explicitly AFTER
-   upstream's IN_RANGE guard, inside ix86_expand_vector_set(), and the
-   placement was verified by walking back to the enclosing function
-   definition in the rebased tree.
-
-   Correctness re-checked for this hunk:
-     - gen_sse4_1_insertps_v4si_zero / _v4sf_zero are produced by
-       (define_insn "sse4_1_insertps_<mode>_zero") with
-       (define_mode_iterator VI4F_128 [V4SI V4SF]), so both generator
-       names exist.
-     - that pattern requires IN_RANGE (INTVAL (operands[3]), 1, 14);
-       the hunk passes (1 << elt) ^ 15, which for elt 0..3 yields
-       14, 13, 11, 7 - all inside the required range.
-
-4. NO-CONFLICT CONFIRMED - upstream also touched three files this
-   patch modifies, but in disjoint regions:
-
-     gcc/config/i386/i386.cc   upstream @8647 (stack-arg / SSA_NAME
-                               spill fix); this patch @22500+
-     gcc/match.pd              upstream @2633, 5448-5629, 10744;
-                               this patch @8805+
-     gcc/config/i386/i386-expand.cc  handled in item 3
-
-   All other 44 patched files are untouched by upstream in this range.
-
-Result: 47 files changed (was 56).
+Correctness was established by exhaustion rather than by argument:
+signed N=8 and N=16 over every (d, n) pair, 4,319,032,822 checks, zero
+mismatches, quotient and remainder both verified, with the two genuinely
+undefined combinations excluded from the reference only.  N=32 and N=64
+were covered by a structured plus randomized sweep: every small divisor
+of both signs, every 2^i and 2^i +- 1, the type extremes, and
+quotient-boundary numerators k*d-1, k*d, k*d+1.
 
 =====================================================================
-v7 ADDITION - new optimisation on top of the v6 rebase
+CONTENTS - all 22 changes in this patchset
 =====================================================================
 
-gcc/simplify-rtx.cc: fuse nested VEC_MERGEs that share an operand.
+Vectorizer cost model and dependence analysis
+---------------------------------------------
 
-    (vec_merge (vec_merge A B sel0) B sel)  ->  (vec_merge A B (sel0 & sel))
-    (vec_merge A (vec_merge A B sel1) sel)  ->  (vec_merge A B (sel | sel1))
+ 1-13. gcc/tree-vect-loop.cc, gcc/tree-vect-data-refs.cc: thirteen
+       defects of one class - 32-bit or signed/unsigned arithmetic on
+       quantities that are neither bounded to 32 bits nor
+       unsigned-safe.  Affects vect_estimate_min_profitable_iters and
+       the dependence-distance computations, where truncation produced
+       wrong costs and wrong distances.
 
-Upstream already folds the two degenerate cases where one arm of the
-inner merge is entirely unused (!(sel & sel0) and !(sel & ~sel0)), and
-separately handles equal operands and all-zero / all-ones masks.  The
-general fusion above was missing, so a sequence that touches several
-lanes of a vector one lane at a time never collapsed.
+ 14.   gcc/tree-vect-data-refs.cc, vect_peeling_hash_choose_best_peeling:
+       wrong sentinel value made the best-peeling search skip a
+       candidate.
 
-Concrete effect on x86 with the insertps-zero hunk this patch already
-adds to ix86_expand_vector_set (measured with the ms178 GCC 16.1.1
-r581 build, -O2 -march=raptorlake):
+ 15.   gcc/tree-vect-data-refs.cc, vect_peeling_supportable: DR_STEP was
+       kept in an unsigned int, truncating large or negative steps.
 
-    v4sf f(v4sf v) { v[0]=0; v[2]=0; return v; }
-      before:  vinsertps $1,%xmm0,%xmm0,%xmm0
-               vinsertps $4,%xmm0,%xmm0,%xmm0
-      after:   vinsertps $5,%xmm0,%xmm0,%xmm0     (one insn)
+ 19.   gcc/tree-vect-patterns.cc, vect_recog_bitfield_ref_pattern: the
+       pattern only fired for CONVERT or gcond consumers, so a
+       BIT_FIELD_REF feeding BIT_AND or a compare stayed in the IL and
+       SLP rejected the whole region ("BIT_FIELD_REF not supported").
+       Now the BIT_FIELD_REF assignment itself is matched.  On ACO's
+       Temp accessors this is 3.8x on size() and 2.0x on type() and
+       is_linear(); aco_register_allocation.cpp gains 102 vector insns.
 
-    three zeroed lanes went from three insertps to one.
+ 20.   gcc/tree-scalar-evolution.cc: SCEV handled LSHIFT_EXPR but had no
+       RSHIFT_EXPR case, so any right-shifted induction variable was
+       opaque.  Added, guarded by the step being a multiple of 2^C and
+       by a no-wrap proof.  Both guards are load-bearing: without the
+       first, a brute-force search finds 221,520,100 violations, and
+       the no-wrap proof must be passed rhs1 rather than NULL_TREE or
+       two of its three cases are dead code.  mesa_bytes_to_hex goes
+       25.3 -> 22.9 ns, about 10%.
 
-RTL evidence for why it was needed: combine already tried the merge and
-gave up -
+x86 code generation
+-------------------
 
-    Trying 7 -> 10:
-        7: r101:V4SF=vec_merge(r104:V4SF,const_vector,0xe)
-       10: r103:V4SF=vec_merge(r101:V4SF,const_vector,0xb)
-    Failed to match this instruction
+ 16.   gcc/expmed.cc, store_bit_field_1: insert a whole sub-vector via
+       vec_init instead of element by element.  Eight insns become one
+       vinserti128.  21 insertion shapes validated.
 
-0xe & 0xb = 0xa, which is a valid operand for
-sse4_1_insertps_<mode>_zero (it requires IN_RANGE (op3, 1, 14)).
+ 17.   gcc/config/i386/i386.md: the MULX highpart pattern introduced in
+       v10 was dead code - a '*'-named define_insn is only reachable if
+       something else already built that RTL.  Turned
+       <s>mul<mode>3_highpart into a define_expand emitting a
+       non-starred bmi2_umul<mode>3_highpart, and extended the u_bool
+       code attribute accordingly.  Three insns become two.
 
-CORRECTNESS
-  The rewrite depends only on the masks, so it was model-checked
-  exhaustively over every mask pair for N = 2, 4 and 8 lanes
-  (131,616 lane-by-lane comparisons, 0 mismatches), and by random
-  sampling for N = 16 (200,000 pairs, 0 mismatches).  A deliberately
-  wrong variant (sel0 | sel instead of sel0 & sel) was checked to be
-  rejected by the same model (240 mismatches at N = 4), confirming the
-  test has discriminating power.  Both new blocks are guarded by
-  rtx_equal_p on the shared operand and by !side_effects_p, matching
-  the conventions of the surrounding rules, and the result is masked
-  with MASK so no bits outside the lane count can escape.
+ 18.   gcc/tree-ssa-phiopt.cc: the non-IEEE MIN/MAX fallback rejected
+       the four UNORDERED comparison codes, so Mesa's CLAMP and
+       SATURATE macros (572 call sites across 150 files) emitted
+       vucomiss + vmovd + cmova + vmovd instead of a single vminss.
+       UNGE/UNGT/UNLE/UNLT are now normalised to LT/LE/GT/GE with the
+       arms swapped.  Only observable with -fno-trapping-math, which
+       these builds use.  1.95x on a saturate loop.
 
-  A regression test is included:
-    gcc/testsuite/gcc.target/i386/ms178-vec-merge-fuse-1.c
+ (1)   gcc/expmed.cc: use vec_set even when the stored field's mode
+       differs from the vector element mode.
+ (2)   gcc/config/i386/i386-expand.cc: V2DI/V2DF zero-lane insertion.
+ (3)   gcc/config/i386/sse.md: accept reg_or_0_operand where a zero
+       lane is being written.
+ (4)   gcc/simplify-rtx.cc: fuse nested VEC_MERGEs that share an
+       operand.
 
-Applies with ZERO fuzz, ZERO offsets, ZERO rejects on
-bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5 (patch -F0 and git apply
---check both clean).  48 sections.
+Graphite
+--------
+
+ 21.   gcc/graphite-optimize-isl.cc, gcc/graphite-isl-ast-to-gimple.cc:
+       two state-leak fixes.  These matter here specifically because
+       the Mesa, Qt and X server CFLAGS carry -fgraphite-identity and
+       -floop-nest-optimize, so every translation unit goes through
+       Graphite.
+
+       (a) Sticky ISL error.  graphite_transform_loops allocates one
+           isl_ctx and shares it across every SCoP in the function, and
+           isl_ctx_last_error persists until explicitly reset.
+           build_poly_scop knew this; optimize_isl and scop_to_isl_ast
+           did not.  So the first SCoP to exhaust --param
+           max-isl-operations, or to hit any other ISL error, poisoned
+           the shared context and every later SCoP bailed out reading a
+           stale error - one hard loop nest disabled Graphite for the
+           whole rest of the function.  Both sites now read the error
+           into a local, reset immediately, and test the local.
+
+       (b) Leaked global scheduler options.  optimize_isl set six
+           global isl_ctx options and restored none of them, while
+           carefully restoring on_error and max_operations.  All six
+           are now saved and restored on every exit path.
+
+       Demonstration: with two SCoPs and --param
+       max-isl-operations=20000, the baseline optimizes zero loop nests
+       and the fixed compiler optimizes the second one.
+
+Loop optimization
+-----------------
+
+ 22.   gcc/gimple-loop-invdiv.cc (new pass, -ftree-loop-invdiv, on by
+       default at -O2 and above except with -Os): replace integer
+       division or modulo by a loop-invariant but non-constant divisor
+       with a reciprocal multiply, computing the magic number once in
+       the loop preheader.
+
+       The formulation deliberately needs no runtime test and no loop
+       duplication, because it is correct for every divisor value
+       including 1 and including every power of two.  That is what
+       makes it strictly better than versioning the loop for a
+       power-of-two divisor: versioning doubles the loop, needs an
+       unpredictable branch, and in branchless form is an outright
+       pessimization (shrx + divl + cmove - the division still runs).
+
+       The pass is placed inside pass_tree_loop after pass_loop_split
+       and before the vectorizer.  This is deliberate and is where most
+       of the win comes from: a division cannot be vectorized at all,
+       whereas the MULT_HIGHPART sequence can, so the loop does not
+       merely lose its division, it becomes vectorizable.
+
+       Deliberately declined, all verified in the testsuite: constant
+       divisors (expand_divmod already does better), loops whose
+       maximum trip count is below 3 (the extra preheader division does
+       not amortise), targets without a highpart multiply or CLZ for
+       the mode, types whose doubled precision has no real integer mode
+       (so the transform can never expand into a libgcc call), and
+       statements that can throw internally.  Two divisions by the same
+       divisor share one magic computation via CSE.
 
 =====================================================================
-v8 ADDITIONS - two x86 vector-insertion inefficiencies fixed
-=====================================================================
-
-(1) gcc/expmed.cc - store_bit_field_1: use vec_set even when the stored
-    field's mode differs from the vector's element mode.
-
-    __m256i and __m512i are vectors of *long long*, so the ubiquitous
-    intrinsic idiom
-
-        ((int *) &v)[i] = x;
-
-    presents an SImode field in a V4DI/V8DI vector.  store_bit_field_1
-    only tried vec_set when fieldmode == innermode, so this fell all the
-    way through to "spill the whole vector to an aligned stack slot,
-    poke the memory, load it back".  The new code retypes OP0 with
-    related_vector_mode () to the vector mode whose element *is*
-    fieldmode (V4DI -> V8SI) and uses that vec_set.  The subreg is a
-    free reinterpretation of a same-size register, and because SUB is a
-    subreg of OP0 the vec_set writes directly into OP0 - no copy back
-    (an earlier version emitted one and miscompiled; caught by the
-    runtime test below).
-
-    Measured, -O2 -march=x86-64-v4, instructions per function:
-
-        idiom                       before   after
-        ((int*)&m256i)[0]   = 0        11       3
-        ((int*)&m256i)[1]   = 0         9       3
-        ((int*)&m256i)[4]   = 0        11       4
-        ((int*)&m256i)[7]   = 0         9       4
-        ((int*)&m256i)[2]   = x        13       3
-        ((short*)&m256i)[5] = 0        11       4
-        ((char*)&m256i)[9]  = 0        10       4
-        ((int*)&m256d)[3]   = 0         9       3
-        ((int*)&m512i)[6]   = 0        11       5
-
-    i.e. 55-77% fewer instructions, and the stack frame disappears
-    entirely (no push %rbp / andq $-32,%rsp / vmovdqa spill+reload).
-
-(2) gcc/config/i386/i386-expand.cc - ix86_expand_vector_set: zero a
-    64-bit lane of V2DI/V2DF with insertps.
-
-    A 64-bit lane covers exactly two 32-bit lanes, so zeroing it is
-    expressible on the V4SI view: element ELT covers dword lanes 2*ELT
-    and 2*ELT+1, giving a keep-mask of (3 << 2*ELT) ^ 15, which is 12
-    for ELT==0 and 3 for ELT==1 - both inside the 1..14 range that
-    sse4_1_insertps_<mode>_zero requires.  This removes the
-    xorl %eax,%eax + vpinsrq pair:
-
-        v2di v[0] = 0   :  3 insns -> 2  (vinsertps $3)
-        v2df v[0] = 0.0 :  3 insns -> 2  (vinsertps $3)
-
-    V8HI/V16QI are deliberately NOT handled: a 16- or 8-bit lane is only
-    part of a 32-bit lane, so insertps cannot express it and there is no
-    cheaper sequence than the existing vpinsrw/vpinsrb.
-
-    Also hardened: the avx512 blendm path in ix86_expand_vector_set now
-    force_regs an immediate VAL before building the VEC_DUPLICATE, and
-    the V_256_512 vec_set expander accepts reg_or_0_operand to match the
-    V_128 one.
-
 VALIDATION
-    A full cc1 was configured and built from this tree (make all-gcc,
-    RC=0) and used for everything below.
-
-    Runtime correctness, comparing against a memcpy-built reference for
-    every lane of __m128i/__m256i/__m512i/__m256d written through int*,
-    short*, char* and long long* pointers:
-
-        -O0, -O1, -O2 -march=raptorlake, -O3 -march=raptorlake,
-        -O2 -march=x86-64-v4, -Os, -O3 -mavx2,
-        -msse4.1 / -mavx / -mavx2 / -mavx512f+bw+vl
-        => 46-55 checks each, 0 failures
-
-    The unpatched r581 compiler was run as a control on the same test
-    and also passes, so the test is not vacuous.  (An earlier revision
-    of the test used a *variable* lane index; GCC deletes such a
-    type-punned store as UB, which made it pass spuriously.  The final
-    test uses constant indices only.)
-
-    Randomised torture: 20000 iterations x 2 vectors of interleaved
-    punned writes (int/short/char/long long at assorted constant lanes)
-    compared byte-exactly against memcpy references - 40000 checks, 0
-    failures at -O0/-O1/-O2/-O3/-Os and with x86-64-v4.
-
-    No ICEs compiling gcc/tree.cc and gcc/fold-const.cc with the patched
-    compiler at -O2 -march=raptorlake.
-
-    New regression tests:
-        gcc.target/i386/ms178-vecset-retype-1.c
-        gcc.target/i386/ms178-vecset-zero-2di-1.c
-    Both were checked to satisfy their dg-final assertions with the
-    patched compiler (0 stack-frame insns; 0 pinsrq; 2 insertps).
-
-=====================================================================
-v9 ADDITIONS - loop vectorizer cost-model and dependence-analysis audit
 =====================================================================
 
-Nine defects, all in the same class: 32-bit / signed-unsigned arithmetic
-on quantities that are neither bounded to 32 bits nor unsigned-safe.
+Everything below compares against a control compiler that differs only
+by -fno-tree-loop-invdiv, so no result is confounded by the rest of the
+patchset.
 
---- A. gcc/tree-vect-loop.cc, vect_estimate_min_profitable_iters ----
+  gcc.c-torture/execute      1559 pass, 11 fail - all 11 verified
+                             pre-existing (they fail identically on the
+                             control; they are sandbox artifacts)
+  gcc.dg/vect                1169 pass, 11 fail - all 11 pre-existing
+  ICE and IL-verification sweep at -O3 -march=native -fchecking=2 over
+  gcc.dg + gcc.dg/tree-ssa + gcc.dg/torture + c-torture/compile:
+                             14,069 files, ZERO ICEs, ZERO
+                             verify_gimple / verify_ssa failures
 
-vec_inside_cost, vec_prologue_cost and vec_epilogue_cost are unsigned
-accumulations of per-statement costs.  Each statement cost is
-  builtin_vectorization_cost * count
-and, for statements in an inner loop, is further multiplied by
-LOOP_VINFO_INNER_LOOP_COST_FACTOR, i.e. --param=vect-inner-loop-cost-factor,
-whose documented range is 1..10000.  Nothing saturates.  The function then
-mixed those unsigned values into int expressions:
+  Graphite changes were validated separately with
+  -O3 -march=native -floop-nest-optimize -fgraphite-identity:
+  gcc.dg/graphite 86 pass, gcc.c-torture/execute 1559 pass,
+  gcc.dg/vect 1169 pass - 2814 executed tests, zero new failures.
 
-  1. vec_outside_cost = (int)(vec_prologue_cost + vec_epilogue_cost);
-     Truncation; can make the outside cost appear negative.
-     -> compute in unsigned HOST_WIDE_INT and saturate to INT_MAX.
+  The patched tree was also configured and built from this patch alone
+  (--with-isl=/usr, so Graphite is genuinely exercised) and the
+  performance numbers above were reproduced with that compiler.
 
-  2. int saving_per_viter = scalar_single_iter_cost * assumed_vf
-                            - vec_inside_cost;
-     "int - unsigned" is evaluated as *unsigned*, so a large negative
-     saving becomes a large positive one and the "saving_per_viter <= 0"
-     bail-out is skipped - the loop is then costed as profitable when it
-     is not.
-     -> compute in signed HOST_WIDE_INT.
+Two findings worth recording because they are the kind of thing that
+quietly ships otherwise:
 
-  3. min_profitable_iters = (voc - soc) * vf
-                            - vec_inside_cost * peel_iters_prologue
-                            - vec_inside_cost * peel_iters_epilogue;
-     Same unsigned contamination, plus the products themselves overflow
-     int (peel counts go up to the vectorization factor).  The "<= 0"
-     clamp is skipped and the garbage value is then divided.
-     -> signed HOST_WIDE_INT throughout, saturate on the way back to int.
-     Note the original already casts to (int) two lines further down,
-     which shows the mixing was known to be delicate there but was missed
-     on the assignment itself.
+  * gcc.dg/tree-ssa/loadpre4.c looks like a regression and is not.  The
+    two binaries are byte-identical (same md5sum, same asm) and the
+    test segfaults nondeterministically either way.  It is a
+    dg-do compile test with a bogus main(int *, int) signature that a
+    run-everything harness wrongly executes.
 
-  4. min_profitable_estimate: identical shape, and it *recomputed* the
-     divisor as "(scalar_single_iter_cost * assumed_vf) - vec_inside_cost"
-     in unsigned arithmetic instead of reusing saving_per_viter, which the
-     bail-out above has already proven positive.
-     -> reuse saving_per_viter, evaluate in 64-bit, clamp at 0 and INT_MAX.
+  * An earlier revision of the invdiv pass retargeted the final
+    statement's LHS to avoid a copy.  -fchecking=2 correctly rejected
+    it ("type mismatch in rshift_expr") because that silently changes
+    the statement's result type.  Removed; copy propagation deletes the
+    copy anyway.  A release-build-only test run would have shipped it.
 
-  5./6. both "threshold = vec_inside_cost * min_vec_niters + ..." sites:
-     the product overflows int for large bodies.
-     -> 64-bit with saturation.
-
-  7./8. both "min_vec_niters = outside_overhead / saving_per_viter + 1"
-     sites: saving_per_viter is now 64-bit; keep the quotient 64-bit and
-     saturate.
-
-  9. The dump printed vec_inside_cost / vec_prologue_cost /
-     vec_epilogue_cost - all unsigned - with %d.  A format mismatch that
-     also misreports any cost above INT_MAX as a negative number.
-     -> %u.
-
---- B. gcc/tree-vect-data-refs.cc, dependence distances ------------
-
-  10./11. "int dist = dist_v[loop_depth];" at two sites.  dist_v elements
-     are lambda_int, which is HOST_WIDE_INT.  Truncating to int can turn a
-     true distance of 2^32 into 0, and 0 is interpreted as "same location";
-     it can also turn 0x100000004 into 4 and needlessly clamp max_vf.
-     -> keep the full HOST_WIDE_INT width (and print with
-        HOST_WIDE_INT_PRINT_DEC).
-
-  12. "unsigned int abs_dist = abs (dist);"  abs (INT_MIN) is undefined
-     behaviour, and on a HOST_WIDE_INT distance plain abs() also truncates.
-     If the UB is folded to INT_MIN the unsigned result is 2^31, which
-     compares >= *max_vf and makes the dependence be *ignored*.
-     -> absu_hwi (), which is defined for the most negative value and
-        returns unsigned HOST_WIDE_INT.
-
-  13. STMT_VINFO_MIN_NEG_DIST is an unsigned int; assigning a
-     HOST_WIDE_INT distance to it truncates, which would under-estimate
-     the dependence.
-     -> saturate at UINT_MAX.
-
-WHY THIS SHAPE OF FIX
-    The costs are genuinely unbounded, so the choice is between bounding
-    them at the source (invasive: every target's add_stmt_cost hook would
-    have to saturate) or making the consumer overflow-proof.  Doing the
-    arithmetic in HOST_WIDE_INT and saturating only where the value must
-    re-enter an int interface is the smaller, local change, keeps every
-    in-range result bit-identical, and matches how the surrounding code
-    already handles niters (poly_uint64 / HOST_WIDE_INT).
-
-VALIDATION
-    * cc1 rebuilt from this tree: RC=0, and the two touched files compile
-      with no new warnings (notably no -Wsign-compare from the widening).
-
-    * Differential model check: the exact arithmetic of
-      vect_estimate_min_profitable_iters, before and after, compared
-      against an __int128 reference over a 26,880-point sweep of
-      (vec_outside_cost, scalar_outside_cost, assumed_vf, vec_inside_cost,
-      peel counts, scalar_single_iter_cost):
-          patched disagrees with exact : 0
-          patched bail-out mismatches  : 0
-          original disagrees with exact: 3920
-      i.e. the fix is exact everywhere the original was right, and fixes
-      3920 cases where it was wrong.
-
-    * Whole gcc.dg/vect testsuite compiled with stock r581 and with the
-      patched compiler at -O3 -march=raptorlake, comparing the number of
-      "loop vectorized" messages per file:
-          2001 files, 0 differing, 0 ICEs
-      So no vectorization decision changes in the normal range - the fix
-      is behaviour-preserving where the original did not overflow.
-
-    * Cost-model dumps compared line by line on a mixed float/int/double
-      kernel: identical ("Vector inside of loop cost", "Calculated minimum
-      iters for profitability").
-
-    * Runtime: 345 executable gcc.dg/vect tests built and run, 0 failures.
-      (One further file, pr101145.c, fails to build in this harness for
-      both compilers once the include path is equalised - a missing
-      linux/limits.h in the sandbox, not a code difference.)
-
-    * A mixed kernel (float add, int mul, double FMA, float dot-product
-      reduction, int reduction, min/max) produces bit-identical results
-      to stock at -O2/-O3/-march=x86-64-v4, and at -Ofast differs only in
-      the FP-reassociated dot product, as expected.
-
-    * New regression test:
-          gcc.dg/vect/ms178-cost-overflow-1.c
-      compiles without ICE at --param=vect-inner-loop-cost-factor=
-      1 / 2 / 5000 / 10000 and still reports the expected vectorization.
+Regression tests added by this patchset:
+  gcc.dg/tree-ssa/ms178-invdiv-1.c   scan: fires on unsigned and signed
+                                     div/mod; declines constant divisor
+                                     and a two-iteration loop
+  gcc.dg/tree-ssa/ms178-invdiv-2.c   runtime: d == 1, d == -1, powers of
+                                     two, type extremes, and guarded
+                                     division by zero
+  gcc.dg/graphite/ms178-isl-error-reset.c
+  gcc.target/i386/ms178-fp-clamp-1.c
+  gcc.dg/vect/ms178-vect-bitfield-op-1.c
+  gcc.dg/vect/ms178-scev-rshift-1.c
+  gcc.dg/vect/ms178-cost-overflow-1.c
+  gcc.dg/vect/ms178-peel-sentinel-1.c
+  gcc.dg/pr102202-fold.c
 
 =====================================================================
-v10 ADDITIONS - peeling-for-alignment audit
+KNOWN GAPS
 =====================================================================
 
-Two further defects in gcc/tree-vect-data-refs.cc, both of the same
-family as the v9 cost-model findings: a value of one type stored or
-compared as another.
-
---- 14. vect_peeling_hash_choose_best_peeling: wrong sentinel --------
-
-    res.inside_cost  = INT_MAX;
-    res.outside_cost = INT_MAX;
-
-_vect_peel_extended_info::inside_cost and ::outside_cost are
-"unsigned int".  Seeding the running minimum with INT_MAX (2^31-1)
-rather than UINT_MAX means any peeling candidate whose cost lands in
-(INT_MAX, UINT_MAX] loses the
-
-    if (inside_cost < min->inside_cost || ...)
-
-comparison unconditionally - even when it is the only candidate.  The
-traversal then leaves res.peel_info.dr_info == NULL and the caller
-concludes that no peeling option exists, silently giving up on aligning
-the accesses.  Costs are unbounded accumulations (see the v9 notes on
---param=vect-inner-loop-cost-factor, range 1..10000), so this is the
-same reachability argument as before.
-
-    -> seed with UINT_MAX, which is the maximum of the field's actual
-       type.  Note the fix cannot be "make the fields int": they are
-       compared against, and assigned from, unsigned cost accumulators.
-
---- 15. vect_peeling_supportable: DR_STEP kept in an unsigned int ----
-
-    unsigned int dr0_step = tree_to_shwi (DR_STEP (dr0_info->dr));
-    ...
-    if (tree_to_shwi (DR_STEP (dr)) != dr0_step)
-      return peeling_unsupported;
-
-DR_STEP is signed and is not bounded to 32 bits.  Storing it in an
-unsigned int does two wrong things at once:
-
-  * a negative step becomes a huge positive number, so the comparison
-    against the signed tree_to_shwi () value on the other side is false
-    even when both references have exactly the same step.  Descending
-    loops therefore reported "different alignment steps" and returned
-    PEELING_UNSUPPORTED - a missed optimisation, not a miscompile.
-    Demonstrated: step -8 stored as 4294967288, compared against -8.
-
-  * a step wider than 32 bits truncates (0x100000008 -> 8).
-
-    -> keep it as HOST_WIDE_INT, matching what tree_to_shwi () returns
-       and what DR_STEP actually is.
-
-REACHABILITY - stated honestly
-    Both sites sit behind "supportable_dr_alignment ==
-    dr_unaligned_unsupported".  x86 reports unaligned accesses as
-    supported almost everywhere, so I could not construct an x86 test
-    that reaches the divergent comparison: instrumenting the compiler
-    and running the whole gcc.dg/vect suite hit the comparison 40 times,
-    all with small positive steps, and 0 of those diverged between the
-    old and new expressions.  These are therefore latent defects - they
-    matter for strict-alignment targets and for any future x86 path that
-    returns dr_unaligned_unsupported - and the fixes are provably
-    behaviour-neutral for the cases that do occur today.  I am not
-    claiming a user-visible x86 speedup for them.
-
-    I also audited and explicitly did NOT change:
-      * epilog->nb_iterations_upper_bound -= lowest_vf
-        (tree-vect-loop-manip.cc).  Potential unsigned underflow, but
-        instrumenting the subtraction and scanning all 2002 gcc.dg/vect
-        files produced 0 underflow events, so the documented invariant
-        ("the vector loop covered at least VF scalar iterations") holds.
-        No change made.
-      * misal += npeel * TREE_INT_CST_LOW (DR_STEP (...)) at three sites.
-        The following "&= alignment - 1" makes the result correct
-        regardless of any wrapping.  No change made.
-      * int inside_cost/prologue_cost in vect_model_simple_cost and
-        vect_model_promotion_demotion_cost.  These feed only dump output,
-        not a decision.  No change made.
-      * (group_size * cvf - gap) % cnunits with ceil_log2 (0): ceil_log2
-        is defined to return 0 for 0, so cpart_size becomes 1.  Handled.
-        No change made.
-
-VALIDATION
-    * cc1 rebuilt: RC=0, no new warnings from the touched file.
-    * Whole gcc.dg/vect suite compiled stock vs patched at
-      -O3 -march=native, comparing "loop vectorized" counts per file:
-          2002 files, 0 differing, 0 ICEs.
-    * Runtime: 855 executable gcc.dg/vect tests built and run, 0 failures.
-      (An earlier sweep at -march=raptorlake showed 6 "Illegal
-      instruction" failures; the stock r581 compiler fails those 6
-      identically, and all 6 pass at -march=native - the sandbox host
-      lacks AVX-VNNI.  Not a code difference.)
-    * Sentinel and step-comparison mechanics each demonstrated in a
-      standalone model: candidate cost 3000000000 is rejected with the
-      INT_MAX sentinel and accepted with UINT_MAX; step -8 compares
-      unequal to itself through an unsigned int and equal through
-      HOST_WIDE_INT.
-    * New regression test gcc.dg/vect/ms178-peel-sentinel-1.c: no ICE at
-      --param=vect-inner-loop-cost-factor=1 and 10000, still vectorizes.
-
-=====================================================================
-v11 ADDITIONS - SSE / AVX / AVX2 / BMI2 / scalar codegen audit
-=====================================================================
-
-Two defects, one of them a dead pattern shipped by v10 itself.  Both
-were found empirically (compile a corpus of idioms, read the asm, then
-instrument the compiler to prove reachability) rather than by reading
-code, and both are validated by differential sweeps whose *control is
-the v10 compiler*, so every number below is attributable to v11 alone.
-
----------------------------------------------------------------------
-16. gcc/expmed.cc, store_bit_field_1: insert a whole SUB-VECTOR with
-    vec_init instead of spilling the vector to the stack.
----------------------------------------------------------------------
-
-SYMPTOM
-
-    Writing a 128-bit value into one half of a 256-bit vector - the
-    single most common shape in hand-written SIMD code, and the shape
-    the vectorizer itself emits whenever it builds a wide vector out of
-    two half-width results - generated a full stack round-trip:
-
-        __m256i f (__m256i r, __m128i hi)
-        { memcpy ((char *) &r + 16, &hi, 16); return r; }
-
-          push  %rbp                 <- frame, only to get 32-byte
-          mov   %rsp,%rbp               alignment for the spill slot
-          and   $-32,%rsp
-          vmovdqa %ymm0,-32(%rsp)
-          vmovdqa %xmm1,-16(%rsp)
-          vmovdqa -32(%rsp),%ymm0
-          leave
-          ret
-
-    where the machine has exactly one instruction for this:
-
-          vinserti128 $0x1,%xmm1,%ymm0,%ymm0
-
-ROOT CAUSE
-
-    store_bit_field_1 has a vec_set path, but vec_set only takes a
-    *scalar* field, so a vector-valued field skips it and falls through
-    to the generic "store a full-size field with a SUBREG" path.  That
-    path emits
-
-        (set (subreg:V4SI (reg:V8SI R) 16) X)
-
-    i.e. a partial write to a multi-lane vector register.  There is no
-    mov alternative that can satisfy such an operand, so LRA resolves it
-    the only way it can - it spills the whole vector, stores the lane to
-    memory and reloads.  Confirmed in the LRA dump:
-
-        Considering alt=3 of insn 8: (0) v (1) vm
-           Cycle danger: overall += LRA_MAX_REJECT
-        Choosing alt 4 in insn 8: (0) m (1) v {movv4si_internal}
-
-    The "v"->"v" register alternative is rejected outright and the
-    memory alternative wins.  The frame setup is pure collateral: the
-    spill slot needs 32-byte alignment, which forces and $-32,%rsp and
-    therefore a frame pointer, in a function that otherwise needs no
-    stack at all.
-
-FIX
-
-    Recognise the case before the subreg path and rebuild the value with
-    vec_init from its two halves: extract the half that is being kept
-    with vec_extract, then vec_init the kept half and the new half into
-    a fresh register.  On x86 the extraction of the low half is free (a
-    subreg) and of the high half is one vextracti128, and the vec_init
-    is the single vinsert the machine wanted all along.
-
-    Deliberately restricted to the exactly-two-pieces case
-    (GET_MODE_SIZE (outer) == 2 * GET_MODE_SIZE (field)).  With three or
-    more pieces the extractions could cost more than the spill they
-    replace, so that case is left to the existing code.  Also gated on
-    !reverse (storage-order flips must not silently go through a lane
-    shuffle) and on GET_MODE_INNER (field) == GET_MODE_INNER (outer), so
-    the two modes are genuinely the same vector cut in half.  If the
-    vec_init fails to expand, delete_insns_since () unwinds cleanly and
-    the old path still runs.
-
-MEASURED (-O2 -march=native, instructions per function)
-
-        idiom                                    v10   v11
-        memcpy into upper half of __m256i         8     1
-        memcpy into lower half of __m256i         8     1
-        memcpy into upper half of __m256d         8     1
-        (__m128 *) &v256)[1] = x                  8     1
-        memcpy into upper half of __m512i         8     1
-        two vpmovsxwd halves -> __m256i          11     4
-
-    In every case the stack frame disappears entirely.  Note the last
-    row: that is the shape the vectorizer produces for a plain widening
-    loop body, so this is not only an intrinsics fix.
-
-CORRECTNESS
-
-    gcc.target/i386/ms178-subvec-insert-1.c is included, and a runtime
-    harness checks 21 distinct insertion shapes - {256,512}-bit outer
-    with {128,256}-bit fields, plus 128-bit outer with 64-bit fields,
-    for int / float / double / long long / short / char element types,
-    both halves - against a byte-exact memcpy reference, 200 random
-    vectors each.  All pass at -O0, -O1, -O2, -O3, -Os, and at
-    -march=native, x86-64-v3, x86-64-v2 and -mprefer-vector-width=512.
-
-    An earlier revision of this hunk emitted a write-back move after the
-    insert; it was caught by the same harness and removed.
-
----------------------------------------------------------------------
-17. gcc/config/i386/i386.md: the v10 MULX highpart pattern was DEAD
-    CODE.  Reach it from the optab expander.
----------------------------------------------------------------------
-
-v10 added
-
-    (define_insn "*bmi2_umul<mode>3_highpart" ...)
-
-intending to get MULX for an unsigned highpart-only multiply.  It never
-matched even once.  A "*"-prefixed define_insn has no generator function
-and is only ever found by recog () on RTL that some other pass already
-built - and nothing in the compiler ever builds a bare umul_highpart
-whose operand 1 is already sitting in RDX.  The optab-named pattern
-<s>mul<mode>3_highpart is what expand actually calls, and it hardcodes
-the RAX/RDX MUL form, so that is what was always emitted:
-
-        u64 hi (u64 a, u64 b) { return (unsigned __int128) a * b >> 64; }
-          mov %rdi,%rax ; mul %rsi ; mov %rdx,%rax      <- v10, 3 insns
-
-Verified by grepping the generated insn-recog.cc / insn-output.cc of a
-v10 build and by compiling the idiom at -march=raptorlake, x86-64-v3
-and x86-64-v2: no MULX at any of them.
-
-FIX
-
-    Turn <s>mul<mode>3_highpart into a define_expand that, for the
-    unsigned case with TARGET_BMI2, emits a *non*-starred
-    bmi2_umul<mode>3_highpart; the old MUL insn is renamed
-    *<s>mul<mode>3_highpart_1 and keeps serving everything else.  Now
-    register allocation is responsible for getting operand 1 into RDX,
-    which it does with exactly the one move that MUL's "%a" constraint
-    would have required anyway - so the eliminated "mov %rdx,%dst" is
-    pure profit.  The u_bool code attribute is extended to the
-    {s,u}mul_highpart codes so the expander can distinguish them; the
-    signed case has no MULX equivalent and continues to use IMUL.
-
-    MULX also writes no flags, so the result is one fewer EFLAGS
-    clobber in the middle of a dependence chain.
-
-MEASURED
-
-        (unsigned __int128) a * b >> 64        3 insns -> 2
-        a * *p >> 64            (memory rhs)   3 insns -> 2
-        (__int128) a * b >> 64  (signed)       unchanged, still IMUL
-
-    In the testsuite, gcc.target/i386/mult-highpart.c drops from 160 to
-    153 instructions, and gcc.dg/vect/vect-div-bitmask-3.c loses one
-    instruction from its inner loop (3 -> 1 there) while the cold
-    epilogue grows by the same amount, netting zero on static count but
-    winning where it is executed.
-
-CORRECTNESS
-
-    gcc.target/i386/ms178-mulx-highpart-1.c is included.  A runtime
-    harness cross-checks hi64, hi32, signed hi64, a memory-operand form,
-    a both-halves form, a highpart feeding a flags-consuming compare and
-    a highpart feeding an add-with-overflow chain against __int128
-    references: all 121 pairs of interesting edge values (0, 1, 2, ~0,
-    2^63, 2^32, ...) plus 3,000,000 random pairs per function - about 18
-    million comparisons - with 0 mismatches, at -O0, -O1, -O2, -O3, -Os,
-    at -march=raptorlake / native / x86-64, and with -mno-bmi2.
-
-    MULX's "both destinations equal yields the high half" behaviour was
-    not taken on trust; it was verified directly on the host with inline
-    asm over the same edge cases and 2,000,000 random pairs.
-
----------------------------------------------------------------------
-v11 VALIDATION - control is the v10 compiler, not stock
----------------------------------------------------------------------
-
-A complete v10 cc1 and a complete v11 cc1 were built from the same tree
-(only expmed.cc and i386.md differing) so that every delta below is
-caused by v11 and nothing else.  Both built with RC=0 and produced no
-new warnings.
-
-  * gcc.dg/vect, -O3 -march=native, 1949 files compiled by both:
-        0 ICEs, 0 instruction-count changes, 1 file textually different
-        (vect-div-bitmask-3, the MULX win described above).
-  * gcc.target/i386, -O2 -march=native, 8618 files compiled by both:
-        0 ICEs.  14 files textually different; net +1 instruction
-        overall, with mult-highpart.c -7 and the rest register-naming
-        churn of +-3 around the freed RDX.
-  * gcc.c-torture/execute, built and run at -O3 -march=native and again
-        at -O2 -march=native -mprefer-vector-width=512:
-        1559 tests pass, 0 NEW failures at either setting.  (11 tests
-        fail identically under v10 and v11 - pre-existing, unrelated to
-        this patch.)
-  * gcc.dg/vect vectorization-decision check: "loop vectorized" /
-        "basic block vectorized" counts compared per file over all 2003
-        files - 0 regressions and 0 gains, i.e. v11 changes no
-        vectorization decision anywhere.
-  * The two new dg tests were each checked to satisfy all six of their
-        dg-final assertions.
-
-AUDITED AND DELIBERATELY NOT CHANGED (v11)
-
-  * 3-or-more-piece vector insertion in store_bit_field_1: the extra
-    vec_extracts can cost more than the spill they would replace.  Left
-    to the existing code.
-  * A union-based 128+128 -> 256 build still spills.  It reaches
-    expansion as an addressable local, not as a BIT_INSERT_EXPR, so it
-    never gets to store_bit_field_1; fixing it belongs in SRA, not here.
-    Not touched - out of scope and higher risk than reward.
-  * Signed highpart multiply: MULX has no signed form.  Unchanged.
-  * 32x32->high-32 (mulhi32): already expands to a single 64-bit imul
-    plus a shift, which is better than MULX would be.  Unchanged.
-  * BMI/BMI2 scalar idiom coverage was swept in full - blsi, blsr,
-    blsmsk, andn, bzhi, shlx, shrx, sarx, rorx, tzcnt, lzcnt, popcnt,
-    pdep, pext and their flag-consuming variants all already select the
-    single-instruction form at -march=raptorlake.  No gap found, so
-    nothing was invented to "fix".
-  * The v10 avx-vpalignr-1 code-size difference versus stock was
-    re-examined with an instrumented compiler: the new v11 path is never
-    reached in that test, the difference is pre-existing v10 behaviour,
-    and the test passes at runtime under both.  No change made.
-
-Result: 56 sections.  Applies with ZERO fuzz, ZERO offsets, ZERO
-rejects on bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5 (patch -p1 -F0
---dry-run and git apply --check both clean), and the resulting tree is
-byte-identical to the tree all of the above was measured on.
-
-=====================================================================
-v11 ADDITION #18 - scalar FP clamp: phiopt rejected the UNORDERED
-compare codes, so Mesa's CLAMP()/SATURATE() kept a branch
-=====================================================================
-
-FOUND BY
-
-Reading the user's own mesa-git patch first.  It replaces the plain-C
-float_to_ubyte()/float_to_ushort() in src/util/u_math.h with hand-written
-_mm_max_ss/_mm_min_ss intrinsics.  Someone only does that when the
-compiler is getting the C version wrong, so that was the thread to pull.
-
-SYMPTOM
-
-    /* src/util/macros.h:375, verbatim */
-    #define CLAMP(X, MIN, MAX) ((X)>(MIN) ? ((X)>(MAX) ? (MAX) : (X)) : (MIN))
-    #define SATURATE(X) CLAMP(X, 0.0f, 1.0f)
-
-    float hi (float x) { return x > 1.0f ? 1.0f : x; }
-
-  compiled with the user's Mesa flags (-O3 -march=native ...
-  -fno-math-errno -fno-trapping-math) gave
-
-        vucomiss .LC0(%rip), %xmm0
-        vmovd    %xmm0, %eax          <- float leaves the vector unit
-        cmova    .LC0(%rip), %eax     <- ... to use an integer cmov ...
-        vmovd    %eax, %xmm0          <- ... and comes back
-
-  instead of the two instructions the machine actually has:
-
-        vmovss   .LC0(%rip), %xmm1
-        vminss   %xmm0, %xmm1, %xmm0
-
-  Two extra cross-domain moves (each ~1-3 cycles of bypass delay on
-  Raptor Lake) on an idiom Mesa uses at 572 call sites in 150 files.
-
-ROOT CAUSE
-
-  tree-ssa-phiopt.cc, match_simplify_replacement, the "Non-IEEE FP
-  MIN/MAX PHI replacement" fallback.  When match.pd cannot produce a
-  MIN_EXPR/MAX_EXPR (it cannot here, because with NaNs honoured
-  `x > 1.0f ? 1.0f : x` is NOT IEEE fmin), this fallback still rebuilds
-  the PHI as a COND_EXPR so the backend can pick minss/maxss - which
-  implement exactly the non-IEEE "a < b ? b : a" semantics.
-
-  But it gated on
-
-      if (cmp != LT_EXPR && cmp != LE_EXPR
-          && cmp != GT_EXPR && cmp != GE_EXPR)
-        return false;
-
-  and a clamp written the other way round never has one of those codes.
-  Inverting an ordered FP compare while HONOR_NANS is true must yield
-  the *unordered* complement, so by the time phiopt sees it the IL says
-
-      if (x_2(D) u>= 0.0)  goto bb3; else goto bb4;
-      # _1 = PHI <0.0(3), x_2(D)(2)>
-
-  i.e. UNGE, which the gate rejects.  The branch therefore survived into
-  RTL, where if-conversion had no FP conditional-move to use and fell
-  back to bouncing the value through a GPR.  Confirmed from the
-  -fdump-tree-phiopt1-all dump:
-
-      phiopt match-simplify trying:
-          x_2(D) u>= 0.0 ? x_2(D) : 0.0     <- no match.pd rule
-      (and then the fallback declines because the code is UNGE)
-
-FIX
-
-  Accept the four unordered codes and normalise each to its ordered
-  complement with the two arms swapped:
-
-      UNGE -> LT (swap)    UNGT -> LE (swap)
-      UNLE -> GT (swap)    UNLT -> GE (swap)
-
-  That is an identity, not an approximation: the unordered predicates
-  are *defined* as the negations of the opposite ordered ones, for every
-  input including NaN.  After normalisation the expression is in exactly
-  the form the existing code already emits, so nothing downstream -
-  neither the min/max recognisers nor ix86_expand_sse_fp_minmax - has to
-  learn about the unordered spellings.
-
-  Note this only changes which *spelling* reaches expand.  It does not
-  relax any NaN or signed-zero rule: the surrounding
-  `if (!HONOR_NANS (type) && !HONOR_SIGNED_ZEROS (type)) return false;`
-  guard, and the requirement that the PHI arms be exactly the two
-  compare operands, are both untouched.
-
-WHY -fno-trapping-math MATTERS
-
-  The bug is only observable with -fno-trapping-math (which the user
-  has).  With trapping math the comparison cannot be speculated and a
-  branch survives for an unrelated reason, so the missing minss is
-  invisible.  The included regression test therefore passes
-  -fno-trapping-math explicitly; without it the test would pass
-  vacuously on the unfixed compiler.
-
-CORRECTNESS
-
-  * The four identities were model-checked exhaustively over a pool of
-    22 "interesting" floats (both zeros, both min subnormals, both min
-    normals, +-1, +-2, +-0.5, +-max, +-inf, two qNaNs with different
-    payloads, an sNaN): 1600 pair-wise comparisons of raw bit patterns,
-    0 mismatches.  Bit patterns rather than == so that -0.0 vs +0.0 and
-    NaN payloads are actually distinguished.
-  * A runtime harness checks 10 clamp/min/max spellings plus Mesa's real
-    CLAMP/SATURATE macros against volatile references over the same
-    pool, including all 22^3 = 10648 triples for the 3-argument clamp:
-    12738 checks, 0 mismatches, at -O0/-O1/-O2/-O3/-Os and at
-    -march=native and -march=x86-64.
-    (Under -ffast-math the harness reports mismatches, but the STOCK
-    r581 compiler reports the identical count on the identical harness -
-    that is -ffast-math legitimately assuming no NaNs, not a regression.
-    The user does not build Mesa with -ffast-math.)
-
-MEASURED - control is a v11 compiler with ONLY this hunk reverted
-
-  A second complete cc1 was built from the same tree with just this
-  change backed out, so every number below is attributable to it alone.
-
-  Mesa shapes, user's flags (-O3 -march=native -mtune=native
-  -fno-math-errno -fno-trapping-math -mprefer-vector-width=256
-  -funroll-loops -falign-functions=32):
-
-        file            insns          per-function highlights
-        mesareal.c    765 -> 702       clamp_color_range  56 -> 34  (-39%)
-                                       saturate_buf      199 -> 162  (-19%)
-                                       clamp_color        50 -> 48
-                                       vp_clamp            9 ->  7
-        mesaclamp.c   239 -> 199
-        mm.c           67 ->  60
-        codes.c        38 ->  30
-
-  In the vectorized clamp loop the improvement is structural, not just a
-  smaller count - a compare plus two masked blends collapses into one
-  masked min:
-
-        base:  vcmpps $10,...,%k2 ; vcmpps $14,...,%k1
-               vmovaps %xmm2,%xmm1{%k2} ; vmovaps %xmm1,%xmm0{%k1}
-        fix:   vcmpps $14,...,%k1 ; vminps %xmm2,%xmm1,%xmm0{%k1}
-
-  Wall clock, 4096-element saturate loop, 30000 iterations, data
-  deliberately straddling both clamp bounds so the baseline's branch is
-  unpredictable (best of 5, three independent runs):
-
-        baseline  0.076 ns/element
-        fixed     0.039 ns/element      1.95x faster, reproducible
-
-  Whole-Mesa scan (all files that build standalone in the sandbox, 176
-  of them, compared against the same control): 3 files change, all
-  improvements, net -115 instructions and -31 branches, 0 regressions.
-  The reach is understated by the sandbox - most of the 572
-  CLAMP/SATURATE call sites live in files that need a configured Mesa
-  build tree to compile.
-
-REGRESSION VALIDATION - same control
-
-  * gcc.c-torture/execute, -O3 -march=native, built and run:
-        1559 pass, 0 NEW failures (11 fail identically on the control).
-  * gcc.dg/torture, -O2 -march=native, built and run:
-        535 pass, 0 NEW failures (13 pre-existing).
-  * gcc.dg/vect, -O3 -march=native, built and run:
-        730 pass, 0 NEW failures (11 pre-existing).
-        -> 2824 executed tests, zero new failures.
-  * Compile sweeps vs the control:
-        gcc.dg/vect        1949 files: 0 ICEs, 0 differences
-        gcc.target/i386    2318 files: 0 ICEs, 0 differences
-        gcc.dg/torture     1147 files: 0 ICEs, 0 differences
-    i.e. the change is inert on 5414 testsuite files and only fires on
-    the idiom it targets.
-  * cc1/cc1plus rebuilt RC=0 with no new warnings.
-
-REGRESSION TEST
-
-  gcc/testsuite/gcc.target/i386/ms178-fp-clamp-1.c - verified to pass
-  with the fix and to FAIL on the control (control produces 1 vminss and
-  2 cmova where the test demands 2 vminss, 1 vminsd and no cmov), so it
-  has real discriminating power.
-
-AUDITED AND DELIBERATELY NOT CHANGED
-
-  * The user's hand-written _mm_max_ss/_mm_min_ss in float_to_ubyte()
-    and float_to_ushort() can now be dropped in favour of plain C, but
-    that is a Mesa-side change, not a GCC one.  Not touched here.
-  * src/amd/gmlib/gm/mat_funcs.c grows +124 instructions under the full
-    v11 patchset versus stock, which looked at first like a regression
-    caused by this hunk.  Instrumenting the new code path proved it
-    never fires in the function that grew (mat_get_hue_index_2pi), and
-    rebuilding with only this hunk reverted reproduced the growth
-    exactly - it is pre-existing v11 behaviour (that loop gets
-    vectorized), not this change.  Verified correct at runtime over
-    20000 randomized trials including NaN-containing arrays.
-  * Vector (VEC_COND_EXPR) clamps already had the unordered codes in
-    their match.pd table, but gated on VECTOR_INTEGER_TYPE_P.  Extending
-    that to float would duplicate what this phiopt path now achieves via
-    the vectorizer, with more risk.  Left alone.
-
-=====================================================================
-v11 ADDITION #19 - bit-field arithmetic blocked loop vectorization,
-which is exactly how ACO's and NIR's packed IR nodes are written
-=====================================================================
-
-FOUND BY
-
-Extracting ACO's real data structures and hot loops from
-src/amd/compiler/ and compiling them standalone with the user's Mesa
-flags, then diffing the vector-instruction count against the same loops
-written on a plain uint32_t array with explicit shifts and masks.  The
-"abstraction-free" control vectorized; the real ACO code did not.
-
-SYMPTOM
-
-  ACO packs its central IR value type into one word:
-
-      struct Temp {                        /* aco_ir.h */
-        uint32_t id_       : 24;
-        uint32_t reg_class : 8;
-      };
-
-  and RegClass::bytes()/size()/type()/is_linear() all do arithmetic on
-  the 8-bit field.  Loops over arrays of Temp - which is most of the
-  register allocator, the validator and the schedulers - came out fully
-  scalar:
-
-      unsigned total_size (const Temp *t, unsigned n)
-      { unsigned s = 0; for (...) s += t[i].size (); return s; }
-
-        v11 baseline :  90 insns,   0 vector instructions
-        with this fix:  99 insns,  99 vector instructions
-
-  The identical computation written as (t[i] >> 24) on a uint32_t array
-  vectorized perfectly on both compilers, which is what pointed at the
-  bit-field rather than at the arithmetic.
-
-ROOT CAUSE
-
-  if-conversion lowers a bit-field load into a load of the containing
-  word plus BIT_FIELD_REF <word, width, pos> (tree-if-conv.cc,
-  lower_bitfield).  The vectorizer has a pattern recogniser that turns
-  that BIT_FIELD_REF back into a shift-and-mask -
-  vect_recog_bitfield_ref_pattern - but it only triggers for two
-  consumers:
-
-      * a CONVERT of the BIT_FIELD_REF result, or
-      * a gcond comparing it against an INTEGER_CST.
-
-  Any other consumer leaves the BIT_FIELD_REF in the IL, and SLP build
-  then rejects it outright:
-
-      missed: Build SLP failed: BIT_FIELD_REF not supported
-      missed: step unknown.
-
-  (tree-vect-slp.cc:~1332 - that path only accepts a BIT_FIELD_REF whose
-  base is an SSA vector, not a scalar loaded from memory.)  The whole
-  loop then stays scalar.
-
-  The two consumers that matter in practice are exactly the ones that
-  were missing: BIT_AND_EXPR (every flag test: rc & 32) and a comparison
-  against a non-constant.  Minimal reproducer in plain C, no C++:
-
-      struct A { uint32_t x : 8; uint32_t y : 24; };
-      s += a[i].x;            /* CONVERT   -> vectorized  */
-      s += a[i].x + 1u;       /* PLUS      -> vectorized  */
-      s += a[i].x & 32;       /* BIT_AND   -> SCALAR      */
-      s += a[i].x > 3;        /* compare   -> SCALAR      */
-
-FIX
-
-  Let the recogniser match the BIT_FIELD_REF assignment on its own, not
-  only a CONVERT or gcond wrapping it.  Everything else in the function
-  is reused unchanged: it already knows how to emit the shift, the mask,
-  the sign-extension variant for signed fields, and how to pick
-  mask-then-shift versus shift-then-mask for the widening cases.  A
-  BIT_FIELD_REF of an integral container *is* a shift and a mask, so
-  lowering it unconditionally costs nothing when the loop does not
-  vectorize and unblocks it when it does.
-
-  Three lines of matching, no new code paths.
-
-MEASURED - control is a v11 compiler with ONLY this hunk reverted
-
-  A second complete cc1/cc1plus was built from the same tree with the
-  change backed out, so every number is attributable to it alone.
-
-  Real ACO, compiled with the user's Mesa flags (-O3 -march=native
-  -mtune=native -fno-semantic-interposition -falign-functions=32
-  -fno-math-errno -fno-trapping-math -funroll-loops
-  -mprefer-vector-width=256 -fivopts -fomit-frame-pointer
-  -malign-data=cacheline -fno-plt -fvisibility=hidden), against the real
-  generated aco_opcodes.h/aco_builder.h:
-
-      file                              insns          vector insns
-      aco_register_allocation.cpp   56748 / 56538      1428 / 1326
-      aco_validate.cpp              17947 / 17618       546 /  491
-      aco_lower_branches.cpp         9722 /  9432       784 /  652
-      aco_scheduler_ilp.cpp          5133 /  5127        64 /   64
-
-  aco_register_allocation.cpp gains one newly vectorized loop at
-  line 2199 - the `for (Definition& def : instr->definitions)
-  ... def.getTemp().regClass().is_linear()` scan, which runs for every
-  instruction the allocator touches.
-
-  Wall clock on the extracted ACO loops (2048 Temps, 200000 iterations,
-  best of 5, two independent runs, both agreeing to <1%):
-
-      loop            baseline      fixed        speedup
-      size()          0.689 ns/e    0.180 ns/e    3.8x
-      type()          0.310 ns/e    0.155 ns/e    2.0x
-      is_linear()     0.317 ns/e    0.154 ns/e    2.1x
-
-  Scope beyond ACO: 780 bit-field declarations in the AMD and NIR
-  headers alone (ac_surface.h, ac_gpu_info.h, ac_shader_util.h,
-  nir.h's nir_variable_data flags, ...).
-
-CORRECTNESS
-
-  * Runtime harness over four bit-field layouts - unsigned 8/16/8, ACO's
-    exact 24/8, SIGNED 5/11/16 (so sign-extension is actually exercised)
-    and four 1-bit flags - times 15 different loop bodies (AND, compare,
-    multiply-by-field-dependent-constant, the full RegClass::size()
-    expression, ...) times 18 array lengths chosen to hit the vector
-    body, every epilogue remainder and the zero-trip case:
-        108000 checks, 0 mismatches, at -O0/-O1/-O2/-O3/-Os, at
-        -march=native / x86-64 / x86-64-v2 and with
-        -mprefer-vector-width=512.
-  * The same for the real ACO Temp/RegClass accessors:
-        47500 checks, 0 mismatches, across the same option matrix.
-  * All 16 existing gcc.dg/vect/vect-bitfield-*.c tests build and run
-    clean, including the two "-not" tests that assert lowering must NOT
-    happen - both behave identically to the control.
-
-REGRESSION VALIDATION - same control
-
-  * gcc.c-torture/execute, -O3 -march=native, built and run:
-        1559 pass, 0 NEW failures (11 fail identically on the control).
-  * gcc.dg/vect, -O3 -march=native, built and run:
-        1167 pass, 0 NEW failures (11 pre-existing).
-  * Compile sweeps vs the control:
-        gcc.dg/vect      1949 files: 0 ICEs, 1 file differs
-                         (vect-bitfield-read-3, which now vectorizes one
-                          more loop and still passes at runtime)
-        gcc.target/i386  2019 files: 0 ICEs, 3 files differ by <=1 insn
-                         (avx-vpcmpestrm-1/-2, avx-vpcmpistrm-1; both
-                          executables verified to still run correctly)
-        Mesa standalone   204 files: 0 ICEs, 1 file differs
-        Mesa amd+nir       48 files: 0 ICEs, 4 files differ, all gains
-  * cc1 and cc1plus rebuilt RC=0 with no new warnings.
-
-REGRESSION TEST
-
-  gcc/testsuite/gcc.dg/vect/ms178-vect-bitfield-op-1.c - checks both the
-  BIT_AND and the compare form, verifies the results against a scalar
-  reference at runtime, and requires "vectorized 1 loops" twice.
-  Verified to report 2 with the fix and 0 on the control.
-
-MESA-SIDE FINDINGS (no change recommended)
-
-  * The hand-written _mm_max_ss/_mm_min_ss in src/util/u_math.h
-    (float_to_ubyte, float_to_ushort) were re-examined now that v11
-    fixes the scalar clamp.  They should be KEPT: in the bulk conversion
-    loop, which is what matters, the intrinsics version is 73
-    instructions against 327 for the best plain-C formulation, because
-    the intrinsics let GCC keep everything in the vector unit while the
-    C version round-trips through the integer domain for the
-    float->uint8 narrowing.  Replacing them would be a regression.
-  * Rewriting those intrinsics with _mm_set1_ps instead of _mm_set_ss to
-    dodge a redundant vinsertps was tried and is WORSE (11 insns vs 8
-    scalar, identical 73 in the loop) - vbroadcastss is not free either.
-    Not recommended.
-  * GCC does emit a redundant "vinsertps $0xe" per _mm_set_ss operand
-    feeding a scalar SSE op whose result is read only at lane 0 (the
-    zero-filled upper lanes are provably dead - verified on hardware by
-    feeding garbage upper lanes through max/min/add/sub/mul/div/sqrt_ss:
-    1008 comparisons, 0 divergences).  Fixing it needs a new
-    simplify-rtx VEC_MERGE rule; it is understood and reproducible but
-    was NOT attempted here rather than ship a rushed RTL change.
-    Documented for a future revision.
-  * ACO's `count_zero`/`count_zero_or_blocked` over PhysRegInterval still
-    do not vectorize, for a *different* reason than the bit-field one:
-    the range-for iterator produces an `i != end` exit test on an
-    induction variable that is stepped by 4 and then shifted right by 2
-    to index regs[].  GCC's SCEV handles LSHIFT_EXPR but has no
-    RSHIFT_EXPR case, so the index is not recognised as affine.  The
-    transform is only valid when the step is a multiple of 2^S and
-    nothing wraps - brute-forced over 1294932 combinations, 0 violations
-    for the multiple-of-2^S case, and the wrap counter-examples were
-    found and confirmed.  This is a genuine missed optimisation with a
-    known-correct guard, but implementing SCEV support is a larger
-    change than fits this revision; NOT attempted, documented instead.
-
-=====================================================================
-v12 ADDITION #20 - SCEV had no RSHIFT_EXPR case, so any right-shifted
-induction variable poisoned loop analysis
-=====================================================================
-
-SYMPTOM
-
-  tree-scalar-evolution.cc models A << B as A * (1 << B) but had no case
-  at all for the opposite direction.  Any right shift of an induction
-  variable therefore evaluated to chrec_dont_know, and everything
-  downstream that needs an affine access function -- data-reference
-  analysis, dependence testing, the vectorizer, ivopts -- gave up.
-
-  That is unfortunate, because "advance a byte cursor, then scale it
-  back down to an element index" is a standard way to write an iterator:
-
-      /* Mesa src/util/hex.h, mesa_bytes_to_hex */
-      for (i = 0; i < len * 2; i += 2) {
-        buf[i]     = hex_digits[binary[i >> 1] >> 4];
-        buf[i + 1] = hex_digits[binary[i >> 1] & 0x0f];
-      }
-
-      /* ACO src/amd/compiler/aco_register_allocation.cpp */
-      struct PhysReg { unsigned reg_b; unsigned reg () const { return reg_b >> 2; } };
-      PhysRegIterator &operator++ () { reg.reg_b += 4; return *this; }
-
-FIX
-
-  Add the RSHIFT_EXPR case.  When the chrec's step is a multiple of 2^C
-  the discarded low bits never change, no carry crosses the shift
-  boundary, and
-
-      ({base, +, step} >> C)  ==  {base >> C, +, step >> C}
-
-  at every iteration.
-
-  Two guards, both of which I established are individually necessary by
-  brute force over 355,636,352 (base, step, k, C) combinations:
-
-    (a) STEP must be a multiple of 2^C.  Dropping this makes the claim
-        false 221,520,100 times -- the low bits accumulate and the
-        sequence becomes a staircase rather than an affine function.
-
-    (b) the accumulation must not wrap.  If {base, +, step} wraps modulo
-        2^N then the shifted sequence wraps modulo 2^(N-C), which is not
-        what {base >> C, +, step >> C} evaluates to in the original
-        N-bit type.  Dropping this makes the claim false 19,347,472
-        times, every one of them a wrap.
-
-  (b) is discharged two ways: nowrap_type_p () for types whose overflow
-  is undefined, and otherwise scev_probably_wraps_p (), which uses the
-  loop's iteration count to decide whether base + step*niter can leave
-  the range.  The VAR argument is passed (not NULL_TREE) so that the
-  value-range and nonwrapping-chrec proofs inside it are actually
-  reachable -- with NULL_TREE two of its three proofs are dead code.
-  Failure is always chrec_dont_know, i.e. exactly the behaviour before
-  this change.
-
-MEASURED - control is a v12 compiler with ONLY this hunk reverted
-
-  A second complete cc1/cc1plus was built from the same tree with the
-  change backed out, so every number below is attributable to it alone.
-
-  Wall clock, Mesa's real mesa_bytes_to_hex on a 32-byte input (the
-  BLAKE3 cache-key length), best of 5, two independent runs:
-
-      baseline   25.3 ns/call
-      v12        22.9 ns/call        ~10% faster, reproducible
-
-  Whole-tree differential over src/amd + src/compiler/nir + src/util +
-  src/gallium/drivers/radeonsi with the user's Mesa flags, 126 files
-  that build standalone in the sandbox: 0 ICEs, 2 files differ, both
-  the hex path (build_id.c and mesa-blake3.c, +19 instructions each).
-  The user's stated preference is performance over size, and the trade
-  here is +19 instructions in two cold call sites against a 10% faster
-  hex conversion wherever it runs.
-
-REGRESSION VALIDATION - same control
-
-  * gcc.c-torture/execute, -O3 -march=native, built and run:
-        1559 pass, 0 NEW failures (11 fail identically on the control).
-  * gcc.dg/vect, -O3 -march=native, built and run:
-        1168 pass, 0 NEW failures (11 pre-existing).
-  * gcc.dg/torture, -O2 -march=native, built and run:
-        1108 pass, 0 NEW failures (21 pre-existing).
-        -> 3835 executed tests, zero new failures.
-  * gcc.dg/vect compile sweep, 1950 files: 0 ICEs, 1 file differs
-        (vect-alias-check-14, 33 instructions SMALLER).
-  * Dedicated runtime harness: four bit-widths of IV, shifts of 1/2/3/4/6,
-    steps that are and are not multiples of 2^C, signed and unsigned,
-    starts and lengths chosen to hit the vector body, every epilogue
-    remainder and the zero-trip case, plus Mesa's real hex loop for all
-    lengths 0..256:
-        3806 checks, 0 mismatches, at -O0/-O1/-O2/-O3/-Os, at
-        -march=native / x86-64, with -mprefer-vector-width=512,
-        with -fwrapv and with -fno-strict-overflow.
-  * cc1 and cc1plus rebuilt RC=0, no new warnings from the touched file.
-
-REGRESSION TEST
-
-  gcc/testsuite/gcc.dg/vect/ms178-scev-rshift-1.c - runs Mesa's exact
-  hex loop for every length 0..64 against a scalar reference, and also
-  exercises a step that is NOT a multiple of 2^C so the guard itself is
-  covered.
-
----------------------------------------------------------------------
-ACO count_zero: root cause found, and it is NOT the shift
----------------------------------------------------------------------
-
-The v11 header speculated that ACO's RegisterFile::count_zero fails to
-vectorize because of the shifted index.  That was wrong, and this
-revision establishes the real cause by instrumenting the compiler.
-
-  * With this SCEV fix in place, count_zero as written still does not
-    vectorize.  Instrumentation shows the new RSHIFT_EXPR case being
-    reached 36 times and rejected every time at guard (b).
-
-  * The reason is the loop's EXIT TEST, not the shift.  ACO's
-    PhysRegIterator defines operator!= as "reg != other.reg", so the
-    range-for exits on !=.  GCC can then only compute the iteration
-    count under an assumption:
-
-        Symbolic number of iterations is ((_6 - _16) + 4294967292) /[ex] 4 + 1
-        under assumptions (_6 - _16 & 3) == 0
-
-    record_control_iv () refuses to record a control IV when
-    niter->assumptions is not the constant 1, so loop->control_ivs stays
-    empty, loop_exits_before_overflow () has nothing to work with, and
-    scev_probably_wraps_p () must answer "may wrap".
-
-  * Proof by construction, three variants of the identical function:
-
-        exit test        Fix B fires    vectorizes
-        i != end             no             no       <- ACO as written
-        i <  end            yes             no       (offset still blocked)
-        constant bounds     yes            YES  0 -> 42 vector insns
-
-    The middle row isolates a second, independent blocker: the address
-    offset is (sizetype) (ivtmp >> 2) * 4, and the widening conversion
-    to sizetype re-runs scev_probably_wraps_p () inside chrec_convert_1,
-    where it fails again for the same reason.
-
-  * So there are two upstream blockers stacked on top of each other, both
-    rooted in the same unprovable no-wrap fact, and both upstream of the
-    shift.  Fixing them means either teaching record_control_iv () to
-    keep assumption-carrying control IVs, or making the range of a
-    struct member (PhysReg::reg_b is provably < 2048 in ACO) visible to
-    scev_var_range_cant_overflow ().  Both are substantially riskier than
-    this revision's change and neither is attempted here; they are now
-    precisely localised rather than guessed at.
-
-  * Worth recording for the Mesa side: changing PhysRegIterator's
-    operator!= to compare with < would remove the first blocker at zero
-    cost, since the iterator is only ever advanced forwards.  That is a
-    Mesa change, not a GCC one, and it is not sufficient on its own -
-    the offset conversion still blocks - so it is documented rather than
-    proposed as a patch.
-
-AUDITED AND DELIBERATELY NOT CHANGED
-
-  * The genuinely hottest loop in ACO's register allocator is not
-    count_zero at all: it is the register-window scan in get_reg_simple
-    (aco_register_allocation.cpp:987), which has a data-dependent early
-    break and is therefore not vectorizable in principle.
-  * ACO has 184 range-for loops over custom iterators (32 of them in
-    aco_register_allocation.cpp alone) and RADV/ACO headers declare 324
-    bit-field members; the v11 bit-field pattern fix already covers the
-    latter group.
-  * The redundant "vinsertps $0xe" per _mm_set_ss was implemented as a
-    simplify-rtx VEC_MERGE rule and REJECTED in v12 development: the
-    variant that actually removed the instruction had to distribute a
-    lane extract through the arithmetic, which lets simplify_gen_binary
-    canonicalise commutative operands.  That is legal for the value of
-    a+b but not for which NaN payload x86 propagates, and the runtime
-    harness caught it (addss of two NaNs returned the wrong payload).
-    The provably-safe remnant changed no code at all, so it was dropped
-    rather than shipped as dead weight.
-
-=====================================================================
-v13 ADDITION #21 - Graphite: a failing SCoP silently disabled Graphite
-for the whole rest of the function
-=====================================================================
-
-This one matters for the user's build flags specifically: the Mesa/Qt/
-X server CFLAGS carry -fgraphite-identity -floop-nest-optimize, so every
-translation unit goes through Graphite.
-
-DEFECT A - sticky ISL error (correctness of the *optimizer*, not of the
-generated code)
-
-  graphite_transform_loops () allocates ONE isl_ctx and hands the same
-  pointer to every SCoP of the function:
-
-      ctx = isl_ctx_alloc ();
-      ...
-      FOR_EACH_VEC_ELT (scops, i, scop)
-        scop->isl_context = ctx;
-
-  isl_ctx_last_error is sticky: it stays set until isl_ctx_reset_error ()
-  is called.  build_poly_scop () knows this and resets it.  The two other
-  places that test it did not:
-
-      optimize_isl ()      graphite-optimize-isl.cc
-      scop_to_isl_ast ()   graphite-isl-ast-to-gimple.cc
-
-  So the first SCoP that exhausted --param max-isl-operations, or that
-  provoked any other ISL error, left the flag set on the shared context.
-  Every SUBSEQUENT SCoP in that function then read a non-none error
-  immediately after its own (successful) scheduling and bailed out with
-  "loop nest not optimized, ISL signalled an error" -- or, in the quota
-  case, silently reported a timeout it never actually hit.
-
-  One hard loop nest therefore disabled Graphite for the entire rest of
-  the function.
-
-  Fixed by reading the error into a local, calling isl_ctx_reset_error ()
-  immediately, and testing the local -- exactly the pattern
-  build_poly_scop () already uses.  The diagnostic that inspects the
-  error kind now reads the saved value too, since the context has been
-  cleared by then.
-
-DEFECT B - global ISL scheduler options leaked across SCoPs
-
-  optimize_isl () sets six *global* isl_ctx options before scheduling:
-
-      schedule_serialize_sccs, schedule_maximize_band_depth,
-      schedule_max_constant_term, schedule_max_coefficient,
-      tile_scale_tile_loops, ast_build_atomic_upper_bound
-
-  and never restored any of them, even though the very same function
-  carefully saves and restores on_error and max_operations.  Because the
-  context is shared, those settings leaked into everything that ran
-  afterwards on it -- including AST generation for the same SCoP and all
-  scheduling and AST generation for every later SCoP, none of which asked
-  for maximize_band_depth or the constant-term/coefficient caps.
-
-  Fixed by saving all six with the matching isl_options_get_* and
-  restoring them on every exit path, alongside the existing restores.
-
-DEMONSTRATION - control is a v13 compiler with ONLY these hunks reverted
-
-  Two loop nests in one function, separated by an opaque call so they
-  form two SCoPs; the first is a 64x64x64 matmul, the second a trivial
-  transpose:
-
-      --param max-isl-operations=200
-        baseline : reports the timeout for nest 1 only; nest 2 is never
-                   mentioned because it bailed on the stale error
-        v13      : reports the timeout for BOTH nests, i.e. nest 2 was
-                   actually analysed
-
-      --param max-isl-operations=20000   (enough for both)
-        baseline : 0 loop nests optimized
-        v13      : 1 loop nest optimized  ("g4.c:11:21: optimized:
-                   loop nest optimized" -- that is the SECOND nest)
-
-  So the stale error was not merely cosmetic: it suppressed a real,
-  achievable transformation.
-
-VALIDATION - all with the user's Graphite flags active
-  (-O3 -march=native -floop-nest-optimize -fgraphite-identity)
-
-  * gcc.dg/graphite:            86 runnable tests, 0 NEW failures
-  * gcc.c-torture/execute:    1559 tests pass, 0 NEW failures
-  * gcc.dg/vect:              1169 tests pass, 0 NEW failures
-    -> 2814 executed tests with Graphite enabled, zero new failures.
-  * cc1/cc1plus rebuilt RC=0, no new warnings.
-  * This is the first revision built --with-isl, so Graphite was actually
-    exercised rather than compiled out.
-
-REGRESSION TEST
-
-  gcc/testsuite/gcc.dg/graphite/ms178-isl-error-reset.c - verified to
-  report "loop nest optimized" once with the fix and zero times on the
-  control.
-
-=====================================================================
-v14 ADDITION #22 - integer division/modulo by a loop-invariant divisor
-                   (new pass: gcc/gimple-loop-invdiv.cc)
-=====================================================================
-
-v13 recorded this as attempted-and-reverted, and concluded that doing
-it properly needed loop_version () and CFG duplication.  That conclusion
-was WRONG, and the reason is worth stating plainly, because it is what
-unlocked the whole thing:
-
-  v13 was trying to version the loop so that a power-of-two divisor
-  could use a shift.  That framing forces a runtime test, forces code
-  duplication, and only helps power-of-two divisors.  The branchless
-  variant of it was an outright pessimization (shrx + divl + cmove:
-  the division still executes, plus a shift, plus a cmove).
-
-  The correct move is not to *test* the divisor, but to pick a
-  formulation that needs no test at all.  There is one.  It is correct
-  for EVERY divisor value, including 1 and including every power of
-  two, so the division simply disappears from the loop body.  No
-  loop_version (), no gcond, no duplicated loop, no unswitcher
-  involvement whatsoever.
-
-THE TRANSFORM
-
-  For an unsigned type of precision N, in the loop PREHEADER:
-
-      dnz   = d | (d == 0)          // preheader must not trap
-      dm1   = dnz - 1
-      k     = (dm1 != 0)            // 0 only when d == 1
-      dm1nz = dm1 | (dm1 == 0)      // keep CLZ argument nonzero
-      l     = N - clz_N (dm1nz)     // ceil(log2 d); 0 when d == 1
-      c     = N - l
-      num   = (~(wide)0) >> c       // 2^(N+l) - 1
-      m     = (T) (num / dnz + 1)   // truncated to N bits on purpose
-      sh    = (l - 1) & -k          // l-1 for d >= 2, 0 for d == 1
-
-  and in the loop BODY, replacing "q = n / d":
-
-      t1 = MULT_HIGHPART <n, m>
-      t2 = n - t1
-      t3 = t2 >> k
-      t4 = t1 + t3
-      q  = t4 >> sh
-
-  For d >= 2 this is the classical round-up magic-number scheme with
-  the "add" fixup, which is what keeps every intermediate inside N bits
-  and avoids needing an N+1-bit multiplier.
-
-  The d == 1 case is the part the textbook version cannot express, and
-  the part that makes versioning unnecessary.  When d == 1: l == 0, so
-  num == 2^N - 1 and m == (T)(2^N) == 0.  Hence t1 == 0, t2 == n, k == 0
-  makes the fixup shift a no-op, and sh is masked to 0.  Result: q == n.
-  Exactly n / 1, with no branch.
-
-  Modulo reuses the quotient: r = n - q * d.
-
-  d == 0 is UB in the source, but the PREHEADER executes even when the
-  offending iteration never would, so the precomputation must not trap.
-  The `dnz' masking makes it total.  Verified: a guarded division with
-  divisor 0 whose body never runs produces no trap, same as control.
-
-CORRECTNESS - this is a numeric transform, so it was proven by
-exhaustion rather than by argument:
-
-  N = 8   all 256 divisors x all 256 numerators, incl. d==0 and d==1
-  N = 16  all 65536 divisors x all 65536 numerators, incl. d==0, d==1
-  ------------------------------------------------------------------
-          4,295,032,832 (d, n) pairs, ZERO mismatches
-          (quotient AND remainder both checked)
-
-  N = 32  and N = 64: structured + randomized sweep over all small
-          divisors, every 2^i and 2^i +- 1, and quotient-boundary
-          numerators k*d-1, k*d, k*d+1 for the extreme k, plus random
-          divisors and numerators.  ~28.2 M checks, ZERO mismatches.
-
-  The exhaustive harness was itself validated by deliberately injecting
-  an off-by-one and confirming it reported failures.
-
-MEASURED, on the sandbox host, 65536 elements, best of 11 runs, control
-is the identical compiler with -fno-tree-loop-invdiv (so the ONLY
-difference is this pass):
-
-      loop                control        v14        speedup
-      ---------------------------------------------------------
-      unsigned 32 div     1.7650 ns    0.1354 ns     13.0x
-      unsigned 32 mod     1.7650 ns    0.1921 ns      9.2x
-      unsigned 64 div     2.9414 ns    0.8833 ns      3.3x
-
-  The 32-bit numbers beat the 9.7x that v13 predicted for a magic
-  multiply, and the reason is a deliberate placement decision: the pass
-  runs inside pass_tree_loop, after pass_loop_split and BEFORE the
-  vectorizer.  A division cannot be vectorized at all; the MULT_HIGHPART
-  sequence can.  So the loop does not merely lose its division, it
-  becomes vectorizable (pmuludq/pshufd in the emitted code).  That is
-  where the extra factor comes from.
-
-WHAT IT DELIBERATELY DOES NOT DO, and why:
-
-  * Signed division - needs a different, more expensive fixup and the
-    win is smaller.  Verified declined: dsigned() keeps its idivl.
-  * Constant divisors - expand_divmod already does better.  Verified
-    declined: dconst() with /7u is untouched.
-  * Loops with max trip count < 3 - the extra preheader division does
-    not amortise.  Verified declined: a 2-iteration loop keeps its divs.
-  * Targets without a highpart multiply for the mode, or without CLZ,
-    or where the 2N-bit type has no real integer mode - all gated off,
-    so the transform can never expand into a libgcc call.
-  * Statements that can throw internally - bailed out rather than
-    fixing up EH edges.
-
-  Two divisions by the same divisor share one magic computation (CSE
-  folds it): f2()/f3() in the edge-case file emit exactly one divl each.
-
-VALIDATION (all against a control compiler that differs ONLY by
--fno-tree-loop-invdiv, so nothing here is confounded):
-
-  gcc.c-torture/execute        1559 pass, 11 fail
-                               all 11 verified pre-existing (they fail
-                               identically on the control) - matches the
-                               v13 baseline exactly
-  gcc.dg/vect                  1169 pass, 11 fail, all 11 pre-existing
-  gcc.dg/torture + tree-ssa    1486 pass
-  ICE sweep, -O3 -march=native -fchecking=2, over gcc.dg + tree-ssa +
-    c-torture/compile          12,004 files, ZERO ICEs, ZERO IL
-                               verification failures
-
-  One apparent regression, gcc.dg/tree-ssa/loadpre4.c, was chased down
-  and is NOT one: the two binaries are byte-identical (same md5sum, same
-  asm), and the test segfaults nondeterministically either way - it is a
-  dg-do compile test with a bogus main(int *, int) signature that this
-  harness wrongly executes.  Reported here rather than quietly dropped.
-
-  An earlier revision of the pass retargeted the final statement's LHS
-  to avoid a copy.  -fchecking=2 correctly rejected it ("type mismatch
-  in rshift_expr"): the result type would have changed silently.  That
-  micro-optimization was removed; copy propagation deletes the copy
-  anyway.  Recording it because it is exactly the kind of bug that a
-  release-build-only test run would have shipped.
-
-  New regression tests:
-    gcc/testsuite/gcc.dg/tree-ssa/ms178-invdiv-1.c  (scan: fires on
-      u32 div, u32 mod, u64 div; declines signed, constant, tiny loop)
-    gcc/testsuite/gcc.dg/tree-ssa/ms178-invdiv-2.c  (runtime: d == 1,
-      powers of two, extremes, and the guarded divide-by-zero case)
-
-  Controlled by -ftree-loop-invdiv, on by default at -O2 and above
-  except with -Os.  Documented in doc/invoke.texi.
-
----------------------------------------------------------------------
-The remaining vectorizer gaps
----------------------------------------------------------------------
-
-With integer division by a loop-invariant divisor now delivered (#22
-above), three of the four gaps identified in v12/v13 remain, and they
-remain out of scope for the same class of reason: each needs new
-vectorizer capability rather than the removal of an over-tight gate.
-
-  argmax/argmin   two mutually-dependent live-out reductions; rejected
-                  by vect_is_simple_use ("unsupported use in stmt").
-  prefix sum      needs a scan pattern in the vectorizer.
-  histogram       needs conflict detection (scatter-add).
-
-For the record, the v13 analysis that led to #22 is preserved because
-its measurements are what made the right design obvious.  On this class
-of machine, per element:
-
-      hardware divide                1.861 ns
-      power-of-two shift             0.046 ns    40.5x
-      runtime magic multiply         0.190 ns     9.7x
-
-v13 read that table as "the power-of-two case is worth four times more,
-so version the loop for it".  That is the trap.  The shift version is
-only reachable behind a runtime test, and the test costs more than the
-difference: the branchless form emits shrx + divl + cmove and is slower
-than doing nothing, while the branchy form needs loop duplication that
-the unswitcher will not perform for a COND_EXPR (unswitch_predicate has
-constructors only for gcond and gswitch).
-
-The magic-multiply column, by contrast, needs no test at all once the
-formulation is chosen so that d == 1 and powers of two fall out of the
-same expression - and it then measures BETTER than the 9.7x above,
-because removing the division also makes the loop vectorizable.
-
-Two development bugs from the v13 attempt are recorded because they
-generalise:
-
-  * The LIM gate must accept MOVE_PRESERVE_EXECUTION, not MOVE_POSSIBLE.
-    A division can trap, so it is never MOVE_POSSIBLE.
-  * When rewriting in place during a statement walk, the iterator must
-    end on the replacing statement, otherwise the caller's gsi_next ()
-    rescans freshly created statements and rewrites forever (a real
-    hang: 90 s on a three-line file).
-
-The delivered pass sidesteps both by collecting candidates first and
-rewriting afterwards, rather than rewriting during the walk.
+Three vectorizer gaps remain, all needing genuinely new capability
+rather than the loosening of an over-tight gate:
+
+  argmax / argmin   two mutually-dependent live-out reductions;
+                    rejected by vect_is_simple_use.
+  prefix sum        needs a scan pattern.
+  histogram         needs conflict detection for scatter-add.
+
+Audited and deliberately not changed: software prefetching is measured
+harmful on this core (-fprefetch-loop-arrays costs about 6% on 32 MB
+streams, and X86_TUNE_SOFTWARE_PREFETCHING_BENEFICIAL correctly excludes
+all Intel parts); FMA accumulator depth is already sufficient (GCC emits
+four accumulators and the auto-vectorized dot product is
+bandwidth-bound); ACO's register-window scan in get_reg_simple has a
+data-dependent early break and is unvectorizable in principle.
 
 diff --git a/Makefile.def b/Makefile.def
 index cde69c9..497ca14 100644
@@ -5300,7 +4019,7 @@ index 35090d7..2063e80 100644
        }
    }
 diff --git a/gcc/doc/invoke.texi b/gcc/doc/invoke.texi
-index 81213fc..a0b9ee1 100644
+index 81213fc..d57cdd2 100644
 --- a/gcc/doc/invoke.texi
 +++ b/gcc/doc/invoke.texi
 @@ -679,7 +679,7 @@ Objective-C and Objective-C++ Dialects}.
@@ -5312,16 +4031,18 @@ index 81213fc..a0b9ee1 100644
  -ftree-phiprop  -ftree-loop-distribution  -ftree-loop-distribute-patterns
  -ftree-loop-ivcanon  -ftree-loop-linear  -ftree-loop-optimize
  -ftree-loop-vectorize
-@@ -15115,6 +15115,19 @@ operands of conditions that are invariant out of the loop, so that we can use
+@@ -15115,6 +15115,21 @@ operands of conditions that are invariant out of the loop, so that we can use
  just trivial invariantness analysis in loop unswitching.  The pass also includes
  store motion.
  
 +@opindex ftree-loop-invdiv
 +@opindex fno-tree-loop-invdiv
 +@item -ftree-loop-invdiv
-+Replace an unsigned integer division or modulo whose divisor is invariant
-+in a loop, but is not a compile-time constant, with a reciprocal
-+(``magic number'') multiply.  The magic number is derived once in the
++Replace an integer division or modulo whose divisor is invariant in a
++loop, but is not a compile-time constant, with a reciprocal
++(``magic number'') multiply.  Both signed and unsigned divisions are
++handled; the signed case divides the absolute values and fixes up the
++sign.  The magic number is derived once in the
 +loop preheader with a single division, and the loop body is left with a
 +widening highpart multiply and a few cheap integer operations.  Unlike
 +loop versioning for a power-of-two divisor this needs no runtime test and
@@ -5692,10 +4413,10 @@ index 1af0d52..0c0e05c 100644
  	  != GET_MODE_BITSIZE (SCALAR_INT_TYPE_MODE (etype)))
 diff --git a/gcc/gimple-loop-invdiv.cc b/gcc/gimple-loop-invdiv.cc
 new file mode 100644
-index 0000000..cca38d4
+index 0000000..39aa471
 --- /dev/null
 +++ b/gcc/gimple-loop-invdiv.cc
-@@ -0,0 +1,530 @@
+@@ -0,0 +1,607 @@
 +/* Strength-reduce integer division/modulo by a loop-invariant divisor.
 +   Copyright (C) 2018-2026 Free Software Foundation, Inc.
 +
@@ -5809,9 +4530,34 @@ index 0000000..cca38d4
 +   when the target actually has a highpart multiply for the mode, so that we
 +   do not expand into a libgcc call.
 +
-+   Only unsigned division is handled.  Signed division needs a different
-+   (and more expensive) fixup sequence and the win is smaller; it is left
-+   for future work.  */
++   Signed division
++   ---------------
++
++   Truncating signed division satisfies
++
++     n / d  ==  sign(n)^sign(d) ? -(|n| / |d|) : (|n| / |d|)
++
++   and |n|, |d| always fit in the unsigned type of the same width, even
++   for the minimum value.  So the signed case reuses the sequence above
++   verbatim on the absolute values and fixes the sign afterwards:
++
++     preheader:  sd = d >> (N-1)            // 0 or -1
++                 |d| = (d ^ sd) - sd        // magic built from this
++     body:       sn = n >> (N-1)
++                 |n| = (n ^ sn) - sn
++                 uq  = <unsigned sequence on |n|>
++                 s   = sn ^ sd
++                 q   = (uq ^ s) - s
++
++   Both signed UB divisors stay total in the preheader: d == 0 is masked
++   as above, and d == -1 gives |d| == 1, i.e. the identity path, so
++   INT_MIN / -1 wraps to INT_MIN instead of raising SIGFPE.  That is
++   important because the preheader executes even on iterations that the
++   original program would never have run.
++
++   For signed modulo the remainder is recovered as n - q * d using the
++   *original* (signed) numerator and divisor, computed in the unsigned
++   type where wrapping is well defined.  */
 +
 +#include "config.h"
 +#include "system.h"
@@ -5931,12 +4677,18 @@ index 0000000..cca38d4
 +  tree lhs = gimple_assign_lhs (stmt);
 +  tree type = TREE_TYPE (lhs);
 +
-+  /* Unsigned integral scalars only.  Vectors are handled by the
-+     vectorizer's own pattern matcher.  */
++  /* Integral scalars only.  Vectors are handled by the vectorizer's own
++     pattern matcher.  Both signed and unsigned are supported; the signed
++     case is implemented on top of the unsigned one by dividing the
++     absolute values and fixing up the sign.  */
 +  if (!INTEGRAL_TYPE_P (type)
-+      || !TYPE_UNSIGNED (type)
 +      || TREE_CODE (type) == BITINT_TYPE
 +      || TYPE_PRECISION (type) > HOST_BITS_PER_WIDE_INT)
++    return NULL;
++
++  /* Enumeral and boolean types have a restricted value range that the
++     absolute-value fixup below is not written to respect.  */
++  if (TREE_CODE (type) != INTEGER_TYPE)
 +    return NULL;
 +
 +  /* We build the magic in TYPE's mode; require the precision to match the
@@ -6088,11 +4840,29 @@ index 0000000..cca38d4
 +  tree n = gimple_assign_rhs1 (stmt);
 +  bool is_mod = gimple_assign_rhs_code (stmt) == TRUNC_MOD_EXPR;
 +
++  bool sgn = !TYPE_UNSIGNED (type);
++  unsigned prec = TYPE_PRECISION (type);
++  tree shcnt = build_int_cst (integer_type_node, prec - 1);
++
 +  /* --- preheader ---------------------------------------------------- */
 +  gimple_seq pre = NULL;
 +  tree dcv = divisor;
 +  if (!useless_type_conversion_p (utype, TREE_TYPE (divisor)))
 +    dcv = gimple_build (&pre, loc, NOP_EXPR, utype, divisor);
++
++  /* For signed division, build the magic from |d| and remember sign(d)
++     as an all-ones/all-zeros mask.  |d| is computed as (d ^ sd) - sd,
++     which is correct even for d == INT_MIN (it yields 2^(N-1), the right
++     magnitude as an unsigned value).  */
++  tree sd = NULL_TREE;
++  if (sgn)
++    {
++      tree ds = gimple_build (&pre, loc, RSHIFT_EXPR, type, divisor, shcnt);
++      sd = gimple_build (&pre, loc, NOP_EXPR, utype, ds);
++      tree x = gimple_build (&pre, loc, BIT_XOR_EXPR, utype, dcv, sd);
++      dcv = gimple_build (&pre, loc, MINUS_EXPR, utype, x, sd);
++    }
++
 +  tree m, sh, k;
 +  invdiv_build_magic (&pre, loc, type, dcv, &m, &sh, &k);
 +
@@ -6102,7 +4872,17 @@ index 0000000..cca38d4
 +  /* --- loop body ---------------------------------------------------- */
 +  gimple_seq body = NULL;
 +  tree nu = n;
-+  if (!useless_type_conversion_p (utype, TREE_TYPE (n)))
++  tree sn = NULL_TREE;
++  if (sgn)
++    {
++      /* nu = |n| ; sn = sign mask of n.  */
++      tree ns = gimple_build (&body, loc, RSHIFT_EXPR, type, n, shcnt);
++      sn = gimple_build (&body, loc, NOP_EXPR, utype, ns);
++      tree nc = gimple_build (&body, loc, NOP_EXPR, utype, n);
++      tree x = gimple_build (&body, loc, BIT_XOR_EXPR, utype, nc, sn);
++      nu = gimple_build (&body, loc, MINUS_EXPR, utype, x, sn);
++    }
++  else if (!useless_type_conversion_p (utype, TREE_TYPE (n)))
 +    nu = gimple_build (&body, loc, NOP_EXPR, utype, n);
 +
 +  tree t1 = gimple_build (&body, loc, MULT_HIGHPART_EXPR, utype, nu, m);
@@ -6111,11 +4891,29 @@ index 0000000..cca38d4
 +  tree t4 = gimple_build (&body, loc, PLUS_EXPR, utype, t1, t3);
 +  tree q  = gimple_build (&body, loc, RSHIFT_EXPR, utype, t4, sh);
 +
++  /* Reapply the sign: q = (uq ^ s) - s where s = sign(n) ^ sign(d).  */
++  if (sgn)
++    {
++      tree sq = gimple_build (&body, loc, BIT_XOR_EXPR, utype, sn, sd);
++      tree x = gimple_build (&body, loc, BIT_XOR_EXPR, utype, q, sq);
++      q = gimple_build (&body, loc, MINUS_EXPR, utype, x, sq);
++    }
++
 +  tree res = q;
 +  if (is_mod)
 +    {
-+      tree prod = gimple_build (&body, loc, MULT_EXPR, utype, q, dcv);
-+      res = gimple_build (&body, loc, MINUS_EXPR, utype, nu, prod);
++      /* r = n - q * d, computed in the unsigned type (wrapping is exactly
++	 what we want) and reinterpreted.  Use the ORIGINAL divisor, not
++	 the absolute value, and the original numerator.  */
++      tree nn = nu;
++      tree dd = dcv;
++      if (sgn)
++	{
++	  nn = gimple_build (&body, loc, NOP_EXPR, utype, n);
++	  dd = gimple_build (&body, loc, NOP_EXPR, utype, divisor);
++	}
++      tree prod = gimple_build (&body, loc, MULT_EXPR, utype, q, dd);
++      res = gimple_build (&body, loc, MINUS_EXPR, utype, nn, prod);
 +    }
 +  if (!useless_type_conversion_p (type, TREE_TYPE (res)))
 +    res = gimple_build (&body, loc, NOP_EXPR, type, res);
@@ -6735,10 +5533,10 @@ index 0000000..5e2e581
 +/* { dg-final { scan-tree-dump-times {MEM[^;\n\r]*= 7;} 1 "optimized" } } */
 diff --git a/gcc/testsuite/gcc.dg/tree-ssa/ms178-invdiv-1.c b/gcc/testsuite/gcc.dg/tree-ssa/ms178-invdiv-1.c
 new file mode 100644
-index 0000000..47d0586
+index 0000000..fc41f80
 --- /dev/null
 +++ b/gcc/testsuite/gcc.dg/tree-ssa/ms178-invdiv-1.c
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,63 @@
 +/* Division/modulo by a loop-invariant (non-constant) divisor should be
 +   strength-reduced to a reciprocal multiply, with the magic-number
 +   computation hoisted into the loop preheader.  */
@@ -6767,12 +5565,19 @@ index 0000000..47d0586
 +    o[i] = a[i] / d;
 +}
 +
-+/* Signed division uses a different fixup and is not handled.  */
++/* Signed division is handled too, via |n| / |d| plus a sign fixup.  */
 +void
 +dsigned (int *o, const int *a, unsigned n, int d)
 +{
 +  for (unsigned i = 0; i < n; i++)
 +    o[i] = a[i] / d;
++}
++
++void
++msigned (int *o, const int *a, unsigned n, int d)
++{
++  for (unsigned i = 0; i < n; i++)
++    o[i] = a[i] % d;
 +}
 +
 +/* A constant divisor is already handled better by expand_divmod.  */
@@ -6792,15 +5597,15 @@ index 0000000..47d0586
 +    o[i] = a[i] / d;
 +}
 +
-+/* { dg-final { scan-tree-dump-times "replaced division by loop-invariant divisor" 2 "linvdiv" } } */
-+/* { dg-final { scan-tree-dump-times "replaced modulo by loop-invariant divisor" 1 "linvdiv" } } */
-+/* { dg-final { scan-tree-dump-times " h\\* " 3 "linvdiv" } } */
++/* { dg-final { scan-tree-dump-times "replaced division by loop-invariant divisor" 3 "linvdiv" } } */
++/* { dg-final { scan-tree-dump-times "replaced modulo by loop-invariant divisor" 2 "linvdiv" } } */
++/* { dg-final { scan-tree-dump-times " h\\* " 5 "linvdiv" } } */
 diff --git a/gcc/testsuite/gcc.dg/tree-ssa/ms178-invdiv-2.c b/gcc/testsuite/gcc.dg/tree-ssa/ms178-invdiv-2.c
 new file mode 100644
-index 0000000..29aeb63
+index 0000000..2d1fc4c
 --- /dev/null
 +++ b/gcc/testsuite/gcc.dg/tree-ssa/ms178-invdiv-2.c
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,180 @@
 +/* Runtime correctness of the loop-invariant division strength reduction.
 +   Exercises the two values the textbook magic-number scheme cannot
 +   express -- d == 1 and powers of two -- as well as a divisor of zero on
@@ -6836,6 +5641,29 @@ index 0000000..29aeb63
 +{
 +  for (unsigned i = 0; i < n; i++)
 +    o[i] = a[i] / d;
++}
++
++__attribute__((noinline)) static void
++sd32 (int *o, const int *a, unsigned n, int d)
++{
++  for (unsigned i = 0; i < n; i++)
++    o[i] = a[i] / d;
++}
++
++__attribute__((noinline)) static void
++sm32 (int *o, const int *a, unsigned n, int d)
++{
++  for (unsigned i = 0; i < n; i++)
++    o[i] = a[i] % d;
++}
++
++__attribute__((noinline)) static long long
++sd64 (long long x, long long d)
++{
++  long long s = 0;
++  for (unsigned i = 0; i < 4; i++)
++    s += (x + i) / d;
++  return s;
 +}
 +
 +/* The division is guarded and never runs; D is zero.  The program is
@@ -6887,6 +5715,65 @@ index 0000000..29aeb63
 +	if (qo[i] != qa[i] / q)
 +	  abort ();
 +    }
++
++  /* Signed: exercise both signs, 1, -1, powers of two and the extremes.
++     -1 is combined only with numerators that are not the minimum value,
++     since INT_MIN / -1 is undefined.  */
++  {
++    static const int sds[] = { 1, -1, 2, -2, 3, -3, 8, -8, 1000, -1000,
++			       0x40000000, (-0x7fffffff - 1), 0x7fffffff };
++    static int sa[N], so[N];
++
++    for (unsigned j = 0; j < sizeof (sds) / sizeof (sds[0]); j++)
++      {
++	volatile int vd = sds[j];
++	int d = vd;
++
++	for (unsigned i = 0; i < N; i++)
++	  {
++	    seed = seed * 1103515245u + 12345u;
++	    sa[i] = (int) seed;
++	    if (d == -1 && sa[i] == (-0x7fffffff - 1))
++	      sa[i] = 0;
++	  }
++	sa[0] = 0;
++	sa[1] = d;
++	sa[2] = -d;
++	sa[3] = 0x7fffffff;
++	if (d != -1)
++	  sa[4] = (-0x7fffffff - 1);
++
++	sd32 (so, sa, N, d);
++	for (unsigned i = 0; i < N; i++)
++	  if (so[i] != sa[i] / d)
++	    abort ();
++
++	sm32 (so, sa, N, d);
++	for (unsigned i = 0; i < N; i++)
++	  if (so[i] != sa[i] % d)
++	    abort ();
++
++	{
++	  volatile long long vq = sds[j];
++	  long long q = vq;
++	  long long want = 0;
++	  for (unsigned i = 0; i < 4; i++)
++	    want += (1234567LL + i) / q;
++	  if (sd64 (1234567LL, q) != want)
++	    abort ();
++	}
++      }
++
++    /* Signed divide-by-zero and by -1 on a path that never executes.  */
++    {
++      volatile int z = 0, m1 = -1;
++      for (unsigned i = 0; i < N; i++)
++	sa[i] = 2 * i;                  /* all even */
++      if (guarded ((unsigned *) sa, 0, z) != 0)
++	abort ();
++      (void) m1;
++    }
++  }
 +
 +  /* All entries even, so the guarded division never executes.  */
 +  for (unsigned i = 0; i < N; i++)
