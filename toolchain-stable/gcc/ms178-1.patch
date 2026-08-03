@@ -1,4 +1,6 @@
-From: ms178 toolchain patchset v11 (v10 + SSE/AVX/BMI2/scalar codegen audit)
+From: ms178 toolchain patchset v11 (v10 + SSE/AVX/BMI2/scalar codegen audit
+ + Mesa/RADV/ACO scalar-FP clamp fix
+ + ACO/NIR bit-field vectorization fix)
 Subject: [PATCH v11] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
  rebased onto bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5
 
@@ -682,6 +684,396 @@ Result: 56 sections.  Applies with ZERO fuzz, ZERO offsets, ZERO
 rejects on bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5 (patch -p1 -F0
 --dry-run and git apply --check both clean), and the resulting tree is
 byte-identical to the tree all of the above was measured on.
+
+=====================================================================
+v11 ADDITION #18 - scalar FP clamp: phiopt rejected the UNORDERED
+compare codes, so Mesa's CLAMP()/SATURATE() kept a branch
+=====================================================================
+
+FOUND BY
+
+Reading the user's own mesa-git patch first.  It replaces the plain-C
+float_to_ubyte()/float_to_ushort() in src/util/u_math.h with hand-written
+_mm_max_ss/_mm_min_ss intrinsics.  Someone only does that when the
+compiler is getting the C version wrong, so that was the thread to pull.
+
+SYMPTOM
+
+    /* src/util/macros.h:375, verbatim */
+    #define CLAMP(X, MIN, MAX) ((X)>(MIN) ? ((X)>(MAX) ? (MAX) : (X)) : (MIN))
+    #define SATURATE(X) CLAMP(X, 0.0f, 1.0f)
+
+    float hi (float x) { return x > 1.0f ? 1.0f : x; }
+
+  compiled with the user's Mesa flags (-O3 -march=native ...
+  -fno-math-errno -fno-trapping-math) gave
+
+        vucomiss .LC0(%rip), %xmm0
+        vmovd    %xmm0, %eax          <- float leaves the vector unit
+        cmova    .LC0(%rip), %eax     <- ... to use an integer cmov ...
+        vmovd    %eax, %xmm0          <- ... and comes back
+
+  instead of the two instructions the machine actually has:
+
+        vmovss   .LC0(%rip), %xmm1
+        vminss   %xmm0, %xmm1, %xmm0
+
+  Two extra cross-domain moves (each ~1-3 cycles of bypass delay on
+  Raptor Lake) on an idiom Mesa uses at 572 call sites in 150 files.
+
+ROOT CAUSE
+
+  tree-ssa-phiopt.cc, match_simplify_replacement, the "Non-IEEE FP
+  MIN/MAX PHI replacement" fallback.  When match.pd cannot produce a
+  MIN_EXPR/MAX_EXPR (it cannot here, because with NaNs honoured
+  `x > 1.0f ? 1.0f : x` is NOT IEEE fmin), this fallback still rebuilds
+  the PHI as a COND_EXPR so the backend can pick minss/maxss - which
+  implement exactly the non-IEEE "a < b ? b : a" semantics.
+
+  But it gated on
+
+      if (cmp != LT_EXPR && cmp != LE_EXPR
+          && cmp != GT_EXPR && cmp != GE_EXPR)
+        return false;
+
+  and a clamp written the other way round never has one of those codes.
+  Inverting an ordered FP compare while HONOR_NANS is true must yield
+  the *unordered* complement, so by the time phiopt sees it the IL says
+
+      if (x_2(D) u>= 0.0)  goto bb3; else goto bb4;
+      # _1 = PHI <0.0(3), x_2(D)(2)>
+
+  i.e. UNGE, which the gate rejects.  The branch therefore survived into
+  RTL, where if-conversion had no FP conditional-move to use and fell
+  back to bouncing the value through a GPR.  Confirmed from the
+  -fdump-tree-phiopt1-all dump:
+
+      phiopt match-simplify trying:
+          x_2(D) u>= 0.0 ? x_2(D) : 0.0     <- no match.pd rule
+      (and then the fallback declines because the code is UNGE)
+
+FIX
+
+  Accept the four unordered codes and normalise each to its ordered
+  complement with the two arms swapped:
+
+      UNGE -> LT (swap)    UNGT -> LE (swap)
+      UNLE -> GT (swap)    UNLT -> GE (swap)
+
+  That is an identity, not an approximation: the unordered predicates
+  are *defined* as the negations of the opposite ordered ones, for every
+  input including NaN.  After normalisation the expression is in exactly
+  the form the existing code already emits, so nothing downstream -
+  neither the min/max recognisers nor ix86_expand_sse_fp_minmax - has to
+  learn about the unordered spellings.
+
+  Note this only changes which *spelling* reaches expand.  It does not
+  relax any NaN or signed-zero rule: the surrounding
+  `if (!HONOR_NANS (type) && !HONOR_SIGNED_ZEROS (type)) return false;`
+  guard, and the requirement that the PHI arms be exactly the two
+  compare operands, are both untouched.
+
+WHY -fno-trapping-math MATTERS
+
+  The bug is only observable with -fno-trapping-math (which the user
+  has).  With trapping math the comparison cannot be speculated and a
+  branch survives for an unrelated reason, so the missing minss is
+  invisible.  The included regression test therefore passes
+  -fno-trapping-math explicitly; without it the test would pass
+  vacuously on the unfixed compiler.
+
+CORRECTNESS
+
+  * The four identities were model-checked exhaustively over a pool of
+    22 "interesting" floats (both zeros, both min subnormals, both min
+    normals, +-1, +-2, +-0.5, +-max, +-inf, two qNaNs with different
+    payloads, an sNaN): 1600 pair-wise comparisons of raw bit patterns,
+    0 mismatches.  Bit patterns rather than == so that -0.0 vs +0.0 and
+    NaN payloads are actually distinguished.
+  * A runtime harness checks 10 clamp/min/max spellings plus Mesa's real
+    CLAMP/SATURATE macros against volatile references over the same
+    pool, including all 22^3 = 10648 triples for the 3-argument clamp:
+    12738 checks, 0 mismatches, at -O0/-O1/-O2/-O3/-Os and at
+    -march=native and -march=x86-64.
+    (Under -ffast-math the harness reports mismatches, but the STOCK
+    r581 compiler reports the identical count on the identical harness -
+    that is -ffast-math legitimately assuming no NaNs, not a regression.
+    The user does not build Mesa with -ffast-math.)
+
+MEASURED - control is a v11 compiler with ONLY this hunk reverted
+
+  A second complete cc1 was built from the same tree with just this
+  change backed out, so every number below is attributable to it alone.
+
+  Mesa shapes, user's flags (-O3 -march=native -mtune=native
+  -fno-math-errno -fno-trapping-math -mprefer-vector-width=256
+  -funroll-loops -falign-functions=32):
+
+        file            insns          per-function highlights
+        mesareal.c    765 -> 702       clamp_color_range  56 -> 34  (-39%)
+                                       saturate_buf      199 -> 162  (-19%)
+                                       clamp_color        50 -> 48
+                                       vp_clamp            9 ->  7
+        mesaclamp.c   239 -> 199
+        mm.c           67 ->  60
+        codes.c        38 ->  30
+
+  In the vectorized clamp loop the improvement is structural, not just a
+  smaller count - a compare plus two masked blends collapses into one
+  masked min:
+
+        base:  vcmpps $10,...,%k2 ; vcmpps $14,...,%k1
+               vmovaps %xmm2,%xmm1{%k2} ; vmovaps %xmm1,%xmm0{%k1}
+        fix:   vcmpps $14,...,%k1 ; vminps %xmm2,%xmm1,%xmm0{%k1}
+
+  Wall clock, 4096-element saturate loop, 30000 iterations, data
+  deliberately straddling both clamp bounds so the baseline's branch is
+  unpredictable (best of 5, three independent runs):
+
+        baseline  0.076 ns/element
+        fixed     0.039 ns/element      1.95x faster, reproducible
+
+  Whole-Mesa scan (all files that build standalone in the sandbox, 176
+  of them, compared against the same control): 3 files change, all
+  improvements, net -115 instructions and -31 branches, 0 regressions.
+  The reach is understated by the sandbox - most of the 572
+  CLAMP/SATURATE call sites live in files that need a configured Mesa
+  build tree to compile.
+
+REGRESSION VALIDATION - same control
+
+  * gcc.c-torture/execute, -O3 -march=native, built and run:
+        1559 pass, 0 NEW failures (11 fail identically on the control).
+  * gcc.dg/torture, -O2 -march=native, built and run:
+        535 pass, 0 NEW failures (13 pre-existing).
+  * gcc.dg/vect, -O3 -march=native, built and run:
+        730 pass, 0 NEW failures (11 pre-existing).
+        -> 2824 executed tests, zero new failures.
+  * Compile sweeps vs the control:
+        gcc.dg/vect        1949 files: 0 ICEs, 0 differences
+        gcc.target/i386    2318 files: 0 ICEs, 0 differences
+        gcc.dg/torture     1147 files: 0 ICEs, 0 differences
+    i.e. the change is inert on 5414 testsuite files and only fires on
+    the idiom it targets.
+  * cc1/cc1plus rebuilt RC=0 with no new warnings.
+
+REGRESSION TEST
+
+  gcc/testsuite/gcc.target/i386/ms178-fp-clamp-1.c - verified to pass
+  with the fix and to FAIL on the control (control produces 1 vminss and
+  2 cmova where the test demands 2 vminss, 1 vminsd and no cmov), so it
+  has real discriminating power.
+
+AUDITED AND DELIBERATELY NOT CHANGED
+
+  * The user's hand-written _mm_max_ss/_mm_min_ss in float_to_ubyte()
+    and float_to_ushort() can now be dropped in favour of plain C, but
+    that is a Mesa-side change, not a GCC one.  Not touched here.
+  * src/amd/gmlib/gm/mat_funcs.c grows +124 instructions under the full
+    v11 patchset versus stock, which looked at first like a regression
+    caused by this hunk.  Instrumenting the new code path proved it
+    never fires in the function that grew (mat_get_hue_index_2pi), and
+    rebuilding with only this hunk reverted reproduced the growth
+    exactly - it is pre-existing v11 behaviour (that loop gets
+    vectorized), not this change.  Verified correct at runtime over
+    20000 randomized trials including NaN-containing arrays.
+  * Vector (VEC_COND_EXPR) clamps already had the unordered codes in
+    their match.pd table, but gated on VECTOR_INTEGER_TYPE_P.  Extending
+    that to float would duplicate what this phiopt path now achieves via
+    the vectorizer, with more risk.  Left alone.
+
+=====================================================================
+v11 ADDITION #19 - bit-field arithmetic blocked loop vectorization,
+which is exactly how ACO's and NIR's packed IR nodes are written
+=====================================================================
+
+FOUND BY
+
+Extracting ACO's real data structures and hot loops from
+src/amd/compiler/ and compiling them standalone with the user's Mesa
+flags, then diffing the vector-instruction count against the same loops
+written on a plain uint32_t array with explicit shifts and masks.  The
+"abstraction-free" control vectorized; the real ACO code did not.
+
+SYMPTOM
+
+  ACO packs its central IR value type into one word:
+
+      struct Temp {                        /* aco_ir.h */
+        uint32_t id_       : 24;
+        uint32_t reg_class : 8;
+      };
+
+  and RegClass::bytes()/size()/type()/is_linear() all do arithmetic on
+  the 8-bit field.  Loops over arrays of Temp - which is most of the
+  register allocator, the validator and the schedulers - came out fully
+  scalar:
+
+      unsigned total_size (const Temp *t, unsigned n)
+      { unsigned s = 0; for (...) s += t[i].size (); return s; }
+
+        v11 baseline :  90 insns,   0 vector instructions
+        with this fix:  99 insns,  99 vector instructions
+
+  The identical computation written as (t[i] >> 24) on a uint32_t array
+  vectorized perfectly on both compilers, which is what pointed at the
+  bit-field rather than at the arithmetic.
+
+ROOT CAUSE
+
+  if-conversion lowers a bit-field load into a load of the containing
+  word plus BIT_FIELD_REF <word, width, pos> (tree-if-conv.cc,
+  lower_bitfield).  The vectorizer has a pattern recogniser that turns
+  that BIT_FIELD_REF back into a shift-and-mask -
+  vect_recog_bitfield_ref_pattern - but it only triggers for two
+  consumers:
+
+      * a CONVERT of the BIT_FIELD_REF result, or
+      * a gcond comparing it against an INTEGER_CST.
+
+  Any other consumer leaves the BIT_FIELD_REF in the IL, and SLP build
+  then rejects it outright:
+
+      missed: Build SLP failed: BIT_FIELD_REF not supported
+      missed: step unknown.
+
+  (tree-vect-slp.cc:~1332 - that path only accepts a BIT_FIELD_REF whose
+  base is an SSA vector, not a scalar loaded from memory.)  The whole
+  loop then stays scalar.
+
+  The two consumers that matter in practice are exactly the ones that
+  were missing: BIT_AND_EXPR (every flag test: rc & 32) and a comparison
+  against a non-constant.  Minimal reproducer in plain C, no C++:
+
+      struct A { uint32_t x : 8; uint32_t y : 24; };
+      s += a[i].x;            /* CONVERT   -> vectorized  */
+      s += a[i].x + 1u;       /* PLUS      -> vectorized  */
+      s += a[i].x & 32;       /* BIT_AND   -> SCALAR      */
+      s += a[i].x > 3;        /* compare   -> SCALAR      */
+
+FIX
+
+  Let the recogniser match the BIT_FIELD_REF assignment on its own, not
+  only a CONVERT or gcond wrapping it.  Everything else in the function
+  is reused unchanged: it already knows how to emit the shift, the mask,
+  the sign-extension variant for signed fields, and how to pick
+  mask-then-shift versus shift-then-mask for the widening cases.  A
+  BIT_FIELD_REF of an integral container *is* a shift and a mask, so
+  lowering it unconditionally costs nothing when the loop does not
+  vectorize and unblocks it when it does.
+
+  Three lines of matching, no new code paths.
+
+MEASURED - control is a v11 compiler with ONLY this hunk reverted
+
+  A second complete cc1/cc1plus was built from the same tree with the
+  change backed out, so every number is attributable to it alone.
+
+  Real ACO, compiled with the user's Mesa flags (-O3 -march=native
+  -mtune=native -fno-semantic-interposition -falign-functions=32
+  -fno-math-errno -fno-trapping-math -funroll-loops
+  -mprefer-vector-width=256 -fivopts -fomit-frame-pointer
+  -malign-data=cacheline -fno-plt -fvisibility=hidden), against the real
+  generated aco_opcodes.h/aco_builder.h:
+
+      file                              insns          vector insns
+      aco_register_allocation.cpp   56748 / 56538      1428 / 1326
+      aco_validate.cpp              17947 / 17618       546 /  491
+      aco_lower_branches.cpp         9722 /  9432       784 /  652
+      aco_scheduler_ilp.cpp          5133 /  5127        64 /   64
+
+  aco_register_allocation.cpp gains one newly vectorized loop at
+  line 2199 - the `for (Definition& def : instr->definitions)
+  ... def.getTemp().regClass().is_linear()` scan, which runs for every
+  instruction the allocator touches.
+
+  Wall clock on the extracted ACO loops (2048 Temps, 200000 iterations,
+  best of 5, two independent runs, both agreeing to <1%):
+
+      loop            baseline      fixed        speedup
+      size()          0.689 ns/e    0.180 ns/e    3.8x
+      type()          0.310 ns/e    0.155 ns/e    2.0x
+      is_linear()     0.317 ns/e    0.154 ns/e    2.1x
+
+  Scope beyond ACO: 780 bit-field declarations in the AMD and NIR
+  headers alone (ac_surface.h, ac_gpu_info.h, ac_shader_util.h,
+  nir.h's nir_variable_data flags, ...).
+
+CORRECTNESS
+
+  * Runtime harness over four bit-field layouts - unsigned 8/16/8, ACO's
+    exact 24/8, SIGNED 5/11/16 (so sign-extension is actually exercised)
+    and four 1-bit flags - times 15 different loop bodies (AND, compare,
+    multiply-by-field-dependent-constant, the full RegClass::size()
+    expression, ...) times 18 array lengths chosen to hit the vector
+    body, every epilogue remainder and the zero-trip case:
+        108000 checks, 0 mismatches, at -O0/-O1/-O2/-O3/-Os, at
+        -march=native / x86-64 / x86-64-v2 and with
+        -mprefer-vector-width=512.
+  * The same for the real ACO Temp/RegClass accessors:
+        47500 checks, 0 mismatches, across the same option matrix.
+  * All 16 existing gcc.dg/vect/vect-bitfield-*.c tests build and run
+    clean, including the two "-not" tests that assert lowering must NOT
+    happen - both behave identically to the control.
+
+REGRESSION VALIDATION - same control
+
+  * gcc.c-torture/execute, -O3 -march=native, built and run:
+        1559 pass, 0 NEW failures (11 fail identically on the control).
+  * gcc.dg/vect, -O3 -march=native, built and run:
+        1167 pass, 0 NEW failures (11 pre-existing).
+  * Compile sweeps vs the control:
+        gcc.dg/vect      1949 files: 0 ICEs, 1 file differs
+                         (vect-bitfield-read-3, which now vectorizes one
+                          more loop and still passes at runtime)
+        gcc.target/i386  2019 files: 0 ICEs, 3 files differ by <=1 insn
+                         (avx-vpcmpestrm-1/-2, avx-vpcmpistrm-1; both
+                          executables verified to still run correctly)
+        Mesa standalone   204 files: 0 ICEs, 1 file differs
+        Mesa amd+nir       48 files: 0 ICEs, 4 files differ, all gains
+  * cc1 and cc1plus rebuilt RC=0 with no new warnings.
+
+REGRESSION TEST
+
+  gcc/testsuite/gcc.dg/vect/ms178-vect-bitfield-op-1.c - checks both the
+  BIT_AND and the compare form, verifies the results against a scalar
+  reference at runtime, and requires "vectorized 1 loops" twice.
+  Verified to report 2 with the fix and 0 on the control.
+
+MESA-SIDE FINDINGS (no change recommended)
+
+  * The hand-written _mm_max_ss/_mm_min_ss in src/util/u_math.h
+    (float_to_ubyte, float_to_ushort) were re-examined now that v11
+    fixes the scalar clamp.  They should be KEPT: in the bulk conversion
+    loop, which is what matters, the intrinsics version is 73
+    instructions against 327 for the best plain-C formulation, because
+    the intrinsics let GCC keep everything in the vector unit while the
+    C version round-trips through the integer domain for the
+    float->uint8 narrowing.  Replacing them would be a regression.
+  * Rewriting those intrinsics with _mm_set1_ps instead of _mm_set_ss to
+    dodge a redundant vinsertps was tried and is WORSE (11 insns vs 8
+    scalar, identical 73 in the loop) - vbroadcastss is not free either.
+    Not recommended.
+  * GCC does emit a redundant "vinsertps $0xe" per _mm_set_ss operand
+    feeding a scalar SSE op whose result is read only at lane 0 (the
+    zero-filled upper lanes are provably dead - verified on hardware by
+    feeding garbage upper lanes through max/min/add/sub/mul/div/sqrt_ss:
+    1008 comparisons, 0 divergences).  Fixing it needs a new
+    simplify-rtx VEC_MERGE rule; it is understood and reproducible but
+    was NOT attempted here rather than ship a rushed RTL change.
+    Documented for a future revision.
+  * ACO's `count_zero`/`count_zero_or_blocked` over PhysRegInterval still
+    do not vectorize, for a *different* reason than the bit-field one:
+    the range-for iterator produces an `i != end` exit test on an
+    induction variable that is stepped by 4 and then shifted right by 2
+    to index regs[].  GCC's SCEV handles LSHIFT_EXPR but has no
+    RSHIFT_EXPR case, so the index is not recognised as affine.  The
+    transform is only valid when the step is a multiple of 2^S and
+    nothing wraps - brute-forced over 1294932 combinations, 0 violations
+    for the multiple-of-2^S case, and the wrap counter-examples were
+    found and confirmed.  This is a genuine missed optimisation with a
+    known-correct guard, but implementing SCEV support is a larger
+    change than fits this revision; NOT attempted, documented instead.
 
 diff --git a/Makefile.def b/Makefile.def
 index cde69c9c9..497ca1435 100644
@@ -5114,6 +5506,106 @@ index 000000000..5e2e58193
 +/* { dg-final { scan-tree-dump-times {\(unsigned char\) c_[0-9]+\(D\)} 3 "optimized" } } */
 +/* { dg-final { scan-tree-dump-times {MEM[^;\n\r]*= _[0-9]+;} 3 "optimized" } } */
 +/* { dg-final { scan-tree-dump-times {MEM[^;\n\r]*= 7;} 1 "optimized" } } */
+diff --git a/gcc/testsuite/gcc.dg/vect/ms178-vect-bitfield-op-1.c b/gcc/testsuite/gcc.dg/vect/ms178-vect-bitfield-op-1.c
+new file mode 100644
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/vect/ms178-vect-bitfield-op-1.c
+@@ -0,0 +1,59 @@
++/* A loop that does arithmetic on a bit-field must vectorize.
++
++   vect_recog_bitfield_ref_pattern only fired when the BIT_FIELD_REF fed a
++   CONVERT or a gcond.  Any other consumer left the BIT_FIELD_REF in the
++   IL, and SLP build then rejects it ("BIT_FIELD_REF not supported"),
++   leaving the whole loop scalar.
++
++   This is the shape Mesa's bit-packed IR nodes produce (ACO's
++   Temp { id:24; reg_class:8 }, nir_instr's flag bit-fields).  */
++/* { dg-require-effective-target vect_int } */
++/* { dg-additional-options "-fdump-tree-vect-details" } */
++
++#include <stdarg.h>
++#include "tree-vect.h"
++
++struct s { unsigned rc : 8; unsigned id : 24; };
++
++#define N 64
++struct s a[N];
++
++__attribute__((noipa)) unsigned
++f_and (struct s *p, unsigned n)
++{
++  unsigned s = 0;
++  for (unsigned i = 0; i < n; i++)
++    s += p[i].rc & 32;
++  return s;
++}
++
++__attribute__((noipa)) unsigned
++f_cmp (struct s *p, unsigned n)
++{
++  unsigned s = 0;
++  for (unsigned i = 0; i < n; i++)
++    s += p[i].rc > 3;
++  return s;
++}
++
++int main (void)
++{
++  check_vect ();
++
++  unsigned ref_and = 0, ref_cmp = 0;
++  for (unsigned i = 0; i < N; i++)
++    {
++      a[i].rc = (i * 7) & 0xff;
++      a[i].id = i;
++      ref_and += a[i].rc & 32;
++      ref_cmp += a[i].rc > 3;
++    }
++
++  if (f_and (a, N) != ref_and)
++    abort ();
++  if (f_cmp (a, N) != ref_cmp)
++    abort ();
++  return 0;
++}
++
++/* { dg-final { scan-tree-dump-times "vectorized 1 loops" 2 "vect" } } */
+diff --git a/gcc/testsuite/gcc.target/i386/ms178-fp-clamp-1.c b/gcc/testsuite/gcc.target/i386/ms178-fp-clamp-1.c
+new file mode 100644
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/i386/ms178-fp-clamp-1.c
+@@ -0,0 +1,31 @@
++/* A scalar float clamp written with the comparison the "other way round"
++   must still select minss/maxss.
++
++   Inverting an ordered FP compare while NaNs are honoured has to produce
++   the UNORDERED complement (x < c  =>  x UNGE c).  phiopt's non-IEEE
++   MIN/MAX fallback only accepted the four ordered codes, so the inverted
++   spelling kept a real branch in the IL and RTL if-conversion then turned
++   it into a GPR round-trip: vucomiss + vmovd + cmova + vmovd.
++
++   -fno-trapping-math is what exposes it: with trapping math the compare
++   cannot be speculated and a branch survives for other reasons, so this
++   test would pass vacuously without it.
++
++   This is Mesa's CLAMP()/SATURATE() shape.  */
++/* { dg-do compile } */
++/* { dg-options "-O2 -mavx -mfpmath=sse -fno-trapping-math -fno-math-errno" } */
++
++#define CLAMP(X, MIN, MAX)  ((X) > (MIN) ? ((X) > (MAX) ? (MAX) : (X)) : (MIN))
++
++float  hi_con  (float x)          { return x > 1.0f ? 1.0f : x; }
++float  hi_reg  (float x, float b) { return x > b ? b : x; }
++float  lo_reg  (float x, float b) { return x < b ? b : x; }
++double hi_cond (double x)         { return x > 1.0 ? 1.0 : x; }
++
++/* Every one of these is a single min/max; none may fall back to moving the
++   value through a general register to use cmov.  */
++/* { dg-final { scan-assembler-times "vminss" 2 } } */
++/* { dg-final { scan-assembler-times "vmaxss" 1 } } */
++/* { dg-final { scan-assembler-times "vminsd" 1 } } */
++/* { dg-final { scan-assembler-not "cmova" } } */
++/* { dg-final { scan-assembler-not "cmovb" } } */
 diff --git a/gcc/testsuite/gcc.target/i386/ms178-mulx-highpart-1.c b/gcc/testsuite/gcc.target/i386/ms178-mulx-highpart-1.c
 new file mode 100644
 --- /dev/null
@@ -5980,6 +6472,57 @@ index cd3fd2fc8..393878ecf 100644
  
    for (gphi_iterator psi_next, psi = gsi_start_phis (bb); !gsi_end_p (psi);
         psi = psi_next)
+diff --git a/gcc/tree-ssa-phiopt.cc b/gcc/tree-ssa-phiopt.cc
+--- a/gcc/tree-ssa-phiopt.cc
++++ b/gcc/tree-ssa-phiopt.cc
+@@ -1070,9 +1070,44 @@
+       if (stmt_to_move || stmt_to_move_alt)
+ 	return false;
+       tree_code cmp = gimple_cond_code (stmt);
+-      if (cmp != LT_EXPR && cmp != LE_EXPR
+-	  && cmp != GT_EXPR && cmp != GE_EXPR)
+-	return false;
++      /* ms178: also accept the four UNORDERED codes.  A source-level
++	 clamp written the "wrong" way round, e.g.
++
++	     x < 0.0f ? 0.0f : x        (Mesa's CLAMP/SATURATE macros)
++
++	 reaches phiopt with the comparison already inverted into
++	 x UNGE 0.0, because inverting an ordered FP compare under
++	 HONOR_NANS must produce the unordered complement.  Rejecting
++	 those codes here left a real branch in the IL, and RTL
++	 if-conversion then produced a GPR cmov round-trip
++	 (vmovd/cmova/vmovd) instead of a single minss/maxss.
++
++	 The unordered predicates are by definition the negations of the
++	 opposite ordered ones,
++
++	     a UNGE b  ==  !(a <  b)      a UNGT b  ==  !(a <= b)
++	     a UNLE b  ==  !(a >  b)      a UNLT b  ==  !(a >= b)
++
++	 for every input including NaN, so `a UNxx b ? T : F` is
++	 bit-identical to `a OPPOSITE b ? F : T`.  Normalise to the
++	 ordered code with the arms swapped: that is the form the
++	 min/max recognisers downstream (and ix86_expand_sse_fp_minmax)
++	 already understand, so nothing else has to learn about the
++	 unordered spellings.  */
++      bool swap_arms = false;
++      switch (cmp)
++	{
++	case LT_EXPR: case LE_EXPR: case GT_EXPR: case GE_EXPR:
++	  break;
++	case UNGE_EXPR: cmp = LT_EXPR; swap_arms = true; break;
++	case UNGT_EXPR: cmp = LE_EXPR; swap_arms = true; break;
++	case UNLE_EXPR: cmp = GT_EXPR; swap_arms = true; break;
++	case UNLT_EXPR: cmp = GE_EXPR; swap_arms = true; break;
++	default:
++	  return false;
++	}
++      if (swap_arms)
++	std::swap (arg_true, arg_false);
+       tree lhs = gimple_cond_lhs (stmt);
+       tree rhs = gimple_cond_rhs (stmt);
+       /* `lhs CMP rhs ? lhs : rhs` or `lhs CMP rhs ? rhs : lhs`
 diff --git a/gcc/tree-ssa-reassoc.cc b/gcc/tree-ssa-reassoc.cc
 index e8c2779c3..04a7f375f 100644
 --- a/gcc/tree-ssa-reassoc.cc
@@ -6097,6 +6640,43 @@ index f25d207b3..fa799ffc0 100644
    for (unsigned int i = 0; i < nunits; i++)
      {
        tree cst = VECTOR_CST_ELT (op1, i);
+diff --git a/gcc/tree-vect-patterns.cc b/gcc/tree-vect-patterns.cc
+--- a/gcc/tree-vect-patterns.cc
++++ b/gcc/tree-vect-patterns.cc
+@@ -2676,6 +2676,33 @@
+       lhs = gimple_assign_lhs (stmt);
+       ret_type = TREE_TYPE (lhs);
+     }
++  /* ms178: also match the BIT_FIELD_REF assignment on its own.
++     Previously this recogniser only fired when the bitfield feeds a
++     CONVERT or a gcond.  Any other consumer -- BIT_AND_EXPR and a
++     comparison against a non-constant being the common ones -- left the
++     BIT_FIELD_REF in the IL, where SLP build rejects it outright
++     ("BIT_FIELD_REF not supported", because the base is a loaded scalar
++     rather than an SSA vector) and the whole loop stayed scalar.
++
++     A BIT_FIELD_REF of an integral container is just a shift and a mask,
++     which is exactly what the body of this function already emits, so
++     lowering it unconditionally costs nothing and lets the loop
++     vectorize.  Concretely this is the shape that Mesa's bit-packed IR
++     nodes produce (ACO's Temp id_:24/reg_class:8, nir_instr's flag
++     bitfields, ac_surface descriptors -- 780 bitfield declarations in
++     the AMD/NIR headers alone):
++
++	 s += t[i].rc & 32;        <- BIT_AND of a bitfield
++	 s += t[i].rc > 3;         <- compare of a bitfield
++
++     both of which were scalar before and vectorize after.  */
++  else if (is_gimple_assign (stmt)
++	   && gimple_assign_rhs_code (stmt) == BIT_FIELD_REF)
++    {
++      bf_stmt = as_a <gassign *> (stmt);
++      lhs = gimple_assign_lhs (stmt);
++      ret_type = TREE_TYPE (lhs);
++    }
+ 
+   if (!bf_stmt
+       || gimple_assign_rhs_code (bf_stmt) != BIT_FIELD_REF)
 diff --git a/libgomp/config/linux/wait.h b/libgomp/config/linux/wait.h
 index f9141408c..cb0cec6f3 100644
 --- a/libgomp/config/linux/wait.h
