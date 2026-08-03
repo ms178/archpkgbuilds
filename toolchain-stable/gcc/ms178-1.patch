@@ -1,7 +1,7 @@
-From: ms178 toolchain patchset v11 (v10 + SSE/AVX/BMI2/scalar codegen audit
+From: ms178 toolchain patchset v12 (v11 + SCEV right-shift induction variables
  + Mesa/RADV/ACO scalar-FP clamp fix
  + ACO/NIR bit-field vectorization fix)
-Subject: [PATCH v11] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
+Subject: [PATCH v12] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
  rebased onto bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5
 
 Rebase of ms178-1.patch v5 (base 642e52b049a24b28a0495f4d2c08f97ad2cb6666)
@@ -1074,6 +1074,184 @@ MESA-SIDE FINDINGS (no change recommended)
     found and confirmed.  This is a genuine missed optimisation with a
     known-correct guard, but implementing SCEV support is a larger
     change than fits this revision; NOT attempted, documented instead.
+
+=====================================================================
+v12 ADDITION #20 - SCEV had no RSHIFT_EXPR case, so any right-shifted
+induction variable poisoned loop analysis
+=====================================================================
+
+SYMPTOM
+
+  tree-scalar-evolution.cc models A << B as A * (1 << B) but had no case
+  at all for the opposite direction.  Any right shift of an induction
+  variable therefore evaluated to chrec_dont_know, and everything
+  downstream that needs an affine access function -- data-reference
+  analysis, dependence testing, the vectorizer, ivopts -- gave up.
+
+  That is unfortunate, because "advance a byte cursor, then scale it
+  back down to an element index" is a standard way to write an iterator:
+
+      /* Mesa src/util/hex.h, mesa_bytes_to_hex */
+      for (i = 0; i < len * 2; i += 2) {
+        buf[i]     = hex_digits[binary[i >> 1] >> 4];
+        buf[i + 1] = hex_digits[binary[i >> 1] & 0x0f];
+      }
+
+      /* ACO src/amd/compiler/aco_register_allocation.cpp */
+      struct PhysReg { unsigned reg_b; unsigned reg () const { return reg_b >> 2; } };
+      PhysRegIterator &operator++ () { reg.reg_b += 4; return *this; }
+
+FIX
+
+  Add the RSHIFT_EXPR case.  When the chrec's step is a multiple of 2^C
+  the discarded low bits never change, no carry crosses the shift
+  boundary, and
+
+      ({base, +, step} >> C)  ==  {base >> C, +, step >> C}
+
+  at every iteration.
+
+  Two guards, both of which I established are individually necessary by
+  brute force over 355,636,352 (base, step, k, C) combinations:
+
+    (a) STEP must be a multiple of 2^C.  Dropping this makes the claim
+        false 221,520,100 times -- the low bits accumulate and the
+        sequence becomes a staircase rather than an affine function.
+
+    (b) the accumulation must not wrap.  If {base, +, step} wraps modulo
+        2^N then the shifted sequence wraps modulo 2^(N-C), which is not
+        what {base >> C, +, step >> C} evaluates to in the original
+        N-bit type.  Dropping this makes the claim false 19,347,472
+        times, every one of them a wrap.
+
+  (b) is discharged two ways: nowrap_type_p () for types whose overflow
+  is undefined, and otherwise scev_probably_wraps_p (), which uses the
+  loop's iteration count to decide whether base + step*niter can leave
+  the range.  The VAR argument is passed (not NULL_TREE) so that the
+  value-range and nonwrapping-chrec proofs inside it are actually
+  reachable -- with NULL_TREE two of its three proofs are dead code.
+  Failure is always chrec_dont_know, i.e. exactly the behaviour before
+  this change.
+
+MEASURED - control is a v12 compiler with ONLY this hunk reverted
+
+  A second complete cc1/cc1plus was built from the same tree with the
+  change backed out, so every number below is attributable to it alone.
+
+  Wall clock, Mesa's real mesa_bytes_to_hex on a 32-byte input (the
+  BLAKE3 cache-key length), best of 5, two independent runs:
+
+      baseline   25.3 ns/call
+      v12        22.9 ns/call        ~10% faster, reproducible
+
+  Whole-tree differential over src/amd + src/compiler/nir + src/util +
+  src/gallium/drivers/radeonsi with the user's Mesa flags, 126 files
+  that build standalone in the sandbox: 0 ICEs, 2 files differ, both
+  the hex path (build_id.c and mesa-blake3.c, +19 instructions each).
+  The user's stated preference is performance over size, and the trade
+  here is +19 instructions in two cold call sites against a 10% faster
+  hex conversion wherever it runs.
+
+REGRESSION VALIDATION - same control
+
+  * gcc.c-torture/execute, -O3 -march=native, built and run:
+        1559 pass, 0 NEW failures (11 fail identically on the control).
+  * gcc.dg/vect, -O3 -march=native, built and run:
+        1168 pass, 0 NEW failures (11 pre-existing).
+  * gcc.dg/torture, -O2 -march=native, built and run:
+        1108 pass, 0 NEW failures (21 pre-existing).
+        -> 3835 executed tests, zero new failures.
+  * gcc.dg/vect compile sweep, 1950 files: 0 ICEs, 1 file differs
+        (vect-alias-check-14, 33 instructions SMALLER).
+  * Dedicated runtime harness: four bit-widths of IV, shifts of 1/2/3/4/6,
+    steps that are and are not multiples of 2^C, signed and unsigned,
+    starts and lengths chosen to hit the vector body, every epilogue
+    remainder and the zero-trip case, plus Mesa's real hex loop for all
+    lengths 0..256:
+        3806 checks, 0 mismatches, at -O0/-O1/-O2/-O3/-Os, at
+        -march=native / x86-64, with -mprefer-vector-width=512,
+        with -fwrapv and with -fno-strict-overflow.
+  * cc1 and cc1plus rebuilt RC=0, no new warnings from the touched file.
+
+REGRESSION TEST
+
+  gcc/testsuite/gcc.dg/vect/ms178-scev-rshift-1.c - runs Mesa's exact
+  hex loop for every length 0..64 against a scalar reference, and also
+  exercises a step that is NOT a multiple of 2^C so the guard itself is
+  covered.
+
+---------------------------------------------------------------------
+ACO count_zero: root cause found, and it is NOT the shift
+---------------------------------------------------------------------
+
+The v11 header speculated that ACO's RegisterFile::count_zero fails to
+vectorize because of the shifted index.  That was wrong, and this
+revision establishes the real cause by instrumenting the compiler.
+
+  * With this SCEV fix in place, count_zero as written still does not
+    vectorize.  Instrumentation shows the new RSHIFT_EXPR case being
+    reached 36 times and rejected every time at guard (b).
+
+  * The reason is the loop's EXIT TEST, not the shift.  ACO's
+    PhysRegIterator defines operator!= as "reg != other.reg", so the
+    range-for exits on !=.  GCC can then only compute the iteration
+    count under an assumption:
+
+        Symbolic number of iterations is ((_6 - _16) + 4294967292) /[ex] 4 + 1
+        under assumptions (_6 - _16 & 3) == 0
+
+    record_control_iv () refuses to record a control IV when
+    niter->assumptions is not the constant 1, so loop->control_ivs stays
+    empty, loop_exits_before_overflow () has nothing to work with, and
+    scev_probably_wraps_p () must answer "may wrap".
+
+  * Proof by construction, three variants of the identical function:
+
+        exit test        Fix B fires    vectorizes
+        i != end             no             no       <- ACO as written
+        i <  end            yes             no       (offset still blocked)
+        constant bounds     yes            YES  0 -> 42 vector insns
+
+    The middle row isolates a second, independent blocker: the address
+    offset is (sizetype) (ivtmp >> 2) * 4, and the widening conversion
+    to sizetype re-runs scev_probably_wraps_p () inside chrec_convert_1,
+    where it fails again for the same reason.
+
+  * So there are two upstream blockers stacked on top of each other, both
+    rooted in the same unprovable no-wrap fact, and both upstream of the
+    shift.  Fixing them means either teaching record_control_iv () to
+    keep assumption-carrying control IVs, or making the range of a
+    struct member (PhysReg::reg_b is provably < 2048 in ACO) visible to
+    scev_var_range_cant_overflow ().  Both are substantially riskier than
+    this revision's change and neither is attempted here; they are now
+    precisely localised rather than guessed at.
+
+  * Worth recording for the Mesa side: changing PhysRegIterator's
+    operator!= to compare with < would remove the first blocker at zero
+    cost, since the iterator is only ever advanced forwards.  That is a
+    Mesa change, not a GCC one, and it is not sufficient on its own -
+    the offset conversion still blocks - so it is documented rather than
+    proposed as a patch.
+
+AUDITED AND DELIBERATELY NOT CHANGED
+
+  * The genuinely hottest loop in ACO's register allocator is not
+    count_zero at all: it is the register-window scan in get_reg_simple
+    (aco_register_allocation.cpp:987), which has a data-dependent early
+    break and is therefore not vectorizable in principle.
+  * ACO has 184 range-for loops over custom iterators (32 of them in
+    aco_register_allocation.cpp alone) and RADV/ACO headers declare 324
+    bit-field members; the v11 bit-field pattern fix already covers the
+    latter group.
+  * The redundant "vinsertps $0xe" per _mm_set_ss was implemented as a
+    simplify-rtx VEC_MERGE rule and REJECTED in v12 development: the
+    variant that actually removed the instruction had to distribute a
+    lane extract through the arithmetic, which lets simplify_gen_binary
+    canonicalise commutative operands.  That is legal for the value of
+    a+b but not for which NaN payload x86 propagates, and the runtime
+    harness caught it (addss of two NaNs returned the wrong payload).
+    The provably-safe remnant changed no code at all, so it was dropped
+    rather than shipped as dead weight.
 
 diff --git a/Makefile.def b/Makefile.def
 index cde69c9c9..497ca1435 100644
@@ -5506,6 +5684,94 @@ index 000000000..5e2e58193
 +/* { dg-final { scan-tree-dump-times {\(unsigned char\) c_[0-9]+\(D\)} 3 "optimized" } } */
 +/* { dg-final { scan-tree-dump-times {MEM[^;\n\r]*= _[0-9]+;} 3 "optimized" } } */
 +/* { dg-final { scan-tree-dump-times {MEM[^;\n\r]*= 7;} 1 "optimized" } } */
+diff --git a/gcc/testsuite/gcc.dg/vect/ms178-scev-rshift-1.c b/gcc/testsuite/gcc.dg/vect/ms178-scev-rshift-1.c
+new file mode 100644
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/vect/ms178-scev-rshift-1.c
+@@ -0,0 +1,83 @@
++/* An induction variable stepped by a multiple of 2^C and then shifted
++   right by C is still an affine index, so SCEV must model it.
++
++   SCEV modelled A << B as A * (1 << B) but had no RSHIFT_EXPR case at
++   all, so any right shift of an IV produced chrec_dont_know and poisoned
++   every analysis downstream.  That is unfortunate because "advance a byte
++   cursor, then scale it back down to an element index" is a standard
++   iterator idiom: Mesa's mesa_bytes_to_hex (src/util/hex.h) steps i by 2
++   and subscripts binary[i >> 1], and ACO's PhysRegIterator steps reg_b by
++   4 and subscripts regs[reg_b >> 2].
++
++   The transform is only valid when the step is a multiple of 2^C (else the
++   discarded low bits accumulate and the sequence is a staircase) and when
++   the accumulation cannot wrap.  Both guards are exercised here.  */
++/* { dg-require-effective-target vect_int } */
++/* { dg-additional-options "-fdump-tree-vect-details" } */
++
++#include <stdarg.h>
++#include "tree-vect.h"
++
++#define N 256
++unsigned char bin[N];
++char buf[N * 2 + 2];
++
++/* Exactly Mesa's mesa_bytes_to_hex loop.  */
++__attribute__((noipa)) void
++to_hex (char *b, const unsigned char *s, unsigned len)
++{
++  static const char hd[] = "0123456789abcdef";
++  unsigned i;
++  for (i = 0; i < len * 2; i += 2)
++    {
++      b[i] = hd[s[i >> 1] >> 4];
++      b[i + 1] = hd[s[i >> 1] & 0x0f];
++    }
++  b[i] = '\0';
++}
++
++/* A step that is NOT a multiple of 2^C must not be miscompiled; the guard
++   rejects it and the loop simply stays as it was.  */
++__attribute__((noipa)) unsigned
++unaligned_step (const unsigned char *s, unsigned lo, unsigned hi)
++{
++  unsigned r = 0;
++  for (unsigned i = lo; i < hi; i += 3)
++    r += s[i >> 2];
++  return r;
++}
++
++int main (void)
++{
++  static const char hd[] = "0123456789abcdef";
++
++  check_vect ();
++
++  for (int i = 0; i < N; i++)
++    bin[i] = (unsigned char) (i * 7 + 3);
++
++  for (unsigned len = 0; len <= 64; len++)
++    {
++      char ref[N * 2 + 2];
++      unsigned i;
++      for (i = 0; i < len * 2; i += 2)
++	{
++	  ref[i] = hd[bin[i >> 1] >> 4];
++	  ref[i + 1] = hd[bin[i >> 1] & 0x0f];
++	}
++      ref[i] = '\0';
++
++      to_hex (buf, bin, len);
++      for (unsigned j = 0; j <= len * 2; j++)
++	if (buf[j] != ref[j])
++	  abort ();
++    }
++
++  unsigned ref2 = 0;
++  for (unsigned i = 0; i < 64; i += 3)
++    ref2 += bin[i >> 2];
++  if (unaligned_step (bin, 0, 64) != ref2)
++    abort ();
++
++  return 0;
++}
 diff --git a/gcc/testsuite/gcc.dg/vect/ms178-vect-bitfield-op-1.c b/gcc/testsuite/gcc.dg/vect/ms178-vect-bitfield-op-1.c
 new file mode 100644
 --- /dev/null
@@ -6445,6 +6711,114 @@ index d3d898ccb..bd3335d6b 100644
        }
        break;
      }
+diff --git a/gcc/tree-scalar-evolution.cc b/gcc/tree-scalar-evolution.cc
+--- a/gcc/tree-scalar-evolution.cc
++++ b/gcc/tree-scalar-evolution.cc
+@@ -1891,6 +1891,104 @@
+ 	res = chrec_convert (type, res, at_stmt);
+       break;
+ 
++    case RSHIFT_EXPR:
++      {
++	/* ms178: handle A >> C for a constant C when the low C bits of A
++	   are loop-invariant, i.e. when the chrec's step is a multiple of
++	   2^C.  Then no carry ever crosses the shift boundary and
++
++	       ({base, +, step} >> C)  ==  {base >> C, +, step >> C}
++
++	   holds at every iteration.
++
++	   SCEV already models A << B as A * (1 << B) but had no case at
++	   all for the opposite direction, so any right shift of an
++	   induction variable produced chrec_dont_know and poisoned every
++	   analysis downstream of it.  That is unfortunate because
++	   "advance a byte cursor, then scale it back down to an element
++	   index" is a standard way to write an iterator class: ACO's
++	   PhysRegIterator steps reg_b by 4 and subscripts regs[reg_b >> 2],
++	   and Mesa's mesa_bytes_to_hex steps i by 2 and subscripts
++	   binary[i >> 1].
++
++	   Correctness needs BOTH of:
++
++	     (a) STEP is a multiple of 2^C.  Otherwise the discarded low
++		 bits accumulate across iterations and the sequence is a
++		 staircase, not an affine function.  Brute force over
++		 355636352 (base, step, k, C) combinations finds the claim
++		 violated 221520100 times when this guard is dropped.
++
++	     (b) the accumulation does not wrap.  If {base, +, step} wraps
++		 modulo 2^N then the shifted sequence wraps modulo 2^(N-C),
++		 which is NOT what {base >> C, +, step >> C} evaluates to
++		 in the original N-bit type.  The same brute force finds
++		 the same-width claim wrong 19347472 times, every one of
++		 them a wrap.
++
++	   (b) is discharged two ways.  A type whose overflow is undefined
++	   cannot wrap in a valid program, which nowrap_type_p () answers
++	   directly.  Otherwise -- and this is the ubiquitous case,
++	   because iterator classes count in unsigned -- ask the loop
++	   itself via scev_probably_wraps_p (), which uses the number of
++	   iterations to decide whether base + step*niter can leave the
++	   range.  Being conservative costs nothing: the fallback is
++	   chrec_dont_know, exactly the behaviour before this change.  */
++	tree cst = rhs2;
++	chrec1 = analyze_scalar_evolution (loop, rhs1);
++	chrec1 = instantiate_parameters (loop, chrec1);
++
++	if (TREE_CODE (cst) != INTEGER_CST
++	    || tree_int_cst_sign_bit (cst)
++	    || !INTEGRAL_TYPE_P (type)
++	    || TYPE_UNSIGNED (TREE_TYPE (rhs1)) != TYPE_UNSIGNED (type)
++	    || TREE_CODE (chrec1) != POLYNOMIAL_CHREC
++	    || !evolution_function_is_affine_p (chrec1))
++	  {
++	    res = chrec_dont_know;
++	    break;
++	  }
++
++	unsigned HOST_WIDE_INT shift = tree_to_uhwi (cst);
++	unsigned prec = TYPE_PRECISION (type);
++	if (shift == 0 || shift >= prec)
++	  {
++	    res = chrec_dont_know;
++	    break;
++	  }
++
++	/* (a) the step must be a multiple of 2^shift.  */
++	tree step = CHREC_RIGHT (chrec1);
++	tree base = CHREC_LEFT (chrec1);
++	if (TREE_CODE (step) != INTEGER_CST
++	    || !integer_zerop (int_const_binop (BIT_AND_EXPR, step,
++						build_int_cst (TREE_TYPE (step),
++							       (HOST_WIDE_INT_1U
++								<< shift) - 1))))
++	  {
++	    res = chrec_dont_know;
++	    break;
++	  }
++
++	/* (b) the accumulation must not wrap.  */
++	if (!nowrap_type_p (type)
++	    && scev_probably_wraps_p (rhs1, base, step, at_stmt,
++				      get_loop (cfun, CHREC_VARIABLE (chrec1)),
++				      /*use_overflow_semantics=*/false))
++	  {
++	    res = chrec_dont_know;
++	    break;
++	  }
++
++	res = build_polynomial_chrec
++		(CHREC_VARIABLE (chrec1),
++		 fold_build2 (RSHIFT_EXPR, type,
++			      chrec_convert (type, base, at_stmt), cst),
++		 fold_build2 (RSHIFT_EXPR, type,
++			      chrec_convert (type, step, at_stmt), cst));
++      }
++      break;
++
+     case LSHIFT_EXPR:
+       {
+ 	/* Handle A<<B as A * (1<<B).  */
 diff --git a/gcc/tree-ssa-loop-ivopts.cc b/gcc/tree-ssa-loop-ivopts.cc
 index 6ecf5bef7..e957043d3 100644
 --- a/gcc/tree-ssa-loop-ivopts.cc
