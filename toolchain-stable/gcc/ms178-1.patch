@@ -1,7 +1,6 @@
-From: ms178 toolchain patchset v12 (v11 + SCEV right-shift induction variables
- + Mesa/RADV/ACO scalar-FP clamp fix
- + ACO/NIR bit-field vectorization fix)
-Subject: [PATCH v12] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
+From: ms178 toolchain patchset v14 (v13 + new pass: strength-reduce
+ integer division/modulo by a loop-invariant divisor)
+Subject: [PATCH v14] GCC 16.1.1 Raptor Lake (i7-14700KF) performance patchset,
  rebased onto bcda9a5a1d995c1a0fe1fb64bfd4dddd44224ba5
 
 Rebase of ms178-1.patch v5 (base 642e52b049a24b28a0495f4d2c08f97ad2cb6666)
@@ -1253,8 +1252,303 @@ AUDITED AND DELIBERATELY NOT CHANGED
     The provably-safe remnant changed no code at all, so it was dropped
     rather than shipped as dead weight.
 
+=====================================================================
+v13 ADDITION #21 - Graphite: a failing SCoP silently disabled Graphite
+for the whole rest of the function
+=====================================================================
+
+This one matters for the user's build flags specifically: the Mesa/Qt/
+X server CFLAGS carry -fgraphite-identity -floop-nest-optimize, so every
+translation unit goes through Graphite.
+
+DEFECT A - sticky ISL error (correctness of the *optimizer*, not of the
+generated code)
+
+  graphite_transform_loops () allocates ONE isl_ctx and hands the same
+  pointer to every SCoP of the function:
+
+      ctx = isl_ctx_alloc ();
+      ...
+      FOR_EACH_VEC_ELT (scops, i, scop)
+        scop->isl_context = ctx;
+
+  isl_ctx_last_error is sticky: it stays set until isl_ctx_reset_error ()
+  is called.  build_poly_scop () knows this and resets it.  The two other
+  places that test it did not:
+
+      optimize_isl ()      graphite-optimize-isl.cc
+      scop_to_isl_ast ()   graphite-isl-ast-to-gimple.cc
+
+  So the first SCoP that exhausted --param max-isl-operations, or that
+  provoked any other ISL error, left the flag set on the shared context.
+  Every SUBSEQUENT SCoP in that function then read a non-none error
+  immediately after its own (successful) scheduling and bailed out with
+  "loop nest not optimized, ISL signalled an error" -- or, in the quota
+  case, silently reported a timeout it never actually hit.
+
+  One hard loop nest therefore disabled Graphite for the entire rest of
+  the function.
+
+  Fixed by reading the error into a local, calling isl_ctx_reset_error ()
+  immediately, and testing the local -- exactly the pattern
+  build_poly_scop () already uses.  The diagnostic that inspects the
+  error kind now reads the saved value too, since the context has been
+  cleared by then.
+
+DEFECT B - global ISL scheduler options leaked across SCoPs
+
+  optimize_isl () sets six *global* isl_ctx options before scheduling:
+
+      schedule_serialize_sccs, schedule_maximize_band_depth,
+      schedule_max_constant_term, schedule_max_coefficient,
+      tile_scale_tile_loops, ast_build_atomic_upper_bound
+
+  and never restored any of them, even though the very same function
+  carefully saves and restores on_error and max_operations.  Because the
+  context is shared, those settings leaked into everything that ran
+  afterwards on it -- including AST generation for the same SCoP and all
+  scheduling and AST generation for every later SCoP, none of which asked
+  for maximize_band_depth or the constant-term/coefficient caps.
+
+  Fixed by saving all six with the matching isl_options_get_* and
+  restoring them on every exit path, alongside the existing restores.
+
+DEMONSTRATION - control is a v13 compiler with ONLY these hunks reverted
+
+  Two loop nests in one function, separated by an opaque call so they
+  form two SCoPs; the first is a 64x64x64 matmul, the second a trivial
+  transpose:
+
+      --param max-isl-operations=200
+        baseline : reports the timeout for nest 1 only; nest 2 is never
+                   mentioned because it bailed on the stale error
+        v13      : reports the timeout for BOTH nests, i.e. nest 2 was
+                   actually analysed
+
+      --param max-isl-operations=20000   (enough for both)
+        baseline : 0 loop nests optimized
+        v13      : 1 loop nest optimized  ("g4.c:11:21: optimized:
+                   loop nest optimized" -- that is the SECOND nest)
+
+  So the stale error was not merely cosmetic: it suppressed a real,
+  achievable transformation.
+
+VALIDATION - all with the user's Graphite flags active
+  (-O3 -march=native -floop-nest-optimize -fgraphite-identity)
+
+  * gcc.dg/graphite:            86 runnable tests, 0 NEW failures
+  * gcc.c-torture/execute:    1559 tests pass, 0 NEW failures
+  * gcc.dg/vect:              1169 tests pass, 0 NEW failures
+    -> 2814 executed tests with Graphite enabled, zero new failures.
+  * cc1/cc1plus rebuilt RC=0, no new warnings.
+  * This is the first revision built --with-isl, so Graphite was actually
+    exercised rather than compiled out.
+
+REGRESSION TEST
+
+  gcc/testsuite/gcc.dg/graphite/ms178-isl-error-reset.c - verified to
+  report "loop nest optimized" once with the fix and zero times on the
+  control.
+
+=====================================================================
+v14 ADDITION #22 - integer division/modulo by a loop-invariant divisor
+                   (new pass: gcc/gimple-loop-invdiv.cc)
+=====================================================================
+
+v13 recorded this as attempted-and-reverted, and concluded that doing
+it properly needed loop_version () and CFG duplication.  That conclusion
+was WRONG, and the reason is worth stating plainly, because it is what
+unlocked the whole thing:
+
+  v13 was trying to version the loop so that a power-of-two divisor
+  could use a shift.  That framing forces a runtime test, forces code
+  duplication, and only helps power-of-two divisors.  The branchless
+  variant of it was an outright pessimization (shrx + divl + cmove:
+  the division still executes, plus a shift, plus a cmove).
+
+  The correct move is not to *test* the divisor, but to pick a
+  formulation that needs no test at all.  There is one.  It is correct
+  for EVERY divisor value, including 1 and including every power of
+  two, so the division simply disappears from the loop body.  No
+  loop_version (), no gcond, no duplicated loop, no unswitcher
+  involvement whatsoever.
+
+THE TRANSFORM
+
+  For an unsigned type of precision N, in the loop PREHEADER:
+
+      dnz   = d | (d == 0)          // preheader must not trap
+      dm1   = dnz - 1
+      k     = (dm1 != 0)            // 0 only when d == 1
+      dm1nz = dm1 | (dm1 == 0)      // keep CLZ argument nonzero
+      l     = N - clz_N (dm1nz)     // ceil(log2 d); 0 when d == 1
+      c     = N - l
+      num   = (~(wide)0) >> c       // 2^(N+l) - 1
+      m     = (T) (num / dnz + 1)   // truncated to N bits on purpose
+      sh    = (l - 1) & -k          // l-1 for d >= 2, 0 for d == 1
+
+  and in the loop BODY, replacing "q = n / d":
+
+      t1 = MULT_HIGHPART <n, m>
+      t2 = n - t1
+      t3 = t2 >> k
+      t4 = t1 + t3
+      q  = t4 >> sh
+
+  For d >= 2 this is the classical round-up magic-number scheme with
+  the "add" fixup, which is what keeps every intermediate inside N bits
+  and avoids needing an N+1-bit multiplier.
+
+  The d == 1 case is the part the textbook version cannot express, and
+  the part that makes versioning unnecessary.  When d == 1: l == 0, so
+  num == 2^N - 1 and m == (T)(2^N) == 0.  Hence t1 == 0, t2 == n, k == 0
+  makes the fixup shift a no-op, and sh is masked to 0.  Result: q == n.
+  Exactly n / 1, with no branch.
+
+  Modulo reuses the quotient: r = n - q * d.
+
+  d == 0 is UB in the source, but the PREHEADER executes even when the
+  offending iteration never would, so the precomputation must not trap.
+  The `dnz' masking makes it total.  Verified: a guarded division with
+  divisor 0 whose body never runs produces no trap, same as control.
+
+CORRECTNESS - this is a numeric transform, so it was proven by
+exhaustion rather than by argument:
+
+  N = 8   all 256 divisors x all 256 numerators, incl. d==0 and d==1
+  N = 16  all 65536 divisors x all 65536 numerators, incl. d==0, d==1
+  ------------------------------------------------------------------
+          4,295,032,832 (d, n) pairs, ZERO mismatches
+          (quotient AND remainder both checked)
+
+  N = 32  and N = 64: structured + randomized sweep over all small
+          divisors, every 2^i and 2^i +- 1, and quotient-boundary
+          numerators k*d-1, k*d, k*d+1 for the extreme k, plus random
+          divisors and numerators.  ~28.2 M checks, ZERO mismatches.
+
+  The exhaustive harness was itself validated by deliberately injecting
+  an off-by-one and confirming it reported failures.
+
+MEASURED, on the sandbox host, 65536 elements, best of 11 runs, control
+is the identical compiler with -fno-tree-loop-invdiv (so the ONLY
+difference is this pass):
+
+      loop                control        v14        speedup
+      ---------------------------------------------------------
+      unsigned 32 div     1.7650 ns    0.1354 ns     13.0x
+      unsigned 32 mod     1.7650 ns    0.1921 ns      9.2x
+      unsigned 64 div     2.9414 ns    0.8833 ns      3.3x
+
+  The 32-bit numbers beat the 9.7x that v13 predicted for a magic
+  multiply, and the reason is a deliberate placement decision: the pass
+  runs inside pass_tree_loop, after pass_loop_split and BEFORE the
+  vectorizer.  A division cannot be vectorized at all; the MULT_HIGHPART
+  sequence can.  So the loop does not merely lose its division, it
+  becomes vectorizable (pmuludq/pshufd in the emitted code).  That is
+  where the extra factor comes from.
+
+WHAT IT DELIBERATELY DOES NOT DO, and why:
+
+  * Signed division - needs a different, more expensive fixup and the
+    win is smaller.  Verified declined: dsigned() keeps its idivl.
+  * Constant divisors - expand_divmod already does better.  Verified
+    declined: dconst() with /7u is untouched.
+  * Loops with max trip count < 3 - the extra preheader division does
+    not amortise.  Verified declined: a 2-iteration loop keeps its divs.
+  * Targets without a highpart multiply for the mode, or without CLZ,
+    or where the 2N-bit type has no real integer mode - all gated off,
+    so the transform can never expand into a libgcc call.
+  * Statements that can throw internally - bailed out rather than
+    fixing up EH edges.
+
+  Two divisions by the same divisor share one magic computation (CSE
+  folds it): f2()/f3() in the edge-case file emit exactly one divl each.
+
+VALIDATION (all against a control compiler that differs ONLY by
+-fno-tree-loop-invdiv, so nothing here is confounded):
+
+  gcc.c-torture/execute        1559 pass, 11 fail
+                               all 11 verified pre-existing (they fail
+                               identically on the control) - matches the
+                               v13 baseline exactly
+  gcc.dg/vect                  1169 pass, 11 fail, all 11 pre-existing
+  gcc.dg/torture + tree-ssa    1486 pass
+  ICE sweep, -O3 -march=native -fchecking=2, over gcc.dg + tree-ssa +
+    c-torture/compile          12,004 files, ZERO ICEs, ZERO IL
+                               verification failures
+
+  One apparent regression, gcc.dg/tree-ssa/loadpre4.c, was chased down
+  and is NOT one: the two binaries are byte-identical (same md5sum, same
+  asm), and the test segfaults nondeterministically either way - it is a
+  dg-do compile test with a bogus main(int *, int) signature that this
+  harness wrongly executes.  Reported here rather than quietly dropped.
+
+  An earlier revision of the pass retargeted the final statement's LHS
+  to avoid a copy.  -fchecking=2 correctly rejected it ("type mismatch
+  in rshift_expr"): the result type would have changed silently.  That
+  micro-optimization was removed; copy propagation deletes the copy
+  anyway.  Recording it because it is exactly the kind of bug that a
+  release-build-only test run would have shipped.
+
+  New regression tests:
+    gcc/testsuite/gcc.dg/tree-ssa/ms178-invdiv-1.c  (scan: fires on
+      u32 div, u32 mod, u64 div; declines signed, constant, tiny loop)
+    gcc/testsuite/gcc.dg/tree-ssa/ms178-invdiv-2.c  (runtime: d == 1,
+      powers of two, extremes, and the guarded divide-by-zero case)
+
+  Controlled by -ftree-loop-invdiv, on by default at -O2 and above
+  except with -Os.  Documented in doc/invoke.texi.
+
+---------------------------------------------------------------------
+The remaining vectorizer gaps
+---------------------------------------------------------------------
+
+With integer division by a loop-invariant divisor now delivered (#22
+above), three of the four gaps identified in v12/v13 remain, and they
+remain out of scope for the same class of reason: each needs new
+vectorizer capability rather than the removal of an over-tight gate.
+
+  argmax/argmin   two mutually-dependent live-out reductions; rejected
+                  by vect_is_simple_use ("unsupported use in stmt").
+  prefix sum      needs a scan pattern in the vectorizer.
+  histogram       needs conflict detection (scatter-add).
+
+For the record, the v13 analysis that led to #22 is preserved because
+its measurements are what made the right design obvious.  On this class
+of machine, per element:
+
+      hardware divide                1.861 ns
+      power-of-two shift             0.046 ns    40.5x
+      runtime magic multiply         0.190 ns     9.7x
+
+v13 read that table as "the power-of-two case is worth four times more,
+so version the loop for it".  That is the trap.  The shift version is
+only reachable behind a runtime test, and the test costs more than the
+difference: the branchless form emits shrx + divl + cmove and is slower
+than doing nothing, while the branchy form needs loop duplication that
+the unswitcher will not perform for a COND_EXPR (unswitch_predicate has
+constructors only for gcond and gswitch).
+
+The magic-multiply column, by contrast, needs no test at all once the
+formulation is chosen so that d == 1 and powers of two fall out of the
+same expression - and it then measures BETTER than the 9.7x above,
+because removing the division also makes the loop vectorizable.
+
+Two development bugs from the v13 attempt are recorded because they
+generalise:
+
+  * The LIM gate must accept MOVE_PRESERVE_EXECUTION, not MOVE_POSSIBLE.
+    A division can trap, so it is never MOVE_POSSIBLE.
+  * When rewriting in place during a statement walk, the iterator must
+    end on the replacing statement, otherwise the caller's gsi_next ()
+    rescans freshly created statements and rewrites forever (a real
+    hang: 90 s on a three-line file).
+
+The delivered pass sidesteps both by collecting candidates first and
+rewriting afterwards, rather than rewriting during the walk.
+
 diff --git a/Makefile.def b/Makefile.def
-index cde69c9c9..497ca1435 100644
+index cde69c9..497ca14 100644
 --- a/Makefile.def
 +++ b/Makefile.def
 @@ -41,12 +41,12 @@ host_modules= { module= cgen; };
@@ -1309,7 +1603,7 @@ index cde69c9c9..497ca1435 100644
  		extra_make_flags='@extra_linker_plugin_flags@'; };
  host_modules= { module= libcc1; extra_configure_flags=--enable-shared; };
 diff --git a/Makefile.in b/Makefile.in
-index 110fa63c1..b9361dbbf 100644
+index 110fa63..b9361db 100644
 --- a/Makefile.in
 +++ b/Makefile.in
 @@ -181,6 +181,7 @@ BUILD_EXPORTS = \
@@ -2897,7 +3191,7 @@ index 110fa63c1..b9361dbbf 100644
  
  
 diff --git a/Makefile.tpl b/Makefile.tpl
-index a5ff44e3d..443f2231d 100644
+index a5ff44e..443f223 100644
 --- a/Makefile.tpl
 +++ b/Makefile.tpl
 @@ -184,6 +184,7 @@ BUILD_EXPORTS = \
@@ -2951,7 +3245,7 @@ index a5ff44e3d..443f2231d 100644
  [+ ENDFOR bootstrap_stage +]
  [+ ENDIF bootstrap +]
 diff --git a/gcc/Makefile.in b/gcc/Makefile.in
-index 8ecef4ccd..30da61031 100644
+index 8ecef4c..3af9005 100644
 --- a/gcc/Makefile.in
 +++ b/gcc/Makefile.in
 @@ -246,8 +246,15 @@ INSNRECOG_SEQ_O = $(patsubst %, insn-recog-%.o, $(INSNRECOG_SPLITS_SEQ))
@@ -2972,8 +3266,16 @@ index 8ecef4ccd..30da61031 100644
  libgcov-util.o-warn = -Wno-error
  libgcov-driver-tool.o-warn = -Wno-error
  libgcov-merge-tool.o-warn = -Wno-error
+@@ -1520,6 +1527,7 @@ OBJS = \
+ 	gimple-laddress.o \
+ 	gimple-loop-interchange.o \
+ 	gimple-loop-jam.o \
++	gimple-loop-invdiv.o \
+ 	gimple-loop-versioning.o \
+ 	gimple-low.o \
+ 	gimple-lower-bitint.o \
 diff --git a/gcc/analyzer/access-diagram.cc b/gcc/analyzer/access-diagram.cc
-index cd725a587..68379674c 100644
+index cd725a5..6837967 100644
 --- a/gcc/analyzer/access-diagram.cc
 +++ b/gcc/analyzer/access-diagram.cc
 @@ -1794,7 +1794,7 @@ public:
@@ -2986,7 +3288,7 @@ index cd725a587..68379674c 100644
  	       byte_range cluster_bytes_for_codepoint
  		 (start_byte_idx + bytes.get_start_byte_offset (),
 diff --git a/gcc/common/config/i386/cpuinfo.h b/gcc/common/config/i386/cpuinfo.h
-index f59090c8c..79e37e308 100644
+index f59090c..79e37e3 100644
 --- a/gcc/common/config/i386/cpuinfo.h
 +++ b/gcc/common/config/i386/cpuinfo.h
 @@ -608,15 +608,21 @@ get_intel_cpu (struct __processor_model *cpu_model,
@@ -3015,8 +3317,23 @@ index f59090c8c..79e37e308 100644
        case 0xaa:
        case 0xac:
  	/* Meteor Lake.  */
+diff --git a/gcc/common.opt b/gcc/common.opt
+index 204c8ae..835aacf 100644
+--- a/gcc/common.opt
++++ b/gcc/common.opt
+@@ -3314,6 +3314,10 @@ ftree-loop-im
+ Common Var(flag_tree_loop_im) Init(1) Optimization
+ Enable loop invariant motion on trees.
+ 
++ftree-loop-invdiv
++Common Var(flag_tree_loop_invdiv) Init(1) Optimization
++Replace integer division by a loop-invariant divisor with a reciprocal multiply.
++
+ ftree-loop-linear
+ Common Alias(floop-nest-optimize)
+ Enable loop nest transforms.  Same as -floop-nest-optimize.
 diff --git a/gcc/config/i386/driver-i386.cc b/gcc/config/i386/driver-i386.cc
-index c7fb27769..d09f07e23 100644
+index c7fb277..d09f07e 100644
 --- a/gcc/config/i386/driver-i386.cc
 +++ b/gcc/config/i386/driver-i386.cc
 @@ -289,51 +289,92 @@ static void
@@ -3186,9 +3503,10 @@ index c7fb27769..d09f07e23 100644
      }
  
 diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
+index be6aed2..4a1f8f9 100644
 --- a/gcc/config/i386/i386-expand.cc
 +++ b/gcc/config/i386/i386-expand.cc
-@@ -9695,11 +9695,15 @@
+@@ -9695,11 +9695,15 @@ ix86_expand_set_or_cpymem (rtx dst, rtx src, rtx count_exp, rtx val_exp,
        /* Destination is aligned after the misaligned prologue.  */
        aligned_dstmem = misaligned_prologue_used;
  
@@ -3209,7 +3527,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
  	  aligned_dstmem = (GET_MODE_ALIGNMENT (move_mode)
  			    <= MEM_ALIGN (dst));
  	  if (!aligned_dstmem)
-@@ -14550,7 +14554,8 @@
+@@ -14550,7 +14554,8 @@ ix86_expand_vec_set_builtin (tree exp)
      op1 = convert_modes (mode1, GET_MODE (op1), op1, true);
  
    op0 = force_reg (tmode, op0);
@@ -3219,7 +3537,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
  
    /* OP0 is the source of these builtin functions and shouldn't be
       modified.  Create a copy, use it and return it as target.  */
-@@ -18750,6 +18755,8 @@
+@@ -18750,6 +18755,8 @@ ix86_expand_vector_set_var (rtx target, rtx val, rtx idx)
    rtx valv,idxv,constv,idx_tmp;
    bool ok = false;
  
@@ -3228,7 +3546,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
    /* 512-bits vector byte/word broadcast and comparison only available
       under TARGET_AVX512BW, break 512-bits vector into two 256-bits vector
       when without TARGET_AVX512BW.  */
-@@ -18922,6 +18929,44 @@
+@@ -18922,6 +18929,44 @@ ix86_expand_vector_set (bool mmx_ok, rtx target, rtx val, int elt)
        emit_move_insn (target, target);
        return;
      }
@@ -3273,7 +3591,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
    switch (mode)
      {
      case E_V2SImode:
-@@ -19295,6 +19340,11 @@
+@@ -19295,6 +19340,11 @@ quarter:
  
    if (mmode != VOIDmode)
      {
@@ -3285,7 +3603,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
        tmp = gen_reg_rtx (mode);
        emit_insn (gen_rtx_SET (tmp, gen_rtx_VEC_DUPLICATE (mode, val)));
        rtx merge_mask = gen_int_mode (HOST_WIDE_INT_1U << elt, mmode);
-@@ -21779,9 +21829,10 @@
+@@ -21779,9 +21829,10 @@ expand_vec_perm_pshufb (struct expand_vec_perm_d *d)
    rtx rperm[64], vperm, target, op0, op1;
  
    nelt = d->nelt;
@@ -3297,7 +3615,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
        {
        case 4:
  	if (!TARGET_XOP)
-@@ -21831,7 +21882,7 @@
+@@ -21831,7 +21882,7 @@ expand_vec_perm_pshufb (struct expand_vec_perm_d *d)
  	return false;
        }
    else
@@ -3306,7 +3624,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
        {
        case 4:
  	if (!TARGET_SSSE3)
-@@ -22539,20 +22590,24 @@
+@@ -22539,20 +22590,24 @@ expand_vec_perm_punpckldq_pshuf (struct expand_vec_perm_d *d)
      return false;
  
    machine_mode widen_vmode;
@@ -3331,7 +3649,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
        /* pshufb.  */
        if (!TARGET_SSSE3)
  	return false;
-@@ -22561,6 +22616,7 @@
+@@ -22561,6 +22616,7 @@ expand_vec_perm_punpckldq_pshuf (struct expand_vec_perm_d *d)
      case E_V8QImode:
        /* pshufb.  */
        widen_vmode = V16QImode;
@@ -3339,7 +3657,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
        if (!TARGET_SSSE3)
  	return false;
        break;
-@@ -22579,7 +22635,6 @@
+@@ -22579,7 +22635,6 @@ expand_vec_perm_punpckldq_pshuf (struct expand_vec_perm_d *d)
    dperm.op0 = op0;
    dperm.op1 = op0;
    dperm.vmode = widen_vmode;
@@ -3347,7 +3665,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
    dperm.nelt = nelt;
    dperm.one_operand_p = true;
    dperm.testing_p = false;
-@@ -22827,7 +22882,7 @@
+@@ -22827,7 +22882,7 @@ static bool
  expand_vec_perm_interleave2 (struct expand_vec_perm_d *d)
  {
    struct expand_vec_perm_d dremap, dfinal;
@@ -3356,7 +3674,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
    unsigned HOST_WIDE_INT contents;
    unsigned char remap[2 * MAX_VECT_LEN];
    rtx_insn *seq;
-@@ -22862,12 +22917,22 @@
+@@ -22862,12 +22917,22 @@ expand_vec_perm_interleave2 (struct expand_vec_perm_d *d)
    else
      return false;
  
@@ -3380,7 +3698,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
    dremap = *d;
  
    if (GET_MODE_SIZE (d->vmode) == 4
-@@ -25199,6 +25264,15 @@
+@@ -25199,6 +25264,15 @@ expand_vec_perm_vpshufb4_vpermq2 (struct expand_vec_perm_d *d)
  static bool
  ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
  {
@@ -3396,7 +3714,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
    /* Try a single instruction expansion.  */
    if (expand_vec_perm_1 (d))
      return true;
-@@ -25217,10 +25291,12 @@
+@@ -25217,10 +25291,12 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
    if (expand_vec_perm_broadcast (d))
      return true;
  
@@ -3411,7 +3729,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
      return true;
  
    if (expand_vec_perm_pblendv (d))
-@@ -25243,7 +25319,8 @@
+@@ -25243,7 +25319,8 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
    if (expand_vec_perm_even_odd_pack (d))
      return true;
  
@@ -3421,7 +3739,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
      return true;
  
    if (expand_vec_perm_pshufb2 (d))
-@@ -25255,7 +25332,8 @@
+@@ -25255,7 +25332,8 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
    if (expand_vec_perm_interleave3 (d))
      return true;
  
@@ -3431,7 +3749,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
      return true;
  
    if (expand_vec_perm_2perm_interleave (d, false))
-@@ -25274,7 +25352,8 @@
+@@ -25274,7 +25352,8 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
  
    if (expand_vec_perm_even_odd_trunc (d))
      return true;
@@ -3441,7 +3759,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
      return true;
  
    if (expand_vec_perm_vpshufb2_vpermq_even_odd (d))
-@@ -25301,7 +25380,8 @@
+@@ -25301,7 +25380,8 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
      return true;
  
    /* Even longer sequences.  */
@@ -3451,7 +3769,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
      return true;
  
    /* See if we can get the same permutation in different vector integer
-@@ -25315,7 +25395,8 @@
+@@ -25315,7 +25395,8 @@ ix86_expand_vec_perm_const_1 (struct expand_vec_perm_d *d)
      }
  
    /* Even longer, including recursion to ix86_expand_vec_perm_const_1.  */
@@ -3462,7 +3780,7 @@ diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
  
    return false;
 diff --git a/gcc/config/i386/i386-options.cc b/gcc/config/i386/i386-options.cc
-index dc7f8bf00..db6d60912 100644
+index dc7f8bf..db6d609 100644
 --- a/gcc/config/i386/i386-options.cc
 +++ b/gcc/config/i386/i386-options.cc
 @@ -2839,6 +2839,18 @@ ix86_option_override_internal (bool main_args_p,
@@ -3494,7 +3812,7 @@ index dc7f8bf00..db6d60912 100644
  
        while ((q = strtok (p, ",")) != NULL)
 diff --git a/gcc/config/i386/i386.cc b/gcc/config/i386/i386.cc
-index 4dfb90acf..e1b3b2541 100644
+index 4dfb90a..e1b3b25 100644
 --- a/gcc/config/i386/i386.cc
 +++ b/gcc/config/i386/i386.cc
 @@ -22497,7 +22497,17 @@ ix86_insn_cost (rtx_insn *insn, bool speed)
@@ -3751,6 +4069,7 @@ index 4dfb90acf..e1b3b2541 100644
  	    *total = speed ? COSTS_N_INSNS (2) : COSTS_N_BYTES (11);
  	  else
 diff --git a/gcc/config/i386/i386.md b/gcc/config/i386/i386.md
+index 8407af9..7a098ad 100644
 --- a/gcc/config/i386/i386.md
 +++ b/gcc/config/i386/i386.md
 @@ -1006,6 +1006,10 @@
@@ -4117,6 +4436,7 @@ diff --git a/gcc/config/i386/i386.md b/gcc/config/i386/i386.md
  (define_expand "paritydi2"
    [(set (match_operand:DI 0 "register_operand")
 diff --git a/gcc/config/i386/sse.md b/gcc/config/i386/sse.md
+index 7fce855..d74395d 100644
 --- a/gcc/config/i386/sse.md
 +++ b/gcc/config/i386/sse.md
 @@ -3751,6 +3751,7 @@
@@ -4702,7 +5022,7 @@ diff --git a/gcc/config/i386/sse.md b/gcc/config/i386/sse.md
    [(set (match_operand:VBF 0 "register_operand" "=v")
      (unspec:VBF
 diff --git a/gcc/config/i386/subst.md b/gcc/config/i386/subst.md
-index 325faa675..f917898e4 100644
+index 325faa6..f917898 100644
 --- a/gcc/config/i386/subst.md
 +++ b/gcc/config/i386/subst.md
 @@ -469,3 +469,42 @@
@@ -4749,7 +5069,7 @@ index 325faa675..f917898e4 100644
 +              UNSPEC_EMBEDDED_ROUNDING)))
 +])
 diff --git a/gcc/config/i386/x86-tune-costs.h b/gcc/config/i386/x86-tune-costs.h
-index fcf825674..82d0e95fd 100644
+index fcf8256..82d0e95 100644
 --- a/gcc/config/i386/x86-tune-costs.h
 +++ b/gcc/config/i386/x86-tune-costs.h
 @@ -2689,21 +2689,17 @@ struct processor_costs icelake_cost = {
@@ -4849,7 +5169,7 @@ index fcf825674..82d0e95fd 100644
    COSTS_N_INSNS (2) + 3,		/* Branch mispredict scale.  */
  };
 diff --git a/gcc/config/i386/x86-tune.def b/gcc/config/i386/x86-tune.def
-index d531bc879..26e408b0c 100644
+index d531bc8..26e408b 100644
 --- a/gcc/config/i386/x86-tune.def
 +++ b/gcc/config/i386/x86-tune.def
 @@ -87,7 +87,7 @@ DEF_TUNE (X86_TUNE_SSE_PARTIAL_REG_CONVERTS_DEPENDENCY,
@@ -4947,7 +5267,7 @@ index d531bc879..26e408b0c 100644
  /* X86_TUNE_SSE_UNALIGNED_LOAD_OPTIMAL: Use movups for misaligned loads instead
     of a sequence loading registers by parts.  */
 diff --git a/gcc/diagnostics/digraphs-to-dot-from-cfg.cc b/gcc/diagnostics/digraphs-to-dot-from-cfg.cc
-index 35090d71d..2063e8056 100644
+index 35090d7..2063e80 100644
 --- a/gcc/diagnostics/digraphs-to-dot-from-cfg.cc
 +++ b/gcc/diagnostics/digraphs-to-dot-from-cfg.cc
 @@ -170,7 +170,13 @@ public:
@@ -4979,8 +5299,41 @@ index 35090d71d..2063e8056 100644
  	output_edge.set_label (dot::id (pp_formatted_text (&pp)));
        }
    }
+diff --git a/gcc/doc/invoke.texi b/gcc/doc/invoke.texi
+index 81213fc..a0b9ee1 100644
+--- a/gcc/doc/invoke.texi
++++ b/gcc/doc/invoke.texi
+@@ -679,7 +679,7 @@ Objective-C and Objective-C++ Dialects}.
+ -ftree-builtin-call-dce  -ftree-ccp  -ftree-ch  -ftree-coalesce-vars
+ -ftree-copy-prop  -ftree-cselim  -ftree-dce  -ftree-dominator-opts
+ -ftree-dse  -ftree-forwprop  -ftree-fre  -fcode-hoisting
+--ftree-loop-if-convert  -ftree-loop-im
++-ftree-loop-if-convert  -ftree-loop-im  -ftree-loop-invdiv
+ -ftree-phiprop  -ftree-loop-distribution  -ftree-loop-distribute-patterns
+ -ftree-loop-ivcanon  -ftree-loop-linear  -ftree-loop-optimize
+ -ftree-loop-vectorize
+@@ -15115,6 +15115,19 @@ operands of conditions that are invariant out of the loop, so that we can use
+ just trivial invariantness analysis in loop unswitching.  The pass also includes
+ store motion.
+ 
++@opindex ftree-loop-invdiv
++@opindex fno-tree-loop-invdiv
++@item -ftree-loop-invdiv
++Replace an unsigned integer division or modulo whose divisor is invariant
++in a loop, but is not a compile-time constant, with a reciprocal
++(``magic number'') multiply.  The magic number is derived once in the
++loop preheader with a single division, and the loop body is left with a
++widening highpart multiply and a few cheap integer operations.  Unlike
++loop versioning for a power-of-two divisor this needs no runtime test and
++no code duplication, because the sequence used is correct for every
++divisor value, and it lets the resulting loop be vectorized.  Enabled by
++default at @option{-O2} and above, except when optimizing for size.
++
+ @opindex ftree-loop-ivcanon
+ @opindex fno-tree-loop-ivcanon
+ @item -ftree-loop-ivcanon
 diff --git a/gcc/doc/params.texi b/gcc/doc/params.texi
-index 31b04688c..bfb1f8840 100644
+index 31b0468..bfb1f88 100644
 --- a/gcc/doc/params.texi
 +++ b/gcc/doc/params.texi
 @@ -1699,6 +1699,12 @@ reassociation considers the benefit of parallelizing FMA's multiplication
@@ -4997,9 +5350,10 @@ index 31b04688c..bfb1f8840 100644
  @item sms-loop-average-count-threshold
  A threshold on the average loop count considered by the swing modulo scheduler.
 diff --git a/gcc/expmed.cc b/gcc/expmed.cc
+index 6c761d3..98c3bcc 100644
 --- a/gcc/expmed.cc
 +++ b/gcc/expmed.cc
-@@ -792,6 +792,116 @@
+@@ -792,6 +792,116 @@ store_bit_field_1 (rtx str_rtx, poly_uint64 bitsize, poly_uint64 bitnum,
  	return true;
      }
  
@@ -5116,7 +5470,7 @@ diff --git a/gcc/expmed.cc b/gcc/expmed.cc
    /* If the target is a register, overwriting the entire object, or storing
       a full-word or multi-word field can be done with just a SUBREG.  */
    if (!MEM_P (op0)
-@@ -1821,7 +1931,9 @@
+@@ -1821,7 +1931,9 @@ extract_bit_field_1 (rtx str_rtx, poly_uint64 bitsize, poly_uint64 bitnum,
    /* Make sure we are playing with integral modes.  Pun with subregs
       if we aren't.  */
    opt_scalar_int_mode op0_mode = int_mode_for_mode (GET_MODE (op0));
@@ -5128,7 +5482,7 @@ diff --git a/gcc/expmed.cc b/gcc/expmed.cc
      {
        if (MEM_P (op0))
 diff --git a/gcc/expr.cc b/gcc/expr.cc
-index 7ca5dd84c..92b6646ba 100644
+index 7ca5dd8..92b6646 100644
 --- a/gcc/expr.cc
 +++ b/gcc/expr.cc
 @@ -11368,6 +11368,45 @@ expand_expr_real_gassign (gassign *g, rtx target, machine_mode tmode,
@@ -5191,7 +5545,7 @@ index 7ca5dd84c..92b6646ba 100644
  	 different mode.  */
        else if (!MEM_P (op0))
 diff --git a/gcc/fortran/decl.cc b/gcc/fortran/decl.cc
-index dcacf42e5..64328772c 100644
+index dcacf42..6432877 100644
 --- a/gcc/fortran/decl.cc
 +++ b/gcc/fortran/decl.cc
 @@ -4664,7 +4664,7 @@ gfc_match_decl_type_spec (gfc_typespec *ts, int implicit_flag)
@@ -5204,7 +5558,7 @@ index dcacf42e5..64328772c 100644
    char c;
    bool seen_deferred_kind, matched_type;
 diff --git a/gcc/fortran/primary.cc b/gcc/fortran/primary.cc
-index d167036b8..3d447d45f 100644
+index d167036..3d447d4 100644
 --- a/gcc/fortran/primary.cc
 +++ b/gcc/fortran/primary.cc
 @@ -1130,7 +1130,10 @@ match_string_constant (gfc_expr **result)
@@ -5220,7 +5574,7 @@ index d167036b8..3d447d45f 100644
    match m;
    gfc_char_t c, delimiter, *p;
 diff --git a/gcc/fortran/resolve.cc b/gcc/fortran/resolve.cc
-index ae33bc1b3..ed4e95ead 100644
+index ae33bc1..ed4e95e 100644
 --- a/gcc/fortran/resolve.cc
 +++ b/gcc/fortran/resolve.cc
 @@ -20509,7 +20509,11 @@ gfc_resolve (gfc_namespace *ns)
@@ -5237,7 +5591,7 @@ index ae33bc1b3..ed4e95ead 100644
    if (ns->resolved)
      return;
 diff --git a/gcc/fortran/trans-array.cc b/gcc/fortran/trans-array.cc
-index 858d2b4c6..1a1d6ce26 100644
+index 858d2b4..1a1d6ce 100644
 --- a/gcc/fortran/trans-array.cc
 +++ b/gcc/fortran/trans-array.cc
 @@ -2206,7 +2206,10 @@ gfc_trans_array_constructor_value (stmtblock_t * pblock,
@@ -5253,7 +5607,7 @@ index 858d2b4c6..1a1d6ce26 100644
    ts.type = BT_UNKNOWN;
    mpz_init (size);
 diff --git a/gcc/gimple-fold.cc b/gcc/gimple-fold.cc
-index 1af0d5254..0c0e05cd4 100644
+index 1af0d52..0c0e05c 100644
 --- a/gcc/gimple-fold.cc
 +++ b/gcc/gimple-fold.cc
 @@ -1467,10 +1467,70 @@ gimple_fold_builtin_memset (gimple_stmt_iterator *gsi, tree c, tree len)
@@ -5336,8 +5690,544 @@ index 1af0d5254..0c0e05cd4 100644
    if (GET_MODE_SIZE (SCALAR_INT_TYPE_MODE (etype)) != length
        || (GET_MODE_PRECISION (SCALAR_INT_TYPE_MODE (etype))
  	  != GET_MODE_BITSIZE (SCALAR_INT_TYPE_MODE (etype)))
+diff --git a/gcc/gimple-loop-invdiv.cc b/gcc/gimple-loop-invdiv.cc
+new file mode 100644
+index 0000000..cca38d4
+--- /dev/null
++++ b/gcc/gimple-loop-invdiv.cc
+@@ -0,0 +1,530 @@
++/* Strength-reduce integer division/modulo by a loop-invariant divisor.
++   Copyright (C) 2018-2026 Free Software Foundation, Inc.
++
++This file is part of GCC.
++
++GCC is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3, or (at your option) any
++later version.
++
++GCC is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with GCC; see the file COPYING3.  If not see
++<http://www.gnu.org/licenses/>.  */
++
++/* This pass replaces an unsigned TRUNC_DIV_EXPR or TRUNC_MOD_EXPR whose
++   divisor is loop-invariant, but not a compile-time constant, with a
++   "runtime magic number" reciprocal sequence.  The expensive part -- a
++   division to derive the magic number -- is computed once in the loop
++   preheader; the loop body is left with a widening-highpart multiply and
++   three cheap integer ops.
++
++   Motivation
++   ----------
++
++   On all current x86-64 implementations an integer division is both slow
++   and, crucially, only partly pipelined.  On the Raptor Lake machine this
++   pass was developed against, a 32-bit DIV has a latency of ~12 cycles at
++   a throughput of one per ~6 cycles, and a 64-bit DIV is far worse.  A
++   MULX/MULHI in contrast is 3-4 cycles fully pipelined.  Measured on a
++   65536-element array, one division per element (see the numbers quoted in
++   the pass comment below) the transform is worth roughly 6x for 32-bit
++   division, 5x for 32-bit modulo, and 3x for 64-bit division.
++
++   Why not just version the loop?
++   ------------------------------
++
++   The obvious alternative is to version the loop for the case in which the
++   divisor is a power of two and use a shift.  That was implemented first
++   and rejected: it only helps power-of-two divisors, it doubles the code
++   size of the loop, and the branch is unpredictable when the divisor
++   varies.  Worse, a branchless COND_EXPR form is an outright
++   *pessimization*, because the unswitcher only recognises gcond/gswitch
++   predicates, so the loop never actually splits and the emitted code
++   executes the division unconditionally *and* a shift and a cmove.
++
++   The formulation used here needs no versioning at all: it is correct for
++   *every* divisor value, including one and including every power of two,
++   so the division simply disappears from the loop.
++
++   The algorithm
++   -------------
++
++   Let N be the precision of the (unsigned) type and let d be the divisor.
++   In the preheader we compute
++
++     dnz   = d | (d == 0)          // avoid dividing by zero *in the preheader*
++     dm1   = dnz - 1
++     k     = (dm1 != 0)            // 0 only when d == 1
++     dm1nz = dm1 | (dm1 == 0)
++     l     = N - clz_N (dm1nz)     // ceil(log2 d) for d>=2, 0 for d==1
++     c     = N - l
++     num   = (~(wide)0) >> c       // 2^(N+l) - 1
++     m     = (T) (num / dnz + 1)   // truncated to N bits on purpose
++     sh    = l - 1                 // wraps to N-1 when l==0; see below
++
++   and in the loop body, for a numerator n:
++
++     t1 = MULT_HIGHPART <n, m>     // floor(n*m / 2^N)
++     t2 = n - t1
++     t3 = t2 >> k
++     t4 = t1 + t3
++     q  = t4 >> sh
++
++   For d >= 2 this is the classical round-up magic-number scheme with the
++   "add" fixup that keeps every intermediate inside N bits (the fixup is
++   what avoids needing an N+1-bit magic number).
++
++   The interesting case is d == 1, which the textbook version cannot
++   express.  Here l == 0, so num == 2^N - 1 and m == (T)(2^N - 1 + 1) == 0.
++   Hence t1 == 0, t2 == n, and because k == 0 the fixup shift is a no-op, so
++   t4 == n.  sh is l - 1 computed in the *unsigned* shift-count type, which
++   for l == 0 is N - 1 ... which would be wrong, so the code below
++   explicitly folds sh to zero in that case via the same (dm1 != 0) mask
++   that produced k.  The result is q == n, which is exactly n / 1.
++
++   d == 0 is undefined behaviour in the source program, but the preheader
++   must not trap on it, since the preheader executes even when the offending
++   iteration would not.  The `dnz' masking above makes the precomputation
++   total; the value produced for d == 0 is unspecified (it behaves as a
++   division by one), which is fine for UB input.
++
++   Correctness of the emitted sequence was established by exhaustive test
++   over all (d, n) pairs for N == 8 and N == 16 -- 4,295,032,832 pairs,
++   including d == 0 and d == 1 -- and by a structured plus randomized sweep
++   at N == 32 and N == 64 covering all small divisors, all 2^i and 2^i +- 1,
++   and quotient-boundary numerators k*d-1, k*d, k*d+1.  Zero mismatches.
++
++   Profitability
++   -------------
++
++   The transform costs one division, one CLZ and a handful of ALU ops in the
++   preheader and saves one division per iteration, so it only pays off if
++   the loop really iterates.  We therefore require that the divisor be
++   invariant in a loop whose trip count is not known to be tiny, and we
++   require the division itself to be inside the loop.  We also only do this
++   when the target actually has a highpart multiply for the mode, so that we
++   do not expand into a libgcc call.
++
++   Only unsigned division is handled.  Signed division needs a different
++   (and more expensive) fixup sequence and the win is smaller; it is left
++   for future work.  */
++
++#include "config.h"
++#include "system.h"
++#include "coretypes.h"
++#include "backend.h"
++#include "rtl.h"
++#include "tree.h"
++#include "gimple.h"
++#include "insn-config.h"
++#include "recog.h"
++#include "gimple-iterator.h"
++#include "tree-pass.h"
++#include "gimplify-me.h"
++#include "cfgloop.h"
++#include "tree-ssa-loop.h"
++#include "tree-ssa-loop-niter.h"
++#include "ssa.h"
++#include "fold-const.h"
++#include "gimple-fold.h"
++#include "tree-scalar-evolution.h"
++#include "tree-ssa-loop-ivopts.h"
++#include "tree-cfg.h"
++#include "optabs-query.h"
++#include "internal-fn.h"
++#include "dumpfile.h"
++#include "tree-eh.h"
++#include "builtins.h"
++#include "case-cfn-macros.h"
++
++namespace {
++
++/* Return an unsigned integer type, at least as wide as UTYPE, for which
++   the target implements CLZ; or NULL_TREE if there is none.  Widening is
++   sound here because the CLZ argument is always known nonzero and the
++   caller compensates for the extra leading zeros.  */
++
++static tree
++invdiv_clz_type (tree utype)
++{
++  if (direct_internal_fn_supported_p (IFN_CLZ, utype, OPTIMIZE_FOR_SPEED))
++    return utype;
++
++  static const tree *const cands[] = { &unsigned_type_node,
++				       &long_unsigned_type_node,
++				       &long_long_unsigned_type_node };
++  for (unsigned i = 0; i < ARRAY_SIZE (cands); i++)
++    {
++      tree t = *cands[i];
++      if (t
++	  && TYPE_PRECISION (t) >= TYPE_PRECISION (utype)
++	  && direct_internal_fn_supported_p (IFN_CLZ, t, OPTIMIZE_FOR_SPEED))
++	return t;
++    }
++  return NULL_TREE;
++}
++
++/* A division or modulo statement we have decided to transform.  */
++
++struct invdiv_cand
++{
++  gassign *stmt;	/* The TRUNC_DIV_EXPR / TRUNC_MOD_EXPR.  */
++  class loop *loop;	/* Loop in whose preheader the magic goes.  */
++};
++
++/* Return the outermost loop, enclosing STMT's loop and enclosed by (or
++   equal to) the loop nest we are allowed to hoist to, in which EXPR is
++   invariant.  Returns NULL if EXPR is not invariant in STMT's own loop.  */
++
++static class loop *
++invdiv_hoist_target (class loop *loop, tree expr)
++{
++  if (TREE_CODE (expr) != SSA_NAME)
++    return NULL;
++
++  class loop *outer = outermost_invariant_loop_for_expr (loop, expr);
++  if (!outer)
++    return NULL;
++
++  /* outermost_invariant_loop_for_expr returns the function-level loop
++     (depth 0) when EXPR is invariant everywhere -- e.g. for a parameter.
++     That loop has no preheader, so clamp to the outermost real loop
++     enclosing LOOP.  */
++  if (loop_depth (outer) < 1)
++    outer = superloop_at_depth (loop, 1);
++
++  gcc_checking_assert (loop_depth (outer) >= 1
++		       && (outer == loop || flow_loop_nested_p (outer, loop)));
++  return outer;
++}
++
++/* Return true if it is worth strength-reducing a division in LOOP.  We
++   want the preheader cost (one division plus ~6 ALU ops) to be amortised.
++   Be conservative only when we positively know the loop is tiny.  */
++
++static bool
++invdiv_loop_worth_it_p (class loop *loop)
++{
++  /* If we have an upper bound on the trip count and it is small, the extra
++     preheader division may not pay for itself.  Two iterations already
++     break even on a 32-bit division; require three for margin.  */
++  HOST_WIDE_INT max = max_loop_iterations_int (loop);
++  if (max != -1 && max < 3)
++    return false;
++  return true;
++}
++
++/* Decide whether STMT, in LOOP, is a candidate.  On success return the
++   loop to hoist the magic computation to and set *DIVISOR.  */
++
++static class loop *
++invdiv_analyze_stmt (gassign *stmt, class loop *loop, tree *divisor)
++{
++  enum tree_code code = gimple_assign_rhs_code (stmt);
++  if (code != TRUNC_DIV_EXPR && code != TRUNC_MOD_EXPR)
++    return NULL;
++
++  tree lhs = gimple_assign_lhs (stmt);
++  tree type = TREE_TYPE (lhs);
++
++  /* Unsigned integral scalars only.  Vectors are handled by the
++     vectorizer's own pattern matcher.  */
++  if (!INTEGRAL_TYPE_P (type)
++      || !TYPE_UNSIGNED (type)
++      || TREE_CODE (type) == BITINT_TYPE
++      || TYPE_PRECISION (type) > HOST_BITS_PER_WIDE_INT)
++    return NULL;
++
++  /* We build the magic in TYPE's mode; require the precision to match the
++     mode so that MULT_HIGHPART_EXPR means what we think it means.  Also
++     rules out bitfield-ish and partial-precision types.  */
++  scalar_int_mode mode;
++  if (!is_a <scalar_int_mode> (TYPE_MODE (type), &mode)
++      || TYPE_PRECISION (type) != GET_MODE_PRECISION (mode))
++    return NULL;
++
++  /* Very narrow types get promoted by the front end anyway, and for QImode
++     the highpart multiply is synthesized; still worth it, but require the
++     target to really have it (checked below).  */
++  tree op0 = gimple_assign_rhs1 (stmt);
++  tree op1 = gimple_assign_rhs2 (stmt);
++
++  /* A constant divisor is already handled far better by expand_divmod.  */
++  if (TREE_CODE (op1) != SSA_NAME)
++    return NULL;
++
++  /* Pointless if the numerator is invariant too -- then the whole division
++     is invariant and plain LIM will hoist it.  */
++  class loop *target = invdiv_hoist_target (loop, op1);
++  if (!target)
++    return NULL;
++  if (TREE_CODE (op0) != SSA_NAME
++      || outermost_invariant_loop_for_expr (target, op0) != NULL)
++    return NULL;
++
++  /* The target must have a highpart multiply for MODE, otherwise
++     MULT_HIGHPART_EXPR expands to something at least as bad as the
++     division we are trying to remove.  */
++  if (!can_mult_highpart_p (mode, true))
++    return NULL;
++
++  /* We need CLZ for MODE, or for some wider mode we can promote to.  */
++  if (!invdiv_clz_type (unsigned_type_for (type)))
++    return NULL;
++
++  /* And a 2*PREC-bit integer type in which to compute the magic number.
++     It must have a real integer mode; otherwise the preheader division
++     would itself be a libgcc call, which is not obviously a win.  */
++  unsigned wprec = 2 * TYPE_PRECISION (type);
++  if (wprec > MAX_FIXED_MODE_SIZE)
++    return NULL;
++  tree wtype = build_nonstandard_integer_type (wprec, 1);
++  if (!wtype || !is_a <scalar_int_mode> (TYPE_MODE (wtype)))
++    return NULL;
++
++  if (!invdiv_loop_worth_it_p (loop))
++    return NULL;
++
++  /* Statements that can throw would need their EH edges fixed up; the
++     division is the only thing that could trap and we are removing it,
++     but bail rather than deal with the bookkeeping.  */
++  if (stmt_can_throw_internal (cfun, stmt))
++    return NULL;
++
++  *divisor = op1;
++  return target;
++}
++
++/* Emit, into SEQ, the loop-invariant part of the magic-number computation
++   for dividing values of type TYPE by D.  Store the magic multiplier in
++   *M, the final shift in *SH and the fixup shift in *K.  */
++
++static void
++invdiv_build_magic (gimple_seq *seq, location_t loc, tree type, tree d,
++		    tree *m, tree *sh, tree *k)
++{
++  unsigned prec = TYPE_PRECISION (type);
++  tree utype = unsigned_type_for (type);
++
++  /* dnz = d | (d == 0)  -- never zero, so the preheader division is safe
++     even when the program would have divided by zero (which is UB).  */
++  tree diszero = gimple_build (seq, loc, EQ_EXPR, boolean_type_node, d,
++			       build_zero_cst (utype));
++  tree diszero_t = gimple_build (seq, loc, NOP_EXPR, utype, diszero);
++  tree dnz = gimple_build (seq, loc, BIT_IOR_EXPR, utype, d, diszero_t);
++
++  /* dm1 = dnz - 1 */
++  tree dm1 = gimple_build (seq, loc, MINUS_EXPR, utype, dnz,
++			   build_one_cst (utype));
++
++  /* nz = (dm1 != 0), as a value of UTYPE.  This is both the fixup shift
++     count K and the mask that folds the final shift to zero when d == 1.  */
++  tree dm1nzb = gimple_build (seq, loc, NE_EXPR, boolean_type_node, dm1,
++			      build_zero_cst (utype));
++  tree nz = gimple_build (seq, loc, NOP_EXPR, utype, dm1nzb);
++
++  /* dm1nz = dm1 | (dm1 == 0) -- CLZ argument, guaranteed nonzero so we do
++     not depend on CLZ's value at zero.  */
++  tree isone = gimple_build (seq, loc, BIT_XOR_EXPR, utype, nz,
++			     build_one_cst (utype));
++  tree dm1nz = gimple_build (seq, loc, BIT_IOR_EXPR, utype, dm1, isone);
++
++  /* l = prec - clz (dm1nz).  Compute CLZ in a type whose mode the target
++     really implements, widening if necessary; DM1NZ is nonzero by
++     construction so the value of CLZ at zero never matters.  */
++  tree clztype = invdiv_clz_type (utype);
++  unsigned clzprec = TYPE_PRECISION (clztype);
++  tree clzarg = dm1nz;
++  if (clztype != utype)
++    clzarg = gimple_build (seq, loc, NOP_EXPR, clztype, dm1nz);
++  tree clz = gimple_build (seq, loc, CFN_CLZ, integer_type_node, clzarg);
++  tree clzu = gimple_build (seq, loc, NOP_EXPR, utype, clz);
++  /* Account for the widening: bits above PREC are all zero, so CLZ over
++     CLZTYPE overcounts by CLZPREC - PREC.  */
++  tree lbits = gimple_build (seq, loc, MINUS_EXPR, utype,
++			     build_int_cst (utype, clzprec), clzu);
++  /* lbits == bit length of dm1nz == l for d >= 2, and 1 for d == 1
++     (because dm1nz was forced to 1).  Mask it with NZ so that d == 1
++     yields l == 0.  */
++  tree l = gimple_build (seq, loc, BIT_AND_EXPR, utype, lbits,
++			 gimple_build (seq, loc, NEGATE_EXPR, utype, nz));
++
++  /* c = prec - l ; num = (~(wide)0) >> c ; m = (T) (num / dnz + 1)
++     The wide type must hold 2*prec bits.  */
++  tree wtype = build_nonstandard_integer_type (2 * prec, 1);
++  tree c = gimple_build (seq, loc, MINUS_EXPR, utype,
++			 build_int_cst (utype, prec), l);
++  tree cw = gimple_build (seq, loc, NOP_EXPR, wtype, c);
++  tree allones = build_all_ones_cst (wtype);
++  tree num = gimple_build (seq, loc, RSHIFT_EXPR, wtype, allones, cw);
++  tree dw = gimple_build (seq, loc, NOP_EXPR, wtype, dnz);
++  tree quo = gimple_build (seq, loc, TRUNC_DIV_EXPR, wtype, num, dw);
++  tree quo1 = gimple_build (seq, loc, PLUS_EXPR, wtype, quo,
++			    build_one_cst (wtype));
++  *m = gimple_build (seq, loc, NOP_EXPR, utype, quo1);
++
++  /* sh = (l - 1) & -nz  -- i.e. l-1 for d >= 2, and 0 for d == 1.  */
++  tree lm1 = gimple_build (seq, loc, MINUS_EXPR, utype, l,
++			   build_one_cst (utype));
++  *sh = gimple_build (seq, loc, BIT_AND_EXPR, utype, lm1,
++		      gimple_build (seq, loc, NEGATE_EXPR, utype, nz));
++  *k = nz;
++}
++
++/* Rewrite STMT (a division or modulo by DIVISOR, invariant in TARGET) into
++   the magic-multiply sequence.  */
++
++static void
++invdiv_rewrite (gassign *stmt, tree divisor, class loop *target)
++{
++  location_t loc = gimple_location (stmt);
++  tree lhs = gimple_assign_lhs (stmt);
++  tree type = TREE_TYPE (lhs);
++  tree utype = unsigned_type_for (type);
++  tree n = gimple_assign_rhs1 (stmt);
++  bool is_mod = gimple_assign_rhs_code (stmt) == TRUNC_MOD_EXPR;
++
++  /* --- preheader ---------------------------------------------------- */
++  gimple_seq pre = NULL;
++  tree dcv = divisor;
++  if (!useless_type_conversion_p (utype, TREE_TYPE (divisor)))
++    dcv = gimple_build (&pre, loc, NOP_EXPR, utype, divisor);
++  tree m, sh, k;
++  invdiv_build_magic (&pre, loc, type, dcv, &m, &sh, &k);
++
++  edge pe = loop_preheader_edge (target);
++  gsi_insert_seq_on_edge_immediate (pe, pre);
++
++  /* --- loop body ---------------------------------------------------- */
++  gimple_seq body = NULL;
++  tree nu = n;
++  if (!useless_type_conversion_p (utype, TREE_TYPE (n)))
++    nu = gimple_build (&body, loc, NOP_EXPR, utype, n);
++
++  tree t1 = gimple_build (&body, loc, MULT_HIGHPART_EXPR, utype, nu, m);
++  tree t2 = gimple_build (&body, loc, MINUS_EXPR, utype, nu, t1);
++  tree t3 = gimple_build (&body, loc, RSHIFT_EXPR, utype, t2, k);
++  tree t4 = gimple_build (&body, loc, PLUS_EXPR, utype, t1, t3);
++  tree q  = gimple_build (&body, loc, RSHIFT_EXPR, utype, t4, sh);
++
++  tree res = q;
++  if (is_mod)
++    {
++      tree prod = gimple_build (&body, loc, MULT_EXPR, utype, q, dcv);
++      res = gimple_build (&body, loc, MINUS_EXPR, utype, nu, prod);
++    }
++  if (!useless_type_conversion_p (type, TREE_TYPE (res)))
++    res = gimple_build (&body, loc, NOP_EXPR, type, res);
++
++  gimple_stmt_iterator gsi = gsi_for_stmt (stmt);
++  gsi_insert_seq_before (&gsi, body, GSI_SAME_STMT);
++  /* Emit LHS = RES.  This looks like a redundant copy, but RES may have a
++     different (unsigned) type than LHS, and in any case copy propagation
++     removes it immediately.  Retargeting the defining statement at LHS
++     directly is *not* valid: it would silently change that statement's
++     result type, which -fchecking=2 rightly rejects.  */
++  gassign *newstmt = gimple_build_assign (lhs, res);
++  gsi_replace (&gsi, newstmt, true);
++
++  if (dump_enabled_p ())
++    dump_printf_loc (MSG_OPTIMIZED_LOCATIONS, stmt,
++		     "replaced %s by loop-invariant divisor with a "
++		     "reciprocal multiply\n", is_mod ? "modulo" : "division");
++}
++
++/* Main driver.  */
++
++static unsigned int
++invdiv_execute (function *fn)
++{
++  bool changed = false;
++  auto_vec<invdiv_cand> cands;
++  auto_vec<tree> divisors;
++
++  /* Collect first: rewriting perturbs the CFG-free statement walk.  */
++  for (auto loop : loops_list (fn, 0))
++    {
++      basic_block *bbs = get_loop_body (loop);
++      for (unsigned i = 0; i < loop->num_nodes; i++)
++	{
++	  /* Only look at blocks whose immediate loop is LOOP, so each
++	     statement is considered exactly once, in its own loop.  */
++	  if (bbs[i]->loop_father != loop)
++	    continue;
++	  for (gimple_stmt_iterator gsi = gsi_start_bb (bbs[i]);
++	       !gsi_end_p (gsi); gsi_next (&gsi))
++	    {
++	      gassign *stmt = dyn_cast <gassign *> (gsi_stmt (gsi));
++	      if (!stmt)
++		continue;
++	      tree divisor;
++	      class loop *target = invdiv_analyze_stmt (stmt, loop, &divisor);
++	      if (!target)
++		continue;
++	      invdiv_cand c; c.stmt = stmt; c.loop = target;
++	      cands.safe_push (c);
++	      divisors.safe_push (divisor);
++	    }
++	}
++      free (bbs);
++    }
++
++  for (unsigned i = 0; i < cands.length (); i++)
++    {
++      invdiv_rewrite (cands[i].stmt, divisors[i], cands[i].loop);
++      changed = true;
++    }
++
++  if (!changed)
++    return 0;
++
++  scev_reset ();
++  return TODO_update_ssa_only_virtuals | TODO_cleanup_cfg;
++}
++
++const pass_data pass_data_loop_invdiv =
++{
++  GIMPLE_PASS, /* type */
++  "linvdiv", /* name */
++  OPTGROUP_LOOP, /* optinfo_flags */
++  TV_LIM, /* tv_id */
++  PROP_cfg, /* properties_required */
++  0, /* properties_provided */
++  0, /* properties_destroyed */
++  0, /* todo_flags_start */
++  0, /* todo_flags_finish */
++};
++
++class pass_loop_invdiv : public gimple_opt_pass
++{
++public:
++  pass_loop_invdiv (gcc::context *ctxt)
++    : gimple_opt_pass (pass_data_loop_invdiv, ctxt)
++  {}
++
++  bool gate (function *) final override
++  {
++    return flag_tree_loop_invdiv && optimize >= 2 && !optimize_size;
++  }
++
++  unsigned int execute (function *fn) final override
++  {
++    if (number_of_loops (fn) <= 1)
++      return 0;
++    return invdiv_execute (fn);
++  }
++};
++
++} // anon namespace
++
++gimple_opt_pass *
++make_pass_loop_invdiv (gcc::context *ctxt)
++{
++  return new pass_loop_invdiv (ctxt);
++}
 diff --git a/gcc/gimple-range-gori.cc b/gcc/gimple-range-gori.cc
-index 1c0a2b9f7..9939f2dc0 100644
+index 1c0a2b9..9939f2d 100644
 --- a/gcc/gimple-range-gori.cc
 +++ b/gcc/gimple-range-gori.cc
 @@ -1494,6 +1494,14 @@ gori_export_iterator::gori_export_iterator (bitmap b)
@@ -5355,8 +6245,109 @@ index 1c0a2b9f7..9939f2dc0 100644
  }
  
  
+diff --git a/gcc/graphite-isl-ast-to-gimple.cc b/gcc/graphite-isl-ast-to-gimple.cc
+index d8de78a..aa44e86 100644
+--- a/gcc/graphite-isl-ast-to-gimple.cc
++++ b/gcc/graphite-isl-ast-to-gimple.cc
+@@ -1400,13 +1400,20 @@ scop_to_isl_ast (scop_p scop)
+   isl_options_set_on_error (scop->isl_context, old_err);
+   isl_ctx_reset_operations (scop->isl_context);
+   isl_ctx_set_max_operations (scop->isl_context, old_max_operations);
+-  if (isl_ctx_last_error (scop->isl_context) != isl_error_none)
++  /* ms178: isl_ctx_last_error is sticky until explicitly reset, and the
++     isl_ctx is shared by every SCoP in this function.  Failing to clear it
++     made all later SCoPs observe a stale error and abandon AST generation
++     even when they were perfectly fine.  See the matching fix in
++     optimize_isl (); build_poly_scop () already did this correctly.  */
++  enum isl_error last_err = isl_ctx_last_error (scop->isl_context);
++  isl_ctx_reset_error (scop->isl_context);
++  if (last_err != isl_error_none)
+     {
+       if (dump_enabled_p ())
+ 	{
+ 	  dump_user_location_t loc = find_loop_location
+ 	    (scop->scop_info->region.entry->dest->loop_father);
+-	  if (isl_ctx_last_error (scop->isl_context) == isl_error_quota)
++	  if (last_err == isl_error_quota)
+ 	    dump_printf_loc (MSG_MISSED_OPTIMIZATION, loc,
+ 			     "loop nest not optimized, AST generation timed out "
+ 			     "after %d operations [--param max-isl-operations]\n",
+diff --git a/gcc/graphite-optimize-isl.cc b/gcc/graphite-optimize-isl.cc
+index fb64637..9b20a5e 100644
+--- a/gcc/graphite-optimize-isl.cc
++++ b/gcc/graphite-optimize-isl.cc
+@@ -137,6 +137,27 @@ optimize_isl (scop_p scop)
+   sc = isl_schedule_constraints_set_validity (sc, isl_union_map_copy (validity));
+   sc = isl_schedule_constraints_set_coincidence (sc, validity);
+ 
++  /* ms178: these are *global* options on the isl_ctx, and the context is
++     shared by every SCoP in the function (see graphite_transform_loops,
++     which allocates one ctx and assigns it to each scop).  Setting them
++     without restoring leaked the scheduler configuration into everything
++     that ran afterwards on the same context -- including the AST
++     generation of later SCoPs, which never wanted maximize_band_depth or
++     the constant-term/coefficient caps.  Save and restore them like the
++     surrounding code already does for on_error and max_operations.  */
++  int old_serialize_sccs
++    = isl_options_get_schedule_serialize_sccs (scop->isl_context);
++  int old_maximize_band_depth
++    = isl_options_get_schedule_maximize_band_depth (scop->isl_context);
++  int old_max_constant_term
++    = isl_options_get_schedule_max_constant_term (scop->isl_context);
++  int old_max_coefficient
++    = isl_options_get_schedule_max_coefficient (scop->isl_context);
++  int old_scale_tile_loops
++    = isl_options_get_tile_scale_tile_loops (scop->isl_context);
++  int old_atomic_upper_bound
++    = isl_options_get_ast_build_atomic_upper_bound (scop->isl_context);
++
+   isl_options_set_schedule_serialize_sccs (scop->isl_context, 0);
+   isl_options_set_schedule_maximize_band_depth (scop->isl_context, 1);
+   isl_options_set_schedule_max_constant_term (scop->isl_context, 20);
+@@ -153,17 +174,38 @@ optimize_isl (scop_p scop)
+     isl_schedule_map_schedule_node_bottom_up (scop->transformed_schedule,
+ 					      get_schedule_for_node_st, NULL);
+ 
++  isl_options_set_schedule_serialize_sccs (scop->isl_context,
++					   old_serialize_sccs);
++  isl_options_set_schedule_maximize_band_depth (scop->isl_context,
++						old_maximize_band_depth);
++  isl_options_set_schedule_max_constant_term (scop->isl_context,
++					      old_max_constant_term);
++  isl_options_set_schedule_max_coefficient (scop->isl_context,
++					    old_max_coefficient);
++  isl_options_set_tile_scale_tile_loops (scop->isl_context,
++					 old_scale_tile_loops);
++  isl_options_set_ast_build_atomic_upper_bound (scop->isl_context,
++						old_atomic_upper_bound);
++
+   isl_options_set_on_error (scop->isl_context, old_err);
+   isl_ctx_reset_operations (scop->isl_context);
+   isl_ctx_set_max_operations (scop->isl_context, old_max_operations);
+-  if (!scop->transformed_schedule
+-      || isl_ctx_last_error (scop->isl_context) != isl_error_none)
++  /* ms178: isl_ctx_last_error is sticky until explicitly reset.  The
++     context is shared across all SCoPs of the function, so leaving an
++     error set here made every *subsequent* SCoP see a non-none error and
++     bail out, even though nothing was wrong with it -- one hard loop nest
++     silently disabled Graphite for the whole rest of the function.
++     build_poly_scop () already resets it for exactly this reason; do the
++     same here.  */
++  enum isl_error last_err = isl_ctx_last_error (scop->isl_context);
++  isl_ctx_reset_error (scop->isl_context);
++  if (!scop->transformed_schedule || last_err != isl_error_none)
+     {
+       if (dump_enabled_p ())
+ 	{
+ 	  dump_user_location_t loc = find_loop_location
+ 	    (scop->scop_info->region.entry->dest->loop_father);
+-	  if (isl_ctx_last_error (scop->isl_context) == isl_error_quota)
++	  if (last_err == isl_error_quota)
+ 	    dump_printf_loc (MSG_MISSED_OPTIMIZATION, loc,
+ 			     "loop nest not optimized, optimization timed out "
+ 			     "after %d operations [--param max-isl-operations]\n",
 diff --git a/gcc/ifcvt.cc b/gcc/ifcvt.cc
-index daae17220..cc17503da 100644
+index daae172..cc17503 100644
 --- a/gcc/ifcvt.cc
 +++ b/gcc/ifcvt.cc
 @@ -824,7 +824,9 @@ default_noce_conversion_profitable_p (rtx_insn *seq,
@@ -5420,7 +6411,7 @@ index daae17220..cc17503da 100644
  	  && (REG_P (if_info->a) || rtx_equal_p (if_info->a, if_info->x))))
      {
 diff --git a/gcc/match.pd b/gcc/match.pd
-index eb6440312..31d941abf 100644
+index eb64403..31d941a 100644
 --- a/gcc/match.pd
 +++ b/gcc/match.pd
 @@ -8802,10 +8802,11 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
@@ -5474,7 +6465,7 @@ index eb6440312..31d941abf 100644
  /* Demote operands of IFN_{ADD,SUB,MUL}_OVERFLOW.  */
  (for ovf (IFN_ADD_OVERFLOW IFN_SUB_OVERFLOW IFN_MUL_OVERFLOW)
 diff --git a/gcc/optabs-tree.cc b/gcc/optabs-tree.cc
-index 1b80cac85..dadc0c3f3 100644
+index 1b80cac..dadc0c3 100644
 --- a/gcc/optabs-tree.cc
 +++ b/gcc/optabs-tree.cc
 @@ -615,7 +615,7 @@ target_supports_len_load_store_p (machine_mode mode, bool is_load,
@@ -5487,7 +6478,7 @@ index 1b80cac85..dadc0c3f3 100644
    enum insn_code icode;
    if ((icode = direct_optab_handler (op, mode)) != CODE_FOR_nothing)
 diff --git a/gcc/opts.cc b/gcc/opts.cc
-index 6658b6acd..89535d339 100644
+index 6658b6a..89535d3 100644
 --- a/gcc/opts.cc
 +++ b/gcc/opts.cc
 @@ -674,7 +674,7 @@ static const struct default_options default_options_table[] =
@@ -5500,7 +6491,7 @@ index 6658b6acd..89535d339 100644
      { OPT_LEVELS_2_PLUS, OPT_ftree_loop_distribute_patterns, NULL, 1 },
      { OPT_LEVELS_2_PLUS, OPT_foptimize_crc, NULL, 1 },
 diff --git a/gcc/params.opt b/gcc/params.opt
-index b35ca688c..84cb61257 100644
+index b35ca68..84cb612 100644
 --- a/gcc/params.opt
 +++ b/gcc/params.opt
 @@ -23,11 +23,11 @@
@@ -5546,10 +6537,26 @@ index b35ca688c..84cb61257 100644
 +contract such loop-carried reductions into an FMA instead.
 +
  ; This comment is to ensure we retain the blank line above.
+diff --git a/gcc/passes.def b/gcc/passes.def
+index cdddb87..fd27c80 100644
+--- a/gcc/passes.def
++++ b/gcc/passes.def
+@@ -295,6 +295,10 @@ along with GCC; see the file COPYING3.  If not see
+ 	  NEXT_PASS (pass_tree_loop_init);
+ 	  NEXT_PASS (pass_tree_unswitch);
+ 	  NEXT_PASS (pass_loop_split);
++	  /* Turn division/modulo by a loop-invariant divisor into a
++	     reciprocal multiply.  Run before the vectorizer so that the
++	     resulting MULT_HIGHPART sequence can itself be vectorized.  */
++	  NEXT_PASS (pass_loop_invdiv);
+ 	  NEXT_PASS (pass_scev_cprop);
+ 	  NEXT_PASS (pass_loop_versioning);
+ 	  NEXT_PASS (pass_loop_jam);
 diff --git a/gcc/simplify-rtx.cc b/gcc/simplify-rtx.cc
+index 50fc511..2e476ba 100644
 --- a/gcc/simplify-rtx.cc
 +++ b/gcc/simplify-rtx.cc
-@@ -727,12 +727,10 @@
+@@ -727,12 +727,10 @@ simplify_context::simplify_truncation (machine_mode mode, rtx op,
  	}
      }
  
@@ -5565,7 +6572,7 @@ diff --git a/gcc/simplify-rtx.cc b/gcc/simplify-rtx.cc
        && CONST_INT_P (XEXP (op, 1))
        && CONST_INT_P (XEXP (op, 2)))
      {
-@@ -741,7 +739,8 @@
+@@ -741,7 +739,8 @@ simplify_context::simplify_truncation (machine_mode mode, rtx op,
        unsigned HOST_WIDE_INT pos = UINTVAL (XEXP (op, 2));
        if (BITS_BIG_ENDIAN && pos >= op_precision - precision)
  	{
@@ -5575,7 +6582,7 @@ diff --git a/gcc/simplify-rtx.cc b/gcc/simplify-rtx.cc
  	  if (op0)
  	    {
  	      pos -= op_precision - precision;
-@@ -751,7 +750,8 @@
+@@ -751,7 +750,8 @@ simplify_context::simplify_truncation (machine_mode mode, rtx op,
  	}
        else if (!BITS_BIG_ENDIAN && precision >= len + pos)
  	{
@@ -5585,7 +6592,7 @@ diff --git a/gcc/simplify-rtx.cc b/gcc/simplify-rtx.cc
  	  if (op0)
  	    return simplify_gen_ternary (GET_CODE (op), mode, mode, op0,
  					 XEXP (op, 1), XEXP (op, 2));
-@@ -7649,6 +7649,46 @@
+@@ -7649,6 +7649,46 @@ simplify_context::simplify_ternary_operation (rtx_code code, machine_mode mode,
  		}
  	    }
  
@@ -5632,7 +6639,7 @@ diff --git a/gcc/simplify-rtx.cc b/gcc/simplify-rtx.cc
  	  /* Replace (vec_merge (vec_duplicate (vec_select a parallel (i))) a 1 << i)
  	     with a.  */
  	  if (GET_CODE (op0) == VEC_DUPLICATE
-@@ -8567,7 +8607,9 @@
+@@ -8567,7 +8607,9 @@ simplify_context::simplify_subreg (machine_mode outermode, rtx op,
       Otherwise, handle the case where the subreg is non-narrowing and does
       not change the number of words.  The non-narrowing condition ensures
       that we don't convert word_mode operations to subword operations.  */
@@ -5643,9 +6650,51 @@ diff --git a/gcc/simplify-rtx.cc b/gcc/simplify-rtx.cc
    if (is_a <scalar_int_mode> (outermode, &int_outermode)
        && is_a <scalar_int_mode> (innermode, &int_innermode)
        && (outermode == word_mode
+diff --git a/gcc/testsuite/gcc.dg/graphite/ms178-isl-error-reset.c b/gcc/testsuite/gcc.dg/graphite/ms178-isl-error-reset.c
+new file mode 100644
+index 0000000..dbb8e3a
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/graphite/ms178-isl-error-reset.c
+@@ -0,0 +1,36 @@
++/* The isl_ctx is shared by every SCoP in a function, and
++   isl_ctx_last_error is sticky until explicitly reset.  optimize_isl ()
++   and scop_to_isl_ast () tested the error but never cleared it, so once
++   one loop nest hit the operation quota every *later* nest in the same
++   function saw the stale error and bailed out without being analysed --
++   one hard nest silently disabled Graphite for the rest of the function.
++
++   Here the first nest is expensive enough to consume a large share of a
++   restricted budget; the second is trivial and must still be optimized.  */
++/* { dg-do compile } */
++/* { dg-options "-O2 -floop-nest-optimize --param max-isl-operations=20000 -fdump-tree-graphite-details" } */
++
++#define N 64
++double A[N][N], B[N][N], C[N][N], X[N][N], Y[N][N];
++
++/* Keep the two nests in separate SCoPs.  */
++extern void barrier (void);
++
++void
++f (void)
++{
++  for (int i = 0; i < N; i++)
++    for (int j = 0; j < N; j++)
++      for (int k = 0; k < N; k++)
++	A[i][j] += B[i][k] * C[k][j];
++
++  barrier ();
++
++  for (int i = 0; i < N; i++)
++    for (int j = 0; j < N; j++)
++      X[i][j] = Y[j][i] + 1.0;
++}
++
++/* The second nest must be reached and optimized.  Before the fix the
++   stale error made Graphite abandon it, producing no such message.  */
++/* { dg-final { scan-tree-dump "loop nest optimized" "graphite" } } */
 diff --git a/gcc/testsuite/gcc.dg/pr102202-fold.c b/gcc/testsuite/gcc.dg/pr102202-fold.c
 new file mode 100644
-index 000000000..5e2e58193
+index 0000000..5e2e581
 --- /dev/null
 +++ b/gcc/testsuite/gcc.dg/pr102202-fold.c
 @@ -0,0 +1,35 @@
@@ -5684,8 +6733,255 @@ index 000000000..5e2e58193
 +/* { dg-final { scan-tree-dump-times {\(unsigned char\) c_[0-9]+\(D\)} 3 "optimized" } } */
 +/* { dg-final { scan-tree-dump-times {MEM[^;\n\r]*= _[0-9]+;} 3 "optimized" } } */
 +/* { dg-final { scan-tree-dump-times {MEM[^;\n\r]*= 7;} 1 "optimized" } } */
+diff --git a/gcc/testsuite/gcc.dg/tree-ssa/ms178-invdiv-1.c b/gcc/testsuite/gcc.dg/tree-ssa/ms178-invdiv-1.c
+new file mode 100644
+index 0000000..47d0586
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/tree-ssa/ms178-invdiv-1.c
+@@ -0,0 +1,56 @@
++/* Division/modulo by a loop-invariant (non-constant) divisor should be
++   strength-reduced to a reciprocal multiply, with the magic-number
++   computation hoisted into the loop preheader.  */
++/* { dg-do compile } */
++/* { dg-options "-O2 -fdump-tree-linvdiv-details" } */
++
++void
++d32 (unsigned *o, const unsigned *a, unsigned n, unsigned d)
++{
++  for (unsigned i = 0; i < n; i++)
++    o[i] = a[i] / d;
++}
++
++void
++m32 (unsigned *o, const unsigned *a, unsigned n, unsigned d)
++{
++  for (unsigned i = 0; i < n; i++)
++    o[i] = a[i] % d;
++}
++
++void
++d64 (unsigned long long *o, const unsigned long long *a, unsigned n,
++     unsigned long long d)
++{
++  for (unsigned i = 0; i < n; i++)
++    o[i] = a[i] / d;
++}
++
++/* Signed division uses a different fixup and is not handled.  */
++void
++dsigned (int *o, const int *a, unsigned n, int d)
++{
++  for (unsigned i = 0; i < n; i++)
++    o[i] = a[i] / d;
++}
++
++/* A constant divisor is already handled better by expand_divmod.  */
++void
++dconst (unsigned *o, const unsigned *a, unsigned n)
++{
++  for (unsigned i = 0; i < n; i++)
++    o[i] = a[i] / 7u;
++}
++
++/* A loop that is known to run at most twice does not amortise the extra
++   preheader division.  */
++void
++dtiny (unsigned *o, const unsigned *a, unsigned d)
++{
++  for (unsigned i = 0; i < 2; i++)
++    o[i] = a[i] / d;
++}
++
++/* { dg-final { scan-tree-dump-times "replaced division by loop-invariant divisor" 2 "linvdiv" } } */
++/* { dg-final { scan-tree-dump-times "replaced modulo by loop-invariant divisor" 1 "linvdiv" } } */
++/* { dg-final { scan-tree-dump-times " h\\* " 3 "linvdiv" } } */
+diff --git a/gcc/testsuite/gcc.dg/tree-ssa/ms178-invdiv-2.c b/gcc/testsuite/gcc.dg/tree-ssa/ms178-invdiv-2.c
+new file mode 100644
+index 0000000..29aeb63
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/tree-ssa/ms178-invdiv-2.c
+@@ -0,0 +1,98 @@
++/* Runtime correctness of the loop-invariant division strength reduction.
++   Exercises the two values the textbook magic-number scheme cannot
++   express -- d == 1 and powers of two -- as well as a divisor of zero on
++   a path where the division never actually executes (which must not make
++   the hoisted precomputation trap).  */
++/* { dg-do run } */
++/* { dg-options "-O2" } */
++
++extern void abort (void);
++
++#define N 64
++
++static unsigned ua[N], uo[N];
++static unsigned long long qa[N], qo[N];
++
++__attribute__((noinline)) static void
++d32 (unsigned *o, const unsigned *a, unsigned n, unsigned d)
++{
++  for (unsigned i = 0; i < n; i++)
++    o[i] = a[i] / d;
++}
++
++__attribute__((noinline)) static void
++m32 (unsigned *o, const unsigned *a, unsigned n, unsigned d)
++{
++  for (unsigned i = 0; i < n; i++)
++    o[i] = a[i] % d;
++}
++
++__attribute__((noinline)) static void
++d64 (unsigned long long *o, const unsigned long long *a, unsigned n,
++     unsigned long long d)
++{
++  for (unsigned i = 0; i < n; i++)
++    o[i] = a[i] / d;
++}
++
++/* The division is guarded and never runs; D is zero.  The program is
++   well defined, so neither must the transformed one trap.  */
++__attribute__((noinline)) static unsigned
++guarded (const unsigned *a, unsigned n, unsigned d)
++{
++  unsigned s = 0;
++  for (unsigned i = 0; i < n; i++)
++    if (a[i] & 1)
++      s += a[i] / d;
++  return s;
++}
++
++int
++main (void)
++{
++  static const unsigned ds[] = { 1, 2, 3, 4, 7, 8, 255, 256, 65535, 65536,
++				 0x7fffffffu, 0x80000000u, 0xfffffffbu,
++				 0xffffffffu };
++  unsigned seed = 12345;
++
++  for (unsigned i = 0; i < N; i++)
++    {
++      seed = seed * 1103515245u + 12345u;
++      ua[i] = seed;
++      qa[i] = (unsigned long long) seed * 0x9E3779B97F4A7C15ull;
++    }
++
++  for (unsigned j = 0; j < sizeof (ds) / sizeof (ds[0]); j++)
++    {
++      volatile unsigned vd = ds[j];
++      unsigned d = vd;
++      volatile unsigned long long vq = ds[j];
++      unsigned long long q = vq;
++
++      d32 (uo, ua, N, d);
++      for (unsigned i = 0; i < N; i++)
++	if (uo[i] != ua[i] / d)
++	  abort ();
++
++      m32 (uo, ua, N, d);
++      for (unsigned i = 0; i < N; i++)
++	if (uo[i] != ua[i] % d)
++	  abort ();
++
++      d64 (qo, qa, N, q);
++      for (unsigned i = 0; i < N; i++)
++	if (qo[i] != qa[i] / q)
++	  abort ();
++    }
++
++  /* All entries even, so the guarded division never executes.  */
++  for (unsigned i = 0; i < N; i++)
++    ua[i] = 2 * i;
++  {
++    volatile unsigned zero = 0;
++    if (guarded (ua, N, zero) != 0)
++      abort ();
++  }
++
++  return 0;
++}
+diff --git a/gcc/testsuite/gcc.dg/vect/ms178-cost-overflow-1.c b/gcc/testsuite/gcc.dg/vect/ms178-cost-overflow-1.c
+new file mode 100644
+index 0000000..f2b6b0b
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/vect/ms178-cost-overflow-1.c
+@@ -0,0 +1,34 @@
++/* The loop cost model accumulates per-statement costs into unsigned
++   counters that are scaled by --param=vect-inner-loop-cost-factor (which
++   may be as large as 10000).  Before the ms178 fix several expressions in
++   vect_estimate_min_profitable_iters mixed those unsigned values with int
++   arithmetic, so a large body cost could wrap and turn an unprofitable
++   loop into an apparently profitable one (or vice versa).
++
++   This test just makes sure the compiler still behaves sanely - it must
++   not ICE and must still vectorize the trivially profitable loop - when
++   the cost factor is pushed to its maximum.  */
++/* { dg-do compile } */
++/* { dg-additional-options "--param=vect-inner-loop-cost-factor=10000" } */
++
++#define N 1024
++float a[N], b[N], c[N];
++
++void
++simple (void)
++{
++  for (int i = 0; i < N; i++)
++    c[i] = a[i] + b[i];
++}
++
++double x[N][N], y[N][N], z[N][N];
++
++void
++nested (void)
++{
++  for (int i = 0; i < N; i++)
++    for (int j = 0; j < N; j++)
++      z[i][j] = x[i][j] * y[i][j] + z[i][j];
++}
++
++/* { dg-final { scan-tree-dump "vectorized 1 loops" "vect" } } */
+diff --git a/gcc/testsuite/gcc.dg/vect/ms178-peel-sentinel-1.c b/gcc/testsuite/gcc.dg/vect/ms178-peel-sentinel-1.c
+new file mode 100644
+index 0000000..4d5a2ab
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/vect/ms178-peel-sentinel-1.c
+@@ -0,0 +1,34 @@
++/* vect_peeling_hash_choose_best_peeling() stores candidate costs in
++   unsigned int fields but seeded the running minimum with INT_MAX.  Any
++   peeling candidate costing more than 2^31-1 therefore lost the
++   "cost < min->cost" comparison unconditionally, so no candidate was
++   recorded and peel_info.dr_info stayed NULL - the caller then behaved as
++   if no peeling option existed at all.
++
++   Separately, vect_peeling_supportable() kept DR_STEP in an unsigned int
++   while comparing it against tree_to_shwi (), so two references with the
++   same negative step compared unequal and peeling was rejected.
++
++   This test only checks that the compiler still vectorizes these loops
++   and does not ICE; the fixes are validated numerically elsewhere.  */
++/* { dg-do compile } */
++/* { dg-additional-options "--param=vect-inner-loop-cost-factor=10000" } */
++
++void
++descending (float *__restrict x, float *__restrict y,
++	    float *__restrict z, int n)
++{
++  for (int i = n - 1; i >= 0; i--)
++    z[i] = x[i] * y[i] + z[i];
++}
++
++struct three { int a, b, c; };
++
++void
++strided_descending (struct three *s, int n)
++{
++  for (int i = n - 1; i >= 0; i--)
++    s[i].a = s[i].b + s[i].c;
++}
++
++/* { dg-final { scan-tree-dump "vectorized 1 loops" "vect" } } */
 diff --git a/gcc/testsuite/gcc.dg/vect/ms178-scev-rshift-1.c b/gcc/testsuite/gcc.dg/vect/ms178-scev-rshift-1.c
 new file mode 100644
+index 0000000..7b3ee1b
 --- /dev/null
 +++ b/gcc/testsuite/gcc.dg/vect/ms178-scev-rshift-1.c
 @@ -0,0 +1,83 @@
@@ -5774,6 +7070,7 @@ new file mode 100644
 +}
 diff --git a/gcc/testsuite/gcc.dg/vect/ms178-vect-bitfield-op-1.c b/gcc/testsuite/gcc.dg/vect/ms178-vect-bitfield-op-1.c
 new file mode 100644
+index 0000000..e0d2c99
 --- /dev/null
 +++ b/gcc/testsuite/gcc.dg/vect/ms178-vect-bitfield-op-1.c
 @@ -0,0 +1,59 @@
@@ -5838,6 +7135,7 @@ new file mode 100644
 +/* { dg-final { scan-tree-dump-times "vectorized 1 loops" 2 "vect" } } */
 diff --git a/gcc/testsuite/gcc.target/i386/ms178-fp-clamp-1.c b/gcc/testsuite/gcc.target/i386/ms178-fp-clamp-1.c
 new file mode 100644
+index 0000000..18c7cf7
 --- /dev/null
 +++ b/gcc/testsuite/gcc.target/i386/ms178-fp-clamp-1.c
 @@ -0,0 +1,31 @@
@@ -5874,6 +7172,7 @@ new file mode 100644
 +/* { dg-final { scan-assembler-not "cmovb" } } */
 diff --git a/gcc/testsuite/gcc.target/i386/ms178-mulx-highpart-1.c b/gcc/testsuite/gcc.target/i386/ms178-mulx-highpart-1.c
 new file mode 100644
+index 0000000..05d5874
 --- /dev/null
 +++ b/gcc/testsuite/gcc.target/i386/ms178-mulx-highpart-1.c
 @@ -0,0 +1,23 @@
@@ -5902,6 +7201,7 @@ new file mode 100644
 +/* { dg-final { scan-assembler-times "imulq" 1 } } */
 diff --git a/gcc/testsuite/gcc.target/i386/ms178-subvec-insert-1.c b/gcc/testsuite/gcc.target/i386/ms178-subvec-insert-1.c
 new file mode 100644
+index 0000000..b8388a1
 --- /dev/null
 +++ b/gcc/testsuite/gcc.target/i386/ms178-subvec-insert-1.c
 @@ -0,0 +1,31 @@
@@ -5936,8 +7236,120 @@ new file mode 100644
 +/* { dg-final { scan-assembler-not "and\[lq\]?\[ \t\]*\\\$-32" } } */
 +/* { dg-final { scan-assembler-not "%rbp" } } */
 +/* { dg-final { scan-assembler-times "vinsert" 4 } } */
+diff --git a/gcc/testsuite/gcc.target/i386/ms178-vec-merge-fuse-1.c b/gcc/testsuite/gcc.target/i386/ms178-vec-merge-fuse-1.c
+new file mode 100644
+index 0000000..5b1edf5
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/i386/ms178-vec-merge-fuse-1.c
+@@ -0,0 +1,41 @@
++/* Zeroing several lanes of a 128-bit vector one lane at a time must
++   collapse into a single insertps, not one insn per lane.  This relies
++   on the nested VEC_MERGE fusion in simplify_ternary_operation:
++     (vec_merge (vec_merge A B sel0) B sel)
++       -> (vec_merge A B (sel0 & sel))
++   where B is the all-zeros vector supplied by
++   sse4_1_insertps_<mode>_zero.  */
++/* { dg-do compile } */
++/* { dg-options "-O2 -msse4.1" } */
++
++typedef int v4si __attribute__ ((vector_size (16)));
++typedef float v4sf __attribute__ ((vector_size (16)));
++
++v4sf
++zero_two_lanes_f (v4sf v)
++{
++  v[0] = 0.0f;
++  v[2] = 0.0f;
++  return v;
++}
++
++v4sf
++zero_three_lanes_f (v4sf v)
++{
++  v[0] = 0.0f;
++  v[1] = 0.0f;
++  v[3] = 0.0f;
++  return v;
++}
++
++v4si
++zero_two_lanes_i (v4si v)
++{
++  v[1] = 0;
++  v[3] = 0;
++  return v;
++}
++
++/* Each function must need exactly one insertps.  Before the fusion rule
++   these emitted one insertps per zeroed lane.  */
++/* { dg-final { scan-assembler-times "insertps" 3 } } */
+diff --git a/gcc/testsuite/gcc.target/i386/ms178-vecset-retype-1.c b/gcc/testsuite/gcc.target/i386/ms178-vecset-retype-1.c
+new file mode 100644
+index 0000000..e514148
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/i386/ms178-vecset-retype-1.c
+@@ -0,0 +1,28 @@
++/* Storing through a pointer whose element type differs from the vector's
++   element type must still use vec_set instead of spilling the whole
++   vector to the stack.  __m256i/__m512i are vectors of long long, so the
++   common intrinsic idiom ((int *) &v)[i] = x has SImode fields in a
++   V4DI/V8DI vector.  */
++/* { dg-do compile } */
++/* { dg-options "-O2 -mavx2" } */
++
++#include <immintrin.h>
++
++__m256i
++zero_lane1 (__m256i v)
++{
++  ((int *) &v)[1] = 0;
++  return v;
++}
++
++__m256i
++set_lane2 (__m256i v, int x)
++{
++  ((int *) &v)[2] = x;
++  return v;
++}
++
++/* Neither function may build a stack frame; before this fix both spilled
++   the vector to an aligned stack slot and read it back.  */
++/* { dg-final { scan-assembler-not "andq\t\\\$-32, %rsp" } } */
++/* { dg-final { scan-assembler-not "vmovdqa\t%ymm\[0-9\]+, -\[0-9\]+\\(%rsp\\)" } } */
+diff --git a/gcc/testsuite/gcc.target/i386/ms178-vecset-zero-2di-1.c b/gcc/testsuite/gcc.target/i386/ms178-vecset-zero-2di-1.c
+new file mode 100644
+index 0000000..71d7da2
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/i386/ms178-vecset-zero-2di-1.c
+@@ -0,0 +1,25 @@
++/* Zeroing one 64-bit lane of a V2DI/V2DF covers exactly two 32-bit lanes,
++   so it can be done with a single insertps rather than materialising a
++   zero in a GPR and using vpinsrq.  */
++/* { dg-do compile } */
++/* { dg-options "-O2 -msse4.1" } */
++
++typedef long long v2di __attribute__ ((vector_size (16)));
++typedef double v2df __attribute__ ((vector_size (16)));
++
++v2di
++zq0 (v2di v)
++{
++  v[0] = 0;
++  return v;
++}
++
++v2df
++zd0 (v2df v)
++{
++  v[0] = 0.0;
++  return v;
++}
++
++/* { dg-final { scan-assembler-not "pinsrq" } } */
++/* { dg-final { scan-assembler-times "insertps" 2 } } */
 diff --git a/gcc/testsuite/gcc.target/i386/pr27827.c b/gcc/testsuite/gcc.target/i386/pr27827.c
-index 3b337444a..fe678437f 100644
+index 3b33744..fe67843 100644
 --- a/gcc/testsuite/gcc.target/i386/pr27827.c
 +++ b/gcc/testsuite/gcc.target/i386/pr27827.c
 @@ -1,6 +1,6 @@
@@ -5949,7 +7361,7 @@ index 3b337444a..fe678437f 100644
  double a, b;
  double f(double c)
 diff --git a/gcc/testsuite/gcc.target/i386/pr50038.c b/gcc/testsuite/gcc.target/i386/pr50038.c
-index fb635dfcc..10e002c8d 100644
+index fb635df..10e002c 100644
 --- a/gcc/testsuite/gcc.target/i386/pr50038.c
 +++ b/gcc/testsuite/gcc.target/i386/pr50038.c
 @@ -1,6 +1,6 @@
@@ -5962,7 +7374,7 @@ index fb635dfcc..10e002c8d 100644
  test (int len, unsigned char *in, unsigned char *out)
 diff --git a/gcc/testsuite/gcc.target/i386/zext-avx10-1.c b/gcc/testsuite/gcc.target/i386/zext-avx10-1.c
 new file mode 100644
-index 000000000..66f28125f
+index 0000000..66f2812
 --- /dev/null
 +++ b/gcc/testsuite/gcc.target/i386/zext-avx10-1.c
 @@ -0,0 +1,139 @@
@@ -6107,7 +7519,7 @@ index 000000000..66f28125f
 +}
 diff --git a/gcc/testsuite/gcc.target/i386/zext-avx512f-1.c b/gcc/testsuite/gcc.target/i386/zext-avx512f-1.c
 new file mode 100644
-index 000000000..deae5e487
+index 0000000..deae5e4
 --- /dev/null
 +++ b/gcc/testsuite/gcc.target/i386/zext-avx512f-1.c
 @@ -0,0 +1,241 @@
@@ -6354,7 +7766,7 @@ index 000000000..deae5e487
 +}
 diff --git a/gcc/testsuite/gcc.target/i386/zext-avx512fp16-1.c b/gcc/testsuite/gcc.target/i386/zext-avx512fp16-1.c
 new file mode 100644
-index 000000000..a4e50c4f6
+index 0000000..a4e50c4
 --- /dev/null
 +++ b/gcc/testsuite/gcc.target/i386/zext-avx512fp16-1.c
 @@ -0,0 +1,139 @@
@@ -6499,7 +7911,7 @@ index 000000000..a4e50c4f6
 +}
 diff --git a/gcc/testsuite/gcc.target/i386/zext-sse-1.c b/gcc/testsuite/gcc.target/i386/zext-sse-1.c
 new file mode 100644
-index 000000000..0965c89dd
+index 0000000..0965c89
 --- /dev/null
 +++ b/gcc/testsuite/gcc.target/i386/zext-sse-1.c
 @@ -0,0 +1,103 @@
@@ -6608,7 +8020,7 @@ index 000000000..0965c89dd
 +}
 diff --git a/gcc/testsuite/gcc.target/i386/zext-sse-2.c b/gcc/testsuite/gcc.target/i386/zext-sse-2.c
 new file mode 100644
-index 000000000..7d917cfd5
+index 0000000..7d917cf
 --- /dev/null
 +++ b/gcc/testsuite/gcc.target/i386/zext-sse-2.c
 @@ -0,0 +1,68 @@
@@ -6681,7 +8093,7 @@ index 000000000..7d917cfd5
 +  return (struct foo) { x->x, x->y, x->z };
 +}
 diff --git a/gcc/text-art/style.cc b/gcc/text-art/style.cc
-index d3d898ccb..bd3335d6b 100644
+index d3d898c..bd3335d 100644
 --- a/gcc/text-art/style.cc
 +++ b/gcc/text-art/style.cc
 @@ -146,7 +146,8 @@ style::color::print_sgr (pretty_printer *pp,
@@ -6711,10 +8123,23 @@ index d3d898ccb..bd3335d6b 100644
        }
        break;
      }
+diff --git a/gcc/tree-pass.h b/gcc/tree-pass.h
+index b3c9765..18bb753 100644
+--- a/gcc/tree-pass.h
++++ b/gcc/tree-pass.h
+@@ -375,6 +375,7 @@ extern gimple_opt_pass *make_pass_tree_loop (gcc::context *ctxt);
+ extern gimple_opt_pass *make_pass_tree_no_loop (gcc::context *ctxt);
+ extern gimple_opt_pass *make_pass_tree_loop_init (gcc::context *ctxt);
+ extern gimple_opt_pass *make_pass_loop_versioning (gcc::context *ctxt);
++extern gimple_opt_pass *make_pass_loop_invdiv (gcc::context *ctxt);
+ extern gimple_opt_pass *make_pass_lim (gcc::context *ctxt);
+ extern gimple_opt_pass *make_pass_linterchange (gcc::context *ctxt);
+ extern gimple_opt_pass *make_pass_tree_unswitch (gcc::context *ctxt);
 diff --git a/gcc/tree-scalar-evolution.cc b/gcc/tree-scalar-evolution.cc
+index dcbec9c..6f7eb58 100644
 --- a/gcc/tree-scalar-evolution.cc
 +++ b/gcc/tree-scalar-evolution.cc
-@@ -1891,6 +1891,104 @@
+@@ -1891,6 +1891,104 @@ interpret_rhs_expr (class loop *loop, gimple *at_stmt,
  	res = chrec_convert (type, res, at_stmt);
        break;
  
@@ -6820,7 +8245,7 @@ diff --git a/gcc/tree-scalar-evolution.cc b/gcc/tree-scalar-evolution.cc
        {
  	/* Handle A<<B as A * (1<<B).  */
 diff --git a/gcc/tree-ssa-loop-ivopts.cc b/gcc/tree-ssa-loop-ivopts.cc
-index 6ecf5bef7..e957043d3 100644
+index 6ecf5be..e957043 100644
 --- a/gcc/tree-ssa-loop-ivopts.cc
 +++ b/gcc/tree-ssa-loop-ivopts.cc
 @@ -6080,7 +6080,7 @@ ivopts_estimate_reg_pressure (struct ivopts_data *data, unsigned n_invs,
@@ -6833,7 +8258,7 @@ index 6ecf5bef7..e957043d3 100644
    else if (regs_needed <= available_regs)
      cost = target_reg_cost [speed] * regs_needed;
 diff --git a/gcc/tree-ssa-math-opts.cc b/gcc/tree-ssa-math-opts.cc
-index cd3fd2fc8..393878ecf 100644
+index cd3fd2f..393878e 100644
 --- a/gcc/tree-ssa-math-opts.cc
 +++ b/gcc/tree-ssa-math-opts.cc
 @@ -6503,7 +6503,8 @@ math_opts_dom_walker::after_dom_children (basic_block bb)
@@ -6847,9 +8272,10 @@ index cd3fd2fc8..393878ecf 100644
    for (gphi_iterator psi_next, psi = gsi_start_phis (bb); !gsi_end_p (psi);
         psi = psi_next)
 diff --git a/gcc/tree-ssa-phiopt.cc b/gcc/tree-ssa-phiopt.cc
+index ebbb5e2..87bc922 100644
 --- a/gcc/tree-ssa-phiopt.cc
 +++ b/gcc/tree-ssa-phiopt.cc
-@@ -1070,9 +1070,44 @@
+@@ -1070,9 +1070,44 @@ match_simplify_replacement (basic_block cond_bb, basic_block middle_bb,
        if (stmt_to_move || stmt_to_move_alt)
  	return false;
        tree_code cmp = gimple_cond_code (stmt);
@@ -6898,7 +8324,7 @@ diff --git a/gcc/tree-ssa-phiopt.cc b/gcc/tree-ssa-phiopt.cc
        tree rhs = gimple_cond_rhs (stmt);
        /* `lhs CMP rhs ? lhs : rhs` or `lhs CMP rhs ? rhs : lhs`
 diff --git a/gcc/tree-ssa-reassoc.cc b/gcc/tree-ssa-reassoc.cc
-index e8c2779c3..04a7f375f 100644
+index e8c2779..04a7f37 100644
 --- a/gcc/tree-ssa-reassoc.cc
 +++ b/gcc/tree-ssa-reassoc.cc
 @@ -6239,6 +6239,56 @@ linearize_expr_tree (vec<operand_entry *> *ops, gimple *stmt,
@@ -6981,7 +8407,7 @@ index e8c2779c3..04a7f375f 100644
  			      /* width > 1 means ranking ops results in better
  				 parallelism.  Check current value to avoid
 diff --git a/gcc/tree-switch-conversion.cc b/gcc/tree-switch-conversion.cc
-index 5027ab559..6efaf20fb 100644
+index 5027ab5..6efaf20 100644
 --- a/gcc/tree-switch-conversion.cc
 +++ b/gcc/tree-switch-conversion.cc
 @@ -1831,9 +1831,15 @@ bit_test_cluster::find_bit_tests (vec<cluster *> &clusters, int max_c)
@@ -7001,8 +8427,103 @@ index 5027ab559..6efaf20fb 100644
  
        /* Since each cluster contains at least one case number and one bit test
  	 cluster can cover at most bits_in_word case numbers, we don't need to
+diff --git a/gcc/tree-vect-data-refs.cc b/gcc/tree-vect-data-refs.cc
+index ae556d8..ea9b1bd 100644
+--- a/gcc/tree-vect-data-refs.cc
++++ b/gcc/tree-vect-data-refs.cc
+@@ -363,7 +363,10 @@ vect_analyze_possibly_independent_ddr (data_dependence_relation *ddr,
+   class loop *loop = LOOP_VINFO_LOOP (loop_vinfo);
+   for (lambda_vector &dist_v : DDR_DIST_VECTS (ddr))
+     {
+-      int dist = dist_v[loop_depth];
++      /* ms178: dist_v elements are lambda_int == HOST_WIDE_INT.  Truncating
++	 to int can turn a huge distance into a small one (or into 0, which
++	 is interpreted as "same location"), so keep the full width.  */
++      HOST_WIDE_INT dist = dist_v[loop_depth];
+       if (dist != 0 && !(dist > 0 && DDR_REVERSED_P (ddr)))
+ 	{
+ 	  /* If the user asserted safelen >= DIST consecutive iterations
+@@ -525,11 +528,13 @@ vect_analyze_data_ref_dependence (struct data_dependence_relation *ddr,
+ 
+   FOR_EACH_VEC_ELT (DDR_DIST_VECTS (ddr), i, dist_v)
+     {
+-      int dist = dist_v[loop_depth];
++      /* ms178: keep the full HOST_WIDE_INT width; see above.  */
++      HOST_WIDE_INT dist = dist_v[loop_depth];
+ 
+       if (dump_enabled_p ())
+ 	dump_printf_loc (MSG_NOTE, vect_location,
+-                         "dependence distance  = %d.\n", dist);
++			 "dependence distance  = " HOST_WIDE_INT_PRINT_DEC
++			 ".\n", dist);
+ 
+       if (dist == 0)
+ 	{
+@@ -598,14 +603,28 @@ vect_analyze_data_ref_dependence (struct data_dependence_relation *ddr,
+ 	  /* Record a negative dependence distance to later limit the
+ 	     amount of stmt copying / unrolling we can perform.
+ 	     Only need to handle read-after-write dependence.  */
+-	  if (DR_IS_READ (drb)
+-	      && (STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) == 0
+-		  || STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) > (unsigned)dist))
+-	    STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) = dist;
++	  /* ms178: DIST is a HOST_WIDE_INT and is > 0 on this path, but
++	     min_neg_dist is only an unsigned int.  Saturate rather than
++	     silently truncating a huge distance down to a small one, which
++	     would under-estimate the dependence.  */
++	  if (DR_IS_READ (drb))
++	    {
++	      unsigned HOST_WIDE_INT udist = (unsigned HOST_WIDE_INT) dist;
++	      unsigned int sat
++		= (unsigned int) MIN (udist,
++				      (unsigned HOST_WIDE_INT) UINT_MAX);
++	      if (STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) == 0
++		  || STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) > sat)
++		STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) = sat;
++	    }
+ 	  continue;
+ 	}
+ 
+-      unsigned int abs_dist = abs (dist);
++      /* ms178: abs (INT_MIN) is undefined and, on a HOST_WIDE_INT distance,
++	 plain abs() would also truncate.  Use absu_hwi, which returns an
++	 unsigned HOST_WIDE_INT and is well defined for the most negative
++	 value.  */
++      unsigned HOST_WIDE_INT abs_dist = absu_hwi (dist);
+       if (abs_dist >= 2 && abs_dist < *max_vf)
+ 	{
+ 	  /* The dependence distance requires reduction of the maximal
+@@ -2132,8 +2151,13 @@ vect_peeling_hash_choose_best_peeling (hash_table<peel_info_hasher> *peeling_hta
+ 
+    if (!unlimited_cost_model (LOOP_VINFO_LOOP (loop_vinfo)))
+      {
+-       res.inside_cost = INT_MAX;
+-       res.outside_cost = INT_MAX;
++       /* ms178: inside_cost/outside_cost are unsigned int, so the sentinel
++	  has to be UINT_MAX.  With INT_MAX any candidate costing more than
++	  2^31-1 could never win the "cost < min->cost" comparison, so no
++	  peeling option was recorded at all and peel_info.dr_info stayed
++	  NULL -- the caller then concluded that peeling is impossible.  */
++       res.inside_cost = UINT_MAX;
++       res.outside_cost = UINT_MAX;
+        peeling_htab->traverse <_vect_peel_extended_info *,
+ 	   		       vect_peeling_hash_get_lowest_cost> (&res);
+      }
+@@ -2163,7 +2187,11 @@ vect_peeling_supportable (loop_vec_info loop_vinfo, dr_vec_info *dr0_info,
+     = known_alignment_for_access_p (dr0_info,
+ 				    STMT_VINFO_VECTYPE (dr0_info->stmt));
+   bool has_unsupported_dr_p = false;
+-  unsigned int dr0_step = tree_to_shwi (DR_STEP (dr0_info->dr));
++  /* ms178: DR_STEP is signed and can exceed 32 bits; storing it in an
++     unsigned int both truncates it and breaks the comparison against
++     tree_to_shwi () below, so two accesses with the same negative step
++     compared unequal and peeling was needlessly rejected.  */
++  HOST_WIDE_INT dr0_step = tree_to_shwi (DR_STEP (dr0_info->dr));
+   int known_unsupported_misalignment = DR_MISALIGNMENT_UNKNOWN;
+ 
+   /* Check if each data ref can be vectorized after peeling.  */
 diff --git a/gcc/tree-vect-generic.cc b/gcc/tree-vect-generic.cc
-index f25d207b3..fa799ffc0 100644
+index f25d207..fa799ff 100644
 --- a/gcc/tree-vect-generic.cc
 +++ b/gcc/tree-vect-generic.cc
 @@ -570,7 +570,7 @@ expand_vector_mult (gimple_stmt_iterator *gsi, tree type, tree op0,
@@ -7014,200 +8535,11 @@ index f25d207b3..fa799ffc0 100644
    for (unsigned int i = 0; i < nunits; i++)
      {
        tree cst = VECTOR_CST_ELT (op1, i);
-diff --git a/gcc/tree-vect-patterns.cc b/gcc/tree-vect-patterns.cc
---- a/gcc/tree-vect-patterns.cc
-+++ b/gcc/tree-vect-patterns.cc
-@@ -2676,6 +2676,33 @@
-       lhs = gimple_assign_lhs (stmt);
-       ret_type = TREE_TYPE (lhs);
-     }
-+  /* ms178: also match the BIT_FIELD_REF assignment on its own.
-+     Previously this recogniser only fired when the bitfield feeds a
-+     CONVERT or a gcond.  Any other consumer -- BIT_AND_EXPR and a
-+     comparison against a non-constant being the common ones -- left the
-+     BIT_FIELD_REF in the IL, where SLP build rejects it outright
-+     ("BIT_FIELD_REF not supported", because the base is a loaded scalar
-+     rather than an SSA vector) and the whole loop stayed scalar.
-+
-+     A BIT_FIELD_REF of an integral container is just a shift and a mask,
-+     which is exactly what the body of this function already emits, so
-+     lowering it unconditionally costs nothing and lets the loop
-+     vectorize.  Concretely this is the shape that Mesa's bit-packed IR
-+     nodes produce (ACO's Temp id_:24/reg_class:8, nir_instr's flag
-+     bitfields, ac_surface descriptors -- 780 bitfield declarations in
-+     the AMD/NIR headers alone):
-+
-+	 s += t[i].rc & 32;        <- BIT_AND of a bitfield
-+	 s += t[i].rc > 3;         <- compare of a bitfield
-+
-+     both of which were scalar before and vectorize after.  */
-+  else if (is_gimple_assign (stmt)
-+	   && gimple_assign_rhs_code (stmt) == BIT_FIELD_REF)
-+    {
-+      bf_stmt = as_a <gassign *> (stmt);
-+      lhs = gimple_assign_lhs (stmt);
-+      ret_type = TREE_TYPE (lhs);
-+    }
- 
-   if (!bf_stmt
-       || gimple_assign_rhs_code (bf_stmt) != BIT_FIELD_REF)
-diff --git a/libgomp/config/linux/wait.h b/libgomp/config/linux/wait.h
-index f9141408c..cb0cec6f3 100644
---- a/libgomp/config/linux/wait.h
-+++ b/libgomp/config/linux/wait.h
-@@ -57,7 +57,16 @@ static inline int do_spin (int *addr, int val)
-     if (__builtin_expect (__atomic_load_n (addr, MEMMODEL_RELAXED) != val, 0))
-       return 0;
-     else
--      cpu_relax ();
-+      {
-+	/* Two-phase back-off: plain NOPs during the first half of the
-+	   spin window keep wakeup latency minimal, PAUSE afterwards
-+	   yields pipeline resources to the sibling hyper-thread and
-+	   reduces power (PAUSE costs ~30-40 cycles on modern cores).  */
-+	if (i < count / 2)
-+	  __asm__ __volatile__ ("nop\n\tnop\n\tnop" : : : "memory");
-+	else
-+	  cpu_relax ();
-+      }
-   return 1;
- }
- 
-diff --git a/lto-plugin/lto-plugin.c b/lto-plugin/lto-plugin.c
-index ee0be4c55..fd12d770a 100644
---- a/lto-plugin/lto-plugin.c
-+++ b/lto-plugin/lto-plugin.c
-@@ -1091,7 +1091,7 @@ static int
- process_symtab (void *data, const char *name, off_t offset, off_t length)
- {
-   struct plugin_objfile *obj = (struct plugin_objfile *)data;
--  char *s;
-+  const char *s;
-   char *secdatastart, *secdata;
- 
-   if (!startswith (name, ".gnu.lto_.symtab"))
-@@ -1143,7 +1143,7 @@ process_symtab_extension (void *data, const char *name, off_t offset,
- 			  off_t length)
- {
-   struct plugin_objfile *obj = (struct plugin_objfile *)data;
--  char *s;
-+  const char *s;
-   char *secdatastart, *secdata;
- 
-   if (!startswith (name, ".gnu.lto_.ext_symtab"))
-diff --git a/gcc/testsuite/gcc.target/i386/ms178-vec-merge-fuse-1.c b/gcc/testsuite/gcc.target/i386/ms178-vec-merge-fuse-1.c
-new file mode 100644
---- /dev/null
-+++ b/gcc/testsuite/gcc.target/i386/ms178-vec-merge-fuse-1.c
-@@ -0,0 +1,41 @@
-+/* Zeroing several lanes of a 128-bit vector one lane at a time must
-+   collapse into a single insertps, not one insn per lane.  This relies
-+   on the nested VEC_MERGE fusion in simplify_ternary_operation:
-+     (vec_merge (vec_merge A B sel0) B sel)
-+       -> (vec_merge A B (sel0 & sel))
-+   where B is the all-zeros vector supplied by
-+   sse4_1_insertps_<mode>_zero.  */
-+/* { dg-do compile } */
-+/* { dg-options "-O2 -msse4.1" } */
-+
-+typedef int v4si __attribute__ ((vector_size (16)));
-+typedef float v4sf __attribute__ ((vector_size (16)));
-+
-+v4sf
-+zero_two_lanes_f (v4sf v)
-+{
-+  v[0] = 0.0f;
-+  v[2] = 0.0f;
-+  return v;
-+}
-+
-+v4sf
-+zero_three_lanes_f (v4sf v)
-+{
-+  v[0] = 0.0f;
-+  v[1] = 0.0f;
-+  v[3] = 0.0f;
-+  return v;
-+}
-+
-+v4si
-+zero_two_lanes_i (v4si v)
-+{
-+  v[1] = 0;
-+  v[3] = 0;
-+  return v;
-+}
-+
-+/* Each function must need exactly one insertps.  Before the fusion rule
-+   these emitted one insertps per zeroed lane.  */
-+/* { dg-final { scan-assembler-times "insertps" 3 } } */
-diff --git a/gcc/testsuite/gcc.target/i386/ms178-vecset-retype-1.c b/gcc/testsuite/gcc.target/i386/ms178-vecset-retype-1.c
-new file mode 100644
---- /dev/null
-+++ b/gcc/testsuite/gcc.target/i386/ms178-vecset-retype-1.c
-@@ -0,0 +1,28 @@
-+/* Storing through a pointer whose element type differs from the vector's
-+   element type must still use vec_set instead of spilling the whole
-+   vector to the stack.  __m256i/__m512i are vectors of long long, so the
-+   common intrinsic idiom ((int *) &v)[i] = x has SImode fields in a
-+   V4DI/V8DI vector.  */
-+/* { dg-do compile } */
-+/* { dg-options "-O2 -mavx2" } */
-+
-+#include <immintrin.h>
-+
-+__m256i
-+zero_lane1 (__m256i v)
-+{
-+  ((int *) &v)[1] = 0;
-+  return v;
-+}
-+
-+__m256i
-+set_lane2 (__m256i v, int x)
-+{
-+  ((int *) &v)[2] = x;
-+  return v;
-+}
-+
-+/* Neither function may build a stack frame; before this fix both spilled
-+   the vector to an aligned stack slot and read it back.  */
-+/* { dg-final { scan-assembler-not "andq\t\\\$-32, %rsp" } } */
-+/* { dg-final { scan-assembler-not "vmovdqa\t%ymm\[0-9\]+, -\[0-9\]+\\(%rsp\\)" } } */
-diff --git a/gcc/testsuite/gcc.target/i386/ms178-vecset-zero-2di-1.c b/gcc/testsuite/gcc.target/i386/ms178-vecset-zero-2di-1.c
-new file mode 100644
---- /dev/null
-+++ b/gcc/testsuite/gcc.target/i386/ms178-vecset-zero-2di-1.c
-@@ -0,0 +1,25 @@
-+/* Zeroing one 64-bit lane of a V2DI/V2DF covers exactly two 32-bit lanes,
-+   so it can be done with a single insertps rather than materialising a
-+   zero in a GPR and using vpinsrq.  */
-+/* { dg-do compile } */
-+/* { dg-options "-O2 -msse4.1" } */
-+
-+typedef long long v2di __attribute__ ((vector_size (16)));
-+typedef double v2df __attribute__ ((vector_size (16)));
-+
-+v2di
-+zq0 (v2di v)
-+{
-+  v[0] = 0;
-+  return v;
-+}
-+
-+v2df
-+zd0 (v2df v)
-+{
-+  v[0] = 0.0;
-+  return v;
-+}
-+
-+/* { dg-final { scan-assembler-not "pinsrq" } } */
-+/* { dg-final { scan-assembler-times "insertps" 2 } } */
 diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc
+index 8101261..cd13fb4 100644
 --- a/gcc/tree-vect-loop.cc
 +++ b/gcc/tree-vect-loop.cc
-@@ -4450,16 +4450,28 @@
+@@ -4450,16 +4450,28 @@ vect_estimate_min_profitable_iters (loop_vec_info loop_vinfo,
        *suggested_unroll_factor = 1;
      }
  
@@ -7240,7 +8572,7 @@ diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc
                     vec_epilogue_cost);
        dump_printf (MSG_NOTE, "  Scalar iteration cost: %d\n",
                     scalar_single_iter_cost);
-@@ -4483,8 +4495,13 @@
+@@ -4483,8 +4495,13 @@ vect_estimate_min_profitable_iters (loop_vec_info loop_vinfo,
       NPEEL = prologue iterations + epilogue iterations,
       SOC = scalar outside cost for run time cost model check.  */
  
@@ -7256,7 +8588,7 @@ diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc
    if (saving_per_viter <= 0)
      {
        if (LOOP_VINFO_LOOP (loop_vinfo)->force_vectorize)
-@@ -4493,7 +4510,7 @@
+@@ -4493,7 +4510,7 @@ vect_estimate_min_profitable_iters (loop_vec_info loop_vinfo,
  
        if (dump_enabled_p ())
          dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
@@ -7265,7 +8597,7 @@ diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc
  			 "divided by the scalar iteration cost = %d "
  			 "is greater or equal to the vectorization factor = %d"
                           ".\n",
-@@ -4524,9 +4541,14 @@
+@@ -4524,9 +4541,14 @@ vect_estimate_min_profitable_iters (loop_vec_info loop_vinfo,
  			      - scalar_outside_cost);
        /* We're only interested in cases that require at least one
  	 vector iteration.  */
@@ -7281,7 +8613,7 @@ diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc
  
        if (dump_enabled_p ())
  	dump_printf (MSG_NOTE, "  Minimum number of vector iterations: %d\n",
-@@ -4543,13 +4565,20 @@
+@@ -4543,13 +4565,20 @@ vect_estimate_min_profitable_iters (loop_vec_info loop_vinfo,
  	     vniters * VF + NPEEL, but it might be (and often is) less
  	     than that if a partial vector iteration is cheaper than the
  	     equivalent scalar code.  */
@@ -7306,7 +8638,7 @@ diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc
  	}
        else
  	/* Convert the number of vector iterations into a number of
-@@ -4560,21 +4589,35 @@
+@@ -4560,21 +4589,35 @@ vect_estimate_min_profitable_iters (loop_vec_info loop_vinfo,
      }
    else
      {
@@ -7353,7 +8685,7 @@ diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc
  	}
      }
  
-@@ -4618,16 +4661,24 @@
+@@ -4618,16 +4661,24 @@ vect_estimate_min_profitable_iters (loop_vec_info loop_vinfo,
  			      - scalar_single_iter_cost * peel_iters_prologue
  			      - scalar_single_iter_cost * peel_iters_epilogue
  			      + scalar_outside_cost);
@@ -7383,7 +8715,7 @@ diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc
  	}
        else
  	min_profitable_estimate = (min_vec_niters * assumed_vf
-@@ -4636,12 +4687,18 @@
+@@ -4636,12 +4687,18 @@ vect_estimate_min_profitable_iters (loop_vec_info loop_vinfo,
      }
    else
      {
@@ -7408,175 +8740,85 @@ diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc
      }
    min_profitable_estimate = MAX (min_profitable_estimate, min_profitable_iters);
    if (dump_enabled_p ())
-diff --git a/gcc/tree-vect-data-refs.cc b/gcc/tree-vect-data-refs.cc
---- a/gcc/tree-vect-data-refs.cc
-+++ b/gcc/tree-vect-data-refs.cc
-@@ -363,7 +363,10 @@
-   class loop *loop = LOOP_VINFO_LOOP (loop_vinfo);
-   for (lambda_vector &dist_v : DDR_DIST_VECTS (ddr))
-     {
--      int dist = dist_v[loop_depth];
-+      /* ms178: dist_v elements are lambda_int == HOST_WIDE_INT.  Truncating
-+	 to int can turn a huge distance into a small one (or into 0, which
-+	 is interpreted as "same location"), so keep the full width.  */
-+      HOST_WIDE_INT dist = dist_v[loop_depth];
-       if (dist != 0 && !(dist > 0 && DDR_REVERSED_P (ddr)))
- 	{
- 	  /* If the user asserted safelen >= DIST consecutive iterations
-@@ -525,11 +528,13 @@
+diff --git a/gcc/tree-vect-patterns.cc b/gcc/tree-vect-patterns.cc
+index 7c6a472..b54e24e 100644
+--- a/gcc/tree-vect-patterns.cc
++++ b/gcc/tree-vect-patterns.cc
+@@ -2676,6 +2676,33 @@ vect_recog_bitfield_ref_pattern (vec_info *vinfo, stmt_vec_info stmt_info,
+       lhs = gimple_assign_lhs (stmt);
+       ret_type = TREE_TYPE (lhs);
+     }
++  /* ms178: also match the BIT_FIELD_REF assignment on its own.
++     Previously this recogniser only fired when the bitfield feeds a
++     CONVERT or a gcond.  Any other consumer -- BIT_AND_EXPR and a
++     comparison against a non-constant being the common ones -- left the
++     BIT_FIELD_REF in the IL, where SLP build rejects it outright
++     ("BIT_FIELD_REF not supported", because the base is a loaded scalar
++     rather than an SSA vector) and the whole loop stayed scalar.
++
++     A BIT_FIELD_REF of an integral container is just a shift and a mask,
++     which is exactly what the body of this function already emits, so
++     lowering it unconditionally costs nothing and lets the loop
++     vectorize.  Concretely this is the shape that Mesa's bit-packed IR
++     nodes produce (ACO's Temp id_:24/reg_class:8, nir_instr's flag
++     bitfields, ac_surface descriptors -- 780 bitfield declarations in
++     the AMD/NIR headers alone):
++
++	 s += t[i].rc & 32;        <- BIT_AND of a bitfield
++	 s += t[i].rc > 3;         <- compare of a bitfield
++
++     both of which were scalar before and vectorize after.  */
++  else if (is_gimple_assign (stmt)
++	   && gimple_assign_rhs_code (stmt) == BIT_FIELD_REF)
++    {
++      bf_stmt = as_a <gassign *> (stmt);
++      lhs = gimple_assign_lhs (stmt);
++      ret_type = TREE_TYPE (lhs);
++    }
  
-   FOR_EACH_VEC_ELT (DDR_DIST_VECTS (ddr), i, dist_v)
-     {
--      int dist = dist_v[loop_depth];
-+      /* ms178: keep the full HOST_WIDE_INT width; see above.  */
-+      HOST_WIDE_INT dist = dist_v[loop_depth];
+   if (!bf_stmt
+       || gimple_assign_rhs_code (bf_stmt) != BIT_FIELD_REF)
+diff --git a/libgomp/config/linux/wait.h b/libgomp/config/linux/wait.h
+index f914140..cb0cec6 100644
+--- a/libgomp/config/linux/wait.h
++++ b/libgomp/config/linux/wait.h
+@@ -57,7 +57,16 @@ static inline int do_spin (int *addr, int val)
+     if (__builtin_expect (__atomic_load_n (addr, MEMMODEL_RELAXED) != val, 0))
+       return 0;
+     else
+-      cpu_relax ();
++      {
++	/* Two-phase back-off: plain NOPs during the first half of the
++	   spin window keep wakeup latency minimal, PAUSE afterwards
++	   yields pipeline resources to the sibling hyper-thread and
++	   reduces power (PAUSE costs ~30-40 cycles on modern cores).  */
++	if (i < count / 2)
++	  __asm__ __volatile__ ("nop\n\tnop\n\tnop" : : : "memory");
++	else
++	  cpu_relax ();
++      }
+   return 1;
+ }
  
-       if (dump_enabled_p ())
- 	dump_printf_loc (MSG_NOTE, vect_location,
--                         "dependence distance  = %d.\n", dist);
-+			 "dependence distance  = " HOST_WIDE_INT_PRINT_DEC
-+			 ".\n", dist);
+diff --git a/lto-plugin/lto-plugin.c b/lto-plugin/lto-plugin.c
+index ee0be4c..fd12d77 100644
+--- a/lto-plugin/lto-plugin.c
++++ b/lto-plugin/lto-plugin.c
+@@ -1091,7 +1091,7 @@ static int
+ process_symtab (void *data, const char *name, off_t offset, off_t length)
+ {
+   struct plugin_objfile *obj = (struct plugin_objfile *)data;
+-  char *s;
++  const char *s;
+   char *secdatastart, *secdata;
  
-       if (dist == 0)
- 	{
-@@ -598,14 +603,28 @@
- 	  /* Record a negative dependence distance to later limit the
- 	     amount of stmt copying / unrolling we can perform.
- 	     Only need to handle read-after-write dependence.  */
--	  if (DR_IS_READ (drb)
--	      && (STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) == 0
--		  || STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) > (unsigned)dist))
--	    STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) = dist;
-+	  /* ms178: DIST is a HOST_WIDE_INT and is > 0 on this path, but
-+	     min_neg_dist is only an unsigned int.  Saturate rather than
-+	     silently truncating a huge distance down to a small one, which
-+	     would under-estimate the dependence.  */
-+	  if (DR_IS_READ (drb))
-+	    {
-+	      unsigned HOST_WIDE_INT udist = (unsigned HOST_WIDE_INT) dist;
-+	      unsigned int sat
-+		= (unsigned int) MIN (udist,
-+				      (unsigned HOST_WIDE_INT) UINT_MAX);
-+	      if (STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) == 0
-+		  || STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) > sat)
-+		STMT_VINFO_MIN_NEG_DIST (stmtinfo_b) = sat;
-+	    }
- 	  continue;
- 	}
+   if (!startswith (name, ".gnu.lto_.symtab"))
+@@ -1143,7 +1143,7 @@ process_symtab_extension (void *data, const char *name, off_t offset,
+ 			  off_t length)
+ {
+   struct plugin_objfile *obj = (struct plugin_objfile *)data;
+-  char *s;
++  const char *s;
+   char *secdatastart, *secdata;
  
--      unsigned int abs_dist = abs (dist);
-+      /* ms178: abs (INT_MIN) is undefined and, on a HOST_WIDE_INT distance,
-+	 plain abs() would also truncate.  Use absu_hwi, which returns an
-+	 unsigned HOST_WIDE_INT and is well defined for the most negative
-+	 value.  */
-+      unsigned HOST_WIDE_INT abs_dist = absu_hwi (dist);
-       if (abs_dist >= 2 && abs_dist < *max_vf)
- 	{
- 	  /* The dependence distance requires reduction of the maximal
-@@ -2132,8 +2151,13 @@
- 
-    if (!unlimited_cost_model (LOOP_VINFO_LOOP (loop_vinfo)))
-      {
--       res.inside_cost = INT_MAX;
--       res.outside_cost = INT_MAX;
-+       /* ms178: inside_cost/outside_cost are unsigned int, so the sentinel
-+	  has to be UINT_MAX.  With INT_MAX any candidate costing more than
-+	  2^31-1 could never win the "cost < min->cost" comparison, so no
-+	  peeling option was recorded at all and peel_info.dr_info stayed
-+	  NULL -- the caller then concluded that peeling is impossible.  */
-+       res.inside_cost = UINT_MAX;
-+       res.outside_cost = UINT_MAX;
-        peeling_htab->traverse <_vect_peel_extended_info *,
- 	   		       vect_peeling_hash_get_lowest_cost> (&res);
-      }
-@@ -2163,7 +2187,11 @@
-     = known_alignment_for_access_p (dr0_info,
- 				    STMT_VINFO_VECTYPE (dr0_info->stmt));
-   bool has_unsupported_dr_p = false;
--  unsigned int dr0_step = tree_to_shwi (DR_STEP (dr0_info->dr));
-+  /* ms178: DR_STEP is signed and can exceed 32 bits; storing it in an
-+     unsigned int both truncates it and breaks the comparison against
-+     tree_to_shwi () below, so two accesses with the same negative step
-+     compared unequal and peeling was needlessly rejected.  */
-+  HOST_WIDE_INT dr0_step = tree_to_shwi (DR_STEP (dr0_info->dr));
-   int known_unsupported_misalignment = DR_MISALIGNMENT_UNKNOWN;
- 
-   /* Check if each data ref can be vectorized after peeling.  */
-diff --git a/gcc/testsuite/gcc.dg/vect/ms178-cost-overflow-1.c b/gcc/testsuite/gcc.dg/vect/ms178-cost-overflow-1.c
-new file mode 100644
---- /dev/null
-+++ b/gcc/testsuite/gcc.dg/vect/ms178-cost-overflow-1.c
-@@ -0,0 +1,34 @@
-+/* The loop cost model accumulates per-statement costs into unsigned
-+   counters that are scaled by --param=vect-inner-loop-cost-factor (which
-+   may be as large as 10000).  Before the ms178 fix several expressions in
-+   vect_estimate_min_profitable_iters mixed those unsigned values with int
-+   arithmetic, so a large body cost could wrap and turn an unprofitable
-+   loop into an apparently profitable one (or vice versa).
-+
-+   This test just makes sure the compiler still behaves sanely - it must
-+   not ICE and must still vectorize the trivially profitable loop - when
-+   the cost factor is pushed to its maximum.  */
-+/* { dg-do compile } */
-+/* { dg-additional-options "--param=vect-inner-loop-cost-factor=10000" } */
-+
-+#define N 1024
-+float a[N], b[N], c[N];
-+
-+void
-+simple (void)
-+{
-+  for (int i = 0; i < N; i++)
-+    c[i] = a[i] + b[i];
-+}
-+
-+double x[N][N], y[N][N], z[N][N];
-+
-+void
-+nested (void)
-+{
-+  for (int i = 0; i < N; i++)
-+    for (int j = 0; j < N; j++)
-+      z[i][j] = x[i][j] * y[i][j] + z[i][j];
-+}
-+
-+/* { dg-final { scan-tree-dump "vectorized 1 loops" "vect" } } */
-diff --git a/gcc/testsuite/gcc.dg/vect/ms178-peel-sentinel-1.c b/gcc/testsuite/gcc.dg/vect/ms178-peel-sentinel-1.c
-new file mode 100644
---- /dev/null
-+++ b/gcc/testsuite/gcc.dg/vect/ms178-peel-sentinel-1.c
-@@ -0,0 +1,34 @@
-+/* vect_peeling_hash_choose_best_peeling() stores candidate costs in
-+   unsigned int fields but seeded the running minimum with INT_MAX.  Any
-+   peeling candidate costing more than 2^31-1 therefore lost the
-+   "cost < min->cost" comparison unconditionally, so no candidate was
-+   recorded and peel_info.dr_info stayed NULL - the caller then behaved as
-+   if no peeling option existed at all.
-+
-+   Separately, vect_peeling_supportable() kept DR_STEP in an unsigned int
-+   while comparing it against tree_to_shwi (), so two references with the
-+   same negative step compared unequal and peeling was rejected.
-+
-+   This test only checks that the compiler still vectorizes these loops
-+   and does not ICE; the fixes are validated numerically elsewhere.  */
-+/* { dg-do compile } */
-+/* { dg-additional-options "--param=vect-inner-loop-cost-factor=10000" } */
-+
-+void
-+descending (float *__restrict x, float *__restrict y,
-+	    float *__restrict z, int n)
-+{
-+  for (int i = n - 1; i >= 0; i--)
-+    z[i] = x[i] * y[i] + z[i];
-+}
-+
-+struct three { int a, b, c; };
-+
-+void
-+strided_descending (struct three *s, int n)
-+{
-+  for (int i = n - 1; i >= 0; i--)
-+    s[i].a = s[i].b + s[i].c;
-+}
-+
-+/* { dg-final { scan-tree-dump "vectorized 1 loops" "vect" } } */
+   if (!startswith (name, ".gnu.lto_.ext_symtab"))
