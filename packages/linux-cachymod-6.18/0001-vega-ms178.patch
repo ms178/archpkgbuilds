@@ -13097,7 +13097,7 @@ index c0cb7d796..690ed1be5 100644
  			goto err_chains;
  		}
 diff --git a/drivers/gpu/drm/ttm/ttm_bo_vm.c b/drivers/gpu/drm/ttm/ttm_bo_vm.c
-index e6abc7b40..9216e3bb4 100644
+index e6abc7b40..a81a9c02f 100644
 --- a/drivers/gpu/drm/ttm/ttm_bo_vm.c
 +++ b/drivers/gpu/drm/ttm/ttm_bo_vm.c
 @@ -1,4 +1,4 @@
@@ -13274,7 +13274,7 @@ index e6abc7b40..9216e3bb4 100644
  		}
  	}
  
-@@ -162,17 +185,100 @@ vm_fault_t ttm_bo_vm_reserve(struct ttm_buffer_object *bo,
+@@ -162,17 +185,108 @@ vm_fault_t ttm_bo_vm_reserve(struct ttm_buffer_object *bo,
  }
  EXPORT_SYMBOL(ttm_bo_vm_reserve);
  
@@ -13299,6 +13299,7 @@ index e6abc7b40..9216e3bb4 100644
 +	/* Hot data - accessed every iteration */
 +	struct page			**pages;
 +	unsigned long			page_offset;
++	unsigned long			page_first;
 +	unsigned long			page_last;
 +
 +	/* Cold data - accessed once per fault or for control flow */
@@ -13329,14 +13330,21 @@ index e6abc7b40..9216e3bb4 100644
 +		pfn = ttm_bo_io_mem_pfn(bag->bo, bag->page_offset);
 +	} else {
 +		struct page *page = bag->pages[bag->page_offset];
++		unsigned long cur = bag->page_offset;
 +
 +		/*
 +		 * NULL page means the backing store isn't allocated yet.
 +		 * This shouldn't happen after ttm_bo_populate() succeeds,
-+		 * but handle it gracefully.
++		 * but handle it gracefully: a hole on the faulted page is
++		 * fatal (VM_FAULT_OOM, matching upstream), whereas holes in
++		 * the prefaulted tail just truncate the batch (matching
++		 * upstream's `break`), leaving the PTE absent so the core
++		 * will refault it later.
 +		 */
-+		if (unlikely(!page))
-+			return -ENOMEM;
++		if (unlikely(!page)) {
++			bag->page_offset++;
++			return (cur == bag->page_first) ? -ENOMEM : 0;
++		}
 +
 +		/*
 +		 * Prefetch the next page pointer to warm the cache.
@@ -13344,8 +13352,8 @@ index e6abc7b40..9216e3bb4 100644
 +		 * large page arrays (e.g., 512 pages for a 2MB PMD).
 +		 * Bounds check ensures we don't read past the array.
 +		 */
-+		if (bag->page_offset + 1 < bag->page_last)
-+			prefetch(&bag->pages[bag->page_offset + 1]);
++		if (cur + 1 < bag->page_last)
++			prefetch(&bag->pages[cur + 1]);
 +
 +		pfn = page_to_pfn(page);
 +	}
@@ -13381,7 +13389,7 @@ index e6abc7b40..9216e3bb4 100644
   *
   * Return:
   *   VM_FAULT_NOPAGE on success or pending signal
-@@ -187,158 +293,253 @@ vm_fault_t ttm_bo_vm_fault_reserved(struct vm_fault *vmf,
+@@ -187,158 +301,258 @@ vm_fault_t ttm_bo_vm_fault_reserved(struct vm_fault *vmf,
  	struct vm_area_struct *vma = vmf->vma;
  	struct ttm_buffer_object *bo = vma->vm_private_data;
  	struct ttm_device *bdev = bo->bdev;
@@ -13460,6 +13468,7 @@ index e6abc7b40..9216e3bb4 100644
 +	bag = (struct ttm_bo_vm_fault_bag){
 +		.pages = NULL,
 +		.page_offset = page_offset,
++		.page_first = page_offset,
 +		.page_last = page_offset + max_pages,
 +		.mm = vma->vm_mm,
 +		.bo = bo,
@@ -13627,11 +13636,10 @@ index e6abc7b40..9216e3bb4 100644
 -	unsigned long pfn;
 +	struct ttm_bo_vm_dummy_bag bag;
  	struct page *page;
-+	unsigned long size;
 +	int err;
  
 -	/* Allocate new dummy page to map all the VA range in this VMA to it*/
-+	/* Allocate a zeroed dummy page to map across the entire VMA */
++	/* Allocate a zeroed dummy page for the faulted address */
  	page = alloc_page(GFP_KERNEL | __GFP_ZERO);
 -	if (!page)
 +	if (unlikely(!page))
@@ -13649,24 +13657,29 @@ index e6abc7b40..9216e3bb4 100644
 +		.prot = prot,
 +		.pfn = page_to_pfn(page),
 +	};
++
++	/*
++	 * Map only the faulted address, matching upstream.  Mapping the
++	 * whole VMA would (a) run apply_to_page_range() over the full
++	 * buffer size on every first fault after unplug (pathological for
++	 * multi-GiB mappings) and (b) silently zero-fill the entire
++	 * buffer, masking the device-gone condition; upstream instead
++	 * keeps SIGBUS-ing on subsequent faults.
++	 */
++	err = apply_to_page_range(vma->vm_mm, vmf->address, PAGE_SIZE,
++				  ttm_bo_vm_dummy_pte_cb, &bag);
  
 -	/* Prefault the entire VMA range right away to avoid further faults */
 -	for (address = vma->vm_start; address < vma->vm_end;
 -	     address += PAGE_SIZE)
 -		ret = vmf_insert_pfn_prot(vma, address, pfn, prot);
-+	size = vma->vm_end - vma->vm_start;
- 
--	return ret;
-+	/* Map the dummy page to the entire VMA to prevent further faults */
-+	err = apply_to_page_range(vma->vm_mm, vma->vm_start, size,
-+				  ttm_bo_vm_dummy_pte_cb, &bag);
-+
 +	if (unlikely(err)) {
 +		if (err == -ENOMEM)
 +			return VM_FAULT_OOM;
 +		return VM_FAULT_SIGBUS;
 +	}
-+
+ 
+-	return ret;
 +	return VM_FAULT_NOPAGE;
  }
  EXPORT_SYMBOL(ttm_bo_vm_dummy_page);
@@ -13708,7 +13721,7 @@ index e6abc7b40..9216e3bb4 100644
  	if (ret == VM_FAULT_RETRY && !(vmf->flags & FAULT_FLAG_RETRY_NOWAIT))
  		return ret;
  
-@@ -348,6 +549,13 @@ vm_fault_t ttm_bo_vm_fault(struct vm_fault *vmf)
+@@ -348,6 +562,13 @@ vm_fault_t ttm_bo_vm_fault(struct vm_fault *vmf)
  }
  EXPORT_SYMBOL(ttm_bo_vm_fault);
  
@@ -13722,7 +13735,7 @@ index e6abc7b40..9216e3bb4 100644
  void ttm_bo_vm_open(struct vm_area_struct *vma)
  {
  	struct ttm_buffer_object *bo = vma->vm_private_data;
-@@ -358,6 +566,13 @@ void ttm_bo_vm_open(struct vm_area_struct *vma)
+@@ -358,6 +579,13 @@ void ttm_bo_vm_open(struct vm_area_struct *vma)
  }
  EXPORT_SYMBOL(ttm_bo_vm_open);
  
@@ -13736,7 +13749,7 @@ index e6abc7b40..9216e3bb4 100644
  void ttm_bo_vm_close(struct vm_area_struct *vma)
  {
  	struct ttm_buffer_object *bo = vma->vm_private_data;
-@@ -367,18 +582,33 @@ void ttm_bo_vm_close(struct vm_area_struct *vma)
+@@ -367,18 +595,33 @@ void ttm_bo_vm_close(struct vm_area_struct *vma)
  }
  EXPORT_SYMBOL(ttm_bo_vm_close);
  
@@ -13774,7 +13787,7 @@ index e6abc7b40..9216e3bb4 100644
  	do {
  		unsigned long bytes = min(bytes_left, PAGE_SIZE - offset);
  		struct ttm_bo_kmap_obj map;
-@@ -386,15 +616,18 @@ static int ttm_bo_vm_access_kmap(struct ttm_buffer_object *bo,
+@@ -386,15 +629,18 @@ static int ttm_bo_vm_access_kmap(struct ttm_buffer_object *bo,
  		bool is_iomem;
  
  		ret = ttm_bo_kmap(bo, page, 1, &map);
@@ -13796,7 +13809,7 @@ index e6abc7b40..9216e3bb4 100644
  		ttm_bo_kunmap(&map);
  
  		page++;
-@@ -408,33 +641,27 @@ static int ttm_bo_vm_access_kmap(struct ttm_buffer_object *bo,
+@@ -408,33 +654,27 @@ static int ttm_bo_vm_access_kmap(struct ttm_buffer_object *bo,
  
  /**
   * ttm_bo_access - Helper to access a buffer object
@@ -13839,7 +13852,7 @@ index e6abc7b40..9216e3bb4 100644
  		ret = -ENODATA;
  		goto unlock;
  	}
-@@ -446,11 +673,11 @@ int ttm_bo_access(struct ttm_buffer_object *bo, unsigned long offset,
+@@ -446,11 +686,11 @@ int ttm_bo_access(struct ttm_buffer_object *bo, unsigned long offset,
  		ret = ttm_bo_vm_access_kmap(bo, offset, buf, len, write);
  		break;
  	default:
@@ -13855,7 +13868,7 @@ index e6abc7b40..9216e3bb4 100644
  	}
  
  unlock:
-@@ -460,11 +687,21 @@ int ttm_bo_access(struct ttm_buffer_object *bo, unsigned long offset,
+@@ -460,11 +700,21 @@ int ttm_bo_access(struct ttm_buffer_object *bo, unsigned long offset,
  }
  EXPORT_SYMBOL(ttm_bo_access);
  
@@ -13878,7 +13891,7 @@ index e6abc7b40..9216e3bb4 100644
  		((vma->vm_pgoff - drm_vma_node_start(&bo->base.vma_node))
  		 << PAGE_SHIFT);
  
-@@ -480,17 +717,18 @@ static const struct vm_operations_struct ttm_bo_vm_ops = {
+@@ -480,17 +730,18 @@ static const struct vm_operations_struct ttm_bo_vm_ops = {
  };
  
  /**
@@ -13902,7 +13915,7 @@ index e6abc7b40..9216e3bb4 100644
  		return -EINVAL;
  
  	drm_gem_object_get(&bo->base);
-@@ -506,7 +744,6 @@ int ttm_bo_mmap_obj(struct vm_area_struct *vma, struct ttm_buffer_object *bo)
+@@ -506,7 +757,6 @@ int ttm_bo_mmap_obj(struct vm_area_struct *vma, struct ttm_buffer_object *bo)
  	 * Note: We're transferring the bo reference to
  	 * vma->vm_private_data here.
  	 */
