@@ -3113,10 +3113,10 @@ index 6651c6dc..32d7fbc3 100644
                  let is_read = read_ranges.iter().any(|&(r_off, r_sz)| {
                      ranges_overlap(offset, store_bytes, r_off, r_sz)
 diff --git a/src/backend/x86/codegen/peephole/passes/identical_blocks.rs b/src/backend/x86/codegen/peephole/passes/identical_blocks.rs
-index f5aff9ac..4220ffdf 100644
+index f5aff9ac..1d57d557 100644
 --- a/src/backend/x86/codegen/peephole/passes/identical_blocks.rs
 +++ b/src/backend/x86/codegen/peephole/passes/identical_blocks.rs
-@@ -7,9 +7,16 @@
+@@ -7,9 +7,114 @@
  //! This primarily targets phi elimination trampoline blocks in large switch
  //! statements (e.g., sqlite3VdbeExec), where many case blocks produce
  //! identical phi copy sequences.
@@ -3131,10 +3131,108 @@ index f5aff9ac..4220ffdf 100644
  use super::super::types::*;
 -use crate::common::fx_hash::FxHashMap;
 +use crate::common::fx_hash::{FxHashMap, FxHashSet};
++
++// ── Soundness helpers (v8) ────────────────────────────────────────────────────
++//
++// Identical TEXT + identical predecessor LABELS is NOT sufficient to prove two
++// blocks are interchangeable, because live-in *state* can still differ:
++//   1. EFLAGS: a block reached via `je B` (fall-through is B2) carries the
++//      flags set by the predecessor's last compare. Two blocks with the same
++//      predecessor labels may be entered with different incoming flags if the
++//      flag-producing edges differ. Merging such blocks and reading the wrong
++//      flags is a miscompile. We therefore require that neither block is
++//      *flag-dependent at entry* (i.e. it establishes its own flags before any
++//      flag-consuming instruction, so incoming EFLAGS are irrelevant).
++//   2. Registers: identical predecessor labels only guarantee identical live-in
++//      register VALUES if each predecessor is a straight-line basic block. If a
++//      "predecessor" block contains internal non-.LBB labels (so it is not a
++//      single basic block), its register state on the edge to one target can
++//      differ from its state on the edge to the other. We therefore require the
++//      merged blocks and all their predecessors to be "clean" (single-entry,
++//      no internal labels), so the register values at entry are path-independent.
++
++/// Does this instruction set the EFLAGS (condition flags)?
++fn sets_flags(store: &LineStore, infos: &[LineInfo], i: usize) -> bool {
++    match infos[i].kind {
++        LineKind::Cmp => true, // cmp/test/ucomis*
++        LineKind::Push { .. } | LineKind::Pop { .. } | LineKind::Label
++        | LineKind::Jmp | LineKind::CondJmp | LineKind::JmpIndirect
++        | LineKind::Call | LineKind::Ret | LineKind::Directive
++        | LineKind::SelfMove | LineKind::SetCC { .. } => false,
++        _ => {
++            let t = infos[i].trimmed(store.get(i));
++            let mnem = t.split_whitespace().next().unwrap_or("");
++            matches!(mnem,
++                "addl"|"addq"|"addw"|"addb"|"subl"|"subq"|"subw"|"subb"|
++                "andl"|"andq"|"andw"|"andb"|"orl"|"orq"|"orw"|"orb"|
++                "xorl"|"xorq"|"xorw"|"xorb"|"imull"|"imulq"|"imulw"|
++                "mull"|"mulq"|"mulw"|"incl"|"incq"|"incw"|"decl"|"decq"|"decw"|
++                "negl"|"negq"|"negw"|"notl"|"notq"|"notw"|"shll"|"shlq"|"shlw"|
++                "shrl"|"shrq"|"shrw"|"sarl"|"sarq"|"sarw"|"roll"|"rolq"|"rolw"|
++                "rorl"|"rorq"|"rorw"|"testl"|"testq"|"testw"|"testb"|
++                "cmpl"|"cmpq"|"cmpw"|"cmpb"|"btl"|"btq"|"btw"|"btb")
++        }
++    }
++}
++
++/// Does this instruction consume (read) the EFLAGS?
++fn reads_flags(store: &LineStore, infos: &[LineInfo], i: usize) -> bool {
++    match infos[i].kind {
++        LineKind::CondJmp | LineKind::SetCC { .. } => true,
++        _ => {
++            let t = infos[i].trimmed(store.get(i));
++            let mnem = t.split_whitespace().next().unwrap_or("");
++            mnem.starts_with("cmov") || mnem.starts_with("set")
++                || mnem == "adcl" || mnem == "adcq" || mnem == "adcw"
++                || mnem == "sbbl" || mnem == "sbbq" || mnem == "sbbw"
++        }
++    }
++}
++
++/// True if the block reads EFLAGS *before* establishing them itself, i.e. it
++/// depends on the incoming (predecessor-set) flags.
++fn block_is_flag_dependent(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> bool {
++    let mut flags_set = false;
++    for j in (start + 1)..end {
++        if infos[j].is_nop() { continue; }
++        if sets_flags(store, infos, j) {
++            flags_set = true;
++        } else if reads_flags(store, infos, j) && !flags_set {
++            return true;
++        }
++    }
++    false
++}
++
++/// True if the block is a clean, single-entry straight-line basic block: it has
++/// no internal label (other than its own entry label) and no directives that
++/// would split it, so its register state at exit is path-independent.
++fn block_is_clean(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> bool {
++    for j in (start + 1)..end {
++        if infos[j].is_nop() { continue; }
++        match infos[j].kind {
++            LineKind::Label | LineKind::Directive => return false,
++            _ => {}
++        }
++    }
++    true
++}
++
++/// Whether the block contains any flag-consuming instruction at all (used to
++/// decide if EFLAGS matter for the merge).
++fn block_has_flag_use(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> bool {
++    for j in (start + 1)..end {
++        if infos[j].is_nop() { continue; }
++        if reads_flags(store, infos, j) || sets_flags(store, infos, j) {
++            return true;
++        }
++    }
++    false
++}
  
  /// Merge identical basic blocks.
  /// Returns true if any blocks were merged.
-@@ -18,34 +25,29 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
+@@ -18,34 +123,29 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
      if len < 10 { return false; }
  
      // Phase 1: Find all labels and their block boundaries.
@@ -3173,7 +3271,7 @@ index f5aff9ac..4220ffdf 100644
                      blocks.push((start, end, label_name.to_string(), current_func_id));
                      i = end;
                      continue;
-@@ -57,46 +59,95 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
+@@ -57,53 +157,200 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
  
      if blocks.len() < 2 { return false; }
  
@@ -3264,6 +3362,89 @@ index f5aff9ac..4220ffdf 100644
  
 -    // Phase 3: For each group of blocks with the same hash, verify they're truly
 -    // identical (not just hash collisions), then pick a canonical representative.
++    // Build label → block index map, for predecessor-cleanliness checks.
++    let mut label_to_bidx: FxHashMap<String, usize> = FxHashMap::default();
++    for (idx, b) in blocks.iter().enumerate() {
++        label_to_bidx.insert(b.2.clone(), idx);
++    }
++
++    // SOUNDNESS (v8): collect labels referenced from JUMP TABLES
++    // (`.long .LBBxxx - .Ljt_n` entries in .rodata). Redirecting/eliminating a
++    // block whose label appears in a jump table leaves the jump-table entry
++    // pointing at a removed (NOP) block — `jmp *%rdx` then lands on garbage and
++    // crashes. The pass cannot rewrite those `.long` entries, so any block that
++    // is a jump-table target must be excluded from merging entirely.
++    let mut jump_table_targets: FxHashSet<String> = FxHashSet::default();
++    for i in 0..len {
++        if infos[i].is_nop() { continue; }
++        let line = infos[i].trimmed(store.get(i));
++        if line.starts_with(".long ") {
++            // Extract every `.LBB...` label mentioned in the entry.
++            // The token is ".LBB" followed by the name characters; start scanning
++            // the name AFTER the ".LBB" prefix so `j` always advances past pos.
++            let mut rest = &line[..];
++            while let Some(pos) = rest.find(".LBB") {
++                let name_start = pos + ".LBB".len();
++                let mut j = name_start;
++                while j < rest.len() && (rest.as_bytes()[j].is_ascii_alphanumeric() || rest.as_bytes()[j] == b'_') {
++                    j += 1;
++                }
++                let tok = rest[pos..j].to_string();
++                jump_table_targets.insert(tok);
++                rest = &rest[j..];
++            }
++        }
++    }
++
++    // Compute the fall-through successor label for each block.
++    // A block FALLS THROUGH to the immediately-following block unless its
++    // terminator is an unconditional jump / indirect jump / return. The
++    // fall-through successor is NOT part of the block's text, so two identical
++    // blocks that fall through to DIFFERENT successors must not be merged
++    // (redirecting branches would change the fall-through destination).
++    // blocks are in source order, so the fall-through successor of block `bi`
++    // is the next block whose start equals block `bi`'s end (if it doesn't end
++    // in an unconditional jump/ret).
++    let mut fallthrough: Vec<Option<String>> = vec![None; blocks.len()];
++    for bi in 0..blocks.len() {
++        let term = block_terminator[bi];
++        let has_explicit_exit = matches!(term, LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret);
++        if !has_explicit_exit {
++            // Find the block that starts exactly where this block ends.
++            let end_pos = blocks[bi].1;
++            for x in 0..blocks.len() {
++                if x != bi && blocks[x].0 == end_pos {
++                    fallthrough[bi] = Some(blocks[x].2.clone());
++                    break;
++                }
++            }
++        }
++    }
++
++    // Precompute per-block soundness flags ONCE (not per candidate pair).
++    // flag_dep[i]: block reads incoming EFLAGS before establishing its own.
++    // clean[i]:    block is a single-entry straight-line basic block.
++    // preds_clean[i]: all predecessor blocks are clean basic blocks.
++    let nblocks = blocks.len();
++    let mut flag_dep = vec![false; nblocks];
++    let mut clean = vec![false; nblocks];
++    let mut preds_clean = vec![false; nblocks];
++    for bi in 0..nblocks {
++        let (bs, be, ref bl, _) = blocks[bi];
++        flag_dep[bi] = block_is_flag_dependent(store, infos, bs, be);
++        clean[bi] = block_is_clean(store, infos, bs, be);
++        let mut all_clean = true;
++        if let Some(pset) = preds.get(bl) {
++            for pl in pset {
++                if let Some(&pidx) = label_to_bidx.get(pl) {
++                    let (ps, pe, _, _) = blocks[pidx];
++                    if !block_is_clean(store, infos, ps, pe) { all_clean = false; break; }
++                }
++            }
++        }
++        preds_clean[bi] = all_clean;
++    }
++
 +    // Phase 3: Merge only truly-identical blocks with IDENTICAL predecessor sets.
      let mut changed = false;
      let mut redirects: FxHashMap<String, String> = FxHashMap::default(); // old_label → canonical_label
@@ -3282,25 +3463,43 @@ index f5aff9ac..4220ffdf 100644
          let canonical_instrs: Vec<String> = ((*can_start + 1)..*can_end)
              .filter(|&j| !infos[j].is_nop())
              .map(|j| store.get(j).to_string())
-@@ -104,6 +155,9 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
+             .collect();
  
++        // SOUNDNESS (v8): skip if the canonical block is flag-dependent, not
++        // clean, has a non-clean predecessor, or is a jump-table target.
++        if flag_dep[canonical_idx] || !clean[canonical_idx] || !preds_clean[canonical_idx]
++            || jump_table_targets.contains(&canonical_label) {
++            continue;
++        }
++
          for &other_idx in &group[1..] {
              let (other_start, other_end, ref other_label, _) = blocks[other_idx];
 +            let other_preds = preds.get(other_label).cloned().unwrap_or_default();
 +            // SOUNDNESS: require identical predecessor sets.
 +            if canonical_preds != other_preds { continue; }
++            // SOUNDNESS (v8): never merge/eliminate a jump-table target, a
++            // flag-dependent block, a non-clean block, or one with a non-clean
++            // predecessor.
++            if jump_table_targets.contains(other_label) { continue; }
++            if flag_dep[other_idx] || !clean[other_idx] || !preds_clean[other_idx] { continue; }
  
              let other_instrs: Vec<String> = ((other_start + 1)..other_end)
                  .filter(|&j| !infos[j].is_nop())
-@@ -111,24 +165,15 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
+@@ -111,24 +358,21 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                  .collect();
  
              if canonical_instrs == other_instrs {
 -                // Truly identical! Redirect branches to other_label → canonical_label.
 -                let (_, _, ref canonical_label, _) = blocks[canonical_idx];
-                 redirects.insert(other_label.clone(), canonical_label.clone());
--
+-                redirects.insert(other_label.clone(), canonical_label.clone());
++                // SOUNDNESS (v8): the fall-through successor is not part of the
++                // block text; both blocks must fall through to the SAME next
++                // block (or neither falls through), else redirecting changes
++                // control flow after the merged block.
++                if fallthrough[canonical_idx] != fallthrough[other_idx] { continue; }
+ 
 -                // NOP out the duplicate block
++                redirects.insert(other_label.clone(), canonical_label.clone());
                  for j in other_start..other_end {
 -                    if !infos[j].is_nop() {
 -                        mark_nop(&mut infos[j]);
@@ -3319,7 +3518,7 @@ index f5aff9ac..4220ffdf 100644
  
      // Phase 4: Rewrite all branch targets that reference redirected labels.
      for i in 0..len {
-@@ -137,7 +182,6 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
+@@ -137,7 +381,6 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
              LineKind::Jmp | LineKind::CondJmp => {
                  let line = store.get(i).to_string();
                  let trimmed = infos[i].trimmed(&line);
@@ -3328,7 +3527,7 @@ index f5aff9ac..4220ffdf 100644
                      let target = trimmed[space_pos + 1..].trim();
                      if let Some(canonical) = redirects.get(target) {
 diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-index 08304359..5d8b54e6 100644
+index 08304359..eada4109 100644
 --- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
 +++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
 @@ -101,12 +101,38 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
@@ -3372,9 +3571,64 @@ index 08304359..5d8b54e6 100644
                          }
                          _ => false,
                      };
-@@ -959,7 +985,14 @@ pub(super) fn fold_accumulator_alu_store(
+@@ -929,37 +955,53 @@ pub(super) fn fold_accumulator_alu_store(
+             (ao.to_string(), ms)
+         };
+ 
+-        // Step 3: Next must be `cltq`
+-        let mut k = j + 1;
+-        while k < len && infos[k].is_nop() { k += 1; }
+-        if k >= len { i += 1; continue; }
+-        { let tk = infos[k].trimmed(store.get(k)); if tk != "cltq" { i += 1; continue; } }
+-
+-        // Step 4: Next must be `movq %rax, STACK` (store to stack)
+-        let mut m = k + 1;
++        // Step 3: The instruction after the ALU must be a 32-bit STORE of
++        // %eax directly (no `cltq` sign-extension in between).
++        //
++        // SOUNDNESS (v8): the original pattern was `movl %REGd,%eax;
++        // OP mem,%eax; cltq; movq %rax,slot`, and the pass rewrote it to
++        // `OP mem,%REGd; movl %REGd,slot`. That was UNSOUND: `cltq` sign-extends
++        // the 32-bit ALU result to 64 bits, so the original `movq %rax,slot`
++        // stores 8 bytes (upper 4 bytes = 0xFFFFFFFF when the result is
++        // negative). The rewrite stored only 4 bytes (`movl %REGd`), corrupting
++        // the adjacent stack slot and dropping the sign extension. We therefore
++        // only fold when the ALU result is stored as 32 bits with NO sign
++        // extension (`movl %eax,slot`), so `OP mem,%REGd; movl %REGd,slot` is
++        // exactly equivalent.
++        let mut m = j + 1;
+         while m < len && infos[m].is_nop() { m += 1; }
+         if m >= len || infos[m].is_barrier() { i += 1; continue; }
+ 
+         let store_dst_s = {
+-            let is_store_rax = match infos[m].kind {
+-                LineKind::StoreRbp { reg: 0, size: MoveSize::Q, .. } => true,
++            let is_32bit_store_rax = match infos[m].kind {
++                LineKind::StoreRbp { reg: 0, size: MoveSize::L, .. } => true,
+                 _ => {
+                     let tm = infos[m].trimmed(store.get(m));
+-                    tm.starts_with("movq %rax, ") && (tm.ends_with("(%rsp)") || tm.ends_with("(%rbp)"))
++                    tm.starts_with("movl %eax, ") && (tm.ends_with("(%rsp)") || tm.ends_with("(%rbp)"))
+                 }
+             };
+-            if !is_store_rax { i += 1; continue; }
++            if !is_32bit_store_rax { i += 1; continue; }
+             let tm = infos[m].trimmed(store.get(m));
+-            tm[11..].to_string() // after "movq %rax, "
++            tm[11..].to_string() // after "movl %eax, "
+         };
+ 
+-        // Step 5: Verify %SRC_REG is overwritten before its next 64-bit read
++        // Step 4: Verify %SRC_REG is dead from the point we modify it (j)
++        // until it is overwritten. The transform does `OP mem, %REGd`, which
++        // DESTROYS %REGd; if %REGd is read before being overwritten (or is live
++        // on another edge at a barrier), the transform is unsound.
+         let src_bit = 1u16 << src_family;
+-        let mut n = m + 1;
++        let mut n = j + 1;
          let mut src_safe = true;
-         while n < len && n < m + 12 {
+-        while n < len && n < m + 12 {
++        while n < len && n < j + 16 {
              if infos[n].is_nop() { n += 1; continue; }
 -            if infos[n].is_barrier() { break; }
 +            if infos[n].is_barrier() {
@@ -3388,7 +3642,20 @@ index 08304359..5d8b54e6 100644
              if infos[n].reg_refs & src_bit == 0 { n += 1; continue; }
              match infos[n].kind {
                  LineKind::LoadRbp { reg, .. } if reg == src_family => break,
-@@ -2137,9 +2170,18 @@ pub(super) fn coalesce_phi_register_copies(
+@@ -977,11 +1019,10 @@ pub(super) fn fold_accumulator_alu_store(
+         }
+         if !src_safe { i += 1; continue; }
+ 
+-        // Transform! Replace 4 instructions with 2.
++        // Transform! Replace 3 instructions with 2 (no cltq, 32-bit store).
+         mark_nop(&mut infos[i]);
+         let new_alu = format!("    {} {}, {}", alu_op_s, mem_src_s, src_reg32);
+         replace_line(store, &mut infos[j], j, new_alu);
+-        mark_nop(&mut infos[k]);
+         let new_store = format!("    movl {}, {}", src_reg32, store_dst_s);
+         replace_line(store, &mut infos[m], m, new_store);
+ 
+@@ -2137,9 +2178,18 @@ pub(super) fn coalesce_phi_register_copies(
              let mut src_referenced = false;
              let mut has_implicit_hazard = false;
              let mut copy_back_pos = None;
@@ -3407,7 +3674,7 @@ index 08304359..5d8b54e6 100644
  
              while j < len && instr_count < 8 {
                  if infos[j].is_nop() { j += 1; continue; }
-@@ -2147,6 +2189,17 @@ pub(super) fn coalesce_phi_register_copies(
+@@ -2147,6 +2197,17 @@ pub(super) fn coalesce_phi_register_copies(
  
                  let tj = infos[j].trimmed(store.get(j));
  
@@ -3425,7 +3692,7 @@ index 08304359..5d8b54e6 100644
                  // Check for direct copy-back: movq %TMP, %SRC
                  if tj == copy_back_pat {
                      copy_back_pos = Some(j);
-@@ -2176,8 +2229,14 @@ pub(super) fn coalesce_phi_register_copies(
+@@ -2176,8 +2237,14 @@ pub(super) fn coalesce_phi_register_copies(
                          let other_reg = &tj[chain_prefix.len() - 1..];
                          let other_fam = register_family_fast(other_reg);
                          if other_fam != REG_NONE && other_fam != tmp_family && other_fam != src_family && other_fam > 1 {
@@ -3440,7 +3707,7 @@ index 08304359..5d8b54e6 100644
                          }
                      }
                  }
-@@ -2192,10 +2251,25 @@ pub(super) fn coalesce_phi_register_copies(
+@@ -2192,10 +2259,25 @@ pub(super) fn coalesce_phi_register_copies(
                  j += 1;
              }
  
@@ -3467,7 +3734,7 @@ index 08304359..5d8b54e6 100644
              let cb = copy_back_pos.unwrap();
  
              // Verify TMP (and chain TMP2 if present) are dead after the copy-back.
-@@ -2206,7 +2280,10 @@ pub(super) fn coalesce_phi_register_copies(
+@@ -2206,7 +2288,10 @@ pub(super) fn coalesce_phi_register_copies(
              while n < len && chk_count < 8 {
                  if infos[n].is_nop() { n += 1; continue; }
                  if infos[n].is_barrier() {
@@ -3479,7 +3746,7 @@ index 08304359..5d8b54e6 100644
                      break;
                  }
                  if infos[n].reg_refs & check_bits != 0 {
-@@ -2228,6 +2305,13 @@ pub(super) fn coalesce_phi_register_copies(
+@@ -2228,6 +2313,13 @@ pub(super) fn coalesce_phi_register_copies(
  
              if !tmp_dead { i += 1; continue; }
  
@@ -3493,7 +3760,7 @@ index 08304359..5d8b54e6 100644
              // Apply: remove copy-out, replace TMP with SRC in intermediate ops, remove copy-back
              // For chain coalescing, also replace TMP2 with SRC
              mark_nop(&mut infos[i]);
-@@ -2290,15 +2374,15 @@ pub(super) fn hoist_loop_invariant_gpr_load(
+@@ -2290,15 +2382,15 @@ pub(super) fn hoist_loop_invariant_gpr_load(
      while i < len {
          if infos[i].is_nop() { i += 1; continue; }
          // Match both unconditional (jmp) and conditional (jle, jl, jne, etc.) back-edges
@@ -3518,7 +3785,7 @@ index 08304359..5d8b54e6 100644
              else { i += 1; continue; };
          if !target.starts_with(".L") { i += 1; continue; }
          let target_label = format!("{}:", target);
-@@ -2428,68 +2512,64 @@ pub(super) fn hoist_loop_invariant_gpr_load(
+@@ -2428,68 +2520,64 @@ pub(super) fn hoist_loop_invariant_gpr_load(
              }
              if reg_written_elsewhere { continue; }
  
@@ -3642,7 +3909,7 @@ index 08304359..5d8b54e6 100644
          }
  
          i += 1;
-@@ -2834,7 +2914,11 @@ pub(super) fn collapse_increment_chain(
+@@ -2834,7 +2922,11 @@ pub(super) fn collapse_increment_chain(
          let mut chk = 0;
          while n < len && chk < 8 {
              if infos[n].is_nop() { n += 1; continue; }
@@ -3655,7 +3922,7 @@ index 08304359..5d8b54e6 100644
              if infos[n].reg_refs & tmp1_bit != 0 {
                  match infos[n].kind {
                      LineKind::Other { dest_reg } if dest_reg == tmp1_family => {}
-@@ -2963,7 +3047,11 @@ pub(super) fn fold_cascaded_shifts(
+@@ -2963,7 +3055,11 @@ pub(super) fn fold_cascaded_shifts(
              let mut chk = 0;
              while n < len && chk < 8 {
                  if infos[n].is_nop() { n += 1; continue; }
@@ -3669,7 +3936,7 @@ index 08304359..5d8b54e6 100644
                      match infos[n].kind {
                          LineKind::Other { dest_reg } if dest_reg == tmp_fam => { tmp_dead = true; break; }
 diff --git a/src/backend/x86/codegen/peephole/passes/memory_fold.rs b/src/backend/x86/codegen/peephole/passes/memory_fold.rs
-index 94aa0490..542c570f 100644
+index 94aa0490..6c3ab7f7 100644
 --- a/src/backend/x86/codegen/peephole/passes/memory_fold.rs
 +++ b/src/backend/x86/codegen/peephole/passes/memory_fold.rs
 @@ -597,16 +597,41 @@ pub(super) fn fold_store_relay(store: &mut LineStore, infos: &mut [LineInfo]) ->
@@ -3719,7 +3986,7 @@ index 94aa0490..542c570f 100644
                      replace_line(store, &mut infos[j], j, new_inst);
                      mark_nop(&mut infos[i]);
                      changed = true;
-@@ -629,8 +654,24 @@ fn is_rax_dead_after(store: &LineStore, infos: &[LineInfo], start: usize, len: u
+@@ -629,18 +654,52 @@ fn is_rax_dead_after(store: &LineStore, infos: &[LineInfo], start: usize, len: u
      let mut scan = start;
      while scan < scan_limit {
          if infos[scan].is_nop() { scan += 1; continue; }
@@ -3746,7 +4013,39 @@ index 94aa0490..542c570f 100644
          if infos[scan].reg_refs & 1 != 0 {
              match infos[scan].kind {
                  LineKind::LoadRbp { reg: 0, .. } => return true,
-@@ -699,18 +740,28 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
+                 LineKind::Other { dest_reg: 0 } => {
+                     let t = infos[scan].trimmed(store.get(scan));
+-                    if (t.ends_with(", %rax") || t.ends_with(", %eax"))
+-                        && !is_read_modify_write(t) {
+-                        return true;
+-                    }
+                     if t == "xorl %eax, %eax" { return true; }
++                    if t.ends_with(", %rax") || t.ends_with(", %eax") {
++                        // The instruction WRITES %rax. %rax is only dead (free to
++                        // retarget) if this write establishes a FRESH value that
++                        // does NOT depend on the current %rax. A write whose
++                        // SOURCE reads %rax — e.g. a self-move `movl %eax, %eax`
++                        // or `movq %rax, %rax`, or `movslq %eax, %rax` — still
++                        // depends on the old %rax, so it is NOT dead. This was
++                        // a miscompile: `movl (%rcx),%eax; movq %rax,%rbp;
++                        // movl %eax,%eax; movq %rax,40(%rsp)` retargeted the load
++                        // to %rbp, but `movq %rax,40(%rsp)` still needed the old
++                        // %rax (which no longer held the loaded value).
++                        let src = t.split_once(',').map(|(s, _)| {
++                            let mut toks = s.splitn(2, char::is_whitespace);
++                            let _mnem = toks.next();
++                            toks.next().unwrap_or("")
++                        }).unwrap_or("");
++                        let reads_rax = src.contains("%rax") || src.contains("%eax")
++                            || src.contains("%al") || src.contains("%ax");
++                        if !reads_rax && !is_read_modify_write(t) {
++                            return true;
++                        }
++                    }
+                     return false; // rax read
+                 }
+                 _ => return false, // rax read
+@@ -699,18 +758,28 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
                  let trimmed_j = infos[j].trimmed(store.get(j));
  
                  // Special case: testq/testl %REG, %REG where REG is the loaded scratch reg.
