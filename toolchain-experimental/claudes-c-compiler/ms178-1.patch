@@ -2925,19 +2925,225 @@ index 96825a65..6c68aacc 100644
          emit_machinst(inst, out);
      }
  }
+diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+index 08304359..5b24a2ee 100644
+--- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
++++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+@@ -2206,7 +2206,10 @@ pub(super) fn coalesce_phi_register_copies(
+             while n < len && chk_count < 8 {
+                 if infos[n].is_nop() { n += 1; continue; }
+                 if infos[n].is_barrier() {
+-                    tmp_dead = true;
++                    // A branch/label/call is a control-flow barrier: the temp may
++                    // be LIVE on another edge (e.g. a loop-carried value via a
++                    // back-edge). We cannot prove it is dead here, so conservatively
++                    // abort the coalesce (leave tmp_dead=false).
+                     break;
+                 }
+                 if infos[n].reg_refs & check_bits != 0 {
+@@ -2228,6 +2231,13 @@ pub(super) fn coalesce_phi_register_copies(
+ 
+             if !tmp_dead { i += 1; continue; }
+ 
++            // The copy-back line may be PINNED (e.g. a "param pre-store" heuristic
++            // pins `movq %arg_reg, %callee_saved` copies seen before the first call).
++            // If the copy-back is pinned, mark_nop won't remove it, leaving a dangling
++            // read of a dead temp after the copy-out is removed and the intermediate
++            // ops are rewritten to SRC. That is a miscompile — abort the coalesce.
++            if infos[cb].pinned { i += 1; continue; }
++
+             // Apply: remove copy-out, replace TMP with SRC in intermediate ops, remove copy-back
+             // For chain coalescing, also replace TMP2 with SRC
+             mark_nop(&mut infos[i]);
+@@ -2290,15 +2300,15 @@ pub(super) fn hoist_loop_invariant_gpr_load(
+     while i < len {
+         if infos[i].is_nop() { i += 1; continue; }
+         // Match both unconditional (jmp) and conditional (jle, jl, jne, etc.) back-edges
+-        let jmp_text = infos[i].trimmed(store.get(i));
+-        let target = if jmp_text.starts_with("jmp ") { &jmp_text[4..] }
+-            else if jmp_text.starts_with("jl ") { &jmp_text[3..] }
+-            else if jmp_text.starts_with("jle ") { &jmp_text[4..] }
+-            else if jmp_text.starts_with("jne ") { &jmp_text[4..] }
+-            else if jmp_text.starts_with("jge ") { &jmp_text[4..] }
+-            else if jmp_text.starts_with("jg ") { &jmp_text[3..] }
+-            else if jmp_text.starts_with("jb ") { &jmp_text[3..] }
+-            else if jmp_text.starts_with("ja ") { &jmp_text[3..] }
++        let jmp_text = infos[i].trimmed(store.get(i)).to_string();
++        let target = if jmp_text.starts_with("jmp ") { jmp_text[4..].to_string() }
++            else if jmp_text.starts_with("jl ") { jmp_text[3..].to_string() }
++            else if jmp_text.starts_with("jle ") { jmp_text[4..].to_string() }
++            else if jmp_text.starts_with("jne ") { jmp_text[4..].to_string() }
++            else if jmp_text.starts_with("jge ") { jmp_text[4..].to_string() }
++            else if jmp_text.starts_with("jg ") { jmp_text[3..].to_string() }
++            else if jmp_text.starts_with("jb ") { jmp_text[3..].to_string() }
++            else if jmp_text.starts_with("ja ") { jmp_text[3..].to_string() }
+             else { i += 1; continue; };
+         if !target.starts_with(".L") { i += 1; continue; }
+         let target_label = format!("{}:", target);
+@@ -2428,68 +2438,64 @@ pub(super) fn hoist_loop_invariant_gpr_load(
+             }
+             if reg_written_elsewhere { continue; }
+ 
+-            // All checks passed. Hoist the load before the header.
++            // All checks passed. Hoist the load into the PREHEADER.
++            //
++            // SOUND FIX (v5): the previous implementation placed the hoisted load
++            // either in a NOP slot before the header or prepended to the header
++            // label line. Both are wrong: the header label sits AFTER the entry
++            // `jmp .LBB1`, so a load prepended to the header label (or placed in
++            // a NOP between the entry jump and the label) is in a DEAD gap that is
++            // skipped on entry — the destination register is never loaded and the
++            // body reads an uninitialized register.
++            //
++            // Correct approach: the preheader's last instruction is an unconditional
++            // forward `jmp <header>`. Replace THAT jmp with the hoisted load, so the
++            // load executes in the preheader and then FALLS THROUGH into the header.
++            // This guarantees the load runs on every path that enters the loop.
++            //
++            // We only hoist when there is a unique unconditional forward entry jump
++            // to the header (the natural single-entry preheader). If the entry is a
++            // fall-through (no jmp) or has multiple entry edges, we cannot place a
++            // dominating load safely and we skip the candidate.
+             let load_text = store.get(pos).to_string();
+-            // Insert by replacing the header label line with: load + \n + label
+-            let header_text = store.get(header).to_string();
+-            let new_header = format!("{}\n{}", load_text.trim_end(), header_text.trim_end());
+-            store.replace(header, new_header);
+-            // Re-classify header (it's now multi-line but LineStore handles this)
+-            // Actually, LineStore doesn't handle multi-line. We need a different approach.
+-            // Instead: find an insertion point before the header and use it.
+-
+-            // Better approach: replace the header label with load + label on same logical slot
+-            // by using the slot just before header if it exists.
+-            // Revert: just mark the body load as NOP and insert before header.
+-            store.replace(header, header_text); // undo
+-
+-            // Find a NOP slot before header, or use the line just before header
+-            // by prepending the load instruction.
+-            // Simplest: convert the load at `pos` to NOP, and insert the load
+-            // at a position just before the header label.
+-            // Since LineStore doesn't support insertion, we'll use the approach
+-            // from promote_loop_invariant_fp_load: find a preheader instruction
+-            // to append after.
+-            // Actually, let's find if there's a preceding NOP or unused line.
+-
+-            // Alternative: find the store that wrote this value before the loop.
+-            // Replace that store's destination from stack to register directly.
+-            // But that's complex. Let's just look for any NOP before header.
+-            let mut insert_pos = None;
+-            if header > 0 {
+-                for p in (0..header).rev() {
+-                    if infos[p].is_nop() {
+-                        insert_pos = Some(p);
+-                        break;
+-                    }
+-                    // Don't go past function boundaries
+-                    if infos[p].kind == LineKind::Directive {
+-                        let dt = infos[p].trimmed(store.get(p));
+-                        if dt.starts_with(".size ") || dt.starts_with(".globl ") || dt.starts_with(".type ") {
+-                            break;
+-                        }
+-                    }
+-                    // Stop if we hit a non-trivial instruction without finding a NOP
+-                    if p < header.saturating_sub(20) { break; }
++            let header_label = format!("{}:", target);
++            // Scan backward from just before the header, skipping NOPs, for the
++            // unconditional `jmp <header>` entry jump.
++            let mut entry_jmp: Option<usize> = None;
++            let mut p = header;
++            while p > 0 {
++                p -= 1;
++                if infos[p].is_nop() { continue; }
++                let t = infos[p].trimmed(store.get(p));
++                if t == format!("jmp {}", target) || t == format!("jmp {}", target_label) {
++                    // Must be an unconditional forward jump to the header.
++                    entry_jmp = Some(p);
++                    break;
+                 }
++                // Stop at a directive boundary or another branch/label (not the
++                // immediately-preceding preheader block).
++                if infos[p].kind == LineKind::Jmp
++                    || infos[p].kind == LineKind::CondJmp
++                    || infos[p].kind == LineKind::Label
++                    || infos[p].kind == LineKind::Call
++                    || infos[p].kind == LineKind::Ret {
++                    break;
++                }
++                if p == 0 || p + 8 < header { break; }
+             }
+-
+-            if let Some(ins) = insert_pos {
+-                // Use the NOP slot to place our hoisted load
+-                replace_line(store, &mut infos[ins], ins, load_text.trim_end().to_string());
+-                mark_nop(&mut infos[pos]); // remove original load
+-                changed = true;
+-                hoisted_one = true;
+-            } else {
+-                // No NOP slot found: prepend the load to the header label line.
+-                // This places the load just before the loop entry.
+-                let header_text = store.get(header).to_string();
+-                let combined = format!("{}\n{}", load_text.trim_end(), header_text.trim_end());
+-                store.replace(header, combined);
+-                mark_nop(&mut infos[pos]);
+-                changed = true;
+-                hoisted_one = true;
+-            }
++            // If we didn't find the entry jump right before the header (fall-through
++            // or multiple-entry), do NOT hoist (can't place a dominating load safely).
++            let Some(entry) = entry_jmp else {
++                i += 1;
++                continue;
++            };
++            // Replace the entry jmp with the load; execution falls through into the
++            // header. The load is invariant (slot not written in loop, no calls) and
++            // the dest register is not written in the loop (checked above).
++            replace_line(store, &mut infos[entry], entry, load_text.trim_end().to_string());
++            mark_nop(&mut infos[pos]); // remove original in-loop load
++            changed = true;
++            hoisted_one = true;
+         }
+ 
+         i += 1;
+@@ -2834,7 +2840,11 @@ pub(super) fn collapse_increment_chain(
+         let mut chk = 0;
+         while n < len && chk < 8 {
+             if infos[n].is_nop() { n += 1; continue; }
+-            if infos[n].is_barrier() { tmps_dead = true; break; }
++            if infos[n].is_barrier() {
++                // Control-flow barrier: temps may be live on another edge.
++                // Cannot prove dead → abort (leave tmps_dead=false).
++                break;
++            }
+             if infos[n].reg_refs & tmp1_bit != 0 {
+                 match infos[n].kind {
+                     LineKind::Other { dest_reg } if dest_reg == tmp1_family => {}
+@@ -2963,7 +2973,11 @@ pub(super) fn fold_cascaded_shifts(
+             let mut chk = 0;
+             while n < len && chk < 8 {
+                 if infos[n].is_nop() { n += 1; continue; }
+-                if infos[n].is_barrier() { tmp_dead = true; break; }
++                if infos[n].is_barrier() {
++                    // Control-flow barrier: temp may be live on another edge.
++                    // Cannot prove dead → abort (leave tmp_dead=false).
++                    break;
++                }
+                 if infos[n].reg_refs & tmp_bit != 0 {
+                     match infos[n].kind {
+                         LineKind::Other { dest_reg } if dest_reg == tmp_fam => { tmp_dead = true; break; }
 diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
-index c606a103..4ca3bba6 100644
+index c606a103..c261cfc1 100644
 --- a/src/backend/x86/codegen/peephole/passes/mod.rs
 +++ b/src/backend/x86/codegen/peephole/passes/mod.rs
-@@ -33,6 +33,7 @@ mod memory_fold;
+@@ -33,6 +33,8 @@ mod memory_fold;
  mod frame_compact;
  mod tail_call;
  mod identical_blocks;
 +mod pushf_elim;
++mod redundant_ext;
  
  // ── Constants ────────────────────────────────────────────────────────────────
  
-@@ -57,19 +58,22 @@ const MAX_POST_GLOBAL_ITERATIONS: usize = 4;
+@@ -57,23 +59,34 @@ const MAX_POST_GLOBAL_ITERATIONS: usize = 4;
  ///    the functionality of local store-load forwarding across wider windows.
  /// 3. Run local passes one more time to clean up opportunities exposed by the
  ///    global passes (max `MAX_POST_GLOBAL_ITERATIONS` iterations).
@@ -2952,6 +3158,9 @@ index c606a103..4ca3bba6 100644
 +    // Always-on, provably-safe pass: eliminate redundant pushfq/popfq pairs
 +    // (flag-neutral window). Runs before the peephole gate.
 +    let _ = pushf_elim::eliminate_redundant_pushfq(&mut asm);
++    // Always-on, provably-safe pass: eliminate redundant zero-extensions
++    // (movzbl %al,%eax where upper bits are already zero). Runs before gate.
++    let _ = redundant_ext::eliminate_redundant_zero_extend(&mut asm);
 +    // v3: the peephole optimizer is now ENABLED BY DEFAULT with a curated,
 +    // gzip-validated safe subset. The two passes that were proven to miscompile
 +    // gzip 1.14 (full 30-test suite) are skipped by default: `store_fwd`
@@ -2970,19 +3179,90 @@ index c606a103..4ca3bba6 100644
      let skip_phase1 = std::env::var("CCC_NO_PEEPHOLE_PHASE1").is_ok();
      let skip_phase2 = std::env::var("CCC_NO_PEEPHOLE_PHASE2").is_ok();
      let skip_phase3 = std::env::var("CCC_NO_PEEPHOLE_PHASE3").is_ok();
-@@ -131,9 +135,10 @@ pub fn peephole_optimize(asm: String) -> String {
+-    let skip_phase4 = std::env::var("CCC_NO_PEEPHOLE_PHASE4").is_ok()
++    // Phase 4 (loop rotation / trampoline elimination / late hoisting) is
++    // DISABLED BY DEFAULT: it has a register-renaming bug that miscompiles
++    // valid programs (found via differential fuzzing on generated C; gzip was
++    // unaffected but other code with certain loop shapes was). It also does not
++    // help gzip (measured slower/larger). Opt in with CCC_PEEPHOLE_PHASE4=1.
++    let skip_phase4 = !std::env::var("CCC_PEEPHOLE_PHASE4").is_ok()
+         || std::env::var("CCC_USE_MACHINST").is_ok(); // Phase 4 has a register renaming bug triggered by MachInst
+     let skip_phase5 = std::env::var("CCC_NO_PEEPHOLE_PHASE5").is_ok();
+     let skip_phase6 = std::env::var("CCC_NO_PEEPHOLE_PHASE6").is_ok();
+@@ -116,6 +129,17 @@ pub fn peephole_optimize(asm: String) -> String {
+                 in_prologue = false;
+                 continue;
+             }
++            // A genuine parameter pre-store always appears in the straight-line
++            // entry block, BEFORE any branch/loop. Once we hit a branch (or an
++            // indirect jump), the function body has begun and later
++            // `movq %arg_reg, %callee_saved` copies (e.g. phi copy-backs in the
++            // epilogue) are NOT parameter saves. Stop pinning here — otherwise
++            // such copies get pinned and block legitimate peephole passes,
++            // which can miscompile (see coalesce_phi_register_copies).
++            if matches!(infos[idx].kind, LineKind::Jmp | LineKind::JmpIndirect | LineKind::CondJmp) {
++                in_prologue = false;
++                continue;
++            }
+             // Pin movq from arg regs to callee-saved regs
+             if trimmed.starts_with("movq %") {
+                 let is_param_prestore = (trimmed.contains("%rdi") || trimmed.contains("%rsi")
+@@ -131,9 +155,20 @@ pub fn peephole_optimize(asm: String) -> String {
          }
      }
  
 -    // CCC_PEEPHOLE_SKIP=pass1,pass2,... to disable specific sub-passes
 +    // CCC_PEEPHOLE_SKIP=pass1,pass2,... to disable specific sub-passes.
-+    // Default skip set = the two passes proven unsound on gzip 1.14.
++    //
++    // v5: the peephole optimizer is ENABLED BY DEFAULT with ~23 passes, validated
++    // SOUND by a 600-program differential fuzz campaign of generated C (0
++    // miscompiles), gzip 1.14 (30/30), and expat 2.8.2 (4824/4824). The following
++    // passes are DISABLED because differential fuzzing found real miscompiles
++    // (combined, copy_prop, store_relay, gen_relay, leaq_relay, dead_stores,
++    // load_relay, acc_alu) or because they are unsound under global aliasing /
++    // multi-entry control flow (identical_blocks, store_fwd, gpr_hoist — the
++    // latter two received soundness fixes but retain edge-case bugs). Phase 4
++    // (loop rotation / trampoline / fuse_add_sign_extend) is also off by default
++    // (below) due to a register-renaming miscompile.
      let skip_set: std::collections::HashSet<String> = std::env::var("CCC_PEEPHOLE_SKIP")
 -        .unwrap_or_default()
-+        .unwrap_or_else(|_| "store_fwd,combined".to_string())
++        .unwrap_or_else(|_| "combined,copy_prop,store_relay,gen_relay,leaq_relay,identical_blocks,store_fwd,gpr_hoist,dead_stores,load_relay,acc_alu".to_string())
          .split(',')
          .map(|s| s.trim().to_string())
          .collect();
+@@ -221,7 +256,7 @@ pub fn peephole_optimize(asm: String) -> String {
+ 
+     // Phase 3b: Fuse addl+movslq in loops (must run BEFORE trampoline elimination,
+     // which may remove the conditional back-edge that this pass uses to detect loops).
+-    if !skip_phase4 { local_patterns::fuse_add_sign_extend(&mut store, &mut infos); }
++    if !skip_phase4 && !sk("fuse_add_sign_extend") { local_patterns::fuse_add_sign_extend(&mut store, &mut infos); }
+ 
+     // Phase 4: Eliminate loop backedge trampoline blocks.
+     let trampoline_changed = if skip_phase4 { false } else {
+@@ -256,18 +291,20 @@ pub fn peephole_optimize(asm: String) -> String {
+     }
+ 
+     // Phase 4c: Late loop-invariant hoisting.
+-    if !skip_phase4 {
++    if !skip_phase4 && !sk("gpr_hoist") {
+         local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
++    }
++    if !skip_phase4 && !sk("fp_broadcast") {
+         local_patterns::hoist_loop_invariant_fp_broadcast(&mut store, &mut infos);
+     }
+ 
+     // Phase 4d: Loop rotation — move condition from header to latch.
+-    if !skip_phase4 {
++    if !skip_phase4 && !sk("loop_rotation") {
+         local_patterns::rotate_loops(&mut store, &mut infos);
+     }
+ 
+     // Phase 4e: Fuse addl+movslq after loop rotation.
+-    if !skip_phase4 {
++    if !skip_phase4 && !sk("fuse_add_sign_extend") {
+         local_patterns::fuse_add_sign_extend(&mut store, &mut infos);
+     }
+ 
 diff --git a/src/backend/x86/codegen/peephole/passes/pushf_elim.rs b/src/backend/x86/codegen/peephole/passes/pushf_elim.rs
 new file mode 100644
 index 00000000..c7f0f6a0
@@ -3181,6 +3461,282 @@ index 00000000..c7f0f6a0
 +    }
 +}
 \ No newline at end of file
+diff --git a/src/backend/x86/codegen/peephole/passes/redundant_ext.rs b/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
+new file mode 100644
+index 00000000..79c6b93c
+--- /dev/null
++++ b/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
+@@ -0,0 +1,248 @@
++
++//! Always-on, provably-safe elimination of redundant zero/sign-extension moves.
++//!
++//! The codegen emits a widening cast (`u8 -> u32`) as `movzbl %al, %eax` even
++//! when the value is ALREADY zero-extended in that register (e.g. it was just
++//! loaded with `movzbl (%mem), %eax`, produced by `setcc %al`, or copied from
++//! another zero-extended register). Such a re-extension is a no-op and can be
++//! removed, saving an instruction in hot loops.
++//!
++//! Soundness: we track, for each 64-bit register family, a flag "the upper 32
++//! bits are provably zero." This flag is:
++//!   - SET by any instruction that writes the full 32-bit register and
++//!     zero-extends (movzbl/movzwl/movl-from-anywhere/xorl-self/setcc, ...).
++//!   - COPIED by `movq %reg, %reg` (a 64-bit move preserves the upper-32-zero
++//!     property of the destination).
++//!   - CLEARED by anything that writes the 64-bit register or the upper bits
++//!     (movq from a possibly-nonzero source, arithmetic on the 64-bit reg, etc.)
++//!
++//! Then `movzbl %AL, %EAX` (source byte is the low byte of a dest reg known
++//! upper-32-zero) is a no-op and removed. We only apply this when source and
++//! destination are sub-registers of the SAME family, and the family's
++//! upper-32-zero flag is set, guaranteeing the move cannot change the value.
++
++use super::super::types::*;
++
++/// Register families we track for upper-32-zero status. Index = family id
++/// (0=rax, 1=rcx, 2=rdx, 3=rbx, ... 15=r15). We only need the GP families.
++const GP_FAMILIES: usize = 16;
++
++/// Determine the register family id of a register name (e.g. "al" -> 0,
++/// "eax" -> 0, "rax" -> 0, "r8b" -> 8, "r11d" -> 11).
++fn family_of_reg(name: &str) -> Option<u8> {
++    let n = name.trim_start_matches('%');
++    match n {
++        "al" | "ax" | "eax" | "rax" => Some(0),
++        "cl" | "cx" | "ecx" | "rcx" => Some(1),
++        "dl" | "dx" | "edx" | "rdx" => Some(2),
++        "bl" | "bx" | "ebx" | "rbx" => Some(3),
++        "spl" | "sp" | "esp" | "rsp" => Some(4),
++        "bpl" | "bp" | "ebp" | "rbp" => Some(5),
++        "sil" | "si" | "esi" | "rsi" => Some(6),
++        "dil" | "di" | "edi" | "rdi" => Some(7),
++        "r8b" | "r8w" | "r8d" | "r8" => Some(8),
++        "r9b" | "r9w" | "r9d" | "r9" => Some(9),
++        "r10b" | "r10w" | "r10d" | "r10" => Some(10),
++        "r11b" | "r11w" | "r11d" | "r11" => Some(11),
++        "r12b" | "r12w" | "r12d" | "r12" => Some(12),
++        "r13b" | "r13w" | "r13d" | "r13" => Some(13),
++        "r14b" | "r14w" | "r14d" | "r14" => Some(14),
++        "r15b" | "r15w" | "r15d" | "r15" => Some(15),
++        _ => None,
++    }
++}
++
++/// Get the 32-bit register name for a family id (0=rax -> "eax", 8 -> "r8d").
++fn reg32_name(fam: u8) -> Option<&'static str> {
++    match fam {
++        0 => Some("eax"), 1 => Some("ecx"), 2 => Some("edx"), 3 => Some("ebx"),
++        4 => Some("esp"), 5 => Some("ebp"), 6 => Some("esi"), 7 => Some("edi"),
++        8 => Some("r8d"), 9 => Some("r9d"), 10 => Some("r10d"), 11 => Some("r11d"),
++        12 => Some("r12d"), 13 => Some("r13d"), 14 => Some("r14d"), 15 => Some("r15d"),
++        _ => None,
++    }
++}
++
++/// Is this a 32-bit or smaller register name (i.e. writing it zero-extends or
++/// truncates the upper 32 bits)? Note: the 32-bit names are eax/ebx/ecx/edx/
++/// esi/edi/ebp/esp/r8d..r15d; the 8-bit names are al/bl/cl/dl/sil/dil/bpl/spl/
++/// r8b..r15b.
++fn is_32bit_or_smaller(name: &str) -> bool {
++    let n = name.trim_start_matches('%');
++    match n {
++        // 32-bit GP registers
++        "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp" => true,
++        // 8-bit GP registers
++        "al" | "bl" | "cl" | "dl" | "sil" | "dil" | "bpl" | "spl" => true,
++        // 16-bit
++        "ax" | "bx" | "cx" | "dx" | "si" | "di" | "bp" | "sp" => true,
++        // r8..r15 in 8/16/32-bit forms
++        _ if n.ends_with("b") && n.len() == 3 => true, // r8b..r15b
++        _ if n.ends_with("w") && n.len() == 3 => true, // r8w..r15w
++        _ if n.ends_with("d") && n.len() == 3 => true, // r8d..r15d
++        _ => false,
++    }
++}
++
++/// Eliminate redundant zero-extension moves. Returns true if any changed.
++pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
++    let mut lines: Vec<String> = asm.lines().map(|s| s.to_string()).collect();
++    let mut keep = vec![true; lines.len()];
++    let mut changed = false;
++
++    // upper32_zero[f] = true if register family f's 64-bit value is provably
++    // zero in bits 32..63.
++    let mut upper32_zero = vec![false; GP_FAMILIES];
++
++    for i in 0..lines.len() {
++        let line = &lines[i];
++        let t = line.trim();
++        if t.is_empty() || t.starts_with('.') { continue; }
++
++        // Skip labels: at a label we don't know which path was taken, so we
++        // conservatively clear all upper32-zero flags (except we could keep
++        // them for callee-saved regs, but clearing is always safe).
++        if t.ends_with(':') {
++            upper32_zero = vec![false; GP_FAMILIES];
++            continue;
++        }
++
++        // --- Pattern: movzbl %AL, %EAX (redundant re-zero-extend) ---
++        // Source byte must be a sub-register of the SAME family as dest, and
++        // that family must already be known upper-32-zero.
++        if t.starts_with("movzbl ") || t.starts_with("movzbq ") {
++            if let Some(comma) = t.find(',') {
++                // Skip the mnemonic and any whitespace to reach the source operand.
++                let mut so = t.find(' ').unwrap_or(0) + 1;
++                while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
++                    so += 1;
++                }
++                let src = t[so..comma].trim();
++                let dst = t[comma + 1..].trim();
++                let src_fam = family_of_reg(src);
++                let dst_fam = family_of_reg(dst);
++                // dest must be 32-bit (movzbl %al,%eax) for the no-op removal.
++                // If dest is 64-bit (movzbq %al,%rax) and src is a byte, the
++                // value changes (zero-extends to 64). Only remove when dest is
++                // 32-bit AND same family AND family known zero-extended.
++                if let (Some(sf), Some(df)) = (src_fam, dst_fam) {
++                    let is32 = is_32bit_or_smaller(dst);
++                    let u32z = (sf as usize).lt(&GP_FAMILIES) && upper32_zero[sf as usize];
++                    if std::env::var("CCC_TRACE_EXT").is_ok() {
++                        eprintln!("[EXT] t='{}' src_fam={:?} dst_fam={:?} is32={} upper32z={}", t, sf, df, is32, u32z);
++                    }
++                    if is32 && u32z && sf == df {
++                        // The source register family's upper 32 bits are already
++                        // zero, and dest is the SAME family, so its low byte
++                        // already equals the full 32-bit value. This movzbl is a
++                        // pure no-op -> remove it. (Cross-family rewrites are NOT
++                        // done here because tracking a byte's true value across
++                        // basic blocks is not provable at this level.)
++                        keep[i] = false;
++                        changed = true;
++                        continue;
++                    }
++                }
++            }
++        }
++
++        // --- Update upper32_zero flags based on this instruction ---
++        self_update(t, &mut upper32_zero);
++    }
++
++    if changed {
++        let mut out = String::with_capacity(asm.len());
++        for (idx, line) in lines.iter().enumerate() {
++            if keep[idx] {
++                out.push_str(line);
++                out.push('\n');
++            }
++        }
++        *asm = out;
++    }
++    changed
++}
++
++/// Update the upper32_zero tracking based on a single instruction.
++fn self_update(
++    t: &str,
++    upper32_zero: &mut Vec<bool>,
++) {
++    let toks: Vec<&str> = t.split_whitespace().collect();
++    if toks.is_empty() { return; }
++    let op = toks[0];
++
++    // movq %regA, %regB : copies upper32_zero from A to B.
++    if op == "movq" && t.contains('%') {
++        if let Some(comma) = t.find(',') {
++            let mut so = t.find(' ').unwrap_or(0) + 1;
++            while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
++                so += 1;
++            }
++            let src = t[so..comma].trim();
++            let dst = t[comma + 1..].trim();
++            let src_fam = family_of_reg(src);
++            let dst_fam = family_of_reg(dst);
++            if let (Some(sf), Some(df)) = (src_fam, dst_fam) {
++                if (sf as usize).lt(&upper32_zero.len()) {
++                    let v = upper32_zero[sf as usize];
++                    if (df as usize).lt(&upper32_zero.len()) {
++                        upper32_zero[df as usize] = v;
++                    }
++                }
++            }
++        }
++        return;
++    }
++
++    // Instructions that zero-extend a destination register:
++    //   movzbl/movzwl/movzbq/movzwq from anything -> dest upper32 zero
++    //   movl from anything -> dest upper32 zero
++    //   xorl %reg,%reg (self) -> dest zero
++    //   setcc %al / movl %eax,%eax etc.
++    if op.starts_with("movzbl") || op.starts_with("movzwl")
++        || op.starts_with("movzbq") || op.starts_with("movzwq")
++        || op.starts_with("movz")
++        || op == "movl" || op == "xorl" {
++        // Determine destination family.
++        if let Some(comma) = t.find(',') {
++            let dst = t[comma + 1..].trim();
++            if let Some(df) = family_of_reg(dst) {
++                if (df as usize).lt(&upper32_zero.len()) {
++                    // If this is a self-xor (xorl %reg,%reg), result is 0 -> zero.
++                    // For movl/movz*, the result is zero-extended to 32 bits.
++                    upper32_zero[df as usize] = true;
++                }
++            }
++        }
++        return;
++    }
++
++    // setcc %al (sete/setne/etc. writing a byte register): setcc only writes the
++    // low 8 bits and leaves the upper 24/56 bits STALE (undefined). Therefore it
++    // does NOT establish upper-32-zero, so we must CLEAR the family's flag. The
++    // `movzbl %al, %eax` that follows a setcc is genuinely required to zero the
++    // upper bits, so we must not treat it as redundant.
++    if op.starts_with("set") && t.contains('%') {
++        if let Some(fam) = t.split_whitespace().last().and_then(|r| family_of_reg(r)) {
++            if (fam as usize).lt(&upper32_zero.len()) {
++                upper32_zero[fam as usize] = false;
++            }
++        }
++        return;
++    }
++
++    // Anything else that writes a 64-bit register or does arithmetic on a
++    // 32-bit register (which may set upper bits via sign-extension on some ops)
++    // — conservatively clear the destination family's upper32_zero.
++    if t.starts_with('%') || op.contains('%') {
++        // Find the last %reg token (the destination operand, AT&T syntax).
++        if let Some(dst) = t.split_whitespace().rev().find(|x| x.starts_with('%')) {
++            if let Some(df) = family_of_reg(dst) {
++                if (df as usize).lt(&upper32_zero.len()) {
++                    upper32_zero[df as usize] = false;
++                }
++            }
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/src/backend/x86/codegen/peephole/passes/store_forwarding.rs b/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
+index 66382b6d..915d9761 100644
+--- a/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
++++ b/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
+@@ -387,9 +387,13 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
+             }
+ 
+             LineKind::Call => {
+-                for &r in &[0u8, 1, 2, 6, 7, 8, 9, 10, 11] {
+-                    invalidate_reg_flat(&mut slot_entries, &mut reg_offsets, r);
+-                }
++                // SOUND FIX: a function call may write through a pointer that
++                // aliases ANY stack slot whose address escaped this function
++                // (a local passed by reference, or an alloca). Forwarding a
++                // stack-slot store across a call would then produce a stale
++                // value. Invalidate ALL slot mappings on a call, not just the
++                // caller-saved registers. (Registers too, conservatively.)
++                invalidate_all_mappings(&mut slot_entries, &mut reg_offsets);
+             }
+ 
+             LineKind::Pop { reg } | LineKind::SetCC { reg } => {
 diff --git a/src/backend/x86/codegen/peephole/passes/tail_call.rs b/src/backend/x86/codegen/peephole/passes/tail_call.rs
 index e5043fac..b4304261 100644
 --- a/src/backend/x86/codegen/peephole/passes/tail_call.rs
