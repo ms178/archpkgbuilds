@@ -1166,6 +1166,405 @@ index 4cd8a531a4203ff64a24bd86a89288020ba96a0e..4c62ae45bdc8258ef6567967139997e6
                      int_idx += 1;
                  }
                  if int_idx + 1 < config.max_int_regs {
+diff --git a/src/backend/cfg_liveness.rs b/src/backend/cfg_liveness.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..65bf189329d60c9d11242ad304c8c66fd61e94a2
+--- /dev/null
++++ b/src/backend/cfg_liveness.rs
+@@ -0,0 +1,393 @@
++//! CFG-aware scalar liveness and interference construction.
++//!
++//! The backend's textual interval approximations lose CFG detail at joins and
++//! loop edges. This module supplies one conservative, reusable copy-aware
++//! interference proof for stack-location coalescing after phi lowering.
++//!
++//! The analysis is deliberately value-ID based because phi elimination has
++//! already happened at backend time. Multiple definitions of one value ID are
++//! treated as one storage identity, matching stack-slot assignment semantics.
++
++use crate::backend::liveness::{
++    for_each_operand_in_instruction,
++    for_each_operand_in_terminator,
++    for_each_value_use_in_instruction,
++};
++use crate::common::fx_hash::{FxHashMap, FxHashSet};
++use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator};
++
++/// Enumerate all uses of an instruction as stable, de-duplicated value IDs.
++///
++/// The canonical operand visitors cover both `Operand::Value` inputs and direct
++/// pointer/base uses.  De-duplication matters for instructions such as `x + x`:
++/// liveness is a set, not a multiplicity count.
++fn instruction_value_uses(inst: &Instruction) -> Vec<u32> {
++    let mut uses = Vec::new();
++    for_each_operand_in_instruction(inst, |op| {
++        if let Operand::Value(v) = op {
++            uses.push(v.0);
++        }
++    });
++    for_each_value_use_in_instruction(inst, |v| uses.push(v.0));
++    uses.sort_unstable();
++    uses.dedup();
++    uses
++}
++
++/// Enumerate all terminator uses as stable, de-duplicated value IDs.
++fn terminator_value_uses(term: &Terminator) -> Vec<u32> {
++    let mut uses = Vec::new();
++    for_each_operand_in_terminator(term, |op| {
++        if let Operand::Value(v) = op {
++            uses.push(v.0);
++        }
++    });
++    uses.sort_unstable();
++    uses.dedup();
++    uses
++}
++
++#[inline]
++fn insert_interference(graph: &mut FxHashMap<u32, FxHashSet<u32>>, lhs: u32, rhs: u32) {
++    if lhs == rhs {
++        return;
++    }
++    graph.entry(lhs).or_default().insert(rhs);
++    graph.entry(rhs).or_default().insert(lhs);
++}
++
++/// Add constraints for a phi-lowered *parallel copy bundle*.
++///
++/// Phi elimination emits the copies belonging to one incoming edge as adjacent
++/// `Copy` instructions.  They execute sequentially in the current backend,
++/// even though their SSA meaning is simultaneous.  Standard move coalescing
++/// may omit each individual `(dest, source)` edge, but it must never create a
++/// new physical-register cycle across different copies, for example:
++///
++/// ```text
++/// a = copy x;  b = copy y;
++/// ```
++///
++/// If `a` shares `y`'s register and `b` shares `x`'s register, the first move
++/// overwrites the source of the second.  The phi eliminator only sees value-ID
++/// cycles, not cycles introduced later by register colours.  We therefore add
++/// cross-copy edges inside every adjacent run whose destinations have multiple
++/// definitions (the post-phi-lowering signature).  Each copy's own source is
++/// intentionally left unconnected, preserving safe single-move coalescing.
++fn add_parallel_copy_bundle_interference(
++    func: &IrFunction,
++    tracked: &FxHashSet<u32>,
++    graph: &mut FxHashMap<u32, FxHashSet<u32>>,
++) {
++    let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Some(dest) = inst.dest() {
++                *def_count.entry(dest.0).or_insert(0) += 1;
++            }
++        }
++    }
++
++    for block in &func.blocks {
++        let mut index = 0usize;
++        while index < block.instructions.len() {
++            let start = index;
++            let mut bundle: Vec<(u32, Option<u32>)> = Vec::new();
++            while let Some(Instruction::Copy { dest, src }) = block.instructions.get(index) {
++                // A multi-definition Copy destination identifies a lowered phi
++                // value.  Stop at unrelated copies so an ordinary assignment
++                // cannot accidentally become part of an edge bundle.
++                if def_count.get(&dest.0).copied().unwrap_or(0) < 2 {
++                    break;
++                }
++                let source = match src {
++                    Operand::Value(value) => Some(value.0),
++                    Operand::Const(_) => None,
++                };
++                bundle.push((dest.0, source));
++                index += 1;
++            }
++
++            if bundle.len() >= 2 {
++                for left in 0..bundle.len() {
++                    let (left_dest, left_source) = bundle[left];
++                    for &(right_dest, right_source) in &bundle[(left + 1)..] {
++                        // Two independently merged phi results must remain
++                        // distinct on this edge; their values may diverge on a
++                        // different predecessor even when their current sources
++                        // happen to match.
++                        if tracked.contains(&left_dest) && tracked.contains(&right_dest) {
++                            insert_interference(graph, left_dest, right_dest);
++                        }
++                        // Sources of the bundle are simultaneously needed until
++                        // their respective moves have completed.  Usually normal
++                        // liveness already adds this edge; repeating it here
++                        // makes the parallel-copy contract explicit and robust
++                        // in the presence of multi-definition value IDs.
++                        if let (Some(lhs), Some(rhs)) = (left_source, right_source) {
++                            if tracked.contains(&lhs) && tracked.contains(&rhs) {
++                                insert_interference(graph, lhs, rhs);
++                            }
++                        }
++                        // Most importantly, prevent either destination from
++                        // overwriting another copy's source before it is read.
++                        if let Some(source) = right_source {
++                            if tracked.contains(&left_dest) && tracked.contains(&source) {
++                                insert_interference(graph, left_dest, source);
++                            }
++                        }
++                        if let Some(source) = left_source {
++                            if tracked.contains(&right_dest) && tracked.contains(&source) {
++                                insert_interference(graph, right_dest, source);
++                            }
++                        }
++                    }
++                }
++            }
++
++            // At least one instruction must be consumed on every outer-loop
++            // iteration.  `index == start` means this was not a phi-copy run.
++            if index == start {
++                index += 1;
++            }
++        }
++    }
++}
++
++/// Build copy-aware interference for `tracked`.
++///
++/// Dataflow is the standard backwards formulation:
++///
++/// ```text
++/// live_out[B] = union(live_in[S] for S in succ(B))
++/// live_in[B]  = use[B] union (live_out[B] - def[B])
++/// ```
++///
++/// At a normal definition `d`, `d` interferes with every value live after the
++/// definition.  For `d = Copy(s)`, the `s` edge is intentionally omitted:
++/// sharing a physical register makes that copy a no-op, while every other live
++/// value still blocks the colour.  This is the classic move-coalescing rule.
++///
++/// Returning `None` on a non-convergent CFG is a legality bailout: callers must
++/// keep their prior conservative allocator rather than use a partial proof.
++pub(crate) fn build_copy_aware_interference(
++    func: &IrFunction,
++    tracked: &FxHashSet<u32>,
++) -> Option<FxHashMap<u32, FxHashSet<u32>>> {
++    if func.blocks.is_empty() {
++        return Some(FxHashMap::default());
++    }
++
++    use crate::ir::analysis;
++    let label_map = analysis::build_label_map(func);
++    let (_preds, successors) = analysis::build_cfg(func, &label_map);
++    let successors: Vec<Vec<usize>> = (0..func.blocks.len())
++        .map(|idx| successors.row(idx).iter().map(|&v| v as usize).collect())
++        .collect();
++
++    // Build block-local upward-exposed uses and definitions.
++    let mut block_use: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
++    let mut block_def: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
++    for (block_idx, block) in func.blocks.iter().enumerate() {
++        for inst in &block.instructions {
++            for value in instruction_value_uses(inst) {
++                if tracked.contains(&value) && !block_def[block_idx].contains(&value) {
++                    block_use[block_idx].insert(value);
++                }
++            }
++            if let Some(dest) = inst.dest() {
++                if tracked.contains(&dest.0) {
++                    block_def[block_idx].insert(dest.0);
++                }
++            }
++        }
++        for value in terminator_value_uses(&block.terminator) {
++            if tracked.contains(&value) && !block_def[block_idx].contains(&value) {
++                block_use[block_idx].insert(value);
++            }
++        }
++    }
++
++    let mut live_in: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
++    let mut live_out: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
++    let mut changed = true;
++    let mut iterations = 0usize;
++    const MAX_CFG_LIVENESS_ITERATIONS: usize = 256;
++    while changed && iterations < MAX_CFG_LIVENESS_ITERATIONS {
++        changed = false;
++        iterations += 1;
++        for block_idx in (0..func.blocks.len()).rev() {
++            let mut out = FxHashSet::default();
++            for &succ in &successors[block_idx] {
++                out.extend(live_in[succ].iter().copied());
++            }
++            let mut input = block_use[block_idx].clone();
++            for value in &out {
++                if !block_def[block_idx].contains(value) {
++                    input.insert(*value);
++                }
++            }
++            if out != live_out[block_idx] {
++                live_out[block_idx] = out;
++                changed = true;
++            }
++            if input != live_in[block_idx] {
++                live_in[block_idx] = input;
++                changed = true;
++            }
++        }
++    }
++    if changed {
++        return None;
++    }
++
++    let mut graph: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
++    for &value in tracked {
++        graph.entry(value).or_default();
++    }
++    for (block_idx, block) in func.blocks.iter().enumerate() {
++        // The terminator executes after all ordinary instructions, so its uses
++        // are live while walking the block backwards.
++        let mut live = live_out[block_idx].clone();
++        for value in terminator_value_uses(&block.terminator) {
++            if tracked.contains(&value) {
++                live.insert(value);
++            }
++        }
++
++        for inst in block.instructions.iter().rev() {
++            let copy_source = match inst {
++                Instruction::Copy { src: Operand::Value(source), .. } => Some(source.0),
++                _ => None,
++            };
++            if let Some(dest) = inst.dest() {
++                if tracked.contains(&dest.0) {
++                    for &other in &live {
++                        if copy_source != Some(other) {
++                            insert_interference(&mut graph, dest.0, other);
++                        }
++                    }
++                    live.remove(&dest.0);
++                }
++            }
++            for value in instruction_value_uses(inst) {
++                if tracked.contains(&value) {
++                    live.insert(value);
++                }
++            }
++        }
++    }
++
++    // The ordinary instruction sweep handles SSA-style dataflow; this final
++    // pass adds the extra simultaneous-move contract of lowered phi bundles.
++    add_parallel_copy_bundle_interference(func, tracked, &mut graph);
++
++    Some(graph)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::common::types::IrType;
++    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrConst, Value};
++
++    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
++        BasicBlock {
++            label: BlockId(label),
++            instructions,
++            source_spans: Vec::new(),
++            terminator,
++        }
++    }
++
++    fn scalar_def(dest: u32, n: i32) -> Instruction {
++        Instruction::BinOp {
++            dest: Value(dest),
++            op: IrBinOp::Add,
++            lhs: Operand::Const(IrConst::I32(n)),
++            rhs: Operand::Const(IrConst::I32(0)),
++            ty: IrType::I32,
++        }
++    }
++
++    #[test]
++    fn graph_adds_edges_for_simultaneously_live_values() {
++        let mut func = IrFunction::new("overlap".to_string(), IrType::I32, vec![], false);
++        func.blocks.push(block(
++            0,
++            vec![
++                scalar_def(0, 1),
++                scalar_def(1, 2),
++                Instruction::BinOp {
++                    dest: Value(2),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(0)),
++                    rhs: Operand::Value(Value(1)),
++                    ty: IrType::I32,
++                },
++            ],
++            Terminator::Return(Some(Operand::Value(Value(2)))),
++        ));
++        let tracked = [0, 1, 2].into_iter().collect();
++        let result = build_copy_aware_interference(&func, &tracked).expect("converges");
++        assert!(result[&0].contains(&1));
++    }
++
++    #[test]
++    fn graph_keeps_mutually_exclusive_values_non_interfering() {
++        let mut func = IrFunction::new("diamond".to_string(), IrType::I32, vec![], false);
++        func.blocks = vec![
++            block(
++                0,
++                vec![],
++                Terminator::CondBranch {
++                    cond: Operand::Const(IrConst::I32(1)),
++                    true_label: BlockId(1),
++                    false_label: BlockId(2),
++                },
++            ),
++            block(1, vec![scalar_def(0, 11)], Terminator::Return(Some(Operand::Value(Value(0))))),
++            block(2, vec![scalar_def(1, 22)], Terminator::Return(Some(Operand::Value(Value(1))))),
++        ];
++        let tracked = [0, 1].into_iter().collect();
++        let result = build_copy_aware_interference(&func, &tracked).expect("converges");
++        assert!(!result[&0].contains(&1));
++        assert!(!result[&1].contains(&0));
++    }
++
++    #[test]
++    fn phi_parallel_copy_bundle_blocks_cross_copy_colour_cycles() {
++        // Values 2 and 3 are multi-definition phi destinations.  On the first
++        // edge the simultaneous copies are `2 = 0, 3 = 1`; colouring 2 with 1
++        // or 3 with 0 would make the sequential emission overwrite a later
++        // source.  The bundle proof must add precisely those cross edges while
++        // still allowing each own (dest, source) pair to coalesce.
++        let mut func = IrFunction::new("parallel_phi".to_string(), IrType::I32, vec![], false);
++        func.blocks = vec![
++            block(
++                0,
++                vec![
++                    scalar_def(0, 10),
++                    scalar_def(1, 20),
++                    Instruction::Copy { dest: Value(2), src: Operand::Value(Value(0)) },
++                    Instruction::Copy { dest: Value(3), src: Operand::Value(Value(1)) },
++                ],
++                Terminator::Branch(BlockId(1)),
++            ),
++            block(
++                1,
++                vec![
++                    Instruction::Copy { dest: Value(2), src: Operand::Value(Value(1)) },
++                    Instruction::Copy { dest: Value(3), src: Operand::Value(Value(0)) },
++                ],
++                Terminator::Return(Some(Operand::Value(Value(2)))),
++            ),
++        ];
++        let tracked = [0, 1, 2, 3].into_iter().collect();
++        let result = build_copy_aware_interference(&func, &tracked).expect("converges");
++        assert!(result[&2].contains(&1));
++        assert!(result[&3].contains(&0));
++    }
++
++
++}
 diff --git a/src/backend/common.rs b/src/backend/common.rs
 index edb9d975b280e5664b7fc60cf7c153cd9a79d1a8..e525ba97d3fab3a1e99bfb8d042dd190b681e655 100644
 --- a/src/backend/common.rs
@@ -2416,10 +2815,118 @@ index a24a9f5c37501a7ff3d7beca08101eca67482473..d75b0960c7c39ec03f41547c94d454b2
  ///
  /// This function:
 diff --git a/src/backend/liveness.rs b/src/backend/liveness.rs
-index 8ae06d43ac0d8e07443ffe36206d0d6fef0c2bf4..f7e67390b1331268c99ff7d49bd860d726784db8 100644
+index 8ae06d43ac0d8e07443ffe36206d0d6fef0c2bf4..2adbff502bb1c9e15329254eed9a60981e39b9b6 100644
 --- a/src/backend/liveness.rs
 +++ b/src/backend/liveness.rs
-@@ -1025,7 +1025,7 @@ fn is_returns_twice_call(inst: &Instruction) -> bool {
+@@ -266,6 +266,43 @@ fn build_dense_value_map(func: &IrFunction, alloca_set: &FxHashSet<u32>) -> (Vec
+     (value_ids, id_to_dense)
+ }
+ 
++/// Return whether an instruction may destroy caller-saved GP registers.
++///
++/// This is the single ABI-boundary predicate used by interval liveness and the
++/// CFG-aware graph allocator. Keeping it centralized avoids the dangerous
++/// situation where one allocator considers a value call-safe while another
++/// recognizes an implicit helper call or register-operand inline assembly.
++pub(crate) fn instruction_clobbers_caller_saved(inst: &Instruction) -> bool {
++    match inst {
++        // Ordinary calls clobber all ABI caller-saved registers.
++        Instruction::Call { .. } | Instruction::CallIndirect { .. } => true,
++
++        // Inline asm with a bound input/output can use arbitrary GP registers.
++        // Empty memory barriers have no GP operands and remain deliberately
++        // non-clobbering, matching the existing interval allocator policy.
++        Instruction::InlineAsm { outputs, inputs, .. } => !outputs.is_empty() || !inputs.is_empty(),
++
++        // These lowering paths use string/copy machinery that clobbers caller
++        // registers (notably rdi/rsi/rcx on x86) even though they are not IR
++        // Call instructions.
++        Instruction::Memcpy { .. }
++        | Instruction::VaArg { .. }
++        | Instruction::VaStart { .. }
++        | Instruction::VaCopy { .. }
++        | Instruction::VaArgStruct { .. } => true,
++
++        // Wide division/remainder and int128<->float conversions lower to
++        // compiler-rt helper calls, which obey normal caller-clobber ABI rules.
++        Instruction::BinOp { op, ty, .. }
++            if matches!(ty, IrType::I128 | IrType::U128)
++                && matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) => true,
++        Instruction::Cast { from_ty, to_ty, .. }
++            if (matches!(from_ty, IrType::I128 | IrType::U128) && to_ty.is_float())
++                || (from_ty.is_float() && matches!(to_ty, IrType::I128 | IrType::U128)) => true,
++        _ => false,
++    }
++}
++
+ /// Phase 1: Assign sequential program points to all instructions/terminators
+ /// and build per-block gen/kill bitsets, def/use point arrays, call points,
+ /// and setjmp block indices.
+@@ -299,58 +336,11 @@ fn assign_program_points(
+                 setjmp_block_indices.push(block_idx);
+             }
+ 
+-            // Track call instruction program points for register allocation.
+-            // InlineAsm instructions with register operands are treated as call
+-            // points because they may clobber caller-saved registers (r8-r11 on
+-            // x86). This ensures values whose live ranges span inline asm get
+-            // callee-saved registers (which survive inline asm), while values NOT
+-            // spanning inline asm can safely use caller-saved registers.
+-            //
+-            // Empty inline asm barriers (e.g., `asm volatile("" ::: "memory")`)
+-            // are NOT call points since they don't use any GP registers. These
+-            // are common in the kernel for memory barriers, preempt_disable/enable,
+-            // etc. Treating them as call points would unnecessarily force values
+-            // into callee-saved registers across simple barriers.
+-            match inst {
+-                Instruction::Call { .. } | Instruction::CallIndirect { .. } => {
+-                    call_points.push(point);
+-                }
+-                Instruction::InlineAsm { outputs, inputs, .. } => {
+-                    // Only treat as call point if the asm has register operands
+-                    // (outputs or inputs that bind to GP registers).
+-                    if !outputs.is_empty() || !inputs.is_empty() {
+-                        call_points.push(point);
+-                    }
+-                }
+-                // Memcpy uses rep movsb which clobbers rdi, rsi, rcx.
+-                // VaArg/VaCopy/VaArgStruct clobber rdi/rsi for struct copy.
+-                // VaStart is included conservatively for safety.
+-                // Treat these as call points so caller-saved registers (including
+-                // rdi/rsi) are not allocated across them.
+-                Instruction::Memcpy { .. }
+-                | Instruction::VaArg { .. }
+-                | Instruction::VaStart { .. }
+-                | Instruction::VaCopy { .. }
+-                | Instruction::VaArgStruct { .. } => {
+-                    call_points.push(point);
+-                }
+-                // i128 div/rem emit implicit calls to __divti3/__udivti3/__modti3/__umodti3.
+-                // These are BinOp instructions at the IR level but generate `call` at the
+-                // assembly level, clobbering all caller-saved registers.
+-                Instruction::BinOp { op, ty, .. }
+-                    if matches!(ty, IrType::I128 | IrType::U128)
+-                        && matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) =>
+-                {
+-                    call_points.push(point);
+-                }
+-                // i128 <-> float casts emit implicit calls to compiler-rt helpers.
+-                Instruction::Cast { from_ty, to_ty, .. }
+-                    if (matches!(from_ty, IrType::I128 | IrType::U128) && to_ty.is_float())
+-                        || (from_ty.is_float() && matches!(to_ty, IrType::I128 | IrType::U128)) =>
+-                {
+-                    call_points.push(point);
+-                }
+-                _ => {}
++            // Track instructions that clobber caller-saved registers. The
++            // predicate is shared with CFG-aware allocation so every allocator
++            // uses exactly the same ABI boundary definition.
++            if instruction_clobbers_caller_saved(inst) {
++                call_points.push(point);
+             }
+ 
+             record_instruction_uses_dense(inst, point, alloca_set, id_to_dense, &mut last_use_points);
+@@ -1025,7 +1015,7 @@ fn is_returns_twice_call(inst: &Instruction) -> bool {
  /// This is the single canonical source of truth for instruction operand traversal.
  /// All code that needs to enumerate operands (liveness, use-counting, GEP fold
  /// verification) should call this rather than hand-rolling its own match.
@@ -2428,7 +2935,7 @@ index 8ae06d43ac0d8e07443ffe36206d0d6fef0c2bf4..f7e67390b1331268c99ff7d49bd860d7
      match inst {
          Instruction::Alloca { .. } => {}
          Instruction::DynAlloca { size, .. } => f(size),
-@@ -1074,7 +1074,7 @@ pub(super) fn for_each_operand_in_instruction(inst: &Instruction, mut f: impl Fn
+@@ -1074,7 +1064,7 @@ pub(super) fn for_each_operand_in_instruction(inst: &Instruction, mut f: impl Fn
  /// These are pointer/base values used directly (not wrapped in Operand),
  /// e.g., the `ptr` in Store/Load, `base` in GEP, `dest`/`src` in Memcpy.
  /// Canonical traversal — shared by liveness, use-counting, and GEP fold analysis.
@@ -2437,7 +2944,7 @@ index 8ae06d43ac0d8e07443ffe36206d0d6fef0c2bf4..f7e67390b1331268c99ff7d49bd860d7
      match inst {
          Instruction::Store { ptr, .. } => f(ptr),
          Instruction::Load { ptr, .. } => f(ptr),
-@@ -1098,7 +1098,7 @@ pub(super) fn for_each_value_use_in_instruction(inst: &Instruction, mut f: impl
+@@ -1098,7 +1088,7 @@ pub(super) fn for_each_value_use_in_instruction(inst: &Instruction, mut f: impl
  
  /// Iterate over all Operand references in a terminator.
  /// Canonical traversal — shared by liveness, use-counting, and GEP fold analysis.
@@ -2446,11 +2953,35 @@ index 8ae06d43ac0d8e07443ffe36206d0d6fef0c2bf4..f7e67390b1331268c99ff7d49bd860d7
      match term {
          Terminator::Return(Some(op)) => f(op),
          Terminator::CondBranch { cond, .. } => f(cond),
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index 436ff26a35459d5e71387595c7d06e2dad56388a..0c3dce2b3b43dfae4156dc7a34b7f4025eeff3d3 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -21,6 +21,7 @@ pub(crate) mod x86_common;  // Shared x86/i686 register names, condition codes,
+ 
+ // Register allocation and liveness analysis
+ pub(crate) mod liveness;     // Live interval computation
++pub(crate) mod cfg_liveness; // CFG-exact interference and caller-clobber proof
+ pub(crate) mod live_range;   // Linear scan data structures (LiveRange, LinearScanAllocator)
+ pub(crate) mod regalloc;     // Linear scan register allocator
+ pub(crate) mod split_ranges; // Live range splitting for call-spanning values
 diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index c4b75fab2213ef8e55736b403367f3f2bb50724d..49beb1916b1c22fee23e3bd96e711767d5c06347 100644
+index c4b75fab2213ef8e55736b403367f3f2bb50724d..35c7b5b18b77d16f9cf2d7b3503e7d8491f54fd7 100644
 --- a/src/backend/regalloc.rs
 +++ b/src/backend/regalloc.rs
-@@ -87,6 +87,147 @@ fn filter_eligible_intervals(
+@@ -70,6 +70,11 @@ pub struct RegAllocConfig {
+     /// Available XMM registers for F64 allocation (caller-saved, non-call-spanning).
+     /// Examples: x86 xmm2-xmm7 (PhysReg 20-25).
+     pub xmm_regs: Vec<PhysReg>,
++    /// True only when the backend emits the paired caller-save spill/reload
++    /// hooks required by Phase 2b.  x86-64 supplies those hooks; other targets
++    /// retain their existing allocation policy rather than silently allocating
++    /// values into call-clobbered registers.
++    pub supports_caller_save_spanning: bool,
+ }
+ 
+ /// Filter live intervals to only those eligible for register allocation,
+@@ -87,6 +92,147 @@ fn filter_eligible_intervals(
          .collect()
  }
  
@@ -2598,7 +3129,7 @@ index c4b75fab2213ef8e55736b403367f3f2bb50724d..49beb1916b1c22fee23e3bd96e711767
  /// Run the register allocator on a function.
  ///
  /// Strategy: We assign callee-saved registers to values with the longest
-@@ -315,18 +456,95 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+@@ -315,18 +461,95 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
  
      let call_points = &liveness.call_points;
  
@@ -2696,7 +3227,7 @@ index c4b75fab2213ef8e55736b403367f3f2bb50724d..49beb1916b1c22fee23e3bd96e711767
  
      // Phase 2: caller-saved linear scan for unallocated non-call-spanning values.
      if !config.caller_saved_regs.is_empty() {
-@@ -352,7 +570,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+@@ -352,7 +575,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
  
              for (vid, reg) in caller_allocator.assignments {
                  assignments.insert(vid, reg);
@@ -2709,8 +3240,15 @@ index c4b75fab2213ef8e55736b403367f3f2bb50724d..49beb1916b1c22fee23e3bd96e711767
              }
          }
      }
-@@ -499,7 +721,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-     if !config.caller_saved_regs.is_empty() && std::env::var("CCC_CALLER_SAVE_SPANNING").is_ok() {
+@@ -496,57 +723,90 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+     // recording their live intervals. The codegen saves/restores each register
+     // only at call sites where the value is actually live.
+     let mut caller_save_spans: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
+-    if !config.caller_saved_regs.is_empty() && std::env::var("CCC_CALLER_SAVE_SPANNING").is_ok() {
++    if config.supports_caller_save_spanning
++        && !config.caller_saved_regs.is_empty()
++        && std::env::var("CCC_NO_CALLER_SAVE_SPANNING").is_err()
++    {
          // Use all available caller-saved registers (not just r10/r11)
          let span_regs: Vec<PhysReg> = config.caller_saved_regs.iter()
 -            .filter(|r| !used_regs_set.contains(&r.0)) // exclude any already used as callee-saved
@@ -2721,7 +3259,99 @@ index c4b75fab2213ef8e55736b403367f3f2bb50724d..49beb1916b1c22fee23e3bd96e711767
              .copied()
              .collect();
  
-@@ -555,6 +780,25 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+         if !span_regs.is_empty() {
+-            let phase2b_intervals: Vec<LiveInterval> = liveness
++            let legal_phase2b = phase2b_legal_values(func);
++            // Phase 2b is profitable only when the weighted reload traffic
++            // avoided by a register exceeds the paired spill/reload at every
++            // crossed call.  The old first-500-by-program-order policy gave
++            // cold early values preference and inflated gzip's call overhead.
++            // Rank from the loop-weighted use count collected above, retain a
++            // bounded hot frontier, then restore program order for linear scan.
++            let mut scored: Vec<(LiveInterval, u64, u32)> = liveness
+                 .intervals
+                 .iter()
+                 .filter(|iv| eligible.contains(&iv.value_id))
++                .filter(|iv| legal_phase2b.contains(&iv.value_id))
+                 .filter(|iv| iv.end > iv.start)
+                 .filter(|iv| !assignments.contains_key(&iv.value_id))
+-                .filter(|iv| spans_any_call(iv, call_points))
+-                .take(500) // Limit to top 500 candidates to avoid O(n²) in linear scan
+-                .copied()
++                .filter_map(|iv| {
++                    let first = call_points.partition_point(|&cp| cp <= iv.start);
++                    let calls = call_points[first..]
++                        .iter()
++                        .take_while(|&&cp| cp < iv.end)
++                        .count() as u32;
++                    if calls == 0 {
++                        return None;
++                    }
++                    let score = use_count.get(&iv.value_id).copied().unwrap_or(0);
++                    // Each crossed call requires a store+load pair.  The fixed
++                    // margin avoids spending frame/code size on one-off values.
++                    if score < u64::from(calls) * 6 + 8 {
++                        return None;
++                    }
++                    Some((*iv, score, calls))
++                })
+                 .collect();
++            scored.sort_by(|(a_iv, a_score, a_calls), (b_iv, b_score, b_calls)| {
++                b_score.cmp(a_score)
++                    .then(a_calls.cmp(b_calls))
++                    .then((a_iv.end - a_iv.start).cmp(&(b_iv.end - b_iv.start)))
++                    .then(a_iv.value_id.cmp(&b_iv.value_id))
++            });
++            scored.truncate(128);
++            let phase2b_intervals: Vec<LiveInterval> = scored.iter().map(|(iv, _, _)| *iv).collect();
+ 
+             if !phase2b_intervals.is_empty() {
+-                // Build interval map for live-at-call checks
++                // Build interval map for live-at-call checks.
+                 let interval_map: FxHashMap<u32, (u32, u32)> = phase2b_intervals.iter()
+                     .map(|iv| (iv.value_id, (iv.start, iv.end)))
+                     .collect();
+ 
+-                // Lightweight range builder — O(n) instead of O(n × instructions).
+-                // The full build_live_ranges scans ALL function instructions for
+-                // use-site data, which is too slow for 4000+ Phase 2b intervals
+-                // in large functions like sqlite3VdbeExec.
+-                let mut phase2b_ranges: Vec<live_range::LiveRange> = phase2b_intervals.iter()
+-                    .map(|iv| {
++                let mut phase2b_ranges: Vec<live_range::LiveRange> = scored.iter()
++                    .map(|(iv, score, _)| {
+                         let mut r = live_range::LiveRange::from_interval(*iv, 0);
+-                        // Priority: inverse range length (shorter ranges = higher priority)
+-                        let len = (iv.end - iv.start).max(1) as u64;
+-                        r.priority = 1_000_000 / len;
++                        r.priority = *score;
+                         r.calculate_spill_weight();
+                         r
+                     })
+                     .collect();
+                 phase2b_ranges.sort_by(|a, b| a.start.cmp(&b.start).then(b.priority.cmp(&a.priority)));
+-                let mut span_allocator =
+-                    LinearScanAllocator::new(phase2b_ranges, span_regs);
++                let mut span_allocator = LinearScanAllocator::new(phase2b_ranges, span_regs);
+                 span_allocator.run();
+ 
++                if std::env::var("CCC_DEBUG_CALLER_SPAN").is_ok() {
++                    eprintln!("[CALLER-SPAN] fn={} legal={} admitted={} assigned={}",
++                        func.name, legal_phase2b.len(), phase2b_intervals.len(), span_allocator.assignments.len());
++                }
+                 for (vid, reg) in span_allocator.assignments {
+                     assignments.insert(vid, reg);
+-                    // Record the interval for this register for selective save/restore
++                    // Record the interval for this register for selective save/restore.
+                     if let Some(&(start, end)) = interval_map.get(&vid) {
+                         caller_save_spans.entry(reg.0).or_default().push((start, end));
+                     }
+-                    // Do NOT add to used_regs_set (not prologue-saved)
++                    // Do NOT add to used_regs_set (not prologue-saved).
+                 }
+             }
+         }
+@@ -555,6 +815,25 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
      let mut used_regs: Vec<PhysReg> = used_regs_set.iter().map(|&r| PhysReg(r)).collect();
      used_regs.sort_by_key(|r| r.0);
  
@@ -2747,6 +3377,76 @@ index c4b75fab2213ef8e55736b403367f3f2bb50724d..49beb1916b1c22fee23e3bd96e711767
      // Verify: no two assigned values should have overlapping live intervals
      // in the same physical register.
      if std::env::var("CCC_VERIFY_REGALLOC").is_ok() {
+@@ -819,6 +1098,48 @@ fn spans_any_call(iv: &LiveInterval, call_points: &[u32]) -> bool {
+     start_idx < call_points.len() && call_points[start_idx] <= iv.end
+ }
+ 
++/// Return true only when an already-defined value must survive a call.
++///
++/// Phase 2b save/restore is stricter than the conservative phase classifiers:
++/// a value defined *by* the call at program point `cp` must not be saved before
++/// that call and restored afterward, because that would overwrite the fresh
++/// return value with stale register contents. Likewise, a value used only as a
++/// call argument dies at `cp` and needs no restore. Therefore both bounds are
++/// strict (`start < cp < end`).
++fn crosses_any_call(iv: &LiveInterval, call_points: &[u32]) -> bool {
++    let start_idx = call_points.partition_point(|&cp| cp <= iv.start);
++    start_idx < call_points.len() && call_points[start_idx] < iv.end
++}
++
++/// Values eligible for Phase 2b caller-save spanning allocation.
++///
++/// A caller-save interval is represented by one static value ID.  Do not apply
++/// it to a call result (which is born after the call) or a value with multiple
++/// backend-time definitions (typically a lowered phi): a scalar interval cannot
++/// distinguish the pre-call incarnation from the new one, so saving/restoring
++/// that physical register can overwrite a fresh result.  These values retain
++/// the proven callee/stack strategy; ordinary single-definition values remain
++/// fully eligible for Phase 2b.
++fn phase2b_legal_values(func: &IrFunction) -> FxHashSet<u32> {
++    let mut defs: FxHashMap<u32, u32> = FxHashMap::default();
++    let mut call_results = FxHashSet::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Some(dest) = inst.dest() {
++                *defs.entry(dest.0).or_insert(0) += 1;
++            }
++            if let Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } = inst {
++                if let Some(dest) = info.dest {
++                    call_results.insert(dest.0);
++                }
++            }
++        }
++    }
++    defs.into_iter()
++        .filter_map(|(value, count)| (count == 1 && !call_results.contains(&value)).then_some(value))
++        .collect()
++}
++
+ /// Build a sorted list of allocation candidates from live intervals.
+ ///
+ /// Filters by eligibility, minimum span length, and call-spanning behavior:
+@@ -1244,3 +1565,20 @@ fn uses_value(inst: &Instruction, val_id: u32) -> bool {
+         _ => false,
+     }
+ }
++
++
++#[cfg(test)]
++mod caller_save_span_tests {
++    use super::*;
++
++    #[test]
++    fn caller_save_crossing_excludes_call_result_and_call_argument_boundaries() {
++        let calls = vec![10];
++        // Defined by the call: no pre-call save / post-call restore.
++        assert!(!crosses_any_call(&LiveInterval { value_id: 1, start: 10, end: 20 }, &calls));
++        // Last use is the call argument position: dead after the call.
++        assert!(!crosses_any_call(&LiveInterval { value_id: 2, start: 2, end: 10 }, &calls));
++        // Defined before and used after: this is the only save/restore case.
++        assert!(crosses_any_call(&LiveInterval { value_id: 3, start: 2, end: 20 }, &calls));
++    }
++}
 diff --git a/src/backend/riscv/linker/emit_shared.rs b/src/backend/riscv/linker/emit_shared.rs
 index 824fd73fda3a69fc1c6c5d66fcc6669066e23b7e..a6ce523937940d31ca02136b38d1583514fd97c1 100644
 --- a/src/backend/riscv/linker/emit_shared.rs
@@ -2774,7 +3474,7 @@ index 84bf0dc70bc4e5763073e70633433e93a3959f12..8b1be11253d2f8270dd578230d9ffda6
          func.blocks[0].source_spans.clear();
  
 diff --git a/src/backend/stack_layout/copy_coalescing.rs b/src/backend/stack_layout/copy_coalescing.rs
-index 616d9ae50e49716a11e2b5856a293f32a3f4eee7..8027689e8c944d4ae27a3865af131537c37b2991 100644
+index 616d9ae50e49716a11e2b5856a293f32a3f4eee7..ecf621119800dde1e5f86c80dbcbd85d31de3032 100644
 --- a/src/backend/stack_layout/copy_coalescing.rs
 +++ b/src/backend/stack_layout/copy_coalescing.rs
 @@ -8,6 +8,7 @@
@@ -2785,7 +3485,7 @@ index 616d9ae50e49716a11e2b5856a293f32a3f4eee7..8027689e8c944d4ae27a3865af131537
      IrFunction,
      Operand,
      Terminator,
-@@ -20,6 +21,404 @@ use crate::backend::liveness::{
+@@ -20,6 +21,266 @@ use crate::backend::liveness::{
      for_each_operand_in_terminator,
  };
  
@@ -2896,152 +3596,14 @@ index 616d9ae50e49716a11e2b5856a293f32a3f4eee7..8027689e8c944d4ae27a3865af131537
 +    classes
 +}
 +
-+fn instruction_value_uses(inst: &Instruction) -> Vec<u32> {
-+    let mut uses = Vec::new();
-+    for_each_operand_in_instruction(inst, |op| {
-+        if let Operand::Value(v) = op {
-+            uses.push(v.0);
-+        }
-+    });
-+    for_each_value_use_in_instruction(inst, |v| uses.push(v.0));
-+    uses.sort_unstable();
-+    uses.dedup();
-+    uses
-+}
-+
-+fn terminator_value_uses(term: &Terminator) -> Vec<u32> {
-+    let mut uses = Vec::new();
-+    for_each_operand_in_terminator(term, |op| {
-+        if let Operand::Value(v) = op {
-+            uses.push(v.0);
-+        }
-+    });
-+    uses.sort_unstable();
-+    uses.dedup();
-+    uses
-+}
-+
-+fn insert_interference(
-+    graph: &mut FxHashMap<u32, FxHashSet<u32>>,
-+    lhs: u32,
-+    rhs: u32,
-+) {
-+    if lhs == rhs {
-+        return;
-+    }
-+    graph.entry(lhs).or_default().insert(rhs);
-+    graph.entry(rhs).or_default().insert(lhs);
-+}
-+
-+/// Build an SSA-style, CFG-aware interference graph after phi lowering.
-+///
-+/// Unlike the former textual interval heuristic, this solves backward liveness
-+/// over actual successor edges and then uses copy-aware interference insertion:
-+/// for `d = copy s`, `d` interferes with every value live after the copy except
-+/// `s` itself.  This is the standard move-coalescing rule: source and
-+/// destination may share a location at the handoff, but any other reaching
-+/// definition/path that keeps them simultaneously live creates an edge and
-+/// blocks the merge.
++/// Reuse the shared CFG proof for stack-copy coalescing and register graph
++/// allocation.  In particular it understands lowered phi parallel-copy bundles
++/// rather than treating adjacent edge moves as unrelated scalar copies.
 +fn cfg_copy_interference(
 +    func: &IrFunction,
 +    tracked: &FxHashSet<u32>,
 +) -> Option<FxHashMap<u32, FxHashSet<u32>>> {
-+    use crate::ir::analysis;
-+
-+    let label_map = analysis::build_label_map(func);
-+    let (_preds, succs) = analysis::build_cfg(func, &label_map);
-+    let succs: Vec<Vec<usize>> = (0..func.blocks.len())
-+        .map(|idx| succs.row(idx).iter().map(|&v| v as usize).collect())
-+        .collect();
-+
-+    let mut block_use: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
-+    let mut block_def: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
-+    for (block_idx, block) in func.blocks.iter().enumerate() {
-+        for inst in &block.instructions {
-+            for value in instruction_value_uses(inst) {
-+                if tracked.contains(&value) && !block_def[block_idx].contains(&value) {
-+                    block_use[block_idx].insert(value);
-+                }
-+            }
-+            if let Some(dest) = inst.dest() {
-+                if tracked.contains(&dest.0) {
-+                    block_def[block_idx].insert(dest.0);
-+                }
-+            }
-+        }
-+        for value in terminator_value_uses(&block.terminator) {
-+            if tracked.contains(&value) && !block_def[block_idx].contains(&value) {
-+                block_use[block_idx].insert(value);
-+            }
-+        }
-+    }
-+
-+    let mut live_in: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
-+    let mut live_out: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
-+    let mut changed = true;
-+    let mut iterations = 0usize;
-+    // A conservative cap guards malformed irreducible CFGs. Failure to
-+    // converge merely under-optimizes because callers reject the empty graph.
-+    while changed && iterations < 256 {
-+        changed = false;
-+        iterations += 1;
-+        for block_idx in (0..func.blocks.len()).rev() {
-+            let mut out = FxHashSet::default();
-+            for &succ in &succs[block_idx] {
-+                out.extend(live_in[succ].iter().copied());
-+            }
-+            let mut input = block_use[block_idx].clone();
-+            for value in &out {
-+                if !block_def[block_idx].contains(value) {
-+                    input.insert(*value);
-+                }
-+            }
-+            if out != live_out[block_idx] {
-+                live_out[block_idx] = out;
-+                changed = true;
-+            }
-+            if input != live_in[block_idx] {
-+                live_in[block_idx] = input;
-+                changed = true;
-+            }
-+        }
-+    }
-+    if changed {
-+        // Do not use partially converged dataflow for a correctness proof.
-+        return None;
-+    }
-+
-+    let mut graph: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
-+    for (block_idx, block) in func.blocks.iter().enumerate() {
-+        let mut live = live_out[block_idx].clone();
-+        for value in terminator_value_uses(&block.terminator) {
-+            if tracked.contains(&value) {
-+                live.insert(value);
-+            }
-+        }
-+        for inst in block.instructions.iter().rev() {
-+            let copy_source = match inst {
-+                Instruction::Copy { src: Operand::Value(source), .. } => Some(source.0),
-+                _ => None,
-+            };
-+            if let Some(dest) = inst.dest() {
-+                if tracked.contains(&dest.0) {
-+                    for &other in &live {
-+                        if copy_source != Some(other) {
-+                            insert_interference(&mut graph, dest.0, other);
-+                        }
-+                    }
-+                    live.remove(&dest.0);
-+                }
-+            }
-+            for value in instruction_value_uses(inst) {
-+                if tracked.contains(&value) {
-+                    live.insert(value);
-+                }
-+            }
-+        }
-+    }
-+    Some(graph)
++    crate::backend::cfg_liveness::build_copy_aware_interference(func, tracked)
 +}
 +
 +fn find_root(parent: &mut FxHashMap<u32, u32>, value: u32) -> u32 {
@@ -3190,7 +3752,7 @@ index 616d9ae50e49716a11e2b5856a293f32a3f4eee7..8027689e8c944d4ae27a3865af131537
  /// Build the copy alias map: dest_id -> root_id for Copy instructions where
  /// dest and src can share the same stack slot.
  ///
-@@ -36,6 +435,10 @@ pub(super) fn build_copy_alias_map(
+@@ -36,6 +297,10 @@ pub(super) fn build_copy_alias_map(
      use_blocks_map: &FxHashMap<u32, Vec<usize>>,
      cached_liveness: &Option<crate::backend::liveness::LivenessResult>,
  ) -> (FxHashMap<u32, u32>, FxHashSet<u32>) {
@@ -3201,7 +3763,7 @@ index 616d9ae50e49716a11e2b5856a293f32a3f4eee7..8027689e8c944d4ae27a3865af131537
      // Count uses of each value across all instructions.
      let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
      for block in &func.blocks {
-@@ -379,6 +782,20 @@ pub(super) fn build_copy_alias_map(
+@@ -379,6 +644,20 @@ pub(super) fn build_copy_alias_map(
          copy_alias.retain(|dest_id, _| !asm_output_ptrs.contains(dest_id));
      }
  
@@ -3222,7 +3784,7 @@ index 616d9ae50e49716a11e2b5856a293f32a3f4eee7..8027689e8c944d4ae27a3865af131537
      (copy_alias, phi_web_aliases)
  }
  
-@@ -557,3 +974,169 @@ fn is_sole_operand_of_terminator(term: &Terminator, value_id: u32) -> bool {
+@@ -557,3 +836,169 @@ fn is_sole_operand_of_terminator(term: &Terminator, value_id: u32) -> bool {
          _ => false,
      }
  }
@@ -3410,6 +3972,34 @@ index 2539e4c7e118abbbfa5fde11383215b0a5bace66..7e55717d39b7743248c59459a4112a4e
      // Phase 4: Tier 2 — liveness-based packing for multi-block values.
      slot_assignment::assign_tier2_liveness_packed_slots(
          state, coalesce, cached_liveness, func,
+diff --git a/src/backend/stack_layout/regalloc_helpers.rs b/src/backend/stack_layout/regalloc_helpers.rs
+index 78909554aa81ba4f08907bf9c692dd8914d5462a..7b24adb71148b1c2c66eac09c2023f11e1b291ee 100644
+--- a/src/backend/stack_layout/regalloc_helpers.rs
++++ b/src/backend/stack_layout/regalloc_helpers.rs
+@@ -31,13 +31,21 @@ pub fn run_regalloc_and_merge_clobbers(
+ ) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>, FxHashMap<u8, Vec<(u32, u32)>>) {
+     // Detect x86-64 target by checking for x86 callee-saved PhysReg IDs (1-5).
+     // On x86-64, provide XMM registers for F64 allocation.
+-    let xmm_regs = if available_regs.iter().any(|r| r.0 == 1) {
++    let is_x86_64 = available_regs.iter().any(|r| r.0 == 1)
++        && !caller_saved_regs.is_empty();
++    let xmm_regs = if is_x86_64 {
+         // x86-64: xmm2-xmm7 available for F64 values
+         vec![PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23), PhysReg(24), PhysReg(25)]
+     } else {
+         Vec::new()
+     };
+-    let config = super::super::regalloc::RegAllocConfig { available_regs, caller_saved_regs, allow_inline_asm_regalloc, xmm_regs };
++    let config = super::super::regalloc::RegAllocConfig {
++        available_regs,
++        caller_saved_regs,
++        allow_inline_asm_regalloc,
++        xmm_regs,
++        supports_caller_save_spanning: is_x86_64,
++    };
+     let alloc_result = super::super::regalloc::allocate_registers(func, &config);
+     *reg_assignments = alloc_result.assignments;
+     *used_callee_saved = alloc_result.used_regs;
 diff --git a/src/backend/stack_layout/slot_assignment.rs b/src/backend/stack_layout/slot_assignment.rs
 index 317d3c099f9b360ded75d4088f4c42fc3be7b465..df07d4250627aff11449a016772806bcd677f74d 100644
 --- a/src/backend/stack_layout/slot_assignment.rs
@@ -4864,7 +5454,7 @@ index 2ea62b8b6ddf185db9b568712eae1d26e94f33f0..6e6cedc256f290bb406accf2685a5726
          if self.state.out.use_rsp_addressing {
              self.state.out.rsp_frame_size -= 8;
 diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 5319589d2342c43374030e71f13bd22ba25ae18d..b41bfe3a2a8ba348b735f15198b9ab542431bfc2 100644
+index 5319589d2342c43374030e71f13bd22ba25ae18d..0fd01b7bb5de0010c6af07e48ecca99e5d2c842f 100644
 --- a/src/backend/x86/codegen/emit.rs
 +++ b/src/backend/x86/codegen/emit.rs
 @@ -139,6 +139,7 @@ pub(super) fn typed_phys_reg_name(reg: PhysReg, ty: IrType) -> &'static str {
@@ -4896,7 +5486,17 @@ index 5319589d2342c43374030e71f13bd22ba25ae18d..b41bfe3a2a8ba348b735f15198b9ab54
      /// IVSR pointer detection results: maps pointer phi value ID to its metadata
      pub(super) ivsr_pointers: FxHashMap<u32, IvsrPointerInfo>,
      /// Maps IVSR pointer phi to original loop counter value ID
-@@ -295,6 +310,10 @@ impl X86Codegen {
+@@ -261,7 +276,8 @@ pub struct X86Codegen {
+     /// MachInst buffer for virtual register ISel. Instructions are accumulated
+     /// here by try_lower_machinst and flushed (allocated + emitted) by flush_machinst.
+     pub(super) machinst_buf: Vec<super::machinst::MachInst>,
+-    /// Whether MachInst ISel is enabled (CCC_USE_MACHINST env var).
++    /// Whether the verified hybrid MachInst selector is enabled. Default-on;
++    /// CCC_NO_MACHINST=1 is a bisection escape hatch.
+     pub(super) machinst_enabled: bool,
+ }
+ 
+@@ -295,6 +311,10 @@ impl X86Codegen {
              no_sse: false,
              skip_i32_sext: false,
              needs_sext_values: FxHashSet::default(),
@@ -4907,7 +5507,16 @@ index 5319589d2342c43374030e71f13bd22ba25ae18d..b41bfe3a2a8ba348b735f15198b9ab54
              current_func: None,
              ivsr_pointers: FxHashMap::default(),
              pointer_to_counter: FxHashMap::default(),
-@@ -524,18 +543,14 @@ impl X86Codegen {
+@@ -302,7 +322,7 @@ impl X86Codegen {
+             caller_save_spill_slots: FxHashMap::default(),
+             caller_save_intervals: FxHashMap::default(),
+             machinst_buf: Vec::new(),
+-            machinst_enabled: std::env::var("CCC_USE_MACHINST").is_ok(),
++            machinst_enabled: std::env::var("CCC_NO_MACHINST").is_err(),
+         }
+     }
+ 
+@@ -524,18 +544,14 @@ impl X86Codegen {
                      }
                      // If same register, nothing to do
                  } else if let Some(slot) = self.state.get_slot(v.0) {
@@ -4934,7 +5543,7 @@ index 5319589d2342c43374030e71f13bd22ba25ae18d..b41bfe3a2a8ba348b735f15198b9ab54
                  } else if self.state.reg_cache.acc_has(v.0, false) || self.state.reg_cache.acc_has(v.0, true) {
                      self.state.out.emit_instr_reg_reg("    movq", "rax", target_name);
                  } else {
-@@ -1172,16 +1187,38 @@ impl X86Codegen {
+@@ -1172,16 +1188,38 @@ impl X86Codegen {
              } else if self.state.vector_values.contains(&val.0) {
                  // Vector value: use leaq to get address (vectors are stored directly at slot)
                  self.state.out.emit_instr_rbp_reg("    leaq", slot.0, reg);
@@ -4983,7 +5592,7 @@ index 5319589d2342c43374030e71f13bd22ba25ae18d..b41bfe3a2a8ba348b735f15198b9ab54
              } else {
                  self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
              }
-@@ -1241,15 +1278,38 @@ impl X86Codegen {
+@@ -1241,15 +1279,38 @@ impl X86Codegen {
                          self.state.emit("    xorl %edx, %edx");
                      } else if self.state.is_i128_value(v.0) {
                          // 128-bit value in 16-byte stack slot
@@ -5025,7 +5634,7 @@ index 5319589d2342c43374030e71f13bd22ba25ae18d..b41bfe3a2a8ba348b735f15198b9ab54
                          } else {
                              self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
                          }
-@@ -1273,8 +1333,13 @@ impl X86Codegen {
+@@ -1273,8 +1334,13 @@ impl X86Codegen {
      /// Store %rax:%rdx (128-bit) to a value's 16-byte stack slot.
      pub(super) fn store_rax_rdx_to(&mut self, dest: &Value) {
          if let Some(slot) = self.state.get_slot(dest.0) {
@@ -5039,7 +5648,7 @@ index 5319589d2342c43374030e71f13bd22ba25ae18d..b41bfe3a2a8ba348b735f15198b9ab54
          }
          // rax holds only the low 64 bits of an i128, not a valid scalar IR value.
          self.state.reg_cache.invalidate_all();
-@@ -1483,7 +1548,8 @@ impl X86Codegen {
+@@ -1483,7 +1549,8 @@ impl X86Codegen {
      /// save/restore incorrectly removed.
      pub(super) fn emit_callee_saved_clobber_annotations(&mut self, clobbers: &[String]) {
          for clobber in clobbers {
@@ -5049,7 +5658,160 @@ index 5319589d2342c43374030e71f13bd22ba25ae18d..b41bfe3a2a8ba348b735f15198b9ab54
                  "rbx" | "ebx" | "bx" | "bl" | "bh" => Some("%rbx"),
                  "r12" | "r12d" | "r12w" | "r12b" => Some("%r12"),
                  "r13" | "r13d" | "r13w" | "r13b" => Some("%r13"),
-@@ -2351,6 +2417,7 @@ impl ArchCodegen for X86Codegen {
+@@ -1944,6 +2011,79 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, ra: &FxHashMap<u32, P
+     }
+ }
+ 
++/// The production MachInst path is intentionally a verified hybrid selector.
++///
++/// The historical experimental mode attempted to lower memory, CFG, copies and
++/// calls into a buffer without a complete independent allocator.  That crossed
++/// representation boundaries (stack homes, phi copies, flag state) and produced
++/// wrong code.  The safe subset below contains only pure GPR integer operations
++/// whose inputs and destination already have physical assignments from the
++/// proven global allocator; no unresolved virtual register, memory address,
++/// call-clobber, or control-flow state can enter the MachInst buffer.
++impl X86Codegen {
++    fn machinst_gpr_value(&self, value: u32) -> bool {
++        self.reg_assignments
++            .get(&value)
++            .is_some_and(|reg| reg.0 < 20)
++    }
++
++    fn machinst_all_operands_are_gpr_or_const(
++        &self,
++        inst: &crate::ir::reexports::Instruction,
++    ) -> bool {
++        use crate::backend::liveness::for_each_operand_in_instruction;
++        let mut ok = true;
++        for_each_operand_in_instruction(inst, |operand| {
++            if let crate::ir::reexports::Operand::Value(value) = operand {
++                ok &= self.machinst_gpr_value(value.0);
++            }
++        });
++        ok
++    }
++
++    fn is_safe_machinst_instruction(&self, inst: &crate::ir::reexports::Instruction) -> bool {
++        use crate::ir::reexports::{Instruction, IrBinOp, IrUnaryOp};
++        let gpr_dest = |dest: &Value| self.machinst_gpr_value(dest.0);
++        match inst {
++            Instruction::BinOp { dest, op, ty, .. }
++                if matches!(op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::And
++                    | IrBinOp::Or | IrBinOp::Xor | IrBinOp::Mul)
++                    && !ty.is_float()
++                    && !ty.is_128bit()
++                    && !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) =>
++            {
++                gpr_dest(dest) && self.machinst_all_operands_are_gpr_or_const(inst)
++            }
++            Instruction::Cast { dest, src, from_ty, to_ty }
++                if !from_ty.is_float() && !to_ty.is_float()
++                    && !from_ty.is_128bit() && !to_ty.is_128bit()
++                    && !from_ty.is_long_double() && !to_ty.is_long_double()
++                    && !matches!(from_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16)
++                    && !matches!(to_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) =>
++            {
++                gpr_dest(dest)
++                    && match src {
++                        crate::ir::reexports::Operand::Value(value) => self.machinst_gpr_value(value.0),
++                        crate::ir::reexports::Operand::Const(_) => true,
++                    }
++            }
++            Instruction::UnaryOp { dest, op, src, ty }
++                if matches!(op, IrUnaryOp::Neg | IrUnaryOp::Not)
++                    && !ty.is_float()
++                    && !ty.is_128bit()
++                    && !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) =>
++            {
++                gpr_dest(dest)
++                    && match src {
++                        crate::ir::reexports::Operand::Value(value) => self.machinst_gpr_value(value.0),
++                        crate::ir::reexports::Operand::Const(_) => true,
++                    }
++            }
++            _ => false,
++        }
++    }
++}
++
+ impl ArchCodegen for X86Codegen {
+     fn state(&mut self) -> &mut CodegenState { &mut self.state }
+     fn state_ref(&self) -> &CodegenState { &self.state }
+@@ -1956,9 +2096,13 @@ impl ArchCodegen for X86Codegen {
+     fn is_machinst_enabled(&self) -> bool { self.machinst_enabled }
+ 
+     fn try_lower_machinst(&mut self, inst: &crate::ir::reexports::Instruction) -> bool {
+-        if !self.machinst_enabled { return false; }
++        if !self.machinst_enabled || !self.is_safe_machinst_instruction(inst) {
++            return false;
++        }
+ 
+-        // Reject instructions involving values we can't handle.
++        // The remaining checks are defense in depth for the verified pure-GPR
++        // subset. They retain a clean fallback if a future lowering broadens
++        // the selector without supplying the required legality proof.
+         // Allocas are allowed for Load/Store ptr (ISel handles via StackSlot).
+         use crate::backend::liveness::for_each_operand_in_instruction;
+         let ra = &self.reg_assignments;
+@@ -2040,7 +2184,25 @@ impl ArchCodegen for X86Codegen {
+             _ => {}
+         }
+ 
+-        super::isel::lower_instruction_ctx(inst, &self.reg_assignments, &alloca_slots, &mut self.machinst_buf)
++        // Lower transactionally.  The old implementation appended first and
++        // discovered an unresolvable vreg only when flushing a whole buffer;
++        // it then discarded already-lowered instructions, silently deleting
++        // program semantics.  Validate each candidate against the fixed
++        // stack/register assignment before accepting it, so `false` cleanly
++        // falls back to the established accumulator codegen for this IR node.
++        let mut candidate = Vec::new();
++        if !super::isel::lower_instruction_ctx(inst, &self.reg_assignments, &alloca_slots, &mut candidate) {
++            return false;
++        }
++        let resolvable = candidate.iter().all(|machine_inst| {
++            let resolved = resolve_stack_vregs(machine_inst, &self.reg_assignments, &self.state);
++            !has_unresolvable_vreg(&resolved, &self.reg_assignments)
++        });
++        if !resolvable {
++            return false;
++        }
++        self.machinst_buf.extend(candidate);
++        true
+     }
+ 
+     fn flush_machinst(&mut self) {
+@@ -2054,6 +2216,11 @@ impl ArchCodegen for X86Codegen {
+ 
+         let has_bad = resolved.iter().any(|mi| has_unresolvable_vreg(mi, &self.reg_assignments));
+         if has_bad {
++            // This is unreachable after transactional admission in
++            // try_lower_machinst.  Do not emit malformed `%vreg` assembly if a
++            // future lowering path violates that contract; retain a loud debug
++            // signal for investigation instead of silently pretending success.
++            debug_assert!(!has_bad, "MachInst buffer admitted an unresolvable vreg");
+             self.machinst_buf.clear();
+             return;
+         }
+@@ -2079,7 +2246,7 @@ impl ArchCodegen for X86Codegen {
+         let point = self.state.current_program_point;
+         for (&reg_id, &slot) in &self.caller_save_spill_slots {
+             if let Some(intervals) = self.caller_save_intervals.get(&reg_id) {
+-                if intervals.iter().any(|&(start, end)| start <= point && point <= end) {
++                if intervals.iter().any(|&(start, end)| start < point && point < end) {
+                     let reg_name = phys_reg_name(PhysReg(reg_id));
+                     self.state.out.emit_instr_reg_rbp("    movq", reg_name, slot.0);
+                 }
+@@ -2091,7 +2258,7 @@ impl ArchCodegen for X86Codegen {
+         let point = self.state.current_program_point;
+         for (&reg_id, &slot) in &self.caller_save_spill_slots {
+             if let Some(intervals) = self.caller_save_intervals.get(&reg_id) {
+-                if intervals.iter().any(|&(start, end)| start <= point && point <= end) {
++                if intervals.iter().any(|&(start, end)| start < point && point < end) {
+                     let reg_name = phys_reg_name(PhysReg(reg_id));
+                     self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg_name);
+                 }
+@@ -2351,6 +2518,7 @@ impl ArchCodegen for X86Codegen {
          // calls
          fn call_abi_config(&self) -> CallAbiConfig => call_abi_config_impl;
          fn emit_call_compute_stack_space(&self, arg_classes: &[CallArgClass], arg_types: &[IrType]) -> usize => emit_call_compute_stack_space_impl;
@@ -5151,6 +5913,66 @@ index 093b4f26cec9d8bddf3f71ff1621da710909cbd0..ac856c00d5efcc2a0de26eeca742647c
      }
  
      pub(super) fn emit_i128_add_impl(&mut self) {
+diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
+index 17fb1537ebc6a0db16cf96007f39f71a82de1be0..86f1fc1fa9cf1e2ac1bf7023a50acae30b119713 100644
+--- a/src/backend/x86/codegen/isel.rs
++++ b/src/backend/x86/codegen/isel.rs
+@@ -391,8 +391,17 @@ pub fn lower_cast(
+         }
+     };
+ 
+-    if to_ty.is_unsigned() || from_ty.is_unsigned() {
+-        out.push(MachInst::Movzx { src: src_reg, dst, from_size, to_size });
++    // Extension semantics are determined by the *source* type.  Casting a
++    // negative I32 to U64 must sign-extend modulo 2^64; the old `to_ty`
++    // condition incorrectly chose zero extension merely because the target
++    // was unsigned.  x86 has no movzx r32 -> r64: a 32-bit `movl` already
++    // performs the required zero extension.
++    if from_ty.is_unsigned() {
++        if from_size == OpSize::S32 && to_size == OpSize::S64 {
++            emit_mov_operand_r(src, dst, OpSize::S32, ra, out);
++        } else {
++            out.push(MachInst::Movzx { src: src_reg, dst, from_size, to_size });
++        }
+     } else {
+         out.push(MachInst::Movsx { src: src_reg, dst, from_size, to_size });
+     }
+@@ -703,3 +712,35 @@ pub fn lower_instruction_ctx(
+         _ => false,
+     }
+ }
++
++
++#[cfg(test)]
++mod machinst_cast_tests {
++    use super::*;
++
++    fn assignments() -> FxHashMap<u32, PhysReg> {
++        [(0, PhysReg(1)), (1, PhysReg(2))].into_iter().collect()
++    }
++
++    #[test]
++    fn u32_to_u64_uses_a_32bit_move_not_invalid_movzx() {
++        let mut out = Vec::new();
++        lower_cast(
++            &Value(1), &Operand::Value(Value(0)), IrType::U32, IrType::U64,
++            &assignments(), &mut out,
++        );
++        assert!(matches!(out.as_slice(), [MachInst::Mov { size: OpSize::S32, .. }]));
++    }
++
++    #[test]
++    fn i32_to_u64_sign_extends_from_the_source_signedness() {
++        let mut out = Vec::new();
++        lower_cast(
++            &Value(1), &Operand::Value(Value(0)), IrType::I32, IrType::U64,
++            &assignments(), &mut out,
++        );
++        assert!(matches!(out.as_slice(), [MachInst::Movsx {
++            from_size: OpSize::S32, to_size: OpSize::S64, ..
++        }]));
++    }
++}
 diff --git a/src/backend/x86/codegen/machinst_emit.rs b/src/backend/x86/codegen/machinst_emit.rs
 index 96825a65c46566a4f389f0621741879a5ec101f7..6c68aaccd4e7919cb79931938a44989ac028e8e6 100644
 --- a/src/backend/x86/codegen/machinst_emit.rs
@@ -5966,7 +6788,7 @@ index f5aff9ac171e86be9e419c954cdfc6d8971e3f67..1d57d557d09ef65c42eef1d7334b536c
                      let target = trimmed[space_pos + 1..].trim();
                      if let Some(canonical) = redirects.get(target) {
 diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-index 08304359edcaf70b2506cd9883fa2bba506dcf8b..1487dc0e352fc95463cab6279a89467d37ac252e 100644
+index 08304359edcaf70b2506cd9883fa2bba506dcf8b..2672732b9ea66610ea5a999c8824285a80d16d11 100644
 --- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
 +++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
 @@ -16,6 +16,19 @@
@@ -6079,7 +6901,328 @@ index 08304359edcaf70b2506cd9883fa2bba506dcf8b..1487dc0e352fc95463cab6279a89467d
                      }
                  }
              }
-@@ -929,37 +996,53 @@ pub(super) fn fold_accumulator_alu_store(
+@@ -877,6 +944,320 @@ fn try_fold_mem_op_with_sib(instr: &str, addr_pat: &str, base_reg: &str, idx_reg
+     Some(new_instr)
+ }
+ 
++// ── Adjacent LEA + dereference SIB folding ──────────────────────────────────
++//
++// Unlike `fold_base_index_addressing` above (which recognizes an accumulator
++// `mov` + `add` construction), modern codegen often already emits a proper LEA:
++//
++//   leaq DISP(%base,%index,SCALE), %tmp
++//   movX DISP2(%tmp), %dst
++//
++// When the temporary address is consumed exactly once by the immediately
++// following memory instruction, fold it into the memory operand directly.  This
++// is the sound post-emission form of variable-GEP/SIB selection: base/index are
++// proven from the actual adjacent assembly, not guessed from stale pre-emission
++// register-cache state.
++
++/// Parse a two-register x86-64 LEA operand into `(tmp, sib_address)`.
++///
++/// Only base+index forms are accepted. `%rsp` cannot be an SIB index encoding
++/// (it denotes "no index"), and dynamic stack-pointer destinations are excluded.
++fn parse_two_reg_leaq(line: &str) -> Option<(String, String)> {
++    let rest = line.strip_prefix("leaq ")?;
++    let (address, dest) = rest.rsplit_once(", ")?;
++    let dest = dest.trim();
++    if !dest.starts_with('%') {
++        return None;
++    }
++    let dest_family = register_family_fast(dest);
++    if dest_family == REG_NONE || dest_family > REG_GP_MAX || dest_family == 4 {
++        return None;
++    }
++
++    let open = address.find('(')?;
++    if !address.ends_with(')') {
++        return None;
++    }
++    let displacement = address[..open].trim();
++    let inside = &address[open + 1..address.len() - 1];
++    let fields: Vec<&str> = inside.split(',').map(str::trim).collect();
++    if fields.len() != 2 && fields.len() != 3 {
++        return None;
++    }
++    let base = fields[0];
++    let index = fields[1];
++    if !base.starts_with('%') || !index.starts_with('%') {
++        return None;
++    }
++    let base_family = register_family_fast(base);
++    let index_family = register_family_fast(index);
++    if base_family == REG_NONE || base_family > REG_GP_MAX
++        || index_family == REG_NONE || index_family > REG_GP_MAX || index_family == 4
++    {
++        return None;
++    }
++    let scale = if fields.len() == 3 { fields[2] } else { "1" };
++    if !matches!(scale, "1" | "2" | "4" | "8") {
++        return None;
++    }
++    let sib = if displacement.is_empty() {
++        format!("({}, {}, {})", base, index, scale)
++    } else {
++        format!("{}({}, {}, {})", displacement, base, index, scale)
++    };
++    Some((dest.to_string(), sib))
++}
++
++pub(super) fn fold_leaq_sib_dereference(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
++    let mut changed = false;
++    let mut i = 0usize;
++    while i < store.len() {
++        if infos[i].is_nop() {
++            i += 1;
++            continue;
++        }
++        let lea = infos[i].trimmed(store.get(i));
++        let Some((tmp, sib)) = parse_two_reg_leaq(lea) else {
++            i += 1;
++            continue;
++        };
++        let tmp_family = register_family_fast(&tmp);
++        let mut use_idx = i + 1;
++        while use_idx < store.len() && infos[use_idx].is_nop() {
++            use_idx += 1;
++        }
++        if use_idx >= store.len() || infos[use_idx].is_barrier() {
++            i += 1;
++            continue;
++        }
++        let use_line = infos[use_idx].trimmed(store.get(use_idx));
++        let tmp_address = format!("({})", tmp);
++        // Exactly one occurrence means tmp is used solely as the memory base,
++        // not also as a source/destination register of the same instruction.
++        if use_line.matches(tmp.as_str()).count() != 1
++            || use_line.matches(tmp_address.as_str()).count() != 1
++            || use_line.starts_with("leaq ")
++        {
++            i += 1;
++            continue;
++        }
++        let folded = format!("    {}", use_line.replace(&tmp_address, &sib));
++
++        // Removing the LEA leaves `%tmp` with its old value.  It is legal only
++        // when no later instruction reads that old computed address before a
++        // barrier or overwrite.  A later write to tmp ends the proof window.
++        let tmp_mask = 1u16 << tmp_family;
++        let mut tmp_dead = true;
++        let mut scan = use_idx + 1;
++        while scan < store.len() {
++            if infos[scan].is_nop() {
++                scan += 1;
++                continue;
++            }
++            if infos[scan].is_barrier() {
++                // A label may be a fall-through join and a control-flow barrier
++                // may transfer to code that still consumes tmp.  Unlike a pure
++                // local overwrite, neither proves the eliminated address dead.
++                // Reject rather than reasoning across CFG edges in a text pass.
++                tmp_dead = false;
++                break;
++            }
++            if infos[scan].reg_refs & tmp_mask != 0 {
++                if get_dest_reg(&infos[scan]) == tmp_family {
++                    break;
++                }
++                tmp_dead = false;
++                break;
++            }
++            scan += 1;
++        }
++        if tmp_dead {
++            mark_nop(&mut infos[i]);
++            replace_line(store, &mut infos[use_idx], use_idx, folded);
++            changed = true;
++            i = use_idx + 1;
++        } else {
++            i += 1;
++        }
++    }
++    changed
++}
++
++// ── XMM spill -> rep movsb relay folding ───────────────────────────────────
++//
++// Vector intrinsics are represented as stack-backed 128-bit temporaries.  The
++// generic aggregate lowering often emits an avoidable relay:
++//
++//   movdqu %xmmN, SCRATCH(%rsp)
++//   leaq DEST(%rsp), %rdi
++//   leaq SCRATCH(%rsp), %rsi
++//   movq $16, %rcx
++//   rep movsb
++//
++// The XMM value is already available, so write it directly to DEST.  This is
++// especially valuable in gzip's PCLMUL CRC loop.  We require an exact local
++// shape and prove that the scratch address/register effects are dead afterwards;
++// any barrier, register read, or later scratch access rejects the fold.
++
++fn parse_xmm_store_to_stack(line: &str) -> Option<(String, String)> {
++    let rest = line.strip_prefix("movdqu ")?;
++    let (src, dst) = rest.split_once(", ")?;
++    let src = src.trim();
++    let dst = dst.trim();
++    if !src.starts_with("%xmm")
++        || !(dst.ends_with("(%rsp)") || dst.ends_with("(%rbp)"))
++        || dst.contains(',')
++    {
++        return None;
++    }
++    Some((src.to_string(), dst.to_string()))
++}
++
++fn parse_leaq_to_stack_reg(line: &str, reg: &str) -> Option<String> {
++    let suffix = format!(", %{}", reg);
++    let addr = line.strip_prefix("leaq ")?.strip_suffix(&suffix)?.trim();
++    if !(addr.ends_with("(%rsp)") || addr.ends_with("(%rbp)")) || addr.contains(',') {
++        return None;
++    }
++    Some(addr.to_string())
++}
++
++fn parse_xmm_store_via_rax(line: &str) -> Option<String> {
++    let rest = line.strip_prefix("movdqu ")?;
++    let (src, dst) = rest.split_once(", ")?;
++    if !src.trim().starts_with("%xmm") || dst.trim() != "(%rax)" {
++        return None;
++    }
++    Some(src.trim().to_string())
++}
++
++pub(super) fn fold_xmm_spill_rep_movsb(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
++    let mut changed = false;
++    let mut i = 0usize;
++    while i < store.len() {
++        if infos[i].is_nop() {
++            i += 1;
++            continue;
++        }
++
++        // Accept either a direct XMM spill or the common codegen form that
++        // materializes the scratch address in rax immediately beforehand.
++        let first = infos[i].trimmed(store.get(i));
++        let (xmm, scratch, store_idx, needs_rax_dead) = if let Some((xmm, scratch)) = parse_xmm_store_to_stack(first) {
++            (xmm, scratch, i, false)
++        } else if let Some(scratch) = parse_leaq_to_stack_reg(first, "rax") {
++            let mut next = i + 1;
++            while next < store.len() && infos[next].is_nop() { next += 1; }
++            if next >= store.len() || infos[next].is_barrier() {
++                i += 1;
++                continue;
++            }
++            let Some(xmm) = parse_xmm_store_via_rax(infos[next].trimmed(store.get(next))) else {
++                i += 1;
++                continue;
++            };
++            (xmm, scratch, next, true)
++        } else {
++            i += 1;
++            continue;
++        };
++
++        let mut indexes = Vec::with_capacity(4);
++        let mut cursor = store_idx + 1;
++        while indexes.len() < 4 {
++            while cursor < store.len() && infos[cursor].is_nop() {
++                cursor += 1;
++            }
++            if cursor >= store.len() || infos[cursor].is_barrier() {
++                break;
++            }
++            indexes.push(cursor);
++            cursor += 1;
++        }
++        if indexes.len() != 4 {
++            i += 1;
++            continue;
++        }
++        let dst = parse_leaq_to_stack_reg(infos[indexes[0]].trimmed(store.get(indexes[0])), "rdi");
++        let src = parse_leaq_to_stack_reg(infos[indexes[1]].trimmed(store.get(indexes[1])), "rsi");
++        let count = infos[indexes[2]].trimmed(store.get(indexes[2]));
++        let copy = infos[indexes[3]].trimmed(store.get(indexes[3]));
++        let Some(dst) = dst else { i += 1; continue; };
++        let Some(src) = src else { i += 1; continue; };
++        if src != scratch
++            || !matches!(count, "movq $16, %rcx" | "movl $16, %ecx")
++            || copy != "rep movsb"
++        {
++            i += 1;
++            continue;
++        }
++
++        // After removing the relay, RDI/RSI/RCX retain old values instead of
++        // rep-movsb post-state, SCRATCH is no longer written, and the optional
++        // leading LEA no longer updates RAX. A register is harmless once it is
++        // overwritten by a non-read-modify-write instruction; otherwise any
++        // reference rejects the fold. Continue scanning for a scratch-memory
++        // read even after all temporary registers have been killed.
++        let mut safe = true;
++        let mut live_effect_regs: Vec<(&str, RegId)> = vec![
++            ("%rdi", register_family_fast("%rdi")),
++            ("%rsi", register_family_fast("%rsi")),
++            ("%rcx", register_family_fast("%rcx")),
++        ];
++        if needs_rax_dead {
++            live_effect_regs.push(("%rax", register_family_fast("%rax")));
++        }
++        let mut scan = indexes[3] + 1;
++        while scan < store.len() {
++            if infos[scan].is_nop() {
++                scan += 1;
++                continue;
++            }
++            if infos[scan].is_barrier() {
++                break;
++            }
++            let text = infos[scan].trimmed(store.get(scan));
++            if text.contains(&scratch) {
++                safe = false;
++                break;
++            }
++            let dest_reg = get_dest_reg(&infos[scan]);
++            let mut still_live = Vec::with_capacity(live_effect_regs.len());
++            for (name, family) in live_effect_regs.drain(..) {
++                if !text.contains(name) {
++                    still_live.push((name, family));
++                } else if dest_reg == family && !is_read_modify_write(text) {
++                    // A pure overwrite makes the original rep-movsb post-state
++                    // irrelevant for the remainder of this basic block.
++                } else {
++                    safe = false;
++                    break;
++                }
++            }
++            if !safe {
++                break;
++            }
++            live_effect_regs = still_live;
++            scan += 1;
++        }
++        if !safe {
++            i += 1;
++            continue;
++        }
++
++        replace_line(store, &mut infos[i], i, format!("    movdqu {}, {}", xmm, dst));
++        if store_idx != i {
++            mark_nop(&mut infos[store_idx]);
++        }
++        for &idx in &indexes {
++            mark_nop(&mut infos[idx]);
++        }
++        changed = true;
++        i = indexes[3] + 1;
++    }
++    changed
++}
++
+ // ── Accumulator ALU + store folding ─────────────────────────────────────────
+ //
+ // Folds the pattern:
+@@ -929,37 +1310,53 @@ pub(super) fn fold_accumulator_alu_store(
              (ao.to_string(), ms)
          };
  
@@ -6150,7 +7293,7 @@ index 08304359edcaf70b2506cd9883fa2bba506dcf8b..1487dc0e352fc95463cab6279a89467d
              if infos[n].reg_refs & src_bit == 0 { n += 1; continue; }
              match infos[n].kind {
                  LineKind::LoadRbp { reg, .. } if reg == src_family => break,
-@@ -977,11 +1060,10 @@ pub(super) fn fold_accumulator_alu_store(
+@@ -977,11 +1374,10 @@ pub(super) fn fold_accumulator_alu_store(
          }
          if !src_safe { i += 1; continue; }
  
@@ -6163,7 +7306,7 @@ index 08304359edcaf70b2506cd9883fa2bba506dcf8b..1487dc0e352fc95463cab6279a89467d
          let new_store = format!("    movl {}, {}", src_reg32, store_dst_s);
          replace_line(store, &mut infos[m], m, new_store);
  
-@@ -2137,9 +2219,18 @@ pub(super) fn coalesce_phi_register_copies(
+@@ -2137,9 +2533,18 @@ pub(super) fn coalesce_phi_register_copies(
              let mut src_referenced = false;
              let mut has_implicit_hazard = false;
              let mut copy_back_pos = None;
@@ -6182,7 +7325,7 @@ index 08304359edcaf70b2506cd9883fa2bba506dcf8b..1487dc0e352fc95463cab6279a89467d
  
              while j < len && instr_count < 8 {
                  if infos[j].is_nop() { j += 1; continue; }
-@@ -2147,6 +2238,17 @@ pub(super) fn coalesce_phi_register_copies(
+@@ -2147,6 +2552,17 @@ pub(super) fn coalesce_phi_register_copies(
  
                  let tj = infos[j].trimmed(store.get(j));
  
@@ -6200,7 +7343,7 @@ index 08304359edcaf70b2506cd9883fa2bba506dcf8b..1487dc0e352fc95463cab6279a89467d
                  // Check for direct copy-back: movq %TMP, %SRC
                  if tj == copy_back_pat {
                      copy_back_pos = Some(j);
-@@ -2176,8 +2278,14 @@ pub(super) fn coalesce_phi_register_copies(
+@@ -2176,8 +2592,14 @@ pub(super) fn coalesce_phi_register_copies(
                          let other_reg = &tj[chain_prefix.len() - 1..];
                          let other_fam = register_family_fast(other_reg);
                          if other_fam != REG_NONE && other_fam != tmp_family && other_fam != src_family && other_fam > 1 {
@@ -6215,7 +7358,7 @@ index 08304359edcaf70b2506cd9883fa2bba506dcf8b..1487dc0e352fc95463cab6279a89467d
                          }
                      }
                  }
-@@ -2192,10 +2300,25 @@ pub(super) fn coalesce_phi_register_copies(
+@@ -2192,10 +2614,25 @@ pub(super) fn coalesce_phi_register_copies(
                  j += 1;
              }
  
@@ -6242,7 +7385,7 @@ index 08304359edcaf70b2506cd9883fa2bba506dcf8b..1487dc0e352fc95463cab6279a89467d
              let cb = copy_back_pos.unwrap();
  
              // Verify TMP (and chain TMP2 if present) are dead after the copy-back.
-@@ -2206,7 +2329,10 @@ pub(super) fn coalesce_phi_register_copies(
+@@ -2206,7 +2643,10 @@ pub(super) fn coalesce_phi_register_copies(
              while n < len && chk_count < 8 {
                  if infos[n].is_nop() { n += 1; continue; }
                  if infos[n].is_barrier() {
@@ -6254,7 +7397,7 @@ index 08304359edcaf70b2506cd9883fa2bba506dcf8b..1487dc0e352fc95463cab6279a89467d
                      break;
                  }
                  if infos[n].reg_refs & check_bits != 0 {
-@@ -2228,6 +2354,13 @@ pub(super) fn coalesce_phi_register_copies(
+@@ -2228,6 +2668,13 @@ pub(super) fn coalesce_phi_register_copies(
  
              if !tmp_dead { i += 1; continue; }
  
@@ -6268,7 +7411,7 @@ index 08304359edcaf70b2506cd9883fa2bba506dcf8b..1487dc0e352fc95463cab6279a89467d
              // Apply: remove copy-out, replace TMP with SRC in intermediate ops, remove copy-back
              // For chain coalescing, also replace TMP2 with SRC
              mark_nop(&mut infos[i]);
-@@ -2290,15 +2423,15 @@ pub(super) fn hoist_loop_invariant_gpr_load(
+@@ -2290,15 +2737,15 @@ pub(super) fn hoist_loop_invariant_gpr_load(
      while i < len {
          if infos[i].is_nop() { i += 1; continue; }
          // Match both unconditional (jmp) and conditional (jle, jl, jne, etc.) back-edges
@@ -6293,7 +7436,7 @@ index 08304359edcaf70b2506cd9883fa2bba506dcf8b..1487dc0e352fc95463cab6279a89467d
              else { i += 1; continue; };
          if !target.starts_with(".L") { i += 1; continue; }
          let target_label = format!("{}:", target);
-@@ -2428,68 +2561,64 @@ pub(super) fn hoist_loop_invariant_gpr_load(
+@@ -2428,68 +2875,64 @@ pub(super) fn hoist_loop_invariant_gpr_load(
              }
              if reg_written_elsewhere { continue; }
  
@@ -6417,7 +7560,7 @@ index 08304359edcaf70b2506cd9883fa2bba506dcf8b..1487dc0e352fc95463cab6279a89467d
          }
  
          i += 1;
-@@ -2834,7 +2963,11 @@ pub(super) fn collapse_increment_chain(
+@@ -2834,7 +3277,11 @@ pub(super) fn collapse_increment_chain(
          let mut chk = 0;
          while n < len && chk < 8 {
              if infos[n].is_nop() { n += 1; continue; }
@@ -6430,7 +7573,7 @@ index 08304359edcaf70b2506cd9883fa2bba506dcf8b..1487dc0e352fc95463cab6279a89467d
              if infos[n].reg_refs & tmp1_bit != 0 {
                  match infos[n].kind {
                      LineKind::Other { dest_reg } if dest_reg == tmp1_family => {}
-@@ -2963,7 +3096,11 @@ pub(super) fn fold_cascaded_shifts(
+@@ -2963,7 +3410,11 @@ pub(super) fn fold_cascaded_shifts(
              let mut chk = 0;
              while n < len && chk < 8 {
                  if infos[n].is_nop() { n += 1; continue; }
@@ -6443,7 +7586,7 @@ index 08304359edcaf70b2506cd9883fa2bba506dcf8b..1487dc0e352fc95463cab6279a89467d
                  if infos[n].reg_refs & tmp_bit != 0 {
                      match infos[n].kind {
                          LineKind::Other { dest_reg } if dest_reg == tmp_fam => { tmp_dead = true; break; }
-@@ -3270,16 +3407,61 @@ pub(super) fn rotate_loops(
+@@ -3270,16 +3721,61 @@ pub(super) fn rotate_loops(
  pub(super) fn eliminate_redundant_leaq(store: &LineStore, infos: &mut [LineInfo]) -> bool {
      let len = store.len();
      let mut changed = false;
@@ -6509,7 +7652,7 @@ index 08304359edcaf70b2506cd9883fa2bba506dcf8b..1487dc0e352fc95463cab6279a89467d
              rax_leaq_src = None;
              continue;
          }
-@@ -3287,32 +3469,57 @@ pub(super) fn eliminate_redundant_leaq(store: &LineStore, infos: &mut [LineInfo]
+@@ -3287,32 +3783,57 @@ pub(super) fn eliminate_redundant_leaq(store: &LineStore, infos: &mut [LineInfo]
          // Check if this is `leaq X, %rax`
          if line.starts_with("leaq ") && line.ends_with(", %rax") {
              let src = &line[5..line.len() - 6]; // between "leaq " and ", %rax"
@@ -6874,7 +8017,7 @@ index 94aa049041c88a2bd537a50396b87780056fa4a9..c79b62c66e2b18c720fad19b586fe3da
                          let mem_op = format_stack_offset(offset, load_line);
                          let new_inst = format!("    {} {}, {}", op_suffix, mem_op, dst_str);
 diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
-index c606a103cfeda97d170e007c54deaa53e65ada4b..2adcc390d0cbbb711235c21f0b855d789584f111 100644
+index c606a103cfeda97d170e007c54deaa53e65ada4b..f2203c5cd74519945d76d9a7bf25db65814ec3a8 100644
 --- a/src/backend/x86/codegen/peephole/passes/mod.rs
 +++ b/src/backend/x86/codegen/peephole/passes/mod.rs
 @@ -33,6 +33,9 @@ mod memory_fold;
@@ -6999,7 +8142,7 @@ index c606a103cfeda97d170e007c54deaa53e65ada4b..2adcc390d0cbbb711235c21f0b855d78
  // ── Main entry point ─────────────────────────────────────────────────────────
  
  /// Run peephole optimization on x86-64 assembly text.
-@@ -57,23 +165,38 @@ const MAX_POST_GLOBAL_ITERATIONS: usize = 4;
+@@ -57,24 +165,39 @@ const MAX_POST_GLOBAL_ITERATIONS: usize = 4;
  ///    the functionality of local store-load forwarding across wider windows.
  /// 3. Run local passes one more time to clean up opportunities exposed by the
  ///    global passes (max `MAX_POST_GLOBAL_ITERATIONS` iterations).
@@ -7040,15 +8183,17 @@ index c606a103cfeda97d170e007c54deaa53e65ada4b..2adcc390d0cbbb711235c21f0b855d78
      let skip_phase2 = std::env::var("CCC_NO_PEEPHOLE_PHASE2").is_ok();
      let skip_phase3 = std::env::var("CCC_NO_PEEPHOLE_PHASE3").is_ok();
 -    let skip_phase4 = std::env::var("CCC_NO_PEEPHOLE_PHASE4").is_ok()
+-        || std::env::var("CCC_USE_MACHINST").is_ok(); // Phase 4 has a register renaming bug triggered by MachInst
 +    // Phase 4 (loop rotation / trampoline elimination / late hoisting) is
 +    // DISABLED BY DEFAULT: it has a register-renaming bug that miscompiles
 +    // valid programs (found via differential fuzzing on generated C; gzip was
 +    // unaffected but other code with certain loop shapes was). It also does not
 +    // help gzip (measured slower/larger). Opt in with CCC_PEEPHOLE_PHASE4=1.
 +    let skip_phase4 = !std::env::var("CCC_PEEPHOLE_PHASE4").is_ok()
-         || std::env::var("CCC_USE_MACHINST").is_ok(); // Phase 4 has a register renaming bug triggered by MachInst
++        || std::env::var("CCC_NO_MACHINST").is_err(); // Phase 4 has a register renaming bug triggered by MachInst
      let skip_phase5 = std::env::var("CCC_NO_PEEPHOLE_PHASE5").is_ok();
      let skip_phase6 = std::env::var("CCC_NO_PEEPHOLE_PHASE6").is_ok();
+     let skip_phase7 = std::env::var("CCC_NO_PEEPHOLE_PHASE7").is_ok();
 @@ -82,21 +205,21 @@ pub fn peephole_optimize(asm: String) -> String {
      let mut store = LineStore::new(asm);
      let line_count = store.len();
@@ -7138,7 +8283,21 @@ index c606a103cfeda97d170e007c54deaa53e65ada4b..2adcc390d0cbbb711235c21f0b855d78
      let skip_set: std::collections::HashSet<String> = std::env::var("CCC_PEEPHOLE_SKIP")
          .unwrap_or_default()
          .split(',')
-@@ -176,6 +336,7 @@ pub fn peephole_optimize(asm: String) -> String {
+@@ -152,11 +312,13 @@ pub fn peephole_optimize(asm: String) -> String {
+         if !sk("rcx_copy") { changed |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos); }
+         if !sk("ptr_deref") { changed |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos); }
+         if !sk("fp_spill") { changed |= local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos); }
++        if !sk("xmm_rep_copy") { changed |= local_patterns::fold_xmm_spill_rep_movsb(&mut store, &mut infos); }
+         if !sk("fuse_copy_op") { changed |= local_patterns::fuse_copy_and_operation(&mut store, &mut infos); }
+         if !sk("fp_hoist") { changed |= local_patterns::promote_loop_invariant_fp_load(&mut store, &mut infos); }
+         if !sk("dead_signext") { changed |= local_patterns::eliminate_dead_sign_extensions(&mut store, &mut infos); }
+         if !sk("dead_leaq") { changed |= local_patterns::eliminate_redundant_leaq(&store, &mut infos); }
+         if !sk("base_index") { changed |= local_patterns::fold_base_index_addressing(&mut store, &mut infos); }
++        if !sk("leaq_sib") { changed |= local_patterns::fold_leaq_sib_dereference(&mut store, &mut infos); }
+         if !sk("acc_alu") { changed |= local_patterns::fold_accumulator_alu_store(&mut store, &mut infos); }
+         if !sk("phi_coalesce") { changed |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos); }
+         if !sk("signext_move") { changed |= local_patterns::fuse_signext_and_move(&mut store, &mut infos); }
+@@ -176,6 +338,7 @@ pub fn peephole_optimize(asm: String) -> String {
      let global_changed = if skip_phase2 { false } else {
      let mut global_changed = false;
      if !sk("store_fwd") { global_changed |= store_forwarding::global_store_forwarding(&mut store, &mut infos); }
@@ -7146,7 +8305,7 @@ index c606a103cfeda97d170e007c54deaa53e65ada4b..2adcc390d0cbbb711235c21f0b855d78
      if !sk("copy_prop") { global_changed |= copy_propagation::propagate_register_copies(&mut store, &mut infos); }
      if !sk("dead_regs") { global_changed |= dead_code::eliminate_dead_reg_moves(&store, &mut infos); }
      if !sk("dead_stores") { global_changed |= dead_code::eliminate_dead_stores(&store, &mut infos); }
-@@ -195,7 +356,11 @@ pub fn peephole_optimize(asm: String) -> String {
+@@ -195,13 +358,18 @@ pub fn peephole_optimize(asm: String) -> String {
          let mut pass_count2 = 0;
          while changed2 && pass_count2 < MAX_POST_GLOBAL_ITERATIONS {
              changed2 = false;
@@ -7159,7 +8318,22 @@ index c606a103cfeda97d170e007c54deaa53e65ada4b..2adcc390d0cbbb711235c21f0b855d78
              changed2 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
              changed2 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
              changed2 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
-@@ -221,10 +386,10 @@ pub fn peephole_optimize(asm: String) -> String {
+             changed2 |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
+             changed2 |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
+             changed2 |= local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos);
++            if !sk("xmm_rep_copy") { changed2 |= local_patterns::fold_xmm_spill_rep_movsb(&mut store, &mut infos); }
+             if !sk("dead_regs") { changed2 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos); }
+             if !sk("dead_stores") { changed2 |= dead_code::eliminate_dead_stores(&store, &mut infos); }
+             if !sk("mem_fold") { changed2 |= memory_fold::fold_memory_operands(&mut store, &mut infos); }
+@@ -212,6 +380,7 @@ pub fn peephole_optimize(asm: String) -> String {
+             if !sk("gen_relay") { changed2 |= memory_fold::fold_general_relay(&mut store, &mut infos); }
+             if !sk("store_relay") { changed2 |= memory_fold::fold_store_relay(&mut store, &mut infos); }
+             if !sk("base_index") { changed2 |= local_patterns::fold_base_index_addressing(&mut store, &mut infos); }
++            if !sk("leaq_sib") { changed2 |= local_patterns::fold_leaq_sib_dereference(&mut store, &mut infos); }
+             if !sk("phi_coalesce") { changed2 |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos); }
+             if !sk("signext_move") { changed2 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos); }
+             changed2 |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
+@@ -221,10 +390,10 @@ pub fn peephole_optimize(asm: String) -> String {
  
      // Phase 3b: Fuse addl+movslq in loops (must run BEFORE trampoline elimination,
      // which may remove the conditional back-edge that this pass uses to detect loops).
@@ -7172,7 +8346,7 @@ index c606a103cfeda97d170e007c54deaa53e65ada4b..2adcc390d0cbbb711235c21f0b855d78
          loop_trampoline::eliminate_loop_trampolines(&mut store, &mut infos)
      };
  
-@@ -256,18 +421,20 @@ pub fn peephole_optimize(asm: String) -> String {
+@@ -256,18 +425,20 @@ pub fn peephole_optimize(asm: String) -> String {
      }
  
      // Phase 4c: Late loop-invariant hoisting.
@@ -7196,7 +8370,7 @@ index c606a103cfeda97d170e007c54deaa53e65ada4b..2adcc390d0cbbb711235c21f0b855d78
          local_patterns::fuse_add_sign_extend(&mut store, &mut infos);
      }
  
-@@ -297,7 +464,18 @@ pub fn peephole_optimize(asm: String) -> String {
+@@ -297,7 +468,18 @@ pub fn peephole_optimize(asm: String) -> String {
          identical_blocks::merge_identical_blocks(&mut store, &mut infos);
      }
  
@@ -7216,7 +8390,93 @@ index c606a103cfeda97d170e007c54deaa53e65ada4b..2adcc390d0cbbb711235c21f0b855d78
  }
  
  // ── Tests ────────────────────────────────────────────────────────────────────
-@@ -448,6 +626,8 @@ mod tests {
+@@ -385,6 +567,85 @@ mod tests {
+         assert_eq!(result.trim(), "");
+     }
+ 
++    #[test]
++    fn test_leaq_sib_dereference_fold() {
++        let asm = [
++            "    leaq (%rbx, %r14, 1), %r15",
++            "    movzbl (%r15), %ebp",
++        ].join("\n") + "\n";
++        let result = peephole_optimize(asm);
++        assert!(!result.contains("leaq (%rbx, %r14, 1), %r15"), "{}", result);
++        assert!(result.contains("movzbl (%rbx, %r14, 1), %ebp"), "{}", result);
++    }
++
++    #[test]
++    fn test_leaq_sib_dereference_keeps_live_address() {
++        let asm = [
++            "    leaq (%rbx, %r14, 1), %r15",
++            "    movzbl (%r15), %ebp",
++            "    movq %r15, %rax",
++        ].join("\n") + "\n";
++        let result = peephole_optimize(asm);
++        assert!(result.contains("leaq (%rbx, %r14, 1), %r15"), "{}", result);
++    }
++
++    #[test]
++    fn test_leaq_sib_dereference_rejects_fallthrough_label_use() {
++        let asm = [
++            "    leaq (%rbx, %r14, 1), %r15",
++            "    movzbl (%r15), %ebp",
++            ".Lfallthrough:",
++            "    movq %r15, %rax",
++        ].join("\n") + "\n";
++        let result = peephole_optimize(asm);
++        assert!(result.contains("leaq (%rbx, %r14, 1), %r15"), "{}", result);
++    }
++
++    #[test]
++    fn test_xmm_spill_rep_movsb_fold() {
++        let asm = [
++            "    movdqu %xmm0, 32(%rsp)",
++            "    leaq 128(%rsp), %rdi",
++            "    leaq 32(%rsp), %rsi",
++            "    movq $16, %rcx",
++            "    rep movsb",
++            "    xorl %eax, %eax",
++        ].join("\n") + "\n";
++        let result = peephole_optimize(asm);
++        assert!(result.contains("movdqu %xmm0, 128(%rsp)"), "{}", result);
++        assert!(!result.contains("rep movsb"), "{}", result);
++    }
++
++    #[test]
++    fn test_xmm_spill_rep_movsb_rejects_live_scratch() {
++        let asm = [
++            "    movdqu %xmm0, 32(%rsp)",
++            "    leaq 128(%rsp), %rdi",
++            "    leaq 32(%rsp), %rsi",
++            "    movq $16, %rcx",
++            "    rep movsb",
++            "    movq 32(%rsp), %rax",
++        ].join("\n") + "\n";
++        let result = peephole_optimize(asm);
++        assert!(result.contains("rep movsb"), "{}", result);
++    }
++
++    #[test]
++    fn test_xmm_spill_rep_movsb_fold_via_rax_address() {
++        let asm = [
++            "    leaq 32(%rsp), %rax",
++            "    movdqu %xmm0, (%rax)",
++            "    leaq 128(%rsp), %rdi",
++            "    leaq 32(%rsp), %rsi",
++            "    movq $16, %rcx",
++            "    rep movsb",
++            "    xorl %edx, %edx",
++        ].join("\n") + "\n";
++        let result = peephole_optimize(asm);
++        assert!(result.contains("movdqu %xmm0, 128(%rsp)"), "{}", result);
++        assert!(!result.contains("rep movsb"), "{}", result);
++    }
++
+     #[test]
+     fn test_parse_store_to_rbp() {
+         assert!(parse_store_to_rbp_str("movq %rax, -8(%rbp)").is_some());
+@@ -448,6 +709,8 @@ mod tests {
      #[test]
      fn test_non_adjacent_store_load_same_reg() {
          let asm = [
@@ -7225,7 +8485,7 @@ index c606a103cfeda97d170e007c54deaa53e65ada4b..2adcc390d0cbbb711235c21f0b855d78
              "    movq %rax, -24(%rbp)",
              "    movq %rcx, -32(%rbp)",
              "    movq -24(%rbp), %rax",
-@@ -459,6 +639,8 @@ mod tests {
+@@ -459,6 +722,8 @@ mod tests {
      #[test]
      fn test_non_adjacent_store_load_diff_reg() {
          let asm = [
@@ -7234,7 +8494,7 @@ index c606a103cfeda97d170e007c54deaa53e65ada4b..2adcc390d0cbbb711235c21f0b855d78
              "    movq %rax, -24(%rbp)",
              "    movq %rcx, -32(%rbp)",
              "    movq -24(%rbp), %rdx",
-@@ -490,6 +672,8 @@ mod tests {
+@@ -490,6 +755,8 @@ mod tests {
      #[test]
      fn test_dead_store_elimination() {
          let asm = [
@@ -7243,7 +8503,7 @@ index c606a103cfeda97d170e007c54deaa53e65ada4b..2adcc390d0cbbb711235c21f0b855d78
              "    movq %rax, -24(%rbp)",
              "    movq %rcx, -24(%rbp)",
          ].join("\n") + "\n";
-@@ -512,9 +696,38 @@ mod tests {
+@@ -512,9 +779,38 @@ mod tests {
          }
      }
  
@@ -7282,7 +8542,7 @@ index c606a103cfeda97d170e007c54deaa53e65ada4b..2adcc390d0cbbb711235c21f0b855d78
              "    movq %rax, -24(%rbp)",
              "    movq %rcx, -32(%rbp)",
              ".Lfallthrough:",
-@@ -544,6 +757,8 @@ mod tests {
+@@ -544,6 +840,8 @@ mod tests {
      #[test]
      fn test_global_store_forward_across_cond_branch() {
          let asm = [
@@ -7291,7 +8551,7 @@ index c606a103cfeda97d170e007c54deaa53e65ada4b..2adcc390d0cbbb711235c21f0b855d78
              "    movq %rax, -24(%rbp)",
              "    cmpq %rcx, %rax",
              "    jne .Lother",
-@@ -569,13 +784,18 @@ mod tests {
+@@ -569,13 +867,18 @@ mod tests {
      #[test]
      fn test_global_store_forward_callee_saved_across_call() {
          let asm = [
@@ -7312,7 +8572,7 @@ index c606a103cfeda97d170e007c54deaa53e65ada4b..2adcc390d0cbbb711235c21f0b855d78
      }
  
      #[test]
-@@ -1432,5 +1652,73 @@ mod regression_tests {
+@@ -1432,5 +1735,73 @@ mod regression_tests {
          assert!(result.contains("(%rbx, %r14)") || result.contains("(%rbx,%r14)"),
              "should fold to SIB indexed addressing: {}", result);
      }
@@ -8654,7 +9914,7 @@ index 714ee052c1cdf7417e504be4517e37e263fe98a0..0b4ac0436489bdb37ace33d438425f2e
  
      // SetCC: extract the actual destination register (not always %al).
 diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
-index 13ecd4f6d8405200e478c1886a1718f3b74ed982..8600b956eaa60e13aff619afbaebfd543152dc8f 100644
+index 13ecd4f6d8405200e478c1886a1718f3b74ed982..0b62fe22ccecf4a55449a31b7fb0fda2c759e6bc 100644
 --- a/src/backend/x86/codegen/prologue.rs
 +++ b/src/backend/x86/codegen/prologue.rs
 @@ -2,15 +2,22 @@
@@ -8681,7 +9941,7 @@ index 13ecd4f6d8405200e478c1886a1718f3b74ed982..8600b956eaa60e13aff619afbaebfd54
          // Store function pointer for indexed addressing detection
          self.current_func = Some(func as *const IrFunction);
  
-@@ -124,38 +131,282 @@ impl X86Codegen {
+@@ -124,38 +131,283 @@ impl X86Codegen {
          // value is destroyed. The fix requires per-call save/restore, not
          // promotion. See binary size investigation in project memory.
  
@@ -8838,7 +10098,8 @@ index 13ecd4f6d8405200e478c1886a1718f3b74ed982..8600b956eaa60e13aff619afbaebfd54
 +        // Soundness: the Cmp handler only skips the setcc when the map says
 +        // the consumer is the next instruction, and the dispatch loop runs
 +        // instructions in order with nothing inserted in between (the
-+        // machinst lowering path is opt-in via CCC_USE_MACHINST and bypasses
++        // verified hybrid MachInst lowering is default-on (CCC_NO_MACHINST
++        // is the bisection escape hatch) and bypasses
 +        // both handlers, so the map is ignored there — the Cmp then takes the
 +        // normal path and the bool is materialized).
 +        {
@@ -8983,7 +10244,7 @@ index 13ecd4f6d8405200e478c1886a1718f3b74ed982..8600b956eaa60e13aff619afbaebfd54
  
          let (reg_assigned, cached_liveness, caller_save_spans) = crate::backend::generation::run_regalloc_and_merge_clobbers(
              func, available_regs, caller_saved_regs, &asm_clobbered_regs,
-@@ -319,6 +570,24 @@ impl X86Codegen {
+@@ -319,6 +571,24 @@ impl X86Codegen {
              }
          }
  
@@ -9515,17 +10776,16 @@ index 670d78054022b17450868e944e26ea278a1b30dc..59fb6d5787e89c3216bbe28b1100b1bd
  
  SIMD feature flags follow GCC's implication chain where each flag implies all
 diff --git a/src/driver/cli.rs b/src/driver/cli.rs
-index b8f9fdc1e0f5ee42b32b244dcd201148e45f695e..3bc28250841e20410d26da3eb926146a6ac4078f 100644
+index b8f9fdc1e0f5ee42b32b244dcd201148e45f695e..8cd89fc2017d009b38b75d68883389f3af4e66b0 100644
 --- a/src/driver/cli.rs
 +++ b/src/driver/cli.rs
-@@ -15,6 +15,19 @@ use crate::backend::Target;
+@@ -15,6 +15,28 @@ use crate::backend::Target;
  use crate::common::error::ColorMode;
  
  impl Driver {
-+    /// Enable the ISA subset that LCCC can lower safely for Raptor Lake-class
-+    /// x86-64 targets. Raptor Lake has AVX2/FMA/BMI, but LCCC currently only
-+    /// has feature-complete lowering and intrinsic coverage through AVX2; do
-+    /// not advertise unsupported FMA/BMI/AVX-512 macros.
++    /// Enable the AVX2/SSE dependency chain without claiming independent
++    /// crypto extensions.  `-mavx2` and x86-64-v3 do not, by themselves,
++    /// promise AES-NI or PCLMULQDQ in GCC's target-feature model.
 +    fn enable_x86_avx2_profile(&mut self) {
 +        self.enable_avx2 = true;
 +        self.enable_avx = true;
@@ -9535,10 +10795,20 @@ index b8f9fdc1e0f5ee42b32b244dcd201148e45f695e..3bc28250841e20410d26da3eb926146a
 +        self.enable_sse3 = true;
 +    }
 +
++    /// Enable the explicit Intel client CPU profile used by the requested
++    /// Raptor Lake deployment target.  These CPUs guarantee AES-NI and
++    /// PCLMULQDQ in addition to the AVX2 baseline, and LCCC implements both
++    /// intrinsic/assembler paths.
++    fn enable_x86_raptorlake_profile(&mut self) {
++        self.enable_x86_avx2_profile();
++        self.enable_aes = true;
++        self.enable_pclmul = true;
++    }
++
      /// Parse GCC-compatible command-line arguments and populate driver fields.
      /// Returns `Ok(true)` if early exit was handled (query flags like -dumpmachine),
      /// `Ok(false)` if normal compilation should proceed, or `Err` for invalid args.
-@@ -252,33 +265,41 @@ impl Driver {
+@@ -252,33 +274,41 @@ impl Driver {
                  "-P" => self.suppress_line_markers = true,
                  "-dM" => self.dump_defines = true,
  
@@ -9596,7 +10866,20 @@ index b8f9fdc1e0f5ee42b32b244dcd201148e45f695e..3bc28250841e20410d26da3eb926146a
                      self.optimize_size = true;
                      self.omit_frame_pointer = true;
                  }
-@@ -467,14 +488,7 @@ impl Driver {
+@@ -459,6 +489,12 @@ impl Driver {
+                         self.target = Target::I686;
+                     }
+                 }
++                // AES-NI/PCLMULQDQ are independent x86 extensions; disabling
++                // either must not suppress the whole SSE/AVX macro family.
++                "-maes" => self.enable_aes = true,
++                "-mpclmul" | "-mpclmulqdq" => self.enable_pclmul = true,
++                "-mno-aes" => self.enable_aes = false,
++                "-mno-pclmul" | "-mno-pclmulqdq" => self.enable_pclmul = false,
+                 "-mno-sse" | "-mno-sse2" | "-mno-mmx" | "-mno-sse3" | "-mno-ssse3"
+                 | "-mno-sse4" | "-mno-sse4.1" | "-mno-sse4.2" | "-mno-avx"
+                 | "-mno-avx2" | "-mno-avx512f" | "-mno-3dnow" => {
+@@ -467,14 +503,7 @@ impl Driver {
                  // Positive SIMD feature flags: define corresponding macros.
                  // -mavx2 implies -mavx implies -msse4.2 implies -msse4.1 implies
                  // -mssse3 implies -msse3 (matching GCC's implication chain).
@@ -9612,7 +10895,7 @@ index b8f9fdc1e0f5ee42b32b244dcd201148e45f695e..3bc28250841e20410d26da3eb926146a
                  "-mavx" => {
                      self.enable_avx = true;
                      self.enable_sse4_2 = true;
-@@ -509,7 +523,32 @@ impl Driver {
+@@ -509,7 +538,33 @@ impl Driver {
                      self.riscv_abi = Some(arg["-mabi=".len()..].to_string());
                  }
                  arg if arg.starts_with("-march=") => {
@@ -9625,7 +10908,8 @@ index b8f9fdc1e0f5ee42b32b244dcd201148e45f695e..3bc28250841e20410d26da3eb926146a
 +                            // highest ISA enabled; AVX-512 is intentionally not
 +                            // implied or emitted.
 +                            "raptorlake" | "raptor-lake" | "alderlake" | "haswell"
-+                            | "broadwell" | "skylake" | "x86-64-v3" => self.enable_x86_avx2_profile(),
++                            | "broadwell" | "skylake" => self.enable_x86_raptorlake_profile(),
++                            "x86-64-v3" => self.enable_x86_avx2_profile(),
 +                            // Baseline profiles retain the x86-64/SSE2 default.
 +                            "x86-64" | "x86-64-v1" | "generic" => {}
 +                            "native" => return Err("-march=native is rejected: the host ISA is not the configured deployment target; pass an explicit profile such as -march=raptorlake".to_string()),
@@ -9646,7 +10930,7 @@ index b8f9fdc1e0f5ee42b32b244dcd201148e45f695e..3bc28250841e20410d26da3eb926146a
                  }
                  "-mlittle-endian" => {
                      // ARM64 target indicator: only arm64-gcc accepts -mlittle-endian.
-@@ -524,7 +563,9 @@ impl Driver {
+@@ -524,7 +579,9 @@ impl Driver {
                      let n: u8 = arg["-mregparm=".len()..].parse().unwrap_or(0);
                      self.regparm = n.min(3);
                  }
@@ -9658,13 +10942,30 @@ index b8f9fdc1e0f5ee42b32b244dcd201148e45f695e..3bc28250841e20410d26da3eb926146a
                  // Feature flags
                  "-fPIC" | "-fpic" | "-fPIE" | "-fpie" => self.pic = true,
 diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
-index cd8e05de34b631c7a12e86dcad4161cf83ba1298..3350d3ae44ee85a327339fb6cb10ac3a5135f19e 100644
+index cd8e05de34b631c7a12e86dcad4161cf83ba1298..11dc7439105bc4ca293a47d56c8ea2a47a792693 100644
 --- a/src/driver/pipeline.rs
 +++ b/src/driver/pipeline.rs
-@@ -115,6 +115,10 @@ pub struct Driver {
+@@ -106,8 +106,10 @@ pub struct Driver {
+     /// any SSE/SSE2/AVX instructions (movdqu, movss, movsd, etc.).
+     /// The Linux kernel uses -mno-sse to avoid FPU state in kernel code.
+     pub(super) no_sse: bool,
+-    /// Explicit SIMD feature flags from -msse3, -msse4.1, -mavx, -mavx2, etc.
+-    /// When set, the corresponding __SSE3__, __AVX__, __AVX2__ macros are defined.
++    /// Explicit SIMD/crypto feature flags from -msse3, -msse4.1, -mavx,
++    /// -mavx2, -maes, -mpclmul, or an explicit CPU profile. When set, the
++    /// corresponding __SSE3__, __AVX__, __AVX2__, __AES__, and __PCLMUL__
++    /// macros are defined.
+     /// These flags enable projects like blosc to compile SIMD-optimized code paths.
+     pub(super) enable_sse3: bool,
+     pub(super) enable_ssse3: bool,
+@@ -115,6 +117,14 @@ pub struct Driver {
      pub(super) enable_sse4_2: bool,
      pub(super) enable_avx: bool,
      pub(super) enable_avx2: bool,
++    /// AES-NI and PCLMULQDQ capability flags.  These gate only preprocessor
++    /// exposure; the x86 intrinsic lowering/assembler already owns emission.
++    pub(super) enable_aes: bool,
++    pub(super) enable_pclmul: bool,
 +    /// Accepted x86 scheduling tune name from -mtune=. LCCC does not yet have
 +    /// a machine scheduler, so this is deliberately diagnostic-only; ISA
 +    /// selection belongs to -march= and is never silently conflated with tune.
@@ -9672,15 +10973,26 @@ index cd8e05de34b631c7a12e86dcad4161cf83ba1298..3350d3ae44ee85a327339fb6cb10ac3a
      /// Whether to use only general-purpose registers (-mgeneral-regs-only).
      /// On AArch64, this prevents FP/SIMD register usage. The Linux kernel uses
      /// this to avoid touching NEON/FP state. When set, variadic function prologues
-@@ -273,6 +277,7 @@ impl Driver {
+@@ -273,6 +283,9 @@ impl Driver {
              enable_sse4_2: false,
              enable_avx: false,
              enable_avx2: false,
++            enable_aes: false,
++            enable_pclmul: false,
 +            x86_tune: None,
              general_regs_only: false,
              code_model_kernel: false,
              no_jump_tables: false,
-@@ -900,6 +905,11 @@ impl Driver {
+@@ -829,6 +842,8 @@ impl Driver {
+                 self.enable_sse4_2,
+                 self.enable_avx,
+                 self.enable_avx2,
++                self.enable_aes,
++                self.enable_pclmul,
+             );
+         }
+         // Define _REENTRANT when -pthread is used.
+@@ -900,6 +915,11 @@ impl Driver {
      ///
      /// Set `CCC_TIME_PHASES=1` in the environment to print per-phase timing to stderr.
      fn compile_to_assembly(&self, input_file: &str) -> Result<String, String> {
@@ -9692,7 +11004,17 @@ index cd8e05de34b631c7a12e86dcad4161cf83ba1298..3350d3ae44ee85a327339fb6cb10ac3a
          let source = Self::read_source(input_file)?;
  
          let time_phases = std::env::var("CCC_TIME_PHASES").is_ok();
-@@ -1113,6 +1123,23 @@ impl Driver {
+@@ -1023,6 +1043,9 @@ impl Driver {
+             sema_result.const_values,
+             diagnostics,
+             self.gnu89_inline,
++            self.enable_avx,
++            self.enable_aes,
++            self.enable_pclmul,
+         );
+         let (mut module, diagnostics) = lowerer.lower(&ast);
+ 
+@@ -1113,6 +1136,23 @@ impl Driver {
          eliminate_phis(&mut module);
          if time_phases { eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64()); }
  
@@ -9735,6 +11057,19 @@ index 7bc97cba693bf396adf402e41ecd6efe45e6c273..85979bdf4cf9f0fd99f921d48db92fb7
              if !self.consume_if(&TokenKind::Comma) {
                  break;
              }
+diff --git a/src/frontend/preprocessor/README.md b/src/frontend/preprocessor/README.md
+index 3524e969c8bcc134042d2b1323492e35f4e5ca42..1fd0782fe710bb1d9549a87fd1adb57f2ca28d1b 100644
+--- a/src/frontend/preprocessor/README.md
++++ b/src/frontend/preprocessor/README.md
+@@ -78,7 +78,7 @@ downstream lexer uses these markers to maintain accurate source locations.
+ | `set_optimize(opt, size)` | Define `__OPTIMIZE__` and `__OPTIMIZE_SIZE__`. |
+ | `set_gnu89_inline(gnu89)` | Toggle between GNU89 and C99 inline semantics macros. |
+ | `set_sse_macros(no_sse)` | Control `__SSE__`/`__SSE2__`/`__MMX__` definitions. |
+-| `set_extended_simd_macros(...)` | Define `__SSE3__`, `__SSSE3__`, `__SSE4_1__`, `__SSE4_2__`, `__AVX__`, `__AVX2__` based on flags. |
++| `set_extended_simd_macros(...)` | Define `__SSE3__`, `__SSSE3__`, `__SSE4_1__`, `__SSE4_2__`, `__AVX__`, `__AVX2__`, `__AES__`, and `__PCLMUL__` based on guaranteed target features. |
+ | `set_asm_mode(asm_mode)` | Enable assembly preprocessing mode: `$` is not treated as an identifier character (for AT&T assembly `$MACRO_NAME` expansion), and `#pragma pack` / `#pragma GCC visibility` synthetic tokens are suppressed (since these are C parser-specific and would cause assembler errors). |
+ | `set_riscv_abi(abi)` | Override RISC-V float ABI macros (`lp64` = soft-float, `lp64f` = single, `lp64d` = double). |
+ | `set_riscv_march(march)` | Override RISC-V extension macros based on `-march=` (removes F/D macros when extensions not present). |
 diff --git a/src/frontend/preprocessor/builtin_macros.rs b/src/frontend/preprocessor/builtin_macros.rs
 index 1e62fe26b569a89b603b00c235f4169056a9e384..70c64f896e6f557bedfefd77873d33aff9be80a9 100644
 --- a/src/frontend/preprocessor/builtin_macros.rs
@@ -9901,7 +11236,7 @@ index ed3696a78e03b052286348130c71c1f260449ef4..28420aabab75955c8dde1505220fcb05
              return None;
          }
 diff --git a/src/frontend/preprocessor/predefined_macros.rs b/src/frontend/preprocessor/predefined_macros.rs
-index e148b3104634e21334c61b4b255bc5435fb45221..0a0a2ca15eee822e3f08aad20ee4e8a492e9aef4 100644
+index e148b3104634e21334c61b4b255bc5435fb45221..6c9869046fc7f35acbf0eb096fa65fc05e52a76a 100644
 --- a/src/frontend/preprocessor/predefined_macros.rs
 +++ b/src/frontend/preprocessor/predefined_macros.rs
 @@ -150,8 +150,8 @@ impl Preprocessor {
@@ -10030,7 +11365,41 @@ index e148b3104634e21334c61b4b255bc5435fb45221..0a0a2ca15eee822e3f08aad20ee4e8a4
              "/usr/include",
          ];
          for candidate in &candidates {
-@@ -470,10 +539,18 @@ impl Preprocessor {
+@@ -383,8 +452,9 @@ impl Preprocessor {
+         }
+     }
+ 
+-    /// Define extended SIMD feature macros (__SSE3__, __AVX__, __AVX2__, etc.)
+-    /// when the corresponding -msse3, -mavx, -mavx2 flags are passed.
++    /// Define extended x86 feature macros (__SSE3__, __AVX__, __AVX2__,
++    /// __AES__, __PCLMUL__, etc.) when the selected flags/profile guarantee
++    /// the corresponding ISA extension.
+     /// Projects like blosc use #ifdef __AVX2__ to select optimized code paths.
+     /// Must be called after set_sse_macros().
+     pub fn set_extended_simd_macros(
+@@ -395,6 +465,8 @@ impl Preprocessor {
+         sse4_2: bool,
+         avx: bool,
+         avx2: bool,
++        aes: bool,
++        pclmul: bool,
+     ) {
+         // Only define SSE/AVX macros for x86 targets.
+         let is_x86 = self.macros.is_defined("__x86_64__") || self.macros.is_defined("__i386__");
+@@ -419,6 +491,12 @@ impl Preprocessor {
+         if avx2 {
+             self.define_simple_macro("__AVX2__", "1");
+         }
++        if aes {
++            self.define_simple_macro("__AES__", "1");
++        }
++        if pclmul {
++            self.define_simple_macro("__PCLMUL__", "1");
++        }
+     }
+ 
+     /// Set the target architecture, updating predefined macros and include paths.
+@@ -470,10 +548,18 @@ impl Preprocessor {
                      !s.contains("x86_64")
                  });
                  let aarch64_paths = [
@@ -10052,7 +11421,7 @@ index e148b3104634e21334c61b4b255bc5435fb45221..0a0a2ca15eee822e3f08aad20ee4e8a4
                      "/usr/aarch64-linux-gnu/include",
                      "/usr/include/aarch64-linux-gnu",
                  ];
-@@ -524,10 +601,18 @@ impl Preprocessor {
+@@ -524,10 +610,18 @@ impl Preprocessor {
                      !s.contains("x86_64")
                  });
                  let riscv_paths = [
@@ -10074,7 +11443,7 @@ index e148b3104634e21334c61b4b255bc5435fb45221..0a0a2ca15eee822e3f08aad20ee4e8a4
                      "/usr/riscv64-linux-gnu/include",
                      "/usr/include/riscv64-linux-gnu",
                  ];
-@@ -610,14 +695,18 @@ impl Preprocessor {
+@@ -610,14 +704,18 @@ impl Preprocessor {
                      !s.contains("x86_64")
                  });
                  let i686_paths = [
@@ -10099,6 +11468,47 @@ index e148b3104634e21334c61b4b255bc5435fb45221..0a0a2ca15eee822e3f08aad20ee4e8a4
                      "/usr/i686-linux-gnu/include",
                      "/usr/include/i386-linux-gnu",
                  ];
+diff --git a/src/frontend/sema/README.md b/src/frontend/sema/README.md
+index c2ac0942dc47dc917b1a96917d399c05f6cba8dd..71bdd9f483f0ee3f7b2c4dff0aa96fdaa398c8b0 100644
+--- a/src/frontend/sema/README.md
++++ b/src/frontend/sema/README.md
+@@ -419,7 +419,8 @@ The `BuiltinIntrinsic` enum covers a wide range of operations:
+ - **Variadic arg forwarding**: `__builtin_va_arg_pack`, `__builtin_va_arg_pack_len`
+   (used in always-inline fortification wrappers)
+ - **CPU feature detection**: `__builtin_cpu_init` (no-op), `__builtin_cpu_supports`
+-  (conservatively returns 0)
++  (target-bound AVX/AES/PCLMUL guarantees for explicit Raptor Lake-class profiles;
++  conservative 0 for generic/unknown features)
+ - **Prefetch**: `__builtin_prefetch` (lowered as a no-op)
+ - **x86 SSE/SSE2/SSE4.1/AES-NI/CLMUL**: complete 128-bit SIMD instruction coverage
+ 
+diff --git a/src/frontend/sema/builtins.rs b/src/frontend/sema/builtins.rs
+index a9f236341c952b0c56bfc8c1e589120ba00396e3..35f3707a48a0fa8c94730c7f7fbd05552d4cc519 100644
+--- a/src/frontend/sema/builtins.rs
++++ b/src/frontend/sema/builtins.rs
+@@ -254,9 +254,9 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
+     // __builtin_cpu_init() initializes CPU feature detection; on glibc systems
+     // this is automatic, so we emit it as a no-op.
+     m.insert("__builtin_cpu_init", BuiltinInfo::intrinsic(BuiltinIntrinsic::CpuInit));
+-    // __builtin_cpu_supports("feature") returns nonzero if the CPU supports
+-    // the named feature. We conservatively return 0 (not supported) so that
+-    // code always takes the safe fallback path.
++    // __builtin_cpu_supports("feature") returns a target-bound guarantee for
++    // AVX/AES/PCLMUL on explicit Raptor Lake-class profiles, and otherwise
++    // conservatively returns 0.
+     m.insert("__builtin_cpu_supports", BuiltinInfo::intrinsic(BuiltinIntrinsic::CpuSupports));
+ 
+     // Cache flush - maps to __clear_cache runtime function (provided by libgcc/glibc).
+@@ -516,7 +516,8 @@ pub enum BuiltinIntrinsic {
+     Nop,
+     /// __builtin_cpu_init() - no-op, glibc handles CPU feature detection init
+     CpuInit,
+-    /// __builtin_cpu_supports("feature") - conservatively returns 0 (unsupported)
++    /// __builtin_cpu_supports("feature") - target-bound AVX/AES/PCLMUL guarantee
++    /// for explicit CPU profiles; 0 for unsupported/generic features.
+     CpuSupports,
+     /// __builtin_add_overflow(a, b, result_ptr) -> bool (1 if overflow)
+     AddOverflow,
 diff --git a/src/ir/constants.rs b/src/ir/constants.rs
 index cd379e9cae2275a16db05a3819145a4bbd0ee2a1..6af29c6e40154e76e68b85dac4c1345e3f0589ac 100644
 --- a/src/ir/constants.rs
@@ -10256,10 +11666,46 @@ index fe3b9126d55ee494163f17380f2ecb238b342190..bbed605615b71daba92224d5a891cfd0
              alloca
          } else {
 diff --git a/src/ir/lowering/expr_builtins.rs b/src/ir/lowering/expr_builtins.rs
-index 75d368c2d74c713a7d5e40215a8cfbc2daee9e03..b9b0d23d887b3883756cafb86f23e7fb89cd1b54 100644
+index 75d368c2d74c713a7d5e40215a8cfbc2daee9e03..815c8341f4e777f4cb3a904746ef9b4606998182 100644
 --- a/src/ir/lowering/expr_builtins.rs
 +++ b/src/ir/lowering/expr_builtins.rs
-@@ -678,7 +678,7 @@ impl Lowerer {
+@@ -356,14 +356,28 @@ impl Lowerer {
+             BuiltinIntrinsic::CpuInit => {
+                 Some(Operand::Const(IrConst::I32(0)))
+             }
+-            // __builtin_cpu_supports("feature") - conservatively return 0 (unsupported).
+-            // This ensures code takes the safe non-optimized fallback path.
++            // __builtin_cpu_supports("feature") is folded only for ISA
++            // features guaranteed by the explicit deployment target.  In
++            // particular, -march=raptorlake promises AVX/AES/PCLMULQDQ, so
++            // gzip may safely dispatch to the implementation it just compiled.
++            // Generic x86-64 remains conservative (0), and non-literal calls
++            // still evaluate their argument before yielding 0.
+             BuiltinIntrinsic::CpuSupports => {
+-                // Evaluate the string argument for side effects (though it's always a literal)
+-                for arg in args {
+-                    self.lower_expr(arg);
+-                }
+-                Some(Operand::Const(IrConst::I32(0)))
++                let guaranteed = match args.first() {
++                    Some(Expr::StringLiteral(feature, _)) => match feature.as_str() {
++                        "avx" => self.x86_avx,
++                        "aes" => self.x86_aes,
++                        "pclmul" => self.x86_pclmul,
++                        _ => false,
++                    },
++                    _ => {
++                        for arg in args {
++                            self.lower_expr(arg);
++                        }
++                        false
++                    }
++                };
++                Some(Operand::Const(IrConst::I32(i32::from(guaranteed))))
+             }
+             // X86 SSE/AES/CRC intrinsics - delegated to lower_x86_intrinsic
+             BuiltinIntrinsic::X86Lfence | BuiltinIntrinsic::X86Mfence
+@@ -678,7 +692,7 @@ impl Lowerer {
              (IrType::F64, 16usize, 8usize)
          };
          let alloca = self.fresh_value();
@@ -10268,7 +11714,7 @@ index 75d368c2d74c713a7d5e40215a8cfbc2daee9e03..b9b0d23d887b3883756cafb86f23e7fb
          self.emit(Instruction::Store { val: real_val, ptr: alloca, ty: comp_ty, seg_override: AddressSpace::Default });
          let imag_ptr = self.fresh_value();
          self.emit(Instruction::GetElementPtr {
-@@ -718,7 +718,7 @@ impl Lowerer {
+@@ -718,7 +732,7 @@ impl Lowerer {
              X86IntrinsicKind::Vec128 => {
                  let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
                  let result_alloca = self.fresh_value();
@@ -10444,10 +11890,44 @@ index 2555850063db828d9522b286997441c0b2c1ac09..4c96096719e8754ca0d5eb56ff484e33
              is_variadic: func.variadic, is_declaration: false, is_static,
              is_inline: func.attrs.is_inline(),
 diff --git a/src/ir/lowering/lower.rs b/src/ir/lowering/lower.rs
-index 267952a46d080ce6391c418eb52806d1653b8572..0d12258d656a9b38e365572a13b5916d0a4eb2d5 100644
+index 267952a46d080ce6391c418eb52806d1653b8572..46832733eb5ad8c66f162b9acc727a5351fc7270 100644
 --- a/src/ir/lowering/lower.rs
 +++ b/src/ir/lowering/lower.rs
-@@ -1108,9 +1108,24 @@ impl Lowerer {
+@@ -156,6 +156,13 @@ pub struct Lowerer {
+     /// as an inline-only definition (no external def emitted), matching the behaviour
+     /// of GCC in GNU89 mode. The default (false) uses C99 inline semantics.
+     pub(super) gnu89_inline: bool,
++    /// ISA features guaranteed by the selected x86 target profile.  These are
++    /// used for target-bound `__builtin_cpu_supports` folding so a binary built
++    /// for Raptor Lake can select its compiled PCLMUL/AES implementation without
++    /// pretending that a generic x86-64 binary has those features.
++    pub(super) x86_avx: bool,
++    pub(super) x86_aes: bool,
++    pub(super) x86_pclmul: bool,
+ }
+ 
+ impl Lowerer {
+@@ -181,6 +188,9 @@ impl Lowerer {
+         sema_const_values: ConstMap,
+         diagnostics: DiagnosticEngine,
+         gnu89_inline: bool,
++        x86_avx: bool,
++        x86_aes: bool,
++        x86_pclmul: bool,
+     ) -> Self {
+         // Pre-populate known_functions from sema's function map.
+         // This means the lowerer knows about all functions before the first pass,
+@@ -220,6 +230,9 @@ impl Lowerer {
+             diagnostics: RefCell::new(diagnostics),
+             materialized_compound_literals: FxHashMap::default(),
+             gnu89_inline,
++            x86_avx,
++            x86_aes,
++            x86_pclmul,
+         }
+     }
+ 
+@@ -1108,9 +1121,24 @@ impl Lowerer {
      /// Used for local variable declarations so that variables whose
      /// declarations are skipped by `goto` still have valid stack slots.
      pub(super) fn emit_entry_alloca(&mut self, ty: IrType, size: usize, align: usize, volatile: bool) -> Value {
@@ -11010,7 +12490,7 @@ index 63263001a220c5f5615905f20cd6c3a388437d40..3132ff5ee85a5dc16eed8060c9bc5aa3
                      dest: Value(1),
                      op: IrBinOp::Add,
 diff --git a/src/passes/gvn.rs b/src/passes/gvn.rs
-index b6f584e77b12d6028c237ceaf234927bc7a11fa1..d1313ae2ba3f7d889c1b650fa864f08184eb8232 100644
+index b6f584e77b12d6028c237ceaf234927bc7a11fa1..1482be11c1245a483faff2e031415cd10e162ee7 100644
 --- a/src/passes/gvn.rs
 +++ b/src/passes/gvn.rs
 @@ -386,7 +386,7 @@ fn find_volatile_allocas(func: &IrFunction) -> FxHashSet<u32> {
@@ -11022,6 +12502,49 @@ index b6f584e77b12d6028c237ceaf234927bc7a11fa1..d1313ae2ba3f7d889c1b650fa864f081
                  volatile.insert(dest.0);
              }
          }
+@@ -394,8 +394,29 @@ fn find_volatile_allocas(func: &IrFunction) -> FxHashSet<u32> {
+     volatile
+ }
+ 
++/// Return true when a function contains an intrinsic whose vector/register
++/// representation is outside GVN's scalar value-number and memory-alias model.
++///
++/// GVN only proves equivalence for the explicit scalar ExprKey variants above.
++/// SIMD/AES/PCLMUL intrinsics can carry 128-bit values through stack-backed
++/// temporaries and have target-specific memory semantics. Treating their
++/// surrounding loads/stores as ordinary scalar CSE allowed a later vector fold
++/// to observe stale data (gzip's PCLMUL CRC path at -O2+). This is a
++/// function-local legality bailout, not a global GVN disablement.
++fn contains_intrinsic(func: &IrFunction) -> bool {
++    func.blocks.iter().any(|block| {
++        block.instructions.iter().any(|inst| matches!(inst, Instruction::Intrinsic { .. }))
++    })
++}
++
+ /// Run dominator-based GVN on a single function.
+ pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
++    if contains_intrinsic(func) {
++        if std::env::var("CCC_DEBUG_GVN").is_ok() {
++            eprintln!("[GVN] skip intrinsic-bearing function {}", func.name);
++        }
++        return 0;
++    }
+     let num_blocks = func.blocks.len();
+     if num_blocks == 0 {
+         return 0;
+@@ -418,6 +439,12 @@ pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
+ /// Run GVN using pre-computed CFG analysis (avoids redundant analysis when
+ /// called from a pipeline that shares analysis across GVN, LICM, IVSR).
+ pub(crate) fn run_gvn_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnalysis) -> usize {
++    if contains_intrinsic(func) {
++        if std::env::var("CCC_DEBUG_GVN").is_ok() {
++            eprintln!("[GVN] skip intrinsic-bearing function {}", func.name);
++        }
++        return 0;
++    }
+     let num_blocks = func.blocks.len();
+     if num_blocks == 0 {
+         return 0;
 diff --git a/src/passes/if_convert.rs b/src/passes/if_convert.rs
 index c7e8462d243179ad88ec2ab1a0f9fc73e7363487..f546a3ca608edd59bd5af02b213025d29dc898ef 100644
 --- a/src/passes/if_convert.rs
@@ -11388,11 +12911,11 @@ index 0ce5efb8778e62e12cfd4b3a2c40e19c1cd2de65..276822265044afed8df2478fd781948b
  #include <setjmp.h>
 diff --git a/tests/fuzz/README.md b/tests/fuzz/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..9dba47a0642630f9e4cf57e42ff283173e7bc8a7
+index 0000000000000000000000000000000000000000..7ad02043aead4cdcdf96f61f277dfdc53eaf496f
 --- /dev/null
 +++ b/tests/fuzz/README.md
-@@ -0,0 +1,32 @@
-+# Differential fuzzing
+@@ -0,0 +1,52 @@
++# Compiler fuzz and semantic stress testing
 +
 +`differential_fuzz.py` emits deterministic, defined-behavior GNU C translation
 +units and compares LCCC's stdout/exit status against a reference compiler.  It
@@ -11412,6 +12935,26 @@ index 0000000000000000000000000000000000000000..9dba47a0642630f9e4cf57e42ff28317
 +The generator avoids signed overflow, invalid shifts, division by zero,
 +out-of-bounds accesses, invalid pointers, and unspecified argument evaluation
 +order.  A failure retains its source under `--out` for reduction.
++
++## LCCC-only self-oracle stress
++
++`lccc_self_fuzz.py` is the validation mode for environments where fuzzing must
++run **only LCCC**. It never executes GCC, Clang, or any other compiler. Its
++independent Python evaluator computes the expected `uint64_t` result for each
++deterministic generated C kernel; LCCC compiles and executes that same kernel
++at every requested optimization level.
++
++```bash
++python3 tests/fuzz/lccc_self_fuzz.py \
++  --ccc ./target/release/lccc \
++  --seeds 0:100 --levels O0,O1,O2,O3,Os,Oz --jobs 2 \
++  --out /tmp/lccc-self-fuzz
++```
++
++The corpus focuses on defined unsigned arithmetic, loop-carried state, switch
++joins, edge-copy pressure, calls, casts, and postfix increment/decrement.
++Successful cases are removed because a failure is fully reproducible from its
++seed; only failing sources/binaries are retained.
 +
 +## CFG / phi-web stress
 +
@@ -11657,6 +13200,280 @@ index 0000000000000000000000000000000000000000..ba676d69e59eb1a9fa5739cbe5c04e6b
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
+diff --git a/tests/fuzz/lccc_self_fuzz.py b/tests/fuzz/lccc_self_fuzz.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ef6a8f75b0e9f6de4092bc6bd4fc00904786eef1
+--- /dev/null
++++ b/tests/fuzz/lccc_self_fuzz.py
+@@ -0,0 +1,268 @@
++#!/usr/bin/env python3
++"""Deterministic LCCC-only semantic stress runner.
++
++Unlike the historical differential fuzzers in this directory, this tool never
++invokes GCC, Clang, or another compiler.  It generates defined unsigned-C
++programs and checks LCCC's output against a small Python reference evaluator.
++
++The generated kernel intentionally combines loop-carried state, switch joins,
++edge copies, calls, casts, and post-increment/decrement.  This targets the
++backend paths where a register/stack location error can survive ordinary unit
++tests while keeping the oracle independent from a C compiler.
++
++Example:
++  tests/fuzz/lccc_self_fuzz.py --ccc ./target/release/lccc \
++      --seeds 0:100 --levels O0,O1,O2,O3,Os,Oz --jobs 2 --out /tmp/lccc-self
++"""
++from __future__ import annotations
++
++import argparse
++import concurrent.futures as futures
++import json
++import random
++import subprocess
++from dataclasses import asdict, dataclass
++from pathlib import Path
++
++MASK64 = (1 << 64) - 1
++C1 = 0x9E3779B97F4A7C15
++C2 = 0xBF58476D1CE4E5B9
++C3 = 0x94D049BB133111EB
++
++
++def u64(value: int) -> int:
++    return value & MASK64
++
++
++def rot64(value: int, amount: int) -> int:
++    amount &= 63
++    return u64(value if amount == 0 else ((value << amount) | (value >> ((64 - amount) & 63))))
++
++
++def mix(x: int, y: int, shift: int) -> int:
++    x = u64(x ^ rot64(u64(y + C1), shift))
++    x = u64(x * C2)
++    return u64(x ^ (x >> 29))
++
++
++def evaluate(seed: int) -> str:
++    rng = random.Random(seed)
++    a = rng.getrandbits(64)
++    b = rng.getrandbits(64)
++    c = rng.getrandbits(64)
++    rounds = 17 + rng.randrange(64)
++    salt = rng.getrandbits(64)
++
++    for i in range(rounds):
++        selector = (a ^ b ^ c ^ i ^ salt) & 3
++        if selector == 0:
++            a = mix(u64(a + b), c, i + 3)
++            b = u64(b ^ u64(c + i))
++        elif selector == 1:
++            b = mix(u64(b + c), a, i + 11)
++            c = u64(c ^ u64(a + i * 3))
++        elif selector == 2:
++            c = mix(u64(c + a), b, i + 19)
++            a = u64(a ^ u64(b + i * 5))
++        else:
++            old = c
++            c = u64(c - 1)
++            a = u64(a + rot64(old ^ b, i))
++            b = u64(b ^ u64(a + i))
++
++        lane = (a >> ((i * 9) & 63)) & 0xFFFFFFFF
++        if a & 1:
++            old = b
++            b = u64(b + 1)
++            c = u64(c ^ u64(old + lane + i))
++        else:
++            old = c
++            c = u64(c - 1)
++            a = u64(a + (old ^ lane ^ i))
++        salt = u64(salt + rot64(a ^ c, (i + lane) & 63))
++
++    result = u64(a ^ rot64(b, 17) ^ rot64(c, 39) ^ salt)
++    return f"{result:016x}\n"
++
++
++def c_u64(value: int) -> str:
++    return f"UINT64_C(0x{value:016x})"
++
++
++def generate(seed: int) -> str:
++    rng = random.Random(seed)
++    a = rng.getrandbits(64)
++    b = rng.getrandbits(64)
++    c = rng.getrandbits(64)
++    rounds = 17 + rng.randrange(64)
++    salt = rng.getrandbits(64)
++    return f'''#include <stdint.h>
++#include <stdio.h>
++
++#define C1 UINT64_C(0x9e3779b97f4a7c15)
++#define C2 UINT64_C(0xbf58476d1ce4e5b9)
++
++static uint64_t rot64(uint64_t value, unsigned amount) {{
++    amount &= 63u;
++    return amount ? ((value << amount) | (value >> ((64u - amount) & 63u))) : value;
++}}
++
++static uint64_t mix(uint64_t x, uint64_t y, unsigned shift) {{
++    x ^= rot64(y + C1, shift);
++    x *= C2;
++    return x ^ (x >> 29);
++}}
++
++static uint64_t kernel(uint64_t a, uint64_t b, uint64_t c,
++                       unsigned rounds, uint64_t salt) {{
++    for (unsigned i = 0; i < rounds; ++i) {{
++        switch ((unsigned)((a ^ b ^ c ^ i ^ salt) & 3u)) {{
++        case 0:
++            a = mix(a + b, c, i + 3u);
++            b ^= c + i;
++            break;
++        case 1:
++            b = mix(b + c, a, i + 11u);
++            c ^= a + i * 3u;
++            break;
++        case 2:
++            c = mix(c + a, b, i + 19u);
++            a ^= b + i * 5u;
++            break;
++        default: {{
++            uint64_t old = c--;
++            a += rot64(old ^ b, i);
++            b ^= a + i;
++            break;
++        }}
++        }}
++
++        uint32_t lane = (uint32_t)(a >> ((i * 9u) & 63u));
++        if (a & 1u) {{
++            uint64_t old = b++;
++            c ^= old + lane + i;
++        }} else {{
++            uint64_t old = c--;
++            a += old ^ lane ^ i;
++        }}
++        salt += rot64(a ^ c, (i + lane) & 63u);
++    }}
++    return a ^ rot64(b, 17u) ^ rot64(c, 39u) ^ salt;
++}}
++
++int main(void) {{
++    uint64_t value = kernel({c_u64(a)}, {c_u64(b)}, {c_u64(c)},
++                            {rounds}u, {c_u64(salt)});
++    printf("%016llx\\n", (unsigned long long)value);
++    return 0;
++}}
++'''
++
++
++@dataclass
++class Result:
++    seed: int
++    level: str
++    status: str
++    compile_rc: int | str
++    run_rc: int | str
++    expected: str
++    actual: str
++    detail: str = ""
++
++
++def invoke(command: list[str], timeout: int) -> tuple[int | str, str, str]:
++    try:
++        completed = subprocess.run(
++            command,
++            text=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            timeout=timeout,
++        )
++        return completed.returncode, completed.stdout, completed.stderr
++    except subprocess.TimeoutExpired:
++        return "TIMEOUT", "", "timeout"
++    except OSError as exc:
++        return "ERROR", "", repr(exc)
++
++
++def one_case(args: tuple[int, str, str, Path]) -> Result:
++    seed, level, ccc, root = args
++    case = root / f"seed_{seed:05d}_{level}"
++    case.mkdir(parents=True, exist_ok=True)
++    source = case / "case.c"
++    binary = case / "case.bin"
++    source.write_text(generate(seed))
++    expected = evaluate(seed)
++    flags = [
++        f"-{level}", "-std=gnu11", "-w", "-march=raptorlake",
++        "-mtune=raptorlake", "-fomit-frame-pointer",
++    ]
++    compile_rc, _, compile_err = invoke([ccc, *flags, str(source), "-o", str(binary)], 60)
++    if compile_rc != 0:
++        return Result(seed, level, "compile_failure", compile_rc, "NA", expected, "", compile_err[-1200:])
++    run_rc, output, run_err = invoke([str(binary)], 10)
++    if run_rc != 0:
++        return Result(seed, level, "run_failure", compile_rc, run_rc, expected, output, run_err[-1200:])
++    if output != expected:
++        return Result(seed, level, "mismatch", compile_rc, run_rc, expected, output)
++
++    # Successful cases are reproducible from the seed; retain only failures.
++    binary.unlink(missing_ok=True)
++    source.unlink(missing_ok=True)
++    try:
++        case.rmdir()
++    except OSError:
++        pass
++    return Result(seed, level, "pass", compile_rc, run_rc, expected, output)
++
++
++def parse_seeds(spec: str) -> range:
++    if ":" in spec:
++        lo, hi = spec.split(":", 1)
++        return range(int(lo), int(hi))
++    start = int(spec)
++    return range(start, start + 1)
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--ccc", required=True, help="LCCC executable; no reference compiler is used")
++    parser.add_argument("--seeds", default="0:100")
++    parser.add_argument("--levels", default="O0,O1,O2,O3,Os,Oz")
++    parser.add_argument("--jobs", type=int, default=1)
++    parser.add_argument("--out", type=Path, required=True)
++    args = parser.parse_args()
++
++    levels = [level.strip() for level in args.levels.split(",") if level.strip()]
++    seeds = list(parse_seeds(args.seeds))
++    args.out.mkdir(parents=True, exist_ok=True)
++    work = [(seed, level, args.ccc, args.out) for level in levels for seed in seeds]
++
++    counts: dict[str, int] = {}
++    failures: list[Result] = []
++    with futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
++        for result in pool.map(one_case, work):
++            counts[result.status] = counts.get(result.status, 0) + 1
++            if result.status != "pass":
++                failures.append(result)
++                print(f"FAIL seed={result.seed} level={result.level} status={result.status}", flush=True)
++
++    report = {
++        "compiler": args.ccc,
++        "oracle": "independent Python uint64 evaluator; no GCC/Clang invocation",
++        "seeds": args.seeds,
++        "levels": levels,
++        "jobs": max(1, args.jobs),
++        "cases": len(work),
++        "counts": counts,
++        "failures": [asdict(failure) for failure in failures],
++    }
++    (args.out / "summary.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
++    print(json.dumps(report, indent=2, sort_keys=True))
++    return 1 if failures else 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
 diff --git a/tests/fuzz/phi_cfg_fuzz.py b/tests/fuzz/phi_cfg_fuzz.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..8457fe8c8f18246cf82b62af84c2bab4a4eb51ca
@@ -11828,6 +13645,34 @@ index 0000000000000000000000000000000000000000..dd1047a63f9ff9db3f38be932bbf36d3
 +int main(void){ struct Bf f; f.a=5; f.b=-7; f.d=0x1234567890UL;
 +  printf("%u %d %lu\n", f.a, f.b, (unsigned long)f.d);
 +  return (f.a==5 && f.b==-7 && (unsigned long)f.d==0x1234567890UL)?0:1; }
+diff --git a/tests/regression/caller_save_return_value.c b/tests/regression/caller_save_return_value.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..60fb56d04d9913ef3e889431a8146bcedf9cedf0
+--- /dev/null
++++ b/tests/regression/caller_save_return_value.c
+@@ -0,0 +1,22 @@
++/* Phase-2b regression: a value born at a call must never be restored from a
++   pre-call spill slot, which would overwrite the fresh return value. */
++#include <stdint.h>
++#include <stdio.h>
++
++static uint64_t noinline_mix(uint64_t value, uint64_t salt) {
++    return (value ^ (salt + UINT64_C(0x9e3779b97f4a7c15)))
++           * UINT64_C(0xbf58476d1ce4e5b9);
++}
++
++static uint64_t chain(uint64_t seed) {
++    uint64_t a = noinline_mix(seed, UINT64_C(3));
++    uint64_t b = noinline_mix(seed + UINT64_C(7), a);
++    uint64_t c = noinline_mix(a ^ b, seed + UINT64_C(11));
++    return a ^ b ^ c;
++}
++
++int main(void) {
++    uint64_t got = chain(UINT64_C(0x0123456789abcdef));
++    printf("%016llx\n", (unsigned long long)got);
++    return got != UINT64_C(0x33315747a4df73bf);
++}
 diff --git a/tests/regression/cfg_phi_web.c b/tests/regression/cfg_phi_web.c
 new file mode 100644
 index 0000000000000000000000000000000000000000..99189df81fefd8d0c1041755f2b5eb0d4abc847a
@@ -12238,6 +14083,37 @@ index 0000000000000000000000000000000000000000..2d110d82b4ff5ca7e5c5e77ac0b096d1
 +    printf("%lu %lu\n", high, low);
 +    return high != ((unsigned long)((u128)1 << 36)) || low != 38;
 +}
+diff --git a/tests/regression/leaq_sib_address_liveness.c b/tests/regression/leaq_sib_address_liveness.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..41a60f3f9387047d0e0244fea99663962fb597a6
+--- /dev/null
++++ b/tests/regression/leaq_sib_address_liveness.c
+@@ -0,0 +1,25 @@
++/* Regression: LEA-to-SIB peephole must retain an address that remains live
++   across a fall-through/join after its first dereference. */
++#include <stdint.h>
++#include <stddef.h>
++#include <stdio.h>
++
++static uint64_t probe(const uint8_t *base, size_t index, unsigned gate) {
++    const uint8_t *address = base + index;
++    uint64_t value = *address;
++    if (gate & 1u)
++        goto join;
++    value += UINT64_C(0x100);
++join:
++    /* `address` is intentionally read again after the control-flow join. */
++    return value + address[1] + (uint64_t)(gate >> 1);
++}
++
++int main(void) {
++    static const uint8_t bytes[] = { 3, 17, 29, 41, 53, 67, 79, 97 };
++    uint64_t sum = 0;
++    for (unsigned gate = 0; gate < 16; ++gate)
++        sum += probe(bytes, (size_t)(gate & 3u), gate);
++    printf("%llu\n", (unsigned long long)sum);
++    return sum != UINT64_C(3024);
++}
 diff --git a/tests/regression/long_double_stack_call.c b/tests/regression/long_double_stack_call.c
 new file mode 100644
 index 0000000000000000000000000000000000000000..cdae0ba839e821cc46dcce3650325ffd921e476c
@@ -12272,6 +14148,31 @@ index 0000000000000000000000000000000000000000..05aa4a4561d821175f36935623963439
 +    printf("n=%d b=%s\n", n, buffer);
 +    return n != 6 || strcmp(buffer, "1.5 33") != 0;
 +}
+diff --git a/tests/regression/machinst_widen_cast.c b/tests/regression/machinst_widen_cast.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..c463591af8d3a70399460408715307089d3cf70a
+--- /dev/null
++++ b/tests/regression/machinst_widen_cast.c
+@@ -0,0 +1,19 @@
++/* MachInst regression: 32->64 casts must not truncate to the low byte. */
++#include <stdint.h>
++#include <stdio.h>
++
++static uint64_t widen_u32(uint32_t value) {
++    return (uint64_t)value + UINT64_C(0x0102030405060708);
++}
++
++static uint64_t widen_signed_to_u64(int32_t value) {
++    return (uint64_t)value;
++}
++
++int main(void) {
++    uint64_t a = widen_u32(UINT32_C(0x12345678));
++    uint64_t b = widen_signed_to_u64(-1);
++    printf("%016llx %016llx\n", (unsigned long long)a, (unsigned long long)b);
++    return a != UINT64_C(0x01020304173a5d80)
++        || b != UINT64_MAX;
++}
 diff --git a/tests/regression/narrowed_to_u32.c b/tests/regression/narrowed_to_u32.c
 new file mode 100644
 index 0000000000000000000000000000000000000000..8be6d089f624926fe7600315d463031a8857fe51
@@ -12284,12 +14185,61 @@ index 0000000000000000000000000000000000000000..8be6d089f624926fe7600315d463031a
 +#include <limits.h>
 +int main(void){ unsigned int ui = UINT_MAX; ui /= 5000.0;
 +  printf("%u\n", ui); return ui==858993?0:1; }
+diff --git a/tests/regression/pclmul_intrinsic_lane.c b/tests/regression/pclmul_intrinsic_lane.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..80ca56cd4a59563bd33456a67d9bc89783f5b891
+--- /dev/null
++++ b/tests/regression/pclmul_intrinsic_lane.c
+@@ -0,0 +1,17 @@
++/* Raptor Lake intrinsic regression: validates actual PCLMULQDQ emission and
++   lane selection, not merely preprocessor macro exposure. */
++#include <stdint.h>
++#include <stdio.h>
++#include <x86intrin.h>
++
++int main(void) {
++    __m128i a = _mm_set_epi64x(0x1d9513d7LL, 0x8f352d95LL);
++    __m128i b = _mm_set_epi64x(0x1db710641LL, 0x1f7011641LL);
++    __m128i product = _mm_clmulepi64_si128(a, b, 0x00);
++    uint64_t lanes[2];
++    _mm_storeu_si128((__m128i_u *)lanes, product);
++    printf("%016llx %016llx\n", (unsigned long long)lanes[1],
++           (unsigned long long)lanes[0]);
++    return lanes[1] != UINT64_C(0)
++        || lanes[0] != UINT64_C(0xf1da085658df66d5);
++}
+diff --git a/tests/regression/raptorlake_crypto_features.c b/tests/regression/raptorlake_crypto_features.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..a807e1d6b4afdbc6fc6c6e0ad9e3d8fddfddb426
+--- /dev/null
++++ b/tests/regression/raptorlake_crypto_features.c
+@@ -0,0 +1,20 @@
++/* Compile this test with -march=raptorlake.  It verifies both macro exposure
++   and target-bound __builtin_cpu_supports folding used by gzip's CRC dispatch. */
++#if !defined(__AVX2__)
++# error "Raptor Lake profile must expose __AVX2__"
++#endif
++#if !defined(__AES__)
++# error "Raptor Lake profile must expose __AES__"
++#endif
++#if !defined(__PCLMUL__)
++# error "Raptor Lake profile must expose __PCLMUL__"
++#endif
++#if defined(__AVX512F__)
++# error "Raptor Lake profile must not assume AVX-512"
++#endif
++
++int main(void) {
++    return !(__builtin_cpu_supports("avx")
++             && __builtin_cpu_supports("aes")
++             && __builtin_cpu_supports("pclmul"));
++}
 diff --git a/tests/regression/run_regression.sh b/tests/regression/run_regression.sh
 new file mode 100755
-index 0000000000000000000000000000000000000000..bab081d79a3d0d30d98360e94c17055022f55f64
+index 0000000000000000000000000000000000000000..e8966393e29cdcf1b404c3351b77300be78f1c9f
 --- /dev/null
 +++ b/tests/regression/run_regression.sh
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,33 @@
 +#!/usr/bin/env bash
 +# Compile+run the CCC regression suite. Each test returns 0 on success.
 +# Usage: run_regression.sh [--compare-gcc]
@@ -12302,7 +14252,13 @@ index 0000000000000000000000000000000000000000..bab081d79a3d0d30d98360e94c170550
 +pass=0; fail=0
 +for src in "$dir"/*.c; do
 +  name=$(basename "$src" .c)
-+  if $CCC $CCCFLAGS "$src" -o "/tmp/ccc_${name}" 2>/tmp/ccc_err.txt; then
++  # This source intentionally asserts the explicit Raptor Lake target contract.
++  # Keep all other regressions profile-neutral.
++  extra_flags=""
++  case "$name" in
++    raptorlake_crypto_features|pclmul_intrinsic_lane) extra_flags="-march=raptorlake" ;;
++  esac
++  if $CCC $CCCFLAGS $extra_flags "$src" -o "/tmp/ccc_${name}" 2>/tmp/ccc_err.txt; then
 +    /tmp/ccc_${name} >/tmp/ccc_out.txt 2>&1; rc=$?
 +    if [ $rc -eq 0 ]; then
 +      if [ "$COMPARE_GCC" = 1 ]; then
