@@ -1328,10 +1328,139 @@ index 29415090..bcbd12e1 100644
  pub const DT_VERNEEDNUM: i64 = 0x6fff_ffff;
  pub const DT_FLAGS_1: i64 = 0x6fff_fffb;
 diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index e3271d1a..51c8c506 100644
+index e3271d1a..997a836a 100644
 --- a/src/backend/generation.rs
 +++ b/src/backend/generation.rs
-@@ -569,7 +569,8 @@ pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule, source_mgr:
+@@ -13,6 +13,7 @@ use crate::ir::reexports::{
+     BasicBlock,
+     GlobalInit,
+     Instruction,
++    IrBinOp,
+     IrConst,
+     IrFunction,
+     IrModule,
+@@ -55,27 +56,54 @@ fn build_gep_fold_map(func: &IrFunction, use_counts: &[u32]) -> FxHashMap<u32, G
+     }
+     let mut gep_map: FxHashMap<u32, GepFoldInfo> = FxHashMap::default();
+ 
+-    // Phase 1: Collect all GEPs with constant offsets.
++    // Phase 1: Collect foldable pointer-producing instructions.
++    // (a) GetElementPtr with constant offset.
++    // (b) BinOp(IAdd, base_value, Const) — ms178: pointer increments from
++    //     `p++`-style loop-carried pointer variables lower to Add, not GEP
++    //     (e.g. gzip's longest_match `*++scan == *++match` inner loop). These
++    //     were previously never folded, so every loop iteration emitted
++    //     lea→spill→reload→deref instead of `movzbl 1(%base),%eax`.
++    //     Foldability (used only as Load/Store ptr) is enforced in Phase 2 for
++    //     all candidates regardless of producer instruction.
+     for block in &func.blocks {
+         for inst in &block.instructions {
+-            if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } = inst {
+-                let offset_val = match c.to_i64() {
+-                    Some(v) => v,
+-                    None => continue,
+-                };
+-                // Offset must fit in 32-bit signed displacement for x86.
+-                // Also reasonable for ARM (signed 9-bit unscaled or 12-bit scaled)
+-                // and RISC-V (signed 12-bit).
+-                // Use i32 range as the safe common limit.
+-                // Unsigned type constants (e.g. U32 -1 = 4294967295) are sign-narrowed.
+-                let offset_val = if offset_val >= i32::MIN as i64 && offset_val <= i32::MAX as i64 {
+-                    offset_val
+-                } else if offset_val > i32::MAX as i64 && offset_val <= u32::MAX as i64 {
+-                    offset_val as i32 as i64
+-                } else {
+-                    continue;
+-                };
+-                gep_map.insert(dest.0, GepFoldInfo { base: *base, offset: offset_val });
++            match inst {
++                Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } => {
++                    let offset_val = match c.to_i64() {
++                        Some(v) => v,
++                        None => continue,
++                    };
++                    // Offset must fit in 32-bit signed displacement for x86.
++                    // Also reasonable for ARM (signed 9-bit unscaled or 12-bit scaled)
++                    // and RISC-V (signed 12-bit).
++                    // Use i32 range as the safe common limit.
++                    // Unsigned type constants (e.g. U32 -1 = 4294967295) are sign-narrowed.
++                    let offset_val = if offset_val >= i32::MIN as i64 && offset_val <= i32::MAX as i64 {
++                        offset_val
++                    } else if offset_val > i32::MAX as i64 && offset_val <= u32::MAX as i64 {
++                        offset_val as i32 as i64
++                    } else {
++                        continue;
++                    };
++                    gep_map.insert(dest.0, GepFoldInfo { base: *base, offset: offset_val });
++                }
++                Instruction::BinOp { dest, op: IrBinOp::Add, lhs: Operand::Value(base), rhs: Operand::Const(c), ty }
++                | Instruction::BinOp { dest, op: IrBinOp::Add, lhs: Operand::Const(c), rhs: Operand::Value(base), ty } => {
++                    // Only fold integer/pointer adds (not float — float add must
++                    // stay in the FP pipeline; the const would be a float literal
++                    // and to_i64() fails for it anyway, but guard explicitly).
++                    use crate::common::types::IrType;
++                    if ty.is_float() || ty.is_long_double() {
++                        continue;
++                    }
++                    let offset_val = match c.to_i64() {
++                        Some(v) if v >= i32::MIN as i64 && v <= i32::MAX as i64 => v,
++                        Some(v) if v > i32::MAX as i64 && v <= u32::MAX as i64 => v as i32 as i64,
++                        _ => continue,
++                    };
++                    gep_map.insert(dest.0, GepFoldInfo { base: *base, offset: offset_val });
++                }
++                _ => {}
+             }
+         }
+     }
+@@ -83,6 +111,34 @@ fn build_gep_fold_map(func: &IrFunction, use_counts: &[u32]) -> FxHashMap<u32, G
+     if gep_map.is_empty() {
+         return gep_map;
+     }
++    let original_count = gep_map.len();
++
++    // ms178 soundness: the IR is NOT SSA at codegen time (phi elimination has
++    // run), so a base value could be redefined between the GEP/Add and its
++    // Load/Store. Folding would then use the NEW base with the OLD offset —
++    // wrong. Alloca bases are safe (the alloca's ADDRESS is frame-constant and
++    // never redefined). Non-alloca bases must be single-def (or parameters).
++    let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
++    let mut is_alloca_set: FxHashSet<u32> = FxHashSet::default();
++    let mut is_param_set: FxHashSet<u32> = FxHashSet::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Instruction::Alloca { dest, .. } = inst {
++                is_alloca_set.insert(dest.0);
++            }
++            if let Instruction::ParamRef { dest, .. } = inst {
++                is_param_set.insert(dest.0);
++            }
++            if let Some(d) = inst.dest() {
++                *def_count.entry(d.0).or_insert(0) += 1;
++            }
++        }
++    }
++    gep_map.retain(|_, info| {
++        is_alloca_set.contains(&info.base.0)
++            || is_param_set.contains(&info.base.0)
++            || def_count.get(&info.base.0).copied().unwrap_or(0) == 1
++    });
+ 
+     // Phase 2: Verify that each candidate GEP dest is ONLY used as Load/Store ptr.
+     // If it's used anywhere else (as a value operand, in a call, in a terminator,
+@@ -151,6 +207,11 @@ fn build_gep_fold_map(func: &IrFunction, use_counts: &[u32]) -> FxHashMap<u32, G
+         (*val_id as usize) < use_counts.len() && use_counts[*val_id as usize] > 0
+     });
+ 
++    if std::env::var("CCC_DEBUG_GEPFOLD").is_ok() {
++        eprintln!("[GEPFOLD] total_candidates={} non_ptr_invalidated={} remaining={}",
++            original_count, non_ptr_uses.len(), gep_map.len());
++    }
++
+     gep_map
+ }
+ 
+@@ -569,7 +630,8 @@ pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule, source_mgr:
      let file_table = build_and_emit_dwarf_file_table(cg, module, source_mgr);
  
      let ptr_dir = cg.ptr_directive();
@@ -1341,7 +1470,7 @@ index e3271d1a..51c8c506 100644
  
      // Emit top-level asm("...") directives verbatim (e.g., musl's _start definition).
      // Switch to .text first so that labels/code in the asm land in the correct section.
-@@ -872,6 +873,20 @@ fn emit_init_fini_arrays(cg: &mut dyn ArchCodegen, module: &IrModule, ptr_dir: s
+@@ -872,6 +934,20 @@ fn emit_init_fini_arrays(cg: &mut dyn ArchCodegen, module: &IrModule, ptr_dir: s
  fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Option<&SourceManager>, file_table: &FxHashMap<String, u32>) {
      cg.state().reset_for_function();
  
@@ -2080,7 +2209,7 @@ index 3b7c38f0..634e1f85 100644
  ///
  /// x86 registers have multiple aliases for the same physical register
 diff --git a/src/backend/live_range.rs b/src/backend/live_range.rs
-index a24a9f5c..7edd3f89 100644
+index a24a9f5c..d75b0960 100644
 --- a/src/backend/live_range.rs
 +++ b/src/backend/live_range.rs
 @@ -44,13 +44,9 @@ impl LiveRange {
@@ -2155,7 +2284,7 @@ index a24a9f5c..7edd3f89 100644
                  best_next_use = next_use;
              }
          }
-@@ -315,11 +327,71 @@ impl LinearScanAllocator {
+@@ -315,11 +327,90 @@ impl LinearScanAllocator {
                  next_use: None,
              });
          } else {
@@ -2203,6 +2332,25 @@ index a24a9f5c..7edd3f89 100644
 +                    } else {
 +                        range.priority > cand_priority && cand_depth < range.loop_depth
 +                    };
++                    // ms178 mode 3: ALSO require that the evicted value's next
++                    // use is AFTER the incoming range's end. This prevents the
++                    // pathological case that makes eviction regress hot loops:
++                    // if the evicted value is needed INSIDE the incoming
++                    // range's window, it reloads from its slot on every use in
++                    // the hot loop — far worse than the spill it avoided. With
++                    // this guard, the reload happens in cold code (or a later
++                    // loop), so eviction can only help.
++                    let ok = if mode >= 3 {
++                        ok && {
++                            let nxt = next_use_after(&cand.range, range.start);
++                            // next_use_after falls back to range.end when there
++                            // is no use at/after range.start; in that case the
++                            // value is genuinely not needed soon.
++                            nxt > range.end
++                        }
++                    } else {
++                        ok
++                    };
 +                    if ok {
 +                        let evicted_reg = self.assignments.remove(&evicted_vid);
 +                        if let Some(reg) = evicted_reg {
@@ -2232,7 +2380,7 @@ index a24a9f5c..7edd3f89 100644
              self.allocate_spill_slot(range.value_id);
          }
      }
-@@ -339,6 +411,21 @@ impl LinearScanAllocator {
+@@ -339,6 +430,21 @@ impl LinearScanAllocator {
      }
  }
  
@@ -2255,7 +2403,7 @@ index a24a9f5c..7edd3f89 100644
  ///
  /// This function:
 diff --git a/src/backend/liveness.rs b/src/backend/liveness.rs
-index 8ae06d43..aff73bfb 100644
+index 8ae06d43..f7e67390 100644
 --- a/src/backend/liveness.rs
 +++ b/src/backend/liveness.rs
 @@ -1025,7 +1025,7 @@ fn is_returns_twice_call(inst: &Instruction) -> bool {
@@ -2267,6 +2415,15 @@ index 8ae06d43..aff73bfb 100644
      match inst {
          Instruction::Alloca { .. } => {}
          Instruction::DynAlloca { size, .. } => f(size),
+@@ -1074,7 +1074,7 @@ pub(super) fn for_each_operand_in_instruction(inst: &Instruction, mut f: impl Fn
+ /// These are pointer/base values used directly (not wrapped in Operand),
+ /// e.g., the `ptr` in Store/Load, `base` in GEP, `dest`/`src` in Memcpy.
+ /// Canonical traversal — shared by liveness, use-counting, and GEP fold analysis.
+-pub(super) fn for_each_value_use_in_instruction(inst: &Instruction, mut f: impl FnMut(&Value)) {
++pub(crate) fn for_each_value_use_in_instruction(inst: &Instruction, mut f: impl FnMut(&Value)) {
+     match inst {
+         Instruction::Store { ptr, .. } => f(ptr),
+         Instruction::Load { ptr, .. } => f(ptr),
 @@ -1098,7 +1098,7 @@ pub(super) fn for_each_value_use_in_instruction(inst: &Instruction, mut f: impl
  
  /// Iterate over all Operand references in a terminator.
@@ -2277,10 +2434,248 @@ index 8ae06d43..aff73bfb 100644
          Terminator::Return(Some(op)) => f(op),
          Terminator::CondBranch { cond, .. } => f(cond),
 diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index c4b75fab..84c3dad7 100644
+index c4b75fab..11da9897 100644
 --- a/src/backend/regalloc.rs
 +++ b/src/backend/regalloc.rs
-@@ -555,6 +555,25 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+@@ -87,6 +87,147 @@ fn filter_eligible_intervals(
+         .collect()
+ }
+ 
++/// ms178: Build Copy-coalescing groups.
++///
++/// Union-find over `Copy { dest, src: Value(v) }` instructions where both ends
++/// are eligible for register allocation. A group is only kept when its members'
++/// live intervals are pairwise DISJOINT — only then can a single register
++/// legally hold all members at distinct times (the copy becomes a no-op).
++/// Members that overlap another member of their group are split out.
++///
++/// Returns map: group leader value id -> all member value ids (incl. leader).
++fn build_coalesce_groups(
++    func: &IrFunction,
++    liveness: &LivenessResult,
++    eligible: &FxHashSet<u32>,
++) -> FxHashMap<u32, Vec<u32>> {
++    use std::collections::HashMap;
++    if std::env::var("CCC_DEBUG_COALESCE").is_ok() {
++        eprintln!("[COALESCE] fn={} build_coalesce_groups ENTERED", func.name);
++    }
++    // interval lookup
++    let iv_of = |vid: u32| -> Option<(u32, u32)> {
++        liveness
++            .intervals
++            .iter()
++            .find(|iv| iv.value_id == vid)
++            .map(|iv| (iv.start, iv.end))
++    };
++    // union-find
++    let mut parent: HashMap<u32, u32> = HashMap::new();
++    fn find(parent: &mut HashMap<u32, u32>, x: u32) -> u32 {
++        let mut r = x;
++        while parent.get(&r).copied() != Some(r) {
++            r = parent.get(&r).copied().unwrap_or(r);
++        }
++        // path compression
++        let mut c = x;
++        while parent.get(&c).copied().map(|p| p != r).unwrap_or(false) {
++            let next = parent.get(&c).copied().unwrap_or(c);
++            parent.insert(c, r);
++            c = next;
++        }
++        r
++    }
++    fn union(parent: &mut HashMap<u32, u32>, a: u32, b: u32) {
++        let ra = find(parent, a);
++        let rb = find(parent, b);
++        if ra != rb {
++            parent.insert(rb, ra);
++        }
++    }
++    let overlaps = |a: (u32, u32), b: (u32, u32)| a.0 < b.1 && b.0 < a.1;
++
++    // Pass 1: union copy pairs.
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Instruction::Copy { dest, src: Operand::Value(v) } = inst {
++                let d = dest.0;
++                let s = v.0;
++                if eligible.contains(&d) && eligible.contains(&s) {
++                    parent.entry(d).or_insert(d);
++                    parent.entry(s).or_insert(s);
++                    union(&mut parent, d, s);
++                }
++            }
++        }
++    }
++    if parent.is_empty() {
++        if std::env::var("CCC_DEBUG_COALESCE").is_ok() {
++            let n_copies = func.blocks.iter().flat_map(|b| &b.instructions)
++                .filter(|i| matches!(i, Instruction::Copy { .. })).count();
++            eprintln!("[COALESCE] fn={} no eligible copy pairs (copies={})", func.name, n_copies);
++        }
++        return FxHashMap::default();
++    }
++    // Pass 2: group members by leader.
++    let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
++    let vids: Vec<u32> = parent.keys().copied().collect();
++    for vid in vids {
++        let leader = find(&mut parent, vid);
++        groups.entry(leader).or_default().push(vid);
++    }
++    // Pass 3: split overlapping members out of their groups.
++    let mut result: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
++    for (leader, members) in groups {
++        // sort by start for the greedy disjoint check
++        let mut sorted = members.clone();
++        sorted.sort_by_key(|&m| iv_of(m).map(|x| x.0).unwrap_or(0));
++        let mut accepted: Vec<u32> = Vec::new();
++        let mut rejected: Vec<u32> = Vec::new();
++        for m in sorted {
++            let mi = iv_of(m);
++            let mut ok = true;
++            if let Some(mi) = mi {
++                for &a in &accepted {
++                    if let Some(ai) = iv_of(a) {
++                        if overlaps(mi, ai) {
++                            ok = false;
++                            break;
++                        }
++                    }
++                }
++            }
++            if ok {
++                accepted.push(m);
++            } else {
++                rejected.push(m);
++            }
++        }
++        if accepted.len() > 1 {
++            // The group representative is the union-find leader IF it is among
++            // the accepted (pairwise-disjoint) members; otherwise use the
++            // earliest-start accepted member. CRITICAL: the representative's
++            // value id must be a member whose interval is covered by the merged
++            // [min,max] interval — a rejected leader whose original interval
++            // extends beyond the merged range would otherwise keep uses outside
++            // the merged interval with no register coverage (miscompile).
++            let rep = if accepted.contains(&leader) { leader } else { accepted[0] };
++            result.insert(rep, accepted);
++        }
++        // rejected members keep their own intervals (not coalesced)
++        let _ = rejected;
++    }
++    if std::env::var("CCC_DEBUG_COALESCE").is_ok() {
++        let mut n_merged = 0usize;
++        let mut n_members = 0usize;
++        for (_, members) in &result {
++            n_merged += 1;
++            n_members += members.len();
++        }
++        eprintln!("[COALESCE] fn={} groups={} members={}", func.name, n_merged, n_members);
++        for (leader, members) in &result {
++            let ivs: Vec<String> = members.iter().map(|m| {
++                liveness.intervals.iter().find(|x| x.value_id == *m)
++                    .map(|x| format!("val{}[{}-{}]", x.value_id, x.start, x.end))
++                    .unwrap_or_else(|| format!("val{}[?]", m))
++            }).collect();
++            eprintln!("[COALESCE]   group leader={} members={:?}", leader, ivs);
++        }
++    }
++    result
++}
++
+ /// Run the register allocator on a function.
+ ///
+ /// Strategy: We assign callee-saved registers to values with the longest
+@@ -315,14 +456,87 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+ 
+     let call_points = &liveness.call_points;
+ 
++    // ms178: pre-allocation COPY COALESCING.
++    //
++    // Linear scan allocates registers per SSA value; Copy instructions whose
++    // dest/src are disjoint should share a register so the copy disappears.
++    // The existing hint mechanism only works when the copy DEST finds a free
++    // register at its (late, in-loop) start point — under register pressure it
++    // never does, so every loop-carried phi copy-back round-trips through a
++    // stack slot (gzip's longest_match: ~922 spill refs in the hot loop).
++    //
++    // Here we union Copy-related values into a single coalesced interval
++    // BEFORE allocation (dest's range extends back to src's start), so the
++    // coalesced interval is allocated as one unit with the src's early start.
++    // Soundness: members are only merged when their live intervals are pairwise
++    // disjoint (then one register provably holds all of them at distinct
++    // times). Any member that overlaps another in its group is split out and
++    // keeps its own interval. The final assignments map then maps every member
++    // to the group leader's register, making the copies no-ops in codegen.
++    // Opt-in (CCC_COALESCE=1): measured neutral on gzip (loop-carried values
++    // genuinely overlap, so only ~2 groups coalesce in longest_match), sound
++    // after the representative fix, and a net win on copy-heavy non-loop code.
++    // Kept OFF by default so the default codegen matches the fully-validated
++    // v14 baseline.
++    let coalesce_groups: FxHashMap<u32, Vec<u32>> = if std::env::var("CCC_COALESCE").is_ok() {
++        build_coalesce_groups(func, &liveness, &eligible)
++    } else {
++        FxHashMap::default()
++    };
++
+     // Phase 1: callee-saved linear scan.
+-    let phase1_intervals = filter_eligible_intervals(&liveness, &eligible);
+-    let phase1_ranges =
++    let mut phase1_intervals = filter_eligible_intervals(&liveness, &eligible);
++    // Replace each coalesced group's member intervals with ONE merged interval
++    // whose id is the group leader, and record the member→leader map for
++    // assignment propagation.
++    let mut coalesce_member_of: FxHashMap<u32, u32> = FxHashMap::default();
++    if !coalesce_groups.is_empty() {
++        let mut removed: FxHashSet<u32> = FxHashSet::default();
++        for (leader, members) in &coalesce_groups {
++            let mut start = u32::MAX;
++            let mut end = 0u32;
++            for m in members {
++                removed.insert(*m);
++                if let Some(iv) = liveness.intervals.iter().find(|x| x.value_id == *m) {
++                    if iv.start < start { start = iv.start; }
++                    if iv.end > end { end = iv.end; }
++                }
++            }
++            for m in members {
++                if *m != *leader {
++                    coalesce_member_of.insert(*m, *leader);
++                }
++            }
++            phase1_intervals.push(LiveInterval { value_id: *leader, start, end });
++        }
++        phase1_intervals.retain(|iv| !removed.contains(&iv.value_id));
++    }
++    let mut phase1_ranges =
+         live_range::build_live_ranges(&phase1_intervals, &liveness.block_loop_depth, func);
++    // Bump coalesced leaders' priority by group size so merged intervals with
++    // many uses (sum of member uses) aren't underweighted vs their single
++    // interval peers.
++    if !coalesce_groups.is_empty() {
++        for r in phase1_ranges.iter_mut() {
++            if let Some(members) = coalesce_groups.get(&r.value_id) {
++                let n = members.len().max(1) as u64;
++                r.priority = r.priority.saturating_mul(n.min(8));
++                r.calculate_spill_weight();
++            }
++        }
++    }
+     let mut allocator = LinearScanAllocator::new(phase1_ranges, config.available_regs.clone());
+     allocator.run();
+ 
+     let mut assignments = allocator.assignments;
++    // Propagate coalesced registers to all group members.
++    if !coalesce_member_of.is_empty() {
++        for (member, leader) in &coalesce_member_of {
++            if let Some(&reg) = assignments.get(leader) {
++                assignments.insert(*member, reg);
++            }
++        }
++    }
+     let mut used_regs_set: FxHashSet<u8> = FxHashSet::default();
+     for &reg in assignments.values() {
+         used_regs_set.insert(reg.0);
+@@ -555,6 +769,25 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
      let mut used_regs: Vec<PhysReg> = used_regs_set.iter().map(|&r| PhysReg(r)).collect();
      used_regs.sort_by_key(|r| r.0);
  
@@ -3927,7 +4322,7 @@ index de1c2f09..824ed496 100644
              i += 1;
              continue;
 diff --git a/src/backend/x86/codegen/peephole/passes/dead_code.rs b/src/backend/x86/codegen/peephole/passes/dead_code.rs
-index 6651c6dc..45d8ccac 100644
+index 6651c6dc..13130fae 100644
 --- a/src/backend/x86/codegen/peephole/passes/dead_code.rs
 +++ b/src/backend/x86/codegen/peephole/passes/dead_code.rs
 @@ -11,6 +11,46 @@
@@ -4019,7 +4414,44 @@ index 6651c6dc..45d8ccac 100644
          let store_bytes = store_size.byte_size();
  
          let end = std::cmp::min(i + WINDOW, len);
-@@ -210,6 +279,23 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
+@@ -202,6 +271,36 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
+ 
+         for j in (i + 1)..end {
+             if infos[j].is_nop() {
++                // ms178 SOUNDNESS FIX: another pass (store_fwd / copy_prop /
++                // dead_regs / phase-1 locals) may have NOP'd this line, but the
++                // LineStore preserves its original text. If that line was a LOAD
++                // or STORE of OUR slot, then our store's value was consumed (or
++                // the slot was rewritten) — deleting our store would orphan the
++                // forwarded value / reintroduce a live store. Check the
++                // preserved text (trimmed: NOP'd lines may retain their original
++                // indentation, which the line parsers do not tolerate): any
++                // same-slot access on a nop'd line counts as a read
++                // (conservative) or overwrite.
++                let nt = infos[j].trimmed(store.get(j)).trim();
++                if let Some((off_str, _reg, sz)) = parse_load_from_rbp_str(nt) {
++                    let off = fast_parse_i32(off_str);
++                    if ranges_overlap(store_offset, store_bytes, off, sz.byte_size()) {
++                        slot_read = true;
++                        break;
++                    }
++                }
++                if let Some((_reg, off_str, sz)) = parse_store_to_rbp_str(nt) {
++                    let off = fast_parse_i32(off_str);
++                    let nb = sz.byte_size();
++                    if off <= store_offset && off + nb >= store_offset + store_bytes {
++                        slot_overwritten = true;
++                        break;
++                    }
++                    if ranges_overlap(store_offset, store_bytes, off, nb) {
++                        slot_read = true;
++                        break;
++                    }
++                }
+                 continue;
+             }
+ 
+@@ -210,6 +309,23 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
                  break;
              }
  
@@ -4043,7 +4475,7 @@ index 6651c6dc..45d8ccac 100644
              if let LineKind::LoadRbp { offset: load_off, size: load_sz, .. } = infos[j].kind {
                  if ranges_overlap(store_offset, store_bytes, load_off, load_sz.byte_size()) {
                      slot_read = true;
-@@ -305,7 +391,13 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
+@@ -305,7 +421,13 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
          // 2. Frame-pointer-less: subq $N,%rsp (without push %rbp)
          let body_start;
  
@@ -4057,7 +4489,7 @@ index 6651c6dc..45d8ccac 100644
              // Form 1: frame pointer prologue
              let mut j = next_non_nop(infos, i + 1, len);
              if j >= len {
-@@ -355,6 +447,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
+@@ -355,6 +477,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
              body_start = callee_save_end;
          } else {
              // Form 2: frame-pointer-less prologue (subq $N, %rsp)
@@ -4065,7 +4497,7 @@ index 6651c6dc..45d8ccac 100644
              let line = infos[i].trimmed(store.get(i));
              let is_subq_rsp = if let Some(rest) = line.strip_prefix("subq $") {
                  rest.strip_suffix(", %rsp").and_then(|v| v.parse::<i64>().ok()).is_some()
-@@ -433,6 +526,20 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
+@@ -433,6 +556,20 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                  continue;
              }
  
@@ -4086,7 +4518,7 @@ index 6651c6dc..45d8ccac 100644
              if infos[k].has_indirect_mem {
                  // Truly indirect memory access (e.g., (%rax) where rax is unknown).
                  // Mark the whole function as having indirect access.
-@@ -441,8 +548,21 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
+@@ -441,8 +578,21 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
              }
  
              match infos[k].kind {
@@ -4109,7 +4541,7 @@ index 6651c6dc..45d8ccac 100644
                      read_ranges.push((offset, size.byte_size()));
                  }
                  LineKind::Other { .. } => {
-@@ -491,6 +611,11 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
+@@ -491,6 +641,11 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                  continue;
              }
              if let LineKind::StoreRbp { offset, size, .. } = infos[k].kind {
@@ -4570,7 +5002,7 @@ index f5aff9ac..1d57d557 100644
                      let target = trimmed[space_pos + 1..].trim();
                      if let Some(canonical) = redirects.get(target) {
 diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-index 08304359..4452d941 100644
+index 08304359..1487dc0e 100644
 --- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
 +++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
 @@ -16,6 +16,19 @@
@@ -5047,6 +5479,148 @@ index 08304359..4452d941 100644
                  if infos[n].reg_refs & tmp_bit != 0 {
                      match infos[n].kind {
                          LineKind::Other { dest_reg } if dest_reg == tmp_fam => { tmp_dead = true; break; }
+@@ -3270,16 +3407,61 @@ pub(super) fn rotate_loops(
+ pub(super) fn eliminate_redundant_leaq(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+     let len = store.len();
+     let mut changed = false;
+-    // Track: the last leaq source that produced %rax, and its position
+-    let mut rax_leaq_src: Option<String> = None;
++    // Track: the last `leaq SRC, %rax` and the register families its source
++    // READS. A later `leaq SRC, %rax` is redundant ONLY if %rax still holds
++    // the value SRC evaluated to at the time of the first leaq, which requires:
++    //   (a) %rax was not written in between,
++    //   (b) none of the registers referenced by SRC were written in between
++    //       (their values are baked into the address), and
++    //   (c) SRC does not reference %rax itself — a leaq whose source reads
++    //       %rax modifies the base that its own source depends on, so a later
++    //       identical `leaq SRC, %rax` computes a DIFFERENT address
++    //       (e.g. `leaq 24(%rax), %rax` twice = base+24 then base+48).
++    //       Such leaqs are therefore never cached (and never eliminated).
++    // Control flow (labels, jmp, ANY conditional jump, call, ret) invalidates
++    // the cache: a jump can enter the region from anywhere, so the first leaq
++    // no longer dominates the second.
++    let mut rax_leaq_src: Option<(String, Vec<RegId>)> = None;
++
++    // Register families written by `line` (REG_NONE entries ignored).
++    // Returns an empty slice when the destination is memory or unknown.
++    fn written_families(line: &str) -> Vec<RegId> {
++        if line.starts_with("pop") {
++            // popq %r12 / pop %r12 — writes the operand register.
++            if let Some(sp) = line.find('%') {
++                return vec![register_family_fast(line[sp..].trim())];
++            }
++            return Vec::new();
++        }
++        match line {
++            "cltq" => return vec![0],
++            "cqto" | "cqo" => return vec![0, 2],
++            "cdq" => return vec![2],
++            _ => {}
++        }
++        // Generic: `... , %reg` — the trailing register is the destination.
++        if let Some(comma) = line.rfind(',') {
++            let dst = line[comma + 1..].trim();
++            if let Some(pct) = dst.find('%') {
++                let fam = register_family_fast(&dst[pct..]);
++                if fam != REG_NONE {
++                    return vec![fam];
++                }
++            }
++        }
++        Vec::new()
++    }
+ 
+     for i in 0..len {
+         if infos[i].is_nop() { continue; }
+         let line = infos[i].trimmed(store.get(i));
+ 
+-        // Block boundary resets tracking
++        // Block/control-flow boundary resets tracking: labels, unconditional
++        // jumps, ANY conditional jump (back edges, jumps into the middle),
++        // calls, returns.
+         if line.ends_with(':') || line.starts_with(".LBB") || line == "ret"
+-            || line.starts_with("jmp ") || line.starts_with("call ") {
++            || line.starts_with("jmp ") || line.starts_with("call ")
++            || (line.starts_with('j') && !line.starts_with("jmp ")) {
+             rax_leaq_src = None;
+             continue;
+         }
+@@ -3287,32 +3469,57 @@ pub(super) fn eliminate_redundant_leaq(store: &LineStore, infos: &mut [LineInfo]
+         // Check if this is `leaq X, %rax`
+         if line.starts_with("leaq ") && line.ends_with(", %rax") {
+             let src = &line[5..line.len() - 6]; // between "leaq " and ", %rax"
+-            if let Some(ref prev_src) = rax_leaq_src {
+-                if src == prev_src.as_str() {
+-                    // Redundant — rax already holds this address
++            // Collect the register families referenced by the source.
++            let mut src_fams: Vec<RegId> = Vec::new();
++            let mut rest = src;
++            while let Some(pct) = rest.find('%') {
++                let tok = &rest[pct + 1..];
++                let end = tok.find(|c: char| !c.is_ascii_alphanumeric()).unwrap_or(tok.len());
++                let reg = format!("%{}", &tok[..end]);
++                let fam = register_family_fast(&reg);
++                if fam != REG_NONE && !src_fams.contains(&fam) {
++                    src_fams.push(fam);
++                }
++                rest = &rest[pct + 1..];
++            }
++            // SOUNDNESS (c): never treat leaqs whose source reads %rax as
++            // redundant, and never cache them.
++            let src_refs_rax = src_fams.contains(&0);
++            if let Some((ref prev_src, _)) = rax_leaq_src {
++                if !src_refs_rax && src == prev_src.as_str() {
++                    // Cache is valid: no cached src register and no %rax was
++                    // written since the cached leaq (any such write cleared it).
+                     super::super::types::mark_nop(&mut infos[i]);
+                     changed = true;
+                     continue;
+                 }
+             }
+-            rax_leaq_src = Some(src.to_string());
++            if !src_refs_rax {
++                rax_leaq_src = Some((src.to_string(), src_fams));
++            } else {
++                rax_leaq_src = None;
++            }
+             continue;
+         }
+ 
+-        // Check if %rax is written (clobbered). Conservative: any instruction
+-        // that writes to rax/eax as destination invalidates the leaq cache.
+-        // Reads of rax (movq %rax, X / cmpq %rax / testq %rax) are OK.
+-        let writes_rax = line.ends_with(", %rax") || line.ends_with(", %eax")
+-            || line.starts_with("call ") || line.starts_with("xorl %eax, %eax")
+-            || line == "cltq" || line == "cqto"
+-            || line.starts_with("popq %rax")
+-            || (line.starts_with("addq ") && line.ends_with(", %rax"))
+-            || (line.starts_with("subq ") && line.ends_with(", %rax"))
+-            || (line.starts_with("imulq ") && line.ends_with(", %rax"))
+-            || (line.starts_with("andq ") && line.ends_with(", %rax"))
+-            || (line.starts_with("orq ") && line.ends_with(", %rax"))
+-            || (line.starts_with("xorq ") && line.ends_with(", %rax"));
+-        if writes_rax {
++        // Check if %rax or any cached source register is written (clobbered).
++        // Any write to %rax invalidates; any write to a register whose value
++        // is baked into the cached leaq's address invalidates as well.
++        let written = written_families(line);
++        let mut invalidate = false;
++        for fam in &written {
++            if *fam == 0 {
++                invalidate = true;
++                break;
++            }
++            if let Some((_, ref src_fams)) = rax_leaq_src {
++                if src_fams.contains(fam) {
++                    invalidate = true;
++                    break;
++                }
++            }
++        }
++        if invalidate {
+             rax_leaq_src = None;
+         }
+     }
 diff --git a/src/backend/x86/codegen/peephole/passes/memory_fold.rs b/src/backend/x86/codegen/peephole/passes/memory_fold.rs
 index 94aa0490..c79b62c6 100644
 --- a/src/backend/x86/codegen/peephole/passes/memory_fold.rs
@@ -5336,19 +5910,20 @@ index 94aa0490..c79b62c6 100644
                          let mem_op = format_stack_offset(offset, load_line);
                          let new_inst = format!("    {} {}, {}", op_suffix, mem_op, dst_str);
 diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
-index c606a103..86022fe9 100644
+index c606a103..7de0f94d 100644
 --- a/src/backend/x86/codegen/peephole/passes/mod.rs
 +++ b/src/backend/x86/codegen/peephole/passes/mod.rs
-@@ -33,6 +33,8 @@ mod memory_fold;
+@@ -33,6 +33,9 @@ mod memory_fold;
  mod frame_compact;
  mod tail_call;
  mod identical_blocks;
 +mod pushf_elim;
 +mod redundant_ext;
++mod spill_deref;
  
  // ── Constants ────────────────────────────────────────────────────────────────
  
-@@ -57,23 +59,34 @@ const MAX_POST_GLOBAL_ITERATIONS: usize = 4;
+@@ -57,23 +60,38 @@ const MAX_POST_GLOBAL_ITERATIONS: usize = 4;
  ///    the functionality of local store-load forwarding across wider windows.
  /// 3. Run local passes one more time to clean up opportunities exposed by the
  ///    global passes (max `MAX_POST_GLOBAL_ITERATIONS` iterations).
@@ -5360,6 +5935,10 @@ index c606a103..86022fe9 100644
 -    // Enable with CCC_PEEPHOLE=1 for benchmarks where it helps.
 -    // Disable explicitly with CCC_NO_PEEPHOLE=1 (overrides CCC_PEEPHOLE).
 +pub fn peephole_optimize(mut asm: String) -> String {
++    // ms178 debug: dump pre-peephole asm
++    if let Ok(path) = std::env::var("CCC_DUMP_ASM") {
++        let _ = std::fs::write(path, &asm);
++    }
 +    // Always-on, provably-safe pass: eliminate redundant pushfq/popfq pairs
 +    // (flag-neutral window). Runs before the peephole gate.
 +    let _ = pushf_elim::eliminate_redundant_pushfq(&mut asm);
@@ -5394,7 +5973,39 @@ index c606a103..86022fe9 100644
          || std::env::var("CCC_USE_MACHINST").is_ok(); // Phase 4 has a register renaming bug triggered by MachInst
      let skip_phase5 = std::env::var("CCC_NO_PEEPHOLE_PHASE5").is_ok();
      let skip_phase6 = std::env::var("CCC_NO_PEEPHOLE_PHASE6").is_ok();
-@@ -116,6 +129,17 @@ pub fn peephole_optimize(asm: String) -> String {
+@@ -83,20 +101,18 @@ pub fn peephole_optimize(asm: String) -> String {
+     let line_count = store.len();
+     let mut infos: Vec<LineInfo> = (0..line_count).map(|i| classify_line(store.get(i))).collect();
+ 
+-    // Detect if this function uses pushfq/popfq (from Select codegen).
+-    // These instructions shift RSP, which invalidates the text-based peephole's
+-    // assumptions about stack slot offsets. When pushfq is present:
+-    // - Limit Phase 1 to 1 iteration (prevent pass interaction chains)
+-    // - Skip Phase 2 (global store forwarding tracks stale offsets)
+-    // - Skip Phase 3 (cleanup after Phase 2 amplifies the problem)
+-    let has_pushfq = (0..line_count).any(|i| {
+-        let s = infos[i].trimmed(store.get(i));
+-        s == "pushfq" || s == "popfq"
+-    });
++    // ms178: pushfq/popfq are now classified as Push{REG_NONE}/Pop{REG_NONE}
++    // (see types.rs) and all passes treat Push/Pop as barriers, so they can no
++    // longer corrupt slot-offset tracking. The old global `has_pushfq` gate —
++    // which skipped Phase 2/3 for the ENTIRE file whenever ANY function used a
++    // Select (the origin of pushfq) — is removed. That gate silently disabled
++    // the whole global peephole for files like gzip's deflate.c (longest_match
++    // uses pushfq), leaving 28+ store→load→deref round-trips per hot loop
++    // unoptimized.
+     let skip_phase1 = skip_phase1;
+-    let skip_phase2 = skip_phase2 || has_pushfq;
+-    let skip_phase3 = skip_phase3 || has_pushfq;
+-    let max_phase1_iters = if has_pushfq { 1 } else { MAX_LOCAL_PASS_ITERATIONS };
++    let skip_phase2 = skip_phase2;
++    let skip_phase3 = skip_phase3;
++    let max_phase1_iters = MAX_LOCAL_PASS_ITERATIONS;
+ 
+     // Pin parameter pre-store instructions: `movq %arg_reg, %callee_saved_reg`
+     // that appear in the prologue area (before the first function call).
+@@ -116,6 +132,17 @@ pub fn peephole_optimize(asm: String) -> String {
                  in_prologue = false;
                  continue;
              }
@@ -5412,7 +6023,7 @@ index c606a103..86022fe9 100644
              // Pin movq from arg regs to callee-saved regs
              if trimmed.starts_with("movq %") {
                  let is_param_prestore = (trimmed.contains("%rdi") || trimmed.contains("%rsi")
-@@ -131,7 +155,33 @@ pub fn peephole_optimize(asm: String) -> String {
+@@ -131,7 +158,33 @@ pub fn peephole_optimize(asm: String) -> String {
          }
      }
  
@@ -5447,7 +6058,15 @@ index c606a103..86022fe9 100644
      let skip_set: std::collections::HashSet<String> = std::env::var("CCC_PEEPHOLE_SKIP")
          .unwrap_or_default()
          .split(',')
-@@ -195,7 +245,11 @@ pub fn peephole_optimize(asm: String) -> String {
+@@ -176,6 +229,7 @@ pub fn peephole_optimize(asm: String) -> String {
+     let global_changed = if skip_phase2 { false } else {
+     let mut global_changed = false;
+     if !sk("store_fwd") { global_changed |= store_forwarding::global_store_forwarding(&mut store, &mut infos); }
++    if !sk("spill_deref") { global_changed |= spill_deref::fold_spill_deref_roundtrip(&mut store, &mut infos); }
+     if !sk("copy_prop") { global_changed |= copy_propagation::propagate_register_copies(&mut store, &mut infos); }
+     if !sk("dead_regs") { global_changed |= dead_code::eliminate_dead_reg_moves(&store, &mut infos); }
+     if !sk("dead_stores") { global_changed |= dead_code::eliminate_dead_stores(&store, &mut infos); }
+@@ -195,7 +249,11 @@ pub fn peephole_optimize(asm: String) -> String {
          let mut pass_count2 = 0;
          while changed2 && pass_count2 < MAX_POST_GLOBAL_ITERATIONS {
              changed2 = false;
@@ -5460,7 +6079,7 @@ index c606a103..86022fe9 100644
              changed2 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
              changed2 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
              changed2 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
-@@ -221,10 +275,10 @@ pub fn peephole_optimize(asm: String) -> String {
+@@ -221,10 +279,10 @@ pub fn peephole_optimize(asm: String) -> String {
  
      // Phase 3b: Fuse addl+movslq in loops (must run BEFORE trampoline elimination,
      // which may remove the conditional back-edge that this pass uses to detect loops).
@@ -5473,7 +6092,7 @@ index c606a103..86022fe9 100644
          loop_trampoline::eliminate_loop_trampolines(&mut store, &mut infos)
      };
  
-@@ -256,18 +310,20 @@ pub fn peephole_optimize(asm: String) -> String {
+@@ -256,18 +314,20 @@ pub fn peephole_optimize(asm: String) -> String {
      }
  
      // Phase 4c: Late loop-invariant hoisting.
@@ -5497,7 +6116,7 @@ index c606a103..86022fe9 100644
          local_patterns::fuse_add_sign_extend(&mut store, &mut infos);
      }
  
-@@ -297,7 +353,18 @@ pub fn peephole_optimize(asm: String) -> String {
+@@ -297,7 +357,18 @@ pub fn peephole_optimize(asm: String) -> String {
          identical_blocks::merge_identical_blocks(&mut store, &mut infos);
      }
  
@@ -6131,6 +6750,287 @@ index 00000000..3fea1961
 +        let _ = cleared;
 +    }
 +}
+diff --git a/src/backend/x86/codegen/peephole/passes/spill_deref.rs b/src/backend/x86/codegen/peephole/passes/spill_deref.rs
+new file mode 100644
+index 00000000..a5366d50
+--- /dev/null
++++ b/src/backend/x86/codegen/peephole/passes/spill_deref.rs
+@@ -0,0 +1,275 @@
++//! ms178: spill-deref round-trip elimination.
++//!
++//! Targets the dominant hot-loop pattern in spill-heavy code (gzip's
++//! `longest_match`, zlib `deflate_*`):
++//!
++//! ```text
++//!     movq %rax, N(%rsp)      ; store a pointer to its spill slot
++//!     movq N(%rsp), %rX       ; reload it (rax still holds the pointer)
++//!     movzbl/movq/movl (%rX), %rY   ; dereference it
++//! ```
++//!
++//! Because the pointer is still live in %rax, the store + reload are pure
++//! waste. We rewrite the sequence to a single dereference through %rax:
++//!
++//! ```text
++//!     movzbl/movq/movl (%rax), %rY
++//! ```
++//!
++//! ## Soundness requirements (all must hold)
++//!
++//! 1. Between the store and the deref, %rax is never written (its pointer value
++//!    must be intact).
++//! 2. Between the store and the load, the slot N is not accessed by any other
++//!    instruction (no store, no load).
++//! 3. Between the load and the deref, the reloaded register %rX is not written,
++//!    and the slot N is not accessed.
++//! 4. After the deref, the slot N is not READ again before it is next WRITTEN
++//!    (otherwise deleting the store leaves garbage for that later read). If no
++//!    write to N is found before a barrier (label/jump/call/ret), we abort.
++//! 5. No barriers anywhere in the window (straight-line code only). A function
++//!    call could clobber %rax (%rY if caller-saved too — but we only rewrite
++//!    the deref's dest, which is produced by the deref itself, so dest is fine;
++//!    the concern is only the pointer in %rax and slot N contents).
++//! 6. The deref must be a plain load (movzbl/movzwl/movb/movw/movl/movq) with
++//!    the reloaded register as base and NO index/scale — we keep the rewrite
++//!    conservative. Sign-extending loads (movslq/movsbq) and float loads are
++//!    left alone.
++//! 7. The store must be a 64-bit store of %rax (pointers are 64-bit). The load
++//!    must be a 64-bit load of a GP register.
++//!
++//! This pass runs in Phase 2 (global passes), after local pattern passes. It is
++//! deliberately conservative: any doubt → skip.
++
++use super::super::types::*;
++use super::helpers::*;
++
++pub(super) fn fold_spill_deref_roundtrip(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
++    let len = store.len();
++    let mut changed = false;
++    let mut i = 0usize;
++    if std::env::var("CCC_DEBUG_SPILL_DEREF_ALWAYS").is_ok() {
++        eprintln!("[SPILL_DEREF] pass entered, lines={}", len);
++    }
++    let dbg = std::env::var("CCC_DEBUG_SPILL_DEREF").is_ok();
++    let mut dbg_stats = [0usize; 8];
++    // 0=stores seen, 1=adjacent load found, 2=intervening dirty, 3=no deref,
++    // 4=deref wrong base, 5=after unsafe, 6=fired, 7=parse fail
++
++    while i < len {
++        if infos[i].is_nop() { i += 1; continue; }
++
++        // Step 1: find `movq %rax, N(%rsp)` (StoreRbp, reg 0 = rax family, Q size).
++        if let LineKind::StoreRbp { reg: 0, offset, size: MoveSize::Q } = infos[i].kind {
++            dbg_stats[0] += 1;
++            let n = offset;
++            // Step 2: find the next non-nop line: must be `movq N(%rsp), %rX` (LoadRbp).
++            let mut j = i + 1;
++            while j < len && infos[j].is_nop() { j += 1; }
++            if j >= len { i += 1; continue; }
++            let load_reg = match infos[j].kind {
++                LineKind::LoadRbp { reg, offset: lo, size: MoveSize::Q } if lo == n && reg != REG_NONE && reg != 0 && reg <= REG_GP_MAX => reg,
++                _ => { dbg_stats[7] += 1; i += 1; continue; }
++            };
++            dbg_stats[1] += 1;
++
++            // Step 3: between store and load, nothing may touch %rax, slot N,
++            // any indirect memory (could alias slot N), or any barrier.
++            let mut clean = true;
++            for k in (i + 1)..j {
++                if infos[k].is_nop() { continue; }
++                if infos[k].kind == LineKind::Empty { continue; }
++                if is_barrier_kind(infos[k].kind) { clean = false; break; }
++                // %rax written?
++                if writes_reg(store, infos, k, 0) { clean = false; break; }
++                // slot N accessed (store or load)?
++                if accesses_slot(store, infos, k, n) { clean = false; break; }
++                // indirect memory op could alias slot N
++                if matches!(infos[k].kind, LineKind::Other { .. }) && infos[k].has_indirect_mem {
++                    clean = false; break;
++                }
++            }
++            if !clean { dbg_stats[2] += 1; i += 1; continue; }
++
++            // Step 4: next non-nop after the load must be a plain load deref
++            // through %load_reg, e.g. `movzbl (%rcx), %eax`.
++            let mut k = j + 1;
++            while k < len && infos[k].is_nop() { k += 1; }
++            if k >= len { dbg_stats[3] += 1; i += 1; continue; }
++            if is_barrier_kind(infos[k].kind) { dbg_stats[3] += 1; i += 1; continue; }
++            // Between load and deref: no write to load_reg, no write to %rax
++            // (the rewrite dereferences through %rax), no slot access, no
++            // indirect memory, no barrier.
++            for m in (j + 1)..k {
++                if infos[m].is_nop() || infos[m].kind == LineKind::Empty { continue; }
++                if is_barrier_kind(infos[m].kind) { clean = false; break; }
++                if writes_reg(store, infos, m, load_reg) { clean = false; break; }
++                if writes_reg(store, infos, m, 0) { clean = false; break; }
++                if accesses_slot(store, infos, m, n) { clean = false; break; }
++                if matches!(infos[m].kind, LineKind::Other { .. }) && infos[m].has_indirect_mem {
++                    clean = false; break;
++                }
++            }
++            if !clean { dbg_stats[2] += 1; i += 1; continue; }
++
++            let deref_line = infos[k].trimmed(store.get(k));
++            let Some((mnem, _base_reg, dest_text)) = parse_plain_deref(&deref_line, load_reg) else {
++                dbg_stats[4] += 1;
++                i += 1;
++                continue;
++            };
++            dbg_stats[3] += 1;
++
++            // Step 5: after the deref, the deleted store's slot N and the deleted
++            // load's register %load_reg must both be WRITTEN before the first
++            // barrier (label / conditional jump / call / jmp / ret), with no
++            // reads of either in between.
++            //
++            // SOUNDNESS: a CondJmp's TAKEN path (or a jump to a later label)
++            // re-enters the code after our window and could read slot N or
++            // %load_reg — both now hold deleted values. We cannot see those
++            // paths, so the only safe exit is: both are provably re-written
++            // (or the function ends) before ANY barrier. `ret` and
++            // end-of-text are safe terminal points (nothing executes after).
++            let mut n_written = false;
++            let mut lr_written = false;
++            let mut safe_after = false;
++            let mut m = k + 1;
++            while m < len {
++                if infos[m].is_nop() || infos[m].kind == LineKind::Empty { m += 1; continue; }
++                // Ret/end: nothing after executes → safe regardless of writes.
++                if infos[m].kind == LineKind::Ret { safe_after = true; break; }
++                // Any other barrier before both writes → can't see the other
++                // paths → unsafe.
++                if is_barrier_kind(infos[m].kind) { break; }
++                // Slot N read before written → unsafe.
++                if matches!(infos[m].kind, LineKind::LoadRbp { offset: lo, .. } if lo == n) { break; }
++                // Slot N written → requirement (a) satisfied.
++                if matches!(infos[m].kind, LineKind::StoreRbp { offset: so, .. } if so == n) { n_written = true; }
++                // load_reg read before written → unsafe.
++                if reads_reg(store, infos, m, load_reg) { break; }
++                // load_reg written → requirement (b) satisfied.
++                if writes_reg(store, infos, m, load_reg) { lr_written = true; }
++                // A generic instruction with indirect memory could alias slot N
++                // or read load_reg indirectly. Conservative: treat as unsafe.
++                if matches!(infos[m].kind, LineKind::Other { .. }) {
++                    let t = infos[m].trimmed(store.get(m));
++                    if t.contains("(%rsp)") { break; }
++                    if infos[m].has_indirect_mem { break; }
++                }
++                if n_written && lr_written {
++                    safe_after = true;
++                    break;
++                }
++                m += 1;
++            }
++            if !safe_after { dbg_stats[5] += 1; i += 1; continue; }
++
++            // All checks pass. Rewrite:
++            //   drop store (i), drop load (j)
++            //   deref (k): replace base %load_reg with %rax
++            let new_deref = format!("    {} ({}), {}", mnem, "%rax", dest_text);
++            mark_nop(&mut infos[i]);
++            mark_nop(&mut infos[j]);
++            replace_line(store, &mut infos[k], k, new_deref);
++            changed = true;
++            dbg_stats[6] += 1;
++            // continue scanning after the deref
++            i = k + 1;
++            continue;
++        }
++
++        i += 1;
++    }
++
++    if dbg {
++        eprintln!("[SPILL_DEREF] stores={} adj_load={} dirty_between={} no_deref={} wrong_base={} after_unsafe={} FIRED={} parse_fail={}",
++            dbg_stats[0], dbg_stats[1], dbg_stats[2], dbg_stats[3], dbg_stats[4], dbg_stats[5], dbg_stats[6], dbg_stats[7]);
++    }
++
++    changed
++}
++
++/// Is this line kind a control-flow / barrier line?
++fn is_barrier_kind(kind: LineKind) -> bool {
++    matches!(kind, LineKind::Label | LineKind::Jmp | LineKind::JmpIndirect
++        | LineKind::CondJmp | LineKind::Call | LineKind::Ret | LineKind::Directive
++        | LineKind::Push { .. } | LineKind::Pop { .. })
++}
++
++/// Does the instruction at index `idx` write the GP register family `reg`?
++fn writes_reg(store: &LineStore, infos: &[LineInfo], idx: usize, reg: u8) -> bool {
++    match infos[idx].kind {
++        LineKind::StoreRbp { .. } => false,
++        LineKind::LoadRbp { reg: r, .. } => r == reg,
++        LineKind::Pop { reg: r } => r == reg,
++        LineKind::SetCC { reg: r } => r == reg,
++        LineKind::Push { .. } | LineKind::Cmp | LineKind::Label | LineKind::Jmp
++        | LineKind::JmpIndirect | LineKind::CondJmp | LineKind::Call | LineKind::Ret
++        | LineKind::Directive | LineKind::Empty | LineKind::Nop => false,
++        LineKind::SelfMove => false,
++        LineKind::Other { dest_reg } => dest_reg == reg,
++    }
++}
++
++/// Does the instruction at index `idx` read or write stack slot `offset`?
++fn accesses_slot(store: &LineStore, infos: &[LineInfo], idx: usize, offset: i32) -> bool {
++    match infos[idx].kind {
++        LineKind::StoreRbp { offset: o, .. } | LineKind::LoadRbp { offset: o, .. } => o == offset,
++        _ => false,
++    }
++}
++
++/// Does the instruction at index `idx` read the GP register family `reg`?
++/// Conservative: a line "mentions" the register in any position and does not
++/// write it → counts as a read (a write would show up in writes_reg first).
++fn reads_reg(store: &LineStore, infos: &[LineInfo], idx: usize, reg: u8) -> bool {
++    if writes_reg(store, infos, idx, reg) {
++        return false; // pure write (or write+read) — treated as write, not read
++    }
++    // Only text lines can mention a register.
++    if infos[idx].kind == LineKind::Empty || infos[idx].kind == LineKind::Nop {
++        return false;
++    }
++    let t = infos[idx].trimmed(store.get(idx));
++    let name = reg_id_to_name(reg, MoveSize::Q);
++    t.contains(name)
++}
++
++/// Parse a plain (non-extending, non-float) load dereference:
++/// `movzbl (%rcx), %eax` / `movl (%rcx), %eax` / `movq (%rcx), %rax` …
++/// Returns (mnemonic, base_reg_family, dest_text) or None.
++/// base_reg must equal `expected_base`.
++fn parse_plain_deref(line: &str, expected_base: u8) -> Option<(&'static str, u8, String)> {
++    let t = line.trim();
++    for mnem in ["movzbl", "movzwl", "movb", "movw", "movl", "movq", "movzbq", "movzwq"] {
++        if let Some(rest) = t.strip_prefix(mnem) {
++            let rest = rest.trim_start();
++            // format: (%reg), %dest
++            if let Some(mem) = rest.strip_prefix('(') {
++                let paren_end = mem.find(')')?;
++                let base = &mem[..paren_end];
++                if base.contains('%') && !base.contains(',') && !base.contains('+') {
++                    let base_fam = register_family_fast(base);
++                    if base_fam != expected_base {
++                        return None;
++                    }
++                    let after = mem[paren_end + 1..].trim_start();
++                    let after = after.strip_prefix(',')?.trim_start();
++                    if !after.starts_with('%') {
++                        return None;
++                    }
++                    // dest must be a GP register
++                    let dest_fam = register_family_fast(after);
++                    if dest_fam == REG_NONE || dest_fam > REG_GP_MAX {
++                        return None;
++                    }
++                    // dest cannot be rsp (never emitted anyway)
++                    return Some((mnem, base_fam, after.to_string()));
++                }
++            }
++            return None;
++        }
++    }
++    None
++}
 diff --git a/src/backend/x86/codegen/peephole/passes/store_forwarding.rs b/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
 index 66382b6d..f141c78d 100644
 --- a/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
@@ -6332,10 +7232,26 @@ index e5043fac..b4304261 100644
  //!     popq %rbp
  //!     jmp TARGET       (or jmp *%r10)
 diff --git a/src/backend/x86/codegen/peephole/types.rs b/src/backend/x86/codegen/peephole/types.rs
-index 714ee052..96d35ba5 100644
+index 714ee052..0b4ac043 100644
 --- a/src/backend/x86/codegen/peephole/types.rs
 +++ b/src/backend/x86/codegen/peephole/types.rs
-@@ -195,6 +195,27 @@ pub(super) fn line_info(kind: LineKind, ts: u16) -> LineInfo {
+@@ -168,7 +168,14 @@ impl LineInfo {
+     pub(super) fn is_barrier(self) -> bool {
+         matches!(self.kind,
+             LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect |
+-            LineKind::CondJmp | LineKind::Ret | LineKind::Directive)
++            LineKind::CondJmp | LineKind::Ret | LineKind::Directive |
++            // ms178: push/pop (incl. pushfq/popfq with REG_NONE) read/write the
++            // stack and adjust %rsp. Treating them as barriers keeps every
++            // offset-tracking pass sound in their presence. The codegen keeps
++            // logical slot offsets consistent across pushfq/popfq, but the
++            // barrier only costs a little optimization locality, never
++            // correctness.
++            LineKind::Push { .. } | LineKind::Pop { .. })
+     }
+     #[inline]
+     pub(super) fn is_push(self) -> bool { matches!(self.kind, LineKind::Push { .. }) }
+@@ -195,6 +202,27 @@ pub(super) fn line_info(kind: LineKind, ts: u16) -> LineInfo {
      LineInfo { kind, ext_kind: ExtKind::None, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0, pinned: false }
  }
  
@@ -6363,7 +7279,7 @@ index 714ee052..96d35ba5 100644
  /// Helper to construct a LineInfo with default ext_kind but pre-scanned reg_refs.
  #[inline]
  pub(super) fn line_info_with_regs(kind: LineKind, ts: u16, reg_refs: u16) -> LineInfo {
-@@ -323,7 +344,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
+@@ -323,7 +351,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
          }
          // Compare: cmpX
          if sb.len() >= 5 && sb[1] == b'm' && sb[2] == b'p' {
@@ -6372,7 +7288,7 @@ index 714ee052..96d35ba5 100644
          }
          // cltq - classify as extension producer
          if s == "cltq" {
-@@ -339,12 +360,12 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
+@@ -339,12 +367,12 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
  
      // Test instructions
      if first == b't' && sb.len() >= 5 && sb[1] == b'e' && sb[2] == b's' && sb[3] == b't' {
@@ -6387,11 +7303,34 @@ index 714ee052..96d35ba5 100644
      }
  
      // Push / Pop (extract register for fast checks)
+@@ -360,6 +388,22 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
+             let rr = if reg <= REG_GP_MAX { 1u16 << reg } else { scan_register_refs(sb) };
+             return line_info_with_regs(LineKind::Pop { reg }, ts, rr);
+         }
++        // ms178: pushfq/popfq (and 32-bit pushfl/popfl) are classified with
++        // REG_NONE so they are distinguishable from real register pushes.
++        // Codegen accounts for the %rsp shift by adjusting its logical frame
++        // offsets, so the peephole's slot offsets stay consistent across them;
++        // the passes treat them as barriers (see is_barrier) to be safe.
++        // Previously they fell through to `Other`, which made every pass that
++        // tracks stack offsets unsound in their presence — forcing Phase 2/3
++        // to be skipped globally whenever ANY function used a Select (the
++        // origin of pushfq), which disabled the whole global peephole for
++        // files like gzip's deflate.c.
++        if s.starts_with("pushf") || s.starts_with("pushfl") {
++            return line_info(LineKind::Push { reg: REG_NONE }, ts);
++        }
++        if s.starts_with("popf") || s.starts_with("popfl") {
++            return line_info(LineKind::Pop { reg: REG_NONE }, ts);
++        }
+     }
+ 
+     // SetCC: extract the actual destination register (not always %al).
 diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
-index 13ecd4f6..7d4d9e13 100644
+index 13ecd4f6..eeb448cd 100644
 --- a/src/backend/x86/codegen/prologue.rs
 +++ b/src/backend/x86/codegen/prologue.rs
-@@ -2,9 +2,10 @@
+@@ -2,15 +2,22 @@
  
  use crate::ir::reexports::{IrBinOp, IrFunction, Instruction, Operand, Terminator, Value};
  use crate::common::types::IrType;
@@ -6403,7 +7342,19 @@ index 13ecd4f6..7d4d9e13 100644
  use crate::backend::regalloc::PhysReg;
  use super::emit::{X86Codegen, X86_CALLEE_SAVED, X86_CALLEE_SAVED_WITH_RBP, X86_CALLER_SAVED,
                       phys_reg_name, collect_inline_asm_callee_saved_x86, X86_ARG_REGS};
-@@ -124,38 +125,282 @@ impl X86Codegen {
+ 
+ impl X86Codegen {
+     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
++        // ms178 debug: dump IR per function
++        if std::env::var("CCC_DUMP_IR").is_ok() {
++            eprintln!("===== IR for {} =====", func.name);
++            eprintln!("{:#?}", func);
++            eprintln!("===== end IR =====");
++        }
+         // Store function pointer for indexed addressing detection
+         self.current_func = Some(func as *const IrFunction);
+ 
+@@ -124,38 +131,282 @@ impl X86Codegen {
          // value is destroyed. The fix requires per-call save/restore, not
          // promotion. See binary size investigation in project memory.
  
@@ -7252,6 +8203,34 @@ index b8f9fdc1..8be861bf 100644
                      self.optimize_size = true;
                      self.omit_frame_pointer = true;
                  }
+diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
+index cd8e05de..93e32fbb 100644
+--- a/src/driver/pipeline.rs
++++ b/src/driver/pipeline.rs
+@@ -1113,6 +1113,23 @@ impl Driver {
+         eliminate_phis(&mut module);
+         if time_phases { eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64()); }
+ 
++        // ms178: phi elimination is the LAST IR transform, so the copy-backs it
++        // introduces have never been optimized: every phi copy-back becomes a
++        // store→load→store relay in codegen (gzip's longest_match had 120 copies
++        // surviving to codegen). Clean them up with the sound post-phi pass
++        // (dead-copy elimination + same-block-after propagation through
++        // single-def values), then DCE the now-dead instructions.
++        if std::env::var("CCC_NO_PHICLEANUP").is_err() {
++            let t7b = std::time::Instant::now();
++            for func in &mut module.functions {
++                if !func.is_declaration && !func.blocks.is_empty() {
++                    crate::passes::copy_prop::propagate_copies_post_phi(func);
++                    crate::passes::dce::eliminate_dead_code(func);
++                }
++            }
++            if time_phases { eprintln!("[TIME] post-phi cleanup: {:.3}s", t7b.elapsed().as_secs_f64()); }
++        }
++
+         // CRITICAL FIX: Renumber all block labels to ensure global uniqueness across all functions
+         // This fixes a bug where optimization passes can create duplicate labels
+         {
 diff --git a/src/frontend/parser/statements.rs b/src/frontend/parser/statements.rs
 index 7bc97cba..85979bdf 100644
 --- a/src/frontend/parser/statements.rs
@@ -7718,7 +8697,7 @@ index 891f7821..c99d4aed 100644
  ## Table of Contents
  
 diff --git a/src/passes/copy_prop.rs b/src/passes/copy_prop.rs
-index d23cbadc..5f1c21ae 100644
+index d23cbadc..fc0371d5 100644
 --- a/src/passes/copy_prop.rs
 +++ b/src/passes/copy_prop.rs
 @@ -12,7 +12,7 @@
@@ -7730,6 +8709,276 @@ index d23cbadc..5f1c21ae 100644
  //! FxHashMap, since Value IDs are dense sequential u32s. This eliminates hashing
  //! overhead and gives O(1) lookups with better cache locality.
  
+@@ -369,6 +369,269 @@ fn replace_value_in_place(val: &mut Value, copy_map: &[Option<Operand>]) -> usiz
+     0
+ }
+ 
++/// ms178: Post-phi-elimination copy cleanup.
++///
++/// `eliminate_phis` runs LAST in the pipeline, so the copy-backs it introduces
++/// are never optimized: every phi copy-back becomes a store→load→store relay in
++/// the emitted asm (huge spill churn in hot loops; gzip's `longest_match` had
++/// 120 copies surviving to codegen).
++///
++/// We cannot naively run `propagate_copies` here — the IR is no longer in SSA
++/// form, and a copy dest may be used before its copy executes in a loop (that
++/// is precisely the phi semantics). Instead we apply two provably sound
++/// transforms, in a fixpoint loop:
++///
++/// 1. **Dead-copy elimination**: remove `Copy(dest, src)` when `dest` has zero
++///    uses anywhere. No use, no semantics.
++///
++/// 2. **Same-block, after-copy propagation through single-def values**: for
++///    `Copy(dest, src)` at instruction index `i` in block B, if every use of
++///    `dest` is an instruction operand in B at an index > `i` (never in a
++///    terminator, never in another block) AND `src` is single-def (defined by
++///    exactly one instruction, or a constant/parameter — hence never modified
++///    between the copy and any use), then replacing those uses with `src` is
++///    equivalent. Removes the copy.
++///
++/// The single-def requirement on `src` restores the SSA guarantee that the
++/// source's value is invariant, which is what makes the substitution sound
++/// despite the IR no longer being SSA. Loop-carried phi copy-backs (src
++/// multi-def) are conservatively kept.
++///
++/// Returns the number of copies removed.
++pub fn propagate_copies_post_phi(func: &mut IrFunction) -> usize {
++    let mut total = 0usize;
++    // Fixpoint: chains (Copy(a,b); Copy(b,c)) collapse one link per round, and
++    // dead copies cascade. Chains are short; cap at 8 rounds.
++    for _ in 0..8 {
++        let removed = one_round_post_phi(func);
++        total += removed;
++        if removed == 0 {
++            break;
++        }
++    }
++    total
++}
++
++fn one_round_post_phi(func: &mut IrFunction) -> usize {
++    let max_id = func.max_value_id() as usize;
++    let mut def_count = vec![0u32; max_id + 1];
++    let mut def_position: Vec<Option<(usize, usize)>> = vec![None; max_id + 1];
++    let mut use_count = vec![0u32; max_id + 1];
++    let mut use_positions: Vec<Vec<(usize, usize)>> = vec![Vec::new(); max_id + 1];
++    let mut copies: Vec<(usize, usize, Value, Operand)> = Vec::new(); // (bi, ii, dest, src)
++
++    // Count definitions (single-def test) and uses.
++    for (bi, block) in func.blocks.iter().enumerate() {
++        for (ii, inst) in block.instructions.iter().enumerate() {
++            match inst {
++                Instruction::Copy { dest, src } => {
++                    if (dest.0 as usize) <= max_id {
++                        def_count[dest.0 as usize] += 1;
++                        def_position[dest.0 as usize] = Some((bi, ii));
++                    }
++                    if let Operand::Value(v) = src {
++                        if (v.0 as usize) <= max_id {
++                            use_count[v.0 as usize] += 1;
++                            use_positions[v.0 as usize].push((bi, ii));
++                        }
++                    }
++                    copies.push((bi, ii, *dest, *src));
++                }
++                _ => {
++                    if let Some(d) = inst.dest() {
++                        if (d.0 as usize) <= max_id {
++                            def_count[d.0 as usize] += 1;
++                            def_position[d.0 as usize] = Some((bi, ii));
++                        }
++                    }
++                    // Operand uses (BinOp/Cmp/Call args/Cast src/GEP offset/...)
++                    crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
++                        if let Operand::Value(v) = op {
++                            if (v.0 as usize) <= max_id {
++                                use_count[v.0 as usize] += 1;
++                                use_positions[v.0 as usize].push((bi, ii));
++                            }
++                        }
++                    });
++                    // Value-only uses (Load.ptr, Store.ptr, GEP.base, Memcpy,
++                    // CallIndirect func_ptr, va_* pointers, atomic ptrs). These
++                    // are uses too — missing them made the pass think a copy
++                    // dest was dead and remove a copy that a Store/Load still
++                    // depended on (miscompiled inflate/deflate).
++                    crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
++                        if (v.0 as usize) <= max_id {
++                            use_count[v.0 as usize] += 1;
++                            use_positions[v.0 as usize].push((bi, ii));
++                        }
++                    });
++                }
++            }
++        }
++        // Terminator uses (Return value, CondBranch cond, Switch val,
++        // IndirectBranch target) — recorded at (bi, usize::MAX) so they count
++        // as "after any instruction in the block".
++        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
++            if let Operand::Value(v) = op {
++                if (v.0 as usize) <= max_id {
++                    use_count[v.0 as usize] += 1;
++                    use_positions[v.0 as usize].push((bi, usize::MAX));
++                }
++            }
++        });
++    }
++
++    // Decide which copies to remove.
++    let mut to_remove: Vec<(usize, usize, Value, Operand)> = Vec::new();
++    let mut dbg_kept = [0usize; 4]; // [other_block, use_before, src_multidef, would_change]
++    for &(bi, ii, dest, ref src) in &copies {
++        let id = dest.0 as usize;
++        let empty: &[(usize, usize)] = &[];
++        let uses: &[(usize, usize)] = if id < use_positions.len() {
++            use_positions[id].as_slice()
++        } else {
++            empty
++        };
++        // Case 1: dead copy.
++        if uses.is_empty() {
++            to_remove.push((bi, ii, dest, *src));
++            continue;
++        }
++        // ms178 debug: restrict to dead-copy-only mode when asked.
++        if std::env::var("CCC_PHICLEANUP_DEADONLY").is_ok() {
++            continue;
++        }
++        // Case 2: same-block-after AND src provably available before the copy
++        // AND dest single-def.
++        //
++        // SOUNDNESS: the IR is not SSA here. A loop-carried src may be defined
++        // AFTER the copy in program order (its def executes at the end of the
++        // previous iteration) — substituting it would read an undefined value on
++        // the first iteration. So we require src to be a constant, a parameter,
++        // or defined in the SAME block at an index BEFORE the copy. That
++        // guarantees src holds the same value at every rewritten use.
++        let src_available = match src {
++            Operand::Const(_) => true,
++            Operand::Value(v) => {
++                if (v.0 as usize) > max_id {
++                    false
++                } else {
++                    match def_position[v.0 as usize] {
++                        Some((db, di)) => db == bi && di < ii,
++                        None => false, // undefined value
++                    }
++                }
++            }
++        };
++        if !src_available {
++            dbg_kept[2] += 1;
++            continue;
++        }
++        if def_count[id] != 1 {
++            continue;
++        }
++        let mut all_after = true;
++        let mut reason = 0usize; // 0=other block, 1=use before
++        for &(ub, ui) in uses {
++            if ub != bi {
++                all_after = false;
++                reason = 0;
++                break;
++            }
++            if ui <= ii {
++                all_after = false;
++                reason = 1;
++                break;
++            }
++        }
++        if all_after {
++            to_remove.push((bi, ii, dest, *src));
++        } else {
++            dbg_kept[reason] += 1;
++        }
++    }
++    if std::env::var("CCC_DEBUG_PHICLEANUP").is_ok() {
++        eprintln!("[PHICLEANUP] fn={} copies={} removed={} kept_other_block={} kept_use_before={} kept_src_multidef={}",
++            func.name, copies.len(), to_remove.len(), dbg_kept[0], dbg_kept[1], dbg_kept[2]);
++    }
++
++    if to_remove.is_empty() {
++        return 0;
++    }
++
++    // Apply: replace same-block-after uses of removed copies with their
++    // RESOLVED source. Chained copies (d1=Copy(s1); d2=Copy(d1)) must resolve
++    // d2's source to s1 — substituting the intermediate d1 would leave a
++    // dangling reference once d1's own copy is removed.
++    let removed = to_remove.len();
++    let resolved_src: Vec<Operand> = to_remove
++        .iter()
++        .map(|&(_, _, dest, src)| {
++            let mut cur = src;
++            let mut depth = 0;
++            while depth < 32 {
++                match cur {
++                    Operand::Value(v) => {
++                        if let Some(&(_, _, d2, s2)) = to_remove.iter().find(|&&(_, _, d, _)| d == v) {
++                            cur = s2;
++                            depth += 1;
++                        } else {
++                            break;
++                        }
++                    }
++                    _ => break,
++                }
++            }
++            cur
++        })
++        .collect();
++    for (idx, (bi, ii, dest, _)) in to_remove.iter().enumerate() {
++        // Replace uses of dest in block bi at indices > ii — INCLUDING the
++        // block's terminator (a terminator use is recorded at (bi, usize::MAX),
++        // passes the "after" check, and executes after all instructions in the
++        // block; leaving it unreplaced would dangle after the copy is removed).
++        let map = copy_single_map(*dest, resolved_src[idx]);
++        let block = &mut func.blocks[*bi];
++        for inst in block.instructions.iter_mut().skip(ii + 1) {
++            replace_operands_in_instruction(inst, &map);
++        }
++        let term = &mut func.blocks[*bi].terminator;
++        replace_operands_in_terminator(term, &map);
++    }
++
++    // Remove the copies themselves (rebuild each block's instruction list,
++    // dropping the marked copy indices).
++    {
++        use std::collections::HashSet;
++        let mut per_block: Vec<HashSet<usize>> = vec![HashSet::new(); func.blocks.len()];
++        for &(bi, ii, _, _) in &to_remove {
++            if bi < per_block.len() {
++                per_block[bi].insert(ii);
++            }
++        }
++        for (bi, block) in func.blocks.iter_mut().enumerate() {
++            let to_drop = &per_block[bi];
++            let mut new_list: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
++            for (ii, inst) in block.instructions.drain(..).enumerate() {
++                if !to_drop.contains(&ii) {
++                    new_list.push(inst);
++                }
++            }
++            block.instructions = new_list;
++        }
++    }
++
++    removed
++}
++
++/// A tiny single-entry copy map used by the post-phi substitution.
++fn copy_single_map(dest: Value, src: Operand) -> Vec<Option<Operand>> {
++    let mut m = Vec::new();
++    let cap = dest.0 as usize + 1;
++    m.resize(cap, None);
++    m[dest.0 as usize] = Some(src);
++    m
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
 diff --git a/src/passes/inline.rs b/src/passes/inline.rs
 index c7da03d8..96906f33 100644
 --- a/src/passes/inline.rs
