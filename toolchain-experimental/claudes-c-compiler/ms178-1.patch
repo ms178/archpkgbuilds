@@ -2773,6 +2773,625 @@ index 84bf0dc70bc4e5763073e70633433e93a3959f12..8b1be11253d2f8270dd578230d9ffda6
          });
          func.blocks[0].source_spans.clear();
  
+diff --git a/src/backend/stack_layout/copy_coalescing.rs b/src/backend/stack_layout/copy_coalescing.rs
+index 616d9ae50e49716a11e2b5856a293f32a3f4eee7..8027689e8c944d4ae27a3865af131537c37b2991 100644
+--- a/src/backend/stack_layout/copy_coalescing.rs
++++ b/src/backend/stack_layout/copy_coalescing.rs
+@@ -8,6 +8,7 @@
+ 
+ use crate::ir::reexports::{
+     Instruction,
++    IrConst,
+     IrFunction,
+     Operand,
+     Terminator,
+@@ -20,6 +21,404 @@ use crate::backend::liveness::{
+     for_each_operand_in_terminator,
+ };
+ 
++/// Return true unless the CFG-aware coalescer is explicitly disabled for
++/// bisection.  v4 made this default after project gates, source regressions,
++/// and two differential fuzz families established that the graph proof is
++/// materially better than the v3 textual interval approximation.
++fn cfg_copy_coalesce_enabled() -> bool {
++    std::env::var("CCC_NO_CFG_COPY_COALESCE").is_err()
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum CoalesceClass {
++    /// Eight-byte scalar stack representation: integer or pointer values only.
++    Scalar,
++}
++
++fn scalar_type(ty: IrType) -> bool {
++    matches!(
++        ty,
++        IrType::I8
++            | IrType::U8
++            | IrType::I16
++            | IrType::U16
++            | IrType::I32
++            | IrType::U32
++            | IrType::I64
++            | IrType::U64
++            | IrType::Ptr
++    )
++}
++
++fn scalar_const(c: IrConst) -> bool {
++    matches!(
++        c,
++        IrConst::I8(_)
++            | IrConst::I16(_)
++            | IrConst::I32(_)
++            | IrConst::I64(_)
++            | IrConst::Zero
++    )
++}
++
++/// Classify values that have the same scalar stack representation in all
++/// relevant paths.  Floats, vectors, i128/F128, allocas, and opaque results
++/// are intentionally excluded: a missed coalescing opportunity is harmless,
++/// whereas widening a slot-sharing rule beyond codegen's exact ABI paths is not.
++fn collect_scalar_values(func: &IrFunction) -> FxHashMap<u32, CoalesceClass> {
++    let mut classes: FxHashMap<u32, CoalesceClass> = FxHashMap::default();
++    let mut allocas: FxHashSet<u32> = FxHashSet::default();
++
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Instruction::Alloca { dest, .. } = inst {
++                allocas.insert(dest.0);
++            }
++            let class = match inst {
++                Instruction::BinOp { dest, ty, .. }
++                | Instruction::UnaryOp { dest, ty, .. }
++                | Instruction::Cast { dest, to_ty: ty, .. }
++                | Instruction::Load { dest, ty, .. }
++                | Instruction::Select { dest, ty, .. }
++                | Instruction::AtomicLoad { dest, ty, .. }
++                | Instruction::AtomicRmw { dest, ty, .. }
++                | Instruction::AtomicCmpxchg { dest, ty, .. }
++                | Instruction::ParamRef { dest, ty, .. } if scalar_type(*ty) => Some(dest.0),
++                Instruction::Cmp { dest, .. }
++                | Instruction::GetElementPtr { dest, .. }
++                | Instruction::GlobalAddr { dest, .. }
++                | Instruction::LabelAddr { dest, .. } => Some(dest.0),
++                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. }
++                    if info.dest.is_some() && scalar_type(info.return_type) => info.dest.map(|v| v.0),
++                _ => None,
++            };
++            if let Some(id) = class {
++                classes.insert(id, CoalesceClass::Scalar);
++            }
++        }
++    }
++
++    // Copy and phi-lowering chains have no type field. Propagate the scalar
++    // classification to a fixed point through values and scalar constants.
++    let mut changed = true;
++    while changed {
++        changed = false;
++        for block in &func.blocks {
++            for inst in &block.instructions {
++                if let Instruction::Copy { dest, src } = inst {
++                    if allocas.contains(&dest.0) || classes.contains_key(&dest.0) {
++                        continue;
++                    }
++                    let source_is_scalar = match src {
++                        Operand::Value(v) => classes.contains_key(&v.0),
++                        Operand::Const(c) => scalar_const(*c),
++                    };
++                    if source_is_scalar {
++                        classes.insert(dest.0, CoalesceClass::Scalar);
++                        changed = true;
++                    }
++                }
++            }
++        }
++    }
++
++    for id in allocas {
++        classes.remove(&id);
++    }
++    classes
++}
++
++fn instruction_value_uses(inst: &Instruction) -> Vec<u32> {
++    let mut uses = Vec::new();
++    for_each_operand_in_instruction(inst, |op| {
++        if let Operand::Value(v) = op {
++            uses.push(v.0);
++        }
++    });
++    for_each_value_use_in_instruction(inst, |v| uses.push(v.0));
++    uses.sort_unstable();
++    uses.dedup();
++    uses
++}
++
++fn terminator_value_uses(term: &Terminator) -> Vec<u32> {
++    let mut uses = Vec::new();
++    for_each_operand_in_terminator(term, |op| {
++        if let Operand::Value(v) = op {
++            uses.push(v.0);
++        }
++    });
++    uses.sort_unstable();
++    uses.dedup();
++    uses
++}
++
++fn insert_interference(
++    graph: &mut FxHashMap<u32, FxHashSet<u32>>,
++    lhs: u32,
++    rhs: u32,
++) {
++    if lhs == rhs {
++        return;
++    }
++    graph.entry(lhs).or_default().insert(rhs);
++    graph.entry(rhs).or_default().insert(lhs);
++}
++
++/// Build an SSA-style, CFG-aware interference graph after phi lowering.
++///
++/// Unlike the former textual interval heuristic, this solves backward liveness
++/// over actual successor edges and then uses copy-aware interference insertion:
++/// for `d = copy s`, `d` interferes with every value live after the copy except
++/// `s` itself.  This is the standard move-coalescing rule: source and
++/// destination may share a location at the handoff, but any other reaching
++/// definition/path that keeps them simultaneously live creates an edge and
++/// blocks the merge.
++fn cfg_copy_interference(
++    func: &IrFunction,
++    tracked: &FxHashSet<u32>,
++) -> Option<FxHashMap<u32, FxHashSet<u32>>> {
++    use crate::ir::analysis;
++
++    let label_map = analysis::build_label_map(func);
++    let (_preds, succs) = analysis::build_cfg(func, &label_map);
++    let succs: Vec<Vec<usize>> = (0..func.blocks.len())
++        .map(|idx| succs.row(idx).iter().map(|&v| v as usize).collect())
++        .collect();
++
++    let mut block_use: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
++    let mut block_def: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
++    for (block_idx, block) in func.blocks.iter().enumerate() {
++        for inst in &block.instructions {
++            for value in instruction_value_uses(inst) {
++                if tracked.contains(&value) && !block_def[block_idx].contains(&value) {
++                    block_use[block_idx].insert(value);
++                }
++            }
++            if let Some(dest) = inst.dest() {
++                if tracked.contains(&dest.0) {
++                    block_def[block_idx].insert(dest.0);
++                }
++            }
++        }
++        for value in terminator_value_uses(&block.terminator) {
++            if tracked.contains(&value) && !block_def[block_idx].contains(&value) {
++                block_use[block_idx].insert(value);
++            }
++        }
++    }
++
++    let mut live_in: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
++    let mut live_out: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
++    let mut changed = true;
++    let mut iterations = 0usize;
++    // A conservative cap guards malformed irreducible CFGs. Failure to
++    // converge merely under-optimizes because callers reject the empty graph.
++    while changed && iterations < 256 {
++        changed = false;
++        iterations += 1;
++        for block_idx in (0..func.blocks.len()).rev() {
++            let mut out = FxHashSet::default();
++            for &succ in &succs[block_idx] {
++                out.extend(live_in[succ].iter().copied());
++            }
++            let mut input = block_use[block_idx].clone();
++            for value in &out {
++                if !block_def[block_idx].contains(value) {
++                    input.insert(*value);
++                }
++            }
++            if out != live_out[block_idx] {
++                live_out[block_idx] = out;
++                changed = true;
++            }
++            if input != live_in[block_idx] {
++                live_in[block_idx] = input;
++                changed = true;
++            }
++        }
++    }
++    if changed {
++        // Do not use partially converged dataflow for a correctness proof.
++        return None;
++    }
++
++    let mut graph: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
++    for (block_idx, block) in func.blocks.iter().enumerate() {
++        let mut live = live_out[block_idx].clone();
++        for value in terminator_value_uses(&block.terminator) {
++            if tracked.contains(&value) {
++                live.insert(value);
++            }
++        }
++        for inst in block.instructions.iter().rev() {
++            let copy_source = match inst {
++                Instruction::Copy { src: Operand::Value(source), .. } => Some(source.0),
++                _ => None,
++            };
++            if let Some(dest) = inst.dest() {
++                if tracked.contains(&dest.0) {
++                    for &other in &live {
++                        if copy_source != Some(other) {
++                            insert_interference(&mut graph, dest.0, other);
++                        }
++                    }
++                    live.remove(&dest.0);
++                }
++            }
++            for value in instruction_value_uses(inst) {
++                if tracked.contains(&value) {
++                    live.insert(value);
++                }
++            }
++        }
++    }
++    Some(graph)
++}
++
++fn find_root(parent: &mut FxHashMap<u32, u32>, value: u32) -> u32 {
++    let mut root = value;
++    while parent.get(&root).copied() != Some(root) {
++        root = parent.get(&root).copied().unwrap_or(root);
++    }
++    let mut cursor = value;
++    while parent.get(&cursor).copied().is_some_and(|p| p != root) {
++        let next = parent[&cursor];
++        parent.insert(cursor, root);
++        cursor = next;
++    }
++    root
++}
++
++fn class_members(parent: &mut FxHashMap<u32, u32>, root: u32) -> Vec<u32> {
++    let values: Vec<u32> = parent.keys().copied().collect();
++    values.into_iter()
++        .filter(|value| find_root(parent, *value) == root)
++        .collect()
++}
++
++fn classes_interfere(
++    parent: &mut FxHashMap<u32, u32>,
++    interference: &FxHashMap<u32, FxHashSet<u32>>,
++    lhs_root: u32,
++    rhs_root: u32,
++) -> bool {
++    let lhs = class_members(parent, lhs_root);
++    let rhs = class_members(parent, rhs_root);
++    lhs.iter().any(|value| {
++        interference.get(value).is_some_and(|neighbors| {
++            rhs.iter().any(|other| neighbors.contains(other))
++        })
++    })
++}
++
++/// CFG-aware stack-copy coalescing.
++///
++/// This replaces only the stack-slot alias decision.  It does not change phi
++/// lowering order, register allocation, or emitted copy semantics; it merely
++/// lets provably non-interfering scalar copy webs use one stack home.  Every
++/// alias is marked forceable because the proof is graph-based rather than the
++/// old linear `def <= last_use` approximation.
++fn build_cfg_copy_alias_map(
++    func: &IrFunction,
++    multi_def_values: &FxHashSet<u32>,
++    reg_assigned: &FxHashMap<u32, PhysReg>,
++) -> (FxHashMap<u32, u32>, FxHashSet<u32>) {
++    let classes = collect_scalar_values(func);
++    let mut candidates: Vec<(u32, u32)> = Vec::new();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Instruction::Copy { dest, src: Operand::Value(source) } = inst {
++                if dest.0 == source.0
++                    || reg_assigned.contains_key(&dest.0)
++                    || reg_assigned.contains_key(&source.0)
++                    || !classes.contains_key(&dest.0)
++                    || !classes.contains_key(&source.0)
++                {
++                    continue;
++                }
++                candidates.push((dest.0, source.0));
++            }
++        }
++    }
++    candidates.sort_unstable();
++    candidates.dedup();
++    if candidates.is_empty() {
++        return (FxHashMap::default(), FxHashSet::default());
++    }
++
++    let tracked: FxHashSet<u32> = candidates
++        .iter()
++        .flat_map(|(dest, source)| [*dest, *source])
++        .collect();
++    let Some(interference) = cfg_copy_interference(func, &tracked) else {
++        // A non-converged dataflow result is never used as an optimization proof.
++        return (FxHashMap::default(), FxHashSet::default());
++    };
++
++    let mut parent: FxHashMap<u32, u32> = tracked.iter().map(|&id| (id, id)).collect();
++    for (dest, source) in candidates {
++        let dest_root = find_root(&mut parent, dest);
++        let source_root = find_root(&mut parent, source);
++        if dest_root == source_root
++            || classes_interfere(&mut parent, &interference, dest_root, source_root)
++        {
++            continue;
++        }
++        // Keep a multi-def phi destination as the group owner. It has the
++        // cross-block lifetime that phi incoming values must feed. Otherwise
++        // use the lower ID to make the output deterministic.
++        let owner = match (
++            multi_def_values.contains(&dest_root),
++            multi_def_values.contains(&source_root),
++        ) {
++            (true, false) => dest_root,
++            (false, true) => source_root,
++            _ => dest_root.min(source_root),
++        };
++        let other = if owner == dest_root { source_root } else { dest_root };
++        parent.insert(other, owner);
++    }
++
++    let mut groups: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
++    for &value in &tracked {
++        let root = find_root(&mut parent, value);
++        groups.entry(root).or_default().push(value);
++    }
++
++    let mut aliases = FxHashMap::default();
++    let mut force_aliases = FxHashSet::default();
++    for (root, mut members) in groups {
++        members.sort_unstable();
++        if members.len() < 2 {
++            continue;
++        }
++        let preferred_root = members.iter().copied()
++            .filter(|id| multi_def_values.contains(id))
++            .min()
++            .unwrap_or(root);
++        for member in members {
++            if member != preferred_root {
++                aliases.insert(member, preferred_root);
++                force_aliases.insert(member);
++            }
++        }
++    }
++
++    if std::env::var("CCC_DEBUG_SLOT_COALESCE").is_ok() && !aliases.is_empty() {
++        let mut pairs: Vec<(u32, u32)> = aliases.iter().map(|(&a, &b)| (a, b)).collect();
++        pairs.sort_unstable();
++        eprintln!(
++            "[CFG-SLOT-COALESCE] fn={} candidates={} aliases={} pairs={:?}",
++            func.name,
++            tracked.len(),
++            pairs.len(),
++            pairs,
++        );
++    }
++    (aliases, force_aliases)
++}
++
+ /// Build the copy alias map: dest_id -> root_id for Copy instructions where
+ /// dest and src can share the same stack slot.
+ ///
+@@ -36,6 +435,10 @@ pub(super) fn build_copy_alias_map(
+     use_blocks_map: &FxHashMap<u32, Vec<usize>>,
+     cached_liveness: &Option<crate::backend::liveness::LivenessResult>,
+ ) -> (FxHashMap<u32, u32>, FxHashSet<u32>) {
++    if cfg_copy_coalesce_enabled() {
++        return build_cfg_copy_alias_map(func, multi_def_values, reg_assigned);
++    }
++
+     // Count uses of each value across all instructions.
+     let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+     for block in &func.blocks {
+@@ -379,6 +782,20 @@ pub(super) fn build_copy_alias_map(
+         copy_alias.retain(|dest_id, _| !asm_output_ptrs.contains(dest_id));
+     }
+ 
++    if std::env::var("CCC_DEBUG_SLOT_COALESCE").is_ok() && !copy_alias.is_empty() {
++        let mut aliases: Vec<(u32, u32)> = copy_alias.iter()
++            .map(|(&dest, &root)| (dest, root))
++            .collect();
++        aliases.sort_unstable();
++        eprintln!(
++            "[SLOT-COALESCE] fn={} aliases={} phi_web_aliases={} pairs={:?}",
++            func.name,
++            aliases.len(),
++            phi_web_aliases.len(),
++            aliases,
++        );
++    }
++
+     (copy_alias, phi_web_aliases)
+ }
+ 
+@@ -557,3 +974,169 @@ fn is_sole_operand_of_terminator(term: &Terminator, value_id: u32) -> bool {
+         _ => false,
+     }
+ }
++
++#[cfg(test)]
++mod cfg_copy_coalesce_tests {
++    use super::*;
++    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, Value};
++
++    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
++        BasicBlock {
++            label: BlockId(label),
++            instructions,
++            source_spans: Vec::new(),
++            terminator,
++        }
++    }
++
++    fn scalar_def(dest: u32, value: i32) -> Instruction {
++        Instruction::BinOp {
++            dest: Value(dest),
++            op: IrBinOp::Add,
++            lhs: Operand::Const(IrConst::I32(value)),
++            rhs: Operand::Const(IrConst::I32(0)),
++            ty: IrType::I32,
++        }
++    }
++
++    #[test]
++    fn cfg_copy_coalesces_a_straight_line_copy() {
++        let mut func = IrFunction::new("straight".to_string(), IrType::I32, vec![], false);
++        func.blocks.push(block(
++            0,
++            vec![
++                scalar_def(0, 7),
++                Instruction::Copy { dest: Value(1), src: Operand::Value(Value(0)) },
++            ],
++            Terminator::Return(Some(Operand::Value(Value(1)))),
++        ));
++        let (aliases, force) = build_cfg_copy_alias_map(
++            &func,
++            &FxHashSet::default(),
++            &FxHashMap::default(),
++        );
++        assert_eq!(aliases.get(&1), Some(&0));
++        assert!(force.contains(&1));
++    }
++
++    #[test]
++    fn cfg_copy_rejects_a_phi_edge_source_live_on_another_path() {
++        // d is a lowered phi: d = x on the left edge, d = y on the right.
++        // x is also used after the join, so x and d must never share a slot.
++        let mut func = IrFunction::new("diamond".to_string(), IrType::I32, vec![], false);
++        func.blocks = vec![
++            block(
++                0,
++                vec![scalar_def(0, 11)],
++                Terminator::CondBranch {
++                    cond: Operand::Const(IrConst::I32(1)),
++                    true_label: BlockId(1),
++                    false_label: BlockId(2),
++                },
++            ),
++            block(
++                1,
++                vec![Instruction::Copy { dest: Value(2), src: Operand::Value(Value(0)) }],
++                Terminator::Branch(BlockId(3)),
++            ),
++            block(
++                2,
++                vec![
++                    scalar_def(1, 22),
++                    Instruction::Copy { dest: Value(2), src: Operand::Value(Value(1)) },
++                ],
++                Terminator::Branch(BlockId(3)),
++            ),
++            block(
++                3,
++                vec![Instruction::BinOp {
++                    dest: Value(3),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(0)),
++                    rhs: Operand::Value(Value(2)),
++                    ty: IrType::I32,
++                }],
++                Terminator::Return(Some(Operand::Value(Value(3)))),
++            ),
++        ];
++        let mut multi_def = FxHashSet::default();
++        multi_def.insert(2);
++        let (aliases, _) = build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default());
++        assert_ne!(aliases.get(&0), Some(&2));
++        assert_ne!(aliases.get(&2), Some(&0));
++        // y is edge-local and may safely use the phi web's home.
++        assert_eq!(aliases.get(&1), Some(&2));
++    }
++
++    #[test]
++    fn cfg_copy_coalesces_loop_carried_phi_sources() {
++        // Lowered loop phi: state is initialized from `init` on entry and
++        // from `next` on the back-edge. Neither incoming value is used after
++        // its edge copy, so both may share the phi web's stack home.
++        let mut func = IrFunction::new("loop_phi".to_string(), IrType::I32, vec![], false);
++        func.blocks = vec![
++            block(
++                0,
++                vec![
++                    scalar_def(0, 3),
++                    Instruction::Copy { dest: Value(2), src: Operand::Value(Value(0)) },
++                ],
++                Terminator::Branch(BlockId(1)),
++            ),
++            block(
++                1,
++                vec![Instruction::BinOp {
++                    dest: Value(1),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(2)),
++                    rhs: Operand::Const(IrConst::I32(1)),
++                    ty: IrType::I32,
++                }],
++                Terminator::CondBranch {
++                    cond: Operand::Const(IrConst::I32(1)),
++                    true_label: BlockId(2),
++                    false_label: BlockId(3),
++                },
++            ),
++            block(
++                2,
++                vec![Instruction::Copy { dest: Value(2), src: Operand::Value(Value(1)) }],
++                Terminator::Branch(BlockId(1)),
++            ),
++            block(3, vec![], Terminator::Return(Some(Operand::Value(Value(2))))),
++        ];
++        let mut multi_def = FxHashSet::default();
++        multi_def.insert(2);
++        let (aliases, _) = build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default());
++        assert_eq!(aliases.get(&0), Some(&2));
++        // `next` is redefined at the loop header on the next iteration, so
++        // the CFG liveness proof conservatively keeps it distinct from the
++        // phi web instead of relying on textual interval order.
++        assert_ne!(aliases.get(&1), Some(&2));
++    }
++
++    #[test]
++    fn cfg_copy_excludes_i128_from_scalar_slot_aliasing() {
++        let mut func = IrFunction::new("wide".to_string(), IrType::I32, vec![], false);
++        func.blocks.push(block(
++            0,
++            vec![
++                Instruction::BinOp {
++                    dest: Value(0),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Const(IrConst::I128(1)),
++                    rhs: Operand::Const(IrConst::I128(2)),
++                    ty: IrType::I128,
++                },
++                Instruction::Copy { dest: Value(1), src: Operand::Value(Value(0)) },
++            ],
++            Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
++        ));
++        let (aliases, _) = build_cfg_copy_alias_map(
++            &func,
++            &FxHashSet::default(),
++            &FxHashMap::default(),
++        );
++        assert!(aliases.is_empty());
++    }
++}
 diff --git a/src/backend/stack_layout/mod.rs b/src/backend/stack_layout/mod.rs
 index 2539e4c7e118abbbfa5fde11383215b0a5bace66..7e55717d39b7743248c59459a4112a4e34e56ddf 100644
 --- a/src/backend/stack_layout/mod.rs
@@ -2792,7 +3411,7 @@ index 2539e4c7e118abbbfa5fde11383215b0a5bace66..7e55717d39b7743248c59459a4112a4e
      slot_assignment::assign_tier2_liveness_packed_slots(
          state, coalesce, cached_liveness, func,
 diff --git a/src/backend/stack_layout/slot_assignment.rs b/src/backend/stack_layout/slot_assignment.rs
-index 317d3c099f9b360ded75d4088f4c42fc3be7b465..6230d9314e0b6141c24c78d1e64d8fa39d51f3b2 100644
+index 317d3c099f9b360ded75d4088f4c42fc3be7b465..df07d4250627aff11449a016772806bcd677f74d 100644
 --- a/src/backend/stack_layout/slot_assignment.rs
 +++ b/src/backend/stack_layout/slot_assignment.rs
 @@ -204,7 +204,10 @@ pub(super) fn classify_instructions(
@@ -2807,6 +3426,66 @@ index 317d3c099f9b360ded75d4088f4c42fc3be7b465..6230d9314e0b6141c24c78d1e64d8fa3
                  classify_alloca(
                      state, dest, *size, *ty, *align, ctx,
                      assign_slot, non_local_space, deferred_slots,
+@@ -929,6 +932,10 @@ pub(super) fn resolve_copy_aliases(
+     phi_web_aliases: &FxHashSet<u32>,
+     func: &crate::ir::reexports::IrFunction,
+ ) {
++    let debug_slot_coalesce = std::env::var("CCC_DEBUG_SLOT_COALESCE").is_ok();
++    let mut resolved_count = 0usize;
++    let mut blocked_overlap_count = 0usize;
++    let mut blocked_missing_root_count = 0usize;
+     // Build liveness intervals for interference checking.
+     // We use a lightweight approach: compute def-point and last-use-point for
+     // each value by scanning all instructions. Two values interfere if their
+@@ -977,15 +984,25 @@ pub(super) fn resolve_copy_aliases(
+             continue;
+         }
+ 
+-        // Liveness-based interference check for copy alias coalescing.
++        // The CFG-aware coalescer has already proven that every member of this
++        // alias class is non-interfering on real CFG edges. Its members must
++        // therefore override their fallback slots. The legacy heuristic retains
++        // its old linear interval guard when explicitly selected for bisection.
++        let cfg_proven = std::env::var("CCC_NO_CFG_COPY_COALESCE").is_err()
++            && phi_web_aliases.contains(&dest_id);
+         if let Some(&slot) = state.value_locations.get(&root_id) {
+-            let dest_def = def_point.get(&dest_id).copied().unwrap_or(u32::MAX);
+-            let root_last = last_use.get(&root_id).copied().unwrap_or(0);
+-            if dest_def <= root_last {
+-                continue; // Root still live when dest is defined
++            if !cfg_proven {
++                let dest_def = def_point.get(&dest_id).copied().unwrap_or(u32::MAX);
++                let root_last = last_use.get(&root_id).copied().unwrap_or(0);
++                if dest_def <= root_last {
++                    blocked_overlap_count += 1;
++                    continue; // Root still live when dest is defined
++                }
+             }
+             state.value_locations.insert(dest_id, slot);
++            resolved_count += 1;
+         } else {
++            blocked_missing_root_count += 1;
+             continue;
+         }
+         // Propagate small-slot property
+@@ -1000,6 +1017,17 @@ pub(super) fn resolve_copy_aliases(
+             state.alloca_alignments.insert(dest_id, align);
+         }
+     }
++
++    if debug_slot_coalesce && !copy_alias.is_empty() {
++        eprintln!(
++            "[SLOT-COALESCE] resolve fn={} requested={} resolved={} blocked_overlap={} blocked_missing_root={}",
++            func.name,
++            copy_alias.len(),
++            resolved_count,
++            blocked_overlap_count,
++            blocked_missing_root_count,
++        );
++    }
+ }
+ 
+ /// On 32-bit targets, propagate wide-value status through Copy chains.
 diff --git a/src/backend/state.rs b/src/backend/state.rs
 index 38b4f2ddc36f49d6ca50ac198e53ac6f25d0528e..0d9645d490eb2a1c0b691d110f9d2f7d3f7d38de 100644
 --- a/src/backend/state.rs
@@ -4509,6 +5188,81 @@ index 96825a65c46566a4f389f0621741879a5ec101f7..6c68aaccd4e7919cb79931938a44989a
          emit_machinst(inst, out);
      }
  }
+diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
+index d47acb7b97685b1ddd8ab7f3ee69e2066ea5de76..fe5f35c3932c34d466b352de9574e1d641396018 100644
+--- a/src/backend/x86/codegen/memory.rs
++++ b/src/backend/x86/codegen/memory.rs
+@@ -581,8 +581,7 @@ impl X86Codegen {
+                 if !is_xmm_reg(p_reg) && !self.state.is_alloca(ptr.0) {
+                     let load_instr = self.mov_load_for_value(ty, dest.0);
+                     let p_name = phys_reg_name(p_reg);
+-                    let use_32bit_dest = matches!(ty, IrType::U32 | IrType::F32)
+-                        || (ty == IrType::I32 && load_instr == "movl");
++                    let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
+ 
+                     // Check if dest has a register — load directly to it.
+                     if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
+@@ -607,6 +606,40 @@ impl X86Codegen {
+             }
+         }
+ 
++        // Accumulator-address load: a preceding GEP/Add often leaves the
++        // pointer in %rax and records it in the accumulator cache.  The legacy
++        // fallback immediately reloaded that same pointer into %rcx before the
++        // dereference, producing `lea/add -> mov %rax,%rcx -> load (%rcx)` in
++        // hot scalar loops.  x86 evaluates a memory address before writing the
++        // load destination, so `movX (%rax),%eax/%rax` is equivalent and avoids
++        // the relay.  This path is restricted to a verified cache hit and
++        // scalar integer/pointer loads; float and wide paths retain their
++        // dedicated ABI handling below.
++        if !ty.is_float()
++            && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128)
++            && !self.state.is_alloca(ptr.0)
++            && self.state.reg_cache.acc_has(ptr.0, false)
++        {
++            let load_instr = self.mov_load_for_value(ty, dest.0);
++            let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
++            if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
++                if !is_xmm_reg(d_reg) {
++                    let d_name = if use_32bit_dest {
++                        phys_reg_name_32(d_reg)
++                    } else {
++                        phys_reg_name(d_reg)
++                    };
++                    self.state.emit_fmt(format_args!("    {} (%rax), %{}", load_instr, d_name));
++                    return;
++                }
++            }
++            let dest_reg = if use_32bit_dest { "%eax" } else { "%rax" };
++            self.state.emit_fmt(format_args!("    {} (%rax), {}", load_instr, dest_reg));
++            self.state.reg_cache.set_acc(dest.0, false);
++            self.store_rax_to(dest);
++            return;
++        }
++
+         // Register-direct load from alloca: when ptr is a stack-allocated local
+         // variable and dest has a register, load directly to the register.
+         // This bypasses the accumulator, saving one movq instruction.
+@@ -615,12 +648,13 @@ impl X86Codegen {
+                 if !is_xmm_reg(d_reg) && self.state.is_alloca(ptr.0) {
+                     if let Some(slot) = self.state.get_slot(ptr.0) {
+                         let load_instr = Self::mov_load_for_type(ty);
+-                        // Match the dest register width to the load instruction:
+-                        // movl → 32-bit dest (implicit zero-extend)
+-                        // movslq/movsbq/movswq/movzbq/movzwq/movq → 64-bit dest
+-                        let d_name = match ty {
+-                            IrType::U32 | IrType::F32 => phys_reg_name_32(d_reg),
+-                            _ => phys_reg_name(d_reg),
++                        // Match the destination width to the selected opcode.
++                        // movzbl/movzwl and movl write a 32-bit register; the
++                        // sign-extending forms and movq write a 64-bit register.
++                        let d_name = if matches!(load_instr, "movl" | "movzbl" | "movzwl") {
++                            phys_reg_name_32(d_reg)
++                        } else {
++                            phys_reg_name(d_reg)
+                         };
+                         let sr = self.slot_ref(slot.0);
+                         self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, d_name));
 diff --git a/src/backend/x86/codegen/peephole/passes/copy_propagation.rs b/src/backend/x86/codegen/peephole/passes/copy_propagation.rs
 index de1c2f09d69542d90fa95b55f9586f981cc43665..824ed49669372ec519d988a6b47c2f64a3d2f858 100644
 --- a/src/backend/x86/codegen/peephole/passes/copy_propagation.rs
@@ -10634,10 +11388,10 @@ index 0ce5efb8778e62e12cfd4b3a2c40e19c1cd2de65..276822265044afed8df2478fd781948b
  #include <setjmp.h>
 diff --git a/tests/fuzz/README.md b/tests/fuzz/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..4a93656aa18625e21f4f1d5f1c192c91f9b1cd9a
+index 0000000000000000000000000000000000000000..9dba47a0642630f9e4cf57e42ff283173e7bc8a7
 --- /dev/null
 +++ b/tests/fuzz/README.md
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,32 @@
 +# Differential fuzzing
 +
 +`differential_fuzz.py` emits deterministic, defined-behavior GNU C translation
@@ -10658,6 +11412,18 @@ index 0000000000000000000000000000000000000000..4a93656aa18625e21f4f1d5f1c192c91
 +The generator avoids signed overflow, invalid shifts, division by zero,
 +out-of-bounds accesses, invalid pointers, and unspecified argument evaluation
 +order.  A failure retains its source under `--out` for reduction.
++
++## CFG / phi-web stress
++
++`phi_cfg_fuzz.py` specifically creates loop-carried values, branch diamonds,
++switch joins, `continue` paths, and postfix increment/decrement operations to
++exercise CFG-aware copy coalescing. For example:
++
++```bash
++python3 tests/fuzz/phi_cfg_fuzz.py \
++  --ccc ./target/release/lccc --gcc gcc \
++  --seeds 0:1000 --levels O3,Os --jobs 2 --out /tmp/lccc-phi-fuzz
++```
 diff --git a/tests/fuzz/differential_fuzz.py b/tests/fuzz/differential_fuzz.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..ba676d69e59eb1a9fa5739cbe5c04e6b7b217218
@@ -10891,6 +11657,157 @@ index 0000000000000000000000000000000000000000..ba676d69e59eb1a9fa5739cbe5c04e6b
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
+diff --git a/tests/fuzz/phi_cfg_fuzz.py b/tests/fuzz/phi_cfg_fuzz.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8457fe8c8f18246cf82b62af84c2bab4a4eb51ca
+--- /dev/null
++++ b/tests/fuzz/phi_cfg_fuzz.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python3
++"""CFG/phi-web differential fuzzer for LCCC.
++
++Generates defined-behavior C programs whose branch diamonds, switch joins,
++loop-carried state, continue/break paths, and postfix decrement expressions
++exercise phi lowering and copy coalescing.  Compare complete stdout and exit
++status against a reference compiler.
++"""
++from __future__ import annotations
++import argparse, concurrent.futures, json, random, subprocess
++from pathlib import Path
++
++MASK=(1<<64)-1
++
++def u64(x): return f"UINT64_C(0x{x & MASK:016x})"
++
++def gen(seed: int) -> str:
++    r=random.Random(seed)
++    n=r.randint(3,24)
++    rounds=r.randint(3,10)
++    lines=[
++        '#include <stdint.h>', '#include <stdio.h>', '#include <inttypes.h>',
++        'static volatile uint64_t observe;',
++        'static uint64_t rot(uint64_t x, unsigned n) { n &= 63u; return n ? ((x << n) | (x >> ((64u-n)&63u))) : x; }',
++        'static uint64_t mix(uint64_t a, uint64_t b, unsigned n) { a ^= rot(b + UINT64_C(0x9e3779b97f4a7c15), n); a *= UINT64_C(0xbf58476d1ce4e5b9); return a ^ (a >> 31); }',
++        'static uint64_t kernel(uint64_t seed, unsigned limit) {',
++        f'  uint64_t a={u64(r.getrandbits(64))} ^ seed;',
++        f'  uint64_t b={u64(r.getrandbits(64))} + seed;',
++        f'  uint64_t c={u64(r.getrandbits(64))};',
++        '  uint64_t table[8];',
++        '  for (unsigned z=0; z<8; ++z) table[z] = mix(a+z,b^z,z);',
++        '  for (unsigned i=0; i<limit; ++i) {',
++        '    switch ((unsigned)((a ^ b ^ c ^ i) & 7u)) {',
++    ]
++    for k in range(8):
++        x=r.getrandbits(64); y=r.getrandbits(64)
++        if k % 4 == 0:
++            body=f'a = mix(a ^ {u64(x)}, b + c, i); b ^= rot(c + {u64(y)}, i);'
++        elif k % 4 == 1:
++            body=f'c = mix(c + {u64(x)}, a ^ b, i+1u); a += rot(b ^ {u64(y)}, i);'
++        elif k % 4 == 2:
++            body=f'b = mix(b + {u64(x)}, c, i+2u); c ^= rot(a + {u64(y)}, i);'
++        else:
++            body=f'a ^= mix(b, {u64(x)}, i); c += mix(a, {u64(y)}, i+3u);'
++        lines += [f'      case {k}: {{ {body} break; }}']
++    lines += [
++        '    }',
++        '    if ((a + i) & 1u) {',
++        '      uint64_t old = b++;',
++        '      a ^= mix(old, c, i);',
++        '    } else {',
++        '      uint64_t old = c--;',
++        '      b ^= mix(old, a, i+1u);',
++        '    }',
++        '    for (unsigned j=0; j<3; ++j) {',
++        '      unsigned idx=(unsigned)((a+b+c+j)&7u);',
++        '      if ((table[idx] ^ a) & 1u) { a += table[idx]; continue; }',
++        '      b ^= table[idx]; c += (a ^ b) + j;',
++        '    }',
++        '    observe = a ^ b ^ c;',
++        '    if ((observe & 15u) == 3u) { c ^= observe; }',
++        '  }',
++        '  return a ^ rot(b,17) ^ rot(c,39) ^ observe;',
++        '}',
++        'int main(void) {',
++        f'  uint64_t x = kernel({u64(r.getrandbits(64))}, {n}u);',
++        f'  uint64_t y = kernel(x ^ {u64(r.getrandbits(64))}, {rounds}u);',
++        '  printf("%016" PRIx64 " %016" PRIx64 "\\n", x, y);',
++        '  return 0;',
++        '}',
++    ]
++    return '\n'.join(lines)+'\n'
++
++def call(cmd, timeout):
++    try:
++        p=subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
++        return p.returncode,p.stdout,p.stderr
++    except subprocess.TimeoutExpired: return 'TIMEOUT','','timeout'
++
++def one(args):
++    seed,level,ccc,gcc,out=args
++    d=out/f'{seed:05d}-{level}'; d.mkdir(parents=True,exist_ok=True)
++    src=d/'x.c'; src.write_text(gen(seed)); cb=d/'c'; gb=d/'g'
++    flags=['-std=gnu11','-w','-march=raptorlake','-mtune=raptorlake','-fomit-frame-pointer']
++    gl='-Os' if level=='Oz' else '-'+level
++    gr,_,ge=call([gcc,gl,*flags,str(src),'-o',str(gb)],45)
++    cr,_,ce=call([ccc,'-'+level,*flags,str(src),'-o',str(cb)],60)
++    if gr!=0 or cr!=0:
++        return {'seed':seed,'level':level,'status':'compile','gcc_rc':gr,'ccc_rc':cr,'detail':(ge+'\n'+ce)[-1000:]}
++    gr,go,ge=call([str(gb)],10); cr,co,ce=call([str(cb)],10)
++    if gr==cr and go==co:
++        for p in (src,cb,gb): p.unlink(missing_ok=True)
++        try:d.rmdir()
++        except OSError:pass
++        return {'seed':seed,'level':level,'status':'pass'}
++    return {'seed':seed,'level':level,'status':'mismatch','gcc_rc':gr,'ccc_rc':cr,'gcc_out':go,'ccc_out':co,'detail':(ge+'\n'+ce)[-1000:]}
++
++def main():
++    ap=argparse.ArgumentParser(); ap.add_argument('--ccc',required=True); ap.add_argument('--gcc',required=True); ap.add_argument('--seeds',default='0:200'); ap.add_argument('--levels',default='O0,O3,Os'); ap.add_argument('--jobs',type=int,default=2); ap.add_argument('--out',type=Path,required=True); ns=ap.parse_args(); ns.out.mkdir(parents=True,exist_ok=True)
++    lo,hi=map(int,ns.seeds.split(':')); levels=ns.levels.split(','); jobs=max(1,ns.jobs)
++    cases=[(s,l,ns.ccc,ns.gcc,ns.out) for l in levels for s in range(lo,hi)]
++    failed=[]; counts={}
++    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
++        for row in ex.map(one,cases):
++            counts[row['status']]=counts.get(row['status'],0)+1
++            if row['status']!='pass':
++                failed.append(row); print('FAIL',row['seed'],row['level'],row['status'],flush=True)
++    report={'cases':len(cases),'counts':counts,'failures':failed,'levels':levels,'seeds':ns.seeds,'ccc':ns.ccc,'gcc':ns.gcc}
++    (ns.out/'summary.json').write_text(json.dumps(report,indent=2)+'\n'); print(json.dumps(report,indent=2)); return 1 if failed else 0
++if __name__=='__main__': raise SystemExit(main())
+diff --git a/tests/regression/accumulator_pointer_load.c b/tests/regression/accumulator_pointer_load.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..14978745894502a013bf6d50cfc6a60007a12ac8
+--- /dev/null
++++ b/tests/regression/accumulator_pointer_load.c
+@@ -0,0 +1,29 @@
++/* Regression: scalar loads through a just-computed pointer may dereference
++   the accumulator directly; unsigned narrow loads must still target a valid
++   32-bit destination and preserve their C value. */
++#include <stdint.h>
++#include <stdio.h>
++
++static unsigned char bytes[257];
++
++static uint64_t walk(const unsigned char *p, unsigned n) {
++    uint64_t sum = 0;
++    for (unsigned i = 0; i < n; ++i) {
++        const unsigned char *q = p + i;
++        unsigned char a = *q;
++        unsigned char b = *(q + 1);
++        sum += (uint64_t)a * 257u + b;
++    }
++    return sum;
++}
++
++int main(void) {
++    for (unsigned i = 0; i < 257; ++i)
++        bytes[i] = (unsigned char)((i * 37u + 11u) & 255u);
++    uint64_t got = walk(bytes, 256);
++    uint64_t expected = 0;
++    for (unsigned i = 0; i < 256; ++i)
++        expected += (uint64_t)bytes[i] * 257u + bytes[i + 1];
++    printf("%llu %llu\n", (unsigned long long)got, (unsigned long long)expected);
++    return got != expected;
++}
 diff --git a/tests/regression/asm_label_on_definition.c b/tests/regression/asm_label_on_definition.c
 new file mode 100644
 index 0000000000000000000000000000000000000000..81c055af93f103d0f646d2bfb8b343145713aba0
@@ -10911,6 +11828,49 @@ index 0000000000000000000000000000000000000000..dd1047a63f9ff9db3f38be932bbf36d3
 +int main(void){ struct Bf f; f.a=5; f.b=-7; f.d=0x1234567890UL;
 +  printf("%u %d %lu\n", f.a, f.b, (unsigned long)f.d);
 +  return (f.a==5 && f.b==-7 && (unsigned long)f.d==0x1234567890UL)?0:1; }
+diff --git a/tests/regression/cfg_phi_web.c b/tests/regression/cfg_phi_web.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..99189df81fefd8d0c1041755f2b5eb0d4abc847a
+--- /dev/null
++++ b/tests/regression/cfg_phi_web.c
+@@ -0,0 +1,37 @@
++/* CFG/phi-web stack-location regression. */
++#include <stdint.h>
++#include <stdio.h>
++
++static uint64_t rot(uint64_t x, unsigned n) {
++    n &= 63u;
++    return n ? ((x << n) | (x >> ((64u - n) & 63u))) : x;
++}
++
++static uint64_t kernel(uint64_t seed) {
++    uint64_t a = seed ^ UINT64_C(0x9e3779b97f4a7c15);
++    uint64_t b = seed + UINT64_C(0xbf58476d1ce4e5b9);
++    uint64_t c = UINT64_C(0x94d049bb133111eb);
++    for (unsigned i = 0; i < 97; ++i) {
++        switch ((unsigned)((a ^ b ^ c ^ i) & 3u)) {
++        case 0: a = rot(a + b, i); b ^= c + i; break;
++        case 1: b = rot(b + c, i + 7u); c ^= a + i; break;
++        case 2: c = rot(c + a, i + 13u); a ^= b + i; break;
++        default: a ^= rot(c, i); b += a ^ i; break;
++        }
++        if (a & 1u) {
++            uint64_t old = b++;
++            c ^= old + i;
++        } else {
++            uint64_t old = c--;
++            a += old ^ i;
++        }
++    }
++    return a ^ rot(b, 17) ^ rot(c, 39);
++}
++
++int main(void) {
++    uint64_t got = kernel(UINT64_C(0x0123456789abcdef));
++    const uint64_t expected = UINT64_C(0x549ed8b2506b8434);
++    printf("%016llx\n", (unsigned long long)got);
++    return got != expected;
++}
 diff --git a/tests/regression/fp_negative_zero_address_escape.c b/tests/regression/fp_negative_zero_address_escape.c
 new file mode 100644
 index 0000000000000000000000000000000000000000..235a37f23e709ed9426b13f351d45cfa64024cf5
