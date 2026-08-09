@@ -1930,10 +1930,27 @@ index 70638a87..ad858ddb 100644
                  let new_expr = resolve_numeric_refs_in_expr(expr, i, &defs);
                  result.push(AsmItem::SkipExpr(new_expr, *fill));
 diff --git a/src/backend/elf/symbol_table.rs b/src/backend/elf/symbol_table.rs
-index abc59ba2..e668614e 100644
+index abc59ba2..767e14cd 100644
 --- a/src/backend/elf/symbol_table.rs
 +++ b/src/backend/elf/symbol_table.rs
-@@ -144,13 +144,22 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
+@@ -126,7 +126,15 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
+                 size: target_sym.size,
+                 binding: alias_binding.unwrap_or(target_sym.binding),
+                 sym_type: alias_type.unwrap_or(target_sym.sym_type),
+-                visibility: alias_vis.unwrap_or(target_sym.visibility),
++                // Visibility comes only from an explicit .hidden/.protected
++                // directive on the alias itself (GNU as semantics). Copying the
++                // target's visibility would make strong_aliases of hidden
++                // objects hidden too — e.g. glibc rtld.c's
++                // `strong_alias (__pointer_chk_guard_local, __pointer_chk_guard)`
++                // would produce a hidden __pointer_chk_guard that the ld.map
++                // version script cannot export (GLIBC_PRIVATE), leaving
++                // libc.so with an undefined __pointer_chk_guard.
++                visibility: alias_vis.unwrap_or(STV_DEFAULT),
+                 section_name: target_sym.section_name.clone(),
+             });
+         } else if let Some((section, offset)) = input.labels.get(resolved) {
+@@ -144,13 +152,22 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
  
      // Add undefined symbols (referenced in relocations but not defined)
      let mut referenced: HashSet<String> = HashSet::new();
@@ -1958,7 +1975,7 @@ index abc59ba2..e668614e 100644
              }
          }
      }
-@@ -172,7 +181,9 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
+@@ -172,7 +189,9 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
                  value: 0,
                  size: 0,
                  binding,
@@ -1969,7 +1986,7 @@ index abc59ba2..e668614e 100644
                  visibility: input.symbol_visibility.get(name).copied().unwrap_or(STV_DEFAULT),
                  section_name: "*UND*".to_string(),
              });
-@@ -181,3 +192,17 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
+@@ -181,3 +200,17 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
  
      symbols
  }
@@ -1982,13 +1999,13 @@ index abc59ba2..e668614e 100644
 +    //          DTPOFF32=21, GOTTPOFF=22, TLSDESC=36, TLSDESC_CALL=42
 +    // i386:    R_386_TLS_TPOFF=14, TLS_IE=15, TLS_GOTIE=16, TLS_LE=17,
 +    //          TLS_GD=18, TLS_LDM=19, TLS_GD_32=24..TLS_TPOFF32=35
-+    matches!(rtype,
-+        16 | 17 | 18 | 21 | 22 | 23 | 36 | 42
-+        | 14 | 15 | 16 | 17 | 18 | 19
-+        | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 | 32 | 33 | 34 | 35)
++    // Deduplicated union of the two arch sets: the 16/17/18 overlap between
++    // x86-64 and i386 made the original arms unreachable (rustc warning).
++    // x86-64 {16,17,18,21,22,23,36,42} ∪ i386 {14..19, 24..35} = {14..19, 21..23, 24..35, 36, 42}
++    matches!(rtype, 14..=19 | 21..=23 | 24..=35 | 36 | 42)
 +}
 diff --git a/src/backend/elf_writer_common.rs b/src/backend/elf_writer_common.rs
-index 2bd62e28..9eaae2f9 100644
+index 2bd62e28..34c28562 100644
 --- a/src/backend/elf_writer_common.rs
 +++ b/src/backend/elf_writer_common.rs
 @@ -22,7 +22,7 @@ use crate::backend::elf::{self as elf_mod,
@@ -2032,7 +2049,40 @@ index 2bd62e28..9eaae2f9 100644
              AsmItem::Zero(n) => {
                  self.ensure_section()?;
                  let section = self.current_section_mut()?;
-@@ -632,6 +643,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
+@@ -521,13 +532,26 @@ impl<A: X86Arch> ElfWriterCore<A> {
+                 self.aliases.insert(alias.clone(), target.clone());
+             }
+             AsmItem::Symver(name, ver_string) => {
+-                // .symver name, alias@@VERSION  -> default version: create alias from "alias" to "name"
+-                // .symver name, alias@VERSION   -> compat version: create alias from "alias" to "name"
+-                // Extract the unversioned alias name from the version string
++                // .symver name, alias@@VERSION  -> default version: the symbol is
++                //   renamed to `alias` (symbol table entry `alias`).
++                // .symver name, alias@VERSION   -> compat version: the symbol keeps
++                //   `name` AND a versioned alias `alias@VERSION` is added, exactly
++                //   like GNU as (e.g. glibc's `compat_symbol (libc, _res, _res,
++                //   GLIBC_2_0)` -> `.symver _res, _res@GLIBC_2_0`).
++                // Truncating at '@' produced a self-alias for `local == symbol`
++                // cases and hence duplicate definitions in one object.
+                 if let Some(at_pos) = ver_string.find('@') {
+-                    let alias = &ver_string[..at_pos];
+-                    if !alias.is_empty() {
+-                        self.aliases.insert(alias.to_string(), name.clone());
++                    let base = &ver_string[..at_pos];
++                    let is_default = ver_string[at_pos..].starts_with("@@");
++                    if !base.is_empty() {
++                        let alias_name = if is_default {
++                            base.to_string()
++                        } else {
++                            ver_string.clone()
++                        };
++                        if alias_name.as_str() != name.as_str() {
++                            self.aliases.insert(alias_name, name.clone());
++                        }
+                     }
+                 }
+             }
+@@ -632,6 +656,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                  Some(SymbolKind::Function) => STT_FUNC,
                  Some(SymbolKind::Object) => STT_OBJECT,
                  Some(SymbolKind::TlsObject) => STT_TLS,
@@ -2040,7 +2090,7 @@ index 2bd62e28..9eaae2f9 100644
                  Some(SymbolKind::NoType) | None => STT_NOTYPE,
              };
  
-@@ -772,6 +784,54 @@ impl<A: X86Arch> ElfWriterCore<A> {
+@@ -772,6 +797,54 @@ impl<A: X86Arch> ElfWriterCore<A> {
          Ok(())
      }
  
@@ -2095,7 +2145,7 @@ index 2bd62e28..9eaae2f9 100644
      fn encode_instruction(&mut self, instr: &Instruction) -> Result<(), String> {
          self.ensure_section()?;
          let sec_idx = self.current_section.unwrap();
-@@ -892,11 +952,88 @@ impl<A: X86Arch> ElfWriterCore<A> {
+@@ -892,11 +965,88 @@ impl<A: X86Arch> ElfWriterCore<A> {
                      *boff += count;
                  }
              }
@@ -2184,7 +2234,7 @@ index 2bd62e28..9eaae2f9 100644
          let diffs = std::mem::take(&mut self.deferred_byte_diffs);
          for (sec_idx, offset, sym_a, sym_b, size, addend) in &diffs {
              let pos_a = self.label_positions.get(sym_a)
-@@ -918,6 +1055,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
+@@ -918,6 +1068,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
                      self.sections[*sec_idx].data[*offset] = bytes[0];
                      self.sections[*sec_idx].data[*offset + 1] = bytes[1];
                  }
@@ -2203,7 +2253,7 @@ index 2bd62e28..9eaae2f9 100644
                  _ => unreachable!(),
              }
          }
-@@ -1117,6 +1266,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
+@@ -1117,6 +1279,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
              self.resolve_deferred_byte_diffs()?;
          }
  
@@ -2217,7 +2267,7 @@ index 2bd62e28..9eaae2f9 100644
          // Resolve internal relocations
          self.resolve_internal_relocations();
  
-@@ -1201,6 +1357,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
+@@ -1201,6 +1370,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                      SymbolKind::Function => STT_FUNC,
                      SymbolKind::Object => STT_OBJECT,
                      SymbolKind::TlsObject => STT_TLS,
@@ -2225,7 +2275,7 @@ index 2bd62e28..9eaae2f9 100644
                      SymbolKind::NoType => STT_NOTYPE,
                  };
                  (name.clone(), stt)
-@@ -1631,7 +1788,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
+@@ -1631,7 +1801,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                              self.label_positions.get(diff_sym),
                          ) {
                              if a_sec == b_sec {
@@ -2234,7 +2284,7 @@ index 2bd62e28..9eaae2f9 100644
                                  resolved.push((reloc.offset as usize, val, reloc.patch_size as usize));
                                  continue;
                              }
-@@ -1698,3 +1855,33 @@ impl<A: X86Arch> ElfWriterCore<A> {
+@@ -1698,3 +1868,33 @@ impl<A: X86Arch> ElfWriterCore<A> {
          }
      }
  }
@@ -2269,7 +2319,7 @@ index 2bd62e28..9eaae2f9 100644
 +    }
 +}
 diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index e3271d1a..8e53cb85 100644
+index e3271d1a..7f395651 100644
 --- a/src/backend/generation.rs
 +++ b/src/backend/generation.rs
 @@ -9,23 +9,19 @@
@@ -2923,26 +2973,36 @@ index e3271d1a..8e53cb85 100644
                  cg.state().current_text_section = sect_name;
                  in_custom_section = false;
              } else if in_custom_section {
-@@ -821,25 +1071,36 @@ fn emit_functions_and_sections(
+@@ -821,59 +1071,123 @@ fn emit_functions_and_sections(
  /// Emit symbol aliases from __attribute__((alias("target"))).
  fn emit_aliases(cg: &mut dyn ArchCodegen, module: &IrModule) {
      for (alias_name, target_name, is_weak) in &module.aliases {
-+        // Resolve __asm__("label") redirects on both the alias and its target
-+        // (glibc's configure alias test: `extern int bar(int) __asm("xyzbar")
-+        // __attribute__((alias("foo")))` must emit `.set xyzbar, xyzfoo`).
-+        let alias_resolved = module.asm_labels.get(alias_name).unwrap_or(alias_name);
++        // The alias name is already asm-resolved by the lowerer (e.g.
++        // `extern int bar __asm("xyzbar") __attribute__((alias("foo")))`
++        // arrives as ("xyzbar","foo")). Resolving it AGAIN here would corrupt
++        // glibc hidden_ver aliases: `__strdup -> __GI___strdup` must stay
++        // `.set __strdup,__GI___strdup`, but `__strdup` also carries the
++        // hidden_proto asm label `__GI___strdup`, so a second resolution
++        // turns it into a self-alias and the alias silently vanishes
++        // (undefined `__strdup` at the ld.so link).
++        // The TARGET may still need asm resolution (configure alias test:
++        // alias("foo") where foo itself is `__asm("xyzfoo")` -> `.set xyzbar, xyzfoo`).
 +        let target_resolved = module.asm_labels.get(target_name).unwrap_or(target_name);
++        // Self-alias guard: `.set x, x` after resolution (e.g. a renamed
++        // definition whose __EI__ alias re-points at itself) would create a
++        // duplicate symbol entry; GCC folds it silently.
++        if alias_name.as_str() == target_resolved.as_str() {
++            continue;
++        }
          cg.state().emit("");
          if *is_weak {
--            cg.state().emit_fmt(format_args!(".weak {}", alias_name));
-+            cg.state().emit_fmt(format_args!(".weak {}", alias_resolved));
+             cg.state().emit_fmt(format_args!(".weak {}", alias_name));
          } else {
--            cg.state().emit_fmt(format_args!(".globl {}", alias_name));
-+            cg.state().emit_fmt(format_args!(".globl {}", alias_resolved));
+             cg.state().emit_fmt(format_args!(".globl {}", alias_name));
          }
 -        cg.state().emit_fmt(format_args!(".set {},{}", alias_name, target_name));
 +        cg.state()
-+            .emit_fmt(format_args!(".set {},{}", alias_resolved, target_resolved));
++            .emit_fmt(format_args!(".set {},{}", alias_name, target_resolved));
      }
  }
  
@@ -2962,10 +3022,27 @@ index e3271d1a..8e53cb85 100644
 +    module: &IrModule,
 +    referenced_symbols: &FxHashSet<String>,
 +) {
++    // Globals are emitted under their asm label (if any); the attribute on the
++    // C name applies to that label.
++    let defined_labels: FxHashSet<&str> =
++        module.globals.iter().map(|g| g.name.as_str()).collect();
      for (name, is_weak, visibility) in &module.symbol_attrs {
-         if !referenced_symbols.contains(name) {
+-        if !referenced_symbols.contains(name) {
++        let resolved = module
++            .asm_labels
++            .get(name)
++            .map(|s| s.as_str())
++            .unwrap_or(name.as_str());
++        if !referenced_symbols.contains(name) && !defined_labels.contains(resolved) {
              continue;
-@@ -852,28 +1113,60 @@ fn emit_symbol_attrs(cg: &mut dyn ArchCodegen, module: &IrModule, referenced_sym
+         }
+         if *is_weak {
+-            cg.state().emit_fmt(format_args!(".weak {}", name));
++            cg.state().emit_fmt(format_args!(".weak {}", resolved));
+         }
+-        cg.state().emit_visibility(name, visibility);
++        cg.state().emit_visibility(resolved, visibility);
+     }
  }
  
  /// Emit .init_array and .fini_array sections for constructor/destructor functions.
@@ -3033,7 +3110,7 @@ index e3271d1a..8e53cb85 100644
      cg.state().emit_visibility(&func.name, &func.visibility);
  
      // Emit patchable function entry NOP padding (-fpatchable-function-entry=N,M).
-@@ -902,11 +1195,13 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
+@@ -902,11 +1216,13 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
                  let pfe_align = crate::common::types::target_ptr_size();
                  let pfe_dir = cg.ptr_directive();
                  cg.state().emit_fmt(format_args!(".align {}", pfe_align));
@@ -3049,7 +3126,7 @@ index e3271d1a..8e53cb85 100644
                  } else {
                      cg.state().emit(".text");
                  }
-@@ -920,7 +1215,8 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
+@@ -920,7 +1236,8 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
          }
      }
  
@@ -3059,7 +3136,7 @@ index e3271d1a..8e53cb85 100644
      cg.state().emit_fmt(format_args!("{}:", func.name));
      let emit_cfi = cg.state().emit_cfi;
      if emit_cfi {
-@@ -949,7 +1245,8 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
+@@ -949,7 +1266,8 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
          if emit_cfi {
              cg.state().emit(".cfi_endproc");
          }
@@ -3069,7 +3146,7 @@ index e3271d1a..8e53cb85 100644
          cg.state().emit("");
          return;
      }
-@@ -957,7 +1254,12 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
+@@ -957,7 +1275,12 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
      // Pre-scan for DynAlloca/StackRestore: if present, the epilogue must restore SP from
      // the frame pointer instead of adding back the compile-time frame size.
      let has_dyn_alloca = func.blocks.iter().any(|block| {
@@ -3083,7 +3160,7 @@ index e3271d1a..8e53cb85 100644
      });
      cg.state().has_dyn_alloca = has_dyn_alloca;
      cg.state().uses_sret = func.uses_sret;
-@@ -978,17 +1280,18 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
+@@ -978,17 +1301,18 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
      let has_vector_intrinsics = func.blocks.iter().any(|block| {
          block.instructions.iter().any(|inst| {
              matches!(inst, Instruction::Intrinsic { op, .. }
@@ -3111,7 +3188,7 @@ index e3271d1a..8e53cb85 100644
  
      // Calculate stack space and emit prologue
      let raw_space = cg.calculate_stack_space(func);
-@@ -1040,12 +1343,20 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
+@@ -1040,12 +1364,20 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
      let mut last_debug_line: u32 = 0;
      cg.state().current_program_point = 0;
  
@@ -3133,7 +3210,7 @@ index e3271d1a..8e53cb85 100644
              cg.state().out.emit_block_label(block.label.0);
          }
  
-@@ -1058,32 +1369,36 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
+@@ -1058,32 +1390,36 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
          let mut skip_fused_add = false;
          let mi_enabled = cg.is_machinst_enabled();
  
@@ -3190,7 +3267,7 @@ index e3271d1a..8e53cb85 100644
                  continue;
              }
              // Skip the Add that was already emitted as part of a fused Mul-Add.
-@@ -1095,8 +1410,10 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
+@@ -1095,8 +1431,10 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
              }
              // Skip GEP instructions whose offset has been folded into Load/Store.
              if let Instruction::GetElementPtr { dest, base, .. } = inst {
@@ -3203,7 +3280,7 @@ index e3271d1a..8e53cb85 100644
                      cg.state().folded_gep_values.insert(dest.0);
                      cg.state().current_program_point += 1;
                      continue;
-@@ -1106,8 +1423,14 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
+@@ -1106,8 +1444,14 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
              // Emit .loc directive if source location changed.
              if emit_debug {
                  if let Some(span) = block.source_spans.get(idx) {
@@ -3220,7 +3297,7 @@ index e3271d1a..8e53cb85 100644
                  }
              }
  
-@@ -1115,12 +1438,26 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
+@@ -1115,12 +1459,26 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
              // and feeds directly into the next Add, emit a fused 3-instruction
              // sequence through %eax. This creates a 3rd multiply ILP channel
              // alongside the 2 register-allocated temp channels (r12, rbx).
@@ -3249,7 +3326,7 @@ index e3271d1a..8e53cb85 100644
                              let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == dest.0);
                              let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
                              cg.emit_fused_mul_add(dest, lhs, rhs, acc_op, add_dest, *add_ty);
-@@ -1143,17 +1480,41 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
+@@ -1143,17 +1501,41 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
              // Flush any accumulated MachInst buffer before emitting via default path
              cg.flush_machinst();
  
@@ -3294,7 +3371,7 @@ index e3271d1a..8e53cb85 100644
                      cg.emit_fused_cmp_branch_blocks(*op, lhs, rhs, *ty, *true_label, *false_label);
                  }
              }
-@@ -1167,8 +1528,10 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
+@@ -1167,8 +1549,10 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
      if emit_cfi {
          cg.state().emit(".cfi_endproc");
      }
@@ -3306,7 +3383,7 @@ index e3271d1a..8e53cb85 100644
  }
  
  /// Emit a `.loc` directive if the source location for this instruction differs
-@@ -1189,7 +1552,10 @@ fn emit_loc_directive(
+@@ -1189,7 +1573,10 @@ fn emit_loc_directive(
      let loc = source_mgr.resolve_span(*span);
      if let Some(&dwarf_file_id) = file_table.get(&loc.file) {
          if dwarf_file_id != *last_file || loc.line != *last_line {
@@ -3318,7 +3395,7 @@ index e3271d1a..8e53cb85 100644
              *last_file = dwarf_file_id;
              *last_line = loc.line;
          }
-@@ -1209,7 +1575,14 @@ fn emit_loc_directive(
+@@ -1209,7 +1596,14 @@ fn emit_loc_directive(
  ///
  /// Instructions that clobber the accumulator unpredictably (calls, stores, atomics,
  /// inline asm, va_arg, memcpy, etc.) invalidate the cache after execution.
@@ -3334,7 +3411,7 @@ index e3271d1a..8e53cb85 100644
      match inst {
          Instruction::Alloca { .. } => {
              // Space already allocated in prologue; does not touch registers
-@@ -1222,11 +1595,29 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
+@@ -1222,11 +1616,29 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
          // These all end with emit_store_result(dest) or store_rax_to(dest),
          // which sets the reg cache correctly. The accumulator holds dest's
          // value after execution, so we do NOT invalidate.
@@ -3369,7 +3446,7 @@ index e3271d1a..8e53cb85 100644
              cg.emit_binop(dest, *op, lhs, rhs, *ty);
              if is_wide_int_type(*ty) {
                  cg.state().reg_cache.invalidate_all();
-@@ -1238,19 +1629,34 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
+@@ -1238,19 +1650,34 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
                  cg.state().reg_cache.invalidate_all();
              }
          }
@@ -3408,7 +3485,7 @@ index e3271d1a..8e53cb85 100644
              }
              cg.emit_gep(dest, base, offset);
          }
-@@ -1268,14 +1674,21 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
+@@ -1268,14 +1695,21 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
              if !is_dead {
                  if cg.state_ref().tls_symbols.contains(name.as_str()) {
                      cg.emit_tls_global_addr(dest, name);
@@ -3432,7 +3509,7 @@ index e3271d1a..8e53cb85 100644
              cg.emit_select(dest, cond, true_val, false_val, *ty);
          }
          Instruction::LabelAddr { dest, label } => {
-@@ -1285,10 +1698,26 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
+@@ -1285,10 +1719,26 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
          // ── Cache-invalidating instructions ──────────────────────────────
          // These clobber the accumulator unpredictably or don't produce a
          // simple acc → dest result. Each arm invalidates the reg cache.
@@ -3462,7 +3539,7 @@ index e3271d1a..8e53cb85 100644
          }
          Instruction::DynAlloca { dest, size, align } => {
              cg.emit_dyn_alloca(dest, size, *align);
-@@ -1297,20 +1726,94 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
+@@ -1297,20 +1747,94 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
              // allocated stack space that may be referenced throughout the function.
              cg.state().protected_slot_values.insert(dest.0);
              cg.state().reg_cache.invalidate_all();
@@ -3560,7 +3637,7 @@ index e3271d1a..8e53cb85 100644
              cg.emit_va_arg(dest, va_list_ptr, *result_ty);
              cg.state().reg_cache.invalidate_all();
          }
-@@ -1326,23 +1829,72 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
+@@ -1326,23 +1850,72 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
              cg.emit_va_copy(dest_ptr, src_ptr);
              cg.state().reg_cache.invalidate_all();
          }
@@ -3639,7 +3716,7 @@ index e3271d1a..8e53cb85 100644
              cg.emit_atomic_store(ptr, val, *ty, *ordering);
              cg.state().reg_cache.invalidate_all();
          }
-@@ -1375,11 +1927,34 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
+@@ -1375,11 +1948,34 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
              cg.emit_set_return_f128_second(src);
              cg.state().reg_cache.invalidate_all();
          }
@@ -3677,7 +3754,7 @@ index e3271d1a..8e53cb85 100644
              cg.emit_intrinsic(dest, op, dest_ptr, args);
              cg.state().reg_cache.invalidate_all();
          }
-@@ -1391,7 +1966,11 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
+@@ -1391,7 +1987,11 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
              cg.emit_stack_restore(ptr);
              cg.state().reg_cache.invalidate_all();
          }
@@ -3690,7 +3767,7 @@ index e3271d1a..8e53cb85 100644
              cg.emit_param_ref(dest, *param_idx, *ty);
              cg.state().reg_cache.invalidate_all();
          }
-@@ -1465,7 +2044,10 @@ fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
+@@ -1465,7 +2065,10 @@ fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
  /// and GEP folding support.
  fn generate_load(
      cg: &mut dyn ArchCodegen,
@@ -3702,7 +3779,7 @@ index e3271d1a..8e53cb85 100644
      gep_fold_map: &FxHashMap<u32, GepFoldInfo>,
      global_addr_map: &FxHashMap<u32, String>,
  ) {
-@@ -1487,7 +2069,9 @@ fn generate_load(
+@@ -1487,7 +2090,9 @@ fn generate_load(
      // in non-PIC mode (x86-64 needs GOTPCREL for PIE compatibility).
      if cg.supports_global_addr_fold() && !is_wide_int_type(ty) && ty != IrType::F128 {
          if let Some(sym) = global_addr_map.get(&ptr.0) {
@@ -3713,7 +3790,7 @@ index e3271d1a..8e53cb85 100644
                  cg.emit_global_load_rip_rel(dest, sym, ty);
                  return;
              }
-@@ -1495,8 +2079,10 @@ fn generate_load(
+@@ -1495,8 +2100,10 @@ fn generate_load(
      }
      // Fold GEP with constant offset into Load addressing mode.
      if let Some(gep_info) = gep_fold_map.get(&ptr.0) {
@@ -3726,7 +3803,7 @@ index e3271d1a..8e53cb85 100644
              cg.emit_load_with_const_offset(dest, &gep_info.base, gep_info.offset, ty);
              return;
          }
-@@ -1511,7 +2097,10 @@ fn generate_load(
+@@ -1511,7 +2118,10 @@ fn generate_load(
  /// and GEP folding support.
  fn generate_store(
      cg: &mut dyn ArchCodegen,
@@ -3738,7 +3815,7 @@ index e3271d1a..8e53cb85 100644
      gep_fold_map: &FxHashMap<u32, GepFoldInfo>,
      global_addr_map: &FxHashMap<u32, String>,
  ) {
-@@ -1528,7 +2117,9 @@ fn generate_store(
+@@ -1528,7 +2138,9 @@ fn generate_store(
      // Uses needs_got_for_addr: same as Load fold above.
      if cg.supports_global_addr_fold() && !is_wide_int_type(ty) && ty != IrType::F128 {
          if let Some(sym) = global_addr_map.get(&ptr.0) {
@@ -3749,7 +3826,7 @@ index e3271d1a..8e53cb85 100644
                  cg.emit_global_store_rip_rel(val, sym, ty);
                  return;
              }
-@@ -1536,8 +2127,10 @@ fn generate_store(
+@@ -1536,8 +2148,10 @@ fn generate_store(
      }
      // Fold GEP with constant offset into Store addressing mode.
      if let Some(gep_info) = gep_fold_map.get(&ptr.0) {
@@ -3762,7 +3839,7 @@ index e3271d1a..8e53cb85 100644
              cg.emit_store_with_const_offset(val, &gep_info.base, gep_info.offset, ty);
              return;
          }
-@@ -1554,13 +2147,22 @@ fn generate_terminator(cg: &mut dyn ArchCodegen, term: &Terminator, frame_size:
+@@ -1554,13 +2168,22 @@ fn generate_terminator(cg: &mut dyn ArchCodegen, term: &Terminator, frame_size:
          Terminator::Branch(label) => {
              cg.emit_branch_to_block(*label);
          }
@@ -3787,7 +3864,7 @@ index e3271d1a..8e53cb85 100644
              cg.emit_switch(val, cases, default, *ty);
          }
          Terminator::Unreachable => {
-@@ -1589,11 +2191,7 @@ pub fn is_wide_int_type(ty: IrType) -> bool {
+@@ -1589,11 +2212,7 @@ pub fn is_wide_int_type(ty: IrType) -> bool {
  // Re-export stack layout functions so existing `crate::backend::generation::X` imports
  // continue to work without changes to downstream code.
  pub use super::stack_layout::{
@@ -9439,6 +9516,42 @@ index 78c0a3dd..96780fbe 100644
      /// Encode AVX pshufd-like (imm8 + 2 register operands)
      pub(crate) fn encode_avx_shuffle(&mut self, ops: &[Operand], opcode: u8, has_66: bool) -> Result<(), String> {
          if ops.len() != 3 { return Err("AVX shuffle requires 3 operands".to_string()); }
+diff --git a/src/backend/x86/assembler/encoder/core.rs b/src/backend/x86/assembler/encoder/core.rs
+index 9be44a0c..a7824ddc 100644
+--- a/src/backend/x86/assembler/encoder/core.rs
++++ b/src/backend/x86/assembler/encoder/core.rs
+@@ -104,10 +104,13 @@ impl super::InstructionEncoder {
+                         self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                     }
+                     Displacement::SymbolMod(sym, modifier) => {
+-                        let reloc_type = match modifier.as_str() {
+-                            "GOTPCREL" => R_X86_64_GOTPCREL,
+-                            "GOTTPOFF" => R_X86_64_GOTTPOFF,
+-                            "PLT" => R_X86_64_PLT32,
++                        // Modifiers are case-insensitive in GNU as: glibc's
++                        // multiarch sources emit lowercase `sym@gottpoff(%rip)`.
++                        let reloc_type = match modifier.to_ascii_lowercase().as_str() {
++                            "gotpcrel" => R_X86_64_GOTPCREL,
++                            "gottpoff" => R_X86_64_GOTTPOFF, // ZZ_MARKER_GOTTPOFF
++                            "tpoff" => R_X86_64_TPOFF32,
++                            "plt" => R_X86_64_PLT32,
+                             _ => R_X86_64_PC32,
+                         };
+                         self.add_relocation(sym, reloc_type, -4);
+@@ -140,9 +143,10 @@ impl super::InstructionEncoder {
+                 (0i64, true, Some((sym.clone(), R_X86_64_32S, *offset)))
+             }
+             Displacement::SymbolMod(sym, modifier) => {
+-                let reloc_type = match modifier.as_str() {
+-                    "TPOFF" => R_X86_64_TPOFF32,
+-                    "GOTPCREL" => R_X86_64_GOTPCREL,
++                let reloc_type = match modifier.to_ascii_lowercase().as_str() {
++                    "tpoff" => R_X86_64_TPOFF32,
++                    "gotpcrel" => R_X86_64_GOTPCREL,
++                    "gottpoff" => R_X86_64_GOTTPOFF,
+                     _ => R_X86_64_32S,
+                 };
+                 (0i64, true, Some((sym.clone(), reloc_type, 0i64)))
 diff --git a/src/backend/x86/assembler/encoder/gp_integer.rs b/src/backend/x86/assembler/encoder/gp_integer.rs
 index 13d6d53d..c5f936f1 100644
 --- a/src/backend/x86/assembler/encoder/gp_integer.rs
@@ -10618,7 +10731,7 @@ index ef59e685..bec349a9 100644
  
      pub(crate) fn encode_bit_scan(&mut self, ops: &[Operand], mnemonic: &str, opcode2: u8) -> Result<(), String> {
 diff --git a/src/backend/x86/assembler/parser.rs b/src/backend/x86/assembler/parser.rs
-index 2160e1c8..04ed3b95 100644
+index 2160e1c8..61d9cb39 100644
 --- a/src/backend/x86/assembler/parser.rs
 +++ b/src/backend/x86/assembler/parser.rs
 @@ -38,6 +38,10 @@ pub enum AsmItem {
@@ -10812,7 +10925,96 @@ index 2160e1c8..04ed3b95 100644
              displacement,
              base,
              index,
-@@ -1753,6 +1825,56 @@ fn expand_gas_macros_with_state(
+@@ -1495,12 +1567,88 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
+             continue;
+         }
+ 
++        // GNU as symbol-difference forms without spaces or with parentheses
++        // (glibc .eh_frame emits `(.LSTART_restore_rt-1)-.`,
++        //  `.LEND_restore_rt-(.LSTART_restore_rt-1)`, `.LENDCIE_-.LSTARTCIE_`).
++        if let Some(val) = try_parse_sym_diff(trimmed) {
++            vals.push(val);
++            continue;
++        }
++
+         // Symbol reference
+         vals.push(DataValue::Symbol(trimmed.to_string()));
+     }
+     Ok(vals)
+ }
+ 
++/// Split `sym`, `sym+N`, `sym-N`, `(sym±N)` into (symbol, addend) where the
++/// value equals `symbol + addend`. Returns None for non-label strings.
++fn parse_sym_addend(s: &str) -> Option<(String, i64)> {
++    let t = s.trim();
++    let t = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')).unwrap_or(t);
++    let t = t.trim();
++    if t.is_empty() {
++        return None;
++    }
++    for (i, c) in t.char_indices().skip(1) {
++        if c == '+' || c == '-' {
++            let sym = t[..i].trim();
++            if !is_label_like(sym) {
++                continue;
++            }
++            let num_raw: String = t[i..].chars().filter(|c| !c.is_whitespace()).collect();
++            let v: i64 = if let Some(r) = num_raw.strip_prefix('+') {
++                r.parse().ok()?
++            } else if let Some(r) = num_raw.strip_prefix('-') {
++                -r.parse::<i64>().ok()?
++            } else {
++                continue;
++            };
++            return Some((sym.to_string(), v));
++        }
++    }
++    if is_label_like(t) {
++        Some((t.to_string(), 0))
++    } else {
++        None
++    }
++}
++
++/// Parse GNU-as symbol-difference expressions that lack spaces around the
++/// operator or use parentheses: `(a-1)-.`, `a-(b-1)`, `(a+2)-b`, `a-b`.
++/// Returns DataValue::SymbolDiffAddend(a, b, add) meaning `a - b + add`.
++fn try_parse_sym_diff(s: &str) -> Option<DataValue> {
++    let s = s.trim();
++    if s.is_empty() {
++        return None;
++    }
++    let bytes = s.as_bytes();
++    let mut depth = 0i32;
++    for i in 0..bytes.len() {
++        let c = bytes[i] as char;
++        if c == '(' {
++            depth += 1;
++        } else if c == ')' {
++            depth -= 1;
++        } else if c == '-' && depth == 0 && i > 0 {
++            let lhs = &s[..i];
++            let rhs = &s[i + 1..];
++            let (a, add_a) = parse_sym_addend(lhs)?;
++            if rhs.trim() == "." {
++                // (a ± N) - .  ==  a - . ± N   (PC-relative, GNU as encodes as
++                // a PC32 reloc with the addend folded in)
++                return Some(DataValue::SymbolDiffAddend(a, ".".to_string(), add_a));
++            }
++            if let Some((b, add_b)) = parse_sym_addend(rhs) {
++                // a + add_a - (b + add_b) = a - b + (add_a - add_b)
++                return Some(DataValue::SymbolDiffAddend(a, b, add_a - add_b));
++            }
++            return None;
++        }
++    }
++    None
++}
++
+ /// Parse symbol+offset or symbol-offset expressions (e.g., GD_struct+128).
+ /// Also handles offset+symbol (e.g., 0x9b000000 + pa_real_mode_base).
+ /// Returns a DataValue::SymbolOffset if the string matches this pattern.
+@@ -1753,6 +1901,56 @@ fn expand_gas_macros_with_state(
              continue;
          }
  
@@ -10869,7 +11071,7 @@ index 2160e1c8..04ed3b95 100644
          // .ifc str1, str2 / .endif
          if trimmed.starts_with(".ifc ") || trimmed.starts_with(".ifc\t") {
              let rest = trimmed[".ifc".len()..].trim();
-@@ -2046,6 +2168,17 @@ fn parse_irp_header(rest: &str) -> Result<(String, Vec<String>), String> {
+@@ -2046,6 +2244,17 @@ fn parse_irp_header(rest: &str) -> Result<(String, Vec<String>), String> {
      Ok((var, items))
  }
  
@@ -10887,7 +11089,7 @@ index 2160e1c8..04ed3b95 100644
  /// Evaluate .ifc string comparison: "str1, str2" => true if equal
  fn eval_ifc(rest: &str) -> bool {
      if let Some(comma_pos) = rest.find(',') {
-@@ -2115,6 +2248,8 @@ fn is_ident_char(b: u8) -> bool {
+@@ -2115,6 +2324,8 @@ fn is_ident_char(b: u8) -> bool {
  fn is_if_start(trimmed: &str) -> bool {
      trimmed.starts_with(".if ") || trimmed.starts_with(".if\t") || trimmed.starts_with(".if(")
          || trimmed.starts_with(".ifc ") || trimmed.starts_with(".ifc\t")
@@ -15410,7 +15612,7 @@ index 093b4f26..ac856c00 100644
  
      pub(super) fn emit_i128_add_impl(&mut self) {
 diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
-index c9b3162c..664e9007 100644
+index c9b3162c..ead2e676 100644
 --- a/src/backend/x86/codegen/intrinsics.rs
 +++ b/src/backend/x86/codegen/intrinsics.rs
 @@ -18,12 +18,15 @@ use crate::ir::reexports::{
@@ -15743,7 +15945,34 @@ index c9b3162c..664e9007 100644
      }
  
      pub(super) fn emit_intrinsic_impl(&mut self, dest: &Option<Value>, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
-@@ -155,24 +383,22 @@ impl X86Codegen {
+@@ -144,6 +372,26 @@ impl X86Codegen {
+             IntrinsicOp::Mfence => { self.state.emit("    mfence"); }
+             IntrinsicOp::Sfence => { self.state.emit("    sfence"); }
+             IntrinsicOp::Pause => { self.state.emit("    pause"); }
++            IntrinsicOp::Rdtsc => {
++                // rdtsc: EDX:EAX -> RAX (matches GCC __builtin_ia32_rdtsc)
++                self.state.emit("    rdtsc");
++                self.state.emit("    shlq $32, %rdx");
++                self.state.emit("    orq %rdx, %rax");
++                if let Some(d) = dest {
++                    self.store_rax_to(d);
++                }
++            }
++            IntrinsicOp::Rdtscp => {
++                // rdtscp: EDX:EAX -> RAX, IA32_TSC_AUX (ecx) -> *args[0]
++                self.state.emit("    rdtscp");
++                self.operand_to_reg(&args[0], "rdi");
++                self.state.emit("    movl %ecx, (%rdi)");
++                self.state.emit("    shlq $32, %rdx");
++                self.state.emit("    orq %rdx, %rax");
++                if let Some(d) = dest {
++                    self.store_rax_to(d);
++                }
++            }
+             IntrinsicOp::Clflush => {
+                 // args[0] = pointer to flush
+                 self.operand_to_reg(&args[0], "rax");
+@@ -155,24 +403,22 @@ impl X86Codegen {
              }
              IntrinsicOp::Loaddqu => {
                  if let Some(dptr) = dest_ptr {
@@ -15775,7 +16004,7 @@ index c9b3162c..664e9007 100644
                  if let Some(dptr) = dest_ptr {
                      let inst = match op {
                          IntrinsicOp::Pcmpeqb128 => "pcmpeqb",
-@@ -182,14 +408,19 @@ impl X86Codegen {
+@@ -182,14 +428,19 @@ impl X86Codegen {
                          IntrinsicOp::Por128 => "por",
                          IntrinsicOp::Pand128 => "pand",
                          IntrinsicOp::Pxor128 => "pxor",
@@ -15797,7 +16026,7 @@ index c9b3162c..664e9007 100644
                  self.state.emit("    pmovmskb %xmm0, %eax");
                  if let Some(d) = dest {
                      self.store_rax_to(d);
-@@ -202,8 +433,7 @@ impl X86Codegen {
+@@ -202,8 +453,7 @@ impl X86Codegen {
                      self.state.emit("    punpcklbw %xmm0, %xmm0");
                      self.state.emit("    punpcklwd %xmm0, %xmm0");
                      self.state.emit("    pshufd $0, %xmm0, %xmm0");
@@ -15807,7 +16036,7 @@ index c9b3162c..664e9007 100644
                  }
              }
              IntrinsicOp::SetEpi32 => {
-@@ -211,8 +441,7 @@ impl X86Codegen {
+@@ -211,8 +461,7 @@ impl X86Codegen {
                      self.operand_to_reg(&args[0], "rax");
                      self.state.emit("    movd %eax, %xmm0");
                      self.state.emit("    pshufd $0, %xmm0, %xmm0");
@@ -15817,7 +16046,7 @@ index c9b3162c..664e9007 100644
                  }
              }
              IntrinsicOp::Crc32_8 | IntrinsicOp::Crc32_16
-@@ -314,36 +543,29 @@ impl X86Codegen {
+@@ -314,36 +563,29 @@ impl X86Codegen {
              // AES-NI unary: aesimc
              IntrinsicOp::Aesimc128 => {
                  if let Some(dptr) = dest_ptr {
@@ -15861,7 +16090,7 @@ index c9b3162c..664e9007 100644
                  }
              }
              // SSE2 shift-by-immediate operations
-@@ -369,17 +591,57 @@ impl X86Codegen {
+@@ -369,17 +611,57 @@ impl X86Codegen {
              // Load low 64 bits, zero upper (MOVQ)
              IntrinsicOp::Loadldi128 => {
                  if let Some(dptr) = dest_ptr {
@@ -15924,7 +16153,7 @@ index c9b3162c..664e9007 100644
              | IntrinsicOp::Packssdw128 | IntrinsicOp::Packsswb128 | IntrinsicOp::Packuswb128
              | IntrinsicOp::Punpcklbw128 | IntrinsicOp::Punpckhbw128
              | IntrinsicOp::Punpcklwd128 | IntrinsicOp::Punpckhwd128 => {
-@@ -388,11 +650,25 @@ impl X86Codegen {
+@@ -388,11 +670,25 @@ impl X86Codegen {
                          IntrinsicOp::Paddw128 => "paddw",
                          IntrinsicOp::Psubw128 => "psubw",
                          IntrinsicOp::Pmulhw128 => "pmulhw",
@@ -15950,7 +16179,7 @@ index c9b3162c..664e9007 100644
                          IntrinsicOp::Packssdw128 => "packssdw",
                          IntrinsicOp::Packsswb128 => "packsswb",
                          IntrinsicOp::Packuswb128 => "packuswb",
-@@ -405,120 +681,418 @@ impl X86Codegen {
+@@ -405,120 +701,418 @@ impl X86Codegen {
                      self.emit_sse_binary_128(dptr, args, inst);
                  }
              }
@@ -16450,7 +16679,7 @@ index c9b3162c..664e9007 100644
                  if let Some(d) = dest {
                      self.store_rax_to(d);
                  }
-@@ -526,16 +1100,23 @@ impl X86Codegen {
+@@ -526,16 +1120,23 @@ impl X86Codegen {
              IntrinsicOp::Storeldi128 => {
                  // Store low 64 bits to memory (MOVQ)
                  if let Some(ptr) = dest_ptr {
@@ -16480,7 +16709,7 @@ index c9b3162c..664e9007 100644
                  self.state.emit("    movd %xmm0, %eax");
                  if let Some(d) = dest {
                      self.store_rax_to(d);
-@@ -546,14 +1127,12 @@ impl X86Codegen {
+@@ -546,14 +1147,12 @@ impl X86Codegen {
                  if let Some(dptr) = dest_ptr {
                      self.operand_to_reg(&args[0], "rax");
                      self.state.emit("    movd %eax, %xmm0");
@@ -16497,7 +16726,7 @@ index c9b3162c..664e9007 100644
                  self.state.emit("    movq %xmm0, %rax");
                  if let Some(d) = dest {
                      self.store_rax_to(d);
-@@ -570,6 +1149,7 @@ impl X86Codegen {
+@@ -570,6 +1169,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::FmaF64x2 => {
@@ -16505,7 +16734,7 @@ index c9b3162c..664e9007 100644
                  // dest_ptr[0..2] += broadcast(args[0]) * args[1][0..2]
                  // args[0] = A pointer (scalar F64, broadcast to both lanes)
                  // args[1] = B pointer (2×F64)
-@@ -587,6 +1167,7 @@ impl X86Codegen {
+@@ -587,6 +1187,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::FmaF64x4 => {
@@ -16513,7 +16742,7 @@ index c9b3162c..664e9007 100644
                  // dest_ptr[0..4] += broadcast(args[0]) * args[1][0..4]
                  // args[0] = A pointer (scalar F64, broadcast to all 4 lanes)
                  // args[1] = B pointer (4×F64)
-@@ -658,6 +1239,7 @@ impl X86Codegen {
+@@ -658,6 +1259,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::FmaF64x4Hoisted => {
@@ -16521,7 +16750,7 @@ index c9b3162c..664e9007 100644
                  // Like FmaF64x4, but A[i][k] broadcast already in ymm1.
                  // args[0] = B pointer (4×F64)
                  // dest_ptr = C pointer (read+write, 4×F64)
-@@ -671,6 +1253,7 @@ impl X86Codegen {
+@@ -671,6 +1273,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::BroadcastLoadF64 => {
@@ -16529,7 +16758,7 @@ index c9b3162c..664e9007 100644
                  // Load scalar F64 from pointer and broadcast to ymm1.
                  // Placed before the vectorized j-loop.
                  self.operand_to_reg(&args[0], "rcx");
-@@ -678,6 +1261,7 @@ impl X86Codegen {
+@@ -678,6 +1281,7 @@ impl X86Codegen {
                  self.state.emit("    vbroadcastsd %xmm1, %ymm1");
              }
              IntrinsicOp::FmaF64x4SIB => {
@@ -16537,7 +16766,7 @@ index c9b3162c..664e9007 100644
                  // FMA with SIB addressing: C[base+off] += broadcast(A) * B[base+off]
                  // args[0] = A pointer (scalar F64)
                  // args[1] = C base pointer
-@@ -706,6 +1290,7 @@ impl X86Codegen {
+@@ -706,6 +1310,7 @@ impl X86Codegen {
  
              // --- Vector loads for reduction patterns ---
              IntrinsicOp::LoadF64x4 => {
@@ -16545,7 +16774,7 @@ index c9b3162c..664e9007 100644
                  // Load 4 packed doubles: vmovupd (%base + %offset), %ymm0
                  if let Some(dptr) = dest_ptr {
                      self.value_to_reg(dptr, "rdx");          // Load dest FIRST into %rdx
-@@ -716,6 +1301,7 @@ impl X86Codegen {
+@@ -716,6 +1321,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::LoadF64x2 => {
@@ -16553,7 +16782,7 @@ index c9b3162c..664e9007 100644
                  // Load 2 packed doubles: movupd (%base + %offset), %xmm0
                  if let Some(dptr) = dest_ptr {
                      self.value_to_reg(dptr, "rdx");          // Load dest FIRST into %rdx
-@@ -726,6 +1312,7 @@ impl X86Codegen {
+@@ -726,6 +1332,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::LoadI32x8 => {
@@ -16561,7 +16790,7 @@ index c9b3162c..664e9007 100644
                  // Load 8 packed ints: vmovdqu (%base + %offset), %ymm0
                  if let Some(dptr) = dest_ptr {
                      self.value_to_reg(dptr, "rdx");          // Load dest FIRST into %rdx
-@@ -736,6 +1323,7 @@ impl X86Codegen {
+@@ -736,6 +1343,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::LoadI32x4 => {
@@ -16569,7 +16798,7 @@ index c9b3162c..664e9007 100644
                  // Load 4 packed ints: movdqu (%base + %offset), %xmm0
                  if let Some(dptr) = dest_ptr {
                      self.value_to_reg(dptr, "rdx");          // Load dest FIRST into %rdx
-@@ -749,7 +1337,7 @@ impl X86Codegen {
+@@ -749,7 +1357,7 @@ impl X86Codegen {
              // --- Vector arithmetic ---
              IntrinsicOp::AddF64x4 => {
                  if let Some(dptr) = dest_ptr {
@@ -16578,7 +16807,7 @@ index c9b3162c..664e9007 100644
                  }
              }
              IntrinsicOp::AddF64x2 => {
-@@ -759,7 +1347,7 @@ impl X86Codegen {
+@@ -759,7 +1367,7 @@ impl X86Codegen {
              }
              IntrinsicOp::MulF64x4 => {
                  if let Some(dptr) = dest_ptr {
@@ -16587,7 +16816,7 @@ index c9b3162c..664e9007 100644
                  }
              }
              IntrinsicOp::MulF64x2 => {
-@@ -769,7 +1357,7 @@ impl X86Codegen {
+@@ -769,7 +1377,7 @@ impl X86Codegen {
              }
              IntrinsicOp::AddI32x8 => {
                  if let Some(dptr) = dest_ptr {
@@ -16596,7 +16825,7 @@ index c9b3162c..664e9007 100644
                  }
              }
              IntrinsicOp::AddI32x4 => {
-@@ -780,6 +1368,7 @@ impl X86Codegen {
+@@ -780,6 +1388,7 @@ impl X86Codegen {
  
              // --- Horizontal reduction ---
              IntrinsicOp::HorizontalAddF64x4 => {
@@ -16604,7 +16833,7 @@ index c9b3162c..664e9007 100644
                  // Reduce 4×F64 → 1×F64
                  self.operand_to_reg(&args[0], "rax");
                  self.state.emit("    vmovupd (%rax), %ymm0");        // Load 4 doubles
-@@ -793,6 +1382,7 @@ impl X86Codegen {
+@@ -793,6 +1402,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::HorizontalAddF64x2 => {
@@ -16612,7 +16841,7 @@ index c9b3162c..664e9007 100644
                  // Reduce 2×F64 → 1×F64
                  self.operand_to_reg(&args[0], "rax");
                  self.state.emit("    movupd (%rax), %xmm0");          // Load 2 doubles
-@@ -804,6 +1394,7 @@ impl X86Codegen {
+@@ -804,6 +1414,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::HorizontalAddI32x8 => {
@@ -16620,7 +16849,7 @@ index c9b3162c..664e9007 100644
                  // Reduce 8×I32 → 1×I32
                  self.operand_to_reg(&args[0], "rax");
                  self.state.emit("    vmovdqu (%rax), %ymm0");         // Load 8 ints
-@@ -819,6 +1410,7 @@ impl X86Codegen {
+@@ -819,6 +1430,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::HorizontalAddI32x4 => {
@@ -16628,7 +16857,7 @@ index c9b3162c..664e9007 100644
                  // Reduce 4×I32 → 1×I32
                  self.operand_to_reg(&args[0], "rax");
                  self.state.emit("    movdqu (%rax), %xmm0");          // Load 4 ints
-@@ -835,6 +1427,7 @@ impl X86Codegen {
+@@ -835,6 +1447,7 @@ impl X86Codegen {
              // --- Register-based vector operations (SSA-friendly) ---
  
              IntrinsicOp::VecLoadF64x4 => {
@@ -16636,7 +16865,7 @@ index c9b3162c..664e9007 100644
                  // %dest_vec = load_vector(base_ptr, offset) - AVX2 4×F64
                  // Load from memory array into ymm0, then store directly to stack slot
                  self.operand_to_reg(&args[0], "rax");  // base pointer
-@@ -849,6 +1442,7 @@ impl X86Codegen {
+@@ -849,6 +1462,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::VecLoadF64x2 => {
@@ -16644,7 +16873,7 @@ index c9b3162c..664e9007 100644
                  // %dest_vec = load_vector(base_ptr, offset) - SSE2 2×F64
                  self.operand_to_reg(&args[0], "rax");
                  self.operand_to_reg(&args[1], "rcx");
-@@ -862,6 +1456,7 @@ impl X86Codegen {
+@@ -862,6 +1476,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::VecLoadI32x8 => {
@@ -16652,7 +16881,7 @@ index c9b3162c..664e9007 100644
                  // %dest_vec = load_vector(base_ptr, offset) - AVX2 8×I32
                  self.operand_to_reg(&args[0], "rax");
                  self.operand_to_reg(&args[1], "rcx");
-@@ -875,6 +1470,7 @@ impl X86Codegen {
+@@ -875,6 +1490,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::VecLoadI32x4 => {
@@ -16660,7 +16889,7 @@ index c9b3162c..664e9007 100644
                  // %dest_vec = load_vector(base_ptr, offset) - SSE2 4×I32
                  self.operand_to_reg(&args[0], "rax");
                  self.operand_to_reg(&args[1], "rcx");
-@@ -888,6 +1484,7 @@ impl X86Codegen {
+@@ -888,6 +1504,7 @@ impl X86Codegen {
              }
  
              IntrinsicOp::VecAddF64x4 => {
@@ -16668,7 +16897,7 @@ index c9b3162c..664e9007 100644
                  // %dest_vec = %src1_vec + %src2_vec - AVX2 4×F64
                  // Load both source vectors directly from their stack slots and add.
                  // Vector values are stored directly in stack slots (not as pointers),
-@@ -918,6 +1515,7 @@ impl X86Codegen {
+@@ -918,6 +1535,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::VecAddF64x2 => {
@@ -16676,7 +16905,7 @@ index c9b3162c..664e9007 100644
                  // %dest_vec = %src1_vec + %src2_vec - SSE2 2×F64
                  // Load both source vectors directly from stack slots
                  if let Some(slot) = self.get_slot_for_operand(&args[0]) {
-@@ -942,6 +1540,7 @@ impl X86Codegen {
+@@ -942,6 +1560,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::VecMulF64x4 => {
@@ -16684,7 +16913,7 @@ index c9b3162c..664e9007 100644
                  // %dest_vec = %src1_vec * %src2_vec - AVX2 4×F64
                  // Load both source vectors directly from stack slots
                  if let Some(slot) = self.get_slot_for_operand(&args[0]) {
-@@ -966,6 +1565,7 @@ impl X86Codegen {
+@@ -966,6 +1585,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::VecMulF64x2 => {
@@ -16692,7 +16921,7 @@ index c9b3162c..664e9007 100644
                  // %dest_vec = %src1_vec * %src2_vec - SSE2 2×F64
                  // Load both source vectors directly from stack slots
                  if let Some(slot) = self.get_slot_for_operand(&args[0]) {
-@@ -990,6 +1590,7 @@ impl X86Codegen {
+@@ -990,6 +1610,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 => {
@@ -16700,7 +16929,7 @@ index c9b3162c..664e9007 100644
                  // Vector integer add (similar pattern)
                  let (load_inst, add_inst, store_inst, reg) = match op {
                      IntrinsicOp::VecAddI32x8 => ("vmovdqu", "vpaddd", "vmovdqu", "ymm"),
-@@ -1017,6 +1618,7 @@ impl X86Codegen {
+@@ -1017,6 +1638,7 @@ impl X86Codegen {
              }
  
              IntrinsicOp::VecHorizontalAddF64x4 => {
@@ -16708,7 +16937,7 @@ index c9b3162c..664e9007 100644
                  // %scalar = horizontal_add(%vec) - AVX2 4×F64 → F64
                  // Load vector from operand and reduce
                  if let Some(slot) = self.get_slot_for_operand(&args[0]) {
-@@ -1037,6 +1639,7 @@ impl X86Codegen {
+@@ -1037,6 +1659,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::VecHorizontalAddF64x2 => {
@@ -16716,7 +16945,7 @@ index c9b3162c..664e9007 100644
                  // %scalar = horizontal_add(%vec) - SSE2 2×F64 → F64
                  if let Some(slot) = self.get_slot_for_operand(&args[0]) {
                      // Direct load from slot
-@@ -1054,6 +1657,7 @@ impl X86Codegen {
+@@ -1054,6 +1677,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::VecHorizontalAddI32x8 => {
@@ -16724,7 +16953,7 @@ index c9b3162c..664e9007 100644
                  // %scalar = horizontal_add(%vec) - AVX2 8×I32 → I32
                  if let Some(slot) = self.get_slot_for_operand(&args[0]) {
                      // Direct load from slot
-@@ -1075,6 +1679,7 @@ impl X86Codegen {
+@@ -1075,6 +1699,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::VecHorizontalAddI32x4 => {
@@ -16732,7 +16961,7 @@ index c9b3162c..664e9007 100644
                  // %scalar = horizontal_add(%vec) - SSE2 4×I32 → I32
                  if let Some(slot) = self.get_slot_for_operand(&args[0]) {
                      // Direct load from slot
-@@ -1095,6 +1700,7 @@ impl X86Codegen {
+@@ -1095,6 +1720,7 @@ impl X86Codegen {
              }
  
              IntrinsicOp::VecZeroF64x4 => {
@@ -16740,7 +16969,7 @@ index c9b3162c..664e9007 100644
                  // %dest_vec = {0.0, 0.0, 0.0, 0.0} - AVX2 4×F64
                  self.state.emit("    vxorpd %ymm0, %ymm0, %ymm0");
                  if let Some(d) = dest {
-@@ -1106,6 +1712,7 @@ impl X86Codegen {
+@@ -1106,6 +1732,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::VecZeroF64x2 => {
@@ -16748,7 +16977,7 @@ index c9b3162c..664e9007 100644
                  // %dest_vec = {0.0, 0.0} - SSE2 2×F64
                  self.state.emit("    xorpd %xmm0, %xmm0");
                  if let Some(d) = dest {
-@@ -1117,6 +1724,7 @@ impl X86Codegen {
+@@ -1117,6 +1744,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::VecZeroI32x8 => {
@@ -16756,7 +16985,7 @@ index c9b3162c..664e9007 100644
                  // %dest_vec = {0, 0, 0, 0, 0, 0, 0, 0} - AVX2 8×I32
                  self.state.emit("    vpxor %ymm0, %ymm0, %ymm0");
                  if let Some(d) = dest {
-@@ -1128,6 +1736,7 @@ impl X86Codegen {
+@@ -1128,6 +1756,7 @@ impl X86Codegen {
                  }
              }
              IntrinsicOp::VecZeroI32x4 => {
@@ -16764,7 +16993,7 @@ index c9b3162c..664e9007 100644
                  // %dest_vec = {0, 0, 0, 0} - SSE2 4×I32
                  self.state.emit("    pxor %xmm0, %xmm0");
                  if let Some(d) = dest {
-@@ -1151,18 +1760,80 @@ impl X86Codegen {
+@@ -1151,18 +1780,80 @@ impl X86Codegen {
  
      /// Emit AVX binary 256-bit op: load ymm0 from arg0 ptr, ymm1 from arg1 ptr,
      /// apply the given AVX instruction, store result ymm0 to dest_ptr.
@@ -22686,7 +22915,7 @@ index 670d7805..59fb6d57 100644
  
  SIMD feature flags follow GCC's implication chain where each flag implies all
 diff --git a/src/driver/cli.rs b/src/driver/cli.rs
-index b8f9fdc1..21f81d2b 100644
+index b8f9fdc1..46a0f600 100644
 --- a/src/driver/cli.rs
 +++ b/src/driver/cli.rs
 @@ -15,6 +15,55 @@ use crate::backend::Target;
@@ -22923,7 +23152,27 @@ index b8f9fdc1..21f81d2b 100644
                      self.optimize_size = true;
                      self.omit_frame_pointer = true;
                  }
-@@ -436,9 +589,12 @@ impl Driver {
+@@ -313,6 +466,19 @@ impl Driver {
+                     }
+                 }
+ 
++                // Linker entry point: -e SYMBOL / -eSYMBOL (glibc links libc.so
++                // with `-e __libc_main`). Without this the symbol is treated as
++                // an input file and the link fails.
++                "-e" => {
++                    i += 1;
++                    if i < args.len() {
++                        self.linker_ordered_items.push(format!("-Wl,-e,{}", args[i]));
++                    }
++                }
++                arg if arg.len() > 2 && arg.starts_with("-e") && !arg.starts_with("-E") => {
++                    self.linker_ordered_items.push(format!("-Wl,-e,{}", &arg[2..]));
++                }
++
+                 // Assembler pass-through: -Wa,flag1,flag2,...
+                 arg if arg.starts_with("-Wa,") => {
+                     for flag in arg[4..].split(',') {
+@@ -436,9 +602,12 @@ impl Driver {
                      self.gnu_extensions = std_value.starts_with("gnu");
                      // gnu89 and c89 use GNU inline semantics by default;
                      // gnu99+ and c99+ use C99 inline semantics.
@@ -22939,7 +23188,7 @@ index b8f9fdc1..21f81d2b 100644
                  }
  
                  // Machine/target flags
-@@ -459,22 +615,92 @@ impl Driver {
+@@ -459,22 +628,92 @@ impl Driver {
                          self.target = Target::I686;
                      }
                  }
@@ -23045,7 +23294,7 @@ index b8f9fdc1..21f81d2b 100644
                  "-mavx" => {
                      self.enable_avx = true;
                      self.enable_sse4_2 = true;
-@@ -500,6 +726,11 @@ impl Driver {
+@@ -500,6 +739,11 @@ impl Driver {
                  "-msse3" => {
                      self.enable_sse3 = true;
                  }
@@ -23057,7 +23306,7 @@ index b8f9fdc1..21f81d2b 100644
                  "-mgeneral-regs-only" => self.general_regs_only = true,
                  "-mcmodel=kernel" => self.code_model_kernel = true,
                  "-mcmodel=small" | "-mcmodel=medlow" | "-mcmodel=medium" | "-mcmodel=medany" | "-mcmodel=large" => {
-@@ -509,7 +740,50 @@ impl Driver {
+@@ -509,7 +753,50 @@ impl Driver {
                      self.riscv_abi = Some(arg["-mabi=".len()..].to_string());
                  }
                  arg if arg.starts_with("-march=") => {
@@ -23109,7 +23358,7 @@ index b8f9fdc1..21f81d2b 100644
                  }
                  "-mlittle-endian" => {
                      // ARM64 target indicator: only arm64-gcc accepts -mlittle-endian.
-@@ -524,7 +798,36 @@ impl Driver {
+@@ -524,7 +811,36 @@ impl Driver {
                      let n: u8 = arg["-mregparm=".len()..].parse().unwrap_or(0);
                      self.regparm = n.min(3);
                  }
@@ -23147,7 +23396,7 @@ index b8f9fdc1..21f81d2b 100644
  
                  // Feature flags
                  "-fPIC" | "-fpic" | "-fPIE" | "-fpie" => self.pic = true,
-@@ -549,8 +852,16 @@ impl Driver {
+@@ -549,8 +865,16 @@ impl Driver {
                  "-fno-data-sections" => self.data_sections = false,
                  "-fcommon" => self.fcommon = true,
                  "-fno-common" => self.fcommon = false,
@@ -24881,7 +25130,7 @@ index 2da42455..6332680c 100644
              | Expr::ImaginaryLiteralF32(_, _)
              | Expr::ImaginaryLiteralLongDouble(_, _, _)
 diff --git a/src/frontend/sema/builtins.rs b/src/frontend/sema/builtins.rs
-index a9f23634..3369fa23 100644
+index a9f23634..1fe26408 100644
 --- a/src/frontend/sema/builtins.rs
 +++ b/src/frontend/sema/builtins.rs
 @@ -20,11 +20,17 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
@@ -24902,7 +25151,16 @@ index a9f23634..3369fa23 100644
      m.insert("__builtin_strncpy", BuiltinInfo::simple("strncpy"));
      m.insert("__builtin_strcmp", BuiltinInfo::simple("strcmp"));
      m.insert("__builtin_strncmp", BuiltinInfo::simple("strncmp"));
-@@ -331,6 +337,40 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
+@@ -101,6 +107,8 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
+     m.insert("__builtin_frame_address", BuiltinInfo::intrinsic(BuiltinIntrinsic::FrameAddress));
+     m.insert("__builtin_extract_return_addr", BuiltinInfo::identity());
+     m.insert("__builtin_thread_pointer", BuiltinInfo::intrinsic(BuiltinIntrinsic::ThreadPointer));
++    m.insert("__builtin_ia32_rdtsc", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Rdtsc));
++    m.insert("__builtin_ia32_rdtscp", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Rdtscp));
+ 
+     // Compiler hints (these become no-ops or identity)
+     m.insert("__builtin_expect", BuiltinInfo::identity()); // returns first arg
+@@ -331,6 +339,40 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
      m.insert("_mm_or_si128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Por128));
      m.insert("_mm_and_si128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pand128));
      m.insert("_mm_xor_si128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pxor128));
@@ -24943,7 +25201,7 @@ index a9f23634..3369fa23 100644
      m.insert("_mm_movemask_epi8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovmskb128));
      m.insert("_mm_stream_si128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntdq));
      m.insert("_mm_stream_si64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movnti64));
-@@ -402,6 +442,212 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
+@@ -402,6 +444,212 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
      m.insert("_mm_extract_epi8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pextrb128));
      m.insert("_mm_insert_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pinsrq128));
      m.insert("_mm_extract_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pextrq128));
@@ -25156,7 +25414,18 @@ index a9f23634..3369fa23 100644
      // __builtin_ia32_* names for the new SSE2 operations
      m.insert("__builtin_ia32_paddw128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Paddw128));
      m.insert("__builtin_ia32_psubw128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psubw128));
-@@ -617,6 +863,58 @@ pub enum BuiltinIntrinsic {
+@@ -534,6 +782,10 @@ pub enum BuiltinIntrinsic {
+     FrameAddress,
+     /// __builtin_return_address(level) -> returns return address
+     ReturnAddress,
++    /// __builtin_ia32_rdtsc() - 64-bit timestamp counter
++    X86Rdtsc,
++    /// __builtin_ia32_rdtscp(&aux) - rdtscp with aux store
++    X86Rdtscp,
+     // X86 SSE intrinsics
+     X86Lfence,
+     X86Mfence,
+@@ -617,6 +869,58 @@ pub enum BuiltinIntrinsic {
      X86Pextrb128,      // _mm_extract_epi8 (PEXTRB)
      X86Pinsrq128,      // _mm_insert_epi64 (PINSRQ)
      X86Pextrq128,      // _mm_extract_epi64 (PEXTRQ)
@@ -25712,7 +25981,7 @@ index 32a0c51b..9aaa715f 100644
          }
      }
 diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
-index 7c5f515b..fef70df3 100644
+index 7c5f515b..1a4076ed 100644
 --- a/src/ir/intrinsics.rs
 +++ b/src/ir/intrinsics.rs
 @@ -44,6 +44,22 @@ pub enum IntrinsicOp {
@@ -25738,7 +26007,18 @@ index 7c5f515b..fef70df3 100644
      /// Move byte mask (pmovmskb) - returns i32
      Pmovmskb128,
      /// Set all bytes to value (splat)
-@@ -258,6 +274,46 @@ pub enum IntrinsicOp {
+@@ -55,6 +71,10 @@ pub enum IntrinsicOp {
+     Crc32_16,
+     Crc32_32,
+     Crc32_64,
++    /// __builtin_ia32_rdtsc() - 64-bit timestamp counter (EDX:EAX)
++    Rdtsc,
++    /// __builtin_ia32_rdtscp(&aux) - rdtscp, stores IA32_TSC_AUX (ecx) to aux
++    Rdtscp,
+     /// __builtin_frame_address(0) - returns current frame pointer
+     FrameAddress,
+     /// __builtin_return_address(0) - returns current return address
+@@ -258,6 +278,46 @@ pub enum IntrinsicOp {
      Paddw128,
      /// Packed 16-bit subtract (PSUBW)
      Psubw128,
@@ -25785,7 +26065,7 @@ index 7c5f515b..fef70df3 100644
      /// Packed 16-bit multiply high (PMULHW)
      Pmulhw128,
      /// Packed 16-bit multiply-add to 32-bit (PMADDWD)
-@@ -334,6 +390,58 @@ pub enum IntrinsicOp {
+@@ -334,6 +394,58 @@ pub enum IntrinsicOp {
      Pinsrq128,
      /// Extract 64-bit value at lane (PEXTRQ) - returns scalar i64
      Pextrq128,
@@ -26164,7 +26444,7 @@ index fe3b9126..bbed6056 100644
              alloca
          } else {
 diff --git a/src/ir/lowering/expr_builtins.rs b/src/ir/lowering/expr_builtins.rs
-index 75d368c2..7d3a67ad 100644
+index 75d368c2..06152726 100644
 --- a/src/ir/lowering/expr_builtins.rs
 +++ b/src/ir/lowering/expr_builtins.rs
 @@ -225,8 +225,10 @@ impl Lowerer {
@@ -26178,7 +26458,7 @@ index 75d368c2..7d3a67ad 100644
                      },
                  });
                  Some(Operand::Value(dest))
-@@ -356,14 +358,26 @@ impl Lowerer {
+@@ -356,18 +358,31 @@ impl Lowerer {
              BuiltinIntrinsic::CpuInit => {
                  Some(Operand::Const(IrConst::I32(0)))
              }
@@ -26209,7 +26489,12 @@ index 75d368c2..7d3a67ad 100644
              }
              // X86 SSE/AES/CRC intrinsics - delegated to lower_x86_intrinsic
              BuiltinIntrinsic::X86Lfence | BuiltinIntrinsic::X86Mfence
-@@ -403,7 +417,62 @@ impl Lowerer {
+             | BuiltinIntrinsic::X86Sfence | BuiltinIntrinsic::X86Pause
++            | BuiltinIntrinsic::X86Rdtsc | BuiltinIntrinsic::X86Rdtscp
+             | BuiltinIntrinsic::X86Clflush
+             | BuiltinIntrinsic::X86Movnti | BuiltinIntrinsic::X86Movnti64
+             | BuiltinIntrinsic::X86Movntdq | BuiltinIntrinsic::X86Movntpd
+@@ -403,7 +418,62 @@ impl Lowerer {
              | BuiltinIntrinsic::X86Crc32_32 | BuiltinIntrinsic::X86Crc32_64
              | BuiltinIntrinsic::X86Pinsrd128 | BuiltinIntrinsic::X86Pextrd128
              | BuiltinIntrinsic::X86Pinsrb128 | BuiltinIntrinsic::X86Pextrb128
@@ -26273,7 +26558,7 @@ index 75d368c2..7d3a67ad 100644
                  self.lower_x86_intrinsic(intrinsic, args)
              }
              // __builtin___*_chk: fortification builtins forward to unchecked libc equivalents.
-@@ -532,9 +601,11 @@ impl Lowerer {
+@@ -532,9 +602,11 @@ impl Lowerer {
                  struct_arg_aligns: vec![],
                  struct_arg_classes: Vec::new(),
                  struct_arg_riscv_float_classes: Vec::new(),
@@ -26285,7 +26570,7 @@ index 75d368c2..7d3a67ad 100644
              },
          });
          Some(Operand::Value(dest))
-@@ -678,7 +749,7 @@ impl Lowerer {
+@@ -678,7 +750,7 @@ impl Lowerer {
              (IrType::F64, 16usize, 8usize)
          };
          let alloca = self.fresh_value();
@@ -26294,7 +26579,7 @@ index 75d368c2..7d3a67ad 100644
          self.emit(Instruction::Store { val: real_val, ptr: alloca, ty: comp_ty, seg_override: AddressSpace::Default });
          let imag_ptr = self.fresh_value();
          self.emit(Instruction::GetElementPtr {
-@@ -715,10 +786,11 @@ impl Lowerer {
+@@ -715,10 +787,11 @@ impl Lowerer {
                  self.emit(Instruction::Intrinsic { dest: None, op, dest_ptr: Some(ptr_val), args: vec![arg_ops[1]] });
                  Some(Operand::Const(IrConst::I64(0)))
              }
@@ -26308,7 +26593,7 @@ index 75d368c2..7d3a67ad 100644
                  let dest_val = self.fresh_value();
                  self.emit(Instruction::Intrinsic { dest: Some(dest_val), op, dest_ptr: Some(result_alloca), args: arg_ops });
                  Some(Operand::Value(result_alloca))
-@@ -729,6 +801,15 @@ impl Lowerer {
+@@ -729,6 +802,15 @@ impl Lowerer {
                  self.emit(Instruction::Intrinsic { dest: Some(dest_val), op, dest_ptr: None, args: arg_ops });
                  Some(Operand::Value(dest_val))
              }
@@ -26324,7 +26609,7 @@ index 75d368c2..7d3a67ad 100644
          }
      }
  }
-@@ -743,8 +824,12 @@ enum X86IntrinsicKind {
+@@ -743,8 +825,12 @@ enum X86IntrinsicKind {
      PtrStore,
      /// 128-bit vector result allocated on stack, returns pointer.
      Vec128,
@@ -26337,7 +26622,7 @@ index 75d368c2..7d3a67ad 100644
  }
  
  /// Map a BuiltinIntrinsic to its emission pattern.
-@@ -757,16 +842,35 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
+@@ -757,16 +843,36 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
  
          BuiltinIntrinsic::X86Movnti | BuiltinIntrinsic::X86Movnti64
          | BuiltinIntrinsic::X86Movntdq | BuiltinIntrinsic::X86Movntpd
@@ -26351,7 +26636,8 @@ index 75d368c2..7d3a67ad 100644
          | BuiltinIntrinsic::X86Crc32_32 | BuiltinIntrinsic::X86Crc32_64
          | BuiltinIntrinsic::X86Pextrd128 | BuiltinIntrinsic::X86Pextrb128
 -        | BuiltinIntrinsic::X86Pextrq128 => X86IntrinsicKind::Scalar,
-+        | BuiltinIntrinsic::X86Pextrq128 | BuiltinIntrinsic::X86Pmovmskb256 => X86IntrinsicKind::Scalar,
++        | BuiltinIntrinsic::X86Pextrq128 | BuiltinIntrinsic::X86Pmovmskb256
++        | BuiltinIntrinsic::X86Rdtsc | BuiltinIntrinsic::X86Rdtscp => X86IntrinsicKind::Scalar,
  
 -        // All remaining X86 intrinsics return 128-bit vector via stack pointer
 +        BuiltinIntrinsic::X86Loadu256 | BuiltinIntrinsic::X86Load256
@@ -26376,7 +26662,16 @@ index 75d368c2..7d3a67ad 100644
          _ => X86IntrinsicKind::Vec128,
      }
  }
-@@ -791,6 +895,22 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
+@@ -774,6 +880,8 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
+ /// Map a BuiltinIntrinsic to its corresponding IntrinsicOp.
+ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
+     match intrinsic {
++        BuiltinIntrinsic::X86Rdtsc => IntrinsicOp::Rdtsc,
++        BuiltinIntrinsic::X86Rdtscp => IntrinsicOp::Rdtscp,
+         BuiltinIntrinsic::X86Lfence => IntrinsicOp::Lfence,
+         BuiltinIntrinsic::X86Mfence => IntrinsicOp::Mfence,
+         BuiltinIntrinsic::X86Sfence => IntrinsicOp::Sfence,
+@@ -791,6 +899,22 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
          BuiltinIntrinsic::X86Por128 => IntrinsicOp::Por128,
          BuiltinIntrinsic::X86Pand128 => IntrinsicOp::Pand128,
          BuiltinIntrinsic::X86Pxor128 => IntrinsicOp::Pxor128,
@@ -26399,7 +26694,7 @@ index 75d368c2..7d3a67ad 100644
          BuiltinIntrinsic::X86Set1Epi8 => IntrinsicOp::SetEpi8,
          BuiltinIntrinsic::X86Set1Epi32 => IntrinsicOp::SetEpi32,
          BuiltinIntrinsic::X86Aesenc128 => IntrinsicOp::Aesenc128,
-@@ -849,6 +969,97 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
+@@ -849,6 +973,97 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
          BuiltinIntrinsic::X86Pextrb128 => IntrinsicOp::Pextrb128,
          BuiltinIntrinsic::X86Pinsrq128 => IntrinsicOp::Pinsrq128,
          BuiltinIntrinsic::X86Pextrq128 => IntrinsicOp::Pextrq128,
@@ -26497,7 +26792,7 @@ index 75d368c2..7d3a67ad 100644
          _ => unreachable!("x86_intrinsic_op called with non-X86 intrinsic: {:?}", intrinsic),
      }
  }
-@@ -881,7 +1092,7 @@ fn classify_ctype(ty: &CType) -> i64 {
+@@ -881,7 +1096,7 @@ fn classify_ctype(ty: &CType) -> i64 {
          | CType::LongLong | CType::ULongLong
          | CType::Int128 | CType::UInt128
          | CType::Enum(_) => 1,       // integer_type_class
@@ -27645,6 +27940,74 @@ index 267952a4..fb4f670f 100644
 +    ];
 +    REGS.contains(&name)
 +}
+diff --git a/src/ir/lowering/lvalue.rs b/src/ir/lowering/lvalue.rs
+index 3046124f..5f9d195b 100644
+--- a/src/ir/lowering/lvalue.rs
++++ b/src/ir/lowering/lvalue.rs
+@@ -56,9 +56,15 @@ impl Lowerer {
+                         return None;
+                     }
+                     let addr_space = ginfo.address_space;
+-                    // Global variable: emit GlobalAddr to get its address
++                    // Global variable: emit GlobalAddr to get its address.
++                    // Apply __asm__("label") redirect (glibc hidden_proto data:
++                    // `extern const char x[] __asm__("__GI_x")` — &x must be
++                    // the address of __GI_x).
++                    let resolved_name = self.asm_label_map.get(name)
++                        .cloned()
++                        .unwrap_or_else(|| name.clone());
+                     let addr = self.fresh_value();
+-                    self.emit(Instruction::GlobalAddr { dest: addr, name: name.clone() });
++                    self.emit(Instruction::GlobalAddr { dest: addr, name: resolved_name });
+                     Some(LValue::Address(addr, addr_space))
+                 } else {
+                     None
+@@ -316,8 +322,15 @@ impl Lowerer {
+                     }
+                 }
+                 if let Some(ginfo) = self.globals.get(name).cloned() {
++                    // Apply __asm__("label") redirect (glibc hidden_proto data
++                    // arrays/pointers: `_dl_argv[0]` in rtld references
++                    // __GI__dl_argv; without this the ld.so link fails with
++                    // R_X86_64_PC32 against undefined `_dl_argv`).
++                    let resolved_name = self.asm_label_map.get(name)
++                        .cloned()
++                        .unwrap_or_else(|| name.clone());
+                     let addr = self.fresh_value();
+-                    self.emit(Instruction::GlobalAddr { dest: addr, name: name.clone() });
++                    self.emit(Instruction::GlobalAddr { dest: addr, name: resolved_name });
+                     let is_inline_data = ginfo.is_array || ginfo.c_type.as_ref().is_some_and(|ct| ct.is_vector());
+                     if is_inline_data {
+                         return Operand::Value(addr);
+diff --git a/src/ir/lowering/ref_collection.rs b/src/ir/lowering/ref_collection.rs
+index 177e5db2..e9921a15 100644
+--- a/src/ir/lowering/ref_collection.rs
++++ b/src/ir/lowering/ref_collection.rs
+@@ -58,14 +58,22 @@ impl Lowerer {
+         for decl in &tu.decls {
+             match decl {
+                 ExternalDecl::FunctionDef(func) => {
+-                    if self.is_skippable_function(func) {
++                    if self.is_skippable_function(func) && !func.attrs.is_used() {
+                         // For skippable functions, collect their refs into a separate map
+                         // so we can do transitive closure later
+                         let mut func_refs = FxHashSet::default();
+                         self.collect_refs_from_compound(&func.body, &mut func_refs);
+                         skippable_refs.insert(func.name.clone(), func_refs);
+                     } else {
+-                        // Root function: collect refs directly into the referenced set
++                        // Root function: collect refs directly into the referenced set.
++                        // __attribute__((used)) functions (e.g. glibc's `static
++                        // __attribute__((__used__)) _dl_start`, called from asm)
++                        // are roots even though they are static — otherwise their
++                        // callees (rtld_timer_start etc.) get skipped and the
++                        // link fails with undefined references.
++                        if func.attrs.is_used() {
++                            referenced.insert(func.name.clone());
++                        }
+                         self.collect_refs_from_compound(&func.body, &mut referenced);
+                     }
+                 }
 diff --git a/src/ir/lowering/stmt.rs b/src/ir/lowering/stmt.rs
 index f82ba2ff..c5fa26ab 100644
 --- a/src/ir/lowering/stmt.rs
@@ -27815,10 +28178,29 @@ index b6e34ac0..8299b887 100644
  
          let dispatch_label = self.fresh_label();
 diff --git a/src/ir/lowering/structs.rs b/src/ir/lowering/structs.rs
-index 1bae6472..37900b09 100644
+index 1bae6472..71910d76 100644
 --- a/src/ir/lowering/structs.rs
 +++ b/src/ir/lowering/structs.rs
-@@ -485,7 +485,7 @@ impl Lowerer {
+@@ -372,8 +372,17 @@ impl Lowerer {
+                     return loaded;
+                 }
+                 if self.globals.contains_key(name) {
++                    // Apply __asm__("label") redirect (glibc hidden_proto data:
++                    // `extern struct opaque_auth _null_auth __asm__("__GI__null_auth")
++                    // __attribute__((visibility("hidden")))` — member accesses
++                    // like `_null_auth.oa_flavor` must reference __GI__null_auth,
++                    // otherwise the object has an unversioned plain reference
++                    // that no member defines).
++                    let resolved_name = self.asm_label_map.get(name)
++                        .cloned()
++                        .unwrap_or_else(|| name.clone());
+                     let addr = self.fresh_value();
+-                    self.emit(Instruction::GlobalAddr { dest: addr, name: name.clone() });
++                    self.emit(Instruction::GlobalAddr { dest: addr, name: resolved_name });
+                     return addr;
+                 }
+                 // Unknown - try to evaluate as expression
+@@ -485,7 +494,7 @@ impl Lowerer {
                      let alloca = self.fresh_value();
                      let alloc_size = if struct_size > 0 { struct_size } else { 8 };
                      let store_ty = Self::packed_store_type(alloc_size);
@@ -27827,7 +28209,7 @@ index 1bae6472..37900b09 100644
                      self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default });
                      alloca
                  }
-@@ -501,7 +501,7 @@ impl Lowerer {
+@@ -501,7 +510,7 @@ impl Lowerer {
                          let alloca = self.fresh_value();
                          let alloc_size = if struct_size > 0 { struct_size } else { 8 };
                          let store_ty = Self::packed_store_type(alloc_size);
@@ -27836,7 +28218,7 @@ index 1bae6472..37900b09 100644
                          self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty, seg_override: AddressSpace::Default });
                          alloca
                      } else {
-@@ -509,7 +509,7 @@ impl Lowerer {
+@@ -509,7 +518,7 @@ impl Lowerer {
                          let src_val = self.lower_expr(expr);
                          let src_addr = self.operand_to_value(src_val);
                          let tmp_alloca = self.fresh_value();
@@ -27845,7 +28227,7 @@ index 1bae6472..37900b09 100644
                          self.emit(Instruction::Memcpy { dest: tmp_alloca, src: src_addr, size: struct_size });
                          tmp_alloca
                      }
-@@ -535,7 +535,7 @@ impl Lowerer {
+@@ -535,7 +544,7 @@ impl Lowerer {
                      let alloca = self.fresh_value();
                      let alloc_size = if struct_size > 0 { struct_size } else { 8 };
                      let store_ty = Self::packed_store_type(alloc_size);
@@ -33636,7 +34018,7 @@ index 78796004..bb0f954b 100644
              },
              source_spans: Vec::new(),
 diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index bd090fac..e03c36b5 100644
+index bd090fac..c529f1f5 100644
 --- a/src/passes/mod.rs
 +++ b/src/passes/mod.rs
 @@ -3,11 +3,13 @@
@@ -33658,7 +34040,7 @@ index bd090fac..e03c36b5 100644
  
  pub(crate) mod cfg_simplify;
  pub(crate) mod constant_fold;
-@@ -22,14 +24,15 @@ pub(crate) mod ipcp;
+@@ -22,30 +24,27 @@ pub(crate) mod ipcp;
  pub(crate) mod iv_strength_reduce;
  pub(crate) mod licm;
  pub(crate) mod loop_analysis;
@@ -33678,7 +34060,12 @@ index bd090fac..e03c36b5 100644
  pub(crate) mod vectorize;
  
  use crate::ir::analysis::CfgAnalysis;
-@@ -40,12 +43,7 @@ use crate::ir::reexports::{IrFunction, IrModule};
+-use crate::ir::reexports::{IrFunction, IrModule};
++use crate::common::fx_hash::FxHashSet;
++use crate::ir::reexports::{Instruction, IrFunction, IrModule};
+ 
+ /// Run a per-function pass only on functions in the visit set.
+ ///
  /// `visit` indicates which functions to process in this iteration.
  /// `changed` accumulates which functions were modified by any pass
  /// (so the next iteration knows what to re-visit).
@@ -33692,7 +34079,7 @@ index bd090fac..e03c36b5 100644
  where
      F: FnMut(&mut IrFunction) -> usize,
  {
-@@ -89,6 +87,7 @@ fn run_gvn_licm_ivsr_shared(
+@@ -89,6 +88,7 @@ fn run_gvn_licm_ivsr_shared(
      let mut gvn_total = 0usize;
      let mut licm_total = 0usize;
      let mut ivsr_total = 0usize;
@@ -33700,7 +34087,7 @@ index bd090fac..e03c36b5 100644
  
      for (i, func) in module.functions.iter_mut().enumerate() {
          if func.is_declaration {
-@@ -105,10 +104,12 @@ fn run_gvn_licm_ivsr_shared(
+@@ -105,10 +105,12 @@ fn run_gvn_licm_ivsr_shared(
          // GVN fast path: single-block functions don't need CFG analysis.
          if num_blocks == 1 {
              if run_gvn {
@@ -33715,7 +34102,7 @@ index bd090fac..e03c36b5 100644
                  }
              }
              // LICM and IVSR need loops (>= 2 blocks), so skip.
-@@ -120,28 +121,52 @@ fn run_gvn_licm_ivsr_shared(
+@@ -120,28 +122,52 @@ fn run_gvn_licm_ivsr_shared(
  
          // Run GVN with shared analysis.
          if run_gvn {
@@ -33775,7 +34162,7 @@ index bd090fac..e03c36b5 100644
              }
          }
  
-@@ -218,11 +243,42 @@ impl DisabledPasses {
+@@ -218,20 +244,65 @@ impl DisabledPasses {
  }
  
  /// Run Phase 0: function inlining and post-inline optimization passes.
@@ -33817,22 +34204,53 @@ index bd090fac..e03c36b5 100644
 +        eprintln!("==== IR after inline phase ====");
 +        eprintln!("{:#?}", module);
 +        eprintln!("==== END IR after inline ====");
++    }
++
++    // After inlining, convert extern inline gnu_inline functions to declarations —
++    // but ONLY when no calls remain. The bodies were only needed for inlining;
++    // they must not be emitted as standalone definitions when fully inlined away,
++    // because their internal calls (e.g., `call btowc`) would resolve to the local
++    // definition instead of the external library symbol, causing infinite recursion.
++    // However, if any call site was NOT inlined (e.g. the caller was skipped by the
++    // inliner), the function MUST still be emitted as a local (static) definition —
++    // GNU89 `extern inline` semantics provide an inline definition usable locally.
++    // Dropping it here made glibc's rtld link fail with undefined references to
++    // `free`, `__bsearch` etc.
++    let mut still_called: FxHashSet<String> = FxHashSet::default();
++    for func in &module.functions {
++        for block in &func.blocks {
++            for inst in &block.instructions {
++                if let Instruction::Call { func: callee, .. } = inst {
++                    still_called.insert(callee.clone());
++                }
++            }
++        }
      }
 -    inline::run(module);
- 
-     // After inlining, convert extern inline gnu_inline functions to declarations.
-     // These function bodies were only needed for inlining; they must not be emitted
-@@ -246,40 +302,65 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
+-
+-    // After inlining, convert extern inline gnu_inline functions to declarations.
+-    // These function bodies were only needed for inlining; they must not be emitted
+-    // as standalone definitions because their internal calls (e.g., `call btowc`)
+-    // would resolve to the local definition instead of the external library symbol,
+-    // causing infinite recursion. Converting to declarations ensures any remaining
+-    // (non-inlined) calls resolve to the external symbol at link time.
+     for func in &mut module.functions {
+-        if func.is_gnu_inline_def && !func.is_declaration {
++        if func.is_gnu_inline_def && !func.is_declaration && !still_called.contains(&func.name) {
+             func.is_declaration = true;
+             func.blocks.clear();
+         }
+@@ -246,40 +317,65 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
      resolve_asm::resolve_inline_asm_symbols(module);
  }
  
 -/// All optimization levels run the same pipeline with the same number of
 -/// iterations. The `opt_level` parameter is accepted for API compatibility
 -/// but currently ignored -- all levels behave identically.
+-///
+-/// **Why single-level optimization matters for this project:**
 +/// Run optimization passes for the requested optimization level.
  ///
--/// **Why single-level optimization matters for this project:**
--///
 -/// Having multiple optimization tiers (e.g., -O0 doing minimal work, -O1 doing
 -/// partial work, -O2 doing full work) is exponentially harder to test. Each tier
 -/// is a separate code path through the optimizer, and bugs that only appear at
@@ -33916,7 +34334,7 @@ index bd090fac..e03c36b5 100644
      constant_fold::resolve_remaining_is_constant(module);
  
      // Switch case outlining: extract case bodies from large switch statements
-@@ -313,8 +394,6 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -313,8 +409,6 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
      // `changed` accumulates which functions were modified during each iteration.
      let mut changed = vec![false; num_funcs];
  
@@ -33925,7 +34343,7 @@ index bd090fac..e03c36b5 100644
      // Per-pass change counts from the previous iteration, used for skip decisions.
      // Pass indices: 0=cfg1, 1=copyprop1, 2=narrow, 3=simplify, 4=constfold,
      //               5=gvn, 6=licm, 7=ifconv, 8=copyprop2, 9=dce, 10=cfg2
-@@ -338,7 +417,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -338,7 +432,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
                      let t0 = std::time::Instant::now();
                      let n = $body;
                      let elapsed = t0.elapsed().as_secs_f64();
@@ -33937,7 +34355,7 @@ index bd090fac..e03c36b5 100644
                      n
                  } else {
                      $body
-@@ -369,7 +451,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -369,7 +466,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
          // Phase 1: CFG simplification
          // Upstream: constfold (constant branches), dce (empty blocks)
          if !dis.cfg && should_run!(0, 4, 9) {
@@ -33949,7 +34367,7 @@ index bd090fac..e03c36b5 100644
              cur_pass_changes[0] = n;
              total_changes += n;
              total_changes_excl_dce += n;
-@@ -378,7 +463,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -378,7 +478,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
          // Phase 2: Copy propagation
          // Upstream: cfg_simplify (simpler CFG), gvn (eliminated exprs), licm (hoisted code), if_convert
          if !dis.copyprop && should_run!(1, 0, 5, 6, 7) {
@@ -33961,7 +34379,7 @@ index bd090fac..e03c36b5 100644
              cur_pass_changes[1] = n;
              total_changes += n;
              total_changes_excl_dce += n;
-@@ -396,7 +484,15 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -396,7 +499,15 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
          // TODO: Re-enable once i686 has proper 64-bit arithmetic support, or implement
          // a 32-bit-aware variant that uses single-operand imull for mulhi.
          if iter == 0 && !disabled.contains("divconst") && !target.is_32bit() {
@@ -33978,7 +34396,7 @@ index bd090fac..e03c36b5 100644
              total_changes += n;
              total_changes_excl_dce += n;
          }
-@@ -404,9 +500,11 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -404,9 +515,11 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
          // Phase 2b: Loop unrolling — iter 0 only, before GVN/LICM so that
          // subsequent passes can optimize the unrolled copies.
          // Pass name for CCC_DISABLE_PASSES: "unroll"
@@ -33993,7 +34411,7 @@ index bd090fac..e03c36b5 100644
              total_changes += n;
              total_changes_excl_dce += n;
          }
-@@ -414,9 +512,11 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -414,9 +527,11 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
          // Phase 2b-vec: SSE2 vectorization — iter 0 only, EARLY in pipeline.
          // Run before GVN/LICM/etc to catch IR in simpler state.
          // Pass name for CCC_DISABLE_PASSES: "vectorize"
@@ -34008,7 +34426,7 @@ index bd090fac..e03c36b5 100644
              total_changes += n;
              total_changes_excl_dce += n;
          }
-@@ -424,7 +524,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -424,7 +539,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
          // Phase 2c: Integer narrowing
          // Upstream: copy_prop (propagated values expose narrowing)
          if !dis.narrow && should_run!(2, 1) {
@@ -34020,7 +34438,7 @@ index bd090fac..e03c36b5 100644
              cur_pass_changes[2] = n;
              total_changes += n;
              total_changes_excl_dce += n;
-@@ -433,7 +536,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -433,7 +551,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
          // Phase 3: Algebraic simplification
          // Upstream: copy_prop (propagated values), narrow (smaller types)
          if !dis.simplify && should_run!(3, 1, 2) {
@@ -34032,7 +34450,7 @@ index bd090fac..e03c36b5 100644
              cur_pass_changes[3] = n;
              total_changes += n;
              total_changes_excl_dce += n;
-@@ -444,7 +550,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -444,7 +565,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
          //           if_convert (creates Select that constfold can fold with known-constant cond),
          //           copy_prop2 (propagates constants into Select/Cmp operands after if_convert)
          if !dis.constfold && should_run!(4, 1, 2, 3, 7, 8) {
@@ -34044,7 +34462,7 @@ index bd090fac..e03c36b5 100644
              cur_pass_changes[4] = n;
              total_changes += n;
              total_changes_excl_dce += n;
-@@ -457,15 +566,22 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -457,15 +581,22 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
          // existing blocks), the analysis computed for GVN remains valid for LICM
          // and IVSR. We compute it once per function and share it across all three.
          {
@@ -34071,7 +34489,7 @@ index bd090fac..e03c36b5 100644
                  );
                  cur_pass_changes[5] = gvn_n;
                  total_changes += gvn_n;
-@@ -481,7 +597,15 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -481,7 +612,15 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
          // Phase 7: If-conversion
          // Upstream: cfg_simplify (simpler CFG), constfold (simplified conditions)
          if !dis.ifconv && should_run!(7, 0, 4) {
@@ -34088,7 +34506,7 @@ index bd090fac..e03c36b5 100644
              cur_pass_changes[7] = n;
              total_changes += n;
              total_changes_excl_dce += n;
-@@ -492,8 +616,13 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -492,8 +631,13 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
          //           gvn (produced copies), licm (hoisted code), if_convert (select values)
          // Note: simplify and constfold run earlier in this iteration, so we check
          // cur_pass_changes for them (not just prev_pass_changes via should_run!).
@@ -34104,7 +34522,7 @@ index bd090fac..e03c36b5 100644
              cur_pass_changes[8] = n;
              total_changes += n;
              total_changes_excl_dce += n;
-@@ -511,7 +640,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -511,7 +655,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
          // (e.g., kernel's cpucap_is_possible switch folding through inlined
          // system_supports_sme -> alternative_has_cap_unlikely -> cpucap_is_possible).
          if !dis.dce && should_run!(9, 5, 6, 7, 8) {
@@ -34116,7 +34534,7 @@ index bd090fac..e03c36b5 100644
              cur_pass_changes[9] = n;
              total_changes += n;
              // Intentionally NOT added to total_changes_excl_dce
-@@ -520,7 +652,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -520,7 +667,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
          // Phase 10: CFG simplification again
          // Upstream: constfold (constant branches), dce (dead blocks), if_convert
          if !dis.cfg && should_run!(10, 4, 7, 9) {
@@ -34128,7 +34546,7 @@ index bd090fac..e03c36b5 100644
              cur_pass_changes[10] = n;
              total_changes += n;
              total_changes_excl_dce += n;
-@@ -540,7 +675,6 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -540,7 +690,6 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
              total_changes_excl_dce += ipcp_changes;
          }
  
@@ -34136,7 +34554,7 @@ index bd090fac..e03c36b5 100644
          if iter == 0 {
              iter0_total_changes = total_changes_excl_dce;
          }
-@@ -576,7 +710,9 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -576,7 +725,9 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
          // least 2 iterations to complete: iter0 for initial folding, iter1 for
          // propagating results through the control flow.
          const DIMINISHING_RETURNS_FACTOR: usize = 20; // 1/20 = 5% threshold
@@ -34147,7 +34565,7 @@ index bd090fac..e03c36b5 100644
              && total_changes_excl_dce * DIMINISHING_RETURNS_FACTOR < iter0_total_changes
          {
              break;
-@@ -599,4 +735,36 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
+@@ -599,4 +750,36 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
      // (e.g., kernel's `___siphash_aligned` calling `__siphash_aligned` which doesn't
      // exist on x86 where CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS is set).
      dead_statics::eliminate_dead_static_functions(module);
