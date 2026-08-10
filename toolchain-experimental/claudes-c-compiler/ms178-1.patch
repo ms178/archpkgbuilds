@@ -1,418 +1,567 @@
-diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
-index c70e91c7..893a4db7 100644
---- a/src/backend/arm/codegen/emit.rs
-+++ b/src/backend/arm/codegen/emit.rs
-@@ -1728,6 +1728,10 @@ pub(super) const ARM_ARG_REGS: [&str; 8] = ["x0", "x1", "x2", "x3", "x4", "x5",
- const ARM_TMP_REGS: [&str; 8] = ["x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16"];
- 
- impl ArchCodegen for ArmCodegen {
-+    fn is_value_reg_assigned(&self, vid: u32) -> bool {
-+        self.reg_assignments.contains_key(&vid)
-+    }
-+
-     fn state(&mut self) -> &mut CodegenState { &mut self.state }
-     fn state_ref(&self) -> &CodegenState { &self.state }
- 
 diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index b7900487..3dedcd21 100644
+index 3dedcd21..4a433077 100644
 --- a/src/backend/generation.rs
 +++ b/src/backend/generation.rs
-@@ -2037,15 +2037,24 @@ fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
-     }
+@@ -1328,6 +1328,7 @@ fn generate_function(
+         !has_dyn_alloca && !func.is_variadic && !has_inline_asm_rbp && !has_vector_intrinsics;
  
-     // Skip Copy when dest and src share the same stack slot (from copy coalescing).
-+    // SOUNDNESS (maketrees #2, 2026-08): the elision is valid ONLY when neither
-+    // side is register-resident. A register-assigned side has its live home in
-+    // the register, not the slot: if dest holds a register, the copy must move
-+    // src's value INTO that register (eliding leaves it stale — this is how the
-+    // exchange eviction exposed the bug); if src holds a register, the slot
-+    // content is stale and dest must receive the register's value. Same-slot
-+    // identity alone is not proof of no-op once allocation can re-home values.
-     if let Operand::Value(src_val) = src {
--        let dest_slot = cg.state_ref().get_slot(dest.0);
--        let src_slot = cg.state_ref().get_slot(src_val.0);
--        if let (Some(ds), Some(ss)) = (dest_slot, src_slot) {
--            if ds.0 == ss.0 {
--                if cg.state_ref().reg_cache.acc_has(src_val.0, false) {
--                    cg.state().reg_cache.set_acc(dest.0, false);
-+        if !cg.is_value_reg_assigned(dest.0) && !cg.is_value_reg_assigned(src_val.0) {
-+            let dest_slot = cg.state_ref().get_slot(dest.0);
-+            let src_slot = cg.state_ref().get_slot(src_val.0);
-+            if let (Some(ds), Some(ss)) = (dest_slot, src_slot) {
-+                if ds.0 == ss.0 {
-+                    if cg.state_ref().reg_cache.acc_has(src_val.0, false) {
-+                        cg.state().reg_cache.set_acc(dest.0, false);
-+                    }
-+                    return;
-                 }
--                return;
+     // Calculate stack space and emit prologue
++    cg.state().current_func_name = func.name.clone();
+     let raw_space = cg.calculate_stack_space(func);
+     let frame_size = cg.aligned_frame_size(raw_space);
+     cg.state().frame_size = frame_size;
+@@ -1510,7 +1511,7 @@ fn generate_function(
+             // If the instruction is handled, it's accumulated in the MachInst buffer.
+             // When an unhandled instruction is encountered, the buffer is flushed
+             // (allocated and emitted) before falling through to the default codegen.
+-            if cg.try_lower_machinst(inst) {
++            if cg.try_lower_machinst(inst, &dead_global_addrs) {
+                 cg.state().current_program_point += 1;
+                 continue;
              }
-         }
-     }
-diff --git a/src/backend/i686/codegen/emit.rs b/src/backend/i686/codegen/emit.rs
-index dbd25e3d..2fa0af3c 100644
---- a/src/backend/i686/codegen/emit.rs
-+++ b/src/backend/i686/codegen/emit.rs
-@@ -1250,6 +1250,10 @@ impl I686Codegen {
- // ─── ArchCodegen trait implementation ────────────────────────────────────────
- 
- impl ArchCodegen for I686Codegen {
-+    fn is_value_reg_assigned(&self, vid: u32) -> bool {
-+        self.reg_assignments.contains_key(&vid)
-+    }
-+
-     fn state(&mut self) -> &mut CodegenState { &mut self.state }
-     fn state_ref(&self) -> &CodegenState { &self.state }
- 
-diff --git a/src/backend/live_range.rs b/src/backend/live_range.rs
-index f3b4de39..34abb1c0 100644
---- a/src/backend/live_range.rs
-+++ b/src/backend/live_range.rs
-@@ -10,7 +10,8 @@
- //! For each interval, we either assign it a free register or spill it to the stack.
- 
- use super::liveness::{
--    for_each_operand_in_instruction, for_each_operand_in_terminator, LiveInterval,
-+    for_each_operand_in_instruction, for_each_operand_in_terminator,
-+    for_each_value_use_in_instruction, LiveInterval,
- };
- use super::regalloc::PhysReg;
- use crate::common::fx_hash::FxHashMap;
-@@ -34,6 +35,12 @@ pub struct LiveRange {
-     pub priority: u64,             // uses.len() * 10^loop_depth (higher priority = allocate first)
-     pub reg_hint: Option<PhysReg>, // Preferred register (from Copy sources)
-     pub spill_weight: f64,         // Cost of spilling: priority / range_length
-+    /// Cascade number for eviction-chain suppression (LLVM RegAllocGreedy
-+    /// lineage): an interval that took a register by eviction carries
-+    /// victim.cascade + 1, and may only be evicted again by an interval with
-+    /// an equal or higher cascade. Bounds eviction chains, killing the
-+    /// ping-pong that plain priority eviction (old mode 2) exhibited.
-+    pub cascade: u32,
- }
- 
- impl LiveRange {
-@@ -65,6 +72,7 @@ impl LiveRange {
-             priority: uses,
-             reg_hint: None,
-             spill_weight,
-+            cascade: 0,
-         }
-     }
- 
-@@ -134,6 +142,17 @@ pub struct LinearScanAllocator {
-     // Rotation index for register selection: start searching from this index
-     // instead of 0 to distribute consecutive allocations across different registers.
-     pub next_reg_idx: usize,
-+
-+    /// Use future-value exchange eviction instead of the mode-3 next-use guard.
-+    /// Enabled only for the callee-saved overflow phase (Phase 2c), where the
-+    /// mode-3 guard makes economically catastrophic decisions: it demotes
-+    /// loop-carried values with dozens of remaining uses to make room for
-+    /// late-starting values used once or twice (measured in gzip's
-+    /// longest_match: chains evicted from rbx/r14/r15 by post-loop
-+    /// single-use temporaries). The exchange rule only evicts when the
-+    /// incoming range has strictly more future uses than the victim, so every
-+    /// eviction provably reduces total slot traffic.
-+    pub exchange_eviction: bool,
- }
- 
- impl LinearScanAllocator {
-@@ -150,6 +169,7 @@ impl LinearScanAllocator {
-             next_spill_slot: 0,
-             enable_splitting: false,
-             next_reg_idx: 0,
-+            exchange_eviction: false,
-         }
-     }
- 
-@@ -252,6 +272,71 @@ impl LinearScanAllocator {
-         None
-     }
- 
-+    /// Remaining (future) weighted use count of a range at scan position `pos`:
-+    /// the number of uses strictly after `pos`. Under LCCC's lifetime-demotion
-+    /// spill model (a demoted value pays slot traffic at EVERY remaining use;
-+    /// there is no reload-at-next-use), this is exactly the cost of demoting
-+    /// the range at this point.
-+    fn future_uses(range: &LiveRange, pos: u32) -> u32 {
-+        range.uses.iter().filter(|&&u| u > pos).count() as u32
-+    }
-+
-+    /// Exchange-based eviction candidate selection (W1 redesign, default).
-+    ///
-+    /// Literature basis: Poletto & Sarkar's linear scan spills the interval
-+    /// with the furthest endpoint; Braun & Hack's MIN rule (spilling the
-+    /// interval with the furthest NEXT use) improves it markedly; LLVM's
-+    /// RegAllocGreedy orders by spill weight and suppresses eviction chains
-+    /// with cascade numbers. Under LCCC's lifetime-demotion model the exact
-+    /// exchange argument is: evicting active C in favor of incoming I changes
-+    /// total slot traffic by +future(C) - future(I), so the demotion is
-+    /// profitable iff future(I) > future(C), and cascades are bounded by
-+    /// requiring C.cascade <= I.cascade (a once-evicted interval cannot be
-+    /// re-displaced by a fresh cascade-0 arrival).
-+    ///
-+    /// Returns the index into `self.active` of the victim, or None when no
-+    /// profitable, cascade-legal victim exists (the incoming then spills).
-+    ///
-+    /// MEASURED & REJECTED as the default (2026-08-10): on gzip 1.14
-+    /// (raptorlake, 13.2MB corpus, 5-run paired medians) CCC_EVICT_MODE=5
-+    /// regressed -6 by +4.5% (0.835s vs 0.799s) and -9 by +3.3% (2.648s vs
-+    /// 2.564s) relative to the mode-3 default, and additionally exposed
-+    /// latent copy-alias/slot-pack unsoundness (maketrees miscompile). Under
-+    /// LCCC's lifetime-demotion model the locally-profitable exchange
-+    /// cascades into NET higher slot traffic in hot loops. Kept reachable via
-+    /// CCC_EVICT_MODE=5 for future work on reload-at-next-use / splitting.
-+    pub fn find_exchange_candidate(&self, range: &LiveRange) -> Option<usize> {
-+        if self.active.is_empty() {
-+            return None;
-+        }
-+        let incoming_future = range.uses.len() as u32;
-+        let mut best_idx: Option<usize> = None;
-+        let mut best_future = u32::MAX;
-+        let mut best_next_use = 0u32;
-+        for (idx, interval) in self.active.iter().enumerate() {
-+            // Cascade legality: never displace an interval that already won
-+            // its register by eviction from a lower-cascade newcomer.
-+            if interval.range.cascade > range.cascade {
-+                continue;
-+            }
-+            let fut = Self::future_uses(&interval.range, range.start);
-+            let nxt = next_use_after(&interval.range, range.start);
-+            // Minimum future cost wins; ties break to the farthest next use
-+            // (MIN rule): demoting it disturbs the nearest-future code least.
-+            if fut < best_future || (fut == best_future && nxt > best_next_use) {
-+                best_idx = Some(idx);
-+                best_future = fut;
-+                best_next_use = nxt;
-+            }
-+        }
-+        // Profitability: the incoming must have strictly more future uses than
-+        // the victim (each future use is one slot access under demotion).
-+        match best_idx {
-+            Some(idx) if best_future < incoming_future => Some(idx),
-+            _ => None,
-+        }
-+    }
-+
-     /// Find the best active interval to evict (spill) to free a register for the
-     /// incoming range at the current scan position.
-     ///
-@@ -347,7 +432,39 @@ impl LinearScanAllocator {
-             let mode: i32 = std::env::var("CCC_EVICT_MODE")
-                 .ok()
-                 .and_then(|s| s.parse().ok())
--                .unwrap_or(3);
-+                .unwrap_or(if self.exchange_eviction { 5 } else { 3 });
-+            if mode == 5 {
-+                // Default: future-value exchange with cascade suppression.
-+                if let Some(evict_idx) = self.find_exchange_candidate(&range) {
-+                    let (evicted_vid, evicted_cascade) = {
-+                        let cand = &self.active[evict_idx];
-+                        (cand.range.value_id, cand.range.cascade)
-+                    };
-+                    if let Some(reg) = self.assignments.remove(&evicted_vid) {
-+                        if !self.spill_slots.contains_key(&evicted_vid) {
-+                            self.allocate_spill_slot(evicted_vid);
-+                        }
-+                        if std::env::var("CCC_TRACE_ALLOCSTATS").is_ok() {
-+                            eprintln!(
-+                                "[EVICT5] val{} reg={} -> val{}[{}] fut_in={} ",
-+                                evicted_vid, reg.0, range.value_id, range.start,
-+                                range.uses.len()
-+                            );
-+                        }
-+                        let mut incoming = range;
-+                        incoming.cascade = evicted_cascade + 1;
-+                        self.assignments.insert(incoming.value_id, reg);
-+                        self.occupy_register(reg, incoming.end + 1);
-+                        self.active[evict_idx] = ActiveInterval {
-+                            range: incoming,
-+                            next_use: None,
-+                        };
-+                        return;
-+                    }
-+                }
-+                self.allocate_spill_slot(range.value_id);
-+                return;
-+            }
-             if mode > 0 {
-                 if let Some(evict_idx) = self.find_evict_candidate(range.start) {
-                     let cand = &self.active[evict_idx];
-@@ -488,6 +605,13 @@ pub fn build_live_ranges(
-                     *entry = (*entry).max(bdepth);
-                 }
-             });
-+            // W1: address-side uses (Load/Store ptr, GEP base) earn loop depth
-+            // exactly like data operands — a pointer consumed as an addressing
-+            // base inside the loop is as hot as any scalar operand.
-+            for_each_value_use_in_instruction(inst, |v| {
-+                let entry = max_use_depth.entry(v.0).or_insert(0);
-+                *entry = (*entry).max(bdepth);
-+            });
-         }
-         for_each_operand_in_terminator(&block.terminator, |op| {
-             if let Operand::Value(v) = op {
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index 18981e7e..e1e09668 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -446,6 +446,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                     *use_count.entry(v.0).or_insert(0) += weight;
-                 }
-             });
-+            // W1: address-side uses (Load/Store ptr, GEP base) carry the same
-+            // loop-weighted heat — hot addressing bases must rank high in the
-+            // allocation/spill-order decisions driven by this count.
-+            for_each_value_use_in_instruction(inst, |v| {
-+                *use_count.entry(v.0).or_insert(0) += weight;
-+            });
-         }
-         for_each_operand_in_terminator(&block.terminator, |op| {
-             if let Operand::Value(v) = op {
-@@ -667,6 +673,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                 let phase2c_ranges =
-                     live_range::build_live_ranges(&phase2c_intervals, &liveness.block_loop_depth, func);
-                 let mut spill_allocator = LinearScanAllocator::new(phase2c_ranges, free_callee);
-+                // NOTE: future-value exchange eviction was measured here too
-+                // (2026-08-10) and ALSO regressed gzip (+5.75%/-6, +5.36%/-9;
-+                // longest_match 304->339 insns, 92->128 rsp refs): hot chains
-+                // evicting each other cancels out and second-order effects lose.
-+                // Mode-3's next-use guard remains the best-measured policy.
-                 spill_allocator.run();
-                 for (vid, reg) in spill_allocator.assignments {
-                     assignments.insert(vid, reg);
-diff --git a/src/backend/riscv/codegen/emit.rs b/src/backend/riscv/codegen/emit.rs
-index 1bf4264f..6a143a5c 100644
---- a/src/backend/riscv/codegen/emit.rs
-+++ b/src/backend/riscv/codegen/emit.rs
-@@ -473,6 +473,10 @@ impl RiscvCodegen {
- }
- 
- impl ArchCodegen for RiscvCodegen {
-+    fn is_value_reg_assigned(&self, vid: u32) -> bool {
-+        self.reg_assignments.contains_key(&vid)
-+    }
-+
-     fn state(&mut self) -> &mut CodegenState { &mut self.state }
-     fn state_ref(&self) -> &CodegenState { &self.state }
-     fn ptr_directive(&self) -> PtrDirective { PtrDirective::Dword }
-diff --git a/src/backend/stack_layout/copy_coalescing.rs b/src/backend/stack_layout/copy_coalescing.rs
-index 1fabd6f9..eb5cc799 100644
---- a/src/backend/stack_layout/copy_coalescing.rs
-+++ b/src/backend/stack_layout/copy_coalescing.rs
-@@ -648,6 +648,19 @@ pub(super) fn build_copy_alias_map(
-             };
- 
-             for &(src_id, _src_blk, src_copy_pp) in sources {
-+                // SOUNDNESS (maketrees miscompile, 2026-08): only loop-carried
-+                // WEB MEMBERS may be aliased into the web. An external feed
-+                // value (single-def, defined outside the web — e.g. the
-+                // GlobalAddr of the final-iteration separator string) has its
-+                // own home; aliasing it in makes the elided phi Copy leave
-+                // the web home holding a STALE earlier value, which later
-+                // reads of the dest then return. Web membership = src is
-+                // itself a phi dest (multi-def loop-carried value).
-+                if !phi_copies.contains_key(&src_id)
-+                    && !multi_def_values.contains(&src_id)
-+                {
-+                    continue;
-+                }
-                 // Get src's liveness interval.
-                 let src_interval = interval_map.get(&src_id);
- 
+@@ -1612,7 +1613,7 @@ fn emit_loc_directive(
+ ///
+ /// Instructions that clobber the accumulator unpredictably (calls, stores, atomics,
+ /// inline asm, va_arg, memcpy, etc.) invalidate the cache after execution.
+-fn generate_instruction(
++pub(crate) fn generate_instruction(
+     cg: &mut dyn ArchCodegen,
+     inst: &Instruction,
+     gep_fold_map: &FxHashMap<u32, GepFoldInfo>,
+diff --git a/src/backend/state.rs b/src/backend/state.rs
+index b141ae2c..98d8b243 100644
+--- a/src/backend/state.rs
++++ b/src/backend/state.rs
+@@ -221,6 +221,8 @@ pub struct CodegenState {
+     /// and skipped during codegen. These values are never emitted — their registers
+     /// are uninitialized. MachInst must not use these as pointers.
+     pub folded_gep_values: FxHashSet<u32>,
++    /// Name of the function currently being code-generated (diagnostics).
++    pub current_func_name: String,
+     /// Total use count for each value ID across the entire function.
+     /// Used by MachInst flush to determine if a buffer-defined vreg is live-out.
+     pub value_use_counts: Vec<u32>,
+@@ -379,6 +381,7 @@ impl CodegenState {
+             reg_cache: RegCache::default(),
+             gep_base_offset: FxHashMap::default(),
+             folded_gep_values: FxHashSet::default(),
++            current_func_name: String::new(),
+             value_use_counts: Vec::new(),
+             block_use_counts: FxHashMap::default(),
+             function_return_thunk: false,
 diff --git a/src/backend/traits.rs b/src/backend/traits.rs
-index 5da2c459..ce240de0 100644
+index ce240de0..992bfdd0 100644
 --- a/src/backend/traits.rs
 +++ b/src/backend/traits.rs
-@@ -97,6 +97,13 @@ pub trait ArchCodegen {
-     /// Immutable access to the shared codegen state.
-     fn state_ref(&self) -> &CodegenState;
- 
-+    /// Whether `vid` holds its value in a physical register (register
-+    /// allocation result). Copy elision and slot-sharing decisions must
-+    /// consult this: a same-slot copy is only a no-op when NEITHER side is
-+    /// register-resident (otherwise the register side is the live home and
-+    /// the copy must move the value into/out of it).
-+    fn is_value_reg_assigned(&self, _vid: u32) -> bool { false }
-+
-     /// The pointer directive for this architecture's data emission.
-     fn ptr_directive(&self) -> PtrDirective;
+@@ -174,7 +174,13 @@ pub trait ArchCodegen {
+     /// internal buffer). Returns false if the instruction should use the default
+     /// accumulator-based codegen path.
+     /// Default: always false (no MachInst support).
+-    fn try_lower_machinst(&mut self, _inst: &Instruction) -> bool {
++    /// Try to lower an IR instruction into the MachInst buffer.
++    /// `folded_global_addrs` lists GlobalAddr values whose address computation
++    /// is folded into direct symbol(%rip) load/store operands by the default
++    /// path (their GlobalAddr instruction is skipped). MachInst cannot
++    /// represent those as a register base, so such loads/stores must stay on
++    /// the default path.
++    fn try_lower_machinst(&mut self, _inst: &Instruction, _folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>) -> bool {
+         false
+     }
  
 diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index fcf8792b..ed892b65 100644
+index ed892b65..65b5df09 100644
 --- a/src/backend/x86/codegen/emit.rs
 +++ b/src/backend/x86/codegen/emit.rs
-@@ -2817,6 +2817,10 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, ra: &FxHashMap<u32, P
+@@ -351,6 +351,13 @@ pub struct X86Codegen {
+     /// MachInst buffer for virtual register ISel. Instructions are accumulated
+     /// here by try_lower_machinst and flushed (allocated + emitted) by flush_machinst.
+     pub(super) machinst_buf: Vec<super::machinst::MachInst>,
++    /// Shadow of the IR instructions currently in `machinst_buf`, in the same
++    /// order. Used by the fallback path: if the MachInst buffer cannot be fully
++    /// resolved (a value on the stack in a register-only position), the
++    /// buffered IR instructions are re-emitted through the default codegen
++    /// path instead of being silently deleted (which miscompiled gzip:
++    /// missing loads/ALU -> segfault).
++    pub(super) machinst_buf_ir: Vec<crate::ir::reexports::Instruction>,
+     /// Whether MachInst ISel is enabled (CCC_USE_MACHINST env var).
+     pub(super) machinst_enabled: bool,
+ }
+@@ -401,6 +408,7 @@ impl X86Codegen {
+             caller_save_spill_slots: FxHashMap::default(),
+             caller_save_intervals: FxHashMap::default(),
+             machinst_buf: Vec::new(),
++            machinst_buf_ir: Vec::new(),
+             machinst_enabled: std::env::var("CCC_USE_MACHINST").is_ok(),
+         }
+     }
+@@ -2569,7 +2577,7 @@ fn collect_vregs_in_inst(
+             def_reg(dst, all, defs);
+         }
+         MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
+-            use_reg(src, all);
++            use_op(src, all);
+             def_reg(dst, all, defs);
+         }
+         MachInst::Cmov { src, dst, .. } => {
+@@ -2730,6 +2738,47 @@ fn resolve_stack_vregs(
+                 size: *size,
+             }
+         }
++        MachInst::Movzx { src, dst, from_size, to_size } => {
++            // movzx/movsx accept a memory source: a slot-backed (spilled) src
++            // vreg can be resolved to StackSlot directly. The emitter formats
++            // the src through fmt_operand, so `movzbl slot, %eax` is emitted.
++            // A slot-backed dst stays a vreg and is caught by
++            // has_unresolvable_vreg -> default-path fallback.
++            let src_resolved = match src {
++                MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
++                    if let Some(slot) = state.get_slot(*id) {
++                        MachOperand::StackSlot(slot.0)
++                    } else {
++                        src.clone()
++                    }
++                }
++                _ => src.clone(),
++            };
++            MachInst::Movzx {
++                src: src_resolved,
++                dst: *dst,
++                from_size: *from_size,
++                to_size: *to_size,
++            }
++        }
++        MachInst::Movsx { src, dst, from_size, to_size } => {
++            let src_resolved = match src {
++                MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
++                    if let Some(slot) = state.get_slot(*id) {
++                        MachOperand::StackSlot(slot.0)
++                    } else {
++                        src.clone()
++                    }
++                }
++                _ => src.clone(),
++            };
++            MachInst::Movsx {
++                src: src_resolved,
++                dst: *dst,
++                from_size: *from_size,
++                to_size: *to_size,
++            }
++        }
+         MachInst::Cmp { lhs, rhs, size } => MachInst::Cmp {
+             lhs: resolve_op(lhs),
+             rhs: resolve_op(rhs),
+@@ -2788,6 +2837,10 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, ra: &FxHashMap<u32, P
+             MachOperand::Reg(r) => check_reg(r),
+             MachOperand::Mem { base, .. } => check_reg(base),
+             MachOperand::MemIndex { base, index, .. } => check_reg(base) || check_reg(index),
++            // AllocaAddr is resolved to a Raw leaq only when a slot exists;
++            // without one the emitter prints an error comment and the address
++            // computation silently vanishes. Fall back instead.
++            MachOperand::AllocaAddr(_) => true,
+             _ => false,
+         }
+     };
+@@ -2808,7 +2861,7 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, ra: &FxHashMap<u32, P
+         }
+         MachInst::SetCC { dst, .. } => check_reg(dst),
+         MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
+-            check_reg(src) || check_reg(dst)
++            check_op(src) || check_reg(dst)
+         }
+         MachInst::Cmov { src, dst, .. } => check_op(src) || check_reg(dst),
+         MachInst::CallIndirect { reg, .. } => check_reg(reg),
+@@ -2816,6 +2869,33 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, ra: &FxHashMap<u32, P
+     }
  }
  
++/// A value is MachInst-unsafe when it lives outside the GPR domain:
++/// floats/XMM, vectors, i128/wide, or long double. MachInst's
++/// lower_copy/lower_cast assume 64-bit GPR moves; touching such values
++/// there miscompiles (float bit-copies read stale slots, i128 copies drop
++/// the high half, vector slots get GPR-clobbered).
++fn is_mi_unsafe_value(
++    v: u32,
++    reg_assignments: &FxHashMap<u32, PhysReg>,
++    state: &CodegenState,
++    value_types: &FxHashMap<u32, crate::common::types::IrType>,
++) -> bool {
++    if state.is_i128_value(v) || state.vector_values.contains(&v) {
++        return true;
++    }
++    if let Some(r) = reg_assignments.get(&v) {
++        if r.0 >= 20 {
++            return true; // XMM-assigned
++        }
++    }
++    if let Some(ty) = value_types.get(&v) {
++        if ty.is_float() || ty.is_long_double() || ty.is_128bit() {
++            return true;
++        }
++    }
++    false
++}
++
  impl ArchCodegen for X86Codegen {
-+    fn is_value_reg_assigned(&self, vid: u32) -> bool {
-+        self.reg_assignments.contains_key(&vid)
-+    }
-+
-     fn state(&mut self) -> &mut CodegenState {
-         &mut self.state
+     fn is_value_reg_assigned(&self, vid: u32) -> bool {
+         self.reg_assignments.contains_key(&vid)
+@@ -2843,10 +2923,21 @@ impl ArchCodegen for X86Codegen {
+         true
      }
-diff --git a/tests/regression/phi_web_external_feed.c b/tests/regression/phi_web_external_feed.c
-new file mode 100644
-index 00000000..c62c33bb
---- /dev/null
-+++ b/tests/regression/phi_web_external_feed.c
-@@ -0,0 +1,57 @@
-+/* Regression: phi-web coalescing must not alias EXTERNAL feed values into a
-+ * loop-carried copy web.
-+ *
-+ * Bug class (found via zlib-ng maketrees, 2026-08): the slot-coalescing phi
-+ * web pass merged values like the last-iteration separator string address
-+ * (defined outside the loop) into the loop-carried web. The elided phi Copy
-+ * then left the shared web home holding the PREVIOUS iteration's value, and
-+ * reads of the "merged" value returned that stale value instead (the printf
-+ * separator came out as the previous iteration's "," instead of "\n};\n\n").
-+ *
-+ * Shape: two cross-copying loop-carried values (c1, c2 — the 209/210/207
-+ * pattern) plus an external constant fed into the web on the final iteration.
-+ * Any staleness in the web changes the checksums below. */
-+#include <stdio.h>
-+#include <string.h>
+ 
+-    fn try_lower_machinst(&mut self, inst: &crate::ir::reexports::Instruction) -> bool {
++    fn try_lower_machinst(
++        &mut self,
++        inst: &crate::ir::reexports::Instruction,
++        folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
++    ) -> bool {
+         if !self.machinst_enabled {
+             return false;
+         }
++        // Debug knob: CCC_MI_SKIP_FUNC=name1,name2 disables the MachInst path
++        // for whole functions (diagnostic bisection aid).
++        if let Some(skip) = std::env::var("CCC_MI_SKIP_FUNC").ok() {
++            if skip.split(',').any(|n| n == self.state.current_func_name.as_str()) {
++                return false;
++            }
++        }
+ 
+         // Reject instructions involving values we can't handle.
+         // Allocas are allowed for Load/Store ptr (ISel handles via StackSlot).
+@@ -2866,6 +2957,10 @@ impl ArchCodegen for X86Codegen {
+                     reject = true;
+                     return;
+                 }
++                if is_mi_unsafe_value(v.0, ra, state, &self.value_types) {
++                    reject = true;
++                    return;
++                }
+                 if let Some(r) = ra.get(&v.0) {
+                     if r.0 >= 20 {
+                         reject = true;
+@@ -2882,9 +2977,27 @@ impl ArchCodegen for X86Codegen {
+         match inst {
+             crate::ir::reexports::Instruction::Load { ptr, .. }
+             | crate::ir::reexports::Instruction::Store { ptr, .. } => {
++                // A pointer whose address is folded into a direct symbol(%rip)
++                // operand by the default path has NO materialized address: the
++                // GlobalAddr instruction was skipped. MachInst would emit a
++                // memory operand through a register that is never loaded
++                // (gzip: `movq %r15, (%r13)` with r13 never set -> SEGV).
++                if folded_global_addrs.contains(&ptr.0) {
++                    reject = true;
++                }
+                 if state.folded_gep_values.contains(&ptr.0) {
+                     reject = true;
+                 }
++                // Over-aligned allocas (e.g. _Alignas(32) SIMD buffers): the
++                // runtime address is (slot+align-1)&~(align-1), not the raw
++                // slot. MachInst's lower_load/lower_store use the raw slot
++                // address and would write to the WRONG location. The default
++                // path handles OverAligned via emit_alloca_aligned_addr.
++                if let Some(crate::backend::state::SlotAddr::OverAligned(_, _)) =
++                    state.resolve_slot_addr(ptr.0)
++                {
++                    reject = true;
++                }
+                 if let Some(r) = ra.get(&ptr.0) {
+                     if r.0 >= 20 {
+                         reject = true;
+@@ -2899,6 +3012,15 @@ impl ArchCodegen for X86Codegen {
+                 }
+             }
+             crate::ir::reexports::Instruction::GetElementPtr { base, .. } => {
++                // Over-aligned alloca bases need the aligned address; the
++                // default path computes it, MachInst would use the raw slot.
++                if state.is_alloca(base.0) {
++                    if let Some(crate::backend::state::SlotAddr::OverAligned(_, _)) =
++                        state.resolve_slot_addr(base.0)
++                    {
++                        reject = true;
++                    }
++                }
+                 // Allow alloca bases (ISel handles via AllocaAddr + leaq)
+                 if !state.is_alloca(base.0) {
+                     if let Some(r) = ra.get(&base.0) {
+@@ -2920,6 +3042,9 @@ impl ArchCodegen for X86Codegen {
+             if state.is_alloca(dest.0) {
+                 reject = true;
+             }
++            if is_mi_unsafe_value(dest.0, ra, state, &self.value_types) {
++                reject = true;
++            }
+             if let Some(r) = ra.get(&dest.0) {
+                 if r.0 >= 20 {
+                     reject = true;
+@@ -2968,12 +3093,16 @@ impl ArchCodegen for X86Codegen {
+             _ => {}
+         }
+ 
+-        super::isel::lower_instruction_ctx(
++        let lowered = super::isel::lower_instruction_ctx(
+             inst,
+             &self.reg_assignments,
+             &alloca_slots,
+             &mut self.machinst_buf,
+-        )
++        );
++        if lowered {
++            self.machinst_buf_ir.push(inst.clone());
++        }
++        lowered
+     }
+ 
+     fn flush_machinst(&mut self) {
+@@ -2993,6 +3122,36 @@ impl ArchCodegen for X86Codegen {
+             .iter()
+             .any(|mi| has_unresolvable_vreg(mi, &self.reg_assignments));
+         if has_bad {
++            if std::env::var("CCC_MI_DEBUG").is_ok() {
++                eprintln!("[MI-FALLBACK] {} instructions -> default path", self.machinst_buf_ir.len());
++                for mi in &resolved {
++                    if has_unresolvable_vreg(mi, &self.reg_assignments) {
++                        eprintln!("[MI-FALLBACK]   unresolvable: {mi:?}");
++                    }
++                }
++            }
++            // CORRECTNESS: never delete instructions. Re-emit the buffered IR
++            // through the default (accumulator) codegen path, which handles
++            // stack-backed values in every position. The buffer is a
++            // straight-line sequence (flushed before calls and at block ends),
++            // the register cache is still valid for the pre-buffer state, and
++            // GEP folding is a pure optimization — an empty fold map keeps the
++            // default path semantics-identical.
++            let ir = std::mem::take(&mut self.machinst_buf_ir);
++            for inst in ir {
++                crate::backend::generation::generate_instruction(
++                    self,
++                    &inst,
++                    &crate::common::fx_hash::FxHashMap::default(),
++                    &crate::common::fx_hash::FxHashMap::default(),
++                    &crate::common::fx_hash::FxHashSet::default(),
++                    &crate::common::fx_hash::FxHashSet::default(),
++                );
++                // Mirror the main loop's program-point accounting so any
++                // call-spanning save/restore decisions after the fallback
++                // stay aligned with the IR positions they were computed for.
++                self.state.current_program_point += 1;
++            }
+             self.machinst_buf.clear();
+             return;
+         }
+@@ -3000,6 +3159,7 @@ impl ArchCodegen for X86Codegen {
+         super::machinst_emit::emit_machinsts(&resolved, &mut self.state.out);
+ 
+         self.machinst_buf.clear();
++        self.machinst_buf_ir.clear();
+         self.state.reg_cache.invalidate_all();
+         self.flush_pending_vec_store_impl();
+         self.state.invalidate_vec_peephole();
+diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
+index 17fb1537..da7c04cd 100644
+--- a/src/backend/x86/codegen/isel.rs
++++ b/src/backend/x86/codegen/isel.rs
+@@ -341,7 +341,7 @@ pub fn lower_cmp(
+     let rhs_op = lower_operand_with_regs(rhs, ra);
+     out.push(MachInst::Cmp { lhs: lhs_op, rhs: rhs_op, size });
+     out.push(MachInst::SetCC { cc, dst });
+-    out.push(MachInst::Movzx { src: dst, dst, from_size: OpSize::S8, to_size: OpSize::S32 });
++    out.push(MachInst::Movzx { src: MachOperand::Reg(dst), dst, from_size: OpSize::S8, to_size: OpSize::S32 });
+ }
+ 
+ /// Lower a fused Cmp + CondBranch (no boolean materialization).
+@@ -392,9 +392,9 @@ pub fn lower_cast(
+     };
+ 
+     if to_ty.is_unsigned() || from_ty.is_unsigned() {
+-        out.push(MachInst::Movzx { src: src_reg, dst, from_size, to_size });
++        out.push(MachInst::Movzx { src: MachOperand::Reg(src_reg), dst, from_size, to_size });
+     } else {
+-        out.push(MachInst::Movsx { src: src_reg, dst, from_size, to_size });
++        out.push(MachInst::Movsx { src: MachOperand::Reg(src_reg), dst, from_size, to_size });
+     }
+ }
+ 
+diff --git a/src/backend/x86/codegen/machinst.rs b/src/backend/x86/codegen/machinst.rs
+index 7194bdc7..842cb95d 100644
+--- a/src/backend/x86/codegen/machinst.rs
++++ b/src/backend/x86/codegen/machinst.rs
+@@ -102,10 +102,10 @@ pub enum MachInst {
+     Mov { src: MachOperand, dst: MachOperand, size: OpSize },
+ 
+     /// movzx src, dst (zero-extend: movzbl, movzwl, movzbq, movzwq)
+-    Movzx { src: MachReg, dst: MachReg, from_size: OpSize, to_size: OpSize },
++    Movzx { src: MachOperand, dst: MachReg, from_size: OpSize, to_size: OpSize },
+ 
+     /// movsx src, dst (sign-extend: movsbq, movswq, movslq)
+-    Movsx { src: MachReg, dst: MachReg, from_size: OpSize, to_size: OpSize },
++    Movsx { src: MachOperand, dst: MachReg, from_size: OpSize, to_size: OpSize },
+ 
+     // ── Arithmetic ───────────────────────────────────────────────────
+     /// Two-address ALU: dst = dst OP src.
+diff --git a/src/backend/x86/codegen/machinst_emit.rs b/src/backend/x86/codegen/machinst_emit.rs
+index 743ddcaf..5e425e44 100644
+--- a/src/backend/x86/codegen/machinst_emit.rs
++++ b/src/backend/x86/codegen/machinst_emit.rs
+@@ -129,6 +129,26 @@ fn fmt_operand(op: &MachOperand, size: OpSize, out: &AsmOutput) -> String {
+     }
+ }
+ 
 +
-+static const char *g_final = "FINAL";
-+
-+static unsigned f(unsigned n) {
-+    const char *sep = ",";
-+    unsigned long acc = 0;
-+    const char *c1 = "";
-+    const char *c2 = "";
-+    for (unsigned i = 0; i <= n; i++) {
-+        const char *s;
-+        if (i == n)
-+            s = g_final; /* external feed on the last iteration */
-+        else
-+            s = sep;
-+        c1 = s;
-+        c2 = c1; /* second copy: cross-copying web members */
-+        acc += strlen(s);
-+        acc += (unsigned long)(unsigned char)c2[0];
++/// If `op` is an immediate outside the signed-32-bit range, materialize it
++/// into %rax with movabsq and return a register operand (plus the emitted
++/// movabsq line). x86 `cmp/test` (like all ALU ops) only support imm32
++/// sign-extended operands; using the raw 64-bit immediate would truncate it
++/// and miscompare (regression: simd_movnt's `lo == 0x1122334455667788ULL`
++/// check compiled to `cmp $0x55667788`).
++fn materialize_large_imm(
++    op: &MachOperand,
++    out: &mut AsmOutput,
++) -> MachOperand {
++    match op {
++        MachOperand::Imm(v) if *v < i32::MIN as i64 || *v > i32::MAX as i64 => {
++            out.emit_fmt(format_args!("    movabsq ${}, %rax", v));
++            MachOperand::Reg(MachReg::Phys(super::machinst::RAX))
++        }
++        _ => op.clone(),
 +    }
-+    return (unsigned)(acc + strlen(c1) + strlen(c2));
 +}
 +
-+int main(void) {
-+    /* n=7: 7 iterations of "," (len 1 + ','=44 => 45 each... strlen(",")=1,
-+     * c2[0]=44) for i=0..6 => 7*45=315; final: strlen("FINAL")=5 + 'F'=70
-+     * => 75; tail strlen(c1)+strlen(c2) = 5+5 = 10. Total = 315+75+10 = 400 */
-+    if (f(7) != 400) {
-+        printf("bad f(7)=%u\n", f(7));
-+        return 1;
-+    }
-+    /* n=1: i=0: 1+44=45; final: 75; tail 10 => 130 */
-+    if (f(1) != 130) {
-+        printf("bad f(1)=%u\n", f(1));
-+        return 2;
-+    }
-+    /* n=100: 100*45 + 75 + 10 = 4585 */
-+    if (f(100) != 4585) {
-+        printf("bad f(100)=%u\n", f(100));
-+        return 3;
-+    }
-+    return 0;
-+}
+ /// ALU operation mnemonic.
+ fn alu_mnemonic(op: AluOp) -> &'static str {
+     match op {
+@@ -318,43 +338,52 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
+ 
+         MachInst::Cmp { lhs, rhs, size } => {
+             let suffix = size.suffix();
++            let mut lhs = lhs.clone();
++            let mut rhs = rhs.clone();
++            // 64-bit immediates don't fit in the imm32 of cmp; materialize.
++            lhs = materialize_large_imm(&lhs, out);
++            rhs = materialize_large_imm(&rhs, out);
+             // x86 cmp can't have two memory operands — load rhs to rax
+-            let both_mem = matches!((lhs, rhs),
++            let both_mem = matches!((&lhs, &rhs),
+                 (MachOperand::StackSlot(_), MachOperand::StackSlot(_)) |
+                 (MachOperand::Mem { .. }, MachOperand::Mem { .. }) |
+                 (MachOperand::StackSlot(_), MachOperand::Mem { .. }) |
+                 (MachOperand::Mem { .. }, MachOperand::StackSlot(_)));
+             if both_mem {
+-                let rhs_str = fmt_operand(rhs, *size, out);
++                let rhs_str = fmt_operand(&rhs, *size, out);
+                 let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
+                 out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, rhs_str, rax));
+-                let lhs_str = fmt_operand(lhs, *size, out);
++                let lhs_str = fmt_operand(&lhs, *size, out);
+                 // AT&T: cmp rhs, lhs
+                 out.emit_fmt(format_args!("    cmp{} %{}, {}", suffix, rax, lhs_str));
+             } else {
+-                let rhs_str = fmt_operand(rhs, *size, out);
+-                let lhs_str = fmt_operand(lhs, *size, out);
++                let rhs_str = fmt_operand(&rhs, *size, out);
++                let lhs_str = fmt_operand(&lhs, *size, out);
+                 out.emit_fmt(format_args!("    cmp{} {}, {}", suffix, rhs_str, lhs_str));
+             }
+         }
+ 
+         MachInst::Test { lhs, rhs, size } => {
+             let suffix = size.suffix();
++            let mut lhs = lhs.clone();
++            let mut rhs = rhs.clone();
++            lhs = materialize_large_imm(&lhs, out);
++            rhs = materialize_large_imm(&rhs, out);
+             // x86 test can't have two memory operands — load one to rax
+-            let both_mem = matches!((lhs, rhs),
++            let both_mem = matches!((&lhs, &rhs),
+                 (MachOperand::StackSlot(_), MachOperand::StackSlot(_)) |
+                 (MachOperand::Mem { .. }, MachOperand::Mem { .. }) |
+                 (MachOperand::StackSlot(_), MachOperand::Mem { .. }) |
+                 (MachOperand::Mem { .. }, MachOperand::StackSlot(_)));
+             if both_mem {
+-                let rhs_str = fmt_operand(rhs, *size, out);
++                let rhs_str = fmt_operand(&rhs, *size, out);
+                 let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
+                 out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, rhs_str, rax));
+-                let lhs_str = fmt_operand(lhs, *size, out);
++                let lhs_str = fmt_operand(&lhs, *size, out);
+                 out.emit_fmt(format_args!("    test{} %{}, {}", suffix, rax, lhs_str));
+             } else {
+-                let rhs_str = fmt_operand(rhs, *size, out);
+-                let lhs_str = fmt_operand(lhs, *size, out);
++                let rhs_str = fmt_operand(&rhs, *size, out);
++                let lhs_str = fmt_operand(&lhs, *size, out);
+                 out.emit_fmt(format_args!("    test{} {}, {}", suffix, rhs_str, lhs_str));
+             }
+         }
+@@ -366,20 +395,25 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
+         }
+ 
+         MachInst::Movzx { src, dst, from_size, to_size } => {
+-            let src_str = fmt_reg(src, *from_size);
+-            // movzbl/movzwl always use 32-bit dest (implicit zero-extend to 64-bit)
+-            let actual_dst_size = if *to_size == OpSize::S64 { OpSize::S32 } else { *to_size };
+-            let dst_str = fmt_reg(dst, actual_dst_size);
++            let src_str = fmt_operand(src, *from_size, out);
++            // movzbl/movzwl always use 32-bit dest (implicit zero-extend to 64-bit).
++            // A 32->64 zero-extension is a plain movl: writing a 32-bit
++            // register zero-extends to the full 64-bit register on x86-64.
++            // (The previous `_ => movzbl` fallback TRUNCATED 32-bit values to
++            // 8 bits — miscompiling every U32->U64 zero-extending cast, e.g.
++            // gzip's send_bits bit packing: wrong values -> corrupt output.)
+             let mnem = match (from_size, to_size) {
+                 (OpSize::S8, _) => "movzbl",
+                 (OpSize::S16, _) => "movzwl",
+-                _ => "movzbl",
++                _ => "movl",
+             };
++            let actual_dst_size = if *to_size == OpSize::S64 { OpSize::S32 } else { *to_size };
++            let dst_str = fmt_reg(dst, actual_dst_size);
+             out.emit_fmt(format_args!("    {} {}, {}", mnem, src_str, dst_str));
+         }
+ 
+         MachInst::Movsx { src, dst, from_size, to_size } => {
+-            let src_str = fmt_reg(src, *from_size);
++            let src_str = fmt_operand(src, *from_size, out);
+             let dst_str = fmt_reg(dst, *to_size);
+             let mnem = match (from_size, to_size) {
+                 (OpSize::S8, OpSize::S32) => "movsbl",
+diff --git a/src/backend/x86/codegen/machinst_regalloc.rs b/src/backend/x86/codegen/machinst_regalloc.rs
+index c54b3795..dd7c9253 100644
+--- a/src/backend/x86/codegen/machinst_regalloc.rs
++++ b/src/backend/x86/codegen/machinst_regalloc.rs
+@@ -96,7 +96,7 @@ fn collect_vreg_refs(
+             def_reg(dst, point, defs, uses);
+         }
+         MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
+-            use_reg(src, point, uses);
++            use_operand(src, point, uses);
+             def_reg(dst, point, defs, uses);
+         }
+         MachInst::Cmov { src, dst, .. } => {
+@@ -239,7 +239,7 @@ fn visit_regs_shared(inst: &MachInst, f: &mut impl FnMut(&MachReg)) {
+         }
+         MachInst::SetCC { dst, .. } => { f(dst); }
+         MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
+-            f(src); f(dst);
++            visit_op(src, f); f(dst);
+         }
+         MachInst::Cmov { src, dst, .. } => { visit_op(src, f); f(dst); }
+         MachInst::CallIndirect { reg, .. } => { f(reg); }
+@@ -571,7 +571,7 @@ pub fn rewrite_machinsts(insts: &[MachInst], result: &MachAllocResult) -> Vec<Ma
+             }
+             MachInst::Movzx { src, dst, from_size, to_size } => {
+                 out.push(MachInst::Movzx {
+-                    src: rewrite_reg(src, result),
++                    src: rewrite_operand(src, result),
+                     dst: rewrite_reg(dst, result),
+                     from_size: *from_size,
+                     to_size: *to_size,
+@@ -579,7 +579,7 @@ pub fn rewrite_machinsts(insts: &[MachInst], result: &MachAllocResult) -> Vec<Ma
+             }
+             MachInst::Movsx { src, dst, from_size, to_size } => {
+                 out.push(MachInst::Movsx {
+-                    src: rewrite_reg(src, result),
++                    src: rewrite_operand(src, result),
+                     dst: rewrite_reg(dst, result),
+                     from_size: *from_size,
+                     to_size: *to_size,
