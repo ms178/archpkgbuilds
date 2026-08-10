@@ -1,5 +1,429 @@
+diff --git a/src/backend/generation.rs b/src/backend/generation.rs
+index 4a4330770a211362473421c4278cb4aba2348b94..b7a6468bc2554ba24f9d38458013f4412a054926 100644
+--- a/src/backend/generation.rs
++++ b/src/backend/generation.rs
+@@ -160,10 +160,30 @@ fn build_gep_fold_map(func: &IrFunction, use_counts: &[u32]) -> FxHashMap<u32, G
+             }
+         }
+     }
+-    gep_map.retain(|_, info| {
++    // A multi-def phi-web base is also safe when a single-use address producer
++    // and its sole memory consumer are adjacent in one block: no redefinition
++    // can occur in that zero-length window. Never extend this proof to a second
++    // memory use later in the block; the base could be redefined in between.
++    let mut adjacent_base_stable: FxHashSet<u32> = FxHashSet::default();
++    for block in &func.blocks {
++        for pair in block.instructions.windows(2) {
++            let Some(dest) = pair[0].dest() else { continue };
++            if !gep_map.contains_key(&dest.0)
++                || use_counts.get(dest.0 as usize).copied().unwrap_or(0) != 1
++            {
++                continue;
++            }
++            if matches!(pair[1], Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } if ptr.0 == dest.0)
++            {
++                adjacent_base_stable.insert(dest.0);
++            }
++        }
++    }
++    gep_map.retain(|dest, info| {
+         is_alloca_set.contains(&info.base.0)
+             || is_param_set.contains(&info.base.0)
+             || def_count.get(&info.base.0).copied().unwrap_or(0) == 1
++            || adjacent_base_stable.contains(dest)
+     });
+ 
+     // Phase 2: Verify that each candidate GEP dest is ONLY used as Load/Store ptr.
+@@ -1613,7 +1633,7 @@ fn emit_loc_directive(
+ ///
+ /// Instructions that clobber the accumulator unpredictably (calls, stores, atomics,
+ /// inline asm, va_arg, memcpy, etc.) invalidate the cache after execution.
+-pub(crate) fn generate_instruction(
++pub(super) fn generate_instruction(
+     cg: &mut dyn ArchCodegen,
+     inst: &Instruction,
+     gep_fold_map: &FxHashMap<u32, GepFoldInfo>,
+diff --git a/src/backend/live_range.rs b/src/backend/live_range.rs
+index 34abb1c09d308d99ef8cb557469ab7ff4b798db1..b7d841e077fa3e817f01c441f05ec3836d2d7786 100644
+--- a/src/backend/live_range.rs
++++ b/src/backend/live_range.rs
+@@ -958,6 +958,7 @@ mod tests {
+             priority: 1,
+             reg_hint: None,
+             spill_weight: 0.1,
++            cascade: 0,
+         };
+ 
+         // Overlapping: starts within range
+@@ -1004,6 +1005,7 @@ mod tests {
+             priority: 100,
+             reg_hint: None,
+             spill_weight: 100.0 / 11.0, // 100 / range_length
++            cascade: 0,
+         };
+ 
+         let long_range = LiveRange {
+@@ -1015,6 +1017,7 @@ mod tests {
+             priority: 100,
+             reg_hint: None,
+             spill_weight: 100.0 / 101.0, // 100 / range_length
++            cascade: 0,
+         };
+ 
+         // Short ranges have higher spill weight (less painful to keep in register)
+@@ -1034,6 +1037,7 @@ mod tests {
+                 priority: 3,
+                 reg_hint: None,
+                 spill_weight: 0.3,
++                cascade: 0,
+             },
+             LiveRange {
+                 value_id: 2,
+@@ -1044,6 +1048,7 @@ mod tests {
+                 priority: 3,
+                 reg_hint: None,
+                 spill_weight: 0.3,
++                cascade: 0,
+             },
+             LiveRange {
+                 value_id: 3,
+@@ -1054,6 +1059,7 @@ mod tests {
+                 priority: 3,
+                 reg_hint: None,
+                 spill_weight: 0.3,
++                cascade: 0,
+             },
+         ];
+ 
+@@ -1081,6 +1087,7 @@ mod tests {
+                 priority: 3, // High priority
+                 reg_hint: None,
+                 spill_weight: 0.03,
++                cascade: 0,
+             },
+             LiveRange {
+                 value_id: 2,
+@@ -1091,6 +1098,7 @@ mod tests {
+                 priority: 2, // Lower priority - should spill
+                 reg_hint: None,
+                 spill_weight: 0.02,
++                cascade: 0,
+             },
+         ];
+ 
+@@ -1117,6 +1125,7 @@ mod tests {
+             priority: 1,
+             reg_hint: None,
+             spill_weight: 0.1,
++            cascade: 0,
+         }];
+ 
+         let regs = vec![]; // No registers available
+diff --git a/src/backend/liveness.rs b/src/backend/liveness.rs
+index 64ce39cb691e92d5aee5c32265a9ba3aaf5c1206..337056b8500c936d8811039c837faabaadd8c4f7 100644
+--- a/src/backend/liveness.rs
++++ b/src/backend/liveness.rs
+@@ -746,6 +746,40 @@ fn extend_gep_base_liveness(
+                     }
+                     gep_info.insert(dest.0, (base.0, 0));
+                 }
++                // build_gep_fold_map also recognizes integer Add(base, const).
++                // Mirror it here so the base register stays live through the
++                // folded memory operation (the old GEP-only analysis could let
++                // linear scan reuse it one point too early).
++                Instruction::BinOp {
++                    dest,
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(base),
++                    rhs: Operand::Const(c),
++                    ty,
++                }
++                | Instruction::BinOp {
++                    dest,
++                    op: IrBinOp::Add,
++                    lhs: Operand::Const(c),
++                    rhs: Operand::Value(base),
++                    ty,
++                } if !ty.is_float() && !ty.is_long_double() => {
++                    if alloca_set.contains(&base.0) {
++                        continue;
++                    }
++                    if let Some(offset) = c.to_i64() {
++                        let offset = if offset >= i32::MIN as i64 && offset <= i32::MAX as i64 {
++                            Some(offset)
++                        } else if offset > i32::MAX as i64 && offset <= u32::MAX as i64 {
++                            Some(offset as i32 as i64)
++                        } else {
++                            None
++                        };
++                        if let Some(offset) = offset {
++                            gep_info.insert(dest.0, (base.0, offset));
++                        }
++                    }
++                }
+                 _ => {}
+             }
+         }
+@@ -1450,4 +1484,41 @@ mod tests {
+             "Empty inline asm barriers should NOT be call points"
+         );
+     }
++
++    #[test]
++    fn binop_address_fold_extends_base_through_load() {
++        let mut func = IrFunction::new("binop_gep_liveness".to_string(), IrType::U8, vec![], false);
++        func.blocks.push(BasicBlock {
++            label: BlockId(0),
++            instructions: vec![
++                Instruction::ParamRef {
++                    dest: Value(0),
++                    param_idx: 0,
++                    ty: IrType::Ptr,
++                },
++                Instruction::BinOp {
++                    dest: Value(1),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(0)),
++                    rhs: Operand::Const(IrConst::I64(4)),
++                    ty: IrType::Ptr,
++                },
++                Instruction::Load {
++                    dest: Value(2),
++                    ptr: Value(1),
++                    ty: IrType::U8,
++                    seg_override: crate::common::types::AddressSpace::Default,
++                },
++            ],
++            terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
++            source_spans: Vec::new(),
++        });
++        func.next_value_id = 3;
++
++        let result = compute_live_intervals(&func);
++        let base = result.intervals.iter().find(|iv| iv.value_id == 0).unwrap();
++        // ParamRef is point 0, Add is point 1, and the folded Load is point 2.
++        assert!(base.end >= 2, "base ended before folded Load: {base:?}");
++    }
++
+ }
+diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
+index e1e096689eefac9889ed7cc3b52edef95c3e0018..6ff193c937e192e1fe29ccd9c36d884a527b4c6c 100644
+--- a/src/backend/regalloc.rs
++++ b/src/backend/regalloc.rs
+@@ -883,14 +883,16 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+             }
+         }
+ 
+-        // Phase 3b (v5, opt-in CCC_ENABLE_VECREG): XMM allocation for 128-bit
+-        // VECTOR values. Runs AFTER the F64 scan so it sees the F64 assignments
+-        // and avoids them. Pool = xmm3-xmm7 (PhysReg 21-25): xmm0/xmm1 are the
+-        // accumulator/scratch pair, xmm2 is pblendvb/VNNI scratch. Candidates
+-        // are strictly guarded by collect_vecreg_candidates (the phase-3
+-        // candidate guards matching the non-GPR collector — a candidate outside
+-        // that whitelist miscompiles, e.g. the fold_4 class).
+-        if std::env::var("CCC_ENABLE_VECREG").is_ok() {
++        // Phase 3b (W6): XMM allocation for 128-bit VECTOR values. Runs AFTER
++        // the F64 scan so it sees those assignments and avoids them. Pool =
++        // xmm3-xmm7 (PhysReg 21-25): xmm0/xmm1 are accumulator/scratch and
++        // xmm2 is an implicit pblendvb/VNNI/F128 scratch. Candidates are
++        // strictly guarded by collect_vecreg_candidates; widening this set
++        // without matching every consumer is unsound. Enabled after regression,
++        // differential-CFG fuzz, gzip, and expat validation; retain an absolute
++        // diagnostic kill switch for reproducibility.
++        let vecreg_enabled = std::env::var("CCC_NO_VECREG").is_err();
++        if vecreg_enabled {
+             let vec_candidates = collect_vecreg_candidates(func);
+             if !vec_candidates.is_empty() {
+                 let mut vec_pool: Vec<PhysReg> = (21..=25).map(PhysReg).collect();
+diff --git a/src/backend/split_ranges.rs b/src/backend/split_ranges.rs
+index 8b1be11253d2f8270dd578230d9ffda66e9bf27b..3b89f9eadf839d474314fb893a9c34916b2f9ea1 100644
+--- a/src/backend/split_ranges.rs
++++ b/src/backend/split_ranges.rs
+@@ -261,6 +261,116 @@ pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> u
+     splits
+ }
+ 
++/// Place single-predecessor phi edge-copy blocks next to their predecessor.
++///
++/// Phi elimination appends edge blocks to the end of the function.  In the
++/// linear program-point order this makes a value defined in a branch arm look
++/// live across every intervening arm until its copy in the appended edge block.
++/// The paths are mutually exclusive, but a contiguous-interval allocator sees
++/// all those artificial ranges overlap (gzip `longest_match`: eight byte-compare
++/// arms alone consumed most of the GPR budget).
++///
++/// Reordering an explicit basic block is semantics-preserving: every block has
++/// an explicit terminator and labels are stable.  Keeping an edge-copy block
++/// adjacent to its sole predecessor makes the source range end at the edge,
++/// which is the lifetime the SSA program actually has.  This is a layout form
++/// of live-range splitting with no inserted loads, stores, or runtime copies.
++pub fn place_edge_copy_blocks(func: &mut IrFunction) -> usize {
++    let n = func.blocks.len();
++    if n < 3 {
++        return 0;
++    }
++    let label_map = analysis::build_label_map(func);
++    let (preds, _succs) = analysis::build_cfg(func, &label_map);
++
++    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
++    let mut is_edge_copy = vec![false; n];
++    for (block_idx, edge_flag) in is_edge_copy.iter_mut().enumerate().skip(1) {
++        let block = &func.blocks[block_idx];
++        if block.instructions.is_empty()
++            || !block
++                .instructions
++                .iter()
++                .all(|inst| matches!(inst, Instruction::Copy { .. }))
++            || preds.len(block_idx) != 1
++        {
++            continue;
++        }
++        let Terminator::Branch(target_label) = block.terminator else {
++            continue;
++        };
++        let Some(&merge_idx) = label_map.get(&target_label) else {
++            continue;
++        };
++        // Phi edge blocks feed a merge.  Requiring multiple incoming edges
++        // avoids perturbing ordinary source blocks that happen to contain only
++        // a user-visible Copy and an unconditional branch.
++        if preds.len(merge_idx) < 2 {
++            continue;
++        }
++        let pred_idx = preds.row(block_idx)[0] as usize;
++        if pred_idx == block_idx {
++            continue;
++        }
++        children[pred_idx].push(block_idx);
++        *edge_flag = true;
++    }
++    if !is_edge_copy.iter().any(|&v| v) {
++        return 0;
++    }
++    for list in &mut children {
++        list.sort_unstable();
++    }
++
++    fn emit_block_and_edges(
++        idx: usize,
++        children: &[Vec<usize>],
++        blocks: &mut [Option<BasicBlock>],
++        emitted: &mut [bool],
++        out: &mut Vec<BasicBlock>,
++    ) {
++        if emitted[idx] {
++            return;
++        }
++        emitted[idx] = true;
++        if let Some(block) = blocks[idx].take() {
++            out.push(block);
++        }
++        for &child in &children[idx] {
++            emit_block_and_edges(child, children, blocks, emitted, out);
++        }
++    }
++
++    let old_blocks = std::mem::take(&mut func.blocks);
++    let mut blocks: Vec<Option<BasicBlock>> = old_blocks.into_iter().map(Some).collect();
++    let mut emitted = vec![false; n];
++    let mut reordered = Vec::with_capacity(n);
++    for (idx, &edge_copy) in is_edge_copy.iter().enumerate() {
++        if !edge_copy {
++            emit_block_and_edges(idx, &children, &mut blocks, &mut emitted, &mut reordered);
++        }
++    }
++    // Conservatively retain any candidate cycle/unreachable component in its
++    // original relative order.  Normal phi edge blocks are all emitted above.
++    for idx in 0..n {
++        emit_block_and_edges(idx, &children, &mut blocks, &mut emitted, &mut reordered);
++    }
++    debug_assert_eq!(reordered.len(), n);
++
++    let moved = reordered
++        .iter()
++        .enumerate()
++        .filter(|(new_idx, block)| {
++            label_map
++                .get(&block.label)
++                .is_some_and(|&old_idx| old_idx != *new_idx)
++                && is_edge_copy[label_map[&block.label]]
++        })
++        .count();
++    func.blocks = reordered;
++    moved
++}
++
+ fn find_value_type(func: &IrFunction, val_id: u32) -> Option<IrType> {
+     for b in &func.blocks {
+         for i in &b.instructions {
+@@ -297,3 +407,65 @@ fn inst_uses_value(inst: &Instruction, v: u32) -> bool {
+         _ => false,
+     }
+ }
++
++#[cfg(test)]
++mod edge_layout_tests {
++    use super::*;
++
++    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
++        BasicBlock {
++            label: BlockId(label),
++            instructions,
++            terminator,
++            source_spans: Vec::new(),
++        }
++    }
++
++    #[test]
++    fn places_single_predecessor_phi_edge_beside_predecessor() {
++        let mut func = IrFunction::new("edge_layout".to_string(), IrType::I32, vec![], false);
++        func.blocks = vec![
++            block(
++                0,
++                vec![Instruction::Copy {
++                    dest: Value(1),
++                    src: Operand::Const(IrConst::I32(1)),
++                }],
++                Terminator::Branch(BlockId(1)),
++            ),
++            block(
++                1,
++                Vec::new(),
++                Terminator::CondBranch {
++                    cond: Operand::Value(Value(1)),
++                    true_label: BlockId(2),
++                    false_label: BlockId(4),
++                },
++            ),
++            block(2, Vec::new(), Terminator::Branch(BlockId(3))),
++            block(
++                3,
++                Vec::new(),
++                Terminator::Return(Some(Operand::Value(Value(10)))),
++            ),
++            block(
++                4,
++                vec![Instruction::Copy {
++                    dest: Value(10),
++                    src: Operand::Value(Value(1)),
++                }],
++                Terminator::Branch(BlockId(3)),
++            ),
++        ];
++        func.next_value_id = 11;
++
++        assert_eq!(place_edge_copy_blocks(&mut func), 1);
++        let labels: Vec<u32> = func.blocks.iter().map(|b| b.label.0).collect();
++        assert_eq!(labels, vec![0, 1, 4, 2, 3]);
++        assert!(matches!(
++            func.blocks[2].instructions.as_slice(),
++            [Instruction::Copy { dest, src: Operand::Value(src) }]
++                if dest.0 == 10 && src.0 == 1
++        ));
++    }
++}
 diff --git a/src/backend/x86/codegen/cast_ops.rs b/src/backend/x86/codegen/cast_ops.rs
-index f91c8572..93da8378 100644
+index f91c857231da2f808bced5735ba724a01a16a510..93da83782f6edb1a5dec61bae06870fbffef59dd 100644
 --- a/src/backend/x86/codegen/cast_ops.rs
 +++ b/src/backend/x86/codegen/cast_ops.rs
 @@ -11,6 +11,15 @@ impl X86Codegen {
@@ -19,7 +443,7 @@ index f91c8572..93da8378 100644
          // tracked in f128_direct_slots) is a no-op regardless of the source
          // type in the IR (the value is already the 16-byte x87 format).
 diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 65b5df09..b3681e6b 100644
+index 65b5df09c7b8e7ed7c6b1a4dc76d5ab63abed711..b3681e6bd851b45ad5e2d49e0348b28c8c792ca7 100644
 --- a/src/backend/x86/codegen/emit.rs
 +++ b/src/backend/x86/codegen/emit.rs
 @@ -327,6 +327,19 @@ pub struct X86Codegen {
@@ -53,7 +477,7 @@ index 65b5df09..b3681e6b 100644
              pending_cmp: None,
              current_func: None,
 diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
-index d9126f9a..dcd645bc 100644
+index d9126f9a32475b89777252e242c1b184fb6aed1d..dcd645bceab46931b31e5d23861e11f9915ff93b 100644
 --- a/src/backend/x86/codegen/memory.rs
 +++ b/src/backend/x86/codegen/memory.rs
 @@ -570,6 +570,10 @@ impl X86Codegen {
@@ -144,8 +568,46 @@ index d9126f9a..dcd645bc 100644
                          return;
                      }
                  }
+diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+index 3877dc423749a11c9554abf3f26abba39b95e347..d47e44e42a2221d5c0727e8fc7d86cce5b395e47 100644
+--- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
++++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+@@ -2061,7 +2061,14 @@ pub(super) fn fuse_movq_ext_truncation(store: &mut LineStore, infos: &mut [LineI
+             if let Some((src, _dst)) = rest.split_once(',') {
+                 let src = src.trim();
+                 let fam = register_family_fast(src);
+-                if fam != REG_NONE && fam != 0 { fam } else { REG_NONE }
++                // This fusion indexes the 16-entry GPR name table. XMM/MMX
++                // register families are recognized by the parser but have no
++                // 8/16/32-bit GPR aliases and must take the unfused path.
++                if fam != REG_NONE && fam != 0 && fam <= REG_GP_MAX {
++                    fam
++                } else {
++                    REG_NONE
++                }
+             } else { REG_NONE }
+         } else { REG_NONE };
+ 
+diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
+index 257edfab983ed4969df8aa64d52a205cb6c39a52..d74435ec37df41e73f86ca84a3f3b93a09d290e3 100644
+--- a/src/backend/x86/codegen/peephole/passes/mod.rs
++++ b/src/backend/x86/codegen/peephole/passes/mod.rs
+@@ -1865,5 +1865,13 @@ mod regression_tests {
+             "reg-reg move with different regs must stay: {}", out);
+     }
+ 
++
++    #[test]
++    fn xmm_source_is_not_indexed_as_a_gpr_in_extension_fusion() {
++        let asm = "    movq %xmm2, %rax\n    movl %eax, %eax\n".to_string();
++        let result = peephole_optimize(asm);
++        assert!(result.contains("%xmm2"));
++    }
++
+ }
+ 
 diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
-index d3daf214..e1004c3c 100644
+index d3daf214d07a37d87f60e78ad2c1ac98395af0e1..e1004c3c20ce0f2c4fd99f86528122d303de5f9e 100644
 --- a/src/backend/x86/codegen/prologue.rs
 +++ b/src/backend/x86/codegen/prologue.rs
 @@ -1,14 +1,14 @@
@@ -333,8 +795,36 @@ index d3daf214..e1004c3c 100644
          // FPO (RSP mode): callee saves are movq'd into the frame at offsets -8..-N*8
          // from the virtual rbp. callee_save_reserve shifts local slots below them.
          // RBP (push mode): pushes go BEFORE subq and are at -8(%rbp)..-N*8(%rbp).
+diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
+index e66b9b7aac54f64b7c81554ae43c67f6d083cc4b..d385e3507cc884f321149f37f82e127d006d4748 100644
+--- a/src/driver/pipeline.rs
++++ b/src/driver/pipeline.rs
+@@ -1388,6 +1388,23 @@ impl Driver {
+             }
+         }
+ 
++        // W5: phi elimination appends mutually-exclusive edge-copy blocks at
++        // function end. Place each beside its sole predecessor so contiguous
++        // live intervals reflect the real CFG lifetime rather than overlapping
++        // every intervening branch arm. Enabled after the full gzip/expat,
++        // regression, and differential-fuzz campaign; retain a diagnostic kill
++        // switch for downstream bisection.
++        if self.target == Target::X86_64
++            && self.opt_level >= 2
++            && std::env::var("CCC_NO_EDGE_COPY_LAYOUT").is_err()
++        {
++            for func in &mut module.functions {
++                if !func.is_declaration {
++                    crate::backend::split_ranges::place_edge_copy_blocks(func);
++                }
++            }
++        }
++
+         // CRITICAL FIX: Renumber all block labels to ensure global uniqueness across all functions
+         // This fixes a bug where optimization passes can create duplicate labels
+         {
 diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index 98980e17..d2ca1c2b 100644
+index 98980e173db8c243347d24dd3817fae09233d3c2..d2ca1c2b9052798a5420b9d7460bf8abf6d6880d 100644
 --- a/src/passes/mod.rs
 +++ b/src/passes/mod.rs
 @@ -174,16 +174,21 @@ fn run_gvn_licm_ivsr_shared(
@@ -382,7 +872,7 @@ index 98980e17..d2ca1c2b 100644
                  let (gvn_n, licm_n, ivsr_n) = run_gvn_licm_ivsr_shared(
 diff --git a/tests/regression/load_cast_fold.c b/tests/regression/load_cast_fold.c
 new file mode 100644
-index 00000000..b0ee7516
+index 0000000000000000000000000000000000000000..b0ee7516cc5ec0f134b99c5169183d874a1a06a9
 --- /dev/null
 +++ b/tests/regression/load_cast_fold.c
 @@ -0,0 +1,82 @@
