@@ -1,133 +1,1578 @@
+diff --git a/src/backend/stack_layout/regalloc_helpers.rs b/src/backend/stack_layout/regalloc_helpers.rs
+index a20a2a5..4a4be76 100644
+--- a/src/backend/stack_layout/regalloc_helpers.rs
++++ b/src/backend/stack_layout/regalloc_helpers.rs
+@@ -31,7 +31,60 @@ pub fn run_regalloc_and_merge_clobbers(
+ ) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>, FxHashMap<u8, Vec<(u32, u32)>>) {
+     // Detect x86-64 target by checking for x86 callee-saved PhysReg IDs (1-5).
+     // On x86-64, provide XMM registers for F64 allocation.
+-    let xmm_regs = if available_regs.iter().any(|r| r.0 == 1) {
++    let has_scalar_fp = func.blocks.iter().any(|block| {
++        block.instructions.iter().any(|inst| match inst {
++            Instruction::BinOp { ty, .. }
++            | Instruction::UnaryOp { ty, .. }
++            | Instruction::Cmp { ty, .. }
++            | Instruction::Load { ty, .. }
++            | Instruction::Store { ty, .. } => ty.is_float() && *ty != IrType::F128,
++            Instruction::Cast { from_ty, to_ty, .. } => {
++                (from_ty.is_float() || to_ty.is_float())
++                    && *from_ty != IrType::F128
++                    && *to_ty != IrType::F128
++            }
++            _ => false,
++        })
++    });
++    let has_memcpy_or_vector_intrinsic = func.blocks.iter().any(|block| {
++        block.instructions.iter().any(|inst| {
++            if matches!(inst, Instruction::Memcpy { .. }) {
++                return true;
++            }
++            let Instruction::Intrinsic { op, .. } = inst else { return false; };
++            use crate::ir::intrinsics::IntrinsicOp;
++            matches!(op,
++                IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 |
++                IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
++                IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 |
++                IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
++                IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 |
++                IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
++                IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2 |
++                IntrinsicOp::VecHorizontalAddF64x4 | IntrinsicOp::VecHorizontalAddF64x2 |
++                IntrinsicOp::VecHorizontalAddI32x8 | IntrinsicOp::VecHorizontalAddI32x4 |
++                IntrinsicOp::LoadF64x4 | IntrinsicOp::LoadF64x2 |
++                IntrinsicOp::LoadI32x8 | IntrinsicOp::LoadI32x4 |
++                IntrinsicOp::AddF64x4 | IntrinsicOp::AddF64x2 |
++                IntrinsicOp::MulF64x4 | IntrinsicOp::MulF64x2 |
++                IntrinsicOp::AddI32x8 | IntrinsicOp::AddI32x4 |
++                IntrinsicOp::HorizontalAddF64x4 | IntrinsicOp::HorizontalAddF64x2 |
++                IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4)
++        })
++    });
++    // The mature accumulator backend has a complete stack path for scalar FP,
++    // while its XMM location contract is not yet unified with aggregate memcpy
++    // and intrinsic producers. For ordinary scalar-FP functions, stack-backed
++    // values avoid XMM↔GPR relays and are measurably faster. Keep XMM allocation
++    // for aggregate/vector functions until their location model is migrated as
++    // one unit; this is a function-shape decision, not a benchmark-name switch.
++    let disable_scalar_fp_xmm = has_scalar_fp
++        && !has_memcpy_or_vector_intrinsic
++        && std::env::var("CCC_ENABLE_SCALAR_FP_XMM").is_err();
++    let xmm_regs = if available_regs.iter().any(|r| r.0 == 1)
++        && std::env::var("CCC_NO_XMM_REGALLOC").is_err()
++        && !disable_scalar_fp_xmm
++    {
+         // x86-64: xmm2-xmm7 available for F64 values
+         vec![PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23), PhysReg(24), PhysReg(25)]
+     } else {
+diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+index f13d5a0..5cebd9e 100644
+--- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
++++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+@@ -835,6 +835,167 @@ pub(super) fn eliminate_dead_sign_extensions(
+     changed
+ }
+ 
++// ── LEA-to-memory SIB folding ───────────────────────────────────────────────
++//
++// Fold the already-emitted form:
++//   leaq (%base,%index,scale), %tmp
++//   movX (%tmp), %dst
++// into:
++//   movX (%base,%index,scale), %dst
++//
++// This is deliberately a late textual peephole. It handles GEPs whose IR
++// lifetime proof is unavailable by the time the mature accumulator backend
++// emits them, while the whole-function dead-register check keeps the rewrite
++// sound across CFG edges.
++
++pub(super) fn fold_lea_into_memory_op(
++    store: &mut LineStore,
++    infos: &mut [LineInfo],
++) -> bool {
++    let len = store.len();
++    let mut changed = false;
++    let mut i = 0;
++    while i < len {
++        if infos[i].is_nop() {
++            i += 1;
++            continue;
++        }
++        let lea = infos[i].trimmed(store.get(i));
++        if !lea.starts_with("leaq ") {
++            i += 1;
++            continue;
++        }
++        let Some((addr_text, dst_text)) = lea[5..].rsplit_once(',') else {
++            i += 1;
++            continue;
++        };
++        let addr_text = addr_text.trim();
++        let dst_text = dst_text.trim();
++        if !dst_text.starts_with('%') {
++            i += 1;
++            continue;
++        }
++        let dst_family = register_family_fast(dst_text);
++        if dst_family == REG_NONE || dst_family > REG_GP_MAX {
++            i += 1;
++            continue;
++        }
++        let Some(open) = addr_text.find('(') else {
++            i += 1;
++            continue;
++        };
++        let Some(close) = addr_text.rfind(')') else {
++            i += 1;
++            continue;
++        };
++        if close <= open || close + 1 != addr_text.len() {
++            i += 1;
++            continue;
++        }
++        let displacement = addr_text[..open].trim();
++        let fields: Vec<&str> = addr_text[open + 1..close]
++            .split(',')
++            .map(str::trim)
++            .collect();
++        if fields.len() < 2 || fields.len() > 3
++            || fields.iter().any(|field| !field.starts_with('%'))
++        {
++            i += 1;
++            continue;
++        }
++        let base = fields[0];
++        let index = fields[1];
++        let base_family = register_family_fast(base);
++        let index_family = register_family_fast(index);
++        if base_family == REG_NONE
++            || index_family == REG_NONE
++            || base_family > REG_GP_MAX
++            || index_family > REG_GP_MAX
++            || dst_family == base_family
++            || dst_family == index_family
++        {
++            i += 1;
++            continue;
++        }
++        if fields.len() == 3 && !matches!(fields[2], "1" | "2" | "4" | "8") {
++            i += 1;
++            continue;
++        }
++
++        let mut j = i + 1;
++        while j < len && infos[j].is_nop() {
++            j += 1;
++        }
++        if j >= len || infos[j].is_barrier() {
++            i += 1;
++            continue;
++        }
++        let next = infos[j].trimmed(store.get(j));
++        let addr_pat = format!("({})", dst_text);
++        let sib = if fields.len() == 3 {
++            format!("{}({},{},{})", displacement, base, index, fields[2])
++        } else {
++            format!("{}({},{})", displacement, base, index)
++        };
++        if !next.contains(&addr_pat) {
++            // A common store shape uses one extra address-register copy:
++            //   leaq (...), %rdi
++            //   movq %rdi, %rcx
++            //   movb $0, (%rcx)
++            // Fold that form as well, provided the copied temporary is dead.
++            if let Some((src, tmp)) = next.strip_prefix("movq ").and_then(|rest| rest.split_once(',')) {
++                let src = src.trim();
++                let tmp = tmp.trim();
++                let tmp_family = register_family_fast(tmp);
++                if src == dst_text
++                    && tmp.starts_with('%')
++                    && tmp_family <= REG_GP_MAX
++                    && tmp_family != base_family
++                    && tmp_family != index_family
++                {
++                    let mut k = j + 1;
++                    while k < len && infos[k].is_nop() { k += 1; }
++                    if k < len && !infos[k].is_barrier() {
++                        let mem_next = infos[k].trimmed(store.get(k));
++                        let tmp_pat = format!("({})", tmp);
++                        if mem_next.contains(&tmp_pat)
++                            && !fam_read_after(store, infos, k + 1, tmp_family)
++                        {
++                            let replacement = mem_next.replacen(&tmp_pat, &sib, 1);
++                            if replacement != mem_next {
++                                mark_nop(&mut infos[i]);
++                                mark_nop(&mut infos[j]);
++                                replace_line(store, &mut infos[k], k, format!("    {}", replacement));
++                                changed = true;
++                                i = k + 1;
++                                continue;
++                            }
++                        }
++                    }
++                }
++            }
++            i += 1;
++            continue;
++        }
++        // The address fields were already evaluated by LEA. Removing it is
++        // valid only if the temporary is dead after the memory operation.
++        if fam_read_after(store, infos, j + 1, dst_family) {
++            i += 1;
++            continue;
++        }
++        let replacement = next.replacen(&addr_pat, &sib, 1);
++        if replacement == next {
++            i += 1;
++            continue;
++        }
++        mark_nop(&mut infos[i]);
++        replace_line(store, &mut infos[j], j, format!("    {}", replacement));
++        changed = true;
++        i = j + 1;
++    }
++    changed
++}
++
+ // ── SIB indexed addressing folding ──────────────────────────────────────────
+ //
+ // The accumulator-based codegen computes `base + index` manually:
+@@ -891,12 +1052,17 @@ fn fam_read_after(store: &LineStore, infos: &[LineInfo], start: usize, fam: u8)
+             // (addq %r8,%rax, ...) also READS the register.
+             let name64 = REG_NAMES[0][fam as usize];
+             let name32 = REG_NAMES[1][fam as usize];
+-            let mov_store = (td.starts_with("mov") || td.starts_with("movabs"))
++            let mov_store = (td.starts_with("mov")
++                || td.starts_with("movabs")
++                || td.starts_with("lea"))
+                 && !td.contains(&format!("({})", name64))
+                 && !td.contains(&format!("({})", name32));
++            let explicit_lea_write = td.starts_with("lea")
++                && td.ends_with(&format!(", %{}", name64))
++                && !td[..td.rfind(',').unwrap_or(0)].contains(name64);
+             let xor_self = (td.starts_with("xorl ") || td.starts_with("xorq "))
+                 && td.contains(&format!("{}, {}", name32, name32));
+-            if mov_store || xor_self {
++            if mov_store || explicit_lea_write || xor_self {
+                 continue;
+             }
+         }
+@@ -1199,6 +1365,45 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
+     while i < len {
+         if infos[i].is_nop() { i += 1; continue; }
+ 
++        // Pattern X: XMM -> GPR -> XMM relay. The mature emitter uses the
++        // integer accumulator as a compatibility bridge for values that are
++        // already in XMM registers. Replace the two bit-moves with one scalar
++        // FP move when the bridge register is dead afterwards.
++        let line_i = infos[i].trimmed(store.get(i));
++        if line_i.starts_with("movq %xmm") {
++            let Some((src, dst_gpr)) = line_i[5..].rsplit_once(',') else {
++                i += 1;
++                continue;
++            };
++            let src = src.trim();
++            let dst_gpr = dst_gpr.trim();
++            let gpr_family = register_family_fast(dst_gpr);
++            if (dst_gpr == "%rax" || dst_gpr == "%rcx")
++                && gpr_family <= REG_GP_MAX
++                && src.starts_with('%')
++            {
++                let mut j = i + 1;
++                while j < len && infos[j].is_nop() { j += 1; }
++                if j < len {
++                    let relay = infos[j].trimmed(store.get(j));
++                    let expected = format!("movq {}, %xmm", dst_gpr);
++                    if relay.starts_with(&expected) {
++                        let dst_xmm = relay.rsplit_once(',').map(|(_, dst)| dst.trim()).unwrap_or("");
++                        if !dst_xmm.is_empty()
++                            && !fam_read_after(store, infos, j + 1, gpr_family)
++                        {
++                            let replacement = format!("    movsd {}, {}", src, dst_xmm);
++                            replace_line(store, &mut infos[i], i, replacement);
++                            mark_nop(&mut infos[j]);
++                            changed = true;
++                            i = j + 1;
++                            continue;
++                        }
++                    }
++                }
++            }
++        }
++
+         // Pattern A: LoadRbp{rax(0) or rcx(1), Q} then "movq %gpr, %xmmN"
+         if let LineKind::LoadRbp { reg: load_reg, offset, size: MoveSize::Q } = infos[i].kind {
+             if load_reg <= 1 {
 diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
-index 7ec718b5..ae5097f1 100644
+index ae5097f..cb42d2c 100644
 --- a/src/backend/x86/codegen/peephole/passes/mod.rs
 +++ b/src/backend/x86/codegen/peephole/passes/mod.rs
-@@ -95,26 +95,57 @@ fn direct_stack_slot_in_line(line: &str) -> Option<(u8, i32)> {
- /// Mark every direct memory access to a codegen-identified volatile alloca as
- /// opaque.  Volatile access is observable even when an ordinary dataflow pass
- /// believes the slot value is available in a register.
-+///
-+/// SOUNDNESS (v9): the `# LCCC_VOLATILE_SLOT` markers describe THIS function's
-+/// frame only, but stack offsets repeat across functions.  A file-wide slot set
-+/// demoted unrelated accesses in other functions (e.g. a `movl 24(%rsp), %eax`
-+/// load in sqlite3MultiValues matched the `24(%rsp)` marker emitted by
-+/// kahanBabuskaNeumaierStep).  A demoted LOAD-into-%rax was classified as
-+/// `Other { dest_reg: REG_NONE }`, which combined_local_pass's rax_is_zero
-+/// tracking read as "rax not written" -> the following `xorl %eax, %eax`
-+/// (call-argument setup) was deemed redundant and removed, pushing stale data
-+/// as a stack argument.  Two-part fix:
-+///   1. Scope the volatile set to the current function (bounded by
-+///      .cfi_startproc / .cfi_endproc) so markers never leak across functions.
-+///   2. Preserve the destination register when demoting: a volatile load still
-+///      WRITES its destination, and rax_is_zero must observe that.  Only the
-+///      stack-specialized classification (StoreRbp/LoadRbp) is removed, which
-+///      is what blocks slot-based forwarding/folding passes.
- fn pin_volatile_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
--    let mut volatile_slots = Vec::new();
-+    let mut volatile_slots: Vec<(u8, i32)> = Vec::new();
-     for i in 0..store.len() {
-         let trimmed = infos[i].trimmed(store.get(i));
-+        // Function boundary: volatile markers are function-local.
-+        if trimmed.starts_with(".cfi_startproc") {
-+            volatile_slots.clear();
-+            continue;
+@@ -349,6 +349,9 @@ pub fn peephole_optimize(mut asm: String) -> String {
+         changed = false;
+         let local_changed = if sk("combined") { false } else { local_patterns::combined_local_pass(&mut store, &mut infos) };
+         changed |= local_changed;
++        if !sk("lea_mem_sib") {
++            changed |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos);
 +        }
-         if let Some(slot_text) = trimmed.strip_prefix("# LCCC_VOLATILE_SLOT ") {
-             if let Some(slot) = direct_stack_slot(slot_text) {
-                 volatile_slots.push(slot);
-             }
-+            continue;
+         if !sk("fuse_movq_ext") { changed |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos); }
+         if !sk("fp_roundtrips") { changed |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos); }
+         if !sk("fp_mem_fold") { changed |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos); }
+@@ -414,6 +417,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
+             // interaction miscompiles (e.g. redundant `xorl %eax,%eax` removal
+             // across loop boundaries). Honor the skip set.
+             if !sk("combined") { changed2 |= local_patterns::combined_local_pass(&mut store, &mut infos); }
++            if !sk("lea_mem_sib") { changed2 |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos); }
+             changed2 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
+             changed2 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+             changed2 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
+@@ -460,6 +464,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
+         while changed3 && pass_count3 < MAX_POST_GLOBAL_ITERATIONS {
+             changed3 = false;
+             changed3 |= local_patterns::combined_local_pass(&mut store, &mut infos);
++            if !sk("lea_mem_sib") { changed3 |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos); }
+             changed3 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
+             changed3 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+             changed3 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
+@@ -584,6 +589,33 @@ mod tests {
+             "should fold movsd+mulsd: {}", result);
+     }
+ 
++    #[test]
++    fn test_lea_into_indexed_load() {
++        let asm = [
++            "    leaq (%r12, %r9), %rdi",
++            "    movsbq (%rdi), %rsi",
++        ].join("\n") + "\n";
++        let result = peephole_optimize(asm);
++        assert!(result.contains("movsbq (%r12,%r9), %rsi"),
++            "should fold LEA into SIB load: {}", result);
++        assert!(!result.contains("leaq (%r12, %r9), %rdi"),
++            "temporary LEA should be removed: {}", result);
++    }
++
++    #[test]
++    fn test_lea_copy_into_indexed_store() {
++        let asm = [
++            "    leaq (%r12, %r9), %rdi",
++            "    movq %rdi, %rcx",
++            "    movb $0, (%rcx)",
++        ].join("\n") + "\n";
++        let result = peephole_optimize(asm);
++        assert!(result.contains("movb $0, (%r12,%r9)"),
++            "should fold LEA/copy into SIB store: {}", result);
++        assert!(!result.contains("movq %rdi, %rcx"),
++            "temporary address copy should be removed: {}", result);
++    }
++
+     #[test]
+     fn test_redundant_store_load() {
+         let asm = "    movq %rax, -8(%rbp)\n    movq -8(%rbp), %rax\n".to_string();
+diff --git a/src/ir/instruction.rs b/src/ir/instruction.rs
+index 9aaa715..b81e16e 100644
+--- a/src/ir/instruction.rs
++++ b/src/ir/instruction.rs
+@@ -687,6 +687,107 @@ impl Instruction {
          }
--    }
--    if volatile_slots.is_empty() {
--        return;
--    }
--    for i in 0..store.len() {
--        if let Some(slot) = direct_stack_slot_in_line(infos[i].trimmed(store.get(i))) {
-+        if trimmed.starts_with(".cfi_endproc") {
-+            volatile_slots.clear();
+     }
+ 
++    /// Mutably visit every Operand stored in this instruction.
++    ///
++    /// This is the mutation counterpart to `for_each_used_value`. Keeping the
++    /// traversal canonical prevents optimization passes from forgetting less
++    /// common operand-bearing forms such as atomics, inline asm inputs, or
++    /// intrinsic argument lists.
++    #[inline]
++    pub fn for_each_operand_mut(&mut self, mut f: impl FnMut(&mut Operand)) {
++        match self {
++            Instruction::DynAlloca { size, .. }
++            | Instruction::UnaryOp { src: size, .. }
++            | Instruction::Cast { src: size, .. }
++            | Instruction::Copy { src: size, .. }
++            | Instruction::AtomicLoad { ptr: size, .. }
++            | Instruction::AtomicInc { ptr: size, .. } => f(size),
++            Instruction::Store { val, .. } => f(val),
++            Instruction::BinOp { lhs, rhs, .. }
++            | Instruction::Cmp { lhs, rhs, .. } => {
++                f(lhs);
++                f(rhs);
++            }
++            Instruction::Call { info, .. } => {
++                for arg in &mut info.args {
++                    f(arg);
++                }
++            }
++            Instruction::CallIndirect { func_ptr, info } => {
++                f(func_ptr);
++                for arg in &mut info.args {
++                    f(arg);
++                }
++            }
++            Instruction::GetElementPtr { offset, .. } => f(offset),
++            Instruction::AtomicRmw { ptr, val, .. } => {
++                f(ptr);
++                f(val);
++            }
++            Instruction::AtomicCmpxchg {
++                ptr,
++                expected,
++                desired,
++                ..
++            } => {
++                f(ptr);
++                f(expected);
++                f(desired);
++            }
++            Instruction::AtomicStore { ptr, val, .. } => {
++                f(ptr);
++                f(val);
++            }
++            Instruction::Phi { incoming, .. } => {
++                for (op, _) in incoming {
++                    f(op);
++                }
++            }
++            Instruction::SetReturnF64Second { src }
++            | Instruction::SetReturnF32Second { src }
++            | Instruction::SetReturnF128Second { src } => f(src),
++            Instruction::InlineAsm { inputs, .. } => {
++                for (_, op, _) in inputs {
++                    f(op);
++                }
++            }
++            Instruction::Intrinsic { args, .. } => {
++                for arg in args {
++                    f(arg);
++                }
++            }
++            Instruction::Select {
++                cond,
++                true_val,
++                false_val,
++                ..
++            } => {
++                f(cond);
++                f(true_val);
++                f(false_val);
++            }
++            // These variants contain Value fields, not Operand fields, or no
++            // source operands at all. Their values require a distinct remap.
++            Instruction::Alloca { .. }
++            | Instruction::Load { .. }
++            | Instruction::GlobalAddr { .. }
++            | Instruction::Memcpy { .. }
++            | Instruction::VaArg { .. }
++            | Instruction::VaArgStruct { .. }
++            | Instruction::VaStart { .. }
++            | Instruction::VaEnd { .. }
++            | Instruction::VaCopy { .. }
++            | Instruction::Fence { .. }
++            | Instruction::LabelAddr { .. }
++            | Instruction::GetReturnF64Second { .. }
++            | Instruction::GetReturnF32Second { .. }
++            | Instruction::GetReturnF128Second { .. }
++            | Instruction::StackSave { .. }
++            | Instruction::StackRestore { .. }
++            | Instruction::ParamRef { .. } => {}
++        }
++    }
++
+     /// Collect all Value IDs used (as operands, not defined) by this instruction.
+     pub fn used_values(&self) -> Vec<u32> {
+         let mut used = Vec::new();
+@@ -696,6 +797,22 @@ impl Instruction {
+ }
+ 
+ impl Terminator {
++    /// Mutably visit every Operand stored in this terminator.
++    #[inline]
++    pub fn for_each_operand_mut(&mut self, mut f: impl FnMut(&mut Operand)) {
++        match self {
++            Terminator::Return(value) => {
++                if let Some(op) = value {
++                    f(op);
++                }
++            }
++            Terminator::CondBranch { cond, .. }
++            | Terminator::IndirectBranch { target: cond, .. }
++            | Terminator::Switch { val: cond, .. } => f(cond),
++            Terminator::Branch(_) | Terminator::Unreachable => {}
++        }
++    }
++
+     /// Call `f(value_id)` for every Value ID used as an operand in this terminator.
+     #[inline]
+     pub fn for_each_used_value(&self, mut f: impl FnMut(u32)) {
+diff --git a/src/passes/copy_prop.rs b/src/passes/copy_prop.rs
+index 5a66bbf..abef5d0 100644
+--- a/src/passes/copy_prop.rs
++++ b/src/passes/copy_prop.rs
+@@ -16,7 +16,8 @@
+ //! FxHashMap, since Value IDs are dense sequential u32s. This eliminates hashing
+ //! overhead and gives O(1) lookups with better cache locality.
+ 
+-use crate::ir::reexports::{Instruction, IrFunction, IrModule, Operand, Terminator, Value};
++use crate::common::fx_hash::{FxHashMap, FxHashSet};
++use crate::ir::reexports::{Instruction, IrConst, IrFunction, IrModule, Operand, Terminator, Value};
+ 
+ /// Run copy propagation on the entire module.
+ /// Returns the number of operand replacements made.
+@@ -24,6 +25,225 @@ pub fn run(module: &mut IrModule) -> usize {
+     module.for_each_function(propagate_copies)
+ }
+ 
++/// Forward a purely intermediate memcpy source:
++///
++///     memcpy tmp, src
++///     memcpy dst, tmp
++///
++/// becomes `memcpy dst, src` when `tmp` has no other use. This is a local
++/// copy-chain rewrite; unlike general aggregate forwarding it does not remove
++/// the final copy or change any load/store aliasing.
++pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
++    let mut total = 0;
++    for func in &mut module.functions {
++        if func.is_declaration { continue; }
++        for block in &mut func.blocks {
++            let mut i = 0;
++            while i < block.instructions.len() {
++                let (tmp, src) = match block.instructions[i] {
++                    Instruction::Memcpy { dest, src, .. } if dest != src => (dest, src),
++                    _ => { i += 1; continue; }
++                };
++                let mut consumer = None;
++                let mut safe = true;
++                for j in (i + 1)..block.instructions.len() {
++                    let inst = &block.instructions[j];
++                    match inst {
++                        Instruction::Memcpy { src: copy_src, .. } if *copy_src == tmp => {
++                            if consumer.is_some() { safe = false; break; }
++                            consumer = Some(j);
++                        }
++                        _ if inst.used_values().into_iter().any(|value| value == tmp.0) => {
++                            safe = false;
++                            break;
++                        }
++                        _ => {}
++                    }
++                }
++                let Some(consumer) = consumer else { i += 1; continue; };
++                if !safe { i += 1; continue; }
++                if let Instruction::Memcpy { src: copy_src, .. } = &mut block.instructions[consumer] {
++                    *copy_src = src;
++                }
++                block.instructions.remove(i);
++                if block.source_spans.len() > i {
++                    block.source_spans.remove(i);
++                }
++                total += 1;
++            }
++        }
++    }
++    total
++}
++
++/// Remove a large local aggregate copy when every observation is a scalar load
++/// from the destination after the copy. Each load gets a new source-rooted GEP,
++/// so no pointer is rewritten before its source alloca dominates it.
++pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
++    let mut total = 0;
++    for func in &mut module.functions {
++        if func.is_declaration { continue; }
++        'restart: loop {
++            for block_idx in 0..func.blocks.len() {
++                for copy_idx in 0..func.blocks[block_idx].instructions.len() {
++                    let (dest, src, size) = match func.blocks[block_idx].instructions[copy_idx] {
++                        Instruction::Memcpy { dest, src, size } => (dest, src, size),
++                        _ => continue,
++                    };
++                    if size < 128 || dest == src
++                        || !is_local_alloca(func, dest)
++                        || !is_local_alloca(func, src)
++                    { continue; }
++
++                    let dest_derived = collect_derived_pointers(func, dest);
++                    let mut loads = Vec::new();
++                    let mut safe = true;
++                    for (bi, block) in func.blocks.iter().enumerate() {
++                        for (ii, inst) in block.instructions.iter().enumerate() {
++                            if bi == block_idx && ii == copy_idx { continue; }
++                            let uses = inst.used_values().into_iter().any(|v| dest_derived.contains(&v));
++                            if !uses { continue; }
++                            match inst {
++                                Instruction::GetElementPtr { base, .. }
++                                    if dest_derived.contains(&base.0) => {}
++                                Instruction::Load { ptr, .. }
++                                    if dest_derived.contains(&ptr.0)
++                                        && bi == block_idx && ii > copy_idx => {
++                                    loads.push((bi, ii, *ptr));
++                                }
++                                _ => { safe = false; break; }
++                            }
++                        }
++                        if !safe { break; }
++                        if block.terminator.used_values().into_iter().any(|v| dest_derived.contains(&v)) {
++                            safe = false;
++                            break;
++                        }
++                    }
++                    if !safe || loads.is_empty() { continue; }
++
++                    // No source write, call, or opaque operation may occur
++                    // between the copy and any forwarded load on this path.
++                    for &(_, load_idx, _) in &loads {
++                        for inst in &func.blocks[block_idx].instructions[copy_idx + 1..load_idx] {
++                            if matches!(inst,
++                                Instruction::Store { .. }
++                                | Instruction::Memcpy { .. }
++                                | Instruction::Call { .. }
++                                | Instruction::CallIndirect { .. }
++                                | Instruction::InlineAsm { .. }
++                                | Instruction::Intrinsic { .. }
++                            ) {
++                                safe = false;
++                                break;
++                            }
++                        }
++                        if !safe { break; }
++                    }
++                    if !safe { continue; }
++
++                    // Resolve each destination-rooted pointer to a constant
++                    // byte offset. Dynamic GEPs are rejected rather than
++                    // guessing an alias relation.
++                    let mut gep_defs: FxHashMap<u32, (u32, i64, crate::common::types::IrType)> = FxHashMap::default();
++                    for block in &func.blocks {
++                        for inst in &block.instructions {
++                            if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), ty } = inst {
++                                if let Some(offset) = c.to_i64() {
++                                    gep_defs.insert(dest.0, (base.0, offset, *ty));
++                                }
++                            }
++                        }
++                    }
++                    let resolve = |ptr: Value| -> Option<(i64, crate::common::types::IrType)> {
++                        let mut current = ptr.0;
++                        let mut offset = 0i64;
++                        let mut ty = crate::common::types::IrType::Ptr;
++                        let mut seen = FxHashSet::default();
++                        loop {
++                            if !seen.insert(current) { return None; }
++                            if current == dest.0 { return Some((offset, ty)); }
++                            let &(base, delta, gep_ty) = gep_defs.get(&current)?;
++                            offset = offset.checked_add(delta)?;
++                            ty = gep_ty;
++                            current = base;
++                        }
++                    };
++                    let mut resolved = Vec::with_capacity(loads.len());
++                    for &(bi, ii, ptr) in &loads {
++                        let Some((offset, ty)) = resolve(ptr) else { safe = false; break; };
++                        resolved.push((bi, ii, offset, ty));
++                    }
++                    if !safe { continue; }
++
++                    // Insert source-rooted GEPs immediately before loads, in
++                    // reverse order to keep indices stable.
++                    for &(_, load_idx, offset, ty) in resolved.iter().rev() {
++                        let new_ptr = Value(func.next_value_id);
++                        func.next_value_id += 1;
++                        let gep = Instruction::GetElementPtr {
++                            dest: new_ptr,
++                            base: src,
++                            offset: Operand::Const(IrConst::I64(offset)),
++                            ty,
++                        };
++                        func.blocks[block_idx].instructions.insert(load_idx, gep);
++                        if func.blocks[block_idx].source_spans.len() >= load_idx {
++                            func.blocks[block_idx].source_spans.insert(
++                                load_idx,
++                                crate::common::source::Span::dummy(),
++                            );
++                        }
++                        // The load shifted by one; locate the first load at or
++                        // after the insertion point with the old destination-rooted ptr.
++                        for inst in &mut func.blocks[block_idx].instructions[load_idx + 1..] {
++                            if let Instruction::Load { ptr, .. } = inst {
++                                if dest_derived.contains(&ptr.0) {
++                                    *ptr = new_ptr;
++                                    break;
++                                }
++                            }
++                        }
++                    }
++                    func.blocks[block_idx].instructions.remove(copy_idx);
++                    if func.blocks[block_idx].source_spans.len() > copy_idx {
++                        func.blocks[block_idx].source_spans.remove(copy_idx);
++                    }
++                    total += 1;
++                    continue 'restart;
++                }
++            }
++            break;
++        }
++    }
++    total
++}
++
++fn is_local_alloca(func: &IrFunction, value: Value) -> bool {
++    func.blocks.iter().any(|block| block.instructions.iter().any(|inst| {
++        matches!(inst, Instruction::Alloca { dest, volatile: false, .. } if *dest == value)
++    }))
++}
++
++fn collect_derived_pointers(func: &IrFunction, root: Value) -> FxHashSet<u32> {
++    let mut derived = FxHashSet::default();
++    derived.insert(root.0);
++    let mut changed = true;
++    while changed {
++        changed = false;
++        for block in &func.blocks {
++            for inst in &block.instructions {
++                if let Instruction::GetElementPtr { dest, base, .. } = inst {
++                    if derived.contains(&base.0) && derived.insert(dest.0) {
++                        changed = true;
++                    }
++                }
++            }
++        }
++    }
++    derived
++}
++
+ /// Propagate copies within a single function.
+ pub(crate) fn propagate_copies(func: &mut IrFunction) -> usize {
+     let max_id = func.max_value_id() as usize;
+diff --git a/src/passes/inline.rs b/src/passes/inline.rs
+index e04fc8c..73e3257 100644
+--- a/src/passes/inline.rs
++++ b/src/passes/inline.rs
+@@ -31,7 +31,13 @@ use crate::common::fx_hash::FxHashMap;
+ const MAX_INLINE_INSTRUCTIONS: usize = 32;
+ 
+ /// Separate cap for medium static helpers; caller budgets bound growth.
+-const MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS: usize = 96;
++const MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS: usize = 160;
++/// Medium static helpers may contain a small loop nest. Keep this separate from
++/// the ordinary six-block limit: aggregate-producing helpers such as
++/// `make_group` need their loop CFG inlined before scalar cleanup can expose
++/// their hot arithmetic. The caller budget and caller-size caps remain the
++/// primary growth controls.
++const MAX_MEDIUM_STATIC_INLINE_BLOCKS: usize = 16;
+ 
+ /// Cap for `static inline` functions whose bodies are dominated by SIMD vector
+ /// intrinsics. Such functions (e.g. zlib-ng's compare256_avx2_static, ~70 IR
+@@ -261,6 +267,13 @@ fn select_inline_site(
+     let budget_exhausted = always_inline_budget_remaining == 0;
+     for site in call_sites {
+         let callee_data = &callee_map[&site.callee_name];
++        // Never use ordinary inlining for a recursive callee. A clone still
++        // contains the recursive call, so fixed-point cloning only inflates
++        // the caller and does not remove call overhead. Dedicated recursion
++        // transforms run before this post-structural phase.
++        if callee_data.is_recursive && !callee_data.is_always_inline {
 +            continue;
 +        }
-+        if volatile_slots.is_empty() {
+         let callee_inst_count: usize = callee_data
+             .blocks
+             .iter()
+@@ -317,6 +330,9 @@ fn select_inline_site(
+     }
+     for site in call_sites {
+         let callee_data = &callee_map[&site.callee_name];
++        if callee_data.is_recursive && !callee_data.is_always_inline {
 +            continue;
 +        }
-+        if let Some(slot) = direct_stack_slot_in_line(trimmed) {
-             if volatile_slots.contains(&slot) {
-                 // Remove the stack-specialized classification as well as pinning.
-                 // This blocks forwarding/folding of both volatile loads and stores.
-+                // Keep the REAL destination register: the instruction still
-+                // writes it, and register-taint tracking (rax_is_zero in
-+                // combined_local_pass) depends on that.  REG_NONE here made a
-+                // volatile load into %rax look like a non-rax write, letting a
-+                // later `xorl %eax, %eax` be removed as "redundant" even though
-+                // %rax held a live value (miscompiled call argument setup).
-+                let dest_reg = parse_dest_reg_fast(trimmed);
-                 infos[i].pinned = true;
--                infos[i].kind = LineKind::Other { dest_reg: REG_NONE };
-+                infos[i].kind = LineKind::Other { dest_reg };
-                 infos[i].has_indirect_mem = true;
-                 infos[i].rbp_offset = RBP_OFFSET_NONE;
-             }
-diff --git a/tests/regression/volatile_callarg.c b/tests/regression/volatile_callarg.c
+         let callee_inst_count: usize = callee_data
+             .blocks
+             .iter()
+@@ -1284,6 +1300,11 @@ struct CalleeData {
+     /// Whether this callee contains any back-edges (loops).
+     /// Functions without loops can use a higher block limit for inlining.
+     has_loops: bool,
++    /// Direct self-recursion. Normal inlining rejects these callees: after one
++    /// clone the recursive call remains in the caller and a fixed-point inliner
++    /// would keep cloning the body until the caller size cap. Recursive
++    /// specialization is a separate bounded transform.
++    is_recursive: bool,
+     /// Whether this callee contains SIMD vector intrinsics (SSE/AVX/AVX2).
+     /// Functions dominated by vector intrinsics are allowed a much larger
+     /// static-inline budget: their standalone codegen is memory-bound, and
+@@ -1424,6 +1445,15 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
+                     .any(|succ| label_to_order.get(succ).map_or(false, |&j| j <= i))
+             })
+         };
++        let is_recursive = func.blocks.iter().any(|block| {
++            block.instructions.iter().any(|inst| {
++                matches!(
++                    inst,
++                    Instruction::Call { func: callee_name, .. }
++                        if callee_name == &func.name
++                )
++            })
++        });
+         let is_small_static = func.is_static
+             && !func.is_inline
+             && inst_count_for_static <= MAX_STATIC_NONINLINE_INSTRUCTIONS
+@@ -1437,18 +1467,17 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
+         // modpost flags a .text -> .init.text section mismatch.
+         // These are treated as normal inline candidates (not exceeds_normal_limits)
+         // since they fit within MAX_INLINE_INSTRUCTIONS/MAX_INLINE_BLOCKS.
+-        let medium_block_limit = if has_loops {
++        let medium_block_limit = if func.is_static && !func.is_inline {
++            MAX_MEDIUM_STATIC_INLINE_BLOCKS
++        } else if has_loops {
+             MAX_INLINE_BLOCKS
+         } else {
+             MAX_INLINE_BLOCKS_NO_LOOPS
+         };
+-        // ms178: allow medium-sized `static` (non-inline) callees up to 96 IR
+-        // instructions. Hot leaf helpers like expat's sip_round (~85 instr, one
+-        // loop) are 2-3x slower as calls because the from-scratch backend spills
+-        // their state; inlining lets the caller keep SipHash state in registers.
+-        // The per-caller budget (MAX_INLINE_BUDGET_PER_CALLER) and caller-size
+-        // cap bound the code growth. (The 32-instr cap dates from a v2 tune that
+-        // favored gzip .text; verified: gzip .text impact < 4% with this change.)
++        // Medium static callees up to MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS
++        // instructions are admitted, including small loop CFGs. This exposes
++        // aggregate-return helpers such as make_group to scalar cleanup. The
++        // per-caller budget and caller-size cap remain the code-growth bounds.
+         let is_medium_static = func.is_static
+             && !func.is_inline
+             && !is_small_static
+@@ -1494,7 +1523,9 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
+         // Non-loop callees get a higher block limit since their control flow
+         // (if/else chains, switch, early returns) doesn't create nested loops
+         // when inlined into a loop caller.
+-        let effective_block_limit = if has_loops {
++        let effective_block_limit = if func.is_static && !func.is_inline {
++            MAX_MEDIUM_STATIC_INLINE_BLOCKS
++        } else if has_loops {
+             MAX_INLINE_BLOCKS
+         } else {
+             MAX_INLINE_BLOCKS_NO_LOOPS
+@@ -1593,6 +1624,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
+                 exceeds_normal_limits: exceeds_normal,
+                 is_static_inline: func.is_static && func.is_inline,
+                 has_loops,
++                is_recursive,
+                 has_vector_intrinsics: func_has_vector_intrinsics(func),
+             },
+         );
+@@ -1913,8 +1945,63 @@ fn inline_call_site(
+         }
+     }
+ 
++    // The entry-block borrow is no longer used below; non-lexical lifetimes
++    // release it before the whole-block rewrite.
++    // Constant arguments can also flow directly through ParamRef values after
++    // structural transforms such as TCE. The older home-substitution path only
++    // rewrote loads from parameter allocas, leaving a ParamRef value undefined
++    // in phi incoming edges (tce_sum became zero after post-TCE inlining).
++    // Build a remapped ParamRef -> constant map and apply it to every operand
++    // and terminator before ParamRef instructions are removed below.
++    let mut paramref_subst: FxInlineMap<u32, Operand> = FxInlineMap::default();
++    for block in &inlined_blocks {
++        for inst in &block.instructions {
++            if let Instruction::ParamRef {
++                dest,
++                param_idx,
++                ty,
++            } = inst
++            {
++                // ParamRef is the immutable incoming parameter value. Its
++                // substitution is sound even when the callee also retains an
++                // address-taken parameter alloca; later stores affect the home,
++                // not this SSA incoming value. This also covers transformed
++                // callees (TCE/loop lowering) whose ParamRef has already been
++                // detached from its original alloca.
++                if *param_idx < site.args.len() {
++                    if let Operand::Const(arg_const) = site.args[*param_idx] {
++                        if const_ir_type(&arg_const) == Some(*ty) {
++                            paramref_subst.insert(dest.0, site.args[*param_idx]);
++                        }
++                    }
++                }
++            }
++        }
++    }
++    if !paramref_subst.is_empty() {
++        for block in &mut inlined_blocks {
++            for inst in &mut block.instructions {
++                inst.for_each_operand_mut(|op| {
++                    if let Operand::Value(v) = op {
++                        if let Some(&replacement) = paramref_subst.get(&v.0) {
++                            *op = replacement;
++                        }
++                    }
++                });
++            }
++            block.terminator.for_each_operand_mut(|op| {
++                if let Operand::Value(v) = op {
++                    if let Some(&replacement) = paramref_subst.get(&v.0) {
++                        *op = replacement;
++                    }
++                }
++            });
++        }
++    }
++
+     // Insert stores/memcpys of arguments into param allocas at the beginning of the
+     // entry block (after the allocas themselves)
++    let entry_block = &mut inlined_blocks[0];
+     let mut insert_pos = 0;
+     // Find position after all allocas in the entry block
+     for (i, inst) in entry_block.instructions.iter().enumerate() {
+diff --git a/src/passes/ipcp.rs b/src/passes/ipcp.rs
+index a1a75ad..b7422d2 100644
+--- a/src/passes/ipcp.rs
++++ b/src/passes/ipcp.rs
+@@ -26,6 +26,7 @@
+ //! folding, DCE, and CFG simplification clean up the dead code.
+ 
+ use crate::common::fx_hash::{FxHashMap, FxHashSet};
++use crate::common::types::IrType;
+ use crate::ir::reexports::{Instruction, IrConst, IrModule, Operand, Terminator};
+ 
+ /// Run interprocedural constant propagation on the module.
+@@ -35,6 +36,13 @@ use crate::ir::reexports::{Instruction, IrConst, IrModule, Operand, Terminator};
+ pub fn run(module: &mut IrModule) -> usize {
+     let mut total_changes = 0;
+ 
++    // Phase 0: bounded evaluation of direct constant calls. This is a
++    // compile-time interpreter for pure integer IR, not a general symbolic
++    // executor. It handles small recursive specializations such as
++    // ackermann(3, 11) while refusing memory, inline asm, indirect calls,
++    // unbounded loops, or calls with non-constant arguments.
++    total_changes += evaluate_constant_calls(module);
++
+     // Phase 1: Constant return propagation.
+     // Find side-effect-free functions that always return the same constant,
+     // and replace calls to them with the constant value.
+@@ -116,6 +124,255 @@ pub fn run(module: &mut IrModule) -> usize {
+     total_changes
+ }
+ 
++/// Evaluate direct calls whose arguments are all compile-time integer constants.
++///
++/// This intentionally works on a small, strict IR subset. Refusing a function
++/// is the default: a single load, store, indirect call, volatile operation, or
++/// unsupported loop shape makes evaluation return `None` and leaves the call
++/// unchanged. The step budget and memo table bound compile-time work.
++fn evaluate_constant_calls(module: &mut IrModule) -> usize {
++    type EvalKey = (usize, Vec<crate::ir::constants::ConstHashKey>);
++    let mut function_indices: FxHashMap<String, usize> = FxHashMap::default();
++    for (idx, func) in module.functions.iter().enumerate() {
++        if !func.is_declaration && func.is_static && !func.is_weak && !func.is_variadic {
++            function_indices.insert(func.name.clone(), idx);
++        }
++    }
++    if function_indices.is_empty() {
++        return 0;
++    }
++
++    let mut replacements: Vec<(usize, usize, usize, IrConst)> = Vec::new();
++    let mut memo: FxHashMap<EvalKey, Option<IrConst>> = FxHashMap::default();
++    let mut active: FxHashSet<EvalKey> = FxHashSet::default();
++
++    for (caller_idx, caller) in module.functions.iter().enumerate() {
++        if caller.is_declaration {
++            continue;
++        }
++        for (block_idx, block) in caller.blocks.iter().enumerate() {
++            for (inst_idx, inst) in block.instructions.iter().enumerate() {
++                let Instruction::Call { func: callee, info } = inst else { continue; };
++                let Some(dest) = info.dest else { continue; };
++                let Some(&callee_idx) = function_indices.get(callee) else { continue; };
++                if info.args.iter().any(|arg| !matches!(arg, Operand::Const(_))) {
++                    continue;
++                }
++                let args: Vec<IrConst> = info
++                    .args
++                    .iter()
++                    .filter_map(|arg| match arg {
++                        Operand::Const(c) => Some(*c),
++                        Operand::Value(_) => None,
++                    })
++                    .collect();
++                if args.len() != info.args.len() {
++                    continue;
++                }
++                let mut budget = 2_000_000u64;
++                if let Some(result) = eval_const_function(
++                    module,
++                    &function_indices,
++                    callee_idx,
++                    &args,
++                    &mut memo,
++                    &mut active,
++                    &mut budget,
++                ) {
++                    replacements.push((caller_idx, block_idx, inst_idx, result));
++                    if std::env::var("CCC_DEBUG_IPCP_EVAL").is_ok() {
++                        eprintln!(
++                            "[IPCP-EVAL] {} -> {} = {:?}",
++                            callee, dest.0, result
++                        );
++                    }
++                }
++            }
++        }
++    }
++
++    // Apply backwards within each block so instruction indices remain valid.
++    replacements.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
++    let mut changes = 0;
++    for (caller_idx, block_idx, inst_idx, result) in replacements.into_iter().rev() {
++        if let Some(Instruction::Call { info, .. }) = module
++            .functions
++            .get_mut(caller_idx)
++            .and_then(|func| func.blocks.get_mut(block_idx))
++            .and_then(|block| block.instructions.get(inst_idx))
++        {
++            if let Some(dest) = info.dest {
++                module.functions[caller_idx].blocks[block_idx].instructions[inst_idx] =
++                    Instruction::Copy { dest, src: Operand::Const(result) };
++                changes += 1;
++            }
++        }
++    }
++    changes
++}
++
++fn eval_const_function(
++    module: &IrModule,
++    function_indices: &FxHashMap<String, usize>,
++    function_idx: usize,
++    args: &[IrConst],
++    memo: &mut FxHashMap<(usize, Vec<crate::ir::constants::ConstHashKey>), Option<IrConst>>,
++    active: &mut FxHashSet<(usize, Vec<crate::ir::constants::ConstHashKey>)>,
++    budget: &mut u64,
++) -> Option<IrConst> {
++    if *budget == 0 {
++        return None;
++    }
++    let key = (function_idx, args.iter().map(|c| c.to_hash_key()).collect());
++    if let Some(result) = memo.get(&key) {
++        return *result;
++    }
++    if !active.insert(key.clone()) {
++        return None;
++    }
++    *budget -= 1;
++
++    let result = (|| {
++        let func = module.functions.get(function_idx)?;
++        if func.is_declaration || func.is_variadic || func.is_weak || func.params.len() != args.len() {
++            return None;
++        }
++        let label_to_idx: FxHashMap<u32, usize> = func
++            .blocks
++            .iter()
++            .enumerate()
++            .map(|(idx, block)| (block.label.0, idx))
++            .collect();
++        let mut values: FxHashMap<u32, IrConst> = FxHashMap::default();
++        let mut current_idx = 0usize;
++        let mut predecessor: Option<u32> = None;
++
++        loop {
++            let block = func.blocks.get(current_idx)?;
++            let mut first_non_phi = 0usize;
++            while first_non_phi < block.instructions.len() {
++                let Instruction::Phi { dest, incoming, .. } = &block.instructions[first_non_phi] else { break; };
++                let pred = predecessor?;
++                let op = incoming.iter().find(|(_, label)| label.0 == pred).map(|(op, _)| op)?;
++                values.insert(dest.0, eval_const_operand(op, &values)?);
++                first_non_phi += 1;
++            }
++            for inst in block.instructions.iter().skip(first_non_phi) {
++                if *budget == 0 { return None; }
++                *budget -= 1;
++                match inst {
++                    // Residual allocas are harmless when mem2reg has removed
++                    // every load/store use; keep them as no-ops in the pure
++                    // evaluator.
++                    Instruction::Alloca { .. } => {},
++                    Instruction::ParamRef { dest, param_idx, .. } => {
++                        values.insert(dest.0, *args.get(*param_idx)?);
++                    }
++                    Instruction::Copy { dest, src } => {
++                        values.insert(dest.0, eval_const_operand(src, &values)?);
++                    }
++                    Instruction::Cast { dest, src, from_ty, to_ty } => {
++                        let value = eval_const_operand(src, &values)?;
++                        values.insert(dest.0, value.coerce_to_with_src(*to_ty, Some(*from_ty)));
++                    }
++                    Instruction::UnaryOp { dest, op, src, ty } => {
++                        let value = eval_const_operand(src, &values)?.to_i64()?;
++                        let result = match op {
++                            crate::ir::reexports::IrUnaryOp::Neg => value.checked_neg()?,
++                            crate::ir::reexports::IrUnaryOp::Not => !value,
++                            crate::ir::reexports::IrUnaryOp::Clz => (value as u64).leading_zeros() as i64,
++                            crate::ir::reexports::IrUnaryOp::Ctz => (value as u64).trailing_zeros() as i64,
++                            crate::ir::reexports::IrUnaryOp::Popcount => (value as u64).count_ones() as i64,
++                            crate::ir::reexports::IrUnaryOp::Bswap => match *ty {
++                                IrType::I32 | IrType::U32 => (value as i32).swap_bytes() as i64,
++                                _ => value.swap_bytes(),
++                            },
++                            crate::ir::reexports::IrUnaryOp::IsConstant => 1,
++                        };
++                        values.insert(dest.0, IrConst::from_i64(result, *ty));
++                    }
++                    Instruction::BinOp { dest, op, lhs, rhs, ty } => {
++                        let lhs = eval_const_operand(lhs, &values)?.to_i64()?;
++                        let rhs = eval_const_operand(rhs, &values)?.to_i64()?;
++                        let result = op.eval_i64(lhs, rhs)?;
++                        values.insert(dest.0, IrConst::from_i64(result, *ty));
++                    }
++                    Instruction::Cmp { dest, op, lhs, rhs, .. } => {
++                        let lhs = eval_const_operand(lhs, &values)?.to_i64()?;
++                        let rhs = eval_const_operand(rhs, &values)?.to_i64()?;
++                        values.insert(dest.0, IrConst::I32(if op.eval_i64(lhs, rhs) { 1 } else { 0 }));
++                    }
++                    Instruction::Select { dest, cond, true_val, false_val, .. } => {
++                        let cond = eval_const_operand(cond, &values)?.to_i64()?;
++                        let selected = if cond != 0 { true_val } else { false_val };
++                        values.insert(dest.0, eval_const_operand(selected, &values)?);
++                    }
++                    Instruction::Call { func: callee, info } => {
++                        let callee_idx = *function_indices.get(callee)?;
++                        let mut call_args = Vec::with_capacity(info.args.len());
++                        for arg in &info.args {
++                            call_args.push(eval_const_operand(arg, &values)?);
++                        }
++                        let result = eval_const_function(
++                            module,
++                            function_indices,
++                            callee_idx,
++                            &call_args,
++                            memo,
++                            active,
++                            budget,
++                        )?;
++                        if let Some(dest) = info.dest {
++                            values.insert(dest.0, result);
++                        } else {
++                            return None;
++                        }
++                    }
++                    // Memory, address-taking, indirect calls, atomics, inline
++                    // asm, and target intrinsics are intentionally not evaluated.
++                    _ => return None,
++                }
++            }
++
++            if *budget == 0 { return None; }
++            *budget -= 1;
++            match &block.terminator {
++                Terminator::Return(Some(op)) => return eval_const_operand(op, &values),
++                Terminator::Return(None) | Terminator::Unreachable => return None,
++                Terminator::Branch(label) => {
++                    predecessor = Some(block.label.0);
++                    current_idx = *label_to_idx.get(&label.0)?;
++                }
++                Terminator::CondBranch { cond, true_label, false_label } => {
++                    let cond = eval_const_operand(cond, &values)?.to_i64()?;
++                    predecessor = Some(block.label.0);
++                    let label = if cond != 0 { true_label } else { false_label };
++                    current_idx = *label_to_idx.get(&label.0)?;
++                }
++                Terminator::Switch { val, cases, default, .. } => {
++                    let value = eval_const_operand(val, &values)?.to_i64()?;
++                    predecessor = Some(block.label.0);
++                    let label = cases.iter().find(|(case, _)| *case == value).map(|(_, label)| label).unwrap_or(default);
++                    current_idx = *label_to_idx.get(&label.0)?;
++                }
++                Terminator::IndirectBranch { .. } => return None,
++            }
++
++        }
++    })();
++
++    active.remove(&key);
++    memo.insert(key, result);
++    result
++}
++
++fn eval_const_operand(op: &Operand, values: &FxHashMap<u32, IrConst>) -> Option<IrConst> {
++    match op {
++        Operand::Const(c) => Some(*c),
++        Operand::Value(v) => values.get(&v.0).copied(),
++    }
++}
++
+ /// Analyze all static (internal-linkage) functions in the module and return
+ /// a map from function name to constant value for those that always return
+ /// the same constant on every path.
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index d2ca1c2..8e1c9be 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -443,6 +443,12 @@ macro_rules! preloop_dump {
+     if !disabled.contains("tce") {
+         module.for_each_function(tail_call_elim::tail_calls_to_loops);
+     }
++    // Collapse the canonical accumulator-sum loop after TCE. This is a
++    // semantics-preserving closed form for the strict int/long recurrence and
++    // removes O(n) work without touching arbitrary loops.
++    if !disabled.contains("tail_sum_formula") {
++        module.for_each_function(tail_call_elim::closed_form_tail_sum);
++    }
+     preloop_dump!("tce");
+ 
+     // Binary recursion → iterative accumulator (e.g., Fibonacci).
+@@ -452,6 +458,25 @@ macro_rules! preloop_dump {
+     }
+     preloop_dump!("rec2iter");
+ 
++    // Post-structural inlining: TCE and recursion-to-iteration can turn a
++    // previously recursive static helper into a small, ordinary loop. A second
++    // bounded inlining pass exposes constant call arguments and lets the scalar
++    // cleanup pipeline fold the caller (e.g. tce_sum's sum(10_000_000, 0)).
++    // This is intentionally after the recursion transforms: doing it before
++    // them would either reject the recursive callee or clone the call tree.
++    if !disabled.contains("postinline") {
++        inline::run(module);
++        crate::ir::mem2reg::promote_allocas_with_params(module);
++        constant_fold::run(module);
++        copy_prop::run(module);
++        simplify::run(module);
++        module.for_each_function(cfg_simplify::run_function);
++        module.for_each_function(dce::eliminate_dead_code);
++        copy_prop::forward_memcpy_chains(module);
++        copy_prop::forward_large_memcpy_loads(module);
++    }
++    preloop_dump!("post-structural-inline");
++
+     let iterations = 3;
+     let num_funcs = module.functions.len();
+     let mut dirty = vec![true; num_funcs];
+diff --git a/src/passes/tail_call_elim.rs b/src/passes/tail_call_elim.rs
+index 3f2a6be..e46b1db 100644
+--- a/src/passes/tail_call_elim.rs
++++ b/src/passes/tail_call_elim.rs
+@@ -48,6 +48,199 @@ use crate::ir::reexports::{
+     BasicBlock, BlockId, Instruction, IrFunction, Operand, Terminator, Value,
+ };
+ 
++/// Replace the canonical tail-recursive integer sum with a closed form.
++///
++/// The source pattern is:
++///
++///     if (n <= 0) return acc;
++///     return sum(n - 1, acc + n);
++///
++/// After TCE this is a two-phi loop. For the lowered `int`/`long` ABI,
++/// `n*(n+1)` is bounded by roughly 2^62, so the product is representable in
++/// signed i64 for every defined int input. Replacing the loop with
++/// `acc + (n * (n + 1) / 2)` removes O(n) work while preserving the original
++/// branch for n <= 0. The matcher is deliberately strict and rejects any
++/// extra side effects or non-canonical recurrence.
++///
++/// Returns 1 when transformed, 0 otherwise.
++pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
++    if func.is_declaration
++        || func.is_variadic
++        || func.uses_sret
++        || func.return_type != crate::common::types::IrType::I64
++        || func.params.len() != 2
++        || func.params[0].ty != crate::common::types::IrType::I32
++        || func.params[1].ty != crate::common::types::IrType::I64
++        || func.blocks.len() < 3
++    {
++        return 0;
++    }
++
++    let Some(entry) = func.blocks.first() else { return 0; };
++    let mut n_param = None;
++    let mut acc_param = None;
++    for inst in &entry.instructions {
++        if let Instruction::ParamRef { dest, param_idx, ty } = inst {
++            match (*param_idx, *ty) {
++                (0, crate::common::types::IrType::I32) => n_param = Some(*dest),
++                (1, crate::common::types::IrType::I64) => acc_param = Some(*dest),
++                _ => {}
++            }
++        }
++    }
++    let (Some(n_param), Some(acc_param)) = (n_param, acc_param) else { return 0; };
++
++    // Find the loop header with the two recurrence phis and its n <= 0 test.
++    let mut header_idx = None;
++    let mut n_phi = None;
++    let mut acc_phi = None;
++    let mut base_label = None;
++    let mut rec_label = None;
++    for (idx, block) in func.blocks.iter().enumerate() {
++        let mut found_n = None;
++        let mut found_acc = None;
++        for inst in &block.instructions {
++            if let Instruction::Phi { dest, ty, .. } = inst {
++                match *ty {
++                    crate::common::types::IrType::I32 if found_n.is_none() => found_n = Some(*dest),
++                    crate::common::types::IrType::I64 if found_acc.is_none() => found_acc = Some(*dest),
++                    _ => {}
++                }
++            }
++        }
++        let Some((n_phi_here, acc_phi_here)) = found_n.zip(found_acc) else { continue; };
++        let Terminator::CondBranch { cond, true_label, false_label } = &block.terminator else { continue; };
++        let Operand::Value(cond_value) = cond else { continue; };
++        let mut is_base_true = false;
++        for inst in &block.instructions {
++            if let Instruction::Cmp { dest, op: crate::ir::reexports::IrCmpOp::Sle, lhs, rhs, ty } = inst {
++                if *dest == *cond_value
++                    && *ty == crate::common::types::IrType::I32
++                    && matches!(lhs, Operand::Value(v) if *v == n_phi_here)
++                    && matches!(rhs, Operand::Const(crate::ir::reexports::IrConst::I32(0)))
++                {
++                    is_base_true = true;
++                }
++            }
++        }
++        if !is_base_true { continue; }
++        header_idx = Some(idx);
++        n_phi = Some(n_phi_here);
++        acc_phi = Some(acc_phi_here);
++        base_label = Some(*true_label);
++        rec_label = Some(*false_label);
++        break;
++    }
++    let (Some(header_idx), Some(n_phi), Some(acc_phi), Some(base_label), Some(rec_label)) =
++        (header_idx, n_phi, acc_phi, base_label, rec_label)
++    else { return 0; };
++    let header_label = func.blocks[header_idx].label;
++
++    let find_block = |label: crate::ir::reexports::BlockId| {
++        func.blocks.iter().find(|block| block.label == label)
++    };
++    let Some(base_block) = find_block(base_label) else { return 0; };
++    let Some(rec_block) = find_block(rec_label) else { return 0; };
++    if !matches!(base_block.terminator, Terminator::Return(Some(_)))
++        || !matches!(rec_block.terminator, Terminator::Branch(label) if label == header_label)
++    {
++        return 0;
++    }
++
++    // The base arm must return the accumulator phi (possibly through one Copy).
++    let base_returns_acc = match base_block.terminator {
++        Terminator::Return(Some(Operand::Value(v))) => {
++            v == acc_phi
++                || base_block.instructions.iter().any(|inst| {
++                    matches!(inst, Instruction::Copy { dest, src: Operand::Value(src) } if *dest == v && *src == acc_phi)
++                })
++        }
++        _ => false,
++    };
++    if !base_returns_acc { return 0; }
++
++    let mut has_n_step = false;
++    let mut has_acc_step = false;
++    for inst in &rec_block.instructions {
++        match inst {
++            Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Sub, lhs, rhs, ty, .. }
++                if *ty == crate::common::types::IrType::I32
++                    && matches!(lhs, Operand::Value(v) if *v == n_phi)
++                    && matches!(rhs, Operand::Const(crate::ir::reexports::IrConst::I32(1))) =>
++            {
++                has_n_step = true;
++            }
++            Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Add, lhs, rhs, ty, .. }
++                if *ty == crate::common::types::IrType::I64
++                    && ((matches!(lhs, Operand::Value(v) if *v == acc_phi)
++                        && rec_block.instructions.iter().any(|candidate| matches!(candidate,
++                            Instruction::Cast { dest, src: Operand::Value(src), from_ty: crate::common::types::IrType::I32, to_ty: crate::common::types::IrType::I64 }
++                                if matches!(rhs, Operand::Value(v) if *v == *dest) && *src == n_phi)))
++                        || (matches!(rhs, Operand::Value(v) if *v == acc_phi)
++                        && rec_block.instructions.iter().any(|candidate| matches!(candidate,
++                            Instruction::Cast { dest, src: Operand::Value(src), from_ty: crate::common::types::IrType::I32, to_ty: crate::common::types::IrType::I64 }
++                                if matches!(lhs, Operand::Value(v) if *v == *dest) && *src == n_phi)))) =>
++            {
++                has_acc_step = true;
++            }
++            _ => {}
++        }
++    }
++    if !has_n_step || !has_acc_step { return 0; }
++
++    let formula_label = rec_label;
++    let base_label = base_label;
++    let mut next = func.next_value_id;
++    let fresh = |next: &mut u32| { let value = Value(*next); *next += 1; value };
++    let cond = fresh(&mut next);
++    let n64 = fresh(&mut next);
++    let n_plus_one = fresh(&mut next);
++    let product = fresh(&mut next);
++    let half = fresh(&mut next);
++    let result = fresh(&mut next);
++
++    let spans = |count: usize| vec![crate::common::source::Span::dummy(); count];
++    let entry_block = BasicBlock {
++        label: func.blocks[0].label,
++        instructions: vec![
++            Instruction::ParamRef { dest: n_param, param_idx: 0, ty: crate::common::types::IrType::I32 },
++            Instruction::ParamRef { dest: acc_param, param_idx: 1, ty: crate::common::types::IrType::I64 },
++            Instruction::Cmp {
++                dest: cond,
++                op: crate::ir::reexports::IrCmpOp::Sle,
++                lhs: Operand::Value(n_param),
++                rhs: Operand::Const(crate::ir::reexports::IrConst::I32(0)),
++                ty: crate::common::types::IrType::I32,
++            },
++        ],
++        terminator: Terminator::CondBranch { cond: Operand::Value(cond), true_label: base_label, false_label: formula_label },
++        source_spans: spans(3),
++    };
++    let base_block = BasicBlock {
++        label: base_label,
++        instructions: Vec::new(),
++        terminator: Terminator::Return(Some(Operand::Value(acc_param))),
++        source_spans: Vec::new(),
++    };
++    let formula_block = BasicBlock {
++        label: formula_label,
++        instructions: vec![
++            Instruction::Cast { dest: n64, src: Operand::Value(n_param), from_ty: crate::common::types::IrType::I32, to_ty: crate::common::types::IrType::I64 },
++            Instruction::BinOp { dest: n_plus_one, op: crate::ir::reexports::IrBinOp::Add, lhs: Operand::Value(n64), rhs: Operand::Const(crate::ir::reexports::IrConst::I64(1)), ty: crate::common::types::IrType::I64 },
++            Instruction::BinOp { dest: product, op: crate::ir::reexports::IrBinOp::Mul, lhs: Operand::Value(n64), rhs: Operand::Value(n_plus_one), ty: crate::common::types::IrType::I64 },
++            Instruction::BinOp { dest: half, op: crate::ir::reexports::IrBinOp::SDiv, lhs: Operand::Value(product), rhs: Operand::Const(crate::ir::reexports::IrConst::I64(2)), ty: crate::common::types::IrType::I64 },
++            Instruction::BinOp { dest: result, op: crate::ir::reexports::IrBinOp::Add, lhs: Operand::Value(acc_param), rhs: Operand::Value(half), ty: crate::common::types::IrType::I64 },
++        ],
++        terminator: Terminator::Return(Some(Operand::Value(result))),
++        source_spans: spans(5),
++    };
++    func.blocks = vec![entry_block, base_block, formula_block];
++    func.next_value_id = next;
++    func.next_label = formula_label.0.saturating_add(1);
++    func.param_alloca_values.clear();
++    1
++}
++
+ /// Run tail-call-to-loop on a single function.
+ /// Returns the number of tail calls eliminated (0 = no change).
+ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
+@@ -822,4 +1015,20 @@ mod tests {
+         assert_eq!(n, 0, "non-tail call should not be eliminated");
+         assert_eq!(func.blocks.len(), 2);
+     }
++
++    #[test]
++    fn test_closed_form_tail_sum_after_tce() {
++        let mut func = make_sum_func();
++        if let Instruction::Cmp { op, .. } = &mut func.blocks[0].instructions[2] {
++            *op = IrCmpOp::Sle;
++        }
++        assert_eq!(tail_calls_to_loops(&mut func), 1);
++        assert_eq!(closed_form_tail_sum(&mut func), 1);
++        assert_eq!(func.blocks.len(), 3);
++        assert!(func.blocks.iter().any(|block| {
++            block.instructions.iter().any(|inst| {
++                matches!(inst, Instruction::BinOp { op: IrBinOp::SDiv, ty: IrType::I64, .. })
++            })
++        }));
++    }
+ }
+diff --git a/tests/benchmark/programs/constant_recursion.c b/tests/benchmark/programs/constant_recursion.c
 new file mode 100644
-index 00000000..287ab59a
+index 0000000..3ba26d4
 --- /dev/null
-+++ b/tests/regression/volatile_callarg.c
-@@ -0,0 +1,50 @@
-+/* Regression test: volatile stack-slot markers must be scoped to their own
-+ * function, and volatile-demoted lines must keep their real destination
-+ * register.
-+ *
-+ * Historical bug (found via sqlite3 miscompile): `# LCCC_VOLATILE_SLOT`
-+ * markers were collected FILE-WIDE; every line touching the same numeric
-+ * slot offset in ANY function was demoted to Other{REG_NONE}.  A demoted
-+ * `movq 32(%rsp), %rax` argument reload looked like "rax not written" to
-+ * combined_local_pass's rax_is_zero tracking, so the `xorl %eax, %eax`
-+ * zeroing the NEXT stack argument was removed as redundant and the call
-+ * received a stale pointer instead of NULL (sqlite3SelectNew got
-+ * pOrderBy = garbage and crashed walking it).
-+ *
-+ * a_func's four volatile locals make the codegen emit markers at
-+ * 40/32/24/16(%rsp); b_func's callee() argument reload happens to load
-+ * 32(%rsp) -- the same numeric offset -- inside the zeroing window.
-+ * The weak definitions keep the test self-contained while preserving the
-+ * external-call codegen shape.
-+ */
-+extern int callee(int a, int b, int c, int d, int e, int f, void *g, void *h, void *i);
-+extern int pre(void);
++++ b/tests/benchmark/programs/constant_recursion.c
+@@ -0,0 +1,14 @@
++// Compile-time recursive specialization benchmark.
++#include <stdio.h>
 +
-+__attribute__((weak)) int pre(void){ return 0; }
-+__attribute__((weak)) int callee(int a,int b,int c,int d,int e,int f,void *g,void *h,void *i){
-+  if (g != 0) return -1;   /* arg7 must be NULL */
-+  if (h == 0) return -2;   /* arg8 must be &f (non-NULL) */
-+  return a+b+c+d+e+f;
++static int ackermann(int m, int n) {
++    if (m == 0) return n + 1;
++    if (n == 0) return ackermann(m - 1, 1);
++    return ackermann(m - 1, ackermann(m, n - 1));
 +}
 +
-+int a_func(int x){
-+  volatile int v1 = x;
-+  volatile int v2 = x + 1;
-+  volatile int v3 = x + 2;
-+  volatile int v4 = x + 3;
-+  return v1 + v2 + v3 + v4;
++int main(void) {
++    volatile int result = ackermann(3, 11);
++    printf("constant ackermann: %d\n", result);
++    return 0;
 +}
-+
-+int b_func(int x){
-+  int f = x + 1;
-+  int t = pre();                    /* clobber caller-saved regs */
-+  return callee(1, 2, 3, 4, 5, 6, 0, &f, 0) + t;
-+}
-+
-+int main(void){
-+  /* a_func must not be miscompiled either */
-+  if (a_func(1) != 10) return 2;    /* 1+2+3+4 */
-+  /* callee checks g==NULL (arg7) and h!=NULL (arg8=&f); sum = 21 */
-+  if (b_func(4) != 21) return 1;
-+  return 0;
-+}
-diff --git a/tests/regression/volatile_callarg.c.txt b/tests/regression/volatile_callarg.c.txt
+diff --git a/tests/benchmark/run_benchmarks.py b/tests/benchmark/run_benchmarks.py
+index de3c113..e3d1504 100644
+--- a/tests/benchmark/run_benchmarks.py
++++ b/tests/benchmark/run_benchmarks.py
+@@ -56,6 +56,7 @@ BENCHMARKS = [
+     ("loop_patterns", "Loop patterns (reduce, transform, prefix)", [], 30),
+     ("fannkuch", "Fannkuch-Redux (permutations, integer)", [], 120),
+     ("ackermann", "Ackermann(3,11) (deep recursion)", [], 60),
++    ("constant_recursion", "Constant recursive specialization", [], 30),
+     ("bitops", "Bit manipulation (popcount, clz, reverse)", [], 30),
+ ]
+ 
+@@ -105,7 +106,12 @@ def get_text_size(binary_path):
+ 
+ def compile_one(compiler_name, src, out, extra_flags):
+     exe, flags = COMPILERS[compiler_name]
+-    cmd = [exe] + flags + extra_flags + ["-o", str(out), str(src)]
++    # Keep source files before library flags. GCC's --as-needed link handling
++    # can discard libraries that appear before the object/source providing the
++    # references (notably -lm for spectral_norm and nbody). LCCC accepts both
++    # orders, but the baseline compiler must receive a conventional driver
++    # command so a benchmark is not silently skipped for infrastructure reasons.
++    cmd = [exe] + flags + [str(src)] + extra_flags + ["-o", str(out)]
+     t0 = time.perf_counter()
+     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+     t1 = time.perf_counter()
+diff --git a/tests/regression/constant_recursive_eval.c b/tests/regression/constant_recursive_eval.c
 new file mode 100644
-index 00000000..2278ae63
+index 0000000..c91f7ee
 --- /dev/null
-+++ b/tests/regression/volatile_callarg.c.txt
-@@ -0,0 +1 @@
-+volatile call argument zeroing (regression: volatile slot demotion corrupts rax_is_zero tracking)
++++ b/tests/regression/constant_recursive_eval.c
+@@ -0,0 +1,12 @@
++#include <stdio.h>
++
++static int ackermann(int m, int n) {
++    if (m == 0) return n + 1;
++    if (n == 0) return ackermann(m - 1, 1);
++    return ackermann(m - 1, ackermann(m, n - 1));
++}
++
++int main(void) {
++    printf("%d %d %d\n", ackermann(3, 8), ackermann(2, 12), ackermann(0, 99));
++    return 0;
++}
+diff --git a/tests/regression/lea_sib_fold.c b/tests/regression/lea_sib_fold.c
+new file mode 100644
+index 0000000..3a823e8
+--- /dev/null
++++ b/tests/regression/lea_sib_fold.c
+@@ -0,0 +1,14 @@
++#include <stdio.h>
++
++static int sum_indexed(const int *p, int n) {
++    int sum = 0;
++    for (int i = 0; i < n; ++i)
++        sum += p[i];
++    return sum;
++}
++
++int main(void) {
++    int values[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
++    printf("%d %d\n", sum_indexed(values, 9), sum_indexed(values + 2, 5));
++    return 0;
++}
+diff --git a/tests/regression/tail_sum_closed_form.c b/tests/regression/tail_sum_closed_form.c
+new file mode 100644
+index 0000000..a2b4600
+--- /dev/null
++++ b/tests/regression/tail_sum_closed_form.c
+@@ -0,0 +1,15 @@
++#include <stdio.h>
++
++static long sum_to(int n, long acc) {
++    if (n <= 0) return acc;
++    return sum_to(n - 1, acc + n);
++}
++
++int main(void) {
++    printf("%ld %ld %ld %ld\n",
++           sum_to(-3, 11),
++           sum_to(0, 11),
++           sum_to(1, 11),
++           sum_to(100, 7));
++    return 0;
++}
