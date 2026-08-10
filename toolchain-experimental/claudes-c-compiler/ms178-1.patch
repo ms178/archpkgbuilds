@@ -1,567 +1,64 @@
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index 3dedcd21..4a433077 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -1328,6 +1328,7 @@ fn generate_function(
-         !has_dyn_alloca && !func.is_variadic && !has_inline_asm_rbp && !has_vector_intrinsics;
- 
-     // Calculate stack space and emit prologue
-+    cg.state().current_func_name = func.name.clone();
-     let raw_space = cg.calculate_stack_space(func);
-     let frame_size = cg.aligned_frame_size(raw_space);
-     cg.state().frame_size = frame_size;
-@@ -1510,7 +1511,7 @@ fn generate_function(
-             // If the instruction is handled, it's accumulated in the MachInst buffer.
-             // When an unhandled instruction is encountered, the buffer is flushed
-             // (allocated and emitted) before falling through to the default codegen.
--            if cg.try_lower_machinst(inst) {
-+            if cg.try_lower_machinst(inst, &dead_global_addrs) {
-                 cg.state().current_program_point += 1;
-                 continue;
-             }
-@@ -1612,7 +1613,7 @@ fn emit_loc_directive(
- ///
- /// Instructions that clobber the accumulator unpredictably (calls, stores, atomics,
- /// inline asm, va_arg, memcpy, etc.) invalidate the cache after execution.
--fn generate_instruction(
-+pub(crate) fn generate_instruction(
-     cg: &mut dyn ArchCodegen,
-     inst: &Instruction,
-     gep_fold_map: &FxHashMap<u32, GepFoldInfo>,
-diff --git a/src/backend/state.rs b/src/backend/state.rs
-index b141ae2c..98d8b243 100644
---- a/src/backend/state.rs
-+++ b/src/backend/state.rs
-@@ -221,6 +221,8 @@ pub struct CodegenState {
-     /// and skipped during codegen. These values are never emitted — their registers
-     /// are uninitialized. MachInst must not use these as pointers.
-     pub folded_gep_values: FxHashSet<u32>,
-+    /// Name of the function currently being code-generated (diagnostics).
-+    pub current_func_name: String,
-     /// Total use count for each value ID across the entire function.
-     /// Used by MachInst flush to determine if a buffer-defined vreg is live-out.
-     pub value_use_counts: Vec<u32>,
-@@ -379,6 +381,7 @@ impl CodegenState {
-             reg_cache: RegCache::default(),
-             gep_base_offset: FxHashMap::default(),
-             folded_gep_values: FxHashSet::default(),
-+            current_func_name: String::new(),
-             value_use_counts: Vec::new(),
-             block_use_counts: FxHashMap::default(),
-             function_return_thunk: false,
-diff --git a/src/backend/traits.rs b/src/backend/traits.rs
-index ce240de0..992bfdd0 100644
---- a/src/backend/traits.rs
-+++ b/src/backend/traits.rs
-@@ -174,7 +174,13 @@ pub trait ArchCodegen {
-     /// internal buffer). Returns false if the instruction should use the default
-     /// accumulator-based codegen path.
-     /// Default: always false (no MachInst support).
--    fn try_lower_machinst(&mut self, _inst: &Instruction) -> bool {
-+    /// Try to lower an IR instruction into the MachInst buffer.
-+    /// `folded_global_addrs` lists GlobalAddr values whose address computation
-+    /// is folded into direct symbol(%rip) load/store operands by the default
-+    /// path (their GlobalAddr instruction is skipped). MachInst cannot
-+    /// represent those as a register base, so such loads/stores must stay on
-+    /// the default path.
-+    fn try_lower_machinst(&mut self, _inst: &Instruction, _folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>) -> bool {
-         false
-     }
- 
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index ed892b65..65b5df09 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -351,6 +351,13 @@ pub struct X86Codegen {
-     /// MachInst buffer for virtual register ISel. Instructions are accumulated
-     /// here by try_lower_machinst and flushed (allocated + emitted) by flush_machinst.
-     pub(super) machinst_buf: Vec<super::machinst::MachInst>,
-+    /// Shadow of the IR instructions currently in `machinst_buf`, in the same
-+    /// order. Used by the fallback path: if the MachInst buffer cannot be fully
-+    /// resolved (a value on the stack in a register-only position), the
-+    /// buffered IR instructions are re-emitted through the default codegen
-+    /// path instead of being silently deleted (which miscompiled gzip:
-+    /// missing loads/ALU -> segfault).
-+    pub(super) machinst_buf_ir: Vec<crate::ir::reexports::Instruction>,
-     /// Whether MachInst ISel is enabled (CCC_USE_MACHINST env var).
-     pub(super) machinst_enabled: bool,
- }
-@@ -401,6 +408,7 @@ impl X86Codegen {
-             caller_save_spill_slots: FxHashMap::default(),
-             caller_save_intervals: FxHashMap::default(),
-             machinst_buf: Vec::new(),
-+            machinst_buf_ir: Vec::new(),
-             machinst_enabled: std::env::var("CCC_USE_MACHINST").is_ok(),
-         }
-     }
-@@ -2569,7 +2577,7 @@ fn collect_vregs_in_inst(
-             def_reg(dst, all, defs);
-         }
-         MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
--            use_reg(src, all);
-+            use_op(src, all);
-             def_reg(dst, all, defs);
-         }
-         MachInst::Cmov { src, dst, .. } => {
-@@ -2730,6 +2738,47 @@ fn resolve_stack_vregs(
-                 size: *size,
-             }
-         }
-+        MachInst::Movzx { src, dst, from_size, to_size } => {
-+            // movzx/movsx accept a memory source: a slot-backed (spilled) src
-+            // vreg can be resolved to StackSlot directly. The emitter formats
-+            // the src through fmt_operand, so `movzbl slot, %eax` is emitted.
-+            // A slot-backed dst stays a vreg and is caught by
-+            // has_unresolvable_vreg -> default-path fallback.
-+            let src_resolved = match src {
-+                MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
-+                    if let Some(slot) = state.get_slot(*id) {
-+                        MachOperand::StackSlot(slot.0)
-+                    } else {
-+                        src.clone()
-+                    }
-+                }
-+                _ => src.clone(),
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index 98980e17..44331488 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -174,16 +174,38 @@ fn run_gvn_licm_ivsr_shared(
+         // Run IVSR with shared analysis.
+         // LICM hoists instructions to preheaders but does not add/remove blocks,
+         // so CFG analysis is still valid.
+-        // IVSR and Un-IVSR disabled: IVSR creates pointer IVs that replace
+-        // index-based GEP addressing with pointer arithmetic. However, when
+-        // the original GEP also uses indexed offsets (e.g., in nested loops
+-        // where the outer loop's row base and the inner loop's column offset
+-        // interact), the pointer increment compounds with the existing offset,
+-        // doubling effective addresses. This causes correctness bugs in matmul
+-        // and other multi-dimensional array patterns.
+-        // TODO: Fix IVSR to correctly handle GEPs in nested loop contexts
+-        // where the base pointer is itself a loop-variant value.
+-        let _ = run_ivsr; // suppress unused warning
++        // W4 re-enablement (2026-08-10): reduce_loop gates every candidate GEP
++        // on is_loop_invariant(base) — loop-VARIANT bases (the historical
++        // matmul address-doubling bug) are skipped, so the pointer recurrence
++        // can never compound with a moving base. Full battery verified with
++        // the pass forced ON. Opt-in (CCC_IVSR=1) because gzip measures
++        // slightly negative: -6 +1.25% (faster 2/9), -9 +0.17% (faster 3/9) —
++        // gzip's hot loops are hash-chained (non-affine) and extra loop-carried
++        // pointer IVs add pressure where registers are already oversubscribed.
++        // Next: per-loop profitability predicate, then re-measure for default.
++        if run_ivsr {
++            let t0 = if time_passes {
++                Some(std::time::Instant::now())
++            } else {
++                None
 +            };
-+            MachInst::Movzx {
-+                src: src_resolved,
-+                dst: *dst,
-+                from_size: *from_size,
-+                to_size: *to_size,
-+            }
-+        }
-+        MachInst::Movsx { src, dst, from_size, to_size } => {
-+            let src_resolved = match src {
-+                MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
-+                    if let Some(slot) = state.get_slot(*id) {
-+                        MachOperand::StackSlot(slot.0)
-+                    } else {
-+                        src.clone()
-+                    }
-+                }
-+                _ => src.clone(),
-+            };
-+            MachInst::Movsx {
-+                src: src_resolved,
-+                dst: *dst,
-+                from_size: *from_size,
-+                to_size: *to_size,
-+            }
-+        }
-         MachInst::Cmp { lhs, rhs, size } => MachInst::Cmp {
-             lhs: resolve_op(lhs),
-             rhs: resolve_op(rhs),
-@@ -2788,6 +2837,10 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, ra: &FxHashMap<u32, P
-             MachOperand::Reg(r) => check_reg(r),
-             MachOperand::Mem { base, .. } => check_reg(base),
-             MachOperand::MemIndex { base, index, .. } => check_reg(base) || check_reg(index),
-+            // AllocaAddr is resolved to a Raw leaq only when a slot exists;
-+            // without one the emitter prints an error comment and the address
-+            // computation silently vanishes. Fall back instead.
-+            MachOperand::AllocaAddr(_) => true,
-             _ => false,
-         }
-     };
-@@ -2808,7 +2861,7 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, ra: &FxHashMap<u32, P
-         }
-         MachInst::SetCC { dst, .. } => check_reg(dst),
-         MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
--            check_reg(src) || check_reg(dst)
-+            check_op(src) || check_reg(dst)
-         }
-         MachInst::Cmov { src, dst, .. } => check_op(src) || check_reg(dst),
-         MachInst::CallIndirect { reg, .. } => check_reg(reg),
-@@ -2816,6 +2869,33 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, ra: &FxHashMap<u32, P
-     }
- }
- 
-+/// A value is MachInst-unsafe when it lives outside the GPR domain:
-+/// floats/XMM, vectors, i128/wide, or long double. MachInst's
-+/// lower_copy/lower_cast assume 64-bit GPR moves; touching such values
-+/// there miscompiles (float bit-copies read stale slots, i128 copies drop
-+/// the high half, vector slots get GPR-clobbered).
-+fn is_mi_unsafe_value(
-+    v: u32,
-+    reg_assignments: &FxHashMap<u32, PhysReg>,
-+    state: &CodegenState,
-+    value_types: &FxHashMap<u32, crate::common::types::IrType>,
-+) -> bool {
-+    if state.is_i128_value(v) || state.vector_values.contains(&v) {
-+        return true;
-+    }
-+    if let Some(r) = reg_assignments.get(&v) {
-+        if r.0 >= 20 {
-+            return true; // XMM-assigned
-+        }
-+    }
-+    if let Some(ty) = value_types.get(&v) {
-+        if ty.is_float() || ty.is_long_double() || ty.is_128bit() {
-+            return true;
-+        }
-+    }
-+    false
-+}
-+
- impl ArchCodegen for X86Codegen {
-     fn is_value_reg_assigned(&self, vid: u32) -> bool {
-         self.reg_assignments.contains_key(&vid)
-@@ -2843,10 +2923,21 @@ impl ArchCodegen for X86Codegen {
-         true
-     }
- 
--    fn try_lower_machinst(&mut self, inst: &crate::ir::reexports::Instruction) -> bool {
-+    fn try_lower_machinst(
-+        &mut self,
-+        inst: &crate::ir::reexports::Instruction,
-+        folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
-+    ) -> bool {
-         if !self.machinst_enabled {
-             return false;
-         }
-+        // Debug knob: CCC_MI_SKIP_FUNC=name1,name2 disables the MachInst path
-+        // for whole functions (diagnostic bisection aid).
-+        if let Some(skip) = std::env::var("CCC_MI_SKIP_FUNC").ok() {
-+            if skip.split(',').any(|n| n == self.state.current_func_name.as_str()) {
-+                return false;
-+            }
-+        }
- 
-         // Reject instructions involving values we can't handle.
-         // Allocas are allowed for Load/Store ptr (ISel handles via StackSlot).
-@@ -2866,6 +2957,10 @@ impl ArchCodegen for X86Codegen {
-                     reject = true;
-                     return;
-                 }
-+                if is_mi_unsafe_value(v.0, ra, state, &self.value_types) {
-+                    reject = true;
-+                    return;
-+                }
-                 if let Some(r) = ra.get(&v.0) {
-                     if r.0 >= 20 {
-                         reject = true;
-@@ -2882,9 +2977,27 @@ impl ArchCodegen for X86Codegen {
-         match inst {
-             crate::ir::reexports::Instruction::Load { ptr, .. }
-             | crate::ir::reexports::Instruction::Store { ptr, .. } => {
-+                // A pointer whose address is folded into a direct symbol(%rip)
-+                // operand by the default path has NO materialized address: the
-+                // GlobalAddr instruction was skipped. MachInst would emit a
-+                // memory operand through a register that is never loaded
-+                // (gzip: `movq %r15, (%r13)` with r13 never set -> SEGV).
-+                if folded_global_addrs.contains(&ptr.0) {
-+                    reject = true;
-+                }
-                 if state.folded_gep_values.contains(&ptr.0) {
-                     reject = true;
-                 }
-+                // Over-aligned allocas (e.g. _Alignas(32) SIMD buffers): the
-+                // runtime address is (slot+align-1)&~(align-1), not the raw
-+                // slot. MachInst's lower_load/lower_store use the raw slot
-+                // address and would write to the WRONG location. The default
-+                // path handles OverAligned via emit_alloca_aligned_addr.
-+                if let Some(crate::backend::state::SlotAddr::OverAligned(_, _)) =
-+                    state.resolve_slot_addr(ptr.0)
-+                {
-+                    reject = true;
-+                }
-                 if let Some(r) = ra.get(&ptr.0) {
-                     if r.0 >= 20 {
-                         reject = true;
-@@ -2899,6 +3012,15 @@ impl ArchCodegen for X86Codegen {
-                 }
-             }
-             crate::ir::reexports::Instruction::GetElementPtr { base, .. } => {
-+                // Over-aligned alloca bases need the aligned address; the
-+                // default path computes it, MachInst would use the raw slot.
-+                if state.is_alloca(base.0) {
-+                    if let Some(crate::backend::state::SlotAddr::OverAligned(_, _)) =
-+                        state.resolve_slot_addr(base.0)
-+                    {
-+                        reject = true;
-+                    }
-+                }
-                 // Allow alloca bases (ISel handles via AllocaAddr + leaq)
-                 if !state.is_alloca(base.0) {
-                     if let Some(r) = ra.get(&base.0) {
-@@ -2920,6 +3042,9 @@ impl ArchCodegen for X86Codegen {
-             if state.is_alloca(dest.0) {
-                 reject = true;
-             }
-+            if is_mi_unsafe_value(dest.0, ra, state, &self.value_types) {
-+                reject = true;
-+            }
-             if let Some(r) = ra.get(&dest.0) {
-                 if r.0 >= 20 {
-                     reject = true;
-@@ -2968,12 +3093,16 @@ impl ArchCodegen for X86Codegen {
-             _ => {}
-         }
- 
--        super::isel::lower_instruction_ctx(
-+        let lowered = super::isel::lower_instruction_ctx(
-             inst,
-             &self.reg_assignments,
-             &alloca_slots,
-             &mut self.machinst_buf,
--        )
-+        );
-+        if lowered {
-+            self.machinst_buf_ir.push(inst.clone());
-+        }
-+        lowered
-     }
- 
-     fn flush_machinst(&mut self) {
-@@ -2993,6 +3122,36 @@ impl ArchCodegen for X86Codegen {
-             .iter()
-             .any(|mi| has_unresolvable_vreg(mi, &self.reg_assignments));
-         if has_bad {
-+            if std::env::var("CCC_MI_DEBUG").is_ok() {
-+                eprintln!("[MI-FALLBACK] {} instructions -> default path", self.machinst_buf_ir.len());
-+                for mi in &resolved {
-+                    if has_unresolvable_vreg(mi, &self.reg_assignments) {
-+                        eprintln!("[MI-FALLBACK]   unresolvable: {mi:?}");
-+                    }
-+                }
-+            }
-+            // CORRECTNESS: never delete instructions. Re-emit the buffered IR
-+            // through the default (accumulator) codegen path, which handles
-+            // stack-backed values in every position. The buffer is a
-+            // straight-line sequence (flushed before calls and at block ends),
-+            // the register cache is still valid for the pre-buffer state, and
-+            // GEP folding is a pure optimization — an empty fold map keeps the
-+            // default path semantics-identical.
-+            let ir = std::mem::take(&mut self.machinst_buf_ir);
-+            for inst in ir {
-+                crate::backend::generation::generate_instruction(
-+                    self,
-+                    &inst,
-+                    &crate::common::fx_hash::FxHashMap::default(),
-+                    &crate::common::fx_hash::FxHashMap::default(),
-+                    &crate::common::fx_hash::FxHashSet::default(),
-+                    &crate::common::fx_hash::FxHashSet::default(),
++            let n = iv_strength_reduce::ivsr_with_analysis(func, &cfg);
++            if let Some(t0) = t0 {
++                eprintln!(
++                    "[PASS] iter={} ivsr (func {}): {:.4}s ({} changes)",
++                    iter,
++                    func.name,
++                    t0.elapsed().as_secs_f64(),
++                    n
 +                );
-+                // Mirror the main loop's program-point accounting so any
-+                // call-spanning save/restore decisions after the fallback
-+                // stay aligned with the IR positions they were computed for.
-+                self.state.current_program_point += 1;
 +            }
-             self.machinst_buf.clear();
-             return;
-         }
-@@ -3000,6 +3159,7 @@ impl ArchCodegen for X86Codegen {
-         super::machinst_emit::emit_machinsts(&resolved, &mut self.state.out);
- 
-         self.machinst_buf.clear();
-+        self.machinst_buf_ir.clear();
-         self.state.reg_cache.invalidate_all();
-         self.flush_pending_vec_store_impl();
-         self.state.invalidate_vec_peephole();
-diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
-index 17fb1537..da7c04cd 100644
---- a/src/backend/x86/codegen/isel.rs
-+++ b/src/backend/x86/codegen/isel.rs
-@@ -341,7 +341,7 @@ pub fn lower_cmp(
-     let rhs_op = lower_operand_with_regs(rhs, ra);
-     out.push(MachInst::Cmp { lhs: lhs_op, rhs: rhs_op, size });
-     out.push(MachInst::SetCC { cc, dst });
--    out.push(MachInst::Movzx { src: dst, dst, from_size: OpSize::S8, to_size: OpSize::S32 });
-+    out.push(MachInst::Movzx { src: MachOperand::Reg(dst), dst, from_size: OpSize::S8, to_size: OpSize::S32 });
- }
- 
- /// Lower a fused Cmp + CondBranch (no boolean materialization).
-@@ -392,9 +392,9 @@ pub fn lower_cast(
-     };
- 
-     if to_ty.is_unsigned() || from_ty.is_unsigned() {
--        out.push(MachInst::Movzx { src: src_reg, dst, from_size, to_size });
-+        out.push(MachInst::Movzx { src: MachOperand::Reg(src_reg), dst, from_size, to_size });
-     } else {
--        out.push(MachInst::Movsx { src: src_reg, dst, from_size, to_size });
-+        out.push(MachInst::Movsx { src: MachOperand::Reg(src_reg), dst, from_size, to_size });
-     }
- }
- 
-diff --git a/src/backend/x86/codegen/machinst.rs b/src/backend/x86/codegen/machinst.rs
-index 7194bdc7..842cb95d 100644
---- a/src/backend/x86/codegen/machinst.rs
-+++ b/src/backend/x86/codegen/machinst.rs
-@@ -102,10 +102,10 @@ pub enum MachInst {
-     Mov { src: MachOperand, dst: MachOperand, size: OpSize },
- 
-     /// movzx src, dst (zero-extend: movzbl, movzwl, movzbq, movzwq)
--    Movzx { src: MachReg, dst: MachReg, from_size: OpSize, to_size: OpSize },
-+    Movzx { src: MachOperand, dst: MachReg, from_size: OpSize, to_size: OpSize },
- 
-     /// movsx src, dst (sign-extend: movsbq, movswq, movslq)
--    Movsx { src: MachReg, dst: MachReg, from_size: OpSize, to_size: OpSize },
-+    Movsx { src: MachOperand, dst: MachReg, from_size: OpSize, to_size: OpSize },
- 
-     // ── Arithmetic ───────────────────────────────────────────────────
-     /// Two-address ALU: dst = dst OP src.
-diff --git a/src/backend/x86/codegen/machinst_emit.rs b/src/backend/x86/codegen/machinst_emit.rs
-index 743ddcaf..5e425e44 100644
---- a/src/backend/x86/codegen/machinst_emit.rs
-+++ b/src/backend/x86/codegen/machinst_emit.rs
-@@ -129,6 +129,26 @@ fn fmt_operand(op: &MachOperand, size: OpSize, out: &AsmOutput) -> String {
-     }
- }
- 
-+
-+/// If `op` is an immediate outside the signed-32-bit range, materialize it
-+/// into %rax with movabsq and return a register operand (plus the emitted
-+/// movabsq line). x86 `cmp/test` (like all ALU ops) only support imm32
-+/// sign-extended operands; using the raw 64-bit immediate would truncate it
-+/// and miscompare (regression: simd_movnt's `lo == 0x1122334455667788ULL`
-+/// check compiled to `cmp $0x55667788`).
-+fn materialize_large_imm(
-+    op: &MachOperand,
-+    out: &mut AsmOutput,
-+) -> MachOperand {
-+    match op {
-+        MachOperand::Imm(v) if *v < i32::MIN as i64 || *v > i32::MAX as i64 => {
-+            out.emit_fmt(format_args!("    movabsq ${}, %rax", v));
-+            MachOperand::Reg(MachReg::Phys(super::machinst::RAX))
++            if n > 0 {
++                ivsr_total += n;
++                if i < changed.len() {
++                    changed[i] = true;
++                }
++            }
 +        }
-+        _ => op.clone(),
-+    }
-+}
-+
- /// ALU operation mnemonic.
- fn alu_mnemonic(op: AluOp) -> &'static str {
-     match op {
-@@ -318,43 +338,52 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
+     }
  
-         MachInst::Cmp { lhs, rhs, size } => {
-             let suffix = size.suffix();
-+            let mut lhs = lhs.clone();
-+            let mut rhs = rhs.clone();
-+            // 64-bit immediates don't fit in the imm32 of cmp; materialize.
-+            lhs = materialize_large_imm(&lhs, out);
-+            rhs = materialize_large_imm(&rhs, out);
-             // x86 cmp can't have two memory operands — load rhs to rax
--            let both_mem = matches!((lhs, rhs),
-+            let both_mem = matches!((&lhs, &rhs),
-                 (MachOperand::StackSlot(_), MachOperand::StackSlot(_)) |
-                 (MachOperand::Mem { .. }, MachOperand::Mem { .. }) |
-                 (MachOperand::StackSlot(_), MachOperand::Mem { .. }) |
-                 (MachOperand::Mem { .. }, MachOperand::StackSlot(_)));
-             if both_mem {
--                let rhs_str = fmt_operand(rhs, *size, out);
-+                let rhs_str = fmt_operand(&rhs, *size, out);
-                 let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
-                 out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, rhs_str, rax));
--                let lhs_str = fmt_operand(lhs, *size, out);
-+                let lhs_str = fmt_operand(&lhs, *size, out);
-                 // AT&T: cmp rhs, lhs
-                 out.emit_fmt(format_args!("    cmp{} %{}, {}", suffix, rax, lhs_str));
-             } else {
--                let rhs_str = fmt_operand(rhs, *size, out);
--                let lhs_str = fmt_operand(lhs, *size, out);
-+                let rhs_str = fmt_operand(&rhs, *size, out);
-+                let lhs_str = fmt_operand(&lhs, *size, out);
-                 out.emit_fmt(format_args!("    cmp{} {}, {}", suffix, rhs_str, lhs_str));
-             }
-         }
+     if time_passes {
+@@ -642,7 +664,9 @@ macro_rules! preloop_dump {
+             let gvn_enabled = true;
+             let run_gvn = gvn_enabled && !dis.gvn && should_run!(5, 0, 1, 3);
+             let run_licm = !dis.licm && should_run!(6, 0, 1, 5);
+-            let run_ivsr = iter == 0 && !disabled.contains("ivsr");
++            let run_ivsr = iter == 0
++                && std::env::var("CCC_IVSR").is_ok()
++                && !disabled.contains("ivsr");
  
-         MachInst::Test { lhs, rhs, size } => {
-             let suffix = size.suffix();
-+            let mut lhs = lhs.clone();
-+            let mut rhs = rhs.clone();
-+            lhs = materialize_large_imm(&lhs, out);
-+            rhs = materialize_large_imm(&rhs, out);
-             // x86 test can't have two memory operands — load one to rax
--            let both_mem = matches!((lhs, rhs),
-+            let both_mem = matches!((&lhs, &rhs),
-                 (MachOperand::StackSlot(_), MachOperand::StackSlot(_)) |
-                 (MachOperand::Mem { .. }, MachOperand::Mem { .. }) |
-                 (MachOperand::StackSlot(_), MachOperand::Mem { .. }) |
-                 (MachOperand::Mem { .. }, MachOperand::StackSlot(_)));
-             if both_mem {
--                let rhs_str = fmt_operand(rhs, *size, out);
-+                let rhs_str = fmt_operand(&rhs, *size, out);
-                 let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
-                 out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, rhs_str, rax));
--                let lhs_str = fmt_operand(lhs, *size, out);
-+                let lhs_str = fmt_operand(&lhs, *size, out);
-                 out.emit_fmt(format_args!("    test{} %{}, {}", suffix, rax, lhs_str));
-             } else {
--                let rhs_str = fmt_operand(rhs, *size, out);
--                let lhs_str = fmt_operand(lhs, *size, out);
-+                let rhs_str = fmt_operand(&rhs, *size, out);
-+                let lhs_str = fmt_operand(&lhs, *size, out);
-                 out.emit_fmt(format_args!("    test{} {}, {}", suffix, rhs_str, lhs_str));
-             }
-         }
-@@ -366,20 +395,25 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
-         }
- 
-         MachInst::Movzx { src, dst, from_size, to_size } => {
--            let src_str = fmt_reg(src, *from_size);
--            // movzbl/movzwl always use 32-bit dest (implicit zero-extend to 64-bit)
--            let actual_dst_size = if *to_size == OpSize::S64 { OpSize::S32 } else { *to_size };
--            let dst_str = fmt_reg(dst, actual_dst_size);
-+            let src_str = fmt_operand(src, *from_size, out);
-+            // movzbl/movzwl always use 32-bit dest (implicit zero-extend to 64-bit).
-+            // A 32->64 zero-extension is a plain movl: writing a 32-bit
-+            // register zero-extends to the full 64-bit register on x86-64.
-+            // (The previous `_ => movzbl` fallback TRUNCATED 32-bit values to
-+            // 8 bits — miscompiling every U32->U64 zero-extending cast, e.g.
-+            // gzip's send_bits bit packing: wrong values -> corrupt output.)
-             let mnem = match (from_size, to_size) {
-                 (OpSize::S8, _) => "movzbl",
-                 (OpSize::S16, _) => "movzwl",
--                _ => "movzbl",
-+                _ => "movl",
-             };
-+            let actual_dst_size = if *to_size == OpSize::S64 { OpSize::S32 } else { *to_size };
-+            let dst_str = fmt_reg(dst, actual_dst_size);
-             out.emit_fmt(format_args!("    {} {}, {}", mnem, src_str, dst_str));
-         }
- 
-         MachInst::Movsx { src, dst, from_size, to_size } => {
--            let src_str = fmt_reg(src, *from_size);
-+            let src_str = fmt_operand(src, *from_size, out);
-             let dst_str = fmt_reg(dst, *to_size);
-             let mnem = match (from_size, to_size) {
-                 (OpSize::S8, OpSize::S32) => "movsbl",
-diff --git a/src/backend/x86/codegen/machinst_regalloc.rs b/src/backend/x86/codegen/machinst_regalloc.rs
-index c54b3795..dd7c9253 100644
---- a/src/backend/x86/codegen/machinst_regalloc.rs
-+++ b/src/backend/x86/codegen/machinst_regalloc.rs
-@@ -96,7 +96,7 @@ fn collect_vreg_refs(
-             def_reg(dst, point, defs, uses);
-         }
-         MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
--            use_reg(src, point, uses);
-+            use_operand(src, point, uses);
-             def_reg(dst, point, defs, uses);
-         }
-         MachInst::Cmov { src, dst, .. } => {
-@@ -239,7 +239,7 @@ fn visit_regs_shared(inst: &MachInst, f: &mut impl FnMut(&MachReg)) {
-         }
-         MachInst::SetCC { dst, .. } => { f(dst); }
-         MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
--            f(src); f(dst);
-+            visit_op(src, f); f(dst);
-         }
-         MachInst::Cmov { src, dst, .. } => { visit_op(src, f); f(dst); }
-         MachInst::CallIndirect { reg, .. } => { f(reg); }
-@@ -571,7 +571,7 @@ pub fn rewrite_machinsts(insts: &[MachInst], result: &MachAllocResult) -> Vec<Ma
-             }
-             MachInst::Movzx { src, dst, from_size, to_size } => {
-                 out.push(MachInst::Movzx {
--                    src: rewrite_reg(src, result),
-+                    src: rewrite_operand(src, result),
-                     dst: rewrite_reg(dst, result),
-                     from_size: *from_size,
-                     to_size: *to_size,
-@@ -579,7 +579,7 @@ pub fn rewrite_machinsts(insts: &[MachInst], result: &MachAllocResult) -> Vec<Ma
-             }
-             MachInst::Movsx { src, dst, from_size, to_size } => {
-                 out.push(MachInst::Movsx {
--                    src: rewrite_reg(src, result),
-+                    src: rewrite_operand(src, result),
-                     dst: rewrite_reg(dst, result),
-                     from_size: *from_size,
-                     to_size: *to_size,
+             if run_gvn || run_licm || run_ivsr {
+                 let (gvn_n, licm_n, ivsr_n) = run_gvn_licm_ivsr_shared(
