@@ -101,6 +101,196 @@ index 00000000..967c105c
 +            i686) target/release/lccc-i686 -c /tmp/hello.c -o /tmp/hello.o ;;
 +          esac
 +          test -s /tmp/hello.o
+diff --git a/.gitignore b/.gitignore
+index 2f7896d1..c5c377c1 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,43 @@
+-target/
++# Rust build artifacts
++/target/
++**/*.rs.bk
++
++# CCC submodule build
++/ccc/target/
++
++# Jekyll build output
++/_site/
++/.jekyll-cache/
++/.sass-cache/
++Gemfile.lock
++
++# IDE
++.vscode/
++.idea/
++*.swp
++*.swo
++*~
++.DS_Store
++Thumbs.db
++
++# Compiled / binary
++*.o
++*.a
++*.so
++*.dylib
++*.exe
++a.out
++test_*
++bench_*
++
++# Benchmark / test output
++/test-results/
++/tmp-results/
++/tmp/
++*.log
++*.png
++*.pdf
++
++# Misc
++.tmp
++.env
+diff --git a/src/backend/linker_common/dynamic.rs b/src/backend/linker_common/dynamic.rs
+index 443bf020..9db20848 100644
+--- a/src/backend/linker_common/dynamic.rs
++++ b/src/backend/linker_common/dynamic.rs
+@@ -38,19 +38,62 @@ pub fn match_shared_library_dynsyms<G: GlobalSymbolOps>(
+     let mut lib_needed = false;
+     let mut matched_weak_objects: Vec<(u64, u64)> = Vec::new();
+ 
++    // Versioned undefined references ("name@VER" — produced by `.symver
++    // real, name@VER` directives, e.g. glibc's compat_symbol_reference) must
++    // match the library's BARE dynsym name when the library exports that
++    // symbol with a matching version. GNU ld binds such references to the
++    // requested version; without this, "printf@GLIBC_2.2.5" stays undefined
++    // even though libc.so.6 exports "printf" (as `printf@@GLIBC_2.2.5`).
++    // "name@@VER" is a definition form, never an undefined ref, so only
++    // single-'@' names are considered here.
++    let versioned_refs: Vec<(String, String, String)> = globals
++        .iter()
++        .filter(|(name, s)| !s.is_defined() && !s.is_dynamic() && name.contains('@'))
++        .filter_map(|(name, _)| {
++            let at = name.find('@')?;
++            if name[at + 1..].contains('@') {
++                return None; // "@@": definition form, not a reference
++            }
++            let base = &name[..at];
++            let ver = &name[at + 1..];
++            if base.is_empty() || ver.is_empty() {
++                return None;
++            }
++            Some((base.to_string(), ver.to_string(), name.clone()))
++        })
++        .collect();
++
+     // First pass: match undefined symbols against library exports
+     for dsym in dyn_syms {
+         if let Some(existing) = globals.get(&dsym.name) {
+             if !existing.is_defined() && !existing.is_dynamic() {
+-                lib_needed = true;
+-                globals.insert(dsym.name.clone(), G::new_dynamic(dsym, soname));
+-                // Track WEAK STT_OBJECT for alias detection
+-                let bind = dsym.info >> 4;
+-                let stype = dsym.info & 0xf;
+-                if bind == STB_WEAK && stype == STT_OBJECT
+-                    && !matched_weak_objects.contains(&(dsym.value, dsym.size))
+-                {
+-                    matched_weak_objects.push((dsym.value, dsym.size));
++                // An UNVERSIONED reference may only bind to the symbol's
++                // default version (@@), matching GNU ld. Non-default exports
++                // (memcpy@GLIBC_2.2.5) are reachable only via versioned refs.
++                if dsym.is_default_ver {
++                    lib_needed = true;
++                    globals.insert(dsym.name.clone(), G::new_dynamic(dsym, soname));
++                    // Track WEAK STT_OBJECT for alias detection
++                    let bind = dsym.info >> 4;
++                    let stype = dsym.info & 0xf;
++                    if bind == STB_WEAK && stype == STT_OBJECT
++                        && !matched_weak_objects.contains(&(dsym.value, dsym.size))
++                    {
++                        matched_weak_objects.push((dsym.value, dsym.size));
++                    }
++                }
++            }
++        }
++        // Versioned reference matching: "base@VER" binds to the export
++        // (base) when the export carries exactly the requested version —
++        // including non-default versions (memcpy@GLIBC_2.2.5).
++        for (base, ver, full) in &versioned_refs {
++            if *base == dsym.name && dsym.version.as_deref() == Some(ver.as_str()) {
++                if let Some(existing) = globals.get(full) {
++                    if !existing.is_defined() && !existing.is_dynamic() {
++                        lib_needed = true;
++                        globals.insert(full.clone(), G::new_dynamic(dsym, soname));
++                    }
+                 }
+             }
+         }
+diff --git a/src/backend/linker_common/parse_shared.rs b/src/backend/linker_common/parse_shared.rs
+index d14db0cf..aff42c08 100644
+--- a/src/backend/linker_common/parse_shared.rs
++++ b/src/backend/linker_common/parse_shared.rs
+@@ -133,22 +133,12 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
+ 
+                     if shndx == SHN_UNDEF { continue; }
+ 
+-                    // Check .gnu.version: if the hidden bit (0x8000) is set and
+-                    // the version index is >= 2, this is a non-default version
+-                    // (symbol@VERSION, not symbol@@VERSION). Such symbols should
+-                    // not be available for linking, matching GNU ld behavior.
+-                    if let Some((vs_off, vs_size)) = versym_shdr {
+-                        if vs_size >= sym_count * 2 && vs_off + vs_size <= data.len() {
+-                            let ver_entry = vs_off + j * 2;
+-                            let raw_ver = read_u16(data, ver_entry);
+-                            let hidden = raw_ver & 0x8000 != 0;
+-                            let ver_idx = raw_ver & 0x7fff;
+-                            if hidden && ver_idx >= 2 {
+-                                continue;
+-                            }
+-                        }
+-                    }
+-
++                    // Versioned exports include non-default (hidden) versions
++                    // such as memcpy@GLIBC_2.2.5 alongside memcpy@@GLIBC_2.14.
++                    // They are KEPT here (marked via is_default_ver); binding
++                    // policy lives in the linker: unversioned references may
++                    // only bind to the default version, while versioned
++                    // references (name@VER) bind to the exact version.
+                     let name = read_cstr(strtab, name_idx);
+                     if name.is_empty() { continue; }
+ 
+@@ -298,23 +288,25 @@ fn parse_shared_library_symbols_from_phdrs(data: &[u8], lib_name: &str) -> Resul
+ 
+         if shndx == SHN_UNDEF { continue; }
+ 
+-        // Check versym: skip non-default (hidden) versioned symbols
++        // Versym: keep non-default (hidden) exports but mark them so the
++        // linker only binds them to explicitly versioned references. The
++        // phdr fallback has no verdef section, so the exact version name is
++        // unknown (version: None) — such symbols stay unbindable, which is the
++        // conservative choice for a stripped library.
++        let mut is_default_ver = true;
+         if versym_addr != 0 {
+             let ver_entry = versym_file_offset + j * 2;
+             if ver_entry + 2 <= data.len() {
+                 let raw_ver = read_u16(data, ver_entry);
+                 let hidden = raw_ver & 0x8000 != 0;
+-                let ver_idx = raw_ver & 0x7fff;
+-                if hidden && ver_idx >= 2 {
+-                    continue;
+-                }
++                is_default_ver = !hidden;
+             }
+         }
+ 
+         let name = read_cstr(strtab, name_idx);
+         if name.is_empty() { continue; }
+ 
+-        symbols.push(DynSymbol { name, info, value, size, version: None, is_default_ver: true });
++        symbols.push(DynSymbol { name, info, value, size, version: None, is_default_ver });
+     }
+ 
+     Ok(symbols)
 diff --git a/src/backend/x86/codegen/peephole/passes/helpers.rs b/src/backend/x86/codegen/peephole/passes/helpers.rs
 index c47776ce..ba165539 100644
 --- a/src/backend/x86/codegen/peephole/passes/helpers.rs
@@ -264,6 +454,196 @@ index 298648dc..7dba6219 100644
 +";
 +        let (changed, _) = run(asm);
 +        assert!(!changed, "shld reads %cl implicitly; fuse must be refused");
++    }
++}
+diff --git a/src/backend/x86/linker/emit_exec.rs b/src/backend/x86/linker/emit_exec.rs
+index c4e26ab2..b2976bba 100644
+--- a/src/backend/x86/linker/emit_exec.rs
++++ b/src/backend/x86/linker/emit_exec.rs
+@@ -10,6 +10,20 @@ use super::elf::*;
+ use super::types::{GlobalSymbol, BASE_ADDR, PAGE_SIZE, INTERP};
+ use crate::backend::linker_common::{self, DynStrTab, OutputSection};
+ 
++/// The dynsym NAME for a dynamic symbol reference. Versioned references are
++/// keyed in the global table by their full object-file name ("memcpy@GLIBC_2.2.5"),
++/// but the emitted .dynstr name must be the BARE symbol name: the dynamic
++/// linker hashes the raw dynstr name against the library's .gnu.hash, and
++/// libc's hash contains "memcpy", not "memcpy@GLIBC_2.2.5". The requested
++/// version is conveyed by the .gnu.version (versym) index into .gnu.version_r
++/// (verneed), exactly as GNU ld represents versioned references.
++fn dynsym_emit_name(name: &str) -> &str {
++    match name.find('@') {
++        Some(at) => &name[..at],
++        None => name,
++    }
++}
++
+ pub(super) fn emit_executable(
+     objects: &[ElfObject], globals: &mut HashMap<String, GlobalSymbol>,
+     output_sections: &mut [OutputSection],
+@@ -79,7 +93,7 @@ pub(super) fn emit_executable(
+         }
+     }
+ 
+-    for name in &dyn_sym_names { dynstr.add(name); }
++    for name in &dyn_sym_names { dynstr.add(dynsym_emit_name(name)); }
+ 
+     // ── Build .gnu.version (versym) and .gnu.version_r (verneed) data ──
+     //
+@@ -179,7 +193,7 @@ pub(super) fn emit_executable(
+     // Compute hashes for hashed symbols
+     let hashed_sym_hashes: Vec<u32> = dyn_sym_names[gnu_hash_symoffset - 1..]
+         .iter()
+-        .map(|name| linker_common::gnu_hash(name.as_bytes()))
++        .map(|name| linker_common::gnu_hash(dynsym_emit_name(name).as_bytes()))
+         .collect();
+ 
+     // Build bloom filter (single 64-bit word)
+@@ -848,7 +862,7 @@ pub(super) fn emit_executable(
+         // .dynsym
+         let mut ds = dynsym_offset as usize + 24; // skip null entry
+         for name in &dyn_sym_names {
+-            let no = dynstr.get_offset(name) as u32;
++            let no = dynstr.get_offset(dynsym_emit_name(name)) as u32;
+             w32(&mut out, ds, no);
+             if let Some(gsym) = globals.get(name) {
+                 if gsym.copy_reloc {
+diff --git a/src/driver/cli.rs b/src/driver/cli.rs
+index b7d443d9..ca649ccc 100644
+--- a/src/driver/cli.rs
++++ b/src/driver/cli.rs
+@@ -14,6 +14,28 @@ use super::pipeline::{Driver, CompileMode, CliDefine};
+ use crate::backend::Target;
+ use crate::common::error::ColorMode;
+ 
++/// Compare dotted version strings numerically ("16.1.1" > "9.5.0").
++///
++/// A lexical sort orders "9.5.0" AFTER "16.1.1"/"12", so
++/// `-print-libgcc-file-name` would probe the OLDEST GCC directory first
++/// instead of the newest. Version directories are dotted decimal, so a
++/// component-wise numeric comparison is the correct order.
++fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
++    let mut ai = a.split('.');
++    let mut bi = b.split('.');
++    loop {
++        match (ai.next(), bi.next()) {
++            (None, None) => return std::cmp::Ordering::Equal,
++            (None, Some(_)) => return std::cmp::Ordering::Less,
++            (Some(_), None) => return std::cmp::Ordering::Greater,
++            (Some(x), Some(y)) => match x.parse::<u64>().unwrap_or(0).cmp(&y.parse::<u64>().unwrap_or(0)) {
++                std::cmp::Ordering::Equal => continue,
++                ord => return ord,
++            },
++        }
++    }
++}
++
+ impl Driver {
+     fn enable_x86_avx_profile(&mut self) {
+         self.no_sse=false; self.enable_avx=true; self.enable_sse4_2=true;
+@@ -67,8 +89,7 @@ impl Driver {
+     /// Parse GCC-compatible command-line arguments and populate driver fields.
+     /// Returns `Ok(true)` if early exit was handled (query flags like -dumpmachine),
+     /// `Ok(false)` if normal compilation should proceed, or `Err` for invalid args.
+-    pub fn parse_cli_args(&mut self, args: &[String]) -> Result<bool, String> {
+-        // Detect target from binary name (argv[0])
++    pub fn parse_cli_args(&mut self, args: &[String]) -> Result<bool, String> {        // Detect target from binary name (argv[0])
+         let binary_name = std::path::Path::new(&args[0])
+             .file_name()
+             .and_then(|n| n.to_str())
+@@ -170,8 +191,8 @@ impl Driver {
+                                     .map(|e| e.file_name().to_string_lossy().to_string())
+                                     .filter(|n| n.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+                                     .collect();
+-                                vers.sort();
+-                                vers.reverse();
++                                // Numeric version order: newest GCC dir first.
++                                vers.sort_by(|a, b| cmp_version(b, a));
+                                 for v in vers {
+                                     search_dirs.push(format!("{}{}/", triple_dir, v));
+                                 }
+@@ -199,8 +220,8 @@ impl Driver {
+                                 .filter_map(|e| e.file_name().into_string().ok())
+                                 .filter(|n| n.chars().all(|c| c.is_ascii_digit() || c == '.'))
+                                 .collect();
+-                            vers.sort();
+-                            for v in vers.iter().rev() {
++                            vers.sort_by(|a, b| cmp_version(b, a));
++                            for v in vers.iter() {
+                                 let a = format!("{}/{}/libgcc.a", dir, v);
+                                 let s = format!("{}/{}/libgcc_s.so", dir, v);
+                                 if std::path::Path::new(&a).exists()
+@@ -524,6 +545,14 @@ impl Driver {
+                         self.linker_ordered_items.push(format!("-Wl,-e,{}", args[i]));
+                     }
+                 }
++                // Export-dynamic family. MUST be matched before the greedy
++                // `-e*` entry-point matcher below: `-export-dynamic` would
++                // otherwise be swallowed as `-Wl,-e,xport-dynamic`, silently
++                // dropping the export request and setting a garbage entry
++                // symbol (the binary then exports no dynamic symbols).
++                "-export-dynamic" | "--export-dynamic" => {
++                    self.linker_ordered_items.push("-Wl,--export-dynamic".to_string());
++                }
+                 arg if arg.len() > 2 && arg.starts_with("-e") && !arg.starts_with("-E") => {
+                     self.linker_ordered_items.push(format!("-Wl,-e,{}", &arg[2..]));
+                 }
+@@ -1095,3 +1124,57 @@ impl Driver {
+         self.include_paths.push(path.to_string());
+     }
+ }
++
++#[cfg(test)]
++mod cli_tests {
++    use super::cmp_version;
++    use crate::driver::pipeline::Driver;
++
++    #[test]
++    fn version_compare_is_numeric() {
++        // Lexical sort would order "9.5.0" after "16.1.1"; numeric must not.
++        assert!(cmp_version("16.1.1", "9.5.0") == std::cmp::Ordering::Greater);
++        assert!(cmp_version("12", "9.5.0") == std::cmp::Ordering::Greater);
++        assert!(cmp_version("16.1.1", "16.1.1") == std::cmp::Ordering::Equal);
++        assert!(cmp_version("16.2.0", "16.1.1") == std::cmp::Ordering::Greater);
++        assert!(cmp_version("10.2.0", "11.4.0") == std::cmp::Ordering::Less);
++        assert!(cmp_version("4.9", "4.10") == std::cmp::Ordering::Less);
++        // Newest-first sort used by -print-libgcc-file-name.
++        let mut v = vec!["10.2.0".to_string(), "9.5.0".to_string(), "16.1.1".to_string(), "12".to_string()];
++        v.sort_by(|a, b| cmp_version(b, a));
++        assert_eq!(v, vec!["16.1.1", "12", "10.2.0", "9.5.0"]);
++    }
++
++    #[test]
++    fn export_dynamic_is_not_swallowed_by_entry_matcher() {
++        let mut d = Driver::new();
++        let args: Vec<String> = ["lccc", "-export-dynamic", "x.c"]
++            .iter().map(|s| s.to_string()).collect();
++        d.parse_cli_args(&args).ok();
++        assert!(d.linker_ordered_items.iter().any(|i| i == "-Wl,--export-dynamic"),
++            "linker items: {:?}", d.linker_ordered_items);
++        assert!(!d.linker_ordered_items.iter().any(|i| i.starts_with("-Wl,-e,")),
++            "must not be parsed as an entry-point flag: {:?}", d.linker_ordered_items);
++        // --export-dynamic long form too.
++        let mut d2 = Driver::new();
++        let args2: Vec<String> = ["lccc", "--export-dynamic", "x.c"]
++            .iter().map(|s| s.to_string()).collect();
++        d2.parse_cli_args(&args2).ok();
++        assert!(d2.linker_ordered_items.iter().any(|i| i == "-Wl,--export-dynamic"));
++    }
++
++    #[test]
++    fn entry_flag_still_works() {
++        // -e SYMBOL must keep mapping to -Wl,-e,SYMBOL.
++        let mut d = Driver::new();
++        let args: Vec<String> = ["lccc", "-e", "__libc_main", "x.c"]
++            .iter().map(|s| s.to_string()).collect();
++        d.parse_cli_args(&args).ok();
++        assert!(d.linker_ordered_items.iter().any(|i| i == "-Wl,-e,__libc_main"));
++        // -eSYMBOL compact form.
++        let mut d2 = Driver::new();
++        let args2: Vec<String> = ["lccc", "-emain", "x.c"].iter().map(|s| s.to_string()).collect();
++        d2.parse_cli_args(&args2).ok();
++        assert!(d2.linker_ordered_items.iter().any(|i| i == "-Wl,-e,main"));
 +    }
 +}
 diff --git a/src/ir/mem2reg/promote.rs b/src/ir/mem2reg/promote.rs
@@ -452,6 +832,54 @@ index bb0f954b..ab3983c5 100644
          });
          let n = unroll_loops(&mut func);
          assert_eq!(n, 0, "loop with call should not be unrolled");
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index 8ac6c9b9..98980e17 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -365,6 +365,10 @@ pub(crate) fn run_passes(module: &mut IrModule, opt_level: u32, target: crate::b
+     // correct backend emission of asm operands.
+     if opt_level == 0 {
+         resolve_asm::resolve_inline_asm_symbols(module);
++        // _Float128 math builtins lower to libgcc helper calls (__copysigntf3,
++        // __fabstf2); LCCC links no libgcc, so fold them to the backend's own
++        // inline intrinsics even at -O0 (semantics-preserving rename).
++        simplify::fold_math_intrinsic_calls(module);
+         return;
+     }
+ 
+@@ -378,6 +382,8 @@ pub(crate) fn run_passes(module: &mut IrModule, opt_level: u32, target: crate::b
+         }
+         constant_fold::run(module);
+         copy_prop::run(module);
++        // Same f128-builtin fold as -O0 (see above).
++        simplify::fold_math_intrinsic_calls(module);
+         module.for_each_function(dce::eliminate_dead_code);
+         resolve_asm::resolve_inline_asm_symbols(module);
+         constant_fold::resolve_remaining_is_constant(module);
+@@ -395,11 +401,6 @@ pub(crate) fn run_passes(module: &mut IrModule, opt_level: u32, target: crate::b
+     // memread/memcmp helper emitted standalone). GCC inlines tiny/small callees
+     // even at -Os: run the small-only inliner so helper bodies fold away while
+     // normal/medium callees stay out. -O1/-O2/-O3 keep full inlining.
+-    // -Os/-Oz are size profiles. Full inlining inflates spill-heavy TUs; but
+-    // disabling inlining ENTIRELY makes -Os binaries LARGER than -O3 (every
+-    // memread/memcmp helper emitted standalone). GCC inlines tiny/small callees
+-    // even at -Os: run the small-only inliner so helper bodies fold away while
+-    // normal/medium callees stay out. -O1/-O2/-O3 keep full inlining.
+ 
+ macro_rules! preloop_dump {
+     ($name:expr) => {
+@@ -667,7 +668,10 @@ macro_rules! preloop_dump {
+ 
+         // Phase 7: If-conversion
+         // Upstream: cfg_simplify (simpler CFG), constfold (simplified conditions)
+-        if !dis.ifconv && should_run!(7, 0, 4) {
++        // -Os/-Oz: skip if-conversion. `cmov` is 4-6 bytes vs a 2-byte jcc +
++        // the skipped block, so branches are usually smaller (and often faster
++        // on the short branch path); GCC makes the same trade-off at -Os.
++        if !dis.ifconv && !optimize_for_size && should_run!(7, 0, 4) {
+             let n = timed_pass!(
+                 "if_convert",
+                 run_on_visited(
 diff --git a/src/passes/recursion_to_iter.rs b/src/passes/recursion_to_iter.rs
 index c8192c3d..61d6ac93 100644
 --- a/src/passes/recursion_to_iter.rs
@@ -484,7 +912,7 @@ index c8192c3d..61d6ac93 100644
              ],
              terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
 diff --git a/src/passes/simplify.rs b/src/passes/simplify.rs
-index e9407814..edb26e94 100644
+index e9407814..0f9270ef 100644
 --- a/src/passes/simplify.rs
 +++ b/src/passes/simplify.rs
 @@ -1729,7 +1729,7 @@ mod tests {
@@ -496,6 +924,37 @@ index e9407814..edb26e94 100644
          }
      }
  
+@@ -2981,3 +2981,30 @@ mod tests {
+         assert!(simplify_default(&inst).is_none());
+     }
+ }
++
++/// Fold calls to math functions that map to inline intrinsics (sqrt, fabs,
++/// `__fabstf2`, `__copysigntf3`, `copysignl`, ...) into `Instruction::Intrinsic`.
++///
++/// The full -O2/-O3 pipeline does this inside `try_simplify`; the cheap -O0/-O1
++/// tiers skip `simplify` entirely, so a call to `__copysigntf3` (the lowering
++/// of `__builtin_copysignf128`) would otherwise survive to the backend as an
++/// external reference and fail to link (LCCC links no libgcc). Running the
++/// same folding here makes `_Float128` math builtins work at every opt level.
++/// Semantics-preserving: the fold is a rename to the backend's own intrinsic.
++pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
++    for func in &mut module.functions {
++        for block in &mut func.blocks {
++            for inst in &mut block.instructions {
++                if let Instruction::Call { func: callee, info } = inst {
++                    if let Some(d) = info.dest {
++                        if let Some(new_inst) =
++                            simplify_math_call(d, callee, &info.args, info.return_type)
++                        {
++                            *inst = new_inst;
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
 diff --git a/src/passes/tail_call_elim.rs b/src/passes/tail_call_elim.rs
 index 4b84f179..3f2a6bed 100644
 --- a/src/passes/tail_call_elim.rs
@@ -518,3 +977,51 @@ index 4b84f179..3f2a6bed 100644
                  },
                  // %2 = %1 + 1   (uses call result — NOT a tail call)
                  Instruction::BinOp {
+diff --git a/tests/regression/glibc_symver_ref.c b/tests/regression/glibc_symver_ref.c
+index 43419290..59fb49ea 100644
+--- a/tests/regression/glibc_symver_ref.c
++++ b/tests/regression/glibc_symver_ref.c
+@@ -1,22 +1,31 @@
+ /* glibc_symver_ref.c — versioned .symver REFERENCES (glibc
+- * compat_symbol_reference). A TU that only REFERENCES `matherr`/`_LIB_VERSION`
+- * via `.symver real, name@VER` must emit versioned references; GNU ld 2.47
+- * refuses to bind unversioned refs to foo@VER under --whole-archive (the
+- * libm.so link failure). We verify the object carries the versioned refs by
+- * resolving through the version script at runtime. */
++ * compat_symbol_reference). A TU that references `printf`/`memcpy` via
++ * `.symver real, name@VER` must emit versioned references and the linker must
++ * resolve them against libc.so.6's exported versions (default-version ref for
++ * printf@GLIBC_2.2.5, and a NON-default version ref for memcpy@GLIBC_2.2.5 —
++ * memcpy's default is GLIBC_2.14). Regression: LCCC's linker treated
++ * "name@VER" as an opaque undefined name and reported it unresolved, blocking
++ * glibc builds. The original test used `_LIB_VERSION`/`matherr`, which glibc
++ * 2.36+ no longer exports — unlinkable with ANY compiler on modern hosts. */
+ #include <stdio.h>
++#include <string.h>
+ 
+-extern int _LIB_VERSION;
+-extern int matherr(void *);
++extern int printf(const char *, ...);
++extern void *memcpy(void *, const void *, unsigned long);
+ 
+-__asm__(".symver _LIB_VERSION,_LIB_VERSION@GLIBC_2.2.5");
+-__asm__(".symver matherr,matherr@GLIBC_2.2.5");
++__asm__(".symver printf,printf@GLIBC_2.2.5");
++__asm__(".symver memcpy,memcpy@GLIBC_2.2.5");
+ 
+ int main(void) {
+     /* Taking addresses forces versioned references into the object. */
+-    volatile unsigned long a = (unsigned long)&_LIB_VERSION;
+-    volatile unsigned long b = (unsigned long)&matherr;
++    volatile unsigned long a = (unsigned long)&printf;
++    volatile unsigned long b = (unsigned long)&memcpy;
+     if (a == 0 || b == 0) { printf("FAIL symver refs\n"); return 1; }
+-    printf("PASS symver_ref %lx %lx\n", a, b);
++    /* Call through the versioned refs: default version (printf) and
++     * non-default version (memcpy@GLIBC_2.2.5). */
++    char dst[16];
++    memcpy(dst, "symver-ok", 10);
++    if (strncmp(dst, "symver-ok", 9) != 0) { printf("FAIL memcpy via symver\n"); return 1; }
++    printf("PASS symver_ref\n");
+     return 0;
+ }
