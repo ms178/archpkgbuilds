@@ -1,1564 +1,290 @@
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index b7a6468b..d54cfad0 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -820,6 +820,29 @@ pub fn generate_module(
-         }
-     }
- 
-+    // Numeric `.set sym, <number>` directives in top-level asm define ABSOLUTE
-+    // symbols (glibc localeinfo.h _NL_CURRENT_DEFINE). Their addresses are
-+    // link-time constants and must never go through the GOT.
-+    for asm_str in &module.toplevel_asm {
-+        for line in asm_str.lines() {
-+            let t = line.trim();
-+            if let Some(rest) = t.strip_prefix(".set ") {
-+                let mut it = rest.splitn(2, ',');
-+                if let (Some(sym), Some(val)) = (it.next(), it.next()) {
-+                    let sym = sym.trim();
-+                    let val = val.trim();
-+                    if !sym.is_empty()
-+                        && val.chars().next().map(|c| c.is_ascii_digit() || c == '-' || c == '+')
-+                            .unwrap_or(false)
-+                        && val.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '+' || c == 'x' || c.is_ascii_hexdigit())
-+                    {
-+                        cg.state().absolute_symbols.insert(sym.to_string());
-+                    }
-+                }
-+            }
-+        }
-+    }
-+
-     let referenced_symbols = collect_referenced_symbols(module);
-     emit_extern_visibility_directives(cg, module, &referenced_symbols);
-     emit_functions_and_sections(cg, module, source_mgr, &file_table);
-@@ -1728,12 +1751,19 @@ pub(super) fn generate_instruction(
-             // not symbol(%rip).
-             let is_dead = dead_global_addrs.contains(&dest.0)
-                 && !cg.state_ref().needs_got_for_addr(name)
--                && !cg.state_ref().tls_symbols.contains(name.as_str());
-+                && !cg.state_ref().tls_symbols.contains(name.as_str())
-+                && !cg.state_ref().absolute_symbols.contains(name.as_str());
-             if !is_dead {
-                 if cg.state_ref().tls_symbols.contains(name.as_str()) {
-                     cg.emit_tls_global_addr(dest, name);
--                } else if cg.state_ref().code_model_kernel && !global_addr_ptr_set.contains(&dest.0)
-+                } else if cg.state_ref().absolute_symbols.contains(name.as_str())
-+                    || (cg.state_ref().code_model_kernel && !global_addr_ptr_set.contains(&dest.0))
-                 {
-+                    // Absolute symbols (`.set sym, <number>` markers such as
-+                    // glibc's _NL_CURRENT_DEFINE) are link-time constants: emit
-+                    // `movq $sym` directly. A GOTPCREL reference would need a
-+                    // GOT entry the absolute symbol cannot provide
-+                    // (glibc_abs_symbol regression under the PIC default).
-                     cg.emit_global_addr_absolute(dest, name);
-                 } else {
-                     cg.emit_global_addr(dest, name);
-diff --git a/src/backend/stack_layout/copy_coalescing.rs b/src/backend/stack_layout/copy_coalescing.rs
-index eb5cc799..2d5f5cc9 100644
---- a/src/backend/stack_layout/copy_coalescing.rs
-+++ b/src/backend/stack_layout/copy_coalescing.rs
-@@ -325,6 +325,25 @@ fn build_cfg_copy_alias_map(
-     reg_assigned: &FxHashMap<u32, PhysReg>,
- ) -> (FxHashMap<u32, u32>, FxHashSet<u32>) {
-     let classes = collect_scalar_values(func);
-+    // Vector results must never share slots through copy coalescing: their
-+    // dest_ptr (alloca) and the phi/copy SSA values live in different value
-+    // namespaces, and a loop-carried copy (e.g. zlib-ng adler32's vs1_0 =
-+    // vs1) coalesced to one slot makes the next iteration read a stale half
-+    // of the pair (vector_defer_multidef_slot regression: wide-loop vs1 add
-+    // stored into vs1_0's slot while vs1's own reads kept using the old one).
-+    let vector_values: FxHashSet<u32> = func
-+        .blocks
-+        .iter()
-+        .flat_map(|b| &b.instructions)
-+        .filter_map(|inst| match inst {
-+            Instruction::Intrinsic {
-+                dest: Some(d),
-+                op,
-+                ..
-+            } => op.vector_result_width().map(|_| d.0),
-+            _ => None,
-+        })
-+        .collect();
-     let mut candidates: Vec<(u32, u32)> = Vec::new();
-     for block in &func.blocks {
-         for inst in &block.instructions {
-@@ -334,6 +353,8 @@ fn build_cfg_copy_alias_map(
-                     || reg_assigned.contains_key(&source.0)
-                     || !classes.contains_key(&dest.0)
-                     || !classes.contains_key(&source.0)
-+                    || vector_values.contains(&dest.0)
-+                    || vector_values.contains(&source.0)
-                 {
-                     continue;
-                 }
-diff --git a/src/backend/stack_layout/mod.rs b/src/backend/stack_layout/mod.rs
-index 306b31dd..b173dab7 100644
---- a/src/backend/stack_layout/mod.rs
-+++ b/src/backend/stack_layout/mod.rs
-@@ -119,10 +119,26 @@ struct StackLayoutContext {
-     /// elimination places Copies at predecessor block ends. If the source
-     /// value's Tier 3 slot was reused by another block, the Copy reads garbage.
-     phi_incoming_values: FxHashSet<u32>,
-+    /// Values that appear as the dest or src of a Memcpy, mapped to the
-+    /// copy width. A struct-by-value temp copied by a 32-byte Memcpy needs a
-+    /// 32-byte slot; the generic 8-byte fallback for Copy/Memcpy temps lets
-+    /// the copy read/write past its slot, corrupting neighbours
-+    /// (simd_avx2_256 mul_ps check: vfb copy read the add-loop residue).
-+    memcpy_value_sizes: FxHashMap<u32, usize>,
-     /// Block indices where the block has more instructions than the Tier 3
-     /// greedy coloring threshold. Values defined in these blocks are directed
-     /// to Tier 2 (liveness-packed) instead of Tier 3 (greedy reuse).
-     large_blocks: FxHashSet<usize>,
-+    /// Loop nesting depth per block index (0 = not inside any loop).
-+    ///
-+    /// Allocas whose single use-block is inside a loop MUST NOT be placed in
-+    /// the shared block-local slot region: that region reuses offsets across
-+    /// blocks under the assumption that blocks execute exclusively, but a
-+    /// loop body re-enters — so a loop-carried alloca (written in iteration N,
-+    /// read in iteration N+1, e.g. adler32's vs1/vs1_0 or a sum accumulator)
-+    /// is clobbered by another value allocated at the same offset
-+    /// (simd_avx2_256 mul check and vector_defer_multidef_slot regressions).
-+    block_loop_depth: Vec<u32>,
- }
- 
- // ── Main stack space calculation ──────────────────────────────────────────
-@@ -163,27 +179,35 @@ pub fn calculate_stack_space_common(
-         eprintln!("[PROTECT] Scanning function {} for vector intrinsics", func.name);
-     }
- 
--    // Pass 1: Mark all vector intrinsic destinations as vector values
-+    // Pass 1: Mark all vector intrinsic destinations as vector values.
-+    // Uses the single authority `IntrinsicOp::vector_result_width()` so that
-+    // USER-level SSE/AVX intrinsics (sad_epu8, maddubs, add_epi32, mul_ps,
-+    // loadu_si256, ...) are protected exactly like the auto-vectorizer's
-+    // internal Vec* ops. Previously only the Vec* ops were recognized, so
-+    // real SIMD code (zlib-ng adler32_ssse3, AVX2 intrinsic chains) got
-+    // 8-byte slots that 16/32-byte stores overflowed and that block-local
-+    // reuse reassigned while still live (vector_defer_multidef_slot,
-+    // simd_avx2_256 regressions).
-     for block in &func.blocks {
-         for inst in &block.instructions {
-             if let crate::ir::instruction::Instruction::Intrinsic { dest: Some(d), op, .. } = inst {
--                // Mark destinations of all vector intrinsics as vector values
--                let is_vector = matches!(op,
--                    IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 |
--                    IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
--                    IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 |
--                    IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
--                    IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 |
--                    IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
--                    IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2
--                );
--                if is_vector {
--                    state.vector_values.insert(d.0);
--                    // Also mark as protected so slot reuse doesn't corrupt vector data
--                    state.protected_slot_values.insert(d.0);
--                    if debug_protect {
--                        eprintln!("[PROTECT] Marked SSA value {} as protected ({:?})", d.0, op);
-+                match op.vector_result_width() {
-+                    Some(32) => {
-+                        state.vector_values.insert(d.0);
-+                        state.protected_slot_values.insert(d.0);
-+                        if debug_protect {
-+                            eprintln!("[PROTECT] Marked SSA value {} as protected 256-bit ({:?})", d.0, op);
-+                        }
-+                    }
-+                    Some(16) => {
-+                        state.vector128_values.insert(d.0);
-+                        state.vector_values.insert(d.0);
-+                        state.protected_slot_values.insert(d.0);
-+                        if debug_protect {
-+                            eprintln!("[PROTECT] Marked SSA value {} as protected 128-bit ({:?})", d.0, op);
-+                        }
-                     }
-+                    _ => {}
+diff --git a/src/backend/x86/codegen/float_ops.rs b/src/backend/x86/codegen/float_ops.rs
+index 0a1ec396..47918884 100644
+--- a/src/backend/x86/codegen/float_ops.rs
++++ b/src/backend/x86/codegen/float_ops.rs
+@@ -260,8 +260,44 @@ impl X86Codegen {
+                     self.state.emit_fmt(format_args!("    movss {}(%rip), %{}", label, xmm));
                  }
              }
-         }
-@@ -215,6 +239,19 @@ pub fn calculate_stack_space_common(
-                 });
-                 if has_vector_incoming {
-                     state.vector_values.insert(dest.0);
-+                    // A 128-bit class propagates only when every vector incoming
-+                    // is 128-bit; any 256-bit incoming makes the PHI 256-bit.
-+                    let all_incoming_128 = incoming.iter().all(|(val, _)| {
-+                        if let crate::ir::instruction::Operand::Value(v) = val {
-+                            !state.vector_values.contains(&v.0)
-+                                || state.vector128_values.contains(&v.0)
-+                        } else {
-+                            true
-+                        }
-+                    });
-+                    if all_incoming_128 {
-+                        state.vector128_values.insert(dest.0);
-+                    }
-                     state.protected_slot_values.insert(dest.0);
-                     if debug_protect {
-                         eprintln!("[PROTECT] Marked PHI SSA value {} as protected (has vector incoming)", dest.0);
-@@ -234,11 +271,18 @@ pub fn calculate_stack_space_common(
-             for inst in &block.instructions {
-                 if let crate::ir::instruction::Instruction::Copy { dest, src } = inst {
-                     if let crate::ir::instruction::Operand::Value(src_val) = src {
--                        if state.protected_slot_values.contains(&src_val.0) {
-+                        // Propagate only from genuinely VECTOR sources. Protected
-+                        // values also include scalar holders (DynAlloca results,
-+                        // addresses); marking those as vectors would switch their
-+                        // codegen from value-load to leaq addressing.
-+                        if state.vector_values.contains(&src_val.0) {
-                             let was_new = state.protected_slot_values.insert(dest.0);
--                            state.vector_values.insert(dest.0);
--                            if debug_protect && was_new {
--                                eprintln!("[PROTECT-COPY] Marked SSA {} as protected (copy from protected SSA {})", dest.0, src_val.0);
-+                            let was_vec = state.vector_values.insert(dest.0);
-+                            if state.vector128_values.contains(&src_val.0) {
-+                                state.vector128_values.insert(dest.0);
-+                            }
-+                            if debug_protect {
-+                                eprintln!("[PROTECT-COPY] Marked SSA {} as protected (copy from vector SSA {})", dest.0, src_val.0);
-                             }
-                         }
-                     }
-@@ -293,7 +337,9 @@ pub fn calculate_stack_space_common(
- 
-     // Raptor Lake Optimization: Protect cross-block vector slots
-     for mbv in &multi_block_values {
--        if state.vector_values.contains(&mbv.dest_id) {
-+        if state.vector_values.contains(&mbv.dest_id)
-+            || state.vector128_values.contains(&mbv.dest_id)
-+        {
-             state.protected_slot_values.insert(mbv.dest_id);
-         }
-     }
-@@ -317,6 +363,35 @@ pub fn calculate_stack_space_common(
-     // Phase 7: Propagate wide-value status through Copy chains (32-bit targets only).
-     slot_assignment::propagate_wide_values(state, func, &ctx.copy_alias);
- 
-+    // Diagnostic: dump the full value→slot map (and the vector/defer sets) so
-+    // slot aliasing miscompiles can be root-caused from the layout alone.
-+    // Usage: CCC_DEBUG_SLOTS=1 lccc -O2 -c file.c
-+    if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-+        eprintln!("[SLOTS] fn={} total_space={}", func.name, total_space);
-+        let mut ids: Vec<u32> = state.value_locations.keys().copied().collect();
-+        ids.sort_unstable();
-+        for id in ids {
-+            let slot = state.value_locations[&id].0;
-+            let tags: Vec<&str> = {
-+                let mut t = Vec::new();
-+                if state.vector_values.contains(&id) {
-+                    t.push(if state.vector128_values.contains(&id) { "v128" } else { "v256" });
++            Operand::Value(v) => {
++                let is_alloca = self.state.is_alloca(v.0);
++                // Stack slot path: load directly from memory to XMM (no GPR intermediate).
++                // This is always safe because stack slots are stable locations.
++                if let Some(slot) = self.state.get_slot(v.0) {
++                    let mov = if ty == IrType::F32 { "movss" } else { "movsd" };
++                    let sr = self.slot_ref(slot.0);
++                    self.state.emit_fmt(format_args!("    {} {}, %{}", mov, sr, xmm));
++                    return;
 +                }
-+                if state.protected_slot_values.contains(&id) {
-+                    t.push("prot");
-+                }
-+                if state.vector_defer_values.contains(&id) {
-+                    t.push("defer");
-+                }
-+                if state.alloca_values.contains(&id) {
-+                    t.push("alloca");
-+                }
-+                t
-+            };
-+            eprintln!("[SLOTS]   v{:<5} slot={:<5} {}", id, slot, tags.join(","));
-+        }
-+    }
-+
-     total_space
- }
- 
-@@ -467,6 +542,25 @@ fn build_layout_context(
-         }
-     }
- 
-+    // Collect Memcpy dest/src value widths: struct copies must get slots at
-+    // least as wide as the copy, otherwise the 16/32-byte copy overflows the
-+    // 8-byte fallback slot into neighbours.
-+    let mut memcpy_value_sizes: FxHashMap<u32, usize> = FxHashMap::default();
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            if let Instruction::Memcpy { dest, src, size } = inst {
-+                let e = memcpy_value_sizes.entry(dest.0).or_insert(0);
-+                if *size > *e {
-+                    *e = *size;
-+                }
-+                let e2 = memcpy_value_sizes.entry(src.0).or_insert(0);
-+                if *size > *e2 {
-+                    *e2 = *size;
-+                }
-+            }
-+        }
-+    }
-+
-     // Collect phi incoming values: values used as operands in Phi instructions.
-     let mut phi_incoming_values = FxHashSet::default();
-     for block in &func.blocks {
-@@ -481,6 +575,15 @@ fn build_layout_context(
-         }
-     }
- 
-+    // Loop depth per block: allocas used only inside a loop must stay out of
-+    // the shared block-local region (loop-carried lifetimes alias across
-+    // iterations). If liveness was not computed, conservatively treat every
-+    // block as looped (disables block-local allocas entirely).
-+    let block_loop_depth = cached_liveness
-+        .as_ref()
-+        .map(|l| l.block_loop_depth.clone())
-+        .unwrap_or_else(|| vec![1u32; func.blocks.len()]);
-+
-     // Identify blocks too large for Tier 3 greedy coloring.
-     // The accumulator-based codegen processes instructions sequentially, but
-     // the actual spill ordering can diverge from IR instruction order in
-@@ -505,6 +608,8 @@ fn build_layout_context(
-         immediately_consumed,
-         vector_defer_values,
-         phi_incoming_values,
-+        memcpy_value_sizes,
-         large_blocks,
-+        block_loop_depth,
-     }
- }
-diff --git a/src/backend/stack_layout/slot_assignment.rs b/src/backend/stack_layout/slot_assignment.rs
-index 9966aa99..afb35568 100644
---- a/src/backend/stack_layout/slot_assignment.rs
-+++ b/src/backend/stack_layout/slot_assignment.rs
-@@ -354,18 +354,36 @@ fn classify_alloca(
- 
-     // Skip dead param allocas (still registered so backend recognizes them).
-     if ctx.dead_param_allocas.contains(&dest.0) {
-+        if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-+            eprintln!("[SLOTS]   alloca v{} SKIPPED: dead param", dest.0);
-+        }
-         return;
-     }
- 
-     // Skip dead non-param allocas (never referenced by any instruction).
-     if ctx.coalescable_allocas.dead.contains(&dest.0) {
-+        if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-+            eprintln!("[SLOTS]   alloca v{} SKIPPED: dead (no recorded uses)", dest.0);
-+        }
-         return;
-     }
- 
-     // Single-block allocas: use block-local coalescing (Tier 3).
-     // Over-aligned allocas (> 16) are excluded because their alignment
-     // padding complicates coalescing.
--    if effective_align <= 16 {
-+    // Allocas whose single use-block is inside a LOOP are excluded too: the
-+    // block-local region shares offsets across blocks assuming exclusive
-+    // execution, but loop bodies re-enter, so a loop-carried alloca (written
-+    // in iteration N, read in N+1) is clobbered by other values at the same
-+    // offset (simd_avx2_256 / vector_defer_multidef_slot regressions). Loop
-+    // allocas get permanent Tier-1 slots instead.
-+    let use_block_in_loop = ctx
-+        .coalescable_allocas
-+        .single_block
-+        .get(&dest.0)
-+        .map(|&ub| ctx.block_loop_depth.get(ub).copied().unwrap_or(1) != 0)
-+        .unwrap_or(false);
-+    if effective_align <= 16 && !use_block_in_loop {
-         if let Some(&use_block) = ctx.coalescable_allocas.single_block.get(&dest.0) {
-             let alloca_size = raw_size + extra as i64;
-             let alloca_align = align as i64;
-@@ -430,13 +448,23 @@ fn classify_value(
-         Some(IrType::F32)
-     );
-     let is_vector = state.vector_values.contains(&dest.0);
--    let slot_size: i64 = if is_vector {
-+    let is_vector128 = state.vector128_values.contains(&dest.0);
-+    let memcpy_width = ctx.memcpy_value_sizes.get(&dest.0).copied().unwrap_or(0) as i64;
-+    let mut slot_size: i64 = if is_vector && !is_vector128 {
-         32 // AVX2 256-bit vectors need 32 bytes
-+    } else if is_vector128 {
-+        16 // SSE 128-bit vectors need 16 bytes
-     } else if is_i128 || is_f128 {
-         16
-     } else {
-         8
-     };
-+    // A value that is a Memcpy dest/src must be at least as wide as the copy:
-+    // struct-by-value temps otherwise get 8-byte slots that a 32-byte copy
-+    // overflows (simd_avx2_256 mul_ps check corruption).
-+    if memcpy_width > slot_size {
-+        slot_size = memcpy_width;
-+    }
- 
-     if is_i128 {
-         state.i128_values.insert(dest.0);
-@@ -451,11 +479,11 @@ fn classify_value(
-         }
-     }
- 
--    // Vector values from Vec* intrinsics need protected stack slots to prevent
--    // slot reuse from corrupting vector data during reduction vectorization.
--    // The vector_values set is populated by the backend's intrinsic emitters
--    // when they encounter VecZero*, VecLoad*, VecAdd*, etc. operations.
--    if state.vector_values.contains(&dest.0) {
-+    // Vector values (both the auto-vectorizer's Vec* ops and user-level
-+    // SSE/AVX intrinsic results, see IntrinsicOp::vector_result_width) need
-+    // protected stack slots to prevent slot reuse from corrupting vector data
-+    // during reduction vectorization and real intrinsic chains.
-+    if is_vector || is_vector128 {
-         state.protected_slot_values.insert(dest.0);
-     }
- 
-@@ -912,8 +940,14 @@ pub(super) fn finalize_deferred_slots(
-         } else {
-             non_local_space
-         };
-+        if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-+            eprintln!("[SLOTS]   block-region base aligned_nls={} max_block_local_space={} n_deferred={}", aligned_nls, max_block_local_space, deferred_slots.len());
-+        }
-         for ds in deferred_slots {
-             let (slot, _) = assign_slot(aligned_nls + ds.block_offset, ds.size, ds.align);
-+            if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-+                eprintln!("[SLOTS]   deferred v{} block_offset={} size={} align={} -> slot {}", ds.dest_id, ds.block_offset, ds.size, ds.align, slot);
-+            }
-             state.value_locations.insert(ds.dest_id, StackSlot(slot));
-         }
-         aligned_nls + max_block_local_space
-diff --git a/src/backend/state.rs b/src/backend/state.rs
-index 98d8b243..c16297a9 100644
---- a/src/backend/state.rs
-+++ b/src/backend/state.rs
-@@ -140,6 +140,12 @@ pub struct CodegenState {
-     /// These should be addressed via leaq (to get stack slot address) instead of movq
-     /// (which would load scalar bytes), because they hold 128/256-bit vector data.
-     pub vector_values: FxHashSet<u32>,
-+    /// 128-bit (SSE-class) vector values. Same addressing rules as
-+    /// `vector_values`, but their home slots are 16 bytes wide rather than 32.
-+    /// Populated together with `vector_values` by the stack-layout pre-scan for
-+    /// every user-level SSE/AVX intrinsic result (see
-+    /// `IntrinsicOp::vector_result_width`).
-+    pub vector128_values: FxHashSet<u32>,
-     /// Vector-register peephole: the stack slot offset that the last
-     /// `avx_store_dest`/`sse_store_dest` wrote from %ymm0/%xmm0, and whether
-     /// that register still provably holds the value. When the very next vector
-@@ -196,6 +202,10 @@ pub struct CodegenState {
-     /// Set of symbol names that are locally defined (not extern) and have internal
-     /// linkage (static) — these can use direct addressing even in PIC mode.
-     pub local_symbols: FxHashSet<String>,
-+    /// Symbols defined by numeric `.set sym, <number>` directives in top-level
-+    /// asm (glibc-style absolute markers). Their address is a link-time
-+    /// constant: emitted as `movq $sym`, never via GOT.
-+    pub absolute_symbols: FxHashSet<String>,
-     /// Set of symbol names that are thread-local (_Thread_local / __thread).
-     /// These require TLS-specific access patterns (e.g., %fs:x@TPOFF on x86-64).
-     pub tls_symbols: FxHashSet<String>,
-@@ -360,6 +370,7 @@ impl CodegenState {
-             i128_values: FxHashSet::default(),
-             wide_values: FxHashSet::default(),
-             vector_values: FxHashSet::default(),
-+            vector128_values: FxHashSet::default(),
-             vec_last_store_slot: None,
-             vec_last_store_val: None,
-             vec_last_store_reg: false,
-@@ -374,6 +385,7 @@ impl CodegenState {
-             label_counter: 0,
-             pic_mode: false,
-             local_symbols: FxHashSet::default(),
-+            absolute_symbols: FxHashSet::default(),
-             tls_symbols: FxHashSet::default(),
-             has_dyn_alloca: false,
-             omit_frame_pointer: false,
-@@ -521,6 +533,19 @@ impl CodegenState {
-         self.sse_last_store_val = None;
-         self.sse_last_store_reg = false;
-         self.sse_last_store_reg_name = None;
-+        // Per-function vector classification sets MUST be cleared here. Value
-+        // IDs are function-local; leaving these populated leaks classifications
-+        // from previously compiled functions into the next one (a scalar value
-+        // in function B colliding with a vector intrinsic result ID from
-+        // function A is then copied via the vector path, emitting LEA instead
-+        // of LOAD — adler32-style miscompile: vs2 initialized with the address
-+        // of its slot).
-+        self.vector_values.clear();
-+        self.vector128_values.clear();
-+        self.protected_slot_values.clear();
-+        self.vector_defer_values.clear();
-+        self.pending_vec_store = None;
-+        self.vec_live_regs.clear();
-         self.uses_sret = false;
-         self.next_block_label = None;
-     }
-diff --git a/src/backend/x86/codegen/globals.rs b/src/backend/x86/codegen/globals.rs
-index e707347b..c0e31e8e 100644
---- a/src/backend/x86/codegen/globals.rs
-+++ b/src/backend/x86/codegen/globals.rs
-@@ -30,7 +30,13 @@ impl X86Codegen {
-     pub(super) fn emit_tls_global_addr_impl(&mut self, dest: &Value, name: &str) {
-         // TLS requires %rax for the fs:0 base — can't fully avoid accumulator.
-         // But when dest has a register, we can skip the final store_rax_to relay.
--        if self.state.pic_mode {
-+        // TLS model selection: LOCAL symbols (static/visibility-hidden TLS, the
-+        // common `static __thread` case) use the Local-Exec model — a direct
-+        // %fs:offset with NO GOT entry — even under -fPIC, exactly like GCC.
-+        // Only external TLS symbols need the GOT-based General-Dynamic sequence
-+        // in PIC mode (globals_tls regression: static __thread read garbage
-+        // when GOTTPOFF was forced for a local symbol).
-+        if self.state.pic_mode && !self.state.local_symbols.contains(name) {
-             self.state.emit_fmt(format_args!("    movq {}@GOTTPOFF(%rip), %rax", name));
-             self.state.emit("    addq %fs:0, %rax");
-         } else {
-diff --git a/src/driver/cli.rs b/src/driver/cli.rs
-index ca649ccc..0f1bda84 100644
---- a/src/driver/cli.rs
-+++ b/src/driver/cli.rs
-@@ -712,6 +712,14 @@ impl Driver {
-                         self.target = Target::I686;
-                     }
-                 }
-+                "-m64" => {
-+                    // 64-bit x86-64 target — the default, but GCC accepts it
-+                    // explicitly and real build systems pass it (zlib-ng's
-+                    // configure does). Accept as a no-op when already x86-64.
-+                    if self.target != Target::X86_64 {
-+                        self.target = Target::X86_64;
-+                    }
-+                }
-                 "-mno-sse" | "-mno-sse2" => self.no_sse = true,
-                 "-mno-mmx" | "-mno-3dnow" => {}
-                 "-mno-avx2" => { self.enable_avx2=false; self.enable_avxvnni=false; self.enable_avxvnniint8=false; self.enable_avxvnniint16=false; }
-diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
-index d385e350..4a173e68 100644
---- a/src/driver/pipeline.rs
-+++ b/src/driver/pipeline.rs
-@@ -327,7 +327,10 @@ impl Driver {
-             shared_lib: false,
-             nostdlib: false,
-             relocatable: false,
--            pic: false,
-+            pic: true, // x86-64 Linux default: PIE/PIC-safe codegen, matching
-+                       // GCC's default (zlib-ng etc. compile shared objects
-+                       // with -DPIC only and rely on the compiler default).
-+                       // -fno-pic/-fno-PIE disables.
-             force_includes: Vec::new(),
-             function_return_thunk: false,
-             indirect_branch_thunk: false,
-diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
-index 639d453e..7ef293d2 100644
---- a/src/ir/intrinsics.rs
-+++ b/src/ir/intrinsics.rs
-@@ -460,6 +460,70 @@ pub enum IntrinsicOp {
- }
- 
- impl IntrinsicOp {
-+    /// Width in bytes of the vector/XMM result produced by this intrinsic:
-+    /// 128-bit SSE results → Some(16), 256-bit AVX/AVX2 results → Some(32).
-+    /// Returns None for ops whose `dest` is scalar (GPR/x87), that produce no
-+    /// value (fences, stores, control), or that are handled by the F128 path.
-+    ///
-+    /// NOTE: ops whose result is a SCALAR must never be listed here even if
-+    /// their name sounds vector-ish (HorizontalAdd*/VecHorizontalAdd* return
-+    /// I32/F64 scalars; Pmovmskb*/Cvtsi128Si*/Pextr*/Crc32* are scalar too).
-+    /// Misclassifying them as vectors corrupts scalar values (volatile_access
-+    /// regression: sum reloaded via leaq instead of movq).
-+    ///
-+    /// This is the single authority for "does this intrinsic write a vector
-+    /// home slot" — used by the stack-layout pre-scan to protect user-level
-+    /// SSE/AVX intrinsic results from block-local slot reuse. Previously only
-+    /// the auto-vectorizer's internal Vec* ops were recognized, so real code
-+    /// (zlib-ng adler32_ssse3, _mm256_mul_ps chains, ...) got 8-byte slots
-+    /// with 16/32-byte stores overflowing into neighbours and reusable slots
-+    /// being read back after corruption (vector_defer_multidef_slot and
-+    /// simd_avx2_256 regressions).
-+    pub fn vector_result_width(&self) -> Option<u32> {
-+        use IntrinsicOp::*;
-+        match self {
-+            // ---- 256-bit AVX/AVX2 results ----
-+            Loadu256 | Load256
-+            | Paddb256 | Paddw256 | Paddd256 | Psubb256 | Psubw256 | Psubusw256
-+            | Psadbw256 | Pmaddubsw256 | Pmaddwd256 | Pcmpeqb256 | Pcmpgtb256
-+            | Pshufb256 | Pabsb256 | Pabsw256 | Pmaxub256
-+            | Pminub256 | Pxor256 | Por256 | Pand256 | Psllidi256 | Psrlidi256
-+            | Psllwi256 | Psrlwi256 | Broadcast128to256 | Zext128to256
-+            | Insert128to256 | SetEpi16_256 | SetEpi32_256 | SetEpi64x256
-+            | Dpbusd256 | Dpbssd256 | Dpwuud256 | Aesenc256 | Vpclmulqdq256
-+            | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB
-+            | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
-+            | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4
-+            | VecAddI32x8 | VecZeroF64x4 | VecZeroI32x8 => Some(32),
-+            // ---- 128-bit SSE/SSE2/SSSE3/SSE4 results ----
-+            Loaddqu | Loadldi128 | Pcmpeqb128 | Pcmpeqd128 | Psubusb128
-+            | Psubsb128 | Por128 | Pand128 | Pxor128 | AddPs128 | SubPs128
-+            | MulPs128 | AddPd128 | SubPd128 | MulPd128 | Pmuludq128
-+            | Pmuldq128 | Pmulld128 | CastReinterpret128 | SetEpi8 | SetEpi16
-+            | SetEpi32 | Pslldqi128 | Psrldqi128 | Psllqi128 | Psrlqi128
-+            | Pshufd128 | Paddw128 | Psubw128 | Paddb128 | Psubb128
-+            | Psubusw128 | Psadbw128 | Pmullw128 | Pmaddubsw128 | Phaddw128
-+            | Phaddd128 | Pshufb128 | Pabsb128 | Pabsw128 | Pabsd128
-+            | Palignr128 | Pmaxub128 | Pminub128 | Pblendvb128 | Pmovzxbw128
-+            | Pmovzxwd128 | Psllw128 | Psrlw128 | Pmulhw128 | Pmaddwd128
-+            | Pcmpgtw128 | Pcmpgtb128 | Psllwi128 | Psrlwi128 | Psrawi128
-+            | Psradi128 | Pslldi128 | Psrldi128 | Paddd128 | Psubd128
-+            | Packssdw128 | Packsswb128 | Packuswb128 | Punpcklbw128
-+            | Punpckhbw128 | Punpcklwd128 | Punpckhwd128 | Pinsrw128
-+            | Cvtsi32Si128 | Pshuflw128 | Pshufhw128 | Pinsrd128 | Pinsrb128
-+            | Pinsrq128 | Cast256to128 | Dpbusd128 | Dpbssd128 | Dpwuud128
-+            | Gf2p8mulb128 | Aesenc128 | Aesenclast128 | Aesdec128
-+            | Aesdeclast128 | Aesimc128 | Aeskeygenassist128 | Pclmulqdq128
-+            | FmaF64x2 | LoadF64x2 | LoadI32x4 | AddF64x2 | MulF64x2
-+            | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecAddF64x2
-+            | VecMulF64x2 | VecAddI32x4 | VecZeroF64x2 | VecZeroI32x4
-+            => Some(16),
-+            // Everything else produces a scalar GPR/x87 result, no result, or
-+            // is an F128 helper handled by the dedicated f128 slot path.
-+            _ => None,
-+        }
-+    }
-+
-     /// Returns true if this intrinsic is a pure function (no side effects, result depends
-     /// only on inputs). Pure intrinsics can be dead-code eliminated if their result is unused.
-     pub fn is_pure(&self) -> bool {
-diff --git a/src/passes/copy_prop.rs b/src/passes/copy_prop.rs
-index abef5d05..6e4050a5 100644
---- a/src/passes/copy_prop.rs
-+++ b/src/passes/copy_prop.rs
-@@ -37,6 +37,29 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
-     let mut total = 0;
-     for func in &mut module.functions {
-         if func.is_declaration { continue; }
-+
-+        // Function-wide use counts. The intermediate `tmp` of a chain
-+        //   memcpy tmp, src
-+        //   memcpy dst, tmp
-+        // must be referenced by NOTHING except those two memcpys (dest of the
-+        // first, src of the second). In particular, uses of `tmp` in OTHER
-+        // blocks (loop bodies reading the variable whose slot `tmp` holds)
-+        // make the rewrite unsound: dropping the first memcpy would leave
-+        // `tmp`'s slot stale for those readers (adler32 dual-loop
-+        // miscompile: vs1's slot was never initialized/updated while the
-+        // wide/narrow loops kept reading it).
-+        let mut uses: FxHashMap<u32, u32> = FxHashMap::default();
-+        for block in &func.blocks {
-+            for inst in &block.instructions {
-+                for v in inst.used_values() {
-+                    *uses.entry(v).or_insert(0) += 1;
-+                }
-+            }
-+            for v in block.terminator.used_values() {
-+                *uses.entry(v).or_insert(0) += 1;
-+            }
-+        }
-+
-         for block in &mut func.blocks {
-             let mut i = 0;
-             while i < block.instructions.len() {
-@@ -44,6 +67,12 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
-                     Instruction::Memcpy { dest, src, .. } if dest != src => (dest, src),
-                     _ => { i += 1; continue; }
-                 };
-+                // Soundness: `tmp` may be referenced only by this memcpy's
-+                // dest and the chain consumer's src (2 uses total).
-+                if uses.get(&tmp.0).copied().unwrap_or(0) != 2 {
-+                    i += 1;
-+                    continue;
-+                }
-                 let mut consumer = None;
-                 let mut safe = true;
-                 for j in (i + 1)..block.instructions.len() {
-diff --git a/src/passes/inline.rs b/src/passes/inline.rs
-index 14c11192..b2f7d4bf 100644
---- a/src/passes/inline.rs
-+++ b/src/passes/inline.rs
-@@ -2416,6 +2416,14 @@ fn inline_call_site(
-     // The merge block has the highest ID we assigned.
-     *global_max_block_id = merge_block_id.0;
- 
-+    // The caller's label namespace must be advanced past every block we just
-+    // cloned. Without this, a later pass that allocates fresh block labels
-+    // from func.next_label (vectorizer, unroller, ...) reuses the inlined
-+    // blocks' labels, corrupting CFG edges — observed as an infinite
-+    // self-loop / out-of-bounds read in the lea_sib_fold -O2 regression
-+    // (exit CondBranch retargeted onto the loop header).
-+    caller.next_label = std::cmp::max(caller.next_label, merge_block_id.0 + 1);
-+
-     true
- }
- 
-diff --git a/src/passes/vector_temp_promotion.rs b/src/passes/vector_temp_promotion.rs
-index b91b2a54..147bc1c4 100644
---- a/src/passes/vector_temp_promotion.rs
-+++ b/src/passes/vector_temp_promotion.rs
-@@ -26,7 +26,7 @@
- 
- use crate::common::fx_hash::{FxHashMap, FxHashSet};
- use crate::ir::instruction::Instruction;
--use crate::ir::reexports::{IrFunction, IrModule, Value};
-+use crate::ir::reexports::{IrFunction, IrModule, Operand, Value};
- 
- /// Run the vector-temp promotion across all functions.
- pub(crate) fn promote_vector_temps(module: &mut IrModule) -> usize {
-@@ -87,6 +87,12 @@ fn promote_in_function(func: &mut IrFunction) -> usize {
-                         if uses.get(&tmp) == Some(&2)
-                             && alloca_sizes.get(&tmp) == Some(size)
-                             && alloca_sizes.contains_key(&dest.0)
-+                            && no_var_access_between(
-+                                &block.instructions,
-+                                intr_idx + 1,
-+                                ii,
-+                                dest.0,
-+                            )
-                         {
-                             rewrites.push(Rewrite {
-                                 block: bi,
-@@ -152,6 +158,64 @@ fn promote_in_function(func: &mut IrFunction) -> usize {
-     promoted
- }
- 
-+/// Soundness window check for temp promotion.
-+///
-+/// The rewrite redirects the Intrinsic's store from `%tmp` to `%var` and drops
-+/// the trailing `Memcpy(dest=%var, src=%tmp)`. This moves the store to `%var`
-+/// EARLIER (from the Memcpy position to the Intrinsic position), so it is only
-+/// valid when nothing reads or writes `%var` in between: a read would observe
-+/// the new value too early, and a write would clobber the promoted value
-+/// before the copy point, changing what later code sees.
-+///
-+/// Real bug fixed: zlib-ng-style dual-loop adler32 code has
-+/// `vs1 = sad+vs1; ...; vs1_0 = vs1` — the memcpy for `vs1_0 = vs1` was
-+/// promoted, redirecting the `vs1` update into `vs1_0`'s slot. In the wide
-+/// loop the interleaved `vs3 = vs1_0 + vs3` happens to read the slot before
-+/// the update (safe by accident); in the narrow loop it reads AFTER the
-+/// redirected store (wrong value → vector_defer_multidef_slot regression).
-+fn no_var_access_between(
-+    insts: &[Instruction],
-+    from: usize,
-+    to: usize,
-+    var: u32,
-+) -> bool {
-+    for inst in &insts[from.min(insts.len())..to.min(insts.len())] {
-+        // Any operand/value-ref use of the slot (args, Load/Store ptr, GEP
-+        // base, Intrinsic dest_ptr, Memcpy src, terminator operands are after
-+        // `to` so not included here).
-+        if inst.used_values().contains(&var) {
-+            return false;
-+        }
-+        // Any SSA write of the variable.
-+        if inst.dest().map(|d| d.0) == Some(var) {
-+            return false;
-+        }
-+        // Any memory write through the slot (Intrinsic dest_ptr is already
-+        // covered by used_values, but be explicit for Store/Memcpy/atomics).
-+        match inst {
-+            Instruction::Store { ptr, .. } => {
-+                if ptr.0 == var {
-+                    return false;
-+                }
-+            }
-+            Instruction::AtomicStore { ptr, .. } => {
-+                if let Operand::Value(v) = ptr {
-+                    if v.0 == var {
-+                        return false;
-+                    }
-+                }
-+            }
-+            Instruction::Memcpy { dest, .. } => {
-+                if dest.0 == var {
-+                    return false;
-+                }
-+            }
-+            _ => {}
-+        }
-+    }
-+    true
-+}
-+
- /// Fuse vector load intrinsics into their single consumer.
- ///
- /// After temp promotion, the IR for `ymm = _mm256_loadu_si256(p); c = op(ymm, ..)`
-diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index 7ceb2c1e..f4c684a7 100644
---- a/src/passes/vectorize.rs
-+++ b/src/passes/vectorize.rs
-@@ -1686,6 +1686,12 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern)
-     // Keep track of the next available Value and BlockId
-     let mut next_val_id = func.next_value_id;
-     let mut next_label = func.next_label;
-+    // Defensive: never trust func.next_label alone — some IR producers can
-+    // leave it stale relative to the blocks actually present. Allocating
-+    // below an existing label duplicates it and corrupts the CFG
-+    // (lea_sib_fold -O2 self-loop regression).
-+    let max_present_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
-+    next_label = std::cmp::max(next_label, max_present_label + 1);
- 
-     // Restrict all IV/GEP tracing and modifications to the innermost loop blocks only.
-     let innermost_blocks: FxHashSet<usize> = [
-@@ -2167,6 +2173,12 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
-     // Keep track of the next available Value and BlockId
-     let mut next_val_id = func.next_value_id;
-     let mut next_label = func.next_label;
-+    // Defensive: never trust func.next_label alone — some IR producers can
-+    // leave it stale relative to the blocks actually present. Allocating
-+    // below an existing label duplicates it and corrupts the CFG
-+    // (lea_sib_fold -O2 self-loop regression).
-+    let max_present_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
-+    next_label = std::cmp::max(next_label, max_present_label + 1);
- 
-     // Restrict all IV/GEP tracing and modifications to the innermost loop blocks only.
-     // This prevents accidentally modifying comparisons or GEPs in outer loops.
-@@ -2854,20 +2866,22 @@ fn insert_reduction_remainder_loop(
-     func.blocks.push(remainder_latch_block);
- 
-     // Step 7: Replace uses of original scalar accumulator with remainder accumulator
--    // After vectorization, pattern.accumulator_phi in the header now holds a VECTOR value.
--    // The exit block and any blocks only reachable after the remainder loop should use
--    // sum_rem_phi (the scalar accumulator from the remainder loop) instead.
--    //
--    // We update the exit block since it's now only reachable from remainder_header.
-+    // After vectorization, pattern.accumulator_phi in the header now holds a VECTOR
-+    // value. EVERY use outside this loop must read the scalar remainder result
-+    // sum_rem_phi instead. The former code only rewired the exit block: with
-+    // several inlined reductions in one function the consumer (e.g. a printf
-+    // argument) lives in a later block and kept reading the vector accumulator —
-+    // emitted as LEA (vectors are addressed, not loaded), printing a stack
-+    // address (lea_sib_fold -O2 wrong sum; --compare-gcc output mismatch).
-     {
--        let exit_block = &mut func.blocks[pattern.exit_idx];
-+        let acc_id = pattern.accumulator_phi.0;
-         let mut updates = 0;
-         if debug {
--            eprintln!("[VEC-RED]   Checking exit block for uses of SSA {} (vector accumulator)", pattern.accumulator_phi.0);
-+            eprintln!("[VEC-RED]   Rewiring uses of SSA {} (vector accumulator) outside the loop", acc_id);
-         }
- 
-         // Helper to replace SSA values in operands
--        let replace_in_operand = |op: &mut Operand, from: u32, to: Value| -> bool {
-+        let mut replace_in_operand = |op: &mut Operand, from: u32, to: Value| -> bool {
-             if let Operand::Value(v) = op {
-                 if v.0 == from {
-                     *v = to;
-@@ -2877,55 +2891,69 @@ fn insert_reduction_remainder_loop(
-             false
-         };
- 
--        // Update all uses of the accumulator phi in the exit block's instructions.
--        // The accumulator may be used in Copy, Store, BinOp, Call args, etc.
--        let acc_id = pattern.accumulator_phi.0;
--        for inst in &mut exit_block.instructions {
--            match inst {
--                Instruction::Copy { src, .. } => {
--                    if let Operand::Value(v) = src { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
--                }
--                Instruction::Store { val, .. } => {
--                    if let Operand::Value(v) = val { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
--                }
--                Instruction::BinOp { lhs, rhs, .. } => {
--                    if let Operand::Value(v) = lhs { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
--                    if let Operand::Value(v) = rhs { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
--                }
--                Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => {
--                    if let Operand::Value(v) = src { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
--                }
--                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
--                    for a in &mut info.args {
--                        if let Operand::Value(v) = a { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
-+        for (bi, block) in func.blocks.iter_mut().enumerate() {
-+            if pattern.loop_blocks.contains(&bi) {
-+                continue; // the vector accumulator lives and is consumed here
-+            }
-+            for inst in &mut block.instructions {
-+                match inst {
-+                    Instruction::Copy { src, .. } => {
-+                        if replace_in_operand(src, acc_id, sum_rem_phi) { updates += 1; }
-                     }
--                }
--                Instruction::Phi { incoming, .. } => {
--                    for (op, _) in incoming {
--                        if let Operand::Value(v) = op { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
-+                    Instruction::Store { val, .. } => {
-+                        if replace_in_operand(val, acc_id, sum_rem_phi) { updates += 1; }
-+                    }
-+                    Instruction::BinOp { lhs, rhs, .. } => {
-+                        if replace_in_operand(lhs, acc_id, sum_rem_phi) { updates += 1; }
-+                        if replace_in_operand(rhs, acc_id, sum_rem_phi) { updates += 1; }
-+                    }
-+                    Instruction::Cmp { lhs, rhs, .. } => {
-+                        // Comparisons consuming the accumulator (e.g.
-+                        // `if (s != 45)`) were missed by the exit-block-only
-+                        // rewiring: a surviving Cmp operand kept the vector
-+                        // accumulator, emitted as leaq (vectors are
-+                        // addressed) — comparing a stack address instead of
-+                        // the sum (regr_v2_reduction_two_sums regression).
-+                        if replace_in_operand(lhs, acc_id, sum_rem_phi) { updates += 1; }
-+                        if replace_in_operand(rhs, acc_id, sum_rem_phi) { updates += 1; }
-+                    }
-+                    Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => {
-+                        if replace_in_operand(src, acc_id, sum_rem_phi) { updates += 1; }
-+                    }
-+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
-+                        for a in &mut info.args {
-+                            if replace_in_operand(a, acc_id, sum_rem_phi) { updates += 1; }
-+                        }
-+                    }
-+                    Instruction::Phi { incoming, .. } => {
-+                        for (op, _) in incoming {
-+                            if replace_in_operand(op, acc_id, sum_rem_phi) { updates += 1; }
-+                        }
-+                    }
-+                    Instruction::Select { cond, true_val, false_val, .. } => {
-+                        if replace_in_operand(cond, acc_id, sum_rem_phi) { updates += 1; }
-+                        if replace_in_operand(true_val, acc_id, sum_rem_phi) { updates += 1; }
-+                        if replace_in_operand(false_val, acc_id, sum_rem_phi) { updates += 1; }
-                     }
-+                    _ => {}
-                 }
--                _ => {}
-             }
--        }
--
--        // Also update terminator
--        match &mut exit_block.terminator {
--            Terminator::Return(Some(op)) => {
--                if replace_in_operand(op, pattern.accumulator_phi.0, sum_rem_phi) {
--                    updates += 1;
-+            match &mut block.terminator {
-+                Terminator::Return(Some(op)) => {
-+                    if replace_in_operand(op, acc_id, sum_rem_phi) { updates += 1; }
-                 }
--            }
--            Terminator::CondBranch { cond, .. } => {
--                if replace_in_operand(cond, pattern.accumulator_phi.0, sum_rem_phi) {
--                    updates += 1;
-+                Terminator::CondBranch { cond, .. } => {
-+                    if replace_in_operand(cond, acc_id, sum_rem_phi) { updates += 1; }
-                 }
-+                Terminator::Switch { val, .. } => {
-+                    if replace_in_operand(val, acc_id, sum_rem_phi) { updates += 1; }
-+                }
-+                _ => {}
-             }
--            _ => {}
-         }
- 
-         if debug {
--            eprintln!("[VEC-RED]   Updated {} uses of accumulator in exit block", updates);
-+            eprintln!("[VEC-RED]   Rewired {} uses of accumulator outside the loop", updates);
-         }
-     }
- 
-@@ -2944,6 +2972,12 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
-     // Keep track of the next available Value and BlockId
-     let mut next_val_id = func.next_value_id;
-     let mut next_label = func.next_label;
-+    // Defensive: never trust func.next_label alone — some IR producers can
-+    // leave it stale relative to the blocks actually present. Allocating
-+    // below an existing label duplicates it and corrupts the CFG
-+    // (lea_sib_fold -O2 self-loop regression).
-+    let max_present_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
-+    next_label = std::cmp::max(next_label, max_present_label + 1);
- 
-     // Determine vector width and intrinsics based on element type
-     // NOTE: These are only used for pattern matching - the actual transform uses Vec* variants
-@@ -3454,6 +3488,12 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
-     // Keep track of the next available Value and BlockId
-     let mut next_val_id = func.next_value_id;
-     let mut next_label = func.next_label;
-+    // Defensive: never trust func.next_label alone — some IR producers can
-+    // leave it stale relative to the blocks actually present. Allocating
-+    // below an existing label duplicates it and corrupts the CFG
-+    // (lea_sib_fold -O2 self-loop regression).
-+    let max_present_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
-+    next_label = std::cmp::max(next_label, max_present_label + 1);
- 
-     // Determine vector width and intrinsics based on element type (SSE2 = half of AVX2)
-     let (vec_width, load_intrinsic, add_intrinsic, mul_intrinsic, horizontal_intrinsic) = match pattern.element_type {
-@@ -3962,6 +4002,114 @@ pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
-         return 0;
-     }
- 
-+    // Volatile memory accesses are observable side effects: vectorizing a
-+    // loop that reads or writes volatile objects changes the number, width,
-+    // and order of memory accesses (C11 6.7.3p7: "Any attempt to refer to a
-+    // volatile object through a non-volatile lvalue is undefined behaviour"
-+    // — a vector load is exactly such an access). Bail out for any function
-+    // whose loop loads/stores chain to a volatile alloca.
-+    // (Reproducer: tests/correctness volatile_access — volatile int array
-+    // sum produced garbage at -O2 when vectorized.)
-+    if func_has_volatile_loop_access(func) {
-+        return 0;
-+    }
-+
-     let cfg = CfgAnalysis::build(func);
-     vectorize_with_analysis(func, &cfg)
- }
-+
-+/// True if any Load/Store in `func` chains (through GEP/Cast/Copy) to an
-+/// alloca declared `volatile` or `semantic_volatile`. Such loops must never be
-+/// vectorized: vector loads/stores would observe or mutate volatile objects
-+/// with different width/count/order than the source program.
-+fn func_has_volatile_loop_access(func: &IrFunction) -> bool {
-+    use crate::ir::instruction::Instruction;
-+
-+    let mut volatile_allocas: FxHashSet<u32> = FxHashSet::default();
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            if let Instruction::Alloca {
-+                dest,
-+                volatile,
-+                semantic_volatile,
-+                ..
-+            } = inst
-+            {
-+                if *volatile || *semantic_volatile {
-+                    volatile_allocas.insert(dest.0);
-+                }
-+            }
-+        }
-+    }
-+    if volatile_allocas.is_empty() {
-+        return false;
-+    }
-+
-+    // Union-find style root map: pointer value -> alloca root it derives from.
-+    let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
-+    fn find(parent: &mut FxHashMap<u32, u32>, v: u32) -> u32 {
-+        let mut root = v;
-+        while let Some(&p) = parent.get(&root) {
-+            if p == root {
-+                break;
-+            }
-+            root = p;
-+        }
-+        // Path compression.
-+        let mut cur = v;
-+        while let Some(&p) = parent.get(&cur) {
-+            if p == root {
-+                break;
-+            }
-+            parent.insert(cur, root);
-+            cur = p;
-+        }
-+        root
-+    }
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            let (dest, base): (Option<u32>, Option<u32>) = match inst {
-+                Instruction::GetElementPtr { dest, base, .. } => (Some(dest.0), Some(base.0)),
-+                Instruction::Cast { dest, src, .. } => {
-+                    if let Operand::Value(v) = src {
-+                        (Some(dest.0), Some(v.0))
++                // Reg cache check for accumulator (value already in %rax)
++                if self.state.reg_cache.acc_has(v.0, is_alloca) {
++                    let gpr = if xmm == "xmm0" { "rax" } else { "rcx" };
++                    let gpr32 = if xmm == "xmm0" { "eax" } else { "ecx" };
++                    if ty == IrType::F32 {
++                        self.state.emit_fmt(format_args!("    movd %{}, %{}", gpr32, xmm));
 +                    } else {
-+                        (None, None)
++                        self.state.emit_fmt(format_args!("    movq %{}, %{}", gpr, xmm));
 +                    }
++                    return;
 +                }
-+                Instruction::Copy { dest, src } => {
-+                    if let Operand::Value(v) = src {
-+                        (Some(dest.0), Some(v.0))
-+                    } else {
-+                        (None, None)
-+                    }
++                // Fallback: GPR → XMM path (handles GPR register-allocated values
++                // and any other case not covered above)
++                let gpr = if xmm == "xmm0" { "rax" } else { "rcx" };
++                let gpr32 = if xmm == "xmm0" { "eax" } else { "ecx" };
++                if gpr == "rax" {
++                    self.operand_to_rax(op);
++                } else {
++                    self.operand_to_rcx(op);
 +                }
-+                _ => (None, None),
-+            };
-+            if let (Some(d), Some(b)) = (dest, base) {
-+                let rb = find(&mut parent, b);
-+                parent.insert(d, rb);
-+                // The alloca itself is its own root.
-+                parent.entry(rb).or_insert(rb);
-+            }
-+        }
-+    }
-+
-+    // Any Load/Store whose pointer chains to a volatile alloca disqualifies
-+    // the whole function from vectorization.
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            let ptr: Option<u32> = match inst {
-+                Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => Some(ptr.0),
-+                _ => None,
-+            };
-+            if let Some(p) = ptr {
-+                let root = find(&mut parent, p);
-+                if volatile_allocas.contains(&root) {
-+                    return true;
++                if ty == IrType::F32 {
++                    self.state.emit_fmt(format_args!("    movd %{}, %{}", gpr32, xmm));
++                } else {
++                    self.state.emit_fmt(format_args!("    movq %{}, %{}", gpr, xmm));
 +                }
 +            }
+             _ => {
+-                // Fall back to GPR → XMM path
++                // Other operand kinds (e.g. Const::I64 for bitcast): GPR → XMM
+                 let gpr = if xmm == "xmm0" { "rax" } else { "rcx" };
+                 let gpr32 = if xmm == "xmm0" { "eax" } else { "ecx" };
+                 if gpr == "rax" {
+diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
+index 2199939b..2f2a1579 100644
+--- a/src/backend/x86/codegen/memory.rs
++++ b/src/backend/x86/codegen/memory.rs
+@@ -1232,16 +1232,14 @@ impl X86Codegen {
+             let mut remaining = size;
+             while remaining > 0 {
+                 if remaining >= 32 {
++                    // Use AVX2 256-bit vmovdqu for 32-byte chunks (1 instruction
++                    // instead of 2x movdqu). ymm scratch: ymm0 = xmm0's extension.
+                     if offset == 0 {
+-                        self.state.emit("    movdqu (%rsi), %xmm0");
+-                        self.state.emit("    movdqu %xmm0, (%rdi)");
+-                        self.state.emit("    movdqu 16(%rsi), %xmm0");
+-                        self.state.emit("    movdqu %xmm0, 16(%rdi)");
++                        self.state.emit("    vmovdqu (%rsi), %ymm0");
++                        self.state.emit("    vmovdqu %ymm0, (%rdi)");
+                     } else {
+-                        self.state.emit_fmt(format_args!("    movdqu {}(%rsi), %xmm0", offset));
+-                        self.state.emit_fmt(format_args!("    movdqu %xmm0, {}(%rdi)", offset));
+-                        self.state.emit_fmt(format_args!("    movdqu {}(%rsi), %xmm0", offset+16));
+-                        self.state.emit_fmt(format_args!("    movdqu %xmm0, {}(%rdi)", offset+16));
++                        self.state.emit_fmt(format_args!("    vmovdqu {}(%rsi), %ymm0", offset));
++                        self.state.emit_fmt(format_args!("    vmovdqu %ymm0, {}(%rdi)", offset));
+                     }
+                     offset += 32;
+                     remaining -= 32;
+@@ -1298,8 +1296,64 @@ impl X86Codegen {
+                 }
+             }
+         } else {
+-            self.state.out.emit_instr_imm_reg("    movq", size as i64, "rcx");
+-            self.state.emit("    rep movsb");
++            // For copies > 64 bytes, use an unrolled AVX2 loop instead of rep movsb.
++            // This is faster for medium copies (65-512 bytes) because vmovdqu ymm
++            // has higher throughput than rep movsb on modern Intel CPUs without ERMS.
++            // Each iteration copies 64 bytes (2x vmovdqu 32-byte).
++            let full_chunks = size / 64;
++            let remainder = size % 64;
++
++            // Unrolled loop: copy 64 bytes per iteration
++            if full_chunks > 0 {
++                self.state.out.emit_instr_imm_reg("    movq", full_chunks as i64, "rcx");
++                let loop_label = format!(".Lmcpy_loop_{}", self.state.next_label_id());
++                self.state.emit_fmt(format_args!("{}:", loop_label));
++                self.state.emit("    vmovdqu (%rsi), %ymm0");
++                self.state.emit("    vmovdqu %ymm0, (%rdi)");
++                self.state.emit("    vmovdqu 32(%rsi), %ymm1");
++                self.state.emit("    vmovdqu %ymm1, 32(%rdi)");
++                self.state.emit("    addq $64, %rsi");
++                self.state.emit("    addq $64, %rdi");
++                self.state.emit("    decq %rcx");
++                self.state.emit_fmt(format_args!("    jne {}", loop_label));
++            }
++
++            // Handle remainder (0-63 bytes) with scalar/128-bit moves
++            let mut offset = 0usize;
++            let mut remaining = remainder;
++            while remaining > 0 {
++                if remaining >= 32 {
++                    self.state.emit_fmt(format_args!("    vmovdqu {}(%rsi), %ymm0", offset));
++                    self.state.emit_fmt(format_args!("    vmovdqu %ymm0, {}(%rdi)", offset));
++                    offset += 32;
++                    remaining -= 32;
++                } else if remaining >= 16 {
++                    self.state.emit_fmt(format_args!("    movdqu {}(%rsi), %xmm0", offset));
++                    self.state.emit_fmt(format_args!("    movdqu %xmm0, {}(%rdi)", offset));
++                    offset += 16;
++                    remaining -= 16;
++                } else if remaining >= 8 {
++                    self.state.emit_fmt(format_args!("    movq {}(%rsi), %rax", offset));
++                    self.state.emit_fmt(format_args!("    movq %rax, {}(%rdi)", offset));
++                    offset += 8;
++                    remaining -= 8;
++                } else if remaining >= 4 {
++                    self.state.emit_fmt(format_args!("    movl {}(%rsi), %eax", offset));
++                    self.state.emit_fmt(format_args!("    movl %eax, {}(%rdi)", offset));
++                    offset += 4;
++                    remaining -= 4;
++                } else if remaining >= 2 {
++                    self.state.emit_fmt(format_args!("    movw {}(%rsi), %ax", offset));
++                    self.state.emit_fmt(format_args!("    movw %ax, {}(%rdi)", offset));
++                    offset += 2;
++                    remaining -= 2;
++                } else {
++                    self.state.emit_fmt(format_args!("    movb {}(%rsi), %al", offset));
++                    self.state.emit_fmt(format_args!("    movb %al, {}(%rdi)", offset));
++                    offset += 1;
++                    remaining -= 1;
++                }
++            }
+         }
+     }
+ 
+diff --git a/tests/regression/fp_domain_crossing.c b/tests/regression/fp_domain_crossing.c
+new file mode 100644
+index 00000000..834d0f55
+--- /dev/null
++++ b/tests/regression/fp_domain_crossing.c
+@@ -0,0 +1,140 @@
++// FP domain-crossing regression test — catches bugs from XMM↔GPR value-flow
++// optimizations.  Covers: chained FP binops, FP accumulators in loops,
++// int→float casts feeding FP chains, FP in nested loops with struct access,
++// FP values live across function calls (sqrt).
++// Expected output: all lines "OK"
++#include <stdio.h>
++#include <math.h>
++#include <string.h>
++
++#define CHECK(tag, got, expect, tol) do { \
++    double _d = (got) - (expect); \
++    if (_d < 0) _d = -_d; \
++    printf("%s: %s (got=%.15e expect=%.15e diff=%.3e)\n", \
++           tag, _d <= (tol) ? "OK" : "FAIL", (double)(got), (double)(expect), _d); \
++} while(0)
++
++// Test 1: simple chained FP ops (add, mul, sub, div)
++static double fp_chain(double a, double b, double c) {
++    double x = a + b;    // FP add
++    double y = x * c;    // FP mul
++    double z = y - a;    // FP sub
++    double w = z / b;    // FP div
++    return w;
++}
++
++// Test 2: FP accumulator in a loop (reduction pattern)
++static double fp_accum(int n) {
++    double sum = 0.0;
++    for (int i = 1; i <= n; i++) {
++        sum += 1.0 / (double)i;
++    }
++    return sum;
++}
++
++// Test 3: FP values from int→float cast flowing into FP ops
++static double int_to_fp_chain(int a, int b, int c) {
++    double da = (double)a;
++    double db = (double)b;
++    double dc = (double)c;
++    return da * db + dc;
++}
++
++// Test 4: FP in nested loop with struct-like memory access
++typedef struct { double x, y, z, vx, vy, vz, mass; } Body;
++static Body test_bodies[3] = {
++    { 1.0, 2.0, 3.0, 0.1, 0.2, 0.3, 100.0 },
++    { 4.0, 5.0, 6.0, 0.4, 0.5, 0.6, 200.0 },
++    { 7.0, 8.0, 9.0, 0.7, 0.8, 0.9, 300.0 },
++};
++
++static double nested_struct_fp(int n) {
++    double e = 0.0;
++    for (int step = 0; step < n; step++) {
++        for (int i = 0; i < 3; i++) {
++            for (int j = i + 1; j < 3; j++) {
++                double dx = test_bodies[i].x - test_bodies[j].x;
++                double dy = test_bodies[i].y - test_bodies[j].y;
++                double dz = test_bodies[i].z - test_bodies[j].z;
++                double d2 = dx*dx + dy*dy + dz*dz;
++                double mag = 0.01 / (d2 * sqrt(d2));
++                test_bodies[i].vx -= dx * test_bodies[j].mass * mag;
++                test_bodies[i].vy -= dy * test_bodies[j].mass * mag;
++                test_bodies[i].vz -= dz * test_bodies[j].mass * mag;
++                test_bodies[j].vx += dx * test_bodies[i].mass * mag;
++                test_bodies[j].vy += dy * test_bodies[i].mass * mag;
++                test_bodies[j].vz += dz * test_bodies[i].mass * mag;
++            }
++        }
++        for (int i = 0; i < 3; i++) {
++            test_bodies[i].x += 0.01 * test_bodies[i].vx;
++            test_bodies[i].y += 0.01 * test_bodies[i].vy;
++            test_bodies[i].z += 0.01 * test_bodies[i].vz;
 +        }
 +    }
-+    false
++    for (int i = 0; i < 3; i++) {
++        e += test_bodies[i].x + test_bodies[i].vx;
++    }
++    return e;
 +}
-diff --git a/tests/regression/lea_sib_fold.s b/tests/regression/lea_sib_fold.s
-new file mode 100644
-index 00000000..d469d46f
---- /dev/null
-+++ b/tests/regression/lea_sib_fold.s
-@@ -0,0 +1,148 @@
-+.section .rodata
-+.Lstr0:
-+    .byte 37, 100, 32, 37, 100, 10, 0
 +
-+.section .text
-+.globl main
-+.type main, @function
-+main:
-+.cfi_startproc
-+    pushq %rbx
-+    pushq %r12
-+    pushq %r13
-+    pushq %r14
-+    pushq %r15
-+    pushq %rbp
-+    subq $264, %rsp
-+    .cfi_def_cfa_offset 320
-+    movl $1, 216(%rsp)
-+    movl $2, 220(%rsp)
-+    movl $3, 224(%rsp)
-+    movl $4, 228(%rsp)
-+    movl $5, 232(%rsp)
-+    movl $6, 236(%rsp)
-+    movl $7, 240(%rsp)
-+    movl $8, 244(%rsp)
-+    movl $9, 248(%rsp)
-+    leaq .Lstr0(%rip), %r14
-+    vpxor %ymm0, %ymm0, %ymm0
-+    leaq 184(%rsp), %rdx
-+    vmovdqu %ymm0, (%rdx)
-+    vpxor %ymm0, %ymm0, %ymm0
-+    vmovupd 184(%rsp), %ymm0
-+    vmovupd %ymm0, 152(%rsp)
-+    xorl %r13d, %r13d
-+.LBB1:
-+    cmpl $1, %r13d
-+jge .LBB1
-+.LBB2:
-+    movslq %r13d, %r8
-+    movq %r8, %r9
-+    shlq $5, %r9
-+    leaq 216(%rsp), %rcx
-+    movq %r9, %rax
-+    addq %rcx, %rax
-+    movq %rax, %rdi
-+    xorl %ecx, %ecx
-+    vmovdqu (%rax,%rcx), %ymm0
-+    leaq 120(%rsp), %rdx
-+    vmovdqu %ymm0, (%rdx)
-+    leaq 152(%rsp), %rax
-+    vmovdqu (%rax), %ymm0
-+    leaq 120(%rsp), %rcx
-+    leaq 120(%rsp), %rcx
-+    vmovdqu (%rcx), %ymm1
-+    vpaddd %ymm1, %ymm0, %ymm0
-+    leaq 88(%rsp), %rdx
-+    vmovdqu %ymm0, (%rdx)
-+    movq %r13, %rax
-+    addl $1, %eax
-+    cltq
-+    movq %rax, 80(%rsp)
-+    jmp .LBB1
-+.LBB3:
-+    testl %esi, %esi
-+jge .LBB3
-+.LBB4:
-+    movslq %esi, %r11
-+    movq %r11, %r10
-+    shlq $5, %r10
-+    movq %r10, %rax
-+    addq %rcx, %rax
-+    movq %rax, %r8
-+    xorl %ecx, %ecx
-+    vmovdqu (%rax,%rcx), %ymm0
-+    leaq 48(%rsp), %rdx
-+    vmovdqu %ymm0, (%rdx)
-+    leaq 16(%rsp), %rax
-+    vmovdqu (%rax), %ymm0
-+    leaq 48(%rsp), %rcx
-+    leaq 48(%rsp), %rcx
-+    vmovdqu (%rcx), %ymm1
-+    vpaddd %ymm1, %ymm0, %ymm0
-+    leaq 16(%rsp), %rdx
-+    vmovdqu %ymm0, (%rdx)
-+    addl $4, %esi
-+    jmp .LBB3
-+.LBB5:
-+    movq %r14, %rdi
-+    leaq 152(%rsp), %rsi
-+    movq %r12, %rdx
-+    xorl %eax, %eax
-+    call printf
-+    xorl %eax, %eax
-+    addq $264, %rsp
-+    popq %rbp
-+    popq %r15
-+    popq %r14
-+    popq %r13
-+    popq %r12
-+    popq %rbx
-+    ret
-+.LBB1:
-+    vmovdqu 152(%rsp), %ymm0
-+    vextracti128 $1, %ymm0, %xmm1
-+    vpaddd %xmm1, %xmm0, %xmm0
-+    vpsrldq $8, %xmm0, %xmm1
-+    vpaddd %xmm1, %xmm0, %xmm0
-+    vpsrldq $4, %xmm0, %xmm1
-+    vpaddd %xmm1, %xmm0, %xmm0
-+    vmovd %xmm0, %eax
-+    movq %rax, 8(%rsp)
-+    movl %r13d, %r9d
-+    shll $3, %r9d
-+    movq %r9, %r15
-+    movq %rax, %rbp
-+.LBB2:
-+    cmpl $9, %r15d
-+jge .LBB3
-+.LBB6:
-+    movslq %r15d, %rsi
-+    movq %rsi, %rdx
-+    shlq $2, %rdx
-+    leaq 216(%rsp), %rcx
-+    movl (%rcx, %rdx), %r10d
-+    addl %r10d, %ebp
-+    addl $1, %r15d
-+    jmp .LBB2
-+.LBB3:
-+    movslq %ebx, %r8
-+    movq %r8, %r9
-+    shlq $2, %r9
-+    movl (%rcx, %r9), %esi
-+    addl %esi, %r12d
-+.LBB4:
-+    addl $4, %ebx
-+    cmpl $5, %ebx
-+jl .LBB3
-+    jmp .LBB5
-+.LBB7:
-+    vmovupd 88(%rsp), %ymm0
-+    vmovupd %ymm0, 152(%rsp)
-+    movq 80(%rsp), %r13
-+    jmp .LBB1
-+.cfi_endproc
-+.size main, .-main
-+
-+
-+.section .note.GNU-stack,"",@progbits
-diff --git a/tests/regression/regr_v1_volatile_loop.c b/tests/regression/regr_v1_volatile_loop.c
-new file mode 100644
-index 00000000..e02f1e70
---- /dev/null
-+++ b/tests/regression/regr_v1_volatile_loop.c
-@@ -0,0 +1,17 @@
-+/* Regression (v1): the auto-vectorizer must NEVER vectorize loops touching
-+ * volatile objects (C11 6.7.3p7: a vector load/store observes volatile
-+ * memory with a different width/count/order than the source program).
-+ * Failing shape (pre-fix): volatile int array reduction at -O2 printed a
-+ * garbage sum (correctness test volatile_access: 884305999 instead of 15).
-+ * The vectorizer had zero volatile awareness; the legality gate
-+ * func_has_volatile_loop_access() was added in the fix. */
-+#include <stdio.h>
-+
-+int main(void) {
-+    volatile int arr[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-+    int sum = 0;
-+    for (int i = 0; i < 8; i++) sum += arr[i];
-+    if (sum != 36) { printf("FAIL sum=%d\n", sum); return 1; }
-+    printf("PASS volatile_loop\n");
-+    return 0;
++// Test 5: FP values live across sqrt call (call-spanning XMM issue)
++static double fp_across_call(double a, double b, double c) {
++    double before = a * b + c;
++    double s = sqrt(before);
++    double after = s * a - b;
++    return after;
 +}
-diff --git a/tests/regression/regr_v2_abs_symbol_value.c b/tests/regression/regr_v2_abs_symbol_value.c
-new file mode 100644
-index 00000000..73f18c97
---- /dev/null
-+++ b/tests/regression/regr_v2_abs_symbol_value.c
-@@ -0,0 +1,28 @@
-+/* Regression (v2): numeric `.set sym, <number>` top-level asm symbols
-+ * (glibc _NL_CURRENT_DEFINE style) are ABSOLUTE symbols: their address IS
-+ * their value (ELF spec). Under the PIC default they must be emitted as
-+ * `movq $sym` — a GOTPCREL reference cannot be resolved for an absolute
-+ * symbol (original bug: "undefined symbols: 4660, 7" at link;
-+ * glibc_abs_symbol.c covers the nonzero form).
-+ *
-+ * This test asserts the exact ELF values (7 and 0x1234). NOTE: GCC 16.1.1
-+ * on this host cannot pass it — its ld rebases absolute-symbol references
-+ * by the load base even for non-PIE executables (proven reduced-case
-+ * baseline defect: a=4198498 for value 7 with -Wl,-no-pie). LCCC emits the
-+ * ELF-correct `movq $sym`. */
-+#include <stdio.h>
 +
-+extern char _nl_test_abs_1;
-+extern char _nl_test_abs_2;
-+
-+__asm__(".globl _nl_test_abs_1\n.set _nl_test_abs_1, 7");
-+__asm__(".globl _nl_test_abs_2\n.set _nl_test_abs_2, 0x1234");
-+
-+int main(void) {
-+    volatile unsigned long a = (unsigned long)&_nl_test_abs_1;
-+    volatile unsigned long b = (unsigned long)&_nl_test_abs_2;
-+    if (a != 7) { printf("FAIL a=%lu\n", a); return 1; }
-+    if (b != 0x1234) { printf("FAIL b=%lu\n", b); return 2; }
-+    printf("PASS abs_symbol_value\n");
-+    return 0;
-+}
-diff --git a/tests/regression/regr_v2_abs_symbol_value.flags b/tests/regression/regr_v2_abs_symbol_value.flags
-new file mode 100644
-index 00000000..e69de29b
-diff --git a/tests/regression/regr_v2_loop_alloca_scalar.c b/tests/regression/regr_v2_loop_alloca_scalar.c
-new file mode 100644
-index 00000000..c23a7344
---- /dev/null
-+++ b/tests/regression/regr_v2_loop_alloca_scalar.c
-@@ -0,0 +1,30 @@
-+/* Regression (v2): allocas whose single use-block is inside a LOOP must not
-+ * be placed in the shared block-local slot region. That region reuses
-+ * offsets across blocks under the assumption of exclusive execution; a loop
-+ * body re-enters, so a loop-carried alloca (written in iteration N, read in
-+ * N+1) is clobbered by another block's value at the same offset.
-+ * (vector_defer_multidef_slot: adler32's loop-body temps and loop-carried
-+ * slots aliased across the wide/narrow loop blocks.)
-+ * Scalar shape: two loops, each with a block-local array alloca, sharing
-+ * the block-local region; loop 1's array must survive into loop 2. */
-+#include <stdio.h>
-+
-+static int two_loops(int n) {
-+    int acc = 0;
++// Test 6: FP phi (loop-carried FP value)
++static double fp_phi_loop(double start, int n) {
++    double val = start;
 +    for (int i = 0; i < n; i++) {
-+        int a[2] = {i, i + 1};          /* block-local alloca in loop 1 */
-+        acc += a[0] + a[1];
++        val = val * 1.0000001 + 0.0000001;
 +    }
-+    for (int i = 0; i < n; i++) {
-+        int b[2] = {2 * i, 2 * i + 1};  /* block-local alloca in loop 2 */
-+        acc += b[0] + b[1];
-+    }
-+    return acc;
++    return val;
++}
++
++// Test 7: FP select/conditional
++static double fp_select(double a, double b, int cond) {
++    double x = cond ? a : b;
++    return x * 2.0;
++}
++
++// Test 8: FP comparison
++static double fp_cmp(double a, double b) {
++    if (a > b) return a - b;
++    return b - a;
 +}
 +
 +int main(void) {
-+    int r = two_loops(10);   /* loop1: 100, loop2: 190 -> 290 */
-+    if (r != 290) { printf("FAIL r=%d\n", r); return 1; }
-+    printf("PASS loop_alloca_scalar\n");
-+    return 0;
-+}
-diff --git a/tests/regression/regr_v2_m64.c b/tests/regression/regr_v2_m64.c
-new file mode 100644
-index 00000000..9bafe67c
---- /dev/null
-+++ b/tests/regression/regr_v2_m64.c
-@@ -0,0 +1,10 @@
-+/* Regression (v2): the driver rejected `-m64` ("unsupported machine option"),
-+ * breaking zlib-ng's configure which passes -m64 on x86-64. -m64 is the
-+ * default target; it must be accepted as a no-op like -m32 selects i686.
-+ * (flags file adds -m64.) */
-+#include <stdio.h>
-+int main(void) {
-+    if (sizeof(void *) != 8) { printf("FAIL not 64-bit\n"); return 1; }
-+    printf("PASS m64\n");
-+    return 0;
-+}
-diff --git a/tests/regression/regr_v2_m64.flags b/tests/regression/regr_v2_m64.flags
-new file mode 100644
-index 00000000..d9b41fc2
---- /dev/null
-+++ b/tests/regression/regr_v2_m64.flags
-@@ -0,0 +1 @@
-+-m64
-diff --git a/tests/regression/regr_v2_memcpy_chain_crossblock.c b/tests/regression/regr_v2_memcpy_chain_crossblock.c
-new file mode 100644
-index 00000000..180b1447
---- /dev/null
-+++ b/tests/regression/regr_v2_memcpy_chain_crossblock.c
-@@ -0,0 +1,37 @@
-+/* Regression (v2): copy_prop::forward_memcpy_chains rewrote
-+ *   memcpy tmp, src; memcpy dst, tmp   ->   memcpy dst, src
-+ * checking only SAME-BLOCK uses of tmp. Loop bodies in OTHER blocks reading
-+ * the variable slot then observed a deleted store: the slot was never
-+ * updated (zlib-ng adler32's vs1 slot stale while both loops kept reading
-+ * it -> wide-loop sums corrupted).
-+ * Fix: the rewrite now requires a FUNCTION-WIDE use count of exactly 2
-+ * (the first memcpy dest + the consumer's src). */
-+#include <immintrin.h>
-+#include <stdint.h>
-+
-+static __m128i loop_chain(__m128i x, __m128i y) {
-+    __m128i s = y;
-+    __m128i o = _mm_setzero_si128();
-+    __m128i r = _mm_setzero_si128();
-+    for (int i = 0; i < 64; i++) {
-+        s = _mm_add_epi32(s, x);   /* s = s + x  (chain of slot copies) */
-+        o = s;                     /* copy o <- s (forwarded through tmp) */
-+        r = _mm_add_epi32(r, o);   /* adjacent consumer */
-+    }
-+    /* cross-block read of s's slot: the chain rewrite must NOT have deleted
-+     * the store that keeps s live across this second loop's iterations. */
-+    for (int i = 0; i < 64; i++) {
-+        r = _mm_add_epi32(r, s);
-+    }
-+    return r;
-+}
-+
-+int main(void) {
-+    __m128i x = _mm_set1_epi32(1);
-+    __m128i y = _mm_set1_epi32(0);
-+    __m128i r = loop_chain(x, y);
-+    /* loop1: s = 1..64, o = s, r = sum(1..64) = 2080.
-+     * loop2: r += s (64) each of 64 iters -> +4096.  Total 6176 lane0. */
-+    if (_mm_cvtsi128_si32(r) != 6176) return 1;
-+    return 0;
-+}
-diff --git a/tests/regression/regr_v2_pic_extern_addr.c b/tests/regression/regr_v2_pic_extern_addr.c
-new file mode 100644
-index 00000000..4c2302e6
---- /dev/null
-+++ b/tests/regression/regr_v2_pic_extern_addr.c
-@@ -0,0 +1,18 @@
-+/* Guard test (v2): address-of-extern and global access must work under the
-+ * default PIC code model (GOTPCREL for external symbols). Exercises the
-+ * needs_got_for_addr path that the PIC-default change made the common case,
-+ * including a call through a function pointer stored in a global. */
-+#include <stdio.h>
-+
-+int g_val = 7;
-+static int (*g_fn)(int) = 0;
-+
-+static int add7(int x) { return x + g_val; }
-+
-+int main(void) {
-+    g_fn = add7;
-+    if ((*g_fn)(35) != 42) { printf("FAIL fnptr\n"); return 1; }
-+    if (g_val != 7) { printf("FAIL global\n"); return 2; }
-+    printf("PASS pic_extern_addr\n");
-+    return 0;
-+}
-diff --git a/tests/regression/regr_v2_reduction_two_sums.c b/tests/regression/regr_v2_reduction_two_sums.c
-new file mode 100644
-index 00000000..a431ba2a
---- /dev/null
-+++ b/tests/regression/regr_v2_reduction_two_sums.c
-@@ -0,0 +1,22 @@
-+/* Regression (v2): reduction vectorization rewired uses of the (now vector)
-+ * accumulator ONLY in the loop exit block. With two inlined reductions the
-+ * consumer (here the return-value select) lives in a later block and kept
-+ * reading the vector accumulator — the backend ADDRESSES vectors (leaq),
-+ * so the result was a stack address instead of the sum.
-+ * Failing shape (pre-fix): lea_sib_fold printed -1728274848 instead of 45. */
-+static int sum(const int *p, int n) {
-+    int s = 0;
-+    for (int i = 0; i < n; i++) s += p[i];
-+    return s;
-+}
-+
-+int main(void) {
-+    int a[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
-+    int b[9] = {9, 8, 7, 6, 5, 4, 3, 2, 1};
-+    int s1 = sum(a, 9);
-+    int s2 = sum(b, 9);
-+    /* consumer in a later block, after both vectorized loops */
-+    if (s1 != 45 || s2 != 45) return 1;
-+    if (s1 + s2 != 90) return 2;
-+    return 0;
-+}
-diff --git a/tests/regression/regr_v2_stateleak.c b/tests/regression/regr_v2_stateleak.c
-new file mode 100644
-index 00000000..b135d115
---- /dev/null
-+++ b/tests/regression/regr_v2_stateleak.c
-@@ -0,0 +1,37 @@
-+/* Regression (v2): CodegenState per-function sets (vector_values,
-+ * vector128_values, protected_slot_values, vector_defer_values) were never
-+ * cleared by reset_for_function(). Value IDs are function-local, so a scalar
-+ * value in function B whose ID collided with a vector-intrinsic result from
-+ * function A (compiled earlier) was treated as a vector: its Copy was emitted
-+ * via the vector path (LEA instead of LOAD) and the value became the address
-+ * of its own slot.
-+ * Failing shape (pre-fix): zlib-ng-style adler32 (vector_defer_multidef_slot.c)
-+ * — vs2 was initialized with the stack address of its slot (wide-loop lanes
-+ * [0x259b,0x13f,...] instead of the weighted sums).
-+ * This test compiles a tiny vector-using function FIRST so its SSA value IDs
-+ * are small, then a scalar loop whose colliding IDs must stay scalar. */
-+#include <immintrin.h>
-+#include <stdint.h>
-+
-+/* compiled first: small function, small SSA value IDs */
-+static uint32_t vsum(__m128i x) {
-+    __m128i t = _mm_srli_si128(x, 8);
-+    return (uint32_t)_mm_cvtsi128_si32(_mm_add_epi32(x, t));
-+}
-+
-+/* scalar loop whose value IDs overlap the vector function's ID space */
-+static uint32_t scalar_sum(uint32_t n) {
-+    uint32_t s = 0;
-+    for (uint32_t i = 1; i <= n; i++) s += i;
-+    return s;
-+}
-+
-+int main(void) {
-+    __m128i v = _mm_setr_epi32(1, 2, 3, 4);
-+    uint32_t a = vsum(v);
-+    uint32_t b = scalar_sum(100);
-+    if (a != 4) return 1;      /* lane0+lane2 = 1+3 (srli 8) */
-+    if (b != 5050) return 2;   /* pre-fix: stack-address garbage */
-+    if (a + b != 5054) return 3;
-+    return 0;
-+}
-diff --git a/tests/regression/regr_v2_temp_promotion_window.c b/tests/regression/regr_v2_temp_promotion_window.c
-new file mode 100644
-index 00000000..b7695d97
---- /dev/null
-+++ b/tests/regression/regr_v2_temp_promotion_window.c
-@@ -0,0 +1,42 @@
-+/* Regression (v2): vector_temp_promotion redirected an intrinsic's result
-+ * store from a temp slot into the memcpy destination slot and dropped the
-+ * copy — WITHOUT checking whether that destination slot is read or written
-+ * in between (the "window"). The narrow-loop sequence
-+ *   vs1 = sad + vs1; ...; vs3 = vs1_0 + vs3; vs1_0 = vs1
-+ * redirected the vs1 update into vs1_0's slot; vs3 then read the NEW value
-+ * too early -> wrong adler32 (vector_defer_multidef_slot regression).
-+ * Fix: no_var_access_between(intrinsic, memcpy, dest) window check. */
-+#include <immintrin.h>
-+#include <stdint.h>
-+
-+static uint32_t narrow_chain(uint32_t adler, const uint8_t *buf) {
-+    uint32_t sum2 = 0;
-+    __m128i vs1 = _mm_cvtsi32_si128((int)adler);
-+    __m128i vs1_0 = vs1;
-+    __m128i vs3 = _mm_setzero_si128();
-+    __m128i zero = _mm_setzero_si128();
-+
-+    for (int k = 0; k < 32; k += 16) {
-+        __m128i vbuf = _mm_loadu_si128((const __m128i *)(buf + k));
-+        __m128i sad = _mm_sad_epu8(vbuf, zero);
-+        vs1 = _mm_add_epi32(sad, vs1);      /* def of new vs1 (temp) */
-+        vs3 = _mm_add_epi32(vs1_0, vs3);    /* reads vs1_0 in the window */
-+        vs1_0 = vs1;                        /* memcpy vs1_0 <- tmp(vs1) */
-+    }
-+    /* Reference: vs3 = old_vs1_0 (adler) + new_vs1_0 each iteration. With
-+     * correct ordering (vs3 reads vs1_0 BEFORE vs1_0 = vs1), the first
-+     * iteration adds adler, the second adds adler + sad(buf[0..15]).
-+     * The pre-fix promotion redirect wrote the new vs1 into vs1_0's slot
-+     * early, so the second iteration read adler + sad -> different result. */
-+    uint32_t sad_sum = 0;
-+    for (int i = 0; i < 16; i++) sad_sum += buf[i];
-+    uint32_t want = adler + (adler + sad_sum);
-+    uint32_t got = (uint32_t)_mm_cvtsi128_si32(_mm_add_epi32(vs3, _mm_srli_si128(vs3, 8)));
-+    return got == want ? 0 : 1;
-+}
-+
-+int main(void) {
-+    uint8_t buf[32];
-+    for (int i = 0; i < 32; i++) buf[i] = (uint8_t)(i * 7);
-+    return narrow_chain(1000, buf);
-+}
-diff --git a/tests/regression/regr_v2_tls_local_pic.c b/tests/regression/regr_v2_tls_local_pic.c
-new file mode 100644
-index 00000000..839b023a
---- /dev/null
-+++ b/tests/regression/regr_v2_tls_local_pic.c
-@@ -0,0 +1,19 @@
-+/* Regression (v2): under the PIC default, LOCAL TLS symbols (static
-+ * __thread) must use the Local-Exec model (direct %fs:TPOFF) exactly like
-+ * GCC; forcing the GOT-based GOTTPOFF sequence for a local symbol reads the
-+ * wrong slot (globals_tls returned 7: g_tls != 100).
-+ * This test needs default PIC (no -fno-pic): a static __thread read must
-+ * return its initialized value. */
-+#include <stdio.h>
-+
-+static __thread int t_a = 100;
-+static __thread long t_b = 0x123456789;
-+
-+int main(void) {
-+    if (t_a != 100) { printf("FAIL t_a=%d\n", t_a); return 1; }
-+    if (t_b != 0x123456789L) { printf("FAIL t_b=%ld\n", t_b); return 2; }
-+    t_a = 42;
-+    if (t_a != 42) { printf("FAIL t_a write\n"); return 3; }
-+    printf("PASS tls_local_pic\n");
++    // Test 1: fp_chain(1.5, 2.5, 3.0) → x=4, y=12, z=10.5, w=4.2
++    CHECK("fp_chain", fp_chain(1.5, 2.5, 3.0), 4.2, 1e-12);
++    
++    // Test 2: H_n for n=1000 — reference: 7.485470860550345
++    CHECK("fp_accum", fp_accum(1000), 7.485470860550345, 1e-10);
++    
++    // Test 3: 3 * 4 + 5 = 17
++    CHECK("int_to_fp", int_to_fp_chain(3, 4, 5), 17.0, 1e-12);
++    
++    // Test 4: nested struct FP
++    double ns = nested_struct_fp(100);
++    printf("nested_struct: %.15e\n", ns);
++    
++    // Test 5: FP across sqrt call
++    CHECK("fp_across_call", fp_across_call(3.0, 4.0, 5.0), sqrt(17.0)*3.0 - 4.0, 1e-12);
++    
++    // Test 6: FP phi loop
++    double phi = fp_phi_loop(1.0, 1000000);
++    printf("fp_phi: %.15e\n", phi);
++    
++    // Test 7: FP select
++    CHECK("fp_select_t", fp_select(3.0, 4.0, 1), 6.0, 1e-12);
++    CHECK("fp_select_f", fp_select(3.0, 4.0, 0), 8.0, 1e-12);
++    
++    // Test 8: FP comparison
++    CHECK("fp_cmp_a", fp_cmp(5.0, 3.0), 2.0, 1e-12);
++    CHECK("fp_cmp_b", fp_cmp(3.0, 5.0), 2.0, 1e-12);
++    
 +    return 0;
 +}
