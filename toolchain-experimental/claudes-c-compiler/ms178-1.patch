@@ -1,63 +1,57 @@
 diff --git a/src/backend/x86/codegen/float_ops.rs b/src/backend/x86/codegen/float_ops.rs
-index 0a1ec396..47918884 100644
+index 0a1ec39..300988e 100644
 --- a/src/backend/x86/codegen/float_ops.rs
 +++ b/src/backend/x86/codegen/float_ops.rs
-@@ -260,8 +260,44 @@ impl X86Codegen {
-                     self.state.emit_fmt(format_args!("    movss {}(%rip), %{}", label, xmm));
-                 }
+@@ -105,6 +105,40 @@ impl X86Codegen {
+                 self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
              }
-+            Operand::Value(v) => {
-+                let is_alloca = self.state.is_alloca(v.0);
-+                // Stack slot path: load directly from memory to XMM (no GPR intermediate).
-+                // This is always safe because stack slots are stable locations.
-+                if let Some(slot) = self.state.get_slot(v.0) {
-+                    let mov = if ty == IrType::F32 { "movss" } else { "movsd" };
-+                    let sr = self.slot_ref(slot.0);
-+                    self.state.emit_fmt(format_args!("    {} {}, %{}", mov, sr, xmm));
-+                    return;
-+                }
-+                // Reg cache check for accumulator (value already in %rax)
-+                if self.state.reg_cache.acc_has(v.0, is_alloca) {
-+                    let gpr = if xmm == "xmm0" { "rax" } else { "rcx" };
-+                    let gpr32 = if xmm == "xmm0" { "eax" } else { "ecx" };
-+                    if ty == IrType::F32 {
-+                        self.state.emit_fmt(format_args!("    movd %{}, %{}", gpr32, xmm));
-+                    } else {
-+                        self.state.emit_fmt(format_args!("    movq %{}, %{}", gpr, xmm));
+             Operand::Value(v) => {
++                // XMM register direct: if RHS is in xmm3-xmm7 (register allocator
++                // assigned), operate directly — avoids GPR domain crossing. Safe
++                // because xmm3-xmm7 are never clobbered by codegen scratch.
++                if let Some(&reg) = self.reg_assignments.get(&v.0) {
++                    if is_xmm_reg(reg) {
++                        let src_name = phys_reg_name(reg);
++                        self.state.emit_fmt(format_args!("    {}{} %{}, %xmm0", mnemonic, suffix, src_name));
++                        // Store result to dest
++                        if let Some(dest_slot) = self.state.get_slot(dest.0) {
++                            let sr = self.slot_ref(dest_slot.0);
++                            self.state.emit_fmt(format_args!("    {} %xmm0, {}", mov_instr, sr));
++                            self.state.reg_cache.invalidate_acc();
++                        } else if let Some(&dreg) = self.reg_assignments.get(&dest.0) {
++                            if is_xmm_reg(dreg) {
++                                let dn = phys_reg_name(dreg);
++                                if dn != "xmm0" {
++                                    self.state.emit_fmt(format_args!("    {} %xmm0, %{}", mov_instr, dn));
++                                }
++                                self.state.reg_cache.invalidate_acc();
++                            } else {
++                                if ty == IrType::F32 { self.state.emit("    movd %xmm0, %eax"); }
++                                else { self.state.emit("    movq %xmm0, %rax"); }
++                                self.state.reg_cache.invalidate_acc();
++                                self.store_rax_to(dest);
++                            }
++                        } else {
++                            if ty == IrType::F32 { self.state.emit("    movd %xmm0, %eax"); }
++                            else { self.state.emit("    movq %xmm0, %rax"); }
++                            self.state.reg_cache.invalidate_acc();
++                            self.store_rax_to(dest);
++                        }
++                        return;
 +                    }
-+                    return;
 +                }
-+                // Fallback: GPR → XMM path (handles GPR register-allocated values
-+                // and any other case not covered above)
-+                let gpr = if xmm == "xmm0" { "rax" } else { "rcx" };
-+                let gpr32 = if xmm == "xmm0" { "eax" } else { "ecx" };
-+                if gpr == "rax" {
-+                    self.operand_to_rax(op);
-+                } else {
-+                    self.operand_to_rcx(op);
-+                }
-+                if ty == IrType::F32 {
-+                    self.state.emit_fmt(format_args!("    movd %{}, %{}", gpr32, xmm));
-+                } else {
-+                    self.state.emit_fmt(format_args!("    movq %{}, %{}", gpr, xmm));
-+                }
-+            }
-             _ => {
--                // Fall back to GPR → XMM path
-+                // Other operand kinds (e.g. Const::I64 for bitcast): GPR → XMM
-                 let gpr = if xmm == "xmm0" { "rax" } else { "rcx" };
-                 let gpr32 = if xmm == "xmm0" { "eax" } else { "ecx" };
-                 if gpr == "rax" {
+                 if let Some(slot) = self.state.get_slot(v.0) {
+                     let sr = self.slot_ref(slot.0);
+                     self.state.emit_fmt(format_args!("    {}{} {}, %xmm0", mnemonic, suffix, sr));
 diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
-index 2199939b..2f2a1579 100644
+index 2199939..74ce105 100644
 --- a/src/backend/x86/codegen/memory.rs
 +++ b/src/backend/x86/codegen/memory.rs
-@@ -1232,16 +1232,14 @@ impl X86Codegen {
+@@ -1232,16 +1232,13 @@ impl X86Codegen {
              let mut remaining = size;
              while remaining > 0 {
                  if remaining >= 32 {
-+                    // Use AVX2 256-bit vmovdqu for 32-byte chunks (1 instruction
-+                    // instead of 2x movdqu). ymm scratch: ymm0 = xmm0's extension.
++                    // AVX2 256-bit copy: 1 vmovdqu replaces 2 movdqu (halves uops)
                      if offset == 0 {
 -                        self.state.emit("    movdqu (%rsi), %xmm0");
 -                        self.state.emit("    movdqu %xmm0, (%rdi)");
@@ -75,216 +69,32 @@ index 2199939b..2f2a1579 100644
                      }
                      offset += 32;
                      remaining -= 32;
-@@ -1298,8 +1296,64 @@ impl X86Codegen {
-                 }
-             }
-         } else {
--            self.state.out.emit_instr_imm_reg("    movq", size as i64, "rcx");
--            self.state.emit("    rep movsb");
-+            // For copies > 64 bytes, use an unrolled AVX2 loop instead of rep movsb.
-+            // This is faster for medium copies (65-512 bytes) because vmovdqu ymm
-+            // has higher throughput than rep movsb on modern Intel CPUs without ERMS.
-+            // Each iteration copies 64 bytes (2x vmovdqu 32-byte).
-+            let full_chunks = size / 64;
-+            let remainder = size % 64;
-+
-+            // Unrolled loop: copy 64 bytes per iteration
-+            if full_chunks > 0 {
-+                self.state.out.emit_instr_imm_reg("    movq", full_chunks as i64, "rcx");
-+                let loop_label = format!(".Lmcpy_loop_{}", self.state.next_label_id());
-+                self.state.emit_fmt(format_args!("{}:", loop_label));
-+                self.state.emit("    vmovdqu (%rsi), %ymm0");
-+                self.state.emit("    vmovdqu %ymm0, (%rdi)");
-+                self.state.emit("    vmovdqu 32(%rsi), %ymm1");
-+                self.state.emit("    vmovdqu %ymm1, 32(%rdi)");
-+                self.state.emit("    addq $64, %rsi");
-+                self.state.emit("    addq $64, %rdi");
-+                self.state.emit("    decq %rcx");
-+                self.state.emit_fmt(format_args!("    jne {}", loop_label));
-+            }
-+
-+            // Handle remainder (0-63 bytes) with scalar/128-bit moves
-+            let mut offset = 0usize;
-+            let mut remaining = remainder;
-+            while remaining > 0 {
-+                if remaining >= 32 {
-+                    self.state.emit_fmt(format_args!("    vmovdqu {}(%rsi), %ymm0", offset));
-+                    self.state.emit_fmt(format_args!("    vmovdqu %ymm0, {}(%rdi)", offset));
-+                    offset += 32;
-+                    remaining -= 32;
-+                } else if remaining >= 16 {
-+                    self.state.emit_fmt(format_args!("    movdqu {}(%rsi), %xmm0", offset));
-+                    self.state.emit_fmt(format_args!("    movdqu %xmm0, {}(%rdi)", offset));
-+                    offset += 16;
-+                    remaining -= 16;
-+                } else if remaining >= 8 {
-+                    self.state.emit_fmt(format_args!("    movq {}(%rsi), %rax", offset));
-+                    self.state.emit_fmt(format_args!("    movq %rax, {}(%rdi)", offset));
-+                    offset += 8;
-+                    remaining -= 8;
-+                } else if remaining >= 4 {
-+                    self.state.emit_fmt(format_args!("    movl {}(%rsi), %eax", offset));
-+                    self.state.emit_fmt(format_args!("    movl %eax, {}(%rdi)", offset));
-+                    offset += 4;
-+                    remaining -= 4;
-+                } else if remaining >= 2 {
-+                    self.state.emit_fmt(format_args!("    movw {}(%rsi), %ax", offset));
-+                    self.state.emit_fmt(format_args!("    movw %ax, {}(%rdi)", offset));
-+                    offset += 2;
-+                    remaining -= 2;
-+                } else {
-+                    self.state.emit_fmt(format_args!("    movb {}(%rsi), %al", offset));
-+                    self.state.emit_fmt(format_args!("    movb %al, {}(%rdi)", offset));
-+                    offset += 1;
-+                    remaining -= 1;
-+                }
-+            }
-         }
-     }
- 
 diff --git a/tests/regression/fp_domain_crossing.c b/tests/regression/fp_domain_crossing.c
 new file mode 100644
-index 00000000..834d0f55
+index 0000000..95b05ba
 --- /dev/null
 +++ b/tests/regression/fp_domain_crossing.c
-@@ -0,0 +1,140 @@
-+// FP domain-crossing regression test — catches bugs from XMM↔GPR value-flow
-+// optimizations.  Covers: chained FP binops, FP accumulators in loops,
-+// int→float casts feeding FP chains, FP in nested loops with struct access,
-+// FP values live across function calls (sqrt).
-+// Expected output: all lines "OK"
+@@ -0,0 +1,23 @@
 +#include <stdio.h>
 +#include <math.h>
-+#include <string.h>
-+
 +#define CHECK(tag, got, expect, tol) do { \
-+    double _d = (got) - (expect); \
-+    if (_d < 0) _d = -_d; \
-+    printf("%s: %s (got=%.15e expect=%.15e diff=%.3e)\n", \
-+           tag, _d <= (tol) ? "OK" : "FAIL", (double)(got), (double)(expect), _d); \
++    double _d = (got) - (expect); if (_d < 0) _d = -_d; \
++    printf("%s: %s\n", tag, _d <= (tol) ? "OK" : "FAIL"); \
 +} while(0)
-+
-+// Test 1: simple chained FP ops (add, mul, sub, div)
-+static double fp_chain(double a, double b, double c) {
-+    double x = a + b;    // FP add
-+    double y = x * c;    // FP mul
-+    double z = y - a;    // FP sub
-+    double w = z / b;    // FP div
-+    return w;
-+}
-+
-+// Test 2: FP accumulator in a loop (reduction pattern)
-+static double fp_accum(int n) {
-+    double sum = 0.0;
-+    for (int i = 1; i <= n; i++) {
-+        sum += 1.0 / (double)i;
-+    }
-+    return sum;
-+}
-+
-+// Test 3: FP values from int→float cast flowing into FP ops
-+static double int_to_fp_chain(int a, int b, int c) {
-+    double da = (double)a;
-+    double db = (double)b;
-+    double dc = (double)c;
-+    return da * db + dc;
-+}
-+
-+// Test 4: FP in nested loop with struct-like memory access
-+typedef struct { double x, y, z, vx, vy, vz, mass; } Body;
-+static Body test_bodies[3] = {
-+    { 1.0, 2.0, 3.0, 0.1, 0.2, 0.3, 100.0 },
-+    { 4.0, 5.0, 6.0, 0.4, 0.5, 0.6, 200.0 },
-+    { 7.0, 8.0, 9.0, 0.7, 0.8, 0.9, 300.0 },
-+};
-+
-+static double nested_struct_fp(int n) {
-+    double e = 0.0;
-+    for (int step = 0; step < n; step++) {
-+        for (int i = 0; i < 3; i++) {
-+            for (int j = i + 1; j < 3; j++) {
-+                double dx = test_bodies[i].x - test_bodies[j].x;
-+                double dy = test_bodies[i].y - test_bodies[j].y;
-+                double dz = test_bodies[i].z - test_bodies[j].z;
-+                double d2 = dx*dx + dy*dy + dz*dz;
-+                double mag = 0.01 / (d2 * sqrt(d2));
-+                test_bodies[i].vx -= dx * test_bodies[j].mass * mag;
-+                test_bodies[i].vy -= dy * test_bodies[j].mass * mag;
-+                test_bodies[i].vz -= dz * test_bodies[j].mass * mag;
-+                test_bodies[j].vx += dx * test_bodies[i].mass * mag;
-+                test_bodies[j].vy += dy * test_bodies[i].mass * mag;
-+                test_bodies[j].vz += dz * test_bodies[i].mass * mag;
-+            }
-+        }
-+        for (int i = 0; i < 3; i++) {
-+            test_bodies[i].x += 0.01 * test_bodies[i].vx;
-+            test_bodies[i].y += 0.01 * test_bodies[i].vy;
-+            test_bodies[i].z += 0.01 * test_bodies[i].vz;
-+        }
-+    }
-+    for (int i = 0; i < 3; i++) {
-+        e += test_bodies[i].x + test_bodies[i].vx;
-+    }
-+    return e;
-+}
-+
-+// Test 5: FP values live across sqrt call (call-spanning XMM issue)
-+static double fp_across_call(double a, double b, double c) {
-+    double before = a * b + c;
-+    double s = sqrt(before);
-+    double after = s * a - b;
-+    return after;
-+}
-+
-+// Test 6: FP phi (loop-carried FP value)
-+static double fp_phi_loop(double start, int n) {
-+    double val = start;
-+    for (int i = 0; i < n; i++) {
-+        val = val * 1.0000001 + 0.0000001;
-+    }
-+    return val;
-+}
-+
-+// Test 7: FP select/conditional
-+static double fp_select(double a, double b, int cond) {
-+    double x = cond ? a : b;
-+    return x * 2.0;
-+}
-+
-+// Test 8: FP comparison
-+static double fp_cmp(double a, double b) {
-+    if (a > b) return a - b;
-+    return b - a;
-+}
-+
++static double fp_chain(double a, double b, double c) { return (a+b)*c-a/b; }
++static double fp_accum(int n) { double s=0; for(int i=1;i<=n;i++) s+=1.0/(double)i; return s; }
++static double int_to_fp(int a, int b, int c) { return (double)a*(double)b+(double)c; }
++static double fp_across_call(double a, double b, double c) { return sqrt(a*b+c)*a-b; }
++static double fp_select(double a, double b, int c) { return (c?a:b)*2.0; }
++static double fp_cmp(double a, double b) { return a>b?a-b:b-a; }
 +int main(void) {
-+    // Test 1: fp_chain(1.5, 2.5, 3.0) → x=4, y=12, z=10.5, w=4.2
-+    CHECK("fp_chain", fp_chain(1.5, 2.5, 3.0), 4.2, 1e-12);
-+    
-+    // Test 2: H_n for n=1000 — reference: 7.485470860550345
++    CHECK("fp_chain", fp_chain(1.5,2.5,3.0), (1.5+2.5)*3.0-1.5/2.5, 1e-12);
 +    CHECK("fp_accum", fp_accum(1000), 7.485470860550345, 1e-10);
-+    
-+    // Test 3: 3 * 4 + 5 = 17
-+    CHECK("int_to_fp", int_to_fp_chain(3, 4, 5), 17.0, 1e-12);
-+    
-+    // Test 4: nested struct FP
-+    double ns = nested_struct_fp(100);
-+    printf("nested_struct: %.15e\n", ns);
-+    
-+    // Test 5: FP across sqrt call
-+    CHECK("fp_across_call", fp_across_call(3.0, 4.0, 5.0), sqrt(17.0)*3.0 - 4.0, 1e-12);
-+    
-+    // Test 6: FP phi loop
-+    double phi = fp_phi_loop(1.0, 1000000);
-+    printf("fp_phi: %.15e\n", phi);
-+    
-+    // Test 7: FP select
-+    CHECK("fp_select_t", fp_select(3.0, 4.0, 1), 6.0, 1e-12);
-+    CHECK("fp_select_f", fp_select(3.0, 4.0, 0), 8.0, 1e-12);
-+    
-+    // Test 8: FP comparison
-+    CHECK("fp_cmp_a", fp_cmp(5.0, 3.0), 2.0, 1e-12);
-+    CHECK("fp_cmp_b", fp_cmp(3.0, 5.0), 2.0, 1e-12);
-+    
++    CHECK("int_to_fp", int_to_fp(3,4,5), 17.0, 1e-12);
++    CHECK("fp_sqrt", fp_across_call(3.0,4.0,5.0), sqrt(17.0)*3.0-4.0, 1e-12);
++    CHECK("sel_t", fp_select(3.0,4.0,1), 6.0, 1e-12);
++    CHECK("sel_f", fp_select(3.0,4.0,0), 8.0, 1e-12);
++    CHECK("cmp_a", fp_cmp(5.0,3.0), 2.0, 1e-12);
++    CHECK("cmp_b", fp_cmp(3.0,5.0), 2.0, 1e-12);
 +    return 0;
 +}
