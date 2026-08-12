@@ -1,183 +1,804 @@
-diff --git a/src/backend/x86/codegen/comparison.rs b/src/backend/x86/codegen/comparison.rs
-index c6500371..d15cf6f8 100644
---- a/src/backend/x86/codegen/comparison.rs
-+++ b/src/backend/x86/codegen/comparison.rs
-@@ -364,7 +364,7 @@ impl X86Codegen {
-         if let Some((op, lhs, rhs, ty)) = self.take_replay_cmp(cond) {
-             self.state.reg_cache.invalidate_acc();
-             let use_32bit = ty == IrType::I32 || ty == IrType::U32;
--            self.emit_int_cmp_insn_typed(&lhs, &rhs, use_32bit);
-+            self.emit_int_cmp_replay_insn(&lhs, &rhs, use_32bit);
-             let jcc = Self::cmp_jcc(op);
-             if true_fallthrough {
-                 self.state
-@@ -625,7 +625,7 @@ impl X86Codegen {
-         if let Some((op, lhs, rhs, ty)) = &replay_op {
-             self.state.reg_cache.invalidate_acc();
-             let use_32bit = *ty == IrType::I32 || *ty == IrType::U32;
--            self.emit_int_cmp_insn_typed(lhs, rhs, use_32bit);
-+            self.emit_int_cmp_replay_insn(lhs, rhs, use_32bit);
-         }
-         // Test the condition in place (no pushfq). Only when the condition is
-         // not directly testable (rare) do we fall back to the legacy
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 0939ad8b..e08eb20f 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -757,6 +757,47 @@ impl X86Codegen {
+diff --git a/src/backend/x86/assembler/encoder/mod.rs b/src/backend/x86/assembler/encoder/mod.rs
+index 6eafd31..688ddba 100644
+--- a/src/backend/x86/assembler/encoder/mod.rs
++++ b/src/backend/x86/assembler/encoder/mod.rs
+@@ -953,6 +953,12 @@ impl InstructionEncoder {
+             "vpabsb" => self.encode_avx_2op_38(ops, 0x1C, true),
+             "vpabsw" => self.encode_avx_2op_38(ops, 0x1D, true),
+             "vpabsd" => self.encode_avx_2op_38(ops, 0x1E, true),
++            "vpmovzxbw" => self.encode_avx_2op_38(ops, 0x30, true),
++            "vpmovzxbd" => self.encode_avx_2op_38(ops, 0x31, true),
++            "vpmovzxwd" => self.encode_avx_2op_38(ops, 0x33, true),
++            "vpmovsxbw" => self.encode_avx_2op_38(ops, 0x20, true),
++            "vpmovsxbd" => self.encode_avx_2op_38(ops, 0x21, true),
++            "vpmovsxwd" => self.encode_avx_2op_38(ops, 0x23, true),
+             "vpmovmskb" => self.encode_avx_extract_gp(ops, 0xD7, true),
+             "vmovd" => self.encode_avx_movd(ops),
+             "vmovq" => self.encode_avx_movq(ops),
+diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
+index f627fb0..dafb25f 100644
+--- a/src/backend/x86/codegen/intrinsics.rs
++++ b/src/backend/x86/codegen/intrinsics.rs
+@@ -1274,10 +1274,12 @@ impl X86Codegen {
+             }
+             IntrinsicOp::Zext128to256 => {
+                 if let Some(dptr) = dest_ptr {
++                    // Zero-extend 128→256: VEX insert of the 128-bit value into
++                    // a zeroed ymm. A lone vinserti128 $1 of the same xmm would
++                    // DUPLICATE the low lane into the high lane (miscompile).
+                     self.sse_load_arg(&args[0], "xmm0");
+-                    self.state.emit("    vinserti128 $1, %xmm0, %ymm0, %ymm0");
+-                    self.state.emit("    vxorps %xmm1, %xmm1, %xmm1");
+-                    self.state.emit("    vinserti128 $1, %xmm1, %ymm0, %ymm0");
++                    self.state.emit("    vpxor %ymm1, %ymm1, %ymm1");
++                    self.state.emit("    vinserti128 $0, %xmm0, %ymm1, %ymm0");
+                     self.avx_store_dest(dptr);
+                 }
+             }
+@@ -1467,6 +1469,212 @@ impl X86Codegen {
+                 }
+             }
  
-     /// Emit a comparison instruction, optionally using 32-bit form for I32/U32 types.
-     /// When `use_32bit` is true, emits `cmpl` with 32-bit register names instead of `cmpq`.
-+    /// COMPARE-REPLAY re-emission: like emit_int_cmp_insn_typed, but loads
-+    /// both operands from their CANONICAL STACK SLOTS instead of trusting
-+    /// register assignments. The replay runs at the consumer (Select /
-+    /// CondBranch) position, after intervening instructions: a register that
-+    /// held the operand at the original Cmp may since have been reassigned to
-+    /// a later-defined value (the register allocator sized live ranges
-+    /// against the original Cmp position). Slots are written for every
-+    /// non-register-allocated value, and the replay candidates are filtered
-+    /// to slot-resident operands at build time — so the slot is always the
-+    /// correct, stable source here.
-+    pub(super) fn emit_int_cmp_replay_insn(&mut self, lhs: &Operand, rhs: &Operand, use_32bit: bool) {
-+        let cmp_instr = if use_32bit { "cmpl" } else { "cmpq" };
-+        let load_slot = |cg: &mut Self, op: &Operand, reg: &str| -> bool {
-+            if let Operand::Value(v) = op {
-+                if let Some(slot) = cg.state.get_slot(v.0) {
-+                    let sr = cg.slot_ref(slot.0);
-+                    cg.state.emit_fmt(format_args!("    movq {}, %{}", sr, reg));
-+                    return true;
++            // --- Newly wired SSE2 ops (were scalar header loops) ---
++            IntrinsicOp::Paddusb128 | IntrinsicOp::Paddsb128 | IntrinsicOp::Paddusw128
++            | IntrinsicOp::Paddsw128 | IntrinsicOp::Psubsw128 | IntrinsicOp::Pandn128
++            | IntrinsicOp::Pcmpeqw128 | IntrinsicOp::Pcmpgtd128 | IntrinsicOp::Pavgb128
++            | IntrinsicOp::Pavgw128 | IntrinsicOp::Pminsw128 | IntrinsicOp::Pmaxsw128
++            | IntrinsicOp::Pmulhuw128 | IntrinsicOp::Paddq128 | IntrinsicOp::Psubq128
++            | IntrinsicOp::Punpckldq128 | IntrinsicOp::Punpckhdq128
++            | IntrinsicOp::Punpcklqdq128 | IntrinsicOp::Punpckhqdq128 => {
++                if let Some(dptr) = dest_ptr {
++                    let inst = match op {
++                        IntrinsicOp::Paddusb128 => "paddusb",
++                        IntrinsicOp::Paddsb128 => "paddsb",
++                        IntrinsicOp::Paddusw128 => "paddusw",
++                        IntrinsicOp::Paddsw128 => "paddsw",
++                        IntrinsicOp::Psubsw128 => "psubsw",
++                        IntrinsicOp::Pandn128 => "pandn",
++                        IntrinsicOp::Pcmpeqw128 => "pcmpeqw",
++                        IntrinsicOp::Pcmpgtd128 => "pcmpgtd",
++                        IntrinsicOp::Pavgb128 => "pavgb",
++                        IntrinsicOp::Pavgw128 => "pavgw",
++                        IntrinsicOp::Pminsw128 => "pminsw",
++                        IntrinsicOp::Pmaxsw128 => "pmaxsw",
++                        IntrinsicOp::Pmulhuw128 => "pmulhuw",
++                        IntrinsicOp::Paddq128 => "paddq",
++                        IntrinsicOp::Psubq128 => "psubq",
++                        IntrinsicOp::Punpckldq128 => "punpckldq",
++                        IntrinsicOp::Punpckhdq128 => "punpckhdq",
++                        IntrinsicOp::Punpcklqdq128 => "punpcklqdq",
++                        IntrinsicOp::Punpckhqdq128 => "punpckhqdq",
++                        _ => unreachable!(),
++                    };
++                    self.emit_sse_binary_128(dptr, args, inst);
 +                }
 +            }
-+            false
-+        };
-+        if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
-+            let lreg = if use_32bit { "eax" } else { "rax" };
-+            if !load_slot(self, lhs, lreg) {
-+                self.operand_to_rax(lhs);
++            IntrinsicOp::Setzero128 => {
++                if let Some(dptr) = dest_ptr {
++                    self.state.emit("    pxor %xmm0, %xmm0");
++                    self.sse_store_dest(dptr, "xmm0");
++                }
 +            }
-+            self.state.emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, lreg));
-+            return;
-+        }
-+        let lreg = if use_32bit { "eax" } else { "rax" };
-+        let rreg = if use_32bit { "ecx" } else { "rcx" };
-+        if !load_slot(self, lhs, lreg) {
-+            self.operand_to_rax(lhs);
-+        }
-+        if !load_slot(self, rhs, rreg) {
-+            self.operand_to_rcx(rhs);
-+        }
-+        self.state.emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rreg, lreg));
-+    }
++            IntrinsicOp::Testz128 => {
++                self.sse_load_arg(&args[0], "xmm0");
++                self.sse_load_arg(&args[1], "xmm1");
++                self.state.emit("    ptest %xmm1, %xmm0");
++                self.state.emit("    sete %al");
++                self.state.emit("    movzbl %al, %eax");
++                if let Some(d) = dest {
++                    self.store_rax_to(d);
++                }
++            }
 +
-     pub(super) fn emit_int_cmp_insn_typed(
-         &mut self,
-         lhs: &Operand,
-@@ -3280,6 +3321,10 @@ impl ArchCodegen for X86Codegen {
- 
-         use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
- 
-+        if std::env::var("CCC_MI_STREAM").is_ok() {
-+            eprintln!("### MI-STREAM fn={} n={}", self.state.current_func_name, self.machinst_buf.len());
-+            for mi in &self.machinst_buf { eprintln!("  {mi:?}"); }
-+        }
-         let resolved: Vec<MachInst> = self
-             .machinst_buf
-             .iter()
-diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-index 5cebd9e8..1d78b6a8 100644
---- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-+++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-@@ -960,6 +960,18 @@ pub(super) fn fold_lea_into_memory_op(
-                         let tmp_pat = format!("({})", tmp);
-                         if mem_next.contains(&tmp_pat)
-                             && !fam_read_after(store, infos, k + 1, tmp_family)
-+                            // SOUNDNESS (sqlite3): removing the leaq leaves the
-+                            // LEA destination register undefined. The
-+                            // temporary-copy check alone is not enough: the
-+                            // leaq dest (e.g. %r13 = GEP result) is commonly
-+                            // read by SUBSEQUENT stores through
-+                            // displacement-form operands like `movw $0, 2(%r13)`
-+                            // (field stores of a promoted struct). The fold
-+                            // must also prove the leaq dest is dead after the
-+                            // folded memory operation. Without this, sqlite3's
-+                            // opcode/schema-init store sequence wrote struct
-+                            // fields through an undefined base register.
-+                            && !fam_read_after(store, infos, k + 1, dst_family)
-                         {
-                             let replacement = mem_next.replacen(&tmp_pat, &sib, 1);
-                             if replacement != mem_next {
-@@ -1052,11 +1064,19 @@ fn fam_read_after(store: &LineStore, infos: &[LineInfo], start: usize, fam: u8)
-             // (addq %r8,%rax, ...) also READS the register.
-             let name64 = REG_NAMES[0][fam as usize];
-             let name32 = REG_NAMES[1][fam as usize];
-+            // SOUNDNESS: a mov to the family is a pure write only if the
-+            // SOURCE part does not reference the family — including through
-+            // displacement-form memory operands like `movq 8(%r13), %r13`
-+            // (or `movl 4(%r13), %r13d`), which the old `(%r13)`-substring
-+            // checks missed (`8(%r13)` does not contain `(r13)`). Such a
-+            // line READS the family, so it must block the fold.
-+            let src_part = td[..td.rfind(',').unwrap_or(td.len())].to_string();
-+            let fam_in_src = src_part.contains(&format!("%{}", name64))
-+                || src_part.contains(&format!("%{}", name32));
-             let mov_store = (td.starts_with("mov")
-                 || td.starts_with("movabs")
-                 || td.starts_with("lea"))
--                && !td.contains(&format!("({})", name64))
--                && !td.contains(&format!("({})", name32));
-+                && !fam_in_src;
-             let explicit_lea_write = td.starts_with("lea")
-                 && td.ends_with(&format!(", %{}", name64))
-                 && !td[..td.rfind(',').unwrap_or(0)].contains(name64);
-@@ -1157,8 +1177,14 @@ pub(super) fn fold_base_index_addressing(
-                         // scan (not window-until-barrier): cross-block reads
-                         // (e.g. phi copy-backs) are just as unsafe.
-                         let tmp_dead = !fam_read_after(store, infos, m + 1, tmp_family);
--
--                        if tmp_dead {
-+                        // SOUNDNESS: the fold removes the `movq %idx, %rax`
-+                        // AND `addq %base, %rax`, leaving %rax undefined. The
-+                        // tmp-copy deadness alone is not sufficient: a later
-+                        // instruction may read %rax expecting the computed
-+                        // address (the accumulator is reused constantly).
-+                        let rax_dead = !fam_read_after(store, infos, m + 1, 0);
++            // --- Newly wired AVX/AVX2 ops ---
++            IntrinsicOp::Pmulld256 | IntrinsicOp::Psubd256 | IntrinsicOp::Paddq256
++            | IntrinsicOp::Psubq256 | IntrinsicOp::Pandn256 | IntrinsicOp::Pcmpeqd256
++            | IntrinsicOp::Pcmpeqq256 | IntrinsicOp::Pcmpgtd256 | IntrinsicOp::Pcmpgtq256
++            | IntrinsicOp::AddPs256 | IntrinsicOp::SubPs256 | IntrinsicOp::MulPs256
++            | IntrinsicOp::AddPd256 | IntrinsicOp::SubPd256 | IntrinsicOp::MulPd256
++            | IntrinsicOp::Punpcklbw256 | IntrinsicOp::Punpckhbw256
++            | IntrinsicOp::Punpcklwd256 | IntrinsicOp::Punpckhwd256
++            | IntrinsicOp::Punpckldq256 | IntrinsicOp::Punpckhdq256
++            | IntrinsicOp::Punpcklqdq256 | IntrinsicOp::Punpckhqdq256
++            | IntrinsicOp::Pmullw256 | IntrinsicOp::Pmulhw256
++            | IntrinsicOp::Pminsd256 | IntrinsicOp::Pmaxsd256
++            | IntrinsicOp::Packssdw256 | IntrinsicOp::Packuswb256
++            | IntrinsicOp::Phaddw256 | IntrinsicOp::Phaddd256
++            | IntrinsicOp::Pmuludq256 => {
++                if let Some(dptr) = dest_ptr {
++                    let (inst, comm) = match op {
++                        IntrinsicOp::Pmulld256 => ("vpmulld", true),
++                        IntrinsicOp::Psubd256 => ("vpsubd", false),
++                        IntrinsicOp::Paddq256 => ("vpaddq", true),
++                        IntrinsicOp::Psubq256 => ("vpsubq", false),
++                        IntrinsicOp::Pandn256 => ("vpandn", false),
++                        IntrinsicOp::Pcmpeqd256 => ("vpcmpeqd", true),
++                        IntrinsicOp::Pcmpeqq256 => ("vpcmpeqq", true),
++                        IntrinsicOp::Pcmpgtd256 => ("vpcmpgtd", false),
++                        IntrinsicOp::Pcmpgtq256 => ("vpcmpgtq", false),
++                        IntrinsicOp::AddPs256 => ("vaddps", true),
++                        IntrinsicOp::SubPs256 => ("vsubps", false),
++                        IntrinsicOp::MulPs256 => ("vmulps", true),
++                        IntrinsicOp::AddPd256 => ("vaddpd", true),
++                        IntrinsicOp::SubPd256 => ("vsubpd", false),
++                        IntrinsicOp::MulPd256 => ("vmulpd", true),
++                        IntrinsicOp::Punpcklbw256 => ("vpunpcklbw", false),
++                        IntrinsicOp::Punpckhbw256 => ("vpunpckhbw", false),
++                        IntrinsicOp::Punpcklwd256 => ("vpunpcklwd", false),
++                        IntrinsicOp::Punpckhwd256 => ("vpunpckhwd", false),
++                        IntrinsicOp::Punpckldq256 => ("vpunpckldq", false),
++                        IntrinsicOp::Punpckhdq256 => ("vpunpckhdq", false),
++                        IntrinsicOp::Punpcklqdq256 => ("vpunpcklqdq", false),
++                        IntrinsicOp::Punpckhqdq256 => ("vpunpckhqdq", false),
++                        IntrinsicOp::Pmullw256 => ("vpmullw", true),
++                        IntrinsicOp::Pmulhw256 => ("vpmulhw", true),
++                        IntrinsicOp::Pminsd256 => ("vpminsd", true),
++                        IntrinsicOp::Pmaxsd256 => ("vpmaxsd", true),
++                        IntrinsicOp::Packssdw256 => ("vpackssdw", false),
++                        IntrinsicOp::Packuswb256 => ("vpackuswb", false),
++                        IntrinsicOp::Phaddw256 => ("vphaddw", false),
++                        IntrinsicOp::Phaddd256 => ("vphaddd", false),
++                        IntrinsicOp::Pmuludq256 => ("vpmuludq", true),
++                        _ => unreachable!(),
++                    };
++                    self.emit_avx_binary_256(dptr, args, inst, comm);
++                }
++            }
++            IntrinsicOp::Setzero256 => {
++                if let Some(dptr) = dest_ptr {
++                    self.state.emit("    vpxor %ymm0, %ymm0, %ymm0");
++                    self.avx_store_dest(dptr);
++                }
++            }
++            IntrinsicOp::Extracti128 => {
++                if let Some(dptr) = dest_ptr {
++                    self.avx_load_arg(&args[0]);
++                    let lane = self.operand_to_imm_i64(&args[1]) & 1;
++                    self.state.emit_fmt(format_args!("    vextracti128 ${}, %ymm0, %xmm0", lane));
++                    self.sse_store_dest(dptr, "xmm0");
++                }
++            }
++            IntrinsicOp::LoaduPs256 | IntrinsicOp::LoaduPd256 => {
++                if let Some(dptr) = dest_ptr {
++                    self.avx_load_arg(&args[0]);
++                    self.avx_store_dest(dptr);
++                }
++            }
++            IntrinsicOp::StoreuPs256 | IntrinsicOp::StoreuPd256 => {
++                if let Some(dptr) = dest_ptr {
++                    self.avx_load_arg(&args[0]);
++                    self.avx_store_dest(dptr);
++                }
++            }
++            IntrinsicOp::Permute2x128 => {
++                if let Some(dptr) = dest_ptr {
++                    self.avx_load_arg(&args[0]);
++                    self.avx_load_arg_to(&args[1], "ymm1");
++                    let imm = self.operand_to_imm_i64(&args[2]);
++                    self.state.emit_fmt(format_args!("    vperm2i128 ${}, %ymm1, %ymm0, %ymm0", imm));
++                    self.avx_store_dest(dptr);
++                }
++            }
++            IntrinsicOp::Permute4x64 => {
++                if let Some(dptr) = dest_ptr {
++                    self.avx_load_arg(&args[0]);
++                    let imm = self.operand_to_imm_i64(&args[1]);
++                    self.state.emit_fmt(format_args!("    vpermq ${}, %ymm0, %ymm0", imm));
++                    self.avx_store_dest(dptr);
++                }
++            }
++            IntrinsicOp::Pshufd256 => {
++                if let Some(dptr) = dest_ptr {
++                    self.avx_load_arg(&args[0]);
++                    let imm = self.operand_to_imm_i64(&args[1]);
++                    self.state.emit_fmt(format_args!("    vpshufd ${}, %ymm0, %ymm0", imm));
++                    self.avx_store_dest(dptr);
++                }
++            }
++            IntrinsicOp::Pslldqi256 | IntrinsicOp::Psrldqi256 => {
++                if let Some(dptr) = dest_ptr {
++                    self.avx_load_arg(&args[0]);
++                    let imm = self.operand_to_imm_i64(&args[1]) & 0xff;
++                    let inst = if matches!(op, IntrinsicOp::Pslldqi256) { "vpslldq" } else { "vpsrldq" };
++                    self.state.emit_fmt(format_args!("    {} ${}, %ymm0, %ymm0", inst, imm));
++                    self.avx_store_dest(dptr);
++                }
++            }
++            IntrinsicOp::Psllqi256 | IntrinsicOp::Psrlqi256
++            | IntrinsicOp::Psrawi256 | IntrinsicOp::Psradi256 => {
++                if let Some(dptr) = dest_ptr {
++                    self.avx_load_arg(&args[0]);
++                    let imm = self.operand_to_imm_i64(&args[1]);
++                    let inst = match op {
++                        IntrinsicOp::Psllqi256 => "vpsllq",
++                        IntrinsicOp::Psrlqi256 => "vpsrlq",
++                        IntrinsicOp::Psrawi256 => "vpsraw",
++                        IntrinsicOp::Psradi256 => "vpsrad",
++                        _ => unreachable!(),
++                    };
++                    self.state.emit_fmt(format_args!("    {} ${}, %ymm0, %ymm0", inst, imm));
++                    self.avx_store_dest(dptr);
++                }
++            }
++            IntrinsicOp::Pmovzxbw256 | IntrinsicOp::Pmovzxbd256 | IntrinsicOp::Pmovzxwd256
++            | IntrinsicOp::Pmovsxbw256 | IntrinsicOp::Pmovsxbd256 | IntrinsicOp::Pmovsxwd256 => {
++                if let Some(dptr) = dest_ptr {
++                    self.sse_load_arg(&args[0], "xmm0");
++                    let inst = match op {
++                        IntrinsicOp::Pmovzxbw256 => "vpmovzxbw",
++                        IntrinsicOp::Pmovzxbd256 => "vpmovzxbd",
++                        IntrinsicOp::Pmovzxwd256 => "vpmovzxwd",
++                        IntrinsicOp::Pmovsxbw256 => "vpmovsxbw",
++                        IntrinsicOp::Pmovsxbd256 => "vpmovsxbd",
++                        IntrinsicOp::Pmovsxwd256 => "vpmovsxwd",
++                        _ => unreachable!(),
++                    };
++                    self.state.emit_fmt(format_args!("    {} %xmm0, %ymm0", inst));
++                    self.avx_store_dest(dptr);
++                }
++            }
++            IntrinsicOp::Pabsd256 => {
++                if let Some(dptr) = dest_ptr {
++                    self.avx_load_arg(&args[0]);
++                    self.state.emit("    vpabsd %ymm0, %ymm0");
++                    self.avx_store_dest(dptr);
++                }
++            }
 +
-+                        if tmp_dead && rax_dead {
-                             mark_nop(&mut infos[i]); // remove movq %REG, %rax
-                             mark_nop(&mut infos[j]); // remove addq
-                             mark_nop(&mut infos[k]); // remove movq %rax, %TMP
-diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
-index 37a9b693..fff96595 100644
---- a/src/backend/x86/codegen/prologue.rs
-+++ b/src/backend/x86/codegen/prologue.rs
-@@ -439,19 +439,21 @@ impl X86Codegen {
-                         continue;
-                     }
-                     // Replay soundness: the operands are re-materialized at the
--                    // consumer via operand_to_rax, which requires a STABLE
--                    // location (register assignment or stack slot). Values with
--                    // neither (immediately-consumed / slot-eliminated) reload
--                    // as zero — a wrong compare (simd_sse2_arith saturating-add
--                    // check: want = s > 255 ? 255 : s got 0x7f). Constants are
--                    // always re-materializable.
-+                    // consumer via a STACK-SLOT load. A register assignment is
-+                    // NOT a stable location here: the allocator sized the
-+                    // operand's live range against the ORIGINAL Cmp position,
-+                    // but the replay executes LATER (after intervening
-+                    // instructions), and a later-defined value may share the
-+                    // register — the replay would compare the wrong value
-+                    // (sqlite3 yy_shift: `state > 599 ? state+415 : state`
-+                    // compared state+415 instead of state because the Cmp lhs
-+                    // register had been reused by the +415 add). Slot-only
-+                    // operands are always safe: store_rax_to writes the slot
-+                    // for every non-register-allocated value.
-                     let op_has_location = |op: &Operand| -> bool {
-                         match op {
-                             Operand::Const(_) => true,
--                            Operand::Value(v) => {
--                                self.reg_assignments.contains_key(&v.0)
--                                    || self.state.get_slot(v.0).is_some()
--                            }
-+                            Operand::Value(v) => self.state.get_slot(v.0).is_some(),
-                         }
-                     };
-                     if !op_has_location(&clhs) || !op_has_location(&crhs) {
+             // SSE2 element shift-by-immediate operations
+             IntrinsicOp::Psllwi128 | IntrinsicOp::Psrlwi128 | IntrinsicOp::Psrawi128
+             | IntrinsicOp::Psradi128 | IntrinsicOp::Pslldi128 | IntrinsicOp::Psrldi128 => {
+diff --git a/src/frontend/sema/builtins.rs b/src/frontend/sema/builtins.rs
+index 8304b29..2d962d8 100644
+--- a/src/frontend/sema/builtins.rs
++++ b/src/frontend/sema/builtins.rs
+@@ -762,6 +762,105 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
+     m.insert("__builtin_ia32_pinsrq128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pinsrq128));
+     m.insert("__builtin_ia32_pextrq128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pextrq128));
+ 
++    // Hardware emission for ops that previously compiled as scalar C loops.
++    m.insert("_mm_adds_epu8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Paddusb128));
++    m.insert("_mm_adds_epi8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Paddsb128));
++    m.insert("_mm_adds_epu16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Paddusw128));
++    m.insert("_mm_adds_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Paddsw128));
++    m.insert("_mm_subs_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psubsw128));
++    m.insert("_mm_andnot_si128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn128));
++    m.insert("_mm_andnot_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn128));
++    m.insert("_mm_andnot_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn128));
++    m.insert("_mm_cmpeq_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pcmpeqw128));
++    m.insert("_mm_cmpgt_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pcmpgtd128));
++    m.insert("_mm_avg_epu8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pavgb128));
++    m.insert("_mm_avg_epu16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pavgw128));
++    m.insert("_mm_min_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pminsw128));
++    m.insert("_mm_max_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmaxsw128));
++    m.insert("_mm_mulhi_epu16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmulhuw128));
++    m.insert("_mm_add_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Paddq128));
++    m.insert("_mm_sub_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psubq128));
++    m.insert("_mm_unpacklo_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpckldq128));
++    m.insert("_mm_unpackhi_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpckhdq128));
++    m.insert("_mm_unpacklo_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpcklqdq128));
++    m.insert("_mm_unpackhi_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpckhqdq128));
++    m.insert("_mm_setzero_si128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Setzero128));
++    m.insert("_mm_setzero_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Setzero128));
++    m.insert("_mm_setzero_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Setzero128));
++    m.insert("_mm_testz_si128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Testz128));
++
++    m.insert("_mm256_mullo_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmulld256));
++    m.insert("_mm256_sub_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psubd256));
++    m.insert("_mm256_add_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Paddq256));
++    m.insert("_mm256_sub_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psubq256));
++    m.insert("_mm256_andnot_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn256));
++    m.insert("_mm256_andnot_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn256));
++    m.insert("_mm256_andnot_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn256));
++    m.insert("_mm256_cmpeq_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pcmpeqd256));
++    m.insert("_mm256_cmpeq_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pcmpeqq256));
++    m.insert("_mm256_cmpgt_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pcmpgtd256));
++    m.insert("_mm256_cmpgt_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pcmpgtq256));
++    m.insert("_mm256_extracti128_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Extracti128));
++    m.insert("_mm256_extractf128_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Extracti128));
++    m.insert("_mm256_extractf128_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Extracti128));
++    m.insert("_mm256_setzero_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Setzero256));
++    m.insert("_mm256_setzero_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Setzero256));
++    m.insert("_mm256_setzero_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Setzero256));
++    m.insert("_mm256_add_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AddPs256));
++    m.insert("_mm256_sub_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SubPs256));
++    m.insert("_mm256_mul_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MulPs256));
++    m.insert("_mm256_add_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AddPd256));
++    m.insert("_mm256_sub_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SubPd256));
++    m.insert("_mm256_mul_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MulPd256));
++    m.insert("_mm256_loadu_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86LoaduPs256));
++    m.insert("_mm256_storeu_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86StoreuPs256));
++    m.insert("_mm256_loadu_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86LoaduPd256));
++    m.insert("_mm256_storeu_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86StoreuPd256));
++    m.insert("_mm256_permute2x128_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Permute2x128));
++    m.insert("_mm256_permute2f128_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Permute2x128));
++    m.insert("_mm256_permute2f128_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Permute2x128));
++    m.insert("_mm256_permute2f128_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Permute2x128));
++    m.insert("_mm256_permute4x64_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Permute4x64));
++    m.insert("_mm256_shuffle_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pshufd256));
++    m.insert("_mm256_unpacklo_epi8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpcklbw256));
++    m.insert("_mm256_unpackhi_epi8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpckhbw256));
++    m.insert("_mm256_unpacklo_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpcklwd256));
++    m.insert("_mm256_unpackhi_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpckhwd256));
++    m.insert("_mm256_unpacklo_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpckldq256));
++    m.insert("_mm256_unpackhi_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpckhdq256));
++    m.insert("_mm256_unpacklo_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpcklqdq256));
++    m.insert("_mm256_unpackhi_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpckhqdq256));
++    m.insert("_mm256_slli_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pslldqi256));
++    m.insert("_mm256_srli_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrldqi256));
++    m.insert("_mm256_bslli_epi128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pslldqi256));
++    m.insert("_mm256_bsrli_epi128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrldqi256));
++    m.insert("_mm256_slli_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psllqi256));
++    m.insert("_mm256_srli_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrlqi256));
++    m.insert("_mm256_mullo_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmullw256));
++    m.insert("_mm256_mulhi_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmulhw256));
++    m.insert("_mm256_min_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pminsd256));
++    m.insert("_mm256_max_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmaxsd256));
++    m.insert("_mm256_cvtepu8_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovzxbw256));
++    m.insert("_mm256_cvtepu8_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovzxbd256));
++    m.insert("_mm256_cvtepu16_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovzxwd256));
++    m.insert("_mm256_cvtepi8_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovsxbw256));
++    m.insert("_mm256_cvtepi8_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovsxbd256));
++    m.insert("_mm256_cvtepi16_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovsxwd256));
++    m.insert("_mm256_srai_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrawi256));
++    m.insert("_mm256_srai_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psradi256));
++    m.insert("_mm256_packs_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Packssdw256));
++    m.insert("_mm256_packus_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Packuswb256));
++    m.insert("_mm256_hadd_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Phaddw256));
++    m.insert("_mm256_hadd_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Phaddd256));
++    m.insert("_mm256_abs_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pabsd256));
++    m.insert("_mm256_mul_epu32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmuludq256));
++    m.insert("_mm256_castsi128_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Zext128to256));
++    m.insert("_mm256_castps128_ps256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Zext128to256));
++    m.insert("_mm256_castpd128_pd256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Zext128to256));
++    m.insert("_mm256_castps256_ps128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Cast256to128));
++    m.insert("_mm256_castpd256_pd128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Cast256to128));
++    m.insert("_mm256_lddqu_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Loadu256));
++
+     m
+ });
+ 
+@@ -999,6 +1098,27 @@ pub enum BuiltinIntrinsic {
+     // VAES 256 + VPCLMULQDQ 256
+     X86Aesenc256, X86Aesenclast256, X86Aesdec256, X86Aesdeclast256,
+     X86Vpclmulqdq256,
++    // SSE2/SSE4.1 previously scalar
++    X86Paddusb128, X86Paddsb128, X86Paddusw128, X86Paddsw128, X86Psubsw128,
++    X86Pandn128, X86Pcmpeqw128, X86Pcmpgtd128, X86Pavgb128, X86Pavgw128,
++    X86Pminsw128, X86Pmaxsw128, X86Pmulhuw128, X86Paddq128, X86Psubq128,
++    X86Punpckldq128, X86Punpckhdq128, X86Punpcklqdq128, X86Punpckhqdq128,
++    X86Setzero128, X86Testz128,
++    // AVX/AVX2 previously scalar
++    X86Pmulld256, X86Psubd256, X86Paddq256, X86Psubq256, X86Pandn256,
++    X86Pcmpeqd256, X86Pcmpeqq256, X86Pcmpgtd256, X86Pcmpgtq256,
++    X86Extracti128, X86Setzero256,
++    X86AddPs256, X86SubPs256, X86MulPs256, X86AddPd256, X86SubPd256, X86MulPd256,
++    X86LoaduPs256, X86StoreuPs256, X86LoaduPd256, X86StoreuPd256,
++    X86Permute2x128, X86Permute4x64, X86Pshufd256,
++    X86Punpcklbw256, X86Punpckhbw256, X86Punpcklwd256, X86Punpckhwd256,
++    X86Punpckldq256, X86Punpckhdq256, X86Punpcklqdq256, X86Punpckhqdq256,
++    X86Pslldqi256, X86Psrldqi256, X86Psllqi256, X86Psrlqi256,
++    X86Pmullw256, X86Pmulhw256, X86Pminsd256, X86Pmaxsd256,
++    X86Pmovzxbw256, X86Pmovzxbd256, X86Pmovzxwd256,
++    X86Pmovsxbw256, X86Pmovsxbd256, X86Pmovsxwd256,
++    X86Psrawi256, X86Psradi256, X86Packssdw256, X86Packuswb256,
++    X86Phaddw256, X86Phaddd256, X86Pabsd256, X86Pmuludq256,
+     /// __builtin___*_chk: fortification builtins that forward to unchecked libc equivalents
+     FortifyChk,
+     /// __builtin_va_arg_pack(): used in always_inline fortification wrappers, returns 0
+diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
+index c0c90c2..cc929d1 100644
+--- a/src/ir/intrinsics.rs
++++ b/src/ir/intrinsics.rs
+@@ -459,6 +459,85 @@ pub enum IntrinsicOp {
+     // --- VAES 256-bit + VPCLMULQDQ 256-bit ---
+     Aesenc256, Aesenclast256, Aesdec256, Aesdeclast256,
+     Vpclmulqdq256,
++
++    // --- SSE2 ops previously left as scalar header loops ---
++    Paddusb128,
++    Paddsb128,
++    Paddusw128,
++    Paddsw128,
++    Psubsw128,
++    Pandn128,
++    Pcmpeqw128,
++    Pcmpgtd128,
++    Pavgb128,
++    Pavgw128,
++    Pminsw128,
++    Pmaxsw128,
++    Pmulhuw128,
++    Paddq128,
++    Psubq128,
++    Punpckldq128,
++    Punpckhdq128,
++    Punpcklqdq128,
++    Punpckhqdq128,
++    Setzero128,
++    Testz128,
++
++    // --- AVX / AVX2 ops previously left as scalar header loops ---
++    Pmulld256,
++    Psubd256,
++    Paddq256,
++    Psubq256,
++    Pandn256,
++    Pcmpeqd256,
++    Pcmpeqq256,
++    Pcmpgtd256,
++    Pcmpgtq256,
++    Extracti128,
++    Setzero256,
++    AddPs256,
++    SubPs256,
++    MulPs256,
++    AddPd256,
++    SubPd256,
++    MulPd256,
++    LoaduPs256,
++    StoreuPs256,
++    LoaduPd256,
++    StoreuPd256,
++    Permute2x128,
++    Permute4x64,
++    Pshufd256,
++    Punpcklbw256,
++    Punpckhbw256,
++    Punpcklwd256,
++    Punpckhwd256,
++    Punpckldq256,
++    Punpckhdq256,
++    Punpcklqdq256,
++    Punpckhqdq256,
++    Pslldqi256,
++    Psrldqi256,
++    Psllqi256,
++    Psrlqi256,
++    Pmullw256,
++    Pmulhw256,
++    Pminsd256,
++    Pmaxsd256,
++    Pmovzxbw256,
++    Pmovzxbd256,
++    Pmovzxwd256,
++    Pmovsxbw256,
++    Pmovsxbd256,
++    Pmovsxwd256,
++    Psrawi256,
++    Psradi256,
++    Packssdw256,
++    Packuswb256,
++    Phaddw256,
++    Phaddd256,
++    Pabsd256,
++    Pmuludq256,
+ }
+ 
+ impl IntrinsicOp {
+@@ -519,6 +598,11 @@ impl IntrinsicOp {
+             | FmaF64x2 | LoadF64x2 | LoadI32x4 | AddF64x2 | MulF64x2
+             | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecAddF64x2
+             | VecMulF64x2 | VecAddI32x4 | VecZeroF64x2 | VecZeroI32x4
++            | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
++            | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
++            | Pminsw128 | Pmaxsw128 | Pmulhuw128 | Paddq128 | Psubq128
++            | Punpckldq128 | Punpckhdq128 | Punpcklqdq128 | Punpckhqdq128
++            | Setzero128 | Extracti128
+             => Some(16),
+             // Everything else produces a scalar GPR/x87 result, no result, or
+             // is an F128 helper handled by the dedicated f128 slot path.
+diff --git a/src/ir/lowering/expr_builtins.rs b/src/ir/lowering/expr_builtins.rs
+index cfe0da0..c6febfe 100644
+--- a/src/ir/lowering/expr_builtins.rs
++++ b/src/ir/lowering/expr_builtins.rs
+@@ -473,6 +473,46 @@ impl Lowerer {
+             | BuiltinIntrinsic::X86Aesenc256 | BuiltinIntrinsic::X86Aesenclast256
+             | BuiltinIntrinsic::X86Aesdec256 | BuiltinIntrinsic::X86Aesdeclast256
+             | BuiltinIntrinsic::X86Vpclmulqdq256
++            | BuiltinIntrinsic::X86Paddusb128 | BuiltinIntrinsic::X86Paddsb128
++            | BuiltinIntrinsic::X86Paddusw128 | BuiltinIntrinsic::X86Paddsw128
++            | BuiltinIntrinsic::X86Psubsw128 | BuiltinIntrinsic::X86Pandn128
++            | BuiltinIntrinsic::X86Pcmpeqw128 | BuiltinIntrinsic::X86Pcmpgtd128
++            | BuiltinIntrinsic::X86Pavgb128 | BuiltinIntrinsic::X86Pavgw128
++            | BuiltinIntrinsic::X86Pminsw128 | BuiltinIntrinsic::X86Pmaxsw128
++            | BuiltinIntrinsic::X86Pmulhuw128 | BuiltinIntrinsic::X86Paddq128
++            | BuiltinIntrinsic::X86Psubq128 | BuiltinIntrinsic::X86Punpckldq128
++            | BuiltinIntrinsic::X86Punpckhdq128 | BuiltinIntrinsic::X86Punpcklqdq128
++            | BuiltinIntrinsic::X86Punpckhqdq128 | BuiltinIntrinsic::X86Setzero128
++            | BuiltinIntrinsic::X86Testz128
++            | BuiltinIntrinsic::X86Pmulld256 | BuiltinIntrinsic::X86Psubd256
++            | BuiltinIntrinsic::X86Paddq256 | BuiltinIntrinsic::X86Psubq256
++            | BuiltinIntrinsic::X86Pandn256 | BuiltinIntrinsic::X86Pcmpeqd256
++            | BuiltinIntrinsic::X86Pcmpeqq256 | BuiltinIntrinsic::X86Pcmpgtd256
++            | BuiltinIntrinsic::X86Pcmpgtq256 | BuiltinIntrinsic::X86Extracti128
++            | BuiltinIntrinsic::X86Setzero256
++            | BuiltinIntrinsic::X86AddPs256 | BuiltinIntrinsic::X86SubPs256
++            | BuiltinIntrinsic::X86MulPs256 | BuiltinIntrinsic::X86AddPd256
++            | BuiltinIntrinsic::X86SubPd256 | BuiltinIntrinsic::X86MulPd256
++            | BuiltinIntrinsic::X86LoaduPs256 | BuiltinIntrinsic::X86StoreuPs256
++            | BuiltinIntrinsic::X86LoaduPd256 | BuiltinIntrinsic::X86StoreuPd256
++            | BuiltinIntrinsic::X86Permute2x128 | BuiltinIntrinsic::X86Permute4x64
++            | BuiltinIntrinsic::X86Pshufd256
++            | BuiltinIntrinsic::X86Punpcklbw256 | BuiltinIntrinsic::X86Punpckhbw256
++            | BuiltinIntrinsic::X86Punpcklwd256 | BuiltinIntrinsic::X86Punpckhwd256
++            | BuiltinIntrinsic::X86Punpckldq256 | BuiltinIntrinsic::X86Punpckhdq256
++            | BuiltinIntrinsic::X86Punpcklqdq256 | BuiltinIntrinsic::X86Punpckhqdq256
++            | BuiltinIntrinsic::X86Pslldqi256 | BuiltinIntrinsic::X86Psrldqi256
++            | BuiltinIntrinsic::X86Psllqi256 | BuiltinIntrinsic::X86Psrlqi256
++            | BuiltinIntrinsic::X86Pmullw256 | BuiltinIntrinsic::X86Pmulhw256
++            | BuiltinIntrinsic::X86Pminsd256 | BuiltinIntrinsic::X86Pmaxsd256
++            | BuiltinIntrinsic::X86Pmovzxbw256 | BuiltinIntrinsic::X86Pmovzxbd256
++            | BuiltinIntrinsic::X86Pmovzxwd256
++            | BuiltinIntrinsic::X86Pmovsxbw256 | BuiltinIntrinsic::X86Pmovsxbd256
++            | BuiltinIntrinsic::X86Pmovsxwd256
++            | BuiltinIntrinsic::X86Psrawi256 | BuiltinIntrinsic::X86Psradi256
++            | BuiltinIntrinsic::X86Packssdw256 | BuiltinIntrinsic::X86Packuswb256
++            | BuiltinIntrinsic::X86Phaddw256 | BuiltinIntrinsic::X86Phaddd256
++            | BuiltinIntrinsic::X86Pabsd256 | BuiltinIntrinsic::X86Pmuludq256
+             | BuiltinIntrinsic::X86XorPs | BuiltinIntrinsic::X86AndPs
+             | BuiltinIntrinsic::X86OrPs | BuiltinIntrinsic::X86AddPs
+             | BuiltinIntrinsic::X86SubPs | BuiltinIntrinsic::X86MulPs
+@@ -852,7 +892,8 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
+         BuiltinIntrinsic::X86Movnti | BuiltinIntrinsic::X86Movnti64
+         | BuiltinIntrinsic::X86Movntdq | BuiltinIntrinsic::X86Movntpd
+         | BuiltinIntrinsic::X86Storedqu | BuiltinIntrinsic::X86Storeldi128
+-        | BuiltinIntrinsic::X86Storeu256 | BuiltinIntrinsic::X86Store256 => X86IntrinsicKind::PtrStore,
++        | BuiltinIntrinsic::X86Storeu256 | BuiltinIntrinsic::X86Store256
++        | BuiltinIntrinsic::X86StoreuPs256 | BuiltinIntrinsic::X86StoreuPd256 => X86IntrinsicKind::PtrStore,
+ 
+         BuiltinIntrinsic::X86Pmovmskb128 | BuiltinIntrinsic::X86Pextrw128
+         | BuiltinIntrinsic::X86Cvtsi128Si32 | BuiltinIntrinsic::X86Cvtsi128Si64
+@@ -860,7 +901,8 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
+         | BuiltinIntrinsic::X86Crc32_32 | BuiltinIntrinsic::X86Crc32_64
+         | BuiltinIntrinsic::X86Pextrd128 | BuiltinIntrinsic::X86Pextrb128
+         | BuiltinIntrinsic::X86Pextrq128 | BuiltinIntrinsic::X86Pmovmskb256
+-        | BuiltinIntrinsic::X86Rdtsc | BuiltinIntrinsic::X86Rdtscp => X86IntrinsicKind::Scalar,
++        | BuiltinIntrinsic::X86Rdtsc | BuiltinIntrinsic::X86Rdtscp
++        | BuiltinIntrinsic::X86Testz128 => X86IntrinsicKind::Scalar,
+ 
+         BuiltinIntrinsic::X86Loadu256 | BuiltinIntrinsic::X86Load256
+         | BuiltinIntrinsic::X86Paddb256 | BuiltinIntrinsic::X86Paddw256 | BuiltinIntrinsic::X86Paddd256
+@@ -879,7 +921,34 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
+         | BuiltinIntrinsic::X86Dpbuud256 | BuiltinIntrinsic::X86Dpbuuds256 | BuiltinIntrinsic::X86Dpwuud256
+         | BuiltinIntrinsic::X86Dpwuuds256 | BuiltinIntrinsic::X86Dpwssd256 | BuiltinIntrinsic::X86Dpwssds256
+         | BuiltinIntrinsic::X86Aesenc256 | BuiltinIntrinsic::X86Aesenclast256 | BuiltinIntrinsic::X86Aesdec256
+-        | BuiltinIntrinsic::X86Aesdeclast256 | BuiltinIntrinsic::X86Vpclmulqdq256 => X86IntrinsicKind::Vec256,
++        | BuiltinIntrinsic::X86Aesdeclast256 | BuiltinIntrinsic::X86Vpclmulqdq256
++        | BuiltinIntrinsic::X86Pmulld256 | BuiltinIntrinsic::X86Psubd256
++        | BuiltinIntrinsic::X86Paddq256 | BuiltinIntrinsic::X86Psubq256
++        | BuiltinIntrinsic::X86Pandn256 | BuiltinIntrinsic::X86Pcmpeqd256
++        | BuiltinIntrinsic::X86Pcmpeqq256 | BuiltinIntrinsic::X86Pcmpgtd256
++        | BuiltinIntrinsic::X86Pcmpgtq256 | BuiltinIntrinsic::X86Setzero256
++        | BuiltinIntrinsic::X86AddPs256 | BuiltinIntrinsic::X86SubPs256
++        | BuiltinIntrinsic::X86MulPs256 | BuiltinIntrinsic::X86AddPd256
++        | BuiltinIntrinsic::X86SubPd256 | BuiltinIntrinsic::X86MulPd256
++        | BuiltinIntrinsic::X86LoaduPs256 | BuiltinIntrinsic::X86LoaduPd256
++        | BuiltinIntrinsic::X86Permute2x128 | BuiltinIntrinsic::X86Permute4x64
++        | BuiltinIntrinsic::X86Pshufd256
++        | BuiltinIntrinsic::X86Punpcklbw256 | BuiltinIntrinsic::X86Punpckhbw256
++        | BuiltinIntrinsic::X86Punpcklwd256 | BuiltinIntrinsic::X86Punpckhwd256
++        | BuiltinIntrinsic::X86Punpckldq256 | BuiltinIntrinsic::X86Punpckhdq256
++        | BuiltinIntrinsic::X86Punpcklqdq256 | BuiltinIntrinsic::X86Punpckhqdq256
++        | BuiltinIntrinsic::X86Pslldqi256 | BuiltinIntrinsic::X86Psrldqi256
++        | BuiltinIntrinsic::X86Psllqi256 | BuiltinIntrinsic::X86Psrlqi256
++        | BuiltinIntrinsic::X86Pmullw256 | BuiltinIntrinsic::X86Pmulhw256
++        | BuiltinIntrinsic::X86Pminsd256 | BuiltinIntrinsic::X86Pmaxsd256
++        | BuiltinIntrinsic::X86Pmovzxbw256 | BuiltinIntrinsic::X86Pmovzxbd256
++        | BuiltinIntrinsic::X86Pmovzxwd256
++        | BuiltinIntrinsic::X86Pmovsxbw256 | BuiltinIntrinsic::X86Pmovsxbd256
++        | BuiltinIntrinsic::X86Pmovsxwd256
++        | BuiltinIntrinsic::X86Psrawi256 | BuiltinIntrinsic::X86Psradi256
++        | BuiltinIntrinsic::X86Packssdw256 | BuiltinIntrinsic::X86Packuswb256
++        | BuiltinIntrinsic::X86Phaddw256 | BuiltinIntrinsic::X86Phaddd256
++        | BuiltinIntrinsic::X86Pabsd256 | BuiltinIntrinsic::X86Pmuludq256 => X86IntrinsicKind::Vec256,
+         BuiltinIntrinsic::X86CastReinterpret => X86IntrinsicKind::CastReinterpret,
+         _ => X86IntrinsicKind::Vec128,
+     }
+@@ -1074,6 +1143,81 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
+         BuiltinIntrinsic::X86Vpclmulqdq256 => IntrinsicOp::Vpclmulqdq256,
+         BuiltinIntrinsic::X86SetEpi32_256 => IntrinsicOp::SetEpi32_256,
+         BuiltinIntrinsic::X86SetEpi64x256 => IntrinsicOp::SetEpi64x256,
++        BuiltinIntrinsic::X86Paddusb128 => IntrinsicOp::Paddusb128,
++        BuiltinIntrinsic::X86Paddsb128 => IntrinsicOp::Paddsb128,
++        BuiltinIntrinsic::X86Paddusw128 => IntrinsicOp::Paddusw128,
++        BuiltinIntrinsic::X86Paddsw128 => IntrinsicOp::Paddsw128,
++        BuiltinIntrinsic::X86Psubsw128 => IntrinsicOp::Psubsw128,
++        BuiltinIntrinsic::X86Pandn128 => IntrinsicOp::Pandn128,
++        BuiltinIntrinsic::X86Pcmpeqw128 => IntrinsicOp::Pcmpeqw128,
++        BuiltinIntrinsic::X86Pcmpgtd128 => IntrinsicOp::Pcmpgtd128,
++        BuiltinIntrinsic::X86Pavgb128 => IntrinsicOp::Pavgb128,
++        BuiltinIntrinsic::X86Pavgw128 => IntrinsicOp::Pavgw128,
++        BuiltinIntrinsic::X86Pminsw128 => IntrinsicOp::Pminsw128,
++        BuiltinIntrinsic::X86Pmaxsw128 => IntrinsicOp::Pmaxsw128,
++        BuiltinIntrinsic::X86Pmulhuw128 => IntrinsicOp::Pmulhuw128,
++        BuiltinIntrinsic::X86Paddq128 => IntrinsicOp::Paddq128,
++        BuiltinIntrinsic::X86Psubq128 => IntrinsicOp::Psubq128,
++        BuiltinIntrinsic::X86Punpckldq128 => IntrinsicOp::Punpckldq128,
++        BuiltinIntrinsic::X86Punpckhdq128 => IntrinsicOp::Punpckhdq128,
++        BuiltinIntrinsic::X86Punpcklqdq128 => IntrinsicOp::Punpcklqdq128,
++        BuiltinIntrinsic::X86Punpckhqdq128 => IntrinsicOp::Punpckhqdq128,
++        BuiltinIntrinsic::X86Setzero128 => IntrinsicOp::Setzero128,
++        BuiltinIntrinsic::X86Testz128 => IntrinsicOp::Testz128,
++        BuiltinIntrinsic::X86Pmulld256 => IntrinsicOp::Pmulld256,
++        BuiltinIntrinsic::X86Psubd256 => IntrinsicOp::Psubd256,
++        BuiltinIntrinsic::X86Paddq256 => IntrinsicOp::Paddq256,
++        BuiltinIntrinsic::X86Psubq256 => IntrinsicOp::Psubq256,
++        BuiltinIntrinsic::X86Pandn256 => IntrinsicOp::Pandn256,
++        BuiltinIntrinsic::X86Pcmpeqd256 => IntrinsicOp::Pcmpeqd256,
++        BuiltinIntrinsic::X86Pcmpeqq256 => IntrinsicOp::Pcmpeqq256,
++        BuiltinIntrinsic::X86Pcmpgtd256 => IntrinsicOp::Pcmpgtd256,
++        BuiltinIntrinsic::X86Pcmpgtq256 => IntrinsicOp::Pcmpgtq256,
++        BuiltinIntrinsic::X86Extracti128 => IntrinsicOp::Extracti128,
++        BuiltinIntrinsic::X86Setzero256 => IntrinsicOp::Setzero256,
++        BuiltinIntrinsic::X86AddPs256 => IntrinsicOp::AddPs256,
++        BuiltinIntrinsic::X86SubPs256 => IntrinsicOp::SubPs256,
++        BuiltinIntrinsic::X86MulPs256 => IntrinsicOp::MulPs256,
++        BuiltinIntrinsic::X86AddPd256 => IntrinsicOp::AddPd256,
++        BuiltinIntrinsic::X86SubPd256 => IntrinsicOp::SubPd256,
++        BuiltinIntrinsic::X86MulPd256 => IntrinsicOp::MulPd256,
++        BuiltinIntrinsic::X86LoaduPs256 => IntrinsicOp::LoaduPs256,
++        BuiltinIntrinsic::X86StoreuPs256 => IntrinsicOp::StoreuPs256,
++        BuiltinIntrinsic::X86LoaduPd256 => IntrinsicOp::LoaduPd256,
++        BuiltinIntrinsic::X86StoreuPd256 => IntrinsicOp::StoreuPd256,
++        BuiltinIntrinsic::X86Permute2x128 => IntrinsicOp::Permute2x128,
++        BuiltinIntrinsic::X86Permute4x64 => IntrinsicOp::Permute4x64,
++        BuiltinIntrinsic::X86Pshufd256 => IntrinsicOp::Pshufd256,
++        BuiltinIntrinsic::X86Punpcklbw256 => IntrinsicOp::Punpcklbw256,
++        BuiltinIntrinsic::X86Punpckhbw256 => IntrinsicOp::Punpckhbw256,
++        BuiltinIntrinsic::X86Punpcklwd256 => IntrinsicOp::Punpcklwd256,
++        BuiltinIntrinsic::X86Punpckhwd256 => IntrinsicOp::Punpckhwd256,
++        BuiltinIntrinsic::X86Punpckldq256 => IntrinsicOp::Punpckldq256,
++        BuiltinIntrinsic::X86Punpckhdq256 => IntrinsicOp::Punpckhdq256,
++        BuiltinIntrinsic::X86Punpcklqdq256 => IntrinsicOp::Punpcklqdq256,
++        BuiltinIntrinsic::X86Punpckhqdq256 => IntrinsicOp::Punpckhqdq256,
++        BuiltinIntrinsic::X86Pslldqi256 => IntrinsicOp::Pslldqi256,
++        BuiltinIntrinsic::X86Psrldqi256 => IntrinsicOp::Psrldqi256,
++        BuiltinIntrinsic::X86Psllqi256 => IntrinsicOp::Psllqi256,
++        BuiltinIntrinsic::X86Psrlqi256 => IntrinsicOp::Psrlqi256,
++        BuiltinIntrinsic::X86Pmullw256 => IntrinsicOp::Pmullw256,
++        BuiltinIntrinsic::X86Pmulhw256 => IntrinsicOp::Pmulhw256,
++        BuiltinIntrinsic::X86Pminsd256 => IntrinsicOp::Pminsd256,
++        BuiltinIntrinsic::X86Pmaxsd256 => IntrinsicOp::Pmaxsd256,
++        BuiltinIntrinsic::X86Pmovzxbw256 => IntrinsicOp::Pmovzxbw256,
++        BuiltinIntrinsic::X86Pmovzxbd256 => IntrinsicOp::Pmovzxbd256,
++        BuiltinIntrinsic::X86Pmovzxwd256 => IntrinsicOp::Pmovzxwd256,
++        BuiltinIntrinsic::X86Pmovsxbw256 => IntrinsicOp::Pmovsxbw256,
++        BuiltinIntrinsic::X86Pmovsxbd256 => IntrinsicOp::Pmovsxbd256,
++        BuiltinIntrinsic::X86Pmovsxwd256 => IntrinsicOp::Pmovsxwd256,
++        BuiltinIntrinsic::X86Psrawi256 => IntrinsicOp::Psrawi256,
++        BuiltinIntrinsic::X86Psradi256 => IntrinsicOp::Psradi256,
++        BuiltinIntrinsic::X86Packssdw256 => IntrinsicOp::Packssdw256,
++        BuiltinIntrinsic::X86Packuswb256 => IntrinsicOp::Packuswb256,
++        BuiltinIntrinsic::X86Phaddw256 => IntrinsicOp::Phaddw256,
++        BuiltinIntrinsic::X86Phaddd256 => IntrinsicOp::Phaddd256,
++        BuiltinIntrinsic::X86Pabsd256 => IntrinsicOp::Pabsd256,
++        BuiltinIntrinsic::X86Pmuludq256 => IntrinsicOp::Pmuludq256,
+         _ => unreachable!("x86_intrinsic_op called with non-X86 intrinsic: {:?}", intrinsic),
+     }
+ }
+diff --git a/tests/regression/simd_new_hw_ops.c b/tests/regression/simd_new_hw_ops.c
+new file mode 100644
+index 0000000..9895bb6
+--- /dev/null
++++ b/tests/regression/simd_new_hw_ops.c
+@@ -0,0 +1,112 @@
++/* Hardware emission for ops that used to be scalar header loops.
++ * Lane-exact vs a scalar reference. Requires SSE2/SSE4.1/AVX2. */
++#include <immintrin.h>
++#include <stdint.h>
++#include <stdio.h>
++
++static int sat_add_u8(int a, int b) {
++    int s = a + b;
++    return s > 255 ? 255 : s;
++}
++static int sat_add_i16(int a, int b) {
++    int s = a + b;
++    if (s > 32767) s = 32767;
++    if (s < -32768) s = -32768;
++    return s;
++}
++
++int main(void) {
++    uint8_t a8[16], b8[16];
++    for (int i = 0; i < 16; i++) { a8[i] = (uint8_t)(i * 17); b8[i] = (uint8_t)(200 + i); }
++    __m128i va8 = _mm_loadu_si128((const __m128i *)a8);
++    __m128i vb8 = _mm_loadu_si128((const __m128i *)b8);
++
++    uint8_t r8[16];
++    _mm_storeu_si128((__m128i *)r8, _mm_adds_epu8(va8, vb8));
++    for (int i = 0; i < 16; i++) if (r8[i] != (uint8_t)sat_add_u8(a8[i], b8[i])) return 1;
++
++    _mm_storeu_si128((__m128i *)r8, _mm_andnot_si128(va8, vb8));
++    for (int i = 0; i < 16; i++) if (r8[i] != (uint8_t)((~a8[i]) & b8[i])) return 2;
++
++    int16_t a16[8] = {30000, -30000, 100, -100, 7, -7, 1234, -4321};
++    int16_t b16[8] = {5000, -5000, 200, 50, 9, 3, 10, 20};
++    __m128i va16 = _mm_loadu_si128((const __m128i *)a16);
++    __m128i vb16 = _mm_loadu_si128((const __m128i *)b16);
++    int16_t r16[8];
++    _mm_storeu_si128((__m128i *)r16, _mm_adds_epi16(va16, vb16));
++    for (int i = 0; i < 8; i++) if (r16[i] != (int16_t)sat_add_i16(a16[i], b16[i])) return 3;
++    _mm_storeu_si128((__m128i *)r16, _mm_min_epi16(va16, vb16));
++    for (int i = 0; i < 8; i++) if (r16[i] != (a16[i] < b16[i] ? a16[i] : b16[i])) return 4;
++    _mm_storeu_si128((__m128i *)r16, _mm_cmpeq_epi16(va16, va16));
++    for (int i = 0; i < 8; i++) if (r16[i] != (int16_t)0xFFFF) return 5;
++
++    int32_t a32[4] = {1, -2, 3, -4};
++    int32_t b32[4] = {0, -3, 3, 5};
++    __m128i va32 = _mm_loadu_si128((const __m128i *)a32);
++    __m128i vb32 = _mm_loadu_si128((const __m128i *)b32);
++    int32_t r32[4];
++    _mm_storeu_si128((__m128i *)r32, _mm_cmpgt_epi32(va32, vb32));
++    for (int i = 0; i < 4; i++) if (r32[i] != (a32[i] > b32[i] ? -1 : 0)) return 6;
++
++    long long a64[2] = {100, -200};
++    long long b64[2] = {7, 9};
++    __m128i va64 = _mm_loadu_si128((const __m128i *)a64);
++    __m128i vb64 = _mm_loadu_si128((const __m128i *)b64);
++    long long r64[2];
++    _mm_storeu_si128((__m128i *)r64, _mm_add_epi64(va64, vb64));
++    if (r64[0] != 107 || r64[1] != -191) return 7;
++    _mm_storeu_si128((__m128i *)r64, _mm_unpacklo_epi64(va64, vb64));
++    if (r64[0] != 100 || r64[1] != 7) return 8;
++
++    __m128i z = _mm_setzero_si128();
++    _mm_storeu_si128((__m128i *)r64, z);
++    if (r64[0] != 0 || r64[1] != 0) return 9;
++
++    if (_mm_testz_si128(z, va64) != 1) return 10;
++    if (_mm_testz_si128(va64, va64) != 0) return 11;
++
++    /* AVX2 */
++    int32_t A[8] = {1,2,3,4,5,6,7,8};
++    int32_t B[8] = {8,7,6,5,4,3,2,1};
++    __m256i vA = _mm256_loadu_si256((const __m256i *)A);
++    __m256i vB = _mm256_loadu_si256((const __m256i *)B);
++    int32_t R[8];
++    _mm256_storeu_si256((__m256i *)R, _mm256_mullo_epi32(vA, vB));
++    for (int i = 0; i < 8; i++) if (R[i] != A[i] * B[i]) return 12;
++    _mm256_storeu_si256((__m256i *)R, _mm256_sub_epi32(vA, vB));
++    for (int i = 0; i < 8; i++) if (R[i] != A[i] - B[i]) return 13;
++    _mm256_storeu_si256((__m256i *)R, _mm256_andnot_si256(vA, vB));
++    for (int i = 0; i < 8; i++) if (R[i] != ((~A[i]) & B[i])) return 14;
++    _mm256_storeu_si256((__m256i *)R, _mm256_cmpeq_epi32(vA, vA));
++    for (int i = 0; i < 8; i++) if (R[i] != -1) return 15;
++
++    __m128i low = _mm_setr_epi32(10, 20, 30, 40);
++    __m256i wide = _mm256_inserti128_si256(_mm256_setzero_si256(), low, 1);
++    __m128i back = _mm256_extracti128_si256(wide, 1);
++    int32_t br[4];
++    _mm_storeu_si128((__m128i *)br, back);
++    if (br[0] != 10 || br[1] != 20 || br[2] != 30 || br[3] != 40) return 16;
++    __m128i zlow = _mm256_extracti128_si256(wide, 0);
++    _mm_storeu_si128((__m128i *)br, zlow);
++    if (br[0] || br[1] || br[2] || br[3]) return 17;
++
++    float fa[8] = {1,2,3,4,5,6,7,8};
++    float fb[8] = {0.5f,1,1.5f,2,2.5f,3,3.5f,4};
++    float fr[8];
++    _mm256_storeu_ps(fr, _mm256_add_ps(_mm256_loadu_ps(fa), _mm256_loadu_ps(fb)));
++    for (int i = 0; i < 8; i++) if (fr[i] != fa[i] + fb[i]) return 18;
++    _mm256_storeu_ps(fr, _mm256_mul_ps(_mm256_loadu_ps(fa), _mm256_loadu_ps(fb)));
++    for (int i = 0; i < 8; i++) if (fr[i] != fa[i] * fb[i]) return 19;
++
++    __m256i z256 = _mm256_setzero_si256();
++    _mm256_storeu_si256((__m256i *)R, z256);
++    for (int i = 0; i < 8; i++) if (R[i] != 0) return 20;
++
++    __m256i zx = _mm256_zextsi128_si256(low);
++    _mm256_storeu_si256((__m256i *)R, zx);
++    if (R[0] != 10 || R[1] != 20 || R[2] != 30 || R[3] != 40) return 21;
++    if (R[4] || R[5] || R[6] || R[7]) return 22;
++
++    printf("OK simd_new_hw_ops\n");
++    return 0;
++}
+diff --git a/tests/regression/simd_new_hw_ops.flags b/tests/regression/simd_new_hw_ops.flags
+new file mode 100644
+index 0000000..b600d27
+--- /dev/null
++++ b/tests/regression/simd_new_hw_ops.flags
+@@ -0,0 +1 @@
++-mavx2
