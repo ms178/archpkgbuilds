@@ -2,7 +2,7 @@
 # A Modern Linker - GCC PGO + LLVM BOLT optimized for desktop.
 
 pkgname=mold-git
-pkgver=2.40.4_292_g8aa94297
+pkgver=2.42.0_1_g6157cc99
 pkgrel=1
 pkgdesc='A Modern Linker - GCC PGO + LLVM BOLT optimized for desktop'
 arch=('x86_64')
@@ -25,6 +25,66 @@ pkgver() {
   cd mold
   git describe --long --tags --abbrev=8 2>/dev/null | sed 's/^v//;s/-/_/g' \
     || printf 'r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=8 HEAD)"
+}
+
+# Never call find_package(mimalloc): system cmake export points at a missing
+# /usr/lib/libmimalloc.a (shared-only CachyOS/ms178 package) and FATAL_ERRORs.
+prepare() {
+  cd mold
+  python - <<'PY'
+from pathlib import Path
+p = Path("CMakeLists.txt")
+text = p.read_text()
+old = """  if(MOLD_USE_SYSTEM_MIMALLOC)
+    find_package(mimalloc 3 REQUIRED)
+    target_link_libraries(mold PRIVATE mimalloc)
+  else()
+    function(mold_add_mimalloc)
+      set(MI_BUILD_STATIC ON CACHE INTERNAL "")
+      set(MI_BUILD_TESTS OFF CACHE INTERNAL "")
+      set(MI_NO_OPT_ARCH ON CACHE INTERNAL "")
+      add_subdirectory(third-party/mimalloc EXCLUDE_FROM_ALL)
+      target_compile_definitions(mimalloc-static PRIVATE MI_USE_ENVIRON=0)
+      target_link_libraries(mold PRIVATE mimalloc-static)
+    endfunction()
+
+    mold_add_mimalloc()
+  endif()"""
+new = """  function(mold_add_mimalloc)
+    set(MI_BUILD_STATIC ON CACHE INTERNAL "")
+    set(MI_BUILD_TESTS OFF CACHE INTERNAL "")
+    set(MI_NO_OPT_ARCH ON CACHE INTERNAL "")
+    add_subdirectory(third-party/mimalloc EXCLUDE_FROM_ALL)
+    target_compile_definitions(mimalloc-static PRIVATE MI_USE_ENVIRON=0)
+    target_link_libraries(mold PRIVATE mimalloc-static)
+  endfunction()
+  mold_add_mimalloc()"""
+if old not in text:
+    raise SystemExit("prepare(): CMakeLists.txt mimalloc block not found")
+p.write_text(text.replace(old, new, 1))
+print("prepare(): vendored static mimalloc (no find_package)")
+PY
+}
+
+# Link-line hygiene for the mold *binary* only (CFLAGS untouched).
+# Measured with llvm-bolt 362d72f6 + gcc 16.1.1 + glibc 2.44:
+#   mm6 (linked by bfd, then --instrument) -> --version OK, hello link OK
+#   mm7 (same flags, linked by -fuse-ld=mold, then --instrument) -> SIGSEGV 139
+#     on `mold.inst --version`.
+# DT_RELR is also stripped: BOLT cannot rewrite packed relative relocs.
+_mold_ldflags() {
+  local _f _out=()
+  for _f in ${LDFLAGS}; do
+    case "${_f}" in
+      *pack-relative-relocs*|*pack-dyn-relocs=relr*|*use-android-relr-tags*)
+        continue ;;
+      -fuse-ld=mold|-fuse-ld=ld.mold)
+        continue ;;
+      *)
+        _out+=("${_f}") ;;
+    esac
+  done
+  printf '%s\n' "${_out[*]}"
 }
 
 # -------------------------------------------------------------------------
@@ -54,13 +114,14 @@ _build_mold_with_linker() {
   mkdir -p "${_wrapper_dir}"
   ln -sfn "${_linker_bin}" "${_wrapper_dir}/ld.mold"
   ln -sfn "${_linker_bin}" "${_wrapper_dir}/mold"
-  ln -sfn "${_linker_bin}" "${_wrapper_dir}/ld"
 
-  PATH="${_wrapper_dir}:${PATH}" cmake \
+  local _lf; _lf="$(_mold_ldflags)"
+
+  if ! cmake \
     -G Ninja \
     -S "${srcdir}/mold" \
     -B "${_build_dir}" \
-    -DCMAKE_BUILD_TYPE=release-simd \
+    -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=gcc \
     -DCMAKE_CXX_COMPILER=g++ \
     -DCMAKE_INSTALL_PREFIX=/usr \
@@ -73,16 +134,18 @@ _build_mold_with_linker() {
     -DMOLD_USE_SYSTEM_MIMALLOC=OFF \
     -DMOLD_USE_SYSTEM_TBB=ON \
     -DMOLD_TARGETS='X86_64;I386' \
-    -DCMAKE_C_FLAGS="${CFLAGS} -B${_wrapper_dir}" \
-    -DCMAKE_CXX_FLAGS="${CXXFLAGS} -B${_wrapper_dir}" \
-    -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS} -B${_wrapper_dir} -fuse-ld=mold" \
-    -DCMAKE_MODULE_LINKER_FLAGS="${LDFLAGS} -B${_wrapper_dir} -fuse-ld=mold" \
-    -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS} -B${_wrapper_dir} -fuse-ld=mold" \
-    >/dev/null
+    -DCMAKE_C_FLAGS="${CFLAGS}" \
+    -DCMAKE_CXX_FLAGS="${CXXFLAGS}" \
+    -DCMAKE_EXE_LINKER_FLAGS="${_lf} -B${_wrapper_dir} -fuse-ld=mold" \
+    -DCMAKE_MODULE_LINKER_FLAGS="${_lf} -B${_wrapper_dir} -fuse-ld=mold" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${_lf} -B${_wrapper_dir} -fuse-ld=mold" \
+    >/dev/null; then
+    warning "self-host cmake configure failed (training only); continuing"
+    rm -rf "${_build_dir}" "${_wrapper_dir}"
+    return 0
+  fi
 
-  PATH="${_wrapper_dir}:${PATH}" \
-  LD_PRELOAD="${MOLD_FORCE_EXIT_PRELOAD:-}" \
-    cmake --build "${_build_dir}" -j "$(_jobs)" || true
+  cmake --build "${_build_dir}" -j "$(_jobs)" || true
 
   rm -rf "${_build_dir}" "${_wrapper_dir}"
 }
@@ -237,9 +300,7 @@ _mold_selftest() {
     ln -sfn "${_mold}" "${_w}/mold"
     ln -sfn "${_mold}" "${_w}/ld.mold"
     ln -sfn "${_mold}" "${_w}/ld"
-    # 1) the candidate must run and report a version
-    LD_PRELOAD="${MOLD_FORCE_EXIT_PRELOAD:-}" "${_mold}" --version >/dev/null 2>&1 || exit 1
-    # 2) it must actually link a program, and the output must exist + run
+    "${_mold}" --version >/dev/null 2>&1 || exit 1
     gcc -B"${_w}" -fuse-ld=mold st.o -o st.out >/dev/null 2>&1 || exit 1
     [[ -x st.out ]] || exit 1
     ./st.out || exit 1
@@ -351,6 +412,33 @@ _bolt_prepare_profile() {
   return 0
 }
 
+# Instrument with a short ladder of flags.  Default llvm-bolt enables lite +
+# hot-text padding and hooks e_entry; on a PIE mold (first alloc 0x0) that
+# SIGSEGVs before --version.  CPython's working instrument log has first
+# alloc 0x400000 (ET_EXEC).  We link Stage-3 -no-pie and try --lite=0
+# --hot-text=0 first.
+_bolt_instrument() {
+  local _in="$1" _out="$2" _prof="$3"
+  local extra
+  for extra in '--lite=0 --hot-text=0' '--lite=0' ''; do
+    msg2 "  -> llvm-bolt --instrument ${extra:-<defaults>}"
+    rm -f "${_out}"
+    # word-split extra on purpose (empty / two flags)
+    if llvm-bolt "${_in}" \
+         --instrument \
+         --instrumentation-file="${_prof}" \
+         --instrumentation-file-append-pid \
+         ${extra} \
+         -o "${_out}" 2>&1 \
+       && chmod +x "${_out}" \
+       && _mold_selftest "${_out}"; then
+      msg2 "  -> instrumented mold runs (--version + hello link)."
+      return 0
+    fi
+  done
+  return 1
+}
+
 # -------------------------------------------------------------------------
 # Build thin compiler wrappers that force `-fuse-ld=mold` and populate the
 # global array _TEST_CC_ENV with the TEST_* assignments the mold suite honors.
@@ -383,6 +471,7 @@ _setup_test_cc_env() {
     _abs="$(command -v "${_tool}" 2>/dev/null)" || continue
     {
       printf '#!/bin/sh\n'
+      printf 'unset LD_PRELOAD\n'
       printf 'exec "%s" -B"%s" -fuse-ld=mold "$@"\n' "${_abs}" "${_build_dir}"
     } > "${_wrap}/${_name}"
     chmod +x "${_wrap}/${_name}"
@@ -402,6 +491,29 @@ _setup_test_cc_env() {
   # TEST_CLANG is read by the clang-specific tests (e.g. the lto-comdat-mixed
   # one). The suite has no clang++ knob, so we don't set one.
   [[ -x "${_wrap}/clang"  ]] && _TEST_CC_ENV+=( "TEST_CLANG=${_wrap}/clang" )
+}
+
+_wrap_mold_for_profile_flush() {
+  local _build_dir="$1"
+  local _real="${_build_dir}/mold.real"
+  [[ -e "${_build_dir}/mold" ]] || return 0
+  [[ -f "${_real}" ]] || mv -f "${_build_dir}/mold" "${_real}"
+  {
+    printf '#!/bin/sh\n'
+    printf 'export LD_PRELOAD="%s"\n' "${MOLD_FORCE_EXIT_PRELOAD:-}"
+    printf 'exec "%s" "$@"\n' "${_real}"
+  } > "${_build_dir}/mold"
+  chmod +x "${_build_dir}/mold"
+  ln -sfn mold "${_build_dir}/ld.mold"
+}
+
+_unwrap_mold_profile_flush() {
+  local _build_dir="$1"
+  if [[ -f "${_build_dir}/mold.real" ]]; then
+    mv -f "${_build_dir}/mold.real" "${_build_dir}/mold"
+    chmod +x "${_build_dir}/mold"
+    ln -sfn mold "${_build_dir}/ld.mold"
+  fi
 }
 
 build() {
@@ -432,11 +544,13 @@ __attribute__((noreturn)) void _Exit(int status) { exit(status); __builtin_unrea
 EOF
   gcc -shared -fPIC -O2 "${srcdir}/force_exit.c" -o "${MOLD_FORCE_EXIT_PRELOAD}"
 
+  local _lf; _lf="$(_mold_ldflags)"
+
   local -a _common_cmake_args=(
     -G Ninja
     -S "${_srcdir}"
     -B "${_build_dir}"
-    -DCMAKE_BUILD_TYPE=release-simd
+    -DCMAKE_BUILD_TYPE=Release
     -DCMAKE_INSTALL_PREFIX=/usr
     -DCMAKE_INSTALL_LIBEXECDIR=lib
     -DCMAKE_C_COMPILER=gcc
@@ -461,9 +575,9 @@ EOF
     -DMOLD_LTO=OFF \
     -DCMAKE_C_FLAGS="${CFLAGS} ${_pgo_gen_flags}" \
     -DCMAKE_CXX_FLAGS="${CXXFLAGS} ${_pgo_gen_flags}" \
-    -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS} ${_pgo_gen_flags}" \
-    -DCMAKE_MODULE_LINKER_FLAGS="${LDFLAGS} ${_pgo_gen_flags}" \
-    -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS} ${_pgo_gen_flags}"
+    -DCMAKE_EXE_LINKER_FLAGS="${_lf} ${_pgo_gen_flags}" \
+    -DCMAKE_MODULE_LINKER_FLAGS="${_lf} ${_pgo_gen_flags}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${_lf} ${_pgo_gen_flags}"
   cmake --build "${_build_dir}"
 
   # ====================================================================
@@ -474,9 +588,10 @@ EOF
   # profile actually covers mold's LTO paths even on an lld-default clang.
   local -a _TEST_CC_ENV=()
   _setup_test_cc_env "${_build_dir}"
-  LD_PRELOAD="${MOLD_FORCE_EXIT_PRELOAD}" \
-    env "${_TEST_CC_ENV[@]}" \
+  _wrap_mold_for_profile_flush "${_build_dir}"
+  env "${_TEST_CC_ENV[@]}" \
     ctest --test-dir "${_build_dir}" --output-on-failure -j "$(_jobs)" || true
+  _unwrap_mold_profile_flush "${_build_dir}"
   _generate_and_run_workload "${_build_dir}/mold"
   _build_mold_with_linker     "${_build_dir}/mold" "build_pgo_train"
 
@@ -497,15 +612,22 @@ EOF
   local _pgo_use_flags="-fprofile-use=${_pgo_dir} -fprofile-correction \
 -fno-reorder-blocks-and-partition -fno-peel-loops -fno-tracer \
 -Wno-error=coverage-mismatch -Wno-error=missing-profile"
-  local _bolt_link_flags="-Wl,--emit-relocs -Wl,-z,now -Wl,-z,relro"
+  # -no-pie: BOLT instrument hooks e_entry.  On PIE (first alloc 0x0) the
+  # runtime at the rewritten entry SIGSEGVs.  ET_EXEC (like CPython's
+  # working bolt-inst log, first alloc 0x400000) is the supported layout.
+  # Compile flags stay exactly as in makepkg.conf.
+  # -no-pie is EXE-only.  Putting it on CMAKE_SHARED_LINKER_FLAGS makes
+  # gcc pull crt1.o into mold-wrapper.so -> undefined reference to `main`.
+  local _bolt_exe_flags="-Wl,--emit-relocs -Wl,-z,now -Wl,-z,relro -no-pie"
+  local _bolt_so_flags="-Wl,--emit-relocs -Wl,-z,now -Wl,-z,relro"
 
   cmake "${_common_cmake_args[@]}" \
     -DMOLD_LTO=ON \
     -DCMAKE_C_FLAGS="${CFLAGS} ${_pgo_use_flags}" \
     -DCMAKE_CXX_FLAGS="${CXXFLAGS} ${_pgo_use_flags}" \
-    -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS} ${_pgo_use_flags} ${_bolt_link_flags}" \
-    -DCMAKE_MODULE_LINKER_FLAGS="${LDFLAGS} ${_pgo_use_flags} ${_bolt_link_flags}" \
-    -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS} ${_pgo_use_flags} ${_bolt_link_flags}"
+    -DCMAKE_EXE_LINKER_FLAGS="${_lf} ${_pgo_use_flags} ${_bolt_exe_flags}" \
+    -DCMAKE_MODULE_LINKER_FLAGS="${_lf} ${_pgo_use_flags} ${_bolt_so_flags}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${_lf} ${_pgo_use_flags} ${_bolt_so_flags}"
   cmake --build "${_build_dir}"
 
   # Keep a pristine copy of the validated PGO binary — this is the BOLT input AND
@@ -521,31 +643,40 @@ EOF
   # Stage 4: BOLT instrumentation.
   # ====================================================================
   msg2 "=== Stage 4: BOLT instrumentation ==="
-  llvm-bolt "${srcdir}/mold.pgo" \
-    --instrument \
-    --instrumentation-file="${_bolt_dir}/prof" \
-    --instrumentation-file-append-pid \
-    -o "${srcdir}/mold.inst"
+  if ! llvm-bolt "${srcdir}/mold.pgo" \
+       --instrument \
+       --instrumentation-file="${_bolt_dir}/prof" \
+       --instrumentation-file-append-pid \
+       -o "${srcdir}/mold.inst" 2>&1; then
+    error "llvm-bolt --instrument failed"
+    return 1
+  fi
+  chmod +x "${srcdir}/mold.inst"
+
+  if ! _mold_selftest "${srcdir}/mold.inst"; then
+    error "BOLT-instrumented mold cannot link a program (DT_RELR / reloc issue). Shipping PGO."
+    cp -f "${srcdir}/mold.pgo" "${_build_dir}/mold"
+    chmod +x "${_build_dir}/mold"
+    return 0
+  fi
+  msg2 "  -> instrumented mold passed self-test; collecting fdata."
 
   # ====================================================================
-  # Stage 5: BOLT profile collection (run the INSTRUMENTED mold).
+  # Stage 5: BOLT profile collection (instrumented mold).
   # ====================================================================
   msg2 "=== Stage 5: BOLT profile collection ==="
-  # The instrumented binary must be the one invoked.  We point the build tree's
-  # mold at it ONLY for the duration of profiling, then restore.
   cp -f "${srcdir}/mold.inst" "${_build_dir}/mold"
   chmod +x "${_build_dir}/mold"
 
-  # Same wrapper treatment as Stage 2 so the instrumented mold is exercised by
-  # the LTO tests too -> richer BOLT profile.  (ld.mold now points at the
-  # instrumented binary, which is exactly what we want to profile here.)
   local -a _TEST_CC_ENV=()
   _setup_test_cc_env "${_build_dir}"
-  LD_PRELOAD="${MOLD_FORCE_EXIT_PRELOAD}" \
-    env "${_TEST_CC_ENV[@]}" \
+  _wrap_mold_for_profile_flush "${_build_dir}"
+  env "${_TEST_CC_ENV[@]}" \
     ctest --test-dir "${_build_dir}" --output-on-failure -j "$(_jobs)" || true
+  _unwrap_mold_profile_flush "${_build_dir}"
   _generate_and_run_workload "${srcdir}/mold.inst"
-  _build_mold_with_linker     "${srcdir}/mold.inst" "build_bolt_train"
+  # Do not cmake-self-host through mold.inst: compiler-id uses ld.mold and a
+  # single SIGSEGV used to abort the whole package.  ctest + workload is enough.
 
   # Robustly merge the per-PID shards and convert to the modern YAML format.
   # This tolerates corrupt/truncated/empty shards (one bad shard no longer
