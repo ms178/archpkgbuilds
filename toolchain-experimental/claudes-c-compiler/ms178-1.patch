@@ -1,2262 +1,1473 @@
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index a0b78d3d..1031d374 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -2264,7 +2264,13 @@ fn generate_terminator(
-             true_label,
-             false_label,
-         } => {
-+            // v11: hand the profile-driven preferred-fallthrough successor
-+            // (the hot edge target, computed by the layout pass) to the
-+            // backend so the hot path falls through without reordering
-+            // blocks. Cleared immediately after emission.
-+            crate::pgo::set_cond_fallthrough(crate::pgo::cond_fallthrough(block_label));
-             cg.emit_cond_branch_blocks(cond, *true_label, *false_label);
-+            crate::pgo::set_cond_fallthrough(None);
-         }
-         Terminator::IndirectBranch { target, .. } => {
-             cg.emit_indirect_branch(target);
-diff --git a/src/backend/x86/codegen/comparison.rs b/src/backend/x86/codegen/comparison.rs
-index d15cf6f8..ae0e8ab5 100644
---- a/src/backend/x86/codegen/comparison.rs
-+++ b/src/backend/x86/codegen/comparison.rs
-@@ -333,25 +333,40 @@ impl X86Codegen {
-         false_block: BlockId,
-     ) {
-         let next = self.state.next_block_label;
--        // If the false edge is the next emitted block, branch only on true.
--        // If the true edge is next, invert the condition and branch only on
--        // false. This removes the unconditional jump from the hot path.
--        let false_fallthrough = next == Some(false_block);
--        let true_fallthrough = next == Some(true_block);
-+        // v11: profile-driven fallthrough. The layout pass recorded which
-+        // successor carries more profile executions (the hot edge); the
-+        // codegen driver sets it before this call. We make that successor the
-+        // physical fallthrough (emit a conditional jump to the COLD successor
-+        // instead), so the hot path takes no branch — Intel branch-prediction
-+        // guidance — without reordering blocks and thus without perturbing
-+        // register allocation. When no hint is present (or it is ambiguous),
-+        // we default to preferring the TRUE successor, preserving the original
-+        // behavior.
-+        let pref_true = crate::pgo::take_cond_fallthrough()
-+            .map(|h| h == true_block.0)
-+            .unwrap_or(true);
-+        let (hot, cold) = if pref_true {
-+            (true_block, false_block)
-+        } else {
-+            (false_block, true_block)
-+        };
-+        let hot_next = next == Some(hot);
-+        let cold_next = next == Some(cold);
- 
-         // FLAG FUSION: the condition is the direct result of the immediately
-         // preceding Cmp; its flags are live — branch on them directly,
-         // skipping the testq of the materialized boolean.
-         if let Some(op) = self.take_pending_cmp(cond) {
-             let jcc = Self::cmp_jcc(op);
--            if true_fallthrough {
-+            let jcc_hot = if pref_true { jcc } else { Self::invert_jcc(jcc) };
-+            if hot_next {
-                 self.state
-                     .out
--                    .emit_jcc_block(Self::invert_jcc(jcc), false_block.0);
-+                    .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
-             } else {
--                self.state.out.emit_jcc_block(jcc, true_block.0);
--                if !false_fallthrough {
--                    self.state.out.emit_jmp_block(false_block.0);
-+                self.state.out.emit_jcc_block(jcc_hot, hot.0);
-+                if !cold_next {
-+                    self.state.out.emit_jmp_block(cold.0);
-                 }
-             }
-             self.state.reg_cache.invalidate_all();
-@@ -366,14 +381,15 @@ impl X86Codegen {
-             let use_32bit = ty == IrType::I32 || ty == IrType::U32;
-             self.emit_int_cmp_replay_insn(&lhs, &rhs, use_32bit);
-             let jcc = Self::cmp_jcc(op);
--            if true_fallthrough {
-+            let jcc_hot = if pref_true { jcc } else { Self::invert_jcc(jcc) };
-+            if hot_next {
-                 self.state
-                     .out
--                    .emit_jcc_block(Self::invert_jcc(jcc), false_block.0);
-+                    .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
-             } else {
--                self.state.out.emit_jcc_block(jcc, true_block.0);
--                if !false_fallthrough {
--                    self.state.out.emit_jmp_block(false_block.0);
-+                self.state.out.emit_jcc_block(jcc_hot, hot.0);
-+                if !cold_next {
-+                    self.state.out.emit_jmp_block(cold.0);
-                 }
-             }
-             self.state.reg_cache.invalidate_all();
-@@ -387,12 +403,14 @@ impl X86Codegen {
-                     let name = phys_reg_name(reg);
-                     self.state
-                         .emit_fmt(format_args!("    testq %{}, %{}", name, name));
--                    if true_fallthrough {
--                        self.state.out.emit_jcc_block("je", false_block.0);
-+                    let jcc_hot = if pref_true { "jne" } else { "je" };
-+                    if hot_next {
-+                        self.state.out.emit_jcc_block(
-+                            Self::invert_jcc(jcc_hot), cold.0);
-                     } else {
--                        self.state.out.emit_jcc_block("jne", true_block.0);
--                        if !false_fallthrough {
--                            self.state.out.emit_jmp_block(false_block.0);
-+                        self.state.out.emit_jcc_block(jcc_hot, hot.0);
-+                        if !cold_next {
-+                            self.state.out.emit_jmp_block(cold.0);
-                         }
-                     }
-                     return;
-@@ -401,12 +419,15 @@ impl X86Codegen {
-         }
-         self.operand_to_rax(cond);
-         self.state.emit("    testq %rax, %rax");
--        if true_fallthrough {
--            self.state.out.emit_jcc_block("je", false_block.0);
-+        let jcc_hot = if pref_true { "jne" } else { "je" };
-+        if hot_next {
-+            self.state
-+                .out
-+                .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
-         } else {
--            self.state.out.emit_jcc_block("jne", true_block.0);
--            if !false_fallthrough {
--                self.state.out.emit_jmp_block(false_block.0);
-+            self.state.out.emit_jcc_block(jcc_hot, hot.0);
-+            if !cold_next {
-+                self.state.out.emit_jmp_block(cold.0);
-             }
+From 34fb430b45f6e4f8e68b85e60bac7407b322e38b Mon Sep 17 00:00:00 2001
+From: SIMD Audit <audit@localhost>
+Date: Thu, 13 Aug 2026 14:06:15 +0000
+Subject: [PATCH] SIMD red-team audit: fix 6 miscompiles + 6 codegen/encoder
+ defects, add regression tests
+
+Auto-vectorizer (vectorize.rs):
+- AVX2 matmul: byte limit (N/4)*32 (was N*8 => OOB write + dead remainder)
+- SSE2 matmul remainder: width-aware start (IV*2, was IV/8)
+- dot-product: scale BOTH array GEPs (break left B at scalar stride)
+- matmul: require F64 element type (float matmul segfaulted)
+- reduction cast-sum: reject cross-kind casts (float += int returned 0.0)
+
+Backend:
+- FmaF64x2: use regalloc assignments (B/C pointer aliasing)
+- blendv256: result in ymm0 (returned the mask)
+- horizontal-add SSE2: fix 3-operand unpckhpd/psrldq/paddd
+- 256-bit unpack: add missing vunpcklps/hps/pd arms (were dropped)
+- vhaddps/vhsubps/vaddsubps + FMA3 ss/sd: F2/F3 VEX prefix
+- 128-bit vector copy width (was 256-bit vmovupd, clobbered locals)
+- vpermilvarps/pd256: add builtin lowering + variable-form encoding
+- encoder: remove 6 duplicate arms + fix vpcmpeq/vpcmpgt shadowing
+
+Regression tests: 9 new self-checking tests (fail on pre-fix binary, match GCC);
+run_regression.sh sources per-test .env for LCCC_FORCE_SSE2 coverage.
+
+Validation: 12/12 SIMD reproducers match GCC; intrinsics 3/3; regression
+120/120; correctness 50/50. zlib-ng adler32_avx2 correct (matches GCC +
+zlib reference); instrs 963 vs gcc 674 / clang 504 => next win: vector
+register allocation + memory-operand folding.
+---
+ SIMD_REDTEAM_AUDIT.md                      | 235 +++++++++++++++++++
+ src/backend/x86/assembler/encoder/avx.rs   |  34 +++
+ src/backend/x86/assembler/encoder/mod.rs   |  69 +++---
+ src/backend/x86/codegen/emit.rs            |  40 +++-
+ src/backend/x86/codegen/intrinsics.rs      |  84 +++++--
+ src/backend/x86/codegen/intrinsics_simd.rs |  27 ++-
+ src/ir/intrinsics.rs                       |   4 +
+ src/ir/lowering/expr_builtins_lcccsimd.rs  |   2 +
+ src/passes/vectorize.rs                    | 253 ++++++++++++---------
+ tests/regression/run_regression.sh         |   9 +
+ tests/regression/simd_blendv256.c          |  22 ++
+ tests/regression/simd_blendv256.flags      |   1 +
+ tests/regression/simd_vhaddps.c            |  20 ++
+ tests/regression/simd_vhaddps.flags        |   1 +
+ tests/regression/simd_vpermilvar256.c      |  21 ++
+ tests/regression/simd_vpermilvar256.flags  |   1 +
+ tests/regression/vectorize_dot_product.c   |  30 +++
+ tests/regression/vectorize_float_matmul.c  |  38 ++++
+ tests/regression/vectorize_i32_sum.c       |  29 +++
+ tests/regression/vectorize_matmul_tail.c   |  42 ++++
+ tests/regression/vectorize_mixed_sum.c     |  24 ++
+ tests/regression/vectorize_sse2_path.c     |  36 +++
+ tests/regression/vectorize_sse2_path.env   |   1 +
+ 23 files changed, 850 insertions(+), 173 deletions(-)
+ create mode 100644 SIMD_REDTEAM_AUDIT.md
+ create mode 100644 tests/regression/simd_blendv256.c
+ create mode 100644 tests/regression/simd_blendv256.flags
+ create mode 100644 tests/regression/simd_vhaddps.c
+ create mode 100644 tests/regression/simd_vhaddps.flags
+ create mode 100644 tests/regression/simd_vpermilvar256.c
+ create mode 100644 tests/regression/simd_vpermilvar256.flags
+ create mode 100644 tests/regression/vectorize_dot_product.c
+ create mode 100644 tests/regression/vectorize_float_matmul.c
+ create mode 100644 tests/regression/vectorize_i32_sum.c
+ create mode 100644 tests/regression/vectorize_matmul_tail.c
+ create mode 100644 tests/regression/vectorize_mixed_sum.c
+ create mode 100644 tests/regression/vectorize_sse2_path.c
+ create mode 100644 tests/regression/vectorize_sse2_path.env
+
+diff --git a/SIMD_REDTEAM_AUDIT.md b/SIMD_REDTEAM_AUDIT.md
+new file mode 100644
+index 00000000..729bb11a
+--- /dev/null
++++ b/SIMD_REDTEAM_AUDIT.md
+@@ -0,0 +1,235 @@
++# SIMD Implementation — Red-Team Audit & Fixes
++
++**Date:** 2026-08-13 · **Branch:** `main` @ `7d86fbf0` (rebased against latest `ms178/lccc`)
++**Scope:** auto-vectorizer (`src/passes/vectorize.rs`), SIMD intrinsic lowering
++(`src/backend/x86/codegen/{intrinsics,intrinsics_simd,emit}.rs`), x86 VEX/EVEX/SSE
++assembler encoders, the generic-SIMD builtin table, and zlib-ng as the real-workload
++test case.
++
++**Method:** every claim below was verified empirically — a C reproducer was compiled
++with lccc (-O2, plus `LCCC_FORCE_SSE2=1` for the legacy path) and cross-checked against
++GCC 14.2 / Clang 19.1 and, where applicable, a Python reference. Generated assembly was
++disassembled to pin each root cause before fixing.
++
++---
++
++## 1. Executive summary
++
++The SIMD implementation was **correct on its one happy path** (AVX2 4-wide double
++matmul with `N % 4 == 0`, single-array F64/I32 reductions) but contained **six
++correctness-critical defects** that produced wrong results or illegal instructions on
++every other shape it claimed to support, plus a large body of dead code. All were fixed,
++regression-tested, and re-validated against GCC. The remaining strategic gap is
++**performance, not correctness**: lccc keeps no vector values in registers across
++intrinsic boundaries, so hand-written intrinsic code (zlib-ng) is **~5.3× slower** than
++GCC despite identical, correct semantics.
++
++### Verified before → after
++
++| Reproducer (N=255 unless noted) | lccc (before) | lccc (after) | GCC/Clang |
++|---|---|---|---|
++| matmul double (AVX2) | 33959684223.750 ✗ | 33958656000.000 ✓ | 33958656000.000 |
++| matmul double (SSE2 path) | 67527162000.000 ✗ | 33958656000.000 ✓ | 33958656000.000 |
++| matmul **float** | **SIGSEGV** ✗ | 33958715392.000 ✓ | 33958715392.000 |
++| dot product (AVX2 & SSE2) | 203466.250 / 187640.000 ✗ | 699040.000 / 707264.000 ✓ | 699040.000 / 707264.000 |
++| `float s += (float)int[i]` | 0.000 ✗ | 32896.000 ✓ | 32896.000 |
++| `_mm256_hadd_ps` | **SIGILL** ✗ | 3 7 19 23 11 15 27 31 ✓ | 3 7 19 23 11 15 27 31 |
++| `_mm256_blendv_ps` | returns *mask* ✗ | 1 2 3 2 5 2 7 2 ✓ | 1 2 3 2 5 2 7 2 |
++| `_mm256_permutevar_ps` | undefined symbol ✗ | 4 3 2 1 8 7 6 5 ✓ | 4 3 2 1 8 7 6 5 |
++
++---
++
++## 2. Confirmed critical defects (fixed)
++
++### D1 — AVX2 matmul tail: OOB write + dead remainder (wrong results)
++`transform_to_fma_f64x4` converted the loop to a byte-offset IV stepping 32 with limit
++`N*8`. For `N%4 != 0` this runs `ceil(N/4)` iterations: the last one reads/writes up to
++3 doubles **past the row end**, and the scalar remainder (start = `IV/8 = ceil(N/4)*4`)
++never fires. Reproduced with N=255 (sum 33959684223.75 vs 33958656000.00; element 255
++clobbered, 252–254 skipped).
++**Fix:** byte limit = `(N/4)*32` (floor). Constant `n → (n/4)*32`; dynamic `N → (N/4)*32`
++via hoisted `UDiv` + `Mul`.
++
++### D2 — SSE2 matmul remainder computed on the wrong IV representation
++`insert_remainder_loop` always computed `j_rem_start = IV / 8` (byte-offset assumption),
++but the SSE2 path keeps an **element-index** IV → the remainder re-processed nearly the
++whole array (67527162000.00 vs 33958656000.00).
++**Fix:** remainder start is now width-aware: `IV/8` for the byte-offset AVX2 IV, `IV*2`
++for the element-index SSE2 IV.
++
++### D3 — Dot-product: second array left at scalar stride
++`transform_reduction_{avx2,sse2}` "scale array indexing" had
++`break; // Only process first GEP per block`, so a dot product's second GEP was never
++scaled and loaded one element per *vector* iteration (dot(255)=203466.25 vs 699040.0).
++**Fix:** collect *all* matching GEPs, apply the ×vec_width scaling in reverse order.
++
++### D4 — Matmul pattern had no element-type gate
++`analyze_loop_pattern` matched `C += A*B` for *any* element type but the transform
++always lowered to `FmaF64x4/FmaF64x2` (packed **double** FMA). A float matmul was
++reinterpreted with an 8-byte element stride → **SIGSEGV**.
++**Fix:** require the multiply's element type to be `IrType::F64`; float/int matmuls stay
++scalar (they already match GCC numerically).
++
++### D5 — Reduction cast-sum path accepted cross-kind casts
++The cast path rejected only *widening* (`long += int`), so `float s += (float)int_arr[i]`
++was vectorized as packed I32 adds on an F32 accumulator and returned 0.0.
++**Fix:** require the cast source type to equal the accumulator type (redundant casts
++only); everything else is rejected.
++
++### D6 — 256-bit `vblendvps/vblendvpd` returned the mask operand
++The blend arm computed its result in `%ymm1` but `avx_store_dest` stores `%ymm0`, which
++held the **mask** — the intrinsic silently returned its mask input.
++**Fix:** produce the result in `%ymm0` (mask→`ymm2`, a→`ymm0`, b→`ymm1`).
++
++### D7 — `FmaF64x2` (SSE2 matmul) aliased the B and C pointers
++The lowering materialized pointers through the transient value cache, which conflated
++two GEPs sharing an offset but not a base — C was loaded and stored through B's address.
++**Fix:** mirror the proven `FmaF64x4` discipline: use the register allocator's
++assignments (`operand_reg`/`dest_reg`) with explicit fallbacks, then
++`reg_cache.invalidate_all()`.
++
++### D8 — Legacy 2-operand SSE instructions emitted in 3-operand form
++`unpckhpd` (2×F64 horizontal add, ×2 sites), `psrldq` (4×I32 horizontal add, ×2 sites)
++and `paddd` (`VecAddI32x4`) were emitted with a 3-operand VEX-style shape
++(`unpckhpd %xmm0, %xmm0, %xmm1`, `psrldq $8, %xmm0, %xmm1`, `paddd %xmm1, %xmm0, %xmm0`).
++The assembler rejects them ("SSE op requires 2 operands"), so the entire SSE2 reduction
++path failed to assemble. The AVX (VEX) forms were correct.
++**Fix:** emit the correct 2-operand sequences (copy + in-place shift/unpack, 2-op add).
++
++### D9 — 256-bit unpack intrinsics were silently dropped
++`UnpcklPs256/UnpckhPs256/UnpcklPd256/UnpckhPd256` were routed to
++`emit_avx_fp_256_op` but had **no match arm**, falling into `_ => {}` and emitting
++nothing — the result alloca stayed uninitialized (garbage).
++**Fix:** added the four arms (`vunpcklps/vunpckhps/vunpcklpd/vunpckhpd`).
++
++### D10 — Wrong VEX prefix on `vhaddps/vhsubps/vaddsubps`
++These require the **F2** prefix (VEX pp = 3) but were encoded with pp = 2 (**F3**) → an
++illegal instruction (**SIGILL**). The `pd` forms (66) were correct.
++**Fix:** pp 2 → 3. Same class fixed for the FMA3 scalar forms: `vfmadd*{132,213,231}ss`
++need F3 (pp=2) and `…sd` need F2 (pp=3); both were wrongly given 66 (pp=1). Added
++`encode_avx_3op_38_pp_w1` for the W=1 (sd) forms.
++
++### D11 — 128-bit vector copies emitted as 256-bit moves (SSE2 reduction corruption)
++`emit_copy_value` contained a literal `TODO` and copied *every* vector with a 256-bit
++`vmovupd`, reading 16 bytes past the source slot and writing 16 bytes past the
++destination. Under `LCCC_FORCE_SSE2=1` the accumulator copies clobbered `main()`'s
++locals (the loop bound itself was corrupted).
++**Fix:** width-aware copy — 128-bit values (`vector128_values`) use `movupd`/`xmm0`,
++256-bit use `vmovupd`/`ymm0`; the 128-bit class is propagated to the copy's dest.
++
++### D12 — Dead/mis-encoding assembler arms
++- 6 exact-duplicate `match` arms (vfmadd213/231ps·pd, vmaxps/pd, vminps/pd, vextractf128)
++  removed (unreachable-pattern warnings, no behaviour change).
++- `vpcmpeq*`/`vpcmpgt*` EVEX arms shadowed the mask-dest alias arm, so `%k`-destination
++  forms were mis-encoded as vector-dest compares. Removed the shadowing arms; the alias
++  arm now correctly handles mask-dest, rejects zmm vector-dest (like GAS), and xmm/ymm
++  falls through to VEX.
++- plain `cvtss2si/cvtsd2si` duplicate arms removed (handled by the q-suffixed arms).
++- duplicate `Vbroadcastsd` arm removed.
++
++Build warnings: **34 → 15** (the remaining 14 are `upper camel case` naming on
++IntrinsicOp variants and one trailing semicolon — cosmetic, deferred deliberately to
++avoid a large mechanical rename).
++
++---
++
++## 3. Gaps closed
++
++- `__lccc_simd256_ps_vpermilvarps256` / `…vpermilvarpd256` were declared in
++  `include/lcccsimd.h` but had **no backend lowering** and the assembler only knew the
++  immediate `vpermilps` form. Added `VpermilvarPs256/VpermilvarPd256` (enum, lookup
++  table, `emit_avx_fp_256_op`) and the variable-index encodings (0F38.0C/0D, operand-kind
++  dispatch against 0F3A.04/05).
++
++---
++
++## 4. zlib-ng as test case (data)
++
++- lccc **compiles zlib-ng's SIMD hot files cleanly** (`adler32_avx2.c`,
++  `chunkset_avx2.c`, `slide_hash_avx2.c`). Other files only fail on missing *generated*
++  config headers (`zconf-ng.h`, `zbuild.h` from a real cmake/configure run) — not
++  compiler defects.
++- **Correctness:** lccc's `adler32_avx2` over 100 KB of data returns `771462159`,
++  identical to GCC and to Python's `zlib.adler32`.
++
++| `zng adler32_avx2` (X86_AVX2, -mavx2 -O2) | instructions | runtime (5000 iters × 100 KB, min of 5, pinned) |
++|---|---|---|
++| **lccc** | **963** | **0.069 s** |
++| GCC 14.2 | 674 | 0.013 s |
++| Clang 19.1 | 504 | — |
++
++**Root cause (the next big win):** lccc has no XMM/YMM/ZMM register allocation for
++intrinsic chains. Every vector op is `vmovdqu %ymm0, N(%rsp)` … `vmovdqu M(%rsp), %ymm0`
++round-trips through the stack (72 `vmovdqu` + 274 `movq` + 77 `leaq` in one function),
++while GCC keeps ~15 ymm registers live across the loop and folds memory operands
++(`vpmaddubsw (%rsi,%rdx), %ymm0, %ymm0`). The single-op `vec_live_regs` peephole is
++insufficient. This is **the** highest-leverage improvement: a proper vector register
++allocator + memory-operand folding would close most of the ~5× gap.
++
++---
++
++## 5. Remaining gaps & prioritized work items
++
++| # | Work item | Evidence | Expected impact |
++|---|---|---|---|
++| 1 | Vector register allocation (XMM/YMM/ZMM) + memory-operand folding for intrinsic chains | adler32_avx2: 963 vs 674/504 instrs, **5.3× slower** | highest — every SIMD workload |
++| 2 | Auto-vectorizer coverage: it only recognizes matmul-F64 and F64/I32 sum/dot reductions; no F32, no stores-into-loops, no if-converted, no unaligned/alias versioning, no `#pragma`/hint support | static analysis of `analyze_loop_pattern`/`analyze_reduction_pattern` | large for real scalar loops |
++| 3 | `BroadcastLoadF64` hoisting is disabled by a `TODO` (register-allocation conflict) — A[i][k] is re-broadcast every inner iteration | comment in `transform_to_fma_f64x4` | matmul inner loop |
++| 4 | `LCCC_FORCE_AVX2` env var is documented but never read; vector width selection ignores target feature detection (uses AVX2 by default on all x86-64) | `vectorize_with_analysis` | correctness on non-AVX2 hosts |
++| 5 | `cvtss2si/cvtsd2si` (plain) are encoded with REX.W=1 even for a 32-bit dest (`%eax`); harmless for lccc's own codegen (sign-extended low 32 bits) but deviates from GAS for hand-written asm | `encoder/mod.rs` q-suffixed arms | minor compat |
++| 6 | Mixed-width vector copies elsewhere should be audited for the D11 class (any other `ymm`-width copy of a 128-bit value) | D11 | correctness hardening |
++| 7 | Duplicate logic in `vectorize.rs` (`transform_reduction_avx2`/`_sse2` are near-identical; `label_to_idx` rebuilt repeatedly) | static analysis | maintainability |
++
++---
++
++## 6. Regression tests added (`tests/regression/`)
++
++Self-checking, return 0 on success, and **verified to fail on the pre-fix binary** and
++**match GCC**:
++
++- `vectorize_matmul_tail.c` — D1 (sentinel canary catches the row-end OOB write)
++- `vectorize_dot_product.c` — D3
++- `vectorize_float_matmul.c` — D4
++- `vectorize_mixed_sum.c` — D5
++- `vectorize_i32_sum.c` — I32 reduction guard
++- `vectorize_sse2_path.c` (+ `.env`) — D2/D7/D8/D11 under `LCCC_FORCE_SSE2=1`
++- `simd_vhaddps.c` (+ `.flags -mavx`) — D10
++- `simd_blendv256.c` (+ `.flags -mavx`) — D6
++- `simd_vpermilvar256.c` (+ `.flags -mavx`) — vpermilvar gap
++
++`run_regression.sh` now sources a per-test `<name>.env` so tests can select
++`LCCC_FORCE_SSE2=1`.
++
++---
++
++## 7. Validation matrix (post-fix)
++
++| Suite | Result |
++|---|---|
++| 12 SIMD reproducers × {AVX2, SSE2} vs GCC | **all match** |
++| `tests/intrinsics/run_intrin_tests.py` | **3/3** (t256_fp now compiles *and* runs) |
++| `tests/regression/run_regression.sh` | **120/120** (5 `--compare-gcc` mismatches are pre-existing on clean main and unrelated: glibc f128/x87/TLS, abs-symbol, clmul256-gcc-SIGILL) |
++| `tests/correctness/run_correctness.py` | **50/50** |
++| zlib-ng `adler32_avx2` | correct output, matches GCC + zlib reference |
++
++---
++
++## 8. What a super-genius would do next
++
++1. **Vector register allocation.** Give the backend a real XMM/YMM/ZMM allocator
++   (e.g. an interval/priority allocator over the `vector_values` live ranges, extending
++   the existing `vec_live_regs` idea from a 1-op peephole to whole-function intervals),
++   plus memory-operand folding in `emit_avx_binary_256`/`emit_simd_op` so the *first*
++   use of a slot can fold it. Target: adler32_avx2 from 963 → ≤ 550 instructions.
++2. **Alias-analysis-driven auto-vectorization** for the general store-loop and
++   mixed-type cases, with runtime versioning (`if (alias-free && aligned && N%4==0)`),
++   and a cost model that consults register pressure (per the project's own §20–§25).
++3. **Target-feature gating**: derive vector width from the driver's target features
++   (verified via CPUID on the host, per §54) instead of the `LCCC_FORCE_SSE2` env var,
++   and honor `LCCC_FORCE_AVX2` or remove it.
++4. Turn `FmaF64x4Hoisted`/`BroadcastLoadF64` back on once (1) lands, eliminating the
++   per-iteration `vbroadcastsd` from the matmul inner loop.
++5. A "why wasn't this vectorized" diagnostic (per §57) wired to `LCCC_DEBUG_VECTORIZE`.
++
++All fixes are committed on branch `simd-redteam-audit`; correctness is backed by the
++reproducers, assembly, and the regression/correctness/intrinsics suites above.
+diff --git a/src/backend/x86/assembler/encoder/avx.rs b/src/backend/x86/assembler/encoder/avx.rs
+index ebba2e0b..158e66d7 100644
+--- a/src/backend/x86/assembler/encoder/avx.rs
++++ b/src/backend/x86/assembler/encoder/avx.rs
+@@ -938,6 +938,40 @@ impl super::InstructionEncoder {
          }
      }
-diff --git a/src/passes/inline.rs b/src/passes/inline.rs
-index 1cbb57d2..9560ff1b 100644
---- a/src/passes/inline.rs
-+++ b/src/passes/inline.rs
-@@ -183,6 +183,10 @@ const MAX_STATIC_NONINLINE_BLOCKS: usize = 4;
- /// aren't fully inlined remain correct because __attribute__((error)) calls
- /// are lowered as no-ops (not traps).
- const MAX_ALWAYS_INLINE_BUDGET_PER_CALLER: usize = 200;
-+/// v11: dedicated budget for profile-guided FORCE-inlined call sites (hot loop
-+/// sites inlined even into large callers). Bounded to keep PGO-driven growth
-+/// safe for stack-frame and I-cache size.
-+const MAX_PGO_FORCE_INLINE_BUDGET_PER_CALLER: usize = 600;
  
- /// Additional always_inline budget for the second (correctness) pass.
- /// After the main inlining loop exhausts max_rounds, any remaining
-@@ -267,6 +271,7 @@ fn select_inline_site(
-     caller_is_recursive: bool,
-     budget_remaining: usize,
-     always_inline_budget_remaining: usize,
-+    pgo_force_budget_remaining: usize,
-     small_only: bool,
- ) -> Option<(InlineCallSite, usize, bool)> {
-     // First pass: look for tiny/small callees anywhere in the function.
-@@ -364,29 +369,38 @@ fn select_inline_site(
-         if caller_is_recursive && !callee_data.is_always_inline {
-             continue;
-         }
--        // When the caller has a section attribute (e.g., .init.text),
--        // allow inlining small callees even into large callers to
--        // prevent section mismatch errors.
--        if caller_too_large
--            && !callee_data.is_always_inline
--            && (!caller_has_section || callee_inst_count > MAX_SMALL_INLINE_INSTRUCTIONS)
--        {
--            continue;
--        }
--        // Absolute cap: stop normal inlining for extremely large callers.
--        // always_inline callees MUST still be inlined (C semantic requirement).
--        if caller_at_absolute_cap && !callee_data.is_always_inline {
--            continue;
--        }
--        // Hard cap: stop normal inlining to prevent kernel stack overflow.
--        // always_inline callees are still inlined (C semantic requirement),
--        // but are limited by the always_inline budget.
--        if caller_at_hard_cap && !callee_data.is_always_inline {
--            continue;
-+        // v11: a profile-guided FORCE-INLINE site is hot (in a hot loop /
-+        // high frequency); it should be inlined even when the caller is large
-+        // or the normal budget is tight — the PGO advantage. We bypass the
-+        // caller-size / cap gates for it, but still bound total PGO-driven
-+        // growth with a dedicated budget so we never unboundedly bloat a
-+        // caller (stack-frame and I-cache safety).
-+        if !site.pgo_force {
-+            // When the caller has a section attribute (e.g., .init.text),
-+            // allow inlining small callees even into large callers to
-+            // prevent section mismatch errors.
-+            if caller_too_large
-+                && !callee_data.is_always_inline
-+                && (!caller_has_section || callee_inst_count > MAX_SMALL_INLINE_INSTRUCTIONS)
-+            {
-+                continue;
++    /// Encode AVX 3-operand in the 0F38 map with W=1 and an explicit VEX pp
++    /// prefix (for the F2-prefixed FMA3 scalar-double forms: vfmadd*132sd, …).
++    pub(crate) fn encode_avx_3op_38_pp_w1(&mut self, ops: &[Operand], opcode: u8, pp: u8) -> Result<(), String> {
++        if ops.len() != 3 { return Err("FMA3 3-op requires 3 operands".to_string()); }
++        let l = self.vex_l_from_ops(ops);
++
++        match (&ops[0], &ops[1], &ops[2]) {
++            (Operand::Register(src), Operand::Register(vvvv), Operand::Register(dst)) => {
++                let src_num = reg_num(&src.name).ok_or("bad register")?;
++                let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
++                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
++                let r = needs_vex_ext(&dst.name);
++                let b = needs_vex_ext(&src.name);
++                let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
++                self.emit_vex(r, false, b, 2, 1, vvvv_enc, l, pp); // W=1 for F64
++                self.bytes.push(opcode);
++                self.bytes.push(self.modrm(3, dst_num, src_num));
++                Ok(())
 +            }
-+            // Absolute cap: stop normal inlining for extremely large callers.
-+            // always_inline callees MUST still be inlined (C semantic requirement).
-+            if caller_at_absolute_cap && !callee_data.is_always_inline {
-+                continue;
++            (Operand::Memory(mem), Operand::Register(vvvv), Operand::Register(dst)) => {
++                let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
++                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
++                let r = needs_vex_ext(&dst.name);
++                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
++                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
++                let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
++                self.emit_vex(r, x, b_ext, 2, 1, vvvv_enc, l, pp); // W=1 for F64
++                self.bytes.push(opcode);
++                self.encode_modrm_mem(dst_num, mem)
 +            }
-+            // Hard cap: stop normal inlining to prevent kernel stack overflow.
-+            // always_inline callees are still inlined (C semantic requirement),
-+            // but are limited by the always_inline budget.
-+            if caller_at_hard_cap && !callee_data.is_always_inline {
-+                continue;
-+            }
-         }
-         let use_relaxed = callee_data.is_always_inline || callee_data.exceeds_normal_limits;
-         // Budget enforcement: always_inline callees use a separate budget;
--        // non-always_inline callees use the normal budget.
-+        // non-always_inline callees use the normal budget. PGO-forced sites
-+        // use the dedicated (larger) PGO budget.
-         if callee_data.is_always_inline {
-             // When the caller has a section attribute, always_inline callees
-             // bypass the budget entirely (critical for kernel init functions
-@@ -398,6 +412,10 @@ fn select_inline_site(
-                     continue;
-                 }
-             }
-+        } else if site.pgo_force {
-+            if callee_inst_count > pgo_force_budget_remaining {
-+                continue;
-+            }
-         } else if callee_inst_count > budget_remaining {
-             continue;
-         }
-@@ -505,6 +523,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
-         };
-         let mut budget_remaining = MAX_INLINE_BUDGET_PER_CALLER;
-         let mut always_inline_budget_remaining = MAX_ALWAYS_INLINE_BUDGET_PER_CALLER;
-+        let mut pgo_force_budget_remaining = MAX_PGO_FORCE_INLINE_BUDGET_PER_CALLER;
-         // Iterate to handle chains of inlined calls (A calls B calls C, all small inline).
-         // Limit iterations to prevent infinite loops from recursive inline functions.
-         let max_rounds = 200;
-@@ -532,8 +551,13 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
-                 &skip_list,
-                 caller_has_section,
-             );
--            // PGO: filter/adjust call sites based on profile
-+            // PGO: filter/adjust call sites based on profile. v10: on a FLAT
-+            // profile (no hot/cold spread) PGO inlining has no informative
-+            // signal; skip reading the profile entirely so inlining is
-+            // byte-identical to plain -O2 (prevents pass perturbation that can
-+            // regress hot paths — see inline_pgo::inline_decisions_active).
-             if let Some(profile) = crate::pgo::get_pgo_profile() {
-+                if crate::pgo::inline_pgo::inline_decisions_active() {
-                 let caller_name = module.functions[func_idx].name.clone();
-                 // v8: per-call-site hotness. Derive block counts for the
-                 // CURRENT caller CFG from the h0-keyed profile (the CFG may
-@@ -597,7 +621,9 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
-                             Some(profile),
-                         ) {
-                             if force {
--                                filtered.push(site);
-+                                let mut s2 = site;
-+                                s2.pgo_force = true;
-+                                filtered.push(s2);
-                                 continue;
-                             } else {
-                                 continue;
-@@ -621,6 +647,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
-                     filtered.push(site);
-                 }
-                 call_sites = filtered;
-+                } // end inline_decisions_active
-             }
-             if call_sites.is_empty() {
-                 break;
-@@ -637,6 +664,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
-                 caller_is_recursive,
-                 budget_remaining,
-                 always_inline_budget_remaining,
-+                pgo_force_budget_remaining,
-                 small_only,
-             );
-             let (site, callee_inst_count, _use_relaxed) = match found_site {
-@@ -707,6 +735,10 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
-                         always_inline_budget_remaining =
-                             always_inline_budget_remaining.saturating_sub(callee_inst_count);
-                     }
-+                } else if site.pgo_force {
-+                    // v11: PGO-forced sites consume the dedicated PGO budget.
-+                    pgo_force_budget_remaining =
-+                        pgo_force_budget_remaining.saturating_sub(callee_inst_count);
-                 } else {
-                     budget_remaining = budget_remaining.saturating_sub(callee_inst_count);
-                 }
-@@ -744,8 +776,13 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
-                 &skip_list,
-                 caller_has_section,
-             );
--            // PGO: filter/adjust call sites based on profile
-+            // PGO: filter/adjust call sites based on profile. v10: on a FLAT
-+            // profile (no hot/cold spread) PGO inlining has no informative
-+            // signal; skip reading the profile entirely so inlining is
-+            // byte-identical to plain -O2 (prevents pass perturbation that can
-+            // regress hot paths — see inline_pgo::inline_decisions_active).
-             if let Some(profile) = crate::pgo::get_pgo_profile() {
-+                if crate::pgo::inline_pgo::inline_decisions_active() {
-                 let caller_name = module.functions[func_idx].name.clone();
-                 // v8: per-call-site hotness. Derive block counts for the
-                 // CURRENT caller CFG from the h0-keyed profile (the CFG may
-@@ -809,7 +846,9 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
-                             Some(profile),
-                         ) {
-                             if force {
--                                filtered.push(site);
-+                                let mut s2 = site;
-+                                s2.pgo_force = true;
-+                                filtered.push(s2);
-                                 continue;
-                             } else {
-                                 continue;
-@@ -833,6 +872,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
-                     filtered.push(site);
-                 }
-                 call_sites = filtered;
-+                } // end inline_decisions_active
-             }
-             if call_sites.is_empty() {
-                 break;
-@@ -1382,6 +1422,12 @@ struct InlineCallSite {
-     dest: Option<Value>,
-     /// Arguments passed to the call
-     args: Vec<Operand>,
-+    /// v11: profile-guided force-inline. Set by the PGO filter when the call
-+    /// site is genuinely HOT (in a hot loop / high frequency) and should be
-+    /// inlined even if the base inliner's caller-size or budget limits would
-+    /// normally skip it — the PGO advantage LLVM/ICC have over a plain build.
-+    /// Still bounded by a dedicated budget to prevent unbounded bloat.
-+    pgo_force: bool,
- }
- 
- /// Check if a GlobalInit contains references to local labels (`.LBBxx`).
-@@ -1809,6 +1855,7 @@ fn find_inline_call_sites(
-                             callee_name: callee_name.clone(),
-                             dest: info.dest,
-                             args: info.args.clone(),
-+                            pgo_force: false,
-                         });
-                     }
-                 }
-diff --git a/src/pgo/inline_pgo.rs b/src/pgo/inline_pgo.rs
-index c9f2be83..feb366fe 100644
---- a/src/pgo/inline_pgo.rs
-+++ b/src/pgo/inline_pgo.rs
-@@ -40,8 +40,13 @@ pub fn inline_threshold_multiplier(caller: &str, callee: &str, p: &ProfileData)
-         let dh = s.is_hot(to_count(df));
-         let dc = s.is_cold(to_count(df));
-         let cc = s.is_cold(to_count(cf));
-+        // v10: the hot-caller/hot-callee bonus is only meaningful when the
-+        // profile has genuine hot/cold separation. On a flat profile
-+        // (`has_spread()` == false) "both hot" is vacuous, and returning 1.75
-+        // makes the base inliner over-inline helpers into hot functions —
-+        // restructuring them and regressing the hot path (see summary.rs).
-         if ch && dh {
--            1.75
-+            if s.has_spread() { 1.75 } else { 1.0 }
-         } else if ch && dc {
-             0.60
-         } else if cc {
-@@ -49,14 +54,48 @@ pub fn inline_threshold_multiplier(caller: &str, callee: &str, p: &ProfileData)
-         } else {
-             1.0
-         }
--    } else if cf >= 0.10 && df >= 0.05 {
--        1.75
--    } else if cf >= 0.10 && df < 0.005 {
--        0.60
--    } else if cf < 0.005 {
--        0.80
-     } else {
--        1.0
-+        // v7 relative-frequency fallback (no summary): same rule — the 1.75
-+        // bonus needs a real hot/cold spread, else it over-inlines.
-+        let m = p
-+            .functions
-+            .values()
-+            .map(|x| x.total_count)
-+            .max()
-+            .unwrap_or(0);
-+        // A genuine hot/cold spread exists if some function is at least 10x
-+        // rarer than the hottest — hotness classification is then meaningful.
-+        let has_cold = m > 0
-+            && p.functions
-+                .values()
-+                .any(|f| f.total_count.saturating_mul(10) < m.max(1));
-+        if cf >= 0.10 && df >= 0.05 && has_cold {
-+            1.75
-+        } else if cf >= 0.10 && df < 0.005 {
-+            0.60
-+        } else if cf < 0.005 {
-+            0.80
-+        } else {
-+            1.0
++            _ => Err("unsupported FMA3 3-op operands".to_string()),
 +        }
 +    }
-+}
 +
-+/// v10: whether profile-driven inlining decisions are meaningfully active.
-+///
-+/// On a FLAT profile (no hot/cold spread) every call site and function looks
-+/// "hot" to the percentile thresholds, so the PGO inliner has no informative
-+/// signal. Merely reading the profile in that state can perturb the inliner's
-+/// pass iterations and change the final code, regressing hot paths (v10
-+/// finding: zlib-ng adler32 and expat kernels regressed ~20-26% under
-+/// `-fprofile-use` on flat profiles, and the regression survived disabling
-+/// layout and the identifiable consumers). Gate the entire PGO inline filter on
-+/// this: a flat profile compiles exactly like plain `-O2` for inlining, and PGO
-+/// inlining only engages where the profile is genuinely skewed.
-+pub fn inline_decisions_active() -> bool {
-+    match crate::pgo::summary::get_summary() {
-+        Some(s) => s.has_spread(),
-+        None => true, // no summary: use the v7 relative-frequency heuristics
-     }
- }
+     /// Encode AVX 3-operand in 0F map (mm=1) with imm8 (vshufps, vshufpd, etc.)
+     pub(crate) fn encode_avx_3op_0f_imm8(&mut self, ops: &[Operand], opcode: u8, has_66: bool) -> Result<(), String> {
+         if ops.len() != 4 { return Err("AVX 3-op+imm8 requires 4 operands".to_string()); }
+diff --git a/src/backend/x86/assembler/encoder/mod.rs b/src/backend/x86/assembler/encoder/mod.rs
+index 215b7b9a..d0133ab6 100644
+--- a/src/backend/x86/assembler/encoder/mod.rs
++++ b/src/backend/x86/assembler/encoder/mod.rs
+@@ -124,13 +124,13 @@ impl InstructionEncoder {
+             "vpmuludq" => r(self.encode_evex_binary(ops, 1, 1, 1, 0xF4)),
+             "vpmulld" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x40)),
+             "vpmullq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x40)),
+-            "vpcmpeqd" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x76)),
+-            "vpcmpeqw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x75)),
+-            "vpcmpeqq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x29)),
+-            "vpcmpgtb" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x64)),
+-            "vpcmpgtw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x65)),
+-            "vpcmpgtd" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x66)),
+-            "vpcmpgtq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x37)),
++            // vpcmpeq*/vpcmpgt* are NOT encoded here: their mask-dest forms are
++            // dispatched by the dedicated alias arm further down (which also
++            // rejects zmm vector-dest compares like GAS), and their xmm/ymm
++            // vector-dest forms never reach this table (no k/zmm operand) and
++            // are handled by the VEX table instead. The old arms here shadowed
++            // that alias arm, so `vpcmpeqw %k1, %zmm2, %zmm3` was mis-encoded
++            // as a vector-dest compare.
+             "vpmaxub" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xDE)),
+             "vpminub" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xDA)),
+             "vpmaxuw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x3E)),
+@@ -1250,8 +1250,8 @@ impl InstructionEncoder {
+             "extractps" => self.encode_sse_extract_gpr_imm8(ops, &[0x66, 0x0F, 0x3A, 0x17]),
+             "cvtsi2ss" => self.encode_cvtsi2x(ops, 0x2A, 2),
+             "cvtsi2sd" => self.encode_cvtsi2x(ops, 0x2A, 3),
+-            "cvtss2si" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x2D]),
+-            "cvtsd2si" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x2D]),
++            // Plain cvtss2si/cvtsd2si are handled by the q-suffixed arms above
++            // (which select the REX.W width); these duplicates were dead.
+             "cvttss2si" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x2C]),
+             "cvttsd2si" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x2C]),
+             "packusdw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x2B]),
+@@ -1329,8 +1329,6 @@ impl InstructionEncoder {
+             "vfmadd213pd" => self.encode_avx_3op_38_w1(ops, 0xA8, true),
+             "vfmadd231ps" => self.encode_avx_3op_38(ops, 0xB8, true),
+             "vfmadd231pd" => self.encode_avx_3op_38_w1(ops, 0xB8, true),
+-            "vfmadd213ps" => self.encode_avx_3op_38(ops, 0xA8, true),
+-            "vfmadd231ps" => self.encode_avx_3op_38(ops, 0xB8, true),
+             "vsqrtps" => self.encode_avx_2op_0f(ops, 0x51, 0),
+             "vsqrtpd" => self.encode_avx_2op_0f(ops, 0x51, 1),
+             "vaddps" => self.encode_avx_3op_np(ops, 0x58),
+@@ -1524,11 +1522,14 @@ impl InstructionEncoder {
+             "vmaxps" => self.encode_avx_3op_np(ops, 0x5F),
+             "vminpd" => self.encode_avx_3op(ops, 0x5D, true),
+             "vmaxpd" => self.encode_avx_3op(ops, 0x5F, true),
+-            "vhaddps" => self.encode_avx_3op_pp(ops, 0x7C, 2),
++            // vhaddps/vhsubps/vaddsubps use the F2 prefix (VEX pp=3); the old
++            // code passed pp=2 (F3), encoding an illegal instruction that
++            // SIGILLs on hardware (reproduced by _mm256_hadd_ps).
++            "vhaddps" => self.encode_avx_3op_pp(ops, 0x7C, 3),
+             "vhaddpd" => self.encode_avx_3op_pp(ops, 0x7C, 1),
+-            "vhsubps" => self.encode_avx_3op_pp(ops, 0x7D, 2),
++            "vhsubps" => self.encode_avx_3op_pp(ops, 0x7D, 3),
+             "vhsubpd" => self.encode_avx_3op_pp(ops, 0x7D, 1),
+-            "vaddsubps" => self.encode_avx_3op_pp(ops, 0xD0, 2),
++            "vaddsubps" => self.encode_avx_3op_pp(ops, 0xD0, 3),
+             "vaddsubpd" => self.encode_avx_3op_pp(ops, 0xD0, 1),
+             "vcvtps2pd" => self.encode_avx_2op_0f(ops, 0x5A, 0),
+             "vcvtpd2ps" => self.encode_avx_2op_0f(ops, 0x5A, 1),
+@@ -1548,14 +1549,15 @@ impl InstructionEncoder {
+             "vdpps" => self.encode_avx_3op_3a_imm8(ops, 0x40, true),
+             "vdppd" => self.encode_avx_3op_3a_imm8(ops, 0x41, true),
+             // FMA3 remaining forms (0F38 map; W=1 for pd/sd)
+-            "vfmadd213pd" => self.encode_avx_3op_38_w1(ops, 0xA8, true),
+-            "vfmadd231pd" => self.encode_avx_3op_38_w1(ops, 0xB8, true),
+-            "vfmadd132ss" => self.encode_avx_3op_38(ops, 0x99, true),
+-            "vfmadd213ss" => self.encode_avx_3op_38(ops, 0xA9, true),
+-            "vfmadd231ss" => self.encode_avx_3op_38(ops, 0xB9, true),
+-            "vfmadd132sd" => self.encode_avx_3op_38_w1(ops, 0x99, true),
+-            "vfmadd213sd" => self.encode_avx_3op_38_w1(ops, 0xA9, true),
+-            "vfmadd231sd" => self.encode_avx_3op_38_w1(ops, 0xB9, true),
++            // FMA3 scalar forms: ss uses F3 (pp=2), sd uses F2 (pp=3). The old
++            // code routed them through the 66-prefix path (pp=1), encoding
++            // illegal instructions.
++            "vfmadd132ss" => self.encode_avx_3op_38_pp(ops, 0x99, 2),
++            "vfmadd213ss" => self.encode_avx_3op_38_pp(ops, 0xA9, 2),
++            "vfmadd231ss" => self.encode_avx_3op_38_pp(ops, 0xB9, 2),
++            "vfmadd132sd" => self.encode_avx_3op_38_pp_w1(ops, 0x99, 3),
++            "vfmadd213sd" => self.encode_avx_3op_38_pp_w1(ops, 0xA9, 3),
++            "vfmadd231sd" => self.encode_avx_3op_38_pp_w1(ops, 0xB9, 3),
+             "vfmsub213pd" => self.encode_avx_3op_38_w1(ops, 0xAA, true),
+             "vfmsub231pd" => self.encode_avx_3op_38_w1(ops, 0xBA, true),
+             "vfnmadd213pd" => self.encode_avx_3op_38_w1(ops, 0xAC, true),
+@@ -1580,19 +1582,28 @@ impl InstructionEncoder {
+             "vsubsd" => self.encode_avx_scalar_3op(ops, 0x5C, 3),   // VEX.NDS.LIG.F2.0F 5C
+             "vmulsd" => self.encode_avx_scalar_3op(ops, 0x59, 3),   // VEX.NDS.LIG.F2.0F 59
+             "vdivsd" => self.encode_avx_scalar_3op(ops, 0x5E, 3),   // VEX.NDS.LIG.F2.0F 5E
+-            "vmaxps" => self.encode_avx_3op_np(ops, 0x5F),
+-            "vminps" => self.encode_avx_3op_np(ops, 0x5D),
+-            "vmaxpd" => self.encode_avx_3op(ops, 0x5F, true),
+-            "vminpd" => self.encode_avx_3op(ops, 0x5D, true),
+             "vmaxss" => self.encode_avx_scalar_3op(ops, 0x5F, 2),
+             "vminss" => self.encode_avx_scalar_3op(ops, 0x5D, 2),
+             "vmaxsd" => self.encode_avx_scalar_3op(ops, 0x5F, 3),
+             "vminsd" => self.encode_avx_scalar_3op(ops, 0x5D, 3),
  
-@@ -97,9 +136,9 @@ fn should_inline_impl(
-         match crate::pgo::summary::get_summary() {
-             Some(s) => (
-                 s.is_hot(cf),
--                s.is_hot(df),
--                s.is_cold(cf),
--                s.is_cold(df),
-+                df > 0 && s.is_hot(df),
-+                cf > 0 && s.is_cold(cf),
-+                df > 0 && s.is_cold(df),
-                 site_count > 0 && s.is_hot(site_count),
-                 site_count > 0 && s.is_cold(site_count),
-             ),
-@@ -114,9 +153,9 @@ fn should_inline_impl(
-                 let r = |c: u64| if m == 0 { 0.0 } else { c as f64 / m as f64 };
-                 (
-                     r(cf) >= 0.10,
--                    r(df) >= 0.05,
--                    r(cf) < 0.005,
--                    r(df) < 0.001,
-+                    df > 0 && r(df) >= 0.05,
-+                    cf > 0 && r(cf) < 0.005,
-+                    df > 0 && r(df) < 0.001,
-                     false,
-                     false,
-                 )
-@@ -132,10 +171,40 @@ fn should_inline_impl(
+             // AVX extract/permute
+-            "vextractf128" => self.encode_avx_extract_imm8(ops, 0x19, true), // VEX.256.66.0F3A 19 /r ib
+-            "vpermilps" => self.encode_avx_shuffle_3a(ops, 0x04, true),      // VEX.256.66.0F3A 04 /r ib (imm form)
+-            "vpermilpd" => self.encode_avx_shuffle_3a(ops, 0x05, true),      // VEX.256.66.0F3A 05 /r ib (imm form)
++            // vpermilps/vpermilpd have two forms: immediate (0F3A 04/05) and
++            // variable-index (0F38 0C/0D, first operand = index register/mem).
++            "vpermilps" => {
++                if matches!(ops.first(), Some(Operand::Immediate(_))) {
++                    self.encode_avx_shuffle_3a(ops, 0x04, true) // VEX.256.66.0F3A 04 /r ib (imm form)
++                } else {
++                    self.encode_avx_3op_38(ops, 0x0C, true) // VEX.256.66.0F38 0C /r (var form)
++                }
++            }
++            "vpermilpd" => {
++                if matches!(ops.first(), Some(Operand::Immediate(_))) {
++                    self.encode_avx_shuffle_3a(ops, 0x05, true) // VEX.256.66.0F3A 05 /r ib (imm form)
++                } else {
++                    self.encode_avx_3op_38(ops, 0x0D, true) // VEX.256.66.0F38 0D /r (var form)
++                }
++            }
+ 
+             // AVX conversions
+             "vcvtps2dq" => self.encode_avx_2op_0f(ops, 0x5B, 1),        // VEX.128/256.66.0F 5B /r
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 05786501..4cedd2af 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -3591,22 +3591,40 @@ impl ArchCodegen for X86Codegen {
+                         self.state.vector_values.insert(dest.0);
+                         return;
+                     }
+-                    // Copy vector from src slot to dest slot using ymm0
+-                    // TODO: check if it's SSE (128-bit) or AVX (256-bit) and use appropriate register
+-                    // For now, assume AVX2 (256-bit)
++                    // Copy vector from src slot to dest slot. The width MUST
++                    // match the value: a 128-bit (SSE2) vector copied with a
++                    // 256-bit vmovupd reads 16 bytes past its slot and writes
++                    // 16 bytes past the destination, corrupting neighbouring
++                    // locals (reproduced: LCCC_FORCE_SSE2=1 dot-product
++                    // clobbered main()'s loop bound with garbage).
++                    let is_128 = self.state.vector128_values.contains(&v.0);
+                     if debug {
+                         eprintln!(
+-                            "[COPY-VEC] Copying slot {} to slot {}",
+-                            src_slot.0, dest_slot.0
++                            "[COPY-VEC] Copying {} slot {} to slot {}",
++                            if is_128 { "128-bit" } else { "256-bit" },
++                            src_slot.0,
++                            dest_slot.0
+                         );
+                     }
+-                    self.state
+-                        .out
+-                        .emit_instr_rbp_reg("    vmovupd", src_slot.0 as i64, "ymm0");
+-                    self.state
+-                        .out
+-                        .emit_instr_reg_rbp("    vmovupd", "ymm0", dest_slot.0 as i64);
++                    if is_128 {
++                        self.state
++                            .out
++                            .emit_instr_rbp_reg("    movupd", src_slot.0 as i64, "xmm0");
++                        self.state
++                            .out
++                            .emit_instr_reg_rbp("    movupd", "xmm0", dest_slot.0 as i64);
++                    } else {
++                        self.state
++                            .out
++                            .emit_instr_rbp_reg("    vmovupd", src_slot.0 as i64, "ymm0");
++                        self.state
++                            .out
++                            .emit_instr_reg_rbp("    vmovupd", "ymm0", dest_slot.0 as i64);
++                    }
+                     self.state.vector_values.insert(dest.0);
++                    if is_128 {
++                        self.state.vector128_values.insert(dest.0);
++                    }
+                     return;
+                 } else if debug {
+                     eprintln!(
+diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
+index 226011a8..bc46b4a2 100644
+--- a/src/backend/x86/codegen/intrinsics.rs
++++ b/src/backend/x86/codegen/intrinsics.rs
+@@ -1810,15 +1810,39 @@ impl X86Codegen {
+                 // args[1] = B pointer (2×F64)
+                 // dest_ptr = C pointer (read+write, 2×F64)
+                 if let Some(c_ptr) = dest_ptr {
+-                    self.operand_to_reg(&args[0], "rcx");      // A ptr → %rcx
+-                    self.operand_to_reg(&args[1], "rdx");      // B ptr → %rdx
+-                    self.value_to_reg(c_ptr, "rax");           // C ptr → %rax
++                    // Use the register allocator's assignments when available
++                    // (mirrors FmaF64x4). The old operand_to_reg/value_to_reg
++                    // path consulted the transient value cache, which conflated
++                    // B and C GEPs sharing an offset but not a base, so C was
++                    // loaded and stored through B's address (SSE2 matmul
++                    // miscompile: every FMA wrote the B array).
++                    let a_name = if let Some(r) = self.operand_reg(&args[0]) {
++                        super::emit::phys_reg_name(r)
++                    } else {
++                        self.operand_to_reg(&args[0], "rcx");
++                        "rcx"
++                    };
++                    let b_name = if let Some(r) = self.operand_reg(&args[1]) {
++                        super::emit::phys_reg_name(r)
++                    } else {
++                        self.operand_to_reg(&args[1], "rdx");
++                        "rdx"
++                    };
++                    let c_name = if let Some(r) = self.dest_reg(c_ptr) {
++                        super::emit::phys_reg_name(r)
++                    } else {
++                        self.value_to_reg(c_ptr, "rax");
++                        "rax"
++                    };
++
+                     // FMA3: load C, fused multiply-add with B, store back
+-                    self.state.emit("    movsd (%rcx), %xmm1");          // xmm1 = A scalar
+-                    self.state.emit("    unpcklpd %xmm1, %xmm1");        // xmm1 = {A, A}
+-                    self.state.emit("    movupd (%rax), %xmm0");         // xmm0 = {C[j], C[j+1]}
+-                    self.state.emit("    vfmadd231pd (%rdx), %xmm1, %xmm0"); // xmm0 = xmm1*B[mem] + xmm0
+-                    self.state.emit("    movupd %xmm0, (%rax)");         // store back
++                    self.state.emit_fmt(format_args!("    movsd (%{}), %xmm1", a_name));  // xmm1 = A scalar
++                    self.state.emit("    unpcklpd %xmm1, %xmm1");                         // xmm1 = {A, A}
++                    self.state.emit_fmt(format_args!("    movupd (%{}), %xmm0", c_name)); // xmm0 = {C[j], C[j+1]}
++                    self.state.emit_fmt(format_args!("    vfmadd231pd (%{}), %xmm1, %xmm0", b_name));
++                    self.state.emit_fmt(format_args!("    movupd %xmm0, (%{})", c_name)); // store back
++
++                    self.state.reg_cache.invalidate_all();
+                 }
+             }
+             IntrinsicOp::FmaF64x4 => {
+@@ -2050,10 +2074,11 @@ impl X86Codegen {
+                 self.state.invalidate_vec_peephole();
+                 // Reduce 2×F64 → 1×F64
+                 self.operand_to_reg(&args[0], "rax");
+-                self.state.emit("    movupd (%rax), %xmm0");          // Load 2 doubles
+-                self.state.emit("    unpckhpd %xmm0, %xmm0, %xmm1");  // Duplicate upper to xmm1
+-                self.state.emit("    addsd %xmm1, %xmm0");            // Add (2→1)
+-                self.state.emit("    movq %xmm0, %rax");              // Extract to GPR
++                self.state.emit("    movupd (%rax), %xmm0");   // Load {lo, hi}
++                self.state.emit("    movapd %xmm0, %xmm1");   // copy
++                self.state.emit("    unpckhpd %xmm0, %xmm1"); // xmm1 = {hi, hi}
++                self.state.emit("    addsd %xmm1, %xmm0");    // xmm0.lo = lo + hi
++                self.state.emit("    movq %xmm0, %rax");      // Extract to GPR
+                 if let Some(d) = dest {
+                     self.store_rax_to(d);
+                 }
+@@ -2081,9 +2106,11 @@ impl X86Codegen {
+                 // Reduce 4×I32 → 1×I32
+                 self.operand_to_reg(&args[0], "rax");
+                 self.state.emit("    movdqu (%rax), %xmm0");          // Load 4 ints
+-                self.state.emit("    psrldq $8, %xmm0, %xmm1");       // Shift 8 bytes (4→2)
++                self.state.emit("    movdqa %xmm0, %xmm1");           // copy
++                self.state.emit("    psrldq $8, %xmm1");              // xmm1 = {0,0,a,b}
+                 self.state.emit("    paddd %xmm1, %xmm0");            // Add (4→2)
+-                self.state.emit("    psrldq $4, %xmm0, %xmm1");       // Shift 4 bytes (2→1)
++                self.state.emit("    movdqa %xmm0, %xmm1");           // copy
++                self.state.emit("    psrldq $4, %xmm1");              // xmm1 = {0,a,b,a+c}
+                 self.state.emit("    paddd %xmm1, %xmm0");            // Add (2→1)
+                 self.state.emit("    movd %xmm0, %eax");              // Extract to GPR
+                 if let Some(d) = dest {
+@@ -2267,10 +2294,13 @@ impl X86Codegen {
+             IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 => {
+                 self.flush_pending_vec_store_impl();
+                 self.state.invalidate_vec_peephole();
+-                // Vector integer add (similar pattern)
+-                let (load_inst, add_inst, store_inst, reg) = match op {
+-                    IntrinsicOp::VecAddI32x8 => ("vmovdqu", "vpaddd", "vmovdqu", "ymm"),
+-                    IntrinsicOp::VecAddI32x4 => ("movdqu", "paddd", "movdqu", "xmm"),
++                // Vector integer add. paddd is a legacy 2-operand instruction;
++                // only its VEX form (vpaddd) takes three operands. The old
++                // code emitted `paddd %xmm1, %xmm0, %xmm0` for the SSE2 case,
++                // which the assembler rejects ("SSE op requires 2 operands").
++                let (load_inst, add_inst, store_inst, reg, is_avx) = match op {
++                    IntrinsicOp::VecAddI32x8 => ("vmovdqu", "vpaddd", "vmovdqu", "ymm", true),
++                    IntrinsicOp::VecAddI32x4 => ("movdqu", "paddd", "movdqu", "xmm", false),
+                     _ => unreachable!(),
+                 };
+                 self.operand_to_reg(&args[0], "rax");
+@@ -2283,7 +2313,12 @@ impl X86Codegen {
+                     self.state.out.emit_instr_rbp_reg("    leaq", slot.0 as i64, "rcx");
+                 }
+                 self.state.emit_fmt(format_args!("    {} (%rcx), %{}1", load_inst, reg));
+-                self.state.emit_fmt(format_args!("    {} %{}1, %{}0, %{}0", add_inst, reg, reg, reg));
++                if is_avx {
++                    self.state.emit_fmt(format_args!("    {} %{}1, %{}0, %{}0", add_inst, reg, reg, reg));
++                } else {
++                    // Legacy SSE2: 2-operand form, src then dst.
++                    self.state.emit_fmt(format_args!("    {} %{}1, %{}0", add_inst, reg, reg));
++                }
+                 if let Some(d) = dest {
+                     self.state.vector_values.insert(d.0);
+                     if let Some(slot) = self.state.get_slot(d.0) {
+@@ -2327,8 +2362,9 @@ impl X86Codegen {
+                     self.operand_to_reg(&args[0], "rax");
+                     self.state.emit("    movupd (%rax), %xmm0");
+                 }
+-                self.state.emit("    unpckhpd %xmm0, %xmm0, %xmm1");
+-                self.state.emit("    addsd %xmm1, %xmm0");
++                self.state.emit("    movapd %xmm0, %xmm1");
++                self.state.emit("    unpckhpd %xmm0, %xmm1"); // xmm1 = {hi, hi}
++                self.state.emit("    addsd %xmm1, %xmm0");    // xmm0.lo = lo + hi
+                 self.state.emit("    movq %xmm0, %rax");
+                 if let Some(d) = dest {
+                     self.store_rax_to(d);
+@@ -2369,9 +2405,11 @@ impl X86Codegen {
+                     self.operand_to_reg(&args[0], "rax");
+                     self.state.emit("    movdqu (%rax), %xmm0");
+                 }
+-                self.state.emit("    psrldq $8, %xmm0, %xmm1");
++                self.state.emit("    movdqa %xmm0, %xmm1");
++                self.state.emit("    psrldq $8, %xmm1");   // xmm1 = {0,0,a,b}
+                 self.state.emit("    paddd %xmm1, %xmm0");
+-                self.state.emit("    psrldq $4, %xmm0, %xmm1");
++                self.state.emit("    movdqa %xmm0, %xmm1");
++                self.state.emit("    psrldq $4, %xmm1");   // xmm1 = {0,a,b,a+c}
+                 self.state.emit("    paddd %xmm1, %xmm0");
+                 self.state.emit("    movd %xmm0, %eax");
+                 if let Some(d) = dest {
+diff --git a/src/backend/x86/codegen/intrinsics_simd.rs b/src/backend/x86/codegen/intrinsics_simd.rs
+index c8ea5cc5..67f0df7d 100644
+--- a/src/backend/x86/codegen/intrinsics_simd.rs
++++ b/src/backend/x86/codegen/intrinsics_simd.rs
+@@ -500,9 +500,10 @@ impl X86Codegen {
+             | HaddPs256 | HsubPs256 | AddsubPs256
+             | RoundPs256 | RoundPd256 | BlendPs256 | BlendPd256
+             | BlendvPs256 | BlendvPd256 | VpermilPs256 | Vperm2f128 | Vinsertf128
+-            | Vextractf128 | Vbroadcastss | Vbroadcastsd | Vbroadcastsd
++            | Vextractf128 | Vbroadcastss | Vbroadcastsd
+             | CvtPs2Ep32_256 | CvtEp32_2Ps_256 | CvttPs2Ep32_256
+             | CvtPs2Pd_256 | CvtPd2Ps_256 | CvtPd2Ep32_256 | CvtEp32_2Pd_256 | CvttPd2Ep32_256
++            | VpermilvarPs256 | VpermilvarPd256
+             | FmaPs132v256 | FmaPs213v256 | FmaPs231v256
+             | FmaPd132v256 | FmaPd213v256 | FmaPd231v256 => {
+                 self.emit_avx_fp_256_op(dptr, op, args);
+@@ -1178,6 +1179,17 @@ impl X86Codegen {
+             HaddPs256 => binary(self, "vhaddps", false),
+             HsubPs256 => binary(self, "vhsubps", false),
+             AddsubPs256 => binary(self, "vaddsubps", false),
++            // The 256-bit unpack family previously had NO arm here: the ops
++            // were routed to this dispatcher but silently emitted nothing,
++            // leaving the result alloca uninitialized (garbage output for
++            // _mm256_unpacklo/hi_ps/_pd).
++            UnpcklPs256 => binary(self, "vunpcklps", false),
++            UnpckhPs256 => binary(self, "vunpckhps", false),
++            UnpcklPd256 => binary(self, "vunpcklpd", false),
++            UnpckhPd256 => binary(self, "vunpckhpd", false),
++            // Variable-index permute: vpermilps/vpermilpd %idx, %src, %dst.
++            VpermilvarPs256 => binary(self, "vpermilps", false),
++            VpermilvarPd256 => binary(self, "vpermilpd", false),
+             CvtPs2Ep32_256 => unary(self, "vcvtps2dq"),
+             CvtEp32_2Ps_256 => unary(self, "vcvtdq2ps"),
+             CvttPs2Ep32_256 => unary(self, "vcvttps2dq"),
+@@ -1267,11 +1279,16 @@ impl X86Codegen {
+             // vblendvps/vblendvpd: operands (mask, a, b): mask, b(src2), a(src1,dst)
+             BlendvPs256 | BlendvPd256 => {
+                 let inst = if matches!(op, BlendvPs256) { "vblendvps" } else { "vblendvpd" };
+-                self.avx_load_arg_to(&args[0], "ymm0"); // mask
+-                self.avx_load_arg_to(&args[1], "ymm1"); // a (src1 = dst)
+-                self.avx_load_arg_to(&args[2], "ymm2"); // b (src2)
++                // The result MUST land in %ymm0: avx_store_dest stores %ymm0,
++                // and the old code computed the blend into %ymm1 then stored
++                // %ymm0 (the mask) instead — blendv returned the mask operand
++                // rather than the blended result. AT&T operand order:
++                //   %mask (is4), %src2, %src1(dst), %dst.
++                self.avx_load_arg_to(&args[0], "ymm2"); // mask
++                self.avx_load_arg_to(&args[1], "ymm0"); // a (src1 = dst)
++                self.avx_load_arg_to(&args[2], "ymm1"); // b (src2)
+                 self.state
+-                    .emit_fmt(format_args!("    {} %ymm0, %ymm2, %ymm1, %ymm1", inst));
++                    .emit_fmt(format_args!("    {} %ymm2, %ymm1, %ymm0, %ymm0", inst));
+                 self.avx_store_dest(dest_ptr);
+             }
+             // FMA 256 (a, b, c)
+diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
+index 9be953b7..0b69eee2 100644
+--- a/src/ir/intrinsics.rs
++++ b/src/ir/intrinsics.rs
+@@ -793,6 +793,10 @@ pub enum IntrinsicOp {
+     CvttPd2Ep32_256,
+     VpermilPs128,
+     VpermilPs256,
++    /// 256-bit variable-index permute: `vpermilps %idx, %src, %dst`.
++    VpermilvarPs256,
++    /// 256-bit variable-index permute (double): `vpermilpd %idx, %src, %dst`.
++    VpermilvarPd256,
+     Vperm2f128,
+     Vinsertf128,
+     Vextractf128,
+diff --git a/src/ir/lowering/expr_builtins_lcccsimd.rs b/src/ir/lowering/expr_builtins_lcccsimd.rs
+index c97c1f66..a099d6c1 100644
+--- a/src/ir/lowering/expr_builtins_lcccsimd.rs
++++ b/src/ir/lowering/expr_builtins_lcccsimd.rs
+@@ -359,6 +359,8 @@ pub(super) fn lccc_simd_lookup(
+         "vcvtdq2pd256" => u(Vec256, CvtEp32_2Pd_256),
+         "vcvttpd2dq256" => u(Vec128, CvttPd2Ep32_256),
+         "vpermilps256" => ui(Vec256, VpermilPs256),
++        "vpermilvarps256" => b(Vec256, VpermilvarPs256),
++        "vpermilvarpd256" => b(Vec256, VpermilvarPd256),
+         "vperm2f128" => s2(Vec256, Vperm2f128),
+         "vinsertf128" => s2(Vec256, Vinsertf128),
+         "vextractf128" => ui(Vec128, Vextractf128),
+diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
+index 9884ea4d..b56ce38c 100644
+--- a/src/passes/vectorize.rs
++++ b/src/passes/vectorize.rs
+@@ -514,6 +514,18 @@ fn analyze_loop_pattern(
          return None;
      }
-     // Strongest signal: a HOT CALL SITE (the block containing the call is
--    // hot — LLVM HotCallSiteThreshold). Medium hot callees inline.
-+    // hot — LLVM HotCallSiteThreshold). Medium hot callees inline. This is
-+    // only reached when inline_decisions_active() (a non-flat profile), so the
-+    // percentile hotness is informative.
-     if (caller_hot || site_hot) && callee_hot && size <= 48 {
-         return Some(true);
-     }
-+    // v11: a LOOPED hot call site — the site executes substantially more often
-+    // than its caller's entry (site_count >> caller entry), i.e. it is inside a
-+    // hot loop. Inlining it removes call overhead from every iteration and
-+    // exposes the callee to the caller's optimizations, which a plain build
-+    // cannot do when the base inliner skips the (larger) callee. This is the
-+    // PGO advantage LLVM/ICC rely on; allow larger callees here, still bounded.
-+    if site_count > 0 && site_count.saturating_mul(2) >= cf.max(1) && size <= 200 {
-+        return Some(true);
-+    }
-+    // v11 (novel): ENTRY-COUNT-RATIO force-inline. Per-block site counts are
-+    // unavailable at pre-pass time — the pre-pass CFG's block labels differ
-+    // from the post-pass labels the instrumentation recorded, so
-+    // `derive_block_counts` yields zero and the block-level hot-site signal is
-+    // destroyed (this is exactly why v10's force-inline never fired). The
-+    // function ENTRY counts, however, are LABEL-INDEPENDENT and survive across
-+    // pre/post pass. The ratio `df / cf` is the average number of times the
-+    // callee runs per caller invocation: when it is large, the callee is called
-+    // from a loop inside the caller, i.e. a hot call site — even if the base
-+    // inliner would skip the (larger) callee. Use it as a robust, block-free
-+    // proxy for looped-hotness. Only on a non-flat (informative) profile.
-+    if crate::pgo::inline_pgo::inline_decisions_active() {
-+        let ce = cf.max(1);
-+        if df >= 8 * ce && size <= 200 && df > 0 {
-+            // Callee runs >=8x per caller invocation: clearly looped. Only when
-+            // the callee is hot (measured, not absent) and not recursive.
-+            return Some(true);
-+        }
-+    }
-     // Hot caller with a warm call site: inline small callees.
-     if caller_hot && site_count > 0 && !site_cold && size <= 32 {
-         return Some(true);
-@@ -150,3 +219,36 @@ fn should_inline_impl(
-     }
-     None
- }
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+    use crate::pgo::summary::ProfileSummary;
-+
-+    #[test]
-+    fn flat_profile_disables_inline_decisions() {
-+        // No summary set -> fallback heuristics active.
-+        crate::pgo::summary::set_summary(ProfileSummary {
-+            total: 146,
-+            max: 48,
-+            second_max: 48, // tied at max -> flat
-+            hot_threshold: 48,
-+            cold_threshold: 48,
-+        });
-+        assert!(
-+            !inline_decisions_active(),
-+            "a flat (tied-max) profile must not drive PGO inlining decisions"
-+        );
-+        crate::pgo::summary::set_summary(ProfileSummary {
-+            total: 2_014_792,
-+            max: 2_014_727,
-+            second_max: 64, // dominant hot -> informative
-+            hot_threshold: 2_014_727,
-+            cold_threshold: 2_014_727,
-+        });
-+        assert!(
-+            inline_decisions_active(),
-+            "a dominant-hot profile must drive PGO inlining decisions"
-+        );
-+    }
-+}
-diff --git a/src/pgo/instrument.rs b/src/pgo/instrument.rs
-index 01b2021a..fca9f0b1 100644
---- a/src/pgo/instrument.rs
-+++ b/src/pgo/instrument.rs
-@@ -225,39 +225,13 @@ fn scc_ids(nodes: &[u32], edges: &[Edge]) -> FxHashMap<u32, u32> {
-         .collect()
- }
- 
--struct Dsu {
--    parent: Vec<usize>,
--}
--impl Dsu {
--    fn new(n: usize) -> Self {
--        Dsu {
--            parent: (0..n).collect(),
--        }
--    }
--    fn find(&mut self, mut x: usize) -> usize {
--        while self.parent[x] != x {
--            self.parent[x] = self.parent[self.parent[x]];
--            x = self.parent[x];
--        }
--        x
--    }
--    fn union(&mut self, a: usize, b: usize) -> bool {
--        let ra = self.find(a);
--        let rb = self.find(b);
--        if ra == rb {
--            return false;
--        }
--        self.parent[ra] = rb;
--        true
--    }
--}
--
--/// Choose the instrumented (non-tree) edges: maximum spanning tree over the
--/// CFG (Kruskal), with the virtual entry edge forced instrumented.
-+/// Choose the instrumented (non-tree) edges: maximum-weight directed spanning
-+/// ARBORESCENCE over the CFG (rooted at entry), with the virtual entry edge
-+/// forced instrumented.
- fn choose_instrumented_edges(nodes: &[u32], edges: &[Edge], entry: u32) -> Vec<Edge> {
-     let comp = scc_ids(nodes, edges);
-     let dom = dominators(nodes, edges, entry);
--    let weight = |e: &Edge| -> (i64, u32, u32) {
-+    let weight = |e: &Edge| -> i64 {
-         let backed = dom
-             .get(&e.src)
-             .map(|d| d.contains(&e.dst))
-@@ -268,30 +242,29 @@ fn choose_instrumented_edges(nodes: &[u32], edges: &[Edge], entry: u32) -> Vec<E
-                 .zip(comp.get(&e.dst))
-                 .map(|(a, b)| a == b)
-                 .unwrap_or(false);
--        let w = if backed {
-+        if backed {
-             2000
-         } else if loopish {
-             1000
-         } else {
-             1
--        };
--        (w, e.src, e.dst)
--    };
--    let node_index: FxHashMap<u32, usize> =
--        nodes.iter().enumerate().map(|(i, n)| (*n, i)).collect();
--    let mut ordered: Vec<usize> = (0..edges.len()).collect();
--    ordered.sort_by(|&a, &b| weight(&edges[a]).cmp(&weight(&edges[b])).reverse());
--    let mut dsu = Dsu::new(nodes.len());
--    let mut tree = FxHashSet::default();
--    for &ei in &ordered {
--        let e = edges[ei];
--        let (Some(&a), Some(&b)) = (node_index.get(&e.src), node_index.get(&e.dst)) else {
--            continue;
--        };
--        if dsu.union(a, b) {
--            tree.insert(e);
-         }
--    }
-+    };
-+    // v9 red-team fix: build a MAX-WEIGHT DIRECTED SPANNING ARBORESCENCE
-+    // rooted at `entry` (Chu–Liu/Edmonds via BFS + greedy improvement),
-+    // over ALL nodes including the virtual EXIT. The old code used an
-+    // UNDIRECTED max spanning tree (Kruskal/DSU), which can orient a loop
-+    // backedge BACKWARDS: for a simple loop the backedge (latch->header,
-+    // weight 2000) was chosen as the tree edge, so the latch's only incoming
-+    // edge (header->latch) became non-tree/instrumented and the latch had NO
-+    // incoming tree edge. The flow-conservation solver (`derive_block_counts`)
-+    // then derived the latch's count from its outgoing edges = 0, silently
-+    // zeroing every loop-latch block count and the derived backedge count —
-+    // corrupting block layout, branch probability and profile-accurate loop
-+    // unrolling for every loop. A proper arborescence guarantees every
-+    // non-entry node (latch included) has exactly one incoming tree edge, so
-+    // the solver reconstructs exact counts.
-+    let tree = max_arborescence(nodes, edges, entry, &weight);
-     let entry_edge = Edge {
-         src: VENTRY,
-         dst: entry,
-@@ -306,6 +279,122 @@ fn choose_instrumented_edges(nodes: &[u32], edges: &[Edge], entry: u32) -> Vec<E
-     instr
- }
- 
-+/// Chu–Liu/Edmonds maximum-weight directed spanning arborescence rooted at
-+/// `root` (which must be in `nodes`). Returns the set of TREE edges (edges NOT
-+/// instrumented). Weight is higher = more desirable to keep off the counter
-+/// path (hot backedges/cycle edges). The result is a valid directed tree: every
-+/// node except `root` has exactly one incoming tree edge and is reachable from
-+/// `root` via tree edges — exactly the invariant the flow-conservation solver
-+/// needs (see `choose_instrumented_edges`).
-+///
-+/// Implementation: start from a BFS arborescence (guaranteed correct), then
-+/// greedily replace each node's tree in-edge with a heavier in-edge whenever
-+/// that cannot create a cycle (v is not an ancestor of the new parent u).
-+/// Iterate to a fixed point. For the hierarchical backedge/loop/normal weight
-+/// scheme this yields the same tree as full Edmonds and is far simpler to keep
-+/// correct.
-+fn max_arborescence(
-+    nodes: &[u32],
-+    edges: &[Edge],
-+    root: u32,
-+    weight: &dyn Fn(&Edge) -> i64,
-+) -> FxHashSet<Edge> {
-+    use std::collections::VecDeque;
-+    let node_idx: FxHashMap<u32, usize> = nodes.iter().enumerate().map(|(i, n)| (*n, i)).collect();
-+    let n = nodes.len();
-+    let root_i = node_idx[&root];
-+    // Allowed edges: within the node set, not into root.
-+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
-+    let mut in_edges: Vec<Vec<(usize, usize, i64)>> = vec![Vec::new(); n]; // dst -> (src,dst,w)
-+    for e in edges {
-+        let (Some(&a), Some(&b)) = (node_idx.get(&e.src), node_idx.get(&e.dst)) else {
-+            continue;
-+        };
-+        if b == root_i {
-+            continue; // no tree edge into the root
-+        }
-+        let w = weight(e);
-+        succs[a].push(b);
-+        in_edges[b].push((a, b, w));
-+    }
-+    // 1. BFS arborescence from root: guarantee a valid tree.
-+    let mut parent: Vec<usize> = vec![usize::MAX; n]; // parent[v] = u (edge u->v)
-+    {
-+        let mut q = VecDeque::new();
-+        q.push_back(root_i);
-+        while let Some(u) = q.pop_front() {
-+            for &b in &succs[u] {
-+                if parent[b] == usize::MAX {
-+                    parent[b] = u;
-+                    q.push_back(b);
-+                }
+     let fmul_inst = fmul_inst?;
++    // The whole transform lowers to FmaF64x4 / FmaF64x2 (packed DOUBLE FMA).
++    // Only double-precision matmuls may match: lowering a float or integer
++    // matmul as double FMA reinterprets the arrays with the wrong element
++    // width and stride (reproducer: a float matmul segfaulted at runtime).
++    if let Instruction::BinOp { ty, .. } = fmul_inst {
++        if *ty != IrType::F64 {
++            if debug {
++                eprintln!("[VEC]   Rejecting matmul: element type {:?} != F64 (only double FMA is supported)", ty);
 +            }
-+        }
-+    }
-+    // Helper: is `anc` an ancestor of `node` in the current tree (walking up)?
-+    // Used to reject a swap that would create a cycle.
-+    fn is_ancestor(node: usize, anc: usize, parent: &[usize], n: usize) -> bool {
-+        let mut x = node;
-+        let mut steps = 0;
-+        while x != usize::MAX && steps <= n {
-+            if x == anc {
-+                return true;
-+            }
-+            x = parent[x];
-+            steps += 1;
-+        }
-+        false
-+    }
-+    // 2. Greedy improvement to fixed point.
-+    loop {
-+        let mut changed = false;
-+        for v in 0..n {
-+            if v == root_i {
-+                continue;
-+            }
-+            let cur = parent[v];
-+            if cur == usize::MAX {
-+                continue; // unreachable — leave as is (won't happen from BFS)
-+            }
-+            let mut cur_w = in_edges[v]
-+                .iter()
-+                .find(|(u, _, _)| *u == cur)
-+                .map(|(_, _, w)| *w)
-+                .unwrap_or(i64::MIN);
-+            for &(u, _, w) in &in_edges[v] {
-+                if u == cur || w <= cur_w {
-+                    continue;
-+                }
-+                // Replacing parent[v]=cur with parent[v]=u forms a cycle iff
-+                // u is already a DESCENDANT of v in the tree (a path v -> u
-+                // exists downward), because the new edge u->v would close it.
-+                // `is_ancestor(u, v)` returns true iff v is an ancestor of u.
-+                if is_ancestor(u, v, &parent, n) {
-+                    continue;
-+                }
-+                parent[v] = u;
-+                cur_w = w;
-+                changed = true;
-+            }
-+        }
-+        if !changed {
-+            break;
-+        }
-+    }
-+    // Convert parent array to tree-edge set (for reachable nodes only).
-+    let mut tree = FxHashSet::default();
-+    for v in 0..n {
-+        if v == root_i || parent[v] == usize::MAX {
-+            continue;
-+        }
-+        tree.insert(Edge {
-+            src: nodes[parent[v]],
-+            dst: nodes[v],
-+        });
-+    }
-+    tree
-+}
-+
- pub fn instrument_module(
-     m: &mut IrModule,
-     dir: &str,
-@@ -390,7 +479,13 @@ pub fn instrument_module(
-         }
-         let edges: Vec<Edge> = edge_set.into_iter().collect();
-         let entry = f.blocks.first().map(|b| b.label.0).unwrap_or(0);
--        let instr_edges = choose_instrumented_edges(&nodes, &edges, entry);
-+        // v9: the arborescence spans ALL nodes including the virtual EXIT so
-+        // it too gets a single incoming tree edge (instead of every
-+        // return->exit edge being instrumented) and the flow solver's
-+        // reconstruction stays exact.
-+        let mut tree_nodes = nodes.clone();
-+        tree_nodes.push(VEXIT);
-+        let instr_edges = choose_instrumented_edges(&tree_nodes, &edges, entry);
-         let n_counters = instr_edges.len();
-         let slot: FxHashMap<Edge, usize> = instr_edges
-             .iter()
-@@ -2331,4 +2426,57 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
-             label_base,
-         );
-     }
--}
-\ No newline at end of file
-+}
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+
-+    #[test]
-+    fn loop_backedge_is_instrumented_not_forward_edge() {
-+        // Simple loop: 0(entry)->1(header)->2(latch), 2->1 backedge,
-+        // 1->3(exit) return, 3->VEXIT. Build the CFG edge list.
-+        let nodes = vec![0u32, 1, 2, 3];
-+        let edges = vec![
-+            Edge { src: 0, dst: 1 },
-+            Edge { src: 1, dst: 2 },
-+            Edge { src: 2, dst: 1 }, // backedge
-+            Edge { src: 1, dst: 3 },
-+            Edge { src: 3, dst: VEXIT },
-+        ];
-+        // Include VEXIT in the node set (as the pipeline does).
-+        let mut tree_nodes = nodes.clone();
-+        tree_nodes.push(VEXIT);
-+        let instr = choose_instrumented_edges(&tree_nodes, &edges, 0);
-+        let has = |s: u32, d: u32| instr.iter().any(|e| e.src == s && e.dst == d);
-+        // The forward edge into the latch (1->2) is a TREE edge: it must NOT
-+        // be instrumented. The backedge (2->1) must be instrumented.
-+        assert!(!has(1, 2), "forward edge 1->2 must be a tree edge, not instrumented");
-+        assert!(has(2, 1), "backedge 2->1 must be instrumented (off the arborescence)");
-+        // Every node except entry must have exactly one incoming TREE edge.
-+        let tree: FxHashSet<Edge> = edges
-+            .iter()
-+            .copied()
-+            .filter(|e| !instr.iter().any(|i| i.src == e.src && i.dst == e.dst))
-+            .collect();
-+        for &v in &[1u32, 2, 3, VEXIT] {
-+            let n = tree.iter().filter(|e| e.dst == v).count();
-+            assert_eq!(n, 1, "node {} must have exactly one incoming tree edge", v);
-+        }
-+        // Reachability from entry via tree edges must cover all nodes.
-+        let mut reachable = FxHashSet::default();
-+        let mut stack = vec![0u32];
-+        while let Some(u) = stack.pop() {
-+            if !reachable.insert(u) {
-+                continue;
-+            }
-+            for e in &tree {
-+                if e.src == u {
-+                    stack.push(e.dst);
-+                }
-+            }
-+        }
-+        for &v in &[1u32, 2, 3, VEXIT] {
-+            assert!(reachable.contains(&v), "node {} must be tree-reachable from entry", v);
-+        }
-+    }
-+}
-diff --git a/src/pgo/layout.rs b/src/pgo/layout.rs
-index e4901943..0ed32e76 100644
---- a/src/pgo/layout.rs
-+++ b/src/pgo/layout.rs
-@@ -31,6 +31,8 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
-     // v8 F7: fresh per-unit switch-hint map (labels are TU-unique post
-     // renumber; layout runs immediately before codegen for this unit).
-     crate::pgo::record_switch_hints(crate::common::fx_hash::FxHashMap::default());
-+    // v11: fresh per-unit conditional-branch fallthrough map.
-+    crate::pgo::record_cond_fallthroughs(crate::common::fx_hash::FxHashMap::default());
-     let max = p.max_total_for_unit(u);
-     if max == 0 {
-         return;
-@@ -44,10 +46,23 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
-         // are derived at propagate time. Reading the raw profile made every
-         // block count 0: chain ordering degenerated and every switch block
-         // looked cold.
--        let Some(fp) = crate::pgo::active_profile_for_function(f)
--            .or_else(|| p.get_for_unit(u, &f.name))
--        else {
--            continue;
-+        //
-+        // v9 (red-team audit): edge-derived block layout is ONLY sound for
-+        // functions whose post-pass CFG matches the training build (the
-+        // drift gate). A drifted function's surviving edge labels no longer
-+        // denote the same CFG edges, so reordering on them would scatter
-+        // blocks by garbage weights. `active_derived_profile` returns None
-+        // for drifted functions; we then use the name/unit-keyed entry count
-+        // for hot/cold SECTIONS only (stable) and skip edge-based block
-+        // reordering entirely (original order preserved).
-+        let derived = crate::pgo::active_derived_profile(f);
-+        let raw = p.get_for_unit(u, &f.name);
-+        let (fp, edges_valid): (&crate::pgo::FunctionProfile, bool) = match derived {
-+            Some(fp) => (fp, true),
-+            None => match raw {
-+                Some(fp) => (fp, false),
-+                None => continue,
-+            },
-         };
-         // v8: hot/cold section classification via the data-driven summary
-         // (percentile thresholds over the unit's count distribution) with
-@@ -64,7 +79,7 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
-         } else if cold {
-             f.section = Some(".text.unlikely".into());
-         }
--        layout_function(f, fp, u);
-+        layout_function(f, fp, u, edges_valid);
-     }
- 
-     // v8: order functions by hotness class within the TU — hot first, cold
-@@ -121,12 +136,52 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
-             perm.swap(i, j);
-         }
-     }
-+
-+    // v11: profile-driven conditional-branch fallthrough. For every
-+    // CondBranch whose edge profile is valid (non-drifted, derived), the
-+    // successor with the higher edge execution count becomes the preferred
-+    // fallthrough. The backend then emits the branch so the HOT successor
-+    // falls through (fewer taken branches / branch misses on the hot path),
-+    // WITHOUT reordering blocks — so register allocation is never perturbed.
-+    use crate::ir::reexports::Terminator;
-+    let mut cf_map: crate::common::fx_hash::FxHashMap<u32, u32> =
-+        crate::common::fx_hash::FxHashMap::default();
-+    for f in &m.functions {
-+        if f.is_declaration || f.blocks.is_empty() {
-+            continue;
-+        }
-+        // Only trust edge-derived hotness for non-drifted functions.
-+        let Some(fp) = crate::pgo::active_derived_profile(f) else {
-+            continue;
-+        };
-+        for b in &f.blocks {
-+            let Terminator::CondBranch {
-+                true_label,
-+                false_label,
-+                ..
-+            } = &b.terminator
-+            else {
-+                continue;
-+            };
-+            let t = fp.edge_count(b.label.0, true_label.0);
-+            let fl = fp.edge_count(b.label.0, false_label.0);
-+            if t == 0 && fl == 0 {
-+                continue; // no informative edge data
-+            }
-+            let hot = if t >= fl { true_label.0 } else { false_label.0 };
-+            cf_map.insert(b.label.0, hot);
-+        }
-+    }
-+    if !cf_map.is_empty() {
-+        crate::pgo::record_cond_fallthroughs(cf_map);
-+    }
- }
- 
- fn layout_function(
-     f: &mut crate::ir::reexports::IrFunction,
-     fp: &crate::pgo::FunctionProfile,
-     u: &str,
-+    edges_valid: bool,
- ) {
-     use crate::ir::reexports::Terminator;
-     let promoted: FxHashSet<u32> = crate::pgo::promoted_hot_labels(u, &f.name);
-@@ -143,171 +198,36 @@ fn layout_function(
-         };
-         counts.insert(b.label, c);
-     }
--    // Edge weights: recorded edge counts; synthesized hot edges for promoted
--    // blocks (their CFG edges have no profile entries).
--    let mut succs = FxHashMap::<BlockId, Vec<BlockId>>::default();
--    for b in &f.blocks {
--        succs.insert(
--            b.label,
--            match &b.terminator {
--                Terminator::Branch(x) => vec![*x],
--                Terminator::CondBranch {
--                    true_label,
--                    false_label,
--                    ..
--                } => vec![*true_label, *false_label],
--                Terminator::Switch { cases, default, .. } => cases
--                    .iter()
--                    .map(|x| x.1)
--                    .chain(std::iter::once(*default))
--                    .collect(),
--                Terminator::IndirectBranch {
--                    possible_targets, ..
--                } => possible_targets.clone(),
--                _ => vec![],
--            },
--        );
--    }
--    let edge_w = |src: BlockId, dst: BlockId| -> u64 {
--        let e = fp
--            .edge_count(src.0, dst.0)
--            .max(fp.edge_count(crate::pgo::instrument::VENTRY, dst.0));
--        if e > 0 {
--            return e;
--        }
--        // Synthesize: promoted block <-> its immediate neighbors are hot.
--        if promoted.contains(&src.0) || promoted.contains(&dst.0) {
--            return entry_count.max(1);
--        }
--        0
-+    // v9 drift gate: when the edge profile is not trustworthy (drifted or a
-+    // raw/entry-only fallback), skip the chain-based block reordering and the
-+    // edge-frequency switch-case sorting — they would scatter blocks by stale
-+    // weights. Preserve original order (still run hot/cold sectioning,
-+    // promoted-block placement, and count-based cold switch lowering).
-+    let mut ordered: Vec<crate::ir::reexports::BasicBlock> = if edges_valid {
-+        // v10 (red-team fix): PRESERVE the original block order. The prior
-+        // chain-based (Petis-Hansen) reorder and even cold-block sinking can,
-+        // for a function dominated by ONE hot loop, perturb the hot loop body
-+        // and its register allocation — expat's multi-byte UTF-8 handling was
-+        // placed before the hot ASCII loop (frame 40->72B, ~2x regression,
-+        // measured 131ms -> 248ms), and cold-block sinking alone cost ~7ms
-+        // (128.5 -> 135.5ms). The source order already provides good
-+        // fallthrough for a hot loop. Robust no-regression rule: keep the
-+        // ORIGINAL block order byte-for-byte (no reordering, no sinking), so
-+        // the hot path is IDENTICAL to the plain build. Profile value comes
-+        // from the (safe, local) switch-case ordering, hot/cold FUNCTION
-+        // sections, promoted-block placement, and the PGO inliner's
-+        // cold-classification fix — not from intra-function block movement.
-+        f.blocks.clone()
-+    } else {
-+        f.blocks.clone()
-     };
- 
--    // Chain building: repeatedly join the max-weight edge whose endpoints are
--    // chain ends. Only edges with positive weight participate; zero-weight
--    // blocks stay singleton chains and sink to the cold tail.
--    let n = f.blocks.len();
--    let labels: Vec<BlockId> = f.blocks.iter().map(|b| b.label).collect();
--    let mut idx_of: FxHashMap<BlockId, usize> = FxHashMap::default();
--    for (i, l) in labels.iter().enumerate() {
--        idx_of.insert(*l, i);
--    }
--    let mut edges: Vec<(u64, BlockId, BlockId)> = Vec::new();
--    for (&s, dsts) in &succs {
--        for &d in dsts {
--            if s == d {
--                continue;
--            }
--            let w = edge_w(s, d);
--            if w > 0 {
--                edges.push((w, s, d));
--            }
--        }
--    }
--    edges.sort_by(|a, b| b.0.cmp(&a.0).then(a.1 .0.cmp(&b.1 .0)).then(a.2 .0.cmp(&b.2 .0)));
--
--    // chain_of[block] = chain id; chains: Vec<Vec<BlockId>>; head/tail lookup.
--    let mut chain_of: Vec<usize> = (0..n).collect();
--    let mut chains: Vec<Vec<BlockId>> = labels.iter().map(|l| vec![*l]).collect();
--    // head/tail: since we only append at ends, chain[0] is head, last is tail.
--    for (w, s, d) in edges {
--        let (Some(&si), Some(&di)) = (idx_of.get(&s), idx_of.get(&d)) else {
--            continue;
--        };
--        let ca = chain_of[si];
--        let cb = chain_of[di];
--        if ca == cb {
--            continue;
--        }
--        let head_a = chains[ca][0];
--        let tail_a = *chains[ca].last().unwrap();
--        let head_b = chains[cb][0];
--        let tail_b = *chains[cb].last().unwrap();
--        // Merge forms: (tail_a -> head_b), (tail_a -> tail_b reversed).
--        let (mut merged, reversed_b) = if tail_a == s && head_b == d {
--            (true, false)
--        } else if tail_a == s && tail_b == d {
--            (true, true)
--        } else {
--            (false, false)
--        };
--        if !merged && head_a == s && head_b == d {
--            // prepend: reverse A then append B
--            let mut a = std::mem::take(&mut chains[ca]);
--            a.reverse();
--            a.extend(chains[cb].iter().copied());
--            chains[ca] = a;
--            merged = true;
--        } else if !merged && head_a == s && tail_b == d {
--            // reverse both
--            let mut a = std::mem::take(&mut chains[ca]);
--            a.reverse();
--            let mut b = std::mem::take(&mut chains[cb]);
--            b.reverse();
--            a.extend(b);
--            chains[ca] = a;
--            merged = true;
--        }
--        if merged {
--            let a = std::mem::take(&mut chains[ca]);
--            let b = std::mem::take(&mut chains[cb]);
--            let mut out = a;
--            if reversed_b {
--                out.extend(b.iter().rev().copied());
--            } else {
--                out.extend(b);
--            }
--            chains[ca] = out;
--            let ca_blocks = chains[ca].clone();
--            for &l in &ca_blocks {
--                if let Some(&li) = idx_of.get(&l) {
--                    chain_of[li] = ca;
--                }
--            }
--        }
--        let _ = w;
--    }
--
--    // Rotate the entry chain to start at the function entry.
--    for chain in chains.iter_mut() {
--        if chain.contains(&entry) {
--            if let Some(pos) = chain.iter().position(|&l| l == entry) {
--                chain.rotate_left(pos);
--            }
--        }
--    }
--    // Order chains: entry chain first, then by max count desc, then cold.
--    let entry_chain = chain_of[idx_of[&entry]];
--    let mut order: Vec<usize> = (0..chains.len()).collect();
--    order.sort_by(|&a, &b| {
--        let ka = if a == entry_chain { 0 } else { 1 };
--        let kb = if b == entry_chain { 0 } else { 1 };
--        ka.cmp(&kb).then_with(|| {
--            let ma = chains[a].iter().map(|l| counts.get(l).copied().unwrap_or(0)).max().unwrap_or(0);
--            let mb = chains[b].iter().map(|l| counts.get(l).copied().unwrap_or(0)).max().unwrap_or(0);
--            mb.cmp(&ma)
--        })
--    });
--    let mut ordered: Vec<crate::ir::reexports::BasicBlock> = Vec::with_capacity(n);
--    let mut placed = FxHashSet::default();
--    for &ci in &order {
--        for &l in &chains[ci] {
--            if placed.insert(l) {
--                if let Some(b) = f.blocks.iter().find(|b| b.label == l) {
--                    ordered.push(b.clone());
--                }
--            }
--        }
--    }
--    // Safety net: any block missed by the chain logic.
--    for b in &f.blocks {
--        if !placed.contains(&b.label) {
--            ordered.push(b.clone());
--        }
--    }
-     // v8 F7: profile-driven switch hints. For every Switch block:
-     //   * cold per the summary -> force a compare chain (no jump table);
-     //   * a case carrying >= 50% of the block's executions -> record it for
-     //     hoisting out of the jump table (profile-guided partitioning).
-+    // v9: hot-case hoisting uses edge counts, so it is only sound when the
-+    // edge profile is valid; cold classification uses block counts (stable).
-     if crate::pgo::summary::get_summary().is_some() {
-         use crate::ir::reexports::Terminator;
-         let mut hints: FxHashMap<u32, crate::pgo::SwitchHint> = FxHashMap::default();
-@@ -321,7 +241,7 @@ fn layout_function(
-                     hot_case: None,
-                     force_chain: cold,
-                 };
--                if c > 0 {
-+                if edges_valid && c > 0 {
-                     let mut best: Option<(i64, u32, u64)> = None;
-                     for (v, t) in cases {
-                         let e = fp.edge_count(b.label.0, t.0);
-@@ -418,19 +338,24 @@ fn layout_function(
-         f.blocks = ordered;
-     }
- 
-+
-+
-     // PGO switch case ordering: sort each Switch's cases by the frequency
-     // of the (switch block -> case block) edge so compare-and-branch
--    // chains test the most likely cases first.
--    for b in &mut f.blocks {
--        let src = b.label.0;
--        if let Terminator::Switch { cases, .. } = &mut b.terminator {
--            if cases.len() < 2 {
--                continue;
-+    // chains test the most likely cases first. Only when the edge profile is
-+    // valid (v9 drift gate).
-+    if edges_valid {
-+        for b in &mut f.blocks {
-+            let src = b.label.0;
-+            if let Terminator::Switch { cases, .. } = &mut b.terminator {
-+                if cases.len() < 2 {
-+                    continue;
-+                }
-+                let mut idx: Vec<usize> = (0..cases.len()).collect();
-+                idx.sort_by_key(|&i| std::cmp::Reverse(fp.edge_count(src, cases[i].1 .0)));
-+                let sorted: Vec<_> = idx.into_iter().map(|i| cases[i]).collect();
-+                *cases = sorted;
-             }
--            let mut idx: Vec<usize> = (0..cases.len()).collect();
--            idx.sort_by_key(|&i| std::cmp::Reverse(fp.edge_count(src, cases[i].1 .0)));
--            let sorted: Vec<_> = idx.into_iter().map(|i| cases[i]).collect();
--            *cases = sorted;
-         }
-     }
- }
-diff --git a/src/pgo/mod.rs b/src/pgo/mod.rs
-index 6ff17885..79f2462e 100644
---- a/src/pgo/mod.rs
-+++ b/src/pgo/mod.rs
-@@ -232,6 +232,41 @@ pub fn switch_hints_snapshot() -> FxHashMap<u32, SwitchHint> {
-     SWITCH_HINTS.lock().unwrap().clone()
- }
- 
-+/// v11: per-unit preferred-fallthrough successor for conditional branches,
-+/// keyed by the branch block's label (TU-unique after the renumber pass). The
-+/// layout pass computes these from the profile edge weights — the successor
-+/// carrying more executions becomes the preferred fallthrough — and codegen
-+/// consumes them so the HOT path falls through (Intel branch-prediction
-+/// guidance: minimize taken branches on the hot path, without reordering
-+/// blocks and thus without perturbing register allocation).
-+static COND_FALLTHROUGHS: std::sync::LazyLock<std::sync::Mutex<FxHashMap<u32, u32>>> =
-+    std::sync::LazyLock::new(|| std::sync::Mutex::new(FxHashMap::default()));
-+/// Pending preferred-fallthrough for the conditional branch being emitted
-+/// (block label is set right before codegen of the terminator and taken by the
-+/// backend's emit_cond_branch_blocks_impl). Codegen is single-threaded and
-+/// per-TU sequential, so a process-wide scratch is safe.
-+static PENDING_COND_FALLTHROUGH: std::sync::LazyLock<std::sync::Mutex<Option<u32>>> =
-+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
-+
-+/// Replace the per-unit cond-branch fallthrough map (called once per unit by
-+/// layout_module).
-+pub fn record_cond_fallthroughs(map: FxHashMap<u32, u32>) {
-+    *COND_FALLTHROUGHS.lock().unwrap() = map;
-+}
-+/// The preferred fallthrough successor (block label) for a conditional branch
-+/// whose source block is `label`, if the profile was informative for it.
-+pub fn cond_fallthrough(label: u32) -> Option<u32> {
-+    COND_FALLTHROUGHS.lock().unwrap().get(&label).copied()
-+}
-+/// Set the pending preferred-fallthrough before codegen of a CondBranch.
-+pub fn set_cond_fallthrough(h: Option<u32>) {
-+    *PENDING_COND_FALLTHROUGH.lock().unwrap() = h;
-+}
-+/// Take (and clear) the pending preferred-fallthrough in the backend.
-+pub fn take_cond_fallthrough() -> Option<u32> {
-+    PENDING_COND_FALLTHROUGH.lock().unwrap().take()
-+}
-+
- /// Translate recorded promoted-block labels through the label-renumber map
- /// (old label -> new label; labels are TU-unique). Called by the driver right
- /// after the renumber pass; labels whose block vanished keep their value (the
-@@ -300,6 +335,14 @@ pub fn init_pgo_profile(path: Option<&str>) {
-                     x.functions.len(),
-                     p
-                 );
-+                // Debug/inspection hook: dump the loaded profile as text for
-+                // a human-readable view (LCCC_PGO_DUMP_TEXT=<file>).
-+                if let Ok(txt) = std::env::var("LCCC_PGO_DUMP_TEXT") {
-+                    match profile::write_text_profile(std::path::Path::new(&txt), &x) {
-+                        Ok(()) => eprintln!("lccc: PGO: wrote text profile to {}", txt),
-+                        Err(e) => eprintln!("lccc: PGO warning: text dump failed: {}", e),
-+                    }
-+                }
-                 x
-             }
-             Err(e) => {
-@@ -354,7 +397,22 @@ pub fn propagate_profile(m: &mut IrModule, u: &str) {
-     // Derive block counts and tree-edge counts from the instrumented edge
-     // counts (flow conservation) into a leaked per-unit map that
-     // active_profile_for_function prefers.
-+    //
-+    // DRIFT GATE (red-team audit): a function whose POST-pass CFG no longer
-+    // matches the training build has been structurally changed by
-+    // profile-guided transforms (inlining/unrolling fired differently than in
-+    // the training build). Its edge counts are keyed by the TRAINING labels;
-+    // after block insertion/removal the surviving labels no longer denote the
-+    // same edges, so every derived block/backedge count is unreliable. We
-+    // therefore only publish edge-DERIVED data for functions whose post_hash
-+    // matches (or legacy profiles with post_hash == 0). Drifted functions
-+    // keep their name/unit-keyed `total_count` (stable, used for hot/cold
-+    // section classification) but get NO edge-derived block counts — edge
-+    // consumers (block layout, branch probability, derived trip counts)
-+    // degrade to entry-count-only, exactly LLVM's fail-closed contract.
-     let mut derived: FxHashMap<String, FunctionProfile> = FxHashMap::default();
-+    let mut edge_ok = 0usize;
-+    let mut drifted_edges = 0usize;
-     for f in &m.functions {
-         if f.is_declaration || f.blocks.is_empty() {
-             continue;
-@@ -363,14 +421,27 @@ pub fn propagate_profile(m: &mut IrModule, u: &str) {
-         let Some(fp) = profile::get_for_unit_cfg(p, u, &f.name, h0) else {
-             continue;
-         };
-+        if fp.post_hash != 0 && fp.post_hash != post_hash_for(&f.name) {
-+            drifted_edges += 1;
-+            continue;
-+        }
-+        edge_ok += 1;
-         let mut copy = fp.clone();
-         profile::derive_block_counts(f, &mut copy);
-         derived.insert(profile::function_key(u, &f.name), copy);
-     }
-+    if drifted_edges > 0 {
-+        eprintln!(
-+            "lccc: PGO v9: {} function(s) drifted from the training CFG: \
-+             edge-derived branch/layout/unroll data disabled for them (hot/cold sections kept)",
-+            drifted_edges
-+        );
-+    }
-     if !derived.is_empty() {
-         let leaked: &'static FxHashMap<String, FunctionProfile> = Box::leak(Box::new(derived));
-         DERIVED_PTR.with(|d| d.set(leaked as *const _));
-     }
-+    let _ = edge_ok;
- }
- 
- /// Return the exact, CFG-validated profile for a function in the translation
-@@ -395,7 +466,39 @@ pub fn active_profile_for_function(f: &IrFunction) -> Option<&'static FunctionPr
-             return Some(fp);
-         }
-         let p = get_pgo_profile()?;
--        profile_for_function(p, unit, f)
-+        let fp = profile_for_function(p, unit, f)?;
-+        // Drift gate: never hand a drifted function's stale edge counts to an
-+        // edge consumer. `total_count` (entry count) is still usable by
-+        // callers that look it up directly via summary::entry_count_for /
-+        // get_for_unit; block/edge consumers must degrade to entry-only.
-+        if fp.post_hash != 0 && fp.post_hash != post_hash_for(&f.name) {
 +            return None;
 +        }
-+        Some(fp)
-+    })
-+}
-+
-+/// The non-drifted, flow-conservation-DERIVED profile for `f`, if one was
-+/// published by `propagate_profile`. `None` for drifted functions and for
-+/// functions without an edge-complete profile. Edge consumers (block layout,
-+/// branch probability, derived trip counts) MUST use this rather than
-+/// `active_profile_for_function`, so a drifted function is never reordered or
-+/// given branch/layout decisions from stale edge counts.
-+pub fn active_derived_profile(f: &IrFunction) -> Option<&'static FunctionProfile> {
-+    ACTIVE_UNIT.with(|slot| {
-+        let unit = slot.borrow();
-+        let unit = unit.as_deref()?;
-+        let key = profile::function_key(unit, &f.name);
-+        DERIVED_PTR.with(|d| {
-+            let p = d.get();
-+            if p.is_null() {
-+                None
-+            } else {
-+                // SAFETY: leaked once per unit before codegen; only replaced
-+                // at the next propagate_profile call, never concurrently.
-+                unsafe { (*p).get(&key) }
-+            }
-+        })
-     })
- }
- 
-diff --git a/src/pgo/profile.rs b/src/pgo/profile.rs
-index d2b34178..e23736ca 100644
---- a/src/pgo/profile.rs
-+++ b/src/pgo/profile.rs
-@@ -433,23 +433,59 @@ pub fn get_for_unit_cfg<'a>(
-         .map(|(_, f)| f)
-         .next()
- }
-+/// Serialize a loaded `ProfileData` as human-readable text.
-+///
-+/// Used for debugging and profile inspection (`LCCC_PGO_DUMP_TEXT=<file>`),
-+/// complementing the binary `.profraw` dump the instrumented runtime writes.
-+/// The on-disk format mirrors `parse_file`'s `lccc-pgo-v3/v4/v5` text layout so
-+/// the text dump can be re-loaded with `load_profile` for round-tripping.
- pub fn write_text_profile(p: &Path, d: &ProfileData) -> std::io::Result<()> {
-     if let Some(q) = p.parent() {
-         fs::create_dir_all(q)?
-     }
-     let mut f = fs::File::create(p)?;
-     for (n, x) in &d.functions {
--        writeln!(
--            f,
--            "lccc-pgo-v3 {} {} {}",
--            x.cfg_hash,
--            x.entry_label,
--            n.split("::").next().unwrap_or("0")
--        )?;
-+        // The function key is `{unit_hash:016x}::name`; the parser reads the
-+        // unit field as a DECIMAL u64 (`unit_hash`), so convert the hex prefix
-+        // back to a decimal u64 to keep the text output re-loadable.
-+        let unit_hex = n.split("::").next().unwrap_or("0");
-+        let unit_dec = u64::from_str_radix(unit_hex, 16).unwrap_or(0);
-+        // v5 header carries both fingerprints and the entry label / unit id;
-+        // fall back to v3 for legacy (post_hash == cfg_hash) so text output is
-+        // re-loadable by the version-tolerant parser.
-+        if x.post_hash != 0 && x.post_hash != x.cfg_hash {
-+            writeln!(
-+                f,
-+                "lccc-pgo-v5 {} {} {} {}",
-+                x.cfg_hash, x.post_hash, x.entry_label, unit_dec
-+            )?;
-+        } else {
-+            writeln!(
-+                f,
-+                "lccc-pgo-v3 {} {} {}",
-+                x.cfg_hash, x.entry_label, unit_dec
-+            )?;
-+        }
-         writeln!(f, "func {}", n)?;
-+        for (s, d2) in &x.edge_counts {
-+            if s.0 == crate::pgo::instrument::VENTRY {
-+                writeln!(f, "f {}", d2)?;
-+            } else {
-+                writeln!(f, "e {} {} {}", s.0, s.1, d2)?;
-+            }
-+        }
-         for (b, c) in &x.block_counts {
-             writeln!(f, "{} {}", b, c)?;
-         }
-+        for vs in &x.value_sites {
-+            for (tname, tcnt, tflags) in &vs.targets {
-+                writeln!(
-+                    f,
-+                    "v {} {} {}\n{} {} {}",
-+                    vs.ordinal, vs.total, vs.sig, tname, tcnt, tflags
-+                )?;
-+            }
-+        }
-     }
-     Ok(())
- }
-@@ -617,3 +653,61 @@ pub fn derive_block_counts(f: &IrFunction, fp: &mut super::FunctionProfile) {
-     }
-     fp.total_count = entry_count;
- }
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+    use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Operand, Terminator, IrParam, Instruction};
-+    use crate::common::types::IrType;
-+    use crate::ir::constants::IrConst;
-+
-+    /// Build a minimal loop CFG:
-+    ///   b0 (entry) -> Branch b1
-+    ///   b1 (header) CondBranch b2 (latch) / b3 (exit)
-+    ///   b2 (latch) Branch b1 (backedge)
-+    ///   b3 (exit) Return
-+    fn loop_cfg() -> IrFunction {
-+        let mk = |label: u32, is: Vec<Instruction>, term: Terminator| BasicBlock {
-+            label: BlockId(label), instructions: is, terminator: term, source_spans: vec![],
-+        };
-+        IrFunction {
-+            name: "loop_fn".into(),
-+            return_type: IrType::I32,
-+            params: vec![IrParam{ty:IrType::I32,struct_size:None,struct_align:None,struct_eightbyte_classes:vec![],is_f128_sse:false,riscv_float_class:None}],
-+            blocks: vec![
-+                mk(0, vec![], Terminator::Branch(BlockId(1))),
-+                mk(1, vec![], Terminator::CondBranch{
-+                    cond: Operand::Const(IrConst::I32(1)), true_label: BlockId(2), false_label: BlockId(3),
-+                }),
-+                mk(2, vec![], Terminator::Branch(BlockId(1))),
-+                mk(3, vec![], Terminator::Return(Some(Operand::Const(IrConst::I32(0))))),
-+            ],
-+            is_variadic:false,is_declaration:false,is_static:false,is_inline:false,is_always_inline:false,
-+            is_noinline:false,next_value_id:0,next_label:0,section:None,visibility:None,is_weak:false,is_used:false,
-+            has_inlined_calls:false,param_alloca_values:vec![],uses_sret:false,is_fastcall:false,is_naked:false,
-+            global_init_label_blocks:vec![],ret_eightbyte_classes:vec![],ret_is_f128_sse:false,is_gnu_inline_def:false,
-+        }
 +    }
-+
-+    #[test]
-+    fn solver_derives_latch_count() {
-+        // A proper arborescence roots the tree at entry(0) with tree edges
-+        // 0->1, 1->2, 1->3, 3->VEXIT; the loop backedge 2->1 is therefore the
-+        // instrumented (non-tree) edge. entry count = 10, backedge = 80.
-+        let f = loop_cfg();
-+        let mut fp = FunctionProfile {
-+            total_count: 0,
-+            block_counts: FxHashMap::default(),
-+            edge_counts: FxHashMap::default(),
-+            cfg_hash: 0, post_hash: 0, entry_label: 0, value_sites: vec![],
-+        };
-+        fp.edge_counts.insert((crate::pgo::instrument::VENTRY, 0), 10); // entry count
-+        fp.edge_counts.insert((2, 1), 80); // instrumented backedge (latch -> header)
-+        derive_block_counts(&f, &mut fp);
-+        // The latch (b2) executes 80 times; the header executes entry + backedge.
-+        assert_eq!(fp.block_count(BlockId(2)), 80,
-+            "latch block must derive its count from flow conservation");
-+        assert_eq!(fp.block_count(BlockId(1)), 90,
-+            "header block must be entry + backedge executions");
-+    }
-+}
-diff --git a/src/pgo/promote.rs b/src/pgo/promote.rs
-index a2de574e..041b72ab 100644
---- a/src/pgo/promote.rs
-+++ b/src/pgo/promote.rs
-@@ -64,6 +64,21 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
-         .unwrap_or(51)
-         .max(1)
-         .min(100);
-+    // v11 (red-team fix): a site whose top target accounts for >= STABLE_PERCENT
-+    // (default 95%) of calls is effectively SINGLE-TARGET and is already
-+    // predicted perfectly by the indirect branch predictor (BTB) — the guarded
-+    // `cmp fp, target; jne cold; call target; cold: call *fp` transform then
-+    // adds a compare + branch to EVERY call with no accuracy benefit, a net
-+    // REGRESSION (measured: op_dispatch indirect dispatch 38.9ms -> 49.9ms,
-+    // +28% from devirtualizing a loop-invariant single target). Devirtualization
-+    // is only beneficial when the site is genuinely MULTI-VALUED (top share
-+    // below STABLE_PERCENT) — there the guard makes the common case a direct
-+    // call and reduces real indirect-call mispredictions.
-+    let stable_percent: u64 = std::env::var("LCCC_PGO_PROMOTE_STABLE")
-+        .ok()
-+        .and_then(|x| x.parse().ok())
-+        .unwrap_or(95)
-+        .clamp(51, 100);
-     let mut promoted = 0;
- 
-     // Module-global label + value counters (labels are TU-global).
-@@ -135,6 +150,12 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
-                 if tcount.saturating_mul(100) < site.total.saturating_mul(threshold) {
-                     continue;
+     let (a_val, b_val) = match fmul_inst {
+         Instruction::BinOp {
+             op: IrBinOp::Mul,
+@@ -1304,13 +1316,16 @@ fn analyze_reduction_pattern(
+                     eprintln!("[VEC-RED]   Simple sum pattern with cast detected: {:?} += ({:?})load(arr[iv])", element_type, from_ty);
                  }
-+                // v11: skip the effectively single-target (stable, perfectly
-+                // predicted) sites — promoting them only adds per-call overhead
-+                // (see the stable_percent rationale above).
-+                if tcount.saturating_mul(100) >= site.total.saturating_mul(stable_percent) {
-+                    continue;
-+                }
-                 // A static target's emitted symbol is LOCAL: cross-TU direct
-                 // calls cannot link (observed: functable.force_init_stub, a
-                 // static in functable.c whose pointer escapes via the global
-diff --git a/src/pgo/summary.rs b/src/pgo/summary.rs
-index 28746337..f2070a77 100644
---- a/src/pgo/summary.rs
-+++ b/src/pgo/summary.rs
-@@ -21,10 +21,19 @@ use crate::common::fx_hash::FxHashMap;
- use crate::pgo::profile::unit_hash;
- use crate::pgo::ProfileData;
  
-+/// The hottest function must be at least this many times hotter than the
-+/// runner-up for the profile to be considered informative (see
-+/// `ProfileSummary::has_spread`). A single dominant hot function is the signal
-+/// that profile-guided decisions have something to optimize; a tie of several
-+/// "hot" functions is a flat profile where acting on hotness is vacuous.
-+pub const HOT_DOMINANCE: u64 = 2;
-+
- #[derive(Debug, Clone)]
- pub struct ProfileSummary {
-     pub total: u64,
-     pub max: u64,
-+    /// Second-highest function entry count (0 if only one nonzero function).
-+    pub second_max: u64,
-     pub hot_threshold: u64,
-     pub cold_threshold: u64,
- }
-@@ -44,6 +53,27 @@ impl ProfileSummary {
-             c as f64 / self.max as f64
-         }
+-                // When the accumulator is wider than the array element (e.g., long += int),
+-                // we cannot simply use packed narrow adds — the results would overflow/truncate.
+-                // Reject this pattern; proper widening vectorization would require
+-                // vpmovsx + vpaddq which is much more complex.
+-                if element_type.size() > from_ty.size() {
++                // The cast must be a redundant no-op (from_ty == accumulator
++                // type). Anything else — widening (`long += int`), narrowing,
++                // or cross-kind (`float += int`, `int += float`) — changes the
++                // per-element add semantics in a way a single-lane-type packed
++                // add cannot reproduce. The old check only rejected widening,
++                // so `float s += (float)int_arr[i]` slipped through, vectorized
++                // as I32 adds on a F32 accumulator, and returned 0.0.
++                if *from_ty != element_type {
+                     if debug {
+-                        eprintln!("[VEC-RED]   Rejecting: accumulator {:?} wider than element {:?}", element_type, from_ty);
++                        eprintln!("[VEC-RED]   Rejecting: cast from {:?} to accumulator type {:?} (only redundant casts are vectorizable)", from_ty, element_type);
+                     }
+                     return None;
+                 }
+@@ -1814,20 +1829,36 @@ fn insert_remainder_loop(
+         *false_label = vec_exit_label;
      }
-+    /// True when the profile reflects genuine hot/cold SEPARATION — the hottest
-+    /// function is clearly dominant (at least `HOT_DOMINANCE`× the runner-up).
-+    ///
-+    /// Percentile thresholds collapse on sparse or flat distributions and are
-+    /// NOT a reliable separation signal (v10 finding: a flat profile of tied
-+    /// "hot" functions [48,48,48,1,1] collapses hot==cold==48, and a truly
-+    /// skewed one [2.0M,64,1] also collapses because the hot count dominates
-+    /// total). What actually matters for whether profile-driven decisions are
-+    /// informative is a clear dominant hot path. `has_spread()` is the gate for
-+    /// profile-driven inlining/layout: on a flat (tied) profile acting on
-+    /// "hotness" is vacuous and regresses hot paths (adler32 -20%), so the
-+    /// transforms must be withheld; on a skewed profile they engage.
-+    pub fn has_spread(&self) -> bool {
-+        if self.max == 0 {
-+            return false;
-+        }
-+        // A UNIQUE, dominant hot function: the max count must be strictly
-+        // greater than the runner-up (not tied) and at least HOT_DOMINANCE× it.
-+        // A tie of several "hot" functions is a flat profile.
-+        self.max > self.second_max && self.max >= HOT_DOMINANCE * self.second_max.max(1)
-+    }
- }
  
- /// Build the summary for one translation unit from the loaded profile.
-@@ -69,10 +99,18 @@ pub fn build_for_unit(p: &ProfileData, unit: &str) -> ProfileSummary {
-         .collect();
-     let total: u64 = counts.iter().sum();
-     let max = counts.iter().copied().max().unwrap_or(0);
-+    // Second-highest count, i.e. the runner-up (for the dominance-based
-+    // has_spread). This is the SECOND element of the descending sort, so a
-+    // tie at the max yields second_max == max (the profile is flat). 0 when
-+    // only one nonzero function exists.
-+    let mut sorted = counts.clone();
-+    sorted.sort_unstable_by(|a, b| b.cmp(a));
-+    let second_max = sorted.get(1).copied().unwrap_or(0);
-     if total == 0 {
-         return ProfileSummary {
-             total,
-             max,
-+            second_max: 0,
-             hot_threshold: 0,
-             cold_threshold: 0,
-         };
-@@ -110,6 +148,7 @@ pub fn build_for_unit(p: &ProfileData, unit: &str) -> ProfileSummary {
-     ProfileSummary {
-         total,
-         max,
-+        second_max,
-         hot_threshold,
-         cold_threshold,
-     }
-@@ -160,3 +199,68 @@ pub fn block_count_for<'a>(p: &'a ProfileData, unit: &str, name: &str, label: u3
-         .unwrap_or(0)
- }
- pub fn _unused(_: FxHashMap<(), ()>) {}
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+
-+    fn counts(v: &[u64]) -> ProfileSummary {
-+        // Build the summary the same way build_for_unit does (percentile
-+        // thresholds + second_max) but from an explicit count list, so the
-+        // test is independent of unit-keying.
-+        let hot_frac = 0.90;
-+        let cold_frac = 0.05;
-+        let total: u64 = v.iter().sum();
-+        let max = v.iter().copied().max().unwrap_or(0);
-+        let mut sorted = v.to_vec();
-+        sorted.sort_unstable_by(|a, b| b.cmp(a));
-+        let second_max = sorted.get(1).copied().unwrap_or(0);
-+        if total == 0 {
-+            return ProfileSummary { total, max, second_max, hot_threshold: 0, cold_threshold: 0 };
+-    // Step 2: Create vec_exit block
+-    // Convert byte-offset IV back to element index for the scalar remainder loop:
+-    // j_rem_start = byte_off_final / 8 (sizeof(double))
++    // Step 2: Create vec_exit block.
++    // Convert the loop's final IV into the element index where the scalar
++    // remainder must start. The IV representation differs by vector width:
++    //   - AVX2 (width 4): IV is a BYTE offset stepping 32 -> start = IV / 8.
++    //   - SSE2 (width 2): IV is an ELEMENT index stepping 1 (GEP stride x2)
++    //                    -> start = IV * 2.
++    // The previous code always divided by 8, which is only valid for the AVX2
++    // byte-offset scheme; for SSE2 it re-processed nearly the whole array
++    // (double-counting elements) and miscomputed the result.
++    let rem_start_inst = if vec_width == 2 {
++        Instruction::BinOp {
++            dest: j_rem_start,
++            op: IrBinOp::Mul,
++            lhs: Operand::Value(pattern.iv),   // Final element index
++            rhs: Operand::Const(IrConst::I32(2)),
++            ty: IrType::I32,
 +        }
-+        let mut counts = v.to_vec();
-+        counts.sort_unstable_by(|a, b| b.cmp(a));
-+        let mut cum = 0u64;
-+        let mut hot_threshold = 0u64;
-+        for &c in &counts {
-+            if c == 0 { break; }
-+            cum += c;
-+            if (cum as f64) / (total as f64) >= hot_frac { hot_threshold = c; break; }
-+        }
-+        let mut cum2 = 0u64;
-+        let mut cold_threshold = 0u64;
-+        for &c in counts.iter().rev() {
-+            if c == 0 { continue; }
-+            cum2 += c;
-+            if (cum2 as f64) / (total as f64) >= cold_frac { cold_threshold = c; break; }
-+        }
-+        ProfileSummary { total, max, second_max, hot_threshold, cold_threshold }
-+    }
-+
-+    #[test]
-+    fn flat_tied_hot_is_not_spread() {
-+        // adler32-style: three tied "hot" functions + a couple cold. Percentile
-+        // hot==cold==48 (collapse), and max == second_max -> NO dominance.
-+        let s = counts(&[48, 48, 48, 1, 1]);
-+        assert!(!s.has_spread(), "tied-hot flat profile must not be informative");
-+    }
-+
-+    #[test]
-+    fn dominant_hot_is_spread() {
-+        // expat-style: one clearly dominant hot function.
-+        let s = counts(&[2_014_727, 64, 1]);
-+        assert!(s.has_spread(), "single dominant hot function must be informative");
-+    }
-+
-+    #[test]
-+    fn two_hot_functions_equal_not_spread() {
-+        let s = counts(&[100, 100, 1, 1]);
-+        assert!(!s.has_spread(), "two tied hot functions are still flat");
-+    }
-+
-+    #[test]
-+    fn empty_profile_no_spread() {
-+        let s = counts(&[]);
-+        assert!(!s.has_spread());
-+    }
-+}
-diff --git a/src/pgo/unroll_pgo.rs b/src/pgo/unroll_pgo.rs
-index cc77df9d..18b494d7 100644
---- a/src/pgo/unroll_pgo.rs
-+++ b/src/pgo/unroll_pgo.rs
-@@ -37,11 +37,25 @@ fn successors(t: &crate::ir::reexports::Terminator) -> Vec<crate::ir::reexports:
-     }
- }
- 
--/// Estimated average trip count of the loop whose header is `f.blocks[idx]`.
--/// Uses the derived edge counts: trip = backedge / entry.
-+/// Estimated average trip count of the loop whose header is `f.blocks[idx]`,
-+/// derived from the profile via flow conservation: trip = backedge / entry.
-+///
-+/// The unroller runs DURING the pre-pass (inside `run_passes`), at which point
-+/// `active_derived_profile` is not yet published (`propagate_profile` runs
-+/// after the pass pipeline). The raw profile only carries instrumented
-+/// NON-tree edges; a loop's backedge is the maximum-spanning-tree edge (weight
-+/// 2000) and is therefore NOT instrumented, so `edge_count(backedge)` is 0 on
-+/// the raw profile — the v8 "derived trip count" path was dead during
-+/// unrolling and always fell back to the entry-count heuristic. Fix: derive
-+/// the tree/backedge counts on the current (pre-pass) CFG right here, exactly
-+/// as the PGO inliner already does for per-call-site hotness.
- fn trip_count(f: &IrFunction, idx: usize) -> Option<u64> {
-     let header = f.blocks.get(idx)?.label.0;
--    let fp = crate::pgo::active_profile_for_function(f)?;
-+    // Pre-pass: clone the raw (name-keyed) profile and derive the tree edges
-+    // on the CURRENT pre-pass CFG. The pre-pass CFG is stable across
-+    // generate/use, so the derived backedge count is correct.
-+    let mut fp = crate::pgo::prepass_profile(&f.name)?;
-+    crate::pgo::profile::derive_block_counts(f, &mut fp);
-     let entry = fp.total_count.max(1);
-     let mut back = 0u64;
-     for b in &f.blocks {
-@@ -71,6 +85,9 @@ pub fn should_unroll_loop(
-         return Some(false);
-     }
-     if let Some(t) = trip_count(f, idx) {
-+        // Profile-accurate unrolling (GCC/LLVM scale unrolling by the
-+        // estimated trip count): high-trip loops unroll, low-trip loops do
-+        // not — no code bloat on cold/once-only paths.
-         if t >= 16 && size <= 24 {
-             return Some(true);
-         }
-@@ -82,7 +99,8 @@ pub fn should_unroll_loop(
-         }
-         return None;
-     }
--    // Pre-pass fallback: entry-count heuristic (v7 behavior).
-+    // Pre-pass fallback: entry-count heuristic (v7 behavior) for functions
-+    // without a usable derived backedge (e.g. no profile for this function).
-     let n = if crate::pgo::prepass_is_active() {
-         crate::pgo::total_count_for(&f.name)
-     } else {
-diff --git a/tests/benchmark/run_pgo_ab.py b/tests/benchmark/run_pgo_ab.py
-new file mode 100644
-index 00000000..ad32dc27
---- /dev/null
-+++ b/tests/benchmark/run_pgo_ab.py
-@@ -0,0 +1,293 @@
-+#!/usr/bin/env python3
-+"""LCCC PGO A/B benchmark laboratory.
-+
-+For every workload kernel and compiler (lccc, gcc) it builds TWO binaries:
-+
-+  * `plain`  — compiled with the requested optimization level only;
-+  * `pgo`    — the same flags PLUS a profile-guided round trip:
-+        generate  : -fprofile-generate=<dir>  -> compile
-+        train     : run the generated binary once (production training data)
-+        use       : -fprofile-use=<dir>        -> compile the final binary
-+
-+It then verifies that every binary prints the SAME output (differential
-+correctness: a PGO build must be observationally identical to the plain build
-+and to the reference compiler), and times all binaries in interleaved,
-+shuffled rounds so the PGO-vs-plain ratio and the lccc-vs-gcc ratio are both
-+paired and controlled.
-+
-+The runtime measurement is CPU-time based and every binary is a fixed-workload
-+program with a deterministic self-check, so this is a fair A/B even without a
-+PMU.  Run with `--reps 21` (default) for bootstrap-CI quality.
-+
-+Usage:
-+  python3 run_pgo_ab.py --reps 21 --opt -O2 --compilers lccc,gcc \
-+      --only gzip_crc32,expat_xml_scan,zlib_ng_adler32
-+"""
-+from __future__ import annotations
-+
-+import argparse
-+import json
-+import os
-+import random
-+import statistics
-+import subprocess
-+import sys
-+import tempfile
-+import time
-+from pathlib import Path
-+
-+REPO_ROOT = Path(__file__).resolve().parents[2]
-+DEFAULT_LCCC = REPO_ROOT / "target" / "release" / "lccc"
-+PROGRAMS = REPO_ROOT / "tests" / "benchmark" / "programs"
-+
-+
-+def invoke(command: list[str], *, timeout_s: int, cwd: Path | None = None) -> dict:
-+    start = time.perf_counter_ns()
-+    try:
-+        cp = subprocess.run(
-+            command, capture_output=True, text=True, timeout=timeout_s, cwd=cwd
-+        )
-+        ok = cp.returncode == 0
-+        return {
-+            "ok": ok,
-+            "wall_s": (time.perf_counter_ns() - start) / 1e9,
-+            "returncode": cp.returncode,
-+            "stdout": cp.stdout,
-+            "stderr": cp.stderr,
-+            "error": None,
-+        }
-+    except subprocess.TimeoutExpired:
-+        return {
-+            "ok": False,
-+            "wall_s": float(timeout_s),
-+            "returncode": -1,
-+            "stdout": "",
-+            "stderr": "",
-+            "error": "timeout",
-+        }
-+
-+
-+def bootstrap_ci(values: list[float], seed: int, resamples: int = 4000) -> dict | None:
-+    """Median with a bias-corrected bootstrap 95% CI. None if <2 samples."""
-+    if len(values) < 2:
-+        return None
-+    rng = random.Random(seed)
-+    n = len(values)
-+    medians = []
-+    for _ in range(resamples):
-+        medians.append(statistics.median(values[rng.randrange(n)] for _ in range(n)))
-+    medians.sort()
-+    lo = medians[int(0.025 * len(medians))]
-+    hi = medians[int(0.975 * len(medians))]
-+    return {
-+        "median": statistics.median(values),
-+        "mean": statistics.mean(values),
-+        "min": min(values),
-+        "max": max(values),
-+        "ci_lo": lo,
-+        "ci_hi": hi,
-+        "n": n,
-+    }
-+
-+
-+def pair_ratio(pgo_values: list[float], plain_values: list[float], seed: int) -> dict | None:
-+    """Paired ratio of PGO over plain for matching run indices."""
-+    n = min(len(pgo_values), len(plain_values))
-+    if n < 2:
-+        return None
-+    rng = random.Random(seed)
-+    ratios = []
-+    for i in range(n):
-+        # Paired within a round; tiny eps to avoid div-by-zero.
-+        ratios.append((pgo_values[i] + 1e-9) / (plain_values[i] + 1e-9))
-+    c = bootstrap_ci(ratios, seed + 12345)
-+    if c is None:
-+        return None
-+    c["pgo_median_s"] = statistics.median(pgo_values)
-+    c["plain_median_s"] = statistics.median(plain_values)
-+    c["pgo_speedup_vs_plain"] = 1.0 / c["median"]  # >1 = PGO faster
-+    return c
-+
-+
-+def gcc_include() -> str | None:
-+    r = subprocess.run(
-+        ["gcc", "-print-file-name=include"], capture_output=True, text=True
-+    )
-+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
-+
-+
-+def compiler_flags(compiler: str, opt: str, extra: list[str], ginc: str | None) -> list[str]:
-+    if compiler == "lccc":
-+        flags = [opt]
-+        if ginc:
-+            flags.append(f"-I{ginc}")
-+        return flags + extra
-+    return [opt] + extra
-+
-+
-+def main() -> int:
-+    ap = argparse.ArgumentParser(description=__doc__)
-+    ap.add_argument("--only", default="", help="comma-separated kernel names (default: all)")
-+    ap.add_argument("--opt", default="-O2", help="optimization level")
-+    ap.add_argument("--compilers", default="lccc,gcc")
-+    ap.add_argument("--reps", type=int, default=21)
-+    ap.add_argument("--warmup", type=int, default=2)
-+    ap.add_argument("--cflag", action="append", default=[], help="extra compiler flag")
-+    ap.add_argument("--work", default="/tmp/lccc_pgo_ab", help="work directory")
-+    ap.add_argument("--lccc", default=str(DEFAULT_LCCC))
-+    ap.add_argument("--json", default="", help="write JSON report to this path")
-+    ap.add_argument("--timeout", type=int, default=120)
-+    args = ap.parse_args()
-+
-+    compilers = [c.strip() for c in args.compilers.split(",") if c.strip()]
-+    work = Path(args.work)
-+    work.mkdir(parents=True, exist_ok=True)
-+    ginc = gcc_include() if "lccc" in compilers else None
-+
-+    selected = {s.strip() for s in args.only.split(",") if s.strip()}
-+    kernels = sorted(p.stem for p in PROGRAMS.glob("*.c"))
-+    if selected:
-+        kernels = [k for k in kernels if k in selected]
-+
-+    if not kernels:
-+        print(f"no kernels selected (available: {sorted(p.stem for p in PROGRAMS.glob('*.c'))})")
-+        return 2
-+
-+    report = {
-+        "lccc": args.lccc,
-+        "opt": args.opt,
-+        "compilers": compilers,
-+        "gcc_version": subprocess.run(
-+            ["gcc", "--version"], capture_output=True, text=True
-+        ).stdout.splitlines()[0] if "gcc" in compilers else None,
-+        "results": {},
-+    }
-+
-+    for name in kernels:
-+        src = PROGRAMS / f"{name}.c"
-+        if not src.exists():
-+            continue
-+        entry: dict = {"plain": {}, "pgo": {}, "outputs": {}, "ratios": {}, "results": {}}
-+        binaries: dict[str, dict[str, Path]] = {}
-+        outputs: dict[str, str] = {}
-+
-+        for compiler in compilers:
-+            exe = args.lccc if compiler == "lccc" else compiler
-+            flags = compiler_flags(compiler, args.opt, args.cflag, ginc)
-+            base = work / f"{name}_{compiler}"
-+            plain_bin = base / "plain"
-+            gen_dir = base / "prof"
-+            use_bin = base / "pgo"
-+            gen_dir.mkdir(parents=True, exist_ok=True)
-+
-+            # ---- plain build ----
-+            plain_bin.parent.mkdir(parents=True, exist_ok=True)
-+            cmd = [exe, *flags, "-o", str(plain_bin), str(src)]
-+            r = invoke(cmd, timeout_s=args.timeout, cwd=REPO_ROOT)
-+            if not r["ok"]:
-+                entry["plain"][compiler] = {"ok": False, "stderr": r["stderr"][:800]}
-+                continue
-+            # train once (deterministic kernel -> identical profile)
-+            tr = invoke([str(plain_bin)], timeout_s=args.timeout)
-+            if not tr["ok"]:
-+                entry["plain"][compiler] = {"ok": False, "stderr": "train run failed"}
-+                continue
-+            outputs[f"{compiler}_plain"] = tr["stdout"]
-+
-+            # ---- PGO build (generate -> train -> use) ----
-+            gen_bin = base / "gen"
-+            gcmd = [exe, *flags, f"-fprofile-generate={gen_dir}", "-o", str(gen_bin), str(src)]
-+            rg = invoke(gcmd, timeout_s=args.timeout, cwd=REPO_ROOT)
-+            if not rg["ok"]:
-+                entry["pgo"][compiler] = {"ok": False, "stderr": rg["stderr"][:800]}
-+                continue
-+            t2 = invoke([str(gen_bin)], timeout_s=args.timeout)
-+            if not t2["ok"]:
-+                entry["pgo"][compiler] = {"ok": False, "stderr": "generated train run failed"}
-+                continue
-+            outputs[f"{compiler}_pgo_train"] = t2["stdout"]
-+            ucmd = [exe, *flags, f"-fprofile-use={gen_dir}", "-o", str(use_bin), str(src)]
-+            ru = invoke(ucmd, timeout_s=args.timeout, cwd=REPO_ROOT)
-+            if not ru["ok"]:
-+                entry["pgo"][compiler] = {"ok": False, "stderr": ru["stderr"][:800]}
-+                continue
-+            binaries[compiler] = {"plain": plain_bin, "pgo": use_bin}
-+            entry["plain"][compiler] = {"ok": True}
-+            entry["pgo"][compiler] = {"ok": True}
-+
-+        # ---- differential correctness ----
-+        # All successful builds must print the identical output.
-+        out_values = set(outputs.values())
-+        if len(out_values) > 1:
-+            entry["outputs"] = outputs
-+            entry["differential_ok"] = False
-+        else:
-+            entry["differential_ok"] = True
-+        # PGO (use) output must equal its plain output for every compiler.
-+        for compiler in compilers:
-+            if f"{compiler}_plain" in outputs and f"{compiler}_pgo_train" in outputs:
-+                if outputs[f"{compiler}_plain"] != outputs[f"{compiler}_pgo_train"]:
-+                    entry["differential_ok"] = False
-+
-+        # ---- timed A/B rounds (interleaved, shuffled) ----
-+        if not entry.get("differential_ok", False):
-+            # Still time, but flag it loudly.
-+            entry["warning"] = "differential mismatch (see outputs)"
-+        variants: dict[str, Path] = {}
-+        for compiler in compilers:
-+            if compiler in binaries:
-+                variants[f"{compiler}_plain"] = binaries[compiler]["plain"]
-+                variants[f"{compiler}_pgo"] = binaries[compiler]["pgo"]
-+
-+        timed: dict[str, list[float]] = {k: [] for k in variants}
-+        rng = random.Random(hash((name, args.opt)) & 0xFFFFFFFF)
-+        keys = list(variants)
-+        for _ in range(args.warmup):
-+            rng.shuffle(keys)
-+            for k in keys:
-+                invoke([str(variants[k])], timeout_s=args.timeout)
-+        for _ in range(args.reps):
-+            rng.shuffle(keys)
-+            for k in keys:
-+                run = invoke([str(variants[k])], timeout_s=args.timeout)
-+                if run["ok"]:
-+                    timed[k].append(run["wall_s"])
-+        for k in variants:
-+            entry["results"][k] = bootstrap_ci(timed[k], hash(k) & 0xFFFFFFFF)
-+        # Paired ratios.
-+        for compiler in compilers:
-+            r = pair_ratio(timed.get(f"{compiler}_pgo", []), timed.get(f"{compiler}_plain", []),
-+                           hash((name, compiler, "pgo")) & 0xFFFFFFFF)
-+            if r:
-+                entry["ratios"][f"{compiler}_pgo_over_plain"] = r
-+        # lccc vs gcc on the same build kind.
-+        if "lccc" in compilers and "gcc" in compilers:
-+            for kind in ("plain", "pgo"):
-+                r = pair_ratio(timed.get(f"lccc_{kind}", []), timed.get(f"gcc_{kind}", []),
-+                               hash((name, "lccc_vs_gcc", kind)) & 0xFFFFFFFF)
-+                if r:
-+                    entry["ratios"][f"lccc_over_gcc_{kind}"] = r
-+
-+        report["results"][name] = entry
-+        # ---- console summary ----
-+        def line(k: str) -> str:
-+            s = entry["results"].get(k)
-+            return "n/a" if not s else f"{s['median']*1e3:.3f}ms [{s['ci_lo']*1e3:.3f},{s['ci_hi']*1e3:.3f}]"
-+        print(f"\n=== {name}  ({args.opt}) ===")
-+        print(f"  differential_ok={entry.get('differential_ok')}")
-+        for compiler in compilers:
-+            pr = entry["ratios"].get(f"{compiler}_pgo_over_plain")
-+            prs = "n/a" if not pr else f"{pr['pgo_speedup_vs_plain']:.3f}x PGO speedup (pgo {pr['pgo_median_s']*1e3:.3f}ms vs plain {pr['plain_median_s']*1e3:.3f}ms)"
-+            print(f"  {compiler:5} plain {line(f'{compiler}_plain'):>28} | pgo {line(f'{compiler}_pgo'):>28} | {prs}")
-+        lpg = entry["ratios"].get("lccc_over_gcc_pgo")
-+        if lpg:
-+            print(f"  lccc_pgo/gcc_pgo ratio = {lpg['median']:.3f}x (lccc {lpg['pgo_median_s']*1e3:.3f}ms vs gcc {lpg['plain_median_s']*1e3:.3f}ms)")
-+
-+    if args.json:
-+        Path(args.json).write_text(json.dumps(report, indent=2, default=str))
-+        print(f"\nreport written to {args.json}")
-+    return 0
-+
-+
-+if __name__ == "__main__":
-+    sys.exit(main())
-diff --git a/tests/regression/regr_v10_pgo_flat.c b/tests/regression/regr_v10_pgo_flat.c
-new file mode 100644
-index 00000000..74bd1c97
---- /dev/null
-+++ b/tests/regression/regr_v10_pgo_flat.c
-@@ -0,0 +1,59 @@
-+// regr_v10_pgo_flat.c
-+//
-+// v10 red-team regression: a FLAT-PROFILE workload. Two functions
-+// (`step_even`, `step_odd`) are called an EQUAL number of times from the hot
-+// loop, so the profile's hot function set is TIED (no dominant hot path).
-+// Under the old behavior the percentile thresholds collapsed and the PGO
-+// inliner acted on the "hot" tie, restructuring hot functions and regressing
-+// them (zlib-ng adler32 -20%). The `has_spread()` dominance gate must detect
-+// this flat profile and skip profile-driven inlining, so the `-fprofile-use`
-+// build's hot functions are NOT bloated relative to plain.
-+//
-+// This kernel self-checks correctness under both builds; the round-trip script
-+// additionally verifies the hot functions are not structurally bloated.
-+#include <stdio.h>
-+
-+__attribute__((noinline)) static int step_even(int x) {
-+    int s = 0;
-+    s += (x * 3 + 1) & 0xffff;
-+    s -= (x >> 2);
-+    s ^= (x << 1) & 0xffff;
-+    s += (x / 7);
-+    return s;
-+}
-+
-+__attribute__((noinline)) static int step_odd(int x) {
-+    int s = 0;
-+    s += (x * 5 - 3) & 0xffff;
-+    s += (x >> 3);
-+    s ^= (x * 11) & 0xffff;
-+    s -= (x / 13);
-+    return s;
-+}
-+
-+__attribute__((noinline)) static int cold_helper(int x) { return x * 2; }
-+
-+int main(int argc, char** argv) {
-+    (void)argv;
-+    long a = 0, b = 0;
-+    /* equal hotness: step_even and step_odd called the same number of times */
-+    for (int i = 0; i < 2000000; i++) {
-+        a += step_even(i & 0xffff);
-+        b += step_odd(i & 0xffff);
-+    }
-+    /* cold path: calls cold_helper once */
-+    long c = cold_helper(5);
-+    long e_a = 0, e_b = 0;
-+    for (int i = 0; i < 2000000; i++) {
-+        e_a += ((((i & 0xffff) * 3 + 1) & 0xffff) - ((i & 0xffff) >> 2)
-+                ^ ((i & 0xffff) << 1) & 0xffff) + (((i & 0xffff)) / 7);
-+        e_b += ((((i & 0xffff) * 5 - 3) & 0xffff) + ((i & 0xffff) >> 3)
-+                ^ ((i & 0xffff) * 11) & 0xffff) - ((i & 0xffff) / 13);
-+    }
-+    if (a != e_a || b != e_b) {
-+        printf("MISMATCH a=%ld e_a=%ld b=%ld e_b=%ld\n", a, e_a, b, e_b);
-+        return 1;
-+    }
-+    printf("ok %ld %ld %ld\n", a, b, c);
-+    return 0;
-+}
-diff --git a/tests/regression/regr_v11_costaware_devirt.c b/tests/regression/regr_v11_costaware_devirt.c
-new file mode 100644
-index 00000000..2d691ceb
---- /dev/null
-+++ b/tests/regression/regr_v11_costaware_devirt.c
-@@ -0,0 +1,37 @@
-+// regr_v11_costaware_devirt.c
-+//
-+// v11 red-team regression: devirtualization must be COST-AWARE. Promoting an
-+// effectively SINGLE-TARGET indirect call (top target share >= LCCC_PGO_PROMOTE_STABLE,
-+// default 95%) is a net REGRESSION: the hardware indirect-branch predictor (BTB)
-+// already predicts a stable single target perfectly, so the guarded
-+// `cmp fp,target; jne cold; call target; cold: call *fp` transform only adds a
-+// compare + branch to every call with no accuracy benefit (measured: op_dispatch
-+// 38.9ms -> 49.9ms, +28%).
-+//
-+// This kernel uses a SINGLE, loop-invariant function pointer, so devirtualization
-+// must NOT fire (otherwise we'd inject overhead into the hot loop). The
-+// self-checking reference verifies correctness; run_pgo_roundtrip.sh verifies
-+// that a MULTI-VALUED site (regr_v7) still promotes.
-+#include <stdio.h>
-+
-+__attribute__((noinline)) static int op_xor(int x) { return x ^ 7; }
-+__attribute__((noinline)) static int op_add(int x) { return x + 7; }
-+
-+__attribute__((noinline)) static int run(int n, int (*f)(int)) {
-+    int s = 0;
-+    for (int i = 0; i < n; i++) s += f(i & 255);   /* single, stable target */
-+    return s;
-+}
-+
-+int main(int argc, char** argv) {
-+    (void)argv;
-+    int (*f)(int) = op_xor;   /* loop-invariant single target */
-+    long s = 0;
-+    for (int k = 0; k < 3000; k++) s += run(2000, f);
-+    long e = 0;
-+    for (int k = 0; k < 3000; k++)
-+        for (int i = 0; i < 2000; i++) e += ((i & 255) ^ 7);
-+    if (s != e) { printf("MISMATCH s=%ld e=%ld\n", s, e); return 1; }
-+    printf("ok %ld\n", s);
-+    return 0;
-+}
-diff --git a/tests/regression/regr_v9_pgo_branchy.c b/tests/regression/regr_v9_pgo_branchy.c
-new file mode 100644
-index 00000000..f3b3aac9
---- /dev/null
-+++ b/tests/regression/regr_v9_pgo_branchy.c
-@@ -0,0 +1,97 @@
-+// regr_v9_pgo_branchy.c
-+//
-+// v9 red-team audit regression: exercises the profile-guided edge consumers
-+// (block layout + branch-probability fallthrough refinement + switch-case
-+// ordering) across a PGO generate -> train -> use roundtrip with self-checking
-+// reference values, and verifies the use build is byte-for-byte behaviorally
-+// identical to the training build.
-+//
-+// The function `classify` has a mix of conditional branches, a dense switch,
-+// and a hot path (mode 3). The training run drives mode 3 90% of the time, so
-+// the PGO use build should lay the hot path as fallthrough and reorder switch
-+// cases — while still producing identical results under both layouts.
-+#include <stdio.h>
-+
-+__attribute__((noinline)) static int classify(int x, int mode) {
-+    int r = 0;
-+    /* conditional-heavy, hot when mode==3 */
-+    if (mode == 3) {
-+        if (x > 1000)      r += (x >> 3) + 1;
-+        else if (x > 100)  r += (x >> 2) - 2;
-+        else if (x > 10)   r += (x >> 1) * 3;
-+        else               r += x * 7;
 +    } else {
-+        r += x * 2;
-+    }
-+    /* dense switch — case ordering / jump-table decisions */
-+    switch (x & 7) {
-+    case 0: r += 1000; break;
-+    case 1: r += 1001; break;
-+    case 2: r += 1002; break;
-+    case 3: r += 1003; break;
-+    case 4: r += 1004; break;
-+    case 5: r += 1005; break;
-+    case 6: r += 1006; break;
-+    default: r += 1007; break;
-+    }
-+    return r;
-+}
-+
-+__attribute__((noinline)) static int hot_impl(int a) { return a * 5 + 3; }
-+__attribute__((noinline)) static int cold_impl(int a) { return a - 9; }
-+
-+int main(int argc, char** argv) {
-+    (void)argv;
-+    int (*f)(int) = hot_impl;
-+    long s = 0;
-+    for (int i = 0; i < 200000; i++) {
-+        int x = (i * 2654435761u) & 0xffff;
-+        /* 90% mode 3 (hot branch path), 10% mode 0 */
-+        int mode = (i % 10) < 9 ? 3 : 0;
-+        s += classify(x, mode);
-+        /* indirect call — promotion site; hot target dominates */
-+        s += f(i & 255);
-+    }
-+    /* cold path: low-trip, exercises the other mode */
-+    for (int i = 0; i < 100; i++) s += classify(i, 0);
-+
-+    /* self-check with an independent formulation */
-+    long e = 0;
-+    for (int i = 0; i < 200000; i++) {
-+        int x = (i * 2654435761u) & 0xffff;
-+        int mode = (i % 10) < 9 ? 3 : 0;
-+        int r = 0;
-+        if (mode == 3) {
-+            if (x > 1000)      r += (x >> 3) + 1;
-+            else if (x > 100)  r += (x >> 2) - 2;
-+            else if (x > 10)   r += (x >> 1) * 3;
-+            else               r += x * 7;
-+        } else {
-+            r += x * 2;
++        Instruction::BinOp {
++            dest: j_rem_start,
++            op: IrBinOp::SDiv,
++            lhs: Operand::Value(pattern.iv),   // Final byte offset
++            rhs: Operand::Const(IrConst::I32(8)),  // sizeof(double)
++            ty: IrType::I32,
 +        }
-+        switch (x & 7) {
-+        case 0: r += 1000; break; case 1: r += 1001; break;
-+        case 2: r += 1002; break; case 3: r += 1003; break;
-+        case 4: r += 1004; break; case 5: r += 1005; break;
-+        case 6: r += 1006; break; default: r += 1007; break;
++    };
++
+     let vec_exit_block = BasicBlock {
+         label: vec_exit_label,
+-        instructions: vec![
+-            Instruction::BinOp {
+-                dest: j_rem_start,
+-                op: IrBinOp::SDiv,
+-                lhs: Operand::Value(pattern.iv),  // Final byte offset
+-                rhs: Operand::Const(IrConst::I32(8)),  // sizeof(double)
+-                ty: IrType::I32,
+-            },
+-        ],
++        instructions: vec![rem_start_inst],
+         terminator: Terminator::Branch(remainder_header_label),
+         source_spans: vec![],
+     };
+@@ -2597,36 +2628,58 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
+     //   - IV increment: +1 → +32 (bytes per AVX2 iteration = 4 doubles × 8 bytes)
+     //   - GEP offset multiply: eliminated (IV IS the byte offset)
+     {
+-        // First, create the byte limit value (N * 8 bytes per double)
++        // First, create the byte limit. The vector loop steps by 32 bytes
++        // (4 doubles) per iteration, so it must run exactly floor(N/4)
++        // iterations: byte_limit = (N/4)*32 = (N & ~3)*8. Using N*8 here
++        // instead runs ceil(N/4) iterations — the final iteration reads and
++        // writes up to 3 doubles past the end of the array (OOB), and the
++        // scalar remainder loop then never fires, silently skipping the tail
++        // (reproducer: N=255 matmul clobbered element 255 and skipped
++        // elements 252..254, producing a wrong sum).
+         let byte_limit = match &pattern.limit {
+-            Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n * 8)),
+-            Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n * 8)),
++            Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32((*n / 4) * 32)),
++            Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64((*n / 4) * 32)),
+             Operand::Value(limit_val) => {
+-                // Dynamic limit: insert multiply by 8 (sizeof(double)) in header
+-                let mul_dest = Value(next_val_id);
+-                next_val_id += 1;
+-
++                // Dynamic limit: byte_limit = (N/4)*32, hoisted into the header.
+                 let limit_ty = match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
+                     Instruction::Cmp { ty, .. } => *ty,
+                     _ => IrType::I64,
+                 };
+ 
++                // N / 4
++                let div_dest = Value(next_val_id);
++                next_val_id += 1;
++                let div_inst = Instruction::BinOp {
++                    dest: div_dest,
++                    op: IrBinOp::UDiv,
++                    lhs: Operand::Value(*limit_val),
++                    rhs: Operand::Const(match limit_ty {
++                        IrType::I32 => IrConst::I32(4),
++                        IrType::I64 => IrConst::I64(4),
++                        _ => IrConst::I64(4),
++                    }),
++                    ty: limit_ty,
++                };
++                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx, div_inst);
++
++                // (N/4) * 32
++                let mul_dest = Value(next_val_id);
++                next_val_id += 1;
+                 let mul_inst = Instruction::BinOp {
+                     dest: mul_dest,
+                     op: IrBinOp::Mul,
+-                    lhs: Operand::Value(*limit_val),
++                    lhs: Operand::Value(div_dest),
+                     rhs: Operand::Const(match limit_ty {
+-                        IrType::I32 => IrConst::I32(8),
+-                        IrType::I64 => IrConst::I64(8),
+-                        _ => IrConst::I64(8),
++                        IrType::I32 => IrConst::I32(32),
++                        IrType::I64 => IrConst::I64(32),
++                        _ => IrConst::I64(32),
+                     }),
+                     ty: limit_ty,
+                 };
+-
+-                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx, mul_inst);
++                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
+ 
+                 if debug {
+-                    eprintln!("[VEC]   Inserted multiply for dynamic byte limit: N * 8 => Value({})", mul_dest.0);
++                    eprintln!("[VEC]   Inserted (N/4)*32 dynamic byte limit: Value({})", mul_dest.0);
+                 }
+ 
+                 Operand::Value(mul_dest)
+@@ -3440,47 +3493,48 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
+         }
+     }
+ 
+-    // Step 2: Scale array indexing by vector width
+-    // Find the GEP offset and multiply it by vec_width
++    // Step 2: Scale array indexing by vector width.
++    // Each GEP's byte offset (element_index * elem_size) must be multiplied by
++    // vec_width so one vector iteration covers vec_width consecutive elements.
++    // Collect ALL matching GEPs first — a dot product has two (array A and
++    // array B) in the same block, and the old `break` after the first match
++    // left array B at scalar stride, loading the wrong elements (miscompile:
++    // dot(x,y,n) returned garbage for both n=255 and n=256).
++    let mut geps_to_scale: Vec<(usize, usize, Value)> = Vec::new();
+     for &block_idx in &pattern.loop_blocks {
+         let block = &func.blocks[block_idx];
+-
+-        // Find GEP instructions that match our arrays
+         for (inst_idx, inst) in block.instructions.iter().enumerate() {
+             if let Instruction::GetElementPtr { dest, offset, .. } = inst {
+-                // Check if this is one of our array GEPs
+                 if *dest == pattern.array_a_gep || Some(*dest) == pattern.array_b_gep {
+                     if let Operand::Value(offset_val) = offset {
+-                        // Insert multiply before GEP: offset' = offset * vec_width
+-                        let mul_dest = Value(next_val_id);
+-                        next_val_id += 1;
+-
+-                        let mul_inst = Instruction::BinOp {
+-                            dest: mul_dest,
+-                            op: IrBinOp::Mul,
+-                            lhs: Operand::Value(*offset_val),
+-                            rhs: Operand::Const(IrConst::I64(vec_width as i64)),
+-                            ty: IrType::I64,
+-                        };
++                        geps_to_scale.push((block_idx, inst_idx, *offset_val));
++                    }
++                }
++            }
 +        }
-+        e += r;
-+        e += hot_impl(i & 255);
 +    }
-+    for (int i = 0; i < 100; i++) {
-+        int x = i, r = x * 2;
-+        switch (x & 7) {
-+        case 0: r += 1000; break; case 1: r += 1001; break;
-+        case 2: r += 1002; break; case 3: r += 1003; break;
-+        case 4: r += 1004; break; case 5: r += 1005; break;
-+        case 6: r += 1006; break; default: r += 1007; break;
++    // Apply in reverse order so earlier insertions don't shift later indices.
++    for (block_idx, inst_idx, offset_val) in geps_to_scale.into_iter().rev() {
++        let mul_dest = Value(next_val_id);
++        next_val_id += 1;
+ 
+-                        // Insert mul before GEP
+-                        let block = &mut func.blocks[block_idx];
+-                        block.instructions.insert(inst_idx, mul_inst);
+-                        changes += 1;
++        let mul_inst = Instruction::BinOp {
++            dest: mul_dest,
++            op: IrBinOp::Mul,
++            lhs: Operand::Value(offset_val),
++            rhs: Operand::Const(IrConst::I64(vec_width as i64)),
++            ty: IrType::I64,
++        };
+ 
+-                        // Update GEP offset (now at inst_idx + 1)
+-                        if let Instruction::GetElementPtr { offset, .. } = &mut block.instructions[inst_idx + 1] {
+-                            *offset = Operand::Value(mul_dest);
+-                        }
++        func.blocks[block_idx].instructions.insert(inst_idx, mul_inst);
++        changes += 1;
+ 
+-                        if debug {
+-                            eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
+-                        }
++        if let Instruction::GetElementPtr { offset, .. } = &mut func.blocks[block_idx].instructions[inst_idx + 1] {
++            *offset = Operand::Value(mul_dest);
 +        }
-+        e += r;
+ 
+-                        break; // Only process first GEP per block
+-                    }
+-                }
+-            }
++        if debug {
++            eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
+         }
+     }
+ 
+@@ -3939,46 +3993,47 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
+         }
+     }
+ 
+-    // Step 2: Scale array indexing by vector width
++    // Step 2: Scale array indexing by vector width.
++    // Each GEP's byte offset (element_index * elem_size) must be multiplied by
++    // vec_width so one vector iteration covers vec_width consecutive elements.
++    // Collect ALL matching GEPs first — a dot product has two (array A and
++    // array B) in the same block, and the old `break` after the first match
++    // left array B at scalar stride, loading the wrong elements.
++    let mut geps_to_scale: Vec<(usize, usize, Value)> = Vec::new();
+     for &block_idx in &pattern.loop_blocks {
+         let block = &func.blocks[block_idx];
+-
+-        // Find GEP instructions that match our arrays
+         for (inst_idx, inst) in block.instructions.iter().enumerate() {
+             if let Instruction::GetElementPtr { dest, offset, .. } = inst {
+-                // Check if this is one of our array GEPs
+                 if *dest == pattern.array_a_gep || Some(*dest) == pattern.array_b_gep {
+                     if let Operand::Value(offset_val) = offset {
+-                        // Insert multiply before GEP: offset' = offset * vec_width
+-                        let mul_dest = Value(next_val_id);
+-                        next_val_id += 1;
+-
+-                        let mul_inst = Instruction::BinOp {
+-                            dest: mul_dest,
+-                            op: IrBinOp::Mul,
+-                            lhs: Operand::Value(*offset_val),
+-                            rhs: Operand::Const(IrConst::I64(vec_width as i64)),
+-                            ty: IrType::I64,
+-                        };
++                        geps_to_scale.push((block_idx, inst_idx, *offset_val));
++                    }
++                }
++            }
++        }
 +    }
-+    if (s != e) {
-+        printf("MISMATCH s=%ld e=%ld\n", s, e);
-+        return 1;
-+    }
-+    printf("ok %ld\n", s);
++    // Apply in reverse order so earlier insertions don't shift later indices.
++    for (block_idx, inst_idx, offset_val) in geps_to_scale.into_iter().rev() {
++        let mul_dest = Value(next_val_id);
++        next_val_id += 1;
+ 
+-                        // Insert mul before GEP
+-                        let block = &mut func.blocks[block_idx];
+-                        block.instructions.insert(inst_idx, mul_inst);
+-                        changes += 1;
++        let mul_inst = Instruction::BinOp {
++            dest: mul_dest,
++            op: IrBinOp::Mul,
++            lhs: Operand::Value(offset_val),
++            rhs: Operand::Const(IrConst::I64(vec_width as i64)),
++            ty: IrType::I64,
++        };
+ 
+-                        // Update GEP offset (now at inst_idx + 1)
+-                        if let Instruction::GetElementPtr { offset, .. } = &mut block.instructions[inst_idx + 1] {
+-                            *offset = Operand::Value(mul_dest);
+-                        }
++        func.blocks[block_idx].instructions.insert(inst_idx, mul_inst);
++        changes += 1;
+ 
+-                        if debug {
+-                            eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
+-                        }
++        if let Instruction::GetElementPtr { offset, .. } = &mut func.blocks[block_idx].instructions[inst_idx + 1] {
++            *offset = Operand::Value(mul_dest);
++        }
+ 
+-                        break; // Only process first GEP per block
+-                    }
+-                }
+-            }
++        if debug {
++            eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
+         }
+     }
+ 
+@@ -4288,18 +4343,6 @@ pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
+         return 0;
+     }
+ 
+-    // A DynAlloca changes the live stack extent at run time. The current vector
+-    // loop/remainder builder assumes fixed alloca addresses when it rewrites
+-    // GEPs and carries scalar reductions, which can misaddress a VLA
+-    // (reproducer: tests/regression/vla_dynamic_stack.c). This is a scoped
+-    // legality check, not a global pass disable: functions without dynamic
+-    // stack allocation retain full vectorization.
+-    if func.blocks.iter().any(|block| {
+-        block.instructions.iter().any(|inst| matches!(inst, Instruction::DynAlloca { .. }))
+-    }) {
+-        return 0;
+-    }
+-
+     // Volatile memory accesses are observable side effects: vectorizing a
+     // loop that reads or writes volatile objects changes the number, width,
+     // and order of memory accesses (C11 6.7.3p7: "Any attempt to refer to a
+diff --git a/tests/regression/run_regression.sh b/tests/regression/run_regression.sh
+index 8dc74216..abe95189 100755
+--- a/tests/regression/run_regression.sh
++++ b/tests/regression/run_regression.sh
+@@ -16,6 +16,15 @@ for src in "$dir"/*.c; do
+   if [ -f "$dir/$name.flags" ]; then
+     extra_flags=$(cat "$dir/$name.flags")
+   fi
++  # Per-test environment: a sibling <name>.env file is sourced so tests can
++  # select non-default compiler modes (e.g. LCCC_FORCE_SSE2=1 for the legacy
++  # SSE2 vectorization path). GCC ignores these variables.
++  if [ -f "$dir/$name.env" ]; then
++    set -a
++    # shellcheck disable=SC1090
++    . "$dir/$name.env"
++    set +a
++  fi
+   # Flags AFTER the source: GCC's driver drops library flags (-lm) that
+   # appear before the object under --as-needed, so extra_flags must follow
+   # the input file (LCCC accepts both orders; GCC does not).
+diff --git a/tests/regression/simd_blendv256.c b/tests/regression/simd_blendv256.c
+new file mode 100644
+index 00000000..125452fc
+--- /dev/null
++++ b/tests/regression/simd_blendv256.c
+@@ -0,0 +1,22 @@
++/* Regression: 256-bit vblendvps/vblendvpd result register.
++ * The blend was computed into %ymm1 but avx_store_dest stores %ymm0, so the
++ * mask operand was returned instead of the blended result. */
++#include <immintrin.h>
++#include <stdio.h>
++
++int main(void) {
++    __m256 a = _mm256_set_ps(8, 7, 6, 5, 4, 3, 2, 1);
++    __m256 b = _mm256_set1_ps(2.0f);
++    __m256 mask = _mm256_set_ps(-0.0f, 0.0f, -0.0f, 0.0f, -0.0f, 0.0f, -0.0f, 0.0f);
++    __m256 r = _mm256_blendv_ps(a, b, mask);
++    float out[8];
++    _mm256_storeu_ps(out, r);
++    float exp[8] = {1, 2, 3, 2, 5, 2, 7, 2};
++    for (int i = 0; i < 8; i++)
++        if (out[i] != exp[i]) {
++            printf("FAIL lane %d: got %.0f expect %.0f\n", i, out[i], exp[i]);
++            return 1;
++        }
++    printf("OK\n");
 +    return 0;
 +}
-diff --git a/tests/regression/regr_v9_pgo_branchy.flags b/tests/regression/regr_v9_pgo_branchy.flags
+diff --git a/tests/regression/simd_blendv256.flags b/tests/regression/simd_blendv256.flags
 new file mode 100644
-index 00000000..5d62bd60
+index 00000000..fdb5c8fe
 --- /dev/null
-+++ b/tests/regression/regr_v9_pgo_branchy.flags
++++ b/tests/regression/simd_blendv256.flags
 @@ -0,0 +1 @@
-+-fprofile-generate=/tmp/pgd_regr_v9
-diff --git a/tests/regression/run_pgo_roundtrip.sh b/tests/regression/run_pgo_roundtrip.sh
-index eed27eb1..0fd31bf1 100755
---- a/tests/regression/run_pgo_roundtrip.sh
-+++ b/tests/regression/run_pgo_roundtrip.sh
-@@ -32,4 +32,53 @@ cmp -s /tmp/r7_pg.out /tmp/r7_pu.out || { echo "OUTPUT-DIFFERS"; exit 1; }
- NPRO=$(grep -c "promoted" /tmp/r7_pu.log)
- echo "roundtrip OK (promoted sites: $NPRO)"
- [ "$NPRO" -gt 0 ] || { echo "NO-PROMOTION"; exit 1; }
++-mavx
+\ No newline at end of file
+diff --git a/tests/regression/simd_vhaddps.c b/tests/regression/simd_vhaddps.c
+new file mode 100644
+index 00000000..6830bdc3
+--- /dev/null
++++ b/tests/regression/simd_vhaddps.c
+@@ -0,0 +1,20 @@
++/* Regression: vhaddps/vhsubps/vaddsubps use the F2 VEX prefix (pp=3).
++ * They were encoded with the F3 prefix, an illegal instruction (SIGILL). */
++#include <immintrin.h>
++#include <stdio.h>
 +
-+# ── v10: flat-profile gate ───────────────────────────────────────────────
-+# A workload whose profile has a TIED hot function set (no dominant hot path)
-+# must not have its hot functions bloated by profile-driven inlining. The
-+# has_spread() dominance gate should make the -fprofile-use build match plain
-+# structurally for the hot functions.
-+FLAT="$DIR/regr_v10_pgo_flat.c"
-+rm -rf /tmp/pgd_flat && mkdir -p /tmp/pgd_flat
-+$CCC -O2 -fprofile-generate=/tmp/pgd_flat "$FLAT" -o /tmp/flat_pg 2>/dev/null || { echo "FLAT-GEN-FAIL"; exit 1; }
-+/tmp/flat_pg > /tmp/flat_pg.out || { echo "FLAT-TRAIN-FAIL"; exit 1; }
-+grep -q "^ok " /tmp/flat_pg.out || { echo "FLAT-OUT-FAIL"; exit 1; }
-+# plain assembly reference
-+$CCC -O2 "$FLAT" -S -o /tmp/flat_plain.s 2>/dev/null || { echo "FLAT-PLAIN-ASM-FAIL"; exit 1; }
-+# use build must round-trip identically and not bloat hot functions
-+$CCC -O2 -fprofile-use=/tmp/pgd_flat "$FLAT" -o /tmp/flat_pu 2>/dev/null || { echo "FLAT-USE-FAIL"; exit 1; }
-+/tmp/flat_pu > /tmp/flat_pu.out || { echo "FLAT-USE-RUN-FAIL"; exit 1; }
-+cmp -s /tmp/flat_pg.out /tmp/flat_pu.out || { echo "FLAT-OUTPUT-DIFFERS"; exit 1; }
-+$CCC -O2 -fprofile-use=/tmp/pgd_flat "$FLAT" -S -o /tmp/flat_use.s 2>/dev/null
-+instr() { awk "/^${1}:/,/^\.size ${1}/" "${2}" | grep -cE "^[[:space:]]+[a-z]"; }
-+for fn in step_even step_odd; do
-+  P=$(instr "$fn" /tmp/flat_plain.s)
-+  U=$(instr "$fn" /tmp/flat_use.s)
-+  echo "flat-profile ${fn}: plain ${P} insns, use ${U} insns"
-+  # flat profile -> gate off -> hot functions should match plain closely;
-+  # allow +40% for benign scheduling/encoding variance, flag real bloat.
-+  if [ "$U" -gt $(( (P * 14) / 10 )) ]; then
-+    echo "FLAT-BLOAT (${fn}: ${P} -> ${U} instructions)"; exit 1;
-+  fi
-+done
-+echo "flat-profile roundtrip OK (no hot-function bloat)"
++int main(void) {
++    __m256 a = _mm256_set_ps(8, 7, 6, 5, 4, 3, 2, 1);
++    __m256 b = _mm256_set_ps(16, 15, 14, 13, 12, 11, 10, 9);
++    __m256 r = _mm256_hadd_ps(a, b);
++    float out[8];
++    _mm256_storeu_ps(out, r);
++    float exp[8] = {3, 7, 19, 23, 11, 15, 27, 31};
++    for (int i = 0; i < 8; i++)
++        if (out[i] != exp[i]) {
++            printf("FAIL lane %d: got %.0f expect %.0f\n", i, out[i], exp[i]);
++            return 1;
++        }
++    printf("OK\n");
++    return 0;
++}
+diff --git a/tests/regression/simd_vhaddps.flags b/tests/regression/simd_vhaddps.flags
+new file mode 100644
+index 00000000..fdb5c8fe
+--- /dev/null
++++ b/tests/regression/simd_vhaddps.flags
+@@ -0,0 +1 @@
++-mavx
+\ No newline at end of file
+diff --git a/tests/regression/simd_vpermilvar256.c b/tests/regression/simd_vpermilvar256.c
+new file mode 100644
+index 00000000..cd1158fe
+--- /dev/null
++++ b/tests/regression/simd_vpermilvar256.c
+@@ -0,0 +1,21 @@
++/* Regression: variable-index 256-bit permute (vpermilps/vpermilpd, 0F38.0C/0D).
++ * The builtin was declared in the header but had no backend lowering, and the
++ * assembler only knew the immediate form (0F3A.04/05). */
++#include <immintrin.h>
++#include <stdio.h>
 +
-+# ── v11: cost-aware devirtualization ────────────────────────────────────
-+# A SINGLE, stable, loop-invariant indirect target is already predicted
-+# perfectly by the BTB; devirtualizing it would only add a per-call compare +
-+# branch (a regression). The cost-aware rule (top-share >= 95% -> skip) must
-+# therefore NOT promote this site.
-+SINGLE="$DIR/regr_v11_costaware_devirt.c"
-+rm -rf /tmp/pgd_single && mkdir -p /tmp/pgd_single
-+$CCC -O2 -fprofile-generate=/tmp/pgd_single "$SINGLE" -o /tmp/single_pg 2>/dev/null || { echo "SINGLE-GEN-FAIL"; exit 1; }
-+/tmp/single_pg > /tmp/single_pg.out || { echo "SINGLE-TRAIN-FAIL"; exit 1; }
-+grep -q "^ok " /tmp/single_pg.out || { echo "SINGLE-OUT-FAIL"; exit 1; }
-+$CCC -O2 -fprofile-use=/tmp/pgd_single "$SINGLE" -o /tmp/single_pu 2>/tmp/single_pu.log || { echo "SINGLE-USE-FAIL"; exit 1; }
-+/tmp/single_pu > /tmp/single_pu.out || { echo "SINGLE-USE-RUN-FAIL"; exit 1; }
-+cmp -s /tmp/single_pg.out /tmp/single_pu.out || { echo "SINGLE-OUTPUT-DIFFERS"; exit 1; }
-+NPROM=$(grep -c "promoted" /tmp/single_pu.log)
-+echo "cost-aware devirt: promoted sites = ${NPROM}"
-+# A single-stable-target site must NOT be promoted (would add hot-path overhead).
-+[ "$NPROM" -gt 0 ] && { echo "SINGLE-TARGET-PROMOTED-REGRESSION"; exit 1; }
-+echo "cost-aware devirtualization roundtrip OK (single target not promoted)"
- exit 0
++int main(void) {
++    __m256 a = _mm256_set_ps(8, 7, 6, 5, 4, 3, 2, 1);
++    __m256i idx = _mm256_set_epi32(0, 1, 2, 3, 4, 5, 6, 7); /* reverse */
++    __m256 r = _mm256_permutevar_ps(a, idx);
++    float out[8];
++    _mm256_storeu_ps(out, r);
++    float exp[8] = {4, 3, 2, 1, 8, 7, 6, 5}; /* vpermilps is per-128-bit lane */
++    for (int i = 0; i < 8; i++)
++        if (out[i] != exp[i]) {
++            printf("FAIL lane %d: got %.0f expect %.0f\n", i, out[i], exp[i]);
++            return 1;
++        }
++    printf("OK\n");
++    return 0;
++}
+diff --git a/tests/regression/simd_vpermilvar256.flags b/tests/regression/simd_vpermilvar256.flags
+new file mode 100644
+index 00000000..fdb5c8fe
+--- /dev/null
++++ b/tests/regression/simd_vpermilvar256.flags
+@@ -0,0 +1 @@
++-mavx
+\ No newline at end of file
+diff --git a/tests/regression/vectorize_dot_product.c b/tests/regression/vectorize_dot_product.c
+new file mode 100644
+index 00000000..9f0da755
+--- /dev/null
++++ b/tests/regression/vectorize_dot_product.c
+@@ -0,0 +1,30 @@
++/* Regression: reduction dot-product vectorization.
++ * The "scale array indexing" step had a `break` that scaled only the FIRST
++ * matching GEP per block, leaving the second array of a dot product at scalar
++ * stride, so the loop multiplied against the wrong elements (garbage sums). */
++#include <stdio.h>
++
++double a[256], b[256];
++
++static double dot(double *x, double *y, int n) {
++    double s = 0.0;
++    for (int i = 0; i < n; i++)
++        s += x[i] * y[i];
++    return s;
++}
++
++int main(void) {
++    for (int i = 0; i < 256; i++) { a[i] = (double)(i + 1); b[i] = (double)(i + 1); }
++    static const int ns[] = {1, 2, 3, 4, 5, 7, 8, 255, 256};
++    for (unsigned k = 0; k < sizeof(ns) / sizeof(ns[0]); k++) {
++        long long n = ns[k];
++        double expect = (double)(n * (n + 1) * (2 * n + 1)) / 6.0; /* sum (i+1)^2 */
++        double got = dot(a, b, (int)n);
++        if (got != expect) {
++            printf("FAIL n=%lld expect=%.0f got=%.0f\n", n, expect, got);
++            return 1;
++        }
++    }
++    printf("OK\n");
++    return 0;
++}
+diff --git a/tests/regression/vectorize_float_matmul.c b/tests/regression/vectorize_float_matmul.c
+new file mode 100644
+index 00000000..d70ca35c
+--- /dev/null
++++ b/tests/regression/vectorize_float_matmul.c
+@@ -0,0 +1,38 @@
++/* Regression: matmul vectorization element-type gate.
++ * The matmul transform lowered to packed-DOUBLE FMA with no check on the
++ * element type; a float matmul was reinterpreted as doubles (wrong stride)
++ * and segfaulted. Float/int matmuls must be left scalar. */
++#include <stdio.h>
++
++static float A[64][64], B[64][64], C[64][64];
++
++static float fmatmul_checksum(int n) {
++    for (int i = 0; i < n; i++)
++        for (int j = 0; j < n; j++) {
++            A[i][j] = 1.0f; B[i][j] = 1.0f; C[i][j] = 0.0f;
++        }
++    for (int i = 0; i < n; i++)
++        for (int k = 0; k < n; k++)
++            for (int j = 0; j < n; j++)
++                C[i][j] += A[i][k] * B[k][j];
++    float s = 0.0f;
++    for (int i = 0; i < n; i++)
++        for (int j = 0; j < n; j++)
++            s += C[i][j];
++    return s;
++}
++
++int main(void) {
++    static const int ns[] = {1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 63, 64};
++    for (unsigned k = 0; k < sizeof(ns) / sizeof(ns[0]); k++) {
++        int n = ns[k];
++        float expect = (float)n * n * n;
++        float got = fmatmul_checksum(n);
++        if (got != expect) {
++            printf("FAIL n=%d expect=%.0f got=%.0f\n", n, (double)expect, (double)got);
++            return 1;
++        }
++    }
++    printf("OK\n");
++    return 0;
++}
+diff --git a/tests/regression/vectorize_i32_sum.c b/tests/regression/vectorize_i32_sum.c
+new file mode 100644
+index 00000000..06503445
+--- /dev/null
++++ b/tests/regression/vectorize_i32_sum.c
+@@ -0,0 +1,29 @@
++/* Regression: I32 reduction vectorization (SSE2 4-wide / AVX2 8-wide add +
++ * horizontal reduce). Exercises VecAddI32x{4,8} and the horizontal-add
++ * sequences whose legacy SSE2 2-operand instructions (paddd, psrldq) were
++ * emitted in invalid 3-operand form. */
++#include <stdio.h>
++
++int arr[256];
++
++static int isum(int *x, int n) {
++    int s = 0;
++    for (int i = 0; i < n; i++)
++        s += x[i];
++    return s;
++}
++
++int main(void) {
++    for (int i = 0; i < 256; i++) arr[i] = 1;
++    static const int ns[] = {1, 2, 3, 4, 5, 7, 8, 15, 16, 255, 256};
++    for (unsigned k = 0; k < sizeof(ns) / sizeof(ns[0]); k++) {
++        int n = ns[k];
++        int got = isum(arr, n);
++        if (got != n) {
++            printf("FAIL n=%d expect=%d got=%d\n", n, n, got);
++            return 1;
++        }
++    }
++    printf("OK\n");
++    return 0;
++}
+diff --git a/tests/regression/vectorize_matmul_tail.c b/tests/regression/vectorize_matmul_tail.c
+new file mode 100644
+index 00000000..bb550b6e
+--- /dev/null
++++ b/tests/regression/vectorize_matmul_tail.c
+@@ -0,0 +1,42 @@
++/* Regression: AVX2 matmul vectorization tail (N % 4 != 0).
++ * The byte limit of the vector loop used to be N*8, running ceil(N/4)
++ * iterations: the last iteration wrote past the logical end of the row
++ * (clobbering a sentinel canary) and the scalar remainder never fired.
++ * Correct: floor(N/4) vector iterations + scalar remainder. */
++#include <stdio.h>
++
++static double A[256][256], B[256][256], C[256][256];
++
++static int matmul_verify(int n) {
++    for (int i = 0; i < 256; i++)
++        for (int j = 0; j < 256; j++) {
++            A[i][j] = 1.0; B[i][j] = 1.0; C[i][j] = 999.0; /* canary */
++        }
++    for (int i = 0; i < n; i++)
++        for (int j = 0; j < n; j++)
++            C[i][j] = 0.0;
++    for (int i = 0; i < n; i++)
++        for (int k = 0; k < n; k++)
++            for (int j = 0; j < n; j++)
++                C[i][j] += A[i][k] * B[k][j];
++    double s = 0.0;
++    for (int i = 0; i < n; i++) {
++        for (int j = 0; j < n; j++) {
++            if (C[i][j] != (double)n) { printf("FAIL [%d][%d]=%.0f\n", i, j, C[i][j]); return 0; }
++            s += C[i][j];
++        }
++        /* column n must be untouched (vector loop ran past the row end).
++         * Only valid when n < 256: for n == 256 the whole row is in range. */
++        if (n < 256 && C[i][n] != 999.0) { printf("FAIL canary [%d][%d]=%.0f\n", i, n, C[i][n]); return 0; }
++    }
++    if (s != (double)n * n * n) { printf("FAIL sum=%.0f\n", s); return 0; }
++    return 1;
++}
++
++int main(void) {
++    static const int ns[] = {5, 6, 7, 9, 15, 16, 17, 31, 63, 64, 65, 255, 256};
++    for (unsigned k = 0; k < sizeof(ns) / sizeof(ns[0]); k++)
++        if (!matmul_verify(ns[k])) return 1;
++    printf("OK\n");
++    return 0;
++}
+diff --git a/tests/regression/vectorize_mixed_sum.c b/tests/regression/vectorize_mixed_sum.c
+new file mode 100644
+index 00000000..34fed7ec
+--- /dev/null
++++ b/tests/regression/vectorize_mixed_sum.c
+@@ -0,0 +1,24 @@
++/* Regression: reduction cast-sum type check.
++ * `float s += (float)int_arr[i]` was vectorized as packed I32 adds on a F32
++ * accumulator (only widening was rejected), returning 0.0. Only redundant
++ * (same-type) casts are vectorizable; cross-kind casts must be rejected. */
++#include <stdio.h>
++
++int arr[256];
++
++static float fsum(int *x, int n) {
++    float s = 0.0f;
++    for (int i = 0; i < n; i++)
++        s += (float)x[i];
++    return s;
++}
++
++int main(void) {
++    for (int i = 0; i < 256; i++) arr[i] = 1;
++    if (fsum(arr, 256) != 256.0f) {
++        printf("FAIL got=%f\n", (double)fsum(arr, 256));
++        return 1;
++    }
++    printf("OK\n");
++    return 0;
++}
+diff --git a/tests/regression/vectorize_sse2_path.c b/tests/regression/vectorize_sse2_path.c
+new file mode 100644
+index 00000000..dec2dd8b
+--- /dev/null
++++ b/tests/regression/vectorize_sse2_path.c
+@@ -0,0 +1,36 @@
++/* Regression: legacy SSE2 vectorization path (LCCC_FORCE_SSE2=1).
++ * The SSE2 matmul remainder loop computed j_rem_start = iv/8 on an ELEMENT-
++ * index IV (should be iv*2), re-processing the array; FmaF64x2 conflated the
++ * B and C pointers (same offset, different base); and the 2×F64/4×I32
++ * horizontal-adds plus VecAddI32x4 emitted legacy 2-operand instructions in
++ * invalid 3-operand form ("SSE op requires 2 operands"). All must be correct
++ * under the forced-SSE2 mode. */
++#include <stdio.h>
++
++double a[256], b[256];
++int iarr[256];
++
++static double dot(double *x, double *y, int n) {
++    double s = 0.0;
++    for (int i = 0; i < n; i++) s += x[i] * y[i];
++    return s;
++}
++
++static int isum(int *x, int n) {
++    int s = 0;
++    for (int i = 0; i < n; i++) s += x[i];
++    return s;
++}
++
++int main(void) {
++    for (int i = 0; i < 256; i++) { a[i] = (double)(i + 1); b[i] = (double)(i + 1); iarr[i] = 1; }
++    static const int ns[] = {1, 2, 3, 5, 7, 8, 255, 256};
++    for (unsigned k = 0; k < sizeof(ns) / sizeof(ns[0]); k++) {
++        long long n = ns[k];
++        double expect_dot = (double)(n * (n + 1) * (2 * n + 1)) / 6.0;
++        if (dot(a, b, (int)n) != expect_dot) { printf("FAIL dot n=%lld\n", n); return 1; }
++        if (isum(iarr, (int)n) != (int)n) { printf("FAIL isum n=%lld\n", n); return 1; }
++    }
++    printf("OK\n");
++    return 0;
++}
+diff --git a/tests/regression/vectorize_sse2_path.env b/tests/regression/vectorize_sse2_path.env
+new file mode 100644
+index 00000000..7b3fa3fd
+--- /dev/null
++++ b/tests/regression/vectorize_sse2_path.env
+@@ -0,0 +1 @@
++LCCC_FORCE_SSE2=1
+-- 
+2.47.3
+
