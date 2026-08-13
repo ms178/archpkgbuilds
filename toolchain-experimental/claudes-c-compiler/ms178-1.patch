@@ -1,1541 +1,637 @@
-From d67c6e576b4e8fd3013fb62fd8f418f7eecf6075 Mon Sep 17 00:00:00 2001
-From: lccc-v8 <v8@localhost>
-Date: Thu, 13 Aug 2026 21:00:02 +0000
-Subject: [PATCH 1/7] v8: linear-scan FP producer->consumer register hints
- (die-at-birth coalescing)
+From a328f763932900581051594ca8ee06abeb3d5a78 Mon Sep 17 00:00:00 2001
+From: lccc-v9 <v9@localhost>
+Date: Thu, 13 Aug 2026 22:22:18 +0000
+Subject: [PATCH 1/4] v9: extend producer-follow hints to Copy, GPR unary, and
+ FP Sqrt/Fabs
 
-Resurrect the in-allocator coalescing hint approach that was previously
-tried and reverted, with the liveness interaction fixed properly.
+The linear-scan follow hints previously covered only FP BinOp LHS. Extend
+them to every instruction whose emitter computes the result INTO the
+destination register with the operand pre-loaded, so die-at-birth sharing
+removes a copy instead of corrupting a value:
 
-Root cause of the old miscompile: the reverted design changed register
-OCCUPANCY to half-open (occupy_until(end)) while the overlap predicate
-stayed inclusive-end, so an unrelated interval could grab a still-live
-producer's register one program point early (energy() -> 0.0/inf).
+- Copy: emit_copy_value emits nothing when dest and source share a register,
+  so every Copy is a free coalescing edge (GPR and FP alike).
+- GPR unary Neg/Not/Bswap: emit_unaryop_impl moves the source into the dest
+  register and applies the op in place (neg %reg).
+- Scalar FP Sqrt/Fabs: emit_fp_scalar_unary / the Fabs path load the argument
+  into the dest register and apply sqrtsd/sqrtss/andpd/andps in place.
 
-The principled fix changes the CONFLICT predicate instead of the
-occupancy:
-- LiveRange::conflicts_with encodes use-before-def at shared points: two
-  ranges that touch only at a boundary (producer.end == consumer.start)
-  may share a register iff the producer is genuinely USED at that point
-  (uses.last() == end). Extended interval ends (live-through-block,
-  phi-incoming, GEP-base, F128-pointer) are not recorded uses, so those
-  stay conservative.
-- find_free_register resolves a producer-follow hint (FP BinOp LHS edge)
-  at allocation time; the producer is always allocated first.
-- The adjacency rule is scoped to the hint path only. The general GPR
-  path keeps the strict free-at-start check: GPR BinOps round-trip
-  through the accumulator and do not tolerate die-at-birth sharing
-  (measured miscompile: sqlite_get_varint emitted 'or %r9,%r9' and
-  silently dropped a term).
-- Fixes the pre-existing hint bug where the hint check compared against
-  ALL active intervals instead of only those in the hint register.
-
-Also fixes the use-collection divergence this work exposed: record_operand_uses
-hand-rolled a match that missed Intrinsic args, InlineAsm inputs, atomic
-pointer operands and SetReturnF*Second sources; it now uses the canonical
-operand/value traversal, making uses (priority, spill weight, next-use
-eviction, and the die-at-birth guard) complete.
-
-Validation: regression 127 passed / 0 failed (--compare-gcc), correctness
-50/50, intrinsics 3/3, benchmark corpus 25/25 correct with geomean 0.953
-vs gcc (v7: 0.951), sqlite_varint + zlib_ng_adler32 bit-exact vs gcc.
+The allocator's conflicts_with() still gates every share on die-at-birth
+compatibility, so a long-lived or multi-use producer simply leaves the hint
+unhonoured. Measured neutral on the corpus (copy_prop already forwards most
+GPR copies; the remaining mov chains come from casts, not Copies), but the
+mechanism is now general as designed.
 ---
- src/backend/live_range.rs | 429 ++++++++++++++++++++++----------------
- 1 file changed, 255 insertions(+), 174 deletions(-)
+ src/backend/live_range.rs | 90 +++++++++++++++++++++++++++------------
+ 1 file changed, 63 insertions(+), 27 deletions(-)
 
 diff --git a/src/backend/live_range.rs b/src/backend/live_range.rs
-index b80d54ff..c5bac936 100644
+index c5bac936..e095e940 100644
 --- a/src/backend/live_range.rs
 +++ b/src/backend/live_range.rs
-@@ -15,7 +15,8 @@ use super::liveness::{
- };
+@@ -16,7 +16,8 @@ use super::liveness::{
  use super::regalloc::PhysReg;
  use crate::common::fx_hash::FxHashMap;
--use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator, Value};
-+use crate::common::types::IrType;
-+use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator};
+ use crate::common::types::IrType;
+-use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator};
++use crate::ir::intrinsics::IntrinsicOp;
++use crate::ir::reexports::{Instruction, IrFunction, IrUnaryOp, Operand, Terminator};
  
  /// Enhanced live interval with priority, uses, and spill weight.
  ///
-@@ -34,6 +35,13 @@ pub struct LiveRange {
-     pub loop_depth: u32,           // Loop nesting depth (0 = no loop, 1 = in loop, etc.)
-     pub priority: u64,             // uses.len() * 10^loop_depth (higher priority = allocate first)
-     pub reg_hint: Option<PhysReg>, // Preferred register (from Copy sources)
-+    /// Dynamic coalescing hint: prefer the register this producer value was
-+    /// assigned. Set by `build_live_ranges` from FP BinOp LHS edges and
-+    /// resolved at allocation time in `find_free_register` (the producer is
-+    /// always allocated first because it is defined earlier). The allocator's
-+    /// `conflicts_with` keeps the share sound: it is honoured only when the
-+    /// producer's final use *is* this consumer's definition.
-+    pub follow_value: Option<u32>,
-     pub spill_weight: f64,         // Cost of spilling: priority / range_length
-     /// Cascade number for eviction-chain suppression (LLVM RegAllocGreedy
-     /// lineage): an interval that took a register by eviction carries
-@@ -71,6 +79,7 @@ impl LiveRange {
-             loop_depth,
-             priority: uses,
-             reg_hint: None,
-+            follow_value: None,
-             spill_weight,
-             cascade: 0,
-         }
-@@ -87,9 +96,47 @@ impl LiveRange {
-         self.start < end && start < self.end
-     }
+@@ -876,41 +877,76 @@ fn record_terminator_uses(term: &Terminator, point: u32, uses: &mut FxHashMap<u3
  
--    /// Check if this interval overlaps with another LiveRange.
--    pub fn overlaps_with(&self, other: &LiveRange) -> bool {
--        self.overlaps(other.start, other.end + 1)
-+    /// True if `self` has a recorded use at exactly `point`.
-+    ///
-+    /// `uses` is ascending (collected in program order), so this is an O(1)
-+    /// tail check. Interval ends extended by the liveness analysis (live
-+    /// through a block, phi incoming edges, GEP-fold bases, F128 source
-+    /// pointers) are NOT recorded uses, which is exactly what makes this the
-+    /// guard for die-at-birth sharing below.
-+    #[inline]
-+    fn last_use_is_at(&self, point: u32) -> bool {
-+        self.uses.last() == Some(&point)
-+    }
-+
-+    /// Whether `self` and `other` may NOT share one physical register.
-+    ///
-+    /// Two ranges conflict when their live-point sets intersect. Under LCCC's
-+    /// per-instruction program-point model every operand USE at a point
-+    /// precedes the single DEFINITION at that point (SSA: a fresh value's def
-+    /// is the result of the very instruction that reads its operands). So
-+    /// when `self` dies exactly where `other` is born (`self.end ==
-+    /// other.start`) — and `self` is genuinely *used* at that point — the read
-+    /// precedes the write and the ranges may legally share a register. This is
-+    /// what lets a producer and its consumer coalesce onto one register during
-+    /// allocation instead of paying a copy.
-+    ///
-+    /// An end that was artificially extended (not a real use) fails
-+    /// `last_use_is_at`, so those ranges stay conservative and never share a
-+    /// register at their extended endpoint.
-+    pub fn conflicts_with(&self, other: &LiveRange) -> bool {
-+        // Strictly disjoint: no shared point at all.
-+        if self.start > other.end || other.start > self.end {
-+            return false;
-+        }
-+        // Shared single point, use-before-def: the dying value's final use
-+        // reads the register before the newborn's definition writes it.
-+        if self.end == other.start && self.last_use_is_at(self.end) {
-+            return false;
-+        }
-+        if other.end == self.start && other.last_use_is_at(other.end) {
-+            return false;
-+        }
-+        true
-     }
- }
- 
-@@ -180,13 +227,6 @@ impl LinearScanAllocator {
-         }
-     }
- 
--    /// Check if a register is free at the given position.
--    pub fn is_register_free(&self, reg: PhysReg, position: u32) -> bool {
--        self.reg_free_until
--            .get(&reg)
--            .map_or(true, |&free_until| free_until <= position)
--    }
--
-     /// Find the earliest position at which a register becomes free.
-     pub fn earliest_free_position(&self) -> u32 {
-         self.reg_free_until.values().copied().min().unwrap_or(0)
-@@ -224,21 +264,43 @@ impl LinearScanAllocator {
-     /// Find a free register for the given range.
-     ///
-     /// Uses the following strategy:
--    /// 1. If there's a register hint from Copy sources, try that first
--    /// 2. Find a register that's free for the entire duration of the range
--    /// 3. If none, return None (caller will spill)
-+    /// 1. If there's a register hint (explicit, or a producer this value
-+    ///    follows), try that register first — the only place the
-+    ///    use-before-def adjacency rule applies.
-+    /// 2. Otherwise pick a register that is strictly free at the range's
-+    ///    start point, rotating the start index to distribute consecutive
-+    ///    allocations across different registers for ILP.
-     pub fn find_free_register(&mut self, range: &LiveRange) -> Option<PhysReg> {
--        // Try register hint first (for coalescing with Copy sources)
-+        // Try a coalescing hint first. The producer is always allocated before
-+        // its consumer (it is defined earlier), so its assignment is already
-+        // known here.
-         if let Some(hint) = range.reg_hint {
--            if self.is_register_free(hint, range.start)
--                && self.active.iter().all(|a| !a.range.overlaps_with(range))
+ /// Compute producer→consumer register-following hints.
+ ///
+-/// For an FP BinOp `d = lhs op rhs`, the x86 FP emitter computes the result
+-/// into `d`'s allocated register and first loads the LHS there
+-/// (`emit_float_binop_into_reg`). When `d` is allocated to the same register
+-/// as `lhs`, that load is a no-op — a whole register copy disappears per
+-/// chain link. We therefore record `d → lhs` as a FOLLOW hint: at allocation
+-/// time the consumer resolves the producer's already-assigned register and
+-/// prefers it (see `LinearScanAllocator::find_free_register`).
++/// A hint `consumer → producer` makes the consumer prefer the producer's
++/// register at allocation time (see `LinearScanAllocator::find_free_register`),
++/// and the allocator's `conflicts_with` honours it only when the producer's
++/// final use IS the consumer's definition (use-before-def at a shared point).
++/// Hints are recorded only for instructions whose emitter computes the result
++/// INTO the destination register with the operand pre-loaded, so die-at-birth
++/// sharing removes a register copy instead of corrupting a value:
+ ///
+-/// Only the LHS is hinted. The emitter loads the LHS into the destination
+-/// register; hinting the RHS would place it in that same register, where the
+-/// LHS load would clobber it before it is read (observed miscompile:
+-/// `subsd %xmm4, %xmm4` ≡ 0). RHS sharing is therefore never requested.
+-///
+-/// The allocator's `conflicts_with` performs the soundness check: a follow
+-/// hint is honoured only when producer and consumer are die-at-birth
+-/// compatible (the producer's final use IS the consumer's definition, so the
+-/// read precedes the write). A long-lived or multi-use producer simply leaves
+-/// the hint unhonoured and the consumer falls back to a free register —
+-/// over-hinting never removes an allocation option.
++/// - FP BinOp LHS: `emit_float_binop_into_reg` loads the LHS into the dest and
++///   applies `addsd/subsd/... rhs, dest`. Only the LHS is hinted — the RHS
++///   would be clobbered by the LHS load before it is read (observed
++///   miscompile: `subsd %xmm4,%xmm4` ≡ 0).
++/// - Copy: `emit_copy_value` emits nothing when dest and source share a
++///   register, so every Copy is a free coalescing edge (GPR and FP alike).
++/// - GPR unary Neg/Not/Bswap: `emit_unaryop_impl` moves the source into the
++///   dest register then applies the op in place (`neg %reg`).
++/// - Scalar FP Sqrt/Fabs intrinsics: `emit_fp_scalar_unary` / the Fabs path
++///   load the argument into the dest register and apply
++///   `sqrtsd/sqrtss/andpd/andps` in place.
+ ///
+ /// Returns a map: consumer value id → producer value id to follow.
+ fn find_register_hints(func: &IrFunction) -> FxHashMap<u32, u32> {
+     let mut hints: FxHashMap<u32, u32> = FxHashMap::default();
+     for block in &func.blocks {
+         for inst in &block.instructions {
+-            if let Instruction::BinOp {
+-                dest,
+-                lhs: Operand::Value(lhs),
+-                ty,
+-                ..
+-            } = inst
 -            {
-+            if self.register_compatible(hint, range) {
-                 return Some(hint);
-             }
-+        } else if let Some(producer) = range.follow_value {
-+            if let Some(&hint) = self.assignments.get(&producer) {
-+                if self.register_compatible(hint, range) {
-+                    return Some(hint);
-+                }
-+            }
-         }
- 
--        // Find any free register, rotating the start index to distribute
--        // consecutive allocations across different registers for ILP.
-+        // Find a STRICTLY free register, rotating the start index to
-+        // distribute consecutive allocations across different registers for
-+        // ILP. A register is usable only when its last occupant's final use is
-+        // strictly before range.start.
-+        //
-+        // The use-before-def adjacency rule from `register_compatible` is
-+        // deliberately NOT applied here: it is only sound for values whose
-+        // defining instruction computes into the destination register with the
-+        // operand pre-loaded (the FP emitter `emit_float_binop_into_reg`).
-+        // General GPR BinOps round-trip through the accumulator and do not
-+        // tolerate die-at-birth sharing — applying it globally produced
-+        // `or %r9,%r9` in sqlite_get_varint, silently dropping a term
-+        // (measured miscompile). Coalescing in the GPR class therefore stays
-+        // with the dedicated, proven paths (phi coalescing, copy coalescing),
-+        // while the FP class uses the hint path above.
-         let n = self.available_regs.len();
-         if n == 0 {
-             return None;
-@@ -247,31 +309,42 @@ impl LinearScanAllocator {
-         for offset in 0..n {
-             let idx = (start + offset) % n;
-             let reg = self.available_regs[idx];
--            // Check if this register is free at the start of the range
--            if self.is_register_free(reg, range.start) {
--                // Also check that no active interval uses this register
--                let reg_free_throughout = self
--                    .active
--                    .iter()
--                    .filter(|a| {
--                        if let Some(assigned_reg) = self.assignments.get(&a.range.value_id) {
--                            *assigned_reg == reg
--                        } else {
--                            false
--                        }
--                    })
--                    .all(|a| !a.range.overlaps_with(range));
--
--                if reg_free_throughout {
--                    self.next_reg_idx = idx + 1;
--                    return Some(reg);
--                }
-+            let free_until = self.reg_free_until.get(&reg).copied().unwrap_or(0);
-+            if free_until <= range.start {
-+                self.next_reg_idx = idx + 1;
-+                return Some(reg);
-             }
-         }
- 
-         None
-     }
- 
-+    /// Whether `reg` may hold `range` for its whole live range.
-+    ///
-+    /// Two checks, both against the allocator's current state:
-+    ///
-+    /// 1. **Occupancy.** `reg_free_until[reg]` is one past the final use of
-+    ///    the last interval assigned to `reg`. `free_until - 1` is therefore
-+    ///    that occupant's end point. If it lies strictly past `range.start`
-+    ///    the occupant is still needed after `range`'s definition and the
-+    ///    register is taken. Equality (`occupant_end == range.start`) is the
-+    ///    die-at-birth case: legal only when the occupant's final use *is*
-+    ///    `range.start` (use-before-def), which the interference check below
-+    ///    verifies precisely.
-+    /// 2. **Interference.** No active interval in `reg` may conflict with
-+    ///    `range` under `LiveRange::conflicts_with`.
-+    fn register_compatible(&self, reg: PhysReg, range: &LiveRange) -> bool {
-+        let free_until = self.reg_free_until.get(&reg).copied().unwrap_or(0);
-+        let occupant_end = free_until.saturating_sub(1);
-+        if occupant_end > range.start {
-+            return false;
-+        }
-+        self.active
-+            .iter()
-+            .filter(|a| self.assignments.get(&a.range.value_id) == Some(&reg))
-+            .all(|a| !a.range.conflicts_with(range))
-+    }
-+
-     /// Remaining (future) weighted use count of a range at scan position `pos`:
-     /// the number of uses strictly after `pos`. Under LCCC's lifetime-demotion
-     /// spill model (a demoted value pays slot traffic at EVERY remaining use;
-@@ -397,7 +470,7 @@ impl LinearScanAllocator {
-             if trace {
-                 for active in &self.active {
-                     if let Some(&areg) = self.assignments.get(&active.range.value_id) {
--                        if areg == reg && active.range.overlaps_with(&range) {
-+                        if areg == reg && active.range.conflicts_with(&range) {
-                             eprintln!("[ALLOC-BUG] Assigning val{}[{}-{}] to reg={} but val{}[{}-{}] already in reg={}!",
-                                 range.value_id, range.start, range.end, reg.0,
-                                 active.range.value_id, active.range.start, active.range.end, areg.0);
-@@ -640,7 +713,7 @@ pub fn build_live_ranges(
-     // Collect actual use points for each value
-     let uses_map = collect_uses_for_values(func);
- 
--    // Register hints from Copy sources (currently none are emitted).
-+    // Producer→consumer follow hints (FP BinOp LHS edges).
-     let hints_map = find_register_hints(func);
- 
-     // PGO-aware use weighting: exact block-entry counts bias allocation toward
-@@ -668,8 +741,9 @@ pub fn build_live_ranges(
-             .sum();
-         range.priority = weighted_uses.max(1).saturating_mul(loop_weight);
- 
--        // Add register hint if available
--        range.reg_hint = hints_map.get(&range.value_id).copied();
-+        // Add producer-follow hint if available (the consumer prefers the
-+        // producer's register; resolved at allocation time).
-+        range.follow_value = hints_map.get(&range.value_id).copied();
- 
-         // Recalculate spill weight with actual use count
-         range.calculate_spill_weight();
-@@ -745,117 +819,18 @@ fn collect_uses_for_values(func: &IrFunction) -> FxHashMap<u32, Vec<u32>> {
- }
- 
- /// Record uses of operands in an instruction.
-+///
-+/// Uses the canonical operand/value traversal (the same visitors the liveness
-+/// analysis runs) so every instruction form is covered — a hand-maintained
-+/// match previously missed Intrinsic args, InlineAsm inputs, atomic pointer
-+/// operands, and the SetReturnF*Second sources, under-counting uses and
-+/// skewing allocation priority and the die-at-birth guard in `conflicts_with`.
- fn record_operand_uses(inst: &Instruction, point: u32, uses: &mut FxHashMap<u32, Vec<u32>>) {
--    // Helper to record a use of a value
--    let mut record = |vid: u32| {
--        uses.entry(vid).or_insert_with(Vec::new).push(point);
--    };
--
--    // Match on instruction type to find all operand uses
--    match inst {
--        Instruction::BinOp { lhs, rhs, .. } => {
--            if let Operand::Value(v) = lhs {
--                record(v.0);
--            }
--            if let Operand::Value(v) = rhs {
--                record(v.0);
--            }
--        }
--        Instruction::UnaryOp { src, .. } => {
--            if let Operand::Value(v) = src {
--                record(v.0);
--            }
--        }
--        Instruction::Cmp { lhs, rhs, .. } => {
--            if let Operand::Value(v) = lhs {
--                record(v.0);
--            }
--            if let Operand::Value(v) = rhs {
--                record(v.0);
--            }
--        }
--        Instruction::Store { val, .. } => {
--            if let Operand::Value(v) = val {
--                record(v.0);
--            }
--        }
--        Instruction::Cast { src, .. } => {
--            if let Operand::Value(v) = src {
--                record(v.0);
--            }
--        }
--        Instruction::Copy { src, .. } => {
--            if let Operand::Value(v) = src {
--                record(v.0);
--            }
--        }
--        Instruction::Call { info, .. } => {
--            for arg in &info.args {
--                if let Operand::Value(v) = arg {
--                    record(v.0);
--                }
--            }
--        }
--        Instruction::CallIndirect { func_ptr, info, .. } => {
--            if let Operand::Value(v) = func_ptr {
--                record(v.0);
--            }
--            for arg in &info.args {
--                if let Operand::Value(v) = arg {
--                    record(v.0);
--                }
--            }
--        }
--        Instruction::GetElementPtr { offset, .. } => {
--            if let Operand::Value(v) = offset {
--                record(v.0);
--            }
--        }
--        Instruction::Select {
--            cond,
--            true_val,
--            false_val,
--            ..
--        } => {
--            if let Operand::Value(v) = cond {
--                record(v.0);
--            }
--            if let Operand::Value(v) = true_val {
--                record(v.0);
--            }
--            if let Operand::Value(v) = false_val {
--                record(v.0);
--            }
--        }
--        Instruction::AtomicRmw { val, .. } => {
--            if let Operand::Value(v) = val {
--                record(v.0);
--            }
-+    for_each_operand_in_instruction(inst, |op| {
-+        if let Operand::Value(v) = op {
-+            uses.entry(v.0).or_insert_with(Vec::new).push(point);
-         }
--        Instruction::AtomicInc { ptr, .. } => {
--            if let Operand::Value(v) = ptr {
--                record(v.0);
--            }
--        }
--        Instruction::AtomicCmpxchg {
--            expected, desired, ..
--        } => {
--            if let Operand::Value(v) = expected {
--                record(v.0);
--            }
--            if let Operand::Value(v) = desired {
--                record(v.0);
--            }
--        }
--        Instruction::Phi { incoming, .. } => {
--            for (op, _) in incoming {
--                if let Operand::Value(v) = op {
--                    record(v.0);
--                }
--            }
--        }
--        _ => {}
--    }
-+    });
- 
-     // Record direct Value uses (pointers, bases, etc.)
-     record_value_uses(inst, point, uses);
-@@ -863,20 +838,9 @@ fn record_operand_uses(inst: &Instruction, point: u32, uses: &mut FxHashMap<u32,
- 
- /// Record direct Value uses (not wrapped in Operand).
- fn record_value_uses(inst: &Instruction, point: u32, uses: &mut FxHashMap<u32, Vec<u32>>) {
--    let mut record = |v: &Value| {
-+    for_each_value_use_in_instruction(inst, |v| {
-         uses.entry(v.0).or_insert_with(Vec::new).push(point);
--    };
--
--    match inst {
--        Instruction::Load { ptr, .. } => record(ptr),
--        Instruction::Store { ptr, .. } => record(ptr),
--        Instruction::GetElementPtr { base, .. } => record(base),
--        Instruction::Memcpy { dest, src, .. } => {
--            record(dest);
--            record(src);
--        }
--        _ => {}
--    }
-+    });
- }
- 
- /// Record uses in a terminator.
-@@ -910,17 +874,47 @@ fn record_terminator_uses(term: &Terminator, point: u32, uses: &mut FxHashMap<u3
-     }
- }
- 
--/// Find register hints from Copy instructions.
-+/// Compute producer→consumer register-following hints.
-+///
-+/// For an FP BinOp `d = lhs op rhs`, the x86 FP emitter computes the result
-+/// into `d`'s allocated register and first loads the LHS there
-+/// (`emit_float_binop_into_reg`). When `d` is allocated to the same register
-+/// as `lhs`, that load is a no-op — a whole register copy disappears per
-+/// chain link. We therefore record `d → lhs` as a FOLLOW hint: at allocation
-+/// time the consumer resolves the producer's already-assigned register and
-+/// prefers it (see `LinearScanAllocator::find_free_register`).
-+///
-+/// Only the LHS is hinted. The emitter loads the LHS into the destination
-+/// register; hinting the RHS would place it in that same register, where the
-+/// LHS load would clobber it before it is read (observed miscompile:
-+/// `subsd %xmm4, %xmm4` ≡ 0). RHS sharing is therefore never requested.
- ///
--/// For Copy instructions where the source is allocated to a register,
--/// the destination can be hinted to use the same register, enabling coalescing.
-+/// The allocator's `conflicts_with` performs the soundness check: a follow
-+/// hint is honoured only when producer and consumer are die-at-birth
-+/// compatible (the producer's final use IS the consumer's definition, so the
-+/// read precedes the write). A long-lived or multi-use producer simply leaves
-+/// the hint unhonoured and the consumer falls back to a free register —
-+/// over-hinting never removes an allocation option.
- ///
--/// Returns a map: dest_value_id → source_register_hint
--fn find_register_hints(func: &IrFunction) -> FxHashMap<u32, PhysReg> {
--    let _ = func;
--    // Register hints are currently not emitted (post-allocation coalescing
--    // handles producer->consumer sharing instead).
--    FxHashMap::default()
-+/// Returns a map: consumer value id → producer value id to follow.
-+fn find_register_hints(func: &IrFunction) -> FxHashMap<u32, u32> {
-+    let mut hints: FxHashMap<u32, u32> = FxHashMap::default();
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            if let Instruction::BinOp {
-+                dest,
-+                lhs: Operand::Value(lhs),
-+                ty,
-+                ..
-+            } = inst
-+            {
-+                if *ty == IrType::F64 || *ty == IrType::F32 {
-+                    hints.insert(dest.0, lhs.0);
-+                }
-+            }
-+        }
-+    }
-+    hints
- }
- 
- #[cfg(test)]
-@@ -954,6 +948,7 @@ mod tests {
-             loop_depth: 0,
-             priority: 1,
-             reg_hint: None,
-+            follow_value: None,
-             spill_weight: 0.1,
-             cascade: 0,
-         };
-@@ -974,6 +969,84 @@ mod tests {
-         assert!(!range.overlaps(0, 9));
-     }
- 
-+    #[test]
-+    fn test_conflicts_with_die_at_birth() {
-+        // Producer used exactly at its end (a genuine use) and a consumer born
-+        // at that same point: use-before-def, so they may share a register.
-+        let producer = LiveRange {
-+            value_id: 1,
-+            start: 0,
-+            end: 5,
-+            uses: vec![0, 5],
-+            loop_depth: 0,
-+            priority: 2,
-+            reg_hint: None,
-+            follow_value: None,
-+            spill_weight: 0.1,
-+            cascade: 0,
-+        };
-+        let consumer = LiveRange {
-+            value_id: 2,
-+            start: 5,
-+            end: 10,
-+            uses: vec![5, 10],
-+            loop_depth: 0,
-+            priority: 2,
-+            reg_hint: None,
-+            follow_value: None,
-+            spill_weight: 0.1,
-+            cascade: 0,
-+        };
-+        assert!(!producer.conflicts_with(&consumer));
-+        assert!(!consumer.conflicts_with(&producer));
-+
-+        // Same shape but with an artificially extended end (no recorded use at
-+        // the shared point) must conflict: the extension is not a real use.
-+        let extended = LiveRange {
-+            value_id: 3,
-+            start: 0,
-+            end: 5,
-+            uses: vec![0], // last recorded use is NOT at end=5
-+            loop_depth: 0,
-+            priority: 2,
-+            reg_hint: None,
-+            follow_value: None,
-+            spill_weight: 0.1,
-+            cascade: 0,
-+        };
-+        assert!(extended.conflicts_with(&consumer));
-+
-+        // Genuine overlap (more than a single shared point) always conflicts.
-+        let overlapping = LiveRange {
-+            value_id: 4,
-+            start: 3,
-+            end: 7,
-+            uses: vec![3, 7],
-+            loop_depth: 0,
-+            priority: 2,
-+            reg_hint: None,
-+            follow_value: None,
-+            spill_weight: 0.1,
-+            cascade: 0,
-+        };
-+        assert!(producer.conflicts_with(&overlapping));
-+
-+        // Disjoint intervals never conflict.
-+        let disjoint = LiveRange {
-+            value_id: 5,
-+            start: 20,
-+            end: 30,
-+            uses: vec![20, 30],
-+            loop_depth: 0,
-+            priority: 2,
-+            reg_hint: None,
-+            follow_value: None,
-+            spill_weight: 0.1,
-+            cascade: 0,
-+        };
-+        assert!(!producer.conflicts_with(&disjoint));
-+    }
-+
-     #[test]
-     fn test_priority_weighting() {
-         let interval = LiveInterval {
-@@ -1001,6 +1074,7 @@ mod tests {
-             loop_depth: 0,
-             priority: 100,
-             reg_hint: None,
-+            follow_value: None,
-             spill_weight: 100.0 / 11.0, // 100 / range_length
-             cascade: 0,
-         };
-@@ -1013,6 +1087,7 @@ mod tests {
-             loop_depth: 0,
-             priority: 100,
-             reg_hint: None,
-+            follow_value: None,
-             spill_weight: 100.0 / 101.0, // 100 / range_length
-             cascade: 0,
-         };
-@@ -1033,6 +1108,7 @@ mod tests {
-                 loop_depth: 0,
-                 priority: 3,
-                 reg_hint: None,
-+                follow_value: None,
-                 spill_weight: 0.3,
-                 cascade: 0,
-             },
-@@ -1044,6 +1120,7 @@ mod tests {
-                 loop_depth: 0,
-                 priority: 3,
-                 reg_hint: None,
-+                follow_value: None,
-                 spill_weight: 0.3,
-                 cascade: 0,
-             },
-@@ -1055,6 +1132,7 @@ mod tests {
-                 loop_depth: 0,
-                 priority: 3,
-                 reg_hint: None,
-+                follow_value: None,
-                 spill_weight: 0.3,
-                 cascade: 0,
-             },
-@@ -1083,6 +1161,7 @@ mod tests {
-                 loop_depth: 0,
-                 priority: 3, // High priority
-                 reg_hint: None,
-+                follow_value: None,
-                 spill_weight: 0.03,
-                 cascade: 0,
-             },
-@@ -1094,6 +1173,7 @@ mod tests {
-                 loop_depth: 0,
-                 priority: 2, // Lower priority - should spill
-                 reg_hint: None,
-+                follow_value: None,
-                 spill_weight: 0.02,
-                 cascade: 0,
-             },
-@@ -1121,6 +1201,7 @@ mod tests {
-             loop_depth: 0,
-             priority: 1,
-             reg_hint: None,
-+            follow_value: None,
-             spill_weight: 0.1,
-             cascade: 0,
-         }];
--- 
-2.47.3
-
-
-From 65753c87654f5c54eee6bf677906c764bdf5e8dd Mon Sep 17 00:00:00 2001
-From: lccc-v8 <v8@localhost>
-Date: Thu, 13 Aug 2026 21:04:20 +0000
-Subject: [PATCH 2/7] v8: remove post-allocation FP coalescing pass (superseded
- by follow hints)
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-coalesce_f64_producers re-scanned F64 chains after allocation and moved
-single-use producers onto their consumer's register. The linear-scan
-follow hints (previous commit) now do the same coalescing DURING
-allocation with the identical die-at-birth conflict predicate, and are
-strictly more general: they are not limited to single-use producers
-(any producer whose final use is the consumer's definition coalesces)
-and they influence register choice, so a consumer prefers its
-producer's register instead of hoping the producer lands there.
-
-Measured on the FP-heavy corpus (paired, pinned, min-of-5/median):
-nbody 3.466x, spectral_norm 2.911x, mandelbrot 1.891x, matmul 1.097x,
-zlib_ng_adler32 1.746x vs gcc — identical to the hint+post-pass build
-within noise, so the pass was pure redundancy. Regression 127 passed /
-0 failed, correctness 50/50, intrinsics 3/3.
----
- src/backend/regalloc.rs | 129 ++--------------------------------------
- 1 file changed, 5 insertions(+), 124 deletions(-)
-
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index 9607fd76..17f3b7c1 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -891,14 +891,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                 // XMM regs (20+) are caller-saved, no prologue save needed
-             }
- 
--            // v7: post-allocation producer->consumer coalescing. Reassign
--            // single-use F64 producers (loads feeding an FP op, chain links)
--            // onto their sole consumer's register when the producer's interval
--            // does not conflict with anything already in that register. This
--            // removes the reg-to-reg copy that otherwise precedes every FP
--            // operation in a dependency chain. Explicit conflict checks make
--            // it sound; the linear scan is untouched.
--            coalesce_f64_producers(func, &f64_intervals, &mut assignments);
-+            // FP producer->consumer coalescing now happens DURING allocation
-+            // via the linear-scan follow hints (see live_range.rs); the
-+            // post-allocation pass is gone. The hint is honoured under the
-+            // same die-at-birth conflict predicate the old pass used, but is
-+            // no longer restricted to single-use producers.
-         }
- 
-         // Phase 3b (W6): XMM allocation for 128-bit VECTOR values. Runs AFTER
-@@ -1376,122 +1373,6 @@ fn synthetic_vec_intervals(
-     result
- }
- 
--/// Post-allocation producer→consumer coalescing for the F64 XMM class.
--///
--/// A single-use F64 value (a load feeding an FP op, or an intermediate chain
--/// link) is reassigned to its sole consumer's register when that causes no
--/// register conflict. This removes the reg-to-reg copy that otherwise precedes
--/// every FP operation in a dependency chain (the load lands directly in the
--/// op's destination register). Candidates are processed in REVERSE program
--/// order so an entire dependency chain folds onto the tail register in one
--/// pass (each link follows the register its consumer just moved to).
--///
--/// Soundness: a value is moved only when its interval does not strictly
--/// overlap any value currently holding the target register (adjacent
--/// intervals — producer's last use == consumer's def — are shareable, since
--/// the read precedes the write within one instruction). Only the final
--/// assignment map changes; the linear scan is untouched.
--fn coalesce_f64_producers(
--    func: &IrFunction,
--    f64_intervals: &[LiveInterval],
--    assignments: &mut FxHashMap<u32, PhysReg>,
--) {
--    let iv_of: FxHashMap<u32, (u32, u32)> = f64_intervals
--        .iter()
--        .map(|iv| (iv.value_id, (iv.start, iv.end)))
--        .collect();
--    if iv_of.is_empty() {
--        return;
--    }
--    let raw_uses = raw_value_use_counts(func);
--
--    // Collect (producer, consumer) pairs. Only the FIRST operand (LHS) of a
--    // BinOp is eligible: the FP emitter loads the LHS into the destination
--    // register, so a coalesced LHS needs no copy. Coalescing the RHS would put
--    // it in the destination register too, where the LHS load would clobber it
--    // before it is read (observed miscompile: `subsd %xmm4, %xmm4` = 0).
--    let mut cands: Vec<(u32, u32)> = Vec::new();
--    for block in &func.blocks {
--        for inst in &block.instructions {
--            let Some(dest) = inst.dest() else { continue };
--            if !iv_of.contains_key(&dest.0) {
--                continue;
--            }
--            if !assignments.contains_key(&dest.0) {
--                continue;
--            }
--            let lhs: Option<u32> = match inst {
--                Instruction::BinOp { lhs: Operand::Value(v), .. } => Some(v.0),
--                _ => None,
--            };
--            if let Some(v) = lhs {
--                if iv_of.contains_key(&v) && raw_uses.get(&v).copied().unwrap_or(0) == 1 {
--                    cands.push((v, dest.0));
--                }
--            }
--        }
--    }
--    // Reverse program order: the chain tail moves first, so earlier links
--    // follow it onto one shared register.
--    cands.reverse();
--
--    for (v, d) in cands {
--        let Some(&creg) = assignments.get(&d) else { continue };
--        if assignments.get(&v) == Some(&creg) {
--            continue; // already coalesced
--        }
--        let (s, e) = iv_of[&v];
--        let mut ok = true;
--        for (&w, &wr) in assignments.iter() {
--            if w == v || wr != creg {
--                continue;
--            }
--            if let Some(&(ws, we)) = iv_of.get(&w) {
--                if s < we && ws < e {
--                    ok = false;
--                    break;
--                }
--            }
--        }
--        if ok {
--            assignments.insert(v, creg);
--        }
--    }
--
--    if std::env::var("CCC_DEBUG_XMM").is_ok() {
--        let mut pairs: Vec<(u32, u32)> = assignments
--            .iter()
--            .filter(|(v, _)| iv_of.contains_key(v))
--            .map(|(&v, &r)| (v, r.0 as u32))
--            .collect();
--        pairs.sort_unstable();
--        eprintln!("[XMM-COALESCE] fn={} {:?}", func.name, pairs);
--    }
--}
--
--/// Raw operand-use count per value (one per Operand::Value occurrence in any
--/// instruction or terminator). Used for single-use detection in coalescing:
--/// only a value with exactly one use can share its consumer's register, because
--/// only then do producer and consumer live ranges not overlap.
--fn raw_value_use_counts(func: &IrFunction) -> FxHashMap<u32, u32> {
--    let mut uses: FxHashMap<u32, u32> = FxHashMap::default();
--    for block in &func.blocks {
--        for inst in &block.instructions {
--            for_each_operand_in_instruction(inst, |op| {
--                if let Operand::Value(v) = op {
--                    *uses.entry(v.0).or_insert(0) += 1;
--                }
--            });
--        }
--        for_each_operand_in_terminator(&block.terminator, |op| {
--            if let Operand::Value(v) = op {
--                *uses.entry(v.0).or_insert(0) += 1;
--            }
--        });
--    }
--    uses
--}
--
- /// Collect values whose types don't fit in a single GPR (floats, i128, and
- /// on 32-bit targets: i64/u64). Copy instructions that chain from these
- /// values must also be excluded via fixpoint propagation.
--- 
-2.47.3
-
-
-From c6fef0e818a6753e6f1226e8d3518320fac4407f Mon Sep 17 00:00:00 2001
-From: lccc-v8 <v8@localhost>
-Date: Thu, 13 Aug 2026 21:04:49 +0000
-Subject: [PATCH 3/7] =?UTF-8?q?v8:=20audit=20report=20=E2=80=94=20die-at-b?=
- =?UTF-8?q?irth=20hint=20coalescing=20section?=
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
----
- SIMD_REDTEAM_AUDIT.md | 50 ++++++++++++++++++++++++++++++++++++++++---
- 1 file changed, 47 insertions(+), 3 deletions(-)
-
-diff --git a/SIMD_REDTEAM_AUDIT.md b/SIMD_REDTEAM_AUDIT.md
-index fae2b661..9d26b5e7 100644
---- a/SIMD_REDTEAM_AUDIT.md
-+++ b/SIMD_REDTEAM_AUDIT.md
-@@ -535,8 +535,8 @@ Correctness: nbody/spectral_norm/mandelbrot/struct_copy bit-exact vs gcc.
-    During development, an iterated linear-scan-hint approach was tried and
-    reverted: it miscompiled `energy()` via a subtle adjacent-interval liveness
-    interaction with the `reg_free_until` bookkeeping (end+1 off-by-one vs
--   `overlaps_with`'s inclusive-end semantics). The post-pass avoids the
--   allocator internals entirely.
-+   `overlaps_with`'s inclusive-end semantics). That interaction is now fixed
-+   and the hint approach supersedes this pass — see the v8 section below.
- 
- 2. **F32 scalars now XMM-allocated** (was F64-only). Also fixed a latent panic
-    the widening exposed: the register-direct int→float cast read an
-@@ -558,7 +558,51 @@ Correctness: nbody/spectral_norm/mandelbrot/struct_copy bit-exact vs gcc.
- Correctness: 14 benchmarks bit-exact vs gcc; F32/F64 difftests 0..300 exact;
- zlib-ng adler32 correct.
- 
--## v8 roadmap (diagnosed this session)
-+## v8 — in-allocator producer→consumer register hints (die-at-birth coalescing)
-+
-+Resurrected the linear-scan hint approach, with the liveness interaction fixed
-+properly (the earlier attempt miscompiled `energy()` and was reverted).
-+
-+**Root cause of the old miscompile.** The reverted design changed register
-+OCCUPANCY to half-open (`occupy_until(end)`) while the overlap predicate stayed
-+inclusive-end, so `is_register_free` reported "free" at a producer's final use
-+point and an unrelated interval clobbered the still-live value.
-+
-+**The fix changes the CONFLICT predicate, not the occupancy:**
-+- `LiveRange::conflicts_with` encodes use-before-def at a shared point: two
-+  ranges touching only at a boundary (producer.end == consumer.start) may share
-+  a register iff the producer is genuinely USED at that point
-+  (`uses.last() == end`). Liveness-extended ends (live-through-block,
-+  phi-incoming, GEP-base, F128-pointer) are not recorded uses, so those stay
-+  conservative.
-+- `find_free_register` resolves a producer-follow hint (FP BinOp LHS edge) at
-+  allocation time; the producer is always allocated first (earlier def).
-+- **The adjacency rule is scoped to the hint path.** Applied globally to the
-+  GPR scan it was UNSOUND: GPR BinOps round-trip through the accumulator and do
-+  not compute into the destination register, so sharing produced
-+  `or %r9,%r9` in sqlite_get_varint (self-op, silently drops a term).
-+  GPR coalescing stays with the proven paths (phi coalescing, copy coalescing).
-+- Fixed the pre-existing hint bug: the hint check compared the incoming range
-+  against ALL active intervals instead of only those in the hint register, so
-+  hints essentially never fired.
-+
-+**Also fixed** the use-collection divergence this exposed: `record_operand_uses`
-+hand-rolled a match that missed Intrinsic args, InlineAsm inputs, atomic
-+pointer operands and `SetReturnF*Second` sources. It now uses the canonical
-+operand/value traversal, making `uses` (priority, spill weight, next-use
-+eviction, die-at-birth guard) complete.
-+
-+**Post-pass removed.** `coalesce_f64_producers` (post-allocation, single-use
-+only) is superseded: the hints are equivalent-or-better (any-use producers via
-+last-use adjacency, and they influence register choice). Measured identical on
-+the FP corpus (nbody 3.466x, spectral_norm 2.911x, mandelbrot 1.891x,
-+zlib_ng_adler32 1.746x).
-+
-+**Validation:** regression 127/127, correctness 50/50, intrinsics 3/3, corpus
-+25/25 correct, geomean 0.953 vs gcc (v7: 0.951); sqlite_varint + zlib_ng_adler32
-+bit-exact. New unit test `test_conflicts_with_die_at_birth`.
-+
-+## v8 roadmap (remaining)
- 
- 1. **Branch/boolean domain** (expat 3.2x, sqlite_varint 2.1x): range-check
-    folding `(x>=lo && x<=hi) -> (unsigned)(x-lo) <= hi-lo`, fused
--- 
-2.47.3
-
-
-From b9edb07c6acc247b8be61b431c848d2582241405 Mon Sep 17 00:00:00 2001
-From: lccc-v8 <v8@localhost>
-Date: Thu, 13 Aug 2026 21:33:22 +0000
-Subject: [PATCH 4/7] v8: fold widen-then-narrow cast chains in simplify
-
-Cast(Cast(x, A->B), B->C) with B strictly widest (B > A and B > C,
-all integer) collapses to Cast(x, A->C) for any signedness and any C:
-the widening A->B preserves every A bit, and narrowing B->C discards
-only high bits, so the result is extend-then-truncate(x) which equals
-Cast(x, A->C) directly. This complements the existing double-widen
-(A<B<C) and double-narrow (A>B>C) folds and covers the ubiquitous C
-integer-promotion idiom (e.g. the bool I8 -> I64 -> I32 chain the
-range-check fold emits).
-
-Regression 127 passed / 0 failed, correctness 50/50, intrinsics 3/3.
----
- src/passes/simplify.rs | 17 +++++++++++++++++
- 1 file changed, 17 insertions(+)
-
-diff --git a/src/passes/simplify.rs b/src/passes/simplify.rs
-index 0f9270ef..7a782df7 100644
---- a/src/passes/simplify.rs
-+++ b/src/passes/simplify.rs
-@@ -368,6 +368,23 @@ fn simplify_cast(
-                             to_ty,
-                         });
-                     }
-+
-+                    // Widen then narrow, B strictly widest: Cast(Cast(x, A->B), B->C)
-+                    // with B > A and B > C (all ints) => Cast(x, A->C).
-+                    // The widening A->B preserves every A bit (zero- or
-+                    // sign-extended), and narrowing B->C discards only high bits,
-+                    // so the result is exactly extend-then-truncate(x) which
-+                    // equals Cast(x, A->C) for any signedness and any C.
-+                    // (Covers the C-promotion idiom the range-check fold emits:
-+                    // bool I8 -> I64 -> I32 collapses to bool I8 -> I32.)
-+                    if b > a && b > c {
-+                        return Some(Instruction::Cast {
-+                            dest,
-+                            src: inner_src,
-+                            from_ty: inner_from,
-+                            to_ty,
-+                        });
-+                    }
-                 }
-             }
-         }
--- 
-2.47.3
-
-
-From 60eb3e06af6c5a4e59f6c8328ffe11677f23e5d0 Mon Sep 17 00:00:00 2001
-From: lccc-v8 <v8@localhost>
-Date: Thu, 13 Aug 2026 21:33:22 +0000
-Subject: [PATCH 5/7] v8: range-check folding pass ((x>=lo && x<=hi) ->
- (unsigned)(x-lo) <= hi-lo)
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-C's a && b / a || b lower to short-circuit control flow which if-conversion
-turns into Select chains. When both arms compare the SAME value against
-constant bounds, the whole boolean dance (two cmp+setcc+movzbl, a test,
-a cmov, a narrowing cast) collapses into one subtract and one unsigned
-compare — exactly GCC's shape for Expat's xml_name_continue / SQLite's
-varint classifier.
-
-Folds, for lo <= hi:
-  x >= lo && x <= hi  =>  (unsigned)(x - lo) <= (hi - lo)
-  x <  lo || x >  hi  =>  (unsigned)(x - lo) >  (hi - lo)
-Wraparound subtraction makes out-of-range values wrap huge, so a single
-unsigned compare classifies the range; valid for signed and unsigned
-comparisons in any width provided hi-lo is representable. The two arms
-are matched through their cast chains (the lowering casts the operand
-once per comparison), and the boolean result keeps the Select's type so
-every downstream use is unchanged. Runs right after if-conversion.
-
-Measured on the corpus (paired, pinned): expat 3.28x -> 3.13x,
-hash_table 1.38x -> 1.31x, loop_patterns 1.85x -> 1.80x; no regressions.
-Regression 127 passed / 0 failed, correctness 50/50, intrinsics 3/3,
-differential range-check test bit-exact vs gcc over all byte values and
-INT/LLONG edge cases.
----
- src/passes/mod.rs         |  17 ++
- src/passes/range_check.rs | 373 ++++++++++++++++++++++++++++++++++++++
- 2 files changed, 390 insertions(+)
- create mode 100644 src/passes/range_check.rs
-
-diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index cddd0d17..f6e26904 100644
---- a/src/passes/mod.rs
-+++ b/src/passes/mod.rs
-@@ -27,6 +27,7 @@ pub(crate) mod loop_analysis;
- pub(crate) mod loop_unroll;
- pub(crate) mod narrow;
- pub(crate) mod outline_switch;
-+pub(crate) mod range_check;
- pub(crate) mod recursion_to_iter;
- mod resolve_asm;
- pub(crate) mod simplify;
-@@ -760,6 +761,22 @@ macro_rules! preloop_dump {
-             total_changes_excl_dce += n;
-         }
- 
-+        // Phase 7b: Range-check folding.
-+        // (x >= lo && x <= hi) -> (unsigned)(x - lo) <= (hi - lo), and the
-+        // complement (x < lo || x > hi) -> (unsigned)(x - lo) > (hi - lo).
-+        // Runs right after if-conversion, which produces the Select form from
-+        // short-circuit branches. Idempotent and O(instructions), so it also
-+        // folds Selects produced earlier (mem2reg in the pre-loop phase).
-+        // Pass name for CCC_DISABLE_PASSES: "range_fold".
-+        if !disabled.contains("range_fold") {
-+            let n = timed_pass!(
-+                "range_fold",
-+                run_on_visited(module, &dirty, &mut changed, range_check::run_function)
-+            );
-+            total_changes += n;
-+            total_changes_excl_dce += n;
-+        }
-+
-         // Phase 8: Copy propagation again
-         // Upstream: simplify (folded casts to copies), constfold (folded exprs to copies),
-         //           gvn (produced copies), licm (hoisted code), if_convert (select values)
-diff --git a/src/passes/range_check.rs b/src/passes/range_check.rs
-new file mode 100644
-index 00000000..07be1c79
---- /dev/null
-+++ b/src/passes/range_check.rs
-@@ -0,0 +1,373 @@
-+//! Range-check folding: `(x >= lo && x <= hi)` → `(unsigned)(x - lo) <= hi - lo`.
-+//!
-+//! C's `a && b` / `a || b` lower to short-circuit control flow, which mem2reg
-+//! and if-conversion collapse into `Select` chains. When both arms of the
-+//! short-circuit compare the SAME value against constant bounds, the whole
-+//! boolean dance (two `cmp`+`setcc`+`movzbl`, a `test`, a `cmov`, and a
-+//! narrowing cast) collapses into one subtract and one unsigned compare —
-+//! exactly what GCC emits for Expat's `xml_name_continue` / SQLite's varint
-+//! classifier hot paths.
-+//!
-+//! The transform is the classic unsigned-bias identity:
-+//!   x >= lo && x <= hi  ⇔  (unsigned)(x - lo) <= (hi - lo)      (lo <= hi)
-+//!   x <  lo || x >  hi  ⇔  (unsigned)(x - lo) >  (hi - lo)      (lo <= hi)
-+//! Wraparound subtraction makes out-of-range values wrap to huge unsigned
-+//! values, so a single unsigned compare classifies the whole range. Valid for
-+//! both signed and unsigned comparisons, in any integer width, provided
-+//! `hi - lo` is representable.
-+//!
-+//! Pass name for CCC_DISABLE_PASSES: "range_fold".
-+
-+use crate::common::types::IrType;
-+use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Value};
-+
-+/// A comparison, canonicalized to `value OP const` with an explicit role.
-+#[derive(Clone, Copy)]
-+struct Bound {
-+    /// The value being compared (always the same value on both arms).
-+    value: Value,
-+    /// The constant bound.
-+    bound: i64,
-+    /// The operand type of the comparison (e.g. I32 after promotion).
-+    ty: IrType,
-+    /// Inclusive/exclusive, lower/upper role.
-+    kind: BoundKind,
-+    /// Signedness of the original comparison (S* vs U*).
-+    signed: bool,
-+}
-+
-+#[derive(Clone, Copy, PartialEq, Eq)]
-+enum BoundKind {
-+    /// x >= c  (or c <= x)
-+    InclLower,
-+    /// x <= c  (or c >= x)
-+    InclUpper,
-+    /// x > c  (or c < x)
-+    ExclLower,
-+    /// x < c  (or c > x)
-+    ExclUpper,
-+}
-+
-+/// Canonicalize `op lhs rhs` into a `Bound` when one side is a value and the
-+/// other an integer constant. Returns None for non-constant or non-integer
-+/// comparisons.
-+fn canonicalize(op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) -> Option<Bound> {
-+    if !ty.is_integer() {
-+        return None;
-+    }
-+    let signed = matches!(op, IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge);
-+    // (value, const) with the const on the RHS, swapping the operator when the
-+    // constant was on the LHS.
-+    let (value, bound, op) = match (lhs, rhs) {
-+        (Operand::Value(v), Operand::Const(c)) => (*v, c.to_i64()?, op),
-+        (Operand::Const(c), Operand::Value(v)) => (*v, c.to_i64()?, swap(op)),
-+        _ => return None,
-+    };
-+    let kind = match op {
-+        IrCmpOp::Sge | IrCmpOp::Uge => BoundKind::InclLower,
-+        IrCmpOp::Sle | IrCmpOp::Ule => BoundKind::InclUpper,
-+        IrCmpOp::Sgt | IrCmpOp::Ugt => BoundKind::ExclLower,
-+        IrCmpOp::Slt | IrCmpOp::Ult => BoundKind::ExclUpper,
-+        IrCmpOp::Eq | IrCmpOp::Ne => return None,
-+    };
-+    Some(Bound { value, bound, ty, kind, signed })
-+}
-+
-+fn swap(op: IrCmpOp) -> IrCmpOp {
-+    match op {
-+        IrCmpOp::Slt => IrCmpOp::Sgt,
-+        IrCmpOp::Sle => IrCmpOp::Sge,
-+        IrCmpOp::Sgt => IrCmpOp::Slt,
-+        IrCmpOp::Sge => IrCmpOp::Sle,
-+        IrCmpOp::Ult => IrCmpOp::Ugt,
-+        IrCmpOp::Ule => IrCmpOp::Uge,
-+        IrCmpOp::Ugt => IrCmpOp::Ult,
-+        IrCmpOp::Uge => IrCmpOp::Ule,
-+        other => other,
-+    }
-+}
-+
-+/// Rebuild an integer constant of type `ty` from an i64 value. Returns None if
-+/// the value does not fit the type.
-+fn int_const(ty: IrType, v: i64) -> Option<IrConst> {
-+    match ty {
-+        IrType::I8 => i8::try_from(v).ok().map(IrConst::I8),
-+        IrType::U8 => u8::try_from(v).ok().map(|x| IrConst::I8(x as i8)),
-+        IrType::I16 => i16::try_from(v).ok().map(IrConst::I16),
-+        IrType::U16 => u16::try_from(v).ok().map(|x| IrConst::I16(x as i16)),
-+        IrType::I32 => i32::try_from(v).ok().map(IrConst::I32),
-+        IrType::U32 => u32::try_from(v).ok().map(|x| IrConst::I32(x as i32)),
-+        IrType::I64 => Some(IrConst::I64(v)),
-+        IrType::U64 => Some(IrConst::I64(v)),
-+        _ => None,
-+    }
-+}
-+
-+/// The `lo`/`hi` bounds of a shared-value range, with lo <= hi in the value's
-+/// domain. `and_form` selects `&&` (inside) vs `||` (outside).
-+struct Range {
-+    lo: i64,
-+    hi: i64,
-+    value: Value,
-+    ty: IrType,
-+}
-+
-+/// Follow a chain of Cast definitions back to the root value, recording the
-+/// (from_ty, to_ty) steps. Two operands are the same comparison operand iff
-+/// their root AND their full cast chain match (an i8→i32 zero-extension is
-+/// not the same operand as an i16→i32 sign-extension).
-+fn follow_casts(mut v: Value, cast_defs: &[Option<(Operand, IrType, IrType)>]) -> (Value, Vec<(IrType, IrType)>) {
-+    let mut chain = Vec::new();
-+    loop {
-+        let idx = v.0 as usize;
-+        match cast_defs.get(idx).and_then(|x| x.as_ref()) {
-+            Some((Operand::Value(src), from_ty, to_ty)) => {
-+                chain.push((*from_ty, *to_ty));
-+                v = *src;
-+            }
-+            _ => break,
-+        }
-+    }
-+    (v, chain)
-+}
-+
-+/// Match the two arms of a short-circuit select against the same value and
-+/// extract the constant range. `and_form`:
-+///   true  → `x >= lo && x <= hi` (inclusive both ends)
-+///   false → `x <  lo || x >  hi` (exclusive both ends, outside the range)
-+fn extract_range(
-+    a: &Bound,
-+    b: &Bound,
-+    and_form: bool,
-+    cast_defs: &[Option<(Operand, IrType, IrType)>],
-+) -> Option<Range> {
-+    if a.ty != b.ty || a.signed != b.signed {
-+        return None;
-+    }
-+    // The two comparison operands must be the same value. The lowering casts
-+    // the operand once per comparison (e.g. two separate `u8 -> i32` casts of
-+    // the same byte), so compare the cast-chain canonical form, not the raw
-+    // value id.
-+    if follow_casts(a.value, cast_defs) != follow_casts(b.value, cast_defs) {
-+        return None;
-+    }
-+    let (lo, hi) = if and_form {
-+        match (a.kind, b.kind) {
-+            (BoundKind::InclLower, BoundKind::InclUpper) => (a.bound, b.bound),
-+            (BoundKind::InclUpper, BoundKind::InclLower) => (b.bound, a.bound),
-+            _ => return None,
-+        }
-+    } else {
-+        match (a.kind, b.kind) {
-+            (BoundKind::ExclUpper, BoundKind::ExclLower) => (a.bound, b.bound),
-+            (BoundKind::ExclLower, BoundKind::ExclUpper) => (b.bound, a.bound),
-+            _ => return None,
-+        }
-+    };
-+    if lo > hi {
-+        return None;
-+    }
-+    Some(Range { lo, hi, value: a.value, ty: a.ty })
-+}
-+
-+/// Fold one `Select` into a range check when it matches. Returns the
-+/// replacement instruction sequence (1-3 instructions) and consumes a fresh
-+/// value id when needed.
-+fn try_fold_select(
-+    inst: &Instruction,
-+    cmp_defs: &[Option<(IrCmpOp, Operand, Operand, IrType)>],
-+    cast_defs: &[Option<(Operand, IrType, IrType)>],
-+    next_id: &mut u32,
-+) -> Option<Vec<Instruction>> {
-+    let Instruction::Select { dest, cond, true_val, false_val, ty } = inst else {
-+        return None;
-+    };
-+    if !ty.is_integer() {
-+        return None;
-+    }
-+
-+    // Resolve the two arms. Both forms have exactly one constant arm and two
-+    // comparison arms.
-+    let (cond_bound, other_bound, and_form): (Bound, Bound, bool) = {
-+        let cond_id = match cond {
-+            Operand::Value(v) => v.0,
-+            _ => return None,
-+        };
-+        let cond_cmp = cmp_defs.get(cond_id as usize)?.as_ref()?;
-+        let cond_bound = canonicalize(cond_cmp.0, &cond_cmp.1, &cond_cmp.2, cond_cmp.3)?;
-+
-+        // `&&`: Select(cond, other, 0).  `||`: Select(cond, 1, other).
-+        if matches!(false_val, Operand::Const(c) if c.to_i64() == Some(0)) {
-+            let other_id = match true_val {
-+                Operand::Value(v) => v.0,
-+                _ => return None,
-+            };
-+            let other_cmp = cmp_defs.get(other_id as usize)?.as_ref()?;
-+            let other_bound = canonicalize(other_cmp.0, &other_cmp.1, &other_cmp.2, other_cmp.3)?;
-+            (cond_bound, other_bound, true)
-+        } else if matches!(true_val, Operand::Const(c) if c.to_i64() == Some(1)) {
-+            let other_id = match false_val {
-+                Operand::Value(v) => v.0,
-+                _ => return None,
-+            };
-+            let other_cmp = cmp_defs.get(other_id as usize)?.as_ref()?;
-+            let other_bound = canonicalize(other_cmp.0, &other_cmp.1, &other_cmp.2, other_cmp.3)?;
-+            (cond_bound, other_bound, false)
-+        } else {
-+            return None;
-+        }
-+    };
-+
-+    let range = extract_range(&cond_bound, &other_bound, and_form, cast_defs)?;
-+
-+    // `hi - lo` must be representable in the operand type.
-+    let span = range.hi - range.lo;
-+    let span_const = int_const(range.ty, span)?;
-+    let lo_const = int_const(range.ty, range.lo)?;
-+
-+    let sub_dest = Value(*next_id);
-+    *next_id += 1;
-+    let mut out = Vec::with_capacity(3);
-+    out.push(Instruction::BinOp {
-+        dest: sub_dest,
-+        op: IrBinOp::Sub,
-+        lhs: Operand::Value(range.value),
-+        rhs: Operand::Const(lo_const),
-+        ty: range.ty,
-+    });
-+    let cmp_op = if and_form { IrCmpOp::Ule } else { IrCmpOp::Ugt };
-+    // The compare result is I8 (boolean). When the Select's result type is I8
-+    // we can use `dest` directly; otherwise widen the boolean to the Select's
-+    // type so every downstream use keeps its type.
-+    if *ty == IrType::I8 {
-+        out.push(Instruction::Cmp {
-+            dest: *dest,
-+            op: cmp_op,
-+            lhs: Operand::Value(sub_dest),
-+            rhs: Operand::Const(span_const),
-+            ty: range.ty,
-+        });
-+    } else {
-+        let cmp_dest = Value(*next_id);
-+        *next_id += 1;
-+        out.push(Instruction::Cmp {
-+            dest: cmp_dest,
-+            op: cmp_op,
-+            lhs: Operand::Value(sub_dest),
-+            rhs: Operand::Const(span_const),
-+            ty: range.ty,
-+        });
-+        out.push(Instruction::Cast {
-+            dest: *dest,
-+            src: Operand::Value(cmp_dest),
-+            from_ty: IrType::I8,
-+            to_ty: *ty,
-+        });
-+    }
-+    Some(out)
-+}
-+
-+/// Run the range-check fold over one function. Returns the number of folds.
-+pub(crate) fn run_function(func: &mut IrFunction) -> usize {
-+    let mut next_id = func.next_value_id;
-+    if next_id == 0 {
-+        next_id = func.max_value_id() + 1;
-+    }
-+
-+    // Def maps: value → its defining comparison / cast.
-+    let max_id = func.max_value_id() as usize;
-+    let mut cmp_defs: Vec<Option<(IrCmpOp, Operand, Operand, IrType)>> = vec![None; max_id + 1];
-+    let mut cast_defs: Vec<Option<(Operand, IrType, IrType)>> = vec![None; max_id + 1];
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
+-                if *ty == IrType::F64 || *ty == IrType::F32 {
 +            match inst {
-+                Instruction::Cmp { dest, op, lhs, rhs, ty } => {
-+                    let idx = dest.0 as usize;
-+                    if idx < cmp_defs.len() {
-+                        cmp_defs[idx] = Some((*op, *lhs, *rhs, *ty));
-+                    }
++                Instruction::BinOp {
++                    dest,
++                    lhs: Operand::Value(lhs),
++                    ty,
++                    ..
++                } if *ty == IrType::F64 || *ty == IrType::F32 => {
+                     hints.insert(dest.0, lhs.0);
+                 }
++                Instruction::Copy {
++                    dest,
++                    src: Operand::Value(src),
++                } => {
++                    hints.insert(dest.0, src.0);
 +                }
-+                Instruction::Cast { dest, src, from_ty, to_ty } => {
-+                    let idx = dest.0 as usize;
-+                    if idx < cast_defs.len() {
-+                        cast_defs[idx] = Some((*src, *from_ty, *to_ty));
++                Instruction::UnaryOp {
++                    dest,
++                    op,
++                    src: Operand::Value(src),
++                    ty,
++                } if !ty.is_float()
++                    && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128)
++                    && matches!(op, IrUnaryOp::Neg | IrUnaryOp::Not | IrUnaryOp::Bswap) =>
++                {
++                    hints.insert(dest.0, src.0);
++                }
++                Instruction::Intrinsic {
++                    dest: Some(dest),
++                    op,
++                    args,
++                    ..
++                } => {
++                    if matches!(
++                        op,
++                        IntrinsicOp::SqrtF64
++                            | IntrinsicOp::SqrtF32
++                            | IntrinsicOp::FabsF64
++                            | IntrinsicOp::FabsF32
++                    ) {
++                        if let [Operand::Value(src)] = args.as_slice() {
++                            hints.insert(dest.0, src.0);
++                        }
 +                    }
 +                }
 +                _ => {}
-+            }
-+        }
-+    }
-+
-+    let mut changes = 0usize;
-+    for block in &mut func.blocks {
-+        let mut new_insts: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
-+        for inst in block.instructions.drain(..) {
-+            if let Some(replacements) = try_fold_select(&inst, &cmp_defs, &cast_defs, &mut next_id) {
-+                changes += 1;
-+                new_insts.extend(replacements);
-+            } else {
-+                new_insts.push(inst);
-+            }
-+        }
-+        block.instructions = new_insts;
-+    }
-+    func.next_value_id = next_id;
-+    changes
-+}
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+
-+    #[test]
-+    fn canonicalize_lower_upper() {
-+        let lo = Operand::Const(IrConst::I32(97));
-+        let hi = Operand::Const(IrConst::I32(122));
-+        let x = Operand::Value(Value(1));
-+
-+        let b1 = canonicalize(IrCmpOp::Sge, &x, &lo, IrType::I32).unwrap();
-+        assert_eq!(b1.kind, BoundKind::InclLower);
-+        assert_eq!(b1.bound, 97);
-+
-+        let b2 = canonicalize(IrCmpOp::Sle, &x, &hi, IrType::I32).unwrap();
-+        assert_eq!(b2.kind, BoundKind::InclUpper);
-+        assert_eq!(b2.bound, 122);
-+
-+        // Constant on the LHS: `97 <= x` is the same lower-inclusive bound.
-+        let b3 = canonicalize(IrCmpOp::Sle, &lo, &x, IrType::I32).unwrap();
-+        assert_eq!(b3.kind, BoundKind::InclLower);
-+        assert_eq!(b3.bound, 97);
-+    }
-+
-+    #[test]
-+    fn extract_and_range() {
-+        let x = Value(1);
-+        let no_casts: Vec<Option<(Operand, IrType, IrType)>> = vec![None; 8];
-+        let lo = Bound { value: x, bound: 97, ty: IrType::I32, kind: BoundKind::InclLower, signed: true };
-+        let hi = Bound { value: x, bound: 122, ty: IrType::I32, kind: BoundKind::InclUpper, signed: true };
-+        let r = extract_range(&lo, &hi, true, &no_casts).unwrap();
-+        assert_eq!((r.lo, r.hi), (97, 122));
-+
-+        // Swapped order still matches.
-+        let r2 = extract_range(&hi, &lo, true, &no_casts).unwrap();
-+        assert_eq!((r2.lo, r2.hi), (97, 122));
-+
-+        // Reversed range (lo > hi) is not a valid inclusive range.
-+        let bad = Bound { value: x, bound: 122, ty: IrType::I32, kind: BoundKind::InclLower, signed: true };
-+        assert!(extract_range(&bad, &hi, true, &no_casts).is_none());
-+    }
-+
-+    #[test]
-+    fn follow_casts_matches_identical_chains() {
-+        // Two separate u8->i32 casts of the same root are the same operand.
-+        let x = Value(1);
-+        let mut cast_defs: Vec<Option<(Operand, IrType, IrType)>> = vec![None; 16];
-+        cast_defs[4] = Some((Operand::Value(x), IrType::U8, IrType::I32));
-+        cast_defs[8] = Some((Operand::Value(x), IrType::U8, IrType::I32));
-+        assert_eq!(follow_casts(Value(4), &cast_defs), follow_casts(Value(8), &cast_defs));
-+
-+        // A different cast chain (i16->i32) is a different operand.
-+        cast_defs[8] = Some((Operand::Value(x), IrType::I16, IrType::I32));
-+        assert_ne!(follow_casts(Value(4), &cast_defs), follow_casts(Value(8), &cast_defs));
-+    }
-+}
+             }
+         }
+     }
 -- 
 2.47.3
 
 
-From 8297ecc7aec7129307332f1c03098ea7a287ca58 Mon Sep 17 00:00:00 2001
-From: lccc-v8 <v8@localhost>
-Date: Thu, 13 Aug 2026 21:33:41 +0000
-Subject: [PATCH 6/7] =?UTF-8?q?v8:=20audit=20report=20=E2=80=94=20range-ch?=
- =?UTF-8?q?eck=20folding=20section?=
+From b465af33763eb48425042080ff6b71aa61c1ff83 Mon Sep 17 00:00:00 2001
+From: lccc-v9 <v9@localhost>
+Date: Thu, 13 Aug 2026 22:22:18 +0000
+Subject: [PATCH 2/4] v9: keep short-circuit || diamonds branchy in
+ if-conversion
+
+ (a || b) if-converts to a cmov chain, but its whole point is
+short-circuit evaluation: a branch is cheaper and lets the backend fuse each
+compare straight into a jump (no setcc+movzbl+test+cmov per link). Skip
+if-conversion when every converted phi has the || shape (true arm == const 1)
+and its result is consumed only by control flow (branch conditions, boolean
+negations Cmp(Eq/Ne,0/1), Select conditions, through Copy/Cast/Phi edges).
+
+The && shape (false arm == const 0) is still converted, because that is the
+Select(cond, Cmp, 0) pattern the range-check fold collapses into one sub+cmp,
+which then fuses into the surrounding || branch.
+
+Measured: expat_xml_scan 3.13x -> 2.90x; regression 127 passed / 0 failed,
+correctness 50/50, intrinsics 3/3. New unit tests test_value_only_controls_branch
+and test_skip_boolean_diamond_or_shape.
+---
+ src/passes/if_convert.rs | 297 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 296 insertions(+), 1 deletion(-)
+
+diff --git a/src/passes/if_convert.rs b/src/passes/if_convert.rs
+index 73ff16d8..a1a21e60 100644
+--- a/src/passes/if_convert.rs
++++ b/src/passes/if_convert.rs
+@@ -41,6 +41,7 @@ use crate::ir::reexports::{
+     BasicBlock,
+     BlockId,
+     Instruction,
++    IrCmpOp,
+     IrFunction,
+     Operand,
+     Terminator,
+@@ -48,7 +49,7 @@ use crate::ir::reexports::{
+ };
+ use crate::ir::analysis;
+ use crate::common::types::IrType;
+-use crate::common::fx_hash::FxHashMap;
++use crate::common::fx_hash::{FxHashMap, FxHashSet};
+ 
+ /// Run if-conversion on a single function.
+ pub(crate) fn if_convert_function(func: &mut IrFunction) -> usize {
+@@ -249,6 +250,139 @@ fn same_value_or_both_zero(a: &Operand, b: &Operand) -> bool {
+     }
+ }
+ 
++/// Whether `v` is consumed only by control flow (never materialized as data),
++/// so the branchy form is at least as good as a cmov Select. Recursively
++/// follows boolean-preserving edges: `Cmp(Eq/Ne, 0/1)`, `Select` conditions,
++/// `Copy`, `Cast`, and `Phi` incoming values.
++fn value_only_controls_branch(func: &IrFunction, v: Value, visited: &mut FxHashSet<u32>) -> bool {
++    if !visited.insert(v.0) {
++        return true; // cycle: nothing data-like seen yet
++    }
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            match inst {
++                Instruction::Cmp { dest, op, lhs, rhs, .. } => {
++                    if matches!(lhs, Operand::Value(x) if x.0 == v.0)
++                        || matches!(rhs, Operand::Value(x) if x.0 == v.0)
++                    {
++                        // Only a boolean negation (v == 0 / v != 0 / v == 1 / v != 1)
++                        // preserves branch-likeness; any other comparison is data.
++                        let other = if matches!(lhs, Operand::Value(x) if x.0 == v.0) {
++                            rhs
++                        } else {
++                            lhs
++                        };
++                        let is_bool_cmp = matches!(op, IrCmpOp::Eq | IrCmpOp::Ne)
++                            && matches!(other, Operand::Const(c) if c.to_i64() == Some(0) || c.to_i64() == Some(1));
++                        if !is_bool_cmp || !value_only_controls_branch(func, *dest, visited) {
++                            return false;
++                        }
++                    }
++                }
++                Instruction::Select {
++                    dest,
++                    cond,
++                    true_val,
++                    false_val,
++                    ..
++                } => {
++                    if matches!(cond, Operand::Value(x) if x.0 == v.0) {
++                        if !value_only_controls_branch(func, *dest, visited) {
++                            return false;
++                        }
++                    } else if matches!(true_val, Operand::Value(x) if x.0 == v.0)
++                        || matches!(false_val, Operand::Value(x) if x.0 == v.0)
++                    {
++                        return false; // selected as a data value
++                    }
++                }
++                Instruction::Copy { dest, src, .. } => {
++                    if matches!(src, Operand::Value(x) if x.0 == v.0)
++                        && !value_only_controls_branch(func, *dest, visited)
++                    {
++                        return false;
++                    }
++                }
++                Instruction::Cast { dest, src, .. } => {
++                    if matches!(src, Operand::Value(x) if x.0 == v.0)
++                        && !value_only_controls_branch(func, *dest, visited)
++                    {
++                        return false;
++                    }
++                }
++                Instruction::Phi { dest, incoming, .. } => {
++                    for (op, _) in incoming {
++                        if matches!(op, Operand::Value(x) if x.0 == v.0)
++                            && !value_only_controls_branch(func, *dest, visited)
++                        {
++                            return false;
++                        }
++                    }
++                }
++                other => {
++                    let mut used = false;
++                    other.for_each_used_value(|u| {
++                        if u == v.0 {
++                            used = true;
++                        }
++                    });
++                    if used {
++                        return false; // data use (binop operand, store, call arg, ...)
++                    }
++                }
++            }
++        }
++        match &block.terminator {
++            // A branch condition is control flow — fine.
++            Terminator::CondBranch { cond, .. }
++                if matches!(cond, Operand::Value(x) if x.0 == v.0) => {}
++            // Return/Switch/IndirectBranch use the value as data.
++            Terminator::Return(Some(op)) if matches!(op, Operand::Value(x) if x.0 == v.0) => {
++                return false;
++            }
++            Terminator::Switch { val, .. } if matches!(val, Operand::Value(x) if x.0 == v.0) => {
++                return false;
++            }
++            Terminator::IndirectBranch { target, .. }
++                if matches!(target, Operand::Value(x) if x.0 == v.0) =>
++            {
++                return false;
++            }
++            _ => {}
++        }
++    }
++    true
++}
++
++/// Skip if-conversion for a short-circuit `||` diamond whose result is
++/// consumed only by control flow. `cond ? 1 : rhs` (`||`) materializes as a
++/// cmov chain, but its whole point is short-circuit evaluation — a branch is
++/// cheaper and lets the backend fuse each compare straight into a jump (no
++/// setcc+movzbl+test+cmov per link). Keeping the branchy form is the
++/// difference between GCC's Expat codegen (`cmpb $X,%dl; ja`) and a wall of
++/// setcc/cmov.
++///
++/// Only the `||` form (true arm == constant 1) is skipped. The `&&` form
++/// (false arm == constant 0) is intentionally still converted: if-converting
++/// it exposes the `Select(cond, Cmp, 0)` pattern the range-check fold
++/// collapses into a single `sub`+`cmp`, which then fuses into the `||` branch.
++fn skip_boolean_diamond(func: &IrFunction, phi_selects: &[(Value, IrType, Operand, Operand)]) -> bool {
++    if phi_selects.is_empty() {
++        return false;
++    }
++    // Every converted phi must be the `||` shape: `cond ? 1 : rhs`.
++    let all_or = phi_selects
++        .iter()
++        .all(|(_, _, tv, _fv)| matches!(tv, Operand::Const(c) if c.to_i64() == Some(1)));
++    if !all_or {
++        return false;
++    }
++    let mut visited = FxHashSet::default();
++    phi_selects
++        .iter()
++        .all(|(dest, _, _, _)| value_only_controls_branch(func, *dest, &mut visited))
++}
++
+ /// Detect a diamond pattern starting from a block with a CondBranch terminator.
+ fn detect_diamond(
+     func: &IrFunction,
+@@ -377,6 +511,11 @@ fn detect_diamond(
+         return None; // No convertible phis
+     }
+ 
++    // Keep short-circuit boolean diamonds branchy (see skip_boolean_diamond).
++    if skip_boolean_diamond(func, &phi_selects) {
++        return None;
++    }
++
+     // The merge block should only be reached from the two arms (and not from pred directly).
+     // If the merge block has other predecessors, we need to preserve the Phi nodes for those.
+     let merge_preds_from_diamond = preds.row(merge_idx).iter()
+@@ -549,6 +688,11 @@ fn detect_triangle(
+         return None;
+     }
+ 
++    // Keep short-circuit boolean diamonds branchy (see skip_boolean_diamond).
++    if skip_boolean_diamond(func, &phi_selects) {
++        return None;
++    }
++
+     // For a triangle, we set the missing arm to merge_idx with empty instructions.
+     // apply_diamond will hoist the arm instructions and the empty side is a no-op.
+     let (true_idx_out, false_idx_out, true_insts, false_insts) = if arm_is_true {
+@@ -667,6 +811,157 @@ mod tests {
+     use crate::common::types::AddressSpace;
+     use crate::ir::reexports::{IrBinOp, IrConst};
+ 
++    #[test]
++    fn test_value_only_controls_branch() {
++        // v used only as a CondBranch condition => branch-only.
++        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
++        func.blocks.push(BasicBlock {
++            label: BlockId(0),
++            instructions: vec![Instruction::ParamRef {
++                dest: Value(0),
++                param_idx: 0,
++                ty: IrType::I32,
++            }],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Value(Value(0)),
++                true_label: BlockId(1),
++                false_label: BlockId(2),
++            },
++            source_spans: Vec::new(),
++        });
++        let mut visited = FxHashSet::default();
++        assert!(value_only_controls_branch(&func, Value(0), &mut visited));
++
++        // v returned as data => not branch-only.
++        func.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(0))));
++        let mut visited = FxHashSet::default();
++        assert!(!value_only_controls_branch(&func, Value(0), &mut visited));
++
++        // v used by Cmp(Eq, 0) whose result feeds a CondBranch => branch-only.
++        let mut func2 = IrFunction::new("t2".to_string(), IrType::I32, vec![], false);
++        func2.blocks.push(BasicBlock {
++            label: BlockId(0),
++            instructions: vec![
++                Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 },
++                Instruction::Cmp {
++                    dest: Value(1),
++                    op: IrCmpOp::Eq,
++                    lhs: Operand::Value(Value(0)),
++                    rhs: Operand::Const(IrConst::I32(0)),
++                    ty: IrType::I32,
++                },
++            ],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Value(Value(1)),
++                true_label: BlockId(1),
++                false_label: BlockId(2),
++            },
++            source_spans: Vec::new(),
++        });
++        let mut visited = FxHashSet::default();
++        assert!(value_only_controls_branch(&func2, Value(0), &mut visited));
++    }
++
++    #[test]
++    fn test_skip_boolean_diamond_or_shape() {
++        // `||` shape: true arm == const 1, result only feeds a branch => skip.
++        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
++        func.blocks.push(BasicBlock {
++            label: BlockId(0),
++            instructions: vec![Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 }],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Value(Value(0)),
++                true_label: BlockId(1),
++                false_label: BlockId(2),
++            },
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(1),
++            instructions: vec![],
++            terminator: Terminator::Branch(BlockId(3)),
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(2),
++            instructions: vec![],
++            terminator: Terminator::Branch(BlockId(3)),
++            source_spans: Vec::new(),
++        });
++        func.blocks.push(BasicBlock {
++            label: BlockId(3),
++            instructions: vec![Instruction::Phi {
++                dest: Value(3),
++                ty: IrType::I32,
++                incoming: vec![
++                    (Operand::Const(IrConst::I32(1)), BlockId(1)),
++                    (Operand::Value(Value(4)), BlockId(2)),
++                ],
++            }],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Value(Value(3)),
++                true_label: BlockId(4),
++                false_label: BlockId(5),
++            },
++            source_spans: Vec::new(),
++        });
++        func.next_value_id = 6;
++
++        // `||` shape, branch-only => skipped (not converted).
++        let label_to_idx = analysis::build_label_map(&func);
++        let (preds, _) = analysis::build_cfg(&func, &label_to_idx);
++        let diamond = detect_diamond(&func, 0, &label_to_idx, &preds);
++        assert!(diamond.is_none(), "branch-only `||` diamond must not be converted");
++
++        // `&&` shape (false arm == const 0) => still converted (range fold needs it).
++        let mut func2 = IrFunction::new("t2".to_string(), IrType::I32, vec![], false);
++        func2.blocks.push(BasicBlock {
++            label: BlockId(0),
++            instructions: vec![Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 }],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Value(Value(0)),
++                true_label: BlockId(1),
++                false_label: BlockId(2),
++            },
++            source_spans: Vec::new(),
++        });
++        func2.blocks.push(BasicBlock {
++            label: BlockId(1),
++            instructions: vec![],
++            terminator: Terminator::Branch(BlockId(3)),
++            source_spans: Vec::new(),
++        });
++        func2.blocks.push(BasicBlock {
++            label: BlockId(2),
++            instructions: vec![],
++            terminator: Terminator::Branch(BlockId(3)),
++            source_spans: Vec::new(),
++        });
++        func2.blocks.push(BasicBlock {
++            label: BlockId(3),
++            instructions: vec![Instruction::Phi {
++                dest: Value(3),
++                ty: IrType::I32,
++                incoming: vec![
++                    (Operand::Value(Value(4)), BlockId(1)),
++                    (Operand::Const(IrConst::I32(0)), BlockId(2)),
++                ],
++            }],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Value(Value(3)),
++                true_label: BlockId(4),
++                false_label: BlockId(5),
++            },
++            source_spans: Vec::new(),
++        });
++        func2.next_value_id = 6;
++        let label_to_idx2 = analysis::build_label_map(&func2);
++        let (preds2, _) = analysis::build_cfg(&func2, &label_to_idx2);
++        assert!(detect_diamond(&func2, 0, &label_to_idx2, &preds2).is_some(),
++                "branch-only `&&` diamond must still be converted for range folding");
++    }
++
++
+     #[test]
+     fn test_simple_diamond_conversion() {
+         // Build a simple diamond:
+-- 
+2.47.3
+
+
+From f5a349342fafbf6cac47510fdd346a5914ec41fd Mon Sep 17 00:00:00 2001
+From: lccc-v9 <v9@localhost>
+Date: Thu, 13 Aug 2026 22:22:18 +0000
+Subject: [PATCH 3/4] v9: fuse Cmp->Cast->branch flag chains (extend the
+ pending-flag handshake)
+
+The fused Cmp chain walk (prologue.rs) previously allowed only flag-neutral
+Copy instructions between a Cmp and its Select/CondBranch consumer. Extend it
+to integer Casts (mov/movzx/movsx leave the flags intact), so the range-check
+fold's Cmp -> Cast(bool, I8->I64) -> CondBranch fuses into a single cmp;jcc
+instead of setcc+movzbl+test. The Cast destination must still have exactly
+one use (only the next chain link or the consumer), preserving the existing
+soundness rule that every fused value is read exactly once.
+
+Measured with the || skip: expat's first range check now emits
+'sub /bin/bashx61; cmp /bin/bashx19; ja' with no boolean materialization.
+---
+ src/backend/x86/codegen/prologue.rs | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
+index fff96595..a98574fb 100644
+--- a/src/backend/x86/codegen/prologue.rs
++++ b/src/backend/x86/codegen/prologue.rs
+@@ -376,6 +376,25 @@ impl X86Codegen {
+                                     cur = cd.0;
+                                     k += 1;
+                                 }
++                                // A widening/shrinking integer Cast of the
++                                // boolean is also flag-neutral: it emits a
++                                // plain mov/movzx/movsx that leaves the Cmp's
++                                // flags intact, and (like the Copy above) its
++                                // destination is never read by anything other
++                                // than the next chain link or the consumer.
++                                // This is what lets the range-check fold's
++                                // `Cmp -> Cast(bool, I8->I64) -> CondBranch`
++                                // fuse into `cmp; jcc` (Expat's name scanner).
++                                Instruction::Cast { dest: cd, src: Operand::Value(sv), from_ty, to_ty }
++                                    if sv.0 == cur && from_ty.is_integer() && to_ty.is_integer() =>
++                                {
++                                    if use_counts.get(&cd.0).copied().unwrap_or(0) != 1 {
++                                        chain_single_use = false;
++                                        break;
++                                    }
++                                    cur = cd.0;
++                                    k += 1;
++                                }
+                                 Instruction::Select { cond: Operand::Value(v), .. } if v.0 == cur => {
+                                     // The copy chain must terminate here (the
+                                     // final value has exactly one use: this
+-- 
+2.47.3
+
+
+From ecc5607f4d715d03c92ba5a5ec912dfd5b5e59ec Mon Sep 17 00:00:00 2001
+From: lccc-v9 <v9@localhost>
+Date: Thu, 13 Aug 2026 22:22:45 +0000
+Subject: [PATCH 4/4] =?UTF-8?q?v9:=20audit=20report=20=E2=80=94=20hint=20e?=
+ =?UTF-8?q?xtensions=20+=20branchy=20short-circuit=20||?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
 ---
- SIMD_REDTEAM_AUDIT.md | 37 +++++++++++++++++++++++++++++++------
- 1 file changed, 31 insertions(+), 6 deletions(-)
+ SIMD_REDTEAM_AUDIT.md | 37 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
 
 diff --git a/SIMD_REDTEAM_AUDIT.md b/SIMD_REDTEAM_AUDIT.md
-index 9d26b5e7..4080b4be 100644
+index 4080b4be..9f61c874 100644
 --- a/SIMD_REDTEAM_AUDIT.md
 +++ b/SIMD_REDTEAM_AUDIT.md
-@@ -602,14 +602,39 @@ zlib_ng_adler32 1.746x).
- 25/25 correct, geomean 0.953 vs gcc (v7: 0.951); sqlite_varint + zlib_ng_adler32
- bit-exact. New unit test `test_conflicts_with_die_at_birth`.
+@@ -625,6 +625,43 @@ Measured: expat 3.28x -> 3.13x, hash_table 1.38x -> 1.31x,
+ loop_patterns 1.85x -> 1.80x; no regressions; corpus 25/25 correct.
+ Differential test (all byte values + INT_MIN/MAX + LLONG edges) bit-exact vs gcc.
  
-+## v8 — range-check folding (branch/boolean domain, part 1)
++## v9 — hint extensions + branchy short-circuit || (branch/boolean, part 2)
 +
-+`a && b` / `a || b` lower to short-circuit control flow; if-conversion turns
-+that into `Select` chains. A new pass (`src/passes/range_check.rs`, runs right
-+after if-conversion) folds the shared-value constant-bound form:
++**Producer-follow hints extended** beyond FP BinOp LHS to every instruction
++whose emitter computes into the destination with the operand pre-loaded:
++`Copy` (no-op when registers match), GPR unary `Neg/Not/Bswap`
++(`emit_unaryop_impl` loads src into dest then `neg %reg`), and scalar FP
++`Sqrt/Fabs` (`emit_fp_scalar_unary` / Fabs loads arg into dest). Measured
++wall-clock neutral (copy_prop already forwards most GPR copies; the remaining
++mov chains come from casts) — but the mechanism is now general as designed.
 +
-+    x >= lo && x <= hi  =>  (unsigned)(x - lo) <= (hi - lo)      (lo <= hi)
-+    x <  lo || x >  hi  =>  (unsigned)(x - lo) >  (hi - lo)
++**Short-circuit `||` diamonds stay branchy.** `cond ? 1 : rhs` if-converts to a
++cmov chain, but short-circuiting IS a branch — a branch is cheaper and lets the
++backend fuse the compare into the jump. `if_convert` now skips diamonds whose
++phis are all `||`-shaped (true arm == 1) and whose results are consumed only by
++control flow (`value_only_controls_branch`: branch conds, `Cmp(Eq/Ne,0/1)`,
++Select conds, through Copy/Cast/Phi edges). The `&&` shape is still converted
++so the range-check fold can collapse it, and its result then fuses into the
++surrounding `||` branch.
 +
-+Wraparound subtraction sends out-of-range values huge, so one unsigned compare
-+classifies the range; valid for signed/unsigned comparisons in any width when
-+hi-lo is representable. The two arms are matched through their cast chains (the
-+lowering casts the operand once per comparison), and the boolean result keeps
-+the Select's type so downstream uses are unchanged.
++**Flag fusion extended through integer Casts.** The fused Cmp chain walk
++(prologue.rs) now allows flag-neutral integer Casts between the Cmp and its
++consumer, so the range fold's `Cmp -> Cast(bool, I8->I64) -> CondBranch` fuses
++into `sub; cmp; ja` (the Cast dest must still be single-use).
 +
-+Supporting change in `simplify`: `Cast(Cast(x, A->B), B->C)` with B strictly
-+widest collapses to `Cast(x, A->C)` (complements the existing double-widen /
-+double-narrow folds; covers the C-promotion idiom the range fold emits).
++Measured: **expat_xml_scan 3.13x -> 2.89x**, corpus geomean 0.9537 -> 0.9457,
++sqlite_varint back to 2.09x, no regressions. Regression 127/127, correctness
++50/50, intrinsics 3/3, 597 lib tests. New unit tests
++`test_value_only_controls_branch`, `test_skip_boolean_diamond_or_shape`.
 +
-+Measured: expat 3.28x -> 3.13x, hash_table 1.38x -> 1.31x,
-+loop_patterns 1.85x -> 1.80x; no regressions; corpus 25/25 correct.
-+Differential test (all byte values + INT_MIN/MAX + LLONG edges) bit-exact vs gcc.
++**Remaining in this domain:** the inner `||` links still materialize because
++the short-circuit lowering stores the RHS boolean to the result alloca
++(`store rhs_bool` + phi), so only the first link of each `||` level fuses. The
++clean fix is *branch-on-logical* at lowering time (when the `&&`/`||` result is
++used only as a condition, emit pure branches instead of a value + phi), plus
++GPR copy/param coalescing for the byte-load `mov %esi,%r15d; mov %r15d,%ebp`
++chains.
 +
  ## v8 roadmap (remaining)
  
--1. **Branch/boolean domain** (expat 3.2x, sqlite_varint 2.1x): range-check
--   folding `(x>=lo && x<=hi) -> (unsigned)(x-lo) <= hi-lo`, fused
--   compare-to-branch for short-circuit booleans, and GPR boolean coalescing
--   (redundant `movl %esi,%ebp; movl %ebp,%r15d` copies). GCC's approach for
--   expat is direct `cmpb $X,%dl; ja/jle` range branches with zero boolean
--   materialization.
-+1. **Branch/boolean domain, part 2** (expat still ~3.1x): the range check now
-+   collapses to one `sub`+`cmp`, but the boolean is still MATERIALIZED
-+   (`setcc; movzbl; test; cmov`) because the `||` chain routes each result
-+   through a Select. GCC fuses the compare straight into the branch
-+   (`cmpb $-17,%dl; ja`) with zero materialization. Remaining work:
-+   fused compare-to-branch for short-circuit chains (extend the existing
-+   `take_pending_cmp` flag fusion past Cast/Select), and GPR boolean copy
-+   coalescing (redundant `movl %esi,%ebp; movl %ebp,%r15d`).
- 2. **Parameter register allocation** (nbody's `movq %xmm0,216(%rsp)` at entry).
- 3. Loop-carried scalar accumulator in an XMM register (the last 2 movsd/iter in
-    reduction loops).
--- 
-2.47.3
-
-
-From ad3403f68045f3f2a9c84f00a456d4cab725ac79 Mon Sep 17 00:00:00 2001
-From: lccc-v8 <v8@localhost>
-Date: Thu, 13 Aug 2026 21:36:27 +0000
-Subject: [PATCH 7/7] v8: fix range_check unit tests (BoundKind Debug,
- corrected reversed-range case)
-
----
- src/passes/range_check.rs | 13 ++++++++++---
- 1 file changed, 10 insertions(+), 3 deletions(-)
-
-diff --git a/src/passes/range_check.rs b/src/passes/range_check.rs
-index 07be1c79..7c901f60 100644
---- a/src/passes/range_check.rs
-+++ b/src/passes/range_check.rs
-@@ -36,7 +36,7 @@ struct Bound {
-     signed: bool,
- }
- 
--#[derive(Clone, Copy, PartialEq, Eq)]
-+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
- enum BoundKind {
-     /// x >= c  (or c <= x)
-     InclLower,
-@@ -352,9 +352,16 @@ mod tests {
-         let r2 = extract_range(&hi, &lo, true, &no_casts).unwrap();
-         assert_eq!((r2.lo, r2.hi), (97, 122));
- 
--        // Reversed range (lo > hi) is not a valid inclusive range.
-+        // Reversed range (lo > hi) is not a valid inclusive range:
-+        // x >= 122 && x <= 97 is empty, so it must not fold.
-         let bad = Bound { value: x, bound: 122, ty: IrType::I32, kind: BoundKind::InclLower, signed: true };
--        assert!(extract_range(&bad, &hi, true, &no_casts).is_none());
-+        let low_hi = Bound { value: x, bound: 97, ty: IrType::I32, kind: BoundKind::InclUpper, signed: true };
-+        assert!(extract_range(&bad, &low_hi, true, &no_casts).is_none());
-+
-+        // A collapsed range (x >= 122 && x <= 122) IS foldable (== 122).
-+        let both = Bound { value: x, bound: 122, ty: IrType::I32, kind: BoundKind::InclUpper, signed: true };
-+        let r3 = extract_range(&bad, &both, true, &no_casts).unwrap();
-+        assert_eq!((r3.lo, r3.hi), (122, 122));
-     }
- 
-     #[test]
+ 1. **Branch/boolean domain, part 2** (expat still ~3.1x): the range check now
 -- 
 2.47.3
 
