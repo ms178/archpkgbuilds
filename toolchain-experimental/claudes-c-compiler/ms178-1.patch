@@ -1,1059 +1,449 @@
-diff --git a/src/driver/cli.rs b/src/driver/cli.rs
-index 8cc6e493..2a4a71aa 100644
---- a/src/driver/cli.rs
-+++ b/src/driver/cli.rs
-@@ -924,6 +924,16 @@ impl Driver {
-                 }
-                 "-fprofile-arcs" => self.pgo_generate = Some(".".to_string()),
-                 "-ftest-coverage" => self.pgo_generate = Some(".".to_string()),
-+                arg if arg.starts_with("-fprofile-update=") => {
-+                    // GCC 7+/LLVM 17+ semantics: single (default, non-atomic),
-+                    // atomic (lock-prefixed), prefer-atomic (atomic when the
-+                    // target supports it — x86-64 always does).
-+                    let m = arg["-fprofile-update=".len()..].to_string();
-+                    self.pgo_update = Some(match m.as_str() {
-+                        "atomic" | "prefer-atomic" => "atomic".to_string(),
-+                        _ => "single".to_string(),
-+                    });
-+                }
-                 "-fbranch-probabilities" => self.pgo_use = Some(self.pgo_use.clone().unwrap_or_else(|| ".".to_string())),
-                 arg if arg.starts_with("-fprofile-dir=") => {
-                     let path = arg["-fprofile-dir=".len()..].to_string();
-diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
-index 154a1c1c..424bfad1 100644
---- a/src/driver/pipeline.rs
-+++ b/src/driver/pipeline.rs
-@@ -1338,6 +1338,13 @@ impl Driver {
-             crate::pgo::init_pgo_profile(pgo_use_dir.as_deref());
-             let u0 = crate::pgo::profile::unit_identity(input_file);
-             crate::pgo::prepass_activate(&u0);
-+            // v8: build the data-driven profile summary (percentile hot/cold
-+            // thresholds over the unit's count distribution — LLVM
-+            // ProfileSummaryInfo analogue) once per unit; inliner, unroller
-+            // and layout all consume it.
-+            if let Some(p) = crate::pgo::get_pgo_profile() {
-+                crate::pgo::summary::set_summary(crate::pgo::summary::build_for_unit(p, &u0));
-+            }
-         }
- 
-         // Run optimization passes
-@@ -1496,6 +1503,10 @@ impl Driver {
-             use crate::ir::instruction::BlockId;
-             use crate::common::fx_hash::FxHashMap;
-             let mut next_global_label = 0u32;
-+            // v8: the renumber map also translates the promoted-hot block
-+            // labels recorded by the value-profiling promotion pass (which
-+            // runs before this pass); layout reads them AFTER renumbering.
-+            let mut renumber_map: FxHashMap<u32, u32> = FxHashMap::default();
- 
-             for func in &mut module.functions {
-                 if func.is_declaration {
-@@ -1507,6 +1518,7 @@ impl Driver {
-                 for block in &func.blocks {
-                     if !label_map.contains_key(&block.label) {
-                         label_map.insert(block.label, BlockId(next_global_label));
-+                        renumber_map.insert(block.label.0, next_global_label);
-                         next_global_label += 1;
-                     }
-                 }
-@@ -1560,6 +1572,7 @@ impl Driver {
-                     }
+diff --git a/src/backend/generation.rs b/src/backend/generation.rs
+index 8f18c197..a0b78d3d 100644
+--- a/src/backend/generation.rs
++++ b/src/backend/generation.rs
+@@ -1600,7 +1600,7 @@ fn generate_function(
                  }
              }
-+            crate::pgo::remap_promoted_hot(&renumber_map);
+         } else {
+-            generate_terminator(cg, &block.terminator, frame_size);
++            generate_terminator(cg, &block.terminator, frame_size, block.label.0);
          }
+         // Count terminator as a program point (matches liveness analysis)
+         cg.state().current_program_point += 1;
+@@ -2246,7 +2246,12 @@ fn generate_store(
+ }
  
-         // PGO is post-optimization and post-label-renumber; profiles are
-diff --git a/src/passes/inline.rs b/src/passes/inline.rs
-index 329f435b..1cbb57d2 100644
---- a/src/passes/inline.rs
-+++ b/src/passes/inline.rs
-@@ -535,14 +535,31 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
-             // PGO: filter/adjust call sites based on profile
-             if let Some(profile) = crate::pgo::get_pgo_profile() {
-                 let caller_name = module.functions[func_idx].name.clone();
-+                // v8: per-call-site hotness. Derive block counts for the
-+                // CURRENT caller CFG from the h0-keyed profile (the CFG may
-+                // have changed since training; derive handles drift
-+                // gracefully) so the decision sees the count of the block
-+                // containing each call (LLVM isHotCallSite/BFI).
-+                let caller_fn = &module.functions[func_idx];
-+                let mut caller_fp = crate::pgo::prepass_profile(&caller_name);
-+                if let Some(fp) = caller_fp.as_mut() {
-+                    crate::pgo::profile::derive_block_counts(caller_fn, fp);
-+                }
-                 // For each call site, check if PGO says to force inline or deny
-                 let mut filtered = Vec::new();
-                 for site in call_sites {
-                     if let Some(callee) = callee_map.get(&site.callee_name) {
-                         // Get callee name
-                         let callee_name = &site.callee_name;
-+                        let site_cnt = caller_fp
-+                            .as_ref()
-+                            .map(|fp| {
-+                                let lbl = module.functions[func_idx].blocks[site.block_idx].label;
-+                                fp.block_count(lbl)
-+                            })
-+                            .unwrap_or(0);
-                         // Check PGO inline decision
--                        if let Some(force) = crate::pgo::inline_pgo::should_inline_normal(
-+                        if let Some(force) = crate::pgo::inline_pgo::should_inline_site(
-                             &module.functions[func_idx],
-                             &{
-                                 // Reconstruct IrFunction for callee from callee_map data
-@@ -576,6 +593,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
-                                 };
-                                 dummy
-                             },
-+                            site_cnt,
-                             Some(profile),
-                         ) {
-                             if force {
-@@ -729,14 +747,31 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
-             // PGO: filter/adjust call sites based on profile
-             if let Some(profile) = crate::pgo::get_pgo_profile() {
-                 let caller_name = module.functions[func_idx].name.clone();
-+                // v8: per-call-site hotness. Derive block counts for the
-+                // CURRENT caller CFG from the h0-keyed profile (the CFG may
-+                // have changed since training; derive handles drift
-+                // gracefully) so the decision sees the count of the block
-+                // containing each call (LLVM isHotCallSite/BFI).
-+                let caller_fn = &module.functions[func_idx];
-+                let mut caller_fp = crate::pgo::prepass_profile(&caller_name);
-+                if let Some(fp) = caller_fp.as_mut() {
-+                    crate::pgo::profile::derive_block_counts(caller_fn, fp);
-+                }
-                 // For each call site, check if PGO says to force inline or deny
-                 let mut filtered = Vec::new();
-                 for site in call_sites {
-                     if let Some(callee) = callee_map.get(&site.callee_name) {
-                         // Get callee name
-                         let callee_name = &site.callee_name;
-+                        let site_cnt = caller_fp
-+                            .as_ref()
-+                            .map(|fp| {
-+                                let lbl = module.functions[func_idx].blocks[site.block_idx].label;
-+                                fp.block_count(lbl)
-+                            })
-+                            .unwrap_or(0);
-                         // Check PGO inline decision
--                        if let Some(force) = crate::pgo::inline_pgo::should_inline_normal(
-+                        if let Some(force) = crate::pgo::inline_pgo::should_inline_site(
-                             &module.functions[func_idx],
-                             &{
-                                 // Reconstruct IrFunction for callee from callee_map data
-@@ -770,6 +805,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
-                                 };
-                                 dummy
-                             },
-+                            site_cnt,
-                             Some(profile),
-                         ) {
-                             if force {
-diff --git a/src/pgo/inline_pgo.rs b/src/pgo/inline_pgo.rs
-index 9e23ecb1..c9f2be83 100644
---- a/src/pgo/inline_pgo.rs
-+++ b/src/pgo/inline_pgo.rs
-@@ -1,15 +1,55 @@
- //! Profile-guided inlining with a bounded, frequency-aware budget.
-+//!
-+//! v8: hotness classification is DATA-DRIVEN via the profile summary
-+//! (`summary::ProfileSummary`, an LLVM `ProfileSummaryInfo` analogue):
-+//! percentile thresholds computed from the unit's count distribution replace
-+//! the v6/v7 magic ratios (`relative_frequency >= 0.10/0.05/0.005`).
-+//! Per-call-site hotness uses the derived count of the block containing the
-+//! call (LLVM `isHotCallSite`/BFI), which is a strictly stronger signal than
-+//! function entry counts for call sites in hot loops.
- use crate::ir::reexports::IrFunction;
- use crate::pgo::ProfileData;
-+
- fn size_opt() -> bool {
-     std::env::var("CFLAGS")
-         .map(|s| s.contains("-Os") || s.contains("-Oz"))
-         .unwrap_or(false)
- }
-+
-+fn entry_counts(caller: &IrFunction, callee: &IrFunction, p: &ProfileData) -> (u64, u64) {
-+    match crate::pgo::active_unit() {
-+        Some(u) => (
-+            crate::pgo::summary::entry_count_for(p, &u, &caller.name),
-+            crate::pgo::summary::entry_count_for(p, &u, &callee.name),
-+        ),
-+        None => (
-+            p.get(&caller.name).map(|f| f.total_count).unwrap_or(0),
-+            p.get(&callee.name).map(|f| f.total_count).unwrap_or(0),
-+        ),
-+    }
-+}
-+
-+/// v8: summary-driven threshold multiplier. When no summary is available the
-+/// v7 relative-frequency ratios are used as a fallback.
- pub fn inline_threshold_multiplier(caller: &str, callee: &str, p: &ProfileData) -> f64 {
-     let cf = p.relative_frequency(caller);
-     let df = p.relative_frequency(callee);
--    if cf >= 0.10 && df >= 0.05 {
-+    if let Some(s) = crate::pgo::summary::get_summary() {
-+        let to_count = |r: f64| (r * s.max as f64) as u64;
-+        let ch = s.is_hot(to_count(cf));
-+        let dh = s.is_hot(to_count(df));
-+        let dc = s.is_cold(to_count(df));
-+        let cc = s.is_cold(to_count(cf));
-+        if ch && dh {
-+            1.75
-+        } else if ch && dc {
-+            0.60
-+        } else if cc {
-+            0.80
-+        } else {
-+            1.0
-+        }
-+    } else if cf >= 0.10 && df >= 0.05 {
-         1.75
-     } else if cf >= 0.10 && df < 0.005 {
-         0.60
-@@ -19,30 +59,93 @@ pub fn inline_threshold_multiplier(caller: &str, callee: &str, p: &ProfileData)
-         1.0
-     }
- }
-+
-+/// Entry-count-only decision (call sites without block info).
- pub fn should_inline_normal(
-     caller: &IrFunction,
-     callee: &IrFunction,
-     p: Option<&ProfileData>,
- ) -> Option<bool> {
-     let p = p?;
--    let cf = p.relative_frequency(&caller.name);
--    let df = p.relative_frequency(&callee.name);
-+    let (cf, df) = entry_counts(caller, callee, p);
-+    should_inline_impl(caller, callee, cf, df, 0, p)
-+}
-+
-+/// v8: call-site-aware decision. `site_count` is the derived count of the
-+/// block containing the call (0 when unknown → entry-count-only behavior).
-+pub fn should_inline_site(
-+    caller: &IrFunction,
-+    callee: &IrFunction,
-+    site_count: u64,
-+    p: Option<&ProfileData>,
-+) -> Option<bool> {
-+    let p = p?;
-+    let (cf, df) = entry_counts(caller, callee, p);
-+    should_inline_impl(caller, callee, cf, df, site_count, p)
-+}
-+
-+fn should_inline_impl(
-+    caller: &IrFunction,
-+    callee: &IrFunction,
-+    cf: u64,
-+    df: u64,
-+    site_count: u64,
-+    p: &ProfileData,
-+) -> Option<bool> {
-     let size: usize = callee.blocks.iter().map(|b| b.instructions.len()).sum();
-+    let (caller_hot, callee_hot, caller_cold, callee_cold, site_hot, site_cold) =
-+        match crate::pgo::summary::get_summary() {
-+            Some(s) => (
-+                s.is_hot(cf),
-+                s.is_hot(df),
-+                s.is_cold(cf),
-+                s.is_cold(df),
-+                site_count > 0 && s.is_hot(site_count),
-+                site_count > 0 && s.is_cold(site_count),
-+            ),
-+            None => {
-+                // Fallback: v7 relative-frequency ratios.
-+                let m = p
-+                    .functions
-+                    .values()
-+                    .map(|x| x.total_count)
-+                    .max()
-+                    .unwrap_or(0);
-+                let r = |c: u64| if m == 0 { 0.0 } else { c as f64 / m as f64 };
-+                (
-+                    r(cf) >= 0.10,
-+                    r(df) >= 0.05,
-+                    r(cf) < 0.005,
-+                    r(df) < 0.001,
-+                    false,
-+                    false,
-+                )
-+            }
-+        };
-     if size_opt() {
--        if cf >= 0.10 && df >= 0.10 && size <= 12 {
-+        if (caller_hot || site_hot) && callee_hot && size <= 12 {
-             return Some(true);
+ /// Dispatch a terminator to the appropriate arch method.
+-fn generate_terminator(cg: &mut dyn ArchCodegen, term: &Terminator, frame_size: i64) {
++fn generate_terminator(
++    cg: &mut dyn ArchCodegen,
++    term: &Terminator,
++    frame_size: i64,
++    block_label: u32,
++) {
+     match term {
+         Terminator::Return(val) => {
+             cg.emit_return(val.as_ref(), frame_size);
+@@ -2270,7 +2275,11 @@ fn generate_terminator(cg: &mut dyn ArchCodegen, term: &Terminator, frame_size:
+             default,
+             ty,
+         } => {
++            // v8 F7: hand the profile-driven switch hint (cold -> chain,
++            // dominant case -> hoist) to the backend for this block.
++            crate::pgo::set_switch_hint(crate::pgo::switch_hint(block_label));
+             cg.emit_switch(val, cases, default, *ty);
++            crate::pgo::set_switch_hint(None);
          }
--        if df < 0.005 && size > 12 {
-+        if (callee_cold || site_cold) && size > 12 {
-             return Some(false);
-         }
-         return None;
-     }
--    // Profile is a hard force only for tiny hot callees. Medium functions stay
--    // under the normal allocator's size budget; this prevents PGO binary bloat.
--    if cf >= 0.10 && df >= 0.05 && size <= 32 {
-+    // Strongest signal: a HOT CALL SITE (the block containing the call is
-+    // hot — LLVM HotCallSiteThreshold). Medium hot callees inline.
-+    if (caller_hot || site_hot) && callee_hot && size <= 48 {
-         return Some(true);
-     }
--    if df < 0.001 && size > 32 {
-+    // Hot caller with a warm call site: inline small callees.
-+    if caller_hot && site_count > 0 && !site_cold && size <= 32 {
-+        return Some(true);
-+    }
-+    // Cold callee or cold call site: deny medium+ callees (keep tiny
-+    // helpers — they cost nothing and keep the cold path self-contained).
-+    if (callee_cold || site_cold) && size > 8 {
-+        return Some(false);
-+    }
-+    if caller_cold && size > 32 {
-         return Some(false);
-     }
-     None
-diff --git a/src/pgo/instrument.rs b/src/pgo/instrument.rs
-index b7a2c16b..8f127843 100644
---- a/src/pgo/instrument.rs
-+++ b/src/pgo/instrument.rs
-@@ -799,47 +799,156 @@ fn dump_helper(
-     next += 1;
-     let fd = Value(next);
-     next += 1;
--    // Entry block: fopen + null check.
-+    // Entry: resolve the output path — LCCC_PROFILE_FILE or (LLVM
-+    // convention) LLVM_PROFILE_FILE override the compile-time path at
-+    // RUNTIME, so training runs can redirect/merge profiles without a
-+    // rebuild (LLVM_PROFILE_FILE / GCC GCOV_PREFIX behaviour). The value is
-+    // used verbatim as the output file path.
-     let skip_l = BlockId(910099);
--    let main_l = BlockId(910001);
-+    let main_l = BlockId(910010);
-+    let pathv = Value(next);
-+    next += 1;
-+    let e1 = Value(next);
-+    next += 1;
-+    let e1z = Value(next);
-+    next += 1;
-+    let e2 = Value(next);
-+    next += 1;
-+    let e2z = Value(next);
-+    next += 1;
-     let is_null = Value(next);
-     next += 1;
--    let mut entry_is: Vec<Instruction> = Vec::new();
--    entry_is.push(Instruction::GlobalAddr {
--        dest: pp,
-+    let env1_sym = format!("__lccc_pgo_env1_{}", m.functions.len());
-+    let env2_sym = format!("__lccc_pgo_env2_{}", m.functions.len());
-+    m.string_literals
-+        .push((env1_sym.clone(), "LCCC_PROFILE_FILE".into()));
-+    m.string_literals
-+        .push((env2_sym.clone(), "LLVM_PROFILE_FILE".into()));
-+    let mut b0: Vec<Instruction> = Vec::new();
-+    let e1p = Value(next);
-+    next += 1;
-+    b0.push(Instruction::GlobalAddr {
-+        dest: e1p,
-+        name: env1_sym.clone(),
-+    });
-+    b0.push(Instruction::Call {
-+        func: "getenv".into(),
-+        info: ci(
-+            Some(e1),
-+            vec![Operand::Value(e1p)],
-+            vec![IrType::Ptr],
-+            IrType::Ptr,
-+            false,
-+        ),
-+    });
-+    b0.push(Instruction::Cmp {
-+        dest: e1z,
-+        op: crate::ir::ops::IrCmpOp::Ne,
-+        lhs: Operand::Value(e1),
-+        rhs: Operand::Const(IrConst::I64(0)),
-+        ty: IrType::I64,
-+    });
-+    let mut b1: Vec<Instruction> = Vec::new();
-+    let e2p = Value(next);
-+    next += 1;
-+    b1.push(Instruction::GlobalAddr {
-+        dest: e2p,
-+        name: env2_sym.clone(),
-+    });
-+    b1.push(Instruction::Call {
-+        func: "getenv".into(),
-+        info: ci(
-+            Some(e2),
-+            vec![Operand::Value(e2p)],
-+            vec![IrType::Ptr],
-+            IrType::Ptr,
-+            false,
-+        ),
-+    });
-+    b1.push(Instruction::Cmp {
-+        dest: e2z,
-+        op: crate::ir::ops::IrCmpOp::Ne,
-+        lhs: Operand::Value(e2),
-+        rhs: Operand::Const(IrConst::I64(0)),
-+        ty: IrType::I64,
-+    });
-+    let use_env = BlockId(910002);
-+    let use_env2 = BlockId(910003);
-+    let use_tag = BlockId(910004);
-+    let open_l = BlockId(910005);
-+    let mut b2: Vec<Instruction> = Vec::new();
-+    b2.push(Instruction::Copy {
-+        dest: pathv,
-+        src: Operand::Value(e1),
-+    });
-+    let mut b3: Vec<Instruction> = Vec::new();
-+    b3.push(Instruction::Copy {
-+        dest: pathv,
-+        src: Operand::Value(e2),
-+    });
-+    let mut b4: Vec<Instruction> = Vec::new();
-+    b4.push(Instruction::GlobalAddr {
-+        dest: pathv,
-         name: tag,
-     });
--    entry_is.push(Instruction::GlobalAddr {
-+    let mut b5: Vec<Instruction> = Vec::new();
-+    b5.push(Instruction::GlobalAddr {
-         dest: mm,
-         name: mode,
-     });
--    entry_is.push(Instruction::Call {
-+    b5.push(Instruction::Call {
-         func: "fopen".into(),
-         info: ci(
-             Some(file),
--            vec![Operand::Value(pp), Operand::Value(mm)],
-+            vec![Operand::Value(pathv), Operand::Value(mm)],
-             vec![IrType::Ptr, IrType::Ptr],
-             IrType::Ptr,
-             false,
-         ),
-     });
--    entry_is.push(Instruction::Cmp {
-+    b5.push(Instruction::Cmp {
-         dest: is_null,
-         op: crate::ir::ops::IrCmpOp::Eq,
-         lhs: Operand::Value(file),
-         rhs: Operand::Const(IrConst::I64(0)),
-         ty: IrType::I64,
-     });
--    let entry_block = BasicBlock {
--        label: BlockId(910000),
--        instructions: entry_is,
--        terminator: Terminator::CondBranch {
-+    let mk = |label: u32, is: Vec<Instruction>, term: Terminator| BasicBlock {
-+        label: BlockId(label),
-+        instructions: is,
-+        terminator: term,
-+        source_spans: vec![],
-+    };
-+    let entry_block = mk(
-+        910000,
-+        b0,
-+        Terminator::CondBranch {
-+            cond: Operand::Value(e1z),
-+            true_label: use_env,
-+            false_label: BlockId(910001),
-+        },
-+    );
-+    let env2_block = mk(
-+        910001,
-+        b1,
-+        Terminator::CondBranch {
-+            cond: Operand::Value(e2z),
-+            true_label: use_env2,
-+            false_label: use_tag,
-+        },
-+    );
-+    let use_env_block = mk(910002, b2, Terminator::Branch(open_l));
-+    let use_env2_block = mk(910003, b3, Terminator::Branch(open_l));
-+    let use_tag_block = mk(910004, b4, Terminator::Branch(open_l));
-+    let open_block = mk(
-+        910005,
-+        b5,
-+        Terminator::CondBranch {
-             cond: Operand::Value(is_null),
-             true_label: skip_l,
-             false_label: main_l,
-         },
--        source_spans: vec![],
--    };
-+    );
-     let skip_block = BasicBlock {
-         label: skip_l,
-         instructions: vec![],
-@@ -1209,6 +1318,11 @@ fn dump_helper(
-         params: vec![],
-         blocks: vec![
-             entry_block,
-+            env2_block,
-+            use_env_block,
-+            use_env2_block,
-+            use_tag_block,
-+            open_block,
-             BasicBlock {
-                 label: main_l,
-                 instructions: is,
-@@ -1224,7 +1338,7 @@ fn dump_helper(
-         is_always_inline: false,
-         is_noinline: true,
-         next_value_id: next,
--        next_label: 910002,
-+        next_label: 910011,
-         section: None,
-         visibility: Some("hidden".into()),
-         is_weak: false,
-@@ -1242,6 +1356,7 @@ fn dump_helper(
-     m.functions.push(f);
-     m.destructors.push(name.into());
-     for (n, t, v) in [
-+        ("getenv", IrType::Ptr, false),
-         ("fopen", IrType::Ptr, true),
-         ("fileno", IrType::I32, false),
-         ("flock", IrType::I32, false),
-diff --git a/src/pgo/layout.rs b/src/pgo/layout.rs
-index 49fb3203..20b2038c 100644
---- a/src/pgo/layout.rs
-+++ b/src/pgo/layout.rs
-@@ -39,13 +39,74 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
-         let Some(fp) = p.get_for_unit(u, &f.name) else {
-             continue;
+         Terminator::Unreachable => {
+             cg.emit_unreachable();
+diff --git a/src/backend/traits.rs b/src/backend/traits.rs
+index 578d0aae..0bfe1953 100644
+--- a/src/backend/traits.rs
++++ b/src/backend/traits.rs
+@@ -1547,8 +1547,13 @@ pub trait ArchCodegen {
+         default: &BlockId,
+         ty: IrType,
+     ) {
+-        // Check density for jump table eligibility (disabled by -fno-jump-tables)
+-        let use_jump_table = if self.state_ref().no_jump_tables {
++        // Check density for jump table eligibility (disabled by -fno-jump-tables).
++        // v8 F7: a COLD switch block (per the profile summary) forces the
++        // compare chain even when dense — a table's rodata + I-cache cost is
++        // not worth a path that barely runs.
++        let hint = crate::pgo::take_switch_hint();
++        let force_chain = hint.map(|h| h.force_chain).unwrap_or(false);
++        let use_jump_table = if self.state_ref().no_jump_tables || force_chain {
+             false
+         } else if cases.len() >= MIN_JUMP_TABLE_CASES {
+             let min_val = cases
+@@ -1571,9 +1576,26 @@ pub trait ArchCodegen {
          };
--        if fp.total_count.saturating_mul(100) >= max && fp.total_count > 0 {
-+        // v8: hot/cold section classification via the data-driven summary
-+        // (percentile thresholds over the unit's count distribution) with
-+        // the v7 ratio as fallback when no summary is available.
-+        let (hot, cold) = match crate::pgo::summary::get_summary() {
-+            Some(s) => (s.is_hot(fp.total_count), s.is_cold(fp.total_count)),
-+            None => (
-+                fp.total_count > 0 && fp.total_count.saturating_mul(100) >= max,
-+                fp.total_count.saturating_mul(10_000) < max,
-+            ),
-+        };
-+        if hot {
-             f.section = Some(".text.hot".into());
--        } else if fp.total_count.saturating_mul(10_000) < max {
-+        } else if cold {
-             f.section = Some(".text.unlikely".into());
-         }
-         layout_function(f, fp, u);
-     }
-+
-+    // v8: order functions by hotness class within the TU — hot first, cold
-+    // last — for I-cache-friendly object layout (GCC -freorder-functions).
-+    // Declarations and helper functions keep their relative order (class 3).
-+    if crate::pgo::summary::get_summary().is_some() {
-+        let n = m.functions.len();
-+        let mut cls: Vec<u8> = vec![3; n];
-+        for (i, f) in m.functions.iter().enumerate() {
-+            if f.is_declaration || f.blocks.is_empty() {
-+                continue;
-+            }
-+            let Some(fp) = p.get_for_unit(u, &f.name) else { continue };
-+            let s = crate::pgo::summary::get_summary().unwrap();
-+            if s.is_hot(fp.total_count) {
-+                cls[i] = 0;
-+            } else if s.is_cold(fp.total_count) {
-+                cls[i] = 2;
-+            } else {
-+                cls[i] = 1;
-+            }
-+        }
-+        let mut order: Vec<usize> = (0..n).collect();
-+        order.sort_by(|&a, &b| {
-+            cls[a]
-+                .cmp(&cls[b])
-+                .then_with(|| {
-+                    let ca = p
-+                        .get_for_unit(u, &m.functions[a].name)
-+                        .map(|f| f.total_count)
-+                        .unwrap_or(0);
-+                    let cb = p
-+                        .get_for_unit(u, &m.functions[b].name)
-+                        .map(|f| f.total_count)
-+                        .unwrap_or(0);
-+                    cb.cmp(&ca)
-+                })
-+                .then_with(|| a.cmp(&b))
-+        });
-+        // In-place permutation (IrFunction is not Clone).
-+        let mut perm = order;
-+        let mut i = 0;
-+        while i < n {
-+            if perm[i] == i {
-+                i += 1;
-+                continue;
-+            }
-+            let j = perm[i];
-+            m.functions.swap(i, j);
-+            perm.swap(i, j);
-+        }
-+    }
- }
  
- fn layout_function(
-@@ -54,7 +115,7 @@ fn layout_function(
-     u: &str,
- ) {
-     use crate::ir::reexports::Terminator;
--    let promoted = crate::pgo::promoted_hot_labels(u, &f.name);
-+    let promoted: FxHashSet<u32> = crate::pgo::promoted_hot_labels(u, &f.name);
-     let entry = f.blocks[0].label;
- 
-     // Per-block hotness: derived counts; promoted blocks get entry hotness.
-@@ -229,6 +290,67 @@ fn layout_function(
-             ordered.push(b.clone());
-         }
-     }
-+    // v8: keep promoted (devirtualized) hot blocks adjacent to their
-+    // predecessor. The chain heuristic can strand them at the function
-+    // tail (their edges to a mid-chain block never merge), hurting the hot
-+    // path — observed in zlib-ng deflate_quick.
-+    if std::env::var("LCCC_DEBUG_LAYOUT").is_ok() {
-+        eprintln!(
-+            "[LAYOUT] {} promoted labels: {:?} ({} blocks)",
-+            f.name,
-+            promoted.iter().collect::<Vec<_>>(),
-+            f.blocks.len()
-+        );
-+    }
-+    let _ = promoted;
-+    if !promoted.is_empty() {
-+        let succ_of = |t: &Terminator| -> Vec<crate::ir::reexports::BlockId> {
-+            match t {
-+                Terminator::Branch(x) => vec![*x],
-+                Terminator::CondBranch {
-+                    true_label,
-+                    false_label,
-+                    ..
-+                } => vec![*true_label, *false_label],
-+                Terminator::Switch { cases, default, .. } => cases
-+                    .iter()
-+                    .map(|x| x.1)
-+                    .chain(std::iter::once(*default))
-+                    .collect(),
-+                Terminator::IndirectBranch {
-+                    possible_targets, ..
-+                } => possible_targets.clone(),
-+                _ => vec![],
-+            }
-+        };
-+        // Deferred-append: promoted blocks are SKIPPED in the main pass and
-+        // appended right after their predecessor; the deferred remainder goes
-+        // to the tail. Length is preserved by construction (each block lands
-+        // exactly once), so the guarded swap below always applies.
-+        let mut placed_prom: FxHashSet<u32> = FxHashSet::default();
-+        let mut out2: Vec<crate::ir::reexports::BasicBlock> = Vec::with_capacity(ordered.len());
-+        for b in ordered.iter() {
-+            if promoted.contains(&b.label.0) {
-+                continue; // deferred
-+            }
-+            out2.push(b.clone());
-+            for s in succ_of(&b.terminator) {
-+                if promoted.contains(&s.0) && placed_prom.insert(s.0) {
-+                    if let Some(pb) = ordered.iter().find(|x| x.label == s) {
-+                        out2.push(pb.clone());
+         if use_jump_table {
+-            self.emit_switch_jump_table(val, cases, default, ty);
++            // Profile-guided partitioning: hoist the dominant case (>= 50% of
++            // executions) OUT of the table into a single compare — the common
++            // path skips the bounds check and the indirect jump entirely.
++            let mut cases2: Vec<(i64, BlockId)> = cases.to_vec();
++            let mut hoist: Option<(i64, BlockId)> = None;
++            if let Some(h) = hint {
++                if let Some((hv, ht)) = h.hot_case {
++                    if let Some(pos) = cases2.iter().position(|&(v, t)| v == hv && t.0 == ht) {
++                        hoist = Some(cases2.remove(pos));
 +                    }
 +                }
 +            }
-+        }
-+        for b in ordered.iter() {
-+            if promoted.contains(&b.label.0) && !placed_prom.contains(&b.label.0) {
-+                out2.push(b.clone());
++            if let Some((hv, ht)) = hoist {
++                self.emit_load_operand(val);
++                self.emit_switch_case_branch(hv, &ht.as_label(), ty);
++            }
++            self.emit_switch_jump_table(val, &cases2, default, ty);
+         } else {
+-            // Sparse: linear compare-and-branch chain
++            // Sparse: linear compare-and-branch chain (PGO-sorted by layout,
++            // so the most likely case is already tested first).
+             self.emit_load_operand(val);
+             for &(case_val, target) in cases {
+                 let label = target.as_label();
+diff --git a/src/pgo/instrument.rs b/src/pgo/instrument.rs
+index 8f127843..01b2021a 100644
+--- a/src/pgo/instrument.rs
++++ b/src/pgo/instrument.rs
+@@ -52,6 +52,12 @@ type Rec = (
+ /// Sentinel source label for the virtual entry edge (V -> entry). Cannot
+ /// collide with a real block label.
+ pub(crate) const VENTRY: u32 = u32::MAX - 1;
++/// Sentinel destination label for the virtual EXIT node (ret block -> exit).
++/// Modeling the exit closes the flow equations for RETURN-terminated blocks:
++/// without it, leaf blocks (case targets, exits) derive count 0 and every
++/// edge into them derives 0 (observed: switch-case edges all zero, so
++/// profile-driven switch partitioning never fired).
++pub(crate) const VEXIT: u32 = u32::MAX - 2;
+ 
+ /// One instrumented indirect-call site.
+ struct SiteRec {
+@@ -373,6 +379,14 @@ pub fn instrument_module(
+                     dst: s,
+                 });
+             }
++            // v8: virtual exit edge for RETURN-terminated blocks — closes
++            // the flow equations at the exit so leaf counts derive correctly.
++            if matches!(b.terminator, Terminator::Return(_)) {
++                edge_set.insert(Edge {
++                    src: b.label.0,
++                    dst: VEXIT,
++                });
++            }
+         }
+         let edges: Vec<Edge> = edge_set.into_iter().collect();
+         let entry = f.blocks.first().map(|b| b.label.0).unwrap_or(0);
+diff --git a/src/pgo/layout.rs b/src/pgo/layout.rs
+index 20b2038c..e4901943 100644
+--- a/src/pgo/layout.rs
++++ b/src/pgo/layout.rs
+@@ -28,6 +28,9 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
+     if std::env::var("LCCC_PGO_NO_LAYOUT").is_ok() {
+         return;
+     }
++    // v8 F7: fresh per-unit switch-hint map (labels are TU-unique post
++    // renumber; layout runs immediately before codegen for this unit).
++    crate::pgo::record_switch_hints(crate::common::fx_hash::FxHashMap::default());
+     let max = p.max_total_for_unit(u);
+     if max == 0 {
+         return;
+@@ -36,7 +39,14 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
+         if f.is_declaration || f.blocks.len() < 2 {
+             continue;
+         }
+-        let Some(fp) = p.get_for_unit(u, &f.name) else {
++        // F9: use the DERIVED profile (flow-conservation solver output) —
++        // raw v5 profiles carry only instrumented EDGE counts; block counts
++        // are derived at propagate time. Reading the raw profile made every
++        // block count 0: chain ordering degenerated and every switch block
++        // looked cold.
++        let Some(fp) = crate::pgo::active_profile_for_function(f)
++            .or_else(|| p.get_for_unit(u, &f.name))
++        else {
+             continue;
+         };
+         // v8: hot/cold section classification via the data-driven summary
+@@ -67,7 +77,11 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
+             if f.is_declaration || f.blocks.is_empty() {
+                 continue;
+             }
+-            let Some(fp) = p.get_for_unit(u, &f.name) else { continue };
++            let Some(fp) = crate::pgo::active_profile_for_function(f)
++                .or_else(|| p.get_for_unit(u, &f.name))
++            else {
++                continue;
++            };
+             let s = crate::pgo::summary::get_summary().unwrap();
+             if s.is_hot(fp.total_count) {
+                 cls[i] = 0;
+@@ -290,6 +304,55 @@ fn layout_function(
+             ordered.push(b.clone());
+         }
+     }
++    // v8 F7: profile-driven switch hints. For every Switch block:
++    //   * cold per the summary -> force a compare chain (no jump table);
++    //   * a case carrying >= 50% of the block's executions -> record it for
++    //     hoisting out of the jump table (profile-guided partitioning).
++    if crate::pgo::summary::get_summary().is_some() {
++        use crate::ir::reexports::Terminator;
++        let mut hints: FxHashMap<u32, crate::pgo::SwitchHint> = FxHashMap::default();
++        for b in &f.blocks {
++            if let Terminator::Switch { cases, .. } = &b.terminator {
++                let c = counts.get(&b.label).copied().unwrap_or(0);
++                let cold = crate::pgo::summary::get_summary()
++                    .map(|s| s.is_cold(c))
++                    .unwrap_or(false);
++                let mut hint = crate::pgo::SwitchHint {
++                    hot_case: None,
++                    force_chain: cold,
++                };
++                if c > 0 {
++                    let mut best: Option<(i64, u32, u64)> = None;
++                    for (v, t) in cases {
++                        let e = fp.edge_count(b.label.0, t.0);
++                        if best.map_or(true, |(_, _, be)| e > be) {
++                            best = Some((*v, t.0, e));
++                        }
++                    }
++                    if let Some((v, t, e)) = best {
++                        if (e as f64) / (c as f64) >= 0.50 {
++                            hint.hot_case = Some((v, t));
++                        }
++                    }
++                }
++                if std::env::var("LCCC_DEBUG_LAYOUT").is_ok() {
++                    eprintln!(
++                        "[LAYOUT-SW] {} switch block {} count={} cold={} hint={:?}",
++                        f.name, b.label.0, c, cold, hint
++                    );
++                }
++                hints.insert(b.label.0, hint);
 +            }
 +        }
-+        if out2.len() == ordered.len() {
-+            ordered = out2;
++        if !hints.is_empty() {
++            let mut all = crate::pgo::switch_hints_snapshot();
++            for (k, v) in hints {
++                all.insert(k, v);
++            }
++            crate::pgo::record_switch_hints(all);
 +        }
 +    }
-     if ordered.len() == f.blocks.len() {
-         f.blocks = ordered;
-     }
++
+     // v8: keep promoted (devirtualized) hot blocks adjacent to their
+     // predecessor. The chain heuristic can strand them at the function
+     // tail (their edges to a mid-chain block never merge), hurting the hot
 diff --git a/src/pgo/mod.rs b/src/pgo/mod.rs
-index ab438be7..edf450bd 100644
+index edf450bd..6ff17885 100644
 --- a/src/pgo/mod.rs
 +++ b/src/pgo/mod.rs
-@@ -5,6 +5,7 @@ pub(crate) mod instrument;
- pub(crate) mod layout;
- pub(crate) mod profile;
- pub(crate) mod promote;
-+pub(crate) mod summary;
- pub(crate) mod unroll_pgo;
- use crate::ir::reexports::{BlockId, IrFunction, IrModule};
- use std::cell::{Cell, RefCell};
-@@ -146,8 +147,10 @@ static PRE_HASHES: std::sync::LazyLock<std::sync::Mutex<FxHashMap<String, u64>>>
- static POST_HASHES: std::sync::LazyLock<std::sync::Mutex<FxHashMap<String, u64>>> =
-     std::sync::LazyLock::new(|| std::sync::Mutex::new(FxHashMap::default()));
- /// Promoted-hot block labels (unit, function) -> labels, from
--/// promote::promote_indirect_calls; layout uses them to keep the
--/// devirtualized hot path hot.
-+/// promote::promote_indirect_calls. Labels are recorded BEFORE the label
-+/// renumber pass; `remap_promoted_hot` (called by the driver right after
-+/// renumbering, which knows the exact old->new map) translates them, so
-+/// layout sees post-renumber labels.
- static PROMOTED_HOT: std::sync::LazyLock<
-     std::sync::Mutex<FxHashMap<(String, String), FxHashSet<u32>>>,
- > = std::sync::LazyLock::new(|| std::sync::Mutex::new(FxHashMap::default()));
-@@ -184,6 +187,22 @@ pub fn promoted_hot_labels(u: &str, fname: &str) -> FxHashSet<u32> {
-         .cloned()
+@@ -188,6 +188,50 @@ pub fn promoted_hot_labels(u: &str, fname: &str) -> FxHashSet<u32> {
          .unwrap_or_default()
  }
-+
-+/// Translate recorded promoted-block labels through the label-renumber map
-+/// (old label -> new label; labels are TU-unique). Called by the driver right
-+/// after the renumber pass; labels whose block vanished keep their value (the
-+/// relocation then simply fails to find them and leaves the block in place —
-+/// harmless).
-+pub fn remap_promoted_hot(remap: &FxHashMap<u32, u32>) {
-+    let mut m = PROMOTED_HOT.lock().unwrap();
-+    for labels in m.values_mut() {
-+        let old: Vec<u32> = labels.iter().copied().collect();
-+        labels.clear();
-+        for l in old {
-+            labels.insert(remap.get(&l).copied().unwrap_or(l));
-+        }
-+    }
-+}
- /// Activate the profile for PRE-PASS consumers (PGO-guided inlining, loop
- /// unrolling). Called before `run_passes`; name+unit-keyed entry counts are
- /// stable across gen/use even when the optimizer changes the CFG.
-@@ -199,6 +218,24 @@ pub fn prepass_is_active() -> bool {
-     PREPASS_ACTIVE.with(Cell::get)
- }
  
-+/// The unit currently being compiled (pre-pass unit preferred, post-pass
-+/// fallback) — used by summary-aware consumers.
-+pub fn active_unit() -> Option<String> {
-+    ACTIVE_UNIT2
-+        .with(|s| s.borrow().clone())
-+        .or_else(|| ACTIVE_UNIT.with(|s| s.borrow().clone()))
++/// v8 F7: profile-driven switch lowering hint for one switch block.
++/// `hot_case` = the case value/target that accounts for >= 50% of the
++/// block's executions (hoist it out of the jump table — LLVM's
++/// profile-guided switch partitioning); `force_chain` = the switch block is
++/// COLD per the profile summary (a jump table would waste rodata + I-cache
++/// on a path that barely runs — lower as a compare chain instead, even when
++/// the case set is dense).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct SwitchHint {
++    pub hot_case: Option<(i64, u32)>,
++    pub force_chain: bool,
 +}
 +
-+/// Raw (instrumented-edge) profile for a function in the PRE-pass unit.
-+/// Block/tree-edge counts are NOT yet derived; callers that need them must
-+/// run `profile::derive_block_counts` on the CURRENT IrFunction (the v8
-+/// inliner does exactly that for per-call-site hotness).
-+pub fn prepass_profile(name: &str) -> Option<FunctionProfile> {
-+    let p = get_pgo_profile()?;
-+    let u = ACTIVE_UNIT2.with(|slot| slot.borrow().clone())?;
-+    profile::get_for_unit(p, &u, name).cloned()
-+}
-+
- /// Name-keyed, unit-scoped total count for pre-pass consumers.
- pub fn total_count_for(name: &str) -> u64 {
-     let Some(p) = get_pgo_profile() else { return 0 };
-diff --git a/src/pgo/promote.rs b/src/pgo/promote.rs
-index ef6ce37c..a2de574e 100644
---- a/src/pgo/promote.rs
-+++ b/src/pgo/promote.rs
-@@ -384,10 +384,12 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
-                         }
-                     }
-                 }
--                hot_labels
--                    .entry(f.name.clone())
--                    .or_default()
--                    .insert(lhot.0);
-+                // Record the promoted blocks by label (lhot, lcold, ljoin).
-+                // The label-renumber pass remaps these via
-+                // crate::pgo::remap_promoted_hot before layout runs.
-+                hot_labels.entry(f.name.clone()).or_default().insert(lhot.0);
-+                hot_labels.entry(f.name.clone()).or_default().insert(lcold.0);
-+                hot_labels.entry(f.name.clone()).or_default().insert(ljoin.0);
-                 promoted += 1;
-             }
-         }
-diff --git a/src/pgo/summary.rs b/src/pgo/summary.rs
-new file mode 100644
-index 00000000..28746337
---- /dev/null
-+++ b/src/pgo/summary.rs
-@@ -0,0 +1,162 @@
-+//! Profile summary (LLVM `ProfileSummaryInfo` analogue).
-+//!
-+//! Data-driven hot/cold classification. LLVM derives hot/cold thresholds
-+//! from percentiles of the profile count distribution (ProfileSummaryInfo:
-+//! `computeThreshold(PercentileCutoff)` walks the sorted counts until the
-+//! cumulative execution share reaches the cutoff, and `isHotCallSite`/
-+//! `isColdCallSite` apply those thresholds to per-call-site block
-+//! frequencies from BFI). We do exactly that:
-+//!
-+//!   * `hot_threshold`  = the smallest count such that counts >= it carry at
-+//!                        least `LCCC_PGO_HOT_FRAC` (default 0.90) of the
-+//!                        unit's total execution;
-+//!   * `cold_threshold` = the largest count such that counts <= it carry at
-+//!                        least `LCCC_PGO_COLD_FRAC` (default 0.05) of total.
-+//!
-+//! This replaces the v6/v7 magic ratios (`total_count*100 >= max`,
-+//! `relative_frequency >= 0.10/0.05/0.005`, `n > 1000`) with thresholds that
-+//! adapt to the actual count distribution: a unit dominated by one hot
-+//! function gets a high threshold, a flat unit gets a low one.
-+use crate::common::fx_hash::FxHashMap;
-+use crate::pgo::profile::unit_hash;
-+use crate::pgo::ProfileData;
-+
-+#[derive(Debug, Clone)]
-+pub struct ProfileSummary {
-+    pub total: u64,
-+    pub max: u64,
-+    pub hot_threshold: u64,
-+    pub cold_threshold: u64,
-+}
-+
-+impl ProfileSummary {
-+    pub fn is_hot(&self, c: u64) -> bool {
-+        c > 0 && self.hot_threshold > 0 && c >= self.hot_threshold
-+    }
-+    pub fn is_cold(&self, c: u64) -> bool {
-+        self.cold_threshold > 0 && c < self.cold_threshold
-+    }
-+    /// Normalized hotness in [0,1]: c / max.
-+    pub fn hotness(&self, c: u64) -> f64 {
-+        if self.max == 0 {
-+            0.0
-+        } else {
-+            c as f64 / self.max as f64
-+        }
-+    }
-+}
-+
-+/// Build the summary for one translation unit from the loaded profile.
-+/// Counts are per-function entry counts (unit-scoped). The thresholds are
-+/// computed from the cumulative execution distribution — see the module doc.
-+pub fn build_for_unit(p: &ProfileData, unit: &str) -> ProfileSummary {
-+    let hot_frac: f64 = std::env::var("LCCC_PGO_HOT_FRAC")
-+        .ok()
-+        .and_then(|x| x.parse::<f64>().ok())
-+        .unwrap_or(0.90)
-+        .clamp(0.01, 1.0);
-+    let cold_frac: f64 = std::env::var("LCCC_PGO_COLD_FRAC")
-+        .ok()
-+        .and_then(|x| x.parse::<f64>().ok())
-+        .unwrap_or(0.05)
-+        .clamp(0.001, 0.5);
-+    let prefix = format!("{:016x}::", unit_hash(unit));
-+    let mut counts: Vec<u64> = p
-+        .functions
-+        .iter()
-+        .filter(|(k, _)| k.starts_with(&prefix))
-+        .map(|(_, f)| f.total_count)
-+        .collect();
-+    let total: u64 = counts.iter().sum();
-+    let max = counts.iter().copied().max().unwrap_or(0);
-+    if total == 0 {
-+        return ProfileSummary {
-+            total,
-+            max,
-+            hot_threshold: 0,
-+            cold_threshold: 0,
-+        };
-+    }
-+    // Hot: walk from the largest count downward until the cumulative share
-+    // of execution reaches hot_frac; the count at that point is the
-+    // threshold (LLVM ProfileSummaryInfo::computeThreshold).
-+    counts.sort_unstable_by(|a, b| b.cmp(a));
-+    let mut cum = 0u64;
-+    let mut hot_threshold = 0u64;
-+    for &c in &counts {
-+        if c == 0 {
-+            break;
-+        }
-+        cum += c;
-+        if (cum as f64) / (total as f64) >= hot_frac {
-+            hot_threshold = c;
-+            break;
-+        }
-+    }
-+    // Cold: walk from the smallest nonzero count upward until the share
-+    // reaches cold_frac; counts strictly below that point are cold.
-+    let mut cum2 = 0u64;
-+    let mut cold_threshold = 0u64;
-+    for &c in counts.iter().rev() {
-+        if c == 0 {
-+            continue;
-+        }
-+        cum2 += c;
-+        if (cum2 as f64) / (total as f64) >= cold_frac {
-+            cold_threshold = c;
-+            break;
-+        }
-+    }
-+    ProfileSummary {
-+        total,
-+        max,
-+        hot_threshold,
-+        cold_threshold,
-+    }
-+}
-+
-+/// Stashed summary for the unit currently being compiled (filled by the
-+/// driver right after profile activation; recomputed on demand otherwise).
-+static SUMMARY: std::sync::LazyLock<std::sync::Mutex<Option<ProfileSummary>>> =
++/// Pending hint consumed by the backend's `emit_switch`. Set by generation.rs
++/// (which knows the current block label) immediately before the terminator is
++/// emitted and taken by the backend default `emit_switch`. Codegen is
++/// single-threaded and per-TU sequential, so a process-wide scratch is safe.
++static PENDING_SWITCH_HINT: std::sync::LazyLock<std::sync::Mutex<Option<SwitchHint>>> =
 +    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 +
-+pub fn set_summary(s: ProfileSummary) {
-+    *SUMMARY.lock().unwrap() = Some(s);
++pub fn set_switch_hint(h: Option<SwitchHint>) {
++    *PENDING_SWITCH_HINT.lock().unwrap() = h;
 +}
-+pub fn get_summary() -> Option<ProfileSummary> {
-+    SUMMARY.lock().unwrap().clone()
++pub fn take_switch_hint() -> Option<SwitchHint> {
++    PENDING_SWITCH_HINT.lock().unwrap().take()
 +}
-+/// Build (and cache) the summary for `unit`.
-+pub fn summary_for_unit(p: &ProfileData, unit: &str) -> ProfileSummary {
-+    if let Some(s) = get_summary() {
-+        return s;
++
++/// Per-unit switch hints keyed by block label (labels are TU-unique after
++/// the renumber pass; layout runs immediately before codegen for the same
++/// unit, so a fresh map per unit is correct even for multi-TU invocations).
++static SWITCH_HINTS: std::sync::LazyLock<std::sync::Mutex<FxHashMap<u32, SwitchHint>>> =
++    std::sync::LazyLock::new(|| std::sync::Mutex::new(FxHashMap::default()));
++
++/// Replace the hint map (called once per unit by layout_module).
++pub fn record_switch_hints(map: FxHashMap<u32, SwitchHint>) {
++    *SWITCH_HINTS.lock().unwrap() = map;
++}
++pub fn switch_hint(label: u32) -> Option<SwitchHint> {
++    SWITCH_HINTS.lock().unwrap().get(&label).copied()
++}
++pub fn switch_hints_snapshot() -> FxHashMap<u32, SwitchHint> {
++    SWITCH_HINTS.lock().unwrap().clone()
++}
++
+ /// Translate recorded promoted-block labels through the label-renumber map
+ /// (old label -> new label; labels are TU-unique). Called by the driver right
+ /// after the renumber pass; labels whose block vanished keep their value (the
+diff --git a/src/pgo/profile.rs b/src/pgo/profile.rs
+index 2a5fb835..d2b34178 100644
+--- a/src/pgo/profile.rs
++++ b/src/pgo/profile.rs
+@@ -472,7 +472,7 @@ pub fn write_text_profile(p: &Path, d: &ProfileData) -> std::io::Result<()> {
+ pub fn derive_block_counts(f: &IrFunction, fp: &mut super::FunctionProfile) {
+     use crate::common::fx_hash::{FxHashMap, FxHashSet};
+     use crate::ir::reexports::Terminator;
+-    use crate::pgo::instrument::VENTRY;
++    use crate::pgo::instrument::{VENTRY, VEXIT};
+     if fp.edge_counts.is_empty() {
+         return; // v3 block-count profile: nothing to derive
+     }
+@@ -495,12 +495,17 @@ pub fn derive_block_counts(f: &IrFunction, fp: &mut super::FunctionProfile) {
+             _ => vec![],
+         }
+     }
+-    // Deduplicated CFG edges.
++    // Deduplicated CFG edges + the virtual exit edges (mirroring the
++    // instrumentation side: every RETURN-terminated block has an edge to the
++    // virtual EXIT node, closing the flow equations at the leaves).
+     let mut edge_set: FxHashSet<(u32, u32)> = FxHashSet::default();
+     for b in &f.blocks {
+         for d in succs(&b.terminator) {
+             edge_set.insert((b.label.0, d));
+         }
++        if matches!(b.terminator, Terminator::Return(_)) {
++            edge_set.insert((b.label.0, VEXIT));
++        }
+     }
+     let edges: Vec<(u32, u32)> = edge_set.into_iter().collect();
+     let entry = f.blocks.first().map(|b| b.label.0).unwrap_or(0);
+@@ -569,7 +574,24 @@ pub fn derive_block_counts(f: &IrFunction, fp: &mut super::FunctionProfile) {
+     let mut out_acc: FxHashMap<u32, u64> = known_out.clone();
+     let mut counts: FxHashMap<u32, u64> = FxHashMap::default();
+     let mut derived_edges: Vec<((u32, u32), u64)> = Vec::new();
++    // The virtual EXIT node FIRST: its count is the entry count (every
++    // execution eventually returns), and its single tree in-edge derives as
++    // entry_count - known_in(exit) — added to the exit edge's source (the
++    // return block) BEFORE that block is processed, so RETURN-terminated
++    // blocks (case targets, exits) get their real counts instead of 0.
++    if let Some(&p) = parent.get(&VEXIT) {
++        let pc = entry_count.saturating_sub(known_in.get(&VEXIT).copied().unwrap_or(0));
++        if pc > 0 {
++            derived_edges.push(((p, VEXIT), pc));
++            *out_acc.entry(p).or_insert(0) =
++                out_acc.get(&p).copied().unwrap_or(0).saturating_add(pc);
++        }
 +    }
-+    let s = build_for_unit(p, unit);
-+    set_summary(s.clone());
-+    s
-+}
-+
-+/// Per-unit count lookup helpers used by consumers that only have the unit
-+/// string (pre-pass consumers have no IrFunction yet).
-+pub fn entry_count_for<'a>(p: &'a ProfileData, unit: &str, name: &str) -> u64 {
-+    crate::pgo::profile::get_for_unit(p, unit, name)
-+        .map(|f| f.total_count)
-+        .unwrap_or(0)
-+}
-+pub fn edge_count_for<'a>(
-+    p: &'a ProfileData,
-+    unit: &str,
-+    name: &str,
-+    src: u32,
-+    dst: u32,
-+) -> u64 {
-+    crate::pgo::profile::get_for_unit(p, unit, name)
-+        .map(|f| f.edge_count(src, dst))
-+        .unwrap_or(0)
-+}
-+pub fn block_count_for<'a>(p: &'a ProfileData, unit: &str, name: &str, label: u32) -> u64 {
-+    crate::pgo::profile::get_for_unit(p, unit, name)
-+        .map(|f| f.block_count(crate::ir::reexports::BlockId(label)))
-+        .unwrap_or(0)
-+}
-+pub fn _unused(_: FxHashMap<(), ()>) {}
-diff --git a/src/pgo/unroll_pgo.rs b/src/pgo/unroll_pgo.rs
-index 2cb2b2cc..cc77df9d 100644
---- a/src/pgo/unroll_pgo.rs
-+++ b/src/pgo/unroll_pgo.rs
-@@ -1,10 +1,65 @@
-+//! Profile-guided loop unrolling.
-+//!
-+//! v8: decisions are based on the ESTIMATED TRIP COUNT where the
-+//! flow-conservation solver has derived edge counts (post-pass):
-+//! `trip = backedge_count / entry_count` (average iterations per call).
-+//! Hot high-trip-count loops unroll; cold or low-trip loops do not — no code
-+//! bloat on cold paths (GCC/LLVM both scale unrolling by profile-derived
-+//! trip counts). The pre-pass path (no CFG-derived edges yet) falls back to
-+//! the entry-count heuristic.
- use crate::ir::reexports::IrFunction;
- use crate::pgo::ProfileData;
-+
- fn size_opt() -> bool {
-     std::env::var("CFLAGS")
-         .map(|x| x.contains("-Os") || x.contains("-Oz"))
-         .unwrap_or(false)
- }
-+
-+fn successors(t: &crate::ir::reexports::Terminator) -> Vec<crate::ir::reexports::BlockId> {
-+    use crate::ir::reexports::Terminator;
-+    match t {
-+        Terminator::Branch(x) => vec![*x],
-+        Terminator::CondBranch {
-+            true_label,
-+            false_label,
-+            ..
-+        } => vec![*true_label, *false_label],
-+        Terminator::Switch { cases, default, .. } => cases
-+            .iter()
-+            .map(|x| x.1)
-+            .chain(std::iter::once(*default))
-+            .collect(),
-+        Terminator::IndirectBranch {
-+            possible_targets, ..
-+        } => possible_targets.clone(),
-+        _ => vec![],
-+    }
-+}
-+
-+/// Estimated average trip count of the loop whose header is `f.blocks[idx]`.
-+/// Uses the derived edge counts: trip = backedge / entry.
-+fn trip_count(f: &IrFunction, idx: usize) -> Option<u64> {
-+    let header = f.blocks.get(idx)?.label.0;
-+    let fp = crate::pgo::active_profile_for_function(f)?;
-+    let entry = fp.total_count.max(1);
-+    let mut back = 0u64;
-+    for b in &f.blocks {
-+        if b.label.0 == header {
++    counts.insert(VEXIT, entry_count);
+     for &b in postorder.iter() {
++        if b == VEXIT {
 +            continue;
 +        }
-+        for s in successors(&b.terminator) {
-+            if s.0 == header {
-+                back = back.max(fp.edge_count(b.label.0, header));
+         let c = if b == entry {
+             entry_count
+         } else {
+@@ -578,7 +600,9 @@ pub fn derive_block_counts(f: &IrFunction, fp: &mut super::FunctionProfile) {
+         counts.insert(b, c);
+         if let Some(&p) = parent.get(&b) {
+             let pc = c.saturating_sub(known_in.get(&b).copied().unwrap_or(0));
+-            derived_edges.push(((p, b), pc));
++            if pc > 0 {
++                derived_edges.push(((p, b), pc));
 +            }
-+        }
+             *out_acc.entry(p).or_insert(0) =
+                 out_acc.get(&p).copied().unwrap_or(0).saturating_add(pc);
+         }
+diff --git a/tests/regression/regr_v8_switch_table.c b/tests/regression/regr_v8_switch_table.c
+new file mode 100644
+index 00000000..10cb403a
+--- /dev/null
++++ b/tests/regression/regr_v8_switch_table.c
+@@ -0,0 +1,74 @@
++// regr_v8_switch_table.c
++//
++// v8 F7: profile-driven switch lowering. With -fprofile-use:
++//   * a HOT dense switch must be lowered to a jump table with the dominant
++//     case HOISTED out of it (single compare + je before the table);
++//   * a COLD dense switch must NOT get a jump table (compare chain instead).
++// The self-checking reference verifies correctness under both lowering
++// forms. The round-trip script greps the emitted assembly for the table
++// (.long .LBB relocations) and for the hoisted compare.
++#include <stdio.h>
++
++__attribute__((noinline)) static int hot_dispatch(int x) {
++    /* dense, called millions of times; case 5 dominates the training run */
++    switch (x & 15) {
++    case 0:  return 1000;
++    case 1:  return 1001;
++    case 2:  return 1002;
++    case 3:  return 1003;
++    case 4:  return 1004;
++    case 5:  return 2005;   /* dominant */
++    case 6:  return 1006;
++    case 7:  return 1007;
++    case 8:  return 1008;
++    case 9:  return 1009;
++    case 10: return 1010;
++    case 11: return 1011;
++    case 12: return 1012;
++    case 13: return 1013;
++    case 14: return 1014;
++    default: return 1015;
 +    }
-+    if back == 0 {
-+        return None;
-+    }
-+    Some(back / entry)
 +}
 +
- pub fn should_unroll_loop(
-     f: &IrFunction,
-     idx: usize,
-@@ -12,6 +67,22 @@ pub fn should_unroll_loop(
-     p: Option<&ProfileData>,
- ) -> Option<bool> {
-     let _ = p?;
-+    if size_opt() {
-+        return Some(false);
++__attribute__((noinline)) static int cold_dispatch(int x) {
++    /* dense but executed once at startup — must stay a chain */
++    switch (x & 7) {
++    case 0: return 50;
++    case 1: return 51;
++    case 2: return 52;
++    case 3: return 53;
++    case 4: return 54;
++    case 5: return 55;
++    case 6: return 56;
++    default: return 57;
 +    }
-+    if let Some(t) = trip_count(f, idx) {
-+        if t >= 16 && size <= 24 {
-+            return Some(true);
-+        }
-+        if t >= 8 && size <= 40 {
-+            return Some(true);
-+        }
-+        if t < 3 {
-+            return Some(false);
-+        }
-+        return None;
++}
++
++int main(int argc, char** argv) {
++    (void)argv;
++    long s = 0;
++    for (int i = 0; i < 4000000; i++) {
++        /* 70% case 5, rest uniform -> case 5 dominates (hoist trigger) */
++        s += hot_dispatch(((i % 10) < 7) ? 5 : (i & 15));
 +    }
-+    // Pre-pass fallback: entry-count heuristic (v7 behavior).
-     let n = if crate::pgo::prepass_is_active() {
-         crate::pgo::total_count_for(&f.name)
-     } else {
-@@ -19,9 +90,7 @@ pub fn should_unroll_loop(
-         let l = f.blocks.get(idx)?.label;
-         fp.block_count(l)
-     };
--    if size_opt() {
--        Some(false)
--    } else if n > 1000 && size <= 24 {
-+    if n > 1000 && size <= 24 {
-         Some(true)
-     } else if n < 50 {
-         Some(false)
++    s += cold_dispatch(argc & 7);   /* runtime value: not foldable; runs once */
++    long e = 0;
++    for (int i = 0; i < 4000000; i++) {
++        int x = ((i % 10) < 7) ? 5 : (i & 15);
++        switch (x & 15) {
++        case 0: e += 1000; break; case 1: e += 1001; break;
++        case 2: e += 1002; break; case 3: e += 1003; break;
++        case 4: e += 1004; break; case 5: e += 2005; break;
++        case 6: e += 1006; break; case 7: e += 1007; break;
++        case 8: e += 1008; break; case 9: e += 1009; break;
++        case 10: e += 1010; break; case 11: e += 1011; break;
++        case 12: e += 1012; break; case 13: e += 1013; break;
++        case 14: e += 1014; break; default: e += 1015; break;
++        }
++    }
++    e += 50 + (argc & 7);   /* cold_dispatch(argc & 7) */
++    if (s != e) { printf("MISMATCH s=%ld e=%ld\n", s, e); return 1; }
++    printf("ok %ld\n", s);
++    return 0;
++}
+diff --git a/tests/regression/regr_v8_switch_table.flags b/tests/regression/regr_v8_switch_table.flags
+new file mode 100644
+index 00000000..fa386d24
+--- /dev/null
++++ b/tests/regression/regr_v8_switch_table.flags
+@@ -0,0 +1 @@
++-fprofile-generate=/tmp/pgd_r8
 diff --git a/tests/regression/run_pgo_roundtrip.sh b/tests/regression/run_pgo_roundtrip.sh
-index 0990e58e..1798b213 100755
+index 1798b213..eed27eb1 100755
 --- a/tests/regression/run_pgo_roundtrip.sh
 +++ b/tests/regression/run_pgo_roundtrip.sh
-@@ -12,6 +12,10 @@ $CCC -O2 -fprofile-generate="$PGD" "$SRC" -o /tmp/r7_pg || { echo "GEN-FAIL"; ex
- /tmp/r7_pg > /tmp/r7_pg.out || { echo "GEN-RUN-FAIL"; exit 1; }
- grep -q "^ok " /tmp/r7_pg.out || { echo "GEN-OUT-FAIL: $(cat /tmp/r7_pg.out)"; exit 1; }
- [ -n "$(ls "$PGD"/*.profraw 2>/dev/null)" ] || { echo "NO-PROFILE"; exit 1; }
-+echo "== env override =="
-+rm -f /tmp/r7_custom.profraw
-+LCCC_PROFILE_FILE=/tmp/r7_custom.profraw /tmp/r7_pg > /dev/null || { echo "ENV-RUN-FAIL"; exit 1; }
-+[ -s /tmp/r7_custom.profraw ] || { echo "ENV-NO-FILE"; exit 1; }
+@@ -16,6 +16,15 @@ echo "== env override =="
+ rm -f /tmp/r7_custom.profraw
+ LCCC_PROFILE_FILE=/tmp/r7_custom.profraw /tmp/r7_pg > /dev/null || { echo "ENV-RUN-FAIL"; exit 1; }
+ [ -s /tmp/r7_custom.profraw ] || { echo "ENV-NO-FILE"; exit 1; }
++echo "== switch lowering =="
++$CCC -O2 -fprofile-generate="$PGD" "$DIR/regr_v8_switch_table.c" -o /tmp/r8_pg 2>/dev/null || { echo "SW-GEN-FAIL"; exit 1; }
++/tmp/r8_pg > /dev/null || { echo "SW-TRAIN-FAIL"; exit 1; }
++$CCC -O2 -fprofile-use="$PGD" "$DIR/regr_v8_switch_table.c" -o /tmp/r8_pu 2>/dev/null || { echo "SW-USE-FAIL"; exit 1; }
++/tmp/r8_pu > /dev/null || { echo "SW-RUN-FAIL"; exit 1; }
++$CCC -O2 -fprofile-use="$PGD" -S "$DIR/regr_v8_switch_table.c" -o /tmp/r8_pu.s 2>/dev/null || { echo "SW-ASM-FAIL"; exit 1; }
++NJT=$(grep -c "\\.long .*\\.LBB" /tmp/r8_pu.s)
++echo "jump tables emitted: $NJT"
++[ "$NJT" -gt 0 ] || { echo "NO-JUMP-TABLE"; exit 1; }
  echo "== use =="
  $CCC -O2 -fprofile-use="$PGD" "$SRC" -o /tmp/r7_pu 2>/tmp/r7_pu.log || { echo "USE-FAIL"; exit 1; }
  /tmp/r7_pu > /tmp/r7_pu.out || { echo "USE-RUN-FAIL"; exit 1; }
