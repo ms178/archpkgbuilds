@@ -1,616 +1,580 @@
-From fb1fe113042c7ea069f4fd2670be823d619b2077 Mon Sep 17 00:00:00 2001
-From: lccc-v6 <v6@localhost>
-Date: Thu, 13 Aug 2026 18:37:06 +0000
-Subject: [PATCH 1/4] v6: widen F64 register class to xmm8-15, XMM-honoring
- sqrt/fabs/FP loads/stores
+From c7e4e8f6c2360639054fec3e2f8c3ff771a423cc Mon Sep 17 00:00:00 2001
+From: lccc-v7 <v7@localhost>
+Date: Thu, 13 Aug 2026 19:44:33 +0000
+Subject: [PATCH 1/4] v7: post-allocation F64 producer->consumer register
+ coalescing
 
-- F64 register pool now spans xmm2-xmm15 (14 regs, was 6): the allocator
-  previously spilled nbody's 58 FP intervals despite xmm8-15 being free and
-  codegen-safe (scratch only touches xmm0/1/2). phys_reg_name/is_xmm_reg
-  extended; the assembler already encodes the REX-extension bank.
-- SqrtF64/F32 and FabsF64/F32 now honor XMM-allocated destinations (the sqrt
-  in nbody's hot loop was a movq %xmm,%rax; movq %rax,%xmm0 round-trip).
-  fabs is now a single andpd/andps against a rodata mask (was movabsq+movq+
-  andpd).
-- F64/F32 loads and stores with materialized/computed pointers now emit
-  movsd/movss directly into/from the XMM home (was movq (%ptr),%rax;
-  movq %rax,%xmmN and the store mirror).
+A single-use F64 value feeding a binary FP op (a load into a sub/mul/add, or a
+chain link) is now reassigned to its consumer's destination register, so the
+load lands directly in the op's register and the reg-to-reg copy that preceded
+every FP operation disappears. Candidates are the LHS operand only (the emitter
+loads the LHS into the destination; coalescing the RHS there would let the LHS
+load clobber it - observed 'subsd %xmm4,%xmm4'=0 miscompile during
+development), processed in reverse program order so an entire dependency chain
+folds onto the tail register, with explicit interval-conflict checks (adjacent
+producer/consumer may share: read precedes write within one instruction).
 
-Measured: mandelbrot 2.87x -> 2.13x vs gcc. nbody FP arithmetic now stays in
-XMM (round-trips 26 -> 13), still bounded by un-strength-reduced i*56 address
-computation (next step).
+The linear scan is untouched; only the final assignment map changes.
 
-Validation: regression 127/127, correctness 50/50, intrinsics 3/3; nbody/
-spectral_norm/mandelbrot/struct_copy bit-exact vs gcc.
+Measured (min-of-5, pinned, vs gcc -O2):
+  nbody        4.25x -> 3.48x  (advance copies 34 -> 11)
+  mandelbrot   2.12x -> 1.89x
+  struct_copy  6.65x -> 6.27x
+
+Correctness: regression 127/127, correctness 50/50, intrinsics 3/3, 11
+benchmarks bit-exact vs gcc, reduction difftests 0..300 x {AVX2,SSE2}, zlib-ng
+adler32 correct.
 ---
- src/backend/stack_layout/regalloc_helpers.rs |  6 +-
- src/backend/x86/codegen/emit.rs              | 14 +++-
- src/backend/x86/codegen/float_ops.rs         | 29 +++++++-
- src/backend/x86/codegen/intrinsics.rs        | 70 ++++++++++++--------
- src/backend/x86/codegen/memory.rs            | 50 ++++++++++++++
- 5 files changed, 135 insertions(+), 34 deletions(-)
+ src/backend/live_range.rs |  13 ++--
+ src/backend/regalloc.rs   | 125 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 130 insertions(+), 8 deletions(-)
 
-diff --git a/src/backend/stack_layout/regalloc_helpers.rs b/src/backend/stack_layout/regalloc_helpers.rs
-index cf04fddf..5a66e6dd 100644
---- a/src/backend/stack_layout/regalloc_helpers.rs
-+++ b/src/backend/stack_layout/regalloc_helpers.rs
-@@ -123,9 +123,11 @@ pub fn run_regalloc_and_merge_clobbers(
-             })
-         });
-         if clobbers_xmm2 {
--            vec![PhysReg(21), PhysReg(22), PhysReg(23), PhysReg(24), PhysReg(25)]
-+            // xmm2 clobbered: use xmm3-xmm15 (13 regs).
-+            (21..=33).map(PhysReg).collect::<Vec<_>>()
-         } else {
--            vec![PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23), PhysReg(24), PhysReg(25)]
-+            // xmm2-xmm15 (14 regs).
-+            (20..=33).map(PhysReg).collect::<Vec<_>>()
+diff --git a/src/backend/live_range.rs b/src/backend/live_range.rs
+index b7d841e0..b80d54ff 100644
+--- a/src/backend/live_range.rs
++++ b/src/backend/live_range.rs
+@@ -640,7 +640,7 @@ pub fn build_live_ranges(
+     // Collect actual use points for each value
+     let uses_map = collect_uses_for_values(func);
+ 
+-    // Find register hints from Copy sources
++    // Register hints from Copy sources (currently none are emitted).
+     let hints_map = find_register_hints(func);
+ 
+     // PGO-aware use weighting: exact block-entry counts bias allocation toward
+@@ -917,13 +917,10 @@ fn record_terminator_uses(term: &Terminator, point: u32, uses: &mut FxHashMap<u3
+ ///
+ /// Returns a map: dest_value_id → source_register_hint
+ fn find_register_hints(func: &IrFunction) -> FxHashMap<u32, PhysReg> {
+-    let mut hints: FxHashMap<u32, PhysReg> = FxHashMap::default();
+-
+-    // TODO: In a full implementation, we would track which values have been
+-    // allocated to registers and use those as hints. For now, return empty map.
+-    // This will be populated when we have actual register assignments.
+-
+-    hints
++    let _ = func;
++    // Register hints are currently not emitted (post-allocation coalescing
++    // handles producer->consumer sharing instead).
++    FxHashMap::default()
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
+index bac2b3b0..b6ecec1c 100644
+--- a/src/backend/regalloc.rs
++++ b/src/backend/regalloc.rs
+@@ -883,6 +883,15 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+                 assignments.insert(vid, reg);
+                 // XMM regs (20+) are caller-saved, no prologue save needed
+             }
++
++            // v7: post-allocation producer->consumer coalescing. Reassign
++            // single-use F64 producers (loads feeding an FP op, chain links)
++            // onto their sole consumer's register when the producer's interval
++            // does not conflict with anything already in that register. This
++            // removes the reg-to-reg copy that otherwise precedes every FP
++            // operation in a dependency chain. Explicit conflict checks make
++            // it sound; the linear scan is untouched.
++            coalesce_f64_producers(func, &f64_intervals, &mut assignments);
          }
-     } else {
-         Vec::new()
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 7b4552bf..8d272e2f 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -113,13 +113,25 @@ pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
-         23 => "xmm5",
-         24 => "xmm6",
-         25 => "xmm7",
-+        // v6: xmm8-xmm15 are additional caller-saved F64 homes. Codegen
-+        // scratch only ever touches xmm0/xmm1 (and xmm2 for pblendvb/VNNI),
-+        // so the upper bank is a safe, stable home; the assembler already
-+        // encodes them (REX.R/X/B extension bits).
-+        26 => "xmm8",
-+        27 => "xmm9",
-+        28 => "xmm10",
-+        29 => "xmm11",
-+        30 => "xmm12",
-+        31 => "xmm13",
-+        32 => "xmm14",
-+        33 => "xmm15",
-         _ => unreachable!("invalid x86 register index {}", reg.0),
-     }
+ 
+         // Phase 3b (W6): XMM allocation for 128-bit VECTOR values. Runs AFTER
+@@ -1360,6 +1369,122 @@ fn synthetic_vec_intervals(
+     result
  }
  
- /// Check if a PhysReg is an XMM register (used for F64 values).
- pub(super) fn is_xmm_reg(reg: PhysReg) -> bool {
--    reg.0 >= 20 && reg.0 <= 25
-+    reg.0 >= 20 && reg.0 <= 33
- }
- 
- /// Map a PhysReg index to its x86-64 32-bit sub-register name.
-diff --git a/src/backend/x86/codegen/float_ops.rs b/src/backend/x86/codegen/float_ops.rs
-index fc4d954e..cb674e44 100644
---- a/src/backend/x86/codegen/float_ops.rs
-+++ b/src/backend/x86/codegen/float_ops.rs
-@@ -13,7 +13,7 @@ impl X86Codegen {
-     /// so the register IS the value's only home — a `movsd %xmmN, %xmm0` is the
-     /// whole load. Falls back to a direct slot load, then to the GPR round-trip
-     /// for constants and values without a home.
--    fn load_fp_to_xmm0(&mut self, op: &Operand, ty: IrType) {
-+    pub(super) fn load_fp_to_xmm0(&mut self, op: &Operand, ty: IrType) {
-         let mov_instr = if ty == IrType::F64 { "movsd" } else { "movss" };
-         if let Operand::Value(v) = op {
-             if let Some(&reg) = self.reg_assignments.get(&v.0) {
-@@ -63,7 +63,7 @@ impl X86Codegen {
- 
-     /// Store %xmm0 to an F32/F64 destination, honoring a register-allocated XMM
-     /// home first (mirrors load_fp_to_xmm0; the result stays in the XMM domain).
--    fn store_xmm0_fp_dest(&mut self, dest: &Value, ty: IrType) {
-+    pub(super) fn store_xmm0_fp_dest(&mut self, dest: &Value, ty: IrType) {
-         let mov_instr = if ty == IrType::F64 { "movsd" } else { "movss" };
-         if let Some(&reg) = self.reg_assignments.get(&dest.0) {
-             if is_xmm_reg(reg) {
-@@ -94,7 +94,7 @@ impl X86Codegen {
-     /// the compute-into-dest path; xmm0 for the scratch path). Honors a
-     /// register-allocated XMM home, then a direct slot, then constants and the
-     /// GPR fallback.
--    fn load_fp_to_reg(&mut self, op: &Operand, ty: IrType, reg: &str) {
-+    pub(super) fn load_fp_to_reg(&mut self, op: &Operand, ty: IrType, reg: &str) {
-         let mov_instr = if ty == IrType::F64 { "movsd" } else { "movss" };
-         if let Operand::Value(v) = op {
-             if let Some(&r) = self.reg_assignments.get(&v.0) {
-@@ -220,6 +220,29 @@ impl X86Codegen {
-         true
-     }
- 
-+    /// Emit a scalar unary FP op (sqrtsd/sqrtss/roundsd/...) honoring an
-+    /// XMM-allocated destination: compute straight into the dest register
-+    /// instead of the xmm0 scratch + GPR/store round-trip. Falls back to the
-+    /// xmm0 path when dest has no XMM home.
-+    pub(super) fn emit_fp_scalar_unary(&mut self, dest: &Option<Value>, arg: &Operand, ty: IrType, inst: &str) {
-+        if let Some(d) = dest {
-+            if let Some(&reg) = self.reg_assignments.get(&d.0) {
-+                if is_xmm_reg(reg) {
-+                    let dname = phys_reg_name(reg);
-+                    self.load_fp_to_reg(arg, ty, dname);
-+                    self.state.emit_fmt(format_args!("    {} %{}, %{}", inst, dname, dname));
-+                    self.state.reg_cache.invalidate_acc();
-+                    return;
++/// Post-allocation producer→consumer coalescing for the F64 XMM class.
++///
++/// A single-use F64 value (a load feeding an FP op, or an intermediate chain
++/// link) is reassigned to its sole consumer's register when that causes no
++/// register conflict. This removes the reg-to-reg copy that otherwise precedes
++/// every FP operation in a dependency chain (the load lands directly in the
++/// op's destination register). Candidates are processed in REVERSE program
++/// order so an entire dependency chain folds onto the tail register in one
++/// pass (each link follows the register its consumer just moved to).
++///
++/// Soundness: a value is moved only when its interval does not strictly
++/// overlap any value currently holding the target register (adjacent
++/// intervals — producer's last use == consumer's def — are shareable, since
++/// the read precedes the write within one instruction). Only the final
++/// assignment map changes; the linear scan is untouched.
++fn coalesce_f64_producers(
++    func: &IrFunction,
++    f64_intervals: &[LiveInterval],
++    assignments: &mut FxHashMap<u32, PhysReg>,
++) {
++    let iv_of: FxHashMap<u32, (u32, u32)> = f64_intervals
++        .iter()
++        .map(|iv| (iv.value_id, (iv.start, iv.end)))
++        .collect();
++    if iv_of.is_empty() {
++        return;
++    }
++    let raw_uses = raw_value_use_counts(func);
++
++    // Collect (producer, consumer) pairs. Only the FIRST operand (LHS) of a
++    // BinOp is eligible: the FP emitter loads the LHS into the destination
++    // register, so a coalesced LHS needs no copy. Coalescing the RHS would put
++    // it in the destination register too, where the LHS load would clobber it
++    // before it is read (observed miscompile: `subsd %xmm4, %xmm4` = 0).
++    let mut cands: Vec<(u32, u32)> = Vec::new();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            let Some(dest) = inst.dest() else { continue };
++            if !iv_of.contains_key(&dest.0) {
++                continue;
++            }
++            if !assignments.contains_key(&dest.0) {
++                continue;
++            }
++            let lhs: Option<u32> = match inst {
++                Instruction::BinOp { lhs: Operand::Value(v), .. } => Some(v.0),
++                _ => None,
++            };
++            if let Some(v) = lhs {
++                if iv_of.contains_key(&v) && raw_uses.get(&v).copied().unwrap_or(0) == 1 {
++                    cands.push((v, dest.0));
 +                }
 +            }
 +        }
-+        self.load_fp_to_xmm0(arg, ty);
-+        self.state.emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
-+        if let Some(d) = dest {
-+            self.store_xmm0_fp_dest(d, ty);
++    }
++    // Reverse program order: the chain tail moves first, so earlier links
++    // follow it onto one shared register.
++    cands.reverse();
++
++    for (v, d) in cands {
++        let Some(&creg) = assignments.get(&d) else { continue };
++        if assignments.get(&v) == Some(&creg) {
++            continue; // already coalesced
++        }
++        let (s, e) = iv_of[&v];
++        let mut ok = true;
++        for (&w, &wr) in assignments.iter() {
++            if w == v || wr != creg {
++                continue;
++            }
++            if let Some(&(ws, we)) = iv_of.get(&w) {
++                if s < we && ws < e {
++                    ok = false;
++                    break;
++                }
++            }
++        }
++        if ok {
++            assignments.insert(v, creg);
 +        }
 +    }
 +
-     pub(super) fn emit_float_binop_impl(&mut self, dest: &Value, op: FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-         if ty == IrType::F128 {
-             let x87_op = match op {
-diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
-index ff178a56..71081990 100644
---- a/src/backend/x86/codegen/intrinsics.rs
-+++ b/src/backend/x86/codegen/intrinsics.rs
-@@ -17,6 +17,7 @@ use crate::ir::reexports::{
-     Operand,
-     Value,
- };
-+use crate::common::types::IrType;
- use crate::backend::state::StackSlot;
- use crate::backend::regalloc::PhysReg;
- use super::emit::{is_xmm_reg, phys_reg_name, X86Codegen};
-@@ -775,32 +776,34 @@ impl X86Codegen {
-                 }
-             }
-             IntrinsicOp::SqrtF64 => {
--                // sqrtsd: scalar double-precision square root
--                self.float_operand_to_xmm0(&args[0], false);
--                self.state.emit("    sqrtsd %xmm0, %xmm0");
--                self.state.emit("    movq %xmm0, %rax");
--                if let Some(d) = dest {
--                    self.store_rax_to(d);
--                }
-+                // sqrtsd, honoring an XMM-allocated destination (was a GPR
-+                // round-trip in the middle of every FP chain: nbody's sqrt(d2)).
-+                self.emit_fp_scalar_unary(dest, &args[0], IrType::F64, "sqrtsd");
-             }
-             IntrinsicOp::SqrtF32 => {
--                // sqrtss: scalar single-precision square root
--                self.float_operand_to_xmm0(&args[0], true);
--                self.state.emit("    sqrtss %xmm0, %xmm0");
--                self.state.emit("    movd %xmm0, %eax");
--                if let Some(d) = dest {
--                    self.store_rax_to(d);
--                }
-+                self.emit_fp_scalar_unary(dest, &args[0], IrType::F32, "sqrtss");
-             }
-             IntrinsicOp::FabsF64 => {
--                // Clear sign bit for double-precision absolute value
--                self.float_operand_to_xmm0(&args[0], false);
--                self.state.emit("    movabsq $0x7FFFFFFFFFFFFFFF, %rcx");
--                self.state.emit("    movq %rcx, %xmm1");
--                self.state.emit("    andpd %xmm1, %xmm0");
--                self.state.emit("    movq %xmm0, %rax");
-+                // v6: single andpd against a rodata mask, honoring the
-+                // XMM-allocated destination (was movabsq + movq + andpd +
-+                // GPR round-trip).
-                 if let Some(d) = dest {
--                    self.store_rax_to(d);
-+                    if let Some(&reg) = self.reg_assignments.get(&d.0) {
-+                        if is_xmm_reg(reg) {
-+                            let dname = phys_reg_name(reg);
-+                            self.load_fp_to_reg(&args[0], IrType::F64, dname);
-+                            let label = self.state.get_fp_const_label(0x7FFF_FFFF_FFFF_FFFFu64);
-+                            self.state.emit_fmt(format_args!("    andpd {}(%rip), %{}", label, dname));
-+                            self.state.reg_cache.invalidate_acc();
-+                            return;
-+                        }
-+                    }
-+                }
-+                self.load_fp_to_xmm0(&args[0], IrType::F64);
-+                let label = self.state.get_fp_const_label(0x7FFF_FFFF_FFFF_FFFFu64);
-+                self.state.emit_fmt(format_args!("    andpd {}(%rip), %xmm0", label));
-+                if let Some(d) = dest {
-+                    self.store_xmm0_fp_dest(d, IrType::F64);
-                 }
-             }
-             IntrinsicOp::F128Fabs => {
-@@ -983,14 +986,25 @@ impl X86Codegen {
-                 }
-             }
-             IntrinsicOp::FabsF32 => {
--                // Clear sign bit for single-precision absolute value
--                self.float_operand_to_xmm0(&args[0], true);
--                self.state.emit("    movl $0x7FFFFFFF, %ecx");
--                self.state.emit("    movd %ecx, %xmm1");
--                self.state.emit("    andps %xmm1, %xmm0");
--                self.state.emit("    movd %xmm0, %eax");
-+                // v6: single andps against a rodata mask, honoring the
-+                // XMM-allocated destination.
-                 if let Some(d) = dest {
--                    self.store_rax_to(d);
-+                    if let Some(&reg) = self.reg_assignments.get(&d.0) {
-+                        if is_xmm_reg(reg) {
-+                            let dname = phys_reg_name(reg);
-+                            self.load_fp_to_reg(&args[0], IrType::F32, dname);
-+                            let label = self.state.get_fp_const_label(0x7FFF_FFFFu64);
-+                            self.state.emit_fmt(format_args!("    andps {}(%rip), %{}", label, dname));
-+                            self.state.reg_cache.invalidate_acc();
-+                            return;
-+                        }
-+                    }
-+                }
-+                self.load_fp_to_xmm0(&args[0], IrType::F32);
-+                let label = self.state.get_fp_const_label(0x7FFF_FFFFu64);
-+                self.state.emit_fmt(format_args!("    andps {}(%rip), %xmm0", label));
-+                if let Some(d) = dest {
-+                    self.store_xmm0_fp_dest(d, IrType::F32);
-                 }
-             }
-             // AES-NI binary ops: aesenc, aesenclast, aesdec, aesdeclast
-diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
-index b0730a4a..61493641 100644
---- a/src/backend/x86/codegen/memory.rs
-+++ b/src/backend/x86/codegen/memory.rs
-@@ -524,6 +524,44 @@ impl X86Codegen {
-             }
-         }
- 
-+        // v6: register-direct F64/F32 store. When the value lives in an
-+        // XMM-allocated register, store it straight to memory (movsd/movss
-+        // %xmmN, (%ptr)) instead of the GPR round-trip (movq %xmmN,%rax;
-+        // movq %rax,(%ptr)) the default path pays on every store.
-+        if ty == IrType::F64 || ty == IrType::F32 {
-+            if let Operand::Value(v) = val {
-+                if let Some(v_reg) = self.reg_assignments.get(&v.0).copied() {
-+                    if is_xmm_reg(v_reg) {
-+                        let v_name = phys_reg_name(v_reg);
-+                        let mov = if ty == IrType::F64 { "movsd" } else { "movss" };
-+                        // ptr in a GPR-allocated register
-+                        if let Some(p_reg) = self.reg_assignments.get(&ptr.0).copied() {
-+                            if !is_xmm_reg(p_reg) && !self.state.is_alloca(ptr.0) {
-+                                let p_name = phys_reg_name(p_reg);
-+                                self.state.emit_fmt(format_args!("    {} %{}, (%{})", mov, v_name, p_name));
-+                                self.state.reg_cache.invalidate_acc();
-+                                return;
-+                            }
-+                        }
-+                        // ptr is an alloca with a direct slot
-+                        if self.state.is_alloca(ptr.0) && self.state.alloca_over_align(ptr.0).is_none() {
-+                            if let Some(slot) = self.state.get_slot(ptr.0) {
-+                                let sr = self.slot_ref(slot.0);
-+                                self.state.emit_fmt(format_args!("    {} %{}, {}", mov, v_name, sr));
-+                                self.state.reg_cache.invalidate_acc();
-+                                return;
-+                            }
-+                        }
-+                        // general pointer: materialize to %rax and store
-+                        self.operand_to_reg(&Operand::Value(*ptr), "rax");
-+                        self.state.emit_fmt(format_args!("    {} %{}, (%rax)", mov, v_name));
-+                        self.state.reg_cache.invalidate_acc();
-+                        return;
-+                    }
-+                }
-+            }
-+        }
++    if std::env::var("CCC_DEBUG_XMM").is_ok() {
++        let mut pairs: Vec<(u32, u32)> = assignments
++            .iter()
++            .filter(|(v, _)| iv_of.contains_key(v))
++            .map(|(&v, &r)| (v, r.0 as u32))
++            .collect();
++        pairs.sort_unstable();
++        eprintln!("[XMM-COALESCE] fn={} {:?}", func.name, pairs);
++    }
++}
 +
-         // Fall back to default store logic
-         crate::backend::traits::emit_store_default(self, val, ptr, ty);
-     }
-@@ -721,6 +759,7 @@ impl X86Codegen {
-                 if is_xmm_reg(d_reg) {
-                     let d_name = phys_reg_name(d_reg);
-                     let mov = if ty == IrType::F64 { "movsd" } else { "movss" };
-+                    // 1. Pointer already in a GPR-allocated register.
-                     if let Some(p_reg) = self.reg_assignments.get(&ptr.0).copied() {
-                         if !is_xmm_reg(p_reg) && !self.state.is_alloca(ptr.0) {
-                             let p_name = phys_reg_name(p_reg);
-@@ -729,6 +768,7 @@ impl X86Codegen {
-                             return;
-                         }
-                     }
-+                    // 2. Alloca with a direct slot (data IS at the slot).
-                     if self.state.is_alloca(ptr.0) && self.state.alloca_over_align(ptr.0).is_none() {
-                         if let Some(slot) = self.state.get_slot(ptr.0) {
-                             let sr = self.slot_ref(slot.0);
-@@ -737,6 +777,16 @@ impl X86Codegen {
-                             return;
-                         }
-                     }
-+                    // 3. General pointer (GEP into a global, IVSR phi, computed
-+                    //    address): materialize into %rax (or reuse it when the
-+                    //    accumulator cache already holds the pointer) and load
-+                    //    directly into the XMM home. This is the nbody inner-
-+                    //    loop case: the old path did movq (%ptr),%rax +
-+                    //    movq %rax,%xmmN.
-+                    self.operand_to_reg(&Operand::Value(*ptr), "rax");
-+                    self.state.emit_fmt(format_args!("    {} (%rax), %{}", mov, d_name));
-+                    self.state.reg_cache.invalidate_acc();
-+                    return;
-                 }
-             }
-         }
++/// Raw operand-use count per value (one per Operand::Value occurrence in any
++/// instruction or terminator). Used for single-use detection in coalescing:
++/// only a value with exactly one use can share its consumer's register, because
++/// only then do producer and consumer live ranges not overlap.
++fn raw_value_use_counts(func: &IrFunction) -> FxHashMap<u32, u32> {
++    let mut uses: FxHashMap<u32, u32> = FxHashMap::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            for_each_operand_in_instruction(inst, |op| {
++                if let Operand::Value(v) = op {
++                    *uses.entry(v.0).or_insert(0) += 1;
++                }
++            });
++        }
++        for_each_operand_in_terminator(&block.terminator, |op| {
++            if let Operand::Value(v) = op {
++                *uses.entry(v.0).or_insert(0) += 1;
++            }
++        });
++    }
++    uses
++}
++
+ /// Collect values whose types don't fit in a single GPR (floats, i128, and
+ /// on 32-bit targets: i64/u64). Copy instructions that chain from these
+ /// values must also be excluded via fixpoint propagation.
 -- 
 2.47.3
 
 
-From bc9d399c05701fa60ea4587be3fb43d9c8663e45 Mon Sep 17 00:00:00 2001
-From: lccc-v6 <v6@localhost>
-Date: Thu, 13 Aug 2026 18:55:28 +0000
-Subject: [PATCH 2/4] v6: re-enable GEP CSE + XMM-allocate scalar FP intrinsic
- results
+From fd1c13927be603f296f26133ef24000a156abda5 Mon Sep 17 00:00:00 2001
+From: lccc-v7 <v7@localhost>
+Date: Thu, 13 Aug 2026 19:53:16 +0000
+Subject: [PATCH 2/4] v7: widen XMM allocation to F32 scalars + fix int->float
+ cast for immediates
 
-- Re-enable GVN CSE for GetElementPtr (two GEPs with the same base+offset
-  compute the same address; the duplicate folds to a Copy the coalescer
-  merges). Was disabled for a pre-register-aware 'stale base register' defect;
-  re-validated against the full suite. nbody's inner loop recomputed
-  'bodies + i*56' once per field access (8 leaq + 8 scratch-slot spills);
-  now computed once (advance 280 -> 252 instrs).
-- Scalar FP intrinsic results (sqrt/fabs, F64/F32) are now XMM-allocated:
-  they were excluded from both the GPR and XMM scans, so their result spilled
-  to the stack in the middle of every FP chain (nbody's sqrt(d2) was a
-  sqrtsd + spill + reload). Now sqrtsd %xmmN, %xmmN in-place.
+- The XMM register class now covers F32 as well as F64 (BinOp/UnaryOp/Load/
+  Cast/Intrinsic producers); F32 scalar chains previously lived entirely on the
+  stack. The emitters (loads, stores, binops, sqrt/fabs) already honor XMM
+  homes, so only the allocator's type filter needed widening.
+- Fixed a latent panic this exposed: the register-direct int->float cast read
+  its source with operand_to_reg (value_to_reg), which panics on an
+  immediately-consumed source (no slot, no register, accumulator-cached).
+  Switched to operand_to_rax, which handles the accumulator cache.
 
-Measured: nbody 4.79x -> 4.31x vs gcc; mandelbrot 2.87x -> 2.13x; both
-bit-exact. regression 127/127, correctness 50/50, intrinsics 3/3.
+Correctness: regression 127/127, correctness 50/50, intrinsics 3/3, F32
+difftests 0..300 exact, benchmarks bit-exact vs gcc.
 ---
- src/backend/regalloc.rs | 21 +++++++++++++++++++--
- src/passes/gvn.rs       | 33 +++++++++++++++++++++++++++------
- 2 files changed, 46 insertions(+), 8 deletions(-)
+ src/backend/regalloc.rs             | 33 +++++++++++++++++------------
+ src/backend/x86/codegen/cast_ops.rs |  5 ++++-
+ 2 files changed, 24 insertions(+), 14 deletions(-)
 
 diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index a0c0baad..bac2b3b0 100644
+index b6ecec1c..9607fd76 100644
 --- a/src/backend/regalloc.rs
 +++ b/src/backend/regalloc.rs
-@@ -825,6 +825,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-             // Only include values that are actually F64 (not i128, not f32, etc.)
+@@ -810,11 +810,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+         }
+     }
+ 
+-    // Phase 3: XMM register allocation for F64 values that don't span calls.
+-    // These values were excluded from GPR allocation but can use XMM registers.
++    // Phase 3: XMM register allocation for scalar FP (F64/F32) values that
++    // don't span calls. These values were excluded from GPR allocation but can
++    // use XMM registers.
+     if !config.xmm_regs.is_empty() {
+-        // Collect F64 values: values in non_gpr_values that are F64 typed,
+-        // haven't been assigned a GPR, and don't span calls.
++        // Collect scalar-FP values: values in non_gpr_values that are F64/F32
++        // typed, haven't been assigned a GPR, and don't span calls.
+         let f64_intervals: Vec<LiveInterval> = liveness
+             .intervals
+             .iter()
+@@ -822,30 +823,36 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+             .filter(|iv| iv.end > iv.start)
+             .filter(|iv| !assignments.contains_key(&iv.value_id))
+             .filter(|iv| !spans_any_call(iv, call_points))
+-            // Only include values that are actually F64 (not i128, not f32, etc.)
++            // Only include values that are actually scalar F64/F32 (not i128,
++            // not long double, etc.)
              .filter(|iv| {
-                 // Check if this value is produced by a F64-typed instruction
-+                // (or a scalar F64 intrinsic such as sqrt/fabs — those were
-+                // previously excluded, so their result spilled to the stack in
-+                // the middle of every FP chain: nbody's sqrt(d2)).
+-                // Check if this value is produced by a F64-typed instruction
+-                // (or a scalar F64 intrinsic such as sqrt/fabs — those were
+-                // previously excluded, so their result spilled to the stack in
+-                // the middle of every FP chain: nbody's sqrt(d2)).
++                // Check if this value is produced by an F64/F32-typed
++                // instruction (or a scalar FP intrinsic such as sqrt/fabs).
                  func.blocks.iter().any(|block| {
                      block.instructions.iter().any(|inst| match inst {
                          Instruction::BinOp { dest, ty, .. }
-@@ -839,6 +842,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                         Instruction::Cast { dest, to_ty, .. } if *to_ty == IrType::F64 => {
+                         | Instruction::UnaryOp { dest, ty, .. }
+-                            if *ty == IrType::F64 =>
++                            if *ty == IrType::F64 || *ty == IrType::F32 =>
+                         {
                              dest.0 == iv.value_id
                          }
-+                        Instruction::Intrinsic { dest: Some(d), op, .. } => {
-+                            use crate::ir::intrinsics::IntrinsicOp as O;
-+                            d.0 == iv.value_id
-+                                && matches!(op, O::SqrtF64 | O::FabsF64)
-+                        }
+-                        Instruction::Load { dest, ty, .. } if *ty == IrType::F64 => {
++                        Instruction::Load { dest, ty, .. }
++                            if *ty == IrType::F64 || *ty == IrType::F32 =>
++                        {
+                             dest.0 == iv.value_id
+                         }
+-                        Instruction::Cast { dest, to_ty, .. } if *to_ty == IrType::F64 => {
++                        Instruction::Cast { dest, to_ty, .. }
++                            if *to_ty == IrType::F64 || *to_ty == IrType::F32 =>
++                        {
+                             dest.0 == iv.value_id
+                         }
+                         Instruction::Intrinsic { dest: Some(d), op, .. } => {
+                             use crate::ir::intrinsics::IntrinsicOp as O;
+                             d.0 == iv.value_id
+-                                && matches!(op, O::SqrtF64 | O::FabsF64)
++                                && matches!(
++                                    op,
++                                    O::SqrtF64 | O::FabsF64 | O::SqrtF32 | O::FabsF32
++                                )
+                         }
                          _ => false,
                      })
-                 })
-@@ -1411,9 +1419,18 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
-                 Instruction::Intrinsic {
-                     dest: Some(d), op, ..
-                 } => {
--                    // Vector intrinsics produce 128/256-bit values that cannot be
--                    // stored in scalar GPRs. Exclude them from register allocation.
-+                    // Scalar FP intrinsics (sqrt/fabs) produce F64/F32 values
-+                    // that must live in XMM, never GPRs. Vector intrinsics
-+                    // produce 128/256-bit values that also cannot be stored in
-+                    // scalar GPRs — exclude both from GPR allocation.
-                     use crate::ir::intrinsics::IntrinsicOp;
-+                    if matches!(
-+                        op,
-+                        IntrinsicOp::SqrtF64 | IntrinsicOp::SqrtF32
-+                            | IntrinsicOp::FabsF64 | IntrinsicOp::FabsF32
-+                    ) {
-+                        non_gpr_values.insert(d.0);
-+                    }
-                     let is_vector = matches!(
-                         op,
-                         IntrinsicOp::VecZeroF64x4
-diff --git a/src/passes/gvn.rs b/src/passes/gvn.rs
-index 819af7d4..69e352bf 100644
---- a/src/passes/gvn.rs
-+++ b/src/passes/gvn.rs
-@@ -427,11 +427,32 @@ impl GvnState {
-                     *dest,
-                 ))
-             }
--            Instruction::GetElementPtr { .. } => {
--                // GEP CSE disabled: creates Copy chains whose base register
--                // may be stale at fold points. Both constant-offset (foldable)
--                // and variable-offset GEPs are affected.
--                None
-+            Instruction::GetElementPtr {
-+                dest,
-+                base,
-+                offset,
-+                ty,
-+            } => {
-+                // v6: re-enable GEP CSE. Two GEPs with the same base and
-+                // offset compute the same address; the duplicate becomes a
-+                // Copy that the copy-coalescer folds to one home slot (the
-+                // nbody inner-loop recomputes `&bodies[i]` once per field
-+                // access, and each recompute paid a leaq + a scratch-slot
-+                // spill). The historical "stale base register at fold points"
-+                // defect was in the pre-register-aware codegen; the current
-+                // Copy/slot machinery keeps GEP results in a single coalesced
-+                // slot, and the store-forwarding analysis keys on value
-+                // numbers, which CSE only strengthens.
-+                let base_vn = self.operand_to_vn(&Operand::Value(*base));
-+                let offset_vn = self.operand_to_vn(offset);
-+                Some((
-+                    ExprKey::Gep {
-+                        base: base_vn,
-+                        offset: offset_vn,
-+                        ty: *ty,
-+                    },
-+                    *dest,
-+                ))
-             }
-             // Pure: a symbol's address is constant for the process lifetime.
-             Instruction::GlobalAddr { dest, name } => Some((
-@@ -1497,7 +1518,7 @@ mod tests {
-         asm_labels: crate::common::fx_hash::FxHashMap::default(),};
- 
-         let eliminated = module.for_each_function(run_gvn_function);
--        assert_eq!(eliminated, 0); // GEP CSE disabled
-+        assert_eq!(eliminated, 1); // two identical GEPs CSE'd into one + Copy
+diff --git a/src/backend/x86/codegen/cast_ops.rs b/src/backend/x86/codegen/cast_ops.rs
+index 9bf5d4f1..1c5725e3 100644
+--- a/src/backend/x86/codegen/cast_ops.rs
++++ b/src/backend/x86/codegen/cast_ops.rs
+@@ -197,7 +197,10 @@ impl X86Codegen {
+             if let Some(dest_phys) = self.dest_reg(dest) {
+                 if super::emit::is_xmm_reg(dest_phys) {
+                     let dname = super::emit::phys_reg_name(dest_phys);
+-                    self.operand_to_reg(src, "rax");
++                    // operand_to_rax handles the accumulator cache
++                    // (immediately-consumed sources have no slot and no
++                    // register — value_to_reg/operand_to_reg would panic).
++                    self.operand_to_rax(src);
+                     if from_ty.is_unsigned() {
+                         self.emit_zero_extend_to_rax(from_ty);
+                     } else {
+-- 
+2.47.3
+
+
+From b2d08e5fd3a5314c901863fc330f25161ed89958 Mon Sep 17 00:00:00 2001
+From: lccc-v7 <v7@localhost>
+Date: Thu, 13 Aug 2026 19:59:19 +0000
+Subject: [PATCH 3/4] v7: affine induction-variable strength reduction ((iv +
+ k) * stride)
+
+IVSR now recognizes the affine form (iv + k) * stride in addition to the plain
+iv * stride: the pointer induction variable is initialized to
+base + (init + k) * stride instead of base + init * stride. Non-constant IV
+inits with a non-zero affine offset fall back conservatively to scalar code.
+
+Verified on a synthetic (i+1)*2 kernel: zero imulq remain, matching the plain
+iv*stride form and GCC. nbody's remaining imulq are preheader pointer-init
+computations for non-constant IV inits (a separate, lower-value optimization).
+
+Correctness: regression 127/127, correctness 50/50, intrinsics 3/3, 14
+benchmarks bit-exact vs gcc.
+---
+ src/passes/iv_strength_reduce.rs | 73 ++++++++++++++++++++++++++------
+ 1 file changed, 60 insertions(+), 13 deletions(-)
+
+diff --git a/src/passes/iv_strength_reduce.rs b/src/passes/iv_strength_reduce.rs
+index 17ee5552..8007fda8 100644
+--- a/src/passes/iv_strength_reduce.rs
++++ b/src/passes/iv_strength_reduce.rs
+@@ -62,6 +62,10 @@ struct DerivedExpr {
+     stride: i64,
+     /// Which basic IV this derives from (index into basic_ivs)
+     iv_index: usize,
++    /// Constant added to the IV BEFORE the stride multiply, for the affine
++    /// pattern `(iv + k) * stride` (e.g. nbody's `(i + 1) * 56`). Zero for the
++    /// plain `iv * stride` pattern.
++    add_offset: i64,
+     /// GEPs that use this multiply/shift result as their offset.
+     /// (block_idx, inst_idx, GEP dest, GEP base)
+     gep_uses: Vec<(usize, usize, Value, Value)>,
+@@ -194,17 +198,18 @@ fn reduce_loop(
+     // literally share the same multiply instruction. C frontends commonly
+     // materialize `a[i]` twice as two independently numbered `i * stride`
+     // expressions. The key is semantic: (basic IV, byte stride, invariant base).
+-    let mut pointer_groups: Vec<(usize, i64, Value, Vec<(usize, usize, Value)>)> = Vec::new();
++    let mut pointer_groups: Vec<(usize, i64, i64, Value, Vec<(usize, usize, Value)>)> = Vec::new();
+     for d in &derived {
+         for &(gep_block_idx, gep_inst_idx, gep_dest, gep_base) in &d.gep_uses {
+-            if let Some((_, _, _, uses)) = pointer_groups.iter_mut().find(|(iv_index, stride, base, _)| {
+-                *iv_index == d.iv_index && *stride == d.stride && *base == gep_base
++            if let Some((_, _, _, _, uses)) = pointer_groups.iter_mut().find(|(iv_index, stride, off, base, _)| {
++                *iv_index == d.iv_index && *stride == d.stride && *off == d.add_offset && *base == gep_base
+             }) {
+                 uses.push((gep_block_idx, gep_inst_idx, gep_dest));
+             } else {
+                 pointer_groups.push((
+                     d.iv_index,
+                     d.stride,
++                    d.add_offset,
+                     gep_base,
+                     vec![(gep_block_idx, gep_inst_idx, gep_dest)],
+                 ));
+@@ -212,7 +217,7 @@ fn reduce_loop(
+         }
      }
  
-     #[test]
--- 
-2.47.3
-
-
-From d20b91a7d1e6f37347cab9eb7c4e9a5d7da18077 Mon Sep 17 00:00:00 2001
-From: lccc-v6 <v6@localhost>
-Date: Thu, 13 Aug 2026 18:59:30 +0000
-Subject: [PATCH 3/4] v6: FP register-direct loads/stores with folded constant
- offsets
-
-The GEP-fold load/store path (movX off(base), dest) only had a register-direct
-fast path for integers; F64/F32 fell to the GPR round-trip (movq off(base),
-%rax; movq %rax,%xmmN and its store mirror). nbody's pairwise loop paid that
-on every field access. Now movsd/movss off(%base), %xmmN into/from the
-XMM-allocated home.
-
-nbody: 4.79x -> 4.25x vs gcc (round-trips 13 -> 5); bit-exact.
-regression 127/127, correctness 50/50, intrinsics 3/3.
----
- src/backend/x86/codegen/memory.rs | 49 +++++++++++++++++++++++++++++++
- 1 file changed, 49 insertions(+)
-
-diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
-index 61493641..d9333034 100644
---- a/src/backend/x86/codegen/memory.rs
-+++ b/src/backend/x86/codegen/memory.rs
-@@ -883,6 +883,31 @@ impl X86Codegen {
+-    for (iv_index, stride, gep_base, gep_uses) in pointer_groups {
++    for (iv_index, stride, add_offset, gep_base, gep_uses) in pointer_groups {
+         let iv = &basic_ivs[iv_index];
+         let inc_bytes = iv.step * stride;
  
-         // Register-direct store: when val has a register, store directly to memory
-         // without loading to %rax first. Handles Direct (alloca) and Indirect (ptr) cases.
-+        // v6: FP variant — an XMM-allocated F64/F32 value stores straight to the
-+        // folded-offset address (movsd/movss %xmmN, off(%base)) instead of the
-+        // GPR round-trip (movq %xmmN,%rax; movq %rax,off(%base)).
-+        if ty == IrType::F64 || ty == IrType::F32 {
-+            if let Operand::Value(v) = val {
-+                if let Some(v_reg) = self.reg_assignments.get(&v.0).copied() {
-+                    if is_xmm_reg(v_reg) {
-+                        if let Some(b_reg) = self.reg_assignments.get(&base.0).copied() {
-+                            if !is_xmm_reg(b_reg) && !self.state.is_alloca(base.0) {
-+                                let mov = if ty == IrType::F64 { "movsd" } else { "movss" };
-+                                let v_name = phys_reg_name(v_reg);
-+                                let b_name = phys_reg_name(b_reg);
-+                                if offset != 0 {
-+                                    self.state.emit_fmt(format_args!("    {} %{}, {}(%{})", mov, v_name, offset, b_name));
-+                                } else {
-+                                    self.state.emit_fmt(format_args!("    {} %{}, (%{})", mov, v_name, b_name));
-+                                }
-+                                self.state.reg_cache.invalidate_acc();
-+                                return;
-+                            }
-+                        }
-+                    }
-+                }
-+            }
-+        }
-         if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
-             if let Operand::Value(v) = val {
-                 if let Some(v_reg) = self.reg_assignments.get(&v.0).copied() {
-@@ -974,6 +999,30 @@ impl X86Codegen {
+@@ -228,9 +233,12 @@ fn reduce_loop(
+         let init_ptr_val = Value(next_id);
+         next_id += 1;
+ 
+-        // Try to resolve init to a constant (looking through copies)
++        // Try to resolve init to a constant (looking through copies). The
++        // initial byte offset is (init + add_offset) * stride: the affine
++        // `(iv + k) * stride` pattern starts at `k * stride` bytes past the
++        // base even when the IV starts at zero.
+         let init_const = try_resolve_const(&iv.init, func);
+-        let init_offset = init_const.map(|v| v * stride);
++        let init_offset = init_const.map(|v| (v + add_offset) * stride);
+ 
+         // Build preheader instructions for computing the initial pointer
+         let mut preheader_insts: Vec<Instruction> = Vec::new();
+@@ -251,7 +259,14 @@ fn reduce_loop(
+                 });
              }
-             return;
-         }
-+        // v6: FP register-direct load with a folded constant offset: movsd/movss
-+        // off(%base), %xmmN into the XMM-allocated destination, instead of the
-+        // GPR round-trip (movq off(%base),%rax; movq %rax,%xmmN) that the
-+        // fold path otherwise pays for every field load in FP-struct loops.
-+        if ty == IrType::F64 || ty == IrType::F32 {
-+            if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
-+                if is_xmm_reg(d_reg) {
-+                    if let Some(b_reg) = self.reg_assignments.get(&base.0).copied() {
-+                        if !is_xmm_reg(b_reg) && !self.state.is_alloca(base.0) {
-+                            let mov = if ty == IrType::F64 { "movsd" } else { "movss" };
-+                            let d_name = phys_reg_name(d_reg);
-+                            let b_name = phys_reg_name(b_reg);
-+                            if offset != 0 {
-+                                self.state.emit_fmt(format_args!("    {} {}(%{}), %{}", mov, offset, b_name, d_name));
-+                            } else {
-+                                self.state.emit_fmt(format_args!("    {} (%{}), %{}", mov, b_name, d_name));
-+                            }
-+                            self.state.reg_cache.invalidate_acc();
-+                            return;
+         } else {
+-            // Non-constant init: compute init * stride at runtime in preheader
++            // Non-constant init: compute init * stride at runtime in preheader.
++            // The affine `(iv + k) * stride` form with a non-constant init would
++            // need `(init + k) * stride` here; that composition is not yet
++            // handled, so skip it conservatively (falls back to scalar code,
++            // which is always correct).
++            if add_offset != 0 {
++                continue;
++            }
+             let init_val = match &iv.init {
+                 Operand::Value(v) => *v,
+                 _ => continue,
+@@ -574,6 +589,33 @@ fn find_derived_exprs(
+     let find_iv = |val_id: u32| -> Option<usize> {
+         iv_values.get(&val_id).or_else(|| iv_derived.get(&val_id)).copied()
+     };
++    // Affine form: `add(iv, k)` (or `add(k, iv)`) — recognized so that
++    // `(iv + k) * stride` strength-reduces with an initial offset of k*stride.
++    let find_affine = |val_id: u32| -> Option<(usize, i64)> {
++        for &bi in loop_body {
++            if bi >= func.blocks.len() {
++                continue;
++            }
++            for inst in &func.blocks[bi].instructions {
++                if inst.dest() != Some(Value(val_id)) {
++                    continue;
++                }
++                if let Instruction::BinOp { op: IrBinOp::Add, lhs, rhs, .. } = inst {
++                    if let (Operand::Value(v), Operand::Const(c)) = (lhs, rhs) {
++                        if let (Some(idx), Some(k)) = (find_iv(v.0), c.to_i64()) {
++                            return Some((idx, k));
++                        }
++                    }
++                    if let (Operand::Const(c), Operand::Value(v)) = (lhs, rhs) {
++                        if let (Some(idx), Some(k)) = (find_iv(v.0), c.to_i64()) {
++                            return Some((idx, k));
 +                        }
 +                    }
 +                }
 +            }
 +        }
-         let addr = self.state.resolve_slot_addr(base.0);
-         if let Some(addr) = addr {
-             let load_instr = Self::mov_load_for_type(ty);
++        None
++    };
+     if std::env::var("CCC_IVSR_DEBUG").is_ok() {
+         let mut d: Vec<u32> = iv_derived.keys().copied().collect();
+         d.sort_unstable();
+@@ -592,16 +634,20 @@ fn find_derived_exprs(
+                     eprintln!("[IVSR-DERIV] b{} label={} BinOp v{} op={:?} lhs={:?} rhs={:?}", bi, func.blocks[bi].label.0, dest.0, op, lhs, rhs);
+                 }
+             }
+-            let (mul_dest, iv_idx, stride) = match inst {
+-                // Multiply by constant
++            let (mul_dest, iv_idx, stride, add_offset) = match inst {
++                // Multiply by constant (plain `iv * s`, or affine
++                // `(iv + k) * s` via find_affine).
+                 Instruction::BinOp {
+                     dest, op: IrBinOp::Mul, lhs, rhs, ..
+                 } => {
+                     match (lhs, rhs) {
+                         (Operand::Value(v), Operand::Const(c))
+                         | (Operand::Const(c), Operand::Value(v)) => {
+-                            if let (Some(idx), Some(s)) = (find_iv(v.0), c.to_i64()) {
+-                                (*dest, idx, s)
++                            let s = c.to_i64();
++                            if let (Some(idx), Some(s)) = (find_iv(v.0), s) {
++                                (*dest, idx, s, 0)
++                            } else if let (Some((idx, k)), Some(s)) = (find_affine(v.0), s) {
++                                (*dest, idx, s, k)
+                             } else {
+                                 continue;
+                             }
+@@ -615,7 +661,7 @@ fn find_derived_exprs(
+                 } => {
+                     if let (Some(idx), Some(shift)) = (find_iv(v.0), c.to_i64()) {
+                         if (0..64).contains(&shift) {
+-                            (*dest, idx, 1i64 << shift)
++                            (*dest, idx, 1i64 << shift, 0)
+                         } else {
+                             continue;
+                         }
+@@ -638,7 +684,7 @@ fn find_derived_exprs(
+                 } => {
+                     if l.0 == r.0 {
+                         if let Some(idx) = find_iv(l.0) {
+-                            (*dest, idx, 2)
++                            (*dest, idx, 2, 0)
+                         } else {
+                             continue;
+                         }
+@@ -681,6 +727,7 @@ fn find_derived_exprs(
+                 derived.push(DerivedExpr {
+                     stride,
+                     iv_index: iv_idx,
++                    add_offset,
+                     gep_uses,
+                 });
+             } else if std::env::var("CCC_IVSR_DEBUG").is_ok() {
 -- 
 2.47.3
 
 
-From 57ef7bade74f0b4639ea28439ae5355bd9c7e886 Mon Sep 17 00:00:00 2001
-From: lccc-v6 <v6@localhost>
-Date: Thu, 13 Aug 2026 18:59:46 +0000
-Subject: [PATCH 4/4] v6: update audit report with FP/GEP findings
+From 3e7390c588fe3fd4f10ae5fd899426cc20e1ff56 Mon Sep 17 00:00:00 2001
+From: lccc-v7 <v7@localhost>
+Date: Thu, 13 Aug 2026 20:01:17 +0000
+Subject: [PATCH 4/4] v7: update audit report
 
 ---
- SIMD_REDTEAM_AUDIT.md | 52 +++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 52 insertions(+)
+ SIMD_REDTEAM_AUDIT.md | 55 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 55 insertions(+)
 
 diff --git a/SIMD_REDTEAM_AUDIT.md b/SIMD_REDTEAM_AUDIT.md
-index 03e8c04c..0115db70 100644
+index 0115db70..fae2b661 100644
 --- a/SIMD_REDTEAM_AUDIT.md
 +++ b/SIMD_REDTEAM_AUDIT.md
-@@ -464,3 +464,55 @@ Correctness: nbody / spectral_norm / mandelbrot bit-exact vs gcc; regression
- 4. Branch/switch codegen (expat 3.2x, sqlite_varint 2.0x, switch_dispatch 1.5x)
-    and bit-op selection (bitops 1.9x, linux_find_bit 1.8x).
- 5. matmul `BroadcastLoadF64` hoisting.
+@@ -516,3 +516,58 @@ Correctness: nbody/spectral_norm/mandelbrot/struct_copy bit-exact vs gcc.
+    is a one-line filter widening plus validation).
+ 5. Branch-heavy workloads (expat 3.2x, sqlite_varint 2.1x): boolean
+    `setcc+movzbl+test` chains instead of fused compare-to-branch.
 +
 +---
 +
-+# v6 (2026-08-13) — FP register class xmm8-15, scalar-FP XMM codegen, GEP CSE
++# v7 (2026-08-13) — FP register coalescing, F32 XMM class, affine IVSR
 +
-+## Delivered (all validated; regression 127/127, correctness 50/50, intrinsics 3/3)
++## Delivered (validated; regression 127/127, correctness 50/50, intrinsics 3/3)
 +
-+1. **F64 register class widened xmm2 → xmm2-xmm15 (14 regs).** The allocator
-+   was spilling FP intervals (nbody has 58) even though xmm8-15 were free and
-+   codegen-scratch only touches xmm0/1/2. `phys_reg_name`/`is_xmm_reg` extended
-+   to the REX-extension bank; the assembler already encodes it.
++1. **Post-allocation F64/F32 producer→consumer register coalescing.** A
++   single-use scalar-FP value feeding a binary op is reassigned to its
++   consumer's destination register, so loads land directly in the op's register
++   and the reg-to-reg copy that preceded every FP operation disappears.
++   LHS-only (the emitter loads the LHS into the destination; coalescing the RHS
++   there would let the LHS load clobber it — caught in development as
++   `subsd %xmm4,%xmm4` = 0), processed in reverse program order so a chain
++   folds onto the tail register, with explicit interval-conflict checks. The
++   linear scan is untouched.
++   During development, an iterated linear-scan-hint approach was tried and
++   reverted: it miscompiled `energy()` via a subtle adjacent-interval liveness
++   interaction with the `reg_free_until` bookkeeping (end+1 off-by-one vs
++   `overlaps_with`'s inclusive-end semantics). The post-pass avoids the
++   allocator internals entirely.
 +
-+2. **Scalar FP intrinsics now XMM-allocated.** sqrt/fabs results were excluded
-+   from both the GPR and XMM scans, so their result spilled mid-chain
-+   (nbody's `sqrtsd` + spill + reload). Now `sqrtsd %xmmN,%xmmN` in place;
-+   fabs is a single `andpd/andps` against a rodata mask.
++2. **F32 scalars now XMM-allocated** (was F64-only). Also fixed a latent panic
++   the widening exposed: the register-direct int→float cast read an
++   immediately-consumed source via `value_to_reg`, which panics when there is
++   no slot/register (accumulator-cached); switched to `operand_to_rax`.
 +
-+3. **FP register-direct loads/stores** — for materialized pointers AND for
-+   GEP-folded constant offsets (`movsd 8(%r8),%xmm5`): the fold path only had
-+   an integer register-direct fast path; F64/F32 fell to the GPR round-trip.
-+
-+4. **GEP CSE re-enabled in GVN.** Two GEPs with the same base+offset collapse
-+   to one + a coalesced Copy (was disabled for a pre-register-aware stale-
-+   register defect). nbody recomputed `bodies + i*56` once per field access
-+   (8 leaq + 8 scratch-slot spills); now once.
++3. **Affine IVSR** — `(iv + k) * stride` now strength-reduces with initial
++   offset `(init + k) * stride` (non-constant init + non-zero offset falls
++   back conservatively). Synthetic `(i+1)*2` kernel: zero `imulq` remain.
 +
 +## Measured (min-of-5, pinned, vs gcc -O2)
 +
-+| benchmark | v5 | v6 |
++| benchmark | v6 | v7 |
 +|---|---|---|
-+| mandelbrot | 2.87x | **2.12x** |
-+| nbody | 4.79x | **4.25x** |
-+| spectral_norm | 2.9x | 2.9x |
-+| struct_copy | 6.7x | 6.7x |
++| nbody | 4.25x | **3.48x** (advance copies 34→11) |
++| mandelbrot | 2.12x | **1.89x** |
++| struct_copy | 6.65x | **6.27x** |
 +
-+Correctness: nbody/spectral_norm/mandelbrot/struct_copy bit-exact vs gcc.
++Correctness: 14 benchmarks bit-exact vs gcc; F32/F64 difftests 0..300 exact;
++zlib-ng adler32 correct.
 +
-+## Remaining top-priority work (v7) — precisely diagnosed
++## v8 roadmap (diagnosed this session)
 +
-+1. **Load→FP-op register coalescing**: the allocator assigns the load and the
-+   consuming binop different XMM registers, leaving `movsd %xmm2,%xmm4` before
-+   every op (the reg_hint field in the linear scan is unused). This plus
-+   folded-offset store coalescing is most of the remaining nbody gap.
-+2. **Affine IVSR**: `mul(add(iv,k),stride)` (nbody's `(i+1)*56`) is not
-+   recognized; only `mul(iv,c)` is. Two imulq per outer iteration survive.
-+3. **Parameter register allocation**: F64/GPR params spill to stack at entry
-+   (`movq %xmm0,216(%rsp)`); struct-by-value copies still vmovdqu+shuffle.
-+4. **F32 XMM allocation**: the XMM scan filters `ty == F64` only; F32 values
-+   still go through the stack (the emitters already honor XMM homes, so this
-+   is a one-line filter widening plus validation).
-+5. Branch-heavy workloads (expat 3.2x, sqlite_varint 2.1x): boolean
-+   `setcc+movzbl+test` chains instead of fused compare-to-branch.
++1. **Branch/boolean domain** (expat 3.2x, sqlite_varint 2.1x): range-check
++   folding `(x>=lo && x<=hi) -> (unsigned)(x-lo) <= hi-lo`, fused
++   compare-to-branch for short-circuit booleans, and GPR boolean coalescing
++   (redundant `movl %esi,%ebp; movl %ebp,%r15d` copies). GCC's approach for
++   expat is direct `cmpb $X,%dl; ja/jle` range branches with zero boolean
++   materialization.
++2. **Parameter register allocation** (nbody's `movq %xmm0,216(%rsp)` at entry).
++3. Loop-carried scalar accumulator in an XMM register (the last 2 movsd/iter in
++   reduction loops).
++4. nbody's remaining `imulq` are preheader pointer-inits for non-constant IV
++   inits (reuse `&bodies[i]+56` for `&bodies[i+1]`).
 -- 
 2.47.3
 
