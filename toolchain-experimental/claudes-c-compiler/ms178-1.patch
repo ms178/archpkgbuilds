@@ -1,329 +1,672 @@
-diff --git a/README.md b/README.md
-index 1d546cbe..59249650 100644
---- a/README.md
-+++ b/README.md
-@@ -41,52 +41,96 @@ See [`LICENSING.md`](LICENSING.md) for the full breakdown and per-file guidance.
+From ad1b97c7cfb18cce7ce38b12b63fbe7c04057325 Mon Sep 17 00:00:00 2001
+From: lccc-v4 <v4@localhost>
+Date: Thu, 13 Aug 2026 16:47:41 +0000
+Subject: [PATCH 1/3] v4: byte-offset IV strength reduction for reduction loops
+ + fix latent dot-product IV bug
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Reduction loops (F64/F32/I32 sum and dot, AVX2 and SSE2) now step a
+byte-offset induction variable (stride = elem_size * vec_width) instead of an
+element index, mirroring the matmul path:
+- the GEP offset becomes the byte IV itself (per-iteration shl/leaq/scale gone),
+- VecLoad takes (base, byte_iv) SIB addressing directly,
+- the loop bound becomes floor(N/vec_width)*byte_stride (running ceil
+  iterations would read/write past the array end — the OOB class already fixed
+  in the matmul path),
+- the scalar remainder start becomes byte_iv_final/elem_size.
+
+Falls back to the element-index scheme when the offset chain is not the
+canonical shl/mul(iv_cast, elem_size) shape.
+
+This exposed and fixed a latent bug: the dot-product transform removed two
+instructions at accumulator_add_idx+4, which only happened to delete dead
+scalar code while the element-index Step 2 kept inserting per-GEP multiplies
+that shifted indices. With byte-offset IV the same removal deleted the loop's
+induction-variable increment (infinite loop / undefined IV). It now removes
+only the dead scalar add and lets DCE reclaim the dead multiply.
+
+Validation: 5 reduction kernels x N in 0..300 x {AVX2,SSE2} bit-exact vs
+scalar reference and GCC; large-N (1M) exact; regression 126/126, correctness
+50/50, intrinsics 3/3. Benchmarks unchanged-to-slightly-better (F64 sum/dot at
+GCC parity, F32 dot 2x GCC).
+---
+ src/passes/vectorize.rs | 338 ++++++++++++++++++++++++++++++++++------
+ 1 file changed, 293 insertions(+), 45 deletions(-)
+
+diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
+index bae82a6a..8936313d 100644
+--- a/src/passes/vectorize.rs
++++ b/src/passes/vectorize.rs
+@@ -1684,6 +1684,81 @@ fn find_inst_in_loop<'a>(func: &'a IrFunction, loop_blocks: &FxHashSet<usize>, d
+     None
+ }
  
- ## Baseline fingerprints
- 
--- **LCCC**: revision `77b4a18c` (+ current working tree, `lccc-pgo-v1` profile
--  format), built `cargo build --release` (Rust opt-level 1, two jobs), swap on.
-+- **LCCC**: current `main`, `lccc-pgo-v1` profile format, built
-+  `cargo build --release` (Rust opt-level 1, two jobs), swap on.
- - **GCC**: gcc (Debian 14.2.0-19) 14.2.0.
--- **Flags**: `-O2` for both compilers (uniform).
-+- **Original CCC**: built from `anthropics/claudes-c-compiler` (`main`) with the
-+  same Rust policy, `-O2`.
-+- **Flags**: `-O2` for every compiler (uniform).
- - **Environment**: Linux 6.1, Intel Xeon 2.60 GHz vCPU, `taskset` pinned to one
--  CPU, 9 paired timed rounds + 2 excluded warm-ups, randomized compiler order
-+  CPU, 5 paired timed rounds + 2 excluded warm-ups, randomized compiler order
-   per round, seed `20260813`.
--- **Correctness**: all 25 reported benchmarks produced **byte-identical output**
--  between LCCC and GCC; outliers are counted and reported, never discarded.
-+- **Correctness**: every reported benchmark produced **byte-identical output**
-+  across LCCC, GCC, and the original CCC; outliers are counted and reported,
-+  never discarded.
- 
- ## A/B benchmark: LCCC vs GCC -O2
- 
- | Benchmark | LCCC (ms) | GCC (ms) | LCCC/GCC |
- |---|---:|---:|---:|
--| fib | 2.4 | 170.3 | **0.014× (70× faster)** |
--| ackermann | 2.5 | 152.6 | **0.016× (63× faster)** |
--| constant_recursion | 2.4 | 150.1 | **0.016× (62× faster)** |
--| tce_sum | 2.1 | 2.1 | **0.98×** |
--| qsort | 138.5 | 125.7 | 1.09× |
--| strlen_bench | 241.4 | 222.0 | 1.09× |
--| arith_loop | 109.5 | 99.9 | 1.10× |
--| matmul | 8.5 | 7.1 | 1.21× |
--| fannkuch | 3073 | 2549 | 1.20× |
--| hash_table | 13164 | 10407 | 1.23× |
--| binary_trees | 1536 | 1243 | 1.23× |
--| glibc_memcmp | 12.3 | 9.4 | 1.35× |
--| sieve | 48.6 | 35.4 | 1.36× |
--| gzip_crc32 | 244.3 | 168.3 | 1.45× |
--| switch_dispatch | 739.7 | 502.4 | 1.47× |
--| zlib_ng_adler32 | 68.9 | 39.3 | 1.73× |
--| loop_patterns | 134.9 | 77.3 | 1.74× |
--| linux_find_bit | 27.7 | 15.2 | 1.83× |
--| bitops | 747.5 | 392.0 | 1.90× |
--| sqlite_varint | 54.7 | 26.4 | 2.06× |
--| mandelbrot | 4747 | 1490 | 3.19× |
--| expat_xml_scan | 134.1 | 40.7 | 3.29× |
--| nbody | 1187 | 308 | 3.88× |
--| spectral_norm | 1878 | 201 | 9.34× |
--| struct_copy | 585.5 | 27.9 | 21.06× |
-+| fib | 2.6 | 175.0 | **0.015× (67× faster)** |
-+| ackermann | 2.5 | 151.7 | **0.016× (60× faster)** |
-+| constant_recursion | 2.4 | 149.1 | **0.016× (62× faster)** |
-+| tce_sum | 2.2 | 2.2 | 0.97× |
-+| qsort | 138.7 | 125.6 | 1.10× |
-+| strlen_bench | 282.1 | 260.8 | 1.08× |
-+| arith_loop | 113.1 | 101.6 | 1.13× |
-+| matmul | 9.2 | 7.5 | 1.22× |
-+| fannkuch | 3235 | 2608 | 1.24× |
-+| binary_trees | 1714 | 1416 | 1.22× |
-+| glibc_memcmp | 11.6 | 8.9 | 1.30× |
-+| sieve | 51.4 | 42.1 | 1.23× |
-+| gzip_crc32 | 244.1 | 168.3 | 1.45× |
-+| switch_dispatch | 742.1 | 508.1 | 1.46× |
-+| zlib_ng_adler32 | 67.6 | 38.9 | 1.74× |
-+| loop_patterns | 133.7 | 74.4 | 1.81× |
-+| linux_find_bit | 26.3 | 14.5 | 1.81× |
-+| bitops | 745.1 | 390.0 | 1.91× |
-+| sqlite_varint | 54.2 | 26.0 | 2.07× |
-+| mandelbrot | 4760 | 1489 | 3.20× |
-+| expat_xml_scan | 131.2 | 40.6 | 3.24× |
-+| nbody | 1218 | 313 | 3.89× |
-+| spectral_norm | 1880 | 202 | 9.29× |
-+| struct_copy | 583.7 | 27.5 | 21.18× |
- 
- **Aggregate (n = 25 correct pairs):** geometric mean **1.08×**, arithmetic mean
--2.59× (pulled up by the struct_copy outlier). LCCC is **faster than GCC on
--tail-recursion and constant-recursion** workloads (fib/ackermann ~60–70× via
-+2.60× (pulled up by the struct_copy outlier). LCCC is **faster than GCC on
-+tail-recursion and constant-recursion** workloads (fib/ackermann ~60–67× via
- TCE + recursion-to-iteration), at parity on `tce_sum`, and within ~1.1–1.5× of
- GCC on most integer/ALU/loop kernels.
- 
-+## A/B benchmark: LCCC vs the original Claude's C Compiler
++/// Element size in bytes for a vectorizable reduction element type.
++fn reduction_element_size(ty: IrType) -> Option<u32> {
++    match ty {
++        IrType::F64 => Some(8),
++        IrType::F32 => Some(4),
++        IrType::I32 => Some(4),
++        IrType::I64 => Some(8),
++        _ => None,
++    }
++}
 +
-+The same corpus was compiled with the **original upstream CCC** (before LCCC's
-+optimizations), so the table shows what LCCC improved over its ancestor.
-+`LCCC/CCC < 1` means LCCC is faster.
++/// For a GEP `base + (iv * elem_size)`, return `(base, byte_iv)` where
++/// `byte_iv` is the I64 cast of the induction variable (i.e. the value that
++/// equals the byte offset once the IV steps by `elem_size * vec_width` bytes
++/// instead of one element). Returns `None` when the offset is not the
++/// canonical `shl/mul(iv_cast, elem_size)` shape, so the caller can fall back
++/// to the element-index scheme (scaled GEP offsets + `iv * vec_width`
++/// remainder start).
++fn find_reduction_byte_iv(
++    func: &IrFunction,
++    loop_blocks: &FxHashSet<usize>,
++    gep_val: Value,
++    elem_size: u32,
++) -> Option<(Value, Value)> {
++    let log2 = elem_size.trailing_zeros(); // 4 -> 2, 8 -> 3
++    for &block_idx in loop_blocks {
++        let block = &func.blocks[block_idx];
++        for inst in &block.instructions {
++            if let Instruction::GetElementPtr { dest, base, offset, .. } = inst {
++                if *dest != gep_val {
++                    continue;
++                }
++                let off_val = match offset {
++                    Operand::Value(v) => *v,
++                    _ => return None, // constant offset: not IV-based
++                };
++                for &b2 in loop_blocks {
++                    for inst2 in &func.blocks[b2].instructions {
++                        if inst2.dest() != Some(off_val) {
++                            continue;
++                        }
++                        match inst2 {
++                            Instruction::BinOp { op: IrBinOp::Shl, lhs, rhs, .. } => {
++                                if let (Operand::Value(v), Operand::Const(c)) = (lhs, rhs) {
++                                    if c.to_i64() == Some(log2 as i64) {
++                                        return Some((*base, *v));
++                                    }
++                                }
++                            }
++                            Instruction::BinOp { op: IrBinOp::Mul, lhs, rhs, .. } => {
++                                let iv_op = match (lhs, rhs) {
++                                    (Operand::Value(v), Operand::Const(c)) => {
++                                        c.to_i64().and_then(|k| (k == elem_size as i64).then_some(*v))
++                                    }
++                                    (Operand::Const(c), Operand::Value(v)) => {
++                                        c.to_i64().and_then(|k| (k == elem_size as i64).then_some(*v))
++                                    }
++                                    _ => None,
++                                };
++                                if let Some(v) = iv_op {
++                                    return Some((*base, v));
++                                }
++                            }
++                            _ => {}
++                        }
++                    }
++                }
++                // Offset exists but is not a clean shl/mul by elem_size.
++                return None;
++            }
++        }
++    }
++    None
++}
 +
-+| Benchmark | CCC (ms) | LCCC/CCC |
-+|---|---:|---:|
-+| fib | 770.8 | **0.003× (~300× faster)** |
-+| constant_recursion | 1266.3 | **0.002× (~520×)** |
-+| ackermann | 1277.1 | **0.002× (~510×)** |
-+| matmul | 50.7 | **0.179× (5.6×)** |
-+| zlib_ng_adler32 | 196.2 | **0.345× (2.9×)** |
-+| arith_loop | 259.5 | **0.438× (2.3×)** |
-+| glibc_memcmp | 24.5 | **0.475× (2.1×)** |
-+| fannkuch | 6658 | **0.486× (2.1×)** |
-+| expat_xml_scan | 258.5 | **0.513× (1.95×)** |
-+| sieve | 99.9 | **0.519× (1.9×)** |
-+| nbody | 2268 | **0.547× (1.8×)** |
-+| linux_find_bit | 44.6 | **0.586× (1.7×)** |
-+| struct_copy | 930.8 | **0.626× (1.6×)** |
-+| loop_patterns | 213.0 | **0.625× (1.6×)** |
-+| bitops | 1126.7 | **0.661× (1.5×)** |
-+| sqlite_varint | 73.4 | **0.740× (1.35×)** |
-+| spectral_norm | 2472.5 | **0.761× (1.3×)** |
-+| strlen_bench | 350.2 | **0.805× (1.2×)** |
-+| hash_table | 14249 | **0.889× (1.1×)** |
-+| mandelbrot | 5218 | **0.912× (1.1×)** |
-+| binary_trees | 1848 | **0.944× (1.06×)** |
-+| qsort | 146.2 | **0.948× (1.05×)** |
-+| gzip_crc32 | 256.5 | **0.952× (1.05×)** |
-+| switch_dispatch | 747.4 | **0.993× (~1.0×)** |
-+| tce_sum | *(original CCC failed to run)* | — |
+ /// Verify that a GEP uses the IV as offset (with or without scale).
+ fn verify_gep_pattern(block: &BasicBlock, gep_val: Value, iv: Value) -> Option<()> {
+     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+@@ -2950,6 +3025,7 @@ fn insert_reduction_remainder_loop(
+     vec_width: u64,
+     horizontal_intrinsic: IntrinsicOp,
+     vec_sum_value: Value,  // Accumulated vector SSA value
++    byte_offset_iv: bool,
+     next_val_id: &mut u32,
+     next_label: &mut u32,
+ ) -> usize {
+@@ -3086,13 +3162,25 @@ fn insert_reduction_remainder_loop(
+                 dest_ptr: None,
+                 args: vec![Operand::Value(pattern.accumulator_phi)],
+             },
+-            // Compute starting index for remainder: i_rem_start = iv_final * vec_width
+-            Instruction::BinOp {
+-                dest: i_rem_start,
+-                op: IrBinOp::Mul,
+-                lhs: Operand::Value(pattern.iv),
+-                rhs: Operand::Const(IrConst::I32(vec_width as i32)),
+-                ty: IrType::I32,
++            // Compute starting index for the scalar remainder loop.
++            //   byte-offset IV: start = byte_iv_final / element_size
++            //   element-index IV: start = iv_final * vec_width
++            if byte_offset_iv {
++                Instruction::BinOp {
++                    dest: i_rem_start,
++                    op: IrBinOp::SDiv,
++                    lhs: Operand::Value(pattern.iv),
++                    rhs: Operand::Const(IrConst::I32(element_size as i32)),
++                    ty: IrType::I32,
++                }
++            } else {
++                Instruction::BinOp {
++                    dest: i_rem_start,
++                    op: IrBinOp::Mul,
++                    lhs: Operand::Value(pattern.iv),
++                    rhs: Operand::Const(IrConst::I32(vec_width as i32)),
++                    ty: IrType::I32,
++                }
+             },
+         ],
+         terminator: Terminator::Branch(remainder_header_label),
+@@ -3457,10 +3545,36 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
+         }
+     }
+ 
+-    // Step 1: Divide loop bound by vector width
++    // v4: byte-offset IV strength reduction (mirrors the matmul path). The IV
++    // steps `elem_sz * vec_width` bytes per iteration instead of one element,
++    // so the GEP offset IS the byte IV (no per-iteration shl/leaq/scale) and
++    // VecLoad can use `(base, byte_iv)` addressing directly. Falls back to the
++    // element-index scheme when the offset chain is not the canonical
++    // `shl/mul(iv_cast, elem_sz)` shape.
++    let elem_sz = reduction_element_size(pattern.element_type).unwrap_or(0) as u64;
++    let byte_stride = elem_sz * vec_width;
++    let byte_iv_a = find_reduction_byte_iv(func, &pattern.loop_blocks, pattern.array_a_gep, elem_sz as u32);
++    let byte_iv_b = pattern
++        .array_b_gep
++        .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
++    let use_byte_iv = byte_iv_a.is_some() && (pattern.array_b_gep.is_none() || byte_iv_b.is_some());
 +
-+LCCC is **faster than the original CCC on every benchmark it can run**. The
-+gains come from LCCC's work: **tail-call elimination** and
-+**recursion-to-iteration** (fib/ackermann/constant_recursion — the original CCC
-+executes the exponential recursion, hence ~500×), **AVX2/SSE2 vectorization and
-+FMA** (matmul, reductions, nbody, spectral_norm), **strength reduction /
-+register allocation / IVSR** (arith_loop, loop_patterns, sieve), and
-+**profile-guided inlining and cost-aware devirtualization** (expat, zlib-ng).
++    // Step 1: Divide loop bound by vector width (byte limit under byte-offset IV)
+     let divided_limit = match &pattern.limit {
+-        Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / vec_width as i32)),
+-        Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / vec_width as i64)),
++        Operand::Const(IrConst::I32(n)) => {
++            if use_byte_iv {
++                Operand::Const(IrConst::I32((*n / vec_width as i32) * byte_stride as i32))
++            } else {
++                Operand::Const(IrConst::I32(*n / vec_width as i32))
++            }
++        }
++        Operand::Const(IrConst::I64(n)) => {
++            if use_byte_iv {
++                Operand::Const(IrConst::I64((*n / vec_width as i64) * byte_stride as i64))
++            } else {
++                Operand::Const(IrConst::I64(*n / vec_width as i64))
++            }
++        }
+         Operand::Value(limit_val) => {
+             // Dynamic limit: insert division
+             let div_dest = Value(next_val_id);
+@@ -3491,7 +3605,26 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
+                 eprintln!("[VEC-RED]   Inserted division for dynamic limit: Value({})", div_dest.0);
+             }
+ 
+-            Operand::Value(div_dest)
++            if use_byte_iv {
++                let mul_dest = Value(next_val_id);
++                next_val_id += 1;
++                let mul_inst = Instruction::BinOp {
++                    dest: mul_dest,
++                    op: IrBinOp::Mul,
++                    lhs: Operand::Value(div_dest),
++                    rhs: Operand::Const(match limit_ty {
++                        IrType::I32 => IrConst::I32(byte_stride as i32),
++                        IrType::I64 => IrConst::I64(byte_stride as i64),
++                        _ => IrConst::I64(byte_stride as i64),
++                    }),
++                    ty: limit_ty,
++                };
++                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
++                changes += 1;
++                Operand::Value(mul_dest)
++            } else {
++                Operand::Value(div_dest)
++            }
+         }
+         _ => {
+             if debug {
+@@ -3539,7 +3672,26 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
+         }
+     }
+ 
+-    // Step 2: Scale array indexing by vector width.
++    // v4: byte-offset IV — the latch increment steps by `byte_stride` bytes.
++    if use_byte_iv {
++        let latch = &mut func.blocks[pattern.latch_idx];
++        if pattern.iv_inc_idx < latch.instructions.len() {
++            if let Instruction::BinOp { op: IrBinOp::Add, rhs, .. } = &mut latch.instructions[pattern.iv_inc_idx] {
++                *rhs = match rhs {
++                    Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(byte_stride as i32)),
++                    _ => Operand::Const(IrConst::I64(byte_stride as i64)),
++                };
++                changes += 1;
++                if debug {
++                    eprintln!("[VEC-RED]   Changed IV increment to byte stride {}", byte_stride);
++                }
++            }
++        }
++    }
 +
- ## Where LCCC wins
++    // Step 2: Scale array indexing by vector width (element-index scheme only;
++    // the byte-offset IV already covers vec_width elements per iteration).
++    if !use_byte_iv {
+     // Each GEP's byte offset (element_index * elem_size) must be multiplied by
+     // vec_width so one vector iteration covers vec_width consecutive elements.
+     // Collect ALL matching GEPs first — a dot product has two (array A and
+@@ -3583,6 +3735,7 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
+             eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
+         }
+     }
++    }
  
- - **Tail-call elimination (TCE)** and **binary recursion-to-iteration**: fib,
-diff --git a/docs/benchmarks.md b/docs/benchmarks.md
-index 515f99a6..49f5b4e2 100644
---- a/docs/benchmarks.md
-+++ b/docs/benchmarks.md
-@@ -46,9 +46,9 @@ mixed into a baseline.
- kernel and compiler it builds both a plain binary and a
- `-fprofile-generate → train → -fprofile-use` binary, verifies the outputs are
- identical (differential correctness), and reports paired bootstrap-CI
--PGO-vs-plain and lccc-vs-gcc speedups.  It was used to validate the PGO v10/v11
--changes (flat-profile gate, cost-aware devirtualization, conservative layout)
--and to confirm those builds no longer regress relative to plain.
-+PGO-vs-plain and lccc-vs-gcc speedups.  It validated the profile-guided
-+inlining and cost-aware devirtualization changes and confirms those builds do
-+not regress relative to plain.
+     // Step 3: Transform loop body - register-based vector operations
+     // Vector values are SSA values that live in stack slots (backend keeps in registers when possible)
+@@ -3665,10 +3818,13 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
+                     dest: Some(vec_load),
+                     op: vec_load_op,
+                     dest_ptr: None,
+-                    args: vec![
+-                        Operand::Value(pattern.array_a_gep),
+-                        Operand::Const(IrConst::I64(0)),
+-                    ],
++                    args: {
++                        let (base, off) = match (use_byte_iv, &byte_iv_a) {
++                            (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
++                            _ => (Operand::Value(pattern.array_a_gep), Operand::Const(IrConst::I64(0))),
++                        };
++                        vec![base, off]
++                    },
+                 };
  
- Build the compiler itself under the research build policy (Rust opt-level 1,
- exactly two Cargo jobs) with:
-@@ -106,41 +106,86 @@ Top-Down metrics) in a controlled affinity/governor/thermal environment.
+                 // Vector add: accumulator + loaded vector → new accumulator
+@@ -3793,10 +3949,13 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
+                 dest: Some(vec_load_a),
+                 op: vec_load_op,
+                 dest_ptr: None,
+-                args: vec![
+-                    Operand::Value(pattern.array_a_gep),
+-                    Operand::Const(IrConst::I64(0)),
+-                ],
++                args: {
++                    let (base, off) = match (use_byte_iv, &byte_iv_a) {
++                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
++                        _ => (Operand::Value(pattern.array_a_gep), Operand::Const(IrConst::I64(0))),
++                    };
++                    vec![base, off]
++                },
+             };
  
- ## Current results (screening)
+             // Load vector from array B
+@@ -3804,10 +3963,13 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
+                 dest: Some(vec_load_b),
+                 op: vec_load_op,
+                 dest_ptr: None,
+-                args: vec![
+-                    Operand::Value(pattern.array_b_gep.unwrap()),
+-                    Operand::Const(IrConst::I64(0)),
+-                ],
++                args: {
++                    let (base, off) = match (use_byte_iv, &byte_iv_b) {
++                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
++                        _ => (Operand::Value(pattern.array_b_gep.unwrap()), Operand::Const(IrConst::I64(0))),
++                    };
++                    vec![base, off]
++                },
+             };
  
--A fresh run of the canonical runner (see the reproducible command above) on
--revision `77b4a18c` with `-O2`, 9 paired rounds, pinned to one KVM vCPU:
-+A fresh run of the canonical runner on the current `main`, `-O2`, 5 paired
-+rounds + 2 warm-ups, pinned to one KVM vCPU. The run included three compilers:
-+**LCCC**, **GCC 14.2**, and the **original upstream Claude's C Compiler (CCC)**
-+built from `anthropics/claudes-c-compiler`, so the corpus also shows what LCCC
-+improved over its ancestor.
+             // Multiply vectors: A * B
+@@ -3838,8 +4000,13 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
+             body_block.instructions.insert(pattern.accumulator_add_idx + 2, mul_inst);
+             body_block.instructions.insert(pattern.accumulator_add_idx + 3, add_inst);
+ 
+-            // Remove old scalar add (and possibly mul) - for now, remove 2 instructions
+-            body_block.instructions.remove(pattern.accumulator_add_idx + 4);
++            // Remove the dead scalar add (now after the 4 inserted vector ops).
++            // The dead scalar multiply that fed it becomes unreachable and is
++            // cleaned up by DCE. The old code removed TWO instructions at
++            // accumulator_add_idx + 4, which accidentally deleted the latch's
++            // induction-variable increment once the byte-offset IV stopped
++            // inserting per-GEP multiplies (infinite loop / undefined IV on
++            // dot products).
+             body_block.instructions.remove(pattern.accumulator_add_idx + 4);
+             changes += 4;
+ 
+@@ -3873,6 +4040,7 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
+         vec_width,
+         horizontal_intrinsic,
+         vec_sum_value,  // Pass the vector accumulator SSA value
++        use_byte_iv,
+         &mut next_val_id,
+         &mut next_label,
+     );
+@@ -3975,10 +4143,36 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
+         }
+     }
+ 
+-    // Step 1: Divide loop bound by vector width
++    // v4: byte-offset IV strength reduction (mirrors the matmul path). The IV
++    // steps `elem_sz * vec_width` bytes per iteration instead of one element,
++    // so the GEP offset IS the byte IV (no per-iteration shl/leaq/scale) and
++    // VecLoad can use `(base, byte_iv)` addressing directly. Falls back to the
++    // element-index scheme when the offset chain is not the canonical
++    // `shl/mul(iv_cast, elem_sz)` shape.
++    let elem_sz = reduction_element_size(pattern.element_type).unwrap_or(0) as u64;
++    let byte_stride = elem_sz * vec_width;
++    let byte_iv_a = find_reduction_byte_iv(func, &pattern.loop_blocks, pattern.array_a_gep, elem_sz as u32);
++    let byte_iv_b = pattern
++        .array_b_gep
++        .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
++    let use_byte_iv = byte_iv_a.is_some() && (pattern.array_b_gep.is_none() || byte_iv_b.is_some());
 +
-+### LCCC vs GCC
++    // Step 1: Divide loop bound by vector width (byte limit under byte-offset IV)
+     let divided_limit = match &pattern.limit {
+-        Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / vec_width as i32)),
+-        Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / vec_width as i64)),
++        Operand::Const(IrConst::I32(n)) => {
++            if use_byte_iv {
++                Operand::Const(IrConst::I32((*n / vec_width as i32) * byte_stride as i32))
++            } else {
++                Operand::Const(IrConst::I32(*n / vec_width as i32))
++            }
++        }
++        Operand::Const(IrConst::I64(n)) => {
++            if use_byte_iv {
++                Operand::Const(IrConst::I64((*n / vec_width as i64) * byte_stride as i64))
++            } else {
++                Operand::Const(IrConst::I64(*n / vec_width as i64))
++            }
++        }
+         Operand::Value(limit_val) => {
+             // Dynamic limit: insert division
+             let div_dest = Value(next_val_id);
+@@ -4009,7 +4203,26 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
+                 eprintln!("[VEC-RED]   Inserted division for dynamic limit: Value({})", div_dest.0);
+             }
  
- | Benchmark | LCCC (ms) | GCC (ms) | LCCC/GCC |
- |---|---:|---:|---:|
--| fib | 2.4 | 170.3 | **0.014×** |
--| ackermann | 2.5 | 152.6 | **0.016×** |
--| constant_recursion | 2.4 | 150.1 | **0.016×** |
--| tce_sum | 2.1 | 2.1 | **0.98×** |
--| qsort | 138.5 | 125.7 | 1.09× |
--| strlen_bench | 241.4 | 222.0 | 1.09× |
--| arith_loop | 109.5 | 99.9 | 1.10× |
--| matmul | 8.5 | 7.1 | 1.21× |
--| fannkuch | 3073 | 2549 | 1.20× |
--| hash_table | 13164 | 10407 | 1.23× |
--| binary_trees | 1536 | 1243 | 1.23× |
--| glibc_memcmp | 12.3 | 9.4 | 1.35× |
--| sieve | 48.6 | 35.4 | 1.36× |
--| gzip_crc32 | 244.3 | 168.3 | 1.45× |
--| switch_dispatch | 739.7 | 502.4 | 1.47× |
--| zlib_ng_adler32 | 68.9 | 39.3 | 1.73× |
--| loop_patterns | 134.9 | 77.3 | 1.74× |
--| linux_find_bit | 27.7 | 15.2 | 1.83× |
--| bitops | 747.5 | 392.0 | 1.90× |
--| sqlite_varint | 54.7 | 26.4 | 2.06× |
--| mandelbrot | 4747 | 1490 | 3.19× |
--| expat_xml_scan | 134.1 | 40.7 | 3.29× |
--| nbody | 1187 | 308 | 3.88× |
--| spectral_norm | 1878 | 201 | 9.34× |
--| struct_copy | 585.5 | 27.9 | 21.06× |
-+| fib | 2.6 | 175.0 | **0.015×** |
-+| ackermann | 2.5 | 151.7 | **0.016×** |
-+| constant_recursion | 2.4 | 149.1 | **0.016×** |
-+| tce_sum | 2.2 | 2.2 | 0.97× |
-+| qsort | 138.7 | 125.6 | 1.10× |
-+| strlen_bench | 282.1 | 260.8 | 1.08× |
-+| arith_loop | 113.1 | 101.6 | 1.13× |
-+| matmul | 9.2 | 7.5 | 1.22× |
-+| fannkuch | 3235 | 2608 | 1.24× |
-+| binary_trees | 1714 | 1416 | 1.22× |
-+| glibc_memcmp | 11.6 | 8.9 | 1.30× |
-+| sieve | 51.4 | 42.1 | 1.23× |
-+| gzip_crc32 | 244.1 | 168.3 | 1.45× |
-+| switch_dispatch | 742.1 | 508.1 | 1.46× |
-+| zlib_ng_adler32 | 67.6 | 38.9 | 1.74× |
-+| loop_patterns | 133.7 | 74.4 | 1.81× |
-+| linux_find_bit | 26.3 | 14.5 | 1.81× |
-+| bitops | 745.1 | 390.0 | 1.91× |
-+| sqlite_varint | 54.2 | 26.0 | 2.07× |
-+| mandelbrot | 4760 | 1489 | 3.20× |
-+| expat_xml_scan | 131.2 | 40.6 | 3.24× |
-+| nbody | 1218 | 313 | 3.89× |
-+| spectral_norm | 1880 | 202 | 9.29× |
-+| struct_copy | 583.7 | 27.5 | 21.18× |
+-            Operand::Value(div_dest)
++            if use_byte_iv {
++                let mul_dest = Value(next_val_id);
++                next_val_id += 1;
++                let mul_inst = Instruction::BinOp {
++                    dest: mul_dest,
++                    op: IrBinOp::Mul,
++                    lhs: Operand::Value(div_dest),
++                    rhs: Operand::Const(match limit_ty {
++                        IrType::I32 => IrConst::I32(byte_stride as i32),
++                        IrType::I64 => IrConst::I64(byte_stride as i64),
++                        _ => IrConst::I64(byte_stride as i64),
++                    }),
++                    ty: limit_ty,
++                };
++                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
++                changes += 1;
++                Operand::Value(mul_dest)
++            } else {
++                Operand::Value(div_dest)
++            }
+         }
+         _ => {
+             if debug {
+@@ -4057,7 +4270,26 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
+         }
+     }
  
- All 25 outputs matched GCC byte-for-byte. **Geometric mean 1.08×.** These are
- *screening* numbers (KVM vCPU, no PMU); a bare-metal Raptor Lake rerun with PMU
- evidence is required before hardware claims.
- 
-+### LCCC vs original Claude's C Compiler
+-    // Step 2: Scale array indexing by vector width.
++    // v4: byte-offset IV — the latch increment steps by `byte_stride` bytes.
++    if use_byte_iv {
++        let latch = &mut func.blocks[pattern.latch_idx];
++        if pattern.iv_inc_idx < latch.instructions.len() {
++            if let Instruction::BinOp { op: IrBinOp::Add, rhs, .. } = &mut latch.instructions[pattern.iv_inc_idx] {
++                *rhs = match rhs {
++                    Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(byte_stride as i32)),
++                    _ => Operand::Const(IrConst::I64(byte_stride as i64)),
++                };
++                changes += 1;
++                if debug {
++                    eprintln!("[VEC-RED]   Changed IV increment to byte stride {}", byte_stride);
++                }
++            }
++        }
++    }
 +
-+The same corpus was compiled with the **original upstream CCC** (before LCCC's
-+optimizations). LCCC is faster than the original CCC on **every benchmark**;
-+the ratio is LCCC / CCC, so a value below 1 means LCCC is faster.
++    // Step 2: Scale array indexing by vector width (element-index scheme only;
++    // the byte-offset IV already covers vec_width elements per iteration).
++    if !use_byte_iv {
+     // Each GEP's byte offset (element_index * elem_size) must be multiplied by
+     // vec_width so one vector iteration covers vec_width consecutive elements.
+     // Collect ALL matching GEPs first — a dot product has two (array A and
+@@ -4100,6 +4332,7 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
+             eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
+         }
+     }
++    }
+ 
+     // Step 3: Transform loop body - replace scalar operations with vector intrinsics
+     // Use register-based SSA values for vector operations (no stack allocations)
+@@ -4174,10 +4407,13 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
+                 dest: Some(vec_load),
+                 op: vec_load_op,
+                 dest_ptr: None,
+-                args: vec![
+-                    Operand::Value(pattern.array_a_gep),
+-                    Operand::Const(IrConst::I64(0)),
+-                ],
++                args: {
++                    let (base, off) = match (use_byte_iv, &byte_iv_a) {
++                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
++                        _ => (Operand::Value(pattern.array_a_gep), Operand::Const(IrConst::I64(0))),
++                    };
++                    vec![base, off]
++                },
+             };
+ 
+             // Create vector add (accumulate) - reads from PHI, produces new value
+@@ -4303,20 +4539,26 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
+                 dest: Some(vec_load_a),
+                 op: vec_load_op,
+                 dest_ptr: None,
+-                args: vec![
+-                    Operand::Value(pattern.array_a_gep),
+-                    Operand::Const(IrConst::I64(0)),
+-                ],
++                args: {
++                    let (base, off) = match (use_byte_iv, &byte_iv_a) {
++                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
++                        _ => (Operand::Value(pattern.array_a_gep), Operand::Const(IrConst::I64(0))),
++                    };
++                    vec![base, off]
++                },
+             };
+ 
+             let load_b_inst = Instruction::Intrinsic {
+                 dest: Some(vec_load_b),
+                 op: vec_load_op,
+                 dest_ptr: None,
+-                args: vec![
+-                    Operand::Value(pattern.array_b_gep.unwrap()),
+-                    Operand::Const(IrConst::I64(0)),
+-                ],
++                args: {
++                    let (base, off) = match (use_byte_iv, &byte_iv_b) {
++                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
++                        _ => (Operand::Value(pattern.array_b_gep.unwrap()), Operand::Const(IrConst::I64(0))),
++                    };
++                    vec![base, off]
++                },
+             };
+ 
+             // Create vector multiply (element-wise)
+@@ -4349,8 +4591,13 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
+                 body_block.instructions.insert(pattern.accumulator_add_idx + 2, mul_inst);
+                 body_block.instructions.insert(pattern.accumulator_add_idx + 3, add_inst);
+ 
+-                // Remove old scalar add (and possibly mul) - for now, remove 2 instructions
+-                body_block.instructions.remove(pattern.accumulator_add_idx + 4);
++                // Remove the dead scalar add (now after the 4 inserted vector
++                // ops). The dead scalar multiply that fed it becomes unreachable
++                // and is cleaned up by DCE. The old code removed TWO
++                // instructions at accumulator_add_idx + 4, which accidentally
++                // deleted the latch's induction-variable increment once the
++                // byte-offset IV stopped inserting per-GEP multiplies
++                // (infinite loop / undefined IV on dot products).
+                 body_block.instructions.remove(pattern.accumulator_add_idx + 4);
+                 changes += 4;
+             }
+@@ -4384,6 +4631,7 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
+         vec_width,
+         horizontal_intrinsic,
+         vec_sum_value,  // Pass the vector accumulator SSA value
++        use_byte_iv,
+         &mut next_val_id,
+         &mut next_label,
+     );
+-- 
+2.47.3
+
+
+From 8b7ccba0226bcc6d319146ab70dcd51ed4658d78 Mon Sep 17 00:00:00 2001
+From: lccc-v4 <v4@localhost>
+Date: Thu, 13 Aug 2026 16:49:27 +0000
+Subject: [PATCH 2/3] v4: update SIMD audit report with byte-offset IV findings
+
+---
+ SIMD_REDTEAM_AUDIT.md | 52 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+diff --git a/SIMD_REDTEAM_AUDIT.md b/SIMD_REDTEAM_AUDIT.md
+index d132a686..ee7c0323 100644
+--- a/SIMD_REDTEAM_AUDIT.md
++++ b/SIMD_REDTEAM_AUDIT.md
+@@ -355,3 +355,55 @@ remains ~2× faster than GCC/Clang.
+    shl/leaq vs the byte-offset IV the matmul path already uses).
+ 3. Store-loop / general loop vectorization (dataflow-driven).
+ 4. matmul `BroadcastLoadF64` hoisting (still blocked on register allocation).
 +
-+| Benchmark | CCC (ms) | LCCC/CCC |
-+|---|---:|---:|
-+| fib | 770.8 | **0.003× (~300× faster)** |
-+| constant_recursion | 1266.3 | **0.002× (~520×)** |
-+| ackermann | 1277.1 | **0.002× (~510×)** |
-+| matmul | 50.7 | **0.179× (5.6×)** |
-+| zlib_ng_adler32 | 196.2 | **0.345× (2.9×)** |
-+| arith_loop | 259.5 | **0.438× (2.3×)** |
-+| glibc_memcmp | 24.5 | **0.475× (2.1×)** |
-+| fannkuch | 6658 | **0.486× (2.1×)** |
-+| expat_xml_scan | 258.5 | **0.513× (1.95×)** |
-+| sieve | 99.9 | **0.519× (1.9×)** |
-+| nbody | 2268 | **0.547× (1.8×)** |
-+| linux_find_bit | 44.6 | **0.586× (1.7×)** |
-+| struct_copy | 930.8 | **0.626× (1.6×)** |
-+| loop_patterns | 213.0 | **0.625× (1.6×)** |
-+| bitops | 1126.7 | **0.661× (1.5×)** |
-+| sqlite_varint | 73.4 | **0.740× (1.35×)** |
-+| spectral_norm | 2472.5 | **0.761× (1.3×)** |
-+| strlen_bench | 350.2 | **0.805× (1.2×)** |
-+| hash_table | 14249 | **0.889× (1.1×)** |
-+| mandelbrot | 5218 | **0.912× (1.1×)** |
-+| binary_trees | 1848 | **0.944× (1.06×)** |
-+| qsort | 146.2 | **0.948× (1.05×)** |
-+| gzip_crc32 | 256.5 | **0.952× (1.05×)** |
-+| switch_dispatch | 747.4 | **0.993× (~1.0×)** |
-+| tce_sum | *(CCC failed to run)* | — |
++---
 +
-+The gains trace directly to LCCC's work: **tail-call elimination** and
-+**recursion-to-iteration** (fib/ackermann/constant_recursion — the original CCC
-+executes the exponential recursion, hence ~500×), **AVX2/SSE2 vectorization and
-+FMA** (matmul, reductions, nbody, spectral_norm), **strength reduction /
-+register allocation / IVSR** (arith_loop, loop_patterns, sieve), and
-+**PGO-driven inlining and devirtualization** (expat, zlib-ng).
++# v4 (2026-08-13) — byte-offset IV strength reduction + latent dot-product fix
 +
- ## Historical snapshot (not current evidence)
- 
- The material below documents an earlier six-microbenchmark report.  Its
-diff --git a/hotspots/README.md b/hotspots/README.md
-index 6476eace..1d575061 100644
---- a/hotspots/README.md
-+++ b/hotspots/README.md
-@@ -51,7 +51,8 @@ to regenerate them must stay in the repository.
- ## Current entries
- 
- - [`RESEARCH_BACKLOG.md`](RESEARCH_BACKLOG.md) — prioritized, evidence-linked
--  optimization queue (now including the integrated PGO v10/v11 items and new
-+  optimization queue (now including the integrated profile-guided optimization
-+  items and new
-   research spikes such as use-def chains, PGO loop-versioned devirtualization,
-   and sample-based PGO).
- - [`expat_xml_scan_static_leaf_inlining.md`](expat_xml_scan_static_leaf_inlining.md)
-diff --git a/hotspots/pgo_regressions_eliminated.md b/hotspots/pgo_regressions_eliminated.md
-index 4c28c4f0..d69e203e 100644
---- a/hotspots/pgo_regressions_eliminated.md
-+++ b/hotspots/pgo_regressions_eliminated.md
-@@ -1,4 +1,4 @@
--# PGO v10/v11 — measured regressions eliminated, devirtualization made cost-aware
-+# Profile-guided optimization — measured regressions eliminated, devirtualization made cost-aware
- 
- Status: `integrated` — correctness, differential testing, real workloads, and
- regression policy passed. Hardware (Raptor Lake PMU) follow-up remains.
-diff --git a/tests/benchmark/run_benchmarks.py b/tests/benchmark/run_benchmarks.py
-index f6c0a0b6..67060fc5 100644
---- a/tests/benchmark/run_benchmarks.py
-+++ b/tests/benchmark/run_benchmarks.py
-@@ -259,13 +259,14 @@ def discover_compilers(args: argparse.Namespace) -> tuple[list[CompilerSpec], di
-     requested = [item.strip().lower() for item in args.compilers.split(",") if item.strip()]
-     aliases = {"icc": "icx"}
-     requested = [aliases.get(item, item) for item in requested]
--    known = {"lccc", "gcc", "clang", "icx"}
-+    known = {"lccc", "ccc", "gcc", "clang", "icx"}
-     unknown = [item for item in requested if item not in known]
-     if unknown:
-         raise ValueError(f"unknown compiler key(s): {', '.join(unknown)}")
- 
-     candidates = {
-         "lccc": ("LCCC", args.lccc),
-+        "ccc": ("CCC", args.ccc),
-         "gcc": ("GCC", args.gcc),
-         "clang": ("Clang", args.clang),
-         "icx": ("ICX", args.icx),
-@@ -281,9 +282,9 @@ def discover_compilers(args: argparse.Namespace) -> tuple[list[CompilerSpec], di
-         if not executable:
-             unavailable[key] = f"not found: {supplied}"
-             continue
--        if key == "lccc":
-+        if key in ("lccc", "ccc"):
-             if not gcc_include:
--                unavailable[key] = "GCC builtin include directory unavailable (needed for LCCC headers)"
-+                unavailable[key] = "GCC builtin include directory unavailable (needed for compiler headers)"
-                 continue
-             flags = (f"-I{gcc_include}", args.opt, *args.cflag)
-         else:
-@@ -1008,6 +1009,7 @@ def main() -> int:
-     parser.add_argument("--gcc", default="gcc", help="GCC executable")
-     parser.add_argument("--clang", default="clang", help="Clang executable")
-     parser.add_argument("--icx", default="icx", help="ICX executable")
-+    parser.add_argument("--ccc", default="", help="path to the original Claude's C Compiler executable (Anthropic upstream)")
-     parser.add_argument("--opt", default="-O2", help="optimization flag passed uniformly to every compiler")
-     parser.add_argument("--cflag", action="append", default=[], help="additional common compiler flag; may be repeated")
-     parser.add_argument("--reps", type=int, default=15, help="timed paired rounds per benchmark (default: %(default)s)")
++## Delivered
++
++1. **Byte-offset IV for reduction loops.** F64/F32/I32 sum and dot products (AVX2
++   and SSE2) now step a byte-offset induction variable (stride = elem_size ×
++   vec_width) instead of an element index, mirroring the matmul path:
++   - the GEP offset becomes the byte IV itself (per-iteration shl/leaq/scale
++     chain removed),
++   - VecLoad takes `(base, byte_iv)` SIB addressing directly,
++   - the loop bound becomes `floor(N/vec_width) * byte_stride` (running ceil
++     iterations would read/write past the array end — the OOB class fixed in
++     the matmul path),
++   - the scalar remainder start becomes `byte_iv_final / elem_size`.
++   Falls back to the element-index scheme when the offset chain is not the
++   canonical `shl/mul(iv_cast, elem_size)` shape.
++
++2. **Latent dot-product bug fixed.** The dot-product transform removed two
++   instructions at `accumulator_add_idx + 4`, which only deleted dead scalar
++   code while the element-index Step 2 kept inserting per-GEP multiplies that
++   shifted indices. Under byte-offset IV the same removal deleted the loop's
++   induction-variable increment (infinite loop / undefined IV). It now removes
++   only the dead scalar add and lets DCE reclaim the dead multiply.
++
++## Validation
++
++- 5 reduction kernels × N ∈ {0..300} × {AVX2, SSE2}: bit-exact vs scalar
++  reference and GCC (edge cases 0, 1, 3, 4, 7, 8 included).
++- Large-N (10⁶) exact in both modes.
++- regression 126/126, correctness 50/50, intrinsics 3/3.
++
++## Benchmarks (min-of-5, pinned core)
++
++| kernel | lccc v4 | gcc |
++|---|---|---|
++| F64 sum 1M | 0.620 s | 0.614 s |
++| F64 dot 1M | 0.252 s | 0.249 s |
++| F32 dot 1M | 0.123 s | 0.245 s |
++
++## Remaining top-priority work (v5)
++
++1. **YMM register allocation for loop-carried accumulators** — closes the
++   per-iteration accumulator copy + temp-store/load (3–4 instr/iter on every
++   reduction loop) and the adler32 5.3× intrinsic-chain gap. Needs a YMM
++   PhysReg class with XMM/YMM aliasing awareness (or width-partitioned pools).
++2. Remove the dead strength-reduced pointer that IVSR emits on top of the
++   byte-offset SIB addressing (1 instr/iter).
++3. Store-loop / general dataflow-driven loop vectorization.
++4. matmul `BroadcastLoadF64` hoisting (unblocks once registers land).
+-- 
+2.47.3
+
+
+From eea98dc9134cb892b93923e212dbe2dbfd5203da Mon Sep 17 00:00:00 2001
+From: lccc-v4 <v4@localhost>
+Date: Thu, 13 Aug 2026 16:51:03 +0000
+Subject: [PATCH 3/3] v4: add dynamic-bound reduction regression test
+ (byte-offset IV)
+
+Sweeps runtime (non-constant) loop bounds for F64 sum/dot, F32 sum, and I32
+sum across edge values; would catch the dot-product induction-variable bug the
+byte-offset IV exposed. regression 127/127.
+---
+ tests/regression/vectorize_reduction_dyn.c | 45 ++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
+ create mode 100644 tests/regression/vectorize_reduction_dyn.c
+
+diff --git a/tests/regression/vectorize_reduction_dyn.c b/tests/regression/vectorize_reduction_dyn.c
+new file mode 100644
+index 00000000..e1717b5f
+--- /dev/null
++++ b/tests/regression/vectorize_reduction_dyn.c
+@@ -0,0 +1,45 @@
++/* Dynamic-loop-bound reduction vectorization: the byte-offset IV computes the
++ * vector limit as floor(n/vec_width)*byte_stride at runtime (div+mul), and the
++ * scalar remainder starts at byte_iv_final/element_size. A latent dot-product
++ * bug deleted the induction-variable increment here (infinite loop). */
++#include <stdio.h>
++#include <stdlib.h>
++
++double da[1024], db[1024];
++float fa[1024], fb[1024];
++int ia[1024];
++
++static double dsum(double *x, int n) { double s = 0; for (int i = 0; i < n; i++) s += x[i]; return s; }
++static double ddot(double *x, double *y, int n) { double s = 0; for (int i = 0; i < n; i++) s += x[i] * y[i]; return s; }
++static float fsum(float *x, int n) { float s = 0; for (int i = 0; i < n; i++) s += x[i]; return s; }
++static int isum(int *x, int n) { int s = 0; for (int i = 0; i < n; i++) s += x[i]; return s; }
++
++int main(int argc, char **argv) {
++    for (int i = 0; i < 1024; i++) {
++        da[i] = (double)(i + 1); db[i] = (double)(i + 1); /* exact in f64 */
++        fa[i] = (float)(i + 1); ia[i] = i + 1;
++    }
++    if (argc > 1) {
++        /* single runtime bound from argv */
++        int n = atoi(argv[1]);
++        long long nn = n;
++        if (dsum(da, n) != (double)(nn * (nn + 1)) / 2.0) { printf("FAIL dsum n=%d\n", n); return 1; }
++        if (ddot(da, db, n) != (double)(nn * (nn + 1) * (2 * nn + 1)) / 6.0) { printf("FAIL ddot n=%d\n", n); return 1; }
++        if (fsum(fa, n) != (float)(nn * (nn + 1)) / 2.0f) { printf("FAIL fsum n=%d\n", n); return 1; }
++        if (isum(ia, n) != (int)(nn * (nn + 1)) / 2) { printf("FAIL isum n=%d\n", n); return 1; }
++        printf("OK n=%d\n", n);
++        return 0;
++    }
++    /* default: sweep a range of runtime bounds (each is a real runtime value) */
++    static const int ns[] = {0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 63, 64, 65, 127, 129, 255, 256, 257, 300};
++    for (unsigned k = 0; k < sizeof(ns) / sizeof(ns[0]); k++) {
++        int n = ns[k];
++        long long nn = n;
++        if (dsum(da, n) != (double)(nn * (nn + 1)) / 2.0) { printf("FAIL dsum n=%d\n", n); return 1; }
++        if (ddot(da, db, n) != (double)(nn * (nn + 1) * (2 * nn + 1)) / 6.0) { printf("FAIL ddot n=%d\n", n); return 1; }
++        if (fsum(fa, n) != (float)(nn * (nn + 1)) / 2.0f) { printf("FAIL fsum n=%d\n", n); return 1; }
++        if (isum(ia, n) != (int)(nn * (nn + 1)) / 2) { printf("FAIL isum n=%d\n", n); return 1; }
++    }
++    printf("OK dynamic bounds sweep\n");
++    return 0;
++}
+-- 
+2.47.3
+
