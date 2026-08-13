@@ -1,637 +1,567 @@
-From a328f763932900581051594ca8ee06abeb3d5a78 Mon Sep 17 00:00:00 2001
-From: lccc-v9 <v9@localhost>
-Date: Thu, 13 Aug 2026 22:22:18 +0000
-Subject: [PATCH 1/4] v9: extend producer-follow hints to Copy, GPR unary, and
- FP Sqrt/Fabs
+From d28b0e7fa43e9998ba70351c0fac31084e3cfc08 Mon Sep 17 00:00:00 2001
+From: lccc-v10 <v10@localhost>
+Date: Thu, 13 Aug 2026 22:53:54 +0000
+Subject: [PATCH 1/3] v10: fix FP constant-pool alignment (andpd/andps need
+ 16-byte slots)
 
-The linear-scan follow hints previously covered only FP BinOp LHS. Extend
-them to every instruction whose emitter computes the result INTO the
-destination register with the operand pre-loaded, so die-at-birth sharing
-removes a copy instead of corrupting a value:
+emit_fp_const_pool emitted each FP constant with .align 8 and 8 bytes of
+data, but the Fabs emitter loads these constants with andpd/andps, whose
+m128 memory operand must be 16-byte aligned. With a single FP function the
+8-byte constant happened to land on a 16-aligned offset; with two or more
+FP functions the layout shifted and the Fabs mask landed on an 8-mod-16
+offset, raising #GP (SIGSEGV at the andpd). Reproduced on the pre-v8 base
+(d1a129e5), so this is pre-existing, not a v8/v9 regression.
 
-- Copy: emit_copy_value emits nothing when dest and source share a register,
-  so every Copy is a free coalescing edge (GPR and FP alike).
-- GPR unary Neg/Not/Bswap: emit_unaryop_impl moves the source into the dest
-  register and applies the op in place (neg %reg).
-- Scalar FP Sqrt/Fabs: emit_fp_scalar_unary / the Fabs path load the argument
-  into the dest register and apply sqrtsd/sqrtss/andpd/andps in place.
-
-The allocator's conflicts_with() still gates every share on die-at-birth
-compatibility, so a long-lived or multi-use producer simply leaves the hint
-unhonoured. Measured neutral on the corpus (copy_prop already forwards most
-GPR copies; the remaining mov chains come from casts, not Copies), but the
-mechanism is now general as designed.
+Every constant now gets a 16-byte-aligned, 16-byte slot (value + zero pad):
+the scalar readers (movsd/movss) read the first 8/4 bytes unchanged, the
+andpd/andps read a correctly-aligned 128-bit mask whose upper lane is zero.
+Caught by the new v8_fp_die_at_birth regression test (F64 fabs + F32 fabs
+in one TU).
 ---
- src/backend/live_range.rs | 90 +++++++++++++++++++++++++++------------
- 1 file changed, 63 insertions(+), 27 deletions(-)
+ src/backend/state.rs | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
 
-diff --git a/src/backend/live_range.rs b/src/backend/live_range.rs
-index c5bac936..e095e940 100644
---- a/src/backend/live_range.rs
-+++ b/src/backend/live_range.rs
-@@ -16,7 +16,8 @@ use super::liveness::{
- use super::regalloc::PhysReg;
- use crate::common::fx_hash::FxHashMap;
- use crate::common::types::IrType;
--use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator};
-+use crate::ir::intrinsics::IntrinsicOp;
-+use crate::ir::reexports::{Instruction, IrFunction, IrUnaryOp, Operand, Terminator};
+diff --git a/src/backend/state.rs b/src/backend/state.rs
+index ca79413f..a77320c6 100644
+--- a/src/backend/state.rs
++++ b/src/backend/state.rs
+@@ -467,6 +467,16 @@ impl CodegenState {
  
- /// Enhanced live interval with priority, uses, and spill weight.
- ///
-@@ -876,41 +877,76 @@ fn record_terminator_uses(term: &Terminator, point: u32, uses: &mut FxHashMap<u3
- 
- /// Compute producer→consumer register-following hints.
- ///
--/// For an FP BinOp `d = lhs op rhs`, the x86 FP emitter computes the result
--/// into `d`'s allocated register and first loads the LHS there
--/// (`emit_float_binop_into_reg`). When `d` is allocated to the same register
--/// as `lhs`, that load is a no-op — a whole register copy disappears per
--/// chain link. We therefore record `d → lhs` as a FOLLOW hint: at allocation
--/// time the consumer resolves the producer's already-assigned register and
--/// prefers it (see `LinearScanAllocator::find_free_register`).
-+/// A hint `consumer → producer` makes the consumer prefer the producer's
-+/// register at allocation time (see `LinearScanAllocator::find_free_register`),
-+/// and the allocator's `conflicts_with` honours it only when the producer's
-+/// final use IS the consumer's definition (use-before-def at a shared point).
-+/// Hints are recorded only for instructions whose emitter computes the result
-+/// INTO the destination register with the operand pre-loaded, so die-at-birth
-+/// sharing removes a register copy instead of corrupting a value:
- ///
--/// Only the LHS is hinted. The emitter loads the LHS into the destination
--/// register; hinting the RHS would place it in that same register, where the
--/// LHS load would clobber it before it is read (observed miscompile:
--/// `subsd %xmm4, %xmm4` ≡ 0). RHS sharing is therefore never requested.
--///
--/// The allocator's `conflicts_with` performs the soundness check: a follow
--/// hint is honoured only when producer and consumer are die-at-birth
--/// compatible (the producer's final use IS the consumer's definition, so the
--/// read precedes the write). A long-lived or multi-use producer simply leaves
--/// the hint unhonoured and the consumer falls back to a free register —
--/// over-hinting never removes an allocation option.
-+/// - FP BinOp LHS: `emit_float_binop_into_reg` loads the LHS into the dest and
-+///   applies `addsd/subsd/... rhs, dest`. Only the LHS is hinted — the RHS
-+///   would be clobbered by the LHS load before it is read (observed
-+///   miscompile: `subsd %xmm4,%xmm4` ≡ 0).
-+/// - Copy: `emit_copy_value` emits nothing when dest and source share a
-+///   register, so every Copy is a free coalescing edge (GPR and FP alike).
-+/// - GPR unary Neg/Not/Bswap: `emit_unaryop_impl` moves the source into the
-+///   dest register then applies the op in place (`neg %reg`).
-+/// - Scalar FP Sqrt/Fabs intrinsics: `emit_fp_scalar_unary` / the Fabs path
-+///   load the argument into the dest register and apply
-+///   `sqrtsd/sqrtss/andpd/andps` in place.
- ///
- /// Returns a map: consumer value id → producer value id to follow.
- fn find_register_hints(func: &IrFunction) -> FxHashMap<u32, u32> {
-     let mut hints: FxHashMap<u32, u32> = FxHashMap::default();
-     for block in &func.blocks {
-         for inst in &block.instructions {
--            if let Instruction::BinOp {
--                dest,
--                lhs: Operand::Value(lhs),
--                ty,
--                ..
--            } = inst
--            {
--                if *ty == IrType::F64 || *ty == IrType::F32 {
-+            match inst {
-+                Instruction::BinOp {
-+                    dest,
-+                    lhs: Operand::Value(lhs),
-+                    ty,
-+                    ..
-+                } if *ty == IrType::F64 || *ty == IrType::F32 => {
-                     hints.insert(dest.0, lhs.0);
-                 }
-+                Instruction::Copy {
-+                    dest,
-+                    src: Operand::Value(src),
-+                } => {
-+                    hints.insert(dest.0, src.0);
-+                }
-+                Instruction::UnaryOp {
-+                    dest,
-+                    op,
-+                    src: Operand::Value(src),
-+                    ty,
-+                } if !ty.is_float()
-+                    && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128)
-+                    && matches!(op, IrUnaryOp::Neg | IrUnaryOp::Not | IrUnaryOp::Bswap) =>
-+                {
-+                    hints.insert(dest.0, src.0);
-+                }
-+                Instruction::Intrinsic {
-+                    dest: Some(dest),
-+                    op,
-+                    args,
-+                    ..
-+                } => {
-+                    if matches!(
-+                        op,
-+                        IntrinsicOp::SqrtF64
-+                            | IntrinsicOp::SqrtF32
-+                            | IntrinsicOp::FabsF64
-+                            | IntrinsicOp::FabsF32
-+                    ) {
-+                        if let [Operand::Value(src)] = args.as_slice() {
-+                            hints.insert(dest.0, src.0);
-+                        }
-+                    }
-+                }
-+                _ => {}
-             }
+     /// Emit all accumulated FP constants as a .rodata section.
+     /// Called once at the end of module codegen.
++    ///
++    /// Every constant gets a 16-byte-aligned, 16-byte slot (the 8-byte value
++    /// followed by an 8-byte zero pad). The scalar readers (movsd/movss) only
++    /// read the first 8/4 bytes, but the Fabs emitter loads these constants
++    /// with `andpd`/`andps`, whose m128 memory operand must be 16-byte
++    /// aligned — an 8-byte-aligned slot raises #GP whenever the constant
++    /// lands on an 8-mod-16 offset (reproduced: two FP functions in one TU,
++    /// F64 fabs + F32 fabs, SIGSEGV at the andpd). The zero pad also makes
++    /// the upper lane of the andpd mask zero, which is the correct identity
++    /// for scalar-typed lanes.
+     pub fn emit_fp_const_pool(&mut self) {
+         if self.fp_const_pool.is_empty() {
+             return;
+@@ -476,10 +486,11 @@ impl CodegenState {
+         let mut entries: Vec<_> = self.fp_const_pool.iter().collect();
+         entries.sort_by_key(|(_, label)| (*label).clone());
+         for (bits, label) in entries {
+-            self.out.emit(".align 8");
++            self.out.emit(".align 16");
+             self.out.emit_fmt(format_args!("{}:", label));
+             self.out
+                 .emit_fmt(format_args!("    .quad {}", *bits as i64));
++            self.out.emit("    .quad 0");
          }
      }
+ 
 -- 
 2.47.3
 
 
-From b465af33763eb48425042080ff6b71aa61c1ff83 Mon Sep 17 00:00:00 2001
-From: lccc-v9 <v9@localhost>
-Date: Thu, 13 Aug 2026 22:22:18 +0000
-Subject: [PATCH 2/4] v9: keep short-circuit || diamonds branchy in
- if-conversion
+From d6af3e26462809fa07b0d1301eb5088c4d58b6ff Mon Sep 17 00:00:00 2001
+From: lccc-v10 <v10@localhost>
+Date: Thu, 13 Aug 2026 22:53:54 +0000
+Subject: [PATCH 2/3] v10: regression tests for the v8/v9 optimizations
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
- (a || b) if-converts to a cmov chain, but its whole point is
-short-circuit evaluation: a branch is cheaper and lets the backend fuse each
-compare straight into a jump (no setcc+movzbl+test+cmov per link). Skip
-if-conversion when every converted phi has the || shape (true arm == const 1)
-and its result is consumed only by control flow (branch conditions, boolean
-negations Cmp(Eq/Ne,0/1), Select conditions, through Copy/Cast/Phi edges).
+End-to-end coverage (differential vs GCC) for everything introduced this
+session that lacked a regression test:
 
-The && shape (false arm == const 0) is still converted, because that is the
-Select(cond, Cmp, 0) pattern the range-check fold collapses into one sub+cmp,
-which then fuses into the surrounding || branch.
+- v8_range_check_fold: every shape the range-check pass folds — inclusive
+  &&, exclusive ||, collapsed ==, reversed empty ranges, signed/unsigned,
+  all widths, cast-chain matching, and untouched single-compare controls,
+  checksummed over all byte values + INT/LLONG edges.
+- v9_short_circuit_sidefx: short-circuit evaluation order with observable
+  global side effects (the || diamonds if-conversion now keeps branchy, and
+  flag fusion skips materialization — both must preserve && / || semantics).
+- v8_fp_die_at_birth: F64/F32 chains, Sqrt/Fabs/Neg, energy-style
+  accumulation (exposed the pre-existing FP constant-pool alignment bug).
+- v9_gpr_unary_hints: Neg/Not/Bswap (incl. __builtin_bswap16/32/64) over
+  edge values and wraparound.
+- v9_cast_chain_fold: widen-then-narrow cast chains across widths and
+  signedness.
+- v9_flag_fusion_cast: Cmp->Cast->branch fusion vs boolean-as-data
+  materialization.
 
-Measured: expat_xml_scan 3.13x -> 2.90x; regression 127 passed / 0 failed,
-correctness 50/50, intrinsics 3/3. New unit tests test_value_only_controls_branch
-and test_skip_boolean_diamond_or_shape.
+Regression suite: 127 -> 133 tests, all passing with --compare-gcc.
 ---
- src/passes/if_convert.rs | 297 ++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 296 insertions(+), 1 deletion(-)
+ tests/regression/v8_fp_die_at_birth.c      | 59 +++++++++++++++++++
+ tests/regression/v8_fp_die_at_birth.flags  |  1 +
+ tests/regression/v8_range_check_fold.c     | 68 ++++++++++++++++++++++
+ tests/regression/v9_cast_chain_fold.c      | 44 ++++++++++++++
+ tests/regression/v9_flag_fusion_cast.c     | 41 +++++++++++++
+ tests/regression/v9_gpr_unary_hints.c      | 52 +++++++++++++++++
+ tests/regression/v9_short_circuit_sidefx.c | 57 ++++++++++++++++++
+ 7 files changed, 322 insertions(+)
+ create mode 100644 tests/regression/v8_fp_die_at_birth.c
+ create mode 100644 tests/regression/v8_fp_die_at_birth.flags
+ create mode 100644 tests/regression/v8_range_check_fold.c
+ create mode 100644 tests/regression/v9_cast_chain_fold.c
+ create mode 100644 tests/regression/v9_flag_fusion_cast.c
+ create mode 100644 tests/regression/v9_gpr_unary_hints.c
+ create mode 100644 tests/regression/v9_short_circuit_sidefx.c
 
-diff --git a/src/passes/if_convert.rs b/src/passes/if_convert.rs
-index 73ff16d8..a1a21e60 100644
---- a/src/passes/if_convert.rs
-+++ b/src/passes/if_convert.rs
-@@ -41,6 +41,7 @@ use crate::ir::reexports::{
-     BasicBlock,
-     BlockId,
-     Instruction,
-+    IrCmpOp,
-     IrFunction,
-     Operand,
-     Terminator,
-@@ -48,7 +49,7 @@ use crate::ir::reexports::{
- };
- use crate::ir::analysis;
- use crate::common::types::IrType;
--use crate::common::fx_hash::FxHashMap;
-+use crate::common::fx_hash::{FxHashMap, FxHashSet};
- 
- /// Run if-conversion on a single function.
- pub(crate) fn if_convert_function(func: &mut IrFunction) -> usize {
-@@ -249,6 +250,139 @@ fn same_value_or_both_zero(a: &Operand, b: &Operand) -> bool {
-     }
- }
- 
-+/// Whether `v` is consumed only by control flow (never materialized as data),
-+/// so the branchy form is at least as good as a cmov Select. Recursively
-+/// follows boolean-preserving edges: `Cmp(Eq/Ne, 0/1)`, `Select` conditions,
-+/// `Copy`, `Cast`, and `Phi` incoming values.
-+fn value_only_controls_branch(func: &IrFunction, v: Value, visited: &mut FxHashSet<u32>) -> bool {
-+    if !visited.insert(v.0) {
-+        return true; // cycle: nothing data-like seen yet
-+    }
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            match inst {
-+                Instruction::Cmp { dest, op, lhs, rhs, .. } => {
-+                    if matches!(lhs, Operand::Value(x) if x.0 == v.0)
-+                        || matches!(rhs, Operand::Value(x) if x.0 == v.0)
-+                    {
-+                        // Only a boolean negation (v == 0 / v != 0 / v == 1 / v != 1)
-+                        // preserves branch-likeness; any other comparison is data.
-+                        let other = if matches!(lhs, Operand::Value(x) if x.0 == v.0) {
-+                            rhs
-+                        } else {
-+                            lhs
-+                        };
-+                        let is_bool_cmp = matches!(op, IrCmpOp::Eq | IrCmpOp::Ne)
-+                            && matches!(other, Operand::Const(c) if c.to_i64() == Some(0) || c.to_i64() == Some(1));
-+                        if !is_bool_cmp || !value_only_controls_branch(func, *dest, visited) {
-+                            return false;
-+                        }
-+                    }
-+                }
-+                Instruction::Select {
-+                    dest,
-+                    cond,
-+                    true_val,
-+                    false_val,
-+                    ..
-+                } => {
-+                    if matches!(cond, Operand::Value(x) if x.0 == v.0) {
-+                        if !value_only_controls_branch(func, *dest, visited) {
-+                            return false;
-+                        }
-+                    } else if matches!(true_val, Operand::Value(x) if x.0 == v.0)
-+                        || matches!(false_val, Operand::Value(x) if x.0 == v.0)
-+                    {
-+                        return false; // selected as a data value
-+                    }
-+                }
-+                Instruction::Copy { dest, src, .. } => {
-+                    if matches!(src, Operand::Value(x) if x.0 == v.0)
-+                        && !value_only_controls_branch(func, *dest, visited)
-+                    {
-+                        return false;
-+                    }
-+                }
-+                Instruction::Cast { dest, src, .. } => {
-+                    if matches!(src, Operand::Value(x) if x.0 == v.0)
-+                        && !value_only_controls_branch(func, *dest, visited)
-+                    {
-+                        return false;
-+                    }
-+                }
-+                Instruction::Phi { dest, incoming, .. } => {
-+                    for (op, _) in incoming {
-+                        if matches!(op, Operand::Value(x) if x.0 == v.0)
-+                            && !value_only_controls_branch(func, *dest, visited)
-+                        {
-+                            return false;
-+                        }
-+                    }
-+                }
-+                other => {
-+                    let mut used = false;
-+                    other.for_each_used_value(|u| {
-+                        if u == v.0 {
-+                            used = true;
-+                        }
-+                    });
-+                    if used {
-+                        return false; // data use (binop operand, store, call arg, ...)
-+                    }
-+                }
-+            }
-+        }
-+        match &block.terminator {
-+            // A branch condition is control flow — fine.
-+            Terminator::CondBranch { cond, .. }
-+                if matches!(cond, Operand::Value(x) if x.0 == v.0) => {}
-+            // Return/Switch/IndirectBranch use the value as data.
-+            Terminator::Return(Some(op)) if matches!(op, Operand::Value(x) if x.0 == v.0) => {
-+                return false;
-+            }
-+            Terminator::Switch { val, .. } if matches!(val, Operand::Value(x) if x.0 == v.0) => {
-+                return false;
-+            }
-+            Terminator::IndirectBranch { target, .. }
-+                if matches!(target, Operand::Value(x) if x.0 == v.0) =>
-+            {
-+                return false;
-+            }
-+            _ => {}
-+        }
-+    }
-+    true
+diff --git a/tests/regression/v8_fp_die_at_birth.c b/tests/regression/v8_fp_die_at_birth.c
+new file mode 100644
+index 00000000..d0abc17b
+--- /dev/null
++++ b/tests/regression/v8_fp_die_at_birth.c
+@@ -0,0 +1,59 @@
++/*
++ * v8/v9 regression: FP producer->consumer register coalescing (die-at-birth
++ * hints) for F64/F32 chains, Sqrt/Fabs/Neg, and energy-style accumulation.
++ *
++ * Every value here is single-use or chain-shaped, so the allocator's
++ * die-at-birth sharing kicks in; a miscompile (e.g. the old `subsd
++ * %xmm4,%xmm4` ≡ 0) shows up as a wrong number. FP arithmetic is IEEE-exact
++ * and expression order is fixed at -O2, so the results are bit-identical to
++ * GCC; the harness (--compare-gcc) diffs them.
++ */
++#include <stdio.h>
++#include <math.h>
++
++static double energy(const double *b, int n) {
++    double e = 0.0;
++    int i;
++    for (i = 0; i < n; i++)
++        e += 0.5 * b[i] * (b[i] * b[i] + b[i]);
++    return e;
 +}
 +
-+/// Skip if-conversion for a short-circuit `||` diamond whose result is
-+/// consumed only by control flow. `cond ? 1 : rhs` (`||`) materializes as a
-+/// cmov chain, but its whole point is short-circuit evaluation — a branch is
-+/// cheaper and lets the backend fuse each compare straight into a jump (no
-+/// setcc+movzbl+test+cmov per link). Keeping the branchy form is the
-+/// difference between GCC's Expat codegen (`cmpb $X,%dl; ja`) and a wall of
-+/// setcc/cmov.
-+///
-+/// Only the `||` form (true arm == constant 1) is skipped. The `&&` form
-+/// (false arm == constant 0) is intentionally still converted: if-converting
-+/// it exposes the `Select(cond, Cmp, 0)` pattern the range-check fold
-+/// collapses into a single `sub`+`cmp`, which then fuses into the `||` branch.
-+fn skip_boolean_diamond(func: &IrFunction, phi_selects: &[(Value, IrType, Operand, Operand)]) -> bool {
-+    if phi_selects.is_empty() {
-+        return false;
-+    }
-+    // Every converted phi must be the `||` shape: `cond ? 1 : rhs`.
-+    let all_or = phi_selects
-+        .iter()
-+        .all(|(_, _, tv, _fv)| matches!(tv, Operand::Const(c) if c.to_i64() == Some(1)));
-+    if !all_or {
-+        return false;
-+    }
-+    let mut visited = FxHashSet::default();
-+    phi_selects
-+        .iter()
-+        .all(|(dest, _, _, _)| value_only_controls_branch(func, *dest, &mut visited))
++static double chain64(double x) { return -fabs(sqrt(x) * x + x); }
++static float  chain32(float x)  { return -fabsf(sqrtf(x) * x + x); }
++static double chain_neg(double x) { return -(-x + x * x); }
++static double chain_div(double x) { return (x + 1.0) / (x * x + 1.0); }
++
++static double mixed_sum(const double *a, const double *b, int n) {
++    double s = 0.0;
++    int i;
++    for (i = 0; i < n; i++)
++        s += sqrt(a[i] * a[i] + b[i] * b[i]);
++    return s;
 +}
 +
- /// Detect a diamond pattern starting from a block with a CondBranch terminator.
- fn detect_diamond(
-     func: &IrFunction,
-@@ -377,6 +511,11 @@ fn detect_diamond(
-         return None; // No convertible phis
-     }
- 
-+    // Keep short-circuit boolean diamonds branchy (see skip_boolean_diamond).
-+    if skip_boolean_diamond(func, &phi_selects) {
-+        return None;
++int main(void) {
++    double b[32], a[32];
++    float bf[32];
++    int i, it;
++    for (i = 0; i < 32; i++) {
++        b[i] = (double)(i + 1) * 0.125;
++        a[i] = (double)(32 - i) * 0.0625;
++        bf[i] = (float)((i + 1) * 0.125f);
 +    }
 +
-     // The merge block should only be reached from the two arms (and not from pred directly).
-     // If the merge block has other predecessors, we need to preserve the Phi nodes for those.
-     let merge_preds_from_diamond = preds.row(merge_idx).iter()
-@@ -549,6 +688,11 @@ fn detect_triangle(
-         return None;
-     }
- 
-+    // Keep short-circuit boolean diamonds branchy (see skip_boolean_diamond).
-+    if skip_boolean_diamond(func, &phi_selects) {
-+        return None;
++    double e = 0.0;
++    for (it = 0; it < 2000; it++) e += energy(b, 32);
++    double c = 0.0;
++    for (it = 0; it < 2000; it++) c += chain64(1.5 + it * 1e-9);
++    float cf = 0.0f;
++    for (it = 0; it < 2000; it++) cf += chain32(1.5f + (float)(it * 1e-7));
++    double cn = 0.0;
++    for (it = 0; it < 2000; it++) cn += chain_neg(0.25 + it * 1e-9);
++    double cd = 0.0;
++    for (it = 0; it < 2000; it++) cd += chain_div(0.5 + it * 1e-9);
++    double ms = mixed_sum(a, b, 32);
++
++    printf("%.9f %.9f %.9f %.9f %.9f %.9f\n", e, c, (double)cf, cn, cd, ms);
++    return 0;
++}
+diff --git a/tests/regression/v8_fp_die_at_birth.flags b/tests/regression/v8_fp_die_at_birth.flags
+new file mode 100644
+index 00000000..9edbe676
+--- /dev/null
++++ b/tests/regression/v8_fp_die_at_birth.flags
+@@ -0,0 +1 @@
++-lm
+diff --git a/tests/regression/v8_range_check_fold.c b/tests/regression/v8_range_check_fold.c
+new file mode 100644
+index 00000000..f4bcf537
+--- /dev/null
++++ b/tests/regression/v8_range_check_fold.c
+@@ -0,0 +1,68 @@
++/*
++ * v8 regression: range-check folding ((x>=lo && x<=hi) -> (unsigned)(x-lo) <= hi-lo).
++ *
++ * Exercises every shape the range_check pass folds (inclusive &&, exclusive
++ * ||, collapsed ==, reversed empty ranges, signed/unsigned, all widths, and
++ * the cast-chain matching), plus the untouched single-comparison controls.
++ * Differential vs GCC via the harness (--compare-gcc): output is a 64-bit
++ * checksum over every byte value and INT/LLONG edge values.
++ */
++#include <stdio.h>
++#include <limits.h>
++
++static int az(unsigned char c) { return c >= 'a' && c <= 'z'; }
++static int azAZ(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
++static int digit(unsigned char c) { return c >= '0' && c <= '9'; }
++static int az_digit(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'); }
++static int wide_u(unsigned int c) { return c >= 0x61u && c <= 0x7au; }
++static int sig(int c) { return c >= -5 && c <= 5; }
++static int sig_or(int c) { return c < -5 || c > 5; }
++static int ll(long long c) { return c >= -100LL && c <= 100LL; }
++static int eq3(int c) { return c >= 3 && c <= 3; }
++static int reversed(int c) { return c >= 5 && c <= -5; } /* always 0 */
++static int utf8_lead(unsigned char c) { return c >= 0xc2U && c <= 0xdfU; }
++static int u16range(unsigned short c) { return c >= 50000u && c <= 60000u; }
++static int negated(unsigned char c) { return !(c >= 'a' && c <= 'z'); }
++static int as_data(unsigned char c) { return (c >= 'a' && c <= 'z') ? 11 : 22; } /* value use, not branch */
++
++static unsigned long long mix(unsigned long long h, unsigned long long v) {
++    return (h ^ v) * 0x9e3779b97f4a7c15ULL + 0xdeadbeefULL;
++}
++
++int main(void) {
++    unsigned long long h = 1469598103934665603ULL;
++    int c;
++    for (c = 0; c <= 255; c++) {
++        unsigned char u = (unsigned char)c;
++        h = mix(h, (unsigned)az(u));
++        h = mix(h, (unsigned)azAZ(u));
++        h = mix(h, (unsigned)digit(u));
++        h = mix(h, (unsigned)az_digit(u));
++        h = mix(h, (unsigned)utf8_lead(u));
++        h = mix(h, (unsigned)negated(u));
++        h = mix(h, (unsigned)as_data(u));
++        h = mix(h, (unsigned)u16range((unsigned short)(c * 257u)));
 +    }
-+
-     // For a triangle, we set the missing arm to merge_idx with empty instructions.
-     // apply_diamond will hoist the arm instructions and the empty side is a no-op.
-     let (true_idx_out, false_idx_out, true_insts, false_insts) = if arm_is_true {
-@@ -667,6 +811,157 @@ mod tests {
-     use crate::common::types::AddressSpace;
-     use crate::ir::reexports::{IrBinOp, IrConst};
- 
-+    #[test]
-+    fn test_value_only_controls_branch() {
-+        // v used only as a CondBranch condition => branch-only.
-+        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
-+        func.blocks.push(BasicBlock {
-+            label: BlockId(0),
-+            instructions: vec![Instruction::ParamRef {
-+                dest: Value(0),
-+                param_idx: 0,
-+                ty: IrType::I32,
-+            }],
-+            terminator: Terminator::CondBranch {
-+                cond: Operand::Value(Value(0)),
-+                true_label: BlockId(1),
-+                false_label: BlockId(2),
-+            },
-+            source_spans: Vec::new(),
-+        });
-+        let mut visited = FxHashSet::default();
-+        assert!(value_only_controls_branch(&func, Value(0), &mut visited));
-+
-+        // v returned as data => not branch-only.
-+        func.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(0))));
-+        let mut visited = FxHashSet::default();
-+        assert!(!value_only_controls_branch(&func, Value(0), &mut visited));
-+
-+        // v used by Cmp(Eq, 0) whose result feeds a CondBranch => branch-only.
-+        let mut func2 = IrFunction::new("t2".to_string(), IrType::I32, vec![], false);
-+        func2.blocks.push(BasicBlock {
-+            label: BlockId(0),
-+            instructions: vec![
-+                Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 },
-+                Instruction::Cmp {
-+                    dest: Value(1),
-+                    op: IrCmpOp::Eq,
-+                    lhs: Operand::Value(Value(0)),
-+                    rhs: Operand::Const(IrConst::I32(0)),
-+                    ty: IrType::I32,
-+                },
-+            ],
-+            terminator: Terminator::CondBranch {
-+                cond: Operand::Value(Value(1)),
-+                true_label: BlockId(1),
-+                false_label: BlockId(2),
-+            },
-+            source_spans: Vec::new(),
-+        });
-+        let mut visited = FxHashSet::default();
-+        assert!(value_only_controls_branch(&func2, Value(0), &mut visited));
++    {
++        static const int vals[] = { INT_MIN, INT_MIN + 1, -101, -100, -99, -6, -5, -4,
++            0, 2, 3, 4, 5, 6, 99, 100, 101, INT_MAX - 1, INT_MAX };
++        unsigned i;
++        for (i = 0; i < sizeof(vals) / sizeof(vals[0]); i++) {
++            int v = vals[i];
++            h = mix(h, (unsigned)sig(v));
++            h = mix(h, (unsigned)sig_or(v));
++            h = mix(h, (unsigned)eq3(v));
++            h = mix(h, (unsigned)reversed(v));
++            h = mix(h, (unsigned)wide_u((unsigned)v));
++        }
 +    }
-+
-+    #[test]
-+    fn test_skip_boolean_diamond_or_shape() {
-+        // `||` shape: true arm == const 1, result only feeds a branch => skip.
-+        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
-+        func.blocks.push(BasicBlock {
-+            label: BlockId(0),
-+            instructions: vec![Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 }],
-+            terminator: Terminator::CondBranch {
-+                cond: Operand::Value(Value(0)),
-+                true_label: BlockId(1),
-+                false_label: BlockId(2),
-+            },
-+            source_spans: Vec::new(),
-+        });
-+        func.blocks.push(BasicBlock {
-+            label: BlockId(1),
-+            instructions: vec![],
-+            terminator: Terminator::Branch(BlockId(3)),
-+            source_spans: Vec::new(),
-+        });
-+        func.blocks.push(BasicBlock {
-+            label: BlockId(2),
-+            instructions: vec![],
-+            terminator: Terminator::Branch(BlockId(3)),
-+            source_spans: Vec::new(),
-+        });
-+        func.blocks.push(BasicBlock {
-+            label: BlockId(3),
-+            instructions: vec![Instruction::Phi {
-+                dest: Value(3),
-+                ty: IrType::I32,
-+                incoming: vec![
-+                    (Operand::Const(IrConst::I32(1)), BlockId(1)),
-+                    (Operand::Value(Value(4)), BlockId(2)),
-+                ],
-+            }],
-+            terminator: Terminator::CondBranch {
-+                cond: Operand::Value(Value(3)),
-+                true_label: BlockId(4),
-+                false_label: BlockId(5),
-+            },
-+            source_spans: Vec::new(),
-+        });
-+        func.next_value_id = 6;
-+
-+        // `||` shape, branch-only => skipped (not converted).
-+        let label_to_idx = analysis::build_label_map(&func);
-+        let (preds, _) = analysis::build_cfg(&func, &label_to_idx);
-+        let diamond = detect_diamond(&func, 0, &label_to_idx, &preds);
-+        assert!(diamond.is_none(), "branch-only `||` diamond must not be converted");
-+
-+        // `&&` shape (false arm == const 0) => still converted (range fold needs it).
-+        let mut func2 = IrFunction::new("t2".to_string(), IrType::I32, vec![], false);
-+        func2.blocks.push(BasicBlock {
-+            label: BlockId(0),
-+            instructions: vec![Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 }],
-+            terminator: Terminator::CondBranch {
-+                cond: Operand::Value(Value(0)),
-+                true_label: BlockId(1),
-+                false_label: BlockId(2),
-+            },
-+            source_spans: Vec::new(),
-+        });
-+        func2.blocks.push(BasicBlock {
-+            label: BlockId(1),
-+            instructions: vec![],
-+            terminator: Terminator::Branch(BlockId(3)),
-+            source_spans: Vec::new(),
-+        });
-+        func2.blocks.push(BasicBlock {
-+            label: BlockId(2),
-+            instructions: vec![],
-+            terminator: Terminator::Branch(BlockId(3)),
-+            source_spans: Vec::new(),
-+        });
-+        func2.blocks.push(BasicBlock {
-+            label: BlockId(3),
-+            instructions: vec![Instruction::Phi {
-+                dest: Value(3),
-+                ty: IrType::I32,
-+                incoming: vec![
-+                    (Operand::Value(Value(4)), BlockId(1)),
-+                    (Operand::Const(IrConst::I32(0)), BlockId(2)),
-+                ],
-+            }],
-+            terminator: Terminator::CondBranch {
-+                cond: Operand::Value(Value(3)),
-+                true_label: BlockId(4),
-+                false_label: BlockId(5),
-+            },
-+            source_spans: Vec::new(),
-+        });
-+        func2.next_value_id = 6;
-+        let label_to_idx2 = analysis::build_label_map(&func2);
-+        let (preds2, _) = analysis::build_cfg(&func2, &label_to_idx2);
-+        assert!(detect_diamond(&func2, 0, &label_to_idx2, &preds2).is_some(),
-+                "branch-only `&&` diamond must still be converted for range folding");
++    {
++        static const long long lv[] = { LLONG_MIN, LLONG_MIN + 1, -101, -100, -99, 0,
++            99, 100, 101, LLONG_MAX - 1, LLONG_MAX };
++        unsigned i;
++        for (i = 0; i < sizeof(lv) / sizeof(lv[0]); i++)
++            h = mix(h, (unsigned)ll(lv[i]));
 +    }
++    printf("%llu\n", (unsigned long long)h);
++    return 0;
++}
+diff --git a/tests/regression/v9_cast_chain_fold.c b/tests/regression/v9_cast_chain_fold.c
+new file mode 100644
+index 00000000..bfda57e7
+--- /dev/null
++++ b/tests/regression/v9_cast_chain_fold.c
+@@ -0,0 +1,44 @@
++/*
++ * v8 regression: widen-then-narrow cast chain folding in simplify.
++ *
++ * Cast(Cast(x, A->B), B->C) with B strictly widest collapses to Cast(x, A->C).
++ * Covers every signedness mix and the extend-then-truncate semantics across
++ * byte values and INT edges; differential vs GCC.
++ */
++#include <stdio.h>
++#include <limits.h>
 +
++static int f1(unsigned char x)  { return (int)(long long)(int)x; }
++static int f2(char x)           { return (int)(unsigned short)(int)x; }
++static long long f3(int x)      { return (long long)(int)(long long)x; }
++static unsigned f4(signed char x) { return (unsigned)(int)(signed char)x; }
++static int f5(unsigned char x)  { return (int)(unsigned int)(unsigned long)x; }
++static short f6(int x)          { return (short)(long long)(int)x; }
++static unsigned long long f7(signed char x) { return (unsigned long long)(long long)(int)x; }
++static int f8(unsigned short x) { return (int)(long long)(unsigned short)x; }
 +
-     #[test]
-     fn test_simple_diamond_conversion() {
-         // Build a simple diamond:
++static unsigned long long mix(unsigned long long h, unsigned long long v) {
++    return (h ^ v) * 0x9e3779b97f4a7c15ULL + 0xdeadbeefULL;
++}
++
++int main(void) {
++    unsigned long long h = 1469598103934665603ULL;
++    int c;
++    for (c = 0; c <= 255; c++) {
++        h = mix(h, (unsigned)f1((unsigned char)c));
++        h = mix(h, (unsigned)f2((char)(c - 128)));
++        h = mix(h, (unsigned long long)f4((signed char)(c - 128)));
++        h = mix(h, (unsigned)f5((unsigned char)c));
++        h = mix(h, (unsigned short)f6(c * 65537 - 1));
++        h = mix(h, (unsigned long long)f7((signed char)(c - 128)));
++        h = mix(h, (unsigned)f8((unsigned short)(c * 257)));
++    }
++    {
++        static const int vals[] = { INT_MIN, INT_MIN + 1, -1, 0, 1, INT_MAX - 1, INT_MAX };
++        unsigned i;
++        for (i = 0; i < sizeof(vals) / sizeof(vals[0]); i++)
++            h = mix(h, (unsigned long long)f3(vals[i]));
++    }
++    printf("%llu\n", (unsigned long long)h);
++    return 0;
++}
+diff --git a/tests/regression/v9_flag_fusion_cast.c b/tests/regression/v9_flag_fusion_cast.c
+new file mode 100644
+index 00000000..6c263257
+--- /dev/null
++++ b/tests/regression/v9_flag_fusion_cast.c
+@@ -0,0 +1,41 @@
++/*
++ * v9 regression: flag fusion through integer Casts (Cmp -> Cast -> branch).
++ *
++ * The v9 fusion lets a widened boolean feed a branch directly (cmp;jcc) with
++ * no setcc/movzbl/test. Soundness rule: the cast destination must be used
++ * exactly once, and a boolean used as DATA must still be materialized.
++ * Both paths are exercised; differential vs GCC.
++ */
++#include <stdio.h>
++
++static int as_branch(int x, int y) { if ((long long)(x < y)) return 1; return 2; }
++static int via_u8(unsigned char c) { if ((int)(c >= 'a' && c <= 'z')) return 3; return 4; }
++static int via_ll(int x) { return ((long long)(x < 100)) ? 7 : 8; }
++static int via_ull(int x) { return ((unsigned long long)(x > -100)) ? 5 : 6; }
++
++/* boolean used as DATA (returned): must materialize, not fuse. */
++static long long as_data(int x, int y) { return (long long)(x < y); }
++static unsigned char as_data2(unsigned char c) { return (unsigned char)(c >= 'a' && c <= 'z'); }
++
++/* fused in a loop condition, then reused as data afterwards. */
++static int loop_cond(int n) {
++    int i, acc = 0;
++    for (i = 0; (long long)(i < n); i++) acc += i;
++    return acc;
++}
++
++int main(void) {
++    int r = 0;
++    r += as_branch(1, 2);
++    r += as_branch(2, 1);
++    r += via_u8('m');
++    r += via_u8('9');
++    r += via_ll(50);
++    r += via_ll(150);
++    r += via_ull(0);
++    r += via_ull(-200);
++    printf("%d %lld %u %d\n", r, as_data(3, 4) + as_data(4, 3),
++           (unsigned)as_data2('q') + (unsigned)as_data2('1'),
++           loop_cond(10));
++    return 0;
++}
+diff --git a/tests/regression/v9_gpr_unary_hints.c b/tests/regression/v9_gpr_unary_hints.c
+new file mode 100644
+index 00000000..29d8a4f6
+--- /dev/null
++++ b/tests/regression/v9_gpr_unary_hints.c
+@@ -0,0 +1,52 @@
++/*
++ * v9 regression: GPR unary producer->consumer hints (Neg / Not / Bswap).
++ *
++ * These unary ops compute into the destination register with the source
++ * pre-loaded (`neg %reg`, `not %reg`, `bswap %reg`), so the allocator may
++ * share the producer's register at die-at-birth. Covers the edge values that
++ * exercise the wraparound (INT_MIN negation, all byte patterns for bswap).
++ */
++#include <stdio.h>
++#include <limits.h>
++
++static int neg(int x) { return -x; }
++static unsigned not_(unsigned x) { return ~x; }
++static unsigned bswap32(unsigned x) { return __builtin_bswap32(x); }
++static unsigned long long bswap64(unsigned long long x) { return __builtin_bswap64(x); }
++static unsigned short bswap16(unsigned short x) { return __builtin_bswap16(x); }
++
++/* Unary chains: the neg result feeds another neg / not. */
++static int neg_neg(int x) { return -(-x); }
++static int neg_plus(int x) { return -x + x; }
++static unsigned not_not(unsigned x) { return ~~x; }
++
++static unsigned long long mix(unsigned long long h, unsigned long long v) {
++    return (h ^ v) * 0x9e3779b97f4a7c15ULL + 0xdeadbeefULL;
++}
++
++int main(void) {
++    unsigned long long h = 1469598103934665603ULL;
++    {
++        static const int vals[] = { INT_MIN, INT_MIN + 1, -1, 0, 1, 2, 1234567, INT_MAX - 1, INT_MAX };
++        unsigned i;
++        for (i = 0; i < sizeof(vals) / sizeof(vals[0]); i++) {
++            h = mix(h, (unsigned)neg(vals[i]));
++            h = mix(h, (unsigned)neg_neg(vals[i]));
++            h = mix(h, (unsigned)neg_plus(vals[i]));
++            h = mix(h, (unsigned)not_(vals[i]));
++            h = mix(h, (unsigned)not_not(vals[i]));
++            h = mix(h, (unsigned)bswap32((unsigned)vals[i]));
++        }
++    }
++    {
++        unsigned x;
++        for (x = 0; x < 4096; x++) {
++            unsigned v = x * 2654435761u;
++            h = mix(h, (unsigned)bswap16((unsigned short)v));
++            h = mix(h, (unsigned)bswap32(v));
++            h = mix(h, (unsigned long long)bswap64((unsigned long long)v << 32 | v));
++        }
++    }
++    printf("%llu\n", (unsigned long long)h);
++    return 0;
++}
+diff --git a/tests/regression/v9_short_circuit_sidefx.c b/tests/regression/v9_short_circuit_sidefx.c
+new file mode 100644
+index 00000000..affa67da
+--- /dev/null
++++ b/tests/regression/v9_short_circuit_sidefx.c
+@@ -0,0 +1,57 @@
++/*
++ * v9 regression: short-circuit evaluation order with side effects.
++ *
++ * The v9 if-conversion change keeps `||` diamonds branchy and the flag-fusion
++ * change skips boolean materialization for branch-only conditions. Both must
++ * preserve C's short-circuit semantics: the right operand of `&&`/`||` is NOT
++ * evaluated when the left operand decides the result, and both arms of a
++ * `cond ? a : b` are evaluated exactly when selected.
++ *
++ * `counter` and `seq` are global so every side effect is observable; the
++ * printed values are deterministic and diffed against GCC.
++ */
++#include <stdio.h>
++
++static int counter = 0;
++static int seq = 0;
++
++static int bump(void) { counter++; return (counter & 1); }       /* returns 1,0,1,0,... */
++static int thrice(void) { counter += 3; return 1; }
++
++static int or_lhs_true(void) { return (1) || bump(); }           /* bump NOT called */
++static int or_lhs_false(void) { return (0) || bump(); }          /* bump called */
++static int and_lhs_true(void) { return (1) && bump(); }          /* bump called */
++static int and_lhs_false(void) { return (0) && bump(); }         /* bump NOT called */
++static int nested_or(void) { return (1) || (0 && thrice()); }    /* nothing called */
++static int nested_and(void) { return (1) && (1) && bump(); }     /* bump called once */
++static int or_with_call(void) { return thrice() || bump(); }     /* thrice called, bump not */
++
++static int cond_ternary(int x) { return (x > 0) ? thrice() : bump(); }
++
++static int branch_or(int x) { if (x > 100 || x < -100) return 7; return 9; }
++static int branch_and(int x) { if (x > 0 && x < 10) return 3; return 4; }
++
++int main(void) {
++    int r = 0, c = 0;
++    counter = 0;
++    r += or_lhs_true();   c += counter;
++    r += or_lhs_false();  c += counter;
++    r += and_lhs_true();  c += counter;
++    r += and_lhs_false(); c += counter;
++    r += nested_or();     c += counter;
++    r += nested_and();    c += counter;
++    r += or_with_call();  c += counter;
++    printf("%d %d\n", r, c);
++
++    counter = 0; seq = 0;
++    r = 0; c = 0;
++    r += cond_ternary(5); c += counter;
++    r += cond_ternary(-5); c += counter;
++    printf("%d %d\n", r, c);
++
++    r = 0;
++    r += branch_or(150); r += branch_or(0);
++    r += branch_and(5); r += branch_and(50);
++    printf("%d\n", r);
++    return 0;
++}
 -- 
 2.47.3
 
 
-From f5a349342fafbf6cac47510fdd346a5914ec41fd Mon Sep 17 00:00:00 2001
-From: lccc-v9 <v9@localhost>
-Date: Thu, 13 Aug 2026 22:22:18 +0000
-Subject: [PATCH 3/4] v9: fuse Cmp->Cast->branch flag chains (extend the
- pending-flag handshake)
-
-The fused Cmp chain walk (prologue.rs) previously allowed only flag-neutral
-Copy instructions between a Cmp and its Select/CondBranch consumer. Extend it
-to integer Casts (mov/movzx/movsx leave the flags intact), so the range-check
-fold's Cmp -> Cast(bool, I8->I64) -> CondBranch fuses into a single cmp;jcc
-instead of setcc+movzbl+test. The Cast destination must still have exactly
-one use (only the next chain link or the consumer), preserving the existing
-soundness rule that every fused value is read exactly once.
-
-Measured with the || skip: expat's first range check now emits
-'sub /bin/bashx61; cmp /bin/bashx19; ja' with no boolean materialization.
----
- src/backend/x86/codegen/prologue.rs | 19 +++++++++++++++++++
- 1 file changed, 19 insertions(+)
-
-diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
-index fff96595..a98574fb 100644
---- a/src/backend/x86/codegen/prologue.rs
-+++ b/src/backend/x86/codegen/prologue.rs
-@@ -376,6 +376,25 @@ impl X86Codegen {
-                                     cur = cd.0;
-                                     k += 1;
-                                 }
-+                                // A widening/shrinking integer Cast of the
-+                                // boolean is also flag-neutral: it emits a
-+                                // plain mov/movzx/movsx that leaves the Cmp's
-+                                // flags intact, and (like the Copy above) its
-+                                // destination is never read by anything other
-+                                // than the next chain link or the consumer.
-+                                // This is what lets the range-check fold's
-+                                // `Cmp -> Cast(bool, I8->I64) -> CondBranch`
-+                                // fuse into `cmp; jcc` (Expat's name scanner).
-+                                Instruction::Cast { dest: cd, src: Operand::Value(sv), from_ty, to_ty }
-+                                    if sv.0 == cur && from_ty.is_integer() && to_ty.is_integer() =>
-+                                {
-+                                    if use_counts.get(&cd.0).copied().unwrap_or(0) != 1 {
-+                                        chain_single_use = false;
-+                                        break;
-+                                    }
-+                                    cur = cd.0;
-+                                    k += 1;
-+                                }
-                                 Instruction::Select { cond: Operand::Value(v), .. } if v.0 == cur => {
-                                     // The copy chain must terminate here (the
-                                     // final value has exactly one use: this
--- 
-2.47.3
-
-
-From ecc5607f4d715d03c92ba5a5ec912dfd5b5e59ec Mon Sep 17 00:00:00 2001
-From: lccc-v9 <v9@localhost>
-Date: Thu, 13 Aug 2026 22:22:45 +0000
-Subject: [PATCH 4/4] =?UTF-8?q?v9:=20audit=20report=20=E2=80=94=20hint=20e?=
- =?UTF-8?q?xtensions=20+=20branchy=20short-circuit=20||?=
+From f7579020cd61c963cecc3bc24af4af5315857a59 Mon Sep 17 00:00:00 2001
+From: lccc-v10 <v10@localhost>
+Date: Thu, 13 Aug 2026 23:07:04 +0000
+Subject: [PATCH 3/3] =?UTF-8?q?v10:=20audit=20=E2=80=94=20regression=20tes?=
+ =?UTF-8?q?ts,=20FP=20const-pool=20fix,=20ICC/ICX=20research,=20prioritize?=
+ =?UTF-8?q?d=20roadmap?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
 ---
- SIMD_REDTEAM_AUDIT.md | 37 +++++++++++++++++++++++++++++++++++++
- 1 file changed, 37 insertions(+)
+ SIMD_REDTEAM_AUDIT.md | 68 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 68 insertions(+)
 
 diff --git a/SIMD_REDTEAM_AUDIT.md b/SIMD_REDTEAM_AUDIT.md
-index 4080b4be..9f61c874 100644
+index 9f61c874..73229894 100644
 --- a/SIMD_REDTEAM_AUDIT.md
 +++ b/SIMD_REDTEAM_AUDIT.md
-@@ -625,6 +625,43 @@ Measured: expat 3.28x -> 3.13x, hash_table 1.38x -> 1.31x,
- loop_patterns 1.85x -> 1.80x; no regressions; corpus 25/25 correct.
- Differential test (all byte values + INT_MIN/MAX + LLONG edges) bit-exact vs gcc.
- 
-+## v9 — hint extensions + branchy short-circuit || (branch/boolean, part 2)
+@@ -677,3 +677,71 @@ chains.
+    reduction loops).
+ 4. nbody's remaining `imulq` are preheader pointer-inits for non-constant IV
+    inits (reuse `&bodies[i]+56` for `&bodies[i+1]`).
 +
-+**Producer-follow hints extended** beyond FP BinOp LHS to every instruction
-+whose emitter computes into the destination with the operand pre-loaded:
-+`Copy` (no-op when registers match), GPR unary `Neg/Not/Bswap`
-+(`emit_unaryop_impl` loads src into dest then `neg %reg`), and scalar FP
-+`Sqrt/Fabs` (`emit_fp_scalar_unary` / Fabs loads arg into dest). Measured
-+wall-clock neutral (copy_prop already forwards most GPR copies; the remaining
-+mov chains come from casts) — but the mechanism is now general as designed.
++## v10 — regression tests + FP constant-pool fix + ICC/ICX research
 +
-+**Short-circuit `||` diamonds stay branchy.** `cond ? 1 : rhs` if-converts to a
-+cmov chain, but short-circuiting IS a branch — a branch is cheaper and lets the
-+backend fuse the compare into the jump. `if_convert` now skips diamonds whose
-+phis are all `||`-shaped (true arm == 1) and whose results are consumed only by
-+control flow (`value_only_controls_branch`: branch conds, `Cmp(Eq/Ne,0/1)`,
-+Select conds, through Copy/Cast/Phi edges). The `&&` shape is still converted
-+so the range-check fold can collapse it, and its result then fuses into the
-+surrounding `||` branch.
++**Pre-existing bug found & fixed** (caught by the new `v8_fp_die_at_birth`
++test): `emit_fp_const_pool` emitted every FP constant with `.align 8` and
++8 bytes of data, but the Fabs emitter loads these constants with
++`andpd`/`andps`, whose m128 memory operand must be 16-byte aligned. With one
++FP function the constant lands on a lucky 16-aligned offset; with two or more
++the layout shifts and the mask lands on an 8-mod-16 offset → #GP (SIGSEGV at
++the andpd). Reproduced identically on the pre-v8 base (`d1a129e5`), so it is
++NOT a v8/v9 regression. Fix: 16-byte-aligned 16-byte slots (value + zero pad);
++the zero pad also makes the mask's upper lane zero (correct for scalar lanes).
++`andpd`/`andps` alignment was confirmed empirically: `andpd [8-aligned]`
++faults, `andpd [16-aligned]` does not.
 +
-+**Flag fusion extended through integer Casts.** The fused Cmp chain walk
-+(prologue.rs) now allows flag-neutral integer Casts between the Cmp and its
-+consumer, so the range fold's `Cmp -> Cast(bool, I8->I64) -> CondBranch` fuses
-+into `sub; cmp; ja` (the Cast dest must still be single-use).
++**Regression tests added** (133 total, all differential vs GCC): range-check
++folding (every shape), short-circuit side effects, FP die-at-birth chains,
++GPR unary Neg/Not/Bswap, widen-narrow cast chains, Cmp→Cast→branch fusion.
 +
-+Measured: **expat_xml_scan 3.13x -> 2.89x**, corpus geomean 0.9537 -> 0.9457,
-+sqlite_varint back to 2.09x, no regressions. Regression 127/127, correctness
-+50/50, intrinsics 3/3, 597 lib tests. New unit tests
-+`test_value_only_controls_branch`, `test_skip_boolean_diamond_or_shape`.
++**ICC/ICX research via godbolt** (`cicc202171` ICC 2021.7.1, `cicxlatest` ICX;
++scripts in work/gb.py + work/gb_*.c):
 +
-+**Remaining in this domain:** the inner `||` links still materialize because
-+the short-circuit lowering stores the RHS boolean to the result alloca
-+(`store rhs_bool` + phi), so only the first link of each `||` level fuses. The
-+clean fix is *branch-on-logical* at lowering time (when the `&&`/`||` result is
-+used only as a condition, emit pure branches instead of a value + phi), plus
-+GPR copy/param coalescing for the byte-load `mov %esi,%r15d; mov %r15d,%ebp`
-+chains.
++- **expat name-length**: ICC folds ALL UTF-8 lead-byte ranges into
++  `lea ecx,[-194+r8]; cmp ecx,29; ja` (matches our v8 range fold), uses ONE
++  `movzx` load + `cmp r8d,128; jb` (sign-bit ASCII test) and compact
++  `and cl,-64; cmp cl,-128; jne` continuation checks. lccc's remaining gap:
++  the `movzbl (%r11),%esi; mov %esi,%r15d; mov %r15d,%ebp` byte-copy chains
++  (each SSA copy of the load gets its own register) and the inner `||` links
++  still materializing setcc/cmov.
++- **sqlite varint**: ICX emits `movzx; test cl,cl; js; and; shl; or; ...`
++  with ZERO register-copy chains and no accumulator round-trips. lccc's gap is
++  the same copy-chain / accumulator-round-trip issue (2.09x vs gcc).
++- **adler32**: ICX pipelines two accumulators (`add r9d,r8d; add eax,r9d`
++  per byte); ICC breaks the adler→sum2→adler serial chain with a 4-register
++  rotation. lccc keeps one accumulator with per-iteration slot copies (1.73x).
++- **range check**: ICX emits `add dil,-97; xor eax,eax; cmp dil,26; setb al`
++  (add-negative instead of sub — same cost). Confirms the v8 fold.
 +
- ## v8 roadmap (remaining)
- 
- 1. **Branch/boolean domain, part 2** (expat still ~3.1x): the range check now
++**Parameter register allocation — exact blocker diagnosed.** The FP-param XMM
++pre-store was implemented and then REVERTED as inert: (1) at -O2, GVN
++deliberately removes the lowering's `ParamRef`+`Store` pair ("the backend's
++ParamRef optimization reads parameter values from the alloca") so no ParamRef
++reaches codegen; (2) at -O0 the param alloca still has a slot (`has_slot`),
++so the dead-alloca pre-store is skipped. Keeping an FP param in XMM therefore
++needs either (a) preserving the scalar FP ParamRef through GVN (gated to
++call-free functions) so the pre-store fires, or (b) teaching `emit_store_params`
++to recognize a read-only FP param alloca whose loads the regalloc can satisfy
++from an XMM register. (a) is the cleaner fix; the pre-store code to emit
++`movq %xmmN, %xmmM` for `ParamClass::FloatReg` is written and tested in this
++session's working history.
++
++## v10 roadmap (prioritized, informed by ICC/ICX)
++
++1. **GPR copy-chain elimination** (expat 2.89x, sqlite 2.09x). The
++   `mov %esi,%r15d; mov %r15d,%ebp` chains are the single biggest remaining
++   gap vs ICX. Two-pronged: (a) hint int→int `Cast` in the regalloc follow
++   hints when the cast emitter computes into the dest register (extends the
++   v9 Copy/unary hints — the chain is Load→Cast→Cast→Cmp, and Cast is the
++   unhinted link); (b) fuse the load+zero/sign-extend (`movzbl (%r11),%esi`
++   directly into the cmp) by folding the cast into the memory operand.
++2. **Branch-on-logical at lowering**: when `&&`/`||` is used only as a
++   condition, emit pure branches instead of a value+phi so every inner link
++   fuses (extends the v9 `||`-skip; currently only the first link fuses).
++3. **Parameter register allocation** — see the diagnosed blocker above.
++4. **Adler32 chain-breaking reassociation** (1.73x): ICC's 4-register rotation
++   for `adler+=b[i]; sum2+=adler` within the 16-byte unroll; also removes the
++   per-iteration slot copies (loop-carried accumulator in registers).
++5. nbody's 2 remaining preheader `imulq` (reuse `&bodies[i*56]+56`).
 -- 
 2.47.3
 
