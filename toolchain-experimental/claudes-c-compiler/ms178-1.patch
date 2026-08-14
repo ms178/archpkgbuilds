@@ -1,685 +1,1881 @@
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/scripts/codegen_scoreboard.py b/scripts/codegen_scoreboard.py
---- a/scripts/codegen_scoreboard.py	1970-01-01 00:00:00.000000000 +0000
-+++ b/scripts/codegen_scoreboard.py	2026-08-14 16:52:54.821147719 +0000
-@@ -0,0 +1,267 @@
-+#!/usr/bin/env python3
-+"""Rank LCCC's generated code against GCC, Clang, ICC and ICX, per function.
+diff --git a/scripts/codegen_scoreboard.py b/scripts/codegen_scoreboard.py
+index 742f11b..8f527f0 100644
+--- a/scripts/codegen_scoreboard.py
++++ b/scripts/codegen_scoreboard.py
+@@ -34,6 +34,8 @@ Examples
+ """
+ from __future__ import annotations
+ 
++import hashlib
++import shlex
+ import argparse
+ import concurrent.futures
+ import json
+@@ -130,6 +132,47 @@ def strip_noise(lines: list[str]) -> list[str]:
+                                                           ".data", ".bss"))]
+ 
+ 
++# Godbolt compiler ids. scripts/godbolt.py exposes only compile_on_godbolt(),
++# so the id table and the local-compile path live here.
++ORACLE_IDS = {
++    "gcc":   "cg162",
++    "clang": "cclang2210",
++    "icc":   "cicc2021100",
++    "icx":   "cicx202400",
++}
 +
-+`godbolt.py compare` answers "how does LCCC do on THIS file". That is the right
-+tool once you know where to look. This one answers the prior question: across a
-+whole benchmark suite, WHICH functions are furthest behind the best compiler,
-+and by what margin -- so effort goes where the gap is largest instead of where
-+it is easiest to look.
-+
-+For every source file it compiles with LCCC locally and with each oracle over
-+the Compiler Explorer API, then reports per function:
-+
-+    insns    instruction count in the function body
-+    loads    memory reads          (the usual cause of a large gap)
-+    stores   memory writes
-+    spills   loads/stores through %rsp or %rbp, i.e. register-allocator churn
-+    branch   control transfers
-+
-+Ranking is by `insns` relative to the best oracle, because that is the metric
-+that correlates with the work actually issued. It is a proxy, not a verdict:
-+this VM has no PMU, so the runner reports counts and leaves timing to
-+`run_benchmarks.py`.
-+
-+Examples
-+--------
-+    # Survey the whole benchmark suite, worst gaps first
-+    scripts/codegen_scoreboard.py tests/benchmark/programs/*.c
-+
-+    # One file, every function, full detail
-+    scripts/codegen_scoreboard.py tests/benchmark/programs/matmul.c -v
-+
-+    # Re-check after a change, comparing to a saved baseline
-+    scripts/codegen_scoreboard.py --baseline before.json --json after.json ...
-+"""
-+from __future__ import annotations
-+
-+import argparse
-+import concurrent.futures
-+import json
-+import os
-+import re
-+import subprocess
-+import sys
-+from dataclasses import dataclass, field, asdict
-+from pathlib import Path
-+
-+sys.path.insert(0, str(Path(__file__).resolve().parent))
-+import godbolt  # noqa: E402  (same directory, deliberate)
-+
-+DEFAULT_FLAGS = "-O2 -march=x86-64-v3"
-+ORACLES = ["gcc", "clang", "icc", "icx"]
-+
-+# Directives and labels carry no instructions.
-+_SKIP = re.compile(r"^\s*(\.|#|//|$)")
-+_LABEL = re.compile(r"^[.\w$]+:")
-+
-+_BRANCH = re.compile(r"^(j\w+|call|ret|loop\w*)$")
-+_STACK_MEM = re.compile(r"[-\d+x]*\(%r(sp|bp)\)")
++CACHE = Path(__file__).resolve().parent.parent / ".godbolt-cache"
 +
 +
-+@dataclass
-+class FuncStats:
-+    name: str
-+    insns: int = 0
-+    loads: int = 0
-+    stores: int = 0
-+    spills: int = 0
-+    branch: int = 0
-+    vector: int = 0
-+
-+    def as_row(self) -> str:
-+        return (f"{self.insns:6d} {self.loads:6d} {self.stores:6d} "
-+                f"{self.spills:6d} {self.branch:6d} {self.vector:6d}")
-+
-+
-+def parse_functions(lines: list[str]) -> dict[str, FuncStats]:
-+    """Split an assembly listing into per-function statistics."""
-+    out: dict[str, FuncStats] = {}
-+    cur: FuncStats | None = None
-+    for raw in lines:
-+        line = raw.rstrip()
-+        if not line:
-+            continue
-+        m = _LABEL.match(line.strip())
-+        if m and not line.strip().startswith("."):
-+            cur = FuncStats(line.strip().rstrip(":"))
-+            out[cur.name] = cur
-+            continue
-+        if m and line.strip().startswith(".L"):
-+            continue
-+        if _SKIP.match(line):
-+            continue
-+        if cur is None:
-+            continue
-+
-+        body = line.strip()
-+        mnem = body.split()[0].lower() if body.split() else ""
-+        if not mnem or mnem.endswith(":"):
-+            continue
-+        cur.insns += 1
-+
-+        if _BRANCH.match(mnem):
-+            cur.branch += 1
-+        if mnem.startswith("v") or re.match(r"^p[a-z]", mnem):
-+            cur.vector += 1
-+
-+        # Operand-side memory classification. In AT&T syntax the destination is
-+        # last, so a memory reference before the final comma is a read and one
-+        # after it is a write.
-+        ops = body[len(mnem):].strip()
-+        if "(" in ops:
-+            parts = ops.rsplit(",", 1)
-+            src = parts[0] if len(parts) > 1 else ops
-+            dst = parts[1] if len(parts) > 1 else ""
-+            if "(" in src:
-+                cur.loads += 1
-+            if "(" in dst:
-+                cur.stores += 1
-+            if _STACK_MEM.search(ops):
-+                cur.spills += 1
-+    return out
-+
-+
-+def strip_noise(lines: list[str]) -> list[str]:
-+    return [l for l in lines if not l.strip().startswith((".cfi", ".file",
-+                                                          ".ident", ".section",
-+                                                          ".size", ".type",
-+                                                          ".globl", ".p2align",
-+                                                          ".align", ".text",
-+                                                          ".data", ".bss"))]
-+
-+
-+@dataclass
-+class FileResult:
-+    path: str
-+    per_compiler: dict[str, dict[str, FuncStats]] = field(default_factory=dict)
-+    errors: dict[str, str] = field(default_factory=dict)
-+
-+
-+def measure(path: Path, lccc: str, flags: str, oracles: list[str],
-+            local_flags: str | None) -> FileResult:
-+    res = FileResult(str(path))
-+    src = path.read_text()
-+
++def compile_local(lccc: str, path: Path, flags: str) -> list[str]:
++    """Compile with the local lccc and return assembly lines."""
++    out = path.with_suffix(".local.s")
++    cmd = [lccc, *shlex.split(flags), "-S", str(path), "-o", str(out)]
++    r = subprocess.run(cmd, capture_output=True, text=True)
++    if r.returncode != 0:
++        raise RuntimeError((r.stderr or r.stdout).strip().splitlines()[-1:] or "lccc failed")
 +    try:
-+        lines = godbolt.compile_local(lccc, path, local_flags or flags)
-+        res.per_compiler["lccc"] = parse_functions(strip_noise(lines))
-+    except Exception as e:  # noqa: BLE001
-+        res.errors["lccc"] = f"{type(e).__name__}: {e}"
-+
-+    def one(name: str):
-+        try:
-+            cid, _ = godbolt.resolve(name)
-+            lines = godbolt.compile_remote(cid, src, flags)
-+            return name, parse_functions(strip_noise(lines)), None
-+        except Exception as e:  # noqa: BLE001
-+            return name, {}, f"{type(e).__name__}: {e}"
-+
-+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(oracles)) as ex:
-+        for name, stats, err in ex.map(one, oracles):
-+            if err:
-+                res.errors[name] = err
-+            else:
-+                res.per_compiler[name] = stats
-+    return res
++        return out.read_text().splitlines()
++    finally:
++        out.unlink(missing_ok=True)
 +
 +
-+def main() -> int:
-+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-+    ap.add_argument("sources", nargs="+", type=Path)
-+    ap.add_argument("--lccc", default=os.environ.get("LCCC",
-+                                                     "./target/release/lccc"))
-+    ap.add_argument("--flags", default=DEFAULT_FLAGS)
-+    ap.add_argument("--local-flags", default=None,
-+                    help="flags for LCCC only (default: same as --flags)")
-+    ap.add_argument("--oracles", default=",".join(ORACLES))
-+    ap.add_argument("--min-insns", type=int, default=6,
-+                    help="ignore functions smaller than this")
-+    ap.add_argument("--json", type=Path)
-+    ap.add_argument("--baseline", type=Path,
-+                    help="compare against a previous --json run")
-+    ap.add_argument("-v", "--verbose", action="store_true")
-+    args = ap.parse_args()
-+
-+    oracles = [o for o in args.oracles.split(",") if o]
-+    results = [measure(p, args.lccc, args.flags, oracles, args.local_flags)
-+               for p in args.sources]
-+
-+    baseline = {}
-+    if args.baseline and args.baseline.exists():
-+        baseline = json.loads(args.baseline.read_text())
-+
-+    rows = []
-+    for r in results:
-+        lstats = r.per_compiler.get("lccc", {})
-+        for fname, ls in lstats.items():
-+            if ls.insns < args.min_insns:
-+                continue
-+            best_n, best_v = None, None
-+            per = {}
-+            for o in oracles:
-+                os_ = r.per_compiler.get(o, {}).get(fname)
-+                if os_ is None:
-+                    continue
-+                per[o] = os_
-+                if best_v is None or os_.insns < best_v:
-+                    best_n, best_v = o, os_.insns
-+            if best_v is None:
-+                continue
-+            rows.append((ls.insns - best_v, Path(r.path).stem, fname,
-+                         ls, best_n, per))
-+
-+    rows.sort(key=lambda t: -t[0])
-+
-+    print(f"{'gap':>5} {'benchmark':<22} {'function':<22} "
-+          f"{'insns':>6} {'loads':>6} {'store':>6} {'spill':>6} "
-+          f"{'brnch':>6} {'vec':>6}   best")
-+    print("-" * 108)
-+    total_gap = 0
-+    for gap, bench, fname, ls, best_n, per in rows:
-+        if gap <= 0 and not args.verbose:
-+            continue
-+        total_gap += max(0, gap)
-+        best = per[best_n]
-+        delta = ""
-+        if baseline:
-+            key = f"{bench}:{fname}"
-+            old = baseline.get("gaps", {}).get(key)
-+            if old is not None:
-+                d = gap - old
-+                delta = f"  ({d:+d} vs baseline)" if d else "  (unchanged)"
-+        print(f"{gap:>5} {bench:<22} {fname:<22} {ls.as_row()}   "
-+              f"{best_n}={best.insns}{delta}")
-+
-+    print("-" * 108)
-+    print(f"total instruction gap vs best-of-oracles: {total_gap}")
-+
-+    behind = sum(1 for g, *_ in rows if g > 0)
-+    ahead = sum(1 for g, *_ in rows if g < 0)
-+    tied = sum(1 for g, *_ in rows if g == 0)
-+    print(f"functions: {behind} behind, {tied} tied, {ahead} ahead "
-+          f"({len(rows)} compared)")
-+
-+    for r in results:
-+        for who, err in r.errors.items():
-+            print(f"  ! {Path(r.path).stem}: {who}: {err}", file=sys.stderr)
-+
-+    if args.json:
-+        payload = {
-+            "flags": args.flags,
-+            "gaps": {f"{b}:{f}": g for g, b, f, *_ in rows},
-+            "detail": [
-+                {"file": r.path,
-+                 "compilers": {c: {k: asdict(v) for k, v in s.items()}
-+                               for c, s in r.per_compiler.items()},
-+                 "errors": r.errors}
-+                for r in results
-+            ],
-+        }
-+        args.json.parent.mkdir(parents=True, exist_ok=True)
-+        args.json.write_text(json.dumps(payload, indent=1))
-+        print(f"wrote {args.json}")
-+    return 0
++def compile_remote(name: str, src: str, flags: str) -> list[str]:
++    """Compile on godbolt, caching by (compiler, flags, source) digest."""
++    cid = ORACLE_IDS.get(name, name)
++    key = hashlib.sha256(f"{cid}\0{flags}\0{src}".encode()).hexdigest()[:32]
++    CACHE.mkdir(exist_ok=True)
++    hit = CACHE / f"{key}.s"
++    if hit.exists():
++        return hit.read_text().splitlines()
++    data = godbolt.compile_on_godbolt(cid, src, flags)
++    if data is None:
++        raise RuntimeError(f"{name}: compile failed")
++    lines = [x.get("text", "") for x in (data.get("asm") or [])]
++    hit.write_text("\n".join(lines))
++    return lines
 +
 +
-+if __name__ == "__main__":
-+    sys.exit(main())
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/stack_layout/analysis.rs b/src/backend/stack_layout/analysis.rs
---- a/src/backend/stack_layout/analysis.rs	2026-08-14 16:51:18.193147719 +0000
-+++ b/src/backend/stack_layout/analysis.rs	2026-08-14 17:37:20.585147719 +0000
-@@ -105,6 +105,49 @@
- /// slot was eliminated, the ABI register may be clobbered, and no callee-saved
- /// register was assigned. This would cause emit_param_ref to fall back to
- /// reading the (already-clobbered) ABI register.
+ @dataclass
+ class FileResult:
+     path: str
+@@ -143,15 +186,14 @@ def measure(path: Path, lccc: str, flags: str, oracles: list[str],
+     src = path.read_text()
+ 
+     try:
+-        lines = godbolt.compile_local(lccc, path, local_flags or flags)
++        lines = compile_local(lccc, path, local_flags or flags)
+         res.per_compiler["lccc"] = parse_functions(strip_noise(lines))
+     except Exception as e:  # noqa: BLE001
+         res.errors["lccc"] = f"{type(e).__name__}: {e}"
+ 
+     def one(name: str):
+         try:
+-            cid, _ = godbolt.resolve(name)
+-            lines = godbolt.compile_remote(cid, src, flags)
++            lines = compile_remote(name, src, flags)
+             return name, parse_functions(strip_noise(lines)), None
+         except Exception as e:  # noqa: BLE001
+             return name, {}, f"{type(e).__name__}: {e}"
+diff --git a/scripts/godbolt.py b/scripts/godbolt.py
+index 27ef154..06fcceb 100644
+--- a/scripts/godbolt.py
++++ b/scripts/godbolt.py
+@@ -1,120 +1,15 @@
+ #!/usr/bin/env python3
+-"""Compiler Explorer (godbolt.org) oracle client for LCCC.
++"""Fetch assembly from godbolt.org's Compiler Explorer API for ICC/ICX/etc.
+ 
+-LCCC's competitive targets are GCC, Clang, ICC and ICX (project goal §1), but
+-ICC and ICX cannot be installed in most development or CI environments. This
+-client fetches their code generation over the public Compiler Explorer API so
+-those compilers can serve as *reference oracles* for both correctness spot
+-checks and codegen comparisons, without a local Intel toolchain.
+-
+-Two modes:
+-
+-  asm      Print one compiler's assembly for a source file.
+-  compare  Compile the same source with several compilers and report, per
+-           function, the instruction count and a normalized instruction-mix
+-           summary — the quantitative form used in the competition matrix.
+-
+-Examples
+---------
+-    # ICX's code for a kernel
+-    scripts/godbolt.py asm --compiler icx --flags "-O3 -march=raptorlake" k.c
+-
+-    # Head-to-head against the reference set
+-    scripts/godbolt.py compare k.c --flags "-O3 -march=x86-64-v3"
+-
+-    # Compare LCCC's own output against the reference set
+-    scripts/godbolt.py compare k.c --local ./target/release/lccc
+-
+-Compiler selection accepts either a short alias (`gcc`, `clang`, `icc`, `icx`)
+-which resolves to the newest x86-64 build Compiler Explorer offers, or an
+-explicit Compiler Explorer id (`cg162`, `cclang2210`, `cicc2021100`, ...).
+-Results are cached under `.godbolt-cache/` so repeated comparisons during a
+-tuning loop do not re-hit the network.
+-
+-Network access is required for anything but `--list`. Every failure is
+-reported explicitly; the script never silently substitutes a different
+-compiler or silently returns partial assembly.
++Usage: gb.py <compiler-id> <source-file> [--flags "..."] [--func name]
++Prints the assembly (intel syntax, filtered) to stdout.
+ """
+-from __future__ import annotations
+-
+-import argparse
+-import hashlib
+ import json
+-import os
+-import re
+ import subprocess
+ import sys
+-import urllib.error
+ import urllib.request
+-from pathlib import Path
+-
+-API = "https://godbolt.org/api"
+-CACHE = Path(os.environ.get("GODBOLT_CACHE", ".godbolt-cache"))
+-TIMEOUT = int(os.environ.get("GODBOLT_TIMEOUT", "120"))
+-
+-# Short aliases -> (name prefix used by Compiler Explorer, id prefix).
+-# The newest matching entry by semantic version wins, so these keep working
+-# as Compiler Explorer adds releases.
+-ALIASES = {
+-    "gcc": ("x86-64 gcc", "cg"),
+-    "clang": ("x86-64 clang", "cclang"),
+-    "icc": ("x86-64 icc", "cicc"),
+-    "icx": ("x86-64 icx", "cicx"),
+-}
+-
+-# Default reference set for `compare`.
+-DEFAULT_SET = ["gcc", "clang", "icc", "icx"]
+-
+ 
+-def _get_json(url: str):
+-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+-        return json.load(resp)
+-
+-
+-_COMPILER_LIST: list[dict] | None = None
+-
+-
+-def compiler_list() -> list[dict]:
+-    global _COMPILER_LIST
+-    if _COMPILER_LIST is None:
+-        _COMPILER_LIST = _get_json(f"{API}/compilers/c?fields=id,name,semver")
+-    return _COMPILER_LIST
+-
+-
+-def _semver_key(c: dict) -> tuple:
+-    s = c.get("semver") or ""
+-    parts = []
+-    for piece in s.split("."):
+-        m = re.match(r"\d+", piece)
+-        parts.append(int(m.group()) if m else 0)
+-    return tuple(parts) if parts else (0,)
+-
+-
+-def resolve(spec: str) -> tuple[str, str]:
+-    """Resolve an alias or explicit id to (compiler_id, display_name)."""
+-    if spec in ALIASES:
+-        name_prefix, id_prefix = ALIASES[spec]
+-        cands = [
+-            c for c in compiler_list()
+-            if c["name"].startswith(name_prefix)
+-            and c["id"].startswith(id_prefix)
+-            # Exclude nightly/trunk builds: an oracle must be reproducible.
+-            and "trunk" not in c["id"]
+-            and "assertions" not in c["id"]
+-        ]
+-        if not cands:
+-            raise SystemExit(f"error: no Compiler Explorer entry for alias {spec!r}")
+-        best = max(cands, key=_semver_key)
+-        return best["id"], best["name"]
+-    for c in compiler_list():
+-        if c["id"] == spec:
+-            return c["id"], c["name"]
+-    raise SystemExit(f"error: unknown compiler id {spec!r} (try --list)")
+-
+-
+-def compile_remote(compiler_id: str, source: str, flags: str) -> list[str]:
+-    """Return the assembly lines Compiler Explorer produced, or raise."""
++def compile_on_godbolt(compiler_id: str, source: str, flags: str):
+     body = {
+         "source": source,
+         "options": {
+@@ -122,8 +17,7 @@ def compile_remote(compiler_id: str, source: str, flags: str) -> list[str]:
+             "filters": {
+                 "binary": False,
+                 "execute": False,
+-                # AT&T output matches LCCC's own emission, so diffs are direct.
+-                "intel": False,
++                "intel": True,
+                 "demangle": True,
+                 "directives": True,
+                 "labels": True,
+@@ -132,199 +26,45 @@ def compile_remote(compiler_id: str, source: str, flags: str) -> list[str]:
+             },
+             "compilerOptions": {"executorRequest": False},
+         },
+-        "lang": "c",
+-        "allowStoreCodeDebug": False,
+     }
+-    key = hashlib.sha256(
+-        f"{compiler_id}\0{flags}\0{source}".encode()
+-    ).hexdigest()[:32]
+-    cached = CACHE / f"{key}.json"
+-    if cached.exists():
+-        return json.loads(cached.read_text())
+-
+     req = urllib.request.Request(
+-        f"{API}/compiler/{compiler_id}/compile",
++        f"https://godbolt.org/api/compiler/{compiler_id}/compile",
+         data=json.dumps(body).encode(),
+         headers={"Content-Type": "application/json", "Accept": "application/json"},
+     )
+-    try:
+-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+-            data = json.load(resp)
+-    except urllib.error.URLError as exc:
+-        raise SystemExit(f"error: Compiler Explorer request failed: {exc}") from exc
+-
++    with urllib.request.urlopen(req, timeout=120) as resp:
++        data = json.load(resp)
+     if data.get("code") != 0:
+-        msg = "\n".join(x.get("text", "") for x in data.get("stderr", []))
+-        raise SystemExit(
+-            f"error: {compiler_id} failed to compile:\n{msg.strip()[:2000]}"
+-        )
+-    lines = [b.get("text", "") for b in data.get("asm", [])]
+-    CACHE.mkdir(parents=True, exist_ok=True)
+-    cached.write_text(json.dumps(lines))
+-    return lines
+-
+-
+-def compile_local(binary: str, source_path: Path, flags: str) -> list[str]:
+-    """Assembly from a locally built compiler (normally LCCC itself)."""
+-    out = source_path.with_suffix(".local.s")
+-    cmd = [binary, *flags.split(), "-S", str(source_path), "-o", str(out)]
+-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+-    if r.returncode != 0:
+-        raise SystemExit(
+-            f"error: {binary} failed:\n{(r.stderr or r.stdout).strip()[:2000]}"
+-        )
+-    return out.read_text().splitlines()
+-
+-
+-# ─── Assembly analysis ────────────────────────────────────────────────────
+-
+-DIRECTIVE = re.compile(r"^\s*\.")
+-LABEL = re.compile(r"^\s*[.\w$]+:\s*$")
+-
+-# Coarse instruction classes for the mix summary. The point is not a cycle
+-# model — it is to make a codegen difference legible at a glance: "ICX used 4
+-# fewer loads and one more FMA" is actionable, "ICX is 3 instructions shorter"
+-# is not.
+-CLASSES: list[tuple[str, re.Pattern]] = [
+-    ("branch", re.compile(r"^(j\w+|call|ret|loop\w*)$")),
+-    ("vector", re.compile(r"^v?(p?(add|sub|mul|div|min|max|and|or|xor|cmp|"
+-                          r"shuf|perm|blend|pack|unpck|broadcast|movdq|movap|"
+-                          r"movup|insert|extract|gather|fmadd|fmsub|fnmadd|"
+-                          r"fnmsub|sqrt|rcp|rsqrt|dp|test|abs|sad|madd|avg)"
+-                          r"\w*)$")),
+-    ("fp", re.compile(r"^(add|sub|mul|div|sqrt|min|max|ucomi|comi|cvt)"
+-                      r"(ss|sd|ps|pd)$")),
+-    ("load", re.compile(r"^(mov\w*|lea)$")),  # refined below by operand shape
+-    ("alu", re.compile(r"^(add|sub|and|or|xor|not|neg|inc|dec|imul|mul|idiv|"
+-                       r"div|shl|shr|sar|rol|ror|adc|sbb|cmp|test|set\w+|"
+-                       r"cmov\w+|bt\w*|bs\w|popcnt|lzcnt|tzcnt|movz\w+|"
+-                       r"movs\w+|cdq\w*|cqo|bswap|xchg)\w*$")),
+-    ("stack", re.compile(r"^(push|pop|leave|enter)\w*$")),
+-    ("nop", re.compile(r"^(nop\w*|pause|endbr\d+)$")),
+-]
+-
+-
+-def analyze(lines: list[str], func: str | None = None) -> dict:
+-    """Instruction count and mix, optionally restricted to one function."""
+-    in_func = func is None
+-    depth_ok = True
+-    counts: dict[str, int] = {}
+-    total = 0
+-    mem_ops = 0
+-    for raw in lines:
+-        line = raw.split("#")[0].split("//")[0].rstrip()
+-        if not line.strip():
+-            continue
+-        if func is not None:
+-            if re.match(rf"^\s*{re.escape(func)}:\s*$", line):
+-                in_func = True
+-                continue
+-            if in_func and re.match(r"^\s*\.(size|cfi_endproc)\b", line):
+-                # `.size f, .-f` ends the function body.
+-                if ".size" in line and func not in line:
+-                    continue
+-                in_func = False
+-                continue
+-        if not in_func or not depth_ok:
+-            continue
+-        if LABEL.match(line) or DIRECTIVE.match(line):
+-            continue
+-        mnemonic = line.strip().split()[0].lower()
+-        # Strip a lock/rep prefix so the following opcode is classified.
+-        if mnemonic in ("lock", "rep", "repe", "repz", "repne", "repnz"):
+-            parts = line.strip().split()
+-            if len(parts) < 2:
+-                continue
+-            mnemonic = parts[1].lower()
+-        total += 1
+-        if "(" in line and not mnemonic.startswith("lea"):
+-            mem_ops += 1
+-        for name, rx in CLASSES:
+-            if rx.match(mnemonic):
+-                counts[name] = counts.get(name, 0) + 1
+-                break
++        sys.stderr.write("compile failed: " + json.dumps(data.get("stderr", [])) + "\n")
++        return None
++    return data
 +
-+/// True when the function contains any instruction that clobbers the
-+/// caller-saved registers: a call, or an operation lowered to one.
-+///
-+/// Used to decide whether a caller-saved GPR is a safe home for an incoming
-+/// parameter. Memcpy/memset and variadic argument handling are included
-+/// because they are lowered to `rep movsb` / helper sequences that destroy
-+/// rdi/rsi, exactly like a call would.
-+pub(super) fn function_makes_calls(func: &IrFunction) -> bool {
-+    if func.is_variadic {
-+        return true;
-+    }
-+    func.blocks.iter().any(|b| {
-+        b.instructions.iter().any(|i| {
-+            matches!(i,
-+                Instruction::Call { .. }
-+                | Instruction::Memcpy { .. }
-+                | Instruction::CallIndirect { .. }
-+                | Instruction::VaArgStruct { .. }
-+                | Instruction::VaArg { .. }
-+                | Instruction::VaStart { .. }
-+                | Instruction::VaCopy { .. }
-+                | Instruction::VaEnd { .. }
-+            )
-+        })
-+    })
-+}
-+
-+/// PhysReg ids 10-15 are the caller-saved GPR pool (r11, r10, r8, r9, rdi,
-+/// rsi). See `X86_CALLER_SAVED` in the x86 emitter.
-+///
-+/// Only r11 (id 10) and r10 (id 11) are safe as parameter homes. The other
-+/// four ARE SysV integer argument registers, so writing a parameter's home
-+/// there in the prologue destroys another parameter's incoming value whenever
-+/// that parameter is materialised in the function BODY rather than by a
-+/// prologue move (`movslq %r8d, %rdi` in a 9-argument callee read r8 after
-+/// param 2's home had already overwritten it). The prologue's parallel-copy
-+/// ordering only sequences the moves it emits itself and cannot protect body
-+/// reads, so the ABI-overlapping registers are excluded here instead.
-+pub(super) fn is_scratch_gpr(phys: PhysReg) -> bool {
-+    matches!(phys.0, 10 | 11)
-+}
-+
- pub(super) fn find_dead_param_allocas(
-     func: &IrFunction,
-     used_values: &FxHashSet<u32>,
-@@ -138,11 +181,22 @@
-                     // - a callee-saved GPR (survives calls, never clobbered);
-                     // - an XMM register (PhysReg 20+), which the allocator
-                     //   only assigns to values that do NOT span calls.
--                    // Caller-saved GPRs overlap with ABI argument registers
--                    // and would clobber other params' values before they're
--                    // saved, so they are deliberately excluded.
-+                    // - r11/r10 in a LEAF function. These two are the only
-+                    //   caller-saved GPRs that are not also SysV argument
-+                    //   registers, so homing a parameter there cannot destroy
-+                    //   another parameter's incoming value; and with no calls
-+                    //   in the function nothing clobbers them either. The
-+                    //   remaining caller-saved GPRs (r8/r9/rdi/rsi) ARE
-+                    //   argument registers and stay excluded.
-+                    // Allowing it removes a store AND a reload per parameter.
-+                    // `int cmp(const void*a, const void*b){return *(int*)a -
-+                    // *(int*)b;}` went from 11 instructions with a 24-byte
-+                    // frame to GCC's 3.
-+                    let leaf = !function_makes_calls(func);
-                     let has_stable_home = reg_assigned.get(&dest_id)
--                        .map(|phys| callee_saved_regs.contains(phys) || phys.0 >= 20)
-+                        .map(|phys| callee_saved_regs.contains(phys)
-+                             || phys.0 >= 20
-+                             || (leaf && is_scratch_gpr(*phys)))
-                         .unwrap_or(false);
-                     if has_stable_home {
-                         dead.insert(pv.0);
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
---- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs	2026-08-14 16:51:18.213147719 +0000
-+++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs	2026-08-14 17:37:20.585147719 +0000
-@@ -2449,7 +2449,7 @@
-         // can have long stretches of non-barrier instructions.
-         let src_32_name = REG_NAMES[1][src_family as usize];
-         let mut rax_dead = false; // conservative default: assume alive
--        let mut cmpl_line: Option<usize> = None;
-+        let mut cmpl_lines: Vec<usize> = Vec::new();
-         let mut n = j + 1;
-         while n < len {
-             if infos[n].is_nop() { n += 1; continue; }
-@@ -2494,7 +2494,7 @@
-                 }
-                 // Check if it's a cmpl $imm, %eax
-                 let tn = infos[n].trimmed(store.get(n));
--                if tn.starts_with("cmpl $") && tn.ends_with(", %eax") && cmpl_line.is_none() {
-+                if tn.starts_with("cmpl $") && tn.ends_with(", %eax") {
-                     // Check src_family is not modified between i and n.
-                     // Must check ALL instruction kinds that can write to a register,
-                     // including calls (clobber caller-saved) and pop.
-@@ -2523,7 +2523,7 @@
-                         }
-                     }
-                     if !src_modified {
--                        cmpl_line = Some(n);
-+                        cmpl_lines.push(n);
-                         n += 1;
-                         continue;
-                     }
-@@ -2535,7 +2535,21 @@
-             n += 1;
++def main():
++    args = sys.argv[1:]
++    if len(args) < 2:
++        sys.stderr.write(__doc__)
++        sys.exit(2)
++    compiler_id = args[0]
++    source_file = args[1]
++    flags = "-O3 -march=x86-64-v3"
++    func = None
++    i = 2
++    while i < len(args):
++        if args[i] == "--flags":
++            flags = args[i + 1]
++            i += 2
++        elif args[i] == "--func":
++            func = args[i + 1]
++            i += 2
+         else:
+-            counts["other"] = counts.get("other", 0) + 1
+-    counts["memory"] = mem_ops
+-    return {"instructions": total, "mix": counts}
+-
+-
+-def main() -> int:
+-    ap = argparse.ArgumentParser(
+-        description="Compiler Explorer oracle for LCCC codegen comparison.")
+-    sub = ap.add_subparsers(dest="cmd", required=True)
+-
+-    p_list = sub.add_parser("list", help="show resolvable compilers")
+-    p_list.add_argument("--filter", default="")
+-
+-    p_asm = sub.add_parser("asm", help="print one compiler's assembly")
+-    p_asm.add_argument("source", type=Path)
+-    p_asm.add_argument("--compiler", default="gcc")
+-    p_asm.add_argument("--flags", default="-O2")
+-    p_asm.add_argument("--func", default=None)
+-
+-    p_cmp = sub.add_parser("compare", help="compare several compilers")
+-    p_cmp.add_argument("source", type=Path)
+-    p_cmp.add_argument("--compilers", default=",".join(DEFAULT_SET))
+-    p_cmp.add_argument("--flags", default="-O2")
+-    p_cmp.add_argument("--func", default=None)
+-    p_cmp.add_argument("--local", default=None,
+-                       help="path to a locally built compiler (e.g. LCCC)")
+-    p_cmp.add_argument("--local-name", default="lccc")
+-    p_cmp.add_argument("--local-flags", default=None,
+-                       help="flags for --local (defaults to --flags)")
+-
+-    args = ap.parse_args()
+-
+-    if args.cmd == "list":
+-        for c in sorted(compiler_list(), key=lambda c: c["id"]):
+-            if args.filter and args.filter not in c["id"] \
+-                    and args.filter.lower() not in c["name"].lower():
+-                continue
+-            print(f"{c['id']:<24} {c['name']}")
+-        for alias in ALIASES:
+-            cid, name = resolve(alias)
+-            print(f"{alias:<24} -> {cid} ({name})")
+-        return 0
+-
+-    source = args.source.read_text()
+-
+-    if args.cmd == "asm":
+-        cid, name = resolve(args.compiler)
+-        print(f"# {name} [{cid}]  flags: {args.flags}", file=sys.stderr)
+-        for line in compile_remote(cid, source, args.flags):
+-            print(line)
+-        return 0
+-
+-    # compare
+-    rows: list[tuple[str, dict]] = []
+-    if args.local:
+-        lines = compile_local(args.local, args.source,
+-                              args.local_flags or args.flags)
+-        rows.append((args.local_name, analyze(lines, args.func)))
+-    for spec in [s for s in args.compilers.split(",") if s.strip()]:
+-        cid, name = resolve(spec.strip())
+-        lines = compile_remote(cid, source, args.flags)
+-        rows.append((name, analyze(lines, args.func)))
+-
+-    keys = ["instructions", "branch", "vector", "fp", "alu", "load",
+-            "stack", "memory", "nop", "other"]
+-    width = max(len(n) for n, _ in rows) + 2
+-    print(f"{'compiler':<{width}}" + "".join(f"{k:>13}" for k in keys))
+-    print("-" * (width + 13 * len(keys)))
+-    for name, res in rows:
+-        cells = []
+-        for k in keys:
+-            v = res["instructions"] if k == "instructions" else res["mix"].get(k, 0)
+-            cells.append(f"{v:>13}")
+-        print(f"{name:<{width}}" + "".join(cells))
+-
+-    best = min(rows, key=lambda r: r[1]["instructions"])
+-    print(f"\nfewest instructions: {best[0]} ({best[1]['instructions']})")
+-    print("NOTE: instruction count is a proxy, not a verdict. Confirm any "
+-          "conclusion with a timed run on real hardware (project goal §12).")
+-    return 0
+-
++            i += 1
++    source = open(source_file).read()
++    data = compile_on_godbolt(compiler_id, source, flags)
++    if data is None:
++        sys.exit(1)
++    for block in data.get("asm", []):
++        text = block.get("text", "")
++        print(text)
+ 
+ if __name__ == "__main__":
+-    sys.exit(main())
++    main()
+diff --git a/src/backend/x86/assembler/encoder/gp_integer.rs b/src/backend/x86/assembler/encoder/gp_integer.rs
+index 330a5f8..3f2f67e 100644
+--- a/src/backend/x86/assembler/encoder/gp_integer.rs
++++ b/src/backend/x86/assembler/encoder/gp_integer.rs
+@@ -141,8 +141,18 @@ impl super::InstructionEncoder {
+                 } else {
+                     // 8-bit: B0+r8 ib is 2 bytes (vs 3 for C6 /0) for
+                     // AL/CL/DL/BL; with REX it matches C6 length. Matches GAS.
+-                    if needs_rex_ext(&dst.name) {
+-                        self.bytes.push(self.rex(false, false, false, true));
++                    //
++                    // %spl/%bpl/%sil/%dil encode as 4..7 -- the SAME numbers as
++                    // %ah/%ch/%dh/%bh -- and are only reachable when a REX
++                    // prefix is present. Emitting B0+r without REX therefore
++                    // silently assembles `movb $imm, %dil` as `movb $imm, %bh`,
++                    // writing bits 8-15 of RBX. That corrupted a live pointer
++                    // (`lea 0x54(%rsp),%rbx; mov $0x50,%bh; mov %dil,(%rbx)`)
++                    // and made struct_copy SIGSEGV intermittently at -O0.
++                    // needs_rex_ext alone only covers r8b-r15b, so the
++                    // mandatory-REX set must be tested as well.
++                    if needs_rex_ext(&dst.name) || is_rex_required_8bit(&dst.name) {
++                        self.bytes.push(self.rex(false, false, false, needs_rex_ext(&dst.name)));
+                         self.bytes.push(0xB0 + (dst_num & 7));
+                     } else {
+                         self.bytes.push(0xB0 + (dst_num & 7));
+@@ -738,6 +748,23 @@ impl super::InstructionEncoder {
+                 self.bytes.push(if size == 1 { 0x84 } else { 0x85 });
+                 self.encode_modrm_mem(src_num, mem)
+             }
++            // test mem, %reg -- the AT&T source/destination order reversed.
++            //
++            // TEST has no 8A/8B-style "load" direction: only 84 /r and 85 /r
++            // exist, both with the register in ModRM.reg and the memory operand
++            // in r/m. TEST is also symmetric (it discards the AND result and
++            // only sets flags), so GNU as encodes `testb (%rcx), %dil` and
++            // `testb %dil, (%rcx)` to the exact same bytes -- verified against
++            // GAS 2.47 for all four operand sizes. Without this arm the valid
++            // memory-source form was rejected outright.
++            (Operand::Memory(mem), Operand::Register(reg)) => {
++                let reg_n = reg_num(&reg.name).ok_or("bad register")?;
++                self.emit_segment_prefix(mem)?;
++                if size == 2 { self.bytes.push(0x66); }
++                self.emit_rex_rm(size, &reg.name, mem);
++                self.bytes.push(if size == 1 { 0x84 } else { 0x85 });
++                self.encode_modrm_mem(reg_n, mem)
++            }
+             // test $imm, mem
+             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Memory(mem)) => {
+                 let val = *val;
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 21902f3..3ab4d20 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -1767,6 +1767,15 @@ impl X86Codegen {
+         if depth >= 32 {
+             panic!("x86 codegen: cyclic or excessive Copy chain for value {}", val.0);
          }
++        // Every materialisation below is a 64-bit `movq`/`leaq` into `reg`, so
++        // `reg` must name a 64-bit register. Passing a 32-bit name produced
++        // `movq %r8, %eax`, which is not encodable; the integrated assembler
++        // rejected it and zlib-ng's slide_hash_avx2.c failed to build. Catch
++        // the mistake at its source instead of in the assembler.
++        debug_assert!(
++            reg.starts_with('r') && !reg.ends_with('d'),
++            "value_to_reg expects a 64-bit register name, got %{reg}"
++        );
+         // Check register allocation first (allocas are never register-allocated)
+         if let Some(&phys_reg) = self.reg_assignments.get(&val.0) {
+             if is_xmm_reg(phys_reg) {
+diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
+index 7d310c7..9ad7a1b 100644
+--- a/src/backend/x86/codegen/intrinsics.rs
++++ b/src/backend/x86/codegen/intrinsics.rs
+@@ -1382,13 +1382,23 @@ impl X86Codegen {
+                         self.state.emit_fmt(format_args!("    {} {}, %ymm0", inst, operand));
+                     } else if self.avx512_enabled {
+                         // EVEX GPR-source vpbroadcast: 1 uop on port 5, no movd.
++                        // operand_to_reg materialises through a 64-bit `movq`,
++                        // so it must be handed the 64-bit register name; only
++                        // the broadcast operand itself is width-specific.
++                        self.operand_to_reg(&args[0], "rax");
+                         let reg = if bits == 8 { "rax" } else { "eax" };
+-                        self.operand_to_reg(&args[0], reg);
+                         self.state.emit_fmt(format_args!("    {} %{}, %ymm0", inst, reg));
+                     } else {
+                         // AVX2: vmovd + xmm-source vpbroadcast (matches GCC/LLVM).
+-                        let reg = if bits == 8 { "rax" } else { "eax" };
+-                        self.operand_to_reg(&args[0], reg);
++                        //
++                        // Always load through %rax: operand_to_reg emits
++                        // `movq %src, %dst` and passing "eax" produced the
++                        // invalid `movq %r8, %eax`, which the integrated
++                        // assembler rightly rejected -- zlib-ng's
++                        // slide_hash_avx2.c (`_mm256_set1_epi16((short)wsize)`)
++                        // failed to build because of it. The narrowing to 32
++                        // or 8 bits is expressed by the movd/movq that follows.
++                        self.operand_to_reg(&args[0], "rax");
+                         if bits == 8 {
+                             self.state.emit("    movq %rax, %xmm0");
+                         } else {
+diff --git a/src/backend/x86/codegen/intrinsics_simd.rs b/src/backend/x86/codegen/intrinsics_simd.rs
+index 67f0df7..311735b 100644
+--- a/src/backend/x86/codegen/intrinsics_simd.rs
++++ b/src/backend/x86/codegen/intrinsics_simd.rs
+@@ -485,10 +485,10 @@ impl X86Codegen {
+             | Movddup128 | Movsldup128 | Movshdup128
+             | RoundPs128 | RoundPd128 | BlendPs128 | BlendPd128 | BlendvPs128 | BlendvPd128
+             | DpPs128 | DpPd128 | InsertPs128 | InsertPd128 | VpermilPs128
+-            | Movss128 | Movsd128 | CvtSi2Ss_128 | CvtSi2Sd_128 | CvtSi2Ss64_128 | CvtSi2Sd64_128
+-            | CvtSs2Sd_128 | CvtSd2Ss_128
+-            | CvtPs2Ep32_128 | CvtEp32_2Ps_128 | CvttPs2Ep32_128
+-            | CvtPs2Pd_128 | CvtPd2Ps_128 | CvtPd2Ep32_128 | CvtEp32_2Pd_128 | CvttPd2Ep32_128
++            | Movss128 | Movsd128 | CvtSi2Ss128 | CvtSi2Sd128 | CvtSi2Ss64_128 | CvtSi2Sd64_128
++            | CvtSs2Sd128 | CvtSd2Ss128
++            | CvtPs2Ep32_128 | CvtEp32ToPs128 | CvttPs2Ep32_128
++            | CvtPs2Pd128 | CvtPd2Ps128 | CvtPd2Ep32_128 | CvtEp32ToPd128 | CvttPd2Ep32_128
+             | FmaPs132 | FmaPs213 | FmaPs231 | FmaPd132 | FmaPd213 | FmaPd231 => {
+                 self.emit_sse_fp_128_op(dptr, op, args);
+                 true
+@@ -501,8 +501,8 @@ impl X86Codegen {
+             | RoundPs256 | RoundPd256 | BlendPs256 | BlendPd256
+             | BlendvPs256 | BlendvPd256 | VpermilPs256 | Vperm2f128 | Vinsertf128
+             | Vextractf128 | Vbroadcastss | Vbroadcastsd
+-            | CvtPs2Ep32_256 | CvtEp32_2Ps_256 | CvttPs2Ep32_256
+-            | CvtPs2Pd_256 | CvtPd2Ps_256 | CvtPd2Ep32_256 | CvtEp32_2Pd_256 | CvttPd2Ep32_256
++            | CvtPs2Ep32_256 | CvtEp32ToPs256 | CvttPs2Ep32_256
++            | CvtPs2Pd256 | CvtPd2Ps256 | CvtPd2Ep32_256 | CvtEp32ToPd256 | CvttPd2Ep32_256
+             | VpermilvarPs256 | VpermilvarPd256
+             | FmaPs132v256 | FmaPs213v256 | FmaPs231v256
+             | FmaPd132v256 | FmaPd213v256 | FmaPd231v256 => {
+@@ -853,8 +853,8 @@ impl X86Codegen {
+             MovemaskPs256 => ("vmovmskps", 0, true),
+             MovemaskPd256 => ("vmovmskpd", 0, true),
+             ExtractPs128 => ("extractps", 0, true),
+-            CvtSs2Si_128 => ("cvtss2si", 0, true),
+-            CvtSd2Si_128 => ("cvtsd2si", 0, true),
++            CvtSs2Si128 => ("cvtss2si", 0, true),
++            CvtSd2Si128 => ("cvtsd2si", 0, true),
+             TestzPs128 => ("vtestps", 0, true),
+             TestzPs256 => ("vtestps", 0, true),
+             ReduceAddEpu32_512 => ("__reduce_add_epu32", 0, false),
+@@ -915,7 +915,7 @@ impl X86Codegen {
+                 }
+                 true
+             }
+-            CvtSs2Si_128 | CvtSd2Si_128 => {
++            CvtSs2Si128 | CvtSd2Si128 => {
+                 self.sse_load_arg(&args[0], "xmm0");
+                 self.state.emit_fmt(format_args!("    {} %xmm0, %eax", inst));
+                 if let Some(d) = dest {
+@@ -1016,12 +1016,12 @@ impl X86Codegen {
+             Movsldup128 => unary(self, "movsldup"),
+             Movshdup128 => unary(self, "movshdup"),
+             CvtPs2Ep32_128 => unary(self, "cvtps2dq"),
+-            CvtEp32_2Ps_128 => unary(self, "cvtdq2ps"),
++            CvtEp32ToPs128 => unary(self, "cvtdq2ps"),
+             CvttPs2Ep32_128 => unary(self, "cvttps2dq"),
+-            CvtPs2Pd_128 => unary(self, "cvtps2pd"),
+-            CvtPd2Ps_128 => unary(self, "cvtpd2ps"),
++            CvtPs2Pd128 => unary(self, "cvtps2pd"),
++            CvtPd2Ps128 => unary(self, "cvtpd2ps"),
+             CvtPd2Ep32_128 => unary(self, "cvtpd2dq"),
+-            CvtEp32_2Pd_128 => unary(self, "cvtdq2pd"),
++            CvtEp32ToPd128 => unary(self, "cvtdq2pd"),
+             CvttPd2Ep32_128 => unary(self, "cvttpd2dq"),
+             HaddPs128 | HsubPs128 | AddsubPs128 | HaddPd128 | HsubPd128 | AddsubPd128
+             | UnpcklPs128 | UnpckhPs128 | UnpcklPd128 | UnpckhPd128 => {
+@@ -1105,8 +1105,8 @@ impl X86Codegen {
+                 self.sse_store_dest(dest_ptr, "xmm0");
+             }
+             // cvtsi2ss/cvtsi2sd (a, i): convert i into xmm0 holding a
+-            CvtSi2Ss_128 | CvtSi2Sd_128 => {
+-                let inst = if matches!(op, CvtSi2Ss_128) { "cvtsi2ss" } else { "cvtsi2sd" };
++            CvtSi2Ss128 | CvtSi2Sd128 => {
++                let inst = if matches!(op, CvtSi2Ss128) { "cvtsi2ss" } else { "cvtsi2sd" };
+                 self.sse_load_arg(&args[0], "xmm0");
+                 self.operand_to_reg(&args[1], "rax");
+                 self.state.emit_fmt(format_args!("    {} %eax, %xmm0", inst));
+@@ -1120,8 +1120,8 @@ impl X86Codegen {
+                 self.sse_store_dest(dest_ptr, "xmm0");
+             }
+             // cvtss2sd/cvtsd2ss (a, b)
+-            CvtSs2Sd_128 | CvtSd2Ss_128 => {
+-                let inst = if matches!(op, CvtSs2Sd_128) { "cvtss2sd" } else { "cvtsd2ss" };
++            CvtSs2Sd128 | CvtSd2Ss128 => {
++                let inst = if matches!(op, CvtSs2Sd128) { "cvtss2sd" } else { "cvtsd2ss" };
+                 self.sse_load_arg(&args[0], "xmm0");
+                 self.sse_load_arg(&args[1], "xmm1");
+                 self.state.emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
+@@ -1191,12 +1191,12 @@ impl X86Codegen {
+             VpermilvarPs256 => binary(self, "vpermilps", false),
+             VpermilvarPd256 => binary(self, "vpermilpd", false),
+             CvtPs2Ep32_256 => unary(self, "vcvtps2dq"),
+-            CvtEp32_2Ps_256 => unary(self, "vcvtdq2ps"),
++            CvtEp32ToPs256 => unary(self, "vcvtdq2ps"),
+             CvttPs2Ep32_256 => unary(self, "vcvttps2dq"),
+-            CvtPs2Pd_256 => unary(self, "vcvtps2pd"),
+-            CvtPd2Ps_256 => unary(self, "vcvtpd2ps"),
++            CvtPs2Pd256 => unary(self, "vcvtps2pd"),
++            CvtPd2Ps256 => unary(self, "vcvtpd2ps"),
+             CvtPd2Ep32_256 => unary(self, "vcvtpd2dq"),
+-            CvtEp32_2Pd_256 => unary(self, "vcvtdq2pd"),
++            CvtEp32ToPd256 => unary(self, "vcvtdq2pd"),
+             CvttPd2Ep32_256 => unary(self, "vcvttpd2dq"),
+             // 3-op with imm: vcmpps/vcmppd/vshufps/vshufpd/vblendps/vblendpd (a, b, imm)
+             CmpPs256 | CmpPd256 | ShufPs256 | ShufPd256 | BlendPs256 | BlendPd256 => {
+diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+index 607bd72..4e069f6 100644
+--- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
++++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+@@ -1171,6 +1171,146 @@ fn fam_read_after(store: &LineStore, infos: &[LineInfo], start: usize, fam: u8)
+     false
+ }
  
--        if !rax_dead && cmpl_line.is_none() { i += 1; continue; }
-+        // The transform retargets the movslq away from %rax, DELETING the only
-+        // definition of %rax. That is legal only when %rax is provably dead
-+        // afterwards. Redirecting the cmpl operands we happened to find is not
-+        // sufficient on its own: the forward scan stops at the first barrier,
-+        // so a `cmpl $imm, %eax` in a SUCCESSOR block is never examined and
-+        // would be left reading a register nothing defines any more.
-+        //
-+        // (Reproducer: a switch lowered to a compare chain. The first
-+        // `cmpl $1, %eax` was redirected, the `je` ended the scan with %rax
-+        // still conservatively live, and the next block's `cmpl $2, %eax` read
-+        // a dead register -- `switch(x){case 1: ... case 2: ...}` returned the
-+        // default value for x == 2. This previously stayed hidden because the
-+        // parameter spill reloaded %rax; eliminating that dead spill exposed
-+        // it.)
-+        if !rax_dead { i += 1; continue; }
++/// Fold `leaq (%base,%index[,scale]), %tmp` into EVERY memory operand that
++/// uses `(%tmp)` within the same basic block, then delete the LEA.
++///
++/// `fold_lea_into_memory_op` only rewrites the IMMEDIATELY following
++/// instruction and only when the temporary dies at that single use. Vectorized
++/// inner loops break both assumptions at once. matmul's kernel is
++///
++///     leaq (%r8,%r10), %r11
++///     leaq (%rsi,%r10), %r13          <- next insn is another LEA
++///     vmovupd (%r13), %ymm0           <- %r13 used here ...
++///     vfmadd231pd (%r11), %ymm1, %ymm0
++///     vmovupd %ymm0, (%r13)           <- ... and again here
++///
++/// so neither LEA folds and the loop pays two address computations plus two
++/// registers per iteration. x86 addresses the whole thing for free in the SIB
++/// byte, which is what ICX emits (`vfmadd213pd ymm1, ymm0, [rax+8*r8-64]`).
++///
++/// Soundness requirements, all enforced below:
++///   * scan stops at the first barrier — folding across a branch would move an
++///     address computation onto a path that never executed it;
++///   * every intervening instruction must leave BOTH base and index untouched,
++///     otherwise the folded operand would read different registers than the
++///     LEA did (this is the check the older pass gets for free by only ever
++///     looking at the very next line);
++///   * `%tmp` must be dead after the last rewritten use, and must not be read
++///     in any form the rewrite does not cover (a bare `(%tmp)` is the only
++///     shape matched; `8(%tmp)` and plain register reads block the fold);
++///   * `%tmp` must differ from base and index, or deleting the LEA would
++///     change the value the folded operand reads.
++pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
++    let len = store.len();
++    let mut changed = false;
++    let mut i = 0;
++
++    while i < len {
++        if infos[i].is_nop() { i += 1; continue; }
++        let lea = infos[i].trimmed(store.get(i));
++        if !lea.starts_with("leaq ") { i += 1; continue; }
++
++        let Some((addr_text, dst_text)) = lea[5..].rsplit_once(',') else { i += 1; continue };
++        let (addr_text, dst_text) = (addr_text.trim(), dst_text.trim());
++        if !dst_text.starts_with('%') { i += 1; continue; }
++        let dst_family = register_family_fast(dst_text);
++        if dst_family == REG_NONE || dst_family > REG_GP_MAX { i += 1; continue; }
++
++        let (Some(open), Some(close)) = (addr_text.find('('), addr_text.rfind(')')) else {
++            i += 1; continue;
++        };
++        if close <= open || close + 1 != addr_text.len() { i += 1; continue; }
++        let displacement = addr_text[..open].trim();
++        let fields: Vec<&str> = addr_text[open + 1..close].split(',').map(str::trim).collect();
++        // Only the two- and three-field SIB forms; the single-base form is
++        // already handled (and folding it here would duplicate that work).
++        if fields.len() < 2 || fields.len() > 3 { i += 1; continue; }
++        if fields.iter().any(|f| !f.starts_with('%')) { i += 1; continue; }
++        if fields.len() == 3 && !matches!(fields[2], "1" | "2" | "4" | "8") { i += 1; continue; }
++
++        let base_family = register_family_fast(fields[0]);
++        let index_family = register_family_fast(fields[1]);
++        if base_family == REG_NONE || index_family == REG_NONE
++            || base_family > REG_GP_MAX || index_family > REG_GP_MAX
++            || dst_family == base_family || dst_family == index_family
++        { i += 1; continue; }
++
++        let sib = if fields.len() == 3 {
++            format!("{}({},{},{})", displacement, fields[0], fields[1], fields[2])
++        } else {
++            format!("{}({},{})", displacement, fields[0], fields[1])
++        };
++        let addr_pat = format!("({})", dst_text);
++        let dst64 = REG_NAMES[0][dst_family as usize];
++        let dst32 = REG_NAMES[1][dst_family as usize];
++        let base_mask = 1u16 << base_family;
++        let index_mask = 1u16 << index_family;
++        let dst_mask = 1u16 << dst_family;
++
++        // Collect every rewritable use up to the end of the block.
++        let mut uses: Vec<usize> = Vec::new();
++        let mut ok = true;
++        let mut n = i + 1;
++        while n < len {
++            if infos[n].is_nop() { n += 1; continue; }
++            if infos[n].is_barrier() { break; }
++            let t = infos[n].trimmed(store.get(n));
++
++            // Base or index redefined => the LEA's value is no longer
++            // reproducible from them; stop (uses collected so far are still
++            // valid only if we fold nothing after this point).
++            let writes = get_dest_reg(&infos[n]);
++            if writes == base_family || writes == index_family { break; }
++
++            if infos[n].reg_refs & dst_mask != 0 {
++                // A bare `(%tmp)` operand is rewritable. Anything else that
++                // mentions the register (displacement form, plain read, or a
++                // write) is not, so the LEA has to stay.
++                let bare = t.match_indices(&addr_pat).any(|(pos, _)| {
++                    pos == 0 || matches!(t.as_bytes()[pos - 1] as char, ' ' | ',' | '\t')
++                });
++                let mentions = t.contains(&format!("%{}", dst64))
++                    || t.contains(&format!("%{}", dst32));
++                if bare {
++                    // Reject a line that ALSO uses %tmp in a non-bare position.
++                    let stripped = t.replace(&addr_pat, "");
++                    if stripped.contains(&format!("%{}", dst64))
++                        || stripped.contains(&format!("%{}", dst32))
++                    { ok = false; break; }
++                    uses.push(n);
++                } else if mentions {
++                    // A pure redefinition of %tmp ends its live range cleanly:
++                    // everything after belongs to a different value.
++                    if writes == dst_family && !t[..t.rfind(',').unwrap_or(t.len())]
++                        .contains(&format!("%{}", dst64)) { break; }
++                    ok = false; break;
++                }
++            }
++            let _ = (base_mask, index_mask);
++            n += 1;
++        }
++
++        // Need at least two rewritable uses to beat the existing single-use
++        // pass; with one use that pass already fires (and is better tested).
++        if !ok || uses.len() < 2 { i += 1; continue; }
++        // %tmp must be dead after the block region we rewrote.
++        if fam_read_after(store, infos, n, dst_family) { i += 1; continue; }
++
++        for &u in &uses {
++            let t = infos[u].trimmed(store.get(u));
++            let replacement = t.replacen(&addr_pat, &sib, 1);
++            if replacement == t { ok = false; break; }
++            replace_line(store, &mut infos[u], u, format!("    {}", replacement));
++        }
++        if ok {
++            mark_nop(&mut infos[i]);
++            changed = true;
++        }
++        i += 1;
++    }
++    changed
++}
++
+ pub(super) fn fold_base_index_addressing(
+     store: &mut LineStore,
+     infos: &mut [LineInfo],
+diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
+index e69954b..2318569 100644
+--- a/src/backend/x86/codegen/peephole/passes/mod.rs
++++ b/src/backend/x86/codegen/peephole/passes/mod.rs
+@@ -352,6 +352,9 @@ pub fn peephole_optimize(mut asm: String) -> String {
+         if !sk("lea_mem_sib") {
+             changed |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos);
+         }
++        if !sk("lea_all_uses") {
++            changed |= local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos);
++        }
+         if !sk("fuse_movq_ext") { changed |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos); }
+         if !sk("fp_roundtrips") { changed |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos); }
+         if !sk("fp_mem_fold") { changed |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos); }
+@@ -418,6 +421,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
+             // across loop boundaries). Honor the skip set.
+             if !sk("combined") { changed2 |= local_patterns::combined_local_pass(&mut store, &mut infos); }
+             if !sk("lea_mem_sib") { changed2 |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos); }
++            if !sk("lea_all_uses") { changed2 |= local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos); }
+             changed2 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
+             changed2 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+             changed2 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
+diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
+index 9e9c878..5e5edfe 100644
+--- a/src/ir/intrinsics.rs
++++ b/src/ir/intrinsics.rs
+@@ -760,10 +760,10 @@ pub enum IntrinsicOp {
+     UnpckhPs128,
+     MovemaskPs128,
+     CvtPs2Ep32_128,
+-    CvtEp32_2Ps_128,
++    CvtEp32ToPs128,
+     CvttPs2Ep32_128,
+-    CvtPs2Pd_128,
+-    CvtPd2Ps_128,
++    CvtPs2Pd128,
++    CvtPd2Ps128,
+     DivPd128,
+     MinPd128,
+     MaxPd128,
+@@ -774,16 +774,16 @@ pub enum IntrinsicOp {
+     UnpckhPd128,
+     MovemaskPd128,
+     CvtPd2Ep32_128,
+-    CvtEp32_2Pd_128,
++    CvtEp32ToPd128,
+     CvttPd2Ep32_128,
+-    CvtSs2Si_128,
+-    CvtSi2Ss_128,
+-    CvtSs2Sd_128,
+-    CvtSd2Ss_128,
+-    CvtSi2Sd_128,
++    CvtSs2Si128,
++    CvtSi2Ss128,
++    CvtSs2Sd128,
++    CvtSd2Ss128,
++    CvtSi2Sd128,
+     CvtSi2Ss64_128,
+     CvtSi2Sd64_128,
+-    CvtSd2Si_128,
++    CvtSd2Si128,
+     Movss128,
+     Movsd128,
+     // === 256-bit FP ops (AVX) ===
+@@ -797,10 +797,10 @@ pub enum IntrinsicOp {
+     UnpckhPs256,
+     MovemaskPs256,
+     CvtPs2Ep32_256,
+-    CvtEp32_2Ps_256,
++    CvtEp32ToPs256,
+     CvttPs2Ep32_256,
+-    CvtPs2Pd_256,
+-    CvtPd2Ps_256,
++    CvtPs2Pd256,
++    CvtPd2Ps256,
+     DivPd256,
+     MinPd256,
+     MaxPd256,
+@@ -811,7 +811,7 @@ pub enum IntrinsicOp {
+     UnpckhPd256,
+     MovemaskPd256,
+     CvtPd2Ep32_256,
+-    CvtEp32_2Pd_256,
++    CvtEp32ToPd256,
+     CvttPd2Ep32_256,
+     VpermilPs128,
+     VpermilPs256,
+diff --git a/src/ir/lowering/expr_builtins_lcccsimd.rs b/src/ir/lowering/expr_builtins_lcccsimd.rs
+index a099d6c..298f190 100644
+--- a/src/ir/lowering/expr_builtins_lcccsimd.rs
++++ b/src/ir/lowering/expr_builtins_lcccsimd.rs
+@@ -279,10 +279,10 @@ pub(super) fn lccc_simd_lookup(
+         "unpckhps128" => b(Vec128, UnpckhPs128),
+         "movmskps128" => s1(Scalar, MovemaskPs128),
+         "cvtps2dq128" => u(Vec128, CvtPs2Ep32_128),
+-        "cvtdq2ps128" => u(Vec128, CvtEp32_2Ps_128),
++        "cvtdq2ps128" => u(Vec128, CvtEp32ToPs128),
+         "cvttps2dq128" => u(Vec128, CvttPs2Ep32_128),
+-        "cvtps2pd128" => u(Vec128, CvtPs2Pd_128),
+-        "cvtpd2ps128" => u(Vec128, CvtPd2Ps_128),
++        "cvtps2pd128" => u(Vec128, CvtPs2Pd128),
++        "cvtpd2ps128" => u(Vec128, CvtPd2Ps128),
+         "divpd128" => b(Vec128, DivPd128),
+         "minpd128" => b(Vec128, MinPd128),
+         "maxpd128" => b(Vec128, MaxPd128),
+@@ -293,18 +293,18 @@ pub(super) fn lccc_simd_lookup(
+         "unpckhpd128" => b(Vec128, UnpckhPd128),
+         "movmskpd128" => s1(Scalar, MovemaskPd128),
+         "cvtpd2dq128" => u(Vec128, CvtPd2Ep32_128),
+-        "cvtdq2pd128" => u(Vec128, CvtEp32_2Pd_128),
++        "cvtdq2pd128" => u(Vec128, CvtEp32ToPd128),
+         "cvttpd2dq128" => u(Vec128, CvttPd2Ep32_128),
+         "movss128" => b(Vec128, Movss128),
+         "movsd128" => b(Vec128, Movsd128),
+-        "cvtsi2ss128" => b(Vec128, CvtSi2Ss_128),
+-        "cvtsi2sd128" => b(Vec128, CvtSi2Sd_128),
++        "cvtsi2ss128" => b(Vec128, CvtSi2Ss128),
++        "cvtsi2sd128" => b(Vec128, CvtSi2Sd128),
+         "cvtsi2ss64_128" => b(Vec128, CvtSi2Ss64_128),
+         "cvtsi2sd64_128" => b(Vec128, CvtSi2Sd64_128),
+-        "cvtss2si128" => s1(Scalar, CvtSs2Si_128),
+-        "cvtsd2si128" => s1(Scalar, CvtSd2Si_128),
+-        "cvtss2sd128" => b(Vec128, CvtSs2Sd_128),
+-        "cvtsd2ss128" => b(Vec128, CvtSd2Ss_128),
++        "cvtss2si128" => s1(Scalar, CvtSs2Si128),
++        "cvtsd2si128" => s1(Scalar, CvtSd2Si128),
++        "cvtss2sd128" => b(Vec128, CvtSs2Sd128),
++        "cvtsd2ss128" => b(Vec128, CvtSd2Ss128),
+         "haddps128" => b(Vec128, HaddPs128),
+         "hsubps128" => b(Vec128, HsubPs128),
+         "addsubps128" => b(Vec128, AddsubPs128),
+@@ -342,10 +342,10 @@ pub(super) fn lccc_simd_lookup(
+         "vunpckhps256" => b(Vec256, UnpckhPs256),
+         "vmovmskps256" => s1(Scalar, MovemaskPs256),
+         "vcvtps2dq256" => u(Vec256, CvtPs2Ep32_256),
+-        "vcvtdq2ps256" => u(Vec256, CvtEp32_2Ps_256),
++        "vcvtdq2ps256" => u(Vec256, CvtEp32ToPs256),
+         "vcvttps2dq256" => u(Vec256, CvttPs2Ep32_256),
+-        "vcvtps2pd256" => u(Vec256, CvtPs2Pd_256),
+-        "vcvtpd2ps256" => u(Vec128, CvtPd2Ps_256),
++        "vcvtps2pd256" => u(Vec256, CvtPs2Pd256),
++        "vcvtpd2ps256" => u(Vec128, CvtPd2Ps256),
+         "vdivpd256" => b(Vec256, DivPd256),
+         "vminpd256" => b(Vec256, MinPd256),
+         "vmaxpd256" => b(Vec256, MaxPd256),
+@@ -356,7 +356,7 @@ pub(super) fn lccc_simd_lookup(
+         "vunpckhpd256" => b(Vec256, UnpckhPd256),
+         "vmovmskpd256" => s1(Scalar, MovemaskPd256),
+         "vcvtpd2dq256" => u(Vec128, CvtPd2Ep32_256),
+-        "vcvtdq2pd256" => u(Vec256, CvtEp32_2Pd_256),
++        "vcvtdq2pd256" => u(Vec256, CvtEp32ToPd256),
+         "vcvttpd2dq256" => u(Vec128, CvttPd2Ep32_256),
+         "vpermilps256" => ui(Vec256, VpermilPs256),
+         "vpermilvarps256" => b(Vec256, VpermilvarPs256),
+diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
+index 000025f..6ed91e1 100644
+--- a/src/passes/vectorize.rs
++++ b/src/passes/vectorize.rs
+@@ -85,12 +85,15 @@ use crate::ir::ops::{IrBinOp, IrCmpOp};
+ use crate::ir::reexports::{IrConst, IrFunction};
+ use crate::passes::loop_analysis;
  
-         // Apply the transformation
-         let dest_reg_stripped = &dest_reg[1..]; // without leading %
-@@ -2543,8 +2557,9 @@
-         replace_line(store, &mut infos[i], i, new_signext);
-         mark_nop(&mut infos[j]); // remove movq %rax, %Y
- 
--        // If there's a cmpl to redirect, do it
--        if let Some(cmp_idx) = cmpl_line {
-+        // Redirect EVERY cmpl that read %eax, not just the first one: they all
-+        // lose their operand's definition when the movslq is retargeted.
-+        for cmp_idx in cmpl_lines {
-             let tc = infos[cmp_idx].trimmed(store.get(cmp_idx));
-             let new_cmp = format!("    {}", tc.replace(", %eax", &format!(", {}", src_32_name)));
-             replace_line(store, &mut infos[cmp_idx], cmp_idx, new_cmp);
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/regression/param_home_scratch_reg.c b/tests/regression/param_home_scratch_reg.c
---- a/tests/regression/param_home_scratch_reg.c	1970-01-01 00:00:00.000000000 +0000
-+++ b/tests/regression/param_home_scratch_reg.c	2026-08-14 17:18:09.157147719 +0000
-@@ -0,0 +1,146 @@
-+/* Regression test: parameter allocas eliminated in favour of a register
-+ * "home" must never let one parameter's home destroy another parameter's
-+ * incoming ABI register.
+-/// Per-loop rejection reason for the "why was this not vectorized" diagnostic
+-/// (project goal §57). The analysis functions record the most specific reason
+-/// they bail out with; `vectorize_with_analysis` prints it when either
+-/// `LCCC_DEBUG_VECTORIZE=1` (full trace) or `LCCC_WHY_NOT_VECTORIZE=1`
+-/// (one-line-per-loop summary) is set. Purely diagnostic — never changes
+-/// codegen.
++// Per-loop rejection reason for the "why was this not vectorized" diagnostic
++// (project goal §57). The analysis functions record the most specific reason
++// they bail out with; `vectorize_with_analysis` prints it when either
++// `LCCC_DEBUG_VECTORIZE=1` (full trace) or `LCCC_WHY_NOT_VECTORIZE=1`
++// (one-line-per-loop summary) is set. Purely diagnostic — never changes
++// codegen.
++//
++// A `///` doc comment cannot attach to a `thread_local!` invocation (the macro
++// expands to items the comment never reaches), so this is a plain comment.
+ thread_local! {
+     static REJECT_REASON: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
+ }
+diff --git a/tests/asm-diff/byteregs.casefile b/tests/asm-diff/byteregs.casefile
+new file mode 100644
+index 0000000..2727907
+--- /dev/null
++++ b/tests/asm-diff/byteregs.casefile
+@@ -0,0 +1,651 @@
++;;; movb_imm_all_byte_regs
++.text
++movb $0, %al
++movb $0, %cl
++movb $0, %dl
++movb $0, %bl
++movb $0, %spl
++movb $0, %bpl
++movb $0, %sil
++movb $0, %dil
++movb $0, %r8b
++movb $0, %r9b
++movb $0, %r10b
++movb $0, %r11b
++movb $0, %r12b
++movb $0, %r13b
++movb $0, %r14b
++movb $0, %r15b
++movb $0, %ah
++movb $0, %ch
++movb $0, %dh
++movb $0, %bh
++movb $1, %al
++movb $1, %cl
++movb $1, %dl
++movb $1, %bl
++movb $1, %spl
++movb $1, %bpl
++movb $1, %sil
++movb $1, %dil
++movb $1, %r8b
++movb $1, %r9b
++movb $1, %r10b
++movb $1, %r11b
++movb $1, %r12b
++movb $1, %r13b
++movb $1, %r14b
++movb $1, %r15b
++movb $1, %ah
++movb $1, %ch
++movb $1, %dh
++movb $1, %bh
++movb $80, %al
++movb $80, %cl
++movb $80, %dl
++movb $80, %bl
++movb $80, %spl
++movb $80, %bpl
++movb $80, %sil
++movb $80, %dil
++movb $80, %r8b
++movb $80, %r9b
++movb $80, %r10b
++movb $80, %r11b
++movb $80, %r12b
++movb $80, %r13b
++movb $80, %r14b
++movb $80, %r15b
++movb $80, %ah
++movb $80, %ch
++movb $80, %dh
++movb $80, %bh
++movb $127, %al
++movb $127, %cl
++movb $127, %dl
++movb $127, %bl
++movb $127, %spl
++movb $127, %bpl
++movb $127, %sil
++movb $127, %dil
++movb $127, %r8b
++movb $127, %r9b
++movb $127, %r10b
++movb $127, %r11b
++movb $127, %r12b
++movb $127, %r13b
++movb $127, %r14b
++movb $127, %r15b
++movb $127, %ah
++movb $127, %ch
++movb $127, %dh
++movb $127, %bh
++movb $-1, %al
++movb $-1, %cl
++movb $-1, %dl
++movb $-1, %bl
++movb $-1, %spl
++movb $-1, %bpl
++movb $-1, %sil
++movb $-1, %dil
++movb $-1, %r8b
++movb $-1, %r9b
++movb $-1, %r10b
++movb $-1, %r11b
++movb $-1, %r12b
++movb $-1, %r13b
++movb $-1, %r14b
++movb $-1, %r15b
++movb $-1, %ah
++movb $-1, %ch
++movb $-1, %dh
++movb $-1, %bh
++movb $255, %al
++movb $255, %cl
++movb $255, %dl
++movb $255, %bl
++movb $255, %spl
++movb $255, %bpl
++movb $255, %sil
++movb $255, %dil
++movb $255, %r8b
++movb $255, %r9b
++movb $255, %r10b
++movb $255, %r11b
++movb $255, %r12b
++movb $255, %r13b
++movb $255, %r14b
++movb $255, %r15b
++movb $255, %ah
++movb $255, %ch
++movb $255, %dh
++movb $255, %bh
++movb $0x50, %al
++movb $0x50, %cl
++movb $0x50, %dl
++movb $0x50, %bl
++movb $0x50, %spl
++movb $0x50, %bpl
++movb $0x50, %sil
++movb $0x50, %dil
++movb $0x50, %r8b
++movb $0x50, %r9b
++movb $0x50, %r10b
++movb $0x50, %r11b
++movb $0x50, %r12b
++movb $0x50, %r13b
++movb $0x50, %r14b
++movb $0x50, %r15b
++movb $0x50, %ah
++movb $0x50, %ch
++movb $0x50, %dh
++movb $0x50, %bh
++
++;;; movb_imm_mem_and_mixed
++.text
++movb $0, (%rax)
++movb $0, 8(%rdx)
++movb $0, (%r13)
++movb $0, -1(%r12)
++movb $0, (%rbp)
++movb $0, (%rsp)
++movb $0, 16(%rsp)
++movb $80, (%rax)
++movb $80, 8(%rdx)
++movb $80, (%r13)
++movb $80, -1(%r12)
++movb $80, (%rbp)
++movb $80, (%rsp)
++movb $80, 16(%rsp)
++movb $-1, (%rax)
++movb $-1, 8(%rdx)
++movb $-1, (%r13)
++movb $-1, -1(%r12)
++movb $-1, (%rbp)
++movb $-1, (%rsp)
++movb $-1, 16(%rsp)
++
++;;; byte_reg_alu_rex8
++.text
++addb %spl, %al
++addb %spl, %dil
++addb %spl, %sil
++addb %spl, %r8b
++addb %spl, %bpl
++addb %spl, (%rcx)
++addb (%rcx), %spl
++addb %bpl, %al
++addb %bpl, %dil
++addb %bpl, %sil
++addb %bpl, %r8b
++addb %bpl, %bpl
++addb %bpl, (%rcx)
++addb (%rcx), %bpl
++addb %sil, %al
++addb %sil, %dil
++addb %sil, %sil
++addb %sil, %r8b
++addb %sil, %bpl
++addb %sil, (%rcx)
++addb (%rcx), %sil
++addb %dil, %al
++addb %dil, %dil
++addb %dil, %sil
++addb %dil, %r8b
++addb %dil, %bpl
++addb %dil, (%rcx)
++addb (%rcx), %dil
++addb $7, %spl
++addb $7, %bpl
++addb $7, %sil
++addb $7, %dil
++subb %spl, %al
++subb %spl, %dil
++subb %spl, %sil
++subb %spl, %r8b
++subb %spl, %bpl
++subb %spl, (%rcx)
++subb (%rcx), %spl
++subb %bpl, %al
++subb %bpl, %dil
++subb %bpl, %sil
++subb %bpl, %r8b
++subb %bpl, %bpl
++subb %bpl, (%rcx)
++subb (%rcx), %bpl
++subb %sil, %al
++subb %sil, %dil
++subb %sil, %sil
++subb %sil, %r8b
++subb %sil, %bpl
++subb %sil, (%rcx)
++subb (%rcx), %sil
++subb %dil, %al
++subb %dil, %dil
++subb %dil, %sil
++subb %dil, %r8b
++subb %dil, %bpl
++subb %dil, (%rcx)
++subb (%rcx), %dil
++subb $7, %spl
++subb $7, %bpl
++subb $7, %sil
++subb $7, %dil
++andb %spl, %al
++andb %spl, %dil
++andb %spl, %sil
++andb %spl, %r8b
++andb %spl, %bpl
++andb %spl, (%rcx)
++andb (%rcx), %spl
++andb %bpl, %al
++andb %bpl, %dil
++andb %bpl, %sil
++andb %bpl, %r8b
++andb %bpl, %bpl
++andb %bpl, (%rcx)
++andb (%rcx), %bpl
++andb %sil, %al
++andb %sil, %dil
++andb %sil, %sil
++andb %sil, %r8b
++andb %sil, %bpl
++andb %sil, (%rcx)
++andb (%rcx), %sil
++andb %dil, %al
++andb %dil, %dil
++andb %dil, %sil
++andb %dil, %r8b
++andb %dil, %bpl
++andb %dil, (%rcx)
++andb (%rcx), %dil
++andb $7, %spl
++andb $7, %bpl
++andb $7, %sil
++andb $7, %dil
++orb %spl, %al
++orb %spl, %dil
++orb %spl, %sil
++orb %spl, %r8b
++orb %spl, %bpl
++orb %spl, (%rcx)
++orb (%rcx), %spl
++orb %bpl, %al
++orb %bpl, %dil
++orb %bpl, %sil
++orb %bpl, %r8b
++orb %bpl, %bpl
++orb %bpl, (%rcx)
++orb (%rcx), %bpl
++orb %sil, %al
++orb %sil, %dil
++orb %sil, %sil
++orb %sil, %r8b
++orb %sil, %bpl
++orb %sil, (%rcx)
++orb (%rcx), %sil
++orb %dil, %al
++orb %dil, %dil
++orb %dil, %sil
++orb %dil, %r8b
++orb %dil, %bpl
++orb %dil, (%rcx)
++orb (%rcx), %dil
++orb $7, %spl
++orb $7, %bpl
++orb $7, %sil
++orb $7, %dil
++xorb %spl, %al
++xorb %spl, %dil
++xorb %spl, %sil
++xorb %spl, %r8b
++xorb %spl, %bpl
++xorb %spl, (%rcx)
++xorb (%rcx), %spl
++xorb %bpl, %al
++xorb %bpl, %dil
++xorb %bpl, %sil
++xorb %bpl, %r8b
++xorb %bpl, %bpl
++xorb %bpl, (%rcx)
++xorb (%rcx), %bpl
++xorb %sil, %al
++xorb %sil, %dil
++xorb %sil, %sil
++xorb %sil, %r8b
++xorb %sil, %bpl
++xorb %sil, (%rcx)
++xorb (%rcx), %sil
++xorb %dil, %al
++xorb %dil, %dil
++xorb %dil, %sil
++xorb %dil, %r8b
++xorb %dil, %bpl
++xorb %dil, (%rcx)
++xorb (%rcx), %dil
++xorb $7, %spl
++xorb $7, %bpl
++xorb $7, %sil
++xorb $7, %dil
++cmpb %spl, %al
++cmpb %spl, %dil
++cmpb %spl, %sil
++cmpb %spl, %r8b
++cmpb %spl, %bpl
++cmpb %spl, (%rcx)
++cmpb (%rcx), %spl
++cmpb %bpl, %al
++cmpb %bpl, %dil
++cmpb %bpl, %sil
++cmpb %bpl, %r8b
++cmpb %bpl, %bpl
++cmpb %bpl, (%rcx)
++cmpb (%rcx), %bpl
++cmpb %sil, %al
++cmpb %sil, %dil
++cmpb %sil, %sil
++cmpb %sil, %r8b
++cmpb %sil, %bpl
++cmpb %sil, (%rcx)
++cmpb (%rcx), %sil
++cmpb %dil, %al
++cmpb %dil, %dil
++cmpb %dil, %sil
++cmpb %dil, %r8b
++cmpb %dil, %bpl
++cmpb %dil, (%rcx)
++cmpb (%rcx), %dil
++cmpb $7, %spl
++cmpb $7, %bpl
++cmpb $7, %sil
++cmpb $7, %dil
++adcb %spl, %al
++adcb %spl, %dil
++adcb %spl, %sil
++adcb %spl, %r8b
++adcb %spl, %bpl
++adcb %spl, (%rcx)
++adcb (%rcx), %spl
++adcb %bpl, %al
++adcb %bpl, %dil
++adcb %bpl, %sil
++adcb %bpl, %r8b
++adcb %bpl, %bpl
++adcb %bpl, (%rcx)
++adcb (%rcx), %bpl
++adcb %sil, %al
++adcb %sil, %dil
++adcb %sil, %sil
++adcb %sil, %r8b
++adcb %sil, %bpl
++adcb %sil, (%rcx)
++adcb (%rcx), %sil
++adcb %dil, %al
++adcb %dil, %dil
++adcb %dil, %sil
++adcb %dil, %r8b
++adcb %dil, %bpl
++adcb %dil, (%rcx)
++adcb (%rcx), %dil
++adcb $7, %spl
++adcb $7, %bpl
++adcb $7, %sil
++adcb $7, %dil
++sbbb %spl, %al
++sbbb %spl, %dil
++sbbb %spl, %sil
++sbbb %spl, %r8b
++sbbb %spl, %bpl
++sbbb %spl, (%rcx)
++sbbb (%rcx), %spl
++sbbb %bpl, %al
++sbbb %bpl, %dil
++sbbb %bpl, %sil
++sbbb %bpl, %r8b
++sbbb %bpl, %bpl
++sbbb %bpl, (%rcx)
++sbbb (%rcx), %bpl
++sbbb %sil, %al
++sbbb %sil, %dil
++sbbb %sil, %sil
++sbbb %sil, %r8b
++sbbb %sil, %bpl
++sbbb %sil, (%rcx)
++sbbb (%rcx), %sil
++sbbb %dil, %al
++sbbb %dil, %dil
++sbbb %dil, %sil
++sbbb %dil, %r8b
++sbbb %dil, %bpl
++sbbb %dil, (%rcx)
++sbbb (%rcx), %dil
++sbbb $7, %spl
++sbbb $7, %bpl
++sbbb $7, %sil
++sbbb $7, %dil
++testb %spl, %al
++testb %spl, %dil
++testb %spl, %sil
++testb %spl, %r8b
++testb %spl, %bpl
++testb %spl, (%rcx)
++testb (%rcx), %spl
++testb %bpl, %al
++testb %bpl, %dil
++testb %bpl, %sil
++testb %bpl, %r8b
++testb %bpl, %bpl
++testb %bpl, (%rcx)
++testb (%rcx), %bpl
++testb %sil, %al
++testb %sil, %dil
++testb %sil, %sil
++testb %sil, %r8b
++testb %sil, %bpl
++testb %sil, (%rcx)
++testb (%rcx), %sil
++testb %dil, %al
++testb %dil, %dil
++testb %dil, %sil
++testb %dil, %r8b
++testb %dil, %bpl
++testb %dil, (%rcx)
++testb (%rcx), %dil
++movb %spl, %al
++movb %spl, %dil
++movb %spl, %sil
++movb %spl, %r8b
++movb %spl, %bpl
++movb %spl, (%rcx)
++movb (%rcx), %spl
++movb %bpl, %al
++movb %bpl, %dil
++movb %bpl, %sil
++movb %bpl, %r8b
++movb %bpl, %bpl
++movb %bpl, (%rcx)
++movb (%rcx), %bpl
++movb %sil, %al
++movb %sil, %dil
++movb %sil, %sil
++movb %sil, %r8b
++movb %sil, %bpl
++movb %sil, (%rcx)
++movb (%rcx), %sil
++movb %dil, %al
++movb %dil, %dil
++movb %dil, %sil
++movb %dil, %r8b
++movb %dil, %bpl
++movb %dil, (%rcx)
++movb (%rcx), %dil
++movb $7, %spl
++movb $7, %bpl
++movb $7, %sil
++movb $7, %dil
++
++;;; byte_reg_unary_rex8
++.text
++incb %spl
++incb %bpl
++incb %sil
++incb %dil
++decb %spl
++decb %bpl
++decb %sil
++decb %dil
++negb %spl
++negb %bpl
++negb %sil
++negb %dil
++notb %spl
++notb %bpl
++notb %sil
++notb %dil
++mulb %spl
++mulb %bpl
++mulb %sil
++mulb %dil
++imulb %spl
++imulb %bpl
++imulb %sil
++imulb %dil
++divb %spl
++divb %bpl
++divb %sil
++divb %dil
++idivb %spl
++idivb %bpl
++idivb %sil
++idivb %dil
++shlb $1, %spl
++shlb %cl, %spl
++shlb $1, %bpl
++shlb %cl, %bpl
++shlb $1, %sil
++shlb %cl, %sil
++shlb $1, %dil
++shlb %cl, %dil
++shrb $1, %spl
++shrb %cl, %spl
++shrb $1, %bpl
++shrb %cl, %bpl
++shrb $1, %sil
++shrb %cl, %sil
++shrb $1, %dil
++shrb %cl, %dil
++sarb $1, %spl
++sarb %cl, %spl
++sarb $1, %bpl
++sarb %cl, %bpl
++sarb $1, %sil
++sarb %cl, %sil
++sarb $1, %dil
++sarb %cl, %dil
++rolb $1, %spl
++rolb %cl, %spl
++rolb $1, %bpl
++rolb %cl, %bpl
++rolb $1, %sil
++rolb %cl, %sil
++rolb $1, %dil
++rolb %cl, %dil
++rorb $1, %spl
++rorb %cl, %spl
++rorb $1, %bpl
++rorb %cl, %bpl
++rorb $1, %sil
++rorb %cl, %sil
++rorb $1, %dil
++rorb %cl, %dil
++
++;;; byte_reg_setcc_movx_rex8
++.text
++sete %spl
++sete %bpl
++sete %sil
++sete %dil
++sete (%rdi)
++setne %spl
++setne %bpl
++setne %sil
++setne %dil
++setne (%rdi)
++setl %spl
++setl %bpl
++setl %sil
++setl %dil
++setl (%rdi)
++setge %spl
++setge %bpl
++setge %sil
++setge %dil
++setge (%rdi)
++seta %spl
++seta %bpl
++seta %sil
++seta %dil
++seta (%rdi)
++setbe %spl
++setbe %bpl
++setbe %sil
++setbe %dil
++setbe (%rdi)
++sets %spl
++sets %bpl
++sets %sil
++sets %dil
++sets (%rdi)
++seto %spl
++seto %bpl
++seto %sil
++seto %dil
++seto (%rdi)
++movzbl %spl, %eax
++movsbl %spl, %eax
++movzbl %spl, %edi
++movsbl %spl, %edi
++movzbl %spl, %r8d
++movsbl %spl, %r8d
++movzbq %spl, %rax
++movsbq %spl, %rax
++movzbq %spl, %rdi
++movsbq %spl, %rdi
++movzbl %bpl, %eax
++movsbl %bpl, %eax
++movzbl %bpl, %edi
++movsbl %bpl, %edi
++movzbl %bpl, %r8d
++movsbl %bpl, %r8d
++movzbq %bpl, %rax
++movsbq %bpl, %rax
++movzbq %bpl, %rdi
++movsbq %bpl, %rdi
++movzbl %sil, %eax
++movsbl %sil, %eax
++movzbl %sil, %edi
++movsbl %sil, %edi
++movzbl %sil, %r8d
++movsbl %sil, %r8d
++movzbq %sil, %rax
++movsbq %sil, %rax
++movzbq %sil, %rdi
++movsbq %sil, %rdi
++movzbl %dil, %eax
++movsbl %dil, %eax
++movzbl %dil, %edi
++movsbl %dil, %edi
++movzbl %dil, %r8d
++movsbl %dil, %r8d
++movzbq %dil, %rax
++movsbq %dil, %rax
++movzbq %dil, %rdi
++movsbq %dil, %rdi
++xchgb %spl, %sil
++xchgb %spl, %al
++xchgb %bpl, %sil
++xchgb %bpl, %al
++xchgb %sil, %sil
++xchgb %sil, %al
++xchgb %dil, %sil
++xchgb %dil, %al
+diff --git a/tests/regression/movb_imm_rex8.c b/tests/regression/movb_imm_rex8.c
+new file mode 100644
+index 0000000..f9ad9c0
+--- /dev/null
++++ b/tests/regression/movb_imm_rex8.c
+@@ -0,0 +1,122 @@
++/* Regression test: `movb $imm, %dil/%sil/%bpl/%spl` must carry a REX prefix.
 + *
-+ * Background. When a parameter's stack slot is never read, the backend can
-+ * skip the entry-block spill entirely and keep the parameter in the register
-+ * the allocator gave its ParamRef. That is only sound when the home register
-+ * is stable, so eligibility is restricted to:
-+ *   - a callee-saved GPR,
-+ *   - an XMM register (only assigned to values that do not span calls),
-+ *   - r11/r10 in a LEAF function.
++ * The byte registers %spl, %bpl, %sil and %dil encode as 4..7 -- the SAME
++ * register numbers as the legacy high-byte registers %ah, %ch, %dh and %bh.
++ * The two sets are distinguished ONLY by the presence of a REX prefix. The
++ * B0+r form of `mov imm8, r8` was emitted without REX for these four, so
 + *
-+ * r11 and r10 are the ONLY caller-saved GPRs in the allocation pool that are
-+ * not also SysV integer argument registers. The rest of that pool is
-+ * r8/r9/rdi/rsi, which ARE argument registers. Homing a parameter there
-+ * corrupts a sibling parameter whenever that sibling is materialised in the
-+ * function BODY instead of by a prologue move:
++ *     movb $80, %dil        assembled as        movb $80, %bh
 + *
-+ *     callee(a,b,c,d,e,f,g,h,i)   homes: a->r11 b->r10 c->r8 d->r9 e->rdi ...
-+ *     ...
-+ *     movslq %r8d, %rdi     <- reads e, but c's home already overwrote r8
++ * which writes bits 8-15 of RBX instead of the low byte of RDI. When the
++ * clobbered register held a live pointer the result was a wild store:
 + *
-+ * The prologue can order the moves it emits itself (and break cycles with
-+ * xchg), but it cannot protect reads that happen later in the body, so the
-+ * ABI-overlapping registers must be rejected at eligibility time.
++ *     leaq 0x54(%rsp), %rbx
++ *     movb $80, %bh          <- was meant to be %dil, corrupts the pointer
++ *     movb %dil, (%rbx)      <- stores through the corrupted pointer
 + *
-+ * The historical failure that motivated this test: a 9-argument callee
-+ * returned 17 instead of 21 because arguments 5 and 6 were read after their
-+ * registers had been reused as homes.
++ * That is exactly the `p.name[0] = 'P'` assignment in the struct_copy
++ * benchmark, which SIGSEGV'd on roughly one run in five at -O0. The crash was
++ * intermittent because it depended on whether the corrupted address happened
++ * to land in a mapped page.
 + *
-+ * Every function below consumes its parameters in a scrambled order so a
-+ * clobber cannot be masked by a lucky in-order read.
++ * The same aliasing applies to r8b-r15b (handled by the REX.B path).
++ *
++ * Scope note: this is the END-TO-END guard (compiler -> assembler -> run). It
++ * checks that byte stores through live pointers produce the right bytes at
++ * runtime, but it cannot force the register allocator to pick a REX-only byte
++ * register, so it does not by itself reproduce the encoding bug. The exhaustive
++ * encoding check lives in tests/asm-diff/byteregs.casefile, which assembles
++ * `movb $imm` into all twenty byte registers plus the full byte-ALU/setcc/movzx
++ * matrix and diffs the bytes against GNU as. Both are needed: the casefile
++ * catches the encoder, this catches everything downstream of it.
 + */
 +
-+extern int ext_sink(int);
-+__attribute__((weak)) int ext_sink(int x) { return x & 7; }
++#include <string.h>
 +
-+/* 9 integer arguments: 6 in registers, 3 on the stack. The historical bug.
-+ * Arguments are consumed in a permuted order and the stack arguments are
-+ * checked too, because eliminating the register spill area changes the
-+ * offsets the stack arguments are read from. */
++struct rec {
++    char  name[8];
++    int   id;
++    double val;
++};
++
++/* Mirrors make_particle: build a struct in a local, set a byte field through
++ * a pointer, and return it by value. */
 +__attribute__((noinline))
-+int nine_args(int a, int b, int c, int d, int e, int f, void *g, void *h, void *i)
++static struct rec build(int i)
 +{
-+    if (g != 0) return -1;      /* arg7 must be NULL   */
-+    if (h == 0) return -2;      /* arg8 must be non-NULL */
-+    if (i != 0) return -3;      /* arg9 must be NULL   */
-+    /* scrambled consumption order: f, c, a, e, b, d */
-+    return f * 100000 + c * 10000 + a * 1000 + e * 100 + b * 10 + d;
++    struct rec r;
++    memset(&r, 0, sizeof r);
++    r.val = (double)i * 0.5;
++    r.id = i;
++    r.name[0] = 'P';                 /* the byte store that was miscompiled */
++    r.name[1] = (char)('0' + i % 10);
++    r.name[2] = '\0';
++    return r;
 +}
 +
-+/* Leaf, pointer parameters dereferenced in the body -- the qsort comparator
-+ * shape that motivated the optimisation. Must stay correct while losing its
-+ * stack frame. */
++/* Force many simultaneously-live byte values so the register allocator has to
++ * use the REX-only byte registers rather than just al/cl/dl/bl. */
 +__attribute__((noinline))
-+int cmp_ints(const void *a, const void *b)
++static unsigned long many_bytes(unsigned char seed, unsigned char *out)
 +{
-+    return *(const int *)a - *(const int *)b;
++    unsigned char a = (unsigned char)(seed + 1);
++    unsigned char b = (unsigned char)(seed + 2);
++    unsigned char c = (unsigned char)(seed + 3);
++    unsigned char d = (unsigned char)(seed + 4);
++    unsigned char e = (unsigned char)(seed + 5);
++    unsigned char f = (unsigned char)(seed + 6);
++    unsigned char g = (unsigned char)(seed + 7);
++    unsigned char h = (unsigned char)(seed + 8);
++    /* keep every value live across the stores */
++    out[0] = a; out[1] = b; out[2] = c; out[3] = d;
++    out[4] = e; out[5] = f; out[6] = g; out[7] = h;
++    return (unsigned long)a + b + c + d + e + f + g + h;
 +}
 +
-+/* Leaf, six integer parameters read strictly in reverse. */
++/* A pointer that must survive a neighbouring byte-immediate store. If the
++ * store lands in the high half of the pointer register, this writes wild. */
 +__attribute__((noinline))
-+long six_reverse(long p0, long p1, long p2, long p3, long p4, long p5)
++static int store_via_pointer(char *buf, int n)
 +{
-+    long acc = 0;
-+    acc = acc * 3 + p5;
-+    acc = acc * 3 + p4;
-+    acc = acc * 3 + p3;
-+    acc = acc * 3 + p2;
-+    acc = acc * 3 + p1;
-+    acc = acc * 3 + p0;
-+    return acc;
-+}
-+
-+/* Leaf, parameters swapped relative to their ABI registers: a true
-+ * permutation, the case an unordered prologue would miscompile. */
-+__attribute__((noinline))
-+long swapped(long a, long b, long c)
-+{
-+    return a * 1 + b * 1000 + c * 1000000;
-+}
-+
-+/* NON-leaf: parameters are first read AFTER a call, so their homes must
-+ * survive the call. r11/r10 are caller-saved, so they are ineligible here
-+ * and the parameters must land in callee-saved registers or memory. */
-+__attribute__((noinline))
-+long live_across_call(long a, long b, long c)
-+{
-+    long t = ext_sink(7);
-+    return a * 100 + b * 10 + c + t;   /* a,b,c read only after the call */
-+}
-+
-+/* NON-leaf with a loop: the parameter stays live across many calls. */
-+__attribute__((noinline))
-+long live_across_loop(long a, long n)
-+{
-+    long s = 0;
-+    for (long i = 0; i < n; i++)
-+        s += ext_sink((int)i);
-+    return s + a;                       /* a live across every iteration */
-+}
-+
-+/* Mixed integer/FP: FP homes are XMM, integer homes r11/r10. Both pools are
-+ * exercised at once, consumed out of order. */
-+__attribute__((noinline))
-+double mixed(int a, double x, int b, double y, int c, double z)
-+{
-+    return z * 1.0 + (double)c * 2.0 + y * 4.0 + (double)b * 8.0
-+         + x * 16.0 + (double)a * 32.0;
++    char *p = buf;
++    for (int i = 0; i < n; i++) {
++        *p = 'P';                    /* byte immediate through a live pointer */
++        p++;
++        *p = (char)('0' + (i % 10));
++        p++;
++    }
++    return (int)(p - buf);
 +}
 +
 +int main(void)
 +{
-+    int dummy = 0;
-+
-+    /* 9 arguments: f=6 c=3 a=1 e=5 b=2 d=4 -> 631524 */
-+    if (nine_args(1, 2, 3, 4, 5, 6, 0, &dummy, 0) != 631524) return 1;
-+
-+    {
-+        static const int arr[2] = { 42, 17 };
-+        if (cmp_ints(&arr[0], &arr[1]) != 25) return 2;
-+        if (cmp_ints(&arr[1], &arr[0]) != -25) return 3;
-+        if (cmp_ints(&arr[0], &arr[0]) != 0) return 4;
-+    }
-+
-+    /* ((((5*3+4)*3+3)*3+2)*3+1)*3+0 with acc built from p5 down to p0 */
-+    if (six_reverse(0, 1, 2, 3, 4, 5) != 1641) return 5;
-+
-+    if (swapped(7, 8, 9) != 7 + 8000 + 9000000) return 6;
-+
-+    if (live_across_call(3, 4, 5) != 3 * 100 + 4 * 10 + 5 + (7 & 7)) return 7;
-+
-+    {
-+        long want = 0;
-+        for (long i = 0; i < 5; i++) want += (i & 7);
-+        if (live_across_loop(6, 5) != want + 6) return 8;
++    for (int i = 0; i < 10; i++) {
++        struct rec r = build(i);
++        if (r.name[0] != 'P') return 1;
++        if (r.name[1] != (char)('0' + i % 10)) return 2;
++        if (r.name[2] != '\0') return 3;
++        if (r.id != i) return 4;
++        if (r.val != (double)i * 0.5) return 5;
 +    }
 +
 +    {
-+        double got = mixed(1, 2.0, 3, 4.0, 5, 6.0);
-+        double want = 6.0 + 5 * 2.0 + 4.0 * 4.0 + 3 * 8.0 + 2.0 * 16.0 + 1 * 32.0;
-+        if (got != want) return 9;
++        unsigned char out[8];
++        unsigned long sum = many_bytes(100, out);
++        if (sum != (unsigned long)(101 + 102 + 103 + 104 + 105 + 106 + 107 + 108))
++            return 6;
++        for (int i = 0; i < 8; i++)
++            if (out[i] != (unsigned char)(101 + i)) return 7;
++    }
++
++    {
++        char buf[64];
++        memset(buf, 0, sizeof buf);
++        if (store_via_pointer(buf, 16) != 32) return 8;
++        for (int i = 0; i < 16; i++) {
++            if (buf[2 * i] != 'P') return 9;
++            if (buf[2 * i + 1] != (char)('0' + (i % 10))) return 10;
++        }
 +    }
 +
 +    return 0;
 +}
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/regression/param_home_scratch_reg.c.txt b/tests/regression/param_home_scratch_reg.c.txt
---- a/tests/regression/param_home_scratch_reg.c.txt	1970-01-01 00:00:00.000000000 +0000
-+++ b/tests/regression/param_home_scratch_reg.c.txt	2026-08-14 17:17:59.117147719 +0000
+diff --git a/tests/regression/movb_imm_rex8.c.txt b/tests/regression/movb_imm_rex8.c.txt
+new file mode 100644
+index 0000000..0edf838
+--- /dev/null
++++ b/tests/regression/movb_imm_rex8.c.txt
 @@ -0,0 +1 @@
-+parameter register homes must not clobber sibling ABI argument registers (9-arg callee, permuted reads, leaf vs call-spanning)
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/regression/signext_move_cross_block.c b/tests/regression/signext_move_cross_block.c
---- a/tests/regression/signext_move_cross_block.c	1970-01-01 00:00:00.000000000 +0000
-+++ b/tests/regression/signext_move_cross_block.c	2026-08-14 17:33:23.177147719 +0000
-@@ -0,0 +1,105 @@
-+/* Regression test: fusing `movslq %Xd, %rax` + `movq %rax, %Y` into
-+ * `movslq %Xd, %Y` DELETES the only definition of %rax, so it is legal only
-+ * when %rax is provably dead afterwards.
++movb $imm into %dil/%sil/%bpl/%spl must emit REX (else it writes %bh/%dh/%ch/%ah and corrupts a live pointer)
+diff --git a/tests/regression/set1_epi_narrow_operand.c b/tests/regression/set1_epi_narrow_operand.c
+new file mode 100644
+index 0000000..3e15ef2
+--- /dev/null
++++ b/tests/regression/set1_epi_narrow_operand.c
+@@ -0,0 +1,81 @@
++/* Regression test: the GPR-source vpbroadcast lowering must materialise its
++ * operand through a 64-bit register.
 + *
-+ * Historical bug (fuse_signext_and_move). The pass scanned forward for
-+ * `cmpl $imm, %eax` operands it could redirect to the source register, and
-+ * then proceeded whenever it had found at least one -- even though its own
-+ * liveness scan had stopped at a barrier with %rax conservatively LIVE:
++ * `_mm256_set1_epi{8,16,32,64}` with a RUNTIME operand lowers to
++ * "load the value into a GPR, movd/movq it into xmm0, vpbroadcast". The load
++ * step went through operand_to_reg(), which always emits a 64-bit
++ * `movq %src, %dst` -- but it was handed the 32-bit name "eax" for the 16- and
++ * 32-bit element widths. That produced
 + *
-+ *     movslq %edi, %rax     <- only definition of %rax
-+ *     movq   %rax, %r11
-+ *     cmpl   $1, %eax       <- redirected to %edi, sets "found a cmpl"
-+ *     je     .Lcase1        <- BARRIER: scan stops, rax_dead == false
-+ *     cmpl   $2, %eax       <- SUCCESSOR block, never examined
++ *     movq %r8, %eax        <- not encodable: 64-bit source, 32-bit destination
 + *
-+ * The movslq was retargeted to %r11, so the second compare read a register
-+ * nothing defined any more and `case 2:` was never taken.
++ * which the integrated assembler correctly rejected with
++ * "operand size mismatch for `movq`". zlib-ng could not be built at all:
++ * arch/x86/slide_hash_avx2.c does `_mm256_set1_epi16((short)wsize)` where
++ * wsize is narrowed from a wider struct field, and the file failed to compile.
 + *
-+ * A switch over an int parameter lowered to a compare chain reproduces it
-+ * exactly: the chain puts one compare per basic block, all reading the same
-+ * sign-extended value. The test additionally covers two compares in the SAME
-+ * block (only the first used to be redirected) and a case where %rax really
-+ * is dead, so the fusion must still happen.
++ * The fix loads through %rax and lets the following movd/movq express the
++ * narrowing, so the emitted code is now one instruction SHORTER as well
++ * (`movd %r8d, %xmm0` directly).
 + *
-+ * MIN_JUMP_TABLE_CASES keeps these small switches on the compare-chain path;
-+ * the values are deliberately sparse so no jump table is formed.
++ * Every element width is covered, and each broadcast operand is narrowed from
++ * a wider value so the lowering really does see a truncating source rather
++ * than a same-width copy. Results are checked elementwise at runtime.
 + */
 +
-+#include <stdio.h>
++#include <immintrin.h>
++#include <stdint.h>
++#include <string.h>
 +
-+/* Compare chain over a sign-extended int parameter. Each case lands in its
-+ * own basic block, so every `cmpl` after the first is cross-block. */
 +__attribute__((noinline))
-+int chain(int x)
-+{
-+    switch (x) {
-+    case 1:  x += 10;  /* fall through */
-+    case 2:  x += 100; break;
-+    case 7:  x += 1000; break;
-+    case 19: x += 10000; break;
-+    default: x = -1;
-+    }
-+    return x;
-+}
-+
-+/* Same shape, but the switch value is used again AFTER the switch, so the
-+ * sign-extended value must survive every branch. */
++static __m256i b8(uint32_t w)  { return _mm256_set1_epi8((char)(uint8_t)w); }
 +__attribute__((noinline))
-+long chain_reuse(int x)
-+{
-+    long acc = 0;
-+    switch (x) {
-+    case 3:  acc = 30; break;
-+    case 5:  acc = 50; break;
-+    case 11: acc = 110; break;
-+    default: acc = -7;
-+    }
-+    return acc * 1000 + (long)x;
-+}
-+
-+/* Two comparisons of the same value inside ONE basic block (no barrier
-+ * between them): both operands must be redirected together. */
++static __m256i b16(uint32_t w) { return _mm256_set1_epi16((short)(uint16_t)w); }
 +__attribute__((noinline))
-+int two_cmps_one_block(int x)
-+{
-+    int r = 0;
-+    if (x == 4) r += 1;
-+    if (x == 4) r += 2;   /* same block shape after the first test folds */
-+    if (x == 9) r += 4;
-+    return r * 100 + x;
-+}
-+
-+/* %rax genuinely dead after the fuse: nothing here should inhibit the
-+ * optimisation, so this guards against "fix" by disabling the pass. */
++static __m256i b32(uint64_t w) { return _mm256_set1_epi32((int)(uint32_t)w); }
 +__attribute__((noinline))
-+long plain_widen(int x)
-+{
-+    long v = x;      /* movslq, value then lives in a callee-saved home */
-+    return v * 3 + 1;
-+}
++static __m256i b64(uint64_t w) { return _mm256_set1_epi64x((long long)w); }
 +
 +int main(void)
 +{
-+    if (chain(1)  != 111) return 1;   /* 1+10+100  */
-+    if (chain(2)  != 102) return 2;   /* 2+100     */
-+    if (chain(7)  != 1007) return 3;
-+    if (chain(19) != 10019) return 4;
-+    if (chain(3)  != -1) return 5;
-+    if (chain(-5) != -1) return 6;
++    /* 0x1234 truncated to 8 bits is 0x34; to 16 bits it stays 0x1234. */
++    {
++        unsigned char out[32];
++        _mm256_storeu_si256((__m256i *)out, b8(0x1234u));
++        for (int i = 0; i < 32; i++) if (out[i] != 0x34) return 1;
++    }
++    {
++        uint16_t out[16];
++        _mm256_storeu_si256((__m256i *)out, b16(0xABCD1234u));
++        for (int i = 0; i < 16; i++) if (out[i] != 0x1234) return 2;
++    }
++    {
++        uint32_t out[8];
++        _mm256_storeu_si256((__m256i *)out, b32(0xDEADBEEFCAFEBABEull));
++        for (int i = 0; i < 8; i++) if (out[i] != 0xCAFEBABEu) return 3;
++    }
++    {
++        uint64_t out[4];
++        _mm256_storeu_si256((__m256i *)out, b64(0x0123456789ABCDEFull));
++        for (int i = 0; i < 4; i++) if (out[i] != 0x0123456789ABCDEFull) return 4;
++    }
 +
-+    if (chain_reuse(3)  != 30L * 1000 + 3) return 7;
-+    if (chain_reuse(5)  != 50L * 1000 + 5) return 8;
-+    if (chain_reuse(11) != 110L * 1000 + 11) return 9;
-+    if (chain_reuse(-2) != -7L * 1000 + -2) return 10;
++    /* The zlib-ng slide_hash shape verbatim: saturating 16-bit subtract of a
++     * broadcast window size, which is what the miscompiled file computes. */
++    {
++        uint16_t table[16], expect[16];
++        for (int i = 0; i < 16; i++) table[i] = (uint16_t)(i * 4096);
++        uint32_t w_size = 32768;
++        __m256i wsize = b16(w_size);
++        __m256i v = _mm256_loadu_si256((const __m256i *)table);
++        __m256i r = _mm256_subs_epu16(v, wsize);
++        _mm256_storeu_si256((__m256i *)table, r);
++        for (int i = 0; i < 16; i++) {
++            int t = i * 4096 - 32768;
++            expect[i] = (uint16_t)(t < 0 ? 0 : t);
++        }
++        if (memcmp(table, expect, sizeof table) != 0) return 5;
++    }
 +
-+    if (two_cmps_one_block(4) != 3 * 100 + 4) return 11;
-+    if (two_cmps_one_block(9) != 4 * 100 + 9) return 12;
-+    if (two_cmps_one_block(0) != 0) return 13;
-+
-+    if (plain_widen(7)  != 22) return 14;
-+    if (plain_widen(-3) != -8) return 15;
-+
-+    (void)printf("");
 +    return 0;
 +}
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/regression/signext_move_cross_block.c.txt b/tests/regression/signext_move_cross_block.c.txt
---- a/tests/regression/signext_move_cross_block.c.txt	1970-01-01 00:00:00.000000000 +0000
-+++ b/tests/regression/signext_move_cross_block.c.txt	2026-08-14 17:33:28.413147719 +0000
+diff --git a/tests/regression/set1_epi_narrow_operand.c.txt b/tests/regression/set1_epi_narrow_operand.c.txt
+new file mode 100644
+index 0000000..4c73edb
+--- /dev/null
++++ b/tests/regression/set1_epi_narrow_operand.c.txt
 @@ -0,0 +1 @@
-+sign-extend/move fusion must not delete the only definition of %rax when a successor block still reads it (switch compare chain)
++vpbroadcast GPR-source lowering must load through a 64-bit register (movq %r8,%eax is unencodable; broke zlib-ng slide_hash_avx2)
+diff --git a/tests/regression/set1_epi_narrow_operand.flags b/tests/regression/set1_epi_narrow_operand.flags
+new file mode 100644
+index 0000000..b600d27
+--- /dev/null
++++ b/tests/regression/set1_epi_narrow_operand.flags
+@@ -0,0 +1 @@
++-mavx2
