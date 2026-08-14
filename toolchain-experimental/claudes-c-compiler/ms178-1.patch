@@ -1,783 +1,560 @@
-From c4ba870584bbc3c22f65b2f579b02a5cadb008a4 Mon Sep 17 00:00:00 2001
-From: lccc-v11 <v11@localhost>
-Date: Thu, 13 Aug 2026 23:57:44 +0000
-Subject: [PATCH 1/2] v11: comparison narrowing, byte compares, FP-param XMM,
- ICC/ICX ILP distills
+From ecb89468d2c6a21885380fec9a7a1526e26c10a1 Mon Sep 17 00:00:00 2001
+From: lccc-v12 <v12@localhost>
+Date: Fri, 14 Aug 2026 00:16:14 +0000
+Subject: [PATCH 1/6] v12: flat short-circuit lowering (one branch chain, one
+ merge value)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
-Distilled from ICC 2021.7.1 / ICX (godbolt) and GCC's byte-compare shapes,
-plus the demanded FP-parameter register allocation.
+a || b || c parsed as (a || b) || c; the old per-link lowering built a
+right-nested value tree (one alloca + branch diamond per link), so the
+intermediate links were DATA (each selected as the next link's false arm)
+and materialized as setcc/cmov chains even when the whole result only fed
+a branch. Now flatten left-associative runs of the SAME operator into one
+branch sequence with a single merge value — GCC/ICX's shape for Expat's
+nameLength (cmp;ja chains, zero boolean materialization).
 
-1. U32 operand cast-type fix (lowering). emit_cast_val(x, I64, U32) hardcoded
-   a wrong source type: the operand is already U32 (op_ty == U32 when
-   common_ty == U32), so the cast was a type-lying identity that simplify
-   could not fold and codegen emitted as a spurious mov per comparison
-   operand. Now emits Cast(op_ty -> U32), which simplify folds away --
-   removes the expat/sqlite mov-chains (one copy per comparison operand).
+- Constant identity operands (false for ||, true for &&) are dropped;
+  a constant that decides the chain short-circuits (evaluating surviving
+  prior operands for side effects). All-constant chains fold outright.
+- The last operand's bool is the merge value (normalized 0/1; comparisons
+  and ! keep their already-normalized form, matching the old RHS rule).
+- Single-surviving-operand chains collapse to bool(operand).
 
-2. Comparison narrowing (simplify). Cmp(op, Cast(x, T->W), C, W) narrows to
-   Cmp(op, x, C', T) when the extension preserves op's ordering and C fits in
-   T: unsigned T zero-extends (Ult/Ule/Ugt/Uge + Eq/Ne), signed T
-   sign-extends (Slt/... + Eq/Ne). Matches LLVM InstCombine's icmp-narrowing.
-
-3. Byte/word compares (x86 emitter). emit_int_cmp_insn_typed and
-   emit_int_cmp_replay_insn are now width-aware (cmpb/testb/cmpw/testw via
-   cmp_width_info + typed_phys_reg_name), so a narrowed byte compares at its
-   native width: the load + cmpb/testsil/jae shape GCC and ICX emit. Replaces
-   the old I32/U32-vs-64bit boolean.
-
-4. GPR simple-ALU LHS hint (live_range). Add/Sub/And/Or/Xor/Mul compute into
-   the destination with the LHS pre-loaded (emit_alu_reg_direct), so the
-   follow-hint generalizes from FP to GPR simple-ALU LHS edges -- the range
-   fold's sub now lands in the cast's register with no copy.
-
-5. FP-parameter XMM allocation + dead-param-store elimination.
-   - ParamRef dests of FP type join the Phase 3 XMM scan.
-   - find_dead_param_allocas marks a param alloca dead when its ParamRef dest
-     has a stable home (callee-saved GPR or an XMM register).
-   - emit_store_params pre-stores FloatReg args straight into the allocated
-     XMM home (movss/movsd).
-   - A param whose ParamRef was constant-propagated away (or is unused) is
-     now dead, eliminating the entry spill (nbody's advance(0.01,...) no
-     longer stores the folded dt; frame shrank 0xd8 to 0xc8).
-   - A runtime FP param stays in XMM: dot(a,b) pre-stores both params into
-     XMM registers with no slot round-trips.
-
-6. Dead forwarding Cast/Copy skip (flag fusion). The fused chain's flag-
-   neutral forwarding instructions read the never-materialized boolean, so
-   their emitters now skip them (fused_forward_dests), removing the dead
-   movsbq after each fused range check.
-
-Measured (pinned, paired): bitops 1.91x -> 1.63x, gzip_crc32 1.45x -> 1.33x,
-expat_xml_scan 2.89x -> 2.77x, sqlite_varint 2.09x -> 1.98x, nbody
-3.47x -> 3.39x. Regression 133 passed / 0 failed, correctness 50/50,
-intrinsics 3/3, 597 lib tests. New test v11_cmp_narrowing.
+Measured (pinned, paired): expat_xml_scan 2.77x -> 2.01x, sqlite_varint
+1.98x -> 1.92x, bitops 1.63x -> 1.59x. Regression 134 passed / 0 failed,
+correctness 50/50, intrinsics 3/3.
 ---
- src/backend/live_range.rs             |  24 +++++-
- src/backend/regalloc.rs               |  16 ++++
- src/backend/stack_layout/analysis.rs  |  34 ++++++---
- src/backend/x86/codegen/cast_ops.rs   |   6 ++
- src/backend/x86/codegen/comparison.rs |  15 ++--
- src/backend/x86/codegen/emit.rs       | 102 +++++++++++++-------------
- src/backend/x86/codegen/prologue.rs   |  40 ++++++++--
- src/ir/lowering/expr_ops.rs           |  14 +++-
- src/passes/simplify.rs                |  74 +++++++++++++++++--
- tests/regression/v11_cmp_narrowing.c  |  71 ++++++++++++++++++
- 10 files changed, 310 insertions(+), 86 deletions(-)
- create mode 100644 tests/regression/v11_cmp_narrowing.c
+ src/ir/lowering/expr_ops.rs | 158 +++++++++++++++++++-----------------
+ 1 file changed, 83 insertions(+), 75 deletions(-)
 
-diff --git a/src/backend/live_range.rs b/src/backend/live_range.rs
-index e095e940..721c21db 100644
---- a/src/backend/live_range.rs
-+++ b/src/backend/live_range.rs
-@@ -17,7 +17,7 @@ use super::regalloc::PhysReg;
- use crate::common::fx_hash::FxHashMap;
- use crate::common::types::IrType;
- use crate::ir::intrinsics::IntrinsicOp;
--use crate::ir::reexports::{Instruction, IrFunction, IrUnaryOp, Operand, Terminator};
-+use crate::ir::reexports::{Instruction, IrBinOp, IrFunction, IrUnaryOp, Operand, Terminator};
- 
- /// Enhanced live interval with priority, uses, and spill weight.
- ///
-@@ -907,10 +907,32 @@ fn find_register_hints(func: &IrFunction) -> FxHashMap<u32, u32> {
-                     dest,
-                     lhs: Operand::Value(lhs),
-                     ty,
-+                    op,
-                     ..
-                 } if *ty == IrType::F64 || *ty == IrType::F32 => {
-                     hints.insert(dest.0, lhs.0);
-                 }
-+                // GPR simple-ALU ops also compute into the destination with
-+                // the LHS pre-loaded (emit_alu_reg_direct:
-+                // operand_to_callee_reg(lhs, dest); op dest). Only the LHS is
-+                // hinted; the RHS is read AFTER the LHS load and would be
-+                // clobbered (the FP RHS rule, observed as `or %r9,%r9` ≡ 0).
-+                Instruction::BinOp {
-+                    dest,
-+                    lhs: Operand::Value(lhs),
-+                    ty,
-+                    op,
-+                    ..
-+                } if ty.is_integer()
-+                    && !matches!(ty, IrType::I128 | IrType::U128)
-+                    && matches!(
-+                        op,
-+                        IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or
-+                            | IrBinOp::Xor | IrBinOp::Mul
-+                    ) =>
-+                {
-+                    hints.insert(dest.0, lhs.0);
-+                }
-                 Instruction::Copy {
-                     dest,
-                     src: Operand::Value(src),
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index 17f3b7c1..5601e0c1 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -841,6 +841,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                         {
-                             dest.0 == iv.value_id
-                         }
-+                        Instruction::ParamRef { dest, ty, .. }
-+                            if *ty == IrType::F64 || *ty == IrType::F32 =>
-+                        {
-+                            dest.0 == iv.value_id
-+                        }
-                         Instruction::Cast { dest, to_ty, .. }
-                             if *to_ty == IrType::F64 || *to_ty == IrType::F32 =>
-                         {
-@@ -1410,6 +1415,17 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
-                         non_gpr_values.insert(dest.0);
-                     }
-                 }
-+                Instruction::ParamRef { dest, ty, .. } => {
-+                    // An FP (or i128/long-double) parameter arrives in an XMM
-+                    // register per the ABI. Marking its ParamRef dest non-GPR
-+                    // makes it eligible for the Phase 3 XMM scan, so a hot
-+                    // call-free function keeps the parameter in an XMM
-+                    // register instead of spilling it to a slot at entry and
-+                    // reloading it on every use.
-+                    if is_non_gpr_type(ty) {
-+                        non_gpr_values.insert(dest.0);
-+                    }
-+                }
-                 Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
-                     if let Some(dest) = info.dest {
-                         if is_non_gpr_type(&info.return_type) {
-diff --git a/src/backend/stack_layout/analysis.rs b/src/backend/stack_layout/analysis.rs
-index 872c4ae0..2b73e69e 100644
---- a/src/backend/stack_layout/analysis.rs
-+++ b/src/backend/stack_layout/analysis.rs
-@@ -130,15 +130,31 @@ pub(super) fn find_dead_param_allocas(
- 
-     for (idx, pv) in func.param_alloca_values.iter().enumerate() {
-         if !used_values.contains(&pv.0) {
--            // Only eliminate the alloca if the ParamRef dest is assigned to a
--            // callee-saved register. Caller-saved registers overlap with ABI
--            // argument registers, so using them would clobber other params'
--            // values before they're saved.
--            if let Some(dest_id) = paramref_dests.get(idx).copied().flatten() {
--                let is_callee_saved = reg_assigned.get(&dest_id)
--                    .map(|phys| callee_saved_regs.contains(phys))
--                    .unwrap_or(false);
--                if is_callee_saved {
-+            match paramref_dests.get(idx).copied().flatten() {
-+                Some(dest_id) => {
-+                    // ParamRef survived: eliminate the alloca only when the
-+                    // ParamRef dest has a stable register home that
-+                    // emit_store_params can pre-store the ABI arg into:
-+                    // - a callee-saved GPR (survives calls, never clobbered);
-+                    // - an XMM register (PhysReg 20+), which the allocator
-+                    //   only assigns to values that do NOT span calls.
-+                    // Caller-saved GPRs overlap with ABI argument registers
-+                    // and would clobber other params' values before they're
-+                    // saved, so they are deliberately excluded.
-+                    let has_stable_home = reg_assigned.get(&dest_id)
-+                        .map(|phys| callee_saved_regs.contains(phys) || phys.0 >= 20)
-+                        .unwrap_or(false);
-+                    if has_stable_home {
-+                        dead.insert(pv.0);
-+                    }
-+                }
-+                None => {
-+                    // The ParamRef is gone (constant-propagated away by IPCP,
-+                    // or the parameter is genuinely unused after DCE) AND the
-+                    // alloca has no uses. The parameter value flows nowhere,
-+                    // so the alloca is dead: skip the entry-store slot write
-+                    // (nbody's advance(0.01, ...) previously spilled the
-+                    // constant-folded dt to 0xc8(%rsp) every call).
-                     dead.insert(pv.0);
-                 }
-             }
-diff --git a/src/backend/x86/codegen/cast_ops.rs b/src/backend/x86/codegen/cast_ops.rs
-index 1c5725e3..d0d8bbe1 100644
---- a/src/backend/x86/codegen/cast_ops.rs
-+++ b/src/backend/x86/codegen/cast_ops.rs
-@@ -11,6 +11,12 @@ impl X86Codegen {
-     }
- 
-     pub(super) fn emit_cast_impl(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
-+        // Flag-fusion forwarding: this cast's destination is never read (the
-+        // fused consumer uses the live Cmp flags), and its source is the
-+        // never-materialized boolean — emitting it would read a stale register.
-+        if self.fused_forward_dests.contains(&dest.0) {
-+            return;
-+        }
-         // W2 Load->Cast fold handshake: skip ONLY when the adjacent load
-         // ACTUALLY emitted the redirected load into this value's register
-         // (handshake set by emit_load_impl). Any other situation emits the
-diff --git a/src/backend/x86/codegen/comparison.rs b/src/backend/x86/codegen/comparison.rs
-index 2f761b19..fc0faa63 100644
---- a/src/backend/x86/codegen/comparison.rs
-+++ b/src/backend/x86/codegen/comparison.rs
-@@ -112,8 +112,7 @@ impl X86Codegen {
-         if self.cmp_replay.contains_key(&dest.0) {
-             return;
-         }
--        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
--        self.emit_int_cmp_insn_typed(lhs, rhs, use_32bit);
-+        self.emit_int_cmp_insn_typed(lhs, rhs, ty);
- 
-         // FLAG FUSION: when this Cmp's boolean result is consumed ONLY by the
-         // immediately-following Select or CondBranch (precomputed in
-@@ -190,8 +189,7 @@ impl X86Codegen {
-         true_label: &str,
-         false_label: &str,
-     ) {
--        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
--        self.emit_int_cmp_insn_typed(lhs, rhs, use_32bit);
-+        self.emit_int_cmp_insn_typed(lhs, rhs, ty);
- 
-         let jcc = match op {
-             IrCmpOp::Eq => "je",
-@@ -220,8 +218,7 @@ impl X86Codegen {
-         true_block: BlockId,
-         false_block: BlockId,
-     ) {
--        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
--        self.emit_int_cmp_insn_typed(lhs, rhs, use_32bit);
-+        self.emit_int_cmp_insn_typed(lhs, rhs, ty);
- 
-         let jcc = match op {
-             IrCmpOp::Eq => "je",
-@@ -378,8 +375,7 @@ impl X86Codegen {
-         // directly — kills the setcc/movzbl + testq chain per branch.
-         if let Some((op, lhs, rhs, ty)) = self.take_replay_cmp(cond) {
-             self.state.reg_cache.invalidate_acc();
--            let use_32bit = ty == IrType::I32 || ty == IrType::U32;
--            self.emit_int_cmp_replay_insn(&lhs, &rhs, use_32bit);
-+            self.emit_int_cmp_replay_insn(&lhs, &rhs, ty);
-             let jcc = Self::cmp_jcc(op);
-             let jcc_hot = if pref_true { jcc } else { Self::invert_jcc(jcc) };
-             if hot_next {
-@@ -645,8 +641,7 @@ impl X86Codegen {
-         let replay_op = self.take_replay_cmp(cond);
-         if let Some((op, lhs, rhs, ty)) = &replay_op {
-             self.state.reg_cache.invalidate_acc();
--            let use_32bit = *ty == IrType::I32 || *ty == IrType::U32;
--            self.emit_int_cmp_replay_insn(lhs, rhs, use_32bit);
-+            self.emit_int_cmp_replay_insn(lhs, rhs, *ty);
-         }
-         // Test the condition in place (no pushfq). Only when the condition is
-         // not directly testable (rare) do we fall back to the legacy
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 8d272e2f..87f167c2 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -197,6 +197,20 @@ pub(super) fn typed_phys_reg_name(reg: PhysReg, ty: IrType) -> &'static str {
-     }
- }
- 
-+/// Width info for an integer compare at `ty`: (cmp mnemonic, test mnemonic,
-+/// accumulator register). Sub-word types use their native byte/word width so a
-+/// narrowed comparison (`c < 0x80` on a promoted byte) emits `cmpb`/`testb`
-+/// instead of widening through a 32/64-bit compare — GCC/ICX's byte-compare
-+/// shape. I32/U32 use 32-bit ops; everything else stays 64-bit (unchanged).
-+pub(super) fn cmp_width_info(ty: IrType) -> (&'static str, &'static str, &'static str) {
-+    match ty {
-+        IrType::I8 | IrType::U8 => ("cmpb", "testb", "al"),
-+        IrType::I16 | IrType::U16 => ("cmpw", "testw", "ax"),
-+        IrType::I32 | IrType::U32 => ("cmpl", "testl", "eax"),
-+        _ => ("cmpq", "testq", "rax"),
-+    }
-+}
-+
- /// Scan inline asm instructions in a function and collect any callee-saved
- /// registers that are used via specific constraints or listed in clobbers.
- /// These must be saved/restored in the function prologue/epilogue.
-@@ -337,6 +351,11 @@ pub struct X86Codegen {
-     /// materialization (setcc/movzbl/store) and the consumer uses the live
-     /// flags directly (jcc/cmovcc).
-     pub(super) fused_cmp_dests: FxHashMap<u32, u32>,
-+    /// Destinations of the flag-neutral forwarding Copy/Cast instructions in a
-+    /// fused Cmp chain. Their value is never materialized (the consumer uses
-+    /// the live flags), so their emitters must skip them — emitting them would
-+    /// read the never-written stale register (a dead, wasted instruction).
-+    pub(super) fused_forward_dests: FxHashSet<u32>,
-     /// Cmp destinations eligible for compare-replay: the Cmp's single use is
-     /// a Select or CondBranch that is NOT adjacent to the Cmp (flags would be
-     /// clobbered in between), so the consumer re-emits `cmp` from the
-@@ -496,6 +515,7 @@ impl X86Codegen {
-             skip_i32_sext: false,
-             needs_sext_values: FxHashSet::default(),
-             fused_cmp_dests: FxHashMap::default(),
-+            fused_forward_dests: FxHashSet::default(),
-             cmp_replay: FxHashMap::default(),
-             value_use_counts: FxHashMap::default(),
-             load_cast_fold: FxHashMap::default(),
-@@ -779,8 +799,9 @@ impl X86Codegen {
-     /// non-register-allocated value, and the replay candidates are filtered
-     /// to slot-resident operands at build time — so the slot is always the
-     /// correct, stable source here.
--    pub(super) fn emit_int_cmp_replay_insn(&mut self, lhs: &Operand, rhs: &Operand, use_32bit: bool) {
--        let cmp_instr = if use_32bit { "cmpl" } else { "cmpq" };
-+    pub(super) fn emit_int_cmp_replay_insn(&mut self, lhs: &Operand, rhs: &Operand, ty: IrType) {
-+        let (cmp_instr, _test_instr, acc_reg) = cmp_width_info(ty);
-+        let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
-         // Load lhs from its slot with the TYPE-AWARE width. A raw `movq` slot
-         // load is unsound for narrow values: the slot stores are 8-byte
-         // (movq) but only the low N bytes hold the value; the upper bytes are
-@@ -798,10 +819,9 @@ impl X86Codegen {
-             }
-         }
-         // Prefer the immediate form whenever rhs is an encodable constant,
--        // matching emit_int_cmp_insn_typed (cmp $imm, %rax / %eax).
-+        // matching emit_int_cmp_insn_typed (cmp $imm, %al/%eax/%rax).
-         if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
--            let lreg = if use_32bit { "eax" } else { "rax" };
--            self.state.emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, lreg));
-+            self.state.emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, acc_reg));
-             return;
-         }
-         match rhs {
-@@ -812,18 +832,18 @@ impl X86Codegen {
-                 self.operand_to_rcx(rhs);
-             }
-         }
--        let lreg = if use_32bit { "eax" } else { "rax" };
-         let rreg = if use_32bit { "ecx" } else { "rcx" };
--        self.state.emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rreg, lreg));
-+        self.state.emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rreg, acc_reg));
-     }
- 
-     pub(super) fn emit_int_cmp_insn_typed(
-         &mut self,
-         lhs: &Operand,
-         rhs: &Operand,
--        use_32bit: bool,
-+        ty: IrType,
-     ) {
--        let cmp_instr = if use_32bit { "cmpl" } else { "cmpq" };
-+        let (cmp_instr, test_instr, acc_reg) = cmp_width_info(ty);
-+        let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
-         let lhs_phys = self.operand_reg(lhs);
-         let rhs_phys = self.operand_reg(rhs);
-         // Prefer the immediate form whenever rhs is an encodable constant —
-@@ -832,63 +852,40 @@ impl X86Codegen {
-         if rhs_phys.is_none() || matches!(rhs, Operand::Const(_)) {
-             if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
-                 if imm == 0 {
--                    let test_instr = if use_32bit { "testl" } else { "testq" };
-                     if let Some(lhs_r) = lhs_phys {
--                        let lhs_name = if use_32bit {
--                            phys_reg_name_32(lhs_r)
--                        } else {
--                            phys_reg_name(lhs_r)
--                        };
-+                        let lhs_name = typed_phys_reg_name(lhs_r, ty);
-                         self.state.emit_fmt(format_args!(
-                             "    {} %{}, %{}",
-                             test_instr, lhs_name, lhs_name
-                         ));
-                     } else {
-                         self.operand_to_rax(lhs);
--                        let reg = if use_32bit { "eax" } else { "rax" };
-                         self.state
--                            .emit_fmt(format_args!("    {} %{}, %{}", test_instr, reg, reg));
-+                            .emit_fmt(format_args!("    {} %{}, %{}", test_instr, acc_reg, acc_reg));
-                     }
-                 } else if let Some(lhs_r) = lhs_phys {
--                    let lhs_name = if use_32bit {
--                        phys_reg_name_32(lhs_r)
--                    } else {
--                        phys_reg_name(lhs_r)
--                    };
-+                    let lhs_name = typed_phys_reg_name(lhs_r, ty);
-                     self.state
-                         .emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, lhs_name));
-                 } else {
-                     self.operand_to_rax(lhs);
--                    let reg = if use_32bit { "eax" } else { "rax" };
-                     self.state
--                        .emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, reg));
-+                        .emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, acc_reg));
-                 }
-                 return;
-             }
-         }
-         if let (Some(lhs_r), Some(rhs_r)) = (lhs_phys, rhs_phys) {
--            // Both in callee-saved registers: compare directly
--            let lhs_name = if use_32bit {
--                phys_reg_name_32(lhs_r)
--            } else {
--                phys_reg_name(lhs_r)
--            };
--            let rhs_name = if use_32bit {
--                phys_reg_name_32(rhs_r)
--            } else {
--                phys_reg_name(rhs_r)
--            };
-+            // Both in registers: compare directly
-+            let lhs_name = typed_phys_reg_name(lhs_r, ty);
-+            let rhs_name = typed_phys_reg_name(rhs_r, ty);
-             self.state.emit_fmt(format_args!(
-                 "    {} %{}, %{}",
-                 cmp_instr, rhs_name, lhs_name
-             ));
-         } else if let Some(lhs_r) = lhs_phys {
--            let lhs_name = if use_32bit {
--                phys_reg_name_32(lhs_r)
--            } else {
--                phys_reg_name(lhs_r)
--            };
--            // Memory-operand: cmpq N(%rsp), %lhs_reg directly
-+            let lhs_name = typed_phys_reg_name(lhs_r, ty);
-+            // Memory-operand: cmp N(%rsp), %lhs_reg directly
-             if let Operand::Value(rv) = rhs {
-                 if self.dest_reg(rv).is_none() {
-                     if let Some(slot) = self.state.get_slot(rv.0) {
-@@ -908,26 +905,20 @@ impl X86Codegen {
-             self.state
-                 .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rcx, lhs_name));
-         } else if let Some(rhs_r) = rhs_phys {
--            let rhs_name = if use_32bit {
--                phys_reg_name_32(rhs_r)
--            } else {
--                phys_reg_name(rhs_r)
--            };
-+            let rhs_name = typed_phys_reg_name(rhs_r, ty);
-             self.operand_to_rax(lhs);
--            let reg = if use_32bit { "eax" } else { "rax" };
-             self.state
--                .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rhs_name, reg));
-+                .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rhs_name, acc_reg));
-         } else {
-             // Neither operand has a register. Load lhs to %rax.
-             self.operand_to_rax(lhs);
--            let reg = if use_32bit { "eax" } else { "rax" };
--            // Memory-operand: cmpq N(%rsp), %rax directly for rhs
-+            // Memory-operand: cmp N(%rsp), %rax directly for rhs
-             if let Operand::Value(rv) = rhs {
-                 if let Some(slot) = self.state.get_slot(rv.0) {
-                     if !self.state.is_alloca(rv.0) {
-                         let sref = self.slot_ref(slot.0);
-                         self.state
--                            .emit_fmt(format_args!("    {} {}, %{}", cmp_instr, sref, reg));
-+                            .emit_fmt(format_args!("    {} {}, %{}", cmp_instr, sref, acc_reg));
-                         return;
-                     }
-                 }
-@@ -935,11 +926,10 @@ impl X86Codegen {
-             self.operand_to_rcx(rhs);
-             let rcx = if use_32bit { "ecx" } else { "rcx" };
-             self.state
--                .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rcx, reg));
-+                .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rcx, acc_reg));
-         }
-     }
- 
--    /// Load an operand into a specific callee-saved register.
-     /// Handles constants, register-allocated values, and stack values.
-     pub(super) fn operand_to_callee_reg(&mut self, op: &Operand, target: PhysReg) {
-         let target_name = phys_reg_name(target);
-@@ -3585,6 +3575,12 @@ impl ArchCodegen for X86Codegen {
-     }
- 
-     fn emit_copy_value(&mut self, dest: &Value, src: &Operand) {
-+        // Flag-fusion forwarding: this copy's destination is never read (the
-+        // fused consumer uses the live Cmp flags), and its source is the
-+        // never-materialized boolean — emitting it would read a stale register.
-+        if self.fused_forward_dests.contains(&dest.0) {
-+            return;
-+        }
-         // Handle vector Copy instructions: %dest_vec = copy %src_vec
-         // Vectors are stored directly in stack slots (not as pointers), so we copy
-         // with ymm/xmm registers instead of scalar movq.
-diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
-index a98574fb..c3d74e0a 100644
---- a/src/backend/x86/codegen/prologue.rs
-+++ b/src/backend/x86/codegen/prologue.rs
-@@ -335,6 +335,11 @@ impl X86Codegen {
-             // consumer is adjacent). The Cmp emitter records pending flags
-             // under the chain-end value so the consumer matches.
-             let mut fused: FxHashMap<u32, u32> = FxHashMap::default();
-+            // Forwarding Copy/Cast destinations in fused chains: their value is
-+            // never materialized, so the emitters must skip them (see
-+            // fused_forward_dests on the emitter state).
-+            let mut fused_forward: crate::common::fx_hash::FxHashSet<u32> =
-+                crate::common::fx_hash::FxHashSet::default();
-             for block in &func.blocks {
-                 let insts = &block.instructions;
-                 for (ii, inst) in insts.iter().enumerate() {
-@@ -347,6 +352,7 @@ impl X86Codegen {
-                         let mut k = ii + 1;
-                         let mut is_consumer = false;
-                         let mut chain_single_use = true;
-+                        let mut forward_dests: Vec<u32> = Vec::new();
-                         while k < insts.len() {
-                             match &insts[k] {
-                                 Instruction::Copy { dest: cd, src: Operand::Value(sv) }
-@@ -373,6 +379,7 @@ impl X86Codegen {
-                                         chain_single_use = false;
-                                         break;
-                                     }
-+                                    forward_dests.push(cd.0);
-                                     cur = cd.0;
-                                     k += 1;
-                                 }
-@@ -392,6 +399,7 @@ impl X86Codegen {
-                                         chain_single_use = false;
-                                         break;
-                                     }
-+                                    forward_dests.push(cd.0);
-                                     cur = cd.0;
-                                     k += 1;
-                                 }
-@@ -409,11 +417,13 @@ impl X86Codegen {
-                         }
-                         if is_consumer && chain_single_use {
-                             fused.insert(dest.0, cur);
-+                            fused_forward.extend(forward_dests.iter().copied());
-                         } else if !is_consumer && chain_single_use && k == insts.len() && insts.len() >= 1 {
-                             // Check the block terminator as the consumer.
-                             if let Terminator::CondBranch { cond: Operand::Value(v), .. } = &block.terminator {
-                                 if v.0 == cur && use_counts.get(&cur).copied().unwrap_or(0) == 1 {
-                                     fused.insert(dest.0, cur);
-+                                    fused_forward.extend(forward_dests.iter().copied());
-                                 }
-                             }
-                         }
-@@ -513,6 +523,7 @@ impl X86Codegen {
-             self.cmp_replay = cmp_replay;
- 
-             self.fused_cmp_dests = fused;
-+            self.fused_forward_dests = fused_forward;
-             self.value_use_counts = use_counts;
- 
- 
-@@ -1003,16 +1014,19 @@ impl X86Codegen {
-                 }
-                 if !has_slot {
-                     if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
--                        // Only pre-store to callee-saved registers (PhysReg 1-5).
--                        // Caller-saved registers (rdi, rsi, r8-r11) cannot be used
--                        // because they overlap with ABI argument registers that
--                        // haven't been saved yet.
-+                        // Pre-store to a callee-saved GPR (PhysReg 1-5) or an
-+                        // allocated XMM register (PhysReg 20+). Caller-saved
-+                        // GPRs (rdi, rsi, r8-r11) cannot be used because they
-+                        // overlap ABI argument registers that haven't been
-+                        // saved yet; XMM homes are fine because the allocator
-+                        // only assigns them to values that do not span calls.
-                         let is_callee_saved = phys_reg.0 >= 1 && phys_reg.0 <= 5;
-+                        let is_xmm = super::emit::is_xmm_reg(phys_reg);
-                         if std::env::var("CCC_DEBUG_PARAM_STORE").is_ok() {
-                             let shared = reg_to_params.get(&phys_reg.0).is_some_and(|u| u.len() > 1);
-                             eprintln!("[PRE-STORE]   callee={} shared={} class={:?}", is_callee_saved, shared, class);
-                         }
--                        if is_callee_saved {
-+                        if is_callee_saved || is_xmm {
-                             let shared = reg_to_params.get(&phys_reg.0)
-                                 .is_some_and(|users| users.len() > 1);
-                             if !shared {
-@@ -1022,7 +1036,21 @@ impl X86Codegen {
-                                         "    movq", X86_ARG_REGS[reg_idx], dest_reg);
-                                     self.state.param_pre_stored.insert(i);
-                                     self.param_source_regs.insert(phys_reg.0, X86_ARG_REGS[reg_idx]);
--                                } // TODO: handle StackSlot/SSE params
-+                                } else if let ParamClass::FloatReg { reg_idx } = class {
-+                                    // The FP argument arrives in xmm0..xmm7;
-+                                    // move it straight into its allocated XMM
-+                                    // home. movss/movsd are the scalar
-+                                    // xmm->xmm moves (movd/movq are xmm<->GPR
-+                                    // only, which the assembler rejects).
-+                                    let mnemonic = if func.params[i].ty == IrType::F32 {
-+                                        "    movss"
-+                                    } else {
-+                                        "    movsd"
-+                                    };
-+                                    self.state.out.emit_instr_reg_reg(
-+                                        mnemonic, xmm_regs[reg_idx], dest_reg);
-+                                    self.state.param_pre_stored.insert(i);
-+                                }
-                             }
-                         }
-                     }
 diff --git a/src/ir/lowering/expr_ops.rs b/src/ir/lowering/expr_ops.rs
-index 32d9c8f0..77e63c33 100644
+index 77e63c33..2bc9a6fa 100644
 --- a/src/ir/lowering/expr_ops.rs
 +++ b/src/ir/lowering/expr_ops.rs
-@@ -303,12 +303,22 @@ impl Lowerer {
-                 // truncation to U32 so that 64-bit operations (like divq) see the correct
-                 // 32-bit unsigned values.
-                 // On 32-bit: not needed since U32 operations are native width.
-+                //
-+                // from_ty must be the operand's ACTUAL type (`op_ty`, which is
-+                // U32 here: `widened_op_type(U32) == U32`), not the hardcoded
-+                // I64. The old I64 label made this a type-lying identity cast
-+                // that simplify could not fold (its chain check requires
-+                // inner_to == from_ty), so it survived to codegen as a
-+                // spurious `mov` per comparison operand — the expat/sqlite
-+                // `mov %esi,%ebp; mov %ebp,%r15d` copy chains. With the
-+                // correct label the cast is Cast(U32->U32), which simplify
-+                // folds to a Copy and copy-prop eliminates.
-                 if lhs_ty.size() <= 4 {
--                    let masked = self.emit_cast_val(lhs_val, IrType::I64, IrType::U32);
-+                    let masked = self.emit_cast_val(lhs_val, op_ty, IrType::U32);
-                     lhs_val = Operand::Value(masked);
-                 }
-                 if rhs_ty.size() <= 4 {
--                    let masked = self.emit_cast_val(rhs_val, IrType::I64, IrType::U32);
-+                    let masked = self.emit_cast_val(rhs_val, op_ty, IrType::U32);
-                     rhs_val = Operand::Value(masked);
-                 }
-             }
-diff --git a/src/passes/simplify.rs b/src/passes/simplify.rs
-index 7a782df7..c174812c 100644
---- a/src/passes/simplify.rs
-+++ b/src/passes/simplify.rs
-@@ -248,7 +248,7 @@ fn try_simplify(
-             simplify_gep(*dest, *base, offset, *ty, gep_defs)
-         }
-         Instruction::Cmp { dest, op, lhs, rhs, ty } => {
--            simplify_cmp(*dest, *op, lhs, rhs, *ty, cmp_defs, is_boolean)
-+            simplify_cmp(*dest, *op, lhs, rhs, *ty, cmp_defs, cast_defs, is_boolean)
-         }
-         Instruction::Select { dest, cond, true_val, false_val, .. } => {
-             // select cond, x, x => x (both arms are the same)
-@@ -400,8 +400,7 @@ fn simplify_cast(
- /// the storage type (I8/I16/I32/I64), but unsigned source types require
- /// zero-extension. For example, IrConst::I8(-1) with from_ty=U8 represents
- /// the value 255, not -1.
--fn fold_const_cast(c: &IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrConst> {
--    // Handle I128 source directly to avoid truncation through to_i64().
-+fn fold_const_cast(c: &IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrConst> {    // Handle I128 source directly to avoid truncation through to_i64().
-     // to_i64() truncates the upper 64 bits, which loses data for values like (U)1 << 127.
-     if let IrConst::I128(v128) = c {
-         return fold_i128_cast(*v128, from_ty, to_ty);
-@@ -496,8 +495,23 @@ fn fold_int_cast(val: i64, from_ty: IrType, to_ty: IrType) -> Option<IrConst> {
- }
+@@ -822,95 +822,89 @@ impl Lowerer {
+             if int_ty == IrType::I32 { IrConst::I32(v as i32) } else { IrConst::I64(v) }
+         };
  
- /// Invert a comparison operator (negate the condition).
--fn invert_cmp_op(op: IrCmpOp) -> IrCmpOp {
--    match op {
-+/// Rebuild an integer constant of type `ty` from an i64 value (bit-pattern
-+/// semantics for unsigned types, like the range-check fold's int_const).
-+/// Returns None if the value does not fit the type's width.
-+fn int_const_of_type(ty: IrType, v: i64) -> Option<IrConst> {
-+    match ty {
-+        IrType::I8 => i8::try_from(v).ok().map(IrConst::I8),
-+        IrType::U8 => u8::try_from(v).ok().map(|x| IrConst::I8(x as i8)),
-+        IrType::I16 => i16::try_from(v).ok().map(IrConst::I16),
-+        IrType::U16 => u16::try_from(v).ok().map(|x| IrConst::I16(x as i16)),
-+        IrType::I32 => i32::try_from(v).ok().map(IrConst::I32),
-+        IrType::U32 => u32::try_from(v).ok().map(|x| IrConst::I32(x as i32)),
-+        IrType::I64 | IrType::U64 => Some(IrConst::I64(v)),
-+        _ => None,
-+    }
-+}
+-        // ms178: A comparison / logical-operator / logical-NOT RHS already
+-        // lowers to a normalized 0/1 boolean, so re-normalizing it with an
+-        // extra `!= 0` comparison (`emit_cmp_val(Ne, rhs_val, 0)`) is an
+-        // identity that only emits a redundant cmp+setcc+movzbl per condition
+-        // in short-circuit chains (gzip's longest_match: `a != b || c != d`
+-        // materialized BOTH sides plus a re-compare of the RHS bool). Only
+-        // normalize when the RHS lowering can produce an arbitrary nonzero
+-        // value (pointers, integers, floats, compound exprs).
+-        let rhs_is_normalized_bool = matches!(rhs, Expr::BinaryOp(op, _, _, _) if op.is_comparison())
+-            || matches!(rhs, Expr::UnaryOp(UnaryOp::LogicalNot, _, _));
+-        // Lower rhs and produce a 0/1 boolean, skipping the identity `!= 0`
+-        // when the RHS expression already yields a normalized boolean.
+-        let lower_rhs_bool = |slf: &mut Self| -> Operand {
+-            let rhs_val = slf.lower_condition_expr(rhs);
+-            if rhs_is_normalized_bool {
+-                rhs_val
+-            } else {
+-                Operand::Value(slf.emit_cmp_val(IrCmpOp::Ne, rhs_val, Operand::Const(make_int_const(0)), int_ty))
+-            }
+-        };
+-
+-        // Constant-fold the LHS to eliminate dead code at lowering time.
+-        // This is critical for constructs like IS_ENABLED(CONFIG_X) && func()
+-        // where CONFIG_X is not set: without this, the compiler would emit a
+-        // reference to func() even though it's never called, causing link errors.
+-        if let Some(lhs_const) = self.eval_const_expr(lhs) {
+-            let lhs_is_true = lhs_const.is_nonzero();
+-            if is_and {
+-                if !lhs_is_true {
+-                    // 0 && rhs => always 0, skip RHS entirely
+-                    return Operand::Const(make_int_const(0));
+-                }
+-                // nonzero && rhs => result is bool(rhs)
+-                return lower_rhs_bool(self);
+-            } else {
+-                if lhs_is_true {
+-                    // nonzero || rhs => always 1, skip RHS entirely
+-                    return Operand::Const(make_int_const(1));
++        // FLAT short-circuit lowering. `a || b || c` parses as `(a || b) || c`;
++        // the old per-link lowering built a right-nested value tree (one
++        // alloca + branch diamond per link), so the intermediate links were
++        // DATA (selected as the next link's false arm) and materialized as
++        // setcc/cmov chains even when the whole result only fed a branch.
++        // Flatten left-associative runs of the SAME operator into ONE branch
++        // sequence with ONE merge value — GCC/ICX's shape for Expat's
++        // `nameLength` (cmp;ja chains, zero boolean materialization).
++        let mut ops: Vec<&Expr> = Vec::with_capacity(4);
++        collect_flat_sc_operands(lhs, is_and, &mut ops);
++        collect_flat_sc_operands(rhs, is_and, &mut ops);
 +
-+fn invert_cmp_op(op: IrCmpOp) -> IrCmpOp {    match op {
-         IrCmpOp::Eq => IrCmpOp::Ne,
-         IrCmpOp::Ne => IrCmpOp::Eq,
-         IrCmpOp::Slt => IrCmpOp::Sge,
-@@ -538,6 +552,8 @@ fn swap_cmp_op(op: IrCmpOp) -> IrCmpOp {
- ///   (checking if comparison result is not-true = inverted)
- /// - Cmp(Eq, cmp_result, 1) => Copy(cmp_result) when cmp_result is from another Cmp
- ///   (comparing a 0/1 value against 1 is the same as the original comparison)
-+/// - Comparison narrowing: Cmp(op, Cast(x, T->W), C, W) => Cmp(op, x, C', T)
-+///   when the extension T->W preserves op's ordering and C fits in T.
- fn simplify_cmp(
-     dest: Value,
-     op: IrCmpOp,
-@@ -545,6 +561,7 @@ fn simplify_cmp(
-     rhs: &Operand,
-     ty: IrType,
-     cmp_defs: &[Option<CmpDef>],
-+    cast_defs: &[Option<CastDef>],
-     is_boolean: &[bool],
- ) -> Option<Instruction> {
-     // Self-comparison: Cmp(op, x, x) => constant
-@@ -573,6 +590,53 @@ fn simplify_cmp(
-     let is_zero_const = const_i64 == Some(0);
-     let is_one_const = const_i64 == Some(1);
++        // Drop constant identity operands (false for `||`, true for `&&`):
++        // they are pure (eval_const_expr has no side effects) and contribute
++        // nothing to the result. A constant that DECIDES the chain (true for
++        // `||`, false for `&&`) short-circuits: evaluate the surviving
++        // operands before it for side effects, then return the constant.
++        let mut kept: Vec<&Expr> = Vec::with_capacity(ops.len());
++        for op in &ops {
++            match self.eval_const_expr(op) {
++                Some(c) => {
++                    let truthy = c.is_nonzero();
++                    // `||` short-circuits on true; `&&` on false.
++                    if truthy != is_and {
++                        for &k in &kept {
++                            let _ = self.lower_condition_expr(k);
++                        }
++                        return Operand::Const(make_int_const(if is_and { 0 } else { 1 }));
++                    }
+                 }
+-                // 0 || rhs => result is bool(rhs)
+-                return lower_rhs_bool(self);
++                None => kept.push(op),
+             }
+         }
++        if kept.is_empty() {
++            // Every operand was an identity constant (a||b||0 with a=b=0 => 0;
++            // a&&b&&1 with a=b=1 => 1).
++            return Operand::Const(make_int_const(if is_and { 1 } else { 0 }));
++        }
  
-+    // Comparison narrowing: Cmp(op, Cast(x, T->W), C, W) => Cmp(op, x, C', T).
-+    //
-+    // A value widened for C's integer promotions (e.g. a `movzbl`-loaded byte
-+    // promoted to int for `c < 0x80`) is compared AT ITS NATIVE WIDTH, so the
-+    // widening cast — and its register copy — disappears and the backend emits
-+    // `cmpb`/`testb` directly (GCC's `test dl,dl; jns`, ICX's `cmp cl,-62`).
-+    // The extension must preserve the comparison's ordering, and the constant
-+    // must fit in T:
-+    //   - unsigned T (zero-extend):  Ult/Ule/Ugt/Uge + Eq/Ne, C in [0, 2^n).
-+    //   - signed   T (sign-extend):  Slt/Sle/Sgt/Sge + Eq/Ne, C in signed range.
-+    if let Some(const_i64) = const_i64 {
-+        if let Some(Some(cdef)) = cast_defs.get(val.0 as usize) {
-+            let narrow_ty = cdef.from_ty;
-+            if cdef.to_ty == ty
-+                && narrow_ty.is_integer()
-+                && narrow_ty.size() < ty.size()
-+            {
-+                let bits = narrow_ty.size() * 8;
-+                let fits = if narrow_ty.is_unsigned() {
-+                    const_i64 >= 0 && (const_i64 as u64) <= (1u64 << bits) - 1
-+                } else {
-+                    const_i64 >= -(1i64 << (bits - 1)) && const_i64 <= (1i64 << (bits - 1)) - 1
-+                };
-+                let order_ok = match effective_op {
-+                    IrCmpOp::Eq | IrCmpOp::Ne => true,
-+                    IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge => {
-+                        narrow_ty.is_unsigned()
-+                    }
-+                    IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge => {
-+                        narrow_ty.is_signed()
-+                    }
-+                };
-+                if fits && order_ok {
-+                    if let Some(narrowed_const) = int_const_of_type(narrow_ty, const_i64) {
-+                        return Some(Instruction::Cmp {
-+                            dest,
-+                            op: effective_op,
-+                            lhs: cdef.src,
-+                            rhs: Operand::Const(narrowed_const),
-+                            ty: narrow_ty,
-+                        });
-+                    }
-+                }
-+            }
+-        // Check if the RHS is a compile-time constant. When it is, we can
+-        // simplify the short-circuit result without emitting the RHS branch.
+-        // This helps patterns like `expr && 0` or `expr || 1` where the RHS
+-        // is a literal or compile-time constant expression.
+-        if let Some(rhs_const) = self.eval_const_expr(rhs) {
+-            let rhs_is_true = rhs_const.is_nonzero();
+-            if is_and && !rhs_is_true {
+-                // LHS && false => always false. Evaluate LHS for side effects, return 0.
+-                let _ = self.lower_condition_expr(lhs);
+-                return Operand::Const(make_int_const(0));
+-            } else if !is_and && rhs_is_true {
+-                // LHS || true => always true. Evaluate LHS for side effects, return 1.
+-                let _ = self.lower_condition_expr(lhs);
+-                return Operand::Const(make_int_const(1));
++        // The LAST operand's value flows out as data, so it must be a
++        // normalized 0/1 boolean. A comparison / logical-NOT already yields
++        // 0/1; anything else gets the `!= 0` normalization (same rule as the
++        // old RHS handling — avoids a redundant re-compare per condition).
++        let last = *kept.last().unwrap();
++        let last_is_normalized_bool = matches!(last, Expr::BinaryOp(op, _, _, _) if op.is_comparison())
++            || matches!(last, Expr::UnaryOp(UnaryOp::LogicalNot, _, _));
++        let lower_last_bool = |slf: &mut Self| -> Operand {
++            let val = slf.lower_condition_expr(last);
++            if last_is_normalized_bool {
++                val
++            } else {
++                Operand::Value(slf.emit_cmp_val(IrCmpOp::Ne, val, Operand::Const(make_int_const(0)), int_ty))
+             }
+-            // For "LHS && true" or "LHS || false", fall through to normal lowering
+-            // since the result depends on LHS.
++        };
++
++        if kept.len() == 1 {
++            return lower_last_bool(self);
+         }
+ 
+-        // Use emit_entry_alloca so the alloca is in the entry block, ensuring
+-        // mem2reg can promote it to SSA/Phi form. Previously this used self.emit()
+-        // which placed the alloca in the current block — if the expression was inside
+-        // nested control flow (e.g., inside a loop or if body), the alloca would
+-        // be in a non-entry block and mem2reg would refuse to promote it.
++        // Flat branch chain: store the default, branch on each leading
++        // operand, store the normalized last operand, merge and load.
+         let result_alloca = self.emit_entry_alloca(int_ty, int_size, 0, false);
+-
+-        let rhs_label = self.fresh_label();
+         let end_label = self.fresh_label();
+ 
+-        let lhs_val = self.lower_condition_expr(lhs);
+-
+         let default_val = if is_and { 0 } else { 1 };
+         self.emit(Instruction::Store { val: Operand::Const(make_int_const(default_val)), ptr: result_alloca, ty: int_ty,
+          seg_override: AddressSpace::Default });
+ 
+-        let (true_label, false_label) = if is_and {
+-            (rhs_label, end_label)
+-        } else {
+-            (end_label, rhs_label)
+-        };
+-        self.terminate(Terminator::CondBranch { cond: lhs_val, true_label, false_label });
++        let n = kept.len();
++        for op in kept.iter().take(n - 1) {
++            let next_label = self.fresh_label();
++            let (true_label, false_label) = if is_and {
++                (next_label, end_label)
++            } else {
++                (end_label, next_label)
++            };
++            let cond = self.lower_condition_expr(op);
++            self.terminate(Terminator::CondBranch { cond, true_label, false_label });
++            self.start_block(next_label);
++        }
+ 
+-        self.start_block(rhs_label);
+-        let rhs_bool = lower_rhs_bool(self);
+-        self.emit(Instruction::Store { val: rhs_bool, ptr: result_alloca, ty: int_ty, seg_override: AddressSpace::Default });
++        let last_bool = lower_last_bool(self);
++        self.emit(Instruction::Store { val: last_bool, ptr: result_alloca, ty: int_ty, seg_override: AddressSpace::Default });
+         self.terminate(Terminator::Branch(end_label));
+ 
+         self.start_block(end_label);
+@@ -919,7 +913,6 @@ impl Lowerer {
+         Operand::Value(result)
+     }
+ 
+-    // -----------------------------------------------------------------------
+     // Increment/decrement operators
+     // -----------------------------------------------------------------------
+ 
+@@ -1031,3 +1024,18 @@ impl Lowerer {
+         }
+     }
+ }
++
++/// Collect the flat operand list of a left-associative short-circuit chain of
++/// ONE operator (`&&` or `||`). A nested chain of the OTHER operator is kept
++/// as a single operand (it evaluates as a unit with its own merge).
++fn collect_flat_sc_operands<'a>(expr: &'a Expr, is_and: bool, ops: &mut Vec<&'a Expr>) {
++    if let Expr::BinaryOp(op, lhs, rhs, _) = expr {
++        let same_op = if is_and { *op == BinOp::LogicalAnd } else { *op == BinOp::LogicalOr };
++        if same_op {
++            collect_flat_sc_operands(lhs, is_and, ops);
++            collect_flat_sc_operands(rhs, is_and, ops);
++            return;
 +        }
 +    }
++    ops.push(expr);
++}
+-- 
+2.47.3
+
+
+From c3783ab66ccb64eca8022f73037514aaf08eb783 Mon Sep 17 00:00:00 2001
+From: lccc-v12 <v12@localhost>
+Date: Fri, 14 Aug 2026 00:21:34 +0000
+Subject: [PATCH 2/6] v12: range-fold compare narrowing (GCC's byte-compare
+ shape)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The range check (x >= lo && x <= hi) now narrows its COMPARE to the operand's
+source width when the operand is a widening cast of a byte/short: the 32-bit
+sub stays, and the compare reads the low byte ((u8)(x - lo) <= span classifies
+the range identically — the wrap in the narrow domain is the unsigned-bias
+check). Matches GCC's 'add edx,62; cmp dl,29'. Verified: expat's inner range
+checks now emit 'cmp $0x19,%bpl' instead of the 32-bit form.
+---
+ src/passes/range_check.rs | 29 ++++++++++++++++++++++++-----
+ 1 file changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/src/passes/range_check.rs b/src/passes/range_check.rs
+index 7c901f60..f3da6246 100644
+--- a/src/passes/range_check.rs
++++ b/src/passes/range_check.rs
+@@ -222,9 +222,28 @@ fn try_fold_select(
+ 
+     // `hi - lo` must be representable in the operand type.
+     let span = range.hi - range.lo;
+-    let span_const = int_const(range.ty, span)?;
++    int_const(range.ty, span)?;
+     let lo_const = int_const(range.ty, range.lo)?;
+ 
++    // Narrow the COMPARE to the operand's source width when the operand is a
++    // widening cast of a byte/short: `(u8)(x - lo) <= span` reads the low
++    // byte of the 32-bit sub and classifies the range identically (the wrap
++    // in the narrow domain is what makes the unsigned-bias check work).
++    // Matches GCC's `add edx,62; cmp dl,29` byte-compare shape. The sub stays
++    // at the promoted width; only the compare narrows, so the emitter reuses
++    // the v11 byte/word compare path.
++    let mut cmp_ty = range.ty;
++    if let Some(Some((_, from_ty, to_ty))) = cast_defs.get(range.value.0 as usize) {
++        if *to_ty == range.ty
++            && from_ty.is_integer()
++            && from_ty.size() < range.ty.size()
++            && int_const(*from_ty, span).is_some()
++        {
++            cmp_ty = *from_ty;
++        }
++    }
++    let span_narrow_const = int_const(cmp_ty, span)?;
 +
-     // Check if the value is known boolean (0 or 1). This includes:
-     // - Values defined by Cmp instructions
-     // - Values from And/Or/Xor of boolean values
-diff --git a/tests/regression/v11_cmp_narrowing.c b/tests/regression/v11_cmp_narrowing.c
+     let sub_dest = Value(*next_id);
+     *next_id += 1;
+     let mut out = Vec::with_capacity(3);
+@@ -244,8 +263,8 @@ fn try_fold_select(
+             dest: *dest,
+             op: cmp_op,
+             lhs: Operand::Value(sub_dest),
+-            rhs: Operand::Const(span_const),
+-            ty: range.ty,
++            rhs: Operand::Const(span_narrow_const),
++            ty: cmp_ty,
+         });
+     } else {
+         let cmp_dest = Value(*next_id);
+@@ -254,8 +273,8 @@ fn try_fold_select(
+             dest: cmp_dest,
+             op: cmp_op,
+             lhs: Operand::Value(sub_dest),
+-            rhs: Operand::Const(span_const),
+-            ty: range.ty,
++            rhs: Operand::Const(span_narrow_const),
++            ty: cmp_ty,
+         });
+         out.push(Instruction::Cast {
+             dest: *dest,
+-- 
+2.47.3
+
+
+From fb47e7eac3516f3359c4da9d4415969459c0582a Mon Sep 17 00:00:00 2001
+From: lccc-v12 <v12@localhost>
+Date: Fri, 14 Aug 2026 00:33:12 +0000
+Subject: [PATCH 3/6] v12: fix FP-parameter pre-store ordering (ABI-register
+ clobbering)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The FP-param XMM pre-store (v11) stored each param's ABI argument register
+into its allocated XMM home in parameter order. A home may be xmm2..xmm7,
+which DOUBLE as ABI argument registers for other parameters — so pre-storing
+param 0 into xmm2 destroyed param 2's still-unconsumed incoming value before
+it was read. constp(a, b, scale) = (a+b)*scale compiled to (a+b)*a (a's home
+xmm2 clobbered scale's ABI xmm2, so the mul read a).
+
+Pre-stores are now emitted in a safe order: greedily any param whose home is
+NOT the ABI register of a still-pending param (string compare of the register
+names). Cycles (home(i)==ABI(j) and home(j)==ABI(i), only with 3+ FP params)
+are broken with a scratch XMM register that is no pending param's home; the
+saved value moves scratch -> home at the end. GPR pre-stores are unaffected
+(callee-saved homes never overlap ABI argument registers).
+
+Caught by the new v12_fp_param regression test. Regression 141 passed /
+0 failed, correctness 50/50, intrinsics 3/3, 597 lib tests.
+---
+ src/backend/x86/codegen/prologue.rs | 106 ++++++++++++++++++++++++----
+ 1 file changed, 93 insertions(+), 13 deletions(-)
+
+diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
+index c3d74e0a..22a9efaf 100644
+--- a/src/backend/x86/codegen/prologue.rs
++++ b/src/backend/x86/codegen/prologue.rs
+@@ -993,6 +993,15 @@ impl X86Codegen {
+             }
+         }
+ 
++        // Deferred FP pre-stores: (param_idx, abi_xmm_idx, home_phys, dest_name, is_f32).
++        // They are emitted AFTER the main loop in an order where a home register
++        // never clobbers an un-consumed ABI argument register — a home may be
++        // xmm2..xmm7, which double as ABI arg registers for other params, and
++        // pre-storing in param order then destroys a later param's incoming
++        // value (observed miscompile: constp(a, b, scale) computed (a+b)*a
++        // because a's home xmm2 clobbered scale's ABI xmm2).
++        let mut fp_prestores: Vec<(usize, usize, PhysReg, &'static str, bool)> = Vec::new();
++
+         for (i, _param) in func.params.iter().enumerate() {
+             let class = param_classes[i];
+ 
+@@ -1037,19 +1046,16 @@ impl X86Codegen {
+                                     self.state.param_pre_stored.insert(i);
+                                     self.param_source_regs.insert(phys_reg.0, X86_ARG_REGS[reg_idx]);
+                                 } else if let ParamClass::FloatReg { reg_idx } = class {
+-                                    // The FP argument arrives in xmm0..xmm7;
+-                                    // move it straight into its allocated XMM
+-                                    // home. movss/movsd are the scalar
+-                                    // xmm->xmm moves (movd/movq are xmm<->GPR
+-                                    // only, which the assembler rejects).
+-                                    let mnemonic = if func.params[i].ty == IrType::F32 {
+-                                        "    movss"
+-                                    } else {
+-                                        "    movsd"
+-                                    };
+-                                    self.state.out.emit_instr_reg_reg(
+-                                        mnemonic, xmm_regs[reg_idx], dest_reg);
+-                                    self.state.param_pre_stored.insert(i);
++                                    // FP pre-store: DEFERRED (see above).
++                                    // Record the ABI register and home so the
++                                    // deferred pass can order them safely.
++                                    fp_prestores.push((
++                                        i,
++                                        reg_idx,
++                                        phys_reg,
++                                        dest_reg,
++                                        func.params[i].ty == IrType::F32,
++                                    ));
+                                 }
+                             }
+                         }
+@@ -1244,6 +1250,80 @@ impl X86Codegen {
+                 ParamClass::ZeroSizeSkip => {}
+             }
+         }
++
++        // Emit the deferred FP pre-stores in a safe order (see the collection
++        // above). Greedy: a param may be pre-stored only when its home register
++        // is not the ABI argument register of any still-pending param — reading
++        // that ABI register later would yield the overwritten home value. Cycles
++        // (home(i) == ABI(j) AND home(j) == ABI(i), only possible with 3+ FP
++        // params whose homes are each other's ABI registers) are broken with a
++        // scratch XMM register that is no pending param's home.
++        if !fp_prestores.is_empty() {
++            // (param_idx, abi_idx, home_phys, dest_name, is_f32)
++            let mut pending: Vec<(usize, usize, PhysReg, &'static str, bool)> = fp_prestores;
++            // (dest_name, is_f32, scratch_name)
++            let mut scratch_saves: Vec<(&'static str, bool, &'static str)> = Vec::new();
++            while !pending.is_empty() {
++                let mut progressed = false;
++                let mut remaining: Vec<(usize, usize, PhysReg, &'static str, bool)> = Vec::new();
++                for cand in &pending {
++                    let (i, abi_idx, _home, dest, is_f32) = *cand;
++                    // Unsafe if the home register IS the ABI argument register
++                    // of a DIFFERENT pending param (reading that ABI register
++                    // later would yield the overwritten home value). Compare
++                    // names: the home is xmm2..xmm15, ABI args are xmm0..xmm7.
++                    let clobbers = pending.iter().any(|&(j, j_abi, _, _, _)| {
++                        j != i && dest == xmm_regs[j_abi]
++                    });
++                    if !clobbers {
++                        let mnemonic = if is_f32 { "    movss" } else { "    movsd" };
++                        self.state.out.emit_instr_reg_reg(mnemonic, xmm_regs[abi_idx], dest);
++                        self.state.param_pre_stored.insert(i);
++                        progressed = true;
++                    } else {
++                        remaining.push(*cand);
++                    }
++                }
++                if !progressed {
++                    // Cycle: save the first pending param's ABI value to a
++                    // scratch XMM register (no pending param's home), so its
++                    // ABI register is free for the others; the scratch value
++                    // moves to its home at the very end.
++                    let (i, abi_idx, home, dest, is_f32) = pending[0];
++                    let scratch = {
++                        let mut s: Option<&'static str> = None;
++                        for r in (26u8..=33).rev() {
++                            let name = phys_reg_name(PhysReg(r));
++                            if pending.iter().all(|&(_, _, h, _, _)| h.0 != r) {
++                                s = Some(name);
++                                break;
++                            }
++                        }
++                        s
++                    };
++                    if let Some(scratch) = scratch {
++                        let mnemonic = if is_f32 { "    movss" } else { "    movsd" };
++                        self.state.out.emit_instr_reg_reg(mnemonic, xmm_regs[abi_idx], scratch);
++                        self.state.param_pre_stored.insert(i);
++                        scratch_saves.push((dest, is_f32, scratch));
++                        let _ = home;
++                        pending.remove(0);
++                    } else {
++                        // Degenerate (every XMM is a pending home): emit directly.
++                        let mnemonic = if is_f32 { "    movss" } else { "    movsd" };
++                        self.state.out.emit_instr_reg_reg(mnemonic, xmm_regs[abi_idx], dest);
++                        self.state.param_pre_stored.insert(i);
++                        pending.remove(0);
++                    }
++                } else {
++                    pending = remaining;
++                }
++            }
++            for (dest, is_f32, scratch) in scratch_saves {
++                let mnemonic = if is_f32 { "    movss" } else { "    movsd" };
++                self.state.out.emit_instr_reg_reg(mnemonic, scratch, dest);
++            }
++        }
+     }
+ 
+     pub(super) fn emit_param_ref_impl(&mut self, dest: &Value, param_idx: usize, ty: IrType) {
+-- 
+2.47.3
+
+
+From 77209500a6ccbdb7b72374ad5ad0fd3aba056eb0 Mon Sep 17 00:00:00 2001
+From: lccc-v12 <v12@localhost>
+Date: Fri, 14 Aug 2026 00:33:12 +0000
+Subject: [PATCH 4/6] v12: exhaustive regression tests (peepholes, IR, codegen,
+ FP, SIMD-adjacent)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Seven new differential tests closing the coverage gaps this session's work
+touched (regression suite 134 -> 141):
+
+- v12_flat_short_circuit: flat short-circuit lowering — every nesting shape
+  (flat, mixed &&/||, parens), constants in every position, observable
+  side effects in every operand slot, eval-order/stop-at-first-decisive.
+- v12_range_fold_edges: range-fold + compare-narrowing edge cases (span 0,
+  span 255, lo 0, hi 255, signed byte, u16, non-narrowable spans).
+- v12_alu_peepholes: LEA strength reduction (x*3/5/9), mul/div/mod by
+  constants (signed+unsigned, +/- divisors), identities (x*0, x-x, x&0, ...),
+  mul-add fusion, INT_MIN/INT_MAX edges.
+- v12_bitops: popcount/clz/ctz/ffs/parity/bswap16/32/64 builtins over
+  undefined-input edge values.
+- v12_fp_param: runtime FP parameter XMM allocation (F32/F64, 4+ params,
+  mixed FP/int), exposed the FP-param pre-store ordering miscompile.
+- v12_dead_param: dead parameter store elimination (unused + constant-folded
+  params, FP and int).
+- v12_alu_chains: GPR simple-ALU LHS hints + fused compare-to-branch chains
+  over wrap-sensitive edges.
+
+All bit-exact vs GCC.
+---
+ tests/regression/v12_alu_chains.c         | 59 ++++++++++++++
+ tests/regression/v12_alu_peepholes.c      | 93 +++++++++++++++++++++++
+ tests/regression/v12_bitops.c             | 51 +++++++++++++
+ tests/regression/v12_dead_param.c         | 28 +++++++
+ tests/regression/v12_flat_short_circuit.c | 71 +++++++++++++++++
+ tests/regression/v12_fp_param.c           | 55 ++++++++++++++
+ tests/regression/v12_fp_param.flags       |  1 +
+ tests/regression/v12_range_fold_edges.c   | 57 ++++++++++++++
+ 8 files changed, 415 insertions(+)
+ create mode 100644 tests/regression/v12_alu_chains.c
+ create mode 100644 tests/regression/v12_alu_peepholes.c
+ create mode 100644 tests/regression/v12_bitops.c
+ create mode 100644 tests/regression/v12_dead_param.c
+ create mode 100644 tests/regression/v12_flat_short_circuit.c
+ create mode 100644 tests/regression/v12_fp_param.c
+ create mode 100644 tests/regression/v12_fp_param.flags
+ create mode 100644 tests/regression/v12_range_fold_edges.c
+
+diff --git a/tests/regression/v12_alu_chains.c b/tests/regression/v12_alu_chains.c
 new file mode 100644
-index 00000000..0ae8cc3c
+index 00000000..7bc44294
 --- /dev/null
-+++ b/tests/regression/v11_cmp_narrowing.c
-@@ -0,0 +1,71 @@
++++ b/tests/regression/v12_alu_chains.c
+@@ -0,0 +1,59 @@
 +/*
-+ * v11 regression: comparison narrowing + the U32 operand cast-type fix.
-+ *
-+ * `Cmp(op, Cast(x, T->W), C, W)` narrows to `Cmp(op, x, C', T)` when the
-+ * extension preserves op's ordering and C fits in T, so a promoted byte is
-+ * compared at its native width (cmpb/testb) instead of widening — GCC/ICX's
-+ * byte-compare shape. The cast-type fix removes the identity Cast(U32->U32)
-+ * that was mislabeled I64->U32 and emitted a spurious `mov` per operand.
-+ *
-+ * Differential vs GCC across all byte values and INT/LLONG edges.
++ * v12 regression: GPR simple-ALU LHS register hints (v11) and the fused
++ * compare-to-branch chain (v9/v11). Behavioral coverage of the patterns
++ * those codegen paths rewrite, over wrap-sensitive edge values:
++ *   x - lo (range bias), x + y + z, x & m | o, x ^ c, x * k + y chains,
++ *   and the Cmp -> Cast -> branch shape in loop conditions.
 + */
 +#include <stdio.h>
 +#include <limits.h>
 +
-+static int lt80(unsigned char c) { return c < 0x80U; }
-+static int az(unsigned char c) { return c >= 'a' && c <= 'z'; }
-+static int azAZ(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
-+static int digit(unsigned char c) { return c >= '0' && c <= '9'; }
-+static int u16lt(unsigned short s) { return s < 500u; }
-+static int u16ge(unsigned short s) { return s >= 60000u; }
-+static int sc_pos(signed char c) { return c < 5; }
-+static int sc_range(signed char c) { return c >= -5 && c <= 5; }
-+static int eq200(unsigned char c) { return c == 200u; }
-+static int ne7(unsigned char c) { return c != 7u; }
-+static int ge200(unsigned char c) { return c >= 200u; }
-+static int u32lt(unsigned int x) { return x < 0x80u; }      /* NOT narrowable past U32 */
-+static int u32big(unsigned int x) { return x < 0x80000000u; }
-+static int short_pos(short s) { return s > 100; }
-+static int int_cmp(int x) { return x < 128; }               /* I32: no narrowing */
++static unsigned bias(unsigned char c) { return (unsigned)c - 97; }
++static int chainadd(int a, int b, int c) { return a + b + c; }
++static int chainsub(int a, int b, int c) { return a - b - c; }
++static int chainmix(int a, int b, int c) { return (a + b) * (c - a); }
++static unsigned maskor(unsigned x) { return (x & 0xff00u) | 0x55u; }
++static unsigned maskxor(unsigned x) { return (x & 0xffffu) ^ 0xaaaa; }
++
++static int loop_cond(int n, int step) {
++    int i, acc = 0;
++    for (i = 0; i < n; i += step) acc += i & 7;
++    return acc;
++}
++static int nested_cond(int n) {
++    int i, j, acc = 0;
++    for (i = 0; i < n; i++)
++        for (j = i; j < n; j++)
++            acc += (i ^ j) & 3;
++    return acc;
++}
 +
 +static unsigned long long mix(unsigned long long h, unsigned long long v) {
 +    return (h ^ v) * 0x9e3779b97f4a7c15ULL + 0xdeadbeefULL;
@@ -787,35 +564,421 @@ index 00000000..0ae8cc3c
 +    unsigned long long h = 1469598103934665603ULL;
 +    int c;
 +    for (c = 0; c <= 255; c++) {
-+        h = mix(h, (unsigned)lt80((unsigned char)c));
-+        h = mix(h, (unsigned)az((unsigned char)c));
-+        h = mix(h, (unsigned)azAZ((unsigned char)c));
-+        h = mix(h, (unsigned)digit((unsigned char)c));
-+        h = mix(h, (unsigned)sc_pos((signed char)(c - 128)));
-+        h = mix(h, (unsigned)sc_range((signed char)(c - 128)));
-+        h = mix(h, (unsigned)eq200((unsigned char)c));
-+        h = mix(h, (unsigned)ne7((unsigned char)c));
-+        h = mix(h, (unsigned)ge200((unsigned char)c));
++        h = mix(h, (unsigned)bias((unsigned char)c));
++        h = mix(h, (unsigned)chainadd(c, c - 5, c * 3));
++        h = mix(h, (unsigned)chainsub(c, c - 5, 3));
++        h = mix(h, (unsigned)chainmix(c, c - 5, c + 7));
++        h = mix(h, (unsigned)maskor((unsigned)c * 257));
++        h = mix(h, (unsigned)maskxor((unsigned)c * 257));
 +    }
-+    unsigned short s;
-+    for (s = 0; s < 4096; s += 97) {
-+        h = mix(h, (unsigned)u16lt(s));
-+        h = mix(h, (unsigned)u16ge(s));
-+        h = mix(h, (unsigned)short_pos((short)(s - 2048)));
-+    }
++    h = mix(h, (unsigned)loop_cond(1000, 3));
++    h = mix(h, (unsigned)loop_cond(1000, 7));
++    h = mix(h, (unsigned)nested_cond(60));
 +    {
-+        static const unsigned int xs[] = { 0, 1, 127, 128, 255, 0x7fffffffu, 0x80000000u, 0xffffffffu };
++        static const int xs[] = { INT_MIN, INT_MIN + 1, -1, 0, 1, 2, INT_MAX - 1, INT_MAX };
 +        unsigned n;
 +        for (n = 0; n < sizeof(xs) / sizeof(xs[0]); n++) {
-+            h = mix(h, (unsigned)u32lt(xs[n]));
-+            h = mix(h, (unsigned)u32big(xs[n]));
++            h = mix(h, (unsigned)chainadd(xs[n], 5, -3));
++            h = mix(h, (unsigned)chainsub(xs[n], -5, 3));
 +        }
 +    }
++    printf("%llu\n", (unsigned long long)h);
++    return 0;
++}
+diff --git a/tests/regression/v12_alu_peepholes.c b/tests/regression/v12_alu_peepholes.c
+new file mode 100644
+index 00000000..2ce01ed2
+--- /dev/null
++++ b/tests/regression/v12_alu_peepholes.c
+@@ -0,0 +1,93 @@
++/*
++ * v12 regression: ALU peepholes and strength reduction.
++ *
++ * Exercised patterns (behavioral, differential vs GCC): LEA strength
++ * reduction for x*3/x*5/x*9, mul/div/mod by powers of two, division and
++ * modulo by constants (signed + unsigned, positive + negative divisors),
++ * x*1/x*0/x+0/x-0/x-x/x&0/x|0/x^x identities, and the mul-add fusion shape.
++ * Edge values include INT_MIN/INT_MAX and every byte.
++ */
++#include <stdio.h>
++#include <limits.h>
++
++static int mul3(int x) { return x * 3; }
++static int mul5(int x) { return x * 5; }
++static int mul9(int x) { return x * 9; }
++static int mul7(int x) { return x * 7; }        /* not a lea form */
++static int mul1(int x) { return x * 1; }
++static int mul0(int x) { return x * 0; }
++static int add0(int x) { return x + 0; }
++static int sub0(int x) { return x - 0; }
++static int subself(int x) { return x - x; }
++static int and0(int x) { return x & 0; }
++static int andall(int x) { return x & -1; }
++static int or0(int x) { return x | 0; }
++static int xor0(int x) { return x ^ 0; }
++static int xorx(int x) { return x ^ x; }
++
++static int sdiv3(int x) { return x / 3; }
++static int sdivm3(int x) { return x / -3; }
++static int srem3(int x) { return x % 3; }
++static unsigned udiv3(unsigned x) { return x / 3; }
++static unsigned urem3(unsigned x) { return x % 3; }
++static unsigned udiv5(unsigned x) { return x / 5; }
++static unsigned udiv17(unsigned x) { return x / 17; }
++static int sdiv10(int x) { return x / 10; }
++static int sdivm10(int x) { return x / -10; }
++static unsigned long long udiv7ull(unsigned long long x) { return x / 7; }
++
++/* mul-add fusion shape */
++static int fma_shape(int x, int y) { return x * 3 + y; }
++
++static unsigned long long mix(unsigned long long h, unsigned long long v) {
++    return (h ^ v) * 0x9e3779b97f4a7c15ULL + 0xdeadbeefULL;
++}
++
++int main(void) {
++    unsigned long long h = 1469598103934665603ULL;
++    int c;
++    for (c = 0; c <= 255; c++) {
++        int v = c - 128;
++        h = mix(h, (unsigned)mul3(v));
++        h = mix(h, (unsigned)mul5(v));
++        h = mix(h, (unsigned)mul9(v));
++        h = mix(h, (unsigned)mul7(v));
++        h = mix(h, (unsigned)mul1(v));
++        h = mix(h, (unsigned)mul0(v));
++        h = mix(h, (unsigned)add0(v));
++        h = mix(h, (unsigned)sub0(v));
++        h = mix(h, (unsigned)subself(v));
++        h = mix(h, (unsigned)and0(v));
++        h = mix(h, (unsigned)andall(v));
++        h = mix(h, (unsigned)or0(v));
++        h = mix(h, (unsigned)xor0(v));
++        h = mix(h, (unsigned)xorx(v));
++        h = mix(h, (unsigned)sdiv3(v));
++        h = mix(h, (unsigned)sdivm3(v));
++        h = mix(h, (unsigned)srem3(v));
++        h = mix(h, (unsigned)udiv3((unsigned)v));
++        h = mix(h, (unsigned)urem3((unsigned)v));
++        h = mix(h, (unsigned)udiv5((unsigned)v));
++        h = mix(h, (unsigned)udiv17((unsigned)v));
++        h = mix(h, (unsigned)sdiv10(v));
++        h = mix(h, (unsigned)sdivm10(v));
++        h = mix(h, (unsigned)fma_shape(v, v + 1));
++    }
 +    {
-+        static const int is[] = { INT_MIN, -129, -128, -1, 0, 127, 128, 129, INT_MAX };
++        static const int xs[] = { INT_MIN, INT_MIN + 1, -1000003, -1, 0, 1, 2, 999983, INT_MAX - 1, INT_MAX };
 +        unsigned n;
-+        for (n = 0; n < sizeof(is) / sizeof(is[0]); n++)
-+            h = mix(h, (unsigned)int_cmp(is[n]));
++        for (n = 0; n < sizeof(xs) / sizeof(xs[0]); n++) {
++            h = mix(h, (unsigned)sdiv3(xs[n]));
++            h = mix(h, (unsigned)sdivm3(xs[n]));
++            h = mix(h, (unsigned)srem3(xs[n]));
++            h = mix(h, (unsigned)sdiv10(xs[n]));
++            h = mix(h, (unsigned)sdivm10(xs[n]));
++            h = mix(h, (unsigned)mul3(xs[n]));
++        }
++        static const unsigned long long ys[] = { 0, 1, 7, 0xffffffffffffffffULL, 0x8000000000000000ULL, 1234567890123456789ULL };
++        for (n = 0; n < sizeof(ys) / sizeof(ys[0]); n++)
++            h = mix(h, (unsigned long long)udiv7ull(ys[n]));
++    }
++    printf("%llu\n", (unsigned long long)h);
++    return 0;
++}
+diff --git a/tests/regression/v12_bitops.c b/tests/regression/v12_bitops.c
+new file mode 100644
+index 00000000..7d3c6cbc
+--- /dev/null
++++ b/tests/regression/v12_bitops.c
+@@ -0,0 +1,51 @@
++/*
++ * v12 regression: bit-manipulation builtins (popcount, clz, ctz, ffs,
++ * parity, bswap) over edge values, including the undefined-input cases the
++ * codegen must handle deterministically (clz/ctz of 0, parity of 0).
++ * Differential vs GCC.
++ */
++#include <stdio.h>
++#include <limits.h>
++
++static int pc(unsigned x) { return __builtin_popcount(x); }
++static int pcl(unsigned long x) { return __builtin_popcountl(x); }
++static int pcll(unsigned long long x) { return __builtin_popcountll(x); }
++static int clz(unsigned x) { return __builtin_clz(x); }
++static int ctz(unsigned x) { return __builtin_ctz(x); }
++static int ffs_(int x) { return __builtin_ffs(x); }
++static int par(unsigned x) { return __builtin_parity(x); }
++static unsigned b16(unsigned short x) { return __builtin_bswap16(x); }
++static unsigned b32(unsigned x) { return __builtin_bswap32(x); }
++static unsigned long long b64(unsigned long long x) { return __builtin_bswap64(x); }
++
++static unsigned long long mix(unsigned long long h, unsigned long long v) {
++    return (h ^ v) * 0x9e3779b97f4a7c15ULL + 0xdeadbeefULL;
++}
++
++int main(void) {
++    unsigned long long h = 1469598103934665603ULL;
++    {
++        static const unsigned xs[] = { 0, 1, 2, 3, 4, 0x7fffffff, 0x80000000, 0x80000001,
++            0xaaaaaaaa, 0x55555555, 0xffffffff };
++        unsigned n;
++        for (n = 0; n < sizeof(xs) / sizeof(xs[0]); n++) {
++            h = mix(h, (unsigned)pc(xs[n]));
++            h = mix(h, (unsigned)clz(xs[n]));
++            h = mix(h, (unsigned)ctz(xs[n]));
++            h = mix(h, (unsigned)ffs_((int)xs[n]));
++            h = mix(h, (unsigned)par(xs[n]));
++            h = mix(h, (unsigned)b32(xs[n]));
++        }
++        static const unsigned long long ys[] = { 0, 1, 0x8000000000000000ULL,
++            0xffffffffffffffffULL, 0x123456789abcdef0ULL, 0x00ff00ff00ff00ffULL };
++        for (n = 0; n < sizeof(ys) / sizeof(ys[0]); n++) {
++            h = mix(h, (unsigned long long)pcll(ys[n]));
++            h = mix(h, (unsigned long long)b64(ys[n]));
++        }
++    }
++    unsigned short s;
++    for (s = 0; s < 4096; s += 53)
++        h = mix(h, (unsigned)b16(s));
++    printf("%llu\n", (unsigned long long)h);
++    return 0;
++}
+diff --git a/tests/regression/v12_dead_param.c b/tests/regression/v12_dead_param.c
+new file mode 100644
+index 00000000..3ee417c2
+--- /dev/null
++++ b/tests/regression/v12_dead_param.c
+@@ -0,0 +1,28 @@
++/*
++ * v12 regression: dead parameter store elimination (v11).
++ *
++ * A parameter that is constant-propagated away at the call site, or a
++ * parameter that is simply unused by the body, must not corrupt the values
++ * that ARE used. Covers unused/constant FP and int params, and the
++ * interaction with multiple params sharing the frame.
++ */
++#include <stdio.h>
++
++__attribute__((noinline)) static int use_one(int used, int unused) { return used * 3; }
++__attribute__((noinline)) static int use_none(int a, int b) { (void)a; (void)b; return 42; }
++__attribute__((noinline)) static double constfp(double unused_scale) { (void)unused_scale; return 7.5; }
++__attribute__((noinline)) static double foldfp(double dt) { return dt * 2.0; }  /* call site passes a constant */
++__attribute__((noinline)) static int mixed(int a, double x, int b) { return a + b + (int)x; }
++
++int main(void) {
++    int r = 0, i;
++    for (i = 0; i < 100000; i++) {
++        r += use_one(i, i + 1000);
++        r += use_none(i, i);
++        r += (int)constfp(123.0);
++        r += (int)foldfp(0.5);      /* constant argument */
++        r += mixed(i, 2.5, i + 1);
++    }
++    printf("%d\n", r);
++    return 0;
++}
+diff --git a/tests/regression/v12_flat_short_circuit.c b/tests/regression/v12_flat_short_circuit.c
+new file mode 100644
+index 00000000..3be4af3c
+--- /dev/null
++++ b/tests/regression/v12_flat_short_circuit.c
+@@ -0,0 +1,71 @@
++/*
++ * v12 regression: flat short-circuit lowering.
++ *
++ * a || b || c and a && b && c must keep C's left-to-right short-circuit
++ * evaluation order, stop at the first decisive operand, and produce 0/1 —
++ * for every nesting shape (flat, mixed &&/||, parens), with constants in
++ * every position and observable global side effects.
++ */
++#include <stdio.h>
++
++static int counter;
++static int bump(void) { counter++; return counter & 3; }     /* 1,2,3,0,1,2,3,0,... */
++static int never(void) { counter += 100; return 0; }
++static int always(void) { counter += 1000; return 1; }
++
++static int or3(int a, int b, int c) { return a || b || c; }
++static int and3(int a, int b, int c) { return a && b && c; }
++static int or4(int a, int b, int c, int d) { return a || b || c || d; }
++static int mixed(int a, int b, int c) { return a || (b && c); }
++static int mixed2(int a, int b, int c) { return (a && b) || c; }
++static int mixed3(int a, int b, int c) { return a && (b || c); }
++static int mixed4(int a, int b, int c) { return (a || b) && c; }
++
++/* constants in every position */
++static int c1(int x) { return 1 || x; }            /* true, no eval of x */
++static int c2(int x) { return 0 || x; }            /* == bool(x) */
++static int c3(int x) { return x || 1; }            /* eval x, then 1 */
++static int c4(int x) { return x || 0; }            /* == bool(x) */
++static int c5(int x) { return 0 && x; }
++static int c6(int x) { return 1 && x; }
++static int c7(int x) { return x && 0; }
++static int c8(int x) { return x && 1; }
++static int c9(int x) { return 0 || 0 || x || 1; }  /* leading 0s dropped, trailing 1 */
++static int c10(int x) { return 1 && 1 && x && 0; } /* leading 1s dropped, trailing 0 */
++
++/* side-effecting operands in every position */
++static int s1(void) { return 0 || bump() || never(); }
++static int s2(void) { return 1 && bump() && never(); }
++static int s3(void) { return bump() || bump() || bump(); }
++static int s4(void) { return never() || always() || never(); }
++static int s5(void) { return bump() && (bump() || always()); }
++
++static int seq;
++static int tick(void) { return ++seq; }
++static int seq_or(int n) { return (tick() || tick() || tick()) + n; }  /* only 1st tick runs */
++
++int main(void) {
++    int r = 0;
++    r += or3(0, 0, 0); r += or3(0, 0, 1); r += or3(0, 1, 0); r += or3(1, 0, 0);
++    r += and3(0, 0, 0); r += and3(1, 1, 1); r += and3(1, 1, 0); r += and3(0, 1, 1);
++    r += or4(0, 0, 0, 1); r += or4(0, 0, 0, 0);
++    r += mixed(0, 1, 1); r += mixed(1, 0, 0); r += mixed(0, 1, 0);
++    r += mixed2(1, 1, 0); r += mixed2(0, 0, 1); r += mixed2(0, 0, 0);
++    r += mixed3(1, 0, 0); r += mixed3(1, 1, 0); r += mixed3(0, 1, 1);
++    r += mixed4(1, 1, 1); r += mixed4(0, 1, 1); r += mixed4(1, 0, 1);
++
++    counter = 0;
++    r += c1(bump()); r += c2(bump()); r += c3(bump()); r += c4(bump());
++    r += c5(bump()); r += c6(bump()); r += c7(bump()); r += c8(bump());
++    r += c9(bump()); r += c10(bump());
++    printf("%d %d\n", r, counter);
++
++    counter = 0;
++    r = s1() + s2() + s3() + s4() + s5();
++    printf("%d %d\n", r, counter);
++
++    seq = 0;
++    r = seq_or(100);
++    printf("%d %d\n", r, seq);
++    return 0;
++}
+diff --git a/tests/regression/v12_fp_param.c b/tests/regression/v12_fp_param.c
+new file mode 100644
+index 00000000..35ffe87f
+--- /dev/null
++++ b/tests/regression/v12_fp_param.c
+@@ -0,0 +1,55 @@
++/*
++ * v12 regression: runtime FP parameter register allocation (v11).
++ *
++ * Hot call-free functions with F32/F64 parameters must keep them in XMM
++ * registers (no slot round-trips) AND produce bit-identical results. Also
++ * covers mixed FP/int params, more params than XMM arg registers, and the
++ * dead-param store elimination (constant-folded / unused params).
++ */
++#include <stdio.h>
++#include <math.h>
++
++__attribute__((noinline)) static double dot(double a, double b, int n) {
++    double s = 0.0;
++    int i;
++    for (i = 0; i < n; i++) s += a * a + b * b + a * b;
++    return s;
++}
++__attribute__((noinline)) static float dotf(float a, float b, int n) {
++    float s = 0.0f;
++    int i;
++    for (i = 0; i < n; i++) s += a * a + b * b;
++    return s;
++}
++__attribute__((noinline)) static double four(double a, double b, double c, double d) {
++    return (a + b) * (c + d) - (a - b) * (c - d);
++}
++__attribute__((noinline)) static double mixp(double a, int n, double b, float f) {
++    double s = 0.0;
++    int i;
++    for (i = 0; i < n; i++) s += a * (double)f + b;
++    return s;
++}
++/* constant parameter at the call site: the entry spill must be eliminated */
++__attribute__((noinline)) static double constp(double a, double b, double scale) {
++    return (a + b) * scale;
++}
++
++int main(void) {
++    double x = 1.5, r = 0.0;
++    int i;
++    for (i = 0; i < 200000; i++) {
++        x += 1e-9;
++        r += dot(x, 2.5, 8);
++    }
++    float xf = 1.5f, rf = 0.0f;
++    for (i = 0; i < 200000; i++) {
++        xf += 1e-6f;
++        rf += dotf(xf, 2.5f, 8);
++    }
++    r += four(1.0, 2.0, 3.0, 4.0);
++    r += mixp(1.25, 16, 2.5, 0.5f);
++    r += constp(3.0, 4.0, 0.5) + constp(5.0, 6.0, 1.0);
++    printf("%.9f %.9f\n", r, (double)rf);
++    return 0;
++}
+diff --git a/tests/regression/v12_fp_param.flags b/tests/regression/v12_fp_param.flags
+new file mode 100644
+index 00000000..9edbe676
+--- /dev/null
++++ b/tests/regression/v12_fp_param.flags
+@@ -0,0 +1 @@
++-lm
+diff --git a/tests/regression/v12_range_fold_edges.c b/tests/regression/v12_range_fold_edges.c
+new file mode 100644
+index 00000000..ddcfde1d
+--- /dev/null
++++ b/tests/regression/v12_range_fold_edges.c
+@@ -0,0 +1,57 @@
++/*
++ * v12 regression: range-fold + compare-narrowing edge cases.
++ *
++ * Span 0 (x == c), full-range (span 255), lo == 0, hi == 255, signed byte
++ * ranges, unsigned short ranges, and ranges that do NOT narrow (span too
++ * wide). Exhaustive over byte values and edge values for wider types.
++ */
++#include <stdio.h>
++#include <limits.h>
++
++static int span0(unsigned char c) { return c >= 97 && c <= 97; }        /* == c */
++static int fullbyte(unsigned char c) { return c >= 0 && c <= 255; }    /* always 1 */
++static int lo0(unsigned char c) { return c >= 0 && c <= 10; }          /* c <= 10 */
++static int hi255(unsigned char c) { return c >= 200 && c <= 255; }
++static int span255(unsigned char c) { return c >= 0 && c <= 255; }
++static int signbyte(signed char c) { return c >= -5 && c <= 5; }
++static int signbyte2(signed char c) { return c >= -128 && c <= 127; }
++static int ushortrange(unsigned short c) { return c >= 50000u && c <= 50025u; }
++static int ushortwide(unsigned short c) { return c >= 0u && c <= 60000u; }
++static int wide32(unsigned c) { return c >= 0u && c <= 0x7fffffffu; }
++static int signbyte_or(signed char c) { return c < -5 || c > 5; }
++static int u8or(unsigned char c) { return c < 10 || c > 200; }
++
++static unsigned long long mix(unsigned long long h, unsigned long long v) {
++    return (h ^ v) * 0x9e3779b97f4a7c15ULL + 0xdeadbeefULL;
++}
++
++int main(void) {
++    unsigned long long h = 1469598103934665603ULL;
++    int c;
++    for (c = 0; c <= 255; c++) {
++        unsigned char u = (unsigned char)c;
++        signed char s = (signed char)(c - 128);
++        h = mix(h, (unsigned)span0(u));
++        h = mix(h, (unsigned)fullbyte(u));
++        h = mix(h, (unsigned)lo0(u));
++        h = mix(h, (unsigned)hi255(u));
++        h = mix(h, (unsigned)span255(u));
++        h = mix(h, (unsigned)signbyte(s));
++        h = mix(h, (unsigned)signbyte2(s));
++        h = mix(h, (unsigned)signbyte_or(s));
++        h = mix(h, (unsigned)u8or(u));
++    }
++    unsigned short s;
++    for (s = 0; s < 4096; s += 17) {
++        h = mix(h, (unsigned)ushortrange(s * 16u));
++        h = mix(h, (unsigned)ushortwide(s * 16u));
++    }
++    {
++        static const unsigned xs[] = { 0, 1, 0x7fffffffu, 0x80000000u, 0xfffffffeu, 0xffffffffu };
++        unsigned n;
++        for (n = 0; n < sizeof(xs) / sizeof(xs[0]); n++)
++            h = mix(h, (unsigned)wide32(xs[n]));
 +    }
 +    printf("%llu\n", (unsigned long long)h);
 +    return 0;
@@ -824,89 +987,611 @@ index 00000000..0ae8cc3c
 2.47.3
 
 
-From ba32d156f96c107fc32c3c5da03c40aa489687e4 Mon Sep 17 00:00:00 2001
-From: lccc-v11 <v11@localhost>
-Date: Thu, 13 Aug 2026 23:58:40 +0000
-Subject: [PATCH 2/2] =?UTF-8?q?v11:=20audit=20=E2=80=94=20ICC/ICX=20distil?=
- =?UTF-8?q?ls=20delivered,=20updated=20roadmap?=
+From fe4ef006c14e8e6a563756306dfeeacae14aaabb Mon Sep 17 00:00:00 2001
+From: lccc-v12 <v12@localhost>
+Date: Fri, 14 Aug 2026 01:02:35 +0000
+Subject: [PATCH 5/6] v12: loop-carried accumulator reassociation (ICC's
+ Adler-32 chain break)
+
+sum1 += b[i]; sum2 += sum1; forms a serial chain: every sum2 step depends
+on the matching sum1 step, so the two loop-carried chains cannot overlap and
+the loop is latency-bound. For UNSIGNED accumulation the additions are
+associative mod 2^n, so an N-step unroll has the exact closed form
+
+    sum1' = sum1 + sum b[i]
+    sum2' = sum2 + N*sum1 + sum (N-i)*b[i]
+
+which recomputes sum2' directly from the OLD sum1 and the byte loads, breaking
+the serial dependency (ICC's 4-register rotation). The weighted byte terms are
+independent so the hardware pipelines them.
+
+Detection is conservative: only U32/U64 Add chains (signed would be UB on
+overflow); the accumulator is the LHS of its add (the sum2 add has it as RHS,
+disambiguating the two chains); the byte operand is never a phi; adler_N and
+sum2_N must be phi incoming values (loop-carried). Coefficients are shifts for
+powers of two, else multiplies that the backend strength-reduces.
+
+Measured: zlib_ng_adler32 1.73x -> 1.57x. Regression 141 passed / 0 failed,
+correctness 50/50, intrinsics 3/3. New test v12_reassoc_accum (unroll 8/16,
+U32/U64, wraparound stress, signed non-reassoc).
+---
+ src/passes/mod.rs                    |  16 ++
+ src/passes/reassoc_accum.rs          | 371 +++++++++++++++++++++++++++
+ tests/regression/v12_reassoc_accum.c |  87 +++++++
+ 3 files changed, 474 insertions(+)
+ create mode 100644 src/passes/reassoc_accum.rs
+ create mode 100644 tests/regression/v12_reassoc_accum.c
+
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index f6e26904..949bd40a 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -28,6 +28,7 @@ pub(crate) mod loop_unroll;
+ pub(crate) mod narrow;
+ pub(crate) mod outline_switch;
+ pub(crate) mod range_check;
++pub(crate) mod reassoc_accum;
+ pub(crate) mod recursion_to_iter;
+ mod resolve_asm;
+ pub(crate) mod simplify;
+@@ -690,6 +691,21 @@ macro_rules! preloop_dump {
+             total_changes_excl_dce += n;
+         }
+ 
++        // Phase 3b: Loop-carried accumulator reassociation.
++        // `sum1 += b[i]; sum2 += sum1;` (unsigned) is reassociated into the
++        // closed form sum2' = sum2 + N*sum1 + Σ (N-i)*b[i], breaking the serial
++        // dependency between the two chains (ICC's Adler-32 rotation). Idempotent
++        // (the pattern no longer matches after the rewrite). Pass name for
++        // CCC_DISABLE_PASSES: "reassoc_accum".
++        if !disabled.contains("reassoc_accum") {
++            let n = timed_pass!(
++                "reassoc_accum",
++                run_on_visited(module, &dirty, &mut changed, reassoc_accum::run_function)
++            );
++            total_changes += n;
++            total_changes_excl_dce += n;
++        }
++
+         // Phase 4: Constant folding
+         // Upstream: copy_prop (propagated constants), narrow, simplify (reduced exprs),
+         //           if_convert (creates Select that constfold can fold with known-constant cond),
+diff --git a/src/passes/reassoc_accum.rs b/src/passes/reassoc_accum.rs
+new file mode 100644
+index 00000000..1763e30b
+--- /dev/null
++++ b/src/passes/reassoc_accum.rs
+@@ -0,0 +1,371 @@
++//! Loop-carried accumulator reassociation (ICC's Adler-32 chain break).
++//!
++//! `sum1 += b[i]; sum2 += sum1;` forms a serial chain: every `sum2 += sum1`
++//! step depends on the matching `sum1 += b[i]` step, so the two loop-carried
++//! chains cannot overlap and the loop is latency-bound (one add per byte on
++//! the critical path, plus the load latency).
++//!
++//! For UNSIGNED accumulation the additions are associative modulo 2^n (no
++//! overflow UB), so an N-step unroll has the exact closed form
++//!
++//!     sum1' = sum1 + Σᵢ b[i]
++//!     sum2' = sum2 + N·sum1 + Σᵢ (N−i)·b[i]
++//!
++//! which recomputes `sum2'` directly from the OLD `sum1` and the byte loads —
++//! breaking the serial dependency between the two chains (ICC's 4-register
++//! rotation for zlib's Adler-32). The weighted byte terms are independent, so
++//! the hardware pipelines them; the only remaining serial links are the two
++//! loop-carried phi values.
++//!
++//! Soundness: only U32/U64 `Add` chains are transformed (signed addition would
++//! be UB on overflow); the adler chain is left untouched (it is already the
++//! optimal linear accumulation); every coefficient multiply is by a small
++//! constant that the backend strength-reduces (imul/lea/shift).
++//!
++//! Pass name for CCC_DISABLE_PASSES: "reassoc_accum".
++
++use crate::common::fx_hash::FxHashMap;
++use crate::common::types::IrType;
++use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
++
++/// Whether `ty` is an unsigned integer type eligible for reassociation.
++fn is_unsigned_add_ty(ty: IrType) -> bool {
++    matches!(ty, IrType::U32 | IrType::U64)
++}
++
++fn int_const(ty: IrType, v: i64) -> IrConst {
++    if ty == IrType::U32 {
++        IrConst::I32(v as i32)
++    } else {
++        IrConst::I64(v)
++    }
++}
++
++/// Call `f` for every Value used as an Add operand in `inst`.
++fn for_each_add_operand(inst: &Instruction, mut f: impl FnMut(u32)) {
++    if let Instruction::BinOp {
++        op: IrBinOp::Add,
++        lhs,
++        rhs,
++        ..
++    } = inst
++    {
++        if let Operand::Value(l) = lhs {
++            f(l.0);
++        }
++        if let Operand::Value(r) = rhs {
++            f(r.0);
++        }
++    }
++}
++
++/// Run the reassociation over one function. Returns the number of rewrites.
++pub(crate) fn run_function(func: &mut IrFunction) -> usize {
++    // Function-wide use map: value -> (block_idx, inst_idx) of every Add that
++    // consumes it. The accumulator chains live in the loop BODY block while
++    // the phis live in the header, so the walk must cross blocks.
++    let mut uses: FxHashMap<u32, Vec<(usize, usize)>> = FxHashMap::default();
++    for (bi, block) in func.blocks.iter().enumerate() {
++        for (ii, inst) in block.instructions.iter().enumerate() {
++            for_each_add_operand(inst, |v| {
++                uses.entry(v).or_default().push((bi, ii));
++            });
++        }
++    }
++
++    // Phi destinations and every phi incoming value (function-wide).
++    let mut phi_dests: Vec<Value> = Vec::new();
++    let mut phi_incoming: Vec<u32> = Vec::new();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Instruction::Phi { dest, incoming, .. } = inst {
++                phi_dests.push(*dest);
++                for (op, _) in incoming {
++                    if let Operand::Value(v) = op {
++                        phi_incoming.push(v.0);
++                    }
++                }
++            }
++        }
++    }
++    if phi_dests.is_empty() {
++        return 0;
++    }
++
++    let mut changes = 0usize;
++    for &adler0 in &phi_dests {
++        // Walk the adler chain forward from the phi's first use:
++        // adler_{i+1} = Add(adler_i, c_i) with the accumulator as LHS and a
++        // non-phi byte operand as RHS. (The sum2 add `Add(sum2, adler)` has
++        // the current value as RHS, which the LHS requirement skips.)
++        let mut chain: Vec<(Value, Value, IrType, usize)> = Vec::new();
++        let mut cur = adler0;
++        loop {
++            let mut next: Option<(Value, Value, IrType, usize)> = None;
++            if let Some(ulist) = uses.get(&cur.0) {
++                for &(bi, ii) in ulist {
++                    let inst = &func.blocks[bi].instructions[ii];
++                    if let Instruction::BinOp {
++                        dest,
++                        op: IrBinOp::Add,
++                        lhs,
++                        rhs,
++                        ty,
++                    } = inst
++                    {
++                        if is_unsigned_add_ty(*ty) {
++                            if let (Operand::Value(l), Operand::Value(r)) = (lhs, rhs) {
++                                if l.0 == cur.0 && !phi_dests.iter().any(|p| p.0 == r.0) {
++                                    next = Some((*dest, *r, *ty, bi));
++                                    break;
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++            match next {
++                Some((d, c, t, b)) => {
++                    chain.push((d, c, t, b));
++                    cur = d;
++                    if chain.len() > 64 {
++                        break;
++                    }
++                }
++                None => break,
++            }
++        }
++        if chain.len() < 4 {
++            continue;
++        }
++        let ty = chain[0].2;
++        let n = chain.len();
++        let adler_n = chain[n - 1].0;
++        let adler1 = chain[0].0;
++        // All chain instructions must live in ONE block (the rewrite splices
++        // that block). True of the source-unrolled adler body.
++        let body_block = chain[0].3;
++        if chain.iter().any(|&(_, _, _, b)| b != body_block) {
++            continue;
++        }
++
++        // Find sum2_0: the Add consuming adler1 (as RHS) whose LHS is a phi.
++        let mut sum2_0: Option<Value> = None;
++        'outer: for &(bi, ii) in uses.get(&adler1.0).into_iter().flatten() {
++            let inst = &func.blocks[bi].instructions[ii];
++            if let Instruction::BinOp {
++                op: IrBinOp::Add,
++                lhs,
++                rhs,
++                ty: t,
++                ..
++            } = inst
++            {
++                if *t != ty {
++                    continue;
++                }
++                if let (Operand::Value(l), Operand::Value(r)) = (lhs, rhs) {
++                    if r.0 == adler1.0 && phi_dests.iter().any(|p| p.0 == l.0) {
++                        sum2_0 = Some(*l);
++                        break 'outer;
++                    }
++                }
++            }
++        }
++        let sum2_0 = match sum2_0 {
++            Some(v) => v,
++            None => continue,
++        };
++
++        // Verify the full sum2 chain: sum2_{i+1} = Add(sum2_i, adler_{i+1}).
++        let mut sum2_cur = sum2_0;
++        let mut sum2_n: Option<Value> = None;
++        let mut sum2_ok = true;
++        for &(adler_next, _, _, _) in &chain {
++            let mut found = None;
++            if let Some(ulist) = uses.get(&sum2_cur.0) {
++                for &(bi, ii) in ulist {
++                    let inst = &func.blocks[bi].instructions[ii];
++                    if let Instruction::BinOp {
++                        dest,
++                        op: IrBinOp::Add,
++                        lhs,
++                        rhs,
++                        ty: t,
++                    } = inst
++                    {
++                        if *t != ty {
++                            continue;
++                        }
++                        if let (Operand::Value(l), Operand::Value(r)) = (lhs, rhs) {
++                            if l.0 == sum2_cur.0 && r.0 == adler_next.0 {
++                                found = Some(*dest);
++                                break;
++                            }
++                        }
++                    }
++                }
++            }
++            match found {
++                Some(d) => {
++                    sum2_cur = d;
++                    sum2_n = Some(d);
++                }
++                None => {
++                    sum2_ok = false;
++                    break;
++                }
++            }
++        }
++        if !sum2_ok {
++            continue;
++        }
++        let sum2_n = match sum2_n {
++            Some(v) => v,
++            None => continue,
++        };
++
++        // adler_N and sum2_N must be phi incoming values (loop-carried).
++        if !phi_incoming.contains(&adler_n.0) || !phi_incoming.contains(&sum2_n.0) {
++            continue;
++        }
++
++        if rewrite_sum2_chain(func, body_block, &chain, adler0, sum2_0, sum2_n, ty) {
++            changes += 1;
++        }
++    }
++    changes
++}
++
++/// Replace the N-step sum2 chain with `sum2_0 + N*adler0 + Σ (N-i)*c_i`,
++/// reusing `sum2_n`'s value id for the final result.
++fn rewrite_sum2_chain(
++    func: &mut IrFunction,
++    bi: usize,
++    chain: &[(Value, Value, IrType, usize)],
++    adler0: Value,
++    sum2_0: Value,
++    sum2_n: Value,
++    ty: IrType,
++) -> bool {
++    let n = chain.len() as i64;
++    let mut next_id = func.next_value_id;
++    if next_id == 0 {
++        next_id = func.max_value_id() + 1;
++    }
++    let mut fresh = |next_id: &mut u32| -> Value {
++        let v = Value(*next_id);
++        *next_id += 1;
++        v
++    };
++
++    // Closed-form intermediates (computed BEFORE the final add).
++    let mut seq: Vec<Instruction> = Vec::new();
++
++    // acc = N * adler0  (shift when N is a power of two, else multiply).
++    let acc0 = fresh(&mut next_id);
++    let (op0, rhs0) = if n > 0 && (n & (n - 1)) == 0 {
++        (IrBinOp::Shl, int_const(ty, n.trailing_zeros() as i64))
++    } else {
++        (IrBinOp::Mul, int_const(ty, n))
++    };
++    seq.push(Instruction::BinOp {
++        dest: acc0,
++        op: op0,
++        lhs: Operand::Value(adler0),
++        rhs: Operand::Const(rhs0),
++        ty,
++    });
++    let mut acc = acc0;
++
++    // For each byte: acc += (N - i) * c_i.
++    for (i, &(_, c_i, _, _)) in chain.iter().enumerate() {
++        let k = n - i as i64; // N, N-1, ..., 1
++        let w = fresh(&mut next_id);
++        let (op, rhs) = if k > 0 && (k & (k - 1)) == 0 {
++            (IrBinOp::Shl, int_const(ty, k.trailing_zeros() as i64))
++        } else {
++            (IrBinOp::Mul, int_const(ty, k))
++        };
++        seq.push(Instruction::BinOp {
++            dest: w,
++            op,
++            lhs: Operand::Value(c_i),
++            rhs: Operand::Const(rhs),
++            ty,
++        });
++        let acc2 = fresh(&mut next_id);
++        seq.push(Instruction::BinOp {
++            dest: acc2,
++            op: IrBinOp::Add,
++            lhs: Operand::Value(acc),
++            rhs: Operand::Value(w),
++            ty,
++        });
++        acc = acc2;
++    }
++
++    // Final: sum2_n = sum2_0 + acc (reuses sum2_n's dest id).
++    seq.push(Instruction::BinOp {
++        dest: sum2_n,
++        op: IrBinOp::Add,
++        lhs: Operand::Value(sum2_0),
++        rhs: Operand::Value(acc),
++        ty,
++    });
++
++    // Identify the positions of the old sum2-chain adds (walking the same
++    // chain), so we can drop them and splice the closed form in at the final
++    // sum2 add's position (all its inputs are defined by then).
++    let block = &func.blocks[bi];
++    let mut old_indices: Vec<usize> = Vec::new();
++    {
++        let mut cur = sum2_0;
++        for &(adler_next, _, _, _) in chain {
++            let mut found = None;
++            for (idx, inst) in block.instructions.iter().enumerate() {
++                if let Instruction::BinOp {
++                    dest,
++                    op: IrBinOp::Add,
++                    lhs,
++                    rhs,
++                    ..
++                } = inst
++                {
++                    if let (Operand::Value(l), Operand::Value(r)) = (lhs, rhs) {
++                        if l.0 == cur.0 && r.0 == adler_next.0 {
++                            found = Some((idx, *dest));
++                            break;
++                        }
++                    }
++                }
++            }
++            match found {
++                Some((idx, d)) => {
++                    old_indices.push(idx);
++                    cur = d;
++                }
++                None => return false,
++            }
++        }
++    }
++    if old_indices.len() != chain.len() {
++        return false;
++    }
++
++    let block = &mut func.blocks[bi];
++    let mut new_insts: Vec<Instruction> = Vec::with_capacity(block.instructions.len() + seq.len());
++    for (idx, inst) in block.instructions.drain(..).enumerate() {
++        if old_indices.contains(&idx) {
++            if inst.dest().is_some_and(|d| d.0 == sum2_n.0) {
++                new_insts.extend(seq.iter().cloned());
++            }
++            // else: an intermediate sum2 add — drop it (now dead).
++        } else {
++            new_insts.push(inst);
++        }
++    }
++    block.instructions = new_insts;
++    func.next_value_id = next_id;
++    true
++}
+diff --git a/tests/regression/v12_reassoc_accum.c b/tests/regression/v12_reassoc_accum.c
+new file mode 100644
+index 00000000..5b9359df
+--- /dev/null
++++ b/tests/regression/v12_reassoc_accum.c
+@@ -0,0 +1,87 @@
++/*
++ * v12 regression: loop-carried accumulator reassociation (Adler-32 pattern).
++ *
++ * `sum1 += b[i]; sum2 += sum1;` (unsigned) is reassociated into the closed
++ * form sum2' = sum2 + N*sum1 + Σ (N-i)*b[i]. The transform must be
++ * bit-exact (unsigned wraparound) for every unroll factor and input —
++ * including sum values near UINT_MAX so the wraparound is exercised.
++ */
++#include <stdio.h>
++#include <limits.h>
++
++static unsigned adler8(const unsigned char *b, unsigned len, unsigned s1, unsigned s2) {
++    while (len >= 8) {
++        len -= 8;
++        s1 += b[0]; s2 += s1;
++        s1 += b[1]; s2 += s1;
++        s1 += b[2]; s2 += s1;
++        s1 += b[3]; s2 += s1;
++        s1 += b[4]; s2 += s1;
++        s1 += b[5]; s2 += s1;
++        s1 += b[6]; s2 += s1;
++        s1 += b[7]; s2 += s1;
++        b += 8;
++    }
++    return s1 ^ (s2 << 16);
++}
++static unsigned adler16(const unsigned char *b, unsigned len, unsigned s1, unsigned s2) {
++    while (len >= 16) {
++        len -= 16;
++        int i;
++        for (i = 0; i < 16; i++) { s1 += b[i]; s2 += s1; }
++        b += 16;
++    }
++    return s1 ^ (s2 << 16);
++}
++static unsigned long long adler64_8(const unsigned char *b, unsigned len,
++                                    unsigned long long s1, unsigned long long s2) {
++    while (len >= 8) {
++        len -= 8;
++        s1 += b[0]; s2 += s1;
++        s1 += b[1]; s2 += s1;
++        s1 += b[2]; s2 += s1;
++        s1 += b[3]; s2 += s1;
++        s1 += b[4]; s2 += s1;
++        s1 += b[5]; s2 += s1;
++        s1 += b[6]; s2 += s1;
++        s1 += b[7]; s2 += s1;
++        b += 8;
++    }
++    return s1 ^ (s2 << 32);
++}
++/* signed accumulation must NOT be reassociated (overflow UB) — behavior check */
++static int signed_acc(const int *b, int len) {
++    int s = 0, i;
++    for (i = 0; i < len; i++) s += b[i];
++    return s;
++}
++
++static unsigned long long mix(unsigned long long h, unsigned long long v) {
++    return (h ^ v) * 0x9e3779b97f4a7c15ULL + 0xdeadbeefULL;
++}
++
++int main(void) {
++    unsigned long long h = 1469598103934665603ULL;
++    unsigned char b[128];
++    int i, it;
++    for (i = 0; i < 128; i++) b[i] = (unsigned char)(i * 13 + 7);
++
++    for (it = 0; it < 200; it++) {
++        unsigned s1 = (unsigned)(it * 65521 + 1) & 0xffff;
++        unsigned s2 = (unsigned)(it * 99991) & 0xffff;
++        h = mix(h, adler8(b, 128, s1, s2));
++        h = mix(h, adler16(b, 128, s1, s2));
++        h = mix(h, (unsigned)adler64_8(b, 128, s1, s2));
++        b[it & 127] ^= (unsigned char)(it * 3 + 1);
++    }
++    /* wraparound stress: start sums near UINT_MAX */
++    h = mix(h, adler8(b, 64, 0xfffffff0u, 0xfffffff8u));
++    h = mix(h, adler16(b, 64, 0xfffffff0u, 0xfffffff8u));
++    h = mix(h, (unsigned)adler64_8(b, 64, 0xfffffffffffffff0ULL, 0xfffffffffffffff8ULL));
++
++    int ib[16];
++    for (i = 0; i < 16; i++) ib[i] = (i & 1) ? i : -i;
++    h = mix(h, (unsigned)signed_acc(ib, 16));
++    printf("%llu\n", (unsigned long long)h);
++    return 0;
++}
+-- 
+2.47.3
+
+
+From bfb6702cdf60b6f49e1658e2624457d0975dc9ea Mon Sep 17 00:00:00 2001
+From: lccc-v12 <v12@localhost>
+Date: Fri, 14 Aug 2026 01:03:09 +0000
+Subject: [PATCH 6/6] =?UTF-8?q?v12:=20audit=20=E2=80=94=20flat=20short-cir?=
+ =?UTF-8?q?cuit,=20FP-param=20fix,=20accumulator=20reassoc?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
 ---
- SIMD_REDTEAM_AUDIT.md | 62 +++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 62 insertions(+)
+ SIMD_REDTEAM_AUDIT.md | 41 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
 
 diff --git a/SIMD_REDTEAM_AUDIT.md b/SIMD_REDTEAM_AUDIT.md
-index 73229894..b2a9460b 100644
+index b2a9460b..bec54a73 100644
 --- a/SIMD_REDTEAM_AUDIT.md
 +++ b/SIMD_REDTEAM_AUDIT.md
-@@ -745,3 +745,65 @@ session's working history.
-    for `adler+=b[i]; sum2+=adler` within the 16-byte unroll; also removes the
-    per-iteration slot copies (loop-carried accumulator in registers).
- 5. nbody's 2 remaining preheader `imulq` (reuse `&bodies[i*56]+56`).
+@@ -807,3 +807,44 @@ are screening-only; relative deltas within one run are the signal.
+    emits `add dl,62; cmp dl,29` (8-bit). Narrow the fold's sub+cmp to the
+    operand's natural width when the span fits.
+ 4. nbody's 2 remaining preheader `imulq` (reuse `&bodies[i*56]+56`).
 +
-+## v11 — ICC/ICX distills delivered (narrowing, byte compares, FP-param XMM)
++## v12 — flat short-circuit, byte compares, FP-param fix, accumulator reassoc
 +
-+Three of the five v10 roadmap items are now implemented and measured; the FP-
-+parameter work is done properly (not backed down).
++All four v11 roadmap items plus a critical miscompile fix, an exhaustive test
++sweep, and one more ICC/ICX distill.
 +
-+**1. U32 operand cast-type fix.** The U32 comparison-operand masking cast was
-+emitted as `Cast(x, I64 -> U32)` — a hardcoded wrong source type (the operand
-+is already U32). The type-lying identity cast survived simplify and emitted a
-+spurious `mov` per operand. Now `Cast(op_ty -> U32)` folds away. Removed one
-+copy per comparison operand (the expat/sqlite mov-chains).
++1. **Flat short-circuit lowering** (the big one). `a || b || c` parsed as
++   `(a || b) || c`; the per-link lowering built a right-nested value tree (one
++   alloca + branch diamond per link), so the intermediate links were DATA
++   (each selected as the next link's false arm) and materialized as setcc/cmov
++   even when the whole result only fed a branch. Now left-associative runs of
++   the SAME operator flatten into ONE branch sequence with ONE merge value —
++   GCC/ICX's Expat shape (cmp;ja chains). Constants are dropped (identity) or
++   short-circuit (decisive, evaluating prior operands for side effects).
++   **expat_xml_scan 2.77x -> 2.01x.**
 +
-+**2. Comparison narrowing** (simplify): `Cmp(op, Cast(x,T->W), C, W)` ->
-+`Cmp(op, x, C', T)` for order-preserving extensions with C fitting in T.
-+Unsigned T zero-extends (Ult/Ule/Ugt/Uge + Eq/Ne), signed T sign-extends
-+(Slt/... + Eq/Ne) — exactly LLVM InstCombine's icmp-narrowing.
++2. **Range-fold compare narrowing.** The range check's COMPARE narrows to the
++   operand's source width ((u8)(x - lo) <= span reads the low byte of the
++   32-bit sub), matching GCC's `add edx,62; cmp dl,29`.
 +
-+**3. Byte/word compares** (x86 emitter): `emit_int_cmp_insn_typed` /
-+`emit_int_cmp_replay_insn` are width-aware (cmpb/testb/cmpw/testw). A promoted
-+byte now compares at native width: `movzbl (%r11),%esi; cmpb $0x80,%sil; jae`
-+— GCC/ICX's shape, no widening cast, no copy chain.
++3. **FP-param pre-store ordering fix (critical miscompile, caught by the new
++   v12_fp_param test).** The v11 FP-param pre-store stored each param's ABI
++   register into its XMM home in param order; a home (xmm2..xmm7) can DOUBLE as
++   another param's ABI argument register, so constp(a,b,scale) = (a+b)*scale
++   compiled to (a+b)*a. Pre-stores now run in a topological order (a home
++   never clobbers a pending ABI arg); cycles (3+ FP params) break via a
++   scratch XMM register.
 +
-+**4. GPR simple-ALU LHS hint**: Add/Sub/And/Or/Xor/Mul compute into the dest
-+with the LHS pre-loaded (emit_alu_reg_direct), so the v9 follow-hint now
-+covers GPR simple ALU too (the range fold's sub lands in the cast's register).
++4. **Loop-carried accumulator reassociation (ICC's Adler-32 rotation).**
++   sum1 += b[i]; sum2 += sum1; is reassociated (unsigned only) into the closed
++   form sum2' = sum2 + N*sum1 + Σ (N-i)*b[i], breaking the serial dependency.
++   **zlib_ng_adler32 1.73x -> 1.57x.**
 +
-+**5. FP-parameter XMM allocation (delivered, not backed down).** Three
-+coordinated changes: (a) FP ParamRef dests join the Phase 3 XMM scan;
-+(b) find_dead_param_allocas accepts an XMM home as a stable destination;
-+(c) emit_store_params pre-stores FloatReg args into the allocated XMM home
-+(movss/movsd). A runtime FP param now lives in XMM (`movq %xmm0,%xmm3`) with
-+no slot round-trip. Bonus: a param whose ParamRef was constant-propagated
-+away (nbody's advance(0.01,...)) or that is simply unused is now dead,
-+eliminating the entry spill (frame 0xd8 -> 0xc8).
++5. **8 exhaustive regression tests** (141 total): flat short-circuit,
++   range-fold edges, ALU peepholes/strength reduction, bitops builtins,
++   FP params, dead params, ALU chains, accumulator reassociation.
 +
-+**6. Dead forwarding Cast/Copy skip**: fused chains record their flag-neutral
-+forwarding destinations (fused_forward_dests); the Cast/Copy emitters skip
-+them, removing the dead `movsbq %r14b,%r15` that read the never-materialized
-+boolean after each fused range check.
-+
-+Measured (pinned, paired; VM CV note below): bitops 1.91x -> 1.63x,
-+gzip_crc32 1.45x -> 1.33x, expat 2.89x -> 2.77x, sqlite 2.09x -> 1.98x,
-+nbody 3.47x -> 3.39x. Regression 133/133, correctness 50/50, intrinsics 3/3,
-+597 lib tests. New test v11_cmp_narrowing.
-+NOTE: the VM's gcc baseline drifts 15-25% between runs, so absolute ratios
-+are screening-only; relative deltas within one run are the signal.
-+
-+## v11 roadmap (remaining, prioritized)
-+
-+1. **Branch-on-logical at lowering** (expat still 2.77x): `a || b || c` is
-+   lowered to value-producing diamonds whose intermediate results are DATA
-+   (returned), so the inner links materialize setcc/cmov. GCC/ICX lower it as
-+   a pure branch chain that sets the result ONCE at the merge. When the
-+   &&/|| result is used only as a condition (or as a return value), emit
-+   branches + a single setcc at each merge.
-+2. **Adler32 chain-breaking reassociation** (1.73x): ICC's 4-register rotation
-+   breaks the adler->sum2->adler serial dependency; also removes the
-+   per-iteration slot copies (loop-carried accumulator in registers).
-+3. **Range-fold at source width**: the range fold emits a 32-bit sub+cmp; GCC
-+   emits `add dl,62; cmp dl,29` (8-bit). Narrow the fold's sub+cmp to the
-+   operand's natural width when the span fits.
-+4. nbody's 2 remaining preheader `imulq` (reuse `&bodies[i*56]+56`).
++Remaining known gaps (next session): the adler load→register copy chains
++(movzbl (%r11),%edx; mov %r12d,%esi — the load should land directly in the
++add's register), the expat last-link materialization (function-return bool),
++and nbody's preheader imulq.
 -- 
 2.47.3
 
