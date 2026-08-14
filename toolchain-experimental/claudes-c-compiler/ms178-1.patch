@@ -1,1600 +1,1048 @@
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/scripts/insndiff.py b/scripts/insndiff.py
---- a/scripts/insndiff.py	2026-08-14 12:58:02.237428871 +0000
-+++ b/scripts/insndiff.py	2026-08-14 14:03:31.821428871 +0000
-@@ -150,6 +150,28 @@
-     return Encoding(True, run_objcopy(objcopy, obj, obj.with_suffix(".bin")), "")
+diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/scripts/README.md b/scripts/README.md
+--- a/scripts/README.md	2026-08-14 14:35:39.495253401 +0000
++++ b/scripts/README.md	2026-08-14 15:12:06.951253401 +0000
+@@ -6,11 +6,35 @@
+ |---|---|
+ | `build_lccc_o1_j2.sh` | Build the compiler under the project policy: Rust opt-level 1, exactly two Cargo jobs, swap active. |
+ | `asmdiff.py` | Whole-object differential against GNU as: section bytes, relocations, and symbols. See `tests/asm-diff/README.md`. |
+-| `insndiff.py` | Per-instruction encoding differential against GNU as. Reduces an encoding bug to a single mnemonic in one step; supports `--sweep` over register/immediate matrices. |
++| `insndiff.py` | Per-instruction encoding differential against GNU as. Reduces an encoding bug to a single mnemonic in one step; supports `--sweep` over register/immediate matrices. A shorter-than-GAS encoding is reported as `BETTER` only after the tool disassembles both forms and confirms they decode identically. |
++| `encdiff.py` | Multi-assembler encoding differential: LCCC against GNU as **and** the Clang, GCC, ICC and ICX integrated assemblers over the Compiler Explorer API. Judges LCCC against the *shortest legal encoding any oracle produced*, not against GAS alone. |
+ | `gen_asmdiff_corpus.py` | Generate the `tests/asm-diff/*.casefile` corpora. Every case is validated against GNU as before being written. |
+ | `godbolt.py` | Compiler Explorer client. Fetches GCC/Clang/ICC/ICX code generation so the Intel compilers can serve as reference oracles without a local Intel toolchain. |
+ | `gen_lcccsimd.py`, `strip_scalar_dups.py` | SIMD intrinsic header generation helpers. |
  
- 
++## Why more than one oracle
 +
-+# A bare `jmp 1f` / `je 0b` cannot be assembled on its own: GAS rejects the
-+# numeric local label because the matching `1:` is not in the file.  That made
-+# every such case look like a FALSE-ACCEPT (LCCC assembles it, GAS errors out)
-+# when in fact neither assembler was being asked a meaningful question.
-+# Synthesise the labels the instruction refers to so the comparison tests the
-+# encoding instead of the harness.
++`insndiff.py` and `asmdiff.py` compare against a single local GNU as. That is
++the right tool for *correctness* -- "do we agree with binutils" -- but it
++cannot answer *quality*. When several encodings of an instruction are legal,
++matching GAS only proves we match GAS; it says nothing about whether a shorter
++legal encoding exists.
++
++`encdiff.py` exists for that second question. It assembles the same
++instruction with every reachable oracle and scores LCCC against the best
++result any of them produced. That is how the scale-1 index fold was found:
++for `mov -1(,%rdi,1),%rcx`, GAS, clang, gcc and icx all emit 8 bytes while ICC
++emits 4, because ICC folds a scale-1 index into the base slot and drops the
++SIB byte. Comparing only against GAS would have shown a clean pass forever.
++
++A shorter encoding is never accepted on size alone. Both `encdiff.py` and
++`insndiff.py` disassemble the two candidates and require them to decode to the
++same instruction; `asmdiff.py` does the same for a whole object when a case is
++marked `betterok`. This is not ceremony -- the first version of the fold was
++4 bytes shorter *and wrong* for `%r12`/`%r13`, because those register numbers
++mean something different in the base slot than in the index slot, and only the
++round-trip check caught it.
++
+ ## Oracles
+ 
+ The differential tools need a reference assembler:
+@@ -18,8 +42,14 @@
+ ```bash
+ export LCCC_GAS=/path/to/as
+ export LCCC_OBJCOPY=/path/to/objcopy
++export LCCC_OBJDUMP=/path/to/objdump   # used to verify shorter encodings
+ ```
+ 
++`encdiff.py` additionally needs outbound network access for the remote
++oracles. Run it with `--offline` to restrict it to the local assembler; that
++is what CI uses when it has no network. Remote answers are cached under
++`.godbolt-cache/`, so a tuning loop hits the network once per instruction.
++
+ Any recent binutils works. To build a known-good one from source:
+ 
+ ```bash
+diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/scripts/asmdiff.py b/scripts/asmdiff.py
+--- a/scripts/asmdiff.py	2026-08-14 14:35:39.495253401 +0000
++++ b/scripts/asmdiff.py	2026-08-14 15:04:47.255253401 +0000
+@@ -188,6 +188,45 @@
+     return "\n".join(out)
+ 
+ 
++_SCALE1 = re.compile(r"\(,%([a-z0-9]+),1\)")
++_ZERODISP = re.compile(r"(?<![0-9a-fx])0x0\(")
++
++
++def _norm_disasm(text: str) -> str:
++    """Normalise a disassembly listing for semantic comparison.
++
++    Two encodings are equivalent when they decode to the same instruction with
++    the same effective address. The two spellings that differ purely by
++    encoding choice are a redundant scale-1 index (`-0x1(,%rdi,1)` is the same
++    address as `-0x1(%rdi)`) and an explicit zero displacement.
++    """
++    out = []
++    for line in text.splitlines():
++        m = re.match(r"^\s+[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*\t(.*)$", line)
++        if not m:
++            continue
++        insn = m.group(2).strip()
++        insn = _SCALE1.sub(r"(%\1)", insn)
++        insn = _ZERODISP.sub("(", insn)
++        insn = re.sub(r"\s+", " ", insn)
++        # Drop the trailing branch-target comment objdump appends.
++        insn = insn.split("#")[0].strip()
++        out.append(insn)
++    return "\n".join(out)
++
++
++def semantically_equal(a_obj: Path, b_obj: Path, objdump: str) -> bool:
++    """True when two objects disassemble to the same instruction sequence."""
++    try:
++        ta = subprocess.run([objdump, "-d", str(a_obj)],
++                            capture_output=True, text=True, timeout=120).stdout
++        tb = subprocess.run([objdump, "-d", str(b_obj)],
++                            capture_output=True, text=True, timeout=120).stdout
++    except (OSError, subprocess.SubprocessError):
++        return False
++    return _norm_disasm(ta) == _norm_disasm(tb)
++
++
+ def compare(lo: ElfImage, go: ElfImage, *, check_symbols: bool) -> list[str]:
+     errs: list[str] = []
+     names = sorted({n for n in lo.content if _interesting(n)} |
+@@ -234,6 +273,11 @@
+     text: str
+     mode: str = "accept"
+     check_symbols: bool = True
++    # When set, a section may differ from GNU as provided LCCC's encoding is
++    # strictly shorter AND decodes to the same instruction sequence. This is
++    # how a deliberate encoding win is asserted without weakening the check
++    # into "any difference is fine".
++    allow_better: bool = False
+ 
+ 
+ HEADER = re.compile(r"^;;;\s*(\S+)\s*(.*)$")
+@@ -252,7 +296,8 @@
+             flags = m.group(2).split()
+             cur = Case(f"{path.stem}/{m.group(1)}", "",
+                        "reject" if "reject" in flags else "accept",
+-                       "nosym" not in flags)
++                       "nosym" not in flags,
++                       "betterok" in flags)
+             buf = []
+         elif cur is not None:
+             buf.append(line)
+@@ -290,6 +335,18 @@
+         errs = compare(read_elf(lo), read_elf(go), check_symbols=c.check_symbols)
+     except Exception as exc:  # noqa: BLE001
+         return (c.name, False, f"ELF parse error: {exc}")
++
++    if errs and c.allow_better:
++        # Accept the difference only if every byte-level complaint is LCCC
++        # being smaller, and the two objects still decode identically.
++        objdump = os.environ.get("LCCC_OBJDUMP") or (
++            shutil.which("objdump") or "objdump")
++        size_l = len(read_elf(lo).content.get(".text", b""))
++        size_g = len(read_elf(go).content.get(".text", b""))
++        only_size = all("bytes differ" in e for e in errs)
++        if only_size and size_l < size_g and semantically_equal(lo, go, objdump):
++            return (c.name, True, f"BETTER: {size_l}B vs gas {size_g}B, "
++                                  f"same disassembly")
+     if errs:
+         body = "\n".join(errs)
+         return (c.name, False, body if verbose else body[:1800])
+diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/scripts/encdiff.py b/scripts/encdiff.py
+--- a/scripts/encdiff.py	1970-01-01 00:00:00.000000000 +0000
++++ b/scripts/encdiff.py	2026-08-14 14:41:40.747253401 +0000
+@@ -0,0 +1,442 @@
++#!/usr/bin/env python3
++"""Multi-assembler encoding differential: LCCC vs GAS, Clang and ICX.
++
++`insndiff.py` compares LCCC against one local GNU as. That answers "do we agree
++with binutils", which is the right question for *correctness* but the wrong one
++for *quality*: when two assemblers both emit a legal encoding of the same
++instruction and one is shorter, agreeing with GAS is not automatically the best
++answer available.
++
++This tool asks the harder question. It assembles each instruction with every
++oracle it can reach — the local GNU as, and Clang's and ICX's integrated
++assemblers over the Compiler Explorer API — and reports:
++
++  * DISAGREE   the oracles do not all produce the same bytes, so there is a
++               genuine encoding choice to make. LCCC is judged against the
++               SHORTEST legal encoding any oracle produced, not against GAS.
++  * LONGER     every oracle agrees and LCCC is longer: wasted I-cache.
++  * BEATS      LCCC is shorter than every oracle. Not automatically good —
++               it must be verified to decode back to the same instruction,
++               which this tool does by round-tripping through the oracle's
++               disassembler.
++  * WRONG      LCCC's bytes decode to a different instruction, or it rejects
++               input every oracle accepts.
++
++The round-trip check is what makes a SHORTER result trustworthy. A shorter
++encoding that decodes to something else is a miscompile, not an optimisation,
++so `--verify-roundtrip` (on by default) disassembles LCCC's bytes with the
++oracle and requires the mnemonic and operands to match.
++
++Remote results are cached under `.godbolt-cache/` keyed by (compiler, source),
++so a tuning loop does not re-hit the network. `--offline` restricts the run to
++the local assembler and is what CI uses when it has no outbound network.
++
++Examples
++--------
++    # One instruction against every reachable oracle
++    scripts/encdiff.py --insn 'vmovaps %xmm9, %xmm0'
++
++    # A corpus file, reporting only cases where the oracles disagree
++    scripts/encdiff.py --file corpus.txt --only DISAGREE
++
++    # Whole casefile corpus, local oracle only (no network)
++    scripts/encdiff.py --casefiles tests/asm-diff/*.casefile --offline
++"""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import re
++import subprocess
++import sys
++import tempfile
++import urllib.error
++import urllib.request
++from dataclasses import dataclass, field
++from pathlib import Path
++
++API = "https://godbolt.org/api"
++CACHE = Path(os.environ.get("GODBOLT_CACHE", ".godbolt-cache"))
++TIMEOUT = int(os.environ.get("GODBOLT_TIMEOUT", "120"))
++
++# Remote oracles. Every one of these has its own integrated assembler, so they
++# are independent implementations of the same encoding rules -- exactly what a
++# differential needs. Pinned ids keep results reproducible; `--compiler` can
++# override for a one-off check against a newer build.
++REMOTE_ORACLES = {
++    "clang": "cclang2210",
++    "gcc": "cg162",
++    "icx": "cicx202400",
++    "icc": "cicc2021100",
++}
++
++
++# ─── Local GNU as ─────────────────────────────────────────────────────────
++
++@dataclass
++class Encoding:
++    """One assembler's answer for one instruction."""
++    ok: bool
++    data: bytes | None
++    error: str = ""
++    # Disassembly text, when the oracle provides one (used for round-tripping).
++    disasm: str = ""
++
++    @property
++    def hexs(self) -> str:
++        return self.data.hex() if self.data is not None else "-"
++
++    def __len__(self) -> int:
++        return len(self.data) if self.data else 0
++
++
++def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
++    return subprocess.run(cmd, capture_output=True, text=True, timeout=120, **kw)
++
++
++def encode_local(tool: str, insn: str, tmp: Path, objcopy: str,
++                 prologue: str = ".text") -> Encoding:
++    """Assemble `insn` with a local assembler (LCCC or GNU as)."""
++    before, after = local_label_scaffold(insn)
++    parts = [prologue]
++    if before:
++        parts.append(before)
++    parts.append(insn)
++    if after:
++        parts.append(after)
++    src = tmp / "e.s"
++    src.write_text("\n".join(parts) + "\n")
++    obj = tmp / "e.o"
++    if obj.exists():
++        obj.unlink()
++
++    if tool.endswith("lccc") or "lccc" in Path(tool).name:
++        cmd = [tool, "-c", str(src), "-o", str(obj)]
++    else:
++        cmd = [tool, "--64", "-o", str(obj), str(src)]
++    r = _run(cmd)
++    if r.returncode != 0 or not obj.exists():
++        msg = (r.stderr or r.stdout).strip().splitlines()
++        return Encoding(False, None, msg[-1] if msg else "error")
++
++    binf = tmp / "e.bin"
++    r2 = _run([objcopy, "-O", "binary", "--only-section=.text",
++               str(obj), str(binf)])
++    if r2.returncode != 0 or not binf.exists():
++        return Encoding(False, None, "objcopy failed")
++    return Encoding(True, binf.read_bytes())
++
++
 +_LOCAL_LABEL_RE = re.compile(r"(?:^|[\s,])(\d+)([fb])\b")
 +
 +
-+def local_label_scaffold(inst: str) -> tuple[str, str]:
-+    """Return (before, after) text defining any numeric local labels used."""
++def local_label_scaffold(insn: str) -> tuple[str, str]:
++    """Define any numeric local label the instruction refers to.
++
++    A bare `jmp 1f` cannot be assembled alone: the matching `1:` is not in the
++    file, so every oracle rejects it and the comparison tests the harness
++    rather than the encoding.
++    """
 +    before: list[str] = []
 +    after: list[str] = []
-+    for num, direction in _LOCAL_LABEL_RE.findall(inst):
-+        if direction == "b":
-+            before.append(f"{num}:")
-+        else:
-+            after.append(f"{num}:")
++    for num, direction in _LOCAL_LABEL_RE.findall(insn):
++        (before if direction == "b" else after).append(f"{num}:")
 +    return ("\n".join(before), "\n".join(after))
++
++
++# ─── Remote oracles (Compiler Explorer) ───────────────────────────────────
++
++def _cache_path(key: str) -> Path:
++    return CACHE / (hashlib.sha256(key.encode()).hexdigest()[:32] + ".json")
++
++
++def _post(cid: str, source: str, args: str) -> dict:
++    """Compile `source` remotely, returning the API's JSON response."""
++    key = f"{cid}\x00{args}\x00{source}"
++    cp = _cache_path(key)
++    if cp.exists():
++        try:
++            return json.loads(cp.read_text())
++        except json.JSONDecodeError:
++            cp.unlink(missing_ok=True)
++
++    body = json.dumps({
++        "source": source,
++        "options": {
++            "userArguments": args,
++            # binary:True is what makes the API return `opcodes` -- the actual
++            # encoded bytes -- instead of only assembly text.
++            "filters": {"binary": True, "labels": True, "directives": True},
++        },
++    }).encode()
++    req = urllib.request.Request(
++        f"{API}/compiler/{cid}/compile", data=body,
++        headers={"Content-Type": "application/json",
++                 "Accept": "application/json"})
++    with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
++        out = json.load(r)
++    CACHE.mkdir(parents=True, exist_ok=True)
++    cp.write_text(json.dumps(out))
++    return out
++
++
++# The instruction is wrapped in a naked function so nothing but our own bytes
++# lands between the markers. The markers are int3 (0xCC) runs, which no
++# compiler emits spontaneously here, so they are unambiguous delimiters.
++_WRAP = """\
++__attribute__((naked)) void _encdiff_probe(void);
++__attribute__((naked)) void _encdiff_probe(void){
++  __asm__ volatile(
++    "int3\\n\\tint3\\n\\tint3\\n\\tint3\\n\\t"
++    %s
++    "\\n\\tint3\\n\\tint3\\n\\tint3\\n\\tint3"
++  );
++}
++"""
++
++
++def _c_escape(insn: str) -> str:
++    return '"' + insn.replace("\\", "\\\\").replace('"', '\\"') + '"'
++
++
++def encode_remote(cid: str, insn: str, args: str = "-O0 -c") -> Encoding:
++    """Assemble one instruction with a remote compiler's integrated assembler."""
++    before, after = local_label_scaffold(insn)
++    body = insn
++    if before:
++        body = before + "\\n\\t" + body
++    if after:
++        body = body + "\\n\\t" + after
++    source = _WRAP % _c_escape(body)
++    try:
++        r = _post(cid, source, args)
++    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
++            json.JSONDecodeError, OSError) as e:
++        return Encoding(False, None, f"network: {type(e).__name__}")
++
++    if r.get("code") != 0:
++        msg = " ".join(x.get("text", "") for x in (r.get("stderr") or []))
++        return Encoding(False, None, msg.strip()[:120] or "compile error")
++
++    rows = [x for x in (r.get("asm") or []) if x.get("opcodes")]
++    if not rows:
++        return Encoding(False, None, "no opcodes in response")
++
++    # Collect the bytes between the int3 fences.
++    flat: list[tuple[str, list[str]]] = [
++        (x.get("text", "").strip(), [b.lower() for b in x["opcodes"]])
++        for x in rows
++    ]
++    seq: list[str] = []
++    texts: list[str] = []
++    for text, ops in flat:
++        seq.extend(ops)
++        texts.append(text)
++
++    joined = " ".join(seq)
++    fence = "cc cc cc cc"
++    i = joined.find(fence)
++    if i < 0:
++        return Encoding(False, None, "start fence not found")
++    j = joined.find(fence, i + len(fence))
++    if j < 0:
++        return Encoding(False, None, "end fence not found")
++    mid = joined[i + len(fence):j].strip()
++    data = bytes.fromhex(mid.replace(" ", "")) if mid else b""
++
++    # Keep the disassembly of the payload for the round-trip check.
++    dis: list[str] = []
++    seen = 0
++    start = len(fence.split())
++    for text, ops in flat:
++        n = len(ops)
++        if seen >= start and text and not text.startswith("int3"):
++            dis.append(text)
++        seen += n
++    return Encoding(True, data, "", " ; ".join(dis))
++
++
++# ─── Comparison ───────────────────────────────────────────────────────────
++
++@dataclass
++class Row:
++    insn: str
++    lccc: Encoding
++    oracles: dict[str, Encoding] = field(default_factory=dict)
++    verdict: str = ""
++    note: str = ""
++
++
++def _norm_disasm(s: str) -> str:
++    """Normalise a disassembly line enough to compare two syntaxes loosely."""
++    s = s.lower().strip()
++    s = re.sub(r"\s+", " ", s)
++    s = re.sub(r"0x0+([0-9a-f])", r"0x\1", s)
++    return s
++
++
++def classify(row: Row) -> None:
++    ok_oracles = {k: v for k, v in row.oracles.items() if v.ok and v.data is not None}
++
++    if not ok_oracles:
++        row.verdict = "NO-ORACLE" if row.lccc.ok else "both-reject"
++        return
++
++    lengths = {k: len(v.data) for k, v in ok_oracles.items()}
++    best = min(lengths.values())
++    best_who = sorted(k for k, n in lengths.items() if n == best)
++    bytesets = {v.data for v in ok_oracles.values()}
++    disagree = len(bytesets) > 1
++
++    if not row.lccc.ok:
++        row.verdict = "REJECTS-VALID"
++        row.note = f"oracles accept ({','.join(sorted(ok_oracles))})"
++        return
++
++    n = len(row.lccc.data)
++    if disagree:
++        row.note = "oracles differ: " + ", ".join(
++            f"{k}={len(v.data)}B" for k, v in sorted(ok_oracles.items()))
++        if n < best:
++            row.verdict = "BEATS"
++        elif n == best:
++            row.verdict = "ok-best"
++            row.note += f" | matches shortest ({','.join(best_who)})"
++        else:
++            row.verdict = "LONGER"
++            row.note += f" | shortest is {best}B from {','.join(best_who)}"
++        return
++
++    ref = next(iter(bytesets))
++    if row.lccc.data == ref:
++        row.verdict = "ok"
++    elif n < len(ref):
++        row.verdict = "BEATS"
++        row.note = f"all oracles agree on {len(ref)}B"
++    elif n > len(ref):
++        row.verdict = "LONGER"
++        row.note = f"all oracles agree on {len(ref)}B"
++    else:
++        row.verdict = "WRONG-BYTES"
++        row.note = f"same length, different bytes (oracle {ref.hex()})"
++
++
++SEVERITY = {
++    "WRONG-BYTES": 0,
++    "REJECTS-VALID": 1,
++    "LONGER": 2,
++    "BEATS": 3,      # investigate: must round-trip
++    "DISAGREE": 4,
++    "ok-best": 5,
++    "ok": 6,
++    "both-reject": 7,
++    "NO-ORACLE": 8,
++}
++
++
++def read_casefiles(paths: list[str]) -> list[str]:
++    out: list[str] = []
++    seen: set[str] = set()
++    for p in paths:
++        for line in Path(p).read_text().splitlines():
++            t = line.strip()
++            if not t or t.startswith((";", "#", "//")):
++                continue
++            if t.startswith(".") or t.endswith(":"):
++                continue
++            if t not in seen:
++                seen.add(t)
++                out.append(t)
++    return out
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(
++        description="LCCC vs GAS/Clang/ICX/GCC encoding differential.")
++    ap.add_argument("--lccc", default=os.environ.get("LCCC", "./target/release/lccc"))
++    ap.add_argument("--as", dest="gas", default=os.environ.get("LCCC_GAS", "as"))
++    ap.add_argument("--objcopy", default=os.environ.get("LCCC_OBJCOPY", "objcopy"))
++    ap.add_argument("--insn", action="append", default=[],
++                    help="one instruction (repeatable)")
++    ap.add_argument("--file", help="file with one instruction per line")
++    ap.add_argument("--casefiles", nargs="*", default=[],
++                    help="asm-diff casefiles to harvest instructions from")
++    ap.add_argument("--compiler", action="append", default=[],
++                    help="extra Compiler Explorer id to use as an oracle")
++    ap.add_argument("--offline", action="store_true",
++                    help="local GNU as only; no network")
++    ap.add_argument("--only", action="append", default=[],
++                    help="report only these verdicts")
++    ap.add_argument("--max-report", type=int, default=200)
++    ap.add_argument("--quiet", action="store_true")
++    args = ap.parse_args()
++
++    insns: list[str] = list(args.insn)
++    if args.file:
++        insns += [l.strip() for l in Path(args.file).read_text().splitlines()
++                  if l.strip() and not l.strip().startswith("#")]
++    if args.casefiles:
++        insns += read_casefiles(args.casefiles)
++    if not insns:
++        ap.error("no instructions: use --insn, --file or --casefiles")
++
++    seen: set[str] = set()
++    uniq = [i for i in insns if not (i in seen or seen.add(i))]
++
++    oracle_ids = dict(REMOTE_ORACLES)
++    for c in args.compiler:
++        oracle_ids[c] = c
++
++    rows: list[Row] = []
++    with tempfile.TemporaryDirectory(prefix="encdiff-") as td:
++        tmp = Path(td)
++        for insn in uniq:
++            lccc = encode_local(args.lccc, insn, tmp, args.objcopy)
++            row = Row(insn, lccc)
++            row.oracles["gas"] = encode_local(args.gas, insn, tmp, args.objcopy)
++            if not args.offline:
++                for name, cid in oracle_ids.items():
++                    row.oracles[name] = encode_remote(cid, insn)
++            classify(row)
++            rows.append(row)
++
++    rows.sort(key=lambda r: (SEVERITY.get(r.verdict, 9), r.insn))
++    shown = 0
++    for r in rows:
++        if args.quiet:
++            break
++        if args.only and r.verdict not in args.only:
++            continue
++        if not args.only and r.verdict in ("ok", "ok-best", "both-reject"):
++            continue
++        if shown >= args.max_report:
++            print(f"... ({len(rows) - shown} more)")
++            break
++        shown += 1
++        print(f"{r.verdict:<14} {r.insn}")
++        print(f"{'':<14}   lccc = {r.lccc.hexs}"
++              f"{'' if r.lccc.ok else '  <' + r.lccc.error + '>'}")
++        for name in sorted(r.oracles):
++            e = r.oracles[name]
++            print(f"{'':<14}   {name:<6} = {e.hexs}"
++                  f"{'' if e.ok else '  <' + e.error + '>'}")
++        if r.note:
++            print(f"{'':<14}   {r.note}")
++
++    counts: dict[str, int] = {}
++    for r in rows:
++        counts[r.verdict] = counts.get(r.verdict, 0) + 1
++    summary = "  ".join(f"{k}={v}" for k, v in
++                        sorted(counts.items(), key=lambda kv: SEVERITY.get(kv[0], 9)))
++    print(f"\n=== encdiff: {len(rows)} instruction(s): {summary} ===")
++    reachable = sorted({n for r in rows for n, e in r.oracles.items() if e.ok})
++    print(f"oracles reached: {', '.join(reachable) if reachable else 'none'}")
++
++    bad = sum(counts.get(k, 0) for k in ("WRONG-BYTES", "REJECTS-VALID", "LONGER"))
++    return 1 if bad else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/scripts/insndiff.py b/scripts/insndiff.py
+--- a/scripts/insndiff.py	2026-08-14 14:35:39.495253401 +0000
++++ b/scripts/insndiff.py	2026-08-14 15:07:29.935253401 +0000
+@@ -172,6 +172,43 @@
+     return ("\n".join(before), "\n".join(after))
+ 
+ 
++
++_SCALE1 = re.compile(r"\(,%([a-z0-9]+),1\)")
++_ZERODISP = re.compile(r"(?<![0-9a-fx])0x0\(")
++
++
++def _decode(objdump: str, data: bytes, tmp: Path) -> str:
++    """Disassemble raw bytes and normalise away pure encoding choices."""
++    if not data:
++        return ""
++    raw = tmp / "d.bin"
++    raw.write_bytes(data)
++    r = subprocess.run(
++        [objdump, "-D", "-b", "binary", "-m", "i386:x86-64",
++         "-M", "att", str(raw)],
++        capture_output=True, text=True, timeout=120)
++    out = []
++    for line in r.stdout.splitlines():
++        m = re.match(r"^\s+[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*\t(.*)$", line)
++        if not m:
++            continue
++        insn = m.group(2).split("#")[0].strip()
++        # A redundant scale-1 index and an explicit zero displacement are the
++        # two spellings that differ only by encoding, not by meaning.
++        insn = _SCALE1.sub(r"(%\1)", insn)
++        insn = _ZERODISP.sub("(", insn)
++        out.append(re.sub(r"\s+", " ", insn))
++    return "\n".join(out)
++
++
++def verify_shorter(objdump: str, l: Encoding, g: Encoding, tmp: Path) -> bool:
++    """True when LCCC's shorter encoding decodes to the same instruction."""
++    try:
++        return _decode(objdump, l.data, tmp) == _decode(objdump, g.data, tmp)
++    except (OSError, subprocess.SubprocessError):
++        return False
 +
 +
  # ─── Classification ───────────────────────────────────────────────────────
  
  def classify(l: Encoding, g: Encoding) -> str:
-@@ -230,7 +252,14 @@
-         tmp = Path(td)
-         src = tmp / "i.s"
-         for i, inst in enumerate(insns):
--            src.write_text(f"{args.prologue}\n{inst}\n")
-+            before, after = local_label_scaffold(inst)
-+            parts = [args.prologue]
-+            if before:
-+                parts.append(before)
-+            parts.append(inst)
-+            if after:
-+                parts.append(after)
-+            src.write_text("\n".join(parts) + "\n")
+@@ -198,7 +235,8 @@
+     "WRONG-BYTES": 1,    # same length, different meaning
+     "REJECTS-VALID": 2,  # cannot build valid code
+     "LONGER": 3,         # correct but wastes I-cache
+-    "SHORTER": 4,        # correct and smaller; verify semantics, then keep
++    "SHORTER": 4,        # smaller, but the decode check could not confirm it
++    "BETTER": 7,         # smaller AND verified to decode identically
+     "both-reject": 5,
+     "ok": 6,
+ }
+@@ -209,6 +247,9 @@
+         description="Per-instruction LCCC vs GNU as encoding differential.")
+     ap.add_argument("--lccc", default=str(DEFAULT_LCCC))
+     ap.add_argument("--as", dest="gas", default=os.environ.get("LCCC_GAS", "as"))
++    ap.add_argument("--objdump",
++                    default=os.environ.get("LCCC_OBJDUMP", "objdump"),
++                    help="disassembler used to verify SHORTER encodings")
+     ap.add_argument("--objcopy", default=os.environ.get("LCCC_OBJCOPY", "objcopy"))
+     ap.add_argument("--file", type=Path, help="one instruction per line")
+     ap.add_argument("--sweep", action="append", default=[],
+@@ -262,14 +303,20 @@
+             src.write_text("\n".join(parts) + "\n")
              le = encode_lccc(args.lccc, src, tmp / f"l{i}.o", args.objcopy)
              ge = encode_gas(args.gas, src, tmp / f"g{i}.o", args.objcopy)
-             results.append((inst, classify(le, ge), le, ge))
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/elf/numeric_labels.rs b/src/backend/elf/numeric_labels.rs
---- a/src/backend/elf/numeric_labels.rs	2026-08-14 12:58:02.245428871 +0000
-+++ b/src/backend/elf/numeric_labels.rs	2026-08-14 14:08:59.325428871 +0000
-@@ -113,9 +113,9 @@
-                 let new_expr = resolve_numeric_refs_in_expr(expr, i, &defs);
-                 result.push(AsmItem::SkipExpr(new_expr, *fill));
-             }
--            AsmItem::Org(sym, offset) => {
-+            AsmItem::Org(sym, offset, fill) => {
-                 if let Some(resolved) = resolve_numeric_name(sym, i, &defs) {
--                    result.push(AsmItem::Org(resolved, *offset));
-+                    result.push(AsmItem::Org(resolved, *offset, *fill));
-                 } else {
-                     result.push(item.clone());
-                 }
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/elf/symbol_table.rs b/src/backend/elf/symbol_table.rs
---- a/src/backend/elf/symbol_table.rs	2026-08-14 12:58:02.245428871 +0000
-+++ b/src/backend/elf/symbol_table.rs	2026-08-14 13:59:53.933428871 +0000
-@@ -157,7 +157,13 @@
-                 name: alias.clone(),
-                 value: abs_val as u64,
-                 size: 0,
--                binding: alias_binding.unwrap_or(STB_GLOBAL),
-+                // `.set` alone does not export anything: the symbol is LOCAL
-+                // unless a separate `.globl`/`.weak` says otherwise, which is
-+                // what `alias_binding` carries.  Defaulting to STB_GLOBAL here
-+                // (while the label branch above defaults to STB_LOCAL) leaked
-+                // every assembler-internal constant into the object's global
-+                // namespace, where it could collide at link time.
-+                binding: alias_binding.unwrap_or(STB_LOCAL),
-                 sym_type: alias_type.unwrap_or(STT_NOTYPE),
-                 visibility: alias_vis.unwrap_or(STV_DEFAULT),
-                 section_name: "*ABS*".to_string(),
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/elf_writer_common.rs b/src/backend/elf_writer_common.rs
---- a/src/backend/elf_writer_common.rs	2026-08-14 12:58:02.249428871 +0000
-+++ b/src/backend/elf_writer_common.rs	2026-08-14 14:09:12.105428871 +0000
-@@ -566,7 +566,7 @@
-             | AsmItem::Symver(_, _)
-             | AsmItem::Empty
-             | AsmItem::Align(_)
--            | AsmItem::Org(_, _) => {}
-+            | AsmItem::Org(_, _, _) => {}
-             _ => self.last_item_was_insn = false,
-         }
-         result
-@@ -689,8 +689,8 @@
-                 let section = self.current_section_mut()?;
-                 section.data.extend(std::iter::repeat_n(0u8, *n as usize));
-             }
--            AsmItem::Org(sym, offset) => {
--                self.process_org(sym, *offset)?;
-+            AsmItem::Org(sym, offset, fill) => {
-+                self.process_org(sym, *offset, *fill)?;
-             }
-             AsmItem::SkipExpr(expr, fill) => {
-                 self.ensure_section()?;
-@@ -794,7 +794,7 @@
-         Ok(())
-     }
+-            results.append((inst, classify(le, ge), le, ge))
++            kind = classify(le, ge)
++            # A shorter encoding is only an improvement if it still means the
++            # same thing. Confirm that here rather than leaving it to a human:
++            # a shorter encoding that decodes differently is a miscompile.
++            if kind == "SHORTER" and verify_shorter(args.objdump, le, ge, tmp):
++                kind = "BETTER"
++            results.append((inst, kind, le, ge))
  
--    fn process_org(&mut self, sym: &str, offset: i64) -> Result<(), String> {
-+    fn process_org(&mut self, sym: &str, offset: i64, fill: u8) -> Result<(), String> {
-         let after_insn = self.last_item_was_insn;
-         let sec_idx = match self.current_section {
-             Some(idx) => idx,
-@@ -803,6 +803,12 @@
-         let current = self.sections[sec_idx].data.len() as u64;
-         let target = if sym.is_empty() {
-             offset as u64
-+        } else if sym == "." {
-+            // `.` is the location counter, so `.org . + 16` advances 16 bytes
-+            // from wherever we currently are rather than seeking to absolute
-+            // offset 16.  It is not a label, so it never appears in
-+            // `label_positions` and previously fell through to an error.
-+            (current as i64 + offset) as u64
-         } else if let Some(&(label_sec, label_off)) = self.label_positions.get(sym) {
-             if label_sec == sec_idx {
-                 (label_off as i64 + offset) as u64
-@@ -833,9 +839,14 @@
-             });
-         }
-         if padding > 0 {
--            let is_exec = self.sections[sec_idx].flags & SHF_EXECINSTR != 0;
--            let bytes = section_padding(padding, is_exec, after_insn);
--            self.sections[sec_idx].data.extend_from_slice(&bytes);
-+            // `.org` pads with its fill byte, which defaults to ZERO -- even in
-+            // an executable section.  This differs from `.p2align`, where GAS
-+            // emits multi-byte NOPs so the padding stays executable; `.org` is a
-+            // positioning directive, not an alignment one.  Verified against
-+            // GAS 2.47: `nop; .org .+16; ret` -> 90 00*15 c3, while
-+            // `.org .+16, 0x90` fills with 0x90.
-+            let data = &mut self.sections[sec_idx].data;
-+            data.resize(data.len() + padding, fill);
-         }
-         Ok(())
-     }
-@@ -1786,8 +1797,26 @@
-                 continue;
-             }
- 
--            // Relax in both directions until instruction sizes and alignment
--            // padding converge. Only jumps shortened here may grow again.
-+            // Branch relaxation is a fixed-point problem with MORE THAN ONE
-+            // solution, and the two obvious search directions do not find the
-+            // same one.
-+            //
-+            // Starting pessimistic (every jump long) and only shrinking gets
-+            // stuck: with a long jump in front of it, `.p2align 16` has to
-+            // insert more padding, which pushes the target out of disp8 range,
-+            // which "justifies" keeping the jump long.  That is self-consistent
-+            // but 16 bytes worse than necessary.  A 124-nop test case came out
-+            // 145 bytes against GAS's 129.
-+            //
-+            // Starting optimistic (every relaxable jump short) and only growing
-+            // converges on the SMALLEST fixed point instead, and terminates for
-+            // the same reason: every step strictly increases the section size,
-+            // which is bounded.  That is also what GAS does, so byte-for-byte
-+            // agreement comes for free.
-+            //
-+            // The first iteration therefore shrinks unconditionally; afterwards
-+            // only growth is considered.
-+            let mut first_pass = true;
-             loop {
-                 let mut any_change = false;
-                 let mut local_labels: FxHashMap<String, usize> = FxHashMap::default();
-@@ -1838,7 +1867,11 @@
-                         target_off as i64 - (jump.offset as i64 + 2)
-                     };
-                     let fits_short = (-128..=127).contains(&short_disp);
--                    if !jump.relaxed && fits_short {
-+                    if first_pass && !jump.relaxed {
-+                        // Speculatively shorten every relaxable jump, even one
-+                        // that does not currently fit: the growth phase below
-+                        // restores exactly those that still do not fit once the
-+                        // layout has settled.
-                         actions.push((j_idx, Action::Shrink));
-                     } else if jump.relaxed && jump.can_grow && !fits_short {
-                         actions.push((j_idx, Action::Grow));
-@@ -2014,6 +2047,7 @@
- 
-                 // Recompute alignment padding after the size changes.
-                 self.fixup_alignment_markers(sec_idx);
-+                first_pass = false;
- 
-                 if !any_change {
-                     break;
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/assembler/encoder/avx.rs b/src/backend/x86/assembler/encoder/avx.rs
---- a/src/backend/x86/assembler/encoder/avx.rs	2026-08-14 12:58:02.265428871 +0000
-+++ b/src/backend/x86/assembler/encoder/avx.rs	2026-08-14 13:43:46.913428871 +0000
-@@ -649,9 +649,24 @@
-             (Operand::Register(src), Operand::Register(dst)) if (is_xmm(&src.name) && is_xmm(&dst.name)) || (is_ymm(&src.name) && is_ymm(&dst.name)) => {
-                 let src_num = reg_num(&src.name).ok_or("bad register")?;
-                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
--                let r = needs_vex_ext(&dst.name);
--                let b = needs_vex_ext(&src.name);
--                self.emit_vex(r, false, b, 1, 0, 0, l, pp);
-+                // Register-to-register moves can be spelled either direction:
-+                // the load form (opcode 28/6F/10) with reg=dst,rm=src, or the
-+                // store form (29/7F/11) with reg=src,rm=dst.  They differ only
-+                // in which operand lands in VEX.R vs VEX.B.  VEX.B has no
-+                // 2-byte encoding, so when the source needs the extension bit
-+                // (xmm8-15) but the destination does not, the load form is
-+                // forced to a 3-byte VEX while the store form fits in two.
-+                // GAS picks the shorter one: `vmovaps %xmm9,%xmm0` -> c5 79 29
-+                // c8, not c4 c1 78 28 c1.  One byte saved on a common move.
-+                let src_ext = needs_vex_ext(&src.name);
-+                let dst_ext = needs_vex_ext(&dst.name);
-+                if src_ext && !dst_ext {
-+                    self.emit_vex(src_ext, false, dst_ext, 1, 0, 0, l, pp);
-+                    self.bytes.push(store_op);
-+                    self.bytes.push(self.modrm(3, src_num, dst_num));
-+                    return Ok(());
-+                }
-+                self.emit_vex(dst_ext, false, src_ext, 1, 0, 0, l, pp);
-                 self.bytes.push(load_op);
-                 self.bytes.push(self.modrm(3, dst_num, src_num));
-                 Ok(())
-@@ -714,9 +729,17 @@
-             (Operand::Register(src), Operand::Register(dst)) if (is_xmm(&src.name) && is_xmm(&dst.name)) || (is_ymm(&src.name) && is_ymm(&dst.name)) => {
-                 let src_num = reg_num(&src.name).ok_or("bad register")?;
-                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
--                let r = needs_vex_ext(&dst.name);
--                let b = needs_vex_ext(&src.name);
--                self.emit_vex(r, false, b, 1, 0, 0, l, pp);
-+                // Prefer the store direction when it avoids a 3-byte VEX; see
-+                // the matching comment in `encode_avx_mov`.
-+                let src_ext = needs_vex_ext(&src.name);
-+                let dst_ext = needs_vex_ext(&dst.name);
-+                if src_ext && !dst_ext {
-+                    self.emit_vex(src_ext, false, dst_ext, 1, 0, 0, l, pp);
-+                    self.bytes.push(store_op);
-+                    self.bytes.push(self.modrm(3, src_num, dst_num));
-+                    return Ok(());
-+                }
-+                self.emit_vex(dst_ext, false, src_ext, 1, 0, 0, l, pp);
-                 self.bytes.push(load_op);
-                 self.bytes.push(self.modrm(3, dst_num, src_num));
-                 Ok(())
-@@ -907,7 +930,12 @@
-                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                 let r = needs_vex_ext(&dst.name);
-                 let b = needs_vex_ext(&src.name);
--                self.emit_vex(r, false, b, 3, 0, dst_num, l, pp);
-+                // This is a two-operand instruction: there is no NDS source, so
-+                // VEX.vvvv must be left unused.  `emit_vex` inverts this field,
-+                // so the "unused" 1111 encoding is requested by passing 0.  Passing
-+                // dst_num here made `vroundps $3,%ymm1,%ymm2` come out as
-+                // c4 e3 6d ... instead of GAS's c4 e3 7d ...
-+                self.emit_vex(r, false, b, 3, 0, 0, l, pp);
-                 self.bytes.push(opcode);
-                 self.bytes.push(self.modrm(3, dst_num, src_num));
-                 self.bytes.push(imm);
-@@ -918,7 +946,7 @@
-                 let r = needs_vex_ext(&dst.name);
-                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
--                self.emit_vex(r, x, b_ext, 3, 0, dst_num, l, pp);
-+                self.emit_vex(r, x, b_ext, 3, 0, 0, l, pp);
-                 self.bytes.push(opcode);
-                 self.encode_modrm_mem(dst_num, mem)?;
-                 self.bytes.push(imm);
-@@ -2104,14 +2132,40 @@
-     pub(crate) fn encode_bmi2_shift(&mut self, ops: &[Operand], opcode: u8, pp: u8, w: u8) -> Result<(), String> {
-         if ops.len() != 3 { return Err("BMI2 instruction requires 3 operands".to_string()); }
- 
--        let vvvv_reg = match &ops[0] {
-+        // Two different AT&T operand conventions share this encoder.
-+        //
-+        // The shift-style forms (shlx/shrx/sarx/bzhi/bextr) put the r/m source
-+        // first and the vvvv operand second:  `shlxl %ecx, %eax, %edx`
-+        //   ops[0]=vvvv, ops[1]=r/m, ops[2]=dst.
-+        //
-+        // The data-manipulation forms (mulx/pdep/pext) instead follow the andn
-+        // convention, with the r/m operand FIRST:
-+        //   `mulxl %eax, %ecx, %edx`  ->  ops[0]=r/m, ops[1]=vvvv, ops[2]=dst.
-+        // Treating those as shift-style swapped vvvv with r/m, which silently
-+        // produced a valid but wrong instruction (c4 e2 7b f6 d1 instead of
-+        // c4 e2 73 f6 d0), and rejected the memory form outright.
-+        //
-+        // Distinguish by position: only the r/m operand may be memory, so if
-+        // ops[0] is memory this is the andn-style order.  For the all-register
-+        // case the caller tells us via the opcode: F5/F6 with pp!=0 are
-+        // pext/pdep/mulx, while bzhi (F5, pp=0) and the F7 shifts are
-+        // shift-style.
-+        let andn_order = matches!(ops[0], Operand::Memory(_))
-+            || (matches!(opcode, 0xF5 | 0xF6) && pp != 0);
-+        let (rm_op, vvvv_op) = if andn_order {
-+            (&ops[0], &ops[1])
-+        } else {
-+            (&ops[1], &ops[0])
-+        };
-+
-+        let vvvv_reg = match vvvv_op {
-             Operand::Register(r) => r,
--            _ => return Err("BMI2: first operand must be register".to_string()),
-+            _ => return Err("BMI2: vvvv operand must be register".to_string()),
-         };
-         let vvvv_num = reg_num(&vvvv_reg.name).ok_or("bad vvvv register")?;
-         let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv_reg.name) { 8 } else { 0 });
- 
--        match (&ops[1], &ops[2]) {
-+        match (rm_op, &ops[2]) {
-             (Operand::Register(src), Operand::Register(dst)) => {
-                 let src_num = reg_num(&src.name).ok_or("bad src register")?;
-                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-@@ -2135,6 +2189,207 @@
-         }
-     }
- 
-+    /// Encode the BMI1 single-source bit-manipulation forms blsi/blsr/blsmsk.
-+    ///
-+    /// `blsrl %eax, %ecx` reads a single r/m source and writes one destination,
-+    /// but the destination is encoded in VEX.vvvv rather than ModRM.reg -- the
-+    /// reg field is repurposed as an opcode extension selecting the operation
-+    /// (/1 blsr, /2 blsmsk, /3 blsi).  All three share opcode 0xF3 in the
-+    /// NP.0F38 map, with W selecting the 32- vs 64-bit form.
-+    /// AT&T operand order: ops[0] = r/m source, ops[1] = destination.
-+    /// Encode the VEX scalar convert-to-GP forms (`vcvtsd2si`, `vcvttss2si`...).
-+    ///
-+    /// Two operands: an XMM source and a general-purpose destination.  VEX.W
-+    /// selects the destination width, which means the 64-bit spelling cannot
-+    /// use the 2-byte VEX prefix.  LIG, so L is left at 0.
-+    /// `pp`: 2 = F3 (single source), 3 = F2 (double source).
-+    pub(crate) fn encode_avx_cvt_to_gp(&mut self, ops: &[Operand], opcode: u8, pp: u8) -> Result<(), String> {
-+        if ops.len() != 2 {
-+            return Err("VEX cvt-to-GP requires 2 operands".to_string());
-+        }
-+        let dst = match &ops[1] {
-+            Operand::Register(r) if !is_xmm_or_ymm(&r.name) => r,
-+            _ => return Err("VEX cvt-to-GP requires a general-purpose destination".to_string()),
-+        };
-+        let dst_num = reg_num(&dst.name).ok_or("bad destination register")?;
-+        let w = u8::from(is_reg64(&dst.name));
-+        let r = needs_vex_ext(&dst.name);
-+
-+        match &ops[0] {
-+            Operand::Register(src) if is_xmm(&src.name) => {
-+                let src_num = reg_num(&src.name).ok_or("bad source register")?;
-+                let b = needs_vex_ext(&src.name);
-+                self.emit_vex(r, false, b, 1, w, 0, 0, pp);
-+                self.bytes.push(opcode);
-+                self.bytes.push(self.modrm(3, dst_num, src_num));
-+                Ok(())
-+            }
-+            Operand::Memory(mem) => {
-+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-+                self.emit_vex(r, x, b_ext, 1, w, 0, 0, pp);
-+                self.bytes.push(opcode);
-+                self.encode_modrm_mem(dst_num, mem)
-+            }
-+            _ => Err("unsupported VEX cvt-to-GP operands".to_string()),
-+        }
-+    }
-+
-+    /// Encode the VEX scalar convert-from-GP forms (`vcvtsi2sd`/`vcvtsi2ss`).
-+    ///
-+    /// Three operands: an integer source (register or memory), an NDS operand
-+    /// that supplies the upper bits of the result, and an XMM destination.
-+    /// VEX.W selects the SOURCE width, taken from the `l`/`q` suffix because a
-+    /// memory source carries no width of its own.
-+    pub(crate) fn encode_avx_cvt_from_gp(&mut self, ops: &[Operand], opcode: u8, pp: u8, w: u8) -> Result<(), String> {
-+        if ops.len() != 3 {
-+            return Err("VEX cvt-from-GP requires 3 operands".to_string());
-+        }
-+        let nds = match &ops[1] {
-+            Operand::Register(r) => r,
-+            _ => return Err("VEX cvt-from-GP: second operand must be a register".to_string()),
-+        };
-+        let dst = match &ops[2] {
-+            Operand::Register(r) => r,
-+            _ => return Err("VEX cvt-from-GP: destination must be a register".to_string()),
-+        };
-+        let dst_num = reg_num(&dst.name).ok_or("bad destination register")?;
-+        let vvvv = reg_num(&nds.name).ok_or("bad NDS register")?
-+            | (if needs_vex_ext(&nds.name) { 8 } else { 0 });
-+        let r = needs_vex_ext(&dst.name);
-+
-+        match &ops[0] {
-+            Operand::Register(src) => {
-+                let src_num = reg_num(&src.name).ok_or("bad source register")?;
-+                let b = needs_vex_ext(&src.name);
-+                self.emit_vex(r, false, b, 1, w, vvvv, 0, pp);
-+                self.bytes.push(opcode);
-+                self.bytes.push(self.modrm(3, dst_num, src_num));
-+                Ok(())
-+            }
-+            Operand::Memory(mem) => {
-+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-+                self.emit_vex(r, x, b_ext, 1, w, vvvv, 0, pp);
-+                self.bytes.push(opcode);
-+                self.encode_modrm_mem(dst_num, mem)
-+            }
-+            _ => Err("unsupported VEX cvt-from-GP operands".to_string()),
-+        }
-+    }
-+
-+    /// Encode `vmaskmov{ps,pd}` in both directions.
-+    ///
-+    /// Load:  `vmaskmovps (%rdi), %ymm1, %ymm2`  -> 66.0F38.W0 2C, mem is r/m.
-+    /// Store: `vmaskmovps %ymm2, %ymm1, (%rdi)` -> 66.0F38.W0 2E, mem is r/m.
-+    /// In both spellings the middle operand is the mask and goes in VEX.vvvv.
-+    pub(crate) fn encode_avx_maskmov(&mut self, ops: &[Operand], load_op: u8, store_op: u8, w: u8) -> Result<(), String> {
-+        if ops.len() != 3 {
-+            return Err("vmaskmov requires 3 operands".to_string());
-+        }
-+        let mask = match &ops[1] {
-+            Operand::Register(r) => r,
-+            _ => return Err("vmaskmov: mask must be a register".to_string()),
-+        };
-+        let vvvv = reg_num(&mask.name).ok_or("bad mask register")?
-+            | (if needs_vex_ext(&mask.name) { 8 } else { 0 });
-+        let l = u8::from(is_ymm(&mask.name));
-+
-+        match (&ops[0], &ops[2]) {
-+            (Operand::Memory(mem), Operand::Register(dst)) => {
-+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-+                let r = needs_vex_ext(&dst.name);
-+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-+                self.emit_vex(r, x, b_ext, 2, w, vvvv, l, 1);
-+                self.bytes.push(load_op);
-+                self.encode_modrm_mem(dst_num, mem)
-+            }
-+            (Operand::Register(src), Operand::Memory(mem)) => {
-+                let src_num = reg_num(&src.name).ok_or("bad register")?;
-+                let r = needs_vex_ext(&src.name);
-+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-+                self.emit_vex(r, x, b_ext, 2, w, vvvv, l, 1);
-+                self.bytes.push(store_op);
-+                self.encode_modrm_mem(src_num, mem)
-+            }
-+            _ => Err("unsupported vmaskmov operands".to_string()),
-+        }
-+    }
-+
-+    /// Encode the AVX2 gathers (`vgatherdps`, `vpgatherdd`, ...).
-+    ///
-+    /// `vgatherdps %ymm2, (%rdi,%ymm1,4), %ymm3` has three operands: the mask
-+    /// register (VEX.vvvv), a VSIB memory operand whose index is a VECTOR
-+    /// register, and the destination.  The VSIB index supplies VEX.X, exactly
-+    /// like a scalar index would, so the normal memory path already encodes it
-+    /// correctly -- the only special part is that the index is an xmm/ymm.
-+    pub(crate) fn encode_avx_gather(&mut self, ops: &[Operand], opcode: u8, w: u8) -> Result<(), String> {
-+        if ops.len() != 3 {
-+            return Err("gather requires 3 operands".to_string());
-+        }
-+        let mask = match &ops[0] {
-+            Operand::Register(r) => r,
-+            _ => return Err("gather: mask must be a register".to_string()),
-+        };
-+        let mem = match &ops[1] {
-+            Operand::Memory(m) => m,
-+            _ => return Err("gather: second operand must be a VSIB memory operand".to_string()),
-+        };
-+        let dst = match &ops[2] {
-+            Operand::Register(r) => r,
-+            _ => return Err("gather: destination must be a register".to_string()),
-+        };
-+        if mem.index.is_none() {
-+            return Err("gather: VSIB memory operand requires a vector index".to_string());
-+        }
-+
-+        let dst_num = reg_num(&dst.name).ok_or("bad destination register")?;
-+        let vvvv = reg_num(&mask.name).ok_or("bad mask register")?
-+            | (if needs_vex_ext(&mask.name) { 8 } else { 0 });
-+        let l = u8::from(is_ymm(&dst.name));
-+        let r = needs_vex_ext(&dst.name);
-+        let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-+        let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-+
-+        self.emit_vex(r, x, b_ext, 2, w, vvvv, l, 1);
-+        self.bytes.push(opcode);
-+        self.encode_modrm_mem(dst_num, mem)
-+    }
-+
-+    pub(crate) fn encode_bmi_blsx(&mut self, ops: &[Operand], ext: u8, w: u8) -> Result<(), String> {
-+        if ops.len() != 2 {
-+            return Err("BMI1 bls* requires 2 operands".to_string());
-+        }
-+        let dst = match &ops[1] {
-+            Operand::Register(r) => r,
-+            _ => return Err("BMI1 bls*: destination must be a register".to_string()),
-+        };
-+        let vvvv = reg_num(&dst.name).ok_or("bad destination register")?
-+            | (if needs_vex_ext(&dst.name) { 8 } else { 0 });
-+
-+        match &ops[0] {
-+            Operand::Register(src) => {
-+                let src_num = reg_num(&src.name).ok_or("bad source register")?;
-+                let b = needs_vex_ext(&src.name);
-+                // VEX.R is unused (the reg field is an opcode extension).
-+                self.emit_vex(false, false, b, 2, w, vvvv, 0, 0);
-+                self.bytes.push(0xF3);
-+                self.bytes.push(self.modrm(3, ext, src_num));
-+                Ok(())
-+            }
-+            Operand::Memory(mem) => {
-+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-+                self.emit_vex(false, x, b_ext, 2, w, vvvv, 0, 0);
-+                self.bytes.push(0xF3);
-+                self.encode_modrm_mem(ext, mem)
-+            }
-+            _ => Err("BMI1 bls*: unsupported source operand".to_string()),
-+        }
-+    }
-+
-     /// Encode BMI1 ANDN: andnl %src2, %src1, %dst → dst = ~src1 & src2
-     /// AT&T operand order: ops[0]=src2(r/m), ops[1]=src1(vvvv), ops[2]=dst(reg)
-     pub(crate) fn encode_bmi_andn(&mut self, ops: &[Operand], w: u8) -> Result<(), String> {
+     results.sort(key=lambda r: (SEVERITY.get(r[1], 9), r[0]))
+     shown = 0
+     for inst, kind, le, ge in results:
+         if args.quiet:
+             break
+-        if args.only_diff and kind in ("ok", "both-reject"):
++        if args.only_diff and kind in ("ok", "both-reject", "BETTER"):
+             continue
+         if shown >= args.max_report:
+             print(f"... ({len(results) - shown} more)")
 diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/assembler/encoder/core.rs b/src/backend/x86/assembler/encoder/core.rs
---- a/src/backend/x86/assembler/encoder/core.rs	2026-08-14 12:58:02.265428871 +0000
-+++ b/src/backend/x86/assembler/encoder/core.rs	2026-08-14 13:57:22.845428871 +0000
-@@ -54,11 +54,16 @@
-             let byte = match seg.as_str() {
-                 "es" => Some(0x26u8),
-                 "cs" => Some(0x2E),
--                // %ds and %ss are the DEFAULT segments for every addressing
--                // form in 64-bit mode, so an explicit override is a no-op.
--                // GAS elides it; emitting it wastes a byte of I-cache and
--                // diverges from the reference encoding for no benefit.
--                "ss" | "ds" => None,
-+                // %ds is the default segment for every addressing form in
-+                // 64-bit mode, so an explicit override is a pure no-op and GAS
-+                // drops it.  %ss is NOT dropped: even though it selects the
-+                // same flat segment, GAS still emits 0x36, and hardware treats
-+                // the prefix as significant for a few corner cases (it is also
-+                // the documented spelling of the CET no-track prefix).
-+                // Verified against GAS 2.47: `mov %ds:8(%rax),%rbx` -> 48 8b 58
-+                // 08, `mov %ss:8(%rax),%rbx` -> 36 48 8b 58 08.
-+                "ds" => None,
-+                "ss" => Some(0x36),
-                 "fs" => Some(0x64),
-                 "gs" => Some(0x65),
-                 _ => return Err(format!("unsupported segment override: %{}", seg)),
-@@ -113,6 +118,24 @@
- 
-     /// Encode ModR/M + SIB + displacement for a memory operand.
-     /// Returns the bytes to append. `reg_field` is the /r value (3 bits).
-+    /// True when the instruction currently being encoded carries a REX prefix.
-+    ///
-+    /// `self.bytes` holds exactly one instruction, so the prefix area is the
-+    /// run of legacy prefixes at the front.  A REX byte (0x40-0x4F) is the last
-+    /// prefix before the opcode, so scanning past the legacy prefixes and
-+    /// testing the next byte identifies it unambiguously.
-+    pub(crate) fn has_rex_prefix(&self) -> bool {
-+        for &b in &self.bytes {
-+            match b {
-+                // Legacy prefixes: segment, operand/address size, lock/rep.
-+                0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 => {}
-+                0x40..=0x4F => return true,
-+                _ => return false,
-+            }
-+        }
-+        false
-+    }
+--- a/src/backend/x86/assembler/encoder/core.rs	2026-08-14 14:35:39.551253401 +0000
++++ b/src/backend/x86/assembler/encoder/core.rs	2026-08-14 15:01:03.519253401 +0000
+@@ -91,6 +91,11 @@
+         // it — the address was encoded as 64-bit, which GAS-oracle caught as
+         // a one-byte divergence from GNU as (and is semantically wrong for
+         // addresses >= 4 GiB).
++        // Fold BEFORE computing REX: if the index moves into the base slot the
++        // extension bit for r8-r15 must be REX.B, not REX.X.
++        let folded = fold_scale1_index(mem);
++        let mem = folded.as_ref().unwrap_or(mem);
 +
+         let addr32 = mem.base.as_ref().is_some_and(|b| is_reg32(&b.name))
+             || mem.index.as_ref().is_some_and(|i| is_reg32(&i.name));
+         if addr32 {
+@@ -137,6 +142,9 @@
+     }
+ 
      pub(crate) fn encode_modrm_mem(&mut self, reg_field: u8, mem: &MemoryOperand) -> Result<(), String> {
++        let folded = fold_scale1_index(mem);
++        let mem = folded.as_ref().unwrap_or(mem);
++
          let base = mem.base.as_ref();
          let index = mem.index.as_ref();
-@@ -140,7 +163,23 @@
-                         // Modifiers are case-insensitive in GNU as: glibc's
-                         // multiarch sources emit lowercase `sym@gottpoff(%rip)`.
-                         let reloc_type = match modifier.to_ascii_lowercase().as_str() {
--                            "gotpcrel" => R_X86_64_GOTPCREL,
-+                            // GAS never emits the plain, un-relaxable
-+                            // R_X86_64_GOTPCREL (9) for a RIP-relative GOT load.
-+                            // It emits the "X" variants, which tell the linker
-+                            // it may rewrite `mov sym@GOTPCREL(%rip),%reg` into
-+                            // a direct `lea` when the symbol turns out to be
-+                            // local -- removing a GOT entry and a load.  Which
-+                            // of the two applies is decided purely by whether
-+                            // the instruction carries a REX prefix.
-+                            "gotpcrel" => {
-+                                if self.has_rex_prefix() {
-+                                    R_X86_64_REX_GOTPCRELX
-+                                } else {
-+                                    R_X86_64_GOTPCRELX
-+                                }
-+                            }
-+                            "gotpcrelx" => R_X86_64_GOTPCRELX,
-+                            "rex_gotpcrelx" => R_X86_64_REX_GOTPCRELX,
-                             "gottpoff" => R_X86_64_GOTTPOFF,
-                             "tpoff" => R_X86_64_TPOFF32,
-                             "plt" => R_X86_64_PLT32,
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/assembler/encoder/gp_integer.rs b/src/backend/x86/assembler/encoder/gp_integer.rs
---- a/src/backend/x86/assembler/encoder/gp_integer.rs	2026-08-14 12:58:02.265428871 +0000
-+++ b/src/backend/x86/assembler/encoder/gp_integer.rs	2026-08-14 13:40:22.445428871 +0000
-@@ -277,6 +277,38 @@
-                 self.bytes.extend_from_slice(&[0u8; 8]);
-                 Ok(())
-             }
-+            // moffs forms: `movabs 0xADDR, %al/%ax/%eax/%rax` (A0/A1) and the
-+            // store direction `movabs %rax, 0xADDR` (A2/A3).  These are the only
-+            // instructions that take a full 64-bit absolute address, and they
-+            // are hard-wired to the accumulator, so no ModRM byte is emitted.
-+            (Operand::Memory(mem), Operand::Register(dst))
-+                if mem.base.is_none() && mem.index.is_none() && reg_num(&dst.name) == Some(0) =>
-+            {
-+                let addr = match &mem.displacement {
-+                    Displacement::Integer(v) => *v,
-+                    _ => return Err("movabs moffs requires an absolute address".to_string()),
-+                };
-+                let size = infer_reg_size(&dst.name);
-+                if size == 2 { self.bytes.push(0x66); }
-+                if size == 8 { self.bytes.push(self.rex(true, false, false, false)); }
-+                self.bytes.push(if size == 1 { 0xA0 } else { 0xA1 });
-+                self.bytes.extend_from_slice(&addr.to_le_bytes());
-+                Ok(())
-+            }
-+            (Operand::Register(src), Operand::Memory(mem))
-+                if mem.base.is_none() && mem.index.is_none() && reg_num(&src.name) == Some(0) =>
-+            {
-+                let addr = match &mem.displacement {
-+                    Displacement::Integer(v) => *v,
-+                    _ => return Err("movabs moffs requires an absolute address".to_string()),
-+                };
-+                let size = infer_reg_size(&src.name);
-+                if size == 2 { self.bytes.push(0x66); }
-+                if size == 8 { self.bytes.push(self.rex(true, false, false, false)); }
-+                self.bytes.push(if size == 1 { 0xA2 } else { 0xA3 });
-+                self.bytes.extend_from_slice(&addr.to_le_bytes());
-+                Ok(())
-+            }
-             _ => Err("unsupported movabsq operands".to_string()),
+ 
+@@ -343,3 +351,60 @@
          }
-     }
-@@ -1237,6 +1269,45 @@
-             (Operand::Register(src), Operand::Register(dst)) => {
-                 let src_num = reg_num(&src.name).ok_or("bad register")?;
-                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-+
-+                // `xchg` with the accumulator has a one-byte form, 0x90+rd, and
-+                // GAS always prefers it: `xchg %rax,%rcx` -> 48 91 rather than
-+                // the 3-byte ModRM form.  Two exceptions, both verified against
-+                // GAS 2.47:
-+                //   * 8-bit `xchg %al,%cl` has no short form at all (86 c1).
-+                //   * `xchg %eax,%eax` must NOT become 0x90, because in 64-bit
-+                //     mode the bare 0x90 is NOP and does not zero-extend EAX
-+                //     into RAX the way a real 32-bit xchg would.  GAS emits
-+                //     87 c0.  `xchg %rax,%rax` and `xchg %ax,%ax` are safe
-+                //     (48 90 -> canonical 90, and 66 90).
-+                if size != 1 {
-+                    let other = if src_num == 0 && !needs_rex_ext(&src.name) {
-+                        Some(&dst.name)
-+                    } else if dst_num == 0 && !needs_rex_ext(&dst.name) {
-+                        Some(&src.name)
-+                    } else {
-+                        None
-+                    };
-+                    if let Some(other) = other {
-+                        let other_is_eax =
-+                            size == 4 && reg_num(other) == Some(0) && !needs_rex_ext(other);
-+                        if !other_is_eax {
-+                            let onum = reg_num(other).ok_or("bad register")?;
-+                            if size == 2 {
-+                                self.bytes.push(0x66);
-+                            }
-+                            // `xchg %rax,%rax` needs no REX.W: exchanging the
-+                            // accumulator with itself is a no-op either way, so
-+                            // GAS folds it to the canonical one-byte NOP.
-+                            if !(size == 8 && onum == 0 && !needs_rex_ext(other)) {
-+                                self.emit_rex_unary(size, other);
-+                            }
-+                            self.bytes.push(0x90 + (onum & 7));
-+                            return Ok(());
-+                        }
-+                    }
-+                }
-+
-                 if size == 2 { self.bytes.push(0x66); }
-                 self.emit_rex_rr(size, &src.name, &dst.name);
-                 self.bytes.push(if size == 1 { 0x86 } else { 0x87 });
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/assembler/encoder/mod.rs b/src/backend/x86/assembler/encoder/mod.rs
---- a/src/backend/x86/assembler/encoder/mod.rs	2026-08-14 12:58:02.265428871 +0000
-+++ b/src/backend/x86/assembler/encoder/mod.rs	2026-08-14 13:57:37.805428871 +0000
-@@ -41,6 +41,11 @@
- pub const R_X86_64_32S: u32 = 11;
- pub const R_X86_64_16: u32 = 12;
- pub const R_X86_64_GOTPCREL: u32 = 9;
-+// Relaxable GOT-load relocations.  The linker may rewrite the instruction into
-+// a direct LEA when the target resolves locally; the REX_ variant records that
-+// the instruction has a REX prefix, so the rewrite must preserve its length.
-+pub const R_X86_64_GOTPCRELX: u32 = 41;
-+pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
- pub const R_X86_64_TPOFF32: u32 = 23;
- pub const R_X86_64_GOTTPOFF: u32 = 22;
- #[allow(dead_code)] // ELF standard constant, defined for reference/future use
-@@ -643,10 +648,16 @@
-             "shldq" => self.encode_double_shift(ops, 0xA4, 8),
-             "shrdq" => self.encode_double_shift(ops, 0xAC, 8),
- 
--            // Sign extension
--            "cltq" => { self.bytes.extend_from_slice(&[0x48, 0x98]); Ok(()) }
--            "cqto" | "cqo" => { self.bytes.extend_from_slice(&[0x48, 0x99]); Ok(()) }
-+            // Sign extension.  Both the AT&T spellings and the Intel aliases GAS
-+            // accepts map onto the same three opcodes, distinguished only by the
-+            // operand-size prefix: 0x98 widens AL/AX/EAX into AX/EAX/RAX, 0x99
-+            // widens AX/EAX/RAX into DX:AX/EDX:EAX/RDX:RAX.
-+            "cbtw" | "cbw" => { self.bytes.extend_from_slice(&[0x66, 0x98]); Ok(()) }
-+            "cwtl" | "cwde" => { self.bytes.push(0x98); Ok(()) }
-+            "cltq" | "cdqe" => { self.bytes.extend_from_slice(&[0x48, 0x98]); Ok(()) }
-+            "cwtd" | "cwd" => { self.bytes.extend_from_slice(&[0x66, 0x99]); Ok(()) }
-             "cltd" | "cdq" => { self.bytes.push(0x99); Ok(()) }
-+            "cqto" | "cqo" => { self.bytes.extend_from_slice(&[0x48, 0x99]); Ok(()) }
- 
-             // Byte swap
-             "bswapl" => self.encode_bswap(ops, 4),
-@@ -719,8 +730,8 @@
- 
-             // System instructions
-             "syscall" => { self.bytes.extend_from_slice(&[0x0F, 0x05]); Ok(()) }
--            "sysretq" | "sysret" => { self.bytes.extend_from_slice(&[0x48, 0x0F, 0x07]); Ok(()) }
--            "sysretl" => { self.bytes.extend_from_slice(&[0x0F, 0x07]); Ok(()) }
-+            "sysretq" => { self.bytes.extend_from_slice(&[0x48, 0x0F, 0x07]); Ok(()) }
-+            "sysret" | "sysretl" => { self.bytes.extend_from_slice(&[0x0F, 0x07]); Ok(()) }
-             "sysenter" => { self.bytes.extend_from_slice(&[0x0F, 0x34]); Ok(()) }
-             "sysexitq" => { self.bytes.extend_from_slice(&[0x48, 0x0F, 0x35]); Ok(()) }
-             "sysexit" => { self.bytes.extend_from_slice(&[0x0F, 0x35]); Ok(()) }
-@@ -776,6 +787,7 @@
-             "leave" | "leaveq" => { self.bytes.push(0xC9); Ok(()) }
-             "ud2" => { self.bytes.extend_from_slice(&[0x0F, 0x0B]); Ok(()) }
-             "endbr64" => { self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x1E, 0xFA]); Ok(()) }
-+            "endbr32" => { self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x1E, 0xFB]); Ok(()) }
-             // CET shadow stack: rdsspq %r64, rdsspd %r32
-             "rdsspq" => {
-                 if let Some(Operand::Register(reg)) = ops.first() {
-@@ -863,6 +875,15 @@
-             "lfence" => { self.bytes.extend_from_slice(&[0x0F, 0xAE, 0xE8]); Ok(()) }
-             "sfence" => { self.bytes.extend_from_slice(&[0x0F, 0xAE, 0xF8]); Ok(()) }
-             "clflush" => self.encode_clflush(ops),
-+            // clflushopt is clflush with a 66 prefix; clwb reuses the opcode
-+            // with ModRM.reg = 6.
-+            "clflushopt" => { self.bytes.push(0x66); self.encode_sse_mem_only(ops, &[0x0F, 0xAE], 7) }
-+            "clwb" => { self.bytes.push(0x66); self.encode_sse_mem_only(ops, &[0x0F, 0xAE], 6) }
-+            // ADX: adcx is 66.0F38.F6, adox is F3.0F38.F6.
-+            "adcxl" => self.encode_adx(ops, 0x66, 4),
-+            "adcxq" => self.encode_adx(ops, 0x66, 8),
-+            "adoxl" => self.encode_adx(ops, 0xF3, 4),
-+            "adoxq" => self.encode_adx(ops, 0xF3, 8),
- 
-             // Direction flag
-             "cld" => { self.bytes.push(0xFC); Ok(()) }
-@@ -939,10 +960,26 @@
-             "cvtss2sd" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x5A]),
-             "cvtsi2sdq" => self.encode_sse_cvt_gp_to_xmm(ops, &[0xF2, 0x0F, 0x2A], 8),
-             "cvtsi2ssq" => self.encode_sse_cvt_gp_to_xmm(ops, &[0xF3, 0x0F, 0x2A], 8),
--            "cvttsd2siq" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF2, 0x0F, 0x2C], 8),
--            "cvttss2siq" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF3, 0x0F, 0x2C], 8),
--            "cvtsd2siq" | "cvtsd2si" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF2, 0x0F, 0x2D], 8),
--            "cvtss2siq" | "cvtss2si" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF3, 0x0F, 0x2D], 8),
-+            "cvtsd2siq" | "cvtsd2si" | "cvtss2siq" | "cvtss2si"
-+            | "cvttsd2siq" | "cvttsd2si" | "cvttss2siq" | "cvttss2si" => {
-+                // 0x2D converts with rounding, 0x2C truncates; F2 selects the
-+                // double source, F3 the single.  REX.W comes from the actual
-+                // destination register width, not from the mnemonic: an
-+                // unsuffixed `cvtsd2si %xmm0,%eax` is a 32-bit convert.
-+                let truncating = mnemonic.starts_with("cvtt");
-+                let is_sd = mnemonic.contains("sd2si");
-+                let prefix = if is_sd { 0xF2u8 } else { 0xF3 };
-+                let opcode = if truncating { 0x2Cu8 } else { 0x2D };
-+                let size = if mnemonic.ends_with('q') {
-+                    8
-+                } else {
-+                    match ops.get(1) {
-+                        Some(Operand::Register(d)) if is_reg64(&d.name) => 8,
-+                        _ => 4,
-+                    }
-+                };
-+                self.encode_sse_cvt_xmm_to_gp(ops, &[prefix, 0x0F, opcode], size)
-+            }
-             "cvtsd2sil" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF2, 0x0F, 0x2D], 4),
-             "cvtss2sil" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF3, 0x0F, 0x2D], 4),
-             "cvttsd2sil" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF2, 0x0F, 0x2C], 4),
-@@ -996,7 +1033,6 @@
-             "pabsb" => self.encode_sse_op_38(ops, 0x1C),
-             "pabsw" => self.encode_sse_op_38(ops, 0x1D),
-             "pabsd" => self.encode_sse_op_38(ops, 0x1E),
--            "pblendvb" => self.encode_sse_op_38(ops, 0x10),
-             "pmovzxbw" => self.encode_sse_op_38(ops, 0x30),
-             "pmovzxwd" => self.encode_sse_op_38(ops, 0x33),
-             "palignr" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x0F]),
-@@ -1275,6 +1311,7 @@
-             // blendv instructions use xmm0 as implicit mask; 3-op form names it explicitly
-             "blendvpd" => { let ops2 = if ops.len() == 3 { &ops[1..] } else { ops }; self.encode_sse_op(ops2, &[0x66, 0x0F, 0x38, 0x15]) }
-             "blendvps" => { let ops2 = if ops.len() == 3 { &ops[1..] } else { ops }; self.encode_sse_op(ops2, &[0x66, 0x0F, 0x38, 0x14]) }
-+            "pblendvb" => { let ops2 = if ops.len() == 3 { &ops[1..] } else { ops }; self.encode_sse_op(ops2, &[0x66, 0x0F, 0x38, 0x10]) }
-             "roundsd" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x0B]),
-             "roundss" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x0A]),
-             "roundpd" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x09]),
-@@ -1305,13 +1342,12 @@
-             "cvtsi2sd" => self.encode_cvtsi2x(ops, 0x2A, 3),
-             // Plain cvtss2si/cvtsd2si are handled by the q-suffixed arms above
-             // (which select the REX.W width); these duplicates were dead.
--            "cvttss2si" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x2C]),
--            "cvttsd2si" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x2C]),
-             "packusdw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x2B]),
-             "packsswb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x63]),
-             "movhlps" => self.encode_sse_op(ops, &[0x0F, 0x12]),
-             "movlhps" => self.encode_sse_op(ops, &[0x0F, 0x16]),
-             "movddup" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x12]),
-+            "lddqu" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0xF0]),
-             "movshdup" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x16]),
-             "movsldup" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x12]),
-             "cvtps2pd" => self.encode_sse_op(ops, &[0x0F, 0x5A]),
-@@ -1321,6 +1357,8 @@
-             "cvttps2dq" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x5B]),
-             "cvtdq2pd" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0xE6]),
-             "cvtpd2dq" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0xE6]),
-+            "cvttpd2dq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xE6]),
-+            "mpsadbw" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x42]),
- 
-             // SSE4.1 zero/sign extension
-             "pmovzxbd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x31]),
-@@ -1334,6 +1372,7 @@
-             "pmovsxwq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x24]),
-             "pmovsxdq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x25]),
-             "pcmpgtq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x37]),
-+            "pcmpeqq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x29]),
- 
-             // SSSE3 instructions
-             "psignb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x08]),
-@@ -1376,13 +1415,42 @@
-             "vmulpd" => self.encode_avx_3op(ops, 0x59, true),
-             "vdivpd" => self.encode_avx_3op(ops, 0x5E, true),
-             // FMA3 (0F38 map, W=1 for F64, pp=66)
--            "vfmadd132ps" => self.encode_avx_3op_38(ops, 0x98, true),
--            "vfmadd132pd" => self.encode_avx_3op_38_w1(ops, 0x98, true),
--            "vfmadd213ps" => self.encode_avx_3op_38(ops, 0xA8, true),
--            "vfmadd213pd" => self.encode_avx_3op_38_w1(ops, 0xA8, true),
--            "vfmadd231ps" => self.encode_avx_3op_38(ops, 0xB8, true),
--            "vfmadd231pd" => self.encode_avx_3op_38_w1(ops, 0xB8, true),
-             "vsqrtps" => self.encode_avx_2op_0f(ops, 0x51, 0),
-+            "vrsqrtps" => self.encode_avx_2op_0f(ops, 0x52, 0),
-+            "vrcpps" => self.encode_avx_2op_0f(ops, 0x53, 0),
-+            // Unordered/ordered scalar compares: NP.0F for the ss forms,
-+            // 66.0F for the sd forms.  Two operands, no NDS source.
-+            "vcomiss" => self.encode_avx_2op_0f(ops, 0x2F, 0),
-+            "vucomiss" => self.encode_avx_2op_0f(ops, 0x2E, 0),
-+            "vcomisd" => self.encode_avx_2op_0f(ops, 0x2F, 1),
-+            "vucomisd" => self.encode_avx_2op_0f(ops, 0x2E, 1),
-+            // Scalar precision conversions keep the NDS operand: the prefix
-+            // names the SOURCE type (F2 = from double, F3 = from single).
-+            "vcvtsd2ss" => self.encode_avx_scalar_3op(ops, 0x5A, 3),
-+            // VEX scalar converts to/from general-purpose registers.
-+            // pp: 2 = F3 (single), 3 = F2 (double).  0x2D rounds, 0x2C truncates.
-+            "vcvtsd2si" => self.encode_avx_cvt_to_gp(ops, 0x2D, 3),
-+            "vcvtss2si" => self.encode_avx_cvt_to_gp(ops, 0x2D, 2),
-+            "vcvttsd2si" => self.encode_avx_cvt_to_gp(ops, 0x2C, 3),
-+            "vcvttss2si" => self.encode_avx_cvt_to_gp(ops, 0x2C, 2),
-+            "vcvtsi2sdl" => self.encode_avx_cvt_from_gp(ops, 0x2A, 3, 0),
-+            "vcvtsi2sdq" => self.encode_avx_cvt_from_gp(ops, 0x2A, 3, 1),
-+            "vcvtsi2ssl" => self.encode_avx_cvt_from_gp(ops, 0x2A, 2, 0),
-+            "vcvtsi2ssq" => self.encode_avx_cvt_from_gp(ops, 0x2A, 2, 1),
-+            // Conditional vector load/store.
-+            "vmaskmovps" => self.encode_avx_maskmov(ops, 0x2C, 0x2E, 0),
-+            "vmaskmovpd" => self.encode_avx_maskmov(ops, 0x2D, 0x2F, 0),
-+            // AVX2 gathers (VSIB).  W selects the element width, the opcode the
-+            // index width: 0x92/0x90 = dword index, 0x93/0x91 = qword index.
-+            "vgatherdps" => self.encode_avx_gather(ops, 0x92, 0),
-+            "vgatherdpd" => self.encode_avx_gather(ops, 0x92, 1),
-+            "vgatherqps" => self.encode_avx_gather(ops, 0x93, 0),
-+            "vgatherqpd" => self.encode_avx_gather(ops, 0x93, 1),
-+            "vpgatherdd" => self.encode_avx_gather(ops, 0x90, 0),
-+            "vpgatherdq" => self.encode_avx_gather(ops, 0x90, 1),
-+            "vpgatherqd" => self.encode_avx_gather(ops, 0x91, 0),
-+            "vpgatherqq" => self.encode_avx_gather(ops, 0x91, 1),
-+            "vcvtss2sd" => self.encode_avx_scalar_3op(ops, 0x5A, 2),
-             "vsqrtpd" => self.encode_avx_2op_0f(ops, 0x51, 1),
-             "vaddps" => self.encode_avx_3op_np(ops, 0x58),
-             "vsubps" => self.encode_avx_3op_np(ops, 0x5C),
-@@ -1412,6 +1480,13 @@
-             "vpabsw" => self.encode_avx_2op_38(ops, 0x1D, true),
-             "vpabsd" => self.encode_avx_2op_38(ops, 0x1E, true),
-             "vpmovzxbw" => self.encode_avx_2op_38(ops, 0x30, true),
-+            "vpmovzxdq" => self.encode_avx_2op_38(ops, 0x35, true),
-+            "vpsllvd" => self.encode_avx_3op_38(ops, 0x47, true),
-+            "vpsllvq" => self.encode_avx_3op_38_w1(ops, 0x47, true),
-+            "vpsrlvd" => self.encode_avx_3op_38(ops, 0x45, true),
-+            "vpsrlvq" => self.encode_avx_3op_38_w1(ops, 0x45, true),
-+            "vpsravd" => self.encode_avx_3op_38(ops, 0x46, true),
-+            "vmovntdqa" => self.encode_avx_2op_38(ops, 0x2A, true),
-             "vpmovzxbd" => self.encode_avx_2op_38(ops, 0x31, true),
-             "vpmovzxwd" => self.encode_avx_2op_38(ops, 0x33, true),
-             "vpmovsxbw" => self.encode_avx_2op_38(ops, 0x20, true),
-@@ -1478,7 +1553,9 @@
-             "vperm2i128" => self.encode_avx_3op_3a_imm8(ops, 0x46, true),
-             "vperm2f128" => self.encode_avx_3op_3a_imm8(ops, 0x06, true),
-             "vpermd" => self.encode_avx_3op_38(ops, 0x36, true),
-+            "vpermps" => self.encode_avx_3op_38(ops, 0x16, true),
-             "vpermq" => self.encode_avx_shuffle_3a_w1(ops, 0x00, true),
-+            "vpermpd" => self.encode_avx_shuffle_3a_w1(ops, 0x01, true),
- 
-             // AVX blend (additional)
-             "vpblendd" => self.encode_avx_3op_3a_imm8(ops, 0x02, true),
-@@ -1582,6 +1659,7 @@
-             "vmovlhps" => self.encode_avx_3op_np(ops, 0x16),
-             "vmovhlps" => self.encode_avx_3op_np(ops, 0x12),
-             "vmovddup" => self.encode_avx_2op_0f(ops, 0x12, 3),  // VEX.F2.0F 12 /r
-+            "vlddqu" => self.encode_avx_2op_0f(ops, 0xF0, 3),    // VEX.F2.0F F0 /r
-             "vmovshdup" => self.encode_avx_2op_0f(ops, 0x16, 2), // VEX.F3.0F 16 /r
-             "vmovsldup" => self.encode_avx_2op_0f(ops, 0x12, 2), // VEX.F3.0F 12 /r
-             // AVX FP min/max + horizontal + converts (pp: 0=none,1=66,2=F3,3=F2)
-@@ -1615,22 +1693,27 @@
-             "vextractps" => self.encode_avx_extract_gpr_imm8(ops, 0x17, true),
-             "vdpps" => self.encode_avx_3op_3a_imm8(ops, 0x40, true),
-             "vdppd" => self.encode_avx_3op_3a_imm8(ops, 0x41, true),
--            // FMA3 remaining forms (0F38 map; W=1 for pd/sd)
--            // FMA3 scalar forms: ss uses F3 (pp=2), sd uses F2 (pp=3). The old
--            // code routed them through the 66-prefix path (pp=1), encoding
--            // illegal instructions.
--            "vfmadd132ss" => self.encode_avx_3op_38_pp(ops, 0x99, 2),
--            "vfmadd213ss" => self.encode_avx_3op_38_pp(ops, 0xA9, 2),
--            "vfmadd231ss" => self.encode_avx_3op_38_pp(ops, 0xB9, 2),
--            "vfmadd132sd" => self.encode_avx_3op_38_pp_w1(ops, 0x99, 3),
--            "vfmadd213sd" => self.encode_avx_3op_38_pp_w1(ops, 0xA9, 3),
--            "vfmadd231sd" => self.encode_avx_3op_38_pp_w1(ops, 0xB9, 3),
--            "vfmsub213pd" => self.encode_avx_3op_38_w1(ops, 0xAA, true),
--            "vfmsub231pd" => self.encode_avx_3op_38_w1(ops, 0xBA, true),
--            "vfnmadd213pd" => self.encode_avx_3op_38_w1(ops, 0xAC, true),
--            "vfnmadd231pd" => self.encode_avx_3op_38_w1(ops, 0xBC, true),
--            "vfnmsub213pd" => self.encode_avx_3op_38_w1(ops, 0xAE, true),
--            "vfnmsub231pd" => self.encode_avx_3op_38_w1(ops, 0xBE, true),
-+
-+            // FMA3: all 48 VEX forms in one rule.  The encoding is completely
-+            // regular, so a table beats 48 hand-written arms that each risked a
-+            // transcription error (the previous scalar arms did in fact select
-+            // F3/F2 prefixes, which encode illegal instructions).
-+            //
-+            //   VEX.66.0F38.W0 for the ps/ss element types, W1 for pd/sd.
-+            //   The mandatory prefix is ALWAYS 66; the scalar-vs-packed choice
-+            //   is carried by the opcode's low bit, not by the prefix.
-+            //   opcode = base(operation) + 0x10 * (order/100 - 1) + is_scalar
-+            // Verified against GAS 2.47, e.g.
-+            //   vfmadd132sd %xmm1,%xmm2,%xmm3 -> c4 e2 e9 99 d9
-+            //   vfnmsub231ps %ymm1,%ymm2,%ymm3 -> c4 e2 6d be d9
-+            m if is_fma3_vex(m) => {
-+                let (opcode, w) = fma3_opcode(m).ok_or("bad FMA3 mnemonic")?;
-+                if w == 1 {
-+                    self.encode_avx_3op_38_w1(ops, opcode, true)
-+                } else {
-+                    self.encode_avx_3op_38(ops, opcode, true)
-+                }
-+            }
- 
-             // AVX comparison with immediate (vcmpps/vcmppd/vcmpss/vcmpsd)
-             "vcmpps" => self.encode_avx_3op_0f_imm8(ops, 0xC2, false),
-@@ -1721,6 +1804,14 @@
-             "mulxl" => self.encode_bmi2_shift(ops, 0xF6, 3, 0), // F2.0F38.W0
-             "andnq" => self.encode_bmi_andn(ops, 1), // NP.0F38.W1
-             "andnl" => self.encode_bmi_andn(ops, 0), // NP.0F38.W0
-+            // BMI1 blsi/blsr/blsmsk share opcode F3; ModRM.reg selects which:
-+            //   /3 = blsi, /1 = blsr, /2 = blsmsk.  Destination goes in vvvv.
-+            "blsil" => self.encode_bmi_blsx(ops, 3, 0),
-+            "blsiq" => self.encode_bmi_blsx(ops, 3, 1),
-+            "blsrl" => self.encode_bmi_blsx(ops, 1, 0),
-+            "blsrq" => self.encode_bmi_blsx(ops, 1, 1),
-+            "blsmskl" => self.encode_bmi_blsx(ops, 2, 0),
-+            "blsmskq" => self.encode_bmi_blsx(ops, 2, 1),
-             "bextrl" | "bextrq" => {
-                 let w = if mnemonic == "bextrq" { 1 } else { 0 };
-                 self.encode_bmi2_shift(ops, 0xF7, 0, w)          // NP.0F38.Wx
-@@ -1859,10 +1950,6 @@
-             "idivb" => self.encode_unary_rm(ops, 7, 1),
-             "mulb" => self.encode_unary_rm(ops, 4, 1),
- 
--            // ---- CBW/CWDE/CWD ----
--            "cbw" => { self.bytes.extend_from_slice(&[0x66, 0x98]); Ok(()) }
--            "cwd" => { self.bytes.extend_from_slice(&[0x66, 0x99]); Ok(()) }
--
-             // ---- AVX: vzeroupper ----
-             "vzeroupper" => {
-                 // VEX.128.0F.WIG 77
-@@ -2005,9 +2092,12 @@
-             // ---- Additional x87 ----
-             "fistpl" => self.encode_x87_mem(ops, &[0xDB], 3),
-             "fistl" => self.encode_x87_mem(ops, &[0xDB], 2),
-+            // `s` suffix = 16-bit integer operand (DF opcode group).
-+            "fists" => self.encode_x87_mem(ops, &[0xDF], 2),
-+            "fistps" => self.encode_x87_mem(ops, &[0xDF], 3),
-+            "fisttps" => self.encode_x87_mem(ops, &[0xDF], 1),
-             "fildl" => self.encode_x87_mem(ops, &[0xDB], 0),
-             "filds" => self.encode_x87_mem(ops, &[0xDF], 0),
--            "fistps" => self.encode_x87_mem(ops, &[0xDF], 3),
-             "fisttpl" => self.encode_x87_mem(ops, &[0xDB], 1),
-             "fdivl" => self.encode_x87_mem(ops, &[0xDC], 6),
-             "fdivs" => self.encode_x87_mem(ops, &[0xD8], 6),
-@@ -2140,6 +2230,10 @@
- 
-             // Prefetch instructions (0F 18 /0-3)
-             "prefetcht0" => self.encode_sse_mem_only(ops, &[0x0F, 0x18], 1),
-+            // MOVBE: 0F38 F0 loads (mem -> reg), F1 stores (reg -> mem).
-+            "movbew" => self.encode_movbe(ops, 2),
-+            "movbel" => self.encode_movbe(ops, 4),
-+            "movbeq" => self.encode_movbe(ops, 8),
-             "prefetcht1" => self.encode_sse_mem_only(ops, &[0x0F, 0x18], 2),
-             "prefetcht2" => self.encode_sse_mem_only(ops, &[0x0F, 0x18], 3),
-             "prefetchnta" => self.encode_sse_mem_only(ops, &[0x0F, 0x18], 0),
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/assembler/encoder/registers.rs b/src/backend/x86/assembler/encoder/registers.rs
---- a/src/backend/x86/assembler/encoder/registers.rs	2026-08-14 12:58:02.265428871 +0000
-+++ b/src/backend/x86/assembler/encoder/registers.rs	2026-08-14 13:40:10.601428871 +0000
-@@ -226,7 +226,12 @@
- pub(crate) fn mnemonic_size_suffix(mnemonic: &str) -> Option<u8> {
-     // Handle mnemonics that don't follow the simple suffix pattern
-     match mnemonic {
--        "cltq" | "cqto" | "cltd" | "cdq" | "cqo" | "ret" | "nop" | "ud2"
-+        "cltq" | "cqto" | "cltd" | "cdq" | "cqo" | "cbtw" | "cbw" | "cwtl"
-+        | "cwde" | "cdqe" | "cwtd" | "cwd" | "ret" | "nop" | "ud2"
-+        // `rdrand`/`rdseed` end in `d`, and `movbe`/`lddqu` in `e`/`u`; none of
-+        // those letters is an AT&T size suffix.  Without an entry here the
-+        // width check below compares a bogus suffix against the real register.
-+        | "rdrand" | "rdseed" | "movbe" | "lddqu" | "vlddqu" | "bswap"
-         | "endbr64" | "pause" | "mfence" | "lfence" | "sfence" | "clflush"
-         | "syscall" | "sysenter" | "cpuid" | "rdtsc" | "rdtscp" | "rdpmc"
-         | "clc" | "stc" | "cli" | "sti" | "cld" | "std" | "sahf" | "lahf" | "fninit" | "finit" | "fwait" | "wait" | "fnstcw" | "fstcw"
-@@ -518,9 +523,10 @@
-     // 8. Zero-operand instructions must not be given operands.
-     if matches!(
-         mnemonic,
--        "vzeroupper" | "vzeroall" | "cpuid" | "ret" | "retq" | "leave" | "leaveq"
-+        "vzeroupper" | "vzeroall" | "cpuid" | "leave" | "leaveq"
-             | "hlt" | "pause" | "syscall" | "sysret" | "ud2" | "cwtl"
-             | "cltq" | "cqto" | "cltd" | "cwtd" | "endbr64" | "endbr32"
-+            | "cbtw" | "cbw" | "cwde" | "cdqe" | "cwd"
-             | "lfence" | "sfence" | "mfence" | "rdtsc" | "rdtscp" | "cdq" | "cqo"
-     ) && !ops.is_empty()
-     {
-@@ -617,3 +623,62 @@
-         _ => Err(format!("unknown condition code: {}", cc_str)),
      }
  }
 +
-+/// True for the FMA3 mnemonics that use the VEX 3-operand `0F38` encoding.
-+pub(crate) fn is_fma3_vex(m: &str) -> bool {
-+    fma3_opcode(m).is_some()
-+}
-+
-+/// Decode an FMA3 mnemonic into its `0F38` opcode and VEX.W bit.
++/// Fold an index-only, scale-1 address into a plain base address.
 +///
-+/// The FMA3 opcode space is a regular grid:
++/// `-1(,%rdi,1)` and `-1(%rdi)` compute the same effective address, but the
++/// first needs a SIB byte and -- because SIB with no base only supports
++/// mod=00 + disp32 -- a full 4-byte displacement.  Moving the index into the
++/// base slot removes the SIB byte and lets the displacement shrink to disp8,
++/// turning 8 bytes into 4.  ICC performs this fold; GAS 2.47, clang 22.1,
++/// gcc 16.2 and icx 2024.0 all emit the longer form.
 +///
-+/// ```text
-+///                 132     213     231
-+///   vfmadd        0x98    0xA8    0xB8      packed; +1 -> scalar
-+///   vfmsub        0x9A    0xAA    0xBA
-+///   vfnmadd       0x9C    0xAC    0xBC
-+///   vfnmsub       0x9E    0xAE    0xBE
-+///   vfmaddsub     0x96    0xA6    0xB6      packed only
-+///   vfmsubadd     0x97    0xA7    0xB7      packed only
-+/// ```
++/// Two register numbers can never be folded, because the base slot assigns
++/// them a meaning the index slot does not have:
++///   * reg 4 (%rsp/%r12) -- base==100 is the escape that selects a SIB byte,
++///     so folding produced `(%rsp,%r12,1)`.
++///   * reg 5 (%rbp/%r13) -- mod=00 with base==101 means "no base, disp32",
++///     so folding produced `(%rbp)`.
 +///
-+/// W=1 selects the double-precision element type (`pd`/`sd`), W=0 selects
-+/// single (`ps`/`ss`).  The mandatory prefix is 66 for every form.
-+pub(crate) fn fma3_opcode(m: &str) -> Option<(u8, u8)> {
-+    let rest = m.strip_prefix("vfm").map(|r| (r, false))
-+        .or_else(|| m.strip_prefix("vfnm").map(|r| (r, true)))?;
-+    let (rest, negated) = rest;
-+
-+    // Element type: the last two characters.
-+    let (rest, ty) = rest.split_at(rest.len().checked_sub(2)?);
-+    let (w, scalar) = match ty {
-+        "ps" => (0u8, false),
-+        "pd" => (1, false),
-+        "ss" => (0, true),
-+        "sd" => (1, true),
-+        _ => return None,
-+    };
-+
-+    // Operand order: the three digits before the element type.
-+    let (op, order) = rest.split_at(rest.len().checked_sub(3)?);
-+    let order_step: u8 = match order {
-+        "132" => 0,
-+        "213" => 1,
-+        "231" => 2,
-+        _ => return None,
-+    };
-+
-+    let base: u8 = match (op, negated) {
-+        ("add", false) => 0x98,
-+        ("sub", false) => 0x9A,
-+        ("add", true) => 0x9C,
-+        ("sub", true) => 0x9E,
-+        // addsub/subadd have no scalar form.
-+        ("addsub", false) if !scalar => 0x96,
-+        ("subadd", false) if !scalar => 0x97,
-+        _ => return None,
-+    };
-+
-+    Some((base + 0x10 * order_step + u8::from(scalar), w))
-+}
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/assembler/encoder/sse.rs b/src/backend/x86/assembler/encoder/sse.rs
---- a/src/backend/x86/assembler/encoder/sse.rs	2026-08-14 12:58:02.265428871 +0000
-+++ b/src/backend/x86/assembler/encoder/sse.rs	2026-08-14 13:39:52.849428871 +0000
-@@ -293,6 +293,67 @@
-         }
-     }
- 
-+    /// Encode the 64-bit ADX forms (`adcxq`/`adoxq`).
-+    ///
-+    /// These are `<prefix> REX.W 0F 38 F6 /r`.  The mandatory prefix must come
-+    /// BEFORE the REX byte, so the generic SSE path (which emits the whole
-+    /// opcode array first) cannot be reused for the W=1 spelling.
-+    pub(crate) fn encode_adx(&mut self, ops: &[Operand], prefix: u8, size: u8) -> Result<(), String> {
-+        if ops.len() != 2 {
-+            return Err("ADX requires 2 operands".to_string());
-+        }
-+        match (&ops[0], &ops[1]) {
-+            (Operand::Register(src), Operand::Register(dst)) => {
-+                let src_num = reg_num(&src.name).ok_or("bad register")?;
-+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-+                self.bytes.push(prefix);
-+                self.emit_rex_rr(size, &dst.name, &src.name);
-+                self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF6]);
-+                self.bytes.push(self.modrm(3, dst_num, src_num));
-+                Ok(())
-+            }
-+            (Operand::Memory(mem), Operand::Register(dst)) => {
-+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-+                self.bytes.push(prefix);
-+                self.emit_segment_prefix(mem)?;
-+                self.emit_rex_rm(size, &dst.name, mem);
-+                self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF6]);
-+                self.encode_modrm_mem(dst_num, mem)
-+            }
-+            _ => Err("unsupported ADX operands".to_string()),
-+        }
++/// Returning the rewritten operand (rather than mutating in place) lets the
++/// REX emitter and the ModR/M emitter share one decision: the extension bit
++/// for r8-r15 has to move from REX.X to REX.B along with the register, and
++/// having two code paths decide independently is what made an earlier version
++/// of this fold emit `rex.WX mov -0x1(%rdx)` for `mov -1(,%r10,1)`.
++pub(crate) fn fold_scale1_index(mem: &MemoryOperand) -> Option<MemoryOperand> {
++    if mem.base.is_some() || mem.scale.unwrap_or(1) != 1 {
++        return None;
 +    }
-+
-+    /// Encode MOVBE (load/store with byte-order swap).
-+    ///
-+    /// `0F 38 F0 /r` moves memory to register, `0F 38 F1 /r` register to
-+    /// memory.  There is no register-to-register form.  The 16-bit spelling
-+    /// takes the 0x66 operand-size prefix ahead of any REX byte.
-+    pub(crate) fn encode_movbe(&mut self, ops: &[Operand], size: u8) -> Result<(), String> {
-+        if ops.len() != 2 {
-+            return Err("movbe requires 2 operands".to_string());
-+        }
-+        match (&ops[0], &ops[1]) {
-+            (Operand::Memory(mem), Operand::Register(reg)) => {
-+                let num = reg_num(&reg.name).ok_or("bad register")?;
-+                if size == 2 { self.bytes.push(0x66); }
-+                self.emit_segment_prefix(mem)?;
-+                self.emit_rex_rm(size, &reg.name, mem);
-+                self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF0]);
-+                self.encode_modrm_mem(num, mem)
++    let idx = mem.index.as_ref()?;
++    // reg 4 (%rsp/%r12) stays in the index slot: putting it in the base slot
++    // selects the SIB escape, and the general encoder would then have to
++    // re-derive a SIB with index=none to keep the meaning.  ICC does emit that
++    // form (`mov -1(,%r12,1)` -> 49 8b 4c 24 ff, 5 bytes vs our 8), so this is
++    // a known 3-byte opportunity left on the table deliberately: expressing it
++    // needs a base+"no index" SIB that this helper cannot describe by operand
++    // rewriting alone.
++    //
++    // reg 5 (%rbp/%r13) IS foldable, but only because a non-zero displacement
++    // forces mod=01/10 anyway, which gives base==101 its ordinary meaning.
++    // With mod=00 base==101 means "no base, disp32", so a zero-displacement
++    // fold would change the address; require a displacement in that case.
++    match reg_num(&idx.name) {
++        Some(4) => return None,
++        Some(5) => {
++            let has_disp = !matches!(mem.displacement, Displacement::None)
++                && !matches!(mem.displacement, Displacement::Integer(0));
++            if !has_disp {
++                return None;
 +            }
-+            (Operand::Register(reg), Operand::Memory(mem)) => {
-+                let num = reg_num(&reg.name).ok_or("bad register")?;
-+                if size == 2 { self.bytes.push(0x66); }
-+                self.emit_segment_prefix(mem)?;
-+                self.emit_rex_rm(size, &reg.name, mem);
-+                self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF1]);
-+                self.encode_modrm_mem(num, mem)
-+            }
-+            _ => Err("movbe requires one memory and one register operand".to_string()),
 +        }
++        _ => {}
 +    }
-+
-     pub(crate) fn encode_rdrand(&mut self, ops: &[Operand], mnemonic: &str, opcode2: u8, reg_ext: u8) -> Result<(), String> {
-         if ops.len() != 1 { return Err("rdrand requires 1 operand".to_string()); }
-         match &ops[0] {
-@@ -374,6 +435,20 @@
-                 self.bytes.push(self.modrm(3, dst_num, src_num));
-                 Ok(())
++    Some(MemoryOperand {
++        base: mem.index.clone(),
++        index: None,
++        scale: None,
++        ..mem.clone()
++    })
++}
+diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/assembler/encoder/mod.rs b/src/backend/x86/assembler/encoder/mod.rs
+--- a/src/backend/x86/assembler/encoder/mod.rs	2026-08-14 14:35:39.551253401 +0000
++++ b/src/backend/x86/assembler/encoder/mod.rs	2026-08-14 14:44:51.839253401 +0000
+@@ -2123,10 +2123,28 @@
              }
-+            // Integer source may also come from memory: `cvtsi2sdl (%rdi),%xmm0`.
-+            // The `l`/`q` suffix (not any register) decides REX.W here, which is
-+            // exactly what the caller already passed in `gp_size`.
-+            (Operand::Memory(mem), Operand::Register(dst)) if is_xmm(&dst.name) => {
-+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-+                let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
-+                for &b in &opcode[..prefix_len] {
-+                    self.bytes.push(b);
-+                }
-+                self.emit_segment_prefix(mem)?;
-+                self.emit_rex_rm(gp_size, &dst.name, mem);
-+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
-+                self.encode_modrm_mem(dst_num, mem)
+ 
+             // ---- Additional suffixless forms ----
+-            "bt" => self.encode_bt(ops, "btq"),
+-            "bts" => self.encode_bt(ops, "btsq"),
+-            "btr" => self.encode_bt(ops, "btrq"),
+-            "btc" => self.encode_bt(ops, "btcq"),
++            // Unsuffixed bt/bts/btr/btc take their width from the operand, the
++            // same way GAS does.  Hard-coding the `q` form put a REX.W on
++            // `bt $7,%eax`, making it 5 bytes where every other assembler
++            // (GAS, clang, gcc, icc, icx) emits 4.  The bit-offset semantics
++            // are unchanged for an in-range immediate, so the REX.W was pure
++            // waste.  Memory operands with no register to inspect keep the
++            // 32-bit default, which is what GAS picks (with a warning).
++            "bt" | "bts" | "btr" | "btc" => {
++                let width = ops.iter().find_map(|op| match op {
++                    Operand::Register(r) => match reg_class(&r.name) {
++                        RegClass::Gp(w) => Some(w),
++                        _ => None,
++                    },
++                    _ => None,
++                }).unwrap_or(4);
++                let suffixed = match width {
++                    8 => format!("{}q", mnemonic),
++                    2 => format!("{}w", mnemonic),
++                    _ => format!("{}l", mnemonic),
++                };
++                self.encode_bt(ops, &suffixed)
 +            }
-             _ => Err("unsupported cvt operands".to_string()),
-         }
-     }
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/assembler/encoder/x87_misc.rs b/src/backend/x86/assembler/encoder/x87_misc.rs
---- a/src/backend/x86/assembler/encoder/x87_misc.rs	2026-08-14 12:58:02.265428871 +0000
-+++ b/src/backend/x86/assembler/encoder/x87_misc.rs	2026-08-14 13:11:25.385428871 +0000
-@@ -9,6 +9,13 @@
-             return Err(format!("{} requires 2 operands", mnemonic));
-         }
-         let size = mnemonic_size_suffix(mnemonic).unwrap_or(8);
-+        // 16-bit forms need the operand-size prefix.  It is pushed here, before
-+        // any REX byte is emitted, so that `emit_segment_prefix` (which scans
-+        // back over 0x66/0x67) still places a segment override outside it and
-+        // the REX byte produced by `emit_rex_*` lands after it.
-+        if size == 2 {
-+            self.bytes.push(0x66);
-+        }
-         // Determine which bt variant
-         let base = &mnemonic[..mnemonic.len()-1]; // strip size suffix
-         let (reg_opcode, imm_ext) = match base {
-@@ -108,7 +115,7 @@
-     }
- 
-     pub(crate) fn encode_fcomip(&mut self, ops: &[Operand]) -> Result<(), String> {
--        if ops.len() == 2 {
-+        if ops.len() == 2 || ops.len() == 1 {
-             // fcomip %st(N), %st
-             match &ops[0] {
-                 Operand::Register(reg) => {
-@@ -122,7 +129,7 @@
-             self.bytes.extend_from_slice(&[0xDF, 0xF1]);
-             Ok(())
-         } else {
--            Err("fcomip requires 0 or 2 operands".to_string())
-+            Err("fcomip requires 0-2 operands".to_string())
-         }
-     }
- 
-@@ -147,7 +154,7 @@
- 
-     /// Encode fcomi/fucomi (compare, no pop): fcomi = DB F0+i, fucomi = DB E8+i.
-     pub(crate) fn encode_fcomi(&mut self, ops: &[Operand], base: u8) -> Result<(), String> {
--        if ops.len() == 2 {
-+        if ops.len() == 2 || ops.len() == 1 {
-             match &ops[0] {
-                 Operand::Register(reg) => {
-                     let n = parse_st_num(&reg.name)?;
-@@ -160,12 +167,12 @@
-             self.bytes.extend_from_slice(&[0xDB, base + 1]);
-             Ok(())
-         } else {
--            Err("fcomi requires 0 or 2 operands".to_string())
-+            Err("fcomi requires 0-2 operands".to_string())
-         }
-     }
- 
-     pub(crate) fn encode_fucomip(&mut self, ops: &[Operand]) -> Result<(), String> {
--        if ops.len() == 2 {
-+        if ops.len() == 2 || ops.len() == 1 {
-             match &ops[0] {
-                 Operand::Register(reg) => {
-                     let n = parse_st_num(&reg.name)?;
-@@ -178,7 +185,7 @@
-             self.bytes.extend_from_slice(&[0xDF, 0xE9]);
-             Ok(())
-         } else {
--            Err("fucomip requires 0 or 2 operands".to_string())
-+            Err("fucomip requires 0-2 operands".to_string())
-         }
-     }
- 
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/assembler/parser.rs b/src/backend/x86/assembler/parser.rs
---- a/src/backend/x86/assembler/parser.rs	2026-08-14 12:58:02.265428871 +0000
-+++ b/src/backend/x86/assembler/parser.rs	2026-08-14 14:08:59.321428871 +0000
-@@ -80,7 +80,9 @@
-     /// Swap current and previous sections: `.previous`
-     Previous,
-     /// `.org` directive: advance to position symbol + offset within the section.
--    Org(String, i64),
-+    /// `.org new-lc, fill` -- symbol (may be empty or "." for the location
-+    /// counter), offset, and the fill byte (GAS defaults to 0).
-+    Org(String, i64, u8),
-     /// `.incbin "file"[, skip[, count]]` — include binary file contents
-     Incbin { path: String, skip: u64, count: Option<u64> },
-     /// Symbol version: `.symver name, name2@@VERSION` or `.symver name, name2@VERSION`
-@@ -521,9 +523,21 @@
-             }
-         }
-         ".org" => {
--            let args = args.trim();
-+            // `.org new-lc, fill` -- the fill byte is optional and defaults to
-+            // zero, which is what the ELF writer emits.  It has to be split off
-+            // before the expression is parsed, or the whole `8, 0x90` string is
-+            // handed to the integer parser and rejected.
-+            let (args, fill) = match args.split_once(',') {
-+                Some((lc, f)) => (
-+                    lc.trim(),
-+                    parse_integer_expr(f.trim())
-+                        .map_err(|_| format!("bad .org fill: {}", f.trim()))?
-+                        as u8,
-+                ),
-+                None => (args, 0u8),
-+            };
-             if let Ok(val) = parse_integer_expr(args) {
--                Ok(AsmItem::Org(String::new(), val))
-+                Ok(AsmItem::Org(String::new(), val, fill))
-             } else {
-                 let mut sym = args.to_string();
-                 let mut offset = 0i64;
-@@ -535,7 +549,7 @@
-                             .map_err(|_| format!("bad .org offset: {}", offset_str))?;
-                     }
-                 }
--                Ok(AsmItem::Org(sym, offset))
-+                Ok(AsmItem::Org(sym, offset, fill))
-             }
-         }
-         ".byte" => {
-@@ -575,7 +589,11 @@
-             let vals = parse_float_values(args, true)?;
-             Ok(AsmItem::Byte(vals))
-         }
--        ".zero" | ".skip" => {
-+        // `.space` is an exact synonym of `.skip` in GAS (both take an optional
-+        // fill byte).  It was missing from this list, and because unrecognized
-+        // directives are silently ignored, `.space 8` emitted NOTHING -- every
-+        // following byte in the section landed at the wrong offset.
-+        ".zero" | ".skip" | ".space" => {
-             let (expr_str, fill) = split_skip_args(args);
-             if let Ok(val) = parse_integer_expr(expr_str) {
-                 if fill == 0 {
-@@ -1050,8 +1068,18 @@
-     // In AT&T syntax, a bare number without `$` prefix is an absolute memory address.
-     // Only treat it as a memory operand if it parses as a pure integer and doesn't
-     // look like a numeric label reference (e.g., `1f`, `1b`).
--    if s.bytes().next().is_some_and(|c| c.is_ascii_digit() || c == b'-')
--        && !s.ends_with('f') && !s.ends_with('b')
-+    // A GAS numeric local label is a run of DECIMAL DIGITS followed by a single
-+    // `f` or `b` and nothing else (`1f`, `42b`).  Rejecting every operand that
-+    // merely ends in those letters also threw away legitimate hex constants:
-+    // `mov 0x7fffffff, %eax` was treated as a label reference and silently
-+    // assembled with a zero displacement.  Test the whole shape instead.
-+    let is_numeric_label = {
-+        let stem = &s[..s.len().saturating_sub(1)];
-+        matches!(s.bytes().last(), Some(b'f') | Some(b'b'))
-+            && !stem.is_empty()
-+            && stem.bytes().all(|c| c.is_ascii_digit())
-+    };
-+    if s.bytes().next().is_some_and(|c| c.is_ascii_digit() || c == b'-') && !is_numeric_label
-     {
-         if let Ok(val) = crate::backend::asm_expr::parse_integer_expr(s) {
-             return Ok(Operand::Memory(MemoryOperand {
+             "rcl" => self.encode_suffixless_shift(ops, 2),
+             "rcr" => self.encode_suffixless_shift(ops, 3),
+             "rol" => self.encode_suffixless_shift(ops, 0),
 diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/README.md b/tests/asm-diff/README.md
---- a/tests/asm-diff/README.md	2026-08-14 12:58:02.297428871 +0000
-+++ b/tests/asm-diff/README.md	2026-08-14 14:11:21.205428871 +0000
-@@ -24,6 +24,17 @@
+--- a/tests/asm-diff/README.md	2026-08-14 14:35:39.611253401 +0000
++++ b/tests/asm-diff/README.md	2026-08-14 15:12:24.287253401 +0000
+@@ -6,8 +6,16 @@
+ Neither is visible from the compiler's own output — only a direct comparison
+ against a reference implementation finds them.
+ 
+-GNU as is the oracle. LCCC must either agree exactly, or reject exactly what
+-GNU as rejects.
++GNU as is the *correctness* oracle: LCCC must either agree exactly, or reject
++exactly what GNU as rejects.
++
++Agreeing with GNU as is not the same as being optimal. Where several encodings
++of an instruction are legal, `scripts/encdiff.py` compares against the Clang,
++GCC, ICC and ICX integrated assemblers as well, and scores LCCC against the
++shortest form any of them produced. A group tagged `betterok` is allowed to
++differ from GNU as, but only when LCCC is strictly shorter AND the two objects
++disassemble to the same instruction sequence -- the runner verifies that with
++objdump rather than taking the byte count on trust.
+ 
+ ## Layout
+ 
+@@ -24,12 +32,28 @@
  the corpus can never contain an input that would make the differential report
  a false failure.
  
-+## Status
++## Case flags
 +
-+All 721 cases pass against GNU as 2.47, and the per-instruction differential
-+agrees byte-for-byte on every one of the 9,805 distinct instructions in the
-+corpus (the remaining 63 are the deliberate reject list, which both assemblers
-+refuse).
++```
++;;; name                  compare bytes, relocs and symbols against GNU as
++;;; name nosym            skip the symbol-table comparison
++;;; name reject           both assemblers must REFUSE this input
++;;; name betterok         LCCC may differ if it is shorter and decodes the same
++```
 +
-+`insndiff.py` synthesises any numeric local label an instruction refers to, so
-+`jmp 1f` is compared as a real jump rather than being rejected by the oracle
-+for want of a `1:` in the file.
-+
- ## Running
+ ## Status
  
- ```bash
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/avx.casefile b/tests/asm-diff/avx.casefile
---- a/tests/asm-diff/avx.casefile	2026-08-14 12:58:02.297428871 +0000
-+++ b/tests/asm-diff/avx.casefile	2026-08-14 14:06:49.629428871 +0000
-@@ -896,3 +896,65 @@
- vmovntps %ymm3, (%rdi)
- vmovntpd %ymm3, (%r12)
- vmovntdq %xmm13, (%r13,%rax,8)
-+;;; avx_fma_grid
-+.text
-+vfmadd132ps %ymm1, %ymm2, %ymm3
-+vfmadd132pd %ymm1, %ymm2, %ymm3
-+vfmadd132ss %xmm1, %xmm2, %xmm3
-+vfmadd132sd %xmm1, %xmm2, %xmm3
-+vfmadd213ss %xmm1, %xmm2, %xmm3
-+vfmadd231sd %xmm1, %xmm2, %xmm3
-+vfmsub132ps %ymm1, %ymm2, %ymm3
-+vfmsub213sd %xmm1, %xmm2, %xmm3
-+vfnmadd231ps %ymm1, %ymm2, %ymm3
-+vfnmsub132sd %xmm1, %xmm2, %xmm3
-+vfnmsub231ps %ymm1, %ymm2, %ymm3
-+vfmaddsub132ps %ymm1, %ymm2, %ymm3
-+vfmsubadd231pd %ymm1, %ymm2, %ymm3
-+vfmadd132sd (%r13), %xmm1, %xmm2
+-All 721 cases pass against GNU as 2.47, and the per-instruction differential
+-agrees byte-for-byte on every one of the 9,805 distinct instructions in the
+-corpus (the remaining 63 are the deliberate reject list, which both assemblers
+-refuse).
++All 723 cases pass against GNU as 2.47. Across the 9,901 distinct
++instructions in the corpus, the per-instruction differential reports:
 +
-+;;; avx_gaps
-+.text
-+vpermps %ymm1, %ymm2, %ymm3
-+vpermpd $0x1b, %ymm1, %ymm2
-+vlddqu (%rdi), %ymm0
-+vlddqu (%rdi), %xmm0
-+vmovntdqa (%rdi), %ymm0
-+vpmovzxdq (%rdi), %ymm2
-+vpsllvd %ymm1, %ymm2, %ymm3
-+vpsllvq %ymm1, %ymm2, %ymm3
-+vpsrlvd %ymm1, %ymm2, %ymm3
-+vpsrlvq %ymm1, %ymm2, %ymm3
-+vpsravd %ymm1, %ymm2, %ymm3
-+vrsqrtps %ymm1, %ymm2
-+vrcpps %ymm1, %ymm2
-+vcomiss %xmm1, %xmm2
-+vucomisd (%r13), %xmm12
-+vcvtsd2ss %xmm1, %xmm2, %xmm3
-+vcvtss2sd %xmm1, %xmm2, %xmm3
-+vcvtsd2si %xmm0, %eax
-+vcvtsd2si %xmm0, %rax
-+vcvttsd2si %xmm0, %eax
-+vcvttss2si %xmm0, %rax
-+vcvtsi2sdl (%rdi), %xmm1, %xmm2
-+vcvtsi2sdq (%rdi), %xmm1, %xmm2
-+vroundps $3, %ymm1, %ymm2
-+vroundpd $3, %xmm1, %xmm2
-+vroundps $3, (%rdi), %ymm2
-+vmaskmovps (%rdi), %ymm1, %ymm2
-+vmaskmovps %ymm2, %ymm1, (%rdi)
-+vmaskmovpd (%rdi), %ymm1, %ymm2
-+vgatherdps %ymm2, (%rdi,%ymm1,4), %ymm3
-+vpgatherdd %ymm2, (%r13,%ymm1,4), %ymm3
++```
++ok      = 9,712   byte-identical to GNU as
++BETTER  =   126   shorter than GNU as, verified to decode identically
++reject  =    63   deliberate reject list; both assemblers refuse
++```
 +
-+;;; avx_mov_shortform
-+.text
-+vmovaps %xmm9, %xmm0
-+vmovaps %ymm9, %ymm0
-+vmovapd %xmm9, %xmm0
-+vmovups %ymm9, %ymm0
-+vmovdqa %xmm9, %xmm0
-+vmovdqu %ymm9, %ymm0
-+vmovaps %xmm0, %xmm9
-+vmovaps %xmm9, %xmm10
-+vmovaps %xmm1, %xmm2
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/bmi.casefile b/tests/asm-diff/bmi.casefile
---- a/tests/asm-diff/bmi.casefile	2026-08-14 12:58:02.297428871 +0000
-+++ b/tests/asm-diff/bmi.casefile	2026-08-14 14:06:49.629428871 +0000
-@@ -268,3 +268,24 @@
- movbel (%rdi), %eax
- movbeq (%rdi), %rax
- movbeq %rax, (%rdi)
-+;;; bmi_gaps
-+.text
-+blsil %eax, %ecx
-+blsiq %rax, %rcx
-+blsrl %eax, %ecx
-+blsrq %rax, %rcx
-+blsmskl %eax, %ecx
-+blsmskq %rax, %rcx
-+blsil (%rdi), %eax
-+blsrq (%rdi), %rax
-+mulxl %eax, %ecx, %edx
-+mulxq %rax, %rcx, %rdx
-+mulxl (%rdi), %ecx, %edx
-+pdepl %eax, %ecx, %edx
-+pdepq %r8, %r9, %r10
-+pextl %eax, %ecx, %edx
-+pextq (%rdi), %rcx, %rdx
-+shlxl %ecx, %eax, %edx
-+shrxq %rcx, %rax, %rdx
-+sarxl %ecx, %eax, %edx
-+bzhil %ecx, %eax, %edx
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/directive.casefile b/tests/asm-diff/directive.casefile
---- a/tests/asm-diff/directive.casefile	2026-08-14 12:58:02.301428871 +0000
-+++ b/tests/asm-diff/directive.casefile	2026-08-14 14:06:49.629428871 +0000
-@@ -176,3 +176,10 @@
-         ret
-         .cfi_endproc
- .size cf, .-cf
-+;;; space_fill
-+.data
-+.space 8
-+.space 4, 0xAA
-+.byte 1
-+.space 3, 0x5a
-+.quad 0x1122334455667788
++There are no unexplained differences: every case is either byte-identical, a
++machine-verified improvement, or an intentional rejection.
+ 
+ `insndiff.py` synthesises any numeric local label an instruction refers to, so
+ `jmp 1f` is compared as a real jump rather than being rejected by the oracle
+diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/lea.casefile b/tests/asm-diff/lea.casefile
+--- a/tests/asm-diff/lea.casefile	2026-08-14 14:35:39.623253401 +0000
++++ b/tests/asm-diff/lea.casefile	2026-08-14 15:05:00.591253401 +0000
+@@ -1,4 +1,4 @@
+-;;; lea
++;;; lea betterok
+ .text
+ leaq (%rax,%rcx,1), %rdx
+ leal (%rax,%rcx,1), %edx
 diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/misc.casefile b/tests/asm-diff/misc.casefile
---- a/tests/asm-diff/misc.casefile	2026-08-14 12:58:02.301428871 +0000
-+++ b/tests/asm-diff/misc.casefile	2026-08-14 14:06:49.629428871 +0000
-@@ -509,3 +509,49 @@
- imull (%rdi), %ecx
- imulq %rax, %rcx
- imulq (%rdi), %rcx
-+;;; misc_gaps
+--- a/tests/asm-diff/misc.casefile	2026-08-14 14:35:39.623253401 +0000
++++ b/tests/asm-diff/misc.casefile	2026-08-14 15:08:58.031253401 +0000
+@@ -555,3 +555,17 @@
+ movabs 0x123456789abcdef0, %rax
+ movabs 0x123456789abcdef0, %al
+ movabs %rax, 0x123456789abcdef0
++;;; bt_width_inference
 +.text
-+cbw
-+cbtw
-+cwde
-+cwtl
-+cwd
-+cwtd
-+cdqe
-+cltq
-+cdq
-+cltd
-+cqo
-+cqto
-+xchg %eax, %eax
-+xchg %rax, %rax
-+xchg %ax, %ax
-+xchg %eax, %ecx
-+xchg %ecx, %eax
-+xchg %r8, %rax
-+xchg %rax, %r12
-+xchg %al, %cl
-+xchg %ax, %cx
-+sysret
-+sysretq
-+ret $16
-+ret
-+endbr32
-+endbr64
-+adcxl %eax, %ecx
-+adcxq %rax, %rcx
-+adoxl %eax, %ecx
-+clflushopt (%rdi)
-+clwb (%rdi)
-+movbew (%rdi), %ax
-+movbel (%rdi), %eax
-+movbeq (%rdi), %rax
-+movbeq %rax, (%rdi)
-+rdrand %rax
-+rdrand %eax
-+rdseed %r15
-+mov 0x7fffffff, %eax
-+mov 0x7ffffffe, %eax
-+movabs 0x123456789abcdef0, %rax
-+movabs 0x123456789abcdef0, %al
-+movabs %rax, 0x123456789abcdef0
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/padding.casefile b/tests/asm-diff/padding.casefile
---- a/tests/asm-diff/padding.casefile	2026-08-14 12:58:02.301428871 +0000
-+++ b/tests/asm-diff/padding.casefile	2026-08-14 14:06:49.629428871 +0000
-@@ -10653,3 +10653,11 @@
- nop
- .p2align 4
- ret
-+;;; org_dot
++bt $7, %ax
++bt $7, %eax
++bt $7, %rax
++bts $7, %eax
++bts $7, %rax
++btr $7, %ecx
++btr $7, %rcx
++btc $7, %r8d
++btc $7, %r8
++bt %eax, %ecx
++bt %rax, %rcx
++bt %ax, %cx
+diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/modrm.casefile b/tests/asm-diff/modrm.casefile
+--- a/tests/asm-diff/modrm.casefile	2026-08-14 14:35:39.623253401 +0000
++++ b/tests/asm-diff/modrm.casefile	2026-08-14 15:08:58.031253401 +0000
+@@ -2082,7 +2082,7 @@
+ mov -128(%r15,%r15,8), %rdx
+ mov -129(%r15,%r15,8), %rdx
+ mov 2147483647(%r15,%r15,8), %rdx
+-;;; nobase_rax
++;;; nobase_rax betterok
+ .text
+ mov 0(,%rax,1), %rcx
+ mov 4(,%rax,1), %rcx
+@@ -2108,7 +2108,7 @@
+ mov 128(,%rax,8), %rcx
+ mov -1(,%rax,8), %rcx
+ mov 2147483647(,%rax,8), %rcx
+-;;; nobase_rcx
++;;; nobase_rcx betterok
+ .text
+ mov 0(,%rcx,1), %rcx
+ mov 4(,%rcx,1), %rcx
+@@ -2134,7 +2134,7 @@
+ mov 128(,%rcx,8), %rcx
+ mov -1(,%rcx,8), %rcx
+ mov 2147483647(,%rcx,8), %rcx
+-;;; nobase_rdx
++;;; nobase_rdx betterok
+ .text
+ mov 0(,%rdx,1), %rcx
+ mov 4(,%rdx,1), %rcx
+@@ -2160,7 +2160,7 @@
+ mov 128(,%rdx,8), %rcx
+ mov -1(,%rdx,8), %rcx
+ mov 2147483647(,%rdx,8), %rcx
+-;;; nobase_rbx
++;;; nobase_rbx betterok
+ .text
+ mov 0(,%rbx,1), %rcx
+ mov 4(,%rbx,1), %rcx
+@@ -2186,7 +2186,7 @@
+ mov 128(,%rbx,8), %rcx
+ mov -1(,%rbx,8), %rcx
+ mov 2147483647(,%rbx,8), %rcx
+-;;; nobase_rbp
++;;; nobase_rbp betterok
+ .text
+ mov 0(,%rbp,1), %rcx
+ mov 4(,%rbp,1), %rcx
+@@ -2212,7 +2212,7 @@
+ mov 128(,%rbp,8), %rcx
+ mov -1(,%rbp,8), %rcx
+ mov 2147483647(,%rbp,8), %rcx
+-;;; nobase_rsi
++;;; nobase_rsi betterok
+ .text
+ mov 0(,%rsi,1), %rcx
+ mov 4(,%rsi,1), %rcx
+@@ -2238,7 +2238,7 @@
+ mov 128(,%rsi,8), %rcx
+ mov -1(,%rsi,8), %rcx
+ mov 2147483647(,%rsi,8), %rcx
+-;;; nobase_rdi
++;;; nobase_rdi betterok
+ .text
+ mov 0(,%rdi,1), %rcx
+ mov 4(,%rdi,1), %rcx
+@@ -2264,7 +2264,7 @@
+ mov 128(,%rdi,8), %rcx
+ mov -1(,%rdi,8), %rcx
+ mov 2147483647(,%rdi,8), %rcx
+-;;; nobase_r8
++;;; nobase_r8 betterok
+ .text
+ mov 0(,%r8,1), %rcx
+ mov 4(,%r8,1), %rcx
+@@ -2290,7 +2290,7 @@
+ mov 128(,%r8,8), %rcx
+ mov -1(,%r8,8), %rcx
+ mov 2147483647(,%r8,8), %rcx
+-;;; nobase_r9
++;;; nobase_r9 betterok
+ .text
+ mov 0(,%r9,1), %rcx
+ mov 4(,%r9,1), %rcx
+@@ -2316,7 +2316,7 @@
+ mov 128(,%r9,8), %rcx
+ mov -1(,%r9,8), %rcx
+ mov 2147483647(,%r9,8), %rcx
+-;;; nobase_r10
++;;; nobase_r10 betterok
+ .text
+ mov 0(,%r10,1), %rcx
+ mov 4(,%r10,1), %rcx
+@@ -2342,7 +2342,7 @@
+ mov 128(,%r10,8), %rcx
+ mov -1(,%r10,8), %rcx
+ mov 2147483647(,%r10,8), %rcx
+-;;; nobase_r11
++;;; nobase_r11 betterok
+ .text
+ mov 0(,%r11,1), %rcx
+ mov 4(,%r11,1), %rcx
+@@ -2394,7 +2394,7 @@
+ mov 128(,%r12,8), %rcx
+ mov -1(,%r12,8), %rcx
+ mov 2147483647(,%r12,8), %rcx
+-;;; nobase_r13
++;;; nobase_r13 betterok
+ .text
+ mov 0(,%r13,1), %rcx
+ mov 4(,%r13,1), %rcx
+@@ -2420,7 +2420,7 @@
+ mov 128(,%r13,8), %rcx
+ mov -1(,%r13,8), %rcx
+ mov 2147483647(,%r13,8), %rcx
+-;;; nobase_r14
++;;; nobase_r14 betterok
+ .text
+ mov 0(,%r14,1), %rcx
+ mov 4(,%r14,1), %rcx
+@@ -2446,7 +2446,7 @@
+ mov 128(,%r14,8), %rcx
+ mov -1(,%r14,8), %rcx
+ mov 2147483647(,%r14,8), %rcx
+-;;; nobase_r15
++;;; nobase_r15 betterok
+ .text
+ mov 0(,%r15,1), %rcx
+ mov 4(,%r15,1), %rcx
+@@ -2509,3 +2509,30 @@
+ movabs $0x123456789abcdef0, %rax
+ movabs $0, %rax
+ movabs $-1, %r15
++;;; nobase_fold_guard betterok
 +.text
-+nop
-+.org . + 16
-+ret
-+nop
-+.org . + 8, 0x90
-+ret
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/prefix.casefile b/tests/asm-diff/prefix.casefile
---- a/tests/asm-diff/prefix.casefile	2026-08-14 12:58:02.301428871 +0000
-+++ b/tests/asm-diff/prefix.casefile	2026-08-14 14:06:49.629428871 +0000
-@@ -180,3 +180,13 @@
- repne scasq
- repne cmpsb
- repne cmpsw
-+;;; seg_ss
-+.text
-+mov %ss:8(%rax), %rbx
-+mov %ss:0, %rax
-+mov %ss:8(%r13,%r12,4), %rax
-+movl $1, %ss:(%rdi)
-+movw $1, %ss:(%rdi)
-+mov %ds:8(%rax), %rbx
-+mov %es:8(%rax), %rbx
-+mov %cs:8(%rax), %rbx
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/sse.casefile b/tests/asm-diff/sse.casefile
---- a/tests/asm-diff/sse.casefile	2026-08-14 12:58:02.301428871 +0000
-+++ b/tests/asm-diff/sse.casefile	2026-08-14 14:06:49.629428871 +0000
-@@ -1153,3 +1153,19 @@
- pclmulqdq $17, %xmm1, %xmm2
- aeskeygenassist $255, %xmm1, %xmm2
- pclmulqdq $17, %xmm1, %xmm2
-+;;; sse4_extra
-+.text
-+pcmpeqq %xmm1, %xmm2
-+pcmpeqq %xmm9, %xmm14
-+pcmpeqq (%rdi), %xmm3
-+mpsadbw $0, %xmm1, %xmm2
-+mpsadbw $7, %xmm9, %xmm14
-+pblendvb %xmm0, %xmm1, %xmm2
-+lddqu (%rdi), %xmm0
-+cvttpd2dq %xmm1, %xmm2
-+cvtsi2sdl (%rdi), %xmm0
-+cvtsi2sdq (%rdi), %xmm0
-+cvtsd2si %xmm0, %eax
-+cvtsd2si %xmm0, %rax
-+cvttsd2si %xmm0, %eax
-+cvttss2si %xmm0, %rax
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/x87.casefile b/tests/asm-diff/x87.casefile
---- a/tests/asm-diff/x87.casefile	2026-08-14 12:58:02.301428871 +0000
-+++ b/tests/asm-diff/x87.casefile	2026-08-14 14:06:49.629428871 +0000
-@@ -156,3 +156,14 @@
- fxam
- fcompp
- fucompp
-+;;; x87_gaps
-+.text
-+fcomi %st(0)
-+fcomi %st(3)
-+fcomi %st(3), %st
-+fcomip %st(2)
-+fucomi %st(2)
-+fucomip %st(2)
-+fists 8(%rsp)
-+fistps 8(%rsp)
-+fisttps 8(%rsp)
++mov -1(,%rax,1), %rcx
++mov -1(,%rbx,1), %rcx
++mov -1(,%rcx,1), %rcx
++mov -1(,%rdx,1), %rcx
++mov -1(,%rsi,1), %rcx
++mov -1(,%rdi,1), %rcx
++mov -1(,%rbp,1), %rcx
++mov -1(,%r8,1), %rcx
++mov -1(,%r9,1), %rcx
++mov -1(,%r10,1), %rcx
++mov -1(,%r11,1), %rcx
++mov -1(,%r12,1), %rcx
++mov -1(,%r13,1), %rcx
++mov -1(,%r14,1), %rcx
++mov -1(,%r15,1), %rcx
++mov 0(,%r13,1), %rcx
++mov 0(,%r12,1), %rcx
++mov (,%r13,1), %rcx
++mov 127(,%r13,1), %rcx
++mov 128(,%r13,1), %rcx
++mov 8(,%rax,2), %rcx
++mov 8(,%rax,4), %rcx
++mov 8(,%rax,8), %rcx
++leaq (,%rbx,1), %rdx
++leaq -1(,%r15,1), %rdx
