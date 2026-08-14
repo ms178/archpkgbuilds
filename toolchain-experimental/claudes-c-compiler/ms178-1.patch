@@ -1,1439 +1,616 @@
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/scripts/README.md b/scripts/README.md
---- a/scripts/README.md	2026-08-14 15:36:30.265030618 +0000
-+++ b/scripts/README.md	2026-08-14 16:18:33.393030618 +0000
-@@ -8,6 +8,7 @@
- | `asmdiff.py` | Whole-object differential against GNU as: section bytes, relocations, and symbols. See `tests/asm-diff/README.md`. |
- | `insndiff.py` | Per-instruction encoding differential against GNU as. Reduces an encoding bug to a single mnemonic in one step; supports `--sweep` over register/immediate matrices. A shorter-than-GAS encoding is reported as `BETTER` only after the tool disassembles both forms and confirms they decode identically. |
- | `encdiff.py` | Multi-assembler encoding differential: LCCC against GNU as **and** the Clang, GCC, ICC and ICX integrated assemblers over the Compiler Explorer API. Judges LCCC against the *shortest legal encoding any oracle produced*, not against GAS alone. |
-+| `gen_encoding_sweep.py` | Generate instructions that have MORE THAN ONE legal encoding (accumulator short forms, imm8 sign-extension, redundant REX, VEX2-vs-VEX3, scale-1 index folds, ...). These are the only places an encoding can be improved, and most are invisible to a structural-coverage corpus. |
- | `gen_asmdiff_corpus.py` | Generate the `tests/asm-diff/*.casefile` corpora. Every case is validated against GNU as before being written. |
- | `godbolt.py` | Compiler Explorer client. Fetches GCC/Clang/ICC/ICX code generation so the Intel compilers can serve as reference oracles without a local Intel toolchain. |
- | `gen_lcccsimd.py`, `strip_scalar_dups.py` | SIMD intrinsic header generation helpers. |
-@@ -27,6 +28,11 @@
- emits 4, because ICC folds a scale-1 index into the base slot and drops the
- SIB byte. Comparing only against GAS would have shown a clean pass forever.
- 
-+`encdiff.py` batches many instructions into one Compiler Explorer request
-+(each probe fenced by `ud2` inside its own naked function) and queries the
-+oracles concurrently, so a 1,900-instruction sweep against five assemblers
-+takes ~30 s rather than ~2 h.
-+
- A shorter encoding is never accepted on size alone. Both `encdiff.py` and
- `insndiff.py` disassemble the two candidates and require them to decode to the
- same instruction; `asmdiff.py` does the same for a whole object when a case is
-@@ -35,6 +41,21 @@
- mean something different in the base slot than in the index slot, and only the
- round-trip check caught it.
- 
-+Two verdicts record deliberate refusals, so they are not mistaken for work
-+left undone:
-+
-+* `DECLINED-FP` -- clang and icx exchange the sources of `vaddps`/`vmulps`
-+  (and the pd/scalar forms) to reach the 2-byte VEX prefix. x86 FP add and
-+  multiply are not bit-commutative: with two NaN inputs the result carries
-+  SRC1's payload. Measured here, `vaddps` over (0x7fc00001, 0x7fc00002) gives
-+  0x7fc00001 one way and 0x7fc00002 the other, so the byte is not taken.
-+  Bitwise FP ops (`vandps`/`vorps`/`vxorps`) have no NaN rule and were
-+  measured bit-identical under exchange, so those ARE shortened.
-+* `DECLINED-WRONG` -- ICC encodes `xchg %eax, %eax` as the one-byte `0x90`.
-+  That is not equivalent: the xchg is a 32-bit register write and zeroes the
-+  upper half of RAX, while NOP does nothing. Measured from
-+  RAX=0x1122334455667788, `87 c0` leaves 0x0000000055667788.
-+
- ## Oracles
- 
- The differential tools need a reference assembler:
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/scripts/asmdiff.py b/scripts/asmdiff.py
---- a/scripts/asmdiff.py	2026-08-14 15:36:30.265030618 +0000
-+++ b/scripts/asmdiff.py	2026-08-14 16:05:59.529030618 +0000
-@@ -192,6 +192,56 @@
- _ZERODISP = re.compile(r"(?<![0-9a-fx])0x0\(")
- 
- 
-+# VEX 3-operand instructions whose two SOURCE operands may be exchanged with
-+# no change to the result bits. Integer and bitwise only: FP add/mul propagate
-+# SRC1's NaN payload, so exchanging them is observable and is NOT done.
-+_COMMUTATIVE_VEX = {
-+    "vpand", "vpor", "vpxor", "vpaddb", "vpaddw", "vpaddd", "vpaddq",
-+    "vpmullw", "vpaddsb", "vpaddsw", "vpaddusb", "vpaddusw",
-+    "vpminub", "vpmaxub", "vpminsw", "vpmaxsw", "vpavgb", "vpavgw",
-+    "vpmulhw", "vpmulhuw", "vpcmpeqb", "vpcmpeqw", "vpcmpeqd",
-+    "vandps", "vandpd", "vorps", "vorpd", "vxorps", "vxorpd",
-+}
-+_VEX3 = re.compile(r"^(v\S+)\s+(%\S+),(%\S+),(%\S+)$")
-+
-+
-+# A 32-bit register write zero-extends into its 64-bit parent, so
-+# `mov $0xffffffff,%eax` and `movabs $0xffffffff,%rax` leave the same value in
-+# %rax -- the first in 5 bytes, the second in 10. Canonicalise the pair so the
-+# semantic comparison sees them as equal.
-+_GP32_TO_64 = {
-+    "eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
-+    "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp",
-+    **{f"r{n}d": f"r{n}" for n in range(8, 16)},
-+}
-+_MOV_IMM = re.compile(r"^(movabs|mov)\s+\$(0x[0-9a-f]+|\d+),%(\w+)$")
-+
-+
-+def _canon_mov_imm(insn: str) -> str:
-+    """Normalise a zero-extending 32-bit immediate load to its 64-bit meaning."""
-+    m = _MOV_IMM.match(insn.strip())
-+    if not m:
-+        return insn
-+    val = int(m.group(2), 0)
-+    reg = m.group(3)
-+    if reg in _GP32_TO_64 and 0 <= val <= 0xFFFFFFFF:
-+        return f"mov ${val:#x},%{_GP32_TO_64[reg]}"
-+    return f"mov ${val:#x},%{reg}"
-+
-+
-+def _canon_commutative(insn: str) -> str:
-+    """Put the two sources of a commutative VEX op in a canonical order.
-+
-+    An assembler may exchange them to reach the shorter 2-byte VEX prefix, so
-+    the disassembly differs textually while denoting the same operation.
-+    """
-+    m = _VEX3.match(insn.strip())
-+    if not m or m.group(1) not in _COMMUTATIVE_VEX:
-+        return insn
-+    a, b = sorted((m.group(2), m.group(3)))
-+    return f"{m.group(1)} {a},{b},{m.group(4)}"
-+
-+
- def _norm_disasm(text: str) -> str:
-     """Normalise a disassembly listing for semantic comparison.
- 
-@@ -209,6 +259,8 @@
-         insn = _SCALE1.sub(r"(%\1)", insn)
-         insn = _ZERODISP.sub("(", insn)
-         insn = re.sub(r"\s+", " ", insn)
-+        insn = _canon_commutative(insn)
-+        insn = _canon_mov_imm(insn)
-         # Drop the trailing branch-target comment objdump appends.
-         insn = insn.split("#")[0].strip()
-         out.append(insn)
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/scripts/encdiff.py b/scripts/encdiff.py
---- a/scripts/encdiff.py	2026-08-14 15:36:30.265030618 +0000
-+++ b/scripts/encdiff.py	2026-08-14 16:23:33.713030618 +0000
-@@ -45,6 +45,7 @@
- from __future__ import annotations
- 
- import argparse
-+import concurrent.futures
- import hashlib
- import json
- import os
-@@ -59,6 +60,7 @@
- 
- API = "https://godbolt.org/api"
- CACHE = Path(os.environ.get("GODBOLT_CACHE", ".godbolt-cache"))
-+_OBJDUMP = os.environ.get("LCCC_OBJDUMP", "objdump")
- TIMEOUT = int(os.environ.get("GODBOLT_TIMEOUT", "120"))
- 
- # Remote oracles. Every one of these has its own integrated assembler, so they
-@@ -183,15 +185,18 @@
- 
- 
- # The instruction is wrapped in a naked function so nothing but our own bytes
--# lands between the markers. The markers are int3 (0xCC) runs, which no
--# compiler emits spontaneously here, so they are unambiguous delimiters.
-+# lands between the markers. The markers are `ud2` runs: unlike int3 (0xCC),
-+# ud2 is never emitted as alignment padding, and it cannot be confused with a
-+# payload byte because fences are matched on the disassembled MNEMONIC, not on
-+# raw bytes -- an instruction such as `dec %r12d` (41 ff cc) ends in 0xCC and
-+# broke a byte-level scanner.
- _WRAP = """\
- __attribute__((naked)) void _encdiff_probe(void);
- __attribute__((naked)) void _encdiff_probe(void){
-   __asm__ volatile(
--    "int3\\n\\tint3\\n\\tint3\\n\\tint3\\n\\t"
-+    "ud2\\n\\tud2\\n\\tud2\\n\\tud2\\n\\t"
-     %s
--    "\\n\\tint3\\n\\tint3\\n\\tint3\\n\\tint3"
-+    "\\n\\tud2\\n\\tud2\\n\\tud2\\n\\tud2"
-   );
+From 21f0ae979c0965ff3a60e57228bf00c40ecf563f Mon Sep 17 00:00:00 2001
+From: lccc-v15 <v15@localhost>
+Date: Fri, 14 Aug 2026 15:48:24 +0000
+Subject: [PATCH 1/6] Fix STT_TLS misclassification of GOTPCRELX relocations
+
+is_tls_reloc used a naive x86-64/i386 union that included 42
+(R_X86_64_REX_GOTPCRELX, a relaxable GOT reference) in the TLS set. Every
+@GOTPCRELX-referenced symbol was therefore emitted as STT_TLS and laid out as
+a thread-local symbol, so the linker resolved it to the wrong address (gzip:
+'prev' resolved to &rsync, so head = prev + WSIZE wrote hash entries into the
+globals region and corrupted strstart). Make the classifier target-aware:
+i386 {14..19, 24..37, 39..41}, x86-64 {16..23, 29..31}.
+---
+ src/backend/elf/symbol_table.rs | 31 +++++++++++++++++++++++--------
+ 1 file changed, 23 insertions(+), 8 deletions(-)
+
+diff --git a/src/backend/elf/symbol_table.rs b/src/backend/elf/symbol_table.rs
+index f775df90..96e70007 100644
+--- a/src/backend/elf/symbol_table.rs
++++ b/src/backend/elf/symbol_table.rs
+@@ -225,13 +225,28 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
+ /// True if the relocation type is a TLS relocation (x86-64 and i386).
+ /// Undefined symbols referenced by these must be emitted as STT_TLS so the
+ /// static linker can match them against TLS definitions.
++///
++/// The relocation-type numbers COLLIDE across the two architectures, so the
++/// classifier must be target-aware. The old naive union included 42, which is
++/// `R_X86_64_REX_GOTPCRELX` (a relaxable GOT reference) — NOT a TLS
++/// relocation on either architecture. Every `@GOTPCRELX`-referenced symbol
++/// was therefore emitted as STT_TLS, and the linker laid it out as a
++/// thread-local symbol whose address resolved to the WRONG symbol (gzip:
++/// `prev` resolved to `&rsync`, so `head = prev + WSIZE` wrote hash entries
++/// into the globals region and corrupted `strstart` — SIGSEGV in deflate
++/// under PGO builds, and only there because block alignment changed the
++/// GOT-layout path).
+ fn is_tls_reloc(rtype: u32) -> bool {
+-    // x86-64: R_X86_64_DTPMOD64=16, DTPOFF64=17, TPOFF64=18, TPOFF32=23,
+-    //          DTPOFF32=21, GOTTPOFF=22, TLSDESC=36, TLSDESC_CALL=42
+-    // i386:    R_386_TLS_TPOFF=14, TLS_IE=15, TLS_GOTIE=16, TLS_LE=17,
+-    //          TLS_GD=18, TLS_LDM=19, TLS_GD_32=24..TLS_TPOFF32=35
+-    // Deduplicated union of the two arch sets: the 16/17/18 overlap between
+-    // x86-64 and i386 made the original arms unreachable (rustc warning).
+-    // x86-64 {16,17,18,21,22,23,36,42} ∪ i386 {14..19, 24..35} = {14..19, 21..23, 24..35, 36, 42}
+-    matches!(rtype, 14..=19 | 21..=23 | 24..=35 | 36 | 42)
++    if crate::common::types::target_is_32bit() {
++        // i386 R_386_TLS_*: TPOFF=14, IE=15, GOTIE=16, LE=17, GD=18, LDM=19,
++        // GD_32..TPOFF32 = 24..=37, GOTDESC=39, DESC_CALL=40, DESC=41.
++        matches!(rtype, 14..=19 | 24..=37 | 39..=41)
++    } else {
++        // x86-64 TLS relocations: DTPMOD64=16, DTPOFF64=17, TPOFF64=18,
++        // TLSGD=19, TLSLD=20, DTPOFF32=21, GOTTPOFF=22, TPOFF32=23,
++        // GOTPC32_TLSDESC=29, TLSDESC_CALL=30, TLSDESC=31.
++        // 41 (GOTPCRELX) and 42 (REX_GOTPCRELX) are relaxable GOT relocations,
++        // NOT TLS — deliberately excluded.
++        matches!(rtype, 16..=23 | 29..=31)
++    }
  }
- """
-@@ -220,42 +225,188 @@
-         msg = " ".join(x.get("text", "") for x in (r.get("stderr") or []))
-         return Encoding(False, None, msg.strip()[:120] or "compile error")
+-- 
+2.47.3
+
+
+From 34075fbd99c01274386f82988f6546b8a02e99f9 Mon Sep 17 00:00:00 2001
+From: lccc-v15 <v15@localhost>
+Date: Fri, 14 Aug 2026 15:48:32 +0000
+Subject: [PATCH 2/6] Peephole: only hoist loop-invariant GPR loads with a
+ single entry edge
+
+hoist_loop_invariant_gpr_load replaced the preheader's 'jmp <header>' with a
+hoisted stack load and assumed every loop entry passes through it. A header
+with a second FORWARD entry edge (e.g. 'je <header>' from a different
+predecessor) enters the loop directly and observes a stale destination
+register. gzip's deflate hit this under PGO: the '.p2align' before the hot
+join block kept the entry jmp from being folded away, so the hoist fired and
+moved the 'head' (prev+WSIZE) reload into only the rsync!=0 path; the
+rsync==0 path then used &rsync as the hash-table base and SIGSEGV'd.
+
+Count branches targeting the header before the header label; hoist only when
+the entry jmp is the sole forward reference. Add unit tests for the
+multi-entry (must skip) and single-entry (must hoist) cases.
+---
+ .../codegen/peephole/passes/local_patterns.rs | 31 +++++++++-
+ .../x86/codegen/peephole/passes/mod.rs        | 57 +++++++++++++++++++
+ 2 files changed, 87 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+index 7ecd2c16..292263e1 100644
+--- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
++++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+@@ -14,7 +14,7 @@
+ //!   7. eliminate_redundant_xorl_zero: xorl %eax,%eax when %rax already zero
  
--    rows = [x for x in (r.get("asm") or []) if x.get("opcodes")]
-+    rows = [(x.get("text", "").strip(), [b.lower() for b in x["opcodes"]])
-+            for x in (r.get("asm") or []) if x.get("opcodes")]
-     if not rows:
-         return Encoding(False, None, "no opcodes in response")
-+    return _split_fenced(rows, 1)[0]
+ use super::super::types::*;
+-use super::helpers::{is_valid_gp_reg, has_implicit_reg_usage, replace_reg_family, is_callee_saved_reg, get_dest_reg, is_read_modify_write, implicit_read_reg_family};
++use super::helpers::{is_valid_gp_reg, has_implicit_reg_usage, replace_reg_family, is_callee_saved_reg, get_dest_reg, is_read_modify_write, implicit_read_reg_family, extract_jump_target};
  
--    # Collect the bytes between the int3 fences.
--    flat: list[tuple[str, list[str]]] = [
--        (x.get("text", "").strip(), [b.lower() for b in x["opcodes"]])
--        for x in rows
--    ]
--    seq: list[str] = []
--    texts: list[str] = []
--    for text, ops in flat:
--        seq.extend(ops)
--        texts.append(text)
--
--    joined = " ".join(seq)
--    fence = "cc cc cc cc"
--    i = joined.find(fence)
--    if i < 0:
--        return Encoding(False, None, "start fence not found")
--    j = joined.find(fence, i + len(fence))
--    if j < 0:
--        return Encoding(False, None, "end fence not found")
--    mid = joined[i + len(fence):j].strip()
--    data = bytes.fromhex(mid.replace(" ", "")) if mid else b""
--
--    # Keep the disassembly of the payload for the round-trip check.
--    dis: list[str] = []
--    seen = 0
--    start = len(fence.split())
--    for text, ops in flat:
--        n = len(ops)
--        if seen >= start and text and not text.startswith("int3"):
--            dis.append(text)
--        seen += n
--    return Encoding(True, data, "", " ; ".join(dis))
-+
-+_BATCH_WRAP_HEAD = "__attribute__((naked)) void _p%d(void);\n" \
-+                   "__attribute__((naked)) void _p%d(void){ __asm__ volatile(\n"
-+_BATCH_WRAP_TAIL = "  );\n}\n"
-+
-+
-+def _batch_source(insns: list[str]) -> str:
-+    """One naked function per instruction, each inside its own int3 fence."""
-+    out = []
-+    for i, insn in enumerate(insns):
-+        before, after = local_label_scaffold(insn)
-+        body = insn
-+        if before:
-+            body = before + "\\n\\t" + body
-+        if after:
-+            body = body + "\\n\\t" + after
-+        out.append(_BATCH_WRAP_HEAD % (i, i))
-+        out.append('    "ud2\\n\\tud2\\n\\tud2\\n\\tud2\\n\\t"\n')
-+        out.append("    " + _c_escape(body) + "\n")
-+        out.append('    "\\n\\tud2\\n\\tud2\\n\\tud2\\n\\tud2"\n')
-+        out.append(_BATCH_WRAP_TAIL)
-+    return "".join(out)
-+
-+
-+def _split_fenced(rows: list[tuple[str, list[str]]], count: int) -> list[Encoding]:
-+    """Cut the row stream into `count` fenced payloads.
-+
-+    Splitting on raw 0xCC bytes is WRONG: an instruction may legitimately end
-+    in 0xCC (`dec %r12d` is 41 ff cc), and a byte scanner then treats its last
-+    byte as the opening of the closing fence and truncates the encoding.
-+    Compiler Explorer reports one row per instruction, so fences are detected
-+    as rows whose disassembly is `int3`, which no payload row can imitate.
-+
-+    Padding matters too: the compiler aligns each function, so an alignment
-+    NOP sits between one payload's closing fence and the next opening fence.
-+    Payload extraction therefore only takes rows between a fence run and the
-+    NEXT fence run, and anything after a closing fence is skipped until the
-+    following opening fence is seen.
-+    """
-+    def is_fence(text: str) -> bool:
-+        return text.strip().split()[0:1] == ["ud2"]
-+
-+    # Collect maximal fence runs, then treat consecutive pairs as delimiters.
-+    runs: list[tuple[int, int]] = []   # (start_row, end_row_exclusive)
-+    i = 0
-+    n = len(rows)
-+    while i < n:
-+        if is_fence(rows[i][0]):
-+            j = i
-+            while j < n and is_fence(rows[j][0]):
-+                j += 1
-+            if j - i >= 4:
-+                runs.append((i, j))
-+            i = j
-+        else:
-+            i += 1
-+
-+    out: list[Encoding] = []
-+    for k in range(0, len(runs) - 1, 2):
-+        if len(out) >= count:
-+            break
-+        _, open_end = runs[k]
-+        close_start, _ = runs[k + 1]
-+        payload = rows[open_end:close_start]
-+        data = bytes.fromhex("".join(b for _, ops in payload for b in ops))
-+        texts = [t for t, _ in payload if t]
-+        out.append(Encoding(True, data, "", " ; ".join(texts)))
-+    while len(out) < count:
-+        out.append(Encoding(False, None, "fence not found"))
-+    return out
-+
-+
-+def _split_labelled(asm_rows: list[dict], count: int) -> list[Encoding]:
-+    """Extract each probe's payload using the `_pN:` function labels.
-+
-+    Positional fence pairing is fragile: whether the compiler emits an
-+    alignment NOP after a probe depends on that probe's own length, and a
-+    payload ending in `ret` gets none at all. The wrapper emits one labelled
-+    function per instruction, so slicing by label is exact and independent of
-+    padding.
-+    """
-+    def is_fence(text: str) -> bool:
-+        return text.strip().split()[0:1] == ["ud2"]
-+
-+    # Bucket rows by the most recent `_pN:` label.
-+    buckets: dict[int, list[tuple[str, list[str]]]] = {}
-+    cur: int | None = None
-+    for x in asm_rows:
-+        text = (x.get("text") or "").strip()
-+        m = re.match(r"^_p(\d+):", text)
-+        if m:
-+            cur = int(m.group(1))
-+            buckets.setdefault(cur, [])
-+            continue
-+        if cur is None or not x.get("opcodes"):
-+            continue
-+        buckets[cur].append((text, [b.lower() for b in x["opcodes"]]))
-+
-+    out: list[Encoding] = []
-+    for i in range(count):
-+        rows = buckets.get(i)
-+        if not rows:
-+            out.append(Encoding(False, None, "probe label not found"))
-+            continue
-+        # Drop the leading fence run, then take everything up to the next one.
-+        k = 0
-+        while k < len(rows) and is_fence(rows[k][0]):
-+            k += 1
-+        payload = []
-+        while k < len(rows) and not is_fence(rows[k][0]):
-+            payload.append(rows[k])
-+            k += 1
-+        data = bytes.fromhex("".join(b for _, ops in payload for b in ops))
-+        texts = [t for t, _ in payload if t]
-+        out.append(Encoding(True, data, "", " ; ".join(texts)))
-+    return out
-+
-+
-+# The fence mnemonic cannot be measured by this transport: a probe consisting
-+# of `ud2` is indistinguishable from its own delimiter. Route it to the local
-+# assembler only rather than reporting a bogus remote answer.
-+UNMEASURABLE_REMOTE = {"ud2"}
-+
-+
-+def encode_remote_many(cid: str, insns: list[str], args: str = "-O0 -c",
-+                       chunk: int = 60) -> list[Encoding]:
-+    """Assemble many instructions remotely, batching them into few requests.
-+
-+    A batch is only usable if the whole translation unit compiles. One bad
-+    instruction would fail the entire chunk, so on failure the chunk is split
-+    and retried, isolating the offender in O(log n) extra requests instead of
-+    giving up on all of its neighbours.
-+    """
-+    if not insns:
-+        return []
-+    results: list[Encoding] = []
-+    for base in range(0, len(insns), chunk):
-+        group = insns[base:base + chunk]
-+        # Keep unmeasurable probes out of the batch entirely; they would
-+        # desync the fence structure for their neighbours.
-+        idx = [k for k, i in enumerate(group)
-+               if i.strip().split()[0:1] != list(UNMEASURABLE_REMOTE)]
-+        sendable = [group[k] for k in idx]
-+        got = _encode_group(cid, sendable, args) if sendable else []
-+        merged: list[Encoding] = [
-+            Encoding(False, None, "not measurable over this transport")
-+            for _ in group
-+        ]
-+        for pos, k in enumerate(idx):
-+            if pos < len(got):
-+                merged[k] = got[pos]
-+        results.extend(merged)
-+    return results
-+
-+
-+def _encode_group(cid: str, group: list[str], args: str) -> list[Encoding]:
-+    if not group:
-+        return []
-+    try:
-+        r = _post(cid, _batch_source(group), args)
-+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
-+            json.JSONDecodeError, OSError) as e:
-+        return [Encoding(False, None, f"network: {type(e).__name__}")] * len(group)
-+
-+    if r.get("code") != 0:
-+        if len(group) == 1:
-+            msg = " ".join(x.get("text", "") for x in (r.get("stderr") or []))
-+            return [Encoding(False, None, msg.strip()[:120] or "compile error")]
-+        mid = len(group) // 2
-+        return _encode_group(cid, group[:mid], args) + \
-+               _encode_group(cid, group[mid:], args)
-+
-+    got = _split_labelled(r.get("asm") or [], len(group))
-+    if len(got) != len(group):
-+        got += [Encoding(False, None, "batch desync")] * (len(group) - len(got))
-+    return got
- 
- 
- # ─── Comparison ───────────────────────────────────────────────────────────
-@@ -277,6 +428,67 @@
-     return s
- 
- 
-+_SCALE1 = re.compile(r"\(,%([a-z0-9]+),1\)")
-+_ZERODISP = re.compile(r"(?<![0-9a-fx])0x0\(")
-+_COMMUTATIVE_VEX = {
-+    "vpand", "vpor", "vpxor", "vpaddb", "vpaddw", "vpaddd", "vpaddq",
-+    "vpmullw", "vpaddsb", "vpaddsw", "vpaddusb", "vpaddusw",
-+    "vpminub", "vpmaxub", "vpminsw", "vpmaxsw", "vpavgb", "vpavgw",
-+    "vpmulhw", "vpmulhuw", "vpcmpeqb", "vpcmpeqw", "vpcmpeqd",
-+    "vandps", "vandpd", "vorps", "vorpd", "vxorps", "vxorpd",
-+}
-+_VEX3 = re.compile(r"^(v\S+)\s+(%\S+),(%\S+),(%\S+)$")
-+_GP32_TO_64 = {
-+    "eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
-+    "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp",
-+    **{f"r{n}d": f"r{n}" for n in range(8, 16)},
-+}
-+_MOV_IMM = re.compile(r"^(movabs|mov)\s+\$(0x[0-9a-f]+|\d+),%(\w+)$")
-+
-+
-+def _canon_insn(insn: str) -> str:
-+    """Canonicalise the spellings that differ only by encoding choice."""
-+    insn = insn.split("#")[0].strip().lower()
-+    insn = _SCALE1.sub(r"(%\1)", insn)
-+    insn = _ZERODISP.sub("(", insn)
-+    insn = re.sub(r"\s+", " ", insn)
-+    m = _VEX3.match(insn)
-+    if m and m.group(1) in _COMMUTATIVE_VEX:
-+        a, b = sorted((m.group(2), m.group(3)))
-+        insn = f"{m.group(1)} {a},{b},{m.group(4)}"
-+    m = _MOV_IMM.match(insn)
-+    if m:
-+        val = int(m.group(2), 0)
-+        reg = m.group(3)
-+        if reg in _GP32_TO_64 and 0 <= val <= 0xFFFFFFFF:
-+            insn = f"mov ${val:#x},%{_GP32_TO_64[reg]}"
-+    return insn
-+
-+
-+def decodes_same(objdump: str, a: bytes, b: bytes) -> bool:
-+    """True when two byte strings disassemble to the same instruction."""
-+    def dis(data: bytes) -> str:
-+        if not data:
-+            return ""
-+        with tempfile.TemporaryDirectory(prefix="encdiff-dis-") as td:
-+            raw = Path(td) / "d.bin"
-+            raw.write_bytes(data)
-+            r = subprocess.run(
-+                [objdump, "-D", "-b", "binary", "-m", "i386:x86-64",
-+                 "-M", "att", str(raw)],
-+                capture_output=True, text=True, timeout=120)
-+        out = []
-+        for line in r.stdout.splitlines():
-+            m = re.match(r"^\s+[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*\t(.*)$", line)
-+            if m:
-+                out.append(_canon_insn(m.group(2)))
-+        return "\n".join(out)
-+    try:
-+        return dis(a) == dis(b)
-+    except (OSError, subprocess.SubprocessError):
-+        return False
-+
-+
- def classify(row: Row) -> None:
-     ok_oracles = {k: v for k, v in row.oracles.items() if v.ok and v.data is not None}
- 
-@@ -304,6 +516,15 @@
-         elif n == best:
-             row.verdict = "ok-best"
-             row.note += f" | matches shortest ({','.join(best_who)})"
-+        elif is_wrong_shorter(row.insn):
-+            row.verdict = "DECLINED-WRONG"
-+            row.note += (f" | {best}B form from {','.join(best_who)} is not"
-+                         " equivalent; refused")
-+        elif is_declined_fp_swap(row.insn):
-+            row.verdict = "DECLINED-FP"
-+            row.note += (f" | {best}B form from {','.join(best_who)} needs a"
-+                         " source swap; refused, FP add/mul propagate SRC1's"
-+                         " NaN payload")
-         else:
-             row.verdict = "LONGER"
-             row.note += f" | shortest is {best}B from {','.join(best_who)}"
-@@ -318,13 +539,57 @@
-     elif n > len(ref):
-         row.verdict = "LONGER"
-         row.note = f"all oracles agree on {len(ref)}B"
-+    elif decodes_same(_OBJDUMP, row.lccc.data, ref):
-+        # Same length, different bytes, but the two decode identically -- a
-+        # different spelling of the same instruction, not a defect.
-+        row.verdict = "ok"
-     else:
-         row.verdict = "WRONG-BYTES"
-         row.note = f"same length, different bytes (oracle {ref.hex()})"
- 
- 
-+# Cases where a shorter encoding EXISTS but is deliberately not taken.
-+#
-+# clang and icx exchange the sources of vaddps/vaddpd/vmulps/vmulpd to reach
-+# the 2-byte VEX prefix. That is one byte smaller and, for ordinary operands,
-+# gives the same result -- but x86 FP add/mul are not bit-commutative: when
-+# both sources are NaN the result carries SRC1's payload. Measured on a
-+# Skylake-SP host, `vaddps` over (0x7fc00001, 0x7fc00002) yields 0x7fc00001 in
-+# one operand order and 0x7fc00002 in the other.
-+#
-+# Reporting these as LONGER forever would train the reader to ignore LONGER,
-+# so they are classified separately and explained.
-+_FP_NONCOMMUTATIVE = {"vaddps", "vaddpd", "vmulps", "vmulpd",
-+                      "vaddss", "vaddsd", "vmulss", "vmulsd"}
-+
-+
-+def is_declined_fp_swap(insn: str) -> bool:
-+    """True for a swap we refuse on NaN-payload grounds."""
-+    parts = insn.replace(",", " ").split()
-+    return bool(parts) and parts[0] in _FP_NONCOMMUTATIVE
-+
-+
-+# Shorter encodings that are simply WRONG. Every one of these was produced by
-+# an oracle and rejected here after checking what the bytes actually do.
-+#
-+#   xchg %eax,%eax -> 0x90
-+#       ICC emits the one-byte NOP. But `xchg %eax,%eax` is a real 32-bit
-+#       register write and therefore zeroes the upper half of RAX, while 0x90
-+#       does nothing at all. Measured: starting from RAX=0x1122334455667788,
-+#       `87 c0` leaves 0x0000000055667788 and `90` leaves it unchanged.
-+_WRONG_SHORTER = {
-+    "xchg %eax, %eax", "xchg %eax,%eax",
-+}
-+
-+
-+def is_wrong_shorter(insn: str) -> bool:
-+    return " ".join(insn.split()) in _WRONG_SHORTER
-+
-+
- SEVERITY = {
-     "WRONG-BYTES": 0,
-+    "DECLINED-FP": 6,   # shorter form exists but changes NaN payload
-+    "DECLINED-WRONG": 6, # shorter form exists but is not equivalent
-     "REJECTS-VALID": 1,
-     "LONGER": 2,
-     "BEATS": 3,      # investigate: must round-trip
-@@ -369,6 +634,8 @@
-                     help="local GNU as only; no network")
-     ap.add_argument("--only", action="append", default=[],
-                     help="report only these verdicts")
-+    ap.add_argument("--batch", type=int, default=60,
-+                    help="instructions per remote request (0 disables batching)")
-     ap.add_argument("--max-report", type=int, default=200)
-     ap.add_argument("--quiet", action="store_true")
-     args = ap.parse_args()
-@@ -392,13 +659,35 @@
-     rows: list[Row] = []
-     with tempfile.TemporaryDirectory(prefix="encdiff-") as td:
-         tmp = Path(td)
--        for insn in uniq:
--            lccc = encode_local(args.lccc, insn, tmp, args.objcopy)
--            row = Row(insn, lccc)
--            row.oracles["gas"] = encode_local(args.gas, insn, tmp, args.objcopy)
--            if not args.offline:
--                for name, cid in oracle_ids.items():
--                    row.oracles[name] = encode_remote(cid, insn)
-+        # Local assemblers are cheap; run them straight through.
-+        locals_lccc = [encode_local(args.lccc, i, tmp, args.objcopy) for i in uniq]
-+        locals_gas = [encode_local(args.gas, i, tmp, args.objcopy) for i in uniq]
-+
-+        remote: dict[str, list[Encoding]] = {}
-+        if not args.offline:
-+            # Each oracle is an independent network stream, so fetch them
-+            # concurrently; within an oracle the instructions are batched.
-+            with concurrent.futures.ThreadPoolExecutor(
-+                    max_workers=max(1, len(oracle_ids))) as ex:
-+                futs = {
-+                    ex.submit(encode_remote_many, cid, uniq, "-O0 -c",
-+                              args.batch): name
-+                    for name, cid in oracle_ids.items()
-+                }
-+                for fut in concurrent.futures.as_completed(futs):
-+                    name = futs[fut]
-+                    try:
-+                        remote[name] = fut.result()
-+                    except Exception as e:  # noqa: BLE001
-+                        remote[name] = [Encoding(False, None,
-+                                                 f"oracle failed: {e}")] * len(uniq)
-+
-+        for k, insn in enumerate(uniq):
-+            row = Row(insn, locals_lccc[k])
-+            row.oracles["gas"] = locals_gas[k]
-+            for name, encs in remote.items():
-+                if k < len(encs):
-+                    row.oracles[name] = encs[k]
-             classify(row)
-             rows.append(row)
- 
-@@ -409,7 +698,8 @@
-             break
-         if args.only and r.verdict not in args.only:
-             continue
--        if not args.only and r.verdict in ("ok", "ok-best", "both-reject"):
-+        if not args.only and r.verdict in ("ok", "ok-best", "both-reject",
-+                                           "DECLINED-FP", "DECLINED-WRONG"):
-             continue
-         if shown >= args.max_report:
-             print(f"... ({len(rows) - shown} more)")
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/scripts/gen_encoding_sweep.py b/scripts/gen_encoding_sweep.py
---- a/scripts/gen_encoding_sweep.py	1970-01-01 00:00:00.000000000 +0000
-+++ b/scripts/gen_encoding_sweep.py	2026-08-14 15:40:48.409030618 +0000
-@@ -0,0 +1,326 @@
-+#!/usr/bin/env python3
-+"""Generate instructions that have more than one legal encoding.
-+
-+`gen_asmdiff_corpus.py` builds a corpus for *correctness*: it walks the ModRM,
-+SIB, REX and VEX decision trees so every structural encoding path is taken at
-+least once. That corpus is deliberately GAS-shaped, and it is already clean.
-+
-+This generator targets a different axis: places where the instruction set
-+offers a CHOICE, so two assemblers can both be right and one can be smaller.
-+Those are the only places where `encdiff.py` can find an improvement, and most
-+of them are invisible to a corpus built around structural coverage.
-+
-+The families, and why each admits a choice:
-+
-+  accumulator     Many ALU ops have a short `op %eax, imm32` form (opcode
-+                  0x05/0x2D/...) that saves the ModRM byte. Only valid when
-+                  the destination is the accumulator.
-+  imm8_sext       An immediate in [-128,127] can use the sign-extended imm8
-+                  opcode (0x83) instead of imm32 (0x81): saves 3 bytes.
-+  redundant_rex   A REX byte is only needed for W, r8-r15, or spl/bpl/sil/dil.
-+                  Emitting 0x40 otherwise is legal but wasteful.
-+  mov_imm_zero    `mov $0,%rax` can be `xor %eax,%eax` only if flags are dead,
-+                  which an assembler cannot know -- but `movq $0` vs
-+                  `movl $0` into the same register IS an assembler choice, and
-+                  `movabsq $small` should shrink to the 5-byte form.
-+  sib_fold        A scale-1 index with no base folds into the base slot; a
-+                  zero displacement can drop entirely.
-+  disp_shrink     disp32 that fits in disp8 (and disp8 of zero) should shrink.
-+  vex_len         VEX3 collapses to VEX2 whenever X, B and W are all clear and
-+                  the map is 0F: one byte saved on a very common form.
-+  test_and        `test $imm,%reg` has an accumulator short form; the 8-bit
-+                  forms have their own opcode.
-+  push_imm        push imm8 vs imm32.
-+  shift_one       Shift by 1 has a dedicated opcode (0xD1) shorter than the
-+                  imm8 form (0xC1 /r ib).
-+  inc_dec         inc/dec via 0xFE/0xFF vs the (invalid in 64-bit) 0x40+r.
-+  xchg_acc        xchg with the accumulator has the one-byte 0x90+r form.
-+  lea_strength    LEA forms that a smarter assembler can shorten.
-+
-+Output is one instruction per line, ready for `encdiff.py --file`.
-+"""
-+from __future__ import annotations
-+
-+import argparse
-+import sys
-+
-+GP64 = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp",
-+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
-+GP32 = ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp",
-+        "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"]
-+GP16 = ["ax", "bx", "cx", "dx", "si", "di", "bp",
-+        "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w"]
-+GP8 = ["al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl",
-+       "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"]
-+XMM = [f"xmm{i}" for i in range(16)]
-+YMM = [f"ymm{i}" for i in range(16)]
-+
-+ALU = ["add", "sub", "and", "or", "xor", "cmp", "adc", "sbb"]
-+# Values that sit on an encoding boundary: imm8 range, imm32 range, and the
-+# sign-extension edges where a smaller opcode becomes legal or stops being so.
-+IMM_EDGE = [0, 1, 127, 128, -1, -128, -129, 255, 256, 32767, 65535,
-+            2147483647, -2147483648]
-+DISP_EDGE = [0, 1, 127, 128, -1, -128, -129, 255, 1024, 65536]
-+
-+
-+def accumulator(out):
-+    """op $imm, %acc -- short form exists only for the accumulator."""
-+    for op in ALU:
-+        for imm in IMM_EDGE:
-+            out.append(f"{op}b ${imm & 0xff}, %al")
-+            out.append(f"{op}w ${imm & 0xffff}, %ax")
-+            out.append(f"{op}l ${imm}, %eax")
-+            out.append(f"{op}q ${imm}, %rax")
-+            # Same immediate into a non-accumulator: no short form, so this is
-+            # the control that proves the short form is not applied wrongly.
-+            out.append(f"{op}l ${imm}, %ecx")
-+            out.append(f"{op}q ${imm}, %rbx")
-+
-+
-+def imm8_sext(out):
-+    """imm in [-128,127] should take the sign-extended imm8 opcode."""
-+    for op in ALU:
-+        for imm in [-128, -1, 0, 1, 127, 128, -129]:
-+            for r in ("ecx", "edx", "r8d", "r13d"):
-+                out.append(f"{op}l ${imm}, %{r}")
-+            for r in ("rcx", "rdx", "r8", "r13"):
-+                out.append(f"{op}q ${imm}, %{r}")
-+            out.append(f"{op}l ${imm}, (%rdi)")
-+            out.append(f"{op}q ${imm}, 8(%rsi)")
-+
-+
-+def redundant_rex(out):
-+    """Registers that do and do not require a REX byte."""
-+    for r in GP8:
-+        out.append(f"movb $1, %{r}")
-+        out.append(f"addb $1, %{r}")
-+        out.append(f"testb %{r}, %{r}")
-+    for a, b in (("al", "cl"), ("sil", "dil"), ("spl", "bpl"),
-+                 ("r8b", "r9b"), ("al", "r8b"), ("r8b", "al")):
-+        out.append(f"movb %{a}, %{b}")
-+        out.append(f"xorb %{a}, %{b}")
-+
-+
-+def mov_imm(out):
-+    """Immediate loads: width choice and the movabs shrink."""
-+    for r64, r32 in zip(GP64, GP32):
-+        out.append(f"movq $0, %{r64}")
-+        out.append(f"movl $0, %{r32}")
-+        out.append(f"movq $1, %{r64}")
-+        out.append(f"movq $-1, %{r64}")
-+        out.append(f"movq $4294967295, %{r64}")
-+        out.append(f"movq $2147483647, %{r64}")
-+        out.append(f"movq $2147483648, %{r64}")
-+        out.append(f"movabsq $1, %{r64}")
-+        out.append(f"movabsq $4294967296, %{r64}")
-+
-+
-+def sib_fold(out):
-+    """Scale-1 index folds; zero displacements; every scale."""
-+    for r in GP64:
-+        if r == "rsp":
-+            continue
-+        for d in (0, 1, -1, 127, 128, -128, -129):
-+            out.append(f"mov {d}(,%{r},1), %rcx")
-+            out.append(f"lea {d}(,%{r},1), %rdx")
-+        for sc in (2, 4, 8):
-+            out.append(f"mov 8(,%{r},{sc}), %rcx")
-+        out.append(f"mov (,%{r},1), %rcx")
-+        out.append(f"mov (%{r}), %rcx")
-+        out.append(f"mov 0(%{r}), %rcx")
-+
-+
-+def disp_shrink(out):
-+    """disp32 that fits disp8, and disp8 that is zero."""
-+    for r in ("rax", "rbx", "rbp", "r12", "r13", "rsp"):
-+        for d in DISP_EDGE:
-+            out.append(f"mov {d}(%{r}), %rcx")
-+            out.append(f"mov %rcx, {d}(%{r})")
-+            out.append(f"lea {d}(%{r}), %rdx")
-+    for b in ("rax", "r12", "rbp", "r13"):
-+        for i in ("rbx", "r9"):
-+            for d in (0, 1, 127, 128):
-+                out.append(f"mov {d}(%{b},%{i},4), %rcx")
-+
-+
-+def vex_len(out):
-+    """VEX3 should collapse to VEX2 when X, B and W are clear."""
-+    pairs = [("xmm0", "xmm1"), ("xmm8", "xmm0"), ("xmm0", "xmm8"),
-+             ("xmm8", "xmm9"), ("ymm0", "ymm1"), ("ymm8", "ymm0"),
-+             ("ymm0", "ymm8"), ("ymm8", "ymm9")]
-+    ops2 = ["vmovaps", "vmovapd", "vmovups", "vmovupd", "vmovdqa", "vmovdqu",
-+            "vsqrtps", "vrcpps", "vrsqrtps"]
-+    for op in ops2:
-+        for a, b in pairs:
-+            if op.endswith(("ps", "pd")) or op.startswith("vmov"):
-+                out.append(f"{op} %{a}, %{b}")
-+    ops3 = ["vaddps", "vsubps", "vmulps", "vdivps", "vandps", "vxorps",
-+            "vaddpd", "vmulpd", "vpaddb", "vpaddd", "vpaddq", "vpand",
-+            "vpxor", "vpor", "vpsubd", "vpmullw"]
-+    for op in ops3:
-+        for a in ("xmm1", "xmm9"):
-+            for b in ("xmm2", "xmm10"):
-+                for c in ("xmm3", "xmm11"):
-+                    out.append(f"{op} %{a}, %{b}, %{c}")
-+    for op in ("vaddps", "vpaddd", "vpxor"):
-+        for m in ("(%rdi)", "(%r13)", "8(%rax,%rbx,4)", "(%r12)"):
-+            out.append(f"{op} {m}, %xmm2, %xmm3")
-+            out.append(f"{op} {m}, %ymm2, %ymm3")
-+
-+
-+def test_and(out):
-+    for imm in (1, 127, 128, 255, 256, 65535, -1):
-+        out.append(f"testb ${imm & 0xff}, %al")
-+        out.append(f"testb ${imm & 0xff}, %cl")
-+        out.append(f"testw ${imm & 0xffff}, %ax")
-+        out.append(f"testl ${imm}, %eax")
-+        out.append(f"testl ${imm}, %ecx")
-+        out.append(f"testq ${imm}, %rax")
-+        out.append(f"testq ${imm}, %rbx")
-+    for a in ("al", "cl", "eax", "ecx", "rax", "rbx", "r8", "r8d"):
-+        out.append(f"test %{a}, %{a}")
-+
-+
-+def push_imm(out):
-+    for imm in (0, 1, 127, 128, -1, -128, -129, 32767, 2147483647):
-+        out.append(f"pushq ${imm}")
-+    for r in GP64:
-+        out.append(f"pushq %{r}")
-+        out.append(f"popq %{r}")
-+
-+
-+def shift_one(out):
-+    for op in ("shl", "shr", "sar", "rol", "ror", "rcl", "rcr"):
-+        for r in ("eax", "ecx", "r8d"):
-+            out.append(f"{op}l $1, %{r}")
-+            out.append(f"{op}l $2, %{r}")
-+            out.append(f"{op}l %cl, %{r}")
-+        for r in ("rax", "rcx", "r8"):
-+            out.append(f"{op}q $1, %{r}")
-+            out.append(f"{op}q $2, %{r}")
-+        out.append(f"{op}b $1, %al")
-+        out.append(f"{op}w $1, %ax")
-+
-+
-+def inc_dec(out):
-+    for r32, r64 in zip(GP32, GP64):
-+        out.append(f"incl %{r32}")
-+        out.append(f"decl %{r32}")
-+        out.append(f"incq %{r64}")
-+        out.append(f"decq %{r64}")
-+    for m in ("(%rdi)", "8(%rsi)", "(%r12)"):
-+        out.append(f"incl {m}")
-+        out.append(f"decq {m}")
-+
-+
-+def xchg_acc(out):
-+    for r32, r64 in zip(GP32, GP64):
-+        out.append(f"xchg %eax, %{r32}")
-+        out.append(f"xchg %{r32}, %eax")
-+        out.append(f"xchg %rax, %{r64}")
-+        out.append(f"xchg %{r64}, %rax")
-+    out.append("xchg %ecx, %edx")
-+    out.append("xchg %rcx, %rdx")
-+
-+
-+def lea_strength(out):
-+    for r in ("rax", "rbx", "r12", "r13"):
-+        out.append(f"lea (%{r}), %rcx")
-+        out.append(f"lea 0(%{r}), %rcx")
-+        out.append(f"lea (%{r},%rbx,1), %rcx")
-+        out.append(f"lea 0(%{r},%rbx,1), %rcx")
-+        out.append(f"lea (,%{r},2), %rcx")
-+        out.append(f"lea (,%{r},4), %rcx")
-+        out.append(f"lea (,%{r},8), %rcx")
-+    out.append("lea (%rax,%rax,1), %rcx")
-+    out.append("lea (%rax,%rax,2), %rcx")
-+
-+
-+def movzx_sx(out):
-+    for src8 in ("al", "cl", "sil", "r8b"):
-+        for dst in ("eax", "ecx", "r9d"):
-+            out.append(f"movzbl %{src8}, %{dst}")
-+            out.append(f"movsbl %{src8}, %{dst}")
-+        out.append(f"movzbq %{src8}, %rax")
-+        out.append(f"movsbq %{src8}, %rax")
-+    for src16 in ("ax", "cx", "r8w"):
-+        out.append(f"movzwl %{src16}, %eax")
-+        out.append(f"movswl %{src16}, %eax")
-+        out.append(f"movzwq %{src16}, %rax")
-+    for src32 in ("eax", "ecx", "r8d"):
-+        out.append(f"movslq %{src32}, %rax")
-+
-+
-+def setcc_cmov(out):
-+    ccs = ["o", "no", "b", "ae", "e", "ne", "be", "a",
-+           "s", "ns", "p", "np", "l", "ge", "le", "g"]
-+    for cc in ccs:
-+        out.append(f"set{cc} %al")
-+        out.append(f"set{cc} %r8b")
-+        out.append(f"set{cc} (%rdi)")
-+        out.append(f"cmov{cc}l %eax, %ecx")
-+        out.append(f"cmov{cc}q %rax, %rcx")
-+
-+
-+def nop_forms(out):
-+    out.append("nop")
-+    for n in range(1, 16):
-+        out.append(f".p2align {n}" if False else "nop")
-+    for m in ("%ax", "%eax", "(%rax)", "0(%rax)", "0(%rax,%rax,1)"):
-+        out.append(f"nopw {m}" if m in ("%ax",) else f"nopl {m}")
-+
-+
-+GROUPS = {
-+    "accumulator": accumulator,
-+    "imm8_sext": imm8_sext,
-+    "redundant_rex": redundant_rex,
-+    "mov_imm": mov_imm,
-+    "sib_fold": sib_fold,
-+    "disp_shrink": disp_shrink,
-+    "vex_len": vex_len,
-+    "test_and": test_and,
-+    "push_imm": push_imm,
-+    "shift_one": shift_one,
-+    "inc_dec": inc_dec,
-+    "xchg_acc": xchg_acc,
-+    "lea_strength": lea_strength,
-+    "movzx_sx": movzx_sx,
-+    "setcc_cmov": setcc_cmov,
-+    "nop_forms": nop_forms,
-+}
-+
-+
-+def main() -> int:
-+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-+    ap.add_argument("--groups", nargs="*", default=sorted(GROUPS),
-+                    help="which families to emit (default: all)")
-+    ap.add_argument("--list", action="store_true", help="list family names")
-+    ap.add_argument("-o", "--output", help="write here instead of stdout")
-+    args = ap.parse_args()
-+
-+    if args.list:
-+        for g in sorted(GROUPS):
-+            print(g)
-+        return 0
-+
-+    out: list[str] = []
-+    for g in args.groups:
-+        if g not in GROUPS:
-+            print(f"unknown group: {g}", file=sys.stderr)
-+            return 2
-+        GROUPS[g](out)
-+
-+    seen: set[str] = set()
-+    uniq = [i for i in out if not (i in seen or seen.add(i))]
-+    text = "\n".join(uniq) + "\n"
-+    if args.output:
-+        with open(args.output, "w") as f:
-+            f.write(text)
-+        print(f"{len(uniq)} instructions -> {args.output}", file=sys.stderr)
-+    else:
-+        sys.stdout.write(text)
-+    return 0
-+
-+
-+if __name__ == "__main__":
-+    sys.exit(main())
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/scripts/insndiff.py b/scripts/insndiff.py
---- a/scripts/insndiff.py	2026-08-14 15:36:30.277030618 +0000
-+++ b/scripts/insndiff.py	2026-08-14 16:16:51.761030618 +0000
-@@ -177,6 +177,48 @@
- _ZERODISP = re.compile(r"(?<![0-9a-fx])0x0\(")
- 
- 
-+_COMMUTATIVE_VEX = {
-+    "vpand", "vpor", "vpxor", "vpaddb", "vpaddw", "vpaddd", "vpaddq",
-+    "vpmullw", "vpaddsb", "vpaddsw", "vpaddusb", "vpaddusw",
-+    "vpminub", "vpmaxub", "vpminsw", "vpmaxsw", "vpavgb", "vpavgw",
-+    "vpmulhw", "vpmulhuw", "vpcmpeqb", "vpcmpeqw", "vpcmpeqd",
-+    "vandps", "vandpd", "vorps", "vorpd", "vxorps", "vxorpd",
-+}
-+_VEX3 = re.compile(r"^(v\S+)\s+(%\S+),(%\S+),(%\S+)$")
-+_GP32_TO_64 = {
-+    "eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
-+    "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp",
-+    **{f"r{n}d": f"r{n}" for n in range(8, 16)},
-+}
-+_MOV_IMM = re.compile(r"^(movabs|mov)\s+\$(0x[0-9a-f]+|\d+),%(\w+)$")
-+
-+
-+def _canon_commutative(insn: str) -> str:
-+    """Order the two sources of a commutative VEX op canonically.
-+
-+    Exchanging them is how the 2-byte VEX prefix becomes reachable, so the
-+    disassembly differs textually while the operation is identical. Restricted
-+    to integer and bitwise ops: FP add/mul propagate SRC1's NaN payload.
-+    """
-+    m = _VEX3.match(insn.strip())
-+    if not m or m.group(1) not in _COMMUTATIVE_VEX:
-+        return insn
-+    a, b = sorted((m.group(2), m.group(3)))
-+    return f"{m.group(1)} {a},{b},{m.group(4)}"
-+
-+
-+def _canon_mov_imm(insn: str) -> str:
-+    """A 32-bit immediate load zero-extends, so it equals the 64-bit form."""
-+    m = _MOV_IMM.match(insn.strip())
-+    if not m:
-+        return insn
-+    val = int(m.group(2), 0)
-+    reg = m.group(3)
-+    if reg in _GP32_TO_64 and 0 <= val <= 0xFFFFFFFF:
-+        return f"mov ${val:#x},%{_GP32_TO_64[reg]}"
-+    return f"mov ${val:#x},%{reg}"
-+
-+
- def _decode(objdump: str, data: bytes, tmp: Path) -> str:
-     """Disassemble raw bytes and normalise away pure encoding choices."""
-     if not data:
-@@ -197,7 +239,10 @@
-         # two spellings that differ only by encoding, not by meaning.
-         insn = _SCALE1.sub(r"(%\1)", insn)
-         insn = _ZERODISP.sub("(", insn)
--        out.append(re.sub(r"\s+", " ", insn))
-+        insn = re.sub(r"\s+", " ", insn)
-+        insn = _canon_commutative(insn)
-+        insn = _canon_mov_imm(insn)
-+        out.append(insn)
-     return "\n".join(out)
- 
- 
-@@ -307,8 +352,12 @@
-             # A shorter encoding is only an improvement if it still means the
-             # same thing. Confirm that here rather than leaving it to a human:
-             # a shorter encoding that decodes differently is a miscompile.
--            if kind == "SHORTER" and verify_shorter(args.objdump, le, ge, tmp):
--                kind = "BETTER"
-+            if kind in ("SHORTER", "WRONG-BYTES") and \
-+                    verify_shorter(args.objdump, le, ge, tmp):
-+                # Equivalent after canonicalisation. Only call it BETTER when
-+                # it is actually smaller; equal size is just a different but
-+                # equally good spelling.
-+                kind = "BETTER" if len(le.data or b"") < len(ge.data or b"") else "ok"
-             results.append((inst, kind, le, ge))
- 
-     results.sort(key=lambda r: (SEVERITY.get(r[1], 9), r[0]))
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/assembler/encoder/avx.rs b/src/backend/x86/assembler/encoder/avx.rs
---- a/src/backend/x86/assembler/encoder/avx.rs	2026-08-14 15:36:30.337030618 +0000
-+++ b/src/backend/x86/assembler/encoder/avx.rs	2026-08-14 15:53:02.013030618 +0000
-@@ -769,6 +769,36 @@
-     /// Encode AVX 3-operand instruction with 66 prefix (or no prefix): op src, vvvv, dst
-     /// Format: VEX.NDS.128/256.66.0F opcode /r
-     pub(crate) fn encode_avx_3op(&mut self, ops: &[Operand], opcode: u8, has_66: bool) -> Result<(), String> {
-+        self.encode_avx_3op_commutative(ops, opcode, has_66, false)
-+    }
-+
-+    /// Encode a VEX 3-operand instruction, optionally exploiting commutativity
-+    /// to reach the shorter 2-byte VEX prefix.
-+    ///
-+    /// The 2-byte VEX (C5) can only encode REX.R; it has no bit for B or X.
-+    /// So `vpaddd %xmm9,%xmm2,%xmm3` -- where the r/m operand is xmm9 -- needs
-+    /// the 3-byte C4 form purely to express VEX.B, costing one byte.
-+    ///
-+    /// For a COMMUTATIVE operation the two source operands can be exchanged:
-+    /// putting xmm9 in vvvv (which has 4 bits of its own, no REX needed) and
-+    /// xmm2 in r/m clears B and lets the 2-byte form encode it. clang and icx
-+    /// both do this; GAS, GCC and ICC do not.
-+    ///
-+    /// `commutative` is opt-in per mnemonic and is deliberately restricted to
-+    /// INTEGER and BITWISE operations. Bitwise FP ops (vandps/vorps/vxorps and
-+    /// their pd forms) qualify: they have no NaN-propagation rule at all, and
-+    /// were measured bit-identical under exchange with two distinct NaN
-+    /// payloads. Floating-point add/mul are NOT
-+    /// bit-commutative on x86: when both sources are NaN the result takes
-+    /// SRC1's payload, so exchanging them changes the result bits. Measured on
-+    /// this host: `vaddps` with sources (0x7fc00001, 0x7fc00002) yields
-+    /// 0x7fc00001 one way and 0x7fc00002 the other. clang performs the swap
-+    /// for vaddps/vmulps anyway; we do not, because a one-byte saving is not
-+    /// worth changing an architecturally-defined result.
-+    pub(crate) fn encode_avx_3op_commutative(&mut self, ops: &[Operand], opcode: u8,
-+                                             has_66: bool, commutative: bool)
-+        -> Result<(), String>
-+    {
-         if ops.len() != 3 { return Err("AVX 3-op requires 3 operands".to_string()); }
-         let l = self.vex_l_from_ops(ops);
-         let pp = if has_66 { 1 } else { 0 };
-@@ -776,6 +806,16 @@
-         match (&ops[0], &ops[1], &ops[2]) {
-             // src_reg, vvvv_reg, dst_reg
-             (Operand::Register(src), Operand::Register(vvvv), Operand::Register(dst)) => {
-+                // Exchange the sources when doing so removes the only reason we
-+                // would need the 3-byte prefix.
-+                let (src, vvvv) = if commutative
-+                    && needs_vex_ext(&src.name)
-+                    && !needs_vex_ext(&vvvv.name)
-+                {
-+                    (vvvv, src)
-+                } else {
-+                    (src, vvvv)
-+                };
-                 let src_num = reg_num(&src.name).ok_or("bad register")?;
-                 let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
-                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/assembler/encoder/core.rs b/src/backend/x86/assembler/encoder/core.rs
---- a/src/backend/x86/assembler/encoder/core.rs	2026-08-14 15:36:30.337030618 +0000
-+++ b/src/backend/x86/assembler/encoder/core.rs	2026-08-14 15:55:11.441030618 +0000
-@@ -378,29 +378,23 @@
-         return None;
-     }
-     let idx = mem.index.as_ref()?;
--    // reg 4 (%rsp/%r12) stays in the index slot: putting it in the base slot
--    // selects the SIB escape, and the general encoder would then have to
--    // re-derive a SIB with index=none to keep the meaning.  ICC does emit that
--    // form (`mov -1(,%r12,1)` -> 49 8b 4c 24 ff, 5 bytes vs our 8), so this is
--    // a known 3-byte opportunity left on the table deliberately: expressing it
--    // needs a base+"no index" SIB that this helper cannot describe by operand
--    // rewriting alone.
--    //
--    // reg 5 (%rbp/%r13) IS foldable, but only because a non-zero displacement
--    // forces mod=01/10 anyway, which gives base==101 its ordinary meaning.
--    // With mod=00 base==101 means "no base, disp32", so a zero-displacement
--    // fold would change the address; require a displacement in that case.
--    match reg_num(&idx.name) {
--        Some(4) => return None,
--        Some(5) => {
--            let has_disp = !matches!(mem.displacement, Displacement::None)
--                && !matches!(mem.displacement, Displacement::Integer(0));
--            if !has_disp {
--                return None;
--            }
--        }
--        _ => {}
-+    // %rsp can never be an index, so an index-only operand naming it is
-+    // invalid input; leave it for the validator to reject.
-+    if idx.name == "rsp" || idx.name == "esp" {
-+        return None;
-     }
-+    // Every other register folds, including reg 4 (%r12) and reg 5
-+    // (%rbp/%r13). Those two need special ModR/M shapes in the base slot --
-+    // %r12 needs a SIB with index=none, and %rbp at mod=00 would mean "no
-+    // base", so it needs mod=01 with a zero disp8 -- but the general memory
-+    // encoder already produces exactly those forms for a plain base operand
-+    // (verified byte-identical to GAS for `lea (%r12)`, `lea 0(%rbp)` and
-+    // `mov -1(%r12)`), so rewriting the operand is sufficient and no special
-+    // case is needed here.
-+    //
-+    // This is what lets us reach ICC's encoding for the whole family:
-+    // `lea 0(,%r12,1),%rdx` becomes 49 8d 14 24 (4 bytes) instead of
-+    // 4a 8d 14 25 00000000 (8 bytes).
-     Some(MemoryOperand {
-         base: mem.index.clone(),
-         index: None,
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/assembler/encoder/gp_integer.rs b/src/backend/x86/assembler/encoder/gp_integer.rs
---- a/src/backend/x86/assembler/encoder/gp_integer.rs	2026-08-14 15:36:30.337030618 +0000
-+++ b/src/backend/x86/assembler/encoder/gp_integer.rs	2026-08-14 15:42:36.917030618 +0000
-@@ -92,8 +92,29 @@
-                         self.bytes.push(0xC7);
-                         self.bytes.push(self.modrm(3, 0, dst_num));
-                         self.bytes.extend_from_slice(&(val as i32).to_le_bytes());
-+                    } else if (0..=0xFFFF_FFFFi64).contains(&val) {
-+                        // A value that fits in UNSIGNED 32 bits needs no 64-bit
-+                        // immediate at all: writing a 32-bit register zeroes
-+                        // the upper half of its 64-bit parent, so
-+                        // `movl $imm32, %eax` leaves exactly imm32 in %rax.
-+                        // That is 5 bytes (6 with REX.B) against 10 for the
-+                        // movabs form -- the single largest per-instruction
-+                        // saving in the whole encoder.
-+                        //
-+                        // The sign-extended C7 /0 form CANNOT be used here:
-+                        // it would load 0xFFFFFFFF_FFFFFFFF for 0xFFFFFFFF.
-+                        // ICC emits exactly that and is wrong; verified against
-+                        // GAS 2.47, which decodes `48 c7 c0 ff ff ff ff` as
-+                        // `mov $0xffffffffffffffff,%rax`.  Only the
-+                        // zero-extending 32-bit form is both short and correct.
-+                        let b = needs_rex_ext(&dst.name);
-+                        if b {
-+                            self.bytes.push(self.rex(false, false, false, true));
+ /// Return which stack base register (`(%rsp)` vs `(%rbp)`) a line uses, if any.
+ /// Used to ensure an adjacent store and load refer to the SAME slot (same base),
+@@ -3011,6 +3011,35 @@ pub(super) fn hoist_loop_invariant_gpr_load(
+                 i += 1;
+                 continue;
+             };
++            // SAFETY: replacing the preheader's `jmp <header>` with the hoisted
++            // load relies on that load executing on EVERY entry into the loop via
++            // fall-through from the preheader. That is only sound when the header
++            // has NO other FORWARD entry edge: a conditional branch (e.g.
++            // `je <header>`) from a different predecessor enters the loop
++            // directly, bypassing the preheader, and would observe an
++            // uninitialized destination register. (gzip's deflate: the `rsync`
++            // guard's `je` into the hash-table loop header — `head` was reloaded
++            // into %rcx only on the fall-through edge, so `head[ins_h]=strstart`
++            // wrote through `&rsync`, corrupted globals and SIGSEGV'd.) Back-edges
++            // (position > header) are fine: the load is invariant and the
++            // destination is not written inside the loop (verified above).
++            let mut forward_entries = 0u32;
++            for idx in 0..header {
++                if infos[idx].is_nop() { continue; }
++                if matches!(infos[idx].kind, LineKind::Jmp | LineKind::CondJmp) {
++                    let t = infos[idx].trimmed(store.get(idx));
++                    if let Some(tg) = extract_jump_target(t) {
++                        if tg == target.as_str() {
++                            forward_entries += 1;
 +                        }
-+                        self.bytes.push(0xB8 + (dst_num & 7));
-+                        self.bytes.extend_from_slice(&(val as u32).to_le_bytes());
-                     } else {
--                        // Need movabsq for 64-bit immediate
-+                        // Need movabsq for a true 64-bit immediate.
-                         let b = needs_rex_ext(&dst.name);
-                         self.bytes.push(self.rex(true, false, false, b));
-                         self.bytes.push(0xB8 + (dst_num & 7));
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/assembler/encoder/mod.rs b/src/backend/x86/assembler/encoder/mod.rs
---- a/src/backend/x86/assembler/encoder/mod.rs	2026-08-14 15:36:30.337030618 +0000
-+++ b/src/backend/x86/assembler/encoder/mod.rs	2026-08-14 16:02:58.093030618 +0000
-@@ -1164,6 +1164,9 @@
-             "fucomip" => self.encode_fucomip(ops),
-             "fld" => self.encode_fld_st(ops),
-             "fstp" => self.encode_fstp_st(ops),
-+            // `fst %st(N)` -> DD D0+N (the non-popping sibling of fstp).
-+            "fst" if matches!(ops.first(), Some(Operand::Register(_))) =>
-+                self.encode_x87_st_reg(ops, "fst", 0xDD, 0xD0),
- 
-             // ---- Flag manipulation ----
-             "clc" => { self.bytes.push(0xF8); Ok(()) }
-@@ -1394,20 +1397,20 @@
-             "vmovupd" => self.encode_avx_mov_np(ops, 0x10, 0x11, true),
-             "vbroadcastss" => self.encode_avx_broadcast(ops, &[0x18]),
-             "vbroadcastsd" => self.encode_avx_broadcast(ops, &[0x19]),
--            "vpand" => self.encode_avx_3op(ops, 0xDB, true),
-+            "vpand" => self.encode_avx_3op_commutative(ops, 0xDB, true, true),
-             "vpandn" => self.encode_avx_3op(ops, 0xDF, true),
--            "vpor" => self.encode_avx_3op(ops, 0xEB, true),
--            "vpxor" => self.encode_avx_3op(ops, 0xEF, true),
--            "vpaddd" => self.encode_avx_3op(ops, 0xFE, true),
-+            "vpor" => self.encode_avx_3op_commutative(ops, 0xEB, true, true),
-+            "vpxor" => self.encode_avx_3op_commutative(ops, 0xEF, true, true),
-+            "vpaddd" => self.encode_avx_3op_commutative(ops, 0xFE, true, true),
-             "vpsubd" => self.encode_avx_3op(ops, 0xFA, true),
--            "vpcmpeqd" => self.encode_avx_3op(ops, 0x76, true),
--            "vpcmpeqb" => self.encode_avx_3op(ops, 0x74, true),
--            "vpcmpeqw" => self.encode_avx_3op(ops, 0x75, true),
-+            "vpcmpeqd" => self.encode_avx_3op_commutative(ops, 0x76, true, true),
-+            "vpcmpeqb" => self.encode_avx_3op_commutative(ops, 0x74, true, true),
-+            "vpcmpeqw" => self.encode_avx_3op_commutative(ops, 0x75, true, true),
-             "vpcmpgtb" => self.encode_avx_3op(ops, 0x64, true),
-             "vpcmpgtw" => self.encode_avx_3op(ops, 0x65, true),
-             "vpcmpgtd" => self.encode_avx_3op(ops, 0x66, true),
--            "vpaddb" => self.encode_avx_3op(ops, 0xFC, true),
--            "vpaddw" => self.encode_avx_3op(ops, 0xFD, true),
-+            "vpaddb" => self.encode_avx_3op_commutative(ops, 0xFC, true, true),
-+            "vpaddw" => self.encode_avx_3op_commutative(ops, 0xFD, true, true),
-             "vpsubb" => self.encode_avx_3op(ops, 0xF8, true),
-             "vpsubw" => self.encode_avx_3op(ops, 0xF9, true),
-             "vaddpd" => self.encode_avx_3op(ops, 0x58, true),
-@@ -1456,14 +1459,14 @@
-             "vsubps" => self.encode_avx_3op_np(ops, 0x5C),
-             "vmulps" => self.encode_avx_3op_np(ops, 0x59),
-             "vdivps" => self.encode_avx_3op_np(ops, 0x5E),
--            "vxorpd" => self.encode_avx_3op(ops, 0x57, true),
--            "vxorps" => self.encode_avx_3op_np(ops, 0x57),
--            "vandpd" => self.encode_avx_3op(ops, 0x54, true),
--            "vandps" => self.encode_avx_3op_np(ops, 0x54),
-+            "vxorpd" => self.encode_avx_3op_commutative(ops, 0x57, true, true),
-+            "vxorps" => self.encode_avx_3op_commutative(ops, 0x57, false, true),
-+            "vandpd" => self.encode_avx_3op_commutative(ops, 0x54, true, true),
-+            "vandps" => self.encode_avx_3op_commutative(ops, 0x54, false, true),
-             "vandnpd" => self.encode_avx_3op(ops, 0x55, true),
-             "vandnps" => self.encode_avx_3op_np(ops, 0x55),
--            "vorpd" => self.encode_avx_3op(ops, 0x56, true),
--            "vorps" => self.encode_avx_3op_np(ops, 0x56),
-+            "vorpd" => self.encode_avx_3op_commutative(ops, 0x56, true, true),
-+            "vorps" => self.encode_avx_3op_commutative(ops, 0x56, false, true),
-             "vpshufd" => self.encode_avx_shuffle(ops, 0x70, true),
-             "vpshufb" => self.encode_avx_3op_38(ops, 0x00, true),
-             "vpalignr" => self.encode_avx_3op_3a_imm8(ops, 0x0F, true),
-@@ -1503,7 +1506,7 @@
-             "vpunpckhdq" => self.encode_avx_3op(ops, 0x6A, true),
-             "vpunpcklqdq" => self.encode_avx_3op(ops, 0x6C, true),
-             "vpunpckhqdq" => self.encode_avx_3op(ops, 0x6D, true),
--            "vpmullw" => self.encode_avx_3op(ops, 0xD5, true),
-+            "vpmullw" => self.encode_avx_3op_commutative(ops, 0xD5, true, true),
-             "vpmulld" => self.encode_avx_3op_38(ops, 0x40, true),
-             "vpmuludq" => self.encode_avx_3op(ops, 0xF4, true),
-             "vpsllw" => self.encode_avx_shift(ops, 0xF1, 6, 0x71, true),
-@@ -1585,20 +1588,20 @@
-             // AVX PCLMULQDQ
- 
-             // Additional AVX packed integer
--            "vpminub" => self.encode_avx_3op(ops, 0xDA, true),
--            "vpmaxub" => self.encode_avx_3op(ops, 0xDE, true),
-+            "vpminub" => self.encode_avx_3op_commutative(ops, 0xDA, true, true),
-+            "vpmaxub" => self.encode_avx_3op_commutative(ops, 0xDE, true, true),
-             "vpminsd" => self.encode_avx_3op_38(ops, 0x39, true),
-             "vpmaxsd" => self.encode_avx_3op_38(ops, 0x3D, true),
-             "vpminsb" => self.encode_avx_3op_38(ops, 0x38, true),
-             "vpmaxsb" => self.encode_avx_3op_38(ops, 0x3C, true),
-             "vpminuw" => self.encode_avx_3op_38(ops, 0x3A, true),
-             "vpmaxuw" => self.encode_avx_3op_38(ops, 0x3E, true),
--            "vpminsw" => self.encode_avx_3op(ops, 0xEA, true),
--            "vpmaxsw" => self.encode_avx_3op(ops, 0xEE, true),
-+            "vpminsw" => self.encode_avx_3op_commutative(ops, 0xEA, true, true),
-+            "vpmaxsw" => self.encode_avx_3op_commutative(ops, 0xEE, true, true),
-             "vpminud" => self.encode_avx_3op_38(ops, 0x3B, true),
-             "vpmaxud" => self.encode_avx_3op_38(ops, 0x3F, true),
--            "vpavgb" => self.encode_avx_3op(ops, 0xE0, true),
--            "vpavgw" => self.encode_avx_3op(ops, 0xE3, true),
-+            "vpavgb" => self.encode_avx_3op_commutative(ops, 0xE0, true, true),
-+            "vpavgw" => self.encode_avx_3op_commutative(ops, 0xE3, true, true),
-             "vpsadbw" => self.encode_avx_3op(ops, 0xF6, true),
-             "vpmaddubsw" => self.encode_avx_3op_38(ops, 0x04, true),
-             // AVX-VNNI (66 pp) — Raptor Lake+
-@@ -1635,17 +1638,17 @@
-             "vphaddw" => self.encode_avx_3op_38(ops, 0x01, true),
-             "vphaddd" => self.encode_avx_3op_38(ops, 0x02, true),
-             "vpmaddwd" => self.encode_avx_3op(ops, 0xF5, true),
--            "vpmulhw" => self.encode_avx_3op(ops, 0xE5, true),
-+            "vpmulhw" => self.encode_avx_3op_commutative(ops, 0xE5, true, true),
-             "vpsubusb" => self.encode_avx_3op(ops, 0xD8, true),
-             "vpsubusw" => self.encode_avx_3op(ops, 0xD9, true),
-             "vpackuswb" => self.encode_avx_3op(ops, 0x67, true),
-             "vpackssdw" => self.encode_avx_3op(ops, 0x6B, true),
-             "vpackusdw" => self.encode_avx_3op_38(ops, 0x2B, true),
-             "vpacksswb" => self.encode_avx_3op(ops, 0x63, true),
--            "vpaddusb" => self.encode_avx_3op(ops, 0xDC, true),
--            "vpaddusw" => self.encode_avx_3op(ops, 0xDD, true),
--            "vpaddsb" => self.encode_avx_3op(ops, 0xEC, true),
--            "vpaddsw" => self.encode_avx_3op(ops, 0xED, true),
-+            "vpaddusb" => self.encode_avx_3op_commutative(ops, 0xDC, true, true),
-+            "vpaddusw" => self.encode_avx_3op_commutative(ops, 0xDD, true, true),
-+            "vpaddsb" => self.encode_avx_3op_commutative(ops, 0xEC, true, true),
-+            "vpaddsw" => self.encode_avx_3op_commutative(ops, 0xED, true, true),
-             "vpsubsb" => self.encode_avx_3op(ops, 0xE8, true),
-             "vpsubsw" => self.encode_avx_3op(ops, 0xE9, true),
- 
-@@ -1965,7 +1968,7 @@
-             }
- 
-             // Additional AVX operations
--            "vpaddq" => self.encode_avx_3op(ops, 0xD4, true),
-+            "vpaddq" => self.encode_avx_3op_commutative(ops, 0xD4, true, true),
-             "vpsubq" => self.encode_avx_3op(ops, 0xFB, true),
-             "vpsrldq" => {
-                 // VEX.NDD.128/256.66.0F 73 /3 ib
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/assembler/encoder/registers.rs b/src/backend/x86/assembler/encoder/registers.rs
---- a/src/backend/x86/assembler/encoder/registers.rs	2026-08-14 15:36:30.337030618 +0000
-+++ b/src/backend/x86/assembler/encoder/registers.rs	2026-08-14 16:00:58.621030618 +0000
-@@ -293,7 +293,7 @@
-         "vpinsr", "vpextr", "extractps", "vextractps", "insertps", "vinsertps",
-         "vextract", "vinsert", "vbroadcast", "vpbroadcast", "broadcast",
-         "kmov", "movmsk", "vmovmsk",
--        "crc32", "popcnt", "lzcnt", "tzcnt", "bsf", "bsr", "bt", "shld", "shrd",
-+        "crc32", "bt", "shld", "shrd",
-         "vperm", "vpsll", "vpsrl", "vpsra", "psll", "psrl", "psra",
-         "vgather", "vpgather", "vscatter", "vpscatter", "in", "out", "vzero",
-         "enter", "lar", "lsl", "lgdt", "lidt", "sgdt", "sidt", "lldt", "sldt",
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/assembler/encoder/x87_misc.rs b/src/backend/x86/assembler/encoder/x87_misc.rs
---- a/src/backend/x86/assembler/encoder/x87_misc.rs	2026-08-14 15:36:30.337030618 +0000
-+++ b/src/backend/x86/assembler/encoder/x87_misc.rs	2026-08-14 16:02:58.089030618 +0000
-@@ -204,16 +204,26 @@
++                    }
++                }
++            }
++            // Exactly one forward reference (the entry jmp itself) is allowed.
++            if forward_entries != 1 {
++                i += 1;
++                continue;
++            }
+             // Replace the entry jmp with the load; execution falls through into the
+             // header. The load is invariant (slot not written in loop, no calls) and
+             // the dest register is not written in the loop (checked above).
+diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
+index 90032cee..e69954b3 100644
+--- a/src/backend/x86/codegen/peephole/passes/mod.rs
++++ b/src/backend/x86/codegen/peephole/passes/mod.rs
+@@ -668,6 +668,63 @@ mod tests {
+         assert!(result.contains(".Lfoo:"));
      }
  
-     pub(crate) fn encode_fstp_st(&mut self, ops: &[Operand]) -> Result<(), String> {
-+        self.encode_x87_st_reg(ops, "fstp", 0xDD, 0xD8)
++    #[test]
++    fn test_gpr_hoist_skips_multi_entry_loop() {
++        // Regression: hoisting a loop-invariant GPR load into the preheader is
++        // sound only when the header has a SINGLE forward entry edge (the entry
++        // jmp). A conditional `je <header>` from a different predecessor enters
++        // the loop directly, bypassing the preheader, and would observe a stale
++        // destination register. (gzip deflate: the `rsync` guard's `je` into the
++        // hash-table loop header left `head` unloaded in %rcx, so
++        // `head[ins_h]=strstart` wrote through `&rsync`, corrupted globals, and
++        // SIGSEGV'd under PGO builds.)
++        let asm = [
++            "    movq 16(%rsp), %rcx",
++            "    movslq (%rcx), %rax",
++            "    testq %rax, %rax",
++            "    je .LBB1",
++            ".LBB2:",
++            "    movl (%rbx), %eax",
++            "    jmp .LBB1",
++            ".p2align 4",
++            ".LBB1:",
++            "    movl (%rbx), %edi",
++            "    movq 304(%rsp), %rcx",
++            "    addq %rcx, %rax",
++            "    jne .LBB1",
++        ].join("\n") + "\n";
++        let mut store = LineStore::new(asm);
++        let mut infos: Vec<LineInfo> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
++        let changed = local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
++        assert!(!changed, "must not hoist when the header has a second forward entry edge");
++        let result = store.build_result(|i| infos[i].is_nop());
++        assert!(result.contains("jmp .LBB1"), "entry jmp must be preserved: {}", result);
++        assert!(result.contains("movq 304(%rsp), %rcx"), "invariant load must stay in the loop: {}", result);
 +    }
 +
-+    /// Encode a one-operand x87 instruction that takes a stack register:
-+    /// `<opcode> <base + N>` for `%st(N)`.
-+    ///
-+    /// `fst %st(N)` is DD D0+N and `fstp %st(N)` is DD D8+N -- adjacent rows of
-+    /// the same opcode block, so the two differ only in the base byte.
-+    pub(crate) fn encode_x87_st_reg(&mut self, ops: &[Operand], name: &str,
-+                                    opcode: u8, base: u8) -> Result<(), String> {
-         if ops.len() != 1 {
--            return Err("fstp requires 1 operand".to_string());
-+            return Err(format!("{} requires 1 operand", name));
-         }
-         match &ops[0] {
-             Operand::Register(reg) => {
-                 let n = parse_st_num(&reg.name)?;
--                self.bytes.extend_from_slice(&[0xDD, 0xD8 + n]);
-+                self.bytes.extend_from_slice(&[opcode, base + n]);
-                 Ok(())
-             }
--            _ => Err("fstp requires st register".to_string()),
-+            _ => Err(format!("{} requires st register", name)),
++    #[test]
++    fn test_gpr_hoist_single_entry() {
++        // Positive control: with a single forward entry edge (the entry jmp),
++        // the invariant load SHOULD still be hoisted into the preheader.
++        let asm = [
++            ".LBB2:",
++            "    movl (%rbx), %eax",
++            "    jmp .LBB1",
++            ".LBB1:",
++            "    movl (%rbx), %edi",
++            "    movq 304(%rsp), %rcx",
++            "    addq %rcx, %rax",
++            "    jne .LBB1",
++        ].join("\n") + "\n";
++        let mut store = LineStore::new(asm);
++        let mut infos: Vec<LineInfo> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
++        let changed = local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
++        assert!(changed, "single-entry loop should still hoist the invariant load");
++        let result = store.build_result(|i| infos[i].is_nop());
++        assert!(!result.contains("jmp .LBB1"), "entry jmp should be replaced by the hoisted load: {}", result);
++        assert!(result.contains("movq 304(%rsp), %rcx"), "hoisted load must be present in the preheader: {}", result);
++    }
++
+     #[test]
+     fn test_push_pop_elimination() {
+         let asm = "    pushq %rax\n    movq %rax, %rcx\n    popq %rax\n".to_string();
+-- 
+2.47.3
+
+
+From 29772abbafe398b9b4dbbf375d1b287766e1bb9e Mon Sep 17 00:00:00 2001
+From: lccc-v15 <v15@localhost>
+Date: Fri, 14 Aug 2026 15:48:37 +0000
+Subject: [PATCH 3/6] Add PGO-layout diagnostic switches and linker GOT debug
+ tracing
+
+Gate the four profile-driven layout transforms (section splitting, function
+reordering, conditional-fallthrough, block alignment) behind LCCC_PGO_NO_*
+switches so any one can be bisected in isolation, and add an LCCC_DEBUG_GOT
+trace to the x86-64 linker (GOT entry table plus per-relocation slot math) for
+diagnosing GOT-slot issues.
+---
+ src/backend/x86/linker/emit_exec.rs |  5 +++++
+ src/backend/x86/linker/plt_got.rs   |  5 +++++
+ src/pgo/layout.rs                   | 18 +++++++++++++-----
+ 3 files changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/src/backend/x86/linker/emit_exec.rs b/src/backend/x86/linker/emit_exec.rs
+index 25c24b44..00d56ed9 100644
+--- a/src/backend/x86/linker/emit_exec.rs
++++ b/src/backend/x86/linker/emit_exec.rs
+@@ -1173,6 +1173,11 @@ pub(super) fn emit_executable(
+                                         let nb = got_entries[..gi].iter().filter(|(n,p)| !n.is_empty() && !*p).count();
+                                         got_addr + nb as u64 * 8
+                                     };
++                                    if std::env::var("LCCC_DEBUG_GOT").is_ok() {
++                                        let nb = got_entries[..gi].iter().filter(|(n,p)| !n.is_empty() && !*p).count();
++                                        eprintln!("[GOTREL] name={:?} gi={} is_plt={} nb={} gea=0x{:x} got_addr=0x{:x} p=0x{:x} addend={}",
++                                            sym.name, gi, entry.1, nb, gea, got_addr, p, a);
++                                    }
+                                     w32(&mut out, fp, (gea as i64 + a - p as i64) as u32);
+                                     continue;
+                                 }
+diff --git a/src/backend/x86/linker/plt_got.rs b/src/backend/x86/linker/plt_got.rs
+index 58abe4fb..49a6ec78 100644
+--- a/src/backend/x86/linker/plt_got.rs
++++ b/src/backend/x86/linker/plt_got.rs
+@@ -137,5 +137,10 @@ pub(super) fn create_plt_got(
          }
      }
  
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/README.md b/tests/asm-diff/README.md
---- a/tests/asm-diff/README.md	2026-08-14 15:36:30.421030618 +0000
-+++ b/tests/asm-diff/README.md	2026-08-14 16:18:33.421030618 +0000
-@@ -43,12 +43,12 @@
++    if std::env::var("LCCC_DEBUG_GOT").is_ok() {
++        for (i, (name, is_plt)) in got_entries.iter().enumerate() {
++            eprintln!("[GOT] idx={} plt={} name={:?}", i, is_plt, name);
++        }
++    }
+     (plt_names, got_entries)
+ }
+diff --git a/src/pgo/layout.rs b/src/pgo/layout.rs
+index 0d918427..077fb1f7 100644
+--- a/src/pgo/layout.rs
++++ b/src/pgo/layout.rs
+@@ -62,10 +62,12 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
+         // with cold code — the opposite of the I-cache goal.
+         let hot = fp.total_count > 0 && fp.total_count.saturating_mul(10) >= max;
+         let cold = max > 0 && fp.total_count.saturating_mul(1000) < max;
+-        if hot {
+-            f.section = Some(".text.hot".into());
+-        } else if cold {
+-            f.section = Some(".text.unlikely".into());
++        if std::env::var("LCCC_PGO_NO_SECTION").is_err() {
++            if hot {
++                f.section = Some(".text.hot".into());
++            } else if cold {
++                f.section = Some(".text.unlikely".into());
++            }
+         }
+         if f.blocks.len() >= 2 {
+             layout_function(f, fp, u, edges_valid);
+@@ -75,7 +77,9 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
+     // Order functions by hotness class within the TU — hot first, cold
+     // last — for I-cache-friendly object layout (GCC -freorder-functions).
+     // Declarations and helper functions keep their relative order (class 3).
+-    if crate::pgo::summary::get_summary().is_some() {
++    if crate::pgo::summary::get_summary().is_some()
++        && std::env::var("LCCC_PGO_NO_REORDER").is_err()
++    {
+         let n = m.functions.len();
+         let mut cls: Vec<u8> = vec![3; n];
+         for (i, f) in m.functions.iter().enumerate() {
+@@ -134,6 +138,9 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
+     let mut cf_map: crate::common::fx_hash::FxHashMap<u32, u32> =
+         crate::common::fx_hash::FxHashMap::default();
+     for f in &m.functions {
++        if std::env::var("LCCC_PGO_NO_CFALL").is_ok() {
++            break;
++        }
+         if f.is_declaration || f.blocks.is_empty() {
+             continue;
+         }
+@@ -167,6 +174,7 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
+     // Hot loop headers and join points get 16-byte alignment. Very hot loop
+     // headers with larger bodies get 32-byte alignment. Candidates are gated
+     // on per-block execution count, so cold blocks receive no padding.
++    if std::env::var("LCCC_PGO_NO_ALIGN").is_err()
+     {
+         let mut align_map: crate::common::fx_hash::FxHashMap<u32, u8> =
+             crate::common::fx_hash::FxHashMap::default();
+-- 
+2.47.3
+
+
+From 04bd17c41660b9e943a655a109160aa5f2980c2f Mon Sep 17 00:00:00 2001
+From: lccc-v15 <v15@localhost>
+Date: Fri, 14 Aug 2026 17:32:34 +0000
+Subject: [PATCH 4/6] =?UTF-8?q?PGO:=20stop=20regressing=20gzip=20=E2=80=94?=
+ =?UTF-8?q?=20neutral=20RA=20weighting,=2016-byte=20loop=20align,=20bisect?=
+ =?UTF-8?q?=20gates?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three measured regressions in the PGO use-mode pipeline, each fixed:
+
+1. PGO-weighted register allocation (pgo_point_weights) inflated hot-block
+   use counts by up to 4x, making hot-loop values near-unevictable. On gzip
+   compress this produced +16 stack-slot accesses (~20%) inside longest_match
+   and a +4.7% runtime regression vs plain -O2. The weighting also
+   double-counts loop depth (priority already carries 10^loop_depth), so the
+   default factor is now 1 (neutral); CCC_PGO_WEIGHT_MAX remains for
+   experiments that show a real win.
+
+2. The 32-byte alignment tier for very-hot loop headers bloated hot functions
+   with multi-byte NOP padding (longest_match: 7 padding sites) and measured
+   slower than 16-byte alignment. Only 16-byte alignment is now emitted,
+   matching GCC's -falign-loops and LLVM's hot-loop default.
+
+3. Add LCCC_PGO_NO_INLINE / LCCC_PGO_NO_UNROLL / LCCC_PGO_NO_PROMOTE
+   diagnostic switches so each PGO consumer can be bisected in isolation.
+---
+ src/backend/live_range.rs | 11 ++++++++++-
+ src/pgo/inline_pgo.rs     |  3 +++
+ src/pgo/layout.rs         | 18 ++++++++----------
+ src/pgo/promote.rs        |  3 +++
+ src/pgo/unroll_pgo.rs     |  3 +++
+ 5 files changed, 27 insertions(+), 11 deletions(-)
+
+diff --git a/src/backend/live_range.rs b/src/backend/live_range.rs
+index 721c21db..2e9b8f83 100644
+--- a/src/backend/live_range.rs
++++ b/src/backend/live_range.rs
+@@ -774,10 +774,19 @@ fn pgo_point_weights(func: &IrFunction) -> FxHashMap<u32, u64> {
+     if max == 0 {
+         return out;
+     }
++    // Default factor is 1 (NEUTRAL). Inflating use counts by up to 4x made
++    // the allocator treat hot-loop values as near-unevictable, which measured
++    // as a ~20% increase in stack-slot traffic inside gzip's `longest_match`
++    // hot loop (+16 stack accesses) and a +4.7% runtime regression on gzip
++    // compress versus plain -O2. The weighting also double-counts loop depth:
++    // `priority` already carries a 10^loop_depth multiplier, so per-use
++    // hotness on top over-amplifies inner-loop temporaries and perturbs the
++    // eviction heuristic. The knob remains for experiments that show a real
++    // win on their own workload.
+     let max_factor = std::env::var("CCC_PGO_WEIGHT_MAX")
+         .ok()
+         .and_then(|s| s.parse::<u64>().ok())
+-        .unwrap_or(4)
++        .unwrap_or(1)
+         .clamp(1, 16);
+     let span = max_factor - 1;
+     let mut point = 0u32;
+diff --git a/src/pgo/inline_pgo.rs b/src/pgo/inline_pgo.rs
+index 21f8d760..7db7141f 100644
+--- a/src/pgo/inline_pgo.rs
++++ b/src/pgo/inline_pgo.rs
+@@ -93,6 +93,9 @@ pub fn inline_threshold_multiplier(caller: &str, callee: &str, p: &ProfileData)
+ /// this: a flat profile compiles exactly like plain `-O2` for inlining, and PGO
+ /// inlining only engages where the profile is genuinely skewed.
+ pub fn inline_decisions_active() -> bool {
++    if std::env::var("LCCC_PGO_NO_INLINE").is_ok() {
++        return false;
++    }
+     match crate::pgo::summary::get_summary() {
+         Some(s) => s.has_spread(),
+         None => true, // no summary: use the relative-frequency heuristics
+diff --git a/src/pgo/layout.rs b/src/pgo/layout.rs
+index 077fb1f7..888ace20 100644
+--- a/src/pgo/layout.rs
++++ b/src/pgo/layout.rs
+@@ -260,20 +260,18 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
+             }
+             for b in &f.blocks {
+                 let l = b.label.0;
+-                let c = fp.block_count(b.label);
+                 if !hot(l) {
+                     continue;
+                 }
+                 if is_loop_header.contains(&l) {
+-                    // Use 32 bytes for very hot headers with at least eight
+-                    // instructions; otherwise use 16 bytes.
+-                    let body = b.instructions.len();
+-                    let alignment = if c.saturating_mul(4) >= entry_count && body >= 8 {
+-                        5
+-                    } else {
+-                        4
+-                    };
+-                    align_map.insert(l, alignment);
++                    // 16-byte loop-header alignment only. The former 32-byte
++                    // tier for very hot headers with at least eight
++                    // instructions bloated hot functions with multi-byte NOP
++                    // padding (gzip: longest_match grew ~11%, 7 padding
++                    // sites) and measured SLOWER than 16-byte alignment on
++                    // gzip compress — GCC's -falign-loops default is 16 and
++                    // LLVM aligns hot loops to 16 too.
++                    align_map.insert(l, 4);
+                 } else if indeg.get(&l).copied().unwrap_or(0) >= 2 {
+                     // Hot join point (multiple predecessors): align the merge
+                     // so the fall-in is decode-friendly.
+diff --git a/src/pgo/promote.rs b/src/pgo/promote.rs
+index 43a7af19..57697f9f 100644
+--- a/src/pgo/promote.rs
++++ b/src/pgo/promote.rs
+@@ -55,6 +55,9 @@ pub fn sig_of(info: &CallInfo) -> String {
+ /// Promote indirect calls in `m` using the loaded profile for unit `u`.
+ /// Returns the number of sites promoted and records hot labels for layout.
+ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
++    if std::env::var("LCCC_PGO_NO_PROMOTE").is_ok() {
++        return 0;
++    }
+     let Some(p) = crate::pgo::get_pgo_profile() else {
+         return 0;
+     };
+diff --git a/src/pgo/unroll_pgo.rs b/src/pgo/unroll_pgo.rs
+index b72440a1..ef511b89 100644
+--- a/src/pgo/unroll_pgo.rs
++++ b/src/pgo/unroll_pgo.rs
+@@ -80,6 +80,9 @@ pub fn should_unroll_loop(
+     size: usize,
+     p: Option<&ProfileData>,
+ ) -> Option<bool> {
++    if std::env::var("LCCC_PGO_NO_UNROLL").is_ok() {
++        return None; // let the size/feature-driven unroller decide on its own
++    }
+     let _ = p?;
+     if size_opt() {
+         return Some(false);
+-- 
+2.47.3
+
+
+From 44b189ad9b851e80a1936a85dca56d68c5ecf16c Mon Sep 17 00:00:00 2001
+From: lccc-v15 <v15@localhost>
+Date: Fri, 14 Aug 2026 17:32:40 +0000
+Subject: [PATCH 5/6] Linker: preserve .text.hot/.text.unlikely for PGO
+ hot/cold partitioning
+
+The linker folded every .text.* input section into .text, interleaving hot
+and cold functions per object and throwing away the compiler's profile-driven
+partitioning entirely. Keep .text.hot and .text.unlikely as separate output
+sections and order the executable region .text -> .text.hot -> .text.unlikely
+-> other exec, so hot functions stay contiguous for I-cache locality and cold
+code is pushed to the tail of the executable segment (GNU ld's default
+layout). Verified on gzip: longest_match, deflate_fast, gzip_deflate and
+ct_tally now land together in .text.hot.
+---
+ src/backend/linker_common/merge.rs       | 20 +++++++++++++++++---
+ src/backend/linker_common/section_map.rs |  8 ++++++++
+ 2 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/src/backend/linker_common/merge.rs b/src/backend/linker_common/merge.rs
+index dfcd9cce..22e55ea7 100644
+--- a/src/backend/linker_common/merge.rs
++++ b/src/backend/linker_common/merge.rs
+@@ -101,9 +101,23 @@ pub fn merge_sections_elf64_gc(
+         let is_exec = sec.flags & SHF_EXECINSTR != 0;
+         let is_write = sec.flags & SHF_WRITE != 0;
+         let is_nobits = sec.sh_type == SHT_NOBITS;
+-        if is_exec { (1u32, is_nobits as u32) }
+-        else if !is_write { (0, is_nobits as u32) }
+-        else { (2, is_nobits as u32) }
++        // Executable sections are ordered so PGO hot/cold partitioning is
++        // honored: `.text` → `.text.hot` → `.text.unlikely` → other exec.
++        // Hot functions stay in a contiguous region and cold functions are
++        // pushed to the tail of the executable segment.
++        let exec_rank = if is_exec {
++            match sec.name.as_str() {
++                ".text" => 0u32,
++                ".text.hot" => 1,
++                ".text.unlikely" => 2,
++                _ => 3,
++            }
++        } else {
++            0
++        };
++        if is_exec { (1u32, exec_rank, is_nobits as u32) }
++        else if !is_write { (0, 0u32, is_nobits as u32) }
++        else { (2, 0u32, is_nobits as u32) }
+     });
  
- ## Status
- 
--All 723 cases pass against GNU as 2.47. Across the 9,901 distinct
-+All 728 cases pass against GNU as 2.47. Across the 9,918 distinct
- instructions in the corpus, the per-instruction differential reports:
- 
- ```
--ok      = 9,712   byte-identical to GNU as
--BETTER  =   126   shorter than GNU as, verified to decode identically
-+ok      = 9,695   byte-identical to GNU as
-+BETTER  =   160   shorter than GNU as, verified to decode identically
- reject  =    63   deliberate reject list; both assemblers refuse
- ```
- 
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/avx.casefile b/tests/asm-diff/avx.casefile
---- a/tests/asm-diff/avx.casefile	2026-08-14 15:36:30.421030618 +0000
-+++ b/tests/asm-diff/avx.casefile	2026-08-14 16:05:38.325030618 +0000
-@@ -1,4 +1,4 @@
--;;; avx_arith
-+;;; avx_arith betterok
- .text
- vaddps %xmm0, %xmm1, %xmm2
- vaddps %ymm0, %ymm1, %ymm2
-@@ -958,3 +958,33 @@
- vmovaps %xmm0, %xmm9
- vmovaps %xmm9, %xmm10
- vmovaps %xmm1, %xmm2
-+;;; vex2_commutative betterok
-+.text
-+vpaddd %xmm9, %xmm2, %xmm3
-+vpaddb %xmm9, %xmm2, %xmm3
-+vpaddw %xmm9, %xmm2, %xmm3
-+vpaddq %xmm9, %xmm2, %xmm3
-+vpand %xmm9, %xmm2, %xmm3
-+vpor %xmm9, %xmm2, %xmm3
-+vpxor %xmm9, %xmm2, %xmm3
-+vpmullw %xmm9, %xmm2, %xmm3
-+vxorps %xmm9, %xmm2, %xmm3
-+vandps %xmm9, %xmm2, %xmm3
-+vorps %xmm9, %xmm2, %xmm3
-+vxorpd %xmm9, %xmm2, %xmm3
-+vpaddd %ymm9, %ymm2, %ymm3
-+vpxor %ymm9, %ymm2, %ymm3
-+vpaddd %xmm2, %xmm9, %xmm3
-+vpaddd %xmm9, %xmm10, %xmm3
-+vpaddd %xmm2, %xmm3, %xmm9
-+
-+;;; vex_noncommutative_guard
-+.text
-+vsubps %xmm9, %xmm2, %xmm3
-+vdivps %xmm9, %xmm2, %xmm3
-+vpsubd %xmm9, %xmm2, %xmm3
-+vpsubb %xmm9, %xmm2, %xmm3
-+vaddps %xmm9, %xmm2, %xmm3
-+vmulps %xmm9, %xmm2, %xmm3
-+vaddpd %xmm9, %xmm2, %xmm3
-+vmulpd %xmm9, %xmm2, %xmm3
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/misc.casefile b/tests/asm-diff/misc.casefile
---- a/tests/asm-diff/misc.casefile	2026-08-14 15:36:30.421030618 +0000
-+++ b/tests/asm-diff/misc.casefile	2026-08-14 16:05:38.321030618 +0000
-@@ -569,3 +569,20 @@
- bt %eax, %ecx
- bt %rax, %rcx
- bt %ax, %cx
-+;;; mov_imm32_zeroext betterok
-+.text
-+movq $4294967295, %rax
-+movq $4294967295, %rcx
-+movq $4294967295, %r8
-+movq $4294967295, %r13
-+movq $2147483648, %rax
-+movq $2147483648, %r15
-+movq $2147483647, %rax
-+movq $1, %rax
-+movq $0, %rax
-+movq $-1, %rax
-+movq $-2147483648, %rax
-+movq $4294967296, %rax
-+movq $-4294967295, %rax
-+movabsq $4294967295, %rax
-+movl $4294967295, %eax
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/modrm.casefile b/tests/asm-diff/modrm.casefile
---- a/tests/asm-diff/modrm.casefile	2026-08-14 15:36:30.421030618 +0000
-+++ b/tests/asm-diff/modrm.casefile	2026-08-14 15:57:23.613030618 +0000
-@@ -2368,7 +2368,7 @@
- mov 128(,%r11,8), %rcx
- mov -1(,%r11,8), %rcx
- mov 2147483647(,%r11,8), %rcx
--;;; nobase_r12
-+;;; nobase_r12 betterok
- .text
- mov 0(,%r12,1), %rcx
- mov 4(,%r12,1), %rcx
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/reject.casefile b/tests/asm-diff/reject.casefile
---- a/tests/asm-diff/reject.casefile	2026-08-14 15:36:30.421030618 +0000
-+++ b/tests/asm-diff/reject.casefile	2026-08-14 16:05:20.281030618 +0000
-@@ -91,3 +91,13 @@
- ;;; r31_bswapw reject
- .text
- bswapw %ax
-+;;; suffix_width_mismatch reject
-+.text
-+bsfq %r8d, %r9d
-+bsrq %r8d, %r9d
-+popcntq %r8d, %r9d
-+lzcntq %r8d, %r9d
-+tzcntq %r8d, %r9d
-+bsfq %r8d, %r9
-+bsfq %r8, %r9d
-+bsfl %r8, %r9
-diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/asm-diff/x87.casefile b/tests/asm-diff/x87.casefile
---- a/tests/asm-diff/x87.casefile	2026-08-14 15:36:30.421030618 +0000
-+++ b/tests/asm-diff/x87.casefile	2026-08-14 16:05:20.281030618 +0000
-@@ -167,3 +167,12 @@
- fists 8(%rsp)
- fistps 8(%rsp)
- fisttps 8(%rsp)
-+;;; x87_st_reg
-+.text
-+fst %st(0)
-+fst %st(1)
-+fst %st(7)
-+fstp %st(0)
-+fstp %st(3)
-+fld %st(0)
-+fld %st(5)
+     let mut index_remap: FxHashMap<usize, usize> = FxHashMap::default();
+diff --git a/src/backend/linker_common/section_map.rs b/src/backend/linker_common/section_map.rs
+index 17e2caa6..3696c253 100644
+--- a/src/backend/linker_common/section_map.rs
++++ b/src/backend/linker_common/section_map.rs
+@@ -9,6 +9,14 @@
+ /// like `.text.foo` are merged into `.text`, `.rodata.bar` into `.rodata`, etc.
+ /// RISC-V additionally maps `.sdata`/`.sbss` (via `map_section_name_riscv()`).
+ pub fn map_section_name(name: &str) -> &str {
++    // Profile-guided hot/cold partitioning (PGO `-fprofile-use`) emits
++    // `.text.hot` and `.text.unlikely` sections; the linker must KEEP them
++    // separate (ordered `.text` → `.text.hot` → `.text.unlikely`) so hot
++    // functions stay contiguous for I-cache locality and cold code is pushed
++    // to the end of the executable region. Folding them into `.text` (the old
++    // `.text.*` → `.text` rule) interleaved hot and cold functions per object
++    // and threw away the entire benefit of the compiler's partitioning.
++    if name == ".text.hot" || name == ".text.unlikely" { return name; }
+     if name.starts_with(".text.") || name == ".text" { return ".text"; }
+     if name.starts_with(".data.rel.ro") { return ".data.rel.ro"; }
+     if name.starts_with(".data.") || name == ".data" { return ".data"; }
+-- 
+2.47.3
+
+
+From 22c7e8d6a34b0a958ac123966c92376b72eecf75 Mon Sep 17 00:00:00 2001
+From: lccc-v15 <v15@localhost>
+Date: Fri, 14 Aug 2026 17:32:45 +0000
+Subject: [PATCH 6/6] Peephole: fold single-base LEA into its memory operand
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+fold_lea_into_memory_op only matched SIB addresses (base,index[,scale]) and
+rejected the single-base form leaq disp(%base), %dst — the dominant shape of
+pointer induction (gzip longest_match emits leaq 2(%r9),%rdx; movzbl (%rdx),
+%edi per compare). Fold it to movzbl disp(%base),%edi when the temporary is
+provably dead afterward (fam_read_after), matching a bare (%dst) operand so
+displacement forms like 8(%rdx) are never corrupted.
+---
+ .../codegen/peephole/passes/local_patterns.rs | 65 ++++++++++++++++++-
+ 1 file changed, 62 insertions(+), 3 deletions(-)
+
+diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+index 292263e1..b4369c5e 100644
+--- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
++++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+@@ -918,9 +918,68 @@ pub(super) fn fold_lea_into_memory_op(
+             .split(',')
+             .map(str::trim)
+             .collect();
+-        if fields.len() < 2 || fields.len() > 3
+-            || fields.iter().any(|field| !field.starts_with('%'))
+-        {
++        // Single-base form: `leaq disp(%base), %dst` with no index/scale.
++        // This is the dominant shape emitted for pointer induction in hot
++        // loops (gzip longest_match): `leaq 2(%r9),%rdx; movzbl (%rdx),%edi`.
++        // The SIB-only matcher below never fired on it, so each byte compare
++        // paid a dead LEA + a register round-trip. Fold it to
++        // `movzbl disp(%base),%edi` when the temporary is provably dead.
++        if fields.len() == 1 {
++            let base = fields[0];
++            if !base.starts_with('%') {
++                i += 1;
++                continue;
++            }
++            let base_family = register_family_fast(base);
++            if base_family == REG_NONE
++                || base_family > REG_GP_MAX
++                || dst_family == base_family
++            {
++                i += 1;
++                continue;
++            }
++            let mut j = i + 1;
++            while j < len && infos[j].is_nop() {
++                j += 1;
++            }
++            if j >= len || infos[j].is_barrier() {
++                i += 1;
++                continue;
++            }
++            let next = infos[j].trimmed(store.get(j));
++            let addr_pat = format!("({})", dst_text);
++            // Match a BARE `(%dst)` memory operand. A displacement form like
++            // `8(%rdx)` or `0x2(%rdx)` must not match — the replacement would
++            // corrupt `8(` into `8disp(`.
++            let bare_ok = next.match_indices(&addr_pat).any(|(pos, _)| {
++                pos == 0 || {
++                    let c = next.as_bytes()[pos - 1] as char;
++                    c == ' ' || c == ',' || c == '\t'
++                }
++            });
++            if !bare_ok {
++                i += 1;
++                continue;
++            }
++            // The address was already computed by the LEA; dropping it is valid
++            // only if the destination register is dead after the memory op.
++            if fam_read_after(store, infos, j + 1, dst_family) {
++                i += 1;
++                continue;
++            }
++            let sib = format!("{}({})", displacement, base);
++            let replacement = next.replacen(&addr_pat, &sib, 1);
++            if replacement == next {
++                i += 1;
++                continue;
++            }
++            mark_nop(&mut infos[i]);
++            replace_line(store, &mut infos[j], j, format!("    {}", replacement));
++            changed = true;
++            i = j + 1;
++            continue;
++        }
++        if fields.len() > 3 || fields.iter().any(|field| !field.starts_with('%')) {
+             i += 1;
+             continue;
+         }
+-- 
+2.47.3
+
