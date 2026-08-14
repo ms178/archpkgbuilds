@@ -1,616 +1,685 @@
-From 21f0ae979c0965ff3a60e57228bf00c40ecf563f Mon Sep 17 00:00:00 2001
-From: lccc-v15 <v15@localhost>
-Date: Fri, 14 Aug 2026 15:48:24 +0000
-Subject: [PATCH 1/6] Fix STT_TLS misclassification of GOTPCRELX relocations
-
-is_tls_reloc used a naive x86-64/i386 union that included 42
-(R_X86_64_REX_GOTPCRELX, a relaxable GOT reference) in the TLS set. Every
-@GOTPCRELX-referenced symbol was therefore emitted as STT_TLS and laid out as
-a thread-local symbol, so the linker resolved it to the wrong address (gzip:
-'prev' resolved to &rsync, so head = prev + WSIZE wrote hash entries into the
-globals region and corrupted strstart). Make the classifier target-aware:
-i386 {14..19, 24..37, 39..41}, x86-64 {16..23, 29..31}.
----
- src/backend/elf/symbol_table.rs | 31 +++++++++++++++++++++++--------
- 1 file changed, 23 insertions(+), 8 deletions(-)
-
-diff --git a/src/backend/elf/symbol_table.rs b/src/backend/elf/symbol_table.rs
-index f775df90..96e70007 100644
---- a/src/backend/elf/symbol_table.rs
-+++ b/src/backend/elf/symbol_table.rs
-@@ -225,13 +225,28 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
- /// True if the relocation type is a TLS relocation (x86-64 and i386).
- /// Undefined symbols referenced by these must be emitted as STT_TLS so the
- /// static linker can match them against TLS definitions.
+diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/scripts/codegen_scoreboard.py b/scripts/codegen_scoreboard.py
+--- a/scripts/codegen_scoreboard.py	1970-01-01 00:00:00.000000000 +0000
++++ b/scripts/codegen_scoreboard.py	2026-08-14 16:52:54.821147719 +0000
+@@ -0,0 +1,267 @@
++#!/usr/bin/env python3
++"""Rank LCCC's generated code against GCC, Clang, ICC and ICX, per function.
++
++`godbolt.py compare` answers "how does LCCC do on THIS file". That is the right
++tool once you know where to look. This one answers the prior question: across a
++whole benchmark suite, WHICH functions are furthest behind the best compiler,
++and by what margin -- so effort goes where the gap is largest instead of where
++it is easiest to look.
++
++For every source file it compiles with LCCC locally and with each oracle over
++the Compiler Explorer API, then reports per function:
++
++    insns    instruction count in the function body
++    loads    memory reads          (the usual cause of a large gap)
++    stores   memory writes
++    spills   loads/stores through %rsp or %rbp, i.e. register-allocator churn
++    branch   control transfers
++
++Ranking is by `insns` relative to the best oracle, because that is the metric
++that correlates with the work actually issued. It is a proxy, not a verdict:
++this VM has no PMU, so the runner reports counts and leaves timing to
++`run_benchmarks.py`.
++
++Examples
++--------
++    # Survey the whole benchmark suite, worst gaps first
++    scripts/codegen_scoreboard.py tests/benchmark/programs/*.c
++
++    # One file, every function, full detail
++    scripts/codegen_scoreboard.py tests/benchmark/programs/matmul.c -v
++
++    # Re-check after a change, comparing to a saved baseline
++    scripts/codegen_scoreboard.py --baseline before.json --json after.json ...
++"""
++from __future__ import annotations
++
++import argparse
++import concurrent.futures
++import json
++import os
++import re
++import subprocess
++import sys
++from dataclasses import dataclass, field, asdict
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++import godbolt  # noqa: E402  (same directory, deliberate)
++
++DEFAULT_FLAGS = "-O2 -march=x86-64-v3"
++ORACLES = ["gcc", "clang", "icc", "icx"]
++
++# Directives and labels carry no instructions.
++_SKIP = re.compile(r"^\s*(\.|#|//|$)")
++_LABEL = re.compile(r"^[.\w$]+:")
++
++_BRANCH = re.compile(r"^(j\w+|call|ret|loop\w*)$")
++_STACK_MEM = re.compile(r"[-\d+x]*\(%r(sp|bp)\)")
++
++
++@dataclass
++class FuncStats:
++    name: str
++    insns: int = 0
++    loads: int = 0
++    stores: int = 0
++    spills: int = 0
++    branch: int = 0
++    vector: int = 0
++
++    def as_row(self) -> str:
++        return (f"{self.insns:6d} {self.loads:6d} {self.stores:6d} "
++                f"{self.spills:6d} {self.branch:6d} {self.vector:6d}")
++
++
++def parse_functions(lines: list[str]) -> dict[str, FuncStats]:
++    """Split an assembly listing into per-function statistics."""
++    out: dict[str, FuncStats] = {}
++    cur: FuncStats | None = None
++    for raw in lines:
++        line = raw.rstrip()
++        if not line:
++            continue
++        m = _LABEL.match(line.strip())
++        if m and not line.strip().startswith("."):
++            cur = FuncStats(line.strip().rstrip(":"))
++            out[cur.name] = cur
++            continue
++        if m and line.strip().startswith(".L"):
++            continue
++        if _SKIP.match(line):
++            continue
++        if cur is None:
++            continue
++
++        body = line.strip()
++        mnem = body.split()[0].lower() if body.split() else ""
++        if not mnem or mnem.endswith(":"):
++            continue
++        cur.insns += 1
++
++        if _BRANCH.match(mnem):
++            cur.branch += 1
++        if mnem.startswith("v") or re.match(r"^p[a-z]", mnem):
++            cur.vector += 1
++
++        # Operand-side memory classification. In AT&T syntax the destination is
++        # last, so a memory reference before the final comma is a read and one
++        # after it is a write.
++        ops = body[len(mnem):].strip()
++        if "(" in ops:
++            parts = ops.rsplit(",", 1)
++            src = parts[0] if len(parts) > 1 else ops
++            dst = parts[1] if len(parts) > 1 else ""
++            if "(" in src:
++                cur.loads += 1
++            if "(" in dst:
++                cur.stores += 1
++            if _STACK_MEM.search(ops):
++                cur.spills += 1
++    return out
++
++
++def strip_noise(lines: list[str]) -> list[str]:
++    return [l for l in lines if not l.strip().startswith((".cfi", ".file",
++                                                          ".ident", ".section",
++                                                          ".size", ".type",
++                                                          ".globl", ".p2align",
++                                                          ".align", ".text",
++                                                          ".data", ".bss"))]
++
++
++@dataclass
++class FileResult:
++    path: str
++    per_compiler: dict[str, dict[str, FuncStats]] = field(default_factory=dict)
++    errors: dict[str, str] = field(default_factory=dict)
++
++
++def measure(path: Path, lccc: str, flags: str, oracles: list[str],
++            local_flags: str | None) -> FileResult:
++    res = FileResult(str(path))
++    src = path.read_text()
++
++    try:
++        lines = godbolt.compile_local(lccc, path, local_flags or flags)
++        res.per_compiler["lccc"] = parse_functions(strip_noise(lines))
++    except Exception as e:  # noqa: BLE001
++        res.errors["lccc"] = f"{type(e).__name__}: {e}"
++
++    def one(name: str):
++        try:
++            cid, _ = godbolt.resolve(name)
++            lines = godbolt.compile_remote(cid, src, flags)
++            return name, parse_functions(strip_noise(lines)), None
++        except Exception as e:  # noqa: BLE001
++            return name, {}, f"{type(e).__name__}: {e}"
++
++    with concurrent.futures.ThreadPoolExecutor(max_workers=len(oracles)) as ex:
++        for name, stats, err in ex.map(one, oracles):
++            if err:
++                res.errors[name] = err
++            else:
++                res.per_compiler[name] = stats
++    return res
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    ap.add_argument("sources", nargs="+", type=Path)
++    ap.add_argument("--lccc", default=os.environ.get("LCCC",
++                                                     "./target/release/lccc"))
++    ap.add_argument("--flags", default=DEFAULT_FLAGS)
++    ap.add_argument("--local-flags", default=None,
++                    help="flags for LCCC only (default: same as --flags)")
++    ap.add_argument("--oracles", default=",".join(ORACLES))
++    ap.add_argument("--min-insns", type=int, default=6,
++                    help="ignore functions smaller than this")
++    ap.add_argument("--json", type=Path)
++    ap.add_argument("--baseline", type=Path,
++                    help="compare against a previous --json run")
++    ap.add_argument("-v", "--verbose", action="store_true")
++    args = ap.parse_args()
++
++    oracles = [o for o in args.oracles.split(",") if o]
++    results = [measure(p, args.lccc, args.flags, oracles, args.local_flags)
++               for p in args.sources]
++
++    baseline = {}
++    if args.baseline and args.baseline.exists():
++        baseline = json.loads(args.baseline.read_text())
++
++    rows = []
++    for r in results:
++        lstats = r.per_compiler.get("lccc", {})
++        for fname, ls in lstats.items():
++            if ls.insns < args.min_insns:
++                continue
++            best_n, best_v = None, None
++            per = {}
++            for o in oracles:
++                os_ = r.per_compiler.get(o, {}).get(fname)
++                if os_ is None:
++                    continue
++                per[o] = os_
++                if best_v is None or os_.insns < best_v:
++                    best_n, best_v = o, os_.insns
++            if best_v is None:
++                continue
++            rows.append((ls.insns - best_v, Path(r.path).stem, fname,
++                         ls, best_n, per))
++
++    rows.sort(key=lambda t: -t[0])
++
++    print(f"{'gap':>5} {'benchmark':<22} {'function':<22} "
++          f"{'insns':>6} {'loads':>6} {'store':>6} {'spill':>6} "
++          f"{'brnch':>6} {'vec':>6}   best")
++    print("-" * 108)
++    total_gap = 0
++    for gap, bench, fname, ls, best_n, per in rows:
++        if gap <= 0 and not args.verbose:
++            continue
++        total_gap += max(0, gap)
++        best = per[best_n]
++        delta = ""
++        if baseline:
++            key = f"{bench}:{fname}"
++            old = baseline.get("gaps", {}).get(key)
++            if old is not None:
++                d = gap - old
++                delta = f"  ({d:+d} vs baseline)" if d else "  (unchanged)"
++        print(f"{gap:>5} {bench:<22} {fname:<22} {ls.as_row()}   "
++              f"{best_n}={best.insns}{delta}")
++
++    print("-" * 108)
++    print(f"total instruction gap vs best-of-oracles: {total_gap}")
++
++    behind = sum(1 for g, *_ in rows if g > 0)
++    ahead = sum(1 for g, *_ in rows if g < 0)
++    tied = sum(1 for g, *_ in rows if g == 0)
++    print(f"functions: {behind} behind, {tied} tied, {ahead} ahead "
++          f"({len(rows)} compared)")
++
++    for r in results:
++        for who, err in r.errors.items():
++            print(f"  ! {Path(r.path).stem}: {who}: {err}", file=sys.stderr)
++
++    if args.json:
++        payload = {
++            "flags": args.flags,
++            "gaps": {f"{b}:{f}": g for g, b, f, *_ in rows},
++            "detail": [
++                {"file": r.path,
++                 "compilers": {c: {k: asdict(v) for k, v in s.items()}
++                               for c, s in r.per_compiler.items()},
++                 "errors": r.errors}
++                for r in results
++            ],
++        }
++        args.json.parent.mkdir(parents=True, exist_ok=True)
++        args.json.write_text(json.dumps(payload, indent=1))
++        print(f"wrote {args.json}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/stack_layout/analysis.rs b/src/backend/stack_layout/analysis.rs
+--- a/src/backend/stack_layout/analysis.rs	2026-08-14 16:51:18.193147719 +0000
++++ b/src/backend/stack_layout/analysis.rs	2026-08-14 17:37:20.585147719 +0000
+@@ -105,6 +105,49 @@
+ /// slot was eliminated, the ABI register may be clobbered, and no callee-saved
+ /// register was assigned. This would cause emit_param_ref to fall back to
+ /// reading the (already-clobbered) ABI register.
++
++/// True when the function contains any instruction that clobbers the
++/// caller-saved registers: a call, or an operation lowered to one.
 +///
-+/// The relocation-type numbers COLLIDE across the two architectures, so the
-+/// classifier must be target-aware. The old naive union included 42, which is
-+/// `R_X86_64_REX_GOTPCRELX` (a relaxable GOT reference) — NOT a TLS
-+/// relocation on either architecture. Every `@GOTPCRELX`-referenced symbol
-+/// was therefore emitted as STT_TLS, and the linker laid it out as a
-+/// thread-local symbol whose address resolved to the WRONG symbol (gzip:
-+/// `prev` resolved to `&rsync`, so `head = prev + WSIZE` wrote hash entries
-+/// into the globals region and corrupted `strstart` — SIGSEGV in deflate
-+/// under PGO builds, and only there because block alignment changed the
-+/// GOT-layout path).
- fn is_tls_reloc(rtype: u32) -> bool {
--    // x86-64: R_X86_64_DTPMOD64=16, DTPOFF64=17, TPOFF64=18, TPOFF32=23,
--    //          DTPOFF32=21, GOTTPOFF=22, TLSDESC=36, TLSDESC_CALL=42
--    // i386:    R_386_TLS_TPOFF=14, TLS_IE=15, TLS_GOTIE=16, TLS_LE=17,
--    //          TLS_GD=18, TLS_LDM=19, TLS_GD_32=24..TLS_TPOFF32=35
--    // Deduplicated union of the two arch sets: the 16/17/18 overlap between
--    // x86-64 and i386 made the original arms unreachable (rustc warning).
--    // x86-64 {16,17,18,21,22,23,36,42} ∪ i386 {14..19, 24..35} = {14..19, 21..23, 24..35, 36, 42}
--    matches!(rtype, 14..=19 | 21..=23 | 24..=35 | 36 | 42)
-+    if crate::common::types::target_is_32bit() {
-+        // i386 R_386_TLS_*: TPOFF=14, IE=15, GOTIE=16, LE=17, GD=18, LDM=19,
-+        // GD_32..TPOFF32 = 24..=37, GOTDESC=39, DESC_CALL=40, DESC=41.
-+        matches!(rtype, 14..=19 | 24..=37 | 39..=41)
-+    } else {
-+        // x86-64 TLS relocations: DTPMOD64=16, DTPOFF64=17, TPOFF64=18,
-+        // TLSGD=19, TLSLD=20, DTPOFF32=21, GOTTPOFF=22, TPOFF32=23,
-+        // GOTPC32_TLSDESC=29, TLSDESC_CALL=30, TLSDESC=31.
-+        // 41 (GOTPCRELX) and 42 (REX_GOTPCRELX) are relaxable GOT relocations,
-+        // NOT TLS — deliberately excluded.
-+        matches!(rtype, 16..=23 | 29..=31)
++/// Used to decide whether a caller-saved GPR is a safe home for an incoming
++/// parameter. Memcpy/memset and variadic argument handling are included
++/// because they are lowered to `rep movsb` / helper sequences that destroy
++/// rdi/rsi, exactly like a call would.
++pub(super) fn function_makes_calls(func: &IrFunction) -> bool {
++    if func.is_variadic {
++        return true;
 +    }
- }
--- 
-2.47.3
-
-
-From 34075fbd99c01274386f82988f6546b8a02e99f9 Mon Sep 17 00:00:00 2001
-From: lccc-v15 <v15@localhost>
-Date: Fri, 14 Aug 2026 15:48:32 +0000
-Subject: [PATCH 2/6] Peephole: only hoist loop-invariant GPR loads with a
- single entry edge
-
-hoist_loop_invariant_gpr_load replaced the preheader's 'jmp <header>' with a
-hoisted stack load and assumed every loop entry passes through it. A header
-with a second FORWARD entry edge (e.g. 'je <header>' from a different
-predecessor) enters the loop directly and observes a stale destination
-register. gzip's deflate hit this under PGO: the '.p2align' before the hot
-join block kept the entry jmp from being folded away, so the hoist fired and
-moved the 'head' (prev+WSIZE) reload into only the rsync!=0 path; the
-rsync==0 path then used &rsync as the hash-table base and SIGSEGV'd.
-
-Count branches targeting the header before the header label; hoist only when
-the entry jmp is the sole forward reference. Add unit tests for the
-multi-entry (must skip) and single-entry (must hoist) cases.
----
- .../codegen/peephole/passes/local_patterns.rs | 31 +++++++++-
- .../x86/codegen/peephole/passes/mod.rs        | 57 +++++++++++++++++++
- 2 files changed, 87 insertions(+), 1 deletion(-)
-
-diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-index 7ecd2c16..292263e1 100644
---- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-+++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-@@ -14,7 +14,7 @@
- //!   7. eliminate_redundant_xorl_zero: xorl %eax,%eax when %rax already zero
- 
- use super::super::types::*;
--use super::helpers::{is_valid_gp_reg, has_implicit_reg_usage, replace_reg_family, is_callee_saved_reg, get_dest_reg, is_read_modify_write, implicit_read_reg_family};
-+use super::helpers::{is_valid_gp_reg, has_implicit_reg_usage, replace_reg_family, is_callee_saved_reg, get_dest_reg, is_read_modify_write, implicit_read_reg_family, extract_jump_target};
- 
- /// Return which stack base register (`(%rsp)` vs `(%rbp)`) a line uses, if any.
- /// Used to ensure an adjacent store and load refer to the SAME slot (same base),
-@@ -3011,6 +3011,35 @@ pub(super) fn hoist_loop_invariant_gpr_load(
-                 i += 1;
-                 continue;
-             };
-+            // SAFETY: replacing the preheader's `jmp <header>` with the hoisted
-+            // load relies on that load executing on EVERY entry into the loop via
-+            // fall-through from the preheader. That is only sound when the header
-+            // has NO other FORWARD entry edge: a conditional branch (e.g.
-+            // `je <header>`) from a different predecessor enters the loop
-+            // directly, bypassing the preheader, and would observe an
-+            // uninitialized destination register. (gzip's deflate: the `rsync`
-+            // guard's `je` into the hash-table loop header — `head` was reloaded
-+            // into %rcx only on the fall-through edge, so `head[ins_h]=strstart`
-+            // wrote through `&rsync`, corrupted globals and SIGSEGV'd.) Back-edges
-+            // (position > header) are fine: the load is invariant and the
-+            // destination is not written inside the loop (verified above).
-+            let mut forward_entries = 0u32;
-+            for idx in 0..header {
-+                if infos[idx].is_nop() { continue; }
-+                if matches!(infos[idx].kind, LineKind::Jmp | LineKind::CondJmp) {
-+                    let t = infos[idx].trimmed(store.get(idx));
-+                    if let Some(tg) = extract_jump_target(t) {
-+                        if tg == target.as_str() {
-+                            forward_entries += 1;
-+                        }
-+                    }
-+                }
-+            }
-+            // Exactly one forward reference (the entry jmp itself) is allowed.
-+            if forward_entries != 1 {
-+                i += 1;
-+                continue;
-+            }
-             // Replace the entry jmp with the load; execution falls through into the
-             // header. The load is invariant (slot not written in loop, no calls) and
-             // the dest register is not written in the loop (checked above).
-diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
-index 90032cee..e69954b3 100644
---- a/src/backend/x86/codegen/peephole/passes/mod.rs
-+++ b/src/backend/x86/codegen/peephole/passes/mod.rs
-@@ -668,6 +668,63 @@ mod tests {
-         assert!(result.contains(".Lfoo:"));
-     }
- 
-+    #[test]
-+    fn test_gpr_hoist_skips_multi_entry_loop() {
-+        // Regression: hoisting a loop-invariant GPR load into the preheader is
-+        // sound only when the header has a SINGLE forward entry edge (the entry
-+        // jmp). A conditional `je <header>` from a different predecessor enters
-+        // the loop directly, bypassing the preheader, and would observe a stale
-+        // destination register. (gzip deflate: the `rsync` guard's `je` into the
-+        // hash-table loop header left `head` unloaded in %rcx, so
-+        // `head[ins_h]=strstart` wrote through `&rsync`, corrupted globals, and
-+        // SIGSEGV'd under PGO builds.)
-+        let asm = [
-+            "    movq 16(%rsp), %rcx",
-+            "    movslq (%rcx), %rax",
-+            "    testq %rax, %rax",
-+            "    je .LBB1",
-+            ".LBB2:",
-+            "    movl (%rbx), %eax",
-+            "    jmp .LBB1",
-+            ".p2align 4",
-+            ".LBB1:",
-+            "    movl (%rbx), %edi",
-+            "    movq 304(%rsp), %rcx",
-+            "    addq %rcx, %rax",
-+            "    jne .LBB1",
-+        ].join("\n") + "\n";
-+        let mut store = LineStore::new(asm);
-+        let mut infos: Vec<LineInfo> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
-+        let changed = local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
-+        assert!(!changed, "must not hoist when the header has a second forward entry edge");
-+        let result = store.build_result(|i| infos[i].is_nop());
-+        assert!(result.contains("jmp .LBB1"), "entry jmp must be preserved: {}", result);
-+        assert!(result.contains("movq 304(%rsp), %rcx"), "invariant load must stay in the loop: {}", result);
-+    }
++    func.blocks.iter().any(|b| {
++        b.instructions.iter().any(|i| {
++            matches!(i,
++                Instruction::Call { .. }
++                | Instruction::Memcpy { .. }
++                | Instruction::CallIndirect { .. }
++                | Instruction::VaArgStruct { .. }
++                | Instruction::VaArg { .. }
++                | Instruction::VaStart { .. }
++                | Instruction::VaCopy { .. }
++                | Instruction::VaEnd { .. }
++            )
++        })
++    })
++}
 +
-+    #[test]
-+    fn test_gpr_hoist_single_entry() {
-+        // Positive control: with a single forward entry edge (the entry jmp),
-+        // the invariant load SHOULD still be hoisted into the preheader.
-+        let asm = [
-+            ".LBB2:",
-+            "    movl (%rbx), %eax",
-+            "    jmp .LBB1",
-+            ".LBB1:",
-+            "    movl (%rbx), %edi",
-+            "    movq 304(%rsp), %rcx",
-+            "    addq %rcx, %rax",
-+            "    jne .LBB1",
-+        ].join("\n") + "\n";
-+        let mut store = LineStore::new(asm);
-+        let mut infos: Vec<LineInfo> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
-+        let changed = local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
-+        assert!(changed, "single-entry loop should still hoist the invariant load");
-+        let result = store.build_result(|i| infos[i].is_nop());
-+        assert!(!result.contains("jmp .LBB1"), "entry jmp should be replaced by the hoisted load: {}", result);
-+        assert!(result.contains("movq 304(%rsp), %rcx"), "hoisted load must be present in the preheader: {}", result);
-+    }
++/// PhysReg ids 10-15 are the caller-saved GPR pool (r11, r10, r8, r9, rdi,
++/// rsi). See `X86_CALLER_SAVED` in the x86 emitter.
++///
++/// Only r11 (id 10) and r10 (id 11) are safe as parameter homes. The other
++/// four ARE SysV integer argument registers, so writing a parameter's home
++/// there in the prologue destroys another parameter's incoming value whenever
++/// that parameter is materialised in the function BODY rather than by a
++/// prologue move (`movslq %r8d, %rdi` in a 9-argument callee read r8 after
++/// param 2's home had already overwritten it). The prologue's parallel-copy
++/// ordering only sequences the moves it emits itself and cannot protect body
++/// reads, so the ABI-overlapping registers are excluded here instead.
++pub(super) fn is_scratch_gpr(phys: PhysReg) -> bool {
++    matches!(phys.0, 10 | 11)
++}
 +
-     #[test]
-     fn test_push_pop_elimination() {
-         let asm = "    pushq %rax\n    movq %rax, %rcx\n    popq %rax\n".to_string();
--- 
-2.47.3
-
-
-From 29772abbafe398b9b4dbbf375d1b287766e1bb9e Mon Sep 17 00:00:00 2001
-From: lccc-v15 <v15@localhost>
-Date: Fri, 14 Aug 2026 15:48:37 +0000
-Subject: [PATCH 3/6] Add PGO-layout diagnostic switches and linker GOT debug
- tracing
-
-Gate the four profile-driven layout transforms (section splitting, function
-reordering, conditional-fallthrough, block alignment) behind LCCC_PGO_NO_*
-switches so any one can be bisected in isolation, and add an LCCC_DEBUG_GOT
-trace to the x86-64 linker (GOT entry table plus per-relocation slot math) for
-diagnosing GOT-slot issues.
----
- src/backend/x86/linker/emit_exec.rs |  5 +++++
- src/backend/x86/linker/plt_got.rs   |  5 +++++
- src/pgo/layout.rs                   | 18 +++++++++++++-----
- 3 files changed, 23 insertions(+), 5 deletions(-)
-
-diff --git a/src/backend/x86/linker/emit_exec.rs b/src/backend/x86/linker/emit_exec.rs
-index 25c24b44..00d56ed9 100644
---- a/src/backend/x86/linker/emit_exec.rs
-+++ b/src/backend/x86/linker/emit_exec.rs
-@@ -1173,6 +1173,11 @@ pub(super) fn emit_executable(
-                                         let nb = got_entries[..gi].iter().filter(|(n,p)| !n.is_empty() && !*p).count();
-                                         got_addr + nb as u64 * 8
-                                     };
-+                                    if std::env::var("LCCC_DEBUG_GOT").is_ok() {
-+                                        let nb = got_entries[..gi].iter().filter(|(n,p)| !n.is_empty() && !*p).count();
-+                                        eprintln!("[GOTREL] name={:?} gi={} is_plt={} nb={} gea=0x{:x} got_addr=0x{:x} p=0x{:x} addend={}",
-+                                            sym.name, gi, entry.1, nb, gea, got_addr, p, a);
-+                                    }
-                                     w32(&mut out, fp, (gea as i64 + a - p as i64) as u32);
-                                     continue;
-                                 }
-diff --git a/src/backend/x86/linker/plt_got.rs b/src/backend/x86/linker/plt_got.rs
-index 58abe4fb..49a6ec78 100644
---- a/src/backend/x86/linker/plt_got.rs
-+++ b/src/backend/x86/linker/plt_got.rs
-@@ -137,5 +137,10 @@ pub(super) fn create_plt_got(
-         }
-     }
- 
-+    if std::env::var("LCCC_DEBUG_GOT").is_ok() {
-+        for (i, (name, is_plt)) in got_entries.iter().enumerate() {
-+            eprintln!("[GOT] idx={} plt={} name={:?}", i, is_plt, name);
-+        }
-+    }
-     (plt_names, got_entries)
- }
-diff --git a/src/pgo/layout.rs b/src/pgo/layout.rs
-index 0d918427..077fb1f7 100644
---- a/src/pgo/layout.rs
-+++ b/src/pgo/layout.rs
-@@ -62,10 +62,12 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
-         // with cold code — the opposite of the I-cache goal.
-         let hot = fp.total_count > 0 && fp.total_count.saturating_mul(10) >= max;
-         let cold = max > 0 && fp.total_count.saturating_mul(1000) < max;
--        if hot {
--            f.section = Some(".text.hot".into());
--        } else if cold {
--            f.section = Some(".text.unlikely".into());
-+        if std::env::var("LCCC_PGO_NO_SECTION").is_err() {
-+            if hot {
-+                f.section = Some(".text.hot".into());
-+            } else if cold {
-+                f.section = Some(".text.unlikely".into());
-+            }
-         }
-         if f.blocks.len() >= 2 {
-             layout_function(f, fp, u, edges_valid);
-@@ -75,7 +77,9 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
-     // Order functions by hotness class within the TU — hot first, cold
-     // last — for I-cache-friendly object layout (GCC -freorder-functions).
-     // Declarations and helper functions keep their relative order (class 3).
--    if crate::pgo::summary::get_summary().is_some() {
-+    if crate::pgo::summary::get_summary().is_some()
-+        && std::env::var("LCCC_PGO_NO_REORDER").is_err()
-+    {
-         let n = m.functions.len();
-         let mut cls: Vec<u8> = vec![3; n];
-         for (i, f) in m.functions.iter().enumerate() {
-@@ -134,6 +138,9 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
-     let mut cf_map: crate::common::fx_hash::FxHashMap<u32, u32> =
-         crate::common::fx_hash::FxHashMap::default();
-     for f in &m.functions {
-+        if std::env::var("LCCC_PGO_NO_CFALL").is_ok() {
-+            break;
-+        }
-         if f.is_declaration || f.blocks.is_empty() {
-             continue;
-         }
-@@ -167,6 +174,7 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
-     // Hot loop headers and join points get 16-byte alignment. Very hot loop
-     // headers with larger bodies get 32-byte alignment. Candidates are gated
-     // on per-block execution count, so cold blocks receive no padding.
-+    if std::env::var("LCCC_PGO_NO_ALIGN").is_err()
-     {
-         let mut align_map: crate::common::fx_hash::FxHashMap<u32, u8> =
-             crate::common::fx_hash::FxHashMap::default();
--- 
-2.47.3
-
-
-From 04bd17c41660b9e943a655a109160aa5f2980c2f Mon Sep 17 00:00:00 2001
-From: lccc-v15 <v15@localhost>
-Date: Fri, 14 Aug 2026 17:32:34 +0000
-Subject: [PATCH 4/6] =?UTF-8?q?PGO:=20stop=20regressing=20gzip=20=E2=80=94?=
- =?UTF-8?q?=20neutral=20RA=20weighting,=2016-byte=20loop=20align,=20bisect?=
- =?UTF-8?q?=20gates?=
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Three measured regressions in the PGO use-mode pipeline, each fixed:
-
-1. PGO-weighted register allocation (pgo_point_weights) inflated hot-block
-   use counts by up to 4x, making hot-loop values near-unevictable. On gzip
-   compress this produced +16 stack-slot accesses (~20%) inside longest_match
-   and a +4.7% runtime regression vs plain -O2. The weighting also
-   double-counts loop depth (priority already carries 10^loop_depth), so the
-   default factor is now 1 (neutral); CCC_PGO_WEIGHT_MAX remains for
-   experiments that show a real win.
-
-2. The 32-byte alignment tier for very-hot loop headers bloated hot functions
-   with multi-byte NOP padding (longest_match: 7 padding sites) and measured
-   slower than 16-byte alignment. Only 16-byte alignment is now emitted,
-   matching GCC's -falign-loops and LLVM's hot-loop default.
-
-3. Add LCCC_PGO_NO_INLINE / LCCC_PGO_NO_UNROLL / LCCC_PGO_NO_PROMOTE
-   diagnostic switches so each PGO consumer can be bisected in isolation.
----
- src/backend/live_range.rs | 11 ++++++++++-
- src/pgo/inline_pgo.rs     |  3 +++
- src/pgo/layout.rs         | 18 ++++++++----------
- src/pgo/promote.rs        |  3 +++
- src/pgo/unroll_pgo.rs     |  3 +++
- 5 files changed, 27 insertions(+), 11 deletions(-)
-
-diff --git a/src/backend/live_range.rs b/src/backend/live_range.rs
-index 721c21db..2e9b8f83 100644
---- a/src/backend/live_range.rs
-+++ b/src/backend/live_range.rs
-@@ -774,10 +774,19 @@ fn pgo_point_weights(func: &IrFunction) -> FxHashMap<u32, u64> {
-     if max == 0 {
-         return out;
-     }
-+    // Default factor is 1 (NEUTRAL). Inflating use counts by up to 4x made
-+    // the allocator treat hot-loop values as near-unevictable, which measured
-+    // as a ~20% increase in stack-slot traffic inside gzip's `longest_match`
-+    // hot loop (+16 stack accesses) and a +4.7% runtime regression on gzip
-+    // compress versus plain -O2. The weighting also double-counts loop depth:
-+    // `priority` already carries a 10^loop_depth multiplier, so per-use
-+    // hotness on top over-amplifies inner-loop temporaries and perturbs the
-+    // eviction heuristic. The knob remains for experiments that show a real
-+    // win on their own workload.
-     let max_factor = std::env::var("CCC_PGO_WEIGHT_MAX")
-         .ok()
-         .and_then(|s| s.parse::<u64>().ok())
--        .unwrap_or(4)
-+        .unwrap_or(1)
-         .clamp(1, 16);
-     let span = max_factor - 1;
-     let mut point = 0u32;
-diff --git a/src/pgo/inline_pgo.rs b/src/pgo/inline_pgo.rs
-index 21f8d760..7db7141f 100644
---- a/src/pgo/inline_pgo.rs
-+++ b/src/pgo/inline_pgo.rs
-@@ -93,6 +93,9 @@ pub fn inline_threshold_multiplier(caller: &str, callee: &str, p: &ProfileData)
- /// this: a flat profile compiles exactly like plain `-O2` for inlining, and PGO
- /// inlining only engages where the profile is genuinely skewed.
- pub fn inline_decisions_active() -> bool {
-+    if std::env::var("LCCC_PGO_NO_INLINE").is_ok() {
-+        return false;
-+    }
-     match crate::pgo::summary::get_summary() {
-         Some(s) => s.has_spread(),
-         None => true, // no summary: use the relative-frequency heuristics
-diff --git a/src/pgo/layout.rs b/src/pgo/layout.rs
-index 077fb1f7..888ace20 100644
---- a/src/pgo/layout.rs
-+++ b/src/pgo/layout.rs
-@@ -260,20 +260,18 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
-             }
-             for b in &f.blocks {
-                 let l = b.label.0;
--                let c = fp.block_count(b.label);
-                 if !hot(l) {
-                     continue;
+ pub(super) fn find_dead_param_allocas(
+     func: &IrFunction,
+     used_values: &FxHashSet<u32>,
+@@ -138,11 +181,22 @@
+                     // - a callee-saved GPR (survives calls, never clobbered);
+                     // - an XMM register (PhysReg 20+), which the allocator
+                     //   only assigns to values that do NOT span calls.
+-                    // Caller-saved GPRs overlap with ABI argument registers
+-                    // and would clobber other params' values before they're
+-                    // saved, so they are deliberately excluded.
++                    // - r11/r10 in a LEAF function. These two are the only
++                    //   caller-saved GPRs that are not also SysV argument
++                    //   registers, so homing a parameter there cannot destroy
++                    //   another parameter's incoming value; and with no calls
++                    //   in the function nothing clobbers them either. The
++                    //   remaining caller-saved GPRs (r8/r9/rdi/rsi) ARE
++                    //   argument registers and stay excluded.
++                    // Allowing it removes a store AND a reload per parameter.
++                    // `int cmp(const void*a, const void*b){return *(int*)a -
++                    // *(int*)b;}` went from 11 instructions with a 24-byte
++                    // frame to GCC's 3.
++                    let leaf = !function_makes_calls(func);
+                     let has_stable_home = reg_assigned.get(&dest_id)
+-                        .map(|phys| callee_saved_regs.contains(phys) || phys.0 >= 20)
++                        .map(|phys| callee_saved_regs.contains(phys)
++                             || phys.0 >= 20
++                             || (leaf && is_scratch_gpr(*phys)))
+                         .unwrap_or(false);
+                     if has_stable_home {
+                         dead.insert(pv.0);
+diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+--- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs	2026-08-14 16:51:18.213147719 +0000
++++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs	2026-08-14 17:37:20.585147719 +0000
+@@ -2449,7 +2449,7 @@
+         // can have long stretches of non-barrier instructions.
+         let src_32_name = REG_NAMES[1][src_family as usize];
+         let mut rax_dead = false; // conservative default: assume alive
+-        let mut cmpl_line: Option<usize> = None;
++        let mut cmpl_lines: Vec<usize> = Vec::new();
+         let mut n = j + 1;
+         while n < len {
+             if infos[n].is_nop() { n += 1; continue; }
+@@ -2494,7 +2494,7 @@
                  }
-                 if is_loop_header.contains(&l) {
--                    // Use 32 bytes for very hot headers with at least eight
--                    // instructions; otherwise use 16 bytes.
--                    let body = b.instructions.len();
--                    let alignment = if c.saturating_mul(4) >= entry_count && body >= 8 {
--                        5
--                    } else {
--                        4
--                    };
--                    align_map.insert(l, alignment);
-+                    // 16-byte loop-header alignment only. The former 32-byte
-+                    // tier for very hot headers with at least eight
-+                    // instructions bloated hot functions with multi-byte NOP
-+                    // padding (gzip: longest_match grew ~11%, 7 padding
-+                    // sites) and measured SLOWER than 16-byte alignment on
-+                    // gzip compress — GCC's -falign-loops default is 16 and
-+                    // LLVM aligns hot loops to 16 too.
-+                    align_map.insert(l, 4);
-                 } else if indeg.get(&l).copied().unwrap_or(0) >= 2 {
-                     // Hot join point (multiple predecessors): align the merge
-                     // so the fall-in is decode-friendly.
-diff --git a/src/pgo/promote.rs b/src/pgo/promote.rs
-index 43a7af19..57697f9f 100644
---- a/src/pgo/promote.rs
-+++ b/src/pgo/promote.rs
-@@ -55,6 +55,9 @@ pub fn sig_of(info: &CallInfo) -> String {
- /// Promote indirect calls in `m` using the loaded profile for unit `u`.
- /// Returns the number of sites promoted and records hot labels for layout.
- pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
-+    if std::env::var("LCCC_PGO_NO_PROMOTE").is_ok() {
-+        return 0;
-+    }
-     let Some(p) = crate::pgo::get_pgo_profile() else {
-         return 0;
-     };
-diff --git a/src/pgo/unroll_pgo.rs b/src/pgo/unroll_pgo.rs
-index b72440a1..ef511b89 100644
---- a/src/pgo/unroll_pgo.rs
-+++ b/src/pgo/unroll_pgo.rs
-@@ -80,6 +80,9 @@ pub fn should_unroll_loop(
-     size: usize,
-     p: Option<&ProfileData>,
- ) -> Option<bool> {
-+    if std::env::var("LCCC_PGO_NO_UNROLL").is_ok() {
-+        return None; // let the size/feature-driven unroller decide on its own
-+    }
-     let _ = p?;
-     if size_opt() {
-         return Some(false);
--- 
-2.47.3
-
-
-From 44b189ad9b851e80a1936a85dca56d68c5ecf16c Mon Sep 17 00:00:00 2001
-From: lccc-v15 <v15@localhost>
-Date: Fri, 14 Aug 2026 17:32:40 +0000
-Subject: [PATCH 5/6] Linker: preserve .text.hot/.text.unlikely for PGO
- hot/cold partitioning
-
-The linker folded every .text.* input section into .text, interleaving hot
-and cold functions per object and throwing away the compiler's profile-driven
-partitioning entirely. Keep .text.hot and .text.unlikely as separate output
-sections and order the executable region .text -> .text.hot -> .text.unlikely
--> other exec, so hot functions stay contiguous for I-cache locality and cold
-code is pushed to the tail of the executable segment (GNU ld's default
-layout). Verified on gzip: longest_match, deflate_fast, gzip_deflate and
-ct_tally now land together in .text.hot.
----
- src/backend/linker_common/merge.rs       | 20 +++++++++++++++++---
- src/backend/linker_common/section_map.rs |  8 ++++++++
- 2 files changed, 25 insertions(+), 3 deletions(-)
-
-diff --git a/src/backend/linker_common/merge.rs b/src/backend/linker_common/merge.rs
-index dfcd9cce..22e55ea7 100644
---- a/src/backend/linker_common/merge.rs
-+++ b/src/backend/linker_common/merge.rs
-@@ -101,9 +101,23 @@ pub fn merge_sections_elf64_gc(
-         let is_exec = sec.flags & SHF_EXECINSTR != 0;
-         let is_write = sec.flags & SHF_WRITE != 0;
-         let is_nobits = sec.sh_type == SHT_NOBITS;
--        if is_exec { (1u32, is_nobits as u32) }
--        else if !is_write { (0, is_nobits as u32) }
--        else { (2, is_nobits as u32) }
-+        // Executable sections are ordered so PGO hot/cold partitioning is
-+        // honored: `.text` → `.text.hot` → `.text.unlikely` → other exec.
-+        // Hot functions stay in a contiguous region and cold functions are
-+        // pushed to the tail of the executable segment.
-+        let exec_rank = if is_exec {
-+            match sec.name.as_str() {
-+                ".text" => 0u32,
-+                ".text.hot" => 1,
-+                ".text.unlikely" => 2,
-+                _ => 3,
-+            }
-+        } else {
-+            0
-+        };
-+        if is_exec { (1u32, exec_rank, is_nobits as u32) }
-+        else if !is_write { (0, 0u32, is_nobits as u32) }
-+        else { (2, 0u32, is_nobits as u32) }
-     });
- 
-     let mut index_remap: FxHashMap<usize, usize> = FxHashMap::default();
-diff --git a/src/backend/linker_common/section_map.rs b/src/backend/linker_common/section_map.rs
-index 17e2caa6..3696c253 100644
---- a/src/backend/linker_common/section_map.rs
-+++ b/src/backend/linker_common/section_map.rs
-@@ -9,6 +9,14 @@
- /// like `.text.foo` are merged into `.text`, `.rodata.bar` into `.rodata`, etc.
- /// RISC-V additionally maps `.sdata`/`.sbss` (via `map_section_name_riscv()`).
- pub fn map_section_name(name: &str) -> &str {
-+    // Profile-guided hot/cold partitioning (PGO `-fprofile-use`) emits
-+    // `.text.hot` and `.text.unlikely` sections; the linker must KEEP them
-+    // separate (ordered `.text` → `.text.hot` → `.text.unlikely`) so hot
-+    // functions stay contiguous for I-cache locality and cold code is pushed
-+    // to the end of the executable region. Folding them into `.text` (the old
-+    // `.text.*` → `.text` rule) interleaved hot and cold functions per object
-+    // and threw away the entire benefit of the compiler's partitioning.
-+    if name == ".text.hot" || name == ".text.unlikely" { return name; }
-     if name.starts_with(".text.") || name == ".text" { return ".text"; }
-     if name.starts_with(".data.rel.ro") { return ".data.rel.ro"; }
-     if name.starts_with(".data.") || name == ".data" { return ".data"; }
--- 
-2.47.3
-
-
-From 22c7e8d6a34b0a958ac123966c92376b72eecf75 Mon Sep 17 00:00:00 2001
-From: lccc-v15 <v15@localhost>
-Date: Fri, 14 Aug 2026 17:32:45 +0000
-Subject: [PATCH 6/6] Peephole: fold single-base LEA into its memory operand
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-fold_lea_into_memory_op only matched SIB addresses (base,index[,scale]) and
-rejected the single-base form leaq disp(%base), %dst — the dominant shape of
-pointer induction (gzip longest_match emits leaq 2(%r9),%rdx; movzbl (%rdx),
-%edi per compare). Fold it to movzbl disp(%base),%edi when the temporary is
-provably dead afterward (fam_read_after), matching a bare (%dst) operand so
-displacement forms like 8(%rdx) are never corrupted.
----
- .../codegen/peephole/passes/local_patterns.rs | 65 ++++++++++++++++++-
- 1 file changed, 62 insertions(+), 3 deletions(-)
-
-diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-index 292263e1..b4369c5e 100644
---- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-+++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-@@ -918,9 +918,68 @@ pub(super) fn fold_lea_into_memory_op(
-             .split(',')
-             .map(str::trim)
-             .collect();
--        if fields.len() < 2 || fields.len() > 3
--            || fields.iter().any(|field| !field.starts_with('%'))
--        {
-+        // Single-base form: `leaq disp(%base), %dst` with no index/scale.
-+        // This is the dominant shape emitted for pointer induction in hot
-+        // loops (gzip longest_match): `leaq 2(%r9),%rdx; movzbl (%rdx),%edi`.
-+        // The SIB-only matcher below never fired on it, so each byte compare
-+        // paid a dead LEA + a register round-trip. Fold it to
-+        // `movzbl disp(%base),%edi` when the temporary is provably dead.
-+        if fields.len() == 1 {
-+            let base = fields[0];
-+            if !base.starts_with('%') {
-+                i += 1;
-+                continue;
-+            }
-+            let base_family = register_family_fast(base);
-+            if base_family == REG_NONE
-+                || base_family > REG_GP_MAX
-+                || dst_family == base_family
-+            {
-+                i += 1;
-+                continue;
-+            }
-+            let mut j = i + 1;
-+            while j < len && infos[j].is_nop() {
-+                j += 1;
-+            }
-+            if j >= len || infos[j].is_barrier() {
-+                i += 1;
-+                continue;
-+            }
-+            let next = infos[j].trimmed(store.get(j));
-+            let addr_pat = format!("({})", dst_text);
-+            // Match a BARE `(%dst)` memory operand. A displacement form like
-+            // `8(%rdx)` or `0x2(%rdx)` must not match — the replacement would
-+            // corrupt `8(` into `8disp(`.
-+            let bare_ok = next.match_indices(&addr_pat).any(|(pos, _)| {
-+                pos == 0 || {
-+                    let c = next.as_bytes()[pos - 1] as char;
-+                    c == ' ' || c == ',' || c == '\t'
-+                }
-+            });
-+            if !bare_ok {
-+                i += 1;
-+                continue;
-+            }
-+            // The address was already computed by the LEA; dropping it is valid
-+            // only if the destination register is dead after the memory op.
-+            if fam_read_after(store, infos, j + 1, dst_family) {
-+                i += 1;
-+                continue;
-+            }
-+            let sib = format!("{}({})", displacement, base);
-+            let replacement = next.replacen(&addr_pat, &sib, 1);
-+            if replacement == next {
-+                i += 1;
-+                continue;
-+            }
-+            mark_nop(&mut infos[i]);
-+            replace_line(store, &mut infos[j], j, format!("    {}", replacement));
-+            changed = true;
-+            i = j + 1;
-+            continue;
-+        }
-+        if fields.len() > 3 || fields.iter().any(|field| !field.starts_with('%')) {
-             i += 1;
-             continue;
+                 // Check if it's a cmpl $imm, %eax
+                 let tn = infos[n].trimmed(store.get(n));
+-                if tn.starts_with("cmpl $") && tn.ends_with(", %eax") && cmpl_line.is_none() {
++                if tn.starts_with("cmpl $") && tn.ends_with(", %eax") {
+                     // Check src_family is not modified between i and n.
+                     // Must check ALL instruction kinds that can write to a register,
+                     // including calls (clobber caller-saved) and pop.
+@@ -2523,7 +2523,7 @@
+                         }
+                     }
+                     if !src_modified {
+-                        cmpl_line = Some(n);
++                        cmpl_lines.push(n);
+                         n += 1;
+                         continue;
+                     }
+@@ -2535,7 +2535,21 @@
+             n += 1;
          }
--- 
-2.47.3
-
+ 
+-        if !rax_dead && cmpl_line.is_none() { i += 1; continue; }
++        // The transform retargets the movslq away from %rax, DELETING the only
++        // definition of %rax. That is legal only when %rax is provably dead
++        // afterwards. Redirecting the cmpl operands we happened to find is not
++        // sufficient on its own: the forward scan stops at the first barrier,
++        // so a `cmpl $imm, %eax` in a SUCCESSOR block is never examined and
++        // would be left reading a register nothing defines any more.
++        //
++        // (Reproducer: a switch lowered to a compare chain. The first
++        // `cmpl $1, %eax` was redirected, the `je` ended the scan with %rax
++        // still conservatively live, and the next block's `cmpl $2, %eax` read
++        // a dead register -- `switch(x){case 1: ... case 2: ...}` returned the
++        // default value for x == 2. This previously stayed hidden because the
++        // parameter spill reloaded %rax; eliminating that dead spill exposed
++        // it.)
++        if !rax_dead { i += 1; continue; }
+ 
+         // Apply the transformation
+         let dest_reg_stripped = &dest_reg[1..]; // without leading %
+@@ -2543,8 +2557,9 @@
+         replace_line(store, &mut infos[i], i, new_signext);
+         mark_nop(&mut infos[j]); // remove movq %rax, %Y
+ 
+-        // If there's a cmpl to redirect, do it
+-        if let Some(cmp_idx) = cmpl_line {
++        // Redirect EVERY cmpl that read %eax, not just the first one: they all
++        // lose their operand's definition when the movslq is retargeted.
++        for cmp_idx in cmpl_lines {
+             let tc = infos[cmp_idx].trimmed(store.get(cmp_idx));
+             let new_cmp = format!("    {}", tc.replace(", %eax", &format!(", {}", src_32_name)));
+             replace_line(store, &mut infos[cmp_idx], cmp_idx, new_cmp);
+diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/regression/param_home_scratch_reg.c b/tests/regression/param_home_scratch_reg.c
+--- a/tests/regression/param_home_scratch_reg.c	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/regression/param_home_scratch_reg.c	2026-08-14 17:18:09.157147719 +0000
+@@ -0,0 +1,146 @@
++/* Regression test: parameter allocas eliminated in favour of a register
++ * "home" must never let one parameter's home destroy another parameter's
++ * incoming ABI register.
++ *
++ * Background. When a parameter's stack slot is never read, the backend can
++ * skip the entry-block spill entirely and keep the parameter in the register
++ * the allocator gave its ParamRef. That is only sound when the home register
++ * is stable, so eligibility is restricted to:
++ *   - a callee-saved GPR,
++ *   - an XMM register (only assigned to values that do not span calls),
++ *   - r11/r10 in a LEAF function.
++ *
++ * r11 and r10 are the ONLY caller-saved GPRs in the allocation pool that are
++ * not also SysV integer argument registers. The rest of that pool is
++ * r8/r9/rdi/rsi, which ARE argument registers. Homing a parameter there
++ * corrupts a sibling parameter whenever that sibling is materialised in the
++ * function BODY instead of by a prologue move:
++ *
++ *     callee(a,b,c,d,e,f,g,h,i)   homes: a->r11 b->r10 c->r8 d->r9 e->rdi ...
++ *     ...
++ *     movslq %r8d, %rdi     <- reads e, but c's home already overwrote r8
++ *
++ * The prologue can order the moves it emits itself (and break cycles with
++ * xchg), but it cannot protect reads that happen later in the body, so the
++ * ABI-overlapping registers must be rejected at eligibility time.
++ *
++ * The historical failure that motivated this test: a 9-argument callee
++ * returned 17 instead of 21 because arguments 5 and 6 were read after their
++ * registers had been reused as homes.
++ *
++ * Every function below consumes its parameters in a scrambled order so a
++ * clobber cannot be masked by a lucky in-order read.
++ */
++
++extern int ext_sink(int);
++__attribute__((weak)) int ext_sink(int x) { return x & 7; }
++
++/* 9 integer arguments: 6 in registers, 3 on the stack. The historical bug.
++ * Arguments are consumed in a permuted order and the stack arguments are
++ * checked too, because eliminating the register spill area changes the
++ * offsets the stack arguments are read from. */
++__attribute__((noinline))
++int nine_args(int a, int b, int c, int d, int e, int f, void *g, void *h, void *i)
++{
++    if (g != 0) return -1;      /* arg7 must be NULL   */
++    if (h == 0) return -2;      /* arg8 must be non-NULL */
++    if (i != 0) return -3;      /* arg9 must be NULL   */
++    /* scrambled consumption order: f, c, a, e, b, d */
++    return f * 100000 + c * 10000 + a * 1000 + e * 100 + b * 10 + d;
++}
++
++/* Leaf, pointer parameters dereferenced in the body -- the qsort comparator
++ * shape that motivated the optimisation. Must stay correct while losing its
++ * stack frame. */
++__attribute__((noinline))
++int cmp_ints(const void *a, const void *b)
++{
++    return *(const int *)a - *(const int *)b;
++}
++
++/* Leaf, six integer parameters read strictly in reverse. */
++__attribute__((noinline))
++long six_reverse(long p0, long p1, long p2, long p3, long p4, long p5)
++{
++    long acc = 0;
++    acc = acc * 3 + p5;
++    acc = acc * 3 + p4;
++    acc = acc * 3 + p3;
++    acc = acc * 3 + p2;
++    acc = acc * 3 + p1;
++    acc = acc * 3 + p0;
++    return acc;
++}
++
++/* Leaf, parameters swapped relative to their ABI registers: a true
++ * permutation, the case an unordered prologue would miscompile. */
++__attribute__((noinline))
++long swapped(long a, long b, long c)
++{
++    return a * 1 + b * 1000 + c * 1000000;
++}
++
++/* NON-leaf: parameters are first read AFTER a call, so their homes must
++ * survive the call. r11/r10 are caller-saved, so they are ineligible here
++ * and the parameters must land in callee-saved registers or memory. */
++__attribute__((noinline))
++long live_across_call(long a, long b, long c)
++{
++    long t = ext_sink(7);
++    return a * 100 + b * 10 + c + t;   /* a,b,c read only after the call */
++}
++
++/* NON-leaf with a loop: the parameter stays live across many calls. */
++__attribute__((noinline))
++long live_across_loop(long a, long n)
++{
++    long s = 0;
++    for (long i = 0; i < n; i++)
++        s += ext_sink((int)i);
++    return s + a;                       /* a live across every iteration */
++}
++
++/* Mixed integer/FP: FP homes are XMM, integer homes r11/r10. Both pools are
++ * exercised at once, consumed out of order. */
++__attribute__((noinline))
++double mixed(int a, double x, int b, double y, int c, double z)
++{
++    return z * 1.0 + (double)c * 2.0 + y * 4.0 + (double)b * 8.0
++         + x * 16.0 + (double)a * 32.0;
++}
++
++int main(void)
++{
++    int dummy = 0;
++
++    /* 9 arguments: f=6 c=3 a=1 e=5 b=2 d=4 -> 631524 */
++    if (nine_args(1, 2, 3, 4, 5, 6, 0, &dummy, 0) != 631524) return 1;
++
++    {
++        static const int arr[2] = { 42, 17 };
++        if (cmp_ints(&arr[0], &arr[1]) != 25) return 2;
++        if (cmp_ints(&arr[1], &arr[0]) != -25) return 3;
++        if (cmp_ints(&arr[0], &arr[0]) != 0) return 4;
++    }
++
++    /* ((((5*3+4)*3+3)*3+2)*3+1)*3+0 with acc built from p5 down to p0 */
++    if (six_reverse(0, 1, 2, 3, 4, 5) != 1641) return 5;
++
++    if (swapped(7, 8, 9) != 7 + 8000 + 9000000) return 6;
++
++    if (live_across_call(3, 4, 5) != 3 * 100 + 4 * 10 + 5 + (7 & 7)) return 7;
++
++    {
++        long want = 0;
++        for (long i = 0; i < 5; i++) want += (i & 7);
++        if (live_across_loop(6, 5) != want + 6) return 8;
++    }
++
++    {
++        double got = mixed(1, 2.0, 3, 4.0, 5, 6.0);
++        double want = 6.0 + 5 * 2.0 + 4.0 * 4.0 + 3 * 8.0 + 2.0 * 16.0 + 1 * 32.0;
++        if (got != want) return 9;
++    }
++
++    return 0;
++}
+diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/regression/param_home_scratch_reg.c.txt b/tests/regression/param_home_scratch_reg.c.txt
+--- a/tests/regression/param_home_scratch_reg.c.txt	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/regression/param_home_scratch_reg.c.txt	2026-08-14 17:17:59.117147719 +0000
+@@ -0,0 +1 @@
++parameter register homes must not clobber sibling ABI argument registers (9-arg callee, permuted reads, leaf vs call-spanning)
+diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/regression/signext_move_cross_block.c b/tests/regression/signext_move_cross_block.c
+--- a/tests/regression/signext_move_cross_block.c	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/regression/signext_move_cross_block.c	2026-08-14 17:33:23.177147719 +0000
+@@ -0,0 +1,105 @@
++/* Regression test: fusing `movslq %Xd, %rax` + `movq %rax, %Y` into
++ * `movslq %Xd, %Y` DELETES the only definition of %rax, so it is legal only
++ * when %rax is provably dead afterwards.
++ *
++ * Historical bug (fuse_signext_and_move). The pass scanned forward for
++ * `cmpl $imm, %eax` operands it could redirect to the source register, and
++ * then proceeded whenever it had found at least one -- even though its own
++ * liveness scan had stopped at a barrier with %rax conservatively LIVE:
++ *
++ *     movslq %edi, %rax     <- only definition of %rax
++ *     movq   %rax, %r11
++ *     cmpl   $1, %eax       <- redirected to %edi, sets "found a cmpl"
++ *     je     .Lcase1        <- BARRIER: scan stops, rax_dead == false
++ *     cmpl   $2, %eax       <- SUCCESSOR block, never examined
++ *
++ * The movslq was retargeted to %r11, so the second compare read a register
++ * nothing defined any more and `case 2:` was never taken.
++ *
++ * A switch over an int parameter lowered to a compare chain reproduces it
++ * exactly: the chain puts one compare per basic block, all reading the same
++ * sign-extended value. The test additionally covers two compares in the SAME
++ * block (only the first used to be redirected) and a case where %rax really
++ * is dead, so the fusion must still happen.
++ *
++ * MIN_JUMP_TABLE_CASES keeps these small switches on the compare-chain path;
++ * the values are deliberately sparse so no jump table is formed.
++ */
++
++#include <stdio.h>
++
++/* Compare chain over a sign-extended int parameter. Each case lands in its
++ * own basic block, so every `cmpl` after the first is cross-block. */
++__attribute__((noinline))
++int chain(int x)
++{
++    switch (x) {
++    case 1:  x += 10;  /* fall through */
++    case 2:  x += 100; break;
++    case 7:  x += 1000; break;
++    case 19: x += 10000; break;
++    default: x = -1;
++    }
++    return x;
++}
++
++/* Same shape, but the switch value is used again AFTER the switch, so the
++ * sign-extended value must survive every branch. */
++__attribute__((noinline))
++long chain_reuse(int x)
++{
++    long acc = 0;
++    switch (x) {
++    case 3:  acc = 30; break;
++    case 5:  acc = 50; break;
++    case 11: acc = 110; break;
++    default: acc = -7;
++    }
++    return acc * 1000 + (long)x;
++}
++
++/* Two comparisons of the same value inside ONE basic block (no barrier
++ * between them): both operands must be redirected together. */
++__attribute__((noinline))
++int two_cmps_one_block(int x)
++{
++    int r = 0;
++    if (x == 4) r += 1;
++    if (x == 4) r += 2;   /* same block shape after the first test folds */
++    if (x == 9) r += 4;
++    return r * 100 + x;
++}
++
++/* %rax genuinely dead after the fuse: nothing here should inhibit the
++ * optimisation, so this guards against "fix" by disabling the pass. */
++__attribute__((noinline))
++long plain_widen(int x)
++{
++    long v = x;      /* movslq, value then lives in a callee-saved home */
++    return v * 3 + 1;
++}
++
++int main(void)
++{
++    if (chain(1)  != 111) return 1;   /* 1+10+100  */
++    if (chain(2)  != 102) return 2;   /* 2+100     */
++    if (chain(7)  != 1007) return 3;
++    if (chain(19) != 10019) return 4;
++    if (chain(3)  != -1) return 5;
++    if (chain(-5) != -1) return 6;
++
++    if (chain_reuse(3)  != 30L * 1000 + 3) return 7;
++    if (chain_reuse(5)  != 50L * 1000 + 5) return 8;
++    if (chain_reuse(11) != 110L * 1000 + 11) return 9;
++    if (chain_reuse(-2) != -7L * 1000 + -2) return 10;
++
++    if (two_cmps_one_block(4) != 3 * 100 + 4) return 11;
++    if (two_cmps_one_block(9) != 4 * 100 + 9) return 12;
++    if (two_cmps_one_block(0) != 0) return 13;
++
++    if (plain_widen(7)  != 22) return 14;
++    if (plain_widen(-3) != -8) return 15;
++
++    (void)printf("");
++    return 0;
++}
+diff -urN '--exclude=target' '--exclude=.git' '--exclude=.godbolt-cache' '--exclude=*.pyc' '--exclude=__pycache__' a/tests/regression/signext_move_cross_block.c.txt b/tests/regression/signext_move_cross_block.c.txt
+--- a/tests/regression/signext_move_cross_block.c.txt	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/regression/signext_move_cross_block.c.txt	2026-08-14 17:33:28.413147719 +0000
+@@ -0,0 +1 @@
++sign-extend/move fusion must not delete the only definition of %rax when a successor block still reads it (switch compare chain)
