@@ -1,2034 +1,914 @@
-From 14a3baba3c85a9fbdb191edaf827de9120a0a719 Mon Sep 17 00:00:00 2001
-From: Neo <neo@Neos-MacBook.local>
-Date: Sat, 15 Aug 2026 09:33:49 -0400
-Subject: [PATCH 01/11] AArch64: use wzr/xzr for constant-zero stores
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Constant-zero stores materialized the value through the accumulator
-(mov x0, #0; strb w0, ...) on both the const-offset and indexed store
-paths. Emit strb/strh/str with wzr/xzr directly — one fewer instruction
-per zero store (sieve's marking loop, memset-style code).
----
- src/backend/arm/codegen/memory.rs | 57 ++++++++++++++++++++++++++++++-
- 1 file changed, 56 insertions(+), 1 deletion(-)
-
-diff --git a/src/backend/arm/codegen/memory.rs b/src/backend/arm/codegen/memory.rs
-index 0867fb09..23808bc2 100644
---- a/src/backend/arm/codegen/memory.rs
-+++ b/src/backend/arm/codegen/memory.rs
-@@ -1,6 +1,6 @@
- //! ArmCodegen: memory operations (load, store, memcpy, GEP, stack).
- 
--use crate::ir::reexports::{Operand, Value};
-+use crate::ir::reexports::{IrConst, Operand, Value};
- use crate::common::types::IrType;
- use crate::backend::state::{StackSlot, SlotAddr};
- use crate::backend::traits::ArchCodegen;
-@@ -113,6 +113,25 @@ impl ArmCodegen {
-                 return true;
-             }
-         }
-+        // Constant-zero integer stores go through the zero register —
-+        // no per-iteration `mov x0, #0` materialization (sieve's marking loop).
-+        if let Operand::Const(c) = val {
-+            let is_zero = matches!(c, IrConst::Zero)
-+                || matches!(c, IrConst::I8(0) | IrConst::I16(0) | IrConst::I32(0) | IrConst::I64(0));
-+            if is_zero {
-+                let (instr, zr) = match ty {
-+                    IrType::I8 | IrType::U8 => ("strb", "wzr"),
-+                    IrType::I16 | IrType::U16 => ("strh", "wzr"),
-+                    IrType::I32 | IrType::U32 => ("str", "wzr"),
-+                    IrType::I64 | IrType::U64 | IrType::Ptr => ("str", "xzr"),
-+                    _ => ("", ""),
-+                };
-+                if !instr.is_empty() {
-+                    self.state.emit_fmt(format_args!("    {} {}, {}", instr, zr, addr));
-+                    return true;
-+                }
-+            }
-+        }
-         // General path: materialize the value, then store.
-         self.operand_to_x0(val);
-         match ty {
-@@ -200,6 +219,42 @@ impl ArmCodegen {
-             crate::backend::f128_softfloat::f128_emit_store_with_offset(self, val, base, offset);
-             return;
-         }
-+        // Integer constant-zero stores use the zero register — no x0
-+        // materialization (`mov x0, #0` per store in e.g. sieve's marking loop).
-+        if let Operand::Const(c) = val {
-+            let is_zero = matches!(c, IrConst::Zero)
-+                || matches!(c, IrConst::I8(0) | IrConst::I16(0) | IrConst::I32(0) | IrConst::I64(0));
-+            if is_zero {
-+                let width_ok = matches!(ty,
-+                    IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 |
-+                    IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr);
-+                if width_ok {
-+                    if let Some(addr) = self.state.resolve_slot_addr(base.0) {
-+                        let zr = if matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr) { "xzr" } else { "wzr" };
-+                        let store_instr = self.store_instr_for_type_impl(ty);
-+                        match addr {
-+                            SlotAddr::OverAligned(slot, id) => {
-+                                self.emit_alloca_aligned_addr_impl(slot, id);
-+                                self.emit_add_offset_to_addr_reg_impl(offset);
-+                                self.state.emit_fmt(format_args!("    {} {}, [x9]", store_instr, zr));
-+                            }
-+                            SlotAddr::Direct(slot) => {
-+                                let folded_slot = StackSlot(slot.0 + offset);
-+                                self.emit_store_to_sp(zr, folded_slot.0, store_instr);
-+                            }
-+                            SlotAddr::Indirect(slot) => {
-+                                self.emit_load_ptr_from_slot_impl(slot, base.0);
-+                                if offset != 0 {
-+                                    self.emit_add_offset_to_addr_reg_impl(offset);
-+                                }
-+                                self.state.emit_fmt(format_args!("    {} {}, [x9]", store_instr, zr));
-+                            }
-+                        }
-+                        return;
-+                    }
-+                }
-+            }
-+        }
-         // FP value with a register assignment: store the d/s register directly,
-         // folding the constant offset into the addressing mode when encodable.
-         if matches!(ty, IrType::F32 | IrType::F64) {
--- 
-2.47.3
-
-
-From 2b1d809473aaa3fb835cb474ee82f6618294b617 Mon Sep 17 00:00:00 2001
-From: Neo <neo@Neos-MacBook.local>
-Date: Sat, 15 Aug 2026 10:18:59 -0400
-Subject: [PATCH 02/11] AArch64 peephole: eliminate redundant sxtw after
- ldrsw/extended registers
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-An I32 load emits ldrsw (sign-extending), but a following I32->I64 cast
-recomputed the extension (sxtw xD, wS) — one dead instruction per
-sign-extended load in int-heavy loops (dot_product, hash_table chains).
-Track registers whose upper 32 bits are known sign-extensions
-(ldrsw/sxtw writes, 64-bit movs of extended registers), and rewrite the
-redundant sxtw to a plain mov (or drop it when D == S). All tracking is
-cleared at labels, branches, calls, and unknown clobbers.
-
-hash_table 1.34x -> 1.19x, binary_trees 1.21x -> 1.11x, geomean
-0.634x -> 0.627x; 18/18 correct, 536 unit tests pass.
----
- src/backend/arm/codegen/peephole.rs | 88 +++++++++++++++++++++++++++++
- 1 file changed, 88 insertions(+)
-
-diff --git a/src/backend/arm/codegen/peephole.rs b/src/backend/arm/codegen/peephole.rs
-index 26cac193..d06ba7e3 100644
---- a/src/backend/arm/codegen/peephole.rs
-+++ b/src/backend/arm/codegen/peephole.rs
-@@ -427,6 +427,7 @@ pub fn peephole_optimize(asm: String) -> String {
-         changed |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
-         changed |= eliminate_redundant_branches(&lines, &mut kinds, n);
-         changed |= eliminate_self_moves(&mut kinds, n);
-+        changed |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
-         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
-         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
-         changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
-@@ -458,6 +459,7 @@ pub fn peephole_optimize(asm: String) -> String {
-             changed2 |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
-             changed2 |= eliminate_redundant_branches(&lines, &mut kinds, n);
-             changed2 |= eliminate_self_moves(&mut kinds, n);
-+            changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
-             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
-             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
-             changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
-@@ -848,6 +850,92 @@ fn eliminate_self_moves(kinds: &mut [LineKind], n: usize) -> bool {
-     changed
- }
- 
-+// ── Pass 3b: Redundant sign-extension elimination ───────────────────────────
-+//
-+// Pattern: `sxtw xD, wS` where xS already holds a sign-extended value (written
-+// by `ldrsw`, an earlier `sxtw`, or a 64-bit mov of an extended register).
-+// The sxtw recomputes what is already true — replace with `mov xD, xS`
-+// (or drop entirely when D == S). Common after `ldrsw x0, [..]; mov xR, x0`
-+// feeding an I32→I64 cast (e.g. dot_product's per-load sxtw).
-+//
-+// A register stops being known-extended on any write: w-writes zero the upper
-+// bits, x-writes of unknown provenance clobber conservatively. All tracking is
-+// cleared at labels, branches, and calls.
-+
-+fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-+    let mut extended = [false; 33];
-+    extended[32] = true; // xzr is always "extended" (sxtw xD, wzr ≡ mov xD, xzr)
-+    let mut changed = false;
-+    for i in 0..n {
-+        match kinds[i] {
-+            // Control-flow barriers: nothing is known across them.
-+            LineKind::Label | LineKind::Branch | LineKind::CondBranch
-+            | LineKind::CmpBranch | LineKind::Call | LineKind::Ret => {
-+                extended = [false; 33];
-+                extended[32] = true;
-+            }
-+            // Unknown/memory kinds may clobber registers — except ldrsw with
-+            // non-sp addressing (classifies as MemOther), which CREATES a
-+            // sign-extended register.
-+            LineKind::MemOther | LineKind::Other | LineKind::LoadsbReg | LineKind::LoadPairSp => {
-+                let t = lines[i].trim();
-+                let mut ldrsw_dst: Option<u8> = None;
-+                if let Some(rest) = t.strip_prefix("ldrsw ") {
-+                    if let Some((reg_str, _)) = rest.split_once(',') {
-+                        let r = parse_reg(reg_str.trim());
-+                        if r != REG_NONE && r < 32 {
-+                            ldrsw_dst = Some(r);
-+                        }
-+                    }
-+                }
-+                extended = [false; 33];
-+                extended[32] = true;
-+                if let Some(r) = ldrsw_dst {
-+                    extended[r as usize] = true;
-+                }
-+            }
-+            LineKind::LoadswSp { reg, .. } => {
-+                if reg < 32 {
-+                    extended[reg as usize] = true;
-+                }
-+            }
-+            LineKind::Sxtw { dst, src } => {
-+                if extended[src as usize] {
-+                    if dst == src {
-+                        kinds[i] = LineKind::Nop;
-+                    } else {
-+                        lines[i] = format!("    mov {}, {}", xreg_name(dst), xreg_name(src));
-+                        kinds[i] = LineKind::Move { dst, src, is_32bit: false };
-+                    }
-+                    changed = true;
-+                }
-+                // Whether redundant or not, the sxtw result is sign-extended.
-+                if dst < 32 {
-+                    extended[dst as usize] = true;
-+                }
-+            }
-+            LineKind::Move { dst, src, is_32bit } => {
-+                if is_32bit {
-+                    // mov wN, wM zero-extends into xN — NOT a sign extension.
-+                    if dst < 32 {
-+                        extended[dst as usize] = false;
-+                    }
-+                } else if dst < 32 {
-+                    extended[dst as usize] = extended[src as usize];
-+                }
-+            }
-+            _ => {
-+                if let Some(dst) = written_gp_register(&lines[i], kinds[i]) {
-+                    if dst < 32 {
-+                        extended[dst as usize] = false;
-+                    }
-+                }
-+            }
-+        }
-+    }
-+    changed
-+}
-+
- // ── Pass 4: Move chain optimization ──────────────────────────────────────────
- //
- // Pattern: mov A, B  ;  mov C, A → mov C, B
--- 
-2.47.3
-
-
-From 214b7c1b6d22b5bda3eebd784f1b88ced5c4a0ae Mon Sep 17 00:00:00 2001
+From 55ebc3c0f5ff30a28728d83d0e20fa3c096b0b09 Mon Sep 17 00:00:00 2001
 From: Arena Agent <agent@arena.ai>
-Date: Sat, 15 Aug 2026 21:41:44 +0000
-Subject: [PATCH 03/11] test: add AArch64 differential regression driver (qemu
- + aarch64-gcc oracle)
+Date: Sat, 15 Aug 2026 22:51:48 +0000
+Subject: [PATCH 1/3] harden ARM harness against @PROFDIR@ artifact pollution
 
-Mirrors run_regression.sh but cross-compiles with lccc-arm, assembles and
-links with aarch64-linux-gnu-gcc, executes under qemu-aarch64, and diffs
-stdout+exit code against a native aarch64-gcc -O2 build. x86-only tests
-(intrinsics headers, SSE/AVX flags, x86 inline asm, .env-gated modes) are
-skipped; lccc-arm compile failures count as SKIP (backend maturity) unless
-ARM_STRICT=1. 20s qemu timeout per run (a hung binary must not stall the
-suite - lev/main's x86 build already hangs loop_mem_promote_dup_gep).
+Root cause of the .gcda junk that landed in a previous ms178-1.patch
+revision: PGO round-trip tests carry '@PROFDIR@' placeholders in their
+.flags files which only the x86 driver substitutes. The ARM differential
+driver passed them through verbatim, so aarch64-gcc created a literal
+'@PROFDIR@/' directory in the repo root; a later 'git add -A' swept the
+binary .gcda files into a commit and hence into the format-patch.
 
-Baseline on origin/main+fixes: 91 passed, 35 failed, 36 skipped. This is
-the acceptance gate for every AArch64 backport: the pass count must never
-drop below the recorded baseline.
-
-PROOF: lev/main HEAD scored 83/33/46 on the same harness - his tip fixes
-23 of our fails but BREAKS 21 tests that pass here (asm_label_alias,
-structs_bitfields, vectorize_float_matmul, pgo_flat, ...), confirming
-per-commit adoption with per-commit validation is mandatory.
+Two defenses: (1) the ARM driver now SKIPs any test whose flags contain
+@PROFDIR@ (they exercise the x86 PGO pipeline; qemu runs of them prove
+nothing), and (2) '@PROFDIR@/' is gitignored so even a stray run cannot
+be committed.
 ---
- tests/regression/run_regression_arm.sh | 70 ++++++++++++++++++++++++++
- 1 file changed, 70 insertions(+)
- create mode 100644 tests/regression/run_regression_arm.sh
+ .gitignore                             | 4 ++++
+ tests/regression/run_regression_arm.sh | 5 +++++
+ 2 files changed, 9 insertions(+)
 
+diff --git a/.gitignore b/.gitignore
+index 381c71c7..d3d9c7f0 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,5 +1,9 @@
+ # Rust build artifacts
+ /target/
++
++# Literal @PROFDIR@ dir dropped by PGO tests run outside the x86 driver
++# (once polluted a format-patch with .gcda binary blobs)
++@PROFDIR@/
+ /target-sroa/
+ **/*.rs.bk
+ 
 diff --git a/tests/regression/run_regression_arm.sh b/tests/regression/run_regression_arm.sh
-new file mode 100644
-index 00000000..02b931d7
---- /dev/null
+index 02b931d7..bd360251 100755
+--- a/tests/regression/run_regression_arm.sh
 +++ b/tests/regression/run_regression_arm.sh
-@@ -0,0 +1,70 @@
-+#!/usr/bin/env bash
-+# AArch64 differential regression driver: compile each regression test with
-+# lccc-arm, assemble+link with aarch64-linux-gnu-gcc, run under qemu-aarch64,
-+# and compare stdout+exit code against a native aarch64-gcc -O2 build of the
-+# same source. Mirrors run_regression.sh semantics (.flags/.env/.txt files).
-+#
-+# Usage: CCC_ARM=./target/fastbuild/lccc-arm bash tests/regression/run_regression_arm.sh [filter]
-+set -u
-+CCC_ARM=${CCC_ARM:-./target/fastbuild/lccc-arm}
-+CCCFLAGS=${CCCFLAGS:--O2}
-+CROSS_GCC=${CROSS_GCC:-aarch64-linux-gnu-gcc}
-+QEMU=${QEMU:-qemu-aarch64}
-+dir=$(cd "$(dirname "$0")" && pwd)
-+filter=${1:-}
-+
-+pass=0; fail=0; skip=0
-+for src in "$dir"/*.c; do
-+  name=$(basename "$src" .c)
-+  [ -n "$filter" ] && case "$name" in *"$filter"*) ;; *) continue ;; esac
-+
-+  extra_flags=""
-+  [ -f "$dir/$name.flags" ] && extra_flags=$(cat "$dir/$name.flags")
-+  # x86-only tests: intrinsics headers, SSE/AVX flags, x86 inline asm.
-+  if grep -qE '(immintrin|emmintrin|xmmintrin|pmmintrin|smmintrin|tmmintrin|wmmintrin|nmmintrin)\.h' "$src" \
-+     || echo "$extra_flags" | grep -qE '(-m(sse|avx|pclmul|fma|gfni|vaes))' \
-+     || grep -qE '__asm__.*%(e|r)(ax|bx|cx|dx|si|di)' "$src"; then
-+    skip=$((skip+1)); continue
-+  fi
-+  # Env-gated tests select x86-specific compiler modes; skip.
-+  if [ -f "$dir/$name.env" ]; then skip=$((skip+1)); continue; fi
-+
-+  LCCC_NO_COMPARE=0
-+  grep -q "LCCC_NO_COMPARE" "$dir/$name.txt" 2>/dev/null && LCCC_NO_COMPARE=1
-+
-+  if ! "$CCC_ARM" $CCCFLAGS "$src" $extra_flags -S -o "/tmp/arm_${name}.s" 2>/tmp/arm_err.txt; then
-+    # lccc-arm may legitimately not support every construct yet; treat
-+    # compile failure as SKIP (backend maturity), not FAIL, unless
-+    # ARM_STRICT=1.
-+    if [ "${ARM_STRICT:-0}" = 1 ]; then echo "FAIL  $name (lccc-arm compile)"; fail=$((fail+1));
-+    else skip=$((skip+1)); fi
-+    continue
-+  fi
-+  if ! "$CROSS_GCC" "/tmp/arm_${name}.s" $extra_flags -o "/tmp/arm_${name}" -static -lm 2>/tmp/arm_ld.txt; then
-+    echo "FAIL  $name (assemble/link: $(tail -1 /tmp/arm_ld.txt))"; fail=$((fail+1)); continue
-+  fi
-+  lout=$(timeout 20 "$QEMU" "/tmp/arm_${name}" 2>/dev/null); lrc=$?
-+  [ $lrc -eq 124 ] && lout="(TIMEOUT)"
-+
-+  if [ "$LCCC_NO_COMPARE" = 1 ]; then
-+    # lccc-conformance test: exit 0 is the pass criterion.
-+    if [ $lrc -eq 0 ]; then pass=$((pass+1)); else echo "FAIL  $name (rc=$lrc, lccc-only)"; fail=$((fail+1)); fi
-+    rm -f "/tmp/arm_${name}.s" "/tmp/arm_${name}"; continue
-+  fi
-+
-+  if ! "$CROSS_GCC" -O2 "$src" $extra_flags -o "/tmp/armg_${name}" -static -lm 2>/dev/null; then
-+    # GCC can't build it either (e.g. lccc extension test): fall back to rc==0.
-+    if [ $lrc -eq 0 ]; then pass=$((pass+1)); else echo "FAIL  $name (rc=$lrc, no-gcc-ref)"; fail=$((fail+1)); fi
-+    rm -f "/tmp/arm_${name}.s" "/tmp/arm_${name}"; continue
-+  fi
-+  gout=$(timeout 20 "$QEMU" "/tmp/armg_${name}" 2>/dev/null); grc=$?
-+  if [ "$lout" = "$gout" ] && [ $lrc -eq $grc ]; then
-+    pass=$((pass+1))
-+  else
-+    echo "FAIL  $name (lccc rc=$lrc vs gcc rc=$grc; outputs $( [ "$lout" = "$gout" ] && echo match || echo DIFFER))"
-+    fail=$((fail+1))
-+  fi
-+  rm -f "/tmp/arm_${name}.s" "/tmp/arm_${name}" "/tmp/armg_${name}"
-+done
-+echo "=== ARM Regression: $pass passed, $fail failed, $skip skipped ==="
-+[ $fail -eq 0 ]
--- 
-2.47.3
-
-
-From c7eee827bd212b43627202d1ae6c66fd38677656 Mon Sep 17 00:00:00 2001
-From: Neo <neo@Neos-MacBook.local>
-Date: Sat, 15 Aug 2026 10:02:44 -0400
-Subject: [PATCH 04/11] adopt int_const_hoist from levkropp, gated to AArch64
- (x86 would regress)
-
-Lev's pass (e896ab2b) hoists integer constants outside A64 imm12/cmn
-encoding range out of loop bodies into preheader Copies - on AArch64
-each such constant otherwise costs movz+movk per iteration (sieve's
-marking-loop bound).
-
-CRITICAL DIVERGENCE from his version: he registers the pass
-unconditionally. On x86-64 any imm32 encodes directly into cmp/add, so
-hoisting is a strict pessimization there - measured on sieve -O2:
-'cmpq $10000000, %r11' became a register compare, burned %r10, and
-added a callee-saved push to the prologue. Gated to
-Target::Aarch64 only.
-
-PROOF:
-- x86: with the gate, sieve asm is BIT-IDENTICAL to the pass-disabled
-  build; 162/162 regression, 653 lib tests.
-- ARM: movk count in sieve loop 2 -> 1; qemu run prints 664579 (matches
-  native gcc -O2); ARM differential suite holds at baseline 91 passed.
-- CCC_DISABLE_PASSES=intconst escape hatch preserved.
----
- .../tmp/armg_pgo_branchy-pgo_branchy.gcda     | Bin 0 -> 488 bytes
- .../armg_pgo_split_label-pgo_split_label.gcda | Bin 0 -> 320 bytes
- .../tmp/armg_switch_table-switch_table.gcda   | Bin 0 -> 384 bytes
- .../armg_value_profiling-value_profiling.gcda | Bin 0 -> 576 bytes
- src/passes/int_const_hoist.rs                 | 130 ++++++++++++++++++
- src/passes/mod.rs                             |  14 ++
- 6 files changed, 144 insertions(+)
- create mode 100644 @PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda
- create mode 100644 @PROFDIR@/tmp/armg_pgo_split_label-pgo_split_label.gcda
- create mode 100644 @PROFDIR@/tmp/armg_switch_table-switch_table.gcda
- create mode 100644 @PROFDIR@/tmp/armg_value_profiling-value_profiling.gcda
- create mode 100644 src/passes/int_const_hoist.rs
-
-diff --git a/@PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda b/@PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda
-new file mode 100644
-index 0000000000000000000000000000000000000000..c3ed5bc183f778c126b7c29a49bbbbfd4320e432
-GIT binary patch
-literal 488
-zcmYdHNlw=?GI8?wmdL(*b^Rg+28M+kK!O>F8~lZUBm*N4ka%5Gz_xio-?3%3Gem((
-z7;gZ@5?+C%85j<zbAo9dMli*oCJQowf#J6dgnyq2LMK2dh94>rh2+vIP;=A?&@grA
-zG*lbdk1#ff2KgBR)-!^90QC+?2pk6Ku^;LZeL~WAG#e}dg#kznG>m{Oh#rI)5Is|F
-qvUx6!yHGfhBk(v#PXbUSq41GWh1e`lfQG3<r(te^20PG31_l6S`ZK8j
-
-literal 0
-HcmV?d00001
-
-diff --git a/@PROFDIR@/tmp/armg_pgo_split_label-pgo_split_label.gcda b/@PROFDIR@/tmp/armg_pgo_split_label-pgo_split_label.gcda
-new file mode 100644
-index 0000000000000000000000000000000000000000..328933f2247dec809ccf0c40278977f39881f66f
-GIT binary patch
-literal 320
-zcmYdHNlw=?GI8qrmB=30JnIt!1H(cNAi)g88p=R|fq{_+NW3m8VB2tQ?G|wh={rCr
-zj1fRFs62xzL>&VgNHr3eA_(EYXqY;f5|ACp0Ks3+2yz1>LK5tT5SAeALcg!A$pug5
-zf!v?~l!xho*#V;wc0tU7sRL>On^o4kA@TbqpBm#k=MJNr1@niJGEg-NfSAREBnAM)
-CQzJM4
-
-literal 0
-HcmV?d00001
-
-diff --git a/@PROFDIR@/tmp/armg_switch_table-switch_table.gcda b/@PROFDIR@/tmp/armg_switch_table-switch_table.gcda
-new file mode 100644
-index 0000000000000000000000000000000000000000..ad500b1098517fe199e0bb2a7ab0513ac6b89e71
-GIT binary patch
-literal 384
-zcmYdHNlw=?GI9FHmBii`{5*w$fngyBkYEO42I=h}l92~Uye=wW>)pIy`-wBPKs5^)
-zcL2p2-kE{qVd@wjOlARdKX@{MX?pV$4zz&ng%Mysz&Jn}!C%h^@*^Wc4(!JRuNS&#
-w`hPyvy}WQe$d3XDc?`V>vmoJfsHUsv|9S4|$a-P^S7_e^H3?!bBy=D`0L`mD1poj5
-
-literal 0
-HcmV?d00001
-
-diff --git a/@PROFDIR@/tmp/armg_value_profiling-value_profiling.gcda b/@PROFDIR@/tmp/armg_value_profiling-value_profiling.gcda
-new file mode 100644
-index 0000000000000000000000000000000000000000..599b8ea12f45be2d4ee2c77522480e33c52100dd
-GIT binary patch
-literal 576
-zcmYdHNlw=?GI8?dPhu~zkk@BmU|7fjB$$Etz!gRy$-u}1BwiO4u-!8_`nlk&$$Ov@
-z#tNVqNDT<!q76z><zak?C_*2MKf?;fLe&Qoh1tWvu#(XMC<rqT>`Ea2)nQ?<jWBT-
-zjZ2<^VLc<ruP}KK6Xe&^mkhn$o;i3-?BuIPkY6=`Vw^w>0x&aSG|bH~d63%-fa-pz
-zKul!<>q59K;T1&SIm@|75DTUs<`$TGpcL3GAazkkJAUtIHdq333&_1NyFqq=%z)`-
-zfp9=1ST86%-ej77Mb-<AQ=k%5y@;@d=sn@}(SC_f;$xWJAOHXVN7e)3GcW)E-K<fE
-
-literal 0
-HcmV?d00001
-
-diff --git a/src/passes/int_const_hoist.rs b/src/passes/int_const_hoist.rs
-new file mode 100644
-index 00000000..6106e59d
---- /dev/null
-+++ b/src/passes/int_const_hoist.rs
-@@ -0,0 +1,130 @@
-+//! Integer constant hoisting for loop bodies.
-+//!
-+//! Integer constants that do not fit the AArch64 add/cmp immediate forms
-+//! (imm12: 0..=4095, or cmn negative range) are otherwise materialized with
-+//! movz/movk inside the loop on every iteration — sieve's marking-loop bound
-+//! `cmp j, #10000000` cost two instructions per iteration. This pass
-+//! materializes each distinct large constant once in the loop preheader as a
-+//! `Copy`, making it a register-allocatable SSA value (the register steal
-+//! rebalances it if a hotter value needs the register more).
-+//!
-+//! Constants are collected from BinOp/Cmp operands (the forms whose immediate
-+//! encoding is range-limited); small constants and zero (`wzr`/`xzr`) are
-+//! already free. A hoisted value is reused by nested loops (the outer
-+//! preheader dominates them) but never across sibling loops.
-+
-+use crate::common::fx_hash::{FxHashMap, FxHashSet};
-+use crate::ir::analysis;
-+use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Value};
-+use super::loop_analysis;
-+
-+/// Run integer-constant hoisting on a function. Returns the number of
-+/// distinct constants materialized in preheaders.
-+pub(crate) fn run(func: &mut IrFunction) -> usize {
-+    if func.blocks.len() < 2 {
-+        return 0;
-+    }
-+    let cfg = analysis::CfgAnalysis::build(func);
-+    let mut loops = loop_analysis::merge_loops_by_header(loop_analysis::find_natural_loops(
-+        cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom));
-+    if loops.is_empty() {
-+        return 0;
-+    }
-+    // Outermost first so constants used by nested loops hoist as far out as
-+    // possible and inner loops can reuse the dominating value.
-+    loops.sort_by_key(|l| l.body.len());
-+    loops.reverse();
-+
-+    // const bits -> (hoisted value id, body of the loop whose preheader defines it)
-+    let mut hoisted: FxHashMap<u64, (u32, FxHashSet<usize>)> = FxHashMap::default();
-+    let mut count = 0;
-+    for lp in &loops {
-+        let Some(preheader) = loop_analysis::find_preheader(lp.header, &lp.body, &cfg.preds) else {
-+            continue;
-+        };
-+        // Distinct large constants used in this loop body.
-+        let mut consts: Vec<u64> = Vec::new();
-+        let mut seen: FxHashSet<u64> = FxHashSet::default();
-+        for &bi in &lp.body {
-+            for inst in &func.blocks[bi].instructions {
-+                for_each_int_operand(inst, &mut |op| {
-+                    if let Some(bits) = large_int_const(op) {
-+                        if seen.insert(bits) {
-+                            consts.push(bits);
-+                        }
-+                    }
-+                });
-+            }
-+        }
-+
-+        for bits in consts {
-+            // Reuse a previously hoisted value when its definition dominates
-+            // this loop (i.e. this loop is nested inside the defining one).
-+            let reusable = hoisted.get(&bits).filter(|(_, body)| lp.body.is_subset(body));
-+            let new_val = if let Some(&(vid, _)) = reusable {
-+                vid
-+            } else {
-+                let vid = func.next_value_id;
-+                func.next_value_id += 1;
-+                func.blocks[preheader].instructions.push(Instruction::Copy {
-+                    dest: Value(vid),
-+                    src: Operand::Const(IrConst::I64(bits as i64)),
-+                });
-+                hoisted.insert(bits, (vid, lp.body.clone()));
-+                count += 1;
-+                vid
-+            };
-+            // Rewrite uses within the loop body.
-+            for &bi in &lp.body {
-+                for inst in &mut func.blocks[bi].instructions {
-+                    rewrite_int_operands(inst, bits, new_val);
-+                }
-+            }
-+        }
-+    }
-+    count
-+}
-+
-+/// An integer constant that is NOT encodable as an AArch64 add/cmp immediate
-+/// (imm12 0..=4095, or the cmn negative range -4095..=-1) and so would be
-+/// materialized with movz/movk. Returns the value as u64 bits.
-+fn large_int_const(op: &Operand) -> Option<u64> {
-+    let v: i64 = match op {
-+        Operand::Const(IrConst::I8(v)) => *v as i64,
-+        Operand::Const(IrConst::I16(v)) => *v as i64,
-+        Operand::Const(IrConst::I32(v)) => *v as i64,
-+        Operand::Const(IrConst::I64(v)) => *v,
-+        _ => return None,
-+    };
-+    if (-4095..=4095).contains(&v) {
-+        return None; // imm12 / cmn encodable — free already
-+    }
-+    Some(v as u64)
-+}
-+
-+/// Visit operands of the instruction forms with range-limited immediate encodings.
-+fn for_each_int_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand)) {
-+    match inst {
-+        Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
-+            f(lhs);
-+            f(rhs);
-+        }
-+        _ => {}
-+    }
-+}
-+
-+/// Replace operands equal to the constant `bits` with the hoisted value.
-+fn rewrite_int_operands(inst: &mut Instruction, bits: u64, new_val: u32) {
-+    let sub = |op: &mut Operand| {
-+        if large_int_const(op) == Some(bits) {
-+            *op = Operand::Value(Value(new_val));
-+        }
-+    };
-+    match inst {
-+        Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
-+            sub(lhs);
-+            sub(rhs);
-+        }
-+        _ => {}
-+    }
-+}
-diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index b44a5118..bf35e761 100644
---- a/src/passes/mod.rs
-+++ b/src/passes/mod.rs
-@@ -22,6 +22,7 @@ pub(crate) mod dce;
- mod dead_statics;
- pub(crate) mod div_by_const;
- pub(crate) mod fp_const_hoist;
-+pub(crate) mod int_const_hoist;
- pub(crate) mod gvn;
- pub(crate) mod if_convert;
- pub(crate) mod inline;
-@@ -1056,6 +1057,19 @@ macro_rules! preloop_dump {
-         module.for_each_function(fp_const_hoist::run);
-     }
+@@ -20,6 +20,11 @@ for src in "$dir"/*.c; do
  
-+    // Hoist large integer constants (not encodable as cmp/add immediates) out
-+    // of loop bodies for the same reason — sieve's loop bound cost movz+movk
-+    // per iteration before this.
-+    //
-+    // AArch64-ONLY: the pass models A64 immediate encodings (imm12/cmn).
-+    // x86-64 encodes any imm32 directly in cmp/add, so hoisting there only
-+    // burns a register and pessimizes the loop (measured on sieve: the
-+    // hoisted bound turned `cmpq $10000000, %r11` into a register compare
-+    // plus an extra callee-saved push in the prologue).
-+    if target == crate::backend::Target::Aarch64 && !disabled.contains("intconst") {
-+        module.for_each_function(int_const_hoist::run);
-+    }
-+
-     // Phase 11: Dead static function elimination.
-     // After all optimizations, remove internal-linkage (static) functions that are
-     // never referenced by any other function or global initializer. This is critical
+   extra_flags=""
+   [ -f "$dir/$name.flags" ] && extra_flags=$(cat "$dir/$name.flags")
++  # PGO round-trip tests use the @PROFDIR@ placeholder that only the x86
++  # driver substitutes. Passing it through verbatim makes gcc create a
++  # literal '@PROFDIR@/' directory in the repo (which once polluted a
++  # format-patch with .gcda binary blobs). Skip them here.
++  case "$extra_flags" in *@PROFDIR@*) skip=$((skip+1)); continue ;; esac
+   # x86-only tests: intrinsics headers, SSE/AVX flags, x86 inline asm.
+   if grep -qE '(immintrin|emmintrin|xmmintrin|pmmintrin|smmintrin|tmmintrin|wmmintrin|nmmintrin)\.h' "$src" \
+      || echo "$extra_flags" | grep -qE '(-m(sse|avx|pclmul|fma|gfni|vaes))' \
 -- 
 2.47.3
 
 
-From 542bce2284cc73109d914f8dd425db05a5444752 Mon Sep 17 00:00:00 2001
+From ba8f21a8d3f75865b4ca0fdec3960284e867d653 Mon Sep 17 00:00:00 2001
 From: Arena Agent <agent@arena.ai>
-Date: Sat, 15 Aug 2026 21:54:04 +0000
-Subject: [PATCH 05/11] adopt AArch64 fused FP compare-and-branch from
- levkropp, hardened
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+Date: Sat, 15 Aug 2026 23:06:07 +0000
+Subject: [PATCH 2/3] regalloc: GP phi coalescing back to first-pair-per-dest
+ (sieve +52% fix)
 
-Backport of fef5e2d1: FP comparisons feeding a CondBranch materialized a
-cset boolean and branched on it (fcmp; cset; mov; cbz = 4 insns per FP
-branch in mandelbrot's escape test). detect_cmp_branch_fusion now (a)
-accepts float compares on backends whose emit_fused_cmp_branch handles
-them (new supports_fused_fp_cmp_branch hook, AArch64-only), (b) also
-fuses across a dead phi-web Copy between the Cmp and the branch, with
-strict use-count proofs for both shapes (Copy dead + cmp_uses==2, or
-Copy single-use + cmp_uses==1).
+PERF REGRESSION found by the new before/after benchmark matrix, present
+since the multi-pair backport (94141751): detect_phi_coalesce_groups now
+returns ALL loop-block copy pairs per phi dest, and the GP path removed
+EVERY backedge source from the eligible set. All sources then competed
+for the single dest register; the losers got no register at all and
+their loop-carried updates round-tripped through stack slots. sieve's
+marking loop went 0.209s -> 0.318s (+52%); the asm shows the inner
+j+=i update spilling to 8(%rsp) per iteration.
 
-TWO DIVERGENCES from Lev's version:
-1. BUG IN HIS VERSION FIXED: he gates FP fusion on ty.is_float() alone.
-   long double lowers to soft-float libcalls on AArch64; routing F128
-   through a d-register fcmp reads half the value — his tip MISCOMPILES
-   glibc_ld_builtins (sqrtl(9.0L)==3.0L fails). Fusion is restricted to
-   hardware F32/F64.
-2. Program-point alignment: our skip paths bump current_program_point
-   for both the fused Cmp AND the skipped dead Copy (liveness numbers
-   every IR instruction; his version silently desynced the point).
+FIX: the GP consumer takes only the FIRST pair per dest (restores the
+pre-multi-pair allocation exactly), while the consumers that genuinely
+exploit multiple pairs keep them: the ARM FP coalesce pass reads
+all_phi_pairs with its own per-pair interval conflict check, and slot
+coalescing runs its own detection guarded by claimed_dests.
 
-The ARM emitter's fcmp cond-code map (mi/ls for lt/le) is byte-identical
-to emit_float_cmp_impl's cset map, so NaN-unordered semantics are
-preserved exactly.
-
-PROOF:
-- mandelbrot kernel: cset 4 -> 1, qemu output 15477 == native gcc -O2.
-- NaN matrix test (14 compares incl. n==n, n!=n): 10277 == gcc.
-- glibc_ld_builtins passes (fails on lev/main tip).
-- x86 asm BIT-IDENTICAL (hook returns false); 162/162 x86 regression,
-  653 lib tests, ARM differential at baseline 91.
+PROOF: sieve 0.318s -> 0.196s (better than the 0.209s pre-backport
+baseline); 653 lib, 163/163 x86 regression, ARM harness unchanged,
+240/240 differential fuzz, ARM FP accumulator kernel still prints
+2.000000 == gcc (multi-pair FP path intact).
 ---
- .../tmp/armg_pgo_branchy-pgo_branchy.gcda     | Bin 488 -> 488 bytes
- .../armg_pgo_split_label-pgo_split_label.gcda | Bin 320 -> 320 bytes
- .../tmp/armg_switch_table-switch_table.gcda   | Bin 384 -> 384 bytes
- .../armg_value_profiling-value_profiling.gcda | Bin 576 -> 576 bytes
- src/backend/arm/codegen/comparison.rs         |  28 +++++
- src/backend/arm/codegen/emit.rs               |   1 +
- src/backend/generation.rs                     | 100 +++++++++++++-----
- src/backend/traits.rs                         |   7 ++
- 8 files changed, 109 insertions(+), 27 deletions(-)
+ src/backend/regalloc.rs | 23 ++++++++++++++++++-----
+ 1 file changed, 18 insertions(+), 5 deletions(-)
 
-diff --git a/@PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda b/@PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda
-index c3ed5bc183f778c126b7c29a49bbbbfd4320e432..a1fd85bd58b7e17ab1a7179480796105ead4f22b 100644
-GIT binary patch
-literal 488
-zcmYdHNlw=?GI8RaoW;I;b^Rg+28M+kK!Od38Rn~iNJbtY@w%vhZS#V@W6Nx3hys-`
-z-T;anxWWjMXK3&j0@D#pV2Z)VN&w9GW(nc%V};NMAQZy~Pl!TtX%DD5egtTkI&>PU
-z4dO=_2S|hc4Cb$A1cd>_cVGc<7^KI3s7v$-N#D_IumltaAT`i10x}?an8C`y1X$0M
-pn{1wo<1Q3V<On<t(vtv`A{0IrUXbvyBS6E{q0=z8K%)cf7y$Z9ILrV5
-
-literal 488
-zcmYdHNlw=?GI8?wmdL(*b^Rg+28M+kK!O>F8~lZUBm*N4ka%5Gz_xio-?3%3Gem((
-z7;gZ@5?+C%85j<zbAo9dMli*oCJQowf#J6dgnyq2LMK2dh94>rh2+vIP;=A?&@grA
-zG*lbdk1#ff2KgBR)-!^90QC+?2pk6Ku^;LZeL~WAG#e}dg#kznG>m{Oh#rI)5Is|F
-qvUx6!yHGfhBk(v#PXbUSq41GWh1e`lfQG3<r(te^20PG31_l6S`ZK8j
-
-diff --git a/@PROFDIR@/tmp/armg_pgo_split_label-pgo_split_label.gcda b/@PROFDIR@/tmp/armg_pgo_split_label-pgo_split_label.gcda
-index 328933f2247dec809ccf0c40278977f39881f66f..86a750c26a2fd8e519086e4a01a475c809dfe6f2 100644
-GIT binary patch
-literal 320
-zcmYdHNlw=?GI5fhp2Z&6JnIt!1H(cNAi)O20d7Eofq{_+NW3m8VB2tQ?G|wh={rCr
-zj1fRFs62xgL>&W29Wu~RhVWoCOdU)O$PQ$H;IC%{xq%TO33fvWOOSS<-`CdUf+zDp
-yZcqTq!}P%HfYAuMAZ9V6nN`-iA@TbqpBm#k=MJNr1@ngs)L#g#5VM#N0t^5<Y9iGD
-
-literal 320
-zcmYdHNlw=?GI8qrmB=30JnIt!1H(cNAi)g88p=R|fq{_+NW3m8VB2tQ?G|wh={rCr
-zj1fRFs62xzL>&VgNHr3eA_(EYXqY;f5|ACp0Ks3+2yz1>LK5tT5SAeALcg!A$pug5
-zf!v?~l!xho*#V;wc0tU7sRL>On^o4kA@TbqpBm#k=MJNr1@niJGEg-NfSAREBnAM)
-CQzJM4
-
-diff --git a/@PROFDIR@/tmp/armg_switch_table-switch_table.gcda b/@PROFDIR@/tmp/armg_switch_table-switch_table.gcda
-index ad500b1098517fe199e0bb2a7ab0513ac6b89e71..b67a8305f34cbfcfc2d2eb3f2d396fcef72c7f99 100644
-GIT binary patch
-literal 384
-zcmYdHNlw=?GI4spEQ`G__<0Hg1H(cNAi)O23}$(ZK$4LMNW3m8VC&tyVEc(PwLmos
-z8Fzr>@8*I?m^y|7>YQNigUKvln(q7tPLO-y0PF`i59%i{e?23}k4TEaemwAcp^K*f
-t=TqIw3)h4ED1b*VGeQom_fSn&(f{+@(~<SU{O`b*3bhJiFB3v90{{wnIurl^
-
-literal 384
-zcmYdHNlw=?GI9FHmBii`{5*w$fngyBkYEO42I=h}l92~Uye=wW>)pIy`-wBPKs5^)
-zcL2p2-kE{qVd@wjOlARdKX@{MX?pV$4zz&ng%Mysz&Jn}!C%h^@*^Wc4(!JRuNS&#
-w`hPyvy}WQe$d3XDc?`V>vmoJfsHUsv|9S4|$a-P^S7_e^H3?!bBy=D`0L`mD1poj5
-
-diff --git a/@PROFDIR@/tmp/armg_value_profiling-value_profiling.gcda b/@PROFDIR@/tmp/armg_value_profiling-value_profiling.gcda
-index 599b8ea12f45be2d4ee2c77522480e33c52100dd..f95305ee493b08dfdf72089c8b71c8caf20c4889 100644
-GIT binary patch
-literal 576
-zcmYdHNlw=?GI26poyA^aA+OKCz_5@5NU#BM!%Ai#$-u}1BwiO4u-!8_`nlk&$$Ov@
-z#tNVqNDT<!q7z=B%ER~&QG`Ai-=Gx6Le&Qoh1tWvu#(XMC<rr;5vt(TVPUWdFmV`-
-zOP+yYJtN4kFnJIY<k!=e487i-Ie1L$<f}%IUp0VYLO=`xFf(B^%*`-)klPG^>OOcf
-zfz?Au1_qeh4qSoQ_MGKhBuD{FKg=yK^*|}GTR`ffj&}Us(QL2;<Q9;7VRnP;0+|8R
-z%L3tmNU&azoo_Ntzar~}#wkz<s$OtRL-d37p78o;zr-i;F--4||Ns9Z>w)kY7y!vh
-BR~-NV
-
-literal 576
-zcmYdHNlw=?GI8?dPhu~zkk@BmU|7fjB$$Etz!gRy$-u}1BwiO4u-!8_`nlk&$$Ov@
-z#tNVqNDT<!q76z><zak?C_*2MKf?;fLe&Qoh1tWvu#(XMC<rqT>`Ea2)nQ?<jWBT-
-zjZ2<^VLc<ruP}KK6Xe&^mkhn$o;i3-?BuIPkY6=`Vw^w>0x&aSG|bH~d63%-fa-pz
-zKul!<>q59K;T1&SIm@|75DTUs<`$TGpcL3GAazkkJAUtIHdq333&_1NyFqq=%z)`-
-zfp9=1ST86%-ej77Mb-<AQ=k%5y@;@d=sn@}(SC_f;$xWJAOHXVN7e)3GcW)E-K<fE
-
-diff --git a/src/backend/arm/codegen/comparison.rs b/src/backend/arm/codegen/comparison.rs
-index c0845678..80d49ef9 100644
---- a/src/backend/arm/codegen/comparison.rs
-+++ b/src/backend/arm/codegen/comparison.rs
-@@ -47,6 +47,34 @@ impl ArmCodegen {
-         true_label: &str,
-         false_label: &str,
-     ) {
-+        if ty.is_float() {
-+            // fcmp + conditional branch — no cset boolean materialization.
-+            // Condition codes match emit_float_cmp_impl exactly (mi/ls for
-+            // less-than shapes so unordered compares stay false), so branching
-+            // on flags is identical to branching on the materialized boolean.
-+            let (l, r) = if ty == IrType::F32 {
-+                (self.float_operand_reg(lhs, ty, "s0"), self.float_operand_reg(rhs, ty, "s1"))
-+            } else {
-+                (self.float_operand_reg(lhs, ty, "d0"), self.float_operand_reg(rhs, ty, "d1"))
-+            };
-+            self.state.emit_fmt(format_args!("    fcmp {}, {}", l, r));
-+            let cond = match op {
-+                IrCmpOp::Eq => "eq",
-+                IrCmpOp::Ne => "ne",
-+                IrCmpOp::Slt | IrCmpOp::Ult => "mi",
-+                IrCmpOp::Sle | IrCmpOp::Ule => "ls",
-+                IrCmpOp::Sgt | IrCmpOp::Ugt => "gt",
-+                IrCmpOp::Sge | IrCmpOp::Uge => "ge",
-+            };
-+            let inv_cc = arm_invert_cond_code(cond);
-+            let skip = self.state.fresh_label("skip");
-+            self.state.emit_fmt(format_args!("    b.{} {}", inv_cc, skip));
-+            self.state.emit_fmt(format_args!("    b {}", true_label));
-+            self.state.emit_fmt(format_args!("{}:", skip));
-+            self.state.emit_fmt(format_args!("    b {}", false_label));
-+            self.state.reg_cache.invalidate_all();
-+            return;
+diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
+index 23ca56f6..2d09647d 100644
+--- a/src/backend/regalloc.rs
++++ b/src/backend/regalloc.rs
+@@ -499,11 +499,24 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+     // allocated independently. After allocation, it inherits the phi dest's
+     // register assignment.
+     let all_phi_pairs = detect_phi_coalesce_groups(func, &liveness);
+-    let mut phi_coalesce = if std::env::var("CCC_NO_PHI_COALESCE").is_ok() {
+-        Vec::new()
+-    } else {
+-        all_phi_pairs.clone()
+-    };
++    // GP register coalescing takes only the FIRST pair per phi dest. The
++    // detector may return several (loop-entry copy + true backedge copy, or
++    // multiple latches); removing EVERY backedge source from `eligible` makes
++    // them all compete for the single dest register — the losers end up with
++    // no register at all and their loop-carried update round-trips through a
++    // stack slot (sieve marking loop: 0.21s -> 0.32s, +52%). The multi-pair
++    // consumers that actually profit from ALL pairs — the ARM FP coalesce
++    // pass below and the slot-alias coalescing in stack_layout — read
++    // `all_phi_pairs` / run their own detection and are unaffected.
++    let mut phi_coalesce: Vec<PhiCoalesceCandidate> = Vec::new();
++    if std::env::var("CCC_NO_PHI_COALESCE").is_err() {
++        let mut seen_dest: FxHashSet<u32> = FxHashSet::default();
++        for cand in &all_phi_pairs {
++            if seen_dest.insert(cand.phi_dest) {
++                phi_coalesce.push(*cand);
++            }
 +        }
-         self.emit_int_cmp_insn(lhs, rhs, ty);
-         let cc = arm_int_cond_code(op);
-         let inv_cc = arm_invert_cond_code(cc);
-diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
-index 2eb57a7a..22f6f215 100644
---- a/src/backend/arm/codegen/emit.rs
-+++ b/src/backend/arm/codegen/emit.rs
-@@ -1823,6 +1823,7 @@ impl ArchCodegen for ArmCodegen {
-     fn supports_fused_float_mul_add(&self) -> bool { true }
-     fn supports_shifted_logical(&self) -> bool { true }
-     fn supports_indexed_addr(&self) -> bool { true }
-+    fn supports_fused_fp_cmp_branch(&self) -> bool { true }
-     fn emit_load_indexed(&mut self, dest: &Value, base: &Value, index: &Value, shift: u8, ty: IrType) -> bool {
-         self.emit_load_indexed_impl(dest, base, index, shift, ty)
-     }
++    }
+     for candidate in &phi_coalesce {
+         // Remove the backedge source from independent allocation. If the
+         // candidate survives final conflict checks it inherits the phi
+-- 
+2.47.3
+
+
+From 6744032df2e338bfc4b85d7abba28d3c1fdb98b6 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Sat, 15 Aug 2026 23:26:08 +0000
+Subject: [PATCH 3/3] fix ARM small-memcpy deletion + adopt hardened
+ store_load_forward pass
+
+TWO changes, found and validated together because the new pass's C-level
+regression test flushed out the first:
+
+1. MISCOMPILE FIX (pre-existing, ALL AArch64 builds): generate_instruction
+   inlines fixed-size memcpy/__memcpy_chk calls <= 32 bytes by dispatching
+   emit_inline_memcpy_call - whose TRAIT DEFAULT IS AN EMPTY BODY. x86
+   overrides it; ARM does not, so on AArch64 a 16-byte struct memcpy
+   emitted ZERO instructions and the destination silently kept its old
+   bytes. Reproducer: struct P s={7,8}, t={100,200}; memcpy(&s,&t,16);
+   s.a+s.b == 15 instead of 300, on the PRE-backport build too. Gated the
+   inline path on supports_inline_memcpy_call(); ARM falls back to the
+   real call ('bl memcpy' now present). Heals 6 ARM differential tests
+   (88 -> 94 passed).
+
+2. store_load_forward adopted from levkropp 0980060d - as a HARDENED
+   REWRITE, not a copy. His transfer function was fail-open: Intrinsic
+   (writes through dest_ptr!), AtomicInc, VaArg, StackRestore, DynAlloca
+   all left the store map alive; volatile allocas were tracked; escaped
+   addresses (stored to memory) stayed forwardable; seg_override was
+   ignored; and analysis/rewrite were two hand-kept copies that could
+   drift. Ours: default-closed transfer function (only Store/Load/Memcpy
+   with tracked pointers keep the map; everything else clears it),
+   volatile/semantic_volatile allocas never tracked, escape analysis
+   drops roots referenced outside modeled shapes (incl. variable-offset
+   GEPs), one shared transfer function, 10 unit tests covering each
+   guard (intrinsic kill, escape, join disagreement, overlap kill, size
+   mismatch, variable GEP escape...), plus C-level regression
+   store_load_forward.c (6 adversarial shapes + profitable case).
+
+PROOF: struct-scalarization kernel drops 21 -> 15 stack refs with the
+pass on, checksum identical to gcc; 663 lib tests (+10), 164/164 x86
+regression (+1), ARM 94 passed / 30 failed (was 88/36), 50/50
+correctness, 3/3 intrinsics, 300/300 differential fuzz (seeds 0:150).
+CCC_NO_SL_FORWARD / CCC_DISABLE_PASSES=slforward escape hatches.
+---
+ src/backend/generation.rs             |  27 +-
+ src/passes/mod.rs                     |  11 +
+ src/passes/store_load_forward.rs      | 591 ++++++++++++++++++++++++++
+ tests/regression/store_load_forward.c |  70 +++
+ 4 files changed, 689 insertions(+), 10 deletions(-)
+ create mode 100644 src/passes/store_load_forward.rs
+ create mode 100644 tests/regression/store_load_forward.c
+
 diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index b409fdba..f87b9471 100644
+index f87b9471..2593647f 100644
 --- a/src/backend/generation.rs
 +++ b/src/backend/generation.rs
-@@ -799,7 +799,11 @@ fn count_value_uses(func: &IrFunction) -> Vec<u32> {
- /// Detect if a block's last instruction is a Cmp whose result is only used
- /// by the block's CondBranch terminator. Returns the index of the Cmp if
- /// fusion is possible, None otherwise.
--fn detect_cmp_branch_fusion(block: &BasicBlock, use_counts: &[u32]) -> Option<usize> {
-+fn detect_cmp_branch_fusion(
-+    block: &BasicBlock,
-+    use_counts: &[u32],
-+    fuse_fp: bool,
-+) -> Option<(usize, Option<usize>)> {
-     // Terminator must be a CondBranch
-     let (cond, _, _) = match &block.terminator {
-         Terminator::CondBranch {
-@@ -816,42 +820,77 @@ fn detect_cmp_branch_fusion(block: &BasicBlock, use_counts: &[u32]) -> Option<us
-         _ => return None,
-     };
- 
--    // Find the last instruction that is a Cmp producing this value
--    let last_idx = block.instructions.len().checked_sub(1)?;
--    let last_inst = &block.instructions[last_idx];
-+    // Locate the Cmp feeding the branch, plus an optional dead trailing Copy
-+    // to skip (common after phi-web lowering: Cmp ; Copy ; CondBranch).
-+    let n = block.instructions.len();
-+    if n == 0 {
-+        return None;
-+    }
-+    let (cmp_idx, dead_copy_idx) = match &block.instructions[n - 1] {
-+        // Common case: the Cmp is the last instruction.
-+        Instruction::Cmp { dest, .. } if dest.0 == cond_val.0 => (n - 1, None),
-+        _ if n >= 2 => {
-+            let (cmp_dest, copy_idx) = match &block.instructions[n - 2] {
-+                Instruction::Cmp { dest, .. } => (dest.0, n - 1),
-+                _ => return None,
-+            };
-+            let Instruction::Copy { dest: cd, src: Operand::Value(cs) } = &block.instructions[copy_idx]
-+            else {
-+                return None;
-+            };
-+            if cs.0 != cmp_dest {
-+                return None;
-+            }
-+            let cmp_uses = use_counts.get(cmp_dest as usize).copied().unwrap_or(u32::MAX);
-+            if cond_val.0 == cmp_dest {
-+                // Branch reads the Cmp directly; the Copy must be dead.
-+                if use_counts.get(cd.0 as usize).copied().unwrap_or(0) != 0 || cmp_uses != 2 {
-+                    return None;
-+                }
-+            } else if cond_val.0 == cd.0 {
-+                // Branch reads the Copy; the Cmp must feed only the Copy, and
-+                // the Copy only the branch.
-+                if use_counts.get(cd.0 as usize).copied().unwrap_or(u32::MAX) != 1 || cmp_uses != 1 {
-+                    return None;
-+                }
-+            } else {
-+                return None;
-+            }
-+            (n - 2, Some(copy_idx))
-+        }
-+        _ => return None,
-+    };
- 
--    let (dest, _op, _lhs, _rhs, ty) = match last_inst {
--        Instruction::Cmp {
--            dest,
--            op,
--            lhs,
--            rhs,
--            ty,
--        } => (dest, op, lhs, rhs, ty),
-+    let ty = match &block.instructions[cmp_idx] {
-+        Instruction::Cmp { ty, .. } => ty,
-         _ => return None,
-     };
- 
--    // The Cmp dest must be the same as the CondBranch cond
--    if dest.0 != cond_val.0 {
-+    // Don't fuse wide-int comparisons (they have special codegen paths).
-+    // FP comparisons only on backends with a fused FP compare-and-branch
-+    // (AArch64: fcmp + b.cc with cond codes identical to the cset path,
-+    // so NaN semantics are preserved bit-for-bit) — and ONLY for the
-+    // hardware types F32/F64. F128/long-double lowers to soft-float
-+    // libcalls (__lttf2 ...); routing it through a d-register fcmp reads
-+    // half the value (glibc_ld_builtins: sqrtl(9.0L)==3.0L failed).
-+    if is_wide_int_type(*ty) {
-         return None;
-     }
--
--    // Don't fuse wide-int or float comparisons (they have special codegen paths).
--    // On 32-bit targets, also exclude I64/U64: the fused compare-and-branch
--    // uses 32-bit cmpl which only tests the low half of a 64-bit value.
--    if is_wide_int_type(*ty) || ty.is_float() {
-+    if ty.is_float() && !(fuse_fp && matches!(ty, IrType::F32 | IrType::F64)) {
-         return None;
-     }
-     if crate::common::types::target_is_32bit() && matches!(ty, IrType::I64 | IrType::U64) {
-         return None;
-     }
- 
--    // The Cmp result must be used exactly once (by the CondBranch terminator)
--    if (cond_val.0 as usize) < use_counts.len() && use_counts[cond_val.0 as usize] == 1 {
--        Some(last_idx)
--    } else {
--        None
-+    // For the simple case the Cmp result must be used exactly once (by the
-+    // CondBranch terminator). The dead-Copy shapes carry their own counts above.
-+    if dead_copy_idx.is_none()
-+        && !((cond_val.0 as usize) < use_counts.len() && use_counts[cond_val.0 as usize] == 1)
-+    {
-+        return None;
-     }
-+    Some((cmp_idx, dead_copy_idx))
- }
- 
- /// Detect multiply-add fusion opportunities within a block.
-@@ -1642,7 +1681,8 @@ fn generate_function(
-         // If the last instruction is a Cmp whose result is only used by the
-         // CondBranch terminator, emit a fused compare-and-conditional-jump
-         // instead of materializing the boolean result to a register/stack slot.
--        let fuse_idx = detect_cmp_branch_fusion(block, &value_use_counts);
-+        let fuse_idx =
-+            detect_cmp_branch_fusion(block, &value_use_counts, cg.supports_fused_fp_cmp_branch());
-         let mul_add_fusions = detect_mul_add_fusions(block, &value_use_counts, cg.supports_fused_float_mul_add());
-         let shifted_logical_fusions = if cg.supports_shifted_logical() {
-             detect_shifted_logical_fusions(block, &value_use_counts)
-@@ -1677,7 +1717,7 @@ fn generate_function(
-         }
- 
-         for (idx, inst) in block.instructions.iter().enumerate() {
--            if Some(idx) == fuse_idx {
-+            if Some(idx) == fuse_idx.map(|f| f.0) {
-                 // The Cmp is emitted together with the terminator, but liveness
-                 // numbers every IR instruction.  Keep codegen's program point
-                 // aligned so any opt-in call-spanning save/restore decision is
-@@ -1685,6 +1725,12 @@ fn generate_function(
-                 cg.state().current_program_point += 1;
-                 continue;
-             }
-+            if fuse_idx.and_then(|f| f.1) == Some(idx) {
-+                // Dead Copy between the Cmp and the fused branch: nothing is
-+                // emitted, but liveness numbered it — keep the point aligned.
-+                cg.state().current_program_point += 1;
-+                continue;
-+            }
-             // Skip the Add that was already emitted as part of a fused Mul-Add.
-             // This flag is set by the Mul handler below when fusion fires.
-             if skip_fused_add {
-@@ -1819,7 +1865,7 @@ fn generate_function(
-         cg.flush_vecreg_liveout();
- 
-         cg.state().next_block_label = func.blocks.get(block_idx + 1).map(|b| b.label);
--        if let Some(fi) = fuse_idx {
-+        if let Some((fi, _)) = fuse_idx {
-             // Emit fused compare-and-branch: cmp + jCC directly
-             if let Instruction::Cmp {
-                 dest: _,
-diff --git a/src/backend/traits.rs b/src/backend/traits.rs
-index 37e1c794..4804a928 100644
---- a/src/backend/traits.rs
-+++ b/src/backend/traits.rs
-@@ -298,6 +298,13 @@ pub trait ArchCodegen {
-         false
-     }
- 
-+    /// Whether `emit_fused_cmp_branch_blocks` handles floating-point compares
-+    /// (AArch64: fcmp + b.cc without materializing a cset boolean). Default
-+    /// false; x86 keeps its dedicated FP compare paths.
-+    fn supports_fused_fp_cmp_branch(&self) -> bool {
-+        false
-+    }
-+
-     /// Emit a load using indexed addressing: dest = [base + (index << shift)].
-     /// Returns false if it cannot be emitted (caller falls back to unfolding).
-     fn emit_load_indexed(&mut self, _dest: &Value, _base: &Value, _index: &Value, _shift: u8, _ty: IrType) -> bool {
--- 
-2.47.3
-
-
-From c328119b6ceba77f69fafefcea2d95006c673d48 Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sat, 15 Aug 2026 22:02:07 +0000
-Subject: [PATCH 06/11] adopt multi-pair phi coalescing + FP no-op copy elision
- from levkropp
-
-Backport of 94141751 in three coordinated parts:
-
-1. detect_phi_coalesce_groups returns ALL loop-block Copy pairs per phi
-   dest instead of only the first found. The first-found rule meant a
-   loop-entry copy (acc <- init) shadowed the true backedge copy
-   (acc <- updated), so the accumulator update kept a register-to-
-   register shuffle in the loop body. Soundness shifts to the consumers,
-   which all carry per-pair proofs: register propagation revalidates the
-   same-block def/copy window and rejects interval conflicts (later
-   pairs see earlier pairs' assignments in the shared map and fail
-   closed); the ARM FP-coalesce pass has its own conflict check.
-
-2. copy_coalescing: one NEW slot alias per phi dest (claimed_dests set).
-   Slot aliasing has no per-source interval conflict check, so two
-   backedge sources sharing one dest slot could observe each other's
-   writes - this claim set is the multi-pair enabler for the slot path.
-
-3. ARM emit: promoted-F64 copies where FP phi coalescing assigned src
-   and dest registers skip the d0 round-trip (fmov d0, dN; fmov dN, d0
-   becomes nothing when same reg, one direct fmov otherwise).
-
-PROOF: x86 asm verified BIT-IDENTICAL on phi-heavy tests
-(loop_alloca_scalar, reduction_two_sums); 240/240 differential fuzz vs
-gcc; 653 lib, 162/162 x86 regression, 50/50 correctness, 3/3
-intrinsics; ARM differential at baseline 91; conditional FP accumulator
-loop prints 2.000000 == native gcc -O2 under qemu.
----
- @PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda | Bin 488 -> 488 bytes
- .../armg_pgo_split_label-pgo_split_label.gcda   | Bin 320 -> 320 bytes
- .../tmp/armg_switch_table-switch_table.gcda     | Bin 384 -> 384 bytes
- .../armg_value_profiling-value_profiling.gcda   | Bin 576 -> 576 bytes
- src/backend/arm/codegen/emit.rs                 |  14 ++++++++++++++
- src/backend/regalloc.rs                         |  16 ++++++++++------
- src/backend/stack_layout/copy_coalescing.rs     |   7 +++++++
- 7 files changed, 31 insertions(+), 6 deletions(-)
-
-diff --git a/@PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda b/@PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda
-index a1fd85bd58b7e17ab1a7179480796105ead4f22b..bad596242590475fa5ec63f8fce46ad7389f591b 100644
-GIT binary patch
-literal 488
-zcmYdHNlw=?GI7$IR=~b|b^Rg+28M+kK!P2J8+K{|Nd`t9Ao04WfNk@FzGKU5XNUro
-zFx~))Jy2o-$uk^?0SW=Z9tf9V-8&&Lf4(!AV%W?Ep&vjfh8e3N3dyBIpyosqpkeCJ
-zX{a`^A7N||4e~PttY-v;0V9kH4TJR94|Rz?A?Z7s4VHky0Hg*QMnD!s4>OvcDL2_X
-m7sp*FoX8P)9Hb`!C{HMS-ay0WGXWZ=4xNU%1sWY-7Xbi=%td|x
-
-literal 488
-zcmYdHNlw=?GI8RaoW;I;b^Rg+28M+kK!Od38Rn~iNJbtY@w%vhZS#V@W6Nx3hys-`
-z-T;anxWWjMXK3&j0@D#pV2Z)VN&w9GW(nc%V};NMAQZy~Pl!TtX%DD5egtTkI&>PU
-z4dO=_2S|hc4Cb$A1cd>_cVGc<7^KI3s7v$-N#D_IumltaAT`i10x}?an8C`y1X$0M
-pn{1wo<1Q3V<On<t(vtv`A{0IrUXbvyBS6E{q0=z8K%)cf7y$Z9ILrV5
-
-diff --git a/@PROFDIR@/tmp/armg_pgo_split_label-pgo_split_label.gcda b/@PROFDIR@/tmp/armg_pgo_split_label-pgo_split_label.gcda
-index 86a750c26a2fd8e519086e4a01a475c809dfe6f2..7bbb074e2a40371916a8daf0949334c4ed7c367a 100644
-GIT binary patch
-literal 320
-zcmYdHNlw=?GI0u@RlpwDJnIt!1H(cNAi)mA96>;Wfq{_+NW3m8VB2tQ?G|wh={rCr
-zj1fRFs5}EBL>&VkNHr2*(S&edG)x^#3CIp)fZ(rZ1i66`AqjRv2uqN5q2Jfm<bo&j
-zKyFX~%ER=)?10e-yC7yUqnTCKyCL!WC7&AOJLe9gn+5a7uRw$*2n%8s6Ou3hQgtFZ
-
-literal 320
-zcmYdHNlw=?GI5fhp2Z&6JnIt!1H(cNAi)O20d7Eofq{_+NW3m8VB2tQ?G|wh={rCr
-zj1fRFs62xgL>&W29Wu~RhVWoCOdU)O$PQ$H;IC%{xq%TO33fvWOOSS<-`CdUf+zDp
-yZcqTq!}P%HfYAuMAZ9V6nN`-iA@TbqpBm#k=MJNr1@ngs)L#g#5VM#N0t^5<Y9iGD
-
-diff --git a/@PROFDIR@/tmp/armg_switch_table-switch_table.gcda b/@PROFDIR@/tmp/armg_switch_table-switch_table.gcda
-index b67a8305f34cbfcfc2d2eb3f2d396fcef72c7f99..24bcadb5dcd43bacef30f8a859c0c10faa4c44ea 100644
-GIT binary patch
-literal 384
-zcmYdHNlw=?GI9F5s(`&O_<0Hg1H(cNAi)mA4EC!Tfg~djka%5Gz}CBY!S)kpYJqAN
-zGVTD1HRv<|Ng#lzV@O!X1?C!rvw~@Q^B){A1-Tavz<z-9pnd}L*E53rh@=?o#{;hy
-xx@h`;KGnUva6QP60(kT?Bjmt(57l%P{Xfq=9a%5T{|hE8fLaBymkFVl0RVq)Hdg=u
-
-literal 384
-zcmYdHNlw=?GI4spEQ`G__<0Hg1H(cNAi)O23}$(ZK$4LMNW3m8VC&tyVEc(PwLmos
-z8Fzr>@8*I?m^y|7>YQNigUKvln(q7tPLO-y0PF`i59%i{e?23}k4TEaemwAcp^K*f
-t=TqIw3)h4ED1b*VGeQom_fSn&(f{+@(~<SU{O`b*3bhJiFB3v90{{wnIurl^
-
-diff --git a/@PROFDIR@/tmp/armg_value_profiling-value_profiling.gcda b/@PROFDIR@/tmp/armg_value_profiling-value_profiling.gcda
-index f95305ee493b08dfdf72089c8b71c8caf20c4889..63115211c651cf64dd440727a3576d4096d20cd3 100644
-GIT binary patch
-literal 576
-zcmYdHNlw=?GI6qAU%*~sA+OKCz_5@5NU#I(0aq3v$-u}1BwiO4u-!8_`nlk&$$Ov@
-z#tNVqNDT<!q6-8WQRHEKupp8?7=K3xj0K@#=E6h~{FRIjKtY&!5L*}+UL6)L1*wIJ
-z!)RRc3=HcTL4JkFgP0({p1x%0_4drcV`3*?HG=%A0TdGjVi16t38P_dhRHK9tYkC*
-zs++Nz39KGMBHZ>s2_o{G<y<640Zc#4Eim;!DX?2W>Y|Qz{NB-Qumt25kb7ZvgX{vC
-z0n-bPEr<YEFDN|TWSV|O)(eeOpej_o%n*Gb60G-x*GKy$K8cTEdVl=?{~uWogwMbL
-E00W3oH~;_u
-
-literal 576
-zcmYdHNlw=?GI26poyA^aA+OKCz_5@5NU#BM!%Ai#$-u}1BwiO4u-!8_`nlk&$$Ov@
-z#tNVqNDT<!q7z=B%ER~&QG`Ai-=Gx6Le&Qoh1tWvu#(XMC<rr;5vt(TVPUWdFmV`-
-zOP+yYJtN4kFnJIY<k!=e487i-Ie1L$<f}%IUp0VYLO=`xFf(B^%*`-)klPG^>OOcf
-zfz?Au1_qeh4qSoQ_MGKhBuD{FKg=yK^*|}GTR`ffj&}Us(QL2;<Q9;7VRnP;0+|8R
-z%L3tmNU&azoo_Ntzar~}#wkz<s$OtRL-d37p78o;zr-i;F--4||Ns9Z>w)kY7y!vh
-BR~-NV
-
-diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
-index 22f6f215..e330eb92 100644
---- a/src/backend/arm/codegen/emit.rs
-+++ b/src/backend/arm/codegen/emit.rs
-@@ -2003,6 +2003,20 @@ impl ArchCodegen for ArmCodegen {
-         let is_promoted = self.loop_promoted_f64_values.iter().any(|v| v.0 == dest.0)
-             || src_value.is_some_and(|src| self.loop_promoted_f64_values.iter().any(|v| v.0 == src.0));
-         if is_promoted {
-+            // When FP phi coalescing gave src and dest the same register the
-+            // copy is a no-op — skip the d0 round-trip (fmov d0, dN; fmov dN, d0).
-+            let dest_fp = self.get_phys_reg_for_value(dest.0).filter(|r| is_arm_fp_phys(*r));
-+            let src_fp = src_value
-+                .and_then(|v| self.get_phys_reg_for_value(v.0))
-+                .filter(|r| is_arm_fp_phys(*r));
-+            if let (Some(d), Some(s)) = (dest_fp, src_fp) {
-+                if d != s {
-+                    self.state.emit_fmt(format_args!(
-+                        "    fmov {}, {}", arm_fp_name(d, IrType::F64), arm_fp_name(s, IrType::F64)));
-+                    self.state.reg_cache.invalidate_acc();
-+                }
-+                return;
-+            }
-             self.float_operand_to_reg(src, IrType::F64, "d0");
-             self.store_float_reg(dest, IrType::F64, "d0");
-             self.state.reg_cache.invalidate_acc();
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index 7a788cef..09922dc6 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -2260,7 +2260,15 @@ pub(crate) fn detect_phi_coalesce_groups(
- 
-     let debug = std::env::var("CCC_DEBUG_PHI_COALESCE").is_ok();
-     let mut candidates = Vec::new();
--    let mut seen_phi_dests: FxHashSet<u32> = FxHashSet::default();
-+    // A phi dest may have several loop-block copies (loop-entry initialization
-+    // plus the true backedge update, or multiple latches via `continue`). ALL
-+    // pairs are returned: keeping only the first found meant an entry copy
-+    // shadowed the true backedge copy, so the accumulator update kept a
-+    // register shuffle in the loop. Safety relies on the consumers' own
-+    // proofs: the same-block window revalidation + interval conflict check in
-+    // register propagation (later pairs see earlier pairs' assignments and
-+    // fail closed), and the one-NEW-alias-per-dest claim set in slot
-+    // coalescing (claimed_dests).
- 
-     for (block_idx, block) in func.blocks.iter().enumerate() {
-         if liveness
-@@ -2281,10 +2289,7 @@ pub(crate) fn detect_phi_coalesce_groups(
-             else {
-                 continue;
-             };
--            if !multi_def.contains(&dest.0)
--                || seen_phi_dests.contains(&dest.0)
--                || multi_def.contains(&src.0)
--            {
-+            if !multi_def.contains(&dest.0) || multi_def.contains(&src.0) {
-                 continue;
-             }
- 
-@@ -2343,7 +2348,6 @@ pub(crate) fn detect_phi_coalesce_groups(
-                 source_def_idx,
-                 copy_idx,
-             });
--            seen_phi_dests.insert(dest.0);
-         }
-     }
- 
-diff --git a/src/backend/stack_layout/copy_coalescing.rs b/src/backend/stack_layout/copy_coalescing.rs
-index 82ef9656..0de4be9e 100644
---- a/src/backend/stack_layout/copy_coalescing.rs
-+++ b/src/backend/stack_layout/copy_coalescing.rs
-@@ -827,6 +827,10 @@ pub(super) fn build_copy_alias_map(
-             }
-             let already_aliased: FxHashSet<u32> =
-                 raw_aliases.iter().map(|&(a, _)| a).collect();
-+            // Only one NEW slot alias per phi dest: two backedge sources sharing
-+            // the dest's slot could see each other's writes (unlike register
-+            // coalescing, there is no per-source interval conflict check here).
-+            let mut claimed_dests: FxHashSet<u32> = FxHashSet::default();
-             for cand in detect_phi_coalesce_groups(func, liveness) {
-                 let (phi_dest, backedge_src) = (cand.phi_dest, cand.backedge_src);
-                 if std::env::var("CCC_DEBUG_LOOP_PHI").is_ok() {
-@@ -860,6 +864,9 @@ pub(super) fn build_copy_alias_map(
-                 if !def_ty_ok.get(&backedge_src).copied().unwrap_or(false) {
-                     continue;
-                 }
-+                if !claimed_dests.insert(phi_dest) {
-+                    continue; // a source already claims this dest's slot
-+                }
-                 raw_aliases.push((backedge_src, phi_dest));
-                 phi_web_aliases.insert(backedge_src); // force-overwrite at resolve
-                 loop_phi_aliases.insert(backedge_src); // skip generic interference check
--- 
-2.47.3
-
-
-From 4fabb264df0f8878337ae801475c54f064100fc6 Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sat, 15 Aug 2026 22:04:14 +0000
-Subject: [PATCH 07/11] adopt AArch64 direct FP-register stores to stack slots
- from levkropp
-
-Backport of 2c3a0d31: three sites where a register-held F64 value bound
-for a stack slot bounced through the integer accumulator
-(fmov x0, dN; str x0, [slot]) or the d0 scratch (fmov d0, dN; str d0).
-store_float_reg and the two promoted-F64 copy paths now emit a single
-'str dN/sN, [slot]' when the destination is stack-homed and non-alloca.
-
-Width safety: the store instruction takes the FP register NAME (sN=4
-bytes, dN=8 bytes), so F32/F64 slot widths are preserved by
-construction. Register-cache safety: the old path CLOBBERED x0 while
-the new one leaves it untouched, so any cached 'x0 holds V' fact
-remains strictly MORE valid than before - fail-safe direction.
-
-PROOF: fp-heavy triple-recurrence loop (1000 iters) prints
-3108.839000677 == native gcc -O2 bit-for-bit under qemu; x0 round-trips
-in that kernel 6 -> 1; 653 lib, 162/162 x86 regression (x86 path
-untouched - file is arm-only), ARM differential at baseline 91.
----
- .../tmp/armg_pgo_branchy-pgo_branchy.gcda     | Bin 488 -> 488 bytes
- .../armg_pgo_split_label-pgo_split_label.gcda | Bin 320 -> 320 bytes
- .../tmp/armg_switch_table-switch_table.gcda   | Bin 384 -> 384 bytes
- .../armg_value_profiling-value_profiling.gcda | Bin 576 -> 576 bytes
- src/backend/arm/codegen/emit.rs               |  18 ++++++++++++++++++
- src/backend/arm/codegen/float_ops.rs          |   9 +++++++++
- 6 files changed, 27 insertions(+)
-
-diff --git a/@PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda b/@PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda
-index bad596242590475fa5ec63f8fce46ad7389f591b..c2fdeaf9adb513e65f978aef8e6978443733209a 100644
-GIT binary patch
-literal 488
-zcmYdHNlw=?GI7$WDP~{3x_%J@1H(cNAOXS*R}4TTBM*>xT~xrfc|qT?WwtX!fl3%}
-zfMg1pKqLc0mIRnmU<OkR0*ir4fWX5S!e7A-p&1w<v;!|hA-Qw{)VK@+G)x^j4b=wm
-zBa8#2!F~qw*E53HQ0Ia~z+sRc`=Kt;CnSAGv%wNj7$AiaPzgj2Gzj2&rrc!nTpV|y
-ja3V+Gagd$_pbVk#SpW^66$EIQI&>Q57HI5%+`<3=<m509
-
-literal 488
-zcmYdHNlw=?GI7$IR=~b|b^Rg+28M+kK!P2J8+K{|Nd`t9Ao04WfNk@FzGKU5XNUro
-zFx~))Jy2o-$uk^?0SW=Z9tf9V-8&&Lf4(!AV%W?Ep&vjfh8e3N3dyBIpyosqpkeCJ
-zX{a`^A7N||4e~PttY-v;0V9kH4TJR94|Rz?A?Z7s4VHky0Hg*QMnD!s4>OvcDL2_X
-m7sp*FoX8P)9Hb`!C{HMS-ay0WGXWZ=4xNU%1sWY-7Xbi=%td|x
-
-diff --git a/@PROFDIR@/tmp/armg_pgo_split_label-pgo_split_label.gcda b/@PROFDIR@/tmp/armg_pgo_split_label-pgo_split_label.gcda
-index 7bbb074e2a40371916a8daf0949334c4ed7c367a..e2a6269dc5bc7d8d1f62922c631af73d89ee1be5 100644
-GIT binary patch
-literal 320
-zcmYdHNlw=?GI7#vC}t0Ap7n`=fngyBkO1KWu|R@>fsqGDye=wW+i-2|7I6#dJ3u9j
-z5kN7hJi`u%ItBrdY9#PL55j@bFm*5`AUlu&g1?>-#AZZDg540p5~N+|_q8>-;K@9Y
-y8x(-@Fg-9kU^K!mh*`{NW|j4BNc?`ur^fisxx?sY!ThlS>Mw*=h*?Ys0R{l5u_+S(
-
-literal 320
-zcmYdHNlw=?GI0u@RlpwDJnIt!1H(cNAi)mA96>;Wfq{_+NW3m8VB2tQ?G|wh={rCr
-zj1fRFs5}EBL>&VkNHr2*(S&edG)x^#3CIp)fZ(rZ1i66`AqjRv2uqN5q2Jfm<bo&j
-zKyFX~%ER=)?10e-yC7yUqnTCKyCL!WC7&AOJLe9gn+5a7uRw$*2n%8s6Ou3hQgtFZ
-
-diff --git a/@PROFDIR@/tmp/armg_switch_table-switch_table.gcda b/@PROFDIR@/tmp/armg_switch_table-switch_table.gcda
-index 24bcadb5dcd43bacef30f8a859c0c10faa4c44ea..1b3d22ef6b762c1a468af82d192eec17d132c4a1 100644
-GIT binary patch
-literal 384
-zcmYdHNlw=?GI1)NP|V&J{5*w$fngyBkN{x@j~9$Ul92~Uye=wW>)pIy`-wBPKs5^)
-zcYx$;CV@zpItB()kV*!I1}Qc$O?N(H63D%90QLi%2lW$}zn&2!hol(n#{;hyx@h`;
-tKGnUva6QP60(kT?Bjmt(57l%P{Xfq=9YrrRJQ#%UK&^t<%Y@L&008WlEam_J
-
-literal 384
-zcmYdHNlw=?GI9F5s(`&O_<0Hg1H(cNAi)mA4EC!Tfg~djka%5Gz}CBY!S)kpYJqAN
-zGVTD1HRv<|Ng#lzV@O!X1?C!rvw~@Q^B){A1-Tavz<z-9pnd}L*E53rh@=?o#{;hy
-xx@h`;KGnUva6QP60(kT?Bjmt(57l%P{Xfq=9a%5T{|hE8fLaBymkFVl0RVq)Hdg=u
-
-diff --git a/@PROFDIR@/tmp/armg_value_profiling-value_profiling.gcda b/@PROFDIR@/tmp/armg_value_profiling-value_profiling.gcda
-index 63115211c651cf64dd440727a3576d4096d20cd3..66d88c362e609b63591d53e6519852881977fa5d 100644
-GIT binary patch
-literal 576
-zcmYdHNlw=?GI3frrI@|MLSCPNfngyBkN{zZM=T(ckq1b;E-GNVXK?g$!C8~{KqZV7
-zKryfyJamHvBTyEh4#o!yB8kKJ4s&2E2n{nICW_#%WOM)u!pwu%!ocwAuy83zEleCn
-z<C14!SkDMD6DAL0g8X{=lA+hzGY5}}oqW{@@~Z|=Oah2O0A?nPhPfFg&%m&f(EzB<
-zftMMqo(W7M+{RD{5qZvXE)paK(+_hCOg&Hv>=ux^sG}XfcQhL;0l5X_UYOk=yFg~Z
-z^nzmxA^_G43XeCLreBfuLgN&u3RN$}wP4L)y(hdr+Ar}*d<@h3<NyEv$a)}r1_l6f
-CEl`;N
-
-literal 576
-zcmYdHNlw=?GI6qAU%*~sA+OKCz_5@5NU#I(0aq3v$-u}1BwiO4u-!8_`nlk&$$Ov@
-z#tNVqNDT<!q6-8WQRHEKupp8?7=K3xj0K@#=E6h~{FRIjKtY&!5L*}+UL6)L1*wIJ
-z!)RRc3=HcTL4JkFgP0({p1x%0_4drcV`3*?HG=%A0TdGjVi16t38P_dhRHK9tYkC*
-zs++Nz39KGMBHZ>s2_o{G<y<640Zc#4Eim;!DX?2W>Y|Qz{NB-Qumt25kb7ZvgX{vC
-z0n-bPEr<YEFDN|TWSV|O)(eeOpej_o%n*Gb60G-x*GKy$K8cTEdVl=?{~uWogwMbL
-E00W3oH~;_u
-
-diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
-index e330eb92..86ef5efb 100644
---- a/src/backend/arm/codegen/emit.rs
-+++ b/src/backend/arm/codegen/emit.rs
-@@ -2017,6 +2017,17 @@ impl ArchCodegen for ArmCodegen {
-                 }
-                 return;
-             }
-+            // Register-held src, stack-homed dest: store the FP register
-+            // straight to the slot — no d0/x0 round-trip.
-+            if let (None, Some(s)) = (dest_fp, src_fp) {
-+                if !self.state.is_alloca(dest.0) {
-+                    if let Some(slot) = self.state.get_slot(dest.0) {
-+                        self.emit_store_to_sp(&arm_fp_name(s, IrType::F64), slot.0, "str");
-+                        self.state.reg_cache.invalidate_acc();
-+                        return;
+@@ -2128,16 +2128,23 @@ pub(super) fn generate_instruction(
+             // the register allocator at -O2 (the dest register was clobbered,
+             // corrupting overlapping moves). libc memmove is direction-aware
+             // and optimized; keep the call.
+-            let inline_copy = match func.as_str() {
+-                "memcpy" | "__memcpy_chk" => {
+-                    info.args.len() >= 3
+-                        && matches!(info.args.get(2),
+-                            Some(crate::ir::reexports::Operand::Const(c))
+-                                if c.to_i64().map_or(false, |s| s >= 0 && s <= 32))
+-                        && !info.is_variadic
+-                }
+-                _ => false,
+-            };
++            // GATE ON BACKEND SUPPORT: the trait default of
++            // emit_inline_memcpy_call is an EMPTY body. Dispatching to it on
++            // a backend that has not implemented the expansion silently
++            // deletes the copy — on AArch64 `memcpy(&s,&t,16)` emitted NO
++            // instructions at all and the destination kept its old bytes
++            // (struct copy read back 7+8 instead of 100+200).
++            let inline_copy = cg.supports_inline_memcpy_call()
++                && match func.as_str() {
++                    "memcpy" | "__memcpy_chk" => {
++                        info.args.len() >= 3
++                            && matches!(info.args.get(2),
++                                Some(crate::ir::reexports::Operand::Const(c))
++                                    if c.to_i64().map_or(false, |s| s >= 0 && s <= 32))
++                            && !info.is_variadic
 +                    }
-+                }
-+            }
-             self.float_operand_to_reg(src, IrType::F64, "d0");
-             self.store_float_reg(dest, IrType::F64, "d0");
-             self.state.reg_cache.invalidate_acc();
-@@ -2036,6 +2047,13 @@ impl ArchCodegen for ArmCodegen {
-                             "    fmov {}, {}", arm_fp_name(d, IrType::F64), arm_fp_name(s, IrType::F64)));
-                     }
-                 }
-+                // Register-held src, stack-homed dest: direct `str dN, [slot]`.
-+                (None, Some(s)) if !self.state.is_alloca(dest.0)
-+                    && self.state.get_slot(dest.0).is_some() =>
-+                {
-+                    let slot = self.state.get_slot(dest.0).unwrap();
-+                    self.emit_store_to_sp(&arm_fp_name(s, IrType::F64), slot.0, "str");
-+                }
-                 _ => {
-                     self.float_operand_to_reg(src, IrType::F64, "d0");
-                     self.store_float_reg(dest, IrType::F64, "d0");
-diff --git a/src/backend/arm/codegen/float_ops.rs b/src/backend/arm/codegen/float_ops.rs
-index 3aadbf58..17b9ae41 100644
---- a/src/backend/arm/codegen/float_ops.rs
-+++ b/src/backend/arm/codegen/float_ops.rs
-@@ -69,6 +69,15 @@ impl ArmCodegen {
-                 return;
-             }
-         }
-+        // Stack-homed dest with a slot: store the FP register directly
-+        // (`str dN, [slot]`) instead of round-tripping through x0
-+        // (`fmov x0, dN; str x0, [slot]`).
-+        if !self.state.is_alloca(dest.0) {
-+            if let Some(slot) = self.state.get_slot(dest.0) {
-+                self.emit_store_to_sp(source, slot.0, "str");
-+                return;
-+            }
-+        }
-         if ty == IrType::F32 {
-             self.state.emit_fmt(format_args!("    fmov w0, {}", source));
-         } else {
--- 
-2.47.3
-
-
-From 11d3a4105df3508e9f8b8510822bec8acb97899e Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sat, 15 Aug 2026 22:07:53 +0000
-Subject: [PATCH 08/11] adopt AArch64 callee-saved FP registers d8-d14 +
- register-direct const GEP
-
-Backport of 90e05e19. Two independent wins:
-
-1. FP register pool: was caller-saved d16-d23 (+d24-d31 promotion pool)
-   only, so FP-heavy code with >8-16 live values spilled temporaries
-   GCC keeps in registers. d8-d14 (allocator IDs 32-38) join the scan,
-   appended AFTER the caller-saved pool so the free registers fill
-   first; prologue/epilogue save/restore only the ones actually
-   assigned (stp/ldp pairs + odd tail). d15/v15 stays reserved (FMA
-   intrinsic scratch). is_arm_fp_phys, the FP phi-coalesce filter, and
-   arm_fp_name all extended to the 32..=38 range. CCC_NO_FP_CALLEE_SAVED
-   opt-out for A/B.
-
-2. emit_gep_reg_const hook (default false): when a constant-offset GEP
-   has base AND dest register-assigned, AArch64 emits one add/sub
-   dest, base, #imm instead of the mov-to-x0 + add + mov-back
-   round-trip that every pointer-marching loop paid per iteration.
-
-PROOF:
-- 20-live-double stress loop: d8-d13 allocated, 'stp d8, d9 ...' saved
-  in prologue, self-spills 28 -> 24; qemu output BIT-IDENTICAL to
-  aarch64-gcc -O2 (1233175391357638.5; the x86-gcc delta is legal fmadd
-  contraction, 20 fmadds in the kernel).
-- FP triple-recurrence prints 3108.839000677 == gcc.
-- x86: xmm pool starts at PhysReg 20, arm branch not taken - asm
-  unchanged; 162/162 x86 regression, 653 lib tests, ARM baseline 91.
-- Pre-existing (NOT this change): giant literal pools can overflow
-  R_AARCH64_LD_PREL_LO19 range when statically linked - reproduces
-  with CCC_NO_FP_CALLEE_SAVED=1 too; tracked for a later ADRP+LDR fix.
----
- .../tmp/armg_pgo_branchy-pgo_branchy.gcda     | Bin 488 -> 488 bytes
- .../armg_pgo_split_label-pgo_split_label.gcda | Bin 320 -> 320 bytes
- .../tmp/armg_switch_table-switch_table.gcda   | Bin 384 -> 384 bytes
- .../armg_value_profiling-value_profiling.gcda | Bin 576 -> 576 bytes
- src/backend/arm/codegen/emit.rs               |  50 +++++++++++++++++-
- src/backend/arm/codegen/prologue.rs           |  39 ++++++++++++++
- src/backend/regalloc.rs                       |   7 ++-
- src/backend/stack_layout/regalloc_helpers.rs  |  14 +++--
- src/backend/traits.rs                         |  12 +++++
- 9 files changed, 116 insertions(+), 6 deletions(-)
-
-diff --git a/@PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda b/@PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda
-index c2fdeaf9adb513e65f978aef8e6978443733209a..803326cce3628566461b93dc2ead74ff1d554153 100644
-GIT binary patch
-literal 488
-zcmYdHNlw=?GI5d&Dq~;1x_%J@1H(cNAi)X54e!i=Bm*N4ka%5Gz_xio-?3%3Gem((
-z7;gZ@6!tTL<QW{wrNMLyGnis13YP#gK88W~b3q0IfdV6hevt=JNG_cNF@~X(01Z=z
-zPD8bU{Rm@&Xpo;FU_B$q$x!Elgur2t9{Zs#(I+H*N3+2aP#A#JK*I>gg6M$;0bI|N
-rn{1wo<1Q3V<On<t(vtv`Arw9#`4CfL3D7Wg=rqhNkk|n^g@FM8N)kO>
-
-literal 488
-zcmYdHNlw=?GI7$WDP~{3x_%J@1H(cNAOXS*R}4TTBM*>xT~xrfc|qT?WwtX!fl3%}
-zfMg1pKqLc0mIRnmU<OkR0*ir4fWX5S!e7A-p&1w<v;!|hA-Qw{)VK@+G)x^j4b=wm
-zBa8#2!F~qw*E53HQ0Ia~z+sRc`=Kt;CnSAGv%wNj7$AiaPzgj2Gzj2&rrc!nTpV|y
-ja3V+Gagd$_pbVk#SpW^66$EIQI&>Q57HI5%+`<3=<m509
-
-diff --git a/@PROFDIR@/tmp/armg_pgo_split_label-pgo_split_label.gcda b/@PROFDIR@/tmp/armg_pgo_split_label-pgo_split_label.gcda
-index e2a6269dc5bc7d8d1f62922c631af73d89ee1be5..f924fb29d0395fd97563ca58178088cb1a19413d 100644
-GIT binary patch
-literal 320
-zcmYdHNlw=?GI0_MD`O9Ap7n`=fngyBkl+O3icBEEz`)1@BwiO4ux+@uc8j=$^c|oQ
-z#t5JoRGuLpqK-ibq#6nAF@bPkG)x^#3CIp)fZ(rZ1i66`AqjRv2uqN5q2Jfm<bo&j
-zKyFX~%ER=)?10e-yC7yUqnTCKyCL!WC7&AOJLe9gn+5Yn8q{A1tq`-A5CRMU0ZJzM
-
-literal 320
-zcmYdHNlw=?GI7#vC}t0Ap7n`=fngyBkO1KWu|R@>fsqGDye=wW+i-2|7I6#dJ3u9j
-z5kN7hJi`u%ItBrdY9#PL55j@bFm*5`AUlu&g1?>-#AZZDg540p5~N+|_q8>-;K@9Y
-y8x(-@Fg-9kU^K!mh*`{NW|j4BNc?`ur^fisxx?sY!ThlS>Mw*=h*?Ys0R{l5u_+S(
-
-diff --git a/@PROFDIR@/tmp/armg_switch_table-switch_table.gcda b/@PROFDIR@/tmp/armg_switch_table-switch_table.gcda
-index 1b3d22ef6b762c1a468af82d192eec17d132c4a1..ddf59e547d296ce2501ad9a49ad021d059e1b330 100644
-GIT binary patch
-literal 384
-zcmYdHNlw=?GI1(TEo1KsexAa>z_5@5NN@r%L!c@XkYwZm60eI2*m^fF*nZ+nEl|xu
-z#vMShhSN)cBoIK<F)Y~43+7(9%Lb<D%~x>jV+30aCBS|_5<u|RGlKkxq!{eS1Fsjl
-xX!?IX)xErMJ;;v&c=R$O<iL6l)pQm8KhHfKSuf202~)*E;Rpl}d!Zb#2mro0Kh^*M
-
-literal 384
-zcmYdHNlw=?GI1)NP|V&J{5*w$fngyBkN{x@j~9$Ul92~Uye=wW>)pIy`-wBPKs5^)
-zcYx$;CV@zpItB()kV*!I1}Qc$O?N(H63D%90QLi%2lW$}zn&2!hol(n#{;hyx@h`;
-tKGnUva6QP60(kT?Bjmt(57l%P{Xfq=9YrrRJQ#%UK&^t<%Y@L&008WlEam_J
-
-diff --git a/@PROFDIR@/tmp/armg_value_profiling-value_profiling.gcda b/@PROFDIR@/tmp/armg_value_profiling-value_profiling.gcda
-index 66d88c362e609b63591d53e6519852881977fa5d..607c05049a50de42d0da1665804f23973658c513 100644
-GIT binary patch
-literal 576
-zcmYdHNlw=?GI46lEMqURkk@BmU|7fjBshWCp^g<uGBEN0iPuF1Z1)U~el9p`@*b#!
-zu>vRtQUe0G=n3(RDDp5qSP)4cjDKQ1j0K@#=E6h~{FRIjKtY&!5L*}+UL6)L1*wIJ
-z!)RRc3=HcTL4JkFgP0({p1x%0_4drcV`3*?HG=%A0Th!4Vi16t38P_dhRHK9tYkC*
-zs(X>g3|7wsCJ}B^*bfnT&T=jiBn8tCa|=v8Pzvl8kh-X&9lv)p8!Q321>|0s-5|R_
-zX2A5aKsX>0tQQm>Z!%54BI||5DNqTjUWjYK27vXR@cL-K#3%7FOz)5X|NkTFf$$j^
-E0CcuhNdN!<
-
-literal 576
-zcmYdHNlw=?GI3frrI@|MLSCPNfngyBkN{zZM=T(ckq1b;E-GNVXK?g$!C8~{KqZV7
-zKryfyJamHvBTyEh4#o!yB8kKJ4s&2E2n{nICW_#%WOM)u!pwu%!ocwAuy83zEleCn
-z<C14!SkDMD6DAL0g8X{=lA+hzGY5}}oqW{@@~Z|=Oah2O0A?nPhPfFg&%m&f(EzB<
-zftMMqo(W7M+{RD{5qZvXE)paK(+_hCOg&Hv>=ux^sG}XfcQhL;0l5X_UYOk=yFg~Z
-z^nzmxA^_G43XeCLreBfuLgN&u3RN$}wP4L)y(hdr+Ar}*d<@h3<NyEv$a)}r1_l6f
-CEl`;N
-
-diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
-index 86ef5efb..25b0f1cd 100644
---- a/src/backend/arm/codegen/emit.rs
-+++ b/src/backend/arm/codegen/emit.rs
-@@ -74,7 +74,10 @@ pub(super) fn callee_saved_name_32(reg: PhysReg) -> &'static str {
- }
- 
- pub(super) fn is_arm_fp_phys(reg: PhysReg) -> bool {
--    (40..=55).contains(&reg.0)
-+    // 40..=55 map to v16..v31 (d16..d31); 32..=38 map to d8..d14 — the
-+    // callee-saved FP registers (d15/v15 is scratch in the FMA intrinsic path,
-+    // so it is not allocated).
-+    (32..=38).contains(&reg.0) || (40..=55).contains(&reg.0)
- }
- 
- pub(super) fn arm_fp_name(reg: PhysReg, ty: IrType) -> String {
-@@ -186,6 +189,11 @@ pub struct ArmCodegen {
-     pub(super) used_callee_saved: Vec<PhysReg>,
-     /// SP offset where callee-saved registers are stored.
-     pub(super) callee_save_offset: i64,
-+    /// Which callee-saved FP registers (d8-d14, allocator IDs 32-38) are
-+    /// actually used by the FP allocator (for save/restore).
-+    pub(super) used_fp_callee_saved: Vec<PhysReg>,
-+    /// SP offset where callee-saved FP registers are stored.
-+    pub(super) fp_callee_save_offset: i64,
-     /// For large stack frames: reserved for future x19 frame base optimization.
-     /// Currently always None (optimization disabled due to correctness issue).
-     pub(super) frame_base_offset: Option<i64>,
-@@ -212,6 +220,8 @@ impl ArmCodegen {
-             loop_promoted_f64_values: Vec::new(),
-             used_callee_saved: Vec::new(),
-             callee_save_offset: 0,
-+            used_fp_callee_saved: Vec::new(),
-+            fp_callee_save_offset: 0,
-             frame_base_offset: None,
-             general_regs_only: false,
-         }
-@@ -558,6 +568,24 @@ impl ArmCodegen {
-             let offset = base + (i as i64) * 8;
-             self.emit_load_from_sp(r, offset, "ldr");
-         }
-+
-+        // Restore callee-saved FP registers (d8-d14).
-+        let used_fp = self.used_fp_callee_saved.clone();
-+        let fp_base = self.fp_callee_save_offset;
-+        let m = used_fp.len();
-+        let mut j = 0;
-+        while j + 1 < m {
-+            let r1 = format!("d{}", used_fp[j].0 - 24);
-+            let r2 = format!("d{}", used_fp[j + 1].0 - 24);
-+            let offset = fp_base + (j as i64) * 8;
-+            self.emit_ldp_from_sp(&r1, &r2, offset);
-+            j += 2;
-+        }
-+        if j < m {
-+            let r = format!("d{}", used_fp[j].0 - 24);
-+            let offset = fp_base + (j as i64) * 8;
-+            self.emit_load_from_sp(&r, offset, "ldr");
-+        }
-     }
- 
-     /// Check if an IrConst is a small unsigned immediate that fits in AArch64
-@@ -2079,6 +2107,26 @@ impl ArchCodegen for ArmCodegen {
-     fn emit_save_acc(&mut self) { self.state.emit("    mov x1, x0"); }
-     fn emit_add_secondary_to_acc(&mut self) { self.state.emit("    add x0, x1, x0"); }
-     fn emit_gep_add_const_to_acc(&mut self, offset: i64) { if offset != 0 { self.emit_add_imm_to_acc_impl(offset); } }
-+
-+    /// Register-direct GEP: `add dest_reg, base_reg, #imm` with no accumulator
-+    /// round-trip. Covers the pointer-marching pattern in every array/struct
-+    /// loop (`p += stride`), which otherwise costs mov+add+mov per iteration.
-+    fn emit_gep_reg_const(&mut self, dest: &Value, base: &Value, offset: i64) -> bool {
-+        let base_reg = self.get_phys_reg_for_value(base.0).filter(|r| !is_arm_fp_phys(*r));
-+        let dest_reg = self.get_phys_reg_for_value(dest.0).filter(|r| !is_arm_fp_phys(*r));
-+        let (Some(br), Some(dr)) = (base_reg, dest_reg) else { return false };
-+        let b = callee_saved_name(br);
-+        let d = callee_saved_name(dr);
-+        if (0..=4095).contains(&offset) {
-+            self.state.emit_fmt(format_args!("    add {}, {}, #{}", d, b, offset));
-+        } else if offset < 0 && (-offset) <= 4095 {
-+            self.state.emit_fmt(format_args!("    sub {}, {}, #{}", d, b, -offset));
-+        } else {
-+            return false;
-+        }
-+        self.state.reg_cache.invalidate_acc();
-+        true
-+    }
-     fn emit_acc_to_secondary(&mut self) { self.state.emit("    mov x1, x0"); }
-     fn emit_reg_to_acc(&mut self, reg: PhysReg) {
-         self.state.emit_fmt(format_args!("    mov x0, {}", callee_saved_name(reg)));
-diff --git a/src/backend/arm/codegen/prologue.rs b/src/backend/arm/codegen/prologue.rs
-index 1930e462..0d723f07 100644
---- a/src/backend/arm/codegen/prologue.rs
-+++ b/src/backend/arm/codegen/prologue.rs
-@@ -79,6 +79,20 @@ impl ArmCodegen {
-             false,
-         );
- 
-+        // Callee-saved FP registers (d8-d14, allocator IDs 32-38) assigned by
-+        // the FP scan must be preserved by the prologue/epilogue.
-+        self.used_fp_callee_saved = {
-+            let mut v: Vec<PhysReg> = self
-+                .reg_assignments
-+                .values()
-+                .copied()
-+                .filter(|r| (32..=38).contains(&r.0))
-+                .collect();
-+            v.sort_by_key(|r| r.0);
-+            v.dedup();
-+            v
-+        };
-+
-         let mut space = calculate_stack_space_common(&mut self.state, func, 16, |space, alloc_size, align| {
-             let effective_align = if align > 0 { align.max(8) } else { 8 };
-             let slot = (space + effective_align - 1) & !(effective_align - 1);
-@@ -127,6 +141,13 @@ impl ArmCodegen {
-             space += save_count * 8;
-         }
- 
-+        let fp_save_count = self.used_fp_callee_saved.len() as i64;
-+        if fp_save_count > 0 {
-+            space = (space + 7) & !7;
-+            self.fp_callee_save_offset = space;
-+            space += fp_save_count * 8;
-+        }
-+
-         space
-     }
- 
-@@ -160,6 +181,24 @@ impl ArmCodegen {
-             let offset = base + (i as i64) * 8;
-             self.emit_store_to_sp(r, offset, "str");
-         }
-+
-+        // Save callee-saved FP registers (d8-d14) used by the FP allocator.
-+        let used_fp = self.used_fp_callee_saved.clone();
-+        let fp_base = self.fp_callee_save_offset;
-+        let m = used_fp.len();
-+        let mut j = 0;
-+        while j + 1 < m {
-+            let r1 = format!("d{}", used_fp[j].0 - 24);
-+            let r2 = format!("d{}", used_fp[j + 1].0 - 24);
-+            let offset = fp_base + (j as i64) * 8;
-+            self.emit_stp_to_sp(&r1, &r2, offset);
-+            j += 2;
-+        }
-+        if j < m {
-+            let r = format!("d{}", used_fp[j].0 - 24);
-+            let offset = fp_base + (j as i64) * 8;
-+            self.emit_store_to_sp(&r, offset, "str");
-+        }
-     }
- 
-     // ---- emit_epilogue ----
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index 09922dc6..23ca56f6 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -1204,8 +1204,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-         for candidate in &all_phi_pairs {
-             let phi_dest = candidate.phi_dest;
-             let backedge_src = candidate.backedge_src;
--            let d_reg = assignments.get(&phi_dest).copied().filter(|r| (40..=55).contains(&r.0));
--            let s_reg = assignments.get(&backedge_src).copied().filter(|r| (40..=55).contains(&r.0));
-+            // FP pool spans caller-saved d16..d31 (40..=55) AND callee-saved
-+            // d8..d14 (32..=38) — both are valid coalesce targets.
-+            let is_fp = |r: &PhysReg| (32..=38).contains(&r.0) || (40..=55).contains(&r.0);
-+            let d_reg = assignments.get(&phi_dest).copied().filter(is_fp);
-+            let s_reg = assignments.get(&backedge_src).copied().filter(is_fp);
-             let (Some(d), Some(s)) = (d_reg, s_reg) else { continue };
-             if d == s {
-                 continue;
-diff --git a/src/backend/stack_layout/regalloc_helpers.rs b/src/backend/stack_layout/regalloc_helpers.rs
-index e7f5a298..41118f50 100644
---- a/src/backend/stack_layout/regalloc_helpers.rs
-+++ b/src/backend/stack_layout/regalloc_helpers.rs
-@@ -132,17 +132,25 @@ pub fn run_regalloc_and_merge_clobbers(
-     } else if available_regs.iter().any(|r| r.0 == 28) {
-         // AArch64: v16-v23 are caller-saved SIMD/FP registers.  Keep their
-         // allocator IDs disjoint from x0-x30; the ARM emitter maps 40..47 to
--        // d16..d23.  The generic FP allocator only assigns values that do not
--        // span calls, so no save/restore sequence is required.
-+        // d16..d23.
-         //
-         // When the function has no loop-promoted F64 values, the dedicated
-         // d24..d31 promotion pool (allocator IDs 48..55) is unused, so open it
-         // up to the general scan — FP-heavy loops easily keep 8+ values live.
--        if func.loop_promoted_f64_values.is_empty() {
-+        let mut regs: Vec<PhysReg> = if func.loop_promoted_f64_values.is_empty() {
-             (40..=55).map(PhysReg).collect()
-         } else {
-             (40..=47).map(PhysReg).collect()
-+        };
-+        // d8..d14 (allocator IDs 32..38) are the callee-saved FP registers.
-+        // They are appended last so the cheaper caller-saved pool fills first;
-+        // the prologue saves only the ones actually assigned. d15/v15 stays
-+        // reserved (scratch in the FMA intrinsic path). CCC_NO_FP_CALLEE_SAVED
-+        // disables for A/B.
-+        if std::env::var("CCC_NO_FP_CALLEE_SAVED").is_err() {
-+            regs.extend((32..=38).map(PhysReg));
-         }
-+        regs
-     } else {
-         Vec::new()
-     };
-diff --git a/src/backend/traits.rs b/src/backend/traits.rs
-index 4804a928..aa4e9b4b 100644
---- a/src/backend/traits.rs
-+++ b/src/backend/traits.rs
-@@ -930,6 +930,11 @@ pub trait ArchCodegen {
-                 }
-             });
-             if let Some(off) = const_offset {
-+                // Register-direct path: base and dest both register-assigned —
-+                // emit a single add/sub with no accumulator round-trip.
-+                if self.emit_gep_reg_const(dest, base, off) {
-+                    return;
-+                }
-                 if let Some(addr) = self.state_ref().resolve_slot_addr(base.0) {
-                     match addr {
-                         SlotAddr::OverAligned(slot, id) => {
-@@ -988,6 +993,13 @@ pub trait ArchCodegen {
-         self.emit_gep_add_const_to_acc_from_secondary(offset);
-     }
- 
-+    /// Register-direct GEP hook: base and dest both live in registers and the
-+    /// offset is a constant. Backends that can emit a single add/sub override
-+    /// this and return true. Default: not handled (falls back to slot paths).
-+    fn emit_gep_reg_const(&mut self, _dest: &Value, _base: &Value, _offset: i64) -> bool {
-+        false
-+    }
-+
-     /// Emit optimized GEP for Indirect base + constant offset.
-     /// Default: load ptr from slot, then lea offset(ptr), %rax — two instructions on x86.
-     fn emit_gep_indirect_const(&mut self, slot: StackSlot, offset: i64, val_id: u32) {
--- 
-2.47.3
-
-
-From 970e3e08902eacc72bc974a98b3a5e4c2251b8a8 Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sat, 15 Aug 2026 22:25:53 +0000
-Subject: [PATCH 09/11] fix reduction vectorizer: reject IV-dependent GEP bases
- (OOB segfault)
-
-PRE-EXISTING MISCOMPILE on upstream main, found while stress-testing the
-iv_strength_reduce stride limit with a 256x256 matmul whose result is
-consumed via a diagonal sum:
-
-    double s=0; for (i=0;i<N;i++) s += C[i][i];
-
-lowers to a two-level GEP chain:
-    row  = C + (i << 11)      ; base DEPENDS ON i
-    addr = row + (i << 3)     ; offset alone looks like stride-8
-
-detect: gep_uses_iv only inspected the OFFSET operand. The transform then
-models the access as invariant_base + iv*8, rewrites the IV to step in
-BYTES (0,32,...,2047), and keeps all other IV uses - so the row term
-becomes C + (byte_iv << 11), up to 4 MB past C. SIGSEGV at runtime;
-every gate except CCC_DISABLE_PASSES=vectorize left the crash in place,
-and origin/main (730ccabd) reproduces it verbatim.
-
-FIX: gep_uses_iv now requires the GEP BASE to be loop-invariant via the
-new gep_base_is_loop_invariant helper - defined outside the loop, or a
-constant address (GlobalAddr/Alloca), following Copy chains, everything
-else fails closed. Contiguous reductions are untouched.
-
-PROOF:
-- vectorize_iv_dependent_base.c: diagonal + strided-diagonal sums, both
-  previously SIGSEGV, now exact (32640/16256); added to regression.
-- Legit patterns still fire: 'Reduction pattern matched' for s+=a[i]
-  and dot product, outputs equal gcc -O2 (4193280 / 196561).
-- 653 lib, 163/163 x86 regression, ARM 92 (test passes there too),
-  240/240 differential fuzz.
----
- .../tmp/armg_pgo_branchy-pgo_branchy.gcda     | Bin 488 -> 488 bytes
- .../armg_pgo_split_label-pgo_split_label.gcda | Bin 320 -> 320 bytes
- .../tmp/armg_switch_table-switch_table.gcda   | Bin 384 -> 384 bytes
- .../armg_value_profiling-value_profiling.gcda | Bin 576 -> 576 bytes
- src/passes/vectorize.rs                       |  54 +++++++++++++++++-
- .../regression/vectorize_iv_dependent_base.c  |  41 +++++++++++++
- 6 files changed, 94 insertions(+), 1 deletion(-)
- create mode 100644 tests/regression/vectorize_iv_dependent_base.c
-
-diff --git a/@PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda b/@PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda
-index 803326cce3628566461b93dc2ead74ff1d554153..cb9e922bbdbfa2411b93817cf70290d8ec634898 100644
-GIT binary patch
-literal 488
-zcmYdHNlw=?GI0_NX=h))x_%J@1H(cNAi)L144k$gl92~Uye=wW+q|If*fQH0qCh2#
-zH-KUeyv!hZhK3e7F#Q6;Ww^pE4d%~E08<Q;I3ctHBZQuC0iuvxx&mShLlXfSrVgEk
-zYJ>O@#sSh`KZE(}89`wHbuLH*90uvJAL<f)Leh6M8!Q2Z0Z0urjDQS?9%vANWWai+
-q++_1y9Cx8`B1hnHke&pf1flTZxCk*thyV>!hfc%X!US>!6aWDEW;^`=
-
-literal 488
-zcmYdHNlw=?GI5d&Dq~;1x_%J@1H(cNAi)X54e!i=Bm*N4ka%5Gz_xio-?3%3Gem((
-z7;gZ@6!tTL<QW{wrNMLyGnis13YP#gK88W~b3q0IfdV6hevt=JNG_cNF@~X(01Z=z
-zPD8bU{Rm@&Xpo;FU_B$q$x!Elgur2t9{Zs#(I+H*N3+2aP#A#JK*I>gg6M$;0bI|N
-rn{1wo<1Q3V<On<t(vtv`Arw9#`4CfL3D7Wg=rqhNkk|n^g@FM8N)kO>
-
-diff --git a/@PROFDIR@/tmp/armg_pgo_split_label-pgo_split_label.gcda b/@PROFDIR@/tmp/armg_pgo_split_label-pgo_split_label.gcda
-index f924fb29d0395fd97563ca58178088cb1a19413d..a8072fe44ad8c3c335bfdfb65c66d7e1b80a088a 100644
-GIT binary patch
-literal 320
-zcmYdHNlw=?GI3IjXlD;>p7n`=fngyBkl+GhgHj;Dz`)1@BwiO4ux+@uc8j=$^c|oQ
-z#t5JoRGvW%qK-iXq#6m#u!3-4G)x^#3CIp)fZ(rZ1i66`AqjRv2uqN5q2Jfm<bo&j
-zKyFX~%ER=)?10e-yC7yUqnTCKyCL!WC7&AOJLe9gn+5ZS4Afr;tq`-A5CRMU$*d(i
-
-literal 320
-zcmYdHNlw=?GI0_MD`O9Ap7n`=fngyBkl+O3icBEEz`)1@BwiO4ux+@uc8j=$^c|oQ
-z#t5JoRGuLpqK-ibq#6nAF@bPkG)x^#3CIp)fZ(rZ1i66`AqjRv2uqN5q2Jfm<bo&j
-zKyFX~%ER=)?10e-yC7yUqnTCKyCL!WC7&AOJLe9gn+5Yn8q{A1tq`-A5CRMU0ZJzM
-
-diff --git a/@PROFDIR@/tmp/armg_switch_table-switch_table.gcda b/@PROFDIR@/tmp/armg_switch_table-switch_table.gcda
-index ddf59e547d296ce2501ad9a49ad021d059e1b330..a97e05e12420bebd0a0811195d2daf2e75c5a0d2 100644
-GIT binary patch
-literal 384
-zcmYdHNlw=?GI452Z)fidexAa>z_5@5NN@o$LsSwIkYwZm60eI2*m^fF*nZ+nEl|xu
-z#vLGe>FppArjEhEi66{WSjY~h>CSK5#R#?-N`U=<B!J+rX9W2XNio=u2VO69(e(d(
-ts(X3idXOIl@aSbm$bt19s_82Ff1Z0fvR;_~4~PeY!Vw4{_Ch&e5diI?F)RQ8
-
-literal 384
-zcmYdHNlw=?GI1(TEo1KsexAa>z_5@5NN@r%L!c@XkYwZm60eI2*m^fF*nZ+nEl|xu
-z#vMShhSN)cBoIK<F)Y~43+7(9%Lb<D%~x>jV+30aCBS|_5<u|RGlKkxq!{eS1Fsjl
-xX!?IX)xErMJ;;v&c=R$O<iL6l)pQm8KhHfKSuf202~)*E;Rpl}d!Zb#2mro0Kh^*M
-
-diff --git a/@PROFDIR@/tmp/armg_value_profiling-value_profiling.gcda b/@PROFDIR@/tmp/armg_value_profiling-value_profiling.gcda
-index 607c05049a50de42d0da1665804f23973658c513..0f5d9a65c8fd3c519c9c507e69e169b69581ca08 100644
-GIT binary patch
-literal 576
-zcmYdHNlw=?GI7euZf7sCkk@BmU|7fjB)EXML5dAXGBEN0iPuF1Z1)U~el9p`@*b#!
-zu>vRtQUe0G=ml+zDDp5qSP)4cj300q#)8l=b77(g{z^s%pdidVh%F2ZuMP{Bg4Dvq
-zVKgpz28Q*FAiu)oK}?WePhT?hdVA*JF|m`c8bN;50E)>0F$loSgwZfJ!{iwlRx%m@
-z)lIm-3|7wsCJ}CP;Dv}kXE_%Ml7i`nxdo;kC<S&4NL|#?j^8_)4VHl10&*|RZjfCd
-zGhljIARG`0)(Z-cH<_kik@Z636sQDMFT_<~1HgJuczv{A;*<CoruWDH|NoKoK==#{
-E0P@LIM*si-
-
-literal 576
-zcmYdHNlw=?GI46lEMqURkk@BmU|7fjBshWCp^g<uGBEN0iPuF1Z1)U~el9p`@*b#!
-zu>vRtQUe0G=n3(RDDp5qSP)4cjDKQ1j0K@#=E6h~{FRIjKtY&!5L*}+UL6)L1*wIJ
-z!)RRc3=HcTL4JkFgP0({p1x%0_4drcV`3*?HG=%A0Th!4Vi16t38P_dhRHK9tYkC*
-zs(X>g3|7wsCJ}B^*bfnT&T=jiBn8tCa|=v8Pzvl8kh-X&9lv)p8!Q321>|0s-5|R_
-zX2A5aKsX>0tQQm>Z!%54BI||5DNqTjUWjYK27vXR@cL-K#3%7FOz)5X|NkTFf$$j^
-E0CcuhNdN!<
-
-diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index fb1ea2f6..9993b809 100644
---- a/src/passes/vectorize.rs
-+++ b/src/passes/vectorize.rs
-@@ -1576,8 +1576,23 @@ fn gep_uses_iv(
-     for &block_idx in loop_blocks {
-         let block = &func.blocks[block_idx];
-         for inst in &block.instructions {
--            if let Instruction::GetElementPtr { dest, offset, .. } = inst {
-+            if let Instruction::GetElementPtr { dest, base, offset, .. } = inst {
-                 if *dest == gep {
-+                    // The reduction transform models the access as
-+                    // `invariant_base + iv * element_size` and later rewrites
-+                    // the IV to step in bytes. That model is WRONG when the
-+                    // GEP's BASE itself depends on the IV — multi-level GEPs
-+                    // like C[i][i] lower to
-+                    //     row  = C + (i << 11)      ; IV-dependent base!
-+                    //     addr = row + (i << 3)     ; looks like stride-8
-+                    // and after the byte-stride rewrite the row computation
-+                    // scales with the byte IV (i<<11 over 0..2048 = 4 MB):
-+                    // out-of-bounds segfault (256x256 matmul diagonal-sum
-+                    // reproducer). Fail closed: the base must be defined
-+                    // outside the loop or be a loop-invariant address.
-+                    if !gep_base_is_loop_invariant(func, loop_blocks, *base, iv, iv_derived) {
-+                        return false;
-+                    }
-                     // Check if offset uses IV or IV-derived value
-                     if let Operand::Value(v) = offset {
-                         if v == &iv || iv_derived.contains(v) {
-@@ -1594,6 +1609,43 @@ fn gep_uses_iv(
-     false
- }
- 
-+/// A GEP base is loop-invariant when its defining instruction lives outside
-+/// the loop, or is a loop-materialized but constant address (GlobalAddr,
-+/// Alloca). Anything defined inside the loop — in particular another GEP or
-+/// arithmetic that involves the IV — disqualifies the access from the
-+/// contiguous-stream reduction model. Chains of Copy/GlobalAddr are followed;
-+/// unknown shapes fail closed.
-+fn gep_base_is_loop_invariant(
-+    func: &IrFunction,
-+    loop_blocks: &FxHashSet<usize>,
-+    base: Value,
-+    iv: Value,
-+    iv_derived: &FxHashSet<Value>,
-+) -> bool {
-+    if base == iv || iv_derived.contains(&base) {
-+        return false;
-+    }
-+    for &block_idx in loop_blocks {
-+        for inst in &func.blocks[block_idx].instructions {
-+            if inst.dest() == Some(base) {
-+                return match inst {
-+                    // Constant addresses are invariant regardless of where
-+                    // they are materialized.
-+                    Instruction::GlobalAddr { .. } | Instruction::Alloca { .. } => true,
-+                    Instruction::Copy { src: Operand::Value(v), .. } => {
-+                        gep_base_is_loop_invariant(func, loop_blocks, *v, iv, iv_derived)
-+                    }
-+                    // GEP/BinOp/Cast/Load/Phi defined IN the loop: treat as
-+                    // variant (fail closed).
 +                    _ => false,
 +                };
+             if inline_copy {
+                 if let Some(crate::ir::reexports::Operand::Const(c)) = info.args.get(2) {
+                     let size = c.to_i64().unwrap_or(0) as usize;
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index bf35e761..411a7f86 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -40,6 +40,7 @@ pub(crate) mod reassoc_accum;
+ pub(crate) mod recursion_to_iter;
+ mod resolve_asm;
+ pub(crate) mod simplify;
++pub(crate) mod store_load_forward;
+ pub(crate) mod tail_call_elim;
+ pub(crate) mod univsr;
+ pub(crate) mod vector_temp_promotion;
+@@ -1042,6 +1043,16 @@ macro_rules! preloop_dump {
+             if module.for_each_function(aggregate_copy_forward::run) == 0 { break; }
+         }
+     }
++    // Forward alloca-field stores to later loads of the same constant-offset
++    // field (the SROA effect for scalarized aggregates: struct memory traffic
++    // becomes SSA dataflow). Hardened rewrite of levkropp's 0980060d pass:
++    // default-closed transfer function, volatile/escape/segment guards.
++    // Iterate: each round can expose new dead stores for the next.
++    if !disabled.contains("slforward") {
++        for _ in 0..4 {
++            if module.for_each_function(store_load_forward::run) == 0 { break; }
++        }
++    }
+     module.for_each_function(dce::eliminate_dead_code);
+     // Run memory-recurrence promotion again after CFG and copy cleanup have
+     // exposed canonical natural loops.
+diff --git a/src/passes/store_load_forward.rs b/src/passes/store_load_forward.rs
+new file mode 100644
+index 00000000..ae866157
+--- /dev/null
++++ b/src/passes/store_load_forward.rs
+@@ -0,0 +1,591 @@
++//! Store-to-load forwarding for alloca fields.
++//!
++//! After inlining and unrolling, aggregate code looks like
++//! `store v1 -> [agg + 0]; store v2 -> [agg + 8]; ...; load [agg + 0]`
++//! spread across a chain of blocks. When the load's address is a
++//! compile-time-constant offset of the same alloca root and the same value is
++//! stored on every incoming path, the load can be replaced by a Copy of the
++//! stored SSA value — turning struct memory traffic into register dataflow
++//! (the SROA effect for fully-scalarized aggregates).
++//!
++//! A forward dataflow computes, per block, the map (root, offset) -> stored
++//! value. At control-flow joins only entries on which ALL predecessors agree
++//! survive. Semantics of the transfer function are DEFAULT-CLOSED: only
++//! instructions whose memory effects this pass models precisely (Store, Load,
++//! Memcpy with tracked destination) may keep the map alive — EVERY other
++//! instruction that can write memory (calls, intrinsics via dest_ptr, va_arg,
++//! atomics incl. AtomicInc, inline asm, stack restore, DynAlloca) clears it.
++//! This is the lesson of the aggregate_copy_forward bug family: the fail-open
++//! allowlist variant of this pass (levkropp 0980060d) missed Intrinsic writes
++//! exactly the way the SSE __m128i-init deletion bug did.
++//!
++//! Additional guards over the original:
++//!   * volatile / semantic_volatile allocas are never tracked;
++//!   * stores through pointers with a non-default segment override are not
++//!     forwarded (they may not even target the tracked object);
++//!   * escaped roots (address stored to memory, passed as operand of any
++//!     unmodeled instruction) are dropped from tracking entirely, so a
++//!     write through a reloaded pointer cannot be missed;
++//!   * one shared transfer function for analysis and rewrite (the original
++//!     kept two copies that could drift apart).
++//!
++//! Disable with CCC_NO_SL_FORWARD=1.
++
++use crate::common::fx_hash::{FxHashMap, FxHashSet};
++use crate::common::types::{AddressSpace, IrType};
++use crate::ir::analysis;
++use crate::ir::reexports::{Instruction, IrFunction, Operand, Value};
++
++/// A constant byte path from an alloca root: (root value id, byte offset).
++#[derive(Clone, Copy, PartialEq, Eq, Hash)]
++struct FieldPath {
++    root: u32,
++    offset: i64,
++}
++
++fn type_size(ty: IrType) -> i64 {
++    use crate::common::types::IrType::*;
++    match ty {
++        I8 | U8 => 1,
++        I16 | U16 => 2,
++        I32 | U32 | F32 => 4,
++        I64 | U64 | F64 | Ptr => 8,
++        _ => 16,
++    }
++}
++
++/// Resolve pointer values to (alloca root, constant byte offset), and compute
++/// the set of roots whose address escapes the modeled instruction set.
++/// Escaped roots are excluded from `paths` entirely (fail closed).
++fn build_field_paths(func: &IrFunction) -> FxHashMap<u32, FieldPath> {
++    let mut paths: FxHashMap<u32, FieldPath> = FxHashMap::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Instruction::Alloca { dest, volatile, semantic_volatile, .. } = inst {
++                if !volatile && !semantic_volatile {
++                    paths.insert(dest.0, FieldPath { root: dest.0, offset: 0 });
++                }
 +            }
 +        }
 +    }
-+    // Not defined in any loop block: defined before the loop — invariant.
-+    true
-+}
-+
- /// Check if a value depends on the IV (transitively through operations)
- fn value_depends_on_iv(
-     func: &IrFunction,
-diff --git a/tests/regression/vectorize_iv_dependent_base.c b/tests/regression/vectorize_iv_dependent_base.c
-new file mode 100644
-index 00000000..746f7cce
---- /dev/null
-+++ b/tests/regression/vectorize_iv_dependent_base.c
-@@ -0,0 +1,41 @@
-+/* Reduction vectorizer must NOT treat a multi-level GEP whose BASE depends
-+ * on the induction variable as a contiguous stride-elem_size stream.
-+ *
-+ * s += C[i][i] lowers to
-+ *     row  = C + (i << 11)     <- base depends on i!
-+ *     addr = row + (i << 3)    <- offset alone looks like stride-8
-+ *
-+ * The transform rewrites the IV to step in BYTES (0,32,64,..,2047) and keeps
-+ * every IV use, so the row computation becomes C + (byte_iv << 11): up to
-+ * 2047<<11 = 4 MB past C -- out-of-bounds reads, SIGSEGV on a 256x256
-+ * static matrix (found via matmul diagonal-sum; present upstream).
-+ *
-+ * The fix requires the GEP base to be loop-invariant (defined outside the
-+ * loop, or GlobalAddr/Alloca). Contiguous reductions (s += a[i]) must still
-+ * vectorize -- covered by vectorize_f32_sum / vectorize_dot_product.
-+ */
-+#include <stdio.h>
-+
-+#define N 256
-+static double C[N][N];
-+
-+int main(void) {
-+    for (int i = 0; i < N; i++)
-+        C[i][i] = (double)i;
-+
-+    double s = 0.0;
-+    for (int i = 0; i < N; i++)
-+        s += C[i][i];          /* diagonal walk: stride N+1 elements */
-+
-+    /* sum 0..255 = 32640 */
-+    if (s != 32640.0) { printf("FAIL diag sum %.1f\n", s); return 1; }
-+
-+    /* variant: IV-dependent base via row pointer arithmetic */
-+    double t = 0.0;
-+    for (int i = 0; i < N; i += 2)
-+        t += C[i][i];
-+    if (t != 16256.0) { printf("FAIL strided diag %.1f\n", t); return 2; }
-+
-+    printf("32640.0\n");
-+    return 0;
-+}
--- 
-2.47.3
-
-
-From 494e105db4824910950cba03e53a8e012cc0425c Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sat, 15 Aug 2026 22:28:53 +0000
-Subject: [PATCH 10/11] adopt IVSR stride limit 1024 -> 1 MiB from levkropp
- (2b555fbc slice)
-
-Matrix row strides are routinely several KiB (256 doubles = 2048 bytes)
-and their multiply executes in the ENCLOSING hot loop, so excluding them
-from pointer induction left an imul + re-addressing on the middle-loop
-path of every ikj matmul.
-
-ADOPTION ORDER MATTERS: applied only AFTER the reduction vectorizer's
-IV-dependent-base fix (previous commit). On the unfixed compiler this
-same stride bump turns the latent vectorizer OOB into a hard segfault
-on 256x256 matmul + diagonal sum - which is exactly how the upstream
-bug was flushed out. Lev's tree carries the same latent combination.
-
-PROOF: 384x384 ikj matmul x3, best-of-2: 0.303s -> 0.288s (~5%) on
-x86-64; result identical; 653 lib, 163/163 x86 regression, ARM 92,
-240/240 differential fuzz. (gcc -O2 remains 5.6x faster on this kernel
-- full loop-nest vectorization is tracked as future work, not a
-regression.)
----
- @PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda | Bin 488 -> 488 bytes
- .../armg_pgo_split_label-pgo_split_label.gcda   | Bin 320 -> 320 bytes
- .../tmp/armg_switch_table-switch_table.gcda     | Bin 384 -> 384 bytes
- .../armg_value_profiling-value_profiling.gcda   | Bin 576 -> 576 bytes
- src/passes/iv_strength_reduce.rs                |   8 ++++----
- 5 files changed, 4 insertions(+), 4 deletions(-)
-
-diff --git a/@PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda b/@PROFDIR@/tmp/armg_pgo_branchy-pgo_branchy.gcda
-index cb9e922bbdbfa2411b93817cf70290d8ec634898..3b652775a8706829b8a21bf14353dc08ccef1a6a 100644
-GIT binary patch
-literal 488
-zcmYdHNlw=?GI2Vu(#5`fb^Rg+28M+kK!OK|8SFekBqNCZx~PC{^Mbx(%WP+e0+le{
-z0E#uNWCqDIFw9p0QyW;o6vK=X1u)}HF@#^k4WSztA@qaE5QXH@6ClPg%ppL-)S=T*
-zZ4f`gI6xZgXE1*~BPa}@&IO5p!yrBOLtUazNcxUugC(Fa0I7k75s(4V0}T<73|P;U
-pn{1wo<1Q3V<On<t(vtv`AQV0YQy}3}Lx6^<L#JVGVFI}V3IM8TL9ze<
-
-literal 488
-zcmYdHNlw=?GI0_NX=h))x_%J@1H(cNAi)L144k$gl92~Uye=wW+q|If*fQH0qCh2#
-zH-KUeyv!hZhK3e7F#Q6;Ww^pE4d%~E08<Q;I3ctHBZQuC0iuvxx&mShLlXfSrVgEk
-zYJ>O@#sSh`KZE(}89`wHbuLH*90uvJAL<f)Leh6M8!Q2Z0Z0urjDQS?9%vANWWai+
-q++_1y9Cx8`B1hnHke&pf1flTZxCk*thyV>!hfc%X!US>!6aWDEW;^`=
-
-diff --git a/@PROFDIR@/tmp/armg_pgo_split_label-pgo_split_label.gcda b/@PROFDIR@/tmp/armg_pgo_split_label-pgo_split_label.gcda
-index a8072fe44ad8c3c335bfdfb65c66d7e1b80a088a..379ab9e4d5a922905e8463aa23dbc67e28dfdd6f 100644
-GIT binary patch
-literal 320
-zcmYdHNlw=?GI2Vm(ZwFvJnIt!1H(cNAi)E~3wnSA0|O(7{ko`tZNs&-Tf{A-?*NrB
-zMgYa2@(fcT>KG(Is*yl|8-xR+Vd`K?K;|L?1b;mv$PJ7LNw6D2Sc0?*{l2y)7d)8<
-za)Sa;9;OFo2aHD81u=^m&8)KC4T;|``P3NSId>S{ESNt!p#DN=g_y;J5MTfREv+a0
-
-literal 320
-zcmYdHNlw=?GI3IjXlD;>p7n`=fngyBkl+GhgHj;Dz`)1@BwiO4ux+@uc8j=$^c|oQ
-z#t5JoRGvW%qK-iXq#6m#u!3-4G)x^#3CIp)fZ(rZ1i66`AqjRv2uqN5q2Jfm<bo&j
-zKyFX~%ER=)?10e-yC7yUqnTCKyCL!WC7&AOJLe9gn+5ZS4Afr;tq`-A5CRMU$*d(i
-
-diff --git a/@PROFDIR@/tmp/armg_switch_table-switch_table.gcda b/@PROFDIR@/tmp/armg_switch_table-switch_table.gcda
-index a97e05e12420bebd0a0811195d2daf2e75c5a0d2..a520dc76eee985e0dbbb1db22d2fc1385a895a69 100644
-GIT binary patch
-literal 384
-zcmYdHNlw=?GI5f#=wj~+exAa>z_5@5NbmqLL(Uy0Ajt?~zb-0Z>)pIy`-wBPKs5^)
-zcYx$~-3E~`bqo#uLSXIzbxtr%cRr&q$h~j?_5+*;^%I!Co)P3nMuZ&Lj|W~abkX$x
-ve5!kS;d+oC1rYL(@IcbbjF1ECJyg?G^#45fbY#6S|2N2-g1QT0FR~*6o8&d)
-
-literal 384
-zcmYdHNlw=?GI452Z)fidexAa>z_5@5NN@o$LsSwIkYwZm60eI2*m^fF*nZ+nEl|xu
-z#vLGe>FppArjEhEi66{WSjY~h>CSK5#R#?-N`U=<B!J+rX9W2XNio=u2VO69(e(d(
-ts(X3idXOIl@aSbm$bt19s_82Ff1Z0fvR;_~4~PeY!Vw4{_Ch&e5diI?F)RQ8
-
-diff --git a/@PROFDIR@/tmp/armg_value_profiling-value_profiling.gcda b/@PROFDIR@/tmp/armg_value_profiling-value_profiling.gcda
-index 0f5d9a65c8fd3c519c9c507e69e169b69581ca08..2d0b5565289463c78fcd47576721c6cf95231a42 100644
-GIT binary patch
-literal 576
-zcmYdHNlw=?GI0{L>0&Rjkk@BmU|7fjBzS<BA($ORGJ@EziwfB8865pwaMt8KPzhrN
-zPz<aF4}IVYBTyEh4#o!yB8kKJ39n!*2n{nICW_#%WOM)u!pwu%!ocwAuy83zEleCn
-z<C14!SkDOZD@-251le)=lA+hzGY5}}oqW{@@~Z|=Oa+KR0A?nPhPfFg&%m&f(EzCK
-z!DJS&dL}T5a9hJlX0XU}mUEFH224N9Eim;!DX?2W>Y|Qz{NB-Qumt25kb7ZvgX{vC
-z0n-by5i9`K3kr`nnWkTn^+Mwms0dXr#8n8rC%it|FY!ry4AcAL|NsBUdLVoT1_19T
-BS;YVV
-
-literal 576
-zcmYdHNlw=?GI7euZf7sCkk@BmU|7fjB)EXML5dAXGBEN0iPuF1Z1)U~el9p`@*b#!
-zu>vRtQUe0G=ml+zDDp5qSP)4cj300q#)8l=b77(g{z^s%pdidVh%F2ZuMP{Bg4Dvq
-zVKgpz28Q*FAiu)oK}?WePhT?hdVA*JF|m`c8bN;50E)>0F$loSgwZfJ!{iwlRx%m@
-z)lIm-3|7wsCJ}CP;Dv}kXE_%Ml7i`nxdo;kC<S&4NL|#?j^8_)4VHl10&*|RZjfCd
-zGhljIARG`0)(Z-cH<_kik@Z636sQDMFT_<~1HgJuczv{A;*<CoruWDH|NoKoK==#{
-E0P@LIM*si-
-
-diff --git a/src/passes/iv_strength_reduce.rs b/src/passes/iv_strength_reduce.rs
-index 8007fda8..dab3e3d2 100644
---- a/src/passes/iv_strength_reduce.rs
-+++ b/src/passes/iv_strength_reduce.rs
-@@ -33,10 +33,10 @@ use crate::ir::reexports::{
- };
- use super::loop_analysis::{self, NaturalLoop};
- 
--/// Maximum stride (in bytes) for an induction variable to be eligible for
--/// strength reduction. Covers common element sizes up to 1 KB; larger strides
--/// are unlikely to benefit and may indicate non-array access patterns.
--const MAX_IV_STRIDE: i64 = 1024;
-+/// Maximum byte stride eligible for pointer induction. Matrix row strides are
-+/// routinely several KiB (256 doubles = 2048 bytes), and are especially worth
-+/// reducing because their multiply executes in an enclosing hot loop.
-+const MAX_IV_STRIDE: i64 = 1 << 20;
- 
- /// Maximum number of Cast/Copy instructions to follow when looking through
- /// cast chains to find the root value. Guards against infinite loops on
--- 
-2.47.3
-
-
-From a6e418721b39865986115bf34a8c30403b2fc3af Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sat, 15 Aug 2026 22:29:46 +0000
-Subject: [PATCH 11/11] adopt opt-in loop-transparent live-range splitting
- hookup (160472ec slice)
-
-split_loop_transparent_ranges already landed with the PR#64 integration;
-lev's pipeline hookup (CCC_LOOP_SPLIT=1, honoring CCC_SPLIT_MAX) was the
-missing piece. Strictly opt-in: Lev's own commit documents it as a net
-LOSS on his benchmark suite (store/reload round-trips outweigh the freed
-registers; hot-loop values are the in-loop ones which cannot be
-transparent-split), and we keep that assessment in the comment. Adopted
-for experimentation parity, not enabled.
-
-PROOF: default path bit-identical (env gate untouched -> code not
-reached); 653 lib, 163/163 x86 regression; CCC_LOOP_SPLIT=1 smoke test
-compiles+runs matmul correctly (0.0 checksum matches).
----
- src/driver/pipeline.rs | 14 ++++++++++++++
- 1 file changed, 14 insertions(+)
-
-diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
-index 54bbec6c..59fbe585 100644
---- a/src/driver/pipeline.rs
-+++ b/src/driver/pipeline.rs
-@@ -1453,6 +1453,20 @@ impl Driver {
-                     }
-                 }
-             }
-+            // Loop-transparent splitting (spill values live across a hot loop
-+            // but unused inside it). NOTE: measured as a net loss on the
-+            // benchmark suite — the store/reload round-trips cost more than the
-+            // freed registers save, because the values competing for registers
-+            // in hot loops are the in-loop ones (bases/IVs), which can't be
-+            // transparent-split. Kept opt-in for reference.
-+            if std::env::var("CCC_LOOP_SPLIT").is_ok() {
-+                for func in &mut module.functions {
-+                    if !func.is_declaration && !func.blocks.is_empty() {
-+                        let n = crate::backend::split_ranges::split_loop_transparent_ranges(func, max_splits);
-+                        if n > 0 { did_split = true; }
++    loop {
++        let mut changed = false;
++        for block in &func.blocks {
++            for inst in &block.instructions {
++                let derived = match inst {
++                    Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } => {
++                        c.to_i64().and_then(|off| {
++                            paths.get(&base.0).map(|p| {
++                                (dest.0, FieldPath { root: p.root, offset: p.offset + off })
++                            })
++                        })
++                    }
++                    Instruction::Copy { dest, src: Operand::Value(src) } => {
++                        paths.get(&src.0).copied().map(|p| (dest.0, p))
++                    }
++                    _ => None,
++                };
++                if let Some((dest, path)) = derived {
++                    if !paths.contains_key(&dest) {
++                        paths.insert(dest, path);
++                        changed = true;
 +                    }
 +                }
 +            }
-             // Run cleanup passes on split IR: copy propagation + DCE
-             // to eliminate redundant Store/Load → Copy chains from mem2reg
-             if did_split {
++        }
++        if !changed {
++            break;
++        }
++    }
++
++    // Escape analysis, default-closed: any use of a tracked pointer outside
++    // the modeled shapes (GEP base / Copy src derivation above, Store ptr,
++    // Load ptr, Memcpy dest) escapes its ROOT. In particular a pointer used
++    // as a STORED VALUE, a call argument, an intrinsic arg/dest_ptr, a phi
++    // input, a select arm, or a terminator operand escapes — after that a
++    // write through a reloaded alias could invalidate entries we would never
++    // see. Escaped roots are removed from tracking wholesale.
++    let mut escaped: FxHashSet<u32> = FxHashSet::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            match inst {
++                Instruction::GetElementPtr { base, offset, .. } => {
++                    // Variable-offset GEP derives an untracked pointer from
++                    // the root: writes through it are invisible to the map.
++                    if matches!(offset, Operand::Value(_)) {
++                        if let Some(p) = paths.get(&base.0) {
++                            escaped.insert(p.root);
++                        }
++                    }
++                }
++                Instruction::Copy { .. } => {}
++                Instruction::Store { val, ptr: _, .. } => {
++                    if let Operand::Value(v) = val {
++                        if let Some(p) = paths.get(&v.0) {
++                            escaped.insert(p.root);
++                        }
++                    }
++                }
++                Instruction::Load { .. } => {}
++                Instruction::Memcpy { src, dest: _, .. } => {
++                    // src is read-only: no escape. dest is modeled in the
++                    // transfer function (kills overlapping entries).
++                    let _ = src;
++                }
++                _ => {
++                    // EVERYTHING else: any referenced tracked pointer escapes
++                    // its root (visitors cover Intrinsic args + dest_ptr,
++                    // call args, va_arg, atomics, selects, phis, asm).
++                    crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
++                        if let Operand::Value(v) = op {
++                            if let Some(p) = paths.get(&v.0) {
++                                escaped.insert(p.root);
++                            }
++                        }
++                    });
++                    crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
++                        if let Some(p) = paths.get(&v.0) {
++                            escaped.insert(p.root);
++                        }
++                    });
++                }
++            }
++        }
++        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
++            if let Operand::Value(v) = op {
++                if let Some(p) = paths.get(&v.0) {
++                    escaped.insert(p.root);
++                }
++            }
++        });
++    }
++    paths.retain(|_, p| !escaped.contains(&p.root));
++    paths
++}
++
++/// Shared transfer function: apply one instruction's memory effect to the
++/// running (root, offset) -> (value, size) map. When `rewrite` is set,
++/// forwardable loads are replaced by Copies (counted in `changed`).
++fn apply_inst(
++    inst: &mut Instruction,
++    paths: &FxHashMap<u32, FieldPath>,
++    map: &mut FxHashMap<FieldPath, (Value, i64)>,
++    rewrite: bool,
++    changed: &mut usize,
++) {
++    match inst {
++        Instruction::Store { val, ptr, ty, seg_override, .. } => {
++            if *seg_override != AddressSpace::Default {
++                // Segment-relative store: target unknown, kill everything.
++                map.clear();
++                return;
++            }
++            if let Some(fp) = paths.get(&ptr.0).copied() {
++                let size = type_size(*ty);
++                // Kill overlapping field entries (a wide store covers narrower
++                // fields starting within its range).
++                map.retain(|ofp, &mut (_v, fs)| {
++                    ofp.root != fp.root
++                        || ofp.offset + fs <= fp.offset
++                        || fp.offset + size <= ofp.offset
++                });
++                if let Operand::Value(v) = val {
++                    map.insert(fp, (*v, size));
++                }
++            } else {
++                // Store through an untracked pointer may alias anything.
++                map.clear();
++            }
++        }
++        Instruction::Load { dest, ptr, ty, seg_override, .. } => {
++            if *seg_override != AddressSpace::Default {
++                return;
++            }
++            if let Some(fp) = paths.get(&ptr.0) {
++                if let Some(&(stored_v, store_size)) = map.get(fp) {
++                    if rewrite && store_size == type_size(*ty) && stored_v.0 != dest.0 {
++                        *inst = Instruction::Copy { dest: *dest, src: Operand::Value(stored_v) };
++                        *changed += 1;
++                    }
++                }
++            }
++        }
++        Instruction::Memcpy { dest, size, .. } => match paths.get(&dest.0).copied() {
++            Some(d) => {
++                let sz = *size as i64;
++                map.retain(|fp, &mut (_v, fs)| {
++                    fp.root != d.root || fp.offset + fs <= d.offset || d.offset + sz <= fp.offset
++                });
++            }
++            None => map.clear(),
++        },
++        // Pure value computations: no memory effect.
++        Instruction::Alloca { .. }
++        | Instruction::BinOp { .. }
++        | Instruction::UnaryOp { .. }
++        | Instruction::Cmp { .. }
++        | Instruction::GetElementPtr { .. }
++        | Instruction::Cast { .. }
++        | Instruction::Copy { .. }
++        | Instruction::GlobalAddr { .. }
++        | Instruction::LabelAddr { .. }
++        | Instruction::Phi { .. }
++        | Instruction::Select { .. }
++        | Instruction::ParamRef { .. }
++        | Instruction::StackSave { .. } => {}
++        // DEFAULT-CLOSED: every other instruction may write memory (calls,
++        // intrinsics via dest_ptr, va_arg family, ALL atomics incl.
++        // AtomicInc, inline asm, stack restore, dyn alloca, PGO counters,
++        // fences with unknown pairing...). Kill the whole map.
++        _ => {
++            map.clear();
++        }
++    }
++}
++
++/// Run store-to-load forwarding on a function. Returns loads replaced.
++pub(crate) fn run(func: &mut IrFunction) -> usize {
++    if std::env::var("CCC_NO_SL_FORWARD").is_ok() {
++        return 0;
++    }
++    let paths = build_field_paths(func);
++    if paths.is_empty() {
++        return 0;
++    }
++
++    let label_to_idx = analysis::build_label_map(func);
++    let (preds, succs) = analysis::build_cfg(func, &label_to_idx);
++    let n = func.blocks.len();
++
++    // Forward dataflow to a fixpoint. Entry blocks start empty; IN[b] is the
++    // agreement-intersection of OUT over all predecessors. Because the maps
++    // only shrink at joins and kills, and grow only through stores, the
++    // lattice is finite and the worklist terminates.
++    let mut in_map: Vec<FxHashMap<FieldPath, (Value, i64)>> =
++        (0..n).map(|_| FxHashMap::default()).collect();
++    let mut out_map: Vec<FxHashMap<FieldPath, (Value, i64)>> =
++        (0..n).map(|_| FxHashMap::default()).collect();
++    let mut computed = vec![false; n];
++    let mut worklist: Vec<usize> = (0..n).collect();
++    while let Some(b) = worklist.pop() {
++        let mut acc: Option<FxHashMap<FieldPath, (Value, i64)>> = None;
++        for &p in preds.row(b).iter() {
++            let p = p as usize;
++            acc = Some(match acc {
++                None => out_map[p].clone(),
++                Some(mut a) => {
++                    a.retain(|fp, v| out_map[p].get(fp) == Some(v));
++                    a
++                }
++            });
++        }
++        let in_b = acc.unwrap_or_default();
++        if computed[b] && in_b == in_map[b] {
++            continue;
++        }
++        computed[b] = true;
++        in_map[b] = in_b.clone();
++        let mut m = in_b;
++        let mut dummy = 0;
++        for inst in &mut func.blocks[b].instructions {
++            apply_inst(inst, &paths, &mut m, false, &mut dummy);
++        }
++        if m != out_map[b] {
++            out_map[b] = m;
++            for &s in succs.row(b).iter() {
++                worklist.push(s as usize);
++            }
++        }
++    }
++
++    // Rewrite pass using the converged IN maps.
++    let mut changes = 0;
++    for b in 0..n {
++        let mut m = in_map[b].clone();
++        for inst in &mut func.blocks[b].instructions {
++            apply_inst(inst, &paths, &mut m, true, &mut changes);
++        }
++    }
++    changes
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::common::types::AddressSpace;
++    use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Terminator};
++
++    fn mk_func(blocks: Vec<BasicBlock>) -> IrFunction {
++        let mut f = IrFunction::new("t".into(), IrType::I64, vec![], false);
++        f.blocks = blocks;
++        f.next_value_id = 1000;
++        f
++    }
++
++    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
++        BasicBlock { label: BlockId(label), instructions, terminator, source_spans: vec![] }
++    }
++
++    fn store(val: u32, ptr: u32) -> Instruction {
++        Instruction::Store {
++            val: Operand::Value(Value(val)),
++            ptr: Value(ptr),
++            ty: IrType::I64,
++            seg_override: AddressSpace::Default,
++        }
++    }
++
++    fn load(dest: u32, ptr: u32) -> Instruction {
++        Instruction::Load {
++            dest: Value(dest),
++            ptr: Value(ptr),
++            ty: IrType::I64,
++            seg_override: AddressSpace::Default,
++        }
++    }
++
++    fn alloca(dest: u32) -> Instruction {
++        Instruction::Alloca {
++            dest: Value(dest),
++            ty: IrType::Ptr,
++            size: 16,
++            align: 8,
++            volatile: false,
++            semantic_volatile: false,
++        }
++    }
++
++    #[test]
++    fn forwards_simple_store_to_load() {
++        let mut f = mk_func(vec![block(
++            0,
++            vec![alloca(1), store(7, 1), load(2, 1)],
++            Terminator::Return(Some(Operand::Value(Value(2)))),
++        )]);
++        assert_eq!(run(&mut f), 1);
++        assert!(matches!(
++            f.blocks[0].instructions[2],
++            Instruction::Copy { dest: Value(2), src: Operand::Value(Value(7)) }
++        ));
++    }
++
++    #[test]
++    fn intrinsic_kills_map() {
++        // Intrinsic may write through dest_ptr — the fail-open original
++        // forwarded across it (the __m128i-init deletion bug shape).
++        let mut f = mk_func(vec![block(
++            0,
++            vec![
++                alloca(1),
++                store(7, 1),
++                Instruction::Intrinsic {
++                    dest: None,
++                    op: crate::ir::intrinsics::IntrinsicOp::AddPs128,
++                    dest_ptr: Some(Value(1)),
++                    args: vec![],
++                },
++                load(2, 1),
++            ],
++            Terminator::Return(Some(Operand::Value(Value(2)))),
++        )]);
++        assert_eq!(run(&mut f), 0);
++        assert!(matches!(f.blocks[0].instructions[3], Instruction::Load { .. }));
++    }
++
++    #[test]
++    fn volatile_alloca_not_tracked() {
++        let mut f = mk_func(vec![block(
++            0,
++            vec![
++                Instruction::Alloca {
++                    dest: Value(1),
++                    ty: IrType::Ptr,
++                    size: 16,
++                    align: 8,
++                    volatile: true,
++                    semantic_volatile: false,
++                },
++                store(7, 1),
++                load(2, 1),
++            ],
++            Terminator::Return(Some(Operand::Value(Value(2)))),
++        )]);
++        assert_eq!(run(&mut f), 0);
++    }
++
++    #[test]
++    fn escaped_root_not_tracked() {
++        // The alloca's address is itself stored to memory: a later reload
++        // could write through an alias the map never sees.
++        let mut f = mk_func(vec![block(
++            0,
++            vec![
++                alloca(1),
++                alloca(3),
++                Instruction::Store {
++                    val: Operand::Value(Value(1)), // address escapes!
++                    ptr: Value(3),
++                    ty: IrType::Ptr,
++                    seg_override: AddressSpace::Default,
++                },
++                store(7, 1),
++                load(2, 1),
++            ],
++            Terminator::Return(Some(Operand::Value(Value(2)))),
++        )]);
++        assert_eq!(run(&mut f), 0);
++    }
++
++    #[test]
++    fn call_kills_map() {
++        use crate::ir::reexports::CallInfo;
++        let mut f = mk_func(vec![block(
++            0,
++            vec![
++                alloca(1),
++                store(7, 1),
++                Instruction::Call { func: "opaque".into(), info: CallInfo::default() },
++                load(2, 1),
++            ],
++            Terminator::Return(Some(Operand::Value(Value(2)))),
++        )]);
++        assert_eq!(run(&mut f), 0);
++    }
++
++    #[test]
++    fn join_requires_agreement() {
++        // Two predecessors store DIFFERENT values to the same field: the
++        // load in the join block must not be forwarded.
++        let gep = |dest: u32, base: u32| Instruction::GetElementPtr {
++            dest: Value(dest),
++            base: Value(base),
++            offset: Operand::Const(IrConst::I64(8)),
++            ty: IrType::I64,
++        };
++        let mut f = mk_func(vec![
++            block(
++                0,
++                vec![alloca(1), gep(10, 1)],
++                Terminator::CondBranch {
++                    cond: Operand::Const(IrConst::I64(1)),
++                    true_label: BlockId(1),
++                    false_label: BlockId(2),
++                },
++            ),
++            block(1, vec![store(7, 10)], Terminator::Branch(BlockId(3))),
++            block(2, vec![store(8, 10)], Terminator::Branch(BlockId(3))),
++            block(
++                3,
++                vec![load(2, 10)],
++                Terminator::Return(Some(Operand::Value(Value(2)))),
++            ),
++        ]);
++        assert_eq!(run(&mut f), 0);
++        assert!(matches!(f.blocks[3].instructions[0], Instruction::Load { .. }));
++    }
++
++    #[test]
++    fn join_forwards_agreeing_value() {
++        let mut f = mk_func(vec![
++            block(
++                0,
++                vec![alloca(1), store(7, 1)],
++                Terminator::CondBranch {
++                    cond: Operand::Const(IrConst::I64(1)),
++                    true_label: BlockId(1),
++                    false_label: BlockId(2),
++                },
++            ),
++            block(1, vec![], Terminator::Branch(BlockId(3))),
++            block(2, vec![], Terminator::Branch(BlockId(3))),
++            block(
++                3,
++                vec![load(2, 1)],
++                Terminator::Return(Some(Operand::Value(Value(2)))),
++            ),
++        ]);
++        assert_eq!(run(&mut f), 1);
++        assert!(matches!(
++            f.blocks[3].instructions[0],
++            Instruction::Copy { dest: Value(2), src: Operand::Value(Value(7)) }
++        ));
++    }
++
++    #[test]
++    fn overlapping_narrow_store_kills_wide_entry() {
++        // I64 store, then an I8 store into byte 3 of the same field, then an
++        // I64 load: must NOT forward the stale wide value.
++        let gep3 = Instruction::GetElementPtr {
++            dest: Value(10),
++            base: Value(1),
++            offset: Operand::Const(IrConst::I64(3)),
++            ty: IrType::I8,
++        };
++        let mut f = mk_func(vec![block(
++            0,
++            vec![
++                alloca(1),
++                store(7, 1),
++                gep3,
++                Instruction::Store {
++                    val: Operand::Value(Value(9)),
++                    ptr: Value(10),
++                    ty: IrType::I8,
++                    seg_override: AddressSpace::Default,
++                },
++                load(2, 1),
++            ],
++            Terminator::Return(Some(Operand::Value(Value(2)))),
++        )]);
++        assert_eq!(run(&mut f), 0);
++    }
++
++    #[test]
++    fn size_mismatch_not_forwarded() {
++        // I64 store, I32 load of the same offset: byte-exact subset but the
++        // pass only forwards size-matched accesses.
++        let mut f = mk_func(vec![block(
++            0,
++            vec![
++                alloca(1),
++                store(7, 1),
++                Instruction::Load {
++                    dest: Value(2),
++                    ptr: Value(1),
++                    ty: IrType::I32,
++                    seg_override: AddressSpace::Default,
++                },
++            ],
++            Terminator::Return(Some(Operand::Value(Value(2)))),
++        )]);
++        assert_eq!(run(&mut f), 0);
++    }
++
++    #[test]
++    fn variable_gep_escapes_root() {
++        // A variable-offset GEP off the root makes ALL fields untrackable
++        // (a store through it could hit any offset).
++        let mut f = mk_func(vec![block(
++            0,
++            vec![
++                alloca(1),
++                store(7, 1),
++                Instruction::GetElementPtr {
++                    dest: Value(10),
++                    base: Value(1),
++                    offset: Operand::Value(Value(99)),
++                    ty: IrType::I8,
++                },
++                Instruction::Store {
++                    val: Operand::Value(Value(9)),
++                    ptr: Value(10),
++                    ty: IrType::I8,
++                    seg_override: AddressSpace::Default,
++                },
++                load(2, 1),
++            ],
++            Terminator::Return(Some(Operand::Value(Value(2)))),
++        )]);
++        assert_eq!(run(&mut f), 0);
++    }
++}
+diff --git a/tests/regression/store_load_forward.c b/tests/regression/store_load_forward.c
+new file mode 100644
+index 00000000..75e3b2ea
+--- /dev/null
++++ b/tests/regression/store_load_forward.c
+@@ -0,0 +1,70 @@
++/* store_load_forward correctness battery: every shape that must NOT be
++ * forwarded plus the profitable shapes that must stay correct.
++ * Derived from the failure modes of the aggregate_copy_forward bug family
++ * (8 unsoundness bugs) applied to the new pass. */
++#include <stdio.h>
++#include <string.h>
++
++struct P { long a, b; };
++
++/* 1. escape via pointer: callee writes through the escaped address */
++static void __attribute__((noinline)) poke(long *p) { *p = 99; }
++static long esc(void) {
++    struct P s;
++    s.a = 1;
++    poke(&s.a);       /* address escapes, store must not forward across */
++    return s.a;       /* must be 99 */
++}
++
++/* 2. join with disagreeing values */
++static long __attribute__((noinline)) join(int c) {
++    struct P s;
++    if (c) s.a = 10; else s.a = 20;
++    return s.a;
++}
++
++/* 3. overlapping narrow store kills wide entry */
++static long overlap(void) {
++    struct P s;
++    s.a = 0x1111111111111111L;
++    ((char *)&s.a)[3] = 0x22;
++    return s.a;       /* byte 3 replaced */
++}
++
++/* 4. memcpy into the aggregate kills entries */
++static long thrucpy(void) {
++    struct P s, t;
++    s.a = 7; s.b = 8;
++    t.a = 100; t.b = 200;
++    memcpy(&s, &t, sizeof s);
++    return s.a + s.b; /* 300 */
++}
++
++/* 5. profitable case: build-then-read chain across blocks */
++static long __attribute__((noinline)) build(int c) {
++    struct P s;
++    s.a = 40;
++    s.b = 2;
++    if (c) s.b = 3;
++    return s.a + s.b; /* forwardable: s.a agreed on all paths */
++}
++
++/* 6. variable index store into the same aggregate */
++static long varidx(int i) {
++    long arr[4] = {1, 2, 3, 4};
++    arr[0] = 5;
++    arr[i] = 9;       /* variable GEP: kills tracking of arr */
++    return arr[0];    /* 9 when i==0! */
++}
++
++int main(void) {
++    if (esc() != 99) { printf("FAIL esc\n"); return 1; }
++    if (join(1) != 10 || join(0) != 20) { printf("FAIL join\n"); return 2; }
++    long ov = overlap();
++    if (((ov >> 24) & 0xff) != 0x22) { printf("FAIL overlap %lx\n", ov); return 3; }
++    if (thrucpy() != 300) { printf("FAIL thrucpy\n"); return 4; }
++    if (build(0) != 42 || build(1) != 43) { printf("FAIL build\n"); return 5; }
++    if (varidx(0) != 9 || varidx(1) != 5) { printf("FAIL varidx\n"); return 6; }
++    printf("OK\n");
++    return 0;
++}
 -- 
 2.47.3
 
