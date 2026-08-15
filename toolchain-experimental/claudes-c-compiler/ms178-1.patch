@@ -1,424 +1,184 @@
-From 0d428517779835eecb00879dcce3c16f1b959f0a Mon Sep 17 00:00:00 2001
+From 65f641a6732d3f0fa04416b97117ee3d484c5209 Mon Sep 17 00:00:00 2001
 From: Arena Agent <agent@arena.ai>
-Date: Sat, 15 Aug 2026 18:40:31 +0000
-Subject: [PATCH 08/10] inline: substitute ParamRefs in return-phi; remove
- unsound add_signext peephole
+Date: Sat, 15 Aug 2026 19:33:11 +0000
+Subject: [PATCH] fix zmm-width vecreg flush + dest-liveness in aggregate
+ store-forwarding
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-Two independent miscompiles found via the expat 2.7.3 test suite:
+Two miscompiles found via the zlib-ng 2.2.4 suite (both remaining parts
+of the real-world validation bundle; the inliner/peephole/loop-promote
+fixes landed separately as PR#66):
 
-1. INLINER (return-value phi staleness): phi_incoming for the merge
-   block is collected from the callee's Return terminators BEFORE
-   ParamRef substitution runs — and those Returns are rewritten to
-   Branch(merge) so the later substitution loop never sees them. A
-   callee that returns its own parameter (expat checkCharRefNumber
-   after copy-prop: 'return result' where result IS the ParamRef
-   value) left a stale, never-defined value id in the merge phi.
-   Codegen gave it a zeroed slot: every XML char ref (&#60; &#34; ...)
-   decoded to 0 -> 'not well-formed' on valid documents. Fix: apply
-   paramref_subst to phi_incoming operands as well.
+1. flush_vecreg_liveout width bug (zlib-ng adler32_avx512 build break):
+   the live-out flush assumed vec_live_regs only holds xmm names and
+   emitted the SSE 'movdqu' for zmm/ymm registers — an illegal encoding
+   the internal assembler rightly rejected ('movdqu: no AVX-512/EVEX
+   form'). Emit vmovdqu64 / vmovdqu / movdqu by register class.
 
-2. PEEPHOLE fuse_add_sign_extend, REMOVED as unsound by design: it
-   rewrote 'addl %X,%X; movslq %X,%DST' into 'addl %X,%DSTd'. Its own
-   SAFETY comment required 'DST was initialized with the same value'
-   but nothing checked that — %DSTd is typically garbage at that point
-   — and the rewrite also DROPS the sign extension entirely. In expat's
-   reportProcessingInstruction the PI-target length became garbage and
-   XmlNameLength walked off the end of the heap buffer (SIGSEGV in
-   runtests + runtests_cxx). A sound version would still need the init
-   proof AND a following sext, saving nothing: deleted, not gated.
+2. aggregate_copy_forward dest-liveness window (zlib-ng CRC corruption):
+   forward_store_only_temporaries redirects every write of root up to
+   the memcpy so it lands in dest EARLY. That is only sound if dest's
+   old contents are provably dead throughout [first redirected use,
+   copy): any read of dest's object in that window now observes the new
+   value. zlib-ng's fold_1 register rotation
+   (tmp=*c3; *c3=*c0; *c1=*c2; *c2=tmp) read c2's OLD value after the
+   snapshot write was redirected into c2 — every crc32_fold_copy+fold
+   pair with unaligned lengths produced a wrong CRC, so gzip-wrapped
+   decompression of any stream larger than one inflate window failed
+   with 'incorrect data check' (minigzip -d, gzread). The validation
+   now rejects candidates whose dest object is referenced (read OR
+   written) inside the window. Regression: agg_fwd_dest_liveness.c
+   locks in the rotation shape.
 
-PROOF: expat 2.7.3 configure CC=lccc CFLAGS=-O2 && make check:
-was FAIL 2/2 (acc_tests ERROR + SIGSEGV) -> now PASS 2/2.
-Minimal repro locked in below as regression tests.
+PROOF (CC=lccc -O2):
+  zlib-ng 2.2.4: configure+make clean (incl. AVX512 TUs); make test
+  PASS; 64K/256K/1M/4M random gzip round-trips OK; system-gzip
+  cross-decompression OK; fold_copy+fold split-length matrix
+  (17/999, 16/1000, 15/17, ...) matches oneshot CRC for all pairs
+  (was 8/11 MISMATCH).
+  Full battery: 653 lib tests, 161 regressions, 50 correctness,
+  86 linker, 240/240 differential fuzz, asm-diff clean.
+  gzip 1.14 30/30, expat 2.7.3 2/2, sqlite 3.50.4 differential
+  byte-identical vs system sqlite3.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
 ---
- .../codegen/peephole/passes/local_patterns.rs | 100 ------------------
- .../x86/codegen/peephole/passes/mod.rs        |  17 +--
- src/passes/inline.rs                          |  22 ++++
- 3 files changed, 32 insertions(+), 107 deletions(-)
+ src/backend/x86/codegen/emit.rs          | 14 +++++-
+ src/passes/aggregate_copy_forward.rs     | 56 ++++++++++++++++++++++++
+ tests/regression/agg_fwd_dest_liveness.c | 23 ++++++++++
+ 3 files changed, 92 insertions(+), 1 deletion(-)
+ create mode 100644 tests/regression/agg_fwd_dest_liveness.c
 
-diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-index 5d28e7c0..c22b5a6f 100644
---- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-+++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-@@ -3443,106 +3443,6 @@ pub(super) fn hoist_loop_invariant_fp_broadcast(
- // The 32-bit addl into %DSTd automatically zero-extends to 64-bit on x86-64.
- // This is safe when the value is non-negative (array indices, loop counters).
- 
--pub(super) fn fuse_add_sign_extend(
--    store: &mut LineStore,
--    infos: &mut [LineInfo],
--) -> bool {
--    let len = store.len();
--    let mut changed = false;
--    let mut i = 0;
--
--    // Simple adjacent-pair scan: find addl %X, %TMP immediately followed by
--    // movslq %TMP, %DST. Check that %TMP is not used elsewhere in the
--    // surrounding block.
--    //
--    // SAFETY: addl %X, %TMP is a read-modify-write: it reads TMP, adds X,
--    // writes back to TMP. We can only redirect the destination to DST when
--    // TMP == X (self-add, e.g. addl %ebx, %ebx → doubling), because then
--    // changing to addl %DSTd, %DSTd is correct if DST was initialized with
--    // the same value. For X != TMP, the redirect loses the TMP read.
--    while i + 1 < len {
--        let t1 = store.get(i).trim().to_string();
--        if !t1.starts_with("addl %") { i += 1; continue; }
--        let parts1: Vec<&str> = t1.split(", %").collect();
--        if parts1.len() != 2 { i += 1; continue; }
--        let src_reg = parts1[0][6..].to_string(); // after "addl %"
--        let tmp_reg = parts1[1].to_string();
--
--        // addl %X, %TMP is read-modify-write on TMP. Redirecting the
--        // destination to DST is only safe when X == TMP (self-add / doubling).
--        // For X != TMP, the old TMP value is part of the computation and
--        // DST wouldn't have it.
--        let src_base = src_reg.trim_end_matches('d').to_string();
--        if src_base != tmp_reg && src_reg != tmp_reg {
--            i += 1; continue;
--        }
--
--        // Next line must be movslq %TMP, %DST (check all lines in case of multi-line)
--        let t2_raw = store.get(i + 1);
--        let t2 = t2_raw.trim().to_string();
--        // Handle multi-line entries: check first line
--        let t2_first = t2.split('\n').next().unwrap_or(&t2).trim().to_string();
--        if !t2_first.starts_with("movslq %") { i += 1; continue; }
--        let parts2: Vec<&str> = t2_first.split(", %").collect();
--        if parts2.len() != 2 { i += 1; continue; }
--        let sext_src = parts2[0][8..].to_string();
--        let dst_reg = parts2[1].to_string();
--
--        let sext_base = sext_src.trim_end_matches('d').to_string();
--        if sext_base != tmp_reg && sext_src != tmp_reg {
--            i += 1; continue;
--        }
--
--        // Find enclosing block bounds for safety check
--        let mut block_start = 0;
--        for k in (0..i).rev() {
--            let tk = store.get(k);
--            if tk.trim().ends_with(':') || tk.contains(":\n") {
--                block_start = k;
--                break;
--            }
--        }
--        let mut block_end = len - 1;
--        for k in (i + 2)..len.min(i + 30) {
--            let tk = store.get(k).trim().to_string();
--            if tk.starts_with("j") || tk.ends_with(':') {
--                block_end = k;
--                break;
--            }
--        }
--
--        // Safety: %TMP must not appear elsewhere in the block
--        let tmp_pattern = format!("%{}", tmp_reg);
--        let mut tmp_used_elsewhere = false;
--        for k in block_start..=block_end {
--            if k == i || k == i + 1 { continue; }
--            let tk = store.get(k).to_string();
--            if tk.contains(&tmp_pattern) {
--                tmp_used_elsewhere = true;
--                break;
--            }
--        }
--        if tmp_used_elsewhere { i += 1; continue; }
--
--        // Transform!
--        let Some(dst_reg32) = bare_reg_64_to_32(&dst_reg) else { i += 1; continue; };
--        let new_add = format!("    addl %{}, %{}", src_reg, dst_reg32);
--        let t2_raw_owned = store.get(i + 1).to_string();
--        store.replace(i, new_add);
--        // If movslq was part of a multi-line entry, keep the rest
--        if t2_raw_owned.contains('\n') {
--            let rest = t2_raw_owned.split_once('\n').map(|(_, r)| r).unwrap_or("");
--            store.replace(i + 1, rest.to_string());
--        } else {
--            store.replace(i + 1, String::new());
--        }
--        changed = true;
--        i += 2;
--        continue;
--    }
--    changed
--}
--
- // ── Increment chain collapse ─────────────────────────────────────────────────
- //
- // Collapses a common SSA phi-resolution pattern for loop counter increments:
-diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
-index cb3201f8..7200f169 100644
---- a/src/backend/x86/codegen/peephole/passes/mod.rs
-+++ b/src/backend/x86/codegen/peephole/passes/mod.rs
-@@ -376,7 +376,15 @@ pub fn peephole_optimize(mut asm: String) -> String {
-         if !sk("phi_coalesce") { changed |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos); }
-         if !sk("signext_move") { changed |= local_patterns::fuse_signext_and_move(&mut store, &mut infos); }
-         if !sk("inc_chain") { changed |= local_patterns::collapse_increment_chain(&mut store, &mut infos); }
--        if !sk("add_signext") { changed |= local_patterns::fuse_add_sign_extend(&mut store, &mut infos); }
-+        // add_signext (fuse_add_sign_extend) REMOVED: it rewrote
-+        // `addl %X,%X; movslq %X,%DST` into `addl %X,%DSTd`, which (a) reads
-+        // an uninitialized %DSTd — its own SAFETY comment required "DST was
-+        // initialized with the same value" but never checked it — and
-+        // (b) drops the sign extension (addl zero-extends the upper half).
-+        // expat xmlparse.c reportProcessingInstruction: the PI-target length
-+        // became garbage and XmlNameLength walked off the buffer (SIGSEGV).
-+        // A sound fusion saves nothing (still needs init + sext), so the
-+        // pass is deleted rather than gated.
-         if !sk("copy_shift_back") { changed |= local_patterns::fold_copy_shift_copyback(&mut store, &mut infos); }
-         if !sk("xor_move_fold") { changed |= local_patterns::fold_zero_extended_xor_moves(&mut store, &mut infos); }
-         if !sk("rotate_idiom") { changed |= local_patterns::fold_rotate_idiom(&mut store, &mut infos); }
-@@ -454,7 +462,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
- 
-     // Phase 3b: Fuse addl+movslq in loops (must run BEFORE trampoline elimination,
-     // which may remove the conditional back-edge that this pass uses to detect loops).
--    if !skip_phase4 && !sk("fuse_add_sign_extend") { local_patterns::fuse_add_sign_extend(&mut store, &mut infos); }
-+    // fuse_add_sign_extend removed (unsound: uninitialized dest + dropped sext).
- 
-     // Phase 4: Eliminate loop backedge trampoline blocks.
-     let trampoline_changed = if skip_phase4 || sk("loop_trampoline") { false } else {
-@@ -502,11 +510,6 @@ pub fn peephole_optimize(mut asm: String) -> String {
-         local_patterns::rotate_loops(&mut store, &mut infos);
-     }
- 
--    // Phase 4e: Fuse addl+movslq after loop rotation.
--    if !skip_phase4 && !sk("fuse_add_sign_extend") {
--        local_patterns::fuse_add_sign_extend(&mut store, &mut infos);
--    }
--
-     // Phase 5: Tail call optimization.
-     if !skip_phase5 {
-         tail_call::optimize_tail_calls(&mut store, &mut infos);
-diff --git a/src/passes/inline.rs b/src/passes/inline.rs
-index 23e5eeb4..3d544900 100644
---- a/src/passes/inline.rs
-+++ b/src/passes/inline.rs
-@@ -2517,6 +2517,28 @@ fn inline_call_site(
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index a6c16df5..3a47878f 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -741,8 +741,20 @@ impl X86Codegen {
+                 } else {
+                     self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
                  }
-             });
++                // Width-correct store: vec_live_regs can hold xmm (128-bit),
++                // ymm (256-bit) or zmm (512-bit) names; movdqu is the SSE
++                // 128-bit form and is ILLEGAL for the wider registers (the
++                // internal assembler rightly rejected `movdqu %zmm0, (%rax)`
++                // in zlib-ng's adler32_avx512).
++                let mov = if reg_name.starts_with("zmm") {
++                    "vmovdqu64"
++                } else if reg_name.starts_with("ymm") {
++                    "vmovdqu"
++                } else {
++                    "movdqu"
++                };
+                 self.state
+-                    .emit_fmt(format_args!("    movdqu %{}, (%rax)", reg_name));
++                    .emit_fmt(format_args!("    {} %{}, (%rax)", mov, reg_name));
+             }
          }
-+        // CRITICAL: phi_incoming was collected from the callee's Return
-+        // terminators BEFORE this substitution ran (those Returns are
-+        // already rewritten to Branch(merge), so the loop above cannot see
-+        // their operands). A callee that returns its own parameter (e.g.
-+        // expat's checkCharRefNumber: `return result` where result IS the
-+        // ParamRef value after copy-prop) left the stale pre-substitution
-+        // id in the merge phi — an undefined value at codegen time (the
-+        // switch 'break' path returned 0 instead of result; char refs
-+        // &#60; etc. all decoded to 0).
-+        for (op, _) in phi_incoming.iter_mut() {
-+            if let Operand::Value(v) = op {
-+                if let Some(&replacement) = paramref_subst.get(&v.0) {
-+                    if paramref_debug {
-+                        eprintln!(
-+                            "[INLINE_PARAMREF] {} return-phi v{} -> {:?}",
-+                            site.callee_name, v.0, replacement
-+                        );
-+                    }
-+                    *op = replacement;
+     }
+diff --git a/src/passes/aggregate_copy_forward.rs b/src/passes/aggregate_copy_forward.rs
+index a0a3039b..63a2c289 100644
+--- a/src/passes/aggregate_copy_forward.rs
++++ b/src/passes/aggregate_copy_forward.rs
+@@ -357,6 +357,56 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
+     for root in invalid { copies.remove(&root); }
+     if copies.is_empty() { return 0; }
+ 
++    // DEST-LIVENESS WINDOW: forwarding moves every write of `root` up to the
++    // memcpy so that it lands in `dest` EARLY. That is only sound if dest's
++    // OLD contents are provably dead throughout [first redirected use, copy):
++    // any read of dest's memory in that window would now observe the new
++    // value; any write would be clobbered by the redirected stores. The
++    // previous validation only inspected uses of ROOT — never of DEST.
++    // zlib-ng fold_1: `x_tmp3=*c3; *c3=*c0; *c1=*c2; ...; *c2=x_tmp3` — the
++    // snapshot write was redirected into c2 while `*c1=*c2` still read c2's
++    // old value (CRC mismatch on every odd-length fold_copy+fold sequence).
++    {
++        let mut reject = FxHashSet::default();
++        for (&root, &(copy_b, copy_i, dest)) in &copies {
++            // dest's aliasing root (dest may be a GEP into a larger object;
++            // any access to that object is conservatively a conflict).
++            let dest_root = paths.get(&dest.0).map(|p| p.0).unwrap_or(dest.0);
++            // First instruction that references `root` before the copy.
++            let mut first_use = copy_i;
++            for (ii, inst) in func.blocks[copy_b].instructions.iter().enumerate() {
++                if ii >= copy_i { break; }
++                let mut hit = false;
++                inst.for_each_used_value(|v| {
++                    if paths.get(&v).is_some_and(|p| p.0 == root) { hit = true; }
++                });
++                if let Some(d) = inst.dest() {
++                    if paths.get(&d.0).is_some_and(|p| p.0 == root) { hit = true; }
 +                }
++                if hit { first_use = ii; break; }
++            }
++            // dest's object must be untouched inside the window (the memcpy
++            // itself at copy_i is the legitimate final write).
++            for ii in first_use..copy_i {
++                let inst = &func.blocks[copy_b].instructions[ii];
++                let mut touches_dest = false;
++                inst.for_each_used_value(|v| {
++                    if v == dest.0 || paths.get(&v).is_some_and(|p| p.0 == dest_root) {
++                        touches_dest = true;
++                    }
++                });
++                if let Some(d) = inst.dest() {
++                    if d.0 == dest.0 || paths.get(&d.0).is_some_and(|p| p.0 == dest_root) {
++                        touches_dest = true;
++                    }
++                }
++                if touches_dest { reject.insert(root); break; }
 +            }
 +        }
++        for root in reject { copies.remove(&root); }
++    }
++    if copies.is_empty() { return 0; }
++
+     let mut changes = 0;
+     for (&root, &(bi, copy_i, dest)) in &copies {
+         for (ii, inst) in func.blocks[bi].instructions.iter_mut().enumerate() {
+@@ -511,6 +561,12 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
+         source
      }
  
-     // Now split the caller's block at the call site:
--- 
-2.47.3
-
-
-From e8fbcd5a19411940f41fb5803000f78b97bee004 Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sat, 15 Aug 2026 18:41:17 +0000
-Subject: [PATCH 09/10] tests: lock in expat-shape inliner + peephole
- regressions
-
-inline_return_param_phi.c: callee returns its parameter through a
-switch/break CFG; after inlining into two callers the merge phi must
-reference the substituted argument load, never the removed ParamRef id.
-
-peephole_add_signext_init.c: the addl+movslq shape that add_signext
-used to fuse into an uninitialized destination register.
-
-159/159 regressions.
----
- tests/regression/inline_return_param_phi.c   | 47 ++++++++++++++++++++
- tests/regression/peephole_add_signext_init.c | 26 +++++++++++
- 2 files changed, 73 insertions(+)
- create mode 100644 tests/regression/inline_return_param_phi.c
- create mode 100644 tests/regression/peephole_add_signext_init.c
-
-diff --git a/tests/regression/inline_return_param_phi.c b/tests/regression/inline_return_param_phi.c
++    if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
++        for (root, c) in &candidates {
++            eprintln!("[AGGFWD] {} root=v{} src=v{} src_root=v{} at b{}:{}",
++                func.name, root, c.source.0, c.source_root, c.block, c.inst);
++        }
++    }
+     let mut changes = 0;
+     for bi in 0..func.blocks.len() {
+         let old = std::mem::take(&mut func.blocks[bi].instructions);
+diff --git a/tests/regression/agg_fwd_dest_liveness.c b/tests/regression/agg_fwd_dest_liveness.c
 new file mode 100644
-index 00000000..9ce18c55
+index 00000000..21772445
 --- /dev/null
-+++ b/tests/regression/inline_return_param_phi.c
-@@ -0,0 +1,47 @@
-+/* Regression: inliner return-value phi must receive ParamRef substitution.
-+ * A callee returning its own parameter through a multi-return CFG (switch
-+ * with break) left a stale value id in the merge phi after inlining:
-+ * checkCharRefNumber-shape functions returned 0 instead of the parameter.
-+ * (expat 2.7.3: every XML char ref decoded to 0.) */
-+#include <stdio.h>
-+static unsigned char type_tab[256];
-+static int check(int result) {
-+    switch (result >> 8) {
-+    case 0xD8: case 0xD9: case 0xDA: case 0xDB:
-+    case 0xDC: case 0xDD: case 0xDE: case 0xDF:
-+        return -1;
-+    case 0:
-+        if (type_tab[result] == 0) return -1;
-+        break;
-+    case 0xFF:
-+        if (result == 0xFFFE || result == 0xFFFF) return -1;
-+        break;
-+    }
-+    return result;
-+}
-+static int __attribute__((noinline)) crn_a(const char *ptr) {
-+    int result = 0;
-+    ptr += 2;
-+    for (; *ptr != ';'; ptr += 1) {
-+        result *= 10; result += ((unsigned char)*ptr - '0');
-+        if (result >= 0x110000) return -1;
-+    }
-+    return check(result);
-+}
-+static int __attribute__((noinline)) crn_b(const char *ptr) {
-+    int result = 0;
-+    ptr += 4;
-+    for (; *ptr != ';'; ptr += 2) {
-+        result *= 10; result += ((unsigned char)*ptr - '0');
-+        if (result >= 0x110000) return -1;
-+    }
-+    return check(result);
-+}
-+int main(void){
-+    type_tab[60] = 1; type_tab[34] = 2; type_tab[62] = 3;
-+    int a = crn_a("&#60;");
-+    int b = crn_a("&#34;");
-+    int c = check(0x300);
-+    printf("%d %d %d %d\n", a, b, c, crn_b("&_#_6_2_;"));
-+    return (a == 60 && b == 34 && c == 0x300) ? 0 : 1;
-+}
-diff --git a/tests/regression/peephole_add_signext_init.c b/tests/regression/peephole_add_signext_init.c
-new file mode 100644
-index 00000000..7e89ff7b
---- /dev/null
-+++ b/tests/regression/peephole_add_signext_init.c
-@@ -0,0 +1,26 @@
-+/* Regression: the removed fuse_add_sign_extend peephole rewrote
-+ * `addl %X,%X; movslq %X,%DST` to `addl %X,%DSTd`, reading uninitialized
-+ * %DSTd and dropping the sign extension. expat reportProcessingInstruction
-+ * shape: double a loaded int, sign-extend, use as pointer offset. */
-+#include <stdio.h>
++++ b/tests/regression/agg_fwd_dest_liveness.c
+@@ -0,0 +1,23 @@
++/* Regression: forward_store_only_temporaries must verify the memcpy DEST's
++ * old contents are dead in [first redirected use, copy). zlib-ng fold_1
++ * register rotation: tmp=*c3; *c3=*c0; *c1=*c2; *c2=tmp — the snapshot
++ * write was redirected into c2 while *c1=*c2 still read c2's OLD value
++ * (CRC mismatch on every fold_copy+fold pair with unaligned lengths). */
 +#include <string.h>
-+struct enc { int min_bytes; };
-+static const char *g_text;
-+static int __attribute__((noinline)) name_len(const char *p) {
-+    const char *s = p;
-+    while (*p == 'p' || *p == 'i') p++;
-+    return (int)(p - s);
-+}
-+static int __attribute__((noinline)) report(const struct enc *e, const char *start) {
-+    /* start += e->min_bytes * 2  — the addl/movslq shape */
-+    start += e->min_bytes * 2;
-+    int n = name_len(start);
-+    return n;
-+}
-+int main(void){
-+    struct enc e = { 1 };
-+    g_text = "<?pi unknown?>";
-+    int n = report(&e, g_text);
-+    printf("%d\n", n);
-+    return n == 2 ? 0 : 1;
-+}
--- 
-2.47.3
-
-
-From 3d254e2f041d60fd9516b46724b3c18359f49f0c Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sat, 15 Aug 2026 19:01:01 +0000
-Subject: [PATCH 10/10] loop_memory_promote: aliasing LOADS block promotion,
- not just stores
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-The alias check only scanned OTHER STORES for overlap with the promoted
-location. A load through a DIFFERENT pointer value with the same
-base+offset (the C frontend materializes duplicate GEPs routinely) kept
-reading the memory location whose in-loop store the promotion removed —
-stale data every iteration. sqlite 3.50.4 sqlite3FpDecode: the
-trailing-zero trimmer  loaded p->n via
-GEP#1 while the decrement was promoted via GEP#2; the loop never
-terminated and every REAL literal hung the shell (SELECT 1.5 -> timeout).
-
-Promotion now requires ALL other loads to be provably disjoint too
-(same fail-closed disjoint() as stores). Regression test locks in the
-duplicate-GEP trim-loop shape.
-
-PROOF: sqlite3 shell passes a 10k-row workload (CTEs, indexes, GROUP
-BY, LIKE, JOIN, UPDATE/DELETE, VACUUM, integrity_check, recursive
-fib(40)) with output byte-identical to the system sqlite3.
----
- src/passes/loop_memory_promote.rs           | 12 ++++++++++++
- tests/regression/loop_mem_promote_dup_gep.c | 21 +++++++++++++++++++++
- 2 files changed, 33 insertions(+)
- create mode 100644 tests/regression/loop_mem_promote_dup_gep.c
-
-diff --git a/src/passes/loop_memory_promote.rs b/src/passes/loop_memory_promote.rs
-index 9fb34509..42a40e60 100644
---- a/src/passes/loop_memory_promote.rs
-+++ b/src/passes/loop_memory_promote.rs
-@@ -135,6 +135,18 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
-                     if !disjoint(&paths, ptr, load_ty, Value(other_ptr), *other_ty) { alias = true; }
-                 }
-             }
-+            // OTHER LOADS through a different pointer value that aliases the
-+            // promoted location must also block promotion: the in-loop store
-+            // is removed, so such a load reads STALE memory. The C frontend
-+            // routinely materializes the same field address twice (two GEPs
-+            // with identical base+offset but different value ids) — sqlite
-+            // sqlite3FpDecode's trailing-zero trimmer read p->n through one
-+            // GEP while the decrement was promoted through the other,
-+            // making `while(z[n-1]=='0') n--` an infinite loop.
-+            for (&other_ptr, _other_loads) in &loads {
-+                if other_ptr == ptr_id { continue; }
-+                if !disjoint(&paths, ptr, load_ty, Value(other_ptr), load_ty) { alias = true; }
-+            }
-             if alias { continue; }
- 
-             let init = Value(func.next_value_id); func.next_value_id += 1;
-diff --git a/tests/regression/loop_mem_promote_dup_gep.c b/tests/regression/loop_mem_promote_dup_gep.c
-new file mode 100644
-index 00000000..a496b244
---- /dev/null
-+++ b/tests/regression/loop_mem_promote_dup_gep.c
-@@ -0,0 +1,21 @@
-+/* Regression: loop_memory_promote must treat a LOAD through a duplicate
-+ * GEP (same base+offset, different value id) as an alias of the promoted
-+ * location. The in-loop store is removed by promotion, so such a load
-+ * read stale memory: sqlite3FpDecode's `while(z[n-1]=='0') n--;` spun
-+ * forever (SELECT 1.5 hung). */
 +#include <stdio.h>
-+struct FpD { char sign; int n; int iDP; char *z; char zBuf[24]; };
-+static void __attribute__((noinline)) trim(struct FpD *p) {
-+    while (p->z[p->n - 1] == '0') {
-+        p->n--;
-+    }
++typedef struct { unsigned long long a, b; } V;
++static void __attribute__((noinline)) rot(V *c0, V *c1, V *c2, V *c3) {
++    V tmp;                 /* snapshot alloca */
++    memcpy(&tmp, c3, 16);  /* tmp = *c3 */
++    memcpy(c3, c0, 16);    /* mutate */
++    memcpy(c1, c2, 16);    /* READS c2's OLD value */
++    memcpy(c2, &tmp, 16);  /* c2 = snapshot (the forwarding target) */
++    c3->a ^= c3->b;
 +}
 +int main(void){
-+    struct FpD d;
-+    d.n = 8;
-+    d.z = d.zBuf;
-+    __builtin_strcpy(d.zBuf, "15000000");
-+    trim(&d);
-+    printf("n=%d\n", d.n);
-+    return d.n == 2 ? 0 : 1;
++    V c0 = {1,10}, c1 = {2,20}, c2 = {3,30}, c3 = {4,40};
++    rot(&c0, &c1, &c2, &c3);
++    printf("%llu %llu %llu %llu\n", c1.a, c1.b, c2.a, c2.b);
++    /* c1 must have OLD c2 (3,30); c2 must have old c3 (4,40) */
++    return (c1.a == 3 && c1.b == 30 && c2.a == 4 && c2.b == 40) ? 0 : 1;
 +}
 -- 
 2.47.3
