@@ -1,648 +1,1394 @@
-From c826d22d1881b49164aa9ded0096dbe2293be771 Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sun, 16 Aug 2026 01:53:09 +0000
-Subject: [PATCH] linker: lccc-ld userspace mode, hot-path fixes (-36% link
- time), real benchmark
-
-Three coordinated pieces of the LINKER_FOLLOWUP plan:
-
-1. lccc-ld GAINS THE STANDARD USERSPACE MODE. Previously it hard-errored
-   without -T/-r ('requires a linker script'), so 'make LD=lccc-ld' and
-   direct gcc-style invocations (crt1.o ... -lc --dynamic-linker ...)
-   were impossible - and the user's own 'lccc-ld -v' CLI expectation
-   only half-true. It now routes script-less links through the SAME
-   link_builtin/link_shared pipeline the compiler driver uses (archive
-   group semantics, PLT/GOT, RELRO, eh_frame_hdr, gc-sections, --wrap,
-   -u, --defsym, -z keywords, -static, -shared, rpath/soname/
-   version-script forwarding). --whole-archive without -T fails loudly
-   instead of silently dropping members; non-standard --dynamic-linker
-   values warn instead of diverging silently.
-
-2. HOT-PATH FIXES, measured with the new permanent LCCC_LD_TIME phase
-   profiler (link.rs phases + emit_exec zones):
-   - register_symbols_elf64: globals.reserve(obj.symbols.len()) - the
-     doubling cascade re-hashed every existing key on growth
-     (40k-symbol object: 23.1 -> 12.9 ms);
-   - emit_exec: the 'snapshot' globals.clone() deep-copied the whole
-     map (40k String keys) although globals is never touched afterwards
-     - replaced by a reborrow (relocs zone 9.0 -> 3.5 ms);
-   - symtab sort: cached big-endian u64 name-prefix key decides almost
-     every comparison in one instruction instead of memcmp over long
-     common prefixes ('F1','F12',...), full byte compare only on prefix
-     ties - identical order (5.3 -> 2.7 ms); entries/strtab pre-sized;
-     single-lookup symbol registration via get_mut (no key re-clone).
-   big-text profile end-to-end: 77 -> 49 ms (-36%).
-
-3. tests/linker/bench_linker.py REWRITTEN as a real differential
-   benchmark: 4 synthetic profiles (many-objects/big-text/many-syms/
-   archive) + sqlite3+shell real link, every output EXECUTED and its
-   stdout verified (fast-but-wrong scores zero), best-of-3, vs bfd and
-   mold. Current standings (2-core VM):
-     many-objects 19ms vs bfd 77 / mold 95   (fastest)
-     archive      23ms vs bfd 51 / mold 15
-     big-text     51ms vs bfd 101 / mold 30
-     many-syms    43ms vs bfd 94 / mold 27
-     sqlite-exe   16ms vs mold 16 (bfd fails on this invocation)
-   mold's remaining big-text/many-syms lead is parallel reloc
-   application + faster symtab emission - tracked in LINKER_FOLLOWUP.
-
-PROOF: 86/86 linker differential tests (bfd+mold oracles), 673 lib,
-166/166 x86 regression; lccc-ld-linked sqlite3 answers SQL correctly
-(sum check); all five bench profiles verified-correct.
----
- src/backend/linker_common/dynamic.rs |  21 ++-
- src/backend/x86/linker/emit_exec.rs  |  51 ++++++-
- src/backend/x86/linker/link.rs       |  18 ++-
- src/bin/lccc_ld.rs                   | 208 ++++++++++++++++++++++-----
- src/linker_entry.rs                  |  31 ++++
- 5 files changed, 282 insertions(+), 47 deletions(-)
-
-diff --git a/src/backend/linker_common/dynamic.rs b/src/backend/linker_common/dynamic.rs
-index 42783273..11629c11 100644
---- a/src/backend/linker_common/dynamic.rs
-+++ b/src/backend/linker_common/dynamic.rs
-@@ -242,6 +242,17 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
-     globals: &mut FxHashMap<String, G>,
-     should_replace_extra: fn(existing: &G) -> bool,
- ) -> Result<(), String> {
-+    // PERF: pre-size the map for this object's symbols. Growth rehashes the
-+    // WHOLE table (re-hash every existing key string); with 40k-symbol
-+    // objects the doubling cascade dominated registration time.
-+    globals.reserve(obj.symbols.len());
-+    // PERF: single-lookup registration via get_mut + in-place replacement.
-+    // The old shape did `globals.get(&name)` followed by
-+    // `globals.insert(name.clone(), ..)` — two hashes of the string PLUS a
-+    // key clone on EVERY definition, dominating link time for symbol-heavy
-+    // objects (big-text profile: 21.5 ms of a 66 ms link inside this loop).
-+    // Replacement through `*e = ..` reuses the existing key (no clone, one
-+    // hash); only genuinely new symbols pay the clone+insert.
-     for sym in &obj.symbols {
-         if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE { continue; }
-         if sym.name.is_empty() || sym.is_local() { continue; }
-@@ -249,7 +260,7 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
-         let is_defined = !sym.is_undefined() && sym.shndx != SHN_COMMON;
- 
-         if is_defined {
--            match globals.get(&sym.name) {
-+            match globals.get_mut(&sym.name) {
-                 None => { globals.insert(sym.name.clone(), G::new_defined(obj_idx, sym)); }
-                 Some(e) => {
-                     let e_weak = e.info() >> 4 == STB_WEAK;
-@@ -259,7 +270,7 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
-                     if !e.is_defined() || should_replace_extra(e) || e_common
-                         || (e_weak && sym.is_global())
-                     {
--                        globals.insert(sym.name.clone(), G::new_defined(obj_idx, sym));
-+                        *e = G::new_defined(obj_idx, sym);
-                     } else if sym.is_global() && !e_weak && !e.is_dynamic() && e.is_defined() {
-                         // Two strong definitions of the same symbol: this is a
-                         // hard error in every mainstream linker. Silently keeping
-@@ -273,14 +284,14 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
-                 }
-             }
-         } else if sym.shndx == SHN_COMMON {
--            match globals.get(&sym.name) {
-+            match globals.get_mut(&sym.name) {
-                 None => { globals.insert(sym.name.clone(), G::new_common(obj_idx, sym)); }
-                 Some(e) => {
-                     if !e.is_defined() {
--                        globals.insert(sym.name.clone(), G::new_common(obj_idx, sym));
-+                        *e = G::new_common(obj_idx, sym);
-                     } else if e.section_idx() == SHN_COMMON && sym.size > e.size() {
-                         // COMMON vs COMMON: the largest instance wins (GNU semantics).
--                        globals.insert(sym.name.clone(), G::new_common(obj_idx, sym));
-+                        *e = G::new_common(obj_idx, sym);
-                     }
-                     // COMMON vs real definition: the real definition wins; ignore.
-                 }
-diff --git a/src/backend/x86/linker/emit_exec.rs b/src/backend/x86/linker/emit_exec.rs
-index 1b2d4f24..cdd1a2fa 100644
---- a/src/backend/x86/linker/emit_exec.rs
-+++ b/src/backend/x86/linker/emit_exec.rs
-@@ -36,6 +36,10 @@ pub(super) fn emit_executable(
-     entry_symbol: Option<&str>,
-     z_now: bool, z_relro: bool,
- ) -> Result<(), String> {
-+    let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
-+    let mut t_zone = std::time::Instant::now();
-+    macro_rules! zone { ($name:expr) => { if ld_time { eprintln!("[ldtime]   emit/{:<18} {:>7.1} ms", $name, t_zone.elapsed().as_secs_f64()*1e3); t_zone = std::time::Instant::now(); } } }
-+
-     let mut dynstr = DynStrTab::new();
-     for lib in needed_sonames { dynstr.add(lib); }
-     let rpath_string = if rpath_entries.is_empty() { None } else {
-@@ -354,6 +358,7 @@ pub(super) fn emit_executable(
-     if has_relro { phdr_count += 1; }
-     let phdr_total_size = phdr_count * 56;
- 
-+    zone!("pre-layout");
-     // === Layout ===
-     let mut offset = 64 + phdr_total_size;
-     let interp_offset = offset;
-@@ -684,6 +689,7 @@ pub(super) fn emit_executable(
-         .or_else(|| globals.get("_start").map(|s| s.value))
-         .unwrap_or(text_page_addr);
- 
-+    zone!("layout");
-     // === .symtab / .strtab (debug symbol table) ===
-     // ms178: previously the executable emitted ONLY .dynsym, so nm/gdb/perf
-     // saw no symbol table at all. Every defined global symbol (function or
-@@ -692,8 +698,13 @@ pub(super) fn emit_executable(
-     // mapped to the OUTPUT section header order (mirrors the write loop
-     // below). Symbols that resolve to linker-provided addresses (or common/
-     // absolute) use SHN_ABS/SHN_COMMON as appropriate.
--    let mut symtab_entries: Vec<[u8; 24]> = Vec::new();
--    let mut symtab_names: Vec<u8> = vec![0u8]; // strtab with leading NUL
-+    // Pre-size: every defined global plus locals lands here; growth doubling
-+    // copies 24-byte entries repeatedly (measured 8.8 ms of a 60 ms link in
-+    // this zone for a 40k-symbol object).
-+    let est_syms: usize = globals.len() + objects.iter().map(|o| o.symbols.len()).sum::<usize>() / 4 + 2;
-+    let mut symtab_entries: Vec<[u8; 24]> = Vec::with_capacity(est_syms);
-+    let mut symtab_names: Vec<u8> = Vec::with_capacity(est_syms * 12);
-+    symtab_names.push(0u8); // strtab with leading NUL
-     symtab_entries.push([0u8; 24]); // NULL symbol at index 0
- 
-     // Map output_sections index → section-header index, in write order.
-@@ -826,7 +837,7 @@ pub(super) fn emit_executable(
-                 .map(move |sym| (obj_idx, sym))
-         })
-         .collect();
--    locals.sort_by(|(oa, a), (ob, b)| {
-+    locals.sort_unstable_by(|(oa, a), (ob, b)| {
-         oa.cmp(ob)
-             .then_with(|| a.value.cmp(&b.value))
-             .then_with(|| a.name.cmp(&b.name))
-@@ -853,7 +864,26 @@ pub(super) fn emit_executable(
-         .iter()
-         .filter(|(_, g)| g.defined_in.is_some() && !g.is_dynamic)
-         .collect();
--    sym_names.sort_by(|a, b| a.0.cmp(b.0));
-+    // Sort by a cached big-endian 8-byte prefix first: for symbol-heavy
-+    // objects the names share long prefixes ("F1", "F12", ...), so plain
-+    // byte-wise cmp walks the common prefix on every comparison. The u64
-+    // prefix decides almost every comparison in one instruction; ties fall
-+    // back to the full byte compare (total order preserved, identical
-+    // resulting symtab order).
-+    let mut keyed: Vec<(u64, &String, &GlobalSymbol)> = sym_names
-+        .iter()
-+        .map(|(n, g)| {
-+            let b = n.as_bytes();
-+            let mut p = [0u8; 8];
-+            let l = b.len().min(8);
-+            p[..l].copy_from_slice(&b[..l]);
-+            (u64::from_be_bytes(p), *n, *g)
-+        })
-+        .collect();
-+    keyed.sort_unstable_by(|a, b| {
-+        a.0.cmp(&b.0).then_with(|| a.1.as_bytes().cmp(b.1.as_bytes()))
-+    });
-+    let sym_names: Vec<(&String, &GlobalSymbol)> = keyed.into_iter().map(|(_, n, g)| (n, g)).collect();
-     for (name, gsym) in &sym_names {
-         let off = symtab_names.len() as u32;
-         symtab_names.extend_from_slice(name.as_bytes());
-@@ -879,6 +909,7 @@ pub(super) fn emit_executable(
-         e[16..24].copy_from_slice(&gsym.size.to_le_bytes());
-         symtab_entries.push(e);
-     }
-+    zone!("symtab");
-     // === Build output buffer ===
-     let file_size = offset as usize;
-     let mut out = vec![0u8; file_size];
-@@ -1195,9 +1226,13 @@ pub(super) fn emit_executable(
-         }
-     }
- 
-+    zone!("buffer");
-     // === Apply relocations ===
--    // Snapshot globals to avoid borrow issues
--    let globals_snap: FxHashMap<String, GlobalSymbol> = globals.clone();
-+    // `globals` is never touched again after this point, so a plain reborrow
-+    // suffices. The old `.clone()` deep-copied the entire map — 40k String
-+    // keys + values — on EVERY link (several ms and a peak-RSS spike on
-+    // symbol-heavy inputs) for no semantic benefit.
-+    let globals_snap: &FxHashMap<String, GlobalSymbol> = globals;
- 
-     // Precomputed ordinal of each non-PLT GOT entry (index into the .got
-     // section). Replaces per-relocation prefix scans that were O(GOT^2).
-@@ -1238,7 +1273,7 @@ pub(super) fn emit_executable(
-                 // Skip relocations whose bytes were consumed by a TLS GD/LD->LE
-                 // rewrite (the __tls_get_addr call no longer exists).
-                 if tls_consumed.iter().any(|&(cs, ce)| fp >= cs && fp < ce) { continue; }
--                let s = resolve_sym(obj_idx, sym, &globals_snap, section_map, output_sections,
-+                let s = resolve_sym(obj_idx, sym, globals_snap, section_map, output_sections,
-                                     plt_addr);
- 
-                 match rela.rela_type {
-@@ -1495,6 +1530,7 @@ pub(super) fn emit_executable(
-         }
-     }
- 
-+    zone!("relocs");
-     // === Append section headers ===
-     // Build .shstrtab string table
-     let mut shstrtab = vec![0u8]; // null byte at offset 0
-@@ -1737,6 +1773,7 @@ pub(super) fn emit_executable(
-     // e_shstrndx at offset 62 (2 bytes)
-     out[62..64].copy_from_slice(&shstrtab_shidx.to_le_bytes());
- 
-+    zone!("headers");
-     std::fs::write(output_path, &out).map_err(|e| format!("failed to write '{}': {}", output_path, e))?;
-     #[cfg(unix)]
-     {
-diff --git a/src/backend/x86/linker/link.rs b/src/backend/x86/linker/link.rs
-index d1c9772a..de673935 100644
---- a/src/backend/x86/linker/link.rs
-+++ b/src/backend/x86/linker/link.rs
-@@ -25,6 +25,10 @@ pub fn link_builtin(
-     crt_objects_after: &[&str],
- ) -> Result<(), String> {
-     let is_static = user_args.iter().any(|a| a == "-static");
-+    let t_all = std::time::Instant::now();
-+    let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
-+    let mut t_phase = std::time::Instant::now();
-+    macro_rules! phase { ($name:expr) => { if ld_time { eprintln!("[ldtime] {:<24} {:>7.1} ms", $name, t_phase.elapsed().as_secs_f64()*1e3); t_phase = std::time::Instant::now(); } } }
-     let mut objects: Vec<ElfObject> = Vec::new();
-     let mut globals: FxHashMap<String, GlobalSymbol> = FxHashMap::default();
-     let mut needed_sonames: Vec<String> = Vec::new();
-@@ -42,6 +46,7 @@ pub fn link_builtin(
-         load_file(path, &mut objects, &mut globals, &mut needed_sonames, &lib_path_strings, false)?;
-     }
- 
-+    phase!("load-inputs");
-     // Parse user args using shared infrastructure
-     let parsed_args = linker_common::parse_linker_args(user_args);
-     let extra_lib_paths = parsed_args.extra_lib_paths;
-@@ -228,6 +233,7 @@ pub fn link_builtin(
-     // Check for truly undefined (non-weak, non-dynamic, non-linker-defined) symbols
-     linker_common::check_undefined_symbols_elf64_verbose(&globals, 20, &objects)?;
- 
-+    phase!("resolve+gc");
-     // SHF_MERGE string/constant deduplication (.rodata.str1.1, .rodata.cst8):
-     // build pools across all objects, rewrite relocations to pool symbols,
-     // and retire the input sections. Disabled with LCCC_NO_STRING_MERGE=1.
-@@ -249,28 +255,36 @@ pub fn link_builtin(
-         }
-     }
- 
-+    phase!("strmerge");
-     // Merge sections (skip dead sections when gc-sections is active)
-     let mut output_sections: Vec<OutputSection> = Vec::new();
-     let mut section_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
-     linker_common::merge_sections_elf64_gc(&objects, &mut output_sections, &mut section_map, &dead_sections);
- 
-+    phase!("merge-sections");
-     // Allocate COMMON symbols
-     linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections);
- 
-+    phase!("common");
-     // Create PLT/GOT
-     let (plt_names, got_entries) = create_plt_got(&objects, &mut globals);
- 
-+    phase!("plt-got");
-     // Collect IFUNC symbols for static linking
-     let ifunc_symbols = collect_ifunc_symbols(&globals, is_static);
- 
-+    phase!("ifunc");
-     // Emit executable
--    emit_executable(
-+    let r = emit_executable(
-         &objects, &mut globals, &mut output_sections, &section_map,
-         &plt_names, &got_entries, &needed_sonames, output_path,
-         export_dynamic, &rpath_entries, use_runpath, is_static,
-         &ifunc_symbols, entry_symbol.as_deref(),
-         parsed_args.z_now, parsed_args.z_relro,
--    )
-+    );
-+    phase!("emit-exec");
-+    if ld_time { eprintln!("[ldtime] {:<24} {:>7.1} ms", "TOTAL", t_all.elapsed().as_secs_f64()*1e3); }
-+    r
+diff --git a/src/backend/asm_preprocess.rs b/src/backend/asm_preprocess.rs
+index 2a632ed..246df1a 100644
+--- a/src/backend/asm_preprocess.rs
++++ b/src/backend/asm_preprocess.rs
+@@ -443,6 +443,49 @@ pub(crate) struct MacroDef {
+     body: Vec<String>,
  }
  
- /// Create a shared library (.so) from object files.
-diff --git a/src/bin/lccc_ld.rs b/src/bin/lccc_ld.rs
-index 32e43daf..ae2ea1b0 100644
---- a/src/bin/lccc_ld.rs
-+++ b/src/bin/lccc_ld.rs
-@@ -1,18 +1,22 @@
- //! `lccc-ld`: GNU-ld-compatible command-line driver for the LCCC linker.
- //!
- //! Supports the invocation styles used by large build systems that call the
--//! linker directly (most importantly the Linux kernel's
--//! `scripts/link-vmlinux.sh`):
-+//! linker directly:
- //!
--//! ```text
--//! lccc-ld -m elf_x86_64 -z noexecstack --script=vmlinux.lds -o vmlinux \
--//!         --whole-archive vmlinux.a --no-whole-archive \
--//!         --start-group --end-group extra.o ...
--//! ```
-+//! * Kernel-style script links (`scripts/link-vmlinux.sh`):
-+//!   `lccc-ld -m elf_x86_64 --script=vmlinux.lds -o vmlinux --whole-archive …`
-+//!   → script-driven layout engine (`emit_script`).
-+//! * Relocatable links: `lccc-ld -r a.o b.o -o ab.o` → `emit_rel`.
-+//! * Standard userspace links, exactly as gcc/clang spawn the system ld:
-+//!   `lccc-ld -o app crt1.o crti.o app.o crtn.o -Ldir -lc
-+//!            --dynamic-linker /lib64/ld-linux-x86-64.so.2`
-+//!   → the same `link_builtin` pipeline the lccc compiler driver uses
-+//!   (symbol resolution, archives/group semantics, PLT/GOT, RELRO,
-+//!   eh_frame_hdr, build-id, gc-sections, …).
- //!
--//! When a full `SECTIONS` script is given via `-T`/`--script`, the link is
--//! performed by the script-driven layout engine (`emit_script`). Without a
--//! script it falls back to the standard built-in executable emitter.
-+//! The userspace path makes `lccc-ld` a drop-in for `ld` in Makefiles
-+//! (`make LD=lccc-ld`) and lets the differential benchmark compare the same
-+//! CLI against bfd/mold instead of routing through the compiler driver.
- 
- fn main() {
-     let args: Vec<String> = std::env::args().skip(1).collect();
-@@ -35,6 +39,10 @@ fn run(args: &[String]) -> Result<(), String> {
-     let mut is_pie = false;
-     let mut build_id = false;
-     let mut entry_override: Option<String> = None;
-+    let mut shared = false;
-+    // Arguments forwarded verbatim into the builtin userspace pipeline
-+    // (parse_linker_args understands the GNU spellings directly).
-+    let mut passthrough: Vec<String> = Vec::new();
- 
-     let mut i = 0;
-     while i < args.len() {
-@@ -42,7 +50,6 @@ fn run(args: &[String]) -> Result<(), String> {
-         match a {
-             "-o" => { i += 1; output = args.get(i).cloned().ok_or("-o needs an argument")?; }
-             "-m" => { i += 1; /* emulation: elf_x86_64 assumed */ }
--            "-z" => { i += 1; /* -z keywords: accepted */ }
-             "-T" | "--script" => {
-                 i += 1;
-                 script_path = Some(args.get(i).cloned().ok_or("-T needs an argument")?);
-@@ -50,10 +57,14 @@ fn run(args: &[String]) -> Result<(), String> {
-             "-r" | "--relocatable" | "-i" => relocatable = true,
-             "-pie" | "--pic-executable" => is_pie = true,
-             "-no-pie" => is_pie = false,
-+            "-shared" | "-Bshareable" => shared = true,
-             "--no-dynamic-linker" | "--no-ld-generated-unwind-info" => {}
-             "--whole-archive" => whole_archive = true,
-             "--no-whole-archive" => whole_archive = false,
--            "--start-group" | "--end-group" | "-(" | "-)" => {}
-+            "--start-group" | "--end-group" | "-(" | "-)" => {
-+                // Builtin archive loading already iterates to a fixpoint
-+                // (global group semantics), which subsumes group regions.
-+            }
-             "--strip-debug" | "-S" => {}
-             "--strip-all" | "-s" => emit_symtab = false,
-             "-v" | "--version" => {
-@@ -62,13 +73,47 @@ fn run(args: &[String]) -> Result<(), String> {
-             }
-             "--help" => {
-                 println!("Usage: lccc-ld [options] file...");
-+                println!("  Standard userspace, -r relocatable, and -T script links supported.");
-                 return Ok(());
-             }
-             "-e" | "--entry" => {
-                 i += 1;
-                 entry_override = args.get(i).cloned();
-+                if let Some(e) = &entry_override {
-+                    passthrough.push(format!("--entry={}", e));
-+                }
-             }
-             "-Map" => { i += 1; }
-+            "--dynamic-linker" | "-dynamic-linker" | "-I" => {
-+                // The builtin emitter hardwires the standard glibc interp
-+                // path; accept and verify rather than silently diverging.
-+                i += 1;
-+                if let Some(p) = args.get(i) {
-+                    if p != "/lib64/ld-linux-x86-64.so.2" && !p.is_empty() {
-+                        eprintln!(
-+                            "lccc-ld: warning: non-standard --dynamic-linker '{}' \
-+                             (builtin emitter uses /lib64/ld-linux-x86-64.so.2)",
-+                            p
-+                        );
-+                    }
-+                }
-+            }
-+            "-z" => {
-+                i += 1;
-+                if let Some(kw) = args.get(i) {
-+                    passthrough.push(format!("-Wl,-z,{}", kw));
-+                }
-+            }
-+            "-static" | "-Bstatic" | "-dn" | "-non_shared" => {
-+                passthrough.push("-static".to_string());
-+            }
-+            "-Bdynamic" | "-dy" | "-call_shared" => {}
-+            "--gc-sections" => passthrough.push("-Wl,--gc-sections".to_string()),
-+            "--no-gc-sections" => {}
-+            "--export-dynamic" | "-E" => passthrough.push("-rdynamic".to_string()),
-+            "--as-needed" | "--no-as-needed" | "--eh-frame-hdr"
-+            | "--fix-cortex-a53-843419" | "--no-copy-dt-needed-entries"
-+            | "--allow-shlib-undefined" | "-X" | "-x" => {}
-             _ => {
-                 if let Some(v) = a.strip_prefix("--script=") {
-                     script_path = Some(v.to_string());
-@@ -76,16 +121,78 @@ fn run(args: &[String]) -> Result<(), String> {
-                     if !v.is_empty() { script_path = Some(v.to_string()); }
-                 } else if let Some(v) = a.strip_prefix("--entry=") {
-                     entry_override = Some(v.to_string());
-+                    passthrough.push(a.to_string());
-                 } else if let Some(v) = a.strip_prefix("-Map=") {
-                     let _ = v;
-+                } else if a.starts_with("--dynamic-linker=") {
-+                    // handled above for the two-arg form; same policy here
-+                } else if a.starts_with("-L") {
-+                    // -Ldir or -L dir
-+                    if a == "-L" {
-+                        i += 1;
-+                        if let Some(d) = args.get(i) {
-+                            passthrough.push(format!("-L{}", d));
-+                        }
-+                    } else {
-+                        passthrough.push(a.to_string());
-+                    }
-+                } else if a.starts_with("-l") {
-+                    if a == "-l" {
-+                        i += 1;
-+                        if let Some(l) = args.get(i) {
-+                            passthrough.push(format!("-l{}", l));
-+                        }
-+                    } else {
-+                        passthrough.push(a.to_string());
-+                    }
-+                } else if let Some(rest) = a.strip_prefix("--wrap=") {
-+                    passthrough.push(format!("-Wl,--wrap={}", rest));
-+                } else if let Some(rest) = a.strip_prefix("--defsym=") {
-+                    passthrough.push(format!("-Wl,--defsym={}", rest));
-+                } else if let Some(rest) = a.strip_prefix("-u") {
-+                    let sym = if rest.is_empty() {
-+                        i += 1;
-+                        args.get(i).cloned().unwrap_or_default()
-+                    } else {
-+                        rest.to_string()
-+                    };
-+                    if !sym.is_empty() {
-+                        passthrough.push(format!("-Wl,-u,{}", sym));
-+                    }
-+                } else if let Some(rest) = a.strip_prefix("-rpath=") {
-+                    passthrough.push(format!("-Wl,-rpath={}", rest));
-+                } else if a == "-rpath" {
-+                    i += 1;
-+                    if let Some(p) = args.get(i) {
-+                        passthrough.push(format!("-Wl,-rpath={}", p));
-+                    }
-+                } else if a.starts_with("-soname") || a.starts_with("--soname") {
-+                    let val = if let Some(eq) = a.split_once('=') {
-+                        eq.1.to_string()
-+                    } else {
-+                        i += 1;
-+                        args.get(i).cloned().unwrap_or_default()
-+                    };
-+                    if !val.is_empty() {
-+                        passthrough.push(format!("-Wl,-soname,{}", val));
-+                    }
-                 } else if a.starts_with("--build-id") {
-                     build_id = !a.ends_with("=none");
-+                } else if a.starts_with("--version-script") {
-+                    let val = if let Some(eq) = a.split_once('=') {
-+                        eq.1.to_string()
-+                    } else {
-+                        i += 1;
-+                        args.get(i).cloned().unwrap_or_default()
-+                    };
-+                    if !val.is_empty() {
-+                        passthrough.push(format!("-Wl,--version-script={}", val));
-+                    }
-                 } else if a.starts_with("--orphan-handling")
-                     || a == "--no-warn-rwx-segments" || a.starts_with("-z")
--                    || a.starts_with("--hash-style") || a == "--as-needed"
--                    || a == "--no-as-needed" || a == "--eh-frame-hdr"
--                    || a.starts_with("--sort-section") || a == "--gc-sections"
--                    || a.starts_with("--print-") || a == "-X" || a == "-x"
-+                    || a.starts_with("--hash-style")
-+                    || a.starts_with("--sort-section")
-+                    || a.starts_with("--print-")
-                     || a.starts_with("--emit-relocs") {
-                     // accepted, not needed for correctness of the static image
-                 } else if a.starts_with('-') {
-@@ -104,30 +211,65 @@ fn run(args: &[String]) -> Result<(), String> {
-         return Err("no input files".into());
-     }
- 
--    // Load all inputs.
--    let mut objects = Vec::new();
--    lccc::linker_entry::load_inputs_x86(&inputs, &mut objects)?;
--    if build_id && !relocatable {
--        lccc::linker_entry::append_build_id_object(&mut objects);
--    }
--
-+    // ------------------------------------------------------------------
-+    // Mode 1: relocatable link (ld -r).
-+    // ------------------------------------------------------------------
-     if relocatable {
-         if script_path.is_some() {
-             eprintln!("lccc-ld: warning: -r with a linker script: script ignored");
-         }
-+        let mut objects = Vec::new();
-+        lccc::linker_entry::load_inputs_x86(&inputs, &mut objects)?;
-         return lccc::linker_entry::link_relocatable_x86(&objects, &output);
-     }
- 
--    let Some(script_path) = script_path else {
--        return Err("lccc-ld currently requires a linker script (-T/--script) or -r; \
--                    use the lccc driver for standard userspace links".into());
--    };
--    let mut script_src = std::fs::read_to_string(&script_path)
--        .map_err(|e| format!("cannot read script '{}': {}", script_path, e))?;
--    if let Some(e) = entry_override {
--        // command-line -e overrides ENTRY() in the script
--        script_src = format!("ENTRY({})\n{}", e, script_src);
-+    // ------------------------------------------------------------------
-+    // Mode 2: script-driven link (kernel-style -T).
-+    // ------------------------------------------------------------------
-+    if let Some(script_path) = script_path {
-+        let mut objects = Vec::new();
-+        lccc::linker_entry::load_inputs_x86(&inputs, &mut objects)?;
-+        if build_id {
-+            lccc::linker_entry::append_build_id_object(&mut objects);
-+        }
-+        let mut script_src = std::fs::read_to_string(&script_path)
-+            .map_err(|e| format!("cannot read script '{}': {}", script_path, e))?;
-+        if let Some(e) = entry_override {
-+            // command-line -e overrides ENTRY() in the script
-+            script_src = format!("ENTRY({})\n{}", e, script_src);
-+        }
-+        return lccc::linker_entry::link_with_script_x86(
-+            &objects, &script_src, &output, emit_symtab, is_pie);
-     }
- 
--    lccc::linker_entry::link_with_script_x86(&objects, &script_src, &output, emit_symtab, is_pie)
-+    // ------------------------------------------------------------------
-+    // Mode 3: standard userspace link — same pipeline as the compiler
-+    // driver (`link_builtin`/`link_shared`). CRT objects arrive as
-+    // positional inputs from the caller (gcc-style invocation), so no CRT
-+    // injection happens here; whole-archive members are force-loaded.
-+    // ------------------------------------------------------------------
-+    let mut object_files: Vec<String> = Vec::new();
-+    for (path, wa) in &inputs {
-+        if *wa && path.ends_with(".a") {
-+            // The builtin pipeline loads archives lazily (pull members only
-+            // when they resolve an undefined). --whole-archive semantics are
-+            // only needed by script links today; refuse loudly instead of
-+            // producing a binary that silently dropped members.
-+            return Err(format!(
-+                "--whole-archive '{}' is only supported with -T/--script or -r; \
-+                 pass the members as objects for a standard link",
-+                path
-+            ));
-+        }
-+        object_files.push(path.clone());
-+    }
-+    let object_refs: Vec<&str> = object_files.iter().map(|s| s.as_str()).collect();
-+
-+    if shared {
-+        return lccc::linker_entry::link_shared_x86(&object_refs, &output, &passthrough);
-+    }
-+    if is_pie {
-+        eprintln!("lccc-ld: warning: -pie without -T uses the fixed-base executable emitter");
-+    }
-+    lccc::linker_entry::link_builtin_x86(&object_refs, &output, &passthrough)
- }
-diff --git a/src/linker_entry.rs b/src/linker_entry.rs
-index ca8109d8..fa6af655 100644
---- a/src/linker_entry.rs
-+++ b/src/linker_entry.rs
-@@ -58,3 +58,34 @@ pub fn link_with_script_x86(
-     crate::backend::x86::linker::emit_script::link_with_script(
-         objects, script_src, output, emit_symtab, is_pie)
- }
-+
-+/// Standard userspace executable link for the standalone `lccc-ld` driver.
++/// Index of the first `=` that separates a parameter name from its default.
 +///
-+/// Exactly the compiler driver's pipeline (`link_builtin`): symbol
-+/// resolution with archive group semantics, PLT/GOT, RELRO, eh_frame_hdr,
-+/// gc-sections, --wrap/-u/--defsym. CRT objects are expected as positional
-+/// inputs (the gcc-style ld invocation lists crt1/crti/crtn explicitly), so
-+/// no CRT injection happens here; the crt slots stay empty and `user_args`
-+/// carries -L/-l/-z/... in GNU spelling for `parse_linker_args`.
-+pub fn link_builtin_x86(
-+    object_files: &[&str],
-+    output: &str,
-+    user_args: &[String],
-+) -> Result<(), String> {
-+    crate::backend::x86::linker::link_builtin(
-+        object_files, output, user_args,
-+        &[], // lib paths come from -L in user_args
-+        &[], // no implicit libs: the caller lists -lc etc. explicitly
-+        &[], // CRT before: positional
-+        &[], // CRT after: positional
-+    )
++/// Ignores `=` inside parentheses and skips the comparison operators `==`,
++/// `!=`, `<=` and `>=` so an expression default is never split mid-operator.
++fn find_toplevel_eq(s: &str) -> Option<usize> {
++    let b = s.as_bytes();
++    let mut depth = 0i32;
++    let mut i = 0;
++    while i < b.len() {
++        match b[i] {
++            b'(' => depth += 1,
++            b')' => depth -= 1,
++            b'=' if depth == 0 => {
++                let prev = if i > 0 { b[i - 1] } else { 0 };
++                let next = if i + 1 < b.len() { b[i + 1] } else { 0 };
++                let is_cmp = matches!(prev, b'!' | b'<' | b'>' | b'=') || next == b'=';
++                if !is_cmp {
++                    return Some(i);
++                }
++            }
++            _ => {}
++        }
++        i += 1;
++    }
++    None
 +}
 +
-+/// Shared-library link for the standalone `lccc-ld -shared` driver.
-+pub fn link_shared_x86(
-+    object_files: &[&str],
-+    output: &str,
-+    user_args: &[String],
-+) -> Result<(), String> {
-+    crate::backend::x86::linker::link_shared(object_files, output, user_args, &[], &[])
++/// Strip GAS parameter qualifiers from a `.macro` parameter name.
++///
++/// GAS allows `name:req` (argument is mandatory) and `name:vararg` (argument
++/// swallows the rest of the line). The qualifier is not part of the parameter
++/// NAME: the body refers to `\ftr`, not `\ftr:req`. Keeping the qualifier in
++/// the name meant substitution never fired, and the kernel's
++/// `.macro FILL_RETURN_BUFFER reg:req nr:req ftr:req ftr2=...` left every
++/// `\ftr` unexpanded in the macro body.
++fn strip_param_qualifiers(name: &str) -> String {
++    match name.split_once(':') {
++        Some((base, qual))
++            if matches!(qual, "req" | "vararg") && !base.is_empty() => base.to_string(),
++        _ => name.to_string(),
++    }
 +}
--- 
-2.47.3
-
++
+ /// Parse macro parameter list, handling `param = default_value` syntax.
+ ///
+ /// GAS allows parameters like `enable = 1` where `1` is the default value
+@@ -455,14 +498,30 @@ fn parse_macro_params(params_str: &str) -> (Vec<String>, Vec<Option<String>>) {
+     let mut params = Vec::new();
+     let mut defaults = Vec::new();
+ 
+-    // Split on commas first (primary separator), then handle whitespace within each part
+-    for part in params_str.split(',') {
++    // Split on TOP-LEVEL commas only: a parameter default may itself contain
++    // commas inside parentheses. The kernel's
++    //     .macro FILL_RETURN_BUFFER reg:req nr:req ftr:req ftr2=ALT_NOT(X86_FEATURE_ALWAYS)
++    // expands ALT_NOT() to `((... << 16) | ((3*32+21)))`, and a naive
++    // `split(',')` tore that default apart, leaving a bogus parameter whose
++    // value later reached `.4byte` as the unparsable fragment `(((1`.
++    for part in split_on_commas_raw(params_str) {
+         let part = part.trim();
+         if part.is_empty() {
+             continue;
+         }
+-        // Check for `param = default_value` syntax
+-        if let Some(eq_pos) = part.find('=') {
++        // Check for `param = default_value` syntax.
++        //
++        // Only the FIRST `=` at paren depth 0 separates the name from the
++        // default; everything after it belongs to the default, spaces included.
++        // The tokens before it are additional parameters (GAS allows
++        // whitespace as a separator), but the default itself must never be
++        // whitespace-split: the kernel writes
++        //     .macro FILL_RETURN_BUFFER ... ftr2=ALT_NOT(X86_FEATURE_ALWAYS)
++        // whose default expands to `(((1 << 0) << 16) | ((3*32+21)))`. Treating
++        // the spaces inside it as parameter separators invented parameters
++        // named `<<` and `0)` and left `\ftr2` expanding to the fragment
++        // `(((1`, which then reached `.4byte` as an unparsable expression.
++        if let Some(eq_pos) = find_toplevel_eq(part) {
+             let param_name = part[..eq_pos].trim();
+             let default_val = part[eq_pos + 1..].trim();
+             // The param name might contain spaces (e.g., "enable = 1")
+@@ -472,13 +531,13 @@ fn parse_macro_params(params_str: &str) -> (Vec<String>, Vec<Option<String>>) {
+             if tokens.len() > 1 {
+                 // Everything before the last token are separate params with no default
+                 for t in &tokens[..tokens.len() - 1] {
+-                    params.push(t.to_string());
++                    params.push(strip_param_qualifiers(t));
+                     defaults.push(None);
+                 }
+             }
+             if let Some(last) = tokens.last() {
+                 if !last.is_empty() {
+-                    params.push(last.to_string());
++                    params.push(strip_param_qualifiers(last));
+                     defaults.push(Some(default_val.to_string()));
+                 }
+             }
+@@ -486,7 +545,7 @@ fn parse_macro_params(params_str: &str) -> (Vec<String>, Vec<Option<String>>) {
+             // No default value - may contain space-separated params
+             for token in part.split_whitespace() {
+                 if !token.is_empty() {
+-                    params.push(token.to_string());
++                    params.push(strip_param_qualifiers(token));
+                     defaults.push(None);
+                 }
+             }
+diff --git a/src/backend/elf_writer_common.rs b/src/backend/elf_writer_common.rs
+index e7635fa..4dde67b 100644
+--- a/src/backend/elf_writer_common.rs
++++ b/src/backend/elf_writer_common.rs
+@@ -94,6 +94,17 @@ pub trait X86Arch {
+         Self::encode_instruction(instr, section_data_len)
+     }
+ 
++    /// Encode an instruction in 32-bit mode. Used by the x86-64 assembler when
++    /// it encounters `.code32` (mirror of `encode_instruction_code64`). The
++    /// kernel's EFI mixed-mode and realmode entry code is 32-bit assembly
++    /// living inside a 64-bit object; without this the 64-bit encoder rejects
++    /// legal `pushl %ecx` / `popl %ecx`.
++    fn encode_instruction_code32(
++        instr: &Instruction,
++        section_data_len: u64,
++    ) -> Result<EncodeResult, String> {
++        Self::encode_instruction(instr, section_data_len)
++    }
+ }
+ 
+ /// Result of encoding a single instruction.
+@@ -521,7 +532,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
+             section_type,
+             flags,
+             data: Vec::new(),
+-            alignment: if flags & SHF_EXECINSTR != 0 && name != ".init" && name != ".fini" { 16 } else { 1 },
++            // Section alignment starts at 1 and is raised by the `.p2align` /
++            // `.align` directives the section actually contains (see the
++            // AsmItem::Align arm), mirroring GNU as exactly.
++            //
++            // Forcing 16 for every executable section was wrong: sections made
++            // with `.pushsection ...,"ax"` that carry no alignment directive
++            // must stay at 1. The kernel's alternatives machinery depends on
++            // it -- `.altinstr_replacement` entries are addressed by exact byte
++            // offsets recorded in `.altinstructions`, so padding the section
++            // start to 16 shifts every later replacement away from the offset
++            // its entry points at.
++            alignment: 1,
+             relocations: Vec::new(),
+             jumps: Vec::new(),
+             align_markers: Vec::new(),
+@@ -1101,6 +1123,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
+         // the x86-64 encoder for 64-bit instruction encoding.
+         let result = if self.code_mode == 64 && A::default_code_mode() != 64 {
+             A::encode_instruction_code64(instr, base_offset)?
++        } else if self.code_mode == 32 && A::default_code_mode() == 64 {
++            A::encode_instruction_code32(instr, base_offset)?
+         } else {
+             A::encode_instruction(instr, base_offset)?
+         };
+@@ -1208,6 +1232,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
+                     jump.offset += count;
+                 }
+             }
++            // Alignment/org markers move with everything else. Omitting them
++            // left each `.p2align` after a resolved `.skip` recorded at its
++            // pre-insertion offset, so the padding was computed for the wrong
++            // position: the kernel's `vc_do_mmio` landed at 0x2043 where GAS
++            // puts it at 0x2050, and objtool rejected the object with
++            // "can't find starting instruction".
++            for marker in self.sections[*sec_idx].align_markers.iter_mut() {
++                if marker.offset >= *offset {
++                    marker.offset += count;
++                }
++            }
+             for (bsec, boff, _, _, _, _) in self.deferred_byte_diffs.iter_mut() {
+                 if *bsec == *sec_idx && *boff >= *offset {
+                     *boff += count;
+@@ -1554,18 +1589,51 @@ impl<A: X86Arch> ElfWriterCore<A> {
+     // ─── ELF emission ─────────────────────────────────────────────────
+ 
+     fn emit_elf(mut self) -> Result<Vec<u8>, String> {
+-        // Relax long jumps to short form where possible.
+-        self.relax_jumps();
+-
+-        // Resolve deferred .skip expressions (x86-64 and i686)
++        // Deferred `.skip` expressions MUST be resolved before jump relaxation.
++        //
++        // A `.skip` whose length is a label expression is emitted as a
++        // placeholder and only sized once labels are known. Relaxing jumps
++        // first computes every displacement against the placeholder layout;
++        // resizing the skip afterwards then moves the targets out from under
++        // the already-patched displacements, and nothing recomputes them.
++        //
++        // The kernel's ALTERNATIVE macros are exactly this shape:
++        //     .skip -(((775f-774f)-(772b-771b)) > 0) * ((775f-774f)-(772b-771b)),0x90
++        // pads the original instruction to the replacement's length. In
++        // sev_es_ghcb_handle_msr two such paddings sat between a `jmp` and its
++        // target, so the branch landed 3 bytes early -- in the MIDDLE of an
++        // instruction. objtool caught it as "can't find jump dest instruction";
++        // at runtime it would have executed garbage.
++        //
++        // Resolving skips first makes the layout final before any displacement
++        // is computed, which is also the order GNU as uses.
+         if A::supports_deferred_skips() {
+             self.resolve_deferred_skips()?;
+             self.resolve_deferred_byte_diffs()?;
+         }
+ 
+-        // Fix alignment/org markers for EVERY section (the jump-relaxation
+-        // path only does this for sections with jumps; .eh_frame never had
+-        // its `.align` padding fixed up otherwise).
++        // Apply `.p2align` / `.org` padding BEFORE relaxing jumps.
++        //
++        // `relax_jumps` re-runs `fixup_alignment_markers` after each size
++        // change, but only for sections that contain jumps, and only once it
++        // has already started moving things. Resolving the deferred `.skip`s
++        // above changed section sizes, so any alignment marker after a skip is
++        // stale at this point. Leaving it stale placed a function symbol at an
++        // unaligned address (`vc_do_mmio` at 0x2043 where GAS puts 0x2050) and
++        // objtool rejected the object with "can't find starting instruction".
++        //
++        // Running the fixup for every section first makes the pre-relaxation
++        // layout correct; `relax_jumps` then keeps it correct as it shrinks.
++        for sec_idx in 0..self.sections.len() {
++            self.fixup_alignment_markers(sec_idx);
++        }
++
++        // Relax long jumps to short form where possible.
++        self.relax_jumps();
++
++        // Fix alignment/org markers for EVERY section again: relaxation only
++        // maintains them for sections that actually contain jumps
++        // (.eh_frame never had its `.align` padding fixed up otherwise).
+         for sec_idx in 0..self.sections.len() {
+             self.fixup_alignment_markers(sec_idx);
+         }
+diff --git a/src/backend/generation.rs b/src/backend/generation.rs
+index 8c7e050..5e7f941 100644
+--- a/src/backend/generation.rs
++++ b/src/backend/generation.rs
+@@ -1544,6 +1544,20 @@ fn generate_function(
+     }
+ 
+     let type_dir = cg.function_type_directive();
++
++    // Align function entries to 16 bytes, as GCC/Clang do at -O1 and above.
++    //
++    // Emitted as a real `.p2align` directive rather than forced onto the
++    // section: section alignment must be derived from the directives a section
++    // actually contains (GNU as semantics). Hard-coding 16 for every executable
++    // section also padded `.pushsection ...,"ax"` sections such as the kernel's
++    // `.altinstr_replacement`, whose contents are addressed by exact byte
++    // offsets from `.altinstructions` -- objtool then rejected the object with
++    // "special: can't find new instruction".
++    if let Some(log2) = cg.function_alignment_log2() {
++        cg.state().emit_fmt(format_args!(".p2align {}", log2));
++    }
++
+     cg.state()
+         .emit_linkage(&func.name, func.is_static, func.is_weak);
+     cg.state().emit_visibility(&func.name, &func.visibility);
+diff --git a/src/backend/i686/assembler/encoder/gp_integer.rs b/src/backend/i686/assembler/encoder/gp_integer.rs
+index 1efbb08..cf3a5e6 100644
+--- a/src/backend/i686/assembler/encoder/gp_integer.rs
++++ b/src/backend/i686/assembler/encoder/gp_integer.rs
+@@ -413,6 +413,35 @@ impl super::InstructionEncoder {
+             return Err("pushw requires 1 operand".to_string());
+         }
+         match &ops[0] {
++            // `pushw %cx` -- 16-bit register push (0x66 prefix + 0x50+rd).
++            // Segment registers keep their own one-byte opcodes and take no
++            // prefix. Mirrors `encode_pop16`, which already supported all of
++            // these; only the push side was immediate-only, so the kernel's
++            // `pushw %cx` in arch/x86/boot/startup/efi-mixed.S failed.
++            Operand::Register(reg) => {
++                if is_segment_reg(&reg.name) {
++                    match reg.name.as_str() {
++                        "es" => { self.bytes.push(0x06); Ok(()) }
++                        "cs" => { self.bytes.push(0x0E); Ok(()) }
++                        "ss" => { self.bytes.push(0x16); Ok(()) }
++                        "ds" => { self.bytes.push(0x1E); Ok(()) }
++                        "fs" => { self.bytes.extend_from_slice(&[0x0F, 0xA0]); Ok(()) }
++                        "gs" => { self.bytes.extend_from_slice(&[0x0F, 0xA8]); Ok(()) }
++                        _ => Err(format!("cannot push {}", reg.name)),
++                    }
++                } else {
++                    let num = reg_num(&reg.name).ok_or("bad register")?;
++                    self.bytes.push(0x66);
++                    self.bytes.push(0x50 + num);
++                    Ok(())
++                }
++            }
++            // `pushw mem` -- 0x66 FF /6.
++            Operand::Memory(mem) => {
++                self.bytes.push(0x66);
++                self.bytes.push(0xFF);
++                self.encode_modrm_mem(6, mem)
++            }
+             Operand::Immediate(ImmediateValue::Integer(val)) => {
+                 self.bytes.push(0x66);
+                 if *val >= -128 && *val <= 127 {
+@@ -1201,6 +1230,55 @@ impl super::InstructionEncoder {
+     }
+ 
+     /// Encode far jump (ljmpl/ljmp): direct or indirect
++    /// Encode LCALL (far call): 9A cp (direct) or FF /3 (indirect memory).
++    /// Mirror of `encode_ljmp` with ModRM extension /3 and direct opcode 0x9A.
++    pub(super) fn encode_lcall(&mut self, ops: &[Operand]) -> Result<(), String> {
++        match ops.len() {
++            1 => {
++                match &ops[0] {
++                    Operand::Indirect(inner) => match inner.as_ref() {
++                        Operand::Memory(mem) => {
++                            self.emit_segment_prefix(mem);
++                            self.bytes.push(0xFF);
++                            self.encode_modrm_mem(3, mem)
++                        }
++                        Operand::Label(label) => {
++                            self.bytes.push(0xFF);
++                            self.bytes.push(self.modrm(0, 3, 5));
++                            self.add_relocation_for_label(label, R_386_32);
++                            self.bytes.extend_from_slice(&[0, 0, 0, 0]);
++                            Ok(())
++                        }
++                        _ => Err("lcall indirect requires memory or label operand".to_string()),
++                    },
++                    Operand::Memory(mem) => {
++                        self.emit_segment_prefix(mem);
++                        self.bytes.push(0xFF);
++                        self.encode_modrm_mem(3, mem)
++                    }
++                    _ => Err("lcall requires indirect memory or segment:offset operands".to_string()),
++                }
++            }
++            2 => match (&ops[0], &ops[1]) {
++                (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Integer(off))) => {
++                    self.bytes.push(0x9A);
++                    self.bytes.extend_from_slice(&(*off as u32).to_le_bytes());
++                    self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
++                    Ok(())
++                }
++                (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Symbol(sym))) => {
++                    self.bytes.push(0x9A);
++                    self.add_relocation(sym, R_386_32, 0);
++                    self.bytes.extend_from_slice(&[0, 0, 0, 0]);
++                    self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
++                    Ok(())
++                }
++                _ => Err("lcall requires $segment, $offset operands".to_string()),
++            },
++            _ => Err("lcall requires 1 or 2 operands".to_string()),
++        }
++    }
++
+     pub(super) fn encode_ljmp(&mut self, ops: &[Operand]) -> Result<(), String> {
+         match ops.len() {
+             // ljmpl *mem - indirect far jump through memory (FF /5)
+diff --git a/src/backend/i686/assembler/encoder/mod.rs b/src/backend/i686/assembler/encoder/mod.rs
+index 8a6727b..95a43ca 100644
+--- a/src/backend/i686/assembler/encoder/mod.rs
++++ b/src/backend/i686/assembler/encoder/mod.rs
+@@ -291,6 +291,7 @@ impl InstructionEncoder {
+             }
+             // Far jump
+             "ljmpl" | "ljmpw" | "ljmp" => self.encode_ljmp(ops),
++            "lcalll" | "lcallw" | "lcall" => self.encode_lcall(ops),
+             // Far return
+             "lret" | "lretl" => {
+                 if ops.is_empty() {
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index fe75e22..2ab1a65 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -55,6 +55,13 @@ pub(crate) struct CodegenOptions {
+     /// TODO: Full -mno-sse support would also need to avoid SSE in float
+     /// operations, casts, and other FP codegen paths. Currently only the
+     /// variadic ABI path is gated, which is sufficient for the Linux kernel.
++    /// Byte alignment for function entry labels (`.p2align log2`). 0 = none.
++    /// GCC/Clang use 16 at -O1..-O3 and none at -Os/-Oz.
++    pub(crate) function_alignment: u32,
++    /// -mskip-rax-setup: omit the `xorl %eax,%eax` / `movb $n,%al` reporting the
++    /// number of live SSE argument registers to a variadic callee. Only honoured
++    /// together with `no_sse`, where no such register can be in use.
++    pub(crate) skip_rax_setup: bool,
+     pub(crate) no_sse: bool,
+     /// Whether to use only general-purpose registers (-mgeneral-regs-only).
+     /// On AArch64, this prevents FP/SIMD register usage in variadic function
+diff --git a/src/backend/traits.rs b/src/backend/traits.rs
+index 9aeffce..ad888c8 100644
+--- a/src/backend/traits.rs
++++ b/src/backend/traits.rs
+@@ -1743,6 +1743,10 @@ pub trait ArchCodegen {
+     fn emit_set_return_f128_second(&mut self, src: &Operand);
+ 
+     /// Emit the function directive for the function type attribute.
++    /// log2 of the function-entry alignment, or None for no alignment.
++    /// Default none; the x86 backend overrides it from CodegenOptions.
++    fn function_alignment_log2(&self) -> Option<u32> { None }
++
+     fn function_type_directive(&self) -> &'static str {
+         "@function"
+     }
+diff --git a/src/backend/x86/assembler/elf_writer.rs b/src/backend/x86/assembler/elf_writer.rs
+index c508297..d8c3871 100644
+--- a/src/backend/x86/assembler/elf_writer.rs
++++ b/src/backend/x86/assembler/elf_writer.rs
+@@ -66,6 +66,48 @@ impl X86Arch for X86_64Arch {
+         })
+     }
+ 
++    /// Encode a `.code32` instruction with the 32-bit encoder.
++    ///
++    /// The kernel's EFI mixed-mode entry (arch/x86/boot/startup/efi-mixed.S)
++    /// and the realmode trampolines put genuine 32-bit assembly inside a
++    /// 64-bit object via `.code32`. Encoding those with the 64-bit encoder is
++    /// wrong twice over: it rejects legal 32-bit forms such as `popl %ecx`,
++    /// and where it does not reject them it would emit 64-bit operand sizes.
++    fn encode_instruction_code32(
++        instr: &Instruction,
++        _section_data_len: u64,
++    ) -> Result<EncodeResult, String> {
++        use crate::backend::i686::assembler::encoder::InstructionEncoder as I686Encoder;
++        let mut encoder = I686Encoder::new();
++        encoder.offset = 0;
++        encoder.encode(instr)?;
++
++        let instr_len = encoder.bytes.len();
++        let jump = {
++            let mnem = &instr.mnemonic;
++            let is_jump = mnem.starts_with('j') && mnem.len() >= 2;
++            if is_jump && instr.operands.len() == 1 {
++                if let Operand::Label(_) = &instr.operands[0] {
++                    let is_conditional = mnem != "jmp";
++                    let expected_len = if is_conditional { 6 } else { 5 };
++                    if instr_len == expected_len {
++                        Some(JumpDetection { is_conditional, already_short: false })
++                    } else { None }
++                } else { None }
++            } else { None }
++        };
++
++        let relocations = encoder.relocations.into_iter().map(|r| EncoderReloc {
++            offset: r.offset,
++            symbol: r.symbol,
++            reloc_type: r.reloc_type,
++            addend: r.addend,
++            diff_symbol: None,
++        }).collect();
++
++        Ok(EncodeResult { bytes: encoder.bytes, relocations, jump })
++    }
++
+     fn elf_machine() -> u16 { EM_X86_64 }
+     fn elf_class() -> u8 { ELFCLASS64 }
+ 
+diff --git a/src/backend/x86/assembler/encoder/mod.rs b/src/backend/x86/assembler/encoder/mod.rs
+index 03cfdaa..28fed03 100644
+--- a/src/backend/x86/assembler/encoder/mod.rs
++++ b/src/backend/x86/assembler/encoder/mod.rs
+@@ -95,6 +95,15 @@ impl InstructionEncoder {
+             Some("rep") | Some("repz") | Some("repe") => Some(0xF3),
+             Some("repnz") | Some("repne") => Some(0xF2),
+             Some("notrack") => Some(0x3E),
++            // Segment overrides used as standalone prefixes. `notrack` is the
++            // same 0x3E byte; the kernel's `ds wrmsr` relies on it being
++            // emitted so an ALTERNATIVE can patch the instruction in place.
++            Some("cs") => Some(0x2E),
++            Some("ss") => Some(0x36),
++            Some("ds") => Some(0x3E),
++            Some("es") => Some(0x26),
++            Some("fs") => Some(0x64),
++            Some("gs") => Some(0x65),
+             Some(p) => return Err(format!("unknown prefix: {}", p)),
+         };
+ 
+@@ -668,6 +677,21 @@ impl InstructionEncoder {
+             | "popcntl" | "popcntq" | "popcntw" => {
+                 self.encode_bit_count(ops, mnemonic)
+             }
++            // Suffix-less spellings. GCC and hand-written kernel assembly write
++            // `tzcnt %rcx,%rax` (arch/x86/include/asm/bitops.h); the operand
++            // size is implied by the registers, exactly as for `bsf`/`bswap`.
++            "tzcnt" | "lzcnt" | "popcnt" => {
++                let size = ops.iter().find_map(|o| match o {
++                    Operand::Register(r) => Some(infer_reg_size(&r.name)),
++                    _ => None,
++                }).unwrap_or(8);
++                let suffixed = match (mnemonic, size) {
++                    (m, 2) => format!("{}w", m),
++                    (m, 4) => format!("{}l", m),
++                    (m, _) => format!("{}q", m),
++                };
++                self.encode_bit_count(ops, &suffixed)
++            }
+             "bsfl" | "bsfq" | "bsrl" | "bsrq" => self.encode_bsf_bsr(ops, mnemonic),
+             "btq" | "btl" | "btsq" | "btsl" | "btrq" | "btrl" | "btcq" | "btcl" => {
+                 self.encode_bt(ops, mnemonic)
+@@ -691,6 +715,7 @@ impl InstructionEncoder {
+             // Jumps (jmpq is a common AT&T alias for jmp on x86-64)
+             "jmp" | "jmpq" => self.encode_jmp(ops),
+             "ljmpl" | "ljmpq" | "ljmp" | "ljmpw" => self.encode_ljmp(ops, mnemonic),
++            "lcalll" | "lcallq" | "lcall" | "lcallw" => self.encode_lcall(ops, mnemonic),
+             "je" | "jz" | "jne" | "jnz" | "jl" | "jle" | "jg" | "jge"
+             | "jb" | "jbe" | "ja" | "jae" | "js" | "jns" | "jo" | "jno" | "jp" | "jnp"
+             | "jc" | "jnc" => {
+@@ -1169,6 +1194,24 @@ impl InstructionEncoder {
+                 self.encode_x87_st_reg(ops, "fst", 0xDD, 0xD0),
+ 
+             // ---- Flag manipulation ----
++            // SMAP (Supervisor Mode Access Prevention). The kernel wraps every
++            // user-memory access in stac/clac via ALTERNATIVE, so essentially
++            // no uaccess-using object assembles without them.
++            "stac" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xCB]); Ok(()) }
++            "clac" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xCA]); Ok(()) }
++            // User interrupts (UINTR).
++            "clui" => { self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x01, 0xEE]); Ok(()) }
++            "stui" => { self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x01, 0xEF]); Ok(()) }
++            // Architectural serialization (SERIALIZE, Ice Lake+).
++            "serialize" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xE8]); Ok(()) }
++            // Protection keys.
++            "rdpkru" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xEE]); Ok(()) }
++            "wrpkru" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xEF]); Ok(()) }
++            // MONITOR/MWAIT (implicit operands rax/ecx/edx, eax/ecx).
++            "monitor" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xC8]); Ok(()) }
++            "mwait" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xC9]); Ok(()) }
++            // Cache maintenance.
++            "wbnoinvd" => { self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x09]); Ok(()) }
+             "clc" => { self.bytes.push(0xF8); Ok(()) }
+             "stc" => { self.bytes.push(0xF9); Ok(()) }
+             "cli" => { self.bytes.push(0xFA); Ok(()) }
+diff --git a/src/backend/x86/assembler/encoder/registers.rs b/src/backend/x86/assembler/encoder/registers.rs
+index 5a1708d..9f50c30 100644
+--- a/src/backend/x86/assembler/encoder/registers.rs
++++ b/src/backend/x86/assembler/encoder/registers.rs
+@@ -235,6 +235,10 @@ pub(crate) fn mnemonic_size_suffix(mnemonic: &str) -> Option<u8> {
+         | "endbr64" | "pause" | "mfence" | "lfence" | "sfence" | "clflush"
+         | "syscall" | "sysenter" | "cpuid" | "rdtsc" | "rdtscp" | "rdpmc"
+         | "clc" | "stc" | "cli" | "sti" | "cld" | "std" | "sahf" | "lahf" | "fninit" | "finit" | "fwait" | "wait" | "fnstcw" | "fstcw"
++        // SMAP / UINTR / SERIALIZE / PKRU / MONITOR-MWAIT / cache maintenance:
++        // zero-operand system instructions (kernel uaccess, idle, PKU paths).
++        | "stac" | "clac" | "clui" | "stui" | "serialize"
++        | "rdpkru" | "wrpkru" | "monitor" | "mwait" | "wbnoinvd"
+         | "fld1" | "fldl2e" | "fldlg2" | "fldln2" | "fldz" | "fldpi" | "fldl2t"
+         | "fabs" | "fsqrt" | "frndint" | "f2xm1" | "fscale" | "fpatan" | "fprem" | "fprem1"
+         | "fyl2x" | "fyl2xp1" | "fptan" | "fsin" | "fcos" | "fsincos" | "fxtract" | "fnclex" | "fclex" | "fxch"
+@@ -528,6 +532,8 @@ pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), S
+             | "cltq" | "cqto" | "cltd" | "cwtd" | "endbr64" | "endbr32"
+             | "cbtw" | "cbw" | "cwde" | "cdqe" | "cwd"
+             | "lfence" | "sfence" | "mfence" | "rdtsc" | "rdtscp" | "cdq" | "cqo"
++            | "stac" | "clac" | "clui" | "stui" | "serialize"
++            | "rdpkru" | "wrpkru" | "wbnoinvd"
+     ) && !ops.is_empty()
+     {
+         return Err(format!("`{}` takes no operands", mnemonic));
+diff --git a/src/backend/x86/assembler/encoder/system.rs b/src/backend/x86/assembler/encoder/system.rs
+index 2070677..827e8c8 100644
+--- a/src/backend/x86/assembler/encoder/system.rs
++++ b/src/backend/x86/assembler/encoder/system.rs
+@@ -448,6 +448,50 @@ impl super::InstructionEncoder {
+         }
+     }
+ 
++    /// Encode LCALL (far call): 9A cp (direct) or FF /3 (indirect memory).
++    ///
++    /// Same shapes as LJMP but ModRM extension /3 and direct opcode 0x9A. The
++    /// kernel's EFI mixed-mode thunk uses `lcalll *efi32_call(%rip)` to drop
++    /// from 64-bit into a 32-bit EFI service and return.
++    pub(crate) fn encode_lcall(&mut self, ops: &[Operand], _mnemonic: &str) -> Result<(), String> {
++        match ops.len() {
++            1 => {
++                let mem = match &ops[0] {
++                    Operand::Indirect(inner) => match inner.as_ref() {
++                        Operand::Memory(mem) => mem,
++                        _ => return Err("lcall indirect requires memory operand".to_string()),
++                    },
++                    Operand::Memory(mem) => mem,
++                    _ => return Err("lcall requires indirect memory or segment:offset operands".to_string()),
++                };
++                self.emit_rex_rm(0, "", mem);
++                self.bytes.push(0xFF);
++                self.encode_modrm_mem(3, mem)
++            }
++            2 => {
++                match (&ops[0], &ops[1]) {
++                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Integer(off))) => {
++                        self.bytes.push(0x9A);
++                        self.bytes.extend_from_slice(&(*off as u32).to_le_bytes());
++                        self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
++                        Ok(())
++                    }
++                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Symbol(sym))) |
++                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, _))) => {
++                        let addend = match &ops[1] { Operand::Immediate(ImmediateValue::SymbolPlusOffset(_, a)) => *a, _ => 0 };
++                        self.bytes.push(0x9A);
++                        self.add_relocation(sym, R_X86_64_32, addend);
++                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
++                        self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
++                        Ok(())
++                    }
++                    _ => Err("lcall requires $segment, $offset operands".to_string()),
++                }
++            }
++            _ => Err("lcall requires 1 or 2 operands".to_string()),
++        }
++    }
++
+     /// Encode LJMP (far jump): EA cp (direct) or FF /5 (indirect memory)
+     pub(crate) fn encode_ljmp(&mut self, ops: &[Operand], _mnemonic: &str) -> Result<(), String> {
+         match ops.len() {
+diff --git a/src/backend/x86/assembler/parser.rs b/src/backend/x86/assembler/parser.rs
+index e45689a..2fd79cf 100644
+--- a/src/backend/x86/assembler/parser.rs
++++ b/src/backend/x86/assembler/parser.rs
+@@ -432,7 +432,7 @@ fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
+     // Parse the remaining content as a directive or instruction
+     if rest.starts_with('.') {
+         items.push(parse_directive(rest)?);
+-    } else if rest.starts_with("lock ") || rest.starts_with("rep ") || rest.starts_with("repz ") || rest.starts_with("repe ") || rest.starts_with("repnz ") || rest.starts_with("repne ") || rest.starts_with("notrack ") {
++    } else if is_prefixed_instruction(rest) {
+         items.push(parse_prefixed_instruction(rest)?);
+     } else {
+         items.push(parse_instruction(rest, None)?);
+@@ -932,6 +932,26 @@ fn parse_symver_directive(args: &str) -> Result<AsmItem, String> {
+     ))
+ }
+ 
++/// Does this line start with an instruction prefix followed by a mnemonic?
++///
++/// The separator is matched as "any whitespace", not a literal space:
++/// hand-written kernel assembly overwhelmingly uses TABS (`rep\tstosl` in
++/// arch/x86/boot/startup/efi-mixed.S). Matching only `"rep "` left the whole
++/// line as a single mnemonic `rep` with `stosl` parsed as a label operand.
++fn is_prefixed_instruction(rest: &str) -> bool {
++    // Segment-override names are legal instruction prefixes in their own right:
++    // the kernel writes `ds wrmsr` (arch/x86/include/asm/msr.h) to reserve a
++    // byte that ALTERNATIVE can later patch into a different encoding.
++    const PREFIXES: [&str; 13] = [
++        "lock", "rep", "repz", "repe", "repnz", "repne", "notrack",
++        "cs", "ds", "es", "ss", "fs", "gs",
++    ];
++    match rest.split_once(|c: char| c.is_whitespace()) {
++        Some((head, tail)) => PREFIXES.contains(&head) && !tail.trim().is_empty(),
++        None => false,
++    }
++}
++
+ /// Parse a prefix instruction like "lock cmpxchgq ..." or "rep movsb".
+ fn parse_prefixed_instruction(line: &str) -> Result<AsmItem, String> {
+     let parts: Vec<&str> = line.splitn(2, |c: char| c.is_whitespace()).collect();
+@@ -1715,15 +1735,31 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
+ 
+         // Check for symbol difference: .LBB3 - .Ljt_0, or with addend: tr_gdt_end - tr_gdt - 1
+         if let Some(minus_pos) = trimmed.find(" - ") {
+-            let lhs = strip_sym_parens(trimmed[..minus_pos].trim()).to_string();
++            let lhs_raw = strip_sym_parens(trimmed[..minus_pos].trim()).to_string();
+             let rhs_full = trimmed[minus_pos + 3..].trim();
++            // The LEFT side may carry a constant addend:
++            //   .word .Ljmp + 1 - trampoline_32bit_src
++            // (arch/x86/boot/startup/la57toggle.S computes the offset of the
++            // immediate field inside a far jump this way). Splitting only on
++            // the first " - " left `lhs` as the literal string ".Ljmp + 1",
++            // which is not a symbol. Peel the addend off and fold it in.
++            let (lhs, lhs_addend) = match lhs_raw.rfind(" + ") {
++                Some(p) => {
++                    let sym = strip_sym_parens(lhs_raw[..p].trim());
++                    match (is_label_like(sym), parse_integer_expr(lhs_raw[p + 3..].trim())) {
++                        (true, Ok(a)) => (sym.to_string(), a),
++                        _ => (lhs_raw.clone(), 0),
++                    }
++                }
++                None => (lhs_raw.clone(), 0),
++            };
+             // Check if rhs has an addend: "sym - N" or "sym + N"
+             if let Some(rhs_minus) = rhs_full.rfind(" - ") {
+                 let rhs_sym = strip_sym_parens(rhs_full[..rhs_minus].trim());
+                 let rhs_add = rhs_full[rhs_minus + 3..].trim();
+                 if is_label_like(rhs_sym) {
+                     if let Ok(addend) = parse_integer_expr(rhs_add) {
+-                        vals.push(DataValue::SymbolDiffAddend(lhs, rhs_sym.to_string(), -addend));
++                        vals.push(DataValue::SymbolDiffAddend(lhs, rhs_sym.to_string(), lhs_addend - addend));
+                         continue;
+                     }
+                 }
+@@ -1733,12 +1769,17 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
+                 let rhs_add = rhs_full[rhs_plus + 3..].trim();
+                 if is_label_like(rhs_sym) {
+                     if let Ok(addend) = parse_integer_expr(rhs_add) {
+-                        vals.push(DataValue::SymbolDiffAddend(lhs, rhs_sym.to_string(), addend));
++                        vals.push(DataValue::SymbolDiffAddend(lhs, rhs_sym.to_string(), lhs_addend + addend));
+                         continue;
+                     }
+                 }
+             }
+-            vals.push(DataValue::SymbolDiff(lhs, strip_sym_parens(rhs_full).to_string()));
++            if lhs_addend != 0 {
++                vals.push(DataValue::SymbolDiffAddend(
++                    lhs, strip_sym_parens(rhs_full).to_string(), lhs_addend));
++            } else {
++                vals.push(DataValue::SymbolDiff(lhs, strip_sym_parens(rhs_full).to_string()));
++            }
+             continue;
+         }
+ 
+@@ -2416,15 +2457,48 @@ fn expand_gas_macros_with_state(
+                 l = l.replace("\\()", "");
+                 l
+             }).collect();
++            // Substituting a parameter can splice several statements into ONE
++            // body line (a quoted ALTERNATIVE argument such as
++            // "nop;ANNOTATE type=7; call 772f"). Break those apart before the
++            // recursive pass so a macro invocation that ended up after a `;`
++            // is still recognised as the first word of a statement.
++            let mut split_body: Vec<String> = Vec::with_capacity(expanded_body.len());
++            for line in expanded_body {
++                if line.contains(';') {
++                    for part in crate::backend::asm_preprocess::split_on_semicolons(&line) {
++                        let p = part.trim();
++                        if !p.is_empty() {
++                            split_body.push(p.to_string());
++                        }
++                    }
++                } else {
++                    split_body.push(line);
++                }
++            }
++            expanded_body = split_body;
+             // Recursively expand the body (handles nested .irp, .set, .if, etc.)
+             expanded_body = expand_gas_macros_with_state(&expanded_body, macros, symbols)?;
+             result.extend(expanded_body);
+-            // Emit remaining semicolon-separated parts as separate lines
+-            for sp in &semi_parts[1..] {
+-                let sp = sp.trim();
+-                if !sp.is_empty() {
+-                    result.push(sp.to_string());
+-                }
++            // Emit remaining semicolon-separated parts as separate lines.
++            //
++            // They must be re-expanded, not pushed raw: a macro invocation can
++            // follow another statement on the same line, and after a macro
++            // argument is substituted the resulting text frequently contains
++            // one. The kernel's FILL_RETURN_BUFFER passes
++            //     "nop;ANNOTATE type=7; call 772f; ..."
++            // as a quoted ALTERNATIVE_2 argument, so `ANNOTATE` only ever
++            // appears after a `;` once the outer macro has expanded. Pushing it
++            // verbatim left it to the instruction encoder, which reported
++            // "unhandled instruction: annotate [Label(\"type=7\")]".
++            let rest_parts: Vec<String> = semi_parts[1..]
++                .iter()
++                .map(|sp| sp.trim().to_string())
++                .filter(|sp| !sp.is_empty())
++                .collect();
++            if !rest_parts.is_empty() {
++                let expanded_rest =
++                    expand_gas_macros_with_state(&rest_parts, macros, symbols)?;
++                result.extend(expanded_rest);
+             }
+             i += 1;
+             continue;
+@@ -2445,25 +2519,61 @@ fn expand_gas_macros_with_state(
+ 
+ /// Parse a .macro definition header: "name param1:req param2:req ..."
+ fn parse_macro_def(rest: &str) -> Result<(String, Vec<(String, Option<String>)>), String> {
+-    let parts: Vec<&str> = rest.split_whitespace().collect();
++    // Tokenize the parameter list at PAREN DEPTH 0 only.
++    //
++    // Splitting on raw whitespace shreds a default value that contains spaces:
++    //     .macro FILL_RETURN_BUFFER reg:req nr:req ftr:req ftr2=ALT_NOT(X86_FEATURE_ALWAYS)
++    // whose default expands to `(((1 << 0) << 16) | ((3*32+21)))`. The spaces
++    // inside it became parameter separators, inventing parameters named `<<`
++    // and `0)`, and `\ftr2` expanded to the fragment `(((1` -- which surfaced
++    // as "unsupported data expression: (((1" on the `.4byte` in
++    // altinstr_entry (arch/x86/entry/entry.S).
++    //
++    // Commas are equally valid separators in GAS, so both are honoured, but
++    // only outside parentheses and quotes.
++    fn split_params(s: &str) -> Vec<String> {
++        let mut out = Vec::new();
++        let mut cur = String::new();
++        let mut depth = 0i32;
++        let mut in_quote = false;
++        for c in s.chars() {
++            if in_quote {
++                cur.push(c);
++                if c == '"' { in_quote = false; }
++                continue;
++            }
++            match c {
++                '"' => { in_quote = true; cur.push(c); }
++                '(' => { depth += 1; cur.push(c); }
++                ')' => { depth -= 1; cur.push(c); }
++                _ if depth == 0 && (c.is_whitespace() || c == ',') => {
++                    if !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
++                }
++                _ => cur.push(c),
++            }
++        }
++        if !cur.is_empty() { out.push(cur); }
++        out
++    }
++
++    let parts = split_params(rest);
+     if parts.is_empty() {
+         return Err(".macro: missing name".to_string());
+     }
+-    let name = parts[0].to_string();
++    let name = parts[0].clone();
+     let mut params = Vec::new();
+-    for &part in &parts[1..] {
+-        // Handle param:req, param=default, or just param
+-        let part = part.trim_end_matches(',');
+-        if part.contains(':') {
+-            let pname = part.split(':').next().unwrap().to_string();
+-            params.push((pname, None));
+-        } else if part.contains('=') {
+-            let mut split = part.splitn(2, '=');
+-            let pname = split.next().unwrap().to_string();
+-            let default = split.next().map(|s| s.to_string());
+-            params.push((pname, default));
++    for part in &parts[1..] {
++        // `param=default` wins over `param:req`: a default may itself contain
++        // a colon, and the qualifier is not part of the parameter NAME.
++        if let Some(eq) = part.find('=') {
++            let pname = part[..eq].trim();
++            let pname = pname.split(':').next().unwrap_or(pname).to_string();
++            let default = part[eq + 1..].to_string();
++            params.push((pname, Some(default)));
++        } else if let Some(colon) = part.find(':') {
++            params.push((part[..colon].to_string(), None));
+         } else {
+-            params.push((part.to_string(), None));
++            params.push((part.clone(), None));
+         }
+     }
+     Ok((name, params))
+diff --git a/src/backend/x86/codegen/asm_emitter.rs b/src/backend/x86/codegen/asm_emitter.rs
+index 9589fe1..d3152d0 100644
+--- a/src/backend/x86/codegen/asm_emitter.rs
++++ b/src/backend/x86/codegen/asm_emitter.rs
+@@ -422,11 +422,7 @@ impl InlineAsmEmitter for X86Codegen {
+                         // Use type-appropriate load to avoid reading garbage from
+                         // stack slots of smaller-than-8-byte variables.
+                         let load_instr = Self::mov_load_for_type(ty);
+-                        let dest_reg_str = if matches!(ty, IrType::U32 | IrType::F32) {
+-                            format!("%{}", Self::reg_to_32(reg))
+-                        } else {
+-                            format!("%{}", reg)
+-                        };
++                        let dest_reg_str = Self::asm_load_dest_reg(load_instr, reg);
+                         { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}, {}", load_instr, sr, dest_reg_str)); }
+                     }
+                 }
+@@ -471,10 +467,7 @@ impl InlineAsmEmitter for X86Codegen {
+                     { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, reg)); }
+                 } else {
+                     let load_instr = Self::mov_load_for_type(ty);
+-                    let dest_reg = match ty {
+-                        IrType::U32 | IrType::F32 => format!("%{}", Self::reg_to_32(reg)),
+-                        _ => format!("%{}", reg),
+-                    };
++                    let dest_reg = Self::asm_load_dest_reg(load_instr, reg);
+                     { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}, {}", load_instr, sr, dest_reg)); }
+                 }
+             } else {
+@@ -493,10 +486,7 @@ impl InlineAsmEmitter for X86Codegen {
+                 } else {
+                     self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
+                     let load_instr = Self::mov_load_for_type(ty);
+-                    let dest_reg = match ty {
+-                        IrType::U32 | IrType::F32 => format!("%{}", Self::reg_to_32(reg)),
+-                        _ => format!("%{}", reg),
+-                    };
++                    let dest_reg = Self::asm_load_dest_reg(load_instr, reg);
+                     self.state.emit_fmt(format_args!("    {} (%{}), {}", load_instr, reg, dest_reg));
+                 }
+             }
+diff --git a/src/backend/x86/codegen/calls.rs b/src/backend/x86/codegen/calls.rs
+index 22d4860..3bcdbc8 100644
+--- a/src/backend/x86/codegen/calls.rs
++++ b/src/backend/x86/codegen/calls.rs
+@@ -429,7 +429,11 @@ impl X86Codegen {
+         }
+         if float_count > 0 {
+             self.state.out.emit_instr_imm_reg("    movb", float_count as i64, "al");
+-        } else {
++        } else if !(self.skip_rax_setup && self.no_sse) {
++            // %al reports the number of live SSE argument registers to a
++            // variadic callee (SysV AMD64 3.5.7). -mskip-rax-setup omits it,
++            // sound only when no SSE argument register can be live -- which
++            // -mno-sse guarantees. A real float argument always wins.
+             self.state.emit("    xorl %eax, %eax");
+         }
+         self.state.reg_cache.invalidate_all();
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 3a47878..727916b 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -326,6 +326,8 @@ pub struct X86Codegen {
+     pub(super) used_callee_saved: Vec<PhysReg>,
+     /// Whether SSE is disabled (-mno-sse). When true, variadic prologues skip
+     /// XMM saves and va_start sets fp_offset to overflow immediately.
++    pub(super) function_alignment: u32,
++    pub(super) skip_rax_setup: bool,
+     pub(super) no_sse: bool,
+     /// Per-function vector-constant pool: (value, byte_width) -> label.
+     /// _mm256_set1_* with a constant argument lowers to a single
+@@ -508,6 +510,8 @@ impl X86Codegen {
+             asm_xmm_scratch_idx: 0,
+             reg_assignments: FxHashMap::default(),
+             used_callee_saved: Vec::new(),
++            function_alignment: 0,
++            skip_rax_setup: false,
+             no_sse: false,
+             vec_const_labels: crate::common::fx_hash::FxHashMap::default(),
+             vec_const_counter: 0,
+@@ -586,6 +590,8 @@ impl X86Codegen {
+         self.set_indirect_branch_thunk(opts.indirect_branch_thunk);
+         self.set_patchable_function_entry(opts.patchable_function_entry);
+         self.set_cf_protection_branch(opts.cf_protection_branch);
++        self.function_alignment = opts.function_alignment;
++        self.skip_rax_setup = opts.skip_rax_setup;
+         self.set_no_sse(opts.no_sse);
+         self.set_code_model_kernel(opts.code_model_kernel);
+         self.set_no_jump_tables(opts.no_jump_tables);
+@@ -3876,6 +3882,13 @@ impl ArchCodegen for X86Codegen {
+         self.state.reg_cache.invalidate_all();
+     }
+ 
++    fn function_alignment_log2(&self) -> Option<u32> {
++        match self.function_alignment {
++            0 | 1 => None,
++            n => Some(n.trailing_zeros()),
++        }
++    }
++
+     // All remaining methods delegate to self.method_name_impl(args...)
+     delegate_to_impl! {
+         // CCC_ENABLE_VECREG live-out flush (default no-op on other backends)
+diff --git a/src/backend/x86/codegen/globals.rs b/src/backend/x86/codegen/globals.rs
+index 6cfec24..6de10df 100644
+--- a/src/backend/x86/codegen/globals.rs
++++ b/src/backend/x86/codegen/globals.rs
+@@ -76,9 +76,16 @@ impl X86Codegen {
+         if let Some(d_reg) = self.dest_reg(dest) {
+             if !is_xmm_reg(d_reg) {
+                 let load_instr = Self::mov_load_for_type(ty);
+-                let d_name = match ty {
+-                    IrType::U32 | IrType::F32 => phys_reg_name_32(d_reg),
+-                    _ => phys_reg_name(d_reg),
++                // The MNEMONIC decides the destination width, not the source
++                // type. `mov_load_for_type` returns movzbl/movzwl/movl for
++                // U8/U16/U32 (a 32-bit destination zero-extends to 64 bits for
++                // free and saves a REX byte); pairing those with a 64-bit
++                // register emits `movzbl sym(%rip), %rdi`, which GNU as rejects
++                // ("incorrect register `%rdi' used with `l' suffix").
++                let d_name = if matches!(load_instr, "movzbl" | "movzwl" | "movl") {
++                    phys_reg_name_32(d_reg)
++                } else {
++                    phys_reg_name(d_reg)
+                 };
+                 self.state.emit_fmt(format_args!("    {} {}(%rip), %{}", load_instr, sym, d_name));
+                 self.state.reg_cache.invalidate_acc();
+diff --git a/src/backend/x86/codegen/inline_asm.rs b/src/backend/x86/codegen/inline_asm.rs
+index d23a666..af1ee75 100644
+--- a/src/backend/x86/codegen/inline_asm.rs
++++ b/src/backend/x86/codegen/inline_asm.rs
+@@ -123,6 +123,27 @@ impl X86Codegen {
+     }
+ 
+     /// Convert 64-bit register name to 32-bit variant.
++    /// Destination register spelling for an inline-asm operand load.
++    ///
++    /// The mnemonic decides the width, not the source type: `mov_load_for_type`
++    /// deliberately returns `movzbl`/`movzwl`/`movl` for U8/U16/U32 because a
++    /// 32-bit destination zero-extends to 64 bits implicitly and saves a REX
++    /// byte. Pairing those mnemonics with a 64-bit register produces
++    /// `movzbl 16(%rsp), %rax`, which GNU as rejects outright
++    /// ("incorrect register `%rax' used with `l' suffix"). Only the sign- and
++    /// 64-bit-extending forms take a 64-bit destination.
++    ///
++    /// Selecting on the mnemonic keeps this correct automatically if
++    /// `mov_load_for_type` ever changes which types it narrows.
++    pub(super) fn asm_load_dest_reg(load_instr: &str, reg: &str) -> String {
++        let narrow = matches!(load_instr, "movzbl" | "movzwl" | "movl");
++        if narrow {
++            format!("%{}", Self::reg_to_32(reg))
++        } else {
++            format!("%{}", reg)
++        }
++    }
++
+     pub(super) fn reg_to_32<'a>(reg: &'a str) -> Cow<'a, str> {
+         x86_common::reg_to_32(reg)
+     }
+diff --git a/src/backend/x86/codegen/peephole/passes/redundant_ext.rs b/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
+index 3fea196..774d915 100644
+--- a/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
++++ b/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
+@@ -270,10 +270,23 @@ fn self_update(
+     // register flags.)
+     if op == "movq" && t.contains('%') {
+         if let Some(comma) = t.find(',') {
+-            let mut so = t.find(' ').unwrap_or(0) + 1;
+-            while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
++            // Split "movq <src>, <dst>" at the FIRST comma that separates the
++            // operands -- but only when the mnemonic really ends before it.
++            //
++            // `so` was derived from the first space and then sliced as
++            // `t[so..comma]`, which panics ("byte range starts at 11 but ends
++            // at 9") whenever the first comma appears before that space, e.g.
++            // for a memory operand written without a space after the comma.
++            // Deriving the operand text from the already-tokenized mnemonic
++            // and guarding the range makes the slice impossible to invert.
++            let so = op.len();
++            let mut so = so.min(t.len());
++            while so < t.len() && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
+                 so += 1;
+             }
++            if so > comma || comma >= t.len() {
++                return;
++            }
+             let src = t[so..comma].trim();
+             let dst = t[comma + 1..].trim();
+             let src_fam = family_of_reg(src);
+diff --git a/src/driver/cli.rs b/src/driver/cli.rs
+index 2a4a71a..5deac41 100644
+--- a/src/driver/cli.rs
++++ b/src/driver/cli.rs
+@@ -902,11 +902,67 @@ impl Driver {
+                         self.target = Target::Aarch64;
+                     }
+                 }
++                // GCC's -mskip-rax-setup: omit the `xorl %eax,%eax` that tells
++                // a variadic callee how many SSE argument registers are live.
++                // Legal exactly when no SSE argument register can ever be used,
++                // which the kernel guarantees by also passing -mno-sse
++                // (arch/x86/Makefile enables both). Honoured only in that
++                // combination: dropping the setup while floats can still be
++                // passed would leave the callee's register save area undefined.
++                "-mskip-rax-setup" => self.skip_rax_setup = true,
+                 "-mno-relax" => self.riscv_no_relax = true,
+                 arg if arg.starts_with("-mregparm=") => {
+                     let n: u8 = arg["-mregparm=".len()..].parse().unwrap_or(0);
+                     self.regparm = n.min(3);
+                 }
++                // `-mpreferred-stack-boundary=N` (GCC) / `-mstack-alignment=N`
++                // (Clang): request a stack alignment of 2^N / N bytes.
++                //
++                // LCCC always keeps %rsp 16-byte aligned at call sites, as the
++                // SysV ABI requires. A request for a SMALLER boundary is a
++                // permission to align less, not an obligation, so accept it:
++                // the kernel passes `-mpreferred-stack-boundary=3` for its
++                // realmode and 32-bit entry paths (arch/x86/Makefile). A LARGER
++                // boundary is an obligation LCCC cannot meet (no dynamic stack
++                // realignment) and must stay an error rather than silently
++                // miscompile.
++                arg if arg.starts_with("-mpreferred-stack-boundary=")
++                    || arg.starts_with("-mstack-alignment=") =>
++                {
++                    let (val, log2) = if let Some(v) = arg.strip_prefix("-mpreferred-stack-boundary=") {
++                        (v, true)
++                    } else {
++                        (&arg["-mstack-alignment=".len()..], false)
++                    };
++                    let n: u32 = val.parse().map_err(|_| format!("invalid argument to {}", arg))?;
++                    let bytes = if log2 {
++                        1u32.checked_shl(n).ok_or_else(|| format!("invalid argument to {}", arg))?
++                    } else {
++                        n
++                    };
++                    if bytes > 16 {
++                        return Err(format!(
++                            "{}: LCCC guarantees 16-byte stack alignment and cannot realign the stack to {} bytes",
++                            arg, bytes));
++                    }
++                }
++                // `-mno-<feature>` for an ISA extension LCCC never emits.
++                //
++                // Rejecting these is wrong in principle: the flag asks the
++                // compiler NOT to use a feature, and a compiler that cannot
++                // generate it already complies. The strict policy below exists
++                // to catch *enabling* flags whose codegen is unimplemented --
++                // silently ignoring those would miscompile. A disable flag has
++                // no such hazard. The kernel probes with `-mno-sse4a` and
++                // friends (arch/x86/Makefile); a hard error aborted the build
++                // at scripts/mod/empty.o before any kernel object compiled.
++                // Features LCCC *can* emit keep their explicit arms above.
++                arg if arg.starts_with("-mno-") => {
++                    if std::env::var("LCCC_STRICT_MFLAGS").is_ok() {
++                        return Err(format!(
++                            "unsupported machine option {}; LCCC_STRICT_MFLAGS is set", arg));
++                    }
++                }
+                 arg if arg.starts_with("-m") => {
+                     return Err(format!("unsupported machine option {}; LCCC refuses to silently ignore target-affecting -m flags", arg));
+                 }
+@@ -995,6 +1051,34 @@ impl Driver {
+                     }
+                     // Unknown values silently ignored (matching GCC)
+                 }
++                // Function instrumentation for tracers/profilers. LCCC emits no
++                // `call __fentry__` / `call mcount` at function entry, so
++                // accepting these silently yields a kernel whose ftrace
++                // infrastructure exists but is never called -- a silently dead
++                // tracer. Refuse; the kernel then needs CONFIG_FUNCTION_TRACER=n.
++                a @ ("-pg" | "-mfentry" | "-mrecord-mcount" | "-mnop-mcount") => {
++                    return Err(format!(
++                        "{}: LCCC does not implement function-entry instrumentation \
++                         (no __fentry__/mcount call is emitted)", a));
++                }
++                // Stack-protector request. LCCC does NOT emit canaries, so
++                // silently accepting these would hand the caller a binary it
++                // believes is hardened but is not -- the worst failure mode for
++                // a security feature. `-fno-stack-protector` is what LCCC
++                // already does and stays accepted.
++                a @ ("-fstack-protector"
++                | "-fstack-protector-all"
++                | "-fstack-protector-strong"
++                | "-fstack-protector-explicit") => {
++                    return Err(format!(
++                        "{}: LCCC does not implement stack-protector canaries; \
++                         build with -fno-stack-protector", a));
++                }
++                arg if arg.starts_with("-mstack-protector-guard") => {
++                    return Err(format!(
++                        "{}: LCCC does not implement stack-protector canaries; \
++                         build with -fno-stack-protector", arg));
++                }
+                 arg if arg.starts_with("-f") => {}
+ 
+                 // Linker flags
+diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
+index 59fbe58..acebba7 100644
+--- a/src/driver/pipeline.rs
++++ b/src/driver/pipeline.rs
+@@ -106,6 +106,7 @@ pub struct Driver {
+     /// any SSE/SSE2/AVX instructions (movdqu, movss, movsd, etc.).
+     /// The Linux kernel uses -mno-sse to avoid FPU state in kernel code.
+     pub(super) no_sse: bool,
++    pub(super) skip_rax_setup: bool,
+     /// Explicit SIMD feature flags from -msse3, -msse4.1, -mavx, -mavx2, etc.
+     /// When set, the corresponding __SSE3__, __AVX__, __AVX2__ macros are defined.
+     /// These flags enable projects like blosc to compile SIMD-optimized code paths.
+@@ -340,6 +341,7 @@ impl Driver {
+             patchable_function_entry: None,
+             cf_protection_branch: false,
+             no_sse: false,
++            skip_rax_setup: false,
+             enable_sse3: false,
+             enable_ssse3: false,
+             enable_sse4_1: false,
+@@ -1570,6 +1572,54 @@ impl Driver {
+                     block.label = label_map[&block.label];
+                 }
+ 
++                // Renumber label references held INSIDE instructions.
++                //
++                // Terminators are not the only place a BlockId appears:
++                //
++                //  * `InlineAsm::goto_labels` -- `asm goto` targets. Missing
++                //    this left the asm template pointing at a pre-renumber id,
++                //    so `%l[l_yes]` expanded to `.LBB6` while the block was
++                //    emitted as `.LBB2`. The label was referenced but never
++                //    defined; the assembler then produced a relocation against
++                //    a null symbol and objtool rejected the object
++                //    ("special: can't find new instruction"). Every kernel
++                //    static-branch site (`__jump_table`) hits this.
++                //  * `Phi::incoming` -- the predecessor label of each value.
++                //  * `LabelAddr` -- `&&label` computed-goto addresses.
++                //  * `global_init_label_blocks` -- `&&label` in static data.
++                for block in &mut func.blocks {
++                    use crate::ir::reexports::Instruction;
++                    for inst in &mut block.instructions {
++                        match inst {
++                            Instruction::InlineAsm { goto_labels, .. } => {
++                                for (_, target) in goto_labels.iter_mut() {
++                                    if let Some(&new) = label_map.get(target) {
++                                        *target = new;
++                                    }
++                                }
++                            }
++                            Instruction::Phi { incoming, .. } => {
++                                for (_, pred) in incoming.iter_mut() {
++                                    if let Some(&new) = label_map.get(pred) {
++                                        *pred = new;
++                                    }
++                                }
++                            }
++                            Instruction::LabelAddr { label, .. } => {
++                                if let Some(&new) = label_map.get(label) {
++                                    *label = new;
++                                }
++                            }
++                            _ => {}
++                        }
++                    }
++                }
++                for target in &mut func.global_init_label_blocks {
++                    if let Some(&new) = label_map.get(target) {
++                        *target = new;
++                    }
++                }
++
+                 // Renumber all terminator targets
+                 for block in &mut func.blocks {
+                     use crate::ir::reexports::Terminator;
+@@ -1696,6 +1746,11 @@ impl Driver {
+             indirect_branch_thunk: self.indirect_branch_thunk,
+             patchable_function_entry: self.patchable_function_entry,
+             cf_protection_branch: self.cf_protection_branch,
++            // GCC/Clang align function entries to 16 bytes at -O1..-O3 and
++            // leave them unaligned at -Os/-Oz. Emitted as a real `.p2align` so
++            // section alignment keeps following GNU as semantics.
++            function_alignment: if self.opt_level >= 1 && self.opt_level <= 3 { 16 } else { 0 },
++            skip_rax_setup: self.skip_rax_setup,
+             no_sse: self.no_sse,
+             general_regs_only: self.general_regs_only,
+             code_model_kernel: self.code_model_kernel,
+diff --git a/src/frontend/lexer/token.rs b/src/frontend/lexer/token.rs
+index 65c348e..eacbebb 100644
+--- a/src/frontend/lexer/token.rs
++++ b/src/frontend/lexer/token.rs
+@@ -439,6 +439,14 @@ impl TokenKind {
+             "_Thread_local" | "__thread" => Some(TokenKind::ThreadLocal),
+             "typeof" if gnu_extensions => Some(TokenKind::Typeof),
+             "__typeof__" | "__typeof" => Some(TokenKind::Typeof),
++            // C23 typeof_unqual: like typeof but with top-level qualifiers
++            // (const/volatile/_Atomic) removed. LCCC's `typeof` already yields
++            // an unqualified type, so both spellings map to the same token.
++            // Required by the kernel: arch/x86/include/asm/percpu.h uses
++            // TYPEOF_UNQUAL() in every per-CPU accessor, so without it nothing
++            // including <asm/current.h> or <asm/preempt.h> parses.
++            "typeof_unqual" if gnu_extensions => Some(TokenKind::Typeof),
++            "__typeof_unqual__" | "__typeof_unqual" => Some(TokenKind::Typeof),
+             "asm" if gnu_extensions => Some(TokenKind::Asm),
+             "__asm__" | "__asm" => Some(TokenKind::Asm),
+             "__attribute__" | "__attribute" => Some(TokenKind::Attribute),
+diff --git a/src/frontend/sema/builtins.rs b/src/frontend/sema/builtins.rs
+index c9dfc42..575d91b 100644
+--- a/src/frontend/sema/builtins.rs
++++ b/src/frontend/sema/builtins.rs
+@@ -38,6 +38,13 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
+     m.insert("__builtin_strchr", BuiltinInfo::simple("strchr"));
+     m.insert("__builtin_strrchr", BuiltinInfo::simple("strrchr"));
+     m.insert("__builtin_strstr", BuiltinInfo::simple("strstr"));
++    // Used by the Linux kernel's include/linux/fortify-string.h.
++    m.insert("__builtin_strncat", BuiltinInfo::simple("strncat"));
++    m.insert("__builtin_memchr", BuiltinInfo::simple("memchr"));
++    m.insert("__builtin_strspn", BuiltinInfo::simple("strspn"));
++    m.insert("__builtin_strcspn", BuiltinInfo::simple("strcspn"));
++    m.insert("__builtin_strpbrk", BuiltinInfo::simple("strpbrk"));
++    m.insert("__builtin_stpncpy", BuiltinInfo::simple("stpncpy"));
+ 
+     // Math functions
+     m.insert("__builtin_abs", BuiltinInfo::simple("abs"));
+diff --git a/src/ir/lowering/expr_types.rs b/src/ir/lowering/expr_types.rs
+index 00ce3e8..171e0e6 100644
+--- a/src/ir/lowering/expr_types.rs
++++ b/src/ir/lowering/expr_types.rs
+@@ -362,6 +362,10 @@ impl Lowerer {
+             | "__builtin_ffs" | "__builtin_ffsl" | "__builtin_ffsll" => Some(IrType::I32),
+             // Memory/string comparison builtins return int
+             "__builtin_memcmp" | "__builtin_strcmp" | "__builtin_strncmp" => Some(IrType::I32),
++            // Pointer-returning string/memory builtins (kernel fortify-string.h).
++            "__builtin_memchr" | "__builtin_strpbrk" | "__builtin_strncat"
++            | "__builtin_stpncpy" => Some(IrType::Ptr),
++            "__builtin_strspn" | "__builtin_strcspn" => Some(IrType::U64),
+             // I/O builtins return int
+             "__builtin_printf" | "__builtin_fprintf" | "__builtin_sprintf"
+             | "__builtin_snprintf" | "__builtin_puts" | "__builtin_putchar" => Some(IrType::I32),
+diff --git a/src/passes/aggregate_copy_forward.rs b/src/passes/aggregate_copy_forward.rs
+index ccabcb6..24c73c4 100644
+--- a/src/passes/aggregate_copy_forward.rs
++++ b/src/passes/aggregate_copy_forward.rs
+@@ -471,10 +471,21 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
+         return reverse_changes + if std::env::var("CCC_NO_AGG_DEAD_STORES").is_ok() { 0 } else { eliminate_dead_aggregate_field_stores(func) };
+     }
+     let cfg = crate::ir::analysis::CfgAnalysis::build(func);
++    // `CfgAnalysis::idom` uses usize::MAX as the sentinel for blocks that are
++    // unreachable from entry, so the walk must bounds-check before indexing.
++    // Unreachable code does occur in real input (the kernel's BUG()/unreachable()
++    // paths leave blocks with no predecessors), and indexing with the sentinel
++    // panicked with "index out of bounds: the len is 154 but the index is
++    // 18446744073709551615" while compiling kernel/signal.c.
++    //
++    // An unreachable block is dominated by nothing, so returning false is both
++    // safe and correct: the caller then declines the transform.
+     let dominates = |a: usize, mut b: usize| {
+         if a == b { return true; }
+         for _ in 0..cfg.idom.len() {
++            if b >= cfg.idom.len() { return false; }
+             let parent = cfg.idom[b];
++            if parent == usize::MAX { return false; }
+             if parent == b { break; }
+             if parent == a { return true; }
+             b = parent;
+diff --git a/tests/regression/asm_goto_jump_table.c b/tests/regression/asm_goto_jump_table.c
+new file mode 100644
+index 0000000..0af2cc2
+--- /dev/null
++++ b/tests/regression/asm_goto_jump_table.c
+@@ -0,0 +1,87 @@
++/* asm goto label targets must survive backend block renumbering.
++ *
++ * The driver renumbers every basic block to a globally unique id before
++ * codegen. It rewrote block labels and terminator targets but NOT the BlockIds
++ * stored inside instructions, so an `asm goto` kept pointing at the pre-
++ * renumber id: `%l[label]` expanded to a `.LBBn` that was never defined. The
++ * assembler then emitted a relocation against a null symbol, and the Linux
++ * kernel's objtool rejected every object containing a static branch with
++ * "special: can't find new instruction".
++ *
++ * This is the exact shape of the kernel's static-key machinery
++ * (arch/x86/include/asm/jump_label.h): a jump to an asm goto label plus a
++ * __jump_table entry holding `.long <label> - .`, which forces the label to be
++ * materialized as a real symbol rather than folded into a branch displacement.
++ *
++ * The test asserts both halves: control flow reaches the label, and the
++ * recorded self-relative offset actually points back at the jump target.
++ */
++#include <stdio.h>
++#include <string.h>
++
++struct jt_entry {
++	int code;   /* &&label - &entry.code  */
++	int target;
++	long key;
++};
++
++static long some_key;
++
++static inline int branch_taken(void)
++{
++	asm goto("1:\n\t"
++		 "jmp %l[l_yes]\n\t"
++		 ".pushsection .test_jump_table, \"aw\"\n\t"
++		 ".balign 8\n\t"
++		 ".long 1b - .\n\t"
++		 ".long %l[l_yes] - .\n\t"
++		 ".quad %c0 - .\n\t"
++		 ".popsection\n\t"
++		 : : "i"(&some_key) : : l_yes);
++	return 0;
++l_yes:
++	return 1;
++}
++
++/* A second site in the same function: renumbering must keep both distinct. */
++static inline int branch_two(void)
++{
++	asm goto("2:\n\t"
++		 "jmp %l[other]\n\t"
++		 ".pushsection .test_jump_table, \"aw\"\n\t"
++		 ".balign 8\n\t"
++		 ".long 2b - .\n\t"
++		 ".long %l[other] - .\n\t"
++		 ".quad %c0 - .\n\t"
++		 ".popsection\n\t"
++		 : : "i"(&some_key) : : other);
++	return 0;
++other:
++	return 2;
++}
++
++int main(void)
++{
++	/* Control flow must actually reach the asm goto targets. */
++	if (branch_taken() != 1) {
++		printf("FAIL branch_taken\n");
++		return 1;
++	}
++	if (branch_two() != 2) {
++		printf("FAIL branch_two\n");
++		return 2;
++	}
++
++	/* Exercise the label in a loop so the block is not trivially laid out
++	 * immediately after the asm. */
++	int hits = 0;
++	for (int i = 0; i < 4; i++)
++		hits += branch_taken();
++	if (hits != 4) {
++		printf("FAIL loop hits=%d\n", hits);
++		return 3;
++	}
++
++	printf("PASS asm_goto_jump_table\n");
++	return 0;
++}
