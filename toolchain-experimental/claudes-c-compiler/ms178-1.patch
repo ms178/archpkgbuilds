@@ -113,7 +113,7 @@ index 2a632ed..246df1a 100644
                  }
              }
 diff --git a/src/backend/elf_writer_common.rs b/src/backend/elf_writer_common.rs
-index e7635fa..4dde67b 100644
+index e7635fa..9f228a7 100644
 --- a/src/backend/elf_writer_common.rs
 +++ b/src/backend/elf_writer_common.rs
 @@ -94,6 +94,17 @@ pub trait X86Arch {
@@ -163,7 +163,15 @@ index e7635fa..4dde67b 100644
          } else {
              A::encode_instruction(instr, base_offset)?
          };
-@@ -1208,6 +1232,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
+@@ -1181,7 +1205,6 @@ impl<A: X86Arch> ElfWriterCore<A> {
+             let val = val?;
+             let count = if val < 0 { 0usize } else { val as usize };
+             if count == 0 { continue; }
+-
+             let fill_bytes: Vec<u8> = vec![*fill; count];
+             self.sections[*sec_idx].data.splice(*offset..*offset, fill_bytes);
+ 
+@@ -1208,6 +1231,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
                      jump.offset += count;
                  }
              }
@@ -181,7 +189,7 @@ index e7635fa..4dde67b 100644
              for (bsec, boff, _, _, _, _) in self.deferred_byte_diffs.iter_mut() {
                  if *bsec == *sec_idx && *boff >= *offset {
                      *boff += count;
-@@ -1554,18 +1589,51 @@ impl<A: X86Arch> ElfWriterCore<A> {
+@@ -1554,24 +1588,86 @@ impl<A: X86Arch> ElfWriterCore<A> {
      // ─── ELF emission ─────────────────────────────────────────────────
  
      fn emit_elf(mut self) -> Result<Vec<u8>, String> {
@@ -208,8 +216,26 @@ index e7635fa..4dde67b 100644
 +        // Resolving skips first makes the layout final before any displacement
 +        // is computed, which is also the order GNU as uses.
          if A::supports_deferred_skips() {
++            // ORDER MATTERS, and there is more than one self-consistent
++            // answer. `.skip` padding and jump relaxation are mutually
++            // dependent: the kernel's ALTERNATIVE padding
++            //     .skip -(((775f-774f)-(772b-771b)) > 0) * (...),0x90
++            // measures a region that relaxation can shrink, and the padding it
++            // inserts changes the distances relaxation sees.
++            //
++            // Relaxing FIRST -- while no padding exists at all -- lets every
++            // branch pick its shortest encoding, and the padding is then sized
++            // against that final layout. That is the SMALLEST fixed point and
++            // the one GNU as reaches. Sizing the padding first instead locks in
++            // longer displacements and over-pads by a byte, so the `origlen`
++            // recorded for the alternative did not describe the code actually
++            // present (objtool: "weirdly overlapping alternative! 33 != 35").
++            self.relax_jumps();
++            for sec_idx in 0..self.sections.len() {
++                self.fixup_alignment_markers(sec_idx);
++            }
              self.resolve_deferred_skips()?;
-             self.resolve_deferred_byte_diffs()?;
+-            self.resolve_deferred_byte_diffs()?;
          }
  
 -        // Fix alignment/org markers for EVERY section (the jump-relaxation
@@ -227,19 +253,39 @@ index e7635fa..4dde67b 100644
 +        //
 +        // Running the fixup for every section first makes the pre-relaxation
 +        // layout correct; `relax_jumps` then keeps it correct as it shrinks.
-+        for sec_idx in 0..self.sections.len() {
-+            self.fixup_alignment_markers(sec_idx);
-+        }
-+
+         for sec_idx in 0..self.sections.len() {
+             self.fixup_alignment_markers(sec_idx);
+         }
+ 
+-        // Fold scaled symbol differences last: alignment fixups above can
+-        // still move labels, so the arithmetic must see final positions.
 +        // Relax long jumps to short form where possible.
 +        self.relax_jumps();
 +
 +        // Fix alignment/org markers for EVERY section again: relaxation only
 +        // maintains them for sections that actually contain jumps
 +        // (.eh_frame never had its `.align` padding fixed up otherwise).
-         for sec_idx in 0..self.sections.len() {
-             self.fixup_alignment_markers(sec_idx);
-         }
++        for sec_idx in 0..self.sections.len() {
++            self.fixup_alignment_markers(sec_idx);
++        }
++
++        // Fold symbol differences LAST, once the layout is frozen.
++        //
++        // `.byte`/`.word` label differences MEASURE code that jump relaxation
++        // and alignment padding can still resize. Resolving them earlier records
++        // pre-shrink sizes: the kernel's ALTERNATIVE entry stored
++        // `origlen = 773b-771b = 35` for a region relaxation had shortened to
++        // 31, and objtool rejected the object with
++        // "weirdly overlapping alternative! 33 != 35". GNU as likewise emits
++        // these only after the section layout is final.
++        if A::supports_deferred_skips() {
++            self.resolve_deferred_byte_diffs()?;
++        }
++
++        // Scaled symbol differences: same reasoning.
+         self.resolve_scaled_diffs()?;
+ 
+         // Resolve internal relocations
 diff --git a/src/backend/generation.rs b/src/backend/generation.rs
 index 8c7e050..5e7f941 100644
 --- a/src/backend/generation.rs
@@ -614,10 +660,33 @@ index 2070677..827e8c8 100644
      pub(crate) fn encode_ljmp(&mut self, ops: &[Operand], _mnemonic: &str) -> Result<(), String> {
          match ops.len() {
 diff --git a/src/backend/x86/assembler/parser.rs b/src/backend/x86/assembler/parser.rs
-index e45689a..2fd79cf 100644
+index e45689a..08cd8ba 100644
 --- a/src/backend/x86/assembler/parser.rs
 +++ b/src/backend/x86/assembler/parser.rs
-@@ -432,7 +432,7 @@ fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
+@@ -198,8 +198,21 @@ pub struct Register {
+ }
+ 
+ impl Register {
++    /// Build a register from its bare name (no `%` sigil).
++    ///
++    /// The name is trimmed and any leftover `%` is stripped. GNU as tolerates
++    /// whitespace between the sigil and the register name, and the kernel
++    /// relies on it: `__ASM_REGPFX` splices `(% rip)` and `(% rsp)` into
++    /// `arch/x86/include/asm/asm.h`'s `_ASM_RIP()`. Callers used to strip only
++    /// the `%`, leaving a name of `" rip"` that matched no register and
++    /// silently defaulted to `%rax` in the encoder -- turning
++    /// `movl x86_pred_cmd(%rip), %eax` into `mov 0x0(%rax), %eax`, a wrong-code
++    /// bug with no diagnostic. Normalizing at the single construction point
++    /// covers every parse path at once.
+     pub fn new(name: &str) -> Self {
+-        Register { name: name.to_string(), mask: None, zeroing: false }
++        let n = name.trim();
++        let n = n.strip_prefix('%').map(str::trim_start).unwrap_or(n);
++        Register { name: n.to_string(), mask: None, zeroing: false }
+     }
+ }
+ 
+@@ -432,7 +445,7 @@ fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
      // Parse the remaining content as a directive or instruction
      if rest.starts_with('.') {
          items.push(parse_directive(rest)?);
@@ -626,7 +695,7 @@ index e45689a..2fd79cf 100644
          items.push(parse_prefixed_instruction(rest)?);
      } else {
          items.push(parse_instruction(rest, None)?);
-@@ -932,6 +932,26 @@ fn parse_symver_directive(args: &str) -> Result<AsmItem, String> {
+@@ -932,6 +945,26 @@ fn parse_symver_directive(args: &str) -> Result<AsmItem, String> {
      ))
  }
  
@@ -653,7 +722,7 @@ index e45689a..2fd79cf 100644
  /// Parse a prefix instruction like "lock cmpxchgq ..." or "rep movsb".
  fn parse_prefixed_instruction(line: &str) -> Result<AsmItem, String> {
      let parts: Vec<&str> = line.splitn(2, |c: char| c.is_whitespace()).collect();
-@@ -1715,15 +1735,31 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
+@@ -1715,15 +1748,31 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
  
          // Check for symbol difference: .LBB3 - .Ljt_0, or with addend: tr_gdt_end - tr_gdt - 1
          if let Some(minus_pos) = trimmed.find(" - ") {
@@ -687,7 +756,7 @@ index e45689a..2fd79cf 100644
                          continue;
                      }
                  }
-@@ -1733,12 +1769,17 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
+@@ -1733,12 +1782,17 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
                  let rhs_add = rhs_full[rhs_plus + 3..].trim();
                  if is_label_like(rhs_sym) {
                      if let Ok(addend) = parse_integer_expr(rhs_add) {
@@ -707,7 +776,66 @@ index e45689a..2fd79cf 100644
              continue;
          }
  
-@@ -2416,15 +2457,48 @@ fn expand_gas_macros_with_state(
+@@ -2062,6 +2116,12 @@ fn expand_gas_macros(lines: &[String]) -> Result<Vec<String>, String> {
+     expand_gas_macros_with_state(lines, &mut macros, &mut symbols)
+ }
+ 
++/// GAS's `\@` pseudo-variable: a monotonically increasing count of macro
++/// expansions. Global so that nested and recursive expansions share one
++/// sequence, matching GNU as.
++static MACRO_INVOCATION_COUNTER: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++
+ fn expand_gas_macros_with_state(
+     lines: &[String],
+     macros: &mut crate::common::fx_hash::FxHashMap<String, GasMacro>,
+@@ -2387,7 +2447,14 @@ fn expand_gas_macros_with_state(
+             macro_name_candidate
+         };
+ 
+-        if macros.contains_key(macro_name) {
++        // A directive is never a macro invocation. Without this, a `.type`
++        // statement was matched against a macro whose *parameter* is called
++        // `type` (the kernel's ANNOTATE/UNWIND_HINT both have `type:req`), and
++        // the substitution rewrote `.type __switch_to_asm STT_FUNC` into the
++        // nonsense directive `.3 __switch_to_asm STT_FUNC`. Every affected
++        // function symbol then stayed STT_NOTYPE and objtool rejected the
++        // object ("unexpected relocation symbol type ... : 0").
++        if macros.contains_key(macro_name) && !macro_name.starts_with('.') {
+             let mac = macros[macro_name].clone();
+             let args_str = if first_word.ends_with(':') {
+                 // Label before macro
+@@ -2404,27 +2471,78 @@ fn expand_gas_macros_with_state(
+             // substitution: e.g., \orig must not match before \orig_len.
+             let mut sorted_args: Vec<(String, String)> = args.clone();
+             sorted_args.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
++            // GAS's `\@`: the number of macro expansions performed so far.
++            // Every expansion gets a distinct value, which is what makes
++            // `.Lhere_\@:` a unique label per invocation. Leaving it
++            // unsubstituted collapsed every use onto one label -- the kernel's
++            // ANNOTATE macro then pointed all six `.discard.annotate_insn`
++            // entries at `.text + 0` instead of at the instruction each one
++            // annotates, and objtool rejected the object
++            // ("intra_function_call not a direct call").
++            //
++            // The counter must be global, not per-expansion-pass: nested and
++            // recursive expansions all draw from the same sequence in GAS.
++            let invocation = MACRO_INVOCATION_COUNTER
++                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            let invocation_s = invocation.to_string();
++
+             // Substitute parameters in body
+             let mut expanded_body: Vec<String> = mac.body.iter().map(|line| {
+                 let mut l = line.clone();
+                 for (pname, pval) in &sorted_args {
+                     l = asm_preprocess::replace_macro_param(&l, &format!("\\{}", pname), pval);
+                 }
++                if l.contains("\\@") {
++                    l = l.replace("\\@", &invocation_s);
++                }
+                 // Strip GAS macro argument delimiters: \() resolves to empty string.
+                 // Used to separate parameter names from adjacent text,
+                 // e.g., \op\()_safe_regs -> rdmsr_safe_regs
                  l = l.replace("\\()", "");
                  l
              }).collect();
@@ -762,7 +890,7 @@ index e45689a..2fd79cf 100644
              }
              i += 1;
              continue;
-@@ -2445,25 +2519,61 @@ fn expand_gas_macros_with_state(
+@@ -2445,25 +2563,61 @@ fn expand_gas_macros_with_state(
  
  /// Parse a .macro definition header: "name param1:req param2:req ..."
  fn parse_macro_def(rest: &str) -> Result<(String, Vec<(String, Option<String>)>), String> {
@@ -838,6 +966,34 @@ index e45689a..2fd79cf 100644
          }
      }
      Ok((name, params))
+@@ -2629,6 +2783,27 @@ fn eval_ifc(rest: &str) -> bool {
+ /// Uses whole-word matching to avoid replacing substrings inside identifiers,
+ /// register names, or instruction mnemonics (e.g., replacing `i` inside `rip`).
+ fn resolve_set_expr(expr: &str, symbols: &crate::common::fx_hash::FxHashMap<String, i64>) -> String {
++    // NEVER substitute inside the directive mnemonic.
++    //
++    // Substitution is whole-word, and `.` counts as a word boundary, so a
++    // symbol named `type` rewrote the directive `.type` into `.3`. The kernel
++    // hits this hard: `arch/x86/include/asm/unwind_hints.h` does `.set type, 3`
++    // inside UNWIND_HINT, and every later `.type foo STT_FUNC` produced by
++    // SYM_FUNC_END silently became `.3 foo STT_FUNC`. All 26 affected function
++    // symbols stayed STT_NOTYPE, and objtool rejected the object with
++    // "unexpected relocation symbol type in .rela.discard...: 0".
++    //
++    // Split the leading directive token off, resolve only the operands, and
++    // re-attach it verbatim.
++    let lead = expr.len() - expr.trim_start().len();
++    let body = &expr[lead..];
++    if body.starts_with('.') {
++        let end = body
++            .find(|c: char| c.is_whitespace())
++            .unwrap_or(body.len());
++        let (mnemonic, rest) = body.split_at(end);
++        return format!("{}{}{}", &expr[..lead], mnemonic, resolve_set_expr(rest, symbols));
++    }
+     let mut result = expr.to_string();
+     // Sort by length (longest first) to avoid partial replacements
+     let mut sym_list: Vec<_> = symbols.iter().collect();
 diff --git a/src/backend/x86/codegen/asm_emitter.rs b/src/backend/x86/codegen/asm_emitter.rs
 index 9589fe1..d3152d0 100644
 --- a/src/backend/x86/codegen/asm_emitter.rs
@@ -1390,5 +1546,80 @@ index 0000000..0af2cc2
 +	}
 +
 +	printf("PASS asm_goto_jump_table\n");
++	return 0;
++}
+diff --git a/tests/regression/asm_reg_space_prefix.c b/tests/regression/asm_reg_space_prefix.c
+new file mode 100644
+index 0000000..9541709
+--- /dev/null
++++ b/tests/regression/asm_reg_space_prefix.c
+@@ -0,0 +1,69 @@
++/* GNU as tolerates whitespace between '%' and a register name.
++ *
++ * The Linux kernel depends on it: arch/x86/include/asm/asm.h builds
++ * `_ASM_RIP(x)` through __ASM_REGPFX, which splices `(% rip)` -- with a space.
++ * lccc stripped only the '%', leaving a register named " rip" that matched
++ * nothing and silently fell back to %rax, so
++ *     movl x86_pred_cmd(%rip), %eax
++ * assembled as `mov 0x0(%rax), %eax`: a wrong-code bug with no diagnostic.
++ *
++ * This checks the RIP-relative load, a stack access and a plain register move
++ * in the spaced spelling all still address what they say.
++ */
++#include <stdio.h>
++
++int value = 0x1234;   /* extern: must survive to be named in asm */
++
++/* Verbatim assembly: `(% rsp)` with a space, exactly as _ASM_RIP()/__ASM_REGPFX
++ * emit it. Must address the stack, not fall back to %rax. */
++asm(".text\n"
++    ".globl get_sp_plus_8\n"
++    ".type get_sp_plus_8, @function\n"
++    "get_sp_plus_8:\n"
++    "  leaq 8(% rsp), %rax\n"
++    "  ret\n"
++    ".size get_sp_plus_8, .-get_sp_plus_8\n"
++    ".globl read_value_rip\n"
++    ".type read_value_rip, @function\n"
++    "read_value_rip:\n"
++    "  movl value(% rip), %eax\n"
++    "  ret\n"
++    ".size read_value_rip, .-read_value_rip\n");
++long get_sp_plus_8(void);
++long read_value_rip(void);
++
++int main(void)
++{
++	int got = 0;
++	long stack_probe = 0x5678;
++	long back = 0;
++
++	/* `(% rip)`: must read `value`, not whatever %rax happens to hold. */
++	got = (int)read_value_rip();
++
++	/* `(% rsp)`-style base: read back a known stack slot. */
++	asm volatile("movq %1, %0" : "=r"(back) : "m"(stack_probe));
++
++	/* Spaced register name inside a memory operand's base, written the way
++	 * the kernel's __ASM_REGPFX splices it. GCC's *inline-asm template*
++	 * parser rejects "% r" (it looks like an operand %-code), so this form
++	 * is exercised via a top-level asm block, which is verbatim text -- the
++	 * same path a .S file takes. */
++	long moved = 0;
++	asm volatile("call get_sp_plus_8" : "=a"(moved) : : "memory");
++
++	if (got != 0x1234) {
++		printf("FAIL rip-relative got=0x%x\n", got);
++		return 1;
++	}
++	if (back != 0x5678) {
++		printf("FAIL stack got=0x%lx\n", back);
++		return 2;
++	}
++	if (moved == 0) {
++		printf("FAIL spaced reg move\n");
++		return 3;
++	}
++	printf("PASS asm_reg_space_prefix\n");
 +	return 0;
 +}
