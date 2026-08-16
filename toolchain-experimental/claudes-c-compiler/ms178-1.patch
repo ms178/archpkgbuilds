@@ -1,1123 +1,648 @@
-From 2ce4581484b7d69e4b56d6d74488b19a12b24d62 Mon Sep 17 00:00:00 2001
+From c826d22d1881b49164aa9ded0096dbe2293be771 Mon Sep 17 00:00:00 2001
 From: Arena Agent <agent@arena.ai>
-Date: Sun, 16 Aug 2026 01:22:05 +0000
-Subject: [PATCH] adopt NEON sadalp/smlal reductions + if-convert covered
- loads, csel fusion hardened
+Date: Sun, 16 Aug 2026 01:53:09 +0000
+Subject: [PATCH] linker: lccc-ld userspace mode, hot-path fixes (-36% link
+ time), real benchmark
 
-Backport of levkropp 36e6cb18, the last substantial commit in his tree.
-Adopted: VecSadalpI32x4 4-wide i32->i64 sum reduction (sadalp accumulates
-sign-extended pairs, exact for integer sums), VecSmlalLo/HiI32x4 dot
-products, the saddlp/uaddlp/sadalp/uadalp encoder fix (size field from
-the SOURCE arrangement - was a reserved encoding -> SIGILL), if_convert
-covered-arm-load rewriting (copy-chain aware), and AArch64 fused
-cmp+csel via the new supports_fused_cmp_select hook.
+Three coordinated pieces of the LINKER_FOLLOWUP plan:
 
-TWO BUGS IN HIS COMMIT FOUND BY OUR ARM DIFFERENTIAL SUITE AND FIXED:
+1. lccc-ld GAINS THE STANDARD USERSPACE MODE. Previously it hard-errored
+   without -T/-r ('requires a linker script'), so 'make LD=lccc-ld' and
+   direct gcc-style invocations (crt1.o ... -lc --dynamic-linker ...)
+   were impossible - and the user's own 'lccc-ld -v' CLI expectation
+   only half-true. It now routes script-less links through the SAME
+   link_builtin/link_shared pipeline the compiler driver uses (archive
+   group semantics, PLT/GOT, RELRO, eh_frame_hdr, gc-sections, --wrap,
+   -u, --defsym, -z keywords, -static, -shared, rpath/soname/
+   version-script forwarding). --whole-archive without -T fails loudly
+   instead of silently dropping members; non-standard --dynamic-linker
+   values warn instead of diverging silently.
 
-1. ASSEMBLY FAILURE (huft_build_crash): select_arm_reg emitted
-   'mov w2, x0' for 32-bit selects - not a valid A64 form (width must
-   match on both sides). Source is now w0 when the scratch is a w-reg.
+2. HOT-PATH FIXES, measured with the new permanent LCCC_LD_TIME phase
+   profiler (link.rs phases + emit_exec zones):
+   - register_symbols_elf64: globals.reserve(obj.symbols.len()) - the
+     doubling cascade re-hashed every existing key on growth
+     (40k-symbol object: 23.1 -> 12.9 ms);
+   - emit_exec: the 'snapshot' globals.clone() deep-copied the whole
+     map (40k String keys) although globals is never touched afterwards
+     - replaced by a reborrow (relocs zone 9.0 -> 3.5 ms);
+   - symtab sort: cached big-endian u64 name-prefix key decides almost
+     every comparison in one instruction instead of memcmp over long
+     common prefixes ('F1','F12',...), full byte compare only on prefix
+     ties - identical order (5.3 -> 2.7 ms); entries/strtab pre-sized;
+     single-lookup symbol registration via get_mut (no key re-clone).
+   big-text profile end-to-end: 77 -> 49 ms (-36%).
 
-2. MISCOMPILE (pgo_sections, training output 770104689198169071 !=
-   365601466280353968): detect_cmp_select_fusion allowed the Cmp to sit
-   ARBITRRARILY far above the Select. The fusion re-emits the Cmp at the
-   Select's program point, but in the accumulator-based codegen the
-   intervening instructions clobber the scratch registers the Cmp
-   operands lived in - pgo_sections' if-chain then compared k-87
-   instead of k ('add w8, w8, #-87' reused the register between the
-   three sunk compares). Fusion is now restricted to the immediately
-   adjacent shapes 'cmp; select' and 'cmp; copy; select', where the
-   register state at the re-emit point provably equals the state at the
-   original Cmp. CCC_NO_FUSED_CSEL=1 added for A/B bisection.
+3. tests/linker/bench_linker.py REWRITTEN as a real differential
+   benchmark: 4 synthetic profiles (many-objects/big-text/many-syms/
+   archive) + sqlite3+shell real link, every output EXECUTED and its
+   stdout verified (fast-but-wrong scores zero), best-of-3, vs bfd and
+   mold. Current standings (2-core VM):
+     many-objects 19ms vs bfd 77 / mold 95   (fastest)
+     archive      23ms vs bfd 51 / mold 15
+     big-text     51ms vs bfd 101 / mold 30
+     many-syms    43ms vs bfd 94 / mold 27
+     sqlite-exe   16ms vs mold 16 (bfd fails on this invocation)
+   mold's remaining big-text/many-syms lead is parallel reloc
+   application + faster symtab emission - tracked in LINKER_FOLLOWUP.
 
-Merge notes: byte_offset_iv (ours) and second_acc (his) both threaded
-through insert_reduction_remainder_loop; our loud unhandled-intrinsic
-diagnostic on x86 kept instead of his silent no-op arms; his smlal dot
-patterns pass through OUR stricter reduction soundness gate (currently
-rejects the multiply shape conservatively - correct result, sadalp sum
-path fires and is verified). Task-file edits dropped.
-
-PROOF: sadalp fires on 4096-i32 sum, qemu == gcc (-2048); dot product
-correct (-627, scalar); huft + pgo_sections both pass again; ARM
-differential 101/25 (baseline held), 166/166 x86, 673 lib, 50/50
-correctness, 3/3 intrinsics, 300/300 fuzz; x86 sieve asm BIT-IDENTICAL
-to origin/main (all new hooks default-false on x86).
+PROOF: 86/86 linker differential tests (bfd+mold oracles), 673 lib,
+166/166 x86 regression; lccc-ld-linked sqlite3 answers SQL correctly
+(sum check); all five bench profiles verified-correct.
 ---
- src/backend/arm/assembler/encoder/mod.rs  |   8 +-
- src/backend/arm/assembler/encoder/neon.rs |  26 +++
- src/backend/arm/codegen/comparison.rs     |  57 ++++-
- src/backend/arm/codegen/emit.rs           |   2 +
- src/backend/arm/codegen/intrinsics.rs     |  50 ++++
- src/backend/generation.rs                 | 111 +++++++++
- src/backend/i686/codegen/intrinsics.rs    |   4 +-
- src/backend/riscv/codegen/intrinsics.rs   |   4 +-
- src/backend/traits.rs                     |  31 +++
- src/backend/x86/codegen/intrinsics.rs     |   4 +-
- src/ir/intrinsics.rs                      |  12 +
- src/passes/if_convert.rs                  | 140 +++++++++++-
- src/passes/vectorize.rs                   | 265 ++++++++++++++++++++--
- 13 files changed, 681 insertions(+), 33 deletions(-)
+ src/backend/linker_common/dynamic.rs |  21 ++-
+ src/backend/x86/linker/emit_exec.rs  |  51 ++++++-
+ src/backend/x86/linker/link.rs       |  18 ++-
+ src/bin/lccc_ld.rs                   | 208 ++++++++++++++++++++++-----
+ src/linker_entry.rs                  |  31 ++++
+ 5 files changed, 282 insertions(+), 47 deletions(-)
 
-diff --git a/src/backend/arm/assembler/encoder/mod.rs b/src/backend/arm/assembler/encoder/mod.rs
-index 3b54d6cf..d9ace68f 100644
---- a/src/backend/arm/assembler/encoder/mod.rs
-+++ b/src/backend/arm/assembler/encoder/mod.rs
-@@ -579,10 +579,10 @@ pub fn encode_instruction(mnemonic: &str, operands: &[Operand], raw_operands: &s
-         "rev32" => if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
-             encode_neon_two_misc(operands, 1, 0b00000)
-         } else { encode_rev32(operands) },
--        "saddlp" => encode_neon_two_misc(operands, 0, 0b00010),
--        "uaddlp" => encode_neon_two_misc(operands, 1, 0b00010),
--        "sadalp" => encode_neon_two_misc(operands, 0, 0b00110),
--        "uadalp" => encode_neon_two_misc(operands, 1, 0b00110),
-+        "saddlp" => encode_neon_pairwise_long(operands, 0, 0b00010),
-+        "uaddlp" => encode_neon_pairwise_long(operands, 1, 0b00010),
-+        "sadalp" => encode_neon_pairwise_long(operands, 0, 0b00110),
-+        "uadalp" => encode_neon_pairwise_long(operands, 1, 0b00110),
-         "sqxtun" => encode_neon_two_misc_narrow(operands, 1, 0b10010, false),
-         "sqxtun2" => encode_neon_two_misc_narrow(operands, 1, 0b10010, true),
-         "sqabs" => if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
-diff --git a/src/backend/arm/assembler/encoder/neon.rs b/src/backend/arm/assembler/encoder/neon.rs
-index 15d84de0..cdeee497 100644
---- a/src/backend/arm/assembler/encoder/neon.rs
-+++ b/src/backend/arm/assembler/encoder/neon.rs
-@@ -1462,6 +1462,32 @@ pub(crate) fn encode_neon_two_misc(operands: &[Operand], u_bit: u32, opcode: u32
-     Ok(EncodeResult::Word(word))
- }
+diff --git a/src/backend/linker_common/dynamic.rs b/src/backend/linker_common/dynamic.rs
+index 42783273..11629c11 100644
+--- a/src/backend/linker_common/dynamic.rs
++++ b/src/backend/linker_common/dynamic.rs
+@@ -242,6 +242,17 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
+     globals: &mut FxHashMap<String, G>,
+     should_replace_extra: fn(existing: &G) -> bool,
+ ) -> Result<(), String> {
++    // PERF: pre-size the map for this object's symbols. Growth rehashes the
++    // WHOLE table (re-hash every existing key string); with 40k-symbol
++    // objects the doubling cascade dominated registration time.
++    globals.reserve(obj.symbols.len());
++    // PERF: single-lookup registration via get_mut + in-place replacement.
++    // The old shape did `globals.get(&name)` followed by
++    // `globals.insert(name.clone(), ..)` — two hashes of the string PLUS a
++    // key clone on EVERY definition, dominating link time for symbol-heavy
++    // objects (big-text profile: 21.5 ms of a 66 ms link inside this loop).
++    // Replacement through `*e = ..` reuses the existing key (no clone, one
++    // hash); only genuinely new symbols pay the clone+insert.
+     for sym in &obj.symbols {
+         if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE { continue; }
+         if sym.name.is_empty() || sym.is_local() { continue; }
+@@ -249,7 +260,7 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
+         let is_defined = !sym.is_undefined() && sym.shndx != SHN_COMMON;
  
-+// ── NEON pairwise add long / accumulate ──────────────────────────────────
-+/// Encode SADDLP/UADDLP/SADALP/UADALP.
-+/// Format: 0 Q U 01110 size 10000 opcode 10 Rn Rd
-+/// Unlike most two-reg misc ops, the size field encodes the SOURCE (narrow)
-+/// element size and Q encodes the source register width — deriving size from
-+/// the destination (wide) arrangement produces a reserved encoding.
-+pub(crate) fn encode_neon_pairwise_long(operands: &[Operand], u_bit: u32, opcode: u32) -> Result<EncodeResult, String> {
-+    if operands.len() < 2 {
-+        return Err("NEON pairwise-long requires 2 operands".to_string());
-+    }
-+    let (rd, _arr_d) = get_neon_reg(operands, 0)?;
-+    let (rn, arr_n) = get_neon_reg(operands, 1)?;
-+    let (q, size) = match arr_n.as_str() {
-+        "8b" => (0u32, 0b00u32),
-+        "16b" => (1, 0b00),
-+        "4h" => (0, 0b01),
-+        "8h" => (1, 0b01),
-+        "2s" => (0, 0b10),
-+        "4s" => (1, 0b10),
-+        _ => return Err(format!("unsupported source arrangement for pairwise long: {}", arr_n)),
-+    };
-+    let word = (q << 30) | (u_bit << 29) | (0b01110 << 24) | (size << 22)
-+        | (0b10000 << 17) | (opcode << 12) | (0b10 << 10) | (rn << 5) | rd;
-+    Ok(EncodeResult::Word(word))
-+}
-+
- // ── NEON float two-register misc ─────────────────────────────────────────
- /// Encode NEON float two-reg misc: UCVTF, SCVTF, FCVTZS, FCVTZU, FNEG, FABS, etc. (vector)
- /// Format: 0 Q U 01110 size 10000 opcode 10 Rn Rd
-diff --git a/src/backend/arm/codegen/comparison.rs b/src/backend/arm/codegen/comparison.rs
-index 80d49ef9..cdd66f2f 100644
---- a/src/backend/arm/codegen/comparison.rs
-+++ b/src/backend/arm/codegen/comparison.rs
-@@ -2,7 +2,7 @@
- 
- use crate::ir::reexports::{IrCmpOp, Operand, Value};
- use crate::common::types::IrType;
--use super::emit::{ArmCodegen, arm_int_cond_code, arm_invert_cond_code};
-+use super::emit::{ArmCodegen, arm_int_cond_code, arm_invert_cond_code, callee_saved_name, callee_saved_name_32, is_arm_fp_phys};
- 
- impl ArmCodegen {
-     pub(super) fn emit_float_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-@@ -97,4 +97,59 @@ impl ArmCodegen {
-         self.state.reg_cache.invalidate_acc();
-         self.store_x0_to(dest);
-     }
-+
-+    /// Fused integer compare-and-select: `cmp lhs, rhs` + `csel dest, tv, fv, cc`.
-+    /// The Cmp's boolean result was used only by this select, so the cset
-+    /// materialization is skipped entirely. Register-allocated select arms are
-+    /// used in place (no x0 round-trips), keeping the loop-carried dependency
-+    /// chain short (cmp; csel) for if-converted hot loops.
-+    pub(super) fn emit_fused_cmp_select_impl(
-+        &mut self,
-+        op: IrCmpOp,
-+        lhs: &Operand,
-+        rhs: &Operand,
-+        cmp_ty: IrType,
-+        true_val: &Operand,
-+        false_val: &Operand,
-+        dest: &Value,
-+        sel_ty: IrType,
-+    ) {
-+        self.emit_int_cmp_insn(lhs, rhs, cmp_ty);
-+        let cc = arm_int_cond_code(op);
-+        let use_32bit = sel_ty.size() <= 4;
-+
-+        // Stage the select arms before the dest: x1/x2 scratch are never
-+        // allocator-assigned, so they cannot collide with phys regs.
-+        let f_name = self.select_arm_reg(false_val, "x1", use_32bit);
-+        let t_name = self.select_arm_reg(true_val, "x2", use_32bit);
-+
-+        if let Some(dp) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
-+            let d = if use_32bit { callee_saved_name_32(dp) } else { callee_saved_name(dp) };
-+            self.state.emit_fmt(format_args!("    csel {}, {}, {}, {}", d, t_name, f_name, cc));
-+        } else {
-+            self.state.emit_fmt(format_args!("    csel x0, {}, {}, {}", t_name, f_name, cc));
-+            self.store_x0_to(dest);
-+        }
-+        self.state.reg_cache.invalidate_acc();
-+    }
-+
-+    /// Resolve a Select arm to a register name: its assigned phys reg when
-+    /// available, otherwise loaded into the given scratch register.
-+    fn select_arm_reg(&mut self, op: &Operand, scratch_x: &str, use_32bit: bool) -> String {
-+        if let Operand::Value(v) = op {
-+            if let Some(phys) = self.reg_assignments.get(&v.0).copied() {
-+                if !is_arm_fp_phys(phys) {
-+                    return (if use_32bit { callee_saved_name_32(phys) } else { callee_saved_name(phys) }).to_string();
-+                }
-+            }
-+        }
-+        // Width must match on BOTH sides of the mov: `mov w2, x0` is not a
-+        // valid A64 form (operand mismatch at assembly time — huft_build
-+        // repro). 32-bit selects copy w0 into a w-scratch.
-+        let scratch = if use_32bit { scratch_x.replacen('x', "w", 1) } else { scratch_x.to_string() };
-+        let src = if use_32bit { "w0" } else { "x0" };
-+        self.operand_to_x0(op);
-+        self.state.emit_fmt(format_args!("    mov {}, {}", scratch, src));
-+        scratch
-+    }
- }
-diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
-index 25b0f1cd..95f6a20e 100644
---- a/src/backend/arm/codegen/emit.rs
-+++ b/src/backend/arm/codegen/emit.rs
-@@ -1852,6 +1852,7 @@ impl ArchCodegen for ArmCodegen {
-     fn supports_shifted_logical(&self) -> bool { true }
-     fn supports_indexed_addr(&self) -> bool { true }
-     fn supports_fused_fp_cmp_branch(&self) -> bool { true }
-+    fn supports_fused_cmp_select(&self) -> bool { true }
-     fn emit_load_indexed(&mut self, dest: &Value, base: &Value, index: &Value, shift: u8, ty: IrType) -> bool {
-         self.emit_load_indexed_impl(dest, base, index, shift, ty)
-     }
-@@ -2214,6 +2215,7 @@ impl ArchCodegen for ArmCodegen {
-         fn emit_int_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_cmp_impl;
-         fn emit_f128_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand) => emit_f128_cmp_impl;
-         fn emit_fused_cmp_branch(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, true_label: &str, false_label: &str) => emit_fused_cmp_branch_impl;
-+        fn emit_fused_cmp_select(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, cmp_ty: IrType, true_val: &Operand, false_val: &Operand, dest: &Value, sel_ty: IrType) => emit_fused_cmp_select_impl;
-         fn emit_select(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) => emit_select_impl;
-         // calls
-         fn call_abi_config(&self) -> CallAbiConfig => call_abi_config_impl;
-diff --git a/src/backend/arm/codegen/intrinsics.rs b/src/backend/arm/codegen/intrinsics.rs
-index 33fd2fd9..28e9b350 100644
---- a/src/backend/arm/codegen/intrinsics.rs
-+++ b/src/backend/arm/codegen/intrinsics.rs
-@@ -507,6 +507,56 @@ impl ArmCodegen {
-                 if let Some(d) = dest { self.store_x0_to(d); }
-             }
- 
-+            // NEON sadalp: accumulate sign-extended adjacent pairs of a 4×I32
-+            // vector into a 2×I64 accumulator (one instruction per 4 elements).
-+            IntrinsicOp::VecSadalpI32x4 => {
-+                if let Some(d) = dest {
-+                    let acc = self.load_vector_value_128(&args[0], "q0");
-+                    let src = self.load_vector_value_128(&args[1], "q1");
-+                    if let Some(name) = self.assigned_vector_reg(d.0) {
-+                        self.state.vector_values.insert(d.0);
-+                        if name != acc {
-+                            self.state.emit_fmt(format_args!("    mov {}.16b, {}.16b", name, acc));
-+                        }
-+                        self.state.emit_fmt(format_args!("    sadalp {}.2d, {}.4s", name, src));
-+                    } else {
-+                        if acc != "v0" {
-+                            self.state.emit_fmt(format_args!("    mov v0.16b, {}.16b", acc));
-+                        }
-+                        self.state.emit_fmt(format_args!("    sadalp v0.2d, {}.4s", src));
-+                        self.store_vector_value_128(d, "q0");
-+                    }
-+                }
-+            }
-+
-+            // NEON smlal/smlal2: accumulate sign-extended products of the low
-+            // (2s) or high (4s) halves of two 4×I32 vectors into a 2×I64 acc.
-+            IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4 => {
-+                if let Some(d) = dest {
-+                    let acc = self.load_vector_value_128(&args[0], "q0");
-+                    let a = self.load_vector_value_128(&args[1], "q1");
-+                    let b = self.load_vector_value_128(&args[2], "q2");
-+                    let (mnemonic, suffix) = if *op == IntrinsicOp::VecSmlalLoI32x4 {
-+                        ("smlal", "2s")
-+                    } else {
-+                        ("smlal2", "4s")
-+                    };
-+                    if let Some(name) = self.assigned_vector_reg(d.0) {
-+                        self.state.vector_values.insert(d.0);
-+                        if name != acc {
-+                            self.state.emit_fmt(format_args!("    mov {}.16b, {}.16b", name, acc));
-+                        }
-+                        self.state.emit_fmt(format_args!("    {} {}.2d, {}.{}, {}.{}", mnemonic, name, a, suffix, b, suffix));
-+                    } else {
-+                        if acc != "v0" {
-+                            self.state.emit_fmt(format_args!("    mov v0.16b, {}.16b", acc));
-+                        }
-+                        self.state.emit_fmt(format_args!("    {} v0.2d, {}.{}, {}.{}", mnemonic, a, suffix, b, suffix));
-+                        self.store_vector_value_128(d, "q0");
-+                    }
-+                }
-+            }
-+
-             // Register-based vector operations (NEON 128-bit).
-             // Two-wide F64 (2×.2d) and four-wide I32 (4×.4s) for reductions.
-             IntrinsicOp::VecLoadF64x2 | IntrinsicOp::VecLoadI32x4 => {
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index 2593647f..8c7e050e 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -893,6 +893,91 @@ fn detect_cmp_branch_fusion(
-     Some((cmp_idx, dead_copy_idx))
- }
- 
-+/// Detect compare-and-select fusion opportunities within a block.
-+///
-+/// Finds `Select` instructions whose condition is an integer Cmp result used
-+/// nowhere else (optionally through one dead Copy), e.g. what if-conversion
-+/// produces for `if (a > 0) s += a`. Fusing skips the cset materialization
-+/// and emits compare + conditional-select directly.
-+///
-+/// Returns one entry per fusable Select: (select_idx, cmp_idx, dead_copy_idx).
-+/// The cmp_idx/dead_copy_idx instructions are skipped by the caller.
-+fn detect_cmp_select_fusion(
-+    block: &BasicBlock,
-+    use_counts: &[u32],
-+) -> Vec<(usize, usize, Option<usize>)> {
-+    let uses = |v: u32| -> u32 { use_counts.get(v as usize).copied().unwrap_or(u32::MAX) };
-+    let mut out = Vec::new();
-+    for (sel_idx, inst) in block.instructions.iter().enumerate() {
-+        let Instruction::Select { cond: Operand::Value(cond_v), ty: sel_ty, .. } = inst else {
-+            continue;
-+        };
-+        if sel_ty.is_long_double() || sel_ty.is_128bit() {
-+            continue;
-+        }
-+        // Find the defining Cmp of the select condition, either directly or
-+        // through one Copy (SSA means at most one definition exists).
-+        let mut cmp_idx = None;
-+        let mut copy_idx = None;
-+        for (j, prev) in block.instructions[..sel_idx].iter().enumerate() {
-+            match prev {
-+                Instruction::Cmp { dest, .. } if dest.0 == cond_v.0 => {
-+                    cmp_idx = Some(j);
-+                    copy_idx = None;
-+                }
-+                Instruction::Copy { dest, src: Operand::Value(src) } if dest.0 == cond_v.0 => {
-+                    for (k, prev2) in block.instructions[..j].iter().enumerate() {
-+                        if let Instruction::Cmp { dest: cd, .. } = prev2 {
-+                            if cd.0 == src.0 {
-+                                cmp_idx = Some(k);
-+                                copy_idx = Some(j);
-+                            }
-+                        }
-+                    }
-+                }
-+                _ => {}
-+            }
-+        }
-+        let Some(ci) = cmp_idx else { continue };
-+        // ADJACENCY REQUIRED. The fusion re-emits the Cmp at the Select's
-+        // program point; in the accumulator-based codegen every instruction
-+        // between them may clobber the scratch registers the Cmp operands
-+        // were materialized in. Lev's original allowed arbitrary sinking:
-+        // pgo_sections' if-chain then compared k-87 instead of k (an
-+        // intervening `add w8, w8, #-87` reused the accumulator) and the
-+        // training output diverged. Only the immediately-adjacent shapes
-+        // `cmp; select` and `cmp; copy; select` are sound — at that distance
-+        // the register state at the re-emit point is identical to the state
-+        // at the original Cmp.
-+        let adjacent = match copy_idx {
-+            None => ci + 1 == sel_idx,
-+            Some(cp) => ci + 1 == cp && cp + 1 == sel_idx,
-+        };
-+        if !adjacent {
-+            continue;
-+        }
-+        let Instruction::Cmp { dest: cmp_dest, ty: cmp_ty, .. } = &block.instructions[ci] else {
-+            continue;
-+        };
-+        // Integer comparisons only: FP compares need fcmp and a different
-+        // condition-code mapping.
-+        if cmp_ty.is_float() || cmp_ty.is_long_double() || cmp_ty.is_128bit() {
-+            continue;
-+        }
-+        // The cmp result must feed only the select (directly, or via the copy).
-+        if copy_idx.is_some() {
-+            if uses(cmp_dest.0) != 1 || uses(cond_v.0) != 1 {
-+                continue;
-+            }
-+        } else if uses(cmp_dest.0) != 1 {
-+            continue;
-+        }
-+        out.push((sel_idx, ci, copy_idx));
-+    }
-+    out
-+}
-+
-+
- /// Detect multiply-add fusion opportunities within a block.
- ///
- /// Finds `BinOp::Mul` instructions whose result is used exactly once as an
-@@ -1684,6 +1769,13 @@ fn generate_function(
-         let fuse_idx =
-             detect_cmp_branch_fusion(block, &value_use_counts, cg.supports_fused_fp_cmp_branch());
-         let mul_add_fusions = detect_mul_add_fusions(block, &value_use_counts, cg.supports_fused_float_mul_add());
-+        let cmp_select_fusions = if cg.supports_fused_cmp_select()
-+            && std::env::var("CCC_NO_FUSED_CSEL").is_err()
-+        {
-+            detect_cmp_select_fusion(block, &value_use_counts)
-+        } else {
-+            Vec::new()
-+        };
-         let shifted_logical_fusions = if cg.supports_shifted_logical() {
-             detect_shifted_logical_fusions(block, &value_use_counts)
-         } else {
-@@ -1731,6 +1823,12 @@ fn generate_function(
-                 cg.state().current_program_point += 1;
-                 continue;
-             }
-+            if cmp_select_fusions.iter().any(|&(_, ci, copy_i)| ci == idx || copy_i == Some(idx)) {
-+                // Skip the Cmp (and dead Copy) folded into a fused
-+                // compare-and-select emitted at the Select below.
-+                cg.state().current_program_point += 1;
-+                continue;
-+            }
-             // Skip the Add that was already emitted as part of a fused Mul-Add.
-             // This flag is set by the Mul handler below when fusion fires.
-             if skip_fused_add {
-@@ -1834,6 +1932,19 @@ fn generate_function(
+         if is_defined {
+-            match globals.get(&sym.name) {
++            match globals.get_mut(&sym.name) {
+                 None => { globals.insert(sym.name.clone(), G::new_defined(obj_idx, sym)); }
+                 Some(e) => {
+                     let e_weak = e.info() >> 4 == STB_WEAK;
+@@ -259,7 +270,7 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
+                     if !e.is_defined() || should_replace_extra(e) || e_common
+                         || (e_weak && sym.is_global())
+                     {
+-                        globals.insert(sym.name.clone(), G::new_defined(obj_idx, sym));
++                        *e = G::new_defined(obj_idx, sym);
+                     } else if sym.is_global() && !e_weak && !e.is_dynamic() && e.is_defined() {
+                         // Two strong definitions of the same symbol: this is a
+                         // hard error in every mainstream linker. Silently keeping
+@@ -273,14 +284,14 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
                  }
              }
- 
-+            // Fused compare-and-select: the Cmp feeding this Select was skipped
-+            // above; emit compare + conditional-select directly.
-+            if let Some(&(_, ci, _)) = cmp_select_fusions.iter().find(|&&(si, _, _)| si == idx) {
-+                if let (Instruction::Select { dest, true_val, false_val, ty: sel_ty, .. },
-+                        Instruction::Cmp { op, lhs, rhs, ty: cmp_ty, .. }) =
-+                    (inst, &block.instructions[ci])
-+                {
-+                    cg.emit_fused_cmp_select(*op, lhs, rhs, *cmp_ty, true_val, false_val, dest, *sel_ty);
-+                    cg.state().current_program_point += 1;
-+                    continue;
-+                }
-+            }
-+
-             // Try MachInst pipeline first (virtual register ISel).
-             // If the instruction is handled, it's accumulated in the MachInst buffer.
-             // When an unhandled instruction is encountered, the buffer is flushed
-diff --git a/src/backend/i686/codegen/intrinsics.rs b/src/backend/i686/codegen/intrinsics.rs
-index 4af5a9d9..cc81a7b1 100644
---- a/src/backend/i686/codegen/intrinsics.rs
-+++ b/src/backend/i686/codegen/intrinsics.rs
-@@ -445,7 +445,9 @@ impl I686Codegen {
-             IntrinsicOp::VecMulI64x2 | IntrinsicOp::VecHorizontalAddI64x2 |
-             IntrinsicOp::VecZeroI64x2 |
-             IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecBroadcastI32x4 |
--            IntrinsicOp::VecStoreI32x4 => {
-+            IntrinsicOp::VecStoreI32x4 |
-+            IntrinsicOp::VecSadalpI32x4 |
-+            IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4 => {
-                 // These are x86-64/AArch64-specific register-based vector operations
-                 unimplemented!("Register-based vector intrinsics not implemented for i686");
-             }
-diff --git a/src/backend/riscv/codegen/intrinsics.rs b/src/backend/riscv/codegen/intrinsics.rs
-index 3ceb5895..db0c838a 100644
---- a/src/backend/riscv/codegen/intrinsics.rs
-+++ b/src/backend/riscv/codegen/intrinsics.rs
-@@ -310,7 +310,9 @@ impl RiscvCodegen {
-             IntrinsicOp::VecMulI64x2 | IntrinsicOp::VecHorizontalAddI64x2 |
-             IntrinsicOp::VecZeroI64x2 |
-             IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecBroadcastI32x4 |
--            IntrinsicOp::VecStoreI32x4 => {
-+            IntrinsicOp::VecStoreI32x4 |
-+            IntrinsicOp::VecSadalpI32x4 |
-+            IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4 => {
-                 // These are x86-64/AArch64-specific register-based vector operations
-                 // RISC-V would use RVV (RISC-V Vector extension) differently
-                 unimplemented!("Register-based vector intrinsics not implemented for RISC-V");
-diff --git a/src/backend/traits.rs b/src/backend/traits.rs
-index aa4e9b4b..9aeffce4 100644
---- a/src/backend/traits.rs
-+++ b/src/backend/traits.rs
-@@ -1586,6 +1586,37 @@ pub trait ArchCodegen {
-         self.emit_fused_cmp_branch(op, lhs, rhs, ty, &true_label, &false_label);
-     }
- 
-+    /// Whether the backend can fuse an integer compare feeding a Select into
-+    /// compare + conditional-select, skipping the boolean materialization.
-+    fn supports_fused_cmp_select(&self) -> bool {
-+        false
-+    }
-+
-+    /// Emit a fused compare-and-select: `dest = (lhs <op> rhs) ? tv : fv`
-+    /// without materializing the comparison's boolean value. Only called for
-+    /// integer comparisons whose Cmp result is used solely by this select
-+    /// (the caller skips the standalone Cmp emission).
-+    ///
-+    /// Default: materialize via the generic cmp + select sequence.
-+    fn emit_fused_cmp_select(
-+        &mut self,
-+        op: IrCmpOp,
-+        lhs: &Operand,
-+        rhs: &Operand,
-+        cmp_ty: IrType,
-+        true_val: &Operand,
-+        false_val: &Operand,
-+        dest: &Value,
-+        sel_ty: IrType,
-+    ) {
-+        let dummy_dest = Value(u32::MAX);
-+        self.emit_cmp(&dummy_dest, op, lhs, rhs, cmp_ty);
-+        // The accumulator holds the boolean result; select on it.
-+        self.emit_select(dest, &Operand::Value(dummy_dest), true_val, false_val, sel_ty);
-+        // Invalidate cache since dummy_dest may have polluted it.
-+        self.state().reg_cache.invalidate_all();
-+    }
-+
-     /// Emit an indirect branch (computed goto).
-     fn emit_indirect_branch(&mut self, target: &Operand) {
-         self.emit_load_operand(target);
-diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
-index e18abd2c..d4a0034d 100644
---- a/src/backend/x86/codegen/intrinsics.rs
-+++ b/src/backend/x86/codegen/intrinsics.rs
-@@ -2553,7 +2553,9 @@ impl X86Codegen {
-             }
-             // AArch64-only intrinsics must never reach the x86 emitter; fall
-             // through to the loud "unhandled" diagnostic below rather than
--            // silently no-opping (which would miscompile).
-+            // silently no-opping (which would miscompile). This covers
-+            // Lev's VecSadalp/VecSmlal* widening reductions too — the sadalp
-+            // transform is gated to the AArch64 pipeline entry.
-             // Generic SIMD family (512-bit + FP): emitted by intrinsics_simd.rs.
-             _ => {
-                 if !self.emit_simd_op(dest, op, dest_ptr, args) {
-diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
-index 4708ec9f..9b5a7065 100644
---- a/src/ir/intrinsics.rs
-+++ b/src/ir/intrinsics.rs
-@@ -254,6 +254,16 @@ pub enum IntrinsicOp {
-     VecAddI64x2,
-     VecMulI64x2,
- 
-+    /// NEON sadalp: sign-extend 4×I32 lanes and accumulate adjacent pairs into
-+    /// a 2×I64 accumulator: dest = args[0] + pairwise_sums(args[1]).
-+    /// Integer addition is associative, so this matches sequential scalar order.
-+    VecSadalpI32x4,
-+    /// NEON smlal (low half): dest = args[0] + widen_mul(low2(args[1]), low2(args[2]))
-+    /// where args[1]/args[2] are 4×I32 vectors and the accumulator is 2×I64.
-+    VecSmlalLoI32x4,
-+    /// NEON smlal2 (high half): same as VecSmlalLoI32x4 but for lanes 2-3.
-+    VecSmlalHiI32x4,
-+
-     /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 4×F64 → F64
-     /// args[0] = source vector value; dest = scalar F64 result
-     VecHorizontalAddF64x4,
-@@ -1076,6 +1086,8 @@ impl IntrinsicOp {
-             | IntrinsicOp::VecAddI64x2 | IntrinsicOp::VecMulI64x2
-             | IntrinsicOp::VecZeroI64x2
-             | IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecBroadcastI32x4
-+            | IntrinsicOp::VecSadalpI32x4
-+            | IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4
-         )
-     }
- }
-diff --git a/src/passes/if_convert.rs b/src/passes/if_convert.rs
-index a1a21e60..46cfe391 100644
---- a/src/passes/if_convert.rs
-+++ b/src/passes/if_convert.rs
-@@ -48,7 +48,7 @@ use crate::ir::reexports::{
-     Value,
- };
- use crate::ir::analysis;
--use crate::common::types::IrType;
-+use crate::common::types::{AddressSpace, IrType};
- use crate::common::fx_hash::{FxHashMap, FxHashSet};
- 
- /// Run if-conversion on a single function.
-@@ -72,6 +72,135 @@ pub(crate) fn if_convert_function(func: &mut IrFunction) -> usize {
-     total
- }
- 
-+/// Rewrite loads in single-predecessor arm blocks that re-load an address the
-+/// branch predecessor already loads. The arm always executes immediately after
-+/// the pred on any path that reaches it, so when both blocks are free of
-+/// memory writes the pred's identical load produces exactly the value the arm
-+/// load would see; replacing it with a Copy eliminates a redundant memory
-+/// access and often makes the arm side-effect-free enough for if-conversion
-+/// (e.g. `if (a[i] > 0) s += a[i]` reloading `a[i]` in the then-arm).
-+fn rewrite_covered_arm_loads(
-+    func: &mut IrFunction,
-+    label_to_idx: &FxHashMap<BlockId, usize>,
-+    preds: &analysis::FlatAdj,
-+) -> usize {
-+    /// Free of memory writes and other externally visible effects.
-+    /// Loads are fine (they don't change memory). Conservative: intrinsics,
-+    /// calls, stores, atomics, allocas are all treated as barriers.
-+    fn is_pure(inst: &Instruction) -> bool {
-+        matches!(
-+            inst,
-+            Instruction::Load { .. }
-+                | Instruction::BinOp { .. }
-+                | Instruction::UnaryOp { .. }
-+                | Instruction::Cmp { .. }
-+                | Instruction::Cast { .. }
-+                | Instruction::Copy { .. }
-+                | Instruction::GetElementPtr { .. }
-+                | Instruction::GlobalAddr { .. }
-+                | Instruction::Select { .. }
-+                | Instruction::Phi { .. }
-+        )
-+    }
-+
-+    let mut rewrites = 0;
-+    let debug = std::env::var("CCC_DEBUG_IFCONV").is_ok();
-+
-+    // Resolve pointer copies to their root value: `p = q; load [p]` loads the
-+    // same address as `load [q]`. SSA guarantees the root dominates both uses.
-+    let mut copy_of: FxHashMap<Value, Value> = FxHashMap::default();
-+    for b in &func.blocks {
-+        for i in &b.instructions {
-+            if let Instruction::Copy { dest, src: Operand::Value(src) } = i {
-+                copy_of.insert(*dest, *src);
-+            }
-+        }
-+    }
-+    let resolve = |v: &Value| -> Value {
-+        let mut cur = *v;
-+        for _ in 0..64 {
-+            match copy_of.get(&cur) {
-+                Some(&next) if next != cur => cur = next,
-+                _ => break,
-+            }
-+        }
-+        cur
-+    };
-+
-+    for pred_idx in 0..func.blocks.len() {
-+        let (true_label, false_label) = match &func.blocks[pred_idx].terminator {
-+            Terminator::CondBranch { true_label, false_label, .. } => (*true_label, *false_label),
-+            _ => continue,
-+        };
-+        // The pred must not write memory between its load and the arm.
-+        if !func.blocks[pred_idx].instructions.iter().all(is_pure) {
-+            continue;
-+        }
-+        // Collect the pred's loads: (ptr, ty, seg) -> dest. Linear-scan Vec;
-+        // preds hold only a handful of loads.
-+        let mut pred_loads: Vec<(Value, IrType, AddressSpace, Value)> = Vec::new();
-+        for inst in &func.blocks[pred_idx].instructions {
-+            if let Instruction::Load { dest, ptr, ty, seg_override } = inst {
-+                let root = resolve(ptr);
-+                // On a duplicate, keep the last load (same value either way).
-+                if let Some(entry) = pred_loads.iter_mut().find(|(p, t, s, _)| {
-+                    *p == root && *t == *ty && *s == *seg_override
-+                }) {
-+                    entry.3 = *dest;
-+                } else {
-+                    pred_loads.push((root, *ty, *seg_override, *dest));
-+                }
-+            }
-+        }
-+        if pred_loads.is_empty() {
-+            continue;
-+        }
-+        for label in [true_label, false_label] {
-+            let Some(&arm_idx) = label_to_idx.get(&label) else { continue };
-+            if arm_idx == pred_idx {
-+                continue;
-+            }
-+            // The arm must be reached only from this pred, and must not write
-+            // memory before (or after) its loads.
-+            if preds.len(arm_idx) != 1 || preds.row(arm_idx)[0] as usize != pred_idx {
-+                continue;
-+            }
-+            if !func.blocks[arm_idx].instructions.iter().all(is_pure) {
-+                continue;
-+            }
-+            // Collect rewrites first (immutable), then apply.
-+            let mut pending: Vec<(usize, Value, Value)> = Vec::new();
-+            for (inst_pos, inst) in func.blocks[arm_idx].instructions.iter().enumerate() {
-+                if let Instruction::Load { dest, ptr, ty, seg_override } = inst {
-+                    let root = resolve(ptr);
-+                    if let Some((_, _, _, covering)) = pred_loads.iter().find(|(p, t, s, _)| {
-+                        *p == root && *t == *ty && *s == *seg_override
-+                    }) {
-+                        pending.push((inst_pos, *dest, *covering));
-+                    } else if debug {
-+                        eprintln!("[IFCONV] arm block {} load ptr={} ty={:?} not covered by pred loads {:?}",
-+                            arm_idx, ptr.0, ty,
-+                            pred_loads.iter().map(|(p, t, _, d)| (p.0, *t, d.0)).collect::<Vec<_>>());
-+                        for b in &func.blocks {
-+                            for i in &b.instructions {
-+                                if i.dest() == Some(*ptr) || pred_loads.iter().any(|(p, ..)| i.dest() == Some(*p)) {
-+                                    eprintln!("[IFCONV]   def: {:?}", i);
-+                                }
-+                            }
-+                        }
-+                    }
-+                }
-+            }
-+            for (inst_pos, dest, covering) in pending {
-+                func.blocks[arm_idx].instructions[inst_pos] =
-+                    Instruction::Copy { dest, src: Operand::Value(covering) };
-+                rewrites += 1;
-+            }
-+        }
-+    }
-+    rewrites
-+}
-+
- /// Single pass of if-conversion. Returns number of diamonds converted.
- fn if_convert_once(func: &mut IrFunction) -> usize {
-     let num_blocks = func.blocks.len();
-@@ -83,6 +212,11 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
-     let label_to_idx = analysis::build_label_map(func);
-     let (preds, _succs) = analysis::build_cfg(func, &label_to_idx);
- 
-+    // Eliminate arm-block reloads of addresses the branch pred already loads;
-+    // this both removes redundant memory traffic and unblocks diamond/triangle
-+    // detection below (loads make arms fail the side-effect-free check).
-+    let rewrites = rewrite_covered_arm_loads(func, &label_to_idx, &preds);
-+
-     // Collect diamond candidates
-     let mut diamonds: Vec<DiamondInfo> = Vec::new();
- 
-@@ -96,7 +230,7 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
- 
- 
-     if diamonds.is_empty() {
--        return 0;
-+        return rewrites;
-     }
- 
-     // Apply conversions. Track modified blocks to avoid applying overlapping diamonds
-@@ -125,7 +259,7 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
-     // (they'll have no instructions and just an unconditional branch)
-     // This is handled by the CFG simplification pass that runs after us.
- 
--    converted
-+    converted + rewrites
- }
- 
- /// Information about a detected diamond pattern.
-diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index 0619a13f..bb6ed0cc 100644
---- a/src/passes/vectorize.rs
-+++ b/src/passes/vectorize.rs
-@@ -112,10 +112,10 @@ fn take_reject() -> Option<&'static str> {
- 
- /// Run SSE2 vectorization on a function with precomputed CFG analysis.
- pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) -> usize {
--    vectorize_with_analysis_mode(func, cfg, false)
-+    vectorize_with_analysis_mode(func, cfg, false, false)
- }
- 
--fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_two_wide: bool) -> usize {
-+fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_two_wide: bool, neon: bool) -> usize {
-     let num_blocks = func.blocks.len();
-     let loops = loop_analysis::find_natural_loops(
-         num_blocks,
-@@ -187,7 +187,7 @@ fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_
+         } else if sym.shndx == SHN_COMMON {
+-            match globals.get(&sym.name) {
++            match globals.get_mut(&sym.name) {
+                 None => { globals.insert(sym.name.clone(), G::new_common(obj_idx, sym)); }
+                 Some(e) => {
+                     if !e.is_defined() {
+-                        globals.insert(sym.name.clone(), G::new_common(obj_idx, sym));
++                        *e = G::new_common(obj_idx, sym);
+                     } else if e.section_idx() == SHN_COMMON && sym.size > e.size() {
+                         // COMMON vs COMMON: the largest instance wins (GNU semantics).
+-                        globals.insert(sym.name.clone(), G::new_common(obj_idx, sym));
++                        *e = G::new_common(obj_idx, sym);
+                     }
+                     // COMMON vs real definition: the real definition wins; ignore.
                  }
-                 total_changes += transform_to_fma_f64x4(func, &pattern);
-             }
--        } else if let Some(red_pattern) = analyze_reduction_pattern(func, loop_info, cfg, force_two_wide) {
-+        } else if let Some(red_pattern) = analyze_reduction_pattern(func, loop_info, cfg, force_two_wide, neon) {
-             // Try reduction pattern vectorization (sum += arr[i], sum += a[i] * b[i], etc.)
-             let use_sse2 = force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok();
-             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
-@@ -206,7 +206,7 @@ fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_
-                 if debug {
-                     eprintln!("[VEC] Reduction pattern matched! Transforming to SSE2 2-wide");
-                 }
--                total_changes += transform_reduction_sse2(func, &red_pattern);
-+                total_changes += transform_reduction_sse2(func, &red_pattern, neon);
-             } else {
-                 if debug {
-                     eprintln!("[VEC] Reduction pattern matched! Transforming to AVX2 4-wide");
-@@ -1005,11 +1005,14 @@ fn reduction_pattern_is_sound(
-     true
- }
- 
-+/// `neon` enables AArch64-only forms: i32→i64 dot products whose multiply
-+/// operands are sign-extension casts of i32 loads (lowered to smlal/smlal2).
- fn analyze_reduction_pattern(
-     func: &IrFunction,
-     loop_info: &loop_analysis::NaturalLoop,
-     cfg: &CfgAnalysis,
-     allow_widening_i32: bool,
-+    neon: bool,
- ) -> Option<ReductionPattern> {
-     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
-     let header_idx = loop_info.header;
-@@ -1501,23 +1504,50 @@ fn analyze_reduction_pattern(
-             rhs,
-             ..
-         } => {
--            // Both operands of multiply should be loads
-+            // Both operands of multiply should be loads, or (NEON i32→i64 dot)
-+            // sign-extension casts of i32 loads: (long)a[i] * (long)b[i].
-             let mul_lhs_val = if let Operand::Value(v) = lhs { *v } else { return None };
-             let mul_rhs_val = if let Operand::Value(v) = rhs { *v } else { return None };
- 
-             let mul_lhs_inst = find_inst_by_dest(body, mul_lhs_val)?;
-             let mul_rhs_inst = find_inst_by_dest(body, mul_rhs_val)?;
- 
--            let array_a_gep = if let Instruction::Load { ptr, .. } = mul_lhs_inst {
--                *ptr
--            } else {
--                return None;
-+            // Resolve one multiply operand to its array GEP, tracking whether
-+            // it came through an i32→i64 sign-extension cast of a load.
-+            let mut widened_i32 = false;
-+            let operand_gep = |inst: &Instruction, widened: &mut bool| -> Option<Value> {
-+                match inst {
-+                    Instruction::Load { ptr, .. } => Some(*ptr),
-+                    Instruction::Cast { src, from_ty: IrType::I32, to_ty: IrType::I64, .. } if neon => {
-+                        let src_val = if let Operand::Value(v) = src { *v } else { return None };
-+                        if let Some(Instruction::Load { ptr, .. }) = find_inst_by_dest(body, src_val) {
-+                            *widened = true;
-+                            Some(*ptr)
-+                        } else {
-+                            None
-+                        }
-+                    }
-+                    _ => None,
-+                }
-             };
- 
--            let array_b_gep = if let Instruction::Load { ptr, .. } = mul_rhs_inst {
--                *ptr
-+            let array_a_gep = operand_gep(mul_lhs_inst, &mut widened_i32)?;
-+            let array_b_gep = operand_gep(mul_rhs_inst, &mut widened_i32)?;
+diff --git a/src/backend/x86/linker/emit_exec.rs b/src/backend/x86/linker/emit_exec.rs
+index 1b2d4f24..cdd1a2fa 100644
+--- a/src/backend/x86/linker/emit_exec.rs
++++ b/src/backend/x86/linker/emit_exec.rs
+@@ -36,6 +36,10 @@ pub(super) fn emit_executable(
+     entry_symbol: Option<&str>,
+     z_now: bool, z_relro: bool,
+ ) -> Result<(), String> {
++    let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
++    let mut t_zone = std::time::Instant::now();
++    macro_rules! zone { ($name:expr) => { if ld_time { eprintln!("[ldtime]   emit/{:<18} {:>7.1} ms", $name, t_zone.elapsed().as_secs_f64()*1e3); t_zone = std::time::Instant::now(); } } }
 +
-+            // A widened dot must widen BOTH operands (C usual arithmetic
-+            // conversions) and accumulate in i64; mixed forms are rejected.
-+            let (element_type, accumulator_type) = if widened_i32 {
-+                let both_widened = matches!(mul_lhs_inst, Instruction::Cast { .. })
-+                    && matches!(mul_rhs_inst, Instruction::Cast { .. });
-+                if !both_widened || element_type != IrType::I64 {
-+                    if debug {
-+                        eprintln!("[VEC-RED]   Rejecting partially widened dot product");
-+                    }
-+                    return None;
-+                }
-+                (IrType::I32, IrType::I64)
-             } else {
--                return None;
-+                (element_type, element_type)
-             };
+     let mut dynstr = DynStrTab::new();
+     for lib in needed_sonames { dynstr.add(lib); }
+     let rpath_string = if rpath_entries.is_empty() { None } else {
+@@ -354,6 +358,7 @@ pub(super) fn emit_executable(
+     if has_relro { phdr_count += 1; }
+     let phdr_total_size = phdr_count * 56;
  
-             // Verify both GEPs use IV
-@@ -1556,7 +1586,7 @@ fn analyze_reduction_pattern(
-             Some(ReductionPattern {
-                 kind: ReductionKind::DotProduct,
-                 element_type,
--                accumulator_type: element_type,
-+                accumulator_type,
-                 header_idx,
-                 body_idx,
-                 latch_idx,
-@@ -3465,6 +3495,7 @@ fn insert_reduction_remainder_loop(
-     horizontal_intrinsic: IntrinsicOp,
-     vec_sum_value: Value,  // Accumulated vector SSA value
-     byte_offset_iv: bool,
-+    second_acc: Option<Value>,  // Second vector accumulator phi (NEON smlal2 half)
-     next_val_id: &mut u32,
-     next_label: &mut u32,
- ) -> usize {
-@@ -3592,9 +3623,30 @@ fn insert_reduction_remainder_loop(
-         _ => horizontal_intrinsic,  // Fallback
-     };
++    zone!("pre-layout");
+     // === Layout ===
+     let mut offset = 64 + phdr_total_size;
+     let interp_offset = offset;
+@@ -684,6 +689,7 @@ pub(super) fn emit_executable(
+         .or_else(|| globals.get("_start").map(|s| s.value))
+         .unwrap_or(text_page_addr);
  
--    let vec_exit_block = BasicBlock {
--        label: vec_exit_label,
--        instructions: vec![
-+    let vec_exit_block = {
-+        // When a second NEON accumulator was used (smlal/smlal2 split), fold
-+        // the two vector accumulators together before the horizontal reduce.
-+        let (horiz_src, mut prefix) = if let Some(acc2) = second_acc {
-+            let combined = Value(*next_val_id);
-+            *next_val_id += 1;
-+            (
-+                combined,
-+                vec![Instruction::Intrinsic {
-+                    dest: Some(combined),
-+                    op: IntrinsicOp::VecAddI64x2,
-+                    dest_ptr: None,
-+                    args: vec![
-+                        Operand::Value(pattern.accumulator_phi),
-+                        Operand::Value(acc2),
-+                    ],
-+                }],
-+            )
-+        } else {
-+            (pattern.accumulator_phi, Vec::new())
-+        };
-+        let mut instructions = Vec::new();
-+        instructions.append(&mut prefix);
-+        instructions.extend_from_slice(&[
-             // Horizontal reduction: scalar_sum = reduce(vec_accumulator)
-             // Use the accumulator PHI (not vec_sum_value) so that when the
-             // vectorized loop has 0 iterations, we reduce the initial zero
-@@ -3603,7 +3655,7 @@ fn insert_reduction_remainder_loop(
-                 dest: Some(scalar_sum),
-                 op: vec_horizontal_op,
-                 dest_ptr: None,
--                args: vec![Operand::Value(pattern.accumulator_phi)],
-+                args: vec![Operand::Value(horiz_src)],
-             },
-             // Compute starting index for the scalar remainder loop.
-             //   byte-offset IV: start = byte_iv_final / element_size
-@@ -3625,9 +3677,13 @@ fn insert_reduction_remainder_loop(
-                     ty: IrType::I32,
-                 }
-             },
--        ],
--        terminator: Terminator::Branch(remainder_header_label),
--        source_spans: vec![],
-+        ]);
-+        BasicBlock {
-+            label: vec_exit_label,
-+            instructions,
-+            terminator: Terminator::Branch(remainder_header_label),
-+            source_spans: vec![],
-+        }
-     };
++    zone!("layout");
+     // === .symtab / .strtab (debug symbol table) ===
+     // ms178: previously the executable emitted ONLY .dynsym, so nm/gdb/perf
+     // saw no symbol table at all. Every defined global symbol (function or
+@@ -692,8 +698,13 @@ pub(super) fn emit_executable(
+     // mapped to the OUTPUT section header order (mirrors the write loop
+     // below). Symbols that resolve to linker-provided addresses (or common/
+     // absolute) use SHN_ABS/SHN_COMMON as appropriate.
+-    let mut symtab_entries: Vec<[u8; 24]> = Vec::new();
+-    let mut symtab_names: Vec<u8> = vec![0u8]; // strtab with leading NUL
++    // Pre-size: every defined global plus locals lands here; growth doubling
++    // copies 24-byte entries repeatedly (measured 8.8 ms of a 60 ms link in
++    // this zone for a 40k-symbol object).
++    let est_syms: usize = globals.len() + objects.iter().map(|o| o.symbols.len()).sum::<usize>() / 4 + 2;
++    let mut symtab_entries: Vec<[u8; 24]> = Vec::with_capacity(est_syms);
++    let mut symtab_names: Vec<u8> = Vec::with_capacity(est_syms * 12);
++    symtab_names.push(0u8); // strtab with leading NUL
+     symtab_entries.push([0u8; 24]); // NULL symbol at index 0
  
-     // Step 3: Create remainder_header block
-@@ -4510,6 +4566,7 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
-         horizontal_intrinsic,
-         vec_sum_value,  // Pass the vector accumulator SSA value
-         use_byte_iv,
-+        None,           // AVX2 path uses a single accumulator
-         &mut next_val_id,
-         &mut next_label,
-     );
-@@ -4527,7 +4584,7 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
- }
- 
- /// Transform reduction loop to use SSE2 128-bit vectorization (2×F64, 4×I32, etc.).
--fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -> usize {
-+fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, neon: bool) -> usize {
-     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
-     let mut changes = 0;
- 
-@@ -4550,6 +4607,17 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
-             Some(IntrinsicOp::MulF64x2),
-             IntrinsicOp::HorizontalAddF64x2,
-         ),
-+        // NEON 4-wide i32→i64 forms: sadalp for sums, smlal/smlal2 for dots.
-+        IrType::I32 if pattern.accumulator_type == IrType::I64 && neon => (
-+            4u64,
-+            IntrinsicOp::VecLoadI32x4,
-+            match pattern.kind {
-+                ReductionKind::Sum => IntrinsicOp::VecSadalpI32x4,
-+                ReductionKind::DotProduct => IntrinsicOp::VecSmlalLoI32x4,
-+            },
-+            None,
-+            IntrinsicOp::VecHorizontalAddI64x2,
-+        ),
-         IrType::I32 if pattern.accumulator_type == IrType::I64 => (
-             2u64,
-             IntrinsicOp::VecLoadWidenI32ToI64x2,
-@@ -4813,6 +4881,9 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
-     // Step 3: Transform loop body - replace scalar operations with vector intrinsics
-     // Use register-based SSA values for vector operations (no stack allocations)
-     let vec_sum_value: Value;
-+    // NEON smlal dot products split lanes across two 2×I64 accumulators;
-+    // this carries the second accumulator's header phi to the epilogue.
-+    let mut second_acc: Option<Value> = None;
- 
-     match pattern.kind {
-         ReductionKind::Sum => {
-@@ -4839,6 +4910,12 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
-                     IntrinsicOp::VecAddI64x2,
-                     IntrinsicOp::VecZeroI64x2,
-                 ),
-+                // NEON 4-wide i32→i64 sum: load 4×I32, accumulate pairs (sadalp).
-+                IntrinsicOp::VecLoadI32x4 => (
-+                    IntrinsicOp::VecLoadI32x4,
-+                    IntrinsicOp::VecSadalpI32x4,
-+                    IntrinsicOp::VecZeroI64x2,
-+                ),
-                 _ => panic!("Unsupported SSE2 load intrinsic: {:?}", load_intrinsic),
-             };
- 
-@@ -4945,6 +5022,147 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
-                 eprintln!("[VEC-RED]   Transformed sum body: load + add (register-based)");
-             }
+     // Map output_sections index → section-header index, in write order.
+@@ -826,7 +837,7 @@ pub(super) fn emit_executable(
+                 .map(move |sym| (obj_idx, sym))
+         })
+         .collect();
+-    locals.sort_by(|(oa, a), (ob, b)| {
++    locals.sort_unstable_by(|(oa, a), (ob, b)| {
+         oa.cmp(ob)
+             .then_with(|| a.value.cmp(&b.value))
+             .then_with(|| a.name.cmp(&b.name))
+@@ -853,7 +864,26 @@ pub(super) fn emit_executable(
+         .iter()
+         .filter(|(_, g)| g.defined_in.is_some() && !g.is_dynamic)
+         .collect();
+-    sym_names.sort_by(|a, b| a.0.cmp(b.0));
++    // Sort by a cached big-endian 8-byte prefix first: for symbol-heavy
++    // objects the names share long prefixes ("F1", "F12", ...), so plain
++    // byte-wise cmp walks the common prefix on every comparison. The u64
++    // prefix decides almost every comparison in one instruction; ties fall
++    // back to the full byte compare (total order preserved, identical
++    // resulting symtab order).
++    let mut keyed: Vec<(u64, &String, &GlobalSymbol)> = sym_names
++        .iter()
++        .map(|(n, g)| {
++            let b = n.as_bytes();
++            let mut p = [0u8; 8];
++            let l = b.len().min(8);
++            p[..l].copy_from_slice(&b[..l]);
++            (u64::from_be_bytes(p), *n, *g)
++        })
++        .collect();
++    keyed.sort_unstable_by(|a, b| {
++        a.0.cmp(&b.0).then_with(|| a.1.as_bytes().cmp(b.1.as_bytes()))
++    });
++    let sym_names: Vec<(&String, &GlobalSymbol)> = keyed.into_iter().map(|(_, n, g)| (n, g)).collect();
+     for (name, gsym) in &sym_names {
+         let off = symtab_names.len() as u32;
+         symtab_names.extend_from_slice(name.as_bytes());
+@@ -879,6 +909,7 @@ pub(super) fn emit_executable(
+         e[16..24].copy_from_slice(&gsym.size.to_le_bytes());
+         symtab_entries.push(e);
+     }
++    zone!("symtab");
+     // === Build output buffer ===
+     let file_size = offset as usize;
+     let mut out = vec![0u8; file_size];
+@@ -1195,9 +1226,13 @@ pub(super) fn emit_executable(
          }
-+        // NEON 4-wide i32→i64 dot product: load both arrays 4×I32, then
-+        // smlal (lanes 0-1) + smlal2 (lanes 2-3) into two independent 2×I64
-+        // accumulators to break the loop-carried dependency chain.
-+        ReductionKind::DotProduct
-+            if pattern.element_type == IrType::I32
-+                && pattern.accumulator_type == IrType::I64
-+                && load_intrinsic == IntrinsicOp::VecLoadI32x4 =>
-+        {
-+            let vec_load_a = Value(next_val_id);
-+            next_val_id += 1;
-+            let vec_load_b = Value(next_val_id);
-+            next_val_id += 1;
-+            let acc0_next = Value(next_val_id);
-+            next_val_id += 1;
-+            let acc1_next = Value(next_val_id);
-+            next_val_id += 1;
-+            let init_zero0 = Value(next_val_id);
-+            next_val_id += 1;
-+            let init_zero1 = Value(next_val_id);
-+            next_val_id += 1;
-+            let acc1_phi = Value(next_val_id);
-+            next_val_id += 1;
-+            vec_sum_value = acc0_next;
-+            second_acc = Some(acc1_phi);
-+
-+            // Zero both vector accumulators in the entry block.
-+            {
-+                let entry_block = &mut func.blocks[0];
-+                for init in [init_zero0, init_zero1] {
-+                    entry_block.instructions.push(Instruction::Intrinsic {
-+                        dest: Some(init),
-+                        op: IntrinsicOp::VecZeroI64x2,
-+                        dest_ptr: None,
-+                        args: vec![],
-+                    });
-+                }
-+                changes += 2;
+     }
+ 
++    zone!("buffer");
+     // === Apply relocations ===
+-    // Snapshot globals to avoid borrow issues
+-    let globals_snap: FxHashMap<String, GlobalSymbol> = globals.clone();
++    // `globals` is never touched again after this point, so a plain reborrow
++    // suffices. The old `.clone()` deep-copied the entire map — 40k String
++    // keys + values — on EVERY link (several ms and a peak-RSS spike on
++    // symbol-heavy inputs) for no semantic benefit.
++    let globals_snap: &FxHashMap<String, GlobalSymbol> = globals;
+ 
+     // Precomputed ordinal of each non-PLT GOT entry (index into the .got
+     // section). Replaces per-relocation prefix scans that were O(GOT^2).
+@@ -1238,7 +1273,7 @@ pub(super) fn emit_executable(
+                 // Skip relocations whose bytes were consumed by a TLS GD/LD->LE
+                 // rewrite (the __tls_get_addr call no longer exists).
+                 if tls_consumed.iter().any(|&(cs, ce)| fp >= cs && fp < ce) { continue; }
+-                let s = resolve_sym(obj_idx, sym, &globals_snap, section_map, output_sections,
++                let s = resolve_sym(obj_idx, sym, globals_snap, section_map, output_sections,
+                                     plt_addr);
+ 
+                 match rela.rela_type {
+@@ -1495,6 +1530,7 @@ pub(super) fn emit_executable(
+         }
+     }
+ 
++    zone!("relocs");
+     // === Append section headers ===
+     // Build .shstrtab string table
+     let mut shstrtab = vec![0u8]; // null byte at offset 0
+@@ -1737,6 +1773,7 @@ pub(super) fn emit_executable(
+     // e_shstrndx at offset 62 (2 bytes)
+     out[62..64].copy_from_slice(&shstrtab_shidx.to_le_bytes());
+ 
++    zone!("headers");
+     std::fs::write(output_path, &out).map_err(|e| format!("failed to write '{}': {}", output_path, e))?;
+     #[cfg(unix)]
+     {
+diff --git a/src/backend/x86/linker/link.rs b/src/backend/x86/linker/link.rs
+index d1c9772a..de673935 100644
+--- a/src/backend/x86/linker/link.rs
++++ b/src/backend/x86/linker/link.rs
+@@ -25,6 +25,10 @@ pub fn link_builtin(
+     crt_objects_after: &[&str],
+ ) -> Result<(), String> {
+     let is_static = user_args.iter().any(|a| a == "-static");
++    let t_all = std::time::Instant::now();
++    let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
++    let mut t_phase = std::time::Instant::now();
++    macro_rules! phase { ($name:expr) => { if ld_time { eprintln!("[ldtime] {:<24} {:>7.1} ms", $name, t_phase.elapsed().as_secs_f64()*1e3); t_phase = std::time::Instant::now(); } } }
+     let mut objects: Vec<ElfObject> = Vec::new();
+     let mut globals: FxHashMap<String, GlobalSymbol> = FxHashMap::default();
+     let mut needed_sonames: Vec<String> = Vec::new();
+@@ -42,6 +46,7 @@ pub fn link_builtin(
+         load_file(path, &mut objects, &mut globals, &mut needed_sonames, &lib_path_strings, false)?;
+     }
+ 
++    phase!("load-inputs");
+     // Parse user args using shared infrastructure
+     let parsed_args = linker_common::parse_linker_args(user_args);
+     let extra_lib_paths = parsed_args.extra_lib_paths;
+@@ -228,6 +233,7 @@ pub fn link_builtin(
+     // Check for truly undefined (non-weak, non-dynamic, non-linker-defined) symbols
+     linker_common::check_undefined_symbols_elf64_verbose(&globals, 20, &objects)?;
+ 
++    phase!("resolve+gc");
+     // SHF_MERGE string/constant deduplication (.rodata.str1.1, .rodata.cst8):
+     // build pools across all objects, rewrite relocations to pool symbols,
+     // and retire the input sections. Disabled with LCCC_NO_STRING_MERGE=1.
+@@ -249,28 +255,36 @@ pub fn link_builtin(
+         }
+     }
+ 
++    phase!("strmerge");
+     // Merge sections (skip dead sections when gc-sections is active)
+     let mut output_sections: Vec<OutputSection> = Vec::new();
+     let mut section_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
+     linker_common::merge_sections_elf64_gc(&objects, &mut output_sections, &mut section_map, &dead_sections);
+ 
++    phase!("merge-sections");
+     // Allocate COMMON symbols
+     linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections);
+ 
++    phase!("common");
+     // Create PLT/GOT
+     let (plt_names, got_entries) = create_plt_got(&objects, &mut globals);
+ 
++    phase!("plt-got");
+     // Collect IFUNC symbols for static linking
+     let ifunc_symbols = collect_ifunc_symbols(&globals, is_static);
+ 
++    phase!("ifunc");
+     // Emit executable
+-    emit_executable(
++    let r = emit_executable(
+         &objects, &mut globals, &mut output_sections, &section_map,
+         &plt_names, &got_entries, &needed_sonames, output_path,
+         export_dynamic, &rpath_entries, use_runpath, is_static,
+         &ifunc_symbols, entry_symbol.as_deref(),
+         parsed_args.z_now, parsed_args.z_relro,
+-    )
++    );
++    phase!("emit-exec");
++    if ld_time { eprintln!("[ldtime] {:<24} {:>7.1} ms", "TOTAL", t_all.elapsed().as_secs_f64()*1e3); }
++    r
+ }
+ 
+ /// Create a shared library (.so) from object files.
+diff --git a/src/bin/lccc_ld.rs b/src/bin/lccc_ld.rs
+index 32e43daf..ae2ea1b0 100644
+--- a/src/bin/lccc_ld.rs
++++ b/src/bin/lccc_ld.rs
+@@ -1,18 +1,22 @@
+ //! `lccc-ld`: GNU-ld-compatible command-line driver for the LCCC linker.
+ //!
+ //! Supports the invocation styles used by large build systems that call the
+-//! linker directly (most importantly the Linux kernel's
+-//! `scripts/link-vmlinux.sh`):
++//! linker directly:
+ //!
+-//! ```text
+-//! lccc-ld -m elf_x86_64 -z noexecstack --script=vmlinux.lds -o vmlinux \
+-//!         --whole-archive vmlinux.a --no-whole-archive \
+-//!         --start-group --end-group extra.o ...
+-//! ```
++//! * Kernel-style script links (`scripts/link-vmlinux.sh`):
++//!   `lccc-ld -m elf_x86_64 --script=vmlinux.lds -o vmlinux --whole-archive …`
++//!   → script-driven layout engine (`emit_script`).
++//! * Relocatable links: `lccc-ld -r a.o b.o -o ab.o` → `emit_rel`.
++//! * Standard userspace links, exactly as gcc/clang spawn the system ld:
++//!   `lccc-ld -o app crt1.o crti.o app.o crtn.o -Ldir -lc
++//!            --dynamic-linker /lib64/ld-linux-x86-64.so.2`
++//!   → the same `link_builtin` pipeline the lccc compiler driver uses
++//!   (symbol resolution, archives/group semantics, PLT/GOT, RELRO,
++//!   eh_frame_hdr, build-id, gc-sections, …).
+ //!
+-//! When a full `SECTIONS` script is given via `-T`/`--script`, the link is
+-//! performed by the script-driven layout engine (`emit_script`). Without a
+-//! script it falls back to the standard built-in executable emitter.
++//! The userspace path makes `lccc-ld` a drop-in for `ld` in Makefiles
++//! (`make LD=lccc-ld`) and lets the differential benchmark compare the same
++//! CLI against bfd/mold instead of routing through the compiler driver.
+ 
+ fn main() {
+     let args: Vec<String> = std::env::args().skip(1).collect();
+@@ -35,6 +39,10 @@ fn run(args: &[String]) -> Result<(), String> {
+     let mut is_pie = false;
+     let mut build_id = false;
+     let mut entry_override: Option<String> = None;
++    let mut shared = false;
++    // Arguments forwarded verbatim into the builtin userspace pipeline
++    // (parse_linker_args understands the GNU spellings directly).
++    let mut passthrough: Vec<String> = Vec::new();
+ 
+     let mut i = 0;
+     while i < args.len() {
+@@ -42,7 +50,6 @@ fn run(args: &[String]) -> Result<(), String> {
+         match a {
+             "-o" => { i += 1; output = args.get(i).cloned().ok_or("-o needs an argument")?; }
+             "-m" => { i += 1; /* emulation: elf_x86_64 assumed */ }
+-            "-z" => { i += 1; /* -z keywords: accepted */ }
+             "-T" | "--script" => {
+                 i += 1;
+                 script_path = Some(args.get(i).cloned().ok_or("-T needs an argument")?);
+@@ -50,10 +57,14 @@ fn run(args: &[String]) -> Result<(), String> {
+             "-r" | "--relocatable" | "-i" => relocatable = true,
+             "-pie" | "--pic-executable" => is_pie = true,
+             "-no-pie" => is_pie = false,
++            "-shared" | "-Bshareable" => shared = true,
+             "--no-dynamic-linker" | "--no-ld-generated-unwind-info" => {}
+             "--whole-archive" => whole_archive = true,
+             "--no-whole-archive" => whole_archive = false,
+-            "--start-group" | "--end-group" | "-(" | "-)" => {}
++            "--start-group" | "--end-group" | "-(" | "-)" => {
++                // Builtin archive loading already iterates to a fixpoint
++                // (global group semantics), which subsumes group regions.
 +            }
-+
-+            let latch_label = func.blocks[pattern.latch_idx].label;
-+
-+            // Rewire the original accumulator phi (acc0): entry → zero vector,
-+            // backedge → smlal result. Remember the preheader label for acc1.
-+            let mut preheader_label = None;
-+            {
-+                let header_block = &mut func.blocks[pattern.header_idx];
-+                for inst in header_block.instructions.iter_mut() {
-+                    if let Instruction::Phi { dest, incoming, .. } = inst {
-+                        if *dest == pattern.accumulator_phi {
-+                            for (val, label) in incoming.iter_mut() {
-+                                if *label == latch_label {
-+                                    *val = Operand::Value(acc0_next);
-+                                } else {
-+                                    preheader_label = Some(*label);
-+                                    if matches!(val, Operand::Const(_)) {
-+                                        *val = Operand::Value(init_zero0);
-+                                    }
-+                                }
-+                            }
-+                        }
+             "--strip-debug" | "-S" => {}
+             "--strip-all" | "-s" => emit_symtab = false,
+             "-v" | "--version" => {
+@@ -62,13 +73,47 @@ fn run(args: &[String]) -> Result<(), String> {
+             }
+             "--help" => {
+                 println!("Usage: lccc-ld [options] file...");
++                println!("  Standard userspace, -r relocatable, and -T script links supported.");
+                 return Ok(());
+             }
+             "-e" | "--entry" => {
+                 i += 1;
+                 entry_override = args.get(i).cloned();
++                if let Some(e) = &entry_override {
++                    passthrough.push(format!("--entry={}", e));
++                }
+             }
+             "-Map" => { i += 1; }
++            "--dynamic-linker" | "-dynamic-linker" | "-I" => {
++                // The builtin emitter hardwires the standard glibc interp
++                // path; accept and verify rather than silently diverging.
++                i += 1;
++                if let Some(p) = args.get(i) {
++                    if p != "/lib64/ld-linux-x86-64.so.2" && !p.is_empty() {
++                        eprintln!(
++                            "lccc-ld: warning: non-standard --dynamic-linker '{}' \
++                             (builtin emitter uses /lib64/ld-linux-x86-64.so.2)",
++                            p
++                        );
 +                    }
 +                }
 +            }
-+            let Some(preheader_label) = preheader_label else {
-+                if debug {
-+                    eprintln!("[VEC-RED]   NEON dot: no preheader edge on accumulator phi");
++            "-z" => {
++                i += 1;
++                if let Some(kw) = args.get(i) {
++                    passthrough.push(format!("-Wl,-z,{}", kw));
 +                }
-+                return changes;
-+            };
-+
-+            // Insert the second accumulator phi after the existing header phis.
-+            {
-+                let header_block = &mut func.blocks[pattern.header_idx];
-+                let insert_pos = header_block
-+                    .instructions
-+                    .iter()
-+                    .rposition(|inst| matches!(inst, Instruction::Phi { .. }))
-+                    .map(|p| p + 1)
-+                    .unwrap_or(0);
-+                header_block.instructions.insert(insert_pos, Instruction::Phi {
-+                    dest: acc1_phi,
-+                    ty: IrType::I64,
-+                    incoming: vec![
-+                        (Operand::Value(init_zero1), preheader_label),
-+                        (Operand::Value(acc1_next), latch_label),
-+                    ],
-+                });
-+                changes += 1;
 +            }
-+
-+            // Body: two 4-wide loads + smlal/smlal2, replacing the scalar add.
-+            {
-+                let body_block = &mut func.blocks[pattern.body_idx];
-+                body_block.instructions.insert(pattern.accumulator_add_idx, Instruction::Intrinsic {
-+                    dest: Some(vec_load_a),
-+                    op: IntrinsicOp::VecLoadI32x4,
-+                    dest_ptr: None,
-+                    args: vec![
-+                        Operand::Value(pattern.array_a_gep),
-+                        Operand::Const(IrConst::I64(0)),
-+                    ],
-+                });
-+                body_block.instructions.insert(pattern.accumulator_add_idx + 1, Instruction::Intrinsic {
-+                    dest: Some(vec_load_b),
-+                    op: IntrinsicOp::VecLoadI32x4,
-+                    dest_ptr: None,
-+                    args: vec![
-+                        Operand::Value(pattern.array_b_gep.unwrap()),
-+                        Operand::Const(IrConst::I64(0)),
-+                    ],
-+                });
-+                body_block.instructions.insert(pattern.accumulator_add_idx + 2, Instruction::Intrinsic {
-+                    dest: Some(acc0_next),
-+                    op: IntrinsicOp::VecSmlalLoI32x4,
-+                    dest_ptr: None,
-+                    args: vec![
-+                        Operand::Value(pattern.accumulator_phi),
-+                        Operand::Value(vec_load_a),
-+                        Operand::Value(vec_load_b),
-+                    ],
-+                });
-+                body_block.instructions.insert(pattern.accumulator_add_idx + 3, Instruction::Intrinsic {
-+                    dest: Some(acc1_next),
-+                    op: IntrinsicOp::VecSmlalHiI32x4,
-+                    dest_ptr: None,
-+                    args: vec![
-+                        Operand::Value(acc1_phi),
-+                        Operand::Value(vec_load_a),
-+                        Operand::Value(vec_load_b),
-+                    ],
-+                });
-+                // Remove the old scalar add; the scalar mul/casts/loads are now
-+                // dead and cleaned up by DCE.
-+                body_block.instructions.remove(pattern.accumulator_add_idx + 4);
-+                changes += 4;
++            "-static" | "-Bstatic" | "-dn" | "-non_shared" => {
++                passthrough.push("-static".to_string());
 +            }
-+
-+            if debug {
-+                eprintln!("[VEC-RED]   Transformed dot product body: load_a + load_b + smlal + smlal2 (NEON 4-wide)");
-+            }
-+        }
-         ReductionKind::DotProduct => {
-             // Dot product: sum += a[i] * b[i]
-             // Note: Only F64 dot products are supported (no integer multiply intrinsic yet)
-@@ -5119,6 +5337,7 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
-         horizontal_intrinsic,
-         vec_sum_value,  // Pass the vector accumulator SSA value
-         use_byte_iv,
-+        second_acc,     // Second NEON accumulator phi (smlal2 half), if any
-         &mut next_val_id,
-         &mut next_label,
-     );
-@@ -5672,7 +5891,9 @@ fn func_has_volatile_loop_access(func: &IrFunction) -> bool {
- }
++            "-Bdynamic" | "-dy" | "-call_shared" => {}
++            "--gc-sections" => passthrough.push("-Wl,--gc-sections".to_string()),
++            "--no-gc-sections" => {}
++            "--export-dynamic" | "-E" => passthrough.push("-rdynamic".to_string()),
++            "--as-needed" | "--no-as-needed" | "--eh-frame-hdr"
++            | "--fix-cortex-a53-843419" | "--no-copy-dt-needed-entries"
++            | "--allow-shlib-undefined" | "-X" | "-x" => {}
+             _ => {
+                 if let Some(v) = a.strip_prefix("--script=") {
+                     script_path = Some(v.to_string());
+@@ -76,16 +121,78 @@ fn run(args: &[String]) -> Result<(), String> {
+                     if !v.is_empty() { script_path = Some(v.to_string()); }
+                 } else if let Some(v) = a.strip_prefix("--entry=") {
+                     entry_override = Some(v.to_string());
++                    passthrough.push(a.to_string());
+                 } else if let Some(v) = a.strip_prefix("-Map=") {
+                     let _ = v;
++                } else if a.starts_with("--dynamic-linker=") {
++                    // handled above for the two-arg form; same policy here
++                } else if a.starts_with("-L") {
++                    // -Ldir or -L dir
++                    if a == "-L" {
++                        i += 1;
++                        if let Some(d) = args.get(i) {
++                            passthrough.push(format!("-L{}", d));
++                        }
++                    } else {
++                        passthrough.push(a.to_string());
++                    }
++                } else if a.starts_with("-l") {
++                    if a == "-l" {
++                        i += 1;
++                        if let Some(l) = args.get(i) {
++                            passthrough.push(format!("-l{}", l));
++                        }
++                    } else {
++                        passthrough.push(a.to_string());
++                    }
++                } else if let Some(rest) = a.strip_prefix("--wrap=") {
++                    passthrough.push(format!("-Wl,--wrap={}", rest));
++                } else if let Some(rest) = a.strip_prefix("--defsym=") {
++                    passthrough.push(format!("-Wl,--defsym={}", rest));
++                } else if let Some(rest) = a.strip_prefix("-u") {
++                    let sym = if rest.is_empty() {
++                        i += 1;
++                        args.get(i).cloned().unwrap_or_default()
++                    } else {
++                        rest.to_string()
++                    };
++                    if !sym.is_empty() {
++                        passthrough.push(format!("-Wl,-u,{}", sym));
++                    }
++                } else if let Some(rest) = a.strip_prefix("-rpath=") {
++                    passthrough.push(format!("-Wl,-rpath={}", rest));
++                } else if a == "-rpath" {
++                    i += 1;
++                    if let Some(p) = args.get(i) {
++                        passthrough.push(format!("-Wl,-rpath={}", p));
++                    }
++                } else if a.starts_with("-soname") || a.starts_with("--soname") {
++                    let val = if let Some(eq) = a.split_once('=') {
++                        eq.1.to_string()
++                    } else {
++                        i += 1;
++                        args.get(i).cloned().unwrap_or_default()
++                    };
++                    if !val.is_empty() {
++                        passthrough.push(format!("-Wl,-soname,{}", val));
++                    }
+                 } else if a.starts_with("--build-id") {
+                     build_id = !a.ends_with("=none");
++                } else if a.starts_with("--version-script") {
++                    let val = if let Some(eq) = a.split_once('=') {
++                        eq.1.to_string()
++                    } else {
++                        i += 1;
++                        args.get(i).cloned().unwrap_or_default()
++                    };
++                    if !val.is_empty() {
++                        passthrough.push(format!("-Wl,--version-script={}", val));
++                    }
+                 } else if a.starts_with("--orphan-handling")
+                     || a == "--no-warn-rwx-segments" || a.starts_with("-z")
+-                    || a.starts_with("--hash-style") || a == "--as-needed"
+-                    || a == "--no-as-needed" || a == "--eh-frame-hdr"
+-                    || a.starts_with("--sort-section") || a == "--gc-sections"
+-                    || a.starts_with("--print-") || a == "-X" || a == "-x"
++                    || a.starts_with("--hash-style")
++                    || a.starts_with("--sort-section")
++                    || a.starts_with("--print-")
+                     || a.starts_with("--emit-relocs") {
+                     // accepted, not needed for correctness of the static image
+                 } else if a.starts_with('-') {
+@@ -104,30 +211,65 @@ fn run(args: &[String]) -> Result<(), String> {
+         return Err("no input files".into());
+     }
  
- /// AArch64 NEON has 128-bit vectors, matching the two-wide F64 transform.
-+/// Passes neon=true so AArch64-only widening forms (sadalp, smlal/smlal2)
-+/// may be emitted; other backends reject those intrinsics.
- pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
-     let cfg = CfgAnalysis::build(func);
--    vectorize_with_analysis_mode(func, &cfg, true)
-+    vectorize_with_analysis_mode(func, &cfg, true, true)
+-    // Load all inputs.
+-    let mut objects = Vec::new();
+-    lccc::linker_entry::load_inputs_x86(&inputs, &mut objects)?;
+-    if build_id && !relocatable {
+-        lccc::linker_entry::append_build_id_object(&mut objects);
+-    }
+-
++    // ------------------------------------------------------------------
++    // Mode 1: relocatable link (ld -r).
++    // ------------------------------------------------------------------
+     if relocatable {
+         if script_path.is_some() {
+             eprintln!("lccc-ld: warning: -r with a linker script: script ignored");
+         }
++        let mut objects = Vec::new();
++        lccc::linker_entry::load_inputs_x86(&inputs, &mut objects)?;
+         return lccc::linker_entry::link_relocatable_x86(&objects, &output);
+     }
+ 
+-    let Some(script_path) = script_path else {
+-        return Err("lccc-ld currently requires a linker script (-T/--script) or -r; \
+-                    use the lccc driver for standard userspace links".into());
+-    };
+-    let mut script_src = std::fs::read_to_string(&script_path)
+-        .map_err(|e| format!("cannot read script '{}': {}", script_path, e))?;
+-    if let Some(e) = entry_override {
+-        // command-line -e overrides ENTRY() in the script
+-        script_src = format!("ENTRY({})\n{}", e, script_src);
++    // ------------------------------------------------------------------
++    // Mode 2: script-driven link (kernel-style -T).
++    // ------------------------------------------------------------------
++    if let Some(script_path) = script_path {
++        let mut objects = Vec::new();
++        lccc::linker_entry::load_inputs_x86(&inputs, &mut objects)?;
++        if build_id {
++            lccc::linker_entry::append_build_id_object(&mut objects);
++        }
++        let mut script_src = std::fs::read_to_string(&script_path)
++            .map_err(|e| format!("cannot read script '{}': {}", script_path, e))?;
++        if let Some(e) = entry_override {
++            // command-line -e overrides ENTRY() in the script
++            script_src = format!("ENTRY({})\n{}", e, script_src);
++        }
++        return lccc::linker_entry::link_with_script_x86(
++            &objects, &script_src, &output, emit_symtab, is_pie);
+     }
+ 
+-    lccc::linker_entry::link_with_script_x86(&objects, &script_src, &output, emit_symtab, is_pie)
++    // ------------------------------------------------------------------
++    // Mode 3: standard userspace link — same pipeline as the compiler
++    // driver (`link_builtin`/`link_shared`). CRT objects arrive as
++    // positional inputs from the caller (gcc-style invocation), so no CRT
++    // injection happens here; whole-archive members are force-loaded.
++    // ------------------------------------------------------------------
++    let mut object_files: Vec<String> = Vec::new();
++    for (path, wa) in &inputs {
++        if *wa && path.ends_with(".a") {
++            // The builtin pipeline loads archives lazily (pull members only
++            // when they resolve an undefined). --whole-archive semantics are
++            // only needed by script links today; refuse loudly instead of
++            // producing a binary that silently dropped members.
++            return Err(format!(
++                "--whole-archive '{}' is only supported with -T/--script or -r; \
++                 pass the members as objects for a standard link",
++                path
++            ));
++        }
++        object_files.push(path.clone());
++    }
++    let object_refs: Vec<&str> = object_files.iter().map(|s| s.as_str()).collect();
++
++    if shared {
++        return lccc::linker_entry::link_shared_x86(&object_refs, &output, &passthrough);
++    }
++    if is_pie {
++        eprintln!("lccc-ld: warning: -pie without -T uses the fixed-base executable emitter");
++    }
++    lccc::linker_entry::link_builtin_x86(&object_refs, &output, &passthrough)
  }
+diff --git a/src/linker_entry.rs b/src/linker_entry.rs
+index ca8109d8..fa6af655 100644
+--- a/src/linker_entry.rs
++++ b/src/linker_entry.rs
+@@ -58,3 +58,34 @@ pub fn link_with_script_x86(
+     crate::backend::x86::linker::emit_script::link_with_script(
+         objects, script_src, output, emit_symtab, is_pie)
+ }
++
++/// Standard userspace executable link for the standalone `lccc-ld` driver.
++///
++/// Exactly the compiler driver's pipeline (`link_builtin`): symbol
++/// resolution with archive group semantics, PLT/GOT, RELRO, eh_frame_hdr,
++/// gc-sections, --wrap/-u/--defsym. CRT objects are expected as positional
++/// inputs (the gcc-style ld invocation lists crt1/crti/crtn explicitly), so
++/// no CRT injection happens here; the crt slots stay empty and `user_args`
++/// carries -L/-l/-z/... in GNU spelling for `parse_linker_args`.
++pub fn link_builtin_x86(
++    object_files: &[&str],
++    output: &str,
++    user_args: &[String],
++) -> Result<(), String> {
++    crate::backend::x86::linker::link_builtin(
++        object_files, output, user_args,
++        &[], // lib paths come from -L in user_args
++        &[], // no implicit libs: the caller lists -lc etc. explicitly
++        &[], // CRT before: positional
++        &[], // CRT after: positional
++    )
++}
++
++/// Shared-library link for the standalone `lccc-ld -shared` driver.
++pub fn link_shared_x86(
++    object_files: &[&str],
++    output: &str,
++    user_args: &[String],
++) -> Result<(), String> {
++    crate::backend::x86::linker::link_shared(object_files, output, user_args, &[], &[])
++}
 -- 
 2.47.3
 
