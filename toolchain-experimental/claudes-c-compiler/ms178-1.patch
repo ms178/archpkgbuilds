@@ -1,215 +1,1147 @@
+From c4f2f2186d687c29e9086ea0c90424f1e22c06e7 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Sun, 16 Aug 2026 18:29:31 +0000
+Subject: [PATCH 1/3] vmlinux link fixes: weak typeof externs, strcmp literal
+ folding, symbol-diff immediates
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Five root causes stood between vmlinux.o and a linked kernel image; the
+first two are C-frontend gaps, the rest x86 assembler gaps. All are
+proven against GCC/GAS output.
+
+1) Block-scope `extern typeof(f) f __attribute__((weak, visibility
+   ("hidden")))` dropped both attributes: typeof supplies the function
+   type, `derived` stays empty, so the declaration bypassed the
+   function-decl handler that propagates symbol attrs. The kernel's
+   !CONFIG_MODULES symbol_get() (module.h:835) expands to exactly this
+   shape; ips_link_to_i915_driver stayed a GLOBAL undef and vmlinux
+   failed to link instead of weak-resolving to NULL.
+   lower_extern_decl now pushes weak/visibility for every named extern.
+   PROOF: wk4.c readelf shows `WEAK HIDDEN UND` — identical to GCC.
+
+2) __builtin_strcmp/strncmp/memcmp on two string literals now fold at
+   lowering time (value = sign of first differing byte; strncmp/memcmp
+   only with a constant length). GCC folds these at -O0; the kernel's
+   vruntime_cmp (CachyMod fair.c) depends on it — the unmatched-operator
+   branch calls the deliberately undefined __BUILD_BUG_vruntime_cmp,
+   which must be eliminated as dead code. fair.o previously kept the
+   call and vmlinux failed with "undefined reference to
+   `__BUILD_BUG_vruntime_cmp'".
+   PROOF: regression builtin_strcmp_fold.c (kernel macro idiom + runtime
+   semantics vs glibc); fair.o has no BUILD_BUG relocs after the fix.
+
+3) `$identity_mapped - 0b` immediates (relocate_kernel_64.S): the
+   label-diff scanner did not trim around '-', so the whole expression
+   fell through to a PLAIN SYMBOL named "identity_mapped - 0b" → ld
+   "undefined reference". Now parsed as SymbolDiff.
+
+4) SymbolDiff immediates were unsupported by the ALU encoder. New arm
+   emits the 0x81 imm32 form and records a diff relocation; resolution
+   in resolve_internal_relocations understands NUMERIC local labels
+   (`0b`) on either side, folds same-section pairs to constants, and
+   converts extern-minus-local to R_X86_64_PC32 with the addend
+   adjusted by the label position (S - addr(0b)) — the exact reloc GAS
+   emits for this shape.
+   PROOF: asm-diff imm_symbol_diff.s byte-identical; relk2.s reloc
+   `ext_fwd + 3` matches GAS.
+
+5) `$(srso_safe_ret)+5` (nospec-branch.h __HANDLE_INTR_SAFERET):
+   parenthesized symbols in symbol+offset immediates were rejected and
+   degenerated to a literal-string reloc "(srso_safe_ret)+5". Parens now
+   strip to the bare symbol; addend preserved.
+   PROOF: srso.s relocs `ext_sym + 5` / `ext_sym + 0` identical to GAS.
+
+Deviation note (documented in the encoder): backward-defined
+same-section diffs fold to imm8 in GAS at parse time; lccc emits the
+semantically identical imm32. The kernel's uses are all forward
+references where GAS also reserves imm32.
+
+Validation: cargo test 685 pass; regression 191 pass (+1 new);
+correctness 50/50; intrinsics 3/3; linker 86/86; asm-diff ALL RAW .text
+BYTES EXACT (+1 new case).
+---
+ src/backend/elf_writer_common.rs              | 32 ++++++++--
+ src/backend/x86/assembler/elf_writer.rs       |  2 +-
+ src/backend/x86/assembler/encoder/core.rs     | 16 +++++
+ .../x86/assembler/encoder/gp_integer.rs       | 23 +++++++
+ src/backend/x86/assembler/encoder/mod.rs      |  6 ++
+ src/backend/x86/assembler/parser.rs           | 25 ++++++--
+ src/ir/lowering/expr_builtins.rs              | 52 ++++++++++++++++
+ src/ir/lowering/stmt_init.rs                  | 18 ++++++
+ tests/asm-diff/imm_symbol_diff.s              | 26 ++++++++
+ tests/regression/builtin_strcmp_fold.c        | 61 +++++++++++++++++++
+ 10 files changed, 252 insertions(+), 9 deletions(-)
+ create mode 100644 tests/asm-diff/imm_symbol_diff.s
+ create mode 100644 tests/regression/builtin_strcmp_fold.c
+
+diff --git a/src/backend/elf_writer_common.rs b/src/backend/elf_writer_common.rs
+index 3bc47874..d29b0740 100644
+--- a/src/backend/elf_writer_common.rs
++++ b/src/backend/elf_writer_common.rs
+@@ -2460,16 +2460,40 @@ impl<A: X86Arch> ElfWriterCore<A> {
+                 // Handle SymbolDiff relocations
+                 if reloc.diff_symbol.is_some() {
+                     if let Some(ref diff_sym) = reloc.diff_symbol {
+-                        if let (Some(&(a_sec, a_off)), Some(&(b_sec, b_off))) = (
+-                            self.label_positions.get(&reloc.symbol),
+-                            self.label_positions.get(diff_sym),
+-                        ) {
++                        // Either side may be a NUMERIC local label (`0b` in
++                        // relocate_kernel_64.S `$identity_mapped - 0b`);
++                        // label_positions only holds named labels.
++                        let a_pos = self.label_positions.get(&reloc.symbol).copied()
++                            .or_else(|| self.resolve_numeric_label(&reloc.symbol, reloc.offset, sec_idx));
++                        let b_pos = self.label_positions.get(diff_sym).copied()
++                            .or_else(|| self.resolve_numeric_label(diff_sym, reloc.offset, sec_idx));
++                        if let (Some((a_sec, a_off)), Some((b_sec, b_off))) = (a_pos, b_pos) {
+                             if a_sec == b_sec {
+                                 let val = a_off as i64 - b_off as i64 + reloc.addend;
+                                 resolved.push((reloc.offset as usize, val, reloc.patch_size as usize));
+                                 continue;
+                             }
+                         }
++                        // `$sym - 0b` where sym is EXTERNAL (or in another
++                        // section) but the subtrahend is a local label in
++                        // THIS section: GAS emits R_X86_64_PC32 against sym
++                        // with addend = reloc_offset - addr(0b), so the link
++                        // computes S + (P - addr(0b)) - P = S - addr(0b).
++                        // relocate_kernel_64.S relies on this for computing
++                        // `identity_mapped - 0b` where identity_mapped lives
++                        // in a different section of the same object.
++                        if a_pos.is_none() || a_pos.map(|(s, _)| s) != Some(sec_idx) {
++                            if let Some((b_sec, b_off)) = b_pos {
++                                if b_sec == sec_idx && reloc.patch_size == 4 {
++                                    let mut conv = reloc.clone();
++                                    conv.reloc_type = A::reloc_pc32();
++                                    conv.addend += reloc.offset as i64 - b_off as i64;
++                                    conv.diff_symbol = None;
++                                    unresolved.push(conv);
++                                    continue;
++                                }
++                            }
++                        }
+                     }
+                     unresolved.push(reloc.clone());
+                     continue;
+diff --git a/src/backend/x86/assembler/elf_writer.rs b/src/backend/x86/assembler/elf_writer.rs
+index b0d14aca..87943bc5 100644
+--- a/src/backend/x86/assembler/elf_writer.rs
++++ b/src/backend/x86/assembler/elf_writer.rs
+@@ -55,7 +55,7 @@ impl X86Arch for X86_64Arch {
+                 symbol: r.symbol,
+                 reloc_type: r.reloc_type,
+                 addend: r.addend,
+-                diff_symbol: None,
++                diff_symbol: r.diff_symbol,
+             }
+         }).collect();
+ 
+diff --git a/src/backend/x86/assembler/encoder/core.rs b/src/backend/x86/assembler/encoder/core.rs
+index 93c1fd14..41998704 100644
+--- a/src/backend/x86/assembler/encoder/core.rs
++++ b/src/backend/x86/assembler/encoder/core.rs
+@@ -322,6 +322,22 @@ impl super::InstructionEncoder {
+             symbol: sym.to_string(),
+             reloc_type: rtype,
+             addend,
++            diff_symbol: None,
++        });
++    }
++
++    /// Add a symbol-difference relocation for an immediate (`$a - b`).
++    /// Resolution happens after layout: same-section pairs patch the
++    /// constant `a - b + addend`; otherwise the writer converts to a
++    /// PC-relative reloc against `a` with the addend adjusted by `b`'s
++    /// position (GAS semantics for `$sym - 0b`).
++    pub(crate) fn add_diff_relocation(&mut self, symbol: &str, diff: &str, reloc_type: u32, addend: i64) {
++        self.relocations.push(Relocation {
++            offset: self.bytes.len() as u64,
++            symbol: symbol.to_string(),
++            reloc_type,
++            addend,
++            diff_symbol: Some(diff.to_string()),
+         });
+     }
+ 
+diff --git a/src/backend/x86/assembler/encoder/gp_integer.rs b/src/backend/x86/assembler/encoder/gp_integer.rs
+index 3f2f67e0..f42a6ad4 100644
+--- a/src/backend/x86/assembler/encoder/gp_integer.rs
++++ b/src/backend/x86/assembler/encoder/gp_integer.rs
+@@ -689,6 +689,29 @@ impl super::InstructionEncoder {
+                 self.bytes.extend_from_slice(&[0; 4]);
+                 Ok(())
+             }
++            (Operand::Immediate(ImmediateValue::SymbolDiff(sym, diff)), Operand::Register(dst)) => {
++                // `addq $identity_mapped - 0b, %rsi` (relocate_kernel_64.S):
++                // GAS reserves imm32 for a forward-referenced difference and
++                // resolves it after layout. Same-section pairs become a plain
++                // constant; when `sym` stays external the writer converts to
++                // R_X86_64_PC32 against `sym` with the addend adjusted by the
++                // local label's position (value = S - addr(diff)) — exactly
++                // the reloc GAS emits for this shape.
++                //
++                // Deviation note: for a BACKWARD-defined same-section pair
++                // GAS folds at parse time and may pick the shorter imm8 form;
++                // we always emit imm32. Semantically identical, one byte
++                // larger — acceptable because the kernel's uses are forward
++                // references where GAS also emits imm32.
++                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
++                if size == 2 { self.bytes.push(0x66); }
++                self.emit_rex_unary(size, &dst.name);
++                self.bytes.push(0x81);
++                self.bytes.push(self.modrm(3, alu_op, dst_num));
++                self.add_diff_relocation(sym, diff, R_X86_64_PC32, 0);
++                self.bytes.extend_from_slice(&[0; 4]);
++                Ok(())
++            }
+             _ => Err(format!("unsupported {} operands", mnemonic)),
+         }
+     }
+diff --git a/src/backend/x86/assembler/encoder/mod.rs b/src/backend/x86/assembler/encoder/mod.rs
+index db8c6d38..4a7ac143 100644
+--- a/src/backend/x86/assembler/encoder/mod.rs
++++ b/src/backend/x86/assembler/encoder/mod.rs
+@@ -27,6 +27,12 @@ pub struct Relocation {
+     pub reloc_type: u32,
+     /// Addend for the relocation.
+     pub addend: i64,
++    /// Symbol-difference immediates (`addq $identity_mapped - 0b, %rsi` in
++    /// relocate_kernel_64.S): the patched value is `symbol - diff_symbol +
++    /// addend`. Same-section pairs resolve to a constant after layout;
++    /// an external `symbol` degrades to a PC32 against it with the addend
++    /// adjusted by the label position — both identical to GAS.
++    pub diff_symbol: Option<String>,
+ }
+ 
+ // ELF x86-64 relocation types (standard constants; not all emitted by assembler yet)
+diff --git a/src/backend/x86/assembler/parser.rs b/src/backend/x86/assembler/parser.rs
+index 6e8da4c0..b4cc33e5 100644
+--- a/src/backend/x86/assembler/parser.rs
++++ b/src/backend/x86/assembler/parser.rs
+@@ -1304,8 +1304,13 @@ fn parse_immediate_label_diff(s: &str) -> Option<ImmediateValue> {
+     // is a negation, not a difference.
+     for (i, c) in s.char_indices().skip(1) {
+         if c == '-' {
+-            let lhs = &s[..i];
+-            let rhs = &s[i + 1..];
++            // Trim both sides: `$identity_mapped - 0b` (relocate_kernel_64.S)
++            // carries spaces around the minus; without trimming the strings
++            // failed is_label_like and the WHOLE expression fell through to a
++            // plain symbol named "identity_mapped - 0b", which the linker
++            // reported as an undefined reference.
++            let lhs = s[..i].trim();
++            let rhs = s[i + 1..].trim();
+             if !lhs.is_empty() && !rhs.is_empty()
+                 && is_label_like(lhs) && is_label_like(rhs)
+             {
+@@ -1569,7 +1574,19 @@ fn try_parse_symbol_plus_offset(s: &str) -> Option<Displacement> {
+ /// This handles cases like `init_top_pgt - 0xffffffff80000000` where the expression
+ /// mixes a symbol with a large integer constant.
+ fn try_parse_immediate_symbol_offset(s: &str) -> Option<ImmediateValue> {
++    // A parenthesized symbol `(name)` is the same symbol — GAS grouping.
++    // The kernel emits `$(srso_safe_ret)+5` via __HANDLE_INTR_SAFERET;
++    // rejecting the parens made the whole expression a literal symbol
++    // name and the vmlinux link failed on `(srso_safe_ret)+5`.
++    fn strip_parens(s: &str) -> &str {
++        if s.len() >= 2 && s.starts_with('(') && s.ends_with(')') {
++            &s[1..s.len() - 1]
++        } else {
++            s
++        }
++    }
+     let is_valid_sym = |s: &str| -> bool {
++        let s = strip_parens(s);
+         !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
+     };
+ 
+@@ -1585,7 +1602,7 @@ fn try_parse_immediate_symbol_offset(s: &str) -> Option<ImmediateValue> {
+             // Case 1: symbol+/-offset (e.g. "init_top_pgt - 0xffffffff80000000")
+             if let Ok(offset) = parse_integer_expr(right_with_sign) {
+                 if is_valid_sym(left) {
+-                    return Some(ImmediateValue::SymbolPlusOffset(left.to_string(), offset));
++                    return Some(ImmediateValue::SymbolPlusOffset(strip_parens(left).to_string(), offset));
+                 }
+             }
+ 
+@@ -1594,7 +1611,7 @@ fn try_parse_immediate_symbol_offset(s: &str) -> Option<ImmediateValue> {
+                 if let Ok(offset) = parse_integer_expr(left) {
+                     let sym = right_with_sign[1..].trim();
+                     if is_valid_sym(sym) {
+-                        return Some(ImmediateValue::SymbolPlusOffset(sym.to_string(), offset));
++                        return Some(ImmediateValue::SymbolPlusOffset(strip_parens(sym).to_string(), offset));
+                     }
+                 }
+             }
 diff --git a/src/ir/lowering/expr_builtins.rs b/src/ir/lowering/expr_builtins.rs
-index 469ff71..c82a056 100644
+index c82a0568..28628995 100644
 --- a/src/ir/lowering/expr_builtins.rs
 +++ b/src/ir/lowering/expr_builtins.rs
-@@ -314,10 +314,6 @@ impl Lowerer {
-             // For types 2 and 3: return 0 when size is unknown
-             // We conservatively return "unknown" since we don't do points-to analysis.
-             BuiltinIntrinsic::ObjectSize => {
--                // Evaluate args for side effects
--                for arg in args {
--                    self.lower_expr(arg);
--                }
-                 let obj_type = if args.len() >= 2 {
-                     match self.eval_const_expr(&args[1]) {
-                         Some(IrConst::I64(v)) => v,
-@@ -327,6 +323,22 @@ impl Lowerer {
-                 } else {
-                     0
-                 };
-+                // Fast path: string literal. Size is strlen+1 (NUL included).
-+                // Highest-ROI object_size case for fortify; every serious C
-+                // compiler folds this without full points-to analysis.
-+                if let Some(arg0) = args.first() {
-+                    if let Expr::StringLiteral(s, _) = arg0 {
-+                        let sz = (s.len() + 1) as i64;
-+                        if args.len() >= 2 {
-+                            let _ = self.lower_expr(&args[1]);
-+                        }
-+                        return Some(Operand::Const(IrConst::I64(sz)));
-+                    }
-+                }
-+                // Conservative unknown: evaluate args for side effects.
-+                for arg in args {
-+                    let _ = self.lower_expr(arg);
-+                }
-                 // Types 0 and 1: maximum estimate -> -1 (unknown)
-                 // Types 2 and 3: minimum estimate -> 0 (unknown)
-                 let result = if obj_type == 2 || obj_type == 3 { 0i64 } else { -1i64 };
-@@ -831,7 +843,7 @@ impl Lowerer {
-             (IrType::F64, 16usize, 8usize)
-         };
-         let alloca = self.fresh_value();
--        self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: complex_size, align: 0, volatile: false, semantic_volatile: false });
-+        self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: complex_size, align: 16, volatile: false, semantic_volatile: false });
-         self.emit(Instruction::Store { val: real_val, ptr: alloca, ty: comp_ty, seg_override: AddressSpace::Default });
-         let imag_ptr = self.fresh_value();
-         self.emit(Instruction::GetElementPtr {
-@@ -866,7 +878,7 @@ impl Lowerer {
+@@ -65,6 +65,58 @@ impl Lowerer {
+             }
          }
-         // By-value packed I128 (nested raw builtin): spill to a slot.
-         let slot = self.fresh_value();
--        self.emit(Instruction::Alloca { dest: slot, ty: IrType::Ptr, size: 16, align: 0, volatile: false, semantic_volatile: false });
-+        self.emit(Instruction::Alloca { dest: slot, ty: IrType::Ptr, size: 16, align: 16, volatile: false, semantic_volatile: false });
-         let val = self.operand_to_value(op);
-         self.emit(Instruction::Store { val: Operand::Value(val), ptr: slot, ty: IrType::I128, seg_override: AddressSpace::Default });
-         Operand::Value(slot)
-@@ -879,7 +891,12 @@ impl Lowerer {
-         let lo = self.fresh_value();
-         self.emit(Instruction::Load { dest: lo, ptr: slot, ty: IrType::I64, seg_override: AddressSpace::Default });
-         let hi_ptr = self.fresh_value();
--        self.emit(Instruction::BinOp { dest: hi_ptr, op: IrBinOp::Add, lhs: Operand::Value(slot), rhs: Operand::Const(IrConst::I64(8)), ty: IrType::I64 });
-+        self.emit(Instruction::GetElementPtr {
-+            dest: hi_ptr,
-+            base: slot,
-+            offset: Operand::Const(IrConst::I64(8)),
-+            ty: IrType::I8,
-+        });
-         let hi = self.fresh_value();
-         self.emit(Instruction::Load { dest: hi, ptr: hi_ptr, ty: IrType::I64, seg_override: AddressSpace::Default });
-         let lo128 = self.fresh_value();
-@@ -908,7 +925,7 @@ impl Lowerer {
-         let v1p = self.operand_to_value(v1);
-         let v2p = self.operand_to_value(v2);
-         let result = self.fresh_value();
--        self.emit(Instruction::Alloca { dest: result, ty: IrType::Ptr, size: 16, align: 0, volatile: false, semantic_volatile: false });
-+        self.emit(Instruction::Alloca { dest: result, ty: IrType::Ptr, size: 16, align: 16, volatile: false, semantic_volatile: false });
-         for lane in 0..4usize {
-             let idx = match self.eval_const_expr(&args[2 + lane]) {
-                 Some(IrConst::I64(v)) => v,
-@@ -958,16 +975,29 @@ impl Lowerer {
-                 Some(Operand::Const(IrConst::I64(0)))
-             }
-             X86IntrinsicKind::PtrStore => {
-+                // Defensive: never panic the compiler on a short argument list.
-+                if args.len() < 2 {
-+                    for a in args {
-+                        let _ = self.lower_expr(a);
-+                    }
-+                    return Some(Operand::Const(IrConst::I64(0)));
-+                }
-                 let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
--                let ptr_val = self.operand_to_value(arg_ops[0]);
--                self.emit(Instruction::Intrinsic { dest: None, op, dest_ptr: Some(ptr_val), args: vec![arg_ops[1]] });
-+                let ptr_val = self.operand_to_value(arg_ops[0].clone());
-+                self.emit(Instruction::Intrinsic {
-+                    dest: None,
-+                    op,
-+                    dest_ptr: Some(ptr_val),
-+                    args: vec![arg_ops[1].clone()],
-+                });
-                 Some(Operand::Const(IrConst::I64(0)))
-             }
-             X86IntrinsicKind::Vec128 | X86IntrinsicKind::Vec256 => {
-                 let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
-                 let result_size = match x86_intrinsic_kind(intrinsic) { X86IntrinsicKind::Vec128 => 16, X86IntrinsicKind::Vec256 => 32, _ => unreachable!() };
-                 let result_alloca = self.fresh_value();
--                self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::Ptr, size: result_size, align: 0, volatile: false, semantic_volatile: false });
-+                let align = match result_size { 32 => 32usize, _ => 16usize };
-+                self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::Ptr, size: result_size, align, volatile: false, semantic_volatile: false });
-                 let dest_val = self.fresh_value();
-                 self.emit(Instruction::Intrinsic { dest: Some(dest_val), op, dest_ptr: Some(result_alloca), args: arg_ops });
-                 Some(Operand::Value(result_alloca))
-@@ -994,15 +1024,20 @@ impl Lowerer {
-                 }).collect();
  
-                 let result_alloca = self.fresh_value();
--                self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::Ptr, size: 16, align: 0, volatile: false, semantic_volatile: false });
-+                self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::Ptr, size: 16, align: 16, volatile: false, semantic_volatile: false });
-                 let dest_val = self.fresh_value();
-                 self.emit(Instruction::Intrinsic { dest: Some(dest_val), op, dest_ptr: Some(result_alloca), args: arg_ops });
-                 // lo half
-                 let lo = self.fresh_value();
-                 self.emit(Instruction::Load { dest: lo, ptr: result_alloca, ty: IrType::I64, seg_override: crate::common::types::AddressSpace::Default });
--                // hi half: result_alloca + 8
-+                // hi half: result_alloca + 8 (GEP so analyses see a proper derived pointer)
-                 let hi_ptr = self.fresh_value();
--                self.emit(Instruction::BinOp { dest: hi_ptr, op: IrBinOp::Add, lhs: Operand::Value(result_alloca), rhs: Operand::Const(IrConst::I64(8)), ty: IrType::I64 });
-+                self.emit(Instruction::GetElementPtr {
-+                    dest: hi_ptr,
-+                    base: result_alloca,
-+                    offset: Operand::Const(IrConst::I64(8)),
-+                    ty: IrType::I8,
-+                });
-                 let hi = self.fresh_value();
-                 self.emit(Instruction::Load { dest: hi, ptr: hi_ptr, ty: IrType::I64, seg_override: crate::common::types::AddressSpace::Default });
-                 let lo128 = self.fresh_value();
-diff --git a/src/ir/lowering/expr_builtins_lcccsimd.rs b/src/ir/lowering/expr_builtins_lcccsimd.rs
-index 298f190..23540a8 100644
---- a/src/ir/lowering/expr_builtins_lcccsimd.rs
-+++ b/src/ir/lowering/expr_builtins_lcccsimd.rs
-@@ -422,11 +422,18 @@ impl Lowerer {
-         match class {
-             LcccSimdClass::Vec128 | LcccSimdClass::Vec256 | LcccSimdClass::Vec512 => {
-                 let result_alloca = self.fresh_value();
-+                // Natural alignment for the vector width (Raptor Lake prefers
-+                // aligned vmovdqa / store-forwarding on 16/32-byte slots).
-+                let align = match width {
-+                    64 => 64usize,
-+                    32 => 32usize,
-+                    _ => 16usize,
++        // Compile-time folding of string-literal strcmp/strncmp/memcmp.
++        // GCC folds these at -O0 already; the kernel RELIES on the fold for
++        // its "unknown operator throws linker error" idiom (fair.c
++        // vruntime_cmp uses __builtin_strcmp(OP, "<") in an if/else ladder
++        // whose dead branch calls the undefined __BUILD_BUG_vruntime_cmp).
++        // Without folding, the branch survives into codegen and vmlinux
++        // fails to link. Fold only when BOTH arguments are string literals —
++        // everything else lowers normally.
++        if matches!(name, "__builtin_strcmp" | "__builtin_strncmp" | "__builtin_memcmp") {
++            fn literal_of(e: &Expr) -> Option<&str> {
++                match e {
++                    Expr::StringLiteral(s, _) => Some(s.as_str()),
++                    _ => None,
++                }
++            }
++            if args.len() >= 2 {
++                if let (Some(a), Some(b)) = (literal_of(&args[0]), literal_of(&args[1])) {
++                    let n = if name == "__builtin_strcmp" {
++                        Some(usize::MAX)
++                    } else {
++                        match args.get(2).and_then(|e| self.eval_const_expr(e)) {
++                            Some(IrConst::I64(n)) if n >= 0 => Some(n as usize),
++                            Some(IrConst::I32(n)) if n >= 0 => Some(n as usize),
++                            // strncmp/memcmp with non-constant length: no fold.
++                            _ => None,
++                        }
++                    };
++                    if let Some(n) = n {
++                        let ab = a.as_bytes();
++                        let bb = b.as_bytes();
++                        // Compare including the NUL terminator (strcmp stops
++                        // there; memcmp of literal arrays sees the NUL too).
++                        let mut result: i64 = 0;
++                        let mut i = 0usize;
++                        while i < n {
++                            let ca = if i < ab.len() { ab[i] } else { 0 };
++                            let cb = if i < bb.len() { bb[i] } else { 0 };
++                            if ca != cb {
++                                result = ca as i64 - cb as i64;
++                                break;
++                            }
++                            // For strcmp/strncmp: stop at NUL.
++                            if name != "__builtin_memcmp" && ca == 0 { break; }
++                            if i >= ab.len() && i >= bb.len() { break; }
++                            i += 1;
++                        }
++                        return Some(Operand::Const(IrConst::I32(result.signum() as i32)));
++                    }
++                }
++            }
++        }
++
+         // Handle __builtin_choose_expr(const_expr, expr1, expr2)
+         // This is a compile-time selection: if const_expr is nonzero, returns expr1, else expr2.
+         if name == "__builtin_choose_expr" {
+diff --git a/src/ir/lowering/stmt_init.rs b/src/ir/lowering/stmt_init.rs
+index 7edd5b2a..293687f9 100644
+--- a/src/ir/lowering/stmt_init.rs
++++ b/src/ir/lowering/stmt_init.rs
+@@ -40,6 +40,24 @@ impl Lowerer {
+         // resolves to the true global, not a same-named static local
+         self.shadow_static_for_scope(&declarator.name);
+ 
++        // Propagate __attribute__((weak)) / visibility from ANY block-scope
++        // extern declaration — including `extern typeof(f) f
++        // __attribute__((weak, visibility("hidden")))`, where typeof supplies
++        // the function type and `derived` is empty so the function-declaration
++        // handler below never sees it. The kernel's !CONFIG_MODULES
++        // symbol_get() expands to exactly that shape (module.h:835); dropping
++        // the attributes left ips_link_to_i915_driver a STB_GLOBAL undef and
++        // the vmlinux link failed instead of resolving it to NULL.
++        if !declarator.name.is_empty()
++            && (declarator.attrs.is_weak() || declarator.attrs.visibility.is_some())
++        {
++            self.module.symbol_attrs.push((
++                declarator.name.clone(),
++                declarator.attrs.is_weak(),
++                declarator.attrs.visibility.clone(),
++            ));
++        }
++
+         // Check if this is a function declaration (extern int f(int))
+         let is_func_decl = declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Function(_, _)));
+         if is_func_decl {
+diff --git a/tests/asm-diff/imm_symbol_diff.s b/tests/asm-diff/imm_symbol_diff.s
+new file mode 100644
+index 00000000..8b36b56e
+--- /dev/null
++++ b/tests/asm-diff/imm_symbol_diff.s
+@@ -0,0 +1,26 @@
++# Symbol-difference and parenthesized-symbol immediates.
++#
++# relocate_kernel_64.S computes section-relative offsets in immediates:
++#     0: addq $identity_mapped - 0b, %rsi
++# and nospec-branch.h's __HANDLE_INTR_SAFERET emits parenthesized symbols
++# with an addend:
++#     cmpq $(srso_safe_ret)+5, RIP+pt_regs
++# Both shapes previously degenerated into relocations against the LITERAL
++# expression string ("identity_mapped - 0b", "(srso_safe_ret)+5") and the
++# vmlinux link failed with undefined references.
++#
++# All references here are FORWARD (like the kernel's), where GAS also
++# reserves imm32 — so the encodings must be byte-identical. (For
++# backward-defined same-section pairs GAS folds at parse time and may
++# pick imm8; lccc emits the semantically identical imm32 there, which is
++# why this test deliberately avoids backward references.)
++.text
++0:	addq $fwd_lbl - 0b, %rsi
++	subq $fwd_lbl2 - 0b, %rsi
++	cmpq $(ext_sym)+5, 8(%rsp)
++	cmpq $(ext_sym), 8(%rsp)
++	ret
++fwd_lbl:
++	nop
++fwd_lbl2:
++	nop
+diff --git a/tests/regression/builtin_strcmp_fold.c b/tests/regression/builtin_strcmp_fold.c
+new file mode 100644
+index 00000000..c0daba54
+--- /dev/null
++++ b/tests/regression/builtin_strcmp_fold.c
+@@ -0,0 +1,61 @@
++/*
++ * Compile-time folding of __builtin_strcmp/strncmp/memcmp on string
++ * literals. The kernel's vruntime_cmp MACRO (CachyMod fair.c) relies on
++ * this fold: an if/else ladder over __builtin_strcmp(OP_STR, "<") whose
++ * dead branch calls an UNDEFINED function (__BUILD_BUG_vruntime_cmp).
++ * Without the fold the dead call survives into codegen and vmlinux fails
++ * to link.
++ *
++ * NOTE: the kernel idiom is a MACRO, so both strcmp arguments are string
++ * literals at the point of lowering — that is exactly what lccc folds.
++ * (An inline function with a char* parameter is NOT folded; GCC only
++ * manages that via post-inline optimization, which no kernel code
++ * depends on.)
++ *
++ * The runtime checks also pin the fold's SEMANTICS to glibc/GCC: sign of
++ * the first differing byte, strncmp length cutoff, memcmp byte count.
++ */
++extern int printf(const char *, ...);
++
++/* Deliberately undefined: any surviving call breaks the link. */
++extern void __BUILD_BUG_strcmp_fold(void);
++
++/* The kernel's exact idiom shape (vruntime_cmp, kernel/sched/fair.c). */
++#define op_class(OP_STR) ({					\
++	int __res = 0;						\
++	if (!__builtin_strcmp(OP_STR, "<"))			\
++		__res = 1;					\
++	else if (!__builtin_strcmp(OP_STR, "<="))		\
++		__res = 2;					\
++	else if (!__builtin_strcmp(OP_STR, ">"))		\
++		__res = 3;					\
++	else if (!__builtin_strcmp(OP_STR, ">="))		\
++		__res = 4;					\
++	else							\
++		__BUILD_BUG_strcmp_fold();			\
++	__res;							\
++})
++
++int main(void)
++{
++	/* Every branch of the dead-code idiom must fold away. */
++	printf("ops %d %d %d %d\n",
++	       op_class("<"), op_class("<="), op_class(">"), op_class(">="));
++
++	printf("strcmp %d %d %d\n",
++	       __builtin_strcmp("a", "a"),
++	       __builtin_strcmp("a", "b") < 0,
++	       __builtin_strcmp("b", "a") > 0);
++
++	/* Prefix equality vs. length cutoff. */
++	printf("strncmp %d %d %d\n",
++	       __builtin_strncmp("abc", "abd", 2),
++	       __builtin_strncmp("abc", "abd", 3) < 0,
++	       __builtin_strncmp("ab", "abc", 5) < 0);
++
++	printf("memcmp %d %d\n",
++	       __builtin_memcmp("ab", "ab", 2),
++	       __builtin_memcmp("ab", "ac", 2) < 0);
++
++	return 0;
++}
+-- 
+2.47.3
+
+
+From d2c2f9ffc89a63891f13a07fe73bed9caad66cad Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Sun, 16 Aug 2026 18:33:37 +0000
+Subject: [PATCH 2/3] x86/i686 asm: ljmpl with symbol-difference offset
+ (la57toggle.S)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`ljmpl $__KERNEL_CS, $(.Lret - trampoline_32bit_src)` — the direct far
+jump in the LA57 trampoline carries a same-section label difference as
+its offset immediate. Both encoders (x86-64 encode_ljmp and the i686
+one that handles .code32 inside 64-bit kernel objects) only accepted
+Integer/Symbol offsets and rejected the file with "ljmp requires
+$segment, $offset operands", stopping the kernel build at
+arch/x86/boot/startup/la57toggle.o.
+
+New arm: emit 0xEA, record a diff relocation on the imm32 field, append
+the segment word. Same-section pairs fold to a constant after layout via
+the existing diff-reloc resolution.
+
+PROOF: lj.s (.code32 + ljmpl label-diff) — .rodata bytes
+`90 ea 08000000 1000 90` identical to GAS. la57toggle.o now assembles.
+
+Validation: full battery green (685 lib / 191 regression / 50
+correctness / 3 intrinsics / 86 linker / asm-diff RAW EXACT).
+---
+ src/backend/i686/assembler/encoder/gp_integer.rs | 13 +++++++++++++
+ src/backend/x86/assembler/encoder/system.rs      | 13 +++++++++++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/src/backend/i686/assembler/encoder/gp_integer.rs b/src/backend/i686/assembler/encoder/gp_integer.rs
+index cf3a5e6e..0bb0bd3b 100644
+--- a/src/backend/i686/assembler/encoder/gp_integer.rs
++++ b/src/backend/i686/assembler/encoder/gp_integer.rs
+@@ -1327,6 +1327,19 @@ impl super::InstructionEncoder {
+                         self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
+                         Ok(())
+                     }
++                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::SymbolDiff(sym, diff))) => {
++                        // la57toggle.S (compiled as .code32 inside a 64-bit
++                        // kernel object): `ljmpl $__KERNEL_CS, $(.Lret -
++                        // trampoline_32bit_src)`. The offset is a
++                        // same-section label difference; GAS folds it to a
++                        // constant after layout (`ea 08000000 1000`). Record
++                        // a diff relocation on the imm32 field.
++                        self.bytes.push(0xEA);
++                        self.add_relocation_with_diff(sym, R_386_32, 0, diff);
++                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
++                        self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
++                        Ok(())
++                    }
+                     _ => Err("ljmp requires $segment, $offset operands".to_string()),
+                 }
+             }
+diff --git a/src/backend/x86/assembler/encoder/system.rs b/src/backend/x86/assembler/encoder/system.rs
+index d62a5285..2448a2bf 100644
+--- a/src/backend/x86/assembler/encoder/system.rs
++++ b/src/backend/x86/assembler/encoder/system.rs
+@@ -544,6 +544,19 @@ impl super::InstructionEncoder {
+                         self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
+                         Ok(())
+                     }
++                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::SymbolDiff(sym, diff))) => {
++                        // la57toggle.S: `ljmpl $__KERNEL_CS, $(.Lret -
++                        // trampoline_32bit_src)` — the offset is a
++                        // same-section label difference that resolves to a
++                        // constant after layout (GAS: `ea 08000000 1000`).
++                        // Record a diff relocation on the imm32; the writer
++                        // patches the folded value in place.
++                        self.bytes.push(0xEA);
++                        self.add_diff_relocation(sym, diff, R_X86_64_32, 0);
++                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
++                        self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
++                        Ok(())
++                    }
+                     _ => Err("ljmp requires $segment, $offset operands".to_string()),
+                 }
+             }
+-- 
+2.47.3
+
+
+From e2b78abc334031f81ed38a960eb27994e598dafd Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Sun, 16 Aug 2026 19:28:52 +0000
+Subject: [PATCH 3/3] Boot-path assembler: displacement diffs, .irpc, jmpl,
+ multi-symbol .globl, mov/ljmp diff immediates, 16-bit symbol movs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Continuing the bzImage blocker chain after vmlinux.o linked. Every fix is
+byte-verified against GAS output.
+
+1) Displacement::SymbolDiff/SymbolDiffAddend: head_64.S's rva() macro
+   produces `((gdt) - startup_32)(%ebp)` and `((pgtable + 0) -
+   startup_32)(%ebp)` — label differences (optionally with constant
+   addend) as memory displacements. New parser arms + both encoders
+   (x86-64/i686) thread a diff relocation through encode_modrm_mem;
+   same-section pairs fold to constants after layout (no reloc emitted,
+   byte-identical: lea2.s/lea3.s vs GAS).
+   RIP-relative + SymbolDiff is rejected loudly (meaningless).
+
+2) numeric_labels.rs resolve_numeric_displacement lacked SymbolDiff arms:
+   `leal (_bss - 1b)(%ecx), %edi` (efi-mixed.S) left the raw "1b" name
+   in the reloc. Now either side resolves; extern-minus-local converts to
+   R_X86_64_PC32 with addend = P - addr(label) — identical to GAS
+   (efm4.s: `_bss + 4` PC32).
+
+3) .irpc (character iteration) implemented in the GAS macro expander,
+   and the .rept pre-pass now tracks .irpc blocks so their .endr is not
+   swallowed (previously the body leaked one stray instruction per
+   iteration). efi-mixed.S `.irpc l, 0123` page-table unroll is
+   byte-identical (irpc.s).
+
+4) i686: `jmpl` mnemonic aliased to jmp (pmjump.S `jmpl *%eax` = ff e0);
+   `mov $sym_diff, %reg` (head_64.S `movl $(_bss - startup_32), %ecx`);
+   16-bit `movw $sym, %reg` emits B8+rd iw with R_386_16 (header.S
+   realmode `movw $_end, %dx`); `test $imm, LABEL` routes the bare-label
+   operand through the absolute-memory path (header.S
+   `testb $CAN_USE_HEAP, loadflags`).
+
+5) x86-64: mov $sym_diff imm32 (B8+rd id + folded diff), ljmpl
+   $seg, $(a - b) far-jump offsets in both encoders
+   (la57toggle.S trampoline: `ea 08000000 1000` == GAS).
+
+6) `.globl a, b` (comma list) marks EVERY name global. mkpiggy emits
+   `.globl input_data, input_data_end`; the single-string handling left
+   both LOCAL and the compressed vmlinux link failed with "hidden symbol
+   `input_data' isn't defined".
+
+7) Kernel tree fix (not lccc): R8169 Kconfig now selects PAGE_POOL —
+   the 1020-r8169 multi-queue patch uses page_pool_* but never selected
+   it; link failed identically under GCC. (Reported for upstreaming to
+   the CachyMod patch; kept local to the kernel tree.)
+
+Validation: 685 lib / 191 regression / 50 correctness / 86 linker green;
+asm-diff ALL RAW .text BYTES EXACT.
+
+Known remaining gap (next commit): true .code16 encoding — the i686
+encoder emits 32-bit ModR/M inside .code16 (GAS uses 16-bit addressing
+modes + R_*_16 relocs there). Affects arch/x86/boot/header.o.
+---
+ src/backend/elf/numeric_labels.rs             | 29 ++++++
+ src/backend/elf_writer_common.rs              | 13 ++-
+ src/backend/i686/assembler/encoder/core.rs    | 33 ++++++-
+ .../i686/assembler/encoder/gp_integer.rs      | 41 ++++++++-
+ src/backend/i686/assembler/encoder/mod.rs     | 12 ++-
+ src/backend/i686/assembler/encoder/system.rs  | 19 ++++
+ src/backend/x86/assembler/encoder/core.rs     | 37 +++++++-
+ .../x86/assembler/encoder/gp_integer.rs       | 24 ++++-
+ src/backend/x86/assembler/parser.rs           | 90 ++++++++++++++++++-
+ 9 files changed, 281 insertions(+), 17 deletions(-)
+
+diff --git a/src/backend/elf/numeric_labels.rs b/src/backend/elf/numeric_labels.rs
+index 493429ac..6a18bb00 100644
+--- a/src/backend/elf/numeric_labels.rs
++++ b/src/backend/elf/numeric_labels.rs
+@@ -252,6 +252,35 @@ fn resolve_numeric_displacement(
+             resolve_numeric_name(name, current_idx, defs)
+                 .map(|n| Displacement::SymbolPlusOffset(n, *offset))
+         }
++        // Label differences as displacements (efi-mixed.S:
++        // `leal (_bss - 1b)(%ecx), %edi`): EITHER side may be a numeric
++        // label reference. Returning Some whenever at least one side
++        // resolved keeps the other side's name unchanged.
++        Displacement::SymbolDiff(lhs, rhs) => {
++            let new_lhs = resolve_numeric_name(lhs, current_idx, defs);
++            let new_rhs = resolve_numeric_name(rhs, current_idx, defs);
++            if new_lhs.is_none() && new_rhs.is_none() {
++                None
++            } else {
++                Some(Displacement::SymbolDiff(
++                    new_lhs.unwrap_or_else(|| lhs.clone()),
++                    new_rhs.unwrap_or_else(|| rhs.clone()),
++                ))
++            }
++        }
++        Displacement::SymbolDiffAddend(lhs, rhs, addend) => {
++            let new_lhs = resolve_numeric_name(lhs, current_idx, defs);
++            let new_rhs = resolve_numeric_name(rhs, current_idx, defs);
++            if new_lhs.is_none() && new_rhs.is_none() {
++                None
++            } else {
++                Some(Displacement::SymbolDiffAddend(
++                    new_lhs.unwrap_or_else(|| lhs.clone()),
++                    new_rhs.unwrap_or_else(|| rhs.clone()),
++                    *addend,
++                ))
++            }
++        }
+         _ => None,
+     }
+ }
+diff --git a/src/backend/elf_writer_common.rs b/src/backend/elf_writer_common.rs
+index d29b0740..de2bff29 100644
+--- a/src/backend/elf_writer_common.rs
++++ b/src/backend/elf_writer_common.rs
+@@ -625,7 +625,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
+                 }
+             }
+             AsmItem::Global(name) => {
+-                self.pending_globals.push(name.clone());
++                // `.globl a, b` declares EVERY comma-separated name global
++                // (GAS semantics). mkpiggy emits `.globl input_data,
++                // input_data_end`; storing the whole string as one symbol
++                // name silently made BOTH stay local and the compressed
++                // vmlinux link failed with "hidden symbol `input_data'
++                // isn't defined".
++                for part in name.split(',') {
++                    let sym = part.trim();
++                    if !sym.is_empty() {
++                        self.pending_globals.push(sym.to_string());
++                    }
++                }
+             }
+             AsmItem::Weak(name) => {
+                 self.pending_weaks.push(name.clone());
+diff --git a/src/backend/i686/assembler/encoder/core.rs b/src/backend/i686/assembler/encoder/core.rs
+index 4070af1d..aa55ad0e 100644
+--- a/src/backend/i686/assembler/encoder/core.rs
++++ b/src/backend/i686/assembler/encoder/core.rs
+@@ -47,6 +47,7 @@ impl super::InstructionEncoder {
+         let index = mem.index.as_ref();
+ 
+         // Parse displacement but defer relocation until after ModR/M+SIB bytes
++        let mut diff_sym: Option<String> = None;
+         let (disp_val, has_symbol, pending_reloc) = match &mem.displacement {
+             Displacement::None => (0i64, false, None),
+             Displacement::Integer(v) => (*v, false, None),
+@@ -59,6 +60,18 @@ impl super::InstructionEncoder {
+             Displacement::SymbolPlusOffset(sym, offset) => {
+                 (0i64, true, Some((sym.clone(), R_386_32, *offset)))
+             }
++            Displacement::SymbolDiff(sym, diff) => {
++                // head_64.S rva() in .code32: `((gdt) - startup_32)(%ebp)`.
++                // Same-section label difference; folds to a constant after
++                // layout via the diff-reloc path (GAS emits the folded
++                // disp32 with no relocation).
++                diff_sym = Some(diff.clone());
++                (0i64, true, Some((sym.clone(), R_386_32, 0i64)))
++            }
++            Displacement::SymbolDiffAddend(sym, diff, addend) => {
++                diff_sym = Some(diff.clone());
++                (0i64, true, Some((sym.clone(), R_386_32, *addend)))
++            }
+             Displacement::SymbolMod(sym, modifier) => {
+                 let reloc_type = self.tls_reloc_type(modifier);
+                 (0i64, true, Some((sym.clone(), reloc_type, 0i64)))
+@@ -71,7 +84,10 @@ impl super::InstructionEncoder {
+             self.bytes.push(self.modrm(0, reg_field, 5));
+             // Emit relocation now, pointing at the displacement bytes
+             if let Some((sym, reloc_type, addend)) = pending_reloc {
+-                self.add_relocation(&sym, reloc_type, addend);
++                match &diff_sym {
++                    Some(d) => self.add_relocation_with_diff(&sym, reloc_type, addend, d),
++                    None => self.add_relocation(&sym, reloc_type, addend),
++                }
+             }
+             self.bytes.extend_from_slice(&(disp_val as i32).to_le_bytes());
+             return Ok(());
+@@ -108,7 +124,10 @@ impl super::InstructionEncoder {
+                 self.bytes.push(self.sib(scale, idx_num, 5));
+                 // Emit relocation after ModR/M+SIB, before displacement
+                 if let Some((sym, reloc_type, addend)) = pending_reloc {
+-                    self.add_relocation(&sym, reloc_type, addend);
++                    match &diff_sym {
++                        Some(d) => self.add_relocation_with_diff(&sym, reloc_type, addend, d),
++                        None => self.add_relocation(&sym, reloc_type, addend),
++                    }
+                 }
+                 self.bytes.extend_from_slice(&(disp_val as i32).to_le_bytes());
+             } else {
+@@ -116,7 +135,10 @@ impl super::InstructionEncoder {
+                 self.bytes.push(self.sib(scale, idx_num, base_num));
+                 // Emit relocation after ModR/M+SIB, before displacement
+                 if let Some((sym, reloc_type, addend)) = pending_reloc {
+-                    self.add_relocation(&sym, reloc_type, addend);
++                    match &diff_sym {
++                        Some(d) => self.add_relocation_with_diff(&sym, reloc_type, addend, d),
++                        None => self.add_relocation(&sym, reloc_type, addend),
++                    }
+                 }
+                 match disp_size {
+                     0 => {}
+@@ -129,7 +151,10 @@ impl super::InstructionEncoder {
+             self.bytes.push(self.modrm(mod_bits, reg_field, base_num));
+             // Emit relocation after ModR/M, before displacement
+             if let Some((sym, reloc_type, addend)) = pending_reloc {
+-                self.add_relocation(&sym, reloc_type, addend);
++                match &diff_sym {
++                    Some(d) => self.add_relocation_with_diff(&sym, reloc_type, addend, d),
++                    None => self.add_relocation(&sym, reloc_type, addend),
++                }
+             }
+             match disp_size {
+                 0 => {}
+diff --git a/src/backend/i686/assembler/encoder/gp_integer.rs b/src/backend/i686/assembler/encoder/gp_integer.rs
+index 0bb0bd3b..5d0c2fd4 100644
+--- a/src/backend/i686/assembler/encoder/gp_integer.rs
++++ b/src/backend/i686/assembler/encoder/gp_integer.rs
+@@ -165,11 +165,36 @@ impl super::InstructionEncoder {
+                     self.bytes.push(0xB8 + dst_num);
+                     self.add_relocation(sym, R_386_32, addend);
+                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
++                } else if size == 2 {
++                    // Real-mode boot code (header.S with .code16 semantics):
++                    // `movw $_end, %dx` — a 16-bit absolute symbol immediate.
++                    // GAS emits B8+rd iw with R_386_16 / R_X86_64_16 on the
++                    // 2-byte field; the kernel's build-time relocs tool
++                    // whitelists 16-bit relocs in the realmode blob.
++                    // (The caller has already emitted the 0x66 prefix in
++                    // 32-bit code mode when needed.)
++                    self.bytes.push(0xB8 + dst_num);
++                    self.add_relocation(sym, R_386_16, addend);
++                    self.bytes.extend_from_slice(&[0, 0]);
+                 } else {
+-                    return Err("symbol immediate only supported for 32-bit mov".to_string());
++                    return Err("symbol immediate only supported for 16/32-bit mov".to_string());
+                 }
+             }
+-            ImmediateValue::SymbolMod(_, _) | ImmediateValue::SymbolDiff(_, _) => {
++            ImmediateValue::SymbolDiff(sym_a, sym_b) => {
++                // head_64.S (compressed boot, .code32): `movl $(_bss -
++                // startup_32), %ecx` and the rva(X) macro produce label
++                // differences as mov immediates. Same-section pairs fold to
++                // a constant after layout via the diff-reloc path — GAS
++                // emits `b9 <imm32>` with the folded value.
++                if size == 4 {
++                    self.bytes.push(0xB8 + dst_num);
++                    self.add_relocation_with_diff(sym_a, R_386_32, 0, sym_b);
++                    self.bytes.extend_from_slice(&[0, 0, 0, 0]);
++                } else {
++                    return Err("symbol-difference immediate only supported for 32-bit mov".to_string());
++                }
++            }
++            ImmediateValue::SymbolMod(_, _) => {
+                 return Err("unsupported immediate type for mov".to_string());
+             }
+         }
+@@ -762,6 +787,18 @@ impl super::InstructionEncoder {
+                 }
+                 Ok(())
+             }
++            (Operand::Immediate(imm), Operand::Label(label)) => {
++                // `testb $CAN_USE_HEAP, loadflags` (header.S): a bare symbol
++                // as the memory operand — absolute addressing through a
++                // relocation, same shape GAS emits (F6 /0 disp16/32 + reloc).
++                let mem = MemoryOperand {
++                    segment: None,
++                    displacement: Displacement::Symbol(label.clone()),
++                    base: None, index: None, scale: None,
++                    mask: None, zeroing: false,
 +                };
-                 self.emit(Instruction::Alloca {
-                     dest: result_alloca,
-                     ty: IrType::Ptr,
-                     size: width,
--                    align: 0,
-+                    align,
-                     volatile: false,
-                     semantic_volatile: false,
-                 });
-diff --git a/tests/regression/builtin_cpu_supports_raptor.c b/tests/regression/builtin_cpu_supports_raptor.c
-new file mode 100644
-index 0000000..c2762ad
---- /dev/null
-+++ b/tests/regression/builtin_cpu_supports_raptor.c
-@@ -0,0 +1,14 @@
-+/* Compile-time __builtin_cpu_supports must match Raptor Lake / x86-64-v3. */
-+int main(void) {
-+    if (!__builtin_cpu_supports("sse2")) return 1;
-+    if (!__builtin_cpu_supports("avx2")) return 2;
-+    if (!__builtin_cpu_supports("bmi2")) return 3;
-+    if (!__builtin_cpu_supports("fma"))  return 4;
-+    if (!__builtin_cpu_supports("aes"))  return 5;
-+    if (__builtin_cpu_supports("avx512f")) return 6;
-+    if (__builtin_cpu_supports("avx512bw")) return 7;
-+    if (__builtin_cpu_supports("amx-tile")) return 8;
-+    if (__builtin_cpu_supports("sse4a")) return 9;
-+    if (__builtin_cpu_supports("xop")) return 10;
-+    return 0;
-+}
-diff --git a/tests/regression/builtin_object_size_string.c b/tests/regression/builtin_object_size_string.c
-new file mode 100644
-index 0000000..d8902ff
---- /dev/null
-+++ b/tests/regression/builtin_object_size_string.c
-@@ -0,0 +1,17 @@
-+/* Verify __builtin_object_size folds string literals (fortify high-ROI path). */
-+#include <stddef.h>
++                self.encode_test(&[Operand::Immediate(imm.clone()), Operand::Memory(mem)], mnemonic)
++            }
+             _ => Err("unsupported test operands".to_string()),
+         }
+     }
+diff --git a/src/backend/i686/assembler/encoder/mod.rs b/src/backend/i686/assembler/encoder/mod.rs
+index 0fc92750..9a2c2f84 100644
+--- a/src/backend/i686/assembler/encoder/mod.rs
++++ b/src/backend/i686/assembler/encoder/mod.rs
+@@ -235,7 +235,10 @@ impl InstructionEncoder {
+             | "cmovo" | "cmovno" | "cmovc" | "cmovnc" => self.encode_cmovcc(ops, mnemonic),
+ 
+             // Jumps
+-            "jmp" => self.encode_jmp(ops),
++            // `jmpl` is the explicit 32-bit-operand spelling; in 32-bit
++            // mode it is the SAME encoding as `jmp` (pmjump.S: `jmpl *%eax`
++            // = ff e0). GAS accepts both spellings interchangeably here.
++            "jmp" | "jmpl" => self.encode_jmp(ops),
+             "je" | "jz" | "jne" | "jnz" | "jl" | "jle" | "jg" | "jge"
+             | "jb" | "jbe" | "ja" | "jae" | "js" | "jns" | "jo" | "jno" | "jp" | "jnp"
+             | "jc" | "jnc" => {
+@@ -384,6 +387,13 @@ impl InstructionEncoder {
+             "verw" => self.encode_verw(ops),
+             "lsl" => self.encode_lsl(ops),
+             "sgdt" | "sgdtl" | "sidt" | "sidtl" | "lgdt" | "lgdtl" | "lidt" | "lidtl" => self.encode_system_table(ops, mnemonic),
++            // 0F 00 /r group: descriptor-table register loads/stores with an
++            // r/m16 operand. head_64.S runs `lldt %ax` / `ltr %ax` in its
++            // .code32 startup path (clearing LDT, loading the boot TSS).
++            "sldt" => self.encode_system_reg16(ops, 0),
++            "lldt" => self.encode_system_reg16(ops, 2),
++            "ltr" => self.encode_system_reg16(ops, 3),
++            "str" if ops.len() == 1 && matches!(&ops[0], Operand::Register(_)) => self.encode_system_reg16(ops, 1),
+             "lmsw" => self.encode_lmsw(ops),
+             "smsw" => self.encode_smsw(ops),
+ 
+diff --git a/src/backend/i686/assembler/encoder/system.rs b/src/backend/i686/assembler/encoder/system.rs
+index d891b5cc..da36fdbc 100644
+--- a/src/backend/i686/assembler/encoder/system.rs
++++ b/src/backend/i686/assembler/encoder/system.rs
+@@ -167,6 +167,25 @@ impl super::InstructionEncoder {
+     }
+ 
+     /// Encode SGDT/SIDT/LGDT/LIDT: 0F 01 /N (memory operand)
++    /// 0F 00 /r group (sldt/lldt/ltr/str): register form only, r/m16.
++    /// GAS encodes `lldt %ax` as `0f 00 d0` — no operand-size prefix; the
++    /// operand is architecturally 16-bit regardless of spelling.
++    pub(super) fn encode_system_reg16(&mut self, ops: &[Operand], reg_ext: u8) -> Result<(), String> {
++        if ops.len() != 1 {
++            return Err("system segment instruction requires 1 operand".to_string());
++        }
++        match &ops[0] {
++            Operand::Register(reg) => {
++                let rm = reg_num(&reg.name)
++                    .ok_or_else(|| format!("bad register for system segment instruction: {}", reg.name))?;
++                self.bytes.extend_from_slice(&[0x0F, 0x00]);
++                self.bytes.push(self.modrm(3, reg_ext, rm));
++                Ok(())
++            }
++            _ => Err("system segment instruction requires a register operand".to_string()),
++        }
++    }
 +
-+int main(void) {
-+    if (__builtin_object_size("hello", 0) != 6) return 1;
-+    if (__builtin_object_size("hello", 1) != 6) return 2;
-+    if (__builtin_object_size("hello", 2) != 6) return 3;
-+    if (__builtin_object_size("hello", 3) != 6) return 4;
-+    if (__builtin_object_size("", 0) != 1) return 5;
-+    if (__builtin_object_size("x", 0) != 2) return 6;
-+    if (__builtin_object_size("abcdef", 0) != (long)sizeof("abcdef")) return 7;
+     pub(super) fn encode_system_table(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
+         if ops.len() != 1 {
+             return Err(format!("{} requires 1 operand", mnemonic));
+diff --git a/src/backend/x86/assembler/encoder/core.rs b/src/backend/x86/assembler/encoder/core.rs
+index 41998704..5d71665f 100644
+--- a/src/backend/x86/assembler/encoder/core.rs
++++ b/src/backend/x86/assembler/encoder/core.rs
+@@ -199,6 +199,11 @@ impl super::InstructionEncoder {
+                     Displacement::Integer(val) => {
+                         self.bytes.extend_from_slice(&(*val as i32).to_le_bytes());
+                     }
++                    Displacement::SymbolDiff(a, b)
++                    | Displacement::SymbolDiffAddend(a, b, _) => {
++                        return Err(format!(
++                            "symbol-difference displacement `{} - {}` is not valid with RIP-relative addressing", a, b));
++                    }
+                     Displacement::None => {
+                         self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                     }
+@@ -210,6 +215,7 @@ impl super::InstructionEncoder {
+         // Handle symbol displacements that need relocations.
+         // We defer emitting the relocation until after the ModR/M and SIB bytes
+         // so the relocation offset correctly points to the displacement bytes.
++        let mut diff_sym: Option<String> = None;
+         let (disp_val, has_symbol, deferred_reloc) = match &mem.displacement {
+             Displacement::None => (0i64, false, None),
+             Displacement::Integer(v) => (*v, false, None),
+@@ -222,6 +228,17 @@ impl super::InstructionEncoder {
+             Displacement::SymbolPlusOffset(sym, offset) => {
+                 (0i64, true, Some((sym.clone(), R_X86_64_32S, *offset)))
+             }
++            Displacement::SymbolDiff(sym, diff) => {
++                // head_64.S rva(): `((gdt) - startup_32)(%ebp)`. Recorded as
++                // a diff relocation; same-section pairs fold to a constant
++                // after layout, so no reloc reaches the object file.
++                diff_sym = Some(diff.clone());
++                (0i64, true, Some((sym.clone(), R_X86_64_32, 0i64)))
++            }
++            Displacement::SymbolDiffAddend(sym, diff, addend) => {
++                diff_sym = Some(diff.clone());
++                (0i64, true, Some((sym.clone(), R_X86_64_32, *addend)))
++            }
+             Displacement::SymbolMod(sym, modifier) => {
+                 let reloc_type = match modifier.to_ascii_lowercase().as_str() {
+                     "tpoff" => R_X86_64_TPOFF32,
+@@ -239,7 +256,10 @@ impl super::InstructionEncoder {
+             self.bytes.push(self.modrm(0, reg_field, 4));
+             self.bytes.push(self.sib(1, 4, 5)); // index=100 (none), base=101 (disp32)
+             if let Some((sym, reloc_type, addend)) = deferred_reloc {
+-                self.add_relocation(&sym, reloc_type, addend);
++                match &diff_sym {
++                    Some(d) => self.add_diff_relocation(&sym, d, reloc_type, addend),
++                    None => self.add_relocation(&sym, reloc_type, addend),
++                }
+             }
+             self.bytes.extend_from_slice(&(disp_val as i32).to_le_bytes());
+             return Ok(());
+@@ -275,14 +295,20 @@ impl super::InstructionEncoder {
+                 self.bytes.push(self.modrm(0, reg_field, 4));
+                 self.bytes.push(self.sib(scale, idx_num, 5));
+                 if let Some((sym, reloc_type, addend)) = deferred_reloc {
+-                    self.add_relocation(&sym, reloc_type, addend);
++                    match &diff_sym {
++                        Some(d) => self.add_diff_relocation(&sym, d, reloc_type, addend),
++                        None => self.add_relocation(&sym, reloc_type, addend),
++                    }
+                 }
+                 self.bytes.extend_from_slice(&(disp_val as i32).to_le_bytes());
+             } else {
+                 self.bytes.push(self.modrm(mod_bits, reg_field, 4));
+                 self.bytes.push(self.sib(scale, idx_num, base_num));
+                 if let Some((sym, reloc_type, addend)) = deferred_reloc {
+-                    self.add_relocation(&sym, reloc_type, addend);
++                    match &diff_sym {
++                        Some(d) => self.add_diff_relocation(&sym, d, reloc_type, addend),
++                        None => self.add_relocation(&sym, reloc_type, addend),
++                    }
+                 }
+                 match disp_size {
+                     0 => {}
+@@ -294,7 +320,10 @@ impl super::InstructionEncoder {
+         } else {
+             self.bytes.push(self.modrm(mod_bits, reg_field, base_num));
+             if let Some((sym, reloc_type, addend)) = deferred_reloc {
+-                self.add_relocation(&sym, reloc_type, addend);
++                match &diff_sym {
++                    Some(d) => self.add_diff_relocation(&sym, d, reloc_type, addend),
++                    None => self.add_relocation(&sym, reloc_type, addend),
++                }
+             }
+             match disp_size {
+                 0 => {}
+diff --git a/src/backend/x86/assembler/encoder/gp_integer.rs b/src/backend/x86/assembler/encoder/gp_integer.rs
+index f42a6ad4..64460fbe 100644
+--- a/src/backend/x86/assembler/encoder/gp_integer.rs
++++ b/src/backend/x86/assembler/encoder/gp_integer.rs
+@@ -182,7 +182,29 @@ impl super::InstructionEncoder {
+                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                 }
+             }
+-            ImmediateValue::SymbolMod(_, _) | ImmediateValue::SymbolDiff(_, _) => {
++            ImmediateValue::SymbolDiff(sym_a, sym_b) => {
++                // head_64.S (compressed boot): `movl $(_bss - startup_32),
++                // %ecx` — a label difference as a mov immediate. Both labels
++                // live in the SAME object (startup_32 in the .code32 part,
++                // _bss at the end), so the difference folds to a constant
++                // after layout via the diff-reloc path. GAS emits
++                // `b9 <imm32>` with the folded value; the 8-byte movabs
++                // form never appears for these (kernel-image offsets are
++                // far below 4 GiB).
++                if size == 4 {
++                    let b = needs_rex_ext(&dst.name);
++                    if b {
++                        self.bytes.push(self.rex(false, false, false, true));
++                    }
++                    self.bytes.push(0xB8 + (dst_num & 7));
++                    self.add_diff_relocation(sym_a, sym_b, R_X86_64_32, 0);
++                    self.bytes.extend_from_slice(&[0, 0, 0, 0]);
++                } else {
++                    return Err(format!(
++                        "symbol-difference mov immediate only supported at 32-bit width (got size {})", size));
++                }
++            }
++            ImmediateValue::SymbolMod(_, _) => {
+                 Err("unsupported immediate type for mov".to_string())?
+             }
+         }
+diff --git a/src/backend/x86/assembler/parser.rs b/src/backend/x86/assembler/parser.rs
+index b4cc33e5..905f9cbe 100644
+--- a/src/backend/x86/assembler/parser.rs
++++ b/src/backend/x86/assembler/parser.rs
+@@ -263,6 +263,13 @@ pub enum Displacement {
+     SymbolMod(String, String),
+     /// Symbol plus integer offset: symbol+N or symbol-N
+     SymbolPlusOffset(String, i64),
++    /// Symbol difference: `rva(gdt)(%ebp)` in the compressed-boot head_64.S
++    /// expands to `((gdt) - startup_32)(%ebp)` — a label difference as a
++    /// displacement. Same-section pairs fold to a constant after layout.
++    SymbolDiff(String, String),
++    /// Symbol difference with a constant addend on the minuend:
++    /// `rva(pgtable + 0)` -> `((pgtable + 0) - startup_32)`.
++    SymbolDiffAddend(String, String, i64),
+ }
+ 
+ /// Comment style for x86 AT&T GAS: `#` only.
+@@ -310,7 +317,13 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
+             for _ in 0..count {
+                 result.extend(expanded_body.iter().cloned());
+             }
+-        } else if trimmed.starts_with(".irp ") || trimmed.starts_with(".irp\t") {
++        } else if trimmed.starts_with(".irp ") || trimmed.starts_with(".irp\t")
++            || trimmed.starts_with(".irpc ") || trimmed.starts_with(".irpc\t") {
++            // .irpc must be tracked exactly like .irp here: this pre-pass
++            // only expands .rept, and treating .irpc's .endr as a stray
++            // DELETED it, so the later .irpc expansion ran off the end of
++            // the block (efi-mixed.S page-table unroll emitted a stray
++            // `ret` per iteration).
+             irp_depth += 1;
+             result.push(lines[i].to_string());
+         } else if trimmed == ".endr" {
+@@ -1308,9 +1321,11 @@ fn parse_immediate_label_diff(s: &str) -> Option<ImmediateValue> {
+             // carries spaces around the minus; without trimming the strings
+             // failed is_label_like and the WHOLE expression fell through to a
+             // plain symbol named "identity_mapped - 0b", which the linker
+-            // reported as an undefined reference.
+-            let lhs = s[..i].trim();
+-            let rhs = s[i + 1..].trim();
++            // reported as an undefined reference. Also strip grouping parens:
++            // head_64.S's rva() macro expands `$ rva(1b)` to `$((1b) -
++            // startup_32)` — the inner label arrives as `(1b)`.
++            let lhs = strip_sym_parens(s[..i].trim());
++            let rhs = strip_sym_parens(s[i + 1..].trim());
+             if !lhs.is_empty() && !rhs.is_empty()
+                 && is_label_like(lhs) && is_label_like(rhs)
+             {
+@@ -1527,6 +1542,28 @@ fn parse_displacement(s: &str) -> Result<Displacement, String> {
+         return Ok(offset_disp);
+     }
+ 
++    // Symbol difference: `(gdt) - startup_32` (head_64.S rva() macro as a
++    // displacement). Either side may be paren-wrapped or a numeric label,
++    // and the LHS may carry a constant addend: `rva(pgtable + 0)` expands
++    // to `((pgtable + 0) - startup_32)`. Scan minus positions left to
++    // right; at each, try to interpret LHS as `sym [+ const-chain]`.
++    for (i, c) in s.char_indices().skip(1) {
++        if c == '-' {
++            let lhs_raw = strip_sym_parens(s[..i].trim());
++            let rhs = strip_sym_parens(s[i + 1..].trim());
++            if lhs_raw.is_empty() || rhs.is_empty() || !is_label_like(rhs) {
++                continue;
++            }
++            if is_label_like(lhs_raw) {
++                return Ok(Displacement::SymbolDiff(lhs_raw.to_string(), rhs.to_string()));
++            }
++            // LHS with folded constant tail: `pgtable + 0`, `sym + (1<<4) - 8`.
++            if let Some(DataValue::SymbolOffset(sym, add)) = parse_symbol_expr_chain(lhs_raw) {
++                return Ok(Displacement::SymbolDiffAddend(sym, rhs.to_string(), add));
++            }
++        }
++    }
 +
-+    char *p = (char *)0;
-+    if (__builtin_object_size(p, 0) != (size_t)-1) return 9;
-+    if (__builtin_object_size(p, 2) != 0) return 10;
-+    return 0;
-+}
-diff --git a/tests/regression/builtin_trap_unreachable.c b/tests/regression/builtin_trap_unreachable.c
-new file mode 100644
-index 0000000..3337c68
---- /dev/null
-+++ b/tests/regression/builtin_trap_unreachable.c
-@@ -0,0 +1,6 @@
-+/* trap/unreachable must not depend on libc abort(); compile+run smoke. */
-+int main(void) {
-+    if (0) { __builtin_trap(); }
-+    if (0) { __builtin_unreachable(); }
-+    return 0;
-+}
+     // Plain symbol
+     Ok(Displacement::Symbol(s.to_string()))
+ }
+@@ -2445,6 +2482,51 @@ fn expand_gas_macros_with_state(
+             }
+         }
+ 
++        // .irpc var, string  /  .endr -- GAS character iteration: the body
++        // expands once per CHARACTER of the string. efi-mixed.S uses
++        // `.irpc l, 0123` to unroll four page-table-entry stores with
++        // `\l * 8(%eax)` displacements; without this the raw `\l` leaked
++        // into the object as a relocation symbol named "\l * 8".
++        if trimmed.starts_with(".irpc ") || trimmed.starts_with(".irpc\t") {
++            let rest = trimmed[".irpc".len()..].trim();
++            let comma = rest.find(',').ok_or(".irpc: missing comma after variable")?;
++            let var = rest[..comma].trim().to_string();
++            let chars_str = rest[comma + 1..].trim();
++            // GAS allows the string to be quoted; strip one layer.
++            let chars_str = chars_str.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(chars_str);
++            let mut body = Vec::new();
++            let mut depth = 1;
++            i += 1;
++            while i < lines.len() {
++                let inner = strip_comment(&lines[i]).trim().to_string();
++                if inner.starts_with(".irp ") || inner.starts_with(".irp\t")
++                    || inner.starts_with(".irpc ") || inner.starts_with(".irpc\t")
++                    || inner.starts_with(".rept ") || inner.starts_with(".rept\t") {
++                    depth += 1;
++                } else if inner == ".endr" {
++                    depth -= 1;
++                    if depth == 0 {
++                        break;
++                    }
++                }
++                body.push(lines[i].clone());
++                i += 1;
++            }
++            let mut all_expanded = Vec::new();
++            for ch in chars_str.chars() {
++                let item = ch.to_string();
++                for bline in &body {
++                    let mut expanded = asm_preprocess::replace_macro_param(bline, &format!("\\{}", var), &item);
++                    expanded = expanded.replace("\\()", "");
++                    all_expanded.push(expanded);
++                }
++            }
++            let processed = expand_gas_macros_with_state(&all_expanded, macros, symbols)?;
++            result.extend(processed);
++            i += 1;
++            continue;
++        }
++
+         // .irp var, item1, item2, ...  /  .endr
+         if trimmed.starts_with(".irp ") || trimmed.starts_with(".irp\t") {
+             let rest = trimmed[".irp".len()..].trim();
+-- 
+2.47.3
+
