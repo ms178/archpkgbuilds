@@ -1,775 +1,443 @@
-From 592a34da1d43a40d4661a8084101825a6d8ec19a Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sun, 16 Aug 2026 22:16:11 +0000
-Subject: [PATCH] Repair PR#82 merge, re-land missing kernel-boot fixes,
- complete .code16 branch encoding
-
-AUDIT of PR#82 (.code16 encoding, merged as 9944a63e) vs. my parallel
-implementation, empirically byte-diffed against GAS:
-
-VERDICT - PR#82's architecture is BETTER on two points, which I keep:
- 1. Central prefix inversion (fixup_code16_prefixes + sized_op) instead
-    of my per-site opsize_prefix(size) rewrite of 43 emit sites. One
-    place owns mode knowledge; single-encoding instructions (ret/nop/
-    cli/int) cannot accidentally gain a 66 because only encoders that
-    made a real width choice set sized_op.
- 2. encode_abs_addr_modrm unifying eleven bare-label absolute-address
-    sites (vs. my label_as_abs_mem + encode_modrm_mem detour).
-
-But the MERGED state was broken and incomplete; this commit fixes:
-
- a) encode_abs_addr_modrm was CALLED 11x but never DEFINED - main did
-    not compile (E0599 x11). Implemented in core.rs: 32-bit mode =
-    rm=101 + disp32 + R_386_32; .code16 = rm=110 + disp16 + R_386_16.
- b) encode_modrm_mem had NO .code16 path: `testb $0x80, sym` through a
-    Memory operand emitted 32-bit ModR/M + disp32 inside real-mode code
-    (silent wrong bytes vs GAS `f6 06 <d16>`). Added the 16-bit table
-    (bx/bp/si/di combos, %bp disp8 special case), disp16 absolutes with
-    R_386_16, pending_addr32 for 32-bit register bases.
- c) mov $imm32/$sym32, %reg never set sized_op: `movl $0x12345678,%eax`
-    in .code16 lost its 66 prefix and decoded as mov $imm16 + stray
-    bytes (silent wrong code). Both Integer and Symbol arms marked.
- d) Branches: call/jmp/Jcc in .code16 now emit E8/E9/0F8x rel16 with
-    R_386_PC16 (addend -2); `calll` keeps the 66-prefixed rel32+PC32
-    form (wakeup_asm.S forces 4-byte return addresses with it). New
-    writer hook reloc_pc16() folds same-section locals to constants
-    (GAS emits no reloc there); reloc_patch_size() gives 16-bit reloc
-    types 2-byte patch slots so a 4-byte write cannot clobber the
-    following field.
- e) pushfl/popfl/pushal/popal ('l' = genuine 32-bit form) and
-    ret/retl/lretw width-by-suffix in .code16; ljmpl = 66 EA imm32
-    seg16 vs ljmp/ljmpw = EA imm16 seg16 (la57/wakeup trampolines).
-
-RE-LANDED fixes that PR#82 did not include (all previously proven,
-lost in the reset):
- f) Absolute .set constants: `.set section_count, (. - section_table)
-    / 40` (header.S PE metadata) evaluates with `.`-position and
-    forward label refs; relocs against such names patch constants.
-    Bare-symbol targets stay aliases (asm_label_alias guard).
- g) Cross-section `.byte a - b` emits R_*_PC8 with A = addend +
-    byte_off - b_off (header.S `.byte start_of_setup-1f` short jump);
-    identical reloc to GAS (bd16.s: .other - 1 PC8).
- h) Pure-constant data expressions probe before the " - " diff split
-    (.quad ((0x1000000)+(0x200000-1)) & ~(0x200000-1) = pref_address).
- i) pushw $sym = 68 imm16 + R_386_16 in .code16 (header.S pushw $6f).
-
-Documented deviations (size-optimal forms GAS picks that lccc does
-not replicate; semantically identical, byte-larger):
- - GAS relaxes same-section short branches to rel8 (74 fe); lccc emits
-   fixed rel16 (0f 84 fc ff) - always in range for real-mode blobs.
- - GAS uses the A1/A3 moffs shortform for mov abs,%eax; lccc emits the
-   generic 8B/89 ModR/M form (1 byte larger).
-
-PROOF: c16full.s probe (60+ instruction shapes incl. branches, far
-jumps, prefixes, 16-bit ModR/M, relocs) - remaining GAS diff is
-exactly the two documented deviations. st16.s/bd16.s/qx.s/pw.s
-byte- or reloc-identical to GAS.
-
-Validation: 685 lib / 192 regression / 50 correctness / 3 intrinsics /
-86 linker green; asm-diff ALL RAW .text BYTES EXACT.
----
- src/backend/elf_writer_common.rs              | 185 +++++++++++++++++-
- src/backend/i686/assembler/elf_writer.rs      |   9 +
- src/backend/i686/assembler/encoder/core.rs    |  94 +++++++++
- .../i686/assembler/encoder/gp_integer.rs      |  93 ++++++++-
- src/backend/i686/assembler/encoder/mod.rs     |  55 +++++-
- src/backend/x86/assembler/elf_writer.rs       |   1 +
- src/backend/x86/assembler/parser.rs           |  11 ++
- 7 files changed, 430 insertions(+), 18 deletions(-)
-
-diff --git a/src/backend/elf_writer_common.rs b/src/backend/elf_writer_common.rs
-index 525fd3e3..91d3a04a 100644
---- a/src/backend/elf_writer_common.rs
-+++ b/src/backend/elf_writer_common.rs
-@@ -76,6 +76,15 @@ pub trait X86Arch {
-     /// Optional: PC8 internal relocation type for loop/jrcxz instructions.
-     /// Only x86-64 has this; i686 returns None.
-     fn reloc_pc8_internal() -> Option<u32> { None }
-+    /// 16-bit PC-relative type (R_386_PC16 / R_X86_64_PC16) for rel16
-+    /// branch fields in real-mode (.code16) code. None = never emitted.
-+    fn reloc_pc16() -> Option<u32> { None }
-+    /// Real 8-bit PC-relative ELF type (R_X86_64_PC8=15 / R_386_PC8=23) for
-+    /// cross-section `.byte a - b` (header.S short-jump displacement).
-+    fn reloc_pc8() -> Option<u32> { None }
-+    /// Patch width for a relocation type: 16-bit reloc types own 2-byte
-+    /// fields; writing 4 bytes would clobber the neighbors.
-+    fn reloc_patch_size(_reloc_type: u32) -> u8 { 4 }
- 
-     /// Optional: absolute 32-bit relocation for local symbol references.
-     /// Only x86-64 uses R_X86_64_32 this way; i686 returns None since
-@@ -460,6 +469,16 @@ pub struct ElfWriterCore<A: X86Arch> {
-     pending_protected: Vec<String>,
-     pending_internal: Vec<String>,
-     aliases: FxHashMap<String, String>,
-+    /// `.set NAME, expr` where expr evaluates to a CONSTANT (possibly using
-+    /// `.` and same-section labels, e.g. header.S
-+    /// `.set section_count, (. - section_table) / 40`). Relocations against
-+    /// these names patch the constant value directly -- GAS gives such
-+    /// symbols an absolute value; they never become undefined references.
-+    set_values: FxHashMap<String, i64>,
-+    /// Position-dependent `.set` expressions with forward label refs:
-+    /// (alias, expr with `.` already substituted, sec_idx). Re-evaluated
-+    /// after all labels are placed.
-+    pending_set_exprs: Vec<(String, String, usize)>,
-     /// `.symver real, name@VER` where `real` is NOT defined in this object:
-     /// GNU-as semantics — every reference to `real` becomes a versioned
-     /// reference `name@VER` (glibc compat_symbol_reference; needed because
-@@ -506,6 +525,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
-             pending_protected: Vec::new(),
-             pending_internal: Vec::new(),
-             aliases: FxHashMap::default(),
-+            set_values: FxHashMap::default(),
-+            pending_set_exprs: Vec::new(),
-             symver_refs: FxHashMap::default(),
-             section_stack: Vec::new(),
-             deferred_skips: Vec::new(),
-@@ -796,7 +817,31 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                 self.symbol_map.insert(name.clone(), sym_idx);
-             }
-             AsmItem::Set(alias, target) => {
--                self.aliases.insert(alias.clone(), target.clone());
-+                // ONLY expressions with actual arithmetic are folded to
-+                // constants; a bare symbol target (`.set foo_alias, bar_fn`,
-+                // the alias-attribute lowering) must stay a symbolic alias —
-+                // folding it to a section offset redirects calls to an
-+                // absolute address (asm_label_alias regression, SIGSEGV).
-+                let is_arithmetic = target.contains(|c: char| matches!(c, '+' | '-' | '*' | '/' | '&' | '|' | '^' | '~' | '(' | '<' | '>'));
-+                if is_arithmetic {
-+                    if let Some((sec_idx, substituted)) = self.substitute_dot(target) {
-+                        match self.eval_label_expr(&substituted, sec_idx) {
-+                            Some(val) => { self.set_values.insert(alias.clone(), val); }
-+                            None => {
-+                                // Forward label refs: retry after layout.
-+                                self.pending_set_exprs.push((alias.clone(), substituted, sec_idx));
-+                                self.aliases.insert(alias.clone(), target.clone());
-+                            }
-+                        }
-+                    } else {
-+                        self.aliases.insert(alias.clone(), target.clone());
-+                    }
-+                } else if let Ok(val) = crate::backend::asm_expr::parse_integer_expr(target) {
-+                    // Pure integer constant (`.set salign, 0x1000`).
-+                    self.set_values.insert(alias.clone(), val);
-+                } else {
-+                    self.aliases.insert(alias.clone(), target.clone());
-+                }
-             }
-             AsmItem::Symver(name, ver_string) => {
-                 // GNU as semantics (verified against binutils 2.47):
-@@ -1248,7 +1293,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                 reloc_type: reloc.reloc_type,
-                 addend: reloc.addend,
-                 diff_symbol: reloc.diff_symbol,
--                patch_size: 4,
-+                patch_size: A::reloc_patch_size(reloc.reloc_type),
-             });
-         }
- 
-@@ -1467,6 +1512,26 @@ impl<A: X86Arch> ElfWriterCore<A> {
-             let (pos_a, pos_b) = (&pos_a, &pos_b);
- 
-             if pos_a.0 != pos_b.0 {
-+                // Cross-section byte diff (header.S: `.byte start_of_setup-1f`,
-+                // start_of_setup in .entrytext, 1f in .header). GAS emits a
-+                // PC8 relocation: S + A - P with P = the byte's own offset,
-+                // so A = addend + byte_off - b_off computes a - b when the
-+                // subtrahend is in the byte's OWN section (its distance to
-+                // the byte is a link-time constant).
-+                if *size == 1 && pos_b.0 == *sec_idx {
-+                    if let Some(pc8) = A::reloc_pc8() {
-+                        let addend = *addend + (*offset as i64) - (pos_b.1 as i64);
-+                        self.sections[*sec_idx].relocations.push(ElfRelocation {
-+                            offset: *offset as u64,
-+                            symbol: sym_a.clone(),
-+                            reloc_type: pc8,
-+                            addend,
-+                            diff_symbol: None,
-+                            patch_size: 1,
-+                        });
-+                        continue;
-+                    }
-+                }
-                 return Err(format!("cross-section .byte diff: {} - {}", sym_a, sym_b));
-             }
- 
-@@ -1800,6 +1865,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
-         // Scaled symbol differences: same reasoning.
-         self.resolve_scaled_diffs()?;
- 
-+        // Absolute .set constants (incl. forward `.`-position expressions)
-+        // fold before internal relocation resolution: relocs against them
-+        // patch constants and never reach the symbol table.
-+        self.resolve_set_constants();
-+
-         // Resolve internal relocations
-         self.resolve_internal_relocations();
- 
-@@ -2477,6 +2547,106 @@ impl<A: X86Arch> ElfWriterCore<A> {
- 
-     // ─── Internal relocation resolution ───────────────────────────────
- 
-+    /// Substitute a standalone `.` (current position) in a .set expression
-+    /// with the current section offset. None when no section is active.
-+    fn substitute_dot(&self, expr: &str) -> Option<(usize, String)> {
-+        let sec_idx = self.current_section?;
-+        let offset = self.sections[sec_idx].data.len() as u64;
-+        let bytes = expr.as_bytes();
-+        let mut out = String::with_capacity(expr.len() + 8);
-+        for (i, &b) in bytes.iter().enumerate() {
-+            if b == b'.' {
-+                let prev_ok = i == 0 || !(bytes[i-1].is_ascii_alphanumeric() || bytes[i-1] == b'_' || bytes[i-1] == b'.');
-+                let next_ok = i + 1 >= bytes.len() || !(bytes[i+1].is_ascii_alphanumeric() || bytes[i+1] == b'_' || bytes[i+1] == b'.');
-+                if prev_ok && next_ok {
-+                    out.push_str(&offset.to_string());
-+                    continue;
-+                }
-+            }
-+            out.push(b as char);
-+        }
-+        Some((sec_idx, out))
-+    }
-+
-+    /// Evaluate an integer expression that may reference SAME-SECTION labels
-+    /// (label -> section offset) and previously-evaluated .set constants.
-+    /// None if any symbol is unknown or cross-section.
-+    fn eval_label_expr(&self, expr: &str, sec_idx: usize) -> Option<i64> {
-+        let bytes = expr.as_bytes();
-+        let mut out = String::with_capacity(expr.len() + 16);
-+        let mut i = 0;
-+        while i < bytes.len() {
-+            let b = bytes[i];
-+            // NUMBER tokens first: `0x100` must not become `0` + ident `x100`.
-+            if b.is_ascii_digit() {
-+                let start = i;
-+                while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
-+                    i += 1;
-+                }
-+                out.push_str(&expr[start..i]);
-+                continue;
-+            }
-+            if b.is_ascii_alphabetic() || b == b'_' || b == b'.' {
-+                let start = i;
-+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.' || bytes[i] == b'$') {
-+                    i += 1;
-+                }
-+                let ident = &expr[start..i];
-+                if let Some(&(lsec, loff)) = self.label_positions.get(ident) {
-+                    if lsec != sec_idx {
-+                        return None;
-+                    }
-+                    out.push_str(&loff.to_string());
-+                } else if let Some(&v) = self.set_values.get(ident) {
-+                    out.push_str(&v.to_string());
-+                } else {
-+                    return None;
-+                }
-+            } else {
-+                out.push(b as char);
-+                i += 1;
-+            }
-+        }
-+        crate::backend::asm_expr::parse_integer_expr(&out).ok()
-+    }
-+
-+    /// Late resolution: pending `.`-position .set expressions, then convert
-+    /// relocations against constant .set names into direct data patches.
-+    fn resolve_set_constants(&mut self) {
-+        let pending = std::mem::take(&mut self.pending_set_exprs);
-+        for (alias, expr, sec_idx) in pending {
-+            if let Some(val) = self.eval_label_expr(&expr, sec_idx) {
-+                self.set_values.insert(alias.clone(), val);
-+                self.aliases.remove(&alias);
-+            }
-+        }
-+        if self.set_values.is_empty() {
-+            return;
-+        }
-+        for sec_idx in 0..self.sections.len() {
-+            let mut remaining = Vec::new();
-+            let relocs = std::mem::take(&mut self.sections[sec_idx].relocations);
-+            for reloc in relocs {
-+                if reloc.diff_symbol.is_none() {
-+                    if let Some(&val) = self.set_values.get(&reloc.symbol) {
-+                        let v = val + reloc.addend;
-+                        let off = reloc.offset as usize;
-+                        let data = &mut self.sections[sec_idx].data;
-+                        match reloc.patch_size {
-+                            1 => { data[off] = v as u8; }
-+                            2 => { data[off..off+2].copy_from_slice(&(v as i16).to_le_bytes()); }
-+                            8 => { data[off..off+8].copy_from_slice(&v.to_le_bytes()); }
-+                            _ => { data[off..off+4].copy_from_slice(&(v as i32).to_le_bytes()); }
-+                        }
-+                        continue;
-+                    }
-+                }
-+                remaining.push(reloc);
-+            }
-+            self.sections[sec_idx].relocations = remaining;
-+        }
-+    }
-+
-     fn resolve_internal_relocations(&mut self) {
-         for sec_idx in 0..self.sections.len() {
-             let mut resolved: Vec<(usize, i64, usize)> = Vec::new(); // (offset, value, patch_size)
-@@ -2532,6 +2702,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                 if let Some((target_sec, target_off)) = label_pos {
-                     let is_local = self.is_local_symbol(&reloc.symbol);
- 
-+                    // Same-section rel16 branches (.code16): patch the
-+                    // 2-byte field directly — GAS never emits a reloc for
-+                    // a local 16-bit branch.
-+                    if let Some(pc16) = A::reloc_pc16() {
-+                        if reloc.reloc_type == pc16 && target_sec == sec_idx && is_local {
-+                            let rel = (target_off as i64) + reloc.addend - (reloc.offset as i64);
-+                            resolved.push((reloc.offset as usize, rel, 2));
-+                            continue;
-+                        }
-+                    }
-+
-                     // Handle PC8 internal relocations (x86-64 loop/jrcxz)
-                     if let Some(pc8_type) = A::reloc_pc8_internal() {
-                         if reloc.reloc_type == pc8_type && target_sec == sec_idx {
-diff --git a/src/backend/i686/assembler/elf_writer.rs b/src/backend/i686/assembler/elf_writer.rs
-index 6876f392..4251a5ec 100644
---- a/src/backend/i686/assembler/elf_writer.rs
-+++ b/src/backend/i686/assembler/elf_writer.rs
-@@ -97,6 +97,15 @@ impl X86Arch for I686Arch {
-     }
-     fn reloc_abs64() -> u32 { R_386_32 } // i686 doesn't have 64-bit relocs
-     fn reloc_pc32() -> u32 { R_386_PC32 }
-+    fn reloc_pc16() -> Option<u32> { Some(R_386_PC16) }
-+    fn reloc_pc8() -> Option<u32> { Some(23) } // R_386_PC8
-+    fn reloc_patch_size(reloc_type: u32) -> u8 {
-+        match reloc_type {
-+            // R_386_16 / R_386_PC16: 2-byte fields (real-mode disp16/rel16).
-+            20 | 21 => 2,
-+            _ => 4,
-+        }
-+    }
-     fn reloc_plt32() -> u32 { R_386_PLT32 }
- 
-     fn uses_rel_format() -> bool { true }
-diff --git a/src/backend/i686/assembler/encoder/core.rs b/src/backend/i686/assembler/encoder/core.rs
-index aa55ad0e..dc0b8558 100644
---- a/src/backend/i686/assembler/encoder/core.rs
-+++ b/src/backend/i686/assembler/encoder/core.rs
-@@ -42,6 +42,41 @@ impl super::InstructionEncoder {
-         }
-     }
- 
-+    /// Absolute-address ModR/M for a bare-label memory operand
-+    /// (`movw heap_end_ptr, %dx`, `lgdtl tr_gdt`, `testb $x, loadflags`).
+diff --git a/src/backend/i686/codegen/emit.rs b/src/backend/i686/codegen/emit.rs
+index b2bde28..ef66d78 100644
+--- a/src/backend/i686/codegen/emit.rs
++++ b/src/backend/i686/codegen/emit.rs
+@@ -55,6 +55,12 @@ pub struct I686Codegen {
+     pub(super) fastcall_stack_cleanup: usize,
+     /// For fastcall functions, how many leading params are passed in registers (0, 1, or 2).
+     pub(super) fastcall_reg_param_count: usize,
++    /// Whether %ebx holds the PIC GOT base for the function being emitted.
 +    ///
-+    /// PR#82 unified eleven emit sites onto this helper but the helper
-+    /// itself was lost in the merge; this is the missing definition.
-+    ///
-+    /// 32-bit mode: mod=00 rm=101 + disp32 + R_386_32 — the classic form.
-+    /// .code16:     mod=00 rm=110 + disp16 + R_386_16 (GAS: `8b 16 <d16>`
-+    /// for `movw sym, %dx`). A 16-bit reloc field also means the addend
-+    /// must fit 16 bits, which holds for all real-mode setup symbols.
-+    pub(super) fn encode_abs_addr_modrm(&mut self, reg_field: u8, label: &str) -> Result<(), String> {
-+        // Numeric literal labels are absolute addresses with no relocation.
-+        if let Ok(addr) = label.parse::<i64>() {
-+            if self.code16 {
-+                self.bytes.push(self.modrm(0, reg_field, 6));
-+                self.bytes.extend_from_slice(&(addr as i16).to_le_bytes());
-+            } else {
-+                self.bytes.push(self.modrm(0, reg_field, 5));
-+                self.bytes.extend_from_slice(&(addr as i32).to_le_bytes());
-+            }
-+            return Ok(());
-+        }
-+        let (sym, addend) = split_label_offset(label);
-+        if self.code16 {
-+            self.bytes.push(self.modrm(0, reg_field, 6)); // rm=110: disp16
-+            self.add_relocation(sym, R_386_16, addend);
-+            self.bytes.extend_from_slice(&[0, 0]);
-+        } else {
-+            self.bytes.push(self.modrm(0, reg_field, 5)); // rm=101: disp32
-+            self.add_relocation(sym, R_386_32, addend);
-+            self.bytes.extend_from_slice(&[0, 0, 0, 0]);
-+        }
-+        Ok(())
++    /// Set per function by `function_needs_got`. When false the GOT setup is
++    /// skipped entirely and %ebx stays a general allocatable register, which
++    /// is what keeps leaf functions small in the 32 KiB kernel setup binary.
++    pub(super) pic_got_live: bool,
+     /// Whether the __x86.get_pc_thunk.bx helper needs to be emitted.
+     pub(super) needs_pc_thunk_bx: bool,
+     /// Number of integer arguments to pass in registers (-mregparm=N).
+@@ -126,6 +132,7 @@ impl I686Codegen {
+             is_fastcall: false,
+             fastcall_stack_cleanup: 0,
+             fastcall_reg_param_count: 0,
++            pic_got_live: false,
+             needs_pc_thunk_bx: false,
+             regparm: 0,
+             omit_frame_pointer: false,
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index efb5c69..244ca74 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -1103,25 +1103,266 @@ fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+ // ── Pass: Dead register move elimination ─────────────────────────────────────
+ 
+ /// Remove register moves where the destination is overwritten before being read.
++/// Substitute `old_reg` -> `new_reg` in the SOURCE operands of an AT&T
++/// instruction, leaving the destination untouched.
++///
++/// AT&T puts the destination LAST (`orl %ecx, %eax` writes %eax), which is the
++/// opposite of Intel syntax. `peephole_common::replace_source_reg_in_instruction`
++/// rewrites everything after the first comma -- correct for Intel, and exactly
++/// wrong here: it rewrote the destination and turned `orl %ecx,%eax` into
++/// `orl %ecx,%edi`, silently computing into the wrong register.
++///
++/// Rules implemented:
++///   * 2+ operands: every operand EXCEPT the last is a source.
++///   * 1 operand: it is read-modify-write (`incl %eax`, `negl %eax`) or a
++///     jump/call target -- never a pure source, so nothing is rewritten.
++///   * Memory operands among the sources are rewritten too: the registers in
++///     `disp(%base,%index,scale)` are read, not written.
++///   * A destination that is a MEMORY operand (`movl %eax, (%ebx)`) still
++///     only reads %ebx, so its registers may be substituted as well.
++fn replace_att_source_reg(line: &str, old_reg: &str, new_reg: &str) -> Option<String> {
++    use crate::backend::peephole_common::{has_whole_word, replace_whole_word};
++
++    let leading = line.len() - line.trim_start().len();
++    let (ws, body) = line.split_at(leading);
++    let body = body.trim_end();
++    if body.is_empty() {
++        return None;
++    }
++    // Split mnemonic from operand list.
++    let sp = body.find(|c: char| c.is_whitespace())?;
++    let (mnemonic, rest) = body.split_at(sp);
++    let operands = rest.trim_start();
++    if operands.is_empty() {
++        return None;
 +    }
 +
-     pub(super) fn encode_modrm_mem(&mut self, reg_field: u8, mem: &MemoryOperand) -> Result<(), String> {
-         let base = mem.base.as_ref();
-         let index = mem.index.as_ref();
-@@ -78,6 +113,65 @@ impl super::InstructionEncoder {
-             }
-         };
- 
-+        // ── .code16: 16-bit ModR/M table ─────────────────────────────
-+        // Real mode defaults to 16-bit addressing: absolute operands use
-+        // mod=00 rm=110 + disp16 (+ R_386_16 for symbols); the classic
-+        // register bases (%bx/%bp/%si/%di) use the 16-bit table; 32-bit
-+        // register bases fall back to the 32-bit table below with a 0x67
-+        // override requested via pending_addr32 (GAS order 67-before-66 is
-+        // restored by fixup_code16_prefixes).
-+        if self.code16 {
-+            if base.is_none() && index.is_none() {
-+                self.bytes.push(self.modrm(0, reg_field, 6)); // rm=110: disp16
-+                if let Some((sym, _rt, addend)) = pending_reloc {
-+                    if diff_sym.is_some() {
-+                        return Err(format!(
-+                            "symbol-difference displacement in .code16 absolute operand: {}", sym));
-+                    }
-+                    self.add_relocation(&sym, R_386_16, addend);
-+                }
-+                self.bytes.extend_from_slice(&(disp_val as i16).to_le_bytes());
-+                return Ok(());
-+            }
-+            let is_16bit_base = matches!(
-+                (base.map(|r| r.name.as_str()), index.map(|r| r.name.as_str())),
-+                (Some("bx"), Some("si")) | (Some("bx"), Some("di"))
-+                | (Some("bp"), Some("si")) | (Some("bp"), Some("di"))
-+                | (Some("si"), None) | (Some("di"), None)
-+                | (Some("bp"), None) | (Some("bx"), None)
-+            );
-+            if is_16bit_base {
-+                let rm = match (base.map(|r| r.name.as_str()), index.map(|r| r.name.as_str())) {
-+                    (Some("bx"), Some("si")) => 0u8,
-+                    (Some("bx"), Some("di")) => 1,
-+                    (Some("bp"), Some("si")) => 2,
-+                    (Some("bp"), Some("di")) => 3,
-+                    (Some("si"), None) => 4,
-+                    (Some("di"), None) => 5,
-+                    (Some("bp"), None) => 6,
-+                    (Some("bx"), None) => 7,
-+                    _ => unreachable!(),
-+                };
-+                if has_symbol {
-+                    return Err("symbolic displacement with 16-bit register base is unsupported".to_string());
-+                }
-+                // %bp at mod=00 rm=110 means ABSOLUTE; it needs at least disp8.
-+                if disp_val == 0 && rm != 6 {
-+                    self.bytes.push(self.modrm(0, reg_field, rm));
-+                } else if (-128..=127).contains(&disp_val) {
-+                    self.bytes.push(self.modrm(1, reg_field, rm));
-+                    self.bytes.push(disp_val as u8);
-+                } else {
-+                    self.bytes.push(self.modrm(2, reg_field, rm));
-+                    self.bytes.extend_from_slice(&(disp_val as i16).to_le_bytes());
-+                }
-+                return Ok(());
-+            }
-+            // 32-bit register base inside .code16: request the 0x67 prefix
-+            // and use the normal 32-bit encoding below.
-+            self.pending_addr32 = true;
++    // Split the operand list on TOP-LEVEL commas: a memory operand contains
++    // commas of its own (`4(%eax,%ebx,2)`).
++    let mut parts: Vec<String> = Vec::new();
++    let mut depth = 0i32;
++    let mut cur = String::new();
++    for ch in operands.chars() {
++        match ch {
++            '(' => { depth += 1; cur.push(ch); }
++            ')' => { depth -= 1; cur.push(ch); }
++            ',' if depth == 0 => parts.push(std::mem::take(&mut cur)),
++            _ => cur.push(ch),
 +        }
++    }
++    parts.push(cur);
 +
-         // No base register - need SIB with no-base encoding or direct displacement
-         if base.is_none() && index.is_none() {
-             // Direct memory reference - mod=00, rm=101 (disp32)
-diff --git a/src/backend/i686/assembler/encoder/gp_integer.rs b/src/backend/i686/assembler/encoder/gp_integer.rs
-index e0502c3d..fd3766ef 100644
---- a/src/backend/i686/assembler/encoder/gp_integer.rs
-+++ b/src/backend/i686/assembler/encoder/gp_integer.rs
-@@ -133,7 +133,12 @@ impl super::InstructionEncoder {
-             ImmediateValue::Integer(val) => {
-                 let val = *val;
-                 if size == 4 {
--                    // movl $imm32, %reg - use compact B8+rd encoding
-+                    // movl $imm32, %reg - compact B8+rd id. sized_op MUST be
-+                    // set: in .code16 the 32-bit form is 66 B8+rd id (GAS:
-+                    // `66 b8 78 56 34 12`); without the marker the prefix
-+                    // inversion skipped it and the imm32 was decoded as
-+                    // imm16 + stray bytes (silent wrong code).
-+                    self.sized_op = true;
-                     self.bytes.push(0xB8 + dst_num);
-                     self.bytes.extend_from_slice(&(val as i32).to_le_bytes());
-                 } else if size == 2 {
-@@ -149,6 +154,7 @@ impl super::InstructionEncoder {
-             ImmediateValue::Symbol(sym) | ImmediateValue::SymbolPlusOffset(sym, _) => {
-                 let addend = if let ImmediateValue::SymbolPlusOffset(_, a) = imm { *a } else { 0 };
-                 if size == 4 {
-+                    self.sized_op = true;
-                     self.bytes.push(0xB8 + dst_num);
-                     self.add_relocation(sym, R_386_32, addend);
-                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
-@@ -489,6 +495,20 @@ impl super::InstructionEncoder {
-                 }
-                 Ok(())
-             }
-+            // `pushw $sym` (header.S: `pushw $6f` lretw trampoline):
-+            // 68 imm16 + R_386_16 in .code16. No valid GAS form outside
-+            // 16-bit mode, so reject loudly there.
-+            Operand::Immediate(ImmediateValue::Symbol(sym)) |
-+            Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, _)) => {
-+                let addend = if let Operand::Immediate(ImmediateValue::SymbolPlusOffset(_, a)) = &ops[0] { *a } else { 0 };
-+                if !self.code16 {
-+                    return Err("pushw $symbol is only supported in .code16 mode".to_string());
-+                }
-+                self.bytes.push(0x68);
-+                self.add_relocation(sym, R_386_16, addend);
-+                self.bytes.extend_from_slice(&[0, 0]);
-+                Ok(())
-+            }
-             _ => Err("unsupported pushw operand".to_string()),
-         }
-     }
-@@ -1263,10 +1283,21 @@ impl super::InstructionEncoder {
- 
-         match &ops[0] {
-             Operand::Label(label) => {
-+                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
-+                if self.code16 {
-+                    // .code16 near jmp: E9 rel16 + R_386_PC16 (GAS emits
-+                    // `e9 00 00` + PC16 for forward targets; short local
-+                    // targets get relaxed to EB rel8 by GAS — lccc's fixed
-+                    // rel16 form is semantically identical and local
-+                    // targets fold to constants in the writer).
-+                    self.bytes.push(0xE9);
-+                    self.add_relocation(sym, R_386_PC16, -2);
-+                    self.bytes.extend_from_slice(&[0, 0]);
-+                    return Ok(());
-+                }
-                 self.bytes.push(0xE9);
-                 // Always use R_386_PLT32 for branch targets, matching modern GCC/binutils.
-                 // R_386_PC32 is rejected by ld for PIE executables calling shared lib functions.
--                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
-                 let reloc_type = R_386_PLT32;
-                 self.add_relocation(sym, reloc_type, -4);
-                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
-@@ -1378,15 +1409,31 @@ impl super::InstructionEncoder {
-             2 => {
-                 match (&ops[0], &ops[1]) {
-                     (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Integer(off))) => {
--                        self.bytes.push(0xEA);
--                        self.bytes.extend_from_slice(&(*off as u32).to_le_bytes());
-+                        // .code16: offset width follows the suffix — ljmpl
-+                        // marks sized_op (66-prefixed via the inversion) and
-+                        // keeps imm32; ljmp/ljmpw emit imm16. .code32: imm32.
-+                        if self.code16 && !self.ljmp_wide {
-+                            self.bytes.push(0xEA);
-+                            self.bytes.extend_from_slice(&(*off as u16).to_le_bytes());
-+                        } else {
-+                            if self.code16 { self.sized_op = true; }
-+                            self.bytes.push(0xEA);
-+                            self.bytes.extend_from_slice(&(*off as u32).to_le_bytes());
-+                        }
-                         self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
-                         Ok(())
-                     }
-                     (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Symbol(sym))) => {
--                        self.bytes.push(0xEA);
--                        self.add_relocation(sym, R_386_32, 0);
--                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
-+                        if self.code16 && !self.ljmp_wide {
-+                            self.bytes.push(0xEA);
-+                            self.add_relocation(sym, R_386_16, 0);
-+                            self.bytes.extend_from_slice(&[0, 0]);
-+                        } else {
-+                            if self.code16 { self.sized_op = true; }
-+                            self.bytes.push(0xEA);
-+                            self.add_relocation(sym, R_386_32, 0);
-+                            self.bytes.extend_from_slice(&[0, 0, 0, 0]);
-+                        }
-                         self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
-                         Ok(())
-                     }
-@@ -1419,9 +1466,20 @@ impl super::InstructionEncoder {
- 
-         match &ops[0] {
-             Operand::Label(label) => {
-+                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
-+                if self.code16 {
-+                    // .code16 Jcc: 0F 8x rel16 + R_386_PC16. GAS relaxes
-+                    // same-section short targets to 7x rel8; lccc emits the
-+                    // fixed rel16 form (identical semantics, always in
-+                    // range for real-mode blobs; local targets resolve to
-+                    // constants via the writer's PC16 path).
-+                    self.bytes.extend_from_slice(&[0x0F, 0x80 + cc]);
-+                    self.add_relocation(sym, R_386_PC16, -2);
-+                    self.bytes.extend_from_slice(&[0, 0]);
-+                    return Ok(());
-+                }
-                 self.bytes.extend_from_slice(&[0x0F, 0x80 + cc]);
-                 // Always use R_386_PLT32 for branch targets, matching modern GCC/binutils.
--                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
-                 let reloc_type = R_386_PLT32;
-                 self.add_relocation(sym, reloc_type, -4);
-                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
-@@ -1438,10 +1496,27 @@ impl super::InstructionEncoder {
- 
-         match &ops[0] {
-             Operand::Label(label) => {
-+                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
-+                if self.code16 {
-+                    // .code16 near call: E8 rel16 + R_386_PC16 (GAS:
-+                    // `e8 00 00` + PC16 ext_fn-0x2). The explicit 32-bit
-+                    // spelling `calll` is 66-prefixed rel32 (PC32) — GAS
-+                    // `66 e8 00 00 00 00` + PC32 ext_fn-0x4 — selected by
-+                    // the sized_op the dispatch sets for "calll".
-+                    if self.sized_op {
-+                        self.bytes.push(0xE8);
-+                        self.add_relocation(sym, R_386_PC32, -4);
-+                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
-+                    } else {
-+                        self.bytes.push(0xE8);
-+                        self.add_relocation(sym, R_386_PC16, -2);
-+                        self.bytes.extend_from_slice(&[0, 0]);
-+                    }
-+                    return Ok(());
-+                }
-                 self.bytes.push(0xE8);
-                 // Always use R_386_PLT32 for branch targets, matching modern GCC/binutils.
-                 let reloc_type = R_386_PLT32;
--                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
-                 self.add_relocation(sym, reloc_type, -4);
-                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
-                 Ok(())
-diff --git a/src/backend/i686/assembler/encoder/mod.rs b/src/backend/i686/assembler/encoder/mod.rs
-index cf5b51c4..31ae5932 100644
---- a/src/backend/i686/assembler/encoder/mod.rs
-+++ b/src/backend/i686/assembler/encoder/mod.rs
-@@ -17,7 +17,7 @@ use crate::backend::x86::assembler::parser::*;
- 
- /// Split a label string like `"pa_tr_efer + 4"` or `"symbol-8"` into (symbol, addend).
- /// Returns the original string with addend 0 if no offset is found.
--fn split_label_offset(label: &str) -> (&str, i64) {
-+pub(super) fn split_label_offset(label: &str) -> (&str, i64) {
-     // Scan for '+' or '-' that separates the symbol from the offset.
-     // Skip the first character to avoid splitting on leading sign/dot.
-     for (i, c) in label.char_indices().skip(1) {
-@@ -66,6 +66,8 @@ pub const R_386_PLT32: u32 = 4;
- /// relocs tool distinguishes R_386_16-against-segment-symbol (legal, recorded
- /// in relocs16) from R_386_32 (rejected as "Invalid absolute relocation").
- pub const R_386_16: u32 = 20;
-+/// 16-bit PC-relative (rel16 branch fields in real-mode code).
-+pub const R_386_PC16: u32 = 21;
- pub const R_386_GOTOFF: u32 = 9;
- pub const R_386_GOTPC: u32 = 10;
- pub const R_386_TLS_LE_32: u32 = 37;
-@@ -105,6 +107,8 @@ pub struct InstructionEncoder {
-     /// (i.e. one where 16- vs 32-bit operands are distinguishable). Only such
-     /// instructions take part in the `.code16` operand-size inversion.
-     pub(super) sized_op: bool,
-+    /// Current far jump uses the explicit 32-bit-offset spelling (`ljmpl`).
-+    pub(super) ljmp_wide: bool,
- }
- 
- impl InstructionEncoder {
-@@ -117,6 +121,7 @@ impl InstructionEncoder {
-             code16: false,
-             pending_addr32: false,
-             sized_op: false,
-+            ljmp_wide: false,
-         }
-     }
- 
-@@ -394,11 +399,23 @@ impl InstructionEncoder {
-             // 32-bit mode it is the plain CALL encoding (kernel realmode
-             // wakeup_asm.S/copy.S use it from .code16 files to force a
-             // 4-byte return address).
--            "call" | "calll" => self.encode_call(ops),
-+            "call" | "calll" => {
-+                // `calll` in .code16 selects the 32-bit form: 66 E8 rel32
-+                // (wakeup_asm.S uses it to force a 4-byte return address).
-+                // Plain `call` is the mode-default width (rel16 in .code16).
-+                // sized_op routes both through the prefix inversion; the
-+                // rel width is chosen inside encode_call.
-+                if mnemonic == "calll" { self.sized_op = true; }
-+                self.encode_call(ops)
-+            }
-             // `retl` = explicit 32-bit near return (same C3 byte in 32-bit
-             // mode); `retw` = 16-bit near return (66 C3).
-             "ret" | "retl" | "retw" => {
-+                // Width follows the suffix. .code32: retw = 66 C3, ret/retl
-+                // = C3. .code16 (via the prefix inversion): retl marks
-+                // sized_op -> 66 C3 (retl); ret/retw stay C3. GAS verified.
-                 if mnemonic == "retw" { self.sized_op = true; self.bytes.push(0x66); }
-+                if mnemonic == "retl" { self.sized_op = true; }
-                 if ops.is_empty() {
-                     self.bytes.push(0xC3);
-                 } else if let Some(Operand::Immediate(ImmediateValue::Integer(val))) = ops.first() {
-@@ -411,7 +428,16 @@ impl InstructionEncoder {
-                 Ok(())
-             }
-             // Far jump
--            "ljmpl" | "ljmpw" | "ljmp" => self.encode_ljmp(ops),
-+            "ljmpl" | "ljmpw" | "ljmp" => {
-+                // Far-jump offset width follows the suffix. In .code16:
-+                // ljmpl = 66 EA imm32 seg16, ljmp/ljmpw = EA imm16 seg16
-+                // (GAS: `66 ea 00 10 00 00 10 00` / `ea 00 00 ff ff`).
-+                // In .code32 both spellings take imm32.
-+                self.ljmp_wide = mnemonic == "ljmpl";
-+                let r = self.encode_ljmp(ops);
-+                self.ljmp_wide = false;
-+                r
-+            }
-             // `lcallw` forces 16-bit operand size: 0x66 prefix AND an imm16
-             // offset in the direct form (realmode wakemain.c BIOS video call
-             // `lcallw $0xc000, $3` — without this the offset would be encoded
-@@ -872,15 +898,30 @@ impl InstructionEncoder {
-             "sti" => { self.bytes.push(0xFB); Ok(()) }
-             "sahf" => { self.bytes.push(0x9E); Ok(()) }
-             "lahf" => { self.bytes.push(0x9F); Ok(()) }
--            "pushf" | "pushfl" => { self.bytes.push(0x9C); Ok(()) }
--            "popf" | "popfl" => { self.bytes.push(0x9D); Ok(()) }
-+            "pushf" | "pushfl" => {
-+                // The 'l' spelling selects the 32-bit form — a real size
-+                // choice, so it participates in the .code16 inversion
-+                // (wakeup_asm.S pushfl = 66 9c in real mode).
-+                if mnemonic == "pushfl" { self.sized_op = true; }
-+                self.bytes.push(0x9C); Ok(())
-+            }
-+            "popf" | "popfl" => {
-+                if mnemonic == "popfl" { self.sized_op = true; }
-+                self.bytes.push(0x9D); Ok(())
-+            }
-             // PUSHA/POPA (60/61): push/pop all eight GP registers. 32-bit
-             // only (invalid in 64-bit mode — correctly absent from the x86-64
-             // encoder). Kernel realmode BIOS trampolines save the full
-             // register file around INT calls (arch/x86/boot/bioscall.S).
-             // `pushaw`/`popaw` are the 16-bit-operand forms (0x66 prefix).
--            "pusha" | "pushal" => { self.bytes.push(0x60); Ok(()) }
--            "popa" | "popal" => { self.bytes.push(0x61); Ok(()) }
-+            "pusha" | "pushal" => {
-+                if mnemonic == "pushal" { self.sized_op = true; }
-+                self.bytes.push(0x60); Ok(())
-+            }
-+            "popa" | "popal" => {
-+                if mnemonic == "popal" { self.sized_op = true; }
-+                self.bytes.push(0x61); Ok(())
-+            }
-             "pushaw" => { self.bytes.extend_from_slice(&[0x66, 0x60]); Ok(()) }
-             "popaw" => { self.bytes.extend_from_slice(&[0x66, 0x61]); Ok(()) }
- 
-diff --git a/src/backend/x86/assembler/elf_writer.rs b/src/backend/x86/assembler/elf_writer.rs
-index 87943bc5..98d1b8d5 100644
---- a/src/backend/x86/assembler/elf_writer.rs
-+++ b/src/backend/x86/assembler/elf_writer.rs
-@@ -160,6 +160,7 @@ impl X86Arch for X86_64Arch {
-     fn uses_rel_format() -> bool { false }
- 
-     fn reloc_pc8_internal() -> Option<u32> { Some(R_X86_64_PC8_INTERNAL) }
-+    fn reloc_pc8() -> Option<u32> { Some(15) } // R_X86_64_PC8
-     fn reloc_abs32_for_internal() -> Option<u32> { Some(R_X86_64_32) }
-     fn supports_deferred_skips() -> bool { true }
-     fn resolve_set_aliases_in_data() -> bool { true }
-diff --git a/src/backend/x86/assembler/parser.rs b/src/backend/x86/assembler/parser.rs
-index cc63648f..1f08e21f 100644
---- a/src/backend/x86/assembler/parser.rs
-+++ b/src/backend/x86/assembler/parser.rs
-@@ -1842,6 +1842,17 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
-             continue;
-         }
- 
-+        // PURE constant expressions first: `.quad ((0x1000000) + (0x200000
-+        // - 1)) & ~(0x200000 - 1)` (header.S pref_address/LOAD_PHYSICAL_ADDR).
-+        // The " - " diff split below would break the expression at its first
-+        // minus and emit a relocation against the literal left-half string.
-+        // parse_integer_expr fails on any symbol reference, so this probe
-+        // can never swallow a legitimate symbol diff.
-+        if let Ok(val) = parse_integer_expr(trimmed) {
-+            vals.push(DataValue::Integer(val));
++    // A single operand is read-modify-write or a branch target: not a source.
++    if parts.len() < 2 {
++        return None;
++    }
++
++    let last = parts.len() - 1;
++    let mut hit = false;
++    for (idx, part) in parts.iter_mut().enumerate() {
++        let is_dest = idx == last;
++        // The destination may still be a MEMORY reference, whose registers are
++        // read. A bare register destination must not be touched.
++        let dest_is_memory = is_dest && part.contains('(');
++        if is_dest && !dest_is_memory {
++            continue;
++        }
++        if has_whole_word(part, old_reg) {
++            *part = replace_whole_word(part, old_reg, new_reg);
++            hit = true;
++        }
++    }
++    if !hit {
++        return None;
++    }
++    Some(format!("{}{} {}", ws, mnemonic, parts.join(",")))
++}
++
++/// Copy propagation over register-to-register moves.
++///
++/// `movl %eax, %ebx` makes %ebx an alias of %eax. Every later reader of %ebx
++/// can read %eax instead, as long as NEITHER register has been redefined in
++/// between. Rewriting the readers usually makes the copy itself dead, and
++/// `eliminate_dead_reg_moves` (which runs after this) then deletes it.
++///
++/// Why this matters so much on i686: the register allocator hands out a fresh
++/// register for every SSA value, so a simple expression turns into a chain
++///     movl 32(%esp),%eax ; movl %eax,%ebx ; movl %ebx,%ecx ; movzbl (%ecx),%eax
++/// Four registers for one address. That is what forced `read_word` to save
++/// ebx/esi/edi/ebp and cost 73 bytes where GCC needs 11. Breaking the chains
++/// removes both the moves AND the register pressure that produced the
++/// callee-save prologue -- which is the dominant cost in the 32 KiB kernel
++/// setup binary.
++///
++/// SOUNDNESS. The rewrite is applied only while both registers are provably
++/// unchanged, and the scan stops at anything that could invalidate that:
++///   * any write to src or dst (including implicit ones via `Other.dest_reg`,
++///     `SetCC`, `Pop`, `LoadEbp`, `Call` clobbers);
++///   * any barrier -- label, jump, call, ret -- because this is a LOCAL
++///     analysis with no CFG;
++///   * `%esp`/`%ebp`, which addressing depends on;
++///   * a partial-register read of dst (`%bl`, `%bx`) -- `line_references_reg`
++///     matches those spellings, and substituting a 32-bit name for them would
++///     change the operand width.
++/// The substitution itself only touches SOURCE operands
++/// (`replace_source_reg_in_instruction` refuses to rewrite a destination), so
++/// a reader that also writes dst is never corrupted.
++fn propagate_reg_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
++    let len = infos.len();
++    let mut changed = false;
++    // Bounded like the other local passes: copies live only a few
++    // instructions in practice, and this keeps the pass linear.
++    const WINDOW: usize = 24;
++
++    for i in 0..len {
++        if infos[i].is_nop() {
++            continue;
++        }
++        let (dst_reg, src_reg) = match infos[i].kind {
++            LineKind::Move { dst, src } => (dst, src),
++            _ => continue,
++        };
++        // Never rewrite through the stack or frame pointer.
++        if dst_reg == REG_ESP || dst_reg == REG_EBP
++            || src_reg == REG_ESP || src_reg == REG_EBP
++        {
++            continue;
++        }
++        if dst_reg == src_reg {
 +            continue;
 +        }
 +
-         // General `symbol +/- const-expr [+/- const-expr ...]` chain, e.g. the
-         // kernel's `level1_fixmap_pgt + (2 << 12) - 8 + 16`. The " - " split
-         // below would break at the FIRST minus and treat everything left of
--- 
-2.47.3
-
++        let mut j = i + 1;
++        let mut count = 0;
++        while j < len && count < WINDOW {
++            if infos[j].is_nop() {
++                j += 1;
++                continue;
++            }
++            // No CFG here: anything that can transfer control ends the region
++            // in which the alias is known to hold.
++            if infos[j].is_barrier() {
++                break;
++            }
++
++            let line = trimmed(store, &infos[j], j);
++
++            // A write to the SOURCE breaks the alias immediately -- readers
++            // after this point must keep using dst.
++            let writes_src = match infos[j].kind {
++                LineKind::Move { dst, .. } => dst == src_reg,
++                LineKind::LoadEbp { reg, .. } => reg == src_reg,
++                LineKind::Pop { reg } => reg == src_reg,
++                LineKind::SetCC { reg } => reg == src_reg,
++                LineKind::Other { dest_reg } => dest_reg == src_reg,
++                _ => false,
++            };
++            if writes_src {
++                break;
++            }
++
++            // Rewrite this reader to use the source register.
++            if line_references_reg(line, dst_reg) {
++                // Only the plain 32-bit spelling is safe to substitute: a
++                // partial read (`%bl`/`%bx`) would need the matching sub-name
++                // of src, and getting that wrong silently changes the width.
++                let dst_name = reg32_name(dst_reg);
++                let src_name = reg32_name(src_reg);
++                if let Some(new_line) = replace_att_source_reg(store.get(j), dst_name, src_name) {
++                    store.replace(j, new_line);
++                    let re = classify_line(store.get(j));
++                    infos[j] = LineInfo { trim_start: infos[j].trim_start, ..re };
++                    changed = true;
++                }
++            }
++
++            // A write to the DESTINATION ends the alias (after any rewrite of
++            // this same instruction's sources, which is why this comes last).
++            let writes_dst = match infos[j].kind {
++                LineKind::Move { dst, .. } => dst == dst_reg,
++                LineKind::LoadEbp { reg, .. } => reg == dst_reg,
++                LineKind::Pop { reg } => reg == dst_reg,
++                LineKind::SetCC { reg } => reg == dst_reg,
++                LineKind::Other { dest_reg } => dest_reg == dst_reg,
++                _ => false,
++            };
++            if writes_dst {
++                break;
++            }
++
++            j += 1;
++            count += 1;
++        }
++    }
++
++    changed
++}
++
++/// Is `reg` callee-saved in the i386 SysV ABI?
++///
++/// %ebx, %esi, %edi and %ebp are preserved across calls, which means a write
++/// to one of them that is never read before `ret` is dead: the epilogue's
++/// `pop` overwrites it, and no caller can observe the value. %eax/%edx are
++/// return-value registers and %esp/%ecx are not callee-saved.
++fn is_callee_saved_reg(reg: RegId) -> bool {
++    matches!(reg, REG_EBX | REG_ESI | REG_EDI | REG_EBP)
++}
++
+ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+     let len = infos.len();
+     let mut changed = false;
+     const WINDOW: usize = 16;
+ 
++    // Detect a real frame pointer: `movl %esp, %ebp` in the prologue, or any
++    // %ebp-relative addressing. Either means %ebp is load-bearing and must not
++    // be treated as a dataflow register. Scanning once per call keeps this
++    // O(n) and cannot be fooled by a function that only *pushes* %ebp as a
++    // callee-saved register without establishing a frame.
++    let frame_pointer_in_use = (0..len).any(|k| {
++        if infos[k].is_nop() {
++            return false;
++        }
++        let l = trimmed(store, &infos[k], k);
++        l.contains("(%ebp)") || l == "movl %esp, %ebp" || l.starts_with("movl %esp, %ebp")
++    });
++
+     for i in 0..len {
+         if infos[i].is_nop() { continue; }
+         let dst_reg = match infos[i].kind {
+             LineKind::Move { dst, .. } => dst,
+             _ => continue,
+         };
+-        // Don't eliminate moves to esp/ebp
+-        if dst_reg == REG_ESP || dst_reg == REG_EBP { continue; }
++        // %esp is never a dataflow register. %ebp is only off-limits while it
++        // serves as the FRAME POINTER; under -fomit-frame-pointer (which the
++        // kernel's 32 KiB setup code is built with) it is an ordinary
++        // allocatable register, and refusing to touch it kept every dead write
++        // to it alive -- together with the push/pop pair the prologue emits
++        // because the allocator claimed it.
++        if dst_reg == REG_ESP { continue; }
++        if dst_reg == REG_EBP && frame_pointer_in_use { continue; }
+ 
+         // Look ahead: if dst is overwritten before being read, this move is dead
+         let mut j = i + 1;
+         let mut count = 0;
+         while j < len && count < WINDOW {
+             if infos[j].is_nop() { j += 1; continue; }
++            // A `ret` is not an opaque barrier for a callee-saved register: by
++            // the ABI the caller does not observe it, and the epilogue's `pop`
++            // restores it anyway. Treating `ret` like a label kept every dead
++            // write to %ebx/%esi/%edi/%ebp alive, and since the prologue saves
++            // exactly the registers the allocator claims, each one cost a
++            // push+pop pair on top of the dead move itself.
++            //
++            // %eax/%edx carry the return value, so they must stay live to the
++            // `ret`; the pops between here and it are handled by the Pop arm
++            // below, which sees the register being redefined.
++            if matches!(infos[j].kind, LineKind::Ret) {
++                if is_callee_saved_reg(dst_reg) {
++                    infos[i].kind = LineKind::Nop;
++                    changed = true;
++                }
++                break;
++            }
+             if infos[j].is_barrier() { break; }
+ 
+             // Check if dst is read by this instruction
+@@ -1131,6 +1372,23 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+                     // dst is read (stored to stack) - move is alive
+                     break;
+                 }
++                // `popl %reg` OVERWRITES the register -- it does not read it.
++                // Without this arm the epilogue's pops fell into the catch-all
++                // below, which sees the register mentioned and concludes it is
++                // live. Every dead write to a callee-saved register therefore
++                // survived, e.g. the final `movl %eax,%ebp` immediately before
++                // `popl %ebp`.
++                LineKind::Pop { reg } => {
++                    if reg == dst_reg {
++                        infos[i].kind = LineKind::Nop;
++                        changed = true;
++                    }
++                    break;
++                }
++                // `pushl %reg` READS it: the move that produced it is alive.
++                LineKind::Push { reg } if reg == dst_reg => {
++                    break;
++                }
+                 LineKind::Move { src, dst } => {
+                     if src == dst_reg {
+                         // dst is read - move is alive
+@@ -1684,7 +1942,10 @@ pub fn peephole_optimize(asm: String) -> String {
+     }
+ 
+     // Phase 2: Global passes (run once)
+-    let global_changed = eliminate_dead_reg_moves(&store, &mut infos);
++    // Copy propagation first: it turns chained moves into dead moves, which
++    // the very next pass then removes.
++    let global_changed = propagate_reg_copies(&mut store, &mut infos);
++    let global_changed = global_changed | eliminate_dead_reg_moves(&store, &mut infos);
+     let global_changed = global_changed | eliminate_dead_stores(&store, &mut infos);
+     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
+     let global_changed = global_changed | fold_memory_operands(&mut store, &mut infos);
+@@ -1696,6 +1957,7 @@ pub fn peephole_optimize(asm: String) -> String {
+         while changed2 && pass_count2 < MAX_POST_GLOBAL_ITERATIONS {
+             changed2 = false;
+             changed2 |= combined_local_pass(&mut store, &mut infos);
++            changed2 |= propagate_reg_copies(&mut store, &mut infos);
+             changed2 |= eliminate_dead_reg_moves(&store, &mut infos);
+             changed2 |= eliminate_dead_stores(&store, &mut infos);
+             changed2 |= fold_memory_operands(&mut store, &mut infos);
+@@ -1945,3 +2207,4 @@ mod tests {
+         assert!(!result.contains("decl"), "must NOT convert to decl before sbbl: {}", result);
+     }
+ }
++}
+diff --git a/src/backend/i686/codegen/prologue.rs b/src/backend/i686/codegen/prologue.rs
+index 63b4b0d..a8965b8 100644
+--- a/src/backend/i686/codegen/prologue.rs
++++ b/src/backend/i686/codegen/prologue.rs
+@@ -16,6 +16,46 @@ use crate::backend::regalloc::PhysReg;
+ use crate::backend::traits::ArchCodegen;
+ 
+ impl I686Codegen {
++    /// Does this function need the PIC GOT base in %ebx?
++    ///
++    /// Exactly the constructs that expand to a `@GOT`/`@GOTOFF` reference:
++    ///   * `GlobalAddr`  -> `movl sym@GOT(%ebx)` / `leal sym@GOTOFF(%ebx)`
++    ///   * `LabelAddr`   -> `leal L@GOTOFF(%ebx)`   (computed goto, `&&label`)
++    ///   * TLS addresses -> `movl sym@GOTNTPOFF(%ebx)`
++    ///   * a `Switch` lowered to a jump table -> `leal jt@GOTOFF(%ebx)`
++    ///   * inline asm, which may name any symbol in text we do not parse
++    ///
++    /// Deliberately an ALLOWLIST with a conservative default: anything not
++    /// recognised here keeps the GOT. Getting this wrong in the permissive
++    /// direction produces a wild %ebx dereference, so the failure mode must be
++    /// "one wasted register", never "wrong address".
++    fn function_needs_got(func: &IrFunction, pic: bool) -> bool {
++        use crate::ir::reexports::{Instruction, Terminator};
++        if !pic {
++            return false;
++        }
++        for block in &func.blocks {
++            // A Switch may be lowered to a GOTOFF-relative jump table. The
++            // decision happens later in emit_switch_jump_table, so assume the
++            // table form whenever a Switch is present.
++            if matches!(block.terminator, Terminator::Switch { .. }) {
++                return true;
++            }
++            if matches!(block.terminator, Terminator::IndirectBranch { .. }) {
++                return true;
++            }
++            for inst in &block.instructions {
++                match inst {
++                    Instruction::GlobalAddr { .. }
++                    | Instruction::LabelAddr { .. }
++                    | Instruction::InlineAsm { .. } => return true,
++                    _ => {}
++                }
++            }
++        }
++        false
++    }
++
+     // ---- calculate_stack_space ----
+ 
+     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
+@@ -57,8 +97,19 @@ impl I686Codegen {
+             i686_clobber_to_phys,
+             callee_saved_set,
+         );
+-        // In PIC mode, %ebx (PhysReg(0)) is reserved as the GOT base pointer.
+-        if self.state.pic_mode && !asm_clobbered_regs.contains(&PhysReg(0)) {
++        // In PIC mode, %ebx (PhysReg(0)) is reserved as the GOT base pointer --
++        // but ONLY for functions that actually reference the GOT.
++        //
++        // Unconditionally reserving it cost every leaf function 12 bytes it
++        // could not use: `push %ebx` + `call __x86.get_pc_thunk.bx` +
++        // `addl $_GLOBAL_OFFSET_TABLE_,%ebx` + `pop %ebx`, plus the loss of a
++        // register that then forced spills elsewhere. On the 32 KiB-limited
++        // kernel setup binary that is pure waste, because the overwhelming
++        // majority of those functions never form a global address at all.
++        // GCC makes the same call: it materializes the GOT base lazily.
++        let needs_got = Self::function_needs_got(func, self.state.pic_mode);
++        self.pic_got_live = needs_got;
++        if needs_got && !asm_clobbered_regs.contains(&PhysReg(0)) {
+             asm_clobbered_regs.push(PhysReg(0));
+         }
+         let available_regs = filter_available_regs(callee_saved_set, &asm_clobbered_regs);
+@@ -71,8 +122,8 @@ impl I686Codegen {
+             false,
+         );
+ 
+-        // In PIC mode, %ebx must be saved/restored as a callee-saved register.
+-        if self.state.pic_mode && !self.used_callee_saved.contains(&PhysReg(0)) {
++        // %ebx must be saved/restored only when it really holds the GOT base.
++        if needs_got && !self.used_callee_saved.contains(&PhysReg(0)) {
+             self.used_callee_saved.insert(0, PhysReg(0));
+         }
+ 
+@@ -154,9 +205,9 @@ impl I686Codegen {
+             emit!(self.state, "    pushl %{}", name);
+         }
+ 
+-        if self.state.pic_mode {
++        if self.pic_got_live {
+             debug_assert!(self.used_callee_saved.contains(&PhysReg(0)),
+-                "PIC mode requires ebx in used_callee_saved");
++                "GOT-using function requires ebx in used_callee_saved");
+             self.state.emit("    call __x86.get_pc_thunk.bx");
+             self.state.emit("    addl $_GLOBAL_OFFSET_TABLE_, %ebx");
+             self.needs_pc_thunk_bx = true;
