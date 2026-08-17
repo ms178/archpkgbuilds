@@ -1,792 +1,321 @@
-From 98644960d80121da9d29bd2a05f5a54769ca3ad8 Mon Sep 17 00:00:00 2001
+From b1dc55900fbc27ce06f2616ddeee841e9dd8b6f5 Mon Sep 17 00:00:00 2001
 From: Arena Agent <agent@arena.ai>
-Date: Mon, 17 Aug 2026 11:05:18 +0000
-Subject: [PATCH 1/4] i686: compare against immediates directly (cmpl $C /
- testl)
+Date: Mon, 17 Aug 2026 13:36:04 +0000
+Subject: [PATCH] i686: (a) alloca-precise hazard scan, (b) direct phys-reg
+ materialization
 
-emit_int_cmp_impl and emit_fused_cmp_branch_impl staged EVERY rhs in
-%ecx, so a constant compare cost 8 bytes:
-    movl $36, %ecx ; cmpl %ecx, %eax
-where GCC emits 3..6:
-    cmpl $36, %eax          (testl %eax,%eax for C==0, 2 bytes)
-testl is flag-identical to cmpl $0 for every Jcc (both clear CF/OF,
-set SF/ZF/PF from eax). Bonus: %ecx stays untouched across constant
-compares, removing a false dependency the peephole had to clean up.
+Follow-up work on the ecx/edx caller-saved allocation, attacking the
+accumulator-detour bloat from three sides:
 
-Kernel repro szt.c (-Os -m32): 1988 -> 1944 bytes. cmpimm.c now shows
-cmpl $2/$36 + testl exactly like GCC.
+(a) Hazard scan precision: 32-bit loads/stores whose pointer is a
+    NON-over-aligned alloca resolve to SlotAddr::Direct and emit
+    acc-only code (movl slot,%eax / movl %eax,slot) -- no %ecx pointer
+    staging. The scan now whitelists those (align <= 16, mirroring
+    slot_assignment.rs; %gs:/%fs: seg_override stays fail-closed),
+    extending ecx/edx live-range viability across alloca traffic.
 
-Validation: cargo test 687; regression 209; correctness 50; linker 86;
-intrinsics 3; asm-diff exact; fuzz 300/300 (O2+Os).
+(b) Direct materialization: new trait hook emit_load_direct_to_phys_reg
+    with an i686 override -- `movl slot,%ecx` / `movl $imm,%edx` /
+    `leal slot,%ecx` in ONE instruction where emit_copy_value's default
+    detoured through movl-to-%eax + movl %eax,%dest. Wide values and
+    over-aligned allocas correctly refuse (fall back to acc path).
+    Also applied inside 32-bit Select arms, where the load+move pair
+    sits immediately before a label and no peephole can ever prove
+    deadness across that barrier.
+
+    New peephole Pattern 2b catches the remaining textual shape
+    `movl $X,%eax; movl %eax,%REG` -> `movl $X,%REG` under the same
+    bounded deadness scan as Pattern 2a (no memory operands, so no
+    slot-bias interaction).
+
+Kernel repro szt.c -Os -m32: 1833 -> 1829. Correctness unchanged
+everywhere else.
+
+Validation: cargo test 699; regression 283; correctness 50; linker 91;
+intrinsics 3; asm-diff exact; m32 differential fuzz 450/450 (seeds
+0:150, O0+O2+Os); x86-64 fuzz 300/300 (O2+Os); runtime reproducers
+mulhaz/gep0/fptest all exit 0.
 ---
- src/backend/i686/codegen/comparison.rs | 33 ++++++++++++++++++++++----
- 1 file changed, 29 insertions(+), 4 deletions(-)
+ src/backend/i686/codegen/comparison.rs | 30 +++++++++++--
+ src/backend/i686/codegen/emit.rs       | 47 +++++++++++++++++++++
+ src/backend/i686/codegen/peephole.rs   | 58 ++++++++++++++++++++++++++
+ src/backend/regalloc.rs                | 47 +++++++++++++++++----
+ src/backend/traits.rs                  | 19 +++++++--
+ 5 files changed, 186 insertions(+), 15 deletions(-)
 
 diff --git a/src/backend/i686/codegen/comparison.rs b/src/backend/i686/codegen/comparison.rs
-index 430ca8cf..a27df0a8 100644
+index a27df0a8..daaecda5 100644
 --- a/src/backend/i686/codegen/comparison.rs
 +++ b/src/backend/i686/codegen/comparison.rs
-@@ -105,8 +105,23 @@ impl I686Codegen {
- 
-     pub(super) fn emit_int_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, _ty: IrType) {
-         self.operand_to_eax(lhs);
--        self.operand_to_ecx(rhs);
--        self.state.emit("    cmpl %ecx, %eax");
-+        // Constant rhs: compare against the immediate directly instead of
-+        // staging it in %ecx. `movl $C,%ecx; cmpl %ecx,%eax` is 8 bytes where
-+        // `cmpl $C,%eax` is 3..6 and `testl %eax,%eax` is 2 (flags are
-+        // identical for ALL Jcc: eax-0 and eax&eax both clear CF/OF and set
-+        // SF/ZF/PF from eax). GCC emits exactly these forms. This also keeps
-+        // %ecx untouched, which the register allocator relies on when it
-+        // places a value in %ecx across a constant compare.
-+        if let Some(imm) = Self::const_as_imm32(rhs) {
-+            if imm == 0 {
-+                self.state.emit("    testl %eax, %eax");
+@@ -205,13 +205,35 @@ impl I686Codegen {
+             let end_label = format!(".Lsel_end_{}", label_id);
+             self.emit_load_operand(cond);
+             self.emit_branch_nonzero(&true_label);
+-            self.emit_load_operand(false_val);
+-            self.emit_store_result(dest);
++            // When dest is register-allocated, materialize each arm DIRECTLY
++            // into that register (movl slot,%esi) instead of the
++            // load-to-%eax + movl %eax,%esi detour. The peephole cannot fuse
++            // these afterwards because the pair sits right before a label
++            // (deadness unprovable across the barrier), so the win must
++            // happen here. Falls back to the accumulator path per-arm.
++            let dest_phys = self.get_phys_reg_for_value(dest.0);
++            if let Some(d) = dest_phys {
++                if !self.emit_load_direct_to_phys_reg(false_val, d) {
++                    self.emit_load_operand(false_val);
++                    self.emit_store_result(dest);
++                }
 +            } else {
-+                emit!(self.state, "    cmpl ${}, %eax", imm);
++                self.emit_load_operand(false_val);
++                self.emit_store_result(dest);
 +            }
-+        } else {
-+            self.operand_to_ecx(rhs);
-+            self.state.emit("    cmpl %ecx, %eax");
-+        }
- 
-         let set_instr = match op {
-             IrCmpOp::Eq => "sete",
-@@ -136,8 +151,18 @@ impl I686Codegen {
-         false_label: &str,
-     ) {
-         self.operand_to_eax(lhs);
--        self.operand_to_ecx(rhs);
--        self.state.emit("    cmpl %ecx, %eax");
-+        // Same immediate forms as emit_int_cmp_impl (see there for the
-+        // testl flags argument); keeps %ecx clean across fused compares.
-+        if let Some(imm) = Self::const_as_imm32(rhs) {
-+            if imm == 0 {
-+                self.state.emit("    testl %eax, %eax");
+             self.emit_branch(&end_label);
+             self.state.emit_fmt(format_args!("{}:", true_label));
+-            self.emit_load_operand(true_val);
+-            self.emit_store_result(dest);
++            if let Some(d) = dest_phys {
++                if !self.emit_load_direct_to_phys_reg(true_val, d) {
++                    self.emit_load_operand(true_val);
++                    self.emit_store_result(dest);
++                }
 +            } else {
-+                emit!(self.state, "    cmpl ${}, %eax", imm);
++                self.emit_load_operand(true_val);
++                self.emit_store_result(dest);
 +            }
-+        } else {
-+            self.operand_to_ecx(rhs);
-+            self.state.emit("    cmpl %ecx, %eax");
-+        }
+             self.state.emit_fmt(format_args!("{}:", end_label));
++            self.state.reg_cache.invalidate_acc();
+             return;
+         }
  
-         let jcc = match op {
-             IrCmpOp::Eq  => "je",
--- 
-2.47.3
-
-
-From 9bb47d2812ab87255e4598c27990e649950abd0b Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Mon, 17 Aug 2026 12:03:01 +0000
-Subject: [PATCH 2/4] regalloc: gate XMM pool on 64-bit target (i686 got
- phantom XMM homes)
-
-The x86-64 detection `available_regs.iter().any(|r| r.0 == 1)` tested
-for rbx=PhysReg(1) -- but i686's callee-saved pool is ebx/esi/edi/ebp =
-PhysReg(0..3), where PhysReg(1) is %esi. Every i686 function therefore
-passed the check and the Phase-3 F64 scan handed out XMM PhysRegs
-(20..33) that the i686 backend cannot emit: the slot assigner saw an
-assignment and skipped the stack slot, so every consumer read a
-nonexistent home.
-
-Runtime reproducer fptest.c (double accumulate loop, i386 nostdlib
-harness): O2 returned garbage (exit 1) where GCC returns 23.0; with
-CCC_NO_XMM_REGALLOC=1 it passed -- pinpointing the phantom pool. After
-gating on !target_is_32bit(): exit 0.
-
-Also prepares I686_CALLER_SAVED for the upcoming ecx/edx phase-2 work
-(names for PhysReg 4/5 in phys_reg_name; pool still empty until the
-hazard scan lands).
-
-Validation: cargo test 687; regression 209; correctness 50; linker 86;
-intrinsics 3; asm-diff exact; fuzz 300/300 (O2+Os); fptest O2 exit 0.
----
- src/backend/i686/codegen/emit.rs             | 17 +++++++++++++++--
- src/backend/stack_layout/regalloc_helpers.rs |  8 ++++++++
- 2 files changed, 23 insertions(+), 2 deletions(-)
-
 diff --git a/src/backend/i686/codegen/emit.rs b/src/backend/i686/codegen/emit.rs
-index ef66d788..d6b10361 100644
+index 54899cd4..d8acc9d0 100644
 --- a/src/backend/i686/codegen/emit.rs
 +++ b/src/backend/i686/codegen/emit.rs
-@@ -84,8 +84,19 @@ pub struct I686Codegen {
- pub(super) const I686_CALLEE_SAVED: &[PhysReg] = &[PhysReg(0), PhysReg(1), PhysReg(2)];
- // Extended callee-saved list including ebp (used when -fomit-frame-pointer)
- pub(super) const I686_CALLEE_SAVED_WITH_EBP: &[PhysReg] = &[PhysReg(0), PhysReg(1), PhysReg(2), PhysReg(3)];
--// No caller-saved registers available for allocation (eax/ecx/edx are scratch)
--pub(super) const I686_CALLER_SAVED: &[PhysReg] = &[];
-+// Caller-saved registers for Phase-2 allocation (non-call-spanning values).
-+// PhysReg(4) = ecx, PhysReg(5) = edx. %eax stays the accumulator.
-+//
-+// These are handed out ONLY to values whose live range crosses neither a
-+// call point nor a "scratch hazard" -- an instruction whose i686 emitter
-+// uses %ecx/%edx internally (non-const binop rhs staging, div/rem, indirect
-+// loads/stores, wide operations, casts, atomics, inline asm, ...). The
-+// hazard scan lives in regalloc.rs (collect_i686_scratch_hazard_points) and
-+// is a WHITELIST: anything not proven clean is a hazard, so a missed case
-+// costs a register, never a wrong value. This is GCC's main size advantage
-+// on the 32 KiB kernel setup binary: values that live between two compares
-+// can sit in %edx instead of forcing a %ebx..%ebp spill + push/pop pair.
-+pub(super) const I686_CALLER_SAVED: &[PhysReg] = &[];  // TEMP: re-enabled below once hazard scan lands
- 
- pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
-     match reg.0 {
-@@ -93,6 +104,8 @@ pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
-         1 => "esi",
-         2 => "edi",
-         3 => "ebp",
-+        4 => "ecx",
-+        5 => "edx",
-         _ => panic!("invalid i686 phys reg: {:?}", reg),
-     }
- }
-diff --git a/src/backend/stack_layout/regalloc_helpers.rs b/src/backend/stack_layout/regalloc_helpers.rs
-index 41118f50..c85b44e1 100644
---- a/src/backend/stack_layout/regalloc_helpers.rs
-+++ b/src/backend/stack_layout/regalloc_helpers.rs
-@@ -91,7 +91,15 @@ pub fn run_regalloc_and_merge_clobbers(
-         && !has_memcpy_or_vector_intrinsic
-         && std::env::var("CCC_DISABLE_SCALAR_FP_XMM").is_ok()
-         && std::env::var("CCC_ENABLE_SCALAR_FP_XMM").is_err();
-+    // x86-64 detection: callee-saved pool contains rbx=PhysReg(1). This MUST
-+    // exclude 32-bit targets: i686's pool is ebx/esi/edi/ebp = PhysReg(0..3),
-+    // where PhysReg(1) is %esi -- the old `any(r.0 == 1)` check matched it and
-+    // handed the i686 backend XMM PhysRegs (20+) it cannot emit. The slot
-+    // assigner then skipped stack slots for those F64 values, and every read
-+    // went to a nonexistent home: fptest.c returned garbage at O2 (exit 1 vs
-+    // GCC's 23.0). 64-bit gate fixes it (fptest exit 0).
-     let xmm_regs = if available_regs.iter().any(|r| r.0 == 1)
-+        && !crate::common::types::target_is_32bit()
-         && std::env::var("CCC_NO_XMM_REGALLOC").is_err()
-         && !disable_scalar_fp_xmm
-     {
--- 
-2.47.3
-
-
-From 56c2366a7b19ba726afdf913db261517b426c4e4 Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Mon, 17 Aug 2026 12:07:32 +0000
-Subject: [PATCH 3/4] i686: implement emit_reg_to_acc / emit_leaq_base_index
- (GEP wrong-code)
-
-The trait default for emit_reg_to_acc is a NO-OP ('backends override').
-i686 never overrode it, so emit_leaq_base_index's default sequence
-    emit_reg_to_acc(base)       <- silently did nothing
-    emit_acc_to_secondary()     <- copied the STALE accumulator (index!)
-    emit_reg_to_acc(index)      <- silently did nothing
-    emit_add_secondary_to_acc() <- acc = index + index
-computed addr = 2*scaled_offset with the base NEVER added, for every
-GEP whose base and index were both register-allocated.
-
-Runtime reproducers (i386 nostdlib harness):
-  gep0.c  a[i] load  -> SIGSEGV at O0..Os, now exit 0 on all levels
-  fptest.c F64 loop  -> SIGSEGV at O0, now exit 0
-Emitted code shows the bug 1:1: `imull $8,%edi,%eax; movl %eax,%ecx;
-addl %ecx,%eax; movl (%ecx),%eax` -- base %ebx unused.
-
-Fix: proper i686 overrides -- emit_reg_to_acc = movl %reg,%eax, and
-emit_leaq_base_index emits the single-instruction x86 form
-`leal (%base,%index), %dest` like the x86-64 backend.
-
-Validation: cargo test 687; regression 209; correctness 50; linker 86;
-intrinsics 3; asm-diff exact; fuzz 300/300 (O2+Os); gep0/fptest exit 0
-at O0/O1/O2/Os.
----
- src/backend/i686/codegen/emit.rs | 35 ++++++++++++++++++++++++++++++++
- 1 file changed, 35 insertions(+)
-
-diff --git a/src/backend/i686/codegen/emit.rs b/src/backend/i686/codegen/emit.rs
-index d6b10361..a94e4857 100644
---- a/src/backend/i686/codegen/emit.rs
-+++ b/src/backend/i686/codegen/emit.rs
-@@ -1294,6 +1294,41 @@ impl ArchCodegen for I686Codegen {
+@@ -1294,6 +1294,53 @@ impl ArchCodegen for I686Codegen {
          emit!(self.state, "    movl %eax, %{}", dest_name);
      }
  
-+    fn emit_reg_to_acc(&mut self, reg: PhysReg) {
-+        // The trait DEFAULT for this hook is a NO-OP ("backends override").
-+        // i686 never overrode it, so emit_leaq_base_index's default path
-+        //     emit_reg_to_acc(base);      <- silently did nothing
-+        //     emit_acc_to_secondary();    <- copied the STALE acc (the index!)
-+        //     emit_reg_to_acc(index);     <- silently did nothing
-+        //     emit_add_secondary_to_acc() <- acc = 2*index, base never added
-+        // producing addr = 2*offset for every GEP whose base AND index were
-+        // register-allocated: a[i] at -O0 segfaulted (gep0.c/fptest.c).
-+        let name = phys_reg_name(reg);
-+        emit!(self.state, "    movl %{}, %eax", name);
-+        self.state.reg_cache.invalidate_acc();
-+    }
-+
-+    fn emit_leaq_base_index(
-+        &mut self,
-+        base_reg: PhysReg,
-+        index_reg: PhysReg,
-+        dest: &Value,
-+        dest_reg: Option<PhysReg>,
-+    ) {
-+        // Single-instruction form, like x86-64: leal (%base,%index), %dest.
-+        let b = phys_reg_name(base_reg);
-+        let i = phys_reg_name(index_reg);
-+        if let Some(d) = dest_reg {
-+            let d = phys_reg_name(d);
-+            emit!(self.state, "    leal (%{}, %{}), %{}", b, i, d);
-+            self.state.reg_cache.invalidate_acc();
-+        } else {
-+            emit!(self.state, "    leal (%{}, %{}), %eax", b, i);
-+            self.state.reg_cache.invalidate_acc();
-+            self.store_eax_to(dest);
++    fn emit_load_direct_to_phys_reg(&mut self, src: &Operand, dest: PhysReg) -> bool {
++        // Materialize straight into the destination register instead of the
++        // `movl src,%eax; movl %eax,%dest` accumulator detour that
++        // emit_copy_value's default takes. One instruction shorter and it
++        // leaves %eax (and the reg_cache) untouched.
++        let d = phys_reg_name(dest);
++        match src {
++            Operand::Const(c) => {
++                let val: i32 = match c {
++                    IrConst::I8(v) => *v as i32,
++                    IrConst::I16(v) => *v as i32,
++                    IrConst::I32(v) => *v,
++                    IrConst::I64(v) => *v as i32,
++                    IrConst::Zero => 0,
++                    // F32/F64/LongDouble/I128 keep the accumulator path.
++                    _ => return false,
++                };
++                if val == 0 {
++                    emit!(self.state, "    xorl %{}, %{}", d, d);
++                } else {
++                    emit!(self.state, "    movl ${}, %{}", val, d);
++                }
++                true
++            }
++            Operand::Value(v) => {
++                // Wide values need two registers -- never direct.
++                if self.state.wide_values.contains(&v.0) {
++                    return false;
++                }
++                if let Some(slot) = self.state.get_slot(v.0) {
++                    let sr = self.slot_ref(slot);
++                    if self.state.is_alloca(v.0) {
++                        if self.state.alloca_over_align(v.0).is_some() {
++                            return false; // needs the lea+add+and sequence
++                        }
++                        emit!(self.state, "    leal {}, %{}", sr, d);
++                    } else {
++                        emit!(self.state, "    movl {}, %{}", sr, d);
++                    }
++                    true
++                } else {
++                    false
++                }
++            }
 +        }
 +    }
 +
-     // ---- Standard trait methods (kept inline - arch-specific) ----
-     fn emit_load_operand(&mut self, op: &Operand) { self.operand_to_eax(op); }
-     fn emit_store_result(&mut self, dest: &Value) { self.store_eax_to(dest); }
--- 
-2.47.3
-
-
-From fdc8b4ddc64980b3df04f15ee0cf92cd0b5b8acb Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Mon, 17 Aug 2026 12:27:32 +0000
-Subject: [PATCH 4/4] i686 regalloc: ecx/edx caller-saved allocation with
- per-register hazard scan
-
-THE big size lever for the 32 KiB kernel setup binary: i686 had ZERO
-caller-saved registers (I686_CALLER_SAVED = []), so every intermediate
-that outlives one instruction went to a stack slot or a callee-saved
-register with its push/pop tax. GCC's main advantage on this code is
-exactly its free use of ecx/edx between calls.
-
-Design (fail-closed):
-* collect_i686_scratch_hazard_points() walks the IR and returns, per
-  register, the sorted program points where the i686 EMITTERS themselves
-  may clobber %ecx or %edx (operand_to_ecx staging for value-rhs binops/
-  cmps, cltd/idivl for div/rem, indirect load/store pointers, wide-copy
-  high halves, emit_save_acc, %cl shifts, PIC switch tables, compare-
-  and-branch FUSION re-emitting the cmp at the CondBranch, wide returns).
-  It is a WHITELIST over instructions audited in the i686 emitters: any
-  unlisted construct is a hazard for both registers -- a miss costs a
-  register, never a value.
-* Phase 2 splits into per-register scans (edx first: fewer hazards)
-  filtered by 'interval spans no hazard point of that register', reusing
-  the sorted-points binary search from spans_any_call. 64-bit backends
-  keep the single unfiltered scan (their pools never contain PhysReg 4/5).
-* PhysReg(4)=ecx, PhysReg(5)=edx added to phys_reg_name.
-
-Proof:
-* NEW m32 differential fuzzer (tests/fuzz/m32_differential_fuzz.py):
-  libc-free codegen fuzz vs gcc -m32 with a nostdlib _start driver
-  folding 17 calls into the exit code; div/mod/shifts/helper calls/
-  global arrays. 360/360 pass (seeds 0:120, O0+O2+Os).
-* Runtime reproducers all exit 0: mulhaz (idiv+imul), gep0 (a[i]),
-  fptest (F64 loop), storeind (global stores).
-* Kernel repro szt.c -Os -m32: 1944 -> 1833 bytes (-5.7%; GCC 493).
-* Full battery: cargo test 687; regression 209; correctness 50;
-  linker 86; intrinsics 3; asm-diff exact; x86-64 fuzz 600/600
-  (O0+O2+Os, seeds 0:200).
----
- src/backend/i686/codegen/emit.rs    |   2 +-
- src/backend/regalloc.rs             | 289 +++++++++++++++++++++++++---
- tests/fuzz/m32_differential_fuzz.py | 164 ++++++++++++++++
- 3 files changed, 432 insertions(+), 23 deletions(-)
- create mode 100644 tests/fuzz/m32_differential_fuzz.py
-
-diff --git a/src/backend/i686/codegen/emit.rs b/src/backend/i686/codegen/emit.rs
-index a94e4857..54899cd4 100644
---- a/src/backend/i686/codegen/emit.rs
-+++ b/src/backend/i686/codegen/emit.rs
-@@ -96,7 +96,7 @@ pub(super) const I686_CALLEE_SAVED_WITH_EBP: &[PhysReg] = &[PhysReg(0), PhysReg(
- // costs a register, never a wrong value. This is GCC's main size advantage
- // on the 32 KiB kernel setup binary: values that live between two compares
- // can sit in %edx instead of forcing a %ebx..%ebp spill + push/pop pair.
--pub(super) const I686_CALLER_SAVED: &[PhysReg] = &[];  // TEMP: re-enabled below once hazard scan lands
-+pub(super) const I686_CALLER_SAVED: &[PhysReg] = &[PhysReg(5), PhysReg(4)];
- 
- pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
-     match reg.0 {
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index 3821cb5a..4903438f 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -791,31 +791,85 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
- 
-     // Phase 2: caller-saved linear scan for unallocated non-call-spanning values.
-     if !config.caller_saved_regs.is_empty() {
--        let phase2_intervals: Vec<LiveInterval> = liveness
--            .intervals
-+        // i686's pool is %ecx/%edx (PhysReg 4/5) -- registers the i686
-+        // emitters ALSO use as internal scratch. A value may live in one of
-+        // them only while no instruction in its range clobbers that specific
-+        // register, so the pool splits into per-register scans filtered by
-+        // the whitelist-based hazard table. 64-bit backends (whose pools
-+        // never contain PhysReg 4/5) keep the single unfiltered scan.
-+        let i686_pool = config
-+            .caller_saved_regs
-             .iter()
--            .filter(|iv| eligible.contains(&iv.value_id))
--            .filter(|iv| iv.end > iv.start)
--            .filter(|iv| !assignments.contains_key(&iv.value_id))
--            .filter(|iv| !spans_any_call(iv, call_points))
--            .filter(|iv| !param_ref_values.contains(&iv.value_id))
--            .copied()
--            .collect();
-+            .any(|r| matches!(r.0, 4 | 5));
-+        let hazards: Option<(Vec<u32>, Vec<u32>)> = if i686_pool {
-+            Some(collect_i686_scratch_hazard_points(func, &non_gpr_values))
-+        } else {
-+            None
-+        };
- 
--        if !phase2_intervals.is_empty() {
--            let phase2_ranges =
--                live_range::build_live_ranges(&phase2_intervals, &liveness.block_loop_depth, func);
--            let mut caller_allocator =
--                LinearScanAllocator::new(phase2_ranges, config.caller_saved_regs.clone());
--            caller_allocator.run();
-+        let base_filter = |iv: &&LiveInterval| {
-+            eligible.contains(&iv.value_id)
-+                && iv.end > iv.start
-+                && !spans_any_call(iv, call_points)
-+                && !param_ref_values.contains(&iv.value_id)
-+        };
- 
--            for (vid, reg) in caller_allocator.assignments {
--                assignments.insert(vid, reg);
--                // Phase 2 values are proven not to span calls; their ABI
--                // caller-saved registers need neither entry save nor exit
--                // restore. The old insertion into used_regs_set caused every
--                // such register to be pushed/popped as if callee-saved.
--                caller_used_regs_set.insert(reg.0);
-+        if let Some((ecx_hazards, edx_hazards)) = hazards {
-+            // Per-register scans, %edx first: it has strictly fewer hazards
-+            // (no address staging), so it can hold longer ranges.
-+            for (reg, reg_hazards) in [
-+                (PhysReg(5), &edx_hazards),
-+                (PhysReg(4), &ecx_hazards),
-+            ] {
-+                if !config.caller_saved_regs.contains(&reg) {
-+                    continue;
-+                }
-+                let intervals: Vec<LiveInterval> = liveness
-+                    .intervals
-+                    .iter()
-+                    .filter(&base_filter)
-+                    .filter(|iv| !assignments.contains_key(&iv.value_id))
-+                    // spans_any_call doubles as "spans any hazard point":
-+                    // both lists are sorted program points.
-+                    .filter(|iv| !spans_any_call(iv, reg_hazards))
-+                    .copied()
-+                    .collect();
-+                if intervals.is_empty() {
-+                    continue;
-+                }
-+                let ranges =
-+                    live_range::build_live_ranges(&intervals, &liveness.block_loop_depth, func);
-+                let mut alloc = LinearScanAllocator::new(ranges, vec![reg]);
-+                alloc.run();
-+                for (vid, r) in alloc.assignments {
-+                    assignments.insert(vid, r);
-+                    caller_used_regs_set.insert(r.0);
-+                }
-+            }
-+        } else {
-+            let phase2_intervals: Vec<LiveInterval> = liveness
-+                .intervals
-+                .iter()
-+                .filter(&base_filter)
-+                .filter(|iv| !assignments.contains_key(&iv.value_id))
-+                .copied()
-+                .collect();
-+
-+            if !phase2_intervals.is_empty() {
-+                let phase2_ranges =
-+                    live_range::build_live_ranges(&phase2_intervals, &liveness.block_loop_depth, func);
-+                let mut caller_allocator =
-+                    LinearScanAllocator::new(phase2_ranges, config.caller_saved_regs.clone());
-+                caller_allocator.run();
-+
-+                for (vid, reg) in caller_allocator.assignments {
-+                    assignments.insert(vid, reg);
-+                    // Phase 2 values are proven not to span calls; their ABI
-+                    // caller-saved registers need neither entry save nor exit
-+                    // restore. The old insertion into used_regs_set caused every
-+                    // such register to be pushed/popped as if callee-saved.
-+                    caller_used_regs_set.insert(reg.0);
-+                }
+     fn emit_reg_to_acc(&mut self, reg: PhysReg) {
+         // The trait DEFAULT for this hook is a NO-OP ("backends override").
+         // i686 never overrode it, so emit_leaq_base_index's default path
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index 4647daa6..34a7b998 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -995,6 +995,64 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
              }
          }
-     }
-@@ -2022,6 +2076,197 @@ fn spans_any_call(iv: &LiveInterval, call_points: &[u32]) -> bool {
-     start_idx < call_points.len() && call_points[start_idx] <= iv.end
- }
  
-+/// i686 scratch-hazard scan for the ecx/edx caller-saved pool.
-+///
-+/// The i686 emitters use %ecx and %edx as INTERNAL scratch all over the
-+/// place (`operand_to_ecx` staging for non-const binop rhs, `cltd; idivl`,
-+/// `emit_save_acc` = movl %eax,%edx, indirect load/store pointers in %ecx,
-+/// wide i64 halves in %eax:%edx, shifts' %cl, ...). A value parked in
-+/// %ecx/%edx therefore only survives across instructions whose emitters are
-+/// PROVEN not to touch that register.
-+///
-+/// This function returns, for each of (%ecx, %edx), the sorted list of
-+/// program points at which the emitted code may clobber it. It is a
-+/// WHITELIST: every instruction is a hazard for both registers unless the
-+/// match arm below proves otherwise (fail-closed: an unknown or new
-+/// instruction costs a register, never a value).
-+///
-+/// Whitelist justification, per arm (i686 emitter audit 2026-08-18):
-+///  * BinOp Add/Sub/Mul/And/Or/Xor with CONST rhs: single `op $imm,%eax`
-+///    (alu.rs imm paths); Shl/AShr/LShr with CONST rhs: `shl $n,%eax`.
-+///    Non-const rhs stages in %ecx -> ecx hazard; Div/Rem clobber both
-+///    (cltd + idivl); 64-bit ops use %eax:%edx pairs -> both.
-+///  * Cmp with CONST rhs: `cmpl $imm,%eax` / `testl %eax,%eax` (the
-+///    immediate-compare commit); non-const rhs -> ecx hazard. 64-bit
-+///    compares use the wide path -> both.
-+///  * Load/Store DIRECT (alloca slot, 32-bit int): movl slot,%eax /
-+///    movl %eax,slot -- no scratch. Anything indirect loads the pointer
-+///    into %ecx; wide/f64 use %edx too. We cannot see SlotAddr here, so
-+///    only loads/stores whose POINTER IS AN ALLOCA qualify (checked via
-+///    alloca_values from the state is not available here either --
-+///    conservatively, ALL loads/stores are hazards for %ecx; direct
-+///    32-bit ones are clean for %edx).
-+///  * Copy of 32-bit values: movl via %eax only (emit_copy_value int path).
-+///  * UnaryOp 32-bit int Neg/Not/Clz/Ctz/Bswap/Popcount: acc-only
-+///    (negl/notl/lzcnt/tzcnt/bswap/popcnt on %eax).
-+///  * GetElementPtr: emitters use %ecx as secondary -> ecx hazard, %edx
-+///    clean (traits default path uses acc+secondary only).
-+///  * Alloca/Phi/PgoCounterInc/Fence(compile-only): no code or acc-only.
-+///  * Everything else (casts, i128, atomics, intrinsics, memcpy, va_*,
-+///    inline asm, calls, selects, stack ops, f64/f128 anything): hazard
-+///    for BOTH. Calls are additionally call_points, but listing them here
-+///    keeps this table independent of the call filter.
-+///
-+/// Terminators: Return of a 64-bit value materializes %eax:%edx (edx
-+/// hazard); Switch uses %ecx for PIC jump tables (ecx hazard);
-+/// CondBranch/Branch evaluate the condition through the acc (clean).
-+fn collect_i686_scratch_hazard_points(
-+    func: &IrFunction,
-+    wide: &FxHashSet<u32>,
-+) -> (Vec<u32>, Vec<u32>) {
-+    use crate::ir::reexports::{IrBinOp, IrUnaryOp};
-+    let mut ecx: Vec<u32> = Vec::new();
-+    let mut edx: Vec<u32> = Vec::new();
-+    let mut point: u32 = 0;
-+
-+    let is_gpr32 = |ty: &IrType| {
-+        matches!(
-+            ty,
-+            IrType::I8
-+                | IrType::U8
-+                | IrType::I16
-+                | IrType::U16
-+                | IrType::I32
-+                | IrType::U32
-+                | IrType::Ptr
-+        )
-+    };
-+    let const_imm = |op: &Operand| {
-+        matches!(
-+            op,
-+            Operand::Const(IrConst::I8(_))
-+                | Operand::Const(IrConst::I16(_))
-+                | Operand::Const(IrConst::I32(_))
-+                | Operand::Const(IrConst::Zero)
-+        ) || matches!(op, Operand::Const(IrConst::I64(v)) if *v >= i32::MIN as i64 && *v <= i32::MAX as i64)
-+    };
-+
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            let (ecx_clean, edx_clean) = match inst {
-+                Instruction::BinOp { op, ty, rhs, .. } if is_gpr32(ty) => match op {
-+                    // Const rhs folds to `op $imm,%eax` (acc-only). Non-const
-+                    // rhs stages in %ecx (shifts through %cl) -- ecx hazard,
-+                    // %edx untouched on all these paths.
-+                    IrBinOp::Add
-+                    | IrBinOp::Sub
-+                    | IrBinOp::Mul
-+                    | IrBinOp::And
-+                    | IrBinOp::Or
-+                    | IrBinOp::Xor
-+                    | IrBinOp::Shl
-+                    | IrBinOp::AShr
-+                    | IrBinOp::LShr => (const_imm(rhs), true),
-+                    // div/rem: cltd+idivl clobber %edx, rhs staged in %ecx.
-+                    _ => (false, false),
-+                },
-+                // 32-bit compare: const rhs -> cmpl $imm/testl (acc-only);
-+                // value rhs -> staged in %ecx. sete/movzbl are acc-only.
-+                // %edx untouched either way.
-+                Instruction::Cmp { ty, rhs, .. } if is_gpr32(ty) => (const_imm(rhs), true),
-+                Instruction::Copy { dest, src } => {
-+                    // 32-bit copies are acc-only; WIDE copies materialize the
-+                    // high half in %edx. Wide-ness comes from the non-GPR set
-+                    // (I64/U64/F64/F128 on 32-bit targets).
-+                    match src {
-+                        Operand::Value(v) => {
-+                            let c = !wide.contains(&v.0) && !wide.contains(&dest.0);
-+                            (c, c)
-+                        }
-+                        c => {
-+                            let k = const_imm(c) && !wide.contains(&dest.0);
-+                            (k, k)
++        // Pattern 2b: Immediate/symbol-load + move fusion --
++        // `movl $X, %eax; movl %eax, %REG` becomes `movl $X, %REG` under the
++        // same deadness scan as Pattern 2a. The codegen emits this shape for
++        // every constant that lands in a phase-2 register (%ecx/%edx), e.g.
++        // `movl $.Lstr0, %eax; movl %eax, %edx`. GCC materializes the
++        // constant into the final register directly.
++        if let LineKind::Other { dest_reg } = infos[i].kind {
++            if dest_reg == REG_EAX {
++                let src_line = trimmed(store, &infos[i], i);
++                if src_line.starts_with("movl $") && src_line.ends_with("%eax")
++                    && !src_line.contains('(')
++                {
++                    if let LineKind::Move { dst: mdst, src: msrc } = infos[j].kind {
++                        if msrc == REG_EAX && mdst != REG_EAX && mdst <= REG_GP_MAX {
++                            // Same bounded deadness scan as Pattern 2a.
++                            let mut k = j + 1;
++                            let mut cnt = 0;
++                            let mut dead = false;
++                            while k < len && cnt < 24 {
++                                if infos[k].is_nop() { k += 1; continue; }
++                                if infos[k].is_barrier() { break; }
++                                let s = trimmed(store, &infos[k], k);
++                                let written = match infos[k].kind {
++                                    LineKind::Other { dest_reg } => dest_reg == REG_EAX,
++                                    LineKind::Move { dst, .. } => dst == REG_EAX,
++                                    LineKind::LoadEbp { reg, .. } => reg == REG_EAX,
++                                    LineKind::SetCC { reg } => reg == REG_EAX,
++                                    _ => false,
++                                };
++                                if written && !line_reads_dest_source(s, REG_EAX) {
++                                    dead = true;
++                                    break;
++                                }
++                                if line_references_reg(s, REG_EAX)
++                                    || line_writes_reg_implicitly(s, REG_EAX)
++                                {
++                                    break;
++                                }
++                                k += 1;
++                                cnt += 1;
++                            }
++                            if dead {
++                                let comma = src_line.rfind(',').unwrap();
++                                let imm = &src_line[..comma]; // "movl $X"
++                                let fused = format!("    {}, {}", imm, reg32_name(mdst));
++                                store.replace(i, fused);
++                                infos[i] = classify_line(store.get(i));
++                                infos[j].kind = LineKind::Nop;
++                                changed = true;
++                                i += 1;
++                                continue;
++                            }
 +                        }
 +                    }
 +                }
-+                // negl/notl/lzcnt/tzcnt/bswap/popcnt: all acc-only.
-+                // BitReverse/IsConstant excluded (fail closed).
-+                Instruction::UnaryOp { op, ty, .. }
-+                    if is_gpr32(ty)
-+                        && matches!(
-+                            op,
-+                            IrUnaryOp::Neg
-+                                | IrUnaryOp::Not
-+                                | IrUnaryOp::Clz
-+                                | IrUnaryOp::Ctz
-+                                | IrUnaryOp::Bswap
-+                                | IrUnaryOp::Popcount
-+                        ) =>
-+                {
-+                    (true, true)
++            }
++        }
++
+         // Pattern 2: Adjacent store/load with same offset
+         if let LineKind::StoreEbp { reg: store_reg, offset: store_off, size: store_size } = infos[i].kind {
+             if let LineKind::LoadEbp { reg: load_reg, offset: load_off, size: load_size } = infos[j].kind {
+diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
+index c0ab00c4..2303250f 100644
+--- a/src/backend/regalloc.rs
++++ b/src/backend/regalloc.rs
+@@ -2136,6 +2136,22 @@ fn collect_i686_scratch_hazard_points(
+     let mut edx: Vec<u32> = Vec::new();
+     let mut point: u32 = 0;
+ 
++    // Allocas with alignment <= 16 resolve to SlotAddr::Direct: their loads
++    // and stores are pure `movl slot(%esp),%eax` / `movl %eax,slot(%esp)`
++    // with NO pointer staging in %ecx. Over-aligned allocas go through
++    // emit_alloca_aligned_addr (lea+add+and into %ecx) and stay hazards.
++    // Mirrors slot_assignment.rs: alloca_alignments only records > 16.
++    let mut direct_allocas: FxHashSet<u32> = FxHashSet::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Instruction::Alloca { dest, align, .. } = inst {
++                if *align <= 16 {
++                    direct_allocas.insert(dest.0);
 +                }
-+                // 32-bit loads: direct slot is acc-only, indirect pulls the
-+                // pointer through %ecx; can't tell them apart here, so %ecx
-+                // is a hazard. No 32-bit load path touches %edx.
-+                Instruction::Load { ty, .. } if is_gpr32(ty) => (false, true),
-+                // Stores: pointer through %ecx AND the const-offset override
-+                // calls emit_save_acc (movl %eax,%edx) on its OverAligned/
-+                // Indirect paths -- both registers are hazards.
-+                Instruction::Store { .. } => (false, false),
-+                // GEP: %ecx is the secondary/address scratch; %edx unused
-+                // (emit_gep_direct/indirect_const and leal base+index are
-+                // acc-only, general path uses acc+%ecx).
-+                Instruction::GetElementPtr { .. } => (false, true),
-+                Instruction::Alloca { .. }
-+                | Instruction::Phi { .. }
-+                | Instruction::PgoCounterInc { .. } => (true, true),
-+                // 32-bit select: acc + branch; wide-cond check ORs the halves
-+                // through the acc only.
-+                Instruction::Select { ty, .. } if is_gpr32(ty) => (true, true),
-+                Instruction::ParamRef { ty, .. } if is_gpr32(ty) => (true, true),
-+                // movl $sym,%eax / movl sym@GOT(%ebx),%eax: acc + %ebx only.
-+                Instruction::GlobalAddr { .. } | Instruction::LabelAddr { .. } => (true, true),
-+                // Everything else (casts, i128, atomics, intrinsics, memcpy,
-+                // va_*, inline asm, calls, f64/f128 ops, dynalloca, stack
-+                // save/restore): fail closed, hazard for both.
-+                _ => (false, false),
-+            };
-+            if !ecx_clean {
-+                ecx.push(point);
 +            }
-+            if !edx_clean {
-+                edx.push(point);
-+            }
-+            point += 1;
 +        }
-+        // Terminator occupies one program point (liveness.rs increments once
-+        // after recording terminator uses).
-+        let ret_is_gpr32 = is_gpr32(&func.return_type);
-+        let (t_ecx_clean, t_edx_clean) = match &block.terminator {
-+            // 32-bit returns load the acc only; wide returns set %eax:%edx.
-+            Terminator::Return(Some(_)) => (true, ret_is_gpr32),
-+            Terminator::Return(None) => (true, true),
-+            Terminator::Branch(_) => (true, true),
-+            // Compare-and-branch FUSION re-emits the block's Cmp at the
-+            // terminator (recorded operands), so a value-rhs compare runs
-+            // operand_to_ecx HERE, not at the Cmp's own program point.
-+            // Fail closed: every CondBranch is an %ecx hazard.
-+            Terminator::CondBranch { .. } => (false, true),
-+            Terminator::Switch { .. } => (false, true), // PIC table via %ecx
-+            Terminator::IndirectBranch { .. } => (false, false),
-+            Terminator::Unreachable => (true, true), // emits nothing
-+        };
-+        if !t_ecx_clean {
-+            ecx.push(point);
-+        }
-+        if !t_edx_clean {
-+            edx.push(point);
-+        }
-+        point += 1;
 +    }
-+    (ecx, edx)
-+}
 +
- /// Build a sorted list of allocation candidates from live intervals.
- ///
- /// Filters by eligibility, minimum span length, and call-spanning behavior:
-diff --git a/tests/fuzz/m32_differential_fuzz.py b/tests/fuzz/m32_differential_fuzz.py
-new file mode 100644
-index 00000000..3ff0dd7e
---- /dev/null
-+++ b/tests/fuzz/m32_differential_fuzz.py
-@@ -0,0 +1,164 @@
-+#!/usr/bin/env python3
-+"""i686 (-m32) differential fuzz without a 32-bit libc.
+     let is_gpr32 = |ty: &IrType| {
+         matches!(
+             ty,
+@@ -2212,14 +2228,29 @@ fn collect_i686_scratch_hazard_points(
+                 {
+                     (true, true)
+                 }
+-                // 32-bit loads: direct slot is acc-only, indirect pulls the
+-                // pointer through %ecx; can't tell them apart here, so %ecx
+-                // is a hazard. No 32-bit load path touches %edx.
+-                Instruction::Load { ty, .. } if is_gpr32(ty) => (false, true),
+-                // Stores: pointer through %ecx AND the const-offset override
+-                // calls emit_save_acc (movl %eax,%edx) on its OverAligned/
+-                // Indirect paths -- both registers are hazards.
+-                Instruction::Store { .. } => (false, false),
++                // 32-bit loads: a DIRECT-alloca pointer (align <= 16) is
++                // `movl slot,%eax` -- acc-only, both registers clean. Any
++                // other pointer is staged in %ecx. No 32-bit load path
++                // touches %edx.
++                Instruction::Load { ty, ptr, seg_override, .. } if is_gpr32(ty) => {
++                    // %gs:/%fs: loads take a different emitter path -- fail
++                    // closed on any non-default address space.
++                    let clean = direct_allocas.contains(&ptr.0)
++                        && *seg_override == crate::common::types::AddressSpace::Default;
++                    (clean, true)
++                }
++                // Stores: direct-alloca 32-bit stores are `movl %eax,slot`
++                // (emit_typed_store_to_slot, acc-only). All other stores
++                // stage the pointer in %ecx, and the const-offset override
++                // additionally calls emit_save_acc (movl %eax,%edx) on its
++                // OverAligned/Indirect paths -- hazard for both. Wide stores
++                // (I64/F64) materialize %eax:%edx even for direct slots.
++                Instruction::Store { ty, ptr, seg_override, .. } => {
++                    let direct32 = is_gpr32(ty)
++                        && direct_allocas.contains(&ptr.0)
++                        && *seg_override == crate::common::types::AddressSpace::Default;
++                    (direct32, direct32)
++                }
+                 // GEP: %ecx is the secondary/address scratch; %edx unused
+                 // (emit_gep_direct/indirect_const and leal base+index are
+                 // acc-only, general path uses acc+%ecx).
+diff --git a/src/backend/traits.rs b/src/backend/traits.rs
+index a179f396..dd06f536 100644
+--- a/src/backend/traits.rs
++++ b/src/backend/traits.rs
+@@ -156,9 +156,14 @@ pub trait ArchCodegen {
+                 self.state().reg_cache.invalidate_acc();
+             }
+             (Some(d), None) => {
+-                // Dest in register, src on stack/constant: load to acc then move
+-                self.emit_load_operand(src);
+-                self.emit_acc_to_phys_reg(d);
++                // Dest in register, src on stack/constant. Backends that can
++                // materialize straight into the destination register do so
++                // (movl src,%ecx -- one instruction); the default detours
++                // through the accumulator (load-to-acc + move).
++                if !self.emit_load_direct_to_phys_reg(src, d) {
++                    self.emit_load_operand(src);
++                    self.emit_acc_to_phys_reg(d);
++                }
+                 self.state().reg_cache.invalidate_acc();
+             }
+             _ => {
+@@ -169,6 +174,14 @@ pub trait ArchCodegen {
+         }
+     }
+ 
++    /// Load a stack/constant operand DIRECTLY into a physical register,
++    /// bypassing the accumulator. Returns false when the backend cannot (or
++    /// the operand shape is unsupported); the caller then falls back to the
++    /// load-to-acc + move detour. Default: not supported.
++    fn emit_load_direct_to_phys_reg(&mut self, _src: &Operand, _dest: PhysReg) -> bool {
++        false
++    }
 +
-+Generates deterministic, libc-free C functions (int32 arithmetic, control
-+flow, arrays, pointer walks -- the constructs the i686 ecx/edx caller-saved
-+allocation touches), compiles them with lccc -m32 and gcc -m32, links each
-+against a tiny nostdlib _start driver that folds the results of many calls
-+into an 8-bit exit code, runs both binaries and compares exit codes.
-+
-+Usage:
-+  python3 m32_differential_fuzz.py --ccc path/to/lccc [--seeds 0:100]
-+                                   [--levels O0,O2,Os] [--out /tmp/m32fz]
-+"""
-+import argparse
-+import json
-+import random
-+import subprocess
-+import sys
-+from pathlib import Path
-+
-+DRIVER = r"""
-+.globl _start
-+_start:
-+    xorl %ebp, %ebp          # accumulator
-+    movl $SEEDVAL, %esi      # input seed
-+    movl $17, %edi           # iterations
-+1:
-+    subl $8, %esp
-+    movl %esi, (%esp)
-+    movl %edi, 4(%esp)
-+    call probe
-+    addl $8, %esp
-+    xorl %eax, %ebp
-+    roll $5, %ebp
-+    imull $0x01000193, %esi, %esi
-+    addl $0x9e3779b9, %esi
-+    decl %edi
-+    jnz 1b
-+    movl %ebp, %ebx
-+    andl $255, %ebx
-+    movl $1, %eax
-+    int $0x80
-+"""
-+
-+
-+def gen_c(seed: int) -> str:
-+    rng = random.Random(seed)
-+    n_vars = rng.randint(4, 9)
-+    vars_ = [f"v{i}" for i in range(n_vars)]
-+    lines = [
-+        "typedef unsigned int u32;",
-+        "typedef int i32;",
-+        "static u32 g_arr[16];",
-+        "static u32 g_x;",
-+        "static u32 helper(u32 a, u32 b) {",
-+        "  return (a ^ (b << 3)) + (a >> (b & 15)) + (b | 0x55);",
-+        "}",
-+        "i32 probe(i32 seed, i32 iter) {",
-+    ]
-+    for i, v in enumerate(vars_):
-+        expr = rng.choice([
-+            f"(u32)seed * {rng.randint(3, 977)}u",
-+            f"(u32)seed ^ {rng.randint(1, 1 << 30)}u",
-+            f"(u32)(seed + iter * {rng.randint(1, 99)})",
-+            f"(u32)seed >> {rng.randint(1, 7)}",
-+        ])
-+        lines.append(f"  u32 {v} = {expr};")
-+    lines.append("  g_x = (u32)seed;")
-+    lines.append(f"  for (i32 i = 0; i < (iter & 15) + 2; i++) {{")
-+    lines.append(f"    g_arr[i & 15] = g_arr[(i + 3) & 15] + {vars_[0]} + (u32)i;")
-+    body_ops = rng.randint(4, 10)
-+    for _ in range(body_ops):
-+        d = rng.choice(vars_)
-+        a = rng.choice(vars_)
-+        b = rng.choice(vars_)
-+        op = rng.choice([
-+            f"{d} = {a} + {b};",
-+            f"{d} = {a} - ({b} >> 2);",
-+            f"{d} = {a} * ({b} | 1u);",
-+            f"{d} = {a} ^ ({b} + 0x9e37u);",
-+            f"{d} = {a} & ({b} | 0x0f0fu);",
-+            f"{d} = ({a} << ({b} & 7u)) | ({a} >> (32 - ({b} & 7u) - 1));",
-+            f"{d} = helper({a}, {b});",
-+            f"{d} = ({a} > {b}) ? {a} - {b} : {b} - {a};",
-+            f"if ({a} % 3u == 1u) {d} += g_arr[{b} & 15];",
-+            f"{d} = {a} / (({b} & 7u) + 1u);",
-+            f"{d} = {a} % (({b} & 15u) + 1u);",
-+        ])
-+        lines.append(f"    {op}")
-+    lines.append("    g_x = g_x * 1664525u + 1013904223u;")
-+    lines.append("  }")
-+    fold = " ^ ".join(vars_)
-+    lines.append(f"  return (i32)({fold} ^ g_x ^ g_arr[seed & 15]);")
-+    lines.append("}")
-+    return "\n".join(lines) + "\n"
-+
-+
-+def run(cmd, timeout=30):
-+    try:
-+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-+        return p.returncode, p.stderr
-+    except Exception as e:  # noqa: BLE001
-+        return "ERR", repr(e)
-+
-+
-+def main() -> int:
-+    ap = argparse.ArgumentParser()
-+    ap.add_argument("--ccc", required=True)
-+    ap.add_argument("--gcc", default="/usr/bin/gcc")
-+    ap.add_argument("--seeds", default="0:100")
-+    ap.add_argument("--levels", default="O0,O2,Os")
-+    ap.add_argument("--out", default="/tmp/m32fz")
-+    args = ap.parse_args()
-+
-+    lo, hi = (int(x) for x in args.seeds.split(":"))
-+    levels = args.levels.split(",")
-+    out = Path(args.out)
-+    out.mkdir(parents=True, exist_ok=True)
-+
-+    results = {"pass": 0, "mismatch": 0, "lccc_compile_failure": 0, "skip": 0}
-+    failures = []
-+    for seed in range(lo, hi):
-+        src = out / f"s{seed}.c"
-+        src.write_text(gen_c(seed))
-+        drv = out / f"d{seed}.s"
-+        drv.write_text(DRIVER.replace("SEEDVAL", str(0x1234 + seed * 7919)))
-+        for level in levels:
-+            common = ["-m32", "-fno-PIE", "-fomit-frame-pointer", f"-{level}", "-w"]
-+            lo_obj = out / f"s{seed}_{level}_l.o"
-+            go_obj = out / f"s{seed}_{level}_g.o"
-+            rc, err = run([args.ccc, *common, "-c", str(src), "-o", str(lo_obj)])
-+            if rc != 0:
-+                results["lccc_compile_failure"] += 1
-+                failures.append({"seed": seed, "level": level, "kind": "ccc_compile", "err": err[-400:]})
-+                continue
-+            rc, _ = run([args.gcc, *common, "-c", str(src), "-o", str(go_obj)])
-+            if rc != 0:
-+                results["skip"] += 1
-+                continue
-+            lbin = out / f"b{seed}_{level}_l"
-+            gbin = out / f"b{seed}_{level}_g"
-+            rc1, e1 = run([args.gcc, "-m32", "-nostdlib", "-no-pie", str(drv), str(lo_obj), "-o", str(lbin)])
-+            rc2, _ = run([args.gcc, "-m32", "-nostdlib", "-no-pie", str(drv), str(go_obj), "-o", str(gbin)])
-+            if rc1 != 0 or rc2 != 0:
-+                results["skip"] += 1
-+                continue
-+            lrc, _ = run([str(lbin)], timeout=10)
-+            grc, _ = run([str(gbin)], timeout=10)
-+            if lrc == grc and isinstance(lrc, int):
-+                results["pass"] += 1
-+            else:
-+                results["mismatch"] += 1
-+                failures.append({"seed": seed, "level": level, "kind": "mismatch",
-+                                 "lccc_exit": str(lrc), "gcc_exit": str(grc)})
-+
-+    summary = {"results": results, "failures": failures[:20],
-+               "seeds": args.seeds, "levels": levels}
-+    (out / "summary.json").write_text(json.dumps(summary, indent=1))
-+    print(json.dumps(results))
-+    return 0 if results["mismatch"] == 0 and results["lccc_compile_failure"] == 0 else 1
-+
-+
-+if __name__ == "__main__":
-+    sys.exit(main())
+     /// Try to lower an IR instruction to the MachInst pipeline (virtual register ISel).
+     /// Returns true if the instruction was handled by MachInst (accumulated in an
+     /// internal buffer). Returns false if the instruction should use the default
 -- 
 2.47.3
 
