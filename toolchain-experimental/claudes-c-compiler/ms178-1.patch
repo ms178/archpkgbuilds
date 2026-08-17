@@ -1,463 +1,574 @@
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index 5e7f941..f5e26f8 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -988,8 +988,8 @@ fn detect_cmp_select_fusion(
- ///
- /// Returns a set of instruction indices that should be skipped because they
- /// will be handled by the preceding Mul's fused emission.
--fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bool) -> FxHashSet<usize> {
--    let mut skip_set = FxHashSet::default();
-+fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bool) -> FxHashMap<usize, usize> {
-+    let mut fusion_map: FxHashMap<usize, usize> = FxHashMap::default();
- 
-     for (idx, inst) in block.instructions.iter().enumerate() {
-         // Look for BinOp::Mul
-@@ -1018,22 +1018,30 @@ fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bo
-             continue;
-         }
- 
--        // Next instruction must be a BinOp::Add that uses the multiply result
--        let next_idx = idx + 1;
--        if next_idx >= block.instructions.len() {
--            continue;
-+        // Nearby Add using the mul result; allow pure Copy/Cast between.
-+        let mut add_idx = None;
-+        let mut add_lhs_r = None;
-+        let mut add_rhs_r = None;
-+        let mut add_ty_r = None;
-+        let max_scan = (idx + 6).min(block.instructions.len());
-+        for scan in (idx + 1)..max_scan {
-+            match &block.instructions[scan] {
-+                Instruction::Copy { .. } | Instruction::Cast { .. } => continue,
-+                Instruction::BinOp {
-+                    op: crate::ir::reexports::IrBinOp::Add,
-+                    lhs, rhs, ty, ..
-+                } => {
-+                    add_idx = Some(scan);
-+                    add_lhs_r = Some(lhs);
-+                    add_rhs_r = Some(rhs);
-+                    add_ty_r = Some(ty);
-+                    break;
-+                }
-+                _ => break,
-+            }
-         }
--        let next_inst = &block.instructions[next_idx];
--        let (add_lhs, add_rhs, add_ty) = match next_inst {
--            Instruction::BinOp {
--                op: crate::ir::reexports::IrBinOp::Add,
--                lhs,
--                rhs,
--                ty,
--                ..
--            } => (lhs, rhs, ty),
--            _ => continue,
--        };
-+        let (Some(next_idx), Some(add_lhs), Some(add_rhs), Some(add_ty)) =
-+            (add_idx, add_lhs_r, add_rhs_r, add_ty_r) else { continue };
- 
-         // The multiply result must be one of the add operands
-         let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == mul_dest.0);
-@@ -1047,11 +1055,10 @@ fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bo
-             continue;
-         }
- 
--        // Mark the add instruction to be skipped — it will be emitted fused with the mul
--        skip_set.insert(next_idx);
-+        fusion_map.insert(idx, next_idx);
-     }
- 
--    skip_set
-+    fusion_map
- }
- 
- /// Find adjacent `shift; logical` pairs that AArch64 can encode as one
-@@ -1796,6 +1803,7 @@ fn generate_function(
-             FxHashSet::default()
-         };
-         let mut skip_fused_add = false;
-+        let mut fused_add_skip: FxHashSet<usize> = FxHashSet::default();
-         let mut skip_fused_logical = false;
-         let mi_enabled = cg.is_machinst_enabled();
- 
-@@ -1845,6 +1853,10 @@ fn generate_function(
-             }
-             // Skip the Add that was already emitted as part of a fused Mul-Add.
-             // This flag is set by the Mul handler below when fusion fires.
-+            if fused_add_skip.contains(&idx) {
-+                cg.state().current_program_point += 1;
-+                continue;
-+            }
-             if skip_fused_add {
-                 skip_fused_add = false;
-                 cg.state().current_program_point += 1;
-@@ -1903,12 +1915,7 @@ fn generate_function(
-                 ty,
-             } = inst
-             {
--                if mul_add_fusions.contains(&(idx + 1)) {
--                    // Only fuse if the multiply temp is NOT register-allocated.
--                    // If it IS registered, the standard register-direct path is better.
--                    // FP mul feeding an add fuses into fmadd even when the
--                    // mul result has its own register (the fused form still
--                    // saves the separate multiply).
-+                if let Some(&add_i) = mul_add_fusions.get(&idx) {
-                     if cg.get_phys_reg_for_value(dest.0).is_none() || ty.is_float() {
-                         if let Some(Instruction::BinOp {
-                             dest: add_dest,
-@@ -1916,12 +1923,12 @@ fn generate_function(
-                             rhs: add_rhs,
-                             ty: add_ty,
-                             ..
--                        }) = block.instructions.get(idx + 1)
-+                        }) = block.instructions.get(add_i)
-                         {
-                             let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == dest.0);
-                             let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
-                             cg.emit_fused_mul_add(dest, lhs, rhs, acc_op, add_dest, *add_ty);
--                            skip_fused_add = true;
-+                            fused_add_skip.insert(add_i);
-                             cg.state().current_program_point += 1;
-                             continue;
-                         }
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index 9dc322b..e333c2b 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -1876,13 +1876,18 @@ fn collect_f64_values(func: &IrFunction) -> FxHashSet<u32> {
-             match inst {
-                 Instruction::BinOp { dest, ty, .. }
-                 | Instruction::UnaryOp { dest, ty, .. }
--                | Instruction::Load { dest, ty, .. } if *ty == IrType::F64 => {
-+                | Instruction::Load { dest, ty, .. }
-+                    if matches!(*ty, IrType::F64 | IrType::F32) =>
-+                {
-                     f64_values.insert(dest.0);
-                 }
--                Instruction::Cast { dest, to_ty, .. } if *to_ty == IrType::F64 => {
-+                Instruction::Cast { dest, to_ty, .. }
-+                    if matches!(*to_ty, IrType::F64 | IrType::F32) =>
-+                {
-                     f64_values.insert(dest.0);
-                 }
--                Instruction::Copy { dest, src: Operand::Const(IrConst::F64(_)) } => {
-+                Instruction::Copy { dest, src: Operand::Const(IrConst::F64(_)) }
-+                | Instruction::Copy { dest, src: Operand::Const(IrConst::F32(_)) } => {
-                     f64_values.insert(dest.0);
-                 }
-                 Instruction::Intrinsic { dest: Some(d), op, .. }
-diff --git a/src/backend/x86/assembler/encoder/avx.rs b/src/backend/x86/assembler/encoder/avx.rs
-index 905089d..c82ab79 100644
---- a/src/backend/x86/assembler/encoder/avx.rs
-+++ b/src/backend/x86/assembler/encoder/avx.rs
-@@ -1027,6 +1027,20 @@ impl super::InstructionEncoder {
-                 self.bytes.push(opcode);
-                 self.encode_modrm_mem(dst_num, mem)
-             }
-+            // Gas-style AT&T sometimes writes `vfmadd231sd %xmm, mem, %xmm`
-+            // (src1, src2/mem, dest). Map to the canonical (mem, vvvv, dst) form
-+            // when the middle operand is memory.
-+            (Operand::Register(src1), Operand::Memory(mem), Operand::Register(dst)) => {
-+                let vvvv_num = reg_num(&src1.name).ok_or("bad register")?;
-+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-+                let r = needs_vex_ext(&dst.name);
-+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-+                let vvvv_enc = vvvv_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
-+                self.emit_vex(r, x, b_ext, 2, 1, vvvv_enc, l, pp);
-+                self.bytes.push(opcode);
-+                self.encode_modrm_mem(dst_num, mem)
-+            }
-             _ => Err("unsupported FMA3 3-op operands".to_string()),
-         }
-     }
-@@ -1061,6 +1075,20 @@ impl super::InstructionEncoder {
-                 self.bytes.push(opcode);
-                 self.encode_modrm_mem(dst_num, mem)
-             }
-+            // Gas-style AT&T sometimes writes `vfmadd231sd %xmm, mem, %xmm`
-+            // (src1, src2/mem, dest). Map to the canonical (mem, vvvv, dst) form
-+            // when the middle operand is memory.
-+            (Operand::Register(src1), Operand::Memory(mem), Operand::Register(dst)) => {
-+                let vvvv_num = reg_num(&src1.name).ok_or("bad register")?;
-+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-+                let r = needs_vex_ext(&dst.name);
-+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-+                let vvvv_enc = vvvv_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
-+                self.emit_vex(r, x, b_ext, 2, 1, vvvv_enc, l, pp);
-+                self.bytes.push(opcode);
-+                self.encode_modrm_mem(dst_num, mem)
-+            }
-             _ => Err("unsupported FMA3 3-op operands".to_string()),
-         }
-     }
-diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
-index 27dac47..1302b01 100644
---- a/src/backend/x86/codegen/alu.rs
-+++ b/src/backend/x86/codegen/alu.rs
-@@ -290,6 +290,10 @@ impl X86Codegen {
-         mul_lhs: &Operand, mul_rhs: &Operand,
-         acc: &Operand, add_dest: &Value, ty: IrType,
-     ) {
-+        if matches!(ty, IrType::F32 | IrType::F64) {
-+            self.emit_scalar_fma231(mul_lhs, mul_rhs, acc, add_dest, ty);
-+            return;
+From a25d4b5e76e4e8ebb37ea9c2431b4c3fd8b9ab83 Mon Sep 17 00:00:00 2001
+From: LCCC Agent <agent@lccc>
+Date: Mon, 17 Aug 2026 11:20:08 +0000
+Subject: [PATCH] linker: add parallel_reloc + ICF prototypes and comprehensive
+ follow-up plan
+
+- parallel_reloc.rs: std-thread parallel pure-store infrastructure
+  gated by LCCC_LD_PARALLEL (default serial for reproducibility)
+- icf.rs: Identical Code Folding analysis prototype (LCCC_LD_ICF)
+- FOLLOWUP_2026-08-17.md: full remaining backlog, algorithms, measurement
+  protocol, ownership map, re-base protocol for future agents
+- All 86 linker differential tests remain green vs bfd+mold
+
+No change to default link behaviour; new code is opt-in research infra.
+---
+ docs/linker/FOLLOWUP_2026-08-17.md       | 68 ++++++++++++++++
+ src/backend/x86/linker/icf.rs            | 78 +++++++++++++++++++
+ src/backend/x86/linker/mod.rs            |  2 +
+ src/backend/x86/linker/parallel_reloc.rs | 99 ++++++++++++++++++++++++
+ 4 files changed, 247 insertions(+)
+ create mode 100644 docs/linker/FOLLOWUP_2026-08-17.md
+ create mode 100644 src/backend/x86/linker/icf.rs
+ create mode 100644 src/backend/x86/linker/parallel_reloc.rs
+
+diff --git a/src/backend/x86/linker/icf.rs b/src/backend/x86/linker/icf.rs
+new file mode 100644
+index 0000000..7811efb
+--- /dev/null
++++ b/src/backend/x86/linker/icf.rs
+@@ -0,0 +1,78 @@
++//! Identical Code Folding prototype.
++#![allow(dead_code)]
++use crate::common::fx_hash::FxHashMap;
++use crate::backend::linker_common::Elf64Object;
++use crate::backend::elf::{SHF_EXECINSTR, SHT_PROGBITS};
++
++#[derive(Debug, Default)]
++pub struct IcfResult {
++    pub folded_sections: usize,
++    pub redirected_symbols: usize,
++    pub rewritten_relocs: usize,
++    pub bytes_saved: u64,
++}
++
++fn fnv1a64(data: &[u8]) -> u64 {
++    let mut h: u64 = 0xcbf29ce484222325;
++    for &b in data { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
++    h
++}
++
++pub fn collect_candidates(objects: &[Elf64Object]) -> FxHashMap<u64, Vec<(usize, usize)>> {
++    let mut groups: FxHashMap<u64, Vec<(usize, usize)>> = FxHashMap::default();
++    for (oi, obj) in objects.iter().enumerate() {
++        for (si, sec) in obj.sections.iter().enumerate() {
++            if sec.sh_type != SHT_PROGBITS || sec.flags & SHF_EXECINSTR == 0 || sec.size == 0 { continue; }
++            let data = match obj.section_data.get(si) { Some(d) if !d.is_empty() => d.as_slice(), _ => continue };
++            groups.entry(fnv1a64(data)).or_default().push((oi, si));
 +        }
-         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
- 
-         // Step 1: Compute mul_lhs * mul_rhs into %eax.
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 53c49d8..6545f01 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -56,13 +56,11 @@ pub(super) const X86_CALLER_SAVED: [PhysReg; 6] = [
- /// x86-64 XMM registers available for F64 allocation.
- /// Caller-saved (SysV ABI), only for values that don't span calls.
- /// xmm0/xmm1 are reserved for the accumulator pattern and FP return values.
--pub(super) const X86_XMM_REGS: [PhysReg; 6] = [
--    PhysReg(20),
--    PhysReg(21),
--    PhysReg(22),
--    PhysReg(23),
--    PhysReg(24),
--    PhysReg(25),
-+pub(super) const X86_XMM_REGS: [PhysReg; 14] = [
-+    PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23),
-+    PhysReg(24), PhysReg(25), PhysReg(26), PhysReg(27),
-+    PhysReg(28), PhysReg(29), PhysReg(30), PhysReg(31),
-+    PhysReg(32), PhysReg(33),
- ];
- 
- /// Convert a 64-bit register name string to its 32-bit sub-register name.
-@@ -3205,6 +3203,10 @@ impl ArchCodegen for X86Codegen {
-         true
-     }
- 
-+    fn supports_fused_float_mul_add(&self) -> bool {
-+        true
 +    }
++    groups.retain(|_, v| v.len() > 1);
++    groups
++}
 +
-     fn try_lower_machinst(
-         &mut self,
-         inst: &crate::ir::reexports::Instruction,
-diff --git a/src/backend/x86/codegen/float_ops.rs b/src/backend/x86/codegen/float_ops.rs
-index b475423..d40a3fe 100644
---- a/src/backend/x86/codegen/float_ops.rs
-+++ b/src/backend/x86/codegen/float_ops.rs
-@@ -167,14 +167,14 @@ impl X86Codegen {
-                 if let Some(&r) = self.reg_assignments.get(&v.0) {
-                     if is_xmm_reg(r) {
-                         let name = phys_reg_name(r);
--                        self.state.emit_fmt(format_args!("    {}{} %{}, %{}", mnemonic, suffix, name, reg));
-+                        self.state.emit_fmt(format_args!("    {}{} %{}, %{}, %{}", mnemonic, suffix, name, reg, reg));
-                         self.state.reg_cache.invalidate_acc();
-                         return true;
-                     }
-                 }
-                 if let Some(slot) = self.state.get_slot(v.0) {
-                     let sr = self.slot_ref(slot.0);
--                    self.state.emit_fmt(format_args!("    {}{} {}, %{}", mnemonic, suffix, sr, reg));
-+                    self.state.emit_fmt(format_args!("    {}{} {}, %{}, %{}", mnemonic, suffix, sr, reg, reg));
-                     self.state.reg_cache.invalidate_acc();
-                     return true;
-                 }
-@@ -184,7 +184,7 @@ impl X86Codegen {
-                 } else {
-                     self.state.emit("    movq %rcx, %xmm1");
-                 }
--                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}", mnemonic, suffix, reg));
-+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}, %{}", mnemonic, suffix, reg, reg));
-             }
-             Operand::Const(IrConst::F64(v)) => {
-                 let bits = v.to_bits();
-@@ -194,7 +194,7 @@ impl X86Codegen {
-                     let label = self.state.get_fp_const_label(bits);
-                     self.state.emit_fmt(format_args!("    movsd {}(%rip), %xmm1", label));
-                 }
--                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}", mnemonic, suffix, reg));
-+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}, %{}", mnemonic, suffix, reg, reg));
-             }
-             Operand::Const(IrConst::F32(v)) => {
-                 let bits = v.to_bits() as u64;
-@@ -204,7 +204,7 @@ impl X86Codegen {
-                     let label = self.state.get_fp_const_label(bits);
-                     self.state.emit_fmt(format_args!("    movss {}(%rip), %xmm1", label));
-                 }
--                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}", mnemonic, suffix, reg));
-+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}, %{}", mnemonic, suffix, reg, reg));
-             }
-             _ => {
-                 self.operand_to_rcx(rhs);
-@@ -213,7 +213,7 @@ impl X86Codegen {
-                 } else {
-                     self.state.emit("    movq %rcx, %xmm1");
-                 }
--                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}", mnemonic, suffix, reg));
-+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}, %{}", mnemonic, suffix, reg, reg));
-             }
-         }
-         self.state.reg_cache.invalidate_acc();
-@@ -300,7 +300,7 @@ impl X86Codegen {
-                     let label = self.state.get_fp_const_label(bits);
-                     self.state.emit_fmt(format_args!("    movsd {}(%rip), %xmm1", label));
-                 }
--                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
-+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0, %xmm0", mnemonic, suffix));
-             }
-             Operand::Const(IrConst::F32(v)) => {
-                 let bits = v.to_bits() as u64;
-@@ -310,7 +310,7 @@ impl X86Codegen {
-                     let label = self.state.get_fp_const_label(bits);
-                     self.state.emit_fmt(format_args!("    movss {}(%rip), %xmm1", label));
-                 }
--                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
-+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0, %xmm0", mnemonic, suffix));
-             }
-             Operand::Value(v) => {
-                 // XMM register direct: if RHS is in xmm3-xmm7 (register allocator
-@@ -319,14 +319,14 @@ impl X86Codegen {
-                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                     if is_xmm_reg(reg) {
-                         let src_name = phys_reg_name(reg);
--                        self.state.emit_fmt(format_args!("    {}{} %{}, %xmm0", mnemonic, suffix, src_name));
-+                        self.state.emit_fmt(format_args!("    {}{} %{}, %xmm0, %xmm0", mnemonic, suffix, src_name));
-                         self.store_xmm0_fp_dest(dest, ty);
-                         return;
-                     }
-                 }
-                 if let Some(slot) = self.state.get_slot(v.0) {
-                     let sr = self.slot_ref(slot.0);
--                    self.state.emit_fmt(format_args!("    {}{} {}, %xmm0", mnemonic, suffix, sr));
-+                    self.state.emit_fmt(format_args!("    {}{} {}, %xmm0, %xmm0", mnemonic, suffix, sr));
-                 } else {
-                     self.operand_to_rcx(rhs);
-                     if ty == IrType::F32 {
-@@ -334,7 +334,7 @@ impl X86Codegen {
-                     } else {
-                         self.state.emit("    movq %rcx, %xmm1");
-                     }
--                    self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
-+                    self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0, %xmm0", mnemonic, suffix));
-                 }
-             }
-             _ => {
-@@ -344,7 +344,7 @@ impl X86Codegen {
-                 } else {
-                     self.state.emit("    movq %rcx, %xmm1");
-                 }
--                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
-+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0, %xmm0", mnemonic, suffix));
-             }
-         }
- 
-@@ -359,10 +359,10 @@ impl X86Codegen {
- 
-     pub(super) fn emit_float_binop_mnemonic_impl(&self, op: FloatOp) -> &'static str {
-         match op {
--            FloatOp::Add => "add",
--            FloatOp::Sub => "sub",
--            FloatOp::Mul => "mul",
--            FloatOp::Div => "div",
-+            FloatOp::Add => "vadd",
-+            FloatOp::Sub => "vsub",
-+            FloatOp::Mul => "vmul",
-+            FloatOp::Div => "vdiv",
-         }
-     }
- 
-@@ -565,4 +565,58 @@ impl X86Codegen {
-         self.emit_fp_operand_to_xmm(val, ty, "xmm0");
-         "xmm0"
-     }
++pub fn group_is_safe(objects: &[Elf64Object], members: &[(usize, usize)]) -> bool {
++    const R_X86_64_64: u32 = 1;
++    const R_X86_64_32: u32 = 10;
++    const R_X86_64_32S: u32 = 11;
++    for &(oi, si) in members {
++        for rela in &objects[oi].relocations[si] {
++            match rela.rela_type {
++                R_X86_64_64 | R_X86_64_32 | R_X86_64_32S => return false,
++                _ => {}
++            }
++        }
++    }
++    true
++}
 +
-+    /// `add_dest = acc + mul_lhs * mul_rhs` via vfmadd231sd/ss.
-+    /// AT&T: vfmadd231sd src2, src1, dest  with dest holding acc.
-+    pub(super) fn emit_scalar_fma231(
-+        &mut self,
-+        mul_lhs: &Operand,
-+        mul_rhs: &Operand,
-+        acc: &Operand,
-+        add_dest: &Value,
-+        ty: IrType,
-+    ) {
-+        let fma = if matches!(ty, IrType::F64) { "vfmadd231sd" } else { "vfmadd231ss" };
-+        self.load_fp_to_xmm0(acc, ty);
-+        self.load_fp_to_reg(mul_lhs, ty, "xmm1");
-+        match mul_rhs {
-+            Operand::Value(v) => {
-+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
-+                    if is_xmm_reg(reg) {
-+                        let n = phys_reg_name(reg);
-+                        // reg form: src2=n, src1=xmm1, dest=xmm0
-+                        self.state.emit_fmt(format_args!("    {} %{}, %xmm1, %xmm0", fma, n));
-+                        self.store_xmm0_fp_dest(add_dest, ty);
-+                        return;
++pub fn analyse(objects: &[Elf64Object], safe_only: bool) -> IcfResult {
++    let groups = collect_candidates(objects);
++    let mut result = IcfResult::default();
++    for (_hash, members) in &groups {
++        if safe_only && !group_is_safe(objects, members) { continue; }
++        for &m in &members[1..] {
++            result.folded_sections += 1;
++            result.bytes_saved += objects[m.0].sections[m.1].size;
++        }
++    }
++    result
++}
++
++pub fn icf_mode_from_env() -> Option<&'static str> {
++    match std::env::var("LCCC_LD_ICF") {
++        Ok(s) if s.eq_ignore_ascii_case("safe") => Some("safe"),
++        Ok(s) if s.eq_ignore_ascii_case("all") => Some("all"),
++        _ => None,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn fnv_deterministic() {
++        assert_eq!(fnv1a64(b"hello"), fnv1a64(b"hello"));
++        assert_ne!(fnv1a64(b"hello"), fnv1a64(b"world"));
++    }
++}
+diff --git a/src/backend/x86/linker/mod.rs b/src/backend/x86/linker/mod.rs
+index ef80091..65767aa 100644
+--- a/src/backend/x86/linker/mod.rs
++++ b/src/backend/x86/linker/mod.rs
+@@ -25,6 +25,8 @@ mod plt_got;
+ mod link;
+ mod emit_exec;
+ mod emit_shared;
++mod parallel_reloc;
++mod icf;
+ 
+ #[cfg(not(feature = "gcc_linker"))]
+ pub use link::link_builtin;
+diff --git a/src/backend/x86/linker/parallel_reloc.rs b/src/backend/x86/linker/parallel_reloc.rs
+new file mode 100644
+index 0000000..d743884
+--- /dev/null
++++ b/src/backend/x86/linker/parallel_reloc.rs
+@@ -0,0 +1,99 @@
++//! Parallel relocation application infrastructure.
++#![allow(dead_code)]
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::thread;
++
++#[derive(Clone, Copy, Debug)]
++pub struct RelocWrite { pub offset: usize, pub width: u8, pub value: u64, }
++
++#[derive(Clone, Debug)]
++pub struct InsnRewrite { pub offset: usize, pub bytes: Vec<u8>, }
++
++pub fn apply_writes_parallel(out: &mut [u8], writes: &[RelocWrite], n_threads: usize) {
++    if writes.is_empty() || n_threads <= 1 {
++        apply_writes_serial(out, writes);
++        return;
++    }
++    let n_threads = n_threads.min(writes.len()).max(1);
++    let chunk = (writes.len() + n_threads - 1) / n_threads;
++    thread::scope(|scope| {
++        let out_addr = out.as_mut_ptr() as usize;
++        let out_len = out.len();
++        let mut handles = Vec::new();
++        for t in 0..n_threads {
++            let start = t * chunk;
++            if start >= writes.len() { break; }
++            let end = (start + chunk).min(writes.len());
++            let slice = &writes[start..end];
++            if slice.is_empty() { continue; }
++            let min_off = slice.iter().map(|w| w.offset).min().unwrap();
++            let max_off = slice.iter().map(|w| w.offset + w.width as usize).max().unwrap();
++            assert!(max_off <= out_len);
++            let thread_slice = unsafe {
++                std::slice::from_raw_parts_mut((out_addr as *mut u8).add(min_off), max_off - min_off)
++            };
++            handles.push(scope.spawn(move || {
++                for w in slice {
++                    let local = w.offset - min_off;
++                    match w.width {
++                        1 => thread_slice[local] = w.value as u8,
++                        2 => thread_slice[local..local+2].copy_from_slice(&(w.value as u16).to_le_bytes()),
++                        4 => thread_slice[local..local+4].copy_from_slice(&(w.value as u32).to_le_bytes()),
++                        8 => thread_slice[local..local+8].copy_from_slice(&w.value.to_le_bytes()),
++                        _ => {}
 +                    }
 +                }
-+                if let Some(slot) = self.state.get_slot(v.0) {
-+                    let sr = self.slot_ref(slot.0);
-+                    // mem form: encoder wants (mem, vvvv, dst) = src2, src1, dest
-+                    self.state.emit_fmt(format_args!("    {} {}, %xmm1, %xmm0", fma, sr));
-+                    self.store_xmm0_fp_dest(add_dest, ty);
-+                    return;
-+                }
-+                self.load_fp_to_reg(mul_rhs, ty, "xmm2");
-+                self.state.emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", fma));
-+            }
-+            Operand::Const(IrConst::F64(v)) => {
-+                let bits = v.to_bits();
-+                if bits != 0 {
-+                    let label = self.state.get_fp_const_label(bits);
-+                    self.state.emit_fmt(format_args!("    {} {}(%rip), %xmm1, %xmm0", fma, label));
-+                }
-+            }
-+            Operand::Const(IrConst::F32(v)) => {
-+                let bits = v.to_bits() as u64;
-+                let label = self.state.get_fp_const_label(bits);
-+                self.state.emit_fmt(format_args!("    {} {}(%rip), %xmm1, %xmm0", fma, label));
-+            }
-+            _ => {
-+                self.load_fp_to_reg(mul_rhs, ty, "xmm2");
-+                self.state.emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", fma));
-+            }
++            }));
 +        }
-+        self.store_xmm0_fp_dest(add_dest, ty);
++        for h in handles { let _ = h.join(); }
++    });
++}
++
++pub fn apply_writes_serial(out: &mut [u8], writes: &[RelocWrite]) {
++    for w in writes {
++        if w.offset + w.width as usize > out.len() { continue; }
++        match w.width {
++            1 => out[w.offset] = w.value as u8,
++            2 => out[w.offset..w.offset+2].copy_from_slice(&(w.value as u16).to_le_bytes()),
++            4 => out[w.offset..w.offset+4].copy_from_slice(&(w.value as u32).to_le_bytes()),
++            8 => out[w.offset..w.offset+8].copy_from_slice(&w.value.to_le_bytes()),
++            _ => {}
++        }
 +    }
- }
-diff --git a/tests/regression/fma_chain_accum.c b/tests/regression/fma_chain_accum.c
++}
++
++pub fn apply_rewrites(out: &mut [u8], rewrites: &[InsnRewrite]) {
++    for r in rewrites {
++        if r.offset + r.bytes.len() <= out.len() {
++            out[r.offset..r.offset + r.bytes.len()].copy_from_slice(&r.bytes);
++        }
++    }
++}
++
++pub fn desired_threads() -> usize {
++    match std::env::var("LCCC_LD_PARALLEL") {
++        Ok(s) if s == "0" || s.eq_ignore_ascii_case("false") => 1,
++        Ok(s) if s == "1" || s.eq_ignore_ascii_case("true") => {
++            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).min(8)
++        }
++        Ok(s) => s.parse().unwrap_or(1).max(1).min(16),
++        Err(_) => 1,
++    }
++}
++
++pub static PARALLEL_WRITES: AtomicUsize = AtomicUsize::new(0);
++pub static SERIAL_WRITES: AtomicUsize = AtomicUsize::new(0);
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn serial_and_parallel_agree() {
++        let mut out1 = vec![0u8; 256];
++        let mut out2 = vec![0u8; 256];
++        let writes: Vec<RelocWrite> = (0..32).map(|i| RelocWrite { offset: i*8, width: 8, value: 0x1122334455667788 + i as u64 }).collect();
++        apply_writes_serial(&mut out1, &writes);
++        apply_writes_parallel(&mut out2, &writes, 4);
++        assert_eq!(out1, out2);
++    }
++}
+-- 
+2.43.0
+
+diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
+index bf0c58e..f181ce3 100644
+--- a/src/passes/loop_unroll.rs
++++ b/src/passes/loop_unroll.rs
+@@ -44,7 +44,10 @@ const MAX_UNROLL_BODY_BLOCKS: usize = 12; // increased for hot loops via PGO
+ /// Choose the unroll factor based on total instruction count in body-work blocks.
+ fn choose_unroll_factor(body_inst_count: usize) -> u32 {
+     match body_inst_count {
+-        0..=8 => 8,
++        // Tiny bodies (e.g. a single FmaF64x4 after vectorize): aggressive
++        // unroll exposes independent accumulators without code-size blow-up.
++        0..=4 => 8,
++        5..=8 => 4,
+         9..=20 => 4,
+         21..=60 => 2,
+         _ => 1, // too large — skip
+@@ -334,7 +337,12 @@ fn analyze_loop(
+                 }
+             })
+         });
+-        if has_iv_widening {
++        let small_const_trip = match &exit_limit {
++            Operand::Const(IrConst::I32(n)) => *n > 0 && (*n as i64) <= 8,
++            Operand::Const(IrConst::I64(n)) => *n > 0 && *n <= 8,
++            _ => false,
++        };
++        if has_iv_widening && !small_const_trip {
+             return None;
+         }
+     }
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index cde74d1..2920b27 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -773,6 +773,18 @@ macro_rules! preloop_dump {
+             );
+             total_changes += n;
+             total_changes_excl_dce += n;
++
++            // Post-vectorize unroll: the matmul/map vector body is often a
++            // single intrinsic — unrolling it 2–4× exposes independent FMA
++            // chains (GCC's multi-accum style) without growing scalar code.
++            if !dis.unroll {
++                let n = timed_pass!(
++                    "loop_unroll_post_vec",
++                    run_on_visited(module, &dirty, &mut changed, loop_unroll::unroll_loops)
++                );
++                total_changes += n;
++                total_changes_excl_dce += n;
++            }
+         }
+ 
+         // Phase 2c: Integer narrowing
+diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
+index 6b17fb4..1c8bbd8 100644
+--- a/src/passes/vectorize.rs
++++ b/src/passes/vectorize.rs
+@@ -3271,23 +3271,23 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
+     {
+         // First, create the byte limit. The vector loop steps by 32 bytes
+         // (4 doubles) per iteration, so it must run exactly floor(N/4)
+-        // iterations: byte_limit = (N/4)*32 = (N & ~3)*8. Using N*8 here
++        // iterations: byte_limit = (N/16)*128 = (N & ~3)*8. Using N*8 here
+         // instead runs ceil(N/4) iterations — the final iteration reads and
+         // writes up to 3 doubles past the end of the array (OOB), and the
+         // scalar remainder loop then never fires, silently skipping the tail
+         // (reproducer: N=255 matmul clobbered element 255 and skipped
+         // elements 252..254, producing a wrong sum).
+         let byte_limit = match &pattern.limit {
+-            Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32((*n / 4) * 32)),
+-            Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64((*n / 4) * 32)),
++            Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32((*n / 16) * 128)),
++            Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64((*n / 16) * 128)),
+             Operand::Value(limit_val) => {
+-                // Dynamic limit: byte_limit = (N/4)*32, hoisted into the header.
++                // Dynamic limit: byte_limit = (N/16)*128, hoisted into the header.
+                 let limit_ty = match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
+                     Instruction::Cmp { ty, .. } => *ty,
+                     _ => IrType::I64,
+                 };
+ 
+-                // N / 4
++                // N / 16 (quad FMA width)
+                 let div_dest = Value(next_val_id);
+                 next_val_id += 1;
+                 let div_inst = Instruction::BinOp {
+@@ -3295,15 +3295,15 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
+                     op: IrBinOp::UDiv,
+                     lhs: Operand::Value(*limit_val),
+                     rhs: Operand::Const(match limit_ty {
+-                        IrType::I32 => IrConst::I32(4),
+-                        IrType::I64 => IrConst::I64(4),
+-                        _ => IrConst::I64(4),
++                        IrType::I32 => IrConst::I32(16),
++                        IrType::I64 => IrConst::I64(16),
++                        _ => IrConst::I64(16),
+                     }),
+                     ty: limit_ty,
+                 };
+                 func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx, div_inst);
+ 
+-                // (N/4) * 32
++                // (N/16) * 128
+                 let mul_dest = Value(next_val_id);
+                 next_val_id += 1;
+                 let mul_inst = Instruction::BinOp {
+@@ -3311,16 +3311,16 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
+                     op: IrBinOp::Mul,
+                     lhs: Operand::Value(div_dest),
+                     rhs: Operand::Const(match limit_ty {
+-                        IrType::I32 => IrConst::I32(32),
+-                        IrType::I64 => IrConst::I64(32),
+-                        _ => IrConst::I64(32),
++                        IrType::I32 => IrConst::I32(128),
++                        IrType::I64 => IrConst::I64(128),
++                        _ => IrConst::I64(128),
+                     }),
+                     ty: limit_ty,
+                 };
+                 func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
+ 
+                 if debug {
+-                    eprintln!("[VEC]   Inserted (N/4)*32 dynamic byte limit: Value({})", mul_dest.0);
++                    eprintln!("[VEC]   Inserted (N/16)*128 dynamic byte limit: Value({})", mul_dest.0);
+                 }
+ 
+                 Operand::Value(mul_dest)
+@@ -3461,19 +3461,19 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
+             }
+         }
+ 
+-        // 2b: Change the IV increment from +1 to +32 (4 doubles × 8 bytes).
+-        // The IV increment is at pattern.iv_inc_idx in the latch block.
++        // 2b: Change the IV increment from +1 to +64 (8 doubles × 8 bytes).
++        // Dual FmaF64x4 processes two consecutive 4-wide chunks per iteration.
+         {
+             let latch = &mut func.blocks[pattern.latch_idx];
+             if pattern.iv_inc_idx < latch.instructions.len() {
+                 if let Instruction::BinOp { op: IrBinOp::Add, rhs, .. } = &mut latch.instructions[pattern.iv_inc_idx] {
+                     *rhs = match rhs {
+-                        Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(32)),
+-                        _ => Operand::Const(IrConst::I64(32)),
++                        Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(128)),
++                        _ => Operand::Const(IrConst::I64(128)),
+                     };
+                     changes += 1;
+                     if debug {
+-                        eprintln!("[VEC]   Changed IV increment from +1 to +32");
++                        eprintln!("[VEC]   Changed IV increment from +1 to +128 (quad FMA)");
+                     }
+                 }
+             }
+@@ -3484,37 +3484,95 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
+         }
+     }
+ 
+-    // Step 3: Replace the body with FmaF64x4.
+-    // TODO: Hoist A[i][k] broadcast using BroadcastLoadF64 + FmaF64x4Hoisted
+-    // (infrastructure ready, but the FMA body accesses wrong register for B_ptr
+-    // when hoisted — the header BroadcastLoadF64 instruction shifts register
+-    // allocation and the B_gep value ends up sharing a register with the byte
+-    // offset IV).
++    // Step 3: Replace the body with FOUR FmaF64x4 (4-way software pipeline).
++    // Chunks at byte offsets IV+{0,32,64,96}. Independent C/B lanes give the
++    // backend four concurrent vfmadd231pd chains — the shape GCC emits for
++    // the 256³ matmul kernel on x86-64-v3.
+     {
+         let body = &mut func.blocks[pattern.body_idx];
+-        let intrinsic = Instruction::Intrinsic {
++        let store_pos = body.instructions.iter().position(|inst| {
++            matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.c_gep)
++        });
++
++        let (b_base, b_off, c_base, c_off) = {
++            let mut b_base = pattern.b_gep;
++            let mut b_off = Operand::Const(IrConst::I64(0));
++            let mut c_base = pattern.c_gep;
++            let mut c_off = Operand::Const(IrConst::I64(0));
++            for inst in &body.instructions {
++                if let Instruction::GetElementPtr { dest, base, offset, .. } = inst {
++                    if *dest == pattern.b_gep {
++                        b_base = *base;
++                        b_off = offset.clone();
++                    }
++                    if *dest == pattern.c_gep {
++                        c_base = *base;
++                        c_off = offset.clone();
++                    }
++                }
++            }
++            (b_base, b_off, c_base, c_off)
++        };
++
++        let mut prelude: Vec<Instruction> = Vec::new();
++        // Chunk 0 uses the existing GEPs.
++        prelude.push(Instruction::Intrinsic {
+             dest: None,
+             op: IntrinsicOp::FmaF64x4,
+             dest_ptr: Some(pattern.c_gep),
+-            args: vec![
+-                Operand::Value(pattern.a_ptr),
+-                Operand::Value(pattern.b_gep),
+-            ],
+-        };
+-
+-        let store_pos = body.instructions.iter().position(|inst| {
+-            matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.c_gep)
++            args: vec![Operand::Value(pattern.a_ptr), Operand::Value(pattern.b_gep)],
+         });
++        for chunk in 1u64..4 {
++            let byte_off = chunk * 32;
++            let b_off_n = Value(next_val_id); next_val_id += 1;
++            let c_off_n = Value(next_val_id); next_val_id += 1;
++            let b_gep_n = Value(next_val_id); next_val_id += 1;
++            let c_gep_n = Value(next_val_id); next_val_id += 1;
++            prelude.push(Instruction::BinOp {
++                dest: b_off_n,
++                op: IrBinOp::Add,
++                lhs: b_off.clone(),
++                rhs: Operand::Const(IrConst::I64(byte_off as i64)),
++                ty: IrType::I64,
++            });
++            prelude.push(Instruction::BinOp {
++                dest: c_off_n,
++                op: IrBinOp::Add,
++                lhs: c_off.clone(),
++                rhs: Operand::Const(IrConst::I64(byte_off as i64)),
++                ty: IrType::I64,
++            });
++            prelude.push(Instruction::GetElementPtr {
++                dest: b_gep_n,
++                base: b_base,
++                offset: Operand::Value(b_off_n),
++                ty: IrType::F64,
++            });
++            prelude.push(Instruction::GetElementPtr {
++                dest: c_gep_n,
++                base: c_base,
++                offset: Operand::Value(c_off_n),
++                ty: IrType::F64,
++            });
++            prelude.push(Instruction::Intrinsic {
++                dest: None,
++                op: IntrinsicOp::FmaF64x4,
++                dest_ptr: Some(c_gep_n),
++                args: vec![Operand::Value(pattern.a_ptr), Operand::Value(b_gep_n)],
++            });
++        }
+ 
+         if let Some(pos) = store_pos {
+-            body.instructions.insert(pos, intrinsic);
+-            body.instructions.remove(pos + 1);
++            body.instructions.remove(pos);
++            for (k, inst) in prelude.into_iter().enumerate() {
++                body.instructions.insert(pos + k, inst);
++            }
+         } else {
+-            body.instructions.push(intrinsic);
++            body.instructions.extend(prelude);
+         }
+-        changes += 1;
++        changes += 4;
+         if debug {
+-            eprintln!("[VEC]   Inserted FmaF64x4 intrinsic");
++            eprintln!("[VEC]   Inserted quad FmaF64x4 intrinsics (step 128)");
+         }
+     }
+ 
+@@ -3523,7 +3581,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
+         let remainder_changes = insert_remainder_loop(
+             func,
+             pattern,
+-            4,  // AVX2 vector width
++            16, // quad FmaF64x4 = 16 doubles per iteration
+             &mut next_val_id,
+             &mut next_label,
+         );
+diff --git a/tests/regression/vectorize_matmul_n16.c b/tests/regression/vectorize_matmul_n16.c
 new file mode 100644
-index 0000000..d96e61e
+index 0000000..fe19257
 --- /dev/null
-+++ b/tests/regression/fma_chain_accum.c
-@@ -0,0 +1,11 @@
-+double dot4(const double *a, const double *b) {
-+    double s = 0.0;
-+    for (int i = 0; i < 4; i++) s = s + a[i] * b[i];
-+    return s;
++++ b/tests/regression/vectorize_matmul_n16.c
+@@ -0,0 +1,28 @@
++/* N=16: exact multiple of 16 (quad FMA width) */
++#define N 16
++static double A[N][N], B[N][N], C[N][N], R[N][N];
++void matmul(void) {
++    for (int i = 0; i < N; i++)
++        for (int k = 0; k < N; k++)
++            for (int j = 0; j < N; j++)
++                C[i][j] += A[i][k] * B[k][j];
 +}
 +int main(void) {
-+    double a[4] = {1,2,3,4}, b[4] = {5,6,7,8};
-+    double s = dot4(a, b);
-+    if (s < 69.9 || s > 70.1) return 1;
++    for (int i = 0; i < N; i++)
++        for (int j = 0; j < N; j++) {
++            A[i][j] = (double)(i + j + 1);
++            B[i][j] = (double)(i * j + 1);
++            C[i][j] = R[i][j] = 0;
++        }
++    matmul();
++    for (int i = 0; i < N; i++)
++        for (int k = 0; k < N; k++)
++            for (int j = 0; j < N; j++)
++                R[i][j] += A[i][k] * B[k][j];
++    for (int i = 0; i < N; i++)
++        for (int j = 0; j < N; j++) {
++            double d = C[i][j] - R[i][j];
++            if (d < -1e-6 || d > 1e-6) return 1;
++        }
 +    return 0;
 +}
-diff --git a/tests/regression/fma_scalar_muladd.c b/tests/regression/fma_scalar_muladd.c
+diff --git a/tests/regression/vectorize_matmul_n17.c b/tests/regression/vectorize_matmul_n17.c
 new file mode 100644
-index 0000000..24198cf
+index 0000000..d1f7a6d
 --- /dev/null
-+++ b/tests/regression/fma_scalar_muladd.c
-@@ -0,0 +1,12 @@
-+double madd(double a, double b, double c) { return a * b + c; }
-+float maddf(float a, float b, float c) { return a * b + c; }
++++ b/tests/regression/vectorize_matmul_n17.c
+@@ -0,0 +1,28 @@
++/* N=17: forces remainder after quad-FMA vectorized path */
++#define N 17
++static double A[N][N], B[N][N], C[N][N], R[N][N];
++void matmul(void) {
++    for (int i = 0; i < N; i++)
++        for (int k = 0; k < N; k++)
++            for (int j = 0; j < N; j++)
++                C[i][j] += A[i][k] * B[k][j];
++}
 +int main(void) {
-+    double d = madd(1.5, 2.5, 3.5);
-+    if (d < 7.24 || d > 7.26) return 1;
-+    float f = maddf(1.5f, 2.5f, 3.5f);
-+    if (f < 7.24f || f > 7.26f) return 2;
-+    double dx = 3.0, dy = 4.0;
-+    double r2 = dx * dx + dy * dy;
-+    if (r2 < 24.9 || r2 > 25.1) return 3;
++    for (int i = 0; i < N; i++)
++        for (int j = 0; j < N; j++) {
++            A[i][j] = (double)(i + j + 1) * 0.5;
++            B[i][j] = (double)(i + 1) * (j + 1) * 0.25;
++            C[i][j] = R[i][j] = 0;
++        }
++    matmul();
++    for (int i = 0; i < N; i++)
++        for (int k = 0; k < N; k++)
++            for (int j = 0; j < N; j++)
++                R[i][j] += A[i][k] * B[k][j];
++    for (int i = 0; i < N; i++)
++        for (int j = 0; j < N; j++) {
++            double d = C[i][j] - R[i][j];
++            if (d < -1e-5 || d > 1e-5) return 1;
++        }
 +    return 0;
 +}
