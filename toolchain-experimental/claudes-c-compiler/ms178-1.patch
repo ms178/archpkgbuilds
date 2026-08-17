@@ -1,1344 +1,368 @@
-From 3b988a1ce486b62a44b4beb7cba1ebafc68230fb Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sun, 16 Aug 2026 22:34:21 +0000
-Subject: [PATCH 01/11] i686 -Os size: ESP-slot peepholes, store-to-load
- forwarding, scratch-copy propagation, if-convert at -Os
-
-The kernel real-mode setup (arch/x86/boot, -m16 -Os) overflowed its
-hard 64-sector limit: lccc's setup .text was ~48K vs GCC's ~17K. The
-oracle comparison (lccc vs GCC -Os on the extracted number()/printf
-reproducer) shows the fat is one pattern family: the i686 codegen
-round-trips nearly every IR value through a stack slot and funnels
-every copy through %eax. Four measures, each byte-measured on the
-reproducer (1048 -> 791 bytes; GCC = 312):
-
-1) if_convert now also runs at -Os (was skipped): the branchy select
-   lowering emits two arms full of slot round-trips, strictly bigger
-   than the setcc/cmov form. Measured: -Os without if-conversion was
-   LARGER than -O2 with it (1156 vs 955). GCC if-converts at -Os too.
-
-2) ESP-relative slots participate in ALL slot peepholes. With
-   -fomit-frame-pointer (implied by -Os and the boot Makefile) every
-   local lives at N(%esp), but the peephole classifier only matched
-   (%ebp) - the entire slot-optimization tier was a dead letter for
-   real-mode code. (%esp) slots get a disjoint offset namespace
-   (ESP_SLOT_BIAS) so they can never be confused with (%ebp) slots.
-   SOUNDNESS: push/pop and any instruction writing %esp are now
-   barriers - an ESP adjustment renumbers every (%esp) slot, so no
-   slot window may cross one. Pushes/pops only occur at prologue/
-   epilogue and around calls (calls were already barriers).
-
-3) forward_slot_loads: window-scan store-to-load forwarding. After
-   `movl %R, N(%esp)`, a later exact reload becomes `movl %R, %R2`
-   (or a NOP when R2==R); once every reload is forwarded, the
-   existing never-read-store elimination deletes the store itself.
-   Stops at barriers, overlapping stores/loads, writes to %R,
-   indirect memory, folded-operand slot accesses, and implicit
-   register writers (mul/div/cltd/string ops).
-
-4) Scratch-copy propagation: `movl %SRC, %T; movl %T, X` where %T is
-   dead after the consumer (bounded written-before-read scan) becomes
-   a single `movl %SRC, X` - the i686 codegen emits this %eax-funnel
-   shape for nearly every assignment. Plus load+move fusion:
-   `movl SLOT, %eax; movl %eax, %REG` -> `movl SLOT, %REG` under the
-   same deadness proof.
-
-Validation: 685 lib / 192 regression / 50 correctness green;
-differential fuzz 240/240 (O2+Os, seeds 0:120) - the fuzzer runs Os
-now exercising all new peepholes end-to-end.
----
- src/backend/i686/codegen/peephole.rs | 328 +++++++++++++++++++++++++--
- src/passes/mod.rs                    |   8 +-
- 2 files changed, 313 insertions(+), 23 deletions(-)
-
-diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index 148e3546..687f8d01 100644
---- a/src/backend/i686/codegen/peephole.rs
-+++ b/src/backend/i686/codegen/peephole.rs
-@@ -109,7 +109,13 @@ impl LineInfo {
-     fn is_barrier(self) -> bool {
-         matches!(self.kind,
-             LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect |
--            LineKind::CondJmp | LineKind::Ret | LineKind::Directive)
-+            LineKind::CondJmp | LineKind::Ret | LineKind::Directive |
-+            // ESP changes renumber every (%esp) slot: push/pop and explicit
-+            // %esp arithmetic fence all slot windows now that ESP-relative
-+            // slots participate in the peepholes. Pushes/pops only appear
-+            // in prologue/epilogue and around calls, so the cost is nil.
-+            LineKind::Push { .. } | LineKind::Pop { .. })
-+            || matches!(self.kind, LineKind::Other { dest_reg } if dest_reg == REG_ESP)
+diff --git a/src/frontend/lexer/scan.rs b/src/frontend/lexer/scan.rs
+index 71c1d66..ff59777 100644
+--- a/src/frontend/lexer/scan.rs
++++ b/src/frontend/lexer/scan.rs
+@@ -8,6 +8,9 @@ pub struct Lexer {
+     pos: usize,
+     file_id: u32,
+     gnu_extensions: bool,
++    at_line_start: bool,
++    ident_pool: std::collections::HashMap<Vec<u8>, std::sync::Arc<str>>,
++    pub diagnostics: Vec<(String, crate::common::source::Span)>,
+ }
+ 
+ impl Lexer {
+@@ -17,6 +20,9 @@ impl Lexer {
+             pos: 0,
+             file_id,
+             gnu_extensions: true,
++            at_line_start: true,
++            ident_pool: std::collections::HashMap::with_capacity(256),
++            diagnostics: Vec::new(),
+         }
      }
- }
  
-@@ -175,10 +181,21 @@ fn parse_store_to_ebp(s: &str) -> Option<(&str, &str, MoveSize)> {
-     let comma = rest.find(',')?;
-     let reg = &rest[..comma];
-     let mem = rest[comma + 1..].trim();
--    if !mem.ends_with("(%ebp)") { return None; }
--    // Reject indirect memory (pointer dereference, not stack slot)
--    if mem.contains("(%e") && !mem.ends_with("(%ebp)") { return None; }
--    let offset_str = &mem[..mem.len() - 6]; // strip "(%ebp)"
-+    // Accept BOTH frame-pointer and stack-pointer slots. With
-+    // -fomit-frame-pointer (implied by -Os and the kernel's realmode
-+    // Makefile) every local lives at N(%esp); matching only (%ebp) made
-+    // all slot peepholes dead letters -- the real-mode printf.o carried
-+    // ~100 store/reload round-trips GCC folds away, overflowing the
-+    // 64-sector setup limit. ESP-relative offsets are stable between ESP
-+    // adjustments; push/pop/%esp-writes are barriers (see is_barrier), so
-+    // a slot tracked within a window can never be renumbered mid-window.
-+    let is_ebp = mem.ends_with("(%ebp)");
-+    let is_esp = mem.ends_with("(%esp)");
-+    if !is_ebp && !is_esp { return None; }
-+    // Reject indexed forms like 4(%esp,%eax,4): only plain offset(base).
-+    let paren = mem.find('(').unwrap_or(0);
-+    if mem[paren..].contains(',') { return None; }
-+    let offset_str = &mem[..mem.len() - 6]; // strip "(%ebp)"/"(%esp)"
-     Some((reg.trim(), offset_str, size))
- }
+@@ -24,6 +30,19 @@ impl Lexer {
+         self.gnu_extensions = enabled;
+     }
  
-@@ -202,10 +219,15 @@ fn parse_load_from_ebp(s: &str) -> Option<(&str, &str, MoveSize)> {
-         return None;
-     };
-     let rest = rest.trim();
--    // Must start with an offset or directly with (%ebp)
--    if !rest.contains("(%ebp)") { return None; }
--    let paren_start = rest.find("(%ebp)")?;
-+    // Accept both frame-pointer and stack-pointer slots (see
-+    // parse_store_to_ebp for the -fomit-frame-pointer rationale).
-+    let paren_start = match rest.find("(%ebp)") {
-+        Some(p) => p,
-+        None => rest.find("(%esp)")?,
-+    };
-     let offset_str = &rest[..paren_start];
-+    // Reject scaled/indexed forms like 4(%esp,%eax,4).
-+    if offset_str.contains('(') { return None; }
-     let after = rest[paren_start + 6..].trim();
-     if !after.starts_with(',') { return None; }
-     let reg = after[1..].trim();
-@@ -257,19 +279,35 @@ fn has_indirect_memory_access(s: &str) -> bool {
- }
- 
- /// Parse the %ebp offset from a line, or return EBP_OFFSET_NONE.
-+/// Namespace bias for %esp-relative slots: keeps them disjoint from
-+/// %ebp-relative offsets inside the same LineKind (an (%esp) slot and an
-+/// (%ebp) slot with equal displacement are DIFFERENT memory).
-+const ESP_SLOT_BIAS: i32 = 1 << 24;
-+
-+#[inline]
-+fn slot_bias(s: &str) -> i32 {
-+    if s.contains("(%esp)") { ESP_SLOT_BIAS } else { 0 }
-+}
-+
- fn parse_ebp_offset_in_line(s: &str) -> i32 {
--    if let Some(pos) = s.find("(%ebp)") {
--        let before = &s[..pos];
--        // Find the start of the offset number
--        let offset_start = before.rfind(|c: char| !c.is_ascii_digit() && c != '-').map(|p| p + 1).unwrap_or(0);
--        let offset_str = &before[offset_start..];
--        if offset_str.is_empty() {
--            0
--        } else {
--            offset_str.parse::<i32>().unwrap_or(EBP_OFFSET_NONE)
--        }
-+    let (pos, bias) = if let Some(p) = s.find("(%ebp)") {
-+        (p, 0)
-+    } else if let Some(p) = s.find("(%esp)") {
-+        (p, ESP_SLOT_BIAS)
-+    } else {
-+        return EBP_OFFSET_NONE;
-+    };
-+    let before = &s[..pos];
-+    // Find the start of the offset number
-+    let offset_start = before.rfind(|c: char| !c.is_ascii_digit() && c != '-').map(|p| p + 1).unwrap_or(0);
-+    let offset_str = &before[offset_start..];
-+    if offset_str.is_empty() {
-+        bias
-     } else {
--        EBP_OFFSET_NONE
-+        match offset_str.parse::<i32>() {
-+            Ok(v) => v + bias,
-+            Err(_) => EBP_OFFSET_NONE,
++    fn intern_ident(&mut self, bytes: &[u8]) -> String {
++        if let Some(existing) = self.ident_pool.get(bytes) {
++            return existing.to_string();
 +        }
-     }
- }
++        let s: std::sync::Arc<str> = std::str::from_utf8(bytes).unwrap_or("").into();
++        self.ident_pool.insert(bytes.to_vec(), s.clone());
++        s.to_string()
++    }
++
++    fn emit_lex_diag(&mut self, msg: impl Into<String>, start: usize, end: usize) {
++        self.diagnostics.push((msg.into(), Span::new(start as u32, end as u32, self.file_id)));
++    }
++
+     pub fn tokenize(&mut self) -> Vec<Token> {
+         // Estimate ~1 token per 5 bytes of source (typical for C code).
+         let mut tokens = Vec::with_capacity(self.input.len() / 5);
+@@ -77,6 +96,9 @@ impl Lexer {
+         loop {
+             // Skip whitespace
+             while self.pos < self.input.len() && self.input[self.pos].is_ascii_whitespace() {
++                if self.input[self.pos] == b'\n' {
++                    self.at_line_start = true;
++                }
+                 self.pos += 1;
+             }
  
-@@ -428,14 +466,14 @@ fn classify_line(raw: &str) -> LineInfo {
-         if let Some((reg_str, offset_str, size)) = parse_store_to_ebp(s) {
-             let reg = register_family(reg_str);
-             if reg <= REG_GP_MAX {
--                let offset = parse_offset(offset_str);
-+                let offset = parse_offset(offset_str) + slot_bias(s);
-                 return line_info(LineKind::StoreEbp { reg, offset, size }, ts);
+@@ -88,13 +110,14 @@ impl Lexer {
+             // These are emitted by the preprocessor and must not be lexed as tokens.
+             // A line marker is a '#' at the start of a line (after optional whitespace)
+             // followed by a digit.
+-            if self.input[self.pos] == b'#' && self.is_line_marker() {
++            if self.at_line_start && self.input[self.pos] == b'#' && self.is_line_marker() {
+                 // Skip the entire line
+                 while self.pos < self.input.len() && self.input[self.pos] != b'\n' {
+                     self.pos += 1;
+                 }
+                 continue;
+             }
++            self.at_line_start = false;
+ 
+             // Skip line comments
+             if self.pos + 1 < self.input.len() && self.input[self.pos] == b'/' && self.input[self.pos + 1] == b'/' {
+@@ -124,6 +147,25 @@ impl Lexer {
+     /// Check if the current position is at a GCC-style line marker.
+     /// A line marker is `# <digit>` at the start of a line (i.e., the '#' is
+     /// either at position 0 or preceded by a newline).
++    fn accumulate_digits(bytes: &[u8], base: u32) -> (u64, bool) {
++        let mut val: u64 = 0;
++        let mut overflow = false;
++        let base64 = base as u64;
++        for &b in bytes {
++            let digit = match b {
++                b'0'..=b'9' => (b - b'0') as u64,
++                b'a'..=b'f' => (b - b'a' + 10) as u64,
++                b'A'..=b'F' => (b - b'A' + 10) as u64,
++                _ => continue,
++            };
++            if digit >= base64 { continue; }
++            let (m, o1) = val.overflowing_mul(base64);
++            let (a, o2) = m.overflowing_add(digit);
++            if o1 || o2 { overflow = true; val = u64::MAX; } else { val = a; }
++        }
++        (val, overflow)
++    }
++
+     fn is_line_marker(&self) -> bool {
+         // Must be at '#'
+         if self.pos >= self.input.len() || self.input[self.pos] != b'#' {
+@@ -195,8 +237,10 @@ impl Lexer {
+         }
+ 
+         // Regular hex integer
+-        let hex_str = std::str::from_utf8(&self.input[hex_start..self.pos]).unwrap_or("0");
+-        let value = u64::from_str_radix(hex_str, 16).unwrap_or(0);
++        let (value, overflow) = Self::accumulate_digits(&self.input[hex_start..self.pos], 16);
++        if overflow {
++            self.emit_lex_diag("integer literal is too large to be represented", hex_start, self.pos);
++        }
+         self.finish_int_literal(value, true, start)
+     }
+ 
+@@ -288,8 +332,10 @@ impl Lexer {
+         while self.pos < self.input.len() && (self.input[self.pos] == b'0' || self.input[self.pos] == b'1') {
+             self.pos += 1;
+         }
+-        let bin_str = std::str::from_utf8(&self.input[bin_start..self.pos]).unwrap_or("0");
+-        let value = u64::from_str_radix(bin_str, 2).unwrap_or(0);
++        let (value, overflow) = Self::accumulate_digits(&self.input[bin_start..self.pos], 2);
++        if overflow {
++            self.emit_lex_diag("integer literal is too large to be represented", bin_start, self.pos);
++        }
+         self.finish_int_literal(value, true, start)
+     }
+ 
+@@ -316,8 +362,10 @@ impl Lexer {
+                 return None;
              }
          }
-         if let Some((offset_str, reg_str, size)) = parse_load_from_ebp(s) {
-             let reg = register_family(reg_str);
-             if reg <= REG_GP_MAX {
--                let offset = parse_offset(offset_str);
-+                let offset = parse_offset(offset_str) + slot_bias(s);
-                 return line_info(LineKind::LoadEbp { reg, offset, size }, ts);
+-        let oct_str = std::str::from_utf8(&self.input[oct_start..self.pos]).unwrap_or("0");
+-        let value = u64::from_str_radix(oct_str, 8).unwrap_or(0);
++        let (value, overflow) = Self::accumulate_digits(&self.input[oct_start..self.pos], 8);
++        if overflow {
++            self.emit_lex_diag("integer literal is too large to be represented", oct_start, self.pos);
++        }
+         Some(self.finish_int_literal(value, true, start))
+     }
+ 
+@@ -373,8 +421,10 @@ impl Lexer {
+             self.make_float_token(text, float_kind, is_imaginary, start)
+         } else {
+             // Parse the integer value directly from the &str borrow (no heap allocation).
+-            let text = std::str::from_utf8(&self.input[start..num_end]).unwrap_or("0");
+-            let uvalue: u64 = text.parse().unwrap_or(0);
++            let (uvalue, overflow) = Self::accumulate_digits(&self.input[start..num_end], 10);
++            if overflow {
++                self.emit_lex_diag("integer literal is too large to be represented", start, num_end);
++            }
+             self.finish_int_literal(uvalue, false, start)
+         }
+     }
+@@ -615,7 +665,7 @@ impl Lexer {
+ 
+     fn lex_string(&mut self, start: usize) -> Token {
+         self.pos += 1; // skip opening "
+-        let mut s = String::new();
++        let mut s = String::with_capacity(32);
+         while self.pos < self.input.len() && self.input[self.pos] != b'"' {
+             if self.input[self.pos] == b'\\' {
+                 self.pos += 1;
+@@ -918,22 +968,38 @@ impl Lexer {
+     // TODO: C11 requires exactly num_digits hex digits; emit diagnostic if fewer provided.
+     // TODO: C11 §6.4.3 disallows certain code points (below 0x00A0 except 0x24/0x40/0x60,
+     //       and surrogates 0xD800-0xDFFF). Validate and emit diagnostics for these.
+-    fn lex_unicode_escape(&mut self, num_digits: usize) -> char {
++        fn lex_unicode_escape(&mut self, num_digits: usize) -> char {
++        let esc_start = self.pos.saturating_sub(2);
+         let mut val = 0u32;
++        let mut got = 0usize;
+         for _ in 0..num_digits {
+             if self.pos < self.input.len() && self.input[self.pos].is_ascii_hexdigit() {
+                 val = val * 16 + hex_digit_val(self.input[self.pos]) as u32;
+                 self.pos += 1;
++                got += 1;
+             } else {
+                 break;
              }
          }
-@@ -750,6 +788,133 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-         while j < len && infos[j].is_nop() { j += 1; }
-         if j >= len { i += 1; continue; }
- 
-+        // Pattern 2z: Copy propagation through a scratch register --
-+        //   `movl %SRC, %T; <op reading %T once>` where %T is dead after.
-+        // The i686 codegen funnels almost everything through %eax:
-+        //   movl %esi, %eax; movl %eax, 108(%esp)  ->  movl %esi, 108(%esp)
-+        //   movl %esi, %eax; movl %eax, %edi       ->  movl %esi, %edi
-+        //   movl %esi, %eax; decl %eax; movl %eax, %edi
-+        //        -> (first pair fuses when %eax dead after the store/move)
-+        // GCC/ICX -Os never materialize the scratch copy. Soundness: %T must
-+        // be WRITTEN before any other read after the consuming instruction
-+        // (bounded scan, conservative at barriers), and the consumer must
-+        // read %T exactly as a whole-register source.
-+        if let LineKind::Move { dst: t_reg, src: s_reg } = infos[i].kind {
-+            if t_reg <= REG_GP_MAX && s_reg <= REG_GP_MAX && t_reg != s_reg
-+                && t_reg != REG_ESP && t_reg != REG_EBP {
-+                // The consumer is the next non-nop instruction j.
-+                let consumed = match infos[j].kind {
-+                    // movl %T, X(%esp)  (store)
-+                    LineKind::StoreEbp { reg, .. } if reg == t_reg => Some(1u8),
-+                    // movl %T, %R
-+                    LineKind::Move { src, dst } if src == t_reg && dst != t_reg => Some(2u8),
-+                    _ => None,
-+                };
-+                if let Some(kind2) = consumed {
-+                    // %T must be dead after j: written before any read.
-+                    let mut k = j + 1;
-+                    let mut cnt = 0;
-+                    let mut dead = false;
-+                    while k < len && cnt < 24 {
-+                        if infos[k].is_nop() { k += 1; continue; }
-+                        if infos[k].is_barrier() { break; }
-+                        let s2 = trimmed(store, &infos[k], k);
-+                        let written = match infos[k].kind {
-+                            LineKind::Other { dest_reg } => dest_reg == t_reg,
-+                            LineKind::Move { dst, .. } => dst == t_reg,
-+                            LineKind::LoadEbp { reg, .. } => reg == t_reg,
-+                            LineKind::SetCC { reg } => reg == t_reg,
-+                            _ => false,
-+                        };
-+                        if written && !line_reads_dest_source(s2, t_reg) {
-+                            dead = true;
-+                            break;
-+                        }
-+                        if line_references_reg(s2, t_reg) || line_writes_reg_implicitly(s2, t_reg) {
-+                            break;
-+                        }
-+                        k += 1;
-+                        cnt += 1;
-+                    }
-+                    if dead {
-+                        // Also: %SRC must not be MODIFIED between i and j
-+                        // (j is the immediate next instruction, so no gap).
-+                        // Rewrite the consumer to read %SRC directly and
-+                        // drop the copy.
-+                        let consumer = trimmed(store, &infos[j], j).to_string();
-+                        let old_reg = reg32_name(t_reg);
-+                        let new_reg = reg32_name(s_reg);
-+                        // Only whole-register 32-bit forms are rewritten;
-+                        // the classifier guarantees the consumer is movl.
-+                        if kind2 == 1 || kind2 == 2 {
-+                            let rewritten = consumer.replacen(old_reg, new_reg, 1);
-+                            if rewritten != consumer {
-+                                store.replace(j, format!("    {}", rewritten));
-+                                infos[j] = classify_line(store.get(j));
-+                                infos[i].kind = LineKind::Nop;
-+                                changed = true;
-+                                i += 1;
-+                                continue;
-+                            }
-+                        }
-+                    }
-+                }
-+            }
+-        // TODO: Emit a diagnostic for invalid code points (e.g. surrogates) instead of
+-        //       silently using the replacement character.
++        if got < num_digits {
++            self.emit_lex_diag(
++                format!("universal character name expects {} hex digits, got {}", num_digits, got),
++                esc_start,
++                self.pos,
++            );
 +        }
-+
-+        // Pattern 2a: Load+move fusion -- `movl SLOT, %eax; movl %eax, %REG`
-+        // becomes `movl SLOT, %REG` when %eax is provably dead after the
-+        // move (written before any read, checked by a bounded forward scan
-+        // that stops conservatively at barriers). The i686 codegen emits
-+        // this shape for nearly every slot reload (everything goes through
-+        // %eax first), so this is the single highest-value size peephole:
-+        // ICX/GCC -Os never materialize the intermediate register.
-+        if let LineKind::LoadEbp { reg: lreg, offset: _loff, size: _lsize } = infos[i].kind {
-+            if let LineKind::Move { dst: mdst, src: msrc } = infos[j].kind {
-+                if msrc == lreg && mdst != lreg && mdst <= REG_GP_MAX {
-+                    // Is lreg written before any read after j?
-+                    let mut k = j + 1;
-+                    let mut cnt = 0;
-+                    let mut dead = false;
-+                    while k < len && cnt < 24 {
-+                        if infos[k].is_nop() { k += 1; continue; }
-+                        if infos[k].is_barrier() { break; }
-+                        let s = trimmed(store, &infos[k], k);
-+                        let written = match infos[k].kind {
-+                            LineKind::Other { dest_reg } => dest_reg == lreg,
-+                            LineKind::Move { dst, .. } => dst == lreg,
-+                            LineKind::LoadEbp { reg, .. } => reg == lreg,
-+                            LineKind::SetCC { reg } => reg == lreg,
-+                            _ => false,
-+                        };
-+                        if written && !line_reads_dest_source(s, lreg) {
-+                            dead = true;
-+                            break;
-+                        }
-+                        if line_references_reg(s, lreg) || line_writes_reg_implicitly(s, lreg) {
-+                            break;
-+                        }
-+                        k += 1;
-+                        cnt += 1;
-+                    }
-+                    if dead {
-+                        // Rebuild using the ORIGINAL memory operand text.
-+                        let orig = trimmed(store, &infos[i], i).to_string();
-+                        if let Some(comma) = orig.find(',') {
-+                            let memop = &orig[..comma]; // e.g. "movl 84(%esp)"
-+                            let fused = format!("    {}, {}", memop, reg32_name(mdst));
-+                            store.replace(i, fused);
-+                            infos[i] = classify_line(store.get(i));
-+                            infos[j].kind = LineKind::Nop;
-+                            changed = true;
-+                            i += 1;
-+                            continue;
-+                        }
-+                    }
-+                }
-+            }
++        if (0xD800..=0xDFFF).contains(&val) || val > 0x10FFFF {
++            self.emit_lex_diag(
++                format!("invalid universal character name U+{:X}", val),
++                esc_start,
++                self.pos,
++            );
++            return '\u{FFFD}';
 +        }
-+
-         // Pattern 2: Adjacent store/load with same offset
-         if let LineKind::StoreEbp { reg: store_reg, offset: store_off, size: store_size } = infos[i].kind {
-             if let LineKind::LoadEbp { reg: load_reg, offset: load_off, size: load_size } = infos[j].kind {
-@@ -1032,6 +1197,122 @@ fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
- // ── Pass: Dead store elimination ─────────────────────────────────────────────
+         char::from_u32(val).unwrap_or('\u{FFFD}')
+     }
  
- /// Remove stores to stack slots that are immediately overwritten.
-+/// Store-to-load forwarding for stack slots: after `movl %R, N(%esp)`, a
-+/// later `movl N(%esp), %R2` in the same window (slot and %R untouched)
-+/// becomes `movl %R, %R2` -- 2 bytes instead of 4-7 -- and once every load
-+/// of a slot is forwarded, eliminate_never_read_stores deletes the store.
-+/// This is the pass that shrinks -fomit-frame-pointer code: the i686
-+/// codegen round-trips most IR values through slots, and the real-mode
-+/// setup.elf overflowed its 64-sector limit on exactly that bloat
-+/// (GCC -Os: 312 bytes for number(); lccc before: 1048).
-+///
-+/// Soundness: the scan stops at barriers (labels/branches/calls/push/pop/
-+/// %esp-writes -- see is_barrier), at any write to %R, at any overlapping
-+/// store to the slot, and at any indirect memory access (a taken slot
-+/// address could alias). Forwarding into %R itself just NOPs the reload.
-+fn forward_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-+    let len = infos.len();
-+    let mut changed = false;
-+    const WINDOW: usize = 48;
-+
-+    for i in 0..len {
-+        if infos[i].is_nop() { continue; }
-+        let LineKind::StoreEbp { reg: src_reg, offset: slot, size } = infos[i].kind else { continue; };
-+        if src_reg > REG_GP_MAX { continue; }
-+        let store_bytes = size.byte_size();
-+
-+        let mut j = i + 1;
-+        let mut count = 0;
-+        while j < len && count < WINDOW {
-+            if infos[j].is_nop() { j += 1; continue; }
-+            if infos[j].is_barrier() { break; }
-+
-+            match infos[j].kind {
-+                LineKind::LoadEbp { reg: dst_reg, offset, size: lsize }
-+                    if offset == slot && lsize == size =>
-+                {
-+                    if dst_reg == src_reg {
-+                        // Exact reload into the same register: pure no-op.
-+                        infos[j].kind = LineKind::Nop;
-+                        changed = true;
-+                        j += 1;
-+                        count += 1;
-+                        continue;
-+                    } else if dst_reg <= REG_GP_MAX {
-+                        let text = format!("    movl {}, {}", reg32_name(src_reg), reg32_name(dst_reg));
-+                        store.replace(j, text);
-+                        infos[j] = classify_line(store.get(j));
-+                        changed = true;
-+                        j += 1;
-+                        count += 1;
-+                        continue;
-+                    } else {
-+                        break;
-+                    }
-+                }
-+                LineKind::LoadEbp { offset, size: lsize, .. }
-+                    if ranges_overlap(slot, store_bytes, offset, lsize.byte_size()) =>
-+                {
-+                    // Partial-overlap read: store live, no forwarding.
-+                    break;
-+                }
-+                LineKind::StoreEbp { offset, size: ssize, .. }
-+                    if ranges_overlap(slot, store_bytes, offset, ssize.byte_size()) => break,
-+                LineKind::Other { dest_reg } if dest_reg == src_reg => break,
-+                LineKind::Move { dst, .. } if dst == src_reg => break,
-+                LineKind::SetCC { reg } if reg == src_reg => break,
-+                LineKind::LoadEbp { reg, .. } if reg == src_reg => break,
-+                _ => {}
-+            }
-+            if infos[j].has_indirect_mem { break; }
-+            // A folded-operand access of the slot: reads keep the store
-+            // live; a WRITE through a folded operand is indistinguishable
-+            // here, so stop conservatively either way.
-+            if infos[j].ebp_offset == slot { break; }
-+            // Implicit register writes the generic parser misses.
-+            {
-+                let s = trimmed(store, &infos[j], j);
-+                if line_writes_reg_implicitly(s, src_reg) { break; }
-+            }
-+            j += 1;
-+            count += 1;
-+        }
-+    }
-+    changed
-+}
-+
-+/// Instructions with IMPLICIT register writes that parse_dest_reg misses
-+/// (one-operand mul/div families, cltd, string ops, xchg).
-+/// Does this line READ `reg` as a source rather than only writing it?
-+/// `movl X, %reg` reads reg only if X mentions it; `addl $1, %reg` is a
-+/// read-modify-write. Used by the load+move fusion deadness check.
-+fn line_reads_dest_source(s: &str, reg: RegId) -> bool {
-+    let mn = s.split_whitespace().next().unwrap_or("");
-+    if mn.starts_with("mov") || mn.starts_with("lea") || mn.starts_with("set") {
-+        if let Some(comma) = s.rfind(',') {
-+            return line_references_reg(&s[..comma], reg);
-+        }
-+        return false;
-+    }
-+    // Everything else: conservatively a read.
-+    line_references_reg(s, reg)
-+}
-+
-+fn line_writes_reg_implicitly(s: &str, reg: RegId) -> bool {
-+    let mn = s.split_whitespace().next().unwrap_or("");
-+    match mn {
-+        "mull" | "imull" if !s.contains(',') => reg == REG_EAX || reg == REG_EDX,
-+        "divl" | "idivl" => reg == REG_EAX || reg == REG_EDX,
-+        "cltd" | "cdq" => reg == REG_EDX,
-+        "xchgl" | "xchgw" | "xchgb" => line_references_reg(s, reg),
-+        _ if mn.starts_with("rep") || mn.starts_with("movs")
-+            || mn.starts_with("stos") || mn.starts_with("lods")
-+            || mn.starts_with("scas") || mn.starts_with("cmps") =>
-+            matches!(reg, REG_ECX | REG_ESI | REG_EDI | REG_EAX),
-+        _ => false,
-+    }
-+}
-+
- fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -> bool {
-     let len = infos.len();
-     let mut changed = false;
-@@ -1943,8 +2224,10 @@ pub fn peephole_optimize(asm: String) -> String {
- 
-     // Phase 2: Global passes (run once)
-     // Copy propagation first: it turns chained moves into dead moves, which
--    // the very next pass then removes.
-+    // the very next pass then removes. Slot-load forwarding runs right after,
-+    // so freshly exposed store/load pairs are folded in the same phase.
-     let global_changed = propagate_reg_copies(&mut store, &mut infos);
-+    let global_changed = global_changed | forward_slot_loads(&mut store, &mut infos);
-     let global_changed = global_changed | eliminate_dead_reg_moves(&store, &mut infos);
-     let global_changed = global_changed | eliminate_dead_stores(&store, &mut infos);
-     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
-@@ -1958,6 +2241,7 @@ pub fn peephole_optimize(asm: String) -> String {
-             changed2 = false;
-             changed2 |= combined_local_pass(&mut store, &mut infos);
-             changed2 |= propagate_reg_copies(&mut store, &mut infos);
-+            changed2 |= forward_slot_loads(&mut store, &mut infos);
-             changed2 |= eliminate_dead_reg_moves(&store, &mut infos);
-             changed2 |= eliminate_dead_stores(&store, &mut infos);
-             changed2 |= fold_memory_operands(&mut store, &mut infos);
-diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index 7ca353d0..cde74d14 100644
---- a/src/passes/mod.rs
-+++ b/src/passes/mod.rs
-@@ -884,7 +884,13 @@ macro_rules! preloop_dump {
-         // -Os/-Oz: skip if-conversion. `cmov` is 4-6 bytes vs a 2-byte jcc +
-         // the skipped block, so branches are usually smaller (and often faster
-         // on the short branch path); GCC makes the same trade-off at -Os.
--        if !dis.ifconv && !optimize_for_size && should_run!(7, 0, 4) {
-+        // if_convert also RUNS at -Os: measured on the kernel's real-mode
-+        // number()/printf.c reproducer, -Os WITHOUT if-conversion is LARGER
-+        // than -O2 WITH it (1156 vs 955 bytes i686 .text) -- the branchy
-+        // select lowering produces two arms full of slot round-trips, which
-+        // is strictly bigger than the setcc/cmov form. GCC if-converts at
-+        // -Os for the same reason.
-+        if !dis.ifconv && should_run!(7, 0, 4) {
-             // Forward redundant reloads first: removing a load from a
-             // conditional arm makes the arm side-effect-free so
-             // if-conversion can fire.
--- 
-2.47.3
-
-
-From 3dbc41e4e36aec3861f468fec9ef5ee126b0adca Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sun, 16 Aug 2026 23:02:08 +0000
-Subject: [PATCH 02/11] asm: `.` in .set expressions is label-valued
- (post-layout), fix SYM_FUNC_END sizes
-
-The kernel's SYM_FUNC_END expands to
-  .set .L__sym_size_X, .-X ; .size X, .L__sym_size_X
-
-Two bugs made every such size wrong or zero:
-
-1) SizeExpr::SymbolRef never consulted the new set_values table, so all
-   sizes evaluated through the .set constant fold silently became 0.
-   objtool then mis-decoded retpoline.o ("can't find jump dest
-   instruction at .text..__x86.return_thunk+0xc0": with
-   retbleed_untrain_ret size=0 it read the `.byte 0xf6` prefix trick as
-   a testb spanning the following ret).
-
-2) `.` was substituted as a FROZEN INTEGER (the pre-relaxation offset).
-   Jump relaxation shrinks code after the directive is parsed, so
-   verify_cpu measured 315 bytes where GAS says 249, and objtool
-   rejected head_64.o ("can't find call dest symbol at .text+0x170" --
-   the oversized symbol swallowed its neighbors, __pfx generation
-   failed). `.` is now substituted as a SYNTHETIC LABEL registered at
-   the current offset; labels are maintained by relax_jumps/
-   fixup_alignment_markers, and any `.`-relative .set expression is
-   force-deferred to the post-layout evaluation pass. verify_cpu now
-   measures exactly 249 -- byte-parity with GAS -- and objtool passes
-   head_64.o with zero warnings.
-
-Validation: 685 lib / 192 regression / 50 correctness / 86 linker
-green; asm-diff ALL RAW .text BYTES EXACT.
----
- src/backend/elf_writer_common.rs     | 53 ++++++++++++++++++++++------
- src/backend/i686/codegen/peephole.rs | 24 +++++++++++++
- 2 files changed, 67 insertions(+), 10 deletions(-)
-
-diff --git a/src/backend/elf_writer_common.rs b/src/backend/elf_writer_common.rs
-index 91d3a04a..2263e8ab 100644
---- a/src/backend/elf_writer_common.rs
-+++ b/src/backend/elf_writer_common.rs
-@@ -825,12 +825,21 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                 let is_arithmetic = target.contains(|c: char| matches!(c, '+' | '-' | '*' | '/' | '&' | '|' | '^' | '~' | '(' | '<' | '>'));
-                 if is_arithmetic {
-                     if let Some((sec_idx, substituted)) = self.substitute_dot(target) {
--                        match self.eval_label_expr(&substituted, sec_idx) {
--                            Some(val) => { self.set_values.insert(alias.clone(), val); }
--                            None => {
--                                // Forward label refs: retry after layout.
--                                self.pending_set_exprs.push((alias.clone(), substituted, sec_idx));
--                                self.aliases.insert(alias.clone(), target.clone());
-+                        if substituted.contains(".Ldotpos_") {
-+                            // `.`-relative: MUST defer to post-layout eval;
-+                            // jump relaxation moves everything after this
-+                            // point (SYM_FUNC_END sizes were 66 bytes too
-+                            // large when evaluated eagerly).
-+                            self.pending_set_exprs.push((alias.clone(), substituted, sec_idx));
-+                            self.aliases.insert(alias.clone(), target.clone());
-+                        } else {
-+                            match self.eval_label_expr(&substituted, sec_idx) {
-+                                Some(val) => { self.set_values.insert(alias.clone(), val); }
-+                                None => {
-+                                    // Forward label refs: retry after layout.
-+                                    self.pending_set_exprs.push((alias.clone(), substituted, sec_idx));
-+                                    self.aliases.insert(alias.clone(), target.clone());
-+                                }
-                             }
-                         }
-                     } else {
-@@ -2000,6 +2009,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                         end_off.wrapping_sub(start_off)
-                     }
-                     SizeExpr::SymbolRef(sym_ref) => {
-+                        // The kernel's SYM_FUNC_END expands to
-+                        //   .set .L__sym_size_X, .-X ; .size X, .L__sym_size_X
-+                        // The new absolute-.set fold evaluates that .set to a
-+                        // CONSTANT in set_values (the `.` position is the
-+                        // set-directive's own offset — exactly GAS
-+                        // semantics), so consult it FIRST; without this the
-+                        // sizes silently became 0 and objtool mis-decoded
-+                        // retpoline.o ("can't find jump dest instruction").
-+                        if let Some(&v) = self.set_values.get(sym_ref) {
-+                            return (name.clone(), v as u64);
-+                        }
-                         if let Some(alias_target) = self.aliases.get(sym_ref) {
-                             let normalized = alias_target.replace(' ', "");
-                             if let Some(rest) = normalized.strip_prefix(".-") {
-@@ -2548,18 +2568,31 @@ impl<A: X86Arch> ElfWriterCore<A> {
-     // ─── Internal relocation resolution ───────────────────────────────
- 
-     /// Substitute a standalone `.` (current position) in a .set expression
--    /// with the current section offset. None when no section is active.
--    fn substitute_dot(&self, expr: &str) -> Option<(usize, String)> {
-+    /// with a SYNTHETIC LABEL registered at the current offset. A frozen
-+    /// integer would be wrong: jump relaxation shrinks code AFTER this
-+    /// directive is seen, and GAS treats `.` as a label-valued expression
-+    /// that moves with the layout (verify_cpu measured 315 pre-relaxation
-+    /// vs GAS's 249 -- objtool then rejected head_64.o). Labels are kept
-+    /// consistent by relax_jumps/fixup_alignment_markers, so evaluating
-+    /// after layout yields the exact GAS value.
-+    fn substitute_dot(&mut self, expr: &str) -> Option<(usize, String)> {
-         let sec_idx = self.current_section?;
-         let offset = self.sections[sec_idx].data.len() as u64;
-         let bytes = expr.as_bytes();
--        let mut out = String::with_capacity(expr.len() + 8);
-+        let mut out = String::with_capacity(expr.len() + 24);
-+        let mut label_made = false;
-+        let mut label_name = String::new();
-         for (i, &b) in bytes.iter().enumerate() {
-             if b == b'.' {
-                 let prev_ok = i == 0 || !(bytes[i-1].is_ascii_alphanumeric() || bytes[i-1] == b'_' || bytes[i-1] == b'.');
-                 let next_ok = i + 1 >= bytes.len() || !(bytes[i+1].is_ascii_alphanumeric() || bytes[i+1] == b'_' || bytes[i+1] == b'.');
-                 if prev_ok && next_ok {
--                    out.push_str(&offset.to_string());
-+                    if !label_made {
-+                        label_name = format!(".Ldotpos_{}_{}", sec_idx, offset);
-+                        self.label_positions.insert(label_name.clone(), (sec_idx, offset));
-+                        label_made = true;
-+                    }
-+                    out.push_str(&label_name);
-                     continue;
-                 }
-             }
-diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index 687f8d01..35cb73ef 100644
---- a/src/backend/i686/codegen/peephole.rs
-+++ b/src/backend/i686/codegen/peephole.rs
-@@ -808,6 +808,19 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                     LineKind::StoreEbp { reg, .. } if reg == t_reg => Some(1u8),
-                     // movl %T, %R
-                     LineKind::Move { src, dst } if src == t_reg && dst != t_reg => Some(2u8),
-+                    // testl %T, %T / cmpl $i, %T -- flag-setting reads.
-+                    // `movl %R,%eax; testl %eax,%eax; jcc` is the single
-+                    // most common surviving triple; GCC emits
-+                    // `testl %R,%R` directly.
-+                    LineKind::Cmp => {
-+                        let s2 = trimmed(store, &infos[j], j);
-+                        let rn = reg32_name(t_reg);
-+                        let both = format!("testl {}, {}", rn, rn);
-+                        let is_test_self = s2 == both;
-+                        let is_cmp_imm = s2.starts_with("cmpl $") && s2.ends_with(rn)
-+                            && !s2[..s2.len()-rn.len()].contains('%');
-+                        if is_test_self || is_cmp_imm { Some(3u8) } else { None }
-+                    }
-                     _ => None,
-                 };
-                 if let Some(kind2) = consumed {
-@@ -856,6 +869,17 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                                 i += 1;
-                                 continue;
-                             }
-+                        } else if kind2 == 3 {
-+                            // test/cmp: replace every %T occurrence.
-+                            let rewritten = consumer.replace(old_reg, new_reg);
-+                            if rewritten != consumer {
-+                                store.replace(j, format!("    {}", rewritten));
-+                                infos[j] = classify_line(store.get(j));
-+                                infos[i].kind = LineKind::Nop;
-+                                changed = true;
-+                                i += 1;
-+                                continue;
-+                            }
-                         }
-                     }
-                 }
--- 
-2.47.3
-
-
-From d014ff3bdd9b257e3b9021056de5ae6101f010b7 Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sun, 16 Aug 2026 23:06:44 +0000
-Subject: [PATCH 03/11] asm: .set constants stay as SHN_ABS symbols (ZOFFSET nm
- scrape)
-
-GAS keeps .set/=-defined constants in the symbol table as absolute
-symbols. The new constant fold consumed them entirely, so mkpiggy's
-z_input_len (.globl'd, scraped from nm output by the boot Makefile's
-ZOFFSET rule) vanished and setup.elf failed with 'undefined reference
-to ZO_z_input_len'. After reloc patching, every folded constant is
-re-exported as a decimal alias, which the symbol-table integer-alias
-branch emits as *ABS* -- byte-parity with GAS (nm: 'A z_input_len').
-
-Validation: 685 lib / 192 regression green; asm-diff RAW EXACT.
----
- src/backend/elf_writer_common.rs | 18 ++++++++++++++++++
- 1 file changed, 18 insertions(+)
-
-diff --git a/src/backend/elf_writer_common.rs b/src/backend/elf_writer_common.rs
-index 2263e8ab..a096edb0 100644
---- a/src/backend/elf_writer_common.rs
-+++ b/src/backend/elf_writer_common.rs
-@@ -2645,6 +2645,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
- 
-     /// Late resolution: pending `.`-position .set expressions, then convert
-     /// relocations against constant .set names into direct data patches.
-+    /// GAS semantics for `.set NAME, <constant>`: NAME becomes an ABSOLUTE
-+    /// symbol (st_shndx = SHN_ABS) with the constant as its value. It stays
-+    /// in the symbol table -- mkpiggy's `z_input_len = N` plus `.globl
-+    /// z_input_len` is scraped by the boot Makefile's ZOFFSET rule via nm,
-+    /// which broke when the constant fold swallowed the symbol entirely
-+    /// ("undefined reference to ZO_z_input_len" in header.S).
-+    /// The writer consumes abs_symbols in build_symbol_table.
-     fn resolve_set_constants(&mut self) {
-         let pending = std::mem::take(&mut self.pending_set_exprs);
-         for (alias, expr, sec_idx) in pending {
-@@ -2678,6 +2685,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
-             }
-             self.sections[sec_idx].relocations = remaining;
+-    fn lex_identifier(&mut self, start: usize) -> Token {
++fn lex_identifier(&mut self, start: usize) -> Token {
+         while self.pos < self.input.len() && (self.input[self.pos] == b'_' || self.input[self.pos] == b'$' || self.input[self.pos].is_ascii_alphanumeric()) {
+             self.pos += 1;
          }
-+
-+        // GAS keeps `.set NAME, <constant>` in the symbol table as an
-+        // SHN_ABS symbol. Re-export every folded constant as a decimal
-+        // alias so the symbol-table builder's integer-alias branch emits
-+        // it; mkpiggy's `z_input_len = N` + `.globl z_input_len` is
-+        // scraped from nm output by the boot Makefile's ZOFFSET rule, and
-+        // swallowing it produced "undefined reference to ZO_z_input_len"
-+        // in header.S.
-+        for (name, val) in self.set_values.clone() {
-+            self.aliases.entry(name).or_insert_with(|| val.to_string());
-+        }
+@@ -987,7 +1053,9 @@ impl Lexer {
+         if let Some(kw) = TokenKind::from_keyword(text, self.gnu_extensions) {
+             Token::new(kw, span)
+         } else {
+-            Token::new(TokenKind::Identifier(text.to_string()), span)
++            let bytes = self.input[start..self.pos].to_vec();
++            let name = self.intern_ident(&bytes);
++            Token::new(TokenKind::Identifier(name), span)
+         }
      }
  
-     fn resolve_internal_relocations(&mut self) {
--- 
-2.47.3
-
-
-From f612b88eddfe4ecd3b9649d6e0de83842516faa5 Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sun, 16 Aug 2026 23:09:04 +0000
-Subject: [PATCH 04/11] asm: (a - b) / N division in scaled symbol diffs,
- dot-operand as synthetic label
-
-header.S PE metadata: '.long (section_table - .) / 8'
-(NumberOfRvaAndSizes). SymbolDiffScaled grows a divisor field, the
-paren-diff parser accepts '/ N' after the closing paren, and a bare
-'.' operand registers a synthetic label at the directive's own offset
-so the post-layout fold computes the exact GAS value (byte-verified:
-divd2.s '01000000' == GAS).
-
-Validation: 685 lib / 192 regression green; asm-diff RAW EXACT.
----
- src/backend/elf/numeric_labels.rs   |  4 ++--
- src/backend/elf_writer_common.rs    | 27 ++++++++++++++++++++++++---
- src/backend/x86/assembler/parser.rs | 14 ++++++++++++--
- 3 files changed, 38 insertions(+), 7 deletions(-)
-
-diff --git a/src/backend/elf/numeric_labels.rs b/src/backend/elf/numeric_labels.rs
-index 0bc8ff0b..a25f6f2f 100644
---- a/src/backend/elf/numeric_labels.rs
-+++ b/src/backend/elf/numeric_labels.rs
-@@ -221,12 +221,12 @@ fn resolve_numeric_data_values(
-                     .unwrap_or_else(|| rhs.clone());
-                 DataValue::SymbolDiffAddend(new_lhs, new_rhs, *addend)
-             }
--            DataValue::SymbolDiffScaled(lhs, rhs, scale, addend) => {
-+            DataValue::SymbolDiffScaled(lhs, rhs, scale, div, addend) => {
-                 let new_lhs = resolve_numeric_name(lhs, current_idx, defs)
-                     .unwrap_or_else(|| lhs.clone());
-                 let new_rhs = resolve_numeric_name(rhs, current_idx, defs)
-                     .unwrap_or_else(|| rhs.clone());
--                DataValue::SymbolDiffScaled(new_lhs, new_rhs, *scale, *addend)
-+                DataValue::SymbolDiffScaled(new_lhs, new_rhs, *scale, *div, *addend)
-             }
-             // Exhaustive on purpose: every future DataValue variant that can
-             // carry a symbol name must be considered here explicitly.
-diff --git a/src/backend/elf_writer_common.rs b/src/backend/elf_writer_common.rs
-index a096edb0..c7a92ee7 100644
---- a/src/backend/elf_writer_common.rs
-+++ b/src/backend/elf_writer_common.rs
-@@ -206,6 +206,8 @@ struct ScaledDiff {
-     a: String,
-     b: String,
-     scale: i64,
-+    /// Divisor applied after scaling (div >= 1).
-+    div: i64,
-     addend: i64,
-     size: usize,
- }
-@@ -1084,17 +1086,35 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                 DataValue::SymbolDiffAddend(a, b, addend) => {
-                     self.emit_symbol_diff(sec_idx, a, b, size, *addend)?;
+@@ -1210,10 +1278,17 @@ impl Lexer {
+                 // Non-ASCII or unknown character: skip any remaining bytes of
+                 // a multi-byte UTF-8 sequence (including PUA-encoded bytes from
+                 // non-UTF-8 source files) and continue tokenizing.
+-                // TODO: emit a diagnostic for genuinely unknown/invalid characters
++                let bad_start = self.pos;
++                let bad = self.input[self.pos];
++                self.pos += 1;
+                 while self.pos < self.input.len() && (self.input[self.pos] & 0xC0) == 0x80 {
+-                    self.pos += 1; // skip continuation bytes
++                    self.pos += 1;
                  }
--                DataValue::SymbolDiffScaled(a, b, scale, addend) => {
-+                DataValue::SymbolDiffScaled(a, b, scale, div, addend) => {
-                     // `(a-b)*scale + addend`. A scaled difference cannot be
-                     // expressed by any ELF relocation, so it must be folded to
-                     // a constant here; that is sound precisely because a
-                     // same-section label difference is link-time invariant.
-+                    // `.` as either operand is THIS directive's position: register a
-+                    // synthetic label at the current offset so the post-layout
-+                    // fold resolves it (header.S: `.long (section_table - .) / 8`).
-+                    let here = self.sections[sec_idx].data.len() as u64;
-+                    let dot_name = format!(".Ldot_{}_{}", sec_idx, here);
-+                    let a_res = if a == "." {
-+                        self.label_positions.insert(dot_name.clone(), (sec_idx, here));
-+                        dot_name.clone()
-+                    } else {
-+                        self.aliases.get(a).cloned().unwrap_or_else(|| a.clone())
-+                    };
-+                    let b_res = if b == "." {
-+                        self.label_positions.insert(dot_name.clone(), (sec_idx, here));
-+                        dot_name.clone()
-+                    } else {
-+                        self.aliases.get(b).cloned().unwrap_or_else(|| b.clone())
-+                    };
-                     self.deferred_scaled_diffs.push(ScaledDiff {
-                         sec_idx,
-                         offset: self.sections[sec_idx].data.len(),
--                        a: self.aliases.get(a).cloned().unwrap_or_else(|| a.clone()),
--                        b: self.aliases.get(b).cloned().unwrap_or_else(|| b.clone()),
-+                        a: a_res,
-+                        b: b_res,
-                         scale: *scale,
-+                        div: *div,
-                         addend: *addend,
-                         size,
-                     });
-@@ -1773,6 +1793,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
++                self.emit_lex_diag(
++                    format!("unexpected character byte 0x{:02X} in source", bad),
++                    bad_start,
++                    self.pos,
++                );
+                 return self.next_token();
              }
-             let value = (pa.1 as i64 - pb.1 as i64)
-                 .checked_mul(d.scale)
-+                .map(|v| v / d.div)
-                 .and_then(|v| v.checked_add(d.addend))
-                 .ok_or_else(|| format!("overflow folding ({} - {})", d.a, d.b))?;
-             let bytes = value.to_le_bytes();
-diff --git a/src/backend/x86/assembler/parser.rs b/src/backend/x86/assembler/parser.rs
-index 1f08e21f..69180597 100644
---- a/src/backend/x86/assembler/parser.rs
-+++ b/src/backend/x86/assembler/parser.rs
-@@ -146,7 +146,9 @@ pub enum DataValue {
-     /// `(a - b) * scale + addend` — a symbol difference folded through an
-     /// arithmetic expression (e.g. `.long (end-start)*2`). Same-section label
-     /// differences are absolute, so this always resolves to a constant.
--    SymbolDiffScaled(String, String, i64, i64),
-+    /// `(a - b) * scale / div + addend`. div=1 for plain scaling; header.S
-+    /// PE metadata divides: `.long (section_table - .) / 8`.
-+    SymbolDiffScaled(String, String, i64, i64, i64),
- }
- 
- /// CFI directives (call frame information).
-@@ -2074,12 +2076,20 @@ fn try_parse_sym_diff_expr(s: &str) -> Option<DataValue> {
-         scale = scale.checked_mul(parse_integer_expr(f).ok()?)?;
-     }
- 
-+    let mut div: i64 = 1;
-     let mut rest = after;
-     if let Some(r) = rest.strip_prefix('*') {
-         let (num, tail) = split_leading_int(r.trim())?;
-         scale = scale.checked_mul(num)?;
-         rest = tail.trim();
-     }
-+    // Division: `(a - b) / 8` (header.S NumberOfRvaAndSizes).
-+    if let Some(r) = rest.strip_prefix('/') {
-+        let (num, tail) = split_leading_int(r.trim())?;
-+        if num == 0 { return None; }
-+        div = num;
-+        rest = tail.trim();
-+    }
-     if !rest.is_empty() {
-         let (sign, r) = if let Some(r) = rest.strip_prefix('+') {
-             (1i64, r)
-@@ -2094,7 +2104,7 @@ fn try_parse_sym_diff_expr(s: &str) -> Option<DataValue> {
-     if !rest.is_empty() {
-         return None;
-     }
--    Some(DataValue::SymbolDiffScaled(a, b, scale, addend))
-+    Some(DataValue::SymbolDiffScaled(a, b, scale, div, addend))
- }
- 
- /// Split `A-B` into its two label operands, or `None` when the text is not a
--- 
-2.47.3
-
-
-From d1d73ca496cee38eb187f9b16efb54d5af8b99c8 Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sun, 16 Aug 2026 23:13:27 +0000
-Subject: [PATCH 05/11] i686 peephole: decode slot-namespace bias in
- memory-operand folding
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-fold_memory_operands rebuilt the folded operand with a hard-coded
-(%ebp) base and the RAW offset — which now carries the ESP_SLOT_BIAS
-namespace marker. An ESP-slot fold produced silent wrong code:
-'cmpl 16777244(%ebp), %eax' (bias leaked into the displacement, wrong
-base register) — visible in the number() reproducer and fatal anywhere
-it fired. Decode the bias back into (disp, %esp/%ebp) before emission.
-
-Validation: 685 lib / 192 regression / 50 correctness green;
-differential fuzz 300/300 (O2+Os, seeds 0:150).
----
- src/backend/i686/codegen/peephole.rs | 14 ++++++++++++--
- 1 file changed, 12 insertions(+), 2 deletions(-)
-
-diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index 35cb73ef..ce6bbdde 100644
---- a/src/backend/i686/codegen/peephole.rs
-+++ b/src/backend/i686/codegen/peephole.rs
-@@ -1994,11 +1994,21 @@ fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
- fn try_fold_memory_operand(s: &str, load_reg: RegId, offset: i32, _size: MoveSize) -> Option<String> {
-     let reg_name = reg32_name(load_reg);
- 
-+    // The offset carries the slot-namespace bias: decode it back into the
-+    // real displacement and its base register. Emitting the BIASED number
-+    // with a hard-coded (%ebp) produced silent wrong code once ESP slots
-+    // joined the peepholes (`cmpl 16777244(%ebp), %eax`).
-+    let (disp, base) = if offset >= ESP_SLOT_BIAS / 2 {
-+        (offset - ESP_SLOT_BIAS, "%esp")
-+    } else {
-+        (offset, "%ebp")
-+    };
-+
-     // Try patterns: `OPCODE %load_reg, %other_reg`
-     for op in &["addl", "subl", "andl", "orl", "xorl", "cmpl", "testl", "imull"] {
-         if let Some(rest) = s.strip_prefix(op) {
-             let rest = rest.trim();
--            // Pattern: `%load_reg, %dst` → `OPCODE offset(%ebp), %dst`
-+            // Pattern: `%load_reg, %dst` -> `OPCODE disp(base), %dst`
-             if let Some(after) = rest.strip_prefix(reg_name) {
-                 let after = after.trim();
-                 if let Some(after_comma) = after.strip_prefix(',') {
-@@ -2006,7 +2016,7 @@ fn try_fold_memory_operand(s: &str, load_reg: RegId, offset: i32, _size: MoveSiz
-                     if dst.starts_with('%') && !dst.contains('(') {
-                         // Don't fold if dst is the same as load_reg (would be read after free)
-                         if register_family(dst) != load_reg {
--                            return Some(format!("{} {}(%ebp), {}", op, offset, dst));
-+                            return Some(format!("{} {}({}), {}", op, disp, base, dst));
-                         }
-                     }
-                 }
--- 
-2.47.3
-
-
-From 5ef6147bd8402272f94f863f6ca5dfd37a93b3af Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sun, 16 Aug 2026 23:15:52 +0000
-Subject: [PATCH 06/11] i686 peephole: fold immediate-to-scratch comparisons
- (cmpl $IMM, %R)
-
-movl $IMM, %C ; cmpl %C, %R  ->  cmpl $IMM, %R  when %C is dead after
-the comparison (bounded written-before-read scan, conservative at
-barriers). AT&T operand order preserves semantics exactly (R - C vs
-R - IMM). GCC always emits the immediate form; the scratch turnaround
-cost 5 bytes and a register per comparison in the boot-path hot shapes.
-
-Validation: 685 lib / 192 regression green; fuzz 100/100 (Os).
----
- src/backend/i686/codegen/peephole.rs | 56 ++++++++++++++++++++++++++++
- 1 file changed, 56 insertions(+)
-
-diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index ce6bbdde..ce7526f8 100644
---- a/src/backend/i686/codegen/peephole.rs
-+++ b/src/backend/i686/codegen/peephole.rs
-@@ -788,6 +788,62 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-         while j < len && infos[j].is_nop() { j += 1; }
-         if j >= len { i += 1; continue; }
- 
-+        // Pattern 2w: immediate-to-scratch feeding a comparison --
-+        //   movl $IMM, %C ; cmpl %C, %R  ->  cmpl $IMM, %R
-+        // AT&T semantics match exactly: `cmpl %C, %R` computes R - C and
-+        // `cmpl $IMM, %R` computes R - IMM. Fires only when %C is dead
-+        // after the cmp (bounded written-before-read scan). GCC always
-+        // emits the immediate form; the scratch turnaround costs 5 bytes
-+        // and a register per comparison.
-+        if let LineKind::Other { dest_reg: c_reg } = infos[i].kind {
-+            if c_reg <= REG_GP_MAX && c_reg != REG_ESP && c_reg != REG_EBP
-+                && infos[j].kind == LineKind::Cmp {
-+                let s0 = trimmed(store, &infos[i], i).to_string();
-+                if s0.starts_with("movl $") && !s0.contains('(') {
-+                    let cn = reg32_name(c_reg);
-+                    if s0.ends_with(cn) {
-+                        let imm = s0[5..].split(',').next().unwrap_or("").trim().to_string();
-+                        let s1 = trimmed(store, &infos[j], j).to_string();
-+                        let pref = format!("cmpl {}, ", cn);
-+                        if let Some(rhs) = s1.strip_prefix(&pref) {
-+                            let rhs = rhs.trim();
-+                            if rhs.starts_with('%') && !rhs.contains('(')
-+                                && register_family(rhs) != c_reg {
-+                                // deadness of %C after the cmp
-+                                let mut k = j + 1;
-+                                let mut cnt = 0;
-+                                let mut dead = false;
-+                                while k < len && cnt < 24 {
-+                                    if infos[k].is_nop() { k += 1; continue; }
-+                                    if infos[k].is_barrier() { break; }
-+                                    let s2 = trimmed(store, &infos[k], k);
-+                                    let written = match infos[k].kind {
-+                                        LineKind::Other { dest_reg } => dest_reg == c_reg,
-+                                        LineKind::Move { dst, .. } => dst == c_reg,
-+                                        LineKind::LoadEbp { reg, .. } => reg == c_reg,
-+                                        LineKind::SetCC { reg } => reg == c_reg,
-+                                        _ => false,
-+                                    };
-+                                    if written && !line_reads_dest_source(s2, c_reg) { dead = true; break; }
-+                                    if line_references_reg(s2, c_reg) || line_writes_reg_implicitly(s2, c_reg) { break; }
-+                                    k += 1;
-+                                    cnt += 1;
-+                                }
-+                                if dead {
-+                                    store.replace(j, format!("    cmpl {}, {}", imm, rhs));
-+                                    infos[j] = classify_line(store.get(j));
-+                                    infos[i].kind = LineKind::Nop;
-+                                    changed = true;
-+                                    i += 1;
-+                                    continue;
-+                                }
-+                            }
-+                        }
-+                    }
-+                }
-+            }
-+        }
-+
-         // Pattern 2z: Copy propagation through a scratch register --
-         //   `movl %SRC, %T; <op reading %T once>` where %T is dead after.
-         // The i686 codegen funnels almost everything through %eax:
--- 
-2.47.3
-
-
-From 9296dff9aa0c6a66e7fa68347ae61521bff3544f Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Mon, 17 Aug 2026 00:14:00 +0000
-Subject: [PATCH 07/11] i686: fix wrong-code in emit_typed_store_indirect
- (store %eax, not %edx)
-
-emit_store_default (traits.rs) loads the pointer into %ecx FIRST and the
-value into the accumulator %eax SECOND -- there is no save_acc on that
-path. The i686 hook nevertheless stored from %edx, so every non-i64
-store through SlotAddr::Indirect/OverAligned (global stores like
-`g = v;`, *p = v through a spilled pointer) wrote an UNINITIALIZED
-register:
-
-    movl x@GOT(%ebx), %ecx   ; pointer
-    movl 16(%esp), %eax      ; value
-    movl %edx, (%ecx)        ; <- garbage
-
-Runtime reproducer (storeind.c): set_global(42); get_global() returned
-garbage; exit code 1. After the fix: exit 0, store is `movl %ebx,(%ecx)`
-(value register), byte-verified via objdump.
-
-The ARM backend fixed the identical bug (store from x0, not x1) and
-x86-64 always stored from %rax; i686 was the last backend with the
-stale contract. The only other caller, our emit_store_with_const_offset
-override, calls emit_save_acc() (%eax -> %edx) and then only touches
-%ecx before the store -- %eax still holds the value there, so storing
-from %eax is correct on that path too.
-
-Validation: cargo test 685 pass; regression 192; correctness 50;
-intrinsics 3; linker 86; asm-diff clean; differential fuzz 300/300
-(O2+Os).
----
- src/backend/i686/codegen/memory.rs | 18 +++++++++++++++---
- 1 file changed, 15 insertions(+), 3 deletions(-)
-
-diff --git a/src/backend/i686/codegen/memory.rs b/src/backend/i686/codegen/memory.rs
-index f2bd3f20..c62195ce 100644
---- a/src/backend/i686/codegen/memory.rs
-+++ b/src/backend/i686/codegen/memory.rs
-@@ -356,10 +356,22 @@ impl I686Codegen {
-     }
- 
-     pub(super) fn emit_typed_store_indirect_impl(&mut self, instr: &'static str, ty: IrType) {
-+        // Store from the ACCUMULATOR (%eax), not %edx.
-+        //
-+        // Every caller of this hook loads the value into %eax last:
-+        //   * emit_store_default (traits.rs) loads the pointer into %ecx
-+        //     first and then the value into %eax -- there is NO save_acc on
-+        //     that path, so storing %edx wrote an uninitialized register.
-+        //     `g = v;` compiled to `movl %edx, (%ecx)` with %edx never set.
-+        //   * our own emit_store_with_const_offset override calls
-+        //     emit_save_acc() and then only touches %ecx (slot load /
-+        //     lea+add+and), so %eax still holds the value there too.
-+        // The ARM backend fixed the identical bug (store from x0, not x1);
-+        // x86-64 always stored from %rax.
-         let reg = match ty {
--            IrType::I8 | IrType::U8 => "%dl",
--            IrType::I16 | IrType::U16 => "%dx",
--            _ => "%edx",
-+            IrType::I8 | IrType::U8 => "%al",
-+            IrType::I16 | IrType::U16 => "%ax",
-+            _ => "%eax",
          };
-         emit!(self.state, "    {} {}, (%ecx)", instr, reg);
-     }
--- 
-2.47.3
-
-
-From 658e6f1374cdae927039a36e6c80d70628139341 Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Mon, 17 Aug 2026 00:20:29 +0000
-Subject: [PATCH 08/11] i686 peephole: propagate_reg_copies must respect
- implicit register writes
-
-PR#84's propagate_reg_copies tracked alias invalidation only through
-LineKind dest_reg, but `idivl %ecx`, `mull`, `cltd`, `xchg` and the
-string ops write %eax/%edx (or %ecx/%esi/%edi) with NO comma operand,
-so classify_line reports Other{dest_reg: REG_NONE}. The alias from a
-prior `movl %ebx,%eax` therefore survived the division, and the
-quotient consumer was rewritten from %eax back to %ebx:
-
-    movl %ebx, %eax
-    cltd
-    idivl %ecx          ; eax = quotient
-    movl %eax, %edi     ; -> rewritten to movl %ebx, %edi  (WRONG)
-
-Runtime reproducer mulhaz.c: g(100,7) = a + a/b returned 200 instead
-of 114 (exit 1). GCC oracle returns 114. Fixed by also consulting
-line_writes_reg_implicitly() (already used by forward_slot_loads for
-exactly this purpose) when deciding whether src or dst of the copy is
-redefined. After the fix both g(100,7)=114 and f(3,5,29) mull-variant
-pass (exit 0).
-
-Validation: cargo test 685; regression 192; correctness 50; linker 86;
-asm-diff clean; differential fuzz 300/300 (O2+Os).
----
- src/backend/i686/codegen/peephole.rs | 12 ++++++++++--
- 1 file changed, 10 insertions(+), 2 deletions(-)
-
-diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index ce7526f8..13360f02 100644
---- a/src/backend/i686/codegen/peephole.rs
-+++ b/src/backend/i686/codegen/peephole.rs
-@@ -1610,6 +1610,14 @@ fn propagate_reg_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+diff --git a/src/frontend/parser/declarations.rs b/src/frontend/parser/declarations.rs
+index d82f0f0..bcebe7a 100644
+--- a/src/frontend/parser/declarations.rs
++++ b/src/frontend/parser/declarations.rs
+@@ -245,11 +245,12 @@ impl Parser {
+         let return_type = self.build_return_type(type_spec, &derived);
  
-             // A write to the SOURCE breaks the alias immediately -- readers
-             // after this point must keep using dst.
-+            //
-+            // IMPLICIT writes matter as much as explicit ones: `idivl %ecx`
-+            // has no comma, so classify_line gives Other{dest_reg: REG_NONE},
-+            // yet it clobbers %eax AND %edx. Without the implicit check the
-+            // alias from `movl %ebx,%eax` survived the division and the
-+            // quotient consumer `movl %eax,%edi` was rewritten to
-+            // `movl %ebx,%edi` -- silently replacing a/b with a. Same story
-+            // for mull, cltd, xchg and the string ops.
-             let writes_src = match infos[j].kind {
-                 LineKind::Move { dst, .. } => dst == src_reg,
-                 LineKind::LoadEbp { reg, .. } => reg == src_reg,
-@@ -1617,7 +1625,7 @@ fn propagate_reg_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                 LineKind::SetCC { reg } => reg == src_reg,
-                 LineKind::Other { dest_reg } => dest_reg == src_reg,
-                 _ => false,
--            };
-+            } || line_writes_reg_implicitly(line, src_reg);
-             if writes_src {
-                 break;
-             }
-@@ -1646,7 +1654,7 @@ fn propagate_reg_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                 LineKind::SetCC { reg } => reg == dst_reg,
-                 LineKind::Other { dest_reg } => dest_reg == dst_reg,
-                 _ => false,
--            };
-+            } || line_writes_reg_implicitly(trimmed(store, &infos[j], j), dst_reg);
-             if writes_dst {
-                 break;
-             }
--- 
-2.47.3
-
-
-From 8728447dfd7b60dc183976f3e8fa14e28f3bd4c8 Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Mon, 17 Aug 2026 00:34:27 +0000
-Subject: [PATCH 09/11] i686 PIC: keep GOT base alive for functions that make
- @PLT calls
-
-PR#84's function_needs_got() allowlist covered GlobalAddr, LabelAddr,
-InlineAsm, Switch and IndirectBranch -- but not CALLS. On i386 the
-lazy-binding PLT stub itself is the other consumer of %ebx:
-
-    helper@plt:  jmp *name@GOT(%ebx)   ; needs GOT base!
-                 push $reloc
-                 jmp .plt0
-    .plt0:       push 4(%ebx); jmp *8(%ebx)
-
-A function whose only PIC construct is `return helper(x)+1;` compiled
-to `call helper@PLT` with NO thunk and %ebx holding a caller value:
-the first call through an unbound PLT entry jumps through garbage.
-GCC oracle (gcc -m32 -fPIC -O2): emits get_pc_thunk.bx + GOT setup for
-exactly this function -- verified side by side.
-
-Fix: function_needs_got() now also returns true for
-  * Instruction::Call whose callee needs_plt() (external, PIC), and
-  * 64-bit SDiv/UDiv/SRem/URem, which lower to __{u}div/moddi3 PLT
-    calls inside the backend (invisible as IR Calls).
-Pure leaf functions (add2, static-inlined callees) remain thunk-free;
-probe output shows caller and d64 get the thunk, add2 does not.
-
-Validation: cargo test 685; regression 192; correctness 50;
-intrinsics 3; linker 86; asm-diff clean; fuzz 300/300 (O2+Os).
----
- src/backend/i686/codegen/prologue.rs | 36 +++++++++++++++++++++++++---
- 1 file changed, 33 insertions(+), 3 deletions(-)
-
-diff --git a/src/backend/i686/codegen/prologue.rs b/src/backend/i686/codegen/prologue.rs
-index a8965b85..4a8184ee 100644
---- a/src/backend/i686/codegen/prologue.rs
-+++ b/src/backend/i686/codegen/prologue.rs
-@@ -29,9 +29,9 @@ impl I686Codegen {
-     /// recognised here keeps the GOT. Getting this wrong in the permissive
-     /// direction produces a wild %ebx dereference, so the failure mode must be
-     /// "one wasted register", never "wrong address".
--    fn function_needs_got(func: &IrFunction, pic: bool) -> bool {
-+    fn function_needs_got(&self, func: &IrFunction) -> bool {
-         use crate::ir::reexports::{Instruction, Terminator};
--        if !pic {
-+        if !self.state.pic_mode {
-             return false;
-         }
-         for block in &func.blocks {
-@@ -49,6 +49,36 @@ impl I686Codegen {
-                     Instruction::GlobalAddr { .. }
-                     | Instruction::LabelAddr { .. }
-                     | Instruction::InlineAsm { .. } => return true,
-+                    // A `call sym@PLT` is the i386 PSABI's OTHER consumer of
-+                    // %ebx: the lazy-binding PLT stub is
-+                    //     jmp *name@GOT(%ebx); push $reloc; jmp .plt0
-+                    // and .plt0 itself does `push 4(%ebx); jmp *8(%ebx)`.
-+                    // Without the GOT base at the call site the very first
-+                    // call through the stub jumps through garbage. This is
-+                    // why GCC sets up the thunk even in functions whose only
-+                    // PIC-relevant construct is an external call (verified:
-+                    // gcc -m32 -fPIC on `return helper(x)+1;` emits
-+                    // get_pc_thunk.bx + call helper@PLT).
-+                    Instruction::Call { func: callee, .. }
-+                        if self.state.needs_plt(callee) =>
-+                    {
-+                        return true;
-+                    }
-+                    // 64-bit div/mod lowers to __{u}divdi3/__{u}moddi3 calls
-+                    // behind the backend's back (emit_i128_divmod). Those are
-+                    // PLT calls under the same rule when the weak stubs end
-+                    // up resolved externally, so keep the GOT alive for them.
-+                    Instruction::BinOp { op, ty, .. }
-+                        if matches!(
-+                            op,
-+                            crate::ir::reexports::IrBinOp::SDiv
-+                                | crate::ir::reexports::IrBinOp::UDiv
-+                                | crate::ir::reexports::IrBinOp::SRem
-+                                | crate::ir::reexports::IrBinOp::URem
-+                        ) && matches!(ty, IrType::I64 | IrType::U64) =>
-+                    {
-+                        return true;
-+                    }
-                     _ => {}
+         // Shadow typedef names used as parameter names
+-        let saved_shadowed = self.shadowed_typedefs.clone();
++        let mut shadowed_added: Vec<String> = Vec::new();
+         for param in &final_params {
+             if let Some(ref pname) = param.name {
+                 if self.typedefs.contains(pname) && !self.shadowed_typedefs.contains(pname) {
+                     self.shadowed_typedefs.insert(pname.clone());
++                    shadowed_added.push(pname.clone());
                  }
              }
-@@ -107,7 +137,7 @@ impl I686Codegen {
-         // kernel setup binary that is pure waste, because the overwhelming
-         // majority of those functions never form a global address at all.
-         // GCC makes the same call: it materializes the GOT base lazily.
--        let needs_got = Self::function_needs_got(func, self.state.pic_mode);
-+        let needs_got = self.function_needs_got(func);
-         self.pic_got_live = needs_got;
-         if needs_got && !asm_clobbered_regs.contains(&PhysReg(0)) {
-             asm_clobbered_regs.push(PhysReg(0));
--- 
-2.47.3
-
-
-From e385167e4fc236e2cfa1223a3d95174c89434194 Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Mon, 17 Aug 2026 00:35:27 +0000
-Subject: [PATCH 10/11] i686 peephole: unit tests for copy-prop
- implicit-clobber soundness
-
-Two regression tests locking in the propagate_reg_copies fix: aliases
-must die at idivl (implicit %eax/%edx write) and at one-operand mull.
-Both fail on PR#84's original pass and pass with the
-line_writes_reg_implicitly() check.
----
- src/backend/i686/codegen/peephole.rs | 28 ++++++++++++++++++++++++++++
- 1 file changed, 28 insertions(+)
-
-diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index 13360f02..4647daa6 100644
---- a/src/backend/i686/codegen/peephole.rs
-+++ b/src/backend/i686/codegen/peephole.rs
-@@ -2383,6 +2383,34 @@ mod tests {
-         assert_eq!(result.trim(), "");
+         }
+@@ -258,7 +259,9 @@ impl Parser {
+         // parse_compound_stmt saves/restores attr flags, so this is safe.
+         self.attrs.set_noreturn(false);
+         let body = self.parse_compound_stmt();
+-        self.shadowed_typedefs = saved_shadowed;
++        for n in shadowed_added {
++            self.shadowed_typedefs.remove(&n);
++        }
+ 
+         Some(ExternalDecl::FunctionDef(FunctionDef {
+             return_type,
+@@ -1243,8 +1246,8 @@ impl Parser {
+         let message = if self.consume_if(&TokenKind::Comma) {
+             let mut msg = String::new();
+             let mut found_string = false;
+-            while let TokenKind::StringLiteral(s) = self.peek().clone() {
+-                msg.push_str(&s);
++            while let TokenKind::StringLiteral(s) = self.peek() {
++                msg.push_str(s);
+                 found_string = true;
+                 self.advance();
+             }
+diff --git a/src/frontend/parser/parse.rs b/src/frontend/parser/parse.rs
+index e98758c..6f01826 100644
+--- a/src/frontend/parser/parse.rs
++++ b/src/frontend/parser/parse.rs
+@@ -324,6 +324,30 @@ impl Parser {
+         self.diagnostics.error(message, span);
      }
  
-+    /// idivl writes %eax implicitly (no comma operand -> Other{REG_NONE}).
-+    /// Copy propagation must NOT rewrite readers of %eax past the division:
-+    /// `movl %ebx,%eax; cltd; idivl %ecx; movl %eax,%edi` -- the last move
-+    /// consumes the QUOTIENT, not %ebx. (mulhaz.c: a + a/b returned 2*a.)
-+    #[test]
-+    fn test_copy_prop_stops_at_idivl() {
-+        let asm = "    movl %ebx, %eax\n    cltd\n    idivl %ecx\n    movl %eax, %edi\n    pushl %edi\n".to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            !result.contains("movl %ebx, %edi"),
-+            "quotient consumer must keep reading %eax: {}",
-+            result
-+        );
++    /// Panic-mode recovery: skip until a synchronization point.
++    pub(super) fn sync_to(&mut self, stop: &[TokenKind]) {
++        while !matches!(self.peek(), TokenKind::Eof) {
++            let k = self.peek();
++            if stop.iter().any(|s| std::mem::discriminant(k) == std::mem::discriminant(s)) {
++                return;
++            }
++            if matches!(k,
++                TokenKind::Semicolon | TokenKind::RBrace | TokenKind::Eof
++                | TokenKind::RParen | TokenKind::RBracket
++            ) {
++                return;
++            }
++            self.advance();
++        }
 +    }
 +
-+    /// mull (one-operand) clobbers %eax and %edx implicitly; the alias from
-+    /// a copy of either must die at the multiply.
-+    #[test]
-+    fn test_copy_prop_stops_at_mull() {
-+        let asm = "    movl %esi, %eax\n    mull %ecx\n    movl %eax, %edi\n    pushl %edi\n".to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            !result.contains("movl %esi, %edi"),
-+            "product consumer must keep reading %eax: {}",
-+            result
-+        );
++    pub(super) fn sync_after_error(&mut self) {
++        self.sync_to(&[TokenKind::Semicolon, TokenKind::RBrace]);
++        if matches!(self.peek(), TokenKind::Semicolon) {
++            self.advance();
++        }
 +    }
 +
-     #[test]
-     fn test_redundant_jump() {
-         let asm = "    jmp .Lfoo\n.Lfoo:\n".to_string();
--- 
-2.47.3
-
-
-From 5055b12c1a99d81f104ffb234fc3debe2931982e Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Mon, 17 Aug 2026 00:48:05 +0000
-Subject: [PATCH 11/11] backend: honor LCCC_NO_PEEPHOLE on the i686 path too
-
-The bisection escape hatch existed only for x86-64; on -m32 the env var
-silently did nothing, which cost real triage time this session (a
-suspected peephole miscompile 'reproduced' identically with and without
-the flag -- because the flag was ignored). Now both paths behave the
-same. No change to default output (verified: szt.c 1988 bytes with
-peephole, 2301 without).
----
- src/backend/mod.rs | 10 +++++++++-
- 1 file changed, 9 insertions(+), 1 deletion(-)
-
-diff --git a/src/backend/mod.rs b/src/backend/mod.rs
-index 9d77fedd..ffd7b16f 100644
---- a/src/backend/mod.rs
-+++ b/src/backend/mod.rs
-@@ -334,7 +334,15 @@ impl Target {
-                 cg.state.function_sections = opts.function_sections;
-                 cg.state.data_sections = opts.data_sections;
-                 let raw = generation::generate_module_with_debug(&mut cg, module, opts.debug_info, source_mgr);
--                let optimized = i686::codegen::peephole::peephole_optimize(raw);
-+                // Same bisection escape hatch as x86-64: LCCC_NO_PEEPHOLE=1
-+                // emits the pre-peephole assembly verbatim. Without this the
-+                // i686 peepholes could not be ruled out when triaging a
-+                // miscompile (the flag silently did nothing on -m32).
-+                let optimized = if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
-+                    raw
-+                } else {
-+                    i686::codegen::peephole::peephole_optimize(raw)
-+                };
-                 if opts.code16gcc {
-                     format!(".code16gcc\n{}", optimized)
-                 } else {
--- 
-2.47.3
-
+     /// Standard C typedef names commonly provided by system headers.
+     /// Since we don't actually include system headers, we pre-seed these.
+     fn builtin_typedefs() -> FxHashSet<String> {
+@@ -437,6 +461,9 @@ impl Parser {
+         } else {
+             let span = self.peek_span();
+             self.emit_error(format!("expected {} before {}", expected, self.peek()), span);
++            if matches!(expected, TokenKind::Semicolon) {
++                self.sync_after_error();
++            }
+             span
+         }
+     }
+diff --git a/tests/regression/lexer_ident_keyword.c b/tests/regression/lexer_ident_keyword.c
+new file mode 100644
+index 0000000..0aff327
+--- /dev/null
++++ b/tests/regression/lexer_ident_keyword.c
+@@ -0,0 +1,7 @@
++/* Keywords vs identifiers still tokenize correctly after interning. */
++int main(void) {
++    int int_ = 1; /* identifier, not keyword */
++    int x = 2;
++    if (int_ + x != 3) return 1;
++    return 0;
++}
+diff --git a/tests/regression/lexer_integer_overflow.c b/tests/regression/lexer_integer_overflow.c
+new file mode 100644
+index 0000000..c7bb894
+--- /dev/null
++++ b/tests/regression/lexer_integer_overflow.c
+@@ -0,0 +1,10 @@
++/* Large integer literals must still parse (saturated) and compile. */
++int main(void) {
++    /* 2^64 is too large for u64 — lexer saturates; value is implementation-defined
++       at this stage but must not crash the compiler. */
++    unsigned long long x = 0xFFFFFFFFFFFFFFFFULL;
++    if (x != 0xFFFFFFFFFFFFFFFFULL) return 1;
++    unsigned long long y = 18446744073709551615ULL;
++    if (y != x) return 2;
++    return 0;
++}
+diff --git a/tests/regression/parser_recovery_semicolon.c b/tests/regression/parser_recovery_semicolon.c
+new file mode 100644
+index 0000000..ddd52ed
+--- /dev/null
++++ b/tests/regression/parser_recovery_semicolon.c
+@@ -0,0 +1,6 @@
++/* Valid program: recovery path must not break normal parses. */
++int main(void) {
++    int a = 1;
++    int b = 2;
++    return a + b - 3;
++}
+diff --git a/tests/regression/parser_string_concat_static_assert.c b/tests/regression/parser_string_concat_static_assert.c
+new file mode 100644
+index 0000000..cb82308
+--- /dev/null
++++ b/tests/regression/parser_string_concat_static_assert.c
+@@ -0,0 +1,5 @@
++/* Adjacent string literals in _Static_assert message must concatenate. */
++int main(void) {
++    _Static_assert(1, "a" "b" "c");
++    return 0;
++}
