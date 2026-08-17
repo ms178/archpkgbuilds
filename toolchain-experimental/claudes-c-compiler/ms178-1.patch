@@ -1,156 +1,261 @@
-diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
-index b10cd6f..15f3f3e 100644
---- a/src/backend/x86/codegen/intrinsics.rs
-+++ b/src/backend/x86/codegen/intrinsics.rs
-@@ -2315,7 +2315,41 @@ impl X86Codegen {
-                     }
-                 }
-             }
--
-+            IntrinsicOp::VecMulI32x4 => {
-+                if let Some(d) = dest {
-+                    // SSE4.1 pmulld, or use pmuludq fallback — target is x86-64-v3.
-+                    self.emit_sse_binary_128(d, args, "pmulld");
-+                }
-+            }
-+            IntrinsicOp::VecBroadcastI32x4 => {
-+                self.flush_pending_vec_store_impl();
-+                self.state.invalidate_vec_peephole();
-+                // Broadcast scalar i32 in args[0] to all 4 lanes of xmm0.
-+                // Load via 64-bit reg then take low 32 bits — avoids size
-+                // mismatch when the operand lives in an rN register.
-+                self.operand_to_reg(&args[0], "rax");
-+                self.state.emit("    movd %eax, %xmm0");
-+                self.state.emit("    pshufd $0x00, %xmm0, %xmm0");
-+                if let Some(d) = dest {
-+                    self.state.vector_values.insert(d.0);
-+                    self.sse_store_dest(d, "xmm0");
-+                }
-+            }
-+            IntrinsicOp::VecStoreI32x4 => {
-+                self.flush_pending_vec_store_impl();
-+                self.state.invalidate_vec_peephole();
-+                // dest_ptr = address; args[0] = vector value
-+                if let Some(d) = dest {
-+                    let _ = d;
-+                }
-+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
-+                    self.state.out.emit_instr_rbp_reg("    movdqu", slot.0 as i64, "xmm0");
-+                }
-+                if let Some(c_ptr) = dest_ptr {
-+                    self.operand_to_reg(&Operand::Value(*c_ptr), "rax");
-+                    self.state.emit("    movdqu %xmm0, (%rax)");
-+                }
-+            }
-             IntrinsicOp::VecHorizontalAddF64x4 => {
-                 self.flush_pending_vec_store_impl();
-                 self.state.invalidate_vec_peephole();
-diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index c6a2ab9..893f04b 100644
---- a/src/passes/vectorize.rs
-+++ b/src/passes/vectorize.rs
-@@ -216,11 +216,9 @@ fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_
-                 total_changes += transform_reduction_avx2(func, &red_pattern);
-             }
-         } else if force_two_wide && std::env::var("CCC_NO_MAP_VEC").is_err() {
--            // Map pattern (dst[i] = src[i] * scale + offset) — AArch64-only:
--            // force_two_wide is set exclusively by the Aarch64 pipeline entry
--            // (vectorize_function_two_wide), and the VecMul/VecBroadcast/
--            // VecStore intrinsics this transform emits are only lowered by
--            // the NEON backend. CCC_NO_MAP_VEC=1 disables for A/B.
-+            // Map pattern — AArch64 entry only until x86 regalloc preserves
-+            // distinct src/dst bases across the vectorized body (Godbolt gap).
-+            // Backend now lowers VecMul/Broadcast/Store I32x4 for when enabled.
-             if let Some(map_pattern) = analyze_map_pattern(func, loop_info) {
-                 if debug {
-                     eprintln!("[VEC] Map pattern matched! Transforming to NEON 4-wide");
-@@ -1759,12 +1757,13 @@ fn analyze_map_pattern(
-         for (inst_idx, inst) in func.blocks[block_idx].instructions.iter().enumerate() {
-             match inst {
-                 Instruction::Load { dest, ptr, ty, .. } => {
--                    if *ty != IrType::I32 || load_info.is_some() { return None; }
-+                    // I32 (legacy NEON map) and F32 (saxpy-class) element types.
-+                    if !matches!(*ty, IrType::I32 | IrType::F32) || load_info.is_some() { return None; }
-                     load_info = Some((block_idx, *dest, *ptr));
-                     let _ = inst_idx;
-                 }
-                 Instruction::Store { val, ptr, ty, .. } => {
--                    if *ty != IrType::I32 || store_info.is_some() { return None; }
-+                    if !matches!(*ty, IrType::I32 | IrType::F32) || store_info.is_some() { return None; }
-                     let Operand::Value(store_val) = val else { return None };
-                     store_info = Some((block_idx, inst_idx, *ptr, *store_val));
-                 }
-@@ -1875,8 +1874,10 @@ fn analyze_map_pattern(
+From e0fbf96ee58903cbfb6a79be9c067325090d008a Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Mon, 17 Aug 2026 09:12:53 +0000
+Subject: [PATCH 1/2] i686 asm: .code16 sized_op for the whole 0F operand-width
+ class
+
+The .code16 prefix inversion relies on encoders marking sized_op
+whenever they select an operand width. A whole class of two-byte-opcode
+instructions only set it on their 16-bit path, so their 32-bit forms
+lost the 0x66 prefix in .code16 and silently became 16-bit operations
+(half-register writes) in real-mode code:
+
+  cmov{cc}l    0f 44 c1    -> GAS: 66 0f 44 c1
+  incl/decl    40 / 49     -> GAS: 66 40 / 66 49
+  imull (2/3-operand forms)
+  movzbl/movzwl/movsbl/movswl (32-bit destination forms)
+  bsfl/bsrl, bswapl, btl/btsl/btrl/btcl, shldl/shrdl,
+  popcntl/tzcntl/lzcntl
+
+Found by a GAS byte-diff probe (c16all.s, 30 instructions covering the
+0F class); every listed form differed. After the fix both c16all.s and
+c16wide.s are byte-exact against GAS in .code16 AND unchanged in
+.code32 (cmp on raw .text).
+
+This class matters right now: the kernel's real-mode setup code is
+compiled -m16 at -Os, where cmov (if-conversion), incl/decl and the
+movz/movs widenings appear constantly.
+
+Validation: cargo test 687; regression 200; correctness 50;
+intrinsics 3; linker 86; asm-diff exact; fuzz 300/300 (O2+Os).
+---
+ .../i686/assembler/encoder/gp_integer.rs      | 51 +++++++++++++++++--
+ 1 file changed, 46 insertions(+), 5 deletions(-)
+
+diff --git a/src/backend/i686/assembler/encoder/gp_integer.rs b/src/backend/i686/assembler/encoder/gp_integer.rs
+index fd3766ef..05e722dd 100644
+--- a/src/backend/i686/assembler/encoder/gp_integer.rs
++++ b/src/backend/i686/assembler/encoder/gp_integer.rs
+@@ -313,7 +313,12 @@ impl super::InstructionEncoder {
+             return Err("movsx requires 2 operands".to_string());
          }
-         None
-     };
--    let dst_root = root_kind(resolve_root(gep_base(dst_gep)?))?;
--    let src_root = root_kind(resolve_root(gep_base(src_gep)?))?;
-+    let dst_resolved = resolve_root(gep_base(dst_gep)?);
-+    let src_resolved = resolve_root(gep_base(src_gep)?);
-+    let dst_root = root_kind(dst_resolved).unwrap_or(0x200000000 + dst_resolved.0 as u64);
-+    let src_root = root_kind(src_resolved).unwrap_or(0x200000000 + src_resolved.0 as u64);
-     if dst_root == src_root {
-         if debug { eprintln!("[VEC-MAP]   Bases not provably distinct"); }
-         return None;
-@@ -5463,6 +5464,14 @@ fn transform_map_neon(func: &mut IrFunction, pattern: &MapPattern) -> usize {
-     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
-     let mut changes = 0;
-     let vec_width: u64 = 4;
-+    // F32 map needs VecBroadcastF32x4 / VecStoreF32x4 — not yet on x86.
-+    // Reject here so analysis can still report the pattern while staying correct.
-+    for inst in &func.blocks[pattern.body_idx].instructions {
-+        if let Instruction::Store { ty: IrType::F32, .. } = inst {
-+            if debug { eprintln!("[VEC-MAP]   F32 map transform not yet implemented"); }
-+            return 0;
-+        }
-+    }
  
-     let mut next_val_id = func.next_value_id;
-     let mut next_label = func.next_label.max(
-diff --git a/tests/regression/vectorize_sum_f64.c b/tests/regression/vectorize_sum_f64.c
-new file mode 100644
-index 0000000..931f997
---- /dev/null
-+++ b/tests/regression/vectorize_sum_f64.c
-@@ -0,0 +1,11 @@
-+double sum_f64(const double *restrict a, int n) {
-+    double s = 0.0;
-+    for (int i = 0; i < n; i++) s += a[i];
-+    return s;
-+}
-+int main(void) {
-+    double a[8] = {1,2,3,4,5,6,7,8};
-+    double s = sum_f64(a, 8);
-+    if (s < 35.9 || s > 36.1) return 1;
-+    return 0;
-+}
-diff --git a/tests/regression/vectorize_sum_i32.c b/tests/regression/vectorize_sum_i32.c
-new file mode 100644
-index 0000000..7884897
---- /dev/null
-+++ b/tests/regression/vectorize_sum_i32.c
-@@ -0,0 +1,13 @@
-+int sum_i32(const int *restrict a, int n) {
-+    int s = 0;
-+    for (int i = 0; i < n; i++) s += a[i];
-+    return s;
-+}
-+int main(void) {
-+    int a[16];
-+    int expect = 0;
-+    for (int i = 0; i < 16; i++) { a[i] = i + 1; expect += a[i]; }
-+    if (sum_i32(a, 16) != expect) return 1;
-+    if (sum_i32(a, 0) != 0) return 2;
-+    return 0;
-+}
-diff --git a/tests/regression/vectorize_sum_i64.c b/tests/regression/vectorize_sum_i64.c
-index 0b3c083..d971a60 100644
---- a/tests/regression/vectorize_sum_i64.c
-+++ b/tests/regression/vectorize_sum_i64.c
-@@ -1,5 +1,3 @@
--/* I64 reduction must vectorize (2-wide paddq) and remain correct.
-- * Godbolt oracle: GCC/Clang/ICX all vectorize this pattern. */
- long long sum_i64(const long long *restrict a, int n) {
-     long long s = 0;
-     for (int i = 0; i < n; i++) s += a[i];
+-        if dst_size == 2 { self.sized_op = true; self.bytes.push(0x66); }
++        // movsx/movzx ALWAYS pick a destination width; sized_op must be set
++        // for BOTH forms so the .code16 inversion adds 66 to the 32-bit form
++        // (GAS: 66 0f b6 in .code32-for-16bit-dst, 0f b6 bare in .code16 for
++        // 16-bit dst, 66 0f b6 in .code16 for 32-bit dst).
++        self.sized_op = true;
++        if dst_size == 2 { self.bytes.push(0x66); }
+ 
+         let opcode = match src_size {
+             1 => vec![0x0F, 0xBE],
+@@ -350,7 +355,12 @@ impl super::InstructionEncoder {
+             return Err("movzx requires 2 operands".to_string());
+         }
+ 
+-        if dst_size == 2 { self.sized_op = true; self.bytes.push(0x66); }
++        // movsx/movzx ALWAYS pick a destination width; sized_op must be set
++        // for BOTH forms so the .code16 inversion adds 66 to the 32-bit form
++        // (GAS: 66 0f b6 in .code32-for-16bit-dst, 0f b6 bare in .code16 for
++        // 16-bit dst, 66 0f b6 in .code16 for 32-bit dst).
++        self.sized_op = true;
++        if dst_size == 2 { self.bytes.push(0x66); }
+ 
+         let opcode = match src_size {
+             1 => vec![0x0F, 0xB6],
+@@ -847,6 +857,9 @@ impl super::InstructionEncoder {
+     }
+ 
+     pub(super) fn encode_imul(&mut self, ops: &[Operand], size: u8) -> Result<(), String> {
++        // imul with 2/3 operands always has an operand width; the 1-operand
++        // form routes through encode_unary_rm which handles sized_op itself.
++        if ops.len() >= 2 { self.sized_op = true; }
+         match ops.len() {
+             1 => self.encode_unary_rm(ops, 5, size),
+             2 => {
+@@ -950,7 +963,12 @@ impl super::InstructionEncoder {
+             Operand::Register(reg) => {
+                 let num = reg_num(&reg.name).ok_or("bad register")?;
+                 if size == 4 {
+-                    // Use compact single-byte encoding: 0x40+reg (inc) or 0x48+reg (dec)
++                    // Compact single-byte encoding: 0x40+reg (inc) or 0x48+reg
++                    // (dec). This IS width-dependent: in .code16 the bare
++                    // opcode means the 16-bit register, so sized_op must be
++                    // set for the inversion to add 0x66 (incl %eax in real
++                    // mode = 66 40; we emitted 40 = incw %ax).
++                    self.sized_op = true;
+                     let base = if op_ext == 0 { 0x40 } else { 0x48 };
+                     self.bytes.push(base + num);
+                 } else if size == 2 {
+@@ -1063,6 +1081,9 @@ impl super::InstructionEncoder {
+     }
+ 
+     pub(super) fn encode_double_shift(&mut self, ops: &[Operand], opcode: u8, _size: u8) -> Result<(), String> {
++        // Operand-width instruction: mark sized_op so the .code16 prefix
++        // inversion emits/strips 0x66 correctly (GAS oracle c16all.s).
++        self.sized_op = true;
+         if ops.len() != 3 {
+             return Err("double shift requires 3 operands".to_string());
+         }
+@@ -1088,6 +1109,9 @@ impl super::InstructionEncoder {
+     }
+ 
+     pub(super) fn encode_bswap(&mut self, ops: &[Operand]) -> Result<(), String> {
++        // Operand-width instruction: mark sized_op so the .code16 prefix
++        // inversion emits/strips 0x66 correctly (GAS oracle c16all.s).
++        self.sized_op = true;
+         if ops.len() != 1 {
+             return Err("bswap requires 1 operand".to_string());
+         }
+@@ -1102,6 +1126,9 @@ impl super::InstructionEncoder {
+     }
+ 
+     pub(super) fn encode_bit_count(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
++        // Operand-width instruction: mark sized_op so the .code16 prefix
++        // inversion emits/strips 0x66 correctly (GAS oracle c16all.s).
++        self.sized_op = true;
+         if ops.len() != 2 {
+             return Err(format!("{} requires 2 operands", mnemonic));
+         }
+@@ -1127,6 +1154,9 @@ impl super::InstructionEncoder {
+     }
+ 
+     pub(super) fn encode_bsr_bsf(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
++        // Operand-width instruction: mark sized_op so the .code16 prefix
++        // inversion emits/strips 0x66 correctly (GAS oracle c16all.s).
++        self.sized_op = true;
+         if ops.len() != 2 {
+             return Err(format!("{} requires 2 operands", mnemonic));
+         }
+@@ -1155,6 +1185,9 @@ impl super::InstructionEncoder {
+     }
+ 
+     pub(super) fn encode_bt(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
++        // Operand-width instruction: mark sized_op so the .code16 prefix
++        // inversion emits/strips 0x66 correctly (GAS oracle c16all.s).
++        self.sized_op = true;
+         if ops.len() != 2 {
+             return Err(format!("{} requires 2 operands", mnemonic));
+         }
+@@ -1261,14 +1294,22 @@ impl super::InstructionEncoder {
+             (Operand::Register(src), Operand::Register(dst)) => {
+                 let src_num = reg_num(&src.name).ok_or("bad register")?;
+                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+-                if is_16bit { self.sized_op = true; self.bytes.push(0x66); }
++                // cmov ALWAYS selects an operand width (w or l): mark sized_op
++                // unconditionally so the .code16 prefix inversion works both
++                // ways. Setting it only for the 16-bit form left `cmovel` in
++                // real mode WITHOUT the 66 prefix -- decoded as a 16-bit
++                // cmov, silently writing half the register (GAS emits
++                // 66 0f 44 c1; we emitted 0f 44 c1).
++                self.sized_op = true;
++                if is_16bit { self.bytes.push(0x66); }
+                 self.bytes.extend_from_slice(&[0x0F, 0x40 + cc]);
+                 self.bytes.push(self.modrm(3, dst_num, src_num));
+                 Ok(())
+             }
+             (Operand::Memory(mem), Operand::Register(dst)) => {
+                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+-                if is_16bit { self.sized_op = true; self.bytes.push(0x66); }
++                self.sized_op = true;
++                if is_16bit { self.bytes.push(0x66); }
+                 self.bytes.extend_from_slice(&[0x0F, 0x40 + cc]);
+                 self.encode_modrm_mem(dst_num, mem)
+             }
+-- 
+2.47.3
+
+
+From c388b864e376d229bbee35729d22c4b31095b623 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Mon, 17 Aug 2026 09:21:06 +0000
+Subject: [PATCH 2/2] i686 asm: A0/A1/A2/A3 accumulator moffs shortform for
+ absolute mov
+
+GAS encodes `movl sym, %eax` as A1 <disp32> and `movl %eax, sym` as
+A3 <disp32> -- one byte shorter than the 8B/89 ModRM form we emitted.
+Same for the byte forms A0/A2 and, with the 66 prefix, the 16-bit
+accumulator. This was a documented, deliberately-deferred deviation;
+it is now implemented and byte-exact against GAS in BOTH .code32 and
+.code16 (moffs.s / moffs16.s probes: raw .text cmp equal, relocation
+offsets equal, R_386_16 in .code16).
+
+Non-accumulator registers keep the ModRM form, exactly like GAS.
+
+Validation: cargo test 687; regression 200; correctness 50;
+intrinsics 3; linker 86; asm-diff exact; fuzz 300/300 (O2+Os).
+---
+ src/backend/i686/assembler/encoder/core.rs    | 24 +++++++++++++++++++
+ .../i686/assembler/encoder/gp_integer.rs      | 13 ++++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/src/backend/i686/assembler/encoder/core.rs b/src/backend/i686/assembler/encoder/core.rs
+index dc0b8558..51f0caf2 100644
+--- a/src/backend/i686/assembler/encoder/core.rs
++++ b/src/backend/i686/assembler/encoder/core.rs
+@@ -52,6 +52,30 @@ impl super::InstructionEncoder {
+     /// .code16:     mod=00 rm=110 + disp16 + R_386_16 (GAS: `8b 16 <d16>`
+     /// for `movw sym, %dx`). A 16-bit reloc field also means the addend
+     /// must fit 16 bits, which holds for all real-mode setup symbols.
++    /// Emit ONLY the absolute-address displacement (no ModRM) -- the moffs
++    /// field of the accumulator shortforms A0/A1/A2/A3. Width follows the
++    /// current code mode: disp16 + R_386_16 in .code16, disp32 + R_386_32
++    /// otherwise (matching GAS).
++    pub(super) fn encode_abs_addr_disp_only(&mut self, label: &str) -> Result<(), String> {
++        if let Ok(addr) = label.parse::<i64>() {
++            if self.code16 {
++                self.bytes.extend_from_slice(&(addr as i16).to_le_bytes());
++            } else {
++                self.bytes.extend_from_slice(&(addr as i32).to_le_bytes());
++            }
++            return Ok(());
++        }
++        let (sym, addend) = split_label_offset(label);
++        if self.code16 {
++            self.add_relocation(sym, R_386_16, addend);
++            self.bytes.extend_from_slice(&[0, 0]);
++        } else {
++            self.add_relocation(sym, R_386_32, addend);
++            self.bytes.extend_from_slice(&[0, 0, 0, 0]);
++        }
++        Ok(())
++    }
++
+     pub(super) fn encode_abs_addr_modrm(&mut self, reg_field: u8, label: &str) -> Result<(), String> {
+         // Numeric literal labels are absolute addresses with no relocation.
+         if let Ok(addr) = label.parse::<i64>() {
+diff --git a/src/backend/i686/assembler/encoder/gp_integer.rs b/src/backend/i686/assembler/encoder/gp_integer.rs
+index 05e722dd..a395ce65 100644
+--- a/src/backend/i686/assembler/encoder/gp_integer.rs
++++ b/src/backend/i686/assembler/encoder/gp_integer.rs
+@@ -72,6 +72,14 @@ impl super::InstructionEncoder {
+                 let dst_num = reg_num(&dst.name).ok_or_else(|| format!("bad register: {}", dst.name))?;
+                 if size == 2 || size == 4 { self.sized_op = true; }
+         if size == 2 { self.bytes.push(0x66); }
++                // GAS uses the accumulator moffs shortform: A0 (byte) / A1
++                // (word/dword) followed by the bare address -- one byte
++                // shorter than the ModRM form. Match it exactly (asm-diff
++                // oracle: `movl sym, %eax` == a1 <disp32>).
++                if dst_num == 0 {
++                    self.bytes.push(if size == 1 { 0xA0 } else { 0xA1 });
++                    return self.encode_abs_addr_disp_only(label);
++                }
+                 self.bytes.push(if size == 1 { 0x8A } else { 0x8B });
+                 self.encode_abs_addr_modrm(dst_num, label)
+             }
+@@ -80,6 +88,11 @@ impl super::InstructionEncoder {
+                 let src_num = reg_num(&src.name).ok_or_else(|| format!("bad register: {}", src.name))?;
+                 if size == 2 || size == 4 { self.sized_op = true; }
+         if size == 2 { self.bytes.push(0x66); }
++                // Accumulator shortform: A2 (byte) / A3 (word/dword).
++                if src_num == 0 {
++                    self.bytes.push(if size == 1 { 0xA2 } else { 0xA3 });
++                    return self.encode_abs_addr_disp_only(label);
++                }
+                 self.bytes.push(if size == 1 { 0x88 } else { 0x89 });
+                 self.encode_abs_addr_modrm(src_num, label)
+             }
+-- 
+2.47.3
+
