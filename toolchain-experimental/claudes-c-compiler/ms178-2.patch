@@ -1,0 +1,3244 @@
+diff --git a/docs/linker/FOLLOWUP_2026-08-17_SESSION2.md b/docs/linker/FOLLOWUP_2026-08-17_SESSION2.md
+new file mode 100644
+index 0000000..1f5c222
+--- /dev/null
++++ b/docs/linker/FOLLOWUP_2026-08-17_SESSION2.md
+@@ -0,0 +1,392 @@
++# LCCC Linker — Follow-Up Plan (Session 2)
++
++**Date:** 2026-08-17 (second session of the day)
++**Base:** `origin/main` @ `1706984` (post-PR #98)
++**Deliverable:** `ms178-1.patch` — 6 commits, 12 files, +1920 / −121
++**Supersedes:** `FOLLOWUP_2026-08-17.md` for the items marked DONE below.
++
++---
++
++## 0. Oracle environment (read this before trusting any number)
++
++The previous session's oracles were **stale release binaries** and produced two
++false failures. Both "bugs" were in the oracle, not in lccc:
++
++| Oracle | Old (this repo's prior sessions) | Now | Effect |
++|---|---|---|---|
++| mold | 2.37 / 2.40.1 release | **2.42.0-git `a718dbb`, built `-march=native`** | — |
++| wild | 0.7.0 / 0.10 release | **0.10.0-git `c545fc5`, built `-march=native`** | fixed 2 false FAILs |
++| bfd | 2.44 (Debian) | 2.44 | — |
++
++With wild 0.7.0 the suite reported:
++
++```
++[FAIL] ctor_priority_order      lccc (0,'123') != wild (0,'213')
++[FAIL] relro_write_protection   lccc (0,'PROTECTED') != wild (1,'WRITABLE')
++```
++
++**lccc was right in both cases** — constructor priority order and RELRO
++enforcement — and wild-git agrees. Anyone re-running this suite must build the
++oracles from git; a stale oracle silently inverts the verdict.
++
++> **Action for future sessions:** always `git clone` mold and wild and build
++> them before drawing conclusions. Budget ~12 min for wild, ~25 min for mold at
++> `-j2`.
++
++---
++
++## 1. Measurement methodology (no PMU available)
++
++The research VM is a 2-core Xeon with **no hardware PMU**
++(`/sys/bus/event_source/devices` has only software events, `perf` absent) and
++run-to-run wall-clock spread of 20–55%. Wall clock alone cannot resolve the
++effects we care about.
++
++**Solution: `valgrind --tool=callgrind` instruction counts as the primary
++metric.** Verified deterministic — three consecutive runs of the same binary on
++the same input returned *bit-identical* `486,425`. This is the technique
++rustc-perf and wild's own benchmark suite use.
++
++Stated limitation, so nobody over-reads it: instruction count is **not** time.
++It ignores memory-level parallelism, branch misprediction and cache misses, and
++it serialises threads — a parallel linker's wall time can fall while its
++instruction count rises. It is therefore used for **single-threaded algorithmic
++work** only, and always reported next to best-of-N wall clock.
++
++`tests/linker/bench_linker.py` implements this: best-of-N wall (minimum, not
++mean — noise is additive, so the minimum is the best estimator), peak RSS via
++`wait4`/`getrusage`, output size, and callgrind instructions. Every
++configuration is **validated by executing its output** before it is timed.
++
++---
++
++## 2. DONE this session
++
++### 2.1 ELF parser robustness — two fuzzer-found crashes fixed
++
++Built a structure-aware mutation fuzzer (`/home/user/fuzz/fuzz_ld.py`) whose
++seed links to a *complete, runnable* freestanding binary, so mutants exercise
++the whole pipeline (resolution → layout → relocation → emit) rather than dying
++at symbol resolution. It found two distinct real defects:
++
++**(a) Integer overflow in bounds checks → panic.**
++`if off + size <= data.len()` wraps in release builds, so a section header
++claiming `sh_offset = 2^64 − 0x2000` passed the guard and panicked in the slice:
++`range start index 18446744073692774483 out of range for slice of length 2064`.
++
++This was a **systemic class**, not one site: 4 sites in `parse_object.rs` and
++10 in `parse_shared.rs`. Fixed at the root by adding overflow-safe helpers to
++`backend/elf/io.rs` (`slice_at`, `range_ok`, `table_entry`, `try_read_u*`) and
++converting every call site. `table_entry` also guards the
++`base + idx * entsize` multiplication, itself an overflow hazard since
++`e_shnum` and `e_shentsize` are attacker-controlled.
++
++**(b) Non-power-of-two `sh_addralign` → 1 TiB allocation → SIGABRT.**
++`sh_addralign = 0xffffffffff` violates the gABI (must be 0 or 2^n). The layout
++engine rounded the section address up to it and the process died in the
++allocator: `memory allocation of 1099511627796 bytes failed`. `catch_unwind`
++**cannot** intercept an allocator abort, so this needed a real fix, not a
++handler. Rejected at parse time with the offending value in the message, plus a
++64 GiB defence-in-depth cap on the output buffer.
++
++**Comparison on the same malformed input:**
++
++| Linker | Behaviour |
++|---|---|
++| **lccc (after fix)** | `error: section '.text._start' data out of bounds`, **exit 1** |
++| bfd | exit 1 |
++| mold 2.42-git | **SIGSEGV (exit 139)** |
++| wild 0.10-git | exit 255 |
++
++lccc is now strictly more robust than mold on this input class.
++
++**(c) `catch_unwind` at the `lccc-ld` driver** with a quiet panic hook: a
++residual panic becomes `lccc-ld: internal error: …` + exit 1 (what build
++systems expect) instead of exit 101 + a backtrace note.
++`LCCC_LD_PANIC_TRACE=1` restores the full hook for debugging.
++
++**Validation:** 15 new surgical malformed-input tests (each mutates exactly one
++field and documents which invariant it probes); 6000-mutant fuzz campaign →
++**0 defects**.
++
++### 2.2 `parallel_reloc.rs` — undefined behaviour fixed
++
++The opt-in parallel store path had a **soundness bug**. Its doc comment claimed
++"partitions are contiguous segments of a list that has been sorted by offset;
++therefore the byte ranges cannot overlap" — but nothing sorted the list or
++checked the precondition. With an unsorted list, offsets `[0, 1000, 8, 1008]`
++and 2 threads produce spans `[0,1008)` and `[8,1016)`: **two `&mut [u8]`
++aliasing the same bytes**, i.e. UB. Additionally the buffer bounds check was a
++`debug_assert!`, which compiles out in release — an out-of-range offset became
++an out-of-bounds *write* rather than a skip.
++
++Rewritten so disjointness is **established, not assumed**: partition boundaries
++are placed only where a running high-water mark has been reached, so mutually
++overlapping writes always stay in one partition; every write is bounds-checked
++before any pointer is formed.
++
++**A randomised differential test caught a bug in the fix itself** — sorting by
++offset reorders writes that overlap at *different* offsets, silently inverting
++last-writer-wins (a stable sort only protects equal offsets). Order is now
++restored within each partition after the split points are chosen.
++
++11 tests: unsorted-equals-serial, last-writer-wins under 5 thread counts,
++out-of-range skipping, partition/no-partition assertions, and a 300-round
++randomised differential across densities, widths, overlaps and thread counts.
++
++### 2.3 Congruent segment packing — **59.5% smaller binaries**
++
++Root-caused by comparing program headers against bfd and wild. lccc rounded
++each PT_LOAD's **file offset** up to a page, because `addr` was hardwired to
++`BASE_ADDR + offset`. The gABI only requires
++`p_offset ≡ p_vaddr (mod p_align)` — `mmap` maps `p_offset & ~(pgsz−1)` onto
++`p_vaddr & ~(pgsz−1)`. bfd and wild emit congruent, *unaligned* offsets
++(`off=0x2d70/vaddr=0x3d70`); lccc was inserting a full page of zeros per
++segment.
++
++Fixed with a `vaddr_bias` that is always a multiple of `PAGE_SIZE`: file
++offsets stay dense, virtual addresses advance one page per segment.
++Congruence then holds by construction.
++
++**Subtle correctness point that this change forced:** RELRO's boundary is an
++*address* boundary (ld.so mprotects rounded-out page bounds). Once offsets and
++addresses diverge, aligning the file offset would leave RELRO ending mid-page
++and write-protect the start of the next section. Now aligned in address space
++and verified: a probe that writes to `_DYNAMIC` reports `PROTECTED` for both
++lccc and bfd.
++
++**Measured (zlib-ng test binary, same objects, only the linker varies):**
++
++| Linker | Before | After |
++|---|---:|---:|
++| **lccc** | 20 640 B | **8 352 B (−59.5%)** |
++| bfd | 16 400 B | 16 400 B |
++| mold | 9 808 B | 9 808 B |
++| wild | 6 773 B | 6 773 B |
++
++lccc went from **worst to second-best**, beating bfd by 2.0× and mold by 1.2×.
++Largest inter-LOAD file gap fell from ≥4096 B to 384 B.
++
++**`emit_shared.rs` had the identical defect** and was fixed the same way. It is
++a *separate* layout implementation, which is itself the finding: the two paths
++duplicate layout logic, so a fix to one silently leaves the other broken (see
++§4.6). Shared libraries:
++
++| Linker | Before | After |
++|---|---:|---:|
++| **lccc** | 19 568 B | **7 280 B (−62.8%)** |
++| bfd | 15 240 B | 15 240 B |
++| mold | 7 792 B | 7 792 B |
++| wild | 5 974 B | 5 974 B |
++
++Here lccc beats **both** bfd (2.1×) and mold, and is within 22% of wild.
++
++7 new invariant tests covering both paths: PT_LOAD congruence, no page-sized
++padding, RELRO ends on a page boundary, output not larger than bfd, and the
++same congruence/padding/loadability checks for a `.so`.
++
++`emit_script.rs` (kernel/linker-script mode) still has the unfixed variant —
++see §4.6.
++
++### 2.4 `-Map=` / `-Map FILE` — implemented end-to-end
++
++Previously parsed and **discarded** (`let _ = v;`). Now wired through
++`parse_linker_args` → `link_builtin` → `emit_exec`, written after address
++assignment from the same layout state the ELF is emitted from.
++
++Output follows GNU ld's column layout so existing scrapers work. Two bugs found
++and fixed while wiring: bare `-Map=` was only recognised inside `-Wl,` groups,
++and the two-argument `-Map FILE` form was swallowed.
++
++**Verified authoritative, not merely plausible:** every symbol address in the
++map is compared against `st_value` read back from the produced ELF —
++**20 003 / 20 003 exact matches**. That property is the regression test.
++
++### 2.5 Symbol-table sort — −6.8% instructions, byte-identical output
++
++Callgrind attributed **12.4%** of a 20k-symbol link to the symtab sort and
++**7.0%** to `__memcmp_avx2_movbe`. Cause: the cached sort prefix was 8 bytes,
++but real symbol names share longer prefixes (`g_sym_12345`, `_ZNSt3__1`,
++`__pthread_`), so the `u64` key tied and every comparison fell through to a
++byte compare. Widened to 16 bytes (`u128`): memcmp disappeared from the profile
++entirely. **57.65M → 53.74M instructions**, output byte-identical.
++
++Also: `read_cstr` now uses a SWAR word-at-a-time NUL scan (Mycroft's test, no
++`unsafe`, no new dependency) and an ASCII fast path that avoids the
++`Utf8Chunks` machinery. Exhaustively tested against the naive reference across
++every alignment × NUL position (640 combinations).
++
++**Negative result, recorded so nobody repeats it:** an *index* sort (sort `u32`
++indices into a separate key array; 4-byte swaps instead of 32) was **worse** —
++57.8M vs 53.7M — because the double indirection on every comparison costs more
++than the wider swap saves. The comment in the code says so.
++
++### 2.6 Test infrastructure
++
++* `tests/linker/bench_linker.py` (new) — 4 profiles, callgrind + best-of-N
++  wall + peak RSS + size, correctness-gated.
++* `tests/linker/real_workloads.py` (new) — links **real project objects**
++  (expat/xmlwf, gzip, zlib-ng) with lccc/bfd/mold/wild and compares *runtime
++  behaviour*, not just exit status: gzip round-trips and compares compressed
++  size, zlib-ng round-trips 256 KiB and prints a CRC, xmlwf must accept a valid
++  document, reject a malformed one with a diagnostic, and produce a matching
++  SHA-256 of its echoed output.
++  A harness bug was found and fixed here: `xmlwf -d DIR` rewrites its input in
++  place, which destroyed the fixture and made every linker look equally broken.
++* `run_linker_tests.py`: **89 → 112** tests.
++
++---
++
++## 3. Current scoreboard
++
++**Correctness:** 718 unit tests, 112 differential tests (bfd + mold-git +
++wild-git), 15 real-workload checks, 6000 fuzz mutants — **all green**.
++
++**Link speed** (best-of-5, 2-core VM; spread is high, treat as ordinal):
++
++| Profile | lccc | wild | bfd | mold | Winner |
++|---|---:|---:|---:|---:|---|
++| many_objects | **2.8** | 4.4 | 6.8 | 7.2 | **lccc** |
++| reloc_heavy | **2.5** | 3.0 | 3.7 | 5.2 | **lccc** |
++| archive | **2.2** | 3.1 | 4.9 | 5.3 | **lccc** |
++| many_syms | 14.4 | **6.1** | 19.3 | 11.4 | wild |
++
++**lccc wins 3 of 4 synthetic profiles and beats bfd everywhere.**
++
++**Output size** (real workloads, lower is better):
++
++| Workload | lccc | bfd | mold | wild |
++|---|---:|---:|---:|---:|
++| expat/xmlwf | **201.2 K** | 207.5 K | 207.0 K | 194.5 K |
++| gzip | **106.7 K** | 114.8 K | 111.8 K | 100.7 K |
++| zlib-ng | **128.9 K** | 129.0 K | 132.1 K | 118.1 K |
++| zlib-ng minimal exe | **8 352** | 16 400 | 9 808 | 6 773 |
++| trivial `.so` | **7 280** | 15 240 | 7 792 | 5 974 |
++
++lccc now beats bfd and mold on size in all of these; wild remains ahead on the
++small cases (it packs the ELF header region harder still — worth a look).
++
++**Deliverable verification:** `ms178-1.patch` was applied with `git apply
++--check` to a *pristine* `git clone` of `ms178/lccc` at `1706984` — clean.
++14 files, +2368 / −150.
++
++---
++
++## 4. Highest-ROI remaining work (ordered by expected-gain × breadth ÷ cost)
++
++### 4.1 `many_syms`: close the 2.4× gap to wild — **biggest single win**
++
++Callgrind attribution after this session's fixes (20k-symbol link, 53.7M Ir):
++
++| Cost | Share | Note |
++|---|---:|---|
++| `_int_malloc` + `free` + `malloc_consolidate` + `_int_free_chunk` | **~22%** | `String` per symbol |
++| symtab sort (`partition_lomuto` + `insert_tail`) | ~13% | after the u128 fix |
++| `emit_executable` body | ~10% | |
++| `memcpy` | ~7.6% | `section_data` `to_vec()` |
++| `HashMap::insert` + `get_mut` | ~9.6% | `String` keys |
++| `read_cstr` + `from_utf8` | ~8.7% | one `String` per name |
++
++**The dominant cost is one heap allocation per symbol name.** Two changes,
++in dependency order:
++
++1. **Symbol interning (`SymbolId(u32)`).** Intern every name once into a single
++   arena; replace `FxHashMap<String, GlobalSymbol>` with
++   `FxHashMap<SymbolId, GlobalSymbol>`. Removes the malloc traffic *and* the
++   string hashing/compare in the hot maps. Expected **−25–35%** instructions on
++   symbol-heavy links. Estimated 1–1.5 days; touches `linker_common/symbols.rs`,
++   `types.rs`, `dynamic.rs`, all four backends. Do this **first** — several
++   items below get easier once names are `Copy`.
++2. **Borrowed section data / mmap input.** `parse_elf64_object` copies every
++   section with `to_vec()` after `std::fs::read` already copied the file. An
++   arena/lifetime model (or `mmap`) removes the largest single memcpy.
++   Expected −20–30% on large links. Dependency policy: prefer a small `unsafe`
++   `mmap` wrapper over adding `memmap2`.
++
++### 4.2 Wire the parallel store path into `emit_exec`
++
++`parallel_reloc.rs` is now **sound and well-tested but still unused** —
++`emit_exec` writes relocations inline. Wiring requires splitting the reloc loop
++into (a) resolution, which mutates instruction bytes for TLS/GOTPCRELX
++relaxation and must stay serial, and (b) a pure `RelocWrite` list. Expected
++1.3–1.8× on reloc-heavy links at ≥4 cores; **no gain on this 2-core VM**, which
++is why it was not attempted here — measure on the 14700KF.
++
++### 4.3 ICF apply
++
++`icf.rs` analyses and classifies but never folds. Applying it needs symbol and
++relocation redirection plus dropping folded sections. This is the main
++remaining *size* lever against wild.
++
++### 4.4 Remaining feature gaps
++
++`--version-script` on ET_EXEC · positional `--as-needed` · `--exclude-libs` ·
++`--emit-relocs` (also unlocks `CONFIG_RELOCATABLE` kernels) · ELF32 script path
++(`setup.elf`) · `--print-map` as an alias for `-Map=/dev/stdout`.
++
++### 4.5 Fuzzing depth
++
++The current fuzzer is a byte mutator over 4 seeds. Next: a *grammar-aware* ELF
++generator (valid-but-hostile structures: overlapping sections, cyclic
++`sh_link`, 0-size `SHT_GROUP`, INCLUDE cycles in scripts) and `cargo-fuzz`
++targets for `parse_elf64_object`, `parse_archive_members` and
++`parse_linker_script`. Also fuzz the **archive** and **linker-script** seeds
++harder — this session's campaign was dominated by `.o` mutants.
++
++### 4.6 Structural debt
++
++* `emit_exec.rs` is ~1900 lines with layout, symtab, relocation and header
++  emission interleaved; `layout_plan.rs` exists but is **still not wired**.
++  The `vaddr!`/`new_segment!` macros added this session are a local fix — the
++  real cleanup is to make `LayoutPlan` own segment assignment.
++* **`emit_script.rs` still has the page-padding defect.** `emit_exec.rs` and
++  `emit_shared.rs` were both fixed this session; the script path (kernel
++  links, `-T`) was not, because its addresses come from the script's own
++  `SECTIONS`/`. =` assignments and the fix is not a mechanical copy — the
++  bias must be derived from the script-assigned vaddr rather than imposed.
++  **This is the top structural item**: three near-duplicate layout engines is
++  why one fix needed applying twice and still is not complete. Unify them
++  behind `LayoutPlan` (which exists and is still unwired) instead of porting
++  the fix a third time.
++* `link_shared`'s hand-written argument parser still duplicates `args.rs` and
++  therefore misses `-Map=` and every bug fixed there.
++
++---
++
++## 5. Reproduction
++
++```bash
++# oracles (must be git builds)
++git clone --depth 1 https://github.com/rui314/mold           && cmake -B build -DCMAKE_BUILD_TYPE=Release \
++    -DCMAKE_CXX_FLAGS="-O2 -march=native" && cmake --build build -j2
++git clone --depth 1 https://github.com/davidlattimore/wild   && RUSTFLAGS="-C target-cpu=native" \
++    cargo build --release -p wild-linker --bin wild
++
++# lccc (project policy: opt-level 1, two jobs, swap enabled)
++./scripts/build_lccc_o1_j2.sh
++
++# validation
++cargo test --release --locked -j2 --lib          # 718 pass
++tests/linker/run_linker_tests.py                 # 112 pass
++tests/linker/real_workloads.py                   # 15 ok
++tests/linker/bench_linker.py                     # perf + size matrix
++```
++
++**Environment:** 2-core Intel Xeon @ 2.60 GHz, 2 GB RAM + **4 GiB swapfile**
++(required; the build OOMs without it), Debian 13, gcc 14.2.0, rustc 1.97.1,
++valgrind 3.24.0, no PMU.
++
++---
++
++## 6. Working rules that paid off this session
++
++1. **Fuzz before claiming robustness.** Both crashes were found in minutes by a
++   ~120-line mutator, after the suite was already "green".
++2. **Write the randomised differential test before trusting a concurrency
++   fix.** It caught a real ordering bug in the very fix that was removing UB.
++3. **Verify the oracle.** Two "lccc failures" were wild-0.7 bugs.
++4. **Record negative results in the code.** The index-sort experiment is
++   documented at the call site so it is not retried.
++5. **Snapshot after every validated change.** `lccc-snapshot.sh` writes an
++   atomically-renamed patch + tarball + git bundle and *verifies the patch
++   applies to a clean worktree* before reporting success.
+diff --git a/src/backend/elf/io.rs b/src/backend/elf/io.rs
+index a0d3b78..834d08e 100644
+--- a/src/backend/elf/io.rs
++++ b/src/backend/elf/io.rs
+@@ -1,6 +1,58 @@
+ //! Binary read/write helpers for little-endian ELF fields, plus section header,
+ //! program header, symbol table entry, and relocation entry writers.
+ 
++// ── Overflow-safe range helpers ──────────────────────────────────────────────
++//
++// ELF offset/size fields are attacker-controlled 32/64-bit values.  The naive
++// bounds check
++//
++//     if off + size <= data.len() { &data[off..off + size] }
++//
++// is **wrong**: `off + size` wraps in release builds (where overflow checks are
++// off), so a section header claiming `sh_offset = 2^64 - 100, sh_size = 200`
++// passes the guard and then panics — or, worse, silently reads the wrong
++// memory — inside the slice operation.  A fuzzer found exactly this against
++// `parse_object.rs` (`range start index 18446744073692774483 out of range`).
++//
++// These helpers make the correct form as short as the incorrect one, so there
++// is no incentive to hand-roll a check again.  All arithmetic is checked; the
++// happy path compiles to the same single compare + slice as the naive version
++// because `checked_add` on values the optimizer can bound folds away.
++
++/// Return `data[off .. off + len]`, or `None` if the range is not fully
++/// contained in `data`.  Overflow-safe: `off + len` is computed with
++/// `checked_add`, so wrap-around cannot produce a false "in bounds" verdict.
++#[inline]
++pub fn slice_at(data: &[u8], off: usize, len: usize) -> Option<&[u8]> {
++    let end = off.checked_add(len)?;
++    data.get(off..end)
++}
++
++/// Overflow-safe containment test for `[off, off + len)` within `data`.
++///
++/// Prefer [`slice_at`] when the slice itself is wanted; use this when only the
++/// predicate is needed (e.g. before a loop that indexes incrementally).
++#[inline]
++pub fn range_ok(data: &[u8], off: usize, len: usize) -> bool {
++    match off.checked_add(len) {
++        Some(end) => end <= data.len(),
++        None => false,
++    }
++}
++
++/// Byte range of ELF table entry `idx` given a table base, entry size and
++/// entry count-independent bounds check, or `None` on overflow / out of range.
++///
++/// Used for section-header, program-header, symbol and relocation tables,
++/// where the naive `base + idx * entsize` multiplication is itself an overflow
++/// hazard (`e_shentsize` and `e_shnum` are both attacker-controlled u16, and
++/// `e_shoff` a full u64).
++#[inline]
++pub fn table_entry(data: &[u8], base: usize, idx: usize, entsize: usize) -> Option<&[u8]> {
++    let off = idx.checked_mul(entsize)?.checked_add(base)?;
++    slice_at(data, off, entsize)
++}
++
+ // ── Binary read helpers (little-endian) ──────────────────────────────────────
+ 
+ /// Read a little-endian u16 from `data` at `offset`.
+@@ -44,12 +96,107 @@ pub fn read_i64(data: &[u8], offset: usize) -> i64 {
+ }
+ 
+ /// Read a null-terminated string from a byte slice starting at `offset`.
++///
++/// Returns an empty string when `offset` is out of bounds.  An unterminated
++/// tail is accepted and returned up to the end of `data` (GNU ld tolerates a
++/// truncated final string table entry rather than rejecting the object).
+ pub fn read_cstr(data: &[u8], offset: usize) -> String {
+-    if offset >= data.len() {
+-        return String::new();
++    let tail = match data.get(offset..) {
++        Some(t) => t,
++        None => return String::new(),
++    };
++    let end = memchr0(tail);
++    let bytes = &tail[..end];
++
++    // Fast path: ELF symbol and section names are ASCII in every real
++    // toolchain, and `str::from_utf8` on ASCII is a cheap validation scan,
++    // whereas `String::from_utf8_lossy(..).into_owned()` drags in the
++    // `Utf8Chunks` iterator and an extra copy.  Profiling a 20k-symbol link
++    // attributed 3.8% of all instructions to `read_cstr` and a further 3.4%
++    // to `Utf8Chunks::next`; this removes the latter entirely.
++    match std::str::from_utf8(bytes) {
++        Ok(s) => s.to_owned(),
++        // Non-UTF-8 names are legal in ELF (the format stores bytes), so keep
++        // the lossy fallback rather than rejecting the object.
++        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+     }
+-    let end = data[offset..].iter().position(|&b| b == 0).unwrap_or(data.len() - offset);
+-    String::from_utf8_lossy(&data[offset..offset + end]).into_owned()
++}
++
++/// Index of the first NUL byte in `hay`, or `hay.len()`.
++///
++/// A byte-at-a-time `position()` costs one compare + one branch per byte and
++/// dominated string-table parsing on symbol-heavy links.  This scans a machine
++/// word at a time using the classic SWAR zero-byte test
++/// (Mycroft's `(w - 0x01..01) & !w & 0x80..80`), which is portable, has no
++/// `unsafe`, and needs no external crate (`memchr` would be a new dependency,
++/// which linker policy avoids).
++#[inline]
++fn memchr0(hay: &[u8]) -> usize {
++    const LO: usize = usize::from_ne_bytes([0x01; core::mem::size_of::<usize>()]);
++    const HI: usize = usize::from_ne_bytes([0x80; core::mem::size_of::<usize>()]);
++    const W: usize = core::mem::size_of::<usize>();
++
++    let n = hay.len();
++    let mut i = 0;
++
++    // Align to a word boundary so the word loads never straddle a page.
++    let align = (W - (hay.as_ptr() as usize % W)) % W;
++    let head = align.min(n);
++    while i < head {
++        if hay[i] == 0 {
++            return i;
++        }
++        i += 1;
++    }
++
++    while i + W <= n {
++        // Aligned, in-bounds: this is a plain slice read, no unsafe needed.
++        let chunk = usize::from_ne_bytes(hay[i..i + W].try_into().unwrap());
++        if chunk.wrapping_sub(LO) & !chunk & HI != 0 {
++            // A zero byte is somewhere in this word; find it exactly.
++            for k in 0..W {
++                if hay[i + k] == 0 {
++                    return i + k;
++                }
++            }
++        }
++        i += W;
++    }
++
++    while i < n {
++        if hay[i] == 0 {
++            return i;
++        }
++        i += 1;
++    }
++    n
++}
++
++// ── Fallible readers for untrusted input ─────────────────────────────────────
++//
++// The `read_uN` family above indexes directly and therefore panics on a short
++// buffer.  That is acceptable for buffers the linker itself just built, but not
++// for parsing attacker-controlled files.  These variants return `None` instead
++// and let the caller emit a proper diagnostic.
++
++/// Read a little-endian u16 at `offset`, or `None` if out of bounds.
++#[inline]
++pub fn try_read_u16(data: &[u8], offset: usize) -> Option<u16> {
++    slice_at(data, offset, 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
++}
++
++/// Read a little-endian u32 at `offset`, or `None` if out of bounds.
++#[inline]
++pub fn try_read_u32(data: &[u8], offset: usize) -> Option<u32> {
++    slice_at(data, offset, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
++}
++
++/// Read a little-endian u64 at `offset`, or `None` if out of bounds.
++#[inline]
++pub fn try_read_u64(data: &[u8], offset: usize) -> Option<u64> {
++    slice_at(data, offset, 8).map(|b| {
++        u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
++    })
+ }
+ 
+ // ── Binary write helpers (little-endian, in-place) ───────────────────────────
+@@ -202,3 +349,111 @@ pub fn write_rela32(buf: &mut Vec<u8>, r_offset: u32, r_sym: u32, r_type: u8, r_
+     buf.extend_from_slice(&r_info.to_le_bytes());
+     buf.extend_from_slice(&r_addend.to_le_bytes());
+ }
++
++#[cfg(test)]
++mod bounds_tests {
++    use super::*;
++
++    /// The exact defect a mutation fuzzer found in `parse_object.rs`: a section
++    /// header whose `sh_offset` is near `u64::MAX` makes `off + size` wrap to a
++    /// small value, so the naive guard `off + size <= len` succeeds and the
++    /// subsequent slice panics.  `slice_at` must reject it.
++    #[test]
++    fn slice_at_rejects_wrapping_range() {
++        let data = [0u8; 64];
++        let off = usize::MAX - 16;
++        // Demonstrate the hazard: wrapping arithmetic claims the range fits.
++        assert!(off.wrapping_add(32) <= data.len());
++        // The safe helper must not be fooled.
++        assert!(slice_at(&data, off, 32).is_none());
++        assert!(!range_ok(&data, off, 32));
++    }
++
++    #[test]
++    fn slice_at_exact_and_boundary() {
++        let data = [1u8, 2, 3, 4];
++        assert_eq!(slice_at(&data, 0, 4), Some(&data[..]));
++        assert_eq!(slice_at(&data, 4, 0), Some(&[] as &[u8])); // empty at end is valid
++        assert_eq!(slice_at(&data, 2, 2), Some(&[3u8, 4][..]));
++        assert_eq!(slice_at(&data, 3, 2), None);               // one past the end
++        assert_eq!(slice_at(&data, 5, 0), None);               // start beyond end
++    }
++
++    #[test]
++    fn table_entry_rejects_multiplication_overflow() {
++        let data = [0u8; 4096];
++        // e_shnum * e_shentsize overflows usize; must not wrap into a valid range.
++        assert!(table_entry(&data, 0, usize::MAX / 8, 64).is_none());
++        assert!(table_entry(&data, usize::MAX, 1, 64).is_none());
++        // Normal indexing still works.
++        assert_eq!(table_entry(&data, 64, 2, 64).map(<[u8]>::len), Some(64));
++        // Last fully-contained entry is accepted, the next is not.
++        assert!(table_entry(&data, 0, 63, 64).is_some());
++        assert!(table_entry(&data, 0, 64, 64).is_none());
++    }
++
++    #[test]
++    fn try_readers_are_total() {
++        let data = [0xefu8, 0xbe, 0xad, 0xde, 0, 0, 0, 0];
++        assert_eq!(try_read_u16(&data, 0), Some(0xbeef));
++        assert_eq!(try_read_u32(&data, 0), Some(0xdeadbeef));
++        assert_eq!(try_read_u64(&data, 0), Some(0x00000000deadbeef));
++        // Out of bounds and overflowing offsets yield None, never a panic.
++        assert_eq!(try_read_u32(&data, 5), None);
++        assert_eq!(try_read_u64(&data, 1), None);
++        assert_eq!(try_read_u16(&data, usize::MAX), None);
++    }
++
++    /// Exhaustive check of the SWAR NUL scanner against the naive reference,
++    /// across every alignment and every NUL position in a multi-word buffer.
++    /// Word-at-a-time scanning is easy to get subtly wrong at the head/tail
++    /// boundaries, so this brute-forces the whole space rather than sampling.
++    #[test]
++    fn memchr0_matches_naive_for_all_alignments_and_positions() {
++        const N: usize = 40;
++        // A backing buffer big enough to slice at every alignment offset.
++        let mut buf = vec![0xffu8; N + 16];
++        for align in 0..16usize {
++            for pos in 0..N {
++                for b in buf.iter_mut() { *b = 0xff; }
++                buf[align + pos] = 0;
++                let hay = &buf[align..align + N];
++                let naive = hay.iter().position(|&b| b == 0).unwrap_or(hay.len());
++                assert_eq!(memchr0(hay), naive,
++                           "align={align} pos={pos}");
++            }
++            // No NUL at all: must report the full length.
++            for b in buf.iter_mut() { *b = 0xff; }
++            let hay = &buf[align..align + N];
++            assert_eq!(memchr0(hay), N, "align={align} (no NUL)");
++        }
++        // Degenerate sizes.
++        assert_eq!(memchr0(b""), 0);
++        assert_eq!(memchr0(b"\0"), 0);
++        assert_eq!(memchr0(b"a"), 1);
++    }
++
++    /// Non-UTF-8 names are legal in ELF; the fast ASCII path must not change
++    /// the result for them.
++    #[test]
++    fn read_cstr_preserves_lossy_behaviour_for_non_utf8() {
++        let data = b"ok\0\xff\xfe bad\0";
++        assert_eq!(read_cstr(data, 0), "ok");
++        let got = read_cstr(data, 3);
++        assert_eq!(got, String::from_utf8_lossy(b"\xff\xfe bad"));
++        assert!(got.contains("bad"));
++    }
++
++    #[test]
++    fn read_cstr_handles_unterminated_and_oob() {
++        // Unterminated tail: return what is there rather than panicking.
++        assert_eq!(read_cstr(b"abc", 0), "abc");
++        assert_eq!(read_cstr(b"abc\0def", 4), "def");
++        assert_eq!(read_cstr(b"abc\0def", 0), "abc");
++        // Offset at and beyond the end.
++        assert_eq!(read_cstr(b"abc", 3), "");
++        assert_eq!(read_cstr(b"abc", 99), "");
++        assert_eq!(read_cstr(b"", 0), "");
++        assert_eq!(read_cstr(b"abc", usize::MAX), "");
++    }
++}
+diff --git a/src/backend/linker_common/args.rs b/src/backend/linker_common/args.rs
+index 72f6a8d..e8f3cac 100644
+--- a/src/backend/linker_common/args.rs
++++ b/src/backend/linker_common/args.rs
+@@ -42,6 +42,8 @@ pub struct LinkerArgs {
+     pub z_now: bool,
+     /// `-z relro` (default true, `-z norelro` clears): emit PT_GNU_RELRO.
+     pub z_relro: bool,
++    /// `-Map=FILE` / `-Map FILE`: write a GNU-ld-compatible link map.
++    pub map_path: Option<String>,
+ }
+ 
+ /// Parse user linker arguments into a structured `LinkerArgs`.
+@@ -58,6 +60,13 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
+         let arg = args[i];
+         if arg == "-rdynamic" {
+             result.export_dynamic = true;
++        } else if let Some(v) = arg.strip_prefix("-Map=") {
++            // Top-level spelling: lccc-ld and other direct callers pass
++            // `-Map=FILE` as its own argument, not inside a `-Wl,` group.
++            result.map_path = Some(v.to_string());
++        } else if arg == "-Map" && i + 1 < args.len() {
++            i += 1;
++            result.map_path = Some(args[i].to_string());
+         } else if arg == "-static" {
+             result.is_static = true;
+         } else if let Some(path) = arg.strip_prefix("-L") {
+@@ -113,6 +122,11 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
+                             defsym_arg[eq_pos + 1..].to_string(),
+                         ));
+                     }
++                } else if let Some(v) = part.strip_prefix("-Map=") {
++                    result.map_path = Some(v.to_string());
++                } else if part == "-Map" && j + 1 < parts.len() {
++                    j += 1;
++                    result.map_path = Some(parts[j].to_string());
+                 } else if part == "--gc-sections" {
+                     result.gc_sections = true;
+                 } else if part == "--no-gc-sections" {
+@@ -167,3 +181,39 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
+     }
+     result
+ }
++
++#[cfg(test)]
++mod map_arg_tests {
++    use super::*;
++
++    fn args(v: &[&str]) -> Vec<String> {
++        v.iter().map(|s| s.to_string()).collect()
++    }
++
++    /// `-Map` reaches the linker in four spellings depending on whether the
++    /// caller is a Makefile driving `ld` directly, gcc forwarding via `-Wl,`,
++    /// or a build system using the separated form. All four must work.
++    #[test]
++    fn map_path_is_recognised_in_every_spelling() {
++        assert_eq!(parse_linker_args(&args(&["-Map=out.map"])).map_path.as_deref(),
++                   Some("out.map"));
++        assert_eq!(parse_linker_args(&args(&["-Map", "out.map"])).map_path.as_deref(),
++                   Some("out.map"));
++        assert_eq!(parse_linker_args(&args(&["-Wl,-Map=out.map"])).map_path.as_deref(),
++                   Some("out.map"));
++        assert_eq!(parse_linker_args(&args(&["-Wl,-Map,out.map"])).map_path.as_deref(),
++                   Some("out.map"));
++    }
++
++    #[test]
++    fn map_path_absent_by_default() {
++        assert!(parse_linker_args(&args(&["-static", "a.o"])).map_path.is_none());
++    }
++
++    /// A path containing '=' (legal) must survive intact.
++    #[test]
++    fn map_path_with_equals_in_filename() {
++        assert_eq!(parse_linker_args(&args(&["-Map=/tmp/a=b.map"])).map_path.as_deref(),
++                   Some("/tmp/a=b.map"));
++    }
++}
+diff --git a/src/backend/linker_common/mapfile.rs b/src/backend/linker_common/mapfile.rs
+index f6e9260..5b02476 100644
+--- a/src/backend/linker_common/mapfile.rs
++++ b/src/backend/linker_common/mapfile.rs
+@@ -4,8 +4,18 @@
+ //! which input sections contributed to which output sections, symbol
+ //! addresses, and archive member extraction reasons.
+ //!
+-//! Status: data model and formatting helpers are complete. The call site
+-//! in the emit path (after address assignment) is the remaining wiring.
++//! The output follows GNU ld's column layout so that existing tooling which
++//! scrapes map files (kernel `scripts/`, embedded size-accounting scripts,
++//! bloaty-style analysers) keeps working:
++//!
++//! ```text
++//! .text           0x0000000000401000       0x3a
++//!  .text          0x0000000000401000       0x2d bmain.o
++//!                 0x0000000000401000                _start
++//! ```
++//!
++//! Output-section lines start in column 0, input-section contributions are
++//! indented by one space, and symbol lines are indented to the address column.
+ 
+ #![allow(dead_code)]
+ 
+@@ -16,6 +26,11 @@ use std::path::Path;
+ #[derive(Debug, Clone)]
+ pub struct MapSectionContribution {
+     pub output_section: String,
++    /// Address of the *output* section this contribution belongs to.
++    pub out_section_addr: u64,
++    /// Total size of the *output* section this contribution belongs to.
++    pub out_section_size: u64,
++    /// Address at which this particular input section was placed.
+     pub output_addr: u64,
+     pub input_file: String,
+     pub input_section: String,
+@@ -43,38 +58,59 @@ pub struct LinkMap {
+ impl LinkMap {
+     /// Format a GNU-ld-style map into `out`.
+     pub fn write_gnu(&self, out: &mut String) {
+-        let _ = writeln!(out, "Archive member included to satisfy reference by file (symbol)\n");
+-        for m in &self.archive_members {
++        if self.archive_members.is_empty() {
++            let _ = writeln!(out, "\nThere are no discarded input sections\n");
++        } else {
+             let _ = writeln!(
+                 out,
+-                "{}({})\n              {}\n",
+-                m.archive, m.member, m.reason_symbol
+-            );
+-        }
+-        let _ = writeln!(out, "\nMemory Configuration\n\nName             Origin             Length             Attributes\n");
+-        let _ = writeln!(out, "\nLinker script and memory map\n");
+-        if let Some(ref e) = self.entry_symbol {
+-            let _ = writeln!(out, "                0x{:016x}                {}\n", self.entry_addr, e);
++                "Archive member included to satisfy reference by file (symbol)\n");
++            for m in &self.archive_members {
++                let _ = writeln!(out, "{}({})", m.archive, m.member);
++                let _ = writeln!(out, "                              {}", m.reason_symbol);
++            }
++            let _ = writeln!(out);
+         }
+-        let mut current_out = String::new();
++
++        let _ = writeln!(out, "Memory Configuration\n");
++        let _ = writeln!(
++            out,
++            "Name             Origin             Length             Attributes");
++        let _ = writeln!(
++            out,
++            "*default*        0x0000000000000000 0xffffffffffffffff\n");
++
++        let _ = writeln!(out, "Linker script and memory map\n");
++
++        let mut current_out: Option<&str> = None;
+         for c in &self.contributions {
+-            if c.output_section != current_out {
++            if current_out != Some(c.output_section.as_str()) {
++                // Output-section header line: name in column 0, then the
++                // section's own address and total size.
++                let _ = writeln!(out);
+                 let _ = writeln!(
+                     out,
+-                    "\n{}            0x{:016x}    0x{:x}",
+-                    c.output_section, c.output_addr, c.size
+-                );
+-                current_out = c.output_section.clone();
++                    "{:<15} 0x{:016x} {:>8x}",
++                    c.output_section, c.out_section_addr, c.out_section_size);
++                current_out = Some(c.output_section.as_str());
+             }
++            // Input-section contribution: one leading space, then the address
++            // and size this input occupies, then the file it came from.
+             let _ = writeln!(
+                 out,
+-                " {:.16}  0x{:016x}    0x{:x} {}",
+-                c.input_section, c.output_addr, c.size, c.input_file
+-            );
++                " {:<14} 0x{:016x} {:>8x} {}",
++                c.input_section, c.output_addr, c.size, c.input_file);
+             for (name, addr) in &c.symbols {
+-                let _ = writeln!(out, "                0x{:016x}                {}", addr, name);
++                let _ = writeln!(
++                    out,
++                    "                0x{:016x}                {}", addr, name);
+             }
+         }
++
++        if let Some(ref e) = self.entry_symbol {
++            let _ = writeln!(
++                out,
++                "\n                0x{:016x}                {}", self.entry_addr, e);
++        }
+     }
+ 
+     /// Write the map to a file. Creates parent directories if needed.
+@@ -97,8 +133,8 @@ mod tests {
+         let m = LinkMap::default();
+         let mut s = String::new();
+         m.write_gnu(&mut s);
+-        assert!(s.contains("Archive member included"));
+         assert!(s.contains("Memory Configuration"));
++        assert!(s.contains("Linker script and memory map"));
+     }
+ 
+     #[test]
+@@ -106,6 +142,8 @@ mod tests {
+         let mut m = LinkMap::default();
+         m.contributions.push(MapSectionContribution {
+             output_section: ".text".into(),
++            out_section_addr: 0x401000,
++            out_section_size: 0x20,
+             output_addr: 0x401000,
+             input_file: "a.o".into(),
+             input_section: ".text".into(),
+@@ -121,3 +159,134 @@ mod tests {
+         assert!(s.contains("_start"));
+     }
+ }
++
++/// Build a `LinkMap` from the linker's final layout state.
++///
++/// Called after address assignment, when `output_sections[*].addr` and each
++/// input's `output_offset` are final. Symbols are attached to the input
++/// section that contains them so the map shows, for every address, which
++/// object file put it there — the question a map file exists to answer.
++pub fn build_link_map(
++    output_sections: &[crate::backend::linker_common::OutputSection],
++    object_names: &[String],
++    // (name, object_idx, section_idx, value-within-section)
++    symbols: &[(String, usize, usize, u64)],
++    entry_symbol: Option<&str>,
++    entry_addr: u64,
++) -> LinkMap {
++    // Index symbols by the input section they live in, so the contribution
++    // loop below is O(symbols) overall rather than O(inputs x symbols).
++    let mut by_input: crate::common::fx_hash::FxHashMap<(usize, usize), Vec<(&str, u64)>> =
++        crate::common::fx_hash::FxHashMap::default();
++    for (name, oi, si, val) in symbols {
++        by_input.entry((*oi, *si)).or_default().push((name.as_str(), *val));
++    }
++
++    let mut map = LinkMap {
++        entry_symbol: entry_symbol.map(str::to_string),
++        entry_addr,
++        ..LinkMap::default()
++    };
++
++    for sec in output_sections {
++        if sec.inputs.is_empty() && sec.mem_size == 0 {
++            continue;
++        }
++        for input in &sec.inputs {
++            let addr = sec.addr + input.output_offset;
++            let mut syms: Vec<(String, u64)> = by_input
++                .get(&(input.object_idx, input.section_idx))
++                .map(|v| {
++                    v.iter()
++                        .map(|(n, off)| ((*n).to_string(), addr + off))
++                        .collect()
++                })
++                .unwrap_or_default();
++            // Ascending address, like GNU ld.
++            syms.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
++
++            map.contributions.push(MapSectionContribution {
++                output_section: sec.name.clone(),
++                out_section_addr: sec.addr,
++                out_section_size: sec.mem_size,
++                input_file: object_names
++                    .get(input.object_idx)
++                    .cloned()
++                    .unwrap_or_else(|| format!("<object {}>", input.object_idx)),
++                input_section: sec.name.clone(),
++                output_addr: addr,
++                size: input.size,
++                symbols: syms,
++            });
++        }
++    }
++    map
++}
++
++#[cfg(test)]
++mod build_tests {
++    use super::*;
++    use crate::backend::linker_common::{InputSection, OutputSection};
++
++    fn sec(name: &str, addr: u64, size: u64, inputs: Vec<InputSection>) -> OutputSection {
++        OutputSection {
++            name: name.into(), sh_type: 1, flags: 0, alignment: 1,
++            inputs, data: Vec::new(), addr, file_offset: 0, mem_size: size,
++        }
++    }
++
++    #[test]
++    fn map_reports_addresses_per_input_and_symbol() {
++        let secs = vec![sec(".text", 0x401000, 0x40, vec![
++            InputSection { object_idx: 0, section_idx: 1, output_offset: 0, size: 0x2d },
++            InputSection { object_idx: 1, section_idx: 1, output_offset: 0x2d, size: 0xd },
++        ])];
++        let names = vec!["bmain.o".to_string(), "syms.o".to_string()];
++        let syms = vec![
++            ("_start".to_string(), 0usize, 1usize, 0u64),
++            ("touch".to_string(), 1, 1, 0),
++        ];
++        let m = build_link_map(&secs, &names, &syms, Some("_start"), 0x401000);
++        let mut s = String::new();
++        m.write_gnu(&mut s);
++
++        // Output-section header carries the section's own address and size.
++        assert!(s.contains(".text           0x0000000000401000       40"), "{s}");
++        // Each input is attributed to its file at its real address.
++        assert!(s.contains("0x0000000000401000       2d bmain.o"), "{s}");
++        assert!(s.contains("0x000000000040102d        d syms.o"), "{s}");
++        // Symbol addresses are absolute, not section-relative.
++        assert!(s.contains("0x000000000040102d                touch"), "{s}");
++        assert!(s.contains("_start"));
++    }
++
++    #[test]
++    fn symbols_are_sorted_by_address() {
++        let secs = vec![sec(".data", 0x403000, 0x10, vec![
++            InputSection { object_idx: 0, section_idx: 2, output_offset: 0, size: 0x10 },
++        ])];
++        let names = vec!["a.o".to_string()];
++        // Deliberately supplied out of order.
++        let syms = vec![
++            ("z".to_string(), 0usize, 2usize, 8u64),
++            ("a".to_string(), 0, 2, 0),
++            ("m".to_string(), 0, 2, 4),
++        ];
++        let m = build_link_map(&secs, &names, &syms, None, 0);
++        let mut s = String::new();
++        m.write_gnu(&mut s);
++        let ia = s.find("                a").unwrap();
++        let im = s.find("                m").unwrap();
++        let iz = s.find("                z").unwrap();
++        assert!(ia < im && im < iz, "symbols not address-ordered:\n{s}");
++    }
++
++    #[test]
++    fn empty_layout_still_produces_valid_map() {
++        let m = build_link_map(&[], &[], &[], None, 0);
++        let mut s = String::new();
++        m.write_gnu(&mut s);
++        assert!(s.contains("Memory Configuration"));
++        assert!(s.contains("Linker script and memory map"));
++    }
++}
+diff --git a/src/backend/linker_common/mod.rs b/src/backend/linker_common/mod.rs
+index 76822b5..28e9325 100644
+--- a/src/backend/linker_common/mod.rs
++++ b/src/backend/linker_common/mod.rs
+@@ -95,9 +95,12 @@ pub use dynstr::DynStrTab;
+ // hash.rs
+ pub use hash::{gnu_hash, sysv_hash};
+ 
++// mapfile.rs
++pub use mapfile::{LinkMap, MapArchiveMember, MapSectionContribution, build_link_map};
++
+ // symbols.rs
+ pub use symbols::{
+-    OutputSection, GlobalSymbolOps,
++    InputSection, OutputSection, GlobalSymbolOps,
+     is_linker_defined_symbol,
+     is_valid_c_identifier_for_section, resolve_start_stop_symbols,
+ };
+diff --git a/src/backend/linker_common/parse_object.rs b/src/backend/linker_common/parse_object.rs
+index d7892eb..30fc8b3 100644
+--- a/src/backend/linker_common/parse_object.rs
++++ b/src/backend/linker_common/parse_object.rs
+@@ -7,7 +7,7 @@
+ use crate::backend::elf::{
+     ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, ET_REL,
+     SHT_NOBITS, SHT_SYMTAB, SHT_RELA,
+-    read_u16, read_u32, read_u64, read_i64, read_cstr,
++    read_u16, read_u32, read_u64, read_i64, read_cstr, slice_at, table_entry,
+ };
+ use super::types::{Elf64Section, Elf64Symbol, Elf64Rela, Elf64Object};
+ 
+@@ -52,12 +52,37 @@ pub fn parse_elf64_object(data: &[u8], source_name: &str, expected_machine: u16)
+     }
+ 
+     // Parse section headers
++    // A malformed e_shentsize would make every subsequent field read land at
++    // the wrong offset; reject it up front rather than parsing garbage.
++    if e_shentsize < 64 {
++        return Err(format!("{}: bogus e_shentsize {} (need >= 64)", source_name, e_shentsize));
++    }
++    // `Vec::with_capacity(e_shnum)` on an attacker-controlled u16 is bounded
++    // (<= 65535 * 88 bytes), so no reservation guard is needed here.
+     let mut sections = Vec::with_capacity(e_shnum);
+     for i in 0..e_shnum {
+-        let off = e_shoff + i * e_shentsize;
+-        if off + e_shentsize > data.len() {
++        // Overflow-safe: e_shoff is a full u64 and i * e_shentsize can itself
++        // overflow, so both operations are checked.
++        if table_entry(data, e_shoff, i, e_shentsize).is_none() {
+             return Err(format!("{}: section header {} out of bounds", source_name, i));
+         }
++        let off = e_shoff + i * e_shentsize;
++        // ELF gABI: sh_addralign is 0 or a positive integral power of two.
++        // A non-power-of-two value is not merely cosmetic: the layout engine
++        // rounds section addresses up to it, so a value such as 0xffffffffff
++        // demands a 1 TiB-aligned output and aborts the process in the
++        // allocator (`memory allocation of 1099511627796 bytes failed`).
++        // A mutation fuzzer found exactly that.  bfd and mold silently accept
++        // the bogus value; wild rejects it, which is the spec-correct and
++        // safe behaviour, so lccc rejects it too — with the offending value
++        // in the message.
++        let addralign = read_u64(data, off + 48);
++        if addralign > 1 && !addralign.is_power_of_two() {
++            return Err(format!(
++                "{}: section header {} has invalid sh_addralign 0x{:x} \
++                 (must be 0 or a power of two)",
++                source_name, i, addralign));
++        }
+         sections.push(Elf64Section {
+             name_idx: read_u32(data, off),
+             name: String::new(),
+@@ -68,7 +93,7 @@ pub fn parse_elf64_object(data: &[u8], source_name: &str, expected_machine: u16)
+             size: read_u64(data, off + 32),
+             link: read_u32(data, off + 40),
+             info: read_u32(data, off + 44),
+-            addralign: read_u64(data, off + 48),
++            addralign,
+             entsize: read_u64(data, off + 56),
+         });
+     }
+@@ -78,8 +103,9 @@ pub fn parse_elf64_object(data: &[u8], source_name: &str, expected_machine: u16)
+         let shstrtab = &sections[e_shstrndx];
+         let strtab_off = shstrtab.offset as usize;
+         let strtab_size = shstrtab.size as usize;
+-        if strtab_off + strtab_size <= data.len() {
+-            let strtab_data = &data[strtab_off..strtab_off + strtab_size];
++        // Overflow-safe: `strtab_off + strtab_size` wraps for offsets near
++        // usize::MAX, which previously turned a malformed object into a panic.
++        if let Some(strtab_data) = slice_at(data, strtab_off, strtab_size) {
+             for sec in &mut sections {
+                 sec.name = read_cstr(strtab_data, sec.name_idx as usize);
+             }
+@@ -93,11 +119,11 @@ pub fn parse_elf64_object(data: &[u8], source_name: &str, expected_machine: u16)
+             section_data.push(Vec::new());
+         } else {
+             let start = sec.offset as usize;
+-            let end = start + sec.size as usize;
+-            if end > data.len() {
++            let len = sec.size as usize;
++            let Some(bytes) = slice_at(data, start, len) else {
+                 return Err(format!("{}: section '{}' data out of bounds", source_name, sec.name));
+-            }
+-            section_data.push(data[start..end].to_vec());
++            };
++            section_data.push(bytes.to_vec());
+         }
+     }
+ 
+diff --git a/src/backend/linker_common/parse_shared.rs b/src/backend/linker_common/parse_shared.rs
+index e694f2e..f5e892b 100644
+--- a/src/backend/linker_common/parse_shared.rs
++++ b/src/backend/linker_common/parse_shared.rs
+@@ -10,7 +10,7 @@ use crate::backend::elf::{
+     SHN_UNDEF, PT_DYNAMIC,
+     DT_NULL, DT_SONAME, DT_SYMTAB, DT_STRTAB, DT_STRSZ,
+     DT_GNU_HASH, DT_VERSYM,
+-    read_u16, read_u32, read_u64, read_i64, read_cstr,
++    read_u16, read_u32, read_u64, read_i64, read_cstr, slice_at, table_entry,
+ };
+ use super::types::DynSymbol;
+ 
+@@ -42,10 +42,12 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
+     if e_shoff != 0 && e_shnum != 0 {
+         let mut sections = Vec::with_capacity(e_shnum);
+         for i in 0..e_shnum {
+-            let off = e_shoff + i * e_shentsize;
+-            if off + e_shentsize > data.len() {
++            // Overflow-safe table indexing (e_shoff is u64, i * e_shentsize
++            // can overflow); a wrapped range must not read out of bounds.
++            if e_shentsize < 64 || table_entry(data, e_shoff, i, e_shentsize).is_none() {
+                 break;
+             }
++            let off = e_shoff + i * e_shentsize;
+             sections.push((
+                 read_u32(data, off + 4),  // sh_type
+                 read_u64(data, off + 24), // offset
+@@ -73,14 +75,15 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
+                 let (_, s_off, s_sz, _) = sections[vd_link];
+                 let s_off = s_off as usize;
+                 let s_sz = s_sz as usize;
+-                if s_off + s_sz <= data.len() { &data[s_off..s_off + s_sz] } else { &[] as &[u8] }
++                slice_at(data, s_off, s_sz).unwrap_or(&[])
+             } else {
+                 &[] as &[u8]
+             };
+ 
+             let mut pos = vd_off;
+-            let end = vd_off + vd_size;
+-            while pos < end && pos + 20 <= data.len() {
++            // Saturating: a bogus vd_size near u64::MAX must not wrap `end`.
++            let end = vd_off.saturating_add(vd_size);
++            while pos < end && slice_at(data, pos, 20).is_some() {
+                 let vd_ndx = read_u16(data, pos + 4);
+                 let vd_cnt = read_u16(data, pos + 6);
+                 let vd_aux = read_u32(data, pos + 12) as usize;
+@@ -88,8 +91,8 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
+ 
+                 // First verdaux entry has the version name
+                 if vd_cnt > 0 {
+-                    let aux_pos = pos + vd_aux;
+-                    if aux_pos + 8 <= data.len() {
++                    let aux_pos = pos.saturating_add(vd_aux);
++                    if slice_at(data, aux_pos, 8).is_some() {
+                         let vda_name = read_u32(data, aux_pos) as usize;
+                         if vda_name < vd_strtab.len() {
+                             let name = read_cstr(vd_strtab, vda_name);
+@@ -98,8 +101,10 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
+                     }
+                 }
+ 
++                // vd_next == 0 terminates the chain; a wrapping add would
++                // otherwise loop forever on malformed input.
+                 if vd_next == 0 { break; }
+-                pos += vd_next;
++                match pos.checked_add(vd_next) { Some(p) => pos = p, None => break }
+             }
+         }
+ 
+@@ -112,13 +117,11 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
+                 let (_, str_off, str_size, _) = sections[strtab_idx];
+                 let str_off = str_off as usize;
+                 let str_size = str_size as usize;
+-                if str_off + str_size > data.len() { continue; }
+-                let strtab = &data[str_off..str_off + str_size];
++                let Some(strtab) = slice_at(data, str_off, str_size) else { continue };
+ 
+                 let sym_off = offset as usize;
+                 let sym_size = size as usize;
+-                if sym_off + sym_size > data.len() { continue; }
+-                let sym_data = &data[sym_off..sym_off + sym_size];
++                let Some(sym_data) = slice_at(data, sym_off, sym_size) else { continue };
+                 let sym_count = sym_data.len() / 24;
+ 
+                 let mut symbols = Vec::new();
+@@ -144,8 +147,8 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
+ 
+                     // Look up version for this symbol from .gnu.version table
+                     let (version, is_default_ver) = if let Some((vs_off, _vs_size)) = versym_shdr {
+-                        let vs_entry = vs_off + j * 2;
+-                        if vs_entry + 2 <= data.len() {
++                        let vs_entry = vs_off.saturating_add(j.saturating_mul(2));
++                        if slice_at(data, vs_entry, 2).is_some() {
+                             let raw_ver = read_u16(data, vs_entry);
+                             let hidden = raw_ver & 0x8000 != 0;
+                             let ver_idx = raw_ver & 0x7fff;
+@@ -195,8 +198,8 @@ fn parse_shared_library_symbols_from_phdrs(data: &[u8], lib_name: &str) -> Resul
+     let mut dyn_offset = 0usize;
+     let mut dyn_size = 0usize;
+     for i in 0..e_phnum {
++        if e_phentsize < 56 || table_entry(data, e_phoff, i, e_phentsize).is_none() { break; }
+         let ph = e_phoff + i * e_phentsize;
+-        if ph + e_phentsize > data.len() { break; }
+         let p_type = read_u32(data, ph);
+         if p_type == PT_DYNAMIC {
+             dyn_offset = read_u64(data, ph + 8) as usize;
+@@ -217,8 +220,8 @@ fn parse_shared_library_symbols_from_phdrs(data: &[u8], lib_name: &str) -> Resul
+     let mut versym_addr: u64 = 0;
+ 
+     let mut pos = dyn_offset;
+-    let dyn_end = dyn_offset + dyn_size;
+-    while pos + 16 <= dyn_end && pos + 16 <= data.len() {
++    let dyn_end = dyn_offset.saturating_add(dyn_size);
++    while pos.saturating_add(16) <= dyn_end && slice_at(data, pos, 16).is_some() {
+         let tag = read_i64(data, pos);
+         let val = read_u64(data, pos + 8);
+         match tag {
+diff --git a/src/backend/x86/linker/emit_exec.rs b/src/backend/x86/linker/emit_exec.rs
+index 28b612d..0b4eae4 100644
+--- a/src/backend/x86/linker/emit_exec.rs
++++ b/src/backend/x86/linker/emit_exec.rs
+@@ -35,6 +35,8 @@ pub(super) fn emit_executable(
+     is_static: bool, ifunc_symbols: &[String],
+     entry_symbol: Option<&str>,
+     z_now: bool, z_relro: bool,
++    // `-Map=FILE`: write a GNU-ld-compatible link map after layout.
++    map_path: Option<&str>,
+ ) -> Result<(), String> {
+     let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
+     let mut t_zone = std::time::Instant::now();
+@@ -360,45 +362,76 @@ pub(super) fn emit_executable(
+ 
+     zone!("pre-layout");
+     // === Layout ===
++    //
++    // Segment packing: file offsets stay *dense*, virtual addresses advance in
++    // whole pages.
++    //
++    // A PT_LOAD segment does not need its file offset page-aligned. The ELF
++    // gABI only requires `p_offset ≡ p_vaddr (mod p_align)`, because mmap maps
++    // `p_offset & ~(pagesize-1)` to `p_vaddr & ~(pagesize-1)`. Rounding the
++    // *file offset* up to a page at every segment boundary — which this
++    // linker used to do, since `addr` was hardwired to `BASE_ADDR + offset` —
++    // inserts up to one page of zero padding per segment.
++    //
++    // Measured on a zlib-ng test binary: lccc 20 640 bytes vs bfd 16 400 and
++    // wild 6 773, with the entire difference being inter-segment padding
++    // (7 568 + 3 504 bytes of holes) rather than content. bfd and wild both
++    // emit congruent, non-page-aligned offsets (e.g. off=0x2d70/vaddr=0x3d70).
++    //
++    // `vaddr_bias` is always a multiple of PAGE_SIZE, so congruence
++    // `(offset + bias) ≡ offset (mod PAGE_SIZE)` holds by construction and
++    // every `p_offset ≡ p_vaddr (mod PAGE_SIZE)` requirement is satisfied
++    // automatically. Bumping the bias by one page at a segment boundary gives
++    // the new segment a fresh page of address space (so permissions never
++    // share a page) while costing zero bytes in the file.
++    let mut vaddr_bias: u64 = 0;
++    // Virtual address currently assigned to file offset `off`.
++    macro_rules! vaddr { ($off:expr) => { BASE_ADDR + vaddr_bias + ($off) } }
++    // Begin a new PT_LOAD: leave the file offset untouched and push the
++    // virtual address forward by exactly one page. Because the increment is
++    // PAGE_SIZE, the low bits of (offset + bias) are unchanged and congruence
++    // is preserved; the new segment simply starts on the next page of address
++    // space, so two segments with different permissions never share a page.
++    macro_rules! new_segment { () => { vaddr_bias += PAGE_SIZE; } }
+     let mut offset = 64 + phdr_total_size;
+     let interp_offset = offset;
+-    let interp_addr = BASE_ADDR + offset;
++    let interp_addr = vaddr!(offset);
+     if !is_static { offset += INTERP.len() as u64; }
+ 
+     offset = (offset + 7) & !7;
+-    let gnu_hash_offset = offset; let gnu_hash_addr = BASE_ADDR + offset; offset += gnu_hash_size;
++    let gnu_hash_offset = offset; let gnu_hash_addr = vaddr!(offset); offset += gnu_hash_size;
+     offset = (offset + 7) & !7;
+-    let dynsym_offset = offset; let dynsym_addr = BASE_ADDR + offset; offset += dynsym_size;
+-    let dynstr_offset = offset; let dynstr_addr = BASE_ADDR + offset; offset += dynstr_size;
++    let dynsym_offset = offset; let dynsym_addr = vaddr!(offset); offset += dynsym_size;
++    let dynstr_offset = offset; let dynstr_addr = vaddr!(offset); offset += dynstr_size;
+     // .gnu.version (versym) - right after dynstr, aligned to 2
+     offset = (offset + 1) & !1;
+-    let versym_offset = offset; let versym_addr = BASE_ADDR + offset;
++    let versym_offset = offset; let versym_addr = vaddr!(offset);
+     if versym_size > 0 { offset += versym_size; }
+     // .gnu.version_r (verneed) - aligned to 4
+     offset = (offset + 3) & !3;
+-    let verneed_offset = offset; let verneed_addr = BASE_ADDR + offset;
++    let verneed_offset = offset; let verneed_addr = vaddr!(offset);
+     if verneed_size > 0 { offset += verneed_size; }
+     offset = (offset + 7) & !7;
+-    let rela_dyn_offset = offset; let rela_dyn_addr = BASE_ADDR + offset; offset += rela_dyn_size;
++    let rela_dyn_offset = offset; let rela_dyn_addr = vaddr!(offset); offset += rela_dyn_size;
+     offset = (offset + 7) & !7;
+-    let rela_plt_offset = offset; let rela_plt_addr = BASE_ADDR + offset; offset += rela_plt_size;
++    let rela_plt_offset = offset; let rela_plt_addr = vaddr!(offset); offset += rela_plt_size;
+ 
+     // Text segment
+-    offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
++    new_segment!();
+     let text_page_offset = offset;
+-    let text_page_addr = BASE_ADDR + offset;
++    let text_page_addr = vaddr!(offset);
+     for sec in output_sections.iter_mut() {
+         if sec.flags & SHF_EXECINSTR != 0 && sec.flags & SHF_ALLOC != 0 {
+             let a = sec.alignment.max(1);
+             offset = (offset + a - 1) & !(a - 1);
+-            sec.addr = BASE_ADDR + offset;
++            sec.addr = vaddr!(offset);
+             sec.file_offset = offset;
+             offset += sec.mem_size;
+         }
+     }
+     let (plt_addr, plt_offset) = if plt_size > 0 {
+         offset = (offset + 15) & !15;
+-        let a = BASE_ADDR + offset; let o = offset; offset += plt_size; (a, o)
++        let a = vaddr!(offset); let o = offset; offset += plt_size; (a, o)
+     } else { (0u64, 0u64) };
+ 
+     // .iplt (IFUNC PLT entries for static linking)
+@@ -407,18 +440,18 @@ pub(super) fn emit_executable(
+     let iplt_total_size = num_ifunc as u64 * iplt_entry_size;
+     let (iplt_addr, iplt_offset) = if iplt_total_size > 0 {
+         offset = (offset + 15) & !15;
+-        let a = BASE_ADDR + offset; let o = offset; offset += iplt_total_size; (a, o)
++        let a = vaddr!(offset); let o = offset; offset += iplt_total_size; (a, o)
+     } else { (0u64, 0u64) };
+ 
+     let text_total_size = offset - text_page_offset;
+ 
+     // Rodata segment
+-    offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
++    new_segment!();
+     let rodata_page_offset = offset;
+-    let rodata_page_addr = BASE_ADDR + offset;
++    let rodata_page_addr = vaddr!(offset);
+     // .eh_frame_hdr leads the rodata segment (data filled after relocation).
+     let (eh_frame_hdr_offset, eh_frame_hdr_vaddr) = if eh_frame_hdr_size > 0 {
+-        let o = offset; let v = BASE_ADDR + offset;
++        let o = offset; let v = vaddr!(offset);
+         offset += eh_frame_hdr_size;
+         (o, v)
+     } else { (0u64, 0u64) };
+@@ -427,7 +460,7 @@ pub(super) fn emit_executable(
+            sec.flags & SHF_WRITE == 0 && sec.sh_type != SHT_NOBITS {
+             let a = sec.alignment.max(1);
+             offset = (offset + a - 1) & !(a - 1);
+-            sec.addr = BASE_ADDR + offset;
++            sec.addr = vaddr!(offset);
+             sec.file_offset = offset;
+             offset += sec.mem_size;
+         }
+@@ -435,9 +468,9 @@ pub(super) fn emit_executable(
+     let rodata_total_size = offset - rodata_page_offset;
+ 
+     // RW segment
+-    offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
++    new_segment!();
+     let rw_page_offset = offset;
+-    let rw_page_addr = BASE_ADDR + offset;
++    let rw_page_addr = vaddr!(offset);
+ 
+     let mut init_array_addr = 0u64; let mut init_array_size = 0u64;
+     let mut fini_array_addr = 0u64; let mut fini_array_size = 0u64;
+@@ -447,7 +480,7 @@ pub(super) fn emit_executable(
+         if sec.name == ".preinit_array" {
+             let a = sec.alignment.max(8);
+             offset = (offset + a - 1) & !(a - 1);
+-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
++            sec.addr = vaddr!(offset); sec.file_offset = offset;
+             preinit_array_addr = sec.addr; preinit_array_size = sec.mem_size;
+             offset += sec.mem_size; break;
+         }
+@@ -456,7 +489,7 @@ pub(super) fn emit_executable(
+         if sec.name == ".init_array" {
+             let a = sec.alignment.max(8);
+             offset = (offset + a - 1) & !(a - 1);
+-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
++            sec.addr = vaddr!(offset); sec.file_offset = offset;
+             init_array_addr = sec.addr; init_array_size = sec.mem_size;
+             offset += sec.mem_size; break;
+         }
+@@ -465,42 +498,51 @@ pub(super) fn emit_executable(
+         if sec.name == ".fini_array" {
+             let a = sec.alignment.max(8);
+             offset = (offset + a - 1) & !(a - 1);
+-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
++            sec.addr = vaddr!(offset); sec.file_offset = offset;
+             fini_array_addr = sec.addr; fini_array_size = sec.mem_size;
+             offset += sec.mem_size; break;
+         }
+     }
+ 
+     offset = (offset + 7) & !7;
+-    let dynamic_offset = offset; let dynamic_addr = BASE_ADDR + offset; offset += dynamic_size;
++    let dynamic_offset = offset; let dynamic_addr = vaddr!(offset); offset += dynamic_size;
+     offset = (offset + 7) & !7;
+-    let got_offset = offset; let got_addr = BASE_ADDR + offset; offset += got_size;
++    let got_offset = offset; let got_addr = vaddr!(offset); offset += got_size;
+     // Under -z now the .got.plt is never written after startup, so it can be
+     // protected too (Full RELRO). Under lazy binding it must stay writable
+     // and is placed after the RELRO page boundary below.
+     let (mut got_plt_offset, mut got_plt_addr) = (0u64, 0u64);
+     if has_relro && z_now {
+         offset = (offset + 7) & !7;
+-        got_plt_offset = offset; got_plt_addr = BASE_ADDR + offset;
++        got_plt_offset = offset; got_plt_addr = vaddr!(offset);
+         offset += got_plt_size;
+     }
+     // RELRO boundary: everything before this is mprotect(PROT_READ)ed by
+     // ld.so after relocation; the boundary must be page-aligned.
+     let relro_start = rw_page_offset;
++    let relro_start_addr = rw_page_addr;
+     let mut relro_size = 0u64;
+     if has_relro {
+-        offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+-        relro_size = offset - relro_start;
++        // ld.so mprotects [vaddr, vaddr+memsz) rounded out to page bounds, so
++        // it is the *virtual address* that must reach a page boundary, not the
++        // file offset. With file offsets packed densely (vaddr_bias != 0) the
++        // two are no longer the same number: aligning `offset` here would
++        // leave the RELRO end mid-page and let ld.so write-protect the first
++        // bytes of whatever follows.
++        let end_addr = vaddr!(offset);
++        let aligned_end = (end_addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
++        offset += aligned_end - end_addr;
++        relro_size = vaddr!(offset) - relro_start_addr;
+     }
+     if !(has_relro && z_now) {
+         offset = (offset + 7) & !7;
+-        got_plt_offset = offset; got_plt_addr = BASE_ADDR + offset;
++        got_plt_offset = offset; got_plt_addr = vaddr!(offset);
+         offset += got_plt_size;
+     }
+ 
+     // IFUNC GOT (8 bytes per entry, stores resolver addresses initially)
+     offset = (offset + 7) & !7;
+-    let ifunc_got_offset = offset; let ifunc_got_addr = BASE_ADDR + offset;
++    let ifunc_got_offset = offset; let ifunc_got_addr = vaddr!(offset);
+     let ifunc_got_size = num_ifunc as u64 * 8;
+     offset += ifunc_got_size;
+ 
+@@ -508,7 +550,7 @@ pub(super) fn emit_executable(
+     // Only emitted for STATIC executables: dynamic executables put their
+     // IRELATIVE entries in .rela.dyn instead (ld.so ignores .rela.iplt).
+     offset = (offset + 7) & !7;
+-    let rela_iplt_offset = offset; let rela_iplt_addr = BASE_ADDR + offset;
++    let rela_iplt_offset = offset; let rela_iplt_addr = vaddr!(offset);
+     let rela_iplt_size = if is_static { num_ifunc as u64 * 24 } else { 0 };
+     offset += rela_iplt_size;
+ 
+@@ -518,7 +560,7 @@ pub(super) fn emit_executable(
+            sec.flags & SHF_TLS == 0 {
+             let a = sec.alignment.max(1);
+             offset = (offset + a - 1) & !(a - 1);
+-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
++            sec.addr = vaddr!(offset); sec.file_offset = offset;
+             offset += sec.mem_size;
+         }
+     }
+@@ -533,7 +575,7 @@ pub(super) fn emit_executable(
+         if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS {
+             let a = sec.alignment.max(1);
+             offset = (offset + a - 1) & !(a - 1);
+-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
++            sec.addr = vaddr!(offset); sec.file_offset = offset;
+             if tls_addr == 0 { tls_addr = sec.addr; tls_file_offset = offset; tls_align = a; }
+             tls_file_size += sec.mem_size;
+             tls_mem_size += sec.mem_size;
+@@ -543,7 +585,7 @@ pub(super) fn emit_executable(
+     // If only .tbss (NOBITS TLS) exists with no .tdata, we still need a TLS segment.
+     // Set tls_addr/tls_file_offset to the current position so TPOFF calculations work.
+     if tls_addr == 0 && has_tls_sections {
+-        tls_addr = BASE_ADDR + offset;
++        tls_addr = vaddr!(offset);
+         tls_file_offset = offset;
+     }
+     for sec in output_sections.iter_mut() {
+@@ -559,7 +601,7 @@ pub(super) fn emit_executable(
+     tls_mem_size = (tls_mem_size + tls_align - 1) & !(tls_align - 1);
+     let has_tls = tls_addr != 0;
+ 
+-    let bss_addr = BASE_ADDR + offset;
++    let bss_addr = vaddr!(offset);
+     let mut bss_size = 0u64;
+     for sec in output_sections.iter_mut() {
+         if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 {
+@@ -870,14 +912,30 @@ pub(super) fn emit_executable(
+     // prefix decides almost every comparison in one instruction; ties fall
+     // back to the full byte compare (total order preserved, identical
+     // resulting symtab order).
+-    let mut keyed: Vec<(u64, &String, &GlobalSymbol)> = sym_names
++    //
++    // The prefix is 16 bytes, not 8. Eight bytes is too narrow for real symbol
++    // tables: names routinely share a longer prefix than that (`g_sym_12345`,
++    // `_ZNSt3__1`, `__pthread_`, `nghttp2_session_`), so the u64 key ties and
++    // every comparison falls through to the byte compare. Profiling a
++    // 20k-symbol link showed 7.0% of all instructions in `__memcmp_avx2_movbe`
++    // for exactly that reason. A u128 covers the whole name for the vast
++    // majority of symbols, so the fallback almost never runs; the fallback is
++    // retained so the total order — and therefore the emitted symtab — is
++    // byte-for-byte identical to the previous implementation.
++    //
++    // Measured alternative, rejected: an *index* sort (sort u32 indices into a
++    // separate key array) moves 4 bytes per swap instead of 32, but the double
++    // indirection on every comparison cost more than the wider swap saved:
++    // 57.8M instructions vs 53.7M for this version on the 20k-symbol profile.
++    // Keeping the tuple sort.
++    let mut keyed: Vec<(u128, &String, &GlobalSymbol)> = sym_names
+         .iter()
+         .map(|(n, g)| {
+             let b = n.as_bytes();
+-            let mut p = [0u8; 8];
+-            let l = b.len().min(8);
++            let mut p = [0u8; 16];
++            let l = b.len().min(16);
+             p[..l].copy_from_slice(&b[..l]);
+-            (u64::from_be_bytes(p), *n, *g)
++            (u128::from_be_bytes(p), *n, *g)
+         })
+         .collect();
+     keyed.sort_unstable_by(|a, b| {
+@@ -912,6 +970,23 @@ pub(super) fn emit_executable(
+     zone!("symtab");
+     // === Build output buffer ===
+     let file_size = offset as usize;
++    // Defence in depth against malformed input driving a gigantic layout.
++    // `parse_elf64_object` already rejects non-power-of-two sh_addralign (the
++    // fuzzer-found path that demanded a 1 TiB buffer), but any future arithmetic
++    // slip here would abort the process inside the allocator, which
++    // `catch_unwind` cannot intercept.  Fail with a diagnostic instead.
++    //
++    // The cap is deliberately far above any real link (the Linux kernel's
++    // vmlinux is ~1 GiB at the extreme) and is a guard, not a policy limit.
++    const MAX_OUTPUT_BYTES: usize = 64 << 30; // 64 GiB
++    if file_size > MAX_OUTPUT_BYTES {
++        return Err(format!(
++            "output would be {} bytes ({:.1} GiB), which exceeds the {} GiB sanity limit; \
++             this usually means an input object has corrupt section offsets or sizes",
++            file_size,
++            file_size as f64 / (1u64 << 30) as f64,
++            MAX_OUTPUT_BYTES >> 30));
++    }
+     let mut out = vec![0u8; file_size];
+ 
+     // ELF header
+@@ -940,7 +1015,7 @@ pub(super) fn emit_executable(
+     }
+     if has_relro && relro_size > 0 {
+         wphdr(&mut out, ph, PT_GNU_RELRO, PF_R,
+-              relro_start, BASE_ADDR + relro_start, relro_size, relro_size, 1);
++              relro_start, relro_start_addr, relro_size, relro_size, 1);
+         ph += 56;
+     }
+     wphdr(&mut out, ph, PT_GNU_STACK, PF_R|PF_W, 0, 0, 0, 0, 0x10); ph += 56;
+@@ -1837,6 +1912,40 @@ pub(super) fn emit_executable(
+     out[62..64].copy_from_slice(&shstrtab_shidx.to_le_bytes());
+ 
+     zone!("headers");
++
++    // === -Map=FILE ===
++    // Written after layout, so every address in the map is the final one.
++    // Built from the same `output_sections` / `section_map` state the ELF
++    // itself was emitted from, which makes the map authoritative rather than
++    // a reconstruction that can drift from reality.
++    if let Some(mp) = map_path {
++        let object_names: Vec<String> =
++            objects.iter().map(|o| o.source_name.clone()).collect();
++
++        // (name, object_idx, section_idx, offset-within-input-section)
++        let mut map_syms: Vec<(String, usize, usize, u64)> = Vec::new();
++        for (obj_idx, obj) in objects.iter().enumerate() {
++            for sym in &obj.symbols {
++                if sym.name.is_empty() { continue; }
++                let st = sym.sym_type();
++                // STT_SECTION (3) and STT_FILE (4) are bookkeeping entries,
++                // not addresses a map reader cares about.
++                if st == STT_SECTION || st == 4 { continue; }
++                if sym.is_undefined() { continue; }
++                let si = sym.shndx as usize;
++                if section_map.contains_key(&(obj_idx, si)) {
++                    map_syms.push((sym.name.clone(), obj_idx, si, sym.value));
++                }
++            }
++        }
++
++        let lm = linker_common::build_link_map(
++            output_sections, &object_names, &map_syms,
++            entry_symbol.or(Some("_start")), entry_addr);
++        lm.write_to_path(std::path::Path::new(mp))
++            .map_err(|e| format!("failed to write map file '{}': {}", mp, e))?;
++    }
++
+     std::fs::write(output_path, &out).map_err(|e| format!("failed to write '{}': {}", output_path, e))?;
+     #[cfg(unix)]
+     {
+diff --git a/src/backend/x86/linker/emit_shared.rs b/src/backend/x86/linker/emit_shared.rs
+index 8e8cad4..3f7a3b7 100644
+--- a/src/backend/x86/linker/emit_shared.rs
++++ b/src/backend/x86/linker/emit_shared.rs
+@@ -161,6 +161,18 @@ pub(super) fn emit_shared_library(
+ ) -> Result<(), String> {
+     let base_addr: u64 = 0;
+ 
++    // Congruent segment packing — see the extended rationale in
++    // emit_exec.rs. File offsets stay dense; virtual addresses advance one
++    // page per PT_LOAD. The gABI only requires
++    // `p_offset === p_vaddr (mod p_align)`, which holds by construction
++    // because `vaddr_bias` is always a multiple of PAGE_SIZE. Rounding the
++    // *file offset* up at each segment boundary (what this function used to
++    // do) wastes up to a page per segment: measured 19 568 B for a trivial
++    // .so versus 7 792 B from mold and 5 974 B from wild.
++    let mut vaddr_bias: u64 = 0;
++    macro_rules! vaddr { ($off:expr) => { base_addr + vaddr_bias + ($off) } }
++    macro_rules! new_segment { () => { vaddr_bias += PAGE_SIZE; } }
++
+     let mut dynstr = DynStrTab::new();
+     for lib in needed_sonames { dynstr.add(lib); }
+     if let Some(ref sn) = soname { dynstr.add(sn); }
+@@ -619,24 +631,24 @@ pub(super) fn emit_shared_library(
+     let mut offset = 64 + phdr_total_size;
+ 
+     offset = (offset + 7) & !7;
+-    let gnu_hash_offset = offset; let gnu_hash_addr = base_addr + offset; offset += gnu_hash_size;
++    let gnu_hash_offset = offset; let gnu_hash_addr = vaddr!(offset); offset += gnu_hash_size;
+     offset = (offset + 7) & !7;
+-    let dynsym_offset = offset; let dynsym_addr = base_addr + offset; offset += dynsym_size;
+-    let dynstr_offset = offset; let dynstr_addr = base_addr + offset; offset += dynstr_size;
++    let dynsym_offset = offset; let dynsym_addr = vaddr!(offset); offset += dynsym_size;
++    let dynstr_offset = offset; let dynstr_addr = vaddr!(offset); offset += dynstr_size;
+     offset = (offset + 1) & !1;
+-    let versym_offset = offset; let versym_addr = base_addr + offset; offset += versym_size;
++    let versym_offset = offset; let versym_addr = vaddr!(offset); offset += versym_size;
+     offset = (offset + 7) & !7;
+-    let verdef_offset = offset; let verdef_addr = base_addr + offset; offset += verdef_size;
++    let verdef_offset = offset; let verdef_addr = vaddr!(offset); offset += verdef_size;
+ 
+     // Text segment
+-    offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
++    new_segment!();
+     let text_page_offset = offset;
+-    let text_page_addr = base_addr + offset;
++    let text_page_addr = vaddr!(offset);
+     for sec in output_sections.iter_mut() {
+         if sec.flags & SHF_EXECINSTR != 0 && sec.flags & SHF_ALLOC != 0 {
+             let a = sec.alignment.max(1);
+             offset = (offset + a - 1) & !(a - 1);
+-            sec.addr = base_addr + offset;
++            sec.addr = vaddr!(offset);
+             sec.file_offset = offset;
+             offset += sec.mem_size;
+         }
+@@ -644,19 +656,19 @@ pub(super) fn emit_shared_library(
+     // PLT goes at the end of the text segment
+     let (plt_addr, plt_offset) = if plt_size > 0 {
+         offset = (offset + 15) & !15;
+-        let a = base_addr + offset; let o = offset; offset += plt_size; (a, o)
++        let a = vaddr!(offset); let o = offset; offset += plt_size; (a, o)
+     } else { (0u64, 0u64) };
+     let text_total_size = offset - text_page_offset;
+ 
+     // Rodata segment - only pure rodata (no absolute relocations)
+-    offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
++    new_segment!();
+     let rodata_page_offset = offset;
+-    let rodata_page_addr = base_addr + offset;
++    let rodata_page_addr = vaddr!(offset);
+     for (idx, sec) in output_sections.iter_mut().enumerate() {
+         if is_pure_rodata(idx, sec) {
+             let a = sec.alignment.max(1);
+             offset = (offset + a - 1) & !(a - 1);
+-            sec.addr = base_addr + offset;
++            sec.addr = vaddr!(offset);
+             sec.file_offset = offset;
+             offset += sec.mem_size;
+         }
+@@ -665,9 +677,9 @@ pub(super) fn emit_shared_library(
+ 
+     // RW segment - includes RELRO sections (rodata with abs relocs), then linker
+     // data structures, then actual writable data
+-    offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
++    new_segment!();
+     let rw_page_offset = offset;
+-    let rw_page_addr = base_addr + offset;
++    let rw_page_addr = vaddr!(offset);
+ 
+     // First: RELRO sections (rodata that needs dynamic relocations)
+     let _relro_start_offset = offset;
+@@ -675,7 +687,7 @@ pub(super) fn emit_shared_library(
+         if is_relro_rodata(idx, sec) {
+             let a = sec.alignment.max(1);
+             offset = (offset + a - 1) & !(a - 1);
+-            sec.addr = base_addr + offset;
++            sec.addr = vaddr!(offset);
+             sec.file_offset = offset;
+             offset += sec.mem_size;
+         }
+@@ -688,7 +700,7 @@ pub(super) fn emit_shared_library(
+         if sec.name == ".init_array" {
+             let a = sec.alignment.max(8);
+             offset = (offset + a - 1) & !(a - 1);
+-            sec.addr = base_addr + offset; sec.file_offset = offset;
++            sec.addr = vaddr!(offset); sec.file_offset = offset;
+             init_array_addr = sec.addr; init_array_size = sec.mem_size;
+             offset += sec.mem_size; break;
+         }
+@@ -697,7 +709,7 @@ pub(super) fn emit_shared_library(
+         if sec.name == ".fini_array" {
+             let a = sec.alignment.max(8);
+             offset = (offset + a - 1) & !(a - 1);
+-            sec.addr = base_addr + offset; sec.file_offset = offset;
++            sec.addr = vaddr!(offset); sec.file_offset = offset;
+             fini_array_addr = sec.addr; fini_array_size = sec.mem_size;
+             offset += sec.mem_size; break;
+         }
+@@ -709,7 +721,7 @@ pub(super) fn emit_shared_library(
+     // Reserve space for .rela.dyn (will be filled later)
+     offset = (offset + 7) & !7;
+     let rela_dyn_offset = offset;
+-    let rela_dyn_addr = base_addr + offset;
++    let rela_dyn_addr = vaddr!(offset);
+     // Each R_X86_64_64 reloc in input becomes one R_X86_64_RELATIVE entry.
+     let mut max_rela_count: usize = 0;
+     for obj in objects.iter() {
+@@ -737,32 +749,38 @@ pub(super) fn emit_shared_library(
+     // .rela.plt (JMPREL) for PLT GOT entries
+     offset = (offset + 7) & !7;
+     let rela_plt_offset = offset;
+-    let rela_plt_addr = base_addr + offset;
++    let rela_plt_addr = vaddr!(offset);
+     offset += rela_plt_size;
+ 
+     offset = (offset + 7) & !7;
+-    let dynamic_offset = offset; let dynamic_addr = base_addr + offset; offset += dynamic_size;
++    let dynamic_offset = offset; let dynamic_addr = vaddr!(offset); offset += dynamic_size;
+ 
+     // End of RELRO region (page-aligned up for PT_GNU_RELRO).
+     // Everything after this must be on a new page so that mprotect(PROT_READ)
+     // on the RELRO region doesn't affect writable data (GOT.PLT, GOT, .data, .bss).
+-    let relro_end_offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+-    let relro_end_addr = base_addr + relro_end_offset;
++    // With densely packed file offsets the RELRO end must be aligned in
++    // ADDRESS space: ld.so mprotects page-rounded [vaddr, vaddr+memsz), so
++    // aligning the file offset would leave the boundary mid-page and
++    // write-protect the head of the following section.
++    let relro_end_addr = {
++        let end = vaddr!(offset);
++        (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
++    };
+     if has_relro {
+-        offset = relro_end_offset; // advance to page boundary
++        offset += relro_end_addr - vaddr!(offset); // advance to page boundary
+     }
+ 
+     // .got.plt entries - MUST be after RELRO boundary since dynamic linker
+     // needs to write to them during lazy PLT resolution
+     offset = (offset + 7) & !7;
+     let got_plt_offset = offset;
+-    let got_plt_addr = base_addr + offset;
++    let got_plt_addr = vaddr!(offset);
+     offset += got_plt_size;
+ 
+     // GOT for locally-resolved symbols, followed by TLS GD pairs and the
+     // optional LD pair. Layout:
+     //   [got_needed slots][GD pair 0][GD pair 1]...[LD pair]
+-    let got_offset = offset; let got_addr = base_addr + offset;
++    let got_offset = offset; let got_addr = vaddr!(offset);
+     let tlsgd_got_base = got_needed.len() as u64 * 8; // offset of first GD pair within .got
+     let tlsld_got_off = tlsgd_got_base + tlsgd_names.len() as u64 * 16;
+     let got_size = tlsld_got_off + if needs_tlsld_slot { 16 } else { 0 };
+@@ -774,7 +792,7 @@ pub(super) fn emit_shared_library(
+            sec.flags & SHF_TLS == 0 {
+             let a = sec.alignment.max(1);
+             offset = (offset + a - 1) & !(a - 1);
+-            sec.addr = base_addr + offset; sec.file_offset = offset;
++            sec.addr = vaddr!(offset); sec.file_offset = offset;
+             offset += sec.mem_size;
+         }
+     }
+@@ -789,7 +807,7 @@ pub(super) fn emit_shared_library(
+         if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS {
+             let a = sec.alignment.max(1);
+             offset = (offset + a - 1) & !(a - 1);
+-            sec.addr = base_addr + offset; sec.file_offset = offset;
++            sec.addr = vaddr!(offset); sec.file_offset = offset;
+             if tls_addr == 0 { tls_addr = sec.addr; tls_file_offset = offset; tls_align = a; }
+             tls_file_size += sec.mem_size;
+             tls_mem_size += sec.mem_size;
+@@ -797,7 +815,7 @@ pub(super) fn emit_shared_library(
+         }
+     }
+     if tls_addr == 0 && has_tls_sections {
+-        tls_addr = base_addr + offset;
++        tls_addr = vaddr!(offset);
+         tls_file_offset = offset;
+     }
+     for sec in output_sections.iter_mut() {
+@@ -812,7 +830,7 @@ pub(super) fn emit_shared_library(
+     tls_mem_size = (tls_mem_size + tls_align - 1) & !(tls_align - 1);
+     let has_tls = tls_addr != 0;
+ 
+-    let bss_addr = base_addr + offset;
++    let bss_addr = vaddr!(offset);
+     let mut bss_size = 0u64;
+     for sec in output_sections.iter_mut() {
+         if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 {
+diff --git a/src/backend/x86/linker/link.rs b/src/backend/x86/linker/link.rs
+index de67393..d0072b7 100644
+--- a/src/backend/x86/linker/link.rs
++++ b/src/backend/x86/linker/link.rs
+@@ -281,6 +281,7 @@ pub fn link_builtin(
+         export_dynamic, &rpath_entries, use_runpath, is_static,
+         &ifunc_symbols, entry_symbol.as_deref(),
+         parsed_args.z_now, parsed_args.z_relro,
++        parsed_args.map_path.as_deref(),
+     );
+     phase!("emit-exec");
+     if ld_time { eprintln!("[ldtime] {:<24} {:>7.1} ms", "TOTAL", t_all.elapsed().as_secs_f64()*1e3); }
+diff --git a/src/backend/x86/linker/parallel_reloc.rs b/src/backend/x86/linker/parallel_reloc.rs
+index 6e20e37..0ba2dee 100644
+--- a/src/backend/x86/linker/parallel_reloc.rs
++++ b/src/backend/x86/linker/parallel_reloc.rs
+@@ -57,6 +57,34 @@ pub struct InsnRewrite {
+ }
+ 
+ /// Apply pure reloc stores in parallel.
++///
++/// # Correctness
++///
++/// The output is byte-for-byte identical to [`apply_writes_serial`] for any
++/// input, including unsorted lists and lists containing several writes to the
++/// same offset: partitioning preserves list order within a partition, and
++/// partitions are split so that no two of them can touch the same byte.
++///
++/// # Soundness
++///
++/// Workers receive disjoint `&mut [u8]` sub-slices carved out of one buffer.
++/// Disjointness is *established here*, not assumed:
++///
++/// * The list is indexed through a permutation sorted by offset, so a
++///   partition boundary can be placed between two writes whose byte ranges do
++///   not overlap.  The previous implementation partitioned the list as given
++///   and merely documented "the caller must pass a sorted list"; with an
++///   unsorted list the per-partition `[min, max)` spans overlap and the
++///   workers alias the same bytes, which is undefined behaviour.  (Concretely,
++///   offsets `[0, 1000, 8, 1008]` with two threads yield the overlapping spans
++///   `[0, 1008)` and `[8, 1016)`.)
++/// * A cluster of writes that overlap each other is never split across
++///   partitions, so overlapping writes are always applied by one worker in
++///   list order — preserving serial semantics.
++/// * Every write is bounds-checked against the buffer *before* any pointer is
++///   formed.  Out-of-range writes are dropped, exactly as the serial path
++///   does; the old `debug_assert!` compiled out in release builds, so a bad
++///   offset became an out-of-bounds write instead of a skipped one.
+ pub fn apply_writes_parallel(out: &mut [u8], writes: &[RelocWrite], n_threads: usize) {
+     if writes.is_empty() || n_threads <= 1 {
+         apply_writes_serial(out, writes);
+@@ -64,34 +92,58 @@ pub fn apply_writes_parallel(out: &mut [u8], writes: &[RelocWrite], n_threads: u
+         return;
+     }
+ 
+-    let n_threads = n_threads.min(writes.len()).max(1);
+-    let chunk = (writes.len() + n_threads - 1) / n_threads;
++    let out_len = out.len();
++
++    let (order, partitions) = plan_partitions_inner(writes, n_threads);
++
++    if partitions.len() <= 1 {
++        // Everything overlaps (or the list is tiny): no safe split exists.
++        apply_writes_serial(out, writes);
++        SERIAL_WRITES.fetch_add(writes.len(), Ordering::Relaxed);
++        return;
++    }
++
++    let span = |i: u32| -> (usize, usize) {
++        let w = &writes[i as usize];
++        (w.offset, w.offset.saturating_add(w.width as usize))
++    };
+ 
+     thread::scope(|scope| {
+         let out_addr = out.as_mut_ptr() as usize;
+-        let out_len = out.len();
+-        let mut handles = Vec::with_capacity(n_threads);
++        let mut handles = Vec::with_capacity(partitions.len());
+ 
+-        for t in 0..n_threads {
+-            let start = t * chunk;
+-            if start >= writes.len() { break; }
+-            let end = (start + chunk).min(writes.len());
+-            let slice = &writes[start..end];
+-            if slice.is_empty() { continue; }
++        for &(ps, pe) in &partitions {
++            let idxs = &order[ps..pe];
++            if idxs.is_empty() { continue; }
+ 
+-            let min_off = slice.iter().map(|w| w.offset).min().unwrap();
+-            let max_off = slice.iter().map(|w| w.offset + w.width as usize).max().unwrap();
+-            debug_assert!(max_off <= out_len, "reloc write past end of buffer");
++            // Span of this partition, clamped to the buffer. Writes outside
++            // the buffer are filtered in the worker; here we only need a
++            // sound base/length for the sub-slice. Both bounds are computed by
++            // scanning: after the re-sort above, `idxs` is in list order, so
++            // neither end of the span is at a known position.
++            let lo = idxs.iter().map(|&i| span(i).0).min().unwrap();
++            let hi = idxs.iter().map(|&i| span(i).1).max().unwrap_or(lo);
++            if lo >= out_len { continue; }
++            let hi = hi.min(out_len);
++            if hi <= lo { continue; }
+ 
++            // SAFETY: `partitions` was built so that the [lo, hi) spans of any
++            // two partitions are disjoint (a boundary is only placed where the
++            // running high-water mark has been reached), and each span is
++            // clamped into `0..out_len`. Therefore the sub-slices handed to the
++            // workers do not alias and stay inside the allocation that `out`
++            // borrows, which outlives the scope.
+             let thread_slice = unsafe {
+-                let base = out_addr as *mut u8;
+-                std::slice::from_raw_parts_mut(base.add(min_off), max_off - min_off)
++                std::slice::from_raw_parts_mut((out_addr as *mut u8).add(lo), hi - lo)
+             };
+ 
+             handles.push(scope.spawn(move || {
+-                for w in slice {
+-                    let local = w.offset - min_off;
+-                    write_le(thread_slice, local, w.width, w.value);
++                for &i in idxs {
++                    let w = &writes[i as usize];
++                    // Same bounds policy as the serial path: skip, never panic.
++                    let Some(end) = w.offset.checked_add(w.width as usize) else { continue };
++                    if end > out_len { continue; }
++                    write_le(thread_slice, w.offset - lo, w.width, w.value);
+                 }
+             }));
+         }
+@@ -104,9 +156,80 @@ pub fn apply_writes_parallel(out: &mut [u8], writes: &[RelocWrite], n_threads: u
+     PARALLEL_WRITES.fetch_add(writes.len(), Ordering::Relaxed);
+ }
+ 
++/// Compute a safe partitioning of `writes` for `n_threads` workers.
++///
++/// Returns `(order, partitions)` where `order` is a permutation of indices
++/// into `writes` and each `(start, end)` in `partitions` denotes the range
++/// `order[start..end]` handled by one worker.
++///
++/// Guarantees, on which the `unsafe` slice construction in
++/// [`apply_writes_parallel`] depends:
++/// * the byte spans of any two partitions are disjoint;
++/// * within a partition, indices are in ascending *list* order, so
++///   last-writer-wins is preserved for overlapping writes.
++fn plan_partitions_inner(writes: &[RelocWrite], n_threads: usize)
++    -> (Vec<u32>, Vec<(usize, usize)>)
++{
++    // Index permutation sorted by offset, used only to find safe split points.
++    let mut order: Vec<u32> = (0..writes.len() as u32).collect();
++    order.sort_by_key(|&i| writes[i as usize].offset);
++
++    let span = |i: u32| -> (usize, usize) {
++        let w = &writes[i as usize];
++        (w.offset, w.offset.saturating_add(w.width as usize))
++    };
++
++    // A split may be placed at k only when every byte written so far ends at
++    // or before the first byte written at k. Tracking the running high-water
++    // mark (not merely the previous write's end) keeps a chain of mutually
++    // overlapping writes inside one partition.
++    let target = writes.len().div_ceil(n_threads).max(1);
++    let mut partitions: Vec<(usize, usize)> = Vec::with_capacity(n_threads);
++    let mut part_start = 0usize;
++    let mut reach = span(order[0]).1;
++    for k in 1..order.len() {
++        let (lo, hi) = span(order[k]);
++        if lo >= reach && k - part_start >= target {
++            partitions.push((part_start, k));
++            part_start = k;
++            reach = hi;
++        } else {
++            reach = reach.max(hi);
++        }
++    }
++    partitions.push((part_start, order.len()));
++
++    // Restore original list order *within* each partition.
++    //
++    // Sorting by offset must not survive into application order. Two writes
++    // that overlap at *different* offsets are reordered by an offset sort,
++    // which silently inverts last-writer-wins: for [(off 4, w4, B),
++    // (off 0, w8, A)] the serial result has A covering bytes 4..8, whereas
++    // offset order applies A then B and leaves B there. (A stable sort only
++    // protects writes at the *same* offset.) The randomised differential test
++    // caught exactly this. Writes in different partitions never touch the
++    // same byte, so their relative order is unobservable.
++    for &(ps, pe) in &partitions {
++        order[ps..pe].sort_unstable();
++    }
++    (order, partitions)
++}
++
++/// Test hook: the partition ranges that would be used for `n_threads`.
++#[cfg(test)]
++fn plan_partitions(writes: &[RelocWrite], n_threads: usize) -> Vec<(usize, usize)> {
++    if writes.is_empty() || n_threads <= 1 {
++        return vec![(0, writes.len())];
++    }
++    plan_partitions_inner(writes, n_threads).1
++}
++
+ pub fn apply_writes_serial(out: &mut [u8], writes: &[RelocWrite]) {
+     for w in writes {
+-        if w.offset + w.width as usize > out.len() { continue; }
++        // checked_add: `offset + width` must not wrap for offsets near
++        // usize::MAX, which would turn a skip into an out-of-bounds write.
++        let Some(end) = w.offset.checked_add(w.width as usize) else { continue };
++        if end > out.len() { continue; }
+         write_le(out, w.offset, w.width, w.value);
+     }
+ }
+@@ -124,7 +247,7 @@ fn write_le(buf: &mut [u8], off: usize, width: u8, value: u64) {
+ 
+ pub fn apply_rewrites(out: &mut [u8], rewrites: &[InsnRewrite]) {
+     for r in rewrites {
+-        if r.offset + r.bytes.len() <= out.len() {
++        if r.offset.checked_add(r.bytes.len()).is_some_and(|e| e <= out.len()) {
+             out[r.offset..r.offset + r.bytes.len()].copy_from_slice(&r.bytes);
+         }
+     }
+@@ -204,4 +327,143 @@ mod tests {
+     fn desired_threads_defaults_to_one() {
+         let _ = desired_threads();
+     }
++
++    // ---- regressions for the partitioning soundness fix --------------------
++
++    /// The exact shape that made the previous implementation alias two `&mut`
++    /// slices: an *unsorted* list whose naive contiguous partitions produce
++    /// overlapping `[min, max)` spans ([0,1008) and [8,1016) with 2 threads).
++    /// Under the old code this was UB; the observable symptom here is simply
++    /// that the result must equal the serial one.
++    #[test]
++    fn unsorted_writes_match_serial() {
++        let writes = vec![
++            RelocWrite { offset: 0,    width: 8, value: 0x1111_1111_1111_1111 },
++            RelocWrite { offset: 1000, width: 8, value: 0x2222_2222_2222_2222 },
++            RelocWrite { offset: 8,    width: 8, value: 0x3333_3333_3333_3333 },
++            RelocWrite { offset: 1008, width: 8, value: 0x4444_4444_4444_4444 },
++        ];
++        let mut a = vec![0u8; 2048];
++        let mut b = vec![0u8; 2048];
++        apply_writes_serial(&mut a, &writes);
++        apply_writes_parallel(&mut b, &writes, 2);
++        assert_eq!(a, b);
++    }
++
++    /// Overlapping writes must be applied in list order (last writer wins),
++    /// which requires an overlapping cluster never to be split across workers.
++    #[test]
++    fn overlapping_writes_preserve_last_writer_wins() {
++        let writes = vec![
++            RelocWrite { offset: 0, width: 8, value: 0xffff_ffff_ffff_ffff },
++            RelocWrite { offset: 0, width: 4, value: 0x0000_0001 },
++            RelocWrite { offset: 2, width: 4, value: 0x0000_0002 },
++            RelocWrite { offset: 1, width: 2, value: 0x0003 },
++        ];
++        for threads in [1usize, 2, 3, 4, 8] {
++            let mut a = vec![0u8; 64];
++            let mut b = vec![0u8; 64];
++            apply_writes_serial(&mut a, &writes);
++            apply_writes_parallel(&mut b, &writes, threads);
++            assert_eq!(a, b, "thread count {threads} diverged from serial");
++        }
++    }
++
++    /// Out-of-range writes must be skipped, never written and never panic.
++    /// The old code only had a `debug_assert!`, so a release build turned a
++    /// bad offset into an out-of-bounds store.
++    #[test]
++    fn out_of_range_writes_are_skipped_not_written() {
++        let writes = vec![
++            RelocWrite { offset: 0,  width: 8, value: 0xaaaa_aaaa_aaaa_aaaa },
++            RelocWrite { offset: 60, width: 8, value: 0xbbbb_bbbb_bbbb_bbbb }, // 60+8 > 64
++            RelocWrite { offset: 64, width: 1, value: 0xcc },                  // at end
++            RelocWrite { offset: usize::MAX, width: 8, value: 0xdd },          // wraps
++            RelocWrite { offset: 16, width: 4, value: 0x1234_5678 },
++        ];
++        for threads in [1usize, 2, 4] {
++            let mut a = vec![0u8; 64];
++            let mut b = vec![0u8; 64];
++            apply_writes_serial(&mut a, &writes);
++            apply_writes_parallel(&mut b, &writes, threads);
++            assert_eq!(a, b, "thread count {threads}");
++            assert_eq!(&a[0..8], &0xaaaa_aaaa_aaaa_aaaau64.to_le_bytes());
++            assert_eq!(&a[16..20], &0x1234_5678u32.to_le_bytes());
++            assert!(a[56..64].iter().all(|&x| x == 0), "clobbered past-end region");
++        }
++    }
++
++    /// Randomised differential test against the serial reference across a
++    /// range of densities, widths, overlap rates and thread counts. This is
++    /// the property that actually matters: for *every* input, parallel output
++    /// == serial output. A deterministic xorshift keeps it reproducible.
++    #[test]
++    fn randomised_differential_against_serial() {
++        let mut state: u64 = 0x243f_6a88_85a3_08d3;
++        let mut next = move || {
++            state ^= state << 13;
++            state ^= state >> 7;
++            state ^= state << 17;
++            state
++        };
++        const BUF: usize = 4096;
++        for round in 0..300 {
++            let n = 1 + (next() % 200) as usize;
++            // Alternate between a sparse layout and a dense/overlapping one.
++            let dense = round % 3 == 0;
++            let mut writes = Vec::with_capacity(n);
++            for _ in 0..n {
++                let width = [1u8, 2, 4, 8][(next() % 4) as usize];
++                let offset = if dense {
++                    (next() % 64) as usize
++                } else {
++                    (next() % (BUF as u64 + 16)) as usize
++                };
++                writes.push(RelocWrite { offset, width, value: next() });
++            }
++            let threads = 1 + (next() % 8) as usize;
++            let mut a = vec![0u8; BUF];
++            let mut b = vec![0u8; BUF];
++            apply_writes_serial(&mut a, &writes);
++            apply_writes_parallel(&mut b, &writes, threads);
++            assert_eq!(a, b, "round {round} (n={n}, threads={threads}, dense={dense})");
++        }
++    }
++
++    /// Many disjoint writes must actually be split across workers (otherwise
++    /// the "parallel" path silently degrades to serial and no speed-up is
++    /// possible).
++    ///
++    /// The partitioning decision is tested directly via `plan_partitions`
++    /// rather than through the global `PARALLEL_WRITES` counter: cargo runs
++    /// tests concurrently in one process, so any assertion on a shared
++    /// counter is racy and would flake. (It did: an earlier version of this
++    /// test read 1004 instead of 1000 because a sibling test ran in between.)
++    #[test]
++    fn disjoint_writes_are_partitioned() {
++        let writes: Vec<RelocWrite> = (0..1000)
++            .map(|i| RelocWrite { offset: i * 8, width: 8, value: i as u64 })
++            .collect();
++        let parts = plan_partitions(&writes, 4);
++        assert!(parts.len() >= 2,
++                "1000 disjoint writes must split across workers, got {} partition(s)",
++                parts.len());
++        // And the result must still equal the serial reference.
++        let mut a = vec![0u8; 8 * 1000];
++        let mut b = vec![0u8; 8 * 1000];
++        apply_writes_serial(&mut a, &writes);
++        apply_writes_parallel(&mut b, &writes, 4);
++        assert_eq!(a, b);
++    }
++
++    /// Conversely, a fully-overlapping cluster must NOT be split, because
++    /// splitting it would break last-writer-wins.
++    #[test]
++    fn overlapping_cluster_is_not_split() {
++        let writes: Vec<RelocWrite> = (0..100)
++            .map(|i| RelocWrite { offset: 0, width: 8, value: i as u64 })
++            .collect();
++        assert_eq!(plan_partitions(&writes, 8).len(), 1,
++                   "an all-overlapping cluster must stay in one partition");
++    }
+ }
+diff --git a/src/bin/lccc_ld.rs b/src/bin/lccc_ld.rs
+index ae2ea1b..4bac6e1 100644
+--- a/src/bin/lccc_ld.rs
++++ b/src/bin/lccc_ld.rs
+@@ -20,12 +20,49 @@
+ 
+ fn main() {
+     let args: Vec<String> = std::env::args().skip(1).collect();
+-    match run(&args) {
+-        Ok(()) => {}
+-        Err(e) => {
++
++    // Last line of defence against a panic on malformed input.
++    //
++    // A linker is routinely fed attacker-influenced or simply corrupt object
++    // files (truncated build artefacts, interrupted writes, bad archives).
++    // GNU ld, mold and wild all answer those with a diagnostic and exit code
++    // 1.  Without this guard a Rust panic escapes as exit code 101 plus a
++    // backtrace note, which build systems report as an internal toolchain
++    // failure and which hides the offending file from the user.
++    //
++    // The panic hook is replaced so the default "thread panicked at ..."
++    // spew is suppressed, and the payload is rendered in GNU style with the
++    // location that failed — enough to file a bug, not a stack dump.
++    let default_hook = std::panic::take_hook();
++    std::panic::set_hook(Box::new(move |info| {
++        if std::env::var_os("LCCC_LD_PANIC_TRACE").is_some() {
++            default_hook(info);
++        }
++    }));
++
++    let result = std::panic::catch_unwind(|| run(&args));
++
++    match result {
++        Ok(Ok(())) => {}
++        Ok(Err(e)) => {
+             eprintln!("lccc-ld: error: {}", e);
+             std::process::exit(1);
+         }
++        Err(payload) => {
++            let msg = payload
++                .downcast_ref::<&str>()
++                .map(|s| (*s).to_string())
++                .or_else(|| payload.downcast_ref::<String>().cloned())
++                .unwrap_or_else(|| "unknown panic".to_string());
++            eprintln!("lccc-ld: internal error: {}", msg);
++            eprintln!(
++                "lccc-ld: this is a bug; re-run with LCCC_LD_PANIC_TRACE=1 \
++                 (and RUST_BACKTRACE=1) for details"
++            );
++            // Exit 1, like every other linker rejecting an input, so build
++            // systems surface the file rather than an internal-error code.
++            std::process::exit(1);
++        }
+     }
+ }
+ 
+@@ -83,7 +120,14 @@ fn run(args: &[String]) -> Result<(), String> {
+                     passthrough.push(format!("--entry={}", e));
+                 }
+             }
+-            "-Map" => { i += 1; }
++            "-Map" => {
++                // Two-argument form: `-Map FILE`. Re-spell as the joined form
++                // so the shared parser handles both identically.
++                i += 1;
++                if let Some(v) = args.get(i) {
++                    passthrough.push(format!("-Map={}", v));
++                }
++            }
+             "--dynamic-linker" | "-dynamic-linker" | "-I" => {
+                 // The builtin emitter hardwires the standard glibc interp
+                 // path; accept and verify rather than silently diverging.
+@@ -122,8 +166,10 @@ fn run(args: &[String]) -> Result<(), String> {
+                 } else if let Some(v) = a.strip_prefix("--entry=") {
+                     entry_override = Some(v.to_string());
+                     passthrough.push(a.to_string());
+-                } else if let Some(v) = a.strip_prefix("-Map=") {
+-                    let _ = v;
++                } else if a.starts_with("-Map=") {
++                    // Forwarded verbatim; parse_linker_args understands it and
++                    // emit_exec writes the map after address assignment.
++                    passthrough.push(a.to_string());
+                 } else if a.starts_with("--dynamic-linker=") {
+                     // handled above for the two-arg form; same policy here
+                 } else if a.starts_with("-L") {
+diff --git a/tests/linker/real_workloads.py b/tests/linker/real_workloads.py
+new file mode 100755
+index 0000000..34134e7
+--- /dev/null
++++ b/tests/linker/real_workloads.py
+@@ -0,0 +1,346 @@
++#!/usr/bin/env python3
++"""Real-workload differential linker test: expat, zlib-ng, gzip.
++
++Why this exists
++===============
++Synthetic fixtures exercise one linker feature at a time.  Real projects
++exercise the *combinations* that actually break linkers: `-ffunction-sections`
++plus `--gc-sections`, hidden visibility, weak aliases, constructors, archive
++member selection, PLT/GOT through libc, `.eh_frame` from `-fexceptions`,
++COMDAT groups, and a symbol table with thousands of entries.
++
++Contract per workload
++---------------------
++For each linker (lccc, bfd, mold, wild) we link the *same* set of object
++files, then **run the resulting program against a real input and compare the
++output byte-for-byte**.  A linker passes only if its binary behaves
++identically to the reference.  Sizes and link times are reported alongside,
++but correctness is the gate: a smaller or faster wrong binary fails.
++
++The object files are produced once by the system compiler, so the generated
++code is held constant and only the linker varies.
++
++Usage:
++    tests/linker/real_workloads.py [--workloads DIR] [--filter NAME] [-v]
++"""
++
++import argparse
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++REPO = os.path.dirname(os.path.dirname(HERE))
++DEFAULT_LD = os.environ.get(
++    "LCCC_LD", os.path.join(REPO, "target", "release", "lccc-ld"))
++WORKLOADS = os.environ.get("LCCC_WORKLOADS", "/home/user/workloads")
++CC = os.environ.get("LINKTEST_CC", "gcc")
++
++
++def sh(cmd, cwd=None, timeout=300, stdin=None):
++    return subprocess.run(cmd, cwd=cwd, timeout=timeout, input=stdin,
++                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++
++
++class Result:
++    def __init__(self, name, status, detail=""):
++        self.name, self.status, self.detail = name, status, detail
++
++
++def gcc_link_driver(ld_path):
++    """Return a gcc argv prefix that forces gcc to use `ld_path`.
++
++    Using gcc as the front end (rather than invoking the linker bare) is what
++    real build systems do: it supplies crt1.o/crti.o/crtn.o, the libc search
++    paths and --dynamic-linker.  `-B<dir>` makes gcc pick up a directory that
++    contains an executable named `ld`.
++    """
++    d = tempfile.mkdtemp(prefix="ldshim.")
++    link = os.path.join(d, "ld")
++    os.symlink(os.path.abspath(ld_path), link)
++    return ["-B" + d], d
++
++
++# ---------------------------------------------------------------------------
++# workload definitions
++# ---------------------------------------------------------------------------
++
++class Workload:
++    """One real program to link and then exercise."""
++
++    def __init__(self, name, root, objects, extra_ldflags=None,
++                 make_input=None, run=None, note=""):
++        self.name = name
++        self.root = root
++        self.objects = objects          # paths relative to root
++        self.extra_ldflags = extra_ldflags or []
++        self.make_input = make_input    # callable(td) -> None
++        self.run = run                  # callable(binary, td) -> bytes
++        self.note = note
++
++
++def _expat_input(td):
++    with open(os.path.join(td, "in.xml"), "w") as f:
++        f.write('<?xml version="1.0"?>\n<root attr="v">\n')
++        for i in range(500):
++            f.write(f'  <item id="{i}"><name>n{i}</name><val>{i*7}</val></item>\n')
++        f.write("</root>\n")
++    # A deliberately malformed document: the parser must report an error at a
++    # specific line/column, which only works if the real parser tables linked.
++    with open(os.path.join(td, "bad.xml"), "w") as f:
++        f.write('<?xml version="1.0"?>\n<root>\n  <unclosed>\n</root>\n')
++
++
++def _expat_run(binary, td):
++    """Exercise xmlwf on a valid and an invalid document.
++
++    Two calls, because a linker bug that breaks the parser tables would still
++    let a "just validate" run exit 0 by doing nothing.  Requiring a *correct
++    diagnostic* on malformed input proves the parser really ran.
++
++    `-d DIR` is deliberately not used: it makes xmlwf rewrite the input in
++    place, which destroyed the fixture and made every linker look equally
++    broken ("no element found") in an earlier version of this harness.
++    """
++    good = os.path.join(td, "in.xml")
++    bad = os.path.join(td, "bad.xml")
++    r1 = sh([binary, good], cwd=td, timeout=60)
++    r2 = sh([binary, bad], cwd=td, timeout=60)
++    # -c echoes the parsed document, which makes the parser's output itself
++    # part of the comparison rather than only its exit status.
++    r3 = sh([binary, "-c", good], cwd=td, timeout=60)
++    import hashlib
++    digest = hashlib.sha256(r3.stdout).hexdigest()[:16]
++    return b"valid_rc=%d valid_err=%s | invalid_rc=%d invalid_err=%s | echo=%s" % (
++        r1.returncode, r1.stdout.strip()[:80],
++        r2.returncode, (r2.stdout.strip() or r2.stderr.strip())[:80],
++        digest.encode())
++
++
++def _gzip_input(td):
++    data = (b"the quick brown fox jumps over the lazy dog 0123456789\n" * 2000)
++    with open(os.path.join(td, "in.txt"), "wb") as f:
++        f.write(data)
++
++
++def _gzip_run(binary, td):
++    src = os.path.join(td, "in.txt")
++    r1 = sh([binary, "-c", "-9", src], cwd=td, timeout=60)
++    if r1.returncode != 0:
++        return b"compress-failed rc=%d %s" % (r1.returncode, r1.stderr[:200])
++    r2 = sh([binary, "-d", "-c"], cwd=td, timeout=60, stdin=r1.stdout)
++    original = open(src, "rb").read()
++    ok = (r2.returncode == 0 and r2.stdout == original)
++    # Report the compressed size too: a linker bug that silently drops an
++    # optimised code path would still round-trip but change the output size.
++    return b"roundtrip=%s csize=%d" % (b"ok" if ok else b"BROKEN", len(r1.stdout))
++
++
++def discover(workload_dir):
++    wls = []
++
++    # ---- expat / xmlwf -----------------------------------------------------
++    expat = None
++    for d in sorted(os.listdir(workload_dir)) if os.path.isdir(workload_dir) else []:
++        if d.startswith("expat-"):
++            expat = os.path.join(workload_dir, d)
++    if expat:
++        objs = [
++            "xmlwf/xmlwf-xmlwf.o", "xmlwf/xmlwf-xmlfile.o",
++            "xmlwf/xmlwf-codepage.o", "xmlwf/xmlwf-unixfilemap.o",
++            "lib/.libs/xmlparse.o", "lib/.libs/xmlrole.o", "lib/.libs/xmltok.o",
++        ]
++        if all(os.path.exists(os.path.join(expat, o)) for o in objs):
++            wls.append(Workload(
++                "expat_xmlwf", expat, objs,
++                make_input=_expat_input, run=_expat_run,
++                note="XML parser + CLI: hidden visibility, tables, "
++                     "-ffunction-sections"))
++
++    # ---- gzip --------------------------------------------------------------
++    gz = None
++    for d in sorted(os.listdir(workload_dir)) if os.path.isdir(workload_dir) else []:
++        if d.startswith("gzip-"):
++            gz = os.path.join(workload_dir, d)
++    if gz:
++        objs = [f for f in sorted(os.listdir(gz)) if f.endswith(".o")]
++        libgz = os.path.join(gz, "lib", "libgzip.a")
++        if objs and os.path.exists(libgz):
++            wls.append(Workload(
++                "gzip", gz, objs + ["lib/libgzip.a"],
++                make_input=_gzip_input, run=_gzip_run,
++                note="compressor: gnulib archive, ctors, many TUs"))
++
++    # ---- zlib-ng (static lib -> test program) -----------------------------
++    zng = None
++    for d in sorted(os.listdir(workload_dir)) if os.path.isdir(workload_dir) else []:
++        if d.startswith("zlib-ng-"):
++            zng = os.path.join(workload_dir, d)
++    if zng:
++        lib = os.path.join(zng, "build", "libz.a")
++        if not os.path.exists(lib):
++            lib = os.path.join(zng, "build", "libz-ng.a")
++        if os.path.exists(lib):
++            wls.append(Workload(
++                "zlib_ng", zng, [os.path.relpath(lib, zng)],
++                make_input=_zng_input, run=_zng_run,
++                note="deflate/inflate static archive: CPU-dispatch, "
++                     "many archive members"))
++    return wls
++
++
++ZNG_DRIVER = r"""
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#include <zlib.h>
++int main(void) {
++    static unsigned char src[262144];
++    for (size_t i = 0; i < sizeof src; i++)
++        src[i] = (unsigned char)((i * 31 + (i >> 5)) & 0xff);
++    uLongf clen = compressBound(sizeof src);
++    unsigned char *comp = malloc(clen);
++    if (compress2(comp, &clen, src, sizeof src, 9) != Z_OK) {
++        puts("compress failed"); return 1;
++    }
++    static unsigned char back[262144];
++    uLongf blen = sizeof back;
++    if (uncompress(back, &blen, comp, clen) != Z_OK) {
++        puts("uncompress failed"); return 1;
++    }
++    if (blen != sizeof src || memcmp(src, back, blen) != 0) {
++        puts("ROUNDTRIP MISMATCH"); return 1;
++    }
++    printf("roundtrip=ok csize=%lu crc=%08lx\n",
++           (unsigned long)clen,
++           (unsigned long)crc32(0L, src, sizeof src));
++    return 0;
++}
++"""
++
++
++def _zng_input(td):
++    with open(os.path.join(td, "zdrv.c"), "w") as f:
++        f.write(ZNG_DRIVER)
++
++
++def _zng_run(binary, td):
++    r = sh([binary], cwd=td, timeout=120)
++    return b"rc=%d|%s" % (r.returncode, r.stdout.strip())
++
++
++# ---------------------------------------------------------------------------
++# driver
++# ---------------------------------------------------------------------------
++
++def run_workload(wl, linkers, args):
++    td = tempfile.mkdtemp(prefix=f"rw.{wl.name}.")
++    shims = []
++    try:
++        if wl.make_input:
++            wl.make_input(td)
++
++        inputs = [os.path.join(wl.root, o) for o in wl.objects]
++        missing = [i for i in inputs if not os.path.exists(i)]
++        if missing:
++            return [Result(wl.name, "SKIP", f"missing objects: {missing[:2]}")]
++
++        # zlib-ng needs its driver compiled against the built headers.
++        if wl.name == "zlib_ng":
++            inc = os.path.join(wl.root, "build")
++            r = sh([CC, "-c", "-O2", "-I", inc, "-I", wl.root,
++                    "zdrv.c", "-o", "zdrv.o"], cwd=td)
++            if r.returncode != 0:
++                return [Result(wl.name, "SKIP",
++                               f"driver compile failed: {r.stderr.decode()[:200]}")]
++            inputs = [os.path.join(td, "zdrv.o")] + inputs
++
++        results, outputs = [], {}
++        for lname, ldpath in linkers:
++            out = os.path.join(td, f"bin.{lname}")
++            if ldpath is None:                      # system default (bfd)
++                pre = []
++            else:
++                pre, shimdir = gcc_link_driver(ldpath)
++                shims.append(shimdir)
++            cmd = [CC] + pre + inputs + ["-o", out] + wl.extra_ldflags
++            t0 = time.perf_counter()
++            r = sh(cmd, cwd=td, timeout=600)
++            dt = time.perf_counter() - t0
++            if r.returncode != 0 or not os.path.exists(out):
++                results.append(Result(f"{wl.name}[{lname}]", "LINK-FAIL",
++                                      r.stderr.decode(errors="replace")[:300]))
++                continue
++
++            behaviour = wl.run(out, td) if wl.run else b""
++            outputs[lname] = behaviour
++            size = os.path.getsize(out)
++            results.append(Result(
++                f"{wl.name}[{lname}]", "OK",
++                f"{dt*1e3:7.1f} ms  {size/1024:8.1f} KiB  {behaviour.decode(errors='replace')[:70]}"))
++
++        # differential comparison against the reference linker
++        if "bfd" in outputs and "lccc" in outputs:
++            if outputs["lccc"] != outputs["bfd"]:
++                results.append(Result(
++                    f"{wl.name}:DIFFERENTIAL", "FAIL",
++                    f"lccc behaviour {outputs['lccc'][:120]!r} != "
++                    f"bfd {outputs['bfd'][:120]!r}"))
++            else:
++                results.append(Result(f"{wl.name}:DIFFERENTIAL", "PASS",
++                                      "lccc binary behaves identically to bfd's"))
++        return results
++    except Exception as e:
++        return [Result(wl.name, "FAIL", f"harness exception: {e!r}")]
++    finally:
++        for d in shims:
++            shutil.rmtree(d, ignore_errors=True)
++        if not args.keep:
++            shutil.rmtree(td, ignore_errors=True)
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--lccc-ld", default=DEFAULT_LD)
++    ap.add_argument("--workloads", default=WORKLOADS)
++    ap.add_argument("--filter", default="")
++    ap.add_argument("--keep", action="store_true")
++    ap.add_argument("-v", "--verbose", action="store_true")
++    args = ap.parse_args()
++
++    linkers = [("lccc", args.lccc_ld), ("bfd", shutil.which("ld.bfd"))]
++    for n, e in (("mold", "mold"), ("wild", "wild")):
++        p = shutil.which(e)
++        if p:
++            linkers.append((n, p))
++    linkers = [(n, p) for n, p in linkers if p]
++
++    wls = discover(args.workloads)
++    if not wls:
++        print(f"no built workloads found under {args.workloads}")
++        return 0
++
++    print("linkers: " + ", ".join(n for n, _ in linkers))
++    all_results = []
++    for wl in wls:
++        if args.filter and args.filter not in wl.name:
++            continue
++        print(f"\n### {wl.name} — {wl.note}")
++        for r in run_workload(wl, linkers, args):
++            all_results.append(r)
++            if r.status != "OK" or args.verbose:
++                print(f"  [{r.status}] {r.name}" + (f"  {r.detail}" if r.detail else ""))
++            else:
++                print(f"  [ OK ] {r.name}  {r.detail}")
++
++    nfail = sum(1 for r in all_results if r.status in ("FAIL", "LINK-FAIL"))
++    npass = sum(1 for r in all_results if r.status in ("OK", "PASS"))
++    print(f"\n== real workloads: {npass} ok, {nfail} fail ==")
++    return 1 if nfail else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/linker/run_linker_tests.py b/tests/linker/run_linker_tests.py
+index d8f4bce..ea93c0e 100755
+--- a/tests/linker/run_linker_tests.py
++++ b/tests/linker/run_linker_tests.py
+@@ -24,6 +24,7 @@ Usage:
+ 
+ import argparse
+ import os
++import re
+ import shutil
+ import subprocess
+ import sys
+@@ -1551,6 +1552,559 @@ REL_TESTS = [
+      "42\n"),
+ ]
+ 
++# ============================================================================
++# ROBUSTNESS: malformed / hostile ELF inputs
++# ============================================================================
++#
++# A linker is routinely handed corrupt objects: interrupted builds, truncated
++# artefacts on a full disk, bad NFS writes, or deliberately hostile input in a
++# distro build service.  The contract is:
++#
++#     reject with a clear diagnostic and a normal error exit  --  never
++#     panic, never abort in the allocator, never read out of bounds, never
++#     loop forever.
++#
++# Every case below is a *surgical* mutation of one field in a real object file
++# (not a random smash), so the test states precisely which invariant is under
++# test.  Cases marked `found_by_fuzzing` are regressions for defects an actual
++# mutation-fuzzing campaign found in this linker.
++#
++# Note on oracles: bfd and mold silently *accept* several of these (mold even
++# segfaults on the truncated-section case, exit 139), so they cannot serve as
++# a pass/fail oracle here.  The invariant is lccc-internal and absolute:
++# a controlled rejection, i.e. exit code 1 with a diagnostic, or a successful
++# link -- but never a crash, an abort, or a hang.
++
++ROBUSTNESS_SRC = r"""
++static char msg[16] = "hi\n";
++static int table[8] = {1,2,3,4,5,6,7,8};
++int helper(int x) { return x * 3 + table[x & 7]; }
++static long wr(long fd, const void *b, long n) {
++    long r; __asm__ volatile("syscall" : "=a"(r) : "a"(1),"D"(fd),"S"(b),"d"(n)
++                             : "rcx","r11","memory"); return r;
++}
++void _start(void) {
++    wr(1, msg, 3);
++    long code = helper(5);
++    __asm__ volatile("syscall" :: "a"(60), "D"(code));
++    __builtin_unreachable();
++}
++"""
++
++def _u16(b, off):  return int.from_bytes(b[off:off+2], "little")
++def _u32(b, off):  return int.from_bytes(b[off:off+4], "little")
++def _u64(b, off):  return int.from_bytes(b[off:off+8], "little")
++def _pu16(b, off, v): b[off:off+2] = (v & 0xffff).to_bytes(2, "little")
++def _pu32(b, off, v): b[off:off+4] = (v & 0xffffffff).to_bytes(4, "little")
++def _pu64(b, off, v): b[off:off+8] = (v & 0xffffffffffffffff).to_bytes(8, "little")
++
++def _shdr(b, i):
++    """Return the file offset of section header `i`."""
++    return _u64(b, 40) + i * _u16(b, 58)
++
++def _find_section(b, name):
++    """Return index of the section whose name is `name`, or None."""
++    shoff, shentsize, shnum = _u64(b, 40), _u16(b, 58), _u16(b, 60)
++    shstrndx = _u16(b, 62)
++    stro = _u64(b, shoff + shstrndx * shentsize + 24)
++    for i in range(shnum):
++        nameo = stro + _u32(b, shoff + i * shentsize)
++        end = b.index(b"\0", nameo)
++        if b[nameo:end].decode() == name:
++            return i
++    return None
++
++# --- the mutations -----------------------------------------------------------
++# Each entry: (case name, mutator(bytearray) -> None, note)
++
++def _m_addralign_not_pow2(b):
++    """sh_addralign = 0xffffffffff violates the ELF gABI (must be 0 or 2^n).
++
++    The layout engine aligns the section address up to that value, demanding a
++    ~1 TiB output buffer; the process then died with
++    'memory allocation of 1099511627796 bytes failed' (SIGABRT), which
++    catch_unwind cannot intercept.  wild rejects this input; bfd and mold
++    silently accept it.  found_by_fuzzing
++    """
++    i = _find_section(b, ".data.msg") or 1
++    _pu64(b, _shdr(b, i) + 48, 0xffffffffff)
++
++def _m_section_offset_wraps(b):
++    """sh_offset near u64::MAX makes the naive check `off + size <= len` wrap.
++
++    The guard then passes and the slice panics with
++    'range start index 18446744073692774483 out of range'.  found_by_fuzzing
++    """
++    i = _find_section(b, ".text._start") or 1
++    _pu64(b, _shdr(b, i) + 24, (1 << 64) - 0x2000)
++    _pu64(b, _shdr(b, i) + 32, 0x4000)
++
++def _m_section_size_huge(b):
++    """sh_size far beyond the file: must be a bounds error, not a huge read."""
++    i = _find_section(b, ".text._start") or 1
++    _pu64(b, _shdr(b, i) + 32, 0xffff_ffff_0000)
++
++def _m_shoff_beyond_eof(b):
++    """e_shoff points past the end of the file."""
++    _pu64(b, 40, len(b) + 0x100000)
++
++def _m_shentsize_zero(b):
++    """e_shentsize = 0 makes every section header alias header 0."""
++    _pu16(b, 58, 0)
++
++def _m_shnum_huge(b):
++    """e_shnum claims 65535 sections in a file that has ~18."""
++    _pu16(b, 60, 0xffff)
++
++def _m_shstrndx_oob(b):
++    """e_shstrndx indexes a section that does not exist."""
++    _pu16(b, 62, 0xfffe)
++
++def _m_symtab_link_oob(b):
++    """.symtab sh_link points at a non-existent string table."""
++    i = _find_section(b, ".symtab")
++    if i is not None:
++        _pu32(b, _shdr(b, i) + 40, 0xfffe)
++
++def _m_sym_name_oob(b):
++    """A symbol's st_name indexes far outside .strtab."""
++    i = _find_section(b, ".symtab")
++    if i is not None:
++        symoff = _u64(b, _shdr(b, i) + 24)
++        _pu32(b, symoff + 24 * 2, 0xffff_fff0)   # symbol #2
++
++def _m_sym_shndx_oob(b):
++    """A symbol claims membership in a section index that does not exist."""
++    i = _find_section(b, ".symtab")
++    if i is not None:
++        symoff = _u64(b, _shdr(b, i) + 24)
++        _pu16(b, symoff + 24 * 2 + 6, 0xfff0)
++
++def _m_reloc_sym_idx_oob(b):
++    """r_info symbol index points past the end of .symtab."""
++    i = _find_section(b, ".rela.text._start")
++    if i is not None:
++        ro = _u64(b, _shdr(b, i) + 24)
++        _pu32(b, ro + 8 + 4, 0xffff)     # high half of r_info = sym index
++
++def _m_reloc_offset_oob(b):
++    """r_offset lies outside the section the relocation applies to."""
++    i = _find_section(b, ".rela.text._start")
++    if i is not None:
++        ro = _u64(b, _shdr(b, i) + 24)
++        _pu64(b, ro, 0xffff_ffff_0000)
++
++def _m_reloc_type_unknown(b):
++    """An x86-64 relocation type the linker does not implement."""
++    i = _find_section(b, ".rela.text._start")
++    if i is not None:
++        ro = _u64(b, _shdr(b, i) + 24)
++        _pu32(b, ro + 8, 250)
++
++def _m_truncated_file(b):
++    """The file ends in the middle of the section header table."""
++    del b[len(b) // 2:]
++
++def _m_rela_info_target_oob(b):
++    """A SHT_RELA section's sh_info names a section that does not exist."""
++    i = _find_section(b, ".rela.text._start")
++    if i is not None:
++        _pu32(b, _shdr(b, i) + 44, 0xfffe)
++
++MALFORMED_CASES = [
++    ("malformed_addralign_not_power_of_two", _m_addralign_not_pow2),
++    ("malformed_section_offset_wraps_u64",   _m_section_offset_wraps),
++    ("malformed_section_size_huge",          _m_section_size_huge),
++    ("malformed_shoff_beyond_eof",           _m_shoff_beyond_eof),
++    ("malformed_shentsize_zero",             _m_shentsize_zero),
++    ("malformed_shnum_huge",                 _m_shnum_huge),
++    ("malformed_shstrndx_out_of_range",      _m_shstrndx_oob),
++    ("malformed_symtab_link_out_of_range",   _m_symtab_link_oob),
++    ("malformed_symbol_name_out_of_range",   _m_sym_name_oob),
++    ("malformed_symbol_shndx_out_of_range",  _m_sym_shndx_oob),
++    ("malformed_reloc_sym_idx_out_of_range", _m_reloc_sym_idx_oob),
++    ("malformed_reloc_offset_out_of_range",  _m_reloc_offset_oob),
++    ("malformed_reloc_type_unknown",         _m_reloc_type_unknown),
++    ("malformed_rela_info_target_oob",       _m_rela_info_target_oob),
++    ("malformed_truncated_file",             _m_truncated_file),
++]
++
++def _robustness_tests(args, _oracles):
++    """Link each mutated object with lccc-ld and assert controlled behaviour."""
++    out = []
++    td = tempfile.mkdtemp(prefix="lnk.robust.")
++    ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
++    try:
++        if not os.path.exists(ld):
++            return [Result("robustness", "SKIP", f"{ld} not built")]
++        with open(os.path.join(td, "r.c"), "w") as f:
++            f.write(ROBUSTNESS_SRC)
++        r = sh([CC, "-c", "-O1", "-ffunction-sections", "-fdata-sections",
++                "r.c", "-o", "r.o"], cwd=td)
++        if r.returncode != 0:
++            return [Result("robustness", "SKIP",
++                           f"fixture compile failed: {r.stderr.decode()[:200]}")]
++        pristine = bytearray(open(os.path.join(td, "r.o"), "rb").read())
++
++        # Sanity: the pristine fixture must link and run, otherwise the
++        # mutations would be testing a failure that is not theirs.
++        base = os.path.join(td, "base.out")
++        r = sh([ld, "-o", base, "r.o"], cwd=td)
++        if r.returncode != 0:
++            return [Result("robustness", "SKIP",
++                           f"pristine fixture does not link: {r.stderr.decode()[:200]}")]
++
++        for name, mutate in MALFORMED_CASES:
++            b = bytearray(pristine)
++            try:
++                mutate(b)
++            except Exception as e:
++                out.append(Result(name, "SKIP", f"mutator failed: {e!r}"))
++                continue
++            obj = os.path.join(td, f"{name}.o")
++            with open(obj, "wb") as f:
++                f.write(bytes(b))
++            outp = os.path.join(td, f"{name}.out")
++            try:
++                r = sh([ld, "-o", outp, obj], cwd=td, timeout=25)
++            except subprocess.TimeoutExpired:
++                out.append(Result(name, "FAIL", "linker hung (>25s) on malformed input"))
++                continue
++
++            rc = r.returncode
++            err = (r.stderr.decode(errors="replace") +
++                   r.stdout.decode(errors="replace"))
++
++            if rc < 0:
++                out.append(Result(name, "FAIL",
++                    f"killed by signal {-rc} (must be a clean diagnostic)"))
++                continue
++            if rc == 101:
++                out.append(Result(name, "FAIL", f"rust panic (exit 101): {err[:300]}"))
++                continue
++            for marker in ("panicked at", "memory allocation of",
++                           "index out of bounds", "unreachable",
++                           "capacity overflow", "attempt to subtract with overflow"):
++                if marker in err:
++                    out.append(Result(name, "FAIL",
++                        f"internal failure leaked ({marker!r}): {err[:300]}"))
++                    break
++            else:
++                if rc == 0:
++                    # Accepting the input is legal (bfd does for several of
++                    # these) provided the result is a well-formed file.
++                    if not os.path.exists(outp) or os.path.getsize(outp) == 0:
++                        out.append(Result(name, "FAIL",
++                            "reported success but produced no output"))
++                    else:
++                        out.append(Result(name, "PASS"))
++                elif rc == 1:
++                    if err.strip():
++                        out.append(Result(name, "PASS"))
++                    else:
++                        out.append(Result(name, "FAIL",
++                            "exit 1 with no diagnostic message"))
++                else:
++                    out.append(Result(name, "FAIL",
++                        f"unexpected exit code {rc}: {err[:300]}"))
++        return out
++    finally:
++        if not args.keep:
++            shutil.rmtree(td, ignore_errors=True)
++
++# ============================================================================
++# -Map= : link map file
++# ============================================================================
++#
++# The value of a map file is that it is *authoritative*: every address it
++# prints must be the address the linker actually emitted.  A map that is
++# merely plausible is worse than none, because it silently misleads size
++# accounting and post-mortem debugging.
++#
++# The test therefore does not compare text against GNU ld (whose layout
++# differs legitimately).  It checks the two properties that matter:
++#   1. every symbol address in the map equals that symbol's st_value in the
++#      produced ELF (ground truth read back with readelf);
++#   2. the structural GNU format is present, so existing scrapers parse it.
++
++def _map_file_test(args, _oracles):
++    td = tempfile.mkdtemp(prefix="lnk.mapfile.")
++    ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
++    try:
++        if not os.path.exists(ld):
++            return Result("map_file_matches_binary", "SKIP", "lccc-ld not built")
++        if not shutil.which("readelf"):
++            return Result("map_file_matches_binary", "SKIP", "readelf not available")
++
++        with open(os.path.join(td, "m.c"), "w") as f:
++            f.write(ROBUSTNESS_SRC)
++        with open(os.path.join(td, "extra.c"), "w") as f:
++            f.write("int extra_a = 1; int extra_b = 2;\n"
++                    "int extra_fn(int x){ return x + extra_a + extra_b; }\n")
++        r = sh([CC, "-c", "-O1", "-ffunction-sections", "-fdata-sections",
++                "m.c", "extra.c"], cwd=td)
++        if r.returncode != 0:
++            return Result("map_file_matches_binary", "SKIP",
++                          f"fixture compile failed: {r.stderr.decode()[:200]}")
++
++        out = os.path.join(td, "a.out")
++        mp = os.path.join(td, "a.map")
++        r = sh([ld, "-Map=" + mp, "-o", out, "m.o", "extra.o"], cwd=td)
++        if r.returncode != 0:
++            return Result("map_file_matches_binary", "FAIL",
++                          f"link failed: {r.stderr.decode()[:300]}")
++        if not os.path.exists(mp):
++            return Result("map_file_matches_binary", "FAIL",
++                          "-Map= produced no file")
++
++        text = open(mp).read()
++        for needed in ("Memory Configuration", "Linker script and memory map"):
++            if needed not in text:
++                return Result("map_file_matches_binary", "FAIL",
++                              f"map lacks GNU section {needed!r}")
++
++        # map: lines of the form "        0xADDR        name"
++        map_syms = {}
++        for line in text.splitlines():
++            m = re.match(r"\s+0x([0-9a-f]{16})\s+(\S+)\s*$", line)
++            if m:
++                map_syms[m.group(2)] = int(m.group(1), 16)
++        if not map_syms:
++            return Result("map_file_matches_binary", "FAIL",
++                          "map contains no symbol lines")
++
++        # ground truth from the emitted binary
++        rr = sh(["readelf", "-sW", out], cwd=td)
++        elf_syms = {}
++        for line in rr.stdout.decode(errors="replace").splitlines():
++            parts = line.split()
++            if len(parts) >= 8 and re.match(r"^\d+:$", parts[0]):
++                try:
++                    elf_syms[parts[7]] = int(parts[1], 16)
++                except ValueError:
++                    pass
++
++        common = set(map_syms) & set(elf_syms)
++        if not common:
++            return Result("map_file_matches_binary", "FAIL",
++                          "no symbols shared between map and binary")
++        bad = [(k, hex(elf_syms[k]), hex(map_syms[k]))
++               for k in common if elf_syms[k] != map_syms[k]]
++        if bad:
++            return Result("map_file_matches_binary", "FAIL",
++                          f"{len(bad)}/{len(common)} map addresses disagree "
++                          f"with the binary, e.g. {bad[:3]}")
++
++        # The binary must also still work.
++        code, sout = run_bin(out, [], td)
++        if sout != "hi\n":
++            return Result("map_file_matches_binary", "FAIL",
++                          f"binary output {sout!r} != 'hi\\n'")
++        return Result("map_file_matches_binary", "PASS")
++    except Exception as e:
++        return Result("map_file_matches_binary", "FAIL", f"harness exception: {e!r}")
++    finally:
++        if not args.keep:
++            shutil.rmtree(td, ignore_errors=True)
++
++
++def _map_file_spellings_test(args, _oracles):
++    """`-Map FILE` (two-arg) must behave exactly like `-Map=FILE`."""
++    td = tempfile.mkdtemp(prefix="lnk.mapspell.")
++    ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
++    try:
++        if not os.path.exists(ld):
++            return Result("map_file_two_arg_spelling", "SKIP", "lccc-ld not built")
++        with open(os.path.join(td, "m.c"), "w") as f:
++            f.write(ROBUSTNESS_SRC)
++        r = sh([CC, "-c", "-O1", "m.c"], cwd=td)
++        if r.returncode != 0:
++            return Result("map_file_two_arg_spelling", "SKIP", "compile failed")
++        r = sh([ld, "-Map", "two.map", "-o", "a.out", "m.o"], cwd=td)
++        if r.returncode != 0:
++            return Result("map_file_two_arg_spelling", "FAIL",
++                          f"link failed: {r.stderr.decode()[:200]}")
++        p = os.path.join(td, "two.map")
++        if not os.path.exists(p) or os.path.getsize(p) == 0:
++            return Result("map_file_two_arg_spelling", "FAIL",
++                          "-Map FILE produced no map")
++        return Result("map_file_two_arg_spelling", "PASS")
++    finally:
++        if not args.keep:
++            shutil.rmtree(td, ignore_errors=True)
++
++
++# ============================================================================
++# SEGMENT PACKING: congruence + no wasted pages
++# ============================================================================
++#
++# A PT_LOAD segment's file offset does NOT have to be page-aligned; the ELF
++# gABI only requires p_offset === p_vaddr (mod p_align), because mmap maps
++# p_offset rounded down to a page onto p_vaddr rounded down to a page.
++#
++# Rounding the *file offset* up to a page at every segment boundary wastes up
++# to one page per segment.  It cost this linker 12 288 bytes on a small
++# zlib-ng binary (20 640 vs 8 352 after the fix; bfd 16 400, mold 9 808,
++# wild 6 773).
++#
++# These tests lock in both halves of the property:
++#   1. congruence holds for every PT_LOAD (else the loader maps garbage);
++#   2. inter-segment file padding stays small (else the regression is back);
++#   3. RELRO still ends on a page boundary in *address* space, so ld.so's
++#      mprotect cannot spill into the following page.
++
++def _parse_phdrs(binary):
++    r = sh(["readelf", "-lW", binary])
++    out = r.stdout.decode(errors="replace")
++    seg = []
++    for m in re.finditer(
++            r"^\s+(LOAD|GNU_RELRO|DYNAMIC|PHDR|INTERP|TLS)\s+"
++            r"0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+0x[0-9a-f]+\s+"
++            r"0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+(\S+)\s+0x([0-9a-f]+)",
++            out, re.M):
++        t, off, va, fsz, msz, flags, align = m.groups()
++        seg.append({"type": t, "off": int(off, 16), "vaddr": int(va, 16),
++                    "filesz": int(fsz, 16), "memsz": int(msz, 16),
++                    "flags": flags.strip(), "align": int(align, 16)})
++    return seg
++
++
++def _segment_packing_test(args, _oracles):
++    td = tempfile.mkdtemp(prefix="lnk.segpack.")
++    ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
++    out = []
++    try:
++        if not shutil.which("readelf"):
++            return [Result("segment_packing", "SKIP", "readelf not available")]
++
++        # A program with distinct RX / R / RW content, linked dynamically so
++        # RELRO and .dynamic are present.
++        with open(os.path.join(td, "s.c"), "w") as f:
++            f.write("""
++                #include <stdio.h>
++                const char rodata_blob[4096] = "ro";
++                char rw_blob[4096] = {1};
++                static char bss_blob[8192];
++                int helper(int x){ return x + rw_blob[0] + rodata_blob[0]; }
++                int main(void){
++                    bss_blob[0] = 3;
++                    printf("%d\\n", helper(1) + bss_blob[0]);
++                    return 0;
++                }
++            """)
++        r = sh([CC, "-c", "-O1", "s.c"], cwd=td)
++        if r.returncode != 0:
++            return [Result("segment_packing", "SKIP", "fixture compile failed")]
++
++        shim = os.path.join(td, "shim")
++        os.makedirs(shim, exist_ok=True)
++        os.symlink(os.path.abspath(ld), os.path.join(shim, "ld"))
++        binp = os.path.join(td, "a.out")
++        r = sh([CC, "-B" + shim, "s.o", "-o", binp,
++                "-Wl,-z,relro", "-Wl,-z,now"], cwd=td)
++        if r.returncode != 0 or not os.path.exists(binp):
++            return [Result("segment_packing", "FAIL",
++                           f"link failed: {r.stderr.decode()[:300]}")]
++
++        # It must still run.
++        code, sout = run_bin(binp, [], td)
++        if code != 0:
++            return [Result("segment_packing", "FAIL",
++                           f"binary exited {code}: {sout!r}")]
++
++        segs = _parse_phdrs(binp)
++        loads = [s for s in segs if s["type"] == "LOAD"]
++        if not loads:
++            return [Result("segment_packing", "FAIL", "no PT_LOAD segments")]
++
++        # (1) congruence
++        bad = [s for s in loads
++               if s["align"] > 1 and (s["off"] % s["align"]) != (s["vaddr"] % s["align"])]
++        out.append(Result("segment_congruence",
++                          "FAIL" if bad else "PASS",
++                          "" if not bad else
++                          f"p_offset !== p_vaddr (mod align) for {bad}"))
++
++        # (2) no page-sized holes between consecutive LOADs
++        loads_sorted = sorted(loads, key=lambda s: s["off"])
++        worst = 0
++        for a, b in zip(loads_sorted, loads_sorted[1:]):
++            gap = b["off"] - (a["off"] + a["filesz"])
++            worst = max(worst, gap)
++        # Allow modest alignment padding, but never a whole page per segment.
++        out.append(Result("segment_no_page_padding",
++                          "PASS" if worst < 4096 else "FAIL",
++                          f"largest inter-LOAD file gap = {worst} bytes"
++                          + ("" if worst < 4096 else " (page padding regressed)")))
++
++        # (3) RELRO ends on a page boundary in ADDRESS space
++        relro = [s for s in segs if s["type"] == "GNU_RELRO"]
++        if relro:
++            r0 = relro[0]
++            end = r0["vaddr"] + r0["memsz"]
++            out.append(Result("relro_ends_on_page_boundary",
++                              "PASS" if end % 4096 == 0 else "FAIL",
++                              f"RELRO end vaddr = 0x{end:x}"))
++        else:
++            out.append(Result("relro_ends_on_page_boundary", "SKIP",
++                              "no PT_GNU_RELRO"))
++
++        # (4b) the same invariants for a SHARED LIBRARY, which goes through
++        # emit_shared.rs — an independent layout implementation that had the
++        # identical page-padding defect (19 568 B -> 7 280 B once fixed).
++        with open(os.path.join(td, "lib.c"), "w") as f:
++            f.write("int gv = 1; static int t[64] = {1};\n"
++                    "int f1(int x){ return x + gv + t[x & 63]; }\n"
++                    "int f2(int x){ return f1(x) * 2; }\n")
++        rl = sh([CC, "-c", "-O2", "-fPIC", "lib.c", "-o", "lib.o"], cwd=td)
++        if rl.returncode == 0:
++            so = os.path.join(td, "liblx.so")
++            rl = sh([CC, "-shared", "-B" + shim, "lib.o", "-o", so,
++                     "-Wl,-z,relro"], cwd=td)
++            if rl.returncode == 0 and os.path.exists(so):
++                sosegs = _parse_phdrs(so)
++                soloads = [x for x in sosegs if x["type"] == "LOAD"]
++                sobad = [x for x in soloads
++                         if x["align"] > 1
++                         and (x["off"] % x["align"]) != (x["vaddr"] % x["align"])]
++                out.append(Result("shared_lib_segment_congruence",
++                                  "FAIL" if sobad else "PASS",
++                                  "" if not sobad else f"non-congruent: {sobad}"))
++                ss = sorted(soloads, key=lambda x: x["off"])
++                sworst = 0
++                for a, b in zip(ss, ss[1:]):
++                    sworst = max(sworst, b["off"] - (a["off"] + a["filesz"]))
++                out.append(Result("shared_lib_no_page_padding",
++                                  "PASS" if sworst < 4096 else "FAIL",
++                                  f"largest inter-LOAD gap = {sworst} bytes"))
++                # It must still be loadable and correct.
++                with open(os.path.join(td, "use.c"), "w") as f:
++                    f.write("#include <stdio.h>\nextern int f2(int);\n"
++                            "int main(void){ printf(\"%d\\n\", f2(5)); return 0; }\n")
++                ru = sh([CC, "use.c", so, "-Wl,-rpath," + td, "-o", "useso"], cwd=td)
++                if ru.returncode == 0:
++                    code, sout = run_bin(os.path.join(td, "useso"), [], td)
++                    out.append(Result("shared_lib_still_loads",
++                                      "PASS" if sout == "12\n" else "FAIL",
++                                      f"output {sout!r} (expected '12')"))
++
++        # (4) not larger than GNU ld on the same input
++        bfd_bin = os.path.join(td, "a.bfd")
++        rb = sh([CC, "-fuse-ld=bfd", "s.o", "-o", bfd_bin,
++                 "-Wl,-z,relro", "-Wl,-z,now"], cwd=td)
++        if rb.returncode == 0 and os.path.exists(bfd_bin):
++            ls, bs = os.path.getsize(binp), os.path.getsize(bfd_bin)
++            out.append(Result("output_not_larger_than_bfd",
++                              "PASS" if ls <= bs * 1.05 else "FAIL",
++                              f"lccc {ls} B vs bfd {bs} B"))
++        return out
++    except Exception as e:
++        return [Result("segment_packing", "FAIL", f"harness exception: {e!r}")]
++    finally:
++        if not args.keep:
++            shutil.rmtree(td, ignore_errors=True)
++
++
+ # ============================================================================
+ # Runner
+ # ============================================================================
+@@ -1648,6 +2202,21 @@ def main():
+             "so_bsymbolic_binds_local", ["-Wl,-Bsymbolic"], "43\n"))
+         results.append(_zdefs_test(args, oracles))
+ 
++    if not args.tag or args.tag == "layout":
++        if not args.filter or "segment" in args.filter or "relro" in args.filter \
++                or "shared_lib" in args.filter \
++                or "output_not" in args.filter:
++            results.extend(_segment_packing_test(args, oracles))
++
++    if not args.tag or args.tag == "map":
++        if not args.filter or "map" in args.filter:
++            results.append(_map_file_test(args, oracles))
++            results.append(_map_file_spellings_test(args, oracles))
++
++    if not args.tag or args.tag == "robustness":
++        if not args.filter or "malformed" in args.filter or "robust" in args.filter:
++            results.extend(_robustness_tests(args, oracles))
++
+     npass = sum(1 for r in results if r.status == "PASS")
+     nfail = sum(1 for r in results if r.status == "FAIL")
+     nwarn = sum(1 for r in results if r.status == "WARN")
