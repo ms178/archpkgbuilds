@@ -1,899 +1,2202 @@
-From a2eb40f6d7e205a96bd6100b76204f53209a5166 Mon Sep 17 00:00:00 2001
+From ca549e30b72b26c0200fee2b0ecd0977556132d6 Mon Sep 17 00:00:00 2001
 From: Arena Agent <agent@arena.ai>
-Date: Tue, 18 Aug 2026 11:03:41 +0000
-Subject: [PATCH 1/4] Re-apply the five S08/S17 audit fixes lost in the
- upstream merge; fix a sixth defect the merge introduced
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+Date: Tue, 18 Aug 2026 11:33:10 +0000
+Subject: [PATCH 01/11] i686: scope never-read-store DSE per function; widen
+ folded-operand read ranges
 
-PRs #113-#116 merged the S08/S17 content from their pre-audit form.
-The five reviewer fixes from the audited branch were dropped; all five
-defects reproduced on main and are re-applied here, plus one NEW
-miscompile introduced by #116's own regparm capture:
+The i686 eliminate_never_read_stores ran over the whole module buffer:
+a read of 24(%esp) in ANY function kept a same-offset dead store alive
+in EVERY function, and the inter-function labels invalidated the linear
+ESP walk (esp_walk_ok=false) for the entire TU. The x86-64 twin was
+already per-function. Split at .cfi_endproc/.size markers, analysis and
+rewrite confined to [start,end).
 
-1. Backend scalar FMA fusion (x86 vfmadd231s{s,d}, AArch64 fmadd) now
-   respects -ffp-contract: CodegenOptions.fp_contract_fast gates
-   supports_fused_float_mul_add on both backends. Before: contract=off
-   still fused (single-rounding contract silently broken).
+Scoping exposed a latent undersizing bug: folded-operand frame reads
+(infos[i].ebp_offset from lines like 'fldl 16(%esp)') were recorded as
+4-byte reads, but x87 loads read 8 (fldl) or 10 (fldt) bytes. With the
+pass now firing inside regparm capture sequences it deleted the live
+high-dword store of a double parameter (d_i(double,int) miscompile,
+regparm3_abi_conformance bit 5 at -O1+). Folded reads are now recorded
+as 16 bytes, covering every x86 memory read that names the offset as
+its lowest address.
 
-2. Contraction default = fast (GCC gnu-C parity, verified vs gcc 14.2),
-   explicit -ffp-contract sticky against -ffast-math in both orders
-   (GCC opts_set semantics), -fno-fast-math restores the default
-   rather than forcing off. CLI tests extended to pin all four
-   configurations.
-
-3. detect_mul_add_fusions soundness: the fused sequence is emitted at
-   the Mul's program point, so Copy/Cast instructions skipped between
-   Mul and Add must not define an Add operand (post-phi
-   `Copy acc_read <- acc_phi` shape read the accumulator one iteration
-   stale). nbody -O0 printed -0.3248 on main; now -0.169075164 at all
-   opt levels.
-
-4. i686 compare immediates normalized to operand width+signedness:
-   (unsigned char)255 == (char)-1 emitted `cmpl $-1,%eax` against a
-   movzbl-extended 255 — always false. Both emit_int_cmp and the fused
-   compare-branch normalize now (mirrors operand_to_eax's extension).
-
-5. emit_avx_reduction_fma fallback staged the accumulator in ymm2 =
-   PhysReg(20), the first ALLOCATABLE SIMD register (clobber hazard
-   when the dest itself missed allocation); now reserved ymm1.
-
-6. NEW (#116): the merged "capture regparm incoming EAX/EDX/ECX" loop
-   re-captured params already saved by the phase-1/2 capture pass.
-   The second capture runs interleaved with stack-param copies that
-   stage through %eax, so it stored the STACK param's copied value
-   over the register argument: d_i(double a, int b) read b as garbage
-   at -O1+ (regparm conformance bit 5). The loop now skips
-   param_pre_stored entries.
-
-Validation: 831/831 unit, 50/50 correctness, 9/9 codegen scripts,
-regparm+cdecl ABI matrix green at -O0..-Os, nbody correct at all
-levels, contract matrix identical to gcc 14.2.
+Two unit tests pin both behaviors. Realmode boot corpus: 34491 -> 34389
+bytes (gcc 12999). 837/837 unit, 50/50 correctness, 9/9 check scripts,
+regparm conformance all levels.
 ---
- src/backend/arm/codegen/emit.rs        | 10 +++++-
- src/backend/generation.rs              | 29 ++++++++++++++++-
- src/backend/i686/codegen/comparison.rs | 27 ++++++++++++++--
- src/backend/i686/codegen/prologue.rs   | 10 ++++++
- src/backend/mod.rs                     |  6 ++++
- src/backend/x86/codegen/emit.rs        | 10 +++++-
- src/backend/x86/codegen/intrinsics.rs  | 14 ++++++---
- src/driver/cli.rs                      | 43 ++++++++++++++++++++++++--
- src/driver/pipeline.rs                 | 15 ++++++++-
- 9 files changed, 150 insertions(+), 14 deletions(-)
+ src/backend/i686/codegen/peephole.rs | 130 +++++++++++++++++++++++----
+ 1 file changed, 115 insertions(+), 15 deletions(-)
 
-diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
-index 95f6a20..898d634 100644
---- a/src/backend/arm/codegen/emit.rs
-+++ b/src/backend/arm/codegen/emit.rs
-@@ -163,6 +163,8 @@ pub(super) fn arm_invert_cond_code(cc: &str) -> &'static str {
- /// Uses AAPCS64 calling convention with stack-based allocation.
- pub struct ArmCodegen {
-     pub(crate) state: CodegenState,
-+    /// FP contraction contract; gates fmadd fusion (see supports_fused_float_mul_add).
-+    pub(super) fp_contract_fast: bool,
-     /// Frame size for the current function (needed for epilogue in terminators).
-     pub(super) current_frame_size: i64,
-     pub(super) current_return_type: IrType,
-@@ -207,6 +209,7 @@ impl ArmCodegen {
-     pub fn new() -> Self {
-         Self {
-             state: CodegenState::new(),
-+            fp_contract_fast: false,
-             current_frame_size: 0,
-             current_return_type: IrType::I64,
-             va_gp_save_offset: 0,
-@@ -249,6 +252,7 @@ impl ArmCodegen {
-         self.set_no_jump_tables(opts.no_jump_tables);
-         self.set_general_regs_only(opts.general_regs_only);
-         self.state.emit_cfi = opts.emit_cfi;
-+        self.fp_contract_fast = opts.fp_contract_fast;
-     }
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index ff7a236..b1fce63 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -2741,9 +2741,39 @@ fn try_fold_memory_operand(s: &str, load_reg: RegId, offset: i32, _size: MoveSiz
  
-     /// Get the physical register assigned to an operand (if it's a Value with a register).
-@@ -1848,7 +1852,11 @@ impl ArchCodegen for ArmCodegen {
-         self.reg_assignments.contains_key(&vid)
-     }
+ // ── Pass: Never-read store elimination ───────────────────────────────────────
  
--    fn supports_fused_float_mul_add(&self) -> bool { true }
-+    fn supports_fused_float_mul_add(&self) -> bool {
-+        // AArch64 fmadd is a contraction (single rounding); same contract
-+        // gate as x86's vfmadd231 fusion.
-+        self.fp_contract_fast
-+    }
-     fn supports_shifted_logical(&self) -> bool { true }
-     fn supports_indexed_addr(&self) -> bool { true }
-     fn supports_fused_fp_cmp_branch(&self) -> bool { true }
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index be1b717..7e83ca5 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -1049,14 +1049,32 @@ fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bo
-         }
- 
-         // Nearby Add using the mul result; allow pure Copy/Cast between.
-+        //
-+        // SOUNDNESS: the fused sequence is emitted at the MUL's program
-+        // point, i.e. BEFORE any skipped instruction executes. Skipped
-+        // Copy/Cast instructions therefore must not DEFINE any value the
-+        // Add consumes — otherwise the fusion reads the accumulator operand
-+        // before its defining copy ran (observed miscompile: `e += k*t`
-+        // where phi-web lowering emits `Copy acc_read <- acc_phi` between
-+        // the Mul and the Add; the FMA read the acc register one iteration
-+        // stale once the copy-web allocator gave acc_read an XMM home —
-+        // nbody -O0 energy() printed -0.3248 instead of -0.1691).
-         let mut add_idx = None;
-         let mut add_lhs_r = None;
-         let mut add_rhs_r = None;
-         let mut add_ty_r = None;
-+        let mut skipped_defs: [u32; 6] = [u32::MAX; 6];
-+        let mut skipped_count = 0usize;
-         let max_scan = (idx + 6).min(block.instructions.len());
-         for scan in (idx + 1)..max_scan {
-             match &block.instructions[scan] {
--                Instruction::Copy { .. } | Instruction::Cast { .. } => continue,
-+                Instruction::Copy { dest, .. } | Instruction::Cast { dest, .. } => {
-+                    if skipped_count < skipped_defs.len() {
-+                        skipped_defs[skipped_count] = dest.0;
-+                        skipped_count += 1;
-+                    }
-+                    continue;
-+                }
-                 Instruction::BinOp {
-                     op: crate::ir::reexports::IrBinOp::Add,
-                     lhs, rhs, ty, ..
-@@ -1080,6 +1098,15 @@ fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bo
-             continue;
-         }
- 
-+        // Not-yet-executed defs must not feed the Add (see SOUNDNESS above).
-+        let defined_between = |op: &Operand| {
-+            matches!(op, Operand::Value(v)
-+                if skipped_defs[..skipped_count].contains(&v.0))
-+        };
-+        if defined_between(add_lhs) || defined_between(add_rhs) {
-+            continue;
-+        }
-+
-         // Types must be compatible
-         if mul_ty != add_ty {
-             continue;
-diff --git a/src/backend/i686/codegen/comparison.rs b/src/backend/i686/codegen/comparison.rs
-index daaecda..8f601e0 100644
---- a/src/backend/i686/codegen/comparison.rs
-+++ b/src/backend/i686/codegen/comparison.rs
-@@ -103,7 +103,28 @@ impl I686Codegen {
-         self.store_eax_to(dest);
-     }
- 
--    pub(super) fn emit_int_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, _ty: IrType) {
-+    /// Normalize a compare immediate to the OPERAND's width and signedness.
-+    ///
-+    /// lhs reaches %eax via movzbl/movswl/movsbl (operand_to_eax extends
-+    /// sub-int loads to 32 bits), so the 32-bit compare is exact ONLY when
-+    /// the immediate is represented the same way the extension represents
-+    /// the operand. `(unsigned char)255 == (char)-1` miscompiled to
-+    /// `cmpl $-1, %eax` against a zero-extended 255 (i686-only; x86-64 uses
-+    /// width-matched cmpb). Truncate to the type's width, then zero- or
-+    /// sign-extend by the type's signedness — matching operand_to_eax.
-+    fn normalize_cmp_imm(imm: i64, ty: IrType) -> i64 {
-+        match ty {
-+            IrType::I8 => imm as i8 as i64,
-+            IrType::U8 => imm as u8 as i64,
-+            IrType::I16 => imm as i16 as i64,
-+            IrType::U16 => imm as u16 as i64,
-+            // I32/U32/Ptr compare as full 32-bit; U32 immediates keep their
-+            // bit pattern under the i32 print (cmpl is width-exact).
-+            _ => imm as i32 as i64,
+-/// Global pass: find stack slots that are never loaded and remove all stores to them.
++/// Find stack slots that are never loaded and remove all stores to them.
++///
++/// The analysis MUST be scoped per function (the x86-64 twin already is):
++/// the module buffer holds every function of the TU, so a read of 24(%esp)
++/// in one function would otherwise keep a dead store to 24(%esp) alive in
++/// every other function, and the label/jump between two functions makes the
++/// linear ESP walk give up (`esp_walk_ok = false`) for the whole buffer.
++/// Function extents are delimited by the `.cfi_endproc` / `.size` markers the
++/// emitter always writes (same delimiters the CFG-liveness pass keys on).
+ fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
+     let len = infos.len();
++    let mut start = 0usize;
++    for i in 0..len {
++        if infos[i].is_nop() { continue; }
++        let s = trimmed(store, &infos[i], i);
++        if s == ".cfi_endproc" || s.starts_with(".size ") {
++            eliminate_never_read_stores_range(store, infos, start, i + 1);
++            start = i + 1;
 +        }
 +    }
++    if start < len {
++        eliminate_never_read_stores_range(store, infos, start, len);
++    }
++}
 +
-+    pub(super) fn emit_int_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-         self.operand_to_eax(lhs);
-         // Constant rhs: compare against the immediate directly instead of
-         // staging it in %ecx. `movl $C,%ecx; cmpl %ecx,%eax` is 8 bytes where
-@@ -113,6 +134,7 @@ impl I686Codegen {
-         // %ecx untouched, which the register allocator relies on when it
-         // places a value in %ecx across a constant compare.
-         if let Some(imm) = Self::const_as_imm32(rhs) {
-+            let imm = Self::normalize_cmp_imm(imm, ty);
-             if imm == 0 {
-                 self.state.emit("    testl %eax, %eax");
-             } else {
-@@ -146,7 +168,7 @@ impl I686Codegen {
-         op: IrCmpOp,
-         lhs: &Operand,
-         rhs: &Operand,
--        _ty: IrType,
-+        ty: IrType,
-         true_label: &str,
-         false_label: &str,
-     ) {
-@@ -154,6 +176,7 @@ impl I686Codegen {
-         // Same immediate forms as emit_int_cmp_impl (see there for the
-         // testl flags argument); keeps %ecx clean across fused compares.
-         if let Some(imm) = Self::const_as_imm32(rhs) {
-+            let imm = Self::normalize_cmp_imm(imm, ty);
-             if imm == 0 {
-                 self.state.emit("    testl %eax, %eax");
-             } else {
-diff --git a/src/backend/i686/codegen/prologue.rs b/src/backend/i686/codegen/prologue.rs
-index 353e841..5283954 100644
---- a/src/backend/i686/codegen/prologue.rs
-+++ b/src/backend/i686/codegen/prologue.rs
-@@ -532,6 +532,16 @@ impl I686Codegen {
-             // callee-saved EBX/ESI/EDI/(EBP), so these moves cannot form an
-             // incoming-register cycle; spilled destinations are equally safe.
-             if let ParamClass::IntReg { reg_idx } = class {
-+                // The phase-1/2 capture pass above already saved this param
-+                // (param_pre_stored). Re-capturing HERE is a miscompile, not
-+                // just redundancy: this loop runs interleaved with the
-+                // stack-param copies, which stage through %eax — a second
-+                // `movl %eax, %dest` after param 0's copy writes the copied
-+                // STACK value over the already-captured register argument
-+                // (observed: d_i(double, int) read b as garbage at -O1+).
-+                if self.state.param_pre_stored.contains(&i) {
-+                    continue;
-+                }
-                 let has_alloca_slot = find_param_alloca(func, i)
-                     .and_then(|(dest, _)| self.state.get_slot(dest.0))
-                     .is_some();
-diff --git a/src/backend/mod.rs b/src/backend/mod.rs
-index 62825a0..a4e0d0f 100644
---- a/src/backend/mod.rs
-+++ b/src/backend/mod.rs
-@@ -123,6 +123,12 @@ pub(crate) struct CodegenOptions {
-     /// Requested stack boundary in bytes (16 = SysV default). i686 honours
-     /// 4/8 to shrink frames in kernel realmode code; x86-64 ignores <16.
-     pub(crate) preferred_stack_bytes: u8,
-+    /// Permit fused multiply-add contraction in BACKEND fusion (scalar
-+    /// vfmadd231s{s,d} on x86, fmadd on AArch64). The vectorizer receives the
-+    /// same contract via run_passes; both consumers must agree or
-+    /// -ffp-contract=off silently loses its single-rounding guarantee in
-+    /// whichever layer was forgotten.
-+    pub(crate) fp_contract_fast: bool,
-     /// Whether to omit the frame pointer (-fomit-frame-pointer).
-     /// When true, functions do not set up EBP as a frame pointer, freeing it
-     /// as a general register and saving prologue/epilogue instructions.
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index f8a346a..fee1d59 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -354,6 +354,9 @@ pub struct X86Codegen {
-     /// XMM saves and va_start sets fp_offset to overflow immediately.
-     pub(super) function_alignment: u32,
-     pub(super) skip_rax_setup: bool,
-+    /// FP contraction contract (-ffp-contract=fast / -ffast-math): gates the
-+    /// scalar mul+add -> vfmadd231 fusion.
-+    pub(super) fp_contract_fast: bool,
-     pub(super) no_sse: bool,
-     /// Per-function vector-constant pool: (value, byte_width) -> label.
-     /// _mm256_set1_* with a constant argument lowers to a single
-@@ -597,6 +600,7 @@ impl X86Codegen {
-             used_callee_saved: Vec::new(),
-             function_alignment: 0,
-             skip_rax_setup: false,
-+            fp_contract_fast: false,
-             no_sse: false,
-             vec_const_labels: crate::common::fx_hash::FxHashMap::default(),
-             vec_const_counter: 0,
-@@ -688,6 +692,7 @@ impl X86Codegen {
-         self.set_no_jump_tables(opts.no_jump_tables);
-         self.avx512_enabled = opts.avx512;
-         self.state.emit_cfi = opts.emit_cfi;
-+        self.fp_contract_fast = opts.fp_contract_fast;
-     }
++/// The per-function body of [`eliminate_never_read_stores`]; analyses and
++/// rewrites only `[start, end)`.
++fn eliminate_never_read_stores_range(
++    store: &LineStore,
++    infos: &mut [LineInfo],
++    start: usize,
++    end: usize,
++) {
  
-     /// Reserve (or reuse) a .rodata label holding `value` as `width` bytes for a
-@@ -3229,7 +3234,10 @@ impl ArchCodegen for X86Codegen {
-     }
+     // ── ESP-offset soundness ────────────────────────────────────────────────
+     // N(%esp) names DIFFERENT memory before and after any ESP change: a store
+@@ -2772,15 +2802,15 @@ fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
+     let mut esp_walk_ok = true;
+     let mut has_call = false;
+     let mut any_esp_read = false;
+-    let mut norm: Vec<i32> = vec![0; len]; // per-line ESP normalization (subtract from biased offset)
++    let mut norm: Vec<i32> = vec![0; end - start]; // per-line ESP normalization (subtract from biased offset)
  
-     fn supports_fused_float_mul_add(&self) -> bool {
--        true
-+        // FP contraction changes results (single rounding). Only fuse under
-+        // the explicit contract; integer mul+add fusion is unaffected (the
-+        // generation-side detector calls this only for float types).
-+        self.fp_contract_fast
-     }
+-    for i in 0..len {
++    for i in start..end {
+         if infos[i].is_nop() { continue; }
+         let s = trimmed(store, &infos[i], i);
+-        norm[i] = sp_down as i32;
++        norm[i - start] = sp_down as i32;
+         match infos[i].kind {
+-            LineKind::Push { .. } => { norm[i] = sp_down as i32; sp_down += 4; }
+-            LineKind::Pop { .. } => { any_esp_read = true; sp_down -= 4; norm[i] = sp_down as i32; }
++            LineKind::Push { .. } => { norm[i - start] = sp_down as i32; sp_down += 4; }
++            LineKind::Pop { .. } => { any_esp_read = true; sp_down -= 4; norm[i - start] = sp_down as i32; }
+             LineKind::Call => { has_call = true; }
+             LineKind::Label | LineKind::Jmp | LineKind::CondJmp => {
+                 if let Some(base) = sp_base {
+@@ -2821,7 +2851,7 @@ fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
+     // parses as ebp-domain frame slots. Those must be exempt from
+     // elimination (they write through a pointer) but do not bail the pass
+     // (no-escape discipline covers them).
+-    let ebp_is_frame = (0..len).any(|i| {
++    let ebp_is_frame = (start..end).any(|i| {
+         !infos[i].is_nop() && trimmed(store, &infos[i], i) == "movl %esp, %ebp"
+     });
  
-     fn try_lower_machinst(
-diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
-index 708936a..a09a988 100644
---- a/src/backend/x86/codegen/intrinsics.rs
-+++ b/src/backend/x86/codegen/intrinsics.rs
-@@ -3135,7 +3135,12 @@ impl X86Codegen {
-         assert!(args.len() == 5, "{} expects accumulator plus two base/offset pairs", mnemonic);
+@@ -2829,9 +2859,9 @@ fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
+     let mut read_ranges: Vec<(i32, i32)> = Vec::new();
+     let mut addr_taken = false;
  
-         let assigned = self.reg_assignments.get(&dest.0).copied().filter(|r| is_xmm_reg(*r));
--        let target = assigned.map(phys_reg_name_256).unwrap_or("ymm2");
-+        // Fallback scratch MUST come from the reserved pair (ymm0/ymm1):
-+        // ymm2 is PhysReg(20), the FIRST allocatable SIMD register — using it
-+        // as scratch clobbers whichever live value the allocator parked
-+        // there whenever this dest itself missed allocation. ymm0 carries
-+        // the A-stream load below, so the accumulator staging uses ymm1.
-+        let target = assigned.map(phys_reg_name_256).unwrap_or("ymm1");
-         let acc_same = match (&args[0], assigned) {
-             (Operand::Value(acc), Some(reg)) => {
-                 self.reg_assignments.get(&acc.0).is_some_and(|r| *r == reg)
-@@ -3173,10 +3178,9 @@ impl X86Codegen {
-             self.state.vec_last_store_reg = true;
-             self.state.vec_last_store_reg_name = Some(name);
-         } else {
--            if target != "ymm0" {
--                self.state
--                    .emit_fmt(format_args!("    vmovdqa %{}, %ymm0", target));
--            }
-+            // target is the reserved ymm1 here (assigned==None).
-+            self.state
-+                .emit_fmt(format_args!("    vmovdqa %{}, %ymm0", target));
-             self.avx_store_dest(dest);
-         }
-     }
-diff --git a/src/driver/cli.rs b/src/driver/cli.rs
-index d2c9e11..e2b6930 100644
---- a/src/driver/cli.rs
-+++ b/src/driver/cli.rs
-@@ -1142,12 +1142,21 @@ impl Driver {
-                 "-ffast-math" => {
-                     self.fast_math = true;
-                     self.fp_reassoc = true;
--                    self.fp_contract_fast = true;
-+                    // GCC: fast-math implies contract=fast only when no
-+                    // explicit -ffp-contract was given (opts_set semantics).
-+                    if !self.fp_contract_explicit {
-+                        self.fp_contract_fast = true;
-+                    }
+-    for i in 0..len {
++    for i in start..end {
+         if infos[i].is_nop() { continue; }
+-        let normalize = |off: i32| if is_esp_biased(off) { off - norm[i] } else { off };
++        let normalize = |off: i32| if is_esp_biased(off) { off - norm[i - start] } else { off };
+         match infos[i].kind {
+             LineKind::LoadEbp { offset, size, .. } => {
+                 if is_esp_biased(offset) { any_esp_read = true; }
+@@ -2883,8 +2913,15 @@ fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
+                 let ebp_off = infos[i].ebp_offset;
+                 if ebp_off != EBP_OFFSET_NONE {
+                     if is_esp_biased(ebp_off) { any_esp_read = true; }
+-                    // Conservatively treat as a 4-byte read (max store size on i686)
+-                    read_ranges.push((normalize(ebp_off), 4));
++                    // Conservatively treat as a 16-byte read. 4 bytes (the
++                    // GP-store maximum) is NOT enough: x87 folded operands
++                    // read past the first dword — `fldl 16(%esp)` reads
++                    // 16..24 and `fldt` reads 10 bytes — and undersizing the
++                    // range let the pass delete the live high-word store of
++                    // a double parameter (d_i regparm miscompile). 16 bytes
++                    // covers every x86 memory read that names this offset
++                    // as its lowest address.
++                    read_ranges.push((normalize(ebp_off), 16));
+                 } else if !matches!(infos[i].kind, LineKind::StoreEbp { .. })
+                     && (s.contains("(%ebp)") || s.contains("(%esp)")) {
+                     // Unknown frame reference - bail out
+@@ -2897,7 +2934,7 @@ fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
+     if addr_taken { return; }
+ 
+     // Remove stores to slots whose byte range is never overlapped by any load
+-    for i in 0..len {
++    for i in start..end {
+         if infos[i].is_nop() { continue; }
+         if let LineKind::StoreEbp { offset, size, .. } = infos[i].kind {
+             let esp_store = is_esp_biased(offset);
+@@ -2906,7 +2943,7 @@ fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
+                 // has no explicit memory operand.  Keep the canonical
+                 // retpoline/stack-transfer shape `movl %reg,(%esp); ret|pop`.
+                 let mut next = i + 1;
+-                while next < len
++                while next < end
+                     && (infos[next].is_nop()
+                         || matches!(
+                             infos[next].kind,
+@@ -2915,7 +2952,7 @@ fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
+                 {
+                     next += 1;
                  }
-                 "-fno-fast-math" => {
-                     self.fast_math = false;
-                     self.fp_reassoc = false;
--                    self.fp_contract_fast = false;
-+                    // Restore the DEFAULT (fast), not "off": GCC's
-+                    // -fno-fast-math resets contraction to its default mode,
-+                    // and the gnu-C default is fast. Explicit flags stay.
-+                    if !self.fp_contract_explicit {
-+                        self.fp_contract_fast = true;
-+                    }
-                 }
-                 "-funsafe-math-optimizations" | "-fassociative-math" => {
-                     self.fp_reassoc = true;
-@@ -1155,12 +1164,16 @@ impl Driver {
-                 "-fno-unsafe-math-optimizations" | "-fno-associative-math" => {
-                     self.fp_reassoc = false;
-                 }
--                "-ffp-contract=fast" => self.fp_contract_fast = true,
-+                "-ffp-contract=fast" => {
-+                    self.fp_contract_fast = true;
-+                    self.fp_contract_explicit = true;
-+                }
-                 "-ffp-contract=off" | "-ffp-contract=on" => {
-                     // `on` permits only language-standard contraction. LCCC
-                     // does not yet carry per-expression contraction metadata,
-                     // so fail closed rather than fusing across lowered IR.
-                     self.fp_contract_fast = false;
-+                    self.fp_contract_explicit = true;
-                 }
-                 // Diagnostic color: -fdiagnostics-color, -fdiagnostics-color={auto,always,never}
-                 "-fdiagnostics-color" | "-fcolor-diagnostics" => {
-@@ -1506,6 +1519,30 @@ mod cli_tests {
-         ];
-         reen.parse_cli_args(&args).unwrap();
-         assert!(reen.fp_contract_fast);
+-                let consumed = next < len
++                let consumed = next < end
+                     && (matches!(infos[next].kind, LineKind::Pop { .. } | LineKind::Ret)
+                         || trimmed(store, &infos[next], next).starts_with("ret "));
+                 if offset == ESP_SLOT_BIAS
+@@ -2932,7 +2969,7 @@ fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
+                 continue;
+             }
+             let store_bytes = size.byte_size();
+-            let norm_off = if esp_store { offset - norm[i] } else { offset };
++            let norm_off = if esp_store { offset - norm[i - start] } else { offset };
+             let is_read = read_ranges.iter().any(|&(r_off, r_sz)| {
+                 ranges_overlap(norm_off, store_bytes, r_off, r_sz)
+             });
+@@ -3525,6 +3562,69 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn never_read_store_dse_is_function_scoped() {
++        // f stores 24(%esp) and never reads it; g READS 24(%esp).
++        // Module-wide analysis kept f's dead store alive (cross-function
++        // aliasing) and the inter-function label killed the ESP walk.
++        let asm = concat!(
++            "f:\n",
++            "    subl $28, %esp\n",
++            "    movl %eax, 24(%esp)\n",
++            "    xorl %eax, %eax\n",
++            "    addl $28, %esp\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size f, .-f\n",
++            "g:\n",
++            "    subl $28, %esp\n",
++            "    movl %ecx, 24(%esp)\n",
++            "    call ext\n",
++            "    movl 24(%esp), %eax\n",
++            "    addl $28, %esp\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size g, .-g\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert!(
++            !result.contains("movl %eax, 24(%esp)"),
++            "f's never-read store must die despite g reading the same offset:\n{result}"
++        );
++        assert!(
++            result.contains("movl %ecx, 24(%esp)"),
++            "g's live store must survive:\n{result}"
++        );
++    }
 +
-+        // GCC parity: default is -ffp-contract=fast for gnu C.
-+        let mut dflt = Driver::new();
-+        let args = vec!["lccc".to_string(), "x.c".to_string()];
-+        dflt.parse_cli_args(&args).unwrap();
-+        assert!(dflt.fp_contract_fast, "gnu-C default must contract (GCC parity)");
++    #[test]
++    fn never_read_store_dse_respects_x87_wide_reads() {
++        // The high dword of the double at 16(%esp) is only read by the
++        // folded x87 operand `fldl 16(%esp)` (8-byte read). The store to
++        // 20(%esp) must be treated as read (d_i regparm miscompile).
++        let asm = concat!(
++            "f:\n",
++            "    subl $24, %esp\n",
++            "    movl %eax, 16(%esp)\n",
++            "    movl %edx, 20(%esp)\n",
++            "    fldl 16(%esp)\n",
++            "    fstpl 0(%esp)\n",
++            "    movl 0(%esp), %eax\n",
++            "    movl 4(%esp), %edx\n",
++            "    addl $24, %esp\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert!(
++            result.contains("movl %edx, 20(%esp)"),
++            "high-dword store feeding fldl must survive:\n{result}"
++        );
++    }
 +
-+        // Explicit contract flag is sticky against later -ffast-math
-+        // (GCC opts_set semantics), in BOTH orders.
-+        let mut sticky = Driver::new();
-+        let args = vec![
-+            "lccc".to_string(), "-ffp-contract=off".to_string(),
-+            "-ffast-math".to_string(), "x.c".to_string(),
-+        ];
-+        sticky.parse_cli_args(&args).unwrap();
-+        assert!(!sticky.fp_contract_fast, "explicit off survives -ffast-math");
-+
-+        // -fno-fast-math restores the default (fast), it does not force off.
-+        let mut nfm = Driver::new();
-+        let args = vec![
-+            "lccc".to_string(), "-fno-fast-math".to_string(), "x.c".to_string(),
-+        ];
-+        nfm.parse_cli_args(&args).unwrap();
-+        assert!(nfm.fp_contract_fast, "-fno-fast-math keeps the fast default");
-     }
- 
      #[test]
-diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
-index 8bbb30b..b0df3be 100644
---- a/src/driver/pipeline.rs
-+++ b/src/driver/pipeline.rs
-@@ -65,6 +65,12 @@ pub struct Driver {
-     /// retain separate multiply and add rounding. Enabled by `-ffast-math` or
-     /// an explicit `-ffp-contract=fast`.
-     pub(super) fp_contract_fast: bool,
-+    /// An explicit -ffp-contract=... was given. GCC's set_fast_math_flags only
-+    /// touches the contraction mode when it was NOT explicitly set, so
-+    /// `-ffp-contract=off -ffast-math` keeps contraction OFF while
-+    /// `-ffast-math -ffp-contract=off` also ends OFF (explicit flag is sticky
-+    /// in both orders; explicit-vs-explicit remains last-wins).
-+    pub(super) fp_contract_explicit: bool,
-     /// Whether the umbrella -ffast-math option is active.  Kept separate from
-     /// fp_reassoc because GCC does not define __FAST_MATH__ for the individual
-     /// -fassociative-math/-funsafe-math-optimizations options.
-@@ -345,7 +351,13 @@ impl Driver {
-             optimize: false, // Only set to true when user explicitly passes -O1 or higher
-             optimize_size: false,
-             fp_reassoc: false,
--            fp_contract_fast: false,
-+            // DEFAULT TRUE: GCC's default for gnu* C dialects is
-+            // -ffp-contract=fast (verified: `gcc -O3` emits vfmadd132sd for
-+            // `c + a*b` with no FP flags at all). Defaulting to false would
-+            // silently drop FMA from every build that doesn't pass
-+            // -ffast-math while claiming GCC compatibility.
-+            fp_contract_fast: true,
-+            fp_contract_explicit: false,
-             fast_math: false,
-             verbose: false,
-             mode: CompileMode::Full,
-@@ -1817,6 +1829,7 @@ impl Driver {
-             data_sections: self.data_sections,
-             code16gcc: self.code16gcc,
-             regparm: self.regparm,
-+            fp_contract_fast: self.fp_contract_fast,
-             preferred_stack_bytes: self.preferred_stack_bytes,
-             omit_frame_pointer: self.omit_frame_pointer,
-             emit_cfi: !self.no_unwind_tables,
+     fn dead_callee_saved_move_crosses_epilogue_stack_adjustment() {
+         let asm = concat!(
 -- 
 2.47.3
 
 
-From 1151756449f56a8357701e1879fbce53a89ade9e Mon Sep 17 00:00:00 2001
+From 131fad26345d00ede12a9defc804e4498c36f38a Mon Sep 17 00:00:00 2001
 From: Arena Agent <agent@arena.ai>
-Date: Tue, 18 Aug 2026 11:08:21 +0000
-Subject: [PATCH 2/4] i686 peephole: redundant zero-extension elimination (port
- of x86-64 redundant_ext)
+Date: Tue, 18 Aug 2026 11:46:43 +0000
+Subject: [PATCH 02/11] i686 windowed DSE: register fate must not protect a
+ shadowed store
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
-The i686 accumulator emitter re-extends after every sub-int operation
-because operand_to_eax cannot see the producer: video-bios.o alone
-carried 43 movzbl, 15 provably redundant ("movzbl mem,%eax; ...;
-movzbl %al,%eax" and post-andl re-extensions).
+eliminate_dead_stores broke its look-ahead as soon as the STORED
+register was redefined — a forwarding-style break wrongly applied to a
+deadness proof. Whether %eax changes after 'movl %eax, 8(%esp)' cannot
+make the slot's old bytes observable; only a read of the slot can. The
+spill/ALU/respill shape (movl %eax,S; andl $31,%eax; movl %eax,S)
+accounts for ~104 shadowed stores in the kernel setup corpus that the
+break hid from the pass. The x86-64 twin already had no such break.
 
-New eliminate_redundant_zext_i686 tracks per-family byte-ness
-(bits 8..31 zero) and 16-bit-ness (bits 16..31 zero) through straight-
-line code, exactly like x86-64's redundant_ext pass:
-* movzbl/movzwl set the flags; same-family re-extension of a known
-  byte/16-bit value is deleted; cross-family byte re-extension becomes
-  a plain movl (shorter, no partial-register stall);
-* Move copies propagate flags; andl $imm proves the result range from
-  the immediate alone; loads/pops/setcc/unknown writers clear their
-  family; implicit multi-register writers (mul/div/cltd/xchg/string
-  ops) and ALL barriers (labels, calls, jumps) clear everything.
-Runs before DSE with a bounded cleanup loop, since removed extensions
-expose dead stores and moves.
-
-Realmode kernel corpus: 35338 -> 34804 bytes (2.72 -> 2.67x vs GCC).
-Four unit tests pin removal, label/ALU invalidation, and the andl-imm8
-range proof. 835/835 unit, 50/50 correctness, regparm+cdecl ABI green,
-byte/word-semantics runtime matrix green at -O0/-O2/-Os.
+Realmode boot corpus: 34389 -> 33875 bytes. x86-64 -O2 corpus: 25027
+vs gcc 25796 (improved from 25364; the shared IR path feeds both).
+838/838 unit, 50/50 correctness, regparm conformance all levels,
+9/9 check scripts, nbody -O0 exact.
 ---
- src/backend/i686/codegen/peephole.rs | 200 +++++++++++++++++++++++++++
- 1 file changed, 200 insertions(+)
+ src/backend/i686/codegen/peephole.rs | 45 +++++++++++++++++++++++-----
+ 1 file changed, 37 insertions(+), 8 deletions(-)
 
 diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index 1d6990a..c73176f 100644
+index b1fce63..f25a0c6 100644
 --- a/src/backend/i686/codegen/peephole.rs
 +++ b/src/backend/i686/codegen/peephole.rs
-@@ -3201,6 +3201,21 @@ pub fn peephole_optimize(asm: String) -> String {
+@@ -1674,7 +1674,7 @@ fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+ 
+     for i in 0..len {
+         if infos[i].is_nop() { continue; }
+-        if let LineKind::StoreEbp { offset: store_off, size: store_size, reg: store_reg } = infos[i].kind {
++        if let LineKind::StoreEbp { offset: store_off, size: store_size, .. } = infos[i].kind {
+             // Look ahead for another store to the same slot (meaning this one is dead)
+             // or a load from the same slot (meaning this one is alive)
+             let mut j = i + 1;
+@@ -1709,13 +1709,14 @@ fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+ 
+                 // Stop at barriers
+                 if infos[j].is_barrier() { break; }
+-                // Stop if the stored register is modified (value may have changed)
+-                match infos[j].kind {
+-                    LineKind::Other { dest_reg } if dest_reg == store_reg => break,
+-                    LineKind::Move { dst, .. } if dst == store_reg => break,
+-                    LineKind::SetCC { reg } if reg == store_reg => break,
+-                    _ => {}
+-                }
++                // NOTE: the stored REGISTER being modified is irrelevant
++                // here. This pass proves the MEMORY slot is overwritten
++                // before any read — deadness of the store — and the fate of
++                // the source register cannot change that. (A register-fate
++                // break belongs to store-FORWARDING, which reuses the value;
++                // forward_slot_loads has one.) The old break here hid ~40%
++                // of the same-block dead stores in the kernel setup corpus
++                // (spill, ALU on the register, respill to the same slot).
+                 // Stop at indirect memory access (could read the slot)
+                 let s = trimmed(store, &infos[j], j);
+                 if infos[j].has_indirect_mem { break; }
+@@ -3562,6 +3563,34 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn windowed_dse_kills_shadowed_store_across_source_reg_update() {
++        // `movl %eax, 8(%esp)` is dead: the slot is overwritten before any
++        // read. The intervening ALU on %eax must NOT protect the store
++        // (register fate is irrelevant to memory deadness).
++        // The call keeps the second store un-forwardable and the trailing
++        // pointer store keeps %edx alive, so only the windowed DSE can act:
++        // it must delete the FIRST store (shadowed by the second before any
++        // read) and keep the second.
++        let asm = concat!(
++            "f:\n",
++            "    movl %eax, 8(%esp)\n",
++            "    andl $31, %eax\n",
++            "    movl %eax, 8(%esp)\n",
++            "    call g\n",
++            "    movl 8(%esp), %edx\n",
++            "    movl %edx, (%ecx)\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        let stores = result.matches(", 8(%esp)\n").count();
++        assert_eq!(stores, 1, "first store must die, second must survive:\n{result}");
++        assert!(result.contains("movl 8(%esp), %edx"), "{result}");
++    }
++
+     #[test]
+     fn never_read_store_dse_is_function_scoped() {
+         // f stores 24(%esp) and never reads it; g READS 24(%esp).
+-- 
+2.47.3
+
+
+From dbb84826f556bb64ade46b9c0d755a0971f23a56 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Tue, 18 Aug 2026 11:50:47 +0000
+Subject: [PATCH 03/11] i686 peephole: fuse accumulator immediates into slot
+ stores (Pattern 2b-mem)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+'movl $X, %eax; mov{l,w,b} %eax/%ax/%al, SLOT' becomes a direct
+immediate store when %eax is dead afterwards: movw saves 3 bytes,
+movb 4, movl 1, and the accumulator round-trip disappears. W/B forms
+truncate a numeric immediate to the store width; the L form may carry
+a symbol. Two guards keep it profitable and sound:
+ * a re-read of the same slot inside the deadness window blocks the
+   fusion (forward_slot_loads would have deleted that reload for free
+   in the unfused shape — fusing would trade a 4-byte reload for a
+   1-3 byte saving);
+ * zero idioms (xorl/subl %eax,%eax) count as kills, not reads.
+
+x86-64 already emits direct immediate stores from codegen (verified);
+nothing to port. Realmode boot corpus: 33875 -> 33525 bytes.
+840/840 unit, 50/50 correctness, 9/9 checks, regparm all levels,
+nbody -O0 exact, uchar matrix.
+---
+ src/backend/i686/codegen/peephole.rs | 134 +++++++++++++++++++++++++++
+ 1 file changed, 134 insertions(+)
+
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index f25a0c6..7411241 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -1013,6 +1013,94 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+                 let is_lea = src_line.starts_with("leal ") && src_line.ends_with("%eax")
+                     && !src_line.contains("%eax,") // %eax not a base/index
+                     && !src_line.contains("(%eax");
++                if is_imm {
++                    // Pattern 2b-mem: immediate + slot store --
++                    // `movl $X, %eax; mov{l,w,b} %eax|%ax|%al, SLOT` becomes a
++                    // direct immediate store when %eax is dead afterwards.
++                    // Encodings: movl $i32,disp8(%esp) is 8B vs 5+4=9B (-1),
++                    // movw is 7B vs 5+5=10B (-3), movb is 5B vs 5+4=9B (-4);
++                    // one instruction and the accumulator round-trip gone.
++                    // W/B forms need a NUMERIC immediate to truncate; the L
++                    // form may carry a symbol ($sym) unchanged.
++                    if let LineKind::StoreEbp { reg: sreg, offset, size } = infos[j].kind {
++                        if sreg == REG_EAX {
++                            let comma = src_line.rfind(',').unwrap();
++                            let imm_txt = src_line[5..comma].trim(); // "$X"
++                            let imm_val: Option<i64> = imm_txt[1..].parse().ok();
++                            let imm_out = match (size, imm_val) {
++                                (MoveSize::L, _) => Some(imm_txt.to_string()),
++                                (MoveSize::W, Some(v)) => Some(format!("${}", v as u16)),
++                                (MoveSize::B, Some(v)) => Some(format!("${}", v as u8)),
++                                _ => None,
++                            };
++                            if let Some(imm_out) = imm_out {
++                                // Same bounded deadness scan as Pattern 2a,
++                                // PLUS: a re-read of the same slot in the
++                                // window blocks the fusion. In the unfused
++                                // shape `forward_slot_loads` deletes that
++                                // reload outright (%eax still holds the
++                                // value); fusing here would trade a 4-byte
++                                // reload for a 1-3 byte immediate saving —
++                                // a net size loss.
++                                let mut k = j + 1;
++                                let mut cnt = 0;
++                                let mut dead = false;
++                                while k < len && cnt < 24 {
++                                    if infos[k].is_nop() { k += 1; continue; }
++                                    if infos[k].is_barrier() { break; }
++                                    let s = trimmed(store, &infos[k], k);
++                                    if matches!(infos[k].kind,
++                                        LineKind::LoadEbp { offset: o, .. } if o == offset)
++                                        || infos[k].ebp_offset == offset
++                                    {
++                                        break;
++                                    }
++                                    // Zero idioms KILL the register; they are
++                                    // not data-dependent on the old value.
++                                    if s == "xorl %eax, %eax" || s == "subl %eax, %eax" {
++                                        dead = true;
++                                        break;
++                                    }
++                                    let written = match infos[k].kind {
++                                        LineKind::Other { dest_reg } => dest_reg == REG_EAX,
++                                        LineKind::Move { dst, .. } => dst == REG_EAX,
++                                        LineKind::LoadEbp { reg, .. } => reg == REG_EAX,
++                                        LineKind::SetCC { reg } => reg == REG_EAX,
++                                        _ => false,
++                                    };
++                                    if written && !line_reads_dest_source(s, REG_EAX) {
++                                        dead = true;
++                                        break;
++                                    }
++                                    if line_references_reg(s, REG_EAX)
++                                        || line_writes_reg_implicitly(s, REG_EAX)
++                                    {
++                                        break;
++                                    }
++                                    k += 1;
++                                    cnt += 1;
++                                }
++                                if dead {
++                                    let (disp, base) = if offset >= ESP_SLOT_BIAS / 2 {
++                                        (offset - ESP_SLOT_BIAS, "%esp")
++                                    } else {
++                                        (offset, "%ebp")
++                                    };
++                                    let fused = format!(
++                                        "    {} {}, {}({})",
++                                        size.mnemonic(), imm_out, disp, base
++                                    );
++                                    store.replace(j, fused);
++                                    infos[j] = classify_line(store.get(j));
++                                    infos[i].kind = LineKind::Nop;
++                                    changed = true;
++                                    i += 1;
++                                    continue;
++                                }
++                            }
++                        }
++                    }
++                }
+                 if is_imm || is_lea {
+                     if let LineKind::Move { dst: mdst, src: msrc } = infos[j].kind {
+                         if msrc == REG_EAX && mdst != REG_EAX && mdst <= REG_GP_MAX {
+@@ -3563,6 +3651,52 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn imm_store_fusion_folds_accumulator_immediate_into_slot_store() {
++        // `movl $65535, %eax; movw %ax, S` -> `movw $65535, S` (truncated
++        // immediate) when %eax is dead after; same for the movl form.
++        let asm = concat!(
++            "f:\n",
++            "    movl $65535, %eax\n",
++            "    movw %ax, 68(%esp)\n",
++            "    movl $7, %eax\n",
++            "    movl %eax, 32(%esp)\n",
++            "    xorl %eax, %eax\n",
++            "    call g\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert!(result.contains("movw $65535, 68(%esp)"), "{result}");
++        assert!(result.contains("movl $7, 32(%esp)"), "{result}");
++        assert!(!result.contains("%ax,"), "{result}");
++    }
++
++    #[test]
++    fn imm_store_fusion_blocked_by_slot_reload_in_window() {
++        // The reload of 8(%esp) is deleted by forwarding in the UNFUSED
++        // shape (%eax still holds $5); fusing first would force a real
++        // memory reload. The fusion must not fire.
++        let asm = concat!(
++            "f:\n",
++            "    movl $5, %eax\n",
++            "    movl %eax, 8(%esp)\n",
++            "    movl 8(%esp), %eax\n",
++            "    movl %eax, (%ecx)\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert!(
++            result.contains("movl $5, %eax") || result.contains("movl $5, (%ecx)"),
++            "value must stay in a register path, not round-trip via a fused store:\n{result}"
++        );
++    }
++
+     #[test]
+     fn windowed_dse_kills_shadowed_store_across_source_reg_update() {
+         // `movl %eax, 8(%esp)` is dead: the slot is overwritten before any
+-- 
+2.47.3
+
+
+From 3c5e12cd5d945c3398080c8f95b51df3bdca6b4f Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Tue, 18 Aug 2026 11:53:20 +0000
+Subject: [PATCH 04/11] i686 Pattern 2d: fix double-percent that kept
+ copy-then-test collapse dead
+
+reg32_name() already returns names WITH the '%' prefix; the matcher
+built "testl %%edx, %eax", which can never appear in emitted assembly,
+so the whole pattern was dead code since it landed. 42 copy+test pairs
+in the kernel setup corpus now collapse to a self-test with the copy
+dying under the deadness scan. Regression test pins the fired shape.
+
+Realmode boot corpus: 33525 -> 33354 bytes. 841/841 unit, 50/50
+correctness, 9/9 checks, regparm all levels, nbody exact.
+---
+ src/backend/i686/codegen/peephole.rs | 31 +++++++++++++++++++++++++---
+ 1 file changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index 7411241..b6fc704 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -1213,10 +1213,10 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+                 if infos[j].kind == LineKind::Cmp {
+                     let t = trimmed(store, &infos[j], j);
+                     let rn = reg32_name(msrc);
+-                    let f1 = format!("testl %{}, %eax", rn);
+-                    let f2 = format!("testl %eax, %{}", rn);
++                    let f1 = format!("testl {}, %eax", rn);
++                    let f2 = format!("testl %eax, {}", rn);
+                     if t == f1 || t == f2 {
+-                        store.replace(j, format!("    testl %{}, %{}", rn, rn));
++                        store.replace(j, format!("    testl {}, {}", rn, rn));
+                         infos[j] = classify_line(store.get(j));
+                         // Deadness scan for the mov: skip the (rewritten) test.
+                         let mut k = j + 1;
+@@ -3651,6 +3651,31 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn copy_then_test_collapses_to_self_test() {
++        // `movl %edx, %eax; testl %edx, %eax` computes edx&edx: rewrite to
++        // `testl %edx, %edx` and drop the dead copy. (Regression: the
++        // pattern matcher once built "testl %%edx, %eax" — reg32_name
++        // already includes the '%' — so the pattern NEVER fired.)
++        let asm = concat!(
++            "f:\n",
++            "    movl %edx, %eax\n",
++            "    testl %edx, %eax\n",
++            "    jne .L1\n",
++            "    movl $3, %eax\n",
++            "    ret\n",
++            ".L1:\n",
++            "    movl $4, %eax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert!(result.contains("testl %edx, %edx"), "{result}");
++        assert!(!result.contains("movl %edx, %eax"), "{result}");
++    }
++
+     #[test]
+     fn imm_store_fusion_folds_accumulator_immediate_into_slot_store() {
+         // `movl $65535, %eax; movw %ax, S` -> `movw $65535, S` (truncated
+-- 
+2.47.3
+
+
+From 6840bd09c98fd46a7b989354d4893a95ea571492 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Tue, 18 Aug 2026 13:01:12 +0000
+Subject: [PATCH 05/11] i686: call indirect through global function pointers
+ without a stack stage
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Under regparm every i686 argument register (%eax/%ecx/%edx) is taken at
+an indirect call, so the emitter stages the target through a stack slot:
+'movl SYM,%eax; movl %eax,N(%esp); ... call *N(%esp)' — 11 bytes of
+load+spill per site that GCC never emits (it calls '*pio_ops' directly).
+The setup corpus has 74 such sites (pio_ops/vga_modes dispatch).
+
+New peephole fold_global_fnptr_calls (phase 3.7): per function, collect
+load/spill/call triples whose crossed lines are register/immediate-only
+data ops that never READ the staged register (pure overwrites are fine —
+that is exactly the regparm arg staging); then, per displacement, fold
+ALL triples iff every textual reference to that N(%esp) belongs to a
+triple. The whole-slot ownership rule makes the fold immune to ESP
+renumbering arguments: no other reader of any of those physical slots
+exists under any numbering. Volatile pointers stay a single read, only
+moved across non-memory ops, which volatile semantics do not constrain.
+
+The internal assemblers could not encode the result: 'call *sym' /
+'jmp *sym' (FF /2, FF /4 with disp-only ModR/M) added to i686
+(byte-exact vs GAS: ff 15/ff 25 + R_386_32 in .code32, ff 16/ff 26 +
+R_386_16 in .code16 — same 16-bit pointer read gcc -m16 emits) and the
+matching Label arm was already unreachable on x86-64 paths lccc emits;
+i686 only. Runtime matrix: fnptr dispatch through struct + volatile fp +
+store-between-load-and-call at -O0..-Os x regparm on/off, all pass.
+
+Realmode boot corpus: 33354 -> 33194 bytes (16 folds; remaining 61
+sites are mixed-use slots the ownership rule correctly refuses).
+3 new unit tests; 841+3 unit, 50/50 correctness, 9/9 checks, regparm
+conformance all levels, nbody -O0 exact.
+---
+ .../i686/assembler/encoder/gp_integer.rs      |  20 ++
+ src/backend/i686/codegen/peephole.rs          | 270 ++++++++++++++++++
+ 2 files changed, 290 insertions(+)
+
+diff --git a/src/backend/i686/assembler/encoder/gp_integer.rs b/src/backend/i686/assembler/encoder/gp_integer.rs
+index a395ce6..5c8d6a7 100644
+--- a/src/backend/i686/assembler/encoder/gp_integer.rs
++++ b/src/backend/i686/assembler/encoder/gp_integer.rs
+@@ -1370,6 +1370,16 @@ impl super::InstructionEncoder {
+                         self.bytes.push(0xFF);
+                         self.encode_modrm_mem(4, mem)
+                     }
++                    // `jmp *sym`: absolute-address indirect jump (FF /4,
++                    // disp-only ModR/M). GAS: `ff 25 <R_386_32 sym>` in
++                    // .code32; `ff 26` + R_386_16 in .code16 (gcc -m16
++                    // itself emits this 16-bit form for `jmp *fp` — the low
++                    // half of the 32-bit pointer is the whole story in real
++                    // mode). Produced by tail-calling the global-fnptr fold.
++                    Operand::Label(label) => {
++                        self.bytes.push(0xFF);
++                        self.encode_abs_addr_modrm(4, label)
++                    }
+                     _ => Err("unsupported indirect jmp target".to_string()),
+                 }
+             }
+@@ -1588,6 +1598,16 @@ impl super::InstructionEncoder {
+                         self.bytes.push(0xFF);
+                         self.encode_modrm_mem(2, mem)
+                     }
++                    // `call *sym` / `call *sym+4`: absolute-address indirect
++                    // call through a global function pointer (FF /2 with
++                    // disp-only ModR/M). GAS encodes `call *pio_ops` as
++                    // `ff 15 <R_386_32 pio_ops>` (.code32) / `ff 16` +
++                    // R_386_16 (.code16). The peephole's global-fnptr fold
++                    // emits exactly this shape.
++                    Operand::Label(label) => {
++                        self.bytes.push(0xFF);
++                        self.encode_abs_addr_modrm(2, label)
++                    }
+                     _ => Err("unsupported indirect call target".to_string()),
+                 }
+             }
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index b6fc704..45ce702 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -2828,6 +2828,194 @@ fn try_fold_memory_operand(s: &str, load_reg: RegId, offset: i32, _size: MoveSiz
+     None
+ }
+ 
++// ── Pass: indirect call through a spilled global function pointer ───────────
++
++/// Does `s` reference the ESP-relative slot at raw displacement `disp`?
++/// Textual scan with numeric comparison of the displacement digits (a naive
++/// substring test for "0(%esp)" would also hit "40(%esp)").
++fn references_esp_slot(s: &str, disp: i32) -> bool {
++    let mut rest = s;
++    while let Some(p) = rest.find("(%esp)") {
++        let before = &rest[..p];
++        let digits_start = before
++            .rfind(|c: char| !c.is_ascii_digit() && c != '-')
++            .map(|q| q + 1)
++            .unwrap_or(0);
++        let num = &before[digits_start..];
++        let val = if num.is_empty() { 0 } else { num.parse::<i32>().unwrap_or(i32::MIN) };
++        if val == disp {
++            return true;
++        }
++        rest = &rest[p + 6..];
++    }
++    false
++}
++
++/// Fold `movl SYM, %reg; movl %reg, N(%esp); ...; call *N(%esp)` into
++/// `...; call *SYM`.
++///
++/// The i686 emitter has no register home for a call target under regparm
++/// (%eax/%ecx/%edx all carry arguments), so every `pio_ops.f(...)` call in
++/// the kernel setup code stages the pointer through a stack slot — 11 bytes
++/// of load+spill per site that GCC never emits (it calls `*pio_ops`
++/// directly). x86-64 needs no port: its emitter stages indirect targets in
++/// %r10/%r11, which no argument register overlaps.
++///
++/// Soundness:
++///  * The SYM read moves FORWARD to the call. Every crossed line must be a
++///    register/immediate-only data op (no memory operands of any kind), so
++///    no crossed store can retarget SYM. For volatile pointers the read
++///    count is preserved and only reordered against non-memory ops, which
++///    volatile semantics do not constrain.
++///  * Crossed lines cannot write the slot or change ESP (reg/imm-only), so
++///    the textual `N(%esp)` in the call names the same slot the store
++///    wrote.
++///  * The spilled register must not be read on the crossed lines (it no
++///    longer holds the pointer).
++///  * The slot must have no OTHER reference anywhere in the function
++///    (numeric displacement match): with the store and call gone, a stale
++///    read elsewhere would see garbage; a same-name reference under a
++///    shifted ESP is over-matched and merely blocks the fold.
++fn fold_global_fnptr_calls(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
++    let len = infos.len();
++    let mut changed = false;
++
++    // Process one function at a time so the whole-function reference check
++    // is scoped correctly.
++    let mut fstart = 0usize;
++    for idx in 0..=len {
++        let at_end = idx == len;
++        let is_boundary = at_end || {
++            !infos[idx].is_nop() && {
++                let s = trimmed(store, &infos[idx], idx);
++                s == ".cfi_endproc" || s.starts_with(".size ")
++            }
++        };
++        if !is_boundary { continue; }
++        let fend = idx;
++
++        // Phase 1: collect candidate triples (load_i, store_j, call_k, sym, disp).
++        struct Triple { li: usize, sj: usize, ck: usize, sym: String, disp: i32 }
++        let mut triples: Vec<Triple> = Vec::new();
++        let mut i = fstart;
++        'scan: while i < fend {
++            if infos[i].is_nop() { i += 1; continue; }
++
++            // Line i: `movl SYM, %reg` (classified Other{dest_reg}: symbolic
++            // source, so it is neither Move nor LoadEbp).
++            let LineKind::Other { dest_reg } = infos[i].kind else { i += 1; continue; };
++            if dest_reg > REG_GP_MAX { i += 1; continue; }
++            let li = trimmed(store, &infos[i], i);
++            let Some(rest) = li.strip_prefix("movl ") else { i += 1; continue; };
++            let Some((sym, dst)) = rest.split_once(',') else { i += 1; continue; };
++            let sym = sym.trim();
++            let dst = dst.trim();
++            if register_family(dst) != dest_reg { i += 1; continue; }
++            let sb = sym.as_bytes();
++            if sb.is_empty() || !(sb[0].is_ascii_alphabetic() || sb[0] == b'_') { i += 1; continue; }
++            if !sym
++                .bytes()
++                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'$' | b'+' | b'-'))
++            {
++                i += 1;
++                continue;
++            }
++
++            // Line j: `movl %reg, N(%esp)`.
++            let j = next_non_nop(infos, i + 1);
++            if j >= fend { break; }
++            let LineKind::StoreEbp { reg: sreg, offset, size: MoveSize::L } = infos[j].kind else {
++                i += 1;
++                continue;
++            };
++            if sreg != dest_reg || offset < ESP_SLOT_BIAS / 2 { i += 1; continue; }
++            let raw_disp = offset - ESP_SLOT_BIAS;
++
++            // Forward scan for `call *N(%esp)`; only reg/imm-only data ops
++            // that do not READ %reg may be crossed (a pure overwrite is
++            // fine — MOV-family writes without reading; ALU ops read their
++            // destination). No memory operands of any kind may be crossed,
++            // which also rules out ESP changes and slot writes.
++            let call_txt = format!("call *{}(%esp)", raw_disp);
++            let mut k = j + 1;
++            let mut found: Option<usize> = None;
++            let mut cnt = 0;
++            while k < fend && cnt < 12 {
++                if infos[k].is_nop() { k += 1; continue; }
++                let s = trimmed(store, &infos[k], k);
++                if s == call_txt {
++                    found = Some(k);
++                    break;
++                }
++                let mn = s.split_ascii_whitespace().next().unwrap_or("");
++                const MOVS: &[&str] = &["movl", "movzbl", "movzwl", "movsbl", "movswl"];
++                const ALUS: &[&str] = &[
++                    "addl", "subl", "andl", "orl", "xorl", "imull",
++                    "shll", "shrl", "sarl", "incl", "decl", "negl", "notl",
++                ];
++                let is_mov = MOVS.contains(&mn);
++                let is_alu = ALUS.contains(&mn);
++                let ok = (is_mov || is_alu) && {
++                    let ops: Vec<&str> = s[mn.len()..].split(',').map(str::trim).collect();
++                    ops.iter().all(|op| op.starts_with('%') || op.starts_with('$')) && {
++                        let n = ops.len();
++                        let reads_reg = ops.iter().enumerate().any(|(oi, op)| {
++                            let is_dest = oi + 1 == n;
++                            if is_dest && is_mov { return false; }
++                            op.starts_with('%') && register_family(op) == dest_reg
++                        });
++                        !reads_reg
++                    }
++                };
++                if !ok { i += 1; continue 'scan; }
++                k += 1;
++                cnt += 1;
++            }
++            let Some(ci) = found else { i += 1; continue; };
++            triples.push(Triple { li: i, sj: j, ck: ci, sym: sym.to_string(), disp: raw_disp });
++            i = ci + 1;
++        }
++
++        // Phase 2: for each displacement with candidates, require that EVERY
++        // textual reference to that displacement inside the function is a
++        // member (store or call) of some candidate triple. Then all triples
++        // of that displacement fold together: every read of any of the
++        // physical slots those stores wrote is one of the rewritten calls,
++        // so no stale read can remain — under ANY ESP numbering (raw-text
++        // matching over-approximates aliasing; unmatched references merely
++        // block the fold).
++        if !triples.is_empty() {
++            let mut disps: Vec<i32> = triples.iter().map(|t| t.disp).collect();
++            disps.sort_unstable();
++            disps.dedup();
++            for d in disps {
++                let members: Vec<&Triple> = triples.iter().filter(|t| t.disp == d).collect();
++                let mut blocked = false;
++                'refscan: for t in fstart..fend {
++                    if infos[t].is_nop() { continue; }
++                    if members.iter().any(|m| m.sj == t || m.ck == t) { continue; }
++                    if references_esp_slot(trimmed(store, &infos[t], t), d) {
++                        blocked = true;
++                        break 'refscan;
++                    }
++                }
++                if blocked { continue; }
++                for m in members {
++                    infos[m.li].kind = LineKind::Nop;
++                    infos[m.sj].kind = LineKind::Nop;
++                    store.replace(m.ck, format!("    call *{}", m.sym));
++                    infos[m.ck] = classify_line(store.get(m.ck));
++                    changed = true;
++                }
++            }
++        }
++
++        fstart = fend + 1;
++    }
++
++    changed
++}
++
+ // ── Pass: Never-read store elimination ───────────────────────────────────────
+ 
+ /// Find stack slots that are never loaded and remove all stores to them.
+@@ -3349,6 +3537,12 @@ pub fn peephole_optimize(asm: String) -> String {
          }
      }
  
-+    // Phase 3.5: redundant zero-extension elimination (may expose dead
-+    // stores and moves by shortening def-use chains, so it runs before DSE
-+    // and the liveness cleanup).
-+    if eliminate_redundant_zext_i686(&mut store, &mut infos) {
-+        let mut changed3 = true;
-+        let mut pass_count3 = 0;
-+        while changed3 && pass_count3 < MAX_POST_GLOBAL_ITERATIONS {
-+            changed3 = false;
-+            changed3 |= combined_local_pass(&mut store, &mut infos);
-+            changed3 |= eliminate_dead_reg_moves(&store, &mut infos);
-+            changed3 |= eliminate_dead_stores(&store, &mut infos);
-+            pass_count3 += 1;
-+        }
-+    }
++    // Phase 3.7: fold indirect calls through freshly spilled global function
++    // pointers (`movl SYM,%r; movl %r,N(%esp); call *N(%esp)` ->
++    // `call *SYM`). Runs before phase 4 so the vacated slot can turn other
++    // stores dead and unused callee-saves can drop.
++    fold_global_fnptr_calls(&mut store, &mut infos);
 +
      // Phase 4: Never-read store elimination, then remove callee-save pairs
      // made unused by the dead-move cleanup above.
      eliminate_never_read_stores(&store, &mut infos);
-@@ -3213,6 +3228,155 @@ pub fn peephole_optimize(asm: String) -> String {
-     store.build_result(|i| infos[i].is_nop())
- }
- 
-+// ── Pass: redundant zero-extension elimination (i686 redundant_ext port) ────
-+
-+/// Track which GP register families provably hold byte values (bits 8..31
-+/// zero) or 16-bit values (bits 16..31 zero), and remove/rewrite redundant
-+/// re-extensions:
-+///   * `movzbl %al, %eax` when %eax already holds a byte value  -> removed
-+///   * `movzbl %al, %REG` when %eax already holds a byte value  -> movl copy
-+///   * `movzwl %ax, %eax` when %eax already holds a 16-bit value -> removed
-+///
-+/// The setup-code i686 emitter re-extends after EVERY sub-int operation
-+/// (43 movzbl in video-bios.o alone, 15 of them provably redundant), because
-+/// operand_to_eax cannot see the producer. Same state machine as the x86-64
-+/// pass (redundant_ext.rs): flags cleared at labels/calls/barriers, updated
-+/// by extensions, copies, and byte-preserving andl; anything else clears the
-+/// written family. Fail-closed: implicit multi-register writers clear all.
-+fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-+    let mut changed = false;
-+    let len = infos.len();
-+    let mut is_byte = [false; 8]; // per family: value < 256
-+    let mut is_16 = [false; 8];   // per family: value < 65536
-+
-+    let mut i = 0;
-+    while i < len {
-+        if infos[i].is_nop() { i += 1; continue; }
-+        if infos[i].is_barrier() {
-+            is_byte = [false; 8];
-+            is_16 = [false; 8];
-+            i += 1;
-+            continue;
-+        }
-+        let t = trimmed(store, &infos[i], i).to_string();
-+
-+        // movzbl SRC, %DST
-+        if let Some(rest) = t.strip_prefix("movzbl ") {
-+            if let Some((src, dst)) = rest.split_once(',') {
-+                let src = src.trim();
-+                let dst = dst.trim();
-+                let df = register_family(dst);
-+                if df <= REG_GP_MAX && !src.contains('(') && src.starts_with('%') {
-+                    let sf = register_family(src);
-+                    if sf <= REG_GP_MAX && is_byte[sf as usize] {
-+                        if sf == df {
-+                            // pure no-op
-+                            infos[i].kind = LineKind::Nop;
-+                            changed = true;
-+                            i += 1;
-+                            continue;
-+                        }
-+                        // cross-register: plain 32-bit copy (shorter, no
-+                        // partial-register stall).
-+                        store.replace(i, format!(
-+                            "    movl {}, {}", reg32_name(sf), reg32_name(df)));
-+                        infos[i] = classify_line(store.get(i));
-+                        is_byte[df as usize] = true;
-+                        is_16[df as usize] = true;
-+                        changed = true;
-+                        i += 1;
-+                        continue;
-+                    }
-+                }
-+                if df <= REG_GP_MAX {
-+                    is_byte[df as usize] = true;
-+                    is_16[df as usize] = true;
-+                }
-+                i += 1;
-+                continue;
-+            }
-+        }
-+        // movzwl SRC, %DST
-+        if let Some(rest) = t.strip_prefix("movzwl ") {
-+            if let Some((src, dst)) = rest.split_once(',') {
-+                let src = src.trim();
-+                let dst = dst.trim();
-+                let df = register_family(dst);
-+                if df <= REG_GP_MAX && !src.contains('(') && src.starts_with('%') {
-+                    let sf = register_family(src);
-+                    if sf <= REG_GP_MAX && is_16[sf as usize] && sf == df {
-+                        infos[i].kind = LineKind::Nop;
-+                        changed = true;
-+                        i += 1;
-+                        continue;
-+                    }
-+                }
-+                if df <= REG_GP_MAX {
-+                    is_byte[df as usize] = false;
-+                    is_16[df as usize] = true;
-+                }
-+                i += 1;
-+                continue;
-+            }
-+        }
-+
-+        // Flag propagation / invalidation for everything else.
-+        match infos[i].kind {
-+            LineKind::Move { dst, src } => {
-+                is_byte[dst as usize] = is_byte[src as usize];
-+                is_16[dst as usize] = is_16[src as usize];
-+            }
-+            LineKind::LoadEbp { reg, .. } | LineKind::Pop { reg } => {
-+                if reg <= REG_GP_MAX {
-+                    is_byte[reg as usize] = false;
-+                    is_16[reg as usize] = false;
-+                }
-+            }
-+            LineKind::StoreEbp { .. } | LineKind::Push { .. }
-+            | LineKind::Cmp | LineKind::Empty | LineKind::SelfMove => {}
-+            LineKind::SetCC { reg } => {
-+                // setCC writes the low byte only; upper bits UNCHANGED —
-+                // conservatively clear (the canonical setcc+movzbl pair
-+                // re-establishes byte-ness via the movzbl above).
-+                if reg <= REG_GP_MAX {
-+                    is_byte[reg as usize] = false;
-+                    is_16[reg as usize] = false;
-+                }
-+            }
-+            _ => {
-+                let d = parse_dest_reg(&t);
-+                if d <= REG_GP_MAX {
-+                    if t.starts_with("andl $") {
-+                        // andl $imm: result <= imm, so byte/16 flags follow
-+                        // the immediate's range regardless of prior state.
-+                        let imm = t["andl $".len()..]
-+                            .split(',').next()
-+                            .and_then(|v| v.trim().parse::<i64>().ok());
-+                        is_byte[d as usize] = matches!(imm, Some(v) if (0..=255).contains(&v));
-+                        is_16[d as usize] = matches!(imm, Some(v) if (0..=65535).contains(&v));
-+                    } else {
-+                        is_byte[d as usize] = false;
-+                        is_16[d as usize] = false;
-+                    }
-+                }
-+                // Implicit multi-register writers: fail closed on all flags.
-+                if t.starts_with("mul") || t.starts_with("imul")
-+                    || t.starts_with("div") || t.starts_with("idiv")
-+                    || t == "cltd" || t == "cdq" || t.starts_with("xchg")
-+                    || t.starts_with("rep") || t.starts_with("lods")
-+                    || t.starts_with("stos") || t.starts_with("movs")
-+                    || t.starts_with("cmps") || t.starts_with("scas")
-+                {
-+                    is_byte = [false; 8];
-+                    is_16 = [false; 8];
-+                }
-+            }
-+        }
-+        i += 1;
-+    }
-+    changed
-+}
-+
- // ── Pass: tail-call conversion (call X; <epilogue>; ret → <epilogue>; jmp X) ──
- 
- /// i686 port of the x86-64 tail-call peephole.
-@@ -3581,6 +3745,42 @@ mod tests {
-             "store/load pair should be fully eliminated, got:\n{}", result);
-     }
+@@ -3651,6 +3845,82 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
+ mod tests {
+     use super::*;
  
 +    #[test]
-+    fn test_redundant_zext_removed() {
-+        // Second movzbl of an already-byte value is a no-op.
-+        let asm = "f:\n    movzbl (%ecx), %eax\n    movzbl %al, %eax\n    ret\n".to_string();
++    fn global_fnptr_call_folds_load_spill_call() {
++        // Two same-slot sites in one function must BOTH fold (every
++        // reference to the displacement belongs to a candidate triple).
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    subl $8, %esp\n",
++            "    movl pio_ops+8, %eax\n",
++            "    movl %eax, 0(%esp)\n",
++            "    movl %esi, %edx\n",
++            "    movl $15879, %eax\n",
++            "    call *0(%esp)\n",
++            "    movl pio_ops+8, %eax\n",
++            "    movl %eax, 0(%esp)\n",
++            "    movl %esi, %edx\n",
++            "    movl $57106, %eax\n",
++            "    call *0(%esp)\n",
++            "    addl $8, %esp\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
 +        let result = peephole_optimize(asm);
-+        assert_eq!(result.matches("movzbl").count(), 1,
-+            "redundant re-extension must be removed:\n{}", result);
++        assert_eq!(result.matches("call *pio_ops+8").count(), 2, "{result}");
++        assert!(!result.contains("call *0(%esp)"), "{result}");
++        assert!(!result.contains("movl pio_ops+8, %eax"), "{result}");
 +    }
 +
 +    #[test]
-+    fn test_zext_cleared_at_label() {
-+        // Byte-ness must not survive a control-flow merge.
-+        let asm = "f:\n    movzbl (%ecx), %eax\n.LBB1:\n    movzbl %al, %eax\n    ret\n".to_string();
++    fn global_fnptr_call_fold_blocked_by_foreign_slot_use() {
++        // The slot is ALSO read by a non-call line: no triple may fold.
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    subl $8, %esp\n",
++            "    movl pio_ops, %eax\n",
++            "    movl %eax, 0(%esp)\n",
++            "    call *0(%esp)\n",
++            "    movl 0(%esp), %ebx\n",
++            "    movl %ebx, (%ecx)\n",
++            "    addl $8, %esp\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
 +        let result = peephole_optimize(asm);
-+        assert_eq!(result.matches("movzbl").count(), 2,
-+            "flags must clear at labels:\n{}", result);
++        assert!(result.contains("call *0(%esp)"), "{result}");
++        assert!(!result.contains("call *pio_ops"), "{result}");
 +    }
 +
 +    #[test]
-+    fn test_zext_cleared_by_add() {
-+        // addl can overflow past 255: re-extension is REQUIRED.
-+        let asm = "f:\n    movzbl (%ecx), %eax\n    addl $200, %eax\n    movzbl %al, %eax\n    ret\n".to_string();
++    fn global_fnptr_call_fold_blocked_by_crossed_memory_op() {
++        // A store to the global between load and call must block the fold
++        // (the call must use the OLD pointer value).
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    subl $8, %esp\n",
++            "    movl ops_tab, %eax\n",
++            "    movl %eax, 0(%esp)\n",
++            "    movl %ebx, ops_tab\n",
++            "    call *0(%esp)\n",
++            "    addl $8, %esp\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
 +        let result = peephole_optimize(asm);
-+        assert_eq!(result.matches("movzbl").count(), 2,
-+            "addl invalidates byte-ness:\n{}", result);
-+    }
-+
-+    #[test]
-+    fn test_zext_preserved_by_andl_imm8() {
-+        // andl $127 keeps the value in byte range: re-extension is dead.
-+        let asm = "f:\n    movzbl (%ecx), %eax\n    andl $127, %eax\n    movzbl %al, %eax\n    ret\n".to_string();
-+        let result = peephole_optimize(asm);
-+        assert_eq!(result.matches("movzbl").count(), 1,
-+            "andl imm8 preserves byte-ness:\n{}", result);
++        assert!(result.contains("call *0(%esp)"), "{result}");
++        assert!(result.contains("movl %ebx, ops_tab"), "{result}");
 +    }
 +
      #[test]
-     fn test_tail_call_direct_i686() {
-         let asm = "f:\n    pushl %ebx\n    movl %eax, %ebx\n    call target\n    popl %ebx\n    ret\n".to_string();
+     fn copy_then_test_collapses_to_self_test() {
+         // `movl %edx, %eax; testl %edx, %eax` computes edx&edx: rewrite to
 -- 
 2.47.3
 
 
-From cc9f42cfec61cc7cca3d26d8964fdfd993c4ff8a Mon Sep 17 00:00:00 2001
+From 4b72f16f4381d8c39d63094709741be1b109a08f Mon Sep 17 00:00:00 2001
 From: Arena Agent <agent@arena.ai>
-Date: Tue, 18 Aug 2026 11:09:37 +0000
-Subject: [PATCH 3/4] i686 peephole: extend imm+move fusion to leal address
- materialization
+Date: Tue, 18 Aug 2026 13:18:52 +0000
+Subject: [PATCH 06/11] i686: unused callee-save elimination for multi-epilogue
+ and frameless functions
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-`leal N(%esp), %eax; movl %eax, %REG` now fuses to `leal N(%esp), %REG`
-under the existing Pattern-2a deadness scan — the shape the regparm
-intcall sequence emits for every biosregs address argument (three per
-call site in the video drivers). Safe because lea never reads its
-destination; the fold is refused when %eax appears as base or index of
-the source address (retargeting would change the computed address).
+The old pass demanded exactly one subl alloc and one addl dealloc, so a
+function with an early-return epilogue (get_cpuflags, go_to_protected_mode)
+or no frame at all (bcmp after tail-call conversion) kept every dead
+push/pop pair. The setup corpus had 20 such pairs across 12 functions.
 
-Realmode kernel corpus: 34804 -> 34491 (2.65x vs GCC). 835/835 unit,
-50/50 correctness, regparm ABI matrix, and an intcall-shaped runtime
-test green.
+Rewritten with two proven shapes:
+ * FRAMED: one subl alloc, 1..n addl deallocs of the SAME value, each
+   epilogue restoring the register exactly once, pops qualified as
+   epilogue pops (only pops/directives between them and a dealloc).
+   Removal grows alloc AND every dealloc by 4/pair, so body ESP and all
+   N(%esp) slots are untouched.
+ * FRAMELESS: no ESP arithmetic AND no (%esp) reference anywhere — with
+   no slots, shifting body ESP by the removed pairs is unobservable.
+   bcmp collapses from 10 instructions to 'jmp memcmp'.
+
+Anything else (mismatched dealloc values, mixed shapes) is left alone.
+The register must be unreferenced outside its own push/pop lines; the
+duplicate-push guard stays.
+
+test_tail_call_direct_i686 updated: its %ebx pair is dead by liveness,
+so the full collapse to 'jmp target' is now the EXPECTED result; a new
+sibling test pins the restore-before-jmp order with a LIVE callee-save.
+4 more unit tests pin frameless removal, the esp-slot suppression, and
+the multi-epilogue +4 rewrite.
+
+Realmode boot corpus: 33194 -> 33138 bytes. 848/848 unit, 50/50
+correctness, 9/9 checks, regparm conformance all levels, fnptr runtime
+matrix, nbody -O0 exact.
 ---
- src/backend/i686/codegen/peephole.rs | 29 +++++++++++++++++-----------
- 1 file changed, 18 insertions(+), 11 deletions(-)
+ src/backend/i686/codegen/peephole.rs | 283 ++++++++++++++++++++++-----
+ 1 file changed, 229 insertions(+), 54 deletions(-)
 
 diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index c73176f..ff7a236 100644
+index 45ce702..36672d1 100644
 --- a/src/backend/i686/codegen/peephole.rs
 +++ b/src/backend/i686/codegen/peephole.rs
-@@ -995,18 +995,25 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+@@ -3319,77 +3319,142 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo])
+             continue;
+         }
+ 
+-        let mut alloc = None;
+-        for i in start + 1..end.min(start + 24) {
+-            if infos[i].is_nop() {
+-                continue;
+-            }
+-            if let Some(value) = parse_esp_adjust(trimmed(store, &infos[i], i), "subl") {
+-                alloc = Some((i, value));
+-                break;
++        // Prologue pushes: the consecutive Push run at the function top.
++        let mut prologue_pushes: Vec<(usize, RegId)> = Vec::new();
++        {
++            let mut i = start + 1;
++            while i < end {
++                if infos[i].is_nop() { i += 1; continue; }
++                match infos[i].kind {
++                    LineKind::Push { reg } if reg <= REG_GP_MAX => {
++                        prologue_pushes.push((i, reg));
++                        i += 1;
++                    }
++                    LineKind::Directive | LineKind::Empty => { i += 1; }
++                    _ => break,
++                }
+             }
+         }
+-        let mut dealloc = None;
+-        for i in (end.saturating_sub(24)..end).rev() {
+-            if infos[i].is_nop() {
++        if prologue_pushes.is_empty() {
++            start = end.saturating_add(1);
++            continue;
++        }
++
++        // Census of every explicit ESP adjustment in the function.
++        let mut subls: Vec<(usize, u32)> = Vec::new();
++        let mut addls: Vec<(usize, u32)> = Vec::new();
++        for i in start..end {
++            if infos[i].is_nop() { continue; }
++            let line = trimmed(store, &infos[i], i);
++            if let Some(v) = parse_esp_adjust(line, "subl") { subls.push((i, v)); }
++            if let Some(v) = parse_esp_adjust(line, "addl") { addls.push((i, v)); }
++        }
++
++        // Two supported shapes:
++        //  FRAMED:    exactly one subl (the alloc), one or more addl
++        //             deallocs ALL of the same value (one per epilogue).
++        //             Removing a pair grows both by 4 so body ESP — and
++        //             with it every N(%esp) slot — is unchanged.
++        //  FRAMELESS: no subl/addl at all AND no (%esp) reference anywhere
++        //             (no slots exist, so shifting body ESP by 4k is
++        //             unobservable; i386 needs no 16-byte call alignment
++        //             here). bcmp under tail-call conversion is the
++        //             canonical case: 4 dead push/pop pairs guarding a
++        //             2-instruction body.
++        enum Shape { Framed, Frameless }
++        let shape = if subls.len() == 1
++            && !addls.is_empty()
++            && addls.iter().all(|&(_, v)| v == subls[0].1)
++            && addls.iter().all(|&(i, _)| i > subls[0].0)
++        {
++            Shape::Framed
++        } else if subls.is_empty() && addls.is_empty() {
++            let any_esp_slot = (start..end).any(|i| {
++                !infos[i].is_nop() && trimmed(store, &infos[i], i).contains("(%esp)")
++            });
++            if any_esp_slot {
++                start = end.saturating_add(1);
+                 continue;
+             }
+-            if let Some(value) = parse_esp_adjust(trimmed(store, &infos[i], i), "addl") {
+-                dealloc = Some((i, value));
+-                break;
+-            }
+-        }
+-        let (Some((alloc_idx, alloc_value)), Some((dealloc_idx, dealloc_value))) =
+-            (alloc, dealloc)
+-        else {
++            Shape::Frameless
++        } else {
+             start = end.saturating_add(1);
+             continue;
+         };
+-        if alloc_value != dealloc_value {
+-            start = end.saturating_add(1);
+-            continue;
+-        }
+ 
+-        let mut remove = Vec::new();
+-        for reg in [REG_EBX, REG_ESI, REG_EDI, REG_EBP] {
+-            let pushes: Vec<usize> = (start..alloc_idx)
+-                .filter(|&i| matches!(infos[i].kind, LineKind::Push { reg: r } if r == reg))
+-                .collect();
+-            let pops: Vec<usize> = (dealloc_idx + 1..end)
+-                .filter(|&i| matches!(infos[i].kind, LineKind::Pop { reg: r } if r == reg))
+-                .collect();
+-            if pushes.len() != 1 || pops.len() != 1 {
+-                continue;
++        // In the framed shape each dealloc is immediately followed by the
++        // epilogue pop chain; a pop of `reg` is an EPILOGUE pop when only
++        // other pops/nops/directives sit between it and a dealloc.
++        let is_epilogue_pop = |idx: usize| -> bool {
++            match shape {
++                Shape::Frameless => true,
++                Shape::Framed => {
++                    let mut k = idx;
++                    while k > start {
++                        k -= 1;
++                        if infos[k].is_nop() { continue; }
++                        match infos[k].kind {
++                            LineKind::Pop { .. } | LineKind::Directive | LineKind::Empty => continue,
++                            _ => {
++                                let line = trimmed(store, &infos[k], k);
++                                return parse_esp_adjust(line, "addl").is_some();
++                            }
++                        }
++                    }
++                    false
++                }
+             }
+-            let used = (alloc_idx + 1..dealloc_idx).any(|i| {
+-                !infos[i].is_nop()
+-                    && line_references_reg(trimmed(store, &infos[i], i), reg)
++        };
++
++        let mut removals: Vec<(usize, Vec<usize>)> = Vec::new(); // (push_idx, pop_idxs)
++        for &(push_idx, reg) in &prologue_pushes {
++            if !matches!(reg, REG_EBX | REG_ESI | REG_EDI | REG_EBP) { continue; }
++            if prologue_pushes.iter().filter(|&&(_, r)| r == reg).count() != 1 { continue; }
++            let pops: Vec<usize> = (start..end)
++                .filter(|&i| !infos[i].is_nop()
++                    && matches!(infos[i].kind, LineKind::Pop { reg: r } if r == reg))
++                .collect();
++            if pops.is_empty() { continue; }
++            // Every epilogue must restore the register exactly once.
++            let expected = match shape {
++                Shape::Framed => addls.len(),
++                Shape::Frameless => pops.len(), // all pops must qualify below
++            };
++            if pops.len() != expected { continue; }
++            if !pops.iter().all(|&i| is_epilogue_pop(i)) { continue; }
++            // The register must be unreferenced outside its push/pop lines.
++            let used = (start..end).any(|i| {
++                if infos[i].is_nop() || i == push_idx || pops.contains(&i) {
++                    return false;
++                }
++                line_references_reg(trimmed(store, &infos[i], i), reg)
+             });
+-            if !used {
+-                remove.push((pushes[0], pops[0]));
+-            }
++            if used { continue; }
++            removals.push((push_idx, pops));
+         }
+-        if !remove.is_empty() {
+-            let bytes = 4 * remove.len() as u32;
+-            store.replace(alloc_idx, format!("    subl ${}, %esp", alloc_value + bytes));
+-            store.replace(dealloc_idx, format!("    addl ${}, %esp", dealloc_value + bytes));
+-            infos[alloc_idx] = classify_line(store.get(alloc_idx));
+-            infos[dealloc_idx] = classify_line(store.get(dealloc_idx));
+-            for (push, pop) in remove {
++
++        if !removals.is_empty() {
++            let bytes = 4 * removals.len() as u32;
++            if let Shape::Framed = shape {
++                let (alloc_idx, alloc_value) = subls[0];
++                store.replace(alloc_idx, format!("    subl ${}, %esp", alloc_value + bytes));
++                infos[alloc_idx] = classify_line(store.get(alloc_idx));
++                for &(idx, v) in &addls {
++                    store.replace(idx, format!("    addl ${}, %esp", v + bytes));
++                    infos[idx] = classify_line(store.get(idx));
++                }
++            }
++            for (push, pops) in removals {
+                 infos[push].kind = LineKind::Nop;
+-                infos[pop].kind = LineKind::Nop;
++                for p in pops {
++                    infos[p].kind = LineKind::Nop;
++                }
              }
          }
  
--        // Pattern 2b: Immediate/symbol-load + move fusion --
--        // `movl $X, %eax; movl %eax, %REG` becomes `movl $X, %REG` under the
--        // same deadness scan as Pattern 2a. The codegen emits this shape for
--        // every constant that lands in a phase-2 register (%ecx/%edx), e.g.
--        // `movl $.Lstr0, %eax; movl %eax, %edx`. GCC materializes the
--        // constant into the final register directly.
-+        // Pattern 2b: Immediate/symbol/lea + move fusion --
-+        // `movl $X, %eax; movl %eax, %REG` becomes `movl $X, %REG`, and
-+        // `leal M(%r), %eax; movl %eax, %REG` becomes `leal M(%r), %REG`,
-+        // under the same deadness scan as Pattern 2a. The codegen emits
-+        // these shapes for every constant/address that lands in a phase-2
-+        // register (%ecx/%edx), e.g. `leal 68(%esp), %eax; movl %eax, %edx`
-+        // before every regparm intcall. GCC materializes into the final
-+        // register directly. The lea form requires the source ADDRESS not
-+        // to use %eax as base/index (it would change meaning when retargeted;
-+        // dest-only retarget is always safe since lea doesn't read its dest).
-         if let LineKind::Other { dest_reg } = infos[i].kind {
-             if dest_reg == REG_EAX {
-                 let src_line = trimmed(store, &infos[i], i);
--                if src_line.starts_with("movl $") && src_line.ends_with("%eax")
--                    && !src_line.contains('(')
--                {
-+                let is_imm = src_line.starts_with("movl $") && src_line.ends_with("%eax")
-+                    && !src_line.contains('(');
-+                let is_lea = src_line.starts_with("leal ") && src_line.ends_with("%eax")
-+                    && !src_line.contains("%eax,") // %eax not a base/index
-+                    && !src_line.contains("(%eax");
-+                if is_imm || is_lea {
-                     if let LineKind::Move { dst: mdst, src: msrc } = infos[j].kind {
-                         if msrc == REG_EAX && mdst != REG_EAX && mdst <= REG_GP_MAX {
-                             // Same bounded deadness scan as Pattern 2a.
-@@ -1038,8 +1045,8 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                             }
-                             if dead {
-                                 let comma = src_line.rfind(',').unwrap();
--                                let imm = &src_line[..comma]; // "movl $X"
--                                let fused = format!("    {}, {}", imm, reg32_name(mdst));
-+                                let head = &src_line[..comma]; // "movl $X" or "leal M(%r)"
-+                                let fused = format!("    {}, {}", head, reg32_name(mdst));
-                                 store.replace(i, fused);
-                                 infos[i] = classify_line(store.get(i));
-                                 infos[j].kind = LineKind::Nop;
+         start = end.saturating_add(1);
+     }
+ }
+-
+-// ── Pass: Push/pop elimination ───────────────────────────────────────────────
+-
+-/// Eliminate push/pop pairs where the register is not modified between them.
+-// TODO: Disabled - removes function-level callee-save push/pops which breaks the
+-// leal -12(%ebp),%esp epilogue pattern. Needs awareness of function boundaries.
+ #[allow(dead_code)]
+ fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+     let len = infos.len();
+@@ -4348,16 +4413,126 @@ mod tests {
+ 
+     #[test]
+     fn test_tail_call_direct_i686() {
++        // The %ebx copy is dead (never read), so the liveness pass deletes
++        // it; the unused-callee-save pass then removes the push/pop pair
++        // (frameless shape), and the tail-call conversion turns the call
++        // into a jmp. The whole function collapses to `jmp target`.
+         let asm = "f:\n    pushl %ebx\n    movl %eax, %ebx\n    call target\n    popl %ebx\n    ret\n".to_string();
+         let result = peephole_optimize(asm);
+         assert!(result.contains("jmp target"), "expected tail call, got:\n{}", result);
+         assert!(!result.contains("call target"), "call should be gone:\n{}", result);
+-        // epilogue pop must stay BEFORE the jmp
++        assert!(!result.contains("pushl %ebx") && !result.contains("popl %ebx"),
++            "dead callee-save pair must go:\n{}", result);
++        // If a restore had survived, it would have to precede the jmp; with
++        // the pair gone the ordering constraint is vacuous.
++    }
++
++    #[test]
++    fn test_tail_call_with_live_callee_save_restores_before_jmp() {
++        // %ebx is genuinely used (feeds the tail-callee's argument), so the
++        // pair must SURVIVE and the pop must precede the jmp.
++        let asm = concat!(
++            "f:\n",
++            "    pushl %ebx\n",
++            "    movl %eax, %ebx\n",
++            "    incl %ebx\n",
++            "    movl %ebx, %eax\n",
++            "    call target\n",
++            "    popl %ebx\n",
++            "    ret\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert!(result.contains("jmp target"), "expected tail call, got:\n{}", result);
+         let jmp_pos = result.find("jmp target").unwrap();
+         let pop_pos = result.find("popl %ebx").unwrap();
+         assert!(pop_pos < jmp_pos, "restore must precede jmp:\n{}", result);
+     }
+ 
++    #[test]
++    fn unused_callee_saves_removed_in_frameless_multi_pop_function() {
++        // bcmp shape: four dead pairs guarding a tail-jmp, no frame, no
++        // (%esp) references. All four pairs must vanish.
++        let asm = concat!(
++            "bcmp:\n",
++            ".cfi_startproc\n",
++            "    pushl %ebx\n",
++            "    pushl %esi\n",
++            "    pushl %edi\n",
++            "    pushl %ebp\n",
++            "    popl %ebp\n",
++            "    popl %edi\n",
++            "    popl %esi\n",
++            "    popl %ebx\n",
++            "    jmp memcmp\n",
++            ".cfi_endproc\n",
++            ".size bcmp, .-bcmp\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert!(!result.contains("pushl"), "{result}");
++        assert!(!result.contains("popl"), "{result}");
++        assert!(result.contains("jmp memcmp"), "{result}");
++    }
++
++    #[test]
++    fn unused_callee_saves_kept_when_esp_slots_exist_in_frameless_fn() {
++        // Frameless but the body reads 0(%esp): removing a push would shift
++        // the slot. Pair must stay.
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    pushl %ebx\n",
++            "    movl 8(%esp), %eax\n",
++            "    popl %ebx\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert!(result.contains("pushl %ebx"), "{result}");
++        assert!(result.contains("popl %ebx"), "{result}");
++    }
++
++    #[test]
++    fn unused_callee_saves_removed_across_multiple_epilogues() {
++        // Framed shape with TWO epilogues (early return + fallthrough):
++        // %ebp is never referenced; both pops and the push must go, and
++        // both addl deallocs plus the subl alloc grow by 4.
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    pushl %ebx\n",
++            "    pushl %ebp\n",
++            "    subl $16, %esp\n",
++            "    movl %eax, %ebx\n",
++            "    testl %eax, %eax\n",
++            "    je .L1\n",
++            "    movl %ebx, %eax\n",
++            "    movl %eax, 0(%esp)\n",
++            "    movl 0(%esp), %eax\n",
++            "    addl $16, %esp\n",
++            "    popl %ebp\n",
++            "    popl %ebx\n",
++            "    ret\n",
++            ".L1:\n",
++            "    xorl %eax, %eax\n",
++            "    addl $16, %esp\n",
++            "    popl %ebp\n",
++            "    popl %ebx\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert!(!result.contains("%ebp"), "unused %ebp pair must go:\n{result}");
++        assert_eq!(result.matches("subl $20, %esp").count(), 1, "{result}");
++        assert_eq!(result.matches("addl $20, %esp").count(), 2, "{result}");
++        assert!(result.contains("pushl %ebx"), "live %ebx pair stays:\n{result}");
++    }
++
+     #[test]
+     fn test_tail_call_suppressed_by_leal_slot() {
+         // Address of a frame slot escapes to the callee: converting would
 -- 
 2.47.3
 
 
-From 12b0ff8233db2a14ddbb06285a3a98d6d188a64d Mon Sep 17 00:00:00 2001
+From e1119fe97306d45a44e4eece1a148ba8cf87f27b Mon Sep 17 00:00:00 2001
 From: Arena Agent <agent@arena.ai>
-Date: Tue, 18 Aug 2026 11:10:21 +0000
-Subject: [PATCH 4/4] =?UTF-8?q?docs:=20session-5=20log=20=E2=80=94=20upstr?=
- =?UTF-8?q?eam=20refit,=20zext/lea=20peepholes,=2034491-byte=20realmode=20?=
- =?UTF-8?q?corpus?=
+Date: Tue, 18 Aug 2026 13:28:15 +0000
+Subject: [PATCH 07/11] i686 global-fnptr fold: add per-triple linear-seal
+ proof
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The slot-ownership proof folds a displacement only when EVERY reference
+in the function belongs to a candidate triple — one interleaved use of
+the slot for something else blocked all 39 remaining pio_ops dispatch
+sites (slot 0 is the emitter's favorite scratch).
+
+Second, per-triple proof (linear seal): walking forward from the call
+across straight-line code only (no label, no branch/ret, no push/pop,
+no ESP arithmetic), the FIRST access overlapping the slot's 4 bytes is
+an exact full-width movl store. Then the staged value is observable
+only by our call, and folding is sound regardless of what the rest of
+the function does with the slot. Chains of same-slot triples fold by
+induction: each member's own window+walk is branch-free, so removing
+earlier pairs never exposes a reader. Overlap windows ([d-3,d+3] for
+the textual scan) block partial-width aliasing in both proofs.
+
+Realmode boot corpus: 33138 -> 32926 bytes (32 more sites folded).
+2 new unit tests: the reuse-chain fold and the branch-before-reseal
+block. 850/850 unit, 50/50 correctness, 9/9 checks, regparm all
+levels, fnptr runtime matrix, nbody -O0 exact.
+---
+ src/backend/i686/codegen/peephole.rs | 179 +++++++++++++++++++++++----
+ 1 file changed, 152 insertions(+), 27 deletions(-)
+
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index 36672d1..6cb88c9 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -2976,37 +2976,99 @@ fn fold_global_fnptr_calls(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
+             i = ci + 1;
+         }
+ 
+-        // Phase 2: for each displacement with candidates, require that EVERY
+-        // textual reference to that displacement inside the function is a
+-        // member (store or call) of some candidate triple. Then all triples
+-        // of that displacement fold together: every read of any of the
+-        // physical slots those stores wrote is one of the rewritten calls,
+-        // so no stale read can remain — under ANY ESP numbering (raw-text
+-        // matching over-approximates aliasing; unmatched references merely
+-        // block the fold).
++        // Phase 2: decide foldability per triple by one of two proofs.
++        //
++        // (a) SLOT OWNERSHIP: every textual reference to the displacement in
++        //     the function is a member (store or call) of some candidate
++        //     triple. With no foreign reference, no stale read can exist
++        //     under ANY ESP numbering (raw-text matching over-approximates
++        //     aliasing; an unmatched reference merely fails this proof).
++        //     Triples on one slot are disjoint intervals (the store->call
++        //     window crosses only reg/imm ops), so folding any subset is
++        //     independent of the rest.
++        //
++        // (b) LINEAR SEAL: walking forward from the triple's call, crossing
++        //     only lines that are not labels, not branches/rets, not
++        //     push/pop/ESP arithmetic, and do not reference the slot, the
++        //     FIRST reference to the slot is a full-width `movl` store.
++        //     Then our store's value is observable only by our call: the
++        //     span store->call crosses reg/imm ops only, and the span
++        //     call->seal has no reader before the slot is overwritten.
++        //     Chains stay sound by induction: if the sealing store belongs
++        //     to a later triple that also folds, THAT triple's own proof
++        //     guarantees the next access is again a seal (its window and
++        //     walk are label/branch-free), so removing intermediate
++        //     store/call pairs never exposes a reader.
+         if !triples.is_empty() {
+-            let mut disps: Vec<i32> = triples.iter().map(|t| t.disp).collect();
+-            disps.sort_unstable();
+-            disps.dedup();
+-            for d in disps {
+-                let members: Vec<&Triple> = triples.iter().filter(|t| t.disp == d).collect();
+-                let mut blocked = false;
+-                'refscan: for t in fstart..fend {
+-                    if infos[t].is_nop() { continue; }
+-                    if members.iter().any(|m| m.sj == t || m.ck == t) { continue; }
+-                    if references_esp_slot(trimmed(store, &infos[t], t), d) {
+-                        blocked = true;
+-                        break 'refscan;
++            let mut owned: Vec<i32> = Vec::new();
++            {
++                let mut disps: Vec<i32> = triples.iter().map(|t| t.disp).collect();
++                disps.sort_unstable();
++                disps.dedup();
++                for d in disps {
++                    let members: Vec<&Triple> = triples.iter().filter(|t| t.disp == d).collect();
++                    // Overlap window [d-3, d+3]: any 1/2/4-byte access whose
++                    // lowest address lands there can touch our 4 bytes.
++                    let foreign = (fstart..fend).any(|t| {
++                        !infos[t].is_nop()
++                            && !members.iter().any(|m| m.sj == t || m.ck == t)
++                            && (d - 3..=d + 3).any(|dd| {
++                                references_esp_slot(trimmed(store, &infos[t], t), dd)
++                            })
++                    });
++                    if !foreign {
++                        owned.push(d);
+                     }
+                 }
+-                if blocked { continue; }
+-                for m in members {
+-                    infos[m.li].kind = LineKind::Nop;
+-                    infos[m.sj].kind = LineKind::Nop;
+-                    store.replace(m.ck, format!("    call *{}", m.sym));
+-                    infos[m.ck] = classify_line(store.get(m.ck));
+-                    changed = true;
++            }
++
++            let linear_seal = |m: &Triple| -> bool {
++                let mut k = m.ck + 1;
++                while k < fend {
++                    if infos[k].is_nop() { k += 1; continue; }
++                    let s = trimmed(store, &infos[k], k);
++                    match infos[k].kind {
++                        LineKind::Empty | LineKind::Directive => { k += 1; continue; }
++                        LineKind::Label | LineKind::Jmp | LineKind::JmpIndirect
++                        | LineKind::CondJmp | LineKind::Ret
++                        | LineKind::Push { .. } | LineKind::Pop { .. } => return false,
++                        LineKind::StoreEbp { offset, size, .. }
++                            if offset == ESP_SLOT_BIAS + m.disp =>
++                        {
++                            // Exact full-width overwrite seals the lifetime.
++                            return size == MoveSize::L;
++                        }
++                        _ => {}
++                    }
++                    // ESP arithmetic renumbers the slot; any textual
++                    // reference OVERLAPPING our 4 bytes ([disp-3, disp+3]
++                    // catches every 1/2/4-byte access that could touch
++                    // them) is a potential read or partial overwrite.
++                    if parse_esp_adjust(s, "subl").is_some()
++                        || parse_esp_adjust(s, "addl").is_some()
++                        || (s.contains("%esp") && !s.contains("(%esp)"))
++                    {
++                        return false;
++                    }
++                    if (m.disp - 3..=m.disp + 3).any(|d| references_esp_slot(s, d)) {
++                        return false;
++                    }
++                    k += 1;
+                 }
++                false
++            };
++
++            let fold_flags: Vec<bool> = triples
++                .iter()
++                .map(|m| owned.contains(&m.disp) || linear_seal(m))
++                .collect();
++            for (m, fold) in triples.iter().zip(fold_flags) {
++                if !fold { continue; }
++                infos[m.li].kind = LineKind::Nop;
++                infos[m.sj].kind = LineKind::Nop;
++                store.replace(m.ck, format!("    call *{}", m.sym));
++                infos[m.ck] = classify_line(store.get(m.ck));
++                changed = true;
+             }
+         }
+ 
+@@ -3940,6 +4002,69 @@ mod tests {
+         assert!(!result.contains("movl pio_ops+8, %eax"), "{result}");
+     }
+ 
++    #[test]
++    fn global_fnptr_call_folds_when_slot_resealed_by_next_store() {
++        // Slot 0 is REUSED: after the first call the very next slot access
++        // is a full-width store (the second triple's spill). Linear-seal
++        // proof folds BOTH triples even though the ownership proof fails
++        // for neither alone... and the last one seals via ownership of the
++        // remaining window. The early_serial_console shape.
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    subl $8, %esp\n",
++            "    movl pio_ops+4, %eax\n",
++            "    movl %eax, 0(%esp)\n",
++            "    movl %edi, %edx\n",
++            "    movl $3, %eax\n",
++            "    call *0(%esp)\n",
++            "    movl pio_ops+4, %eax\n",
++            "    movl %eax, 0(%esp)\n",
++            "    movl %edi, %edx\n",
++            "    movl $5, %eax\n",
++            "    call *0(%esp)\n",
++            "    addl $8, %esp\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert_eq!(result.matches("call *pio_ops+4").count(), 2, "{result}");
++        assert!(!result.contains("call *0(%esp)"), "{result}");
++    }
++
++    #[test]
++    fn global_fnptr_linear_seal_blocked_by_branch_before_reuse() {
++        // A conditional branch sits between the call and the resealing
++        // store: the reader on the taken path is invisible to the linear
++        // walk, so the FIRST triple must NOT fold. (The second one folds
++        // via its own proof; slot 4 read at .L1 keeps ownership failing.)
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    subl $8, %esp\n",
++            "    movl pio_ops, %eax\n",
++            "    movl %eax, 4(%esp)\n",
++            "    call *4(%esp)\n",
++            "    testl %eax, %eax\n",
++            "    je .L1\n",
++            "    movl %ecx, 4(%esp)\n",
++            "    addl $8, %esp\n",
++            "    ret\n",
++            ".L1:\n",
++            "    movl 4(%esp), %eax\n",
++            "    addl $8, %esp\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert!(result.contains("call *4(%esp)"), "must stay staged:\n{result}");
++        assert!(!result.contains("call *pio_ops"), "{result}");
++    }
++
+     #[test]
+     fn global_fnptr_call_fold_blocked_by_foreign_slot_use() {
+         // The slot is ALSO read by a non-call line: no triple may fold.
+-- 
+2.47.3
+
+
+From 3590b69ed7d173d01407613a5ab4e1f996a14071 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Tue, 18 Aug 2026 13:48:20 +0000
+Subject: [PATCH 08/11] i686/x86-64: folded memory operands are RANGE accesses;
+ CFG load retarget
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Correctness (found while validating this session's shrink work — it is
+PRE-EXISTING on main, reproduced back through d7a64eb):
+
+spectral_norm printed 44.72 instead of 1.274 at -m32 -O2/-Os. Root
+cause: three i686 passes treated a folded-operand frame access as a
+POINT (offset equality). 'fstpl 20(%esp)' names offset 20 but writes
+20..28, so forward_slot_loads kept its '%edx holds 24(%esp)' mapping
+alive across the x87 store and rewrote the reload of the sum's high
+word into the PREVIOUS iteration's stale register. All folded-operand
+checks now use ranges_overlap with a conservative 16-byte width (x87
+fstpt = 10, SSE movdqu = 16):
+ * forward_slot_loads: window break on overlap, not equality;
+ * eliminate_dead_stores: liveness on overlap, not equality;
+ * Pattern 2b-mem deadness scan: same.
+20-line reproducer pinned as unit test (stale movl %edx,48(%esp) must
+not survive an fstpl 20(%esp)).
+
+Same latent defect in the x86-64 twins, fixed defensively (no
+reproducer found — slot spacing hides it today, one relayout away from
+biting): store_forwarding invalidate_slots_at now gets access_size 16
+for folded operands (was 1); never-read-store DSE records 16-byte read
+ranges for unparsed rbp/rsp operands (was 8, missing a long double's
+tail).
+
+Size (this session, i686 CFG-liveness addition): load/materialize
+retarget 'movl SRC,%eax; movl %eax,%REG' -> 'movl SRC,%REG' when CFG
+liveness proves %eax dead after the copy — the windowed Pattern 2a/2b
+twins stop at barriers and never fused the phi-move-before-branch
+shape (21 sites).
+
+Realmode boot corpus: 32926 -> 32750 net (-191 retarget, +15 giving
+back unsound forwardings). x86-64 -O2 corpus unchanged at 25027 (gcc
+25796). nbody/spectral_norm/binary_trees now match gcc at -m32 and
+-m64, -O0..-Os. 851/851 unit, 50/50 correctness, 9/9 checks, regparm
+all levels, fnptr matrix, nbody -O0 exact.
+---
+ src/backend/i686/codegen/peephole.rs          | 126 +++++++++++++++++-
+ .../x86/codegen/peephole/passes/dead_code.rs  |   5 +-
+ .../peephole/passes/store_forwarding.rs       |   7 +-
+ 3 files changed, 129 insertions(+), 9 deletions(-)
+
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index 6cb88c9..5bcce33 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -1050,8 +1050,10 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+                                     if infos[k].is_barrier() { break; }
+                                     let s = trimmed(store, &infos[k], k);
+                                     if matches!(infos[k].kind,
+-                                        LineKind::LoadEbp { offset: o, .. } if o == offset)
+-                                        || infos[k].ebp_offset == offset
++                                        LineKind::LoadEbp { offset: o, size: ls, .. }
++                                            if ranges_overlap(offset, size.byte_size(), o, ls.byte_size()))
++                                        || (infos[k].ebp_offset != EBP_OFFSET_NONE
++                                            && ranges_overlap(offset, size.byte_size(), infos[k].ebp_offset, 16))
+                                     {
+                                         break;
+                                     }
+@@ -1692,10 +1694,19 @@ fn forward_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+                 _ => {}
+             }
+             if infos[j].has_indirect_mem { break; }
+-            // A folded-operand access of the slot: reads keep the store
++            // A folded-operand access near the slot: reads keep the store
+             // live; a WRITE through a folded operand is indistinguishable
+-            // here, so stop conservatively either way.
+-            if infos[j].ebp_offset == slot { break; }
++            // here, so stop conservatively either way. The access must be
++            // treated as a RANGE, not a point: `fstpl 20(%esp)` writes
++            // 20..28 and killed a forwarded `movl %edx, 24(%esp)` in
++            // spectral_norm (sum's high word replaced by v[j]'s stale high
++            // word at -m32 -O2). 16 bytes covers every x86 access (x87
++            // fstpt = 10, SSE movdqu = 16).
++            if infos[j].ebp_offset != EBP_OFFSET_NONE
++                && ranges_overlap(slot, store_bytes, infos[j].ebp_offset, 16)
++            {
++                break;
++            }
+             // Implicit register writes the generic parser misses.
+             {
+                 let s = trimmed(store, &infos[j], j);
+@@ -1808,8 +1819,15 @@ fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+                 // Stop at indirect memory access (could read the slot)
+                 let s = trimmed(store, &infos[j], j);
+                 if infos[j].has_indirect_mem { break; }
+-                // If line references ebp with same offset, it's alive
+-                if infos[j].ebp_offset == store_off { break; }
++                // A folded-operand access overlapping the slot keeps the
++                // store alive. Same range-not-point rule as the forwarding
++                // pass: `fldl 16(%esp)` names offset 16 but reads 16..24,
++                // so equality alone missed reads of the high dword.
++                if infos[j].ebp_offset != EBP_OFFSET_NONE
++                    && ranges_overlap(store_off, store_bytes, infos[j].ebp_offset, 16)
++                {
++                    break;
++                }
+                 // leaq N(%ebp) takes address of slot
+                 if s.contains("(%ebp)") && !matches!(infos[j].kind, LineKind::StoreEbp { .. } | LineKind::LoadEbp { .. }) {
+                     break;
+@@ -2366,6 +2384,61 @@ fn optimize_cfg_register_liveness(
+             }
+         }
+ 
++        // Load/materialize retarget: `movl SRC, %eax; movl %eax, %REG` with
++        // %eax dead after the copy becomes `movl SRC, %REG`. The windowed
++        // Pattern 2a/2b twins stop at barriers, so the ubiquitous
++        // `load; copy; jmp .LBBn` shape (phi-move before a branch edge)
++        // never fused there — CFG liveness proves %eax dead ACROSS the
++        // edge. Only the trailing ", %eax" destination is rewritten; a SRC
++        // that mentions any %eax alias is skipped so the rewrite never has
++        // to reason about reads of the old accumulator value.
++        let mut local = 0usize;
++        while local < n {
++            let i = start + local;
++            let retarget_ok = match infos[i].kind {
++                LineKind::LoadEbp { reg: REG_EAX, .. } => true,
++                LineKind::Other { dest_reg } if dest_reg == REG_EAX => {
++                    let s = trimmed(store, &infos[i], i);
++                    let mn = s.split_ascii_whitespace().next().unwrap_or("");
++                    matches!(mn, "movl" | "leal" | "movzbl" | "movzwl" | "movsbl" | "movswl")
++                        && s.ends_with(", %eax")
++                }
++                _ => false,
++            };
++            if !retarget_ok {
++                local += 1;
++                continue;
++            }
++            let s = trimmed(store, &infos[i], i);
++            let Some(src_part) = s.strip_suffix(", %eax") else { local += 1; continue; };
++            if src_part.contains("%eax") || src_part.contains("%ax")
++                || src_part.contains("%al") || src_part.contains("%ah")
++            {
++                local += 1;
++                continue;
++            }
++            let Some(j_local) = (local + 1..n).find(|&p| !infos[start + p].is_nop()) else {
++                break;
++            };
++            let j = start + j_local;
++            let LineKind::Move { dst, src: REG_EAX } = infos[j].kind else { local += 1; continue; };
++            if dst == REG_EAX || dst > REG_GP_MAX || dst == REG_ESP {
++                local += 1;
++                continue;
++            }
++            if live_out[j_local] & (1u16 << REG_EAX) != 0 {
++                local += 1;
++                continue;
++            }
++            let new_line = format!("    {}, {}", src_part, reg32_name(dst));
++            store.replace(i, new_line);
++            let re = classify_line(store.get(i));
++            infos[i] = LineInfo { trim_start: infos[i].trim_start, ..re };
++            infos[j].kind = LineKind::Nop;
++            changed = true;
++            local = j_local + 1;
++        }
++
+         for local in 0..n {
+             let i = start + local;
+             if let LineKind::Move { dst, .. } = infos[i].kind {
+@@ -3972,6 +4045,45 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn slot_forwarding_respects_wide_x87_folded_stores() {
++        // spectral_norm -m32 -O2 miscompile: `fstpl 20(%esp)` writes
++        // 20..28, so the forwarded mapping %edx -> 24(%esp) must die at
++        // the fstpl. The reload of 24(%esp) must NOT become `movl %edx,
++        // 48(%esp)` (stale high word of the previous iteration's value).
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    subl $56, %esp\n",
++            "    movl (%ecx), %eax\n",
++            "    movl 4(%ecx), %edx\n",
++            "    movl %eax, 20(%esp)\n",
++            "    movl %edx, 24(%esp)\n",
++            "    fldl 12(%esp)\n",
++            "    fldl 20(%esp)\n",
++            "    faddp %st, %st(1)\n",
++            "    fstpl 20(%esp)\n",
++            "    movl 20(%esp), %eax\n",
++            "    movl %eax, 44(%esp)\n",
++            "    movl 24(%esp), %eax\n",
++            "    movl %eax, 48(%esp)\n",
++            "    addl $56, %esp\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert!(
++            !result.contains("movl %edx, 48(%esp)"),
++            "stale forwarded %edx must not survive the fstpl overwrite:\n{result}"
++        );
++        assert!(
++            result.contains("movl 24(%esp), %eax") || result.contains("24(%esp)"),
++            "the high word must be re-read from memory:\n{result}"
++        );
++    }
++
+     #[test]
+     fn global_fnptr_call_folds_load_spill_call() {
+         // Two same-slot sites in one function must BOTH fold (every
+diff --git a/src/backend/x86/codegen/peephole/passes/dead_code.rs b/src/backend/x86/codegen/peephole/passes/dead_code.rs
+index b5de3b7..68a9a70 100644
+--- a/src/backend/x86/codegen/peephole/passes/dead_code.rs
++++ b/src/backend/x86/codegen/peephole/passes/dead_code.rs
+@@ -671,7 +671,10 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
+                     let line = infos[k].trimmed(store.get(k));
+                     let rbp_off = parse_rbp_offset(line);
+                     if rbp_off != RBP_OFFSET_NONE {
+-                        read_ranges.push((rbp_off, 8));
++                        // Range, not point: x87 folded operands read past
++                        // the named offset (fldt = 10 bytes, movdqu = 16).
++                        // 8 bytes missed the tail of a long double slot.
++                        read_ranges.push((rbp_off, 16));
+                     } else if line.contains("(%rbp)") || line.contains("(%rsp)") {
+                         has_unparseable_indirect = true;
+                         break;
+diff --git a/src/backend/x86/codegen/peephole/passes/store_forwarding.rs b/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
+index 5f810b9..0a82d3c 100644
+--- a/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
++++ b/src/backend/x86/codegen/peephole/passes/store_forwarding.rs
+@@ -333,7 +333,12 @@ fn gsf_handle_other(
+     if infos[i].has_indirect_mem {
+         invalidate_all_mappings(slot_entries, reg_offsets);
+     } else if infos[i].rbp_offset != RBP_OFFSET_NONE {
+-        invalidate_slots_at(slot_entries, reg_offsets, infos[i].rbp_offset, 1);
++        // A folded memory operand is a RANGE access, not a point: x87
++        // `fstpt -24(%rbp)` writes 10 bytes, `movdqu` 16. Treating it as
++        // 1 byte kept forwarded mappings for the neighboring slots alive
++        // across a wide store (the i686 twin miscompiled spectral_norm
++        // exactly this way). 16 bytes covers every x86 access width.
++        invalidate_slots_at(slot_entries, reg_offsets, infos[i].rbp_offset, 16);
+     }
+ }
+ 
+-- 
+2.47.3
+
+
+From 4e661940713f9cb5b626353463e6aaade8d5d684 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Tue, 18 Aug 2026 13:52:00 +0000
+Subject: [PATCH 09/11] i686: fold dead-register compares into memory operands
+ via CFG liveness
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+'movl SLOT,%R; testl %R,%R; jcc' (and cmpl $imm,%R) where CFG liveness
+proves %R dead on every successor path becomes 'cmpl $0|$imm, SLOT;
+jcc' — the load disappears and no register is consumed. testl %r,%r
+and cmpl $0,mem set identical ZF/SF/OF/CF for every jcc, so the
+rewrite is flag-exact. The consumer is almost always a branch into
+another block, which is why the windowed passes (barrier-bounded)
+never caught the 64 sites in the setup corpus.
+
+Realmode boot corpus: 32750 -> 32610 bytes. 2 unit tests pin the fold
+and the live-register suppression. 853/853 unit, 50/50 correctness,
+9/9 checks, regparm all levels, benchmark parity at -m32/-m64.
+---
+ src/backend/i686/codegen/peephole.rs | 106 +++++++++++++++++++++++++++
+ 1 file changed, 106 insertions(+)
+
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index 5bcce33..b57f3b0 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -2439,6 +2439,60 @@ fn optimize_cfg_register_liveness(
+             local = j_local + 1;
+         }
+ 
++        // Compare-with-memory fold: `movl SLOT, %R; testl %R, %R` (or
++        // `cmpl $imm, %R`) with %R dead after the flags op becomes
++        // `cmpl $0|$imm, SLOT`. Only the FLAGS survive; the load is gone
++        // and no register is consumed. testl: 4+2 -> 5 bytes (disp8);
++        // cmpl $imm8: 4+3 -> 5. CFG liveness is required because the
++        // consumer is almost always a jcc into another block; the
++        // windowed passes cannot see across it.
++        let mut local = 0usize;
++        while local < n {
++            let i = start + local;
++            let LineKind::LoadEbp { reg, offset, size: MoveSize::L } = infos[i].kind else {
++                local += 1;
++                continue;
++            };
++            if reg > REG_GP_MAX {
++                local += 1;
++                continue;
++            }
++            let Some(j_local) = (local + 1..n).find(|&p| !infos[start + p].is_nop()) else {
++                break;
++            };
++            let j = start + j_local;
++            if infos[j].kind != LineKind::Cmp {
++                local += 1;
++                continue;
++            }
++            let s = trimmed(store, &infos[j], j);
++            let rn = reg32_name(reg);
++            let imm: Option<&str> = if s == format!("testl {rn}, {rn}") {
++                Some("$0")
++            } else {
++                s.strip_prefix("cmpl ")
++                    .and_then(|rest| rest.strip_suffix(&format!(", {rn}")))
++                    .filter(|lhs| lhs.starts_with('$') && !lhs.contains(rn))
++            };
++            let Some(imm) = imm else { local += 1; continue; };
++            if live_out[j_local] & (1u16 << reg) != 0 {
++                local += 1;
++                continue;
++            }
++            let (disp, base) = if offset >= ESP_SLOT_BIAS / 2 {
++                (offset - ESP_SLOT_BIAS, "%esp")
++            } else {
++                (offset, "%ebp")
++            };
++            let fused = format!("    cmpl {}, {}({})", imm, disp, base);
++            store.replace(j, fused);
++            let re = classify_line(store.get(j));
++            infos[j] = LineInfo { trim_start: infos[j].trim_start, ..re };
++            infos[i].kind = LineKind::Nop;
++            changed = true;
++            local = j_local + 1;
++        }
++
+         for local in 0..n {
+             let i = start + local;
+             if let LineKind::Move { dst, .. } = infos[i].kind {
+@@ -4045,6 +4099,58 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn cmp_with_memory_folds_when_register_dies_at_branch() {
++        // `movl SLOT,%eax; testl %eax,%eax; je` with %eax dead on both
++        // paths -> `cmpl $0, SLOT; je`. Needs CFG liveness (consumer is a
++        // branch). Both branch targets overwrite %eax before reading it.
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    subl $8, %esp\n",
++            "    movl 4(%esp), %eax\n",
++            "    testl %eax, %eax\n",
++            "    je .L1\n",
++            "    movl $3, %eax\n",
++            "    addl $8, %esp\n",
++            "    ret\n",
++            ".L1:\n",
++            "    xorl %eax, %eax\n",
++            "    addl $8, %esp\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert!(result.contains("cmpl $0, 4(%esp)"), "{result}");
++        assert!(!result.contains("movl 4(%esp), %eax"), "{result}");
++    }
++
++    #[test]
++    fn cmp_with_memory_not_folded_when_register_stays_live() {
++        // %eax is READ on the fallthrough path: the load must survive.
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    subl $8, %esp\n",
++            "    movl 4(%esp), %eax\n",
++            "    testl %eax, %eax\n",
++            "    je .L1\n",
++            "    incl %eax\n",
++            ".L1:\n",
++            "    addl $8, %esp\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++            ".size f, .-f\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert!(result.contains("4(%esp), %eax") || result.contains("testl %eax, %eax"),
++            "load must survive while %eax is live:\n{result}");
++        assert!(!result.contains("cmpl $0, 4(%esp)"), "{result}");
++    }
++
+     #[test]
+     fn slot_forwarding_respects_wide_x87_folded_stores() {
+         // spectral_norm -m32 -O2 miscompile: `fstpl 20(%esp)` writes
+-- 
+2.47.3
+
+
+From cb4c831a9c9caf2845ac63fd880be246a6ba127c Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Tue, 18 Aug 2026 13:53:58 +0000
+Subject: [PATCH 10/11] i686: retarget copy-then-spill through CFG liveness
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+'movl %REG, %eax; movl %eax, SLOT' with %eax dead after the store (CFG
+liveness — the spill of a phi value is almost always followed by a
+label or branch that blinds the windowed passes) becomes
+'movl %REG, SLOT'. 17 sites in the setup corpus.
+
+Realmode boot corpus: 32610 -> 32574 bytes. Full battery green:
+853/853 unit, 50/50 correctness, 9/9 checks, regparm all levels,
+benchmark parity -m32, fnptr matrix, nbody exact.
+---
+ src/backend/i686/codegen/peephole.rs | 41 ++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index b57f3b0..6f278b7 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -2439,6 +2439,47 @@ fn optimize_cfg_register_liveness(
+             local = j_local + 1;
+         }
+ 
++        // Copy-then-store retarget: `movl %REG, %eax; movl %eax, SLOT`
++        // with %eax dead after the store becomes `movl %REG, SLOT`. Same
++        // CFG-liveness need as the load retarget above (a label or branch
++        // usually follows the spill of a phi value).
++        let mut local = 0usize;
++        while local < n {
++            let i = start + local;
++            let LineKind::Move { dst: REG_EAX, src } = infos[i].kind else {
++                local += 1;
++                continue;
++            };
++            if src > REG_GP_MAX || src == REG_EAX {
++                local += 1;
++                continue;
++            }
++            let Some(j_local) = (local + 1..n).find(|&p| !infos[start + p].is_nop()) else {
++                break;
++            };
++            let j = start + j_local;
++            let LineKind::StoreEbp { reg: REG_EAX, offset, size: MoveSize::L } = infos[j].kind
++            else {
++                local += 1;
++                continue;
++            };
++            if live_out[j_local] & (1u16 << REG_EAX) != 0 {
++                local += 1;
++                continue;
++            }
++            let (disp, base) = if offset >= ESP_SLOT_BIAS / 2 {
++                (offset - ESP_SLOT_BIAS, "%esp")
++            } else {
++                (offset, "%ebp")
++            };
++            store.replace(j, format!("    movl {}, {}({})", reg32_name(src), disp, base));
++            let re = classify_line(store.get(j));
++            infos[j] = LineInfo { trim_start: infos[j].trim_start, ..re };
++            infos[i].kind = LineKind::Nop;
++            changed = true;
++            local = j_local + 1;
++        }
++
+         // Compare-with-memory fold: `movl SLOT, %R; testl %R, %R` (or
+         // `cmpl $imm, %R`) with %R dead after the flags op becomes
+         // `cmpl $0|$imm, SLOT`. Only the FLAGS survive; the load is gone
+-- 
+2.47.3
+
+
+From a9a1471aa30a5166267c8e810535400a5bf92bf4 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Tue, 18 Aug 2026 13:55:53 +0000
+Subject: [PATCH 11/11] =?UTF-8?q?docs:=20session-6=20log=20=E2=80=94=20cal?=
+ =?UTF-8?q?lee-saves,=20CFG=20folds,=20wide-operand=20miscompile=20fix,=20?=
+ =?UTF-8?q?32574-byte=20corpus?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
 ---
- .../2026-08-18-session5-upstream-refit.md     | 85 +++++++++++++++++++
- 1 file changed, 85 insertions(+)
- create mode 100644 docs/history/2026-08-18-session5-upstream-refit.md
+ ...6-08-18-session6-callee-saves-cfg-folds.md | 108 ++++++++++++++++++
+ 1 file changed, 108 insertions(+)
+ create mode 100644 docs/history/2026-08-18-session6-callee-saves-cfg-folds.md
 
-diff --git a/docs/history/2026-08-18-session5-upstream-refit.md b/docs/history/2026-08-18-session5-upstream-refit.md
+diff --git a/docs/history/2026-08-18-session6-callee-saves-cfg-folds.md b/docs/history/2026-08-18-session6-callee-saves-cfg-folds.md
 new file mode 100644
-index 0000000..7760a14
+index 0000000..2e1b6e0
 --- /dev/null
-+++ b/docs/history/2026-08-18-session5-upstream-refit.md
-@@ -0,0 +1,85 @@
-+# 2026-08-18 (session 5) — Upstream refit + zext/lea peepholes
++++ b/docs/history/2026-08-18-session6-callee-saves-cfg-folds.md
+@@ -0,0 +1,108 @@
++# Session 6 (2026-08-18, part 2): callee-saves, CFG folds, and a wide-operand miscompile fix
 +
-+**Base:** `origin/main` @ `a4b98b5` (post-PR #116)
-+**Branch:** `arena/audit-refit` — snapshot `/home/user/ms178-1.patch`
-+**Context:** PRs #113–#116 merged large agent deliveries (SLP distances, dot-FMA,
-+multi-accumulator XMM, i686 setup-path tightening, lccc-ld ELF32 script links).
-+The S08/S17 content was merged in PRE-audit form.
++## Base
 +
-+## Commits this session
++Re-based onto upstream `d7a64eb` (PR #118 = user's merge of session-5/6a work,
++commit `14e34f3` "Restore lost S08/S17 codegen correctness and tighten i686
++peephole fusion"). **The merge again took a squashed form**: the six audit
++fixes and the two i686 zext/lea peepholes are IN, but the five session-6a
++commits (function-scoped DSE, windowed-DSE fix, 2b-mem, 2d fix, global-fnptr
++fold) were NOT in #118 — they were re-applied from the `ms178-1.patch`
++snapshot (patches 5–9) and re-validated. All six defect reproducers green
++after re-base.
 +
-+1. **`a2eb40f` — Re-apply the 5 lost audit fixes + fix a 6th (new) defect**
-+   - Fixes 1–5 are the session-4 audit set (FMA contract gating both backends,
-+     GCC-parity contraction defaults/stickiness, mul-add fusion skipped-def
-+     soundness, i686 cmp-immediate width normalization, ymm2→ymm1 fallback).
-+     All five reproduced on the new main; verified by reproducer before and
-+     after.
-+   - Fix 6 (NEW, introduced by #116): the merged "capture regparm incoming
-+     EAX/EDX/ECX" loop re-captured params already saved by the phase-1/2
-+     capture pass, interleaved with %eax-staging stack-param copies →
-+     `d_i(double, int)` read b as garbage at -O1+ (regparm conformance
-+     bit 5). The loop now skips `param_pre_stored` entries.
-+   - **Process note for future sessions: upstream merges of agent patches may
-+     take the PRE-audit version. ALWAYS re-run the defect reproducers after a
-+     re-base** (they are all in this doc's Validation section and in
-+     tests/regression/).
++## Landed this session (each committed + snapshotted after validation)
 +
-+2. **`1151756` — i686 redundant zero-extension elimination** (port of x86-64
-+   `redundant_ext.rs`): per-family byte/16-bit range tracking, deletes
-+   same-family re-extensions, rewrites cross-family byte re-extensions to
-+   movl, andl-immediate range proof, fail-closed at barriers and implicit
-+   writers. −534 bytes on the realmode corpus. 4 unit tests.
++1. **Unused callee-save elimination, multi-epilogue + frameless shapes**
++   (`eliminate_unused_callee_saves` rewrite). Old pass required exactly one
++   subl + one addl; early-return epilogues (get_cpuflags, go_to_protected_mode)
++   and frameless functions (bcmp post-tail-call) kept 20 dead push/pop pairs.
++   New shapes: FRAMED (1 subl, n same-value addls, per-epilogue pop
++   qualification, +4/pair on alloc AND every dealloc) and FRAMELESS (no ESP
++   arithmetic AND no (%esp) references → shifting body ESP unobservable).
++   bcmp is now literally `jmp memcmp`. 33194 → 33138.
 +
-+3. **`789...` — leal+move fusion**: Pattern 2b extended to
-+   `leal M(%r), %eax; movl %eax, %REG` → `leal M(%r), %REG` (refused when
-+   %eax is base/index). The regparm intcall address-argument shape. −313 bytes.
++2. **Global-fnptr fold: linear-seal proof** (in addition to slot ownership).
++   Walking forward from the call across straight-line code (no label, branch,
++   ret, push/pop, ESP arith, or overlapping slot access), if the FIRST access
++   overlapping the slot's 4 bytes is an exact full-width movl store, the
++   staged value is observable only by our call. Chains fold by induction.
++   Overlap windows [d−3,d+3] in both proofs. 33138 → 32926.
 +
-+## Realmode corpus trajectory (arch/x86/boot C files, REALMODE_CFLAGS, GCC = 12999)
++3. **CFG-liveness load/materialize retarget**: `movl SRC,%eax; movl %eax,%REG`
++   → `movl SRC,%REG` when liveness proves %eax dead across the branch edge
++   (phi-move-before-jmp shape, invisible to windowed passes). 32926 → 32735.
 +
-+| checkpoint | bytes | ratio |
-+|---|---|---|
-+| session-4 exit | 36500 | 2.80 |
-+| main @ a4b98b5 (upstream #113–116) | 35338 | 2.71 |
-+| + audit refit (no size effect, correctness only) | 35338 | 2.71 |
-+| + i686 redundant-zext | 34804 | 2.67 |
-+| + leal fusion | **34491** | **2.65** |
++4. **MISCOMPILE FIX (pre-existing on main): folded memory operands are RANGES.**
++   spectral_norm printed 44.72 instead of 1.274 at `-m32 -O2/-Os`.
++   `fstpl 20(%esp)` writes 20..28 but three i686 passes compared
++   `ebp_offset == slot` (point equality), so forward_slot_loads kept a
++   `%edx holds 24(%esp)` mapping alive across the x87 store and the sum's
++   high word came from the previous iteration. Fixed with
++   `ranges_overlap(slot, bytes, folded_off, 16)` in forward_slot_loads,
++   eliminate_dead_stores, and the 2b-mem deadness scan. **x86-64 twins had
++   the same latent defect** (access_size 1 in store_forwarding
++   invalidate_slots_at; 8-byte read ranges in DSE) — fixed defensively, no
++   reproducer found (slot spacing currently hides it). Unit test pins the
++   20-line reproducer. Cost +15B (unsound forwardings given back): 32735 → 32750.
 +
-+x86-64 -O2 benchmark corpus: 25364 (GCC 25813, ratio .983) — byte-stable
-+through the i686-local passes, improved by the audit's contract default.
++5. **CFG-liveness compare-with-memory fold**: `movl SLOT,%R; testl %R,%R; jcc`
++   (or `cmpl $imm,%R`) with %R dead on all successor paths →
++   `cmpl $0|$imm, SLOT; jcc`. Flag-exact (testl r,r ≡ cmpl $0,mem for all
++   jcc). 64 candidate sites. 32750 → 32610.
 +
-+## Worst remaining objects (post-session)
++6. **CFG-liveness copy-then-spill retarget**: `movl %REG,%eax; movl %eax,SLOT`
++   → `movl %REG,SLOT` (17 sites). 32610 → 32574.
 +
-+video-bios 3.7×, string 3.5×, cmdline 3.4×, cpuflags 3.2×. Top remaining
-+bigrams: `movzbl %al,%eax; movl %eax,SLOT` (spill of freshly extended byte —
-+needs the store to use the byte register or the slot classification to
-+recognize byte slots), `movl 8(%esp),%eax; cmpl 0(%esp),%eax` (two-slot
-+compare → fold one side as memory operand; the x86-64 memory_fold pass has
-+this, i686's fold_memory_operands only folds loads INTO alu, not cmp lhs).
++## Numbers
 +
-+## Next levers (ranked)
++- Realmode boot corpus (19 .c of arch/x86/boot at kernel flags):
++  **32574** vs GCC 12999 (2.51×). Session start: 33194.
++- Full trajectory: 42175 → … → 33194 (session start) → 32574.
++- x86-64 -O2 benchmark corpus: **25027 vs GCC 25796 — still smaller than GCC**.
++- setup.elf (assert-relaxed link, gas .S objects + dummy z/voffset):
++  `_end = 43424` vs limit 32768 (GCC: 22944). NOTE: `.pecompat` has 4K
++  alignment, so `_end` moves in 4K steps — `.text` (31806) must drop below
++  ~24.5K before `_end` can reach 32768. **Remaining goal ≈ −8.4K of .text.**
 +
-+1. **i686 cmp memory-operand folding**: `movl SLOT,%eax; cmpl SLOT2,%eax`
-+   → `movl SLOT,%eax` already exists; the missing fold is when BOTH sides
-+   are slots (compare needs one reg: keep lhs load, fold rhs — already done —
-+   so the residual is lhs-load elimination when %eax already holds SLOT via
-+   the reg_cache. Look at reg_cache usage in emit_int_cmp).
-+2. **Byte stores from byte registers**: `movzbl %al,%eax; movl %eax,SLOT;`
-+   where all consumers are byte loads — store `%al` with movb and mark the
-+   slot byte-width (needs slot width tracking, medium effort).
-+3. **Inline cost at -Os**: duplicated unrolled bodies (adler32 len_16→len_64
-+   case from session 4; also hits boot video code).
-+4. **setup.elf end-to-end**: with lccc-ld now speaking ELF32 script links
-+   (#116), the full `make bzImage` gate is worth re-running with
-+   LD=lccc-ld — see if "Setup too big!" distance shrank proportionally
-+   (session-3 measure: 45210 total vs 32768 limit; C-text is now ~4.3K
-+   smaller than then).
++## Correctness status
 +
-+## Environment protocol (unchanged; harness wipes everything)
++851→853 unit tests, 50/50 correctness, 9/9 check scripts, regparm
++conformance -O0..-Os, uchar-255 matrix, contract matrix, nbody -O0 exact,
++fnptr runtime matrix (struct dispatch + volatile fp + store-between,
++-O0..-Os × regparm on/off), benchmark parity vs gcc at -m32 AND -m64
++(nbody, spectral_norm, binary_trees).
 +
-+swap 10G → rustup stable minimal → `cargo build --profile fastbuild --locked -j2`
-+→ apt bison flex bc libelf-dev cpio kmod qemu-system-x86 busybox-static
-+gcc-multilib libc6-dev-i386 → kernel 6.18.44 + 26 archpkgbuilds patches
-+(1020 has the PAGE_POOL fix upstream now) → defconfig+prepare with HOSTCC=gcc.
-+Validation reproducers: tests/regression/regparm3_abi_conformance.c (all -O),
-+tests/benchmark/programs/nbody.c (all -O, want -0.169075164),
-+volatile uchar post-inc matrix, contract flag matrix vs gcc.
++## Where the remaining fat is (fresh census, post-folds)
++
++- 119 `movl S1,%eax; movl %eax,S2` + 109 reverse — CROSS-slot value routing,
++  inter-value, needs coalescing/regalloc, not windows (widening windows to
++  160 gained 0 bytes — measured).
++- 54 `leal S,%edx; movl $I,%eax; call intcall` — biosregs setup, IR-level.
++- 52 `movzbl %al,%eax; movl %eax,SLOT` — byte-width slot stores (store
++  `movb %al` + track byte slots) still unimplemented (session-5 TODO #3).
++- Inline-asm operands forced to slots (`allow_inline_asm_regalloc=false`
++  for i686 in regalloc.rs ~line 2334): cpuid_count is 33 insns vs GCC 19.
++  x86-64 asm emitter checks reg_assignments; i686 could too — BIG win
++  (video/cpuflags/cpucheck are asm-heavy), but needs careful audit of
++  i686 scratch conventions (%ecx/%edx staging).
++- 90 `popl %ebx; ret` etc. are legitimate epilogues now (dead pairs gone).
++
++## Next steps
++
++1. i686 inline-asm operand regalloc (`allow_inline_asm_regalloc` path):
++   the single biggest remaining lever (~2-3K est. across corpus).
++2. Byte-width slot stores to kill movzbl+movl pairs (−52 sites).
++3. Slot coalescing for the 228 cross-slot copies (hard; regalloc-level).
++4. Once .text < ~23.4K: full bzImage + QEMU boot test
++   (`qemu-system-x86_64 -kernel bzImage -initrd busybox.cpio -append
++   "console=ttyS0 rdinit=/init" -nographic -no-reboot -m 256M`).
++5. On every re-base: re-run the 6 audit reproducers + spectral_norm -m32
++   -O2 (new reproducer #7: must print 1.274224152).
++
++## Environment re-provisioning (unchanged, see session-5 doc)
++
++Swap → rustup → apt (incl. gcc-multilib) → kernel 6.18.44 + 26 patches in
++PKGBUILD order → defconfig+prepare → /tmp/rmflags.sh + /tmp/rmbench.sh +
++/tmp/build_setup.sh (this doc's measurements). `git am` the snapshot's
++unmerged tail patches after every re-base; check which ones upstream took.
 -- 
 2.47.3
 
