@@ -1,1029 +1,281 @@
-From cfe6ba485d92287824f2c33636fee15c176b177f Mon Sep 17 00:00:00 2001
-From: Arena Agent <arena@arena.ai>
-Date: Thu, 20 Aug 2026 15:05:28 +0000
-Subject: [PATCH] Session 25: regbase GEP folds + liveness links,
- cross-function state-leak fix, FP-CSE enabled with staging-hazard pre-spill,
- sqlite DDL fixed at -O0
-
----
- .../2026-08-20-session25-regbase-fpcse.md     |  84 +++++++++
- src/backend/generation.rs                     | 163 +++++++++++++++---
- src/backend/i686/codegen/emit.rs              |  53 ++++++
- src/backend/i686/codegen/memory.rs            |  64 ++++++-
- src/backend/i686/codegen/prologue.rs          |   7 +-
- src/backend/state.rs                          |  12 ++
- src/backend/traits.rs                         |  61 +++++++
- src/backend/x86/codegen/calls.rs              | 131 ++++++++++++++
- src/backend/x86/codegen/emit.rs               |  76 ++++++++
- src/backend/x86/codegen/memory.rs             |  74 +++++++-
- src/backend/x86/codegen/prologue.rs           |   9 +-
- src/passes/gvn.rs                             |  29 ++--
- 12 files changed, 715 insertions(+), 48 deletions(-)
- create mode 100644 docs/history/2026-08-20-session25-regbase-fpcse.md
-
-diff --git a/docs/history/2026-08-20-session25-regbase-fpcse.md b/docs/history/2026-08-20-session25-regbase-fpcse.md
+diff --git a/docs/history/2026-08-20-session26-o2-segfaults.md b/docs/history/2026-08-20-session26-o2-segfaults.md
 new file mode 100644
-index 00000000..75871f35
+index 00000000..6204c06b
 --- /dev/null
-+++ b/docs/history/2026-08-20-session25-regbase-fpcse.md
-@@ -0,0 +1,84 @@
-+# 2026-08-20 (session 25) — Agent-B v3 audit, regbase folds, FP-CSE enable, sqlite DDL fix
++++ b/docs/history/2026-08-20-session26-o2-segfaults.md
+@@ -0,0 +1,114 @@
++# 2026-08-20 (session 26) — the two remaining -O2 segfaults: root-caused and fixed
 +
-+**Base:** `origin/main` @ `e31baa21` (PR #142 — session-23/24 work merged).
-+**Deliverable:** unified `/home/user/ms178-1.patch`, re-based on latest main.
++**Base:** `origin/main` @ `ce906b67` (PR #143 — session-25 fixes merged).
++**Deliverable:** `/home/user/ms178-1.patch` re-based on this base (DAUERAUFGABE).
 +
-+## Agent-B v3 patch audit verdicts
++## Fixed defect 1 — zlib-ng gen_bitlen state corruption (all opt levels,
++## non-compat AND compat): `sqlite3KeyInfoAlloc`-class lost store
 +
-+| Item | Verdict |
++**Symptom:** zlib-ng -O2 (previously also surfaced as the sqlite -O0… no —
++this one is the *value-fabrication* class): `p->aSortFlags = (u8*)&p->aColl[N+X]`
++stored NULL; the store emitted `xorl %eax,%eax; movq %rax, 24(%r13)`.
++
++**Root cause chain (verified instruction-by-instruction):**
++1. The val-side address `V = &p->aColl[N+X]` is a no-home immediately-consumed
++   value: `emit_leaq_base_index_impl` staged it via `leaq (%base,%idx),%rax`
++   + `store_rax_to(V)` — which correctly marks the acc cache `acc = V`.
++2. `emit_leaq_base_index_impl` THEN ran its own `invalidate_acc()` —
++   **destroying the handoff it had just established** (ordering flaw:
++   invalidate must precede the cache-setting store, never follow it; the
++   i686 override has the correct order).
++3. The const-offset-folded store consumer then staged the val via
++   `operand_to_rax(V)`: cache miss → no register home → no slot → the
++   **silent `xorl %eax,%eax` fallback fabricated zero** and stored it.
++
++**Fix (3 parts):**
++- `emit_leaq_base_index_impl`: invalidate only in the register-dest branch;
++  the acc-staged branch keeps the `store_rax_to` handoff intact.
++- x86-64 `operand_to_rax`: the no-home/no-slot/no-cache fallback is now a
++  **hard panic** (with value id + function name) instead of fabricating
++  zero — a live operand in that state is a proven broken handoff, and
++  silent zero is a miscompile factory (it hid this bug and the
++  sqlite3VdbeExec one below for months).
++- i686 `operand_to_eax`: same audit; the equivalent arm EMITS NOTHING
++  (stale-accumulator class). i686's acc-cache contract is not complete
++  enough for the hard gate yet (legit eax-only flows exist without cache
++  entries — the gate panicked 10 regression tests), so it keeps the legacy
++  no-op, documented as the **i686 acc-cache audit** open item. On x86-64
++  the gate is fully validated (959/50/352+6 green, both workloads fixed).
++
++**Repro (fixed):** `/tmp/krep.c` pattern — struct with flexible array,
++`p->sort = (u8*)&p->coll[N+X]` followed by memset; at -O2 lccc stored NULL.
++
++## Fixed defect 2 — sqlite3 -O2 SIGSEGV in `sqlite3KeyInfoFromExprList`
++
++**Symptom:** `mov %al,(%rcx)` through NULL — `pInfo->aSortFlags` read back
++NULL inside the KeyInfo loop (defect 1's store side contributed at -O0; at
++-O2 a second, independent hole stranded the loop condition entirely).
++
++**Root cause (verified with per-pass IR dumps + targeted backend tracing):**
++sqlite's i128 multiply-overflow check lowers to
++`Cmp{ty:I128} → Cast{I64→I32} → CondBranch` in one block.
++- The prologue flag-fusion scan treats the chain as fusable
++  (`cty.is_integer()` includes I128): it inserted the Cmp into
++  `fused_cmp_dests` and the Cast dest into `fused_forward_dests`.
++- The EMIT side routes I128 compares to `emit_i128_cmp`
++  (`emit_cmp` dispatch) — which has **no fusion hooks at all**: it never
++  sets `pending_cmp`, and the Cast is skipped anyway (fused_forward).
++- The CondBranch found no pending flags and tried to materialize the
++  chain-end boolean — which was never emitted → pre-gate: silent garbage
++  branch (the observed SIGSEGV); post-gate: hard panic pointing straight
++  at the stranded value.
++- Same latent hole in the `cmp_replay` scan (would have re-emitted an i128
++  compare through `emit_int_cmp_replay_insn` — wrong codegen).
++
++**Fix:** both scans now gate `!ty.is_integer() || is_wide_int_type(ty)` —
++fusion/replay is only legal for compare kinds the emit side can actually
++fuse (scalar-integer through `emit_int_cmp_impl`). No optimization lost:
++i128 compares never flag-fused in reality (the emitter bypass proves it);
++they now materialize the boolean normally and the chain emits correctly.
++
++## Validation matrix (fastbuild, this session)
++
++| Check | Result |
 +|---|---|
-+| Fixed-point compose+propagate (8 rounds) + safety net in `build_gep_fold_map` | **ADOPTED — superior to my single re-compose.** The safety net (drop entries whose base is still a map key, re-run `retain_ptr_only_uses` per round) is a strict generalisation; deep alias chains my single re-compose missed are resolved. Sound: dropped entries emit their producer instead. |
-+| `collect_gep_fold_base_links` + RA interval extension for folded const-offset BASES | **ADOPTED with corrections.** Right idea (the base is consumed at the access, RA-invisible). Their x86-64 store-path guards were defense-only; the real gaps were elsewhere (below). |
-+| Same-register refusal in x86-64 store fast paths | **SUPERSEDED** — with proper interval extension the value and base provably overlap at the access (distinct registers); the refusals were dead code. Not carried. |
-+| GVN float-CSE still excluded | **DISAGREE — ENABLED** (see root causes below). |
-+| i686 SIB-indexed spec (symbol-base) | **DEFERRED to session 26.** Plumbing added this session (`supports_indexed_sym_base`, `emit_load_indexed_sym`/`emit_store_indexed_sym` hooks, sym-base branch in `can_indexed_addr_fold`) — emitter implementations are the next step. |
-+| quadratic_sr / redundant_loads / alias.rs / fuzzers | **Already merged via PR #142** — v3 duplicates them; NOT re-added (no already-merged hunks in the new patch). |
-+| Docs (session21/23 re-adds) | **REJECTED** — duplicate of main's history docs; would conflict. |
++| unit | 959/959 |
++| correctness | 50/50 |
++| regression | 352 + known gcc-14 six (identical to baseline set) |
++| sqlite 3.50.4 `-O0` DDL roundtrip | OK |
++| sqlite 3.50.4 `-O2` DDL roundtrip | **OK (was SIGSEGV)** |
++| zlib-ng 2.3.3 non-compat `-O2` 5MB/20MB/text roundtrip | OK |
++| zlib-ng 2.3.3 compat `-O2` levels 1/6/9, 20MB random + text | **OK (was inflateInit2_ crash class)** |
++| zlib-ng compat `-O3` / `-Os` | OK |
++| fp_die_at_birth (FP-CSE enabled) | MATCH gcc |
++| m32 / alias / slot-rmw differential fuzz | (see ledger entry) |
 +
-+## Bugs found & fixed this session (all validated)
++## Procedure post-mortem (session 25 failures → session 26 rules)
 +
-+1. **`folded_gep_values` / `gep_base_offset` leaked across functions**
-+   (`state.rs::reset_for_function` never cleared them). Value IDs restart at 0
-+   per function, so skipped-GEP IDs from function A fired spurious
-+   rematerialisations in function B on colliding IDs. The register-base
-+   relaxation flooded the set, making collisions deterministic (zlib-ng
-+   gen_bitlen state corruption → SIGSEGV). This also retroactively explains
-+   the session-23 "unrelated functions perturb each other" fp_die_at_birth
-+   symptom. **Fix: clear both in `reset_for_function`.**
++Session 25 lost hours to guesswork and a harness crash. Institutionalized:
++1. **Auto-save after EVERY validated fix** — commit + regenerate
++   `ms178-1.patch` + artifact snapshot in the SAME command chain as the
++   validation. No exceptions (this session: snapshot S24).
++2. **No bisection on unverified builds.** Session-25's zlib bisection was
++   invalid: `make CC=gcc X.o` silently skipped rebuilds (timestamps) and
++   arch compiles failed silently (`|| true`). Rule: explicit rc checks,
++   never `|| true` on compile steps, rebuild via `rm` + full command.
++3. **Right tools over Rätselraten:** `CCC_DUMP_EACH_PASS`+`CCC_DUMP_FUNC`
++   (upgraded this session to the compact filtered dumper for ALL pass
++   dumps — full-module Debug dumps were unusable on real workloads),
++   `LCCC_DBG_FOLD`, targeted backend eprintln probes added/removed per
++   diagnosis, gdb watchpoints for first-corrupt-write.
++4. **Minimal deterministic repro before touching the workload** (`krep.c`
++   was written in one minute and pinned defect 1 exactly).
 +
-+2. **Default `emit_gep` dropped the base for slot-less register bases.**
-+   Both the const-offset and value-offset branches keyed on
-+   `resolve_slot_addr(base)`; a register-only base produced
-+   `dest = offset + stale scratch`. Hit by `rematerialize_const_addr` once
-+   register-base folds skipped such GEPs. **Fixes: new `emit_gep_reg_const`
-+   overrides (x86-64 `leaq off(%base),%dest`, i686 `leal`), x86-64
-+   `emit_reg_to_acc` override (trait default was a SILENT NO-OP — the same
-+   trap that bit i686 in session 20), and soundness fallbacks in the default
-+   `emit_gep` for both branches.**
++## Open items (session 27)
 +
-+3. **Silent store/load drops in x86-64 const-offset paths for slot-less
-+   register bases** (the trailing `else { operand_to_rax }` emitted NO store;
-+   the FP load `None => return`). **Fixed with register-direct fallbacks +
-+   `const_offset_fold_reg_base_ok` opt-in hooks (safe-set: x86-64 excludes
-+   the rdx/r11 staging scratches; i686 restricts to callee-saved
-+   ebx/esi/edi/ebp, never eax/edx/ecx).** i686 gained register-base
-+   64-bit-pair load/store paths (previously silent gaps too).
-+
-+4. **FP-CSE enabled (F32/F64 load CSE in GVN)** — two blockers removed:
-+   the leak in (1) plus a **call-argument staging hazard**: die-at-birth
-+   coalescing homed a still-needed FP value in an xmm argument register an
-+   EARLIER argument's staging overwrote (fp_die_at_birth: `movsd %xmm7,%xmm3`
-+   staged cn over cd's home before cd was read). **Fix: staging-hazard
-+   pre-spill in `emit_call_reg_args_impl`** — detects args whose source home
-+   is an argument register (xmm0..7 / the SysV GPR six) already written by an
-+   earlier-staged argument and pre-spills them to a transient 16-aligned
-+   stack area before any staging write (symmetric FP + GPR).
-+
-+## Validation (fastbuild, this session)
-+
-+- unit **959/959**, correctness **50/50**, regression **352 + known gcc-14 six**
-+  (builtin_cpu_supports_raptor, code16_realmode_encoding, fp_domain_crossing,
-+  has_attribute_in_code, kernel_flags_and_builtins, sqrt_vex_scalar).
-+- **fp_die_at_birth matches gcc bit-exact with FP-CSE enabled** (-O2).
-+- **zlib-ng 2.3.3 (default config, SIMD arch files) round-trip OK at -O0 and
-+  -O2** (5 MB random, compress + decompress + cmp).
-+- **sqlite 3.50.4 amalgamation -O0: DDL roundtrip OK** (CREATE TABLE + INSERT
-+  + SELECT) — the session-24 "DDL Funktionsfehler" is fixed (the
-+  compose/propagate hole AND the cross-function state leak both contributed).
-+
-+## Open (session 26, documented honestly)
-+
-+- **sqlite3 -O2 SIGSEGV in `sqlite3KeyInfoFromExprList`** (`mov %al,(%rcx)`,
-+  store through bad address; reproduces with `CCC_NO_REGBASE_FOLD=1` too →
-+  NOT the register-base machinery; pre-existing -O2 pipeline/emitter defect).
-+- **i686 SIB indexed addressing** (emitter implementations for the hooks
-+  added this session; est. −300..−500 B on the boot corpus).
-+- Boot-corpus size re-measurement with the regbase folds enabled
-+  (kernel tree re-extract needed).
-+
-+## Env gates (A/B tools)
-+
-+- `CCC_NO_REGBASE_FOLD=1` — force the pre-session-25 alloca-only fold contract.
-+- `CCC_NO_FOLDED_INDEX_LIVENESS=1` — disable RA interval extension AND
-+  register-base folds (one contract).
-+- `CCC_NO_GEP_FOLD=1` — disable all GEP folding.
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index 7431fc4a..9a39f6c4 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -197,20 +197,52 @@ fn filter_rip_legal_symbols(cg: &dyn ArchCodegen, map: &mut FxHashMap<u32, Strin
- }
- 
- fn can_const_addr_fold(cg: &dyn ArchCodegen, info: &GepFoldInfo) -> bool {
--    // Only fold when the base is an alloca: a stack address is always
--    // re-computable (lea) at the use site.  A base that merely sits in a
--    // register is NOT safe: an intervening call clobbers caller-saved
--    // registers, so folding the GEP into a store AFTER the call would
--    // dereference a dead register (zlib-ng gz_write_init stored
--    // `strm->next_in = NULL` through %r8 which deflateInit2_ had clobbered).
--    // With a register base the GEP is instead generated at its definition
--    // point, where the base pointer is still live.
--    cg.state_ref().is_alloca(info.base.0)
--}
--
--fn can_indexed_addr_fold(cg: &dyn ArchCodegen, info: &IndexedGepInfo) -> bool {
--    cg.get_phys_reg_for_value(info.base.0).is_some()
--        && cg.get_phys_reg_for_value(info.index.0).is_some()
-+    // A/B gate: force the pre-session-25 alloca-only contract.
-+    if env_flag_set("CCC_NO_REGBASE_FOLD") {
-+        return cg.state_ref().is_alloca(info.base.0);
-+    }
-+    // Alloca bases are always foldable: a stack address is re-computable
-+    // (lea / slot-relative) at every use site, independent of registers.
-+    if cg.state_ref().is_alloca(info.base.0) {
-+        return true;
-+    }
-+    // REGISTER-RESIDENT bases fold only on backends that (a) extend the
-+    // base's live interval to the consuming Load/Store — the backend passes
-+    // collect_gep_fold_base_links(func) into register allocation — and
-+    // (b) keep the fold paths complete for register bases.  Without (a) the
-+    // allocator reuses the base register for the stored value (zlib-ng
-+    // gz_reset `movl %r15d,(%r15)` NULL store); without (b) the access can
-+    // silently fall through.  The backend hook performs the per-value
-+    // physical-register sanity check (emitter scratch exclusion).
-+    cg.const_offset_fold_reg_base_ok(&info.base)
-+}
-+
-+fn can_indexed_addr_fold(
-+    cg: &dyn ArchCodegen,
-+    info: &IndexedGepInfo,
-+    global_addr_map: &FxHashMap<u32, String>,
-+) -> bool {
-+    // The index is consumed at the access in every indexed form; it must be
-+    // register-resident (the RA link extension keeps it live to there).
-+    if cg.get_phys_reg_for_value(info.index.0).is_none() {
-+        return false;
-+    }
-+    if cg.get_phys_reg_for_value(info.base.0).is_some() {
-+        return true;
-+    }
-+    // Symbol-base indexed addressing (`sym(,%idx,scale)`): the GlobalAddr
-+    // base was never materialised and has no register home.  Only backends
-+    // that emit the symbol form may take this path — otherwise the skipped
-+    // producer would rematerialise against an uncomputed GlobalAddr.
-+    // GOT/TLS/absolute symbols cannot be a bare memory-operand symbol on PIC
-+    // targets, so refuse them here (the consumer re-checks).
-+    if !cg.supports_indexed_sym_base() {
-+        return false;
-+    }
-+    if let Some(sym) = global_addr_map.get(&info.base.0) {
-+        return !rip_rel_blocked(cg, sym);
-+    }
-+    false
- }
- 
- /// Per-function def / alloca / param facts used by GEP-fold soundness.
-@@ -582,6 +614,42 @@ pub(crate) fn collect_folded_index_links(func: &IrFunction) -> FxHashMap<u32, Ve
-     out
- }
- 
-+/// Map of CONST-FOLDED-GEP BASE value ids to their consumer GEP-dest value
-+/// ids. `emit_{load,store}_with_const_offset` consumes `gep_info.base` at
-+/// the Load/Store position while the IR records the base's last use at the
-+/// (folded-away) GEP — the same RA-invisible-consumption family as the
-+/// indexed form, but for the BASE of a constant-offset fold. Without the
-+/// interval extension the allocator may reuse the base's register for the
-+/// stored value: zlib-ng gz_reset `state->x.have = 0` compiled to
-+/// `mov %r14,%r15; xorl %r15d,%r15d; movl %r15d,(%r15)` — the zero
-+/// materialisation (value homed r15) destroyed the base (also homed r15,
-+/// legal by IR liveness because the base "died" at the folded GEP), and the
-+/// store went through NULL.
-+pub(crate) fn collect_gep_fold_base_links(func: &IrFunction) -> FxHashMap<u32, Vec<u32>> {
-+    let use_counts = count_value_uses(func);
-+    let stab = analyze_base_stability(func);
-+    let m = build_gep_fold_map(func, &use_counts, &stab);
-+    let mut out: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-+    for (dest, info) in &m {
-+        out.entry(info.base.0).or_default().push(*dest);
-+    }
-+    out
-+}
-+
-+/// Union of the per-kind folded-GEP consumption links (index + base) for
-+/// backends that fold BOTH forms. Each backend must pass exactly the links
-+/// for the forms its emitter actually consumes at the access position;
-+/// extending intervals for a form the emitter re-materialises only adds
-+/// register pressure (x86-64 `check_gpr_leaf_param_codegen::pointer_mix`
-+/// regressed +2 callee-saves when the INDEX extension was applied blindly).
-+pub(crate) fn collect_folded_gep_links_all(func: &IrFunction) -> FxHashMap<u32, Vec<u32>> {
-+    let mut out = collect_gep_fold_base_links(func);
-+    for (k, vs) in collect_folded_index_links(func) {
-+        out.entry(k).or_default().extend(vs);
-+    }
-+    out
-+}
-+
- fn build_indexed_gep_map(
-     func: &IrFunction,
-     use_counts: &[u32],
-@@ -783,19 +851,48 @@ fn build_gep_fold_map(
-     }
-     let original_count = gep_map.len();
- 
-+    // Compose const chains and propagate Copy/Cast aliases INTERLEAVED, to a
-+    // bounded fixed point.  Composing only once before propagating left
-+    // entries whose base was a later-propagated stable alias pointing at the
-+    // alias (e.g. `GEP(var_idx); Copy V25; GEP V27 = V25+16` composed with
-+    // base = V25) while V25's producer is absorbed (skipped, never emitted):
-+    // the consumer then read V25's stale register home — the variable index
-+    // silently dropped (sqlite ExprListSetSortOrder stored through &p->a
-+    // instead of &p->a[nExpr-1]; openDatabase SIGSEGV at -O0).  Session-24
-+    // fixed this with a single re-compose after propagate; the interleaved
-+    // fixed point additionally resolves deeper alias chains (each round can
-+    // expose one more link), and the safety net below catches anything the
-+    // bound leaves behind.
-+    for _ in 0..8 {
-+        compose_const_gep_folds(&mut gep_map);
-+        propagate_stable_aliases(func, stab, &mut gep_map);
-+    }
-     compose_const_gep_folds(&mut gep_map);
-     retain_stable_bases(func, use_counts, stab, &mut gep_map);
-     propagate_stable_aliases(func, stab, &mut gep_map);
--    // propagate_stable_aliases inserts NEW fold entries (Copy/Cast aliases of
--    // stable folds).  A GEP whose base is one of those newly-added aliases
--    // (e.g. GEP(copy_of_stable, 0) inserted with base = the alias) was not
--    // composed, because composition ran BEFORE the alias existed.  The store
--    // then dereferenced the alias value, which was itself skipped as a folded
--    // address and never materialised -> unmaterialised base register ->
--    // SIGSEGV (zlib-ng gz_write_init `strm->next_in = NULL`).  Re-compose so
--    // every fold's base is a terminal (materialised) value.
-     compose_const_gep_folds(&mut gep_map);
-     retain_ptr_only_uses(func, &mut gep_map);
-+    // SAFETY NET: a fold entry whose base is STILL a map key would read a
-+    // register (or slot) its skipped producer never wrote.  Composition
-+    // removes all such edges when the offsets fit; overflow-truncated
-+    // compositions are the only survivors — drop them (conservative, always
-+    // sound: the producer is emitted instead).  Removal re-exposes the
-+    // dropped dest's base as a real (non-fold) use, so re-run the
-+    // retain_ptr_only_uses fixed point after each round.
-+    loop {
-+        let bad: Vec<u32> = gep_map
-+            .iter()
-+            .filter(|(_, info)| gep_map.contains_key(&info.base.0))
-+            .map(|(dest, _)| *dest)
-+            .collect();
-+        if bad.is_empty() {
-+            break;
-+        }
-+        for d in bad {
-+            gep_map.remove(&d);
-+        }
-+        retain_ptr_only_uses(func, &mut gep_map);
-+    }
-     retain_used(&mut gep_map, use_counts);
- 
-     if env_flag_set("CCC_DEBUG_GEPFOLD") {
-@@ -2490,7 +2587,7 @@ fn generate_function(
-                     }
-                 }
-                 if let Some(info) = indexed_gep_map.get(&dest.0) {
--                    if can_indexed_addr_fold(cg, info) {
-+                    if can_indexed_addr_fold(cg, info, &global_addr_map) {
-                         cg.state().folded_gep_values.insert(dest.0);
-                         cg.state().current_program_point += 1;
-                         continue;
-@@ -3243,10 +3340,18 @@ fn generate_load(
-         rematerialize_const_addr(cg, ptr, gep_info);
-     }
-     if let Some(info) = indexed_gep_map.get(&ptr.0) {
--        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info) {
-+        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map) {
-             if cg.emit_load_indexed(dest, &info.base, &info.index, info.shift, ty) {
-                 return;
-             }
-+            // Symbol-base form: the GlobalAddr base has no register home.
-+            if let Some(sym) = global_addr_map.get(&info.base.0) {
-+                if !rip_rel_blocked(cg, sym)
-+                    && cg.emit_load_indexed_sym(dest, sym, &info.index, info.shift, ty)
-+                {
-+                    return;
-+                }
-+            }
-         }
-         rematerialize_skipped_indexed(cg, ptr, info);
-     }
-@@ -3297,10 +3402,18 @@ fn generate_store(
-         rematerialize_const_addr(cg, ptr, gep_info);
-     }
-     if let Some(info) = indexed_gep_map.get(&ptr.0) {
--        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info) {
-+        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map) {
-             if cg.emit_store_indexed(val, &info.base, &info.index, info.shift, ty) {
-                 return;
-             }
-+            // Symbol-base form: the GlobalAddr base has no register home.
-+            if let Some(sym) = global_addr_map.get(&info.base.0) {
-+                if !rip_rel_blocked(cg, sym)
-+                    && cg.emit_store_indexed_sym(val, sym, &info.index, info.shift, ty)
-+                {
-+                    return;
-+                }
-+            }
-         }
-         rematerialize_skipped_indexed(cg, ptr, info);
-     }
++1. **i686 acc-cache audit** — complete the cache contract so the
++   operand_to_eax hard gate can land there too (currently legacy no-op).
++2. **i686 SIB indexed addressing** — emitter implementations for the
++   session-25 hooks (`supports_indexed_sym_base`,
++   `emit_{load,store}_indexed[_sym]`); est. −300..−500 B boot corpus.
++3. Boot-corpus re-measure with regbase folds (kernel tree re-extract).
++4. MachInst/mature-boundary audit — the initial (wrong) hypothesis for
++   defect 2; the boundary exists and deserves a systematic review even
++   though this instance was fusion-scan-side.
 diff --git a/src/backend/i686/codegen/emit.rs b/src/backend/i686/codegen/emit.rs
-index 3d3e67a4..fb334c8c 100644
+index fb334c8c..5cf71ef6 100644
 --- a/src/backend/i686/codegen/emit.rs
 +++ b/src/backend/i686/codegen/emit.rs
-@@ -1434,6 +1434,41 @@ impl ArchCodegen for I686Codegen {
-         }
-     }
- 
-+    fn emit_gep_reg_const(&mut self, dest: &Value, base: &Value, offset: i64) -> bool {
-+        // Register-resident base + constant offset → `leal off(%base), %dest`.
-+        // Without this hook the default emit_gep silently drops the base for
-+        // slot-less bases (both branches key on resolve_slot_addr), so a
-+        // rematerialised folded GEP computed `offset + stale scratch`.
-+        let Some(&br) = self.reg_assignments.get(&base.0) else {
-+            return false;
-+        };
-+        if offset < i32::MIN as i64 || offset > i32::MAX as i64 {
-+            return false;
-+        }
-+        let b_name = phys_reg_name(br);
-+        if let Some(&dr) = self.reg_assignments.get(&dest.0) {
-+            let d_name = phys_reg_name(dr);
-+            if offset == 0 {
-+                if br != dr {
-+                    emit!(self.state, "    movl %{}, %{}", b_name, d_name);
-+                }
-+            } else {
-+                emit!(self.state, "    leal {}(%{}), %{}", offset as i32, b_name, d_name);
-+            }
-+            self.state.reg_cache.invalidate_acc();
-+            return true;
-+        }
-+        // Slot-only dest: stage through %eax, then store to the home.
-+        if offset == 0 {
-+            emit!(self.state, "    movl %{}, %eax", b_name);
-+        } else {
-+            emit!(self.state, "    leal {}(%{}), %eax", offset as i32, b_name);
-+        }
-+        self.state.reg_cache.set_acc(dest.0, false);
-+        self.emit_store_result(dest);
-+        true
-+    }
-+
-     // ---- Standard trait methods (kept inline - arch-specific) ----
-     fn emit_load_operand(&mut self, op: &Operand) { self.operand_to_eax(op); }
-     fn emit_store_result(&mut self, dest: &Value) { self.store_eax_to(dest); }
-@@ -1641,6 +1676,24 @@ impl ArchCodegen for I686Codegen {
-         true
-     }
- 
-+    fn const_offset_fold_reg_base_ok(&self, base: &Value) -> bool {
-+        // Register-base const-offset folds consume the base at the Load/Store
-+        // position (RA-invisible): sound only with the folded-base liveness
-+        // links wired into register allocation (prologue passes
-+        // collect_gep_fold_base_links).  When that extension is disabled the
-+        // folds must be refused too — the two are one contract.
-+        if std::env::var_os("CCC_NO_FOLDED_INDEX_LIVENESS").is_some() {
-+            return false;
-+        }
-+        match self.reg_assignments.get(&base.0) {
-+            // Safe homes: %ebx/%esi/%edi/%ebp — callee-saved, never touched
-+            // by the %eax:%edx accumulator staging or the %ecx address
-+            // scratch the fold paths use.
-+            Some(&phys) => matches!(phys.0, 0 | 1 | 2 | 3),
-+            None => false,
-+        }
-+    }
-+
-     fn callee_pops_bytes_for_sret(&self, is_sret: bool) -> usize {
-         // Under -mregparm>=1 the sret pointer is passed in %eax, not pushed,
-         // so the callee's plain `ret` pops nothing (mirrors emit_epilogue).
-diff --git a/src/backend/i686/codegen/memory.rs b/src/backend/i686/codegen/memory.rs
-index 53cc2bb2..daef45fc 100644
---- a/src/backend/i686/codegen/memory.rs
-+++ b/src/backend/i686/codegen/memory.rs
-@@ -321,6 +321,32 @@ impl I686Codegen {
-             self.state.reg_cache.invalidate_acc();
-             return;
-         }
-+        // Register-resident 64-bit-pair base store: stage the value into the
-+        // %eax:%edx accumulator pair, then `movl %eax,off(%base);
-+        // movl %edx,off+4(%base)`.  Must precede the slot-based pair branch,
-+        // which silently emits nothing for a slot-less base.  The base is
-+        // callee-saved by the fold predicate, so the staging cannot clobber
-+        // it.
-+        if (ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64)
-+            && !self.state.is_alloca(base.0)
-+        {
-+            if let Some(&phys) = self.reg_assignments.get(&base.0) {
-+                if matches!(phys.0, 0 | 1 | 2 | 3) {
-+                    let base_name = phys_reg_name(phys);
-+                    let mem0 = if offset != 0 {
-+                        format!("{}(%{})", offset, base_name)
-+                    } else {
-+                        format!("(%{})", base_name)
-+                    };
-+                    let mem4 = format!("{}(%{})", offset + 4, base_name);
-+                    self.emit_load_acc_pair(val);
-+                    emit!(self.state, "    movl %eax, {}", mem0);
-+                    emit!(self.state, "    movl %edx, {}", mem4);
-+                    self.state.reg_cache.invalidate_acc();
-+                    return;
-+                }
-+            }
-+        }
-         if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 {
-             self.emit_load_acc_pair(val);
-             let addr = self.state.resolve_slot_addr(base.0);
-@@ -372,10 +398,11 @@ impl I686Codegen {
-         }
-         // Register-resident base: single-instruction store to offset(%reg).
-         // Mirrors the load path (GCC: `movl %eax, 40(%ebx)`); the value is
--        // staged in %eax first — the base register itself is never %eax
--        // (allocator hands out %ebx/%esi/%edi/%ebp/%ecx/%edx only).
-+        // staged in %eax first — the fold predicate keeps the base out of
-+        // %eax/%edx/%ecx (callee-saved homes only), so staging never
-+        // destroys the address.
-         if let Some(&phys) = self.reg_assignments.get(&base.0) {
--            if !self.state.is_alloca(base.0) {
-+            if !self.state.is_alloca(base.0) && matches!(phys.0, 0 | 1 | 2 | 3) {
-                 let store_instr = self.store_instr_for_type(ty);
-                 let base_name = phys_reg_name(phys);
-                 let dst = if offset != 0 {
-@@ -490,6 +517,31 @@ impl I686Codegen {
-             }
-             return;
-         }
-+        // Register-resident 64-bit-pair base load: `movl off(%base),%eax;
-+        // movl off+4(%base),%edx`.  Must precede the slot-based pair branch,
-+        // which silently emits nothing for a slot-less base.  The fold
-+        // predicate (const_offset_fold_reg_base_ok) guarantees the base sits
-+        // in a callee-saved register, never the %eax:%edx accumulator pair.
-+        if (ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64)
-+            && !self.state.is_alloca(base.0)
-+        {
-+            if let Some(&phys) = self.reg_assignments.get(&base.0) {
-+                if matches!(phys.0, 0 | 1 | 2 | 3) {
-+                    let base_name = phys_reg_name(phys);
-+                    let mem0 = if offset != 0 {
-+                        format!("{}(%{})", offset, base_name)
-+                    } else {
-+                        format!("(%{})", base_name)
-+                    };
-+                    let mem4 = format!("{}(%{})", offset + 4, base_name);
-+                    emit!(self.state, "    movl {}, %eax", mem0);
-+                    emit!(self.state, "    movl {}, %edx", mem4);
-+                    self.emit_store_acc_pair(dest);
-+                    self.state.reg_cache.invalidate_acc();
-+                    return;
-+                }
-+            }
-+        }
-         if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 {
-             let addr = self.state.resolve_slot_addr(base.0);
-             if let Some(addr) = addr {
-@@ -527,8 +579,12 @@ impl I686Codegen {
-         // This is the whole point of the GEP fold — GCC emits
-         // `movl 40(%ebx), %eax`; the old path re-materialized the address
-         // (movl %ebx,%ecx; addl $40,%ecx; movl (%ecx),%eax) every time.
-+        // The fold predicate (const_offset_fold_reg_base_ok) restricts the
-+        // base to callee-saved homes (%ebx/%esi/%edi/%ebp): never the
-+        // %eax/%edx accumulator staging registers and never the %ecx address
-+        // scratch, and folded-base liveness links keep it live to here.
-         if let Some(&phys) = self.reg_assignments.get(&base.0) {
--            if !self.state.is_alloca(base.0) {
-+            if !self.state.is_alloca(base.0) && matches!(phys.0, 0 | 1 | 2 | 3) {
-                 let load_instr = self.load_instr_for_type(ty);
-                 let base_name = phys_reg_name(phys);
-                 let mem = if offset != 0 {
-diff --git a/src/backend/i686/codegen/prologue.rs b/src/backend/i686/codegen/prologue.rs
-index f4308cb8..56b031a8 100644
---- a/src/backend/i686/codegen/prologue.rs
-+++ b/src/backend/i686/codegen/prologue.rs
-@@ -256,7 +256,12 @@ impl I686Codegen {
-             false, never_materialized, Vec::new(), Vec::new(),
-             // i686 re-materialises skipped indexed GEPs (default
-             // emit_load_indexed = false): no RA-invisible index consumption.
--            crate::common::fx_hash::FxHashMap::default(),
-+            // It DOES fold constant-offset GEPs with register bases
-+            // (const_offset_fold_reg_base_ok), whose base is consumed at the
-+            // Load/Store position: extend the base's interval to the
-+            // consumer so the address register survives intervening calls
-+            // and value staging.
-+            crate::backend::generation::collect_gep_fold_base_links(func),
-         );
- 
-         // %ebx must be saved/restored only when it really holds the GOT base.
-diff --git a/src/backend/state.rs b/src/backend/state.rs
-index 42cdcb89..d8b91b3b 100644
---- a/src/backend/state.rs
-+++ b/src/backend/state.rs
-@@ -608,6 +608,18 @@ impl CodegenState {
-         self.vec_live_regs.clear();
-         self.uses_sret = false;
-         self.next_block_label = None;
-+        // GEP-fold bookkeeping is function-local too: `folded_gep_values`
-+        // holds the value IDs of skipped address producers, and value IDs
-+        // restart at 0 in every function.  Without this clear, IDs leaked
-+        // from function A made `rematerialize_const_addr` fire spuriously in
-+        // function B on a colliding ID (emitting a stray lea over B's live
-+        // accumulator / rematerialising a GEP that was never skipped there) —
-+        // zlib-ng gen_bitlen corruption once the register-base fold
-+        // relaxation flooded the set, making collisions deterministic.
-+        // `gep_base_offset` is the same class (per-function GEP base/index
-+        // cache keyed by value ID).
-+        self.folded_gep_values.clear();
-+        self.gep_base_offset.clear();
-     }
- 
-     /// Invalidate the vector-register peephole state. Called at every emission
-diff --git a/src/backend/traits.rs b/src/backend/traits.rs
-index 79168639..796209dc 100644
---- a/src/backend/traits.rs
-+++ b/src/backend/traits.rs
-@@ -342,6 +342,49 @@ pub trait ArchCodegen {
-         false
-     }
- 
-+    /// Whether the backend emits indexed addressing with a GLOBAL SYMBOL base
-+    /// (`sym(,%idx,scale)`), folding a never-materialised GlobalAddr straight
-+    /// into the memory operand.  Gates `can_indexed_addr_fold`'s symbol-base
-+    /// branch; without it a skipped producer would rematerialise against an
-+    /// uncomputed GlobalAddr.  Default: unsupported.
-+    fn supports_indexed_sym_base(&self) -> bool {
-+        false
-+    }
-+
-+    /// Whether the backend emits indexed addressing with a GLOBAL SYMBOL base
-+    /// (`sym(,%idx,scale)` / `sym(%base,%idx,scale)` variants), folding a
-+    /// never-materialised GlobalAddr straight into the memory operand. Only
-+    /// consulted when the plain-register indexed fold was refused because the
-+    /// base has no register home. Default: unsupported.
-+    fn emit_load_indexed_sym(&mut self, _dest: &Value, _sym: &str, _index: &Value, _shift: u8, _ty: IrType) -> bool {
-+        false
-+    }
-+
-+    /// Store dual of [`Self::emit_load_indexed_sym`].
-+    fn emit_store_indexed_sym(&mut self, _val: &Operand, _sym: &str, _index: &Value, _shift: u8, _ty: IrType) -> bool {
-+        false
-+    }
-+
-+    /// Constant-offset GEP folds with a REGISTER-RESIDENT base (non-alloca).
-+    ///
-+    /// Sound only when ALL of the following hold on the backend:
-+    ///  1. the backend passes `collect_gep_fold_base_links(func)` into
-+    ///     register allocation, so the base's live interval is extended to
-+    ///     the consuming Load/Store (the IR records the base's last use at
-+    ///     the folded-away GEP; without the extension the allocator reuses
-+    ///     the register for the stored value — zlib-ng gz_reset NULL store);
-+    ///  2. every register-base path in emit_{load,store}_with_const_offset is
-+    ///     complete (no silent fall-through that drops the access);
-+    ///  3. the base's physical register is outside the emitter's private
-+    ///     scratch set for these paths (accumulator, address scratch,
-+    ///     staging registers), which the caller checks per value.
-+    /// Alloca bases never need this: stack addresses are re-derivable at the
-+    /// use site. Default false keeps slot-only backends (arm, riscv) on the
-+    /// proven alloca-only contract.
-+    fn const_offset_fold_reg_base_ok(&self, _base: &Value) -> bool {
-+        false
-+    }
-+
-     /// Emit a RIP-relative load from a global symbol (folded GlobalAddr + Load).
-     /// Used to fold GlobalAddr + Load into a single `movl symbol(%rip), %eax`
-     /// (or appropriate variant). Default: panics.
-@@ -987,6 +1030,18 @@ pub trait ArchCodegen {
-                     self.emit_store_result(dest);
-                     return;
-                 }
-+                // SOUNDNESS FALLBACK: slot-less REGISTER-resident base.  The
-+                // old code fell through here and never loaded the base, so
-+                // the result was `offset + stale scratch` — rematerialised
-+                // folded GEPs then read/wrote through garbage addresses
-+                // (zlib-ng gen_bitlen corruption).  Stage the base through
-+                // the accumulator and add the constant.
-+                if let Some(br) = self.get_phys_reg_for_value(base.0) {
-+                    self.emit_reg_to_acc(br);
-+                    self.emit_gep_add_const_to_acc(off);
-+                    self.emit_store_result(dest);
-+                    return;
-+                }
-             }
-         }
-         // Optimized path: if both base and offset are register-allocated,
-@@ -1012,6 +1067,12 @@ pub trait ArchCodegen {
-                 SlotAddr::Direct(slot) => self.emit_slot_addr_to_secondary(slot, true, base.0),
-                 SlotAddr::Indirect(slot) => self.emit_slot_addr_to_secondary(slot, false, base.0),
-             }
-+        } else if let Some(br) = self.get_phys_reg_for_value(base.0) {
-+            // SOUNDNESS FALLBACK: slot-less register-resident base — move it
-+            // into the secondary register; without this the add below would
-+            // read a stale scratch (same class as the const-offset case).
-+            self.emit_reg_to_acc(br);
-+            self.emit_acc_to_secondary();
-         }
-         self.emit_load_operand(offset);
-         self.emit_add_secondary_to_acc();
-diff --git a/src/backend/x86/codegen/calls.rs b/src/backend/x86/codegen/calls.rs
-index d582d1ee..996c7a2c 100644
---- a/src/backend/x86/codegen/calls.rs
-+++ b/src/backend/x86/codegen/calls.rs
-@@ -243,7 +243,132 @@ impl X86Codegen {
-         }
-         let xmm_regs = ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"];
-         let mut float_count = 0usize;
-+
-+        // ---- Staging-hazard pre-spill (session 25) ----
-+        // Die-at-birth register coalescing can home a still-needed value in
-+        // an argument register that an EARLIER argument's staging overwrites:
-+        // fp_die_at_birth's `cd` accumulator was homed in xmm3 (sharing with
-+        // the dying `cn`), and staging emitted `movsd %xmm7,%xmm3` (cn, arg4)
-+        // BEFORE reading cd for arg5 — arg5 then read cn's value ("chain_div
-+        // returned chain_neg's value").  Detect every argument whose source
-+        // home is an argument register already written by an earlier-staged
-+        // argument, and pre-spill those values to a transient stack area
-+        // BEFORE any staging write.  Symmetric for GPR argument registers.
-+        let mut written_xmm: [bool; 8] = [false; 8];
-+        let mut written_gpr: [bool; 6] = [false; 6];
-+        // (arg index, phys home, is_fp)
-+        let mut hazards: Vec<(usize, crate::backend::regalloc::PhysReg, bool)> = Vec::new();
-+        for (i, arg) in args.iter().enumerate() {
-+            if let Operand::Value(v) = arg {
-+                if let Some(&phys) = self.reg_assignments.get(&v.0) {
-+                    if super::emit::is_xmm_reg(phys) {
-+                        // Allocator XMM homes are PhysReg 20..33 = xmm2..xmm15.
-+                        let src_idx = phys.0 as i64 - 18;
-+                        if (0..=7).contains(&src_idx) && written_xmm[src_idx as usize] {
-+                            hazards.push((i, phys, true));
-+                        }
-+                    } else {
-+                        // Allocatable GPR homes that double as SysV arg regs:
-+                        // rdi=14→arg0, rsi=15→arg1, rdx=16→arg2, r8=12→arg4,
-+                        // r9=13→arg5 (rcx/rax are not allocatable homes).
-+                        let src_idx: Option<usize> = match phys.0 {
-+                            14 => Some(0),
-+                            15 => Some(1),
-+                            16 => Some(2),
-+                            12 => Some(4),
-+                            13 => Some(5),
-+                            _ => None,
-+                        };
-+                        if let Some(si) = src_idx {
-+                            if written_gpr[si] {
-+                                hazards.push((i, phys, false));
-+                            }
-+                        }
-+                    }
-+                }
-+            }
-+            // Mark the targets THIS argument writes (after its own check).
-+            match &arg_classes[i] {
-+                CallArgClass::FloatReg { reg_idx } => {
-+                    if *reg_idx < 8 {
-+                        written_xmm[*reg_idx] = true;
-+                    }
-+                }
-+                CallArgClass::IntReg { reg_idx } => {
-+                    if *reg_idx < 6 {
-+                        written_gpr[*reg_idx] = true;
-+                    }
-+                }
-+                CallArgClass::StructSseReg { lo_fp_idx, hi_fp_idx, .. } => {
-+                    if *lo_fp_idx < 8 {
-+                        written_xmm[*lo_fp_idx] = true;
-+                    }
-+                    if let Some(hi) = hi_fp_idx {
-+                        if *hi < 8 {
-+                            written_xmm[*hi] = true;
-+                        }
-+                    }
-+                }
-+                CallArgClass::F128SseReg { reg_idx } => {
-+                    if *reg_idx < 8 {
-+                        written_xmm[*reg_idx] = true;
-+                    }
-+                }
-+                CallArgClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, .. }
-+                | CallArgClass::StructMixedSseIntReg { int_reg_idx, fp_reg_idx, .. } => {
-+                    if *fp_reg_idx < 8 {
-+                        written_xmm[*fp_reg_idx] = true;
-+                    }
-+                    if *int_reg_idx < 6 {
-+                        written_gpr[*int_reg_idx] = true;
-+                    }
-+                }
-+                _ => {}
-+            }
-+        }
-+        let mut hazard_slot: crate::common::fx_hash::FxHashMap<usize, i64> =
-+            crate::common::fx_hash::FxHashMap::default();
-+        let hazard_area = ((hazards.len() * 8 + 15) / 16) * 16;
-+        if hazard_area > 0 {
-+            self.state
-+                .emit_fmt(format_args!("    subq ${}, %rsp", hazard_area));
-+            for (k, (arg_i, phys, is_fp)) in hazards.iter().enumerate() {
-+                let off = (k * 8) as i64;
-+                hazard_slot.insert(*arg_i, off);
-+                let name = super::emit::phys_reg_name(*phys);
-+                if *is_fp {
-+                    self.state
-+                        .emit_fmt(format_args!("    movsd %{}, {}(%rsp)", name, off));
+@@ -369,6 +369,18 @@ impl I686Codegen {
+                         emit!(self.state, "    movl {}, %eax", sr);
+                     }
+                     self.state.reg_cache.set_acc(v.0, is_alloca);
 +                } else {
-+                    self.state
-+                        .emit_fmt(format_args!("    movq %{}, {}(%rsp)", name, off));
-+                }
-+            }
-+        }
-+
-         for (i, arg) in args.iter().enumerate() {
-+            // Hazard arguments read their pre-spilled slot instead of the
-+            // (already-overwritten) argument-register home.
-+            if let Some(&off) = hazard_slot.get(&i) {
-+                match &arg_classes[i] {
-+                    CallArgClass::FloatReg { reg_idx } => {
-+                        self.state.emit_fmt(format_args!(
-+                            "    movsd {}(%rsp), %{}",
-+                            off, xmm_regs[*reg_idx]
-+                        ));
-+                        float_count += 1;
-+                        continue;
-+                    }
-+                    CallArgClass::IntReg { reg_idx } => {
-+                        self.state.emit_fmt(format_args!(
-+                            "    movq {}(%rsp), %{}",
-+                            off, X86_ARG_REGS[*reg_idx]
-+                        ));
-+                        continue;
-+                    }
-+                    _ => {}
-+                }
-+            }
-             match arg_classes[i] {
-                 CallArgClass::I128RegPair { base_reg_idx } => {
-                     let lo_reg = X86_ARG_REGS[base_reg_idx];
-@@ -446,6 +571,12 @@ impl X86Codegen {
-         self.state.reg_cache.invalidate_all();
-         self.flush_pending_vec_store_impl();
-         self.state.invalidate_vec_peephole();
-+        // Release the staging-hazard pre-spill area (all hazard args have
-+        // been staged from it; nothing beyond this point reads it).
-+        if hazard_area > 0 {
-+            self.state
-+                .emit_fmt(format_args!("    addq ${}, %rsp", hazard_area));
-+        }
-         // Restore the original RSP frame size.
-         if total_sp_adjust != 0 && self.state.out.use_rsp_addressing {
-             self.state.out.rsp_frame_size -= total_sp_adjust;
++                    // i686 acc-flow contract: the accumulator-centric backend
++                    // has paths where a no-home value is consumed DIRECTLY
++                    // from %eax without a cache entry (the producer staged it
++                    // there outside the cache-tracked flow).  The legacy
++                    // behavior is to emit nothing and let the consumer read
++                    // %eax as-is.  (x86-64 has a HARD panic gate in the same
++                    // situation — session 26 — because its cache contract is
++                    // complete; there it caught the sqlite3KeyInfoAlloc and
++                    // sqlite3VdbeExec corruptions.  i686's cache contract is
++                    // not yet complete enough for the gate; hardening it is
++                    // tracked as the i686 acc-cache audit.)
+                 }
+             }
+         }
 diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 07140af6..1a650b2a 100644
+index 1a650b2a..a71efea6 100644
 --- a/src/backend/x86/codegen/emit.rs
 +++ b/src/backend/x86/codegen/emit.rs
-@@ -3788,6 +3788,82 @@ impl ArchCodegen for X86Codegen {
-     fn supports_global_addr_fold(&self) -> bool {
-         true
-     }
-+
-+    fn const_offset_fold_reg_base_ok(&self, base: &Value) -> bool {
-+        // Register-base const-offset folds consume the base at the Load/Store
-+        // position (RA-invisible): sound only with the folded-base liveness
-+        // links wired into register allocation (prologue passes
-+        // collect_gep_fold_base_links).  When that extension is disabled the
-+        // folds must be refused too — the two are one contract.
-+        if std::env::var_os("CCC_NO_FOLDED_INDEX_LIVENESS").is_some() {
-+            return false;
-+        }
-+        match self.reg_assignments.get(&base.0) {
-+            Some(&phys) if !is_xmm_reg(phys) => {
-+                // Exclude the emitter's private scratch set for the fold
-+                // paths: %rdx (PhysReg 16, emit_save_acc staging) and %r11
-+                // (PhysReg 10, operand_to_rax staging / indirect-target
-+                // scratch).  %rax/%rcx are not allocatable homes to begin
-+                // with.  Every other GPR home is safe: the operand staging
-+                // (operand_to_rax, xmm staging) only touches that set.
-+                !matches!(phys.0, 10 | 16)
-+            }
-+            _ => false,
-+        }
-+    }
-+
-+    fn emit_reg_to_acc(&mut self, reg: PhysReg) {
-+        // The trait DEFAULT for this hook is a NO-OP ("backends override").
-+        // Without the override, default emit_gep fallbacks that stage a
-+        // register-resident base through the accumulator silently emit
-+        // nothing and the address math reads a stale scratch (the exact i686
-+        // emit_leaq_base_index bug class, fixed there in session 20).
-+        let name = phys_reg_name(reg);
-+        self.state.emit_fmt(format_args!("    movq %{}, %rax", name));
-+        self.state.reg_cache.invalidate_acc();
-+    }
-+
-+    fn emit_gep_reg_const(&mut self, dest: &Value, base: &Value, offset: i64) -> bool {
-+        // Register-resident base + constant offset → `leaq off(%base), %dest`.
-+        // Without this hook the default emit_gep silently drops the base for
-+        // slot-less bases: both its const and general branches key on
-+        // resolve_slot_addr(base), so a rematerialised folded GEP computed
-+        // `offset + stale scratch` (zlib-ng gen_bitlen corrupt-pointer crash:
-+        // tree/bl_count fields read and written through garbage addresses).
-+        let Some(&br) = self.reg_assignments.get(&base.0) else {
-+            return false;
-+        };
-+        if is_xmm_reg(br) || offset < i32::MIN as i64 || offset > i32::MAX as i64 {
-+            return false;
-+        }
-+        let b_name = phys_reg_name(br);
-+        if let Some(&dr) = self.reg_assignments.get(&dest.0) {
-+            if !is_xmm_reg(dr) {
-+                let d_name = phys_reg_name(dr);
-+                if offset == 0 {
-+                    if br != dr {
-+                        self.state.emit_fmt(format_args!("    movq %{}, %{}", b_name, d_name));
-+                    }
-+                } else {
-+                    self.state
-+                        .emit_fmt(format_args!("    leaq {}(%{}), %{}", offset, b_name, d_name));
-+                }
-+                self.state.reg_cache.invalidate_acc();
-+                return true;
-+            }
-+        }
-+        // Slot-only dest: stage through %rax, then store to the home.
-+        if offset == 0 {
-+            self.state.emit_fmt(format_args!("    movq %{}, %rax", b_name));
-+        } else {
-+            self.state
-+                .emit_fmt(format_args!("    leaq {}(%{}), %rax", offset, b_name));
-+        }
-+        self.state.reg_cache.set_acc(dest.0, false);
-+        self.emit_store_result(dest);
-+        true
-+    }
-+
-     fn emit_call_store_f128_result(&mut self, _dest: &Value) {
-         unreachable!("x86 uses custom emit_call_store_result for F128")
-     }
+@@ -1347,8 +1347,20 @@ impl X86Codegen {
+                     self.value_to_reg(v, "rax");
+                     self.state.reg_cache.set_acc(v.0, is_alloca);
+                 } else {
+-                    self.state.emit("    xorl %eax, %eax");
+-                    self.state.reg_cache.invalidate_acc();
++                    // HARD GATE (session 26): a live operand value with no
++                    // register home, no stack slot and no accumulator-cache
++                    // entry cannot be materialised — this spot used to emit a
++                    // silent `xorl %eax,%eax`, fabricating zero and corrupting
++                    // whatever consumed it (sqlite -O2 sqlite3KeyInfoAlloc:
++                    // p->aSortFlags stored as NULL → SIGSEGV in
++                    // sqlite3KeyInfoFromExprList).  Reaching here means a
++                    // producer/consumer handoff is broken; fail loudly.
++                    panic!(
++                        "x86 codegen: operand_to_rax: value {} in function '{}' \
++                         has no register home, no stack slot and no acc-cache \
++                         entry — refusing to fabricate a value",
++                        v.0, self.state.current_func_name
++                    );
+                 }
+             }
+         }
 diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
-index 952b253b..01df3e1d 100644
+index 01df3e1d..17c231a7 100644
 --- a/src/backend/x86/codegen/memory.rs
 +++ b/src/backend/x86/codegen/memory.rs
-@@ -1151,6 +1151,26 @@ impl X86Codegen {
-                     }
-                 }
-             }
-+        } else if let Some(&b_reg) = self.reg_assignments.get(&base.0) {
-+            // Register-resident base with no slot home (fold accepted through
-+            // const_offset_fold_reg_base_ok).  The old code staged the value
-+            // into %rax and emitted NO store.  operand_to_rax only touches
-+            // %rax plus the %r11/%rdx staging scratches — the base was
-+            // verified to sit outside that set by the fold predicate.
-+            if !is_xmm_reg(b_reg) {
-+                self.operand_to_rax(val);
-+                let b_name = phys_reg_name(b_reg);
-+                let store_instr = Self::mov_store_for_type(ty);
-+                let store_reg = Self::reg_for_type("rax", ty);
-+                if offset != 0 {
-+                    self.state.emit_fmt(format_args!("    {} %{}, {}(%{})", store_instr, store_reg, offset, b_name));
-+                } else {
-+                    self.state.emit_fmt(format_args!("    {} %{}, (%{})", store_instr, store_reg, b_name));
-+                }
-+                self.state.reg_cache.invalidate_all();
-+                self.flush_pending_vec_store_impl();
-+                self.state.invalidate_vec_peephole();
-+            }
+@@ -1506,11 +1506,17 @@ impl X86Codegen {
+         if let Some(dp) = dest_phys {
+             let dest_name = phys_reg_name(dp);
+             self.state.emit_fmt(format_args!("    leaq (%{}, %{}), %{}", base_name, index_name, dest_name));
++            self.state.reg_cache.invalidate_acc();
          } else {
-             // No addr resolution — fall back
-             self.operand_to_rax(val);
-@@ -1210,7 +1230,25 @@ impl X86Codegen {
-                     self.emit_add_offset_to_addr_reg_impl(offset);
-                     self.state.emit_fmt(format_args!("{} (%rcx), %{}", load_instr, target));
-                 }
--                None => return, // no address resolution — nothing to do
-+                None => {
-+                    // Register-resident base with no slot home (fold accepted
-+                    // through const_offset_fold_reg_base_ok).  Dropping the
-+                    // load here silently read garbage; load through the base.
-+                    if let Some(&reg) = self.reg_assignments.get(&base.0) {
-+                        if !is_xmm_reg(reg) {
-+                            let reg_name = phys_reg_name(reg);
-+                            if offset != 0 {
-+                                self.state.emit_fmt(format_args!("{} {}(%{}), %{}", load_instr, offset, reg_name, target));
-+                            } else {
-+                                self.state.emit_fmt(format_args!("{} (%{}), %{}", load_instr, reg_name, target));
-+                            }
-+                        } else {
-+                            return;
-+                        }
-+                    } else {
-+                        return;
-+                    }
-+                }
-             }
-             if dest_xmm.is_none() {
-                 self.store_xmm_to(dest, "xmm0", ty);
-@@ -1282,6 +1320,40 @@ impl X86Codegen {
-                 }
-             }
+             self.state.emit_fmt(format_args!("    leaq (%{}, %{}), %rax", base_name, index_name));
++            // store_rax_to establishes the acc-cache handoff (it marks dest
++            // as the accumulator content, including the immediately-consumed
++            // no-home case).  Invalidating AFTER it strands the value: the
++            // consumer then finds no cache entry, no register, no slot and
++            // fabricates a value (sqlite -O2 sqlite3KeyInfoAlloc: the
++            // `p->aSortFlags = &p->aColl[N+X]` store read a fabricated 0).
              self.store_rax_to(dest);
-+        } else if let Some(&reg) = self.reg_assignments.get(&base.0) {
-+            // Register-resident base with no slot home (fold accepted through
-+            // const_offset_fold_reg_base_ok): load through the base register.
-+            // Previously this shape fell out with no instruction emitted.
-+            if !is_xmm_reg(reg) {
-+                let load_instr = Self::mov_load_for_type(ty);
-+                let reg_name = phys_reg_name(reg);
-+                if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128) {
-+                    if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
-+                        if !is_xmm_reg(d_reg) {
-+                            let use_32bit_dest =
-+                                matches!(load_instr, "movl" | "movzbl" | "movzwl");
-+                            let d_name = if use_32bit_dest {
-+                                phys_reg_name_32(d_reg)
-+                            } else {
-+                                phys_reg_name(d_reg)
-+                            };
-+                            if offset != 0 {
-+                                self.state.emit_fmt(format_args!("    {} {}(%{}), %{}", load_instr, offset, reg_name, d_name));
-+                            } else {
-+                                self.state.emit_fmt(format_args!("    {} (%{}), %{}", load_instr, reg_name, d_name));
-+                            }
-+                            return;
-+                        }
-+                    }
-+                }
-+                let dest_reg = Self::load_dest_reg(ty);
-+                if offset != 0 {
-+                    self.state.emit_fmt(format_args!("    {} {}(%{}), {}", load_instr, offset, reg_name, dest_reg));
-+                } else {
-+                    self.state.emit_fmt(format_args!("    {} (%{}), {}", load_instr, reg_name, dest_reg));
-+                }
-+                self.store_rax_to(dest);
-+            }
          }
+-        self.state.reg_cache.invalidate_acc();
      }
  
+     pub(super) fn emit_gep_add_const_to_acc_impl(&mut self, offset: i64) {
 diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
-index d3cfda3d..6fde4312 100644
+index 6fde4312..64d163aa 100644
 --- a/src/backend/x86/codegen/prologue.rs
 +++ b/src/backend/x86/codegen/prologue.rs
-@@ -782,9 +782,14 @@ impl X86Codegen {
-             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
-             &mut self.reg_assignments, &mut self.used_callee_saved,
-             false, Some(never_materialized), call_arg_regs, indirect_target_regs,
--            // x86-64 re-materialises skipped indexed GEPs (default
-+            // x86-64 re-materialises skipped INDEXED GEPs (default
-             // emit_load_indexed = false): no RA-invisible index consumption.
--            crate::common::fx_hash::FxHashMap::default(),
-+            // It DOES fold constant-offset GEPs with register bases
-+            // (const_offset_fold_reg_base_ok), whose base is consumed at the
-+            // Load/Store position: extend the base's interval to the
-+            // consumer, else the allocator reuses the base register for the
-+            // stored value (zlib-ng gz_reset NULL-store crash).
-+            crate::backend::generation::collect_gep_fold_base_links(func),
-         );
+@@ -472,10 +472,21 @@ impl X86Codegen {
+             for block in &func.blocks {
+                 let insts = &block.instructions;
+                 for (ii, inst) in insts.iter().enumerate() {
+-                    if let Instruction::Cmp { dest, .. } = inst {
++                    if let Instruction::Cmp { dest, ty, .. } = inst {
+                         if use_counts.get(&dest.0).copied().unwrap_or(0) != 1 {
+                             continue;
+                         }
++                        // Only scalar-integer compares fuse: emit_cmp routes
++                        // I128/U128 to emit_i128_cmp and floats to
++                        // emit_float_cmp — neither participates in the
++                        // pending_cmp handshake, so fusing them would strand
++                        // the forward chain (consumer reads a boolean that was
++                        // never materialized).
++                        if !ty.is_integer()
++                            || crate::backend::generation::is_wide_int_type(*ty)
++                        {
++                            continue;
++                        }
+                         // Walk forward over Copies that forward the cmp value.
+                         let mut cur = dest.0;
+                         let mut k = ii + 1;
+@@ -593,7 +604,13 @@ impl X86Codegen {
+                     // ucomisd with a different flag contract (PF for NaN, the
+                     // setnp/sete dance) — replaying them as integer cmps
+                     // produces wrong selects (simd_sse2_arith regression).
+-                    if !cty.is_integer() {
++                    // WIDE (I128) compares are excluded too: emit_cmp routes
++                    // them to emit_i128_cmp, which ignores cmp_replay AND
++                    // could not be replayed by emit_int_cmp_replay_insn
++                    // (multi-instruction 128-bit compare).
++                    if !cty.is_integer()
++                        || crate::backend::generation::is_wide_int_type(cty)
++                    {
+                         continue;
+                     }
+                     // Replay soundness: the operands are re-materialized at the
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index cbfb1ede..8208cd98 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -342,9 +342,7 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
+     macro_rules! iphase_dump {
+         ($name:expr) => {
+             if dump_pre {
+-                eprintln!("==== IR pre-loop: {} ====", $name);
+-                eprintln!("{:#?}", module);
+-                eprintln!("==== END IR pre-loop: {} ====", $name);
++                dump_ir_filtered(module, &format!("pre-loop {}", $name));
+             }
+         };
+     }
+@@ -385,9 +383,7 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
+         }
+     }
+     if std::env::var("CCC_DUMP_IR").is_ok() || std::env::var("CCC_DUMP_EACH_PASS").is_ok() {
+-        eprintln!("==== IR pre-loop: after inliner ====");
+-        eprintln!("{:#?}", module);
+-        eprintln!("==== END IR pre-loop: after inliner ====");
++        dump_ir_filtered(module, "pre-loop after inliner");
+     }
  
-         // MachInst is profitable on straight-line and modest-CFG code, but its
-diff --git a/src/passes/gvn.rs b/src/passes/gvn.rs
-index 77a60da8..6a9773c2 100644
---- a/src/passes/gvn.rs
-+++ b/src/passes/gvn.rs
-@@ -486,21 +486,20 @@ impl GvnState {
-                 if *volatile {
-                     return None;
+     // After inlining, convert extern inline gnu_inline functions to declarations —
+@@ -670,17 +666,13 @@ macro_rules! preloop_dump {
+                         iter, $name, elapsed, n
+                     );
+                     if dump_each_pass {
+-                        eprintln!("==== IR after iter={} {} ====", iter, $name);
+-                        eprintln!("{:#?}", module);
+-                        eprintln!("==== END IR after iter={} {} ====", iter, $name);
++                        dump_ir_filtered(module, &format!("after iter={} {}", iter, $name));
+                     }
+                     n
+                 } else {
+                     let n = $body;
+                     if dump_each_pass {
+-                        eprintln!("==== IR after iter={} {} ====", iter, $name);
+-                        eprintln!("{:#?}", module);
+-                        eprintln!("==== END IR after iter={} {} ====", iter, $name);
++                        dump_ir_filtered(module, &format!("after iter={} {}", iter, $name));
+                     }
+                     n
                  }
--                // Agent-B/levkropp audit (session 23): enabling F32/F64 load
--                // CSE here was REVERTED. The created FP Copies break the
--                // die-at-birth FP coalescing chain on x86-64: fp_die_at_birth
--                // miscompiles (chain_div returns chain_neg's value). The
--                // exclusion stays until the backend FP copy/coalesce paths are
--                // proven for GVN-created FP copies under the full battery.
--                // Session-23 revert, session-24 root cause: F32/F64 load CSE
--                // creates FP Copy instructions that perturb the die-at-birth
--                // FP register coalescing of UNRELATED functions/blocks:
--                // fp_die_at_birth's pure-computation chain_div loop loses its
--                // accumulator register to copies CSE-created in the load-heavy
--                // energy loop (chain_div returned chain_neg's value). A proper
--                // fix needs copy-aware FP chain coalescing (design item in the
--                // session-24 audit doc); until then FP loads stay out of CSE.
--                if ty.is_float() || ty.is_long_double() || ty.is_128bit() {
-+                // F32/F64 load CSE is ENABLED (session-25).  The session-23
-+                // revert blamed GVN-created FP Copies for the fp_die_at_birth
-+                // miscompile (chain_div returning chain_neg's value), but the
-+                // true root cause was `folded_gep_values` leaking across
-+                // functions in CodegenState::reset_for_function: skipped-GEP
-+                // IDs from a load-heavy function collided with value IDs of a
-+                // LATER function and fired spurious rematerialisations there
-+                // — which is why the symptom looked like "unrelated
-+                // functions" perturbing each other.  With the per-function
-+                // reset in place, FP copies created by CSE are safe.
-+                // Long double (x87) and 128-bit loads stay excluded: their
-+                // lowering uses multi-register/x87 paths that CSE's plain
-+                // Copy does not model.
-+                if ty.is_long_double() || ty.is_128bit() {
-                     return None;
-                 }
-                 // Never CSE/forward loads from parameter allocas (see the
--- 
-2.47.3
-
