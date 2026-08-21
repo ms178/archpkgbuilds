@@ -1,848 +1,440 @@
-diff --git a/docs/history/2026-08-21-session38-cross-target-bittest.md b/docs/history/2026-08-21-session38-cross-target-bittest.md
+From e8bcfcd53b7e08313fa15f22054af6cedfbf499e Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Fri, 21 Aug 2026 15:09:04 +0000
+Subject: [PATCH 1/2] aggregate copy-forward: real fixes for the 3 blockers
+ that kept struct_copy at 3.1x; i686 pair load/store base-clobber miscompile
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+IS-02/struct_copy (P0, biggest measured S gap): 'build(tmp); memcpy(dst,
+tmp)' forwarding was blocked three separate ways on the canonical
+inlined-struct-return shape, so every make_particle still built 48
+bytes on the stack and copied them out:
+
+1. STALE PARAM EXCLUSION. forward_store_only_temporaries excluded 'the
+   first params.len() entry allocas' as forwarding sources. mem2reg
+   deletes promoted scalar param allocas, so the positional count
+   excluded the first two TEMPORARIES instead. Use the authoritative
+   func.param_alloca_values (kept in sync by lowering/mem2reg/
+   tail_call_elim); fall back to the positional rule only when empty
+   (inliner-built functions), fail closed.
+
+2. DEST DEFINED TOO LATE. The copy destination is usually the
+   'g->particles[i]' GEP emitted right before the memcpy — after the
+   temp's first store — and the def-before-first-use ordering check
+   rejected it. A const-offset GetElementPtr is pure address
+   arithmetic: hoist it above the first root use when its base
+   dominates that point (one hoist per run; the driver's fixed-point
+   loop handles chains).
+
+3. WINDOW OVER-REJECTION. The dest-liveness window (zlib-ng fold_1
+   guard) treated ANY instruction referencing a dest-rooted value as
+   touching dest's memory — including the hoisted GEP itself.
+   GEP/Copy/Phi only create aliases; actual accesses through them are
+   still caught by the paths lookup on the accessing instruction.
+   Everything else (Load/Store/Memcpy/Call/...) still fails closed.
+
+struct_copy -O2: 3.11x -> 1.54x vs GCC (83ms -> 41ms); all 4 aggregate
+memcpys in the corpus eliminated (was 0 of 4).
+
+i686 CORRECTNESS (exposed by the -m32 battery, PRE-EXISTING on main):
+the F64/I64 pair load through SlotAddr::Reg emitted
+'movl (%eax),%eax; movl 4(%eax),%edx' when RA homed the pointer in
+%eax (Phase 2e accumulator home) — the first load destroys the base,
+the second dereferences the loaded LOW WORD (nbody/struct_copy -m32
+SIGSEGV). Fixed by ordering the pair so the base register is written
+last (load sites, memory.rs 259/513) and by stashing an %eax/%edx base
+into the %ecx address scratch before the value pair is staged (store
+sites, which cannot reorder because the value occupies both halves).
+25-line reproducer: 5-body force loop, bodies[i].vx -= dx*bodies[j].mass.
+
+Validation: 991/991 unit, 50/50 correctness, 46/46 check scripts,
+regparm -O0..-Os, x86-64 differential fuzz 147/150 (3 pre-existing
+fails, seeds 4/9/100, identical on unmodified main), NEW m32
+differential fuzz 200/200, benchmark parity vs gcc -m32/-m64 (nbody,
+spectral_norm, binary_trees, struct_copy, hash_table, qsort).
+---
+ src/backend/i686/codegen/memory.rs   |  65 ++++++++++++++++-
+ src/passes/aggregate_copy_forward.rs | 105 ++++++++++++++++++++++++---
+ 2 files changed, 156 insertions(+), 14 deletions(-)
+
+diff --git a/src/backend/i686/codegen/memory.rs b/src/backend/i686/codegen/memory.rs
+index b311925..d44ba17 100644
+--- a/src/backend/i686/codegen/memory.rs
++++ b/src/backend/i686/codegen/memory.rs
+@@ -178,7 +178,20 @@ impl I686Codegen {
+             return;
+         }
+         if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 {
+-            let addr = self.state.resolve_slot_addr(ptr.0);
++            let mut addr = self.state.resolve_slot_addr(ptr.0);
++            // Base homed in %eax/%edx dies when the VALUE pair is staged
++            // into the accumulator below. Stash such a base into the %ecx
++            // address scratch first and store through it (same hazard as
++            // the pair-load ordering fix; store side cannot reorder because
++            // both halves of the value occupy %eax:%edx).
++            if let Some(SlotAddr::Reg(reg)) = addr {
++                let r = phys_reg_name(reg);
++                if r == "eax" || r == "edx" {
++                    emit!(self.state, "    movl %{}, %ecx", r);
++                    self.state.reg_cache.invalidate_sec();
++                    addr = Some(SlotAddr::Reg(crate::backend::regalloc::PhysReg(4)));
++                }
++            }
+             self.emit_load_acc_pair(val);
+             if let Some(addr) = addr {
+                 match addr {
+@@ -256,7 +269,23 @@ impl I686Codegen {
+                         emit!(self.state, "    movl {}, %edx", sr4);
+                     }
+                     SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(slot,ptr.0); self.state.emit("    movl (%ecx), %eax"); self.state.emit("    movl 4(%ecx), %edx"); }
+-                    SlotAddr::Reg(reg) => { let r=phys_reg_name(reg); emit!(self.state,"    movl (%{}), %eax",r); emit!(self.state,"    movl 4(%{}), %edx",r); }
++                    SlotAddr::Reg(reg) => {
++                        // The base may live in %eax (PhysReg 6, Phase 2e
++                        // accumulator home) or %edx (PhysReg 5): loading the
++                        // word that OVERWRITES the base register first
++                        // destroys the address for the second load (nbody
++                        // -m32 SIGSEGV: `movl (%eax),%eax; movl 4(%eax),%edx`
++                        // dereferenced the low WORD as a pointer). Order the
++                        // pair so the base register is written LAST.
++                        let r = phys_reg_name(reg);
++                        if r == "eax" {
++                            emit!(self.state, "    movl 4(%{}), %edx", r);
++                            emit!(self.state, "    movl (%{}), %eax", r);
++                        } else {
++                            emit!(self.state, "    movl (%{}), %eax", r);
++                            emit!(self.state, "    movl 4(%{}), %edx", r);
++                        }
++                    }
+                 }
+                 self.emit_store_acc_pair(dest);
+             }
+@@ -321,8 +350,19 @@ impl I686Codegen {
+             }
+         }
+         if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 {
++            let mut addr = self.state.resolve_slot_addr(base.0);
++            // Same %eax/%edx-base hazard as the plain pair store: the value
++            // staging below overwrites both accumulator halves, so stash
++            // such a base into %ecx first.
++            if let Some(SlotAddr::Reg(reg)) = addr {
++                let r = phys_reg_name(reg);
++                if r == "eax" || r == "edx" {
++                    emit!(self.state, "    movl %{}, %ecx", r);
++                    self.state.reg_cache.invalidate_sec();
++                    addr = Some(SlotAddr::Reg(crate::backend::regalloc::PhysReg(4)));
++                }
++            }
+             self.emit_load_acc_pair(val);
+-            let addr = self.state.resolve_slot_addr(base.0);
+             if let Some(addr) = addr {
+                 match addr {
+                     SlotAddr::OverAligned(slot, id) => {
+@@ -510,7 +550,24 @@ impl I686Codegen {
+                         emit!(self.state, "    movl {}, %edx", sr4);
+                     }
+                     SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(slot,base.0); if offset!=0 {self.emit_add_offset_to_addr_reg(offset);} self.state.emit("    movl (%ecx), %eax"); self.state.emit("    movl 4(%ecx), %edx"); }
+-                    SlotAddr::Reg(reg) => { let r=phys_reg_name(reg); if offset!=0 {emit!(self.state,"    movl {}(%{}), %eax",offset,r);emit!(self.state,"    movl {}(%{}), %edx",offset+4,r);} else {emit!(self.state,"    movl (%{}), %eax",r);emit!(self.state,"    movl 4(%{}), %edx",r);} }
++                    SlotAddr::Reg(reg) => {
++                        // Same base-clobber hazard as the plain pair load
++                        // above: write the base register (possibly %eax or
++                        // %edx) last.
++                        let r = phys_reg_name(reg);
++                        let (m0, m4) = if offset != 0 {
++                            (format!("{}(%{})", offset, r), format!("{}(%{})", offset + 4, r))
++                        } else {
++                            (format!("(%{})", r), format!("4(%{})", r))
++                        };
++                        if r == "eax" {
++                            emit!(self.state, "    movl {}, %edx", m4);
++                            emit!(self.state, "    movl {}, %eax", m0);
++                        } else {
++                            emit!(self.state, "    movl {}, %eax", m0);
++                            emit!(self.state, "    movl {}, %edx", m4);
++                        }
++                    }
+                 }
+                 self.emit_store_acc_pair(dest);
+             }
+diff --git a/src/passes/aggregate_copy_forward.rs b/src/passes/aggregate_copy_forward.rs
+index 2be085b..8c0753f 100644
+--- a/src/passes/aggregate_copy_forward.rs
++++ b/src/passes/aggregate_copy_forward.rs
+@@ -262,14 +262,28 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
+     // and deletes the copy — the implicit prologue write is lost and the
+     // copy destination stays uninitialized (dump128(__m128 v): the
+     // `memcpy tmp, v_home` snapshot was deleted outright because v_home has
+-    // ZERO IR stores; tmp then fed printf with stack garbage). Exclude the
+-    // first params.len() entry allocas as forwarding sources, fail closed.
+-    let param_slot_roots: FxHashSet<u32> = func.blocks.first()
+-        .map(|b| b.instructions.iter()
+-            .filter_map(|i| match i { Instruction::Alloca { dest, .. } => Some(dest.0), _ => None })
+-            .take(func.params.len())
+-            .collect())
+-        .unwrap_or_default();
++    // ZERO IR stores; tmp then fed printf with stack garbage).
++    //
++    // The exclusion set is `func.param_alloca_values` — the authoritative
++    // list recorded at lowering (also consumed by stack_layout/analysis).
++    // The old positional rule ("first params.len() entry allocas") went
++    // stale the moment mem2reg promoted scalar param allocas away: in
++    // `fill(ParticleGroup*, int)` both scalar param homes are deleted, so
++    // the position count excluded the first two makeparticle TEMPORARIES
++    // and half the struct-return copies stayed (struct_copy 3.1×). When
++    // the recorded list is empty (tail_call_elim clears it; inliner-built
++    // functions never had one) fall back to the positional rule, fail
++    // closed.
++    let param_slot_roots: FxHashSet<u32> = if !func.param_alloca_values.is_empty() {
++        func.param_alloca_values.iter().map(|v| v.0).collect()
++    } else {
++        func.blocks.first()
++            .map(|b| b.instructions.iter()
++                .filter_map(|i| match i { Instruction::Alloca { dest, .. } => Some(dest.0), _ => None })
++                .take(func.params.len())
++                .collect())
++            .unwrap_or_default()
++    };
+     let mut copies: FxHashMap<u32, (usize, usize, Value)> = FxHashMap::default();
+     let mut copy_sizes: FxHashMap<u32, i64> = FxHashMap::default();
+     let mut duplicate = FxHashSet::default();
+@@ -319,6 +333,57 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
+             if hit { first_root_use.insert(*root, ii); break; }
+         }
+     }
++    // HOIST: the copy destination is very often a pure-address GEP emitted
++    // immediately before the memcpy (`g->particles[i]` in
++    // `build(tmp); memcpy(&g->particles[i], tmp)`), i.e. AFTER the first
++    // store into the temporary. That alone made the ordering check below
++    // reject 3 of 4 struct-return copies per make_group (struct_copy 3.1×).
++    // A GetElementPtr with a constant offset has no side effects and reads
++    // only its base, so moving it earlier in the same block is sound
++    // whenever the base is already defined there. Hoist it to just before
++    // the first root use and let the ordering check pass. One hoist per
++    // run() call keeps every recorded index valid (the driver runs this
++    // pass to a fixed point, so all candidates get their turn).
++    {
++        let mut hoist: Option<(usize, usize, usize)> = None; // (block, gep_idx, insert_at)
++        for (root, (copy_b, _copy_i, dest)) in &copies {
++            let Some(&(db, di)) = def_site.get(&dest.0) else { continue };
++            if db != *copy_b { continue; }
++            let first_use = first_root_use.get(root).copied().unwrap_or(usize::MAX);
++            if di < first_use { continue; } // already ordered
++            let inst = &func.blocks[db].instructions[di];
++            let Instruction::GetElementPtr { base, offset: Operand::Const(_), .. } = inst else {
++                continue;
++            };
++            // Base must be defined before the insertion point: an earlier
++            // instruction of this block, an entry-block value when this is
++            // a later block, or a function parameter (no def site).
++            let base_ok = match def_site.get(&base.0) {
++                Some(&(bb, bi)) => (bb == db && bi < first_use) || (bb == 0 && db != 0),
++                None => true,
++            };
++            if !base_ok { continue; }
++            hoist = Some((db, di, first_use));
++            break;
++        }
++        if let Some((bi, gep_idx, insert_at)) = hoist {
++            if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
++                eprintln!("[STOREFWD-HOIST] {} b{} gep@{} -> {}", func.name, bi, gep_idx, insert_at);
++            }
++            let block = &mut func.blocks[bi];
++            let inst = block.instructions.remove(gep_idx);
++            block.instructions.insert(insert_at, inst);
++            if !block.source_spans.is_empty() {
++                let span = block.source_spans.remove(gep_idx);
++                block.source_spans.insert(insert_at, span);
++            }
++            // Indices recorded in `copies`/`def_site` for this block are
++            // now stale; count the hoist as a change and let the caller's
++            // fixed-point loop re-run the analysis on fresh indices.
++            return 1;
++        }
++    }
++
+     copies.retain(|root, (copy_b, _, dest)| {
+         match def_site.get(&dest.0) {
+             Some((db, di)) => {
+@@ -370,6 +435,9 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
+             }
+         }
+     }
++    if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
++        for r in &invalid { eprintln!("[STOREFWD-REJ] {} root=v{} invalid-use", func.name, r); }
++    }
+     for root in invalid { copies.remove(&root); }
+     if copies.is_empty() { return 0; }
+ 
+@@ -401,10 +469,24 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
+                 }
+                 if hit { first_use = ii; break; }
+             }
+-            // dest's object must be untouched inside the window (the memcpy
+-            // itself at copy_i is the legitimate final write).
++            // dest's MEMORY must be untouched inside the window (the memcpy
++            // itself at copy_i is the legitimate final write). Pure address
++            // computations — GetElementPtr / Copy / Phi over pointers rooted
++            // at dest — do not read or write that memory and must not
++            // reject (the hoisted destination GEP itself sits inside the
++            // window by construction). Everything else that references a
++            // dest-rooted value is a read, a write, or an escape
++            // (Load/Store/Memcpy/Call/Intrinsic/InlineAsm/Cast/...) and
++            // fails closed.
+             for ii in first_use..copy_i {
+                 let inst = &func.blocks[copy_b].instructions[ii];
++                if matches!(inst,
++                    Instruction::GetElementPtr { .. }
++                    | Instruction::Copy { .. }
++                    | Instruction::Phi { .. })
++                {
++                    continue;
++                }
+                 let mut touches_dest = false;
+                 inst.for_each_used_value(|v| {
+                     if v == dest.0 || paths.get(&v).is_some_and(|p| p.0 == dest_root) {
+@@ -419,6 +501,9 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
+                 if touches_dest { reject.insert(root); break; }
+             }
+         }
++        if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
++            for r in &reject { eprintln!("[STOREFWD-REJ] {} root=v{} dest-window", func.name, r); }
++        }
+         for root in reject { copies.remove(&root); }
+     }
+     if copies.is_empty() { return 0; }
+-- 
+2.47.3
+
+
+From 9952263e167076656b528771355a053e52c38942 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Fri, 21 Aug 2026 15:25:20 +0000
+Subject: [PATCH 2/2] docs: session-7 log + scoreboard update (struct_copy
+ 1.54x)
+
+---
+ .../2026-08-21-session7-aggfwd-pairload.md    | 97 +++++++++++++++++++
+ engineering/agent/BACKLOG.md                  |  2 +-
+ 2 files changed, 98 insertions(+), 1 deletion(-)
+ create mode 100644 docs/history/2026-08-21-session7-aggfwd-pairload.md
+
+diff --git a/docs/history/2026-08-21-session7-aggfwd-pairload.md b/docs/history/2026-08-21-session7-aggfwd-pairload.md
 new file mode 100644
-index 00000000..142a1e20
+index 0000000..2121b1b
 --- /dev/null
-+++ b/docs/history/2026-08-21-session38-cross-target-bittest.md
-@@ -0,0 +1,102 @@
-+# Session 38 — cross-target bit-test canonicalization
++++ b/docs/history/2026-08-21-session7-aggfwd-pairload.md
+@@ -0,0 +1,97 @@
++# Session 7 (2026-08-21): struct_copy 3.1×→1.54×, i686 pair-load miscompile
 +
-+**Date:** 2026-08-21 UTC  
-+**Base:** `ms178/lccc` `75d16f90469ad1f92d07a9444c9ecc55a9992eb3`  
-+**Focus:** replace the prior x86-only text-peephole bit-test solution with a broad IR-level operation used by every backend.
++## Base
 +
-+## Problem
++Re-based onto `8393754` (PR #174, BitTest IR). Massive upstream progress since
++#118: Tier-2 graph coloring default (P0-01b), RA-23/24/26/27, sema constraints
++(P0-05), engineering/agent/BACKLOG.md is now the authoritative 170-item work
++catalog. ALL session-6 i686 work survived the merge (verified by grep:
++fnptr fold + linear seal, callee-saves shapes, cmp-mem fold, range fixes,
++call *sym encodings). All 7 reproducers green post-rebase.
 +
-+Session 37 solved `(x >> i) & 1` with an x86-64 text peephole (`fold_variable_bit_test`) that recognized one already-assembled sequence and rewrote it to `btq`. That was intentionally narrow: it did not help AArch64, RISC-V or i686, and it was hidden behind backend assembly text. The requested complete solution is to make bit testing a first-class operation, canonicalize to it in the IR optimizer, and lower it in every backend.
++## Landed (single commit e8bcfcd)
 +
-+## Implementation
++### 1. IS-02 family: aggregate copy-forward — struct_copy 3.11× → 1.54×
 +
-+### IR
++The `build(tmp); memcpy(dst, tmp)` store-forwarding sub-pass was blocked
++three independent ways on the canonical inlined-struct-return shape:
 +
-+`src/ir/ops.rs` adds `IrBinOp::BitTest`:
++* **Stale param exclusion**: excluded "first params.len() entry allocas"
++  positionally; after mem2reg deletes promoted scalar param homes the count
++  excluded the first N *temporaries*. Now uses `func.param_alloca_values`
++  (authoritative, maintained by lowering/mem2reg/tail_call_elim), positional
++  fallback only when the list is empty.
++* **Dest defined too late**: the destination GEP (`&g->particles[i]`) is
++  emitted right before the memcpy — after the temp's first store — failing
++  the def-before-first-use ordering check. Const-offset GEPs are pure
++  address arithmetic: hoisted above the first root use when the base
++  dominates (one hoist per run(); driver fixed-point handles chains).
++* **Window over-rejection**: the dest-liveness window (zlib-ng fold_1 guard)
++  rejected ANY instruction referencing a dest-rooted value — including the
++  hoisted GEP itself. GEP/Copy/Phi are address-only; memory accesses through
++  the aliases they create are still caught by the paths lookup on the
++  accessing instruction. Load/Store/Memcpy/Call/etc. still fail closed.
 +
-+```text
-+BitTest(base, index) == ((base >> index) & 1)
-+```
++All 4 struct-return memcpys in struct_copy now eliminated (was 0-1 of 4).
 +
-+It is always an integer operation. Constant evaluation and loop-unroll classification treat it like a shift/AND classifier:
++### 2. i686 pair load/store base-clobber MISCOMPILE (pre-existing)
 +
-+- `src/passes/constant_fold.rs` evaluates it at compile time.
-+- `src/passes/loop_unroll.rs` recognizes it as bit-iteration work.
++Found by running the -m32 battery on the rebased tree: nbody and
++struct_copy SIGSEGV at -m32 -O1+. The F64/I64 pair load through
++`SlotAddr::Reg` emitted `movl (%eax),%eax; movl 4(%eax),%edx` when the RA
++homed the pointer in %eax (PhysReg 6 = Phase 2e accumulator home, newly
++reachable after the upstream RA work): the first load destroys the base and
++the second dereferences the loaded LOW WORD. Fixes:
 +
-+### Canonicalization
++* load sites (memory.rs, emit_load_impl + emit_load_with_const_offset_impl,
++  SlotAddr::Reg arms): order the pair so the base register is written LAST
++  (base=%eax → load %edx-half first).
++* store sites (emit_store_impl + emit_store_with_const_offset_impl): the
++  value pair occupies BOTH accumulator halves so reordering can't help —
++  stash an %eax/%edx base into the %ecx address scratch before staging.
 +
-+`src/passes/simplify.rs` now recognizes both:
-+
-+```text
-+(base >> index) & 1
-+1 & (base >> index)
-+```
-+
-+and rewrites them to `BitTest(base, index)`.
-+
-+The recognizer also:
-+
-+- follows same-width integer casts, so `(int)(u32)(signed >> index) & 1` still canonicalizes (this covers the Expat signed/unsigned promotion shape);
-+- tracks all binary definitions, not only constant-operand ones, because bit tests have variable indexes;
-+- treats arithmetic and logical shifts identically when isolating bit zero;
-+- folds `BitTest(_, 0)` to zero;
-+- leaves the result type at the shift's natural width. This lets 32-bit classifiers use 32-bit BT/UBFX/shift operations and avoids forcing 64-bit shifts on 32-bit values.
-+
-+### Backend lowering
-+
-+- **x86-64** (`src/backend/x86/codegen/alu.rs`): register-dest results use `btl/btq` with SETcc directly into the destination byte register, then zero-extend with `movzbl`. Stack/no-home results use the accumulator fallback. Constant indexes use `bt $imm` directly. MachInst declines BitTest because the text backend already provides the native lowering.
-+- **i686** (`src/backend/i686/codegen/alu.rs`): uses `btl %ecx,%eax` or `btl $imm,%eax`, then SETcc/MOVZBL.
-+- **AArch64** (`src/backend/arm/codegen/alu.rs`): constant indexes use `ubfx`; variable indexes use `lsr`/`asr` plus `and #1`.
-+- **RISC-V** (`src/backend/riscv/codegen/alu.rs`): uses `srlw/srl` plus `andi`, preserving the existing 32-bit zero-extension convention.
-+
-+The old session-37 x86 text peephole was removed from:
-+
-+- `src/backend/x86/codegen/peephole/passes/local_patterns.rs`
-+- `src/backend/x86/codegen/peephole/passes/mod.rs`
-+
-+The canonical IR path now produces the same BT before peepholes run, so the text-only pattern is redundant.
-+
-+## Examples
-+
-+```asm
-+; x86-64: unsigned var(unsigned x, unsigned i)
-+bittest:
-+    movl %esi, %edx
-+    movl %edi, %r8d
-+    btl %rdx, %r8
-+    setc %r8b
-+    movzbl %r8b, %r8d
-+    movl %r8d, %eax
-+    ret
-+```
-+
-+```asm
-+; AArch64: constbit(unsigned x)
-+constbit:
-+    ...
-+    ubfx w0, w1, #3, #1
-+    ...
-+```
-+
-+```asm
-+; RISC-V: bittest
-+srlw t0, t1, s8
-+andi t0, t0, 1
-+slli t0, t0, 32
-+srli t0, t0, 32
-+```
++25-line reproducer: 5-body force loop with `bodies[i].vx -= dx*bodies[j].mass`.
 +
 +## Validation
 +
-+- `cargo test --profile fastbuild -j2`: **990 passed** after removing the obsolete text-peephole unit test.
-+- Regression suite at `-O3`: **383 passed, 0 failed**.
-+- Regression suite at `-O2 --compare-gcc`: **383 passed, 0 failed**.
-+- Correctness suite: **50 passed, 0 failed**.
-+- New regression: `tests/regression/check_bit_test_canonical.sh` verifies x86 BT, AArch64 UBFX and RISC-V shift/AND, plus an x86 runtime harness over variable/constant indexes.
-+- Targeted build/run checks:
-+  - `adler_inline_tail.c`
-+  - `expat_xml_scan.c` (output remains `626766774715194881`)
++991/991 unit, 50/50 correctness, 46/46 check scripts, regparm -O0..-Os,
++x86-64 differential fuzz 147/150 (seeds 4/9/100 fail IDENTICALLY on
++unmodified main — pre-existing, not investigated this session), **m32
++differential fuzz 200/200**, benchmark output parity vs gcc at -m32 and
++-m64 (nbody, spectral_norm, binary_trees, struct_copy, hash_table, qsort).
 +
-+## Remaining work
++## Benchmark scoreboard after this session (VM, median of 5-9, -O2)
 +
-+The cross-target BitTest primitive is in place. The larger Expat classifier is still a branchy range-membership tree. Future work can map DNF range sets to one or more BitTest operations (or AArch64 TST/UBFX combinations) now that every backend has a canonical destination for the final bit test.
++| kernel | ratio | note |
++|---|---|---|
++| struct_copy | 1.54× | was 3.11× at session start (21× in backlog) |
++| expat_xml_scan | 1.90× | btq classify missing (OP-15/IS-06 wiring) |
++| linux_find_bit | 1.86× | IS-11 andn+cmov chain |
++| sqlite_varint | 1.77× | ISel branches |
++| loop_patterns | 1.75× | vectorizer (OP-05) |
++| zlib_ng_adler32 | 1.66× | RA-03 next-use |
++| sieve | 1.26× | leave alone per backlog |
++| hash_table | 1.20× | |
++| gzip_crc32 | 1.07× | |
++| qsort | 1.00× | |
++| bitops | 0.69× | lccc WINS |
++| matmul | 0.80× | lccc WINS |
++
++## Notes for next session
++
++* The 3 x86-64 fuzz seeds (4, 9, 100) mismatch on pristine main at -O2 —
++  real miscompiles upstream should know about. Repro: tests/fuzz
++  differential_fuzz.py, /tmp/fuzz_base kept the .c files (wiped; regenerate
++  with --seeds 4:5 etc.).
++* expat classify: GCC turns the xml_name_continue OR-chain into
++  `andl $-33` (case-fold) + range + `subl $45; cmpb $50; btq $mask` bit
++  cluster. range_check.rs handles pairs of compares; the btq cluster needs
++  a new "sparse small-set membership" fold over the whole Select chain →
++  BitTest IR (IS-06 landed the op + BT emitters; OP-15 is the wiring).
++  This is the biggest clean structural item left on the parser row.
++* struct_copy remainder (1.54×): GCC pairs the three field multiplies into
++  mulpd (SLP over x/y + z scalar); lccc emits 3 scalar mulsd through
++  slots. That's OP-05/IS-04 territory (vectorizer), not copy-forwarding.
++* Kernel tree at /home/user/linux-6.18.44 was wiped mid-session (only
++  include/generated survived); re-extract + re-patch per session-5 protocol
++  before any realmode measurement.
 diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
-index 00ddec1b..45724eec 100644
+index 07ed216..9facce9 100644
 --- a/engineering/agent/BACKLOG.md
 +++ b/engineering/agent/BACKLOG.md
-@@ -141,7 +141,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
- | 34 | IS-03 | DONE | AVX2 64-byte assignment → 2 YMM load/store pairs + `vzeroupper`; safe leaf DCE removes dead parameter homes and the entire frame/setup | x86 memcpy + target feature contract + DCE | **G/M** 6 instructions, exact parity with GCC16.2/Clang22.1/ICX latest (ICC 9); runtime exact; baseline ISA remains XMM | structural/runtime regression | use YMM for 32/48 B (measured slower) |
- | 35 | IS-04 | P0 | Vectorizer emit `vfmadd231pd` into YMM acc **once** horiz | `vectorize.rs` + `intrinsics.rs` | **G** **icx** not gcc16; spectral ICX FMA 10 | `dot`/spectral CE vs icx | copy gcc16 per-iter hadd |
- | 36 | IS-05 | P1 | Mem-op `vmulpd (%rdi),…` | ISel fold | **G** | mem operand in vec loop | fold aliased |
--| 37 | IS-06 | P1 / partial (peephole landed 2026-08-21 session 37) | `btq` / bitset classify | `simplify.rs` + emit + `fold_variable_bit_test` | **G** gcc name_scan; **M** 1.95×; peephole now converts `shrq %cl; andq $1; cmpq; setne` to `btq; setc` | `btq` in name_scan after if-conversion/select pipeline | mega-inline varint |
-+| 37 | IS-06 | DONE (2026-08-21 session 38) | Cross-target BitTest canonicalization | `ir/ops.rs`, `simplify.rs`, all backends | **G/M** `(x >> i) & 1` becomes `BitTest`; x86 uses BT, AArch64 UBFX for constant indexes, RISC-V/i686 use shift/AND | `check_bit_test_canonical.sh` |
- | 38 | IS-07 | P1 | `cmov` limit idiom | `if_convert.rs` | **G** gcc match `cmovc` | cmov in match | if-convert huge blocks |
- | 39 | IS-08 | P1 | Load-cast fold remaining | `prologue.rs` load_cast | **C** 33% gzip-9 was movzbl | leftover movzbl down | disable `CCC_NO_LOAD_CAST_FOLD` globally without measure |
- | 40 | IS-09 | P1 | Cmp-replay only from **slots** | keep | **C** sqlite `yy_shift` | no sqlite SEGV | replay from physreg |
-diff --git a/src/backend/arm/codegen/alu.rs b/src/backend/arm/codegen/alu.rs
-index ba1e7730..2445be1e 100644
---- a/src/backend/arm/codegen/alu.rs
-+++ b/src/backend/arm/codegen/alu.rs
-@@ -371,6 +371,23 @@ impl ArmCodegen {
-                     self.state.emit("    asr w0, w1, w2");
-                 }
-                 IrBinOp::LShr => self.state.emit("    lsr w0, w1, w2"),
-+                IrBinOp::BitTest => {
-+                    // AArch64 has no BT. UBFX extracts a 1-bit field when the
-+                    // index is an in-range immediate; variable and 64-bit cases
-+                    // use the canonical shift/AND form. The IR recognizer only
-+                    // creates I32 BitTest, so this path remains in w registers.
-+                    if let Some(imm) = Self::const_as_imm12(rhs) {
-+                        if (0..31).contains(&imm) {
-+                            self.state.emit_fmt(format_args!("    ubfx w0, w1, #{imm}, #1"));
-+                        } else {
-+                            self.state.emit_fmt(format_args!("    lsr w0, w1, #{imm}"));
-+                            self.state.emit("    and w0, w0, #1");
-+                        }
-+                    } else {
-+                        self.state.emit("    lsr w0, w1, w2");
-+                        self.state.emit("    and w0, w0, #1");
-+                    }
-+                }
-             }
-         } else {
-             match op {
-@@ -393,6 +410,19 @@ impl ArmCodegen {
-                 IrBinOp::Shl => self.state.emit("    lsl x0, x1, x2"),
-                 IrBinOp::AShr => self.state.emit("    asr x0, x1, x2"),
-                 IrBinOp::LShr => self.state.emit("    lsr x0, x1, x2"),
-+                IrBinOp::BitTest => {
-+                    if let Some(imm) = Self::const_as_imm12(rhs) {
-+                        if (0..63).contains(&imm) {
-+                            self.state.emit_fmt(format_args!("    ubfx x0, x1, #{imm}, #1"));
-+                        } else {
-+                            self.state.emit_fmt(format_args!("    lsr x0, x1, #{imm}"));
-+                            self.state.emit("    and x0, x0, #1");
-+                        }
-+                    } else {
-+                        self.state.emit("    lsr x0, x1, x2");
-+                        self.state.emit("    and x0, x0, #1");
-+                    }
-+                }
-             }
-         }
- 
-diff --git a/src/backend/i686/codegen/alu.rs b/src/backend/i686/codegen/alu.rs
-index 2bcc1585..e8b8cfd9 100644
---- a/src/backend/i686/codegen/alu.rs
-+++ b/src/backend/i686/codegen/alu.rs
-@@ -683,6 +683,19 @@ impl I686Codegen {
-             IrBinOp::Shl => self.state.emit("    shll %cl, %eax"),
-             IrBinOp::AShr => self.state.emit("    sarl %cl, %eax"),
-             IrBinOp::LShr => self.state.emit("    shrl %cl, %eax"),
-+            IrBinOp::BitTest => {
-+                // i686 BT stores the selected bit directly in CF and masks the
-+                // index modulo 32, exactly matching `(base >> index) & 1` on
-+                // an i32 classifier value.
-+                if let Some(imm) = Self::const_as_imm32(rhs) {
-+                    let bit = (imm as u32) % 32;
-+                    self.state.out.emit_instr_imm_reg("    btl", bit as i64, "eax");
-+                } else {
-+                    self.state.emit("    btl %ecx, %eax");
-+                }
-+                self.state.emit("    setc %al");
-+                self.state.emit("    movzbl %al, %eax");
-+            }
-             IrBinOp::SDiv => {
-                 self.state.emit("    cltd");
-                 emit!(self.state, "    idivl {}", rhs_ref);
-diff --git a/src/backend/riscv/codegen/alu.rs b/src/backend/riscv/codegen/alu.rs
-index c14e9b70..27d6e03c 100644
---- a/src/backend/riscv/codegen/alu.rs
-+++ b/src/backend/riscv/codegen/alu.rs
-@@ -49,6 +49,22 @@ impl RiscvCodegen {
- 
-         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
- 
-+        if op == IrBinOp::BitTest {
-+            // RISC-V has no BT. The canonical operation is i32, but keep 64-bit
-+            // behavior for the shared integer default: logical-shift the base
-+            // right by the index, then isolate bit zero. This is exactly what
-+            // every backend would otherwise reconstruct from `(x >> i) & 1`.
-+            let shift = if use_32bit { "srlw" } else { "srl" };
-+            self.state.emit_fmt(format_args!("    {shift} t0, t1, t2"));
-+            self.state.emit("    andi t0, t0, 1");
-+            if use_32bit {
-+                self.state.emit("    slli t0, t0, 32");
-+                self.state.emit("    srli t0, t0, 32");
-+            }
-+            self.store_t0_to(dest);
-+            return;
-+        }
-+
-         let mnemonic = match (op, use_32bit) {
-             (IrBinOp::Add, false) => "add",
-             (IrBinOp::Add, true) => "addw",
-@@ -73,6 +89,7 @@ impl RiscvCodegen {
-             (IrBinOp::AShr, true) => "sraw",
-             (IrBinOp::LShr, false) => "srl",
-             (IrBinOp::LShr, true) => "srlw",
-+            (IrBinOp::BitTest, _) => unreachable!("BitTest handled above"),
-         };
-         self.state.emit_fmt(format_args!("    {} t0, t1, t2", mnemonic));
- 
-diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
-index 0030e4ec..630343aa 100644
---- a/src/backend/x86/codegen/alu.rs
-+++ b/src/backend/x86/codegen/alu.rs
-@@ -3,6 +3,8 @@
- use crate::ir::reexports::{IrBinOp, Operand, Value};
- use crate::common::types::IrType;
- use super::emit::{X86Codegen, shift_mnemonic};
-+use crate::backend::regalloc::PhysReg;
-+use crate::backend::traits::ArchCodegen;
- 
- impl X86Codegen {
-     // ---- Unary ----
-@@ -180,6 +182,70 @@ impl X86Codegen {
-         }
-     }
- 
-+    /// Emit `dest = BT(base, index) & 1` directly to a physical register.
-+    /// Returns false only when the result register is BT's fixed count
-+    /// register (%rcx) or is not an ordinary GPR; the accumulator fallback
-+    /// handles those shapes. SETcc writes an 8-bit GPR directly, and a 32-bit
-+    /// result is zero-extended with `movzbl`. For 64-bit results the zero
-+    /// extension from 32-bit MOVL is enough.
-+    fn emit_bit_test_reg_direct(
-+        &mut self,
-+        base: &Operand,
-+        index: &Operand,
-+        dest_phys: PhysReg,
-+        use_32bit: bool,
-+    ) -> bool {
-+        let dest64 = super::emit::phys_reg_name(dest_phys);
-+        if dest64 == "rcx" {
-+            return false;
-+        }
-+        let dest8 = super::emit::typed_phys_reg_name(dest_phys, IrType::U8);
-+        // Put the base into the destination first; BT reads the base and
-+        // writes only CF. The index must go to %rcx after this, so it does
-+        // not matter whether the base and index source registers alias.
-+        match base {
-+            Operand::Value(v) => {
-+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
-+                    let src64 = super::emit::phys_reg_name(reg);
-+                    if src64 != dest64 {
-+                        if use_32bit {
-+                            let src32 = super::emit::phys_reg_name_32(reg);
-+                            let dest32 = super::emit::phys_reg_name_32(dest_phys);
-+                            self.state.emit_fmt(format_args!("    movl %{src32}, %{dest32}"));
-+                        } else {
-+                            self.state.emit_fmt(format_args!("    movq %{src64}, %{dest64}"));
-+                        }
-+                    }
-+                } else if use_32bit {
-+                    self.value_to_reg(v, dest64);
-+                } else {
-+                    self.value_to_reg(v, dest64);
-+                }
-+            }
-+            Operand::Const(_) => self.operand_to_reg(base, dest64),
-+        }
-+        let const_index = match index {
-+            Operand::Const(c) => c.to_i64().filter(|v| *v >= i32::MIN as i64 && *v <= i32::MAX as i64),
-+            _ => None,
-+        };
-+        if let Some(imm) = const_index {
-+            let width = if use_32bit { 32 } else { 64 };
-+            let bit = (imm as u32) % width;
-+            let bt = if use_32bit { "btl" } else { "btq" };
-+            self.state.emit_fmt(format_args!("    {bt} ${bit}, %{dest64}"));
-+        } else {
-+            self.operand_to_rcx(index);
-+            let bt = if use_32bit { "btl" } else { "btq" };
-+            self.state.emit_fmt(format_args!("    {bt} %rcx, %{dest64}"));
-+        }
-+        self.state.emit_fmt(format_args!("    setc %{dest8}"));
-+        if use_32bit {
-+            let dest32 = super::emit::phys_reg_name_32(dest_phys);
-+            self.state.emit_fmt(format_args!("    movzbl %{dest8}, %{dest32}"));
-+        }
-+        true
-+    }
-+
-     // ---- Binop ----
- 
-     pub(super) fn emit_int_binop_impl(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-@@ -198,6 +264,36 @@ impl X86Codegen {
-                 self.emit_shift_reg_direct(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest.0);
-                 return;
-             }
-+            if op == IrBinOp::BitTest {
-+                if self.emit_bit_test_reg_direct(lhs, rhs, dest_phys, use_32bit) {
-+                    return;
-+                }
-+            }
-+        }
-+
-+        if op == IrBinOp::BitTest {
-+            // Use the native BT instruction: base stays in %rax, the index is
-+            // moved into %rcx (BT's fixed count register), SETC materializes
-+            // CF, and the boolean is stored to the destination.  This is the
-+            // cross-cutting canonical lower instead of patching text peepholes.
-+            self.emit_load_operand(lhs);
-+            self.operand_to_rcx(rhs);
-+            if let Some(imm) = Self::const_as_imm32(rhs) {
-+                let width = if use_32bit { 32 } else { 64 };
-+                let bit = (imm as u32) % width;
-+                let bt_line = if use_32bit {
-+                    format!("    btl ${bit}, %eax")
-+                } else {
-+                    format!("    btq ${bit}, %rax")
-+                };
-+                self.state.emit(&bt_line);
-+            } else {
-+                self.state.emit(if use_32bit { "    btl %ecx, %eax" } else { "    btq %rcx, %rax" });
-+            }
-+            self.state.emit("    setc %al");
-+            self.state.emit(if use_32bit { "    movzbl %al, %eax" } else { "    movzbq %al, %rax" });
-+            self.store_rax_to(dest);
-+            return;
-         }
- 
-         // Accumulator-based fallback: try immediate optimizations first
-@@ -394,6 +490,7 @@ impl X86Codegen {
-                     self.state.emit_fmt(format_args!("    {} %cl, %rax", mnem64));
-                 }
-             }
-+            IrBinOp::BitTest => unreachable!("BitTest handled by native BT fallback"),
-         }
- 
-         self.state.reg_cache.invalidate_acc();
-diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
-index ae8b49ee..ac5a4ee9 100644
---- a/src/backend/x86/codegen/isel.rs
-+++ b/src/backend/x86/codegen/isel.rs
-@@ -671,6 +671,10 @@ pub fn lower_instruction_ctx(
-     match inst {
-         Instruction::BinOp { dest, op, lhs, rhs, ty } => {
-             if ty.is_float() || ty.is_128bit() { return false; }
-+            // BitTest is lowered by the text path, which uses BT plus
-+            // register/stack-aware SETCC materialization and keeps the i32
-+            // result zero-extended. MachInst currently has no BT opcode.
-+            if *op == IrBinOp::BitTest { return false; }
-             // Only handle I32/U32/I64/U64/Ptr — sub-32-bit types have complex
-             // register sub-register interactions that need special handling.
-             if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) { return false; }
-diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-index e798e7ad..268bb10a 100644
---- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-+++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-@@ -4237,111 +4237,6 @@ fn compute_gpr_live_out(store: &LineStore, infos: &[LineInfo]) -> Vec<u16> {
- /// explicit-operand integer ALU operations; one-operand IMUL and partial-width
- /// forms are rejected. 32-bit writes zero-extend on x86-64, so both sequences
- /// have identical SRC and flag semantics.
--/// Replace `shrq %cl, %base; andq $1, %res; cmpq $0, %res; setne %cc`
--/// with a direct `btq %rcx, %base; setc %cc` when `%base` was loaded from a
--/// constant bit mask.  On x86-64, BT stores the selected bit directly in CF and
--/// masks the index modulo 64, so it is equivalent to the shift/AND/compare
--/// sequence for all values of `%cl` and avoids the integer dependency through
--/// the shift result.  Expat's UTF-8 name classifier contains this exact shape
--/// after if-conversion; GCC emits the BT form.
--pub(super) fn fold_variable_bit_test(
--    store: &mut LineStore,
--    infos: &mut [LineInfo],
--) -> bool {
--    let len = store.len();
--    let mut changed = false;
--    let mut i = 0;
--    while i < len {
--        if infos[i].is_nop() { i += 1; continue; }
--        let shift = infos[i].trimmed(store.get(i));
--        let Some((shift_dst, shift_base_ok)) = parse_var_shrq(shift) else { i += 1; continue; };
--        if !shift_base_ok { i += 1; continue; }
--
--        // The shift destination must have been loaded from an immediate mask.
--        // We do not need the mask value for correctness: BT works for every bit,
--        // but this requirement keeps the pattern tied to the bitmap classifier
--        // shape and avoids turning arbitrary shifts into BT.
--        let mut p = i;
--        let mut saw_movabs = false;
--        while p > 0 {
--            p -= 1;
--            if infos[p].is_nop() { continue; }
--            if infos[p].is_barrier() { break; }
--            let prev = infos[p].trimmed(store.get(p));
--            if prev.starts_with("movabsq $") && prev.ends_with(&format!(", {shift_dst}")) {
--                saw_movabs = true;
--            }
--            break;
--        }
--        if !saw_movabs { i += 1; continue; }
--
--        // Find the following AND/compare/set chain without crossing labels,
--        // jumps, calls or other control barriers.
--        let and_idx = next_non_nop(infos, i + 1, len);
--        if and_idx >= len || infos[and_idx].is_barrier() { i += 1; continue; }
--        let and = infos[and_idx].trimmed(store.get(and_idx));
--        let Some(and_res) = parse_and_one(and, shift_dst) else { i += 1; continue; };
--
--        let cmp_idx = next_non_nop(infos, and_idx + 1, len);
--        if cmp_idx >= len || infos[cmp_idx].is_barrier() { i += 1; continue; }
--        let cmp = infos[cmp_idx].trimmed(store.get(cmp_idx));
--        if !is_cmp_zero(cmp, and_res) { i += 1; continue; }
--
--        let set_idx = next_non_nop(infos, cmp_idx + 1, len);
--        if set_idx >= len || infos[set_idx].is_barrier() { i += 1; continue; }
--        let set = infos[set_idx].trimmed(store.get(set_idx)).to_string();
--        let cc_reg = match parse_setcc_nonnegative(&set) {
--            Some(reg) => reg.to_string(),
--            None => { i += 1; continue; }
--        };
--        if register_family_fast(&cc_reg) == 1 { i += 1; continue; }
--
--        // If the result is zero-extended immediately after SETcc, the existing
--        // redundant-extension pass removes the move once SETC is in place.
--        let bt = format!("    btq %rcx, {shift_dst}");
--        let setc = format!("    setc {cc_reg}");
--        replace_line(store, &mut infos[i], i, bt);
--        mark_nop(&mut infos[and_idx]);
--        mark_nop(&mut infos[cmp_idx]);
--        replace_line(store, &mut infos[set_idx], set_idx, setc);
--        changed = true;
--        i = set_idx + 1;
--    }
--    changed
--}
--
--fn parse_var_shrq(line: &str) -> Option<(&str, bool)> {
--    let rest = line.strip_prefix("shrq ")?.trim_start();
--    let (amount, dst) = rest.split_once(',')?;
--    let dst = dst.trim();
--    Some((dst, amount.trim() == "%cl" && dst.starts_with('%')))
--}
--
--fn parse_and_one<'a>(line: &'a str, shift_dst: &str) -> Option<&'a str> {
--    let rest = line.strip_prefix("andq $1,")?;
--    let dst = rest.trim();
--    let same_shift = dst == shift_dst;
--    let preceded = line.contains(shift_dst);
--    (dst.starts_with('%') && (same_shift || preceded)).then_some(dst)
--}
--
--fn is_cmp_zero(line: &str, reg: &str) -> bool {
--    let Some(rest) = line.strip_prefix("cmpq ") else { return false; };
--    let (lhs, rhs) = match rest.split_once(',') { Some(x) => x, None => return false };
--    (lhs.trim() == "$0" && rhs.trim() == reg) || (lhs.trim() == reg && rhs.trim() == "$0")
--}
--
--fn parse_setcc_nonnegative(line: &str) -> Option<&str> {
--    for mnem in ["setne", "setnz", "seta", "setnb", "setae", "setb"] {
--        if let Some(reg) = line.strip_prefix(&format!("{mnem} ")) {
--            let reg = reg.trim();
--            return reg.starts_with('%').then_some(reg);
--        }
--    }
--    None
--}
--
--
- /// Fold a copy/32-bit-update/copy-back round trip:
- ///   movq SRC, TMP; <update> TMPd; movl TMPd, SRCd
- /// into:
-diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
-index b8d0c93c..4d19cc78 100644
---- a/src/backend/x86/codegen/peephole/passes/mod.rs
-+++ b/src/backend/x86/codegen/peephole/passes/mod.rs
-@@ -427,7 +427,6 @@ pub fn peephole_optimize(mut asm: String) -> String {
-         // A sound fusion saves nothing (still needs init + sext), so the
-         // pass is deleted rather than gated.
-         if !sk("copy_shift_back") { changed |= local_patterns::fold_copy_shift_copyback(&mut store, &mut infos); }
--        if !sk("var_bt") { changed |= local_patterns::fold_variable_bit_test(&mut store, &mut infos); }
-         if !sk("xor_move_fold") { changed |= local_patterns::fold_zero_extended_xor_moves(&mut store, &mut infos); }
-         if !sk("rotate_idiom") { changed |= local_patterns::fold_rotate_idiom(&mut store, &mut infos); }
-         if !sk("vec_self_move") { changed |= local_patterns::eliminate_vector_self_moves(&mut store, &mut infos); }
-@@ -619,25 +618,6 @@ mod tests {
-         assert!(!result.contains("movq %rcx, %rax\n    incl %eax"), "{result}");
-     }
- 
--    #[test]
--    fn variable_bit_test_replaces_shift_mask_compare() {
--        let asm = concat!(
--            "f:\n",
--            "    movabsq $-1125899906859004, %rax\n",
--            "    shrq %cl, %rax\n",
--            "    andq $1, %rax\n",
--            "    cmpq $0, %rax\n",
--            "    setne %dil\n",
--            "    ret\n",
--        )
--        .to_string();
--        let result = peephole_optimize(asm);
--        assert!(result.contains("btq %rcx, %rax"), "{result}");
--        assert!(result.contains("setc %dil"), "{result}");
--        assert!(!result.contains("andq $1, %rax"), "{result}");
--        assert!(!result.contains("cmpq $0, %rax"), "{result}");
--    }
--
-     #[test]
-     fn test_copy_propagates_into_source_clobbering_address_load() {
-         let asm = concat!(
-diff --git a/src/ir/ops.rs b/src/ir/ops.rs
-index 36e1c5fa..a9b843e8 100644
---- a/src/ir/ops.rs
-+++ b/src/ir/ops.rs
-@@ -50,6 +50,12 @@ pub enum IrBinOp {
-     Shl,
-     AShr,
-     LShr,
-+    /// Boolean bit test: `(lhs >> rhs) & 1`.  The result is I32 and lhs/rhs are
-+    /// always integer.  Backends may lower this to a native BT-family
-+    /// instruction or to the portable shift/AND sequence.  This is the
-+    /// cross-target canonical form for classifier chains such as Expat name
-+    /// scanning, instead of leaving the pattern in text peepholes.
-+    BitTest,
- }
- 
- impl IrBinOp {
-@@ -80,6 +86,11 @@ impl IrBinOp {
-             IrBinOp::Shl => lhs.wrapping_shl(rhs as u32),
-             IrBinOp::AShr => lhs.wrapping_shr(rhs as u32),
-             IrBinOp::LShr => (lhs as u64).wrapping_shr(rhs as u32) as i64,
-+            IrBinOp::BitTest => {
-+                // The canonical operation is produced by an i32-typed recognizer
-+                // after integer promotion; evaluate it as C's `(x >> i) & 1`.
-+                (((lhs as u64) >> (rhs as u32)) & 1) as i64
-+            }
-             IrBinOp::SDiv => {
-                 if rhs == 0 { return None; }
-                 lhs.wrapping_div(rhs)
-@@ -114,6 +125,7 @@ impl IrBinOp {
-             IrBinOp::Shl => lhs.wrapping_shl(rhs as u32),
-             IrBinOp::AShr => lhs.wrapping_shr(rhs as u32),
-             IrBinOp::LShr => (lhs as u128).wrapping_shr(rhs as u32) as i128,
-+            IrBinOp::BitTest => (((lhs as u128) >> (rhs as u32)) & 1) as i128,
-             IrBinOp::SDiv => {
-                 if rhs == 0 { return None; }
-                 lhs.wrapping_div(rhs)
-diff --git a/src/passes/constant_fold.rs b/src/passes/constant_fold.rs
-index b803132d..92d759a5 100644
---- a/src/passes/constant_fold.rs
-+++ b/src/passes/constant_fold.rs
-@@ -834,12 +834,18 @@ fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
-         }
-         IrBinOp::LShr => {
-             if is_32bit {
--                // For 32-bit types, mask to u32 to get correct unsigned bit pattern
-                 (lhs as u32).wrapping_shr(rhs as u32) as i64
-             } else {
-                 (lhs as u64).wrapping_shr(rhs as u32) as i64
-             }
-         }
-+        IrBinOp::BitTest => {
-+            if is_32bit {
-+                (((lhs as u32) >> (rhs as u32)) & 1) as i64
-+            } else {
-+                (((lhs as u64) >> (rhs as u32)) & 1) as i64
-+            }
-+        }
-     })
- }
- 
-diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
-index 470827b8..25a513fb 100644
---- a/src/passes/loop_unroll.rs
-+++ b/src/passes/loop_unroll.rs
-@@ -439,7 +439,7 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
-             Instruction::BinOp { op, .. } => {
-                 use crate::ir::reexports::IrBinOp::*;
-                 match op {
--                    AShr | LShr | Shl => saw_shift = true,
-+                    AShr | LShr | Shl | BitTest => saw_shift = true,
-                     And | Or | Xor => saw_and = true,
-                     Add | Sub | Mul | SDiv | UDiv | SRem | URem => other_arith = true,
-                 }
-diff --git a/src/passes/simplify.rs b/src/passes/simplify.rs
-index c5142b89..27c7b14c 100644
---- a/src/passes/simplify.rs
-+++ b/src/passes/simplify.rs
-@@ -133,14 +133,13 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
-                     }
-                 }
-                 Instruction::BinOp { dest, op, lhs, rhs, ty } => {
--                    // Track BinOp definitions where at least one operand is a constant.
--                    // This enables constant reassociation: (x + C1) + C2 => x + (C1+C2),
--                    // and multiply reassociation: (x * C1) * C2 => x * (C1*C2).
--                    if matches!(lhs, Operand::Const(_)) || matches!(rhs, Operand::Const(_)) {
--                        set_def(&mut binop_defs, dest.0, BinOpDef {
--                            op: *op, lhs: *lhs, rhs: *rhs, ty: *ty,
--                        });
--                    }
-+                    // Track all binary definitions. Constant reassociation needs
-+                    // the constant-operand subset, but canonical BitTest
-+                    // recognition must see variable-index shifts such as
-+                    // `(base >> index) & 1`.
-+                    set_def(&mut binop_defs, dest.0, BinOpDef {
-+                        op: *op, lhs: *lhs, rhs: *rhs, ty: *ty,
-+                    });
-                 }
-                 Instruction::UnaryOp { dest, op: IrUnaryOp::Neg, src, .. } => {
-                     set_def(&mut neg_defs, dest.0, NegDef { src: *src });
-@@ -253,7 +252,7 @@ fn try_simplify_with_types(
- ) -> Option<Instruction> {
-     match inst {
-         Instruction::BinOp { dest, op, lhs, rhs, ty } => {
--            simplify_binop(*dest, *op, lhs, rhs, *ty, binop_defs, neg_defs)
-+            simplify_binop(*dest, *op, lhs, rhs, *ty, cast_defs, binop_defs, neg_defs)
-         }
-         Instruction::Cast { dest, src, from_ty, to_ty } => {
-             simplify_cast(*dest, src, *from_ty, *to_ty, cast_defs, value_types)
-@@ -912,6 +911,7 @@ fn simplify_binop(
-     lhs: &Operand,
-     rhs: &Operand,
-     ty: IrType,
-+    cast_defs: &[Option<CastDef>],
-     binop_defs: &[Option<BinOpDef>],
-     neg_defs: &[Option<NegDef>],
- ) -> Option<Instruction> {
-@@ -1087,6 +1087,43 @@ fn simplify_binop(
-                 // x & x => x
-                 return Some(Instruction::Copy { dest, src: *lhs });
-             }
-+            // Canonicalize `(base >> index) & 1` to a cross-target BitTest.
-+            // Both operand orders are accepted; for a signed right shift the
-+            // isolated low bit is identical to a logical shift, so AShr is
-+            // safe here too.
-+            let mask_is_one = is_one(lhs) || is_one(rhs);
-+            if mask_is_one && ty.is_integer() {
-+                let candidate = if is_one(lhs) { rhs } else { lhs };
-+                // Peek through same-width integer casts. They are often
-+                // inserted by C integer promotion (`(int)(unsigned)x`) but do
-+                // change the isolated low bit.
-+                let peeled = match candidate {
-+                    Operand::Value(v) => match cast_defs.get(v.0 as usize).copied().flatten() {
-+                        Some(CastDef { from_ty, to_ty, src })
-+                            if from_ty.is_integer() && to_ty.is_integer()
-+                                && from_ty.size() == to_ty.size() => src,
-+                        _ => *candidate,
-+                    },
-+                    _ => *candidate,
-+                };
-+                if let Some(def) = get_binop_def(&peeled, binop_defs) {
-+                    if matches!(def.op, IrBinOp::LShr | IrBinOp::AShr) {
-+                        // Isolating the low bit is independent of whether the
-+                        // shift was arithmetic or logical; only that bit can
-+                        // reach `& 1`. Preserve the source width. A typed
-+                        // narrow/wide mismatch uses the natural 32-bit width so
-+                        // the backend receives a legal i32 BitTest.
-+                        let bt_ty = if def.ty == ty { ty } else { IrType::I32 };
-+                        return Some(Instruction::BinOp {
-+                            dest,
-+                            op: IrBinOp::BitTest,
-+                            lhs: def.lhs,
-+                            rhs: def.rhs,
-+                            ty: bt_ty,
-+                        });
-+                    }
-+                }
-+            }
-             // Reassociation: (x & C1) & C2 => x & (C1 & C2)
-             if let Some(inst) = try_reassociate_bitwise(dest, IrBinOp::And, lhs, rhs, ty, binop_defs) {
-                 return Some(inst);
-@@ -1156,6 +1193,17 @@ fn simplify_binop(
-                 return Some(inst);
-             }
-         }
-+        IrBinOp::BitTest => {
-+            // `(base >> index) & 1`: a zero base or zero bit index always
-+            // yields zero. Do *not* treat index 0 as a copy of base: only bit
-+            // zero is returned, and preserving BitTest lets x86 select BT.
-+            if rhs_zero || lhs_zero {
-+                return Some(Instruction::Copy {
-+                    dest,
-+                    src: Operand::Const(IrConst::zero(ty)),
-+                });
-+            }
-+        }
-     }
- 
-     // Commutative operand canonicalization: for commutative operations
-@@ -3061,6 +3109,84 @@ mod tests {
-         }
-     }
- 
-+
-+    #[test]
-+    fn bit_test_canonicalizes_variable_shift_and_one() {
-+        let mut binops = vec![None; 8];
-+        binops[2] = Some(BinOpDef {
-+            op: IrBinOp::LShr,
-+            lhs: Operand::Value(Value(1)),
-+            rhs: Operand::Value(Value(3)),
-+            ty: IrType::I32,
-+        });
-+        let inst = Instruction::BinOp {
-+            dest: Value(4),
-+            op: IrBinOp::And,
-+            lhs: Operand::Value(Value(2)),
-+            rhs: Operand::Const(IrConst::I64(1)),
-+            ty: IrType::I32,
-+        };
-+        let got = simplify_binop(
-+            Value(4), IrBinOp::And,
-+            &Operand::Value(Value(2)), &Operand::Const(IrConst::I64(1)),
-+            IrType::I32, &[], &binops, &[],
-+        ).unwrap();
-+        match got {
-+            Instruction::BinOp { op: IrBinOp::BitTest, lhs, rhs, ty, .. } => {
-+                assert!(matches!(lhs, Operand::Value(Value(1))));
-+                assert!(matches!(rhs, Operand::Value(Value(3))));
-+                assert_eq!(ty, IrType::I32);
-+            }
-+            other => panic!("expected BitTest, got {other:?}"),
-+        }
-+    }
-+
-+    #[test]
-+    fn bit_test_peels_same_width_integer_cast() {
-+        let mut binops = vec![None; 8];
-+        let mut casts = vec![None; 8];
-+        binops[2] = Some(BinOpDef {
-+            op: IrBinOp::AShr,
-+            lhs: Operand::Value(Value(1)),
-+            rhs: Operand::Value(Value(3)),
-+            ty: IrType::I32,
-+        });
-+        casts[2] = Some(CastDef {
-+            src: Operand::Value(Value(2)),
-+            from_ty: IrType::I32,
-+            to_ty: IrType::U32,
-+        });
-+        let got = simplify_binop(
-+            Value(4), IrBinOp::And,
-+            &Operand::Value(Value(2)), &Operand::Const(IrConst::I64(1)),
-+            IrType::U32, &casts, &binops, &[],
-+        ).unwrap();
-+        match got {
-+            Instruction::BinOp { op: IrBinOp::BitTest, lhs, rhs, ty, .. } => {
-+                assert!(matches!(lhs, Operand::Value(Value(1))));
-+                assert!(matches!(rhs, Operand::Value(Value(3))));
-+                assert_eq!(ty, IrType::I32);
-+            }
-+            other => panic!("expected BitTest through cast, got {other:?}"),
-+        }
-+    }
-+
-+    #[test]
-+    fn bit_test_zero_operand_is_zero() {
-+        let inst = Instruction::BinOp {
-+            dest: Value(4),
-+            op: IrBinOp::BitTest,
-+            lhs: Operand::Value(Value(1)),
-+            rhs: Operand::Const(IrConst::I32(0)),
-+            ty: IrType::I32,
-+        };
-+        let got = simplify_binop(
-+            Value(4), IrBinOp::BitTest,
-+            &Operand::Value(Value(1)), &Operand::Const(IrConst::I32(0)),
-+            IrType::I32, &[], &[], &[],
-+        ).unwrap();
-+        assert!(matches!(got, Instruction::Copy { src: Operand::Const(c), .. } if c.to_i64() == Some(0)));
-+    }
-     #[test]
-     fn test_binop_canonicalize_commutative_and() {
-         // BinOp(And, Const(0xFF), Value(1)) => BinOp(And, Value(1), Const(0xFF))
-diff --git a/tests/regression/check_bit_test_canonical.sh b/tests/regression/check_bit_test_canonical.sh
-new file mode 100755
-index 00000000..9f91483b
---- /dev/null
-+++ b/tests/regression/check_bit_test_canonical.sh
-@@ -0,0 +1,52 @@
-+#!/usr/bin/env bash
-+# Canonical `(x >> i) & 1` lowering.
-+#
-+# This is a cross-target canonical IR operation: x86 should use BT, AArch64
-+# should use UBFX for a constant index, and every target must preserve the
-+# low-bit result for both signed and unsigned right shifts.
-+set -euo pipefail
-+CCC=${CCC:-./target/fastbuild/lccc}
-+td=$(mktemp -d)
-+trap 'rm -rf "$td"' EXIT
-+
-+cat >"$td/bt.c" <<'EOF'
-+unsigned var(unsigned x, unsigned i) { return (x >> i) & 1u; }
-+unsigned signed_var(int x, unsigned i) { return (x >> i) & 1u; }
-+unsigned constbit(unsigned x) { return (x >> 3) & 1u; }
-+EOF
-+
-+"$CCC" -O3 -S "$td/bt.c" -o "$td/x86.s"
-+grep -Eq 'btl[[:space:]]+%r[abcd]x, %r[0-9]+' "$td/x86.s"
-+grep -Eq 'btl[[:space:]]+\$3, %' "$td/x86.s"
-+# The source has no main; only assemble/codegen is required here. A
-+# separate runtime harness links the object below when the host linker is
-+# available.
-+"$CCC" -O3 -c "$td/bt.c" -o "$td/bt.o"
-+if command -v cc >/dev/null 2>&1; then
-+  cat >"$td/driver.c" <<'DRIVER'
-+#include <stdio.h>
-+unsigned var(unsigned x, unsigned i);
-+unsigned constbit(unsigned x);
-+int main(void) {
-+  for (unsigned x = 0; x < 80; x += 7)
-+    for (unsigned i = 0; i < 40; i++)
-+      if (var(x, i) != ((x >> i) & 1u)) return 2;
-+  for (unsigned x = 0; x < 256; x++)
-+    if (constbit(x) != ((x >> 3) & 1u)) return 3;
-+  return 0;
-+}
-+DRIVER
-+  cc "$td/bt.o" "$td/driver.c" -o "$td/bt"
-+  "$td/bt"
-+fi
-+
-+if [ -x "./target/fastbuild/lccc-arm" ]; then
-+  ./target/fastbuild/lccc-arm -O3 -S "$td/bt.c" -o "$td/arm.s"
-+  grep -q 'ubfx' "$td/arm.s"
-+fi
-+if [ -x "./target/fastbuild/lccc-riscv" ]; then
-+  ./target/fastbuild/lccc-riscv -O3 -S "$td/bt.c" -o "$td/riscv.s"
-+  grep -Eq 'srlw|srli' "$td/riscv.s"
-+  grep -q 'andi' "$td/riscv.s"
-+fi
-+echo "OK bit_test_canonical"
+@@ -58,7 +58,7 @@ Build: `scripts/ensure_swap.sh` then `scripts/build_lccc_fast.sh` → `target/fa
+ | Expat name scan | **1.95×** | **classify + inline** | gcc `btq` |
+ | xmltok.c TU | **12×** stack-mem | **RA segments** | — |
+ | inflate.c TU | **15×** stack-mem | **RA segments + switch** | — |
+-| `struct_copy` | **21.06×** (585 vs 28 ms) | **ABI + XMM field copies** | gcc/icx: 2× ymm for 64 B `*dst=*src` |
++| `struct_copy` | **1.54×** (41 vs 26 ms; was 21.06×, then 3.11×) | aggregate copy-forward fixed (param-set staleness, GEP-hoist, window over-rejection); remainder = scalar movsd chains vs GCC's paired mulpd | gcc/icx: 2× ymm for 64 B `*dst=*src` |
+ | `dot` | vectorizer reduction exists | **ICX FMA YMM acc**; gcc16.2 worse | **copy ICX not GCC** |
+ | nbody / spectral / mandelbrot | **2.9–3.8× / 9.3× S** | **non-reduction vectorize** | ICX nbody 97 ymm / 58 FMA; gcc 0 ymm / 24 FMA |
+ | sqlite varint | **~2× S**; 189-inst inline **rejected** | **ISel branches**, not inline | — |
+-- 
+2.47.3
+
