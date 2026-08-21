@@ -1,440 +1,1838 @@
-From e8bcfcd53b7e08313fa15f22054af6cedfbf499e Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Fri, 21 Aug 2026 15:09:04 +0000
-Subject: [PATCH 1/2] aggregate copy-forward: real fixes for the 3 blockers
- that kept struct_copy at 3.1x; i686 pair load/store base-clobber miscompile
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-IS-02/struct_copy (P0, biggest measured S gap): 'build(tmp); memcpy(dst,
-tmp)' forwarding was blocked three separate ways on the canonical
-inlined-struct-return shape, so every make_particle still built 48
-bytes on the stack and copied them out:
-
-1. STALE PARAM EXCLUSION. forward_store_only_temporaries excluded 'the
-   first params.len() entry allocas' as forwarding sources. mem2reg
-   deletes promoted scalar param allocas, so the positional count
-   excluded the first two TEMPORARIES instead. Use the authoritative
-   func.param_alloca_values (kept in sync by lowering/mem2reg/
-   tail_call_elim); fall back to the positional rule only when empty
-   (inliner-built functions), fail closed.
-
-2. DEST DEFINED TOO LATE. The copy destination is usually the
-   'g->particles[i]' GEP emitted right before the memcpy — after the
-   temp's first store — and the def-before-first-use ordering check
-   rejected it. A const-offset GetElementPtr is pure address
-   arithmetic: hoist it above the first root use when its base
-   dominates that point (one hoist per run; the driver's fixed-point
-   loop handles chains).
-
-3. WINDOW OVER-REJECTION. The dest-liveness window (zlib-ng fold_1
-   guard) treated ANY instruction referencing a dest-rooted value as
-   touching dest's memory — including the hoisted GEP itself.
-   GEP/Copy/Phi only create aliases; actual accesses through them are
-   still caught by the paths lookup on the accessing instruction.
-   Everything else (Load/Store/Memcpy/Call/...) still fails closed.
-
-struct_copy -O2: 3.11x -> 1.54x vs GCC (83ms -> 41ms); all 4 aggregate
-memcpys in the corpus eliminated (was 0 of 4).
-
-i686 CORRECTNESS (exposed by the -m32 battery, PRE-EXISTING on main):
-the F64/I64 pair load through SlotAddr::Reg emitted
-'movl (%eax),%eax; movl 4(%eax),%edx' when RA homed the pointer in
-%eax (Phase 2e accumulator home) — the first load destroys the base,
-the second dereferences the loaded LOW WORD (nbody/struct_copy -m32
-SIGSEGV). Fixed by ordering the pair so the base register is written
-last (load sites, memory.rs 259/513) and by stashing an %eax/%edx base
-into the %ecx address scratch before the value pair is staged (store
-sites, which cannot reorder because the value occupies both halves).
-25-line reproducer: 5-body force loop, bodies[i].vx -= dx*bodies[j].mass.
-
-Validation: 991/991 unit, 50/50 correctness, 46/46 check scripts,
-regparm -O0..-Os, x86-64 differential fuzz 147/150 (3 pre-existing
-fails, seeds 4/9/100, identical on unmodified main), NEW m32
-differential fuzz 200/200, benchmark parity vs gcc -m32/-m64 (nbody,
-spectral_norm, binary_trees, struct_copy, hash_table, qsort).
----
- src/backend/i686/codegen/memory.rs   |  65 ++++++++++++++++-
- src/passes/aggregate_copy_forward.rs | 105 ++++++++++++++++++++++++---
- 2 files changed, 156 insertions(+), 14 deletions(-)
-
-diff --git a/src/backend/i686/codegen/memory.rs b/src/backend/i686/codegen/memory.rs
-index b311925..d44ba17 100644
---- a/src/backend/i686/codegen/memory.rs
-+++ b/src/backend/i686/codegen/memory.rs
-@@ -178,7 +178,20 @@ impl I686Codegen {
-             return;
-         }
-         if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 {
--            let addr = self.state.resolve_slot_addr(ptr.0);
-+            let mut addr = self.state.resolve_slot_addr(ptr.0);
-+            // Base homed in %eax/%edx dies when the VALUE pair is staged
-+            // into the accumulator below. Stash such a base into the %ecx
-+            // address scratch first and store through it (same hazard as
-+            // the pair-load ordering fix; store side cannot reorder because
-+            // both halves of the value occupy %eax:%edx).
-+            if let Some(SlotAddr::Reg(reg)) = addr {
-+                let r = phys_reg_name(reg);
-+                if r == "eax" || r == "edx" {
-+                    emit!(self.state, "    movl %{}, %ecx", r);
-+                    self.state.reg_cache.invalidate_sec();
-+                    addr = Some(SlotAddr::Reg(crate::backend::regalloc::PhysReg(4)));
-+                }
+diff --git a/engineering/evidence/godbolt/ra01_global_remat.c b/engineering/evidence/godbolt/ra01_global_remat.c
+new file mode 100644
+index 00000000..77374dca
+--- /dev/null
++++ b/engineering/evidence/godbolt/ra01_global_remat.c
+@@ -0,0 +1,40 @@
++/* RA-01 oracle: file-scope data addresses and loop-carried match state.
++ * Derived from the access shape of GNU gzip 1.14 longest_match, not its code. */
++typedef unsigned char u8;
++typedef unsigned short u16;
++
++u8 window[65536];
++u16 prev[32768];
++unsigned strstart;
++unsigned prev_length;
++unsigned max_chain_length;
++unsigned good_match;
++unsigned match_start;
++
++unsigned global_match_probe(unsigned cur_match)
++{
++    unsigned chain = max_chain_length;
++    u8 *scan = window + strstart;
++    unsigned best = prev_length;
++    unsigned limit = strstart > 32506 ? strstart - 32506 : 0;
++    u8 end0 = scan[best - 1];
++    u8 end1 = scan[best];
++
++    if (best >= good_match)
++        chain >>= 2;
++    do {
++        u8 *match = window + cur_match;
++        if (match[best] == end1 && match[best - 1] == end0
++            && match[0] == scan[0] && match[1] == scan[1]) {
++            unsigned len = 2;
++            while (len < 258 && match[len] == scan[len])
++                ++len;
++            if (len > best) {
++                match_start = cur_match;
++                best = len;
 +            }
-             self.emit_load_acc_pair(val);
-             if let Some(addr) = addr {
-                 match addr {
-@@ -256,7 +269,23 @@ impl I686Codegen {
-                         emit!(self.state, "    movl {}, %edx", sr4);
-                     }
-                     SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(slot,ptr.0); self.state.emit("    movl (%ecx), %eax"); self.state.emit("    movl 4(%ecx), %edx"); }
--                    SlotAddr::Reg(reg) => { let r=phys_reg_name(reg); emit!(self.state,"    movl (%{}), %eax",r); emit!(self.state,"    movl 4(%{}), %edx",r); }
-+                    SlotAddr::Reg(reg) => {
-+                        // The base may live in %eax (PhysReg 6, Phase 2e
-+                        // accumulator home) or %edx (PhysReg 5): loading the
-+                        // word that OVERWRITES the base register first
-+                        // destroys the address for the second load (nbody
-+                        // -m32 SIGSEGV: `movl (%eax),%eax; movl 4(%eax),%edx`
-+                        // dereferenced the low WORD as a pointer). Order the
-+                        // pair so the base register is written LAST.
-+                        let r = phys_reg_name(reg);
-+                        if r == "eax" {
-+                            emit!(self.state, "    movl 4(%{}), %edx", r);
-+                            emit!(self.state, "    movl (%{}), %eax", r);
-+                        } else {
-+                            emit!(self.state, "    movl (%{}), %eax", r);
-+                            emit!(self.state, "    movl 4(%{}), %edx", r);
-+                        }
-+                    }
-                 }
-                 self.emit_store_acc_pair(dest);
-             }
-@@ -321,8 +350,19 @@ impl I686Codegen {
-             }
-         }
-         if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 {
-+            let mut addr = self.state.resolve_slot_addr(base.0);
-+            // Same %eax/%edx-base hazard as the plain pair store: the value
-+            // staging below overwrites both accumulator halves, so stash
-+            // such a base into %ecx first.
-+            if let Some(SlotAddr::Reg(reg)) = addr {
-+                let r = phys_reg_name(reg);
-+                if r == "eax" || r == "edx" {
-+                    emit!(self.state, "    movl %{}, %ecx", r);
-+                    self.state.reg_cache.invalidate_sec();
-+                    addr = Some(SlotAddr::Reg(crate::backend::regalloc::PhysReg(4)));
-+                }
-+            }
-             self.emit_load_acc_pair(val);
--            let addr = self.state.resolve_slot_addr(base.0);
-             if let Some(addr) = addr {
-                 match addr {
-                     SlotAddr::OverAligned(slot, id) => {
-@@ -510,7 +550,24 @@ impl I686Codegen {
-                         emit!(self.state, "    movl {}, %edx", sr4);
-                     }
-                     SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(slot,base.0); if offset!=0 {self.emit_add_offset_to_addr_reg(offset);} self.state.emit("    movl (%ecx), %eax"); self.state.emit("    movl 4(%ecx), %edx"); }
--                    SlotAddr::Reg(reg) => { let r=phys_reg_name(reg); if offset!=0 {emit!(self.state,"    movl {}(%{}), %eax",offset,r);emit!(self.state,"    movl {}(%{}), %edx",offset+4,r);} else {emit!(self.state,"    movl (%{}), %eax",r);emit!(self.state,"    movl 4(%{}), %edx",r);} }
-+                    SlotAddr::Reg(reg) => {
-+                        // Same base-clobber hazard as the plain pair load
-+                        // above: write the base register (possibly %eax or
-+                        // %edx) last.
-+                        let r = phys_reg_name(reg);
-+                        let (m0, m4) = if offset != 0 {
-+                            (format!("{}(%{})", offset, r), format!("{}(%{})", offset + 4, r))
-+                        } else {
-+                            (format!("(%{})", r), format!("4(%{})", r))
-+                        };
-+                        if r == "eax" {
-+                            emit!(self.state, "    movl {}, %edx", m4);
-+                            emit!(self.state, "    movl {}, %eax", m0);
-+                        } else {
-+                            emit!(self.state, "    movl {}, %eax", m0);
-+                            emit!(self.state, "    movl {}, %edx", m4);
-+                        }
-+                    }
-                 }
-                 self.emit_store_acc_pair(dest);
-             }
-diff --git a/src/passes/aggregate_copy_forward.rs b/src/passes/aggregate_copy_forward.rs
-index 2be085b..8c0753f 100644
---- a/src/passes/aggregate_copy_forward.rs
-+++ b/src/passes/aggregate_copy_forward.rs
-@@ -262,14 +262,28 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
-     // and deletes the copy — the implicit prologue write is lost and the
-     // copy destination stays uninitialized (dump128(__m128 v): the
-     // `memcpy tmp, v_home` snapshot was deleted outright because v_home has
--    // ZERO IR stores; tmp then fed printf with stack garbage). Exclude the
--    // first params.len() entry allocas as forwarding sources, fail closed.
--    let param_slot_roots: FxHashSet<u32> = func.blocks.first()
--        .map(|b| b.instructions.iter()
--            .filter_map(|i| match i { Instruction::Alloca { dest, .. } => Some(dest.0), _ => None })
--            .take(func.params.len())
--            .collect())
--        .unwrap_or_default();
-+    // ZERO IR stores; tmp then fed printf with stack garbage).
-+    //
-+    // The exclusion set is `func.param_alloca_values` — the authoritative
-+    // list recorded at lowering (also consumed by stack_layout/analysis).
-+    // The old positional rule ("first params.len() entry allocas") went
-+    // stale the moment mem2reg promoted scalar param allocas away: in
-+    // `fill(ParticleGroup*, int)` both scalar param homes are deleted, so
-+    // the position count excluded the first two makeparticle TEMPORARIES
-+    // and half the struct-return copies stayed (struct_copy 3.1×). When
-+    // the recorded list is empty (tail_call_elim clears it; inliner-built
-+    // functions never had one) fall back to the positional rule, fail
-+    // closed.
-+    let param_slot_roots: FxHashSet<u32> = if !func.param_alloca_values.is_empty() {
-+        func.param_alloca_values.iter().map(|v| v.0).collect()
-+    } else {
-+        func.blocks.first()
-+            .map(|b| b.instructions.iter()
-+                .filter_map(|i| match i { Instruction::Alloca { dest, .. } => Some(dest.0), _ => None })
-+                .take(func.params.len())
-+                .collect())
-+            .unwrap_or_default()
-+    };
-     let mut copies: FxHashMap<u32, (usize, usize, Value)> = FxHashMap::default();
-     let mut copy_sizes: FxHashMap<u32, i64> = FxHashMap::default();
-     let mut duplicate = FxHashSet::default();
-@@ -319,6 +333,57 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
-             if hit { first_root_use.insert(*root, ii); break; }
-         }
-     }
-+    // HOIST: the copy destination is very often a pure-address GEP emitted
-+    // immediately before the memcpy (`g->particles[i]` in
-+    // `build(tmp); memcpy(&g->particles[i], tmp)`), i.e. AFTER the first
-+    // store into the temporary. That alone made the ordering check below
-+    // reject 3 of 4 struct-return copies per make_group (struct_copy 3.1×).
-+    // A GetElementPtr with a constant offset has no side effects and reads
-+    // only its base, so moving it earlier in the same block is sound
-+    // whenever the base is already defined there. Hoist it to just before
-+    // the first root use and let the ordering check pass. One hoist per
-+    // run() call keeps every recorded index valid (the driver runs this
-+    // pass to a fixed point, so all candidates get their turn).
-+    {
-+        let mut hoist: Option<(usize, usize, usize)> = None; // (block, gep_idx, insert_at)
-+        for (root, (copy_b, _copy_i, dest)) in &copies {
-+            let Some(&(db, di)) = def_site.get(&dest.0) else { continue };
-+            if db != *copy_b { continue; }
-+            let first_use = first_root_use.get(root).copied().unwrap_or(usize::MAX);
-+            if di < first_use { continue; } // already ordered
-+            let inst = &func.blocks[db].instructions[di];
-+            let Instruction::GetElementPtr { base, offset: Operand::Const(_), .. } = inst else {
-+                continue;
-+            };
-+            // Base must be defined before the insertion point: an earlier
-+            // instruction of this block, an entry-block value when this is
-+            // a later block, or a function parameter (no def site).
-+            let base_ok = match def_site.get(&base.0) {
-+                Some(&(bb, bi)) => (bb == db && bi < first_use) || (bb == 0 && db != 0),
-+                None => true,
-+            };
-+            if !base_ok { continue; }
-+            hoist = Some((db, di, first_use));
-+            break;
 +        }
-+        if let Some((bi, gep_idx, insert_at)) = hoist {
-+            if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
-+                eprintln!("[STOREFWD-HOIST] {} b{} gep@{} -> {}", func.name, bi, gep_idx, insert_at);
-+            }
-+            let block = &mut func.blocks[bi];
-+            let inst = block.instructions.remove(gep_idx);
-+            block.instructions.insert(insert_at, inst);
-+            if !block.source_spans.is_empty() {
-+                let span = block.source_spans.remove(gep_idx);
-+                block.source_spans.insert(insert_at, span);
-+            }
-+            // Indices recorded in `copies`/`def_site` for this block are
-+            // now stale; count the hoist as a change and let the caller's
-+            // fixed-point loop re-run the analysis on fresh indices.
-+            return 1;
-+        }
++        cur_match = prev[cur_match & 32767];
++    } while (cur_match > limit && --chain != 0);
++    return best;
++}
+diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
+index 2188a2d7..805557bf 100644
+--- a/src/backend/arm/codegen/emit.rs
++++ b/src/backend/arm/codegen/emit.rs
+@@ -249,7 +249,8 @@ impl ArmCodegen {
+     /// Apply all relevant options from a `CodegenOptions` struct.
+     pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
+         self.state.disable_regalloc = opts.disable_regalloc;
+-        self.set_pic(opts.pic);
++        self.set_pic(opts.pic || opts.pie);
++        self.state.pie_mode = opts.pie;
+         self.set_no_jump_tables(opts.no_jump_tables);
+         self.set_general_regs_only(opts.general_regs_only);
+         self.state.emit_cfi = opts.emit_cfi;
+diff --git a/src/backend/generation.rs b/src/backend/generation.rs
+index c9717166..78a1f736 100644
+--- a/src/backend/generation.rs
++++ b/src/backend/generation.rs
+@@ -1187,6 +1187,111 @@ fn build_foldable_global_addr_set(
+     live
+ }
+ 
++/// Root `GlobalAddr` values that can be omitted and reconstructed at each use.
++///
++/// This is deliberately narrower than the symbol identity map. A candidate's
++/// every use must be either an already-proven direct scalar Load/Store or one
++/// address derivation that the target hook can emit as `symbol + offset`.
++/// Passing an address as data, comparing it, storing it as a value, using a
++/// wide/segment memory operation, or placing it in a terminator rejects the
++/// root. The fail-closed scan is what makes removing its register/stack home
++/// safe: no generic operand path can encounter an unmaterialized value.
++pub fn build_rematerializable_global_addr_set_for(
++    func: &IrFunction,
++    global_addr_map: &FxHashMap<u32, String>,
++) -> FxHashSet<u32> {
++    if env_flag_set("CCC_NO_GLOBAL_ADDR_REMAT") {
++        return FxHashSet::default();
 +    }
 +
-     copies.retain(|root, (copy_b, _, dest)| {
-         match def_site.get(&dest.0) {
-             Some((db, di)) => {
-@@ -370,6 +435,9 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
-             }
-         }
-     }
-+    if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
-+        for r in &invalid { eprintln!("[STOREFWD-REJ] {} root=v{} invalid-use", func.name, r); }
++    let mut roots = FxHashSet::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Instruction::GlobalAddr { dest, .. } = inst {
++                if global_addr_map.contains_key(&dest.0) {
++                    roots.insert(dest.0);
++                }
++            }
++        }
 +    }
-     for root in invalid { copies.remove(&root); }
-     if copies.is_empty() { return 0; }
- 
-@@ -401,10 +469,24 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
-                 }
-                 if hit { first_use = ii; break; }
-             }
--            // dest's object must be untouched inside the window (the memcpy
--            // itself at copy_i is the legitimate final write).
-+            // dest's MEMORY must be untouched inside the window (the memcpy
-+            // itself at copy_i is the legitimate final write). Pure address
-+            // computations — GetElementPtr / Copy / Phi over pointers rooted
-+            // at dest — do not read or write that memory and must not
-+            // reject (the hoisted destination GEP itself sits inside the
-+            // window by construction). Everything else that references a
-+            // dest-rooted value is a read, a write, or an escape
-+            // (Load/Store/Memcpy/Call/Intrinsic/InlineAsm/Cast/...) and
-+            // fails closed.
-             for ii in first_use..copy_i {
-                 let inst = &func.blocks[copy_b].instructions[ii];
-+                if matches!(inst,
-+                    Instruction::GetElementPtr { .. }
-+                    | Instruction::Copy { .. }
-+                    | Instruction::Phi { .. })
-+                {
++    if roots.is_empty() {
++        return roots;
++    }
++
++    let op_is_root = |op: &Operand, id: u32| {
++        matches!(op, Operand::Value(v) if v.0 == id)
++    };
++    let op_uses_root = |op: &Operand, id: u32| op_is_root(op, id);
++
++    let candidates: Vec<u32> = roots.iter().copied().collect();
++    for id in candidates {
++        let mut valid = true;
++        for block in &func.blocks {
++            for inst in &block.instructions {
++                if !inst.used_values().contains(&id) {
 +                    continue;
 +                }
-                 let mut touches_dest = false;
-                 inst.for_each_used_value(|v| {
-                     if v == dest.0 || paths.get(&v).is_some_and(|p| p.0 == dest_root) {
-@@ -419,6 +501,9 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
-                 if touches_dest { reject.insert(root); break; }
++                let allowed = match inst {
++                    Instruction::Load {
++                        ptr, ty, seg_override, ..
++                    } => {
++                        ptr.0 == id
++                            && *seg_override == AddressSpace::Default
++                            && is_foldable_mem_ty(*ty)
++                    }
++                    Instruction::Store {
++                        val, ptr, ty, seg_override, ..
++                    } => {
++                        ptr.0 == id
++                            && !op_uses_root(val, id)
++                            && *seg_override == AddressSpace::Default
++                            && is_foldable_mem_ty(*ty)
++                    }
++                    Instruction::GetElementPtr { base, offset, .. } => {
++                        base.0 == id && !op_uses_root(offset, id)
++                    }
++                    Instruction::BinOp {
++                        op: IrBinOp::Add,
++                        lhs,
++                        rhs,
++                        ty,
++                        ..
++                    } => {
++                        !ty.is_float()
++                            && ty.size() == 8
++                            && (op_is_root(lhs, id) ^ op_is_root(rhs, id))
++                    }
++                    Instruction::BinOp {
++                        op: IrBinOp::Sub,
++                        lhs,
++                        rhs,
++                        ty,
++                        ..
++                    } => {
++                        !ty.is_float()
++                            && ty.size() == 8
++                            && op_is_root(lhs, id)
++                            && !op_is_root(rhs, id)
++                    }
++                    _ => false,
++                };
++                if !allowed {
++                    valid = false;
++                    break;
++                }
++            }
++            if !valid || block.terminator.used_values().contains(&id) {
++                valid = false;
++                break;
++            }
++        }
++        if !valid {
++            roots.remove(&id);
++        }
++    }
++    roots
++}
++
+ /// GlobalAddr ids that flow to a memory pointer (kernel code model: those
+ /// need RIP-relative addressing; integer-only uses want R_X86_64_32S).
+ fn build_global_addr_ptr_set(func: &IrFunction) -> FxHashSet<u32> {
+@@ -1984,6 +2089,9 @@ fn pre_size_output_buffer(cg: &mut dyn ArchCodegen, module: &IrModule) {
+ 
+ fn collect_symbol_sets(cg: &mut dyn ArchCodegen, module: &IrModule) {
+     let state = cg.state();
++    state
++        .extern_function_symbols
++        .extend(module.extern_function_symbols.iter().cloned());
+     for func in &module.functions {
+         if func.is_static
+             || matches!(
+@@ -2520,11 +2628,17 @@ fn generate_function(
+         FxHashSet::default()
+     };
+ 
+-    let dead_global_addrs = if cg.supports_global_addr_fold() {
++    let remat_global_addrs = if cg.supports_global_addr_remat() {
++        build_rematerializable_global_addr_set_for(func, &global_addr_map)
++    } else {
++        FxHashSet::default()
++    };
++    let mut dead_global_addrs = if cg.supports_global_addr_fold() {
+         build_foldable_global_addr_set(func, &global_addr_map)
+     } else {
+         FxHashSet::default()
+     };
++    dead_global_addrs.extend(remat_global_addrs.iter().copied());
+ 
+     // Indexed-fold guaranteed-offset-producer skipping (session 27): when an
+     // indexed GEP folds into a Load's SIB memory operand, the GEP's offset
+@@ -3019,6 +3133,7 @@ fn generate_function(
+                 &global_addr_map,
+                 &global_addr_ptr_set,
+                 &dead_global_addrs,
++                &remat_global_addrs,
+             );
+             cg.state().current_program_point += 1;
+         }
+@@ -3108,6 +3223,7 @@ pub(super) fn generate_instruction(
+     global_addr_map: &FxHashMap<u32, String>,
+     global_addr_ptr_set: &FxHashSet<u32>,
+     dead_global_addrs: &FxHashSet<u32>,
++    remat_global_addrs: &FxHashSet<u32>,
+ ) {
+     match inst {
+         Instruction::PgoCounterInc {
+@@ -3151,9 +3267,37 @@ pub(super) fn generate_instruction(
+             rhs,
+             ty,
+         } => {
+-            cg.emit_binop(dest, *op, lhs, rhs, *ty);
+-            if is_wide_int_type(*ty) {
+-                cg.state().reg_cache.invalidate_all();
++            // A rematerializable GlobalAddr has deliberately no home. Rebuild
++            // it only at this audited address derivation; every other use shape
++            // was rejected before allocation.
++            let remat = match (op, lhs, rhs) {
++                (IrBinOp::Add, Operand::Value(base), offset)
++                    if remat_global_addrs.contains(&base.0) =>
++                {
++                    global_addr_map.get(&base.0).map(|sym| (sym, offset, false))
++                }
++                (IrBinOp::Add, offset, Operand::Value(base))
++                    if remat_global_addrs.contains(&base.0) =>
++                {
++                    global_addr_map.get(&base.0).map(|sym| (sym, offset, false))
++                }
++                (IrBinOp::Sub, Operand::Value(base), offset)
++                    if remat_global_addrs.contains(&base.0) =>
++                {
++                    global_addr_map.get(&base.0).map(|sym| (sym, offset, true))
++                }
++                _ => None,
++            };
++            if let Some((sym, offset, subtract)) = remat {
++                assert!(
++                    cg.emit_rematerialized_global_addr(dest, sym, offset, subtract),
++                    "backend accepted GlobalAddr rematerialisation but refused its audited use"
++                );
++            } else {
++                cg.emit_binop(dest, *op, lhs, rhs, *ty);
++                if is_wide_int_type(*ty) {
++                    cg.state().reg_cache.invalidate_all();
++                }
              }
          }
-+        if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
-+            for r in &reject { eprintln!("[STOREFWD-REJ] {} root=v{} dest-window", func.name, r); }
-+        }
-         for root in reject { copies.remove(&root); }
+         Instruction::UnaryOp { dest, op, src, ty } => {
+@@ -3185,12 +3329,22 @@ pub(super) fn generate_instruction(
+         Instruction::GetElementPtr {
+             dest, base, offset, ..
+         } => {
+-            if let Operand::Value(off_val) = offset {
+-                cg.state()
+-                    .gep_base_offset
+-                    .insert(dest.0, (base.0, off_val.0));
++            if remat_global_addrs.contains(&base.0) {
++                let sym = global_addr_map.get(&base.0).expect(
++                    "rematerializable GlobalAddr must retain its legal symbol identity",
++                );
++                assert!(
++                    cg.emit_rematerialized_global_addr(dest, sym, offset, false),
++                    "backend accepted GlobalAddr rematerialisation but refused its audited GEP"
++                );
++            } else {
++                if let Operand::Value(off_val) = offset {
++                    cg.state()
++                        .gep_base_offset
++                        .insert(dest.0, (base.0, off_val.0));
++                }
++                cg.emit_gep(dest, base, offset);
+             }
+-            cg.emit_gep(dest, base, offset);
+         }
+         Instruction::GlobalAddr { dest, name } => {
+             // Defence in depth: the block loop already skipped dead addrs.
+diff --git a/src/backend/i686/codegen/emit.rs b/src/backend/i686/codegen/emit.rs
+index d8514b77..d5513361 100644
+--- a/src/backend/i686/codegen/emit.rs
++++ b/src/backend/i686/codegen/emit.rs
+@@ -178,7 +178,8 @@ impl I686Codegen {
+     /// Apply all relevant options from a `CodegenOptions` struct.
+     pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
+         self.state.disable_regalloc = opts.disable_regalloc;
+-        self.set_pic(opts.pic);
++        self.set_pic(opts.pic || opts.pie);
++        self.state.pie_mode = opts.pie;
+         self.set_no_jump_tables(opts.no_jump_tables);
+         self.regparm = opts.regparm;
+         self.omit_frame_pointer = opts.omit_frame_pointer;
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index 1836d380..f97d698c 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -4344,6 +4344,40 @@ pub fn peephole_optimize(asm: String) -> String {
+ 
+ // ── Pass: redundant zero-extension elimination (i686 redundant_ext port) ────
+ 
++/// Whether a generic instruction defeats every tracked narrow-value fact.
++///
++/// `parse_dest_reg` is deliberately a comma-form parser. Some real writers
++/// therefore have no parsed destination (single-operand shifts/bswap and
++/// unknown inline-assembly instructions), while atomics such as cmpxchg/xadd
++/// write registers in addition to the last textual operand. Narrow-value
++/// elimination must fail closed for both classes: a stale fact can delete a
++/// required extension and silently change the value.
++fn invalidates_all_narrow_facts(text: &str, parsed_dest: RegId) -> bool {
++    parsed_dest == REG_NONE
++        || text.starts_with("mul")
++        || text.starts_with("imul")
++        || text.starts_with("div")
++        || text.starts_with("idiv")
++        || text == "cltd"
++        || text == "cdq"
++        || text.starts_with("xchg")
++        || text.starts_with("xadd")
++        || text.starts_with("cmpxchg")
++        || text.starts_with("lock xadd")
++        || text.starts_with("lock cmpxchg")
++        || text.starts_with("rep")
++        || text.starts_with("lods")
++        || text.starts_with("stos")
++        || text.starts_with("movs")
++        || text.starts_with("cmps")
++        || text.starts_with("scas")
++}
++
++#[inline]
++fn is_low_byte_register(name: &str) -> bool {
++    matches!(name, "%al" | "%bl" | "%cl" | "%dl")
++}
++
+ /// Track which GP register families provably hold byte values (bits 8..31
+ /// zero) or 16-bit values (bits 16..31 zero), and remove/rewrite redundant
+ /// re-extensions:
+@@ -4380,7 +4414,11 @@ fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo])
+                 let src = src.trim();
+                 let dst = dst.trim();
+                 let df = register_family(dst);
+-                if df <= REG_GP_MAX && !src.contains('(') && src.starts_with('%') {
++                // A full-register byte fact applies to its low byte only.
++                // If EAX < 256 then AH is zero, so deleting
++                // `movzbl %ah,%eax` would leave AL instead of producing 0;
++                // a cross-family movl rewrite is wrong for the same reason.
++                if df <= REG_GP_MAX && is_low_byte_register(src) {
+                     let sf = register_family(src);
+                     if sf <= REG_GP_MAX && is_byte[sf as usize] {
+                         if sf == df {
+@@ -4459,28 +4497,19 @@ fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo])
+             }
+             _ => {
+                 let d = parse_dest_reg(&t);
+-                if d <= REG_GP_MAX {
+-                    if t.starts_with("andl $") {
+-                        // andl $imm: result <= imm, so byte/16 flags follow
+-                        // the immediate's range regardless of prior state.
+-                        let imm = t["andl $".len()..]
+-                            .split(',').next()
+-                            .and_then(|v| v.trim().parse::<i64>().ok());
+-                        is_byte[d as usize] = matches!(imm, Some(v) if (0..=255).contains(&v));
+-                        is_16[d as usize] = matches!(imm, Some(v) if (0..=65535).contains(&v));
+-                    } else {
+-                        is_byte[d as usize] = false;
+-                        is_16[d as usize] = false;
+-                    }
++                if d <= REG_GP_MAX && t.starts_with("andl $") {
++                    // andl $imm: result <= imm, so byte/16 flags follow
++                    // the immediate's range regardless of prior state.
++                    let imm = t["andl $".len()..]
++                        .split(',').next()
++                        .and_then(|v| v.trim().parse::<i64>().ok());
++                    is_byte[d as usize] = matches!(imm, Some(v) if (0..=255).contains(&v));
++                    is_16[d as usize] = matches!(imm, Some(v) if (0..=65535).contains(&v));
++                } else if d <= REG_GP_MAX {
++                    is_byte[d as usize] = false;
++                    is_16[d as usize] = false;
+                 }
+-                // Implicit multi-register writers: fail closed on all flags.
+-                if t.starts_with("mul") || t.starts_with("imul")
+-                    || t.starts_with("div") || t.starts_with("idiv")
+-                    || t == "cltd" || t == "cdq" || t.starts_with("xchg")
+-                    || t.starts_with("rep") || t.starts_with("lods")
+-                    || t.starts_with("stos") || t.starts_with("movs")
+-                    || t.starts_with("cmps") || t.starts_with("scas")
+-                {
++                if invalidates_all_narrow_facts(&t, d) {
+                     is_byte = [false; 8];
+                     is_16 = [false; 8];
+                 }
+@@ -4528,7 +4557,10 @@ fn eliminate_redundant_sign_ext_i686(store: &mut LineStore, infos: &mut [LineInf
+                 let dst = dst.trim();
+                 let df = register_family(dst);
+                 if df <= REG_GP_MAX {
+-                    if !src.contains('(') && src.starts_with('%') {
++                    // A sign-extension fact describes the full register's
++                    // low byte. High-byte aliases are different values and
++                    // must never be replaced by a full-register copy.
++                    if is_low_byte_register(src) {
+                         let sf = register_family(src);
+                         if sf <= REG_GP_MAX && sign_ext[sf as usize] {
+                             if sf == df {
+@@ -4567,7 +4599,7 @@ fn eliminate_redundant_sign_ext_i686(store: &mut LineStore, infos: &mut [LineInf
+                 let dst = dst.trim();
+                 let df = register_family(dst);
+                 if df <= REG_GP_MAX {
+-                    let src_bool = !src.contains('(') && src.starts_with('%') && {
++                    let src_bool = is_low_byte_register(src) && {
+                         let sf = register_family(src);
+                         sf <= REG_GP_MAX && is_bool[sf as usize]
+                     };
+@@ -4624,14 +4656,7 @@ fn eliminate_redundant_sign_ext_i686(store: &mut LineStore, infos: &mut [LineInf
+                         is_bool[d as usize] = false;
+                     }
+                 }
+-                // Implicit multi-register writers: fail closed on all flags.
+-                if t.starts_with("mul") || t.starts_with("imul")
+-                    || t.starts_with("div") || t.starts_with("idiv")
+-                    || t == "cltd" || t == "cdq" || t.starts_with("xchg")
+-                    || t.starts_with("rep") || t.starts_with("lods")
+-                    || t.starts_with("stos") || t.starts_with("movs")
+-                    || t.starts_with("cmps") || t.starts_with("scas")
+-                {
++                if invalidates_all_narrow_facts(&t, d) {
+                     sign_ext = [false; 8];
+                     is_bool = [false; 8];
+                 }
+@@ -5524,6 +5549,42 @@ mod tests {
+         assert!(result.contains("movsbl %al"), "{result}");
      }
-     if copies.is_empty() { return 0; }
--- 
-2.47.3
-
-
-From 9952263e167076656b528771355a053e52c38942 Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Fri, 21 Aug 2026 15:25:20 +0000
-Subject: [PATCH 2/2] docs: session-7 log + scoreboard update (struct_copy
- 1.54x)
-
----
- .../2026-08-21-session7-aggfwd-pairload.md    | 97 +++++++++++++++++++
- engineering/agent/BACKLOG.md                  |  2 +-
- 2 files changed, 98 insertions(+), 1 deletion(-)
- create mode 100644 docs/history/2026-08-21-session7-aggfwd-pairload.md
-
-diff --git a/docs/history/2026-08-21-session7-aggfwd-pairload.md b/docs/history/2026-08-21-session7-aggfwd-pairload.md
+ 
++    #[test]
++    fn sign_ext_high_byte_is_not_a_full_register_copy() {
++        for dst in ["%eax", "%ecx"] {
++            let asm = format!(
++                "f:\n.cfi_startproc\n    movsbl (%esi), %eax\n    movsbl %ah, {dst}\n    ret\n.cfi_endproc\n"
++            );
++            let result = peephole_optimize(asm);
++            assert!(
++                result.contains(&format!("movsbl %ah, {dst}")),
++                "high-byte sign extension must remain:\n{result}"
++            );
++        }
++    }
++
++    #[test]
++    fn high_byte_zero_extend_does_not_inherit_low_byte_bool_fact() {
++        // setcc proves AL is 0/1, but says nothing about AH. With AH=0x80,
++        // movzbl %ah produces 128 and the following movsbl must produce -128.
++        let asm = concat!(
++            "f:\n",
++            ".cfi_startproc\n",
++            "    movl $32768, %eax\n",
++            "    cmpl $0, %edx\n",
++            "    setne %al\n",
++            "    movzbl %ah, %ecx\n",
++            "    movsbl %cl, %ecx\n",
++            "    movl %ecx, %eax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        )
++        .to_string();
++        let result = peephole_optimize(asm);
++        assert!(result.contains("movzbl %ah, %ecx"), "{result}");
++        assert!(result.contains("movsbl %cl, %ecx"), "{result}");
++    }
++
+     #[test]
+     fn sign_ext_cross_register_becomes_movl_copy() {
+         let asm = concat!(
+@@ -5767,6 +5828,41 @@ mod tests {
+             "andl imm8 preserves byte-ness:\n{}", result);
+     }
+ 
++    #[test]
++    fn zext_high_byte_is_not_a_full_register_copy() {
++        // EAX < 256 proves AH == 0, not that zero-extending AH is a no-op or
++        // equivalent to copying the full EAX value.
++        for (src, dst) in [("%ah", "%eax"), ("%ah", "%edx")] {
++            let asm = format!(
++                "f:\n    movzbl (%ecx), %eax\n    movzbl {src}, {dst}\n    ret\n"
++            );
++            let result = peephole_optimize(asm);
++            assert!(
++                result.contains(&format!("movzbl {src}, {dst}")),
++                "high-byte extension must remain:\n{result}"
++            );
++        }
++    }
++
++    #[test]
++    fn narrow_facts_die_at_unparsed_and_atomic_writers() {
++        for writer in [
++            "bswapl %eax",
++            "lock cmpxchgl %edx, (%ecx)",
++            "lock xaddl %eax, (%ecx)",
++        ] {
++            let asm = format!(
++                "f:\n    movzbl (%ecx), %eax\n    {writer}\n    movzbl %al, %eax\n    ret\n"
++            );
++            let result = peephole_optimize(asm);
++            assert_eq!(
++                result.matches("movzbl").count(),
++                2,
++                "{writer} must invalidate byte-ness:\n{result}"
++            );
++        }
++    }
++
+     #[test]
+     fn test_tail_call_direct_i686() {
+         // The %ebx copy is dead (never read), so the liveness pass deletes
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index 90fe362a..f67c6873 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -39,8 +39,13 @@ pub(crate) struct CodegenOptions {
+     /// Disable register allocation for non-SSA `-O0` IR. Phi elimination can
+     /// create multi-def values that the production scan must not coalesce.
+     pub(crate) disable_regalloc: bool,
+-    /// Whether to generate position-independent code (-fPIC/-fpic)
++    /// Whether to generate fully interposable position-independent code
++    /// (`-fPIC`/`-fpic`, or a shared object).
+     pub(crate) pic: bool,
++    /// Whether to generate position-independent executable code (`-fPIE`/
++    /// `-fpie`). Unlike full PIC, ordinary data definitions in the executable
++    /// are non-preemptible and may use direct RIP-relative references.
++    pub(crate) pie: bool,
+     /// Whether to replace `ret` with `jmp __x86_return_thunk` (-mfunction-return=thunk-extern)
+     pub(crate) function_return_thunk: bool,
+     /// Whether to replace indirect calls/jumps with retpoline thunks (-mindirect-branch=thunk-extern)
+diff --git a/src/backend/riscv/codegen/emit.rs b/src/backend/riscv/codegen/emit.rs
+index 83653a6e..8553983e 100644
+--- a/src/backend/riscv/codegen/emit.rs
++++ b/src/backend/riscv/codegen/emit.rs
+@@ -150,7 +150,8 @@ impl RiscvCodegen {
+     /// Apply all relevant options from a `CodegenOptions` struct.
+     pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
+         self.state.disable_regalloc = opts.disable_regalloc;
+-        self.set_pic(opts.pic);
++        self.set_pic(opts.pic || opts.pie);
++        self.state.pie_mode = opts.pie;
+         self.set_no_jump_tables(opts.no_jump_tables);
+         self.set_no_relax(opts.no_relax);
+         self.state.emit_cfi = opts.emit_cfi;
+diff --git a/src/backend/state.rs b/src/backend/state.rs
+index d1e9f765..b5c833de 100644
+--- a/src/backend/state.rs
++++ b/src/backend/state.rs
+@@ -208,11 +208,19 @@ pub struct CodegenState {
+     pub vec_live_regs: FxHashMap<u32, &'static str>,
+     /// Counter for generating unique labels (e.g., memcpy loops).
+     label_counter: u32,
+-    /// Whether position-independent code (PIC) generation is enabled.
++    /// Whether any position-independent code generation is enabled. Backends
++    /// that do not distinguish PIE from full PIC retain this conservative bit.
+     pub pic_mode: bool,
++    /// Position-independent executable mode. x86-64 may address ordinary
++    /// executable data directly; full PIC and weak extern data still use GOT.
++    pub pie_mode: bool,
+     /// Set of symbol names that are locally defined (not extern) and have internal
+     /// linkage (static) — these can use direct addressing even in PIC mode.
+     pub local_symbols: FxHashSet<String>,
++    /// Extern function linker names. Their addresses cannot use ELF data copy
++    /// relocations, so default-visibility function pointers remain GOT-based
++    /// in PIE even though ordinary extern data addresses may be direct.
++    pub extern_function_symbols: FxHashSet<String>,
+     /// Compare-replay records: Cmp instructions whose boolean result is
+     /// consumed by exactly one Select or CondBranch that is NOT adjacent to
+     /// the Cmp (so pending-flag fusion cannot fire — an intervening ALU op
+@@ -429,7 +437,9 @@ impl CodegenState {
+             vec_live_regs: FxHashMap::default(),
+             label_counter: 0,
+             pic_mode: false,
++            pie_mode: false,
+             local_symbols: FxHashSet::default(),
++            extern_function_symbols: FxHashSet::default(),
+             cmp_replay: FxHashMap::default(),
+             absolute_symbols: FxHashSet::default(),
+             tls_symbols: FxHashSet::default(),
+@@ -749,26 +759,33 @@ impl CodegenState {
+         !self.local_symbols.contains(name)
+     }
+ 
+-    /// Returns true if taking the address of a symbol requires GOT indirection.
+-    /// Unlike needs_got(), this returns true for external symbols even in non-PIC
+-    /// mode (x86-64 only). Modern toolchains default to PIE, so object files must
+-    /// use GOTPCREL for external symbol addresses to be compatible with PIE linking
+-    /// by the system linker. Locally-defined symbols can still use direct leaq.
++    /// Returns true if taking the address of a symbol requires GOT indirection
++    /// on x86-64.
++    ///
++    /// Full PIC keeps default-visibility data interposable and therefore uses
++    /// GOTPCREL. PIE is different: definitions in the main executable are not
++    /// preemptible, and ordinary extern data can use direct RIP-relative access
++    /// plus a copy relocation. Weak externs still need a GOT slot because their
++    /// address may resolve to zero. This is the GCC/Clang/ICX executable model;
++    /// conflating PIE with PIC added an address load and a long-lived temporary
++    /// to every gzip global access.
+     pub fn needs_got_for_addr(&self, name: &str) -> bool {
+-        if self.code_model_kernel {
++        if self.code_model_kernel || name.starts_with('.') {
+             return false;
+         }
+-        if name.starts_with('.') {
++        if self.local_symbols.contains(name) {
+             return false;
+         }
+-        // Non-PIC executables use direct sym(%rip) + copy reloc (LCCC's own
+-        // linker emits R_X86_64_COPY, like GCC's -fPIE); GOT is required only
+-        // in -fPIC/-shared where copy relocs are illegal. Saves one load per
+-        // global access and enables GlobalAddr+Load folding.
+-        if !self.pic_mode {
+-            return false;
++        if self.pie_mode {
++            // RA-01 kill switch restores the old fully-GOT default so workload
++            // A/B runs isolate direct-global rematerialisation exactly.
++            if std::env::var_os("CCC_NO_GLOBAL_ADDR_REMAT").is_some() {
++                return true;
++            }
++            return self.weak_extern_symbols.contains(name)
++                || self.extern_function_symbols.contains(name);
+         }
+-        !self.local_symbols.contains(name)
++        self.pic_mode
+     }
+ 
+     /// Returns true if a function call needs PLT indirection in PIC mode.
+diff --git a/src/backend/traits.rs b/src/backend/traits.rs
+index 02937a9a..88b8a9dd 100644
+--- a/src/backend/traits.rs
++++ b/src/backend/traits.rs
+@@ -300,6 +300,26 @@ pub trait ArchCodegen {
+         false
+     }
+ 
++    /// Whether the backend can reconstruct an omitted GlobalAddr at audited
++    /// Add/Sub/GEP uses. x86-64 opts in; all other targets default off.
++    fn supports_global_addr_remat(&self) -> bool {
++        false
++    }
++
++    /// Emit `dest = symbol (+|-) offset` for a safely omitted GlobalAddr root.
++    /// The generic generator calls this only for roots whose every use passed
++    /// the fail-closed rematerialisation audit. Returns false by default so
++    /// non-x86 backends retain a materialized address home.
++    fn emit_rematerialized_global_addr(
++        &mut self,
++        _dest: &Value,
++        _sym: &str,
++        _offset: &Operand,
++        _subtract: bool,
++    ) -> bool {
++        false
++    }
++
+     /// Flush per-function vector constants used by vpbroadcast* .LvcN(%rip)
+     /// splats to .rodata. No-op by default; x86 emits the actual entries.
+     fn emit_vector_const_rodata(&mut self) {}
+diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
+index 630343aa..8d1ce015 100644
+--- a/src/backend/x86/codegen/alu.rs
++++ b/src/backend/x86/codegen/alu.rs
+@@ -216,10 +216,20 @@ impl X86Codegen {
+                             self.state.emit_fmt(format_args!("    movq %{src64}, %{dest64}"));
+                         }
+                     }
+-                } else if use_32bit {
+-                    self.value_to_reg(v, dest64);
+                 } else {
+-                    self.value_to_reg(v, dest64);
++                    // An adjacent producer may deliberately live only in the
++                    // allocator-owned accumulator location. `value_to_reg`
++                    // bypasses that cache and hard-fails for such a value;
++                    // consume through the normal operand path first, then copy
++                    // into BT's chosen result register. The canonical
++                    // `(x & y) >> bit & 1` handoff exercises this at -O1+.
++                    self.operand_to_rax(base);
++                    if use_32bit {
++                        let dest32 = super::emit::phys_reg_name_32(dest_phys);
++                        self.state.emit_fmt(format_args!("    movl %eax, %{dest32}"));
++                    } else {
++                        self.state.emit_fmt(format_args!("    movq %rax, %{dest64}"));
++                    }
+                 }
+             }
+             Operand::Const(_) => self.operand_to_reg(base, dest64),
+@@ -239,10 +249,10 @@ impl X86Codegen {
+             self.state.emit_fmt(format_args!("    {bt} %rcx, %{dest64}"));
+         }
+         self.state.emit_fmt(format_args!("    setc %{dest8}"));
+-        if use_32bit {
+-            let dest32 = super::emit::phys_reg_name_32(dest_phys);
+-            self.state.emit_fmt(format_args!("    movzbl %{dest8}, %{dest32}"));
+-        }
++        // SETcc writes one byte only. Always clear the rest of the destination;
++        // a 32-bit MOVZX also zeroes the upper half for an I64/U64 boolean.
++        let dest32 = super::emit::phys_reg_name_32(dest_phys);
++        self.state.emit_fmt(format_args!("    movzbl %{dest8}, %{dest32}"));
+         true
+     }
+ 
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 9b87cc6a..6c04ca97 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -705,7 +705,8 @@ impl X86Codegen {
+     /// Apply all relevant options from a `CodegenOptions` struct.
+     pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
+         self.state.disable_regalloc = opts.disable_regalloc;
+-        self.set_pic(opts.pic);
++        self.set_pic(opts.pic || opts.pie);
++        self.state.pie_mode = opts.pie;
+         self.set_function_return_thunk(opts.function_return_thunk);
+         self.set_indirect_branch_thunk(opts.indirect_branch_thunk);
+         self.set_indirect_branch_thunk_inline(opts.indirect_branch_thunk_inline);
+@@ -3686,6 +3687,7 @@ impl ArchCodegen for X86Codegen {
+                     &crate::common::fx_hash::FxHashMap::default(),
+                     &crate::common::fx_hash::FxHashSet::default(),
+                     &crate::common::fx_hash::FxHashSet::default(),
++                    &crate::common::fx_hash::FxHashSet::default(),
+                 );
+                 self.state.current_program_point += 1;
+             }
+@@ -3890,6 +3892,20 @@ impl ArchCodegen for X86Codegen {
+         true
+     }
+ 
++    fn supports_global_addr_remat(&self) -> bool {
++        true
++    }
++
++    fn emit_rematerialized_global_addr(
++        &mut self,
++        dest: &Value,
++        sym: &str,
++        offset: &Operand,
++        subtract: bool,
++    ) -> bool {
++        self.emit_rematerialized_global_addr_impl(dest, sym, offset, subtract)
++    }
++
+     /// Session 28: x86-64 SIB indexed addressing (mirrors session-27 i686):
+     /// `off(%base,%idx,scale)` / `sym(,%idx,scale)` fold variable-offset GEPs
+     /// into one memory operand.  The prologue wires base AND index liveness
+@@ -3899,7 +3915,11 @@ impl ArchCodegen for X86Codegen {
+     }
+ 
+     fn supports_indexed_sym_base(&self) -> bool {
+-        std::env::var_os("CCC_NO_X64_SIB").is_none() && !self.state.pic_mode
++        // In PIE/PIC x86 cannot combine RIP-relative addressing and an index
++        // in one memory operand. The symbol hook still supports every legal
++        // direct symbol by rebuilding its base in the reserved address scratch
++        // and retaining the scale in the consuming SIB operand.
++        std::env::var_os("CCC_NO_X64_SIB").is_none()
+     }
+ 
+     fn const_offset_fold_reg_base_ok(&self, base: &Value) -> bool {
+diff --git a/src/backend/x86/codegen/globals.rs b/src/backend/x86/codegen/globals.rs
+index a4a1b835..22a6074f 100644
+--- a/src/backend/x86/codegen/globals.rs
++++ b/src/backend/x86/codegen/globals.rs
+@@ -38,6 +38,90 @@ impl X86Codegen {
+         self.store_rax_to(dest);
+     }
+ 
++    /// Recreate an omitted executable-data address at its audited derivation
++    /// use. Offsets are staged first so loading the symbol base into %rax cannot
++    /// destroy an immediately-consumed value. The result then follows the
++    /// ordinary destination-location contract.
++    pub(super) fn emit_rematerialized_global_addr_impl(
++        &mut self,
++        dest: &Value,
++        name: &str,
++        offset: &Operand,
++        subtract: bool,
++    ) -> bool {
++        if self.state.needs_got_for_addr(name)
++            || self.state.tls_symbols.contains(name)
++            || self.state.absolute_symbols.contains(name)
++        {
++            return false;
++        }
++
++        // Constant displacements belong in the LEA itself. This is both
++        // shorter and avoids creating a temporary live range for the offset.
++        if let Operand::Const(c) = offset {
++            if let Some(raw) = c.to_i64() {
++                let disp = if subtract { raw.checked_neg() } else { Some(raw) };
++                if let Some(disp) = disp.filter(|v| (i32::MIN as i64..=i32::MAX as i64).contains(v)) {
++                    let target = self.dest_reg(dest)
++                        .filter(|r| !is_xmm_reg(*r))
++                        .map(phys_reg_name)
++                        .unwrap_or("rax");
++                    let sym = if disp == 0 {
++                        name.to_string()
++                    } else if disp > 0 {
++                        format!("{name}+{disp}")
++                    } else {
++                        format!("{name}{disp}")
++                    };
++                    self.state.out.emit_instr_sym_base_reg(
++                        "    leaq", &sym, "rip", target,
++                    );
++                    if target == "rax" {
++                        self.store_rax_to(dest);
++                    } else {
++                        self.state.reg_cache.invalidate_acc();
++                    }
++                    return true;
++                }
++            }
++        }
++
++        // The common case has both the offset and result in allocated GPRs.
++        // Materialize the base straight into the result and consume the offset
++        // there, unless the two homes alias (which would destroy the offset).
++        if let (Some(off_reg), Some(dst_reg)) = (self.operand_reg(offset), self.dest_reg(dest)) {
++            if !is_xmm_reg(off_reg) && !is_xmm_reg(dst_reg) && off_reg != dst_reg {
++                let off_name = phys_reg_name(off_reg);
++                let dst_name = phys_reg_name(dst_reg);
++                self.state.out.emit_instr_sym_base_reg(
++                    "    leaq", name, "rip", dst_name,
++                );
++                self.state.emit_fmt(format_args!(
++                    "    {}q %{}, %{}",
++                    if subtract { "sub" } else { "add" },
++                    off_name,
++                    dst_name,
++                ));
++                self.state.reg_cache.invalidate_acc();
++                return true;
++            }
++        }
++
++        // Alias/slot/immediately-consumed fallback: preserve the offset in the
++        // secondary scratch before %rax receives the symbol base.
++        self.operand_to_rcx(offset);
++        self.state
++            .out
++            .emit_instr_sym_base_reg("    leaq", name, "rip", "rax");
++        self.state.emit(if subtract {
++            "    subq %rcx, %rax"
++        } else {
++            "    addq %rcx, %rax"
++        });
++        self.store_rax_to(dest);
++        true
++    }
++
+     pub(super) fn emit_tls_global_addr_impl(&mut self, dest: &Value, name: &str) {
+         // TLS requires %rax for the fs:0 base — can't fully avoid accumulator.
+         // But when dest has a register, we can skip the final store_rax_to relay.
+diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
+index c5406442..800446b3 100644
+--- a/src/backend/x86/codegen/memory.rs
++++ b/src/backend/x86/codegen/memory.rs
+@@ -1556,7 +1556,7 @@ impl X86Codegen {
+         shift: u8,
+         ty: IrType,
+     ) -> bool {
+-        if self.state.pic_mode {
++        if self.state.needs_got_for_addr(sym) {
+             return false;
+         }
+         let Some(&x) = self.reg_assignments.get(&index.0) else {
+@@ -1565,7 +1565,19 @@ impl X86Codegen {
+         if is_xmm_reg(x) {
+             return false;
+         }
+-        let mem = Self::sib_mem64_sym(sym, phys_reg_name(x), shift);
++        let index_name = phys_reg_name(x);
++        let mem = if self.state.pic_mode {
++            // x86 has no RIP-relative SIB form. Rebuild the legal direct
++            // executable/local symbol in reserved %rcx, then consume the
++            // scaled index in one memory operand. This avoids separately
++            // materializing the shift, add, and derived pointer.
++            self.state
++                .out
++                .emit_instr_sym_base_reg("    leaq", sym, "rip", "rcx");
++            Self::sib_mem64("rcx", index_name, shift)
++        } else {
++            Self::sib_mem64_sym(sym, index_name, shift)
++        };
+         self.emit_load_indexed_common(dest, index, shift, ty, mem)
+     }
+ 
+@@ -1577,7 +1589,7 @@ impl X86Codegen {
+         shift: u8,
+         ty: IrType,
+     ) -> bool {
+-        if self.state.pic_mode {
++        if self.state.needs_got_for_addr(sym) {
+             return false;
+         }
+         let Some(&x) = self.reg_assignments.get(&index.0) else {
+@@ -1586,7 +1598,15 @@ impl X86Codegen {
+         if is_xmm_reg(x) {
+             return false;
+         }
+-        let mem = Self::sib_mem64_sym(sym, phys_reg_name(x), shift);
++        let index_name = phys_reg_name(x);
++        let mem = if self.state.pic_mode {
++            self.state
++                .out
++                .emit_instr_sym_base_reg("    leaq", sym, "rip", "rcx");
++            Self::sib_mem64("rcx", index_name, shift)
++        } else {
++            Self::sib_mem64_sym(sym, index_name, shift)
++        };
+         self.emit_store_indexed_common(val, index, shift, ty, mem)
+     }
+ 
+diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
+index 4d19cc78..26c7ff8b 100644
+--- a/src/backend/x86/codegen/peephole/passes/mod.rs
++++ b/src/backend/x86/codegen/peephole/passes/mod.rs
+@@ -256,7 +256,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
+     // (flag-neutral window). Runs before the peephole gate.
+     let _ = pushf_elim::eliminate_redundant_pushfq(&mut asm);
+     // Always-on, provably-safe pass: eliminate redundant zero-extensions
+-    // (movzbl %al,%eax where upper bits are already zero). Runs before gate.
++    // only when the tracked value already fits the source width. Runs before gate.
+     let _ = redundant_ext::eliminate_redundant_zero_extend(&mut asm);
+     // the peephole optimizer is now ENABLED BY DEFAULT with a curated,
+     // gzip-validated safe subset. The two passes that were proven to miscompile
+diff --git a/src/backend/x86/codegen/peephole/passes/redundant_ext.rs b/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
+index 56edb593..ee8ebf84 100644
+--- a/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
++++ b/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
+@@ -7,19 +7,13 @@
+ //! another zero-extended register). Such a re-extension is a no-op and can be
+ //! removed, saving an instruction in hot loops.
+ //!
+-//! Soundness: we track, for each 64-bit register family, a flag "the upper 32
+-//! bits are provably zero." This flag is:
+-//!   - SET by any instruction that writes the full 32-bit register and
+-//!     zero-extends (movzbl/movzwl/movl-from-anywhere/xorl-self/setcc, ...).
+-//!   - COPIED by `movq %reg, %reg` (a 64-bit move preserves the upper-32-zero
+-//!     property of the destination).
+-//!   - CLEARED by anything that writes the 64-bit register or the upper bits
+-//!     (movq from a possibly-nonzero source, arithmetic on the 64-bit reg, etc.)
+-//!
+-//! Then `movzbl %AL, %EAX` (source byte is the low byte of a dest reg known
+-//! upper-32-zero) is a no-op and removed. We only apply this when source and
+-//! destination are sub-registers of the SAME family, and the family's
+-//! upper-32-zero flag is set, guaranteeing the move cannot change the value.
++//! Soundness: we separately track, for each 64-bit register family, whether
++//! its value is known to fit in 8, 16, or 32 bits. A byte re-extension such as
++//! `movzbl %al, %eax` is removable only when the source is known to fit in 8
++//! bits; merely knowing that bits 32..63 are zero is insufficient because the
++//! instruction must still clear bits 8..31. The same rule applies to 16-bit
++//! re-extensions. Facts are propagated by width-preserving register copies and
++//! cleared by instructions that may write a wider value.
+ 
+ use super::super::types::*;
+ 
+@@ -225,8 +219,10 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
+                     if std::env::var("CCC_TRACE_EXT").is_ok() {
+                         eprintln!("[EXT] t='{}' src_fam={:?} dst_fam={:?} is32={} u32z={} bytez={}", t, sf, df, is32, u32z, bytez);
+                     }
+-                    if is32 && u32z && sf == df {
+-                        // Same family, upper-32-zero: pure no-op -> remove.
++                    if is32 && bytez && sf == df {
++                        // Same family and already known to fit in a byte: pure
++                        // no-op. Upper-32-zero alone is not enough because the
++                        // re-extension may still need to clear bits 8..31.
+                         keep[i] = false;
+                         changed = true;
+                         continue;
+@@ -588,4 +584,25 @@ mod tests {
+         assert!(!eliminate_redundant_zero_extend(&mut asm));
+         assert_eq!(asm, input);
+     }
++
++    #[test]
++    fn keeps_byte_truncation_after_arbitrary_32bit_value() {
++        // Writing EAX proves only that bits 32..63 are zero. The low 32 bits
++        // can still be 0xffffffd8, so this I8->U8 cast must clear bits 8..31.
++        let input = "f:\n    movl %edi, %eax\n    movzbl %al, %eax\n";
++        let mut asm = input.to_string();
++        assert!(!eliminate_redundant_zero_extend(&mut asm));
++        assert_eq!(asm, input);
++    }
++
++    #[test]
++    fn removes_byte_reextension_of_known_byte_value() {
++        let asm = run(
++            "f:\n\
++             \x20   movzbl (%rdi), %eax\n\
++             \x20   movzbl %al, %eax\n"
++        );
++        assert_eq!(asm.matches("movzbl").count(), 1, "asm was:\n{asm}");
++        assert!(asm.contains("movzbl (%rdi), %eax"), "asm was:\n{asm}");
++    }
+ }
+diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
+index 5c5fcb05..56018189 100644
+--- a/src/backend/x86/codegen/prologue.rs
++++ b/src/backend/x86/codegen/prologue.rs
+@@ -676,32 +676,29 @@ impl X86Codegen {
+             self.value_types = value_types;
+         }
+ 
+-        // GlobalAddr values whose EVERY use is a foldable Load/Store pointer
+-        // never materialize (they become direct sym(%rip) accesses in
+-        // generate_load/store). Keep them out of the allocator AND slot
+-        // assignment: a dead address value otherwise consumes a register a
+-        // live value needs (forcing a callee-saved push/pop or a spill) and
+-        // an 8-byte frame slot. Exact same fold-preview the i686 backend
+-        // uses; the preconditions mirror generate_load/store (non-TLS,
+-        // non-wide type, default address space; GOT-needing symbols are
+-        // filtered inside the fold itself via needs_got_for_addr, which the
+-        // preview conservatively respects by only listing GlobalAddr dests
+-        // whose uses ALL satisfy the foldable-shape test).
++        // Direct scalar global accesses and safely reconstructible global
++        // address roots never need a register or stack home. The former become
++        // `sym(%rip)` Load/Store operands; the latter are recreated only at
++        // audited Add/Sub/GEP uses as `leaq sym(%rip)` plus the live offset.
++        // Filtering GOT/TLS identities before either analysis is the critical
++        // fail-closed contract: full PIC and weak PIE externs still materialize.
+         let never_materialized = {
+-            let gmap = crate::backend::generation::build_global_addr_map_for(
++            let mut gmap = crate::backend::generation::build_global_addr_map_for(
+                 func, &self.state.tls_symbols);
+-            let mut set = crate::backend::generation::build_foldable_global_addr_set_for(func, &gmap);
+-            // x86-64 refinement: the fold additionally requires
+-            // !needs_got_for_addr(sym) at emission time. Drop candidates
+-            // whose symbol would go through the GOT — those DO materialize.
+-            set.retain(|vid| {
+-                gmap.get(vid).map(|sym| {
+-                    // strip "+off" suffixes the GEP-merge may have added
+-                    let base = sym.split(['+', '-']).next().unwrap_or(sym);
+-                    !self.state.needs_got_for_addr(base)
+-                        && !self.state.tls_symbols.contains(base)
+-                }).unwrap_or(false)
++            gmap.retain(|_, sym| {
++                // Strip a composed constant displacement. Symbol names emitted
++                // by C cannot contain '+'; '-' here is only the map's suffix.
++                let base = sym.split(['+', '-']).next().unwrap_or(sym);
++                !self.state.needs_got_for_addr(base)
++                    && !self.state.tls_symbols.contains(base)
++                    && !self.state.absolute_symbols.contains(base)
+             });
++            let mut set = crate::backend::generation::build_foldable_global_addr_set_for(
++                func, &gmap);
++            set.extend(
++                crate::backend::generation::build_rematerializable_global_addr_set_for(
++                    func, &gmap),
++            );
+             self.state.never_materialized_values = set.clone();
+             set
+         };
+diff --git a/src/driver/cli.rs b/src/driver/cli.rs
+index e2b6930c..0bc9348b 100644
+--- a/src/driver/cli.rs
++++ b/src/driver/cli.rs
+@@ -1099,9 +1099,21 @@ impl Driver {
+                 "-fno-profile-arcs" | "-fno-test-coverage" | "-fno-branch-probabilities" | "-fno-auto-profile" => {},
+                 arg if arg.starts_with("-fno-profile") => {},
+ 
+-                // Feature flags
+-                "-fPIC" | "-fpic" | "-fPIE" | "-fpie" => self.pic = true,
+-                "-fno-PIC" | "-fno-pic" | "-fno-PIE" | "-fno-pie" => self.pic = false,
++                // Feature flags. Full PIC and PIE have different x86-64 data
++                // relocation rules, so preserve the last explicit mode rather
++                // than collapsing both flags into one boolean.
++                "-fPIC" | "-fpic" => {
++                    self.pic = true;
++                    self.pie = false;
++                }
++                "-fPIE" | "-fpie" => {
++                    self.pic = false;
++                    self.pie = true;
++                }
++                "-fno-PIC" | "-fno-pic" | "-fno-PIE" | "-fno-pie" => {
++                    self.pic = false;
++                    self.pie = false;
++                }
+                 "-fcf-protection=branch" | "-fcf-protection=full" => self.cf_protection_branch = true,
+                 "-fcf-protection=none" => self.cf_protection_branch = false,
+                 arg if arg.starts_with("-fpatchable-function-entry=") => {
+diff --git a/src/driver/external_tools.rs b/src/driver/external_tools.rs
+index a12c1046..992f0a57 100644
+--- a/src/driver/external_tools.rs
++++ b/src/driver/external_tools.rs
+@@ -306,7 +306,7 @@ impl Driver {
+             // indirection) instead of R_RISCV_PCREL_HI20 (direct PC-relative).
+             // The Linux kernel does not have a GOT and expects PCREL relocations,
+             // so we must explicitly pass -fno-pic when PIC is not requested.
+-            if !self.pic {
++            if !self.pic && !self.pie {
+                 args.push("-fno-pic".to_string());
+             }
+         }
+diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
+index 8521cfc9..2f75b47d 100644
+--- a/src/driver/pipeline.rs
++++ b/src/driver/pipeline.rs
+@@ -105,8 +105,13 @@ pub struct Driver {
+     pub(super) nostdlib: bool,
+     /// Whether to produce a relocatable object file (-r / -relocatable)
+     pub(super) relocatable: bool,
+-    /// Whether to generate position-independent code (-fPIC/-fpic)
++    /// Whether to generate fully interposable position-independent code
++    /// (`-fPIC`/`-fpic`, or `-shared`).
+     pub(super) pic: bool,
++    /// Whether to generate a position-independent executable (`-fPIE`/
++    /// `-fpie`, the x86-64 Linux default). PIE permits direct references to
++    /// ordinary executable data where full PIC requires the GOT.
++    pub(super) pie: bool,
+     /// Files to force-include before the main source (-include flag)
+     pub(super) force_includes: Vec<String>,
+     /// Whether to replace `ret` with `jmp __x86_return_thunk` (-mfunction-return=thunk-extern)
+@@ -373,10 +378,11 @@ impl Driver {
+             shared_lib: false,
+             nostdlib: false,
+             relocatable: false,
+-            pic: true, // x86-64 Linux default: PIE/PIC-safe codegen, matching
+-                       // GCC's default (zlib-ng etc. compile shared objects
+-                       // with -DPIC only and rely on the compiler default).
+-                       // -fno-pic/-fno-PIE disables.
++            // Debian x86-64 defaults to PIE, not full PIC. Keeping these modes
++            // distinct lets executable data use direct RIP-relative accesses
++            // while explicit -fPIC/-shared remains interposition-safe.
++            pic: false,
++            pie: true,
+             force_includes: Vec::new(),
+             function_return_thunk: false,
+             indirect_branch_thunk: false,
+@@ -1035,10 +1041,10 @@ impl Driver {
+         // associative-math flags permit selected transforms but do not define
+         // __FAST_MATH__.
+         preprocessor.set_fast_math(self.fast_math);
+-        // Set PIC mode: defines __PIC__/__pic__ only when -fPIC is active.
+-        // This is critical for kernel code where RIP_REL_REF() checks #ifndef __pic__
+-        // to decide whether to use RIP-relative inline asm for early boot code.
+-        preprocessor.set_pic(self.pic);
++        // PIE and full PIC both define __PIC__; only PIE defines __PIE__.
++        // Kernel `-fno-pic` clears both before RIP_REL_REF inline asm expands.
++        preprocessor.set_pic(self.pic || self.pie || self.shared_lib);
++        preprocessor.set_pie(self.pie && !self.pic && !self.shared_lib);
+         // Set SSE/SSE2/MMX predefined macros for x86 targets.
+         // GCC/Clang always define __SSE__, __SSE2__, __MMX__ for x86_64 (baseline ISA).
+         // Our i686 backend also uses SSE2, so we define them for i686 as well.
+@@ -1832,6 +1838,7 @@ impl Driver {
+             // use canonical stack homes until an SSA-aware O0 allocator exists.
+             disable_regalloc: self.opt_level == 0,
+             pic: self.pic || self.shared_lib,
++            pie: self.pie && !self.pic && !self.shared_lib,
+             function_return_thunk: self.function_return_thunk,
+             indirect_branch_thunk: self.indirect_branch_thunk,
+             indirect_branch_thunk_inline: self.indirect_branch_thunk_inline,
+diff --git a/src/frontend/preprocessor/predefined_macros.rs b/src/frontend/preprocessor/predefined_macros.rs
+index 11d0fdc6..f9c785d1 100644
+--- a/src/frontend/preprocessor/predefined_macros.rs
++++ b/src/frontend/preprocessor/predefined_macros.rs
+@@ -451,6 +451,19 @@ impl Preprocessor {
+         }
+     }
+ 
++    /// Define or undefine GCC-compatible PIE macros. PIE also defines PIC, but
++    /// the driver calls the two setters separately so explicit `-fPIC` does
++    /// not falsely advertise `__PIE__`.
++    pub fn set_pie(&mut self, enabled: bool) {
++        if enabled {
++            self.define_simple_macro("__PIE__", "2");
++            self.define_simple_macro("__pie__", "2");
++        } else {
++            self.macros.undefine("__PIE__");
++            self.macros.undefine("__pie__");
++        }
++    }
++
+     /// Define x86/x86_64 SIMD feature macros (__SSE__, __SSE2__, __MMX__, etc.).
+     ///
+     /// GCC/Clang always define these for x86_64 (SSE2 is baseline for the ISA).
+diff --git a/src/ir/lowering/lower.rs b/src/ir/lowering/lower.rs
+index d586355f..5b284888 100644
+--- a/src/ir/lowering/lower.rs
++++ b/src/ir/lowering/lower.rs
+@@ -858,6 +858,23 @@ impl Lowerer {
+                 }
+             }
+         }
++
++        // Preserve function-vs-data identity through IR. Calls already carry a
++        // dedicated Call instruction, but taking a function address lowers to
++        // the same GlobalAddr shape as data. In PIE, ordinary extern data may
++        // use a copy relocation while an interposable extern function pointer
++        // must remain GOT-indirect. Resolve asm labels / symver aliases now so
++        // this set uses exactly the names GlobalAddr emission will see.
++        let extern_function_symbols: Vec<String> = self
++            .known_functions
++            .iter()
++            .filter(|name| !self.defined_functions.contains(*name))
++            .map(|name| self.resolve_ref_name(name))
++            .collect();
++        self.module
++            .extern_function_symbols
++            .extend(extern_function_symbols);
++
+         (self.module, self.diagnostics.into_inner())
+     }
+ 
+diff --git a/src/ir/module.rs b/src/ir/module.rs
+index 9782d410..6f14d18e 100644
+--- a/src/ir/module.rs
++++ b/src/ir/module.rs
+@@ -12,6 +12,11 @@ use super::instruction::{BasicBlock, Value};
+ #[derive(Debug)]
+ pub struct IrModule {
+     pub functions: Vec<IrFunction>,
++    /// Linker names of functions referenced by this translation unit but not
++    /// defined in it. Backends need this distinction when taking addresses:
++    /// PIE may use copy relocations for ordinary extern data, but no analogous
++    /// mechanism makes an interposable extern function address PC-relative.
++    pub extern_function_symbols: crate::common::fx_hash::FxHashSet<String>,
+     pub globals: Vec<IrGlobal>,
+     pub string_literals: Vec<(String, String)>, // (label, value)
+     /// Wide string literals (L"..."): (label, chars as u32 values including null terminator)
+@@ -269,6 +274,7 @@ impl IrModule {
+     pub fn new() -> Self {
+         Self {
+             functions: Vec::new(),
++            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
+             globals: Vec::new(),
+             string_literals: Vec::new(),
+             wide_string_literals: Vec::new(),
+diff --git a/src/passes/gvn.rs b/src/passes/gvn.rs
+index 1b6b2080..1f2c7a66 100644
+--- a/src/passes/gvn.rs
++++ b/src/passes/gvn.rs
+@@ -1266,6 +1266,7 @@ mod tests {
+ 
+         let mut module = IrModule {
+             functions: vec![func],
++            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
+             globals: vec![],
+             string_literals: vec![],
+             wide_string_literals: vec![],
+@@ -1348,6 +1349,7 @@ mod tests {
+ 
+         let mut module = IrModule {
+             functions: vec![func],
++            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
+             globals: vec![],
+             string_literals: vec![],
+             wide_string_literals: vec![],
+@@ -1418,6 +1420,7 @@ mod tests {
+ 
+         let mut module = IrModule {
+             functions: vec![func],
++            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
+             globals: vec![],
+             string_literals: vec![],
+             wide_string_literals: vec![],
+@@ -1494,6 +1497,7 @@ mod tests {
+ 
+         let mut module = IrModule {
+             functions: vec![func],
++            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
+             globals: vec![],
+             string_literals: vec![],
+             wide_string_literals: vec![],
+@@ -1574,6 +1578,7 @@ mod tests {
+ 
+         let mut module = IrModule {
+             functions: vec![func],
++            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
+             globals: vec![],
+             string_literals: vec![],
+             wide_string_literals: vec![],
+@@ -1654,6 +1659,7 @@ mod tests {
+ 
+         let mut module = IrModule {
+             functions: vec![func],
++            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
+             globals: vec![],
+             string_literals: vec![],
+             wide_string_literals: vec![],
+@@ -1759,6 +1765,7 @@ mod tests {
+ 
+         let mut module = IrModule {
+             functions: vec![func],
++            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
+             globals: vec![],
+             string_literals: vec![],
+             wide_string_literals: vec![],
+@@ -1827,6 +1834,7 @@ mod tests {
+     fn make_module(func: IrFunction) -> IrModule {
+         IrModule {
+             functions: vec![func],
++            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
+             globals: vec![],
+             string_literals: vec![],
+             wide_string_literals: vec![],
+diff --git a/tests/regression/bit_test_accumulator_handoff.c b/tests/regression/bit_test_accumulator_handoff.c
 new file mode 100644
-index 0000000..2121b1b
+index 00000000..dbb9d2e8
 --- /dev/null
-+++ b/docs/history/2026-08-21-session7-aggfwd-pairload.md
-@@ -0,0 +1,97 @@
-+# Session 7 (2026-08-21): struct_copy 3.1×→1.54×, i686 pair-load miscompile
++++ b/tests/regression/bit_test_accumulator_handoff.c
+@@ -0,0 +1,17 @@
++/* A canonicalized BitTest with a physical result home must still consume an
++ * adjacent logical producer assigned only to the accumulator location. */
++__attribute__((noinline))
++unsigned long probe_bit_acc(unsigned long x, unsigned long y)
++{
++    unsigned long value = x & y;
++    return (value >> 63) & 1;
++}
 +
-+## Base
++int main(void)
++{
++    int rc = 0;
++    rc |= probe_bit_acc(1UL << 63, ~0UL) != 1;
++    rc |= probe_bit_acc(7, ~0UL) != 0;
++    rc |= probe_bit_acc(~0UL, 0) != 0;
++    return rc;
++}
+diff --git a/tests/regression/check_global_addr_remat.sh b/tests/regression/check_global_addr_remat.sh
+new file mode 100755
+index 00000000..3bd5b768
+--- /dev/null
++++ b/tests/regression/check_global_addr_remat.sh
+@@ -0,0 +1,71 @@
++#!/usr/bin/env bash
++# RA-01: distinguish PIE from full PIC, and omit only GlobalAddr roots whose
++# every use can be reconstructed safely. The kill switch must restore the old
++# fully-GOT executable lowering for controlled workload measurements.
++set -euo pipefail
++CCC=${CCC:-./target/release/lccc}
++dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
++src="$dir/global_addr_remat.c"
++td=$(mktemp -d)
++trap 'rm -rf "$td"' EXIT
 +
-+Re-based onto `8393754` (PR #174, BitTest IR). Massive upstream progress since
-+#118: Tier-2 graph coloring default (P0-01b), RA-23/24/26/27, sema constraints
-+(P0-05), engineering/agent/BACKLOG.md is now the authoritative 170-item work
-+catalog. ALL session-6 i686 work survived the merge (verified by grep:
-+fnptr fold + linear seal, callee-saves shapes, cmp-mem fold, range fixes,
-+call *sym encodings). All 7 reproducers green post-rebase.
++"$CCC" -O2 -fPIE -S "$src" -o "$td/pie.s"
++CCC_NO_GLOBAL_ADDR_REMAT=1 "$CCC" -O2 -fPIE -S "$src" -o "$td/control.s"
++"$CCC" -O2 -fPIC -S "$src" -o "$td/pic.s"
++cat >"$td/extern_fn_addr.c" <<'EOF'
++typedef int (*fn_ptr)(int);
++extern int ra01_external_function(int);
++fn_ptr external_function_address(void) { return ra01_external_function; }
++EOF
++"$CCC" -O2 -fPIE -S "$td/extern_fn_addr.c" -o "$td/extern_fn_addr.s"
 +
-+## Landed (single commit e8bcfcd)
++body=$(sed -n '/^global_addr_probe:/,/^\.size global_addr_probe/p' "$td/pie.s")
++grep -q 'leaq ra01_bytes(%rip)' <<<"$body" || {
++    echo "PIE probe did not rematerialize the byte-array base"; exit 1;
++}
++grep -q 'ra01_index(%rip)' <<<"$body" || {
++    echo "PIE probe did not use a direct index load"; exit 1;
++}
++if grep -Eq 'ra01_(bytes|index|scalar)@GOTPCREL' <<<"$body"; then
++    echo "ordinary PIE executable data still uses GOTPCREL"; exit 1
++fi
++# Escaping an address is deliberately outside the rematerialization audit, but
++# PIE still materializes that root with a legal direct LEA.
++escape=$(sed -n '/^global_addr_escape:/,/^\.size global_addr_escape/p' "$td/pie.s")
++grep -q 'leaq ra01_scalar(%rip)' <<<"$escape" || {
++    echo "escaping PIE global address lost its direct materialization"; exit 1;
++}
++# Weak externs can resolve to zero and therefore must retain a GOT slot in PIE.
++grep -q 'ra01_missing@GOTPCREL' "$td/pie.s" || {
++    echo "weak PIE extern lost required GOT indirection"; exit 1;
++}
++# Function addresses have no data-copy-relocation equivalent and therefore
++# remain GOT-indirect when the declaration is external and interposable.
++grep -q 'ra01_external_function@GOTPCREL' "$td/extern_fn_addr.s" || {
++    echo "PIE extern function address lost required GOT indirection"; exit 1;
++}
++# Full PIC keeps all default-visibility definitions interposable.
++for sym in ra01_bytes ra01_index ra01_scalar; do
++    grep -q "${sym}@GOTPCREL" "$td/pic.s" || {
++        echo "full PIC emitted direct access for interposable $sym"; exit 1;
++    }
++done
++# One switch controls both direct PIE folding and root rematerialization.
++for sym in ra01_bytes ra01_index ra01_scalar; do
++    grep -q "${sym}@GOTPCREL" "$td/control.s" || {
++        echo "kill-switch control did not restore GOT access for $sym"; exit 1;
++    }
++done
 +
-+### 1. IS-02 family: aggregate copy-forward — struct_copy 3.11× → 1.54×
++"$CCC" -dM -E "$src" >"$td/default.macros"
++"$CCC" -fPIC -dM -E "$src" >"$td/pic.macros"
++"$CCC" -fno-pic -dM -E "$src" >"$td/nopic.macros"
++grep -q '^#define __PIE__ 2$' "$td/default.macros" || {
++    echo "default PIE mode does not define __PIE__"; exit 1;
++}
++if grep -q '^#define __PIE__' "$td/pic.macros"; then
++    echo "full PIC incorrectly defines __PIE__"; exit 1
++fi
++if grep -Eq '^#define __(PIC|PIE)__' "$td/nopic.macros"; then
++    echo "-fno-pic left PIC/PIE macros enabled"; exit 1
++fi
+diff --git a/tests/regression/check_redundant_test_elimination.sh b/tests/regression/check_redundant_test_elimination.sh
+index f8f15904..24445ea1 100755
+--- a/tests/regression/check_redundant_test_elimination.sh
++++ b/tests/regression/check_redundant_test_elimination.sh
+@@ -49,4 +49,8 @@ int main(void)
+ }
+ EOF
+ "$CCC" -m32 -O2 -fno-pic "$td/run.c" -o "$td/run"
+-"$td/run"
++if [ -x /lib/ld-linux.so.2 ] || [ -x /lib32/ld-linux.so.2 ] || [ -x /usr/lib32/ld-linux.so.2 ]; then
++    "$td/run"
++else
++    echo "SKIP runtime: compiled; host has no i386 ELF interpreter"
++fi
+diff --git a/tests/regression/check_unary_rmw_copy_propagation.sh b/tests/regression/check_unary_rmw_copy_propagation.sh
+index 557e9b5f..0fe6788e 100755
+--- a/tests/regression/check_unary_rmw_copy_propagation.sh
++++ b/tests/regression/check_unary_rmw_copy_propagation.sh
+@@ -31,9 +31,18 @@ int main(void) {
+     return rc;
+ }
+ EOF
++have_i386_loader=0
++for loader in /lib/ld-linux.so.2 /lib32/ld-linux.so.2 /usr/lib32/ld-linux.so.2; do
++    [ -x "$loader" ] && have_i386_loader=1
++done
+ for opt in O0 O1 O2 Os; do
+     "$CCC" -m32 -fno-pic -$opt "$td/test.c" -o "$td/test_$opt" 2>"$td/err_$opt.txt" || {
+         echo "compile failed at -$opt"; cat "$td/err_$opt.txt"; exit 1;
+     }
+-    "$td/test_$opt" || { echo "runtime mismatch at -$opt (unary RMW result lost)"; exit 1; }
++    if [ "$have_i386_loader" = 1 ]; then
++        "$td/test_$opt" || { echo "runtime mismatch at -$opt (unary RMW result lost)"; exit 1; }
++    fi
+ done
++if [ "$have_i386_loader" = 0 ]; then
++    echo "SKIP runtime: all modes compiled; host has no i386 ELF interpreter"
++fi
+diff --git a/tests/regression/check_volatile_access_semantics.sh b/tests/regression/check_volatile_access_semantics.sh
+index 348350a0..fbb37b9c 100755
+--- a/tests/regression/check_volatile_access_semantics.sh
++++ b/tests/regression/check_volatile_access_semantics.sh
+@@ -26,6 +26,10 @@ int volatile_local(void) { volatile int loc = 3; loc = loc + 1; return loc; }
+ EOF
+ 
+ rc=0
++# Accept register-indirect and direct RIP-relative memory operands, plus the
++# signed-widening form selected for an i32 value on x86-64. RA-01 deliberately
++# turns ordinary PIE globals into `symbol(%rip)` accesses.
++load_pat='mov(l|slq) +[^,]*\(%[re]?[a-z0-9]+'
+ check() { # check <fn> <grep-pattern> <description>
+     local fn=$1 pat=$2 desc=$3
+     local body
+@@ -43,15 +47,15 @@ for lvl in O0 O1 O2 Os; do
+     "$CCC" -$lvl -S "$td/vol.c" -o "$td/vol.s" || { echo "FAIL: compile at -$lvl"; rc=1; continue; }
+     # 1. a real load of counter between the store and the return
+     body=$(awk '/^read_after_store:/,/^\.size/' "$td/vol.s")
+-    loads=$(echo "$body" | grep -Ec 'movl +[-0-9]*\(%[re]?[a-z]')
++    loads=$(echo "$body" | grep -Ec "$load_pat")
+     if [ "$loads" -ge 1 ]; then echo "ok: store-then-load reloads memory"; else echo "FAIL: volatile load forwarded/eliminated"; rc=1; fi
+     # 2. the loop body must contain a load
+     body=$(awk '/^reads_in_loop:/,/^\.size/' "$td/vol.s" | awk '/\.LBB[0-9]*:/{blk=blk+1} {print}' )
+-    check reads_in_loop 'movl +[-0-9]*\(%[re]?[a-z]' "loop keeps volatile load in body"
++    check reads_in_loop "$load_pat" "loop keeps volatile load in body"
+     # 3. dead read survives
+-    check dead_read 'movl +[-0-9]*\(%[re]?[a-z]' "dead-result volatile load survives DCE"
++    check dead_read "$load_pat" "dead-result volatile load survives DCE"
+     # 4. deref through pointer param loads
+-    check deref_param 'movl +[-0-9]*\(%[re]?[a-z]' "*volatile-ptr param loads"
++    check deref_param "$load_pat" "*volatile-ptr param loads"
+     # 5. volatile local: store;load;store sequence
+     body=$(awk '/^volatile_local:/,/^\.size/' "$td/vol.s")
+     n=$(echo "$body" | grep -Ec 'mov[a-z]* +[^#]*\(%(rsp|rbp|esp|ebp)')
+diff --git a/tests/regression/global_addr_remat.c b/tests/regression/global_addr_remat.c
+new file mode 100644
+index 00000000..cd75976e
+--- /dev/null
++++ b/tests/regression/global_addr_remat.c
+@@ -0,0 +1,41 @@
++/* Executable-data addresses may be rebuilt at pointer-arithmetic uses instead
++ * of occupying a register/slot for their whole lifetime. Full PIC and weak
++ * externs retain GOT semantics. */
++typedef unsigned char u8;
 +
-+The `build(tmp); memcpy(dst, tmp)` store-forwarding sub-pass was blocked
-+three independent ways on the canonical inlined-struct-return shape:
++u8 ra01_bytes[256];
++unsigned ra01_index = 13;
++unsigned ra01_scalar = 7;
++extern int ra01_missing __attribute__((weak));
 +
-+* **Stale param exclusion**: excluded "first params.len() entry allocas"
-+  positionally; after mem2reg deletes promoted scalar param homes the count
-+  excluded the first N *temporaries*. Now uses `func.param_alloca_values`
-+  (authoritative, maintained by lowering/mem2reg/tail_call_elim), positional
-+  fallback only when the list is empty.
-+* **Dest defined too late**: the destination GEP (`&g->particles[i]`) is
-+  emitted right before the memcpy — after the temp's first store — failing
-+  the def-before-first-use ordering check. Const-offset GEPs are pure
-+  address arithmetic: hoisted above the first root use when the base
-+  dominates (one hoist per run(); driver fixed-point handles chains).
-+* **Window over-rejection**: the dest-liveness window (zlib-ng fold_1 guard)
-+  rejected ANY instruction referencing a dest-rooted value — including the
-+  hoisted GEP itself. GEP/Copy/Phi are address-only; memory accesses through
-+  the aliases they create are still caught by the paths lookup on the
-+  accessing instruction. Load/Store/Memcpy/Call/etc. still fail closed.
++__attribute__((noinline))
++unsigned global_addr_probe(unsigned rounds)
++{
++    unsigned sum = 0;
++    for (unsigned i = 0; i < rounds; ++i) {
++        unsigned at = (ra01_index + i) & 255;
++        u8 *p = ra01_bytes + at;
++        *p = (u8)(*p + (u8)(ra01_scalar + i));
++        sum += *p;
++    }
++    return sum;
++}
 +
-+All 4 struct-return memcpys in struct_copy now eliminated (was 0-1 of 4).
++__attribute__((noinline))
++unsigned *global_addr_escape(void)
++{
++    return &ra01_scalar;
++}
 +
-+### 2. i686 pair load/store base-clobber MISCOMPILE (pre-existing)
++int main(void)
++{
++    unsigned a = global_addr_probe(17);
++    unsigned b = global_addr_probe(17);
++    if (a != 255 || b != 510)
++        return 1;
++    if (global_addr_escape() != &ra01_scalar || *global_addr_escape() != 7)
++        return 2;
++    if (&ra01_missing != 0)
++        return 3;
++    return 0;
++}
+diff --git a/tests/regression/peephole_signed_char_cast.c b/tests/regression/peephole_signed_char_cast.c
+new file mode 100644
+index 00000000..887100a9
+--- /dev/null
++++ b/tests/regression/peephole_signed_char_cast.c
+@@ -0,0 +1,43 @@
++#include <stdio.h>
 +
-+Found by running the -m32 battery on the rebased tree: nbody and
-+struct_copy SIGSEGV at -m32 -O1+. The F64/I64 pair load through
-+`SlotAddr::Reg` emitted `movl (%eax),%eax; movl 4(%eax),%edx` when the RA
-+homed the pointer in %eax (PhysReg 6 = Phase 2e accumulator home, newly
-+reachable after the upstream RA work): the first load destroys the base and
-+the second dereferences the loaded LOW WORD. Fixes:
++__attribute__((noinline))
++static int unicode_byte_type(char hi, char lo) {
++  switch ((unsigned char)hi) {
++  case 0xD8:
++  case 0xD9:
++  case 0xDA:
++  case 0xDB:
++    return 4;
++  case 0xDC:
++  case 0xDD:
++  case 0xDE:
++  case 0xDF:
++    return 2;
++  case 0xFF:
++    switch ((unsigned char)lo) {
++    case 0xFF:
++    case 0xFE:
++      return 1;
++    }
++    break;
++  }
++  return 3;
++}
 +
-+* load sites (memory.rs, emit_load_impl + emit_load_with_const_offset_impl,
-+  SlotAddr::Reg arms): order the pair so the base register is written LAST
-+  (base=%eax → load %edx-half first).
-+* store sites (emit_store_impl + emit_store_with_const_offset_impl): the
-+  value pair occupies BOTH accumulator halves so reordering can't help —
-+  stash an %eax/%edx base into the %ecx address scratch before staging.
++int main(void) {
++  static volatile const signed char tests[][3] = {
++    {0x00, 0x00, 3}, {(signed char)0xd7, 0x00, 3}, {(signed char)0xd8, 0x00, 4},
++    {(signed char)0xdb, (signed char)0xff, 4}, {(signed char)0xdc, 0x00, 2}, {(signed char)0xdf, (signed char)0xff, 2},
++    {(signed char)0xe0, 0x00, 3}, {(signed char)0xff, (signed char)0xfd, 3}, {(signed char)0xff, (signed char)0xfe, 1}, {(signed char)0xff, (signed char)0xff, 1}
++  };
++  int failed = 0;
++  for (unsigned i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {
++    int got = unicode_byte_type((char)tests[i][0], (char)tests[i][1]);
++    if (got != tests[i][2]) {
++      printf("case %u: hi=%02x lo=%02x got=%d expected=%u\n",
++             i, tests[i][0], tests[i][1], got, tests[i][2]);
++      failed = 1;
++    }
++  }
++  return failed;
++}
+diff --git a/tests/regression/run_regression.sh b/tests/regression/run_regression.sh
+index 1a323f9b..58135d3c 100755
+--- a/tests/regression/run_regression.sh
++++ b/tests/regression/run_regression.sh
+@@ -7,7 +7,14 @@ CCCFLAGS=${CCCFLAGS:--O2}
+ COMPARE_GCC=0
+ [ "${1:-}" = "--compare-gcc" ] && COMPARE_GCC=1
+ dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+-pass=0; fail=0
++pass=0; fail=0; skip=0
++# A successfully linked i386 executable still cannot run when the host image
++# lacks the ELF interpreter. Keep compiling those regressions, but classify
++# the environment limitation honestly instead of reporting a compiler defect.
++have_i386_loader=0
++for loader in /lib/ld-linux.so.2 /lib32/ld-linux.so.2 /usr/lib32/ld-linux.so.2; do
++  [ -x "$loader" ] && have_i386_loader=1
++done
+ for src in "$dir"/*.c; do
+   name=$(basename "$src" .c)
+   # Per-test flags: a sibling <name>.flags file adds compiler flags
+@@ -61,16 +68,22 @@ for src in "$dir"/*.c; do
+   # appear before the object under --as-needed, so extra_flags must follow
+   # the input file (LCCC accepts both orders; GCC does not).
+   if $CCC $CCCFLAGS "$src" $extra_flags -o "/tmp/ccc_${name}" 2>/tmp/ccc_err.txt; then
+-    /tmp/ccc_${name} >/tmp/ccc_out.txt 2>&1; rc=$?
+-    if [ $rc -eq 0 ]; then
+-      if [ "$COMPARE_GCC" = 1 ] && [ "$LCCC_NO_COMPARE" = 0 ]; then
+-        if command -v gcc >/dev/null && gcc -O2 "$src" $extra_flags -o /tmp/gcc_${name} 2>/dev/null \
+-           && /tmp/gcc_${name} >/tmp/gcc_out.txt 2>&1 \
+-           && diff -q /tmp/ccc_out.txt /tmp/gcc_out.txt >/dev/null; then
+-          echo "PASS  $name"; pass=$((pass+1))
+-        else echo "MISMATCH $name"; fail=$((fail+1)); fi
+-      else echo "PASS  $name${LCCC_NO_COMPARE:+ (lccc-only)}"; pass=$((pass+1)); fi
+-    else echo "FAIL  $name (run rc=$rc) out=[$(cat /tmp/ccc_out.txt)]"; fail=$((fail+1)); fi
++    if [[ " $extra_flags " == *" -m32 "* && "$have_i386_loader" = 0 ]] \
++       && readelf -l "/tmp/ccc_${name}" 2>/dev/null | grep -q 'Requesting program interpreter:.*ld-linux\.so\.2'; then
++      echo "SKIP  $name (compiled; host has no i386 ELF interpreter)"
++      skip=$((skip+1))
++    else
++      /tmp/ccc_${name} >/tmp/ccc_out.txt 2>&1; rc=$?
++      if [ $rc -eq 0 ]; then
++        if [ "$COMPARE_GCC" = 1 ] && [ "$LCCC_NO_COMPARE" = 0 ]; then
++          if command -v gcc >/dev/null && gcc -O2 "$src" $extra_flags -o /tmp/gcc_${name} 2>/dev/null \
++             && /tmp/gcc_${name} >/tmp/gcc_out.txt 2>&1 \
++             && diff -q /tmp/ccc_out.txt /tmp/gcc_out.txt >/dev/null; then
++            echo "PASS  $name"; pass=$((pass+1))
++          else echo "MISMATCH $name"; fail=$((fail+1)); fi
++        else echo "PASS  $name${LCCC_NO_COMPARE:+ (lccc-only)}"; pass=$((pass+1)); fi
++      else echo "FAIL  $name (run rc=$rc) out=[$(cat /tmp/ccc_out.txt)]"; fail=$((fail+1)); fi
++    fi
+   else echo "FAIL  $name compile: $(tail -1 /tmp/ccc_err.txt)"; fail=$((fail+1)); fi
+   # Undo this test's env file so it cannot affect subsequent tests.
+   for _v in $_envfile_vars; do unset "$_v"; done
+@@ -89,5 +102,5 @@ for check in "$dir"/check_*.sh; do
+   fi
+ done
+ 
+-echo "=== Regression: $pass passed, $fail failed ==="
++echo "=== Regression: $pass passed, $skip skipped, $fail failed ==="
+ [ $fail -eq 0 ]
+diff --git a/tests/workloads/gzip-1.14/README.md b/tests/workloads/gzip-1.14/README.md
+index c2398243..055c8918 100644
+--- a/tests/workloads/gzip-1.14/README.md
++++ b/tests/workloads/gzip-1.14/README.md
+@@ -35,8 +35,11 @@ the recipe checksum as validated.
+    and byte-identical decompression;
+ 6. captures binaries, `size`, full `objdump`, build/test logs, raw randomized
+    timing samples, individual best/worst/median cases, and arithmetic/geometric
+-   aggregate ratios; and
+-7. pins timing children to one available CPU when `taskset` is present.
++   aggregate ratios;
++7. optionally builds a same-LCCC kill-switch control (`--lccc-control-env
++   NAME=VALUE`) and reports every treatment/control case, arithmetic/geometric
++   means, best gain, and worst regression without hiding an outlier; and
++8. pins timing children to one available CPU when `taskset` is present.
+ 
+ Example:
+ 
+@@ -45,7 +48,8 @@ python3 tests/workloads/gzip-1.14/run.py \
+   --archive /path/to/gzip-1.14.tar.xz \
+   --lccc "$PWD/target/fastbuild/lccc" \
+   --artifact-dir /path/to/results \
+-  --rounds 9 --warmups 2
++  --lccc-control-env CCC_NO_GLOBAL_ADDR_REMAT=1 \
++  --rounds 15 --warmups 2
+ ```
+ 
+ The generated report is **VM wall-clock screening only**. It does not provide
+diff --git a/tests/workloads/gzip-1.14/run.py b/tests/workloads/gzip-1.14/run.py
+index 2bc20b95..123082d1 100644
+--- a/tests/workloads/gzip-1.14/run.py
++++ b/tests/workloads/gzip-1.14/run.py
+@@ -5,6 +5,8 @@ This is VM wall-clock screening, never a PMU or bare-metal claim.  The script
+ verifies the exact archive digest, builds the complete upstream project, runs
+ its 30-test suite, checks compressed/decompressed bytes, captures disassembly,
+ and records paired randomized timings for deterministic source/mixed corpora.
++An optional same-compiler environment control exposes treatment/control cases,
++aggregate ratios, best gain, and worst regression in one retained report.
+ """
+ from __future__ import annotations
+ 
+@@ -132,14 +134,17 @@ def parse_check_summary(log: str) -> dict[str, int]:
+ 
+ 
+ def build_one(key: str, cc: str, source: Path, root: Path,
+-              artifacts: Path, gcc_include: str) -> dict:
++              artifacts: Path, gcc_include: str,
++              extra_env: dict[str, str] | None = None) -> dict:
+     build = root / f"obj-{key}"
+     build.mkdir()
+     flags = "-O3 -march=x86-64-v3"
+-    if key == "lccc":
++    if key.startswith("lccc"):
+         flags += f" -I{gcc_include}"
+     env = os.environ.copy()
+     env.update(CC=cc, CFLAGS=flags)
++    if extra_env:
++        env.update(extra_env)
+     configure = [str(source / "configure"), "--disable-dependency-tracking"]
+     configured = run(configure, cwd=build, env=env, timeout=600)
+     built = run(["make", "-j2"], cwd=build, env=env, timeout=900)
+@@ -167,6 +172,7 @@ def build_one(key: str, cc: str, source: Path, root: Path,
+         "cc": cc,
+         "compiler_version": compiler_version(cc),
+         "flags": flags,
++        "environment": dict(sorted((extra_env or {}).items())),
+         "binary": str(copied),
+         "binary_sha256": sha256(copied),
+         "binary_bytes": copied.stat().st_size,
+@@ -226,15 +232,85 @@ def summarize(samples: dict[str, dict[str, list[int]]], baseline: str) -> tuple[
+     return summary, lines
+ 
+ 
++def compare_treatment_control(
++    summary: dict[str, dict], treatment: str, control: str,
++) -> tuple[dict, list[str]]:
++    """Expose every treatment/control case plus aggregate and extrema.
 +
-+25-line reproducer: 5-body force loop with `bodies[i].vx -= dx*bodies[j].mass`.
++    Ratios below 1.0 favor the treatment. Medians are paired by case; raw
++    randomized samples remain in the main summary for independent review.
++    """
++    cases: dict[str, dict] = {}
++    ratios: list[float] = []
++    lines = [
++        "## LCCC treatment versus kill-switch control",
++        "",
++        "VM wall-clock screening only; ratio < 1 favors treatment.",
++        "",
++        "| case | treatment ms | control ms | treatment/control | gain % |",
++        "|---|---:|---:|---:|---:|",
++    ]
++    for case, records in summary.items():
++        treatment_ns = records[treatment]["median_ns"]
++        control_ns = records[control]["median_ns"]
++        ratio = treatment_ns / control_ns
++        ratios.append(ratio)
++        cases[case] = {
++            "treatment_median_ns": treatment_ns,
++            "control_median_ns": control_ns,
++            "treatment_to_control": ratio,
++            "gain_percent": (1.0 - ratio) * 100.0,
++        }
++        lines.append(
++            f"| {case} | {treatment_ns/1e6:.3f} | {control_ns/1e6:.3f} | "
++            f"{ratio:.6f} | {(1.0-ratio)*100.0:+.3f} |"
++        )
++    best = min(cases, key=lambda k: cases[k]["treatment_to_control"])
++    worst = max(cases, key=lambda k: cases[k]["treatment_to_control"])
++    aggregates = {
++        "arithmetic_mean_ratio": statistics.mean(ratios),
++        "geometric_mean_ratio": math.exp(statistics.mean(math.log(v) for v in ratios)),
++        "best_gain_case": best,
++        "best_gain_ratio": cases[best]["treatment_to_control"],
++        "worst_regression_case": worst,
++        "worst_regression_ratio": cases[worst]["treatment_to_control"],
++    }
++    lines += [
++        "",
++        f"- Arithmetic mean ratio: **{aggregates['arithmetic_mean_ratio']:.6f}**",
++        f"- Geometric mean ratio: **{aggregates['geometric_mean_ratio']:.6f}**",
++        f"- Best case: `{best}` **{aggregates['best_gain_ratio']:.6f}**",
++        f"- Worst case: `{worst}` **{aggregates['worst_regression_ratio']:.6f}**",
++    ]
++    return {"cases": cases, "aggregates": aggregates}, lines
 +
-+## Validation
 +
-+991/991 unit, 50/50 correctness, 46/46 check scripts, regparm -O0..-Os,
-+x86-64 differential fuzz 147/150 (seeds 4/9/100 fail IDENTICALLY on
-+unmodified main — pre-existing, not investigated this session), **m32
-+differential fuzz 200/200**, benchmark output parity vs gcc at -m32 and
-+-m64 (nbody, spectral_norm, binary_trees, struct_copy, hash_table, qsort).
++def parse_env_assignments(values: list[str]) -> dict[str, str]:
++    env: dict[str, str] = {}
++    for value in values:
++        if "=" not in value:
++            raise SystemExit(f"control environment must be NAME=VALUE, got {value!r}")
++        name, assigned = value.split("=", 1)
++        if not name or not name.replace("_", "a").isalnum() or name[0].isdigit():
++            raise SystemExit(f"invalid environment variable name: {name!r}")
++        env[name] = assigned
++    return env
 +
-+## Benchmark scoreboard after this session (VM, median of 5-9, -O2)
 +
-+| kernel | ratio | note |
-+|---|---|---|
-+| struct_copy | 1.54× | was 3.11× at session start (21× in backlog) |
-+| expat_xml_scan | 1.90× | btq classify missing (OP-15/IS-06 wiring) |
-+| linux_find_bit | 1.86× | IS-11 andn+cmov chain |
-+| sqlite_varint | 1.77× | ISel branches |
-+| loop_patterns | 1.75× | vectorizer (OP-05) |
-+| zlib_ng_adler32 | 1.66× | RA-03 next-use |
-+| sieve | 1.26× | leave alone per backlog |
-+| hash_table | 1.20× | |
-+| gzip_crc32 | 1.07× | |
-+| qsort | 1.00× | |
-+| bitops | 0.69× | lccc WINS |
-+| matmul | 0.80× | lccc WINS |
-+
-+## Notes for next session
-+
-+* The 3 x86-64 fuzz seeds (4, 9, 100) mismatch on pristine main at -O2 —
-+  real miscompiles upstream should know about. Repro: tests/fuzz
-+  differential_fuzz.py, /tmp/fuzz_base kept the .c files (wiped; regenerate
-+  with --seeds 4:5 etc.).
-+* expat classify: GCC turns the xml_name_continue OR-chain into
-+  `andl $-33` (case-fold) + range + `subl $45; cmpb $50; btq $mask` bit
-+  cluster. range_check.rs handles pairs of compares; the btq cluster needs
-+  a new "sparse small-set membership" fold over the whole Select chain →
-+  BitTest IR (IS-06 landed the op + BT emitters; OP-15 is the wiring).
-+  This is the biggest clean structural item left on the parser row.
-+* struct_copy remainder (1.54×): GCC pairs the three field multiplies into
-+  mulpd (SLP over x/y + z scalar); lccc emits 3 scalar mulsd through
-+  slots. That's OP-05/IS-04 territory (vectorizer), not copy-forwarding.
-+* Kernel tree at /home/user/linux-6.18.44 was wiped mid-session (only
-+  include/generated survived); re-extract + re-patch per session-5 protocol
-+  before any realmode measurement.
-diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
-index 07ed216..9facce9 100644
---- a/engineering/agent/BACKLOG.md
-+++ b/engineering/agent/BACKLOG.md
-@@ -58,7 +58,7 @@ Build: `scripts/ensure_swap.sh` then `scripts/build_lccc_fast.sh` → `target/fa
- | Expat name scan | **1.95×** | **classify + inline** | gcc `btq` |
- | xmltok.c TU | **12×** stack-mem | **RA segments** | — |
- | inflate.c TU | **15×** stack-mem | **RA segments + switch** | — |
--| `struct_copy` | **21.06×** (585 vs 28 ms) | **ABI + XMM field copies** | gcc/icx: 2× ymm for 64 B `*dst=*src` |
-+| `struct_copy` | **1.54×** (41 vs 26 ms; was 21.06×, then 3.11×) | aggregate copy-forward fixed (param-set staleness, GEP-hoist, window over-rejection); remainder = scalar movsd chains vs GCC's paired mulpd | gcc/icx: 2× ymm for 64 B `*dst=*src` |
- | `dot` | vectorizer reduction exists | **ICX FMA YMM acc**; gcc16.2 worse | **copy ICX not GCC** |
- | nbody / spectral / mandelbrot | **2.9–3.8× / 9.3× S** | **non-reduction vectorize** | ICX nbody 97 ymm / 58 FMA; gcc 0 ymm / 24 FMA |
- | sqlite varint | **~2× S**; 189-inst inline **rejected** | **ISel branches**, not inline | — |
--- 
-2.47.3
-
+ def main() -> int:
+     p = argparse.ArgumentParser(description=__doc__)
+     p.add_argument("--archive", help="local gzip-1.14.tar.xz (otherwise pinned URL/cache)")
+     p.add_argument("--cache", type=Path, default=Path.home() / ".cache/lccc-workloads")
+     p.add_argument("--lccc", default="target/fastbuild/lccc")
++    p.add_argument(
++        "--lccc-control-env", action="append", default=[], metavar="NAME=VALUE",
++        help="also build a same-compiler kill-switch control with this environment; repeatable",
++    )
+     p.add_argument("--artifact-dir", type=Path, required=True)
+     p.add_argument("--rounds", type=int, default=9)
+     p.add_argument("--warmups", type=int, default=2)
+     args = p.parse_args()
++    control_env = parse_env_assignments(args.lccc_control_env)
+ 
+     archive = get_archive(args.archive, args.cache)
+     lccc = str(Path(args.lccc).resolve())
+@@ -262,6 +338,10 @@ def main() -> int:
+             "lccc": build_one("lccc", lccc, source, root, artifacts, gcc_include),
+             "gcc": build_one("gcc", gcc, source, root, artifacts, gcc_include),
+         }
++        if control_env:
++            builds["lccc-control"] = build_one(
++                "lccc-control", lccc, source, root, artifacts, gcc_include, control_env,
++            )
+         binaries = {k: Path(v["binary"]) for k, v in builds.items()}
+ 
+         # Correctness: complete compressed streams must be bit-identical, and
+@@ -315,8 +395,14 @@ def main() -> int:
+                     samples[case][key].append(timed(command_for(binaries[key]), inp, cpu))
+ 
+         summary, table = summarize(samples, "gcc")
++        treatment_control = None
++        treatment_table: list[str] = []
++        if control_env:
++            treatment_control, treatment_table = compare_treatment_control(
++                summary, "lccc", "lccc-control",
++            )
+         evidence = {
+-            "schema": 1,
++            "schema": 2,
+             "date_utc": datetime.now(timezone.utc).isoformat(),
+             "evidence_class": "VM wall-clock screening; no PMU",
+             "archive": {"url": ARCHIVE_URL, "path": str(archive),
+@@ -330,6 +416,7 @@ def main() -> int:
+             "rounds": args.rounds,
+             "warmups": args.warmups,
+             "summary": summary,
++            "treatment_vs_control": treatment_control,
+         }
+         (artifacts / "results.json").write_text(json.dumps(evidence, indent=2) + "\n")
+         report = [
+@@ -342,6 +429,8 @@ def main() -> int:
+             "",
+             *table,
+             "",
++            *treatment_table,
++            "" if treatment_table else "",
+             "The current archpkgbuilds recipe checksum differs from the repeatedly fetched",
+             "archive digest above; the archive signature was not verified in this run.",
+         ]
