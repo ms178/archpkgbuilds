@@ -1,450 +1,3653 @@
-From f94d0c2e02ef915417428cf53a8a0014a9dca0fa Mon Sep 17 00:00:00 2001
+From 95dcd905b04765c77cd55c3361e155855be6bc01 Mon Sep 17 00:00:00 2001
 From: Arena Agent <agent@arena.ai>
-Date: Fri, 21 Aug 2026 18:50:45 +0000
-Subject: [PATCH] ARM: adopt 2 audited levkropp fixes; fix 4 pre-existing
- backend bugs
+Date: Fri, 21 Aug 2026 21:42:04 +0000
+Subject: [PATCH] aarch64_fuzz: pin -ffp-contract=off; the 12 O2 'mismatches'
+ were false positives
 
-Audited adoptions from levkropp/lccc (guilty-until-proven-innocent review):
-- reuse_stack_loads_within_blocks (lev f958b6a fix e): only NOP a reload
-  when the loaded register is proven dead afterwards (overwritten without
-  intervening read, incl. MoveImm/MoveWide, or function end). Our pass
-  order (propagate_register_copies BEFORE reuse_stack_loads) made the old
-  unconditional NOP unsound: copy propagation could leave other readers
-  of the reloaded register (strlen_bench-class segfault).
-- propagate_address_aliases full-function rewrite (lev ed36c44): replace
-  the same-block-window deletion with a whole-function scan that tracks
-  source-register liveness and only deletes the defining mov when the
-  source provably survives to every use.
+The differential harness compared bitwise output of FP kernels compiled by
+lccc-arm and aarch64-gcc without pinning FP contraction. GCC defaults to
+-ffp-contract=fast on aarch64, and both compilers may legally contract
+a*b+c chains into fmadd at different points, giving standard-conforming
+but bitwise-different results (seed 25: the fa[i]=fs feedback loop
+amplifies one 0.5-ulp rounding difference into full hash divergence;
+verified: gcc -ffp-contract=off output == lccc output bit-for-bit).
 
-Pre-existing bugs found & fixed during the audit (all reproduced on main):
-1. ARM emit_reg_to_acc missing reg_cache.invalidate_acc(): the default
-   emit_gep path (reg-homed base after LICM GlobalAddr hoisting) left a
-   stale acc-cache entry, so emit_load_operand skipped loading the offset
-   and computed base+base -> SIGSEGV (hash_table benchmark at -O2).
-   x86-64/i686 already invalidate at the same point.
-2. ARM ICE 'invalid ARM register index': integer BinOp dest with an FP
-   register home reached callee_saved_name. Filter FP-homed dests in the
-   register-direct ALU path; stage FP-homed sources through x0 in
-   operand_to_callee_reg (fmov handled by operand_to_x0).
-3. ARM emit_load_indexed_impl paired ldrsw with a W destination register
-   for I32 GP-homed dests -- assembler error (ldrsw sign-extends into 64
-   bits and only accepts X). Use the X name for ldrsw.
-4. FP constant pool used '.align 16' which on AArch64/RISC-V gas means
-   2^16 = 64KiB per constant: massive .rodata bloat that pushed the pool
-   out of ldr-literal +/-1MB range (R_AARCH64_LD_PREL_LO19 truncation at
-   static link). Emit '.p2align 4' (16 bytes on every gas target).
+Root-cause evidence: recompiling the failing seed-25 objects with
+-ffp-contract=off made lccc and gcc byte-identical (aec79caa both);
+lccc emits no fmadd for the kernel, gcc does. All 12 remaining O2
+mismatches were this class (scen 0/2 FP-array kernels).
 
-New regression tests: arm_gep_regbase_acc_cache.c (bug 1),
-arm_fp_homed_int_binop.c (bugs 2/3/4 combined).
-
-Validation: 1005/1005 unit, 50/50 correctness, 390/390 x86 regression,
-ARM regression 239 pass (was 230 on main; 7 pre-existing failures fixed,
-0 new), x86-64 fuzz 300/300, m32 fuzz 200/200, aarch64 fuzz O1 60/60
-clean, O2 mismatches 24 -> 12 (rest pre-existing, under investigation).
+With contraction pinned, sweep extended to seeds 0:100 at O1/O2/Os =
+300/300 clean. lccc's own contraction behaviour stays covered by the
+fp-contract matrix regression (off/default/fast-math -> 0/1/0 fmadd).
 ---
- src/backend/arm/codegen/alu.rs               |  10 +-
- src/backend/arm/codegen/emit.rs              |  30 +++-
- src/backend/arm/codegen/memory.rs            |   9 +-
- src/backend/arm/codegen/peephole.rs          | 149 ++++++++++++++++---
- src/backend/state.rs                         |   8 +-
- tests/regression/arm_fp_homed_int_binop.c    |  33 ++++
- tests/regression/arm_gep_regbase_acc_cache.c |  38 +++++
- 7 files changed, 243 insertions(+), 34 deletions(-)
- create mode 100644 tests/regression/arm_fp_homed_int_binop.c
- create mode 100644 tests/regression/arm_gep_regbase_acc_cache.c
+ tests/fuzz/aarch64_fuzz.py | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
 
-diff --git a/src/backend/arm/codegen/alu.rs b/src/backend/arm/codegen/alu.rs
-index 2445be1..436b095 100644
---- a/src/backend/arm/codegen/alu.rs
-+++ b/src/backend/arm/codegen/alu.rs
-@@ -190,8 +190,14 @@ impl ArmCodegen {
-             }
-         }
- 
--        // Register-direct path
--        if let Some(dest_phys) = self.dest_reg(dest) {
-+        // Register-direct path. An FP-homed destination (d8-d14 / d16-d31,
-+        // possible since call-spanning F64 values allocate to the FP pool)
-+        // cannot take the GP three-operand form — callee_saved_name would
-+        // panic ("invalid ARM register index", aarch64_fuzz seed 17: an
-+        // integer BinOp whose result feeds an F64 conversion got an FP
-+        // home). Fall through to the accumulator path, which stages via
-+        // x0 and lets store_x0_to fmov into the FP register.
-+        if let Some(dest_phys) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
-             let dest_name = callee_saved_name(dest_phys);
-             let dest_name_32 = callee_saved_name_32(dest_phys);
- 
-diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
-index 805557b..2db5505 100644
---- a/src/backend/arm/codegen/emit.rs
-+++ b/src/backend/arm/codegen/emit.rs
-@@ -279,14 +279,21 @@ impl ArmCodegen {
-                 self.state.emit_fmt(format_args!("    mov {}, x0", reg_name));
-             }
-             Operand::Value(v) => {
--                if let Some(&src_reg) = self.reg_assignments.get(&v.0) {
--                    if src_reg.0 != reg.0 {
--                        let src_name = callee_saved_name(src_reg);
--                        self.state.emit_fmt(format_args!("    mov {}, {}", reg_name, src_name));
-+                match self.reg_assignments.get(&v.0).copied() {
-+                    // An FP-homed source (d8-d14 / d16-d31, possible since
-+                    // call-spanning F64 values allocate to the FP pool) has
-+                    // no GP alias — callee_saved_name panics on it. Stage
-+                    // through x0 (operand_to_x0 fmovs FP homes correctly).
-+                    Some(src_reg) if !is_arm_fp_phys(src_reg) => {
-+                        if src_reg.0 != reg.0 {
-+                            let src_name = callee_saved_name(src_reg);
-+                            self.state.emit_fmt(format_args!("    mov {}, {}", reg_name, src_name));
-+                        }
-+                    }
-+                    _ => {
-+                        self.operand_to_x0(op);
-+                        self.state.emit_fmt(format_args!("    mov {}, x0", reg_name));
-                     }
--                } else {
--                    self.operand_to_x0(op);
--                    self.state.emit_fmt(format_args!("    mov {}, x0", reg_name));
-                 }
-             }
-         }
-@@ -2141,6 +2148,15 @@ impl ArchCodegen for ArmCodegen {
-     fn emit_acc_to_secondary(&mut self) { self.state.emit("    mov x1, x0"); }
-     fn emit_reg_to_acc(&mut self, reg: PhysReg) {
-         self.state.emit_fmt(format_args!("    mov x0, {}", callee_saved_name(reg)));
-+        // x0 no longer holds whatever the cache recorded. x86-64 and i686
-+        // both invalidate here; ARM did not, so the default emit_gep's
-+        // general path (`emit_reg_to_acc(base); emit_acc_to_secondary();
-+        // emit_load_operand(offset)`) hit a stale acc entry for the OFFSET
-+        // and skipped its load — the address became base+base and hash_table
-+        // dereferenced table[h]+table[h] (SIGSEGV at -O2 once LICM hoisted
-+        // the GlobalAddr into a register home). Same bug class as levkropp
-+        // f958b6a's emit_load_indexed_impl cache-wipe finding.
-+        self.state.reg_cache.invalidate_acc();
-     }
-     fn emit_reg_to_addr(&mut self, reg: PhysReg) {
-         self.state.emit_fmt(format_args!("    mov x9, {}", callee_saved_name(reg)));
-diff --git a/src/backend/arm/codegen/memory.rs b/src/backend/arm/codegen/memory.rs
-index 51eb240..a415317 100644
---- a/src/backend/arm/codegen/memory.rs
-+++ b/src/backend/arm/codegen/memory.rs
-@@ -53,8 +53,6 @@ impl ArmCodegen {
-         }
-         // Integer dest with a GP register assignment: load straight into it.
-         if let Some(dphys) = self.get_phys_reg_for_value(dest.0).filter(|r| !is_arm_fp_phys(*r)) {
--            let wide = !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32);
--            let dname = if wide { callee_saved_name(dphys) } else { callee_saved_name_32(dphys) };
-             let instr = match ty {
-                 IrType::I8 => "ldrsb",
-                 IrType::U8 => "ldrb",
-@@ -63,6 +61,13 @@ impl ArmCodegen {
-                 IrType::I32 => "ldrsw",
-                 _ => "ldr",
-             };
-+            // ldrsw only accepts an X-register destination (it sign-extends
-+            // a word into 64 bits); using the W name is an assembler error.
-+            // ldrsb/ldrsh accept W (sign-extend within 32 bits), matching the
-+            // unassigned-dest path below (w0 for ldrsb/ldrsh, x0 for ldrsw).
-+            let wide = instr == "ldrsw"
-+                || !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32);
-+            let dname = if wide { callee_saved_name(dphys) } else { callee_saved_name_32(dphys) };
-             self.state.emit_fmt(format_args!("    {} {}, {}", instr, dname, addr));
-             self.state.reg_cache.invalidate_acc();
-             return true;
-diff --git a/src/backend/arm/codegen/peephole.rs b/src/backend/arm/codegen/peephole.rs
-index ced1e5d..d661aea 100644
---- a/src/backend/arm/codegen/peephole.rs
-+++ b/src/backend/arm/codegen/peephole.rs
-@@ -486,46 +486,109 @@ pub fn peephole_optimize(asm: String) -> String {
- /// Propagate a register copy used only as a memory-address alias within one
- /// basic block. This handles vector intrinsics where an SSA Copy gives the C
- /// pointer a short-lived register solely for `[xN]` loads/stores.
-+/// Propagate a register copy used only as a memory-address alias.
-+///
-+/// AUDITED ADOPTION of levkropp ed36c44: the previous version deleted the
-+/// defining `mov` after scanning only to the first block boundary — a
-+/// cross-block use of the alias then read a stale/clobbered register
-+/// (hash_table SIGSEGV at -O2, reproduced HERE the moment LICM hoisted
-+/// GlobalAddrs to the entry block and made address values multi-use).
-+/// The rewrite scans the full function text and deletes the mov only on
-+/// proven death of the alias (overwrite without read, or function end),
-+/// tracking src liveness so rewritten address uses never read a clobbered
-+/// source.
- fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-     fn mentions(line: &str, reg: u8) -> bool {
-         line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-             .any(|tok| tok == xreg_name(reg) || tok == wreg_name(reg))
-     }
-+    fn mention_count(line: &str, reg: u8) -> usize {
-+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-+            .filter(|tok| *tok == xreg_name(reg) || *tok == wreg_name(reg))
-+            .count()
-+    }
-+    // Column-0 identifier label: the next function or data object, i.e. the
-+    // end of the current function's text. Block labels start with '.', and
-+    // inline-asm numeric local labels (`1:`) start with a digit — neither
-+    // terminates the function's text.
-+    fn is_function_boundary(line: &str) -> bool {
-+        line.ends_with(':')
-+            && line.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-+    }
-     let mut changed = false;
-     for i in 0..n {
-         let LineKind::Move { dst, src, is_32bit: false } = kinds[i] else { continue };
-         if dst == src || dst >= 29 || src >= 29 { continue; }
-         let mut uses = Vec::new();
-         let mut valid = true;
-+        let mut provably_dead = false;
-+        let mut src_alive = true;
-         let mut j = i + 1;
-         while j < n {
--            if matches!(kinds[j], LineKind::Label | LineKind::Branch | LineKind::CondBranch
--                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret) { break; }
--            if written_gp_register(&lines[j], kinds[j]) == Some(src) {
--                let mut tail = j + 1;
--                while tail < n && !matches!(kinds[tail], LineKind::Label | LineKind::Branch
--                    | LineKind::CondBranch | LineKind::CmpBranch | LineKind::Call | LineKind::Ret)
--                {
--                    if mentions(&lines[tail], dst) { valid = false; }
--                    tail += 1;
--                }
-+            if is_function_boundary(&lines[j]) {
-+                provably_dead = true;
-                 break;
-             }
--            if written_gp_register(&lines[j], kinds[j]) == Some(dst) {
--                break;
--            }
--            if mentions(&lines[j], dst) {
--                let address = format!("[{}", xreg_name(dst));
--                if lines[j].contains(&address) {
--                    uses.push(j);
--                } else {
--                    valid = false;
--                    break;
-+            match kinds[j] {
-+                // No runtime effect. A return ends this path; textually later
-+                // lines belong to other paths, so keep scanning.
-+                //
-+                // Note: an epilogue's `ldp xD, ...` callee-save restore is NOT
-+                // treated as proof of death here — it ends the value only on
-+                // that return path, and textually later blocks (other paths)
-+                // may still use it, so it falls through to the plain-mention
-+                // handling and blocks the transform.
-+                LineKind::Nop | LineKind::Directive | LineKind::Label | LineKind::Ret => {}
-+                // Calls clobber src (x0) and all caller-saved registers. Rather
-+                // than reason about save/restore pairs, stop without committing.
-+                LineKind::Call => { valid = false; break; }
-+                _ => {
-+                    // Kinds whose destination register written_gp_register
-+                    // models precisely.
-+                    let trusted = matches!(kinds[j],
-+                        LineKind::Move { .. } | LineKind::MoveImm { .. }
-+                        | LineKind::MoveWide { .. } | LineKind::Sxtw { .. }
-+                        | LineKind::LoadSp { .. } | LineKind::LoadswSp { .. }
-+                        | LineKind::Alu | LineKind::Compare
-+                        | LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch
-+                        | LineKind::StoreSp { .. });
-+                    let written = written_gp_register(&lines[j], kinds[j]);
-+                    if (trusted && written == Some(src))
-+                        || (!trusted && mentions(&lines[j], src))
-+                    {
-+                        src_alive = false;
-+                    }
-+                    if mentions(&lines[j], dst) {
-+                        if trusted && written == Some(dst) && mention_count(&lines[j], dst) == 1 {
-+                            // dst overwritten without being read: the mov's
-+                            // value is dead past this instruction (register
-+                            // assignments are per-value with disjoint live
-+                            // intervals, so no later text can use the old value).
-+                            provably_dead = true;
-+                            break;
-+                        }
-+                        let address = format!("[{}", xreg_name(dst));
-+                        if src_alive && mention_count(&lines[j], dst) == 1
-+                            && lines[j].contains(&address)
-+                        {
-+                            // dst used purely as the address base of a
-+                            // load/store while src is alive: rewritable.
-+                            uses.push(j);
-+                        } else {
-+                            // Non-address use, an unmodelled effect, or an
-+                            // address use after src died: the mov must stay.
-+                            valid = false;
-+                            break;
-+                        }
-+                    }
-                 }
-             }
-             j += 1;
-         }
--        if valid && !uses.is_empty() {
-+        if j == n {
-+            provably_dead = true; // scanned to the end of the file
-+        }
-+        if valid && provably_dead && !uses.is_empty() {
-             for use_idx in uses {
-                 lines[use_idx] = replace_whole_word(&lines[use_idx], xreg_name(dst), xreg_name(src));
-                 kinds[use_idx] = classify_line(&lines[use_idx]);
-@@ -536,7 +599,6 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
-     }
-     changed
- }
--
- /// Fold an SSA pointer update that is copied back to its loop-carried register:
- /// `mov x0,xS; add x0,xS,#K; mov xT,x0; ...; mov xS,xT` → `add xS,xS,#K`.
- /// The scan proves neither xS nor xT is referenced in the intervening region.
-@@ -656,6 +718,49 @@ fn reuse_stack_loads_within_blocks(lines: &mut [String], kinds: &mut [LineKind],
-             if let LineKind::Move { dst, src, is_32bit } = kinds[j] {
-                 if src == load_reg {
-                     if let Some((_, _, source, source_word)) = old.filter(|entry| entry.3 == is_32bit) {
-+                        // NOPing the load is only sound if its register has no
-+                        // other readers before it is next fully overwritten —
-+                        // copy propagation (which runs BEFORE this pass) can
-+                        // move an instruction's reference onto the load's own
-+                        // register (rewriting `add x1, x5, x2` to read the
-+                        // copy source), and deleting the load would leave
-+                        // that read with stale contents. Audited adoption of
-+                        // levkropp f958b6a fix (e) (strlen_bench segfault on
-+                        // his tree; same pass order hazard exists here).
-+                        let xn = xreg_name(load_reg);
-+                        let wn = wreg_name(load_reg);
-+                        let mut load_dead_after = false;
-+                        let mut k = j + 1;
-+                        while k < n {
-+                            if kinds[k] == LineKind::Nop { k += 1; continue; }
-+                            let t = &lines[k];
-+                            let mentions = t
-+                                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-+                                .any(|tok| tok == xn || tok == wn);
-+                            if mentions {
-+                                // A pure single-register overwrite ends the
-+                                // hazard; anything else (reads, multi-dest
-+                                // loads like ldp) keeps the load alive.
-+                                load_dead_after = match kinds[k] {
-+                                    LineKind::Move { dst, src, .. } => dst == load_reg && src != load_reg,
-+                                    LineKind::MoveImm { dst } | LineKind::MoveWide { dst } => dst == load_reg,
-+                                    LineKind::LoadSp { reg, .. } | LineKind::LoadswSp { reg, .. } => reg == load_reg,
-+                                    _ => false,
-+                                };
-+                                break;
-+                            }
-+                            match kinds[k] {
-+                                LineKind::Label | LineKind::Branch | LineKind::CondBranch
-+                                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret
-+                                | LineKind::Directive => break,
-+                                _ => {}
-+                            }
-+                            k += 1;
-+                        }
-+                        if !load_dead_after {
-+                            i += 1;
-+                            continue;
-+                        }
-                         kinds[i] = LineKind::Nop;
-                         lines[j] = format!("    mov {}, {}",
-                             if is_32bit { wreg_name(dst) } else { xreg_name(dst) },
-diff --git a/src/backend/state.rs b/src/backend/state.rs
-index b5c833d..b8e3eb0 100644
---- a/src/backend/state.rs
-+++ b/src/backend/state.rs
-@@ -540,7 +540,13 @@ impl CodegenState {
-         let mut entries: Vec<_> = self.fp_const_pool.iter().collect();
-         entries.sort_by_key(|(_, label)| (*label).clone());
-         for (bits, label) in entries {
--            self.out.emit(".align 16");
-+            // .p2align, NOT .align: on AArch64/RISC-V gas `.align N` means
-+            // 2^N bytes, so `.align 16` silently requested 64KiB alignment
-+            // per constant. That bloated .rodata by ~64KiB per entry and
-+            // pushed the pool out of the AArch64 ldr-literal ±1MB range
-+            // (R_AARCH64_LD_PREL_LO19 truncation at static link). .p2align 4
-+            // is 16 bytes on every gas target.
-+            self.out.emit(".p2align 4");
-             self.out.emit_fmt(format_args!("{}:", label));
-             self.out
-                 .emit_fmt(format_args!("    .quad {}", *bits as i64));
-diff --git a/tests/regression/arm_fp_homed_int_binop.c b/tests/regression/arm_fp_homed_int_binop.c
-new file mode 100644
-index 0000000..d6d9fed
---- /dev/null
-+++ b/tests/regression/arm_fp_homed_int_binop.c
-@@ -0,0 +1,33 @@
-+// Regression: integer BinOp destination with an FP register home (d8-d14 /
-+// d16-d31) must not reach callee_saved_name ("invalid ARM register index"
-+// ICE). The register-direct ALU path must filter FP-homed dests and
-+// operand_to_callee_reg must stage FP-homed sources through x0.
-+// Derived from aarch64_fuzz seed 17 scenario at -O2.
-+typedef unsigned int u32; typedef int i32; typedef unsigned long long u64;
-+static volatile u32 V = 2241903810u;
-+static u32 H = 2166136261u;
-+static void mix(u32 v) { H = (H ^ v) * 16777619u; }
-+static u32 f2u(float f) { union { float f; u32 u; } c; c.f = f; return c.u; }
-+static u32 d2lo(double d) { union { double d; u64 u; } c; c.d = d; return (u32)c.u; }
-+static u32 d2hi(double d) { union { double d; u64 u; } c; c.d = d; return (u32)(c.u >> 32); }
-+static double m[16][16]; static int im[64];
-+u32 probe(i32 seed, i32 it) {
-+  double a = 1.0, b = 2.0, c = 3.0, d = 4.0, e = 5.0, f = 6.0, g = 7.0, h = 8.0;
-+  for (int i = 0; i < 64; i++) im[i] = i ^ seed;
-+  for (int i = 0; i < 16; i++)
-+    for (int j = 0; j < 16; j++)
-+      m[i][j] = (double)((im[i & 63] + j) & 31);
-+  for (int k = 0; k < 40; k++) {
-+    a += m[k & 15][k & 15] * 0.25; b -= a * 0.5; c += b * 0.125;
-+    d += c * 0.0625; e += d * 2.0; f -= e; g += f; h = h * 1.01 + g * 0.001;
-+  }
-+  mix(f2u(a)); mix(d2hi(h));
-+  return H;
-+}
-+int printf(const char *, ...);
-+int main(void) {
-+    u32 r = 0;
-+    for (int it = 0; it < 4; it++) r ^= probe((i32)(V + it), it);
-+    printf("%08x\n", r);
-+    return 0;
-+}
-diff --git a/tests/regression/arm_gep_regbase_acc_cache.c b/tests/regression/arm_gep_regbase_acc_cache.c
-new file mode 100644
-index 0000000..c5e5597
---- /dev/null
-+++ b/tests/regression/arm_gep_regbase_acc_cache.c
-@@ -0,0 +1,38 @@
-+// Regression: ARM emit_reg_to_acc must invalidate the accumulator cache.
-+// At -O2, LICM hoists GlobalAddrs into the entry block where they get
-+// register homes; the default emit_gep general path then does
-+// emit_reg_to_acc(base); emit_acc_to_secondary(); emit_load_operand(offset).
-+// Without invalidate_acc(), the stale acc cache claimed x0 already held the
-+// offset and skipped the load, computing address = base+base -> SIGSEGV.
-+// Expected output: 1998000
-+int printf(const char*,...);
-+void *malloc(unsigned long);
-+#define TABLE_SIZE 64
-+#define NUM_OPS 2000
-+typedef struct Entry { unsigned int key; int value; struct Entry *next; } Entry;
-+static Entry *table[TABLE_SIZE];
-+static unsigned int hash(unsigned int k) { return k & (TABLE_SIZE - 1); }
-+static void insert(unsigned int key, int value) {
-+    unsigned int h = hash(key);
-+    Entry *e = table[h];
-+    while (e) { if (e->key == key) { e->value = value; return; } e = e->next; }
-+    e = (Entry *)malloc(sizeof(Entry));
-+    e->key = key; e->value = value; e->next = table[h]; table[h] = e;
-+}
-+static int lookup(unsigned int key) {
-+    unsigned int h = hash(key);
-+    for (Entry *e = table[h]; e; e = e->next) if (e->key == key) return e->value;
-+    return -1;
-+}
-+int main(void) {
-+    unsigned int seed = 12345; long sum = 0;
-+    for (int i = 0; i < NUM_OPS; i++) { seed = seed*1664525u + 1013904223u; insert(seed, i); }
-+    seed = 12345;
-+    for (int i = 0; i < NUM_OPS; i++) { seed = seed*1664525u + 1013904223u; sum += lookup(seed); }
-+    for (int i = 0; i < NUM_OPS; i++) {
-+        seed = seed*1664525u + 1013904223u;
-+        if (i & 1) insert(seed, i); else sum += lookup(seed);
-+    }
-+    printf("%ld\n", sum);
-+    return 0;
-+}
+diff --git a/tests/fuzz/aarch64_fuzz.py b/tests/fuzz/aarch64_fuzz.py
+index e9ca2b56..133be9f3 100644
+--- a/tests/fuzz/aarch64_fuzz.py
++++ b/tests/fuzz/aarch64_fuzz.py
+@@ -154,7 +154,13 @@ def main() -> int:
+         for seed in range(lo, hi):
+             src = gen(seed)
+             (out / "t.c").write_text(src)
+-            common = ["-fno-PIE", "-w", "-fno-strict-aliasing", f"-{level}"]
++            # -ffp-contract=off: both compilers may legally contract a*b+c
++            # into fmadd differently (gcc defaults to -ffp-contract=fast);
++            # the differing roundings are standard-conforming, so a bitwise
++            # differential harness must pin contraction or it reports false
++            # positives on every FP scenario (was: 12 phantom mismatches at
++            # O2, scen 0/2 float-double kernels).
++            common = ["-fno-PIE", "-w", "-fno-strict-aliasing", "-ffp-contract=off", f"-{level}"]
+             r1 = subprocess.run([args.ccc] + common + ["-c", str(out / "t.c"), "-o", str(out / "l.o")], capture_output=True)
+             if r1.returncode:
+                 mismatches.append(f"seed{seed}: lccc compile fail: {r1.stderr.decode()[:160]}")
 -- 
 2.47.3
 
+diff --git a/README.md b/README.md
+index 5d11d9e..874e17a 100644
+--- a/README.md
++++ b/README.md
+@@ -58,45 +58,71 @@ https://github.com/ms178/lccc
+ 
+ | Compiler | Revision | Notes |
+ |---|---|---|
+-| **LCCC (ms178)** | [`f874a6fb`](https://github.com/ms178/lccc/commit/f874a6fb) | this fork, `main` after PR #70 (store/load forwarding, ARM memcpy fix, regalloc perf fix) |
+-| **LCCC (Lev)** | [`9beb4333`](https://github.com/levkropp/lccc/commit/9beb4333) | [levkropp/lccc](https://github.com/levkropp/lccc) `main` HEAD at measurement time |
++| **LCCC (ms178)** | [`bc992d69`](https://github.com/ms178/lccc/commit/bc992d69) | this fork, `main` `aa8bc98` (PR #178) + session 41/42 codegen fixes (SIB zero-extend tracking, immediate `imul`, BT direct index, 32-bit-write tracking, alias-aware SIMD temp promotion) |
+ | **GCC** | 14.2.0 (Debian 14.2.0-19) | external reference |
+ 
+ All compilers at `-O2`, identical sources, identical machine, same run window.
+-Driver: `bench/run_bench.sh`-style best-of-3 wall time; every binary's output
+-is compared against the GCC baseline (a mismatch disqualifies the number).
+-
+-## Results (seconds, lower is better)
+-
+-| Kernel | What it stresses | ms178 `f874a6fb` | GCC 14.2 | Lev `9beb4333` | ms178 vs GCC | ms178 vs Lev |
+-|---|---|---:|---:|---:|---:|---:|
+-| fib(38) | binary recursion → TCE/rec2iter | **0.003** | 0.068 | 0.352 | **22.7× faster** | **117× faster** |
+-| csum (adler-like) | serial dependency chains | 0.192 | 0.104 | 0.215 | 1.8× slower | 1.12× faster |
+-| hashloop (FNV) | int mul/xor + table traffic | 0.159 | 0.083 | 3.304 | 1.9× slower | **21× faster** |
+-| sieve (3×10M) | branchy int loops, stores | 0.209 | 0.166 | 0.304 | 1.26× slower | 1.45× faster |
+-| reduction (dot) | FP reduction vectorization | 1.273 | 0.593 | 1.293 | 2.1× slower | 1.02× faster |
+-| nbody (3M steps) | scalar FP, sqrt, locals | 0.984 | 0.260 | 1.147 | 3.8× slower | 1.17× faster |
+-| matmul (384³ ikj) | loop-nest FP, addressing | 0.287 | 0.055 | *wrong result* ⚠ | 5.2× slower | n/a ⚠ |
+-| spectral (N=800) | FP div/sqrt inner loops | 0.200 | 0.044 | 0.422 | 4.5× slower | 2.11× faster |
+-
+-⚠ Lev `9beb4333` **miscompiles** the matmul kernel (checksum 159 ≠ 0): his
+-reduction vectorizer lacks this fork's IV-dependent-GEP-base guard, so the
+-diagonal-sum consumer reads out-of-bounds-adjacent data. The same latent bug
+-class previously **segfaulted** on this fork too and was fixed in PR #69
+-(`tests/regression/vectorize_iv_dependent_base.c`).
++Driver: `tests/benchmark/run_benchmarks.py` (canonical runner). Paired
++median wall time, randomized compiler order, warm-ups excluded; every binary's
++output is checksummed against the GCC baseline (a mismatch disqualifies the
++number). Measured 2026-08-21 in the shared 2-core VM (no PMU); screening
++evidence only.
++
++## Results (ratio = LCCC/GCC; < 1 means LCCC faster)
++
++| Kernel | What it stresses | LCCC median | GCC median | LCCC/GCC | Correct |
++|---|---|---:|---:|---:|:---:|
++| `fib` | binary recursion → TCE/rec2iter | 2.52 ms | 173.02 ms | **0.014** (69× faster) | pass |
++| `ackermann` | deep recursion | 2.48 ms | 150.72 ms | **0.016** (61× faster) | pass |
++| `constant_recursion` | constant recursive specialization | 2.51 ms | 150.87 ms | **0.016** (61× faster) | pass |
++| `bitops` | integer selection, popcount idioms | 260.56 ms | 392.50 ms | **0.664** (1.5× faster) | pass |
++| `matmul` | loop-nest FP + reduction FMA | 7.75 ms | 9.71 ms | **0.840** (1.2× faster) | pass |
++| `binary_search` | branch-heavy lookup | 2.28 ms | 2.37 ms | **0.952** | pass |
++| `ascii_case_fold` | parser byte loop | 2.46 ms | 2.41 ms | 0.995 | pass |
++| `ring_fifo` | dependent loads | 2.25 ms | 2.24 ms | 0.997 | pass |
++| `qsort` | libc branches | 127.54 ms | 126.64 ms | 1.010 | pass |
++| `strlen_bench` | byte loops | 235.44 ms | 233.14 ms | 1.013 | pass |
++| `tce_sum` | tail-recursive accumulator | 2.24 ms | 2.14 ms | 1.052 | pass |
++| `switch_dispatch` | switch lowering | 528.84 ms | 504.43 ms | 1.052 | pass |
++| `gzip_crc32` | gzip CRC-32 table loop | 179.92 ms | 168.86 ms | 1.067 | pass |
++| `arith_loop` | 32-variable register pressure | 112.85 ms | 101.74 ms | 1.112 | pass |
++| `histogram` | indexed increment/reduction | 2.88 ms | 2.52 ms | 1.123 | pass |
++| `hash_table` | pointer chasing | 12.23 s | 10.77 s | 1.129 | pass |
++| `binary_trees` | allocation + recursion | 1.639 s | 1.426 s | 1.147 | pass |
++| `sieve` | branchy int stores | 46.26 ms | 37.82 ms | 1.224 | pass |
++| `glibc_memcmp` | aligned-word memcmp path | 11.75 ms | 9.22 ms | 1.275 | pass |
++| `fannkuch` | permutations | 3.314 s | 2.542 s | 1.303 | pass |
++| `mandelbrot` | FP branch-heavy loop | 2.107 s | 1.489 s | 1.418 | pass |
++| `struct_copy` | aggregate copy + ABI | 41.36 ms | 27.42 ms | 1.514 | pass |
++| `zlib_ng_adler32` | Adler-32 NMAX accumulator | 63.07 ms | 39.41 ms | 1.588 | pass |
++| `loop_patterns` | scalar loop transforms | 127.44 ms | 78.21 ms | 1.629 | pass |
++| `linux_find_bit` | sparse bit search | 25.24 ms | 14.78 ms | 1.697 | pass |
++| `sqlite_varint` | varint decoder | 44.92 ms | 26.09 ms | 1.718 | pass |
++| `expat_xml_scan` | XML name-token scan | 78.44 ms | 40.47 ms | 1.962 | pass |
++| `nbody` | N-body FP structs | 984.30 ms | 305.55 ms | 3.221 | pass |
++| `spectral_norm` | dense FP | 791.51 ms | 202.02 ms | 3.908 | pass |
++
++**Aggregate (29 correct pairs): geometric mean 0.8205, arithmetic mean 1.2640.**
++Best `fib` 0.0144; worst `spectral_norm` 3.908.
+ 
+ ## Reading the table honestly
+ 
+-- **vs Lev**: this fork is faster on every kernel that Lev compiles correctly
+-  (1.02×–117×), and correct where he is not (matmul). The 21×/117× outliers are
+-  optimizations Lev's tree lacks entirely (FNV loop codegen, rec2iter + TCE).
+-- **vs GCC**: one structural win (recursion folding, 23×), near-parity on
+-  branchy int code (sieve 1.26×), and a real 2–5× deficit concentrated in FP
+-  code. Root causes are known and unchanged: accumulator round-trips in FP
+-  codegen, no x86 FMA contraction, and no general loop-nest vectorization
+-  (GCC vectorizes matmul's jk plane; LCCC only the reduction idiom).
++- **Where LCCC wins**: recursion folding (`fib`/`ackermann`/
++  `constant_recursion` — TCE + rec2iter, 60–69× vs GCC's exponential
++  recursion), hand-rolled popcount recognition (`bitops` 1.5× via `popcntl`),
++  and reduction FMA vectorization (`matmul` 1.2×). These lift the geomean
++  below 1.0 even though several codec/parser kernels trail.
++- **Where GCC wins**: dense/non-reduction FP (`spectral_norm` 3.9×,
++  `nbody` 3.2× — no general loop-nest vectorization, no FMA contraction,
++  accumulator round-trips), and a cluster of parser/codec kernels in the
++  1.5–2.0× band (`expat_xml_scan` 1.96×, `sqlite_varint` 1.72×,
++  `linux_find_bit` 1.70×, `loop_patterns` 1.63×, `zlib_ng_adler32` 1.59×).
++  These are the tracked structural gaps — see
++  [`engineering/agent/BACKLOG.md`](engineering/agent/BACKLOG.md) (segment
++  register allocation, accumulator-centric ISel, SysV aggregate ABI, Expat
++  single-table classify).
+ - Every number above was produced by a **correct** binary; correctness is
+-  enforced before speed is recorded.
++  enforced before speed is recorded (checksums byte-identical to GCC).
+ 
+ ## Where LCCC wins
+ 
+diff --git a/docs/history/2026-08-21-session41-x86-isel-peephole-sweep.md b/docs/history/2026-08-21-session41-x86-isel-peephole-sweep.md
+new file mode 100644
+index 0000000..5cb0323
+--- /dev/null
++++ b/docs/history/2026-08-21-session41-x86-isel-peephole-sweep.md
+@@ -0,0 +1,204 @@
++# Session 41 — x86 ISel / peephole sweep + oracle hardening (2026-08-21)
++
++Base: `ms178/lccc` main `aa8bc98` (PR #178). Build: `target/fastbuild`
++(`opt-level=1`, no LTO, 2 jobs, 8 GB swap). Host: 2-core VM, no PMU —
++all evidence is assembly diff + instruction count + VM runtime screening.
++
++## TL;DR
++
++Five low-risk, high-frequency codegen fixes landed this session. Each one
++removes an instruction (or a full staging copy) from hot integer loops on
++every x86-64 build, with zero semantic change:
++
++| # | Fix | File(s) | Effect | Gate |
++|---|-----|---------|--------|------|
++| 1 | Zero-extend tracking broke on SIB memory operands | `redundant_ext.rs` | re-enables `movzbl %al,%eax` removal after `movzbl (base,idx),%eax` | unit + 1010 lib |
++| 2 | Constant multiplies staged through `%rcx` | `alu.rs` | `imull $imm,%eax,%eax` (1 insn) vs `movq $imm,%rcx; imull %rcx,%eax` | unit + 389 regr |
++| 3 | BT bit-index staged through `%rcx` | `alu.rs` | `btl %rN,%dest` direct (BT has no fixed count reg) | unit + 389 regr |
++| 4 | 32-bit ALU writes not tracked as upper-32-zero | `redundant_ext.rs` | `movl %esi,%r12d` vs `movq %rsi,%r12` after addl/subl chains | unit + 389 regr |
++| 5 | Linker oracle: pin `MOLD_LTO=OFF`, record resolved revisions | `setup_oracles.sh` | reproducible oracle revisions | bash -n |
++
++Validation: **1010 unit tests, 389 regression + 1 skip, 50/50 correctness,
++1008→1010 `cargo test --lib`, byte-identical runtime checksums** — all green.
++No gzip `longest_match` stack-mem regression (the RA veto).
++
++## 1. Zero-extend tracking broke on SIB memory operands (IS-08)
++
++**Root cause.** `redundant_ext::self_update` split operands at the **first**
++comma. For a SIB load `movzbl (%rcx,%r12),%eax` the first comma sits *inside*
++the address, so `dst` parsed as `"%r12), %eax"`, `family_of_reg` returned
++`None`, and the `is_byte`/`upper32_zero` fact for `%rax` was never recorded.
++The redundant re-extension `movzbl %al,%eax` (emitted by the I8→U32 cast
++after an indexed byte load) therefore survived in every table-lookup loop.
++
++**Latent soundness bug fixed in the same change.** An opaque 64-bit SIB load
++`movq (%rcx,%r12),%rax` hit the same parse failure in the `movq` handler and
++**failed to clear** the stale byte fact for `%rax` — a later `movzbl %al,%eax`
++could have been wrongly removed (upper bits of a loaded pointer survive).
++
++**Fix.** Split at the **last** comma (AT&T puts the destination last) in every
++operand split inside `self_update`. `rfind(',')` is unambiguous for the
++2-operand forms these handlers accept.
++
++**Tests added.** `removes_byte_reextension_after_sib_memory_load`,
++`removes_16bit_reextension_after_sib_memory_load`,
++`sib_memory_movq_load_clears_byte_fact` (soundness control).
++
++## 2. Constant multiplies staged through `%rcx`
++
++`i * 1664525` (gzip LCG fill) and the Adler DO8 weighted sum emitted
++`movq $7,%rcx; imull %ecx,%eax`. IMUL has a 3-operand immediate form.
++Emit `imull $imm,%eax,%eax` (32-bit) / `imulq $imm,%rax,%rax` (64-bit)
++directly in the general binop path and the fused multiply-add path.
++
++**Width correctness.** The 32-bit form accepts any imm32 bit pattern
++(`N ≡ -1 mod 2^32`, so the low 32 bits are exact); the 64-bit form is
++restricted to the signed i32 range because imm32 sign-extends. Uses the
++existing `const_as_imm32_typed`.
++
++## 3. BT bit-index staged through `%rcx`
++
++`(x >> i) & 1` lowering forced the bit index through `%rcx`
++(`movq %r10,%rcx; btl %ecx,%eax`) because the comment wrongly claimed BT has
++a "fixed count register" (that restriction belongs to variable shifts/`%cl`).
++BT's index is an ordinary r/m operand. Consume the index straight from its
++own register (`btl %r10d,%eax`), guarding the dest-aliasing case in the
++register-direct path. Also removed a **dead** `movq %r10,%rcx` the text
++peephole had already bypassed in the Expat name-scan classify.
++
++`tests/regression/check_bit_test_canonical.sh` updated to assert the general
++register-index BT shape instead of the staging register (oracle update, not
++regression-hiding: the canonical BT still fires).
++
++## 4. 32-bit ALU writes are upper-32-zero
++
++`addl/subl/andl/orl/leal/imull/sall/shll/shrl/sarl/cmovl*` write the low 32
++bits and zero-extend to 64 on x86-64, but the tracker only recorded
++`movl/xorl/movzbl/movzwl`; every other 32-bit write fell into the
++"clear everything" fallback. So `addl %eax,%esi; movq %rsi,%r12` never
++narrowed to `movl %esi,%r12d` (Adler DO8). Added a writer whitelist;
++`cmpl`/`testl` deliberately excluded (flags-only, leave the value alone).
++
++## 5. Linker oracle hardening
++
++`tests/linker/setup_oracles.sh` already honoured the build/version policy
++(mold+wild from git HEAD, `-DMOLD_TARGETS='X86_64;I386'` fast preset,
++mimalloc off, bfd 2.47 pinned). Added `-DMOLD_LTO=OFF` (explicit — LTO would
++slow the constrained-host oracle build) and a resolved-revision record
++(`ORACLE_REVISIONS.txt`) so each session's docs cite the exact mold/wild
++commit instead of an unreproducible "HEAD".
++
++---
++
++## Remaining gaps (do not re-derive — this is the map)
++
++All measured on this session's build; instruction counts are `-O2
++-march=x86-64-v3` whole-file unless noted.
++
++### A. Adler-32 kernel — 1.53× GCC (deepest codec gap now)
++
++`tests/benchmark/programs/zlib_ng_adler32.c`, DO8 loop (`LBB18`). Root cause:
++the reassoc pass expands `sum2 += sum1` ×8 into the closed form
++`sum2 += 8*sum1 + 8*b0 + 7*b1 + … + 1*b7`, which **materialises all eight
++bytes simultaneously** and spills `sum1` (`128(%rsp)` reload twice per
++iteration) and `sum2` (`104(%rsp)`).
++
++GCC/ICX instead interleave a **parallel prefix-sum**: keep `sum1` as the
++running prefix (`esi`), keep `sum2` in a register, and accumulate the weighted
++sum into a second register with a tree (`a0=s1+b0; b1'=a0+b1; r11=b1'+b2; …
++eax=a0+b1'+r11+r10+…; sum2+=eax`) — ~26 insns, 0 stack. This is a
++**delayed-accumulation / prefix-sum reassociation**, not an RA fix. The
++current lccc closed form is *correct* but pressure-hostile. Candidates:
++
++1. In the `reassoc_accum` (or whichever pass produces the closed form), refuse
++   the transform when the number of materialised byte temporaries exceeds the
++   allocatable-GPR budget (register-pressure cost model, §25 of the mandate).
++2. Or recognise the `s += a; a += b` shape and emit the prefix-sum tree.
++
++Also present but secondary: a dead `movq %rax,24(%rsp)` spill-store of the
++`4*b4` intermediate, and `movq %rdx,%rcx` dead staging copies in the sum2
++tail — symptoms of the same pressure problem.
++
++### B. struct_copy — 1.53× GCC (ABI + SROA, OP-02 blocked)
++
++`tests/benchmark/programs/struct_copy.c`. The by-value `Particle`/`Group`
++path keeps every field in stack slots (39 stack-mem) and re-loads per field;
++GCC passes aggregates in XMM/YMM and copies 64 B with 2× `ymm` pairs.
++This is `OP-02` (dominator-aware SROA copy-out, **BLOCKED** — hangs
++`structs_bitfields`, `simd_sse_float` without a dominance/ABI proof) plus
++`AB-01`/`AB-02` (SysV SSE-class return/args). Do **not** enable
++`CCC_SROA_COPYOUT`; the block is real.
++
++### C. Expat name scan — 1.90× GCC (classify + branch structure)
++
++`expat_utf8_name_length`. The classify is already BT-based after OP-15, but
++GCC lowers the *whole* `xml_name_continue` to a single 256-bit table probe
++(`btq %rax, table(%rip)`), while lccc still splits start/continue into ~28
++insns with per-case `movq $1,%r; jmp` blocks. Merge the two bit-tests into one
++table, then fold the multi-byte width ladder (`c2..df → 2`, `e0..ef → 3`,
++`f0..f4 → 4`) into range arithmetic. The 1.90× is branch-prediction shaped
++(the VM has a weak predictor), so instruction-count reduction alone may not
++close it — needs PMU on the 14700KF.
++
++### D. RA-01 / IS-26 — PIE-mode `leaq sym(%rip)` re-materialised in loops
++
++In PIC/PIE mode the indexed-symbol base cannot fold into a memory operand
++(no RIP-relative SIB), so `emit_load_indexed_sym_impl` / the register form
++materialise `leaq sym(%rip),%base` **inside the loop** (gzip CRC `.LBB12`
++has two per-iteration `leaq`s). `classify_site_local_indexed`
++(`src/passes/global_addr_cse.rs:94`) deliberately keeps variable-index bases
++site-local to preserve the non-PIE `sym(,%idx,4)` fold — but in PIC/PIE mode
++that fold is impossible, so hoisting is correct *and* profitable.
++
++Fix sketch: plumb the code model into the pass pipeline (`run_passes` takes
++`target` but not pic/pie); when position-independent, let
++`classify_site_local_indexed` hoist the base to the innermost preheader (the
++`choose_placement` machinery already implements preheader hoisting for
++non-indexed bases). Then `emit_load_indexed` (register form) consumes the
++hoisted base. Kill-switch `CCC_NO_GLOBAL_ADDR_REMAT` already exists for A/B.
++Expected: CRC loop 16→14 insns, and the gzip `longest_match` 36 stack-mem /
++`leaq window(%rip)` per-iteration is the same defect.
++
++### E. RA-05 / RA-06 — the #1 remaining perf gap (do not half-do)
++
++`live_range.rs` still scans **fat** `intervals`; `segments` (hole-aware) is
++built but only consumed by `regalloc.rs` for call-spanning. Wimmer-style
++in-place splitting + reload-at-next-use is the 3–5× spill-traffic fix for
++xmltok/inflate (12×/15× stack-mem). This is the single highest-value item and
++the most delicate; gate on `enable_splitting`. Do not attempt without the
++full differential battery (600 phi + 540 alias + gzip 30/30).
++
++### F. Accumulator staging cleanup (easy wins, same class as §3)
++
++Several kernels still emit dead staging copies that the text peephole leaves
++behind: Adler `movq %rdx,%rcx` (dead), CRC `movl %eax,%edi` before
++`andl $255,%edi` (could be destructive `andl $255,%eax`), and the
++`movq→movl` narrowing's single-instruction lookahead misses
++`movq %rax,%r9; movl %ebx,%eax; movl %r9d,%ecx`. Extend the narrowing
++profitability filter to the first consumer of the destination register
++within the block (stop at labels/calls/64-bit consumers) — provably safe on
++top of the existing upper-32-zero proof.
++
++---
++
++## How to reproduce
++
++```bash
++scripts/ensure_swap.sh && scripts/build_lccc_fast.sh
++python3 tests/benchmark/run_benchmarks.py --only gzip_crc32,zlib_ng_adler32,struct_copy,expat_xml_scan --compilers lccc,gcc --lccc ./target/fastbuild/lccc --opt=-O2 --reps 11
++python3 scripts/godbolt.py compare tests/benchmark/programs/gzip_crc32.c --local target/fastbuild/lccc --oracles gcc16.2,clang,icx --flags '-O2 -march=x86-64-v3'
++cargo test --profile fastbuild --lib
++CCC=./target/fastbuild/lccc bash tests/regression/run_regression.sh
++```
++
++## Scoreboard snapshot (this session, VM screening, 11 reps, paired median)
++
++| Kernel | LCCC | GCC | ratio |
++|---|---:|---:|---:|
++| gzip_crc32 | 181.67 ms | 169.69 ms | 1.07× |
++| zlib_ng_adler32 | 62.79 ms | 40.27 ms | 1.56× |
++| struct_copy | 45.24 ms | 29.45 ms | 1.53× |
++| expat_xml_scan | 77.77 ms | 41.25 ms | 1.89× |
++
++Checksums byte-identical on every kernel. No PMU on this host; treat ratios
++as screening, not hardware claims.
+diff --git a/docs/history/2026-08-21-session42-vector-temp-promotion-redteam.md b/docs/history/2026-08-21-session42-vector-temp-promotion-redteam.md
+new file mode 100644
+index 0000000..09c48c5
+--- /dev/null
++++ b/docs/history/2026-08-21-session42-vector-temp-promotion-redteam.md
+@@ -0,0 +1,73 @@
++# Session 42 — vector temp-promotion red-team audit (2026-08-21)
++
++Base: `ms178/lccc` main `aa8bc98` (PR #178). Build: `target/fastbuild`
++(`opt-level=1`, no LTO, 2 jobs, 8 GB swap). Host: 2-core VM, no PMU.
++
++## TL;DR
++
++Red-team audit of Agent D's rewrite of `src/passes/vector_temp_promotion.rs`
++(the late SIMD cleanup: temp promotion, direct-load fusion, alignment
++downgrade). The rewrite is a major correctness improvement over the prior
++517-line version and was adopted, after fixing four defects found during the
++audit. Assembly is byte-identical to the pre-rewrite compiler on the entire
++34-file benchmark + SIMD-pattern corpus (A/B diffed), and every test gate is
++green.
++
++## What the rewrite gets right (verified, kept)
++
++1. **Alias-aware promotion window.** The old `no_var_access_between` only saw
++   *syntactic* uses of the destination alloca; a read through a `GEP`/`Copy`
++   alias of the destination slipped through and reordered a store past it.
++   `analyze_destination` + `destination_unobserved_between` close this with a
++   pointer-alias fixpoint plus a whole-function escape gate. New test
++   `derived_alias_read_in_window_blocks_promotion` pins the fix.
++2. **Full-width result gating.** Promotion now requires
++   `op.vector_result_width() == alloca_size` and `dest: Some`, and rejects
++   volatile/semantic-volatile slots — strictly safer than the old code.
++3. **Direct-load set is address-correct.** `direct_vector_load_width` only
++   admits 1-argument full-width loads (`Loaddqu`, `Loadu256/256/uPs/uPd256`).
++   The old code also admitted the 2-argument `VecLoadF64x4(base, offset)` and
++   forwarded **base alone**, dropping the offset — a latent miscompile.
++4. **Memory-write invalidation exists at all.** The old fuse had *no*
++   invalidation: `v = load(p); v = setzero(); use(v)` forwarded `use(v)` to the
++   stale `p`. The rewrite tracks writes and kills pending forwards.
++5. **`vmovdqu`-only memory accesses verified in the backend.** `Load256`
++   emits a register-register `vmovdqa` after `avx_load_arg`'s `vmovdqu`, and
++   every slot store/load is `vmovdqu`/`movdqu` — so `_Alignas` on a
++   non-escaping vector alloca is genuinely unobservable and the downgrade is
++   sound. `Alloca`-vs-`Param`/`Global` disjointness is sound via the
++   fresh-object argument (a param is fixed at entry, before the callee frame's
++   allocas exist).
++6. **Source-span-preserving instruction removal.** `remove_instructions` keeps
++   `BasicBlock.source_spans` in lockstep (the old rebuild dropped spans).
++
++## Defects found and fixed
++
++| # | Defect | Severity | Fix |
++|---|--------|----------|-----|
++| 1 | `invalidate_for_pointer_write` checked only *source-vs-write* disjointness, so a write through the loaded **slot itself** (`Setzero256 -> %v`) left the stale forward alive | **miscompile** | also require *slot-vs-write* disjointness (`roots.get(slot)` vs `write_root`) |
++| 2 | `pointer_roots` did not propagate through `Add`/`Sub`, so a load source `a + i*32` (int pointer-arithmetic, folded by LCCC) had **no root** and was treated as "may alias anything" — the second load's write killed the first forward, **un-fusing** `x = a[i]; y = b[i]; acc = op(x,y)` (regression vs the old pass, caught by A/B diff) | perf regression | propagate the root through `Add`/`Sub` when exactly one operand is rooted |
++| 3 | `intrinsic_arg_allows_unaligned_alloca` allowed `LoadF64x4/LoadF64x2/LoadI32x8/LoadI32x4 => index < 2`; index 1 is the **byte offset** (an address-foldable integer) | latent unsoundness | `index == 0` |
++| 4 | `dest_ptr: None` invalidation exempted `produces_vector_value()` (dead code, foot-gun); load removal ignored the load's `dest` SSA result | fail-closed gaps | `!is_pure → clear`; removal requires both slot and `dest` uses to be zero |
++
++## Validation
++
++- **1022** `cargo test --lib` unit tests (12 in this module, incl. new
++  regression tests for defects 1–4).
++- **389 + 1 skip** regression suite, **50/50** correctness, **60/60** O2
++  differential fuzz — all green.
++- **A/B assembly diff**: every file in `tests/benchmark/programs/*.c` +
++  `tests/benchmark/patterns/*.c` (34 files) compiles to **byte-identical**
++  assembly before/after the rewrite (`-O2 -march=x86-64-v3`), plus a
++  hand-written `_mm256` loop.
++- **Benchmark gate** (lccc vs gcc, 9 reps, paired median, checksums verified):
++  gzip_crc32 1.07×, zlib_ng_adler32 1.56×, expat_xml_scan 1.90×,
++  struct_copy 1.53× — unchanged from the pre-rewrite baseline.
++
++## Pre-existing, out of scope (recorded for later)
++
++`tests/intrinsics/cases/{t128_fp,t256_fp,t512_int}.c` fail with **semantic
++errors** (`__lccc_simd256_ps_vshufps256` "too few arguments"): the test cases
++pass the imm8 in GCC's position, which does not match the bundled
++`immintrin.h`'s `__lccc_simd*` signatures. This is a frontend/header mismatch,
++unrelated to any optimization pass; it fails identically before this change.
+diff --git a/docs/history/2026-08-21-session43-vector-promotion-v2-redteam.md b/docs/history/2026-08-21-session43-vector-promotion-v2-redteam.md
+new file mode 100644
+index 0000000..76450de
+--- /dev/null
++++ b/docs/history/2026-08-21-session43-vector-promotion-v2-redteam.md
+@@ -0,0 +1,87 @@
++# Session 43 — red-team audit of Agent D's vector-temp-promotion v2 (2026-08-21)
++
++Base: `ms178/lccc` main `aa8bc98` (PR #178). Build: `target/fastbuild`
++(`opt-level=1`, no LTO, 2 jobs, 8 GB swap). Host: 2-core VM, no PMU.
++
++## TL;DR
++
++Audited Agent D's v2 of `src/passes/vector_temp_promotion.rs` (SIMD temp
++promotion / load fusion / alignment relaxation) and adopted it after fixing
++two soundness holes it re-introduced plus two fail-closed gaps. The claimed
++A/B numbers are **reproduced** against the session-42 revision. All gates
++green; the 34-file benchmark corpus is byte-identical (the pass only fires on
++SIMD-intrinsic code).
++
++## v2's wins over session 42 (verified, kept)
++
++| Kernel | s42 insns | v2 insns | s42 frame | v2 frame |
++|---|---:|---:|---:|---:|
++| `simd_avx2_256` | 743 | **734** | 1016 | **824** |
++| `simd_movnt` | 422 | **390** | 440 | **392** |
++| `simd_avx2_defer_chain` | 121 | 121 | 88 | 88 |
++| `simd_crc_adler` | 1371 | 1371 | 360 | 360 |
++| `simd_defer_chain` | 329 | 329 | 568 | 568 |
++| `vector_defer_multidef_slot` | 565 | 565 | 1048 | 1048 |
++
++Two mechanisms produce the wins, both verified sound against the backend:
++
++1. **Non-temporal stores relax to 16, not 32.** `movntdq`/`movntpd` require
++   exactly 16-byte alignment; `Movnti`/`Movnti64` require none. The x86 slot
++   allocator (`prologue.rs` `assign_slot`) gives `align=16` a 16-aligned
++   *direct* slot (with the FPO mod-16 shift) and only `align>16` pays the
++   runtime `lea/add/and` dance, so `Some(16)` is both sound and cheap.
++   Session 42 fail-closed (`safe.remove`) and kept align 32 for any `dest_ptr`
++   store; v2's `intrinsic_dest_required_alignment` relaxes `Storeu*/Store*/FMA`
++   destinations to 0 (all lowered `vmovdqu`/`movdqu`) and `Movntdq/Movntpd` to 16.
++2. **`pointer_vector_arg_width` unifies forwarding + alignment.** A single
++   width-typed table classifies each intrinsic argument as vector-valued
++   (forwardable, align-0) or scalar/immediate/address (fail closed), with
++   mixed-width cases (`Insert128to256`, `Broadcast128to256`, `Cast256to128`)
++   handled per-index.
++
++Also kept: non-escaping-alloca alias refinement (`local_alias_facts`), the
++`Add`/`Sub` object-root propagation for folded pointer arithmetic (from
++session 42), the ptr-only `Cast` root edge (soundness fix over session 42's
++unconditional cast propagation), load-load chaining, single-read-site gating
++for multi-use AVX values, and the conservative/exact split alias graphs.
++
++## Defects found and fixed in v2
++
++| # | Defect | Severity | Fix |
++|---|--------|----------|-----|
++| 1 | `invalidate_for_value_write` ignored the **slot** key (`retain(\|_, load\|)`), checking only source-vs-write. `v = load(p); v = setzero(); use(v)` therefore kept the forward and `use(v)` read the stale source `p` (the exact reassignment miscompile fixed in session 42). | **miscompile** | `write_may_clobber(pointer, target, …)` now tests slot-vs-write *and* source-vs-write; a write through the slot itself kills the forward |
++| 2 | `VecStoreI64x2` appears in `produces_vector_value` (slot sizing) but is the memory-form store that writes through `args[1]` with `dest_ptr: None` (`emit_vec_store_addr`). The `dest_ptr: None` invalidation arm exempted it, leaving stale forwards across its write. | **miscompile** | the exemption excludes `VecStoreI64x2` (full barrier) |
++| 3 | Load removal ignored the load's `dest` SSA result — a future lowering exposing the register result would be broken by deletion. | fail-closed gap | removal also requires the `dest` result to have zero readers |
++| 4 | `destination_unobserved_between` early-return was convoluted. | clarity | split into explicit `escaped` / empty-window cases |
++
++## Missed-optimization opportunities implemented
++
++The six 256-bit widening extensions (`Pmovzxbw256 | Pmovzxbd256 | Pmovzxwd256 |
++Pmovsxbw256 | Pmovsxbd256 | Pmovsxwd256`, i.e. `_mm256_cvtepu8_epi16` & co.)
++read a **128-bit** source through `sse_load_arg` (`movdqu`) and were absent
++from the argument table, so their source loads could not be forwarded and
++their source allocas could not relax alignment. Added `(index == 0) → 16`.
++
++## Validation
++
++- **1033** `cargo test --lib` (23 in this module, incl. new
++  `intrinsic_write_to_slot_invalidates_pending_load`,
++  `vec_store_memory_form_is_a_forwarding_barrier`,
++  `widening_extension_reads_a_128_bit_source`).
++- **389 + 1 skip** regression suite (all `simd_*`, `vector_defer_*`,
++  `temp_promotion_window`, `state_leak`, `loop_alloca_scalar` pass), **50/50**
++  correctness, **60/60** O2 differential fuzz — all green.
++- **Runtime**: a standalone `movntdq` test (32-aligned local array, two
++  `_mm_stream_si128` + `_mm_sfence`) runs and matches GCC; the emitted
++  `movntdq` has **no** runtime alignment dance (relaxed 32→16).
++- **A/B**: 34-file benchmark + SIMD-pattern corpus byte-identical vs session
++  42 (no intrinsics there); SIMD regression corpus improves as tabulated.
++- Gate kernels unchanged: gzip_crc32 1.07×, zlib_ng_adler32 1.55×,
++  expat_xml_scan 1.89×, struct_copy 1.51×, matmul **1.17× faster** (checksums
++  byte-identical).
++
++## Pre-existing, out of scope (unchanged from session 42)
++
++`tests/intrinsics/cases/{t128_fp,t256_fp,t512_int}.c` fail in **semantic
++analysis** (imm8 argument-order mismatch between the test cases and the
++bundled `immintrin.h`), unrelated to any optimization pass.
+diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
+index 81369e5..e24c4af 100644
+--- a/engineering/agent/BACKLOG.md
++++ b/engineering/agent/BACKLOG.md
+@@ -361,3 +361,6 @@ engineering/evidence/workloads/
+ - ✅ **`LivenessResult::segments`** — hole-aware intervals, consumed for call-spanning (scan still fat).
+ - ✅ **`alias.rs`** — `LoopFrames`, `resolve_in_frame`, `forms_disjoint` (consumed by `redundant_loads` only).
+ - ✅ **Engineering doc tree** — `engineering/{STATE.md, agent/{BACKLOG,RULES,SEQUENCE,README}.md, evidence/godbolt/}`.
++- ✅ **Session 43** — red-team of Agent D's vector-temp-promotion v2: adopted (movnt align-16 relaxation via `intrinsic_dest_required_alignment`, unified width-typed `pointer_vector_arg_width`, non-escaping-alloca alias refinement, load-load chaining, single-read-site gating) and fixed two miscompiles it re-introduced — (1) `invalidate_for_value_write` dropped the slot-vs-write check (reassignment `v=load(p); v=setzero(); use(v)` read stale `p`), now a `write_may_clobber` slot+source test; (2) `VecStoreI64x2` writes memory through `args[1]` with `dest_ptr:None` but inherited the `produces_vector_value` register-result exemption. Also re-added the load-`dest` dead check and added the six 256-bit widening extensions (Pmovzx*/Pmovsx*256) to the forwardable/relaxable table. Measured: simd_movnt 422→390 insns / frame 440→392; simd_avx2_256 743→734 / 1016→824. See `docs/history/2026-08-21-session43-vector-promotion-v2-redteam.md`.
++- ✅ **Session 42** — red-team audit of `vector_temp_promotion.rs` (late SIMD cleanup): adopted Agent D's alias-aware rewrite (escape-gated promotion window, object-root load fusion with write invalidation, fail-closed alignment whitelist, span-preserving removal) and fixed four audit-found defects — (1) slot-identity invalidation in `invalidate_for_pointer_write` (reassignment miscompile), (2) `Add`/`Sub` root propagation in `pointer_roots` (param-derived load sources were "may alias anything" and un-fused), (3) `LoadF64x4/2,LoadI32x8/4` downgrade whitelist narrowed to `index == 0` (offset arg), (4) fail-closed `dest_ptr: None` invalidation + load-`dest` dead check. A/B: 34-file corpus byte-identical; 1022 unit + 389 regression + 50 correctness + 60 fuzz green. See `docs/history/2026-08-21-session42-vector-temp-promotion-redteam.md`.
++- ✅ **Session 41** — `redundant_ext.rs` SIB comma fix (zero-extend tracking re-enabled after indexed loads; also fixes a latent stale-byte-fact soundness bug on opaque SIB `movq` loads); 3-operand immediate `imul` for constant multiplies; BT bit-index consumed from its own register (no `%rcx` staging; `check_bit_test_canonical` oracle widened); 32-bit ALU writes tracked as upper-32-zero (enables `movq→movl` narrowing after `addl`/`subl` chains); `setup_oracles.sh` pins `MOLD_LTO=OFF` and records resolved oracle revisions. See `docs/history/2026-08-21-session41-x86-isel-peephole-sweep.md`.
+diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
+index 3ababfa..be8cbd2 100644
+--- a/src/backend/x86/codegen/alu.rs
++++ b/src/backend/x86/codegen/alu.rs
+@@ -244,9 +244,34 @@ impl X86Codegen {
+             let bt = if use_32bit { "btl" } else { "btq" };
+             self.state.emit_fmt(format_args!("    {bt} ${bit}, %{dest64}"));
+         } else {
+-            self.operand_to_rcx(index);
++            // BT's bit index is an ordinary r/m operand — it has no fixed
++            // count register (that restriction belongs to variable shifts,
++            // which use %cl).  Consume the index's own register directly when
++            // it has one; only a home-less value needs %rcx staging.  The old
++            // unconditional `movq %rN, %rcx; btl %ecx, %dest` paid a copy plus
++            // a partial-register dependency per classify (Expat name scan).
+             let bt = if use_32bit { "btl" } else { "btq" };
+-            self.state.emit_fmt(format_args!("    {bt} %rcx, %{dest64}"));
++            let own_reg = match index {
++                Operand::Value(v) => self.reg_assignments.get(&v.0).copied(),
++                _ => None,
++            };
++            match own_reg {
++                // The base was just staged into dest, so an index sharing
++                // dest's register is clobbered — stage those via %rcx.
++                Some(reg) if !super::emit::is_xmm_reg(reg) && reg != dest_phys => {
++                    let idx = if use_32bit {
++                        super::emit::phys_reg_name_32(reg)
++                    } else {
++                        super::emit::phys_reg_name(reg)
++                    };
++                    self.state.emit_fmt(format_args!("    {bt} %{idx}, %{dest64}"));
++                }
++                _ => {
++                    self.operand_to_rcx(index);
++                    let src = if use_32bit { "ecx" } else { "rcx" };
++                    self.state.emit_fmt(format_args!("    {bt} %{src}, %{dest64}"));
++                }
++            }
+         }
+         self.state.emit_fmt(format_args!("    setc %{dest8}"));
+         // ALWAYS zero-extend: SETcc writes one byte only, and the
+@@ -288,11 +313,12 @@ impl X86Codegen {
+ 
+         if op == IrBinOp::BitTest {
+             // Use the native BT instruction: base stays in %rax, the index is
+-            // moved into %rcx (BT's fixed count register), SETC materializes
+-            // CF, and the boolean is stored to the destination.  This is the
+-            // cross-cutting canonical lower instead of patching text peepholes.
++            // consumed from its own register when it has one (BT's index is an
++            // ordinary r/m operand — only variable shifts are pinned to %cl),
++            // SETC materializes CF, and the boolean is stored to the
++            // destination.  This is the cross-cutting canonical lower instead
++            // of patching text peepholes.
+             self.emit_load_operand(lhs);
+-            self.operand_to_rcx(rhs);
+             if let Some(imm) = Self::const_as_imm32(rhs) {
+                 let width = if use_32bit { 32 } else { 64 };
+                 let bit = (imm as u32) % width;
+@@ -303,7 +329,29 @@ impl X86Codegen {
+                 };
+                 self.state.emit(&bt_line);
+             } else {
+-                self.state.emit(if use_32bit { "    btl %ecx, %eax" } else { "    btq %rcx, %rax" });
++                // %rax is not allocatable on x86-64, so a register-resident
++                // index can never be clobbered by the base load above.  A
++                // value without a home still stages through %rcx.
++                let own_reg = match rhs {
++                    Operand::Value(v) => self.reg_assignments.get(&v.0).copied(),
++                    _ => None,
++                };
++                match own_reg {
++                    Some(reg) if !super::emit::is_xmm_reg(reg) => {
++                        let idx = if use_32bit {
++                            super::emit::phys_reg_name_32(reg)
++                        } else {
++                            super::emit::phys_reg_name(reg)
++                        };
++                        let dst = if use_32bit { "eax" } else { "rax" };
++                        let bt = if use_32bit { "btl" } else { "btq" };
++                        self.state.emit_fmt(format_args!("    {bt} %{idx}, %{dst}"));
++                    }
++                    _ => {
++                        self.operand_to_rcx(rhs);
++                        self.state.emit(if use_32bit { "    btl %ecx, %eax" } else { "    btq %rcx, %rax" });
++                    }
++                }
+             }
+             self.state.emit("    setc %al");
+             self.state.emit(if use_32bit { "    movzbl %al, %eax" } else { "    movzbq %al, %rax" });
+@@ -432,6 +480,29 @@ impl X86Codegen {
+             }
+         }
+ 
++        // Immediate multiply: `imull $imm, %eax, %eax` (3-operand immediate
++        // form) is one instruction and needs no scratch register, versus the
++        // two-instruction `movq $imm, %rcx; imull %ecx, %eax` general path.
++        // IMUL with imm32 sign-extends the immediate; for the 32-bit form any
++        // 32-bit bit pattern yields the correct low 32 bits (N ≡ -1 mod 2^32),
++        // so the typed helper's unsigned extension is sound there. The 64-bit
++        // form is restricted to the signed i32 range.
++        if op == IrBinOp::Mul {
++            let imm = Self::const_as_imm32_typed(rhs, use_32bit);
++            if let Some(imm) = imm {
++                if use_32bit {
++                    self.operand_to_eax(lhs);
++                    self.state.emit_fmt(format_args!("    imull ${}, %eax, %eax", imm));
++                    self.store_eax_to(dest);
++                } else {
++                    self.operand_to_rax(lhs);
++                    self.state.emit_fmt(format_args!("    imulq ${}, %rax, %rax", imm));
++                    self.store_rax_to(dest);
++                }
++                return;
++            }
++        }
++
+         // General case: load lhs to rax, rhs to rcx
+         if use_32bit { self.operand_to_eax(lhs); } else { self.operand_to_rax(lhs); }
+         self.operand_to_rcx(rhs);
+@@ -569,6 +640,18 @@ impl X86Codegen {
+             }
+         }
+ 
++        // Immediate multiply: fold the constant into the 3-operand immediate
++        // form instead of staging it in %rcx first (`imull $imm, %eax, %eax`).
++        if let Some(imm) = Self::const_as_imm32_typed(mul_rhs, use_32bit) {
++            if use_32bit {
++                self.state.emit_fmt(format_args!("    imull ${}, %eax, %eax", imm));
++            } else {
++                self.state.emit_fmt(format_args!("    imulq ${}, %rax, %rax", imm));
++            }
++            self.emit_fused_add_acc(acc, add_dest, use_32bit);
++            return;
++        }
++
+         // Register-source multiply
+         self.operand_to_rcx(mul_rhs);
+         if use_32bit {
+diff --git a/src/backend/x86/codegen/peephole/passes/redundant_ext.rs b/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
+index 272c6af..c9ce425 100644
+--- a/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
++++ b/src/backend/x86/codegen/peephole/passes/redundant_ext.rs
+@@ -192,7 +192,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
+ 
+         // --- Pattern: movzbl %AL, %EAX (redundant re-zero-extend) ---
+         if t.starts_with("movzbl ") || t.starts_with("movzbq ") {
+-            if let Some(comma) = t.find(',') {
++            if let Some(comma) = t.rfind(',') {
+                 // Guard the operand slice.
+                 //
+                 // `so` is derived from the first space; slicing `t[so..comma]`
+@@ -262,7 +262,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
+             && !t.contains('(') {
+             // reg-reg form only (memory sources are handled by the flag
+             // update below: movzwl mem,%eax already zero-extends).
+-            if let Some(comma) = t.find(',') {
++            if let Some(comma) = t.rfind(',') {
+                 // Guard the operand slice.
+                 //
+                 // `so` is derived from the first space; slicing `t[so..comma]`
+@@ -332,7 +332,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
+         // contain an arbitrary 64-bit value, and immediate operands are left
+         // to other constant-materialization patterns.
+         if t.starts_with("movq") && !t.contains('(') {
+-            if let Some(comma) = t.find(',') {
++            if let Some(comma) = t.rfind(',') {
+                 const MOVQ_LEN: usize = "movq".len();
+                 let so = MOVQ_LEN;
+                 let mut so = so.min(t.len());
+@@ -408,6 +408,20 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
+ }
+ 
+ /// Update the upper32_zero/is_byte/is_16 tracking based on a single instruction.
++/// Mnemonics whose 32-bit form writes the low 32 bits of the destination and
++/// zero-extends to 64 bits on x86-64.  `cmpl`/`testl` deliberately do NOT
++/// appear: they only set flags and leave the register value untouched.
++fn is_32bit_zero_extend_write(op: &str) -> bool {
++    matches!(
++        op,
++        "addl" | "subl" | "andl" | "orl" | "leal" | "imull"
++            | "sall" | "shll" | "shrl" | "sarl"
++            | "cmovl" | "cmovel" | "cmovnel" | "cmovsl" | "cmovns"
++            | "cmovgl" | "cmovgel" | "cmovll" | "cmovlel"
++            | "cmovbl" | "cmovael" | "cmovbel" | "cmoval"
++    )
++}
++
+ fn self_update(
+     t: &str,
+     upper32_zero: &mut Vec<bool>,
+@@ -442,7 +456,7 @@ fn self_update(
+     // 64-bit consumers. Harmless for stores: movq %reg, mem changes no
+     // register flags.)
+     if op == "movq" && t.contains('%') {
+-        if let Some(comma) = t.find(',') {
++        if let Some(comma) = t.rfind(',') {
+             // Split "movq <src>, <dst>" at the FIRST comma that separates the
+             // operands -- but only when the mnemonic really ends before it.
+             //
+@@ -486,7 +500,7 @@ fn self_update(
+     // Byte zero-extension into a register sets upper32_zero, is_byte AND
+     // is_16 (a byte value fits in 16 bits).
+     if op.starts_with("movzbl") {
+-        if let Some(comma) = t.find(',') {
++        if let Some(comma) = t.rfind(',') {
+             let dst = t[comma + 1..].trim();
+             if let Some(df) = family_of_reg(dst) {
+                 if (df as usize).lt(&upper32_zero.len()) {
+@@ -500,7 +514,7 @@ fn self_update(
+     }
+     // 16-bit zero-extension: upper-32 zero, fits-16, but NOT a byte.
+     if op.starts_with("movzwl") || op.starts_with("movzwq") || op.starts_with("movz") {
+-        if let Some(comma) = t.find(',') {
++        if let Some(comma) = t.rfind(',') {
+             let dst = t[comma + 1..].trim();
+             if let Some(df) = family_of_reg(dst) {
+                 if (df as usize).lt(&upper32_zero.len()) {
+@@ -515,7 +529,26 @@ fn self_update(
+     // movl / xorl: zero-extends to 32 bits, but NOT necessarily a byte or
+     // 16-bit value.
+     if op == "movl" || op == "xorl" {
+-        if let Some(comma) = t.find(',') {
++        if let Some(comma) = t.rfind(',') {
++            let dst = t[comma + 1..].trim();
++            if let Some(df) = family_of_reg(dst) {
++                if (df as usize).lt(&upper32_zero.len()) {
++                    upper32_zero[df as usize] = true;
++                    is_byte[df as usize] = false;
++                    is_16[df as usize] = false;
++                }
++            }
++        }
++        return;
++    }
++    // Any other 32-bit ALU write (addl, subl, andl, orl, leal, imull, shifts,
++    // cmovl) zero-extends to 64 bits on x86-64, so the destination family is
++    // upper-32-zero (but not byte/16-bit-known).  Without this, an
++    // accumulator chain like `addl %eax, %esi` CLEARED the fact via the
++    // conservative fallback below, and a following `movq %rsi, %r12` never
++    // narrowed to the shorter, dependency-free `movl %esi, %r12d`.
++    if is_32bit_zero_extend_write(op) {
++        if let Some(comma) = t.rfind(',') {
+             let dst = t[comma + 1..].trim();
+             if let Some(df) = family_of_reg(dst) {
+                 if (df as usize).lt(&upper32_zero.len()) {
+@@ -623,4 +656,72 @@ mod tests {
+         assert_eq!(asm.matches("movzbl").count(), 1, "asm was:\n{asm}");
+         assert!(asm.contains("movzbl (%rdi), %eax"), "asm was:\n{asm}");
+     }
++
++    #[test]
++    fn removes_byte_reextension_after_sib_memory_load() {
++        // The comma inside the SIB memory operand must not confuse operand
++        // splitting: the load still records a byte fact for %eax, so the
++        // register re-extension is a no-op (gzip CRC / table-index shape).
++        let asm = run(
++            "f:\n\
++             \x20   movzbl (%rcx, %r12), %eax\n\
++             \x20   movzbl %al, %eax\n"
++        );
++        assert_eq!(asm.matches("movzbl").count(), 1, "asm was:\n{asm}");
++        assert!(asm.contains("movzbl (%rcx, %r12), %eax"), "asm was:\n{asm}");
++    }
++
++    #[test]
++    fn removes_16bit_reextension_after_sib_memory_load() {
++        let asm = run(
++            "f:\n\
++             \x20   movzwl (%rcx, %rdi, 2), %eax\n\
++             \x20   movzwl %ax, %eax\n"
++        );
++        assert_eq!(asm.matches("movzwl").count(), 1, "asm was:\n{asm}");
++        assert!(asm.contains("movzwl (%rcx, %rdi, 2), %eax"), "asm was:\n{asm}");
++    }
++
++    #[test]
++    fn narrows_copy_after_32bit_alu_accumulation() {
++        // 32-bit ALU writes zero-extend: after `addl`/`subl` the accumulator
++        // family is upper-32-zero, so a 64-bit copy into a 32-bit consumer
++        // narrows to `movl`.
++        let asm = run(
++            "f:\n\
++             \x20   movl 128(%rsp), %esi\n\
++             \x20   addl %r15d, %esi\n\
++             \x20   subl $45, %esi\n\
++             \x20   movq %rsi, %r12\n\
++             \x20   addl %eax, %r12d\n"
++        );
++        assert!(asm.contains("movl %esi, %r12d"), "asm was:\n{asm}");
++        assert!(!asm.contains("movq %rsi, %r12"), "asm was:\n{asm}");
++    }
++
++    #[test]
++    fn does_not_claim_32bit_fact_from_flags_only_ops() {
++        // cmpl/testl only set flags; they must not mark the operand register
++        // upper-32-zero.  A 64-bit copy after them stays 64-bit.
++        let input = "f:\n    cmpl %edx, %esi\n    movq %rsi, %r12\n";
++        let mut asm = input.to_string();
++        let _ = eliminate_redundant_zero_extend(&mut asm);
++        assert_eq!(asm, input, "cmpl must not create an upper-32-zero fact");
++    }
++
++    #[test]
++    fn sib_memory_movq_load_clears_byte_fact() {
++        // SOUNDNESS: an opaque 64-bit load through a SIB address must clear
++        // the stale byte fact for %rax, otherwise the following re-extension
++        // would be wrongly removed (upper bits of a loaded pointer survive).
++        let input = "f:\n\
++             \x20   movzbl (%rdi), %eax\n\
++             \x20   movq (%rcx, %r12), %rax\n\
++             \x20   movzbl %al, %eax\n";
++        let mut asm = input.to_string();
++        let _ = eliminate_redundant_zero_extend(&mut asm);
++        // The trailing movzbl must survive: %rax holds an opaque load result.
++        assert!(asm.contains("movzbl %al, %eax"), "asm was:\n{asm}");
++        assert!(asm.contains("movq (%rcx, %r12), %rax"), "asm was:\n{asm}");
++    }
+ }
+diff --git a/src/passes/vector_temp_promotion.rs b/src/passes/vector_temp_promotion.rs
+index 147bc1c..06df177 100644
+--- a/src/passes/vector_temp_promotion.rs
++++ b/src/passes/vector_temp_promotion.rs
+@@ -1,513 +1,1602 @@
+-//! Promote short-lived SIMD vector temporaries into their destination variable
+-//! slots, eliminating the compiler-introduced `Memcpy` + temp alloca produced by
+-//! vector intrinsic lowering.
++//! Late cleanup for pointer-backed SIMD values.
++//!
++//! LCCC's C intrinsic lowering represents a 128/256-bit vector value by the
++//! address of a stack home.  Source assignments consequently tend to leave
++//! this shape in late IR:
+ //!
+-//! Every Vec128/Vec256 intrinsic lowers to:
+ //! ```text
+-//!   %tmp = Alloca(16|32)                       // temp result slot
+-//!   %d   = Intrinsic { op, dest_ptr: %tmp, .. } // backend writes %ymm0 -> *%tmp
+-//!   ...   the C expression value is the *pointer* %tmp ...
+-//!   %var = Alloca(16|32)                       // the C variable (over-aligned)
+-//!   Memcpy { dest: %var, src: %tmp, size }     // aggregate assignment
++//!   %tmp = alloca 32, align 32
++//!   intrinsic op(...), dest_ptr = %tmp
++//!   memcpy %var, %tmp, 32
+ //! ```
+-//! The Memcpy forces a 16/32-byte copy plus a runtime-alignment dance, and the
+-//! temp alloca inflates the frame. When `%tmp` is used only by the Intrinsic
+-//! (as `dest_ptr`) and by exactly one Memcpy (as `src`), we point the
+-//! Intrinsic's `dest_ptr` at `%var`, drop the Memcpy and the temp alloca, and
+-//! let the backend write the result straight into the variable's slot.
+-//! Subsequent intrinsics then read the variable slot directly, which also
+-//! enables the backend's memory-operand folding (e.g. `vpcmpeqb slot,%ymm0,%ymm0`).
+ //!
+-//! Safety: the rewrite is only applied when (a) the Intrinsic and the Memcpy are
+-//! in the same block with the Intrinsic first, (b) `%tmp` has exactly two uses
+-//! (the Intrinsic `dest_ptr` and the one Memcpy `src`), so no other read/write
+-//! can observe the temp, and (c) the Intrinsic's args are evaluated before the
+-//! write in IR order, preserving `x = op(x, y)` semantics.
++//! This module performs three related, deliberately conservative cleanups:
++//!
++//! 1. write a full-width intrinsic result directly to `%var` and remove the
++//!    temporary/copy;
++//! 2. forward a direct SIMD load's source into a compatible pointer-backed
++//!    vector consumer when intervening memory effects cannot change it;
++//! 3. relax unobservable alignment above 16 bytes to the cheapest alignment
++//!    required by the remaining uses.  Most vector homes become ordinary
++//!    stack slots; operations such as `movntdq` retain their mandatory 16-byte
++//!    alignment without paying the >16-byte runtime-addressing cost.
++//!
++//! Correctness is fail-closed.  Unequal SSA IDs are not an alias proof,
++//! pointer-derived aliases are followed, atomics/fences/volatile accesses are
++//! forwarding barriers, and only explicitly classified intrinsic arguments
++//! may consume forwarded vector bytes.  Keeping the intrinsic signature table
++//! here small and explicit is intentional: an unknown operation loses an
++//! optimization rather than changing the program.
+ 
+ use crate::common::fx_hash::{FxHashMap, FxHashSet};
++use crate::common::types::IrType;
+ use crate::ir::instruction::Instruction;
+-use crate::ir::reexports::{IrFunction, IrModule, Operand, Value};
++use crate::ir::intrinsics::IntrinsicOp;
++use crate::ir::reexports::{BasicBlock, IrFunction, IrModule, Operand, Value};
++use std::collections::VecDeque;
+ 
+-/// Run the vector-temp promotion across all functions.
+-pub(crate) fn promote_vector_temps(module: &mut IrModule) -> usize {
+-    let mut total = 0usize;
+-    for func in &mut module.functions {
+-        if func.is_declaration || func.blocks.is_empty() {
+-            continue;
++#[derive(Clone, Copy, Debug)]
++struct AllocaInfo {
++    block: usize,
++    instruction: usize,
++    size: usize,
++    volatile: bool,
++    semantic_volatile: bool,
++}
++
++fn map_capacity(func: &IrFunction) -> usize {
++    let cached = func.next_value_id as usize;
++    if cached != 0 {
++        return cached.clamp(8, 4096);
++    }
++    func.blocks
++        .iter()
++        .map(|block| block.instructions.len())
++        .sum::<usize>()
++        .clamp(8, 4096)
++}
++
++fn collect_allocas(func: &IrFunction) -> FxHashMap<u32, AllocaInfo> {
++    let mut allocas = FxHashMap::with_capacity_and_hasher(
++        (map_capacity(func) / 8).max(8),
++        Default::default(),
++    );
++    for (block_idx, block) in func.blocks.iter().enumerate() {
++        for (instruction_idx, inst) in block.instructions.iter().enumerate() {
++            if let Instruction::Alloca {
++                dest,
++                size,
++                volatile,
++                semantic_volatile,
++                ..
++            } = inst
++            {
++                allocas.insert(
++                    dest.0,
++                    AllocaInfo {
++                        block: block_idx,
++                        instruction: instruction_idx,
++                        size: *size,
++                        volatile: *volatile,
++                        semantic_volatile: *semantic_volatile,
++                    },
++                );
++            }
+         }
+-        total += promote_in_function(func);
+     }
+-    total
++    allocas
+ }
+ 
+-struct Rewrite {
+-    block: usize,
+-    intrinsic: usize,
+-    memcpy: usize,
+-    tmp: u32,
+-    var: u32,
++/// Direct, full-width loads for which `args[0]` denotes exactly the bytes
++/// written to `dest_ptr`.  Offset, masked and partial loads are excluded.
++fn direct_vector_load_width(op: IntrinsicOp) -> Option<usize> {
++    match op {
++        IntrinsicOp::Loaddqu => Some(16),
++        IntrinsicOp::Loadu256
++        | IntrinsicOp::Load256
++        | IntrinsicOp::LoaduPs256
++        | IntrinsicOp::LoaduPd256 => Some(32),
++        _ => None,
++    }
+ }
+ 
+-fn promote_in_function(func: &mut IrFunction) -> usize {
+-    // 1. Collect alloca sizes and use-counts for alloca values.
+-    let mut alloca_sizes: FxHashMap<u32, usize> = FxHashMap::default();
+-    let mut uses: FxHashMap<u32, usize> = FxHashMap::default();
+-    for block in &func.blocks {
+-        for inst in &block.instructions {
+-            if let Instruction::Alloca { dest, size, .. } = inst {
+-                alloca_sizes.insert(dest.0, *size);
+-            }
+-            for v in inst.used_values() {
+-                *uses.entry(v).or_insert(0) += 1;
+-            }
++/// Width of a pointer-backed vector operand at an intrinsic argument position.
++///
++/// This is both a type-safety gate for load forwarding and part of alignment
++/// relaxation.  Address operands (for example the base of `LoadF64x4`) are
++/// deliberately not vector-value operands even though the backend also reads
++/// memory through them.  Scalar/immediate positions are likewise excluded.
++fn pointer_vector_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
++    use IntrinsicOp as O;
++
++    if let Some(width) = direct_vector_load_width(op) {
++        return (index == 0).then_some(width);
++    }
++    match op {
++        // Mixed-width AVX lane construction/casts.
++        O::Broadcast128to256 | O::Zext128to256 => {
++            return (index == 0).then_some(16);
+         }
+-        for v in block.terminator.used_values() {
+-            *uses.entry(v).or_insert(0) += 1;
++        O::Cast256to128 => return (index == 0).then_some(32),
++        O::Insert128to256 => {
++            return match index {
++                0 => Some(32),
++                1 => Some(16),
++                _ => None,
++            };
++        }
++        // 128->256-bit widening extensions read a 128-bit source.
++        O::Pmovzxbw256 | O::Pmovzxbd256 | O::Pmovzxwd256
++        | O::Pmovsxbw256 | O::Pmovsxbd256 | O::Pmovsxwd256 => {
++            return (index == 0).then_some(16);
+         }
++        _ => {}
+     }
+ 
+-    // 2. Find intrinsic(dest_ptr=%tmp) ... Memcpy(dest=%var, src=%tmp) pairs.
+-    let mut rewrites: Vec<Rewrite> = Vec::new();
+-    for (bi, block) in func.blocks.iter().enumerate() {
+-        // tmp value -> index of the preceding Intrinsic that writes it.
+-        let mut intrinsic_at: FxHashMap<u32, usize> = FxHashMap::default();
+-        for (ii, inst) in block.instructions.iter().enumerate() {
++    let width = match op {
++        // 128-bit stores and scalar extract/reduction consumers.
++        O::Storedqu | O::Storeldi128 | O::Movntdq | O::Movntpd
++        | O::Pmovmskb128 | O::Cvtsi128Si32 | O::Cvtsi128Si64
++        | O::HorizontalAddF64x2 | O::HorizontalAddI32x4
++        | O::Pabsb128 | O::Pabsw128 | O::Pabsd128
++        | O::Pmovzxbw128 | O::Pmovzxwd128 | O::Aesimc128 => {
++            return (index == 0).then_some(16);
++        }
++
++        // Unary 128-bit vector + immediate forms.
++        O::Aeskeygenassist128 | O::Pslldqi128 | O::Psrldqi128
++        | O::Psllqi128 | O::Psrlqi128 | O::Psllwi128 | O::Psrlwi128
++        | O::Psrawi128 | O::Psradi128 | O::Pslldi128 | O::Psrldi128
++        | O::Pshufd128 | O::Pshuflw128 | O::Pshufhw128
++        | O::Pextrw128 | O::Pextrd128 | O::Pextrb128 | O::Pextrq128
++        | O::Pinsrw128 | O::Pinsrd128 | O::Pinsrb128 | O::Pinsrq128 => {
++            return (index == 0).then_some(16);
++        }
++
++        // Binary 128-bit vector operations.  Operations with an immediate
++        // have that immediate after the two vector operands.
++        O::Pcmpeqb128 | O::Pcmpeqd128 | O::Psubusb128 | O::Psubsb128
++        | O::Por128 | O::Pand128 | O::Pxor128
++        | O::AddPs128 | O::SubPs128 | O::MulPs128
++        | O::AddPd128 | O::SubPd128 | O::MulPd128
++        | O::Pmuludq128 | O::Pmuldq128 | O::Pmulld128
++        | O::Paddw128 | O::Psubw128 | O::Paddb128 | O::Psubb128
++        | O::Psubusw128 | O::Psadbw128 | O::Pmullw128
++        | O::Pmaddubsw128 | O::Phaddw128 | O::Phaddd128
++        | O::Pshufb128 | O::Palignr128 | O::Pmaxub128 | O::Pminub128
++        | O::Pblendw128 | O::Pclmulqdq128
++        | O::Aesenc128 | O::Aesenclast128 | O::Aesdec128 | O::Aesdeclast128
++        | O::Psllw128 | O::Psrlw128 | O::Pmulhw128 | O::Pmaddwd128
++        | O::Pcmpgtw128 | O::Pcmpgtb128 | O::Paddd128 | O::Psubd128
++        | O::Packssdw128 | O::Packsswb128 | O::Packuswb128
++        | O::Punpcklbw128 | O::Punpckhbw128 | O::Punpcklwd128 | O::Punpckhwd128
++        | O::Paddusb128 | O::Paddsb128 | O::Paddusw128 | O::Paddsw128
++        | O::Psubsw128 | O::Pandn128 | O::Pcmpeqw128 | O::Pcmpgtd128
++        | O::Pavgb128 | O::Pavgw128 | O::Pminsw128 | O::Pmaxsw128
++        | O::Pmulhuw128 | O::Paddq128 | O::Psubq128
++        | O::Punpckldq128 | O::Punpckhdq128 | O::Punpcklqdq128
++        | O::Punpckhqdq128 | O::AddF64x2 | O::MulF64x2 | O::AddI32x4 => 16,
++
++        // PBLENDVB consumes state, true value and mask as vectors.
++        O::Pblendvb128 => return (index < 3).then_some(16),
++
++        // 256-bit stores and unary consumers.
++        O::Storeu256 | O::Store256 | O::StoreuPs256 | O::StoreuPd256
++        | O::Pmovmskb256 | O::HorizontalAddF64x4 | O::HorizontalAddI32x8
++        | O::Pabsb256 | O::Pabsw256 | O::Pabsd256
++        | O::Psllidi256 | O::Psrlidi256 | O::Psllwi256 | O::Psrlwi256
++        | O::Pshufd256 | O::Pslldqi256 | O::Psrldqi256
++        | O::Psllqi256 | O::Psrlqi256 | O::Psrawi256 | O::Psradi256
++        | O::Permute4x64 | O::Extracti128 => {
++            return (index == 0).then_some(32);
++        }
++
++        // Binary 256-bit vector operations.
++        O::Paddb256 | O::Paddw256 | O::Paddd256
++        | O::Psubb256 | O::Psubw256 | O::Psubusw256
++        | O::Psadbw256 | O::Pmaddubsw256 | O::Pmaddwd256
++        | O::Pcmpeqb256 | O::Pcmpgtb256 | O::Pshufb256
++        | O::Pmaxub256 | O::Pminub256 | O::Pxor256 | O::Por256 | O::Pand256
++        | O::Pmulld256 | O::Psubd256 | O::Paddq256 | O::Psubq256
++        | O::Pandn256 | O::Pcmpeqd256 | O::Pcmpeqq256
++        | O::Pcmpgtd256 | O::Pcmpgtq256
++        | O::AddPs256 | O::SubPs256 | O::MulPs256
++        | O::AddPd256 | O::SubPd256 | O::MulPd256
++        | O::Punpcklbw256 | O::Punpckhbw256 | O::Punpcklwd256
++        | O::Punpckhwd256 | O::Punpckldq256 | O::Punpckhdq256
++        | O::Punpcklqdq256 | O::Punpckhqdq256
++        | O::Pmullw256 | O::Pmulhw256 | O::Pminsd256 | O::Pmaxsd256
++        | O::Packssdw256 | O::Packuswb256 | O::Phaddw256 | O::Phaddd256
++        | O::Pmuludq256 | O::AddF64x4 | O::MulF64x4 | O::AddI32x8 => 32,
++
++        // Two vector operands followed by an immediate/control operand.
++        O::Permute2x128 => 32,
++
++        // Index vector + data vector.
++        O::Permutevar8x32 => 32,
++
++        // FMA memory forms: only the B vector is a pointer-backed vector
++        // value; A is a scalar address and dest_ptr is the accumulator.
++        O::FmaF64x2 => return (index == 1).then_some(16),
++        O::FmaF64x4 => return (index == 1).then_some(32),
++        O::FmaF64x2Hoisted => return (index == 0).then_some(16),
++        O::FmaF64x4Hoisted => return (index == 0).then_some(32),
++
++        _ => return None,
++    };
++    (index < 2).then_some(width)
++}
++
++/// Minimum stack alignment required when an intrinsic argument refers to an
++/// alloca.  `Some(0)` means the backend uses an unaligned-safe access; `None`
++/// means that this pass cannot prove the use safe.  Address-valued scalar or
++/// immediate positions therefore fail closed rather than being mistaken for
++/// vector data.
++fn intrinsic_arg_required_alignment(op: IntrinsicOp, index: usize) -> Option<usize> {
++    use IntrinsicOp as O;
++    if pointer_vector_arg_width(op, index).is_some() {
++        return Some(0);
++    }
++    let safe = match op {
++        // Partial load: eight bytes are read and the upper half is zeroed.  It
++        // is alignment-safe but intentionally not forwardable as a 16-byte load.
++        O::Loadldi128 => index == 0,
++
++        // Legacy vectorizer loads use base + byte offset.  Only the base is an
++        // address; accepting the offset would hide an observable pointer-to-int use.
++        O::LoadF64x4 | O::LoadF64x2 | O::LoadI32x8 | O::LoadI32x4 => index == 0,
++
++        // All accesses in these vectorizer memory forms are scalar/unaligned.
++        O::FmaF64x2 | O::FmaF64x4 => index < 2,
++        O::FmaF64x2Hoisted | O::FmaF64x4Hoisted => index == 0,
++        O::FmaF64x4SIB => index < 3,
++        O::BroadcastLoadF64 | O::Rdtscp | O::Clflush => index == 0,
++        _ => false,
++    };
++    safe.then_some(0)
++}
++
++fn intrinsic_dest_required_alignment(
++    op: IntrinsicOp,
++    has_result: bool,
++    alloca_size: usize,
++) -> Option<usize> {
++    use IntrinsicOp as O;
++
++    // Compiler-created vector result homes are emitted through unaligned-safe
++    // stores.  Exact width also rejects partial/RMW operations accidentally
++    // listed by a broad intrinsic family query.
++    if has_result
++        && op.vector_result_width().map(|width| width as usize) == Some(alloca_size)
++    {
++        return Some(0);
++    }
++
++    match op {
++        O::Storedqu
++        | O::Storeldi128
++        | O::Storeu256
++        | O::Store256
++        | O::StoreuPs256
++        | O::StoreuPd256
++        | O::Movnti
++        | O::Movnti64
++        | O::FmaF64x2
++        | O::FmaF64x2Hoisted
++        | O::FmaF64x4
++        | O::FmaF64x4Hoisted
++        | O::FmaF64x4SIB => Some(0),
++        // x86 non-temporal vector stores fault unless the destination is
++        // 16-byte aligned.  Alignment 16 is still a direct stack slot and
++        // therefore avoids the expensive runtime alignment sequence.
++        O::Movntdq | O::Movntpd => Some(16),
++        _ => None,
++    }
++}
++
++fn instruction_uses_any(inst: &Instruction, values: &FxHashSet<u32>) -> bool {
++    let mut found = false;
++    inst.for_each_used_value(|value| found |= values.contains(&value));
++    found
++}
++
++fn operand_is_alias(op: &Operand, aliases: &FxHashSet<u32>) -> bool {
++    matches!(op, Operand::Value(value) if aliases.contains(&value.0))
++}
++
++fn operand_is_value(op: Operand, value: Value) -> bool {
++    matches!(op, Operand::Value(candidate) if candidate == value)
++}
++
++fn add_alias_edge(graph: &mut FxHashMap<u32, Vec<u32>>, source: u32, dest: u32) {
++    graph.entry(source).or_default().push(dest);
++}
++
++/// Build exact pointer-preserving and conservative address-influence graphs.
++/// The latter is only used to block store motion, never to prove no-alias.
++fn build_alias_graphs(
++    func: &IrFunction,
++) -> (FxHashMap<u32, Vec<u32>>, FxHashMap<u32, Vec<u32>>) {
++    let capacity = (map_capacity(func) / 4).max(8);
++    let mut exact = FxHashMap::with_capacity_and_hasher(capacity, Default::default());
++    let mut conservative = FxHashMap::with_capacity_and_hasher(capacity, Default::default());
++
++    for block in &func.blocks {
++        for inst in &block.instructions {
+             match inst {
+-                Instruction::Intrinsic { dest_ptr: Some(tmp), .. } => {
+-                    if alloca_sizes.contains_key(&tmp.0) {
+-                        intrinsic_at.insert(tmp.0, ii);
++                Instruction::GetElementPtr { dest, base, .. } => {
++                    add_alias_edge(&mut exact, base.0, dest.0);
++                    add_alias_edge(&mut conservative, base.0, dest.0);
++                    // An address used as a byte offset can still influence the
++                    // resulting pointer after pointer-to-integer folding.
++                    if let Instruction::GetElementPtr {
++                        offset: Operand::Value(offset),
++                        ..
++                    } = inst
++                    {
++                        add_alias_edge(&mut conservative, offset.0, dest.0);
+                     }
+                 }
+-                Instruction::Memcpy { dest, src, size } => {
+-                    if let Some(&intr_idx) = intrinsic_at.get(&src.0) {
+-                        let tmp = src.0;
+-                        // The temp must be used ONLY by the Intrinsic dest_ptr and
+-                        // this one Memcpy src (used_values counts both), and sizes
+-                        // must match so the assignment is a full copy.
+-                        if uses.get(&tmp) == Some(&2)
+-                            && alloca_sizes.get(&tmp) == Some(size)
+-                            && alloca_sizes.contains_key(&dest.0)
+-                            && no_var_access_between(
+-                                &block.instructions,
+-                                intr_idx + 1,
+-                                ii,
+-                                dest.0,
+-                            )
+-                        {
+-                            rewrites.push(Rewrite {
+-                                block: bi,
+-                                intrinsic: intr_idx,
+-                                memcpy: ii,
+-                                tmp,
+-                                var: dest.0,
+-                            });
++                Instruction::Copy {
++                    dest,
++                    src: Operand::Value(source),
++                } => {
++                    add_alias_edge(&mut exact, source.0, dest.0);
++                    add_alias_edge(&mut conservative, source.0, dest.0);
++                }
++                Instruction::Cast {
++                    dest,
++                    src: Operand::Value(source),
++                    from_ty,
++                    to_ty,
++                } => {
++                    if *from_ty == IrType::Ptr && *to_ty == IrType::Ptr {
++                        add_alias_edge(&mut exact, source.0, dest.0);
++                    }
++                    add_alias_edge(&mut conservative, source.0, dest.0);
++                }
++                Instruction::Phi { dest, ty, incoming } => {
++                    for (operand, _) in incoming {
++                        if let Operand::Value(source) = operand {
++                            if *ty == IrType::Ptr {
++                                add_alias_edge(&mut exact, source.0, dest.0);
++                            }
++                            add_alias_edge(&mut conservative, source.0, dest.0);
+                         }
+                     }
+                 }
++                Instruction::Select {
++                    dest,
++                    cond,
++                    true_val,
++                    false_val,
++                    ty,
++                } => {
++                    for operand in [true_val, false_val] {
++                        if let Operand::Value(source) = operand {
++                            if *ty == IrType::Ptr {
++                                add_alias_edge(&mut exact, source.0, dest.0);
++                            }
++                            add_alias_edge(&mut conservative, source.0, dest.0);
++                        }
++                    }
++                    if let Operand::Value(source) = cond {
++                        add_alias_edge(&mut conservative, source.0, dest.0);
++                    }
++                }
++                Instruction::BinOp { dest, .. } | Instruction::UnaryOp { dest, .. } => {
++                    inst.for_each_used_value(|source| {
++                        add_alias_edge(&mut conservative, source, dest.0)
++                    });
++                }
+                 _ => {}
+             }
+         }
+     }
++    (exact, conservative)
++}
+ 
+-    if rewrites.is_empty() {
+-        return 0;
++fn alias_closure(root: u32, graph: &FxHashMap<u32, Vec<u32>>) -> FxHashSet<u32> {
++    let mut aliases = FxHashSet::with_capacity_and_hasher(8, Default::default());
++    let mut work = VecDeque::with_capacity(8);
++    aliases.insert(root);
++    work.push_back(root);
++    while let Some(value) = work.pop_front() {
++        if let Some(successors) = graph.get(&value) {
++            for &successor in successors {
++                if aliases.insert(successor) {
++                    work.push_back(successor);
++                }
++            }
++        }
+     }
++    aliases
++}
+ 
+-    // 3. Apply. Rebuild each affected block once: patch the Intrinsic dest_ptr,
+-    // drop the Memcpy, and drop the now-unused temp Alloca.
+-    let mut by_block: FxHashMap<usize, Vec<&Rewrite>> = FxHashMap::default();
+-    for r in &rewrites {
+-        by_block.entry(r.block).or_default().push(r);
+-    }
++struct DestinationFacts {
++    aliases: FxHashSet<u32>,
++    escaped: bool,
++}
+ 
+-    let mut promoted = 0usize;
+-    for (bi, rs) in by_block {
+-        let mut memcpy_drop: FxHashSet<usize> = FxHashSet::default();
+-        let mut tmp_patch: FxHashMap<u32, u32> = FxHashMap::default(); // tmp -> var
+-        let mut tmp_set: FxHashSet<u32> = FxHashSet::default();
+-        for r in &rs {
+-            memcpy_drop.insert(r.memcpy);
+-            tmp_patch.insert(r.tmp, r.var);
+-            tmp_set.insert(r.tmp);
+-            promoted += 1;
+-        }
++fn analyze_destination(
++    func: &IrFunction,
++    root: u32,
++    conservative_graph: &FxHashMap<u32, Vec<u32>>,
++) -> DestinationFacts {
++    let aliases = alias_closure(root, conservative_graph);
++    let mut escaped = false;
+ 
+-        let block = &mut func.blocks[bi];
+-        let mut new_instrs = Vec::with_capacity(block.instructions.len());
+-        for (ii, mut inst) in std::mem::take(&mut block.instructions).into_iter().enumerate() {
+-            if memcpy_drop.contains(&ii) {
+-                continue;
+-            }
+-            if let Instruction::Alloca { dest, .. } = &inst {
+-                if tmp_set.contains(&dest.0) {
+-                    continue; // temp alloca is now dead
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            match inst {
++                // The alloca address is stored as data and may subsequently be
++                // recovered under an unrelated SSA ID.
++                Instruction::Store { val, .. } => escaped |= operand_is_alias(val, &aliases),
++                Instruction::AtomicStore { val, .. }
++                | Instruction::AtomicRmw { val, .. } => {
++                    escaped |= operand_is_alias(val, &aliases)
+                 }
+-            }
+-            if let Instruction::Intrinsic { dest_ptr, .. } = &mut inst {
+-                if let Some(ptr) = dest_ptr {
+-                    if let Some(&var) = tmp_patch.get(&ptr.0) {
+-                        *ptr = Value(var);
+-                    }
++                Instruction::AtomicCmpxchg {
++                    expected, desired, ..
++                } => {
++                    escaped |= operand_is_alias(expected, &aliases)
++                        || operand_is_alias(desired, &aliases)
++                }
++                Instruction::Call { .. }
++                | Instruction::CallIndirect { .. }
++                | Instruction::InlineAsm { .. }
++                | Instruction::StackRestore { .. } => {
++                    escaped |= instruction_uses_any(inst, &aliases)
+                 }
++                _ => {}
+             }
+-            new_instrs.push(inst);
+         }
+-        block.instructions = new_instrs;
++        block
++            .terminator
++            .for_each_used_value(|value| escaped |= aliases.contains(&value));
+     }
+ 
+-    promoted
++    DestinationFacts { aliases, escaped }
+ }
+ 
+-/// Soundness window check for temp promotion.
+-///
+-/// The rewrite redirects the Intrinsic's store from `%tmp` to `%var` and drops
+-/// the trailing `Memcpy(dest=%var, src=%tmp)`. This moves the store to `%var`
+-/// EARLIER (from the Memcpy position to the Intrinsic position), so it is only
+-/// valid when nothing reads or writes `%var` in between: a read would observe
+-/// the new value too early, and a write would clobber the promoted value
+-/// before the copy point, changing what later code sees.
+-///
+-/// Real bug fixed: zlib-ng-style dual-loop adler32 code has
+-/// `vs1 = sad+vs1; ...; vs1_0 = vs1` — the memcpy for `vs1_0 = vs1` was
+-/// promoted, redirecting the `vs1` update into `vs1_0`'s slot. In the wide
+-/// loop the interleaved `vs3 = vs1_0 + vs3` happens to read the slot before
+-/// the update (safe by accident); in the narrow loop it reads AFTER the
+-/// redirected store (wrong value → vector_defer_multidef_slot regression).
+-fn no_var_access_between(
+-    insts: &[Instruction],
++fn destination_unobserved_between(
++    instructions: &[Instruction],
+     from: usize,
+     to: usize,
+-    var: u32,
++    facts: &DestinationFacts,
+ ) -> bool {
+-    for inst in &insts[from.min(insts.len())..to.min(insts.len())] {
+-        // Any operand/value-ref use of the slot (args, Load/Store ptr, GEP
+-        // base, Intrinsic dest_ptr, Memcpy src, terminator operands are after
+-        // `to` so not included here).
+-        if inst.used_values().contains(&var) {
+-            return false;
+-        }
+-        // Any SSA write of the variable.
+-        if inst.dest().map(|d| d.0) == Some(var) {
++    if facts.escaped {
++        return false;
++    }
++    if from >= to || from >= instructions.len() {
++        return true;
++    }
++    let end = to.min(instructions.len());
++    for inst in &instructions[from..end] {
++        if instruction_uses_any(inst, &facts.aliases)
++            || matches!(
++                inst,
++                Instruction::Call { .. }
++                    | Instruction::CallIndirect { .. }
++                    | Instruction::InlineAsm { .. }
++                    | Instruction::StackRestore { .. }
++            )
++        {
+             return false;
+         }
+-        // Any memory write through the slot (Intrinsic dest_ptr is already
+-        // covered by used_values, but be explicit for Store/Memcpy/atomics).
+-        match inst {
+-            Instruction::Store { ptr, .. } => {
+-                if ptr.0 == var {
+-                    return false;
++    }
++    true
++}
++
++/// Remove instruction indices while maintaining BasicBlock's parallel source
++/// span table.  The input is normalized here so callers can cheaply append
++/// removals from independent rewrites.
++fn remove_instructions(block: &mut BasicBlock, removed: &mut Vec<usize>) {
++    if removed.is_empty() {
++        return;
++    }
++    removed.sort_unstable();
++    removed.dedup();
++    debug_assert!(removed.last().is_none_or(|&index| index < block.instructions.len()));
++
++    let instruction_count = block.instructions.len();
++    let spans_in_lockstep = block.source_spans.len() == instruction_count;
++    if !block.source_spans.is_empty() && !spans_in_lockstep {
++        // Stale line mappings are worse than absent mappings.
++        block.source_spans.clear();
++    }
++
++    let mut next_removed = 0usize;
++    let mut index = 0usize;
++    block.instructions.retain(|_| {
++        let drop = removed.get(next_removed).copied() == Some(index);
++        next_removed += usize::from(drop);
++        index += 1;
++        !drop
++    });
++
++    if spans_in_lockstep {
++        let mut next_removed = 0usize;
++        let mut index = 0usize;
++        block.source_spans.retain(|_| {
++            let drop = removed.get(next_removed).copied() == Some(index);
++            next_removed += usize::from(drop);
++            index += 1;
++            !drop
++        });
++    }
++}
++
++#[derive(Clone, Copy, Debug)]
++struct Promotion {
++    block: usize,
++    producer: usize,
++    memcpy: usize,
++    tmp: u32,
++    destination: u32,
++}
++
++/// Promote full-width intrinsic result temporaries into copy destinations.
++pub(crate) fn promote_vector_temps(module: &mut IrModule) -> usize {
++    module
++        .functions
++        .iter_mut()
++        .filter(|func| !func.is_declaration && !func.blocks.is_empty())
++        .map(promote_in_function)
++        .sum()
++}
++
++fn promote_in_function(func: &mut IrFunction) -> usize {
++    let allocas = collect_allocas(func);
++    if allocas.is_empty() {
++        return 0;
++    }
++
++    let mut uses = FxHashMap::with_capacity_and_hasher(allocas.len(), Default::default());
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            inst.for_each_used_value(|value| {
++                if allocas.contains_key(&value) {
++                    *uses.entry(value).or_insert(0usize) += 1;
+                 }
++            });
++        }
++        block.terminator.for_each_used_value(|value| {
++            if allocas.contains_key(&value) {
++                *uses.entry(value).or_insert(0usize) += 1;
+             }
+-            Instruction::AtomicStore { ptr, .. } => {
+-                if let Operand::Value(v) = ptr {
+-                    if v.0 == var {
+-                        return false;
++        });
++    }
++
++    let (_, conservative_graph) = build_alias_graphs(func);
++    let mut destination_facts: FxHashMap<u32, DestinationFacts> =
++        FxHashMap::with_capacity_and_hasher(8, Default::default());
++    let mut promotions = Vec::new();
++
++    for (block_idx, block) in func.blocks.iter().enumerate() {
++        let mut producer_at = FxHashMap::with_capacity_and_hasher(4, Default::default());
++        for (instruction_idx, inst) in block.instructions.iter().enumerate() {
++            match inst {
++                Instruction::Intrinsic {
++                    dest: Some(_),
++                    op,
++                    dest_ptr: Some(tmp),
++                    ..
++                } => {
++                    let Some(info) = allocas.get(&tmp.0) else {
++                        continue;
++                    };
++                    if op.vector_result_width().map(|width| width as usize) == Some(info.size)
++                        && !info.volatile
++                        && !info.semantic_volatile
++                    {
++                        producer_at.insert(tmp.0, instruction_idx);
+                     }
+                 }
+-            }
+-            Instruction::Memcpy { dest, .. } => {
+-                if dest.0 == var {
+-                    return false;
++                Instruction::Memcpy { dest, src, size } => {
++                    let Some(&producer) = producer_at.get(&src.0) else {
++                        continue;
++                    };
++                    let (Some(tmp), Some(destination)) =
++                        (allocas.get(&src.0), allocas.get(&dest.0))
++                    else {
++                        continue;
++                    };
++                    if src == dest
++                        || uses.get(&src.0) != Some(&2)
++                        || tmp.size != *size
++                        || destination.size < *size
++                        || tmp.volatile
++                        || tmp.semantic_volatile
++                        || destination.volatile
++                        || destination.semantic_volatile
++                    {
++                        continue;
++                    }
++
++                    let facts = destination_facts.entry(dest.0).or_insert_with(|| {
++                        analyze_destination(func, dest.0, &conservative_graph)
++                    });
++                    if destination_unobserved_between(
++                        &block.instructions,
++                        producer + 1,
++                        instruction_idx,
++                        facts,
++                    ) {
++                        promotions.push(Promotion {
++                            block: block_idx,
++                            producer,
++                            memcpy: instruction_idx,
++                            tmp: src.0,
++                            destination: dest.0,
++                        });
++                    }
+                 }
++                _ => {}
+             }
+-            _ => {}
+         }
+     }
+-    true
+-}
+ 
+-/// Fuse vector load intrinsics into their single consumer.
+-///
+-/// After temp promotion, the IR for `ymm = _mm256_loadu_si256(p); c = op(ymm, ..)`
+-/// is `Intrinsic{Loadu256, dest_ptr: %var, args:[p]}` followed by a consumer
+-/// intrinsic that reads `%var` as an operand. When `%var`'s most recent write is
+-/// that load and the consumer is its first subsequent read, the slot round-trip
+-/// is pure overhead: replace the consumer's operand with the load's source
+-/// pointer `p` (the backend loads `vmovdqu (%p)` for it) and delete the load.
+-/// Works across loop-carried variable reassignment because the check is
+-/// sequential ("last writer of %var is a load, no intervening reads").
+-pub(crate) fn fuse_vector_loads(module: &mut IrModule) -> usize {
+-    let mut total = 0usize;
+-    for func in &mut module.functions {
+-        if func.is_declaration || func.blocks.is_empty() {
+-            continue;
++    if promotions.is_empty() {
++        return 0;
++    }
++
++    let mut removals = vec![Vec::new(); func.blocks.len()];
++    let mut applied = 0usize;
++    for promotion in promotions {
++        let inst = &mut func.blocks[promotion.block].instructions[promotion.producer];
++        match inst {
++            Instruction::Intrinsic {
++                dest_ptr: Some(pointer),
++                ..
++            } if pointer.0 == promotion.tmp => {
++                *pointer = Value(promotion.destination);
++            }
++            _ => {
++                debug_assert!(false, "vector-temp producer changed during planning");
++                continue;
++            }
+         }
+-        total += fuse_in_function(func);
++        removals[promotion.block].push(promotion.memcpy);
++        let tmp = allocas[&promotion.tmp];
++        removals[tmp.block].push(tmp.instruction);
++        applied += 1;
++    }
++
++    for (block, removed) in func.blocks.iter_mut().zip(&mut removals) {
++        remove_instructions(block, removed);
+     }
+-    total
++    applied
+ }
+ 
+-fn fuse_in_function(func: &mut IrFunction) -> usize {
+-    use crate::ir::intrinsics::IntrinsicOp;
+-    use crate::ir::reexports::Operand;
+-
+-    let is_vec_load = |op: &IntrinsicOp| {
+-        matches!(op,
+-            IntrinsicOp::Loadu256 | IntrinsicOp::Load256
+-            | IntrinsicOp::Loaddqu
+-            | IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2
+-            | IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4)
+-    };
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum PointerRoot {
++    Alloca(u32),
++    // Distinct global symbol names are not an alias proof because ELF aliases
++    // can bind multiple names to one object.
++    Global,
++    Param { index: usize, noalias: bool },
++}
+ 
+-    // Phase 1: per-block analysis. Track, for every alloca slot, whether its
+-    // most recent write was a vector load (and from which pointer), and whether
+-    // the slot has been read since that write.
+-    #[derive(Default)]
+-    struct BlockPlan {
+-        fused_vars: FxHashSet<u32>,
+-        patches: Vec<(usize, usize, Operand)>, // (consumer_idx, arg_idx, load_source)
++fn common_root<'a>(
++    operands: impl IntoIterator<Item = &'a Operand>,
++    roots: &FxHashMap<u32, PointerRoot>,
++) -> Option<PointerRoot> {
++    let mut common = None;
++    for operand in operands {
++        let Operand::Value(value) = operand else {
++            return None;
++        };
++        let root = *roots.get(&value.0)?;
++        if common.is_some_and(|old| old != root) {
++            return None;
++        }
++        common = Some(root);
+     }
+-    let mut plans: Vec<BlockPlan> = Vec::with_capacity(func.blocks.len());
++    common
++}
++
++/// Compute exact roots only through operations that preserve pointer object
++/// identity.  Unknown roots may alias anything.
++fn pointer_roots(func: &IrFunction) -> FxHashMap<u32, PointerRoot> {
++    let mut roots = FxHashMap::with_capacity_and_hasher(map_capacity(func), Default::default());
+     for block in &func.blocks {
+-        let mut plan = BlockPlan::default();
+-        let mut last_load: FxHashMap<u32, (Operand, usize)> = FxHashMap::default();
+-        let mut last_read: FxHashMap<u32, usize> = FxHashMap::default();
+-        for (ii, inst) in block.instructions.iter().enumerate() {
++        for inst in &block.instructions {
+             match inst {
+-                Instruction::Intrinsic { op, dest_ptr: Some(d), args, .. } if is_vec_load(op) => {
+-                    if let Some(src) = args.first() {
+-                        last_load.insert(d.0, (src.clone(), ii));
++                Instruction::Alloca { dest, .. } => {
++                    roots.insert(dest.0, PointerRoot::Alloca(dest.0));
++                }
++                Instruction::GlobalAddr { dest, .. } => {
++                    roots.insert(dest.0, PointerRoot::Global);
++                }
++                Instruction::ParamRef {
++                    dest,
++                    param_idx,
++                    ty: IrType::Ptr,
++                } => {
++                    roots.insert(
++                        dest.0,
++                        PointerRoot::Param {
++                            index: *param_idx,
++                            noalias: func.params.get(*param_idx).is_some_and(|param| param.noalias),
++                        },
++                    );
++                }
++                _ => {}
++            }
++        }
++    }
++
++    loop {
++        let mut changed = false;
++        for block in &func.blocks {
++            for inst in &block.instructions {
++                let derived = match inst {
++                    Instruction::GetElementPtr { dest, base, .. } => {
++                        roots.get(&base.0).copied().map(|root| (dest.0, root))
+                     }
+-                    last_read.remove(&d.0); // the load overwrites d
+-                }
+-                Instruction::Intrinsic { args, .. } => {
+-                    for (ai, arg) in args.iter().enumerate() {
+-                        if let Operand::Value(v) = arg {
+-                            if let Some((src, w)) = last_load.get(&v.0) {
+-                                if last_read.get(&v.0).map_or(true, |&r| r < *w) {
+-                                    // First read after the load: fuse.
+-                                    plan.patches.push((ii, ai, src.clone()));
+-                                    plan.fused_vars.insert(v.0);
++                    Instruction::Copy {
++                        dest,
++                        src: Operand::Value(source),
++                    } => roots.get(&source.0).copied().map(|root| (dest.0, root)),
++                    Instruction::Cast {
++                        dest,
++                        src: Operand::Value(source),
++                        from_ty: IrType::Ptr,
++                        to_ty: IrType::Ptr,
++                    } => roots.get(&source.0).copied().map(|root| (dest.0, root)),
++                    // Lowering represents pointer arithmetic as integer-width
++                    // Add/Sub after the base pointer has entered IR.  In a
++                    // defined C program, adding an integer offset preserves the
++                    // base object; adding two pointers is not valid C.  Require
++                    // exactly one known root so pointer differences and mixed
++                    // roots never become an alias proof.
++                    Instruction::BinOp {
++                        dest,
++                        op: crate::ir::reexports::IrBinOp::Add,
++                        lhs,
++                        rhs,
++                        ..
++                    } => match (lhs, rhs) {
++                        (Operand::Value(lhs), Operand::Value(rhs)) => {
++                            match (roots.get(&lhs.0), roots.get(&rhs.0)) {
++                                (Some(root), None) | (None, Some(root)) => {
++                                    Some((dest.0, *root))
+                                 }
++                                _ => None,
+                             }
+                         }
+-                    }
+-                    for arg in args {
+-                        if let Operand::Value(v) = arg {
+-                            last_read.insert(v.0, ii);
+-                        }
+-                    }
+-                }
+-                other => {
+-                    for v in other.used_values() {
+-                        if last_load.contains_key(&v) {
+-                            last_read.insert(v, ii);
++                        (Operand::Value(value), Operand::Const(_))
++                        | (Operand::Const(_), Operand::Value(value)) => {
++                            roots.get(&value.0).copied().map(|root| (dest.0, root))
+                         }
++                        _ => None,
++                    },
++                    Instruction::BinOp {
++                        dest,
++                        op: crate::ir::reexports::IrBinOp::Sub,
++                        lhs: Operand::Value(base),
++                        rhs,
++                        ..
++                    } if !matches!(rhs, Operand::Value(value) if roots.contains_key(&value.0)) => {
++                        roots.get(&base.0).copied().map(|root| (dest.0, root))
+                     }
+-                    if let Some(d) = other.dest() {
+-                        last_load.remove(&d.0);
++                    Instruction::Select {
++                        dest,
++                        true_val,
++                        false_val,
++                        ty: IrType::Ptr,
++                        ..
++                    } => common_root([true_val, false_val], &roots)
++                        .map(|root| (dest.0, root)),
++                    Instruction::Phi {
++                        dest,
++                        incoming,
++                        ty: IrType::Ptr,
++                    } => common_root(incoming.iter().map(|(operand, _)| operand), &roots)
++                        .map(|root| (dest.0, root)),
++                    _ => None,
++                };
++                if let Some((dest, root)) = derived {
++                    if let std::collections::hash_map::Entry::Vacant(entry) = roots.entry(dest) {
++                        entry.insert(root);
++                        changed = true;
+                     }
+                 }
+             }
+         }
+-        plans.push(plan);
++        if !changed {
++            break;
++        }
+     }
++    roots
++}
+ 
+-    // Phase 2: apply. Patch consumer operands; keep the load intrinsics in place
+-    // (their slot may still be read by other, unfused consumers).
+-    let mut removed = 0usize;
+-    for (bi, plan) in plans.into_iter().enumerate() {
+-        if plan.patches.is_empty() {
+-            continue;
++fn roots_proven_distinct(lhs: PointerRoot, rhs: PointerRoot) -> bool {
++    if lhs == rhs {
++        return false;
++    }
++    match (lhs, rhs) {
++        (PointerRoot::Alloca(_), _) | (_, PointerRoot::Alloca(_)) => true,
++        (
++            PointerRoot::Param { noalias: lhs, .. },
++            PointerRoot::Param { noalias: rhs, .. },
++        ) => lhs || rhs,
++        (PointerRoot::Param { noalias, .. }, PointerRoot::Global)
++        | (PointerRoot::Global, PointerRoot::Param { noalias, .. }) => noalias,
++        (PointerRoot::Global, PointerRoot::Global) => false,
++    }
++}
++
++struct LocalAliasFacts {
++    /// Vector-sized allocas whose address cannot be recovered through memory or
++    /// opaque code.
++    nonescaping: FxHashSet<u32>,
++    /// Conservative address-influence relation: value -> possible alloca roots.
++    owners: FxHashMap<u32, Vec<u32>>,
++}
++
++fn local_alias_facts(
++    func: &IrFunction,
++    allocas: &FxHashMap<u32, AllocaInfo>,
++    conservative_graph: &FxHashMap<u32, Vec<u32>>,
++) -> LocalAliasFacts {
++    let roots: Vec<u32> = allocas
++        .iter()
++        .filter_map(|(&value, info)| (info.size == 16 || info.size == 32).then_some(value))
++        .collect();
++    let mut nonescaping: FxHashSet<u32> = roots.iter().copied().collect();
++    let mut owners = FxHashMap::with_capacity_and_hasher(roots.len() * 2, Default::default());
++    for root in roots {
++        for alias in alias_closure(root, conservative_graph) {
++            owners.entry(alias).or_insert_with(Vec::new).push(root);
+         }
+-        let block = &mut func.blocks[bi];
+-        for (ii, inst) in block.instructions.iter_mut().enumerate() {
+-            for &(ci, ai, ref src) in &plan.patches {
+-                if ci == ii {
+-                    if let Instruction::Intrinsic { args, .. } = inst {
+-                        args[ai] = src.clone();
+-                        removed += 1;
+-                    }
+-                }
++    }
++
++    let escape_value = |value: u32,
++                        nonescaping: &mut FxHashSet<u32>,
++                        owners: &FxHashMap<u32, Vec<u32>>| {
++        if let Some(roots) = owners.get(&value) {
++            for root in roots {
++                nonescaping.remove(root);
+             }
+         }
+-    }
++    };
++    let escape_operand = |operand: &Operand,
++                          nonescaping: &mut FxHashSet<u32>,
++                          owners: &FxHashMap<u32, Vec<u32>>| {
++        if let Operand::Value(value) = operand {
++            escape_value(value.0, nonescaping, owners);
++        }
++    };
+ 
+-    // Phase 3: drop load intrinsics whose destination now has zero remaining
+-    // uses (every consumer was fused). A load with any surviving reader must
+-    // stay so the slot still receives its data.
+-    // Count REMAINING READS of each value. dest_ptr of an intrinsic is a write,
+-    // not a read — a load's own dest_ptr must not keep it alive.
+-    let mut uses_after: FxHashMap<u32, usize> = FxHashMap::default();
+     for block in &func.blocks {
+         for inst in &block.instructions {
+             match inst {
+-                Instruction::Intrinsic { dest_ptr: Some(_), .. } => {
+-                    // used_values() includes dest_ptr; count only args here.
+-                    if let Instruction::Intrinsic { args, .. } = inst {
+-                        for arg in args {
+-                            if let crate::ir::reexports::Operand::Value(v) = arg {
+-                                *uses_after.entry(v.0).or_insert(0) += 1;
+-                            }
+-                        }
+-                    }
++                Instruction::Store { val, .. } => {
++                    escape_operand(val, &mut nonescaping, &owners)
+                 }
+-                _ => {
+-                    for v in inst.used_values() {
+-                        *uses_after.entry(v).or_insert(0) += 1;
+-                    }
++                Instruction::AtomicStore { val, .. }
++                | Instruction::AtomicRmw { val, .. } => {
++                    escape_operand(val, &mut nonescaping, &owners)
+                 }
++                Instruction::AtomicCmpxchg {
++                    expected, desired, ..
++                } => {
++                    escape_operand(expected, &mut nonescaping, &owners);
++                    escape_operand(desired, &mut nonescaping, &owners);
++                }
++                Instruction::Call { .. }
++                | Instruction::CallIndirect { .. }
++                | Instruction::InlineAsm { .. }
++                | Instruction::StackRestore { .. } => inst.for_each_used_value(|value| {
++                    escape_value(value, &mut nonescaping, &owners)
++                }),
++                _ => {}
+             }
+         }
+-        for v in block.terminator.used_values() {
+-            *uses_after.entry(v).or_insert(0) += 1;
+-        }
++        block.terminator.for_each_used_value(|value| {
++            escape_value(value, &mut nonescaping, &owners)
++        });
+     }
+-    for bi in 0..func.blocks.len() {
+-        let block = &mut func.blocks[bi];
+-        let mut new_instrs = Vec::with_capacity(block.instructions.len());
+-        for (ii, inst) in std::mem::take(&mut block.instructions).into_iter().enumerate() {
+-            let drop = if let Instruction::Intrinsic { op, dest_ptr: Some(d), .. } = &inst {
+-                is_vec_load(op) && uses_after.get(&d.0).copied().unwrap_or(0) == 0
+-            } else {
+-                false
+-            };
+-            if !drop {
+-                new_instrs.push(inst);
+-            }
+-        }
+-        block.instructions = new_instrs;
++    LocalAliasFacts {
++        nonescaping,
++        owners,
+     }
+-    removed
+ }
+ 
+-/// Downgrade the alignment of non-escaping vector-sized allocas (16/32 bytes)
+-/// from >16 to 0.
+-///
+-/// Every vector access to a variable alloca in the x86-64 backend uses
+-/// UNALIGNED moves (vmovdqu/movdqu — the "aligned" intrinsic forms are
+-/// reg-to-reg no-ops over an unaligned load). Keeping `align > 16` on such an
+-/// alloca makes every access pay the runtime `lea/add/and` alignment dance
+-/// (3 instructions per 32-byte access in zlib-ng's compare256_avx2 inner
+-/// loop) for an alignment nothing observes: if the address never escapes the
+-/// function, no `_Alignas` guarantee is observable and no aligned instruction
+-/// can fault. If the address DOES escape (address-taken, call arg, intrinsic
+-/// arg — conservative: aligned intrinsic forms like `_mm256_load_si256` count
+-/// as escapes), the alignment is preserved.
++#[derive(Clone, Copy)]
++struct AvailableLoad {
++    source: Operand,
++    width: usize,
++    producer: (usize, usize),
++}
++
++/// Does a write through `pointer` possibly clobber the object identified by
++/// `target`?  `write_root` is the pointer's own object root when derivable.
+ ///
+-/// Adopted from Agent B's fold_vec_temp (their escape list is identical in
+-/// spirit; this version additionally treats Memcpy/InlineAsm/terminator uses
+-/// as escapes for extra safety). Sound because the emitter never emits
+-/// vmovdqa on variable allocas.
+-pub(crate) fn downgrade_nonescaping_vector_align(module: &mut IrModule) -> usize {
+-    let mut total = 0usize;
+-    for func in &mut module.functions {
+-        if func.is_declaration || func.blocks.is_empty() {
+-            continue;
++/// A target alloca whose address has never escaped can only be reached by a
++/// pointer that is provably derived from it, so a write through an
++/// unrelated/externally-derived pointer cannot touch it.  That refinement
++/// keeps forwards alive across unrelated stores without ever assuming SSA
++/// value inequality proves no-alias.
++fn write_may_clobber(
++    pointer: Value,
++    target: Value,
++    write_root: Option<PointerRoot>,
++    roots: &FxHashMap<u32, PointerRoot>,
++    local_aliases: &LocalAliasFacts,
++) -> bool {
++    let target_root = roots.get(&target.0).copied();
++    match (target_root, write_root) {
++        (Some(target_root), Some(write_root)) => {
++            !roots_proven_distinct(target_root, write_root)
+         }
+-        total += downgrade_in_function(func);
++        (Some(target_root), None) => match target_root {
++            PointerRoot::Alloca(root) if local_aliases.nonescaping.contains(&root) => {
++                local_aliases
++                    .owners
++                    .get(&pointer.0)
++                    .is_some_and(|owners| owners.contains(&root))
++            }
++            _ => true,
++        },
++        // The target has no derivable root: fail closed.
++        (None, _) => true,
+     }
+-    total
+ }
+ 
+-fn downgrade_in_function(func: &mut IrFunction) -> usize {
+-    use crate::ir::reexports::Operand;
+-
+-    // Conservative escape set: any use that could observe the alloca's ADDRESS
+-    // (or pass it to code that requires alignment).
+-    let mut escape: FxHashSet<u32> = FxHashSet::default();
+-    let mut mark = |inst: &Instruction, escape: &mut FxHashSet<u32>| {
+-        match inst {
+-            Instruction::Store { val, ptr, .. } => {
+-                if let Operand::Value(v) = val {
+-                    escape.insert(v.0);
+-                }
+-                escape.insert(ptr.0);
++/// A write through `pointer` kills a pending `(slot, source)` forward when it
++/// may clobber EITHER object: the slot a later consumer will read, or the
++/// source the load copied.  Checking only the source (or only the slot) is
++/// unsound — a reassignment `v = load(p); v = setzero(); use(v)` writes the
++/// slot itself, and forwarding `use(v)` to `p` would read stale data.
++fn invalidate_for_value_write(
++    available: &mut FxHashMap<u32, AvailableLoad>,
++    pointer: Value,
++    roots: &FxHashMap<u32, PointerRoot>,
++    local_aliases: &LocalAliasFacts,
++) {
++    let write_root = roots.get(&pointer.0).copied();
++    available.retain(|slot, load| {
++        // Slots are allocas, so roots[slot] is always Some; the check still
++        // fails closed if that invariant ever breaks.
++        if write_may_clobber(pointer, Value(*slot), write_root, roots, local_aliases) {
++            return false;
++        }
++        match load.source {
++            Operand::Value(source) => {
++                !write_may_clobber(pointer, source, write_root, roots, local_aliases)
+             }
+-            Instruction::Load { ptr, .. } => {
+-                escape.insert(ptr.0);
++            // A constant source denotes a fixed address; treat as non-writable
++            // for forwarding purposes (the backend materializes it directly).
++            Operand::Const(_) => true,
++        }
++    });
++}
++
++/// Apply ordering and memory-write effects after an instruction's reads have
++/// consumed available loads.
++fn invalidate_for_memory_effects(
++    inst: &Instruction,
++    available: &mut FxHashMap<u32, AvailableLoad>,
++    roots: &FxHashMap<u32, PointerRoot>,
++    local_aliases: &LocalAliasFacts,
++) {
++    match inst {
++        Instruction::Store { ptr, volatile, .. } => {
++            if *volatile {
++                available.clear();
++            } else {
++                invalidate_for_value_write(available, *ptr, roots, local_aliases);
+             }
+-            Instruction::GetElementPtr { base, .. } => {
+-                escape.insert(base.0);
++        }
++        Instruction::Load { volatile: true, .. }
++        | Instruction::AtomicLoad { .. }
++        | Instruction::Fence { .. } => available.clear(),
++        Instruction::Memcpy { dest, .. } => {
++            invalidate_for_value_write(available, *dest, roots, local_aliases)
++        }
++        Instruction::VaArg { va_list_ptr, .. }
++        | Instruction::VaStart { va_list_ptr }
++        | Instruction::VaEnd { va_list_ptr } => {
++            invalidate_for_value_write(available, *va_list_ptr, roots, local_aliases)
++        }
++        Instruction::VaCopy { dest_ptr, .. } => {
++            invalidate_for_value_write(available, *dest_ptr, roots, local_aliases)
++        }
++        Instruction::VaArgStruct {
++            dest_ptr,
++            va_list_ptr,
++            ..
++        } => {
++            invalidate_for_value_write(available, *dest_ptr, roots, local_aliases);
++            invalidate_for_value_write(available, *va_list_ptr, roots, local_aliases);
++        }
++        Instruction::AtomicRmw { .. }
++        | Instruction::AtomicInc { .. }
++        | Instruction::AtomicCmpxchg { .. }
++        | Instruction::AtomicStore { .. } => available.clear(),
++        Instruction::Intrinsic {
++            dest_ptr: Some(pointer),
++            ..
++        } => invalidate_for_value_write(available, *pointer, roots, local_aliases),
++        Instruction::Intrinsic {
++            op,
++            dest_ptr: None,
++            ..
++        } => {
++            // An intrinsic with no destination pointer either only reads
++            // memory (pure) or produces a register-resident vector result and
++            // touches no memory.  VecStoreI64x2 is the exception: it appears in
++            // produces_vector_value for slot sizing but is the memory-form
++            // vector store that writes through args[1] — it must be a full
++            // barrier here.
++            if !op.is_pure()
++                && (!op.produces_vector_value() || matches!(op, IntrinsicOp::VecStoreI64x2))
++            {
++                available.clear();
+             }
+-            Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+-                for a in &info.args {
+-                    if let Operand::Value(v) = a {
+-                        escape.insert(v.0);
++        }
++        Instruction::Call { .. }
++        | Instruction::CallIndirect { .. }
++        | Instruction::InlineAsm { .. }
++        | Instruction::PgoCounterInc { .. }
++        | Instruction::StackRestore { .. } => available.clear(),
++        Instruction::Alloca { .. }
++        | Instruction::DynAlloca { .. }
++        | Instruction::Load { .. }
++        | Instruction::BinOp { .. }
++        | Instruction::UnaryOp { .. }
++        | Instruction::Cmp { .. }
++        | Instruction::GetElementPtr { .. }
++        | Instruction::Cast { .. }
++        | Instruction::Copy { .. }
++        | Instruction::GlobalAddr { .. }
++        | Instruction::Phi { .. }
++        | Instruction::LabelAddr { .. }
++        | Instruction::GetReturnF64Second { .. }
++        | Instruction::SetReturnF64Second { .. }
++        | Instruction::GetReturnF32Second { .. }
++        | Instruction::SetReturnF32Second { .. }
++        | Instruction::GetReturnF128Second { .. }
++        | Instruction::SetReturnF128Second { .. }
++        | Instruction::Select { .. }
++        | Instruction::StackSave { .. }
++        | Instruction::ParamRef { .. } => {}
++    }
++}
++
++#[derive(Clone, Copy)]
++struct ReadSites {
++    first: (usize, usize),
++    multiple: bool,
++}
++
++fn single_read_sites(
++    func: &IrFunction,
++    allocas: &FxHashMap<u32, AllocaInfo>,
++) -> FxHashMap<u32, ReadSites> {
++    let mut sites = FxHashMap::with_capacity_and_hasher(allocas.len(), Default::default());
++    let mut record = |value: u32, site: (usize, usize)| {
++        if !allocas.contains_key(&value) {
++            return;
++        }
++        sites
++            .entry(value)
++            .and_modify(|summary: &mut ReadSites| summary.multiple |= summary.first != site)
++            .or_insert(ReadSites {
++                first: site,
++                multiple: false,
++            });
++    };
++
++    for (block_idx, block) in func.blocks.iter().enumerate() {
++        for (instruction_idx, inst) in block.instructions.iter().enumerate() {
++            let site = (block_idx, instruction_idx);
++            match inst {
++                // A direct load writes dest_ptr; only its source arguments read
++                // memory/value state.  Every other dest_ptr is conservatively
++                // treated as a use because some intrinsics are read-modify-write.
++                Instruction::Intrinsic {
++                    op,
++                    dest_ptr: Some(_),
++                    args,
++                    ..
++                } if direct_vector_load_width(*op).is_some() => {
++                    for arg in args {
++                        if let Operand::Value(value) = arg {
++                            record(value.0, site);
++                        }
+                     }
+                 }
++                _ => inst.for_each_used_value(|value| record(value, site)),
+             }
+-            // Memcpy does NOT escape: it is byte-wise / unaligned-safe by
+-            // definition, so copying to/from an unaligned slot is always
+-            // correct, and compiler-generated aggregate copies of vector
+-            // values are exactly the accesses this pass optimizes. The
+-            // alignment-observing cases (address-of, aligned vector loads,
+-            // call args) are handled by the other arms.
+-            Instruction::Memcpy { .. } => {}
+-            Instruction::Intrinsic { op, args, .. } => {
+-                // Only MEMORY-LOAD intrinsics take their args as ADDRESSES
+-                // (e.g. `_mm256_loadu_si256(&v)`), so only those can observe an
+-                // alloca's alignment. Every other intrinsic reads its vector
+-                // args as VALUES via unaligned moves — the alignment of a
+-                // non-escaping local is unobservable, so those do NOT escape.
+-                use crate::ir::intrinsics::IntrinsicOp;
+-                let is_address_op = matches!(
++        }
++        let terminator_site = (block_idx, usize::MAX);
++        block
++            .terminator
++            .for_each_used_value(|value| record(value, terminator_site));
++    }
++    sites
++}
++
++#[derive(Clone, Copy)]
++struct LoadPatch {
++    consumer: usize,
++    argument: usize,
++    source: Operand,
++    producer: (usize, usize),
++}
++
++/// Forward direct vector loads into compatible first consumers.
++pub(crate) fn fuse_vector_loads(module: &mut IrModule) -> usize {
++    module
++        .functions
++        .iter_mut()
++        .filter(|func| !func.is_declaration && !func.blocks.is_empty())
++        .map(fuse_in_function)
++        .sum()
++}
++
++fn fuse_in_function(func: &mut IrFunction) -> usize {
++    let allocas = collect_allocas(func);
++    if allocas.is_empty() {
++        return 0;
++    }
++    let roots = pointer_roots(func);
++    let (_, conservative_graph) = build_alias_graphs(func);
++    let local_aliases = local_alias_facts(func, &allocas, &conservative_graph);
++    let read_sites = single_read_sites(func, &allocas);
++    let mut plans: Vec<Vec<LoadPatch>> = vec![Vec::new(); func.blocks.len()];
++
++    for (block_idx, block) in func.blocks.iter().enumerate() {
++        let mut available: FxHashMap<u32, AvailableLoad> =
++            FxHashMap::with_capacity_and_hasher(4, Default::default());
++        for (instruction_idx, inst) in block.instructions.iter().enumerate() {
++            let direct_load = match inst {
++                Instruction::Intrinsic {
+                     op,
+-                    IntrinsicOp::Loadu256 | IntrinsicOp::Load256 | IntrinsicOp::Loaddqu
+-                        | IntrinsicOp::LoadF64x4 | IntrinsicOp::LoadF64x2
+-                        | IntrinsicOp::LoadI32x8 | IntrinsicOp::LoadI32x4
+-                        | IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2
+-                        | IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4
+-                );
+-                if is_address_op {
+-                    for a in args {
+-                        if let Operand::Value(v) = a {
+-                            escape.insert(v.0);
++                    dest_ptr: Some(destination),
++                    args,
++                    ..
++                } => direct_vector_load_width(*op)
++                    .map(|width| (*op, *destination, args, width)),
++                _ => None,
++            };
++
++            if let Some((op, destination, args, width)) = direct_load {
++                let mut effective_source = args.first().copied();
++                if args.len() == 1 {
++                    if let Operand::Value(value) = args[0] {
++                        if let Some(load) = available.get(&value.0).copied() {
++                            if pointer_vector_arg_width(op, 0) == Some(load.width)
++                                && load.width == width
++                                && !operand_is_value(load.source, destination)
++                            {
++                                plans[block_idx].push(LoadPatch {
++                                    consumer: instruction_idx,
++                                    argument: 0,
++                                    source: load.source,
++                                    producer: load.producer,
++                                });
++                                effective_source = Some(load.source);
++                            }
+                         }
+                     }
+                 }
+-            }
+-            Instruction::InlineAsm { outputs, inputs, .. } => {
+-                for (_, val, _) in outputs {
+-                    escape.insert(val.0);
++
++                // Every argument is a read, even when it was not forwardable.
++                for arg in args {
++                    if let Operand::Value(value) = arg {
++                        available.remove(&value.0);
++                    }
++                }
++                invalidate_for_value_write(
++                    &mut available,
++                    destination,
++                    &roots,
++                    &local_aliases,
++                );
++
++                if let Some(source) = effective_source {
++                    if args.len() == 1
++                        && !operand_is_value(source, destination)
++                        // The legacy SSE path benefits from forwarding its
++                        // first Loaddqu consumer even when a later consumer
++                        // keeps the home live: doing so shortens GPR address
++                        // lifetimes in adler32-style unpack chains.  The AVX
++                        // backend instead keeps multi-use values in a vector
++                        // register; partial forwarding there caused an extra
++                        // reload and larger frame in measured intrinsic suites.
++                        && (op == IntrinsicOp::Loaddqu
++                            || read_sites
++                                .get(&destination.0)
++                                .is_some_and(|summary| !summary.multiple))
++                        && allocas.get(&destination.0).is_some_and(|info| {
++                            info.size == width && !info.volatile && !info.semantic_volatile
++                        })
++                    {
++                        available.insert(
++                            destination.0,
++                            AvailableLoad {
++                                source,
++                                width,
++                                producer: (block_idx, instruction_idx),
++                            },
++                        );
++                    }
+                 }
+-                for (_, op, _) in inputs {
+-                    if let Operand::Value(v) = op {
+-                        escape.insert(v.0);
++                continue;
++            }
++
++            match inst {
++                Instruction::Intrinsic { op, args, .. } => {
++                    for (argument_idx, arg) in args.iter().enumerate() {
++                        let Operand::Value(value) = arg else {
++                            continue;
++                        };
++                        let Some(load) = available.get(&value.0).copied() else {
++                            continue;
++                        };
++                        if pointer_vector_arg_width(*op, argument_idx) == Some(load.width) {
++                            plans[block_idx].push(LoadPatch {
++                                consumer: instruction_idx,
++                                argument: argument_idx,
++                                source: load.source,
++                                producer: load.producer,
++                            });
++                        }
++                    }
++                    // The first instruction that reads a slot consumes the
++                    // availability.  All compatible occurrences in this one
++                    // instruction were considered above.
++                    for arg in args {
++                        if let Operand::Value(value) = arg {
++                            available.remove(&value.0);
++                        }
+                     }
+                 }
++                _ => inst.for_each_used_value(|value| {
++                    available.remove(&value);
++                }),
+             }
+-            _ => {}
++            invalidate_for_memory_effects(inst, &mut available, &roots, &local_aliases);
+         }
+-    };
++    }
++
++    let patch_count = plans.iter().map(Vec::len).sum();
++    if patch_count == 0 {
++        return 0;
++    }
++
++    let mut forwarded_loads = FxHashSet::with_capacity_and_hasher(
++        patch_count,
++        Default::default(),
++    );
++    for (block, patches) in func.blocks.iter_mut().zip(&plans) {
++        for patch in patches {
++            let Some(Instruction::Intrinsic { args, .. }) =
++                block.instructions.get_mut(patch.consumer)
++            else {
++                debug_assert!(false, "vector-load consumer changed during planning");
++                continue;
++            };
++            let Some(argument) = args.get_mut(patch.argument) else {
++                debug_assert!(false, "vector-load argument changed during planning");
++                continue;
++            };
++            *argument = patch.source;
++            forwarded_loads.insert(patch.producer);
++        }
++    }
++
++    // Remove only loads which actually supplied a forwarded operand and whose
++    // destination slot has no remaining reference.  Counting after patching is
++    // important; direct-load dest_ptr is a write, not a read.
++    let mut forwarded_slots = FxHashSet::with_capacity_and_hasher(
++        forwarded_loads.len(),
++        Default::default(),
++    );
++    for &(block_idx, instruction_idx) in &forwarded_loads {
++        if let Instruction::Intrinsic {
++            dest_ptr: Some(destination),
++            ..
++        } = &func.blocks[block_idx].instructions[instruction_idx]
++        {
++            forwarded_slots.insert(destination.0);
++        }
++    }
++
++    // Also track the load's SSA result (dest), if present, so removal can only
++    // fire when that register result has no reader either.  A future lowering
++    // that exposes the register result must not be broken by load deletion.
++    let mut load_result_slots: FxHashMap<u32, Option<u32>> = FxHashMap::default();
++    for &(block_idx, instruction_idx) in &forwarded_loads {
++        if let Instruction::Intrinsic {
++            dest,
++            dest_ptr: Some(destination),
++            ..
++        } = &func.blocks[block_idx].instructions[instruction_idx]
++        {
++            if let Some(result) = dest {
++                load_result_slots.insert(destination.0, Some(result.0));
++            }
++        }
++    }
++
++    let mut remaining = FxHashMap::with_capacity_and_hasher(
++        forwarded_slots.len(),
++        Default::default(),
++    );
++    let mut remaining_results = FxHashMap::with_capacity_and_hasher(
++        load_result_slots.len(),
++        Default::default(),
++    );
+     for block in &func.blocks {
+         for inst in &block.instructions {
+-            mark(inst, &mut escape);
++            match inst {
++                Instruction::Intrinsic {
++                    op,
++                    dest_ptr: Some(_),
++                    args,
++                    ..
++                } if direct_vector_load_width(*op).is_some() => {
++                    for arg in args {
++                        if let Operand::Value(value) = arg {
++                            if forwarded_slots.contains(&value.0) {
++                                *remaining.entry(value.0).or_insert(0usize) += 1;
++                            }
++                        }
++                    }
++                }
++                _ => inst.for_each_used_value(|value| {
++                    if forwarded_slots.contains(&value) {
++                        *remaining.entry(value).or_insert(0usize) += 1;
++                    }
++                    if load_result_slots.values().any(|slot| *slot == Some(value)) {
++                        *remaining_results.entry(value).or_insert(0usize) += 1;
++                    }
++                }),
++            }
+         }
+-        for v in block.terminator.used_values() {
+-            escape.insert(v);
++        block.terminator.for_each_used_value(|value| {
++            if forwarded_slots.contains(&value) {
++                *remaining.entry(value).or_insert(0usize) += 1;
++            }
++            if load_result_slots.values().any(|slot| *slot == Some(value)) {
++                *remaining_results.entry(value).or_insert(0usize) += 1;
++            }
++        });
++    }
++
++    let mut removals = vec![Vec::new(); func.blocks.len()];
++    for &(block_idx, instruction_idx) in &forwarded_loads {
++        let Instruction::Intrinsic {
++            op,
++            dest,
++            dest_ptr: Some(destination),
++            args,
++            ..
++        } = &func.blocks[block_idx].instructions[instruction_idx]
++        else {
++            continue;
++        };
++        let result_dead = match (dest, load_result_slots.get(&destination.0)) {
++            (Some(reg), Some(Some(_))) => {
++                remaining_results.get(&reg.0).copied().unwrap_or(0) == 0
++            }
++            _ => true,
++        };
++        let removable = direct_vector_load_width(*op).is_some()
++            && args.len() == 1
++            && allocas.get(&destination.0).is_some_and(|info| {
++                !info.volatile && !info.semantic_volatile
++            })
++            && remaining.get(&destination.0).copied().unwrap_or(0) == 0
++            && result_dead;
++        if removable {
++            removals[block_idx].push(instruction_idx);
++        }
++    }
++    for (block, removed) in func.blocks.iter_mut().zip(&mut removals) {
++        remove_instructions(block, removed);
++    }
++
++    patch_count
++}
++
++fn remove_alias_owners(
++    value: u32,
++    owners: &FxHashMap<u32, Vec<u32>>,
++    safe: &mut FxHashSet<u32>,
++) {
++    if let Some(roots) = owners.get(&value) {
++        for root in roots {
++            safe.remove(root);
+         }
+     }
++}
++
++fn remove_operand_owners(
++    operand: &Operand,
++    owners: &FxHashMap<u32, Vec<u32>>,
++    safe: &mut FxHashSet<u32>,
++) {
++    if let Operand::Value(value) = operand {
++        remove_alias_owners(value.0, owners, safe);
++    }
++}
++
++/// Relax unobservable >16-byte stack alignment to the minimum required by uses.
++pub(crate) fn downgrade_nonescaping_vector_align(module: &mut IrModule) -> usize {
++    module
++        .functions
++        .iter_mut()
++        .filter(|func| !func.is_declaration && !func.blocks.is_empty())
++        .map(downgrade_in_function)
++        .sum()
++}
+ 
+-    // Vector-sized allocas with over-alignment that never escape: downgrade.
+-    let mut candidates: Vec<u32> = Vec::new();
++fn downgrade_in_function(func: &mut IrFunction) -> usize {
++    let mut sizes = FxHashMap::with_capacity_and_hasher(8, Default::default());
++    let mut required_align = FxHashMap::with_capacity_and_hasher(8, Default::default());
++    let mut safe = FxHashSet::with_capacity_and_hasher(8, Default::default());
+     for block in &func.blocks {
+         for inst in &block.instructions {
+             if let Instruction::Alloca {
+                 dest,
+                 size,
+                 align,
++                volatile,
++                semantic_volatile,
+                 ..
+             } = inst
+             {
+-                if (*size == 16 || *size == 32) && *align > 16 && !escape.contains(&dest.0) {
+-                    candidates.push(dest.0);
++                if (*size == 16 || *size == 32)
++                    && *align > 16
++                    && !*volatile
++                    && !*semantic_volatile
++                {
++                    sizes.insert(dest.0, *size);
++                    required_align.insert(dest.0, 0usize);
++                    safe.insert(dest.0);
+                 }
+             }
+         }
+     }
+-    if candidates.is_empty() {
++    if safe.is_empty() {
++        return 0;
++    }
++
++    // Map each exact derived pointer back to every candidate alloca it may
++    // select.  A select/phi can therefore carry several owners without making
++    // the unsafe single-root assumption used by many lightweight analyses.
++    let (exact_graph, _) = build_alias_graphs(func);
++    let candidates: Vec<u32> = safe.iter().copied().collect();
++    let mut owners: FxHashMap<u32, Vec<u32>> = FxHashMap::with_capacity_and_hasher(
++        candidates.len() * 2,
++        Default::default(),
++    );
++    for root in candidates {
++        for alias in alias_closure(root, &exact_graph) {
++            owners.entry(alias).or_default().push(root);
++        }
++    }
++
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            match inst {
++                Instruction::Alloca { .. }
++                | Instruction::GlobalAddr { .. }
++                | Instruction::LabelAddr { .. }
++                | Instruction::StackSave { .. }
++                | Instruction::Fence { .. }
++                | Instruction::GetReturnF64Second { .. }
++                | Instruction::GetReturnF32Second { .. }
++                | Instruction::GetReturnF128Second { .. }
++                | Instruction::ParamRef { .. }
++                | Instruction::PgoCounterInc { .. } => {}
++
++                // Dereferencing the object does not expose its address and all
++                // scalar accesses remain naturally aligned at 16.
++                Instruction::Load { .. } => {}
++                Instruction::Store { val, .. } => {
++                    // ptr is safe; storing the pointer itself as data is not.
++                    remove_operand_owners(val, &owners, &mut safe);
++                }
++                Instruction::Memcpy { .. } => {}
++
++                // Exact pointer-preserving derivations are checked at their
++                // eventual use rather than rejected at the derivation itself.
++                Instruction::GetElementPtr { offset, .. } => {
++                    remove_operand_owners(offset, &owners, &mut safe);
++                }
++                Instruction::Copy { .. } => {}
++                Instruction::Cast {
++                    src,
++                    from_ty: IrType::Ptr,
++                    to_ty: IrType::Ptr,
++                    ..
++                } => {
++                    let _ = src;
++                }
++                Instruction::Phi {
++                    ty: IrType::Ptr, ..
++                } => {}
++                Instruction::Select {
++                    cond,
++                    ty: IrType::Ptr,
++                    ..
++                } => remove_operand_owners(cond, &owners, &mut safe),
++
++                Instruction::Intrinsic {
++                    dest,
++                    op,
++                    dest_ptr,
++                    args,
++                } => {
++                    if let Some(pointer) = dest_ptr {
++                        if let Some(roots) = owners.get(&pointer.0) {
++                            for root in roots {
++                                if !safe.contains(root) {
++                                    continue;
++                                }
++                                if let Some(required) = intrinsic_dest_required_alignment(
++                                    *op,
++                                    dest.is_some(),
++                                    sizes[root],
++                                ) {
++                                    let current = required_align.entry(*root).or_insert(0);
++                                    *current = (*current).max(required);
++                                } else {
++                                    safe.remove(root);
++                                }
++                            }
++                        }
++                    }
++                    for (index, arg) in args.iter().enumerate() {
++                        let Operand::Value(value) = arg else {
++                            continue;
++                        };
++                        if let Some(roots) = owners.get(&value.0) {
++                            if let Some(required) = intrinsic_arg_required_alignment(*op, index) {
++                                for root in roots {
++                                    if safe.contains(root) {
++                                        let current = required_align.entry(*root).or_insert(0);
++                                        *current = (*current).max(required);
++                                    }
++                                }
++                            } else {
++                                for root in roots {
++                                    safe.remove(root);
++                                }
++                            }
++                        }
++                    }
++                }
++
++                // Everything not explicitly proven alignment-insensitive fails
++                // closed, including atomics, calls, asm and pointer arithmetic.
++                _ => inst.for_each_used_value(|value| {
++                    remove_alias_owners(value, &owners, &mut safe)
++                }),
++            }
++        }
++        block.terminator.for_each_used_value(|value| {
++            remove_alias_owners(value, &owners, &mut safe)
++        });
++    }
++
++    if safe.is_empty() {
+         return 0;
+     }
+     let mut changed = 0usize;
+     for block in &mut func.blocks {
+         for inst in &mut block.instructions {
+-            if let Instruction::Alloca {
+-                dest, align, ..
+-            } = inst
+-            {
+-                if candidates.contains(&dest.0) {
+-                    *align = 0;
++            if let Instruction::Alloca { dest, align, .. } = inst {
++                if safe.contains(&dest.0) {
++                    *align = required_align.get(&dest.0).copied().unwrap_or(0);
+                     changed += 1;
+                 }
+             }
+@@ -515,3 +1604,744 @@ fn downgrade_in_function(func: &mut IrFunction) -> usize {
+     }
+     changed
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::common::source::Span;
++    use crate::common::types::AddressSpace;
++    use crate::ir::reexports::{
++        AtomicOrdering, BlockId, IrBinOp, IrConst, IrParam, Terminator,
++    };
++
++    fn block(label: u32, instructions: Vec<Instruction>) -> BasicBlock {
++        BasicBlock {
++            label: BlockId(label),
++            source_spans: vec![Span::dummy(); instructions.len()],
++            instructions,
++            terminator: Terminator::Return(None),
++        }
++    }
++
++    fn function(name: &str, blocks: Vec<BasicBlock>) -> IrFunction {
++        let mut function = IrFunction::new(name.into(), IrType::I32, Vec::new(), false);
++        function.blocks = blocks;
++        function
++    }
++
++    fn alloca(dest: u32, size: usize, align: usize) -> Instruction {
++        Instruction::Alloca {
++            dest: Value(dest),
++            ty: IrType::Ptr,
++            size,
++            align,
++            volatile: false,
++            semantic_volatile: false,
++        }
++    }
++
++    fn intrinsic(
++        dest: Option<u32>,
++        op: IntrinsicOp,
++        dest_ptr: Option<u32>,
++        args: Vec<Operand>,
++    ) -> Instruction {
++        Instruction::Intrinsic {
++            dest: dest.map(Value),
++            op,
++            dest_ptr: dest_ptr.map(Value),
++            args,
++        }
++    }
++
++    #[test]
++    fn load_classifier_rejects_partial_and_offset_loads() {
++        assert_eq!(direct_vector_load_width(IntrinsicOp::Loaddqu), Some(16));
++        assert_eq!(direct_vector_load_width(IntrinsicOp::Loadu256), Some(32));
++        assert_eq!(direct_vector_load_width(IntrinsicOp::Load256), Some(32));
++        assert_eq!(direct_vector_load_width(IntrinsicOp::Loadldi128), None);
++        assert_eq!(direct_vector_load_width(IntrinsicOp::LoadF64x4), None);
++        assert_eq!(direct_vector_load_width(IntrinsicOp::MaskLoaduEpi8_256), None);
++    }
++
++    #[test]
++    fn intrinsic_signature_distinguishes_vector_and_scalar_arguments() {
++        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Pcmpeqb256, 0), Some(32));
++        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Pcmpeqb256, 1), Some(32));
++        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Pinsrd128, 0), Some(16));
++        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Pinsrd128, 1), None);
++        assert_eq!(pointer_vector_arg_width(IntrinsicOp::SetEpi32_256, 0), None);
++        assert_eq!(pointer_vector_arg_width(IntrinsicOp::FmaF64x4, 0), None);
++        assert_eq!(pointer_vector_arg_width(IntrinsicOp::FmaF64x4, 1), Some(32));
++        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Insert128to256, 0), Some(32));
++        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Insert128to256, 1), Some(16));
++        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Insert128to256, 2), None);
++    }
++
++    #[test]
++    fn widening_extension_reads_a_128_bit_source() {
++        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Pmovzxbw256, 0), Some(16));
++        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Pmovsxwd256, 0), Some(16));
++        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Pmovzxbw256, 1), None);
++    }
++
++    #[test]
++    fn compaction_preserves_source_span_lockstep() {
++        let mut block = block(
++            0,
++            vec![
++                alloca(0, 32, 32),
++                Instruction::Copy {
++                    dest: Value(1),
++                    src: Operand::Const(IrConst::I32(7)),
++                },
++                Instruction::Copy {
++                    dest: Value(2),
++                    src: Operand::Const(IrConst::I32(9)),
++                },
++            ],
++        );
++        let mut removed = vec![2, 0, 0];
++        remove_instructions(&mut block, &mut removed);
++        assert_eq!(block.instructions.len(), 1);
++        assert_eq!(block.source_spans.len(), 1);
++        assert!(matches!(
++            block.instructions[0],
++            Instruction::Copy { dest: Value(1), .. }
++        ));
++    }
++
++    #[test]
++    fn promotion_removes_entry_alloca_and_keeps_spans_synchronized() {
++        let entry = block(0, vec![alloca(0, 32, 32), alloca(1, 32, 32)]);
++        let body = block(
++            1,
++            vec![
++                intrinsic(
++                    Some(2),
++                    IntrinsicOp::Pcmpeqb256,
++                    Some(0),
++                    vec![Operand::Value(Value(3)), Operand::Value(Value(4))],
++                ),
++                Instruction::Memcpy {
++                    dest: Value(1),
++                    src: Value(0),
++                    size: 32,
++                },
++            ],
++        );
++        let mut function = function("promote", vec![entry, body]);
++        assert_eq!(promote_in_function(&mut function), 1);
++        assert_eq!(function.blocks[0].instructions.len(), 1);
++        assert_eq!(function.blocks[0].source_spans.len(), 1);
++        assert_eq!(function.blocks[1].instructions.len(), 1);
++        assert_eq!(function.blocks[1].source_spans.len(), 1);
++        assert!(matches!(
++            function.blocks[1].instructions[0],
++            Instruction::Intrinsic { dest_ptr: Some(Value(1)), .. }
++        ));
++    }
++
++    #[test]
++    fn derived_destination_access_blocks_promotion() {
++        let mut function = function(
++            "alias_window",
++            vec![block(
++                0,
++                vec![
++                    alloca(0, 32, 32),
++                    alloca(1, 32, 32),
++                    Instruction::Copy {
++                        dest: Value(5),
++                        src: Operand::Value(Value(1)),
++                    },
++                    intrinsic(
++                        Some(2),
++                        IntrinsicOp::Pcmpeqb256,
++                        Some(0),
++                        vec![Operand::Value(Value(3)), Operand::Value(Value(4))],
++                    ),
++                    Instruction::Load {
++                        dest: Value(6),
++                        ptr: Value(5),
++                        ty: IrType::I32,
++                        seg_override: AddressSpace::Default,
++                        volatile: false,
++                    },
++                    Instruction::Memcpy {
++                        dest: Value(1),
++                        src: Value(0),
++                        size: 32,
++                    },
++                ],
++            )],
++        );
++        assert_eq!(promote_in_function(&mut function), 0);
++    }
++
++    #[test]
++    fn stored_destination_address_blocks_promotion_even_outside_window() {
++        let mut function = function(
++            "escaped_destination",
++            vec![block(
++                0,
++                vec![
++                    alloca(0, 32, 32),
++                    alloca(1, 32, 32),
++                    Instruction::Store {
++                        val: Operand::Value(Value(1)),
++                        ptr: Value(9),
++                        ty: IrType::Ptr,
++                        seg_override: AddressSpace::Default,
++                        volatile: false,
++                    },
++                    intrinsic(
++                        Some(2),
++                        IntrinsicOp::Pcmpeqb256,
++                        Some(0),
++                        vec![Operand::Value(Value(3)), Operand::Value(Value(4))],
++                    ),
++                    Instruction::Memcpy {
++                        dest: Value(1),
++                        src: Value(0),
++                        size: 32,
++                    },
++                ],
++            )],
++        );
++        assert_eq!(promote_in_function(&mut function), 0);
++    }
++
++    #[test]
++    fn load_forwarding_rejects_aliasing_source_write() {
++        let mut function = function(
++            "clobber",
++            vec![block(
++                0,
++                vec![
++                    alloca(0, 32, 32),
++                    intrinsic(
++                        Some(1),
++                        IntrinsicOp::Loadu256,
++                        Some(0),
++                        vec![Operand::Value(Value(10))],
++                    ),
++                    Instruction::Store {
++                        val: Operand::Const(IrConst::I32(1)),
++                        ptr: Value(10),
++                        ty: IrType::I32,
++                        seg_override: AddressSpace::Default,
++                        volatile: false,
++                    },
++                    intrinsic(
++                        Some(2),
++                        IntrinsicOp::Pcmpeqb256,
++                        Some(20),
++                        vec![Operand::Value(Value(0)), Operand::Value(Value(21))],
++                    ),
++                ],
++            )],
++        );
++        assert_eq!(fuse_in_function(&mut function), 0);
++        assert_eq!(function.blocks[0].instructions.len(), 4);
++    }
++
++    #[test]
++    fn load_forwarding_keeps_candidates_across_proven_distinct_writes() {
++        let mut function = function(
++            "distinct",
++            vec![block(
++                0,
++                vec![
++                    alloca(0, 32, 32),
++                    alloca(10, 32, 16),
++                    alloca(11, 4, 4),
++                    intrinsic(
++                        Some(1),
++                        IntrinsicOp::Loadu256,
++                        Some(0),
++                        vec![Operand::Value(Value(10))],
++                    ),
++                    Instruction::Store {
++                        val: Operand::Const(IrConst::I32(1)),
++                        ptr: Value(11),
++                        ty: IrType::I32,
++                        seg_override: AddressSpace::Default,
++                        volatile: false,
++                    },
++                    intrinsic(
++                        Some(2),
++                        IntrinsicOp::Pcmpeqb256,
++                        Some(20),
++                        vec![Operand::Value(Value(0)), Operand::Value(Value(21))],
++                    ),
++                ],
++            )],
++        );
++        assert_eq!(fuse_in_function(&mut function), 1);
++        assert_eq!(function.blocks[0].instructions.len(), 5);
++        let Instruction::Intrinsic { args, .. } = &function.blocks[0].instructions[4] else {
++            panic!("expected consumer");
++        };
++        assert!(matches!(args[0], Operand::Value(Value(10))));
++    }
++
++    #[test]
++    fn intrinsic_write_to_slot_invalidates_pending_load() {
++        // v = load(p); v = setzero(); use(v)  — the reassignment writes the
++        // slot itself.  Forwarding use(v) to p would read stale data; the
++        // slot-vs-write check must kill the forward.
++        let mut function = function(
++            "slot_reassign",
++            vec![block(
++                0,
++                vec![
++                    alloca(1, 32, 32), // load slot / variable
++                    alloca(6, 32, 32), // consumer result slot
++                    intrinsic(Some(3), IntrinsicOp::Loadu256, Some(1), vec![Operand::Value(Value(2))]),
++                    intrinsic(Some(4), IntrinsicOp::Setzero256, Some(1), vec![]),
++                    intrinsic(
++                        Some(5),
++                        IntrinsicOp::Paddb256,
++                        Some(6),
++                        vec![Operand::Value(Value(1)), Operand::Value(Value(8))],
++                    ),
++                ],
++            )],
++        );
++        fuse_in_function(&mut function);
++        let Instruction::Intrinsic { args, .. } =
++            function.blocks[0].instructions.last().unwrap()
++        else {
++            panic!("expected consumer");
++        };
++        assert!(
++            matches!(args[0], Operand::Value(Value(1))),
++            "forward after slot reassignment must not reach the stale source"
++        );
++    }
++
++    #[test]
++    fn vec_store_memory_form_is_a_forwarding_barrier() {
++        // VecStoreI64x2 (memory form, dest_ptr: None) writes through args[1].
++        // It must not inherit the register-result exemption of
++        // produces_vector_value.
++        let mut function = function(
++            "vec_store",
++            vec![block(
++                0,
++                vec![
++                    alloca(1, 32, 32),
++                    alloca(6, 32, 32),
++                    intrinsic(Some(3), IntrinsicOp::Loadu256, Some(1), vec![Operand::Value(Value(2))]),
++                    intrinsic(
++                        None,
++                        IntrinsicOp::VecStoreI64x2,
++                        None,
++                        vec![
++                            Operand::Value(Value(7)),
++                            Operand::Value(Value(2)),
++                            Operand::Value(Value(8)),
++                        ],
++                    ),
++                    intrinsic(
++                        Some(5),
++                        IntrinsicOp::Paddb256,
++                        Some(6),
++                        vec![Operand::Value(Value(1)), Operand::Value(Value(9))],
++                    ),
++                ],
++            )],
++        );
++        fuse_in_function(&mut function);
++        let Instruction::Intrinsic { args, .. } =
++            function.blocks[0].instructions.last().unwrap()
++        else {
++            panic!("expected consumer");
++        };
++        // The VecStore wrote through Value(2), the load's source: the forward
++        // must have been killed.
++        assert!(matches!(args[0], Operand::Value(Value(1))));
++    }
++
++    #[test]
++    fn load_with_multiple_consumer_sites_is_not_partially_forwarded() {
++        let mut function = function(
++            "multi_consumer",
++            vec![block(
++                0,
++                vec![
++                    alloca(0, 32, 0),
++                    intrinsic(
++                        Some(1),
++                        IntrinsicOp::LoaduPs256,
++                        Some(0),
++                        vec![Operand::Value(Value(10))],
++                    ),
++                    intrinsic(
++                        Some(2),
++                        IntrinsicOp::AddPs256,
++                        Some(20),
++                        vec![Operand::Value(Value(0)), Operand::Value(Value(21))],
++                    ),
++                    intrinsic(
++                        Some(3),
++                        IntrinsicOp::MulPs256,
++                        Some(22),
++                        vec![Operand::Value(Value(0)), Operand::Value(Value(23))],
++                    ),
++                ],
++            )],
++        );
++        assert_eq!(fuse_in_function(&mut function), 0);
++        assert!(matches!(
++            function.blocks[0].instructions[2],
++            Instruction::Intrinsic { ref args, .. }
++                if matches!(args[0], Operand::Value(Value(0)))
++        ));
++    }
++
++    #[test]
++    fn pointer_arithmetic_between_load_and_consumer_does_not_block_forwarding() {
++        let mut function = function(
++            "address_arithmetic",
++            vec![block(
++                0,
++                vec![
++                    alloca(14, 32, 0),
++                    alloca(28, 32, 0),
++                    alloca(4, 32, 0),
++                    Instruction::Copy {
++                        dest: Value(17),
++                        src: Operand::Const(IrConst::I64(4)),
++                    },
++                    Instruction::BinOp {
++                        dest: Value(18),
++                        op: IrBinOp::Add,
++                        lhs: Operand::Value(Value(4)),
++                        rhs: Operand::Value(Value(17)),
++                        ty: IrType::I64,
++                    },
++                    intrinsic(
++                        Some(20),
++                        IntrinsicOp::Loadu256,
++                        Some(14),
++                        vec![Operand::Value(Value(18))],
++                    ),
++                    Instruction::BinOp {
++                        dest: Value(25),
++                        op: IrBinOp::Add,
++                        lhs: Operand::Value(Value(4)),
++                        rhs: Operand::Value(Value(17)),
++                        ty: IrType::I64,
++                    },
++                    intrinsic(Some(26), IntrinsicOp::Setzero256, Some(28), vec![]),
++                    intrinsic(
++                        Some(30),
++                        IntrinsicOp::Pcmpeqb256,
++                        Some(28),
++                        vec![Operand::Value(Value(14)), Operand::Value(Value(25))],
++                    ),
++                ],
++            )],
++        );
++        assert_eq!(fuse_in_function(&mut function), 1);
++        let Instruction::Intrinsic { args, .. } = function.blocks[0].instructions.last().unwrap() else {
++            panic!("expected consumer");
++        };
++        assert!(matches!(args[0], Operand::Value(Value(18))));
++    }
++
++    #[test]
++    fn fence_and_atomic_load_are_forwarding_barriers() {
++        for barrier in [
++            Instruction::Fence {
++                ordering: AtomicOrdering::SeqCst,
++            },
++            Instruction::AtomicLoad {
++                dest: Value(30),
++                ptr: Operand::Value(Value(31)),
++                ty: IrType::I32,
++                ordering: AtomicOrdering::Acquire,
++            },
++        ] {
++            let mut function = function(
++                "barrier",
++                vec![block(
++                    0,
++                    vec![
++                        alloca(0, 32, 32),
++                        intrinsic(
++                            Some(1),
++                            IntrinsicOp::Loadu256,
++                            Some(0),
++                            vec![Operand::Value(Value(10))],
++                        ),
++                        barrier,
++                        intrinsic(
++                            Some(2),
++                            IntrinsicOp::Pcmpeqb256,
++                            Some(20),
++                            vec![Operand::Value(Value(0)), Operand::Value(Value(21))],
++                        ),
++                    ],
++                )],
++            );
++            assert_eq!(fuse_in_function(&mut function), 0);
++        }
++    }
++
++    #[test]
++    fn scalar_intrinsic_argument_is_never_forwarded() {
++        let mut function = function(
++            "scalar_arg",
++            vec![block(
++                0,
++                vec![
++                    alloca(0, 32, 32),
++                    intrinsic(
++                        Some(1),
++                        IntrinsicOp::Loadu256,
++                        Some(0),
++                        vec![Operand::Value(Value(10))],
++                    ),
++                    intrinsic(
++                        Some(2),
++                        IntrinsicOp::SetEpi32_256,
++                        Some(20),
++                        vec![Operand::Value(Value(0))],
++                    ),
++                ],
++            )],
++        );
++        assert_eq!(fuse_in_function(&mut function), 0);
++    }
++
++    #[test]
++    fn alignment_relaxation_tracks_safe_gep_aliases() {
++        let mut function = function(
++            "align_gep",
++            vec![block(
++                0,
++                vec![
++                    alloca(0, 32, 32),
++                    Instruction::GetElementPtr {
++                        dest: Value(1),
++                        base: Value(0),
++                        offset: Operand::Const(IrConst::I64(8)),
++                        ty: IrType::I8,
++                    },
++                    Instruction::Load {
++                        dest: Value(2),
++                        ptr: Value(1),
++                        ty: IrType::I64,
++                        seg_override: AddressSpace::Default,
++                        volatile: false,
++                    },
++                ],
++            )],
++        );
++        assert_eq!(downgrade_in_function(&mut function), 1);
++        assert!(matches!(
++            function.blocks[0].instructions[0],
++            Instruction::Alloca { align: 0, .. }
++        ));
++    }
++
++    #[test]
++    fn alignment_observed_as_integer_is_not_relaxed() {
++        let mut function = function(
++            "align_integer",
++            vec![block(
++                0,
++                vec![
++                    alloca(0, 32, 32),
++                    Instruction::BinOp {
++                        dest: Value(1),
++                        op: IrBinOp::And,
++                        lhs: Operand::Value(Value(0)),
++                        rhs: Operand::Const(IrConst::I64(31)),
++                        ty: IrType::I64,
++                    },
++                ],
++            )],
++        );
++        assert_eq!(downgrade_in_function(&mut function), 0);
++    }
++
++    #[test]
++    fn vectorizer_offset_cannot_hide_an_address_observation() {
++        let mut function = function(
++            "offset_address",
++            vec![block(
++                0,
++                vec![
++                    alloca(0, 32, 32),
++                    intrinsic(
++                        Some(2),
++                        IntrinsicOp::LoadF64x4,
++                        Some(3),
++                        vec![Operand::Value(Value(4)), Operand::Value(Value(0))],
++                    ),
++                ],
++            )],
++        );
++        assert_eq!(downgrade_in_function(&mut function), 0);
++    }
++
++    #[test]
++    fn unaligned_store_destination_allows_alignment_relaxation() {
++        let mut function = function(
++            "storeu",
++            vec![block(
++                0,
++                vec![
++                    alloca(0, 32, 32),
++                    alloca(1, 32, 16),
++                    intrinsic(
++                        None,
++                        IntrinsicOp::Storeu256,
++                        Some(0),
++                        vec![Operand::Value(Value(1))],
++                    ),
++                ],
++            )],
++        );
++        assert_eq!(downgrade_in_function(&mut function), 1);
++        assert!(matches!(
++            function.blocks[0].instructions[0],
++            Instruction::Alloca { align: 0, .. }
++        ));
++    }
++
++    #[test]
++    fn non_temporal_store_retains_required_align16() {
++        let mut function = function(
++            "movnt",
++            vec![block(
++                0,
++                vec![
++                    alloca(0, 32, 32),
++                    alloca(1, 16, 16),
++                    intrinsic(
++                        None,
++                        IntrinsicOp::Movntdq,
++                        Some(0),
++                        vec![Operand::Value(Value(1))],
++                    ),
++                ],
++            )],
++        );
++        assert_eq!(downgrade_in_function(&mut function), 1);
++        assert!(matches!(
++            function.blocks[0].instructions[0],
++            Instruction::Alloca { align: 16, .. }
++        ));
++    }
++
++    #[test]
++    fn volatile_and_atomic_allocas_are_not_relaxed() {
++        let mut volatile = function(
++            "volatile",
++            vec![block(
++                0,
++                vec![Instruction::Alloca {
++                    dest: Value(0),
++                    ty: IrType::Ptr,
++                    size: 32,
++                    align: 32,
++                    volatile: false,
++                    semantic_volatile: true,
++                }],
++            )],
++        );
++        assert_eq!(downgrade_in_function(&mut volatile), 0);
++
++        let mut atomic = function(
++            "atomic",
++            vec![block(
++                0,
++                vec![
++                    alloca(0, 16, 32),
++                    Instruction::AtomicLoad {
++                        dest: Value(1),
++                        ptr: Operand::Value(Value(0)),
++                        ty: IrType::I128,
++                        ordering: AtomicOrdering::SeqCst,
++                    },
++                ],
++            )],
++        );
++        assert_eq!(downgrade_in_function(&mut atomic), 0);
++    }
++
++    #[test]
++    fn pointer_root_survives_lowered_integer_width_offset_arithmetic() {
++        let param = IrParam {
++            ty: IrType::Ptr,
++            noalias: false,
++            struct_size: None,
++            struct_align: None,
++            struct_eightbyte_classes: Vec::new(),
++            is_f128_sse: false,
++            riscv_float_class: None,
++        };
++        let mut function = IrFunction::new("pointer_add".into(), IrType::I32, vec![param], false);
++        function.blocks.push(block(
++            0,
++            vec![
++                Instruction::ParamRef {
++                    dest: Value(1),
++                    param_idx: 0,
++                    ty: IrType::Ptr,
++                },
++                Instruction::Cast {
++                    dest: Value(2),
++                    src: Operand::Const(IrConst::I32(4)),
++                    from_ty: IrType::I32,
++                    to_ty: IrType::I64,
++                },
++                Instruction::BinOp {
++                    dest: Value(3),
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(Value(1)),
++                    rhs: Operand::Value(Value(2)),
++                    ty: IrType::I64,
++                },
++            ],
++        ));
++        assert_eq!(
++            pointer_roots(&function).get(&3),
++            Some(&PointerRoot::Param { index: 0, noalias: false })
++        );
++    }
++
++    #[test]
++    fn restrict_roots_are_distinct_but_plain_parameters_are_not() {
++        let restricted = PointerRoot::Param {
++            index: 0,
++            noalias: true,
++        };
++        let plain = PointerRoot::Param {
++            index: 1,
++            noalias: false,
++        };
++        assert!(roots_proven_distinct(restricted, plain));
++        assert!(!roots_proven_distinct(
++            plain,
++            PointerRoot::Param {
++                index: 2,
++                noalias: false,
++            },
++        ));
++        let _param_shape = IrParam {
++            ty: IrType::Ptr,
++            noalias: true,
++            struct_size: None,
++            struct_align: None,
++            struct_eightbyte_classes: Vec::new(),
++            is_f128_sse: false,
++            riscv_float_class: None,
++        };
++    }
++}
+diff --git a/tests/linker/setup_oracles.sh b/tests/linker/setup_oracles.sh
+index ae235a8..a328a54 100644
+--- a/tests/linker/setup_oracles.sh
++++ b/tests/linker/setup_oracles.sh
+@@ -85,6 +85,7 @@ else
+         -DCMAKE_BUILD_TYPE=Release \
+         -DMOLD_TARGETS='X86_64;I386' \
+         -DMOLD_USE_MIMALLOC=OFF \
++        -DMOLD_LTO=OFF \
+         -DCMAKE_C_FLAGS="-O2 $NATIVE" \
+         -DCMAKE_CXX_FLAGS="-O2 $NATIVE" \
+         -DCMAKE_INSTALL_PREFIX="$SRC/mold-inst"
+@@ -156,6 +157,21 @@ else
+   log "bfd 2.47: $("$BIN/ld.bfd-2.47" --version | head -1)"
+ fi
+ 
++# Record the resolved oracle revisions so session docs can cite exact
++# versions instead of an unreproducible "HEAD".  mold/wild are built from
++# git HEAD by policy, but WHICH head must be auditable after the fact.
++{
++  echo "# LCCC linker oracle revisions (recorded $(date -u +%Y-%m-%dT%H:%M:%SZ))"
++  if [[ -d "$SRC/mold-src/.git" ]]; then
++    echo "mold:  $(git -C "$SRC/mold-src" rev-parse HEAD 2>/dev/null || echo unknown)"
++  fi
++  if [[ -d "$SRC/wild-src/.git" ]]; then
++    echo "wild:  $(git -C "$SRC/wild-src" rev-parse HEAD 2>/dev/null || echo unknown)"
++  fi
++  echo "binutils (bfd/as reference): $BINUTILS_VERSION"
++  echo "mold build targets: X86_64;I386"
++} > "$BIN/ORACLE_REVISIONS.txt"
++
+ cat <<EOF
+ 
+ Oracles ready in $BIN
+@@ -168,4 +184,6 @@ Then:
+     tests/linker/run_linker_tests.py
+     tests/linker/real_workloads.py
+     tests/linker/bench_linker.py
++
++Resolved revisions: $BIN/ORACLE_REVISIONS.txt
+ EOF
+diff --git a/tests/regression/check_bit_test_canonical.sh b/tests/regression/check_bit_test_canonical.sh
+index 9f91483..fab014a 100755
+--- a/tests/regression/check_bit_test_canonical.sh
++++ b/tests/regression/check_bit_test_canonical.sh
+@@ -16,7 +16,11 @@ unsigned constbit(unsigned x) { return (x >> 3) & 1u; }
+ EOF
+ 
+ "$CCC" -O3 -S "$td/bt.c" -o "$td/x86.s"
+-grep -Eq 'btl[[:space:]]+%r[abcd]x, %r[0-9]+' "$td/x86.s"
++# Register-index BT form.  BT's index is an ordinary r/m operand (it has no
++# fixed count register, unlike variable shifts), so the index is consumed
++# straight from its own register (`btl %edx, %r8`) rather than staged through
++# %rcx.  Assert the general register-index shape, not the staging register.
++grep -Eq 'bt[lq][[:space:]]+%[a-z0-9]+,[[:space:]]*%[a-z0-9]+' "$td/x86.s"
+ grep -Eq 'btl[[:space:]]+\$3, %' "$td/x86.s"
+ # The source has no main; only assemble/codegen is required here. A
+ # separate runtime harness links the object below when the host linker is
