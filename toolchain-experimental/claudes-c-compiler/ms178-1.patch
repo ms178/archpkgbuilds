@@ -1,231 +1,1905 @@
-diff --git a/docs/history/2026-08-22-session47-nrs-prologue-detection.md b/docs/history/2026-08-22-session47-nrs-prologue-detection.md
-new file mode 100644
-index 0000000..5919726
---- /dev/null
-+++ b/docs/history/2026-08-22-session47-nrs-prologue-detection.md
-@@ -0,0 +1,104 @@
-+# Session 47 — re-base onto PR #184/#185 + dead-store elimination revival (2026-08-22)
-+
-+Base: `ms178/lccc` main `7811dc1` (merges PR #184 — ARM peephole battery,
-+scalar fmsub/fnmsub contraction, five codegen correctness fixes — and PR #185,
-+the session-46 MachInst narrowing-cast fix). Build: `fastbuild`, Rust opt-level
-+1, no LTO, two jobs, 4 GiB swap. Host: constrained VM without PMU.
-+
-+## Fix: `eliminate_never_read_stores` was dead for no-FP functions with pushes
-+
-+### Root cause (traced line by line)
-+
-+`peephole/passes/dead_code.rs::eliminate_never_read_stores` detects function
-+prologues in two forms:
-+
-+1. **Form 1 (frame pointer):** `pushq %rbp` + `movq %rsp,%rbp` + `subq $N,%rsp`
-+2. **Form 2 (no frame pointer):** `subq $N,%rsp` preceded by a `.cfi` directive
-+   within a fixed 3-line window
-+
-+Two independent defects made form 2 unreachable for the common six-push no-FP
-+prologue (lccc allocates `%rbp` as an ordinary callee-saved register in no-FP
-+mode, so the push chain is `%rbx %r12 %r13 %r14 %r15 %rbp`):
-+
-+- **Form-1 failure path skipped the prologue marker.** When `pushq %rbp` was
-+  NOT followed by `movq %rsp,%rbp` (the normal no-FP case), the loop jumped to
-+  `j + 1` — one line PAST the `subq $N,%rsp` — so the subq line was never
-+  examined by form 2.
-+- **Form-2's 3-line directive window missed.** Even when the subq was reached,
-+  the `.cfi_startproc` directive sat 7 lines back (behind the six pushes) and
-+  the fixed `i - 3` window missed it.
-+
-+Net effect: every function with a callee-saved push chain silently skipped
-+dead-store elimination. The gzip CRC kernel kept a never-read
-+`movq %rax, 8(%rsp)` in its inner loop (the loaded table value's slot home
-+was stored but never loaded again).
-+
-+### The fix
-+
-+- Form-1's failure path now falls through (`i += 1`) so the `subq` gets its
-+  own form-2 examination.
-+- Form-2's directive scan now walks back up to 16 lines, treating `Push`
-+  lines (callee-saved saves) and nops as transparent, and stops at the first
-+  other line — a directive containing `cfi_startproc`/`cfi_def_cfa_offset`
-+  confirms the prologue; any other terminator fails closed (an interior
-+  `subq` cannot match a previous function's directive).
-+
-+Both changes only widen the pass's reach to the prologue shapes it was
-+already designed for (the form-2 path with its full safety nets — escape
-+pre-scan, rsp-shift bail, read-range collection — was simply unreachable).
-+
-+### Measured effect
-+
-+gzip CRC kernel TU: `main` 118 → 112 instructions (the dead store plus the
-+frame-slot bookkeeping disappears from the hot check loop). Runtime on the
-+1048576-iteration loop unchanged (that loop was already clean); the win is
-+the pass being alive for the entire class of no-FP functions.
-+
-+### Regression coverage
-+
-+New unit test `test_never_read_store_eliminated_in_six_push_nofp_function`
-+pins the exact six-push no-FP shape through the full `peephole_optimize`.
-+
-+## Follow-up work carried over (root causes now precisely documented)
-+
-+1. **RA-03 Adler DO8** — `main` spills v540 (`sum1`, loop-weighted uses 1000)
-+   and friends because Phase 1's six callee-saved registers are claimed by
-+   six earlier-arriving hot values and mode-3 eviction refuses all victims
-+   (every next use is inside the incoming's span). Eviction-policy A/B
-+   (modes 2/4/5) is all worse (60/60/88 stack refs vs mode-3's 60); the real
-+   fix is RA-06 live-range splitting / next-use allocation, not another
-+   eviction knob.
-+2. **RA-01/IS-22 CRC** — the remaining 112-vs-50 gap vs GCC is (a) the PIE
-+   per-iteration `leaq sym(%rip), %rcx` base remat (lccc defaults to PIE;
-+   `sym(,%idx,scale)` is illegal there, GCC-style absolute SIB only works
-+   non-PIE) — needs an OP-34 relaxation allowing preheader register homes
-+   for indexed GlobalAddr bases — and (b) accumulator relay noise
-+   (`movq %rax,%rsi; movl %esi,%ecx`), which is the IS-08 load-cast-fold
-+   extension. Both require the gzip veto gate.
-+3. **Sema const-assignment (C11 6.5.16.2)** — `Declaration::is_const()`
-+   exists, but the parser folds all declarator qualifiers into one flag
-+   (`const int *p` vs `int *const p` are indistinguishable), so a correct
-+   modifiable-lvalue diagnostic needs per-pointer-level qualifier tracking —
-+   the same infrastructure as FE-02 (TBAA/restrict). Do not ship a naive
-+   `is_const` check: it would wrongly reject legal `const int *p; p = q;`.
-+4. **`movl %eax,%eax` artifact** — after `movslq (mem),%rax` the `movl
-+   %eax,%eax` is a REQUIRED zero-extension for U32 semantics; the right
-+   elimination is emitting the load at the destination width directly
-+   (load-cast fold, IS-08), not deleting the movl.
-+
-+## Validation battery (all on the final tree)
-+
-+| Gate | Result |
-+|------|--------|
-+| `cargo test --lib` | **1075 pass**, 6 ignored (incl. new NRS unit test) |
-+| Regression corpus | **382 pass / 0 fail / 7 documented skips** (389 total) |
-+| intrinsics (t128/t256/t512) | **3/3** |
-+| gzip 1.14 (pinned SHA `01a7b881…`) | **30/30** + doc roundtrip |
-+| zlib-ng 2.3.3 pinned gate | **ctest=8, roundtrip=0** |
-+| expat 2.7.1 (lccc-built) | **2/2 ctest** |
-+| phi CFG fuzz 0:600 × 3 levels | **1800/1800** |
-+| differential fuzz 0:500 × 3 levels | **1500/1500** |
-+| alias fuzz m32 0:540 × O2/Os | **1080/1080** |
-+| checkers (sema/bit-test/redundant-test/rmw-copyprop) | all pass |
-+
-+No PMU evidence: VM screening only, per project policy.
-diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
-index fb47851..5de877e 100644
---- a/engineering/agent/BACKLOG.md
-+++ b/engineering/agent/BACKLOG.md
-@@ -363,6 +363,7 @@ engineering/evidence/workloads/
- - ✅ **`alias.rs`** — `LoopFrames`, `resolve_in_frame`, `forms_disjoint` (consumed by `redundant_loads` only).
- - ✅ **Engineering doc tree** — `engineering/{STATE.md, agent/{BACKLOG,RULES,SEQUENCE,README}.md, evidence/godbolt/}`.
- - ✅ **Session 44 (2026-08-22)** — re-based onto PR #179; `hot_loop_home` Phase-1 candidacy now keys on the hottest **use-site** loop depth (preheader-defined IVs get callee-saved homes; ra01 proxy 124→117 insns / 34→20 stack refs); ABI-hinted ParamRefs are never evicted (`select_evict_victim`); rbp(6) accepted as a callee-saved prestore home; the fallback ParamRef ABI read is pinned via `# LCCC_PARAM_ABI_READ`; `vector_temp_promotion` constant-address load sources survive only alloca-confined writes; `gen_lcccsimd.py` imm-builtin protos no longer declare a trailing `int __imm` (t128/t256/t512 intrinsics compile again); `tests/regression/run_regression.py` (the missing-in-repo corpus runner) plus `.env` oracle opt-outs for three host/feature-dependent tests. Zero-future-use eviction search measured (Adler +15%) and **reverted** — do not resurrect without the Adler/gzip oracles. See `docs/history/2026-08-22-session44-rebase-soundness-sweep.md`.
-+- ✅ **Session 47 (2026-08-22)** — `eliminate_never_read_stores` revived for no-FP functions with callee-saved push chains.  Two defects made the form-2 (`subq $N,%rsp`) prologue detector unreachable: the form-1 failure path (`pushq %rbp` NOT followed by `movq %rsp,%rbp` — the normal no-FP case, since lccc allocates rbp as a callee-saved register) skipped one line PAST the subq, and form-2's fixed 3-line window missed the .cfi directive behind six pushes.  Net effect: dead-slot-store elimination silently skipped every such function (gzip CRC kernel kept a never-read `movq %rax, 8(%rsp)` in its inner loop).  Fix: fall through on form-1 mismatch; scan back up to 16 lines past push/nop lines, fail closed on any other terminator.  CRC TU: main 118→112 instructions. New unit test pins the six-push no-FP shape.  Follow-up root causes documented in `docs/history/2026-08-22-session47-nrs-prologue-detection.md`: RA-03 DO8 needs RA-06 splitting (eviction-mode A/B all worse), CRC PIE base-remat needs an OP-34 preheader-home relaxation, sema const-assignment needs per-pointer-level qualifiers (FE-02), and the `movl %eax,%eax` artifact needs load-width-directed folds (IS-08) — not deletion.  Validated: 1075 unit, 382/389 regression, intrinsics 3/3, gzip 30/30 + roundtrip, zlib-ng ctest=8 roundtrip=0, expat 2/2, phi 1800/1800, differential 1500/1500, alias-m32 1080/1080.
- - ✅ **Session 46 (2026-08-22)** — MachInst partial-register segfault class closed. `lower_cast` (x86-64 MachInst ISel) lowered every narrowing/same-size cast as a truncating `movb`/`movw`/`movl`, leaving the destination register's upper bits stale; the folded-SIB index path then read a never-materialized cast result from its (die-at-birth-shared) home at 64-bit width — zlib-ng `zng_emit_dist`'s `extra_dbits(%rcx,%r10,4)` segfaulted OOB. Narrowing/same-size casts now emit extending moves (`movzbl`/`movsbl`/`movzwl`/`movswl`/`movslq`; `movl`-via-`Movzx` so a die-at-birth self-move can never skip the extension; `movl`/`movq $imm` for constants), matching the mature path and GCC/Clang.  The IR always widens sub-32-bit values through an explicit Cast before wider uses, so extending every cast home closes the whole class.  New regressions: `session46_dist_code_index.c` (the zlib shape) and `session46_narrow_cast_torture.c` (U8/U16/I8/I16 × index/shift/mul/select/call/chain, GCC-differential).  Validated: 1046 unit (3 new `lower_cast` tests), 375/383 regression, intrinsics 3/3, zlib-ng 2.3.3 gate ctest=8 roundtrip=0, gzip 1.14 30/30 + roundtrip, expat 2.7.1 2/2 ctest, phi 1800/1800, differential 1500/1500, alias-m32 1080/1080.  See `docs/history/2026-08-22-session46-machinst-partial-register-segfault.md`.
- - ✅ **Session 45 (2026-08-22)** — final red-team audit of vector-temp-promotion v3 (Agent B's patch, independently re-red-teamed): `Load256`/`Store256` keep their 32-byte alignment contracts (not forwardable/relaxable); promotion additionally requires `intrinsic_overwrites_full_result` (FMA/BroadcastLoadF64/store forms never rewrite their dest); `intrinsic_dest_reads_old_value` centralizes RMW destination semantics and feeds `single_read_sites` so write-only dests stop keeping forwarded loads alive (gzip PCLMUL −5 static insns); `pointer_roots` → `pointer_root_analysis` with iterative Kosaraju SCC + single-seed cycle shortcut (`p = phi(seed, p+stride)` now resolves, multi-seed cycles fail closed) + recurrence tracking gating the multi-use Loaddqu exception; wide scalar accesses retain natural alignment (I128/F128 on non-x86); pass order is promote → fuse → downgrade; O(1) load-result membership. Adoption audit fixed: module-wide `max_value_id` array sizing → dense per-function value-id renumbering, the quadratic terminator-loop lookup B missed, `cyclic_seed` simplification, and the complexity comment (O(V + Σ arity²), not flat O(V+E)). Kept the session-44 constant-address rule (alloca-confined writes provably cannot hit a fixed address). New stress regression `session45_vector_recurrence_stress.c`. See `docs/history/2026-08-22-session45-vector-promotion-v3-audit.md`.
- - ✅ **Session 43** — red-team of Agent D's vector-temp-promotion v2: adopted (movnt align-16 relaxation via `intrinsic_dest_required_alignment`, unified width-typed `pointer_vector_arg_width`, non-escaping-alloca alias refinement, load-load chaining, single-read-site gating) and fixed two miscompiles it re-introduced — (1) `invalidate_for_value_write` dropped the slot-vs-write check (reassignment `v=load(p); v=setzero(); use(v)` read stale `p`), now a `write_may_clobber` slot+source test; (2) `VecStoreI64x2` writes memory through `args[1]` with `dest_ptr:None` but inherited the `produces_vector_value` register-result exemption. Also re-added the load-`dest` dead check and added the six 256-bit widening extensions (Pmovzx*/Pmovsx*256) to the forwardable/relaxable table. Measured: simd_movnt 422→390 insns / frame 440→392; simd_avx2_256 743→734 / 1016→824. See `docs/history/2026-08-21-session43-vector-promotion-v2-redteam.md`.
-diff --git a/src/backend/x86/codegen/peephole/passes/dead_code.rs b/src/backend/x86/codegen/peephole/passes/dead_code.rs
-index 144c88f..a55e703 100644
---- a/src/backend/x86/codegen/peephole/passes/dead_code.rs
-+++ b/src/backend/x86/codegen/peephole/passes/dead_code.rs
-@@ -455,7 +455,14 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
-             }
-             let mov_line = infos[j].trimmed(store.get(j));
-             if mov_line != "movq %rsp, %rbp" {
--                i = j + 1;
-+                // Not a frame-pointer prologue: %rbp was pushed as an ordinary
-+                // callee-saved register (no-FP mode allocates rbp), and the
-+                // real prologue marker is the `subq $N,%rsp` that follows the
-+                // push chain.  Falling through to the form-2 detection lets
-+                // that line be examined instead of skipping it — the old
-+                // `i = j + 1` jumped PAST the subq and disabled dead-store
-+                // elimination for every six-push no-FP function.
-+                i += 1;
-                 continue;
-             }
-             j += 1;
-@@ -518,19 +525,29 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
-             }
-             // Must be preceded by .cfi_startproc (within 3 lines) to confirm this
-             // is a function prologue and not just a random subq in the middle.
-+            // Callee-saved pushes (`pushq %rbx` … `pushq %rbp`) legitimately sit
-+            // between the .cfi directives and the `subq $N,%rsp`: a six-push
-+            // prologue moved the directive 7+ lines away and the old fixed
-+            // 3-line window missed it, silently skipping dead-store
-+            // elimination for the entire function (gzip CRC kernel: a
-+            // never-read `movq %rax, 8(%rsp)` survived forever).  Scan back
-+            // past up to 8 push-save lines for the directive; any other
-+            // non-nop line terminates the window (an interior `subq` must not
-+            // match a directive belonging to an earlier function).
-             let mut found_cfi = false;
--            let check_start = if i >= 3 { i - 3 } else { 0 };
--            for k in check_start..i {
--                if infos[k].is_nop() {
-+            let check_start = if i >= 16 { i - 16 } else { 0 };
-+            for k in (check_start..i).rev() {
-+                if infos[k].is_nop() || matches!(infos[k].kind, LineKind::Push { .. }) {
-                     continue;
-                 }
-                 if matches!(infos[k].kind, LineKind::Directive) {
-                     let dl = infos[k].trimmed(store.get(k));
-                     if dl.contains("cfi_startproc") || dl.contains("cfi_def_cfa_offset") {
-                         found_cfi = true;
--                        break;
-                     }
-+                    break;
-                 }
-+                break;
-             }
-             if !found_cfi {
-                 i += 1;
-diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
-index e5cd894..7b2fbe9 100644
---- a/src/backend/x86/codegen/peephole/passes/mod.rs
-+++ b/src/backend/x86/codegen/peephole/passes/mod.rs
-@@ -808,6 +808,50 @@ pub fn peephole_optimize(mut asm: String) -> String {
- mod tests {
-     use super::*;
+From ebb8fb113c9f4e52c16c143d57237e55fd9681f9 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Sat, 22 Aug 2026 02:40:21 +0000
+Subject: [PATCH 1/2] NEON i32 max reduction via smax/smaxv + late AArch64
+ vectorization pass
+
+AUDITED PORT of levkropp 8b139820 (max reductions) and the 8ef1978f
+late-pass concept, rebuilt for our diverged vectorizer rather than
+cherry-picked (his diffs no longer apply; our transform has byte-IV
+strength reduction and different remainder plumbing).
+
+New pipeline stage: vectorize_function_two_wide_late runs after the
+main pass loop's if_convert phase (AArch64, not -Os/-Oz; gates:
+CCC_DISABLE_PASSES=latevec or vectorize). Max reductions only exist in
+Select form after if-conversion, so the early vectorizer structurally
+never sees them (verified: early pass logs 'Rejecting conditional
+reduction loop' on the CondBranch form). Idempotent by construction --
+already-vectorized loops contain Vec* intrinsics and fail the scalar
+shape analyzers. source_spans invalidated by block surgery are dropped
+(wrong-line debug info otherwise), then DCE.
+
+Detector (analyze_reduction_pattern): accumulator phi whose latch
+incoming is a Select of {phi, loaded element}, cond = signed compare of
+element vs phi, all four polarities. SIGNED only -- smax must never
+match an unsigned compare (that needs umax). NEON-gated. STRICT shape
+gate kept from his version: the access must be a marching-pointer phi
+stepping exactly 4 bytes whose preheader incoming is a constant-offset
+GEP at iv_init*4 -- coverage legality depends on it, and a direct
+IV-indexed GEP would be re-scaled wrong (rejected outright).
+
+Transform: broadcast scalar init into the vector accumulator (zero
+vector iterations reduce back to the init -- smaxv of 4 equal lanes),
+lane-wise VecSmaxI32x4 in the body, VecHorizontalMaxI32x4 (smaxv) in
+vec_exit, marching-pointer step scaled 4->16 bytes. Remainder: scalar
+Cmp+Select, start index w*(iv_final - c) RELATIVE to the pointer's
+preheader element c, limit shifted to n-c (constant-folded or a Sub on
+dynamic limits).
+
+Port bugs found by the adversarial battery and fixed before commit:
+1. VecHorizontalMaxI32x4 initially classified as vector-producing;
+   its dest then hit ARM callee_saved_name with a vector-reg index ->
+   ICE 'invalid ARM register index'. It produces a scalar I32, exactly
+   like the VecHorizontalAdd family.
+2. The remainder initially addressed relative to the marching-pointer
+   PHI -- but as an SSA value read in vec_exit that phi holds the END
+   pointer, double-counting vector coverage (out-of-bounds reads for
+   large n). Now resolves the phi's preheader incoming.
+3. Marching-pointer latch step was left at 4 bytes while the body
+   consumed 4 lanes -- every vector load after the first read 3 stale
+   lanes. Now scaled to 16 with a debug_assert that the step was found.
+
+Fail-closed details: phi edges are read before any mutation (no
+partially-rewired phi on unexpected shapes); AVX2 transform arm is
+unreachable!() for Max (NEON-only routing); x86 emitter falls through
+to the loud unhandled-intrinsic diagnostic.
+
+Measured: find_max 65536x2000 1.52x under qemu-aarch64 (smax-vec vs
+scalar, outputs identical); 47-case edge matrix (n in {1..4096},
+iv_init 0/1, both polarities, all-negative, INT_MIN seed) bit-identical
+to gcc at O0/O1/O2 on ARM and x86.
+
+Validation: 1074/1074 unit, 50/50 correctness, x86 regression 400/401
+(1 = documented pre-existing check_tier2), ARM regression 0 new fails
+vs baseline, fuzz 300/300 x3, ARM benchmark battery 8/8, reproducer
+sweep green. New test: vectorize_max_reduction_neon.c (x86 + ARM).
+---
+ src/backend/arm/codegen/intrinsics.rs         |  16 +-
+ src/ir/intrinsics.rs                          |   9 +-
+ src/passes/cfg_simplify.rs                    |   4 +-
+ src/passes/constant_fold.rs                   |   6 +-
+ src/passes/copy_prop.rs                       |  11 +-
+ src/passes/dead_statics.rs                    |   6 +-
+ src/passes/global_addr_cse.rs                 |   2 +-
+ src/passes/if_convert.rs                      |  23 +-
+ src/passes/inline.rs                          |  28 +-
+ src/passes/iv_strength_reduce.rs              |   8 +-
+ src/passes/licm.rs                            |   2 +-
+ src/passes/mod.rs                             |  30 +
+ src/passes/outline_switch.rs                  |  15 +-
+ src/passes/quadratic_sr.rs                    |   2 +-
+ src/passes/set_membership.rs                  |   8 +-
+ src/passes/vector_temp_promotion.rs           |   8 +-
+ src/passes/vectorize.rs                       | 920 +++++++++++++++---
+ .../regression/vectorize_max_reduction_neon.c |  22 +
+ 18 files changed, 950 insertions(+), 170 deletions(-)
+ create mode 100644 tests/regression/vectorize_max_reduction_neon.c
+
+diff --git a/src/backend/arm/codegen/intrinsics.rs b/src/backend/arm/codegen/intrinsics.rs
+index 79fffacb..9ac8abea 100644
+--- a/src/backend/arm/codegen/intrinsics.rs
++++ b/src/backend/arm/codegen/intrinsics.rs
+@@ -3,7 +3,7 @@
+ //! NEON intrinsics: SSE-equivalent operations via 128-bit NEON instructions.
+ //! F128: IEEE 754 binary128 via compiler-rt/libgcc soft-float libcalls.
  
-+    #[test]
-+    fn test_never_read_store_eliminated_in_six_push_nofp_function() {
-+        // No-FP functions push rbp as an ordinary callee-saved register, so
-+        // the `subq $N,%rsp` prologue marker is separated from the .cfi
-+        // directives by the whole push chain.  The old form-1 failure path
-+        // skipped past the subq and the form-2 window missed the directives,
-+        // disabling dead-store elimination for such functions entirely
-+        // (gzip CRC kernel: a never-read `movq %rax, 8(%rsp)` survived).
-+        let asm = concat!(
-+            "main:\n",
-+            ".cfi_startproc\n",
-+            "    pushq %rbx\n",
-+            "    pushq %r12\n",
-+            "    pushq %r13\n",
-+            "    pushq %r14\n",
-+            "    pushq %r15\n",
-+            "    pushq %rbp\n",
-+            "    subq $24, %rsp\n",
-+            ".cfi_def_cfa_offset 80\n",
-+            "    movabsq $4294967295, %r13\n",
-+            ".L1:\n",
-+            "    movl (%rsi), %eax\n",
-+            "    movq %rax, 8(%rsp)\n",
-+            "    addl %eax, %r13d\n",
-+            "    jmp .L1\n",
-+            ".Lend:\n",
-+            "    addq $24, %rsp\n",
-+            "    popq %rbp\n",
-+            "    popq %r15\n",
-+            "    popq %r14\n",
-+            "    popq %r13\n",
-+            "    popq %r12\n",
-+            "    popq %rbx\n",
-+            "    ret\n",
-+            ".size main, .-main\n",
-+        )
-+        .to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            !result.contains("movq %rax, 8(%rsp)"),
-+            "never-read slot store must be eliminated:\n{result}"
+-use super::emit::{arm_fp_name, arm_vector_name, callee_saved_name, is_arm_fp_phys, ArmCodegen};
++use super::emit::{ArmCodegen, arm_fp_name, arm_vector_name, callee_saved_name, is_arm_fp_phys};
+ use crate::common::types::IrType;
+ use crate::ir::reexports::{IntrinsicOp, Operand, Value};
+ 
+@@ -597,6 +597,18 @@ impl ArmCodegen {
+                 }
+             }
+ 
++            // NEON smaxv: horizontal signed max of 4 I32 lanes into a scalar.
++            // The result is a full-width I32 (smaxv writes s0's low 32 bits);
++            // fmov w0 zero-extends into x0, matching the I32 store contract.
++            IntrinsicOp::VecHorizontalMaxI32x4 => {
++                let a = self.load_vector_value_128(&args[0], "q0");
++                self.state.emit_fmt(format_args!("    smaxv s0, {}.4s", a));
++                self.state.emit("    fmov w0, s0");
++                if let Some(d) = dest {
++                    self.store_x0_to(d);
++                }
++            }
++
+             // NEON sadalp: accumulate sign-extended adjacent pairs of a 4×I32
+             // vector into a 2×I64 accumulator (one instruction per 4 elements).
+             IntrinsicOp::VecSadalpI32x4 => {
+@@ -695,6 +707,7 @@ impl ArmCodegen {
+             | IntrinsicOp::VecAddF32x4
+             | IntrinsicOp::VecMulF32x4
+             | IntrinsicOp::VecAddI32x4
++            | IntrinsicOp::VecSmaxI32x4
+             | IntrinsicOp::VecMulI32x4 => {
+                 if let Some(d) = dest {
+                     let a = self.load_vector_value_128(&args[0], "q0");
+@@ -705,6 +718,7 @@ impl ArmCodegen {
+                         IntrinsicOp::VecAddF32x4 => ("fadd", "4s"),
+                         IntrinsicOp::VecMulF32x4 => ("fmul", "4s"),
+                         IntrinsicOp::VecAddI32x4 => ("add", "4s"),
++                        IntrinsicOp::VecSmaxI32x4 => ("smax", "4s"),
+                         _ => ("mul", "4s"),
+                     };
+                     if let Some(name) = self.assigned_vector_reg(d.0) {
+diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
+index 0e5b41ab..39d57363 100644
+--- a/src/ir/intrinsics.rs
++++ b/src/ir/intrinsics.rs
+@@ -266,6 +266,12 @@ pub enum IntrinsicOp {
+     /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+     VecMulI32x4,
+     VecMulI32x8,
++    /// NEON smax: per-lane signed max of two 4xI32 vectors (args[0], args[1]).
++    /// Integer max is associative, commutative, and idempotent, so lane-order
++    /// reduction matches sequential scalar max bit-for-bit (levkropp 8b139820).
++    VecSmaxI32x4,
++    /// NEON smaxv: horizontal signed max of 4xI32 lanes; dest = scalar I32.
++    VecHorizontalMaxI32x4,
+     /// Broadcast a scalar I32 to all 4 lanes: %dest_vec = {x, x, x, x}
+     /// args[0] = scalar I32 value; dest = result vector
+     VecBroadcastI32x4,
+@@ -1075,7 +1081,7 @@ impl IntrinsicOp {
+             | VecMulF64x2 | VecBroadcastF64x2 | VecAddI32x4 | VecZeroF64x2
+             | VecZeroI32x4 | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4 | VecBroadcastF32x4 | VecZeroF32x4
+             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2 | VecLoadI64x4 | VecAddI64x4 | VecHorizontalAddI64x4 | VecZeroI64x4
+-            | VecMulI32x4 | VecBroadcastI32x4
++            | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4
+             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
+             | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
+             | Pminsw128 | Pmaxsw128 | Pmulhuw128 | Paddq128 | Psubq128
+@@ -1189,6 +1195,7 @@ impl IntrinsicOp {
+                 | IntrinsicOp::VecSadalpI32x4
+                 | IntrinsicOp::VecSmlalLoI32x4
+                 | IntrinsicOp::VecSmlalHiI32x4
++                | IntrinsicOp::VecSmaxI32x4
+         )
+     }
+ }
+diff --git a/src/passes/cfg_simplify.rs b/src/passes/cfg_simplify.rs
+index ff96fbbc..b0116c00 100644
+--- a/src/passes/cfg_simplify.rs
++++ b/src/passes/cfg_simplify.rs
+@@ -1653,7 +1653,9 @@ mod tests {
+                 );
+             }
+             Terminator::Branch(_) => {
+-                panic!("CondBranch was incorrectly simplified to unconditional Branch, losing phi distinction");
++                panic!(
++                    "CondBranch was incorrectly simplified to unconditional Branch, losing phi distinction"
++                );
+             }
+             _ => panic!("Unexpected terminator"),
+         }
+diff --git a/src/passes/constant_fold.rs b/src/passes/constant_fold.rs
+index 4398368c..6aedfb1d 100644
+--- a/src/passes/constant_fold.rs
++++ b/src/passes/constant_fold.rs
+@@ -956,11 +956,7 @@ fn fold_unaryop(op: IrUnaryOp, src: i64, ty: IrType) -> Option<i64> {
+         }
+         IrUnaryOp::Ctz => {
+             if src == 0 {
+-                if is_32bit {
+-                    32
+-                } else {
+-                    64
+-                }
++                if is_32bit { 32 } else { 64 }
+             } else if is_32bit {
+                 (src as u32).trailing_zeros() as i64
+             } else {
+diff --git a/src/passes/copy_prop.rs b/src/passes/copy_prop.rs
+index b5619f94..822e6e43 100644
+--- a/src/passes/copy_prop.rs
++++ b/src/passes/copy_prop.rs
+@@ -924,8 +924,15 @@ fn one_round_post_phi(func: &mut IrFunction) -> usize {
+         }
+     }
+     if std::env::var("CCC_DEBUG_PHICLEANUP").is_ok() {
+-        eprintln!("[PHICLEANUP] fn={} copies={} removed={} kept_other_block={} kept_use_before={} kept_src_multidef={}",
+-            func.name, copies.len(), to_remove.len(), dbg_kept[0], dbg_kept[1], dbg_kept[2]);
++        eprintln!(
++            "[PHICLEANUP] fn={} copies={} removed={} kept_other_block={} kept_use_before={} kept_src_multidef={}",
++            func.name,
++            copies.len(),
++            to_remove.len(),
++            dbg_kept[0],
++            dbg_kept[1],
++            dbg_kept[2]
 +        );
+     }
+ 
+     if to_remove.is_empty() {
+diff --git a/src/passes/dead_statics.rs b/src/passes/dead_statics.rs
+index 24aaa4ed..8261ced3 100644
+--- a/src/passes/dead_statics.rs
++++ b/src/passes/dead_statics.rs
+@@ -92,11 +92,7 @@ fn asm_symbol_base(s: &str) -> &str {
+     while end < bytes.len() && is_asm_ident_char(bytes[end]) {
+         end += 1;
+     }
+-    if start < end {
+-        &s[start..end]
+-    } else {
+-        s
+-    }
++    if start < end { &s[start..end] } else { s }
+ }
+ 
+ #[inline]
+diff --git a/src/passes/global_addr_cse.rs b/src/passes/global_addr_cse.rs
+index 4d262939..32f70eb8 100644
+--- a/src/passes/global_addr_cse.rs
++++ b/src/passes/global_addr_cse.rs
+@@ -364,7 +364,7 @@ pub(crate) fn run_with_aliases(
+         if add.is_empty() && !has_delete {
+             continue;
+         }
+-        add.sort_by(|a, b| (a.0.as_str(), a.1, a.2 .0).cmp(&(b.0.as_str(), b.1, b.2 .0)));
++        add.sort_by(|a, b| (a.0.as_str(), a.1, a.2.0).cmp(&(b.0.as_str(), b.1, b.2.0)));
+         let insert_at = block
+             .instructions
+             .iter()
+diff --git a/src/passes/if_convert.rs b/src/passes/if_convert.rs
+index d77b1ed6..e068e897 100644
+--- a/src/passes/if_convert.rs
++++ b/src/passes/if_convert.rs
+@@ -197,9 +197,16 @@ fn rewrite_covered_arm_loads(
+                     {
+                         pending.push((inst_pos, *dest, *covering));
+                     } else if debug {
+-                        eprintln!("[IFCONV] arm block {} load ptr={} ty={:?} not covered by pred loads {:?}",
+-                            arm_idx, ptr.0, ty,
+-                            pred_loads.iter().map(|(p, t, _, d)| (p.0, *t, d.0)).collect::<Vec<_>>());
++                        eprintln!(
++                            "[IFCONV] arm block {} load ptr={} ty={:?} not covered by pred loads {:?}",
++                            arm_idx,
++                            ptr.0,
++                            ty,
++                            pred_loads
++                                .iter()
++                                .map(|(p, t, _, d)| (p.0, *t, d.0))
++                                .collect::<Vec<_>>()
++                        );
+                         for b in &func.blocks {
+                             for i in &b.instructions {
+                                 if i.dest() == Some(*ptr)
+@@ -1268,10 +1275,12 @@ mod tests {
+         ));
+ 
+         // Merge block should have no phi
+-        assert!(!func.blocks[3]
+-            .instructions
+-            .iter()
+-            .any(|i| matches!(i, Instruction::Phi { .. })));
++        assert!(
++            !func.blocks[3]
++                .instructions
++                .iter()
++                .any(|i| matches!(i, Instruction::Phi { .. }))
++        );
+     }
+ 
+     #[test]
+diff --git a/src/passes/inline.rs b/src/passes/inline.rs
+index 80689383..c3476986 100644
+--- a/src/passes/inline.rs
++++ b/src/passes/inline.rs
+@@ -822,8 +822,10 @@ fn inline_run(module: &mut IrModule, size_optimized: bool) -> usize {
+                 Some(s) => s,
+                 None => {
+                     if debug_inline && caller_too_large {
+-                        eprintln!("[INLINE] No more always_inline callees to inline into '{}' (caller has {} instructions)",
+-                            module.functions[func_idx].name, caller_inst_count);
++                        eprintln!(
++                            "[INLINE] No more always_inline callees to inline into '{}' (caller has {} instructions)",
++                            module.functions[func_idx].name, caller_inst_count
++                        );
+                     }
+                     break;
+                 }
+@@ -1199,7 +1201,12 @@ fn resolve_inline_asm_symbols(func: &mut IrFunction) {
+                     let sym_idx = num_outputs_in_sym + i;
+                     if sym_idx >= input_symbols.len() {
+                         if debug_resolve {
+-                            eprintln!("[RESOLVE_ASM]   input[{}]: sym_idx {} >= input_symbols.len() {}, skip", i, sym_idx, input_symbols.len());
++                            eprintln!(
++                                "[RESOLVE_ASM]   input[{}]: sym_idx {} >= input_symbols.len() {}, skip",
++                                i,
++                                sym_idx,
++                                input_symbols.len()
++                            );
+                         }
+                         continue;
+                     }
+@@ -2389,8 +2396,15 @@ fn inline_call_site(
+ 
+     let debug_inline_detail = std::env::var("CCC_INLINE_DEBUG_DETAIL").is_ok();
+     if debug_inline_detail {
+-        eprintln!("[INLINE_DETAIL] Inlining '{}' into '{}': value_offset={}, block_offset={}, callee.next_value_id={}, caller.next_value_id={}",
+-            site.callee_name, caller.name, value_offset, block_offset, callee.next_value_id, caller.next_value_id);
++        eprintln!(
++            "[INLINE_DETAIL] Inlining '{}' into '{}': value_offset={}, block_offset={}, callee.next_value_id={}, caller.next_value_id={}",
++            site.callee_name,
++            caller.name,
++            value_offset,
++            block_offset,
++            callee.next_value_id,
++            caller.next_value_id
++        );
+         eprintln!(
+             "[INLINE_DETAIL]   site.block_idx={}, site.inst_idx={}",
+             site.block_idx, site.inst_idx
+@@ -2534,7 +2548,7 @@ fn inline_call_site(
+         if substitutable[i] {
+             if let Operand::Const(c) = &site.args[i] {
+                 if let Some(at) = const_ir_type(c) {
+-                    home_subst.insert(param_alloca_info[i].0 .0, (site.args[i], at));
++                    home_subst.insert(param_alloca_info[i].0.0, (site.args[i], at));
+                 }
+             }
+         }
+@@ -2567,7 +2581,7 @@ fn inline_call_site(
+         let num_args_to_store = std::cmp::min(site.args.len(), param_alloca_info.len());
+         let mut inserted_arg_count = 0usize;
+         for i in (0..num_args_to_store).rev() {
+-            if home_subst.contains_key(&param_alloca_info[i].0 .0) {
++            if home_subst.contains_key(&param_alloca_info[i].0.0) {
+                 continue; // value flows via the older pure-home substitution
+             }
+             let param_struct_size = callee.param_struct_sizes.get(i).copied().flatten();
+diff --git a/src/passes/iv_strength_reduce.rs b/src/passes/iv_strength_reduce.rs
+index 53f456aa..3e4c05e2 100644
+--- a/src/passes/iv_strength_reduce.rs
++++ b/src/passes/iv_strength_reduce.rs
+@@ -887,9 +887,11 @@ mod tests {
+         // Simulate sorted asc processing: inner first, then outer, then separate
+         let mut kept: Vec<FxHashSet<usize>> = Vec::new();
+         // inner does not overlap kept (empty) -> keep
+-        assert!(!kept
+-            .iter()
+-            .any(|b: &FxHashSet<usize>| !b.is_disjoint(&inner.body)));
++        assert!(
++            !kept
++                .iter()
++                .any(|b: &FxHashSet<usize>| !b.is_disjoint(&inner.body))
++        );
+         kept.push(inner.body.clone());
+         // outer overlaps kept inner -> should be skipped
+         assert!(kept.iter().any(|b| !b.is_disjoint(&outer.body)));
+diff --git a/src/passes/licm.rs b/src/passes/licm.rs
+index 246c4121..2c447bbd 100644
+--- a/src/passes/licm.rs
++++ b/src/passes/licm.rs
+@@ -145,7 +145,7 @@ fn analyze_allocas(func: &IrFunction) -> AllocaAnalysis {
+                 // (as the stored data) means its address escapes.
+                 Instruction::Store { val, ptr, .. } => {
+                     let _ = ptr; // Storing to alloca is fine.
+-                                 // If the stored VALUE is an alloca pointer, it's address-taken.
++                    // If the stored VALUE is an alloca pointer, it's address-taken.
+                     if let Operand::Value(v) = val {
+                         if alloca_values.contains(&v.0) {
+                             address_taken.insert(v.0);
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index ac7532a6..804e6157 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -1146,6 +1146,36 @@ pub(crate) fn run_passes(
+         std::mem::swap(&mut dirty, &mut changed);
+     }
+ 
++    // Late AArch64 vectorization (levkropp 8ef1978f concept, audited): max
++    // and other Select-shaped reductions only exist after the main loop's
++    // if_convert phase, so the early vectorizer never sees them. Re-running
++    // the two-wide NEON pass here catches the converted form; already-
++    // vectorized loops contain Vec* intrinsics and fail the scalar-shape
++    // analyzers, so this is idempotent. -Os/-Oz skip it like the early pass.
++    // CCC_DISABLE_PASSES=latevec disables.
++    if matches!(target, crate::backend::Target::Aarch64)
++        && !optimize_for_size
++        && !disabled.contains("latevec")
++        && !disabled.contains("vectorize")
++    {
++        let n = module.for_each_function(vectorize::vectorize_function_two_wide_late);
++        if n > 0 {
++            // The vectorizer's block surgery does not maintain source_spans;
++            // drop any that no longer align with their block's instructions
++            // (debug-info line table would otherwise attribute wrong lines).
++            for func in &mut module.functions {
++                for block in &mut func.blocks {
++                    if !block.source_spans.is_empty()
++                        && block.source_spans.len() != block.instructions.len()
++                    {
++                        block.source_spans.clear();
++                    }
++                }
++            }
++            module.for_each_function(dce::eliminate_dead_code);
++        }
 +    }
 +
-     #[test]
-     fn test_cfg_retargets_accumulator_update_copyback() {
-         let asm = concat!(
+     // DCE can remove aggregate-copy consumers that previously made forwarding
+     // unsafe (for example a full returned struct whose only surviving use is
+     // one field load). Re-run forwarding before final loop promotion.
+diff --git a/src/passes/outline_switch.rs b/src/passes/outline_switch.rs
+index 06212938..21abfb16 100644
+--- a/src/passes/outline_switch.rs
++++ b/src/passes/outline_switch.rs
+@@ -540,8 +540,13 @@ fn outline_switch_cases(
+             switch_info.cases.iter().map(|(_, bid)| *bid).collect();
+ 
+         if debug {
+-            eprintln!("[OUTLINE] function: {}, switch with {} cases, end_block: {:?}, global_max_block_id: {}",
+-                func.name, switch_info.cases.len(), switch_info.end_block, *global_max_block_id);
++            eprintln!(
++                "[OUTLINE] function: {}, switch with {} cases, end_block: {:?}, global_max_block_id: {}",
++                func.name,
++                switch_info.cases.len(),
++                switch_info.end_block,
++                *global_max_block_id
++            );
+         }
+ 
+         // Analyze each case for outlinability.
+@@ -628,8 +633,10 @@ fn outline_switch_cases(
+         if debug {
+             let total = switch_info.cases.len();
+             let outlined = outlinable.len();
+-            eprintln!("[OUTLINE]   {} of {} cases outlinable (skip: {} block_collect, {} empty, {} small, {} return, {} args)",
+-                outlined, total, skip_block_collect, skip_empty, skip_small, skip_return, skip_args);
++            eprintln!(
++                "[OUTLINE]   {} of {} cases outlinable (skip: {} block_collect, {} empty, {} small, {} return, {} args)",
++                outlined, total, skip_block_collect, skip_empty, skip_small, skip_return, skip_args
++            );
+         }
+ 
+         if outlinable.is_empty() {
+diff --git a/src/passes/quadratic_sr.rs b/src/passes/quadratic_sr.rs
+index e6e6442b..1290b95d 100644
+--- a/src/passes/quadratic_sr.rs
++++ b/src/passes/quadratic_sr.rs
+@@ -526,7 +526,7 @@ fn find_div2_result(func: &IrFunction, loop_body: &FxHashSet<usize>, prod: Value
+                             && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(31)) =>
+                     {
+                         adj = None; // placeholder; LShr dest is the mask
+-                                    // record mask separately below
++                        // record mask separately below
+                     }
+                     _ => {}
+                 }
+diff --git a/src/passes/set_membership.rs b/src/passes/set_membership.rs
+index d143917a..8363d507 100644
+--- a/src/passes/set_membership.rs
++++ b/src/passes/set_membership.rs
+@@ -1307,15 +1307,13 @@ mod tests {
+         );
+         // Case-fold happened: some block computes x & ~32.
+         assert!(
+-            f.blocks
+-                .iter()
+-                .any(|b| {
+-                    b.instructions.iter().any(|i| matches!(
++            f.blocks.iter().any(|b| {
++                b.instructions.iter().any(|i| matches!(
+                 i,
+                 Instruction::BinOp { op: IrBinOp::And, rhs: Operand::Const(IrConst::I32(c)), .. }
+                     if *c == !32
+             ))
+-                }),
++            }),
+             "expected the ASCII case-fold And"
+         );
+         // ONE BitTest cluster (not two): count BitTest instructions.
+diff --git a/src/passes/vector_temp_promotion.rs b/src/passes/vector_temp_promotion.rs
+index 21fb399d..328faaee 100644
+--- a/src/passes/vector_temp_promotion.rs
++++ b/src/passes/vector_temp_promotion.rs
+@@ -673,9 +673,11 @@ fn remove_instructions(block: &mut BasicBlock, removed: &mut Vec<usize>) {
+     }
+     removed.sort_unstable();
+     removed.dedup();
+-    debug_assert!(removed
+-        .last()
+-        .is_none_or(|&index| index < block.instructions.len()));
++    debug_assert!(
++        removed
++            .last()
++            .is_none_or(|&index| index < block.instructions.len())
++    );
+ 
+     let instruction_count = block.instructions.len();
+     let spans_in_lockstep = block.source_spans.len() == instruction_count;
+diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
+index cb3cf7fe..df2a384d 100644
+--- a/src/passes/vectorize.rs
++++ b/src/passes/vectorize.rs
+@@ -348,6 +348,12 @@ enum ReductionKind {
+     Sum,
+     /// Dot product: sum += a[i] * b[i]
+     DotProduct,
++    /// Maximum: mx = max(mx, arr[i]) — Select-shaped after if-conversion.
++    /// Integer max is associative, commutative and idempotent, so a lane-wise
++    /// NEON smax reduction is bit-identical to the scalar loop; no zero init
++    /// required (the scalar init broadcasts into the vector accumulator).
++    /// NEON-only (levkropp 8b139820, audited port).
++    Max,
+ }
+ 
+ /// Pattern matching result for a vectorizable reduction loop.
+@@ -420,7 +426,6 @@ struct SecondaryAccumulator {
+     loads: Vec<Value>,
+ }
+ 
+-
+ /// Analyze a loop to detect the vectorizable matmul pattern.
+ fn analyze_loop_pattern(
+     func: &IrFunction,
+@@ -734,7 +739,10 @@ fn analyze_loop_pattern(
+     if let Instruction::BinOp { ty, .. } = fmul_inst {
+         if *ty != IrType::F64 {
+             if debug {
+-                eprintln!("[VEC]   Rejecting matmul: element type {:?} != F64 (only double FMA is supported)", ty);
++                eprintln!(
++                    "[VEC]   Rejecting matmul: element type {:?} != F64 (only double FMA is supported)",
++                    ty
++                );
+             }
+             set_reject("matmul element type is not double (only F64 FMA is supported)");
+             return None;
+@@ -1042,7 +1050,10 @@ fn reduction_pattern_is_sound(
+                 | Instruction::InlineAsm { .. }
+                 | Instruction::Intrinsic { .. } => {
+                     if debug {
+-                        eprintln!("[VEC-RED]   Rejecting: foreign side-effect instruction in loop block {}", block_idx);
++                        eprintln!(
++                            "[VEC-RED]   Rejecting: foreign side-effect instruction in loop block {}",
++                            block_idx
++                        );
+                     }
+                     return false;
+                 }
+@@ -1067,10 +1078,8 @@ fn reduction_pattern_is_sound(
+     for &block_idx in loop_blocks {
+         let block = &func.blocks[block_idx];
+         for (inst_idx, inst) in block.instructions.iter().enumerate() {
+-            let is_any_add = block_idx == body_idx
+-                && adds
+-                    .iter()
+-                    .any(|&(add_idx, _)| add_idx == inst_idx);
++            let is_any_add =
++                block_idx == body_idx && adds.iter().any(|&(add_idx, _)| add_idx == inst_idx);
+             if is_any_add
+                 || matches!(
+                     inst,
+@@ -1331,25 +1340,121 @@ fn analyze_reduction_pattern(
+     }
+     let iv_inc_idx = iv_inc_idx?;
+ 
++    // Max-reduction form (levkropp 8b139820, audited port): the accumulator
++    // phi's latch incoming is a Select of the loaded element vs the phi
++    // (`mx = x > mx ? x : mx`, if-converted). Detected BEFORE the zero-init
++    // sum search because a max accumulator is NOT zero-initialised (its init
++    // is arr[0] or any seed; the transform broadcasts it). All four compare
++    // polarities are accepted; SIGNED compares only — smax is a signed max,
++    // an unsigned compare (Ugt/Ult) must NOT match (that would need umax).
++    let mut is_max_reduction = false;
++    let mut max_select_val = None;
++    let mut max_accumulator_phi = None;
++    if neon {
++        let latch_label = func.blocks[latch_idx].label;
++        'max_search: for inst in &header.instructions {
++            let Instruction::Phi {
++                dest,
++                incoming,
++                ty: phi_ty,
++                ..
++            } = inst
++            else {
++                continue;
++            };
++            if *dest == iv || incoming.len() != 2 || *phi_ty != IrType::I32 {
++                continue;
++            }
++            let latch_src = incoming.iter().find_map(|(op, lbl)| {
++                if *lbl == latch_label {
++                    if let Operand::Value(v) = op {
++                        return Some(*v);
++                    }
++                }
++                None
++            });
++            let Some(sel_val) = latch_src else { continue };
++            for &bi in &loop_info.body {
++                for sinst in &func.blocks[bi].instructions {
++                    let Instruction::Select {
++                        dest: sd,
++                        cond,
++                        true_val,
++                        false_val,
++                        ..
++                    } = sinst
++                    else {
++                        continue;
++                    };
++                    if *sd != sel_val {
++                        continue;
++                    }
++                    let (Operand::Value(cond_v), Operand::Value(tv), Operand::Value(fv)) =
++                        (cond, true_val, false_val)
++                    else {
++                        continue;
++                    };
++                    // Arms must be {the phi, the element X}; cond compares X
++                    // against the phi.
++                    let (x_val, take_x_when_true) = if fv.0 == dest.0 {
++                        (*tv, true)
++                    } else if tv.0 == dest.0 {
++                        (*fv, false)
++                    } else {
++                        continue;
++                    };
++                    let Some(cmp_inst) = func.blocks[bi]
++                        .instructions
++                        .iter()
++                        .find(|i| matches!(i.dest(), Some(d) if d.0 == cond_v.0))
++                    else {
++                        continue;
++                    };
++                    let Instruction::Cmp { op, lhs, rhs, .. } = cmp_inst else {
++                        continue;
++                    };
++                    use crate::ir::reexports::IrCmpOp as C;
++                    let x_on = |o: &Operand| matches!(o, Operand::Value(v) if v.0 == x_val.0);
++                    let phi_on = |o: &Operand| matches!(o, Operand::Value(v) if v.0 == dest.0);
++                    let is_max_form = match (op, take_x_when_true) {
++                        (C::Sgt | C::Sge, true) if x_on(lhs) && phi_on(rhs) => true,
++                        (C::Slt | C::Sle, false) if x_on(lhs) && phi_on(rhs) => true,
++                        (C::Slt | C::Sle, true) if phi_on(lhs) && x_on(rhs) => true,
++                        (C::Sgt | C::Sge, false) if phi_on(lhs) && x_on(rhs) => true,
++                        _ => false,
++                    };
++                    if is_max_form {
++                        max_accumulator_phi = Some(*dest);
++                        is_max_reduction = true;
++                        max_select_val = Some(sel_val);
++                        break 'max_search;
++                    }
++                }
++            }
++        }
++    }
++
+     // Find the accumulator phi (scalar sum variable)
+-    let mut accumulator_phi = None;
++    let mut accumulator_phi = max_accumulator_phi;
+     let mut accumulator_init_is_zero = false;
+-    for inst in &header.instructions {
+-        if let Instruction::Phi { dest, incoming, .. } = inst {
+-            if incoming.len() == 2 && *dest != iv {
+-                // Check if initialized to zero (common for reductions)
+-                for (val, _block) in incoming {
+-                    if let Operand::Const(c) = val {
+-                        if c.to_i64() == Some(0) {
+-                            accumulator_init_is_zero = true;
+-                        } else if c.to_f64().map(|f| f == 0.0).unwrap_or(false) {
+-                            accumulator_init_is_zero = true;
++    if accumulator_phi.is_none() {
++        for inst in &header.instructions {
++            if let Instruction::Phi { dest, incoming, .. } = inst {
++                if incoming.len() == 2 && *dest != iv {
++                    // Check if initialized to zero (common for reductions)
++                    for (val, _block) in incoming {
++                        if let Operand::Const(c) = val {
++                            if c.to_i64() == Some(0) {
++                                accumulator_init_is_zero = true;
++                            } else if c.to_f64().map(|f| f == 0.0).unwrap_or(false) {
++                                accumulator_init_is_zero = true;
++                            }
+                         }
+                     }
+-                }
+-                if accumulator_init_is_zero {
+-                    accumulator_phi = Some(*dest);
+-                    break;
++                    if accumulator_init_is_zero {
++                        accumulator_phi = Some(*dest);
++                        break;
++                    }
+                 }
+             }
+         }
+@@ -1450,6 +1555,18 @@ fn analyze_reduction_pattern(
+             }
+         }
+         for (idx, inst) in block.instructions.iter().enumerate() {
++            // Max reduction: the accumulator update IS the Select.
++            if is_max_reduction {
++                if let Instruction::Select { dest, .. } = inst {
++                    if Some(*dest) == max_select_val {
++                        body_idx = Some(block_idx);
++                        accumulator_add_idx = Some(idx);
++                        add_result = Some(*dest);
++                        break;
++                    }
++                }
++                continue;
++            }
+             if let Instruction::BinOp {
+                 dest,
+                 op: IrBinOp::Add,
+@@ -1494,6 +1611,187 @@ fn analyze_reduction_pattern(
+     let body = &func.blocks[body_idx];
+     let add_inst = &body.instructions[accumulator_add_idx];
+ 
++    // Max-reduction early return: the update is the Select; the non-phi arm
++    // must be an I32 load whose GEP marches with the IV, and the marching
++    // pointer's preheader init must start exactly at element iv_init
++    // (coverage legality: the vector loop covers [c, c+4*iters), and the
++    // remainder resumes from the marching pointer's position; a pointer
++    // starting anywhere else would silently skip or re-read elements).
++    if is_max_reduction {
++        let Instruction::Select {
++            true_val,
++            false_val,
++            ..
++        } = add_inst
++        else {
++            return None;
++        };
++        let x_val = match (true_val, false_val) {
++            (Operand::Value(tv), Operand::Value(fv)) => {
++                if fv.0 == accumulator_phi.0 {
++                    *tv
++                } else if tv.0 == accumulator_phi.0 {
++                    *fv
++                } else {
++                    return None;
++                }
++            }
++            _ => return None,
++        };
++        let Some(x_inst) = body
++            .instructions
++            .iter()
++            .find(|i| matches!(i.dest(), Some(d) if d.0 == x_val.0))
++        else {
++            return None;
++        };
++        let Instruction::Load {
++            ptr,
++            ty: IrType::I32,
++            ..
++        } = x_inst
++        else {
++            return None;
++        };
++        let array_gep = *ptr;
++        // The access must be either an IV-indexed GEP or a marching-pointer
++        // phi stepping exactly ONE element (4 bytes) per iteration — any
++        // other stride would be silently re-scaled wrong by the vec_width
++        // transform (levkropp's elem_size-extended gep_uses_iv, split into
++        // a dedicated helper here to keep the shared gep_uses_iv signature
++        // and its loop-invariant-base hardening untouched).
++        let marches_one_element = || -> bool {
++            for &bi in &loop_info.body {
++                for pinst in &func.blocks[bi].instructions {
++                    if let Instruction::Phi { dest, incoming, .. } = pinst {
++                        if *dest != array_gep {
++                            continue;
++                        }
++                        for (op, _) in incoming {
++                            if let Operand::Value(v) = op {
++                                let steps =
++                                    func.blocks.iter().flat_map(|b| &b.instructions).any(|i| {
++                                        matches!(i, Instruction::GetElementPtr {
++                                        dest: d,
++                                        base,
++                                        offset: Operand::Const(c),
++                                        ..
++                                    } if *d == *v && base.0 == array_gep.0
++                                        && c.to_i64() == Some(4))
++                                    });
++                                if steps {
++                                    return true;
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++            false
++        };
++        if !gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived) && !marches_one_element()
++        {
++            if debug {
++                eprintln!("[VEC-RED]   Max-reduction array GEP doesn't use IV");
++            }
++            return None;
++        }
++        let latch_label = func.blocks[latch_idx].label;
++        let mut iv_init = None;
++        for inst in &header.instructions {
++            if let Instruction::Phi { dest, incoming, .. } = inst {
++                if *dest == iv {
++                    for (op, lbl) in incoming {
++                        if *lbl != latch_label {
++                            if let Operand::Const(c) = op {
++                                iv_init = c.to_i64();
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        let Some(iv_init) = iv_init else {
++            if debug {
++                eprintln!("[VEC-RED]   Max-reduction IV init is not a constant");
++            }
++            return None;
++        };
++        // STRICT shape requirement (levkropp's original check, kept strict
++        // on purpose): the array access must be a marching-pointer phi whose
++        // preheader incoming is a constant-offset GEP at exactly iv_init*4
++        // bytes (element c). Coverage legality depends on it: the vector
++        // loop covers elements [c, c + 4*iters) via the marching pointer,
++        // and the remainder resumes at (iv_final - c)*4 relative to the
++        // SAME element-c base. A direct IV-indexed GEP would be re-scaled
++        // by vec_width in the transform and start reading at element c*4
++        // instead of c — silently wrong for any c != 0 — so that shape is
++        // rejected outright rather than special-cased.
++        let mut ptr_init_ok = false;
++        for inst in &header.instructions {
++            if let Instruction::Phi { dest, incoming, .. } = inst {
++                if *dest != array_gep {
++                    continue;
++                }
++                for (op, lbl) in incoming {
++                    if *lbl == latch_label {
++                        continue;
++                    }
++                    let Operand::Value(init_v) = op else { continue };
++                    let init_gep = func
++                        .blocks
++                        .iter()
++                        .flat_map(|b| &b.instructions)
++                        .find_map(|i| {
++                            if let Instruction::GetElementPtr {
++                                dest,
++                                offset: Operand::Const(off),
++                                ..
++                            } = i
++                            {
++                                if *dest == *init_v {
++                                    return off.to_i64();
++                                }
++                            }
++                            None
++                        });
++                    if init_gep == Some(iv_init * 4) {
++                        ptr_init_ok = true;
++                    }
++                }
++            }
++        }
++        if !ptr_init_ok {
++            if debug {
++                eprintln!("[VEC-RED]   Max-reduction pointer/IV init mismatch");
++            }
++            return None;
++        }
++        if debug {
++            eprintln!("[VEC-RED]   Max reduction detected: mx = max(mx, load(arr[iv]))");
++        }
++        return Some(ReductionPattern {
++            kind: ReductionKind::Max,
++            second: None,
++            element_type: IrType::I32,
++            accumulator_type: IrType::I32,
++            header_idx,
++            body_idx,
++            latch_idx,
++            exit_idx,
++            iv,
++            iv_inc_idx,
++            accumulator_phi,
++            array_a_gep: array_gep,
++            array_b_gep: None,
++            accumulator_add_idx,
++            limit,
++            exit_cmp_inst_idx,
++            exit_cmp_dest,
++            loop_blocks: loop_info.body.clone(),
++        });
++    }
++
+     // Get the element type from the add instruction
+     let element_type = match add_inst {
+         Instruction::BinOp { ty, .. } => *ty,
+@@ -1647,7 +1945,10 @@ fn analyze_reduction_pattern(
+                 }
+ 
+                 if debug {
+-                    eprintln!("[VEC-RED]   Simple sum pattern with cast detected: {:?} += ({:?})load(arr[iv])", element_type, from_ty);
++                    eprintln!(
++                        "[VEC-RED]   Simple sum pattern with cast detected: {:?} += ({:?})load(arr[iv])",
++                        element_type, from_ty
++                    );
+                 }
+ 
+                 // The cast must be a redundant no-op (from_ty == accumulator
+@@ -1667,7 +1968,10 @@ fn analyze_reduction_pattern(
+                     allow_widening_i32 && element_type == IrType::I64 && *from_ty == IrType::I32;
+                 if *from_ty != element_type && !allowed_widen {
+                     if debug {
+-                        eprintln!("[VEC-RED]   Rejecting: cast from {:?} to accumulator type {:?} (only redundant casts are vectorizable)", from_ty, element_type);
++                        eprintln!(
++                            "[VEC-RED]   Rejecting: cast from {:?} to accumulator type {:?} (only redundant casts are vectorizable)",
++                            from_ty, element_type
++                        );
+                     }
+                     set_reject("widening/narrowing reduction cast not vectorizable");
+                     return None;
+@@ -1878,9 +2182,7 @@ fn analyze_reduction_pattern(
+             if debug {
+                 eprintln!("[VEC-RED]   Rejecting unsound reduction");
+             }
+-            set_reject(
+-                "reduction rejected: side effects / control flow / foreign memory in loop",
+-            );
++            set_reject("reduction rejected: side effects / control flow / foreign memory in loop");
+             return None;
+         }
+     }
+@@ -1913,9 +2215,7 @@ fn analyze_secondary_accumulator(
+     // historical behavior (reject the whole loop) is preserved.
+     if primary.element_type != primary.accumulator_type {
+         if debug {
+-            eprintln!(
+-                "[VEC-RED]   Rejecting multi-reduction: widening accumulator not supported"
+-            );
++            eprintln!("[VEC-RED]   Rejecting multi-reduction: widening accumulator not supported");
+         }
+         set_reject("multi-reduction widening accumulator not supported");
+         return None;
+@@ -2044,10 +2344,7 @@ fn analyze_secondary_accumulator(
+     // Match the secondary shape to the primary kind.
+     let (array_a_gep, array_b_gep, loads): (Value, Option<Value>, Vec<Value>) =
+         match (primary.kind, added_inst) {
+-            (
+-                ReductionKind::Sum,
+-                Instruction::Load { ptr, ty, .. },
+-            ) => {
++            (ReductionKind::Sum, Instruction::Load { ptr, ty, .. }) => {
+                 if *ty != primary.element_type {
+                     set_reject("second accumulator element type mismatch");
+                     return None;
+@@ -2217,10 +2514,7 @@ fn rewrite_reduction_body(
+ 
+     let (a_base, a_off) = match (use_byte_iv, &byte_iv_a) {
+         (true, Some((base, off))) => (Operand::Value(*base), Operand::Value(*off)),
+-        _ => (
+-            Operand::Value(array_a_gep),
+-            Operand::Const(IrConst::I64(0)),
+-        ),
++        _ => (Operand::Value(array_a_gep), Operand::Const(IrConst::I64(0))),
+     };
+     let (b_base, b_off) = match (use_byte_iv, &byte_iv_b) {
+         (true, Some((base, off))) => (Operand::Value(*base), Operand::Value(*off)),
+@@ -2232,6 +2526,11 @@ fn rewrite_reduction_body(
+ 
+     let body_block = &mut func.blocks[body_idx];
+     match kind {
++        // Max never reaches the secondary-accumulator emitter: the Max
++        // detector returns second: None unconditionally.
++        ReductionKind::Max => {
++            unreachable!("max reductions never carry a secondary accumulator")
++        }
+         ReductionKind::Sum => {
+             let load_inst = Instruction::Intrinsic {
+                 dest: Some(vec_load_a),
+@@ -3089,8 +3388,16 @@ fn find_exit(func: &IrFunction, loop_info: &loop_analysis::NaturalLoop) -> Optio
+                     .unwrap_or(false);
+ 
+                 if debug {
+-                    eprintln!("[VEC-RED]   Block[{}] CondBranch: true=BlockId({}) [idx={:?}] (in_loop={}), false=BlockId({}) [idx={:?}] (in_loop={})",
+-                        block_idx, true_label.0, true_idx, then_in_loop, false_label.0, false_idx, else_in_loop);
++                    eprintln!(
++                        "[VEC-RED]   Block[{}] CondBranch: true=BlockId({}) [idx={:?}] (in_loop={}), false=BlockId({}) [idx={:?}] (in_loop={})",
++                        block_idx,
++                        true_label.0,
++                        true_idx,
++                        then_in_loop,
++                        false_label.0,
++                        false_idx,
++                        else_in_loop
++                    );
+                 }
+ 
+                 if then_in_loop && !else_in_loop {
+@@ -3557,7 +3864,7 @@ fn insert_remainder_loop(
+         4 => Instruction::BinOp {
+             dest: j_rem_start,
+             op: IrBinOp::Mul,
+-            lhs: Operand::Value(pattern.iv),   // Final 4-element group index
++            lhs: Operand::Value(pattern.iv), // Final 4-element group index
+             rhs: Operand::Const(IrConst::I32(4)),
+             ty: IrType::I32,
+         },
+@@ -4035,8 +4342,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern)
+                     );
+ 
+                     if debug && (lhs_is_iv_derived || rhs_is_8) {
+-                        eprintln!("[VEC]   Found multiply in block {}: Value({}) = {:?} * {:?}, lhs_is_iv_derived={}, rhs_is_8={}",
+-                            block_idx, dest.0, lhs, rhs, lhs_is_iv_derived, rhs_is_8);
++                        eprintln!(
++                            "[VEC]   Found multiply in block {}: Value({}) = {:?} * {:?}, lhs_is_iv_derived={}, rhs_is_8={}",
++                            block_idx, dest.0, lhs, rhs, lhs_is_iv_derived, rhs_is_8
++                        );
+                     }
+ 
+                     if lhs_is_iv_derived && rhs_is_8 {
+@@ -4063,7 +4372,9 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern)
+         // Look for pointer increments (ptr + 8) and change them to (ptr + 16)
+         if !modified_any_increment {
+             if debug {
+-                eprintln!("[VEC]   No IV*8 multiplies found, searching for strength-reduced pointer increments");
++                eprintln!(
++                    "[VEC]   No IV*8 multiplies found, searching for strength-reduced pointer increments"
++                );
+             }
+ 
+             // Build a set of pointer values that are used in GEPs for C and B arrays
+@@ -4131,8 +4442,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern)
+                             } else {
+                                 false
+                             };
+-                            eprintln!("[VEC]   Block {} has add by 8: Value({}) = {:?} + 8, is_pointer={}",
+-                                block_idx, dest.0, lhs, is_pointer);
++                            eprintln!(
++                                "[VEC]   Block {} has add by 8: Value({}) = {:?} + 8, is_pointer={}",
++                                block_idx, dest.0, lhs, is_pointer
++                            );
+                         }
+ 
+                         // Check if this is a pointer increment
+@@ -4151,7 +4464,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern)
+                             changes += 1;
+                             modified_any_increment = true;
+                             if debug {
+-                                eprintln!("[VEC]   -> Changed pointer increment from 8 to 16 for Value({})", dest.0);
++                                eprintln!(
++                                    "[VEC]   -> Changed pointer increment from 8 to 16 for Value({})",
++                                    dest.0
++                                );
+                             }
+                         }
+                     }
+@@ -4180,8 +4496,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern)
+                             if let Operand::Value(offset_val) = offset {
+                                 geps_to_modify.push((block_idx, inst_idx, *offset_val, *ty));
+                                 if debug {
+-                                    eprintln!("[VEC]   Found GEP in block {} inst {}: Value({}) with offset Value({})",
+-                                        block_idx, inst_idx, dest.0, offset_val.0);
++                                    eprintln!(
++                                        "[VEC]   Found GEP in block {} inst {}: Value({}) with offset Value({})",
++                                        block_idx, inst_idx, dest.0, offset_val.0
++                                    );
+                                 }
+                             }
+                         }
+@@ -4220,8 +4538,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern)
+                     changes += 1;
+                     modified_any_increment = true;
+                     if debug {
+-                        eprintln!("[VEC]   Inserted mul and updated GEP offset: Value({}) = Value({}) * 2",
+-                            mul_dest.0, offset_val.0);
++                        eprintln!(
++                            "[VEC]   Inserted mul and updated GEP offset: Value({}) = Value({}) * 2",
++                            mul_dest.0, offset_val.0
++                        );
+                     }
+                 }
+             }
+@@ -4657,7 +4977,10 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
+                         eliminated_mul = true;
+                         changes += 1;
+                         if debug {
+-                            eprintln!("[VEC]   Eliminated IV*8 multiply for Value({}) (IV is now byte offset)", mul_dest.0);
++                            eprintln!(
++                                "[VEC]   Eliminated IV*8 multiply for Value({}) (IV is now byte offset)",
++                                mul_dest.0
++                            );
+                         }
+                     }
+                 }
+@@ -4690,7 +5013,10 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
+                         eliminated_mul = true;
+                         changes += 1;
+                         if debug {
+-                            eprintln!("[VEC]   Eliminated IV<<3 shift for Value({}) (IV is now byte offset)", shl_dest.0);
++                            eprintln!(
++                                "[VEC]   Eliminated IV<<3 shift for Value({}) (IV is now byte offset)",
++                                shl_dest.0
++                            );
+                         }
+                     }
+                 }
+@@ -4890,6 +5216,28 @@ fn insert_reduction_remainder_loop(
+                 }
+             }
+         }
++        // Max reductions access through a marching-pointer phi. The remainder
++        // must address relative to the phi's PREHEADER incoming — the pointer
++        // at element c — NOT the phi itself: as an SSA value read in
++        // vec_exit, the phi holds the END-of-vector-loop pointer, so using
++        // it double-counts the vector coverage (observed: reads at element
++        // ~2x the intended index, out-of-bounds for large n).
++        if base.is_none() && pattern.kind == ReductionKind::Max {
++            let latch_label = func.blocks[pattern.latch_idx].label;
++            for inst in &func.blocks[pattern.header_idx].instructions {
++                if let Instruction::Phi { dest, incoming, .. } = inst {
++                    if *dest == pattern.array_a_gep {
++                        for (op, lbl) in incoming {
++                            if *lbl != latch_label {
++                                if let Operand::Value(v) = op {
++                                    base = Some(*v);
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
+         let result = base.unwrap_or(pattern.array_a_gep);
+         if std::env::var("LCCC_DEBUG_VECTORIZE").is_ok() {
+             eprintln!(
+@@ -4953,6 +5301,35 @@ fn insert_reduction_remainder_loop(
+     *next_val_id += 1;
+     let i_rem_start = Value(*next_val_id);
+     *next_val_id += 1;
++    // Max-with-shifted-IV temporaries (unused unless max_shift != 0).
++    let i_rem_start_pre = Value(*next_val_id);
++    *next_val_id += 1;
++    let max_limit_adj = Value(*next_val_id);
++    *next_val_id += 1;
++    // Max with IV init c != 0: the vector loop covered elements
++    // [c, c + w*(lim - c)) through the marching pointer, and the remainder
++    // addresses RELATIVE to element c (the pointer's preheader value). Its
++    // start index is w*(iv_final - c) and its limit is n - c.
++    let max_shift: i64 = if pattern.kind == ReductionKind::Max {
++        let latch_label = func.blocks[pattern.latch_idx].label;
++        let mut c = 0i64;
++        for inst in &func.blocks[pattern.header_idx].instructions {
++            if let Instruction::Phi { dest, incoming, .. } = inst {
++                if *dest == pattern.iv {
++                    for (op, lbl) in incoming {
++                        if *lbl != latch_label {
++                            if let Operand::Const(k) = op {
++                                c = k.to_i64().unwrap_or(0);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        c
++    } else {
++        0
++    };
+     let i_rem_iv = Value(*next_val_id);
+     *next_val_id += 1;
+     let i_rem_iv_next = Value(*next_val_id);
+@@ -5120,13 +5497,37 @@ fn insert_reduction_remainder_loop(
+             }
+         } else {
+             Instruction::BinOp {
+-                dest: i_rem_start,
++                dest: if max_shift != 0 {
++                    i_rem_start_pre
++                } else {
++                    i_rem_start
++                },
+                 op: IrBinOp::Mul,
+                 lhs: Operand::Value(pattern.iv),
+                 rhs: Operand::Const(IrConst::I32(vec_width as i32)),
+                 ty: IrType::I32,
+             }
+         });
++        // Max with IV init c != 0: start = w*iv_final - w*c (relative to
++        // element c), and a dynamic limit becomes n - c.
++        if max_shift != 0 {
++            instructions.push(Instruction::BinOp {
++                dest: i_rem_start,
++                op: IrBinOp::Sub,
++                lhs: Operand::Value(i_rem_start_pre),
++                rhs: Operand::Const(IrConst::I32((max_shift * vec_width as i64) as i32)),
++                ty: IrType::I32,
++            });
++            if let Operand::Value(lv) = &pattern.limit {
++                instructions.push(Instruction::BinOp {
++                    dest: max_limit_adj,
++                    op: IrBinOp::Sub,
++                    lhs: Operand::Value(*lv),
++                    rhs: Operand::Const(IrConst::I32(max_shift as i32)),
++                    ty: IrType::I32,
++                });
++            }
++        }
+         BasicBlock {
+             label: vec_exit_label,
+             instructions,
+@@ -5172,7 +5573,21 @@ fn insert_reduction_remainder_loop(
+         dest: i_rem_cmp,
+         op: IrCmpOp::Slt,
+         lhs: Operand::Value(i_rem_iv),
+-        rhs: pattern.limit.clone(), // ORIGINAL limit (not divided)
++        rhs: if max_shift != 0 {
++            // Max with IV init c != 0: the remainder counts RELATIVE to
++            // element c, so the bound is n - c (folded for constants, the
++            // vec_exit Sub for dynamic limits).
++            match &pattern.limit {
++                Operand::Const(IrConst::I32(n)) => {
++                    Operand::Const(IrConst::I32(n - max_shift as i32))
++                }
++                Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(n - max_shift)),
++                Operand::Value(_) => Operand::Value(max_limit_adj),
++                other => other.clone(),
++            }
++        } else {
++            pattern.limit.clone() // ORIGINAL limit (not divided)
++        },
+         ty: IrType::I32,
+     });
+ 
+@@ -5245,6 +5660,26 @@ fn insert_reduction_remainder_loop(
+                 ty: pattern.accumulator_type,
+             });
+         }
++        ReductionKind::Max => {
++            // mx = max(mx, x) as a scalar Select: take x when x > mx.
++            // Signed compare matches the detector's signed-only gate.
++            let cmp_rem = Value(*next_val_id);
++            *next_val_id += 1;
++            remainder_body_instructions.push(Instruction::Cmp {
++                dest: cmp_rem,
++                op: IrCmpOp::Sgt,
++                lhs: Operand::Value(scalar_a),
++                rhs: Operand::Value(sum_rem_phi),
++                ty: pattern.accumulator_type,
++            });
++            remainder_body_instructions.push(Instruction::Select {
++                dest: sum_rem_next,
++                cond: Operand::Value(cmp_rem),
++                true_val: Operand::Value(scalar_a),
++                false_val: Operand::Value(sum_rem_phi),
++                ty: pattern.accumulator_type,
++            });
++        }
+         ReductionKind::DotProduct => {
+             // Dot product: sum += a[i] * b[i]
+             remainder_body_instructions.extend_from_slice(&[
+@@ -5332,6 +5767,9 @@ fn insert_reduction_remainder_loop(
+             },
+         ]);
+         match pattern.kind {
++            ReductionKind::Max => {
++                unreachable!("max reductions never carry a secondary accumulator")
++            }
+             ReductionKind::Sum => {
+                 remainder_body_instructions.push(Instruction::BinOp {
+                     dest: sum_rem_next2,
+@@ -5624,17 +6062,13 @@ fn transform_reduction_avx2(
+     // arrays too; otherwise the whole loop uses the element-index scheme
+     // (scaled GEP offsets), which is correct but one LEA per access heavier.
+     if let Some(sec) = &pattern.second {
+-        let sec_byte_iv_a = find_reduction_byte_iv(
+-            func,
+-            &pattern.loop_blocks,
+-            sec.array_a_gep,
+-            elem_sz as u32,
+-        );
+-        let sec_byte_iv_b = sec.array_b_gep.and_then(|g| {
+-            find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32)
+-        });
+-        use_byte_iv &= sec_byte_iv_a.is_some()
+-            && (sec.array_b_gep.is_none() || sec_byte_iv_b.is_some());
++        let sec_byte_iv_a =
++            find_reduction_byte_iv(func, &pattern.loop_blocks, sec.array_a_gep, elem_sz as u32);
++        let sec_byte_iv_b = sec
++            .array_b_gep
++            .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
++        use_byte_iv &=
++            sec_byte_iv_a.is_some() && (sec.array_b_gep.is_none() || sec_byte_iv_b.is_some());
+     }
+ 
+     // Step 1: Divide loop bound by vector width (byte limit under byte-offset IV)
+@@ -5853,6 +6287,12 @@ fn transform_reduction_avx2(
+ 
+     if pattern.second.is_none() {
+         match pattern.kind {
++            // Max reductions are NEON-only: the detector gates on `neon`, and
++            // the pipeline routes AArch64 through transform_reduction_sse2.
++            // Reaching the AVX2 transform with Max is a pipeline bug.
++            ReductionKind::Max => {
++                unreachable!("max reductions are NEON-only and never reach the AVX2 transform")
++            }
+             ReductionKind::Sum => {
+                 // Simple sum: sum += arr[i]
+                 // Register-based flow: vec_zero → vec_load → vec_add → horizontal_add
+@@ -6006,7 +6446,9 @@ fn transform_reduction_avx2(
+                 }
+ 
+                 if debug {
+-                    eprintln!("[VEC-RED]   Transformed sum body: vec_load + vec_add (register-based)");
++                    eprintln!(
++                        "[VEC-RED]   Transformed sum body: vec_load + vec_add (register-based)"
++                    );
+                 }
+             }
+             ReductionKind::DotProduct => {
+@@ -6196,7 +6638,9 @@ fn transform_reduction_avx2(
+                 }
+ 
+                 if debug {
+-                    eprintln!("[VEC-RED]   Transformed dot product body: load_a + load_b + mul + add");
++                    eprintln!(
++                        "[VEC-RED]   Transformed dot product body: load_a + load_b + mul + add"
++                    );
+                 }
+             }
+         }
+@@ -6207,39 +6651,62 @@ fn transform_reduction_avx2(
+         let (vec_load_op, vec_mul_op, vec_add_op, vec_zero_op, vec_fma_op, use_fma) =
+             match (pattern.kind, pattern.element_type) {
+                 (ReductionKind::Sum, IrType::F64) => (
+-                    IntrinsicOp::VecLoadF64x4, None, IntrinsicOp::VecAddF64x4,
+-                    IntrinsicOp::VecZeroF64x4, None, false),
++                    IntrinsicOp::VecLoadF64x4,
++                    None,
++                    IntrinsicOp::VecAddF64x4,
++                    IntrinsicOp::VecZeroF64x4,
++                    None,
++                    false,
++                ),
+                 (ReductionKind::Sum, IrType::I32) => (
+-                    IntrinsicOp::VecLoadI32x8, None, IntrinsicOp::VecAddI32x8,
+-                    IntrinsicOp::VecZeroI32x8, None, false),
++                    IntrinsicOp::VecLoadI32x8,
++                    None,
++                    IntrinsicOp::VecAddI32x8,
++                    IntrinsicOp::VecZeroI32x8,
++                    None,
++                    false,
++                ),
+                 (ReductionKind::Sum, IrType::F32) => (
+-                    IntrinsicOp::VecLoadF32x8, None, IntrinsicOp::VecAddF32x8,
+-                    IntrinsicOp::VecZeroF32x8, None, false),
++                    IntrinsicOp::VecLoadF32x8,
++                    None,
++                    IntrinsicOp::VecAddF32x8,
++                    IntrinsicOp::VecZeroF32x8,
++                    None,
++                    false,
++                ),
+                 (ReductionKind::DotProduct, IrType::F64) => (
+-                    IntrinsicOp::VecLoadF64x4, Some(IntrinsicOp::VecMulF64x4),
+-                    IntrinsicOp::VecAddF64x4, IntrinsicOp::VecZeroF64x4,
+-                    Some(IntrinsicOp::VecFmaF64x4), fp_contract_fast),
++                    IntrinsicOp::VecLoadF64x4,
++                    Some(IntrinsicOp::VecMulF64x4),
++                    IntrinsicOp::VecAddF64x4,
++                    IntrinsicOp::VecZeroF64x4,
++                    Some(IntrinsicOp::VecFmaF64x4),
++                    fp_contract_fast,
++                ),
+                 (ReductionKind::DotProduct, IrType::F32) => (
+-                    IntrinsicOp::VecLoadF32x8, Some(IntrinsicOp::VecMulF32x8),
+-                    IntrinsicOp::VecAddF32x8, IntrinsicOp::VecZeroF32x8,
+-                    Some(IntrinsicOp::VecFmaF32x8), fp_contract_fast),
++                    IntrinsicOp::VecLoadF32x8,
++                    Some(IntrinsicOp::VecMulF32x8),
++                    IntrinsicOp::VecAddF32x8,
++                    IntrinsicOp::VecZeroF32x8,
++                    Some(IntrinsicOp::VecFmaF32x8),
++                    fp_contract_fast,
++                ),
+                 (ReductionKind::DotProduct, IrType::I32) => (
+-                    IntrinsicOp::VecLoadI32x8, Some(IntrinsicOp::VecMulI32x8),
+-                    IntrinsicOp::VecAddI32x8, IntrinsicOp::VecZeroI32x8,
+-                    None, false),
++                    IntrinsicOp::VecLoadI32x8,
++                    Some(IntrinsicOp::VecMulI32x8),
++                    IntrinsicOp::VecAddI32x8,
++                    IntrinsicOp::VecZeroI32x8,
++                    None,
++                    false,
++                ),
+                 _ => return 0,
+             };
+ 
+         let sec = pattern.second.as_ref().unwrap();
+-        let sec_byte_iv_a = find_reduction_byte_iv(
+-            func,
+-            &pattern.loop_blocks,
+-            sec.array_a_gep,
+-            elem_sz as u32,
+-        );
+-        let sec_byte_iv_b = sec.array_b_gep.and_then(|g| {
+-            find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32)
+-        });
++        let sec_byte_iv_a =
++            find_reduction_byte_iv(func, &pattern.loop_blocks, sec.array_a_gep, elem_sz as u32);
++        let sec_byte_iv_b = sec
++            .array_b_gep
++            .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
+ 
+         let mut order = [
+             (
+@@ -6291,7 +6758,10 @@ fn transform_reduction_avx2(
+                 primary_sum = sum;
+             }
+         }
+-        debug_assert!(primary_sum.0 != u32::MAX, "primary accumulator not rewritten");
++        debug_assert!(
++            primary_sum.0 != u32::MAX,
++            "primary accumulator not rewritten"
++        );
+         vec_sum_value = primary_sum;
+     }
+ 
+@@ -6303,7 +6773,7 @@ fn transform_reduction_avx2(
+         horizontal_intrinsic,
+         vec_sum_value, // Pass the vector accumulator SSA value
+         use_byte_iv,
+-        None, // AVX2 path uses a single NEON accumulator
++        None,                    // AVX2 path uses a single NEON accumulator
+         pattern.second.as_ref(), // Second independent accumulator, if any
+         &mut next_val_id,
+         &mut next_label,
+@@ -6353,6 +6823,25 @@ fn transform_reduction_sse2(
+                 Some(IntrinsicOp::MulF64x2),
+                 IntrinsicOp::HorizontalAddF64x2,
+             ),
++            // NEON 4-wide i32 max reduction: lane-wise smax + smaxv reduce.
++            IrType::I32 if pattern.kind == ReductionKind::Max => {
++                if !neon {
++                    // No packed max path on the x86 side of this transform
++                    // (pmaxsd exists but the epilogue lacks a horizontal-max;
++                    // detector already gates on neon, this is defense).
++                    if debug {
++                        eprintln!("[VEC-RED] Max reduction requires NEON");
++                    }
++                    return 0;
++                }
++                (
++                    4u64,
++                    IntrinsicOp::VecLoadI32x4,
++                    IntrinsicOp::VecSmaxI32x4,
++                    None,
++                    IntrinsicOp::VecHorizontalMaxI32x4,
++                )
++            }
+             // NEON 4-wide i32→i64 forms: sadalp for sums, smlal/smlal2 for dots.
+             IrType::I32 if pattern.accumulator_type == IrType::I64 && neon => (
+                 4u64,
+@@ -6360,6 +6849,7 @@ fn transform_reduction_sse2(
+                 match pattern.kind {
+                     ReductionKind::Sum => IntrinsicOp::VecSadalpI32x4,
+                     ReductionKind::DotProduct => IntrinsicOp::VecSmlalLoI32x4,
++                    ReductionKind::Max => unreachable!("max has an I32 accumulator"),
+                 },
+                 None,
+                 IntrinsicOp::VecHorizontalAddI64x2,
+@@ -6457,17 +6947,13 @@ fn transform_reduction_sse2(
+     // arrays too; otherwise the whole loop uses the element-index scheme
+     // (scaled GEP offsets), which is correct but one LEA per access heavier.
+     if let Some(sec) = &pattern.second {
+-        let sec_byte_iv_a = find_reduction_byte_iv(
+-            func,
+-            &pattern.loop_blocks,
+-            sec.array_a_gep,
+-            elem_sz as u32,
+-        );
+-        let sec_byte_iv_b = sec.array_b_gep.and_then(|g| {
+-            find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32)
+-        });
+-        use_byte_iv &= sec_byte_iv_a.is_some()
+-            && (sec.array_b_gep.is_none() || sec_byte_iv_b.is_some());
++        let sec_byte_iv_a =
++            find_reduction_byte_iv(func, &pattern.loop_blocks, sec.array_a_gep, elem_sz as u32);
++        let sec_byte_iv_b = sec
++            .array_b_gep
++            .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
++        use_byte_iv &=
++            sec_byte_iv_a.is_some() && (sec.array_b_gep.is_none() || sec_byte_iv_b.is_some());
+     }
+ 
+     // Step 1: Divide loop bound by vector width (byte limit under byte-offset IV)
+@@ -6688,6 +7174,177 @@ fn transform_reduction_sse2(
+ 
+     if pattern.second.is_none() {
+         match pattern.kind {
++            // NEON 4-wide i32 max: acc = smax(acc, load4). The scalar init value
++            // (the phi's preheader incoming) is broadcast into the vector
++            // accumulator, so zero vector iterations still reduce to the scalar
++            // init (smaxv of 4 equal lanes = the init).
++            ReductionKind::Max => {
++                let init_bcast = Value(next_val_id);
++                next_val_id += 1;
++                let vec_load = Value(next_val_id);
++                next_val_id += 1;
++                vec_sum_value = Value(next_val_id);
++                next_val_id += 1;
++
++                let latch_label = func.blocks[pattern.latch_idx].label;
++
++                // Read the phi edges FIRST (fail-closed: abort before any
++                // mutation if the shape is unexpected), then rewire: backedge ->
++                // smax result, preheader -> broadcast of the scalar init.
++                let mut preheader_label = None;
++                let mut init_operand = None;
++                {
++                    let header_block = &func.blocks[pattern.header_idx];
++                    for inst in &header_block.instructions {
++                        if let Instruction::Phi { dest, incoming, .. } = inst {
++                            if *dest == pattern.accumulator_phi {
++                                for (val, label) in incoming {
++                                    if *label != latch_label {
++                                        preheader_label = Some(*label);
++                                        init_operand = Some(val.clone());
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++                let (Some(preheader_label), Some(init_operand)) = (preheader_label, init_operand)
++                else {
++                    if debug {
++                        eprintln!("[VEC-RED]   Max: no preheader edge on accumulator phi");
++                    }
++                    return changes; // nothing mutated yet
++                };
++                {
++                    let header_block = &mut func.blocks[pattern.header_idx];
++                    for inst in header_block.instructions.iter_mut() {
++                        if let Instruction::Phi { dest, incoming, .. } = inst {
++                            if *dest == pattern.accumulator_phi {
++                                for (val, label) in incoming.iter_mut() {
++                                    if *label == latch_label {
++                                        *val = Operand::Value(vec_sum_value);
++                                    } else {
++                                        *val = Operand::Value(init_bcast);
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++
++                // Broadcast the scalar init into all 4 lanes, in the preheader
++                // (the init operand dominates that block's terminator).
++                if let Some(pre_idx) = func.blocks.iter().position(|b| b.label == preheader_label) {
++                    func.blocks[pre_idx]
++                        .instructions
++                        .push(Instruction::Intrinsic {
++                            dest: Some(init_bcast),
++                            op: IntrinsicOp::VecBroadcastI32x4,
++                            dest_ptr: None,
++                            args: vec![init_operand],
++                        });
++                    changes += 1;
++                }
++
++                // Body: 4-wide load + lane-wise smax, replacing the Select and
++                // its feeding Cmp. Capture the cmp by VALUE first; remove AFTER
++                // the insert/remove (its index may precede the Select's).
++                {
++                    let body_block = &mut func.blocks[pattern.body_idx];
++                    let mut sel_cmp_val = None;
++                    if let Instruction::Select {
++                        cond: Operand::Value(cv),
++                        ..
++                    } = &body_block.instructions[pattern.accumulator_add_idx]
++                    {
++                        sel_cmp_val = Some(*cv);
++                    }
++                    let (base, off) = match (use_byte_iv, &byte_iv_a) {
++                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
++                        _ => (
++                            Operand::Value(pattern.array_a_gep),
++                            Operand::Const(IrConst::I64(0)),
++                        ),
++                    };
++                    body_block.instructions.insert(
++                        pattern.accumulator_add_idx,
++                        Instruction::Intrinsic {
++                            dest: Some(vec_load),
++                            op: IntrinsicOp::VecLoadI32x4,
++                            dest_ptr: None,
++                            args: vec![base, off],
++                        },
++                    );
++                    body_block.instructions.insert(
++                        pattern.accumulator_add_idx + 1,
++                        Instruction::Intrinsic {
++                            dest: Some(vec_sum_value),
++                            op: IntrinsicOp::VecSmaxI32x4,
++                            dest_ptr: None,
++                            args: vec![
++                                Operand::Value(pattern.accumulator_phi),
++                                Operand::Value(vec_load),
++                            ],
++                        },
++                    );
++                    // Remove the old Select (now shifted to +2).
++                    body_block
++                        .instructions
++                        .remove(pattern.accumulator_add_idx + 2);
++                    changes += 2;
++                    if let Some(cv) = sel_cmp_val {
++                        if let Some(cp) = body_block
++                            .instructions
++                            .iter()
++                            .position(|i| matches!(i.dest(), Some(d) if d.0 == cv.0))
++                        {
++                            body_block.instructions.remove(cp);
++                        }
++                    }
++                }
++
++                // Scale the marching pointer's latch step from one element
++                // (4 bytes) to vec_width elements (16): the detector proved the
++                // access is a one-element marching-pointer phi, and the vector
++                // body now consumes 4 lanes per iteration. Without this the
++                // pointer advances 4 bytes per vector iteration and every load
++                // after the first reads 3 stale lanes (find_max returned a[0]-
++                // adjacent garbage instead of the max).
++                {
++                    let mut scaled = false;
++                    for &bi in &pattern.loop_blocks {
++                        let block = &mut func.blocks[bi];
++                        for inst in block.instructions.iter_mut() {
++                            if let Instruction::GetElementPtr {
++                                base,
++                                offset: offset @ Operand::Const(_),
++                                ..
++                            } = inst
++                            {
++                                if base.0 == pattern.array_a_gep.0 {
++                                    if let Operand::Const(c) = offset {
++                                        if c.to_i64() == Some(4) {
++                                            *offset = Operand::Const(IrConst::I64(16));
++                                            scaled = true;
++                                        }
++                                    }
++                                }
++                            }
++                        }
++                    }
++                    debug_assert!(
++                        scaled,
++                        "max transform requires the marching-pointer step GEP"
++                    );
++                    if scaled {
++                        changes += 1;
++                    }
++                }
++
++                if debug {
++                    eprintln!("[VEC-RED]   Transformed max body: load + smax (NEON 4-wide)");
++                }
++            }
+             ReductionKind::Sum => {
+                 // Simple sum: sum += arr[i]
+                 // Map old intrinsics to new register-based intrinsics
+@@ -7012,7 +7669,9 @@ fn transform_reduction_sse2(
+                 }
+ 
+                 if debug {
+-                    eprintln!("[VEC-RED]   Transformed dot product body: load_a + load_b + smlal + smlal2 (NEON 4-wide)");
++                    eprintln!(
++                        "[VEC-RED]   Transformed dot product body: load_a + load_b + smlal + smlal2 (NEON 4-wide)"
++                    );
+                 }
+             }
+             ReductionKind::DotProduct => {
+@@ -7085,8 +7744,10 @@ fn transform_reduction_sse2(
+                 changes += 1;
+ 
+                 if debug {
+-                    eprintln!("[VEC-RED]   Created SSA values: vec_load_a={}, vec_load_b={}, vec_mul={}, vec_sum={}",
+-                        vec_load_a.0, vec_load_b.0, vec_mul.0, vec_sum_value.0);
++                    eprintln!(
++                        "[VEC-RED]   Created SSA values: vec_load_a={}, vec_load_b={}, vec_mul={}, vec_sum={}",
++                        vec_load_a.0, vec_load_b.0, vec_mul.0, vec_sum_value.0
++                    );
+                 }
+ 
+                 // Update the accumulator PHI to use init_zero_value as the entry predecessor
+@@ -7211,11 +7872,12 @@ fn transform_reduction_sse2(
+                 }
+ 
+                 if debug {
+-                    eprintln!("[VEC-RED]   Transformed dot product body: load_a + load_b + mul + add (register-based)");
++                    eprintln!(
++                        "[VEC-RED]   Transformed dot product body: load_a + load_b + mul + add (register-based)"
++                    );
+                 }
+             }
+         }
+-
+     } else {
+         // Multi-reduction (SSE2/NEON 2-wide): mirror the AVX2 path, deriving
+         // the vector ops from `load_intrinsic` exactly like the single
+@@ -7251,15 +7913,11 @@ fn transform_reduction_sse2(
+         };
+ 
+         let sec = pattern.second.as_ref().unwrap();
+-        let sec_byte_iv_a = find_reduction_byte_iv(
+-            func,
+-            &pattern.loop_blocks,
+-            sec.array_a_gep,
+-            elem_sz as u32,
+-        );
+-        let sec_byte_iv_b = sec.array_b_gep.and_then(|g| {
+-            find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32)
+-        });
++        let sec_byte_iv_a =
++            find_reduction_byte_iv(func, &pattern.loop_blocks, sec.array_a_gep, elem_sz as u32);
++        let sec_byte_iv_b = sec
++            .array_b_gep
++            .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
+ 
+         let mut order = [
+             (
+@@ -7311,7 +7969,10 @@ fn transform_reduction_sse2(
+                 primary_sum = sum;
+             }
+         }
+-        debug_assert!(primary_sum.0 != u32::MAX, "primary accumulator not rewritten");
++        debug_assert!(
++            primary_sum.0 != u32::MAX,
++            "primary accumulator not rewritten"
++        );
+         vec_sum_value = primary_sum;
+     }
+ 
+@@ -7323,7 +7984,7 @@ fn transform_reduction_sse2(
+         horizontal_intrinsic,
+         vec_sum_value, // Pass the vector accumulator SSA value
+         use_byte_iv,
+-        second_acc, // Second NEON accumulator phi (smlal2 half), if any
++        second_acc,              // Second NEON accumulator phi (smlal2 half), if any
+         pattern.second.as_ref(), // Second independent accumulator, if any
+         &mut next_val_id,
+         &mut next_label,
+@@ -8102,8 +8763,8 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
+         lane_addresses.push((a_addr, b_addr));
+     }
+     lane_addresses.sort_by_key(|((_, offset), _)| *offset);
+-    let a_base = lane_addresses[0].0 .0;
+-    let b_base = lane_addresses[0].1 .0;
++    let a_base = lane_addresses[0].0.0;
++    let b_base = lane_addresses[0].1.0;
+     let elem_size = if ty == IrType::F64 { 8 } else { 4 };
+     for (lane, ((this_a, a_offset), (this_b, b_offset))) in lane_addresses.iter().enumerate() {
+         let expected = lane as i64 * elem_size;
+@@ -8325,6 +8986,19 @@ pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
+     vectorize_with_analysis_mode(func, &cfg, true, true, false, false)
+ }
+ 
++/// Late AArch64 vectorization (levkropp 8ef1978f concept): reduction loops
++/// whose accumulator update only becomes Select-shaped after the main loop's
++/// if_convert phase (max reductions, conditional sums). The early vectorizer
++/// runs before if-conversion and rejects those loops as "conditional"; this
++/// second pass catches the converted form. Runs the SAME analysis — patterns
++/// already vectorized early contain Vec* intrinsics, which the analyzers
++/// reject structurally (no scalar Load/BinOp/Select shape), so re-running is
++/// idempotent and cannot double-transform.
++pub(crate) fn vectorize_function_two_wide_late(func: &mut IrFunction) -> usize {
++    let cfg = CfgAnalysis::build(func);
++    vectorize_with_analysis_mode(func, &cfg, true, true, false, false)
++}
++
+ pub(crate) fn vectorize_function_two_wide_fast_math(func: &mut IrFunction) -> usize {
+     let cfg = CfgAnalysis::build(func);
+     vectorize_with_analysis_mode(func, &cfg, true, true, true, false)
+diff --git a/tests/regression/vectorize_max_reduction_neon.c b/tests/regression/vectorize_max_reduction_neon.c
+new file mode 100644
+index 00000000..cd695729
+--- /dev/null
++++ b/tests/regression/vectorize_max_reduction_neon.c
+@@ -0,0 +1,22 @@
++// NEON i32 max reduction (levkropp 8b139820, audited port): find_max-shaped
++// loops (Select-form after if_convert, marching-pointer access) vectorize to
++// smax/smaxv via the late AArch64 pass. Edge matrix: n below/at/above vector
++// width, remainder counts, iv_init=1 (shifted coverage) vs 0, both compare
++// polarities, all-negative arrays (smax lane semantics), INT_MIN seed.
++// x86 keeps the scalar loop (NEON-only gate) and must print identically.
++int printf(const char *, ...);
++static int a[4096];
++int fm(int n) { int m = a[0]; for (int i = 1; i < n; i++) { int x = a[i]; if (x > m) m = x; } return m; }
++int fm0(int n) { int m = -2147483647 - 1; for (int i = 0; i < n; i++) { int x = a[i]; if (x > m) m = x; } return m; }
++int fm2(int n) { int m = a[0]; for (int i = 1; i < n; i++) { int x = a[i]; if (m < x) m = x; } return m; }
++int main() {
++    for (int i = 0; i < 4096; i++) a[i] = (int)((i * 2654435761u) % 100000) - 50000;
++    a[0] = -99999;
++    int ns[] = {1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 100, 3999, 4000, 4096};
++    for (unsigned k = 0; k < sizeof(ns) / sizeof(ns[0]); k++)
++        printf("%d:%d,%d,%d ", ns[k], fm(ns[k]), fm0(ns[k]), fm2(ns[k]));
++    printf("\n");
++    for (int i = 0; i < 4096; i++) a[i] = -100000 - i;
++    printf("neg:%d,%d\n", fm(4000), fm0(4000));
++    return 0;
++}
+-- 
+2.47.3
+
+
+From 9ffb5b74f9f31eb9eef0b466d8fc580b932532c2 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Sat, 22 Aug 2026 02:44:17 +0000
+Subject: [PATCH 2/2] Late-vectorizer guard test: conditional sums must stay
+ scalar
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adversarial companion to the max-reduction port: after if_convert a
+conditional sum has the same Select surface shape as a max reduction.
+reduction_pattern_is_sound check (2) — no instruction other than the
+identified Add may READ an accumulator-derived value — structurally
+rejects it (the Select reads the accumulator). This test pins that
+guarantee with negative-heavy data where an unconditional sum would
+differ wildly, on both backends.
+
+Vectorizing conditional sums PROPERLY (levkropp 8ef1978f's
+VecSmaxZeroI32x4 clamp before the sadalp widening accumulate + a
+Select-form remainder) stays in the backlog: it needs a
+reduction_pattern_is_sound exemption for the detected clamp Select,
+which deserves its own session with this guard test as the tripwire.
+---
+ .../latevec_condsum_not_misvectorized.c       | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+ create mode 100644 tests/regression/latevec_condsum_not_misvectorized.c
+
+diff --git a/tests/regression/latevec_condsum_not_misvectorized.c b/tests/regression/latevec_condsum_not_misvectorized.c
+new file mode 100644
+index 00000000..c089bbcb
+--- /dev/null
++++ b/tests/regression/latevec_condsum_not_misvectorized.c
+@@ -0,0 +1,19 @@
++// Adversarial guard for the late AArch64 vectorization pass: a conditional
++// sum (`if (x > 0) s += x`) is Select-shaped after if_convert — the same
++// surface shape as a max reduction. It must NOT be vectorized as an
++// unconditional sum: reduction_pattern_is_sound check (2) rejects the
++// Select because it reads the accumulator and is not the identified Add.
++// This test pins that structural guarantee with negative-heavy data where
++// an unconditional sum would differ wildly.
++int printf(const char *, ...);
++static int a[4096];
++long cond_sum(int n) {
++    long s = 0;
++    for (int i = 0; i < n; i++) { int x = a[i]; if (x > 0) s += x; }
++    return s;
++}
++int main() {
++    for (int i = 0; i < 4096; i++) a[i] = (int)((i * 2654435761u) % 100000) - 50000;
++    printf("%ld %ld %ld\n", cond_sum(7), cond_sum(4000), cond_sum(4096));
++    return 0;
++}
+-- 
+2.47.3
+
