@@ -1,3 +1,145 @@
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index 1836d38..b881e76 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -3361,8 +3361,8 @@ fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+ 
+         // Look for load from stack slot
+         if let LineKind::LoadEbp { reg: load_reg, offset, size } = infos[i].kind {
+-            // Only fold scratch registers (eax, ecx, edx)
+-            if !is_caller_saved(load_reg) && load_reg != REG_EAX {
++            // Only fold GPR registers
++            if load_reg > REG_GP_MAX {
+                 i += 1; continue;
+             }
+             // Only full-width loads: movzbl/movsbl/movzwl/movswl read fewer
+@@ -3466,7 +3466,11 @@ fn try_fold_memory_operand(s: &str, load_reg: RegId, offset: i32, _size: MoveSiz
+                     if dst.starts_with('%') && !dst.contains('(') {
+                         // Don't fold if dst is the same as load_reg (would be read after free)
+                         if register_family(dst) != load_reg {
+-                            return Some(format!("{} {}({}), {}", op, disp, base, dst));
++                            if *op == "testl" {
++                                return Some(format!("{} {}, {}({})", op, dst, disp, base));
++                            } else {
++                                return Some(format!("{} {}({}), {}", op, disp, base, dst));
++                            }
+                         }
+                     }
+                 }
+diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
+index 8521cfc..41bd9ff 100644
+--- a/src/driver/pipeline.rs
++++ b/src/driver/pipeline.rs
+@@ -1519,7 +1519,7 @@ impl Driver {
+                 .unwrap_or(30);
+             let mut did_split = false;
+             for func in &mut module.functions {
+-                if !func.is_declaration && func.blocks.len() > 10 {
++                if !func.is_declaration && func.blocks.len() > 0 {
+                     let n =
+                         crate::backend::split_ranges::split_call_spanning_ranges(func, max_splits);
+                     if n > 0 {
+diff --git a/src/ir/lowering/expr_access.rs b/src/ir/lowering/expr_access.rs
+index fe6f0a4..1c24cab 100644
+--- a/src/ir/lowering/expr_access.rs
++++ b/src/ir/lowering/expr_access.rs
+@@ -714,6 +714,12 @@ impl Lowerer {
+ 
+         if let Some(lv) = self.lower_lvalue(inner) {
+             let addr = self.lvalue_addr(&lv);
++            if let super::definitions::LValueKind::Variable(v) = lv.kind {
++                // If it is a direct variable, its address is just the alloca value itself.
++                // We can bypass emitting a GEP with offset 0, which makes the variable
++                // appear non-address-taken after helper functions are inlined!
++                return Operand::Value(v);
++            }
+             let result = self.fresh_value();
+             self.emit(Instruction::GetElementPtr {
+                 dest: result, base: addr,
+diff --git a/src/passes/inline.rs b/src/passes/inline.rs
+index 5cf3526..87cf91b 100644
+--- a/src/passes/inline.rs
++++ b/src/passes/inline.rs
+@@ -147,7 +147,7 @@ const MAX_TINY_INLINE_INSTRUCTIONS: usize = 5;
+ const MAX_SMALL_INLINE_INSTRUCTIONS: usize = 20;
+ 
+ /// Maximum blocks for a callee to be considered "small" (see above).
+-const MAX_SMALL_INLINE_BLOCKS: usize = 3;
++const MAX_SMALL_INLINE_BLOCKS: usize = 12;
+ 
+ /// Maximum instructions for a `static` (non-`inline`) function to be eligible
+ /// for inlining. GCC at -O2 inlines small static functions even without the
+@@ -423,7 +423,7 @@ fn select_inline_site(
+             // per site).  Above the ceiling the merge's spill cost can
+             // dominate (see MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST).
+             && !(callee_data.is_single_call_site_static
+-                && size_inline_cost <= (if size_optimized { 40 } else { MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST }))
++                && size_inline_cost <= MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST)
+             && call_is_in_loop
+             && callee_data.has_loops
+             && size_inline_cost > MAX_SIZE_NESTED_LOOP_INLINE_INSTRUCTIONS
+@@ -485,7 +485,7 @@ fn select_inline_site(
+                 && caller_has_loops
+                 && callee_inst_count > MAX_SMALL_INLINE_INSTRUCTIONS;
+             let size_cap_exempt = callee_data.is_single_call_site_static
+-                && callee_data.size_inline_cost <= (if size_optimized { 40 } else { MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST });
++                && callee_data.size_inline_cost <= MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST;
+             if caller_too_large
+                 && !callee_data.is_always_inline
+                 && !size_cap_exempt
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index 65e0b60..ffbf5d9 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -459,6 +459,7 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
+     if !std::env::var("CCC_NO_CLEANUP_FOLD2").is_ok() { constant_fold::run(module); }
+     if !std::env::var("CCC_NO_CLEANUP_CP2").is_ok() { copy_prop::run(module); }
+     iphase_dump!("cleanup-fold2-copyprop2");
++    crate::ir::mem2reg::promote_allocas_with_params(module);
+     resolve_asm::resolve_inline_asm_symbols(module);
+     iphase_dump!("post-inline cleanup");
+ }
+diff --git a/src/passes/simplify.rs b/src/passes/simplify.rs
+index c5142b8..a390b00 100644
+--- a/src/passes/simplify.rs
++++ b/src/passes/simplify.rs
+@@ -287,6 +287,36 @@ fn try_simplify_with_types(
+                 None
+             }
+         }
++        Instruction::Load { dest, ptr, ty, seg_override, volatile } => {
++            let ptr_idx = ptr.0 as usize;
++            if let Some(Some(gep)) = gep_defs.get(ptr_idx) {
++                if is_zero(&gep.offset) {
++                    return Some(Instruction::Load {
++                        dest: *dest,
++                        ptr: gep.base,
++                        ty: *ty,
++                        seg_override: *seg_override,
++                        volatile: *volatile,
++                    });
++                }
++            }
++            None
++        }
++        Instruction::Store { val, ptr, ty, seg_override, volatile } => {
++            let ptr_idx = ptr.0 as usize;
++            if let Some(Some(gep)) = gep_defs.get(ptr_idx) {
++                if is_zero(&gep.offset) {
++                    return Some(Instruction::Store {
++                        val: *val,
++                        ptr: gep.base,
++                        ty: *ty,
++                        seg_override: *seg_override,
++                        volatile: *volatile,
++                    });
++                }
++            }
++            None
++        }
+         _ => None,
+     }
+ }
 diff --git a/docs/history/2026-08-22-session52-rebase-gates-audit.md b/docs/history/2026-08-22-session52-rebase-gates-audit.md
 new file mode 100644
 index 0000000..636e3ea
