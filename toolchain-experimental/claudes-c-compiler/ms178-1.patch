@@ -1,534 +1,815 @@
-diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
-index 1bde28c..4157481 100644
---- a/engineering/agent/BACKLOG.md
-+++ b/engineering/agent/BACKLOG.md
-@@ -415,3 +415,35 @@ Agent-patch policy record: Agent C's remat-globaladdr fixes accepted (reworked:
- TLS-before-GOT order, get_defining_instruction reuse); Agent B's bare-alloca
- accepted; Agent B's MAX_SMALL_INLINE_BLOCKS 12 / -Os cap removal / split-call
- `>0` REJECTED AGAIN — do not resubmit without per-workload A/B evidence.
+diff --git a/docs/history/2026-08-22-session61-unroll-25-defects.md b/docs/history/2026-08-22-session61-unroll-25-defects.md
+new file mode 100644
+index 00000000..206b53e4
+--- /dev/null
++++ b/docs/history/2026-08-22-session61-unroll-25-defects.md
+@@ -0,0 +1,137 @@
++# Session 61 — 25 complete-unroll substitution defects
 +
-+## §11 Session 2026-08-22 (encoding-superiority + glibc-perf session) — carry-over
++Date: 2026-08-22
 +
-+- **LK-26 (P0, frontend, WRONG CODE)**: struct member offset INCONSISTENCY in
-+  glibc's `struct pthread` TU (anonymous union { tcbhead_t header;
-+  void *__padding[24]; } + trailing members). Within ONE compile of
-+  sysdeps/nptl/dl-tls_init_tp.c three different layouts are used for
-+  `robust_head`: __builtin_offsetof = 736, the &pd->robust_head VALUE GEP
-+  = 784, and the pd->robust_head.list STORE-ADDRESS GEP = 1296 **with base
-+  = Const 0 instead of pd** (emitted: `xor %r12d,%r12d; mov %rax,0x510(%r12)`
-+  → NULL-page store → every external binary dies in __tls_init_tp).
-+  Repro: /tmp/tlsinit.i (regen via /tmp/tlspp.sh), probe: /tmp/offprobe.c
-+  (lccc -O1 -S, read printf immediates: 728/736/704/704 vs codegen 784/1296).
-+  Synthetic simplification NOT yet found (my 704-byte-union model lays out
-+  correctly, offsets 1288/1296) — bisect the real TU's include stack; suspect
-+  duplicate/forward struct-def merging or get_expr_ctype layout cache
-+  divergence, since three SUBSYSTEMS disagree.
-+  Blocks: lccc-glibc runtime smoke + perf (ld.so TLS init).
-+- **PERF-1 (identified, quantified)**: FP intrinsic result path bounces
-+  through slot + GPR (`vroundsd; movsd->slot; movq slot->rax; movq rax->xmm0`)
-+  and dead movsd param shuffles: libm_round_family benchmark = 2.99x GCC.
-+  Fix direction: XMM-home the intrinsic dest / return-value path movsd
-+  slot->xmm0 direct; kill the entry double-shuffle.
-+- **PERF-2 (identified, quantified)**: __thread array indexing recomputes the
-+  TLS base per access instead of GCC's `%fs:sym@tpoff(,%r,8)` addressing:
-+  tls_seg_access = 2.60x GCC (was 5.8x before emit_seg_*_const_addr).
-+  Fix direction: TLS-base CSE + tpoff indexed addressing in the backend.
-+- **EVEX/AVX-512 assembler support** (mathvec blocker, 108 errors when
-+  --enable-mathvec): zmm/mask-register vmovups/vmovaps forms; big-ticket.
-+- encdiff status: 10557-insn corpus vs GAS 2.47: LONGER=0, BEATS=180
-+  (redundant-SIB lea class); probe corpus documents ICC silent
-+  sign-extension miscompile class (we + GAS 2.47 + GCC + Clang all reject).
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index b23604d..febdc8a 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -3012,6 +3012,45 @@ fn generate_function(
-     } else {
-         FxHashMap::default()
-     };
-+    // Values that are link-time integer CONSTANTS (Copy/Cast of Const, and
-+    // GEP of such a constant plus a constant offset). Segment-override
-+    // loads/stores through them use the direct `movq %fs:OFF` form —
-+    // glibc's THREAD_SELF/GETMEM/SETMEM all funnel through this shape, and
-+    // the register-indirect fallback costs 3 instructions per access.
-+    let const_addr_vals: FxHashMap<u32, i64> = {
-+        let mut m: FxHashMap<u32, i64> = FxHashMap::default();
-+        let as_const = |op: &Operand, m: &FxHashMap<u32, i64>| -> Option<i64> {
-+            match op {
-+                Operand::Const(c) => ir_const_as_i64(c),
-+                Operand::Value(v) => m.get(&v.0).copied(),
-+            }
-+        };
-+        for block in &func.blocks {
-+            for inst in &block.instructions {
-+                match inst {
-+                    Instruction::Copy { dest, src } => {
-+                        if let Some(v) = as_const(src, &m) {
-+                            m.insert(dest.0, v);
-+                        }
-+                    }
-+                    Instruction::Cast { dest, src, .. } => {
-+                        if let Some(v) = as_const(src, &m) {
-+                            m.insert(dest.0, v);
-+                        }
-+                    }
-+                    Instruction::GetElementPtr { dest, base, offset, .. } => {
-+                        if let (Some(b), Some(o)) =
-+                            (m.get(&base.0).copied(), as_const(offset, &m))
-+                        {
-+                            m.insert(dest.0, b.wrapping_add(o));
-+                        }
-+                    }
-+                    _ => {}
-+                }
-+            }
-+        }
-+        m
-+    };
++Upstream base: `fdeea471` (latest merged `ms178/lccc` main).
++All compiler builds used `scripts/build_lccc_fast.sh` only.
++
++## Root cause
++
++The complete-unroll path cloned loop instructions with two handwritten value
++substitution functions. They understood a small algebraic subset of the IR.
++Every omitted use position retained the original iteration's SSA value after a
++clone, or retained the loop-header IV after the loop disappeared. This is a
++miscompile, not merely a missed optimization.
++
++The first concrete GCC torture reproducer was `20040706-1.c`:
++
++```c
++int i;
++for (i = 0; i < 10; ++i)
++    continue;
++if (i < 10)
++    abort();
++```
++
++Complete unrolling removed the loop but left the post-loop use bound to the
++initial IV, making `abort()` unconditional. The same defect corrupted raw
++pointer fields in `20010910-1.c` and `20050502-2.c`.
++
++## Architectural correction
++
++Manual variant switches were deleted. Unroll cloning now uses the canonical IR
++visitors:
++
++```text
++Instruction::for_each_operand_mut
++Instruction::for_each_value_use_mut
++Terminator::for_each_operand_mut
++```
++
++The final loop IV is explicitly replaced by `init + trip * step` in every block
++outside the removed natural loop, including terminators. This makes the
++transformation complete by construction when new IR variants are added: the
++central visitor contract, already tested by the IR layer, is the single source
++of truth.
++
++## Twenty-five distinct fixed use positions
++
++The old complete-unroll substitution omitted each of these independently
++observable positions. A focused unit test constructs all 25 and proves every
++one is renamed:
++
++1. `Memcpy.dest`
++2. `Memcpy.src`
++3. `AtomicCmpxchg.ptr`
++4. `AtomicCmpxchg.expected`
++5. `AtomicCmpxchg.desired`
++6. `VaArgStruct.dest_ptr`
++7. `VaArgStruct.va_list_ptr`
++8. `VaCopy.dest_ptr`
++9. `VaCopy.src_ptr`
++10. `AtomicRmw.ptr`
++11. `AtomicRmw.val`
++12. `AtomicStore.ptr`
++13. `AtomicStore.val`
++14. first `Phi.incoming` operand
++15. second `Phi.incoming` operand
++16. `VaArg.va_list_ptr`
++17. `VaStart.va_list_ptr`
++18. `VaEnd.va_list_ptr`
++19. `SetReturnF64Second.src`
++20. `SetReturnF32Second.src`
++21. `SetReturnF128Second.src`
++22. `AtomicInc.ptr`
++23. `AtomicLoad.ptr`
++24. post-loop `Return` operand
++25. post-loop `CondBranch.cond`
++
++These are 25 separate def-use edges with different memory, atomic, ABI,
++variadic, complex-return, phi, and control-flow semantics. The fix is shared
++because duplicating 25 ad-hoc repairs would recreate the design error.
++
++## Reproducers and measured impact
++
++A maintained runtime regression, `complete_unroll_exit_iv.c`, covers the empty
++body/final-IV case on both x86 and AArch64.
++
++GCC C torture, first 500 sorted execute tests:
++
++```text
++before: 454 PASS, 46 FAIL
++ after: 457 PASS, 43 FAIL
++```
++
++Newly passing external tests:
++
++* `20010910-1.c` — unrolled pointer-field initialization/verification;
++* `20040706-1.c` — final IV after an empty-body loop;
++* `20050502-2.c` — cloned non-algebraic value uses.
++
++The full 1694-file screening remains an explicit backlog rather than a hidden
++claim: prior baseline was 1535 pass / 152 fail / 7 skip; the remaining failures
++contain frontend nested-function gaps, ABI/complex/varargs defects, and runtime
++miscompilations.
++
++## Validation
++
++```text
++Focused 25-position unit test : PASS
++Rust library tests            : 1090 PASS, 6 ignored, 0 FAIL
++Correctness suite             : 50/50 PASS
++x86 regression                : 438 PASS, 0 FAIL
++ARM regression                : 269 PASS, 51 retained FAIL, 69 SKIP
++GCC torture first 500         : 457 PASS, 43 FAIL
++GAS                           : GNU assembler 2.47.20260726
++Linker suite                  : 159 PASS, 1 pre-existing version-script FAIL
++```
++
++The ARM pass count increased by one due to the new regression; failure identity
++was unchanged outside the fixed unroll cases.
++
++## Performance and lccc-ld screening
++
++Fastbuild LCCC/integrated `lccc-ld` produced correct binaries for every measured
++benchmark. Pinned randomized VM ratios versus GCC:
++
++```text
++aarch64_select_patterns  1.3646
++gzip CRC-32              1.0641
++zlib-ng Adler-32         1.5246
++Expat XML scan           2.0562
++geomean                   1.4607
++```
++
++No runtime win is claimed from noisy host-VM measurements. Complete unrolling
++retains the same profitability budget; the change repairs value flow and does
++not add generated instructions to legal transforms.
+diff --git a/engineering/evidence/aarch64/session61/README.md b/engineering/evidence/aarch64/session61/README.md
+new file mode 100644
+index 00000000..ba145ebd
+--- /dev/null
++++ b/engineering/evidence/aarch64/session61/README.md
+@@ -0,0 +1,9 @@
++# AArch64 session 61 evidence
++
++* `gcc-torture-500-summary.json`: post-fix first-500 GCC execute results and
++  every remaining failure identity.
++* `benchmark-vm-screening.md`: paired randomized fastbuild LCCC/integrated
++  lccc-ld versus GCC runtime screening.
++
++The complete raw object trees are intentionally regenerated rather than stored.
++GNU assembler 2.47 is mandatory in `aarch64_execute_suite.py`.
+diff --git a/engineering/evidence/aarch64/session61/benchmark-vm-screening.md b/engineering/evidence/aarch64/session61/benchmark-vm-screening.md
+new file mode 100644
+index 00000000..4c0bdbb6
+--- /dev/null
++++ b/engineering/evidence/aarch64/session61/benchmark-vm-screening.md
+@@ -0,0 +1,33 @@
++# LCCC benchmark report
++
++- **UTC:** `2026-08-22T21:36:28.001591+00:00`
++- **CPU model(s):** `Intel(R) Xeon(R) Processor @ 2.60GHz`
++- **Hypervisor detected:** `True`
++- **CPU pinning:** `{'requested': 'auto', 'allowed_cpus': [0, 1], 'applied': True, 'cpu': 0, 'reason': 'taskset pinning'}`
++- **PMU:** `perf is not installed`
++- **LCCC revision:** `fdeea471e3f256f7991eea3d18b033d8663fc940`
++- **LCCC binary SHA-256:** `70b39c4cec3016072a499d4b1918e4ccdc6d00ab3e073c8c3d2ffa08e5492ae0`
++- **Method:** randomized compiler order within each paired round; warm-ups excluded; median wall time and paired bootstrap CI; no automatic outlier removal.
++
++| Benchmark | LCCC median | GCC median | Best reference | LCCC/best paired (95% bootstrap CI) | Correct |
++| --- | ---: | ---: | --- | ---: | :---: |
++| `aarch64_select_patterns` | 175.90 ms | 128.52 ms | GCC | 1.3646 [1.3584, 1.3770] | pass |
++| `gzip_crc32` | 179.27 ms | 168.41 ms | GCC | 1.0641 [1.0365, 1.0704] | pass |
++| `zlib_ng_adler32` | 59.41 ms | 38.99 ms | GCC | 1.5246 [1.5201, 1.5567] | pass |
++| `expat_xml_scan` | 84.71 ms | 42.50 ms | GCC | 2.0562 [1.8611, 2.1116] | pass |
++
++## Aggregate LCCC/GCC (correct pairs only)
++
++- Geometric mean ratio: `1.4607`
++- Arithmetic mean ratio: `1.5024`
++- Best individual ratio: `gzip_crc32` = `1.0641`
++- Worst individual ratio: `expat_xml_scan` = `2.0562`
++
++## Aggregate LCCC / fastest available reference (correct pairs only)
++
++- Geometric mean ratio: `1.4607`
++- Arithmetic mean ratio: `1.5024`
++- Best individual ratio: `gzip_crc32` vs `gcc` = `1.0641`
++- Worst individual ratio: `expat_xml_scan` vs `gcc` = `2.0562`
++
++A ratio below 1 means LCCC was faster.  This report is screening evidence; a VM without a verified PMU is not evidence for a Raptor Lake microarchitectural claim.
+diff --git a/engineering/evidence/aarch64/session61/gcc-torture-500-summary.json b/engineering/evidence/aarch64/session61/gcc-torture-500-summary.json
+new file mode 100644
+index 00000000..907fab2c
+--- /dev/null
++++ b/engineering/evidence/aarch64/session61/gcc-torture-500-summary.json
+@@ -0,0 +1,189 @@
++{
++  "gcc_revision": "ad82e41f1b997dedd2cf227cb410afd8763d89c8",
++  "scope": "first 500 sorted top-level gcc.c-torture/execute C files",
++  "counts": {
++    "PASS": 457,
++    "FAIL": 43
++  },
++  "tools": {
++    "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0",
++    "assembler": "GNU assembler (GNU Binutils) 2.47.20260726",
++    "gcc": "aarch64-linux-gnu-gcc (Debian 14.2.0-19) 14.2.0",
++    "clang": null,
++    "qemu": "qemu-aarch64 version 10.0.11 (Debian 1:10.0.11+ds-0+deb13u1)"
++  },
++  "failures": [
++    {
++      "source": "20000822-1.c",
++      "stage": "lccc-compile"
++    },
++    {
++      "source": "20010209-1.c",
++      "stage": "lccc-compile"
++    },
++    {
++      "source": "20010605-1.c",
++      "stage": "lccc-compile"
++    },
++    {
++      "source": "20020411-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20020412-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20020413-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20020720-1.c",
++      "stage": "lccc-link"
++    },
++    {
++      "source": "20021127-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20030125-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20030216-1.c",
++      "stage": "lccc-link"
++    },
++    {
++      "source": "20030501-1.c",
++      "stage": "lccc-compile"
++    },
++    {
++      "source": "20031003-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20040411-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20040423-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20040520-1.c",
++      "stage": "lccc-compile"
++    },
++    {
++      "source": "20040709-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20040709-2.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20040709-3.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20041019-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20041114-1.c",
++      "stage": "lccc-link"
++    },
++    {
++      "source": "20041214-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20041218-2.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20050121-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20051215-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20060929-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20061220-1.c",
++      "stage": "lccc-compile"
++    },
++    {
++      "source": "20070212-2.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20070614-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20070919-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20071210-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20071220-1.c",
++      "stage": "lccc-link"
++    },
++    {
++      "source": "20071220-2.c",
++      "stage": "lccc-link"
++    },
++    {
++      "source": "20080604-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20090219-1.c",
++      "stage": "lccc-compile"
++    },
++    {
++      "source": "20120919-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20171008-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20230630-2.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "20230630-4.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "920302-1.c",
++      "stage": "execute-vs-gcc"
++    },
++    {
++      "source": "920415-1.c",
++      "stage": "lccc-compile"
++    },
++    {
++      "source": "920428-2.c",
++      "stage": "lccc-compile"
++    },
++    {
++      "source": "920501-7.c",
++      "stage": "lccc-compile"
++    },
++    {
++      "source": "920612-2.c",
++      "stage": "lccc-compile"
++    }
++  ]
++}
+diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
+index c48c66c9..eba84e46 100644
+--- a/src/passes/loop_unroll.rs
++++ b/src/passes/loop_unroll.rs
+@@ -760,6 +760,17 @@ fn try_complete_unroll_two_block(
+     let _ = (body_entry, exit_cond_positive);
  
-     let mut global_addr_map = build_global_addr_map(
-         func,
-@@ -3719,6 +3758,7 @@ fn generate_function(
-                 &global_addr_ptr_set,
-                 &dead_global_addrs,
-                 &remat_global_addrs,
-+                &const_addr_vals,
-             );
-             cg.state().current_program_point += 1;
-         }
-@@ -3833,6 +3873,7 @@ pub(super) fn generate_instruction(
-     global_addr_ptr_set: &FxHashSet<u32>,
-     dead_global_addrs: &FxHashSet<u32>,
-     remat_global_addrs: &FxHashSet<u32>,
-+    const_addr_vals: &FxHashMap<u32, i64>,
- ) {
-     match inst {
-         Instruction::PgoCounterInc {
-@@ -3867,6 +3908,7 @@ pub(super) fn generate_instruction(
-                 gep_fold_map,
-                 indexed_gep_map,
-                 global_addr_map,
-+                const_addr_vals,
-             );
-         }
-         Instruction::BinOp {
-@@ -3999,6 +4041,7 @@ pub(super) fn generate_instruction(
-                 gep_fold_map,
-                 indexed_gep_map,
-                 global_addr_map,
-+                const_addr_vals,
-             );
-             clobber_after_call_like(cg);
-         }
-@@ -4319,6 +4362,19 @@ fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
-     cg.emit_copy_value(dest, src);
+     let final_map: FxHashMap<u32, u32> = final_carried.iter().copied().collect();
++    let final_iv = Operand::Const(IrConst::from_i64(iv_init + trip * iv_step, iv_ty));
++    for (block_index, block) in func.blocks.iter_mut().enumerate() {
++        if lp.body.contains(&block_index) {
++            continue;
++        }
++        for instruction in &mut block.instructions {
++            subst_value_with_operand(instruction, iv_phi.0, &final_iv);
++        }
++        subst_value_in_terminator(&mut block.terminator, iv_phi.0, &final_iv);
++    }
++
+     func.blocks.extend(new_blocks);
+ 
+     for (phi_id, final_id) in final_map.iter() {
+@@ -780,70 +791,26 @@ fn try_complete_unroll_two_block(
  }
  
-+
-+/// Integer view of an IR constant for address-constant tracking.
-+fn ir_const_as_i64(c: &IrConst) -> Option<i64> {
-+    match c {
-+        IrConst::I8(v) => Some(*v as i64),
-+        IrConst::I16(v) => Some(*v as i64),
-+        IrConst::I32(v) => Some(*v as i64),
-+        IrConst::I64(v) => Some(*v),
-+        IrConst::Zero => Some(0),
-+        _ => None,
-+    }
+ fn subst_value_with_operand(inst: &mut Instruction, old_id: u32, new_op: &Operand) {
+-    let rep = |op: &mut Operand| {
+-        if let Operand::Value(v) = op {
+-            if v.0 == old_id {
+-                *op = new_op.clone();
+-            }
+-        }
+-    };
+-    match inst {
+-        Instruction::BinOp { lhs, rhs, .. } => {
+-            rep(lhs);
+-            rep(rhs);
+-        }
+-        Instruction::UnaryOp { src, .. }
+-        | Instruction::Cast { src, .. }
+-        | Instruction::Copy { src, .. } => rep(src),
+-        Instruction::Store { val, .. } => rep(val),
+-        Instruction::GetElementPtr { offset, .. } => rep(offset),
+-        Instruction::Cmp { lhs, rhs, .. } => {
+-            rep(lhs);
+-            rep(rhs);
+-        }
+-        Instruction::Select {
+-            cond,
+-            true_val,
+-            false_val,
+-            ..
+-        } => {
+-            rep(cond);
+-            rep(true_val);
+-            rep(false_val);
+-        }
+-        Instruction::Intrinsic { args, .. } => {
+-            for a in args.iter_mut() {
+-                rep(a);
++    inst.for_each_operand_mut(|operand| {
++        if matches!(operand, Operand::Value(value) if value.0 == old_id) {
++            *operand = new_op.clone();
++        }
++    });
++    if let Operand::Value(replacement) = new_op {
++        inst.for_each_value_use_mut(|value| {
++            if value.0 == old_id {
++                *value = *replacement;
+             }
+-        }
+-        _ => {}
++        });
+     }
+-    match inst {
+-        Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
+-            if ptr.0 == old_id {
+-                if let Operand::Value(v) = new_op {
+-                    *ptr = *v;
+-                }
+-            }
+-        }
+-        Instruction::GetElementPtr { base, .. } => {
+-            if base.0 == old_id {
+-                if let Operand::Value(v) = new_op {
+-                    *base = *v;
+-                }
+-            }
+-        }
+-        Instruction::Intrinsic {
+-            dest_ptr: Some(dp), ..
+-        } => {
+-            if dp.0 == old_id {
+-                if let Operand::Value(v) = new_op {
+-                    *dp = *v;
+-                }
+-            }
 +}
 +
- fn generate_load(
-     cg: &mut dyn ArchCodegen,
-     dest: &Value,
-@@ -4328,6 +4384,7 @@ fn generate_load(
-     gep_fold_map: &FxHashMap<u32, GepFoldInfo>,
-     indexed_gep_map: &FxHashMap<u32, IndexedGepInfo>,
-     global_addr_map: &FxHashMap<u32, String>,
-+    const_addr_vals: &FxHashMap<u32, i64>,
- ) {
-     if seg_override != AddressSpace::Default {
-         if let Some(sym) = global_addr_map.get(&ptr.0) {
-@@ -4336,6 +4393,12 @@ fn generate_load(
-                 return;
-             }
++fn subst_value_in_terminator(terminator: &mut Terminator, old_id: u32, new_op: &Operand) {
++    terminator.for_each_operand_mut(|operand| {
++        if matches!(operand, Operand::Value(value) if value.0 == old_id) {
++            *operand = new_op.clone();
          }
-+        // Constant offset (glibc TLS macros): direct one-instruction form.
-+        if let Some(&addr) = const_addr_vals.get(&ptr.0) {
-+            if cg.emit_seg_load_const_addr(dest, addr, ty, seg_override) {
-+                return;
-+            }
-+        }
-         // If the GlobalAddr/GEP was skipped as dead, rematerialize first.
-         if let Some(info) = gep_fold_map.get(&ptr.0) {
-             rematerialize_const_addr(cg, ptr, info);
-@@ -4391,6 +4454,7 @@ fn generate_store(
-     gep_fold_map: &FxHashMap<u32, GepFoldInfo>,
-     indexed_gep_map: &FxHashMap<u32, IndexedGepInfo>,
-     global_addr_map: &FxHashMap<u32, String>,
-+    const_addr_vals: &FxHashMap<u32, i64>,
- ) {
-     if seg_override != AddressSpace::Default {
-         if let Some(sym) = global_addr_map.get(&ptr.0) {
-@@ -4399,6 +4463,12 @@ fn generate_store(
-                 return;
-             }
-         }
-+        // Constant offset (glibc THREAD_SETMEM): direct one-instruction form.
-+        if let Some(&addr) = const_addr_vals.get(&ptr.0) {
-+            if cg.emit_seg_store_const_addr(val, addr, ty, seg_override) {
-+                return;
-+            }
-+        }
-         if let Some(info) = gep_fold_map.get(&ptr.0) {
-             rematerialize_const_addr(cg, ptr, info);
-         } else if let Some(info) = indexed_gep_map.get(&ptr.0) {
-diff --git a/src/backend/traits.rs b/src/backend/traits.rs
-index e508f28..43112cc 100644
---- a/src/backend/traits.rs
-+++ b/src/backend/traits.rs
-@@ -269,6 +269,30 @@ pub trait ArchCodegen {
-     /// Emit a load with a segment override prefix (e.g., %gs: or %fs:).
-     /// Used for GCC named address space extensions (__seg_gs, __seg_fs) on x86.
-     /// Default: panics (only x86 supports segment overrides).
-+    /// Segment-relative access at a LINK-TIME-CONSTANT offset
-+    /// (`movq %fs:16, %rax` — glibc THREAD_SELF/THREAD_GETMEM/SETMEM,
-+    /// errno, stack guard). Returns false when the backend has no direct
-+    /// form; the caller falls back to the register-indirect pair. One
-+    /// instruction instead of const-materialize + reg bounce + indirect
-+    /// access — the difference is 3.1x on the TLS benchmark kernel.
-+    fn emit_seg_load_const_addr(
-+        &mut self,
-+        _dest: &Value,
-+        _addr: i64,
-+        _ty: IrType,
-+        _seg: AddressSpace,
-+    ) -> bool {
-+        false
-+    }
-+    fn emit_seg_store_const_addr(
-+        &mut self,
-+        _val: &Operand,
-+        _addr: i64,
-+        _ty: IrType,
-+        _seg: AddressSpace,
-+    ) -> bool {
-+        false
-+    }
-     fn emit_seg_load(&mut self, _dest: &Value, _ptr: &Value, _ty: IrType, _seg: AddressSpace) {
-         panic!("segment override loads only supported on x86");
-     }
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index d3a0812..c598776 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -3876,6 +3876,7 @@ impl ArchCodegen for X86Codegen {
-                     &crate::common::fx_hash::FxHashSet::default(),
-                     &crate::common::fx_hash::FxHashSet::default(),
-                     &crate::common::fx_hash::FxHashSet::default(),
-+                    &crate::common::fx_hash::FxHashMap::default(),
-                 );
-                 self.state.current_program_point += 1;
-             }
-@@ -4512,6 +4513,8 @@ impl ArchCodegen for X86Codegen {
-         fn emit_inline_memcpy_call(&mut self, dest: &Operand, src: &Operand, size: usize) => emit_inline_memcpy_call_impl;
-         fn emit_inline_memmove_call(&mut self, dest: &Operand, src: &Operand, size: usize) => emit_inline_memmove_call_impl;
-         fn emit_seg_load(&mut self, dest: &Value, ptr: &Value, ty: IrType, seg: AddressSpace) => emit_seg_load_impl;
-+        fn emit_seg_load_const_addr(&mut self, dest: &Value, addr: i64, ty: IrType, seg: AddressSpace) -> bool => emit_seg_load_const_addr_impl;
-+        fn emit_seg_store_const_addr(&mut self, val: &Operand, addr: i64, ty: IrType, seg: AddressSpace) -> bool => emit_seg_store_const_addr_impl;
-         fn emit_seg_load_symbol(&mut self, dest: &Value, sym: &str, ty: IrType, seg: AddressSpace) => emit_seg_load_symbol_impl;
-         fn emit_seg_store(&mut self, val: &Operand, ptr: &Value, ty: IrType, seg: AddressSpace) => emit_seg_store_impl;
-         fn emit_seg_store_symbol(&mut self, val: &Operand, sym: &str, ty: IrType, seg: AddressSpace) => emit_seg_store_symbol_impl;
-diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
-index 8aa2ac5..6f1a92f 100644
---- a/src/backend/x86/codegen/memory.rs
-+++ b/src/backend/x86/codegen/memory.rs
-@@ -2573,6 +2573,107 @@ impl X86Codegen {
-         self.store_rax_to(dest);
+-        _ => {}
+-    }
++    });
+ }
+ 
+ fn find_iv_in_loop(
+@@ -1421,161 +1388,12 @@ fn replace_op(op: &mut Operand, map: &FxHashMap<u32, u32>) {
+ }
+ 
+ fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
+-    match inst {
+-        Instruction::PgoCounterInc { .. } => {}
+-        // Definitions with no operands to replace.
+-        Instruction::ParamRef { .. }
+-        | Instruction::Alloca { .. }
+-        | Instruction::GlobalAddr { .. }
+-        | Instruction::LabelAddr { .. }
+-        | Instruction::Fence { .. }
+-        | Instruction::StackSave { .. }
+-        | Instruction::GetReturnF64Second { .. }
+-        | Instruction::GetReturnF32Second { .. }
+-        | Instruction::GetReturnF128Second { .. } => {}
+-
+-        // Memory.
+-        Instruction::Store { val, ptr, .. } => {
+-            replace_op(val, map);
+-            replace_val(ptr, map);
+-        }
+-        Instruction::Load { ptr, .. } => replace_val(ptr, map),
+-        Instruction::Memcpy { dest, src, .. } => {
+-            replace_val(dest, map);
+-            replace_val(src, map);
+-        }
+-
+-        // Arithmetic / logic.
+-        Instruction::BinOp { lhs, rhs, .. } => {
+-            replace_op(lhs, map);
+-            replace_op(rhs, map);
+-        }
+-        Instruction::UnaryOp { src, .. } => replace_op(src, map),
+-        Instruction::Cmp { lhs, rhs, .. } => {
+-            replace_op(lhs, map);
+-            replace_op(rhs, map);
+-        }
+-
+-        // Pointer / address.
+-        Instruction::GetElementPtr { base, offset, .. } => {
+-            replace_val(base, map);
+-            replace_op(offset, map);
+-        }
+-        Instruction::DynAlloca { size, .. } => replace_op(size, map),
+-        Instruction::StackRestore { ptr } => replace_val(ptr, map),
+-
+-        // Conversions.
+-        Instruction::Cast { src, .. } => replace_op(src, map),
+-        Instruction::Copy { src, .. } => replace_op(src, map),
+-
+-        // Calls.
+-        Instruction::Call { info, .. } => {
+-            for arg in &mut info.args {
+-                replace_op(arg, map);
+-            }
+-        }
+-        Instruction::CallIndirect { func_ptr, info } => {
+-            replace_op(func_ptr, map);
+-            for arg in &mut info.args {
+-                replace_op(arg, map);
+-            }
+-        }
+-
+-        // Phi.
+-        Instruction::Phi { incoming, .. } => {
+-            for (op, _) in incoming {
+-                replace_op(op, map);
+-            }
+-        }
+-
+-        // Select.
+-        Instruction::Select {
+-            cond,
+-            true_val,
+-            false_val,
+-            ..
+-        } => {
+-            replace_op(cond, map);
+-            replace_op(true_val, map);
+-            replace_op(false_val, map);
+-        }
+-
+-        // Atomics.
+-        Instruction::AtomicRmw { ptr, val, .. } => {
+-            replace_op(ptr, map);
+-            replace_op(val, map);
+-        }
+-        Instruction::AtomicInc { ptr, .. } => replace_op(ptr, map),
+-        Instruction::AtomicCmpxchg {
+-            ptr,
+-            expected,
+-            desired,
+-            ..
+-        } => {
+-            replace_op(ptr, map);
+-            replace_op(expected, map);
+-            replace_op(desired, map);
+-        }
+-        Instruction::AtomicLoad { ptr, .. } => replace_op(ptr, map),
+-        Instruction::AtomicStore { ptr, val, .. } => {
+-            replace_op(ptr, map);
+-            replace_op(val, map);
+-        }
+-
+-        // Varargs.
+-        Instruction::VaArg { va_list_ptr, .. } => replace_val(va_list_ptr, map),
+-        Instruction::VaArgStruct {
+-            dest_ptr,
+-            va_list_ptr,
+-            ..
+-        } => {
+-            replace_val(dest_ptr, map);
+-            replace_val(va_list_ptr, map);
+-        }
+-        Instruction::VaStart { va_list_ptr } => replace_val(va_list_ptr, map),
+-        Instruction::VaEnd { va_list_ptr } => replace_val(va_list_ptr, map),
+-        Instruction::VaCopy { dest_ptr, src_ptr } => {
+-            replace_val(dest_ptr, map);
+-            replace_val(src_ptr, map);
+-        }
+-
+-        // Inline assembly.
+-        Instruction::InlineAsm {
+-            outputs, inputs, ..
+-        } => {
+-            for (_, ptr, _) in outputs {
+-                replace_val(ptr, map);
+-            }
+-            for (_, op, _) in inputs {
+-                replace_op(op, map);
+-            }
+-        }
+-
+-        // Intrinsics.
+-        Instruction::Intrinsic { dest_ptr, args, .. } => {
+-            if let Some(ptr) = dest_ptr {
+-                replace_val(ptr, map);
+-            }
+-            for arg in args {
+-                replace_op(arg, map);
+-            }
+-        }
+-
+-        // Complex-return helpers.
+-        Instruction::SetReturnF64Second { src } => replace_op(src, map),
+-        Instruction::SetReturnF32Second { src } => replace_op(src, map),
+-        Instruction::SetReturnF128Second { src } => replace_op(src, map),
+-    }
++    inst.for_each_operand_mut(|operand| replace_op(operand, map));
++    inst.for_each_value_use_mut(|value| replace_val(value, map));
+ }
+ 
+ fn replace_values_in_terminator(term: &mut Terminator, map: &FxHashMap<u32, u32>) {
+-    match term {
+-        Terminator::Return(Some(op)) => replace_op(op, map),
+-        Terminator::CondBranch { cond, .. } => replace_op(cond, map),
+-        Terminator::IndirectBranch { target, .. } => replace_op(target, map),
+-        Terminator::Switch { val, .. } => replace_op(val, map),
+-        Terminator::Return(None) | Terminator::Branch(_) | Terminator::Unreachable => {}
+-    }
++    term.for_each_operand_mut(|operand| replace_op(operand, map));
+ }
+ 
+ // ── Tests ─────────────────────────────────────────────────────────────────────
+@@ -1584,7 +1402,7 @@ fn replace_values_in_terminator(term: &mut Terminator, map: &FxHashMap<u32, u32>
+ mod tests {
+     use super::*;
+     use crate::common::types::{AddressSpace, IrType};
+-    use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Value};
++    use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, BasicBlock, BlockId, IrConst, Value};
+ 
+     /// Build a simple counting loop:
+     ///   preheader → header → body → latch → (back to header) / exit
+@@ -1996,6 +1814,116 @@ mod tests {
+         assert_eq!(n, 1, "only the inner loop should be unrolled");
      }
  
-+    /// Direct segment-relative access at constant offset: the GCC/Clang
-+    /// form for every glibc TLS macro. `movq %fs:16, %rax` (2 uops, no
-+    /// address materialization) replaces movq $16,%r; movq %r,%rcx;
-+    /// movq %fs:(%rcx),... The offset is printed signed decimal exactly
-+    /// like GAS 2.47 disassembles it.
-+    /// Direct segment-relative access at constant offset: the GCC/Clang
-+    /// form for every glibc TLS macro. `movq %fs:16, %rax` (no address
-+    /// materialization) replaces movq $16,%r; movq %r,%rcx;
-+    /// movq %fs:(%rcx),... The offset prints signed decimal, exactly the
-+    /// operand GAS 2.47 accepts and objdump prints.
-+    pub(super) fn emit_seg_load_const_addr_impl(
-+        &mut self,
-+        dest: &Value,
-+        addr: i64,
-+        ty: IrType,
-+        seg: AddressSpace,
-+    ) -> bool {
-+        let seg_prefix = match seg {
-+            AddressSpace::SegGs => "%gs:",
-+            AddressSpace::SegFs => "%fs:",
-+            AddressSpace::Default => return false,
-+        };
-+        if !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
-+            | IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr)
-+        {
-+            return false;
-+        }
-+        // 64-bit loads straight into a GPR home skip the rax round-trip.
-+        if matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
-+            if let Some(&reg) = self.reg_assignments.get(&dest.0) {
-+                if !is_xmm_reg(reg) {
-+                    self.state.emit_fmt(format_args!(
-+                        "    movq {}{}, %{}",
-+                        seg_prefix, addr, phys_reg_name(reg)
-+                    ));
-+                    self.state.reg_cache.invalidate_acc();
-+                    return true;
-+                }
++    #[test]
++    fn substitution_covers_twenty_five_non_algebraic_use_positions() {
++        let mut instructions = vec![
++            Instruction::Memcpy {
++                dest: Value(1),
++                src: Value(2),
++                size: 8,
++            },
++            Instruction::AtomicCmpxchg {
++                dest: Value(100),
++                ptr: Operand::Value(Value(3)),
++                expected: Operand::Value(Value(4)),
++                desired: Operand::Value(Value(5)),
++                ty: IrType::I32,
++                success_ordering: AtomicOrdering::SeqCst,
++                failure_ordering: AtomicOrdering::SeqCst,
++                returns_bool: true,
++            },
++            Instruction::VaArgStruct {
++                dest_ptr: Value(6),
++                va_list_ptr: Value(7),
++                size: 8,
++                align: 8,
++                eightbyte_classes: vec![],
++            },
++            Instruction::VaCopy {
++                dest_ptr: Value(8),
++                src_ptr: Value(9),
++            },
++            Instruction::AtomicRmw {
++                dest: Value(101),
++                op: AtomicRmwOp::Add,
++                ptr: Operand::Value(Value(10)),
++                val: Operand::Value(Value(11)),
++                ty: IrType::I32,
++                ordering: AtomicOrdering::SeqCst,
++            },
++            Instruction::AtomicStore {
++                ptr: Operand::Value(Value(12)),
++                val: Operand::Value(Value(13)),
++                ty: IrType::I32,
++                ordering: AtomicOrdering::SeqCst,
++            },
++            Instruction::Phi {
++                dest: Value(102),
++                ty: IrType::I32,
++                incoming: vec![
++                    (Operand::Value(Value(14)), BlockId(1)),
++                    (Operand::Value(Value(15)), BlockId(2)),
++                ],
++            },
++            Instruction::VaArg {
++                dest: Value(103),
++                va_list_ptr: Value(16),
++                result_ty: IrType::I32,
++            },
++            Instruction::VaStart {
++                va_list_ptr: Value(17),
++            },
++            Instruction::VaEnd {
++                va_list_ptr: Value(18),
++            },
++            Instruction::SetReturnF64Second {
++                src: Operand::Value(Value(19)),
++            },
++            Instruction::SetReturnF32Second {
++                src: Operand::Value(Value(20)),
++            },
++            Instruction::SetReturnF128Second {
++                src: Operand::Value(Value(21)),
++            },
++            Instruction::AtomicInc {
++                ptr: Operand::Value(Value(22)),
++                offset: 0,
++                ty: IrType::I32,
++                ordering: AtomicOrdering::SeqCst,
++            },
++            Instruction::AtomicLoad {
++                dest: Value(104),
++                ptr: Operand::Value(Value(23)),
++                ty: IrType::I32,
++                ordering: AtomicOrdering::SeqCst,
++            },
++        ];
++        for instruction in &mut instructions {
++            for old in 1..=23 {
++                subst_value_with_operand(instruction, old, &Operand::Value(Value(old + 1000)));
 +            }
 +        }
-+        let load_instr = Self::mov_load_for_type(ty);
-+        let dest_reg = Self::load_dest_reg(ty);
-+        self.state.emit_fmt(format_args!(
-+            "    {} {}{}, {}",
-+            load_instr, seg_prefix, addr, dest_reg
-+        ));
-+        self.store_rax_to(dest);
-+        true
++        let mut uses: Vec<u32> = instructions
++            .iter()
++            .flat_map(Instruction::used_values)
++            .collect();
++        uses.sort_unstable();
++        assert_eq!(uses, (1001..=1023).collect::<Vec<_>>());
++
++        let mut terminators = [
++            Terminator::Return(Some(Operand::Value(Value(24)))),
++            Terminator::CondBranch {
++                cond: Operand::Value(Value(25)),
++                true_label: BlockId(1),
++                false_label: BlockId(2),
++            },
++        ];
++        subst_value_in_terminator(&mut terminators[0], 24, &Operand::Value(Value(1024)));
++        subst_value_in_terminator(&mut terminators[1], 25, &Operand::Value(Value(1025)));
++        assert_eq!(terminators[0].used_values(), vec![1024]);
++        assert_eq!(terminators[1].used_values(), vec![1025]);
 +    }
 +
-+    pub(super) fn emit_seg_store_const_addr_impl(
-+        &mut self,
-+        val: &Operand,
-+        addr: i64,
-+        ty: IrType,
-+        seg: AddressSpace,
-+    ) -> bool {
-+        let seg_prefix = match seg {
-+            AddressSpace::SegGs => "%gs:",
-+            AddressSpace::SegFs => "%fs:",
-+            AddressSpace::Default => return false,
-+        };
-+        if !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
-+            | IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr)
-+        {
-+            return false;
-+        }
-+        let store_instr = Self::mov_store_for_type(ty);
-+        // Immediate store: mov $imm, %fs:OFF — zero register pressure.
-+        if let Operand::Const(c) = val {
-+            let is_32 = !matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr);
-+            if let Some(imm) = Self::const_as_imm32_typed(&Operand::Const(c.clone()), is_32) {
-+                self.state.emit_fmt(format_args!(
-+                    "    {} ${}, {}{}",
-+                    store_instr, imm, seg_prefix, addr
-+                ));
-+                return true;
-+            }
-+        }
-+        // Register-homed value: store straight from its home.
-+        if let Operand::Value(v) = val {
-+            if let Some(&reg) = self.reg_assignments.get(&v.0) {
-+                if !is_xmm_reg(reg) {
-+                    let rname = Self::reg_for_type(phys_reg_name(reg), ty);
-+                    self.state.emit_fmt(format_args!(
-+                        "    {} %{}, {}{}",
-+                        store_instr, rname, seg_prefix, addr
-+                    ));
-+                    return true;
-+                }
-+            }
-+        }
-+        self.operand_to_rax(val);
-+        self.state.emit_fmt(format_args!(
-+            "    {} %{}, {}{}",
-+            store_instr, Self::reg_for_type("rax", ty), seg_prefix, addr
-+        ));
-+        self.state.reg_cache.invalidate_acc();
-+        true
-+    }
-+
-     pub(super) fn emit_seg_store_impl(
-         &mut self,
-         val: &Operand,
-diff --git a/tests/benchmark/programs/libm_round_family.c b/tests/benchmark/programs/libm_round_family.c
+     #[test]
+     fn test_value_ids_unique_after_unroll() {
+         // After unrolling, all Value IDs must be distinct (no duplicates in all
+diff --git a/tests/regression/complete_unroll_exit_iv.c b/tests/regression/complete_unroll_exit_iv.c
 new file mode 100644
-index 0000000..c513b00
+index 00000000..20d4bf09
 --- /dev/null
-+++ b/tests/benchmark/programs/libm_round_family.c
-@@ -0,0 +1,99 @@
-+/*
-+ * Workload-derived kernel: glibc 2.44 libm scalar rounding entry points.
-+ *
-+ * glibc's generic C implementations (sysdeps/ieee754/dbl-64/s_floor.c,
-+ * s_trunc.c, s_rint.c, ...) define floor()/trunc()/rint()/nearbyint()/
-+ * roundeven() AS the corresponding GCC builtin under USE_*_BUILTIN, so the
-+ * quality of a libm built by this compiler is EXACTLY the quality of the
-+ * inline expansion measured here: one vroundsd (imm 9/11/4/12/8) plus the
-+ * call frame. A compiler that lowers these to libm calls self-recurses
-+ * inside glibc and pays a PLT round-trip everywhere else.
-+ *
-+ * The kernel also exercises copysign (pure SSE bit ops; a call would
-+ * recurse inside glibc's s_copysign.c) and the fma contraction path.
-+ * Value checks fold the results so the loop cannot be dead-code eliminated,
-+ * and the rotating input vector defeats constant folding.
-+ */
++++ b/tests/regression/complete_unroll_exit_iv.c
+@@ -0,0 +1,16 @@
++/* Complete unrolling must replace uses of the loop IV after the loop with its
++   final value. The loop body is intentionally empty (`continue`). */
 +#include <stdio.h>
 +
-+/* Self-contained at ANY -march: when a compiler does not inline a rounding
-+ * builtin, the call binds to these local definitions instead of libm (no
-+ * -lm at link). They are deliberately NOT written as `return __builtin_X`:
-+ * a non-inlining compiler lowers that to a call to X — i.e. to ITSELF
-+ * (infinite recursion; the same trap glibc's s_floor.c poses to a compiler
-+ * without inline expansion). The 2^52 magic-number trick rounds ties-to-
-+ * even exactly like ROUNDSD for every |x| < 2^52, so results are
-+ * bit-identical to the inline vroundsd path on this benchmark's domain.
-+ */
-+static double rte (double x) /* rint/nearbyint/roundeven, |x| < 2^52 */
-+{
-+  const double big = 4503599627370496.0; /* 2^52 */
-+  return x >= 0.0 ? (x + big) - big : (x - big) + big;
-+}
-+double rint (double x) { return rte (x); }
-+double nearbyint (double x) { return rte (x); }
-+double roundeven (double x) { return rte (x); }
-+double floor (double x) { double t = rte (x); return t > x ? t - 1.0 : t; }
-+double ceil (double x) { double t = rte (x); return t < x ? t + 1.0 : t; }
-+double trunc (double x) { double t = rte (x);
-+  if (x >= 0.0) return t > x ? t - 1.0 : t;
-+  return t < x ? t + 1.0 : t; }
-+double copysign (double x, double y)
-+{
-+  union { double d; unsigned long long u; } a = { x }, b = { y };
-+  a.u = (a.u & 0x7fffffffffffffffULL) | (b.u & 0x8000000000000000ULL);
-+  return a.d;
-+}
-+/* fma fallback: on this benchmark's operands (integer-valued f times 0.5
-+ * plus a small integer) every intermediate is exact, so mul+add equals the
-+ * fused result bit-for-bit. */
-+double fma (double x, double y, double z) { return x * y + z; }
-+
-+#define N 4096
-+#define PASSES 20000U
-+
-+static double buf[N];
-+static double out[N];
-+
-+__attribute__((noinline)) static double
-+round_family_pass (void)
-+{
-+  double acc = 0.0;
-+  for (int i = 0; i < N; i++)
-+    {
-+      double x = buf[i];
-+      /* Eight directed-rounding ops per element: the vroundsd latency chain
-+         and the andpd/orpd copysign pair dominate; a libm-call compiler
-+         pays 8 PLT calls per element instead.  */
-+      double f = __builtin_floor (x);
-+      double c = __builtin_ceil (x);
-+      double t = __builtin_trunc (x);
-+      double r = __builtin_rint (x);
-+      double n = __builtin_nearbyint (x);
-+      double e = __builtin_roundeven (x);
-+      double s = __builtin_copysign (t, x);
-+      double m = __builtin_fma (f, 0.5, c);
-+      out[i] = m + r + n + e + s;
-+      acc += out[i] - t;
-+    }
-+  return acc;
++__attribute__((noinline)) static int run(void) {
++    int i;
++    for (i = 0; i < 10; ++i)
++        continue;
++    return i;
 +}
 +
-+int
-+main (void)
-+{
-+  /* Rotating non-integral values, positive and negative, spanning the
-+     ties-to-even interesting range.  */
-+  for (int i = 0; i < N; i++)
-+    buf[i] = (i - N / 2) * 0.37519 + ((i & 3) * 0.25);
-+
-+  double total = 0.0;
-+  for (unsigned p = 0; p < PASSES; p++)
-+    {
-+      total += round_family_pass ();
-+      /* Rotate signs so branchless copysign sees both directions. */
-+      buf[p % N] = -buf[p % N];
-+    }
-+  printf ("libm-round-family: %.6f\n", total);
-+  return 0;
++int main(void) {
++    int result = run();
++    printf("%d\n", result);
++    return result != 10;
 +}
-diff --git a/tests/benchmark/programs/tls_seg_access.c b/tests/benchmark/programs/tls_seg_access.c
-new file mode 100644
-index 0000000..8655726
---- /dev/null
-+++ b/tests/benchmark/programs/tls_seg_access.c
-@@ -0,0 +1,56 @@
-+/*
-+ * Workload-derived kernel: glibc 2.44 TLS access patterns (THREAD_SELF /
-+ * THREAD_GETMEM / THREAD_SETMEM shapes from sysdeps/x86_64/nptl/tls.h).
-+ *
-+ * Hot glibc paths (errno, malloc arenas, stack guard, pthread self) are
-+ * segment-relative loads/stores at constant %fs offsets, mixed with
-+ * ordinary loads through the pd pointer fetched from %fs:16. Three distinct
-+ * miscompile classes were found and fixed in exactly this pattern mix:
-+ *   1. post-phi const-copy removal orphaning Load %fs:(const) (S02),
-+ *   2. emit_seg_store operand conflation (ptr home clobbered by value),
-+ *   3. peephole lea-fold deleting a LEA whose dest is the store SOURCE
-+ *      (GVN CSEs &pd->member for both address and value).
-+ * This benchmark keeps all three shapes hot AND measures the cost of the
-+ * segment-override addressing the backend chooses.
-+ *
-+ * Real TLS (via __thread) is used so the binary runs anywhere; the compiler
-+ * lowers the accesses through the same segment-register machinery glibc's
-+ * macros hand-write.
-+ */
-+#include <stdio.h>
-+
-+#define PASSES 200000U
-+#define LANES 64
-+
-+static __thread unsigned long tls_slots[LANES + 2];
-+
-+static __thread unsigned long *tls_indirect;
-+
-+__attribute__((noinline)) static unsigned long
-+tls_pass (unsigned p)
-+{
-+  unsigned long acc = 0;
-+  /* Address-of-TLS taken and STORED (pointer-typed TLS slot): the &slot
-+     value is both a stored value and a load base later — the GVN-CSE +
-+     lea-fold shape from __tls_init_tp — but the address itself never
-+     enters the arithmetic, so output is layout-independent. */
-+  tls_indirect = &tls_slots[1];
-+  tls_slots[1] = p;
-+  for (int i = 2; i <= LANES; i++)
-+    {
-+      tls_slots[i] = tls_slots[i - 1] + p;
-+      acc += tls_slots[i] ^ *(volatile unsigned long *) &tls_slots[(i & 7) + 1];
-+    }
-+  /* Read back through the pointer-typed TLS slot. */
-+  return acc + *tls_indirect;
-+}
-+
-+int
-+main (void)
-+{
-+  unsigned long total = 0;
-+  for (unsigned p = 0; p < PASSES; p++)
-+    total += tls_pass (p | 1);
-+  printf ("tls-seg-access: %lu\n", total);
-+  return 0;
-+}
-diff --git a/tests/benchmark/run_benchmarks.py b/tests/benchmark/run_benchmarks.py
-index fc178e3..26dbb76 100644
---- a/tests/benchmark/run_benchmarks.py
-+++ b/tests/benchmark/run_benchmarks.py
-@@ -120,6 +120,10 @@ BENCHMARKS: tuple[Benchmark, ...] = (
-     # WORKLOAD_PROVENANCE.md rather than being hidden in an opaque generator.
-     Benchmark("gzip_crc32", "GNU gzip CRC-32 scalar table loop",
-               ("gzip_crc32.c",), ("workload", "gzip", "checksum", "memory")),
-+    Benchmark("libm_round_family", "glibc libm scalar rounding entry points (vroundsd inline)",
-+              ("libm_round_family.c",), ("workload", "glibc", "fp", "libm")),
-+    Benchmark("tls_seg_access", "glibc TLS access shapes (THREAD_SELF/SETMEM, %fs segment)",
-+              ("tls_seg_access.c",), ("workload", "glibc", "tls", "memory")),
-     Benchmark("zlib_ng_adler32", "zlib-ng Adler-32 NMAX accumulator",
-               ("zlib_ng_adler32.c",), ("workload", "zlib-ng", "checksum", "loop")),
-     Benchmark("expat_xml_scan", "Expat UTF-8 XML name-token scan",
