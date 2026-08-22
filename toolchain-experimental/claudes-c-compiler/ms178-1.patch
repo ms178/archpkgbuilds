@@ -1,516 +1,302 @@
-diff --git a/.gitignore b/.gitignore
-index 09dc3bc..3d69dd0 100644
---- a/.gitignore
-+++ b/.gitignore
-@@ -61,3 +61,4 @@ __pycache__/
- agentB*.patch
- agentB*.txt
- /results/
-+/zlib-ng-validation/
-diff --git a/docs/history/2026-08-22-session46-machinst-partial-register-segfault.md b/docs/history/2026-08-22-session46-machinst-partial-register-segfault.md
-new file mode 100644
-index 0000000..19e432b
---- /dev/null
-+++ b/docs/history/2026-08-22-session46-machinst-partial-register-segfault.md
-@@ -0,0 +1,107 @@
-+# Session 46 — MachInst partial-register narrowing segfault (2026-08-22)
-+
-+Base: `ms178/lccc` main `8b7e3bc` (PR #183). Build: `fastbuild`, Rust
-+opt-level 1, no LTO, two jobs, 4 GiB swap. Host: constrained VM without PMU.
-+
-+## The bug
-+
-+zlib-ng's `zng_emit_dist` (`trees.c` / `trees_emit.h`) computes
-+
-+```c
-+uint8_t code;
-+code = d_code(dist);            /* U32 -> U8 narrowing cast   */
-+extra = extra_dbits[code];      /* folded scale-4 SIB index   */
-+```
-+
-+and lccc emitted
-+
-+```asm
-+movl %esi, %r9d
-+movb %r9b, %r10b        # truncating move: upper 56 bits STALE
-+leaq extra_dbits(%rip), %rcx
-+movslq (%rcx, %r10, 4), %rax   # reads %r10 at 64-bit width -> garbage index
-+```
-+
-+→ out-of-bounds read / segfault. Reproduced standalone with
-+`tests/regression/session46_dist_code_index.c` before fixing.
-+
-+### Root cause chain
-+
-+1. **MachInst `lower_cast`** (`src/backend/x86/codegen/isel.rs`) lowered every
-+   narrowing/same-size cast as a plain truncating move
-+   (`emit_mov_operand_r(src, dst, to_size)`) — `movb`/`movw`/`movl`.  x86
-+   `movb` preserves the destination's upper bits, so the register home was
-+   left **undefined above the narrow width**.
-+2. The folded-SIB index path (never-materialized cast result, possibly
-+   die-at-birth-shared with the source's home) consumes the home at **full
-+   64-bit width** without an explicit extension instruction — its safety
-+   contract is "the home holds a zero-extended value".
-+3. The mature (non-MachInst) path always extended
-+   (`try_emit_cast_reg_direct` emits `movzbl`/`movswl`/`movslq`), which is
-+   why `CCC_NO_MACHINST=1` was clean and why the bug appeared only when the
-+   loop-body MachInst gate fired.
-+
-+## The fix
-+
-+`lower_cast`'s narrowing/same-size arm now emits **extending** moves exactly
-+like the mature path and GCC/Clang:
-+
-+| Cast | Before | After |
-+|------|--------|-------|
-+| U32→U8 / U64→U8 | `movb` | `movzbl %rXb, %rYd` |
-+| I32→I8 / I64→I8 | `movb` | `movsbl %rXb, %rYd` |
-+| →U16 | `movw` | `movzwl` |
-+| →I16 | `movw` | `movswl` |
-+| →U32 | `movl` (elided on self-move!) | `movl` via `Movzx` (never elided) |
-+| →I32 | `movl` | `movslq` (sign semantics, matches mature path) |
-+| const → U8/U16/U32 | `movb/movw/movl $imm` | `movl $imm` (zero-extends) |
-+| const → I8/I16/I32 | `movb/movw/movl $imm` | `movq $imm` (sign-extends) |
-+
-+Same length, no partial-register false dependency, and every wider reader —
-+folded SIB indices included — now sees a defined value.  The `U32` case uses
-+`Movzx{S32,S32}` deliberately: a plain `Mov` is elided as a self-move on a
-+die-at-birth shared home and would skip the extension.
-+
-+### Why the class is now closed
-+
-+The IR guarantees an explicit Cast between any sub-32-bit value and every
-+wider consumer (GEP indices are widened to I64 in the IR, as the dump showed:
-+`Cast { from_ty: U8, to_ty: I64 }` before the `Shl`).  With every cast's home
-+extended at definition time, the folded-index contract holds again.  The
-+remaining `movb` writers (8-bit ALU results, `setcc`, U8 loads) are safe
-+because their wider consumers always flow through a now-extending cast.
-+
-+## Validation (all on the final tree)
-+
-+| Gate | Result |
-+|------|--------|
-+| `cargo test --lib` | **1046 pass**, 6 ignored (incl. 3 new `lower_cast` unit tests) |
-+| Regression corpus | **375 pass / 0 fail / 8 documented skips** (383 total, incl. 2 new session-46 regressions) |
-+| `tests/intrinsics` (t128/t256/t512) | **3/3** |
-+| zlib-ng 2.3.3 pinned gate | **ctest=8, roundtrip=0 failures** |
-+| gzip 1.14 (pinned SHA) | **30/30** + doc roundtrip |
-+| expat 2.7.1 (git HEAD f9a3eeb, lccc-built) | **2/2 ctest (runtests + runtests_cxx)** |
-+| phi CFG fuzz 0:600 × 3 levels | 1800/1800 |
-+| differential fuzz 0:500 × 3 levels | 1500/1500 |
-+| alias fuzz m32 0:540 × O2/Os | 1080/1080 |
-+| checkers (sema/bit-test/redundant-test/rmw-copyprop) | all pass |
-+
-+## Oracle distillation snapshot (post-fix, `-O2 -march=x86-64-v3` whole-file CE)
-+
-+| Kernel | lccc | gcc16.2 | clang | icc | icx | note |
-+|--------|-----:|--------:|------:|----:|----:|------|
-+| `zlib_ng_adler32` | 356 | 156 | 147 | 248 | 147 | DO8 stack traffic — **largest remaining integer gap** (RA-03) |
-+| `gzip_crc32` | 118 | 50 | 82 | 60 | 100 | SIB + remat (RA-01/IS-22) |
-+
-+## Follow-up work
-+
-+1. **RA-03** Adler DO8: `sum2`/`n` must stay in GPRs (the 356→~150 gap is
-+   almost entirely slot traffic in the unrolled DO8 loop).
-+2. **RA-01/IS-22** CRC: file-scope remat + indexed SIB loads.
-+3. The sched/ISel front still emits redundant `movl %eax, %eax`
-+   (zero-extend artifact after `movslq`) — a peephole opportunity.
-+4. Sema accepts writes through `const` arrays (`static const int t[]; t[i]=x;`)
-+   that GCC rejects; add the C11 6.5.16.2 assignment-to-const-object
-+   diagnostic (found while authoring the torture regression).
-+5. Re-measure gzip/zlib-ng runtime on the i7-14700KF with PMU top-down
-+   counters once the RA-03/RA-01 work lands.
-diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
-index 686e50f..fb47851 100644
---- a/engineering/agent/BACKLOG.md
-+++ b/engineering/agent/BACKLOG.md
-@@ -363,6 +363,7 @@ engineering/evidence/workloads/
- - ✅ **`alias.rs`** — `LoopFrames`, `resolve_in_frame`, `forms_disjoint` (consumed by `redundant_loads` only).
- - ✅ **Engineering doc tree** — `engineering/{STATE.md, agent/{BACKLOG,RULES,SEQUENCE,README}.md, evidence/godbolt/}`.
- - ✅ **Session 44 (2026-08-22)** — re-based onto PR #179; `hot_loop_home` Phase-1 candidacy now keys on the hottest **use-site** loop depth (preheader-defined IVs get callee-saved homes; ra01 proxy 124→117 insns / 34→20 stack refs); ABI-hinted ParamRefs are never evicted (`select_evict_victim`); rbp(6) accepted as a callee-saved prestore home; the fallback ParamRef ABI read is pinned via `# LCCC_PARAM_ABI_READ`; `vector_temp_promotion` constant-address load sources survive only alloca-confined writes; `gen_lcccsimd.py` imm-builtin protos no longer declare a trailing `int __imm` (t128/t256/t512 intrinsics compile again); `tests/regression/run_regression.py` (the missing-in-repo corpus runner) plus `.env` oracle opt-outs for three host/feature-dependent tests. Zero-future-use eviction search measured (Adler +15%) and **reverted** — do not resurrect without the Adler/gzip oracles. See `docs/history/2026-08-22-session44-rebase-soundness-sweep.md`.
-+- ✅ **Session 46 (2026-08-22)** — MachInst partial-register segfault class closed. `lower_cast` (x86-64 MachInst ISel) lowered every narrowing/same-size cast as a truncating `movb`/`movw`/`movl`, leaving the destination register's upper bits stale; the folded-SIB index path then read a never-materialized cast result from its (die-at-birth-shared) home at 64-bit width — zlib-ng `zng_emit_dist`'s `extra_dbits(%rcx,%r10,4)` segfaulted OOB. Narrowing/same-size casts now emit extending moves (`movzbl`/`movsbl`/`movzwl`/`movswl`/`movslq`; `movl`-via-`Movzx` so a die-at-birth self-move can never skip the extension; `movl`/`movq $imm` for constants), matching the mature path and GCC/Clang.  The IR always widens sub-32-bit values through an explicit Cast before wider uses, so extending every cast home closes the whole class.  New regressions: `session46_dist_code_index.c` (the zlib shape) and `session46_narrow_cast_torture.c` (U8/U16/I8/I16 × index/shift/mul/select/call/chain, GCC-differential).  Validated: 1046 unit (3 new `lower_cast` tests), 375/383 regression, intrinsics 3/3, zlib-ng 2.3.3 gate ctest=8 roundtrip=0, gzip 1.14 30/30 + roundtrip, expat 2.7.1 2/2 ctest, phi 1800/1800, differential 1500/1500, alias-m32 1080/1080.  See `docs/history/2026-08-22-session46-machinst-partial-register-segfault.md`.
- - ✅ **Session 45 (2026-08-22)** — final red-team audit of vector-temp-promotion v3 (Agent B's patch, independently re-red-teamed): `Load256`/`Store256` keep their 32-byte alignment contracts (not forwardable/relaxable); promotion additionally requires `intrinsic_overwrites_full_result` (FMA/BroadcastLoadF64/store forms never rewrite their dest); `intrinsic_dest_reads_old_value` centralizes RMW destination semantics and feeds `single_read_sites` so write-only dests stop keeping forwarded loads alive (gzip PCLMUL −5 static insns); `pointer_roots` → `pointer_root_analysis` with iterative Kosaraju SCC + single-seed cycle shortcut (`p = phi(seed, p+stride)` now resolves, multi-seed cycles fail closed) + recurrence tracking gating the multi-use Loaddqu exception; wide scalar accesses retain natural alignment (I128/F128 on non-x86); pass order is promote → fuse → downgrade; O(1) load-result membership. Adoption audit fixed: module-wide `max_value_id` array sizing → dense per-function value-id renumbering, the quadratic terminator-loop lookup B missed, `cyclic_seed` simplification, and the complexity comment (O(V + Σ arity²), not flat O(V+E)). Kept the session-44 constant-address rule (alloca-confined writes provably cannot hit a fixed address). New stress regression `session45_vector_recurrence_stress.c`. See `docs/history/2026-08-22-session45-vector-promotion-v3-audit.md`.
- - ✅ **Session 43** — red-team of Agent D's vector-temp-promotion v2: adopted (movnt align-16 relaxation via `intrinsic_dest_required_alignment`, unified width-typed `pointer_vector_arg_width`, non-escaping-alloca alias refinement, load-load chaining, single-read-site gating) and fixed two miscompiles it re-introduced — (1) `invalidate_for_value_write` dropped the slot-vs-write check (reassignment `v=load(p); v=setzero(); use(v)` read stale `p`), now a `write_may_clobber` slot+source test; (2) `VecStoreI64x2` writes memory through `args[1]` with `dest_ptr:None` but inherited the `produces_vector_value` register-result exemption. Also re-added the load-`dest` dead check and added the six 256-bit widening extensions (Pmovzx*/Pmovsx*256) to the forwardable/relaxable table. Measured: simd_movnt 422→390 insns / frame 440→392; simd_avx2_256 743→734 / 1016→824. See `docs/history/2026-08-21-session43-vector-promotion-v2-redteam.md`.
- - ✅ **Session 42** — red-team audit of `vector_temp_promotion.rs` (late SIMD cleanup): adopted Agent D's alias-aware rewrite (escape-gated promotion window, object-root load fusion with write invalidation, fail-closed alignment whitelist, span-preserving removal) and fixed four audit-found defects — (1) slot-identity invalidation in `invalidate_for_pointer_write` (reassignment miscompile), (2) `Add`/`Sub` root propagation in `pointer_roots` (param-derived load sources were "may alias anything" and un-fused), (3) `LoadF64x4/2,LoadI32x8/4` downgrade whitelist narrowed to `index == 0` (offset arg), (4) fail-closed `dest_ptr: None` invalidation + load-`dest` dead check. A/B: 34-file corpus byte-identical; 1022 unit + 389 regression + 50 correctness + 60 fuzz green. See `docs/history/2026-08-21-session42-vector-temp-promotion-redteam.md`.
-diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
-index 24a2f40..effd1b3 100644
---- a/src/backend/x86/codegen/isel.rs
-+++ b/src/backend/x86/codegen/isel.rs
-@@ -521,7 +521,78 @@ pub fn lower_cast(
-     let to_size = OpSize::from_ir_type(to_ty);
+From c72eb7205564605beaf21870bb1f38ec58695fe5 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Sat, 22 Aug 2026 01:44:53 +0000
+Subject: [PATCH 1/2] Gap-fused fmadd across Load/GEP windows (audited levkropp
+ 2e57bcf2 port)
+
+Mul;[Load/GEP x1-2];Add chains now fuse into one fmadd emitted AT the
+Add (nbody's j-side velocity updates: the constant GEP and velocity
+load sit between fmul and fadd, so adjacent-only fusion never fired).
+Both backends benefit through the shared emit_fused_mul_add hook:
+nbody fmadd count 27 -> 45 on AArch64 AND x86-64; measured -6.8%
+wall-clock on native x86 nbody (interleaved best-of-5; his AArch64
+number was -3.3%). CCC_NO_GAP_FMA disables.
+
+Audit findings vs his commit, fixed in this port:
+- HIS ALIAS CHECK WAS INCOMPLETE: he rejected only gap destinations
+  whose PHYSICAL REGISTER aliases a multiply operand's register. A gap
+  destination can also alias a slot-homed operand's STACK SLOT: the
+  multiply operands are read later than IR liveness recorded, and
+  Tier-2 slot coloring may legally pack a gap-born value into the slot
+  of a value whose liveness ended at the Mul. This port rejects both
+  hazard classes (register AND slot identity, the latter only when the
+  operand has no register home and will actually be reloaded).
+- Accumulator gate wired to the same set as the fmsub gate (his commit
+  predates our shared accumulator_dests; identical policy, one source
+  of truth).
+- Detector returns (mul_idx, add_idx) only -- the gap indices he
+  returned were recomputed by his driver anyway; the driver here walks
+  mul_idx+1..add_idx directly (no per-candidate Vec allocation).
+- Disjointness with detect_mul_add_fusions is structural: that scan
+  breaks at Load/GEP, this one breaks at Copy/Cast, so no Add can be
+  claimed twice and no double-emission is possible.
+- His debug-env eprintln paths dropped (CCC_DEBUG_GAPFMA), his
+  gap-vector clone dropped.
+
+Validation: 1073/1073 unit, 50/50 correctness, x86 regression 397/398
+(1 = documented pre-existing check_tier2), ARM regression fail-set
+identical to baseline (0 new), fuzz 300/300 x86-64 + 300/300 m32
+O0-O2 + 300/300 aarch64 O1/O2/Os, ARM benchmark battery 8/8
+output-identical vs gcc, nbody output bit-identical with fusion on/off
+at both contract settings.
+---
+ src/backend/generation.rs | 161 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 161 insertions(+)
+
+diff --git a/src/backend/generation.rs b/src/backend/generation.rs
+index a6c17203..4a15b2d4 100644
+--- a/src/backend/generation.rs
++++ b/src/backend/generation.rs
+@@ -1975,6 +1975,78 @@ fn detect_mul_add_fusions(
+     fusion_map
+ }
  
-     if to_size as u8 <= from_size as u8 {
--        emit_mov_operand_r(src, dst, to_size, ra, out);
-+        // Narrowing or same-size cast.  A plain truncating move (movb/movw/
-+        // movl) would leave the destination register's UPPER BITS STALE.
-+        // x86 code may legitimately consume the value at a wider width:
-+        // the folded-SIB index path reads a never-materialized cast result
-+        // straight from its (possibly die-at-birth-shared) home at 64-bit
-+        // width — zlib-ng's zng_emit_dist computed `code` as uint8_t and
-+        // folded it into `extra_dbits(%rcx,%r10,4)`; the stale high bytes of
-+        // %r10 made the index garbage and segfaulted out of bounds.  Emit
-+        // the extending forms instead: same length, no partial-register
-+        // false dependency, and every wider reader sees a defined value
-+        // (matches the mature path and GCC/Clang lowering).
-+        match src {
-+            Operand::Const(_) => {
-+                // movl $imm zero-extends; movq $imm carries the sign-extended
-+                // mathematical value for signed sources.  movzx/movsx have no
-+                // immediate forms, so pick the width by destination sign.
-+                let size = if to_ty.is_signed() {
-+                    OpSize::S64
-+                } else {
-+                    OpSize::S32
-+                };
-+                emit_mov_operand_r(src, dst, size, ra, out);
++/// Gap-fused multiply-add candidates (levkropp 2e57bcf2, audited port):
++/// `fmul` at idx, one or two Load/GEP instructions between (nbody's j-side
++/// address computation and velocity load), then `fadd` consuming the mul
++/// result. The fmadd is emitted AT the Add so the gap instructions execute
++/// first, in order. Returns (mul_idx, add_idx, gap_indices); the driver
++/// validates register aliasing before committing (the multiply operands are
++/// read LATER than liveness recorded, so no gap destination register may
++/// alias them). Windows are disjoint from detect_mul_add_fusions by
++/// construction: that scan breaks at Load/GEP, this one breaks at Copy/Cast,
++/// so an Add is claimed by at most one detector. CCC_NO_GAP_FMA disables.
++fn detect_gap_fma_fusions(
++    block: &BasicBlock,
++    use_counts: &[u32],
++    fuse_float: bool,
++    accumulator_dests: &FxHashSet<u32>,
++) -> Vec<(usize, usize)> {
++    let mut out = Vec::new();
++    if !fuse_float || env_flag_set("CCC_NO_GAP_FMA") {
++        return out;
++    }
++    for (idx, inst) in block.instructions.iter().enumerate() {
++        let (mul_dest, mul_ty) = match inst {
++            Instruction::BinOp {
++                dest,
++                op: IrBinOp::Mul,
++                ty,
++                ..
++            } => (dest, ty),
++            _ => continue,
++        };
++        if !mul_ty.is_float() || matches!(mul_ty, IrType::F128) {
++            continue;
++        }
++        // Exactly one (global) use: the Add. Skipping the standalone Mul
++        // emission is then safe -- nothing else ever reads mul_dest.
++        if use_counts.get(mul_dest.0 as usize).copied().unwrap_or(0) != 1 {
++            continue;
++        }
++        let mut gap_len = 0usize;
++        let mut found = None;
++        for j in (idx + 1)..block.instructions.len() {
++            match &block.instructions[j] {
++                Instruction::Load { .. } | Instruction::GetElementPtr { .. } if gap_len < 2 => {
++                    gap_len += 1;
++                }
++                Instruction::BinOp {
++                    dest: add_dest,
++                    op: IrBinOp::Add,
++                    lhs,
++                    rhs,
++                    ty: add_ty,
++                } if gap_len > 0 => {
++                    let mul_used = matches!(lhs, Operand::Value(v) if v.0 == mul_dest.0)
++                        || matches!(rhs, Operand::Value(v) if v.0 == mul_dest.0);
++                    // Accumulator gate mirrors the fmsub/fmadd policy: fusing
++                    // into a loop-carried accumulator lengthens the serial
++                    // dependency chain.
++                    if mul_used && add_ty == mul_ty && !accumulator_dests.contains(&add_dest.0) {
++                        found = Some(j);
++                    }
++                    break;
++                }
++                _ => break,
 +            }
-+            Operand::Value(v) => {
-+                let src_reg = value_to_reg(v, ra);
-+                match (to_size, to_ty.is_signed()) {
-+                    (OpSize::S8, true) => out.push(MachInst::Movsx {
-+                        src: MachOperand::Reg(src_reg),
-+                        dst,
-+                        from_size: OpSize::S8,
-+                        to_size: OpSize::S32,
-+                    }),
-+                    (OpSize::S8, false) => out.push(MachInst::Movzx {
-+                        src: MachOperand::Reg(src_reg),
-+                        dst,
-+                        from_size: OpSize::S8,
-+                        to_size: OpSize::S32,
-+                    }),
-+                    (OpSize::S16, true) => out.push(MachInst::Movsx {
-+                        src: MachOperand::Reg(src_reg),
-+                        dst,
-+                        from_size: OpSize::S16,
-+                        to_size: OpSize::S32,
-+                    }),
-+                    (OpSize::S16, false) => out.push(MachInst::Movzx {
-+                        src: MachOperand::Reg(src_reg),
-+                        dst,
-+                        from_size: OpSize::S16,
-+                        to_size: OpSize::S32,
-+                    }),
-+                    // I32 narrowing: movslq sign-extends to 64 bits; movl
-+                    // zero-extends — mirror the mature path exactly.
-+                    // Movzx/S32->S32 lowers to `movl` but, unlike a plain
-+                    // Mov, is never elided as a self-move: a die-at-birth
-+                    // shared home must still be re-zero-extended.
-+                    (OpSize::S32, true) => out.push(MachInst::Movsx {
-+                        src: MachOperand::Reg(src_reg),
-+                        dst,
-+                        from_size: OpSize::S32,
-+                        to_size: OpSize::S64,
-+                    }),
-+                    (OpSize::S32, false) => out.push(MachInst::Movzx {
-+                        src: MachOperand::Reg(src_reg),
-+                        dst,
-+                        from_size: OpSize::S32,
-+                        to_size: OpSize::S32,
-+                    }),
-+                    // Same-size 64-bit: identical bits.
-+                    _ => emit_mov_operand_r(src, dst, to_size, ra, out),
++        }
++        if let Some(add_idx) = found {
++            out.push((idx, add_idx));
++        }
++    }
++    out
++}
++
+ /// Adjacent `shift-imm; logical` that AArch64 encodes as one instruction.
+ fn detect_shifted_logical_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxHashSet<usize> {
+     let mut logical_indices = FxHashSet::default();
+@@ -2909,6 +2981,64 @@ fn generate_function(
+                 None
+             },
+         );
++        // Gap-fused fmadd (levkropp 2e57bcf2, audited port): Mul, [Load/GEP
++        // x1-2], Add. The fmadd is emitted at the Add, so the multiply
++        // operands are read LATER than their IR liveness recorded. Two alias
++        // hazards must be rejected, not one: (a) a gap destination's PHYSICAL
++        // register aliasing a mul operand's register (levkropp's check), and
++        // (b) a gap destination's STACK SLOT aliasing a slot-homed mul
++        // operand -- Tier-2 slot coloring can legally pack a value born in
++        // the gap into the slot of a value whose IR liveness ended at the
++        // Mul (his check missed this class entirely).
++        let mut gap_mul_skips: FxHashSet<usize> = FxHashSet::default();
++        let mut gap_add_fusions: FxHashMap<usize, usize> = FxHashMap::default();
++        for &(mul_idx, add_idx) in &detect_gap_fma_fusions(
++            block,
++            &value_use_counts,
++            cg.supports_fused_float_mul_add(),
++            &accumulator_dests,
++        ) {
++            let Instruction::BinOp {
++                lhs: mul_lhs,
++                rhs: mul_rhs,
++                ..
++            } = &block.instructions[mul_idx]
++            else {
++                continue;
++            };
++            let mut clash = false;
++            for g in (mul_idx + 1)..add_idx {
++                let gap_dest = match &block.instructions[g] {
++                    Instruction::Load { dest, .. } => Some(*dest),
++                    Instruction::GetElementPtr { dest, .. } => Some(*dest),
++                    _ => None,
++                };
++                let Some(gd) = gap_dest else { continue };
++                let gap_phys = cg.get_phys_reg_for_value(gd.0);
++                let gap_slot = cg.state_ref().get_slot(gd.0);
++                for op in [mul_lhs, mul_rhs] {
++                    if let Operand::Value(v) = op {
++                        let op_phys = cg.get_phys_reg_for_value(v.0);
++                        if gap_phys.is_some() && op_phys == gap_phys {
++                            clash = true;
++                        }
++                        // Slot aliasing only matters when the operand will be
++                        // RELOADED from its slot at the Add (no register home).
++                        if op_phys.is_none() {
++                            if let (Some(gs), Some(os)) = (gap_slot, cg.state_ref().get_slot(v.0)) {
++                                if gs.0 == os.0 {
++                                    clash = true;
++                                }
++                            }
++                        }
++                    }
 +                }
 +            }
-+        }
-         return;
-     }
- 
-@@ -1038,6 +1109,95 @@ mod tests {
-         ));
-     }
- 
-+    #[test]
-+    fn narrowing_cast_extends_the_register() {
-+        // A truncating `movb`/`movw` would leave the destination register's
-+        // upper bits stale.  The folded-SIB index path reads a
-+        // never-materialized cast result straight from its (possibly
-+        // die-at-birth-shared) home at 64-bit width — zlib-ng's
-+        // zng_emit_dist computed `code` as uint8_t and folded it into
-+        // `extra_dbits(%rcx,%r10,4)`, and the stale high bytes made the
-+        // index garbage (out-of-bounds segfault).  Narrowing casts must
-+        // therefore extend, matching the mature path and GCC/Clang.
-+        let mut assignments = FxHashMap::default();
-+        assignments.insert(1, PhysReg(1));
-+        assignments.insert(2, PhysReg(2));
-+
-+        let mut u32_to_u8 = Vec::new();
-+        lower_cast(
-+            &Value(2),
-+            &Operand::Value(Value(1)),
-+            IrType::U32,
-+            IrType::U8,
-+            &assignments,
-+            &mut u32_to_u8,
-+        );
-+        assert!(matches!(
-+            u32_to_u8.as_slice(),
-+            [MachInst::Movzx {
-+                from_size: OpSize::S8,
-+                to_size: OpSize::S32,
-+                ..
-+            }]
-+        ));
-+
-+        let mut i32_to_i8 = Vec::new();
-+        lower_cast(
-+            &Value(2),
-+            &Operand::Value(Value(1)),
-+            IrType::I32,
-+            IrType::I8,
-+            &assignments,
-+            &mut i32_to_i8,
-+        );
-+        assert!(matches!(
-+            i32_to_i8.as_slice(),
-+            [MachInst::Movsx {
-+                from_size: OpSize::S8,
-+                to_size: OpSize::S32,
-+                ..
-+            }]
-+        ));
-+
-+        let mut u64_to_u32 = Vec::new();
-+        lower_cast(
-+            &Value(2),
-+            &Operand::Value(Value(1)),
-+            IrType::U64,
-+            IrType::U32,
-+            &assignments,
-+            &mut u64_to_u32,
-+        );
-+        // movl-via-Movzx: always emitted (a plain Mov would be elided as a
-+        // self-move on a die-at-birth shared home and skip the extension).
-+        assert!(matches!(
-+            u64_to_u32.as_slice(),
-+            [MachInst::Movzx {
-+                from_size: OpSize::S32,
-+                to_size: OpSize::S32,
-+                ..
-+            }]
-+        ));
-+
-+        let mut const_to_u8 = Vec::new();
-+        lower_cast(
-+            &Value(2),
-+            &Operand::Const(IrConst::I64(0x1000)),
-+            IrType::I64,
-+            IrType::U8,
-+            &assignments,
-+            &mut const_to_u8,
-+        );
-+        // movl $imm zero-extends; movzx has no immediate form.
-+        assert!(matches!(
-+            const_to_u8.as_slice(),
-+            [MachInst::Mov {
-+                size: OpSize::S32,
-+                ..
-+            }]
-+        ));
-+    }
-+
-     #[test]
-     fn compare_with_immediate_lhs_materializes_destination_operand() {
-         let mut assignments = FxHashMap::default();
-diff --git a/tests/regression/session46_dist_code_index.c b/tests/regression/session46_dist_code_index.c
-new file mode 100644
-index 0000000..4feeb07
---- /dev/null
-+++ b/tests/regression/session46_dist_code_index.c
-@@ -0,0 +1,92 @@
-+/* Session-46 reproducer: zlib-ng trees_emit.h zng_emit_dist partial-register
-+ * codegen bug. `code` is uint8_t, assigned from a 32-bit computation, then
-+ * used as an index into a const int[] table (scale-4 SIB). The copy into
-+ * code's register home must be zero-extended; a byte move leaves the upper
-+ * 56 bits stale and the folded index reads garbage (OOB). */
-+#include <stdint.h>
-+#include <stdio.h>
-+
-+static const int extra_lbits[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
-+                                    2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
-+static const int extra_dbits[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6,
-+                                    6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
-+static const int base_length[29] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20,
-+                                    24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160,
-+                                    192, 224, 0};
-+static const int base_dist[30] = {0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96,
-+                                  128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072,
-+                                  4096, 6144, 8192, 12288, 16384, 24576};
-+static uint8_t dist_code[512];
-+static uint8_t length_code[256];
-+
-+static uint32_t d_code(uint32_t dist) {
-+    return dist < 256 ? dist_code[dist] : dist_code[256 + (dist >> 7)];
-+}
-+
-+__attribute__((noinline)) uint32_t
-+emit_dist(uint32_t lc, uint32_t dist, uint64_t match_bits,
-+          unsigned match_bits_len) {
-+    uint8_t code;
-+    uint32_t extra;
-+
-+    code = length_code[lc & 255];
-+    extra = extra_lbits[code];
-+    if (extra != 0) {
-+        lc -= (uint32_t)base_length[code];
-+        match_bits |= ((uint64_t)lc << match_bits_len);
-+        match_bits_len += extra;
-+    }
-+
-+    dist--;
-+    code = d_code(dist);
-+    extra = (uint32_t)extra_dbits[code];
-+    if (extra != 0) {
-+        dist -= (uint32_t)base_dist[code];
-+        match_bits |= ((uint64_t)dist << match_bits_len);
-+        match_bits_len += extra;
-+    }
-+    return match_bits_len;
-+}
-+
-+static uint32_t ref_emit(uint32_t lc, uint32_t dist, uint64_t match_bits,
-+                         unsigned match_bits_len) {
-+    uint32_t code, extra;
-+    code = length_code[lc & 255];
-+    extra = extra_lbits[code];
-+    if (extra != 0) {
-+        lc -= (uint32_t)base_length[code];
-+        match_bits |= ((uint64_t)lc << match_bits_len);
-+        match_bits_len += extra;
-+    }
-+    dist--;
-+    code = d_code(dist);
-+    extra = (uint32_t)extra_dbits[code];
-+    if (extra != 0) {
-+        dist -= (uint32_t)base_dist[code];
-+        match_bits |= ((uint64_t)dist << match_bits_len);
-+        match_bits_len += extra;
-+    }
-+    return match_bits_len;
-+}
-+
-+int main(void) {
-+    for (int i = 0; i < 256; i++)
-+        length_code[i] = (uint8_t)(i % 29);
-+    for (int i = 0; i < 512; i++)
-+        dist_code[i] = (uint8_t)(i % 30);
-+    uint32_t seed = 12345;
-+    for (uint32_t d = 1; d < 32768; d = d * 3 + 1) {
-+        for (uint32_t l = 3; l < 258; l = l * 5 + 1) {
-+            uint64_t bits = seed;
-+            uint32_t got = emit_dist(l, d, bits, 0);
-+            uint32_t ref = ref_emit(l, d, bits, 0);
-+            if (got != ref) {
-+                printf("FAIL l=%u d=%u got=%u ref=%u\n", l, d, got, ref);
-+                return 1;
++            if !clash {
++                gap_mul_skips.insert(mul_idx);
++                gap_add_fusions.insert(add_idx, mul_idx);
 +            }
-+            seed = seed * 1103515245u + 12345u;
++        }
+         let cmp_select_fusions =
+             if cg.supports_fused_cmp_select() && !env_flag_set("CCC_NO_FUSED_CSEL") {
+                 detect_cmp_select_fusion(block, &value_use_counts)
+@@ -2983,6 +3113,37 @@ fn generate_function(
+                 cg.state().current_program_point += 1;
+                 continue;
+             }
++            // Gap-fused fmadd: the Mul is computed by the fmadd emitted at
++            // the Add (below), after the gap Load/GEP ran in program order.
++            if gap_mul_skips.contains(&idx) {
++                cg.state().current_program_point += 1;
++                continue;
++            }
++            if let Some(&mul_idx) = gap_add_fusions.get(&idx) {
++                if let (
++                    Instruction::BinOp {
++                        dest: mul_dest,
++                        lhs: mul_lhs,
++                        rhs: mul_rhs,
++                        ty: mul_ty,
++                        ..
++                    },
++                    Instruction::BinOp {
++                        dest: add_dest,
++                        lhs: add_lhs,
++                        rhs: add_rhs,
++                        ..
++                    },
++                ) = (&block.instructions[mul_idx], inst)
++                {
++                    let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == mul_dest.0);
++                    let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
++                    cg.flush_machinst();
++                    cg.emit_fused_mul_add(mul_dest, mul_lhs, mul_rhs, acc_op, add_dest, *mul_ty);
++                    cg.state().current_program_point += 1;
++                    continue;
++                }
++            }
+             if skip_fused_logical {
+                 skip_fused_logical = false;
+                 cg.state().current_program_point += 1;
+-- 
+2.47.3
+
+
+From d6350b4826eac8925efd8c100c4a28432571e962 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Sat, 22 Aug 2026 01:53:06 +0000
+Subject: [PATCH 2/2] Complete-unroll: extend trip bound to 16 under a
+ 512-instruction budget
+
+Adopts the LIMITS of levkropp 1b4bac8b's full unroller (trip <= 16,
+<= 512 expanded instructions) without adopting his separate 950-line
+full_unroll_* machinery: our two-block complete unroller
+(try_complete_unroll_two_block) already handles loop-carried phi
+chaining and IV substitution; it was only artificially capped at
+trip 8. His other 1b4bac8b half (try_hoist_def_chain terminal-def
+fix) is already covered by our aggregate_copy_forward GEP hoist
+(parallel evolution, verified line-by-line this session).
+
+Budget gate: body_insts * trip <= 512, checked BEFORE cloning, using
+saturating_mul (no overflow UB on adversarial trip counts). The
+existing F32-only pow2 restriction and bit-iteration/call/asm/intrinsic
+rejections stay untouched. Trip-12 dot-product kernel now fully
+unrolls (0 branches) and computes identically to gcc.
+
+Validation: 1073/1073 unit, 50/50 correctness, x86 regression 397/398
+(1 = documented pre-existing check_tier2), ARM regression fail-set
+unchanged, fuzz 300/300 x3 (x86-64 O1/O2, m32 O0-O2, aarch64
+O1/O2/Os), benchmark battery geomean 1.377x vs gcc recorded as the
+session baseline (struct_copy 1.58x, nbody 2.98x -- nbody is the
+known FP-regalloc gap, tracked in BACKLOG).
+---
+ src/passes/loop_unroll.rs | 20 ++++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
+index 8a6c18be..c48c66c9 100644
+--- a/src/passes/loop_unroll.rs
++++ b/src/passes/loop_unroll.rs
+@@ -583,12 +583,24 @@ fn try_complete_unroll_two_block(
+         }
+         _ => return false,
+     };
+-    // Powers of two only: residual vectorization remainders (trip 3/5/6/7)
+-    // interact badly with the F32 map path. 2/4/8 are the common complete-
+-    // unroll targets (struct_copy trip-4, CRC-safe via bit-iteration guard).
+-    if !(2..=8).contains(&trip) {
++    // Trip bound 16 with a 512-expanded-instruction budget (levkropp
++    // 1b4bac8b's full-unroll limits, grafted onto our two-block complete
++    // unroller): trips 9..16 are profitable for the same struct-return
++    // temp-forwarding reasons as 4/8 once the expansion stays cache-tight.
++    // The pow2 restriction below still applies to trips with F32-only
++    // bodies (residual map-vectorizer interaction).
++    if !(2..=16).contains(&trip) {
+         return false;
+     }
++    {
++        let body_insts: usize = work_blocks
++            .iter()
++            .map(|&wbi| func.blocks[wbi].instructions.len())
++            .sum();
++        if body_insts.saturating_mul(trip as usize) > 512 {
++            return false;
 +        }
 +    }
-+    printf("OK dist-code index\n");
-+    return 0;
-+}
-diff --git a/tests/regression/session46_dist_code_index.flags b/tests/regression/session46_dist_code_index.flags
-new file mode 100644
-index 0000000..5e2403b
---- /dev/null
-+++ b/tests/regression/session46_dist_code_index.flags
-@@ -0,0 +1 @@
-+-O2 -march=x86-64-v3
-diff --git a/tests/regression/session46_narrow_cast_torture.c b/tests/regression/session46_narrow_cast_torture.c
-new file mode 100644
-index 0000000..49aa407
---- /dev/null
-+++ b/tests/regression/session46_narrow_cast_torture.c
-@@ -0,0 +1,84 @@
-+/* Session-46 narrow-cast torture: every narrowing/same-size cast must leave
-+ * the destination register defined at FULL width, because x86 code may read
-+ * it at a wider width later (folded SIB indices, movq copies, 64-bit
-+ * consumers). Exercises U32/U64 -> U8/U16/I8/I16 through: table indexing
-+ * (scale 1/2/4), shifts, mul, phi joins, selects, and call boundaries. */
-+#include <stdint.h>
-+#include <stdio.h>
-+
-+static const int32_t tbl4[32] = {
-+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-+    -16, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1};
-+static int16_t tbl2[64];
-+static int8_t tbl1[64];
-+
-+__attribute__((noinline)) uint32_t idx_u8(uint32_t x) {
-+    uint8_t c = (uint8_t)x;
-+    return (uint32_t)tbl4[c];
-+}
-+__attribute__((noinline)) uint32_t idx_i8(int32_t x) {
-+    int8_t c = (int8_t)x;
-+    return (uint32_t)tbl4[c & 31];
-+}
-+__attribute__((noinline)) uint32_t idx_u16(uint32_t x) {
-+    uint16_t c = (uint16_t)x;
-+    return (uint32_t)tbl2[c & 63];
-+}
-+__attribute__((noinline)) uint32_t idx_i16(int32_t x) {
-+    int16_t c = (int16_t)x;
-+    return (uint32_t)tbl4[c & 31];
-+}
-+__attribute__((noinline)) uint32_t shl_u8(uint32_t x) {
-+    uint8_t c = (uint8_t)x;
-+    return (uint32_t)c << 24;
-+}
-+__attribute__((noinline)) uint32_t mul_u8(uint32_t x) {
-+    uint8_t c = (uint8_t)x;
-+    return (uint32_t)c * 977u;
-+}
-+__attribute__((noinline)) uint32_t sel_u8(uint32_t x, uint32_t y) {
-+    uint8_t c = (uint8_t)(x > y ? x : y);
-+    return (uint32_t)tbl4[c & 31];
-+}
-+__attribute__((noinline)) int32_t narrow_i8_call(int32_t x) {
-+    int8_t c = (int8_t)x;
-+    return (int32_t)c * 3; /* sign semantics across widen */
-+}
-+__attribute__((noinline)) uint32_t chain(uint32_t x) {
-+    uint8_t a = (uint8_t)x;        /* U32->U8 */
-+    uint16_t b = (uint16_t)a;      /* U8->U16 */
-+    uint32_t d = (uint32_t)b;      /* U16->U32 */
-+    return d * 13u + (uint32_t)tbl4[a & 31];
-+}
-+
-+int main(void) {
-+    for (int i = 0; i < 64; i++) {
-+        tbl2[i] = (int16_t)(i * 7 - 100);
-+        tbl1[i] = (int8_t)(i - 32);
-+    }
-+    uint32_t seed = 1;
-+    int bad = 0;
-+    for (uint32_t i = 0; i < 200000; i++) {
-+        uint32_t x = seed;
-+        seed = seed * 1103515245u + 12345u;
-+        uint32_t y = seed;
-+        seed = seed * 1103515245u + 12345u;
-+        int32_t sx = (int32_t)(x ^ 0x80000000u);
-+        uint8_t c8 = (uint8_t)x;
-+        uint16_t c16 = (uint16_t)x;
-+        int8_t s8 = (int8_t)sx;
-+        int16_t s16 = (int16_t)sx;
-+        if (idx_u8(x) != (uint32_t)tbl4[c8]) { printf("FAIL idx_u8 %u\n", x); bad = 1; break; }
-+        if (idx_i8(sx) != (uint32_t)tbl4[s8 & 31]) { printf("FAIL idx_i8 %d\n", sx); bad = 1; break; }
-+        if (idx_u16(x) != (uint32_t)tbl2[c16 & 63]) { printf("FAIL idx_u16 %u\n", x); bad = 1; break; }
-+        if (idx_i16(sx) != (uint32_t)tbl4[s16 & 31]) { printf("FAIL idx_i16 %d\n", sx); bad = 1; break; }
-+        if (shl_u8(x) != (uint32_t)c8 << 24) { printf("FAIL shl_u8 %u\n", x); bad = 1; break; }
-+        if (mul_u8(x) != (uint32_t)c8 * 977u) { printf("FAIL mul_u8 %u\n", x); bad = 1; break; }
-+        if (sel_u8(x, y) != (uint32_t)tbl4[((uint8_t)(x > y ? x : y)) & 31]) { printf("FAIL sel_u8 %u %u\n", x, y); bad = 1; break; }
-+        if (narrow_i8_call(sx) != (int32_t)s8 * 3) { printf("FAIL narrow_i8_call %d\n", sx); bad = 1; break; }
-+        if (chain(x) != c8 * 13u + (uint32_t)tbl4[c8 & 31]) { printf("FAIL chain %u\n", x); bad = 1; break; }
-+    }
-+    if (!bad)
-+        printf("OK narrow-cast torture\n");
-+    return bad;
-+}
-diff --git a/tests/regression/session46_narrow_cast_torture.flags b/tests/regression/session46_narrow_cast_torture.flags
-new file mode 100644
-index 0000000..5e2403b
---- /dev/null
-+++ b/tests/regression/session46_narrow_cast_torture.flags
-@@ -0,0 +1 @@
-+-O2 -march=x86-64-v3
+     // Reject F32-only residual map loops (vectorizer remainder expects a loop).
+     // F64 (nbody) and integer (struct_copy) non-pow2 trips are allowed.
+     if !matches!(trip, 2 | 4 | 8) {
+-- 
+2.47.3
+
