@@ -1,3336 +1,516 @@
-From b0f146058de2f76de06f8b5e33c52c32dc044886 Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Fri, 21 Aug 2026 23:38:51 +0000
-Subject: [PATCH 1/2] ARM: adopt 8 audited levkropp peephole passes; fix 2
- pre-existing miscompiles
-
-AUDITED ADOPTIONS from levkropp/lccc Aug 19-21 (guilty-until-proven-
-innocent; 26 shared functions verified byte-identical, 3 divergent
-reviewed line-by-line, 21 lev-only passes audited individually):
-- forward_fp_slot_loads (aadab341): FP spill-slot store-to-load
-  forwarding with sp-derived base tracking.
-- fuse_fp_adjacent_pairs (de451e57): adjacent F64 ldr/str -> ldp/stp,
-  4-instruction window with partner-mention/dest-write/base-write
-  hazard checks.
-- eliminate_repeated_slot_loads + slot-pointer offset folds (b712c79c).
-- eliminate_overwritten_moves (339cdb8b): movk correctly excluded from
-  MoveWide overwrite kinds.
-- fold_zext_move_chains (89111a1f) -- WITH SOUNDNESS FIX, see below.
-- eliminate_redundant_sxtb (8a052b9a part 2).
-- eliminate_overwritten_stores + sink_loop_carried_stores (69bbce24):
-  store sinking restricted to call-free, single-exit, label-free
-  bottom-tested regions with the stored register surviving to the
-  backedge.
-- CCC_NO_REUSE_STACK_LOADS gate + per-pass gates (CCC_NO_FP_PAIR,
-  CCC_NO_SLOT_LOAD_DEDUP, CCC_NO_FP_SLOT_FWD, CCC_NO_STORE_DSE,
-  CCC_NO_STORE_SINK, CCC_NO_GDSE) for bisection.
-
-REJECTED: his global_dead_store_elimination escape-analysis rewrite
-(e20cdf6e/e03da2f1) -- 9 regressions on our tree (volatile_loop,
-fp_cmp_inf, unroll_const4_*, gvn_param_alloca_load, hash_narrow_chain,
-reduction_two_sums, glibc_ld_builtins; all bisected via CCC_NO_GDSE).
-Kept our conservative bail-on-address-of-sp version; REJECTED-ADOPTION
-note documents the evidence. His 3 GDSE tests rewritten to the
-conservative semantics; 27 of his other peephole tests adopted as-is.
-
-SOUNDNESS FIX in adopted fold_zext_move_chains: his scan treated block
-boundaries as proof of death. ret reads x0/x1 (return value!), calls
-read x0-x8, branch targets are invisible to a single-block scan. His
-version folded d2hi()'s return-value chain into a dead callee-saved
-register: 40/100 aarch64_fuzz mismatches at -O1. Now ABI-precise:
-ret => live iff x0/x1/x8; call => live iff x0-x8, dead iff x9-x18
-(clobbered unread), keep scanning past for x19+; labels/branches =>
-live. New test: test_zext_move_chain_blocked_by_ret.
-
-PRE-EXISTING MISCOMPILES found by the adoption battery, both fixed:
-1. vectorize insert_remainder_loop derived the scalar-remainder start
-   index with the AVX2 byte-offset formula (IV>>3) for the two-wide
-   hoisted FmaF64x2 scheme, whose IV is a 4-double GROUP index
-   (correct: IV*4). The remainder restarted at element 0 and re-ran the
-   whole row: AArch64 matmul at -O2 returned exactly 2x the correct
-   value. x86 masked it because its FmaF64x2Hoisted emitter was an
-   empty stub (the broken remainder then redid ALL work scalar) -- the
-   stub is now a real 4-lane vfmadd231pd implementation using
-   regalloc-assigned pointers (same value-cache conflation hazard as
-   FmaF64x2). Test: vectorize_axpy_remainder_start.c (x86 + ARM).
-2. Default emit_fused_mul_add (traits.rs) loaded  into the
-   accumulator FIRST, clobbering the home-less multiply result whose
-   only location IS the accumulator (use_count 1: no register, no
-   slot). i686's staging fallback then materialised 0:
-   returned 1 at -m32 on ALL opt levels (matmul B-matrix init wrote
-   identical values everywhere). Add is commutative -- consume the mul
-   result as the accumulator-side operand. Test:
-   i686_fused_mul_add_operand_order.c (-m32 -O0).
-
-Validation: 1061/1061 unit (incl. 29 new peephole tests), 50/50
-correctness, x86 regression 392/392 (2 new), ARM regression 241 pass /
-0 new failures (53 pre-existing x86-only-test noise), x86-64 fuzz
-300/300, m32 fuzz O0/O1/O2 300/300, aarch64 fuzz O1/O2/Os 300/300,
-ARM benchmark battery 8/8 output-identical vs gcc (matmul now included;
-was 2x off), full x86 reproducer sweep green.
----
- src/backend/arm/codegen/peephole.rs           | 2201 ++++++++++++++++-
- src/backend/traits.rs                         |   14 +-
- src/backend/x86/codegen/intrinsics.rs         |   36 +-
- src/passes/vectorize.rs                       |   38 +-
- .../i686_fused_mul_add_operand_order.c        |   29 +
- .../i686_fused_mul_add_operand_order.flags    |    1 +
- .../vectorize_axpy_remainder_start.c          |   25 +
- 7 files changed, 2293 insertions(+), 51 deletions(-)
- create mode 100644 tests/regression/i686_fused_mul_add_operand_order.c
- create mode 100644 tests/regression/i686_fused_mul_add_operand_order.flags
- create mode 100644 tests/regression/vectorize_axpy_remainder_start.c
-
-diff --git a/src/backend/arm/codegen/peephole.rs b/src/backend/arm/codegen/peephole.rs
-index c7d3c33b..b9738b50 100644
---- a/src/backend/arm/codegen/peephole.rs
-+++ b/src/backend/arm/codegen/peephole.rs
-@@ -33,6 +33,22 @@
+diff --git a/.gitignore b/.gitignore
+index 09dc3bc..3d69dd0 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -61,3 +61,4 @@ __pycache__/
+ agentB*.patch
+ agentB*.txt
+ /results/
++/zlib-ng-validation/
+diff --git a/docs/history/2026-08-22-session46-machinst-partial-register-segfault.md b/docs/history/2026-08-22-session46-machinst-partial-register-segfault.md
+new file mode 100644
+index 0000000..19e432b
+--- /dev/null
++++ b/docs/history/2026-08-22-session46-machinst-partial-register-segfault.md
+@@ -0,0 +1,107 @@
++# Session 46 — MachInst partial-register narrowing segfault (2026-08-22)
++
++Base: `ms178/lccc` main `8b7e3bc` (PR #183). Build: `fastbuild`, Rust
++opt-level 1, no LTO, two jobs, 4 GiB swap. Host: constrained VM without PMU.
++
++## The bug
++
++zlib-ng's `zng_emit_dist` (`trees.c` / `trees_emit.h`) computes
++
++```c
++uint8_t code;
++code = d_code(dist);            /* U32 -> U8 narrowing cast   */
++extra = extra_dbits[code];      /* folded scale-4 SIB index   */
++```
++
++and lccc emitted
++
++```asm
++movl %esi, %r9d
++movb %r9b, %r10b        # truncating move: upper 56 bits STALE
++leaq extra_dbits(%rip), %rcx
++movslq (%rcx, %r10, 4), %rax   # reads %r10 at 64-bit width -> garbage index
++```
++
++→ out-of-bounds read / segfault. Reproduced standalone with
++`tests/regression/session46_dist_code_index.c` before fixing.
++
++### Root cause chain
++
++1. **MachInst `lower_cast`** (`src/backend/x86/codegen/isel.rs`) lowered every
++   narrowing/same-size cast as a plain truncating move
++   (`emit_mov_operand_r(src, dst, to_size)`) — `movb`/`movw`/`movl`.  x86
++   `movb` preserves the destination's upper bits, so the register home was
++   left **undefined above the narrow width**.
++2. The folded-SIB index path (never-materialized cast result, possibly
++   die-at-birth-shared with the source's home) consumes the home at **full
++   64-bit width** without an explicit extension instruction — its safety
++   contract is "the home holds a zero-extended value".
++3. The mature (non-MachInst) path always extended
++   (`try_emit_cast_reg_direct` emits `movzbl`/`movswl`/`movslq`), which is
++   why `CCC_NO_MACHINST=1` was clean and why the bug appeared only when the
++   loop-body MachInst gate fired.
++
++## The fix
++
++`lower_cast`'s narrowing/same-size arm now emits **extending** moves exactly
++like the mature path and GCC/Clang:
++
++| Cast | Before | After |
++|------|--------|-------|
++| U32→U8 / U64→U8 | `movb` | `movzbl %rXb, %rYd` |
++| I32→I8 / I64→I8 | `movb` | `movsbl %rXb, %rYd` |
++| →U16 | `movw` | `movzwl` |
++| →I16 | `movw` | `movswl` |
++| →U32 | `movl` (elided on self-move!) | `movl` via `Movzx` (never elided) |
++| →I32 | `movl` | `movslq` (sign semantics, matches mature path) |
++| const → U8/U16/U32 | `movb/movw/movl $imm` | `movl $imm` (zero-extends) |
++| const → I8/I16/I32 | `movb/movw/movl $imm` | `movq $imm` (sign-extends) |
++
++Same length, no partial-register false dependency, and every wider reader —
++folded SIB indices included — now sees a defined value.  The `U32` case uses
++`Movzx{S32,S32}` deliberately: a plain `Mov` is elided as a self-move on a
++die-at-birth shared home and would skip the extension.
++
++### Why the class is now closed
++
++The IR guarantees an explicit Cast between any sub-32-bit value and every
++wider consumer (GEP indices are widened to I64 in the IR, as the dump showed:
++`Cast { from_ty: U8, to_ty: I64 }` before the `Shl`).  With every cast's home
++extended at definition time, the folded-index contract holds again.  The
++remaining `movb` writers (8-bit ALU results, `setcc`, U8 loads) are safe
++because their wider consumers always flow through a now-extending cast.
++
++## Validation (all on the final tree)
++
++| Gate | Result |
++|------|--------|
++| `cargo test --lib` | **1046 pass**, 6 ignored (incl. 3 new `lower_cast` unit tests) |
++| Regression corpus | **375 pass / 0 fail / 8 documented skips** (383 total, incl. 2 new session-46 regressions) |
++| `tests/intrinsics` (t128/t256/t512) | **3/3** |
++| zlib-ng 2.3.3 pinned gate | **ctest=8, roundtrip=0 failures** |
++| gzip 1.14 (pinned SHA) | **30/30** + doc roundtrip |
++| expat 2.7.1 (git HEAD f9a3eeb, lccc-built) | **2/2 ctest (runtests + runtests_cxx)** |
++| phi CFG fuzz 0:600 × 3 levels | 1800/1800 |
++| differential fuzz 0:500 × 3 levels | 1500/1500 |
++| alias fuzz m32 0:540 × O2/Os | 1080/1080 |
++| checkers (sema/bit-test/redundant-test/rmw-copyprop) | all pass |
++
++## Oracle distillation snapshot (post-fix, `-O2 -march=x86-64-v3` whole-file CE)
++
++| Kernel | lccc | gcc16.2 | clang | icc | icx | note |
++|--------|-----:|--------:|------:|----:|----:|------|
++| `zlib_ng_adler32` | 356 | 156 | 147 | 248 | 147 | DO8 stack traffic — **largest remaining integer gap** (RA-03) |
++| `gzip_crc32` | 118 | 50 | 82 | 60 | 100 | SIB + remat (RA-01/IS-22) |
++
++## Follow-up work
++
++1. **RA-03** Adler DO8: `sum2`/`n` must stay in GPRs (the 356→~150 gap is
++   almost entirely slot traffic in the unrolled DO8 loop).
++2. **RA-01/IS-22** CRC: file-scope remat + indexed SIB loads.
++3. The sched/ISel front still emits redundant `movl %eax, %eax`
++   (zero-extend artifact after `movslq`) — a peephole opportunity.
++4. Sema accepts writes through `const` arrays (`static const int t[]; t[i]=x;`)
++   that GCC rejects; add the C11 6.5.16.2 assignment-to-const-object
++   diagnostic (found while authoring the torture regression).
++5. Re-measure gzip/zlib-ng runtime on the i7-14700KF with PMU top-down
++   counters once the RA-03/RA-01 work lands.
+diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
+index 686e50f..fb47851 100644
+--- a/engineering/agent/BACKLOG.md
++++ b/engineering/agent/BACKLOG.md
+@@ -363,6 +363,7 @@ engineering/evidence/workloads/
+ - ✅ **`alias.rs`** — `LoopFrames`, `resolve_in_frame`, `forms_disjoint` (consumed by `redundant_loads` only).
+ - ✅ **Engineering doc tree** — `engineering/{STATE.md, agent/{BACKLOG,RULES,SEQUENCE,README}.md, evidence/godbolt/}`.
+ - ✅ **Session 44 (2026-08-22)** — re-based onto PR #179; `hot_loop_home` Phase-1 candidacy now keys on the hottest **use-site** loop depth (preheader-defined IVs get callee-saved homes; ra01 proxy 124→117 insns / 34→20 stack refs); ABI-hinted ParamRefs are never evicted (`select_evict_victim`); rbp(6) accepted as a callee-saved prestore home; the fallback ParamRef ABI read is pinned via `# LCCC_PARAM_ABI_READ`; `vector_temp_promotion` constant-address load sources survive only alloca-confined writes; `gen_lcccsimd.py` imm-builtin protos no longer declare a trailing `int __imm` (t128/t256/t512 intrinsics compile again); `tests/regression/run_regression.py` (the missing-in-repo corpus runner) plus `.env` oracle opt-outs for three host/feature-dependent tests. Zero-future-use eviction search measured (Adler +15%) and **reverted** — do not resurrect without the Adler/gzip oracles. See `docs/history/2026-08-22-session44-rebase-soundness-sweep.md`.
++- ✅ **Session 46 (2026-08-22)** — MachInst partial-register segfault class closed. `lower_cast` (x86-64 MachInst ISel) lowered every narrowing/same-size cast as a truncating `movb`/`movw`/`movl`, leaving the destination register's upper bits stale; the folded-SIB index path then read a never-materialized cast result from its (die-at-birth-shared) home at 64-bit width — zlib-ng `zng_emit_dist`'s `extra_dbits(%rcx,%r10,4)` segfaulted OOB. Narrowing/same-size casts now emit extending moves (`movzbl`/`movsbl`/`movzwl`/`movswl`/`movslq`; `movl`-via-`Movzx` so a die-at-birth self-move can never skip the extension; `movl`/`movq $imm` for constants), matching the mature path and GCC/Clang.  The IR always widens sub-32-bit values through an explicit Cast before wider uses, so extending every cast home closes the whole class.  New regressions: `session46_dist_code_index.c` (the zlib shape) and `session46_narrow_cast_torture.c` (U8/U16/I8/I16 × index/shift/mul/select/call/chain, GCC-differential).  Validated: 1046 unit (3 new `lower_cast` tests), 375/383 regression, intrinsics 3/3, zlib-ng 2.3.3 gate ctest=8 roundtrip=0, gzip 1.14 30/30 + roundtrip, expat 2.7.1 2/2 ctest, phi 1800/1800, differential 1500/1500, alias-m32 1080/1080.  See `docs/history/2026-08-22-session46-machinst-partial-register-segfault.md`.
+ - ✅ **Session 45 (2026-08-22)** — final red-team audit of vector-temp-promotion v3 (Agent B's patch, independently re-red-teamed): `Load256`/`Store256` keep their 32-byte alignment contracts (not forwardable/relaxable); promotion additionally requires `intrinsic_overwrites_full_result` (FMA/BroadcastLoadF64/store forms never rewrite their dest); `intrinsic_dest_reads_old_value` centralizes RMW destination semantics and feeds `single_read_sites` so write-only dests stop keeping forwarded loads alive (gzip PCLMUL −5 static insns); `pointer_roots` → `pointer_root_analysis` with iterative Kosaraju SCC + single-seed cycle shortcut (`p = phi(seed, p+stride)` now resolves, multi-seed cycles fail closed) + recurrence tracking gating the multi-use Loaddqu exception; wide scalar accesses retain natural alignment (I128/F128 on non-x86); pass order is promote → fuse → downgrade; O(1) load-result membership. Adoption audit fixed: module-wide `max_value_id` array sizing → dense per-function value-id renumbering, the quadratic terminator-loop lookup B missed, `cyclic_seed` simplification, and the complexity comment (O(V + Σ arity²), not flat O(V+E)). Kept the session-44 constant-address rule (alloca-confined writes provably cannot hit a fixed address). New stress regression `session45_vector_recurrence_stress.c`. See `docs/history/2026-08-22-session45-vector-promotion-v3-audit.md`.
+ - ✅ **Session 43** — red-team of Agent D's vector-temp-promotion v2: adopted (movnt align-16 relaxation via `intrinsic_dest_required_alignment`, unified width-typed `pointer_vector_arg_width`, non-escaping-alloca alias refinement, load-load chaining, single-read-site gating) and fixed two miscompiles it re-introduced — (1) `invalidate_for_value_write` dropped the slot-vs-write check (reassignment `v=load(p); v=setzero(); use(v)` read stale `p`), now a `write_may_clobber` slot+source test; (2) `VecStoreI64x2` writes memory through `args[1]` with `dest_ptr:None` but inherited the `produces_vector_value` register-result exemption. Also re-added the load-`dest` dead check and added the six 256-bit widening extensions (Pmovzx*/Pmovsx*256) to the forwardable/relaxable table. Measured: simd_movnt 422→390 insns / frame 440→392; simd_avx2_256 743→734 / 1016→824. See `docs/history/2026-08-21-session43-vector-promotion-v2-redteam.md`.
+ - ✅ **Session 42** — red-team audit of `vector_temp_promotion.rs` (late SIMD cleanup): adopted Agent D's alias-aware rewrite (escape-gated promotion window, object-root load fusion with write invalidation, fail-closed alignment whitelist, span-preserving removal) and fixed four audit-found defects — (1) slot-identity invalidation in `invalidate_for_pointer_write` (reassignment miscompile), (2) `Add`/`Sub` root propagation in `pointer_roots` (param-derived load sources were "may alias anything" and un-fused), (3) `LoadF64x4/2,LoadI32x8/4` downgrade whitelist narrowed to `index == 0` (offset arg), (4) fail-closed `dest_ptr: None` invalidation + load-`dest` dead check. A/B: 34-file corpus byte-identical; 1022 unit + 389 regression + 50 correctness + 60 fuzz green. See `docs/history/2026-08-21-session42-vector-temp-promotion-redteam.md`.
+diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
+index 24a2f40..effd1b3 100644
+--- a/src/backend/x86/codegen/isel.rs
++++ b/src/backend/x86/codegen/isel.rs
+@@ -521,7 +521,78 @@ pub fn lower_cast(
+     let to_size = OpSize::from_ir_type(to_ty);
  
- // ── Line classification types ────────────────────────────────────────────────
- 
-+// AUDITED ADOPTION of levkropp ARM peephole passes (session 30, commits
-+// aadab341/e20cdf6e/de451e57/b712c79c/89111a1f/8a052b9a/339cdb8b/69bbce24):
-+// forward_fp_slot_loads, fuse_fp_adjacent_pairs, eliminate_repeated_slot_loads,
-+// eliminate_overwritten_moves, fold_zext_move_chains, eliminate_redundant_sxtb,
-+// eliminate_overwritten_stores, sink_loop_carried_stores, and the GDSE rewrite
-+// (escape analysis for sp-derived bases + loop-variant base -> whole-frame
-+// reads, which also fixes the e03da2f iteration-0-offset unsoundness class).
-+// Every pass individually audited: movk excluded from MoveWide overwrites,
-+// store/branch/compare excluded from register-write helpers, gap hazards in
-+// ldp/stp fusion checked (partner-reg mention, dest write, base write), and
-+// store sinking requires call-free single-exit label-free regions with the
-+// stored register surviving to the backedge. Per-pass env gates retained for
-+// bisection: CCC_NO_FP_PAIR, CCC_NO_SLOT_LOAD_DEDUP, CCC_NO_FP_SLOT_FWD,
-+// CCC_NO_STORE_DSE, CCC_NO_STORE_SINK, CCC_NO_GDSE, CCC_NO_REUSE_STACK_LOADS.
-+use crate::common::fx_hash::{FxHashMap, FxHashSet};
-+
- /// Compact classification of an assembly line.
- #[derive(Clone, Copy, PartialEq, Eq, Debug)]
- enum LineKind {
-@@ -501,11 +517,19 @@ pub fn peephole_optimize(asm: String) -> String {
-         changed |= eliminate_redundant_branches(&lines, &mut kinds, n);
-         changed |= eliminate_self_moves(&mut kinds, n);
-         changed |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
-+        changed |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
-         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
-+        changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
-         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
-         changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
-+        changed |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
-+        changed |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
-+        changed |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
-         changed |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
-         changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
-+        // After the folds: dead staging movs (their patterns must win first).
-+        changed |= eliminate_overwritten_moves(&lines, &mut kinds, n);
-+        changed |= eliminate_overwritten_stores(&lines, &mut kinds, n);
-         if rotate {
-             changed |= rotate_simple_loops(&mut lines, &mut kinds, n);
-         }
-@@ -524,7 +548,12 @@ pub fn peephole_optimize(asm: String) -> String {
-     reuse_stack_loads_within_blocks(&mut lines, &mut kinds, n);
-     propagate_register_copies(&mut lines, &mut kinds, n);
-     eliminate_dead_call_staging_moves(&lines, &mut kinds, n);
--    global_dead_store_elimination(&lines, &mut kinds, n);
-+    if std::env::var("CCC_NO_GDSE").is_err() {
-+        global_dead_store_elimination(&lines, &mut kinds, n);
-+    }
-+    // After rotation (phase 1) and dead-store cleanup: sink loop-carried
-+    // slot-home stores out of bottom-tested loops.
-+    sink_loop_carried_stores(&mut lines, &mut kinds, n);
- 
-     // Phase 3: Local cleanup after global passes (up to 4 rounds)
-     {
-@@ -536,10 +565,17 @@ pub fn peephole_optimize(asm: String) -> String {
-             changed2 |= eliminate_redundant_branches(&lines, &mut kinds, n);
-             changed2 |= eliminate_self_moves(&mut kinds, n);
-             changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
-+            changed2 |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
-             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
-+            changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
-             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
-             changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
-+            changed2 |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
-+            changed2 |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
-+            changed2 |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
-             changed2 |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
-+            changed2 |= eliminate_overwritten_moves(&lines, &mut kinds, n);
-+            changed2 |= eliminate_overwritten_stores(&lines, &mut kinds, n);
-             rounds2 += 1;
-         }
-     }
-@@ -558,17 +594,17 @@ pub fn peephole_optimize(asm: String) -> String {
- /// Propagate a register copy used only as a memory-address alias within one
- /// basic block. This handles vector intrinsics where an SSA Copy gives the C
- /// pointer a short-lived register solely for `[xN]` loads/stores.
--/// Propagate a register copy used only as a memory-address alias.
- ///
--/// AUDITED ADOPTION of levkropp ed36c44: the previous version deleted the
--/// defining `mov` after scanning only to the first block boundary — a
--/// cross-block use of the alias then read a stale/clobbered register
--/// (hash_table SIGSEGV at -O2, reproduced HERE the moment LICM hoisted
--/// GlobalAddrs to the entry block and made address values multi-use).
--/// The rewrite scans the full function text and deletes the mov only on
--/// proven death of the alias (overwrite without read, or function end),
--/// tracking src liveness so rewritten address uses never read a clobbered
--/// source.
-+/// Soundness: the defining `mov` may only be deleted when the copy's value is
-+/// provably dead after the rewritten window — every mention of `dst` from here
-+/// to the end of the function's text must be accounted for. An earlier version
-+/// stopped the scan at the first block boundary and deleted the mov anyway,
-+/// which silently dropped the initializer of any alias used in a later block
-+/// (exposed when global-address CSE made such aliases multi-use). We therefore
-+/// scan to the end of the function and commit only on proof of death:
-+/// overwrite of `dst` by an instruction that does not read it, or the end of
-+/// the function's text. Anything unrecognized (other memory ops, unknown
-+/// instruction kinds, calls) blocks the transform.
- fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-     fn mentions(line: &str, reg: u8) -> bool {
-         line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-@@ -690,6 +726,7 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
-     }
-     changed
- }
-+
- /// Fold an SSA pointer update that is copied back to its loop-carried register:
- /// `mov x0,xS; add x0,xS,#K; mov xT,x0; ...; mov xS,xT` → `add xS,xS,#K`.
- /// The scan proves neither xS nor xT is referenced in the intervening region.
-@@ -805,6 +842,9 @@ fn fold_destructive_pointer_updates(
- /// either it or the slot is overwritten.  Keep this deliberately local and
- /// clear state for instruction classes whose register effects are ambiguous.
- fn reuse_stack_loads_within_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-+    if std::env::var("CCC_NO_REUSE_STACK_LOADS").is_ok() {
-+        return false;
-+    }
-     let mut cached: Vec<(i32, bool, u8, bool)> = Vec::new();
-     let mut changed = false;
-     let mut i = 0;
-@@ -905,9 +945,8 @@ fn reuse_stack_loads_within_blocks(lines: &mut [String], kinds: &mut [LineKind],
-                                 .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                                 .any(|tok| tok == xn || tok == wn);
-                             if mentions {
--                                // A pure single-register overwrite ends the
--                                // hazard; anything else (reads, multi-dest
--                                // loads like ldp) keeps the load alive.
-+                                // A pure overwrite ends the hazard; anything
-+                                // else reads the (soon deleted) register.
-                                 load_dead_after = match kinds[k] {
-                                     LineKind::Move { dst, src, .. } => {
-                                         dst == load_reg && src != load_reg
-@@ -1077,6 +1116,654 @@ fn eliminate_dead_call_staging_moves(lines: &[String], kinds: &mut [LineKind], n
- // Also: str xN, [sp, #off]  →  ldr xM, [sp, #off]  → replace load with mov xM, xN
- // Also handles: str wN, [sp, #off]  →  ldrsw xN, [sp, #off]
- 
-+// ── FP spill slot load forwarding ────────────────────────────────────────────
-+//
-+// Pattern: `str dS, [sp, #off]` (or via a materialized `sp`-derived base
-+// register) followed by `ldr dD, [sp, #off]` in the same block. The slot-home
-+// emission produces these store/reload round-trips for unallocated FP
-+// temporaries; the load is replaceable with `fmov dD, dS` (or deleted when
-+// dD == dS) as long as neither the slot nor dS is clobbered in between.
-+//
-+// Tracking is deliberately conservative: any store through an unknown base,
-+// any call, and any control-flow boundary drops all state, and any write of
-+// a source register drops the entries that forward from it.
-+
-+/// Parse an FP register name token (`d7`, `s3`, `q16`, `v2`, `v2.2d`) to its
-+/// register number.
-+fn fp_token_reg(tok: &str) -> Option<u8> {
-+    let tok = tok.trim();
-+    let digits = match tok.as_bytes().first() {
-+        Some(b'd') | Some(b's') | Some(b'q') | Some(b'v') => {
-+            let mut end = 1;
-+            while end < tok.len() && tok.as_bytes()[end].is_ascii_digit() {
-+                end += 1;
-+            }
-+            if end == 1 {
-+                return None;
-+            }
-+            &tok[1..end]
-+        }
-+        _ => return None,
-+    };
-+    digits.parse::<u8>().ok().filter(|&r| r <= 31)
-+}
-+
-+/// An FP memory operand location: direct `[sp, #off]` slot, or a register
-+/// base with a byte offset (`[xN]` / `[xN, #k]`).
-+#[derive(Clone, Copy)]
-+enum FpAddr {
-+    Sp(i32),
-+    Base(u8, i32),
-+}
-+
-+/// Parse `str dS, ...` / `ldr dD, ...` (d/s/q widths) into (reg, FpAddr).
-+fn parse_fp_mem(line: &str) -> Option<(bool, u8, FpAddr, u8)> {
-+    let t = line.trim();
-+    let (is_store, rest) = if let Some(r) = t.strip_prefix("str ") {
-+        (true, r)
-+    } else if let Some(r) = t.strip_prefix("ldr ") {
-+        (false, r)
-+    } else {
-+        return None;
-+    };
-+    let (reg_str, addr) = rest.split_once(", ")?;
-+    let reg_str = reg_str.trim();
-+    let width = reg_str.as_bytes().first().copied()?;
-+    if !matches!(width, b'd' | b's' | b'q') {
-+        return None;
-+    }
-+    let reg = fp_token_reg(reg_str)?;
-+    let addr = addr.trim();
-+    if let Some(off) = parse_sp_offset(addr) {
-+        return Some((is_store, reg, FpAddr::Sp(off), width));
-+    }
-+    if addr.starts_with("[x") && addr.ends_with(']') && !addr.contains('!') {
-+        let inner = &addr[1..addr.len() - 1];
-+        let (base, off) = match inner.split_once(", ") {
-+            Some((b, o)) => (b.trim(), o.trim().strip_prefix('#')?.parse::<i32>().ok()?),
-+            None => (inner.trim(), 0),
-+        };
-+        let base_reg = parse_reg(base);
-+        if base_reg < 29 {
-+            return Some((is_store, reg, FpAddr::Base(base_reg, off), width));
-+        }
-+    }
-+    None
-+}
-+
-+/// Width in bytes of an FP spill slot access kind.
-+fn fp_access_width(width: u8) -> i32 {
-+    match width {
-+        b's' => 4,
-+        b'q' => 16,
-+        _ => 8, // d
-+    }
-+}
-+
-+/// Does this line write FP register `num` (any d/s/q/v name form) as its
-+/// destination? Store/branch/compare mnemonics never write a register.
-+fn fp_reg_written(line: &str, num: u8) -> bool {
-+    let t = line.trim();
-+    let Some((mnem, rest)) = t.split_once(' ') else {
-+        return false;
-+    };
-+    if matches!(
-+        mnem,
-+        "str"
-+            | "stp"
-+            | "strb"
-+            | "strh"
-+            | "stur"
-+            | "sturb"
-+            | "sturh"
-+            | "stlr"
-+            | "stlrb"
-+            | "stlrh"
-+            | "fcmp"
-+            | "fcmpe"
-+            | "b"
-+            | "bl"
-+            | "ret"
-+            | "cbz"
-+            | "cbnz"
-+            | "tbz"
-+            | "tbnz"
-+            | "cmp"
-+            | "cmn"
-+    ) || mnem.starts_with("b.")
-+    {
-+        return false;
-+    }
-+    rest.split(',')
-+        .next()
-+        .is_some_and(|first| fp_token_reg(first) == Some(num))
-+}
-+
-+/// Does this line write GP register `num` (x or w form)? Checks the first two
-+/// operand positions (pair loads write the second). False positives are fine
-+/// (callers only use this to drop tracking state, never to enable a rewrite);
-+/// false negatives are not, so store/branch/compare mnemonics are excluded and
-+/// anything unrecognized counts as a write when the register appears early.
-+fn gp_reg_written_broad(line: &str, num: u8) -> bool {
-+    let t = line.trim();
-+    let Some((mnem, rest)) = t.split_once(' ') else {
-+        return false;
-+    };
-+    if matches!(
-+        mnem,
-+        "str"
-+            | "stp"
-+            | "strb"
-+            | "strh"
-+            | "stur"
-+            | "sturb"
-+            | "sturh"
-+            | "stlr"
-+            | "stlrb"
-+            | "stlrh"
-+            | "fcmp"
-+            | "fcmpe"
-+            | "b"
-+            | "bl"
-+            | "ret"
-+            | "cbz"
-+            | "cbnz"
-+            | "tbz"
-+            | "tbnz"
-+            | "cmp"
-+            | "cmn"
-+    ) || mnem.starts_with("b.")
-+    {
-+        return false;
-+    }
-+    rest.split(',').take(2).any(|op| {
-+        let op = op.trim();
-+        op == xreg_name(num) || op == wreg_name(num)
-+    })
-+}
-+
-+// ── Adjacent FP field pair fusion (ldp/stp) ─────────────────────────────────
-+//
-+// `ldr dA, [xB]` + `ldr dC, [xB, #8]` (within a small window) → `ldp dA, dC,
-+// [xB]`, and likewise `str` pairs → `stp`. Struct-of-double loops (nbody,
-+// spectral_norm, struct_copy) load/store adjacent fields in pairs; fusing
-+// halves the memory-op issue slots. Bit-identical: ldp/stp move the same
-+// bytes as the two scalar accesses. CCC_NO_FP_PAIR disables.
-+//
-+// Soundness: the second access moves up to the first's position, so nothing
-+// in the gap may write memory (for loads), touch memory at all (for stores),
-+// or mention either destination register or the base.
-+fn fuse_fp_adjacent_pairs(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-+    if std::env::var("CCC_NO_FP_PAIR").is_ok() {
-+        return false;
-+    }
-+    let mention = |line: &str, reg: u8, is_fp: bool| {
-+        let (a, b) = if is_fp {
-+            (format!("d{}", reg), format!("q{}", reg))
-+        } else {
-+            (xreg_name(reg).to_string(), wreg_name(reg).to_string())
-+        };
-+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-+            .any(|tok| tok == a || tok == b)
-+    };
-+    let mut changed = false;
-+    for i in 0..n {
-+        // Skip lines already Nop'd by earlier fusions/passes: their text is
-+        // stale and must not be re-paired.
-+        if kinds[i] == LineKind::Nop {
-+            continue;
-+        }
-+        let Some((is_store, ra, addra, b'd')) = parse_fp_mem(&lines[i]) else {
-+            continue;
-+        };
-+        let base_reg = match addra {
-+            FpAddr::Sp(_) => u8::MAX, // sp is never rewritten mid-body
-+            FpAddr::Base(b, _) => b,
-+        };
-+        // Find a mergeable partner within a 4-instruction window.
-+        let mut partner = None;
-+        let mut j = i + 1;
-+        while j < n && j <= i + 4 {
-+            if kinds[j] == LineKind::Nop {
-+                j += 1;
-+                continue;
-+            }
-+            match kinds[j] {
-+                LineKind::Label
-+                | LineKind::Branch
-+                | LineKind::CondBranch
-+                | LineKind::CmpBranch
-+                | LineKind::Call
-+                | LineKind::Ret
-+                | LineKind::Directive => break,
-+                _ => {}
-+            }
-+            let tj = lines[j].trim();
-+            // A valid merge partner is not a hazard to itself — check for it
-+            // before the generic memory-hazard break.
-+            if let Some((is_store2, rc, addrc, b'd')) = parse_fp_mem(&lines[j]) {
-+                if is_store2 == is_store && rc != ra {
-+                    let same_base = match (addra, addrc) {
-+                        (FpAddr::Sp(a), FpAddr::Sp(b)) => Some((a, b)),
-+                        (FpAddr::Base(x, a), FpAddr::Base(y, b)) if x == y => Some((a, b)),
-+                        _ => None,
-+                    };
-+                    if let Some((oa, ob)) = same_base {
-+                        if (oa - ob).abs() == 8 {
-+                            // The partner's load/store moves up to position i:
-+                            // no gap line may mention rc (its physical register
-+                            // could carry a live older value), write ra, or
-+                            // write the base.
-+                            let mut ok = true;
-+                            for k in (i + 1)..j {
-+                                if kinds[k] == LineKind::Nop {
-+                                    continue;
-+                                }
-+                                if mention(&lines[k], rc, true)
-+                                    || fp_reg_written(&lines[k], ra)
-+                                    || (base_reg != u8::MAX
-+                                        && gp_reg_written_broad(&lines[k], base_reg))
-+                                {
-+                                    ok = false;
-+                                    break;
-+                                }
-+                            }
-+                            if ok {
-+                                partner = Some((j, rc, ob));
-+                            }
-+                            break;
-+                        }
-+                    }
-+                }
-+            }
-+            let is_mem = parse_fp_mem(&lines[j]).is_some()
-+                || matches!(
-+                    kinds[j],
-+                    LineKind::StoreSp { .. }
-+                        | LineKind::LoadSp { .. }
-+                        | LineKind::LoadswSp { .. }
-+                        | LineKind::MemOther
-+                        | LineKind::StorePairSp
-+                        | LineKind::LoadPairSp
-+                        | LineKind::LoadsbReg
-+                );
-+            // A store in the gap could alias the pending load; for store
-+            // fusion any memory access is a hazard.
-+            if is_mem && (is_store || tj.starts_with("st")) {
-+                break;
-+            }
-+            j += 1;
-+        }
-+        let Some((pj, rc, ob)) = partner else {
-+            continue;
-+        };
-+        let oa = match addra {
-+            FpAddr::Sp(o) => o,
-+            FpAddr::Base(_, o) => o,
-+        };
-+        let (lo_reg, hi_reg, lo) = if oa <= ob { (ra, rc, oa) } else { (rc, ra, ob) };
-+        let base_str = match addra {
-+            FpAddr::Sp(_) => "sp".to_string(),
-+            FpAddr::Base(b, _) => xreg_name(b).to_string(),
-+        };
-+        let mnem = if is_store { "stp" } else { "ldp" };
-+        lines[i] = if lo == 0 {
-+            format!("    {} d{}, d{}, [{}]", mnem, lo_reg, hi_reg, base_str)
-+        } else {
-+            format!(
-+                "    {} d{}, d{}, [{}, #{}]",
-+                mnem, lo_reg, hi_reg, base_str, lo
-+            )
-+        };
-+        kinds[i] = classify_line(&lines[i]);
-+        kinds[pj] = LineKind::Nop;
-+        changed = true;
-+    }
-+    changed
-+}
-+
-+// ── Repeated GP slot load elimination ───────────────────────────────────────
-+//
-+// `ldr x9, [sp, #off]` ... `ldr x9, [sp, #off]` (same slot, no clobber):
-+// spill-heavy code reloads slot-homed pointers once per field access. The
-+// second load is redundant (or becomes a `mov` when the destination differs).
-+// Same tracking discipline as forward_fp_slot_loads: stores through unknown
-+// bases, calls, and control-flow boundaries drop all state; a write of the
-+// cached register drops the entry.
-+fn eliminate_repeated_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-+    if std::env::var("CCC_NO_SLOT_LOAD_DEDUP").is_ok() {
-+        return false;
-+    }
-+    // (offset, is_word) -> register holding the slot's content
-+    let mut cached: FxHashMap<(i32, bool), u8> = FxHashMap::default();
-+    let mut changed = false;
-+    for i in 0..n {
-+        match kinds[i] {
-+            LineKind::Label
-+            | LineKind::Branch
-+            | LineKind::CondBranch
-+            | LineKind::CmpBranch
-+            | LineKind::Call
-+            | LineKind::Ret => {
-+                cached.clear();
-+                continue;
-+            }
-+            LineKind::Directive | LineKind::Nop => continue,
-+            LineKind::StoreSp {
-+                offset, is_word, ..
-+            } => {
-+                // Invalidate entries overlapping the stored range.
-+                let (lo, hi) = (offset, offset + if is_word { 4 } else { 8 });
-+                cached.retain(|&(off, word), _| {
-+                    let (l2, h2) = (off, off + if word { 4 } else { 8 });
-+                    h2 <= lo || l2 >= hi
-+                });
-+                continue;
-+            }
-+            LineKind::LoadSp {
-+                reg,
-+                offset,
-+                is_word,
-+            } => {
-+                if let Some(&prev) = cached.get(&(offset, is_word)) {
-+                    if prev == reg {
-+                        kinds[i] = LineKind::Nop;
-+                        changed = true;
-+                        continue;
-+                    }
-+                    lines[i] = format!(
-+                        "    mov {}, {}",
-+                        if is_word {
-+                            wreg_name(reg)
-+                        } else {
-+                            xreg_name(reg)
-+                        },
-+                        if is_word {
-+                            wreg_name(prev)
-+                        } else {
-+                            xreg_name(prev)
-+                        }
-+                    );
-+                    kinds[i] = LineKind::Move {
-+                        dst: reg,
-+                        src: prev,
-+                        is_32bit: is_word,
-+                    };
-+                    changed = true;
-+                }
-+                // The load (or its mov replacement) writes `reg`: any entry
-+                // cached under it is stale. Then record the new mapping.
-+                cached.retain(|_, &mut r| r != reg);
-+                cached.insert((offset, is_word), reg);
-+                continue;
-+            }
-+            _ => {}
-+        }
-+        let t = lines[i].trim();
-+        // Stores through untracked bases may hit the frame: drop everything.
-+        if t.starts_with("st") {
-+            cached.clear();
-+            continue;
-+        }
-+        // Loads and other instructions only invalidate via their destination.
-+        if let Some(w) = written_gp_register(&lines[i], kinds[i]) {
-+            cached.retain(|_, &mut r| r != w);
-+        } else {
-+            // Unrecognized kinds: check destination-position mentions broadly.
-+            let mut dead = Vec::new();
-+            for &r in cached.values() {
-+                if gp_reg_written_broad(&lines[i], r) {
-+                    dead.push(r);
-+                }
-+            }
-+            for r in dead {
-+                cached.retain(|_, &mut v| v != r);
-+            }
-+        }
-+    }
-+    changed
-+}
-+
-+/// Strict single-destination form: only the first operand position, and only
-+/// when it is the line's sole mention of the register (a read-write like
-+/// `add x0, x0, #1` is NOT a pure overwrite).
-+fn gp_reg_write_only(line: &str, num: u8) -> bool {
-+    let t = line.trim();
-+    let Some((mnem, rest)) = t.split_once(' ') else {
-+        return false;
-+    };
-+    if matches!(
-+        mnem,
-+        "str"
-+            | "stp"
-+            | "strb"
-+            | "strh"
-+            | "stur"
-+            | "sturb"
-+            | "sturh"
-+            | "stlr"
-+            | "stlrb"
-+            | "stlrh"
-+            | "fcmp"
-+            | "fcmpe"
-+            | "b"
-+            | "bl"
-+            | "ret"
-+            | "cbz"
-+            | "cbnz"
-+            | "tbz"
-+            | "tbnz"
-+            | "cmp"
-+            | "cmn"
-+    ) || mnem.starts_with("b.")
-+    {
-+        return false;
-+    }
-+    let (xa, wa) = (xreg_name(num), wreg_name(num));
-+    let first = rest.split(',').next().map(str::trim);
-+    if first != Some(xa) && first != Some(wa) {
-+        return false;
-+    }
-+    t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-+        .filter(|tok| *tok == xa || *tok == wa)
-+        .count()
-+        == 1
-+}
-+
-+fn forward_fp_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-+    if std::env::var("CCC_NO_FP_SLOT_FWD").is_ok() {
-+        return false;
-+    }
-+    // slot (offset, width) -> source FP register number
-+    let mut slot_src: FxHashMap<(i32, u8), u8> = FxHashMap::default();
-+    // sp-derived base register -> sp offset (`add xN, sp, #off` / `mov xN, sp`)
-+    let mut base_off: FxHashMap<u8, i32> = FxHashMap::default();
-+    let mut changed = false;
-+
-+    let mut i = 0;
-+    while i < n {
-+        match kinds[i] {
-+            LineKind::Label
-+            | LineKind::Branch
-+            | LineKind::CondBranch
-+            | LineKind::CmpBranch
-+            | LineKind::Call
-+            | LineKind::Ret => {
-+                slot_src.clear();
-+                base_off.clear();
-+                i += 1;
-+                continue;
-+            }
-+            LineKind::Directive | LineKind::Nop => {
-+                i += 1;
-+                continue;
-+            }
-+            _ => {}
-+        }
-+
-+        let t = lines[i].trim().to_string();
-+
-+        // Track sp-derived base registers: `add xN, sp, #off`, `mov xN, sp`.
-+        if let Some(rest) = t.strip_prefix("add ") {
-+            if let Some((dst_s, srcs)) = rest.split_once(", ") {
-+                if let Some((src_s, imm_s)) = srcs.split_once(", ") {
-+                    if src_s.trim() == "sp" {
-+                        let dst = parse_reg(dst_s.trim());
-+                        if dst < 29 {
-+                            if let Some(imm) = imm_s
-+                                .trim()
-+                                .strip_prefix('#')
-+                                .and_then(|v| v.parse::<i32>().ok())
-+                            {
-+                                base_off.insert(dst, imm);
-+                                i += 1;
-+                                continue;
-+                            }
-+                        }
-+                    }
-+                }
-+            }
-+        } else if let Some(rest) = t.strip_prefix("mov ") {
-+            if let Some((dst_s, src_s)) = rest.split_once(", ") {
-+                if src_s.trim() == "sp" {
-+                    let dst = parse_reg(dst_s.trim());
-+                    if dst < 29 {
-+                        base_off.insert(dst, 0);
-+                        i += 1;
-+                        continue;
-+                    }
-+                }
-+            }
-+        }
-+
-+        // Any write of a tracked base register invalidates its mapping.
-+        // (Broad check: loads through untracked bases and pair loads can also
-+        // rewrite the register; over-dropping only loses optimization.)
-+        {
-+            let mut dead_bases = Vec::new();
-+            for &b in base_off.keys() {
-+                if written_gp_register(&lines[i], kinds[i]) == Some(b)
-+                    || gp_reg_written_broad(&lines[i], b)
-+                {
-+                    dead_bases.push(b);
-+                }
-+            }
-+            for b in dead_bases {
-+                base_off.remove(&b);
-+            }
-+        }
-+
-+        if let Some((is_store, reg, addr, width)) = parse_fp_mem(&lines[i]) {
-+            let slot_off = match addr {
-+                FpAddr::Sp(off) => Some(off),
-+                FpAddr::Base(b, k) => base_off.get(&b).map(|&base| base + k),
-+            };
-+            let Some(slot_off) = slot_off else {
-+                // Unknown base: a store through it may alias anything tracked.
-+                if is_store {
-+                    slot_src.clear();
-+                    base_off.clear();
+     if to_size as u8 <= from_size as u8 {
+-        emit_mov_operand_r(src, dst, to_size, ra, out);
++        // Narrowing or same-size cast.  A plain truncating move (movb/movw/
++        // movl) would leave the destination register's UPPER BITS STALE.
++        // x86 code may legitimately consume the value at a wider width:
++        // the folded-SIB index path reads a never-materialized cast result
++        // straight from its (possibly die-at-birth-shared) home at 64-bit
++        // width — zlib-ng's zng_emit_dist computed `code` as uint8_t and
++        // folded it into `extra_dbits(%rcx,%r10,4)`; the stale high bytes of
++        // %r10 made the index garbage and segfaulted out of bounds.  Emit
++        // the extending forms instead: same length, no partial-register
++        // false dependency, and every wider reader sees a defined value
++        // (matches the mature path and GCC/Clang lowering).
++        match src {
++            Operand::Const(_) => {
++                // movl $imm zero-extends; movq $imm carries the sign-extended
++                // mathematical value for signed sources.  movzx/movsx have no
++                // immediate forms, so pick the width by destination sign.
++                let size = if to_ty.is_signed() {
++                    OpSize::S64
 +                } else {
-+                    // Unknown-base load still clobbers its destination.
-+                    let mut to_drop = Vec::new();
-+                    for (&key, &s) in slot_src.iter() {
-+                        if s == reg {
-+                            to_drop.push(key);
-+                        }
-+                    }
-+                    for key in to_drop {
-+                        slot_src.remove(&key);
-+                    }
-+                }
-+                i += 1;
-+                continue;
-+            };
-+            if is_store {
-+                let (lo, hi) = (slot_off, slot_off + fp_access_width(width));
-+                slot_src.retain(|&(off, w), _| {
-+                    let (l2, h2) = (off, off + fp_access_width(w));
-+                    h2 <= lo || l2 >= hi
-+                });
-+                slot_src.insert((slot_off, width), reg);
-+            } else {
-+                if let Some(&src) = slot_src.get(&(slot_off, width)) {
-+                    if src == reg {
-+                        // Loading a slot into the register that already holds
-+                        // its content: redundant.
-+                        kinds[i] = LineKind::Nop;
-+                        changed = true;
-+                        i += 1;
-+                        continue;
-+                    }
-+                    lines[i] = if width == b'q' {
-+                        format!("    mov v{}.16b, v{}.16b", reg, src)
-+                    } else {
-+                        format!(
-+                            "    fmov {}{}, {}{}",
-+                            width as char, reg, width as char, src
-+                        )
-+                    };
-+                    kinds[i] = classify_line(&lines[i]);
-+                    changed = true;
-+                }
-+                // The load writes its destination register, whether or not a
-+                // forward happened: entries forwarding FROM that register are
-+                // now stale. (Missing this clobbered a still-tracked entry
-+                // whose source was silently reloaded between store and use.)
-+                slot_src.retain(|_, &mut s| s != reg);
++                    OpSize::S32
++                };
++                emit_mov_operand_r(src, dst, size, ra, out);
 +            }
-+            i += 1;
-+            continue;
-+        }
-+
-+        // GP stack stores invalidate overlapping FP entries.
-+        if let LineKind::StoreSp {
-+            offset, is_word, ..
-+        } = kinds[i]
-+        {
-+            let (lo, hi) = (offset, offset + if is_word { 4 } else { 8 });
-+            slot_src.retain(|&(off, w), _| {
-+                let (l2, h2) = (off, off + fp_access_width(w));
-+                h2 <= lo || l2 >= hi
-+            });
-+            i += 1;
-+            continue;
-+        }
-+
-+        match kinds[i] {
-+            // Untracked store forms may write anywhere: drop all state.
-+            LineKind::MemOther | LineKind::StorePairSp if t.starts_with("st") => {
-+                slot_src.clear();
-+                base_off.clear();
-+            }
-+            // Pair loads write two registers: drop entries sourcing either.
-+            LineKind::LoadPairSp => {
-+                let mut ops = t
-+                    .trim_start_matches("ldp ")
-+                    .split(',')
-+                    .take(2)
-+                    .filter_map(|tok| fp_token_reg(tok));
-+                let (a, b) = (ops.next(), ops.next());
-+                slot_src.retain(|_, &mut s| Some(s) != a && Some(s) != b);
-+            }
-+            // Other instructions: drop entries whose source register they write.
-+            _ => {
-+                let mut to_drop = Vec::new();
-+                for (&key, &s) in slot_src.iter() {
-+                    if fp_reg_written(&lines[i], s) {
-+                        to_drop.push(key);
-+                    }
-+                }
-+                for key in to_drop {
-+                    slot_src.remove(&key);
++            Operand::Value(v) => {
++                let src_reg = value_to_reg(v, ra);
++                match (to_size, to_ty.is_signed()) {
++                    (OpSize::S8, true) => out.push(MachInst::Movsx {
++                        src: MachOperand::Reg(src_reg),
++                        dst,
++                        from_size: OpSize::S8,
++                        to_size: OpSize::S32,
++                    }),
++                    (OpSize::S8, false) => out.push(MachInst::Movzx {
++                        src: MachOperand::Reg(src_reg),
++                        dst,
++                        from_size: OpSize::S8,
++                        to_size: OpSize::S32,
++                    }),
++                    (OpSize::S16, true) => out.push(MachInst::Movsx {
++                        src: MachOperand::Reg(src_reg),
++                        dst,
++                        from_size: OpSize::S16,
++                        to_size: OpSize::S32,
++                    }),
++                    (OpSize::S16, false) => out.push(MachInst::Movzx {
++                        src: MachOperand::Reg(src_reg),
++                        dst,
++                        from_size: OpSize::S16,
++                        to_size: OpSize::S32,
++                    }),
++                    // I32 narrowing: movslq sign-extends to 64 bits; movl
++                    // zero-extends — mirror the mature path exactly.
++                    // Movzx/S32->S32 lowers to `movl` but, unlike a plain
++                    // Mov, is never elided as a self-move: a die-at-birth
++                    // shared home must still be re-zero-extended.
++                    (OpSize::S32, true) => out.push(MachInst::Movsx {
++                        src: MachOperand::Reg(src_reg),
++                        dst,
++                        from_size: OpSize::S32,
++                        to_size: OpSize::S64,
++                    }),
++                    (OpSize::S32, false) => out.push(MachInst::Movzx {
++                        src: MachOperand::Reg(src_reg),
++                        dst,
++                        from_size: OpSize::S32,
++                        to_size: OpSize::S32,
++                    }),
++                    // Same-size 64-bit: identical bits.
++                    _ => emit_mov_operand_r(src, dst, to_size, ra, out),
 +                }
 +            }
 +        }
-+        i += 1;
-+    }
-+    changed
-+}
-+
- fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-     let mut changed = false;
-     let mut i = 0;
-@@ -1283,30 +1970,112 @@ fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usi
-     changed
- }
- 
--// ── Pass 4: Move chain optimization ──────────────────────────────────────────
-+// ── Pass 3b: Redundant byte sign-extension elimination ──────────────────────
- //
--// Pattern: mov A, B  ;  mov C, A → mov C, B
--// This allows the first mov to potentially be dead-eliminated later.
-+// Mirror of eliminate_redundant_sxtw for byte-level extensions: `ldrsb`
-+// produces a value whose bits 7..63 are uniform (a sign-extended byte), so a
-+// later `sxtb xD, wS` on it is redundant. Fires on char-byte loops like
-+// sieve's count loop (`ldrsb x0, [p]` then `sxtb` before the zero test).
- 
--fn eliminate_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-+fn eliminate_redundant_sxtb(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-+    let mut extb = [false; 33];
-+    extb[32] = true; // the zero register is "byte-extended"
-     let mut changed = false;
--    let mut i = 0;
--    while i + 1 < n {
-+    for i in 0..n {
-         match kinds[i] {
--            LineKind::Move {
--                dst: dst1,
--                src: src1,
--                is_32bit: is_32bit1,
--            } => {
--                // Find next non-Nop instruction
--                let mut j = i + 1;
--                while j < n && kinds[j] == LineKind::Nop {
--                    j += 1;
-+            LineKind::Label
-+            | LineKind::Branch
-+            | LineKind::CondBranch
-+            | LineKind::CmpBranch
-+            | LineKind::Call
-+            | LineKind::Ret => {
-+                extb = [false; 33];
-+                extb[32] = true;
-+            }
-+            LineKind::Move { dst, src, is_32bit } => {
-+                if is_32bit {
-+                    // w-mov zeroes bits 32-63, breaking byte-extension of negatives.
-+                    if dst < 32 {
-+                        extb[dst as usize] = false;
-+                    }
-+                } else if dst < 32 {
-+                    extb[dst as usize] = extb[src as usize];
-                 }
--                if j < n {
--                    if let LineKind::Move {
--                        dst: dst2,
--                        src: src2,
-+            }
-+            _ => {
-+                let t = lines[i].trim().to_string();
-+                // sxtb xD, wS
-+                if let Some(rest) = t.strip_prefix("sxtb ") {
-+                    if let Some((d, s)) = rest.split_once(", ") {
-+                        let dst = parse_reg(d.trim());
-+                        let src = parse_reg(s.trim());
-+                        if dst != REG_NONE && src != REG_NONE && dst < 32 && src < 32 {
-+                            if extb[src as usize] {
-+                                if dst == src {
-+                                    kinds[i] = LineKind::Nop;
-+                                } else {
-+                                    lines[i] =
-+                                        format!("    mov {}, {}", xreg_name(dst), xreg_name(src));
-+                                    kinds[i] = LineKind::Move {
-+                                        dst,
-+                                        src,
-+                                        is_32bit: false,
-+                                    };
-+                                }
-+                                changed = true;
-+                            }
-+                            // The sxtb result is byte-extended either way.
-+                            extb[dst as usize] = true;
-+                            continue;
-+                        }
-+                    }
-+                }
-+                // ldrsb xD/wD, [...] creates a byte-sign-extended value.
-+                if let Some(rest) = t.strip_prefix("ldrsb ") {
-+                    if let Some((d, _)) = rest.split_once(',') {
-+                        let dst = parse_reg(d.trim());
-+                        if dst != REG_NONE && dst < 32 {
-+                            extb[dst as usize] = true;
-+                        }
-+                        continue;
-+                    }
-+                }
-+                // Any other write clobbers the tracking.
-+                if let Some(dst) = written_gp_register(&t, kinds[i]) {
-+                    if dst < 32 {
-+                        extb[dst as usize] = false;
-+                    }
-+                }
-+            }
-+        }
-+    }
-+    changed
-+}
-+
-+// ── Pass 4: Move chain optimization ──────────────────────────────────────────
-+//
-+// Pattern: mov A, B  ;  mov C, A → mov C, B
-+// This allows the first mov to potentially be dead-eliminated later.
-+
-+fn eliminate_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-+    let mut changed = false;
-+    let mut i = 0;
-+    while i + 1 < n {
-+        match kinds[i] {
-+            LineKind::Move {
-+                dst: dst1,
-+                src: src1,
-+                is_32bit: is_32bit1,
-+            } => {
-+                // Find next non-Nop instruction
-+                let mut j = i + 1;
-+                while j < n && kinds[j] == LineKind::Nop {
-+                    j += 1;
-+                }
-+                if j < n {
-+                    if let LineKind::Move {
-+                        dst: dst2,
-+                        src: src2,
-                         is_32bit: is_32bit2,
-                     } = kinds[j]
-                     {
-@@ -1361,6 +2130,195 @@ fn eliminate_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize)
-     changed
- }
- 
-+// ── Overwritten-move elimination ─────────────────────────────────────────────
-+//
-+// The accumulator-staging emission leaves dead moves like `mov x0, x22` right
-+// before `add x0, x1, x22` (the add overwrites x0 without reading it). Delete
-+// any mov/MoveImm whose destination register is provably overwritten before it
-+// is read. Same-block, forward scan; any control flow or non-pure-write
-+// mention keeps the move.
-+fn eliminate_overwritten_moves(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
-+    let mut changed = false;
-+    for i in 0..n {
-+        let dst = match kinds[i] {
-+            LineKind::Move { dst, .. } => dst,
-+            LineKind::MoveImm { dst } | LineKind::MoveWide { dst } => dst,
-+            _ => continue,
-+        };
-+        if dst >= 29 {
-+            continue; // never touch sp/fp-adjacent registers
-+        }
-+        let xn = xreg_name(dst);
-+        let wn = wreg_name(dst);
-+        let mut dead = false;
-+        let mut j = i + 1;
-+        while j < n {
-+            if kinds[j] == LineKind::Nop {
-+                j += 1;
-+                continue;
-+            }
-+            match kinds[j] {
-+                LineKind::Label
-+                | LineKind::Branch
-+                | LineKind::CondBranch
-+                | LineKind::CmpBranch
-+                | LineKind::Call
-+                | LineKind::Ret
-+                | LineKind::Directive => break,
-+                _ => {}
-+            }
-+            let t = &lines[j];
-+            let mentions = t
-+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-+                .any(|tok| tok == xn || tok == wn);
-+            if !mentions {
-+                j += 1;
-+                continue;
-+            }
-+            // First mention decides: a pure overwrite (dest written, not read)
-+            // makes the earlier move dead; anything else reads it.
-+            dead = match kinds[j] {
-+                LineKind::Move {
-+                    dst: d2, src: s2, ..
-+                } => d2 == dst && s2 != dst,
-+                LineKind::MoveImm { dst: d2 } | LineKind::MoveWide { dst: d2 } => d2 == dst,
-+                LineKind::LoadSp { reg, .. } | LineKind::LoadswSp { reg, .. } => reg == dst,
-+                LineKind::Alu => {
-+                    // Three-operand ALU: first operand is the destination.
-+                    // Dead only if dst is that dest and not among the sources.
-+                    let t2 = t.trim();
-+                    let ops = t2.split_once(' ').map(|x| x.1).unwrap_or("");
-+                    let mut parts = ops.splitn(2, ',');
-+                    let first = parts.next().unwrap_or("").trim();
-+                    let rest = parts.next().unwrap_or("");
-+                    let first_is_dst = first == xn || first == wn;
-+                    let rest_reads = rest
-+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-+                        .any(|tok| tok == xn || tok == wn);
-+                    first_is_dst && !rest_reads
-+                }
-+                _ => false,
-+            };
-+            break;
-+        }
-+        if dead {
-+            kinds[i] = LineKind::Nop;
-+            changed = true;
-+        }
-+    }
-+    changed
-+}
-+
-+// ── Zero-extend move-chain folding ───────────────────────────────────────────
-+//
-+// `mov xA, xS ; mov wA, wA ; mov xD, xA` — the accumulator-path zero-extension
-+// idiom (the 32-bit self-move clears the top half; it is NOT a no-op, so
-+// eliminate_self_moves correctly keeps it). The chain computes xD = zext32(wS),
-+// exactly `mov wD, wS`. Sound only if A is not read later in the block.
-+fn fold_zext_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-+    let mut changed = false;
-+    for i in 0..n.saturating_sub(2) {
-+        let LineKind::Move {
-+            dst: a,
-+            src: s,
-+            is_32bit: false,
-+        } = kinds[i]
-+        else {
-+            continue;
-+        };
-+        let LineKind::Move {
-+            dst: a2,
-+            src: s2,
-+            is_32bit: true,
-+        } = kinds[i + 1]
-+        else {
-+            continue;
-+        };
-+        if a2 != a || s2 != a {
-+            continue; // middle must be mov wA, wA
-+        }
-+        let LineKind::Move {
-+            dst: d,
-+            src: s3,
-+            is_32bit: false,
-+        } = kinds[i + 2]
-+        else {
-+            continue;
-+        };
-+        if s3 != a || d == a || s == a {
-+            continue;
-+        }
-+        // A must be dead after the chain: no later READ before a boundary.
-+        // A write-only line (e.g. `mov x0, #15`) ends the old value's life.
-+        let (xa, wa) = (xreg_name(a), wreg_name(a));
-+        let mut a_live = false;
-+        for j in (i + 3)..n {
-+            match kinds[j] {
-+                // Control-flow boundaries are NOT "value is dead" proofs.
-+                // levkropp's break-as-dead default folded d2hi()'s return-
-+                // value chain (`mov x0,x22; mov w0,w0; mov x23,x0` right
-+                // before the epilogue) into a dead callee-saved register and
-+                // returned garbage: aarch64_fuzz seeds 0/2/5 at -O1, 40/100
-+                // mismatches. ABI-precise handling instead:
-+                // - ret implicitly reads the return-value registers x0/x1
-+                //   (and x8 for sret); other registers are dead there.
-+                LineKind::Ret => {
-+                    a_live = a == 0 || a == 1 || a == 8;
-+                    break;
-+                }
-+                // - calls read argument registers x0-x8; caller-saved temps
-+                //   x9-x18 are clobbered unread (dead); callee-saved x19+
-+                //   survive the call, so the scan must CONTINUE looking for
-+                //   readers after the call rather than assume death.
-+                LineKind::Call => {
-+                    if a <= 8 {
-+                        a_live = true;
-+                        break;
-+                    }
-+                    if a >= 19 {
-+                        continue;
-+                    }
-+                    break; // x9-x18: clobbered by the call without a read
-+                }
-+                // - labels and branches: the value may be read in the
-+                //   target/fall-through block; this single-block scan cannot
-+                //   see it, so it must be treated as live.
-+                LineKind::Label | LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch => {
-+                    a_live = true;
-+                    break;
-+                }
-+                LineKind::Nop => continue,
-+                _ => {}
-+            }
-+            let mentions = lines[j]
-+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-+                .filter(|tok| *tok == xa || *tok == wa)
-+                .count();
-+            if mentions == 0 {
-+                continue;
-+            }
-+            if gp_reg_write_only(&lines[j], a) {
-+                break; // write-only: the chain's value in A is dead here
-+            }
-+            a_live = true;
-+            break;
-+        }
-+        if a_live {
-+            continue;
-+        }
-+        lines[i] = format!("    mov {}, {}", wreg_name(d), wreg_name(s));
-+        kinds[i] = LineKind::Move {
-+            dst: d,
-+            src: s,
-+            is_32bit: true,
-+        };
-+        kinds[i + 1] = LineKind::Nop;
-+        kinds[i + 2] = LineKind::Nop;
-+        changed = true;
-+    }
-+    changed
-+}
-+
- /// Retarget a move-immediate instruction to a different destination register.
- /// E.g., `mov x0, #5` with new dest x14 → `mov x14, #5`
- fn retarget_move_imm(line: &str, new_dst: u8) -> Option<String> {
-@@ -1602,6 +2560,14 @@ use crate::backend::peephole_common::{replace_source_reg_in_instruction, replace
- // This runs after global store forwarding, which may have converted many loads
- // to register moves, leaving the original stores dead.
- 
-+// REJECTED ADOPTION: levkropp's GDSE escape-analysis rewrite (e03da2f1 /
-+// e20cdf6e) caused 9 regressions on our tree (volatile_loop, fp_cmp_inf,
-+// unroll_const4_*, gvn_param_alloca_load, hash_narrow_chain,
-+// reduction_two_sums, glibc_ld_builtins — all bisected to CCC_NO_GDSE).
-+// Our codegen emits sp-derived access patterns his tracker misclassifies.
-+// Keeping the conservative bail-on-address-of-sp version: sound by
-+// construction, and the loop-variant-base hazard his rewrite fixes cannot
-+// arise here because we never resolve loads through derived bases at all.
- fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
-     // Safety check: if any instruction takes the address of sp (e.g., `add xN, sp, #off`),
-     // stack slots could be accessed through pointers, so we must not eliminate any stores.
-@@ -1701,6 +2667,85 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
-     changed
- }
- 
-+/// Parse `[xN]`, `[xN, #k]` (no writeback) into (base register, offset).
-+fn parse_base_addr(inner_bracketed: &str) -> Option<(u8, i32)> {
-+    let inner = inner_bracketed.strip_prefix('[')?;
-+    let inner = inner.split_once(']').map(|(h, _)| h).unwrap_or(inner);
-+    let (base, off) = match inner.split_once(", ") {
-+        Some((b, o)) => (b.trim(), o.trim().strip_prefix('#')?.parse::<i32>().ok()?),
-+        None => (inner.trim(), 0),
-+    };
-+    let b = parse_reg(base);
-+    (b < 29).then_some((b, off))
-+}
-+
-+/// Maintain the sp-derived base-register map for one line of text:
-+/// `add/sub xN, sp, #k` creates, `mov` copies or ends a lineage, `add/sub`
-+/// on a base adjusts or derives, calls end caller-saved lineages, and any
-+/// other write of a tracked register ends its lineage.
-+fn track_sp_bases(line: &str, kind: LineKind, base_off: &mut FxHashMap<u8, i32>) {
-+    let t = line.trim();
-+    if let Some(rest) = t.strip_prefix("add ").or_else(|| t.strip_prefix("sub ")) {
-+        let neg = t.starts_with("sub ");
-+        if let Some((dst_s, srcs)) = rest.split_once(", ") {
-+            if let Some((src_s, imm_s)) = srcs.split_once(", ") {
-+                let dst = parse_reg(dst_s.trim());
-+                let src = parse_reg(src_s.trim());
-+                let imm = imm_s
-+                    .trim()
-+                    .strip_prefix('#')
-+                    .and_then(|v| v.parse::<i32>().ok());
-+                if let Some(imm) = imm {
-+                    let signed = if neg { -imm } else { imm };
-+                    if src_s.trim() == "sp" && dst < 29 {
-+                        base_off.insert(dst, signed);
-+                        return;
-+                    }
-+                    if let Some(&off) = base_off.get(&src) {
-+                        if dst < 29 {
-+                            base_off.insert(dst, off + signed);
-+                        }
-+                    }
-+                }
-+            }
-+        }
-+    } else if let Some(rest) = t.strip_prefix("mov ") {
-+        if let Some((dst_s, src_s)) = rest.split_once(", ") {
-+            let (dst_s, src_s) = (dst_s.trim(), src_s.trim());
-+            let dst = parse_reg(dst_s);
-+            if src_s == "sp" {
-+                if dst < 29 {
-+                    base_off.insert(dst, 0);
-+                }
-+                return;
-+            }
-+            let src = parse_reg(src_s);
-+            if let Some(&off) = base_off.get(&src) {
-+                if dst < 29 {
-+                    base_off.insert(dst, off);
-+                }
-+            } else if dst < 29 {
-+                // mov xN, <non-base>: clobbered, lineage ends.
-+                base_off.remove(&dst);
-+            }
-+        }
-+    }
-+    // Calls clobber caller-saved registers: end those lineages.
-+    if kind == LineKind::Call {
-+        base_off.retain(|&r, _| r >= 19);
-+        return;
-+    }
-+    let mut dead = Vec::new();
-+    for &b in base_off.keys() {
-+        if gp_reg_written_broad(line, b) || written_gp_register(line, kind) == Some(b) {
-+            dead.push(b);
-+        }
-+    }
-+    for b in dead {
-+        base_off.remove(&b);
-+    }
-+}
-+
- /// Extract the numeric offset from an instruction containing `[sp, #N]` or `[sp]`.
- fn extract_sp_offset(line: &str) -> Option<i32> {
-     if let Some(start) = line.find("[sp") {
-@@ -1886,6 +2931,441 @@ fn rotate_simple_loops(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
-     changed
- }
- 
-+// ── Loop-carried store sinking ───────────────────────────────────────────────
-+//
-+// The slot-home discipline gives every SSA value a mandatory stack slot, so a
-+// loop-carried value is stored to its slot once per iteration even when
-+// nothing in the loop ever loads the slot back (the value stays live in a
-+// register; the slot is only read after the loop).  Sink such a store to the
-+// loop's fall-through exit:
-+//
-+//     .Lbody:                       .Lbody:
-+//       ...                           ...
-+//       str x0, [sp, #24]   -->       ...            (store removed)
-+//       ...                           ...
-+//       b.le .Lbody                   b.le .Lbody
-+//       b .Lexit                      str x0, [sp, #24]  (stored once)
-+//                                     b .Lexit
-+//
-+// Soundness conditions (all checked below): the slot is not otherwise
-+// referenced inside the loop, this is the only store to it, every path from
-+// the loop head to the fall-through exit executes the store (no labels or
-+// exiting branches between the head and the store, no labels between the
-+// store and the backedge), the only exit is the fall-through past the
-+// backedge, and the stored register is not rewritten between the store and
-+// the backedge.  Then the register holds the last-stored value at the exit,
-+// so storing it there once produces the same slot contents as the original.
-+
-+/// Register number of a scalar register operand (`w0`/`x19`/`d24`/`s3` →
-+/// 0/19/24/3).  The class is ignored: a match on the number alone is a
-+/// conservative clobber indication.
-+fn reg_operand_num(op: &str) -> Option<u8> {
-+    let op = op.trim();
-+    let rest = op.strip_prefix(|c| matches!(c, 'w' | 'x' | 'd' | 's' | 'q' | 'b' | 'h'))?;
-+    rest.parse::<u8>().ok().filter(|&n| n <= 30)
-+}
-+
-+/// Does this instruction write a register with the given number?
-+/// Conservative: the first operand (and the second for `ldp`) counts as a
-+/// destination for everything that is not a store, compare, or branch.
-+fn instr_clobbers_reg(trimmed: &str, num: u8) -> bool {
-+    let mut it = trimmed.splitn(2, char::is_whitespace);
-+    let mnem = it.next().unwrap_or("");
-+    let ops = it.next().unwrap_or("");
-+    if ops.is_empty() {
-+        return false; // labels, directives, ret, bare branches
-+    }
-+    // Stores and comparisons have no register destination.
-+    if mnem.starts_with("st")
-+        || mnem.starts_with("cmp")
-+        || mnem.starts_with("cmn")
-+        || mnem.starts_with("tst")
-+        || mnem.starts_with("fcmp")
-+    {
-+        return false;
-+    }
-+    // Branches.
-+    if mnem == "b"
-+        || mnem.starts_with("b.")
-+        || mnem == "bl"
-+        || mnem == "blr"
-+        || mnem == "br"
-+        || mnem == "cbz"
-+        || mnem == "cbnz"
-+        || mnem == "tbz"
-+        || mnem == "tbnz"
-+    {
-+        return false;
-+    }
-+    let mut operands = ops.split(", ");
-+    if let Some(first) = operands.next() {
-+        if reg_operand_num(first) == Some(num) {
-+            return true;
-+        }
-+    }
-+    if mnem == "ldp" {
-+        if let Some(second) = operands.next() {
-+            if reg_operand_num(second) == Some(num) {
-+                return true;
-+            }
-+        }
-+    }
-+    false
-+}
-+
-+/// Parse `str <reg>, [sp, #off]` for scalar regs (w/x/s/d) → (reg_num, offset).
-+fn parse_sp_store_any(trimmed: &str) -> Option<(u8, i32)> {
-+    let rest = trimmed.strip_prefix("str ")?;
-+    let (reg_str, addr) = rest.split_once(", ")?;
-+    let num = reg_operand_num(reg_str)?;
-+    let off = parse_sp_offset(addr.trim())?;
-+    Some((num, off))
-+}
-+
-+/// Byte size of a scalar `str` register operand (w/s=4, x/d=8).
-+fn store_reg_size(trimmed: &str) -> Option<u32> {
-+    let rest = trimmed.strip_prefix("str ")?;
-+    let (reg_str, _) = rest.split_once(", ")?;
-+    let r = reg_str.trim();
-+    if r.starts_with('w') || r.starts_with('s') {
-+        Some(4)
-+    } else if r.starts_with('x') || r.starts_with('d') {
-+        Some(8)
-+    } else {
-+        None
-+    }
-+}
-+
-+// ── Overwritten store elimination ────────────────────────────────────────────
-+//
-+// Local dead-store peephole: `str R, [sp, #off]` followed by another store to
-+// the same slot with no intervening read (and no label, branch, call, or
-+// unknown memory op between). The first store is dead. This is the store
-+// analog of eliminate_overwritten_moves and catches cases the global DSE
-+// misses when it bails on a whole function due to one escaped frame pointer.
-+fn eliminate_overwritten_stores(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
-+    if std::env::var("CCC_NO_STORE_DSE").is_ok() {
-+        return false;
-+    }
-+    let mut changed = false;
-+    for i in 0..n {
-+        let LineKind::StoreSp {
-+            offset: off_i,
-+            is_word: word_i,
-+            ..
-+        } = kinds[i]
-+        else {
-+            continue;
-+        };
-+        let size_i = if word_i { 4u32 } else { 8 };
-+        let mut j = i + 1;
-+        let mut steps = 0;
-+        while j < n && steps < 40 {
-+            steps += 1;
-+            if lines[j].contains('\n') {
-+                break; // multi-line slot may hide memory ops
-+            }
-+            match kinds[j] {
-+                LineKind::Nop => {
-+                    j += 1;
-+                    continue;
-+                }
-+                LineKind::StoreSp {
-+                    offset: off_j,
-+                    is_word: word_j,
-+                    ..
-+                } => {
-+                    let size_j = if word_j { 4u32 } else { 8 };
-+                    if off_j == off_i && size_j >= size_i {
-+                        // Fully overwritten with no intervening read.
-+                        kinds[i] = LineKind::Nop;
-+                        changed = true;
-+                    }
-+                    if off_j < off_i + size_i as i32 && off_i < off_j + size_j as i32 {
-+                        break; // overlapping store: stop either way
-+                    }
-+                    j += 1;
-+                    continue;
-+                }
-+                LineKind::LoadSp {
-+                    offset: off_j,
-+                    is_word: word_j,
-+                    ..
-+                } => {
-+                    let size_j = if word_j { 4u32 } else { 8 };
-+                    if off_j < off_i + size_i as i32 && off_i < off_j + size_j as i32 {
-+                        break; // reads our slot (or overlaps it)
-+                    }
-+                    j += 1;
-+                    continue;
-+                }
-+                LineKind::LoadswSp { offset: off_j, .. } => {
-+                    if off_j < off_i + size_i as i32 && off_i < off_j + 4 {
-+                        break;
-+                    }
-+                    j += 1;
-+                    continue;
-+                }
-+                // Straight-line, non-memory instructions are transparent.
-+                LineKind::Move { .. }
-+                | LineKind::MoveImm { .. }
-+                | LineKind::MoveWide { .. }
-+                | LineKind::Sxtw { .. }
-+                | LineKind::Compare
-+                | LineKind::Alu => {
-+                    j += 1;
-+                    continue;
-+                }
-+                // Labels, branches, calls, pair/unknown memory ops, anything
-+                // else: stop. `Other` covers unknown instructions that might
-+                // touch memory, so it stops the scan too.
-+                _ => break,
-+            }
-+        }
-+    }
-+    changed
-+}
-+
-+/// Branch target label of a (sub-)line, for plain/conditional/compare branches.
-+fn any_branch_target(trimmed: &str) -> Option<&str> {
-+    if let Some(rest) = trimmed.strip_prefix("b ") {
-+        let t = rest.trim();
-+        if t.starts_with('.') {
-+            return Some(t);
-+        }
-+        return None;
-+    }
-+    if let Some(rest) = trimmed.strip_prefix("b.") {
-+        if let Some((_, t)) = rest.split_once(' ') {
-+            let t = t.trim();
-+            if t.starts_with('.') {
-+                return Some(t);
-+            }
-+        }
-+        return None;
-+    }
-+    for p in ["cbz ", "cbnz ", "tbz ", "tbnz "] {
-+        if trimmed.starts_with(p) {
-+            if let Some((_, t)) = trimmed.rsplit_once(", ") {
-+                let t = t.trim();
-+                if t.starts_with('.') {
-+                    return Some(t);
-+                }
-+            }
-+        }
-+    }
-+    None
-+}
-+
-+fn sink_loop_carried_stores(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-+    if std::env::var("CCC_NO_STORE_SINK").is_ok() {
-+        return false;
-+    }
-+    // Flatten to virtual sub-lines: rotation leaves multi-line slots whose
-+    // embedded latch branches this pass must still see.
-+    let mut v: Vec<(usize, usize, String)> = Vec::new(); // (slot, sub_idx, text)
-+    for i in 0..n {
-+        if kinds[i] == LineKind::Nop {
-+            continue;
-+        }
-+        for (si, sub) in lines[i].split('\n').enumerate() {
-+            let t = sub.trim();
-+            if !t.is_empty() {
-+                v.push((i, si, t.to_string()));
-+            }
-+        }
-+    }
-+    let nv = v.len();
-+    // Label name -> virtual index.
-+    let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-+    for (vi, (_, _, t)) in v.iter().enumerate() {
-+        if let Some(name) = t.strip_suffix(':') {
-+            labels.insert(name, vi);
-+        }
-+    }
-+    // Find loop regions: a conditional backward branch ends a bottom-tested
-+    // loop whose exit is the fall-through past the branch.
-+    let mut regions: Vec<(usize, usize)> = Vec::new(); // (head vi, backedge vi)
-+    for vj in 0..nv {
-+        let t = &v[vj].2;
-+        let conditional = t.starts_with("b.")
-+            || t.starts_with("cbz ")
-+            || t.starts_with("cbnz ")
-+            || t.starts_with("tbz ")
-+            || t.starts_with("tbnz ");
-+        if !conditional {
-+            continue;
-+        }
-+        let Some(target) = any_branch_target(t) else {
-+            continue;
-+        };
-+        let Some(&vi) = labels.get(target) else {
-+            continue;
-+        };
-+        if vi < vj {
-+            regions.push((vi, vj));
-+        }
-+    }
-+    // Largest regions first: sink each store as far out as possible.
-+    regions.sort_by_key(|&(h, j)| std::cmp::Reverse(j - h));
-+
-+    let mut sunk_slot: Vec<bool> = vec![false; n];
-+    // (store slot, store text, backedge slot, backedge sub_idx)
-+    let mut edits: Vec<(usize, String, usize, usize)> = Vec::new();
-+
-+    for &(h, j) in &regions {
-+        // Region-level hazards: calls, returns, or branches to unknown labels.
-+        let mut region_bad = false;
-+        for p in h..=j {
-+            let t = &v[p].2;
-+            if t.starts_with("bl ") || t.starts_with("blr ") || t == "ret" {
-+                region_bad = true;
-+                break;
-+            }
-+            if let Some(tgt) = any_branch_target(t) {
-+                if !labels.contains_key(tgt) {
-+                    region_bad = true;
-+                    break;
-+                }
-+            }
-+        }
-+        if region_bad {
-+            continue;
-+        }
-+        // The backedge slot must contain no other backward branch: splicing
-+        // would shift the second branch's sub-index.
-+        let bslot = v[j].0;
-+        let mut other_backedge = false;
-+        for p in h..j {
-+            if v[p].0 != bslot {
-+                continue;
-+            }
-+            if let Some(tgt) = any_branch_target(&v[p].2) {
-+                if let Some(&tp) = labels.get(tgt) {
-+                    if tp < p {
-+                        other_backedge = true;
-+                        break;
-+                    }
-+                }
-+            }
-+        }
-+        if other_backedge {
-+            continue;
-+        }
-+        // Exit branches: any branch in the region targeting outside it.
-+        // (The backedge at j targets the head, which is inside.)
-+        let mut exits: Vec<usize> = Vec::new();
-+        for p in h..j {
-+            if let Some(tgt) = any_branch_target(&v[p].2) {
-+                let tp = labels[tgt];
-+                if tp < h || tp > j {
-+                    exits.push(p);
-+                }
-+            }
-+        }
-+        // Candidate stores.
-+        for k in (h + 1)..j {
-+            let (slot, _, ref text) = v[k];
-+            if sunk_slot[slot] || lines[slot].contains('\n') {
-+                continue; // already sunk, or not a standalone line
-+            }
-+            if !matches!(kinds[slot], LineKind::StoreSp { .. } | LineKind::MemOther) {
-+                continue;
-+            }
-+            let Some((num, off)) = parse_sp_store_any(text) else {
-+                continue;
-+            };
-+            let debug = std::env::var("CCC_SINK_DEBUG").is_ok();
-+            let slot_ref = format!("[sp, #{}]", off);
-+            let mut bad = false;
-+            // (a) Nothing else in the region references this slot.
-+            for p in h..=j {
-+                if p == k {
-+                    continue;
-+                }
-+                let t = &v[p].2;
-+                if t.contains(&slot_ref) {
-+                    bad = true;
-+                    break;
-+                }
-+                // Pair ops cover a range: stp/ldp at base M spans M..M+16.
-+                if t.starts_with("stp ") || t.starts_with("ldp ") {
-+                    if let Some(base) = extract_sp_offset(t) {
-+                        if base <= off && off < base + 16 {
-+                            bad = true;
-+                            break;
-+                        }
-+                    }
-+                }
-+            }
-+            if bad && debug {
-+                eprintln!("sink bail: {} (slot re-referenced in region)", text);
-+            }
-+            // (b) No exiting branch anywhere (v1: fall-through exit only).
-+            if !bad && !exits.is_empty() {
-+                bad = true;
-+                if debug {
-+                    eprintln!("sink bail: {} ({} exit branches)", text, exits.len());
-+                }
-+            }
-+            // (c) No labels between the store and the backedge (no way to
-+            // reach the exit without passing the store), and none before the
-+            // store either except the head (every path to the exit passes k).
-+            if !bad {
-+                for p in (h + 1)..j {
-+                    if p == k {
-+                        continue;
-+                    }
-+                    if v[p].2.ends_with(':') {
-+                        bad = true;
-+                        if debug {
-+                            eprintln!("sink bail: {} (label {} in region)", text, v[p].2);
-+                        }
-+                        break;
-+                    }
-+                }
-+            }
-+            // (d) The stored register survives to the backedge.
-+            if !bad {
-+                for p in (k + 1)..=j {
-+                    if instr_clobbers_reg(&v[p].2, num) {
-+                        bad = true;
-+                        if debug {
-+                            eprintln!("sink bail: {} (clobbered by {})", text, v[p].2);
-+                        }
-+                        break;
-+                    }
-+                }
-+            }
-+            if bad {
-+                continue;
-+            }
-+            sunk_slot[slot] = true;
-+            edits.push((slot, format!("    {}", text), v[j].0, v[j].1));
-+            if debug {
-+                eprintln!("sink ok: {}", text);
-+            }
-+        }
-+    }
-+
-+    if edits.is_empty() {
-+        return false;
-+    }
-+    for (slot, _, _, _) in &edits {
-+        kinds[*slot] = LineKind::Nop;
-+    }
-+    // Splice each sunk store into the backedge slot, right after the branch.
-+    // Insertions land after the backedge sub-line, so it keeps its original
-+    // sub-index no matter how many stores are spliced in.
-+    for (_, text, bj, bsub) in &edits {
-+        let mut subs: Vec<&str> = lines[*bj].split('\n').collect();
-+        subs.insert(bsub + 1, text.as_str());
-+        lines[*bj] = subs.join("\n");
-+        kinds[*bj] = LineKind::Other;
-+    }
-+    true
-+}
-+
- #[cfg(test)]
- mod tests {
-     use super::*;
-@@ -2186,13 +3666,662 @@ mod tests {
- 
-     #[test]
-     fn test_dse_with_address_taken() {
--        // When sp address is taken, no stores should be eliminated
-+        // Conservative GDSE: materializing ANY sp-derived address disables
-+        // store elimination (we do not track whether it is used), so the
-+        // store stays.
-         let input = "\
-     str w0, [sp, #16]\n\
-     add x1, sp, #16\n\
-     ret\n";
-         let result = peephole_optimize(input.to_string());
--        // Store must be preserved because address of stack slot is taken
--        assert!(result.contains("str w0, [sp, #16]"));
-+        assert!(
-+            result.contains("str w0, [sp, #16]"),
-+            "address-of-sp disables DSE conservatively:\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_dse_with_escaping_address() {
-+        // The derived base is stored into memory here: the address escapes,
-+        // so no store elimination may happen at all.
-+        let input = "\
-+    str w0, [sp, #16]\n\
-+    add x1, sp, #16\n\
-+    str x1, [x9]\n\
-+    ret\n";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("str w0, [sp, #16]"),
-+            "escaping address must preserve stores:\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_dse_dead_fp_store_via_base() {
-+        // Conservative GDSE: any address-of-sp (`add x23, sp, #112`)
-+        // disables store elimination for the whole function — the store
-+        // through the derived base must SURVIVE. (levkropp's escape-
-+        // analysis rewrite that eliminated it caused 9 regressions on
-+        // this tree — volatile_loop, unroll_const4_*, fp_cmp_inf et al. —
-+        // and was rejected; see the REJECTED ADOPTION note at
-+        // global_dead_store_elimination.)
-+        let input = "\
-+f:
-+    add x23, sp, #112
-+    fmul d28, d27, d17
-+    str d28, [x23]
-+    fadd d0, d1, d1
-+    ret
-+g:
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("str d28, [x23]"),
-+            "store via derived base kept (conservative GDSE):\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_dse_live_fp_store_via_base_kept() {
-+        // Same conservative rule: with address-of-sp present, both the
-+        // store and the (differently-addressed) load survive untouched.
-+        let input = "\
-+f:
-+    add x23, sp, #112
-+    fmul d28, d27, d17
-+    str d28, [x23]
-+    ldr d0, [sp, #112]
-+    fadd d0, d0, d0
-+    ret
-+g:
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("str d28"),
-+            "store kept under conservative GDSE:\n{}",
-+            result
-+        );
-+    }
-+
-+    // ── Address-alias soundness ────────────────────────────────────────
-+
-+    #[test]
-+    fn test_address_alias_mov_survives_cross_block_use() {
-+        // The mov's register is used as an address in a LATER block (after a
-+        // call): deleting the initializer must not happen even though the
-+        // in-window use is a pure address alias.
-+        let input = "\
-+f:
-+    adrp x0, tbl
-+    add x0, x0, :lo12:tbl
-+    mov x23, x0
-+    ldr x4, [x23, x28, lsl #3]
-+    mov x19, x4
-+    bl strcmp
-+.LBB9:
-+    ldr x19, [x23, x27, lsl #3]
-+    str x22, [x23, x27, lsl #3]
-+    ret
-+g:
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("mov x23, x0"),
-+            "defining mov must survive:\n{}",
-+            result
-+        );
-+        assert!(
-+            result.contains("[x23, x27, lsl #3]"),
-+            "cross-block use must not be rewritten:\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_address_alias_folded_when_provably_dead() {
-+        // The intended optimization: a short-lived address alias whose
-+        // register is overwritten (without being read) after the uses.
-+        let input = "\
-+f:
-+    mov x9, x26
-+    ldr x4, [x9]
-+    str x4, [x9, #8]
-+    mov x9, x5
-+    ret
-+g:
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            !result.contains("mov x9, x26"),
-+            "dead alias mov removed:\n{}",
-+            result
-+        );
-+        assert!(
-+            result.contains("ldr x4, [x26]"),
-+            "use rewritten:\n{}",
-+            result
-+        );
-+        assert!(
-+            result.contains("str x4, [x26, #8]"),
-+            "use rewritten:\n{}",
-+            result
-+        );
-+    }
-+
-+    // ── FP spill slot forwarding ─────────────────────────────────────────
-+
-+    #[test]
-+    fn test_fp_slot_forward_basic() {
-+        let input = "\
-+f:
-+    fsub d0, d12, d21
-+    str d0, [sp, #224]
-+    fmul d3, d0, d0
-+    ldr d1, [sp, #224]
-+    fadd d4, d1, d3
-+    ret
-+g:
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("fmov d1, d0"),
-+            "reload forwarded:\n{}",
-+            result
-+        );
-+        assert!(!result.contains("ldr d1, [sp, #224]"));
-+    }
-+
-+    #[test]
-+    fn test_fp_slot_forward_same_reg_deletes() {
-+        let input = "\
-+f:
-+    str d7, [sp, #64]
-+    ldr d7, [sp, #64]
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            !result.contains("ldr d7, [sp, #64]"),
-+            "redundant reload deleted:\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_fp_slot_forward_blocked_by_source_clobber() {
-+        // d0 is overwritten between the store and the load: no forwarding.
-+        let input = "\
-+f:
-+    str d0, [sp, #224]
-+    fmul d0, d1, d2
-+    ldr d1, [sp, #224]
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("ldr d1, [sp, #224]"),
-+            "clobbered source must not forward:\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_fp_slot_forward_blocked_by_unknown_store() {
-+        // A store through an untracked base may alias the slot: no forwarding.
-+        let input = "\
-+f:
-+    str d0, [sp, #224]
-+    str d5, [x9]
-+    ldr d1, [sp, #224]
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("ldr d1, [sp, #224]"),
-+            "unknown-base store must block:\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_fp_slot_forward_via_materialized_base() {
-+        // Stores through an sp-derived base register are tracked.
-+        let input = "\
-+f:
-+    add x23, sp, #112
-+    fmul d28, d27, d17
-+    str d28, [x23]
-+    fadd d4, d1, d1
-+    ldr d6, [sp, #112]
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("fmov d6, d28"),
-+            "base-tracked forward:\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_fp_slot_forward_gp_store_overlap_blocks() {
-+        // A GP word store into the upper half of the double slot must
-+        // invalidate the double's forward entry.
-+        let input = "\
-+f:
-+    str d0, [sp, #224]
-+    str w1, [sp, #228]
-+    ldr d1, [sp, #224]
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("ldr d1, [sp, #224]"),
-+            "overlapping GP store must block:\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_fp_slot_forward_blocked_by_intervening_reload_of_source() {
-+        // The reload of d0 from a different slot clobbers the tracked source
-+        // of slot #232's entry: forwarding the second load as `fmov d1, d0`
-+        // would read the wrong value.
-+        let input = "\
-+f:
-+    str d0, [sp, #232]
-+    ldr d0, [sp, #224]
-+    ldr d1, [sp, #232]
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            !result.contains("fmov d1, d0"),
-+            "reload of source must block forward:\n{}",
-+            result
-+        );
-+    }
-+
-+    // ── FP field pair fusion (ldp/stp) ───────────────────────────────────
-+
-+    #[test]
-+    fn test_fp_pair_loads_fused() {
-+        let input = "\
-+f:
-+    ldr d22, [x7]
-+    ldr d23, [x26]
-+    fsub d27, d22, d23
-+    ldr d28, [x7, #8]
-+    fsub d30, d28, d29
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("ldp d22, d28, [x7]"),
-+            "loads fused:\n{}",
-+            result
-+        );
-+        assert!(!result.contains("ldr d28, [x7, #8]"));
-+    }
-+
-+    #[test]
-+    fn test_fp_pair_stores_fused() {
-+        let input = "\
-+f:
-+    str d10, [x8]
-+    str d22, [x8, #8]
-+    ldr d1, [x8]
-+    ldr d2, [x8, #8]
-+    fadd d0, d1, d2
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("stp d10, d22, [x8]"),
-+            "stores fused:\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_fp_pair_loads_blocked_by_store() {
-+        // A store between the loads may alias the second load's address.
-+        let input = "\
-+f:
-+    ldr d22, [x7]
-+    str d0, [x9]
-+    ldr d28, [x7, #8]
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("ldr d28, [x7, #8]"),
-+            "store must block fusion:\n{}",
-+            result
-+        );
-+        assert!(!result.contains("ldp"));
-+    }
-+
-+    #[test]
-+    fn test_fp_pair_stores_blocked_by_load() {
-+        // A load between the stores may read the second store's address.
-+        let input = "\
-+f:
-+    str d10, [x7]
-+    ldr d0, [x9]
-+    str d22, [x7, #8]
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("str d22, [x7, #8]"),
-+            "load must block store fusion:\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_fp_pair_reversed_offsets() {
-+        let input = "\
-+f:
-+    ldr d28, [x7, #8]
-+    ldr d22, [x7]
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("ldp d22, d28, [x7]"),
-+            "reversed pair normalized:\n{}",
-+            result
-+        );
-+    }
-+
-+    // ── Repeated slot load elimination ───────────────────────────────────
-+
-+    #[test]
-+    fn test_repeated_slot_load_same_reg_deleted() {
-+        let input = "\
-+f:
-+    ldr x9, [sp, #392]
-+    ldr d28, [x9, #80]
-+    fmul d29, d28, d8
-+    ldr x9, [sp, #392]
-+    ldr d30, [x9, #56]
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert_eq!(
-+            result.matches("ldr x9, [sp, #392]").count(),
-+            1,
-+            "second load deleted:\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_repeated_slot_load_different_reg_mov() {
-+        // The repeat load becomes a mov, and copy-propagation then folds the
-+        // mov into the consumer — the second slot load disappears entirely.
-+        let input = "\
-+f:
-+    ldr x9, [sp, #392]
-+    ldr d28, [x9, #80]
-+    ldr x10, [sp, #392]
-+    ldr d30, [x10, #56]
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            !result.contains("ldr x10, [sp, #392]"),
-+            "repeat load gone:\n{}",
-+            result
-+        );
-+        assert!(
-+            result.contains("ldr d30, [x9, #56]"),
-+            "consumer uses x9:\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_repeated_slot_load_blocked_by_intervening_store() {
-+        // A store through an unknown base may write the frame slot.
-+        let input = "\
-+f:
-+    ldr x9, [sp, #392]
-+    str d0, [x26]
-+    ldr x9, [sp, #392]
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert_eq!(
-+            result.matches("ldr x9, [sp, #392]").count(),
-+            2,
-+            "unknown-base store must block:\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_repeated_slot_load_blocked_by_reg_clobber() {
-+        let input = "\
-+f:
-+    ldr x9, [sp, #392]
-+    add x9, x9, #8
-+    ldr x9, [sp, #392]
-+    ret
-+";
-+        // x9 was overwritten by the add: the second load must stay.
-+        let result = peephole_optimize(input.to_string());
-+        assert_eq!(
-+            result.matches("ldr x9, [sp, #392]").count(),
-+            2,
-+            "clobbered register must block:\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_fp_pair_latch_stores_no_overlap() {
-+        // Consecutive latch spill stores fuse pairwise; an already-paired line
-+        // must not be re-paired into an overlapping stp.
-+        let input = "\
-+f:
-+    add x19, x26, #56
-+    str d10, [sp, #344]
-+    str d22, [sp, #352]
-+    str d30, [sp, #360]
-+    str d19, [sp, #368]
-+    str d27, [sp, #376]
-+    mov x26, x19
-+    ldr d0, [sp, #344]
-+    ldr d1, [sp, #352]
-+    ldr d2, [sp, #360]
-+    ldr d3, [sp, #368]
-+    ldr d4, [sp, #376]
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("stp d10, d22, [sp, #344]"),
-+            "first pair:\n{}",
-+            result
-+        );
-+        assert!(
-+            result.contains("stp d30, d19, [sp, #360]"),
-+            "second pair:\n{}",
-+            result
-+        );
-+        assert!(
-+            !result.contains("stp d22"),
-+            "no overlapping re-fusion:\n{}",
-+            result
-+        );
-+    }
-+
-+    // ── Zext move-chain folding ──────────────────────────────────────────
-+
-+    #[test]
-+    fn test_zext_move_chain_folded() {
-+        // x0 is overwritten write-only after the chain, proving the chain
-+        // value dead in this block: fold is legal. (Without that overwrite
-+        // the trailing `ret` reads x0 as the return value and MUST block
-+        // the fold; see test_zext_move_chain_blocked_by_ret.)
-+        let input = "\
-+f:
-+    mov x0, x24
-+    mov w0, w0
-+    mov x26, x0
-+    mov x0, #7
-+    mul w4, w26, w25
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(result.contains("mov w26, w24"), "chain folded:\n{}", result);
-+        assert!(!result.contains("mov w0, w0"));
-+    }
-+
-+    #[test]
-+    fn test_zext_move_chain_blocked_by_ret() {
-+        // The chain accumulator IS the return-value register: `ret` reads
-+        // x0, so folding would change the returned value (aarch64_fuzz
-+        // seeds 0/2/5 at -O1: d2hi return chain, 40/100 mismatches).
-+        let input = "\
-+f:
-+    mov x0, x22
-+    mov w0, w0
-+    mov x23, x0
-+    ret
-+";
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("mov w0, w0"),
-+            "zext chain into x0 before ret must not fold:\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_zext_move_chain_blocked_when_accumulator_live() {
-+        let input = "\
-+f:
-+    mov x0, x24
-+    mov w0, w0
-+    mov x26, x0
-+    mul w4, w26, w25
-+    add w5, w0, #1
-+    ret
-+";
-+        // x0 is read after the chain: folding would lose the zext value.
-+        let result = peephole_optimize(input.to_string());
-+        assert!(
-+            result.contains("mov w0, w0"),
-+            "live accumulator blocks fold:\n{}",
-+            result
-+        );
-+    }
-+
-+    #[test]
-+    fn test_sink_loop_carried_store() {
-+        // Bottom-tested loop: the slot is never read inside, the value stays
-+        // live in x20; the store can be sunk to the fall-through exit.
-+        let input = "\
-+f:
-+    mov x20, #0
-+    movz x21, #100
-+    b .Lguard
-+.Lbody:
-+    sxtw x22, w20
-+    add x0, x22, x20
-+    str x0, [sp, #24]
-+    mov x20, x0
-+    cmp w20, w21
-+    b.le .Lbody
-+    b .Lexit
-+.Lguard:
-+    cmp w20, w21
-+    b.le .Lbody
-+    b .Lexit
-+.Lexit:
-+    ldr x0, [sp, #24]
-+    ret
-+";
-+        let result = {
-+            let mut lines: Vec<String> = input.lines().map(String::from).collect();
-+            let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
-+            let n = lines.len();
-+            let changed = sink_loop_carried_stores(&mut lines, &mut kinds, n);
-+            let out = lines
-+                .iter()
-+                .zip(kinds.iter())
-+                .filter(|(_, k)| **k != LineKind::Nop)
-+                .map(|(l, _)| l.as_str())
-+                .collect::<Vec<_>>()
-+                .join("\n");
-+            assert!(changed, "store should be sunk:\n{}", out);
-+            out
-+        };
-+        // Exactly one store remains, on the exit path after the backedge.
-+        assert_eq!(
-+            result.matches("str x0, [sp, #24]").count(),
-+            1,
-+            "\n{}",
-+            result
-+        );
-+        let be = result.find("b.le .Lbody").unwrap();
-+        let st = result.find("str x0, [sp, #24]").unwrap();
-+        assert!(st > be, "store after backedge:\n{}", result);
-+    }
-+
-+    #[test]
-+    fn test_sink_blocked_when_slot_read_in_loop() {
-+        let input = "\
-+f:
-+    mov x20, #0
-+.Lbody:
-+    ldr x0, [sp, #24]
-+    add x0, x0, x20
-+    str x0, [sp, #24]
-+    mov x20, x0
-+    cmp w20, w21
-+    b.le .Lbody
-+    ldr x0, [sp, #24]
-+    ret
-+";
-+        let mut lines: Vec<String> = input.lines().map(String::from).collect();
-+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
-+        let n = lines.len();
-+        assert!(!sink_loop_carried_stores(&mut lines, &mut kinds, n));
-+    }
-+
-+    #[test]
-+    fn test_sink_blocked_by_mid_loop_exit() {
-+        let input = "\
-+f:
-+    mov x20, #0
-+.Lbody:
-+    cmp w20, w22
-+    b.gt .Lexit
-+    add x0, x20, #1
-+    str x0, [sp, #24]
-+    mov x20, x0
-+    cmp w20, w21
-+    b.le .Lbody
-+.Lexit:
-+    ldr x0, [sp, #24]
-+    ret
-+";
-+        let mut lines: Vec<String> = input.lines().map(String::from).collect();
-+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
-+        let n = lines.len();
-+        assert!(!sink_loop_carried_stores(&mut lines, &mut kinds, n));
-     }
- }
-diff --git a/src/backend/traits.rs b/src/backend/traits.rs
-index 15799227..807bfaf4 100644
---- a/src/backend/traits.rs
-+++ b/src/backend/traits.rs
-@@ -576,12 +576,24 @@ pub trait ArchCodegen {
-         ty: IrType,
-     ) {
-         // Default: emit mul then add separately via the standard paths.
-+        //
-+        // Operand order is load-bearing on accumulator-flow backends (i686):
-+        // the fused mul_dest has use_count 1, so it gets neither a register
-+        // home nor a stack slot — its ONLY location is the accumulator
-+        // (%eax) right after the multiply. The Add must therefore consume it
-+        // as the FIRST (accumulator-loaded) operand: operand_to_eax on a
-+        // home-less value is a no-op that reads %eax in place. With `acc`
-+        // first, loading it clobbered %eax and the mul result fell into the
-+        // home-less staging fallback, which materialises 0 — `i*j + 1`
-+        // compiled to `imull; movl $1,%eax; xorl %ecx,%ecx; addl %ecx,%eax`
-+        // = 1 at -m32 (matmul rows all 0.25). Add is commutative, so the
-+        // swap is semantics-preserving on every backend using this default.
-         self.emit_int_binop(_mul_dest, IrBinOp::Mul, mul_lhs, mul_rhs, ty);
-         self.emit_int_binop(
-             add_dest,
-             IrBinOp::Add,
--            acc,
-             &Operand::Value(Value(_mul_dest.0)),
-+            acc,
-             ty,
-         );
-     }
-diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
-index 11eda3ce..9be586bb 100644
---- a/src/backend/x86/codegen/intrinsics.rs
-+++ b/src/backend/x86/codegen/intrinsics.rs
-@@ -2345,7 +2345,41 @@ impl X86Codegen {
-                 }
-             }
-             IntrinsicOp::FmaF64x2Hoisted => {
--                // Emitted only by the AArch64 two-wide vectorizer.
-+                // Two-wide hoisted FMA group: C[0..4] += broadcast * B[0..4].
-+                // Primarily emitted by the AArch64 two-wide vectorizer (two
-+                // NEON fmla per group); reachable on x86 via LCCC_FORCE_SSE2.
-+                // This was a silent no-op stub here — the program only stayed
-+                // correct because the (then-buggy) remainder computation
-+                // restarted at element 0 and redid ALL the work scalar. With
-+                // the remainder start fixed (IV*4 for the group scheme) a
-+                // no-op body would silently drop the whole accumulation, so
-+                // emit the real thing: one 4-lane FMA via ymm, semantically
-+                // identical to the AArch64 pair of fmla v.2d.
-+                // args[0] = B pointer, dest_ptr = C pointer; the broadcast
-+                // factor is already in ymm1 (BroadcastLoadF64).
-+                self.flush_pending_vec_store_impl();
-+                self.state.invalidate_vec_peephole();
-+                if let Some(c_ptr) = dest_ptr {
-+                    // Prefer the register allocator's assignments (same
-+                    // value-cache conflation hazard as FmaF64x2 above: B and
-+                    // C GEPs share the offset value but not the base).
-+                    let b_name = if let Some(r) = self.operand_reg(&args[0]) {
-+                        super::emit::phys_reg_name(r)
-+                    } else {
-+                        self.operand_to_reg(&args[0], "rdx");
-+                        "rdx"
-+                    };
-+                    let c_name = if let Some(r) = self.dest_reg(c_ptr) {
-+                        super::emit::phys_reg_name(r)
-+                    } else {
-+                        self.value_to_reg(c_ptr, "rax");
-+                        "rax"
-+                    };
-+                    self.state.emit_fmt(format_args!("    vmovupd (%{}), %ymm0", c_name));
-+                    self.state.emit_fmt(format_args!("    vfmadd231pd (%{}), %ymm1, %ymm0", b_name));
-+                    self.state.emit_fmt(format_args!("    vmovupd %ymm0, (%{})", c_name));
-+                    self.state.reg_cache.invalidate_all();
-+                }
-             }
-             IntrinsicOp::FmaF64x4 => {
-                 self.flush_pending_vec_store_impl();
-diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index 8bc3fea1..9c5aa2b4 100644
---- a/src/passes/vectorize.rs
-+++ b/src/passes/vectorize.rs
-@@ -2956,29 +2956,41 @@ fn insert_remainder_loop(
- 
-     // Step 2: Create vec_exit block.
-     // Convert the loop's final IV into the element index where the scalar
--    // remainder must start. The IV representation differs by vector width:
--    //   - AVX2 (width 4): IV is a BYTE offset stepping 32 -> start = IV / 8.
--    //   - SSE2 (width 2): IV is an ELEMENT index stepping 1 (GEP stride x2)
--    //                    -> start = IV * 2.
--    // The previous code always divided by 8, which is only valid for the AVX2
--    // byte-offset scheme; for SSE2 it re-processed nearly the whole array
--    // (double-counting elements) and miscomputed the result.
--    let rem_start_inst = if vec_width == 2 {
--        Instruction::BinOp {
-+    // remainder must start. The IV representation differs by scheme:
-+    //   - width 2 (legacy SSE2): IV is an ELEMENT index stepping 1 with the
-+    //     GEP stride doubled -> start = IV * 2.
-+    //   - width 4 (two-NEON / two-XMM hoisted FmaF64x2): IV is a GROUP index
-+    //     stepping 1, each group covering 4 doubles (GEP stride x4, loop
-+    //     limit divided by 4) -> start = IV * 4. Using the byte-offset
-+    //     formula here computed IV >> 3 = 0, so the scalar remainder
-+    //     re-accumulated the ENTIRE row on top of the vector result —
-+    //     matmul C[i][j] came out exactly 2x too large on AArch64 at -O2
-+    //     (x86 masked it: its FmaF64x2Hoisted was a no-op stub, so the
-+    //     remainder redid all the work correctly but unvectorized).
-+    //   - width 16 (quad FmaF64x4, AVX2): IV is a BYTE offset stepping 128
-+    //     -> start = IV / 8.
-+    let rem_start_inst = match vec_width {
-+        2 => Instruction::BinOp {
-             dest: j_rem_start,
-             op: IrBinOp::Mul,
-             lhs: Operand::Value(pattern.iv), // Final element index
-             rhs: Operand::Const(IrConst::I32(2)),
-             ty: IrType::I32,
--        }
--    } else {
--        Instruction::BinOp {
-+        },
-+        4 => Instruction::BinOp {
-+            dest: j_rem_start,
-+            op: IrBinOp::Mul,
-+            lhs: Operand::Value(pattern.iv),   // Final 4-element group index
-+            rhs: Operand::Const(IrConst::I32(4)),
-+            ty: IrType::I32,
-+        },
-+        _ => Instruction::BinOp {
-             dest: j_rem_start,
-             op: IrBinOp::LShr,
-             lhs: Operand::Value(pattern.iv), // Final non-negative byte offset
-             rhs: Operand::Const(IrConst::I32(3)), // log2(sizeof(double))
-             ty: IrType::I32,
--        }
-+        },
-     };
- 
-     let vec_exit_block = BasicBlock {
-diff --git a/tests/regression/i686_fused_mul_add_operand_order.c b/tests/regression/i686_fused_mul_add_operand_order.c
-new file mode 100644
-index 00000000..7541352f
---- /dev/null
-+++ b/tests/regression/i686_fused_mul_add_operand_order.c
-@@ -0,0 +1,29 @@
-+// Regression: the default emit_fused_mul_add (traits.rs) must consume the
-+// home-less multiply result as the accumulator-side operand of the Add.
-+// With `acc` loaded first, %eax was clobbered and the mul result (whose only
-+// location IS %eax — use_count 1, no register, no slot) fell into the i686
-+// home-less staging fallback that materialises 0: `i*j + 1` returned 1,
-+// matmul initialised every B[i][j] to the same value at -m32 (all levels).
-+int printf(const char *, ...);
-+static double B[8][8];
-+int main(void) {
-+    volatile int one = 1;
-+    int i = one, j = one;
-+    int a = i * j;        // plain mul (control)
-+    int b = i * j + 1;    // fused mul+add, constant acc
-+    int c = 1 + i * j;    // fused mul+add, constant acc (lhs form)
-+    int e = i * j + j;    // fused mul+add, value acc
-+    if (a != 1 || b != 2 || c != 2 || e != 2) {
-+        printf("FAIL a=%d b=%d c=%d e=%d\n", a, b, c, e);
-+        return 1;
-+    }
-+    for (int x = 0; x < 8; x++)
-+        for (int y = 0; y < 8; y++)
-+            B[x][y] = (double)(x * y + 1) / 8;
-+    if (B[7][7] != 50.0 / 8 || B[0][0] != 0.125) {
-+        printf("FAIL B\n");
-+        return 1;
-+    }
-+    printf("OK\n");
-+    return 0;
-+}
-diff --git a/tests/regression/i686_fused_mul_add_operand_order.flags b/tests/regression/i686_fused_mul_add_operand_order.flags
-new file mode 100644
-index 00000000..a8c32fa8
---- /dev/null
-+++ b/tests/regression/i686_fused_mul_add_operand_order.flags
-@@ -0,0 +1 @@
-+-m32 -O0
-diff --git a/tests/regression/vectorize_axpy_remainder_start.c b/tests/regression/vectorize_axpy_remainder_start.c
-new file mode 100644
-index 00000000..b1804866
---- /dev/null
-+++ b/tests/regression/vectorize_axpy_remainder_start.c
-@@ -0,0 +1,25 @@
-+// Regression: insert_remainder_loop must derive the scalar-remainder start
-+// index from the vector loop's IV representation. The two-wide hoisted
-+// FmaF64x2 scheme (AArch64 NEON pair / LCCC_FORCE_SSE2) uses a GROUP index
-+// stepping 1 with 4 doubles per group -> start = IV*4. The old byte-offset
-+// formula (IV >> 3) restarted the remainder at element 0 and re-accumulated
-+// the whole row: matmul C[i][j] came out exactly 2x too large on AArch64 -O2.
-+int printf(const char *, ...);
-+#define N 8
-+static double A[N][N], B[N][N], C[N][N];
-+void matmul(void) {
-+    for (int i = 0; i < N; i++)
-+        for (int k = 0; k < N; k++)
-+            for (int j = 0; j < N; j++)
-+                C[i][j] += A[i][k] * B[k][j];
-+}
-+int main(void) {
-+    for (int i = 0; i < N; i++)
-+        for (int j = 0; j < N; j++) {
-+            A[i][j] = (double)(i + j) / N;
-+            B[i][j] = (double)(i * j + 1) / N;
-+        }
-+    matmul();
-+    printf("%.6f %.6f %.6f\n", C[0][0], C[3][6], C[7][7]);
-+    return 0;
-+}
--- 
-2.47.3
-
-
-From 5a4a919c4a53f16de8c000e08c0147abf257da07 Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sat, 22 Aug 2026 01:10:04 +0000
-Subject: [PATCH 2/2] fmsub/fnmsub fusion (audited levkropp port, both
- backends) + 3 pre-existing fixes
-
-AUDITED PORT of levkropp e3b21b8f (float Mul;Sub -> fused multiply-
-subtract), rewritten for our tree rather than cherry-picked -- our
-detect_mul_add_fusions has diverged (window scan over Copy/Cast,
-claimed-adds set, FxHashMap fusion map vs his adjacent-only scan):
-
-- detect_mul_add_fusions gains fuse_float_sub: Option<&FxHashSet<u32>>.
-  None = backend lacks the instruction or CCC_NO_FMSUB; Some(accs) =
-  fuse float Subs except accumulator destinations. Fusing acc -= a*b
-  puts the multiply on the loop-carried serial chain (fmsub latency >
-  fsub), his measured 13% nbody regression. Verified here: nbody -O2
-  assembly is byte-identical with the gate on vs CCC_NO_FMSUB=1;
-  mandelbrot gets its expected fmsub.
-- Accumulator set = memory-promoted loop F64 phis + surviving Phi dests
-  + multi-Copy dests + reverse closure over Copy edges (backedge
-  sources sit on the same chain). Ported as a fixpoint over a collected
-  edge LIST -- O(rounds*edges), not his O(rounds*whole-function) rescan.
-- ARM: fmsub (acc - a*b) / fnmsub (a*b - acc), operand order verified
-  against GCC 14 output; all three sources read before the write, so
-  output aliasing a source register is safe. x86: vfnmadd231sd/ss
-  (acc - product) / vfmsub231sd/ss (product - acc) via the generalized
-  emit_scalar_fma231_with helper -- reuses the destructive-coalescing
-  and memory-source paths of the shipped fmadd emitter unchanged.
-- supports_fused_float_mul_sub gated on fp_contract_fast on both
-  backends (same single-rounding contract as fmadd; matches the
-  fp-contract matrix: off/default/fast = 0/1/1).
-- Trait default for emit_fused_mul_sub is unreachable!() by design: a
-  silent mul+sub fallback would hide a backend advertising support
-  without implementing the hook, and an emit_int_binop-based fallback
-  (levkropp's version) is wrong for floats.
-- Rejected from his commit: emitting the integer path through
-  emit_int_binop inside the ARM override (dead code -- the detector
-  never records integer Subs) and the Sub arm reusing his adjacent-only
-  scan (ours supports gap instructions).
-
-PRE-EXISTING BUGS found by the port's differential testing, all
-reproduced on upstream main and fixed:
-
-1. x86 scalar FMA emitter skipped the entire instruction when the
-   constant multiplier was +0.0 ('if bits != 0' with no else), returning
-   acc unchanged. Wrong for x = +/-Inf/NaN (acc + NaN = NaN) and for
-   -0.0 + 0.0 = +0.0. Now materializes +0.0 via vxorpd/vxorps and
-   fuses. Test: fma_zero_multiplier_semantics.c (lccc now matches gcc:
-   '0 -nan ...' not '-0 2 ...').
-2. Call staging-hazard pre-spill (session 25) moves rsp by hazard_area
-   but did not adjust rsp_frame_size, so every rsp-relative slot read
-   emitted while staging the REMAINING arguments read hazard_area bytes
-   below its slot. printf with 4 FP args (one freshly computed = hazard,
-   three slot-resident) printed stale/garbage args 1-3 at -O1/-O2.
-   Fixed by bracketing the staging loop with rsp_frame_size +=/-=
-   hazard_area under rsp addressing. Test:
-   call_hazard_prespill_rsp_offsets.c.
-3. i686 emit_cond_branch_blocks bounced register-homed conditions
-   through %eax ('movl %reg,%eax; testl %eax,%eax'), defeating the
-   load->widen-cast coalescing on every register-allocated loop
-   condition. Now tests the home register in place (testl %reg,%reg;
-   read-only, no cache invalidation needed). Un-fails the pre-existing
-   check_load_widen_cast_no_relay and validated at runtime (find_c
-   returns 'world').
-
-New tests: fmsub_fnmsub_contract.c (x86 + ARM, -ffp-contract=fast,
-values exact in binary64 so the test is contract-setting-independent),
-fma_zero_multiplier_semantics.c, call_hazard_prespill_rsp_offsets.c.
-
-Known pre-existing (NOT this patch, documented for follow-up):
-check_tier2_graph_default fails on upstream main -- 21 of huft's 35
-multi-block values sit in the protected_slot_values quarantine
-(multi-def/phi/copy-alias webs), so Tier-2 coloring has too few
-colorable values to shrink the frame. Needs a quarantine-refinement
-session, not a quick fix.
-
-Validation: 1073/1073 unit, 50/50 correctness, x86 regression 395/396
-(the 1 = pre-existing check_tier2 above), ARM regression identical
-fail-set to upstream baseline (0 new), x86-64 fuzz 300/300, m32 fuzz
-O0/O1/O2 300/300, aarch64 fuzz O1/O2/Os 300/300, ARM benchmark battery
-8/8 output-identical vs gcc, full reproducer sweep green, nbody
-accumulator-gate A/B byte-identical.
----
- src/backend/arm/codegen/emit.rs               |  18 +++
- src/backend/arm/codegen/float_ops.rs          |  42 ++++++-
- src/backend/generation.rs                     | 111 +++++++++++++++++-
- src/backend/i686/codegen/emit.rs              |  26 ++--
- src/backend/traits.rs                         |  32 ++++-
- src/backend/x86/codegen/calls.rs              |  19 ++-
- src/backend/x86/codegen/emit.rs               |  28 ++++-
- src/backend/x86/codegen/float_ops.rs          |  57 ++++++++-
- .../call_hazard_prespill_rsp_offsets.c        |  17 +++
- .../fma_zero_multiplier_semantics.c           |  15 +++
- tests/regression/fmsub_fnmsub_contract.c      |  13 ++
- tests/regression/fmsub_fnmsub_contract.flags  |   1 +
- 12 files changed, 358 insertions(+), 21 deletions(-)
- create mode 100644 tests/regression/call_hazard_prespill_rsp_offsets.c
- create mode 100644 tests/regression/fma_zero_multiplier_semantics.c
- create mode 100644 tests/regression/fmsub_fnmsub_contract.c
- create mode 100644 tests/regression/fmsub_fnmsub_contract.flags
-
-diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
-index 4c92768d..5e396631 100644
---- a/src/backend/arm/codegen/emit.rs
-+++ b/src/backend/arm/codegen/emit.rs
-@@ -2370,6 +2370,24 @@ impl ArchCodegen for ArmCodegen {
-             self.emit_int_fused_mul_add_impl(mul_lhs, mul_rhs, acc, add_dest, ty);
-         }
-     }
-+    fn supports_fused_float_mul_sub(&self) -> bool {
-+        // Same single-rounding contract as fmadd fusion; the detector is
-+        // additionally gated on CCC_NO_FMSUB and the accumulator-dest set.
-+        self.fp_contract_fast
-+    }
-+    fn emit_fused_mul_sub(
-+        &mut self,
-+        mul_dest: &Value,
-+        mul_lhs: &Operand,
-+        mul_rhs: &Operand,
-+        acc: &Operand,
-+        sub_dest: &Value,
-+        ty: IrType,
-+        mul_is_lhs: bool,
-+    ) {
-+        debug_assert!(ty == IrType::F32 || ty == IrType::F64);
-+        self.emit_fused_mul_sub_impl(mul_dest, mul_lhs, mul_rhs, acc, sub_dest, ty, mul_is_lhs);
-+    }
-     fn state(&mut self) -> &mut CodegenState {
-         &mut self.state
-     }
-diff --git a/src/backend/arm/codegen/float_ops.rs b/src/backend/arm/codegen/float_ops.rs
-index 0861a7b2..4afb0234 100644
---- a/src/backend/arm/codegen/float_ops.rs
-+++ b/src/backend/arm/codegen/float_ops.rs
-@@ -1,6 +1,6 @@
- //! ArmCodegen: floating-point binary operations.
- 
--use super::emit::{arm_fp_name, is_arm_fp_phys, ArmCodegen};
-+use super::emit::{ArmCodegen, arm_fp_name, is_arm_fp_phys};
- use crate::backend::cast::FloatOp;
- use crate::backend::traits::ArchCodegen;
- use crate::common::types::IrType;
-@@ -134,6 +134,46 @@ impl ArmCodegen {
-         self.store_float_reg(add_dest, ty, &output);
+         return;
      }
  
-+    /// Fused multiply-subtract (levkropp e3b21b8f, audited port).
-+    /// `mul_is_lhs == false`: sub_dest = acc - lhs*rhs   -> fmsub  (Rd = Ra - Rn*Rm)
-+    /// `mul_is_lhs == true` : sub_dest = lhs*rhs - acc   -> fnmsub (Rd = Rn*Rm - Ra)
-+    /// All three sources are read before the destination is written (single
-+    /// instruction), so `output` aliasing any source register is safe.
-+    /// Load order matches emit_fused_mul_add_impl (acc, lhs, rhs) so the
-+    /// accumulator-flow staging behaviour is identical to the shipped fmadd.
-+    pub(super) fn emit_fused_mul_sub_impl(
-+        &mut self,
-+        _mul_dest: &Value,
-+        mul_lhs: &Operand,
-+        mul_rhs: &Operand,
-+        acc: &Operand,
-+        sub_dest: &Value,
-+        ty: IrType,
-+        mul_is_lhs: bool,
-+    ) {
-+        let (r0, r1, r2) = if ty == IrType::F32 {
-+            ("s0", "s1", "s2")
-+        } else {
-+            ("d0", "d1", "d2")
-+        };
-+        let acc_reg = self.float_operand_reg(acc, ty, r2);
-+        let lhs_reg = self.float_operand_reg(mul_lhs, ty, r0);
-+        let rhs_reg = self.float_operand_reg(mul_rhs, ty, r1);
-+        let output = self
-+            .reg_assignments
-+            .get(&sub_dest.0)
-+            .copied()
-+            .filter(|r| is_arm_fp_phys(*r))
-+            .map(|r| arm_fp_name(r, ty))
-+            .unwrap_or_else(|| r0.to_string());
-+        let mnemonic = if mul_is_lhs { "fnmsub" } else { "fmsub" };
-+        self.state.emit_fmt(format_args!(
-+            "    {} {}, {}, {}, {}",
-+            mnemonic, output, lhs_reg, rhs_reg, acc_reg
+@@ -1038,6 +1109,95 @@ mod tests {
+         ));
+     }
+ 
++    #[test]
++    fn narrowing_cast_extends_the_register() {
++        // A truncating `movb`/`movw` would leave the destination register's
++        // upper bits stale.  The folded-SIB index path reads a
++        // never-materialized cast result straight from its (possibly
++        // die-at-birth-shared) home at 64-bit width — zlib-ng's
++        // zng_emit_dist computed `code` as uint8_t and folded it into
++        // `extra_dbits(%rcx,%r10,4)`, and the stale high bytes made the
++        // index garbage (out-of-bounds segfault).  Narrowing casts must
++        // therefore extend, matching the mature path and GCC/Clang.
++        let mut assignments = FxHashMap::default();
++        assignments.insert(1, PhysReg(1));
++        assignments.insert(2, PhysReg(2));
++
++        let mut u32_to_u8 = Vec::new();
++        lower_cast(
++            &Value(2),
++            &Operand::Value(Value(1)),
++            IrType::U32,
++            IrType::U8,
++            &assignments,
++            &mut u32_to_u8,
++        );
++        assert!(matches!(
++            u32_to_u8.as_slice(),
++            [MachInst::Movzx {
++                from_size: OpSize::S8,
++                to_size: OpSize::S32,
++                ..
++            }]
 +        ));
-+        self.store_float_reg(sub_dest, ty, &output);
-+    }
 +
-     pub(super) fn emit_float_binop_impl(
-         &mut self,
-         dest: &Value,
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index 01313169..a6c17203 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -1865,6 +1865,14 @@ fn detect_mul_add_fusions(
-     block: &BasicBlock,
-     use_counts: &[u32],
-     fuse_float: bool,
-+    // Float Mul;Sub -> fmsub/fnmsub (levkropp e3b21b8f, audited port).
-+    // None disables Sub fusion entirely (backend lacks the instruction or
-+    // CCC_NO_FMSUB is set); Some(accs) enables it except for destinations
-+    // in `accs`: fusing `acc -= a*b` puts the multiply on the loop-carried
-+    // serial dependency chain (fmsub latency > fsub latency), a measured
-+    // 13% regression on nbody. Such Subs stay split so the multiply issues
-+    // independently of the chain.
-+    fuse_float_sub: Option<&FxHashSet<u32>>,
- ) -> FxHashMap<usize, usize> {
-     let mut fusion_map: FxHashMap<usize, usize> = FxHashMap::default();
-     // `a*b + c*d` must not fuse the first mul with an add whose other
-@@ -1920,6 +1928,27 @@ fn detect_mul_add_fusions(
-                     add_ty_r = Some(ty);
-                     break;
-                 }
-+                // Float-only Sub fusion: `a - b*c` -> fmsub, `b*c - a` ->
-+                // fnmsub (both single-rounding, matching GCC -ffp-contract=
-+                // fast). Integer mul-temp fusion stays Add-only, and Subs
-+                // whose dest is a loop-carried accumulator stay split (see
-+                // fuse_float_sub above).
-+                Instruction::BinOp {
-+                    dest: sub_dest,
-+                    op: IrBinOp::Sub,
-+                    lhs,
-+                    rhs,
-+                    ty,
-+                    ..
-+                } if mul_ty.is_float()
-+                    && fuse_float_sub.is_some_and(|accs| !accs.contains(&sub_dest.0)) =>
-+                {
-+                    add_idx = Some(scan);
-+                    add_lhs_r = Some(lhs);
-+                    add_rhs_r = Some(rhs);
-+                    add_ty_r = Some(ty);
-+                    break;
-+                }
-                 _ => break,
-             }
-         }
-@@ -2665,6 +2694,56 @@ fn generate_function(
-     let value_use_counts = count_value_uses(func);
-     cg.state().value_use_counts = value_use_counts.clone();
- 
-+    // Loop-carried accumulator destinations for the fmsub gate (levkropp
-+    // e3b21b8f, audited). Fusing `acc -= a*b` into fmsub puts the multiply
-+    // on the accumulator's serial dependency chain (fmsub latency > fsub),
-+    // measured 13% regression on nbody. Recognized accumulators: memory-
-+    // promoted loop F64 phis, surviving Phi dests, multi-Copy dests (the
-+    // phi-web shape after phi elimination), and — transitively — values
-+    // COPIED INTO any accumulator (the backedge source sits on the same
-+    // serial chain). The reverse closure is a fixpoint over Copy edges;
-+    // it terminates because each round strictly grows a set bounded by
-+    // the number of distinct value ids in the function.
-+    let accumulator_dests: FxHashSet<u32> = {
-+        let mut accs: FxHashSet<u32> = func.loop_promoted_f64_values.iter().map(|v| v.0).collect();
-+        let mut copy_edges: Vec<(u32, u32)> = Vec::new(); // (dest, src)
-+        let mut copy_def_count: FxHashMap<u32, u32> = FxHashMap::default();
-+        for b in &func.blocks {
-+            for inst in &b.instructions {
-+                match inst {
-+                    Instruction::Phi { dest, .. } => {
-+                        accs.insert(dest.0);
-+                    }
-+                    Instruction::Copy { dest, src } => {
-+                        if let Operand::Value(sv) = src {
-+                            copy_edges.push((dest.0, sv.0));
-+                        }
-+                        let c = copy_def_count.entry(dest.0).or_insert(0);
-+                        *c += 1;
-+                        if *c == 2 {
-+                            accs.insert(dest.0);
-+                        }
-+                    }
-+                    _ => {}
-+                }
-+            }
-+        }
-+        // Reverse closure over the (small) copy-edge list instead of
-+        // re-walking every instruction per round: O(rounds * edges).
-+        loop {
-+            let mut grew = false;
-+            for &(d, src) in &copy_edges {
-+                if accs.contains(&d) && accs.insert(src) {
-+                    grew = true;
-+                }
-+            }
-+            if !grew {
-+                break;
-+            }
-+        }
-+        accs
-+    };
-+
-     let stab = analyze_base_stability(func);
-     let gep_fold_map = build_gep_fold_map(func, &value_use_counts, &stab);
-     let indexed_gep_map = if cg.supports_indexed_addr() {
-@@ -2820,8 +2899,16 @@ fn generate_function(
-             cg.supports_fused_fp_cmp_branch(),
-             cg.supports_fused_bit_test_branch(),
-         );
--        let mul_add_fusions =
--            detect_mul_add_fusions(block, &value_use_counts, cg.supports_fused_float_mul_add());
-+        let mul_add_fusions = detect_mul_add_fusions(
-+            block,
-+            &value_use_counts,
-+            cg.supports_fused_float_mul_add(),
-+            if cg.supports_fused_float_mul_sub() && !env_flag_set("CCC_NO_FMSUB") {
-+                Some(&accumulator_dests)
-+            } else {
-+                None
-+            },
++        let mut i32_to_i8 = Vec::new();
++        lower_cast(
++            &Value(2),
++            &Operand::Value(Value(1)),
++            IrType::I32,
++            IrType::I8,
++            &assignments,
++            &mut i32_to_i8,
 +        );
-         let cmp_select_fusions =
-             if cg.supports_fused_cmp_select() && !env_flag_set("CCC_NO_FUSED_CSEL") {
-                 detect_cmp_select_fusion(block, &value_use_counts)
-@@ -3041,16 +3128,32 @@ fn generate_function(
-                     if cg.get_phys_reg_for_value(dest.0).is_none() || ty.is_float() {
-                         if let Some(Instruction::BinOp {
-                             dest: add_dest,
-+                            op: partner_op,
-                             lhs: add_lhs,
-                             rhs: add_rhs,
-                             ty: add_ty,
--                            ..
-                         }) = block.instructions.get(add_i)
-                         {
-                             let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == dest.0);
-                             let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
-                             cg.flush_machinst();
--                            cg.emit_fused_mul_add(dest, lhs, rhs, acc_op, add_dest, *add_ty);
-+                            match partner_op {
-+                                IrBinOp::Add => {
-+                                    cg.emit_fused_mul_add(
-+                                        dest, lhs, rhs, acc_op, add_dest, *add_ty,
-+                                    );
-+                                }
-+                                IrBinOp::Sub => {
-+                                    // Detector only records float Subs when the
-+                                    // backend advertised supports_fused_float_mul_sub.
-+                                    // mul_is_lhs selects fnmsub (product - acc)
-+                                    // vs fmsub (acc - product).
-+                                    cg.emit_fused_mul_sub(
-+                                        dest, lhs, rhs, acc_op, add_dest, *add_ty, mul_is_lhs,
-+                                    );
-+                                }
-+                                _ => unreachable!("mul fusion partner must be Add or Sub"),
-+                            }
-                             fused_add_skip.insert(add_i);
-                             cg.state().current_program_point += 1;
-                             continue;
-diff --git a/src/backend/i686/codegen/emit.rs b/src/backend/i686/codegen/emit.rs
-index 16f54be0..7db722d8 100644
---- a/src/backend/i686/codegen/emit.rs
-+++ b/src/backend/i686/codegen/emit.rs
-@@ -1884,11 +1884,7 @@ impl ArchCodegen for I686Codegen {
-     fn callee_pops_bytes_for_sret(&self, is_sret: bool) -> usize {
-         // Under -mregparm>=1 the sret pointer is passed in %eax, not pushed,
-         // so the callee's plain `ret` pops nothing (mirrors emit_epilogue).
--        if is_sret && self.regparm == 0 {
--            4
--        } else {
--            0
--        }
-+        if is_sret && self.regparm == 0 { 4 } else { 0 }
-     }
- 
-     // ---- Control flow ----
-@@ -1940,6 +1936,20 @@ impl ArchCodegen for I686Codegen {
-                 self.emit_branch_to_block(false_block);
-                 return;
-             }
-+            // Register-homed condition: test it in place. The accumulator
-+            // relay (`movl %reg,%eax; testl %eax,%eax`) added a copy on
-+            // every register-allocated loop condition (find_c byte-load
-+            // shape: the load coalesced into %ebp but the branch still
-+            // bounced through %eax). testl is read-only, so no cache
-+            // invalidation is needed and %eax keeps whatever it held.
-+            if let Some(&phys) = self.reg_assignments.get(&v.0) {
-+                let reg = phys_reg_name(phys);
-+                emit!(self.state, "    testl %{}, %{}", reg, reg);
-+                let true_label = true_block.as_label();
-+                emit!(self.state, "    jne {}", true_label);
-+                self.emit_branch_to_block(false_block);
-+                return;
-+            }
-         }
-         self.operand_to_eax(cond);
-         let true_label = true_block.as_label();
-@@ -2582,7 +2592,7 @@ impl I686Codegen {
-         s.emit("    shrl %eax");
-         s.emit("    shrl %cl, %eax"); // q = qs >> (1+i)
-         s.emit("    movl %eax, %edi"); // edi = q
--                                       // Verify: compute a - q*b, adjust if negative
-+        // Verify: compute a - q*b, adjust if negative
-         s.emit("    mull 20(%esp)"); // edx:eax = q * B_lo
-         s.emit("    movl 12(%esp), %ebx");
-         s.emit("    movl 16(%esp), %ecx"); // ecx:ebx = a
-@@ -2709,7 +2719,7 @@ impl I686Codegen {
-         s.emit("    xorl %ecx, %edi"); // edi = sign of result (bit 31)
-         s.emit("    movl 16(%esp), %eax"); // A_lo
-         s.emit("    movl 24(%esp), %ebx"); // B_lo
--                                           // Negate A if negative
-+        // Negate A if negative
-         s.emit("    testl %edx, %edx");
-         s.emit("    jns .Ldiv_a_pos");
-         s.emit("    negl %eax");
-@@ -2762,7 +2772,7 @@ impl I686Codegen {
-         s.emit("    movl %edx, %edi"); // save A_hi sign (remainder sign = dividend sign)
-         s.emit("    movl 16(%esp), %eax"); // A_lo
-         s.emit("    movl 24(%esp), %ebx"); // B_lo
--                                           // Negate A if negative
-+        // Negate A if negative
-         s.emit("    testl %edx, %edx");
-         s.emit("    jns .Lmod_a_pos");
-         s.emit("    negl %eax");
-diff --git a/src/backend/traits.rs b/src/backend/traits.rs
-index 807bfaf4..e8ebd74a 100644
---- a/src/backend/traits.rs
-+++ b/src/backend/traits.rs
-@@ -63,7 +63,7 @@ macro_rules! delegate_to_impl {
-     };
- }
- 
--use super::cast::{classify_float_binop, FloatOp};
-+use super::cast::{FloatOp, classify_float_binop};
- use super::common::PtrDirective;
- use super::generation::is_i128_type;
- use super::regalloc::PhysReg;
-@@ -602,6 +602,36 @@ pub trait ArchCodegen {
-         false
-     }
- 
-+    /// Whether the target has a single-instruction fused multiply-subtract
-+    /// (AArch64 fmsub/fnmsub, x86 FMA3 vfmsub231/vfnmadd231). Gates the
-+    /// detector's float Sub fusion; the same fp-contract contract as
-+    /// supports_fused_float_mul_add applies (single rounding is observable).
-+    fn supports_fused_float_mul_sub(&self) -> bool {
-+        false
++        assert!(matches!(
++            i32_to_i8.as_slice(),
++            [MachInst::Movsx {
++                from_size: OpSize::S8,
++                to_size: OpSize::S32,
++                ..
++            }]
++        ));
++
++        let mut u64_to_u32 = Vec::new();
++        lower_cast(
++            &Value(2),
++            &Operand::Value(Value(1)),
++            IrType::U64,
++            IrType::U32,
++            &assignments,
++            &mut u64_to_u32,
++        );
++        // movl-via-Movzx: always emitted (a plain Mov would be elided as a
++        // self-move on a die-at-birth shared home and skip the extension).
++        assert!(matches!(
++            u64_to_u32.as_slice(),
++            [MachInst::Movzx {
++                from_size: OpSize::S32,
++                to_size: OpSize::S32,
++                ..
++            }]
++        ));
++
++        let mut const_to_u8 = Vec::new();
++        lower_cast(
++            &Value(2),
++            &Operand::Const(IrConst::I64(0x1000)),
++            IrType::I64,
++            IrType::U8,
++            &assignments,
++            &mut const_to_u8,
++        );
++        // movl $imm zero-extends; movzx has no immediate form.
++        assert!(matches!(
++            const_to_u8.as_slice(),
++            [MachInst::Mov {
++                size: OpSize::S32,
++                ..
++            }]
++        ));
 +    }
 +
-+    /// Emit a fused multiply-subtract.
-+    /// `mul_is_lhs == false`: sub_dest = acc - (mul_lhs * mul_rhs)  [fmsub]
-+    /// `mul_is_lhs == true` : sub_dest = (mul_lhs * mul_rhs) - acc  [fnmsub]
-+    ///
-+    /// Only called when supports_fused_float_mul_sub() returned true and the
-+    /// type is F32/F64; there is deliberately NO default mul+sub fallback —
-+    /// a fallback emitting the mul via emit_int_binop would be wrong for
-+    /// floats, and a silent two-instruction split would hide a backend
-+    /// forgetting to implement the hook it advertised.
-+    fn emit_fused_mul_sub(
-+        &mut self,
-+        _mul_dest: &Value,
-+        _mul_lhs: &Operand,
-+        _mul_rhs: &Operand,
-+        _acc: &Operand,
-+        _sub_dest: &Value,
-+        _ty: IrType,
-+        _mul_is_lhs: bool,
-+    ) {
-+        unreachable!("emit_fused_mul_sub called on a backend that does not support it");
-+    }
-+
-     /// Whether the target can encode `other & ~value` directly.
-     fn supports_and_not(&self) -> bool {
-         false
-diff --git a/src/backend/x86/codegen/calls.rs b/src/backend/x86/codegen/calls.rs
-index f5f52b97..2ca1f4f0 100644
---- a/src/backend/x86/codegen/calls.rs
-+++ b/src/backend/x86/codegen/calls.rs
-@@ -1,7 +1,7 @@
- //! X86Codegen: function call operations.
- 
--use super::emit::{X86Codegen, X86_ARG_REGS};
--use crate::backend::call_abi::{compute_stack_push_bytes, CallAbiConfig, CallArgClass};
-+use super::emit::{X86_ARG_REGS, X86Codegen};
-+use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_push_bytes};
- use crate::backend::generation::is_i128_type;
- use crate::common::types::IrType;
- use crate::ir::reexports::{IrConst, Operand, Value};
-@@ -386,6 +386,18 @@ impl X86Codegen {
-         if hazard_area > 0 {
-             self.state
-                 .emit_fmt(format_args!("    subq ${}, %rsp", hazard_area));
-+            // The pre-spill area moves rsp: every rsp-relative slot read
-+            // emitted during the staging loop below (emit_fp_operand_to_xmm,
-+            // operand_to_rax, ... all go through slot_ref) must see the
-+            // enlarged frame, or they read hazard_area bytes BELOW their
-+            // slot. Under rsp addressing this returned stale/garbage args:
-+            // printf("%f %f %f %f", s1, s2, t1, t2) printed t1's value as
-+            // arg1 and stack garbage for args 2-3. rbp-addressed frames are
-+            // unaffected (slot_ref ignores rsp there), which is why the
-+            // session-25 hazard tests missed it.
-+            if self.state.out.use_rsp_addressing {
-+                self.state.out.rsp_frame_size += hazard_area as i64;
-+            }
-             for (k, (arg_i, phys, is_fp)) in hazards.iter().enumerate() {
-                 let off = (k * 8) as i64;
-                 hazard_slot.insert(*arg_i, off);
-@@ -735,6 +747,9 @@ impl X86Codegen {
-         if hazard_area > 0 {
-             self.state
-                 .emit_fmt(format_args!("    addq ${}, %rsp", hazard_area));
-+            if self.state.out.use_rsp_addressing {
-+                self.state.out.rsp_frame_size -= hazard_area as i64;
-+            }
-         }
-         // Restore the original RSP frame size.
-         if total_sp_adjust != 0 && self.state.out.use_rsp_addressing {
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 082069b3..e2d4c0b8 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -2374,7 +2374,10 @@ impl X86Codegen {
-                 .out
-                 .emit_instr_reg_rbp("    movq", "rdx", slot.0 + 8);
-         } else if std::env::var("CCC_TRACE_I128").is_ok() {
--            eprintln!("[I128] store_rax_rdx_to: value {} has NO slot — pair left in rax:rdx (may be clobbered)", dest.0);
-+            eprintln!(
-+                "[I128] store_rax_rdx_to: value {} has NO slot — pair left in rax:rdx (may be clobbered)",
-+                dest.0
-+            );
-         }
-         // rax holds only the low 64 bits of an i128, not a valid scalar IR value.
-         self.state.reg_cache.invalidate_all();
-@@ -2473,7 +2476,7 @@ impl X86Codegen {
-     pub(super) fn emit_x86_atomic_op_loop(&mut self, ty: IrType, op: &str) {
-         // Save val to rdi (using rdi instead of r8 to free r8 for register allocation)
-         self.state.emit("    movq %rax, %rdi"); // rdi = val
--                                                // Load old value
-+        // Load old value
-         let load_instr = Self::mov_load_for_type(ty);
-         let load_dest = Self::load_dest_reg(ty);
-         self.state
-@@ -3427,6 +3430,27 @@ impl ArchCodegen for X86Codegen {
-         self.fp_contract_fast
-     }
- 
-+    fn supports_fused_float_mul_sub(&self) -> bool {
-+        // vfmsub231/vfnmadd231 need the same contraction contract as
-+        // vfmadd231. Baseline codegen already emits VEX FMA3 unconditionally
-+        // for fused mul-add, so no separate ISA gate is needed here.
-+        self.fp_contract_fast
-+    }
-+
-+    fn emit_fused_mul_sub(
-+        &mut self,
-+        _mul_dest: &Value,
-+        mul_lhs: &Operand,
-+        mul_rhs: &Operand,
-+        acc: &Operand,
-+        sub_dest: &Value,
-+        ty: IrType,
-+        mul_is_lhs: bool,
-+    ) {
-+        debug_assert!(matches!(ty, IrType::F32 | IrType::F64));
-+        self.emit_scalar_fms231(mul_lhs, mul_rhs, acc, sub_dest, ty, mul_is_lhs);
-+    }
-+
-     fn supports_and_not(&self) -> bool {
-         self.bmi1_enabled && std::env::var_os("CCC_NO_ANDN_FUSION").is_none()
-     }
-diff --git a/src/backend/x86/codegen/float_ops.rs b/src/backend/x86/codegen/float_ops.rs
-index 3ba01909..7098387e 100644
---- a/src/backend/x86/codegen/float_ops.rs
-+++ b/src/backend/x86/codegen/float_ops.rs
-@@ -697,7 +697,41 @@ impl X86Codegen {
-         } else {
-             "vfmadd231ss"
-         };
-+        self.emit_scalar_fma231_with(fma, mul_lhs, mul_rhs, acc, add_dest, ty);
-+    }
-+
-+    /// Fused multiply-subtract via FMA3 (levkropp e3b21b8f, audited port).
-+    /// FMA3 231-form semantics: dest = (src2 * src1) OP dest, dest preloaded
-+    /// with `acc`:
-+    ///   mul_is_lhs == true  (product - acc): vfmsub231  = z*y - x
-+    ///   mul_is_lhs == false (acc - product): vfnmadd231 = -(z*y) + x
-+    pub(super) fn emit_scalar_fms231(
-+        &mut self,
-+        mul_lhs: &Operand,
-+        mul_rhs: &Operand,
-+        acc: &Operand,
-+        sub_dest: &Value,
-+        ty: IrType,
-+        mul_is_lhs: bool,
-+    ) {
-+        let fma = match (mul_is_lhs, matches!(ty, IrType::F64)) {
-+            (true, true) => "vfmsub231sd",
-+            (true, false) => "vfmsub231ss",
-+            (false, true) => "vfnmadd231sd",
-+            (false, false) => "vfnmadd231ss",
-+        };
-+        self.emit_scalar_fma231_with(fma, mul_lhs, mul_rhs, acc, sub_dest, ty);
-+    }
- 
-+    fn emit_scalar_fma231_with(
-+        &mut self,
-+        fma: &str,
-+        mul_lhs: &Operand,
-+        mul_rhs: &Operand,
-+        acc: &Operand,
-+        add_dest: &Value,
-+        ty: IrType,
-+    ) {
-         // Destructive-FMA coalescing: when linear scan assigned the result to
-         // the accumulator's existing XMM home, compute there directly instead
-         // of acc->xmm0, lhs->xmm1, FMA, xmm0->dest. This is the dominant shape
-@@ -773,13 +807,30 @@ impl X86Codegen {
-                     let label = self.state.get_fp_const_label(bits);
-                     self.state
-                         .emit_fmt(format_args!("    {} {}(%rip), %xmm1, %xmm0", fma, label));
-+                } else {
-+                    // +0.0 multiplier: the FMA must still execute. Skipping
-+                    // it silently returned `acc` unchanged, which is wrong
-+                    // for x*0.0 with x = +/-Inf or NaN (product is NaN, so
-+                    // acc+NaN = NaN) and for the -0.0 sum rules
-+                    // (-0.0 + 0.0 = +0.0, not -0.0). Materialise +0.0 in
-+                    // xmm2 (VEX xor keeps the unified AVX domain) and fuse.
-+                    self.state.emit("    vxorpd %xmm2, %xmm2, %xmm2");
-+                    self.state
-+                        .emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", fma));
-                 }
-             }
-             Operand::Const(IrConst::F32(v)) => {
-                 let bits = v.to_bits() as u64;
--                let label = self.state.get_fp_const_label(bits);
--                self.state
--                    .emit_fmt(format_args!("    {} {}(%rip), %xmm1, %xmm0", fma, label));
-+                if bits != 0 {
-+                    let label = self.state.get_fp_const_label(bits);
-+                    self.state
-+                        .emit_fmt(format_args!("    {} {}(%rip), %xmm1, %xmm0", fma, label));
-+                } else {
-+                    // Same +0.0 rule as the F64 arm above.
-+                    self.state.emit("    vxorps %xmm2, %xmm2, %xmm2");
-+                    self.state
-+                        .emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", fma));
-+                }
-             }
-             _ => {
-                 self.load_fp_to_reg(mul_rhs, ty, "xmm2");
-diff --git a/tests/regression/call_hazard_prespill_rsp_offsets.c b/tests/regression/call_hazard_prespill_rsp_offsets.c
+     #[test]
+     fn compare_with_immediate_lhs_materializes_destination_operand() {
+         let mut assignments = FxHashMap::default();
+diff --git a/tests/regression/session46_dist_code_index.c b/tests/regression/session46_dist_code_index.c
 new file mode 100644
-index 00000000..1458be31
+index 0000000..4feeb07
 --- /dev/null
-+++ b/tests/regression/call_hazard_prespill_rsp_offsets.c
-@@ -0,0 +1,17 @@
-+// Regression: the call staging-hazard pre-spill area (session 25) moves rsp
-+// but did not bump rsp_frame_size, so rsp-relative slot reads emitted while
-+// staging the remaining arguments read hazard_area bytes below their slot.
-+// Four FP args where one is freshly computed (hazard) and three come from
-+// slots reproduces it: args 1-3 of printf were stale/garbage.
-+int printf(const char *, ...);
-+double s1(double a, double b, double c) { return c - a * b; }
-+double s2(double a, double b, double c) { return a * b - c; }
-+float t1(float a, float b, float c) { return c - a * b; }
-+float t2(float a, float b, float c) { return a * b - c; }
++++ b/tests/regression/session46_dist_code_index.c
+@@ -0,0 +1,92 @@
++/* Session-46 reproducer: zlib-ng trees_emit.h zng_emit_dist partial-register
++ * codegen bug. `code` is uint8_t, assigned from a 32-bit computation, then
++ * used as an index into a const int[] table (scale-4 SIB). The copy into
++ * code's register home must be zero-extended; a byte move leaves the upper
++ * 56 bits stale and the folded index reads garbage (OOB). */
++#include <stdint.h>
++#include <stdio.h>
++
++static const int extra_lbits[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
++                                    2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
++static const int extra_dbits[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6,
++                                    6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
++static const int base_length[29] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20,
++                                    24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160,
++                                    192, 224, 0};
++static const int base_dist[30] = {0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96,
++                                  128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072,
++                                  4096, 6144, 8192, 12288, 16384, 24576};
++static uint8_t dist_code[512];
++static uint8_t length_code[256];
++
++static uint32_t d_code(uint32_t dist) {
++    return dist < 256 ? dist_code[dist] : dist_code[256 + (dist >> 7)];
++}
++
++__attribute__((noinline)) uint32_t
++emit_dist(uint32_t lc, uint32_t dist, uint64_t match_bits,
++          unsigned match_bits_len) {
++    uint8_t code;
++    uint32_t extra;
++
++    code = length_code[lc & 255];
++    extra = extra_lbits[code];
++    if (extra != 0) {
++        lc -= (uint32_t)base_length[code];
++        match_bits |= ((uint64_t)lc << match_bits_len);
++        match_bits_len += extra;
++    }
++
++    dist--;
++    code = d_code(dist);
++    extra = (uint32_t)extra_dbits[code];
++    if (extra != 0) {
++        dist -= (uint32_t)base_dist[code];
++        match_bits |= ((uint64_t)dist << match_bits_len);
++        match_bits_len += extra;
++    }
++    return match_bits_len;
++}
++
++static uint32_t ref_emit(uint32_t lc, uint32_t dist, uint64_t match_bits,
++                         unsigned match_bits_len) {
++    uint32_t code, extra;
++    code = length_code[lc & 255];
++    extra = extra_lbits[code];
++    if (extra != 0) {
++        lc -= (uint32_t)base_length[code];
++        match_bits |= ((uint64_t)lc << match_bits_len);
++        match_bits_len += extra;
++    }
++    dist--;
++    code = d_code(dist);
++    extra = (uint32_t)extra_dbits[code];
++    if (extra != 0) {
++        dist -= (uint32_t)base_dist[code];
++        match_bits |= ((uint64_t)dist << match_bits_len);
++        match_bits_len += extra;
++    }
++    return match_bits_len;
++}
++
 +int main(void) {
-+    volatile double a = 3, b = 4, c = 20;
-+    volatile float x = 3, y = 4, z = 20;
-+    printf("%.1f %.1f %.1f %.1f\n", s1(a, b, c), s2(a, b, c),
-+           (double)t1(x, y, z), (double)t2(x, y, z));
++    for (int i = 0; i < 256; i++)
++        length_code[i] = (uint8_t)(i % 29);
++    for (int i = 0; i < 512; i++)
++        dist_code[i] = (uint8_t)(i % 30);
++    uint32_t seed = 12345;
++    for (uint32_t d = 1; d < 32768; d = d * 3 + 1) {
++        for (uint32_t l = 3; l < 258; l = l * 5 + 1) {
++            uint64_t bits = seed;
++            uint32_t got = emit_dist(l, d, bits, 0);
++            uint32_t ref = ref_emit(l, d, bits, 0);
++            if (got != ref) {
++                printf("FAIL l=%u d=%u got=%u ref=%u\n", l, d, got, ref);
++                return 1;
++            }
++            seed = seed * 1103515245u + 12345u;
++        }
++    }
++    printf("OK dist-code index\n");
 +    return 0;
 +}
-diff --git a/tests/regression/fma_zero_multiplier_semantics.c b/tests/regression/fma_zero_multiplier_semantics.c
+diff --git a/tests/regression/session46_dist_code_index.flags b/tests/regression/session46_dist_code_index.flags
 new file mode 100644
-index 00000000..73478d8d
+index 0000000..5e2403b
 --- /dev/null
-+++ b/tests/regression/fma_zero_multiplier_semantics.c
-@@ -0,0 +1,15 @@
-+// Regression: the scalar FMA emitter must not skip the multiply when the
-+// constant multiplier is +0.0. `acc + x*0.0` is NOT `acc`: for x = +/-Inf
-+// or NaN the product is NaN (acc+NaN = NaN), and -0.0 + 0.0 = +0.0 (not
-+// -0.0). The skipped-FMA path returned `acc` unchanged for both.
-+int printf(const char *, ...);
-+double f(double a, double x) { return a + x * 0.0; }
-+float g(float a, float x) { return a + x * 0.0f; }
-+int main(void) {
-+    volatile double ninf = -1.0 / 0.0;
-+    volatile float pinf = 1.0f / 0.0f;
-+    // f(-0.0, 1.0): -0.0 + 0.0 = +0.0 (prints "0", not "-0")
-+    // f(2.0, -Inf): 2.0 + NaN = NaN
-+    printf("%g %g %g\n", f(-0.0, 1.0), f(2.0, ninf), (double)g(3.0f, pinf));
-+    return 0;
-+}
-diff --git a/tests/regression/fmsub_fnmsub_contract.c b/tests/regression/fmsub_fnmsub_contract.c
-new file mode 100644
-index 00000000..dcc15032
---- /dev/null
-+++ b/tests/regression/fmsub_fnmsub_contract.c
-@@ -0,0 +1,13 @@
-+// fmsub/fnmsub fusion (levkropp e3b21b8f, audited port): under
-+// -ffp-contract=fast, `c - a*b` -> fmsub and `a*b - c` -> fnmsub on
-+// AArch64 (vfnmadd231/vfmsub231 on x86). Values are exact in binary64,
-+// so contracted and uncontracted results are bit-identical here — the
-+// test passes at any contract setting and validates operand order.
-+int printf(const char *, ...);
-+double s1(double a, double b, double c) { return c - a * b; }
-+double s2(double a, double b, double c) { return a * b - c; }
-+int main(void) {
-+    volatile double a = 3, b = 4, c = 20;
-+    printf("%.1f %.1f\n", s1(a, b, c), s2(a, b, c));
-+    return 0;
-+}
-diff --git a/tests/regression/fmsub_fnmsub_contract.flags b/tests/regression/fmsub_fnmsub_contract.flags
-new file mode 100644
-index 00000000..9d1c3e38
---- /dev/null
-+++ b/tests/regression/fmsub_fnmsub_contract.flags
++++ b/tests/regression/session46_dist_code_index.flags
 @@ -0,0 +1 @@
-+-ffp-contract=fast
--- 
-2.47.3
-
++-O2 -march=x86-64-v3
+diff --git a/tests/regression/session46_narrow_cast_torture.c b/tests/regression/session46_narrow_cast_torture.c
+new file mode 100644
+index 0000000..49aa407
+--- /dev/null
++++ b/tests/regression/session46_narrow_cast_torture.c
+@@ -0,0 +1,84 @@
++/* Session-46 narrow-cast torture: every narrowing/same-size cast must leave
++ * the destination register defined at FULL width, because x86 code may read
++ * it at a wider width later (folded SIB indices, movq copies, 64-bit
++ * consumers). Exercises U32/U64 -> U8/U16/I8/I16 through: table indexing
++ * (scale 1/2/4), shifts, mul, phi joins, selects, and call boundaries. */
++#include <stdint.h>
++#include <stdio.h>
++
++static const int32_t tbl4[32] = {
++    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
++    -16, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1};
++static int16_t tbl2[64];
++static int8_t tbl1[64];
++
++__attribute__((noinline)) uint32_t idx_u8(uint32_t x) {
++    uint8_t c = (uint8_t)x;
++    return (uint32_t)tbl4[c];
++}
++__attribute__((noinline)) uint32_t idx_i8(int32_t x) {
++    int8_t c = (int8_t)x;
++    return (uint32_t)tbl4[c & 31];
++}
++__attribute__((noinline)) uint32_t idx_u16(uint32_t x) {
++    uint16_t c = (uint16_t)x;
++    return (uint32_t)tbl2[c & 63];
++}
++__attribute__((noinline)) uint32_t idx_i16(int32_t x) {
++    int16_t c = (int16_t)x;
++    return (uint32_t)tbl4[c & 31];
++}
++__attribute__((noinline)) uint32_t shl_u8(uint32_t x) {
++    uint8_t c = (uint8_t)x;
++    return (uint32_t)c << 24;
++}
++__attribute__((noinline)) uint32_t mul_u8(uint32_t x) {
++    uint8_t c = (uint8_t)x;
++    return (uint32_t)c * 977u;
++}
++__attribute__((noinline)) uint32_t sel_u8(uint32_t x, uint32_t y) {
++    uint8_t c = (uint8_t)(x > y ? x : y);
++    return (uint32_t)tbl4[c & 31];
++}
++__attribute__((noinline)) int32_t narrow_i8_call(int32_t x) {
++    int8_t c = (int8_t)x;
++    return (int32_t)c * 3; /* sign semantics across widen */
++}
++__attribute__((noinline)) uint32_t chain(uint32_t x) {
++    uint8_t a = (uint8_t)x;        /* U32->U8 */
++    uint16_t b = (uint16_t)a;      /* U8->U16 */
++    uint32_t d = (uint32_t)b;      /* U16->U32 */
++    return d * 13u + (uint32_t)tbl4[a & 31];
++}
++
++int main(void) {
++    for (int i = 0; i < 64; i++) {
++        tbl2[i] = (int16_t)(i * 7 - 100);
++        tbl1[i] = (int8_t)(i - 32);
++    }
++    uint32_t seed = 1;
++    int bad = 0;
++    for (uint32_t i = 0; i < 200000; i++) {
++        uint32_t x = seed;
++        seed = seed * 1103515245u + 12345u;
++        uint32_t y = seed;
++        seed = seed * 1103515245u + 12345u;
++        int32_t sx = (int32_t)(x ^ 0x80000000u);
++        uint8_t c8 = (uint8_t)x;
++        uint16_t c16 = (uint16_t)x;
++        int8_t s8 = (int8_t)sx;
++        int16_t s16 = (int16_t)sx;
++        if (idx_u8(x) != (uint32_t)tbl4[c8]) { printf("FAIL idx_u8 %u\n", x); bad = 1; break; }
++        if (idx_i8(sx) != (uint32_t)tbl4[s8 & 31]) { printf("FAIL idx_i8 %d\n", sx); bad = 1; break; }
++        if (idx_u16(x) != (uint32_t)tbl2[c16 & 63]) { printf("FAIL idx_u16 %u\n", x); bad = 1; break; }
++        if (idx_i16(sx) != (uint32_t)tbl4[s16 & 31]) { printf("FAIL idx_i16 %d\n", sx); bad = 1; break; }
++        if (shl_u8(x) != (uint32_t)c8 << 24) { printf("FAIL shl_u8 %u\n", x); bad = 1; break; }
++        if (mul_u8(x) != (uint32_t)c8 * 977u) { printf("FAIL mul_u8 %u\n", x); bad = 1; break; }
++        if (sel_u8(x, y) != (uint32_t)tbl4[((uint8_t)(x > y ? x : y)) & 31]) { printf("FAIL sel_u8 %u %u\n", x, y); bad = 1; break; }
++        if (narrow_i8_call(sx) != (int32_t)s8 * 3) { printf("FAIL narrow_i8_call %d\n", sx); bad = 1; break; }
++        if (chain(x) != c8 * 13u + (uint32_t)tbl4[c8 & 31]) { printf("FAIL chain %u\n", x); bad = 1; break; }
++    }
++    if (!bad)
++        printf("OK narrow-cast torture\n");
++    return bad;
++}
+diff --git a/tests/regression/session46_narrow_cast_torture.flags b/tests/regression/session46_narrow_cast_torture.flags
+new file mode 100644
+index 0000000..5e2403b
+--- /dev/null
++++ b/tests/regression/session46_narrow_cast_torture.flags
+@@ -0,0 +1 @@
++-O2 -march=x86-64-v3
