@@ -1,965 +1,2234 @@
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index e2d4c0b..02632ff 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -1394,11 +1394,25 @@ impl X86Codegen {
-                     // p->aSortFlags stored as NULL → SIGSEGV in
-                     // sqlite3KeyInfoFromExprList).  Reaching here means a
-                     // producer/consumer handoff is broken; fail loudly.
-+                    //
-+                    // Include the tail of the asm emitted so far: the
-+                    // instruction context around the failure is exactly what a
-+                    // soundness hunt needs, and it is otherwise lost because
-+                    // the panic aborts before the .s file is written.
-+                    let tail: Vec<&str> = {
-+                        let lines: Vec<&str> = self.state.out.buf.lines().collect();
-+                        let n = lines.len();
-+                        lines[n.saturating_sub(30)..].to_vec()
-+                    };
-                     panic!(
-                         "x86 codegen: operand_to_rax: value {} in function '{}' \
-                          has no register home, no stack slot and no acc-cache \
--                         entry — refusing to fabricate a value",
--                        v.0, self.state.current_func_name
-+                         entry — refusing to fabricate a value\n\
-+                         --- last {} asm lines ---\n{}",
-+                        v.0,
-+                        self.state.current_func_name,
-+                        tail.len(),
-+                        tail.join("\n")
-                     );
+diff --git a/.gitignore b/.gitignore
+index 3d69dd0..68e53ee 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -62,3 +62,5 @@ agentB*.patch
+ agentB*.txt
+ /results/
+ /zlib-ng-validation/
++gzip-validation/
++zlib-ng-validation/
+diff --git a/docs/history/2026-08-22-session56-agent-audit-glibc-runtime.md b/docs/history/2026-08-22-session56-agent-audit-glibc-runtime.md
+new file mode 100644
+index 0000000..1e209e0
+--- /dev/null
++++ b/docs/history/2026-08-22-session56-agent-audit-glibc-runtime.md
+@@ -0,0 +1,95 @@
++# Session 56 — Agent B/C patch audit + glibc 2.44 deep dive (2026-08-22)
++
++## Executive summary
++
++Rebased on `95015a2` (all prior session work merged upstream as content-
++identical). Audited two competing patches, folded the keepers, rejected the
++regressions, and pushed glibc 2.44 from "libc.so links" to "glibc's own
++binaries (utmpdump, sprof) execute against the lccc-built libc.so + ld.so".
++
++**Gates:** 406/406 regression corpus · 1079/1079 unit tests · all previously
++failing glibc math TUs compile · sotruss-lib.so links · utmpdump//dev/null and
++sprof run (exit 0) under our ld.so.
++
++## Patch audit verdict: Agent C is the better patch
++
++### Agent C (`rebase-new-main`) — ACCEPTED with rework
++Surgical soundness fixes for the *silent-zero-fabrication* family (the same
++disease class as the session-26 operand_to_rax hard gate), with correct root
++causes and minimal blast radius:
++
++1. `operand_to_rcx` last-resort `xorl %ecx,%ecx` → route to `value_to_reg`
++   (torture 20000412-6.c: `&buf[k]`'s remat-GlobalAddr base became 0,
++   `buf+3` decoded as integer 6).
++2. `value_to_reg` None-arm → materialize rematerialisable GlobalAddr instead
++   of panicking (absolute-address loads, GEP bases, fused int-madd shapes).
++3. High-quality torture triage (T01–T08) with minimal repros.
++
++**Rework applied on top of C's version:**
++* TLS checked BEFORE `needs_got_for_addr` in the new
++  `emit_global_addr_into_reg` — C's order emitted a plain GOTPCREL load for
++  PIC external TLS symbols (latent wrong-address bug).
++* Reused the existing `get_defining_instruction` idiom instead of a second
++  hand-rolled function scan; sec-cache invalidated when %rcx is clobbered.
++
++### Agent B (`torture-test-suite`) — ONE keeper, rest rejected
++* **ACCEPTED:** bare `alloca` as a GNU-mode builtin (sema map, type_checker,
++  DynAlloca lowering). Auto-hardened by the existing `is_defined` user-
++  override guard; regression covers both the builtin and override paths.
++* **REJECTED — stale baseline (already in main, would double-apply):**
++  `&var` GEP+0 elision, simplify.rs Load/Store-through-GEP0 folds, the extra
++  `promote_allocas_with_params` call, both `encoder/core.rs` files
++  (byte-identical to main).
++* **REJECTED — previously-rejected perf knobs resubmitted without workload
++  evidence** (BACKLOG §4 explicitly lists them as lost experiments):
++  `MAX_SMALL_INLINE_BLOCKS` 3→12, removal of the -Os single-site 40-cap,
++  `split_call_spanning_ranges` on every function (`blocks.len() > 0`).
++  The claimed 1389/1514 torture rate is unattributable across these knobs.
++
++## New fixes beyond the audit
++
++4. **hidden_proto inlining** (`inline.rs`): callee map registers gnu89
++   extern-inline bodies under their `__asm__` label too; call-site accounting
++   sums both spellings. Unblocked libc.so (`__GI___argz_next`,
++   `__option_is_end/_short`).
++5. **XMM-homed integer sweep** (x86): integer cmp/ALU/BitTest/select paths no
++   longer request GPR sub-register names for values the RA parked in XMM
++   (bit-punned float words, GET_FLOAT_WORD). Fixed sites:
++   `emit_int_cmp_insn_typed`, alu dispatch + andn dest + mem-dest rhs +
++   int-madd dest + bit-test base, `emit_alu_reg_direct` rhs, fused bit-test
++   branch base/index, 4× cmp/select `dest_reg` in comparison.rs. Eight glibc
++   math TUs (s_tanf, e_logf, e_powf, s_nextupf, ...) ICEd on these.
++6. **Version-script exports for .symver symbols** (`emit_shared.rs`): the
++   `local: *` filter matched the composed "fdopen@@GLIBC_2.2.5" name against
++   the script's `fdopen` pattern — every explicitly-versioned export was
++   silently dropped (libc.so: 2328 → 3185 dynsyms after the fix; GNU ld
++   confirmed fdopen was truly absent).
++7. **versym order desync** (`emit_shared.rs`): the versym table was emitted
++   in pre-reorder symbol order; after the undef-first + .gnu.hash bucket
++   sort, version indices landed on the wrong symbols. Rebuilt from the final
++   dynsym order; single-`@` names now get the hidden (non-default) bit.
++
++## glibc 2.44 status after this session
++
++| Stage | Status |
++|---|---|
++| configure (`CC=lccc`, `LD=lccc-ld`) | ✅ |
++| full compile phase (every TU incl. malloc, elf, nptl, math) | ✅ |
++| ld.so (355 KB dynamic loader) | ✅ links, `-z defs` clean |
++| libc.so (2.97 MB) | ✅ links; 3185 versioned dynsyms |
++| rtld-libc.a / librtld.map machinery | ✅ |
++| sotruss-lib.so, libc_malloc_debug prerequisites | ✅ |
++| **glibc's own binaries run under our ld.so+libc.so** | ✅ utmpdump, sprof |
++| libm.so | ❌ `__builtin_fma{,f}` + `__builtin_ia32_cvtpd2ps` unlowered (ms178 patch's math-use-builtins-fma) |
++| ldconfig | ❌ `feof_unlocked` undefined (extern-inline/export gap) |
++| externally-compiled PIE vs lccc-glibc | ❌ startup SIGSEGV (crt/TLS init triage needed) |
++| `make check` | blocked on the three items above |
++
++## Next-session priorities (in order)
++
++1. Lower `__builtin_fma`/`__builtin_fmaf` to vfmadd (x86-64-v3 baseline) and
++   `__builtin_ia32_cvtpd2ps` → unblocks libm.so.
++2. `feof_unlocked` for ldconfig (likely same hidden_proto/export family).
++3. External-PIE startup crash triage under lccc-glibc (LD_DEBUG walk).
++4. `make check` harness (BACKLOG MS-11) once libm.so exists.
++5. IFUNC end-to-end (LK-19) → --enable-multi-arch parity with the PKGBUILD.
+diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
+index 2fbe185..1bde28c 100644
+--- a/engineering/agent/BACKLOG.md
++++ b/engineering/agent/BACKLOG.md
+@@ -374,3 +374,44 @@ engineering/evidence/workloads/
+ - ✅ **Session 43** — red-team of Agent D's vector-temp-promotion v2: adopted (movnt align-16 relaxation via `intrinsic_dest_required_alignment`, unified width-typed `pointer_vector_arg_width`, non-escaping-alloca alias refinement, load-load chaining, single-read-site gating) and fixed two miscompiles it re-introduced — (1) `invalidate_for_value_write` dropped the slot-vs-write check (reassignment `v=load(p); v=setzero(); use(v)` read stale `p`), now a `write_may_clobber` slot+source test; (2) `VecStoreI64x2` writes memory through `args[1]` with `dest_ptr:None` but inherited the `produces_vector_value` register-result exemption. Also re-added the load-`dest` dead check and added the six 256-bit widening extensions (Pmovzx*/Pmovsx*256) to the forwardable/relaxable table. Measured: simd_movnt 422→390 insns / frame 440→392; simd_avx2_256 743→734 / 1016→824. See `docs/history/2026-08-21-session43-vector-promotion-v2-redteam.md`.
+ - ✅ **Session 42** — red-team audit of `vector_temp_promotion.rs` (late SIMD cleanup): adopted Agent D's alias-aware rewrite (escape-gated promotion window, object-root load fusion with write invalidation, fail-closed alignment whitelist, span-preserving removal) and fixed four audit-found defects — (1) slot-identity invalidation in `invalidate_for_pointer_write` (reassignment miscompile), (2) `Add`/`Sub` root propagation in `pointer_roots` (param-derived load sources were "may alias anything" and un-fused), (3) `LoadF64x4/2,LoadI32x8/4` downgrade whitelist narrowed to `index == 0` (offset arg), (4) fail-closed `dest_ptr: None` invalidation + load-`dest` dead check. A/B: 34-file corpus byte-identical; 1022 unit + 389 regression + 50 correctness + 60 fuzz green. See `docs/history/2026-08-21-session42-vector-temp-promotion-redteam.md`.
+ - ✅ **Session 41** — `redundant_ext.rs` SIB comma fix (zero-extend tracking re-enabled after indexed loads; also fixes a latent stale-byte-fact soundness bug on opaque SIB `movq` loads); 3-operand immediate `imul` for constant multiplies; BT bit-index consumed from its own register (no `%rcx` staging; `check_bit_test_canonical` oracle widened); 32-bit ALU writes tracked as upper-32-zero (enables `movq→movl` narrowing after `addl`/`subl` chains); `setup_oracles.sh` pins `MOLD_LTO=OFF` and records resolved oracle revisions. See `docs/history/2026-08-21-session41-x86-isel-peephole-sweep.md`.
++
++## 9. glibc 2.44 campaign (sessions 54-55, 2026-08-22) — status + new items
++
++**State:** configure passes with `CC=lccc` + `LD=lccc-ld` (`--disable-multi-arch
++--disable-cet`, official tarball + `ms178-glibc.patch`). Entire compile phase
++(every TU incl. malloc.c, all of elf/, nptl, libio, stdlib) compiles at
++`-O2 -march=x86-64-v3 -fPIC`. rtld-libc.a machinery (relocatable links, map
++scraping) works end-to-end. Fixes landed this campaign (do not re-fix):
++`-print-prog-name=`, post-phi `Copy(Const)` Value-position soundness,
++`__seg_fs`/`__seg_gs` declarator/typedef/local threading, `__CET__` GCC
++parity, gnu89 extern-inline must-inline class, `-r` whole-archive/`.os`/`.oS`
++inputs + `-Map` emission, sema vector_size typedef layout (shared cache
++poisoning), return-void GNU compat (sema + lowering), scoped shadowing of
++file-scope prototypes, SQLite-era four miscompiles (see session docs).
++
++| # | ID | Pri | Item | Evidence | Notes |
++|---|----|-----|------|----------|-------|
++| 171 | LK-19 | **P0** | IFUNC end-to-end: `__attribute__((ifunc))` in sema/lowering, `.type %gnu_indirect_function` data refs, `R_X86_64_IRELATIVE` for data words in exec/shared links, ld.so-side semantics | **M** glibc configure rejects `--enable-multi-arch` (probe: `.quad ifunc-sym` produced no IRELATIVE; attribute produced no IFUNC symbol) | Gate for the ms178 PKGBUILD's multi-arch build; string-fn dispatch performance depends on it |
++| 172 | LK-20 | P1 | `-r` output emits a spurious blank `UND NOTYPE LOCAL` symtab entry (index 3) | **M** `readelf -sW` on any `-r` product | Cosmetic-ish but GNU nm prints a bare `U `; fix in emit_rel symbol table build |
++| 173 | LK-21 | P1 | `-l` library resolution in the driver's `-r` path (`-lgcc` in glibc's reloc-link is currently dropped) | **C** common.rs `-r` branch collects only bare paths | Soft-float/i128 helpers would go missing; x86-64-v3 got lucky |
++| 174 | LK-22 | P2 | `-Map` for exec/shared links reaching the mapfile.rs writer from the -r path spellings | **C** | mapfile.rs exists; -r path writes a minimal member list only |
++| 175 | FE-23 | P1 | Address-space qualifiers on function PARAMETERS (`void f(u64 __seg_fs *p)`) and multi-level positions (`T * __seg_fs *`) | **C** apply_declaration_address_space handles decl-level only | glibc THREAD_* macros mostly cast, so not blocking |
++| 176 | FE-24 | P2 | `#error` message must be emitted verbatim (lccc macro-expands the token list: "96 must be multiple of 64" instead of "REGISTER_SAVE_AREA must be multiple of VEC_SIZE") | **M** dl-trampoline.h diagnostics | Diagnostics-quality only |
++| 177 | MS-10 | P1 | `CCC_VALIDATE_SSA` in CI for the regression corpus (watermark + duplicate-def, conventional-SSA aware post phi-elim) | **C** validator landed in passes/mod.rs + 3 backend hooks | Cheap: gate behind env in run_regression.py |
++| 178 | OP-35 | P2 | Post-phi cleanup Case-2 forwarding for Const sources into Value positions could MATERIALIZE the const into a fresh Copy placed at first use instead of refusing (keeps the copy-elimination win for `%fs:16`-style TLS bases) | **C** copy_prop.rs one_round_post_phi filter | Perf polish over the soundness fix |
++| 179 | MS-11 | P0 | glibc `make check` triage harness: run subdir test suites under the lccc-built libc with `test-wrapper`, classify {miscompile, unsupported-feature, environment} | **C** this file, session 55 | Next session's main task |
++
++## 10. Session 56 addenda (agent-audit + glibc runtime)
++
++| # | ID | Pri | Item | Evidence | Notes |
++|---|----|-----|------|----------|-------|
++| 180 | IS-29 | **P0** | Lower `__builtin_fma`/`__builtin_fmaf` (vfmadd at v3) and `__builtin_ia32_cvtpd2ps`; currently emitted as external calls | **M** libm.so link fails (ms178 patch math-use-builtins-fma.h) | Gate for libm.so + make check |
++| 181 | LK-23 | P1 | ldconfig `feof_unlocked` undefined | **M** glibc elf/others | same hidden_proto/export family; check libc_nonshared/static path |
++| 182 | LK-24 | **P0** | Externally-compiled PIE segfaults at startup against lccc-glibc (glibc's OWN utmpdump/sprof run fine) | **M** /tmp/hg2 SIGSEGV | crt/TLS-init triage with LD_DEBUG under our ld.so |
++| 183 | MS-12 | P1 | Audit remaining ~40 `phys_reg_name_32`/`typed_phys_reg_name` sites for XMM-homed operands (8 fixed on evidence this session); consider a debug_assert wrapper | **C** grep audit | loud unreachable!, not silent — fix on evidence |
++| 184 | LK-25 | P2 | -r output: spurious blank UND local symtab entry; host libc.so.6/libm NEEDED leak into our libc.so via -lgcc_s | **M** readelf | cosmetic + hygiene |
++
++Agent-patch policy record: Agent C's remat-globaladdr fixes accepted (reworked:
++TLS-before-GOT order, get_defining_instruction reuse); Agent B's bare-alloca
++accepted; Agent B's MAX_SMALL_INLINE_BLOCKS 12 / -Os cap removal / split-call
++`>0` REJECTED AGAIN — do not resubmit without per-workload A/B evidence.
+diff --git a/scripts/codegen_oracle.py b/scripts/codegen_oracle.py
+old mode 100755
+new mode 100644
+diff --git a/src/backend/common.rs b/src/backend/common.rs
+index e609d64..cbceb3c 100644
+--- a/src/backend/common.rs
++++ b/src/backend/common.rs
+@@ -252,20 +252,73 @@ pub fn link_with_args(
+                 for f in object_files {
+                     inputs.push((f.to_string(), false));
                  }
-             }
-diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
-index 6b80e08..3a4c016 100644
---- a/src/backend/x86/codegen/memory.rs
-+++ b/src/backend/x86/codegen/memory.rs
-@@ -1845,7 +1845,18 @@ impl X86Codegen {
-         shift: u8,
-         ty: IrType,
-     ) -> bool {
--        if self.state.needs_got_for_addr(sym) {
-+        // `sym` may carry a composed constant displacement ("gh+2"). The GOT
-+        // verdict must be computed on the base symbol, exactly like
-+        // `rip_rel_blocked` does on the deciding side (`can_indexed_addr_fold`).
-+        // Passing the composed string made `needs_got_for_addr` miss
-+        // `local_symbols` under -fPIC, so the emitter refused a fold the
-+        // allocator had already committed to: the skipped GEP was then
-+        // rematerialised at the access site, clobbering %rax while it held the
-+        // acc-resident store value (speedtest1 HashFinal ICE).
-+        // C symbol names cannot contain '+'; '-' only occurs in the map's
-+        // displacement suffix.
-+        let base_sym = sym.split(['+', '-']).next().unwrap_or(sym);
-+        if self.state.needs_got_for_addr(base_sym) {
-             return false;
-         }
-         let Some(&x) = self.reg_assignments.get(&index.0) else {
-@@ -1878,7 +1889,11 @@ impl X86Codegen {
-         shift: u8,
-         ty: IrType,
-     ) -> bool {
--        if self.state.needs_got_for_addr(sym) {
-+        // Same basename rule as emit_load_indexed_sym_impl (see comment there):
-+        // the GOT check must match the deciding side or the fold is refused
-+        // after the allocator committed to it.
-+        let base_sym = sym.split(['+', '-']).next().unwrap_or(sym);
-+        if self.state.needs_got_for_addr(base_sym) {
-             return false;
-         }
-         let Some(&x) = self.reg_assignments.get(&index.0) else {
-diff --git a/src/frontend/parser/declarations.rs b/src/frontend/parser/declarations.rs
-index 07075c0..434584c 100644
---- a/src/frontend/parser/declarations.rs
-+++ b/src/frontend/parser/declarations.rs
-@@ -330,18 +330,54 @@ impl Parser {
-                     _ => {}
-                 }
-             }
--            // Apply pre-Function derivations
--            for d in &derived[..fpos] {
--                match d {
-+            // Apply pre-Function derivations.
-+            //
-+            // A (Pointer, FunctionPointer) pair — or a standalone FunctionPointer —
-+            // in the prefix is the "returns a function pointer" core produced by
-+            // `combine_declarator_parts` for declarators like
-+            // `int (*f(int))(const void*, int)`. It must become a
-+            // TypeSpecifier::FunctionPointer wrapping the return type built so
-+            // far (TypeSpecifier::FunctionPointer already denotes
-+            // Pointer(Function(...))). Silently skipping it (the old `_ => {}`)
-+            // truncated such return types to `int *`.
-+            let prefix = &derived[..fpos];
-+            let mut i = 0;
-+            while i < prefix.len() {
-+                match &prefix[i] {
-                     DerivedDeclarator::Pointer => {
--                        return_type =
--                            TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
-+                        if let Some(DerivedDeclarator::FunctionPointer(params, variadic)) =
-+                            prefix.get(i + 1)
++                // Track --whole-archive / --no-whole-archive state in
++                // command-line order (both bare and -Wl, spellings). glibc
++                // builds libc_pic.os with
++                //   `$(CC) -r -Wl,--whole-archive libc_pic.a -o libc_pic.os`
++                // — with the flag ignored, the archive was loaded
++                // *selectively* against an empty undefined-symbol set, so
++                // nothing was pulled in and objcopy failed with "input file
++                // has no sections".
++                let mut whole_archive = false;
+                 for a in user_args {
+-                    if !a.starts_with('-')
+-                        && std::path::Path::new(a).exists()
+-                        && (a.ends_with(".o") || a.ends_with(".a"))
+-                    {
+-                        inputs.push((a.clone(), false));
++                    match a.as_str() {
++                        "--whole-archive" | "-Wl,--whole-archive" => whole_archive = true,
++                        "--no-whole-archive" | "-Wl,--no-whole-archive" => whole_archive = false,
++                        _ if !a.starts_with('-')
++                            && std::path::Path::new(a).exists()
++                            // glibc object suffixes: .o (static), .os (PIC),
++                            // .oS (static-PIC for libc_nonshared.a). The
++                            // librtld.map link passes dl-allobjs.os — with
++                            // only .o/.a accepted it was silently dropped and
++                            // the selective libc_pic.a search resolved
++                            // nothing.
++                            && (a.ends_with(".o")
++                                || a.ends_with(".os")
++                                || a.ends_with(".oS")
++                                || a.ends_with(".a")) =>
 +                        {
-+                            return_type = TypeSpecifier::FunctionPointer(
-+                                Box::new(return_type),
-+                                params.clone(),
-+                                *variadic,
-+                            );
-+                            i += 2;
-+                        } else {
-+                            return_type = TypeSpecifier::Pointer(
-+                                Box::new(return_type),
-+                                AddressSpace::Default,
-+                            );
-+                            i += 1;
++                            inputs.push((a.clone(), whole_archive && a.ends_with(".a")));
++                        }
++                        _ => {}
+                     }
+                 }
+                 let mut objects = Vec::new();
+                 crate::backend::x86::linker::load_inputs_for_ld(&inputs, &mut objects)?;
+-                return crate::backend::x86::linker::emit_rel::link_relocatable(
+-                    &objects,
+-                    output_path,
+-                );
++                crate::backend::x86::linker::emit_rel::link_relocatable(&objects, output_path)?;
++                // `-Map FILE` (any spelling): glibc's elf/Makefile builds
++                // librtld.map with `$(reloc-link) ... -Wl,-Map,$@T` and then
++                // scrapes lines of the form `<path>/libc_pic.a(member.os)` to
++                // learn which archive members the rtld link pulled in. Emit
++                // one line per loaded object (archive members already carry
++                // their GNU `archive(member)` source name), matching the
++                // `^[0-9a-f ]*PATH(MEMBER) *.*$` sed pattern.
++                let mut map_path: Option<String> = None;
++                let mut it = user_args.iter().peekable();
++                while let Some(a) = it.next() {
++                    if let Some(v) = a.strip_prefix("-Wl,-Map,") {
++                        map_path = Some(v.to_string());
++                    } else if let Some(v) = a.strip_prefix("-Wl,-Map=") {
++                        map_path = Some(v.to_string());
++                    } else if let Some(v) = a.strip_prefix("-Map=") {
++                        map_path = Some(v.to_string());
++                    } else if a == "-Map" {
++                        if let Some(v) = it.peek() {
++                            map_path = Some((*v).clone());
 +                        }
 +                    }
-+                    DerivedDeclarator::FunctionPointer(params, variadic) => {
-+                        return_type = TypeSpecifier::FunctionPointer(
-+                            Box::new(return_type),
-+                            params.clone(),
-+                            *variadic,
-+                        );
-+                        i += 1;
-                     }
-                     DerivedDeclarator::Array(size_expr) => {
-                         return_type =
-                             TypeSpecifier::Array(Box::new(return_type), size_expr.clone());
-+                        i += 1;
++                }
++                if let Some(map_path) = map_path {
++                    let mut map = String::from("Archive member included in relocatable link\n\n");
++                    for obj in &objects {
++                        map.push_str(&obj.source_name);
++                        map.push('\n');
 +                    }
-+                    _ => {
-+                        i += 1;
-                     }
--                    _ => {}
++                    std::fs::write(&map_path, map).map_err(|e| {
++                        format!("cannot write link map '{}': {}", map_path, e)
++                    })?;
++                }
++                return Ok(());
+             }
+             return Err("Relocatable linking (-r) requires the gcc_linker feature. \
+                        Rebuild with: cargo build --features gcc_linker"
+diff --git a/src/backend/linker_common/dynamic.rs b/src/backend/linker_common/dynamic.rs
+index 190ce6d..62babec 100644
+--- a/src/backend/linker_common/dynamic.rs
++++ b/src/backend/linker_common/dynamic.rs
+@@ -201,7 +201,15 @@ pub fn load_shared_library_elf64_as_needed<G: GlobalSymbolOps>(
+     });
+ 
+     let dyn_syms = parse_shared_library_symbols(&data, path)?;
++    if std::env::var_os("CCC_DEBUG_LD_SYMS").is_some() {
++        eprintln!("[LD-SO] load path={} soname={} as_needed={} dynsyms={}",
++                  path, soname, as_needed, dyn_syms.len());
++    }
+     let lib_needed = match_shared_library_dynsyms(&dyn_syms, &soname, globals);
++    if std::env::var_os("CCC_DEBUG_LD_SYMS").is_some() {
++        eprintln!("[LD-SO]   -> lib_needed={} (fdopen defined? {:?})", lib_needed,
++                  globals.get("fdopen").map(|g| (g.is_defined(), g.is_dynamic())));
++    }
+ 
+     if (lib_needed || !as_needed) && !needed_sonames.contains(&soname) {
+         needed_sonames.push(soname);
+diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
+index 9f0ae75..a976f46 100644
+--- a/src/backend/x86/codegen/alu.rs
++++ b/src/backend/x86/codegen/alu.rs
+@@ -108,7 +108,10 @@ impl X86Codegen {
+             return;
+         }
+ 
+-        if let Some(reg) = self.dest_reg(dest) {
++        if let Some(reg) = self
++            .dest_reg(dest)
++            .filter(|r| !super::emit::is_xmm_reg(*r))
++        {
+             let name = if narrow {
+                 super::emit::phys_reg_name_32(reg)
+             } else {
+@@ -215,7 +218,15 @@ impl X86Codegen {
+         // not matter whether the base and index source registers alias.
+         match base {
+             Operand::Value(v) => {
+-                if let Some(&reg) = self.reg_assignments.get(&v.0) {
++                // An XMM-homed base (bit-punned float word) has no GPR
++                // sub-register names; route it through the accumulator arm
++                // below, whose operand_to_rax performs the xmm->GPR movq
++                // (glibc s_nextupf: BitTest on GET_FLOAT_WORD's value).
++                if let Some(&reg) = self
++                    .reg_assignments
++                    .get(&v.0)
++                    .filter(|r| !super::emit::is_xmm_reg(**r))
++                {
+                     let src64 = super::emit::phys_reg_name(reg);
+                     if src64 != dest64 {
+                         if use_32bit {
+@@ -319,8 +330,16 @@ impl X86Codegen {
+         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
+         let is_unsigned = ty.is_unsigned();
+ 
+-        // Register-direct path
+-        if let Some(dest_phys) = self.dest_reg(dest) {
++        // Register-direct path. An XMM-homed dest (integer value the RA
++        // parked in an XMM register: bit-punned float words) has no GPR
++        // sub-register names — emit_alu_reg_direct would hit
++        // phys_reg_name_32's unreachable!(). The accumulator path below
++        // handles XMM homes on both loads (operand_to_rax) and the final
++        // store (store_rax_to).
++        if let Some(dest_phys) = self
++            .dest_reg(dest)
++            .filter(|r| !super::emit::is_xmm_reg(*r))
++        {
+             let is_simple_alu = matches!(
+                 op,
+                 IrBinOp::Add
+@@ -427,7 +446,10 @@ impl X86Codegen {
+                         if dest_slot.0 == lhs_slot.0 {
+                             let sref = self.slot_ref(dest_slot.0);
+                             // Try register source: op %reg, mem
+-                            if let Some(rhs_phys) = self.operand_reg(rhs) {
++                            if let Some(rhs_phys) = self
++                                .operand_reg(rhs)
++                                .filter(|r| !super::emit::is_xmm_reg(*r))
++                            {
+                                 if use_32bit {
+                                     let rhs_32 = super::emit::phys_reg_name_32(rhs_phys);
+                                     self.state.emit_fmt(format_args!(
+@@ -766,7 +788,10 @@ impl X86Codegen {
+     /// Helper for fused mul-add: add %eax to the accumulator operand and store to dest.
+     fn emit_fused_add_acc(&mut self, acc: &Operand, add_dest: &Value, use_32bit: bool) {
+         // If add_dest is register-allocated, add %eax to it directly.
+-        if let Some(dest_phys) = self.dest_reg(add_dest) {
++        if let Some(dest_phys) = self
++            .dest_reg(add_dest)
++            .filter(|r| !super::emit::is_xmm_reg(*r))
++        {
+             // Ensure acc is in the dest register first
+             self.operand_to_callee_reg(acc, dest_phys);
+             if use_32bit {
+diff --git a/src/backend/x86/codegen/comparison.rs b/src/backend/x86/codegen/comparison.rs
+index 02bfaf0..abe0df3 100644
+--- a/src/backend/x86/codegen/comparison.rs
++++ b/src/backend/x86/codegen/comparison.rs
+@@ -165,7 +165,10 @@ impl X86Codegen {
+ 
+         // Register-direct: movzbl %al, %dest_reg_32 — skip %rax relay.
+         // Safe because %al is part of %rax, never overlaps callee-saved registers.
+-        if let Some(d_reg) = self.dest_reg(dest) {
++        if let Some(d_reg) = self
++            .dest_reg(dest)
++            .filter(|r| !super::emit::is_xmm_reg(*r))
++        {
+             if !is_xmm_reg(d_reg) {
+                 let d_name = phys_reg_name_32(d_reg);
+                 self.state
+@@ -262,7 +265,13 @@ impl X86Codegen {
+         // Stage the BASE for the r/m operand of BT.
+         let base_reg: String = match base {
+             Operand::Value(v) => {
+-                if let Some(&reg) = self.reg_assignments.get(&v.0) {
++                // XMM-homed base (bit-punned float word): no GPR names;
++                // stage through the accumulator, which handles xmm->GPR.
++                if let Some(&reg) = self
++                    .reg_assignments
++                    .get(&v.0)
++                    .filter(|r| !super::emit::is_xmm_reg(**r))
++                {
+                     if use_32bit {
+                         format!("%{}", super::emit::phys_reg_name_32(reg))
+                     } else {
+@@ -301,7 +310,11 @@ impl X86Codegen {
+             // The index register: prefer its home when it does not alias the
+             // staged base; otherwise stage through %rcx.
+             let idx_reg: String = match index {
+-                Operand::Value(v) => match self.reg_assignments.get(&v.0) {
++                Operand::Value(v) => match self
++                    .reg_assignments
++                    .get(&v.0)
++                    .filter(|r| !super::emit::is_xmm_reg(**r))
++                {
+                     Some(&reg) => {
+                         let name = if use_32bit {
+                             format!("%{}", super::emit::phys_reg_name_32(reg))
+@@ -686,7 +699,10 @@ impl X86Codegen {
+     ) {
+         // legacy-compat path (debugging): the legacy emission order.
+         if std::env::var("CCC_V9_SELECT").is_ok() {
+-            if let Some(d_reg) = self.dest_reg(dest) {
++            if let Some(d_reg) = self
++            .dest_reg(dest)
++            .filter(|r| !super::emit::is_xmm_reg(*r))
++        {
+                 if !is_xmm_reg(d_reg) {
+                     let d_name = phys_reg_name(d_reg);
+                     self.operand_to_rax(cond);
+@@ -730,7 +746,10 @@ impl X86Codegen {
+         // the chosen one needs to be loaded — no test/cmov/branch at all.
+         if let Operand::Const(c) = cond {
+             let chosen = if c.is_zero() { false_val } else { true_val };
+-            if let Some(d_reg) = self.dest_reg(dest) {
++            if let Some(d_reg) = self
++            .dest_reg(dest)
++            .filter(|r| !super::emit::is_xmm_reg(*r))
++        {
+                 if !is_xmm_reg(d_reg) {
+                     self.operand_to_callee_reg(chosen, d_reg);
+                     self.state.reg_cache.invalidate_acc();
+@@ -774,7 +793,10 @@ impl X86Codegen {
+         };
+ 
+         // Register-direct: when dest has a register, operate directly on it.
+-        if let Some(d_reg) = self.dest_reg(dest) {
++        if let Some(d_reg) = self
++            .dest_reg(dest)
++            .filter(|r| !super::emit::is_xmm_reg(*r))
++        {
+             if !is_xmm_reg(d_reg) {
+                 let d_name = phys_reg_name(d_reg);
+                 if tested_in_place {
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 02632ff..0aaceae 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -1013,8 +1013,15 @@ impl X86Codegen {
+     pub(super) fn emit_int_cmp_insn_typed(&mut self, lhs: &Operand, rhs: &Operand, ty: IrType) {
+         let (cmp_instr, test_instr, acc_reg) = cmp_width_info(ty);
+         let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
+-        let lhs_phys = self.operand_reg(lhs);
+-        let rhs_phys = self.operand_reg(rhs);
++        // An INTEGER compare of a value homed in an XMM register (bit-punned
++        // float words: GET_FLOAT_WORD in glibc's flt-32 kernels after the
++        // hidden_proto wrappers inline) has no typed GPR sub-register name —
++        // typed_phys_reg_name would hit unreachable!("invalid x86 register
++        // index"). Route XMM-homed operands through the accumulator
++        // fallbacks below, whose operand_to_rax already handles the
++        // xmm→GPR move.
++        let lhs_phys = self.operand_reg(lhs).filter(|r| !is_xmm_reg(*r));
++        let rhs_phys = self.operand_reg(rhs).filter(|r| !is_xmm_reg(*r));
+         // Prefer the immediate form whenever rhs is an encodable constant —
+         // BEFORE checking register pairs, so `mask == 0xFFFFFFFF` becomes
+         // `cmpl $-1, %eax` instead of movabs+cmpq.
+@@ -2049,7 +2056,14 @@ impl X86Codegen {
+                 {
+                     self.state.out.emit_instr_reg_reg("    movq", "rax", "rcx");
+                 } else {
+-                    self.state.emit("    xorl %ecx, %ecx");
++                    // value_to_reg rebuilds a rematerialisable GlobalAddr (a
++                    // value with deliberately no home) and otherwise fails
++                    // loudly. The old `xorl %ecx,%ecx` silently fabricated 0
++                    // for `&buf[k]` and corrupted the address base — the same
++                    // disease class as the operand_to_rax hard gate
++                    // (torture execute/20000412-6.c: `buf+3` decoded as `6`).
++                    // Credit: Agent C torture triage T01-family.
++                    self.value_to_reg(v, "rcx");
+                 }
+                 // Record what's now in %rcx
+                 self.state.reg_cache.set_sec(v.0, is_alloca);
+@@ -2218,10 +2232,33 @@ impl X86Codegen {
+                 Some(constant @ crate::ir::reexports::Operand::Const(_)) => {
+                     self.operand_to_reg(&constant, reg);
+                 }
+-                None => panic!(
+-                    "x86 codegen: value {} has no register, stack slot, or Copy definition",
+-                    val.0
+-                ),
++                None => {
++                    // A rematerialisable GlobalAddr deliberately has no home:
++                    // its address computation was omitted at the definition
++                    // and every consumer is expected to rebuild it. The
++                    // audited-Add interception in generation.rs is NOT the
++                    // only consumer shape — emit_gep bases, fused int-madd
++                    // operands and operand_to_rcx all reach this generic
++                    // loader (torture execute/20000412-6.c). Rebuild the
++                    // address here; anything else still fails loudly.
++                    // Credit: Agent C torture triage.
++                    let gaddr_name = self.get_defining_instruction(val.0).and_then(|inst| {
++                        if let crate::ir::reexports::Instruction::GlobalAddr { name, .. } = inst {
++                            Some(name.clone())
++                        } else {
++                            None
++                        }
++                    });
++                    if let Some(name) = gaddr_name {
++                        self.emit_global_addr_into_reg(&name, reg);
++                        return;
++                    }
++                    panic!(
++                        "x86 codegen: value {} has no register, stack slot, Copy, or \
++                         GlobalAddr definition",
++                        val.0
++                    );
++                }
+             }
+         }
+     }
+@@ -2741,7 +2778,11 @@ impl X86Codegen {
+         }
+ 
+         // Register-register form
+-        let rhs_phys = self.operand_reg(rhs);
++        // Integer ALU reg-direct requires GPR names; an XMM-homed operand
++        // (bit-punned float words after hidden_proto math wrappers inline)
++        // must take the accumulator fallback, which handles the xmm->GPR
++        // move (phys_reg_name_32(xmm) is unreachable!()).
++        let rhs_phys = self.operand_reg(rhs).filter(|r| !is_xmm_reg(*r));
+         let rhs_conflicts = rhs_phys.is_some_and(|r| r.0 == dest_phys.0);
+         let (rhs_reg_name, rhs_reg_name_32): (String, String) = if rhs_conflicts {
+             // rhs is in dest register — we need to save rhs to %rax before loading lhs.
+diff --git a/src/backend/x86/codegen/globals.rs b/src/backend/x86/codegen/globals.rs
+index 2de90ee..748b1ac 100644
+--- a/src/backend/x86/codegen/globals.rs
++++ b/src/backend/x86/codegen/globals.rs
+@@ -155,6 +155,57 @@ impl X86Codegen {
+         self.store_rax_to(dest);
+     }
+ 
++    /// Materialise a global symbol's runtime address directly into a named
++    /// 64-bit register, honouring GOT / TLS / absolute addressing exactly like
++    /// `emit_global_addr_impl` / `emit_tls_global_addr_impl`, but without
++    /// routing through a value's home.
++    ///
++    /// This is the safe reconstruction for a *rematerialisable* `GlobalAddr`
++    /// (a value whose address computation was deliberately omitted because it
++    /// has no stack/register home). Every generic value-load path that can
++    /// encounter such a value must rebuild it here instead of fabricating 0 —
++    /// a silent `xorl %ecx,%ecx` for a global address corrupted the base of
++    /// `&buf[k]` pointer arithmetic (torture execute/20000412-6.c: `buf+3`
++    /// decoded as `6`, not `&buf[3]`). Credit: Agent C torture triage.
++    ///
++    /// TLS model selection mirrors emit_tls_global_addr_impl: Local-Exec for
++    /// local symbols (even under -fPIC, like GCC), Initial-Exec via GOTTPOFF
++    /// only for external TLS symbols in PIC mode.
++    pub(super) fn emit_global_addr_into_reg(&mut self, name: &str, reg: &str) {
++        if self.state.tls_symbols.contains(name) {
++            if self.state.pic_mode && !self.state.local_symbols.contains(name) {
++                self.state
++                    .emit_fmt(format_args!("    movq {}@GOTTPOFF(%rip), %{}", name, reg));
++                self.state
++                    .emit_fmt(format_args!("    addq %fs:0, %{}", reg));
++            } else {
++                self.state.emit_fmt(format_args!("    movq %fs:0, %{}", reg));
++                self.state
++                    .emit_fmt(format_args!("    leaq {}@TPOFF(%{}), %{}", name, reg, reg));
++            }
++        } else if self.state.needs_got_for_addr(name) {
++            let n = self.got_name(name);
++            self.state
++                .emit_fmt(format_args!("    movq {}@GOTPCREL(%rip), %{}", n, reg));
++        } else if self.state.absolute_symbols.contains(name) {
++            self.state
++                .out
++                .emit_instr_sym_imm_reg("    movq", name, reg);
++        } else {
++            self.state
++                .out
++                .emit_instr_sym_base_reg("    leaq", name, "rip", reg);
++        }
++        // Conservative cache hygiene: this helper writes an arbitrary named
++        // register from a generic load path whose callers manage caches
++        // differently; drop whichever cached mapping the write could stale.
++        if reg == "rax" {
++            self.state.reg_cache.invalidate_acc();
++        } else if reg == "rcx" {
++            self.state.reg_cache.invalidate_sec();
++        }
++    }
++
+     pub(super) fn emit_global_addr_absolute_impl(&mut self, dest: &Value, name: &str) {
+         // Register-direct: emit directly to dest register.
+         if let Some(d_reg) = self.dest_reg(dest) {
+diff --git a/src/backend/x86/linker/emit_shared.rs b/src/backend/x86/linker/emit_shared.rs
+index ce4d0c8..748577e 100644
+--- a/src/backend/x86/linker/emit_shared.rs
++++ b/src/backend/x86/linker/emit_shared.rs
+@@ -213,7 +213,8 @@ pub(super) fn emit_shared_library(
+                             // exported), version-script-locals, or -Bsymbolic.
+                             let hidden = sym.visibility() != 0; // STV_HIDDEN/PROTECTED/INTERNAL
+                             let version_local = version_script.as_ref().is_some_and(|vs| {
+-                                vs.any_local_star() && !vs.matches_global(&sym.name)
++                                vs.any_local_star()
++                                    && !vs.matches_global(&sym_base(&sym.name))
+                             }) || excluded_syms.contains(sym.name.as_str());
+                             let is_func = (gsym.info & 0xf) == STT_FUNC
+                                 || sym.sym_type() == STT_FUNC
+@@ -396,7 +397,14 @@ pub(super) fn emit_shared_library(
+             // FFmpeg-style DSOs expose the intended ABI and produce versioned
+             // dynamic symbols for consumers like mpv.
+             if let Some(ref vs) = version_script {
+-                if vs.any_local_star() && !vs.matches_global(name) {
++                // .symver-derived globals are keyed "base@@VER"/"base@VER";
++                // the script's patterns name the BASE. Matching the composed
++                // string dropped every explicitly-versioned export: glibc's
++                // libc.so lost fdopen/fopen/... (defined as
++                // _IO_new_fdopen + `.symver fdopen@@GLIBC_2.2.5`) and
++                // sotruss-lib.so failed with `undefined reference to fdopen`
++                // even though the DSO was right there on the command line.
++                if vs.any_local_star() && !vs.matches_global(&sym_base(name)) {
+                     return false;
                  }
              }
-         } else {
-diff --git a/src/frontend/parser/declarators.rs b/src/frontend/parser/declarators.rs
-index 7a980f8..671c7b6 100644
---- a/src/frontend/parser/declarators.rs
-+++ b/src/frontend/parser/declarators.rs
-@@ -324,6 +324,69 @@ impl Parser {
-             return result;
+@@ -437,7 +445,7 @@ pub(super) fn emit_shared_library(
+     for name in &abs64_sym_names {
+         let is_version_local = version_script
+             .as_ref()
+-            .is_some_and(|vs| vs.any_local_star() && !vs.matches_global(name));
++            .is_some_and(|vs| vs.any_local_star() && !vs.matches_global(&sym_base(name)));
+         if !is_version_local && dyn_sym_seen.insert(name.clone()) {
+             dyn_sym_names.push(name.clone());
          }
- 
-+        // Function declarator returning a function pointer (C89 "obscure" form),
-+        // e.g. sqlite3 fts3_hash.c:
-+        //   static int (*ftsHashFunction(int keyClass))(const void*,int) { ... }
-+        // and the nested variant
-+        //   int (*(*f(int))(char))(long);
-+        //
-+        // Shape: the parenthesized inner declarator is itself a *function*
-+        // declarator (`*name(A)` → inner = [Pointer, Function(A), ...]) and the
-+        // outer suffix is the parameter list of the *returned* function pointer
-+        // (`(B)` → outer_suffixes = [Function(B)]).
-+        //
-+        // C reads this inside-out: `f` is a function taking A returning a
-+        // pointer to a function taking B returning the base type. In the
-+        // derived-list encoding consumed by `build_full_ctype_with_base` and
-+        // `build_return_type`, that is:
-+        //   outer_pointers ++ [Pointer, FunctionPointer(B)] ++ inner[1..]
-+        // i.e. the inner's leading syntax-marker `*` binds to the outer suffix
-+        // to form the returned-function-pointer core, and the rest of the inner
-+        // declarator (ending in Function(A) — the function's own parameters,
-+        // which funcdef detection expects at derived.last()) follows.
-+        //
-+        // For the nested variant, inner is already the combined
-+        // [Pointer, FunctionPointer(char), Function(int)] from the recursive
-+        // parse, and the same rewrite yields
-+        // [Pointer, FunctionPointer(long), Pointer, FunctionPointer(char), Function(int)].
-+        //
-+        // Restricted to shapes where the inner's leading `*` is the free syntax
-+        // marker for the outer suffix: the inner must end in Function (the
-+        // function's own parameter list) and no Pointer in the remainder may
-+        // bind directly to a Function (which would mean a
-+        // pointer-to-pointer-to-function return like `int (**f(int))(char)`;
-+        // those fall through to the general case rather than being silently
-+        // mis-encoded). This accepts arbitrary nesting depth, since each
-+        // recursive combine emits `[Pointer, FunctionPointer, ...]` chains in
-+        // which every Pointer is immediately consumed by a FunctionPointer.
-+        let inner_has_function = inner_derived
-+            .iter()
-+            .any(|d| matches!(d, DerivedDeclarator::Function(_, _)));
-+        let remainder_ptr_binds_function = inner_derived[1..].windows(2).any(|w| {
-+            matches!(w[0], DerivedDeclarator::Pointer)
-+                && matches!(w[1], DerivedDeclarator::Function(_, _))
-+        });
-+        if inner_has_function
-+            && outer_starts_with_function
-+            && outer_suffixes.len() == 1
-+            && matches!(inner_derived.first(), Some(DerivedDeclarator::Pointer))
-+            && matches!(
-+                inner_derived.last(),
-+                Some(DerivedDeclarator::Function(_, _))
-+            )
-+            && !remainder_ptr_binds_function
-+        {
-+            let mut result = outer_pointers;
-+            result.push(DerivedDeclarator::Pointer);
-+            if let Some(DerivedDeclarator::Function(params, variadic)) =
-+                outer_suffixes.into_iter().next()
-+            {
-+                result.push(DerivedDeclarator::FunctionPointer(params, variadic));
+@@ -619,11 +627,29 @@ pub(super) fn emit_shared_library(
+         // The base node (1) carries the SONAME.
+         let mut versym = Vec::with_capacity(dynsym_count as usize * 2);
+         versym.extend_from_slice(&0u16.to_le_bytes()); // dynsym[0]
+-        for (_, ver, _) in &sym_versions {
+-            let idx: u16 = match ver {
++        // Emit versym in dyn_sym_names' FINAL order. sym_versions was built
++        // before the undef-first reorder and the .gnu.hash bucket sort;
++        // iterating it here assigned version indices to the WRONG symbols
++        // once any reordering happened (glibc libc.so: every .symver export
++        // landed on versym 1 "*global*", so versioned references like
++        // fdopen@GLIBC_2.2.5 failed at load time). Re-derive each entry's
++        // version from its (still composed) name.
++        for name in &dyn_sym_names {
++            let (ver, hidden): (Option<&str>, bool) = if let Some(pos) = name.find("@@") {
++                (Some(&name[pos + 2..]), false)
++            } else if let Some(pos) = name.find('@') {
++                (Some(&name[pos + 1..]), true)
++            } else {
++                (None, false)
++            };
++            let mut idx: u16 = match ver {
+                 Some(v) => 2 + version_set.iter().position(|x| x == v).unwrap_or(0) as u16,
+                 None => 1,
+             };
++            // "name@VER" (single @): non-default version — hidden bit set.
++            if hidden {
++                idx |= 0x8000;
 +            }
-+            result.extend(inner_derived.into_iter().skip(1));
-+            return result;
-+        }
-+
-         // Handle nested function pointer variables like `int (*(*p)(int a, int b))(int c, int d)`.
-         // The inner declarator produces [Pointer, Pointer, FunctionPointer(...)], and the
-         // outer adds Function(...). We keep inner_derived intact and convert the outer
-diff --git a/src/passes/aggregate_copy_forward.rs b/src/passes/aggregate_copy_forward.rs
-index a448af8..483ee6c 100644
---- a/src/passes/aggregate_copy_forward.rs
-+++ b/src/passes/aggregate_copy_forward.rs
-@@ -261,6 +261,31 @@ struct CopyCandidate {
-     source_root: u32,
- }
- 
-+/// Instructions that can write memory the pass cannot attribute to a tracked
-+/// pointer path: calls (including libc `memset`/`memcpy` lowered as plain
-+/// `Call`s), inline asm, atomics, va-machinery, and impure intrinsics. A
-+/// snapshot window that spans one of these may only survive when the source
-+/// is a provably unclobberable local (non-escaping alloca).
-+fn is_opaque_memory_write(inst: &Instruction) -> bool {
-+    match inst {
-+        Instruction::Call { .. }
-+        | Instruction::CallIndirect { .. }
-+        | Instruction::InlineAsm { .. }
-+        | Instruction::AtomicRmw { .. }
-+        | Instruction::AtomicInc { .. }
-+        | Instruction::AtomicCmpxchg { .. }
-+        | Instruction::AtomicStore { .. }
-+        | Instruction::VaStart { .. }
-+        | Instruction::VaEnd { .. }
-+        | Instruction::VaCopy { .. }
-+        | Instruction::VaArg { .. }
-+        | Instruction::VaArgStruct { .. }
-+        | Instruction::StackRestore { .. } => true,
-+        Instruction::Intrinsic { op, .. } => !op.is_pure(),
-+        _ => false,
-+    }
-+}
-+
- /// Return the alloca root and GEP path for pointer values derived from allocas.
- fn pointer_paths(
-     func: &IrFunction,
-@@ -916,9 +941,71 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
-     // The source must also remain unchanged after the copy.  Otherwise replacing
-     // a temporary read with a source read changes snapshot semantics (TinyCC's
-     // `tmp = *vtop; *vtop = ...; use(tmp)` exposed this).
-+    //
-+    // Writes come in two shapes:
-+    //  * attributable — Store/Memcpy through a tracked pointer path; and
-+    //  * opaque — calls, inline asm, atomics, impure intrinsics.  libc
-+    //    `memset`/`memcpy` lower to plain `Call`s, so they land here.
-+    //
-+    // An opaque write can touch the source whenever the source's address has
-+    // escaped (passed to a call, stored as data, or used outside the tracked
-+    // load/store/GEP shapes).  SQLite memjrnlCreateFile miscompiled exactly
-+    // so: `copy = *p; memset(p, 0, sizeof *p); use copy.pVfs` — the memset
-+    // Call was invisible to the old Store/Memcpy-only scan, the copy was
-+    // elided, and the forwarded reads observed the zeroed struct (speedtest1
-+    // --testset json SIGSEGV via a NULL xOpen function pointer).
-+    let mut escaped_roots: FxHashSet<u32> = FxHashSet::default();
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            let mut used = Vec::with_capacity(16);
-+            inst.for_each_used_value(|v| used.push(v));
-+            for value in used {
-+                let Some((root, _)) = paths.get(&value) else {
-+                    continue;
-+                };
-+                let non_escaping_shape = match inst {
-+                    Instruction::GetElementPtr { base, .. } => base.0 == value,
-+                    Instruction::Load { ptr, .. } => ptr.0 == value,
-+                    Instruction::Store { ptr, val, .. } => {
-+                        // Address position is fine; storing the POINTER as a
-+                        // value escapes it.
-+                        ptr.0 == value && !matches!(val, Operand::Value(v) if v.0 == value)
-+                    }
-+                    Instruction::Memcpy { dest, src, .. } => {
-+                        dest.0 == value || src.0 == value
-+                    }
-+                    Instruction::Copy {
-+                        src: Operand::Value(v),
-+                        ..
-+                    } => v.0 == value,
-+                    Instruction::Phi { incoming, .. } => incoming
-+                        .iter()
-+                        .any(|(op, _)| matches!(op, Operand::Value(v) if v.0 == value)),
-+                    _ => false,
-+                };
-+                if !non_escaping_shape {
-+                    escaped_roots.insert(*root);
-+                }
-+            }
-+        }
-+    }
-     let mut invalid = FxHashSet::default();
-     for (bi, block) in func.blocks.iter().enumerate() {
-         for (ii, inst) in block.instructions.iter().enumerate() {
-+            if is_opaque_memory_write(inst) {
-+                for (&dest_root, candidate) in &candidates {
-+                    let after_copy = bi == candidate.block && ii > candidate.inst;
-+                    // A non-escaping alloca cannot be written by an opaque
-+                    // instruction; anything else must be assumed clobbered.
-+                    let source_provably_private = alloca_roots
-+                        .contains(&candidate.source_root)
-+                        && !escaped_roots.contains(&candidate.source_root);
-+                    if after_copy && !source_provably_private {
-+                        invalid.insert(dest_root);
-+                    }
-+                }
-+                continue;
-+            }
-             let written_root = match inst {
-                 Instruction::Store { ptr, .. } => paths.get(&ptr.0).map(|p| p.0),
-                 Instruction::Memcpy { dest, .. } => paths.get(&dest.0).map(|p| p.0),
-diff --git a/src/passes/aggregate_sroa.rs b/src/passes/aggregate_sroa.rs
-index d508436..f0ad94e 100644
---- a/src/passes/aggregate_sroa.rs
-+++ b/src/passes/aggregate_sroa.rs
-@@ -46,6 +46,29 @@ fn ty_size(ty: IrType) -> i64 {
+             versym.extend_from_slice(&idx.to_le_bytes());
+         }
+         let mut verdef = Vec::new();
+diff --git a/src/common/type_builder.rs b/src/common/type_builder.rs
+index da8241a..f65907a 100644
+--- a/src/common/type_builder.rs
++++ b/src/common/type_builder.rs
+@@ -381,3 +381,39 @@ pub fn build_full_ctype_with_base(
+         result
      }
  }
- 
-+/// Instructions that can write memory the pass cannot attribute to a tracked
-+/// pointer: calls (including libc `memset`/`memcpy` lowered as plain `Call`s),
-+/// inline asm, atomics, va-machinery, and impure intrinsics.
-+fn is_opaque_memory_write(inst: &Instruction) -> bool {
-+    match inst {
-+        Instruction::Call { .. }
-+        | Instruction::CallIndirect { .. }
-+        | Instruction::InlineAsm { .. }
-+        | Instruction::AtomicRmw { .. }
-+        | Instruction::AtomicInc { .. }
-+        | Instruction::AtomicCmpxchg { .. }
-+        | Instruction::AtomicStore { .. }
-+        | Instruction::VaStart { .. }
-+        | Instruction::VaEnd { .. }
-+        | Instruction::VaCopy { .. }
-+        | Instruction::VaArg { .. }
-+        | Instruction::VaArgStruct { .. }
-+        | Instruction::StackRestore { .. } => true,
-+        Instruction::Intrinsic { op, .. } => !op.is_pure(),
-+        _ => false,
++
++/// Plant a declaration-level address-space qualifier (`__seg_fs`/`__seg_gs`)
++/// on the pointer level it qualifies in C: the INNERMOST one.
++///
++/// GCC named address spaces qualify the *pointee* memory:
++///   `T __seg_fs *p`   — p (ordinary memory) points into %fs
++///   `T __seg_fs **pp` — pp and *pp are ordinary; **pp reads %fs
++///   `T __seg_fs *a[4]`— each element points into %fs
++/// In this IR, `CType::Pointer(pointee, AddressSpace)` carries "the space the
++/// pointer points into", so the qualifier belongs on the innermost Pointer
++/// (the one whose pointee is the qualified data), reached through Array
++/// elements and outer Pointer levels.
++///
++/// The parser records the qualifier on the whole `Declaration`
++/// (`parsing_address_space`), but `build_full_ctype*` used to hardcode
++/// `AddressSpace::Default` for every derived Pointer, so any *named* variable
++/// or typedef of a segment pointer silently lost its qualifier and its
++/// dereferences read absolute addresses (glibc TLS: `%fs:16`/`%fs:40`
++/// stack-guard loads compiled to NULL-page loads). Only direct
++/// `*(T __seg_fs *)N` casts survived, via TypeSpecifier::Pointer's own field.
++pub fn apply_declaration_address_space(ty: &mut CType, space: AddressSpace) {
++    if space == AddressSpace::Default {
++        return;
++    }
++    match ty {
++        CType::Pointer(inner, sp) => {
++            if matches!(inner.as_ref(), CType::Pointer(..)) {
++                apply_declaration_address_space(inner, space);
++            } else {
++                *sp = space;
++            }
++        }
++        CType::Array(elem, _) => apply_declaration_address_space(elem, space),
++        _ => {}
 +    }
 +}
-+
- fn const_i64(op: &Operand) -> Option<i64> {
-     match op {
-         Operand::Const(c) => match c {
-@@ -424,6 +447,15 @@ fn run_function(func: &mut IrFunction) -> usize {
-                         // The source must not be written between the copy and
-                         // the load (aliasing safety).
-                         let (sr, _so) = resolve(&s.gep, src);
-+                        // A non-escaping alloca cannot be written by a call or
-+                        // other opaque instruction; any other source (param,
-+                        // global, escaped alloca) must be assumed clobbered by
-+                        // one. libc memset/memcpy lower to plain Calls: SQLite
-+                        // memjrnlCreateFile's `copy = *p; memset(p,0,..)` was
-+                        // forwarded across the memset by the old Store/Memcpy-
-+                        // only scan (speedtest1 --testset json SIGSEGV).
-+                        let src_call_private = s.alloca_size.contains_key(&sr)
-+                            && !any_escape(&s.escapes, &s.gep, sr);
-                         let mut src_dirty = false;
-                         for k in (mi + 1)..ii {
-                             if let Some(inst_k) = block.instructions.get(k) {
-@@ -442,7 +474,12 @@ fn run_function(func: &mut IrFunction) -> usize {
-                                             break;
-                                         }
-                                     }
--                                    _ => {}
-+                                    other => {
-+                                        if !src_call_private && is_opaque_memory_write(other) {
-+                                            src_dirty = true;
-+                                            break;
-+                                        }
-+                                    }
-                                 }
-                             }
-                         }
-@@ -562,10 +599,10 @@ fn run_function(func: &mut IrFunction) -> usize {
-                                         break;
-                                     }
-                                 }
--                                // A call may write through either pointer.
--                                Some(Instruction::Call { .. })
--                                | Some(Instruction::CallIndirect { .. })
--                                | Some(Instruction::InlineAsm { .. }) => {
-+                                // Anything that can write memory opaquely may
-+                                // touch either pointer (calls, inline asm,
-+                                // atomics, impure intrinsics, va machinery).
-+                                Some(other) if is_opaque_memory_write(other) => {
-                                     dirty = true;
-                                     break;
-                                 }
-diff --git a/src/passes/licm.rs b/src/passes/licm.rs
-index 2c447bb..e32cb43 100644
---- a/src/passes/licm.rs
-+++ b/src/passes/licm.rs
-@@ -772,9 +772,11 @@ fn is_load_hoistable(
-     loop_defined: &FxHashSet<u32>,
-     invariant: &FxHashSet<u32>,
-     global_addr_values: &FxHashSet<u32>,
-+    root_global_addr_values: &FxHashSet<u32>,
-     value_to_base_global: &FxHashMap<u32, u32>,
-     alias_info: &LoopAliasInfo,
-     load_size: i64,
-+    preheader_is_dedicated: bool,
- ) -> bool {
-     let ptr_id = ptr.0;
- 
-@@ -811,7 +813,16 @@ fn is_load_hoistable(
-     // This is particularly important for inner rendering loops (e.g., DOOM's
-     // R_DrawColumn) where globals like dc_source and dc_colormap are read
-     // every iteration but never written.
-+    //
-+    // Speculation safety: only a load of the *root* symbol address is
-+    // unconditionally dereferenceable. A GEP-derived global pointer with a
-+    // loop-invariant but runtime-variable offset (g.s[x]) can fault when the
-+    // guard protecting the loop is false, so it needs a dedicated preheader
-+    // like any other derived pointer.
-     if global_addr_values.contains(&ptr_id) {
-+        if !preheader_is_dedicated && !root_global_addr_values.contains(&ptr_id) {
-+            return false;
-+        }
-         if loop_mem.has_calls {
-             return false;
-         }
-@@ -834,6 +845,15 @@ fn is_load_hoistable(
-     // memory write in the loop must be modeled, and each modeled store must be
-     // provably disjoint in this exact loop frame. An empty store set is safe
-     // when there are no calls/unmodeled writes.
-+    //
-+    // Unlike the alloca and direct-global classes above, a derived pointer
-+    // (call result, parameter, GEP chain) is not provably dereferenceable:
-+    // executing the load on a path that never enters the loop can fault.
-+    // Such loads may only move into a *dedicated* preheader, whose sole
-+    // successor is the loop header (see hoist_loop_invariants).
-+    if !preheader_is_dedicated {
-+        return false;
-+    }
-     if std::env::var_os("CCC_NO_LICM_ALIAS").is_some() || !alias_info.complete || loop_mem.has_calls
-     {
-         return false;
-@@ -864,6 +884,33 @@ fn hoist_loop_invariants(
-         None => return 0, // No suitable preheader found
-     };
- 
-+    // A *dedicated* preheader has the loop header as its ONLY successor
-+    // (unconditional branch). Hoisting a potentially-faulting load into a
-+    // NON-dedicated preheader executes it on paths that never enter the
-+    // loop — speculation across the very guard that makes the load legal.
-+    //
-+    // Miscompile this gate fixes (SQLite 3.53.4 jsonCacheSearch, inlined
-+    // into jsonParseFuncArg; speedtest1 --testset json SIGSEGV):
-+    //
-+    //   p = sqlite3_get_auxdata(ctx, JSON_CACHE_ID);
-+    //   if( p==0 ) return 0;
-+    //   for(i=0; i<p->nUsed; i++) ...
-+    //
-+    // The `if(p==0)` block is the unique loop predecessor, so it *is* the
-+    // preheader — but it branches both into the loop and to the early
-+    // return. Hoisting the `p->nUsed` load to its end dereferenced NULL
-+    // whenever the cache was empty.
-+    //
-+    // Loads that are provably dereferenceable regardless of the guard
-+    // (allocas and direct data-symbol globals) remain hoistable into
-+    // non-dedicated preheaders; only the derived-pointer path (call
-+    // results, params, GEP chains — anything that can fault) requires the
-+    // dedicated shape.
-+    let preheader_is_dedicated = match &func.blocks[preheader].terminator {
-+        Terminator::Branch(l) => *l == func.blocks[header].label,
-+        _ => false,
-+    };
-+
-     // Build the set of Value IDs defined inside the loop.
-     // InlineAsm outputs are included: after mem2reg promotion, InlineAsm output
-     // pointers become fresh SSA values that define new values, but
-@@ -1070,9 +1117,11 @@ fn hoist_loop_invariants(
-                             &loop_defined,
-                             &invariant,
-                             &global_addr_values,
-+                            &root_global_addr_values,
-                             &value_to_base_global,
-                             &alias_info,
-                             ty.size() as i64,
-+                            preheader_is_dedicated,
-                         )
-                 } else {
-                     false
-diff --git a/src/passes/univsr.rs b/src/passes/univsr.rs
-index 66e496f..9b5489d 100644
---- a/src/passes/univsr.rs
-+++ b/src/passes/univsr.rs
-@@ -219,11 +219,22 @@ fn extract_base_from_init(func: &IrFunction, init_op: &Operand) -> Option<(Value
-                     } = inst
-                     {
-                         if dest.0 == v.0 {
--                            let init_offset = match offset {
--                                Operand::Const(c) => c.to_i64().unwrap_or(0),
--                                _ => 0,
-+                            return match offset {
-+                                Operand::Const(c) => Some((*base, c.to_i64()?)),
-+                                // Variable displacement: peeling to the GEP's
-+                                // base would silently DROP the runtime offset.
-+                                // SQLite 3.53.4 pragmaVtabConnect miscompiled
-+                                // exactly so: the pointer IV init was
-+                                // GEP(pragCName, j0*8) with j0 loaded from
-+                                // pPragma->iPragCName, and the old `_ => 0`
-+                                // arm rewrote every walk to pragCName[i] —
-+                                // every pragma_* eponymous vtab got
-+                                // foreign_key_list's column names
-+                                // (speedtest1 --testset app: "no such column:
-+                                // name"). The init pointer VALUE is itself a
-+                                // legal SIB base: use it and keep disp 0.
-+                                _ => Some((*v, 0)),
-                             };
--                            return Some((*base, init_offset));
-                         }
-                     }
+diff --git a/src/driver/cli.rs b/src/driver/cli.rs
+index 1150b74..32e3cf0 100644
+--- a/src/driver/cli.rs
++++ b/src/driver/cli.rs
+@@ -449,6 +449,36 @@ impl Driver {
+                     println!(".");
+                     return Ok(true);
                  }
-diff --git a/tests/regression/agg_copy_fwd_call_clobbers_source.c b/tests/regression/agg_copy_fwd_call_clobbers_source.c
-new file mode 100644
-index 0000000..5b9841c
---- /dev/null
-+++ b/tests/regression/agg_copy_fwd_call_clobbers_source.c
-@@ -0,0 +1,71 @@
-+/* Aggregate snapshot copies must not be forwarded across opaque writes.
-+ *
-+ * SQLite 3.53.4 memjrnlCreateFile (inlined into memjrnlWrite):
-+ *
-+ *   MemJournal copy = *p;
-+ *   memset(p, 0, sizeof(MemJournal));
-+ *   rc = sqlite3OsOpen(copy.pVfs, copy.zJournal, pReal, copy.flags, 0);
-+ *
-+ * Both aggregate_copy_forward and aggregate_sroa (transform 1) forwarded the
-+ * `copy.*` reads back to `p`'s memory: their source-mutation window scans
-+ * only recognized Store/Memcpy instructions as writes, and libc memset is
-+ * lowered as a plain Call. The copy was then elided as dead, the reads
-+ * observed the zeroed struct, and speedtest1 --testset json crashed calling
-+ * a NULL xOpen function pointer.
-+ *
-+ * Fixed by treating calls, inline asm, atomics, va-machinery, and impure
-+ * intrinsics as opaque memory writes: a snapshot window spanning one may
-+ * only survive when the source is a provably non-escaping alloca.
-+ *
-+ * The struct layout mirrors MemJournal closely enough to keep the
-+ * function-pointer field at a nonzero offset.
-+ */
-+#include <stdio.h>
-+#include <string.h>
++                _ if arg.starts_with("-print-prog-name=")
++                    || arg.starts_with("--print-prog-name=") =>
++                {
++                    // GCC query returning the path of a helper program.
++                    // glibc's configure derives LD from `$CC -print-prog-name=ld`
++                    // and then requires `$LD --version` to advertise GNU ld;
++                    // without this answer LD ends up empty and configure aborts
++                    // with "These critical programs are missing: GNU ld".
++                    //
++                    // The linker programs resolve to the sibling lccc-ld binary
++                    // (which advertises "GNU ld (LCCC built-in)"). Everything
++                    // else follows GCC's not-found behaviour: print the plain
++                    // name unchanged.
++                    let name = arg.trim_start_matches('-');
++                    let name = name.strip_prefix("print-prog-name=").unwrap_or(name);
++                    match name {
++                        "ld" | "ld.bfd" | "collect2" => {
++                            let sibling = std::env::current_exe()
++                                .ok()
++                                .and_then(|p| p.parent().map(|d| d.join("lccc-ld")))
++                                .filter(|p| p.exists());
++                            match sibling {
++                                Some(p) => println!("{}", p.display()),
++                                None => println!("lccc-ld"),
++                            }
++                        }
++                        other => println!("{}", other),
++                    }
++                    return Ok(true);
++                }
+                 "-print-search-dirs" | "--print-search-dirs" => {
+                     println!("install: /usr/lib/gcc/{}/13/", target.triple());
+                     println!("programs: /usr/bin/");
+@@ -1353,10 +1383,22 @@ impl Driver {
+                     self.pic = false;
+                     self.pie = false;
+                 }
+-                "-fcf-protection=branch" | "-fcf-protection=full" => {
+-                    self.cf_protection_branch = true
++                "-fcf-protection=branch" => {
++                    self.cf_protection_branch = true;
++                    self.cf_protection_value = Some("1");
++                }
++                "-fcf-protection=full" | "-fcf-protection" => {
++                    self.cf_protection_branch = true;
++                    self.cf_protection_value = Some("3");
++                }
++                "-fcf-protection=return" => {
++                    self.cf_protection_branch = false;
++                    self.cf_protection_value = Some("2");
++                }
++                "-fcf-protection=none" => {
++                    self.cf_protection_branch = false;
++                    self.cf_protection_value = None;
+                 }
+-                "-fcf-protection=none" => self.cf_protection_branch = false,
+                 arg if arg.starts_with("-fpatchable-function-entry=") => {
+                     let val = &arg["-fpatchable-function-entry=".len()..];
+                     let parts: Vec<&str> = val.split(',').collect();
+diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
+index 47a0c72..8e759f6 100644
+--- a/src/driver/pipeline.rs
++++ b/src/driver/pipeline.rs
+@@ -126,6 +126,9 @@ pub struct Driver {
+     /// Whether to emit endbr64 at function entry points (-fcf-protection=branch).
+     /// Required by the Linux kernel for Intel CET/IBT (Indirect Branch Tracking).
+     pub(super) cf_protection_branch: bool,
++    /// GCC __CET__ macro value derived from -fcf-protection
++    /// (None = flag absent or =none; "1" branch, "2" return, "3" full).
++    pub(super) cf_protection_value: Option<&'static str>,
+     /// Whether SSE is disabled (-mno-sse). When true, the compiler must not emit
+     /// any SSE/SSE2/AVX instructions (movdqu, movss, movsd, etc.).
+     /// The Linux kernel uses -mno-sse to avoid FPU state in kernel code.
+@@ -388,6 +391,7 @@ impl Driver {
+             indirect_branch_thunk: false,
+             patchable_function_entry: None,
+             cf_protection_branch: false,
++            cf_protection_value: None,
+             no_sse: false,
+             skip_rax_setup: false,
+             no_x87: false,
+@@ -1044,6 +1048,8 @@ impl Driver {
+         // PIE and full PIC both define __PIC__; only PIE defines __PIE__.
+         // Kernel `-fno-pic` clears both before RIP_REL_REF inline asm expands.
+         preprocessor.set_pic(self.pic || self.pie || self.shared_lib);
++        // __CET__ mirrors -fcf-protection exactly (GCC never predefines it).
++        preprocessor.set_cet(self.cf_protection_value);
+         preprocessor.set_pie(self.pie && !self.pic && !self.shared_lib);
+         // Set SSE/SSE2/MMX predefined macros for x86 targets.
+         // GCC/Clang always define __SSE__, __SSE2__, __MMX__ for x86_64 (baseline ISA).
+@@ -1582,8 +1588,14 @@ impl Driver {
+         }
+ 
+         // Lower SSA phi nodes to copies before codegen
++        if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
++            crate::passes::validate_unique_defs(&module, "backend:pre-eliminate_phis");
++        }
+         let t7 = std::time::Instant::now();
+         eliminate_phis(&mut module);
++        if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
++            crate::passes::validate_unique_defs(&module, "backend:eliminate_phis");
++        }
+         if time_phases {
+             eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64());
+         }
+@@ -1801,6 +1813,9 @@ impl Driver {
+         {}
+ 
+         // Debug: dump IR labels before codegen
++        if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
++            crate::passes::validate_unique_defs(&module, "backend:pre-codegen");
++        }
+         if std::env::var("LCCC_DUMP_PRECG").is_ok() {
+             eprintln!("==== IR immediately before codegen ====");
+             eprintln!("{:#?}", module);
+diff --git a/src/frontend/parser/declarations.rs b/src/frontend/parser/declarations.rs
+index 434584c..4c53536 100644
+--- a/src/frontend/parser/declarations.rs
++++ b/src/frontend/parser/declarations.rs
+@@ -540,6 +540,10 @@ impl Parser {
+         mut ctx: DeclContext,
+     ) -> Option<ExternalDecl> {
+         let mut declarators = Vec::with_capacity(4);
++        // Same snapshot rationale as parse_local_declaration: initializer
++        // casts to segment-qualified pointers clear parsing_address_space
++        // before Declaration::new would read it.
++        let decl_addr_space = self.attrs.parsing_address_space;
+         let init = if self.consume_if(&TokenKind::Assign) {
+             Some(self.parse_initializer())
+         } else {
+@@ -697,7 +701,7 @@ impl Parser {
+             ctx.alignment,
+             ctx.alignas_type,
+             ctx.alignment_sizeof_type,
+-            self.attrs.parsing_address_space,
++            decl_addr_space,
+             self.attrs.parsing_vector_size.take(),
+             self.attrs.parsing_ext_vector_nelem.take(),
+             start,
+@@ -733,6 +737,15 @@ impl Parser {
+ 
+         self.consume_post_type_qualifiers();
+ 
++        // Snapshot the declaration's address space NOW: initializer parsing
++        // can contain casts to segment-qualified pointers, and the abstract-
++        // declarator path `mem::take`s parsing_address_space (types.rs), so
++        // reading the flag after the declarators+inits are parsed loses the
++        // qualifier. `unsigned long __seg_fs *p = (fsptr)40;` compiled its
++        // `*p` without the %fs prefix — an absolute-address load (glibc TLS
++        // stack-guard reads at %fs:16/%fs:40 became NULL-page dereferences).
++        let decl_addr_space = self.attrs.parsing_address_space;
 +
-+typedef struct VFS {
-+    int ver;
-+    int (*xOpen)(struct VFS *, const char *, void *, int, int *);
-+} VFS;
-+
-+typedef struct MJ {
-+    void *pMethod;
-+    long e1, e2, e3, e4;
-+    int nChunkSize;
-+    int nSpill;
-+    long pFirst;
-+    int flags;
-+    int pad;
-+    VFS *pVfs;
-+    const char *zJournal;
-+} MJ;
-+
-+static int opened;
-+
-+static int myOpen(VFS *v, const char *z, void *f, int fl, int *out) {
-+    (void)v;
-+    (void)f;
-+    (void)out;
-+    opened = 1;
-+    printf("open z=%s flags=%d\n", z, fl);
-+    return 0;
-+}
-+
-+static int create_file(MJ *p) {
-+    MJ copy = *p;
-+    memset(p, 0, sizeof(MJ));
-+    return copy.pVfs->xOpen(copy.pVfs, copy.zJournal, p, copy.flags & 0x1087f7f,
-+                            0);
-+}
-+
-+int main(void) {
-+    static VFS v = { 3, myOpen };
-+    MJ m;
-+    memset(&m, 0, sizeof m);
-+    m.pVfs = &v;
-+    m.zJournal = "jrnl";
-+    m.flags = 0x806;
-+    int rc = create_file(&m);
-+    printf("rc=%d opened=%d pVfs=%p\n", rc, opened, (void *)m.pVfs);
-+    return rc != 0 || !opened;
-+}
-diff --git a/tests/regression/agg_copy_fwd_call_clobbers_source.flags b/tests/regression/agg_copy_fwd_call_clobbers_source.flags
-new file mode 100644
-index 0000000..90e8e23
---- /dev/null
-+++ b/tests/regression/agg_copy_fwd_call_clobbers_source.flags
-@@ -0,0 +1 @@
-+-O2 -fPIC -march=x86-64-v3
-diff --git a/tests/regression/fnptr_return_declarator.c b/tests/regression/fnptr_return_declarator.c
-new file mode 100644
-index 0000000..babd25b
---- /dev/null
-+++ b/tests/regression/fnptr_return_declarator.c
-@@ -0,0 +1,80 @@
-+/* Function declarators returning function pointers (C89 "obscure" form).
-+ *
-+ * SQLite 3.53.4 amalgamation (fts3_hash.c) failed with:
-+ *   static int (*ftsHashFunction(int keyClass))(const void*,int){...}
-+ *   xHash = ftsHashFunction(pH->keyClass);
-+ *   incompatible pointer types (have 'int *' but expected
-+ *   'int (*)(void *, int)')
-+ *
-+ * Two defects combined:
-+ *  1. combine_declarator_parts() had no case for a parenthesized inner
-+ *     declarator that is itself a *function* declarator (inner ends with
-+ *     Function) plus an outer Function suffix, so the derived list came out
-+ *     as [Function(B), Pointer, Function(A)] instead of
-+ *     [Pointer, FunctionPointer(B), Function(A)].
-+ *  2. build_return_type() silently skipped FunctionPointer entries in the
-+ *     pre-Function prefix (`_ => {}`), truncating such return types to
-+ *     `int *`.
-+ *
-+ * Covers: plain form, address-of vs plain function returns, a second
-+ * signature via typedef, pointer-valued return type, and the nested
-+ * two-level form `int (*(*f(int))(...))(...)`.
-+ */
-+
-+static int hashA(const void *p, int n) { return n + (p != 0); }
-+static int hashB(const void *p, int n) { return n - (p != 0); }
-+
-+/* Plain form, both `&f` and `f` return styles. */
-+static int (*pick(int k))(const void *, int) {
-+    if (k == 1)
-+        return &hashA;
-+    else
-+        return hashB;
-+}
-+
-+/* Second signature, assigned into a typedef'd pointer. */
-+typedef int (*cmp_t)(const void *, int, const void *, int);
-+static int cmp3(const void *a, int x, const void *b, int y) {
-+    return x * y + (a == b);
-+}
-+static int (*pick2(int k))(const void *, int, const void *, int) {
-+    (void)k;
-+    return cmp3;
-+}
-+
-+/* Nested: function returning ptr-to-function returning ptr-to-function. */
-+static int addmul(const void *p, int n) {
-+    (void)p;
-+    return 3 * n;
-+}
-+static int (*inner_pick(const void *p, int n))(const void *, int) {
-+    (void)p;
-+    (void)n;
-+    return addmul;
-+}
-+static int (*(*outer_pick(int k))(const void *, int))(const void *, int) {
-+    (void)k;
-+    return inner_pick;
-+}
-+
-+/* Returned function pointer whose own return type is a pointer. */
-+static char *idstr(int n) {
-+    static char b[2] = "x";
-+    (void)n;
-+    return b;
-+}
-+static char *(*pickstr(void))(int) { return idstr; }
-+
-+int main(void) {
-+    int (*h)(const void *, int) = pick(1);
-+    int (*h2)(const void *, int) = pick(0);
-+    cmp_t c = pick2(0);
-+    int (*(*op)(const void *, int))(const void *, int) = outer_pick(5);
-+    int (*ip)(const void *, int) = op((void *)0, 2);
-+    char *(*ps)(int) = pickstr();
-+
-+    /* 5 + 5 + 13 + 21 + 1 = 45 */
-+    int r = h((void *)0, 5) + h2((void *)0, 5) + c((void *)0, 3, (void *)0, 4)
-+        + ip((void *)0, 7) + (ps(0)[0] == 'x');
-+    return r == 45 ? 0 : 1;
-+}
-diff --git a/tests/regression/licm_no_speculative_load_nondedicated_preheader.c b/tests/regression/licm_no_speculative_load_nondedicated_preheader.c
-new file mode 100644
-index 0000000..91ef9be
---- /dev/null
-+++ b/tests/regression/licm_no_speculative_load_nondedicated_preheader.c
-@@ -0,0 +1,95 @@
-+/* LICM must not speculate a faulting load into a non-dedicated preheader.
-+ *
-+ * SQLite 3.53.4 speedtest1 --testset json SIGSEGV (jsonCacheSearch inlined
-+ * into jsonParseFuncArg):
-+ *
-+ *   p = sqlite3_get_auxdata(ctx, JSON_CACHE_ID);
-+ *   if( p==0 ) return 0;
-+ *   for(i=0; i<p->nUsed; i++) ...
-+ *
-+ * The `if(p==0)` block is the loop's unique out-of-loop predecessor, so
-+ * find_preheader() returned it — but it is NOT dedicated (it also branches
-+ * to the early return). LICM hoisted the loop-invariant `p->nUsed` load to
-+ * the end of that block, dereferencing p+8 before the NULL test on every
-+ * call where the cache was absent.
-+ *
-+ * The fix: derived-pointer loads (call results, params, GEP chains) and
-+ * GEP-derived global loads require a *dedicated* preheader (unconditional
-+ * branch to the loop header). Dereferenceable classes (allocas, direct
-+ * data-symbol addresses) remain hoistable.
-+ *
-+ * This test drives the exact shape with a get_aux() that returns NULL, so
-+ * a regressing compiler segfaults deterministically. A second entry with a
-+ * non-NULL cache checks the loop still computes correct results.
-+ */
-+#include <stdio.h>
-+#include <string.h>
-+
-+struct E {
-+    const char *zJson;
-+    int nJson;
-+};
-+struct Cache {
-+    void *db;
-+    int nUsed;
-+    struct E *a[4];
-+};
-+
-+static struct Cache *g_cache;
-+
-+/* Opaque through a volatile function pointer so the optimizer cannot
-+ * prove the return value non-NULL. */
-+static void *get_aux_impl(void *ctx, int id) {
-+    (void)ctx;
-+    (void)id;
-+    return g_cache;
-+}
-+static void *(*volatile get_aux)(void *, int) = get_aux_impl;
-+
-+static struct E *search(void *ctx, const char *zJson, int nJson) {
-+    struct Cache *p;
-+    int i;
-+    p = get_aux(ctx, -429252);
-+    if (p == 0)
-+        return 0;
-+    for (i = 0; i < p->nUsed; i++) {
-+        if (p->a[i]->zJson == zJson)
-+            break;
-+    }
-+    if (i >= p->nUsed) {
-+        for (i = 0; i < p->nUsed; i++) {
-+            if (p->a[i]->nJson != nJson)
-+                continue;
-+            if (memcmp(p->a[i]->zJson, zJson, (unsigned)nJson) == 0)
-+                break;
+         let is_static = self.attrs.parsing_static();
+         let is_extern = self.attrs.parsing_extern();
+ 
+@@ -747,7 +760,7 @@ impl Parser {
+                 None,
+                 None,
+                 None,
+-                self.attrs.parsing_address_space,
++                decl_addr_space,
+                 self.attrs.parsing_vector_size.take(),
+                 self.attrs.parsing_ext_vector_nelem.take(),
+                 start,
+@@ -855,7 +868,7 @@ impl Parser {
+             alignment,
+             alignas_type,
+             alignment_sizeof_type,
+-            self.attrs.parsing_address_space,
++            decl_addr_space,
+             self.attrs.parsing_vector_size.take(),
+             self.attrs.parsing_ext_vector_nelem.take(),
+             start,
+diff --git a/src/frontend/preprocessor/predefined_macros.rs b/src/frontend/preprocessor/predefined_macros.rs
+index e609c95..6f3c591 100644
+--- a/src/frontend/preprocessor/predefined_macros.rs
++++ b/src/frontend/preprocessor/predefined_macros.rs
+@@ -278,12 +278,10 @@ impl Preprocessor {
+             ("__ELF__", "1"),
+             // Note: __PIC__/__pic__ are conditionally defined via set_pic(),
+             // not here, so they are only present when -fPIC is active.
+-            // CET (Control-flow Enforcement Technology) - match GCC's default
+-            // This is x86_64-only; removed for other targets in set_target().
+-            // Value 3 = IBT (bit 0) + SHSTK (bit 1), matching GCC's default.
+-            // Critical: must match the GCC that assembles .S files, because
+-            // libffi's trampoline sizes depend on ENDBR_PRESENT which checks __CET__.
+-            ("__CET__", "3"),
++            // __CET__ is NOT predefined here: GCC only defines it under an
++            // active -fcf-protection (see set_cet(), called from the driver
++            // with the parsed flag). Predefining it unconditionally broke
++            // glibc --disable-cet (undefined _dl_cet_* at the ld.so link).
+             // SSE/MMX feature macros: SSE2 is baseline for x86_64.
+             // Removed for non-x86_64 targets in set_target().
+             // Many projects (dr_libs, minimp3, stb_image, etc.) use #ifdef __SSE2__
+@@ -547,6 +545,23 @@ impl Preprocessor {
+         }
+     }
+ 
++    /// Define or undefine __CET__ based on -fcf-protection.
++    ///
++    /// GCC defines `__CET__` ONLY when -fcf-protection is active (=1 branch,
++    /// =2 return, =3 full); `-fcf-protection=none` or absence leaves it
++    /// undefined. lccc used to predefine __CET__=3 unconditionally (for
++    /// libffi's ENDBR_PRESENT), which dragged CET-only code into builds that
++    /// disabled it: glibc --disable-cet compiles rtld WITHOUT dl-cet.c, but
++    /// sysdeps/x86_64/sysdep.h saw __CET__ and made dl_main call
++    /// _dl_cet_check/_dl_cet_setup_features — undefined symbols at the ld.so
++    /// link.
++    pub fn set_cet(&mut self, value: Option<&str>) {
++        match value {
++            Some(v) => self.define_simple_macro("__CET__", v),
++            None => self.macros.undefine("__CET__"),
 +        }
 +    }
-+    if (i < p->nUsed)
-+        return p->a[i];
-+    return 0;
++
+     /// Define or undefine __PIC__/__pic__ based on whether PIC mode is active.
+     /// GCC defines these to 1 for -fpic and 2 for -fPIC; we always use 2.
+     /// When PIC is disabled (e.g. -fno-PIC), these must not be defined, as
+diff --git a/src/frontend/sema/analysis.rs b/src/frontend/sema/analysis.rs
+index 9753fcf..fc822af 100644
+--- a/src/frontend/sema/analysis.rs
++++ b/src/frontend/sema/analysis.rs
+@@ -401,6 +401,19 @@ impl SemanticAnalyzer {
+                         &declarator.derived,
+                     )
+                 };
++                // Mirror lowering's __attribute__((vector_size(N))) handling:
++                // without the Vector wrap, sema records `typedef float xmm_t
++                // __attribute__((vector_size(16)))` as a plain 4-byte float,
++                // and every struct layout computed through sema's
++                // TypeConvertContext (cached in the SHARED type_context
++                // layout table) is wrong. glibc's La_x86_64_regs then put
++                // lr_vector at offset 96 instead of 192 in the gen-as-const
++                // pipeline, and elf/dl-trampoline.S failed its
++                // "LR_VECTOR_OFFSET must be multiple of VEC_SIZE" #error.
++                let resolved_ctype = match decl.resolve_vector_size(resolved_ctype.size()) {
++                    Some(vs) => CType::Vector(Box::new(resolved_ctype), vs),
++                    None => resolved_ctype,
++                };
+                 self.result
+                     .type_context
+                     .typedefs
+@@ -877,9 +890,29 @@ impl SemanticAnalyzer {
+                 self.analyze_expr(expr);
+                 if let Some(expected) = self.current_return_type.clone() {
+                     if matches!(expected, CType::Void) {
+-                        self.diagnostics
+-                            .borrow_mut()
+-                            .error("return with a value, in function returning void", *span);
++                        // GCC compatibility: `return void_expr;` in a void
++                        // function is accepted silently in GNU mode (glibc
++                        // uses `return __set_errno(...)`/`return helper();`
++                        // shims throughout malloc.c, qsort.c, libio).
++                        // Returning a real VALUE from a void function is a
++                        // default-on warning in GCC, not an error; the value
++                        // is discarded.
++                        let checker = super::type_checker::ExprTypeChecker {
++                            symbols: &self.symbol_table,
++                            types: &self.result.type_context,
++                            functions: &self.result.functions,
++                            expr_types: Some(&self.result.expr_types),
++                        };
++                        let expr_is_void = matches!(
++                            checker.infer_expr_ctype(expr),
++                            Some(CType::Void) | None
++                        );
++                        if !expr_is_void {
++                            self.diagnostics.borrow_mut().warning(
++                                "'return' with a value, in function returning void",
++                                *span,
++                            );
++                        }
+                     } else {
+                         let checker = super::type_checker::ExprTypeChecker {
+                             symbols: &self.symbol_table,
+@@ -1467,18 +1500,40 @@ impl SemanticAnalyzer {
+                 // Validate real prototypes. Empty parameter lists are kept
+                 // permissive because sema also carries legacy `f()` and fallback
+                 // libc declarations with unspecified arguments.
++                //
++                // C scoping: a local object (parameter or variable) SHADOWS a
++                // file-scope function of the same name. glibc nss_module.c
++                // declares `void (*bind)(...)` as a parameter while
++                // <sys/socket.h> declares the 3-argument socket bind();
++                // resolving the call against the global prototype rejected
++                // the 1-argument call through the parameter. When shadowed,
++                // fall through to the function-pointer signature path, which
++                // resolves the identifier through the scoped symbol table.
++                let shadowed_by_object = if let Expr::Identifier(name, _) = callee.as_ref() {
++                    self.symbol_table
++                        .lookup(name)
++                        .map(|s| !matches!(&s.ty, CType::Function(_)))
++                        .unwrap_or(false)
++                } else {
++                    false
++                };
+                 let direct = if let Expr::Identifier(name, _) = callee.as_ref() {
+-                    self.result
+-                        .functions
+-                        .get(name)
+-                        .filter(|fi| !fi.params.is_empty())
+-                        .map(|fi| (name.clone(), fi.params.clone(), fi.variadic))
++                    if shadowed_by_object {
++                        None
++                    } else {
++                        self.result
++                            .functions
++                            .get(name)
++                            .filter(|fi| !fi.params.is_empty())
++                            .map(|fi| (name.clone(), fi.params.clone(), fi.variadic))
++                    }
+                 } else {
+                     None
+                 };
+                 if let Some((name, params, variadic)) = direct {
+                     self.check_call_arguments(&name, args, &params, variadic, expr.span());
+-                } else if !matches!(callee.as_ref(), Expr::Identifier(name, _) if self.result.functions.contains_key(name))
++                } else if shadowed_by_object
++                    || !matches!(callee.as_ref(), Expr::Identifier(name, _) if self.result.functions.contains_key(name))
+                 {
+                     let checker = super::type_checker::ExprTypeChecker {
+                         symbols: &self.symbol_table,
+diff --git a/src/frontend/sema/builtins.rs b/src/frontend/sema/builtins.rs
+index 9bc062d..988c2c4 100644
+--- a/src/frontend/sema/builtins.rs
++++ b/src/frontend/sema/builtins.rs
+@@ -199,6 +199,14 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
+         "__builtin_alloca_with_align",
+         BuiltinInfo::intrinsic(BuiltinIntrinsic::Alloca),
+     );
++    // Bare `alloca` is a builtin in GNU modes, exactly like GCC: code that
++    // calls it without including <alloca.h> (30+ GCC torture execute tests)
++    // must get the DynAlloca lowering, not an undefined external call.
++    // A user-defined function body named `alloca` still overrides this via
++    // the is_defined check in try_lower_builtin_call. glibc is unaffected
++    // (<alloca.h> #defines alloca to __builtin_alloca).
++    // Credit: Agent B torture triage.
++    m.insert("alloca", BuiltinInfo::intrinsic(BuiltinIntrinsic::Alloca));
+ 
+     // Return address / frame address / thread pointer
+     m.insert(
+diff --git a/src/frontend/sema/type_checker.rs b/src/frontend/sema/type_checker.rs
+index 72230a7..2cbdea6 100644
+--- a/src/frontend/sema/type_checker.rs
++++ b/src/frontend/sema/type_checker.rs
+@@ -946,6 +946,7 @@ impl<'a> ExprTypeChecker<'a> {
+             | "__builtin_memset"
+             | "__builtin_alloca"
+             | "__builtin_alloca_with_align"
++            | "alloca"
+             | "__builtin_frame_address"
+             | "__builtin_return_address"
+             | "__builtin_thread_pointer" => {
+diff --git a/src/ir/lowering/expr_builtins.rs b/src/ir/lowering/expr_builtins.rs
+index a0dd769..b92f441 100644
+--- a/src/ir/lowering/expr_builtins.rs
++++ b/src/ir/lowering/expr_builtins.rs
+@@ -148,7 +148,7 @@ impl Lowerer {
+ 
+         // Handle alloca specially - it needs dynamic stack allocation
+         match name {
+-            "__builtin_alloca" | "__builtin_alloca_with_align" => {
++            "__builtin_alloca" | "__builtin_alloca_with_align" | "alloca" => {
+                 if let Some(size_expr) = args.first() {
+                     let size_operand = self.lower_expr(size_expr);
+                     let align = if name == "__builtin_alloca_with_align" && args.len() >= 2 {
+diff --git a/src/ir/lowering/global_decl.rs b/src/ir/lowering/global_decl.rs
+index 46b2bc2..422f202 100644
+--- a/src/ir/lowering/global_decl.rs
++++ b/src/ir/lowering/global_decl.rs
+@@ -58,6 +58,12 @@ impl Lowerer {
+             // initializers (e.g., `struct Node n = {&n}`) can resolve.
+             let mut ginfo = GlobalInfo::from_analysis(&da);
+             ginfo.var.address_space = decl.address_space;
++            if let Some(ref mut ct) = ginfo.var.c_type {
++                crate::common::type_builder::apply_declaration_address_space(
++                    ct,
++                    decl.address_space,
++                );
++            }
+             self.globals.insert(declarator.name.clone(), ginfo);
+ 
+             let init = self.lower_declarator_init(decl, declarator, &da);
+@@ -94,6 +100,10 @@ impl Lowerer {
+                 continue;
+             }
+             let mut resolved_ctype = self.build_full_ctype(&decl.type_spec, &declarator.derived);
++            crate::common::type_builder::apply_declaration_address_space(
++                &mut resolved_ctype,
++                decl.address_space,
++            );
+             if let Some(vs) = decl.resolve_vector_size(resolved_ctype.size()) {
+                 resolved_ctype = CType::Vector(Box::new(resolved_ctype), vs);
+             }
+@@ -212,6 +222,12 @@ impl Lowerer {
+         let mut ginfo = GlobalInfo::from_analysis(&da);
+         ginfo.asm_register = Some(reg_name.clone());
+         ginfo.var.address_space = decl.address_space;
++            if let Some(ref mut ct) = ginfo.var.c_type {
++                crate::common::type_builder::apply_declaration_address_space(
++                    ct,
++                    decl.address_space,
++                );
++            }
+         self.globals.insert(declarator.name.clone(), ginfo);
+         true
+     }
+@@ -229,6 +245,12 @@ impl Lowerer {
+             }
+             let mut ginfo = GlobalInfo::from_analysis(&da);
+             ginfo.var.address_space = decl.address_space;
++            if let Some(ref mut ct) = ginfo.var.c_type {
++                crate::common::type_builder::apply_declaration_address_space(
++                    ct,
++                    decl.address_space,
++                );
++            }
+             self.globals.insert(declarator.name.clone(), ginfo);
+         }
+         // For extern TLS variables, emit an IrGlobal so codegen uses TLS access patterns.
+diff --git a/src/ir/lowering/stmt.rs b/src/ir/lowering/stmt.rs
+index c382993..748dd7d 100644
+--- a/src/ir/lowering/stmt.rs
++++ b/src/ir/lowering/stmt.rs
+@@ -223,6 +223,10 @@ impl Lowerer {
+                     .insert(declarator.name.clone(), fti);
+             }
+             let mut resolved_ctype = self.build_full_ctype(type_spec, &declarator.derived);
++            crate::common::type_builder::apply_declaration_address_space(
++                &mut resolved_ctype,
++                decl.address_space,
++            );
+             if let Some(vs) = decl.resolve_vector_size(resolved_ctype.size()) {
+                 resolved_ctype = CType::Vector(Box::new(resolved_ctype), vs);
+             }
+@@ -352,6 +356,13 @@ impl Lowerer {
+     ) {
+         let mut local_info = LocalInfo::from_analysis(da, alloca, decl.is_const());
+         local_info.var.address_space = decl.address_space;
++        // `T __seg_fs *p`: the qualifier lives on the pointer's CType (the
++        // space the pointer points into), not just on the variable slot.
++        // Without this, `*p` resolves AddressSpace::Default through
++        // get_expr_ctype and the segment prefix is silently dropped.
++        if let Some(ref mut ct) = local_info.var.c_type {
++            crate::common::type_builder::apply_declaration_address_space(ct, decl.address_space);
++        }
+         if explicit_align > 0 {
+             local_info.var.explicit_alignment = Some(explicit_align);
+         }
+@@ -1327,7 +1338,26 @@ impl Lowerer {
+         }
+         match stmt {
+             Stmt::Return(expr, _span) => {
+-                let op = expr.as_ref().map(|e| self.lower_return_expr(e));
++                // GNU C: `return void_expr;` in a void function (accepted by
++                // sema for GCC compatibility — glibc `return helper();`
++                // shims). The expression is evaluated for side effects only;
++                // the Return itself must carry no operand, otherwise it
++                // references the "result" of a void call that no instruction
++                // defines (malloc.c __libc_free ICE: Return(Some(v59)) with
++                // v59 undefined).
++                let func_returns_void = self
++                    .func_state
++                    .as_ref()
++                    .map(|fs| fs.return_type == IrType::Void)
++                    .unwrap_or(false);
++                let op = if func_returns_void {
++                    if let Some(e) = expr.as_ref() {
++                        self.lower_expr_discard(e);
++                    }
++                    None
++                } else {
++                    expr.as_ref().map(|e| self.lower_return_expr(e))
++                };
+                 // Emit cleanup calls for all active scopes before returning
+                 let all_cleanups = self.collect_all_scope_cleanup_vars();
+                 self.emit_cleanup_calls(&all_cleanups);
+diff --git a/src/passes/copy_prop.rs b/src/passes/copy_prop.rs
+index 822e6e4..1f6ee7a 100644
+--- a/src/passes/copy_prop.rs
++++ b/src/passes/copy_prop.rs
+@@ -792,6 +792,15 @@ fn one_round_post_phi(func: &mut IrFunction) -> usize {
+     let mut def_position: Vec<Option<(usize, usize)>> = vec![None; max_id + 1];
+     let mut use_count = vec![0u32; max_id + 1];
+     let mut use_positions: Vec<Vec<(usize, usize)>> = vec![Vec::new(); max_id + 1];
++    // Uses in *Value-typed* instruction fields (Load.ptr, Store.ptr, GEP.base,
++    // Memcpy dest/src, va_list pointers, InlineAsm output pointers, ...).
++    // These fields structurally CANNOT hold a constant, so a copy whose
++    // resolved source is a Const must never be removed while such a use
++    // exists: `replace_value_in_place` cannot rewrite it and the use dangles.
++    // glibc __libc_start_main_impl hit exactly this — `v = Copy(Const 16);
++    // Load %fs:(v)` (TLS stack-guard) lost its only def and the backend's
++    // no-home hard gate fired at the SegFs load.
++    let mut value_pos_uses = vec![0u32; max_id + 1];
+     let mut copies: Vec<(usize, usize, Value, Operand)> = Vec::new(); // (bi, ii, dest, src)
+ 
+     // Count definitions (single-def test) and uses.
+@@ -836,6 +845,7 @@ fn one_round_post_phi(func: &mut IrFunction) -> usize {
+                         if (v.0 as usize) <= max_id {
+                             use_count[v.0 as usize] += 1;
+                             use_positions[v.0 as usize].push((bi, ii));
++                            value_pos_uses[v.0 as usize] += 1;
+                         }
+                     });
+                 }
+@@ -943,7 +953,6 @@ fn one_round_post_phi(func: &mut IrFunction) -> usize {
+     // RESOLVED source. Chained copies (d1=Copy(s1); d2=Copy(d1)) must resolve
+     // d2's source to s1 — substituting the intermediate d1 would leave a
+     // dangling reference once d1's own copy is removed.
+-    let removed = to_remove.len();
+     let resolved_src: Vec<Operand> = to_remove
+         .iter()
+         .map(|&(_, _, dest, src)| {
+@@ -967,6 +976,25 @@ fn one_round_post_phi(func: &mut IrFunction) -> usize {
+             cur
+         })
+         .collect();
++    // Const-resolved removals must not orphan Value-position uses (Load.ptr,
++    // Store.ptr, GEP.base, ...): those fields cannot hold a constant, so
++    // `replace_value_in_place` would silently skip them and the removed copy's
++    // dest would dangle. This covers both direct `Copy(Const)` and chains that
++    // RESOLVE to a Const through other removed copies. Dropping an entry is
++    // always sound: its copy simply stays, and chains that resolved through it
++    // still substitute the same resolved value into their (operand) uses.
++    let (to_remove, resolved_src): (Vec<_>, Vec<_>) = to_remove
++        .into_iter()
++        .zip(resolved_src)
++        .filter(|((_, _, dest, _), rsrc)| {
++            !(matches!(rsrc, Operand::Const(_))
++                && value_pos_uses.get(dest.0 as usize).copied().unwrap_or(0) > 0)
++        })
++        .unzip();
++    if to_remove.is_empty() {
++        return 0;
++    }
++    let removed = to_remove.len();
+     for (idx, (bi, ii, dest, _)) in to_remove.iter().enumerate() {
+         // Replace uses of dest in block bi at indices > ii — INCLUDING the
+         // block's terminator (a terminator use is recorded at (bi, usize::MAX),
+diff --git a/src/passes/inline.rs b/src/passes/inline.rs
+index c347698..89b4773 100644
+--- a/src/passes/inline.rs
++++ b/src/passes/inline.rs
+@@ -377,12 +377,26 @@ fn select_inline_site(
+         // For recursive callers, only inline tiny callees and always_inline callees.
+         // Inlining larger callees into recursive functions multiplies the stack frame
+         // increase by the recursion depth, easily causing stack overflow.
+-        if caller_is_recursive && !is_tiny && !callee_data.is_always_inline {
++        // gnu_inline defs must also pass the recursive-caller guard: their
++        // body is the ONLY definition in this TU, so a skipped site becomes
++        // an undefined symbol in -nostdlib links (glibc rtld: the extern
++        // inline `free` wrapper called from the RECURSIVE free_slotinfo).
++        if caller_is_recursive
++            && !is_tiny
++            && !callee_data.is_always_inline
++            && !callee_data.is_gnu_inline_def
++        {
+             continue;
+         }
++        // gnu_inline caps: generous enough for glibc's header bodies
++        // (bsearch: ~35 insts, 8 blocks with a loop) but still bounded.
++        let is_gnu_inline_eligible = callee_data.is_gnu_inline_def
++            && callee_inst_count <= 128
++            && callee_data.blocks.len() <= 16;
+         if is_tiny
+             || (is_small && (!budget_exhausted || callee_data.is_always_inline))
+             || is_static_inline_eligible
++            || is_gnu_inline_eligible
+         {
+             let use_relaxed = callee_data.is_always_inline || callee_data.exceeds_normal_limits;
+             return Some((site.clone(), callee_inst_count, use_relaxed));
+@@ -1540,6 +1554,7 @@ fn short_inst_name(inst: &Instruction) -> &'static str {
+ }
+ 
+ /// Information about a callee function eligible for inlining.
++#[derive(Clone)]
+ struct CalleeData {
+     blocks: Vec<BasicBlock>,
+     /// For each param, Some(size) if it's a struct-by-value parameter, None otherwise.
+@@ -1561,6 +1576,12 @@ struct CalleeData {
+     /// same to match GCC behavior and enable critical optimizations (e.g.,
+     /// constant propagation of shift amounts in ror32 used by blake2s).
+     is_static_inline: bool,
++    /// GNU89 `extern inline __attribute__((gnu_inline))` definition: the body
++    /// exists ONLY for inlining — no out-of-line copy is emitted in this TU.
++    /// A call left behind resolves to an external symbol that may not exist
++    /// (glibc rtld links -nostdlib: `__bsearch` in intel_check_word was a
++    /// hard undefined-symbol error). Eligibility uses dedicated relaxed caps.
++    is_gnu_inline_def: bool,
+     /// Whether this callee is a `static` (non-`inline`) function with exactly
+     /// one call site in the whole module. Such callees are dead after inlining
+     /// (net code shrink), so they are exempt from the caller-size caps and the
+@@ -1902,9 +1923,23 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
+         // value anywhere (function-pointer table, alias, constructor, asm
+         // template or "i"-constraint symbol); otherwise the outlined body
+         // survives and the exemption must not apply.
+-        let has_single_call_site = call_site_counts.get(&func.name).copied().unwrap_or(0) == 1;
++        // glibc hidden_proto: call sites are redirected to the
++        // __asm__("__GI_...") label while the body keeps its C name, so the
++        // call accounting and the value-reference check must consider both.
++        let asm_alias = module
++            .asm_labels
++            .get(&func.name)
++            .filter(|a| a.as_str() != func.name.as_str());
++        let total_calls = call_site_counts.get(&func.name).copied().unwrap_or(0)
++            + asm_alias
++                .map(|a| call_site_counts.get(a.as_str()).copied().unwrap_or(0))
++                .unwrap_or(0);
++        let has_single_call_site = total_calls == 1;
+         let survives_via_reference = has_single_call_site
+-            && function_referenced_as_value(&func.name, &value_referenced, &asm_templates);
++            && (function_referenced_as_value(&func.name, &value_referenced, &asm_templates)
++                || asm_alias.is_some_and(|a| {
++                    function_referenced_as_value(a, &value_referenced, &asm_templates)
++                }));
+         let fits_single_call_site_static = func.is_static
+             && !func.is_inline
+             && !is_small_static
+@@ -1987,7 +2022,13 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
+         ) || (func.is_static
+             && !func.is_inline
+             && has_loops
+-            && fits_static_loop_inline_limits(inst_count, func.blocks.len(), direct_call_count));
++            && fits_static_loop_inline_limits(inst_count, func.blocks.len(), direct_call_count))
++            // GNU89 `extern inline __attribute__((gnu_inline))` bodies exist
++            // ONLY for inlining (no out-of-line copy is emitted in this TU);
++            // a rejected site leaves a call to an external symbol that may
++            // not exist (glibc rtld __bsearch). Dedicated caps: big enough
++            // for glibc's header bodies, still bounded.
++            || (func.is_gnu_inline_def && inst_count <= 128 && func.blocks.len() <= 16);
+         let fits_relaxed = inst_count <= MAX_ALWAYS_INLINE_INSTRUCTIONS
+             && func.blocks.len() <= MAX_ALWAYS_INLINE_BLOCKS;
+         // Single-call-site statics were already size-checked above against
+@@ -2078,6 +2119,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
+                 is_always_inline,
+                 exceeds_normal_limits: exceeds_normal,
+                 is_static_inline: func.is_static && func.is_inline,
++                is_gnu_inline_def: func.is_gnu_inline_def,
+                 // Any static (non-inline) callee with a single call site is
+                 // dead after inlining, so it is exempt from the soft caller-
+                 // size cap and the per-caller budget in select_inline_site
+@@ -2094,6 +2136,21 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
+                 size_inline_cost: inst_count,
+             },
+         );
++        // Register the same body under its __asm__ label so call sites that
++        // carry the redirected name find the inline definition. Without this,
++        // glibc's hidden_proto pattern (body `__argz_next`, calls
++        // `__GI___argz_next`) left the gnu89 extern-inline body uninlined and
++        // the libc.so link failed with undefined `__GI___argz_next` /
++        // `__option_is_end` / `__option_is_short`.
++        if let Some(asm_name) = module.asm_labels.get(&func.name) {
++            if asm_name.as_str() != func.name.as_str() && !map.contains_key(asm_name.as_str()) {
++                let aliased = map
++                    .get(&func.name)
++                    .cloned()
++                    .expect("entry inserted just above");
++                map.insert(asm_name.clone(), aliased);
++            }
++        }
+     }
+ 
+     // Callee snapshots are captured before any function in this invocation is
+@@ -2142,7 +2199,10 @@ fn is_mandatory_first_pass_callee(data: &CalleeData) -> bool {
+                 static_inline_block_limit
+             };
+ 
++    let is_gnu_inline_eligible =
++        data.is_gnu_inline_def && inst_count <= 128 && data.blocks.len() <= 16;
+     data.is_always_inline || is_tiny || is_small || is_static_inline_eligible
++        || is_gnu_inline_eligible
+ }
+ 
+ /// Estimate a callee's instruction count after mandatory descendants expand.
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index 00c6844..c4f2450 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -55,11 +55,79 @@ use crate::common::fx_hash::FxHashSet;
+ use crate::ir::analysis::CfgAnalysis;
+ use crate::ir::reexports::{Instruction, IrFunction, IrModule};
+ 
++/// CCC_VALIDATE_SSA=1 debug validator: every Value id must have exactly one
++/// defining instruction, InlineAsm outputs and Phi dests included, and every
++/// def must be strictly below the function's `next_value_id` watermark.
++///
++/// A stale watermark is the *origin* of duplicate-def bugs: the offending
++/// pass clones or synthesizes instructions with ids at/above `next_value_id`,
++/// and a later pass that allocates "fresh" ids from the watermark silently
++/// collides with them. The RA then computes one merged live range for two
++/// unrelated values and the backend's no-home hard gate fires far from the
++/// cause (glibc __libc_start_main_impl: Cast and GetElementPtr both defining
++/// v356). Panics at the FIRST violating phase so the bisection is exact.
++///
++/// `strict`: before phi elimination the IR is SSA and every duplicate def is
++/// a violation. After `eliminate_phis` the IR is *conventional* SSA — a phi
++/// home is legally assigned by one `Copy` per predecessor edge — so
++/// duplicates are tolerated iff every def of that id is a `Copy`.
++pub(crate) fn validate_unique_defs(module: &IrModule, tag: &str) {
++    let strict = !tag.starts_with("backend:eliminate_phis") && !tag.starts_with("backend:post-phi")
++        && !tag.starts_with("backend:pre-codegen");
++    for func in &module.functions {
++        if func.is_declaration {
++            continue;
++        }
++        let mut def_of: crate::common::fx_hash::FxHashMap<u32, (String, bool)> =
++            crate::common::fx_hash::FxHashMap::default();
++        let mut max_def: u32 = 0;
++        let mut check = |id: u32, what: String, is_copy: bool| {
++            max_def = max_def.max(id);
++            if let Some((prev, prev_copy)) = def_of.insert(id, (what.clone(), is_copy)) {
++                if strict || !(is_copy && prev_copy) {
++                    panic!(
++                        "SSA VIOLATION after phase '{}': value v{} in function '{}' \
++                         defined twice:\n  first : {}\n  second: {}",
++                        tag, id, func.name, prev, what
++                    );
++                }
++            }
++        };
++        for (bi, block) in func.blocks.iter().enumerate() {
++            for inst in &block.instructions {
++                if let Some(d) = inst.dest() {
++                    let is_copy = matches!(inst, Instruction::Copy { .. });
++                    check(d.0, format!("block {} {:?}", bi, inst), is_copy);
++                }
++                // NOTE: InlineAsm `outputs` carry value_POINTERS (addresses
++                // the asm stores through) — they are uses, not defs, and may
++                // legitimately repeat a GEP dest. They are deliberately not
++                // checked here.
++            }
++        }
++        if max_def >= func.next_value_id {
++            panic!(
++                "SSA WATERMARK VIOLATION after phase '{}': function '{}' has \
++                 def v{} >= next_value_id {} — the phase that created it did \
++                 not bump the watermark; later passes will allocate colliding \
++                 'fresh' ids",
++                tag, func.name, max_def, func.next_value_id
++            );
++        }
++    }
 +}
 +
-+int main(void) {
-+    static const char *k1 = "alpha";
-+    struct E e1 = { "alpha", 5 };
-+    struct E e2 = { "bravo", 5 };
-+    static struct Cache c;
-+    struct E *r;
-+
-+    /* Phase 1: empty cache — the guarded path. A speculating compiler
-+     * dereferences NULL here. */
-+    g_cache = 0;
-+    r = search((void *)0x1, k1, 5);
-+    printf("empty=%p\n", (void *)r);
-+
-+    /* Phase 2: populated cache — identity match then content match. */
-+    c.nUsed = 2;
-+    c.a[0] = &e1;
-+    c.a[1] = &e2;
-+    g_cache = &c;
-+    r = search((void *)0x1, e1.zJson, 5);
-+    printf("ident=%s\n", r ? r->zJson : "(nil)");
-+    r = search((void *)0x1, "bravo", 5); /* different pointer, same bytes */
-+    printf("bytes=%s\n", r ? r->zJson : "(nil)");
-+    return !(r && strcmp(r->zJson, "bravo") == 0);
-+}
-diff --git a/tests/regression/licm_no_speculative_load_nondedicated_preheader.flags b/tests/regression/licm_no_speculative_load_nondedicated_preheader.flags
+ /// Debug hook: dump only functions whose name contains one of the comma-
+ /// separated substrings in `CCC_DUMP_FUNC` (empty = dump all), in the same
+ /// compact per-block format as the backend's CCC_DUMP_IR.
+ /// Environment-gated; never changes codegen.
+ fn dump_ir_filtered(module: &IrModule, tag: &str) {
++    if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
++        validate_unique_defs(module, tag);
++    }
++    if std::env::var_os("CCC_DUMP_EACH_PASS").is_none() {
++        return;
++    }
+     use std::fmt::Write as _;
+     let filters: Vec<String> = std::env::var("CCC_DUMP_FUNC")
+         .unwrap_or_default()
+@@ -343,7 +411,8 @@ impl DisabledPasses {
+ 
+ /// Run Phase 0: function inlining and post-inline optimization passes.
+ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, size_profile: bool) {
+-    let dump_pre = std::env::var("CCC_DUMP_EACH_PASS").is_ok();
++    let dump_pre = std::env::var("CCC_DUMP_EACH_PASS").is_ok()
++        || std::env::var("CCC_VALIDATE_SSA").is_ok();
+     macro_rules! iphase_dump {
+         ($name:expr) => {
+             if dump_pre {
+@@ -394,7 +463,10 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
+             inline::run(module);
+         }
+     }
+-    if std::env::var("CCC_DUMP_IR").is_ok() || std::env::var("CCC_DUMP_EACH_PASS").is_ok() {
++    if std::env::var("CCC_DUMP_IR").is_ok()
++        || std::env::var("CCC_DUMP_EACH_PASS").is_ok()
++        || std::env::var("CCC_VALIDATE_SSA").is_ok()
++    {
+         dump_ir_filtered(module, "pre-loop after inliner");
+     }
+ 
+@@ -513,7 +585,8 @@ pub(crate) fn run_passes(
+ 
+     let time_passes = std::env::var("CCC_TIME_PASSES").is_ok();
+     // -fdump-tree-all equivalent: dump the module after every pass.
+-    let dump_each_pass = std::env::var("CCC_DUMP_EACH_PASS").is_ok();
++    let dump_each_pass = std::env::var("CCC_DUMP_EACH_PASS").is_ok()
++        || std::env::var("CCC_VALIDATE_SSA").is_ok();
+ 
+     // -O0: preserve the alloca-based IR and skip the optimizer completely.
+     // Inline asm symbol resolution is not an optimization; it is required for
+diff --git a/tests/regression/alloca_bare_builtin.c b/tests/regression/alloca_bare_builtin.c
 new file mode 100644
-index 0000000..90e8e23
+index 0000000..2146050
 --- /dev/null
-+++ b/tests/regression/licm_no_speculative_load_nondedicated_preheader.flags
-@@ -0,0 +1 @@
-+-O2 -fPIC -march=x86-64-v3
-diff --git a/tests/regression/pic_indexed_store_static_global.c b/tests/regression/pic_indexed_store_static_global.c
-new file mode 100644
-index 0000000..407be94
---- /dev/null
-+++ b/tests/regression/pic_indexed_store_static_global.c
-@@ -0,0 +1,73 @@
-+/* -fPIC indexed store to a static global with an acc-resident value.
++++ b/tests/regression/alloca_bare_builtin.c
+@@ -0,0 +1,47 @@
++/* Bare `alloca` is a GNU-mode builtin; a user-defined body overrides it.
 + *
-+ * SQLite speedtest1 (HashUpdate/HashFinal, RC4-style state swap) ICE'd:
-+ *   x86 codegen: operand_to_rax: value N in function 'speedtest1_final'
-+ *   has no register home, no stack slot and no acc-cache entry
++ * GCC treats `alloca` as __builtin_alloca in gnu modes even without
++ * <alloca.h> (30+ GCC torture execute tests call it bare). It must lower
++ * to DynAlloca, not an undefined external call. A user-provided function
++ * BODY named alloca must still win (try_lower_builtin_call's is_defined
++ * override), matching GCC. Credit: Agent B torture triage.
 + *
-+ * Root cause: `can_indexed_addr_fold` computed the GOT verdict on the
-+ * symbol *basename* ("gh"), but `emit_store_indexed_sym_impl` /
-+ * `emit_load_indexed_sym_impl` passed the composed displacement string
-+ * ("gh+2") to `needs_got_for_addr`, which then missed `local_symbols`
-+ * under -fPIC and refused the fold the allocator had committed to. The
-+ * skipped GEP was rematerialised at the store site, clobbering %rax
-+ * while it held the acc-resident (nohome) store value.
-+ *
-+ * The kernel below is the exact byte-swap shape: s[i]=s[j] / s[j]=t with
-+ * byte-typed wrapping indices loaded from the global itself.
++ * The override half lives in a separate TU-shape below via a static pool
++ * allocator; both halves execute.
 + */
 +#include <stdio.h>
 +#include <string.h>
 +
-+static struct {
-+    unsigned char i, j;
-+    unsigned char s[256];
-+    unsigned char r[32];
-+} gh;
-+
-+static void HashInitX(void) {
-+    unsigned int k;
-+    gh.i = 0;
-+    gh.j = 0;
-+    for (k = 0; k < 256; k++)
-+        gh.s[k] = (unsigned char)k;
++__attribute__((noinline)) int sum_alloca(int n)
++{
++    int *a = alloca(n * sizeof(int)); /* no <alloca.h> on purpose */
++    int s = 0;
++    for (int i = 0; i < n; i++)
++        a[i] = i;
++    for (int i = 0; i < n; i++)
++        s += a[i];
++    return s;
 +}
 +
-+static void HashUpdateX(const unsigned char *aData, unsigned int nData) {
-+    unsigned char t, i = gh.i, j = gh.j;
-+    unsigned int k;
-+    for (k = 0; k < nData; k++) {
-+        j += gh.s[i] + aData[k];
-+        t = gh.s[j];
-+        gh.s[j] = gh.s[i];
-+        gh.s[i] = t;
-+        i++;
-+    }
-+    gh.i = i;
-+    gh.j = j;
++/* Recursion forces real stack growth: each frame's alloca block must be
++ * distinct storage. */
++__attribute__((noinline)) int depth_sum(int depth)
++{
++    char *p = alloca(32);
++    memset(p, depth, 32);
++    if (depth == 0)
++        return p[7];
++    int below = depth_sum(depth - 1);
++    /* p must still hold OUR frame's byte, not the callee's. */
++    return p[7] + below;
 +}
 +
-+static void HashFinalX(void) {
-+    unsigned int k;
-+    unsigned char t, i = gh.i, j = gh.j;
-+    for (k = 0; k < 32; k++) {
-+        i++;
-+        t = gh.s[i];
-+        j += t;
-+        gh.s[i] = gh.s[j];
-+        gh.s[j] = t;
-+        t += gh.s[i];
-+        gh.r[k] = gh.s[t];
-+    }
++int main(void)
++{
++    int ok = sum_alloca(10) == 45;
++    ok &= sum_alloca(1) == 0;
++    /* 5+4+3+2+1+0 = 15 */
++    ok &= depth_sum(5) == 15;
++    printf("alloca:%s\n", ok ? "ok" : "MISMATCH");
++    return ok ? 0 : 1;
 +}
-+
-+int main(void) {
-+    const char *m = "The quick brown fox jumps over the lazy dog, 1234567890.";
-+    int i;
-+    HashInitX();
-+    HashUpdateX((const unsigned char *)m, (unsigned int)strlen(m));
-+    HashFinalX();
-+    for (i = 0; i < 24; i++)
-+        printf("%02x", gh.r[i]);
-+    printf("\n");
-+    return 0;
-+}
-diff --git a/tests/regression/pic_indexed_store_static_global.flags b/tests/regression/pic_indexed_store_static_global.flags
+diff --git a/tests/regression/alloca_bare_builtin.env b/tests/regression/alloca_bare_builtin.env
 new file mode 100644
-index 0000000..47ec216
+index 0000000..f2f2e3a
 --- /dev/null
-+++ b/tests/regression/pic_indexed_store_static_global.flags
-@@ -0,0 +1 @@
-+-O2 -fPIC
-diff --git a/tests/regression/univsr_variable_init_offset.c b/tests/regression/univsr_variable_init_offset.c
++++ b/tests/regression/alloca_bare_builtin.env
+@@ -0,0 +1,5 @@
++# Host GCC rejects the bare-alloca initialization shape at this flag set
++# (implicit declaration interacts with -Werror-ish defaults in the runner's
++# reference build); the point of the test is LCCC's own builtin lowering and
++# runtime self-check, so the GCC comparison is waived.
++LCCC_NO_COMPARE=1
+diff --git a/tests/regression/cet_macro_mirrors_cf_protection.c b/tests/regression/cet_macro_mirrors_cf_protection.c
 new file mode 100644
-index 0000000..56fec23
+index 0000000..23ed282
 --- /dev/null
-+++ b/tests/regression/univsr_variable_init_offset.c
-@@ -0,0 +1,67 @@
-+/* univsr must not drop a variable initial displacement of a pointer IV.
++++ b/tests/regression/cet_macro_mirrors_cf_protection.c
+@@ -0,0 +1,23 @@
++/* __CET__ must mirror -fcf-protection exactly (GCC parity).
 + *
-+ * SQLite 3.53.4 pragmaVtabConnect:
++ * GCC defines __CET__ ONLY under an active -fcf-protection: =branch -> 1,
++ * =return -> 2, =full/bare -> 3; =none or absence leaves it undefined.
++ * lccc used to predefine __CET__=3 unconditionally, which dragged
++ * CET-only code into builds that disabled it: glibc --disable-cet compiles
++ * rtld WITHOUT dl-cet.c, but sysdeps/x86_64/sysdep.h saw __CET__ and made
++ * dl_main call _dl_cet_check/_dl_cet_setup_features — undefined symbols at
++ * the ld.so link.
 + *
-+ *   for(i=0, j=pPragma->iPragCName; i<pPragma->nPragCName; i++, j++){
-+ *     sqlite3_str_appendf(&acc, "%c\"%s\"", cSep, pragCName[j]);
-+ *   }
-+ *
-+ * IVSR turns the pragCName[j] walk into a moving pointer whose init is
-+ * GEP(pragCName, j0*8) with j0 loaded at runtime. univsr (un-IVSR) then
-+ * reverted it to indexed form, but extract_base_from_init treated the
-+ * VARIABLE init offset as 0 and peeled the base to pragCName — every
-+ * pragma_* eponymous virtual table was declared with foreign_key_list's
-+ * column names (speedtest1 --testset app: "no such column: name").
-+ *
-+ * The fixed pass uses the init pointer value itself as the SIB base.
++ * This test's .flags carry no -fcf-protection, so __CET__ must be absent.
 + */
 +#include <stdio.h>
 +
-+typedef unsigned char u8;
-+typedef unsigned long long u64;
++#ifdef __CET__
++#error "__CET__ must not be predefined without -fcf-protection"
++#endif
 +
-+typedef struct PragmaName {
-+    const char *const zName;
-+    u8 ePragTyp;
-+    u8 mPragFlg;
-+    u8 iPragCName;
-+    u8 nPragCName;
-+    u64 iArg;
-+} PragmaName;
-+
-+static const char *const pragCName[] = {
-+    "id",     "seq",   "table", "from",       "to", "on_update",
-+    "on_delete", "match", "cid",   "name",       "type", "notnull",
-+    "dflt_value", "pk",   "schema", "tname",     "ttype", "ncol",
-+    "wr",     "strict",
-+};
-+
-+static const PragmaName aPragmaName[] = {
-+    { "foreign_key_list", 1, 0x01, 0, 8, 0 },
-+    { "table_info", 2, 0x02, 8, 6, 1 },
-+    { "table_list", 3, 0x03, 14, 6, 2 },
-+};
-+
-+static int connect_vtab(void *pAux, char *out, int cap) {
-+    const PragmaName *pPragma = (const PragmaName *)pAux;
-+    int i, j, n = 0;
-+    char cSep = '(';
-+    for (i = 0, j = pPragma->iPragCName; i < pPragma->nPragCName; i++, j++) {
-+        n += snprintf(out + n, cap - n, "%c\"%s\"", cSep, pragCName[j]);
-+        cSep = ',';
-+    }
-+    if (i == 0)
-+        n += snprintf(out + n, cap - n, "(\"%s\"", pPragma->zName);
-+    n += snprintf(out + n, cap - n, ")");
-+    return n;
-+}
-+
-+int main(void) {
-+    char buf[256];
-+    int k;
-+    for (k = 0; k < 3; k++) {
-+        connect_vtab((void *)&aPragmaName[k], buf, sizeof buf);
-+        printf("%s => %s\n", aPragmaName[k].zName, buf);
-+    }
++int main(void)
++{
++    printf("cet:absent\n");
 +    return 0;
 +}
-diff --git a/tests/regression/univsr_variable_init_offset.flags b/tests/regression/univsr_variable_init_offset.flags
+diff --git a/tests/regression/check_abi_reg_hints.sh b/tests/regression/check_abi_reg_hints.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_affine_map_vectorization_codegen.sh b/tests/regression/check_affine_map_vectorization_codegen.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_alu_audit_fixes.sh b/tests/regression/check_alu_audit_fixes.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_andn_fusion.sh b/tests/regression/check_andn_fusion.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_arm_direct_select.sh b/tests/regression/check_arm_direct_select.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_arm_fp_stack_reload.sh b/tests/regression/check_arm_fp_stack_reload.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_asm_missing_include_fatal.sh b/tests/regression/check_asm_missing_include_fatal.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_bit_test_canonical.sh b/tests/regression/check_bit_test_canonical.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_cfg_leaf_param_homes.sh b/tests/regression/check_cfg_leaf_param_homes.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_cmp_cast_branch_fusion.sh b/tests/regression/check_cmp_cast_branch_fusion.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_copy64_ymm.sh b/tests/regression/check_copy64_ymm.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_crc32_zeroext_moves.sh b/tests/regression/check_crc32_zeroext_moves.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_crc_index_home.sh b/tests/regression/check_crc_index_home.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_empty_leaf_frame.sh b/tests/regression/check_empty_leaf_frame.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_f128_copy_fusion.sh b/tests/regression/check_f128_copy_fusion.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_fixed_slp_distances_codegen.sh b/tests/regression/check_fixed_slp_distances_codegen.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_fma_dest_coalesce_codegen.sh b/tests/regression/check_fma_dest_coalesce_codegen.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_global_addr_cse.sh b/tests/regression/check_global_addr_cse.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_global_addr_remat.sh b/tests/regression/check_global_addr_remat.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_gpr_leaf_param_codegen.sh b/tests/regression/check_gpr_leaf_param_codegen.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_gvn_disjoint_epochs.sh b/tests/regression/check_gvn_disjoint_epochs.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_i686_code16_relax.sh b/tests/regression/check_i686_code16_relax.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_i686_const_div.sh b/tests/regression/check_i686_const_div.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_integer_reduction_vecreg_codegen.sh b/tests/regression/check_integer_reduction_vecreg_codegen.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_licm_alias_disjoint.sh b/tests/regression/check_licm_alias_disjoint.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_load_widen_cast_no_relay.sh b/tests/regression/check_load_widen_cast_no_relay.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_machinst_fallback_replay.sh b/tests/regression/check_machinst_fallback_replay.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_memory_fold_liveness.sh b/tests/regression/check_memory_fold_liveness.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_multi_reduction_vectorize.sh b/tests/regression/check_multi_reduction_vectorize.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_multiple_fp_reductions_codegen.sh b/tests/regression/check_multiple_fp_reductions_codegen.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_o0_no_regalloc.sh b/tests/regression/check_o0_no_regalloc.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_os_nested_loop_inline_policy.sh b/tests/regression/check_os_nested_loop_inline_policy.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_os_postinline_size_policy.sh b/tests/regression/check_os_postinline_size_policy.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_ptr_to_float_cast.sh b/tests/regression/check_ptr_to_float_cast.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_ra_allocstats.sh b/tests/regression/check_ra_allocstats.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_reduction_vecreg_codegen.sh b/tests/regression/check_reduction_vecreg_codegen.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_redundant_test_elimination.sh b/tests/regression/check_redundant_test_elimination.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_reg_src_fold.sh b/tests/regression/check_reg_src_fold.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_return_32bit_zeroext.sh b/tests/regression/check_return_32bit_zeroext.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_slotaddr_reg.sh b/tests/regression/check_slotaddr_reg.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_tier2_graph_default.sh b/tests/regression/check_tier2_graph_default.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_u32_i32_cast_no_relay.sh b/tests/regression/check_u32_i32_cast_no_relay.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_unary_rmw_copy_propagation.sh b/tests/regression/check_unary_rmw_copy_propagation.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_vecreg_new_ops_codegen.sh b/tests/regression/check_vecreg_new_ops_codegen.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_vector_dot_fma_codegen.sh b/tests/regression/check_vector_dot_fma_codegen.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_vector_remainder_codegen.sh b/tests/regression/check_vector_remainder_codegen.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/check_volatile_access_semantics.sh b/tests/regression/check_volatile_access_semantics.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/gnu89_extern_inline_asm_label.c b/tests/regression/gnu89_extern_inline_asm_label.c
+new file mode 100644
+index 0000000..07966c4
+--- /dev/null
++++ b/tests/regression/gnu89_extern_inline_asm_label.c
+@@ -0,0 +1,31 @@
++/* glibc hidden_proto: gnu89 extern-inline body reached via __asm__ label.
++ *
++ * glibc redirects internal calls with
++ *   extern __typeof(f) f __asm__("__GI_f") attribute_hidden;
++ * while the inline-only body is defined under the C name. The inliner's
++ * callee map was keyed by the C name only, so every call site (carrying
++ * the __GI_ label after lowering's asm-rename) missed the body: rtld's
++ * `__argz_next` / `__option_is_end` / `__option_is_short` survived as
++ * undefined externals and the libc.so link failed.
++ *
++ * The callee map now registers the body under both names (single-call-site
++ * accounting sums both spellings).
++ */
++#include <stdio.h>
++
++extern char *my_next(char *entry) __asm__("__GI_my_next")
++    __attribute__((visibility("hidden")));
++extern __inline __attribute__((__gnu_inline__)) char *my_next(char *entry)
++{
++    return entry + 1;
++}
++
++__attribute__((noinline)) char *walk2(char *p) { return my_next(my_next(p)); }
++
++int main(void)
++{
++    char b[4] = "abc";
++    int ok = *walk2(b) == 'c' && *my_next(b) == 'b';
++    printf("hidden-proto:%s\n", ok ? "ok" : "MISMATCH");
++    return ok ? 0 : 1;
++}
+diff --git a/tests/regression/gnu89_extern_inline_must_inline.c b/tests/regression/gnu89_extern_inline_must_inline.c
+new file mode 100644
+index 0000000..b5089da
+--- /dev/null
++++ b/tests/regression/gnu89_extern_inline_must_inline.c
+@@ -0,0 +1,57 @@
++/* GNU89 extern-inline (gnu_inline) bodies must be inlined at -O2.
++ *
++ * `extern __inline __attribute__((__gnu_inline__))` provides an
++ * inline-ONLY definition: no out-of-line copy is emitted in this TU, and a
++ * call left behind resolves to an external symbol. glibc's rtld links with
++ * -nostdlib, so the leftover call to `__bsearch` (bits/stdlib-bsearch.h,
++ * used by intel_check_word via dl-cacheinfo.h) was a hard undefined-symbol
++ * error at the ld.so link.
++ *
++ * The inliner used to reject the body on block count (bsearch: ~10 blocks
++ * with a loop > MAX_INLINE_BLOCKS): is_gnu_inline_def now has a dedicated
++ * eligibility class. This test mirrors the bsearch shape 1:1 and fails to
++ * LINK if the class regresses (nm would show `U my_bsearch`).
++ */
++#include <stdio.h>
++
++typedef int (*cmp_t)(const void *, const void *);
++
++extern __inline __attribute__((__gnu_inline__)) void *
++my_bsearch(const void *key, const void *base, unsigned long nmemb,
++           unsigned long size, cmp_t cmp)
++{
++    const void *p;
++    int c;
++    while (nmemb) {
++        p = (const void *)(((const char *)base) + ((nmemb >> 1) * size));
++        c = (*cmp)(key, p);
++        if (c == 0)
++            return (void *)p;
++        if (c > 0) {
++            base = ((const char *)p) + size;
++            nmemb -= (nmemb >> 1) + 1;
++        } else
++            nmemb >>= 1;
++    }
++    return (void *)0;
++}
++
++static int icmp(const void *a, const void *b)
++{
++    return *(const int *)a - *(const int *)b;
++}
++
++static int find(const int *arr, unsigned long n, int key)
++{
++    void *r = my_bsearch(&key, arr, n, sizeof(int), icmp);
++    return r ? *(int *)r : -1;
++}
++
++int main(void)
++{
++    int a[7] = { 2, 3, 5, 7, 11, 13, 17 };
++    int ok = find(a, 7, 7) == 7 && find(a, 7, 2) == 2 && find(a, 7, 17) == 17
++        && find(a, 7, 4) == -1 && find(a, 7, 1) == -1 && find(a, 0, 2) == -1;
++    printf("bsearch:%s\n", ok ? "ok" : "MISMATCH");
++    return ok ? 0 : 1;
++}
+diff --git a/tests/regression/int_ops_on_xmm_homed_values.c b/tests/regression/int_ops_on_xmm_homed_values.c
+new file mode 100644
+index 0000000..073091f
+--- /dev/null
++++ b/tests/regression/int_ops_on_xmm_homed_values.c
+@@ -0,0 +1,77 @@
++/* Integer ops on XMM-homed values (bit-punned float words).
++ *
++ * After gnu89 extern-inline bodies behind __asm__ labels became inlinable
++ * (glibc hidden_proto), the flt-32 math kernels exposed a backend hole:
++ * integer BinOps/compares whose operand or dest the RA homed in an XMM
++ * register (GET_FLOAT_WORD keeps the word in the FP domain) reached GPR
++ * name lookups and died at unreachable!("invalid x86 register index"):
++ *
++ *   - emit_int_cmp_insn_typed (s_tanf/e_powf/s_erfcf/...)
++ *   - emit_alu_reg_direct rhs + alu.rs dispatch dest (e_logf/e_powf)
++ *   - emit_bit_test_reg_direct base (s_nextupf: BitTest on the sign word)
++ *   - andn dest / mem-dest rhs / int-madd dest
++ *
++ * All such paths now filter XMM homes into the accumulator fallbacks
++ * (operand_to_rax/rcx + store_rax_to handle the xmm<->GPR movq).
++ *
++ * This test mirrors the glibc shape: hidden_proto-style extern-inline
++ * float helpers + bit-punned word manipulation with live FP pressure.
++ */
++#include <stdio.h>
++
++typedef unsigned int u32;
++
++extern float wrap_fabsf(float x) __asm__("__GI_wrap_fabsf");
++extern __inline __attribute__((__gnu_inline__)) float wrap_fabsf(float x)
++{
++    return __builtin_fabsf(x);
++}
++
++static inline u32 bits(float x)
++{
++    union { float f; u32 i; } u;
++    u.f = x;
++    return u.i;
++}
++
++static inline float fromb(u32 i)
++{
++    union { float f; u32 i; } u;
++    u.i = i;
++    return u.f;
++}
++
++__attribute__((noinline)) float my_nextupf(float x)
++{
++    int hx = (int)bits(x);
++    int ix = hx & 0x7fffffff;
++    float ax = wrap_fabsf(x); /* keeps the word's producer in the FP domain */
++    if (ix == 0)
++        return 1.4e-45f;
++    if (ix > 0x7f800000)
++        return x + x;
++    /* BitTest shape: sign bit through a bit-punned word. */
++    if (!((u32)hx >> 31 & 1u)) {
++        if (ix == 0x7f800000)
++            return x;
++        hx += 1;
++    } else {
++        hx -= 1;
++    }
++    /* Extra FP pressure so the punned word competes with live floats. */
++    float guard = ax * 2.0f + wrap_fabsf(x + 1.0f);
++    if (guard < 0.0f)
++        return guard; /* never taken; keeps guard live across the ALU ops */
++    return fromb((u32)hx);
++}
++
++int main(void)
++{
++    int ok = my_nextupf(1.0f) > 1.0f;
++    ok &= my_nextupf(0.0f) > 0.0f;
++    ok &= my_nextupf(-1.0f) > -1.0f;
++    float inf = __builtin_inff();
++    ok &= my_nextupf(inf) == inf;
++    printf("xmmint:%s\n", ok ? "ok" : "MISMATCH");
++    return ok ? 0 : 1;
++}
+diff --git a/tests/regression/local_object_shadows_function_prototype.c b/tests/regression/local_object_shadows_function_prototype.c
+new file mode 100644
+index 0000000..f4dac9f
+--- /dev/null
++++ b/tests/regression/local_object_shadows_function_prototype.c
+@@ -0,0 +1,50 @@
++/* C scoping: a local object shadows a file-scope function prototype.
++ *
++ * glibc nss/nss_module.c declares a function parameter
++ * `void (*bind)(nss_module_functions_untyped)` while <sys/socket.h>
++ * declares the 3-argument socket bind(). Sema's call-arity check resolved
++ * the 1-argument call against the GLOBAL prototype:
++ *   "too few arguments to function 'bind' (expected 3, have 1)".
++ *
++ * The check must resolve through the scoped symbol table first; genuine
++ * arity errors against the real prototype must still be caught (verified
++ * by tests in the sema unit suite, not here — this file must simply
++ * compile and run).
++ */
++#include <stdio.h>
++
++struct sockaddr;
++extern int bind(int, const struct sockaddr *, unsigned); /* sys/socket.h */
++
++typedef void *fnu[32];
++
++static int called_with;
++
++static void my_binder(fnu funcs)
++{
++    called_with = (int)(((void **)funcs)[0] != 0);
++}
++
++/* Parameter named `bind` shadows the socket prototype. */
++static void module_load_full(void *module, void (*bind)(fnu))
++{
++    bind(module); /* 1 argument — the parameter, not socket bind() */
++}
++
++/* Local VARIABLE named `bind` shadows it too. */
++static int local_var_shadow(void *module)
++{
++    void (*bind)(fnu) = my_binder;
++    bind(module);
++    return called_with;
++}
++
++int main(void)
++{
++    void *fake[32] = { (void *)main };
++    module_load_full(fake, my_binder);
++    int a = called_with;
++    int b = local_var_shadow(fake);
++    printf("shadow:%s\n", (a == 1 && b == 1) ? "ok" : "MISMATCH");
++    return (a == 1 && b == 1) ? 0 : 1;
++}
+diff --git a/tests/regression/remat_globaladdr_no_silent_zero.c b/tests/regression/remat_globaladdr_no_silent_zero.c
+new file mode 100644
+index 0000000..baf4aaa
+--- /dev/null
++++ b/tests/regression/remat_globaladdr_no_silent_zero.c
+@@ -0,0 +1,47 @@
++/* Homeless-value materialization: rematerialisable GlobalAddr in generic
++ * value-load paths, and absolute-address dereferences.
++ *
++ * Two silent-zero fabrication sites (same disease class as the
++ * operand_to_rax session-26 hard gate) fixed after Agent C's GCC-torture
++ * triage (execute/20000412-6.c, compile/HIcmp.c family):
++ *
++ *  1. operand_to_rcx's last-resort arm emitted `xorl %ecx,%ecx` for a value
++ *     with no home — a rematerialisable GlobalAddr base of `&buf[k]` became
++ *     0 and the pointer arithmetic produced a small integer instead of an
++ *     address.
++ *  2. value_to_reg panicked (or, in older builds, read a stale slot) for
++ *     the same shape and for literal absolute-address loads
++ *     (`*(short*)0x11111111` read a stack slot instead of the address).
++ *
++ * Both paths now rebuild the GlobalAddr address (GOT/TLS/absolute-aware)
++ * or materialize the constant address into the register.
++ */
++#include <stdio.h>
++
++static char buf[16] = "0123456789abcdef";
++
++/* &buf[k] with a runtime index: the GlobalAddr base is rematerialisable
++ * and must be rebuilt, never fabricated as zero. */
++__attribute__((noinline)) char *pick(int k) { return &buf[k]; }
++
++/* Compile-only: literal absolute addresses must produce a real
++ * materialize+dereference sequence (checked by executing pick/ptr math,
++ * and by this TU merely compiling without ICE at -O2). */
++short absload(short r0, long addr)
++{
++    if (addr == 0) /* never true at runtime with our argument */
++        return (short)(r0 <= *(short *)0x11111111);
++    return r0;
++}
++
++int main(void)
++{
++    char *p = pick(3);
++    long off = p - buf;
++    int ok = (*p == '3') && (off == 3);
++    ok &= pick(0) == buf;
++    ok &= *pick(15) == 'f';
++    ok &= absload(7, 1) == 7;
++    printf("remat:%s off=%ld\n", ok ? "ok" : "MISMATCH", off);
++    return ok ? 0 : 1;
++}
+diff --git a/tests/regression/remat_globaladdr_no_silent_zero.flags b/tests/regression/remat_globaladdr_no_silent_zero.flags
 new file mode 100644
 index 0000000..90e8e23
 --- /dev/null
-+++ b/tests/regression/univsr_variable_init_offset.flags
++++ b/tests/regression/remat_globaladdr_no_silent_zero.flags
 @@ -0,0 +1 @@
 +-O2 -fPIC -march=x86-64-v3
+diff --git a/tests/regression/return_void_expr_gnu_compat.c b/tests/regression/return_void_expr_gnu_compat.c
+new file mode 100644
+index 0000000..c1e101c
+--- /dev/null
++++ b/tests/regression/return_void_expr_gnu_compat.c
+@@ -0,0 +1,36 @@
++/* GCC compatibility: `return expr;` inside a void function.
++ *
++ * glibc uses `return helper();` shims throughout (malloc.c tcache paths,
++ * qsort.c, libio strops.c, login/setutxent.c). GCC in gnu mode accepts a
++ * void-typed expression silently (pedwarn only under -pedantic) and treats
++ * a VALUE return from a void function as a default-on warning with the
++ * value discarded. lccc made both hard errors, then after the sema
++ * relaxation the LOWERER emitted Return(Some(v)) where v was the never-
++ * defined "result" of a void call — glibc __libc_free ICE'd with the
++ * backend's no-home hard gate.
++ *
++ * Checks: the void-expression form runs the side effect exactly once per
++ * call and returns properly on both the early-return and fallthrough
++ * paths.
++ */
++#include <stdio.h>
++
++static int calls;
++
++static void helper(void) { calls++; }
++
++static void outer(int c)
++{
++    if (c)
++        return helper(); /* GNU: evaluated for side effects, then return */
++    helper();
++    helper();
++}
++
++int main(void)
++{
++    outer(1); /* +1 */
++    outer(0); /* +2 */
++    printf("calls=%d\n", calls);
++    return calls == 3 ? 0 : 1;
++}
+diff --git a/tests/regression/run_pgo_roundtrip.sh b/tests/regression/run_pgo_roundtrip.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/run_regression.sh b/tests/regression/run_regression.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/run_regression_arm.sh b/tests/regression/run_regression_arm.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/regression/segfs_pointer_declarator_matrix.c b/tests/regression/segfs_pointer_declarator_matrix.c
+new file mode 100644
+index 0000000..f913578
+--- /dev/null
++++ b/tests/regression/segfs_pointer_declarator_matrix.c
+@@ -0,0 +1,81 @@
++/* GCC named address spaces (__seg_fs) — full declarator/typedef/flow matrix.
++ *
++ * Fixed defects (glibc 2.44 csu/libc-start.c, __libc_start_main_impl):
++ *
++ *  1. post-phi copy cleanup removed `v = Copy(Const 16)` feeding
++ *     `Load %fs:(v)`: Value-position fields (Load.ptr, Store.ptr, GEP.base)
++ *     cannot hold a constant, `replace_value_in_place` silently skipped the
++ *     rewrite, and the load's only def vanished (backend no-home ICE).
++ *
++ *  2. `build_full_ctype*` hardcoded AddressSpace::Default on every derived
++ *     Pointer, so NAMED variables and typedefs of segment pointers lost the
++ *     qualifier — their dereferences emitted absolute-address loads
++ *     (SIGSEGV on the NULL page). Only direct `*(T __seg_fs *)N` casts
++ *     survived.
++ *
++ *  3. Initializer casts to segment-qualified pointers `mem::take` the
++ *     parser's parsing_address_space, clearing the declaration-level
++ *     qualifier before Declaration::new read it
++ *     (`T __seg_fs *p = (T __seg_fs *)40;` lost %fs entirely).
++ *
++ * %fs:40 is the x86-64 TLS stack canary and %fs:16 the TCB self pointer —
++ * both always mapped and readable in a live glibc process, which makes this
++ * miscompile class *executable*: a regressing compiler segfaults on the
++ * NULL-page load instead of printing matching values.
++ */
++#include <stdio.h>
++
++typedef unsigned long __seg_fs *fsp_t;
++
++static unsigned long direct_cast(void) {
++    return *(__seg_fs unsigned long *)40;
++}
++
++static unsigned long qualifier_after_base(void) {
++    return *(unsigned long __seg_fs *)40;
++}
++
++static unsigned long via_variable(void) {
++    unsigned long __seg_fs *p = (unsigned long __seg_fs *)40;
++    return *p;
++}
++
++static unsigned long via_typedef_cast(void) { return *(fsp_t)40; }
++
++static unsigned long via_typedef_variable(void) {
++    fsp_t p = (fsp_t)40;
++    return *p;
++}
++
++/* Pointer selected between two constant TLS offsets: lowers to
++ * `phi-home = Copy(Const)` feeding a SegFs load — the exact
++ * __libc_start_main_impl shape that ICEd. %fs:0 holds the TCB self
++ * pointer (nonzero), %fs:40 the canary. */
++static volatile int sel = 1;
++static unsigned long phi_const_ptr(int c) {
++    fsp_t p = (fsp_t)(unsigned long)(c ? 40 : 0);
++    return *p;
++}
++
++/* The qualifier must not leak into following declarations. */
++static unsigned long plain_val = 7;
++static unsigned long no_leak(void) {
++    unsigned long *q = &plain_val; /* ordinary pointer */
++    return *q;
++}
++
++int main(void) {
++    unsigned long canary = direct_cast();
++    int ok = canary != 0;
++    ok &= qualifier_after_base() == canary;
++    ok &= via_variable() == canary;
++    ok &= via_typedef_cast() == canary;
++    ok &= via_typedef_variable() == canary;
++    ok &= phi_const_ptr(sel) == canary;
++    ok &= phi_const_ptr(0) != 0; /* %fs:0 = TCB self pointer */
++    ok &= no_leak() == 7;
++    /* Print a stable token (not the canary value itself) for the
++     * cross-compiler stdout comparison. */
++    printf("segfs-matrix:%s\n", ok ? "ok" : "MISMATCH");
++    return ok ? 0 : 1;
++}
+diff --git a/tests/regression/segfs_pointer_declarator_matrix.flags b/tests/regression/segfs_pointer_declarator_matrix.flags
+new file mode 100644
+index 0000000..90e8e23
+--- /dev/null
++++ b/tests/regression/segfs_pointer_declarator_matrix.flags
+@@ -0,0 +1 @@
++-O2 -fPIC -march=x86-64-v3
+diff --git a/tests/regression/vector_typedef_offsetof_consteval.c b/tests/regression/vector_typedef_offsetof_consteval.c
+new file mode 100644
+index 0000000..5e08e75
+--- /dev/null
++++ b/tests/regression/vector_typedef_offsetof_consteval.c
+@@ -0,0 +1,57 @@
++/* Vector-typedef struct layout must be identical in const-eval and runtime.
++ *
++ * glibc 2.44 elf/dl-trampoline.S failed with
++ *   "#error LR_VECTOR_OFFSET must be multiple of VEC_SIZE"
++ * because the gen-as-const pipeline (asm "i" constraint / global-init
++ * const-eval) computed offsetof(La_x86_64_regs, lr_vector) = 96 while the
++ * runtime path said 192: sema's typedef registration skipped
++ * __attribute__((vector_size(N))), recorded La_x86_64_xmm as a plain
++ * 4-byte float, and poisoned the SHARED struct-layout cache that lowering's
++ * const-eval reads.
++ *
++ * This mirrors glibc's exact La_x86_64_regs shape and checks const-eval
++ * (global initializers, enum, case labels) against runtime offsetof.
++ */
++#include <stdio.h>
++
++typedef float xmm_t __attribute__((__vector_size__(16)));
++typedef float ymm_t __attribute__((__vector_size__(32), __aligned__(16)));
++typedef double zmm_t __attribute__((__vector_size__(64), __aligned__(16)));
++
++typedef union {
++    ymm_t ymm[2];
++    zmm_t zmm[1];
++    xmm_t xmm[4];
++} vec_t __attribute__((__aligned__(16)));
++
++struct regs {
++    unsigned long r[8];
++    xmm_t lr_xmm[8];
++    vec_t lr_vector[8];
++    __int128 pad[4];
++};
++
++/* Global-initializer const-eval path (the poisoned one). */
++static const long g_xmm_off = __builtin_offsetof(struct regs, lr_xmm);
++static const long g_vec_off = __builtin_offsetof(struct regs, lr_vector);
++static const long g_size = sizeof(struct regs);
++
++/* Enum path: another pure-const context. */
++enum { E_VEC_OFF = __builtin_offsetof(struct regs, lr_vector) };
++
++int main(void) {
++    int ok = 1;
++    ok &= g_xmm_off == 64;
++    ok &= g_vec_off == 192;
++    ok &= E_VEC_OFF == 192;
++    ok &= g_size == 768;
++    /* Runtime path must agree with const-eval. */
++    ok &= (long)__builtin_offsetof(struct regs, lr_xmm) == g_xmm_off;
++    ok &= (long)__builtin_offsetof(struct regs, lr_vector) == g_vec_off;
++    ok &= (long)sizeof(struct regs) == g_size;
++    /* dl-trampoline's own assertion shape. */
++    ok &= (g_vec_off % 64) == 0;
++    printf("layout:%s xmm=%ld vec=%ld size=%ld\n", ok ? "ok" : "MISMATCH",
++           g_xmm_off, g_vec_off, g_size);
++    return ok ? 0 : 1;
++}
+diff --git a/tests/workloads/zlib-ng-2.3.3/run.sh b/tests/workloads/zlib-ng-2.3.3/run.sh
+old mode 100755
+new mode 100644
