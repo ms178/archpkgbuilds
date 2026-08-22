@@ -1,561 +1,839 @@
-From e761c50237b7ff862d95ddf60c68b021a6048df5 Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sat, 22 Aug 2026 10:09:31 +0000
-Subject: [PATCH 1/2] AArch64: integer madd/msub fusion + function-scoped GDSE
- (audited lev 08-22 ports)
-
-Audit of levkropp's 17 Aug-22 commits; two adopted this session after
-line-by-line review, the rest triaged (see below).
-
-ADOPTED 9f064faa (integer madd/msub fusion), rewritten for our tree:
-- supports_fused_int_madd_reg trait hook: integer Mul;Add fuses even for
-  register-homed mul temps on AArch64 (madd latency == mul latency on
-  every shipping core; one fewer instruction and a freed register).
-  x86 keeps the slot-homed-only gate (no integer madd; the fused path
-  stages through the accumulator, so register-direct stays better).
-- supports_fused_int_mul_sub: integer 'acc - a*b' -> msub. STRICT
-  operand-order gate: 'a*b - acc' has no msub form and stays split
-  (validated: no_msub() emits mul+sub, msub_ok() emits msub).
-- New emit_int_fused_mul_sub_impl mirrors the madd emitter's staging.
-  BOTH emitters hardened against the session-29 ICE class his version
-  ignores: FP-homed integer operands stage through the scratch GPR and
-  FP-homed dests fall through to store_x0_to (callee_saved_name panics
-  on FP register indices; his emitter would ICE on regalloc's FP-homed
-  integer values).
-- Gates: CCC_NO_INT_MADD, CCC_NO_MSUB.
-- HIS PERF CLAIMS DID NOT REPRODUCE: sieve -4.4% claim = assembly is
-  byte-identical on/off (his win came from his other regalloc patches);
-  hash_table interleaved-5 = +0.1% (noise). Adopted anyway on the
-  instruction-count argument (3-4 fewer instructions per benchmark,
-  wrap-around semantics bit-identical, overflow sanity in the test).
-
-ADOPTED 1a432a1a (function-scoped GDSE), applied to OUR conservative
-GDSE (his rewritten pass stays rejected): the peephole runs on the
-whole module text, so (a) one address-of-sp anywhere disabled the pass
-for every function in the module, and (b) load ranges collected in
-function A kept dead stores alive in function B (different frames).
-Split at .cfi_endproc; each frame analyzed independently.
-
-TRIAGED, NOT ADOPTED (documented verdicts):
-- 6b8fa0b5/b15548ac (FP copy-web coalescing, multi-segment conflict
-  checks): HIGH-RISK regalloc; needs its own session with gzip gate.
-- 0d47feeb (shrink-wrapping, 380 lines): high value, high risk; own
-  session.
-- bdc2aba1/03e21b1a/972e5535 (sxtw tracking family): interlocking
-  tracker state, adopt as a unit later.
-- 7c54ece0 (affine alias cross-kind): our alias.rs diverged; needs
-  semantic re-derivation, not a port.
-- 558e3ed9 (const hoist): diff does not apply; our int_const_hoist
-  evolved differently. Re-derive later.
-- 2fdf496e caller-saved-first leaf allocation: entangled with his
-  regalloc stack; 177b560d/86b34508/8974cc9a (FP-via-GPR fold, wzr/xzr
-  stores, adr jump tables, ubfx): straightforward but each needs its
-  own soundness pass; queued.
-
-Validation: 1075/1075 unit, 50/50 correctness, x86 regression 406/406
-(check_tier2 now green upstream), ARM regression 0 new fails, fuzz
-300/300 x86-64 + 300/300 m32 + 450/450 aarch64 (O1/O2/Os, seeds 0:150),
-segfault gate all benchmarks x {x86 O1/O2, m32 O2, arm O2} clean,
-ARM benchmark outputs 9/9 identical to gcc, full reproducer sweep
-green. New test: arm_int_madd_msub_fusion.c (incl. overflow-wrap and
-operand-order negative case).
----
- src/backend/arm/codegen/alu.rs              | 73 ++++++++++++++++++++-
- src/backend/arm/codegen/emit.rs             | 23 ++++++-
- src/backend/arm/codegen/peephole.rs         | 32 ++++++++-
- src/backend/generation.rs                   | 43 ++++++++++--
- src/backend/traits.rs                       | 17 +++++
- tests/regression/arm_int_madd_msub_fusion.c | 20 ++++++
- 6 files changed, 194 insertions(+), 14 deletions(-)
- create mode 100644 tests/regression/arm_int_madd_msub_fusion.c
-
-diff --git a/src/backend/arm/codegen/alu.rs b/src/backend/arm/codegen/alu.rs
-index 32c7f749..c1c8c79f 100644
---- a/src/backend/arm/codegen/alu.rs
-+++ b/src/backend/arm/codegen/alu.rs
-@@ -1,7 +1,7 @@
- //! ArmCodegen: ALU operations (integer arithmetic, bitwise, unary).
+diff --git a/docs/history/2026-08-22-session50-gvn-disjoint-epochs.md b/docs/history/2026-08-22-session50-gvn-disjoint-epochs.md
+new file mode 100644
+index 0000000..1bb65b1
+--- /dev/null
++++ b/docs/history/2026-08-22-session50-gvn-disjoint-epochs.md
+@@ -0,0 +1,123 @@
++# Session 50 — GVN per-object epochs (OP-32) + battery hardening + IV-across-call miscompile found
++
++Base: `ms178/lccc` main `a06c720` (PR #191, which upstreamed the session-49
++dedup + N-accumulator work). Build: `fastbuild`, Rust `-O1`, no LTO, two jobs,
++8 GB swap. Host: constrained VM, no PMU.
++
++## 1. GVN per-object epochs for disjoint allocas and restrict parameters (OP-32)
++
++GVN's load CSE / store-to-load forwarding previously keyed per-object epochs
++ONLY for named globals: a store through any other pointer (alloca-derived or
++parameter-derived) bumped the global generation and invalidated every cached
++load.  This session extends the mechanism to two more provably-disjoint object
++classes:
++
++- **Non-escaping allocas** — an alloca whose address provably never leaves the
++  function (`find_nonescaping_allocas`: owner-set fixpoint through
++  address-preserving ops, escape on Store-value / call / asm / terminator).
++  With no escape, every pointer that can reach the alloca is tracked by GVN,
++  so a store through it bumps only that alloca's epoch.
++- **`restrict` pointer parameters** — `find_noalias_params` reads
++  `IrParam.noalias` (plumbed from `restrict` by the frontend).  A restrict
++  parameter cannot alias any other object, so its stores invalidate only its
++  own epoch.
++
++Root propagation (`track_ptr_base`) is single-source and fail-closed:
++`GlobalAddr` / non-escaping `Alloca` / noalias `ParamRef` roots, propagated
++through `GetElementPtr`, pointer-to-pointer `Cast`, `Copy`, and integer-width
++pointer arithmetic (`Add` with exactly one rooted operand, `Sub` with a rooted
++left operand).  Phis/selects with mixed bases, loads of pointers, non-pointer
++casts and two-pointer arithmetic stay `Unknown` and fall back to the global
++generation.
++
++Soundness (re-derived; the same facts as the session-42/45 alias work): two
++allocas are distinct frame objects; an alloca and a global are frame vs static
++storage; an alloca and any parameter are distinct (a parameter's value is
++fixed at entry, before the frame exists); a restrict parameter is disjoint
++from everything by contract; distinct globals are disjoint (pre-existing GVN
++assumption, GNU aliases canonicalized).  Crucially, stores through `Unknown`
++pointers still bump the global generation, which invalidates every load —
++including alloca-rooted ones — so a non-escaping alloca cannot be reached by
++an untracked pointer.
++
++### Evidence
++
++```
++int f(int n, int *restrict x, int *restrict y) {
++    int s = 0;
++    for (int i = 0; i < n; i++) { s += y[i]; x[i] = i * 2; s += y[i]; }
++    return s;
++}
++```
++
++Base emits two `movslq (%rdx,%r12,4)` loads of `y[i]`; with the change the
++second load is value-numbered to the first (one memory load per iteration
++eliminated).  The plain (non-restrict) control still reloads `y[i]` after the
++`x[i]` store, and `f_plain(n, x, x)` (aliased) is runtime-correct — pinned by
++`tests/regression/check_gvn_disjoint_epochs.sh`.
++
++Validation: **1075** unit, **404** regression (+1 new) / 2 skip, **50/50**
++correctness, **600/600** O2/O3/Os differential fuzz, 36-file benchmark/pattern
++corpus byte-identical vs base (the optimization targets allocas/restrict
++shapes the corpus mostly lacks; the win is structural, not corpus-visible).
++
++## 2. Battery hardening
++
++The gzip runner's `make check -j2` was **not** the flaky part — the actual
++root cause of two `make check` failures (one gcc, one lccc, both 30/30 in
++isolation) was a full `/tmp` tmpfs (a leftover 846 MB worktree build).  Two
++fixes:
++
++- `tests/workloads/gzip-1.14/run.py` now runs `make check` serially and
++  retries once before failing (the gzip suite's `timestamp`/`atime` tests are
++  filesystem-granularity-sensitive and must not race under `-j`).
++- Battery runs are documented to use a disk-backed `TMPDIR` (`/home/user/tmp`)
++  instead of the 993 MB tmpfs.
++
++Battery on the modified compiler: **gzip 1.14 30/30 for both lccc and gcc**,
++byte-identical streams (lccc ~1.74× gcc geomean on compression — the known
++codec gap, reported honestly); **zlib-ng 2.3.3 roundtrip byte-identical,
++62/69 CTest pass**.
++
++## 3. Pre-existing miscompile found: loop IV carried in a caller-saved register across a call
++
++The 7 failing zlib-ng CTest cases (`CVE-2018-25032` ×6, `GH-382`) are a real
++lccc miscompile, **pre-existing at `a06c720` and independent of this session's
++GVN change** (a GCC build of the same zlib-ng passes 100%; the base lccc build
++fails identically).
++
++Root cause: in
++
++```c
++for (int i = 1; i < argc; i++)
++    if (strcmp(argv[i], "-m") == 0 && i + 1 < argc)
++        mem_level = atoi(argv[++i]);
++```
++
++the `++i` SSA value (`i1 = i + 1`) is both the array index and the loop
++induction value feeding the backedge.  The x86 backend computes it in `%edi`
++BEFORE the `strtol` call (for `argv[++i]`), then the shared loop latch does
++`movl %edi,%eax; addl $1,%eax; movq %rax,slot` — but `%edi` is caller-saved
++and clobbered by the call, so the latch stores a garbage induction value and
++the loop runs past `argc` into `environ` (zlib-ng's minideflate then tries to
++`fopen("E2B_TEMPLATE_ID=...")`).
++
++Standalone reproducer: `tests/gauntlet-repros/loop_iv_across_call.c`
++(expected `1 -15 2 6 0 0 4 1 1 1`, lccc gives `1 0 0 6 0 0 0 1 1 1`).
++
++The fix belongs in the backend latch/register allocation: a value live across
++a call must not ride a caller-saved register, or the latch must reload the
++induction slot instead of trusting `%edi`.  This is the #1 follow-up (see
++BACKLOG); it is deliberately NOT patched here because it is a pre-existing RA
++defect that needs the full multi-session battery, not a rushed change.
++
++## Follow-up
++
++1. **Loop-IV-across-call miscompile** (above) — top priority; the reproducer
++   is committed in `tests/gauntlet-repros/`.
++2. Re-run the zlib-ng full CTest after fixing it (expected 69/69).
++3. The GVN epochs could extend to `noalias` parameters used via GEP chains in
++   the vectorizer's `VecLoad*` address space (the same `ptr_base` facts).
++4. glibc 2.44 and expat/sqlite end-to-end gates remain open — the pinned
++   expat 2.8.2 / sqlite 3.53.4 tarball checksums are in
++   `tests/benchmark/WORKLOAD_PROVENANCE.md`.
+diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
+index 7b9f59d..2fbe185 100644
+--- a/engineering/agent/BACKLOG.md
++++ b/engineering/agent/BACKLOG.md
+@@ -368,6 +368,7 @@ engineering/evidence/workloads/
+ - ✅ **Session 46 (2026-08-22)** — MachInst partial-register segfault class closed. `lower_cast` (x86-64 MachInst ISel) lowered every narrowing/same-size cast as a truncating `movb`/`movw`/`movl`, leaving the destination register's upper bits stale; the folded-SIB index path then read a never-materialized cast result from its (die-at-birth-shared) home at 64-bit width — zlib-ng `zng_emit_dist`'s `extra_dbits(%rcx,%r10,4)` segfaulted OOB. Narrowing/same-size casts now emit extending moves (`movzbl`/`movsbl`/`movzwl`/`movswl`/`movslq`; `movl`-via-`Movzx` so a die-at-birth self-move can never skip the extension; `movl`/`movq $imm` for constants), matching the mature path and GCC/Clang.  The IR always widens sub-32-bit values through an explicit Cast before wider uses, so extending every cast home closes the whole class.  New regressions: `session46_dist_code_index.c` (the zlib shape) and `session46_narrow_cast_torture.c` (U8/U16/I8/I16 × index/shift/mul/select/call/chain, GCC-differential).  Validated: 1046 unit (3 new `lower_cast` tests), 375/383 regression, intrinsics 3/3, zlib-ng 2.3.3 gate ctest=8 roundtrip=0, gzip 1.14 30/30 + roundtrip, expat 2.7.1 2/2 ctest, phi 1800/1800, differential 1500/1500, alias-m32 1080/1080.  See `docs/history/2026-08-22-session46-machinst-partial-register-segfault.md`.
+ - ✅ **Session 45 (2026-08-22)** — final red-team audit of vector-temp-promotion v3 (Agent B's patch, independently re-red-teamed): `Load256`/`Store256` keep their 32-byte alignment contracts (not forwardable/relaxable); promotion additionally requires `intrinsic_overwrites_full_result` (FMA/BroadcastLoadF64/store forms never rewrite their dest); `intrinsic_dest_reads_old_value` centralizes RMW destination semantics and feeds `single_read_sites` so write-only dests stop keeping forwarded loads alive (gzip PCLMUL −5 static insns); `pointer_roots` → `pointer_root_analysis` with iterative Kosaraju SCC + single-seed cycle shortcut (`p = phi(seed, p+stride)` now resolves, multi-seed cycles fail closed) + recurrence tracking gating the multi-use Loaddqu exception; wide scalar accesses retain natural alignment (I128/F128 on non-x86); pass order is promote → fuse → downgrade; O(1) load-result membership. Adoption audit fixed: module-wide `max_value_id` array sizing → dense per-function value-id renumbering, the quadratic terminator-loop lookup B missed, `cyclic_seed` simplification, and the complexity comment (O(V + Σ arity²), not flat O(V+E)). Kept the session-44 constant-address rule (alloca-confined writes provably cannot hit a fixed address). New stress regression `session45_vector_recurrence_stress.c`. See `docs/history/2026-08-22-session45-vector-promotion-v3-audit.md`.
+ - ✅ **Session 47** — multi-reduction vectorization: loops with TWO independent accumulators (`vBv += u[i]*v[i]; vv += v[i]*v[i]`, double running sums/dots) now vectorize on AVX2 + SSE2 via `ReductionPattern.second`/`analyze_secondary_accumulator`/`rewrite_reduction_body` (descending add-index order, one union soundness check, extracted `rewrite_accumulator_uses_outside_loop`). Dependent (`sum2 += sum1`), widening, and >2-accumulator shapes fail closed; single-accumulator path A/B-verified bit-identical. Evidence: new `double_reduction` benchmark 3.75× → **1.085×** vs GCC (3.5× over LCCC scalar); 1045 lib + 391 regression + 50 correctness + 360 fuzz. See `docs/history/2026-08-22-session47-multi-reduction.md`.
++- ✅ **Session 50** — GVN per-object epochs for disjoint non-escaping allocas and `restrict` parameters (OP-32): `find_nonescaping_allocas` (owner-set fixpoint + escape scan) and `find_noalias_params` feed a `PtrBase` classification propagated single-source through GEP/ptr-Cast/Copy/Add/Sub; stores through classified objects bump only that object's epoch, `Unknown` still bumps the global generation. Eliminates the redundant `y[i]` reload across a disjoint `x[i]` store (`check_gvn_disjoint_epochs.sh` pins the restrict/plain/aliased cases). Battery hardening: gzip runner runs `make check` serially with one retry (the earlier "flakes" were a full /tmp tmpfs). **Found a pre-existing miscompile**: loop IV carried in caller-saved `%edi` across a call (`argv[++i]` shape) → zlib-ng `CVE-2018-25032`/`GH-382` CTest failures (62/69; roundtrip byte-identical; GCC build 100%). Reproducer committed at `tests/gauntlet-repros/loop_iv_across_call.c`. See `docs/history/2026-08-22-session50-gvn-disjoint-epochs.md`.
+ - ✅ **Session 49** — re-based onto PR #190 (which superseded the integer-home half of session 48 with I64x2 + XMM2-scratch quarantine) and kept the two still-unique pieces: `deduplicate_vector_loads` (one VecLoad per shared array per iteration, single- and multi-accumulator paths) and the N-accumulator lift (`seconds: Vec<SecondaryAccumulator>`, arbitrary independent zero-init chains, per-accumulator remainder chains). Conflicts resolved by taking upstream's regalloc/intrinsics verbatim and re-applying the vectorize deltas on top (incl. the new NEON `Max` reduction). See `docs/history/2026-08-22-session49-rebase-dedup-nacc.md`.
+ - ✅ **Session 48** — completed the highest-ROI session-47 follow-up: x86 reduction homes now cover I32x8/I32x4 and I64x2 sum/dot copy webs; integer zero/horizontal/software-multiply emitters honor assignments; the XMM2 scratch quarantine no longer disables a safe pool starting at XMM3. `double_reduction`: 215 vs 227 control instructions, 39 vs 63 frame refs, paired treatment/control **0.7251×** (95% CI 0.6007..0.8807), and current LCCC **0.895× GCC**. Added AVX2/SSE2/I64 structural control gate, generalized the paired benchmark script, made the i686 FMA regression libc-independent, and refreshed the stale Tier-2 frame assertion. Validated: 1075 unit, 381/390 differential (7 oracle + 2 host skips), 400/400 shell/structural, intrinsics 3/3, gzip 30/30 treatment/control. See `docs/history/2026-08-22-session48-integer-reduction-homes.md`.
+ - ✅ **Session 43** — red-team of Agent D's vector-temp-promotion v2: adopted (movnt align-16 relaxation via `intrinsic_dest_required_alignment`, unified width-typed `pointer_vector_arg_width`, non-escaping-alloca alias refinement, load-load chaining, single-read-site gating) and fixed two miscompiles it re-introduced — (1) `invalidate_for_value_write` dropped the slot-vs-write check (reassignment `v=load(p); v=setzero(); use(v)` read stale `p`), now a `write_may_clobber` slot+source test; (2) `VecStoreI64x2` writes memory through `args[1]` with `dest_ptr:None` but inherited the `produces_vector_value` register-result exemption. Also re-added the load-`dest` dead check and added the six 256-bit widening extensions (Pmovzx*/Pmovsx*256) to the forwardable/relaxable table. Measured: simd_movnt 422→390 insns / frame 440→392; simd_avx2_256 743→734 / 1016→824. See `docs/history/2026-08-21-session43-vector-promotion-v2-redteam.md`.
+diff --git a/src/passes/gvn.rs b/src/passes/gvn.rs
+index 85daf2a..d7e9b51 100644
+--- a/src/passes/gvn.rs
++++ b/src/passes/gvn.rs
+@@ -97,6 +97,54 @@ struct MemoryVersion {
+     base: u64,
+ }
  
- use super::emit::{
--    arm_alu_mnemonic, callee_saved_name, callee_saved_name_32, is_arm_fp_phys, ArmCodegen,
-+    ArmCodegen, arm_alu_mnemonic, callee_saved_name, callee_saved_name_32, is_arm_fp_phys,
- };
- use crate::common::types::IrType;
- use crate::ir::reexports::{IrBinOp, Operand, Value};
-@@ -24,7 +24,10 @@ impl ArmCodegen {
-         debug_assert!(amount < width);
- 
-         let mut materialize = |this: &mut Self, op: &Operand, scratch: &str| -> String {
--            if let Some(reg) = this.operand_reg(op) {
-+            // FP-homed integer values must stage through the scratch GPR:
-+            // callee_saved_name panics on FP register indices (the session-29
-+            // ICE class). operand_to_x0 handles the fmov correctly.
-+            if let Some(reg) = this.operand_reg(op).filter(|r| !is_arm_fp_phys(*r)) {
-                 if use_32bit {
-                     callee_saved_name_32(reg).to_string()
-                 } else {
-@@ -106,7 +109,7 @@ impl ArmCodegen {
-         let lhs_reg = materialize(self, lhs, if use_32bit { "w1" } else { "x1" });
-         let rhs_reg = materialize(self, rhs, if use_32bit { "w2" } else { "x2" });
-         let acc_reg = materialize(self, acc, if use_32bit { "w3" } else { "x3" });
--        if let Some(dest_phys) = self.dest_reg(dest) {
-+        if let Some(dest_phys) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
-             let output = if use_32bit {
-                 callee_saved_name_32(dest_phys)
-             } else {
-@@ -127,6 +130,70 @@ impl ArmCodegen {
-         self.store_x0_to(dest);
++/// A provably-distinct memory object a pointer may be rooted at.  Load-CSE and
++/// store-to-load-forwarding entries keyed on such an object only need to be
++/// invalidated by stores through pointers rooted at the SAME object.
++///
++/// Soundness of the per-object epochs (established in the session-42/45 alias
++/// work and re-derived here):
++///
++/// * two `Alloca`s are distinct frame objects;
++/// * an `Alloca` and a `Global` are frame vs static storage;
++/// * an `Alloca` and any parameter are distinct — a parameter's value is fixed
++///   at function entry, before the callee's frame exists;
++/// * a `NoAliasParam` (`restrict` pointer) is distinct from every other object
++///   by the C restrict contract (the pointee is accessed only through that
++///   parameter and pointers derived from it);
++/// * distinct `Global`s are disjoint (the pre-existing GVN assumption; GNU
++///   symbol aliases are canonicalized through `GvnContext::canonical`).
++///
++/// `NoAliasParam`s never alias anything, and `Alloca`s only alias themselves
++/// PROVIDED their address cannot be recovered by untracked code.  An alloca is
++/// therefore only admitted when `find_nonescaping_allocas` proves its address
++/// never escapes (never stored, passed to a call/asm, or used in a
++/// terminator): with no escape, every pointer that can reach it is derived
++/// in-function from the alloca itself and is tracked here.  Any pointer GVN
++/// cannot classify stays `Unknown` (no entry), and stores through it bump the
++/// global generation, which invalidates every cached load.
++#[derive(Debug, Clone, PartialEq, Eq, Hash)]
++enum PtrBase {
++    Global(String),
++    Alloca(u32),
++    NoAliasParam(usize),
++}
++
++/// Epoch-map key for a `PtrBase`.
++#[derive(Debug, Clone, PartialEq, Eq, Hash)]
++enum ObjKey {
++    Sym(String),
++    Alloca(u32),
++    Param(usize),
++}
++
++fn obj_key(base: &PtrBase) -> ObjKey {
++    match base {
++        PtrBase::Global(s) => ObjKey::Sym(s.clone()),
++        PtrBase::Alloca(id) => ObjKey::Alloca(*id),
++        PtrBase::NoAliasParam(i) => ObjKey::Param(*i),
++    }
++}
++
+ /// Module facts needed to canonicalize GNU symbol aliases during GVN.
+ #[derive(Debug, Clone, Default)]
+ pub(crate) struct GvnContext {
+@@ -156,19 +204,26 @@ struct GvnState {
+     load_generation: u32,
+     /// Store-to-load forwarding map with the version recorded after the store.
+     store_fwd_map: FxHashMap<StoreFwdKey, (Operand, MemoryVersion)>,
+-    /// Pointer value number -> global symbol name, for pointers that resolve to
+-    /// a named global (GlobalAddr, or GEP rooted at one). Two distinct globals
+-    /// are disjoint objects and never alias, so a store to one cannot affect
+-    /// loads of the other; per-symbol store epochs exploit this.
+-    ptr_global_base: FxHashMap<u32, String>,
+-    /// Global symbol -> epoch of its most recent store. Load CSE and store-to-
+-    /// load forwarding entries are valid only if they predate the last store to
+-    /// the SAME symbol (GEPs within a symbol may overlap, so any store in the
+-    /// symbol invalidates all loads in it; stores to other symbols do not).
+-    base_store_epoch: FxHashMap<String, u64>,
++    /// Pointer value number -> provably-distinct base object, for pointers
++    /// rooted at a named global, a non-escaping alloca, or a `restrict`
++    /// parameter.  Two pointers with different roots never alias, so a store
++    /// through one only invalidates cached loads through the same object;
++    /// per-object store epochs exploit this (see `PtrBase`).
++    ptr_base: FxHashMap<u32, PtrBase>,
++    /// Base object -> epoch of its most recent store.  Load CSE and store-to-
++    /// load forwarding entries are valid only if they predate the last store
++    /// to the SAME object (GEPs within an object may overlap, so any store in
++    /// the object invalidates all loads in it; stores to other objects do not).
++    base_store_epoch: FxHashMap<ObjKey, u64>,
+     next_base_epoch: u64,
+-    /// Rollback log for per-symbol epochs.
+-    base_epoch_log: Vec<(String, Option<u64>)>,
++    /// Rollback log for per-object epochs.
++    base_epoch_log: Vec<(ObjKey, Option<u64>)>,
++    /// Non-escaping allocas (computed once per function): only these get
++    /// `PtrBase::Alloca` epochs.
++    nonescaping_allocas: FxHashSet<u32>,
++    /// `restrict` pointer parameter indices: only these get
++    /// `PtrBase::NoAliasParam` epochs.
++    noalias_params: FxHashSet<usize>,
+     context: GvnContext,
+     /// Rollback log for `expr_to_value`: (key, previous_value).
+     rollback_log: Vec<(ExprKey, Option<Value>)>,
+@@ -215,6 +270,8 @@ impl GvnState {
+         context: &GvnContext,
+         must_mat_gaddrs: FxHashSet<u32>,
+         site_local_gaddrs: FxHashSet<u32>,
++        nonescaping_allocas: FxHashSet<u32>,
++        noalias_params: FxHashSet<usize>,
+     ) -> Self {
+         Self {
+             value_numbers: vec![u32::MAX; max_value_id + 1],
+@@ -224,10 +281,12 @@ impl GvnState {
+             gep_value_numbers: FxHashMap::default(),
+             load_generation: 0,
+             store_fwd_map: FxHashMap::default(),
+-            ptr_global_base: FxHashMap::default(),
++            ptr_base: FxHashMap::default(),
+             base_store_epoch: FxHashMap::default(),
+             next_base_epoch: 0,
+             base_epoch_log: Vec::new(),
++            nonescaping_allocas,
++            noalias_params,
+             context: context.clone(),
+             rollback_log: Vec::new(),
+             load_rollback_log: Vec::new(),
+@@ -297,9 +356,9 @@ impl GvnState {
+     fn memory_version(&self, ptr_vn: &VNOperand) -> MemoryVersion {
+         let base = match ptr_vn {
+             VNOperand::ValueNum(v) => self
+-                .ptr_global_base
++                .ptr_base
+                 .get(v)
+-                .and_then(|name| self.base_store_epoch.get(name))
++                .and_then(|base| self.base_store_epoch.get(&obj_key(base)))
+                 .copied()
+                 .unwrap_or(0),
+             VNOperand::Const(_) => 0,
+@@ -314,33 +373,131 @@ impl GvnState {
+         version == self.memory_version(ptr_vn)
      }
  
-+    /// Integer fused multiply-subtract: dest = acc - lhs*rhs (msub).
-+    /// Same staging discipline as emit_int_fused_mul_add_impl; msub reads
-+    /// all three sources before writing, so output aliasing is safe.
-+    pub(super) fn emit_int_fused_mul_sub_impl(
-+        &mut self,
-+        lhs: &Operand,
-+        rhs: &Operand,
-+        acc: &Operand,
-+        dest: &Value,
-+        ty: IrType,
-+    ) {
-+        let use_32bit = matches!(
-+            ty,
-+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
-+        );
-+        let mut materialize = |this: &mut Self, op: &Operand, scratch: &str| -> String {
-+            // FP-homed integer values stage through the scratch GPR
-+            // (callee_saved_name panics on FP indices; session-29 class).
-+            if let Some(reg) = this.operand_reg(op).filter(|r| !is_arm_fp_phys(*r)) {
-+                if use_32bit {
-+                    callee_saved_name_32(reg).to_string()
-+                } else {
-+                    callee_saved_name(reg).to_string()
-+                }
-+            } else {
-+                if let Operand::Value(v) = op {
-+                    if !this.state.is_alloca(v.0) {
-+                        if let Some(slot) = this.state.get_slot(v.0) {
-+                            this.emit_load_from_sp(scratch, slot.0, "ldr");
-+                            return scratch.to_string();
-+                        }
-+                    }
-+                }
-+                this.operand_to_x0(op);
-+                let acc_name = if use_32bit { "w0" } else { "x0" };
-+                this.state
-+                    .emit_fmt(format_args!("    mov {}, {}", scratch, acc_name));
-+                scratch.to_string()
-+            }
+-    /// Record that `inst`'s destination pointer resolves to a named global, so
+-    /// later stores can invalidate only that symbol's cached loads.
+-    fn track_global_ptr_base(&mut self, inst: &Instruction) {
++    /// Resolve an operand's base object, or `None` when it is unclassified.
++    /// Only consults already-assigned value numbers (fail closed on
++    /// un-numbered values — those get no epoch and stay conservative).
++    fn base_of(&self, op: &Operand) -> Option<PtrBase> {
++        let Operand::Value(v) = op else {
++            return None;
 +        };
-+        let lhs_reg = materialize(self, lhs, if use_32bit { "w1" } else { "x1" });
-+        let rhs_reg = materialize(self, rhs, if use_32bit { "w2" } else { "x2" });
-+        let acc_reg = materialize(self, acc, if use_32bit { "w3" } else { "x3" });
-+        if let Some(dest_phys) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
-+            let output = if use_32bit {
-+                callee_saved_name_32(dest_phys)
-+            } else {
-+                callee_saved_name(dest_phys)
-+            };
-+            self.state.emit_fmt(format_args!(
-+                "    msub {}, {}, {}, {}",
-+                output, lhs_reg, rhs_reg, acc_reg
-+            ));
-+            self.state.reg_cache.invalidate_acc();
++        let idx = v.0 as usize;
++        if idx >= self.value_numbers.len() || self.value_numbers[idx] == u32::MAX {
++            return None;
++        }
++        self.ptr_base.get(&self.value_numbers[idx]).cloned()
++    }
++
++    /// Propagate `src`'s base object to `dest`'s value number, if any.
++    fn propagate_ptr_base(&mut self, src: Value, dest: Value) {
++        let src_vn = match self.operand_to_vn(&Operand::Value(src)) {
++            VNOperand::ValueNum(vn) => vn,
++            VNOperand::Const(_) => return,
++        };
++        let d_idx = dest.0 as usize;
++        if d_idx >= self.value_numbers.len() || self.value_numbers[d_idx] == u32::MAX {
 +            return;
 +        }
-+        let output = if use_32bit { "w0" } else { "x0" };
-+        self.state.emit_fmt(format_args!(
-+            "    msub {}, {}, {}, {}",
-+            output, lhs_reg, rhs_reg, acc_reg
-+        ));
-+        self.store_x0_to(dest);
-+    }
-+
-     pub(super) fn emit_float_neg_impl(&mut self, ty: IrType) {
-         if ty == IrType::F32 {
-             self.state.emit("    fmov s0, w0");
-diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
-index 5e396631..f97ff260 100644
---- a/src/backend/arm/codegen/emit.rs
-+++ b/src/backend/arm/codegen/emit.rs
-@@ -2370,6 +2370,18 @@ impl ArchCodegen for ArmCodegen {
-             self.emit_int_fused_mul_add_impl(mul_lhs, mul_rhs, acc, add_dest, ty);
-         }
-     }
-+    fn supports_fused_int_madd_reg(&self) -> bool {
-+        // madd latency == mul latency on every shipping AArch64 core; the
-+        // fusion is strictly one fewer instruction. CCC_NO_INT_MADD restores
-+        // the slot-homed-only behavior for bisection.
-+        std::env::var_os("CCC_NO_INT_MADD").is_none()
-+    }
-+
-+    fn supports_fused_int_mul_sub(&self) -> bool {
-+        // msub w0, w1, w2, w3 = w3 - w1*w2 (acc - product only).
-+        std::env::var_os("CCC_NO_MSUB").is_none()
-+    }
-+
-     fn supports_fused_float_mul_sub(&self) -> bool {
-         // Same single-rounding contract as fmadd fusion; the detector is
-         // additionally gated on CCC_NO_FMSUB and the accumulator-dest set.
-@@ -2385,8 +2397,15 @@ impl ArchCodegen for ArmCodegen {
-         ty: IrType,
-         mul_is_lhs: bool,
-     ) {
--        debug_assert!(ty == IrType::F32 || ty == IrType::F64);
--        self.emit_fused_mul_sub_impl(mul_dest, mul_lhs, mul_rhs, acc, sub_dest, ty, mul_is_lhs);
-+        if ty == IrType::F32 || ty == IrType::F64 {
-+            self.emit_fused_mul_sub_impl(mul_dest, mul_lhs, mul_rhs, acc, sub_dest, ty, mul_is_lhs);
-+        } else {
-+            // Integer msub: sub_dest = acc - mul_lhs*mul_rhs. The detector
-+            // only records integer Subs with the mul on the RHS (levkropp
-+            // 9f064faa; `a*b - acc` has no msub form).
-+            debug_assert!(!mul_is_lhs, "integer msub requires acc - product");
-+            self.emit_int_fused_mul_sub_impl(mul_lhs, mul_rhs, acc, sub_dest, ty);
-+        }
-     }
-     fn state(&mut self) -> &mut CodegenState {
-         &mut self.state
-diff --git a/src/backend/arm/codegen/peephole.rs b/src/backend/arm/codegen/peephole.rs
-index b9738b50..353e2c9b 100644
---- a/src/backend/arm/codegen/peephole.rs
-+++ b/src/backend/arm/codegen/peephole.rs
-@@ -2568,12 +2568,38 @@ use crate::backend::peephole_common::{replace_source_reg_in_instruction, replace
- // Keeping the conservative bail-on-address-of-sp version: sound by
- // construction, and the loop-variant-base hazard his rewrite fixes cannot
- // arise here because we never resolve loads through derived bases at all.
-+//
-+// ADOPTED from levkropp 1a432a1a (audited): function-scoped analysis. The
-+// peephole runs on the WHOLE MODULE text (backend/mod.rs), so the old
-+// whole-buffer scan had two inter-function bugs:
-+// (a) one address-of-sp anywhere disabled the pass for EVERY function in
-+//     the module (missed optimization, module-size dependent), and
-+// (b) the load scan collected slot ranges across all functions, so a load
-+//     at [sp, #16] in function A kept a dead store to [sp, #16] alive in
-+//     function B (different frames — pure missed optimization, but also a
-+//     latent soundness trap should ranges ever be used for forwarding).
-+// Split at .cfi_endproc boundaries; each frame is analyzed independently.
- fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
-+    let mut changed = false;
-+    let mut start = 0usize;
-+    for i in 0..n {
-+        if lines[i].trim().starts_with(".cfi_endproc") {
-+            changed |= gdse_one_function(lines, kinds, start, i + 1);
-+            start = i + 1;
++        if let Some(base) = self.ptr_base.get(&src_vn).cloned() {
++            self.ptr_base.insert(self.value_numbers[d_idx], base);
 +        }
 +    }
-+    if start < n {
-+        changed |= gdse_one_function(lines, kinds, start, n);
++
++    /// Record `inst`'s destination pointer's base object so later stores can
++    /// invalidate only that object's cached loads.  Roots are `GlobalAddr`,
++    /// non-escaping `Alloca`, and `restrict` `ParamRef`; the base propagates
++    /// through single-source address-preserving operations (`GetElementPtr`,
++    /// pointer-to-pointer `Cast`, `Copy`) and through integer-width pointer
++    /// arithmetic (`Add` with exactly one rooted operand, `Sub` with a rooted
++    /// left operand).  Every other shape — phis/selects with mixed bases,
++    /// loads of pointers, non-pointer casts, two-pointer arithmetic — stays
++    /// `Unknown` and falls back to the global generation.
++    fn track_ptr_base(&mut self, inst: &Instruction) {
+         match inst {
+             Instruction::GlobalAddr { dest, name } => {
+                 let idx = dest.0 as usize;
+                 if idx < self.value_numbers.len() && self.value_numbers[idx] != u32::MAX {
+-                    self.ptr_global_base.insert(
++                    self.ptr_base.insert(
+                         self.value_numbers[idx],
+-                        self.context.canonical(name).to_string(),
++                        PtrBase::Global(self.context.canonical(name).to_string()),
+                     );
+                 }
+             }
++            Instruction::Alloca { dest, .. } => {
++                if self.nonescaping_allocas.contains(&dest.0) {
++                    let idx = dest.0 as usize;
++                    if idx < self.value_numbers.len() && self.value_numbers[idx] != u32::MAX {
++                        self.ptr_base
++                            .insert(self.value_numbers[idx], PtrBase::Alloca(dest.0));
++                    }
++                }
++            }
++            Instruction::ParamRef {
++                dest, param_idx, ty, ..
++            } => {
++                if *ty == IrType::Ptr && self.noalias_params.contains(param_idx) {
++                    let idx = dest.0 as usize;
++                    if idx < self.value_numbers.len() && self.value_numbers[idx] != u32::MAX {
++                        self.ptr_base.insert(
++                            self.value_numbers[idx],
++                            PtrBase::NoAliasParam(*param_idx),
++                        );
++                    }
++                }
++            }
+             Instruction::GetElementPtr { dest, base, .. } => {
+-                let b_idx = base.0 as usize;
+-                let d_idx = dest.0 as usize;
+-                if b_idx < self.value_numbers.len()
+-                    && d_idx < self.value_numbers.len()
+-                    && self.value_numbers[b_idx] != u32::MAX
+-                    && self.value_numbers[d_idx] != u32::MAX
+-                {
+-                    if let Some(sym) = self
+-                        .ptr_global_base
+-                        .get(&self.value_numbers[b_idx])
+-                        .cloned()
++                self.propagate_ptr_base(*base, *dest);
++            }
++            Instruction::Copy {
++                dest,
++                src: Operand::Value(src),
++            } => {
++                self.propagate_ptr_base(*src, *dest);
++            }
++            Instruction::Cast {
++                dest,
++                src,
++                from_ty,
++                to_ty,
++            } if *from_ty == IrType::Ptr && *to_ty == IrType::Ptr => {
++                if let Operand::Value(src) = src {
++                    self.propagate_ptr_base(*src, *dest);
++                }
++            }
++            Instruction::BinOp {
++                dest,
++                op: IrBinOp::Add,
++                lhs,
++                rhs,
++                ..
++            } => {
++                let base = match (self.base_of(lhs), self.base_of(rhs)) {
++                    (Some(b), None) | (None, Some(b)) => Some(b),
++                    _ => None,
++                };
++                if let Some(base) = base {
++                    let d_idx = dest.0 as usize;
++                    if d_idx < self.value_numbers.len()
++                        && self.value_numbers[d_idx] != u32::MAX
+                     {
+-                        self.ptr_global_base.insert(self.value_numbers[d_idx], sym);
++                        self.ptr_base.insert(self.value_numbers[d_idx], base);
++                    }
++                }
++            }
++            Instruction::BinOp {
++                dest,
++                op: IrBinOp::Sub,
++                lhs,
++                rhs,
++                ..
++            } => {
++                // `ptr - offset` preserves the base; `ptr - ptr` (a distance)
++                // and `offset - ptr` (invalid C) do not.
++                if let (Some(base), None) = (self.base_of(lhs), self.base_of(rhs)) {
++                    let d_idx = dest.0 as usize;
++                    if d_idx < self.value_numbers.len()
++                        && self.value_numbers[d_idx] != u32::MAX
++                    {
++                        self.ptr_base.insert(self.value_numbers[d_idx], base);
+                     }
+                 }
+             }
+@@ -745,6 +902,134 @@ pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
+     run_gvn_function_with_context(func, &GvnContext::default())
+ }
+ 
++/// Allocas whose address provably never escapes the function.
++///
++/// The owner-set fixpoint propagates every alloca's address through
++/// address-preserving operations (GEP, Copy, Cast, BinOp/UnaryOp integer
++/// folding, Phi, Select); an alloca ESCAPES as soon as any value carrying its
++/// address is stored as data, passed to a call/asm, used in a terminator, or
++/// written by an atomic.  Only non-escaping allocas are safe for
++/// `PtrBase::Alloca` epochs: if the address cannot leave the function, every
++/// pointer that can reach the alloca is tracked by GVN and carries its epoch.
++///
++/// The fixpoint deliberately over-approximates address carriers (an int-folded
++/// address still counts), so a root is never falsely reported non-escaping.
++fn find_nonescaping_allocas(func: &IrFunction) -> FxHashSet<u32> {
++    let mut roots: FxHashSet<u32> = FxHashSet::default();
++    let mut owners: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Instruction::Alloca { dest, .. } = inst {
++                roots.insert(dest.0);
++                let mut s = FxHashSet::default();
++                s.insert(dest.0);
++                owners.insert(dest.0, s);
++            }
++        }
 +    }
-+    changed
++    if owners.is_empty() {
++        return roots;
++    }
++
++    // Propagate owner sets through address-preserving operations to a fixpoint.
++    loop {
++        let mut changed = false;
++        for block in &func.blocks {
++            for inst in &block.instructions {
++                let Some(dest) = inst.dest() else { continue };
++                if !matches!(
++                    inst,
++                    Instruction::GetElementPtr { .. }
++                        | Instruction::Copy { .. }
++                        | Instruction::Cast { .. }
++                        | Instruction::BinOp { .. }
++                        | Instruction::UnaryOp { .. }
++                        | Instruction::Phi { .. }
++                        | Instruction::Select { .. }
++                ) {
++                    continue;
++                }
++                let mut incoming: FxHashSet<u32> = FxHashSet::default();
++                inst.for_each_used_value(|v| {
++                    if let Some(o) = owners.get(&v) {
++                        incoming.extend(o.iter().copied());
++                    }
++                });
++                if incoming.is_empty() {
++                    continue;
++                }
++                let entry = owners.entry(dest.0).or_default();
++                for o in incoming {
++                    if entry.insert(o) {
++                        changed = true;
++                    }
++                }
++            }
++        }
++        if !changed {
++            break;
++        }
++    }
++
++    let mut escaped: FxHashSet<u32> = FxHashSet::default();
++    fn mark_value(
++        v: u32,
++        owners: &FxHashMap<u32, FxHashSet<u32>>,
++        escaped: &mut FxHashSet<u32>,
++    ) {
++        if let Some(o) = owners.get(&v) {
++            escaped.extend(o.iter().copied());
++        }
++    }
++    fn mark_operand(
++        op: &Operand,
++        owners: &FxHashMap<u32, FxHashSet<u32>>,
++        escaped: &mut FxHashSet<u32>,
++    ) {
++        if let Operand::Value(v) = op {
++            mark_value(v.0, owners, escaped);
++        }
++    }
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            match inst {
++                Instruction::Store { val, .. } => mark_operand(val, &owners, &mut escaped),
++                Instruction::AtomicStore { val, .. }
++                | Instruction::AtomicRmw { val, .. } => mark_operand(val, &owners, &mut escaped),
++                Instruction::AtomicCmpxchg {
++                    expected, desired, ..
++                } => {
++                    mark_operand(expected, &owners, &mut escaped);
++                    mark_operand(desired, &owners, &mut escaped);
++                }
++                Instruction::Call { .. }
++                | Instruction::CallIndirect { .. }
++                | Instruction::InlineAsm { .. }
++                | Instruction::StackRestore { .. } => {
++                    inst.for_each_used_value(|v| mark_value(v, &owners, &mut escaped));
++                }
++                _ => {}
++            }
++        }
++        block
++            .terminator
++            .for_each_used_value(|v| mark_value(v, &owners, &mut escaped));
++    }
++
++    roots.retain(|r| !escaped.contains(r));
++    roots
 +}
 +
-+fn gdse_one_function(lines: &[String], kinds: &mut [LineKind], start: usize, end: usize) -> bool {
-     // Safety check: if any instruction takes the address of sp (e.g., `add xN, sp, #off`),
-     // stack slots could be accessed through pointers, so we must not eliminate any stores.
-     // This is conservative but sound — it prevents miscompilation when arrays or structs
-     // are allocated on the stack and passed by pointer to callees.
--    for i in 0..n {
-+    for i in start..end {
-         if kinds[i] == LineKind::Nop {
-             continue;
-         }
-@@ -2603,7 +2629,7 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
-     // store (e.g. `str x` at offset 16, 8 bytes) can be partially read by a
-     // narrower load at a different offset (e.g. `ldr w` at offset 20, 4 bytes).
-     let mut loaded_ranges: Vec<(i32, i32)> = Vec::new(); // (offset, size)
--    for i in 0..n {
-+    for i in start..end {
-         match kinds[i] {
-             LineKind::LoadSp {
-                 offset, is_word, ..
-@@ -2648,7 +2674,7 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
- 
-     // Phase 2: Remove stores whose byte range does not overlap any load range
-     let mut changed = false;
--    for i in 0..n {
-+    for i in start..end {
-         if let LineKind::StoreSp {
-             offset, is_word, ..
-         } = kinds[i]
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index e8291d03..c9db8b47 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -1865,6 +1865,8 @@ fn detect_mul_add_fusions(
-     block: &BasicBlock,
-     use_counts: &[u32],
-     fuse_float: bool,
-+    // Integer `acc - a*b` -> msub (AArch64; see supports_fused_int_mul_sub).
-+    fuse_int_sub: bool,
-     // Float Mul;Sub -> fmsub/fnmsub (levkropp e3b21b8f, audited port).
-     // None disables Sub fusion entirely (backend lacks the instruction or
-     // CCC_NO_FMSUB is set); Some(accs) enables it except for destinations
-@@ -1928,11 +1930,10 @@ fn detect_mul_add_fusions(
-                     add_ty_r = Some(ty);
-                     break;
++/// `restrict` pointer parameter indices (their `IrParam.noalias` flag).
++fn find_noalias_params(func: &IrFunction) -> FxHashSet<usize> {
++    func.params
++        .iter()
++        .enumerate()
++        .filter(|(_, p)| p.noalias)
++        .map(|(i, _)| i)
++        .collect()
++}
++
+ pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &GvnContext) -> usize {
+     let num_blocks = func.blocks.len();
+     if num_blocks == 0 || function_uses_128(func) {
+@@ -752,6 +1037,8 @@ pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &Gvn
+     }
+     let escaped = find_escaped_param_allocas(func);
+     let volatile = find_volatile_allocas(func);
++    let nonescaping = find_nonescaping_allocas(func);
++    let noalias = find_noalias_params(func);
+     if num_blocks == 1 {
+         let mut state = GvnState::new(
+             func.max_value_id() as usize,
+@@ -761,6 +1048,8 @@ pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &Gvn
+             context,
+             super::global_addr_cse::classify_must_materialize(func),
+             super::global_addr_cse::classify_site_local_indexed(func),
++            nonescaping,
++            noalias,
+         );
+         return process_block(0, func, &mut state);
+     }
+@@ -786,6 +1075,8 @@ pub(crate) fn run_gvn_with_analysis_and_context(
+     let volatile = find_volatile_allocas(func);
+     let must_mat = super::global_addr_cse::classify_must_materialize(func);
+     let site_local = super::global_addr_cse::classify_site_local_indexed(func);
++    let nonescaping = find_nonescaping_allocas(func);
++    let noalias = find_noalias_params(func);
+     if num_blocks == 1 {
+         let mut state = GvnState::new(
+             func.max_value_id() as usize,
+@@ -795,6 +1086,8 @@ pub(crate) fn run_gvn_with_analysis_and_context(
+             context,
+             must_mat,
+             site_local,
++            nonescaping,
++            noalias,
+         );
+         return process_block(0, func, &mut state);
+     }
+@@ -806,6 +1099,8 @@ pub(crate) fn run_gvn_with_analysis_and_context(
+         context,
+         must_mat,
+         site_local,
++        nonescaping,
++        noalias,
+     );
+     gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
+     state.total_eliminated
+@@ -932,17 +1227,17 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState)
+             } else {
+                 let pv = state.operand_to_vn(&Operand::Value(*ptr));
+                 if let VNOperand::ValueNum(pvn) = pv {
+-                    match state.ptr_global_base.get(&pvn) {
+-                        Some(sym) => {
++                    match state.ptr_base.get(&pvn) {
++                        Some(base) => {
+                             if std::env::var_os("CCC_DEBUG_GVN").is_some() {
+-                                eprintln!("[GVNDBG] store bumps epoch of {}", sym);
++                                eprintln!("[GVNDBG] store bumps epoch of {:?}", base);
+                             }
+-                            let sym = sym.clone();
++                            let key = obj_key(base);
+                             state.next_base_epoch = state.next_base_epoch.saturating_add(1);
+                             let old = state
+                                 .base_store_epoch
+-                                .insert(sym.clone(), state.next_base_epoch);
+-                            state.base_epoch_log.push((sym, old));
++                                .insert(key.clone(), state.next_base_epoch);
++                            state.base_epoch_log.push((key, old));
+                         }
+                         None => {
+                             if std::env::var_os("CCC_DEBUG_GVN").is_some() {
+@@ -1136,7 +1431,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState)
+                         let old_val = state.expr_to_value.insert(expr_key, dest);
+                         state.rollback_log.push((key_for_log, old_val));
+                     }
+-                    state.track_global_ptr_base(&inst);
++                    state.track_ptr_base(&inst);
+                     new_instructions.push(inst);
+                     block_defs.insert(dest.0);
                  }
--                // Float-only Sub fusion: `a - b*c` -> fmsub, `b*c - a` ->
--                // fnmsub (both single-rounding, matching GCC -ffp-contract=
--                // fast). Integer mul-temp fusion stays Add-only, and Subs
--                // whose dest is a loop-carried accumulator stay split (see
--                // fuse_float_sub above).
-+                // Float Sub fusion: `a - b*c` -> fmsub, `b*c - a` -> fnmsub
-+                // (both single-rounding, matching GCC -ffp-contract=fast).
-+                // Subs whose dest is a loop-carried accumulator stay split
-+                // (see fuse_float_sub above).
-                 Instruction::BinOp {
-                     dest: sub_dest,
-                     op: IrBinOp::Sub,
-@@ -1949,6 +1950,28 @@ fn detect_mul_add_fusions(
-                     add_ty_r = Some(ty);
-                     break;
+@@ -1174,7 +1469,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState)
+                 if let Some(dest) = inst.dest() {
+                     block_defs.insert(dest.0);
                  }
-+                // Integer Sub fusion: `acc - a*b` -> msub (levkropp 9f064faa,
-+                // audited port). ONLY when the mul is the Sub's RHS — `a*b -
-+                // acc` has no msub form. Used by magic-number division
-+                // (strlen/itoa: q = n/10; r = n - q*10). No accumulator gate:
-+                // integer msub has the same latency as mul on shipping
-+                // AArch64 cores, so the chain never lengthens.
-+                Instruction::BinOp {
-+                    op: IrBinOp::Sub,
-+                    lhs,
-+                    rhs,
-+                    ty,
-+                    ..
-+                } if !mul_ty.is_float()
-+                    && fuse_int_sub
-+                    && matches!(rhs, Operand::Value(v) if v.0 == mul_dest.0) =>
-+                {
-+                    add_idx = Some(scan);
-+                    add_lhs_r = Some(lhs);
-+                    add_rhs_r = Some(rhs);
-+                    add_ty_r = Some(ty);
-+                    break;
-+                }
-                 _ => break,
+-                state.track_global_ptr_base(&inst);
++                state.track_ptr_base(&inst);
+                 new_instructions.push(inst);
              }
          }
-@@ -2975,6 +2998,7 @@ fn generate_function(
-             block,
-             &value_use_counts,
-             cg.supports_fused_float_mul_add(),
-+            cg.supports_fused_int_mul_sub(),
-             if cg.supports_fused_float_mul_sub() && !env_flag_set("CCC_NO_FMSUB") {
-                 Some(&accumulator_dests)
-             } else {
-@@ -3286,7 +3310,14 @@ fn generate_function(
-             } = inst
-             {
-                 if let Some(&add_i) = mul_add_fusions.get(&idx) {
--                    if cg.get_phys_reg_for_value(dest.0).is_none() || ty.is_float() {
-+                    // Float always fuses (native fmadd/fmsub). Integer fuses
-+                    // when the temp is slot-homed, or unconditionally on
-+                    // targets where madd/msub cost the same as the mul
-+                    // (levkropp 9f064faa: one fewer instruction, freed reg).
-+                    if cg.get_phys_reg_for_value(dest.0).is_none()
-+                        || ty.is_float()
-+                        || cg.supports_fused_int_madd_reg()
-+                    {
-                         if let Some(Instruction::BinOp {
-                             dest: add_dest,
-                             op: partner_op,
-diff --git a/src/backend/traits.rs b/src/backend/traits.rs
-index e8ebd74a..c39de36c 100644
---- a/src/backend/traits.rs
-+++ b/src/backend/traits.rs
-@@ -610,6 +610,23 @@ pub trait ArchCodegen {
-         false
-     }
- 
-+    /// Whether integer Mul;Add should fuse even when the mul temp has a
-+    /// register home. On AArch64 madd has the same latency as mul, so the
-+    /// fusion is one fewer instruction and a freed register, never a longer
-+    /// chain (levkropp 9f064faa). On x86 there is no integer madd — the
-+    /// fused path stages through the accumulator, so register-direct
-+    /// mul+add stays better and this remains false.
-+    fn supports_fused_int_madd_reg(&self) -> bool {
-+        false
-+    }
-+
-+    /// Whether the target has a single-instruction integer multiply-subtract
-+    /// for `acc - a*b` (AArch64 msub). Only that operand order: `a*b - acc`
-+    /// has no msub form and must stay split.
-+    fn supports_fused_int_mul_sub(&self) -> bool {
-+        false
-+    }
-+
-     /// Emit a fused multiply-subtract.
-     /// `mul_is_lhs == false`: sub_dest = acc - (mul_lhs * mul_rhs)  [fmsub]
-     /// `mul_is_lhs == true` : sub_dest = (mul_lhs * mul_rhs) - acc  [fnmsub]
-diff --git a/tests/regression/arm_int_madd_msub_fusion.c b/tests/regression/arm_int_madd_msub_fusion.c
+diff --git a/tests/gauntlet-repros/loop_iv_across_call.c b/tests/gauntlet-repros/loop_iv_across_call.c
 new file mode 100644
-index 00000000..53f290da
+index 0000000..45f5b7c
 --- /dev/null
-+++ b/tests/regression/arm_int_madd_msub_fusion.c
-@@ -0,0 +1,20 @@
-+// Integer madd/msub fusion (levkropp 9f064faa, audited port): on AArch64,
-+// madd/msub have the same latency as the mul they replace, so integer
-+// Mul;Add fuses even for register-homed temps, and `acc - a*b` fuses to
-+// msub. `a*b - acc` has NO msub form and must stay split (operand-order
-+// gate). rem10 is the magic-number-division shape (strlen/itoa).
-+int printf(const char *, ...);
-+unsigned rem10(unsigned n) { unsigned q = n / 10u; return n - q * 10u; }
-+long dot3(long a, long b, long c, long d) { long t = a * b; return t + c * d; }
-+int msub_ok(int a, int b, int c) { return c - a * b; }
-+int no_msub(int a, int b, int c) { return a * b - c; }
-+int main(void) {
-+    volatile unsigned n = 12347;
-+    volatile long p = 3, q = 4, r = 5, s = 6;
-+    volatile int x = 3, y = 4, z = 100;
-+    // Overflow-wrap sanity: fused and split must agree on wrapping.
-+    volatile int big = 0x7fffffff;
-+    printf("%u %ld %d %d %d\n", rem10(n), dot3(p, q, r, s), msub_ok(x, y, z),
-+           no_msub(x, y, z), msub_ok(big, 2, 5));
++++ b/tests/gauntlet-repros/loop_iv_across_call.c
+@@ -0,0 +1,62 @@
++/* GAUNTLET REPRODUCER (known miscompile, pre-existing as of 2026-08-22).
++ *
++ * Loop induction variable carried in a caller-saved register across a call.
++ *
++ * In
++ *
++ *     for (int i = 1; i < argc; i++) {
++ *         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc)
++ *             mem_level = atoi(argv[++i]);
++ *         ...
++ *     }
++ *
++ * the `++i` produces an SSA value `i1 = i + 1` that is BOTH the array index
++ * of `argv[++i]` and the loop induction value fed to the backedge (`i = i1;
++ * i++`).  The x86 backend computes `i1` in %edi BEFORE the `strtol` call
++ * (for the index), then the shared loop latch does `movl %edi,%eax;
++ * addl $1,%eax` — but %edi is caller-saved and is clobbered by the call.
++ * The latch therefore stores a garbage induction value and the loop runs
++ * past `argc` into the environment array (observable as minideflate trying
++ * to fopen("E2B_TEMPLATE_ID=...")).
++ *
++ * Evidence: zlib-ng 2.3.3 CTest `CVE-2018-25032` (6 variants) and `GH-382`
++ * fail with "Failed to open file: <ENVVAR=...>" on BOTH the re-base point
++ * and this tree; a GCC build of the same zlib-ng passes 100%.  This file
++ * reproduces the defect standalone:
++ *
++ *     lccc -O2 loop_iv_across_call.c -o t && ./t -c -k -d -m 1 -w -15 -s 4 -F -6
++ *     # expected  "1 -15 2 6 0 0 4 1 1 1"
++ *     # observed  "1 0 0 6 0 0 0 1 1 1"  (window_bits/strategy/flush lost)
++ *
++ * The fix belongs in the backend latch/RA: a value live across a call must
++ * never ride a caller-saved register, or the latch must reload the induction
++ * slot instead of trusting %edi.  Do not delete this file when fixing — it is
++ * the regression pin.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++int main(int argc, char **argv) {
++    int mem_level = 0, window_bits = 0, strategy = 0, level = 0, rbs = 0, wbs = 0, flush = 0;
++    int copyout = 0, uncompr = 0, keep = 0;
++    for (int i = 1; i < argc; i++) {
++        if ((strcmp(argv[i], "-m") == 0) && (i + 1 < argc)) mem_level = atoi(argv[++i]);
++        else if ((strcmp(argv[i], "-w") == 0) && (i + 1 < argc)) window_bits = atoi(argv[++i]);
++        else if ((strcmp(argv[i], "-r") == 0) && (i + 1 < argc)) rbs = atoi(argv[++i]);
++        else if ((strcmp(argv[i], "-t") == 0) && (i + 1 < argc)) wbs = atoi(argv[++i]);
++        else if ((strcmp(argv[i], "-s") == 0) && (i + 1 < argc)) flush = atoi(argv[++i]);
++        else if (strcmp(argv[i], "-c") == 0) copyout = 1;
++        else if (strcmp(argv[i], "-d") == 0) uncompr = 1;
++        else if (strcmp(argv[i], "-k") == 0) keep = 1;
++        else if (strcmp(argv[i], "-f") == 0) strategy = 1;
++        else if (strcmp(argv[i], "-F") == 0) strategy = 2;
++        else if (strcmp(argv[i], "-h") == 0) strategy = 3;
++        else if (strcmp(argv[i], "-R") == 0) strategy = 4;
++        else if (argv[i][0] == '-' && argv[i][1] >= '0' && argv[i][1] <= '9' && argv[i][2] == 0)
++            level = argv[i][1] - '0';
++    }
++    printf("%d %d %d %d %d %d %d %d %d %d\n",
++           mem_level, window_bits, strategy, level, rbs, wbs, flush, copyout, uncompr, keep);
 +    return 0;
 +}
--- 
-2.47.3
-
-
-From 2e20aede2d8334e6ab61461bd2ff4a1cfa8a190a Mon Sep 17 00:00:00 2001
-From: Arena Agent <agent@arena.ai>
-Date: Sat, 22 Aug 2026 10:13:51 +0000
-Subject: [PATCH 2/2] AArch64 peephole: store literal zero via wzr/xzr (audited
- lev 86b34508 port)
-
-Storing a constant zero materialized a register first (mov x0, #0;
-strb w0, [x9]); the zero register does it for free (strb wzr, [x9]).
-The mov stays for dead-move elimination (it may have other readers).
-sieve's marking loop now stores through wzr (3 sites); zero-init
-patterns in histogram/hash_table benefit equally.
-
-Audit deltas vs his commit:
-- dst < 29 instead of his <= 30: x29/x30 (frame pointer, link register)
-  are absurd zero-source candidates and deserve no code path.
-- Verified the rewrite touches ONLY the store's VALUE operand: a store
-  whose BASE register holds the zero temp breaks out (first != value
-  operand match fails), pinned by the adversarial test (table[idx] with
-  idx==0 keeps its base register).
-- movn exclusion verified (#0 under movn is -1); multi-line slots
-  skipped; scan stops at first barrier/clobber/load; stp first-operand
-  rewrite covered by the same code path.
-
-Wired into phase 1 and phase 3 after fold_destructive_pointer_updates
-(his ordering; the destructive-update folds must win first).
-
-Validation: 1075/1075 unit, 406/406 x86 regression, aarch64 fuzz
-450/450 (O1/O2/Os seeds 0:150), ARM regression 242 pass / 0 new fails,
-ARM benchmark outputs identical (sieve/histogram/ascii_case_fold/
-hash_table re-verified post-change).
----
- src/backend/arm/codegen/peephole.rs | 80 +++++++++++++++++++++++++++++
- 1 file changed, 80 insertions(+)
-
-diff --git a/src/backend/arm/codegen/peephole.rs b/src/backend/arm/codegen/peephole.rs
-index 353e2c9b..800f6df7 100644
---- a/src/backend/arm/codegen/peephole.rs
-+++ b/src/backend/arm/codegen/peephole.rs
-@@ -526,6 +526,7 @@ pub fn peephole_optimize(asm: String) -> String {
-         changed |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
-         changed |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
-         changed |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
-+        changed |= fold_zero_stores(&mut lines, &mut kinds, n);
-         changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
-         // After the folds: dead staging movs (their patterns must win first).
-         changed |= eliminate_overwritten_moves(&lines, &mut kinds, n);
-@@ -574,6 +575,7 @@ pub fn peephole_optimize(asm: String) -> String {
-             changed2 |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
-             changed2 |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
-             changed2 |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
-+            changed2 |= fold_zero_stores(&mut lines, &mut kinds, n);
-             changed2 |= eliminate_overwritten_moves(&lines, &mut kinds, n);
-             changed2 |= eliminate_overwritten_stores(&lines, &mut kinds, n);
-             rounds2 += 1;
-@@ -2994,6 +2996,84 @@ fn reg_operand_num(op: &str) -> Option<u8> {
- /// Does this instruction write a register with the given number?
- /// Conservative: the first operand (and the second for `ldp`) counts as a
- /// destination for everything that is not a store, compare, or branch.
-+// ── Zero-store via wzr/xzr (levkropp 86b34508, audited port) ────────────────
-+//
-+// Storing a literal zero goes through a materialization: `mov x0, #0` then
-+// `strb w0, [x9]`. The zero register does it for free: `strb wzr, [x9]`.
-+// The mov is left for dead-move elimination (it may have other readers).
-+// Audit deltas vs his version: dst < 29 (his `<= 30` admitted the frame
-+// pointer and link register as tracked zero sources — sound but absurd,
-+// and x29-relative rewrites deserve no code path); everything else
-+// verified line-by-line (store-operand-only rewrite keeps a zr_reg BASE
-+// untouched, movn excluded as -1, multi-line slots skipped, scan stops at
-+// the first barrier/clobber/load).
-+fn fold_zero_stores(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-+    let mut changed = false;
-+    for i in 0..n {
-+        let zr_reg = match kinds[i] {
-+            LineKind::MoveImm { dst } | LineKind::MoveWide { dst } if dst < 29 => {
-+                let t = lines[i].trim();
-+                // movn #0 is -1, not zero; symbol operands fail the parse.
-+                if t.starts_with("movn") || lines[i].contains('\n') {
-+                    continue;
-+                }
-+                let zero = t
-+                    .rsplit_once(", ")
-+                    .and_then(|(_, imm)| imm.trim().strip_prefix('#'))
-+                    .is_some_and(|v| v.parse::<i64>() == Ok(0));
-+                if zero {
-+                    dst
-+                } else {
-+                    continue;
-+                }
-+            }
-+            _ => continue,
-+        };
-+        let (xname, wname) = (xreg_name(zr_reg), wreg_name(zr_reg));
-+        // Rewrite the value operand of the next store that reads R, stopping
-+        // at the first barrier, rewrite of R, or other memory op.
-+        for j in (i + 1)..n {
-+            match kinds[j] {
-+                LineKind::Nop => continue,
-+                LineKind::Move { .. }
-+                | LineKind::MoveImm { .. }
-+                | LineKind::MoveWide { .. }
-+                | LineKind::Alu
-+                | LineKind::Compare => {
-+                    if instr_clobbers_reg(lines[j].trim_start(), zr_reg) {
-+                        break;
-+                    }
-+                    continue;
-+                }
-+                LineKind::StoreSp { .. } | LineKind::MemOther | LineKind::StorePairSp => {
-+                    let t = lines[j].trim_start().to_string();
-+                    if !(t.starts_with("str") || t.starts_with("stp")) {
-+                        break; // a load under MemOther: stop
-+                    }
-+                    if let Some((mnem, rest)) = t.split_once(' ') {
-+                        if let Some((first, suffix)) = rest.split_once(',') {
-+                            let first = first.trim();
-+                            let zr = if first == xname {
-+                                "xzr"
-+                            } else if first == wname {
-+                                "wzr"
-+                            } else {
-+                                break;
-+                            };
-+                            lines[j] = format!("    {} {},{}", mnem, zr, suffix);
-+                            kinds[j] = classify_line(&lines[j]);
-+                            changed = true;
-+                        }
-+                    }
-+                    break;
-+                }
-+                _ => break,
-+            }
-+        }
-+    }
-+    changed
-+}
+diff --git a/tests/regression/check_gvn_disjoint_epochs.sh b/tests/regression/check_gvn_disjoint_epochs.sh
+new file mode 100755
+index 0000000..f6f6889
+--- /dev/null
++++ b/tests/regression/check_gvn_disjoint_epochs.sh
+@@ -0,0 +1,87 @@
++#!/usr/bin/env bash
++# GVN per-object epochs for disjoint restrict parameters (OP-32).
++#
++# A store through `x[i]` must NOT invalidate the cached load of `y[i]` when x
++# and y are `restrict` (provably disjoint): the second `y[i]` load in
++#
++#     s += y[i]; x[i] = i*2; s += y[i];
++#
++# must be value-numbered to the first load, eliminating one memory load per
++# iteration.  Without per-object epochs every store through an unclassified
++# pointer bumped the global generation and reloaded `y[i]`.
++#
++# Soundness counterpart (also pinned): when the arrays are NOT restrict, the
++# store may alias `y`, so the second load MUST survive.
++set -euo pipefail
++CCC=${CCC:-./target/fastbuild/lccc}
++td=$(mktemp -d)
++trap 'rm -rf "$td"' EXIT
 +
- fn instr_clobbers_reg(trimmed: &str, num: u8) -> bool {
-     let mut it = trimmed.splitn(2, char::is_whitespace);
-     let mnem = it.next().unwrap_or("");
--- 
-2.47.3
-
++cat >"$td/r.c" <<'EOF'
++int f_restrict(int n, int *restrict x, int *restrict y) {
++    int s = 0;
++    for (int i = 0; i < n; i++) {
++        s += y[i];
++        x[i] = i * 2;
++        s += y[i];
++    }
++    return s;
++}
++int f_plain(int n, int *x, int *y) {
++    int s = 0;
++    for (int i = 0; i < n; i++) {
++        s += y[i];
++        x[i] = i * 2;
++        s += y[i];
++    }
++    return s;
++}
++EOF
++
++"$CCC" -O2 -S "$td/r.c" -o "$td/r.s"
++restrict_body=$(sed -n '/^f_restrict:/,/^\.size[[:space:]]*f_restrict/p' "$td/r.s")
++plain_body=$(sed -n '/^f_plain:/,/^\.size[[:space:]]*f_plain/p' "$td/r.s")
++
++# The restrict version must load y exactly once in the loop body (the second
++# y[i] read is CSE'd to the first; the store through x has its own epoch).
++r_loads=$(grep -cE 'movslq[[:space:]]*\(' <<<"$restrict_body" || true)
++# The plain version must load y twice (the store may alias y, so the second
++# read reloads it).
++p_loads=$(grep -cE 'movslq[[:space:]]*\(' <<<"$plain_body" || true)
++
++if [ "$r_loads" -gt 1 ]; then
++    echo "restrict loop should load y once; got $r_loads movslq loads" >&2
++    echo "$restrict_body" >&2
++    exit 1
++fi
++if [ "$p_loads" -lt 2 ]; then
++    echo "plain loop must reload y (store to x may alias y); got $p_loads movslq loads" >&2
++    echo "$plain_body" >&2
++    exit 1
++fi
++
++# Runtime correctness against the scalar reference.
++cat >"$td/main.c" <<'EOF'
++#include <stdio.h>
++int f_restrict(int, int *restrict, int *restrict);
++int f_plain(int, int *, int *);
++int main(void) {
++    int x[64], y[64];
++    for (int i = 0; i < 64; i++) { x[i] = -1; y[i] = i; }
++    int r = f_restrict(64, x, y);
++    long e = 0; for (int i = 0; i < 64; i++) e += (long)y[i] * 2;
++    if (r != e) { printf("restrict %d vs %ld\n", r, e); return 1; }
++    /* f_plain with x==y: the store aliases y, so the second read sees i*2. */
++    for (int i = 0; i < 64; i++) x[i] = i;
++    r = f_plain(64, x, x);
++    e = 0; for (int i = 0; i < 64; i++) e += (long)i + (long)(i * 2);
++    if (r != e) { printf("plain-alias %d vs %ld\n", r, e); return 2; }
++    return 0;
++}
++EOF
++"$CCC" -O2 "$td/r.c" "$td/main.c" -o "$td/r"
++"$td/r"
++cc -O2 "$td/r.c" "$td/main.c" -o "$td/r.gcc"
++"$td/r.gcc"
++
++echo "OK gvn_disjoint_epochs"
+diff --git a/tests/workloads/gzip-1.14/run.py b/tests/workloads/gzip-1.14/run.py
+index 123082d..5246931 100644
+--- a/tests/workloads/gzip-1.14/run.py
++++ b/tests/workloads/gzip-1.14/run.py
+@@ -148,12 +148,26 @@ def build_one(key: str, cc: str, source: Path, root: Path,
+     configure = [str(source / "configure"), "--disable-dependency-tracking"]
+     configured = run(configure, cwd=build, env=env, timeout=600)
+     built = run(["make", "-j2"], cwd=build, env=env, timeout=900)
+-    checked = run(["make", "check", "-j2"], cwd=build, env=env, timeout=1200)
++    # The gzip test suite is NOT parallel-safe on constrained VMs: the
++    # `timestamp`/`atime` tests assert mtime behavior with filesystem
++    # granularity, and `make check -j2` lets them race against each other and
++    # against unrelated harness load.  Two independent reproductions (one gcc,
++    # one lccc) failed only under `-j2` and passed 30/30 in isolation, so run
++    # the suite SERIALLY and retry once before recording a failure — a flaky
++    # gate is worse than no gate.
++    check_text = ""
++    for attempt in (1, 2):
++        checked = run(["make", "check"], cwd=build, env=env, timeout=1800)
++        check_text = (checked.stdout or "") + (checked.stderr or "")
++        summary0 = parse_check_summary(check_text)
++        if summary0.get("total") == 30 and summary0.get("pass") == 30 and not summary0.get("fail", 0):
++            break
++        if attempt == 1:
++            check_text += f"\n[gzip battery] serial make check attempt 1 incomplete ({summary0}); retrying\n"
+     (artifacts / f"configure-{key}.log").write_text(
+         (configured.stdout or "") + (configured.stderr or ""), errors="replace")
+     (artifacts / f"build-{key}.log").write_text(
+         (built.stdout or "") + (built.stderr or ""), errors="replace")
+-    check_text = (checked.stdout or "") + (checked.stderr or "")
+     (artifacts / f"check-{key}.log").write_text(check_text, errors="replace")
+     binary = build / "gzip"
+     copied = artifacts / f"gzip-{key}"
