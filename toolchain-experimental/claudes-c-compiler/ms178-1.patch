@@ -1,1073 +1,1659 @@
-diff --git a/src/backend/elf_writer_common.rs b/src/backend/elf_writer_common.rs
-index 01c4275..6ab8860 100644
---- a/src/backend/elf_writer_common.rs
-+++ b/src/backend/elf_writer_common.rs
-@@ -307,18 +307,24 @@ const NOP_PATTERNS: [&[u8]; 11] = [
- const MAX_NOP: usize = NOP_PATTERNS.len();
- 
- /// Above this many maximum-size NOPs, jumping over the padding is cheaper
--/// than executing it. Matches GAS's `max_number_of_nops` for the long-NOP
--/// table: at 11 bytes per NOP the switch happens past ~77 bytes of padding,
--/// where a predicted-taken branch clearly beats decoding eight more NOPs.
--const MAX_NOP_RUN: usize = 7;
-+/// than executing it. Matches GAS's `max_number_of_nops` empirically: with
-+/// the 11-byte long-NOP table, GNU as 2.4x emits a jump only once the gap
-+/// exceeds EIGHT max-size NOPs (count/11 > 8 — an 88-byte pad is still all
-+/// NOPs, 99 bytes becomes `jmp` + NOPs), where a predicted-taken branch
-+/// clearly beats decoding more NOP µops.
-+const MAX_NOP_RUN: usize = 8;
- 
- /// Build `count` bytes of executable padding.
- ///
--/// The layout mirrors GAS exactly: an optional remainder NOP sized
--/// `count % MAX_NOP` first, then a run of maximum-size NOPs. When the run
--/// would exceed `MAX_NOP_RUN` NOPs the whole gap is skipped with a single
--/// branch instead, so a large alignment gap costs one predicted-taken jump
--/// rather than dozens of decoded NOPs.
-+/// The layout mirrors GAS byte-exactly (asmdiff.py oracle): a run of
-+/// maximum-size NOPs FIRST, then one remainder NOP sized `count % MAX_NOP`
-+/// LAST — GNU as's i386_output_nops fills from the largest pattern down and
-+/// places the odd-size tail at the end. (The previous remainder-FIRST order
-+/// produced identical total length but 270/746 byte-differential failures
-+/// across the branch/padding corpora, masking real layout regressions.)
-+/// When the run would exceed `MAX_NOP_RUN` NOPs the whole gap is skipped
-+/// with a single branch instead, so a large alignment gap costs one
-+/// predicted-taken jump rather than dozens of decoded NOPs.
- pub(crate) fn exec_padding(count: usize, after_insn: bool) -> Vec<u8> {
-     let mut out = Vec::with_capacity(count);
-     if count == 0 {
-@@ -351,15 +357,13 @@ pub(crate) fn exec_padding(count: usize, after_insn: bool) -> Vec<u8> {
-         }
-     }
- 
--    let remainder = count % MAX_NOP;
--    if remainder != 0 {
--        out.extend_from_slice(NOP_PATTERNS[remainder - 1]);
--        count -= remainder;
--    }
--    while count != 0 {
-+    while count >= MAX_NOP {
-         out.extend_from_slice(NOP_PATTERNS[MAX_NOP - 1]);
-         count -= MAX_NOP;
-     }
-+    if count != 0 {
-+        out.extend_from_slice(NOP_PATTERNS[count - 1]);
-+    }
-     out
- }
- 
-@@ -561,6 +565,13 @@ pub struct ElfWriterCore<A: X86Arch> {
-     /// GNU ld 2.47 does not bind unversioned refs to foo@VER under
-     /// --whole-archive). Applied to relocations after all items are parsed.
-     symver_refs: FxHashMap<String, String>,
-+    /// Three-operand `.symver real, name@VER, {local|hidden|remove}` records
-+    /// the visibility flag here (real -> (versioned name, flag)); applied to
-+    /// the DEFINED plain symbol at emit time (GAS 2.35+ semantics, verified
-+    /// against binutils: local demotes to STB_LOCAL, hidden sets STV_HIDDEN,
-+    /// remove drops the plain symbol and rebinds intra-object references to
-+    /// the versioned alias).
-+    symver_flags: FxHashMap<String, (String, crate::backend::x86::assembler::parser::SymverFlag)>,
-     section_stack: Vec<(Option<usize>, Option<usize>)>,
-     /// Deferred `.skip` expressions: (section_index, offset, expression, fill_byte).
-     deferred_skips: Vec<(usize, usize, String, u8)>,
-@@ -604,6 +615,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
-             set_values: FxHashMap::default(),
-             pending_set_exprs: Vec::new(),
-             symver_refs: FxHashMap::default(),
-+            symver_flags: FxHashMap::default(),
-             section_stack: Vec::new(),
-             deferred_skips: Vec::new(),
-             deferred_byte_diffs: Vec::new(),
-@@ -621,17 +633,46 @@ impl<A: X86Arch> ElfWriterCore<A> {
-         for item in &items {
-             self.process_item(item)?;
-         }
--        // GNU-as .symver references: if `real` was never defined as a label,
--        // rewrite relocations against it to the versioned name (foo@VER).
--        // `@@` in a reference selects the default version -> single @.
-+        // GNU-as .symver references: if `real` was never DEFINED in this
-+        // object, rewrite relocations against it to the versioned name
-+        // (foo@VER). `@@` in a reference selects the default version ->
-+        // single @.
-+        //
-+        // "Defined" must include `.set`/`.equiv` aliases and absolute .set
-+        // symbols, not just labels: glibc's libm builds `.set
-+        // __ieee754_j0f,__j0f` + `.symver __ieee754_j0f,__j0f_finite@...`,
-+        // and treating the alias as undefined would wrongly versionize
-+        // intra-object references that GAS binds to the local definition.
-+        let symbol_is_defined = |writer: &Self, name: &String| {
-+            writer.label_positions.contains_key(name)
-+                || writer.aliases.contains_key(name)
-+                || writer.set_values.contains_key(name)
-+        };
-         if !self.symver_refs.is_empty() {
--            let defined: crate::common::fx_hash::FxHashSet<&String> =
--                self.label_positions.keys().collect();
--            for sec in self.sections.iter_mut() {
--                for reloc in sec.relocations.iter_mut() {
--                    if let Some(ver) = self.symver_refs.get(&reloc.symbol) {
--                        if !defined.contains(&reloc.symbol) {
--                            reloc.symbol = ver.replace("@@", "@");
-+            let mut rewrites: Vec<(String, String)> = Vec::new();
-+            for (name, ver) in &self.symver_refs {
-+                if !symbol_is_defined(&self, name) {
-+                    rewrites.push((name.clone(), ver.replace("@@", "@")));
-+                }
-+            }
-+            // Three-operand `remove` on a DEFINED symbol: GAS drops the
-+            // plain name from the symbol table and rebinds intra-object
-+            // references to the versioned symbol (verified against
-+            // binutils GAS: `call foo` relocates against foo@VERS after
-+            // `.symver foo, foo@VERS, remove`). The versioned name is
-+            // used EXACTLY as written (no @@ folding: a defined default
-+            // version keeps its two-@ symbol).
-+            for (name, (ver, flag)) in &self.symver_flags {
-+                if *flag == SymverFlag::Remove && symbol_is_defined(&self, name) {
-+                    rewrites.push((name.clone(), ver.clone()));
-+                }
-+            }
-+            if !rewrites.is_empty() {
-+                let map: FxHashMap<String, String> = rewrites.into_iter().collect();
-+                for sec in self.sections.iter_mut() {
-+                    for reloc in sec.relocations.iter_mut() {
-+                        if let Some(new_name) = map.get(&reloc.symbol) {
-+                            reloc.symbol = new_name.clone();
-                         }
-                     }
-                 }
-@@ -711,7 +752,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
-             | AsmItem::File(_, _)
-             | AsmItem::Loc(_, _, _)
-             | AsmItem::OptionDirective(_)
--            | AsmItem::Symver(_, _)
-+            | AsmItem::Symver(_, _, _)
-             | AsmItem::Empty
-             | AsmItem::Align(_)
-             | AsmItem::Org(_, _, _) => {}
-@@ -954,7 +995,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                     self.aliases.insert(alias.clone(), target.clone());
-                 }
-             }
--            AsmItem::Symver(name, ver_string) => {
-+            AsmItem::Symver(name, ver_string, flag) => {
-                 // GNU as semantics (verified against binutils 2.47):
-                 //   .symver real, name@@V  -> symbols `real` AND `name@@V`
-                 //   .symver real, name@V   -> symbols `real` AND `name@V`
-@@ -971,6 +1012,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                         // `name` is never defined in this object (checked in
-                         // build() after all items are parsed).
-                         self.symver_refs.insert(name.clone(), ver_string.clone());
-+                        if let Some(f) = flag {
-+                            self.symver_flags.insert(name.clone(), (ver_string.clone(), *f));
-+                        }
-                     }
-                 }
-             }
-@@ -2325,6 +2369,45 @@ impl<A: X86Arch> ElfWriterCore<A> {
-             symbol_visibility.insert(name.clone(), STV_INTERNAL);
-         }
- 
-+        // Three-operand `.symver` visibility flags on DEFINED plain symbols
-+        // (GAS 2.35+ semantics, verified against binutils):
-+        //   local  — plain name demoted to STB_LOCAL (references keep binding
-+        //            to it inside the object),
-+        //   hidden — plain name stays STB_GLOBAL but gets STV_HIDDEN,
-+        //   remove — plain name is dropped from the symbol table entirely
-+        //            (its relocations were already rebound to the versioned
-+        //            alias in build()).
-+        let mut symver_removed: crate::common::fx_hash::FxHashSet<String> =
-+            crate::common::fx_hash::FxHashSet::default();
-+        let mut global_symbols = global_symbols;
-+        for (name, (ver, flag)) in &self.symver_flags {
-+            let defined = self.label_positions.contains_key(name)
-+                || self.aliases.contains_key(name)
-+                || self.set_values.contains_key(name);
-+            if !defined {
-+                // Undefined plain name: GAS silently applies plain reference
-+                // versioning (verified: `.symver und, und@V, remove` produces
-+                // `U und@V` with no diagnostic); nothing to do here.
-+                continue;
-+            }
-+            match flag {
-+                SymverFlag::Local => {
-+                    global_symbols.remove(name);
-+                    // The demotion applies ONLY to the plain name: the
-+                    // versioned alias stays STB_GLOBAL (GAS parity — that is
-+                    // the whole point of `local`: keep the versioned export,
-+                    // hide the unversioned name).
-+                    global_symbols.insert(ver.clone(), true);
-+                }
-+                SymverFlag::Hidden => {
-+                    symbol_visibility.insert(name.clone(), STV_HIDDEN);
-+                }
-+                SymverFlag::Remove => {
-+                    symver_removed.insert(name.clone());
-+                }
-+            }
-+        }
+diff --git a/docs/history/2026-08-22-session59-aarch64-gcc-torture-gas247.md b/docs/history/2026-08-22-session59-aarch64-gcc-torture-gas247.md
+new file mode 100644
+index 00000000..5ae318ee
+--- /dev/null
++++ b/docs/history/2026-08-22-session59-aarch64-gcc-torture-gas247.md
+@@ -0,0 +1,181 @@
++# Session 59 — AArch64 GCC torture, GAS 2.47, and oracle expansion
 +
-         let symtab_input = SymbolTableInput {
-             labels: &labels,
-             global_symbols: &global_symbols,
-@@ -2338,6 +2421,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
++Date: 2026-08-22
++
++Upstream base: `78209d17` (latest `ms178/lccc` after the prior patch was merged).
++All compiler builds in this session used only `scripts/build_lccc_fast.sh`.
++
++## Toolchain and method
++
++* GCC torture source revision: `gcc-mirror/gcc@ad82e41f1b997dedd2cf227cb410afd8763d89c8`.
++* Corpus: `gcc/testsuite/gcc.c-torture/execute`.
++* Assembler: self-built `GNU assembler 2.47.20260726`, configured only for
++  `aarch64-linux-gnu`. The new harness refuses any assembler whose version is
++  not 2.47.
++* Execution oracle: AArch64 GCC 14.2 binaries and LCCC binaries under QEMU
++  10.0.11, comparing exit status, stdout, and stderr.
++* Code-generation oracles: Compiler Explorer ARM64 GCC 16.1, ARM64 GCC trunk,
++  and Clang 22.1 with an automatic `--target=aarch64-linux-gnu` flag.
++
++`aarch64_execute_suite.py` parses unconditional DejaGNU `dg-options` and
++`dg-additional-options`, uses the source directory as an include directory,
++keeps generated data off the 1 GiB `/tmp` tmpfs, emits atomic JSON, and records
++all tool versions. A first implementation exposed and then fixed a race in
++`codegen_oracle.py`: concurrent function requests used the same temporary
++assembly filename and deleted one another's output. Local assembly now uses a
++unique `mkstemp` file per request.
++
++## Correctness defects found and fixed
++
++### 1. Narrow unsigned compare constants mis-selected as CMN
++
++GCC torture `20000528-1.c` exposed this sequence:
++
++```c
++unsigned long source = (unsigned long)-2;
++unsigned short narrowed = source;
++if (narrowed != (unsigned short)-2) abort();
++```
++
++LCCC treated the `I16(-2)` storage variant as full-width `-2` and emitted:
++
++```asm
++cmn wN, #2
++```
++
++That compares against `0xfffffffe`, while the U16 value is `0x0000fffe`.
++The fix normalizes every integer constant according to the comparison type:
++truncate to the semantic width, then sign- or zero-extend to the W/X machine
++width. CMP/CMN immediate selection is performed only after normalization, and
++the register fallback materializes the normalized bit pattern too.
++
++Focused U8/U16/I16 edge tests and two Rust unit tests cover both valid and
++invalid CMN cases. The GCC reproducer now passes.
++
++### 2. Tail recursion illegally reused a frame whose address escaped
++
++GCC torture `20000412-2.c` passes `&local` to the recursive tail call. Turning
++that call into a backedge changes distinct recursive automatic objects into one
++reused object; the result changed from 1 to 0 (and register allocation could
++turn it into a null dereference).
++
++TCE now computes stack-derived pointer provenance through Alloca, DynAlloca,
++GEP, Copy, Cast, Phi, Select, and pointer BinOp forms. A self-tail-call argument
++that can point into the current frame rejects TCE. Scalar locals do not disable
++TCE. A focused IR test covers a GEP-derived stack pointer, and a runtime
++regression verifies frame identity at recursion depth 100.
++
++### 3. Store-only aggregate forwarding deleted copies after pointer promotion
++
++GCC torture `20001026-1.c` constructs a three-long struct via a marching pointer
++and copies it through an sret temporary into an outer struct. Loop pointer
++promotion intentionally made the store pointer unprovable to
++`aggregate_copy_forward`; the pass then interpreted the temporary as having no
++writes and deleted both memcpys while leaving stores in the old temporary.
++
++A store-only forwarding candidate must now contain at least one write that
++`pointer_paths` can attribute to the source root. Unknown/marching-pointer
++writes fail closed. A focused IR test uses pointer arithmetic invisible to the
++path engine, and an independent runtime struct-copy regression covers the full
++sret/copy chain.
++
++### 4. Unassigned 32-bit Select emitted mixed-width CSEL
++
++GCC torture `20020615-1.c` produced:
++
++```asm
++csel x0, w23, w28, ne
++```
++
++which GAS 2.47 correctly rejects. Both ordinary and fused Select fallback paths
++hardcoded `x0` even when the arms were W registers. They now choose `w0` for
++32-bit selects and `x0` for 64-bit selects. The testcase assembles and executes
++correctly with GAS 2.47.
++
++## GCC torture results
++
++Initial 100-test screening before fixes:
++
++```text
++93 PASS, 5 FAIL, 2 SKIP
++```
++
++After the first three fixes and DejaGNU option handling:
++
++```text
++first 100: 96 PASS, 2 nested-function frontend FAIL, 2 oracle-option cases resolved
++```
++
++Expanded first-500 run after all fixes:
++
++```text
++454 PASS, 46 FAIL
++  30 execute mismatches
++  11 frontend compile failures
++   5 link failures
++   0 GAS 2.47 failures
++```
++
++This is not presented as full GCC-suite conformance. The remaining failures are
++a prioritized defect corpus. Importantly, all generated assembly in the tested
++set that reached assembly was accepted by GAS 2.47 after the CSEL fix.
++
++## GCC/Clang code quality
++
++The architecture-aware oracle now compares the maintained benchmark pattern
++against GCC 16.1, GCC trunk, and Clang 22.1. All four compilers choose the same
++core instructions for conditional increment and narrow high-constant compare.
++However, complete LCCC leaf functions remain much larger because parameters and
++results are moved into callee-saved homes:
++
++| Function | LCCC | Best GCC/Clang | Gap |
++|---|---:|---:|---:|
++| `conditional_increment` | 13 | 3 | 4.33x instructions |
++| `narrow_high_constant` | 14 | 4 | 3.50x instructions |
++| `select_pressure` | 31 | 6 | 5.17x instructions |
++
++Therefore the defensible claim is instruction-selection parity for the central
++idioms, **not** overall superiority. ABI-aware AArch64 leaf register allocation
++is the largest remaining code-quality gap; unsafe register-pool swapping is not
++an acceptable substitute for scratch-aware fixed-register allocation.
++
++## Performance and linker evidence
++
++The new `aarch64_select_patterns` benchmark was added to the maintained corpus.
++On the pinned VM's x86 host build, output matched GCC and the paired median was:
++
++```text
++LCCC/GCC = 1.3939 [1.3563, 1.4153] (9 randomized rounds)
++```
++
++This is an honest regression signal, not an ARM hardware claim. Earlier in the
++same controlled run, existing workload kernels all matched GCC; ratios were
++1.071 for gzip CRC, 1.604 for zlib-ng Adler-32, and 2.060 for Expat XML scan.
++These gaps remain optimization targets.
++
++The fastbuild LCCC driver and its integrated `lccc-ld` passed the complete
++linker suite:
++
++```text
++160 PASS, 0 FAIL, 0 WARN, 0 SKIP
++```
++
++A relative `--lccc` path bug in the linker harness was also fixed: tests change
++to temporary working directories, so the driver path is now canonicalized once
++at startup.
++
++## Final validation
++
++```text
++Rust library tests : 1089 pass, 6 ignored, 0 fail
++Correctness suite  : 50/50 pass
++x86 regression     : 436 pass, 0 fail
++Progressive suite  : 22 pass, 0 fail, SQLite corpus absent
++ARM regression     : 268 pass, 51 fail, 68 skip
++Linker suite       : 160 pass, 0 fail
++GCC torture (500)  : 454 pass, 46 fail
++```
++
++The ARM total improved from the prior session's 257/56/67 baseline while adding
++new regression coverage. Remaining failures are explicitly retained rather
++than hidden behind an aggregate score.
+diff --git a/engineering/evidence/aarch64/session59/README.md b/engineering/evidence/aarch64/session59/README.md
+new file mode 100644
+index 00000000..4ddb23ce
+--- /dev/null
++++ b/engineering/evidence/aarch64/session59/README.md
+@@ -0,0 +1,11 @@
++# AArch64 session 59 evidence
++
++* `gcc-torture-500-summary.json`: machine-readable result and every remaining
++  failure from the first 500 sorted GCC C torture execute tests.
++* `codegen-oracle.md`: local LCCC versus ARM64 GCC 16.1, GCC trunk, and Clang
++  22.1 static code-structure comparison.
++* `benchmark-vm-screening.md`: randomized paired host-VM benchmark evidence.
++
++The full raw external-suite objects and binaries are deliberately not checked
++in. Reproduce them with `scripts/aarch64_execute_suite.py`; its JSON records the
++exact tool versions. GNU assembler 2.47 is mandatory.
+diff --git a/engineering/evidence/aarch64/session59/benchmark-vm-screening.md b/engineering/evidence/aarch64/session59/benchmark-vm-screening.md
+new file mode 100644
+index 00000000..4f3a5a0c
+--- /dev/null
++++ b/engineering/evidence/aarch64/session59/benchmark-vm-screening.md
+@@ -0,0 +1,30 @@
++# LCCC benchmark report
++
++- **UTC:** `2026-08-22T20:15:55.384912+00:00`
++- **CPU model(s):** `Intel(R) Xeon(R) Processor @ 2.60GHz`
++- **Hypervisor detected:** `True`
++- **CPU pinning:** `{'requested': 'auto', 'allowed_cpus': [0, 1], 'applied': True, 'cpu': 0, 'reason': 'taskset pinning'}`
++- **PMU:** `perf is not installed`
++- **LCCC revision:** `78209d17d2a6e1d025a87e252183ac3507b1eea3`
++- **LCCC binary SHA-256:** `4e9b66cdacb356157d76113b002a5da71dd0d4d73c7dcbf990784297b15abe4d`
++- **Method:** randomized compiler order within each paired round; warm-ups excluded; median wall time and paired bootstrap CI; no automatic outlier removal.
++
++| Benchmark | LCCC median | GCC median | Best reference | LCCC/best paired (95% bootstrap CI) | Correct |
++| --- | ---: | ---: | --- | ---: | :---: |
++| `aarch64_select_patterns` | 192.67 ms | 138.49 ms | GCC | 1.3939 [1.3563, 1.4153] | pass |
++
++## Aggregate LCCC/GCC (correct pairs only)
++
++- Geometric mean ratio: `1.3939`
++- Arithmetic mean ratio: `1.3939`
++- Best individual ratio: `aarch64_select_patterns` = `1.3939`
++- Worst individual ratio: `aarch64_select_patterns` = `1.3939`
++
++## Aggregate LCCC / fastest available reference (correct pairs only)
++
++- Geometric mean ratio: `1.3939`
++- Arithmetic mean ratio: `1.3939`
++- Best individual ratio: `aarch64_select_patterns` vs `gcc` = `1.3939`
++- Worst individual ratio: `aarch64_select_patterns` vs `gcc` = `1.3939`
++
++A ratio below 1 means LCCC was faster.  This report is screening evidence; a VM without a verified PMU is not evidence for a Raptor Lake microarchitectural claim.
+diff --git a/engineering/evidence/aarch64/session59/codegen-oracle.md b/engineering/evidence/aarch64/session59/codegen-oracle.md
+new file mode 100644
+index 00000000..6bfbb2d0
+--- /dev/null
++++ b/engineering/evidence/aarch64/session59/codegen-oracle.md
+@@ -0,0 +1,11 @@
++# Codegen oracle report
++
++Static code-size/structure statistics from local LCCC and Compiler Explorer.
++These are screening metrics, not PMU evidence; verify wins with controlled
++runtime and hardware counters on the intended target before making claims.
++
++| Source | Function | LCCC | Best | Best compiler | LCCC/best | Loads | Stores | Spills | Branches |
++|---|---:|---:|---:|---|---:|---:|---:|---:|---:|
++| `tests/benchmark/programs/aarch64_select_patterns.c` | `conditional_increment` | 13 | 3 | carm64g1610 | 4.33x | 3 | 3 | 6 | 1 |
++| `tests/benchmark/programs/aarch64_select_patterns.c` | `narrow_high_constant` | 14 | 4 | carm64g1610 | 3.50x | 3 | 3 | 6 | 1 |
++| `tests/benchmark/programs/aarch64_select_patterns.c` | `select_pressure` | 31 | 6 | carm64g1610 | 5.17x | 6 | 6 | 12 | 1 |
+diff --git a/engineering/evidence/aarch64/session59/gcc-torture-500-summary.json b/engineering/evidence/aarch64/session59/gcc-torture-500-summary.json
+new file mode 100644
+index 00000000..b1c213be
+--- /dev/null
++++ b/engineering/evidence/aarch64/session59/gcc-torture-500-summary.json
+@@ -0,0 +1,250 @@
++{
++  "gcc_revision": "ad82e41f1b997dedd2cf227cb410afd8763d89c8",
++  "corpus": "gcc/testsuite/gcc.c-torture/execute (first 500 sorted top-level C files)",
++  "flags": [
++    "-O2"
++  ],
++  "tools": {
++    "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0",
++    "assembler": "GNU assembler (GNU Binutils) 2.47.20260726",
++    "gcc": "aarch64-linux-gnu-gcc (Debian 14.2.0-19) 14.2.0",
++    "clang": null,
++    "qemu": "qemu-aarch64 version 10.0.11 (Debian 1:10.0.11+ds-0+deb13u1)"
++  },
++  "counts": {
++    "PASS": 454,
++    "FAIL": 46
++  },
++  "failures": [
++    {
++      "source": "20000822-1.c",
++      "stage": "lccc-compile",
++      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20000822-1.c:15:3: error: expected ';' after declaration before '{'\n   {\n   ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20000822-1.c: 1 parse error(s)"
++    },
++    {
++      "source": "20010209-1.c",
++      "stage": "lccc-compile",
++      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20010209-1.c:9:3: error: expected ';' after declaration before '{'\n   {\n   ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20010209-1.c: 1 parse error(s)"
++    },
++    {
++      "source": "20010605-1.c",
++      "stage": "lccc-compile",
++      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20010605-1.c:6:5: error: expected ';' after declaration before '{'\n     {\n     ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20010605-1.c: 1 parse error(s)"
++    },
++    {
++      "source": "20010910-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20020411-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20020412-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20020413-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-11 out='' err='qemu: uncaught target signal 11 (Segmentation fault) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20020720-1.c",
++      "stage": "lccc-link",
++      "detail": "/usr/lib/gcc-cross/aarch64-linux-gnu/14/../../../../aarch64-linux-gnu/bin/ld: /home/user/.cache/lccc-aarch64-suite-wiqq49wj/20020720-1.c/lccc.o: in function `foo':\n(.text+0x28): undefined reference to `link_error'\ncollect2: error: ld returned 1 exit status"
++    },
++    {
++      "source": "20021127-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20030125-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20030216-1.c",
++      "stage": "lccc-link",
++      "detail": "/usr/lib/gcc-cross/aarch64-linux-gnu/14/../../../../aarch64-linux-gnu/bin/ld: /home/user/.cache/lccc-aarch64-suite-wiqq49wj/20030216-1.c/lccc.o: in function `main':\n(.text+0x38): undefined reference to `link_error'\ncollect2: error: ld returned 1 exit status"
++    },
++    {
++      "source": "20030501-1.c",
++      "stage": "lccc-compile",
++      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20030501-1.c:11:7: error: expected ';' after declaration before '{'\n       {\n       ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20030501-1.c: 1 parse error(s)"
++    },
++    {
++      "source": "20031003-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20040411-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20040423-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20040520-1.c",
++      "stage": "lccc-compile",
++      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20040520-1.c:7:9: error: expected ';' after declaration before '{'\n         {\n         ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20040520-1.c: 1 parse error(s)"
++    },
++    {
++      "source": "20040706-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20040709-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20040709-2.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20040709-3.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20041019-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20041114-1.c",
++      "stage": "lccc-link",
++      "detail": "/usr/lib/gcc-cross/aarch64-linux-gnu/14/../../../../aarch64-linux-gnu/bin/ld: /home/user/.cache/lccc-aarch64-suite-wiqq49wj/20041114-1.c/lccc.o: in function `foo':\n(.text+0x34): undefined reference to `link_failure'\ncollect2: error: ld returned 1 exit status"
++    },
++    {
++      "source": "20041214-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-11 out='' err='qemu: uncaught target signal 11 (Segmentation fault) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20041218-2.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20050121-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20050502-2.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20051215-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-11 out='' err='qemu: uncaught target signal 11 (Segmentation fault) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20060929-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20061220-1.c",
++      "stage": "lccc-compile",
++      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20061220-1.c:11:3: error: expected ';' after declaration before '{'\n   {\n   ^\n  fix-it hint: insert ';'\n/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20061220-1.c:30:3: error: expected ';' after declaration before '{'\n   {\n   ^\n  fix-it hint: insert ';'\n/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20061220-1.c:49:3: error: expected ';' after declaration before '{'\n   {\n   ^\n  fix-it hint: insert ';'\n/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20061220-1.c:51:5: error: expected ';' after declaration before '{'\n     {\n     ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20061220-1.c: 4 parse error(s)"
++    },
++    {
++      "source": "20070212-2.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20070614-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20070919-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20071210-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20071220-1.c",
++      "stage": "lccc-link",
++      "detail": "/usr/lib/gcc-cross/aarch64-linux-gnu/14/../../../../aarch64-linux-gnu/bin/ld: /home/user/.cache/lccc-aarch64-suite-wiqq49wj/20071220-1.c/lccc.o:(.data+0x0): undefined reference to `.LBB3'\ncollect2: error: ld returned 1 exit status"
++    },
++    {
++      "source": "20071220-2.c",
++      "stage": "lccc-link",
++      "detail": "/usr/lib/gcc-cross/aarch64-linux-gnu/14/../../../../aarch64-linux-gnu/bin/ld: /home/user/.cache/lccc-aarch64-suite-wiqq49wj/20071220-2.c/lccc.o:(.data+0x0): undefined reference to `.LBB3'\ncollect2: error: ld returned 1 exit status"
++    },
++    {
++      "source": "20080604-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20090219-1.c",
++      "stage": "lccc-compile",
++      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20090219-1.c:12:5: error: expected ';' after declaration before '{'\n     {\n     ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20090219-1.c: 1 parse error(s)"
++    },
++    {
++      "source": "20120919-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20171008-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20230630-2.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "20230630-4.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "920302-1.c",
++      "stage": "execute-vs-gcc",
++      "detail": "lccc rc=-11 out='' err='qemu: uncaught target signal 11 (Segmentation fault) - core dumped'; gcc rc=0 out='' err=''"
++    },
++    {
++      "source": "920415-1.c",
++      "stage": "lccc-compile",
++      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/920415-1.c:3:28: error: expected ';' after declaration before '{'\n main(){__label__ l;void*x(){return&&l;}goto*x();abort();return;l:exit(0);}\n                            ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/920415-1.c: 1 parse error(s)"
++    },
++    {
++      "source": "920428-2.c",
++      "stage": "lccc-compile",
++      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/920428-2.c:5:39: error: expected ';' after declaration before '{'\n s(i){if(i>0){__label__ l1;int f(int i){if(i==2)goto l1;return 0;}return f(i);l1:;}return 1;}\n                                       ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/920428-2.c: 1 parse error(s)"
++    },
++    {
++      "source": "920501-7.c",
++      "stage": "lccc-compile",
++      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/920501-7.c:16:5: error: expected ';' after declaration before '{'\n     {\n     ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/920501-7.c: 1 parse error(s)"
++    },
++    {
++      "source": "920612-2.c",
++      "stage": "lccc-compile",
++      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/920612-2.c:11:5: error: expected ';' after declaration before '{'\n     {\n     ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/920612-2.c: 1 parse error(s)"
++    }
++  ]
++}
+diff --git a/scripts/README.md b/scripts/README.md
+index 3971cdc1..93d35d28 100644
+--- a/scripts/README.md
++++ b/scripts/README.md
+@@ -16,7 +16,8 @@ Developer and research tooling. None of these are needed to build LCCC.
+ | `gen_encoding_sweep.py` | Generate instructions that have MORE THAN ONE legal encoding (accumulator short forms, imm8 sign-extension, redundant REX, VEX2-vs-VEX3, scale-1 index folds, ...). These are the only places an encoding can be improved, and most are invisible to a structural-coverage corpus. |
+ | `gen_asmdiff_corpus.py` | Generate the `tests/asm-diff/*.casefile` corpora. Every case is validated against GNU as before being written. |
+ | `godbolt.py` | Compiler Explorer client. Fetches GCC/Clang/ICC/ICX code generation so the Intel compilers can serve as reference oracles without a local Intel toolchain. |
+-| `codegen_oracle.py` | Batch local/Compiler-Explorer comparison with deterministic artifacts and architecture-aware x86 or AArch64 instruction/load/store/stack-traffic statistics. |
++| `codegen_oracle.py` | Batch local/Compiler-Explorer comparison with deterministic artifacts and architecture-aware x86 or AArch64 instruction/load/store/stack-traffic statistics; AArch64 defaults to GCC 16.1, GCC trunk, and Clang 22.1. |
++| `aarch64_execute_suite.py` | GCC `gcc.c-torture/execute` differential runner: LCCC assembly is validated by a mandatory GAS 2.47, linked for AArch64, and executed against GCC/optional Clang under QEMU. |
+ | `lccc-snapshot.sh` | Harness-wipe-resistant autosave: commit, squashed `ms178-1.patch`, series, tarball, bundle, ledger. |
+ | `benchmark_fp_memfold_ab.py` | Builds the stencil5 scalar-FP memory-fold treatment/control and retains randomized CPU-pinned paired samples plus a bootstrap interval. Results are explicitly VM screening, not PMU evidence. |
+ | `benchmark_reduction_vecreg_ab.py` | Builds register- and stack-accumulator variants of the F32 sum+dot workload and retains randomized CPU-pinned paired samples with a bootstrap interval. |
+@@ -102,6 +103,14 @@ scripts/godbolt.py compare kernel.c --flags "-O3 -march=x86-64-v3" \
+ # AArch64 structural comparison (ARM64 GCC 16.1 on Compiler Explorer):
+ python3 scripts/codegen_oracle.py test.c --function hot_loop \
+     --arch aarch64 --local target/fastbuild/lccc-arm \
+-    --local-flags '-O2' --flags '-O2' --oracles carm64g1610 \
++    --local-flags '-O2' --flags '-O2' \
+     --artifact-dir /tmp/aarch64-oracle
++
++# Differential execution of GCC's C torture suite. The harness rejects every
++# assembler whose --version is not 2.47.
++python3 scripts/aarch64_execute_suite.py \
++    /path/to/gcc/gcc/testsuite/gcc.c-torture/execute \
++    --lccc target/fastbuild/lccc-arm \
++    --assembler /path/to/binutils-2.47/aarch64-linux-gnu-as \
++    --jobs 2 --flags=-O2 --json /tmp/aarch64-torture.json
+ ```
+diff --git a/scripts/aarch64_execute_suite.py b/scripts/aarch64_execute_suite.py
+new file mode 100644
+index 00000000..5838dbde
+--- /dev/null
++++ b/scripts/aarch64_execute_suite.py
+@@ -0,0 +1,306 @@
++#!/usr/bin/env python3
++"""Differential AArch64 execution harness for external C conformance suites.
++
++The primary corpus is GCC's ``gcc.c-torture/execute`` directory.  LCCC emits
++assembly, the requested GNU assembler validates/encodes it, and the resulting
++binary is linked with the cross GCC driver.  Reference binaries are built by
++AArch64 GCC and, when requested, Clang.  All binaries execute under qemu-user;
++stdout, stderr, and exit status must agree.
++
++This is a correctness and coverage harness. QEMU wall time is deliberately not
++reported as target-performance evidence.
++"""
++from __future__ import annotations
++
++import argparse
++import concurrent.futures
++import dataclasses
++import json
++import os
++import re
++import shlex
++import subprocess
++import tempfile
++import time
++from pathlib import Path
++from typing import Sequence
++
++
++@dataclasses.dataclass(frozen=True)
++class Toolchain:
++    corpus_root: Path
++    lccc: Path
++    assembler: Path
++    cross_gcc: str
++    qemu: str
++    clang: str | None
++    sysroot: Path
++    cflags: tuple[str, ...]
++    timeout: float
++
++
++@dataclasses.dataclass
++class Result:
++    source: str
++    status: str
++    stage: str
++    elapsed_s: float
++    detail: str = ""
++
++
++def run(command: Sequence[str], timeout: float, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[bytes]:
++    return subprocess.run(
++        command,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=timeout,
++        env=env,
++    )
++
++
++def text(data: bytes, limit: int = 1200) -> str:
++    return data.decode("utf-8", "replace")[:limit].strip()
++
++
++def tool_version(command: Sequence[str]) -> str:
++    try:
++        result = run(command, 10)
++        output = result.stdout or result.stderr
++        return output.decode("utf-8", "replace").splitlines()[0]
++    except (OSError, subprocess.SubprocessError, IndexError):
++        return "unavailable"
++
++
++def execute(binary: Path, tools: Toolchain) -> tuple[int, bytes, bytes]:
++    result = run(
++        [tools.qemu, "-L", str(tools.sysroot), str(binary)],
++        tools.timeout,
++    )
++    return result.returncode, result.stdout, result.stderr
++
++
++def dejagnu_flags(source: Path) -> tuple[str, ...]:
++    """Extract unconditional dg-options/additional-options from one test.
++
++    Target-qualified directives are intentionally ignored: evaluating DejaGNU
++    target expressions incorrectly is worse than leaving the test at the suite
++    default. The common unconditional language/overflow flags are sufficient
++    to avoid false oracle disagreements in gcc.c-torture.
++    """
++    contents = source.read_text(errors="replace")
++    flags: list[str] = []
++    pattern = re.compile(r"\{\s*dg-(?:additional-)?options\s+\"([^\"]*)\"\s*\}")
++    for match in pattern.finditer(contents):
++        flags.extend(shlex.split(match.group(1)))
++    return tuple(flags)
++
++
++def compile_reference(
++    compiler: str,
++    source: Path,
++    output: Path,
++    tools: Toolchain,
++    test_flags: tuple[str, ...],
++    *,
++    clang: bool,
++) -> subprocess.CompletedProcess[bytes]:
++    command = [compiler]
++    if clang:
++        command += ["--target=aarch64-linux-gnu", f"--sysroot={tools.sysroot}"]
++    command += [
++        *tools.cflags,
++        *test_flags,
++        f"-I{source.parent}",
++        str(source),
++        "-static",
++        "-lm",
++        "-o",
++        str(output),
++    ]
++    return run(command, tools.timeout)
++
++
++def test_one(source: Path, tools: Toolchain, work_root: Path) -> Result:
++    started = time.monotonic()
++    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(source.relative_to(tools.corpus_root)))
++    work = work_root / safe
++    work.mkdir(parents=True, exist_ok=True)
++    assembly = work / "lccc.s"
++    obj = work / "lccc.o"
++    binary = work / "lccc"
++    gcc_binary = work / "gcc"
++
++    try:
++        test_flags = dejagnu_flags(source)
++        gcc_compile = compile_reference(
++            tools.cross_gcc, source, gcc_binary, tools, test_flags, clang=False
++        )
++        if gcc_compile.returncode != 0:
++            return Result(str(source), "SKIP", "gcc-compile", time.monotonic() - started, text(gcc_compile.stderr))
++
++        lccc_compile = run(
++            [
++                str(tools.lccc),
++                *tools.cflags,
++                *test_flags,
++                f"-I{source.parent}",
++                "-S",
++                str(source),
++                "-o",
++                str(assembly),
++            ],
++            tools.timeout,
++        )
++        if lccc_compile.returncode != 0:
++            return Result(str(source), "FAIL", "lccc-compile", time.monotonic() - started, text(lccc_compile.stderr))
++
++        assembled = run([str(tools.assembler), str(assembly), "-o", str(obj)], tools.timeout)
++        if assembled.returncode != 0:
++            return Result(str(source), "FAIL", "gas-2.47", time.monotonic() - started, text(assembled.stderr))
++
++        linked = run(
++            [tools.cross_gcc, str(obj), "-static", "-lm", "-o", str(binary)],
++            tools.timeout,
++        )
++        if linked.returncode != 0:
++            return Result(str(source), "FAIL", "lccc-link", time.monotonic() - started, text(linked.stderr))
++
++        gcc_result = execute(gcc_binary, tools)
++        lccc_result = execute(binary, tools)
++        if lccc_result != gcc_result:
++            detail = (
++                f"lccc rc={lccc_result[0]} out={text(lccc_result[1], 400)!r} err={text(lccc_result[2], 400)!r}; "
++                f"gcc rc={gcc_result[0]} out={text(gcc_result[1], 400)!r} err={text(gcc_result[2], 400)!r}"
++            )
++            return Result(str(source), "FAIL", "execute-vs-gcc", time.monotonic() - started, detail)
++
++        if tools.clang:
++            clang_binary = work / "clang"
++            clang_compile = compile_reference(
++                tools.clang, source, clang_binary, tools, test_flags, clang=True
++            )
++            if clang_compile.returncode == 0:
++                clang_result = execute(clang_binary, tools)
++                if clang_result != gcc_result:
++                    return Result(
++                        str(source),
++                        "ORACLE-DISAGREE",
++                        "clang-vs-gcc",
++                        time.monotonic() - started,
++                        f"clang rc={clang_result[0]} vs gcc rc={gcc_result[0]}",
++                    )
++
++        return Result(str(source), "PASS", "execute", time.monotonic() - started)
++    except subprocess.TimeoutExpired as error:
++        return Result(str(source), "FAIL", "timeout", time.monotonic() - started, " ".join(error.cmd))
++    except OSError as error:
++        return Result(str(source), "HARNESS-ERROR", "spawn", time.monotonic() - started, str(error))
++
++
++def discover(root: Path, recursive: bool) -> list[Path]:
++    iterator = root.rglob("*.c") if recursive else root.glob("*.c")
++    return sorted(path.resolve() for path in iterator if path.is_file())
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("corpus", type=Path)
++    parser.add_argument("--lccc", type=Path, default=Path("target/fastbuild/lccc-arm"))
++    parser.add_argument("--assembler", type=Path, required=True)
++    parser.add_argument("--cross-gcc", default="aarch64-linux-gnu-gcc")
++    parser.add_argument("--clang", help="optional Clang executable")
++    parser.add_argument("--qemu", default="qemu-aarch64")
++    parser.add_argument("--sysroot", type=Path, default=Path("/usr/aarch64-linux-gnu"))
++    parser.add_argument("--flags", default="-O2")
++    parser.add_argument("--jobs", type=int, default=2)
++    parser.add_argument("--timeout", type=float, default=15.0)
++    parser.add_argument("--recursive", action="store_true")
++    parser.add_argument("--limit", type=int)
++    parser.add_argument("--match", help="regular expression applied to the source path")
++    parser.add_argument("--work-dir", type=Path)
++    parser.add_argument("--json", type=Path)
++    parser.add_argument("--keep", action="store_true")
++    return parser.parse_args()
++
++
++def main() -> int:
++    args = parse_args()
++    assembler_version = tool_version([str(args.assembler), "--version"])
++    if "2.47" not in assembler_version:
++        raise SystemExit(f"error: --assembler must be GNU as 2.47, got: {assembler_version}")
++    tools = Toolchain(
++        corpus_root=args.corpus.resolve(),
++        lccc=args.lccc.resolve(),
++        assembler=args.assembler.resolve(),
++        cross_gcc=args.cross_gcc,
++        qemu=args.qemu,
++        clang=args.clang,
++        sysroot=args.sysroot.resolve(),
++        cflags=tuple(shlex.split(args.flags)),
++        timeout=args.timeout,
++    )
++    sources = discover(args.corpus.resolve(), args.recursive)
++    if args.match:
++        pattern = re.compile(args.match)
++        sources = [source for source in sources if pattern.search(str(source))]
++    if args.limit is not None:
++        sources = sources[: args.limit]
++    if not sources:
++        raise SystemExit("error: no C tests selected")
++
++    temporary = None
++    if args.work_dir:
++        work_root = args.work_dir.resolve()
++        work_root.mkdir(parents=True, exist_ok=True)
++    else:
++        scratch_parent = Path(os.environ.get("LCCC_SCRATCH", "/home/user/.cache"))
++        scratch_parent.mkdir(parents=True, exist_ok=True)
++        if args.keep:
++            work_root = Path(
++                tempfile.mkdtemp(prefix="lccc-aarch64-suite-", dir=scratch_parent)
++            )
++        else:
++            temporary = tempfile.TemporaryDirectory(
++                prefix="lccc-aarch64-suite-", dir=scratch_parent
++            )
++            work_root = Path(temporary.name)
++
++    results: list[Result] = []
++    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as executor:
++        futures = {executor.submit(test_one, source, tools, work_root): source for source in sources}
++        for future in concurrent.futures.as_completed(futures):
++            result = future.result()
++            results.append(result)
++            if result.status != "PASS":
++                print(f"{result.status:16} {result.stage:16} {Path(result.source).name}: {result.detail}")
++
++    results.sort(key=lambda result: result.source)
++    counts: dict[str, int] = {}
++    for result in results:
++        counts[result.status] = counts.get(result.status, 0) + 1
++    metadata = {
++        "corpus": str(args.corpus.resolve()),
++        "flags": list(tools.cflags),
++        "tools": {
++            "lccc": tool_version([str(tools.lccc), "--version"]),
++            "assembler": assembler_version,
++            "gcc": tool_version([tools.cross_gcc, "--version"]),
++            "clang": tool_version([tools.clang, "--version"]) if tools.clang else None,
++            "qemu": tool_version([tools.qemu, "--version"]),
++        },
++        "counts": counts,
++        "results": [dataclasses.asdict(result) for result in results],
++    }
++    print("SUMMARY " + " ".join(f"{key}={value}" for key, value in sorted(counts.items())))
++    if args.json:
++        args.json.parent.mkdir(parents=True, exist_ok=True)
++        temporary_json = args.json.with_suffix(args.json.suffix + f".tmp.{os.getpid()}")
++        temporary_json.write_text(json.dumps(metadata, indent=2) + "\n")
++        temporary_json.replace(args.json)
++    if args.keep:
++        print(f"WORKDIR {work_root}")
++    return 1 if any(result.status in {"FAIL", "HARNESS-ERROR"} for result in results) else 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/codegen_oracle.py b/scripts/codegen_oracle.py
+index ebde7e5e..df11d038 100644
+--- a/scripts/codegen_oracle.py
++++ b/scripts/codegen_oracle.py
+@@ -23,8 +23,9 @@ Survey a benchmark file and write review artifacts::
+         --artifact-dir results/gzip-crc --json results/gzip-crc/manifest.json
+ 
+ The x86 defaults intentionally include GCC, Clang, ICC and ICX because ICX is
+-a moving channel. AArch64 defaults to ARM64 GCC 16.1 plus trunk. Every manifest
+-records the architecture and resolved compiler id/name/version.
++a moving channel. AArch64 defaults to ARM64 GCC 16.1, GCC trunk, and Clang 22.1
++(with automatic `--target=aarch64-linux-gnu`). Every manifest records the
++architecture and resolved compiler id/name/version.
+ """
+ from __future__ import annotations
+ 
+@@ -38,6 +39,7 @@ import shlex
+ import statistics
+ import subprocess
+ import sys
++import tempfile
+ import time
+ from dataclasses import asdict, dataclass
+ from pathlib import Path
+@@ -48,7 +50,7 @@ import godbolt  # noqa: E402
+ 
+ DEFAULT_FLAGS = "-O3 -march=x86-64-v3"
+ DEFAULT_ORACLES = ("gcc16.2", "clang", "icc", "icx")
+-DEFAULT_AARCH64_ORACLES = ("carm64g1610", "carm64gtrunk")
++DEFAULT_AARCH64_ORACLES = ("carm64g1610", "carm64gtrunk", "cclang2210")
+ 
+ _DIRECTIVE = re.compile(r"^\s*(?:\.|#|//|cfi_)")
+ _LABEL = re.compile(r'^\s*"?([.\w$]+)"?:')
+@@ -146,7 +148,13 @@ def _stats(lines: Iterable[str], arch: str) -> AsmStats:
+ 
+ def _local_compile(executable: str, source: Path, flags: str) -> list[str]:
+     digest = hashlib.sha256((str(source.resolve()) + "\0" + flags).encode()).hexdigest()[:16]
+-    output = Path(os.environ.get("TMPDIR", "/tmp")) / f"codegen-oracle-{digest}-{os.getpid()}.s"
++    fd, output_name = tempfile.mkstemp(
++        prefix=f"codegen-oracle-{digest}-",
++        suffix=".s",
++        dir=os.environ.get("TMPDIR", "/tmp"),
++    )
++    os.close(fd)
++    output = Path(output_name)
+     command = [executable, *shlex.split(flags), "-S", str(source), "-o", str(output)]
+     result = subprocess.run(command, capture_output=True, text=True)
+     if result.returncode != 0:
+@@ -184,14 +192,21 @@ def _record_local(req: Request, executable: str) -> dict[str, Any]:
+ 
+ 
+ def _record_remote(name: str, source: str, req: Request, compilers: list[dict[str, Any]]) -> dict[str, Any]:
++    metadata = godbolt.compiler_metadata(name, compilers=compilers)
++    flags = req.flags
++    compiler_text = f"{metadata.get('id', '')} {metadata.get('name', '')}".lower()
++    # CE's native ARM GCC channels already target AArch64, whereas the newest
++    # Clang channel is hosted as x86-64 and needs an explicit backend target.
++    if req.arch == "aarch64" and "clang" in compiler_text and "--target=" not in flags:
++        flags = f"{flags} --target=aarch64-linux-gnu"
+     started = time.perf_counter()
+-    lines = _compile_remote(name, source, req.flags)
++    lines = _compile_remote(name, source, flags)
+     elapsed = time.perf_counter() - started
+     body = _function_body(lines, req.function)
+     return {
+         "key": name,
+-        **godbolt.compiler_metadata(name, compilers=compilers),
+-        "flags": req.flags,
++        **metadata,
++        "flags": flags,
+         "elapsed_s": elapsed,
+         **asdict(_stats(body, req.arch)),
+         "assembly": body,
+diff --git a/scripts/lccc-snapshot.sh b/scripts/lccc-snapshot.sh
+index 63834058..442c0eef 100755
+--- a/scripts/lccc-snapshot.sh
++++ b/scripts/lccc-snapshot.sh
+@@ -89,14 +89,19 @@ mv -f "$ART/lccc.bundle.tmp.$$" "$ART/lccc.bundle" 2>/dev/null || true
+ # ---- 5. ledger --------------------------------------------------------------
+ files=$(git diff --stat "$BASE" HEAD | tail -1 | sed 's/^ *//')
+ if [[ ! -f "$LEDGER" ]]; then
++  echo "# LCCC Snapshot Ledger" > "$LEDGER"
++fi
++# A merged session starts from a new upstream base while retaining historical
++# artifacts. Start a fresh ledger section instead of silently appending rows
++# under the previous base's heading.
++if ! grep -Fq "Base (upstream): \`$BASE\`" "$LEDGER"; then
+   {
+-    echo "# LCCC Snapshot Ledger"
+     echo
+-    echo "Base (upstream): \`$BASE\`"
++    echo "## Base (upstream): \`$BASE\`"
+     echo
+     echo "| # | UTC | Tag | Description | Cumulative diffstat |"
+     echo "|---|-----|-----|-------------|---------------------|"
+-  } > "$LEDGER"
++  } >> "$LEDGER"
+ fi
+ printf '| %d | %s | `%s` | %s | %s |\n' "$seq" "$stamp" "$tag" "$desc" "${files:-none}" >> "$LEDGER"
+ 
+diff --git a/src/backend/arm/codegen/comparison.rs b/src/backend/arm/codegen/comparison.rs
+index 675a8eb9..1494de65 100644
+--- a/src/backend/arm/codegen/comparison.rs
++++ b/src/backend/arm/codegen/comparison.rs
+@@ -1,8 +1,8 @@
+ //! ArmCodegen: comparison operations.
+ 
+ use super::emit::{
+-    arm_int_cond_code, arm_invert_cond_code, callee_saved_name, callee_saved_name_32,
+-    is_arm_fp_phys, ArmCodegen,
++    ArmCodegen, arm_int_cond_code, arm_invert_cond_code, callee_saved_name, callee_saved_name_32,
++    is_arm_fp_phys,
+ };
+ use crate::common::types::IrType;
+ use crate::ir::reexports::{IrCmpOp, Operand, Value};
+@@ -163,8 +163,11 @@ impl ArmCodegen {
+             self.state
+                 .emit_fmt(format_args!("    csel {}, {}, {}, ne", d, t_name, f_name));
+         } else {
+-            self.state
+-                .emit_fmt(format_args!("    csel x0, {}, {}, ne", t_name, f_name));
++            let accumulator = if use_32bit { "w0" } else { "x0" };
++            self.state.emit_fmt(format_args!(
++                "    csel {}, {}, {}, ne",
++                accumulator, t_name, f_name
++            ));
+             self.store_x0_to(dest);
+         }
+         self.state.reg_cache.invalidate_acc();
+@@ -206,8 +209,11 @@ impl ArmCodegen {
+                 d, t_name, f_name, cc
+             ));
+         } else {
+-            self.state
+-                .emit_fmt(format_args!("    csel x0, {}, {}, {}", t_name, f_name, cc));
++            let accumulator = if use_32bit { "w0" } else { "x0" };
++            self.state.emit_fmt(format_args!(
++                "    csel {}, {}, {}, {}",
++                accumulator, t_name, f_name, cc
++            ));
+             self.store_x0_to(dest);
+         }
+         self.state.reg_cache.invalidate_acc();
+diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
+index 7b4ae469..219e2936 100644
+--- a/src/backend/arm/codegen/emit.rs
++++ b/src/backend/arm/codegen/emit.rs
+@@ -684,42 +684,59 @@ impl ArmCodegen {
+         }
+     }
+ 
+-    /// Check if an IrConst is a small unsigned immediate that fits in AArch64
+-    /// `cmp Xn, #imm12` instruction (0..=4095).
+-    fn const_as_cmp_imm12(c: &IrConst) -> Option<u64> {
+-        let v = match c {
+-            IrConst::I8(v) => *v as i64,
+-            IrConst::I16(v) => *v as i64,
+-            IrConst::I32(v) => *v as i64,
+-            IrConst::I64(v) => *v,
+-            IrConst::Zero => 0,
+-            _ => return None,
++    /// Normalize an integer constant to the exact bit pattern compared by the
++    /// AArch64 instruction. Narrow compares execute in W registers, so signed
++    /// values are sign-extended and unsigned values are zero-extended to 32
++    /// bits. This distinction is essential for `(unsigned short)-2`: its
++    /// compare value is 0x0000fffe, not the 32-bit -2 pattern 0xfffffffe.
++    fn normalized_cmp_const(c: &IrConst, ty: IrType) -> Option<u64> {
++        if !ty.is_integer() && ty != IrType::Ptr {
++            return None;
++        }
++        let bits = (ty.size() * 8) as u32;
++        if bits == 0 || bits > 64 {
++            return None;
++        }
++        let mask = if bits == 64 {
++            u128::from(u64::MAX)
++        } else {
++            (1u128 << bits) - 1
          };
- 
-         let mut shared_symbols = elf_mod::build_elf_symbol_table(&symtab_input);
-+        if !symver_removed.is_empty() {
-+            shared_symbols.retain(|s| !symver_removed.contains(&s.name));
-+        }
- 
-         // Add COMMON symbols
-         for sym in &self.symbols {
-diff --git a/src/backend/x86/assembler/encoder/gp_integer.rs b/src/backend/x86/assembler/encoder/gp_integer.rs
-index 52003eb..d8def63 100644
---- a/src/backend/x86/assembler/encoder/gp_integer.rs
-+++ b/src/backend/x86/assembler/encoder/gp_integer.rs
-@@ -1228,6 +1228,61 @@ impl super::InstructionEncoder {
-         }
-     }
- 
-+    /// GNU as's shift/rotate immediate acceptance, derived empirically
-+    /// against binutils 2.4x (insndiff FALSE-ACCEPT / REJECTS-VALID oracle):
-+    ///   * 0..=255 is accepted everywhere (raw unsigned imm8 field);
-+    ///   * -128..=-1 is additionally accepted when the immediate fits the
-+    ///     DESTINATION width as signed — i.e. for every 8-bit-operand form
-+    ///     (`shlb $-1, %al` is fine) — and for rol/ror at ALL widths (their
-+    ///     binutils template carries Imm8S; a negative rotate is meaningful
-+    ///     modulo the width);
-+    ///   * everything else is "operand type mismatch".
-+    /// Silently truncating an out-of-range count would encode an
-+    /// instruction the programmer did not write.
-+    fn check_shift_imm(mnemonic: &str, size: u8, count: i64) -> Result<(), String> {
-+        // 8-bit operand forms: GNU as accepts ANY immediate and masks it to
-+        // the low byte (silent inside -128..=255, warn-and-truncate outside
-+        // — but never a hard error). Byte destinations therefore skip the
-+        // range check entirely; the caller's `as u8` performs the same
-+        // wrap GAS encodes.
-+        if size == 1 {
-+            return Ok(());
-+        }
-+        if mnemonic.starts_with("rol") || mnemonic.starts_with("ror") {
-+            // rol/ror carry Imm8S. GAS's acceptance windows, probed
-+            // empirically against binutils 2.4x:
-+            //   * the raw value -128..=255, and
-+            //   * the top unsigned band of the OPERAND width,
-+            //     2^bits-128 ..= 2^bits-1 (`rolw $65535` is -1 in 16-bit
-+            //     unsigned clothing; `rolw $65407` = -129 is refused, and
-+            //     values whose low bits merely COLLAPSE into range, like
-+            //     $-2^31 at 16-bit, are refused too — GAS does not mask).
-+            // 64-bit operands need no extra band: 2^64-128.. wraps negative
-+            // in the i64 the parser produced.
-+            let in_basic = (-128..=255).contains(&count);
-+            let in_top_band = size < 8 && {
-+                let bits = (size as u32) * 8;
-+                let top = 1i64 << bits;
-+                count >= top - 128 && count < top
+-        // AArch64 cmp (alias of subs) accepts unsigned 12-bit immediate (0..4095),
+-        // optionally shifted left by 12. We only use the unshifted form.
+-        if (0..=4095).contains(&v) {
+-            Some(v as u64)
++        let truncated = (c.to_i128()? as u128) & mask;
++        if ty.is_signed() {
++            let sign_bit = 1u128 << (bits - 1);
++            let signed = if truncated & sign_bit != 0 {
++                (truncated | !mask) as i128
++            } else {
++                truncated as i128
 +            };
-+            if !in_basic && !in_top_band {
-+                return Err(format!(
-+                    "operand type mismatch for `{}' (count {})",
-+                    mnemonic, count
-+                ));
++            if bits <= 32 {
++                Some((signed as i32 as u32) as u64)
++            } else {
++                Some(signed as i64 as u64)
 +            }
-+            return Ok(());
-+        }
-+        // shl/shr/sal/sar/rcl/rcr at 16/32/64-bit widths: unsigned imm8 only.
-+        if !(0..=255).contains(&count) {
-+            return Err(format!(
-+                "operand type mismatch for `{}' (count {} outside 0..=255)",
-+                mnemonic, count
-+            ));
-+        }
-+        Ok(())
-+    }
-+
-     pub(crate) fn encode_shift(
-         &mut self,
-         ops: &[Operand],
-@@ -1268,6 +1323,7 @@ impl super::InstructionEncoder {
-         match (&ops[0], &ops[1]) {
-             (Operand::Immediate(ImmediateValue::Integer(count)), Operand::Register(dst)) => {
-                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-+                Self::check_shift_imm(mnemonic, size as u8, *count)?;
-                 let count = *count as u8;
- 
-                 if size == 2 {
-@@ -1286,6 +1342,7 @@ impl super::InstructionEncoder {
-                 Ok(())
-             }
-             (Operand::Immediate(ImmediateValue::Integer(count)), Operand::Memory(mem)) => {
-+                Self::check_shift_imm(mnemonic, size as u8, *count)?;
-                 let count = *count as u8;
-                 if size == 2 {
-                     self.bytes.push(0x66);
-diff --git a/src/backend/x86/assembler/parser.rs b/src/backend/x86/assembler/parser.rs
-index b715f11..232d8ce 100644
---- a/src/backend/x86/assembler/parser.rs
-+++ b/src/backend/x86/assembler/parser.rs
-@@ -90,8 +90,10 @@ pub enum AsmItem {
-         skip: u64,
-         count: Option<u64>,
-     },
--    /// Symbol version: `.symver name, name2@@VERSION` or `.symver name, name2@VERSION`
--    Symver(String, String),
-+    /// Symbol version: `.symver name, name2@@VERSION` or `.symver name, name2@VERSION`,
-+    /// optionally followed by a visibility argument:
-+    /// `.symver name, name2@VERSION, {local|hidden|remove}` (GAS 2.35+).
-+    Symver(String, String, Option<SymverFlag>),
-     /// Code mode switch: `.code16`, `.code32`, `.code64`
-     /// The value is the bit width (16, 32, or 64).
-     CodeMode(u8),
-@@ -99,6 +101,20 @@ pub enum AsmItem {
-     Empty,
- }
- 
-+/// Visibility argument of a three-operand `.symver` directive (GAS 2.35+).
-+/// Semantics verified against binutils GAS on the plain-name symbol when the
-+/// versioned alias is created:
-+///   `local`  — the plain name is kept but demoted to STB_LOCAL,
-+///   `hidden` — the plain name stays global with STV_HIDDEN visibility,
-+///   `remove` — the plain name is removed from the symbol table entirely and
-+///              intra-object references rebind to the versioned symbol.
-+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-+pub enum SymverFlag {
-+    Local,
-+    Hidden,
-+    Remove,
-+}
-+
- /// Section directive with optional flags and type.
- #[derive(Debug, Clone)]
- pub struct SectionDirective {
-@@ -989,16 +1005,37 @@ fn parse_set_directive(args: &str) -> Result<AsmItem, String> {
-     ))
- }
- 
--/// Parse `.symver name, name2@@VERSION` or `.symver name, name2@VERSION`.
-+/// Parse `.symver name, name2@@VERSION` or `.symver name, name2@VERSION`,
-+/// with an optional third visibility argument `local`, `hidden` or `remove`
-+/// (GAS 2.35+; glibc's compat_symbol machinery generates the plain two-arg
-+/// form, the Linux kernel and newer glibc use `remove`).
-+///
-+/// An unrecognized third argument is a hard error, exactly like GAS
-+/// ("junk at end of line"): silently folding it into the version string
-+/// previously produced garbage symbol names like `foo@VERS_1, remove`.
- fn parse_symver_directive(args: &str) -> Result<AsmItem, String> {
--    let parts: Vec<&str> = args.splitn(2, ',').collect();
--    if parts.len() != 2 {
-+    let parts: Vec<&str> = args.split(',').collect();
-+    if parts.len() < 2 || parts.len() > 3 {
-         return Err(format!("bad .symver directive: {}", args));
-     }
--    Ok(AsmItem::Symver(
--        parts[0].trim().to_string(),
--        parts[1].trim().to_string(),
--    ))
-+    let name = parts[0].trim();
-+    let ver = parts[1].trim();
-+    if name.is_empty() || ver.is_empty() {
-+        return Err(format!("bad .symver directive: {}", args));
-+    }
-+    let flag = match parts.get(2).map(|s| s.trim()) {
-+        None => None,
-+        Some("local") => Some(SymverFlag::Local),
-+        Some("hidden") => Some(SymverFlag::Hidden),
-+        Some("remove") => Some(SymverFlag::Remove),
-+        Some(other) => {
-+            return Err(format!(
-+                ".symver: invalid visibility argument '{}' (expected local, hidden or remove): {}",
-+                other, args
-+            ));
-+        }
-+    };
-+    Ok(AsmItem::Symver(name.to_string(), ver.to_string(), flag))
- }
- 
- /// Does this line start with an instruction prefix followed by a mnemonic?
-diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
-index 9a3c813..acef23c 100644
---- a/src/backend/x86/codegen/intrinsics.rs
-+++ b/src/backend/x86/codegen/intrinsics.rs
-@@ -984,6 +984,16 @@ impl X86Codegen {
-                     self.store_rax_to(d);
-                 }
-             }
-+            IntrinsicOp::FmaScalarF64 => {
-+                // dest = args[0]*args[1] + args[2], single rounding.
-+                // vfmadd231 form: dest_reg preloaded with the addend, then
-+                // dest = src2*src1 + dest — exactly emit_scalar_fma231's
-+                // contract (shared with the mul+add fusion pass).
-+                self.emit_scalar_fma231(&args[0], &args[1], &args[2], &dest.unwrap(), IrType::F64);
-+            }
-+            IntrinsicOp::FmaScalarF32 => {
-+                self.emit_scalar_fma231(&args[0], &args[1], &args[2], &dest.unwrap(), IrType::F32);
-+            }
-             IntrinsicOp::SqrtF64 => {
-                 // Prefer VEX scalar sqrt (ICX/GCC on x86-64-v3). Avoids the
-                 // legacy SSE encoding and matches the vmul/vadd path.
-diff --git a/src/frontend/sema/builtins.rs b/src/frontend/sema/builtins.rs
-index 988c2c4..d746a93 100644
---- a/src/frontend/sema/builtins.rs
-+++ b/src/frontend/sema/builtins.rs
-@@ -54,6 +54,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
-     m.insert("__builtin_fabsf", BuiltinInfo::simple("fabsf"));
-     m.insert("__builtin_fabsl", BuiltinInfo::simple("fabsl"));
-     m.insert("__builtin_sqrt", BuiltinInfo::simple("sqrt"));
-+    // C99 fused multiply-add: MUST reach the FmaScalar intrinsic for
-+    // single-rounding semantics (glibc math-use-builtins-fma.h).
-+    m.insert("__builtin_fma", BuiltinInfo::simple("fma"));
-+    m.insert("__builtin_fmaf", BuiltinInfo::simple("fmaf"));
-     m.insert("__builtin_sqrtl", BuiltinInfo::simple("sqrtl"));
-     m.insert("__builtin_sqrtf", BuiltinInfo::simple("sqrtf"));
-     m.insert("__builtin_sin", BuiltinInfo::simple("sin"));
-@@ -1486,6 +1490,11 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
-         "__builtin_ia32_shufps",
-         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86ShufPsValue),
-     );
-+    // glibc sysdeps/x86/fpu/sincosf_poly.h: v4sf = __builtin_ia32_cvtpd2ps(v2df).
-+    m.insert(
-+        "__builtin_ia32_cvtpd2ps",
-+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86CvtPd2PsValue),
-+    );
-     m.insert(
-         "__builtin_shufflevector",
-         BuiltinInfo::intrinsic(BuiltinIntrinsic::ShuffleVector),
-@@ -2987,6 +2996,7 @@ pub enum BuiltinIntrinsic {
-     X86MaxPs128,      // __builtin_ia32_maxps (MAXPS) — GCC vector-extension builtin
-     X86MinPs128,      // __builtin_ia32_minps (MINPS)
-     X86ShufPsValue,   // __builtin_ia32_shufps (SHUFPS imm8) — by-value raw builtin
-+    X86CvtPd2PsValue, // __builtin_ia32_cvtpd2ps (CVTPD2PS) — by-value raw builtin
-     ShuffleVector,    // __builtin_shufflevector (4-lane 32-bit shuffles)
-     X86MaxPs256V,     // __builtin_ia32_maxps256 (VMAXPS ymm)
-     X86MinPs256V,     // __builtin_ia32_minps256 (VMINPS ymm)
-diff --git a/src/frontend/sema/type_checker.rs b/src/frontend/sema/type_checker.rs
-index 2cbdea6..1e24c22 100644
---- a/src/frontend/sema/type_checker.rs
-+++ b/src/frontend/sema/type_checker.rs
-@@ -844,6 +844,7 @@ impl<'a> ExprTypeChecker<'a> {
-             "__builtin_inf"
-             | "__builtin_huge_val"
-             | "__builtin_nan"
-+            | "__builtin_fma"
-             | "__builtin_fabs"
-             | "__builtin_sqrt"
-             | "__builtin_sin"
-@@ -863,6 +864,7 @@ impl<'a> ExprTypeChecker<'a> {
-             "__builtin_inff"
-             | "__builtin_huge_valf"
-             | "__builtin_nanf"
-+            | "__builtin_fmaf"
-             | "__builtin_fabsf"
-             | "__builtin_sqrtf"
-             | "__builtin_sinf"
-diff --git a/src/ir/instruction.rs b/src/ir/instruction.rs
-index a2ff906..8f34b86 100644
---- a/src/ir/instruction.rs
-+++ b/src/ir/instruction.rs
-@@ -570,8 +570,12 @@ impl Instruction {
-             Instruction::Phi { ty, .. } => Some(*ty),
-             Instruction::Select { ty, .. } => Some(*ty),
-             Instruction::Intrinsic { op, .. } => match op {
--                IntrinsicOp::SqrtF32 | IntrinsicOp::FabsF32 => Some(IrType::F32),
--                IntrinsicOp::SqrtF64 | IntrinsicOp::FabsF64 => Some(IrType::F64),
-+                IntrinsicOp::SqrtF32 | IntrinsicOp::FabsF32 | IntrinsicOp::FmaScalarF32 => {
-+                    Some(IrType::F32)
-+                }
-+                IntrinsicOp::SqrtF64 | IntrinsicOp::FabsF64 | IntrinsicOp::FmaScalarF64 => {
-+                    Some(IrType::F64)
-+                }
-                 _ => None,
-             },
-             Instruction::GetReturnF128Second { .. } => Some(IrType::F128),
-diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
-index 39d5736..abf5bf9 100644
---- a/src/ir/intrinsics.rs
-+++ b/src/ir/intrinsics.rs
-@@ -90,6 +90,13 @@ pub enum IntrinsicOp {
-     /// args[0] = input float value; dest = |x|
-     FabsF32,
-     FabsF64,
-+    /// C99 fma()/fmaf(): dest = args[0] * args[1] + args[2] with a SINGLE
-+    /// rounding. Must lower to a hardware FMA instruction (vfmadd on x86);
-+    /// splitting into Mul+Add would double-round and is a correctness bug,
-+    /// not a performance choice (glibc's s_fma.c/s_fmaf.c via the ms178
-+    /// math-use-builtins-fma.h are the canonical consumers).
-+    FmaScalarF32,
-+    FmaScalarF64,
-     /// _Float128 fabs: clear sign bit 127 (inline bit ops, no libgcc call).
-     F128Fabs,
-     /// _Float128 negate: toggle sign bit 127 (NOT an integer negation).
-@@ -1101,6 +1108,7 @@ impl IntrinsicOp {
-             self,
-             IntrinsicOp::SqrtF32 | IntrinsicOp::SqrtF64 |
-             IntrinsicOp::FabsF32 | IntrinsicOp::FabsF64 |
-+            IntrinsicOp::FmaScalarF32 | IntrinsicOp::FmaScalarF64 |
-             IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
-             IntrinsicOp::LDFabs | IntrinsicOp::LDCopysign |
-             IntrinsicOp::Aesenc128 | IntrinsicOp::Aesenclast128 |
-diff --git a/src/ir/lowering/expr_builtins.rs b/src/ir/lowering/expr_builtins.rs
-index b92f441..db22e24 100644
---- a/src/ir/lowering/expr_builtins.rs
-+++ b/src/ir/lowering/expr_builtins.rs
-@@ -620,6 +620,7 @@ impl Lowerer {
-             | BuiltinIntrinsic::X86MaxPs128
-             | BuiltinIntrinsic::X86MinPs128
-             | BuiltinIntrinsic::X86ShufPsValue
-+            | BuiltinIntrinsic::X86CvtPd2PsValue
-             | BuiltinIntrinsic::X86Vextractf128V
-             | BuiltinIntrinsic::X86MaxPs256V
-             | BuiltinIntrinsic::X86MinPs256V
-@@ -1677,6 +1678,8 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
-         // deref); the imm8 rides as the last argument, which is exactly the
-         // (a, b, imm) shape the ShufPs128 backend op consumes.
-         BuiltinIntrinsic::X86ShufPsValue => X86IntrinsicKind::Vec128Value,
-+        // __builtin_ia32_cvtpd2ps returns v4sf BY VALUE (raw GCC builtin).
-+        BuiltinIntrinsic::X86CvtPd2PsValue => X86IntrinsicKind::Vec128Value,
-         // vextractf128_ps256 returns a 16-byte vector BY VALUE from a ymm arg.
-         BuiltinIntrinsic::X86Vextractf128V => X86IntrinsicKind::Vec128Value,
-         // 256-bit raw builtins: v8sf is pointer/sret convention everywhere,
-@@ -1700,6 +1703,7 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
-         BuiltinIntrinsic::X86Pause => IntrinsicOp::Pause,
-         BuiltinIntrinsic::X86Vzeroupper => IntrinsicOp::Vzeroupper,
-         BuiltinIntrinsic::X86ShufPsValue => IntrinsicOp::ShufPs128,
-+        BuiltinIntrinsic::X86CvtPd2PsValue => IntrinsicOp::CvtPd2Ps128,
-         BuiltinIntrinsic::X86Vextractf128V => IntrinsicOp::Vextractf128,
-         BuiltinIntrinsic::X86MaxPs256V => IntrinsicOp::MaxPs256,
-         BuiltinIntrinsic::X86MinPs256V => IntrinsicOp::MinPs256,
-diff --git a/src/ir/lowering/expr_types.rs b/src/ir/lowering/expr_types.rs
-index 704050f..a67e90b 100644
---- a/src/ir/lowering/expr_types.rs
-+++ b/src/ir/lowering/expr_types.rs
-@@ -342,7 +342,8 @@ impl Lowerer {
-             "__builtin_nan" => Some(IrType::F64),
-             "__builtin_nanf" => Some(IrType::F32),
-             "__builtin_nanl" => Some(IrType::F128),
--            "__builtin_fabs"
-+            "__builtin_fma"
-+            | "__builtin_fabs"
-             | "__builtin_sqrt"
-             | "__builtin_sin"
-             | "__builtin_cos"
-@@ -357,7 +358,8 @@ impl Lowerer {
-             | "__builtin_fmax"
-             | "__builtin_copysign"
-             | "__builtin_nextafter" => Some(IrType::F64),
--            "__builtin_fabsf"
-+            "__builtin_fmaf"
-+            | "__builtin_fabsf"
-             | "__builtin_sqrtf"
-             | "__builtin_sinf"
-             | "__builtin_cosf"
-diff --git a/src/ir/lowering/func_lowering.rs b/src/ir/lowering/func_lowering.rs
-index 3af7e22..8cf5f8d 100644
---- a/src/ir/lowering/func_lowering.rs
-+++ b/src/ir/lowering/func_lowering.rs
-@@ -34,7 +34,38 @@ impl Lowerer {
-     /// 6. Finalize (implicit return, emit IrFunction)
-     pub(super) fn lower_function(&mut self, func: &FunctionDef) {
-         if self.defined_functions.contains(&func.name) {
--            return;
-+            // GNU89 extern-inline redefinition: an `extern __inline` body
-+            // (gnu89 mode or __attribute__((gnu_inline))) does NOT provide
-+            // the external definition, and GCC explicitly permits a later
-+            // plain definition of the same name in the same TU — that one
-+            // becomes THE external definition. glibc's libio/feof_u.c is
-+            // exactly this shape: include/stdio.h provides __extern_inline
-+            // __feof_unlocked, feof_u.c provides the out-of-line definition
-+            // plus weak_alias(feof_unlocked). The weak alias makes the name
-+            // "referenced", so the inline husk is lowered first; first-wins
-+            // then silently DROPPED the real definition and feof_u.o was
-+            // empty (ldconfig: undefined reference to feof_unlocked).
-+            //
-+            // Replace the husk with the real definition. The plain body is
-+            // authoritative for both emission and inlining from here on.
-+            let new_is_extern_def = !self.is_gnu_inline_no_extern_def(&func.attrs);
-+            let emitted_name = self
-+                .asm_label_map
-+                .get(&func.name)
-+                .cloned()
-+                .unwrap_or_else(|| func.name.clone());
-+            let husk_idx = self.module.functions.iter().position(|f| {
-+                f.name == emitted_name && f.is_gnu_inline_def && !f.is_declaration
-+            });
-+            match husk_idx {
-+                Some(i) if new_is_extern_def => {
-+                    self.module.functions.remove(i);
-+                }
-+                // Plain duplicate definition (a frontend diagnostic case) or
-+                // an extern-inline body FOLLOWING the real definition (GCC
-+                // errors on that shape): keep the first definition.
-+                _ => return,
-+            }
+         } else {
+-            None
++            Some(truncated as u64)
          }
-         self.defined_functions.insert(func.name.clone());
+     }
  
-diff --git a/src/ir/lowering/lower.rs b/src/ir/lowering/lower.rs
-index f7afd12..87d1582 100644
---- a/src/ir/lowering/lower.rs
-+++ b/src/ir/lowering/lower.rs
-@@ -686,8 +686,23 @@ impl Lowerer {
-             for decl in &tu.decls {
-                 if let ExternalDecl::Declaration(decl) = decl {
-                     for declarator in &decl.declarators {
-+                        // An `__attribute__((alias("target")))` declarator IS a
-+                        // definition in this TU, even though it parses as an
-+                        // extern declaration without an initializer. glibc's
-+                        // libm_alias_finite hits exactly this:
-+                        //   strong_alias (__j0f, __ieee754_j0f)      // alias def
-+                        //   .symver __ieee754_j0f,__j0f_finite@GLIBC_2.15
-+                        // GAS semantics for a symbol DEFINED in the object are
-+                        // "create versioned alias for export"; references to
-+                        // the plain name stay bound to the local definition.
-+                        // Misclassifying the alias as undefined applied the
-+                        // reference-versioning flavour instead and rewrote
-+                        // `call __ieee754_j0f` into a dangling reference to
-+                        // `__j0f_finite` (libm.so: undefined __j0f_finite).
-                         if !declarator.name.is_empty()
--                            && (declarator.init.is_some() || !decl.is_extern())
-+                            && (declarator.init.is_some()
-+                                || !decl.is_extern()
-+                                || declarator.attrs.alias_target.is_some())
-                         {
-                             defined.insert(declarator.name.clone());
-                         }
-@@ -700,15 +715,22 @@ impl Lowerer {
-                         let t = line.trim();
-                         if let Some(rest) = t.strip_prefix(".symver") {
-                             let rest = rest.trim();
--                            if let Some(comma) = rest.find(',') {
--                                let real = rest[..comma].trim().to_string();
--                                let alias_ver = rest[comma + 1..].trim().to_string();
--                                if !real.is_empty()
--                                    && alias_ver.contains('@')
--                                    && !defined.contains(&real)
--                                {
--                                    self.symver_ref_map.insert(real, alias_ver);
--                                }
-+                            // Optional third operand (GAS 2.35+):
-+                            // `.symver real, name@VER, {local|hidden|remove}`.
-+                            // The flag governs the DEFINED plain symbol and is
-+                            // handled by the assembler; for the undefined-
-+                            // reference case handled here it changes nothing
-+                            // (verified against GAS: `.symver und, und@V,
-+                            // remove` still just versionizes references), so
-+                            // strip it rather than corrupt the version string.
-+                            let mut fields = rest.split(',');
-+                            let real = fields.next().unwrap_or("").trim().to_string();
-+                            let alias_ver = fields.next().unwrap_or("").trim().to_string();
-+                            if !real.is_empty()
-+                                && alias_ver.contains('@')
-+                                && !defined.contains(&real)
-+                            {
-+                                self.symver_ref_map.insert(real, alias_ver);
-                             }
-                         }
+-    /// Check if an IrConst is a small negative value that can use `cmn Xn, #imm12`
+-    /// (i.e., the negated value fits in 0..=4095).
+-    fn const_as_cmn_imm12(c: &IrConst) -> Option<u64> {
+-        let v = match c {
+-            IrConst::I8(v) => *v as i64,
+-            IrConst::I16(v) => *v as i64,
+-            IrConst::I32(v) => *v as i64,
+-            IrConst::I64(v) => *v,
+-            _ => return None,
+-        };
+-        let neg = v.checked_neg()?;
+-        if (1..=4095).contains(&neg) {
+-            Some(neg as u64)
++    /// Check for the unshifted immediate form of CMP (0..=4095).
++    fn const_as_cmp_imm12(c: &IrConst, ty: IrType) -> Option<u64> {
++        let value = Self::normalized_cmp_const(c, ty)?;
++        (value <= 4095).then_some(value)
++    }
++
++    /// Check whether CMN with an imm12 is bit-exact at the actual machine
++    /// compare width. Testing the full-width two's-complement relation avoids
++    /// treating a narrow unsigned 0xfffe as 32-bit -2.
++    fn const_as_cmn_imm12(c: &IrConst, ty: IrType) -> Option<u64> {
++        let value = Self::normalized_cmp_const(c, ty)?;
++        let negated = if ty.size() <= 4 {
++            (value as u32).wrapping_neg() as u64
+         } else {
+-            None
+-        }
++            value.wrapping_neg()
++        };
++        (1..=4095).contains(&negated).then_some(negated)
+     }
+ 
+     /// Get the register name for a Value if it has a register assignment.
+@@ -752,13 +769,13 @@ impl ArmCodegen {
+ 
+                 // cmp reg, #imm12
+                 if let Operand::Const(c) = rhs {
+-                    if let Some(imm) = Self::const_as_cmp_imm12(c) {
++                    if let Some(imm) = Self::const_as_cmp_imm12(c, ty) {
+                         self.state
+                             .emit_fmt(format_args!("    cmp {}, #{}", lhs_reg, imm));
+                         return;
                      }
-diff --git a/src/passes/simplify.rs b/src/passes/simplify.rs
-index 0ad7666..435a9c2 100644
---- a/src/passes/simplify.rs
-+++ b/src/passes/simplify.rs
-@@ -1968,6 +1968,17 @@ const BINARY_INTRINSICS: &[(&str, IntrinsicOp)] = &[
-     ("copysignl", IntrinsicOp::LDCopysign),
- ];
+                     // cmn reg, #imm12 (for negative constants)
+-                    if let Some(imm) = Self::const_as_cmn_imm12(c) {
++                    if let Some(imm) = Self::const_as_cmn_imm12(c, ty) {
+                         self.state
+                             .emit_fmt(format_args!("    cmn {}, #{}", lhs_reg, imm));
+                         return;
+@@ -775,8 +792,16 @@ impl ArmCodegen {
+                     }
+                 }
  
-+/// Ternary math functions mapping to single-instruction intrinsics.
-+/// fma/fmaf REQUIRE the fused form (single rounding, C99 F.10.10.1);
-+/// converting the libcall is not just faster, it is what makes glibc's own
-+/// s_fma.c/s_fmaf.c (built with math-use-builtins-fma.h) link at all.
-+/// The x86-64 backend emits VEX FMA3 unconditionally at -O2 (project
-+/// baseline is x86-64-v3), matching the existing mul+add fusion policy.
-+const TERNARY_INTRINSICS: &[(&str, IntrinsicOp)] = &[
-+    ("fma", IntrinsicOp::FmaScalarF64),
-+    ("fmaf", IntrinsicOp::FmaScalarF32),
-+];
+-                // lhs in register, rhs needs loading into x0
+-                self.operand_to_x0(rhs);
++                // lhs in register, rhs needs loading into x0. Constants must
++                // use comparison-type normalization rather than their storage
++                // variant's signed interpretation.
++                if let Operand::Const(c) = rhs {
++                    let value = Self::normalized_cmp_const(c, ty)
++                        .expect("integer comparison constant must normalize");
++                    self.emit_load_imm64("x0", value as i64);
++                } else {
++                    self.operand_to_x0(rhs);
++                }
+                 if use_32bit {
+                     self.state.emit_fmt(format_args!("    cmp {}, w0", lhs_reg));
+                 } else {
+@@ -802,7 +827,7 @@ impl ArmCodegen {
+ 
+         // Try: lhs in x0 (accumulator), rhs is immediate
+         if let Operand::Const(c) = rhs {
+-            if let Some(imm) = Self::const_as_cmp_imm12(c) {
++            if let Some(imm) = Self::const_as_cmp_imm12(c, ty) {
+                 self.operand_to_x0(lhs);
+                 if use_32bit {
+                     self.state.emit_fmt(format_args!("    cmp w0, #{}", imm));
+@@ -811,7 +836,7 @@ impl ArmCodegen {
+                 }
+                 return;
+             }
+-            if let Some(imm) = Self::const_as_cmn_imm12(c) {
++            if let Some(imm) = Self::const_as_cmn_imm12(c, ty) {
+                 self.operand_to_x0(lhs);
+                 if use_32bit {
+                     self.state.emit_fmt(format_args!("    cmn w0, #{}", imm));
+@@ -825,7 +850,13 @@ impl ArmCodegen {
+         // Fallback: load both into x0/x1
+         self.operand_to_x0(lhs);
+         self.state.emit("    mov x1, x0");
+-        self.operand_to_x0(rhs);
++        if let Operand::Const(c) = rhs {
++            let value = Self::normalized_cmp_const(c, ty)
++                .expect("integer comparison constant must normalize");
++            self.emit_load_imm64("x0", value as i64);
++        } else {
++            self.operand_to_x0(rhs);
++        }
+         if use_32bit {
+             self.state.emit("    cmp w1, w0");
+         } else {
+@@ -2983,3 +3014,48 @@ impl Default for ArmCodegen {
+         Self::new()
+     }
+ }
 +
- /// Create a float constant (F32 or F64) appropriate for the return type.
- fn float_const(return_type: IrType, val: f64) -> IrConst {
-     if return_type == IrType::F32 {
-@@ -2007,6 +2018,21 @@ fn simplify_math_call(
-         }
++#[cfg(test)]
++mod compare_immediate_tests {
++    use super::*;
++
++    #[test]
++    fn narrow_unsigned_constants_zero_extend_to_machine_width() {
++        assert_eq!(
++            ArmCodegen::normalized_cmp_const(&IrConst::I16(-2), IrType::U16),
++            Some(65_534)
++        );
++        assert_eq!(
++            ArmCodegen::normalized_cmp_const(&IrConst::I8(-2), IrType::U8),
++            Some(254)
++        );
++        assert_eq!(
++            ArmCodegen::const_as_cmn_imm12(&IrConst::I16(-2), IrType::U16),
++            None
++        );
++        assert_eq!(
++            ArmCodegen::const_as_cmp_imm12(&IrConst::I8(-2), IrType::U8),
++            Some(254)
++        );
++    }
++
++    #[test]
++    fn signed_and_full_width_negative_constants_use_cmn() {
++        assert_eq!(
++            ArmCodegen::normalized_cmp_const(&IrConst::I16(-2), IrType::I16),
++            Some(u32::MAX as u64 - 1)
++        );
++        assert_eq!(
++            ArmCodegen::const_as_cmn_imm12(&IrConst::I16(-2), IrType::I16),
++            Some(2)
++        );
++        assert_eq!(
++            ArmCodegen::const_as_cmn_imm12(&IrConst::I32(-2), IrType::U32),
++            Some(2)
++        );
++        assert_eq!(
++            ArmCodegen::const_as_cmn_imm12(&IrConst::I64(-2), IrType::U64),
++            Some(2)
++        );
++    }
++}
+diff --git a/src/passes/aggregate_copy_forward.rs b/src/passes/aggregate_copy_forward.rs
+index 483ee6c5..ca520871 100644
+--- a/src/passes/aggregate_copy_forward.rs
++++ b/src/passes/aggregate_copy_forward.rs
+@@ -454,6 +454,30 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
+         copies.remove(&root);
      }
  
-+    // Ternary intrinsic table (fma/fmaf -> single vfmadd, single rounding).
-+    for &(name, intrinsic_op) in TERNARY_INTRINSICS {
-+        if func == name {
-+            if args.len() != 3 {
-+                return None;
++    // A candidate must have at least one write that this analysis can
++    // attribute to its root. Loop pointer promotion can replace a precise GEP
++    // with a marching phi that `pointer_paths` intentionally cannot prove;
++    // treating the then apparently write-free temporary as dead deletes the
++    // memcpy while leaving the real stores in the old object (GCC torture
++    // 20001026-1). Unknown writes therefore fail closed instead of proving an
++    // empty construction.
++    copies.retain(|root, _| {
++        func.blocks.iter().any(|block| {
++            block
++                .instructions
++                .iter()
++                .any(|instruction| match instruction {
++                    Instruction::Store { ptr, .. } => {
++                        paths.get(&ptr.0).is_some_and(|path| path.0 == *root)
++                    }
++                    Instruction::Memcpy { dest, .. } => {
++                        paths.get(&dest.0).is_some_and(|path| path.0 == *root)
++                    }
++                    _ => false,
++                })
++        })
++    });
++
+     // Byte offset of a tracked pointer when its whole GEP path is constant.
+     let const_offset = |value: u32| -> Option<i64> {
+         let (_, path) = paths.get(&value)?;
+@@ -971,9 +995,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
+                         // value escapes it.
+                         ptr.0 == value && !matches!(val, Operand::Value(v) if v.0 == value)
+                     }
+-                    Instruction::Memcpy { dest, src, .. } => {
+-                        dest.0 == value || src.0 == value
+-                    }
++                    Instruction::Memcpy { dest, src, .. } => dest.0 == value || src.0 == value,
+                     Instruction::Copy {
+                         src: Operand::Value(v),
+                         ..
+@@ -997,8 +1019,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
+                     let after_copy = bi == candidate.block && ii > candidate.inst;
+                     // A non-escaping alloca cannot be written by an opaque
+                     // instruction; anything else must be assumed clobbered.
+-                    let source_provably_private = alloca_roots
+-                        .contains(&candidate.source_root)
++                    let source_provably_private = alloca_roots.contains(&candidate.source_root)
+                         && !escaped_roots.contains(&candidate.source_root);
+                     if after_copy && !source_provably_private {
+                         invalid.insert(dest_root);
+@@ -1115,6 +1136,69 @@ mod tests {
+     use crate::common::types::{AddressSpace, IrType};
+     use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Terminator};
+ 
++    #[test]
++    fn preserves_copy_when_source_write_uses_untracked_pointer_arithmetic() {
++        let mut func = IrFunction::new("untracked_store".into(), IrType::I32, vec![], false);
++        func.next_value_id = 4;
++        func.blocks.push(BasicBlock {
++            label: BlockId(0),
++            instructions: vec![
++                Instruction::Alloca {
++                    dest: Value(0),
++                    ty: IrType::I32,
++                    size: 4,
++                    align: 4,
++                    volatile: false,
++                    semantic_volatile: false,
++                },
++                Instruction::Alloca {
++                    dest: Value(1),
++                    ty: IrType::I32,
++                    size: 4,
++                    align: 4,
++                    volatile: false,
++                    semantic_volatile: false,
++                },
++                Instruction::BinOp {
++                    dest: Value(2),
++                    op: crate::ir::reexports::IrBinOp::Add,
++                    lhs: Operand::Value(Value(0)),
++                    rhs: Operand::Const(IrConst::I64(0)),
++                    ty: IrType::Ptr,
++                },
++                Instruction::Store {
++                    volatile: false,
++                    val: Operand::Const(IrConst::I32(7)),
++                    ptr: Value(2),
++                    ty: IrType::I32,
++                    seg_override: AddressSpace::Default,
++                },
++                Instruction::Memcpy {
++                    dest: Value(1),
++                    src: Value(0),
++                    size: 4,
++                },
++                Instruction::Load {
++                    volatile: false,
++                    dest: Value(3),
++                    ptr: Value(1),
++                    ty: IrType::I32,
++                    seg_override: AddressSpace::Default,
++                },
++            ],
++            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
++            source_spans: vec![],
++        });
++
++        assert_eq!(forward_store_only_temporaries(&mut func), 0);
++        assert!(
++            func.blocks[0]
++                .instructions
++                .iter()
++                .any(|instruction| matches!(instruction, Instruction::Memcpy { .. }))
++        );
++    }
++
+     #[test]
+     fn preserves_snapshot_when_copy_source_is_overwritten() {
+         let mut func = IrFunction::new("snapshot".into(), IrType::I32, vec![], false);
+diff --git a/src/passes/tail_call_elim.rs b/src/passes/tail_call_elim.rs
+index 2836897f..b58bba38 100644
+--- a/src/passes/tail_call_elim.rs
++++ b/src/passes/tail_call_elim.rs
+@@ -43,7 +43,7 @@
+ //! - The call result flows directly to a `Return` with no intervening uses
+ //! - The tail call is not in the entry block (would create duplicate predecessors)
+ 
+-use crate::common::fx_hash::FxHashMap;
++use crate::common::fx_hash::{FxHashMap, FxHashSet};
+ use crate::ir::reexports::{
+     BasicBlock, BlockId, Instruction, IrFunction, Operand, Terminator, Value,
+ };
+@@ -342,6 +342,76 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
+     let func_name = func.name.clone();
+     let num_params = func.params.len();
+ 
++    // Reusing one frame is not semantics-preserving when a recursive argument
++    // points into the current frame: each source-level call owns a distinct
++    // automatic object. Track stack-derived pointers through the pure pointer
++    // forms that can reach call arguments. The actual call-site check below is
++    // deliberately per argument, so ordinary scalar locals do not disable TCE.
++    let mut local_pointers = FxHashSet::default();
++    for block in &func.blocks {
++        for instruction in &block.instructions {
++            if let Instruction::Alloca { dest, .. } | Instruction::DynAlloca { dest, .. } =
++                instruction
++            {
++                local_pointers.insert(dest.0);
 +            }
-+            return Some(Instruction::Intrinsic {
-+                dest: Some(dest),
-+                op: intrinsic_op,
-+                dest_ptr: None,
-+                args: args.to_vec(),
-+            });
++        }
++    }
++    loop {
++        let mut changed = false;
++        for block in &func.blocks {
++            for instruction in &block.instructions {
++                let derived = match instruction {
++                    Instruction::GetElementPtr { dest, base, .. }
++                        if local_pointers.contains(&base.0) =>
++                    {
++                        Some(*dest)
++                    }
++                    Instruction::Copy {
++                        dest,
++                        src: Operand::Value(source),
++                    }
++                    | Instruction::Cast {
++                        dest,
++                        src: Operand::Value(source),
++                        ..
++                    } if local_pointers.contains(&source.0) => Some(*dest),
++                    Instruction::Phi { dest, incoming, .. }
++                        if incoming.iter().any(|(operand, _)| {
++                            matches!(operand, Operand::Value(value) if local_pointers.contains(&value.0))
++                        }) =>
++                    {
++                        Some(*dest)
++                    }
++                    Instruction::Select {
++                        dest,
++                        true_val,
++                        false_val,
++                        ..
++                    } if [true_val, false_val].iter().any(|operand| {
++                        matches!(operand, Operand::Value(value) if local_pointers.contains(&value.0))
++                    }) => Some(*dest),
++                    Instruction::BinOp {
++                        dest,
++                        lhs,
++                        rhs,
++                        ty: crate::common::types::IrType::Ptr,
++                        ..
++                    } if [lhs, rhs].iter().any(|operand| {
++                        matches!(operand, Operand::Value(value) if local_pointers.contains(&value.0))
++                    }) => Some(*dest),
++                    _ => None,
++                };
++                if let Some(dest) = derived {
++                    changed |= local_pointers.insert(dest.0);
++                }
++            }
++        }
++        if !changed {
++            break;
 +        }
 +    }
 +
-     // Binary intrinsic table (copysignf128/copysignl -> inline bit ops).
-     for &(name, intrinsic_op) in BINARY_INTRINSICS {
-         if func == name {
-diff --git a/tests/asm-diff/fma-scalar.casefile b/tests/asm-diff/fma-scalar.casefile
+     // ── 1. Collect ParamRef instructions from the entry block ──────────────
+     // After mem2reg, each parameter has exactly one ParamRef in the entry block.
+     // param_refs[i] = (SSA Value, IrType) for parameter i.
+@@ -406,6 +476,11 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
+ 
+         let call_dest = info.dest;
+         let args: Vec<Operand> = info.args[..num_params].to_vec();
++        if args.iter().any(|argument| {
++            matches!(argument, Operand::Value(value) if local_pointers.contains(&value.0))
++        }) {
++            continue;
++        }
+ 
+         // Verify no instruction after the call uses the call result.
+         if let Some(result_val) = call_dest {
+@@ -924,6 +999,46 @@ mod tests {
+         assert_eq!(n, 1, "should have eliminated 1 tail call");
+     }
+ 
++    #[test]
++    fn test_tce_rejects_pointer_into_current_stack_frame() {
++        let mut func = make_sum_func();
++        func.blocks[0].instructions.insert(
++            0,
++            Instruction::Alloca {
++                dest: Value(7),
++                ty: IrType::I32,
++                size: 4,
++                align: 4,
++                volatile: false,
++                semantic_volatile: false,
++            },
++        );
++        func.blocks[2].instructions.insert(
++            3,
++            Instruction::GetElementPtr {
++                dest: Value(8),
++                base: Value(7),
++                offset: Operand::Const(IrConst::I64(0)),
++                ty: IrType::Ptr,
++            },
++        );
++        let call = func.blocks[2]
++            .instructions
++            .iter_mut()
++            .find(|instruction| matches!(instruction, Instruction::Call { .. }))
++            .unwrap();
++        if let Instruction::Call { info, .. } = call {
++            info.args[1] = Operand::Value(Value(8));
++            info.arg_types[1] = IrType::Ptr;
++        }
++        func.next_value_id = 9;
++
++        assert_eq!(tail_calls_to_loops(&mut func), 0);
++        assert!(func.blocks[2].instructions.iter().any(
++            |instruction| matches!(instruction, Instruction::Call { func, .. } if func == "sum")
++        ));
++    }
++
+     #[test]
+     fn test_tce_inserts_loop_header() {
+         let mut func = make_sum_func();
+diff --git a/tests/benchmark/programs/aarch64_select_patterns.c b/tests/benchmark/programs/aarch64_select_patterns.c
 new file mode 100644
-index 0000000..47555b1
+index 00000000..158548c3
 --- /dev/null
-+++ b/tests/asm-diff/fma-scalar.casefile
-@@ -0,0 +1,26 @@
-+;;; fma-scalar-231-sd
-+    vfmadd231sd %xmm3, %xmm1, %xmm0
-+;;; fma-scalar-231-ss
-+    vfmadd231ss %xmm3, %xmm1, %xmm0
-+;;; fma-scalar-231-sd-high-regs
-+    vfmadd231sd %xmm8, %xmm12, %xmm15
-+;;; fma-scalar-231-ss-high-regs
-+    vfmadd231ss %xmm9, %xmm14, %xmm2
-+;;; fma-scalar-213-sd
-+    vfmadd213sd %xmm2, %xmm1, %xmm0
-+;;; fma-scalar-132-ss
-+    vfmadd132ss %xmm1, %xmm2, %xmm0
-+;;; fms-scalar-231-sd
-+    vfmsub231sd %xmm3, %xmm1, %xmm0
-+;;; fnma-scalar-231-ss
-+    vfnmadd231ss %xmm3, %xmm1, %xmm0
-+;;; fma-scalar-231-sd-mem
-+    vfmadd231sd 8(%rdi), %xmm1, %xmm0
-+;;; fma-scalar-231-ss-mem
-+    vfmadd231ss (%rsi,%rcx,4), %xmm1, %xmm0
-+;;; cvtpd2ps-reg
-+    cvtpd2ps %xmm1, %xmm0
-+;;; cvtpd2ps-high
-+    cvtpd2ps %xmm12, %xmm9
-+;;; cvtpd2ps-mem
-+    cvtpd2ps (%rdi), %xmm0
-diff --git a/tests/asm-diff/symver.casefile b/tests/asm-diff/symver.casefile
++++ b/tests/benchmark/programs/aarch64_select_patterns.c
+@@ -0,0 +1,38 @@
++/* Branchless integer selection corpus distilled from code-generation defects.
++   Header-free declarations keep it usable with cross-target Compiler Explorer. */
++extern int printf(const char *, ...);
++
++typedef unsigned int u32;
++typedef unsigned short u16;
++
++__attribute__((noinline)) u32 conditional_increment(u32 count, u32 condition) {
++    return condition ? count + 1u : count;
++}
++
++__attribute__((noinline)) u32 narrow_high_constant(u16 value) {
++    return value == (u16)-2;
++}
++
++__attribute__((noinline)) u32 select_pressure(
++    u32 condition, u32 a, u32 b, u32 c, u32 d, u32 e
++) {
++    u32 x = condition ? a : b;
++    u32 y = condition ? c : d;
++    u32 z = condition ? e : a;
++    return (condition ? y : z) + x + e;
++}
++
++int main(void) {
++    u32 state = 1;
++    u32 count = 0;
++    u32 checksum = 0;
++    for (u32 i = 0; i < 50000000u; ++i) {
++        state = state * 1664525u + 1013904223u;
++        count = conditional_increment(count, state & 1u);
++        checksum += select_pressure(state & 8u, state, i, count, state >> 3,
++                                    checksum);
++    }
++    checksum ^= narrow_high_constant((u16)-2);
++    printf("%u %u\n", count, checksum);
++    return 0;
++}
+diff --git a/tests/benchmark/run_benchmarks.py b/tests/benchmark/run_benchmarks.py
+index 5548446b..fc178e33 100644
+--- a/tests/benchmark/run_benchmarks.py
++++ b/tests/benchmark/run_benchmarks.py
+@@ -48,7 +48,7 @@ HERE = Path(__file__).resolve().parent
+ PROGRAMS = HERE / "programs"
+ REPO_ROOT = HERE.parents[1]
+ LEGACY_PROGRAMS = REPO_ROOT / "lccc-improvements" / "benchmarks" / "bench"
+-DEFAULT_LCCC = REPO_ROOT / "target" / "release" / "lccc"
++DEFAULT_LCCC = REPO_ROOT / "target" / "fastbuild" / "lccc"
+ 
+ 
+ @dataclass(frozen=True)
+@@ -112,6 +112,8 @@ BENCHMARKS: tuple[Benchmark, ...] = (
+               ("binary_search.c",), ("synthetic", "search", "branch")),
+     Benchmark("ring_fifo", "masked ring FIFO enqueue/dequeue / dependent loads",
+               ("ring_fifo.c",), ("synthetic", "queue", "memory", "branch")),
++    Benchmark("aarch64_select_patterns", "conditional increment, narrow compare, and select pressure",
++              ("aarch64_select_patterns.c",), ("synthetic", "aarch64", "select", "integer")),
+     Benchmark("histogram", "256-bin histogram / indexed increment and reduction",
+               ("histogram.c",), ("synthetic", "database", "memory", "integer")),
+     # Workload-derived corpus.  Licenses and exact extraction records are in
+diff --git a/tests/linker/run_linker_tests.py b/tests/linker/run_linker_tests.py
+index 0b2e96b7..e7c41d42 100644
+--- a/tests/linker/run_linker_tests.py
++++ b/tests/linker/run_linker_tests.py
+@@ -4235,6 +4235,9 @@ def main():
+     ap.add_argument("-v", "--verbose", action="store_true")
+     ap.add_argument("--keep", action="store_true", help="keep temp dirs")
+     args = ap.parse_args()
++    # Many cases execute the driver from a temporary working directory. Keep a
++    # caller-supplied relative path anchored to the invocation directory.
++    args.lccc = os.path.abspath(os.path.expanduser(args.lccc))
+ 
+     have_mold = shutil.which("mold") is not None
+     have_wild = shutil.which("wild") is not None
+diff --git a/tests/regression/aggregate_copy_untracked_store.c b/tests/regression/aggregate_copy_untracked_store.c
 new file mode 100644
-index 0000000..b3226a0
+index 00000000..0e10334e
 --- /dev/null
-+++ b/tests/asm-diff/symver.casefile
-@@ -0,0 +1,78 @@
-+;;; symver-same-name-2arg
-+	.text
-+	.globl foo
-+foo:
-+	ret
-+	.symver foo, foo@VERS_1
-+	.globl bar
-+bar:
-+	call foo
-+	ret
-+;;; symver-same-name-remove
-+	.text
-+	.globl foo
-+foo:
-+	ret
-+	.symver foo, foo@VERS_1, remove
-+	.globl bar
-+bar:
-+	call foo
-+	ret
-+;;; symver-same-name-local
-+	.text
-+	.globl foo
-+foo:
-+	ret
-+	.symver foo, foo@VERS_1, local
-+	.globl bar
-+bar:
-+	call foo
-+	ret
-+;;; symver-same-name-hidden
-+	.text
-+	.globl foo
-+foo:
-+	ret
-+	.symver foo, foo@VERS_1, hidden
-+	.globl bar
-+bar:
-+	call foo
-+	ret
-+;;; symver-undef-ref-remove
-+	.text
-+	.globl bar
-+bar:
-+	call und
-+	ret
-+	.symver und, und@VERS_2, remove
-+;;; symver-undef-ref-2arg
-+	.text
-+	.globl bar
-+bar:
-+	call und2
-+	ret
-+	.symver und2, und2@VERS_2
-+;;; symver-set-alias-defined
-+	.text
-+	.globl base
-+base:
-+	ret
-+	.globl al
-+	.set al, base
-+	.symver al, al_finite@GLIBC_2.15
-+	.globl bar
-+bar:
-+	call al
-+	ret
-+;;; symver-default-version
-+	.text
-+	.globl foo
-+foo:
-+	ret
-+	.symver foo, pub@@VERS_1
-+;;; symver-invalid-flag reject
-+	.text
-+	.globl foo
-+foo:
-+	ret
-+	.symver foo, foo@VERS_1, bogus
-diff --git a/tests/regression/builtin_ia32_cvtpd2ps_value.c b/tests/regression/builtin_ia32_cvtpd2ps_value.c
++++ b/tests/regression/aggregate_copy_untracked_store.c
+@@ -0,0 +1,25 @@
++#include <stdio.h>
++#include <string.h>
++
++struct Triple { long lane[3]; };
++struct Holder { void *left; void *right; struct Triple value; };
++
++__attribute__((noinline)) static struct Triple make_triple(void) {
++    struct Triple result;
++    long *cursor = (long *)((char *)&result + 0);
++    for (int i = 0; i < 3; ++i)
++        *cursor++ = 41 + i;
++    return result;
++}
++
++__attribute__((noinline)) static void fill(struct Holder *holder) {
++    holder->value = make_triple();
++}
++
++int main(void) {
++    struct Holder holder;
++    memset(&holder, 0, sizeof(holder));
++    fill(&holder);
++    printf("%ld %ld %ld\n", holder.value.lane[0], holder.value.lane[1], holder.value.lane[2]);
++    return !(holder.value.lane[0] == 41 && holder.value.lane[1] == 42 && holder.value.lane[2] == 43);
++}
+diff --git a/tests/regression/narrow_compare_constant_semantics.c b/tests/regression/narrow_compare_constant_semantics.c
 new file mode 100644
-index 0000000..12a88b2
+index 00000000..2db81c7e
 --- /dev/null
-+++ b/tests/regression/builtin_ia32_cvtpd2ps_value.c
-@@ -0,0 +1,46 @@
-+/* __builtin_ia32_cvtpd2ps: raw GCC builtin, v2df -> v4sf BY VALUE.
-+ *
-+ * glibc sysdeps/x86/fpu/sincosf_poly.h (only C consumer in the tree):
-+ *
-+ *   v4sf_t v4sf = __builtin_ia32_cvtpd2ps (v2df);
-+ *   *f0p = v4sf[0];  *f1p = v4sf[1];
-+ *
-+ * Routed through X86IntrinsicKind::Vec128Value -> IntrinsicOp::CvtPd2Ps128
-+ * (the same emission the _mm_cvtpd_ps wrapper uses), so the result carries
-+ * value semantics and lane subscripts read real converted data. Without the
-+ * mapping, s_sincosf.os carried an undefined __builtin_ia32_cvtpd2ps and
-+ * libm.so could not link.
-+ */
++++ b/tests/regression/narrow_compare_constant_semantics.c
+@@ -0,0 +1,36 @@
++#include <stdint.h>
 +#include <stdio.h>
 +
-+typedef double v2df_t __attribute__((vector_size(2 * sizeof(double))));
-+typedef float v4sf_t __attribute__((vector_size(4 * sizeof(float))));
-+
-+static inline void v2df_to_sf(v2df_t v2df, float *f0p, float *f1p)
-+{
-+    v4sf_t v4sf = __builtin_ia32_cvtpd2ps(v2df);
-+    *f0p = v4sf[0];
-+    *f1p = v4sf[1];
++__attribute__((noinline)) static unsigned classify_u16(uint16_t value) {
++    unsigned result = 0;
++    result |= value == (uint16_t)-2 ? 1u : 0u;
++    result |= value != (uint16_t)-3 ? 2u : 0u;
++    result |= value < (uint16_t)-4 ? 4u : 0u;
++    result |= value >= (uint16_t)-5 ? 8u : 0u;
++    return result;
 +}
 +
-+__attribute__((noinline)) void conv(double a, double b, float *x, float *y)
-+{
-+    v2df_t v = { a, b };
-+    v2df_to_sf(v, x, y);
++__attribute__((noinline)) static unsigned classify_u8(uint8_t value) {
++    return (value == (uint8_t)-2 ? 1u : 0u)
++         | (value < (uint8_t)-1 ? 2u : 0u);
 +}
 +
-+int main(void)
-+{
-+    float x, y;
-+    conv(1.5, -2.25, &x, &y);
-+    int ok = (x == 1.5f) && (y == -2.25f);
-+    /* rounding on conversion: nearest float to a non-representable double */
-+    conv(0.1, 3.0e38, &x, &y);
-+    ok &= (x == (float)0.1) && (y == (float)3.0e38);
-+    /* upper lanes of cvtpd2ps are zeroed */
-+    v2df_t v = { 7.0, 8.0 };
-+    v4sf_t r = __builtin_ia32_cvtpd2ps(v);
-+    ok &= (r[2] == 0.0f) && (r[3] == 0.0f);
-+    printf("cvtpd2ps:%s %g %g\n", ok ? "ok" : "MISMATCH", x, y);
-+    return ok ? 0 : 1;
++__attribute__((noinline)) static unsigned classify_i16(int16_t value) {
++    return (value == -2 ? 1u : 0u)
++         | (value >= -3 ? 2u : 0u);
 +}
-diff --git a/tests/regression/fma_builtin_single_rounding.c b/tests/regression/fma_builtin_single_rounding.c
++
++int main(void) {
++    unsigned hash = 0;
++    static const uint16_t u16_values[] = {0, 1, 65531, 65532, 65533, 65534, 65535};
++    static const uint8_t u8_values[] = {0, 1, 253, 254, 255};
++    static const int16_t i16_values[] = {-32768, -4, -3, -2, -1, 0, 32767};
++    for (unsigned i = 0; i < sizeof(u16_values) / sizeof(u16_values[0]); ++i)
++        hash = hash * 33u + classify_u16(u16_values[i]);
++    for (unsigned i = 0; i < sizeof(u8_values) / sizeof(u8_values[0]); ++i)
++        hash = hash * 33u + classify_u8(u8_values[i]);
++    for (unsigned i = 0; i < sizeof(i16_values) / sizeof(i16_values[0]); ++i)
++        hash = hash * 33u + classify_i16(i16_values[i]);
++    printf("%08x\n", hash);
++    return 0;
++}
+diff --git a/tests/regression/tce_stack_frame_identity.c b/tests/regression/tce_stack_frame_identity.c
 new file mode 100644
-index 0000000..1b71755
+index 00000000..63cbb554
 --- /dev/null
-+++ b/tests/regression/fma_builtin_single_rounding.c
-@@ -0,0 +1,53 @@
-+/* C99 fma()/fmaf() single-rounding semantics via __builtin_fma{,f}.
-+ *
-+ * glibc 2.44's s_fma.c/s_fmaf.c (built with the ms178 patch's
-+ * math-use-builtins-fma.h) reduce to `return __builtin_fma(x, y, z);` —
-+ * without a real fused lowering the TU emits an undefined call and libm.so
-+ * cannot link. Splitting into Mul+Add is NOT an acceptable lowering: fma
-+ * requires a SINGLE rounding (C99 F.10.10.1).
-+ *
-+ * The separation vector (1+2^-52)(1-2^-52) - 1:
-+ *   exact       = -2^-104            (representable!)
-+ *   fused       -> -0x1p-104
-+ *   double-rounded (mul rounds to 1.0) -> 0.0
-+ * Any implementation that contracts through a rounded product fails this.
-+ *
-+ * The emitted vfmadd231sd/ss encodings are pinned against GNU as by
-+ * tests/asm-diff/fma-scalar.casefile (insndiff/asmdiff oracles).
-+ */
++++ b/tests/regression/tce_stack_frame_identity.c
+@@ -0,0 +1,16 @@
 +#include <stdio.h>
 +
-+__attribute__((noinline)) double via_fma(double a, double b, double c)
-+{
-+    return __builtin_fma(a, b, c);
++__attribute__((noinline)) static int descend(int depth, const int *previous) {
++    int current = depth;
++    if (depth == 0)
++        return *previous;
++    /* This syntactically tail-recursive call must retain distinct frames:
++       `previous` points at the caller's automatic object. */
++    return descend(depth - 1, &current);
 +}
 +
-+__attribute__((noinline)) float via_fmaf(float a, float b, float c)
-+{
-+    return __builtin_fmaf(a, b, c);
++int main(void) {
++    int result = descend(100, (const int *)0);
++    printf("%d\n", result);
++    return result != 1;
 +}
-+
-+__attribute__((noinline)) double via_muladd(double a, double b, double c)
-+{
-+    volatile double p = a * b; /* force the double rounding */
-+    return p + c;
-+}
-+
-+int main(void)
-+{
-+    double f = via_fma(1.0 + 0x1p-52, 1.0 - 0x1p-52, -1.0);
-+    double m = via_muladd(1.0 + 0x1p-52, 1.0 - 0x1p-52, -1.0);
-+    float ff = via_fmaf(1.0f + 0x1p-23f, 1.0f - 0x1p-23f, -1.0f);
-+
-+    int ok = (f == -0x1p-104) && (m == 0.0) && (f != m);
-+    ok &= (ff == -0x1p-46f);
-+    /* plain values too */
-+    ok &= via_fma(2.0, 3.0, 4.0) == 10.0;
-+    ok &= via_fmaf(2.0f, 3.0f, 4.0f) == 10.0f;
-+    /* negative-zero sign: fma(0,0,-0) = -0? No: +0 + -0 = +0; but
-+       fma(-0.0, 5.0, -0.0) = -0.0 exactly. */
-+    ok &= __builtin_signbit(via_fma(-0.0, 5.0, -0.0)) != 0;
-+    printf("fma=%a muladd=%a fmaf=%a %s\n", f, m, (double)ff,
-+           ok ? "ok" : "MISMATCH");
-+    return ok ? 0 : 1;
-+}
-diff --git a/tests/regression/fma_builtin_single_rounding.flags b/tests/regression/fma_builtin_single_rounding.flags
-new file mode 100644
-index 0000000..5e2403b
---- /dev/null
-+++ b/tests/regression/fma_builtin_single_rounding.flags
-@@ -0,0 +1 @@
-+-O2 -march=x86-64-v3
-diff --git a/tests/regression/gnu89_extern_inline_redef_alias.c b/tests/regression/gnu89_extern_inline_redef_alias.c
-new file mode 100644
-index 0000000..8093d7e
---- /dev/null
-+++ b/tests/regression/gnu89_extern_inline_redef_alias.c
-@@ -0,0 +1,61 @@
-+/* GNU89 extern-inline + out-of-line redefinition + weak alias (glibc
-+ * libio/feof_u.c shape, LK-23).
-+ *
-+ * In gnu89 inline semantics (-fgnu89-inline or __attribute__((gnu_inline))),
-+ * an `extern __inline` body does NOT provide the external definition; GCC
-+ * explicitly permits a later plain definition of the same function in the
-+ * same TU, which becomes THE external definition and the authoritative body.
-+ *
-+ * Fixed defect: lower_function's first-wins duplicate guard silently dropped
-+ * the plain definition whenever the inline husk had been lowered first —
-+ * which happened exactly when something *referenced* the name, e.g. the
-+ * weak_alias declarator in feof_u.c. The object came out EMPTY (no
-+ * __feof_unlocked, no feof_unlocked) and glibc's ldconfig link died with
-+ * `undefined reference to feof_unlocked`.
-+ *
-+ * The bodies below intentionally DIFFER (inline: +1, plain: +2) so the test
-+ * proves the plain body is the one emitted AND the one the alias binds to —
-+ * a compiler that resurrects the husk or keeps first-wins fails the value
-+ * checks, and a compiler that drops the definition fails to link.
-+ */
-+typedef struct F { int _flags; } XFILE;
-+
-+extern int feof_x (XFILE *__stream) __attribute__ ((__nothrow__));
-+extern __inline int
-+__attribute__ ((__nothrow__)) feof_x (XFILE *__stream)
-+{
-+  return __stream->_flags + 1;
-+}
-+
-+int
-+feof_x (XFILE *fp)
-+{
-+  return fp->_flags + 2;
-+}
-+extern __typeof (feof_x) feof_x_alias __attribute__ ((weak, alias ("feof_x")));
-+
-+/* Attribute flavour (works independently of -fgnu89-inline). */
-+extern __inline __attribute__ ((__gnu_inline__)) int
-+gi (int x)
-+{
-+  return x + 10;
-+}
-+int
-+gi (int x)
-+{
-+  return x + 20;
-+}
-+extern __typeof (gi) gi_alias __attribute__ ((weak, alias ("gi")));
-+
-+int
-+main (void)
-+{
-+  XFILE f = { ._flags = 40 };
-+  int ok = 1;
-+  ok &= feof_x (&f) == 42;       /* plain body: 40 + 2 */
-+  ok &= feof_x_alias (&f) == 42; /* alias binds to the plain body */
-+  ok &= gi (1) == 21;            /* plain body: 1 + 20 */
-+  ok &= gi_alias (1) == 21;
-+  __builtin_printf ("gnu89-redef-alias:%s\n", ok ? "ok" : "MISMATCH");
-+  return ok ? 0 : 1;
-+}
-diff --git a/tests/regression/gnu89_extern_inline_redef_alias.flags b/tests/regression/gnu89_extern_inline_redef_alias.flags
-new file mode 100644
-index 0000000..8bb9cc2
---- /dev/null
-+++ b/tests/regression/gnu89_extern_inline_redef_alias.flags
-@@ -0,0 +1 @@
-+-O2 -std=gnu11 -fgnu89-inline
-diff --git a/tests/regression/symver_alias_defined_local_bind.c b/tests/regression/symver_alias_defined_local_bind.c
-new file mode 100644
-index 0000000..917002d
---- /dev/null
-+++ b/tests/regression/symver_alias_defined_local_bind.c
-@@ -0,0 +1,43 @@
-+/* .symver on an alias-defined symbol + intra-TU reference (glibc libm
-+ * e_j0f.c shape, IS-29 follow-up: `undefined reference to __j0f_finite`).
-+ *
-+ * glibc's libm_alias_finite expands to
-+ *     strong_alias (__j0f, __ieee754_j0f)              // alias DEFINITION
-+ *     __asm__(".symver __ieee754_j0f, __j0f_finite@GLIBC_2.15");
-+ * and y0f() calls __ieee754_j0f() in the same TU.
-+ *
-+ * GAS semantics: `.symver real, name@VER` where `real` is DEFINED in the
-+ * object creates the versioned alias for export; intra-object references to
-+ * `real` stay bound to the local definition. Only when `real` is UNDEFINED
-+ * do references get rewritten to the versioned name.
-+ *
-+ * Fixed defect: the lowering pre-pass classified __attribute__((alias))
-+ * declarators as "not defined" (they parse as extern declarations without
-+ * initializers), applied the undefined-reference flavour, and rewrote the
-+ * call into a dangling versioned reference — every libm.so link failed.
-+ *
-+ * This test is a link-or-die reproducer: before the fix the executable
-+ * cannot link (undefined reference to exported_compat).
-+ */
-+int
-+impl_fn (int x)
-+{
-+  return x * 3;
-+}
-+extern __typeof (impl_fn) alias_fn __attribute__ ((alias ("impl_fn")));
-+__asm__ (".symver alias_fn, exported_compat@COMPAT_1");
-+
-+int
-+caller (int x)
-+{
-+  /* Must bind to the local definition, NOT become exported_compat@COMPAT_1. */
-+  return alias_fn (x);
-+}
-+
-+int
-+main (void)
-+{
-+  int ok = caller (14) == 42;
-+  __builtin_printf ("symver-alias-defined:%s\n", ok ? "ok" : "MISMATCH");
-+  return ok ? 0 : 1;
-+}
-diff --git a/tests/regression/symver_alias_defined_local_bind.flags b/tests/regression/symver_alias_defined_local_bind.flags
-new file mode 100644
-index 0000000..3a3b579
---- /dev/null
-+++ b/tests/regression/symver_alias_defined_local_bind.flags
-@@ -0,0 +1 @@
-+-O2
