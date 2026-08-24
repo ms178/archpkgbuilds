@@ -1,3 +1,17 @@
+diff --git a/.cargo/config.toml b/.cargo/config.toml
+index e38e60d..d12d44e 100644
+--- a/.cargo/config.toml
++++ b/.cargo/config.toml
+@@ -3,6 +3,9 @@
+ # is i686-unknown-linux-gnu; for the default x86_64 host target mold picks the
+ # x86_64 preset.  This saves ~300-500 ms per rebuild and cuts peak RSS during
+ # LTO/fastbuild links enough to stay out of OOM on the 2 GB VM.
++#
++# scripts/build_lccc_fast.sh keeps this clang+mold pairing when both tools
++# are installed and falls back to gcc + GNU ld otherwise.
+ [target.x86_64-unknown-linux-gnu]
+ linker = "clang"
+ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 diff --git a/.gitignore b/.gitignore
 index 68e53ee..9bb3f45 100644
 --- a/.gitignore
@@ -538,6 +552,182 @@ index 0000000..b3426c0
 +`tzcnt` (or matching GCC's `andn+cmov` shape).
 +
 +These are documented in BACKLOG §16.4 and remain open for v8.
+diff --git a/docs/history/2026-08-24-session76-redteam-pf06-peephole.md b/docs/history/2026-08-24-session76-redteam-pf06-peephole.md
+new file mode 100644
+index 0000000..5aa45e3
+--- /dev/null
++++ b/docs/history/2026-08-24-session76-redteam-pf06-peephole.md
+@@ -0,0 +1,170 @@
++# Session 76 — Repair, red-team and validate the session-75 / v7 patch
++
++Date: 2026-08-24
++Base: `acb61d1` (latest `ms178/lccc` main; PR #224 / session-69 const-hoist included).
++Build: fastbuild profile, Rust 1.98.0, `-j2`, 4 GiB swap.
++
++The incoming `ms178-1.patch` (session 75 / v7) did not apply to main:
++
++* four unified-diff hunks had corrupt line counts (`error: corrupt patch at
++  line 2839`);
++* the new `liveness.rs` was missing a newline after `live_after`'s `{`, so
++  the next hunk's `+` leaked into the source (`{+        if fam > …`).
++
++GNU `patch --fuzz=3` applied the rest. The red-team then found real
++soundness holes, not just apply mechanics.
++
++## 1. Red-team findings and fixes
++
++### 1.1 Compile-breaker: leaked `+` in `FileLiveness::live_after`
++
++`liveness.rs:136` was
++
++```text
++pub(super) fn live_after(...) -> Option<bool> {+        if fam > REG_GP_MAX ...
++```
++
++Fixed. Without this the crate does not compile.
++
++### 1.2 PF-06 kill switch was inverted
++
++`CCC_NO_PF06_ADD_PEEL=1` was documented as "do not peel `add(iv, const)`".
++The implementation still peeled (so `disp` and the IV-as-index stayed) and
++only skipped the two soundness gates. Setting the kill switch therefore
++made the *more dangerous* fold.
++
++Fix: capture the flag inside `resolve_index` and `break` out of the add/sub
++peel arms. The SIB index is then the add's RESULT, which is the pre-PF-06
++behaviour.
++
++### 1.3 Cross-backend miscompile: ARM / i686 dropped `disp`
++
++PF-06 peels `add(iv, const)` in target-independent `generation.rs`. The
++x86-64 emitter used `disp`; the i686 SIB emitters took `_disp` and ignored
++it; AArch64 called the no-disp indexed form and returned success. When the
++indexed fold succeeds the GEP is skipped, so a dropped displacement is a
++wrong address.
++
++Fixes:
++
++* i686: `sib_mem` / `sib_mem_sym` now encode the displacement (same AT&T
++  form as x86-64).
++* AArch64: `emit_{load,store}_indexed` return `false` when `disp != 0`, so
++  `rematerialize_skipped_indexed` rebuilds `base + orig_offset`.
++
++### 1.4 Symbol+disp invented a different symbol
++
++`sib_mem64_sym("foo", …, 4)` emitted `foo4(, %idx)` (symbol `foo4`), not
++`foo+4(, %idx)`. Negative disp happened to work (`foo-4`). Same bug on
++i686. Fixed: `sym+disp` / `sym-disp`.
++
++### 1.5 `fold_load_test_into_cmp` changed SF for unsigned / narrow signed loads
++
++`movzbl mem, %esi; testq %rsi, %rsi; js` → `cmpb $0, mem; js` is a
++miscompile: byte `0x80` has `testq` SF=0 (zero-extended) and `cmpb` SF=1.
++`movsbl` + `testq` has the same hole (32-bit write zero-extends).
++
++Fix: unsigned loads, and 32-bit signed loads under `testq`, fold only when
++every subsequent flag consumer is ZF-only (`je`/`jne`/`sete`/`setne`/…).
++Signed-to-64 (`movsbq`/`movswq`/`movslq`) still fold for SF consumers.
++New unit tests pin both sides.
++
++## 2. What landed from session 75 (kept)
++
++* Exact CFG liveness (`peephole/passes/liveness.rs`) with ABI-aware
++  `call`/`ret` effects and conservative unknown-mnemonic handling.
++* Whole-function copy coalescing of the parameter shuffle.
++* Dead pure-write elimination, redundant-load reuse (with the v6
++  `movslq`/`movsbq` → `movl` miscompile already fixed), load+self-test →
++  `cmp $0, mem`, accumulator round-trip folding, redundant self-test after
++  `and`/`or`/`xor`, dead `movslq` → `movl` narrowing.
++* PF-06: `a[j±1]` becomes `±4(%base, %iv, 4)` instead of a per-iteration
++  `lea`/`cltq` chain.
++
++## 3. Measurements (this VM; screening, no PMU)
++
++Kernel corpus (`scripts/kernel_count.py`, LCCC `-O2` vs system GCC 14.2):
++
++| kernel | LCCC | GCC | delta |
++|---|---:|---:|---:|
++| adler8 | 89 | 63 | +26 |
++| sum8 | **12** | 13 | **−1** |
++| crc32k | 28 | 18 | +10 |
++| my_strlen | 10 | 10 | tie |
++| maxv | **19** | 27 | **−8** |
++| dot | **15** | 17 | **−2** |
++| isort | 40 | 23 | +17 |
++| **total (15)** | **322** | **264** | +58 |
++
++Peephole A/B (`scripts/peephole_ab.py`, new pass set vs
++`CCC_PEEPHOLE_SKIP` of the same set): **9034 → 8525 instructions (−5.63%)**,
++every program's stdout+exit identical. Largest wins: `zlib_ng_adler32` −35,
++`sqlite_varint` −34, `gzip_crc32` −32, `hash_table` −20, `spectral_norm` −20.
++
++Execute vs GCC `-O2` (identical stdout+status): `gzip_crc32`,
++`zlib_ng_adler32`, `expat_xml_scan`, `sqlite_varint`, `linux_find_bit`,
++and the PF-06 driver (`idx1`/`idxm1`/`sum_adj` → `40 40 35`).
++
++Godbolt oracle (`-O2 -march=x86-64-v3`, GCC 16.2 / Clang 22.1 / ICC 2021.10
++/ ICX latest):
++
++| function | LCCC | GCC 16.2 | Clang 22.1 | ICC | ICX | best |
++|---|---:|---:|---:|---:|---:|---|
++| `idx1` (PF-06) | **3** | 3 | 3 | 3 | 3 | **tie** |
++| `sum8` | **12** | 57 | 72 | 39 | 34 | **LCCC** |
++| `adler8` | 89 | **66** | 75 | 76 | 101 | GCC |
++| `crc32k` | 28 | **17** | 54 | 37 | 68 | GCC |
++| `isort` | 40 | 27 | 58 | **19** | 50 | ICC |
++
++`idx1` is now the same three-instruction shape as every reference compiler
++(`movl 4(%rdi,%reg,4), %eax; ret`). `sum8` beats the oracles because they
++vectorise a tiny reduction at this march; that is a screening artefact, not
++a claim that LCCC's scalar loop is the right long-term answer.
++
++`tests/regression/check_gpr_leaf_param_codegen.sh` passes (accepts a fully
++coalesced parameter shuffle).
++
++`cargo test --lib` of the new modules was started and aborted: `--test`
++rebuild of this crate OOMs the 2 GiB box. The new unit tests compile as
++part of the library crate and the C-level A/B + execute gates above cover
++the same shapes.
++
++## 4. Infrastructure
++
++* `scripts/build_lccc_fast.sh` falls back to `gcc` + GNU ld when clang/mold
++  are absent (`cargo --config` overrides, so the committed mold rustflags
++  cannot leak into the gcc link). The committed `.cargo/config.toml` still
++  prefers clang+mold.
++* `scripts/peephole_ab.py` DEFAULT_SKIP now includes the v7 pass names so
++  the A/B gate actually measures them.
++
++## 5. Follow-up (priority order)
++
++1. **RA-06 — adler32 / arithmetic-chain copy webs.** 89 vs GCC 66 (Godbolt
++   GCC 16.2). Next-use-aware eviction, not another peephole. The eight
++   unrolled byte temporaries still win the registers and `s1`/`s2` spill.
++2. **LICM of `leaq table(%rip)`** (crc32k 28 vs 17). x86-64 cannot form
++   RIP-relative+index; GCC hoists the table base. That is still the gap.
++3. **isort 40 vs ICC 19 / GCC 27.** Secondary-IV pointer walk + fewer
++   `cltq`/`movslq`. PF-06 closed the `a[j+1]` SIB half; the rest is RA +
++   IV widening.
++4. **`cargo test --lib` on a box with ≥8 GiB.** The new unit tests
++   (`liveness`, `copy_coalesce`, `dead_writes` unsigned-SF, `flag_peepholes`)
++   were not executed here.
++5. **i686 PF-06 execute gate.** Displacement encoding is in; there is no
++   `-m32` run in this session.
++6. **Do not treat Godbolt `sum8` as a win to chase.** The oracles
++   vectorised; LCCC stayed scalar. Confirm on a real trip count before
++   changing the vectorizer cost model.
++7. **Phase-4 loop trampoline** remains default-off (known rename bug).
++   Still the right call.
++8. **Multi-store stencil / nbody / spectral_norm** — still the structural
++   FP gap. Not touched.
++
++## 6. How to restore this tree
++
++```text
++git checkout acb61d1
++git apply ms178-1.patch          # must apply clean; hunks were rebuilt
++scripts/build_lccc_fast.sh       # gcc fallback if clang/mold missing
++```
 diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
 index 61bc976..1ead203 100644
 --- a/engineering/agent/BACKLOG.md
@@ -608,32 +798,110 @@ index 61bc976..1ead203 100644
  
  ## 1. How to gather data (mandatory)
  
+diff --git a/scripts/build_lccc_fast.sh b/scripts/build_lccc_fast.sh
+index af648fd..7807079 100755
+--- a/scripts/build_lccc_fast.sh
++++ b/scripts/build_lccc_fast.sh
+@@ -28,6 +28,23 @@ fi
+ export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.98.0}
+ export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
+ 
++# Honour the repo's clang+mold preference (.cargo/config.toml) when both are
++# on PATH. Otherwise fall back to gcc + GNU ld for this invocation only.
++# CARGO_TARGET_*_LINKER alone is not enough: the committed rustflags still
++# pass `-fuse-ld=mold`, so we override both via `cargo --config`.
++cargo_config=()
++if command -v clang >/dev/null 2>&1 && command -v mold >/dev/null 2>&1; then
++    : # keep .cargo/config.toml (clang -fuse-ld=mold)
++else
++    cargo_config=(
++        --config 'target.x86_64-unknown-linux-gnu.linker="gcc"'
++        --config 'target.x86_64-unknown-linux-gnu.rustflags=[]'
++        --config 'target.i686-unknown-linux-gnu.linker="gcc"'
++        --config 'target.i686-unknown-linux-gnu.rustflags=["-C","link-arg=-m32"]'
++    )
++    printf '%s\n' "note: clang/mold not found; linking with gcc + GNU ld"
++fi
++
+ printf '%s\n' "Building LCCC (fastbuild profile: -O1, no LTO, incremental)"
+ 
+ # Fail on warnings unless explicitly opted out.
+@@ -42,4 +59,5 @@ if [ "${LCCC_ALLOW_WARNINGS:-0}" != "1" ]; then
+     export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
+ fi
+ 
+-exec cargo build --profile fastbuild --locked -j "${CARGO_BUILD_JOBS}"
++exec cargo build --profile fastbuild --locked -j "${CARGO_BUILD_JOBS}" \
++    "${cargo_config[@]}"
+diff --git a/scripts/peephole_ab.py b/scripts/peephole_ab.py
+index ff296bd..6c263ba 100755
+--- a/scripts/peephole_ab.py
++++ b/scripts/peephole_ab.py
+@@ -40,6 +40,14 @@ DEFAULT_SKIP = [
+     "copy_shift_lea",
+     "setcc_cmov",
+     "copy_mask_movz",
++    # Session-75 / v7 layer
++    "copy_coalesce",
++    "dead_pure_writes",
++    "load_test_cmp",
++    "acc_roundtrip",
++    "load_reuse",
++    "self_test",
++    "narrow_signext",
+ ]
+ 
+ 
 diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
-index 2f6a6c9..61cee8e 100644
+index 2f6a6c9..30d9865 100644
 --- a/src/backend/arm/codegen/emit.rs
 +++ b/src/backend/arm/codegen/emit.rs
-@@ -2408,8 +2408,11 @@ impl ArchCodegen for ArmCodegen {
+@@ -1,5 +1,4 @@
+ use super::asm_emitter::ARM_GP_SCRATCH;
+-use crate::common::fp_contract::FpContract;
+ use crate::backend::call_abi::ParamClass;
+ use crate::backend::call_abi::{CallAbiConfig, CallArgClass};
+ use crate::backend::common::PtrDirective;
+@@ -8,6 +7,7 @@ use crate::backend::inline_asm::emit_inline_asm_common;
+ use crate::backend::regalloc::PhysReg;
+ use crate::backend::state::{CodegenState, StackSlot};
+ use crate::backend::traits::ArchCodegen;
++use crate::common::fp_contract::FpContract;
+ use crate::common::fx_hash::FxHashMap;
+ use crate::common::types::IrType;
+ use crate::delegate_to_impl;
+@@ -2408,8 +2408,16 @@ impl ArchCodegen for ArmCodegen {
          base: &Value,
          index: &Value,
          shift: u8,
 +        _disp: i64,
          ty: IrType,
      ) -> bool {
-+        // AArch64 does not support a displacement + SIB in one operand;
-+        // the displacement is folded into the GEP offset upstream.
++        // AArch64 has no `disp + base + index<<scale` addressing form.
++        // PF-06 peels `add(iv, const)` into `disp` on the shared IR path;
++        // accepting the fold here would drop that displacement (a
++        // miscompile). Refuse so generate_load rematerializes the GEP.
++        if _disp != 0 {
++            return false;
++        }
          self.emit_load_indexed_impl(dest, base, index, shift, ty)
      }
      fn emit_store_indexed(
-@@ -2418,6 +2421,7 @@ impl ArchCodegen for ArmCodegen {
+@@ -2418,8 +2426,12 @@ impl ArchCodegen for ArmCodegen {
          base: &Value,
          index: &Value,
          shift: u8,
 +        _disp: i64,
          ty: IrType,
      ) -> bool {
++        if _disp != 0 {
++            return false;
++        }
          self.emit_store_indexed_impl(val, base, index, shift, ty)
+     }
+     fn emit_shifted_logical(
 diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index a4a9cfe..e8380f1 100644
+index a4a9cfe..0794b35 100644
 --- a/src/backend/generation.rs
 +++ b/src/backend/generation.rs
 @@ -42,6 +42,11 @@ pub(super) struct IndexedGepInfo {
@@ -648,7 +916,7 @@ index a4a9cfe..e8380f1 100644
      /// Original GEP offset operand, used to rematerialize if the backend
      /// refuses the indexed encoding after the GEP was skipped.
      pub(super) orig_offset: Value,
-@@ -296,6 +301,69 @@ fn base_is_fold_stable(
+@@ -296,6 +301,79 @@ fn base_is_fold_stable(
          || adjacent_base_stable.contains(&dest)
  }
  
@@ -663,11 +931,7 @@ index a4a9cfe..e8380f1 100644
 +/// set; unanalysable instructions terminate the walk conservatively (the
 +/// walk returns `false`, "we cannot prove the IV is absent", but for the
 +/// SIB math the fold is sound when `disp = const*scale`, so this is fine).
-+fn base_chain_contains_iv(
-+    defs: &FxHashMap<u32, &Instruction>,
-+    base_id: u32,
-+    iv_id: u32,
-+) -> bool {
++fn base_chain_contains_iv(defs: &FxHashMap<u32, &Instruction>, base_id: u32, iv_id: u32) -> bool {
 +    if base_id == iv_id {
 +        return true;
 +    }
@@ -685,7 +949,11 @@ index a4a9cfe..e8380f1 100644
 +        };
 +        let mut operands: Vec<u32> = Vec::new();
 +        match inst {
-+            Instruction::GetElementPtr { base, offset: Operand::Value(off), .. } => {
++            Instruction::GetElementPtr {
++                base,
++                offset: Operand::Value(off),
++                ..
++            } => {
 +                operands.push(base.0);
 +                operands.push(off.0);
 +            }
@@ -693,11 +961,21 @@ index a4a9cfe..e8380f1 100644
 +                operands.push(base.0);
 +            }
 +            Instruction::BinOp { lhs, rhs, .. } => {
-+                if let Operand::Value(v) = lhs { operands.push(v.0); }
-+                if let Operand::Value(v) = rhs { operands.push(v.0); }
++                if let Operand::Value(v) = lhs {
++                    operands.push(v.0);
++                }
++                if let Operand::Value(v) = rhs {
++                    operands.push(v.0);
++                }
 +            }
-+            Instruction::Cast { src: Operand::Value(v), .. } => operands.push(v.0),
-+            Instruction::Copy { src: Operand::Value(v), .. } => operands.push(v.0),
++            Instruction::Cast {
++                src: Operand::Value(v),
++                ..
++            } => operands.push(v.0),
++            Instruction::Copy {
++                src: Operand::Value(v),
++                ..
++            } => operands.push(v.0),
 +            // Alloca / ParamRef / Const / GlobalAddress / Load / Call:
 +            // leaves. A Load cannot (in the IR's no-promotion model)
 +            // contain the IV unless it loads FROM an IV-derived pointer,
@@ -718,13 +996,20 @@ index a4a9cfe..e8380f1 100644
  /// Unique defining instruction of each single-def value. Multi-def (post-phi)
  /// values are omitted — inspecting a non-unique def is unsafe.
  fn index_single_defs<'a>(
-@@ -690,19 +758,45 @@ fn build_indexed_gep_map(
+@@ -689,20 +767,51 @@ fn build_indexed_gep_map(
+     }
  
      let defs = index_single_defs(func, stab);
- 
+-
 -    // Resolve offset → (index, shift). Multi-def offsets are a plain index
 -    // (shift 0); we refuse to inspect a non-unique definition.
 -    let resolve_index = |off_id: u32| -> Option<(Value, u8)> {
++    // Must be captured by `resolve_index`: when set, add/sub peeling is
++    // skipped so the SIB index stays the add's RESULT (the pre-PF-06
++    // behaviour). The later `iv_in_add = None` rewrite only dropped the
++    // soundness gates and left the peeled `disp` in place — inverted.
++    let pf06_add_peel_disabled = env_flag_set("CCC_NO_PF06_ADD_PEEL");
++
 +    // Resolve offset → (index, shift, displacement, iv_in_add, add_result).
 +    // Multi-def offsets are a plain index (shift 0, disp 0, no iv_in_add);
 +    // we refuse to inspect a non-unique definition.
@@ -772,7 +1057,7 @@ index a4a9cfe..e8380f1 100644
          loop {
              let Some(inst) = defs.get(&id).copied() else {
                  break;
-@@ -730,6 +824,11 @@ fn build_indexed_gep_map(
+@@ -730,6 +839,11 @@ fn build_indexed_gep_map(
                          break;
                      }
                      shift += k as u8;
@@ -784,7 +1069,7 @@ index a4a9cfe..e8380f1 100644
                      id = idx.0;
                  }
                  Instruction::BinOp {
-@@ -753,6 +852,7 @@ fn build_indexed_gep_map(
+@@ -753,6 +867,7 @@ fn build_indexed_gep_map(
                          break;
                      }
                      shift += z as u8;
@@ -792,7 +1077,7 @@ index a4a9cfe..e8380f1 100644
                      id = idx.0;
                  }
                  // Self-addition doubling: the frontend strength-reduces
-@@ -766,15 +866,183 @@ fn build_indexed_gep_map(
+@@ -766,15 +881,185 @@ fn build_indexed_gep_map(
                      ..
                  } if a == b && shift < 3 => {
                      shift += 1;
@@ -882,6 +1167,9 @@ index a4a9cfe..e8380f1 100644
 +                    rhs: Operand::Const(c),
 +                    ..
 +                } => {
++                    if pf06_add_peel_disabled {
++                        break;
++                    }
 +                    if iv_in_add.is_some() {
 +                        break;
 +                    }
@@ -943,11 +1231,10 @@ index a4a9cfe..e8380f1 100644
 +    //   v11 = sub(v25, 1); v13 = shl(v11, 2); v14 = gep(v2, v13); v15 = load(v14);
 +    //   ...; v24 = add(v25, 1); v25 = copy(v24)   <-- iv-update uses v24, NOT v11.
 +    //
-+    // Kill switch: `CCC_NO_PF06_ADD Peel` (any non-empty value) disables
-+    // ONLY the add(iv, const) / sub(iv, const) peeling (the IV used as
-+    // the SIB index is then the add's RESULT, not the IV — preserves
-+    // correctness when this soundness gate is too narrow).
-+    let pf06_add_peel_disabled = env_flag_set("CCC_NO_PF06_ADD_PEEL");
++    // Kill switch: `CCC_NO_PF06_ADD_PEEL` (any non-empty value) disables
++    // ONLY the add(iv, const) / sub(iv, const) peeling. The flag is
++    // captured by `resolve_index` above so the peel itself is skipped,
++    // not merely the soundness gates that used to wrap it.
 +    let mut iv_coalesce_pairs: FxHashSet<(u32, u32)> = FxHashSet::default();
 +    if !pf06_add_peel_disabled {
 +        for block in &func.blocks {
@@ -977,7 +1264,7 @@ index a4a9cfe..e8380f1 100644
      for block in &func.blocks {
          for inst in &block.instructions {
              if let Instruction::GetElementPtr {
-@@ -784,17 +1052,56 @@ fn build_indexed_gep_map(
+@@ -784,17 +1069,56 @@ fn build_indexed_gep_map(
                  ..
              } = inst
              {
@@ -1044,7 +1331,7 @@ index a4a9cfe..e8380f1 100644
              }
          }
      }
-@@ -2212,7 +2519,7 @@ fn detect_gap_fma_fusions(
+@@ -2212,7 +2536,7 @@ fn detect_gap_fma_fusions(
              !ty.is_float()
          }
      }
@@ -1053,7 +1340,7 @@ index a4a9cfe..e8380f1 100644
      for (idx, inst) in block.instructions.iter().enumerate() {
          let (mul_dest, mul_ty) = match inst {
              Instruction::BinOp {
-@@ -2253,7 +2560,7 @@ fn detect_gap_fma_fusions(
+@@ -2253,7 +2577,7 @@ fn detect_gap_fma_fusions(
                      if mul_used
                          && add_ty == mul_ty
                          && !accumulator_dests.contains(&add_dest.0)
@@ -1062,7 +1349,29 @@ index a4a9cfe..e8380f1 100644
                              || fp_contract.fuse_pair(
                                  fp_tags.get(&mul_dest.0).copied(),
                                  fp_tags.get(&add_dest.0).copied(),
-@@ -4516,13 +4823,13 @@ fn generate_load(
+@@ -3081,9 +3405,10 @@ fn generate_function(
+                             m.insert(dest.0, v);
+                         }
+                     }
+-                    Instruction::GetElementPtr { dest, base, offset, .. } => {
+-                        if let (Some(b), Some(o)) =
+-                            (m.get(&base.0).copied(), as_const(offset, &m))
++                    Instruction::GetElementPtr {
++                        dest, base, offset, ..
++                    } => {
++                        if let (Some(b), Some(o)) = (m.get(&base.0).copied(), as_const(offset, &m))
+                         {
+                             m.insert(dest.0, b.wrapping_add(o));
+                         }
+@@ -4453,7 +4778,6 @@ fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
+     cg.emit_copy_value(dest, src);
+ }
+ 
+-
+ /// Integer view of an IR constant for address-constant tracking.
+ fn ir_const_as_i64(c: &IrConst) -> Option<i64> {
+     match c {
+@@ -4516,13 +4840,13 @@ fn generate_load(
      }
      if let Some(info) = indexed_gep_map.get(&ptr.0) {
          if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map) {
@@ -1078,7 +1387,7 @@ index a4a9cfe..e8380f1 100644
                  {
                      return;
                  }
-@@ -4585,13 +4892,13 @@ fn generate_store(
+@@ -4585,13 +4909,13 @@ fn generate_store(
      }
      if let Some(info) = indexed_gep_map.get(&ptr.0) {
          if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map) {
@@ -1114,41 +1423,117 @@ index 7db722d..302e7b2 100644
          fn emit_typed_load_from_slot(&mut self, instr: &'static str, slot: StackSlot) => emit_typed_load_from_slot_impl;
          fn emit_load_ptr_from_slot(&mut self, slot: StackSlot, val_id: u32) => emit_load_ptr_from_slot_impl;
 diff --git a/src/backend/i686/codegen/memory.rs b/src/backend/i686/codegen/memory.rs
-index cf04b3f..aef2873 100644
+index cf04b3f..57d9ecb 100644
 --- a/src/backend/i686/codegen/memory.rs
 +++ b/src/backend/i686/codegen/memory.rs
-@@ -874,6 +874,7 @@ impl I686Codegen {
+@@ -852,19 +852,33 @@ impl I686Codegen {
+         )
+     }
+ 
+-    fn sib_mem(base_reg: &str, index_reg: &str, shift: u8) -> String {
++    fn sib_mem(base_reg: &str, index_reg: &str, shift: u8, disp: i64) -> String {
++        let d = if disp == 0 {
++            String::new()
++        } else {
++            format!("{}", disp)
++        };
+         if shift == 0 {
+-            format!("(%{}, %{})", base_reg, index_reg)
++            format!("{}(%{}, %{})", d, base_reg, index_reg)
+         } else {
+-            format!("(%{}, %{}, {})", base_reg, index_reg, 1u32 << shift)
++            format!("{}(%{}, %{}, {})", d, base_reg, index_reg, 1u32 << shift)
+         }
+     }
+ 
+-    fn sib_mem_sym(sym: &str, index_reg: &str, shift: u8) -> String {
++    fn sib_mem_sym(sym: &str, index_reg: &str, shift: u8, disp: i64) -> String {
++        // Same AT&T rule as x86-64: `sym+disp`, never `sym` concatenated
++        // with a bare decimal (that would invent a different symbol).
++        let head = if disp == 0 {
++            sym.to_string()
++        } else if disp > 0 {
++            format!("{}+{}", sym, disp)
++        } else {
++            format!("{}{}", sym, disp)
++        };
+         if shift == 0 {
+-            format!("{}(, %{})", sym, index_reg)
++            format!("{}(, %{})", head, index_reg)
+         } else {
+-            format!("{}(, %{}, {})", sym, index_reg, 1u32 << shift)
++            format!("{}(, %{}, {})", head, index_reg, 1u32 << shift)
+         }
+     }
+ 
+@@ -874,6 +888,7 @@ impl I686Codegen {
          base: &Value,
          index: &Value,
          shift: u8,
-+        _disp: i64,
++        disp: i64,
          ty: IrType,
      ) -> bool {
          if !Self::sib_scalar_ty(ty) || shift > 3 {
-@@ -912,6 +913,7 @@ impl I686Codegen {
+@@ -885,7 +900,7 @@ impl I686Codegen {
+         let Some(&x) = self.reg_assignments.get(&index.0) else {
+             return false;
+         };
+-        let mem = Self::sib_mem(phys_reg_name(b), phys_reg_name(x), shift);
++        let mem = Self::sib_mem(phys_reg_name(b), phys_reg_name(x), shift, disp);
+         let load_instr = self.load_instr_for_type(ty);
+         // Single instruction — no staging, so dest may alias base/index
+         // (x86 computes the address before writing the destination).
+@@ -912,6 +927,7 @@ impl I686Codegen {
          base: &Value,
          index: &Value,
          shift: u8,
-+        _disp: i64,
++        disp: i64,
          ty: IrType,
      ) -> bool {
          if !Self::sib_scalar_ty(ty) || shift > 3 {
-@@ -952,6 +954,7 @@ impl I686Codegen {
+@@ -923,7 +939,7 @@ impl I686Codegen {
+         let Some(&x) = self.reg_assignments.get(&index.0) else {
+             return false;
+         };
+-        let mem = Self::sib_mem(phys_reg_name(b), phys_reg_name(x), shift);
++        let mem = Self::sib_mem(phys_reg_name(b), phys_reg_name(x), shift, disp);
+         let store_instr = self.store_instr_for_type(ty);
+         // Immediate or register-resident value: single instruction, no
+         // staging.  A register source equal to the index register can only
+@@ -952,6 +968,7 @@ impl I686Codegen {
          sym: &str,
          index: &Value,
          shift: u8,
-+        _disp: i64,
++        disp: i64,
          ty: IrType,
      ) -> bool {
          if self.state.pic_mode || !Self::sib_scalar_ty(ty) || shift > 3 {
-@@ -985,6 +988,7 @@ impl I686Codegen {
+@@ -960,7 +977,7 @@ impl I686Codegen {
+         let Some(&x) = self.reg_assignments.get(&index.0) else {
+             return false;
+         };
+-        let mem = Self::sib_mem_sym(sym, phys_reg_name(x), shift);
++        let mem = Self::sib_mem_sym(sym, phys_reg_name(x), shift, disp);
+         let load_instr = self.load_instr_for_type(ty);
+         if let Some(&d) = self.reg_assignments.get(&dest.0) {
+             emit!(
+@@ -985,6 +1002,7 @@ impl I686Codegen {
          sym: &str,
          index: &Value,
          shift: u8,
-+        _disp: i64,
++        disp: i64,
          ty: IrType,
      ) -> bool {
          if self.state.pic_mode || !Self::sib_scalar_ty(ty) || shift > 3 {
+@@ -993,7 +1011,7 @@ impl I686Codegen {
+         let Some(&x) = self.reg_assignments.get(&index.0) else {
+             return false;
+         };
+-        let mem = Self::sib_mem_sym(sym, phys_reg_name(x), shift);
++        let mem = Self::sib_mem_sym(sym, phys_reg_name(x), shift, disp);
+         let store_instr = self.store_instr_for_type(ty);
+         if let Some(src) = self.direct_store_src(val, ty) {
+             emit!(self.state, "    {} {}, {}", store_instr, src, mem);
 diff --git a/src/backend/traits.rs b/src/backend/traits.rs
 index e5183e9..c3d9ab6 100644
 --- a/src/backend/traits.rs
@@ -1205,10 +1590,10 @@ index b7cecea..058299b 100644
          fn emit_typed_load_from_slot(&mut self, instr: &'static str, slot: StackSlot) => emit_typed_load_from_slot_impl;
          fn emit_save_acc(&mut self) => emit_save_acc_impl;
 diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
-index 4d52b0d..7e3649a 100644
+index 4d52b0d..d12036f 100644
 --- a/src/backend/x86/codegen/memory.rs
 +++ b/src/backend/x86/codegen/memory.rs
-@@ -1704,19 +1704,29 @@ impl X86Codegen {
+@@ -1704,19 +1704,34 @@ impl X86Codegen {
      // not allocatable on x86-64, so rax staging can never collide with the
      // base/index registers.
  
@@ -1230,21 +1615,26 @@ index 4d52b0d..7e3649a 100644
  
 -    fn sib_mem64_sym(sym: &str, index_reg: &str, shift: u8) -> String {
 +    fn sib_mem64_sym(sym: &str, index_reg: &str, shift: u8, disp: i64) -> String {
-+        let d = if disp == 0 {
-+            String::new()
++        // AT&T `sym+disp(, %idx, scale)`. Concatenating the raw number
++        // (`foo` + `4` → `foo4`) invents a different symbol. Negative
++        // displacements already carry the minus sign.
++        let head = if disp == 0 {
++            sym.to_string()
++        } else if disp > 0 {
++            format!("{}+{}", sym, disp)
 +        } else {
-+            format!("{}", disp)
++            format!("{}{}", sym, disp)
 +        };
          if shift == 0 {
 -            format!("{}(, %{})", sym, index_reg)
-+            format!("{}{}(, %{})", sym, d, index_reg)
++            format!("{}(, %{})", head, index_reg)
          } else {
 -            format!("{}(, %{}, {})", sym, index_reg, 1u32 << shift)
-+            format!("{}{}(, %{}, {})", sym, d, index_reg, 1u32 << shift)
++            format!("{}(, %{}, {})", head, index_reg, 1u32 << shift)
          }
      }
  
-@@ -1872,6 +1882,7 @@ impl X86Codegen {
+@@ -1872,6 +1887,7 @@ impl X86Codegen {
          base: &Value,
          index: &Value,
          shift: u8,
@@ -1252,7 +1642,7 @@ index 4d52b0d..7e3649a 100644
          ty: IrType,
      ) -> bool {
          let Some(&b) = self.reg_assignments.get(&base.0) else {
-@@ -1890,6 +1901,7 @@ impl X86Codegen {
+@@ -1890,6 +1906,7 @@ impl X86Codegen {
              phys_reg_name(b),
              phys_reg_name(self.reg_assignments[&index.0]),
              shift,
@@ -1260,7 +1650,7 @@ index 4d52b0d..7e3649a 100644
          );
          self.emit_load_indexed_common(dest, index, shift, ty, mem)
      }
-@@ -1900,6 +1912,7 @@ impl X86Codegen {
+@@ -1900,6 +1917,7 @@ impl X86Codegen {
          base: &Value,
          index: &Value,
          shift: u8,
@@ -1268,7 +1658,7 @@ index 4d52b0d..7e3649a 100644
          ty: IrType,
      ) -> bool {
          let Some(&b) = self.reg_assignments.get(&base.0) else {
-@@ -1918,6 +1931,7 @@ impl X86Codegen {
+@@ -1918,6 +1936,7 @@ impl X86Codegen {
              phys_reg_name(b),
              phys_reg_name(self.reg_assignments[&index.0]),
              shift,
@@ -1276,7 +1666,7 @@ index 4d52b0d..7e3649a 100644
          );
          self.emit_store_indexed_common(val, index, shift, ty, mem)
      }
-@@ -1928,6 +1942,7 @@ impl X86Codegen {
+@@ -1928,6 +1947,7 @@ impl X86Codegen {
          sym: &str,
          index: &Value,
          shift: u8,
@@ -1284,7 +1674,7 @@ index 4d52b0d..7e3649a 100644
          ty: IrType,
      ) -> bool {
          // `sym` may carry a composed constant displacement ("gh+2"). The GOT
-@@ -1959,9 +1974,9 @@ impl X86Codegen {
+@@ -1959,9 +1979,9 @@ impl X86Codegen {
              self.state
                  .out
                  .emit_instr_sym_base_reg("    leaq", sym, "rip", "rcx");
@@ -1296,7 +1686,7 @@ index 4d52b0d..7e3649a 100644
          };
          self.emit_load_indexed_common(dest, index, shift, ty, mem)
      }
-@@ -1972,6 +1987,7 @@ impl X86Codegen {
+@@ -1972,6 +1992,7 @@ impl X86Codegen {
          sym: &str,
          index: &Value,
          shift: u8,
@@ -1304,7 +1694,7 @@ index 4d52b0d..7e3649a 100644
          ty: IrType,
      ) -> bool {
          // Same basename rule as emit_load_indexed_sym_impl (see comment there):
-@@ -1992,9 +2008,9 @@ impl X86Codegen {
+@@ -1992,9 +2013,9 @@ impl X86Codegen {
              self.state
                  .out
                  .emit_instr_sym_base_reg("    leaq", sym, "rip", "rcx");
@@ -1316,12 +1706,79 @@ index 4d52b0d..7e3649a 100644
          };
          self.emit_store_indexed_common(val, index, shift, ty, mem)
      }
+@@ -2683,9 +2704,18 @@ impl X86Codegen {
+             AddressSpace::SegFs => "%fs:",
+             AddressSpace::Default => return false,
+         };
+-        if !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
+-            | IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr)
+-        {
++        if !matches!(
++            ty,
++            IrType::I8
++                | IrType::U8
++                | IrType::I16
++                | IrType::U16
++                | IrType::I32
++                | IrType::U32
++                | IrType::I64
++                | IrType::U64
++                | IrType::Ptr
++        ) {
+             return false;
+         }
+         // 64-bit loads straight into a GPR home skip the rax round-trip.
+@@ -2694,7 +2724,9 @@ impl X86Codegen {
+                 if !is_xmm_reg(reg) {
+                     self.state.emit_fmt(format_args!(
+                         "    movq {}{}, %{}",
+-                        seg_prefix, addr, phys_reg_name(reg)
++                        seg_prefix,
++                        addr,
++                        phys_reg_name(reg)
+                     ));
+                     self.state.reg_cache.invalidate_acc();
+                     return true;
+@@ -2723,9 +2755,18 @@ impl X86Codegen {
+             AddressSpace::SegFs => "%fs:",
+             AddressSpace::Default => return false,
+         };
+-        if !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
+-            | IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr)
+-        {
++        if !matches!(
++            ty,
++            IrType::I8
++                | IrType::U8
++                | IrType::I16
++                | IrType::U16
++                | IrType::I32
++                | IrType::U32
++                | IrType::I64
++                | IrType::U64
++                | IrType::Ptr
++        ) {
+             return false;
+         }
+         let store_instr = Self::mov_store_for_type(ty);
+@@ -2756,7 +2797,10 @@ impl X86Codegen {
+         self.operand_to_rax(val);
+         self.state.emit_fmt(format_args!(
+             "    {} %{}, {}{}",
+-            store_instr, Self::reg_for_type("rax", ty), seg_prefix, addr
++            store_instr,
++            Self::reg_for_type("rax", ty),
++            seg_prefix,
++            addr
+         ));
+         self.state.reg_cache.invalidate_acc();
+         true
 diff --git a/src/backend/x86/codegen/peephole/passes/copy_coalesce.rs b/src/backend/x86/codegen/peephole/passes/copy_coalesce.rs
 new file mode 100644
-index 0000000..c22967a
+index 0000000..9a1416d
 --- /dev/null
 +++ b/src/backend/x86/codegen/peephole/passes/copy_coalesce.rs
-@@ -0,0 +1,347 @@
+@@ -0,0 +1,346 @@
 +//! Whole-function register-copy coalescing.
 +//!
 +//! The register allocator hands parameters homes that rarely coincide with the
@@ -1374,11 +1831,12 @@ index 0000000..c22967a
 +use super::super::types::*;
 +use super::helpers::{has_implicit_reg_usage, is_shift_or_rotate, replace_reg_family};
 +use super::liveness::FileLiveness;
-+use super::relay_and_lea::{function_range, is_relayable_family, plain_gp_operand, split_two_operands};
++use super::relay_and_lea::{
++    function_range, is_relayable_family, plain_gp_operand, split_two_operands,
++};
 +
 +/// High-byte register names that cannot survive a family rename.
 +const HIGH_BYTE: &[&str] = &["%ah", "%bh", "%ch", "%dh"];
-+
 +
 +#[allow(clippy::needless_range_loop)]
 +pub(super) fn coalesce_register_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
@@ -1576,7 +2034,6 @@ index 0000000..c22967a
 +        assert!(out.contains("cmpl %esi, %ebx"), "{out}");
 +    }
 +
-+
 +    #[test]
 +    fn rdx_is_not_coalesced_when_the_epilogue_returns_through_it() {
 +        // 128-bit return: both halves are set explicitly, so %rdx carries part
@@ -1593,7 +2050,6 @@ index 0000000..c22967a
 +        ));
 +        assert!(out.contains("movq %rsi, %rdx"), "{out}");
 +    }
-+
 +
 +    #[test]
 +    fn rcx_is_not_coalesced_when_a_shift_needs_cl() {
@@ -1671,10 +2127,10 @@ index 0000000..c22967a
 +}
 diff --git a/src/backend/x86/codegen/peephole/passes/dead_writes.rs b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
 new file mode 100644
-index 0000000..d3b5f7f
+index 0000000..6de57c5
 --- /dev/null
 +++ b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
-@@ -0,0 +1,795 @@
+@@ -0,0 +1,849 @@
 +//! Dead pure-write elimination and redundant-load reuse.
 +//!
 +//! Two block-level cleanups that need the deadness proofs from
@@ -1692,8 +2148,8 @@ index 0000000..d3b5f7f
 +//!   at labels (join points), at anything that writes memory, and at any write
 +//!   to a register the address depends on.
 +
-+use super::helpers::{get_dest_reg, has_implicit_reg_usage};
 +use super::super::types::*;
++use super::helpers::{get_dest_reg, has_implicit_reg_usage};
 +use super::liveness::FileLiveness;
 +use super::relay_and_lea::{
 +    is_relayable_family, plain_gp_operand, provably_dead_lv, split_two_operands,
@@ -1773,7 +2229,6 @@ index 0000000..d3b5f7f
 +    }
 +    changed
 +}
-+
 +
 +/// True when `label_idx` (a label line) has no incoming branch: the only way
 +/// to reach it is to fall through the preceding instruction. Such a label
@@ -1994,7 +2449,6 @@ index 0000000..d3b5f7f
 +    dst.contains('(') && !t.starts_with("lea")
 +}
 +
-+
 +// ── load + self-test → compare against memory ────────────────────────────────
 +
 +/// `movsbq (%rbx), %rsi; testq %rsi, %rsi; je` → `cmpb $0, (%rbx); je`.
@@ -2074,6 +2528,23 @@ index 0000000..d3b5f7f
 +            continue;
 +        };
 +        if a != b || register_family_fast(a) != fam {
++            i += 1;
++            continue;
++        }
++        // SF of `cmpb`/`cmpw` is the memory operand's sign bit. That matches
++        // `testq`/`testl` of a sign-extended-to-64 load (`movsbq`/`movswq`/
++        // `movslq`) and `testl` of a sign-extended-to-32 load (`movsbl`/
++        // `movswl`). It does NOT match:
++        //   * any zero-extending load (byte 0x80: test SF=0, cmpb SF=1);
++        //   * `movsbl`/`movswl` + `testq` (the 32-bit write zero-extends,
++        //     so testq SF is bit 63 = 0 for a negative byte).
++        // ZF is identical in every case, so ZF-only consumers stay legal.
++        let signed_64 = matches!(*prefix, "movsbq " | "movswq " | "movslq ");
++        let signed_32 = matches!(*prefix, "movsbl " | "movswl ");
++        let test_is_q = test.starts_with("testq ");
++        if !(signed_64 || (signed_32 && !test_is_q))
++            && !super::flag_peepholes::flag_consumers_are_zf_only(store, infos, j + 1)
++        {
 +            i += 1;
 +            continue;
 +        }
@@ -2216,7 +2687,6 @@ index 0000000..d3b5f7f
 +        peephole_optimize(asm.to_string())
 +    }
 +
-+
 +    #[test]
 +    fn load_and_self_test_become_a_memory_compare() {
 +        let out = run(concat!(
@@ -2253,6 +2723,47 @@ index 0000000..d3b5f7f
 +            ".cfi_endproc\n",
 +        ));
 +        assert!(out.contains("movsbq (%rbx), %rsi"), "{out}");
++    }
++
++    #[test]
++    fn unsigned_load_test_is_kept_for_a_sign_consumer() {
++        // Byte 0x80: `testq` after `movzbl` has SF=0 (zero-extended);
++        // `cmpb $0` has SF=1. A signed consumer must keep the load+test.
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    movzbl (%rbx), %esi\n",
++            "    testq %rsi, %rsi\n",
++            "    js .LBB3\n",
++            "    xorl %eax, %eax\n",
++            "    ret\n",
++            ".LBB3:\n",
++            "    movl $1, %eax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("movzbl (%rbx), %esi"), "{out}");
++        assert!(out.contains("testq %rsi, %rsi"), "{out}");
++        assert!(!out.contains("cmpb $0"), "{out}");
++    }
++
++    #[test]
++    fn unsigned_load_test_still_folds_for_a_zero_consumer() {
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    movzbl (%rbx), %esi\n",
++            "    testq %rsi, %rsi\n",
++            "    je .LBB3\n",
++            "    xorl %eax, %eax\n",
++            "    ret\n",
++            ".LBB3:\n",
++            "    movl $1, %eax\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        assert!(out.contains("cmpb $0, (%rbx)"), "{out}");
++        assert!(!out.contains("movzbl"), "{out}");
 +    }
 +
 +    #[test]
@@ -2348,7 +2859,6 @@ index 0000000..d3b5f7f
 +        ));
 +        assert!(!out.contains("movl (%rsi), %eax"), "{out}");
 +    }
-+
 +
 +    #[test]
 +    fn repeated_load_crosses_a_fallthrough_only_label() {
@@ -2471,7 +2981,7 @@ index 0000000..d3b5f7f
 +    }
 +}
 diff --git a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
-index a15824d..99af397 100644
+index a15824d..11a4020 100644
 --- a/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
 +++ b/src/backend/x86/codegen/peephole/passes/flag_peepholes.rs
 @@ -23,8 +23,11 @@
@@ -2487,7 +2997,95 @@ index a15824d..99af397 100644
  };
  
  /// What a line does to EFLAGS.
-@@ -480,6 +483,7 @@ fn parse_cmov(t: &str) -> Option<(&'static str, char, &str, &str)> {
+@@ -43,12 +46,53 @@ pub(super) enum FlagsEffect {
+ 
+ /// Mnemonic prefixes that never touch EFLAGS.
+ const FLAG_NEUTRAL_PREFIXES: &[&str] = &[
+-    "movl ", "movq ", "movb ", "movw ", "movabsq ", "movabs ", "movzbl ", "movzbq ", "movzwl ",
+-    "movzwq ", "movsbl ", "movsbq ", "movswl ", "movswq ", "movslq ", "leal ", "leaq ", "movss ",
+-    "movsd ", "movaps ", "movapd ", "movups ", "movupd ", "movdqa ", "movdqu ", "movd ", "movq2dq ",
+-    "vmovss ", "vmovsd ", "vmovaps ", "vmovapd ", "vmovups ", "vmovupd ", "vmovdqa ", "vmovdqu ",
+-    "cvtsi2sd ", "cvtsi2ss ", "cvttsd2si ", "cvttss2si ", "cvtss2sd ", "cvtsd2ss ", "bswap ",
+-    "bswapl ", "bswapq ", "xchg ", "nop", "prefetch",
++    "movl ",
++    "movq ",
++    "movb ",
++    "movw ",
++    "movabsq ",
++    "movabs ",
++    "movzbl ",
++    "movzbq ",
++    "movzwl ",
++    "movzwq ",
++    "movsbl ",
++    "movsbq ",
++    "movswl ",
++    "movswq ",
++    "movslq ",
++    "leal ",
++    "leaq ",
++    "movss ",
++    "movsd ",
++    "movaps ",
++    "movapd ",
++    "movups ",
++    "movupd ",
++    "movdqa ",
++    "movdqu ",
++    "movd ",
++    "movq2dq ",
++    "vmovss ",
++    "vmovsd ",
++    "vmovaps ",
++    "vmovapd ",
++    "vmovups ",
++    "vmovupd ",
++    "vmovdqa ",
++    "vmovdqu ",
++    "cvtsi2sd ",
++    "cvtsi2ss ",
++    "cvttsd2si ",
++    "cvttss2si ",
++    "cvtss2sd ",
++    "cvtsd2ss ",
++    "bswap ",
++    "bswapl ",
++    "bswapq ",
++    "xchg ",
++    "nop",
++    "prefetch",
+ ];
+ 
+ /// Mnemonic prefixes that read the flags.
+@@ -73,7 +117,10 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
+         return FlagsEffect::Neutral;
+     }
+     // Bare mnemonics (no operand) that are flag-neutral.
+-    if matches!(t, "ret" | "leave" | "cltq" | "cqto" | "cwtl" | "cdqe" | "nop" | "endbr64") {
++    if matches!(
++        t,
++        "ret" | "leave" | "cltq" | "cqto" | "cwtl" | "cdqe" | "nop" | "endbr64"
++    ) {
+         return FlagsEffect::Neutral;
+     }
+     if t.starts_with("push") || t.starts_with("pop") {
+@@ -159,7 +206,6 @@ fn imm_value(text: &str) -> Option<i64> {
+     text.strip_prefix('$')?.parse::<i64>().ok()
+ }
+ 
+-
+ /// The arithmetic operand must name the copy's destination register at the
+ /// arithmetic's own width (`movq %r9, %rax` + `addl $1, %eax`).
+ fn names_family_at_width(text: &str, fam: RegId, wide: bool) -> bool {
+@@ -283,7 +329,6 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
+     changed
+ }
+ 
+-
+ // ── 4. copy + left shift → scaled lea ────────────────────────────────────────
+ 
+ /// `movq %A, %D; shlq $N, %D` → `leaq 0(,%A,2^N), %D` for N in 1..=3 (and the
+@@ -480,6 +525,7 @@ fn parse_cmov(t: &str) -> Option<(&'static str, char, &str, &str)> {
  ///   condition or its negation.
  pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
      let len = store.len();
@@ -2495,7 +3093,7 @@ index a15824d..99af397 100644
      let mut changed = false;
      let mut i = 0;
      while i < len {
-@@ -515,8 +519,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
+@@ -515,8 +561,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
          let mut k = i;
          let mut test_idx = None;
          let mut cmov_idx = None;
@@ -2505,7 +3103,7 @@ index a15824d..99af397 100644
              k = n;
              if infos[n].pinned || infos[n].is_barrier() {
                  break;
-@@ -602,7 +605,8 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
+@@ -602,7 +647,8 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
          // rewrites it before any read, or the whole function only mentions it
          // in the lines we are about to delete.
          owned.push(cmov_i);
@@ -2515,7 +3113,7 @@ index a15824d..99af397 100644
              || family_private_to(store, infos, i, bool_fam, &owned);
          if !dead {
              i += 1;
-@@ -619,6 +623,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
+@@ -619,6 +665,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
              }
          }
          replace_line(store, &mut infos[cmov_i], cmov_i, new_line);
@@ -2523,11 +3121,10 @@ index a15824d..99af397 100644
          changed = true;
          i = test_i.max(cmov_i) + 1;
      }
-@@ -721,6 +726,312 @@ pub(super) fn fold_copy_and_mask_into_movz(store: &mut LineStore, infos: &mut [L
+@@ -721,6 +768,321 @@ pub(super) fn fold_copy_and_mask_into_movz(store: &mut LineStore, infos: &mut [L
      changed
  }
-+
-+
+ 
 +// ── 5. redundant self-test after a logical op ────────────────────────────────
 +
 +/// `andl $1, %esi; testq %rsi, %rsi; je` → `andl $1, %esi; je`.
@@ -2605,7 +3202,9 @@ index a15824d..99af397 100644
 +            || ptext.starts_with("xorq ")
 +        {
 +            (true, true)
-+        } else if ptext.starts_with("andl ") || ptext.starts_with("orl ") || ptext.starts_with("xorl ")
++        } else if ptext.starts_with("andl ")
++            || ptext.starts_with("orl ")
++            || ptext.starts_with("xorl ")
 +        {
 +            (false, true)
 +        } else {
@@ -2627,7 +3226,7 @@ index a15824d..99af397 100644
 +            if infos[n].is_nop() || infos[n].kind == LineKind::Directive {
 +                continue;
 +            }
-+             let tn = infos[n].trimmed(store.get(n));
++            let tn = infos[n].trimmed(store.get(n));
 +            if flags_effect(tn) != FlagsEffect::Neutral || infos[n].reg_refs & mask != 0 {
 +                producer = None;
 +                break;
@@ -2657,7 +3256,6 @@ index a15824d..99af397 100644
 +    changed
 +}
 +
-+
 +/// Verify the whole function keeps EFLAGS inside a basic block: every
 +/// flag-reading instruction is preceded, in its own block, by a flag writer.
 +///
@@ -2667,7 +3265,12 @@ index a15824d..99af397 100644
 +/// across a join, and this check turns that convention into a verified
 +/// precondition instead of an assumption.
 +#[allow(clippy::needless_range_loop)]
-+fn flags_are_block_local(store: &LineStore, infos: &[LineInfo], fstart: usize, fend: usize) -> bool {
++fn flags_are_block_local(
++    store: &LineStore,
++    infos: &[LineInfo],
++    fstart: usize,
++    fend: usize,
++) -> bool {
 +    let mut written = false;
 +    for n in fstart..fend {
 +        if infos[n].is_nop() || infos[n].kind == LineKind::Directive {
@@ -2696,7 +3299,11 @@ index a15824d..99af397 100644
 +
 +/// True when every consumer of the current flags, up to the next flags writer,
 +/// only tests ZF (`e`/`ne`).
-+fn flag_consumers_are_zf_only(store: &LineStore, infos: &[LineInfo], from: usize) -> bool {
++pub(super) fn flag_consumers_are_zf_only(
++    store: &LineStore,
++    infos: &[LineInfo],
++    from: usize,
++) -> bool {
 +    let mut n = from;
 +    let mut saw_consumer = false;
 +    while n < store.len() {
@@ -2836,11 +3443,10 @@ index a15824d..99af397 100644
  #[cfg(test)]
  mod tests {
      use super::super::super::peephole_optimize;
-@@ -729,6 +1040,84 @@ mod tests {
+@@ -729,6 +1091,83 @@ mod tests {
          peephole_optimize(asm.to_string())
      }
-+
-+
+ 
 +    #[test]
 +    fn self_test_after_and_is_removed() {
 +        let out = run(concat!(
@@ -2921,12 +3527,28 @@ index a15824d..99af397 100644
      #[test]
      fn copy_plus_add_becomes_lea() {
          let out = run(concat!(
+@@ -759,7 +1198,6 @@ mod tests {
+         assert!(out.contains("addl $1, %r8d"), "{out}");
+     }
+ 
+-
+     #[test]
+     fn wide_copy_with_narrow_add_becomes_a_32bit_lea() {
+         let out = run(concat!(
+@@ -840,7 +1278,6 @@ mod tests {
+         assert!(out.contains("leal 1(%rbx), %r8d"), "{out}");
+     }
+ 
+-
+     #[test]
+     fn boolean_roundtrip_is_kept_when_a_later_branch_reads_the_test() {
+         // The `jne` consumes the flags the `test` produced ("boolean is set").
 diff --git a/src/backend/x86/codegen/peephole/passes/liveness.rs b/src/backend/x86/codegen/peephole/passes/liveness.rs
 new file mode 100644
-index 0000000..81a3b80
+index 0000000..7dc40b6
 --- /dev/null
 +++ b/src/backend/x86/codegen/peephole/passes/liveness.rs
-@@ -0,0 +1,597 @@
+@@ -0,0 +1,671 @@
 +//! Exact intra-function register liveness for the x86-64 peephole passes.
 +//!
 +//! Every pass that deletes a definition needs one question answered: *is this
@@ -2979,8 +3601,8 @@ index 0000000..81a3b80
 +const CALLER_SAVED: u16 =
 +    RAX | RCX | RDX | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11);
 +/// Live at `ret`: integer return value plus everything the callee must restore.
-+const RET_LIVE: u16 = RAX | RDX | (1 << 3) | (1 << 5) | RSP | (1 << 12) | (1 << 13) | (1 << 14)
-+    | (1 << 15);
++const RET_LIVE: u16 =
++    RAX | RDX | (1 << 3) | (1 << 5) | RSP | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15);
 +/// Same, for a function that demonstrably returns a single value in `%rax`
 +/// (its epilogue writes the accumulator and never touches `%rdx`). Keeping
 +/// `%rdx` artificially live there hides every dead `movq %rax, %rdx` the
@@ -3019,13 +3641,83 @@ index 0000000..81a3b80
 +
 +fn mnemonic_is_known(t: &str) -> bool {
 +    const KNOWN: &[&str] = &[
-+        "mov", "lea", "add", "sub", "and", "or", "xor", "cmp", "test", "imul", "mul", "div",
-+        "idiv", "neg", "not", "inc", "dec", "shl", "shr", "sar", "sal", "rol", "ror", "adc",
-+        "sbb", "set", "cmov", "push", "pop", "call", "ret", "jmp", "j", "nop", "cqto", "cltq",
-+        "cdq", "cwtl", "cdqe", "bswap", "bt", "bsf", "bsr", "popcnt", "lzcnt", "tzcnt", "xchg",
-+        "cmpxchg", "xadd", "lock", "leave", "endbr64", "ud2", "int3", "hlt", "pause", "prefetch",
-+        "cvt", "vm", "movs", "movz", "andn", "bls", "sh", "rc", "adcx", "adox", "mulx", "rdtsc",
-+        "cpuid", "syscall", "sfence", "lfence", "mfence", "vzeroupper", "vzeroall", "xgetbv",
++        "mov",
++        "lea",
++        "add",
++        "sub",
++        "and",
++        "or",
++        "xor",
++        "cmp",
++        "test",
++        "imul",
++        "mul",
++        "div",
++        "idiv",
++        "neg",
++        "not",
++        "inc",
++        "dec",
++        "shl",
++        "shr",
++        "sar",
++        "sal",
++        "rol",
++        "ror",
++        "adc",
++        "sbb",
++        "set",
++        "cmov",
++        "push",
++        "pop",
++        "call",
++        "ret",
++        "jmp",
++        "j",
++        "nop",
++        "cqto",
++        "cltq",
++        "cdq",
++        "cwtl",
++        "cdqe",
++        "bswap",
++        "bt",
++        "bsf",
++        "bsr",
++        "popcnt",
++        "lzcnt",
++        "tzcnt",
++        "xchg",
++        "cmpxchg",
++        "xadd",
++        "lock",
++        "leave",
++        "endbr64",
++        "ud2",
++        "int3",
++        "hlt",
++        "pause",
++        "prefetch",
++        "cvt",
++        "vm",
++        "movs",
++        "movz",
++        "andn",
++        "bls",
++        "sh",
++        "rc",
++        "adcx",
++        "adox",
++        "mulx",
++        "rdtsc",
++        "cpuid",
++        "syscall",
++        "sfence",
++        "lfence",
++        "mfence",
++        "vzeroupper",
++        "vzeroall",
++        "xgetbv",
 +    ];
 +    KNOWN.iter().any(|k| t.starts_with(k))
 +}
@@ -3062,12 +3754,12 @@ index 0000000..81a3b80
 +    /// `Some(true)` when `fam` may be read after line `idx`, `Some(false)` when
 +    /// it is provably dead, `None` when the enclosing function was not
 +    /// analysable.
-+    pub(super) fn live_after(&self, idx: usize, fam: RegId) -> Option<bool> {+        if fam > REG_GP_MAX || idx >= self.known.len() || !self.known[idx] {
++    pub(super) fn live_after(&self, idx: usize, fam: RegId) -> Option<bool> {
++        if fam > REG_GP_MAX || idx >= self.known.len() || !self.known[idx] {
 +            return None;
 +        }
 +        Some(self.live_out[idx] & (1u16 << fam) != 0)
 +    }
-+
 +
 +    /// Recompute the liveness of the function containing `idx` after a pass
 +    /// rewrote or deleted a line inside it. Cheaper than rebuilding the file
@@ -3110,7 +3802,12 @@ index 0000000..81a3b80
 +    /// block, by a write of `%rax` and by no mention of `%rdx`: the signature
 +    /// of a function returning one integer in the accumulator.
 +    #[allow(clippy::needless_range_loop)]
-+    pub(super) fn returns_in_rax_only(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> bool {
++    pub(super) fn returns_in_rax_only(
++        store: &LineStore,
++        infos: &[LineInfo],
++        start: usize,
++        end: usize,
++    ) -> bool {
 +        let mut saw_ret = false;
 +        for n in start..end {
 +            if infos[n].is_nop() || infos[n].kind != LineKind::Ret {
@@ -3184,10 +3881,7 @@ index 0000000..81a3b80
 +            }
 +        }
 +        let resolve = |name: &str| -> Option<usize> {
-+            labels
-+                .iter()
-+                .find(|(l, _)| l == name)
-+                .map(|&(_, idx)| idx)
++            labels.iter().find(|(l, _)| l == name).map(|&(_, idx)| idx)
 +        };
 +
 +        // ── instruction effects + successor edges ────────────────────────────
@@ -3264,7 +3958,8 @@ index 0000000..81a3b80
 +        let mentioned = infos[n].reg_refs;
 +        let fall: Vec<usize> = next.into_iter().collect();
 +
-+        if infos[n].kind == LineKind::InlineAsm || infos[n].pinned && infos[n].kind == LineKind::InlineAsm
++        if infos[n].kind == LineKind::InlineAsm
++            || infos[n].pinned && infos[n].kind == LineKind::InlineAsm
 +        {
 +            return Some((
 +                Effect {
@@ -3385,7 +4080,9 @@ index 0000000..81a3b80
 +                    }
 +                }
 +                // Implicit operands.
-+                if t.starts_with("div") || t.starts_with("idiv") || t.starts_with("mul") && !t.starts_with("mulx")
++                if t.starts_with("div")
++                    || t.starts_with("idiv")
++                    || t.starts_with("mul") && !t.starts_with("mulx")
 +                {
 +                    reads |= RAX | RDX;
 +                    writes |= RAX | RDX;
@@ -3524,10 +4221,10 @@ index 0000000..81a3b80
 +    }
 +}
 diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
-index 4364474..d844d26 100644
+index 4364474..91d5bd6 100644
 --- a/src/backend/x86/codegen/peephole/passes/mod.rs
 +++ b/src/backend/x86/codegen/peephole/passes/mod.rs
-@@ -23,11 +23,14 @@ use super::types::*;
+@@ -23,18 +23,21 @@ use super::types::*;
  // Submodule pass implementations
  mod callee_saves;
  mod compare_branch;
@@ -3535,6 +4232,7 @@ index 4364474..d844d26 100644
  mod copy_propagation;
  mod dead_code;
 +mod dead_writes;
++mod flag_peepholes;
  mod frame_compact;
  mod helpers;
  mod identical_blocks;
@@ -3542,6 +4240,13 @@ index 4364474..d844d26 100644
  mod local_patterns;
  mod loop_trampoline;
  mod memory_fold;
+ mod push_pop;
+ mod pushf_elim;
+ mod redundant_ext;
+-mod flag_peepholes;
+ mod relay_and_lea;
+ mod spill_deref;
+ mod store_forwarding;
 @@ -526,6 +529,32 @@ pub fn peephole_optimize(mut asm: String) -> String {
          if !sk("setcc_cmov") {
              changed |= flag_peepholes::fold_setcc_test_cmov(&mut store, &mut infos);
@@ -3576,18 +4281,32 @@ index 4364474..d844d26 100644
              changed |= flag_peepholes::fold_copy_and_mask_into_movz(&mut store, &mut infos);
          }
 diff --git a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-index e8f98e2..7e8a669 100644
+index e8f98e2..835bc85 100644
 --- a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
 +++ b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
-@@ -49,6 +49,7 @@
- //! immediately recycled by the next LEA).
+@@ -50,6 +50,7 @@
  
  use super::super::types::*;
-+use super::liveness::FileLiveness;
  use super::helpers::{get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family};
++use super::liveness::FileLiveness;
  
  /// Widest window (in non-NOP instructions) searched for the consumer of a LEA.
-@@ -157,18 +158,33 @@ pub(super) fn dead_in_block_after(store: &LineStore, infos: &[LineInfo], from: u
+ /// Unrolled byte loops interleave 2-3 instructions between the address
+@@ -124,7 +125,12 @@ pub(super) fn is_full_write(info: &LineInfo, t: &str, fam: RegId) -> bool {
+ }
+ 
+ /// Proof 1: block-local write-before-read deadness of `fam` from `from`.
+-pub(super) fn dead_in_block_after(store: &LineStore, infos: &[LineInfo], from: usize, fam: RegId) -> bool {
++pub(super) fn dead_in_block_after(
++    store: &LineStore,
++    infos: &[LineInfo],
++    from: usize,
++    fam: RegId,
++) -> bool {
+     let mask = 1u16 << fam;
+     let mut n = from;
+     while n < store.len() {
+@@ -157,18 +163,33 @@ pub(super) fn dead_in_block_after(store: &LineStore, infos: &[LineInfo], from: u
  
  /// Half-open `[start, end)` line range of the function containing `idx`,
  /// delimited by `.cfi_startproc` / `.cfi_endproc`.
@@ -3625,7 +4344,7 @@ index e8f98e2..7e8a669 100644
      let mut end = len;
      let mut n = idx;
      while n < len {
-@@ -178,7 +194,7 @@ pub(super) fn function_range(store: &LineStore, infos: &[LineInfo], idx: usize)
+@@ -178,7 +199,7 @@ pub(super) fn function_range(store: &LineStore, infos: &[LineInfo], idx: usize)
          }
          n += 1;
      }
@@ -3634,7 +4353,7 @@ index e8f98e2..7e8a669 100644
  }
  
  /// Registers an ABI-visible control transfer can READ without naming them in
-@@ -210,7 +226,9 @@ pub(super) fn family_private_to(
+@@ -210,7 +231,9 @@ pub(super) fn family_private_to(
      owned: &[usize],
  ) -> bool {
      let mask = 1u16 << fam;
@@ -3645,10 +4364,20 @@ index e8f98e2..7e8a669 100644
      let mut n = start;
      while n < end {
          if infos[n].is_nop() {
-@@ -265,6 +283,31 @@ pub(super) fn provably_dead(
+@@ -232,7 +255,8 @@ pub(super) fn family_private_to(
+             // argument registers; `.L*` targets are intra-function.
+             LineKind::Jmp
+                 if implicit_at_transfer(fam)
+-                    && !t.trim_start_matches(|c: char| c != ' ')
++                    && !t
++                        .trim_start_matches(|c: char| c != ' ')
+                         .trim()
+                         .starts_with('.') =>
+             {
+@@ -265,6 +289,30 @@ pub(super) fn provably_dead(
          || family_private_to(store, infos, use_idx, fam, owned)
  }
-+
+ 
 +/// Deadness with the exact analysis first: [`FileLiveness`] answers precisely
 +/// whenever the enclosing function is analysable, and the two syntactic proofs
 +/// remain as a fallback for functions it declines (indirect jumps, unknown
@@ -3676,7 +4405,7 @@ index e8f98e2..7e8a669 100644
  /// Split `OP SRC, DST` (AT&T, dest last) into the trimmed operand texts.
  pub(super) fn split_two_operands(rest: &str) -> Option<(&str, &str)> {
      let (src, dst) = rest.rsplit_once(',')?;
-@@ -305,6 +348,7 @@ pub(super) fn plain_gp_operand(text: &str) -> Option<RegId> {
+@@ -305,6 +353,7 @@ pub(super) fn plain_gp_operand(text: &str) -> Option<RegId> {
  /// * `%D` is provably dead after the use (module header, proofs 1 and 2).
  pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
      let len = store.len();
@@ -3684,7 +4413,7 @@ index e8f98e2..7e8a669 100644
      let mut changed = false;
      let mut i = 0;
      while i < len {
-@@ -348,7 +392,8 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
+@@ -348,7 +397,8 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
              if infos[j].is_barrier() || infos[j].pinned {
                  break;
              }
@@ -3694,10 +4423,26 @@ index e8f98e2..7e8a669 100644
              if has_implicit_reg_usage(t) {
                  break; // div/mul/string ops: unmodelled register traffic
              }
-@@ -356,6 +401,32 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
+@@ -356,22 +406,50 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
                  // This is the first line touching %D — it must be the relay
                  // consumer, or the transform is off.
                  let mut folded = false;
+-                if let Some(op) = RELAY_OPS.iter().find(|op| t.starts_with(**op)) {
+-                    if let Some((use_src, use_dst)) = split_two_operands(&t[op.len()..]) {
+-                        let use_dst_fam = register_family_fast(use_dst);
+-                        let dst_is_other_reg = use_dst.starts_with('%')
+-                            && use_dst_fam != REG_NONE
+-                            && use_dst_fam != dst_fam;
+-                        if use_src == dst_text && dst_is_other_reg {
+-                            let new_line = format!("    {}{}, {}", op, src_text, use_dst);
+-                            // The substitution must absorb EVERY mention of %D.
+-                            if !line_refs_family(&new_line, dst_fam)
+-                                && provably_dead(store, infos, j, dst_fam, &[i, j])
+-                            {
+-                                mark_nop(&mut infos[i]);
+-                                replace_line(store, &mut infos[j], j, new_line);
+-                                changed = true;
+-                                folded = true;
 +                // A store whose SOURCE is the copy: `movl %D, MEM` becomes
 +                // `movl %S, MEM`. Same conditions as the ALU case — the
 +                // operand text must match exactly (width-exact) and %D must be
@@ -3724,30 +4469,28 @@ index e8f98e2..7e8a669 100644
 +                    }
 +                }
 +                if !folded {
-                 if let Some(op) = RELAY_OPS.iter().find(|op| t.starts_with(**op)) {
-                     if let Some((use_src, use_dst)) = split_two_operands(&t[op.len()..]) {
-                         let use_dst_fam = register_family_fast(use_dst);
-@@ -366,16 +437,18 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
-                             let new_line = format!("    {}{}, {}", op, src_text, use_dst);
-                             // The substitution must absorb EVERY mention of %D.
-                             if !line_refs_family(&new_line, dst_fam)
--                                && provably_dead(store, infos, j, dst_fam, &[i, j])
-+                                && provably_dead_lv(&lv, store, infos, j, dst_fam, &[i, j])
-                             {
-                                 mark_nop(&mut infos[i]);
-                                 replace_line(store, &mut infos[j], j, new_line);
-+                                lv.refresh_at(store, infos, j);
-                                 changed = true;
-                                 folded = true;
++                    if let Some(op) = RELAY_OPS.iter().find(|op| t.starts_with(**op)) {
++                        if let Some((use_src, use_dst)) = split_two_operands(&t[op.len()..]) {
++                            let use_dst_fam = register_family_fast(use_dst);
++                            let dst_is_other_reg = use_dst.starts_with('%')
++                                && use_dst_fam != REG_NONE
++                                && use_dst_fam != dst_fam;
++                            if use_src == dst_text && dst_is_other_reg {
++                                let new_line = format!("    {}{}, {}", op, src_text, use_dst);
++                                // The substitution must absorb EVERY mention of %D.
++                                if !line_refs_family(&new_line, dst_fam)
++                                    && provably_dead_lv(&lv, store, infos, j, dst_fam, &[i, j])
++                                {
++                                    mark_nop(&mut infos[i]);
++                                    replace_line(store, &mut infos[j], j, new_line);
++                                    lv.refresh_at(store, infos, j);
++                                    changed = true;
++                                    folded = true;
++                                }
                              }
                          }
                      }
-                 }
-+                }
-                 let _ = folded;
-                 break;
-             }
-@@ -469,6 +542,7 @@ fn parse_lea_address(lea: &str) -> Option<(&str, &str, Vec<RegId>)> {
+@@ -469,6 +547,7 @@ fn parse_lea_address(lea: &str) -> Option<(&str, &str, Vec<RegId>)> {
  /// `%T`; and `%T` is provably dead afterwards.
  pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
      let len = store.len();
@@ -3755,7 +4498,7 @@ index e8f98e2..7e8a669 100644
      let mut changed = false;
      let mut i = 0;
      while i < len {
-@@ -526,10 +600,11 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo])
+@@ -526,10 +605,11 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo])
                      let replacement = t.replacen(&addr_pat, &folded_addr, 1);
                      if replacement != t
                          && !line_refs_family(&replacement, dst_fam)
@@ -3768,15 +4511,21 @@ index e8f98e2..7e8a669 100644
                          changed = true;
                      }
                  }
-@@ -591,6 +666,7 @@ pub(super) fn retarget_producer_into_copy(
-     infos: &mut [LineInfo],
- ) -> bool {
+@@ -586,11 +666,9 @@ fn dest_width(name: &str) -> Option<u8> {
+ ///   (retargeting a 64-bit producer under a `movl` copy would keep bits 32..63
+ ///   that the copy discarded);
+ /// * the producer's register is provably dead after the copy (module header).
+-pub(super) fn retarget_producer_into_copy(
+-    store: &mut LineStore,
+-    infos: &mut [LineInfo],
+-) -> bool {
++pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
      let len = store.len();
 +    let mut lv = FileLiveness::new(store, infos);
      let mut changed = false;
      let mut i = 0;
      while i < len {
-@@ -665,7 +741,7 @@ pub(super) fn retarget_producer_into_copy(
+@@ -665,7 +743,7 @@ pub(super) fn retarget_producer_into_copy(
              i += 1;
              continue;
          }
@@ -3785,7 +4534,7 @@ index e8f98e2..7e8a669 100644
              i += 1;
              continue;
          }
-@@ -682,6 +758,7 @@ pub(super) fn retarget_producer_into_copy(
+@@ -682,6 +760,7 @@ pub(super) fn retarget_producer_into_copy(
          }
          replace_line(store, &mut infos[i], i, new_line);
          mark_nop(&mut infos[j]);
@@ -3793,7 +4542,15 @@ index e8f98e2..7e8a669 100644
          changed = true;
          i = j + 1;
      }
-@@ -800,8 +877,14 @@ mod tests {
+@@ -785,7 +864,6 @@ mod tests {
+         assert!(out.contains("movl %ebx, %eax"), "{out}");
+     }
+ 
+-
+     #[test]
+     fn producer_is_retargeted_into_the_copy_destination() {
+         // The store keeps %r10 alive, so the copy cannot simply be deleted;
+@@ -800,8 +878,14 @@ mod tests {
              "    ret\n",
              ".cfi_endproc\n",
          ));
@@ -3809,7 +4566,7 @@ index e8f98e2..7e8a669 100644
      }
  
      #[test]
-@@ -829,6 +912,7 @@ mod tests {
+@@ -829,6 +913,7 @@ mod tests {
              ".cfi_startproc\n",
              "    movq (%rdx), %rax\n",
              "    movl %eax, %r10d\n",
