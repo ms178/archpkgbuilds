@@ -1,2844 +1,691 @@
-diff --git a/src/backend/live_range.rs b/src/backend/live_range.rs
-index 3f55e47..da29408 100644
---- a/src/backend/live_range.rs
-+++ b/src/backend/live_range.rs
-@@ -58,6 +58,11 @@ use std::sync::OnceLock;
- /// - `follow_value`: producer whose assigned register we want to inherit
- /// - `spill_weight`: `priority / live_span` (higher = more painful to spill)
- /// - `cascade`: eviction-chain generation (LLVM RegAllocGreedy lineage)
-+/// - `segments`: hole-aware live coverage as sorted, disjoint, CLOSED point
-+///   intervals (RA-05). Empty = no segment data: every conflict test falls
-+///   back to the fat envelope and the allocator behaves exactly as before
-+///   this field existed. Populated by `regalloc.rs` for GPR/XMM scans from
-+///   `liveness.segments` (coalesce-owner unions for phi webs).
- #[derive(Debug, Clone)]
- pub struct LiveRange {
-     pub value_id: u32,
-@@ -81,6 +86,9 @@ pub struct LiveRange {
-     /// `victim.cascade + 1` and may only be evicted by an interval with
-     /// equal or higher cascade. Bounds ping-pong (used by mode 5).
-     pub cascade: u32,
-+    /// Hole-aware live coverage: sorted, disjoint, CLOSED intervals of
-+    /// program points. Always a subset of `[start, end]`. See the struct doc.
-+    pub segments: Vec<(u32, u32)>,
- }
+diff --git a/README.md b/README.md
+index 6230080..9475d28 100644
+--- a/README.md
++++ b/README.md
+@@ -90,26 +90,42 @@ hardware result.
+ | `histogram` | indexed increment/reduction | **0.80** (1.25× faster) | pass |
+ | `mandelbrot` | FP branch-heavy loop | **0.75** (1.33× faster) | pass |
+ | `sieve` | branchy int stores | **0.78** (1.28× faster) | pass |
+-| `expat_xml_scan` | XML name-token scan | **0.81** (1.23× faster) | pass |
+-| `sqlite_varint` | varint decoder | **0.72** (1.39× faster) | pass |
++| `expat_xml_scan` | XML name-token scan | **0.62** (1.61× faster) | pass |
++| `sqlite_varint` | varint decoder | **0.63** (1.59× faster) | pass |
+ | `linux_find_bit` | sparse bit search | **0.71** (1.41× faster) | pass |
+ | `fannkuch` | permutations | **0.75** (1.33× faster) | pass |
+ | `spectral_norm` | dense FP | **0.80** (1.25× faster) | pass |
+ | `hash_table` (chase) | pointer chasing | **0.92** | pass |
+ | `libm_round_family` | libm round intrinsics | **0.47** | gap |
+-| `loop_patterns` | scalar loop transforms | **0.13** | gap |
++| `loop_patterns` | scalar loop transforms | **0.39** | gap |
+ | `nbody` | N-body FP structs | **0.31** | gap |
  
- impl LiveRange {
-@@ -99,9 +107,18 @@ impl LiveRange {
-             follow_value: None,
-             spill_weight: loop_weight as f64 / live_span(interval.start, interval.end),
-             cascade: 0,
-+            segments: Vec::new(),
-         }
-     }
- 
-+    /// Install hole-aware live coverage (sorted, disjoint, CLOSED point
-+    /// intervals). Callers sort/normalize; this only records. Every segment
-+    /// must lie within `[start, end]` — the interference tests rely on the
-+    /// fat envelope as a conservative superset for mixed fat/segment pairs.
-+    pub fn set_segments(&mut self, segments: Vec<(u32, u32)>) {
-+        self.segments = segments;
-+    }
-+
-     /// Install `uses`, enforcing the sorted+unique invariant that the
-     /// binary-search helpers depend on.
-     pub fn set_uses(&mut self, mut uses: Vec<u32>) {
-@@ -150,6 +167,82 @@ impl LiveRange {
-         }
-         true
-     }
-+
-+    /// Hole-aware generalization of [`LiveRange::conflicts_with`] (RA-05).
-+    ///
-+    /// Two ranges conflict when any live segment of one properly covers a
-+    /// live point of the other, except the use-before-def adjacency: a
-+    /// single shared point `p` (one coverage ending at `p`, the other
-+    /// starting at `p`) is not a conflict when the dying side's last
-+    /// *recorded* use is exactly `p` — the read at `p` precedes the other's
-+    /// def at `p` within the same instruction. This is the same rule the
-+    /// fat test applies at whole-envelope granularity; segment coverage
-+    /// only removes phantom conflicts inside holes (points where liveness
-+    /// proved the value dead on every path).
-+    ///
-+    /// When either side has no segment data the fat envelopes are used as
-+    /// single-segment coverage, which reproduces [`LiveRange::conflicts_with`]
-+    /// exactly (both sides fat pairs are routed through the original test so
-+    /// existing behavior is bit-identical).
-+    pub fn conflicts_with_segments(&self, other: &LiveRange) -> bool {
-+        if self.segments.is_empty() && other.segments.is_empty() {
-+            return self.conflicts_with(other);
-+        }
-+        // Materialize fat coverage for whichever side lacks segments; a
-+        // stack array keeps this allocation-free.
-+        let fat_a = [(self.start, self.end)];
-+        let fat_b = [(other.start, other.end)];
-+        let a: &[(u32, u32)] = if self.segments.is_empty() {
-+            &fat_a
-+        } else {
-+            &self.segments
-+        };
-+        let b: &[(u32, u32)] = if other.segments.is_empty() {
-+            &fat_b
-+        } else {
-+            &other.segments
-+        };
-+        let (mut ai, mut bi) = (0usize, 0usize);
-+        while ai < a.len() && bi < b.len() {
-+            let (sa, ea) = a[ai];
-+            let (sb, eb) = b[bi];
-+            if sa <= eb && sb <= ea {
-+                // Shared closed span [max(sa,sb), min(ea,eb)].
-+                let shared_start = sa.max(sb);
-+                let shared_end = ea.min(eb);
-+                if shared_end > shared_start {
-+                    return true;
-+                }
-+                // Exactly one shared point: the use-before-def adjacency.
-+                // Legal only when the dying side's globally last recorded use
-+                // is that point (the read precedes the other side's def
-+                // within the same instruction). A side that merely has a
-+                // segment boundary there (live-through a hole, reviving
-+                // later) keeps its value in this register across the hole
-+                // and must not be clobbered.
-+                if ea == sb {
-+                    if !self.last_use_is_at(ea) {
-+                        return true;
-+                    }
-+                } else if eb == sa {
-+                    if !other.last_use_is_at(eb) {
-+                        return true;
-+                    }
-+                } else {
-+                    // Both segments end at the shared point (degenerate
-+                    // zero-width coverage); build_segments never produces
-+                    // this. Fail closed.
-+                    return true;
-+                }
-+            }
-+            if ea <= eb {
-+                ai += 1;
-+            } else {
-+                bi += 1;
-+            }
-+        }
-+        false
-+    }
- }
- 
- /// Inclusive live-span length. Inverted intervals do not underflow.
-@@ -186,6 +279,13 @@ pub struct ActiveInterval {
-     /// First use at or after the assignment point. Informational / API;
-     /// eviction recomputes against the *current* scan position.
-     pub next_use: Option<u32>,
-+    /// Half-open `[start, end)` occupancy spans this interval held on
-+    /// `phys_reg`, truncated at eviction. Under the fat model this is the
-+    /// single span `[start, occupancy_end + 1)`; with segment coverage each
-+    /// closed segment `[s, e]` contributes `[s, e + 1)`. Used by
-+    /// [`LinearScanAllocator::verify_handled_history`] to validate
-+    /// segment-aware sharing (RA-05).
-+    pub occupancy_spans: Vec<(u32, u32)>,
- }
- 
- /// Linear-scan allocator state.
-@@ -204,6 +304,20 @@ pub struct LinearScanAllocator {
-     pub assignments: FxHashMap<u32, PhysReg>,
-     /// One past the last use of the most recent occupant of each register.
-     pub reg_free_until: FxHashMap<PhysReg, u32>,
-+    /// Segment-aware occupancy (RA-05): per register, the union of the
-+    /// half-open `[start, end+1)` spans of every current holder's live
-+    /// segments (fat envelope when a holder has no segment data), merged
-+    /// into a sorted disjoint list. Only maintained when `segment_mode` is
-+    /// set; the fat `reg_free_until` above is maintained in BOTH modes so
-+    /// `earliest_free_position` and non-segment callers keep their exact
-+    /// pre-existing semantics.
-+    pub reg_occupancy: FxHashMap<PhysReg, Vec<(u32, u32)>>,
-+    /// Whether the scan consults `reg_occupancy` / segment conflicts.
-+    /// Enabled by [`LinearScanAllocator::new`] when any incoming range
-+    /// carries segment coverage and the `CCC_NO_SEGMENT_SCAN` kill switch
-+    /// is unset. With no segmented ranges the allocator is bit-identical
-+    /// to the pre-RA-05 fat scan.
-+    pub segment_mode: bool,
-     pub spill_slots: FxHashMap<u32, i32>,
-     pub available_regs: Vec<PhysReg>,
-     pub next_spill_slot: i32,
-@@ -215,14 +329,28 @@ pub struct LinearScanAllocator {
-     pub next_reg_idx: usize,
- }
- 
-+/// Cached `CCC_NO_SEGMENT_SCAN` kill switch (RA-05 segment-aware scan).
-+fn segment_scan_enabled() -> bool {
-+    static FLAG: OnceLock<bool> = OnceLock::new();
-+    *FLAG.get_or_init(|| std::env::var_os("CCC_NO_SEGMENT_SCAN").is_none())
-+}
-+
- impl LinearScanAllocator {
-     pub fn new(ranges: Vec<LiveRange>, available_regs: Vec<PhysReg>) -> Self {
-+        // RA-05: enter segment mode only when the worklist actually carries
-+        // hole-aware coverage AND the kill switch is unset. Unit tests and
-+        // unenriched scans (Phase 2b, synthetic vector intervals) run the
-+        // exact fat kernel.
-+        let segment_mode =
-+            segment_scan_enabled() && ranges.iter().any(|r| !r.segments.is_empty());
-         Self {
-             ranges,
-             active: Vec::new(),
-             handled: Vec::new(),
-             assignments: FxHashMap::default(),
-             reg_free_until: FxHashMap::default(),
-+            reg_occupancy: FxHashMap::default(),
-+            segment_mode,
-             spill_slots: FxHashMap::default(),
-             available_regs,
-             next_spill_slot: 0,
-@@ -292,7 +420,13 @@ impl LinearScanAllocator {
-     ///    pool and [`Self::register_compatible`] (the only path that
-     ///    applies use-before-def adjacency).
-     /// 2. Otherwise a register whose last occupant died *strictly before*
--    ///    `range.start`, rotating the start index for ILP.
-+    ///    `range.start`, rotating the start index for ILP. In segment mode
-+    ///    (RA-05) "free" means no occupancy span of the register overlaps
-+    ///    the range's live segments — a register held across a liveness
-+    ///    hole can be reused inside that hole. Touching spans are still
-+    ///    rejected here: the rotation path never applies die-at-birth
-+    ///    sharing, exactly like the fat `free_until <= start` test it
-+    ///    generalizes.
-     pub fn find_free_register(&mut self, range: &LiveRange) -> Option<PhysReg> {
-         if let Some(hint) = range.reg_hint {
-             if self.is_allocatable_reg(hint) && self.register_compatible(hint, range) {
-@@ -314,15 +448,54 @@ impl LinearScanAllocator {
-         for offset in 0..n {
-             let idx = (start + offset) % n;
-             let reg = self.available_regs[idx];
--            let free_until = self.reg_free_until.get(&reg).copied().unwrap_or(0);
--            if free_until <= range.start {
--                self.next_reg_idx = idx + 1;
--                return Some(reg);
-+            if self.segment_mode {
-+                if self.register_free_for_segments(reg, range) {
-+                    self.next_reg_idx = idx + 1;
-+                    return Some(reg);
-+                }
-+            } else {
-+                let free_until = self.reg_free_until.get(&reg).copied().unwrap_or(0);
-+                if free_until <= range.start {
-+                    self.next_reg_idx = idx + 1;
-+                    return Some(reg);
-+                }
-             }
-         }
-         None
-     }
- 
-+    /// Segment-mode rotation check: no occupancy span of `reg` may share
-+    /// even a single point with `range`'s live coverage (half-open spans;
-+    /// touching spans are rejected because the rotation path never applies
-+    /// the die-at-birth exception — same conservatism as the fat test
-+    /// `reg_free_until[reg] <= range.start`).
-+    fn register_free_for_segments(&self, reg: PhysReg, range: &LiveRange) -> bool {
-+        let Some(occupied) = self.reg_occupancy.get(&reg) else {
-+            return true;
-+        };
-+        let fat = [(range.start, range.end)];
-+        let cov: &[(u32, u32)] = if range.segments.is_empty() {
-+            &fat
-+        } else {
-+            &range.segments
-+        };
-+        // Both lists are sorted; a merge scan is sufficient.
-+        let (mut oi, mut ci) = (0usize, 0usize);
-+        while oi < occupied.len() && ci < cov.len() {
-+            let (os, oe) = occupied[oi]; // half-open [os, oe)
-+            let (cs, ce) = cov[ci]; // closed [cs, ce] -> span [cs, ce+1)
-+            if os < ce + 1 && cs < oe {
-+                return false;
-+            }
-+            if oe <= cs {
-+                oi += 1;
-+            } else {
-+                ci += 1;
-+            }
-+        }
-+        true
-+    }
-+
-     /// Whether `reg` belongs to the current allocation class.
-     #[inline]
-     fn is_allocatable_reg(&self, reg: PhysReg) -> bool {
-@@ -331,26 +504,82 @@ impl LinearScanAllocator {
- 
-     /// Whether `reg` may hold `range` for its whole lifetime.
-     ///
--    /// 1. **Occupancy.** `reg_free_until[reg] - 1` is the last occupant's
--    ///    end. Strictly past `range.start` ⇒ the occupant is still needed
--    ///    after `range`'s def. Equality is the die-at-birth case and is
--    ///    decided by (2).
--    /// 2. **Interference.** No active holder of `reg` may
--    ///    [`LiveRange::conflicts_with`] `range`.
-+    /// 1. **Occupancy.** Fat mode: `reg_free_until[reg] - 1` is the last
-+    ///    occupant's end. Strictly past `range.start` ⇒ the occupant is
-+    ///    still needed after `range`'s def. Equality is the die-at-birth
-+    ///    case and is decided by (2). Segment mode (RA-05): no occupancy
-+    ///    span may properly overlap `range`'s live coverage (single-point
-+    ///    use-before-def adjacency is permitted by (2)'s conflict test).
-+    /// 2. **Interference.** No active holder of `reg` may conflict with
-+    ///    `range` ([`LiveRange::conflicts_with_segments`] in segment mode,
-+    ///    [`LiveRange::conflicts_with`] otherwise).
-     ///
-     /// `|active|` is bounded by the register file plus die-at-birth
-     /// extras; a per-register index would add sync surface for tens of
-     /// comparisons.
-     fn register_compatible(&self, reg: PhysReg, range: &LiveRange) -> bool {
--        let free_until = self.reg_free_until.get(&reg).copied().unwrap_or(0);
--        let occupant_end = free_until.saturating_sub(1);
--        if occupant_end > range.start {
--            return false;
-+        if self.segment_mode {
-+            if !self.register_free_for_segments(reg, range) {
-+                // A proper span overlap is a hard reject. The single-point
-+                // die-at-birth case surfaces as a touching span here and is
-+                // adjudicated by the active-holder conflict test below.
-+                let touching_only = self.register_touches_only(reg, range);
-+                if !touching_only {
-+                    return false;
-+                }
-+            }
-+        } else {
-+            let free_until = self.reg_free_until.get(&reg).copied().unwrap_or(0);
-+            let occupant_end = free_until.saturating_sub(1);
-+            if occupant_end > range.start {
-+                return false;
-+            }
-         }
-         self.active
-             .iter()
-             .filter(|a| self.assignments.get(&a.range.value_id) == Some(&reg))
--            .all(|a| !a.range.conflicts_with(range))
-+            .all(|a| {
-+                if self.segment_mode {
-+                    !a.range.conflicts_with_segments(range)
-+                } else {
-+                    !a.range.conflicts_with(range)
-+                }
-+            })
-+    }
-+
-+    /// Segment-mode helper: whether every overlap between `reg`'s occupancy
-+    /// spans and `range`'s coverage is a single shared boundary point
-+    /// (candidate die-at-birth adjacency — final legality is decided by the
-+    /// active-holder conflict test in [`Self::register_compatible`]).
-+    fn register_touches_only(&self, reg: PhysReg, range: &LiveRange) -> bool {
-+        let Some(occupied) = self.reg_occupancy.get(&reg) else {
-+            return true;
-+        };
-+        let fat = [(range.start, range.end)];
-+        let cov: &[(u32, u32)] = if range.segments.is_empty() {
-+            &fat
-+        } else {
-+            &range.segments
-+        };
-+        let (mut oi, mut ci) = (0usize, 0usize);
-+        while oi < occupied.len() && ci < cov.len() {
-+            let (os, oe) = occupied[oi]; // half-open [os, oe)
-+            let (cs, ce) = cov[ci]; // closed [cs, ce] -> span [cs, ce+1)
-+            if os < ce + 1 && cs < oe {
-+                // Overlap span [max(os,cs), min(oe, ce+1)).
-+                let lo = os.max(cs);
-+                let hi = oe.min(ce + 1);
-+                if hi - lo > 1 {
-+                    return false;
-+                }
-+            }
-+            if oe <= cs {
-+                oi += 1;
-+            } else {
-+                ci += 1;
-+            }
-+        }
-+        true
-     }
- 
-     /// Uses of `range` strictly after `pos`. Under lifetime-demotion this
-@@ -381,10 +610,17 @@ impl LinearScanAllocator {
-         if !self.is_allocatable_reg(reg) {
-             return false;
-         }
-+        let conflicts = |holder: &LiveRange| {
-+            if self.segment_mode {
-+                holder.conflicts_with_segments(incoming)
-+            } else {
-+                holder.conflicts_with(incoming)
-+            }
-+        };
-         !self.active.iter().any(|a| {
-             a.range.value_id != evicted_vid
-                 && self.assignments.get(&a.range.value_id) == Some(&reg)
--                && a.range.conflicts_with(incoming)
-+                && conflicts(&a.range)
-         })
-     }
- 
-@@ -569,7 +805,13 @@ impl LinearScanAllocator {
-             if alloc_trace_enabled() {
-                 for active in &self.active {
-                     if let Some(&areg) = self.assignments.get(&active.range.value_id) {
--                        if areg == reg && active.range.conflicts_with(&range) {
-+                        if areg == reg
-+                            && (if self.segment_mode {
-+                                active.range.conflicts_with_segments(&range)
-+                            } else {
-+                                active.range.conflicts_with(&range)
-+                            })
-+                        {
-                             eprintln!(
-                                 "[ALLOC-BUG] Assigning val{}[{}-{}] to reg={} but val{}[{}-{}] already in reg={}!",
-                                 range.value_id, range.start, range.end, reg.0,
-@@ -616,14 +858,105 @@ impl LinearScanAllocator {
-         // a range ending at u32::MAX must not wrap to 0 and look free.
-         self.occupy_register(reg, range.end.saturating_add(1));
-         let occupancy_end = range.end;
-+        // RA-05: record exact occupancy spans (half-open). Fat coverage is
-+        // the single span [start, end+1); segment coverage contributes
-+        // [s, e+1) per closed segment.
-+        let occupancy_spans: Vec<(u32, u32)> = if range.segments.is_empty() {
-+            vec![(range.start, range.end.saturating_add(1))]
-+        } else {
-+            range
-+                .segments
-+                .iter()
-+                .map(|&(s, e)| (s, e.saturating_add(1)))
-+                .collect()
-+        };
-+        if self.segment_mode {
-+            self.insert_occupancy(reg, &occupancy_spans);
-+        }
-         self.active.push(ActiveInterval {
-             range,
-             phys_reg: reg,
-             occupancy_end,
-             next_use: Some(next),
-+            occupancy_spans,
-         });
-     }
- 
-+    /// Merge half-open spans into a register's sorted occupancy union.
-+    fn insert_occupancy(&mut self, reg: PhysReg, spans: &[(u32, u32)]) {
-+        let entry = self.reg_occupancy.entry(reg).or_default();
-+        let mut merged: Vec<(u32, u32)> =
-+            Vec::with_capacity(entry.len() + spans.len());
-+        let (mut i, mut j) = (0usize, 0usize);
-+        while i < entry.len() || j < spans.len() {
-+            let next = if j == spans.len()
-+                || (i < entry.len() && entry[i] <= spans[j])
-+            {
-+                let v = entry[i];
-+                i += 1;
-+                v
-+            } else {
-+                let v = spans[j];
-+                j += 1;
-+                v
-+            };
-+            if let Some(last) = merged.last_mut() {
-+                if next.0 <= last.1 {
-+                    last.1 = last.1.max(next.1);
-+                    continue;
-+                }
-+            }
-+            merged.push(next);
-+        }
-+        *entry = merged;
-+    }
-+
-+    /// Subtract `removed` (sorted, disjoint, half-open) from a register's
-+    /// occupancy union. Only the evicted victim's post-cut coverage is
-+    /// removed — other holders keep theirs (they never properly overlap
-+    /// the victim, at most a single die-at-birth point). The boundary point
-+    /// of each removed span is *kept*: a later range born exactly at the
-+    /// cut point is still rejected by the rotation check, matching the fat
-+    /// model's cross-wave seed conservatism.
-+    fn subtract_from_occupancy(&mut self, reg: PhysReg, removed: &[(u32, u32)]) {
-+        if removed.is_empty() {
-+            return;
-+        }
-+        let Some(entry) = self.reg_occupancy.get_mut(&reg) else {
-+            return;
-+        };
-+        // Shrink each removed span to its interior (rs+1, re): keep the
-+        // boundary point rs in the union.
-+        let interiors: Vec<(u32, u32)> = removed
-+            .iter()
-+            .map(|&(rs, re)| (rs + 1, re))
-+            .filter(|&(s, e)| e > s)
-+            .collect();
-+        if interiors.is_empty() {
-+            return;
-+        }
-+        let mut out: Vec<(u32, u32)> = Vec::with_capacity(entry.len());
-+        'outer: for &(es, ee) in entry.iter() {
-+            let mut start = es;
-+            for &(rs, re) in &interiors {
-+                if re <= start || rs >= ee {
-+                    continue; // no overlap with the remaining piece
-+                }
-+                if rs > start {
-+                    out.push((start, rs));
-+                }
-+                start = start.max(re);
-+                if start >= ee {
-+                    continue 'outer;
-+                }
-+            }
-+            if start < ee {
-+                out.push((start, ee));
-+            }
-+        }
-+        *entry = out;
-+    }
-+
-     /// Evict `active[evict_idx]`, give its register to `incoming`.
-     ///
-     /// Returns false and leaves state unchanged if the victim has no
-@@ -661,6 +994,23 @@ impl LinearScanAllocator {
-         incoming.cascade = evicted_cascade.saturating_add(1);
-         let mut evicted = self.active.swap_remove(evict_idx);
-         evicted.occupancy_end = incoming.start;
-+        // RA-05: the victim keeps its pre-cut occupancy; everything from the
-+        // incoming's start onward is handed to the incoming range.
-+        if self.segment_mode {
-+            let cut = incoming.start;
-+            let full_spans = evicted.occupancy_spans.clone();
-+            evicted.occupancy_spans = full_spans
-+                .iter()
-+                .map(|&(s, e)| (s, e.min(cut.max(s))))
-+                .filter(|&(s, e)| e > s)
-+                .collect();
-+            let removed: Vec<(u32, u32)> = full_spans
-+                .iter()
-+                .map(|&(s, e)| (s.max(cut), e))
-+                .filter(|&(s, e)| e > s)
-+                .collect();
-+            self.subtract_from_occupancy(reg, &removed);
-+        }
-         self.handled.push(evicted);
-         self.commit_assignment(incoming, reg);
-         true
-@@ -688,9 +1038,17 @@ impl LinearScanAllocator {
-         self.next_spill_slot = 0;
-         self.next_reg_idx = 0;
-         self.init_registers();
-+        self.reg_occupancy.clear();
-         for (reg, until) in seed {
-             let cur = self.reg_free_until.entry(*reg).or_insert(0);
-             *cur = (*cur).max(*until);
-+            if self.segment_mode {
-+                // Seeds are fat "occupied until" facts from earlier waves;
-+                // record them as half-open [0, until) occupancy.
-+                if *until > 0 {
-+                    self.insert_occupancy(*reg, &[(0, *until)]);
-+                }
-+            }
-         }
- 
-         let mut ranges = std::mem::take(&mut self.ranges);
-@@ -712,7 +1070,18 @@ impl LinearScanAllocator {
-     /// expired or were evicted and therefore disappeared from final
-     /// `assignments`. `occupancy_end` records the eviction cut point, so legal
-     /// lifetime demotion is distinguished from a true overlapping assignment.
-+    ///
-+    /// RA-05: in segment mode the check runs on the exact half-open
-+    /// `occupancy_spans`. Two spans may share at most ONE point, and only
-+    /// when the earlier-ending side provably released the register there:
-+    /// either it was evicted (cut) at that boundary, or the point is its
-+    /// last recorded use (use-before-def with the other side's def). Any
-+    /// wider overlap is a real double-assignment.
-     fn verify_handled_history(&self) {
-+        if self.segment_mode {
-+            self.verify_handled_history_segments();
-+            return;
-+        }
-         let mut by_reg: FxHashMap<PhysReg, Vec<(u32, u32, u32)>> = FxHashMap::default();
-         for interval in self.handled.iter().chain(self.active.iter()) {
-             if interval.occupancy_end <= interval.range.start {
-@@ -748,6 +1117,71 @@ impl LinearScanAllocator {
-             }
-         }
-     }
-+
-+    /// Segment-mode history verifier (RA-05). See
-+    /// [`Self::verify_handled_history`].
-+    fn verify_handled_history_segments(&self) {
-+        // (start, end, value, cut_at_end, last_use)
-+        type Rec = (u32, u32, u32, bool, Option<u32>);
-+        let mut by_reg: FxHashMap<PhysReg, Vec<Rec>> = FxHashMap::default();
-+        for interval in self.handled.iter().chain(self.active.iter()) {
-+            let evicted = interval.occupancy_end < interval.range.end;
-+            let last_use = interval.range.uses.last().copied();
-+            if interval.occupancy_spans.is_empty() {
-+                // Defensive: a committed interval always records spans.
-+                if interval.occupancy_end <= interval.range.start {
-+                    continue;
-+                }
-+                by_reg.entry(interval.phys_reg).or_default().push((
-+                    interval.range.start,
-+                    interval.occupancy_end.saturating_add(1),
-+                    interval.range.value_id,
-+                    evicted,
-+                    last_use,
-+                ));
-+                continue;
-+            }
-+            for &(s, e) in &interval.occupancy_spans {
-+                if e <= s {
-+                    continue;
-+                }
-+                // `cut_at_end` marks spans whose end IS the eviction cut:
-+                // the holder's register reads provably stop there.
-+                let cut_at_end = evicted && e == interval.occupancy_end;
-+                by_reg.entry(interval.phys_reg).or_default().push((
-+                    s,
-+                    e,
-+                    interval.range.value_id,
-+                    cut_at_end,
-+                    last_use,
-+                ));
-+            }
-+        }
-+        for (reg, mut spans) in &mut by_reg {
-+            spans.sort_unstable();
-+            for w in spans.windows(2) {
-+                let (prev, next) = (w[0], w[1]);
-+                if prev.1 == prev.0 || next.1 == next.0 {
-+                    continue;
-+                }
-+                if next.0 >= prev.1 {
-+                    continue; // apart or touching: fine
-+                }
-+                // Overlap. Half-open spans overlap in [next.0, prev.1).
-+                let shared_len = prev.1 - next.0;
-+                if shared_len == 1 && (prev.3 || prev.4 == Some(next.0)) {
-+                    // Single shared point and the earlier side provably
-+                    // released the register there: evicted at the cut, or
-+                    // its last recorded use (use-before-def).
-+                    continue;
-+                }
-+                panic!(
-+                    "segment-scan history overlap: r{} v{}[{}, {}) vs v{}[{}, {})",
-+                    reg.0, prev.2, prev.0, prev.1, next.2, next.0, next.1
-+                );
-+            }
-+        }
-+    }
- }
- 
- /// First use at or after `pos`, or `range.end` if none.
-@@ -1076,11 +1510,148 @@ mod tests {
-             follow_value: None,
-             spill_weight: priority as f64 / live_span(start, end),
-             cascade: 0,
-+            segments: Vec::new(),
-         };
-         r.set_uses(uses);
-         r
-     }
- 
-+    /// Range with hole-aware segment coverage (closed point intervals).
-+    fn lr_seg(
-+        value_id: u32,
-+        start: u32,
-+        end: u32,
-+        uses: Vec<u32>,
-+        priority: u64,
-+        segments: Vec<(u32, u32)>,
-+    ) -> LiveRange {
-+        let mut r = lr(value_id, start, end, uses, priority);
-+        r.set_segments(segments);
-+        r
-+    }
-+
-+    #[test]
-+    fn test_segment_conflicts_hole_is_not_interference() {
-+        // v1 lives [0,10] and [40,50]; v2 lives only inside v1's hole.
-+        // Fat envelopes overlap; segment coverage must not conflict.
-+        let a = lr_seg(1, 0, 50, vec![0, 10, 40, 50], 10, vec![(0, 10), (40, 50)]);
-+        let b = lr_seg(2, 20, 30, vec![20, 30], 10, vec![(20, 30)]);
-+        assert!(!a.conflicts_with_segments(&b));
-+        assert!(!b.conflicts_with_segments(&a));
-+        // Fat envelope sanity: the old test still sees a conflict.
-+        assert!(a.conflicts_with(&b));
-+    }
-+
-+    #[test]
-+    fn test_segment_conflicts_proper_overlap_still_conflicts() {
-+        let a = lr_seg(1, 0, 50, vec![0, 10, 40, 50], 10, vec![(0, 10), (40, 50)]);
-+        let b = lr_seg(2, 5, 45, vec![5, 45], 10, vec![(5, 45)]);
-+        assert!(a.conflicts_with_segments(&b));
-+        assert!(b.conflicts_with_segments(&a));
-+    }
-+
-+    #[test]
-+    fn test_segment_conflicts_die_at_birth_point_share() {
-+        // v1's last recorded use is exactly where v2 is born: legal share.
-+        let a = lr_seg(1, 0, 10, vec![0, 10], 10, vec![(0, 10)]);
-+        let b = lr_seg(2, 10, 20, vec![10, 20], 10, vec![(10, 20)]);
-+        assert!(!a.conflicts_with_segments(&b));
-+        assert!(!b.conflicts_with_segments(&a));
-+    }
-+
-+    #[test]
-+    fn test_segment_conflicts_point_share_without_last_use_is_conflict() {
-+        // v1 is live through point 10 (its last use is earlier); v2 born at
-+        // 10 would clobber the value v1 still needs at 10.
-+        let a = lr_seg(1, 0, 10, vec![0, 5], 10, vec![(0, 10)]);
-+        let b = lr_seg(2, 10, 20, vec![10, 20], 10, vec![(10, 20)]);
-+        assert!(a.conflicts_with_segments(&b));
-+        assert!(b.conflicts_with_segments(&a));
-+    }
-+
-+    #[test]
-+    fn test_segment_conflicts_hole_boundary_revival_is_conflict() {
-+        // v1's coverage revives at 10 with a later segment; a v2 born at 10
-+        // cannot share the register because v1's value must survive the hole
-+        // *in that register* (single-home model). The dying side's last use
-+        // is not 10, so this is a conflict.
-+        let a = lr_seg(1, 0, 50, vec![0, 5, 40], 10, vec![(0, 10), (40, 50)]);
-+        let b = lr_seg(2, 10, 30, vec![10, 30], 10, vec![(10, 30)]);
-+        assert!(a.conflicts_with_segments(&b));
-+        assert!(b.conflicts_with_segments(&a));
-+    }
-+
-+    #[test]
-+    fn test_segment_conflicts_fat_fallback_is_identical() {
-+        // Mixed fat/segment pair: the fat side is treated as its envelope.
-+        let fat = lr(1, 0, 50, vec![0, 50], 10);
-+        let seg = lr_seg(2, 60, 70, vec![60, 70], 10, vec![(60, 70)]);
-+        assert!(!fat.conflicts_with_segments(&seg));
-+        assert!(!seg.conflicts_with_segments(&fat));
-+        let seg_overlap = lr_seg(2, 40, 70, vec![40, 70], 10, vec![(40, 70)]);
-+        assert!(fat.conflicts_with_segments(&seg_overlap));
-+        assert!(seg_overlap.conflicts_with_segments(&fat));
-+    }
-+
-+    #[test]
-+    fn test_segment_scan_shares_register_through_hole() {
-+        // Two ranges whose fat envelopes overlap but whose segments are
-+        // disjoint must share one register in segment mode (one-register
-+        // pool forces the sharing decision).
-+        let a = lr_seg(1, 0, 50, vec![0, 10, 40, 50], 10, vec![(0, 10), (40, 50)]);
-+        let b = lr_seg(2, 20, 30, vec![20, 30], 5, vec![(20, 30)]);
-+        let mut alloc = LinearScanAllocator::new(vec![a, b], vec![PhysReg(1)]);
-+        assert!(alloc.segment_mode);
-+        alloc.run();
-+        assert_eq!(alloc.assignments.get(&1), Some(&PhysReg(1)));
-+        assert_eq!(alloc.assignments.get(&2), Some(&PhysReg(1)));
-+    }
-+
-+    #[test]
-+    fn test_segment_scan_rejects_register_on_real_overlap() {
-+        let a = lr_seg(1, 0, 50, vec![0, 10, 40, 50], 10, vec![(0, 10), (40, 50)]);
-+        let b = lr_seg(2, 5, 45, vec![5, 45], 100, vec![(5, 45)]);
-+        let mut alloc = LinearScanAllocator::new(vec![a, b], vec![PhysReg(1)]);
-+        assert!(alloc.segment_mode);
-+        alloc.run();
-+        // Real overlap on a one-register pool: the lower-priority range is
-+        // demoted (eviction guards require the victim's next use strictly
-+        // after the incoming's end, so here the incoming just spills).
-+        assert!(alloc.assignments.len() <= 1);
-+    }
-+
-+    #[test]
-+    fn test_segment_scan_unsegmented_worklist_is_fat_mode() {
-+        let a = lr(1, 0, 50, vec![0, 50], 10);
-+        let b = lr(2, 20, 30, vec![20, 30], 5);
-+        let mut alloc = LinearScanAllocator::new(vec![a, b], vec![PhysReg(1)]);
-+        assert!(!alloc.segment_mode);
-+        alloc.run();
-+        // Fat envelopes overlap: only one value can hold the register.
-+        assert!(alloc.assignments.len() <= 1);
-+    }
-+
-+    #[test]
-+    fn test_segment_scan_verification_accepts_legal_sharing() {
-+        // Hole sharing (rotation) + die-at-birth point share (hint path) must
-+        // both pass the segment history verifier.
-+        let a = lr_seg(1, 0, 10, vec![0, 10], 10, vec![(0, 10)]);
-+        // b is born exactly at a's last use: legal point share, reachable
-+        // only through the hint path (rotation never applies die-at-birth).
-+        let mut b = lr_seg(2, 10, 20, vec![10, 20], 10, vec![(10, 20)]);
-+        b.reg_hint = Some(PhysReg(1));
-+        // c lives in a's second hole.
-+        let c = lr_seg(3, 30, 40, vec![30, 40], 10, vec![(30, 40)]);
-+        let mut alloc = LinearScanAllocator::new(vec![a, b, c], vec![PhysReg(1)]);
-+        assert!(alloc.segment_mode);
-+        alloc.run();
-+        // The verifier runs under CCC_VERIFY_REGALLOC; call it explicitly.
-+        alloc.verify_handled_history();
-+        assert_eq!(alloc.assignments.get(&1), Some(&PhysReg(1)));
-+        assert_eq!(alloc.assignments.get(&2), Some(&PhysReg(1)));
-+        assert_eq!(alloc.assignments.get(&3), Some(&PhysReg(1)));
-+    }
-+
-     #[test]
-     fn test_live_range_from_interval() {
-         let interval = LiveInterval {
-@@ -1267,12 +1838,16 @@ mod tests {
-             range: lr(1, 0, 100, vec![0, 15, 100], 1),
-             phys_reg: PhysReg(0),
-             occupancy_end: 100,
-+            occupancy_spans: vec![(0, 101)],
-+
-             next_use: None,
-         });
-         a.active.push(ActiveInterval {
-             range: lr(2, 0, 100, vec![0, 80, 100], 2),
-             phys_reg: PhysReg(1),
-             occupancy_end: 100,
-+            occupancy_spans: vec![(0, 101)],
-+
-             next_use: None,
-         });
-         let incoming = lr(3, 10, 50, vec![10, 50], 100);
-@@ -1307,6 +1882,8 @@ mod tests {
-             range: lr(1, 0, 50, vec![0, 15], 1),
-             phys_reg: PhysReg(0),
-             occupancy_end: 50,
-+            occupancy_spans: vec![(0, 51)],
-+
-             next_use: None,
-         });
-         let incoming = lr(3, 15, 100, vec![15, 40, 100], 50);
-@@ -1332,6 +1909,8 @@ mod tests {
-             range: victim,
-             phys_reg: PhysReg(0),
-             occupancy_end: 50,
-+            occupancy_spans: vec![(0, 51)],
-+
-             next_use: None,
-         });
-         let incoming = lr(3, 15, 100, vec![15, 40, 100], 50);
-diff --git a/src/backend/mod.rs b/src/backend/mod.rs
-index b74ec07..6e9317e 100644
---- a/src/backend/mod.rs
-+++ b/src/backend/mod.rs
-@@ -143,6 +143,13 @@ pub(crate) struct CodegenOptions {
-     /// -ffp-contract=off silently loses its single-rounding guarantee in
-     /// whichever layer was forgotten.
-     pub(crate) fp_contract_fast: bool,
-+    /// Whether the x86 target has FMA3 (`-mfma` or an enabling `-march` such
-+    /// as x86-64-v3). Scalar FMA fusion (`vfmadd231s{s,d}`) is contraction
-+    /// *and* an ISA feature: GCC only emits it when both are present, and
-+    /// emitting FMA3 on a baseline (SSE2) target is SIGILL on pre-Haswell
-+    /// hardware. AArch64 needs no such gate (`fmadd` is baseline ISA there);
-+    /// i686/RISC-V never emit fused FP mul-add.
-+    pub(crate) fma: bool,
-     /// Whether to omit the frame pointer (-fomit-frame-pointer).
-     /// When true, functions do not set up EBP as a frame pointer, freeing it
-     /// as a general register and saving prologue/epilogue instructions.
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index 2561ea7..c35fe0b 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -311,6 +311,57 @@ fn insert_segment_union(into: &mut Vec<(u32, u32)>, added: &[(u32, u32)]) {
-     *into = all;
- }
- 
-+/// RA-05: attach hole-aware live coverage to scan ranges so the linear scan's
-+/// interference test can see through liveness holes (values on mutually
-+/// exclusive diamond/switch arms — the xmltok/inflate 12×/15× stack-memory
-+/// pathology). Coverage is per coalesce-group OWNER (union of the leader's
-+/// and every member's segments) exactly like the Phase 2f residual filler:
-+/// `propagate_coalesce_members` later hands the leader's register to every
-+/// member, so the scan must reason about the whole web's coverage.
-+///
-+/// Fail-closed: a value keeps fat-envelope semantics when it has no segment
-+/// data or its segments do not lie inside the scan's fat envelope (merged
-+/// envelopes are the only case where the envelope exceeds the raw interval).
-+fn attach_scan_segments(
-+    ranges: &mut [crate::backend::live_range::LiveRange],
-+    liveness: &LivenessResult,
-+    coalesce_member_of: &FxHashMap<u32, u32>,
-+) {
-+    if ranges.is_empty() {
-+        return;
-+    }
-+    let owner_of = |v: u32| coalesce_member_of.get(&v).copied().unwrap_or(v);
-+    let mut owned: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
-+    for seg in &liveness.segments {
-+        let owner = owner_of(seg.value_id);
-+        owned.entry(owner).or_default().push((seg.start, seg.end));
-+    }
-+    if owned.is_empty() {
-+        return;
-+    }
-+    for pieces in owned.values_mut() {
-+        pieces.sort_unstable();
-+        let source = std::mem::take(pieces);
-+        insert_segment_union(pieces, &source);
-+    }
-+    for range in ranges.iter_mut() {
-+        let Some(segs) = owned.get(&range.value_id) else {
-+            continue;
-+        };
-+        if segs.is_empty() {
-+            continue;
-+        }
-+        // The union must lie inside the range's fat envelope; otherwise the
-+        // envelope came from a different construction (defensive) and the
-+        // range keeps conservative fat semantics.
-+        let inside = segs.first().is_some_and(|&(s, _)| s >= range.start)
-+            && segs.last().is_some_and(|&(_, e)| e <= range.end);
-+        if inside {
-+            range.set_segments(segs.clone());
-+        }
-+    }
-+}
-+
- /// Live *across* a clobber: defined before it, used after it.
- /// Born at a call (retval) or dying at a call (arg) may use caller-saved.
- #[inline]
-@@ -1176,6 +1227,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-             &config.folded_index_uses,
-             &safe_folded_index_homes,
-         );
-+        // RA-05: hole-aware coverage for the scan's interference tests.
-+        // Values without segment data keep their fat semantics.
-+        attach_scan_segments(&mut ranges, &liveness, &coalesce_member_of);
-         ranges
-     };
- 
-@@ -1757,12 +1811,94 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-         }
-     }
- 
--    // Phase 2f (i686): fill holes in ALREADY-SAVED callee registers using the
--    // CFG-aware liveness segments. The primary scan deliberately retains one
--    // fat [def,last_use] interval per value, which is simple but makes values
--    // on mutually-exclusive diamond/switch arms interfere. Liveness already
-+    // AArch64-only: steal a callee-saved from a colder holder for a missed IV.
-+    // x86 stays out — same eviction already lost gzip inside the scan.
-+    if !env_on("CCC_NO_LOOP_PIN") && arm_fp_pool && !all_phi_pairs.is_empty() {
-+        let k: usize = std::env::var("CCC_LOOP_PIN")
-+            .ok()
-+            .and_then(|s| s.parse().ok())
-+            .unwrap_or(2);
-+        let phi_pair_values: FxHashSet<u32> = phi_coalesce
-+            .iter()
-+            .flat_map(|c| [c.phi_dest, c.backedge_src])
-+            .collect();
-+        let mut candidates: Vec<(u32, u64)> = all_phi_pairs
-+            .iter()
-+            .map(|c| c.phi_dest)
-+            .filter(|v| eligible.contains(v))
-+            .filter(|v| iv_map.get(v).is_some_and(|&(s, e)| e > s))
-+            .map(|v| (v, use_count.get(&v).copied().unwrap_or(0)))
-+            .filter(|&(_, count)| count >= 10)
-+            .collect();
-+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-+        candidates.dedup_by_key(|&mut (v, _)| v);
-+
-+        let overlaps_vid = |a: u32, b: u32| -> bool {
-+            match (iv_map.get(&a), iv_map.get(&b)) {
-+                (Some(&ia), Some(&ib)) => intervals_overlap(ia, ib),
-+                _ => false,
-+            }
-+        };
-+        let mut holders_by_reg: FxHashMap<u8, Vec<u32>> = FxHashMap::default();
-+        for (&v, &r) in &assignments {
-+            holders_by_reg.entry(r.0).or_default().push(v);
-+        }
-+
-+        let mut steals = 0;
-+        for &(vid, hot_count) in &candidates {
-+            if steals >= k || assignments.contains_key(&vid) {
-+                continue;
-+            }
-+            let mut best: Option<(u8, Vec<u32>, u64)> = None;
-+            for (&reg_id, holders) in &holders_by_reg {
-+                if !config.available_regs.iter().any(|r| r.0 == reg_id) {
-+                    continue;
-+                }
-+                if holders.iter().any(|h| phi_pair_values.contains(h)) {
-+                    continue;
-+                }
-+                let evict: Vec<u32> = holders
-+                    .iter()
-+                    .copied()
-+                    .filter(|&h| overlaps_vid(h, vid))
-+                    .collect();
-+                let cost: u64 = evict
-+                    .iter()
-+                    .map(|h| use_count.get(h).copied().unwrap_or(0))
-+                    .sum();
-+                if cost >= hot_count {
-+                    continue;
-+                }
-+                if best.as_ref().is_none_or(|&(_, _, c)| cost < c) {
-+                    best = Some((reg_id, evict, cost));
-+                }
-+            }
-+            if let Some((reg_id, evict, _)) = best {
-+                for &v in &evict {
-+                    evict_group(
-+                        &mut assignments,
-+                        &mut holders_by_reg,
-+                        v,
-+                        &coalesce_member_of,
-+                        &coalesce_groups,
-+                    );
-+                }
-+                assignments.insert(vid, PhysReg(reg_id));
-+                holders_by_reg.entry(reg_id).or_default().push(vid);
-+                steals += 1;
-+            }
-+        }
-+        propagate_coalesce_members(&mut assignments, &coalesce_member_of);
-+    }
-+    // Phase 2f (all targets): fill holes in ALREADY-SAVED callee registers
-+    // using the CFG-aware liveness segments. The primary scan deliberately
-+    // retains one fat [def,last_use] interval per value, which is simple but
-+    // makes values on mutually-exclusive diamond/switch arms interfere
-+    // (the xmltok/inflate 12×/15× stack-memory pathology). Liveness already
-     // computes exact conservative segments for call classification; use those
--    // segments here as a no-eviction residual coloring step.
-+    // segments here as a no-eviction residual coloring step. This is RA-05
-+    // phase A: `segments` become the primary interference representation for
-+    // this allocation decision (not just call classification).
-     //
-     // This phase cannot add a callee-save push/pop: its pool is restricted to
-     // registers already present in used_regs_set. It cannot displace an
-@@ -1770,14 +1906,15 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-     // when none of its segments intersects current occupancy. Thus the
-     // treatment is monotonic in register capacity and fail-closed when a value
-     // lacks segment data (its fat interval is used as fallback).
--    if !env_on("CCC_NO_SEGMENT_FILL")
--        && is_32bit
--        && config
--            .caller_saved_regs
--            .iter()
--            .any(|r| matches!(r.0, 4 | 5))
--        && !used_regs_set.is_empty()
--    {
-+    //
-+    // Ordering: this runs AFTER the AArch64 loop-pin steal. The steal's
-+    // holder/evict logic reasons about fat intervals against single-holder
-+    // registers; a segment-shared co-holder introduced here must not be
-+    // visible to it (the steal would only evict one of the two holders and
-+    // could hand the register to a value that fat-overlaps the survivor).
-+    // i686 validated this fill first (boot C text -1,573 B, stack refs
-+    // -13.1%); x86-64/AArch64/RISC-V get the same treatment now.
-+    if !env_on("CCC_NO_SEGMENT_FILL") && !used_regs_set.is_empty() {
-         let owner_of = |v: u32| coalesce_member_of.get(&v).copied().unwrap_or(v);
- 
-         let mut owned_segments: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
-@@ -1910,85 +2047,6 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-         }
-     }
- 
--    // AArch64-only: steal a callee-saved from a colder holder for a missed IV.
--    // x86 stays out — same eviction already lost gzip inside the scan.
--    if !env_on("CCC_NO_LOOP_PIN") && arm_fp_pool && !all_phi_pairs.is_empty() {
--        let k: usize = std::env::var("CCC_LOOP_PIN")
--            .ok()
--            .and_then(|s| s.parse().ok())
--            .unwrap_or(2);
--        let phi_pair_values: FxHashSet<u32> = phi_coalesce
--            .iter()
--            .flat_map(|c| [c.phi_dest, c.backedge_src])
--            .collect();
--        let mut candidates: Vec<(u32, u64)> = all_phi_pairs
--            .iter()
--            .map(|c| c.phi_dest)
--            .filter(|v| eligible.contains(v))
--            .filter(|v| iv_map.get(v).is_some_and(|&(s, e)| e > s))
--            .map(|v| (v, use_count.get(&v).copied().unwrap_or(0)))
--            .filter(|&(_, count)| count >= 10)
--            .collect();
--        candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
--        candidates.dedup_by_key(|&mut (v, _)| v);
+ **Aggregate: geometric mean ~0.72 (26 pairs, -O3 -march=x86-64-v3, 3-round
+ medians, 2026-08-24).** Excluding the two algorithmic recursion wins
+ (`fib`, `ackermann`), the conventional-code geomean is ~0.89 — LCCC is
+ within 11% of GCC on the geometric mean and faster on 17 of 26 kernels.
+-Remaining structural gaps (root-caused, tracked in BACKLOG): loop_patterns
+-conditional-sum vectorization needs the masked-add transform; nbody needs
++Remaining structural gaps (root-caused, tracked in BACKLOG): nbody needs
+ multi-store scatter (OP-05b); libm_round needs XMM-homed FP call results
+-(IS-29a).
 -
--        let overlaps_vid = |a: u32, b: u32| -> bool {
--            match (iv_map.get(&a), iv_map.get(&b)) {
--                (Some(&ia), Some(&ib)) => intervals_overlap(ia, ib),
--                _ => false,
--            }
--        };
--        let mut holders_by_reg: FxHashMap<u8, Vec<u32>> = FxHashMap::default();
--        for (&v, &r) in &assignments {
--            holders_by_reg.entry(r.0).or_default().push(v);
--        }
 -
--        let mut steals = 0;
--        for &(vid, hot_count) in &candidates {
--            if steals >= k || assignments.contains_key(&vid) {
--                continue;
--            }
--            let mut best: Option<(u8, Vec<u32>, u64)> = None;
--            for (&reg_id, holders) in &holders_by_reg {
--                if !config.available_regs.iter().any(|r| r.0 == reg_id) {
--                    continue;
--                }
--                if holders.iter().any(|h| phi_pair_values.contains(h)) {
--                    continue;
--                }
--                let evict: Vec<u32> = holders
--                    .iter()
--                    .copied()
--                    .filter(|&h| overlaps_vid(h, vid))
--                    .collect();
--                let cost: u64 = evict
--                    .iter()
--                    .map(|h| use_count.get(h).copied().unwrap_or(0))
--                    .sum();
--                if cost >= hot_count {
--                    continue;
--                }
--                if best.as_ref().is_none_or(|&(_, _, c)| cost < c) {
--                    best = Some((reg_id, evict, cost));
--                }
--            }
--            if let Some((reg_id, evict, _)) = best {
--                for &v in &evict {
--                    evict_group(
--                        &mut assignments,
--                        &mut holders_by_reg,
--                        v,
--                        &coalesce_member_of,
--                        &coalesce_groups,
--                    );
--                }
--                assignments.insert(vid, PhysReg(reg_id));
--                holders_by_reg.entry(reg_id).or_default().push(vid);
--                steals += 1;
--            }
--        }
--        propagate_coalesce_members(&mut assignments, &coalesce_member_of);
--    }
++(IS-29a); loop_patterns' residual gap is the LCG init loop + integer dot
++product (widening multiply) + find_max (AVX2 max reduction).
++
++
++
++### v9 highlights (session 80)
++
++- **Conditional-sum vectorization (masked widening reductions)**:
++  `long s = 0; for (...) if (a[i] > K) s += a[i];` now vectorizes as
++  GCC's canonical form — vpcmpgtd lane mask, sign-extended through the
++  widening pipeline, vpand zero-mask, paddq — via the new
++  VecWidenMaskedAddI32x4ToI64x2 composite intrinsic and x86 late
++  vectorization (post-if_convert). The conditional-sum kernel: 62ms
++  scalar → 38ms cmov → **25ms masked** (2.5×; gcc 21ms).
++- **AVX-SSE transition penalty fix in widening codegen**: the widening
++  reductions mixed legacy SSE with VEX instructions — after any
++  YMM-writing loop every legacy op re-triggered the transition penalty
++  (measured 9× on init+map+sum sequences: 318ms → 35ms). All
++  widening-loop instructions are now VEX three-operand forms.
++- **loop_patterns: 381ms → 99ms (3.9×)**; ratio vs GCC 0.11 → 0.39.
  
-     if env_on("CCC_DEBUG_RA") {
-         let mut v: Vec<(u32, u8)> = assignments.iter().map(|(k, r)| (*k, r.0)).collect();
-@@ -2122,8 +2180,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-             .collect();
+ ### v8 highlights (sessions 73–78, this tree)
  
-         if !f64_intervals.is_empty() {
--            let f64_ranges =
-+            let mut f64_ranges =
-                 live_range::build_live_ranges(&f64_intervals, &liveness.block_loop_depth, func);
-+            // RA-05: hole-aware coverage for the XMM scan as well — FP phi
-+            // webs spanning mutually exclusive arms get the same treatment
-+            // as the GPR scan.
-+            attach_scan_segments(&mut f64_ranges, &liveness, &coalesce_member_of);
-             let mut xmm_allocator = LinearScanAllocator::new(f64_ranges, config.xmm_regs.clone());
-             xmm_allocator.run();
-             for (vid, reg) in xmm_allocator.assignments {
-diff --git a/src/backend/x86/codegen/calls.rs b/src/backend/x86/codegen/calls.rs
-index 2ca1f4f..dccb0c0 100644
---- a/src/backend/x86/codegen/calls.rs
-+++ b/src/backend/x86/codegen/calls.rs
-@@ -847,10 +847,12 @@ impl X86Codegen {
-                     (EightbyteClass::Integer, EightbyteClass::Sse) => {
-                         if let Some(slot) = self.state.get_slot(dest.0) {
-                             self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
--                            self.state.emit("    movq %xmm0, %rdx");
-+                            // SSE eightbyte: store %xmm0 directly (movq
-+                            // xmm→m64 is baseline SSE2); the old %rdx relay
-+                            // was an FP-domain round-trip for no reason.
-                             self.state
-                                 .out
--                                .emit_instr_reg_rbp("    movq", "rdx", slot.0 + 8);
-+                                .emit_instr_reg_rbp("    movq", "xmm0", slot.0 + 8);
-                         }
-                         self.state.reg_cache.invalidate_all();
-                         self.flush_pending_vec_store_impl();
-@@ -858,8 +860,11 @@ impl X86Codegen {
-                     }
-                     (EightbyteClass::Sse, EightbyteClass::Integer) => {
-                         if let Some(slot) = self.state.get_slot(dest.0) {
--                            self.state.emit("    movq %xmm0, %rdx");
--                            self.state.out.emit_instr_reg_rbp("    movq", "rdx", slot.0);
-+                            // Direct xmm0→slot store (baseline SSE2 movq);
-+                            // no GPR relay.
-+                            self.state
-+                                .out
-+                                .emit_instr_reg_rbp("    movq", "xmm0", slot.0);
-                             self.state
-                                 .out
-                                 .emit_instr_reg_rbp("    movq", "rax", slot.0 + 8);
-@@ -870,12 +875,15 @@ impl X86Codegen {
-                     }
-                     (EightbyteClass::Sse, EightbyteClass::Sse) => {
-                         if let Some(slot) = self.state.get_slot(dest.0) {
--                            self.state.emit("    movq %xmm0, %rax");
--                            self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
--                            self.state.emit("    movq %xmm1, %rax");
-+                            // Both halves are SSE: two direct xmm stores,
-+                            // replacing the double movq→rax relay (2 extra
-+                            // insns and two false GPR dependencies).
-                             self.state
-                                 .out
--                                .emit_instr_reg_rbp("    movq", "rax", slot.0 + 8);
-+                                .emit_instr_reg_rbp("    movq", "xmm0", slot.0);
-+                            self.state
-+                                .out
-+                                .emit_instr_reg_rbp("    movq", "xmm1", slot.0 + 8);
-                         }
-                         self.state.reg_cache.invalidate_all();
-                         self.flush_pending_vec_store_impl();
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index b831f90..7612c2b 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -385,6 +385,9 @@ pub struct X86Codegen {
-     /// FP contraction contract (-ffp-contract=fast / -ffast-math): gates the
-     /// scalar mul+add -> vfmadd231 fusion.
-     pub(super) fp_contract_fast: bool,
-+    /// FMA3 ISA availability (-mfma / -march=x86-64-v3+). vfmadd231s{s,d} is
-+    /// not in the baseline SSE2 ISA: contraction alone must not emit it.
-+    pub(super) fma_enabled: bool,
-     pub(super) no_sse: bool,
-     /// Per-function vector-constant pool: (value, byte_width) -> label.
-     /// _mm256_set1_* with a constant argument lowers to a single
-@@ -650,6 +653,7 @@ impl X86Codegen {
-             skip_rax_setup: false,
-             func_has_calls: false,
-             fp_contract_fast: false,
-+            fma_enabled: false,
-             no_sse: false,
-             vec_const_labels: crate::common::fx_hash::FxHashMap::default(),
-             vec_const_counter: 0,
-@@ -749,6 +753,7 @@ impl X86Codegen {
-         self.avx512_enabled = opts.avx512;
-         self.state.emit_cfi = opts.emit_cfi;
-         self.fp_contract_fast = opts.fp_contract_fast;
-+        self.fma_enabled = opts.fma;
-         self.optimize_for_size = opts.optimize_for_size;
-     }
- 
-@@ -3499,14 +3504,16 @@ impl ArchCodegen for X86Codegen {
-         // FP contraction changes results (single rounding). Only fuse under
-         // the explicit contract; integer mul+add fusion is unaffected (the
-         // generation-side detector calls this only for float types).
--        self.fp_contract_fast
-+        // FMA3 is additionally gated on the target ISA: vfmadd231s{s,d} is
-+        // illegal on baseline (SSE2) x86-64, matching GCC, which requires
-+        // `-mfma` (or an enabling -march) even under -ffp-contract=fast.
-+        self.fp_contract_fast && self.fma_enabled
-     }
- 
-     fn supports_fused_float_mul_sub(&self) -> bool {
--        // vfmsub231/vfnmadd231 need the same contraction contract as
--        // vfmadd231. Baseline codegen already emits VEX FMA3 unconditionally
--        // for fused mul-add, so no separate ISA gate is needed here.
--        self.fp_contract_fast
-+        // vfmsub231/vfnmadd231 need the same contraction contract *and* the
-+        // same FMA3 ISA gate as vfmadd231.
-+        self.fp_contract_fast && self.fma_enabled
-     }
- 
-     fn emit_fused_mul_sub(
+diff --git a/docs/history/2026-08-25-session80-v8-masked-condsums.md b/docs/history/2026-08-25-session80-v8-masked-condsums.md
+new file mode 100644
+index 0000000..40d7c50
+--- /dev/null
++++ b/docs/history/2026-08-25-session80-v8-masked-condsums.md
+@@ -0,0 +1,77 @@
++# Session 80 (2026-08-25) — v8: masked conditional-sum vectorization + AVX-SSE transition fix
++
++**Base:** `ms178/lccc` `main` at `4e514ea` (PRs #232–#236: torture
++hardening, setjmp/longjmp builtins, narrow load/store sizing,
++allocator-native liveness segments).
++
++## The two coupled fixes
++
++### 1. Masked widening reductions (conditional sums) — the v7 item completed
++
++`long s = 0; for (...) if (a[i] > K) s += a[i];` — the most common
++conditional-reduction idiom — previously stopped at the cmov form
++(session 78's if_convert work). The full vectorized form (GCC's canonical
++vpcmpgtd+blend-mask) is now implemented:
++
++- **`VecWidenMaskedAddI32x4ToI64x2`** composite intrinsic:
++  args = [acc, base, byte_offset, guard_rhs]. The lowering builds the
++  per-lane I32 compare mask, sign-extends it through the SAME
++  vpunpckhqdq/vpmovsxdq lane geometry as the values (all-ones/all-zeros
++  I64 masks), vpand zero-masks the widened values, and paddq folds.
++- **Analyzer**: the accumulator-update search detects the Select guard;
++  the added-value chain validates the guard is `loaded > rhs` (signed,
++  lhs = the loaded element — anything else REJECTS the loop, because the
++  unguarded vector form would silently drop the guard and miscompile).
++  ReductionPattern carries guard_cond + guard_rhs.
++- **Transform**: splices the masked intrinsic replacing BOTH the inner
++  Add and the Select; the scalar remainder re-applies the guard
++  (Cmp + Select on the uncast element, matching C semantics).
++- **Soundness**: the reduction rules and the stencil body scan tolerate
++  the Select (the guarded update's Select reads the accumulator by
++  design).
++- Runs through x86 **late vectorization** (post-if_convert), which was
++  already wired in v6.
++
++The v7 prototype's miscompile (unguarded widening add emitting the
++unconditional sum) is structurally impossible now: the analyzer's
++validation is the gate, and it fails closed.
++
++### 2. AVX-SSE transition penalty in the widening codegen
++
++The widening lowerings (both unguarded and masked) mixed LEGACY SSE
++(`paddq`, `movdqu`, `movdqa`) with VEX instructions inside the vector
++loop. After any YMM-writing loop (a vectorized map, a packed
++reduction...), every legacy SSE instruction re-triggers the AVX-SSE
++transition penalty — measured **318ms vs 35ms** on the
++init+map+widening-sum sequence over 10M elements (9×). All
++widening-loop instructions are now VEX three-operand forms
++(vpaddq/vmovdqu/vmovdqa).
++
++## Results (-O3 -march=x86-64-v3)
++
++| Kernel | before | after | gcc |
++|---|---|---|---|
++| conditional sum (10M) | 62ms scalar / 38ms cmov | **25ms** | 21ms |
++| loop_patterns (full) | 381ms | **99ms** | 38ms |
++| init+map+sum (10M) | 318ms | **35ms** | 30ms |
++
++Benchmark ratios vs GCC: loop_patterns 0.11 → **0.39**;
++expat_xml_scan 0.81 → **0.62**; sqlite_varint 0.72 → **0.63**.
++
++## Remaining ranked gaps (v9+)
++
++1. nbody 0.31 — multi-store scatter (OP-05b) + marching-pointer homes (RA-01b)
++2. libm_round 0.47 — FP call-result accumulator (IS-29a)
++3. loop_patterns residual — LCG init recurrence vectorization, integer
++   dot product (widening multiply), find_max AVX2 form
++4. mandelbrot 0.75, spectral 0.76, fannkuch 0.78 — OP-05b class
++
++## Validation
++
++- 1177/1177 unit tests.
++- 496-file regression corpus: 481 pass, 3 environmental i686 SIGSYS.
++- Conditional sums exact vs GCC across n=1..1000 with
++  const/variable/negative guard thresholds (new
++  vectorize_masked_widen_sum.c regression).
++- Mixed-vector sequences (YMM map → widening sum) verified.
++- loop_patterns full-program output byte-identical.
 diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
-index 85f1426..19d6704 100644
+index 61739ac..f457485 100644
 --- a/src/backend/x86/codegen/intrinsics.rs
 +++ b/src/backend/x86/codegen/intrinsics.rs
-@@ -2872,6 +2872,82 @@ impl X86Codegen {
-                     self.emit_sse_binary_128(d, args, "mulpd");
-                 }
-             }
-+            IntrinsicOp::VecSubF64x4 => {
-+                if let Some(d) = dest {
-+                    // Non-commutative: preserve operand order.
-+                    self.emit_avx_binary_256(d, args, "vsubpd", false);
-+                }
-+            }
-+            IntrinsicOp::VecSubF64x2 => {
-+                if let Some(d) = dest {
-+                    self.emit_sse_binary_128(d, args, "subpd");
-+                }
-+            }
-+            IntrinsicOp::VecSubF32x8 => {
-+                if let Some(d) = dest {
-+                    self.emit_avx_binary_256(d, args, "vsubps", false);
-+                }
-+            }
-+            IntrinsicOp::VecSubF32x4 => {
-+                if let Some(d) = dest {
-+                    self.emit_sse_binary_128(d, args, "subps");
-+                }
-+            }
-+            IntrinsicOp::VecDivF64x4 => {
-+                if let Some(d) = dest {
-+                    self.emit_avx_binary_256(d, args, "vdivpd", false);
-+                }
-+            }
-+            IntrinsicOp::VecDivF64x2 => {
-+                if let Some(d) = dest {
-+                    self.emit_sse_binary_128(d, args, "divpd");
-+                }
-+            }
-+            IntrinsicOp::VecDivF32x8 => {
-+                if let Some(d) = dest {
-+                    self.emit_avx_binary_256(d, args, "vdivps", false);
-+                }
-+            }
-+            IntrinsicOp::VecDivF32x4 => {
-+                if let Some(d) = dest {
-+                    self.emit_sse_binary_128(d, args, "divps");
-+                }
-+            }
-+            IntrinsicOp::VecSqrtF64x4 | IntrinsicOp::VecSqrtF32x8 => {
-+                // Unary AVX: stream the operand through %ymm0.
-+                if let Some(d) = dest {
-+                    self.flush_pending_vec_store_impl();
-+                    self.state.invalidate_vec_peephole();
-+                    self.avx_load_arg_to(&args[0], "ymm0");
-+                    let inst = if matches!(op, IntrinsicOp::VecSqrtF64x4) {
-+                        "vsqrtpd"
-+                    } else {
-+                        "vsqrtps"
-+                    };
-+                    self.state
-+                        .emit_fmt(format_args!("    {} %ymm0, %ymm0", inst));
-+                    self.state.vec_last_store_val = Some(d.0);
-+                    self.state.vec_last_store_reg = true;
-+                    self.state.vec_last_store_reg_name = Some("ymm0");
-+                    self.avx_store_dest(d);
-+                }
-+            }
-+            IntrinsicOp::VecSqrtF64x2 | IntrinsicOp::VecSqrtF32x4 => {
-+                // Unary SSE2: stream the operand through %xmm0.
-+                if let Some(d) = dest {
-+                    self.flush_pending_vec_store_impl();
-+                    self.state.invalidate_vec_peephole();
-+                    self.sse_load_arg(&args[0], "xmm0");
-+                    let inst = if matches!(op, IntrinsicOp::VecSqrtF64x2) {
-+                        "sqrtpd"
-+                    } else {
-+                        "sqrtps"
-+                    };
-+                    self.state
-+                        .emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
-+                    self.sse_store_dest(d, "xmm0");
-+                }
-+            }
-             IntrinsicOp::VecFmaF64x4 => {
-                 if let Some(d) = dest {
-                     self.emit_avx_reduction_fma(d, args, "vfmadd231pd");
-@@ -3556,6 +3632,16 @@ impl X86Codegen {
-     /// Emit a contract-legal affine map as `input * scale + bias`.  Broadcast
-     /// scale/bias values normally have assigned YMM families, while the packed
-     /// input streams through ymm0 from the preceding load.
-+    ///
-+    /// Scratch discipline: %ymm0/%ymm1 are RESERVED (never RA-assigned — the
-+    /// XMM pool starts at xmm2), so they are the only safe scratch registers.
-+    /// %ymm2..%ymm15 are assigned homes whose contents stay live across loop
-+    /// iterations: using one as scratch clobbers a live vector and every
-+    /// following iteration reads the wrong broadcast (the map-tree kernels
-+    /// with non-broadcast FMA operands exposed exactly this). The fallback
-+    /// therefore uses each operand's assigned home directly, a slot-homed
-+    /// operand as the memory source, and copies at most ONE operand through
-+    /// %ymm1.
-     fn emit_avx_map_fma(&mut self, dest: &Value, args: &[Operand], mnemonic: &str) {
-         assert!(args.len() == 3, "{} expects input, scale, bias", mnemonic);
-         if let (Operand::Value(input), Operand::Value(scale), Operand::Value(bias)) =
-@@ -3590,13 +3676,87 @@ impl X86Codegen {
-             }
-         }
- 
-+        // Fallback: the input streams through %ymm0. Every operand source is
-+        // chosen so that no RA-assigned home (%ymm2..%ymm15) is ever written:
-+        // homed operands are read directly as VEX sources, a slot-homed
-+        // operand is read as the memory source (legal in the multiplier
-+        // position), and at most ONE operand is copied through the reserved
-+        // %ymm1.
-         self.avx_load_arg(&args[0]);
--        self.avx_load_arg_to(&args[2], "ymm1");
--        self.avx_load_arg_to(&args[1], "ymm2");
--        self.state
--            .emit_fmt(format_args!("    {} %ymm2, %ymm1, %ymm0", mnemonic));
--        self.state.vec_last_store_reg = false;
--        self.avx_store_dest(dest);
-+
-+        let operand_reg_source = |this: &Self, arg: &Operand| -> Option<String> {
-+            let Operand::Value(v) = arg else {
-+                return None;
-+            };
-+            if let Some(&reg) = this.reg_assignments.get(&v.0) {
-+                if is_xmm_reg(reg) {
-+                    return Some(format!("%{}", phys_reg_name_256(reg)));
-+                }
-+                return None;
-+            }
-+            // A value provably sitting in a non-reserved YMM register within
-+            // this block can be read directly.
-+            if let Some(&held) = this.state.vec_live_regs.get(&v.0) {
-+                if held != "ymm0" && held != "ymm1" {
-+                    return Some(format!("%{}", held));
-+                }
-+                return None;
-+            }
-+            None
-+        };
-+
-+        let scale_reg = operand_reg_source(self, &args[1]);
-+        let bias_reg = operand_reg_source(self, &args[2]);
-+
-+        match (scale_reg, bias_reg) {
-+            (Some(scale), Some(bias)) => {
-+                self.state
-+                    .emit_fmt(format_args!("    {} {}, {}, %ymm0", mnemonic, scale, bias));
-+                self.state.vec_last_store_reg = false;
-+                self.avx_store_dest(dest);
-+            }
-+            (Some(scale), None) => {
-+                self.avx_load_arg_to(&args[2], "ymm1");
-+                self.state
-+                    .emit_fmt(format_args!("    {} {}, %ymm1, %ymm0", mnemonic, scale));
-+                self.state.vec_last_store_reg = false;
-+                self.avx_store_dest(dest);
-+            }
-+            (None, Some(bias)) => {
-+                self.avx_load_arg_to(&args[1], "ymm1");
-+                self.state
-+                    .emit_fmt(format_args!("    {} %ymm1, {}, %ymm0", mnemonic, bias));
-+                self.state.vec_last_store_reg = false;
-+                self.avx_store_dest(dest);
-+            }
-+            (None, None) => {
-+                // Neither operand homed: the bias is copied through %ymm1 and
-+                // the scale is read from memory (the multiplier position
-+                // accepts a memory source). After `avx_load_arg(input)` every
-+                // non-homed operand is slot-homed — a deferred register store
-+                // was flushed to its slot by the input load — so the memory
-+                // operand always exists. (A value tracked in the reserved
-+                // %ymm0/%ymm1 pair cannot survive the input load either.)
-+                // Bias first: the scale's memory operand is unaffected.
-+                self.avx_load_arg_to(&args[2], "ymm1");
-+                let Operand::Value(sv) = &args[1] else {
-+                    unreachable!("vfmadd132 scale operand must be a value");
-+                };
-+                let scale_mem = self
-+                    .value_ptr_mem_operand(sv.0)
-+                    .unwrap_or_else(|| {
-+                        unreachable!(
-+                            "vfmadd132 scale operand must be homed, tracked, or slot-homed"
-+                        )
-+                    });
-+                self.state.emit_fmt(format_args!(
-+                    "    {} {}, %ymm1, %ymm0",
-+                    mnemonic, scale_mem
-+                ));
-+                self.state.vec_last_store_reg = false;
-+                self.avx_store_dest(dest);
-+            }
-+        }
-     }
- 
-     /// Emit one fused AVX reduction step directly from two memory streams:
-diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
-index e60e8a9..086d29a 100644
---- a/src/driver/pipeline.rs
-+++ b/src/driver/pipeline.rs
-@@ -1503,6 +1503,7 @@ impl Driver {
-                 && self.enable_avx
-                 && !self.no_sse
-                 && !self.general_regs_only,
-+            self.enable_fma,
-         );
-         if time_phases {
-             eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64());
-@@ -1572,24 +1573,6 @@ impl Driver {
+@@ -2922,7 +2922,7 @@ impl X86Codegen {
+                 self.state.emit("    vpunpckhqdq %xmm0, %xmm0, %xmm2");
+                 self.state.emit("    vpmovsxdq %xmm0, %xmm1");
+                 self.state.emit("    vpmovsxdq %xmm2, %xmm2");
+-                self.state.emit("    paddq %xmm2, %xmm1");
++                self.state.emit("    vpaddq %xmm2, %xmm1, %xmm1");
+                 if let (Some(d), Operand::Value(acc)) = (dest, &args[0]) {
+                     let acc_reg = self
+                         .reg_assignments
+@@ -2940,10 +2940,10 @@ impl X86Codegen {
+                         (Some(a), Some(dst)) => {
+                             if dst != a {
+                                 self.state
+-                                    .emit_fmt(format_args!("    movdqa %{}, %{}", a, dst));
++                                    .emit_fmt(format_args!("    vmovdqa %{}, %{}", a, dst));
+                             }
+                             self.state
+-                                .emit_fmt(format_args!("    paddq %xmm1, %{}", dst));
++                                .emit_fmt(format_args!("    vpaddq %xmm1, %{}, %{}", dst, dst));
+                             self.state.vector_values.insert(d.0);
+                             self.state.vec_live_regs.insert(d.0, dst);
+                             self.state.vec_last_store_val = Some(d.0);
+@@ -2957,12 +2957,12 @@ impl X86Codegen {
+                             // only when it is provably free — safest is the
+                             // accumulator's own SLOT as the staging area).
+                             if let Some(slot) = self.state.get_slot(acc.0) {
+-                                self.state.out.emit_instr_rbp_reg("    movdqu", slot.0, "xmm3");
+-                                self.state.emit("    paddq %xmm1, %xmm3");
++                                self.state.out.emit_instr_rbp_reg("    vmovdqu", slot.0, "xmm3");
++                                self.state.emit("    vpaddq %xmm1, %xmm3, %xmm3");
+                                 if let Some(dslot) = self.state.get_slot(d.0) {
+                                     self.state
+                                         .out
+-                                        .emit_instr_reg_rbp("    movdqu", "xmm3", dslot.0);
++                                        .emit_instr_reg_rbp("    vmovdqu", "xmm3", dslot.0);
+                                 }
+                             } else {
+                                 self.state.emit("    paddq %xmm1, %xmm1");
+@@ -2971,6 +2971,116 @@ impl X86Codegen {
                      }
                  }
              }
--            // Loop-transparent splitting (spill values live across a hot loop
--            // but unused inside it). NOTE: measured as a net loss on the
--            // benchmark suite — the store/reload round-trips cost more than the
--            // freed registers save, because the values competing for registers
--            // in hot loops are the in-loop ones (bases/IVs), which can't be
--            // transparent-split. Kept opt-in for reference.
--            if std::env::var("CCC_LOOP_SPLIT").is_ok() {
--                for func in &mut module.functions {
--                    if !func.is_declaration && !func.blocks.is_empty() {
--                        let n = crate::backend::split_ranges::split_loop_transparent_ranges(
--                            func, max_splits,
--                        );
--                        if n > 0 {
--                            did_split = true;
--                        }
--                    }
--                }
--            }
-             // Run cleanup passes on split IR: copy propagation + DCE
-             // to eliminate redundant Store/Load → Copy chains from mem2reg
-             if did_split {
-@@ -1943,6 +1926,7 @@ impl Driver {
-             code16gcc: self.code16gcc,
-             regparm: self.regparm,
-             fp_contract_fast: self.fp_contract_fast,
-+            fma: self.enable_fma,
-             preferred_stack_bytes: self.preferred_stack_bytes,
-             omit_frame_pointer: self.omit_frame_pointer,
-             emit_cfi: !self.no_unwind_tables,
++            IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2 => {
++                // dest(I64x2 accumulator) += sext(load4×I32(base, off))
++                // where lane > guard_rhs. args = [acc, base, off, guard_rhs].
++                //
++                // Same lane geometry as VecWidenAddI32x4ToI64x2, plus the
++                // per-lane mask: the I32 0/-1 compare result sign-extends
++                // through the SAME vpmovsxdq splits to all-ones/all-zeros
++                // I64 masks, so vpand zero-masks the widened values exactly
++                // per lane (GCC's canonical conditional-reduction form):
++                //   vmovdqu (mem)            → xmm0 = {a0,a1,a2,a3}
++                //   vpunpckhqdq x0,x0 → xmm2 = {a2,a3,a2,a3}
++                //   vpmovsxdq xmm0 → xmm1    = {sext(a0), sext(a1)}
++                //   vpmovsxdq xmm2 → xmm2    = {sext(a2), sext(a3)}
++                //   <mask into xmm4>         = {a0>r, a1>r, a2>r, a3>r}
++                //   vpcmpgtd x4,x0 → x4      = per-lane I32 0/-1 mask
++                //   vpunpckhqdq x4,x4 → x5   = mask lanes 2,3
++                //   vpmovsxdq xmm4 → xmm3    = {m0, m1} as I64
++                //   vpmovsxdq xmm5 → xmm5    = {m2, m3} as I64
++                //   vpand x3,x1 → x1 ; vpand x5,x2 → x2   (zero-mask)
++                //   paddq x2,x1              → per-lane guarded sums
++                //   dst = paddq(acc, xmm1)
++                self.flush_pending_vec_store_impl();
++                self.state.invalidate_vec_peephole();
++                let (base, index) = self.vec_load_addr_regs(&args[1], &args[2]);
++                match index {
++                    Some(idx) => self.state.emit_fmt(format_args!(
++                        "    vmovdqu (%{},%{}), %xmm0",
++                        base, idx
++                    )),
++                    None => self
++                        .state
++                        .emit_fmt(format_args!("    vmovdqu (%{}), %xmm0", base)),
++                }
++                // Split + widen the VALUES.
++                self.state.emit("    vpunpckhqdq %xmm0, %xmm0, %xmm2");
++                self.state.emit("    vpmovsxdq %xmm0, %xmm1");
++                self.state.emit("    vpmovsxdq %xmm2, %xmm2");
++                // Build the mask in xmm4 = broadcast(guard_rhs).
++                match &args[3] {
++                    Operand::Const(c) if c.to_i64() == Some(0) => {
++                        self.state.emit("    vpxor %xmm4, %xmm4, %xmm4");
++                    }
++                    Operand::Const(c) => {
++                        if let Some(v) = c.to_i64() {
++                            self.state
++                                .emit_fmt(format_args!("    movl ${}, %eax", v as i32));
++                        } else {
++                            self.state.emit("    xorl %eax, %eax");
++                        }
++                        self.state.emit("    vmovd %eax, %xmm4");
++                        self.state.emit("    vpshufd $0, %xmm4, %xmm4");
++                    }
++                    op => {
++                        // Scalar value operand: materialize into %eax.
++                        self.operand_to_reg(op, "rax");
++                        self.state.emit("    vmovd %eax, %xmm4");
++                        self.state.emit("    vpshufd $0, %xmm4, %xmm4");
++                    }
++                }
++                // mask = lanes > rhs (AT&T: vpcmpgtd src2=rhs, src1=lanes).
++                self.state.emit("    vpcmpgtd %xmm4, %xmm0, %xmm4");
++                // Split + widen the MASK (same lane geometry).
++                self.state.emit("    vpunpckhqdq %xmm4, %xmm4, %xmm5");
++                self.state.emit("    vpmovsxdq %xmm4, %xmm3");
++                self.state.emit("    vpmovsxdq %xmm5, %xmm5");
++                // Zero-mask the widened values per lane.
++                self.state.emit("    vpand %xmm3, %xmm1, %xmm1");
++                self.state.emit("    vpand %xmm5, %xmm2, %xmm2");
++                self.state.emit("    vpaddq %xmm2, %xmm1, %xmm1");
++                if let (Some(d), Operand::Value(acc)) = (dest, &args[0]) {
++                    let acc_reg = self
++                        .reg_assignments
++                        .get(&acc.0)
++                        .copied()
++                        .filter(|r| is_xmm_reg(*r))
++                        .map(|r| phys_reg_name(r));
++                    let dst_reg = self
++                        .reg_assignments
++                        .get(&d.0)
++                        .copied()
++                        .filter(|r| is_xmm_reg(*r))
++                        .map(|r| phys_reg_name(r));
++                    match (acc_reg, dst_reg) {
++                        (Some(a), Some(dst)) => {
++                            if dst != a {
++                                self.state
++                                    .emit_fmt(format_args!("    vmovdqa %{}, %{}", a, dst));
++                            }
++                            self.state
++                                .emit_fmt(format_args!("    vpaddq %xmm1, %{}, %{}", dst, dst));
++                            self.state.vector_values.insert(d.0);
++                            self.state.vec_live_regs.insert(d.0, dst);
++                            self.state.vec_last_store_val = Some(d.0);
++                            self.state.vec_last_store_reg = true;
++                            self.state.vec_last_store_reg_name = Some(dst);
++                        }
++                        _ => {
++                            if let Some(slot) = self.state.get_slot(acc.0) {
++                                self.state.out.emit_instr_rbp_reg("    vmovdqu", slot.0, "xmm3");
++                                self.state.emit("    vpaddq %xmm1, %xmm3, %xmm3");
++                                if let Some(dslot) = self.state.get_slot(d.0) {
++                                    self.state
++                                        .out
++                                        .emit_instr_reg_rbp("    vmovdqu", "xmm3", dslot.0);
++                                }
++                            }
++                        }
++                    }
++                }
++            }
+             IntrinsicOp::VecMulI64x2 => {
+                 self.flush_pending_vec_store_impl();
+                 self.state.invalidate_vec_peephole();
 diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
-index 07f7d4c..5918ece 100644
+index 29dd33f..4494fe9 100644
 --- a/src/ir/intrinsics.rs
 +++ b/src/ir/intrinsics.rs
-@@ -286,6 +286,33 @@ pub enum IntrinsicOp {
-     VecBroadcastF64x2,
-     /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - SSE2 4×F32
-     VecMulF32x4,
-+    /// Vector subtract: %dest_vec = %src1_vec - %src2_vec - AVX2 4×F64.
-+    /// args[0] = src1 vector value, args[1] = src2 vector value (non-commutative).
-+    VecSubF64x4,
-+    /// Vector subtract: %dest_vec = %src1_vec - %src2_vec - SSE2 2×F64.
-+    VecSubF64x2,
-+    /// Vector subtract: %dest_vec = %src1_vec - %src2_vec - AVX2 8×F32.
-+    VecSubF32x8,
-+    /// Vector subtract: %dest_vec = %src1_vec - %src2_vec - SSE2 4×F32.
-+    VecSubF32x4,
-+    /// Vector divide: %dest_vec = %src1_vec / %src2_vec - AVX2 4×F64.
-+    /// Elementwise IEEE division; identical per-lane results to scalar div.
-+    VecDivF64x4,
-+    /// Vector divide: %dest_vec = %src1_vec / %src2_vec - SSE2 2×F64.
-+    VecDivF64x2,
-+    /// Vector divide: %dest_vec = %src1_vec / %src2_vec - AVX2 8×F32.
-+    VecDivF32x8,
-+    /// Vector divide: %dest_vec = %src1_vec / %src2_vec - SSE2 4×F32.
-+    VecDivF32x4,
-+    /// Vector square root: %dest_vec = sqrt(%src_vec) - AVX2 4×F64.
-+    /// args[0] = source vector value; dest = result vector.
-+    VecSqrtF64x4,
-+    /// Vector square root: %dest_vec = sqrt(%src_vec) - SSE2 2×F64.
-+    VecSqrtF64x2,
-+    /// Vector square root: %dest_vec = sqrt(%src_vec) - AVX2 8×F32.
-+    VecSqrtF32x8,
-+    /// Vector square root: %dest_vec = sqrt(%src_vec) - SSE2 4×F32.
-+    VecSqrtF32x4,
+@@ -324,6 +324,15 @@ pub enum IntrinsicOp {
+     /// paddq×2. Full I64 precision per lane — `long s += (long)int_arr[i]`
+     /// over 4 elements/iteration.
+     VecWidenAddI32x4ToI64x2,
++    /// Masked widening reduction step: dest(I64x2 accumulator) += sext of
++    /// 4×I32 loaded from (base, byte_offset) WHERE the lane satisfies
++    /// `lane > guard_rhs`. args = [accumulator, base, byte_offset,
++    /// guard_rhs]. The x86 lowering builds the per-lane I32 mask with
++    /// vpcmpgtd, sign-extends it through the same vpmovsxdq lane geometry
++    /// (all-ones/all-zeros I64 masks), and vpand zero-masks the widened
++    /// values before the paddq folds — exact lane-guarded I64 accumulation
++    /// (GCC's canonical conditional-reduction form).
++    VecWidenMaskedAddI32x4ToI64x2,
      /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - 4×I32
      /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
      VecMulI32x4,
-@@ -1064,6 +1091,8 @@ impl IntrinsicOp {
-             | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB
-             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
-             | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8
-+            | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4
-+            | VecSubF32x8 | VecDivF32x8 | VecSqrtF32x8
-             | VecZeroF64x4 | VecZeroI32x8 | VecLoadF32x8 | VecAddF32x8
-             | VecMulF32x8 | VecFmaF32x8 | VecMaddF32x8
-             | VecBroadcastF32x8 | VecZeroF32x8
-@@ -1103,7 +1132,9 @@ impl IntrinsicOp {
-             | FmaF64x2 | LoadF64x2 | LoadI32x4 | AddF64x2 | MulF64x2
-             | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecAddF64x2
-             | VecMulF64x2 | VecBroadcastF64x2 | VecAddI32x4 | VecZeroF64x2
-+            | VecSubF64x2 | VecDivF64x2 | VecSqrtF64x2
+@@ -1147,6 +1156,7 @@ impl IntrinsicOp {
              | VecZeroI32x4 | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4 | VecBroadcastF32x4 | VecZeroF32x4
-+            | VecSubF32x4 | VecDivF32x4 | VecSqrtF32x4
+             | VecSubF32x4 | VecDivF32x4 | VecSqrtF32x4
+             | VecWidenAddI32x4ToI64x2
++            | VecWidenMaskedAddI32x4ToI64x2
              | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2 | VecLoadI64x4 | VecAddI64x4 | VecHorizontalAddI64x4 | VecZeroI64x4
              | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4
              | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
-@@ -1194,10 +1225,22 @@ impl IntrinsicOp {
-                 | IntrinsicOp::VecAddF32x4
-                 | IntrinsicOp::VecMulF64x4
-                 | IntrinsicOp::VecMulF64x2
-+                | IntrinsicOp::VecSubF64x4
-+                | IntrinsicOp::VecSubF64x2
-+                | IntrinsicOp::VecDivF64x4
-+                | IntrinsicOp::VecDivF64x2
-+                | IntrinsicOp::VecSqrtF64x4
-+                | IntrinsicOp::VecSqrtF64x2
-                 | IntrinsicOp::VecBroadcastF64x4
-                 | IntrinsicOp::VecBroadcastF64x2
-                 | IntrinsicOp::VecMulF32x8
-                 | IntrinsicOp::VecMulF32x4
-+                | IntrinsicOp::VecSubF32x8
-+                | IntrinsicOp::VecSubF32x4
-+                | IntrinsicOp::VecDivF32x8
-+                | IntrinsicOp::VecDivF32x4
-+                | IntrinsicOp::VecSqrtF32x8
-+                | IntrinsicOp::VecSqrtF32x4
+@@ -1172,7 +1182,8 @@ impl IntrinsicOp {
+             IntrinsicOp::RoundScalarF32(_) | IntrinsicOp::RoundScalarF64(_) |
+             IntrinsicOp::CopysignF32 | IntrinsicOp::CopysignF64 |
+             IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
+-            IntrinsicOp::VecWidenAddI32x4ToI64x2 |
++            IntrinsicOp::VecWidenAddI32x4ToI64x2
++            | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2 |
+             IntrinsicOp::LDFabs | IntrinsicOp::LDCopysign |
+             IntrinsicOp::Aesenc128 | IntrinsicOp::Aesenclast128 |
+             IntrinsicOp::Aesdec128 | IntrinsicOp::Aesdeclast128 |
+@@ -1255,6 +1266,7 @@ impl IntrinsicOp {
+                 | IntrinsicOp::VecSqrtF32x8
+                 | IntrinsicOp::VecSqrtF32x4
+                 | IntrinsicOp::VecWidenAddI32x4ToI64x2
++                | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2
                  | IntrinsicOp::VecBroadcastF32x8
                  | IntrinsicOp::VecBroadcastF32x4
                  | IntrinsicOp::VecFmaF64x4
-diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index 9f237c0..43da98a 100644
---- a/src/passes/mod.rs
-+++ b/src/passes/mod.rs
-@@ -694,7 +694,12 @@ pub(crate) fn run_passes(
-     fp_reassoc: bool,
-     fp_contract_fast: bool,
-     x86_avx: bool,
-+    x86_fma: bool,
- ) {
-+    // FMA3 ISA availability for the vectorizer's VecFma/VecMadd contraction
-+    // (see vectorize::set_x86_fma_enabled). AArch64 fmla is baseline ISA and
-+    // ignores this.
-+    vectorize::set_x86_fma_enabled(x86_fma && target == crate::backend::Target::X86_64);
-     let disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
-     // Debug hook: dump the module IR to stderr before optimization.
-     if std::env::var("CCC_DUMP_IR").is_ok() {
-@@ -1038,6 +1043,9 @@ pub(crate) fn run_passes(
-                 (_, true, true, false) => vectorize::vectorize_function_fast_math_without_fixed_slp,
-                 (_, true, false, true) => vectorize::vectorize_function_reassoc,
-                 (_, true, false, false) => vectorize::vectorize_function_reassoc_without_fixed_slp,
-+                // contract=fast without reassoc: reductions stay order-locked,
-+                // map trees may fuse (GCC-parity for -ffp-contract=fast).
-+                (_, false, true, _) => vectorize::vectorize_function_contract,
-                 (_, false, _, _) => vectorize::vectorize_function,
-             };
-             let n = timed_pass!(
 diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index 9436446..c41334b 100644
+index 6795977..771ae32 100644
 --- a/src/passes/vectorize.rs
 +++ b/src/passes/vectorize.rs
-@@ -96,6 +96,23 @@ use crate::passes::loop_analysis;
- // expands to items the comment never reaches), so this is a plain comment.
- thread_local! {
-     static REJECT_REASON: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
-+    // FMA3 ISA availability on the x86 target (`-mfma` / enabling -march).
-+    // `VecFma*`/`VecMadd*` lower to `vfmadd231p{s,d}` (FMA3), which is NOT in
-+    // the baseline SSE2 ISA. Contraction (`fp_contract_fast`) alone must not
-+    // produce them, exactly like scalar FMA fusion: GCC requires `-mfma` even
-+    // under `-ffp-contract=fast`. Set once per `run_passes` (per TU) by the
-+    // driver; AArch64 `fmla` is baseline ISA and needs no gate.
-+    static X86_FMA_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-+}
-+
-+/// Record whether the x86 target has FMA3. Called by `run_passes` before any
-+/// vectorization entry point runs on this thread.
-+pub(crate) fn set_x86_fma_enabled(enabled: bool) {
-+    X86_FMA_AVAILABLE.with(|f| f.set(enabled));
-+}
-+
-+fn x86_fma_enabled() -> bool {
-+    X86_FMA_AVAILABLE.with(|f| f.get())
+@@ -454,6 +454,14 @@ struct ReductionPattern {
+     /// the primary; chains share only loads and the induction variable, never
+     /// state.
+     seconds: Vec<SecondaryAccumulator>,
++    /// Conditional-sum guard: the Cmp value feeding the Select that wraps
++    /// the accumulator update (`if (a[i] > 0) s += a[i]`). None for plain
++    /// reductions. The transform emits the MASKED widening add
++    /// (VecWidenMaskedAddI32x4ToI64x2) for this shape.
++    guard_cond: Option<Value>,
++    /// The guard comparison's rhs operand (validated: the comparison is
++    /// `loaded_lane > guard_rhs`, signed, lhs = the loaded element).
++    guard_rhs: Option<Operand>,
  }
  
- fn set_reject(reason: &'static str) {
-@@ -278,7 +295,7 @@ fn vectorize_with_analysis_mode(
-                 total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract_fast);
+ /// Value IDs of one extra accumulator's scalar remainder chain.
+@@ -1223,6 +1231,7 @@ fn reduction_pattern_is_sound(
+                         | Instruction::Cast { .. }
+                         | Instruction::Phi { .. }
+                         | Instruction::Cmp { .. }
++                        | Instruction::Select { .. }
+                 )
+             {
+                 continue;
+@@ -1665,6 +1674,11 @@ fn analyze_reduction_pattern(
+     let mut body_idx = None;
+     let mut accumulator_add_idx = None;
+     let mut add_result = None;
++    // Conditional-sum guard (if_convert output): the Select wrapping the
++    // accumulator update. `s' = Select(cond, s + x, s)` — the guard Cmp's
++    // value id; validated after the added-value chain resolves.
++    let mut guard_select_cond: Option<Value> = None;
++    let mut guard_rhs: Option<Operand> = None;
+     for &block_idx in &loop_info.body {
+         if block_idx == header_idx {
+             continue;
+@@ -1720,6 +1734,34 @@ fn analyze_reduction_pattern(
+                     body_idx = Some(block_idx);
+                     accumulator_add_idx = Some(idx);
+                     add_result = Some(*dest);
++                    // Conditional-sum detection: if this Add's result feeds
++                    // a Select whose other arm is the accumulator phi, the
++                    // update is GUARDED. Record the guard's cond value; the
++                    // plain unguarded path must NOT run (it would drop the
++                    // guard and miscompile), so validation failure later
++                    // rejects the loop entirely.
++                    for sin in block.instructions.iter().skip(idx + 1) {
++                        if let Instruction::Select {
++                            cond,
++                            true_val,
++                            false_val,
++                            ..
++                        } = sin
++                        {
++                            let tv_is_add =
++                                matches!(true_val, Operand::Value(v) if v.0 == dest.0);
++                            let fv_is_phi = matches!(
++                                false_val,
++                                Operand::Value(v) if v.0 == accumulator_phi.0
++                            );
++                            if tv_is_add && fv_is_phi {
++                                if let Operand::Value(cv) = cond {
++                                    guard_select_cond = Some(*cv);
++                                }
++                                break;
++                            }
++                        }
++                    }
+                     break;
+                 }
              }
-         } else if std::env::var("CCC_NO_MAP_VEC").is_err() {
--            if let Some(map_pattern) = analyze_map_pattern(func, loop_info) {
-+            if let Some(map_pattern) = analyze_map_pattern(func, loop_info, neon) {
-                 // AArch64 is always 128-bit; x86 uses 256-bit vectors unless
-                 // the focused SSE diagnostic override requests 128-bit code.
-                 let avx2 = !neon && !force_two_wide && std::env::var("LCCC_FORCE_MAP_SSE").is_err();
-@@ -3114,16 +3131,161 @@ struct MapPattern {
-     exit_cmp_op: IrCmpOp,
-     /// GEP for the destination store (dst[iv])
-     dst_gep: Value,
--    /// GEP for the source load (src[iv])
--    src_gep: Value,
--    /// Optional loop-invariant scale operand of the multiply.
--    scale: Option<Operand>,
--    /// Optional loop-invariant offset operand of the add.
--    offset: Option<Operand>,
-+    /// GEPs for the source load streams (src[iv]); all advance by the same
-+    /// byte induction variable.
-+    src_geps: Vec<Value>,
-+    /// The elementwise expression stored to dst[iv].
-+    expr: MapExpr,
-     /// All block indices in the loop body
-     loop_blocks: FxHashSet<usize>,
- }
+@@ -1902,6 +1944,8 @@ fn analyze_reduction_pattern(
+         return Some(ReductionPattern {
+             kind: ReductionKind::Max,
+             seconds: Vec::new(),
++                guard_cond: None,
++                guard_rhs: None,
+             element_type: IrType::I32,
+             accumulator_type: IrType::I32,
+             header_idx,
+@@ -1979,6 +2023,68 @@ fn analyze_reduction_pattern(
+         );
+     }
  
-+/// Elementwise map expression tree (OP-05a). Leaves are loop loads (by
-+/// stream index) or loop-invariant scalars; internal nodes are FP Add/Sub/
-+/// Mul/Div, integer Add/Mul, or FP Sqrt. The legacy affine family
-+/// (`src[i]`, `src[i]*s`, `src[i]+o`, `src[i]*s+o`) is the depth-1 subset of
-+/// this tree. Lane-exact by construction: every vector intrinsic computes
-+/// the same IEEE operation per lane as the scalar original; the only
-+/// semantics-affecting rewrite is the optional mul+add -> fused madd
-+/// contraction under `-ffp-contract=fast` (same contract as the affine
-+/// path).
-+#[derive(Debug, Clone)]
-+enum MapExpr {
-+    /// Load from source stream `i` (index into `MapPattern::src_geps`).
-+    Load(usize),
-+    /// Loop-invariant scalar operand (broadcast in the preheader).
-+    Invariant(Operand),
-+    /// Binary operation; `ty` was checked to equal the element type.
-+    BinOp(IrBinOp, Box<MapExpr>, Box<MapExpr>),
-+    /// Scalar sqrt over a subexpression (FP only).
-+    Sqrt(Box<MapExpr>),
-+}
-+
-+impl MapExpr {
-+    fn node_count(&self) -> usize {
-+        match self {
-+            MapExpr::Load(_) | MapExpr::Invariant(_) => 1,
-+            MapExpr::BinOp(_, l, r) => 1 + l.node_count() + r.node_count(),
-+            MapExpr::Sqrt(x) => 1 + x.node_count(),
-+        }
-+    }
-+}
-+
-+/// Emission context for the elementwise map tree (OP-05a). Owns the fresh
-+/// value counter and accumulates preheader broadcasts (hoisted, hoisted-once
-+/// per invariant operand) and the packed-body instruction list.
-+struct MapEmitCtx<'a> {
-+    src_bases: &'a [Value],
-+    byte_iv: Value,
-+    load_op: IntrinsicOp,
-+    broadcast_op: IntrinsicOp,
-+    sqrt_op: Option<IntrinsicOp>,
-+    madd_op: Option<IntrinsicOp>,
-+    bin_op: &'a dyn Fn(&IrBinOp) -> Option<IntrinsicOp>,
-+    broadcast_cache: Vec<(String, Value)>,
-+    preheader_insts: Vec<Instruction>,
-+    vec_insts: Vec<Instruction>,
-+    next_val_id: u32,
-+    changes: &'a mut usize,
-+}
-+
-+impl<'a> MapEmitCtx<'a> {
-+    fn fresh(&mut self) -> Value {
-+        let v = Value(self.next_val_id);
-+        self.next_val_id += 1;
-+        v
-+    }
-+
-+    fn emit(&mut self, expr: &MapExpr) -> Option<Value> {
-+        match expr {
-+            MapExpr::Load(stream) => {
-+                let dest = self.fresh();
-+                self.vec_insts.push(Instruction::Intrinsic {
-+                    dest: Some(dest),
-+                    op: self.load_op,
-+                    dest_ptr: None,
-+                    args: vec![
-+                        Operand::Value(self.src_bases[*stream]),
-+                        Operand::Value(self.byte_iv),
-+                    ],
-+                });
-+                Some(dest)
-+            }
-+            MapExpr::Invariant(operand) => {
-+                let key = format!("{:?}", operand);
-+                if let Some(&(_, cached)) = self
-+                    .broadcast_cache
-+                    .iter()
-+                    .find(|(k, _)| *k == key)
-+                {
-+                    return Some(cached);
++    // Conditional-sum guard validation. A Select wrapping the accumulator
++    // update was detected in the search; the guarded vector form is only
++    // expressible when the guard compares the LOADED element (the root of
++    // the added-value chain) with signed greater-than against any operand:
++    //   Select(a[iv] > rhs, acc + sext(a[iv]), acc)
++    // The added-value chain's root load: Load directly, or Cast(Load).
++    // Anything else (or no Select at all when one was detected) stays
++    // scalar — the unguarded vector form would silently drop the guard.
++    let mut select_guard_cond: Option<Value> = None;
++    if let Some(gcv) = guard_select_cond {
++        // Resolve the chain root: the loaded I32 element.
++        let chain_root = match added_inst {
++            Instruction::Load { dest, .. } => Some(*dest),
++            Instruction::Cast {
++                src: Operand::Value(sv),
++                ..
++            } => {
++                // The cast's source must be (or feed) the load; accept the
++                // direct-load case and one intervening cast chain link.
++                if let Some(src_inst) = find_inst_by_dest(body, *sv) {
++                    match src_inst {
++                        Instruction::Load { dest, .. } => Some(*dest),
++                        _ => None,
++                    }
++                } else {
++                    None
 +                }
-+                let dest = self.fresh();
-+                // Broadcasts live in the PREHEADER so they are hoisted out
-+                // of the packed loop (register-allocated once).
-+                self.preheader_insts.push(Instruction::Intrinsic {
-+                    dest: Some(dest),
-+                    op: self.broadcast_op,
-+                    dest_ptr: None,
-+                    args: vec![operand.clone()],
-+                });
-+                self.broadcast_cache.push((key, dest));
-+                Some(dest)
 +            }
-+            MapExpr::Sqrt(x) => {
-+                let inner = self.emit(x)?;
-+                let sqrt_op = self.sqrt_op?;
-+                let dest = self.fresh();
-+                self.vec_insts.push(Instruction::Intrinsic {
-+                    dest: Some(dest),
-+                    op: sqrt_op,
-+                    dest_ptr: None,
-+                    args: vec![Operand::Value(inner)],
-+                });
-+                Some(dest)
-+            }
-+            MapExpr::BinOp(op, l, r) => {
-+                // Contract-legal fusion (same gate as the affine path): a
-+                // mul feeding an add fuses into the 3-operand madd when the
-+                // other addend is not itself a mul (a*b + c*d has no single
-+                // madd form).
-+                if let (Some(madd), IrBinOp::Add, MapExpr::BinOp(IrBinOp::Mul, ml, mr)) =
-+                    (self.madd_op, op, &**l)
-+                {
-+                    if !matches!(&**r, MapExpr::BinOp(IrBinOp::Mul, _, _)) {
-+                        let lv = self.emit(ml)?;
-+                        let rv = self.emit(mr)?;
-+                        let av = self.emit(r)?;
-+                        let dest = self.fresh();
-+                        self.vec_insts.push(Instruction::Intrinsic {
-+                            dest: Some(dest),
-+                            op: madd,
-+                            dest_ptr: None,
-+                            args: vec![
-+                                Operand::Value(lv),
-+                                Operand::Value(rv),
-+                                Operand::Value(av),
-+                            ],
-+                        });
-+                        return Some(dest);
++            _ => None,
++        };
++        let mut valid = false;
++        if let Some(root_load) = chain_root {
++            'gc: for &bi in &loop_info.body {
++                for inst in &func.blocks[bi].instructions {
++                    if let Instruction::Cmp {
++                        dest, op, lhs, rhs, ..
++                    } = inst
++                    {
++                        if dest.0 == gcv.0
++                            && *op == IrCmpOp::Sgt
++                            && matches!(lhs, Operand::Value(lv) if lv.0 == root_load.0)
++                        {
++                            select_guard_cond = Some(gcv);
++                            guard_rhs = Some(*rhs);
++                            valid = true;
++                            break 'gc;
++                        }
 +                    }
 +                }
-+                let lv = self.emit(l)?;
-+                let rv = self.emit(r)?;
-+                let vec_op = (self.bin_op)(op)?;
-+                let dest = self.fresh();
-+                self.vec_insts.push(Instruction::Intrinsic {
-+                    dest: Some(dest),
-+                    op: vec_op,
-+                    dest_ptr: None,
-+                    args: vec![Operand::Value(lv), Operand::Value(rv)],
-+                });
-+                Some(dest)
 +            }
 +        }
-+    }
-+}
-+
- /// Analyze a one-source copy/scale/add/affine store loop.
- ///
- /// Strict legality: the loop must be straight-line (no internal conditionals),
-@@ -3133,6 +3295,7 @@ struct MapPattern {
- fn analyze_map_pattern(
-     func: &IrFunction,
-     loop_info: &loop_analysis::NaturalLoop,
-+    neon: bool,
- ) -> Option<MapPattern> {
-     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
-     let header_idx = loop_info.header;
-@@ -3268,9 +3431,13 @@ fn analyze_map_pattern(
-         return None;
-     }
- 
--    // Scan the loop for loads/stores: exactly one of each, and every other
--    // instruction must be simple, side-effect-free arithmetic.
--    let mut load_info = None; // (block, load dest, ptr value, element type)
-+    // Scan the loop for loads/stores: exactly one store, up to four source
-+    // load streams, and every other instruction must be simple,
-+    // side-effect-free arithmetic. Integer div/rem can fault and keep the
-+    // loop scalar; FP division is IEEE-defined elementwise (no trap) and is
-+    // parsed into the map expression tree.
-+    const MAP_MAX_STREAMS: usize = 4;
-+    let mut load_infos: Vec<(usize, Value, Value, IrType)> = Vec::new();
-     let mut store_info = None; // (block, ptr value, stored val, element type)
-     for &block_idx in &loop_info.body {
-         for inst in &func.blocks[block_idx].instructions {
-@@ -3278,11 +3445,11 @@ fn analyze_map_pattern(
-                 Instruction::Load { dest, ptr, ty, .. } => {
-                     // Packed I32/U32/F32/F64 all have native forms.
-                     if !matches!(*ty, IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64)
--                        || load_info.is_some()
-+                        || load_infos.len() >= MAP_MAX_STREAMS
-                     {
-                         return None;
-                     }
--                    load_info = Some((block_idx, *dest, *ptr, *ty));
-+                    load_infos.push((block_idx, *dest, *ptr, *ty));
-                 }
-                 Instruction::Store { val, ptr, ty, .. } => {
-                     if !matches!(*ty, IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64)
-@@ -3295,7 +3462,15 @@ fn analyze_map_pattern(
-                     };
-                     store_info = Some((block_idx, *ptr, *store_val, *ty));
-                 }
--                Instruction::BinOp { op, .. } if op.can_trap() => return None,
-+                Instruction::BinOp { op, ty, .. } if op.can_trap() && !ty.is_float() => {
-+                    return None;
-+                }
-+                // Scalar sqrt lowers to a pure intrinsic; the map tree
-+                // parser understands it (FP only).
-+                Instruction::Intrinsic {
-+                    op: IntrinsicOp::SqrtF32 | IntrinsicOp::SqrtF64,
-+                    ..
-+                } => {}
-                 Instruction::Phi { .. }
-                 | Instruction::BinOp { .. }
-                 | Instruction::UnaryOp { .. }
-@@ -3308,16 +3483,21 @@ fn analyze_map_pattern(
-             }
-         }
-     }
--    let (_, load_dest, src_gep, load_ty) = load_info?;
-     let (body_idx, dst_gep, store_val, elem_ty) = store_info?;
--    if load_ty != elem_ty {
-+    // At least one source stream is required (a pure store of a loop
-+    // invariant is not a map).
-+    if load_infos.is_empty() {
-         return None;
-     }
--
--    // Both GEPs must be indexed by the IV.
--    if !gep_uses_iv(func, &loop_info.body, src_gep, iv, &iv_derived)
--        || !gep_uses_iv(func, &loop_info.body, dst_gep, iv, &iv_derived)
-+    if load_infos
-+        .iter()
-+        .any(|&(_, _, _, ty)| ty != elem_ty)
-     {
-+        return None;
-+    }
-+
-+    // The destination GEP must be indexed by the IV.
-+    if !gep_uses_iv(func, &loop_info.body, dst_gep, iv, &iv_derived) {
-         if debug {
-             eprintln!("[VEC-MAP]   GEPs don't use IV");
-         }
-@@ -3331,12 +3511,19 @@ fn analyze_map_pattern(
-             return None;
-         }
-     };
--    if find_reduction_byte_iv(func, &loop_info.body, src_gep, elem_size).is_none()
--        || find_reduction_byte_iv(func, &loop_info.body, dst_gep, elem_size).is_none()
--    {
-+    if find_reduction_byte_iv(func, &loop_info.body, dst_gep, elem_size).is_none() {
-         set_reject("map access is not a contiguous element-size stride");
-         return None;
-     }
-+    // Every source stream must be IV-indexed and contiguous as well.
-+    for &(_, _, src_gep, _) in &load_infos {
-+        if !gep_uses_iv(func, &loop_info.body, src_gep, iv, &iv_derived)
-+            || find_reduction_byte_iv(func, &loop_info.body, src_gep, elem_size).is_none()
-+        {
-+            set_reject("map source access is not a contiguous element-size stride");
-+            return None;
-+        }
-+    }
- 
-     // Loop-invariance of an operand: constant, or defined outside the loop and
-     // not derived from the IV.
-@@ -3349,105 +3536,79 @@ fn analyze_map_pattern(
-         }
-     };
- 
--    // Accept the complete one-source affine family.  Missing scale/offset
--    // operations are represented explicitly so the transform does not invent
--    // arithmetic (important for copies and pure scales).
--    let body = &func.blocks[body_idx];
--    let scaled_load = |value: Value| -> Option<Operand> {
--        let Instruction::BinOp {
--            op: IrBinOp::Mul,
--            lhs,
--            rhs,
--            ty,
--            ..
--        } = find_inst_by_dest(body, value)?
--        else {
--            return None;
--        };
--        if *ty != elem_ty {
--            return None;
--        }
--        match (lhs, rhs) {
--            (Operand::Value(v), other) if *v == load_dest && is_invariant(other) => {
--                Some(other.clone())
--            }
--            (other, Operand::Value(v)) if *v == load_dest && is_invariant(other) => {
--                Some(other.clone())
--            }
--            _ => None,
--        }
-+    // Parse the stored value as an elementwise expression tree over the load
-+    // streams and loop invariants (OP-05a). The legacy affine family is the
-+    // depth-1 subset. Bounded: small trees only, so the vector body stays
-+    // compact and register pressure bounded.
-+    let load_dests: Vec<Value> = load_infos.iter().map(|&(_, d, _, _)| d).collect();
-+    // NEON lowers VecAdd/VecMul (fadd/fmul 2d/4s) but has no lowering for
-+    // VecSub/VecDiv/VecSqrt yet — restrict those tree nodes to x86 targets
-+    // (fail-closed: a NEON loop containing them stays scalar).
-+    let allow_ext_fp_ops = !neon;
-+    let parse_tree = |value: Value, depth: usize| -> Option<MapExpr> {
-+        parse_map_expr(
-+            func,
-+            &loop_info.body,
-+            &load_dests,
-+            &iv_derived,
-+            &is_invariant,
-+            &elem_ty,
-+            value,
-+            depth,
-+            allow_ext_fp_ops,
-+        )
-     };
--
--    let (scale, offset) = if store_val == load_dest {
--        (None, None)
-+    let expr = if load_dests.len() == 1 && store_val == load_dests[0] {
-+        MapExpr::Load(0)
-     } else {
--        let expression = find_inst_by_dest(body, store_val)?;
--        match expression {
--            Instruction::BinOp {
--                op: IrBinOp::Mul,
--                ty,
--                ..
--            } if *ty == elem_ty => (Some(scaled_load(store_val)?), None),
--            Instruction::BinOp {
--                op: IrBinOp::Add,
--                lhs,
--                rhs,
--                ty,
--                ..
--            } if *ty == elem_ty => match (lhs, rhs) {
--                (Operand::Value(v), other) if *v == load_dest && is_invariant(other) => {
--                    (None, Some(other.clone()))
--                }
--                (other, Operand::Value(v)) if *v == load_dest && is_invariant(other) => {
--                    (None, Some(other.clone()))
--                }
--                (Operand::Value(v), other) if is_invariant(other) => {
--                    (Some(scaled_load(*v)?), Some(other.clone()))
--                }
--                (other, Operand::Value(v)) if is_invariant(other) => {
--                    (Some(scaled_load(*v)?), Some(other.clone()))
--                }
--                _ => return None,
--            },
--            _ => return None,
--        }
-+        parse_tree(store_val, 0)?
-     };
-+    const MAP_MAX_NODES: usize = 12;
-+    if expr.node_count() > MAP_MAX_NODES {
-+        set_reject("map expression tree too large");
-+        return None;
-+    }
-+    // Every load stream must appear in the tree (a stream read but not
-+    // stored would leave a live scalar load the transform cannot remove).
-+    for (idx, _) in load_dests.iter().enumerate() {
-+        if !expr_uses_stream(&expr, idx) {
-+            if load_dests.len() == 1 {
-+                // The single legacy stream may feed dead code that DCE owns;
-+                // the affine path tolerated this shape.
-+                continue;
-+            }
-+            return None;
-+        }
-+    }
- 
-     // Alias safety: identify the complete pointer roots. Different SSA value
-     // numbers are NOT an alias proof; ordinary pointer parameters may overlap.
-     // Distinct restrict parameters and distinct globals/allocas are legal.
-+    // Only WRITE-vs-READ aliasing matters: source streams only read, so they
-+    // may alias each other freely; each source must be disjoint from the
-+    // destination (or the exact same GEP for lane-local in-place maps).
-     let dst_root = proven_object_root(func, dst_gep)?;
--    let src_root = proven_object_root(func, src_gep)?;
--    // Exact in-place maps are lane-local and safe (`a[i] = a[i] * s + b`).
--    // Otherwise require disjoint complete-object roots; merely seeing different
--    // SSA pointer values is not an alias proof.
--    if !geps_proven_identical(func, &loop_info.body, src_gep, dst_gep)
--        && !roots_proven_distinct(&dst_root, &src_root)
--    {
--        if debug {
--            eprintln!(
--                "[VEC-MAP]   GEP {:?}/{:?} bases not provably distinct: {:?} vs {:?}",
--                dst_gep, src_gep, dst_root, src_root
--            );
--            for &block_idx in &loop_info.body {
--                for inst in &func.blocks[block_idx].instructions {
--                    if matches!(inst, Instruction::GetElementPtr { dest, .. }
--                        if *dest == dst_gep || *dest == src_gep)
--                    {
--                        eprintln!("[VEC-MAP]     {:?}", inst);
--                    }
--                }
-+    for &(_, _, src_gep, _) in &load_infos {
-+        let src_root = proven_object_root(func, src_gep)?;
-+        // Exact in-place maps are lane-local and safe (`a[i] = a[i] * s + b`).
-+        // Otherwise require disjoint complete-object roots; merely seeing
-+        // different SSA pointer values is not an alias proof.
-+        if !geps_proven_identical(func, &loop_info.body, src_gep, dst_gep)
-+            && !roots_proven_distinct(&dst_root, &src_root)
-+        {
++        if !valid {
 +            if debug {
 +                eprintln!(
-+                    "[VEC-MAP]   GEP {:?}/{:?} bases not provably distinct: {:?} vs {:?}",
-+                    dst_gep, src_gep, dst_root, src_root
++                    "[VEC-RED]   Rejecting: conditional-sum guard is not `loaded > rhs` (staying scalar)"
 +                );
-             }
-+            set_reject("map source/destination may alias (use restrict or exact in-place access)");
++            }
++            set_reject("conditional-sum guard shape not expressible (needs loaded > rhs)");
 +            return None;
-         }
--        set_reject("map source/destination may alias (use restrict or exact in-place access)");
--        return None;
-     }
- 
-     if debug {
--        eprintln!(
--            "[VEC-MAP]   Map pattern detected: store(dst[iv]) = load(src[iv]) * {:?} + {:?}",
--            scale, offset
--        );
-+        eprintln!("[VEC-MAP]   Map pattern detected: {:?}", expr);
-     }
- 
-     Some(MapPattern {
-@@ -3461,13 +3622,178 @@ fn analyze_map_pattern(
-         limit,
-         exit_cmp_op,
-         dst_gep,
--        src_gep,
--        scale,
--        offset,
-+        src_geps: load_infos.iter().map(|&(_, _, g, _)| g).collect(),
-+        expr,
-         loop_blocks: loop_info.body.clone(),
-     })
- }
- 
-+/// Recursive parser for the elementwise map expression (OP-05a).
-+///
-+/// Recognizes, bounded by `depth`: stream loads, loop-invariant scalars,
-+/// FP Add/Sub/Mul/Div, integer Add/Mul, and FP Sqrt intrinsics. IV-derived
-+/// values and anything defined in the loop outside this grammar fail closed.
-+#[allow(clippy::too_many_arguments)]
-+fn parse_map_expr(
-+    func: &IrFunction,
-+    loop_blocks: &FxHashSet<usize>,
-+    load_dests: &[Value],
-+    iv_derived: &FxHashSet<Value>,
-+    is_invariant: &dyn Fn(&Operand) -> bool,
-+    elem_ty: &IrType,
-+    value: Value,
-+    depth: usize,
-+    allow_ext_fp_ops: bool,
-+) -> Option<MapExpr> {
-+    // Depth guard is a secondary bound; the analyzer's node-count cap is
-+    // the primary size limit. 6 allows sqrt(mul+add) / div nesting (the
-+    // nbody/spectral elementwise shapes) while keeping the tree compact.
-+    if depth > 6 {
-+        return None;
-+    }
-+    if let Some(idx) = load_dests.iter().position(|&d| d == value) {
-+        return Some(MapExpr::Load(idx));
-+    }
-+    let (_, inst) = find_inst_in_loop(func, loop_blocks, value)?;
-+    match inst {
-+        Instruction::BinOp { op, lhs, rhs, ty, .. } => {
-+            if *ty != *elem_ty {
-+                return None;
-+            }
-+            let fp = ty.is_float();
-+            match op {
-+                IrBinOp::Add | IrBinOp::Mul => {}
-+                // Sub/Div (and Sqrt below) lower to VecSub/VecDiv/VecSqrt,
-+                // which only the x86 backend implements today.
-+                IrBinOp::Sub | IrBinOp::SDiv if fp && allow_ext_fp_ops => {}
-+                _ => return None,
-+            }
-+            let l = parse_map_operand(
-+                func,
-+                loop_blocks,
-+                load_dests,
-+                iv_derived,
-+                is_invariant,
-+                elem_ty,
-+                lhs,
-+                depth + 1,
-+                allow_ext_fp_ops,
-+            )?;
-+            let r = parse_map_operand(
-+                func,
-+                loop_blocks,
-+                load_dests,
-+                iv_derived,
-+                is_invariant,
-+                elem_ty,
-+                rhs,
-+                depth + 1,
-+                allow_ext_fp_ops,
-+            )?;
-+            Some(MapExpr::BinOp(*op, Box::new(l), Box::new(r)))
 +        }
-+        Instruction::Intrinsic {
-+            op: IntrinsicOp::SqrtF64,
-+            args,
-+            ..
-+        } if *elem_ty == IrType::F64 && allow_ext_fp_ops => {
-+            let Operand::Value(v) = &args[0] else {
-+                return None;
-+            };
-+            Some(MapExpr::Sqrt(Box::new(parse_map_expr(
-+                func,
-+                loop_blocks,
-+                load_dests,
-+                iv_derived,
-+                is_invariant,
-+                elem_ty,
-+                *v,
-+                depth + 1,
-+                allow_ext_fp_ops,
-+            )?)))
-+        }
-+        Instruction::Intrinsic {
-+            op: IntrinsicOp::SqrtF32,
-+            args,
-+            ..
-+        } if *elem_ty == IrType::F32 && allow_ext_fp_ops => {
-+            let Operand::Value(v) = &args[0] else {
-+                return None;
-+            };
-+            Some(MapExpr::Sqrt(Box::new(parse_map_expr(
-+                func,
-+                loop_blocks,
-+                load_dests,
-+                iv_derived,
-+                is_invariant,
-+                elem_ty,
-+                *v,
-+                depth + 1,
-+                allow_ext_fp_ops,
-+            )?)))
-+        }
-+        _ => None,
-+    }
-+}
-+
-+#[allow(clippy::too_many_arguments)]
-+fn parse_map_operand(
-+    func: &IrFunction,
-+    loop_blocks: &FxHashSet<usize>,
-+    load_dests: &[Value],
-+    iv_derived: &FxHashSet<Value>,
-+    is_invariant: &dyn Fn(&Operand) -> bool,
-+    elem_ty: &IrType,
-+    operand: &Operand,
-+    depth: usize,
-+    allow_ext_fp_ops: bool,
-+) -> Option<MapExpr> {
-+    if is_invariant(operand) {
-+        return Some(MapExpr::Invariant(operand.clone()));
-+    }
-+    let Operand::Value(v) = operand else {
-+        return None;
-+    };
-+    parse_map_expr(
-+        func,
-+        loop_blocks,
-+        load_dests,
-+        iv_derived,
-+        is_invariant,
-+        elem_ty,
-+        *v,
-+        depth,
-+        allow_ext_fp_ops,
-+    )
-+}
-+
-+/// Every BinOp/Sqrt node in the tree must have a lowering before the
-+/// transform starts mutating the function (fail-closed pre-validation).
-+fn map_tree_ops_available(
-+    expr: &MapExpr,
-+    bin_op: &dyn Fn(&IrBinOp) -> Option<IntrinsicOp>,
-+    sqrt_op: Option<IntrinsicOp>,
-+) -> bool {
-+    match expr {
-+        MapExpr::Load(_) | MapExpr::Invariant(_) => true,
-+        MapExpr::BinOp(op, l, r) => {
-+            bin_op(op).is_some()
-+                && map_tree_ops_available(l, bin_op, sqrt_op)
-+                && map_tree_ops_available(r, bin_op, sqrt_op)
-+        }
-+        MapExpr::Sqrt(x) => sqrt_op.is_some() && map_tree_ops_available(x, bin_op, sqrt_op),
-+    }
-+}
-+
-+fn expr_uses_stream(expr: &MapExpr, stream: usize) -> bool {
-+    match expr {
-+        MapExpr::Load(i) => *i == stream,
-+        MapExpr::Invariant(_) => false,
-+        MapExpr::BinOp(_, l, r) => expr_uses_stream(l, stream) || expr_uses_stream(r, stream),
-+        MapExpr::Sqrt(x) => expr_uses_stream(x, stream),
-+    }
-+}
-+
- /// Prove two loop GEPs denote the same address in every iteration.  Frontend
- /// lowering commonly emits separate GEP SSA destinations for an exact in-place
- /// load/store while sharing the base and byte-offset operands.
-@@ -6843,7 +7169,10 @@ fn transform_reduction_avx2(
-                 };
-                 let body_block = &mut func.blocks[pattern.body_idx];
- 
--                if fp_contract_fast && matches!(pattern.element_type, IrType::F32 | IrType::F64) {
-+                if fp_contract_fast
-+                    && x86_fma_enabled()
-+                    && matches!(pattern.element_type, IrType::F32 | IrType::F64)
-+                {
-                     let fma_inst = Instruction::Intrinsic {
-                         dest: Some(vec_sum_value),
-                         op: vec_fma_op,
-@@ -8381,11 +8710,15 @@ fn transform_map_vector(
-     };
- 
-     let elem_size = if pattern.elem_ty == IrType::F64 { 8 } else { 4 };
--    let Some((src_base, _)) =
--        find_reduction_byte_iv(func, &pattern.loop_blocks, pattern.src_gep, elem_size)
--    else {
--        return 0;
--    };
-+    let mut src_bases = Vec::with_capacity(pattern.src_geps.len());
-+    for &src_gep in &pattern.src_geps {
-+        let Some((base, _)) =
-+            find_reduction_byte_iv(func, &pattern.loop_blocks, src_gep, elem_size)
-+        else {
-+            return 0;
-+        };
-+        src_bases.push(base);
-+    }
-     let Some((dst_base, _)) =
-         find_reduction_byte_iv(func, &pattern.loop_blocks, pattern.dst_gep, elem_size)
-     else {
-@@ -8547,7 +8880,6 @@ fn transform_map_vector(
-         });
-     changes += 2;
- 
--    let src_address = (src_base, Operand::Value(byte_iv));
-     let dst_address = (dst_base, Operand::Value(byte_iv));
- 
-     let broadcast_op = match (pattern.elem_ty, avx2) {
-@@ -8561,70 +8893,63 @@ fn transform_map_vector(
-         _ => return 0,
-     };
- 
--    let mut emit_broadcast = |operand: &Option<Operand>| -> Option<Value> {
--        let scalar = operand.as_ref()?;
--        let value = Value(next_val_id);
--        next_val_id += 1;
--        func.blocks[preheader_idx]
--            .instructions
--            .push(Instruction::Intrinsic {
--                dest: Some(value),
--                op: broadcast_op,
--                dest_ptr: None,
--                args: vec![scalar.clone()],
--            });
--        changes += 1;
--        Some(value)
-+    let load_op = match (pattern.elem_ty, avx2) {
-+        (IrType::F64, true) => IntrinsicOp::VecLoadF64x4,
-+        (IrType::F64, false) => IntrinsicOp::VecLoadF64x2,
-+        (IrType::F32, true) => IntrinsicOp::VecLoadF32x8,
-+        (IrType::F32, false) => IntrinsicOp::VecLoadF32x4,
-+        (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecLoadI32x8,
-+        (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecLoadI32x4,
-+        (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecLoadI64x2,
-+        _ => return 0,
-     };
--    let scale_vec = emit_broadcast(&pattern.scale);
--    let offset_vec = emit_broadcast(&pattern.offset);
--
--    let (load_op, mul_op, add_op, store_op) = match (pattern.elem_ty, avx2) {
--        (IrType::F64, true) => (
--            IntrinsicOp::VecLoadF64x4,
--            IntrinsicOp::VecMulF64x4,
--            IntrinsicOp::VecAddF64x4,
--            IntrinsicOp::VecStoreF64x4,
--        ),
--        (IrType::F64, false) => (
--            IntrinsicOp::VecLoadF64x2,
--            IntrinsicOp::VecMulF64x2,
--            IntrinsicOp::VecAddF64x2,
--            IntrinsicOp::VecStoreF64x2,
--        ),
--        (IrType::F32, true) => (
--            IntrinsicOp::VecLoadF32x8,
--            IntrinsicOp::VecMulF32x8,
--            IntrinsicOp::VecAddF32x8,
--            IntrinsicOp::VecStoreF32x8,
--        ),
--        (IrType::F32, false) => (
--            IntrinsicOp::VecLoadF32x4,
--            IntrinsicOp::VecMulF32x4,
--            IntrinsicOp::VecAddF32x4,
--            IntrinsicOp::VecStoreF32x4,
--        ),
--        (IrType::I32 | IrType::U32, true) => (
--            IntrinsicOp::VecLoadI32x8,
--            IntrinsicOp::VecMulI32x8,
--            IntrinsicOp::VecAddI32x8,
--            IntrinsicOp::VecStoreI32x8,
--        ),
--        (IrType::I32 | IrType::U32, false) => (
--            IntrinsicOp::VecLoadI32x4,
--            IntrinsicOp::VecMulI32x4,
--            IntrinsicOp::VecAddI32x4,
--            IntrinsicOp::VecStoreI32x4,
--        ),
--        (IrType::I64 | IrType::U64, _) => (
--            IntrinsicOp::VecLoadI64x2,
--            IntrinsicOp::VecMulI64x2,
--            IntrinsicOp::VecAddI64x2,
--            IntrinsicOp::VecStoreI64x2,
--        ),
-+    let store_op = match (pattern.elem_ty, avx2) {
-+        (IrType::F64, true) => IntrinsicOp::VecStoreF64x4,
-+        (IrType::F64, false) => IntrinsicOp::VecStoreF64x2,
-+        (IrType::F32, true) => IntrinsicOp::VecStoreF32x8,
-+        (IrType::F32, false) => IntrinsicOp::VecStoreF32x4,
-+        (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecStoreI32x8,
-+        (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecStoreI32x4,
-+        (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecStoreI64x2,
-         _ => return 0,
-     };
--    let madd_op = if fp_contract_fast && avx2 {
-+    let bin_op = |op: &IrBinOp| -> Option<IntrinsicOp> {
-+        match (pattern.elem_ty, avx2, op) {
-+            (IrType::F64, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddF64x4),
-+            (IrType::F64, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddF64x2),
-+            (IrType::F64, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubF64x4),
-+            (IrType::F64, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubF64x2),
-+            (IrType::F64, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulF64x4),
-+            (IrType::F64, false, IrBinOp::Mul) => Some(IntrinsicOp::VecMulF64x2),
-+            (IrType::F64, true, IrBinOp::SDiv) => Some(IntrinsicOp::VecDivF64x4),
-+            (IrType::F64, false, IrBinOp::SDiv) => Some(IntrinsicOp::VecDivF64x2),
-+            (IrType::F32, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddF32x8),
-+            (IrType::F32, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddF32x4),
-+            (IrType::F32, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubF32x8),
-+            (IrType::F32, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubF32x4),
-+            (IrType::F32, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulF32x8),
-+            (IrType::F32, false, IrBinOp::Mul) => Some(IntrinsicOp::VecMulF32x4),
-+            (IrType::F32, true, IrBinOp::SDiv) => Some(IntrinsicOp::VecDivF32x8),
-+            (IrType::F32, false, IrBinOp::SDiv) => Some(IntrinsicOp::VecDivF32x4),
-+            (IrType::I32 | IrType::U32, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddI32x8),
-+            (IrType::I32 | IrType::U32, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddI32x4),
-+            (IrType::I32 | IrType::U32, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI32x8),
-+            (IrType::I32 | IrType::U32, false, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI32x4),
-+            (IrType::I64 | IrType::U64, _, IrBinOp::Add) => Some(IntrinsicOp::VecAddI64x2),
-+            (IrType::I64 | IrType::U64, _, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI64x2),
-+            _ => None,
-+        }
-+    };
-+    // Sqrt is only available for FP element types; integer trees never
-+    // contain Sqrt (the parser gates it), so `None` is fine there.
-+    let sqrt_op = match (pattern.elem_ty, avx2) {
-+        (IrType::F64, true) => Some(IntrinsicOp::VecSqrtF64x4),
-+        (IrType::F64, false) => Some(IntrinsicOp::VecSqrtF64x2),
-+        (IrType::F32, true) => Some(IntrinsicOp::VecSqrtF32x8),
-+        (IrType::F32, false) => Some(IntrinsicOp::VecSqrtF32x4),
-+        _ => None,
-+    };
-+    let madd_op = if fp_contract_fast && avx2 && x86_fma_enabled() {
-         match pattern.elem_ty {
-             IrType::F64 => Some(IntrinsicOp::VecMaddF64x4),
-             IrType::F32 => Some(IntrinsicOp::VecMaddF32x8),
-@@ -8634,68 +8959,58 @@ fn transform_map_vector(
-         None
-     };
- 
-+    // Fail-closed BEFORE any mutation: every operation the tree needs must
-+    // have a lowering. A mid-transform bail after the preheader/byte-IV
-+    // rewrite would leave `func.next_value_id` stale and corrupt every
-+    // later pass (bit_idioms indexed out of bounds on exactly this).
-+    if !map_tree_ops_available(&pattern.expr, &bin_op, sqrt_op) {
-+        if debug {
-+            eprintln!("[VEC-MAP]   Tree requires an op with no vector lowering");
-+        }
-+        return 0;
 +    }
 +
-     // Replace the scalar store with only the packed operations present in the
-     // source expression.  DCE removes the now-unreachable scalar dataflow.
-     {
--        let vec_load = Value(next_val_id);
--        next_val_id += 1;
--        let load_args = vec![Operand::Value(src_address.0), src_address.1.clone()];
--        let mut vec_insts = vec![Instruction::Intrinsic {
--            dest: Some(vec_load),
--            op: load_op,
--            dest_ptr: None,
--            args: load_args,
--        }];
--        let mut current = vec_load;
--        if let (Some(madd), Some(scale), Some(offset)) = (madd_op, scale_vec, offset_vec) {
--            let result = Value(next_val_id);
--            next_val_id += 1;
--            vec_insts.push(Instruction::Intrinsic {
--                dest: Some(result),
--                op: madd,
--                dest_ptr: None,
--                args: vec![
--                    Operand::Value(current),
--                    Operand::Value(scale),
--                    Operand::Value(offset),
--                ],
--            });
--            current = result;
--        } else {
--            if let Some(scale) = scale_vec {
--                let result = Value(next_val_id);
--                next_val_id += 1;
--                vec_insts.push(Instruction::Intrinsic {
--                    dest: Some(result),
--                    op: mul_op,
--                    dest_ptr: None,
--                    args: vec![Operand::Value(current), Operand::Value(scale)],
--                });
--                current = result;
--            }
--            if let Some(offset) = offset_vec {
--                let result = Value(next_val_id);
--                next_val_id += 1;
--                vec_insts.push(Instruction::Intrinsic {
--                    dest: Some(result),
--                    op: add_op,
--                    dest_ptr: None,
--                    args: vec![Operand::Value(current), Operand::Value(offset)],
--                });
--                current = result;
-+        let mut ctx = MapEmitCtx {
-+            src_bases: &src_bases,
-+            byte_iv,
-+            load_op,
-+            broadcast_op,
-+            sqrt_op,
-+            madd_op,
-+            bin_op: &bin_op,
-+            broadcast_cache: Vec::new(),
-+            preheader_insts: Vec::new(),
-+            vec_insts: Vec::new(),
-+            next_val_id,
-+            changes: &mut changes,
-+        };
-+        let Some(current) = ctx.emit(&pattern.expr) else {
-+            if debug {
-+                eprintln!("[VEC-MAP]   Tree emission failed");
+     let mut primary_loads: Vec<Value> = Vec::new();
+     let mut pattern = match added_inst {
+         // Simple sum pattern: sum += arr[i]
+@@ -2021,6 +2127,8 @@ fn analyze_reduction_pattern(
+                 exit_cmp_dest,
+                 loop_blocks: loop_info.body.clone(),
+                 seconds: Vec::new(),
++                guard_cond: select_guard_cond,
++                guard_rhs,
              }
--        }
-+            return changes;
-+        };
-         let store_args = vec![
-             Operand::Value(current),
-             Operand::Value(dst_address.0),
-             dst_address.1.clone(),
-         ];
--        vec_insts.push(Instruction::Intrinsic {
-+        ctx.vec_insts.push(Instruction::Intrinsic {
-             dest: None,
-             op: store_op,
-             dest_ptr: Some(dst_address.0),
-             args: store_args,
-         });
-+        // Broadcasts live in the preheader so they are hoisted out of the
-+        // packed loop (register-allocated once, reused across iterations).
-+        func.blocks[preheader_idx]
-+            .instructions
-+            .extend(ctx.preheader_insts);
-+        next_val_id = ctx.next_val_id;
-+        let mut vec_insts = ctx.vec_insts;
- 
-         let body = &mut func.blocks[pattern.body_idx];
-         let Some(store_pos) = body.instructions.iter().position(
-@@ -8707,7 +9022,7 @@ fn transform_map_vector(
-             return changes;
-         };
-         let inserted = vec_insts.len();
--        for (i, inst) in vec_insts.into_iter().enumerate() {
-+        for (i, inst) in vec_insts.drain(..).enumerate() {
-             body.instructions.insert(store_pos + i, inst);
          }
-         body.instructions.remove(store_pos + inserted);
-@@ -8736,13 +9051,13 @@ fn insert_map_remainder_loop(
-     next_val_id: &mut u32,
-     next_label: &mut u32,
- ) -> usize {
--    let mut src_base = None;
-+    let mut src_bases: Vec<Option<Value>> = vec![None; pattern.src_geps.len()];
-     let mut dst_base = None;
-     for &block_idx in &pattern.loop_blocks {
-         for inst in &func.blocks[block_idx].instructions {
-             if let Instruction::GetElementPtr { dest, base, .. } = inst {
--                if *dest == pattern.src_gep {
--                    src_base = Some(*base);
-+                if let Some(slot) = pattern.src_geps.iter().position(|g| *g == *dest) {
-+                    src_bases[slot] = Some(*base);
+ 
+@@ -2130,6 +2238,8 @@ fn analyze_reduction_pattern(
+                     exit_cmp_dest,
+                     loop_blocks: loop_info.body.clone(),
+                     seconds: Vec::new(),
++                guard_cond: select_guard_cond,
++                guard_rhs,
                  }
-                 if *dest == pattern.dst_gep {
-                     dst_base = Some(*base);
-@@ -8750,9 +9065,13 @@ fn insert_map_remainder_loop(
+             } else {
+                 if debug {
+@@ -2250,6 +2360,8 @@ fn analyze_reduction_pattern(
+                 exit_cmp_dest,
+                 loop_blocks: loop_info.body.clone(),
+                 seconds: Vec::new(),
++                guard_cond: select_guard_cond,
++                guard_rhs,
              }
          }
-     }
--    let (Some(src_base), Some(dst_base)) = (src_base, dst_base) else {
-+    let Some(dst_base) = dst_base else {
-         return 0;
-     };
-+    let src_bases: Vec<Value> = match src_bases.into_iter().collect::<Option<Vec<_>>>() {
-+        Some(v) => v,
-+        None => return 0,
-+    };
  
-     let vec_exit_label = BlockId(*next_label);
-     *next_label += 1;
-@@ -8774,9 +9093,7 @@ fn insert_map_remainder_loop(
-     let i_rem_cmp = fresh();
-     let i_rem_cast = matches!(pattern.iv_ty, IrType::I32 | IrType::U32).then(|| fresh());
-     let offset_v = fresh();
--    let gep_src = fresh();
-     let gep_dst = fresh();
--    let load_v = fresh();
+@@ -4252,6 +4364,7 @@ fn analyze_stencil_pattern(
+                     | Instruction::Cmp { .. }
+                     | Instruction::Cast { .. }
+                     | Instruction::Copy { .. }
++                    | Instruction::Select { .. }
+                     | Instruction::GetElementPtr { .. }
+                     | Instruction::GlobalAddr { .. } => {}
+                     _ => {
+@@ -7927,14 +8040,45 @@ fn insert_reduction_remainder_loop(
+     // Add pattern-specific operations
+     match pattern.kind {
+         ReductionKind::Sum => {
+-            // Simple sum: sum += array_a[i]
+-            remainder_body_instructions.push(Instruction::BinOp {
+-                dest: sum_rem_next,
+-                op: IrBinOp::Add,
+-                lhs: Operand::Value(sum_rem_phi),
+-                rhs: Operand::Value(scalar_a),
+-                ty: pattern.accumulator_type,
+-            });
++            if let Some(guard_rhs) = &pattern.guard_rhs {
++                // Conditional sum: `if (a[i] > rhs) sum += a[i]` — mirror
++                // the guard in the scalar tail (element-type compare on the
++                // UNCAST loaded value, matching the original C semantics).
++                let cmp_rem = Value(*next_val_id);
++                *next_val_id += 1;
++                let add_rem = Value(*next_val_id);
++                *next_val_id += 1;
++                remainder_body_instructions.push(Instruction::Cmp {
++                    dest: cmp_rem,
++                    op: IrCmpOp::Sgt,
++                    lhs: Operand::Value(load_rem_a),
++                    rhs: guard_rhs.clone(),
++                    ty: pattern.element_type,
++                });
++                remainder_body_instructions.push(Instruction::BinOp {
++                    dest: add_rem,
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(sum_rem_phi),
++                    rhs: Operand::Value(scalar_a),
++                    ty: pattern.accumulator_type,
++                });
++                remainder_body_instructions.push(Instruction::Select {
++                    dest: sum_rem_next,
++                    cond: Operand::Value(cmp_rem),
++                    true_val: Operand::Value(add_rem),
++                    false_val: Operand::Value(sum_rem_phi),
++                    ty: pattern.accumulator_type,
++                });
++            } else {
++                // Simple sum: sum += array_a[i]
++                remainder_body_instructions.push(Instruction::BinOp {
++                    dest: sum_rem_next,
++                    op: IrBinOp::Add,
++                    lhs: Operand::Value(sum_rem_phi),
++                    rhs: Operand::Value(scalar_a),
++                    ty: pattern.accumulator_type,
++                });
++            }
+         }
+         ReductionKind::Max => {
+             // mx = max(mx, x) as a scalar Select: take x when x > mx.
+@@ -8687,7 +8831,58 @@ fn transform_reduction_avx2(
+                         ),
+                     };
  
-     // Redirect the vectorized header's known false/exit edge.
-     if let Terminator::CondBranch { false_label, .. } =
-@@ -8854,51 +9171,31 @@ fn insert_map_remainder_loop(
-         rhs: Operand::Const(IrConst::I64(elem_bytes)),
-         ty: IrType::I64,
-     });
--    remainder_insts.push(Instruction::GetElementPtr {
--        dest: gep_src,
--        base: src_base,
--        offset: Operand::Value(offset_v),
--        ty: pattern.elem_ty,
--    });
-     remainder_insts.push(Instruction::GetElementPtr {
-         dest: gep_dst,
-         base: dst_base,
-         offset: Operand::Value(offset_v),
-         ty: pattern.elem_ty,
-     });
--    remainder_insts.push(Instruction::Load {
--        volatile: false,
--        dest: load_v,
--        ptr: gep_src,
--        ty: pattern.elem_ty,
--        seg_override: AddressSpace::Default,
--    });
--    let mut scalar_result = load_v;
--    if let Some(scale) = &pattern.scale {
--        let value = fresh();
--        remainder_insts.push(Instruction::BinOp {
--            dest: value,
--            op: IrBinOp::Mul,
--            lhs: Operand::Value(scalar_result),
--            rhs: scale.clone(),
--            ty: pattern.elem_ty,
--        });
--        scalar_result = value;
--    }
--    if let Some(offset) = &pattern.offset {
--        let value = fresh();
--        remainder_insts.push(Instruction::BinOp {
--            dest: value,
--            op: IrBinOp::Add,
--            lhs: Operand::Value(scalar_result),
--            rhs: offset.clone(),
--            ty: pattern.elem_ty,
--        });
--        scalar_result = value;
--    }
-+    // Per-stream GEP + load, then the scalar mirror of the expression tree.
-+    // Invariant leaves are already available as operands (no instruction);
-+    // Sqrt re-emits the scalar SqrtF32/SqrtF64 intrinsic, and BinOps re-emit
-+    // the identical scalar operation — lane-exact by construction.
-+    let mut next_val_local = *next_val_id;
-+    let Some(scalar_result) = emit_map_scalar_tree(
-+        &pattern.expr,
-+        &src_bases,
-+        pattern,
-+        Operand::Value(offset_v),
-+        &mut remainder_insts,
-+        &mut next_val_local,
-+    ) else {
-+        return 0;
-+    };
-+    *next_val_id = next_val_local;
-     remainder_insts.push(Instruction::Store {
-         volatile: false,
--        val: Operand::Value(scalar_result),
-+        val: scalar_result,
-         ptr: gep_dst,
-         ty: pattern.elem_ty,
-         seg_override: AddressSpace::Default,
-@@ -8932,6 +9229,108 @@ fn insert_map_remainder_loop(
-     4
- }
- 
-+/// Scalar mirror of the map expression tree for the exact remainder loop
-+/// (OP-05a). Emits one instruction per tree node — the identical scalar
-+/// operation the original loop performed — so tail elements observe the same
-+/// arithmetic (and, without `-ffp-contract=fast`, the same rounding) as the
-+/// pre-vectorization code.
-+fn emit_map_scalar_tree(
-+    expr: &MapExpr,
-+    src_bases: &[Value],
-+    pattern: &MapPattern,
-+    byte_offset: Operand,
-+    remainder_insts: &mut Vec<Instruction>,
-+    next_val_id: &mut u32,
-+) -> Option<Operand> {
-+    match expr {
-+        MapExpr::Load(stream) => {
-+            let gep = {
-+                let v = Value(*next_val_id);
-+                *next_val_id += 1;
-+                v
-+            };
-+            let load = {
-+                let v = Value(*next_val_id);
-+                *next_val_id += 1;
-+                v
-+            };
-+            remainder_insts.push(Instruction::GetElementPtr {
-+                dest: gep,
-+                base: src_bases[*stream],
-+                offset: byte_offset.clone(),
-+                ty: pattern.elem_ty,
-+            });
-+            remainder_insts.push(Instruction::Load {
-+                volatile: false,
-+                dest: load,
-+                ptr: gep,
-+                ty: pattern.elem_ty,
-+                seg_override: AddressSpace::Default,
-+            });
-+            Some(Operand::Value(load))
-+        }
-+        MapExpr::Invariant(operand) => Some(operand.clone()),
-+        MapExpr::Sqrt(x) => {
-+            let inner = emit_map_scalar_tree(
-+                x,
-+                src_bases,
-+                pattern,
-+                byte_offset,
-+                remainder_insts,
-+                next_val_id,
-+            )?;
-+            let dest = {
-+                let v = Value(*next_val_id);
-+                *next_val_id += 1;
-+                v
-+            };
-+            let sqrt_op = match pattern.elem_ty {
-+                IrType::F64 => IntrinsicOp::SqrtF64,
-+                IrType::F32 => IntrinsicOp::SqrtF32,
-+                _ => return None,
-+            };
-+            remainder_insts.push(Instruction::Intrinsic {
-+                dest: Some(dest),
-+                op: sqrt_op,
-+                dest_ptr: None,
-+                args: vec![inner],
-+            });
-+            Some(Operand::Value(dest))
-+        }
-+        MapExpr::BinOp(op, l, r) => {
-+            let lhs = emit_map_scalar_tree(
-+                l,
-+                src_bases,
-+                pattern,
-+                byte_offset.clone(),
-+                remainder_insts,
-+                next_val_id,
-+            )?;
-+            let rhs = emit_map_scalar_tree(
-+                r,
-+                src_bases,
-+                pattern,
-+                byte_offset,
-+                remainder_insts,
-+                next_val_id,
-+            )?;
-+            let dest = {
-+                let v = Value(*next_val_id);
-+                *next_val_id += 1;
-+                v
-+            };
-+            remainder_insts.push(Instruction::BinOp {
-+                dest,
-+                op: *op,
-+                lhs,
-+                rhs,
-+                ty: pattern.elem_ty,
-+            });
-+            Some(Operand::Value(dest))
-+        }
-+    }
-+}
-+
- /// Recognize a fixed-width squared-distance expression and pack its independent
- /// lane work.  Reassociation is a hard precondition because the horizontal
- /// reduction tree need not match the source's left-associated additions.
-@@ -9120,6 +9519,15 @@ pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
-     vectorize_function_mode(func, false, false, false)
- }
- 
-+/// `-ffp-contract=fast` without `-fassociative-math`: FP reductions keep
-+/// their scalar-order legality gate (reassociation still off), but map
-+/// expression trees may contract mul+add into fused madd — the same
-+/// distinction GCC makes (`-ffp-contract=fast` alone contracts loops;
-+/// reduction reassociation needs `-fassociative-math`).
-+pub(crate) fn vectorize_function_contract(func: &mut IrFunction) -> usize {
-+    vectorize_function_mode(func, false, true, false)
-+}
-+
- /// Run x86 vectorization with reassociation but without FMA contraction.
- pub(crate) fn vectorize_function_reassoc(func: &mut IrFunction) -> usize {
-     vectorize_function_mode(func, true, false, true)
-diff --git a/tests/regression/vectorize_map_expr_tree.c b/tests/regression/vectorize_map_expr_tree.c
+-                    if widening_i64 {
++                    if widening_i64 && pattern.guard_cond.is_some() {
++                        // CONDITIONAL (guarded) widening: the composite
++                        // masked intrinsic carries the guard's rhs operand;
++                        // the lowering builds the per-lane compare mask
++                        // internally. Splice: remove the Select first (it
++                        // sits after the Add), then replace the Add.
++                        let guard_rhs = pattern.guard_rhs.clone().unwrap_or(Operand::Const(
++                            IrConst::I32(0),
++                        ));
++                        let masked_inst = Instruction::Intrinsic {
++                            dest: Some(vec_sum_value),
++                            op: IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2,
++                            dest_ptr: None,
++                            args: vec![
++                                Operand::Value(pattern.accumulator_phi),
++                                base,
++                                off,
++                                guard_rhs,
++                            ],
++                        };
++                        // The Add's result id (the Select's true_val),
++                        // read BEFORE any splice shifts indices.
++                        let add_result_id = body_block
++                            .instructions
++                            .get(pattern.accumulator_add_idx)
++                            .and_then(|i| i.dest())
++                            .map(|d| d.0);
++                        // Locate the Select (true_val == the Add's result)
++                        // to remove it together with the old Add.
++                        let mut select_idx = None;
++                        for (sidx, sin) in body_block.instructions.iter().enumerate() {
++                            if let Instruction::Select { true_val, .. } = sin {
++                                if matches!(
++                                    true_val,
++                                    Operand::Value(tv) if Some(tv.0) == add_result_id
++                                ) {
++                                    select_idx = Some(sidx);
++                                    break;
++                                }
++                            }
++                        }
++                        if let Some(si) = select_idx {
++                            body_block.instructions.remove(si);
++                        }
++                        body_block
++                            .instructions
++                            .insert(pattern.accumulator_add_idx, masked_inst);
++                        body_block
++                            .instructions
++                            .remove(pattern.accumulator_add_idx + 1);
++                        changes += 1;
++                    } else if widening_i64 {
+                         // One composite intrinsic: acc += sext(load4×I32).
+                         let widen_inst = Instruction::Intrinsic {
+                             dest: Some(vec_sum_value),
+diff --git a/tests/regression/vectorize_masked_widen_sum.c b/tests/regression/vectorize_masked_widen_sum.c
 new file mode 100644
-index 0000000..8c3540e
+index 0000000..386a708
 --- /dev/null
-+++ b/tests/regression/vectorize_map_expr_tree.c
-@@ -0,0 +1,67 @@
++++ b/tests/regression/vectorize_masked_widen_sum.c
+@@ -0,0 +1,34 @@
 +/*
-+ * OP-05a: elementwise map expression trees (sqrt/div/sub/multi-stream).
-+ * Every kernel is checked elementwise against a volatile-anchored scalar
-+ * reference, over a size that exercises both the packed body (130 = 16x8+2)
-+ * and the scalar remainder.
++ * Masked widening I32->I64 reduction (conditional sums, v8):
++ *   long s = 0; for (...) if (a[i] > K) s += a[i];
++ * Verified elementwise against volatile-anchored references for const,
++ * variable, and negative guard thresholds, plus a small tail (16 = 4*4,
++ * exercising the masked vector body and the scalar remainder).
 + */
 +#include <stdio.h>
-+#include <math.h>
-+
-+#define N 130
-+
-+static double d[N], s[N], a3[N], b3[N], c3[N];
-+static float fd[N], fs[N];
-+
-+void sqrt_scale(double *restrict dst, const double *restrict src, int n, double k) {
-+    for (int i = 0; i < n; i++) dst[i] = sqrt(src[i]) * k;
++static int a[64];
++static long cs(int *arr, int n, int t) {
++    long s = 0;
++    for (int i = 0; i < n; i++) if (arr[i] > t) s += arr[i];
++    return s;
 +}
-+void reciprocal(float *restrict dst, const float *restrict src, int n) {
-+    for (int i = 0; i < n; i++) dst[i] = 1.0f / src[i];
-+}
-+void three_stream(double *restrict dst, const double *restrict a,
-+                  const double *restrict b, const double *restrict c, int n) {
-+    for (int i = 0; i < n; i++) dst[i] = a[i] * b[i] + c[i];
-+}
-+void mixed(float *restrict dst, const float *restrict src, int n) {
-+    for (int i = 0; i < n; i++)
-+        dst[i] = sqrtf(src[i] * src[i] + 1.0f) - src[i] / 3.0f;
-+}
-+
 +int main(void) {
-+    for (int i = 0; i < N; i++) {
-+        s[i] = 0.25 + i * 0.01;
-+        fs[i] = 0.5f + i * 0.02f;
-+        a3[i] = i + 1.0;
-+        b3[i] = 2.0 - i * 0.005;
-+        c3[i] = i * 0.5;
-+    }
-+
++    for (int i = 0; i < 64; i++) a[i] = (i * 37 % 211) - 105;
 +    int bad = 0;
-+
-+    sqrt_scale(d, s, N, 2.0);
-+    for (int i = 0; i < N; i++) {
-+        volatile double x = s[i];
-+        if (d[i] != sqrt(x) * 2.0) bad++;
++    for (int n = 1; n <= 64; n *= 4) {
++        long r0 = 0, r5 = 0, rn = 0, rv = 0;
++        for (int i = 0; i < n; i++) {
++            volatile int x = a[i];
++            if (x > 0) r0 += x;
++            if (x > 5) r5 += x;
++            if (x > -100) rn += x;
++            if (x > 30) rv += x;
++        }
++        if (cs(a, n, 0) != r0) bad++;
++        if (cs(a, n, 5) != r5) bad++;
++        if (cs(a, n, -100) != rn) bad++;
++        if (cs(a, n, 30) != rv) bad++;
 +    }
-+
-+    reciprocal(fd, fs, N);
-+    for (int i = 0; i < N; i++) {
-+        volatile float x = fs[i];
-+        if (fd[i] != 1.0f / x) bad++;
-+    }
-+
-+    three_stream(d, a3, b3, c3, N);
-+    for (int i = 0; i < N; i++) {
-+        volatile double x = a3[i], y = b3[i], z = c3[i];
-+        if (d[i] != x * y + z) bad++;
-+    }
-+
-+    mixed(fd, fs, N);
-+    for (int i = 0; i < N; i++) {
-+        volatile float x = fs[i];
-+        if (fd[i] != sqrtf(x * x + 1.0f) - x / 3.0f) bad++;
-+    }
-+
 +    printf("%s\n", bad == 0 ? "OK" : "FAIL");
-+    return bad == 0 ? 0 : 1;
++    return bad;
 +}
-diff --git a/tests/regression/vectorize_map_expr_tree.flags b/tests/regression/vectorize_map_expr_tree.flags
+diff --git a/tests/regression/vectorize_masked_widen_sum.flags b/tests/regression/vectorize_masked_widen_sum.flags
 new file mode 100644
-index 0000000..72305a7
+index 0000000..cd11b1e
 --- /dev/null
-+++ b/tests/regression/vectorize_map_expr_tree.flags
++++ b/tests/regression/vectorize_masked_widen_sum.flags
 @@ -0,0 +1 @@
-+-O3 -march=x86-64-v3 -ffp-contract=fast
++-O3 -march=x86-64-v3
