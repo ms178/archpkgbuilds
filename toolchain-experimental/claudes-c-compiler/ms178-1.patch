@@ -1,875 +1,538 @@
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index f8a21abb..8bb24251 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -242,6 +242,28 @@ fn can_indexed_addr_fold(
-     if cg.get_phys_reg_for_value(info.base.0).is_some() {
-         return true;
-     }
-+    // Alloca bases fold as `disp(%rbp/%rsp,%idx,scale)`: the frame slot is
-+    // re-computable at every use site, exactly like the const-offset alloca
-+    // fold (see can_const_addr_fold). This is the dominant shape for
-+    // inlined array kernels — the callee's `const double *v` parameter
-+    // becomes a caller alloca after inlining, and without this arm every
-+    // access paid a 4-instruction address materialisation
-+    // (`leaq slot,%rcx; shlq $3,%rax; addq; load`) instead of one SIB
-+    // operand (spectral_norm mul_Av/mul_Atv inner loops).
-+    //
-+    // ONLY plain Direct slots: an OverAligned alloca's runtime address is
-+    // `(slot+align-1)&~(align-1)`, which the frame-SIB emitter cannot
-+    // express — and a can-fold/emitter disagreement here is not merely a
-+    // missed fold: the dead-offset producer walk skips the offset chain
-+    // based on THIS answer, and the emitter's rematerialise fallback would
-+    // then reference the skipped producer (vzeroupper_after_ymm: compare
-+    // loop read `dst[i]` through a never-written index register).
-+    if cg.state_ref().is_alloca(info.base.0) {
-+        return matches!(
-+            cg.state_ref().resolve_slot_addr(info.base.0),
-+            Some(crate::backend::state::SlotAddr::Direct(_))
-+        );
-+    }
-     // Symbol-base indexed addressing (`sym(,%idx,scale)`): the GlobalAddr
-     // base was never materialised and has no register home.  Only backends
-     // that emit the symbol form may take this path — otherwise the skipped
-@@ -1105,6 +1127,38 @@ fn build_indexed_gep_map(
-                     // iv-update Copy uses.
-                     if let Some(ar) = add_result {
-                         if iv_coalesce_pairs.contains(&(iv_id, ar)) {
-+                            // Retarget instead of refusing. The offset
-+                            // chain semantically IS
-+                            // `base + add_result << shift` here (the
-+                            // peel walked through the add: address =
-+                            // base + ((iv + k) << shift_at_add) <<
-+                            // shift_after = base + add_result <<
-+                            // shift_final; disp held only the add's own
-+                            // `k << shift_at_add` because nested adds
-+                            // are refused above, so dropping it and
-+                            // indexing by the add's result is exact).
-+                            // The old-iv SIB form `k<<(base, iv, scale)`
-+                            // would read the iv's register after the
-+                            // coalesced in-place add overwrote it; the
-+                            // retargeted form reads the register the add
-+                            // WROTE, and liveness of add_result extends
-+                            // to the access (can_indexed_addr_fold), so
-+                            // the add is ordered before the SIB by a
-+                            // true dependence — no scheduling hazard
-+                            // regardless of block layout. This is the
-+                            // `i++; a[i]` post-increment scan shape
-+                            // (linux_find_bit: 2 extra instructions per
-+                            // scanned word; GCC folds it too).
-+                            map.insert(
-+                                dest.0,
-+                                IndexedGepInfo {
-+                                    base: *base,
-+                                    index: Value(ar),
-+                                    shift,
-+                                    disp: 0,
-+                                    orig_offset: *off,
-+                                },
-+                            );
-                             continue;
-                         }
-                     }
-@@ -3532,35 +3586,52 @@ fn generate_function(
-             }
-         }
-         let single_defs = index_single_defs(func, &stab);
-+        // Fixed-point dead-offset analysis. The old walk required
-+        // `use_count == 1` per chain node, which stops at SHARED offsets:
-+        // `a[i]; b[i]` both GEP the same `i*8` value (use_count 2), and the
-+        // scaled-offset producer stayed live as dead code after both GEPs
-+        // folded (linux_find_bit: `movq %r13,%rbx; shlq $3,%rbx` per scanned
-+        // word). Instead, count uses ATTRIBUTABLE to the fold: (a) offset
-+        // operands of foldable GEPs, (b) operand positions of other dead
-+        // chain nodes. A node is dead iff every one of its uses is
-+        // fold-attributable. The walk still stops at the fold's index value:
-+        // the terminal index is live by construction (the RA keeps it
-+        // register-resident to the access).
-+        let mut fold_uses: FxHashMap<u32, u32> = FxHashMap::default();
-+        for dest in &foldable_folds {
-+            if let Some(info) = indexed_gep_map.get(dest) {
-+                *fold_uses.entry(info.orig_offset.0).or_insert(0) += 1;
-+            }
-+        }
-         for (dest, info) in indexed_gep_map.iter() {
-             if !foldable_folds.contains(dest) || has_store_consumer.contains(dest) {
-                 continue;
-             }
--            // Walk the offset's single-use producer chain; every node whose
--            // only use is within this dead chain is skipped.  Nodes with
--            // other uses (loop IVs, shared subexpressions) stop the walk.
--            // CRITICAL: the walk must stop AT the fold's index value —
--            // resolve_index may return an UNPEELED terminal (e.g. a
--            // const-materialised offset: `movl $132,%edi; leal (%esi,%edi)`
--            // folds to `movl (%esi,%edi)` and READS the index at the
--            // access).  Peeling intermediates are dead; the terminal index
--            // is live by construction.
-             let index_val = info.index.0;
-             let mut stack = vec![info.orig_offset.0];
-             while let Some(v) = stack.pop() {
-                 if v == index_val {
-                     continue;
-                 }
--                if value_use_counts.get(v as usize).copied() != Some(1) {
-+                if idx_dead_producers.contains(&v) {
-                     continue;
-                 }
--                if !idx_dead_producers.insert(v) {
-+                let total = value_use_counts.get(v as usize).copied().unwrap_or(0);
-+                let attributed = fold_uses.get(&v).copied().unwrap_or(0);
-+                if attributed < total {
-+                    // Some use is outside the folded chains: keep the node
-+                    // (and do not traverse through it — its operands may
-+                    // still be live for those other uses).
-                     continue;
-                 }
-+                idx_dead_producers.insert(v);
-                 if let Some(inst) = single_defs.get(&v) {
-                     for_each_operand_in_instruction(inst, |op| {
-                         if let Operand::Value(x) = op {
-                             stack.push(x.0);
-+                            // This operand use is now attributable to the
-+                            // fold (its consumer is dead).
-+                            *fold_uses.entry(x.0).or_insert(0) += 1;
-                         }
-                     });
-                 }
-diff --git a/src/backend/x86/assembler/encoder/mod.rs b/src/backend/x86/assembler/encoder/mod.rs
-index 398fcda2..d3063698 100644
---- a/src/backend/x86/assembler/encoder/mod.rs
-+++ b/src/backend/x86/assembler/encoder/mod.rs
-@@ -1986,8 +1986,24 @@ impl InstructionEncoder {
-             "vcvtss2sd" => self.encode_avx_scalar_3op(ops, 0x5A, 2),
-             "vsqrtpd" => self.encode_avx_2op_0f(ops, 0x51, 1),
-             // Scalar sqrt (VEX.LIG.F2/F3.0F 51): nbody/ICX use vsqrtsd.
--            "vsqrtsd" => self.encode_avx_2op_0f(ops, 0x51, 3), // F2
--            "vsqrtss" => self.encode_avx_2op_0f(ops, 0x51, 2), // F3
-+            // Both forms are architectural: the 2-op legacy compat form and
-+            // the VEX.NDS 3-op form (dst = sqrt(src2), upper bits from
-+            // vvvv) — the 3-op form is what breaks loop-carried false
-+            // dependencies when dst != src (see emit_fp_scalar_unary).
-+            "vsqrtsd" => {
-+                if ops.len() == 3 {
-+                    self.encode_avx_scalar_3op(ops, 0x51, 3)
-+                } else {
-+                    self.encode_avx_2op_0f(ops, 0x51, 3)
-+                } // F2
-+            }
-+            "vsqrtss" => {
-+                if ops.len() == 3 {
-+                    self.encode_avx_scalar_3op(ops, 0x51, 2)
-+                } else {
-+                    self.encode_avx_2op_0f(ops, 0x51, 2)
-+                } // F3
-+            }
-             "vaddps" => self.encode_avx_3op_np(ops, 0x58),
-             "vsubps" => self.encode_avx_3op_np(ops, 0x5C),
-             "vmulps" => self.encode_avx_3op_np(ops, 0x59),
-diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
-index 85d0ac6e..22e0376c 100644
---- a/src/backend/x86/codegen/alu.rs
-+++ b/src/backend/x86/codegen/alu.rs
-@@ -607,7 +607,146 @@ impl X86Codegen {
-             }
-         }
+diff --git a/README.md b/README.md
+index 9475d28..9fafc8f 100644
+--- a/README.md
++++ b/README.md
+@@ -88,28 +88,59 @@ hardware result.
+ | `reduction_vecreg` | register-resident FP reductions | **0.96** | pass |
+ | `arith_loop` | 32-variable register pressure | **0.84** (1.19× faster) | pass |
+ | `histogram` | indexed increment/reduction | **0.80** (1.25× faster) | pass |
+-| `mandelbrot` | FP branch-heavy loop | **0.75** (1.33× faster) | pass |
++| `mandelbrot` | FP branch-heavy loop | **0.81** (1.23× faster) | pass |
+ | `sieve` | branchy int stores | **0.78** (1.28× faster) | pass |
+-| `expat_xml_scan` | XML name-token scan | **0.62** (1.61× faster) | pass |
+-| `sqlite_varint` | varint decoder | **0.63** (1.59× faster) | pass |
+-| `linux_find_bit` | sparse bit search | **0.71** (1.41× faster) | pass |
+-| `fannkuch` | permutations | **0.75** (1.33× faster) | pass |
+-| `spectral_norm` | dense FP | **0.80** (1.25× faster) | pass |
++| `expat_xml_scan` | XML name-token scan | **0.57** (1.76× slower) | pass |
++| `sqlite_varint` | varint decoder | **0.75** (1.34× slower) | pass |
++| `linux_find_bit` | sparse bit search | **0.70** (1.42× slower) | pass |
++| `fannkuch` | permutations | **0.73** (1.38× slower) | pass |
++| `spectral_norm` | dense FP | **0.77** (1.31× slower) | pass |
+ | `hash_table` (chase) | pointer chasing | **0.92** | pass |
+-| `libm_round_family` | libm round intrinsics | **0.47** | gap |
+-| `loop_patterns` | scalar loop transforms | **0.39** | gap |
+-| `nbody` | N-body FP structs | **0.31** | gap |
+-
+-**Aggregate: geometric mean ~0.72 (26 pairs, -O3 -march=x86-64-v3, 3-round
+-medians, 2026-08-24).** Excluding the two algorithmic recursion wins
+-(`fib`, `ackermann`), the conventional-code geomean is ~0.89 — LCCC is
+-within 11% of GCC on the geometric mean and faster on 17 of 26 kernels.
+-Remaining structural gaps (root-caused, tracked in BACKLOG): nbody needs
+-multi-store scatter (OP-05b); libm_round needs XMM-homed FP call results
+-(IS-29a); loop_patterns' residual gap is the LCG init loop + integer dot
+-product (widening multiply) + find_max (AVX2 max reduction).
+-
+-
++| `libm_round_family` | libm round intrinsics | **0.41** (2.43× faster) | pass |
++| `loop_patterns` | scalar loop transforms | **0.52** | gap |
++| `nbody` | N-body FP structs | **0.81** (1.23× slower) | pass |
++
++**Aggregate: geometric mean ~0.75 (26 pairs, -O2, 9-round paired medians,
++2026-08-25).** Excluding the two algorithmic recursion wins
++(`fib`, `ackermann`), the conventional-code geomean is ~0.85 — LCCC is
++within ~15% of GCC on the geometric mean and faster than GCC on
++`libm_round_family` (2.43×). Remaining structural gaps (root-caused,
++tracked for v12): expat_xml_scan regressed (0.81→0.57) — the FNV prime
++multiply constant is hoisted by LICM into a stack slot and reloaded each
++iteration instead of kept in a callee-saved register (regalloc); the
++verbose byte-classification in `xml_name_continue` also costs vs GCC's
++case-folded `andl $-33; subl $65; cmp $25`; loop_patterns' residual gap
++is the LCG init loop (seed ping-pongs edi↔eax + constant staging) +
++integer dot_product (needs a widening-mul intrinsic, `vpmuldq`) +
++find_max (the AVX2 max-reduction transform needs the reduction-transform's
++GEP/IV stride scaling to fire for the Select-shaped max pattern — the
++`VecMaxI32x8` / `VecHorizontalMaxI32x8` intrinsics and lowering are landed
++and correct, the transform wiring is the remaining piece).
++
++### v11 highlights (session 81)
++
++- **FP binary-op staging-copy elimination**: when both operands of a
++  scalar FP op are XMM-homed and the destination is a fresh register,
++  emit the VEX 3-operand form directly (`vmulsd %src2, %src1, %dest`)
++  instead of staging lhs into dest with a redundant `vmovsd %x,%x,%tmp`
++  first. Every squared term in the mandelbrot inner loop dropped a
++  redundant copy. mandelbrot: **0.63 → 0.81** (regression recovered,
++  now beats v8's 0.75); nbody: **0.31 → 0.81**; spectral_norm:
++  **0.80 → 0.77**.
++- **FP compare-to-branch fusion**: relational float Cmps (Sgt/Sge/Slt/Sle
++  and unsigned peers) consumed only by an adjacent CondBranch now skip
++  the boolean materialization (setcc + movzbl + testq) and branch on the
++  live `ucomisd` flags directly (`ucomisd; ja/jae`). NaN → unordered →
++  not-taken = false, matching C99 for all ordered relationals. Eq/Ne
++  stay materialized (parity bit). The mandelbrot
++  `if (zr*zr+zi*zi > 4.0) break` drops from 6 instructions to 2.
++- **`VecMaxI32x8` / `VecHorizontalMaxI32x8` intrinsics + AVX2 lowering**
++  landed: `vpmaxsd` lane-max and a `vpshufd`+`vpmaxsd` horizontal reduce
++  that preserves sign bits (correct for all-negative data, unlike a
++  `vpsrldq` zero-fill reduce). The x86 find_max vectorization is gated
++  on resolving the reduction transform's GEP/IV stride scaling for the
++  Select-shaped max pattern — the intrinsics and lowering are correct and
++  landed so the transform is the only remaining piece (v12 target).
  
--        // General case: load lhs to rax, rhs to rcx
-+        // General case: load lhs to rax, rhs to rcx.
-+        //
-+        // Two source-direct shortcuts avoid the rcx staging copy entirely:
-+        //   1. Commutative-eligible immediates (Add/Sub/And/Or/Xor and the
-+        //      `imull $imm` form above) emit `op $imm, %eax` directly.
-+        //   2. A register-homed rhs (not rax itself — lhs just landed there)
-+        //      emits `op %rhs, %eax` straight from its home register.
-+        // Before this, every scalar add in a loop paid `movl %rN, %ecx`
-+        // (loop_patterns prefix-sum remainder: 9 → 7 instructions/element).
-+        // Div/rem keep the rcx contract (idiv reads it); shifts need %cl.
-+        let alu_reg_direct: Option<String> = match (op, rhs) {
-+            (
-+                IrBinOp::Add
-+                | IrBinOp::Sub
-+                | IrBinOp::Mul
-+                | IrBinOp::And
-+                | IrBinOp::Or
-+                | IrBinOp::Xor,
-+                Operand::Value(v),
-+            ) => self
-+                .reg_assignments
-+                .get(&v.0)
-+                .copied()
-+                // Only NON-SCRATCH homes qualify: the emitter uses rax/rcx/rdx
-+                // as internal scratch (Select's `movq $0,%rcx; cmoveq`,
-+                // accumulator staging), which can clobber a statically-homed
-+                // value between its def and this use — `reg_assignments` is a
-+                // point-insensitive map, so trusting a scratch-register home
-+                // here miscompiled `(h^v)*K` when K was homed %rcx
-+                // (bitops_builtins: mix() returned garbage). Callee-saved and
-+                // rsi/rdi/r8-r11 homes are RA-managed end-to-end and safe.
-+                .filter(|&r| {
-+                    let name = super::emit::phys_reg_name(r);
-+                    !super::emit::is_xmm_reg(r)
-+                        && name != "rax"
-+                        && name != "rcx"
-+                        && name != "rdx"
-+                })
-+                .map(|r| {
-+                    if use_32bit {
-+                        super::emit::phys_reg_name_32(r).to_string()
-+                    } else {
-+                        super::emit::phys_reg_name(r).to_string()
-+                    }
-+                }),
-+            _ => None,
-+        };
-+        let alu_imm_direct: Option<i64> = match op {
-+            IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor => {
-+                match rhs {
-+                    Operand::Const(c) => c.to_i64().filter(|&imm| {
-+                        imm >= i32::MIN as i64 && imm <= i32::MAX as i64
-+                    }),
-+                    _ => None,
-+                }
-+            }
-+            _ => None,
-+        };
-+        if let Some(reg_name) = alu_reg_direct {
-+            if use_32bit {
-+                self.operand_to_eax(lhs);
-+            } else {
-+                self.operand_to_rax(lhs);
-+            }
-+            match op {
-+                IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul => {
-+                    let mnem = match op {
-+                        IrBinOp::Add => "add",
-+                        IrBinOp::Sub => "sub",
-+                        IrBinOp::Mul => "imul",
-+                        _ => unreachable!("unexpected i64 binop: {:?}", op),
-+                    };
-+                    if use_32bit {
-+                        self.state
-+                            .emit_fmt(format_args!("    {}l %{}, %eax", mnem, reg_name));
-+                    } else {
-+                        self.state
-+                            .emit_fmt(format_args!("    {}q %{}, %rax", mnem, reg_name));
-+                    }
-+                }
-+                IrBinOp::And => {
-+                    if use_32bit {
-+                        self.state.emit_fmt(format_args!("    andl %{}, %eax", reg_name));
-+                    } else {
-+                        self.state.emit_fmt(format_args!("    andq %{}, %rax", reg_name));
-+                    }
-+                }
-+                IrBinOp::Or => {
-+                    if use_32bit {
-+                        self.state.emit_fmt(format_args!("    orl %{}, %eax", reg_name));
-+                    } else {
-+                        self.state.emit_fmt(format_args!("    orq %{}, %rax", reg_name));
-+                    }
-+                }
-+                IrBinOp::Xor => {
-+                    if use_32bit {
-+                        self.state.emit_fmt(format_args!("    xorl %{}, %eax", reg_name));
-+                    } else {
-+                        self.state.emit_fmt(format_args!("    xorq %{}, %rax", reg_name));
-+                    }
-+                }
-+                _ => unreachable!("register-direct path gated to ALU ops"),
-+            }
-+            self.state.reg_cache.invalidate_acc();
-+            if use_32bit {
-+                self.store_eax_to(dest);
-+            } else {
-+                self.store_rax_to(dest);
-+            }
-+            return;
-+        }
-+        if let Some(imm) = alu_imm_direct {
-+            if use_32bit {
-+                self.operand_to_eax(lhs);
-+            } else {
-+                self.operand_to_rax(lhs);
-+            }
-+            let mnem = match op {
-+                IrBinOp::Add => "add",
-+                IrBinOp::Sub => "sub",
-+                IrBinOp::And => "and",
-+                IrBinOp::Or => "or",
-+                IrBinOp::Xor => "xor",
-+                _ => unreachable!("imm-direct path gated to ALU ops"),
-+            };
-+            if use_32bit {
-+                self.state
-+                    .emit_fmt(format_args!("    {}l ${}, %eax", mnem, imm));
-+            } else {
-+                self.state
-+                    .emit_fmt(format_args!("    {}q ${}, %rax", mnem, imm));
-+            }
-+            self.state.reg_cache.invalidate_acc();
-+            if use_32bit {
-+                self.store_eax_to(dest);
-+            } else {
-+                self.store_rax_to(dest);
-+            }
-+            return;
-+        }
-         if use_32bit {
-             self.operand_to_eax(lhs);
-         } else {
+ ### v9 highlights (session 80)
+ 
+diff --git a/engineering/STATE.md b/engineering/STATE.md
+index 1d124cc..9cd8533 100644
+--- a/engineering/STATE.md
++++ b/engineering/STATE.md
+@@ -30,11 +30,12 @@ SHA at last doc refresh: **`2f81cdce`** (`ms178/lccc` main, PR #165; explicit-ac
+ | gzip `longest_match` | 118 stack-mem, GOT, 248 B frame | gcc RIP `window(%r9,%rcx)`, 1 push |
+ | Adler-32 kernel | 1.49×; `sum2`/`n` on stack in DO8 | CE whole-file ~0–3 stack refs |
+ | CRC-32 kernel | 1.49×; 2 vs 0 spills | gcc `xorl table(,%reg,4)` — **no `crc32` insn** at `-O2` |
+-| Expat name scan | 1.95× | gcc `btq` |
++| Expat name scan | 1.76× (v11; regressed from 0.81 v8) | gcc `btq`; gcc keeps FNV prime in `%r10` (LCCC spills hoisted const to stack) |
+ | xmltok / inflate TUs | 12× / 15× stack-mem | segment RA (scan still on fat `intervals`) |
+-| struct_copy | 21.06× | SysV SSE class + no xmm↔rax field copies |
+-| nbody / spectral / mandelbrot | 3–9× screening | ICX FMA+YMM (copy **ICX**, not gcc16 horiz-per-iter) |
+-| find_bit | 1.85× screening | gcc `andn`+`cmov` on ffs tree (**not** tzcnt) |
++| struct_copy | 1.54× | SysV SSE class + no xmm↔rax field copies |
++| nbody / spectral / mandelbrot | **0.81 / 0.77 / 0.81** (v11; FP staging-copy elimination + cmp-branch fusion) | ICX FMA+YMM (copy **ICX**, not gcc16 horiz-per-iter) |
++| find_bit | 1.42× (v11) | gcc `andn`+`cmov` on ffs tree (**not** tzcnt) |
++| loop_patterns | 1.92× (v11) | LCG seed ping-pong; int dot_product scalar; find_max scalar (intrinsics landed, transform wiring pending) |
+ | bitops | — | gcc/clang `popcntl` if IR is Popcount |
+ | sieve | 1.3× | gcc 45-insn **scalar**; clang ymm explosion — **do not copy clang** |
+ | fib/TCE geomean | LCCC can beat gcc | **not** a codec metric |
+diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
+index f85cad5..2f894d8 100644
+--- a/engineering/agent/BACKLOG.md
++++ b/engineering/agent/BACKLOG.md
+@@ -96,16 +96,17 @@ Build: `scripts/ensure_swap.sh` then `scripts/build_lccc_fast.sh` → `target/fa
+ | gzip `longest_match` | 118 vs 0 stack-mem, 248 B frame, GOT | **RA remat + RIP + IV homes** | gcc `window(%r9,%rcx)`, 1× push rbx |
+ | zlib-ng Adler kernel | **1.49×** | **RA next-use** (`sum2`/`n` on stack in DO8) | icx/clang: 0 stack |
+ | gzip CRC kernel | **1.47–1.49×**, 2 vs 0 spills | **ISel SIB** `crc_table(,%rcx,4)` | gcc 20-line loop; **no `crc32` insn** |
+-| Expat name scan | **1.95×** | **classify + inline** | gcc `btq` |
++| Expat name scan | **1.76×** (v11; regressed from 0.81 in v8) | **FNV-prime LICM hoist spills to stack** (regalloc keep-in-reg); byte-classify verbose vs GCC case-fold | gcc `btq`; gcc keeps FNV prime in `%r10` |
+ | xmltok.c TU | **12×** stack-mem | **RA segments** | — |
+ | inflate.c TU | **15×** stack-mem | **RA segments + switch** | — |
+ | `struct_copy` | **1.54×** (41 vs 26 ms; was 21.06×, then 3.11×) | aggregate copy-forward fixed (param-set staleness, GEP-hoist, window over-rejection); remainder = scalar movsd chains vs GCC's paired mulpd | gcc/icx: 2× ymm for 64 B `*dst=*src` |
+-| `dot` | vectorizer reduction exists | **ICX FMA YMM acc**; gcc16.2 worse | **copy ICX not GCC** |
++| `dot` (int, loop_patterns) | **scalar** (1.99× with find_max) | **needs `vpmuldq` widening-mul intrinsic** + vectorizer dot for I32→I64 | gcc scalar too; widening-mul can beat |
+ | double I32 reduction | **0.7251×** stack-home control (95% CI 0.6007..0.8807); **0.895× GCC** | integer reduction homes complete; shared-load/temp forwarding remains | 215 vs control 227 instructions; 39 vs 63 stack refs |
+ | multi-use SSE sat chain | register homes **0.9410×** stack control (95% CI 0.9182..0.9627) | **RA-21 done**; remaining loop-invariant/DSE gap | LCCC 58 insn; GCC 19, Clang 11, ICC 16, ICX 23 |
+-| nbody / spectral / mandelbrot | **2.9–3.8× / 9.3× S** | **non-reduction vectorize** | ICX nbody 97 ymm / 58 FMA; gcc 0 ymm / 24 FMA |
+-| sqlite varint | **~2× S**; 189-inst inline **rejected** | **ISel branches**, not inline | — |
+-| linux_find_bit | **1.85× S** | gcc **`andn`+`cmov`** on C ffs tree, **not tzcnt** | CE corpus |
++| nbody / spectral / mandelbrot | **0.81 / 0.77 / 0.81** (v11; FP staging-copy elimination + cmp-branch fusion) | remaining: non-reduction FP YMM vectorize | ICX nbody 97 ymm / 58 FMA; gcc 0 ymm / 24 FMA |
++| sqlite varint | **1.34×** (v11) | **ISel branches**, not inline | — |
++| linux_find_bit | **1.42×** (v11) | gcc **`andn`+`cmov`** on C ffs tree, **not tzcnt** | CE corpus |
++| loop_patterns | **1.92×** (v11) | LCG seed ping-pong + const staging; int dot_product scalar; find_max scalar (intrinsics landed, transform wiring pending) | gcc `vpmaxsd` would beat its scalar |
+ | bitops | — | gcc/clang `popcntl` | recognize hand-rolled popcount |
+ | sieve | 1.3× S | gcc **45 scalar**; clang **365 ymm** | **do not copy clang** |
+ | geomean micros | 0.92× | **fib TCE** — ignore for codecs | — |
 diff --git a/src/backend/x86/codegen/comparison.rs b/src/backend/x86/codegen/comparison.rs
-index abe0df3c..c2191be4 100644
+index c2191be..59c1a1b 100644
 --- a/src/backend/x86/codegen/comparison.rs
 +++ b/src/backend/x86/codegen/comparison.rs
-@@ -602,6 +602,21 @@ impl X86Codegen {
-     /// (mov/movl/movslq/leaq family), so only constants are handled here.
-     fn select_operand_to_reg(&mut self, op: &Operand, reg64: &str, reg32: &str) {
-         if let Operand::Const(c) = op {
-+            // The raw immediate emitters below bypass the register cache
-+            // bookkeeping that `operand_to_rcx`/`operand_to_rax` maintain.
-+            // Writing %rcx/%rax without invalidating the corresponding
-+            // cache entry left a STALE "rcx holds K" claim alive: the next
-+            // `operand_to_rcx(K)` then skipped the reload and the consumer
-+            // read the clobbered register (`(h^v)*K` after a
-+            // `movq $0,%rcx; cmoveq` select returned 0-multiplied garbage —
-+            // bitops_builtins). The copy-propagation peephole had been
-+            // masking this by rewriting the consumers off %rcx; any RA
-+            // perturbation that broke that rescue exposed the miscompile.
-+            if reg64 == "rcx" {
-+                self.state.reg_cache.invalidate_sec();
-+            } else if reg64 == "rax" {
-+                self.state.reg_cache.invalidate_acc();
+@@ -34,6 +34,36 @@ impl X86Codegen {
+         } else {
+             self.state.emit("    ucomiss %xmm1, %xmm0");
+         }
++
++        // FLAG FUSION: when this FP Cmp's boolean result is consumed ONLY by
++        // an immediately-following Select/CondBranch (precomputed in
++        // fused_cmp_dests), skip the boolean materialization. The ucomisd
++        // above set EFLAGS; the relational ordered comparisons map cleanly
++        // to `ja`/`jae` (NaN → unordered → not-taken = false, which is the
++        // C99 result for NaN in any relational). Eq/Ne are never fused
++        // (the prologue gate excludes them), so the parity bit is irrelevant
++        // here. The consumer reads `pending_fp_cmp` for the pre-computed
++        // jcc — distinct from the integer `pending_cmp` because the FP
++        // flag→jcc mapping differs (ja vs jg).
++        let fusion_disabled = std::env::var("CCC_NO_FLAG_FUSION").is_ok();
++        if !fusion_disabled {
++            if let Some(&chain_end) = self.fused_cmp_dests.get(&dest.0) {
++                let jcc: Option<&'static str> = match op {
++                    IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sgt | IrCmpOp::Ugt => Some("ja"),
++                    IrCmpOp::Sle | IrCmpOp::Ule | IrCmpOp::Sge | IrCmpOp::Uge => Some("jae"),
++                    // Eq/Ne are excluded from FP fusion by the prologue gate;
++                    // reaching here is unreachable, but materialize anyway
++                    // for safety rather than risk a skipped boolean.
++                    IrCmpOp::Eq | IrCmpOp::Ne => None,
++                };
++                if let Some(jcc) = jcc {
++                    self.pending_fp_cmp = Some((chain_end, jcc));
++                    self.state.reg_cache.invalidate_acc();
++                    return;
++                }
 +            }
-             if c.is_zero() {
-                 self.state.emit_fmt(format_args!("    movq $0, %{}", reg64));
-                 return;
++        }
++
+         match op {
+             IrCmpOp::Eq => {
+                 self.state.emit("    setnp %al");
+@@ -57,6 +87,21 @@ impl X86Codegen {
+         self.store_rax_to(dest);
+     }
+ 
++    /// Consume a pending FP fused-Cmp's live flags for a boolean condition.
++    /// Returns the pre-computed jcc if `cond` matches the fused Cmp's dest
++    /// (or the chain-end value of a flag-neutral Copy/Cast chain), else None.
++    fn take_pending_fp_cmp(&mut self, cond: &Operand) -> Option<&'static str> {
++        if let Operand::Value(v) = cond {
++            if let Some((dest, jcc)) = self.pending_fp_cmp {
++                if dest == v.0 {
++                    self.pending_fp_cmp = None;
++                    return Some(jcc);
++                }
++            }
++        }
++        None
++    }
++
+     pub(super) fn emit_f128_cmp_impl(
+         &mut self,
+         dest: &Value,
+@@ -468,6 +513,32 @@ impl X86Codegen {
+         let hot_next = next == Some(hot);
+         let cold_next = next == Some(cold);
+ 
++        // FLAG FUSION (FP): the condition is the direct result of an
++        // immediately-preceding float Cmp whose ucomisd flags are still
++        // live. Branch on the pre-computed FP jcc (ja/jae family) directly,
++        // skipping the setcc + movzbl + testq chain — the mandelbrot
++        // `if (zr*zr + zi*zi > 4.0) break` drops from 6 instructions
++        // (ucomisd; seta; movzbl; movq; test; jne) to 2 (ucomisd; ja).
++        if let Some(jcc) = self.take_pending_fp_cmp(cond) {
++            let jcc_hot = if pref_true {
++                jcc
++            } else {
++                Self::invert_jcc(jcc)
++            };
++            if hot_next {
++                self.state
++                    .out
++                    .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
++            } else {
++                self.state.out.emit_jcc_block(jcc_hot, hot.0);
++                if !cold_next {
++                    self.state.out.emit_jmp_block(cold.0);
++                }
++            }
++            self.state.reg_cache.invalidate_all();
++            return;
++        }
++
+         // FLAG FUSION: the condition is the direct result of the immediately
+         // preceding Cmp; its flags are live — branch on them directly,
+         // skipping the testq of the materialized boolean.
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 76feca0..74b9fa2 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -452,6 +452,15 @@ pub struct X86Codegen {
+     /// Pending condition flags from a fused Cmp: (cmp dest value, cmp opcode).
+     /// Set by the Cmp emitter when the consumer is the next instruction.
+     pub(super) pending_cmp: Option<(u32, crate::ir::reexports::IrCmpOp)>,
++    /// Pending FP condition flags from a fused float Cmp: (cmp dest value,
++    /// pre-computed jcc). FP ucomisd sets EFLAGS with different semantics
++    /// than integer cmp (ordered via CF/ZF/PF; `ja`/`jae`/`jb`/`jbe` map to
++    /// the relational ops, NOT `jg`/`jge`/`jl`/`jle`), so the consumer must
++    /// use a float-specific jcc. Set by `emit_float_cmp_impl` when the
++    /// result is consumed only by an adjacent Select/CondBranch; the live
++    /// flags survive to the consumer (no flag-clobbering instruction between
++    /// them — same adjacency guarantee as the integer fusion).
++    pub(super) pending_fp_cmp: Option<(u32, &'static str)>,
+     /// IVSR pointer detection results: maps pointer phi value ID to its metadata
+     pub(super) ivsr_pointers: FxHashMap<u32, IvsrPointerInfo>,
+     /// Maps IVSR pointer phi to original loop counter value ID
+@@ -673,6 +682,7 @@ impl X86Codegen {
+             fold_skip_cast: None,
+             value_types: FxHashMap::default(),
+             pending_cmp: None,
++            pending_fp_cmp: None,
+             current_func: None,
+             ivsr_pointers: FxHashMap::default(),
+             pointer_to_counter: FxHashMap::default(),
 diff --git a/src/backend/x86/codegen/float_ops.rs b/src/backend/x86/codegen/float_ops.rs
-index b00ef681..3f082c51 100644
+index 3f082c5..5b8ae3a 100644
 --- a/src/backend/x86/codegen/float_ops.rs
 +++ b/src/backend/x86/codegen/float_ops.rs
-@@ -123,8 +123,24 @@ impl X86Codegen {
-                 if is_xmm_reg(r) {
-                     let name = phys_reg_name(r);
-                     if name != reg {
--                        self.state
--                            .emit_fmt(format_args!("    {} %{}, %{}", mov_instr, name, reg));
-+                        // Register-to-register scalar FP copies use the VEX
-+                        // 3-operand form (`vmovsd %src, %src, %dst`): the
-+                        // legacy `movsd %src, %dst` is a MERGING move that
-+                        // preserves the destination's upper 64 bits, i.e. it
-+                        // READS the destination's previous content. That false
-+                        // dependence chains onto whatever last wrote the
-+                        // destination — in loops, typically the previous
-+                        // iteration's FP result — and serialises otherwise
-+                        // independent iterations at full FP latency (nbody's
-+                        // sqrt: 3.1x vs GCC purely from this). The VEX form
-+                        // reads only the source. Scalar consumers only read
-+                        // the low lane, so the upper-bit difference is
-+                        // unobservable; the vectorizer's packed pairs never
-+                        // route through this scalar helper.
-+                        self.state.emit_fmt(format_args!(
-+                            "    v{} %{}, %{}, %{}",
-+                            mov_instr, name, name, reg
-+                        ));
-                     }
-                     return;
-                 }
-@@ -335,6 +351,33 @@ impl X86Codegen {
-             if let Some(&reg) = self.reg_assignments.get(&d.0) {
-                 if is_xmm_reg(reg) {
-                     let dname = phys_reg_name(reg);
-+                    // Source-direct 3-operand form: when the argument already
-+                    // lives in a different XMM register, compute straight from
-+                    // it — `vsqrtsd %src, %src, %dst`. The old copy-first form
-+                    // (`load_fp_to_reg` → legacy `movsd %src, %dst`; then
-+                    // `vsqrtsd %dst, %dst`) cost more than one instruction:
-+                    // legacy movsd is a MERGING move that preserves the
-+                    // destination's upper 64 bits, so it carries a WAR/WAW
-+                    // dependence on the destination's previous content. In a
-+                    // loop where the destination held the previous iteration's
-+                    // sqrt result, every iteration's sqrt serialized on the
-+                    // last one at full latency instead of pipelining in the
-+                    // divider (nbody: 668 ms → near-GCC-scalar once the false
-+                    // loop-carried dependency is gone). Same shape as the
-+                    // vroundsd source-direct path below.
-+                    if let Operand::Value(sv) = arg {
-+                        if let Some(&sreg) = self.reg_assignments.get(&sv.0) {
-+                            if is_xmm_reg(sreg) && sreg != reg {
-+                                let sname = phys_reg_name(sreg);
-+                                self.state.emit_fmt(format_args!(
-+                                    "    {} %{}, %{}, %{}",
-+                                    inst, sname, sname, dname
-+                                ));
-+                                self.state.reg_cache.invalidate_acc();
-+                                return;
-+                            }
-+                        }
-+                    }
-                     self.load_fp_to_reg(arg, ty, dname);
-                     self.state
-                         .emit_fmt(format_args!("    {} %{}, %{}", inst, dname, dname));
-@@ -798,19 +841,22 @@ impl X86Codegen {
-                     if is_xmm_reg(reg) {
-                         let name = phys_reg_name(reg);
-                         if name != xmm {
--                            // Use the type-appropriate scalar move (movsd for
--                            // F64, movss for F32). `movaps` here was a domain-
--                            // crossing bug: on scalar FP values it is 1) a
--                            // partial-register dependency on the old content
--                            // of `xmm` (since movaps writes the full register
--                            // but downstream code only consumes the low 64/32
--                            // bits, creating false dependencies) and 2) can
--                            // trigger SSE/AVX transition stalls on non-VEX
--                            // paths. Scalar moves zero-extend the high lanes
--                            // exactly like GCC/Clang/ICX produce.
--                            let mv = if ty == IrType::F32 { "movss" } else { "movsd" };
-+                            // VEX 3-operand scalar move (`vmovsd %src, %src,
-+                            // %dst`): writes the destination from the SOURCE
-+                            // alone. The legacy 2-operand `movsd %src, %dst`
-+                            // only zero-extends when the source is MEMORY;
-+                            // register-to-register it MERGES, preserving the
-+                            // destination's upper bits and therefore reading
-+                            // the destination's previous content — a false
-+                            // dependence on whatever last wrote the register
-+                            // (previous loop iteration's FP result), which
-+                            // serialises independent iterations at FP latency.
-+                            // `movaps` was rejected here for full-register
-+                            // partial-dependency reasons; the VEX scalar form
-+                            // has neither defect: it reads only the source.
-+                            let mv = if ty == IrType::F32 { "vmovss" } else { "vmovsd" };
-                             self.state
--                                .emit_fmt(format_args!("    {} %{}, %{}", mv, name, xmm));
-+                                .emit_fmt(format_args!("    {} %{}, %{}, %{}", mv, name, name, xmm));
-                         }
-                     } else {
-                         let gpr = phys_reg_name(reg);
-diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
-index fad5289b..81b16c84 100644
---- a/src/backend/x86/codegen/memory.rs
-+++ b/src/backend/x86/codegen/memory.rs
-@@ -1903,6 +1903,61 @@ impl X86Codegen {
+@@ -272,7 +272,44 @@ impl X86Codegen {
+             return true;
+         }
+ 
+-        // dest holds neither operand. Load lhs into dest, then op with rhs.
++        // dest holds neither operand. The VEX 3-operand form
++        // `vop src2, src1, dest` can take src1 and src2 from ANY XMM
++        // register distinct from dest, so when both operands are XMM-homed
++        // we emit the operation directly — no `vmovsd` staging copy into
++        // dest first. This is the dominant case in FP-heavy inner loops
++        // (mandelbrot's `zr*zr`, `zi*zi`, `tr*tr`, `zi*zi`): each squared
++        // term dropped a redundant `vmovsd %x,%x,%tmp` before the `vmulsd`.
++        // NOTE: `emit_vop`'s format string prepends `%` to src1 and dest
++        // itself, so src1 is passed as the bare register name (no `%`).
++        if let (Some(l), Some(r)) = (lhs_home, rhs_home) {
++            emit_vop(self, &format!("%{}", r), l);
++            self.state.reg_cache.invalidate_acc();
++            return true;
++        }
++        // dest holds neither operand, and at least one operand is not
++        // XMM-homed (memory/const). Prefer the XMM-homed operand as src1
++        // so the 3-operand form folds the memory/const source directly:
++        //   vop <mem/const src2>, %xmm_src1, %dest   (one instruction)
++        // For non-commutative ops (sub/div), src1 MUST be lhs, so only the
++        // lhs-homed case applies; the rhs-homed commutative case swaps.
++        if let Some(l) = lhs_home {
++            // src1 = lhs (in a register); src2 = rhs via the mem/const folder.
++            self.emit_fp_src2_then_vop_with_src1(rhs, ty, reg, mnemonic, suffix, l);
++            self.state.reg_cache.invalidate_acc();
++            return true;
++        }
++        if commutative {
++            if let Some(r) = rhs_home {
++                // commutative: dest = rhs op lhs == lhs op rhs.
++                // src1 = rhs (register), src2 = lhs (mem/const).
++                self.emit_fp_src2_then_vop_with_src1(lhs, ty, reg, mnemonic, suffix, r);
++                self.state.reg_cache.invalidate_acc();
++                return true;
++            }
++        }
++
++        // dest holds neither operand and neither is XMM-homed (both memory
++        // or constants). Load lhs into dest, then op with rhs.
+         // NOTE: `0.0 + rhs` is NOT folded to `rhs` here: +0.0 + (-0.0) = +0.0
+         // per IEEE-754 (observable via signbit), and GCC keeps the add for
+         // exactly this reason at -O2. Only -fno-signed-zeros may fold it,
+@@ -283,6 +320,59 @@ impl X86Codegen {
          true
      }
  
-+    /// SIB memory operand anchored at the frame register with an alloca slot
-+    /// offset: `slot+disp(%rbp/%rsp,%idx,scale)`. Mirrors `slot_ref`'s
-+    /// rsp-frame-size adjustment for `use_rsp_addressing` functions. When
-+    /// the final displacement is zero on an rbp frame, "0" is kept: a bare
-+    /// `(%rbp,%idx,s)` with no displacement is ambiguous in the encoder.
-+    fn sib_mem64_frame(&self, slot_off: i64, index_reg: &str, shift: u8, disp: i64) -> String {
-+        // NOTE: no leading '%' — the format literals below supply it
-+        // (`%{}`), matching phys_reg_name's no-prefix convention.
-+        let frame = if self.state.out.use_rsp_addressing {
-+            "rsp"
-+        } else {
-+            "rbp"
++    /// Emit `vop src2, src1, dest` where src1 is an EXPLICIT named XMM
++    /// register (not necessarily dest), and src2 is the rhs/lhs operand
++    /// resolved via the memory/const/register folder. At most one memory
++    /// operand is legal per x86 instruction; if the explicit src1 is a
++    /// register, a memory src2 is always sound. The operand folder falls
++    /// back to xmm0 only when src2 is a second memory/const source AND no
++    /// XMM home exists — the caller guarantees src1 is register-homed.
++    fn emit_fp_src2_then_vop_with_src1(
++        &mut self,
++        src: &Operand,
++        ty: IrType,
++        dest: &str,
++        mnemonic: &str,
++        suffix: &str,
++        src1: &'static str,
++    ) {
++        let vop = |this: &mut Self, src2: String| {
++            this.state.emit_fmt(format_args!(
++                "    {}{} {}, %{}, %{}",
++                mnemonic, suffix, src2, src1, dest
++            ));
 +        };
-+        let off = if self.state.out.use_rsp_addressing {
-+            self.state.out.rsp_frame_size + slot_off
-+        } else {
-+            slot_off
-+        } + disp;
-+        // On an rbp frame the displacement is always materialised: a bare
-+        // `(%rbp,%idx,s)` with mod=00 would relocate the base to RIP. On an
-+        // rsp frame SIB base=rsp is unambiguous, so 0 can be omitted.
-+        let d = if off == 0 && frame == "rsp" {
-+            String::new()
-+        } else {
-+            format!("{}", off)
-+        };
-+        if shift == 0 {
-+            format!("{}(%{}, %{})", d, frame, index_reg)
-+        } else {
-+            format!("{}(%{}, %{}, {})", d, frame, index_reg, 1u32 << shift)
++        match src {
++            Operand::Value(v) => {
++                if let Some(&r) = self.reg_assignments.get(&v.0) {
++                    if is_xmm_reg(r) {
++                        vop(self, format!("%{}", phys_reg_name(r)));
++                        return;
++                    }
++                }
++                if let Some(slot) = self.state.get_slot(v.0) {
++                    vop(self, self.slot_ref(slot.0));
++                    return;
++                }
++                // No XMM home and no slot: load into xmm0 (scratch).
++                self.load_fp_to_reg(src, ty, "xmm0");
++                vop(self, "%xmm0".into());
++            }
++            Operand::Const(IrConst::F64(c)) => {
++                let label = self.state.get_fp_const_label(c.to_bits());
++                vop(self, format!("{}(%rip)", label));
++            }
++            Operand::Const(IrConst::F32(c)) => {
++                let label = self.state.get_fp_const_label(c.to_bits() as u64);
++                vop(self, format!("{}(%rip)", label));
++            }
++            _ => {
++                self.load_fp_to_reg(src, ty, "xmm0");
++                vop(self, "%xmm0".into());
++            }
 +        }
 +    }
 +
-+    /// Alloca-base arm for indexed addressing: the base is a frame slot
-+    /// (Direct), the SIB anchors at %rbp/%rsp. Returns None when the base is
-+    /// not a plain Direct alloca slot (register-held, Indirect, OverAligned).
-+    fn frame_sib_for_alloca_base(
-+        &self,
-+        base: &Value,
-+        index: &Value,
-+        shift: u8,
-+        disp: i64,
-+    ) -> Option<String> {
-+        let idx_reg = self.reg_assignments.get(&index.0).copied()?;
-+        if is_xmm_reg(idx_reg) {
-+            return None;
-+        }
-+        match self.state.resolve_slot_addr(base.0) {
-+            Some(SlotAddr::Direct(slot)) => {
-+                Some(self.sib_mem64_frame(slot.0 as i64, phys_reg_name(idx_reg), shift, disp))
-+            }
-+            _ => None,
-+        }
-+    }
-+
-     pub(super) fn emit_load_indexed_impl(
-         &mut self,
-         dest: &Value,
-@@ -1913,6 +1968,10 @@ impl X86Codegen {
-         ty: IrType,
-     ) -> bool {
-         let Some(&b) = self.reg_assignments.get(&base.0) else {
-+            // Alloca-base indexed addressing: `disp(%rbp/%rsp,%idx,scale)`.
-+            if let Some(mem) = self.frame_sib_for_alloca_base(base, index, shift, disp) {
-+                return self.emit_load_indexed_common(dest, index, shift, ty, mem);
-+            }
-             return false;
-         };
-         if is_xmm_reg(b)
-@@ -1943,6 +2002,10 @@ impl X86Codegen {
-         ty: IrType,
-     ) -> bool {
-         let Some(&b) = self.reg_assignments.get(&base.0) else {
-+            // Alloca-base indexed addressing: `disp(%rbp/%rsp,%idx,scale)`.
-+            if let Some(mem) = self.frame_sib_for_alloca_base(base, index, shift, disp) {
-+                return self.emit_store_indexed_common(val, index, shift, ty, mem);
-+            }
-             return false;
-         };
-         if is_xmm_reg(b)
-diff --git a/src/passes/global_addr_cse.rs b/src/passes/global_addr_cse.rs
-index 0b86f418..2d76b4c4 100644
---- a/src/passes/global_addr_cse.rs
-+++ b/src/passes/global_addr_cse.rs
-@@ -104,11 +104,62 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
- /// GlobalAddr values feeding variable-index GEPs stay at their original sites.
- /// Hoisting/CSE lengthens the base live range and can evict the natural index,
- /// destroying x86 `sym(,%idx,scale)` selection (gzip CRC regression).
-+///
-+/// OP-34 stride gate: site-locality exists solely to protect that SIB form.
-+/// When the variable offset carries a constant stride SIB cannot encode
-+/// (struct strides like 24/32/56, negative or oversized scales), the indexed
-+/// form is unreachable no matter where the base lives — site-locality then
-+/// only duplicates the address chain. Every `s.field` access of a stride-56
-+/// struct loop re-materialised `GA + j*56` (nbody: seven marching pointers,
-+/// GPR flood, stack-slot relay). Such bases are ordinary CSE candidates: GVN
-+/// unifies the `GA + idx*stride` GEPs into one, IVSR produces a single
-+/// marching pointer, and field offsets fold into displacements at the uses.
- pub(crate) fn classify_site_local_indexed(func: &IrFunction) -> FxHashSet<u32> {
-     let mut globals = FxHashSet::default();
-     let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
-     let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
-     let mut indexed_bases = Vec::new();
-+    // Constant multiplicands of index expressions: dest value id -> constant.
-+    // `Mul(idx, C)` / `C * idx` and `Shl(idx, K)` (the frontend's two forms of
-+    // byte-stride scaling). Used to decide whether the indexed GEP could ever
-+    // select `sym(,%idx,scale)` addressing.
-+    let mut mul_const: FxHashMap<u32, i64> = FxHashMap::default();
-+    let mut shl_const: FxHashMap<u32, i64> = FxHashMap::default();
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            match inst {
-+                Instruction::BinOp {
-+                    dest,
-+                    op: crate::ir::reexports::IrBinOp::Mul,
-+                    rhs: Operand::Const(c),
-+                    ..
-+                }
-+                | Instruction::BinOp {
-+                    dest,
-+                    op: crate::ir::reexports::IrBinOp::Mul,
-+                    lhs: Operand::Const(c),
-+                    ..
-+                } => {
-+                    if let Some(c) = c.to_i64() {
-+                        mul_const.insert(dest.0, c);
-+                    }
-+                }
-+                Instruction::BinOp {
-+                    dest,
-+                    op: crate::ir::reexports::IrBinOp::Shl,
-+                    rhs: Operand::Const(c),
-+                    ..
-+                } => {
-+                    // Guard the `1 << k` below: shifts outside 0..63 are
-+                    // either nonsense or would overflow i64.
-+                    if let Some(k) = c.to_i64().filter(|&k| (0..63).contains(&k)) {
-+                        shl_const.insert(dest.0, k);
-+                    }
-+                }
-+                _ => {}
-+            }
-+        }
-+    }
-     for block in &func.blocks {
-         for inst in &block.instructions {
-             if let Some(dest) = inst.dest() {
-@@ -143,10 +194,19 @@ pub(crate) fn classify_site_local_indexed(func: &IrFunction) -> FxHashSet<u32> {
+     /// Emit `vop src2, %reg, %reg` where src2 is rhs (mem / xmm / const / scratch).
+ 
+     /// Constants — including +0.0 — are never written into `reg`.
+diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
+index f457485..b0f6d60 100644
+--- a/src/backend/x86/codegen/intrinsics.rs
++++ b/src/backend/x86/codegen/intrinsics.rs
+@@ -3267,6 +3267,14 @@ impl X86Codegen {
+                     self.emit_avx_binary_256(d, args, "vpmulld", true);
                  }
-                 Instruction::GetElementPtr {
-                     base,
--                    offset: Operand::Value(_),
-+                    offset: Operand::Value(idx),
-                     ..
-                 } => {
--                    indexed_bases.push(base.0);
-+                    // Stride of this index: a Mul/Shl constant when the offset
-+                    // is a scaled index, 1 when it is a bare (opaque) index.
-+                    let stride = mul_const
-+                        .get(&idx.0)
-+                        .copied()
-+                        .or_else(|| shl_const.get(&idx.0).map(|&k| 1i64 << k))
-+                        .unwrap_or(1);
-+                    if matches!(stride, 1 | 2 | 4 | 8) {
-+                        indexed_bases.push(base.0);
-+                    }
+             }
++            IntrinsicOp::VecMaxI32x8 => {
++                // Lane-wise signed max of two 8×I32 vectors (vpmaxsd). Used by
++                // the max-reduction vectorizer: the accumulator (running max)
++                // and the freshly-loaded 8 lanes fold into a new accumulator.
++                if let Some(d) = dest {
++                    self.emit_avx_binary_256(d, args, "vpmaxsd", true);
++                }
++            }
+             IntrinsicOp::VecBroadcastI32x4 => {
+                 self.flush_pending_vec_store_impl();
+                 self.state.invalidate_vec_peephole();
+@@ -3586,6 +3594,32 @@ impl X86Codegen {
+                     self.store_rax_to(d);
                  }
-                 Instruction::BinOp {
-                     dest,
-diff --git a/tests/regression/gep_family_stride_cse.c b/tests/regression/gep_family_stride_cse.c
-new file mode 100644
-index 00000000..46e61d51
---- /dev/null
-+++ b/tests/regression/gep_family_stride_cse.c
-@@ -0,0 +1,60 @@
-+/* Regression: struct-array loops whose element stride is not a legal SIB
-+ * scale (e.g. 56-byte bodies) must not keep one site-local GlobalAddr per
-+ * field access. Before the OP-34 stride gate, every `s.field` of `bodies[j]`
-+ * re-materialised `GA + j*56`, IVSR produced seven marching pointers, and
-+ * the register flood forced a stack-slot relay (nbody: 11 pointers, one
-+ * load+store per pointer per iteration). The gate lets GVN CSE the
-+ * `GA + idx*stride` family into one pointer; field offsets fold into
-+ * displacements. Differential vs GCC. */
-+#include <stdio.h>
-+
-+typedef struct { double x, y, z, vx, vy, vz, mass; } Body;
-+
-+#define N 37
-+static Body bodies[N];
-+
-+static void init(void) {
-+    for (int i = 0; i < N; i++) {
-+        bodies[i].x = i * 0.5;
-+        bodies[i].y = i * 1.5;
-+        bodies[i].z = i * 2.5;
-+        bodies[i].vx = i * 0.25;
-+        bodies[i].vy = i * 0.75;
-+        bodies[i].vz = i * 1.25;
-+        bodies[i].mass = 1.0 + i;
-+    }
-+}
-+
-+/* Pairwise interaction over the same triangular loop shape as nbody. */
-+static double advance(double dt) {
-+    double acc = 0.0;
-+    for (int i = 0; i < N; i++) {
-+        for (int j = i + 1; j < N; j++) {
-+            double dx = bodies[i].x - bodies[j].x;
-+            double dy = bodies[i].y - bodies[j].y;
-+            double dz = bodies[i].z - bodies[j].z;
-+            double d2 = dx * dx + dy * dy + dz * dz;
-+            double mag = dt / (d2 + 1.0);
-+            bodies[i].vx -= dx * bodies[j].mass * mag;
-+            bodies[i].vy -= dy * bodies[j].mass * mag;
-+            bodies[i].vz -= dz * bodies[j].mass * mag;
-+            bodies[j].vx += dx * bodies[i].mass * mag;
-+            bodies[j].vy += dy * bodies[i].mass * mag;
-+            bodies[j].vz += dz * bodies[i].mass * mag;
-+            acc += d2;
-+        }
-+    }
-+    return acc;
-+}
-+
-+int main(void) {
-+    init();
-+    double total = 0.0;
-+    for (int step = 0; step < 3; step++)
-+        total += advance(0.01);
-+    double sum = 0.0;
-+    for (int i = 0; i < N; i++)
-+        sum += bodies[i].vx + bodies[i].vy + bodies[i].vz + bodies[i].mass;
-+    printf("%.12f %.12f\n", total, sum);
-+    return 0;
-+}
-diff --git a/tests/regression/indexed_postinc_alloca_sib.c b/tests/regression/indexed_postinc_alloca_sib.c
-new file mode 100644
-index 00000000..0ea9ecb8
---- /dev/null
-+++ b/tests/regression/indexed_postinc_alloca_sib.c
-@@ -0,0 +1,92 @@
-+/* Regression: post-increment indexed addressing (`i++; a[i]`) folds into a
-+ * SIB memory operand anchored at the ADD's result, and alloca bases fold as
-+ * `disp(%rbp/%rsp,%idx,scale)`. Two historical defects are covered:
-+ *
-+ * 1. The PF-06 iv-update-copy gate refused the fold entirely when the RA
-+ *    coalesces the induction variable with the add's result — the scan
-+ *    loop then paid `movq %r13,%rbx; shlq $3,%rbx` per iteration
-+ *    (linux_find_bit). The retarget folds `a[++i]` as `0(base, i_new, 8)`.
-+ *
-+ * 2. The dead-offset producer walk required use_count == 1 per chain node
-+ *    and stopped at SHARED offsets (`a[i]; b[i]` both scale the same `i*8`),
-+ *    leaving the scaled-offset computation live as dead code.
-+ *
-+ * 3. OverAligned allocas (alignas(32)) must be rejected by the alloca-SIB
-+ *    gate — accepting them skipped the offset chain that the emitter's
-+ *    rematerialise fallback then read through a never-written register
-+ *    (vzeroupper_after_ymm compare loop SEGV). Differential vs GCC. */
-+#include <stdio.h>
-+#include <stdalign.h>
-+
-+#define N 4096
-+
-+static unsigned long words_a[N];
-+static unsigned long words_b[N];
-+alignas(32) static unsigned char over_dst[128];
-+alignas(32) static unsigned char over_src[128];
-+
-+static unsigned long scan_andnot(const unsigned long *a,
-+                                 const unsigned long *b,
-+                                 unsigned long size, unsigned long start) {
-+    unsigned long mask, index, value, result = size;
-+    if (start >= size)
-+        return result;
-+    mask = ~0UL << (start % 64);
-+    index = start / 64;
-+    value = (a[index] & ~b[index]) & mask;
-+    while (!value) {
-+        if ((index + 1UL) * 64UL >= size)
-+            return result;
-+        index++;
-+        value = a[index] & ~b[index];
-+    }
-+    result = index * 64UL + __builtin_ctzl(value);
-+    return result < size ? result : size;
-+}
-+
-+int main(void) {
-+    /* Sparse bitmap: one searchable bit every 64 words. */
-+    for (unsigned long i = 0; i < N; i++) {
-+        words_a[i] = 0UL;
-+        words_b[i] = ~0UL;
-+        if ((i & 63UL) == 5UL) {
-+            words_a[i] = 1UL << ((i * 13UL) & 63UL);
-+            words_b[i] = 0UL;
-+        }
-+    }
-+    unsigned long checksum = 0;
-+    unsigned long offset = 0;
-+    do {
-+        unsigned long bit = scan_andnot(words_a, words_b, N * 64UL, offset);
-+        if (bit < N * 64UL) {
-+            checksum ^= bit + 7;
-+            offset = bit + 1;
-+        } else {
-+            break;
-+        }
-+    } while (offset < N * 64UL);
-+
-+    /* OverAligned copy: the alloca-SIB gate must refuse (runtime-aligned
-+     * address), the address math must stay correct. */
-+    for (int i = 0; i < 128; i++)
-+        over_src[i] = (unsigned char)(i * 3 + 1);
-+    for (int i = 0; i < 128; i += 16)
-+        for (int j = 0; j < 16; j++)
-+            over_dst[i + j] = over_src[i + j];
-+    unsigned long over_sum = 0;
-+    for (int i = 0; i < 128; i++)
-+        over_sum = over_sum * 31UL + over_dst[i];
-+
-+    /* Shared-offset loops: `dst[i] = src[i]*3 + 7` over two allocas. */
-+    int la[100], lb[100];
-+    for (int i = 0; i < 100; i++)
-+        la[i] = i - 50;
-+    for (int i = 0; i < 100; i++)
-+        lb[i] = la[i] * 3 + 7;
-+    long lb_sum = 0;
-+    for (int i = 0; i < 100; i++)
-+        lb_sum += lb[i] * (long)(i + 1);
-+
-+    printf("%lu %lu %ld\n", checksum, over_sum, lb_sum);
-+    return 0;
-+}
-diff --git a/tests/regression/select_const_clobbers_sec_cache.c b/tests/regression/select_const_clobbers_sec_cache.c
-new file mode 100644
-index 00000000..6dd44aa4
---- /dev/null
-+++ b/tests/regression/select_const_clobbers_sec_cache.c
-@@ -0,0 +1,39 @@
-+/* Regression: a Select whose constant arm is staged into %rcx
-+ * (`movq $0, %rcx; cmovcc %rcx, %rax`) must invalidate the emitter's
-+ * register cache. Before the fix, `reg_cache.sec` still claimed %rcx held
-+ * the previously staged constant K; the next `operand_to_rcx(K)` skipped
-+ * the reload and `(h ^ v) * K` multiplied the clobbered register (zero) —
-+ * bitops_builtins returned garbage whenever the copy-propagation peephole
-+ * failed to rescue the consumers. This test recreates the shape directly:
-+ * a big-constant multiply interleaved with a branchless select that uses
-+ * %rcx. Differential vs GCC. */
-+#include <stdio.h>
-+
-+static unsigned long long xs[64];
-+
-+static unsigned long long mix(unsigned long long h, unsigned long long v) {
-+    return (h ^ v) * 0x9e3779b97f4a7c15ULL + 0xdeadbeefULL;
-+}
-+
-+int main(void) {
-+    unsigned long long h = 1469598103934665603ULL;
-+    for (int i = 0; i < 64; i++)
-+        xs[i] = (unsigned long long)(i * 2654435761u) ^ 0x9e3779b9ULL;
-+
-+    unsigned long long acc = h;
-+    for (int i = 0; i < 64; i++) {
-+        unsigned long long v = xs[i];
-+        /* The select's constant false-arm stages through rcx; the multiply
-+         * consumes the register-homed big constant afterwards. */
-+        unsigned long long sel = (v & 1) ? v : 0ULL;
-+        acc = mix(acc, v);
-+        acc ^= sel * 3ULL;
-+        /* Second select with the constant as the TRUE arm (cmov direction
-+         * flipped) to cover both staging orders. */
-+        unsigned long long sel2 = (v & 2) ? 0x1234567890abcdefULL : v;
-+        acc = mix(acc, sel2);
-+        acc += (acc >> 31);
-+    }
-+    printf("%llu\n", (unsigned long long)acc);
-+    return 0;
-+}
-diff --git a/tests/regression/vex_move_false_dep.c b/tests/regression/vex_move_false_dep.c
-new file mode 100644
-index 00000000..d0db9b0b
---- /dev/null
-+++ b/tests/regression/vex_move_false_dep.c
-@@ -0,0 +1,38 @@
-+/* Regression: scalar FP register moves and unary FP ops (sqrt/round) must
-+ * use the VEX 3-operand form when the source lives in a different XMM
-+ * register. The legacy 2-operand `movsd %src, %dst` is a MERGING move that
-+ * reads the destination's upper 64 bits — a false dependence on whatever
-+ * last wrote the destination, which in loops chains onto the previous
-+ * iteration's FP result and serialises otherwise independent iterations at
-+ * full FP latency (nbody: 3.1x vs GCC purely from this). Correctness
-+ * differential vs GCC over an FP chain that mixes sqrt, rint, fma and
-+ * accumulator reloads. */
-+#include <stdio.h>
-+
-+#define N 511
-+
-+static double a[N];
-+static double b[N];
-+
-+int main(void) {
-+    for (int i = 0; i < N; i++) {
-+        a[i] = (i - N / 2) * 0.37519 + ((i & 3) * 0.25);
-+        b[i] = 0.5 + (i & 7) * 0.125;
-+    }
-+    double s1 = 0.0, s2 = 0.0, s3 = 0.0;
-+    for (int pass = 0; pass < 4; pass++) {
-+        for (int i = 0; i < N; i++) {
-+            double x = a[i];
-+            double r = __builtin_sqrt(__builtin_fabs(x) + 1.0);
-+            double t = __builtin_rint(x * r);
-+            double m = t * 0.5 + r;
-+            b[i] = m - __builtin_floor(t * 0.25);
-+            s1 += b[i] - t;
-+            s2 += __builtin_rint(b[i]) * 0.125;
-+            s3 += __builtin_copysign(m, x);
-+        }
-+        a[pass % N] = -a[pass % N];
-+    }
-+    printf("%.9f %.9f %.9f %.9f\n", s1, s2, s3, b[N / 2]);
-+    return 0;
-+}
+             }
++            IntrinsicOp::VecHorizontalMaxI32x8 => {
++                self.flush_pending_vec_store_impl();
++                self.state.invalidate_vec_peephole();
++                // %scalar = horizontal_max(%vec) - AVX2 8×I32 → I32.
++                // x86 has no single smaxv, so reduce in three vpmaxsd steps.
++                // CRITICAL: use vpshufd (lane permute, preserves sign bits)
++                // — NOT vpsrldq (byte shift, zero-fills). A zero-fill would
++                // compute max(lane, 0) which is WRONG for all-negative data
++                // (find_max on negative integers): max(-5, 0) = 0 ≠ -5.
++                // vpshufd keeps every lane's real value so the final max is
++                // the true signed maximum.
++                self.avx_load_arg(&args[0]);
++                // Halve 8→4: max of low 128 and high 128.
++                self.state.emit("    vextracti128 $1, %ymm0, %xmm1");
++                self.state.emit("    vpmaxsd %xmm1, %xmm0, %xmm0");
++                // Reduce 4→2: permute lanes {2,3,0,1}, max-merge.
++                self.state.emit("    vpshufd $0x4e, %xmm0, %xmm1");
++                self.state.emit("    vpmaxsd %xmm1, %xmm0, %xmm0");
++                // Reduce 2→1: permute lanes {1,0,3,2}, max-merge.
++                self.state.emit("    vpshufd $0xb1, %xmm0, %xmm1");
++                self.state.emit("    vpmaxsd %xmm1, %xmm0, %xmm0");
++                self.state.emit("    vmovd %xmm0, %eax");
++                if let Some(d) = dest {
++                    self.store_rax_to(d);
++                }
++            }
+             IntrinsicOp::VecHorizontalAddI32x4 => {
+                 self.flush_pending_vec_store_impl();
+                 self.state.invalidate_vec_peephole();
+diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
+index b2f8a86..b38d3fc 100644
+--- a/src/backend/x86/codegen/prologue.rs
++++ b/src/backend/x86/codegen/prologue.rs
+@@ -579,17 +579,40 @@ impl X86Codegen {
+             for block in &func.blocks {
+                 let insts = &block.instructions;
+                 for (ii, inst) in insts.iter().enumerate() {
+-                    if let Instruction::Cmp { dest, ty, .. } = inst {
++                    if let Instruction::Cmp { dest, ty, op, .. } = inst {
+                         if use_counts.get(&dest.0).copied().unwrap_or(0) != 1 {
+                             continue;
+                         }
+-                        // Only scalar-integer compares fuse: emit_cmp routes
+-                        // I128/U128 to emit_i128_cmp and floats to
+-                        // emit_float_cmp — neither participates in the
+-                        // pending_cmp handshake, so fusing them would strand
+-                        // the forward chain (consumer reads a boolean that was
+-                        // never materialized).
+-                        if !ty.is_integer() || crate::backend::generation::is_wide_int_type(*ty) {
++                        // Wide ints (I128/U128) route to emit_i128_cmp and
++                        // never participate in pending_cmp. Float compares
++                        // now fuse for the RELATIONAL operators only
++                        // (Sgt/Sge/Slt/Sle and unsigned peers): ucomisd sets
++                        // CF/ZF/PF such that `ja`/`jae`/`jb`/`jbe` give the
++                        // correct ordered result (NaN → unordered → false on
++                        // all of them). Eq/Ne need the parity bit, so they
++                        // stay materialized (setnp+sete / setp+setne) and are
++                        // NOT fused here.
++                        if crate::backend::generation::is_wide_int_type(*ty) {
++                            continue;
++                        }
++                        let is_fp = matches!(ty, crate::common::types::IrType::F32
++                            | crate::common::types::IrType::F64);
++                        if is_fp {
++                            let relational = matches!(
++                                op,
++                                crate::ir::reexports::IrCmpOp::Sgt
++                                | crate::ir::reexports::IrCmpOp::Sge
++                                | crate::ir::reexports::IrCmpOp::Slt
++                                | crate::ir::reexports::IrCmpOp::Sle
++                                | crate::ir::reexports::IrCmpOp::Ugt
++                                | crate::ir::reexports::IrCmpOp::Uge
++                                | crate::ir::reexports::IrCmpOp::Ult
++                                | crate::ir::reexports::IrCmpOp::Ule
++                            );
++                            if !relational {
++                                continue;
++                            }
++                        } else if !ty.is_integer() {
+                             continue;
+                         }
+                         // Walk forward over Copies that forward the cmp value.
+@@ -659,8 +682,16 @@ impl X86Codegen {
+                                 } if v.0 == cur => {
+                                     // The copy chain must terminate here (the
+                                     // final value has exactly one use: this
+-                                    // select).
+-                                    if use_counts.get(&cur).copied().unwrap_or(0) == 1 {
++                                    // select). FP relational Cmps may NOT
++                                    // fuse into a Select: the Select consumer
++                                    // reads `pending_cmp` (integer jcc), not
++                                    // `pending_fp_cmp`, so fusing would skip
++                                    // the boolean materialization while the
++                                    // Select still expects to read it — a
++                                    // miscompile. FP fusion is CondBranch-only.
++                                    if !is_fp
++                                        && use_counts.get(&cur).copied().unwrap_or(0) == 1
++                                    {
+                                         is_consumer = true;
+                                     }
+                                     break;
+diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
+index 4494fe9..94a4483 100644
+--- a/src/ir/intrinsics.rs
++++ b/src/ir/intrinsics.rs
+@@ -391,6 +391,17 @@ pub enum IntrinsicOp {
+     /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 8×I32 → I32
+     /// args[0] = source vector value; dest = scalar I32 result
+     VecHorizontalAddI32x8,
++    /// AVX2 lane-wise signed max: %dest_vec = max(%src1_vec, %src2_vec) per
++    /// lane, 8×I32 (vpmaxsd). args[0] = src1, args[1] = src2; dest = result.
++    /// Signed max is associative, commutative, and idempotent, so lane-wise
++    /// reduction matches the scalar max bit-for-bit (same property NEON's
++    /// smax relies on for the I32x4 path).
++    VecMaxI32x8,
++    /// AVX2 horizontal signed max: %scalar = max over all 8 I32 lanes of the
++    /// source vector. x86 has no single smaxv; the lowering folds the 8 lanes
++    /// with vextracti128 + vpmaxsd + vpshufd + vpmaxsd pairs, ending in vmovd
++    /// to the dest GPR. args[0] = source vector value; dest = scalar I32.
++    VecHorizontalMaxI32x8,
+     /// Horizontal reduction: %scalar = horizontal_add(%vec) - SSE2 4×I32 → I32
+     /// args[0] = source vector value; dest = scalar I32 result
+     VecHorizontalAddI32x4,
+@@ -1110,7 +1121,7 @@ impl IntrinsicOp {
+             | Dpbusd256 | Dpbssd256 | Dpwuud256 | Aesenc256 | Vpclmulqdq256
+             | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB
+             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
+-            | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8
++            | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8
+             | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4
+             | VecSubF32x8 | VecDivF32x8 | VecSqrtF32x8
+             | VecZeroF64x4 | VecZeroI32x8 | VecLoadF32x8 | VecAddF32x8
+@@ -1220,6 +1231,8 @@ impl IntrinsicOp {
+             IntrinsicOp::AddI32x8 | IntrinsicOp::AddI32x4 |
+             IntrinsicOp::HorizontalAddF64x4 | IntrinsicOp::HorizontalAddF64x2 |
+             IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4
++            | IntrinsicOp::VecMaxI32x8
++            | IntrinsicOp::VecHorizontalMaxI32x8
+         )
+     }
+ 
+@@ -1244,6 +1257,7 @@ impl IntrinsicOp {
+                 | IntrinsicOp::VecAddF64x4
+                 | IntrinsicOp::VecAddF64x2
+                 | IntrinsicOp::VecAddI32x8
++                | IntrinsicOp::VecMaxI32x8
+                 | IntrinsicOp::VecAddI32x4
+                 | IntrinsicOp::VecAddF32x8
+                 | IntrinsicOp::VecAddF32x4
