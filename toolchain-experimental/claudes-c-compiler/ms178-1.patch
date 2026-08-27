@@ -1,318 +1,47 @@
-From 03645aa0f1d85072bd6905e8ff1d70d78dd8e35b Mon Sep 17 00:00:00 2001
-From: "Z.ai Code" <agent@local>
-Date: Thu, 27 Aug 2026 14:24:28 +0000
-Subject: [PATCH] i686 peephole: admit depth-neutral interleaved-zone labels in
- the unused-callee-save envelope gate
-
-PR #262 widened the envelope scan from first to last dealloc (correct for
-interleaved alloc/dealloc geometry) but swept second-epilogue labels like
-.L1 into the window, where the pre-#262 Label rule unconditionally refused.
-That killed the PR #260 forward-edge relaxation for EVERY multi-epilogue
-frame and left upstream's unused_callee_saves_removed_across_multiple_
-epilogues test red (1201/1).
-
-Refined contract (all conservative, text-level provable):
-- Strict zone (alloc, first_dealloc]: unchanged - Label/JmpIndirect refuse.
-- Interleaved zone (first_dealloc, last_dealloc]: a Label keeps depth
-  identity iff every textual edge into it originates at index > alloc
-  (paths crossing pair push + alloc cancel +4/-4 exactly; tail-region
-  sources are fully unwound and cancel too) and the function contains no
-  JmpIndirect (unresolvable edges make entry depths unknowable).
-
-Unit suite: 1205 passed / 0 failed / 6 ignored (was 1201/1 on b72cbbc6 and
-42440536 alike). New pins: pre-alloc-edge refusal, jmp* refusal, tail-edge
-positive control.
----
- src/backend/i686/codegen/peephole.rs | 239 +++++++++++++++++++++++++--
- 1 file changed, 227 insertions(+), 12 deletions(-)
-
-diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index 01f73e91..1eae7929 100644
---- a/src/backend/i686/codegen/peephole.rs
-+++ b/src/backend/i686/codegen/peephole.rs
-@@ -4703,6 +4703,7 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo])
-             // references safely (it lacks the slot-liveness map), so the
-             // only sound choice is to leave such functions untouched.
-             let alloc_idx = subls[0].0;
-+            let first_dealloc = addls.iter().map(|&(i, _)| i).min();
-             let last_dealloc = addls.iter().map(|&(i, _)| i).max();
-             let is_registered_adjust =
-                 |idx: usize| -> bool { subls.iter().chain(&addls).any(|&(i, _)| i == idx) };
-@@ -4710,14 +4711,32 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo])
-             // targets in the envelope soundness check below.
-             let mut label_pos: std::collections::HashMap<String, usize> =
-                 std::collections::HashMap::new();
-+            // Textual edges (source line index, target label name) of every
-+            // resolvable Jmp/CondJmp in the function. Needed to vet labels in
-+            // the interleaved zone (see the Label arm below).
-+            let mut edges: Vec<(usize, &str)> = Vec::new();
-             for i in start..end {
--                if infos[i].kind == LineKind::Label {
--                    let t = trimmed(store, &infos[i], i);
--                    if let Some(name) = t.strip_suffix(':') {
--                        label_pos.insert(name.to_string(), i);
-+                if infos[i].is_nop() {
-+                    continue;
-+                }
-+                match infos[i].kind {
-+                    LineKind::Label => {
-+                        let t = trimmed(store, &infos[i], i);
-+                        if let Some(name) = t.strip_suffix(':') {
-+                            label_pos.insert(name.to_string(), i);
-+                        }
-                     }
-+                    LineKind::Jmp | LineKind::CondJmp => {
-+                        let t = trimmed(store, &infos[i], i);
-+                        if let Some(name) = t.split_whitespace().next_back() {
-+                            edges.push((i, name));
-+                        }
-+                    }
-+                    _ => {}
-                 }
-             }
-+            let has_jmp_indirect = (start..end)
-+                .any(|i| !infos[i].is_nop() && infos[i].kind == LineKind::JmpIndirect);
-             let mut envelope_ok = true;
-             if let Some(ld) = last_dealloc {
-                 // 1) Geometry: every %esp engagement must live strictly
-@@ -4755,10 +4774,13 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo])
-                         }
-                     }
-                     if k > alloc_idx && k <= ld {
--                        // Control flow INSIDE the envelope. The transform's
--                        // invariant is "esp identical at every program point"
--                        // (+4k alloc and +4k deallocs cancel everywhere
--                        // between them), so most edges are harmless:
-+                        // Control flow INSIDE the envelope (which now spans
-+                        // alloc..LAST dealloc so interleaved alloc/dealloc
-+                        // sequences are covered). The transform's invariant
-+                        // is "esp identical at every program point whose
-+                        // path crossed the alloc and the pair push" (+4k
-+                        // alloc and +4k deallocs cancel the removed push
-+                        // everywhere between them), so:
-                         //
-                         //  * Jmp/CondJmp whose target lies strictly AFTER the
-                         //    alloc executes at the identical depth in both
-@@ -4766,18 +4788,48 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo])
-                         //  * Ret inside the envelope returns at identical
-                         //    esp; the dead register's epilogue pop is simply
-                         //    skipped in both versions.
-+                        //  * A Label between the FIRST and LAST dealloc
-+                        //    (second-epilogue targets like `.L1:`) keeps
-+                        //    depth identity exactly when every textual edge
-+                        //    into it originates at an index > alloc (those
-+                        //    paths crossed the pair push + alloc, so their
-+                        //    arrival depth cancels to zero); fallthrough
-+                        //    from the preceding interior line qualifies.
-+                        //    Tail-region sources (past the last dealloc)
-+                        //    are fully unwound and likewise cancel.
-                         //
-                         // What is NOT provable at text level:
--                        //  * A Label inside the envelope: an edge entering
--                        //    from before the alloc arrives 4 bytes shallower
--                        //    (one fewer push) than the interior expects.
-+                        //  * A Label up to the FIRST dealloc: an edge
-+                        //    entering from before the alloc arrives 4 bytes
-+                        //    shallower (one fewer push) than the interior
-+                        //    expects.
-+                        //  * An interleaved-zone Label that has an edge from
-+                        //    at/before the alloc (uncrossed pair push), or
-+                        //    ANY JmpIndirect in the function (its target is
-+                        //    unprovable, so the label's entry depths are
-+                        //    unknowable): same depth mismatch.
-                         //  * JmpIndirect / a jump to an unresolvable or
-                         //    pre-alloc target: same depth mismatch.
-                         match infos[k].kind {
--                            LineKind::Label | LineKind::JmpIndirect => {
-+                            LineKind::JmpIndirect => {
-                                 envelope_ok = false;
-                                 break;
-                             }
-+                            LineKind::Label => {
-+                                let interior_label_ok = first_dealloc
-+                                    .is_some_and(|fd| k > fd)
-+                                    && !has_jmp_indirect
-+                                    && edges.iter().all(|&(src, name)| {
-+                                        label_pos
-+                                            .get(name)
-+                                            .is_none_or(|&ti| ti != k)
-+                                            || src > alloc_idx
-+                                    });
-+                                if !interior_label_ok {
-+                                    envelope_ok = false;
-+                                    break;
-+                                }
-+                            }
-                             LineKind::Jmp | LineKind::CondJmp => {
-                                 let t = trimmed(store, &infos[k], k);
-                                 let target = t.split_whitespace().next_back();
-@@ -7222,6 +7274,169 @@ mod tests {
-         );
-     }
+diff --git a/.base_ref b/.base_ref
+index 22b5ef40..37c882b0 100644
+--- a/.base_ref
++++ b/.base_ref
+@@ -1 +1 @@
+-4be3a0a276336c6e86880c49be1a577ff162c0d4
++c23e3bd11ae21fb8566428eab7849662b34c7455
+diff --git a/src/frontend/parser/declarators.rs b/src/frontend/parser/declarators.rs
+index 11194c09..c6a01185 100644
+--- a/src/frontend/parser/declarators.rs
++++ b/src/frontend/parser/declarators.rs
+@@ -505,6 +505,8 @@ impl Parser {
+                 // Array params: outermost dimension decays to pointer.
+                 // Preserve the outermost dimension expression (if any) so side effects
+                 // like `a++` in `int b[a++]` can be evaluated during IR lowering.
++                // (Inner dimensions are preserved in type_spec and evaluated by
++                // compute_vla_param_strides).
+                 let mut vla_size_exprs = Vec::with_capacity(2);
+                 if !array_dims.is_empty() {
+                     if let Some(Some(expr)) = array_dims.first() {
+diff --git a/src/ir/lowering/nested_functions.rs b/src/ir/lowering/nested_functions.rs
+index 4440ff20..0335811f 100644
+--- a/src/ir/lowering/nested_functions.rs
++++ b/src/ir/lowering/nested_functions.rs
+@@ -938,9 +938,6 @@ impl Lowerer {
+         let entry_label = self.fresh_label();
+         self.start_block(entry_label);
+         self.func_mut().sret_ptr = None;
+-        self.allocate_function_params(&nf_clone, &param_info);
+-        self.evaluate_vla_param_side_effects(&nf_clone);
+-        self.handle_kr_float_promotion(&nf_clone);
  
-+    #[test]
-+    fn unused_callee_saves_refused_when_interleaved_label_edge_prealloc() {
-+        // Two-epilogue frame whose `.L1` label sits in the INTERLEAVED zone
-+        // (between the first and the last dealloc) -- but the edge INTO .L1
-+        // originates BEFORE the save block (source index <= alloc). Such a
-+        // path never crosses the pair push + alloc, so its arrival depth at
-+        // .L1 would shift by 4 after the transform (+4 alloc, -4 push do not
-+        // cancel on that path): the WHOLE transform must be refused -- pairs
-+        // stay, no growth anywhere.
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    testl %eax, %eax\n",
-+            "    je .L1\n",
-+            "    pushl %ebx\n",
-+            "    pushl %ebp\n",
-+            "    subl $16, %esp\n",
-+            "    movl %ebx, 0(%esp)\n",
-+            "    movl 0(%esp), %eax\n",
-+            "    addl $16, %esp\n",
-+            "    popl %ebp\n",
-+            "    popl %ebx\n",
-+            "    ret\n",
-+            ".L1:\n",
-+            "    xorl %eax, %eax\n",
-+            "    addl $16, %esp\n",
-+            "    popl %ebp\n",
-+            "    popl %ebx\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+            ".size f, .-f\n",
-+        )
-+        .to_string();
-+        let result = peephole_optimize(asm);
-+        // NOTE: the frame is otherwise well-formed (both epilogues restore
-+        // both pairs), so the ONLY refusal reason is the pre-alloc edge into
-+        // the interleaved-zone label -- exactly what this pin guards.
-+        assert!(
-+            result.contains("pushl %ebp") && result.contains("popl %ebp"),
-+            "pair must survive: an edge into the interleaved label comes \
-+             from before the alloc:\n{result}"
-+        );
-+        assert_eq!(
-+            result.matches("subl $16, %esp").count(),
-+            1,
-+            "alloc must not grow:\n{result}"
-+        );
-+        assert_eq!(
-+            result.matches("addl $16, %esp").count(),
-+            2,
-+            "deallocs must not grow:\n{result}"
-+        );
-+    }
+         // 3e. Pre-register captured enclosing locals in the nested
+         // function's locals map with chain-walk address values.
+@@ -1024,6 +1021,12 @@ impl Lowerer {
+             self.func_mut().locals.insert(name, info);
+         }
+ 
++        // Allocate function params and evaluate VLA parameter expressions
++        // now that enclosing captured variables are in scope.
++        self.allocate_function_params(&nf_clone, &param_info);
++        self.evaluate_vla_param_side_effects(&nf_clone);
++        self.handle_kr_float_promotion(&nf_clone);
 +
-+    #[test]
-+    fn unused_callee_saves_refused_when_jmp_indirect_present_with_interleaved_label() {
-+        // Same multi-epilogue shape as the accepted forward-edge case, but a
-+        // `jmp *` exists in the tail. An indirect jump can target the
-+        // interleaved-zone label from any depth, which text-level analysis
-+        // cannot exclude: the conservative choice is to refuse the whole
-+        // transform rather than risk a shifted arrival depth.
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    pushl %ebx\n",
-+            "    pushl %ebp\n",
-+            "    subl $16, %esp\n",
-+            "    movl %eax, %ebx\n",
-+            "    testl %eax, %eax\n",
-+            "    je .L1\n",
-+            "    movl %ebx, 0(%esp)\n",
-+            "    movl %ebx, %eax\n",
-+            "    addl $16, %esp\n",
-+            "    popl %ebp\n",
-+            "    popl %ebx\n",
-+            "    ret\n",
-+            ".L1:\n",
-+            "    xorl %eax, %eax\n",
-+            "    addl $16, %esp\n",
-+            "    popl %ebp\n",
-+            "    popl %ebx\n",
-+            "    ret\n",
-+            ".Ltail:\n",
-+            "    jmp *%eax\n",
-+            ".cfi_endproc\n",
-+            ".size f, .-f\n",
-+        )
-+        .to_string();
-+        let result = peephole_optimize(asm);
-+        // The frame is otherwise well-formed (both epilogues restore both
-+        // pairs), so the only refusal reason is the unresolvable `jmp *`.
-+        assert!(
-+            result.contains("pushl %ebp") && result.contains("popl %ebp"),
-+            "pair must survive: jmp * makes the interleaved label's entry \
-+             depths unprovable:\n{result}"
-+        );
-+        assert_eq!(
-+            result.matches("subl $16, %esp").count(),
-+            1,
-+            "alloc must not grow:\n{result}"
-+        );
-+    }
-+
-+    #[test]
-+    fn unused_callee_saves_removed_with_tail_edge_into_interleaved_label() {
-+        // Positive control for the interleaved-zone label rule: a tail-region
-+        // (past the LAST dealloc) edge into the interleaved label is safe --
-+        // paths reaching the tail have crossed the pair push + alloc and
-+        // fully unwound, so the arrival depth cancels to zero exactly like
-+        // interior edges. The unused %ebp pair still goes, both deallocs grow
-+        // in lockstep, and the live %ebx pair survives on both epilogues.
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    pushl %ebx\n",
-+            "    pushl %ebp\n",
-+            "    subl $16, %esp\n",
-+            "    movl %eax, %ebx\n",
-+            "    testl %eax, %eax\n",
-+            "    je .L1\n",
-+            "    movl %ebx, 0(%esp)\n",
-+            "    movl %ebx, %eax\n",
-+            "    addl $16, %esp\n",
-+            "    popl %ebp\n",
-+            "    popl %ebx\n",
-+            "    ret\n",
-+            ".L1:\n",
-+            "    xorl %eax, %eax\n",
-+            "    addl $16, %esp\n",
-+            "    popl %ebp\n",
-+            "    popl %ebx\n",
-+            "    ret\n",
-+            ".Ltail:\n",
-+            "    testl %edi, %edi\n",
-+            "    je .L1\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+            ".size f, .-f\n",
-+        )
-+        .to_string();
-+        let result = peephole_optimize(asm);
-+        assert!(
-+            !result.contains("%ebp"),
-+            "unused %ebp pair must go: all edges into the interleaved \
-+             label cross the alloc (tail sources cancel too):\n{result}"
-+        );
-+        assert_eq!(
-+            result.matches("subl $20, %esp").count(),
-+            1,
-+            "single alloc grows by 4 in lockstep:\n{result}"
-+        );
-+        assert_eq!(
-+            result.matches("addl $20, %esp").count(),
-+            2,
-+            "BOTH deallocs grow by 4:\n{result}"
-+        );
-+        assert_eq!(
-+            result.matches("popl %ebx").count(),
-+            2,
-+            "live %ebx pops stay on both epilogues:\n{result}"
-+        );
-+    }
-+
-     #[test]
-     fn test_tail_call_suppressed_by_leal_slot() {
-         // Address of a frame slot escapes to the callee: converting would
+ 
+         // 3f. Non-local goto targets for the nested function, keyed by the
+         // scope-qualified name that lower_goto_stmt resolves through the
