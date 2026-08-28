@@ -1,1748 +1,1420 @@
-From d5cf0560b7fda7bc95ff387d2a08a5c8a2548d4c Mon Sep 17 00:00:00 2001
-From: Z User <z@container>
-Date: Fri, 28 Aug 2026 03:21:36 +0000
-Subject: [PATCH] =?UTF-8?q?S09:=20fortify-stdio=20folding=20=E2=80=94=20ha?=
- =?UTF-8?q?rdened=20=5Fchk=20family=20+=20plain=20printf/vprintf/fprintf/v?=
- =?UTF-8?q?fprintf=20family=20(GCC-oracle=20fold=20matrix),=20x86=20operan?=
- =?UTF-8?q?d=5Fto=5Frax=20rematerialisable-GlobalAddr=20rebuild=20contract?=
- =?UTF-8?q?=20repair,=20i128=5Fops=20dead-arm=20cleanup?=
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
----
- src/backend/i686/codegen/i128_ops.rs |    2 -
- src/backend/x86/codegen/emit.rs      |   32 +
- src/passes/fortify_fold.rs           | 1616 ++++++++++++++++++++++++++
- src/passes/mod.rs                    |    8 +
- 4 files changed, 1656 insertions(+), 2 deletions(-)
- create mode 100644 src/passes/fortify_fold.rs
-
-diff --git a/src/backend/i686/codegen/i128_ops.rs b/src/backend/i686/codegen/i128_ops.rs
-index b97dd9d3..44aeda50 100644
---- a/src/backend/i686/codegen/i128_ops.rs
-+++ b/src/backend/i686/codegen/i128_ops.rs
-@@ -38,7 +38,6 @@ impl I686Codegen {
-                 let slot = self.state.get_slot(v.0)?;
-                 Some((self.slot_ref(slot), self.slot_ref_offset(slot, 4)))
-             }
--            _ => None,
-         }
-     }
- 
-@@ -250,7 +249,6 @@ impl I686Codegen {
-                 self.store_eax_to(dest);
-                 true
-             }
--            _ => false,
-         }
-     }
- 
 diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index f30c65fa..f3970396 100644
+index f3970396..a6144c2a 100644
 --- a/src/backend/x86/codegen/emit.rs
 +++ b/src/backend/x86/codegen/emit.rs
-@@ -1424,6 +1424,29 @@ impl X86Codegen {
-                     self.value_to_reg(v, "rax");
-                     self.state.reg_cache.set_acc(v.0, is_alloca);
-                 } else {
-+                    // A rematerialisable GlobalAddr deliberately has no home:
-+                    // its address computation is omitted at the definition and
-+                    // "every consumer is expected to rebuild it" (the contract
-+                    // documented at value_to_reg_inner).  operand_to_rax is a
-+                    // consumer like any other — the call-argument staging
-+                    // highway reaches it — so rebuild the address here instead
-+                    // of failing a handoff that the def side is entitled to
-+                    // produce (fresh GlobalAddr definitions spliced in by IR
-+                    // passes, e.g. fortify_fold's stripped puts literals, may
-+                    // legitimately stay slot-less in variadic frames where the
-+                    // packed-slot tiers skip them).  value_to_reg still fails
-+                    // loudly if the value is genuinely unmaterialisable, so
-+                    // the session-26 gate's soundness guarantee is preserved.
-+                    let is_global_addr = self
-+                        .get_defining_instruction(v.0)
-+                        .is_some_and(|inst| {
-+                            matches!(inst, crate::ir::reexports::Instruction::GlobalAddr { .. })
-+                        });
-+                    if is_global_addr {
-+                        self.value_to_reg(v, "rax");
-+                        self.state.reg_cache.set_acc(v.0, is_alloca);
-+                        return;
-+                    }
-                     // HARD GATE (session 26): a live operand value with no
-                     // register home, no stack slot and no accumulator-cache
-                     // entry cannot be materialised — this spot used to emit a
-@@ -1785,6 +1808,15 @@ impl X86Codegen {
-                     Instruction::Load { dest, .. } => Some(dest.0),
-                     Instruction::Cmp { dest, .. } => Some(dest.0),
-                     Instruction::Phi { dest, .. } => Some(dest.0),
-+                    // GlobalAddr dests must be found: rematerialisable
-+                    // addresses have deliberately no home, so every
-+                    // consumer-side rebuild (value_to_reg / operand_to_rax)
-+                    // depends on this lookup locating the definition.  The
-+                    // missing arm made the documented rebuild contract dead
-+                    // code and forced slot assignment for every spliced
-+                    // GlobalAddr (fortify_fold's stripped puts literals in
-+                    // variadic frames hit exactly that wall).
-+                    Instruction::GlobalAddr { dest, .. } => Some(dest.0),
-                     _ => None,
-                 };
+@@ -3298,12 +3298,39 @@ fn resolve_stack_vregs(
+     // (the has_unresolvable_vreg check will catch it and abandon the buffer).
+     let resolve_reg = |r: &MachReg| -> MachReg { *r };
  
-diff --git a/src/passes/fortify_fold.rs b/src/passes/fortify_fold.rs
-new file mode 100644
-index 00000000..8bd422e1
---- /dev/null
-+++ b/src/passes/fortify_fold.rs
-@@ -0,0 +1,1616 @@
-+//! Fortify-stdio folding: rewrite hardened variadic stdio entry points whose
-+//! result is unused, whose flag is provably 1, and whose format string is a
-+//! compile-time constant into the plain non-hardened equivalents.
-+//!
-+//! Contract (validated against GCC's -O2 folding oracle via the abort-probe
-+//! torture tests gcc.c-torture/execute/{printf,vprintf,fprintf,vfprintf}-chk-1.c,
-+//! which define the hardened functions `noinline` and abort iff a foldable
-+//! call still reaches them):
-+//!
-+//! * ONLY result-unused calls fold.  A call whose return value is consumed
-+//!   keeps the hardened entry point (its return value is the formatted byte
-+//!   count, which no replacement preserves).
-+//! * ONLY flag == 1 folds.  The flag operand is hunted through Copy/Cast
-+//!   chains to a constant; any non-1 or non-constant flag refuses.
-+//! * ONLY constant format strings fold.  The format operand is hunted through
-+//!   Copy/Cast chains to a `GlobalAddr` of a string literal; embedded NUL
-+//!   bytes refuse (the runtime would truncate the output mid-string, a shape
-+//!   the byte-level replacements cannot express).
-+//!
-+//! Per-family rules, matching GCC's fold exactly — including its refusals:
-+//!
-+//! printf family (`__printf_chk(flag, fmt, ...)` / `__vprintf_chk(flag, fmt, ap)`,
-+//! output goes to stdout, no stream operand):
-+//!   * `""`                  → call deleted (prints nothing, result unused)
-+//!   * single char `c`       → `putchar(c)`
-+//!   * `%`-free, ≥2 chars, ending in `\n` → `puts(fmt[:-1])`
-+//!     (the trailing newline is *stripped*: puts appends one)
-+//!   * anything else `%`-free (e.g. `"hello"`) is deliberately NOT folded —
-+//!     GCC keeps the hardened call (printf→fputs would be sound, but the
-+//!     torture contract pins GCC's actual choice; matching it keeps the
-+//!     abort-probe tests green).
-+//!   * variadic `__printf_chk` only, exactly one variadic argument:
-+//!       - `"%s"` + constant `S`: `""` → delete, 1 char → `putchar(S[0])`,
-+//!         `S` ending in `\n` → `puts(S[:-1])` (newline stripped into a
-+//!         pooled literal), otherwise NOT folded (GCC keeps `%s` with a
-+//!         non-newline-terminated constant: the fputs shape is only reached
-+//!         by the fprintf family).
-+//!       - `"%c"` + constant `c` → `putchar(c)`
-+//!       - `"%s\n"` + constant `S` → `puts(S)` (verbatim: puts appends the
-+//!         newline the format requested)
-+//!   * `__vprintf_chk` cannot consume its `va_list`, so the three
-+//!     argument-dependent shapes above refuse (GCC likewise folds it only
-+//!     for the argument-independent shapes).
-+//!
-+//! fprintf family (`__fprintf_chk(stream, flag, fmt, ...)` /
-+//! `__vfprintf_chk(stream, flag, fmt, ap)`, stream operand reused verbatim):
-+//!   * `""`                  → call deleted
-+//!   * single char `c`       → `fputc(c, stream)`
-+//!   * `%`-free, ≥2 chars (newline kept — fputs does not append) →
-+//!     `fputs(fmt, stream)`
-+//!   * variadic `__fprintf_chk` only, exactly one variadic argument:
-+//!       - `"%s"` + constant `S`: `""` → delete, 1 char → `fputc(S[0], s)`,
-+//!         else → `fputs(S, stream)` (the shape the printf family refuses)
-+//!       - `"%c"` + constant `c` → `fputc(c, stream)`
-+//!       - `"%s\n"` → refused (fputs cannot append the newline, puts cannot
-+//!         target the stream — GCC keeps the call)
-+//!   * `__vfprintf_chk`: argument-dependent shapes refuse.
-+//!
-+//! The PLAIN (non-hardened) family folds on the same oracle evidence
-+//! (GCC -O2 asm of unused-result calls; result-used calls always stay):
-+//!
-+//! * `printf` (variadic): `""` → delete, single char → `putchar`,
-+//!   `%`-free ending `\n` → `puts` (stripped), and with exactly one
-+//!   variadic argument: `"%s\n"` + constant `S` → `puts(S)`,
-+//!   `"%c"` + constant → `putchar`.  Everything else (notably `%`-free
-+//!   formats without a trailing newline, e.g. `printf("hello")`, and
-+//!   `"%s"` with a non-newline constant) is deliberately KEPT — GCC's
-+//!   oracle keeps them too.
-+//! * `vprintf`: `""` → delete, single char → `putchar`, and `%`-free
-+//!   length ≥ 2 → `puts` (stripped) when the format ends in `\n`,
-+//!   otherwise `fwrite(fmt, 1, len, stdout)` (the va_list consumes
-+//!   nothing for conversion-free formats, so dropping it is sound).
-+//! * `fprintf` (variadic): `""` → delete, single char / `"%c"` + constant →
-+//!   `fputc`, `%`-free length ≥ 2 → `fwrite(fmt, 1, len, stream)`,
-+//!   `"%s"` + constant `S` → `fwrite(S, 1, len(S), stream)`;
-+//!   `"%s\n"` is kept (fputs/fwrite cannot append, puts cannot target
-+//!   the stream — GCC keeps it as well).
-+//! * `vfprintf`: `""` → delete, single char → `fputc`, `%`-free
-+//!   length ≥ 2 (newline kept) → `fwrite(fmt, 1, len, stream)`.
-+//!
-+//! `fwrite`'s size_t width follows the target (U64 on LP64, U32 on ILP32),
-+//! mirroring the frontend's own fwrite lowering exactly.
-+//!
-+//! The pass runs after the inlining phase at -O2+ and after ip_purity at -O1
-+//! (the hardened calls are `noinline` in real headers, so their call sites
-+//! never inline away; running after inlining keeps the Copy/Cast flag-staging
-+//! shapes canonical).  Disable with `CCC_DISABLE_PASSES=fortifyfold`.
-+
-+use crate::common::fx_hash::FxHashMap;
-+use crate::common::types::IrType;
-+use crate::ir::instruction::{CallInfo, Instruction};
-+use crate::ir::module::{IrFunction, IrModule};
-+use crate::ir::reexports::{IrConst, Operand, Value};
-+
-+/// How a value is defined, for the Copy/Cast/GlobalAddr constant hunts.
-+#[derive(Clone, Debug)]
-+enum Def {
-+    CopyOf(Operand),
-+    CastFrom(Operand),
-+    GlobalString(String),
-+}
-+
-+/// Collected mutation for one call site.
-+enum Action {
-+    /// Instructions replacing the call in place: any `GlobalAddr` definitions
-+    /// for freshly interned stripped literals precede the replacement call.
-+    Replace(Vec<Instruction>),
-+    /// The call prints nothing observable and its result is unused: remove it.
-+    Delete,
-+}
-+
-+/// A replacement decision plus bookkeeping for freshly spliced definitions:
-+/// `new_literal` interns a stripped-newline text, `extra_values` counts the
-+/// fresh Value ids the replacement instructions define (stripped-literal
-+/// GlobalAddrs and vprintf's stdout GlobalAddr).  run() records both so
-+/// DCE's def_loc table (sized from next_value_id) covers every new id.
-+struct Decision {
-+    insts: Vec<Instruction>,
-+    new_literal: Option<(String, String)>,
-+    extra_values: u32,
-+}
-+
-+/// Hunt an integer constant through Copy/Cast chains.  `None` = not provable.
-+fn const_int(defs: &FxHashMap<u32, Def>, op: &Operand, depth: u32) -> Option<i64> {
-+    if depth > 8 {
-+        return None;
-+    }
-+    match op {
-+        Operand::Const(c) => match c {
-+            IrConst::I8(v) => Some(*v as i64),
-+            IrConst::I16(v) => Some(*v as i64),
-+            IrConst::I32(v) => Some(*v as i64),
-+            IrConst::I64(v) => Some(*v),
-+            IrConst::Zero => Some(0),
-+            _ => None,
-+        },
-+        Operand::Value(v) => match defs.get(&v.0) {
-+            Some(Def::CopyOf(src)) => const_int(defs, src, depth + 1),
-+            Some(Def::CastFrom(src)) => const_int(defs, src, depth + 1),
-+            _ => None,
-+        },
-+    }
-+}
-+
-+/// Hunt a string literal through Copy/Cast chains to its `GlobalAddr`
-+/// definition.  `None` = not provable.
-+fn const_string<'a>(
-+    defs: &FxHashMap<u32, Def>,
-+    strings: &'a FxHashMap<String, String>,
-+    op: &Operand,
-+    depth: u32,
-+) -> Option<&'a str> {
-+    if depth > 8 {
-+        return None;
-+    }
-+    match op {
-+        Operand::Const(_) => None,
-+        Operand::Value(v) => match defs.get(&v.0)? {
-+            Def::CopyOf(src) => const_string(defs, strings, src, depth + 1),
-+            Def::CastFrom(src) => const_string(defs, strings, src, depth + 1),
-+            Def::GlobalString(name) => strings.get(name).map(|s| s.as_str()),
-+        },
-+    }
-+}
-+
-+/// Highest value id defined or used anywhere in the function.  Passes in
-+/// this pipeline create values without always maintaining `next_value_id`,
-+/// so the fresh ids for stripped literals must be allocated past a full scan
-+/// (same defensive policy as univsr's value allocator).
-+fn max_value_id(func: &IrFunction) -> u32 {
-+    let mut max = 0u32;
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            if let Some(d) = inst.dest() {
-+                if d.0 > max {
-+                    max = d.0;
-+                }
-+            }
-+            for u in inst.used_values() {
-+                if u > max {
-+                    max = u;
-+                }
-+            }
-+        }
-+        for t in block.terminator.used_values() {
-+            if t > max {
-+                max = t;
-+            }
-+        }
-+    }
-+    max
-+}
-+
-+/// True when no instruction or terminator in the function uses `v`.
-+fn value_unused(func: &IrFunction, v: Value) -> bool {
-+    let id = v.0;
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            if inst.used_values().contains(&id) {
-+                return false;
-+            }
-+        }
-+        if block.terminator.used_values().contains(&id) {
-+            return false;
-+        }
-+    }
-+    true
-+}
-+
-+/// Build a plain non-variadic `int name(args...)` call with an unused result.
-+fn mk_call(name: &str, args: Vec<Operand>, arg_types: Vec<IrType>) -> Instruction {
-+    let n = args.len();
-+    Instruction::Call {
-+        func: name.to_string(),
-+        info: CallInfo {
-+            dest: None,
-+            args,
-+            arg_types,
-+            return_type: IrType::I32,
-+            is_variadic: false,
-+            num_fixed_args: n,
-+            struct_arg_sizes: vec![None; n],
-+            struct_arg_aligns: vec![None; n],
-+            struct_arg_classes: vec![Vec::new(); n],
-+            struct_arg_riscv_float_classes: vec![None; n],
-+            struct_arg_is_f128_sse: vec![false; n],
-+            ret_is_f128_sse: false,
-+            is_sret: false,
-+            is_fastcall: false,
-+            is_pure: false,
-+            is_const: false,
-+            ret_eightbyte_classes: Vec::new(),
-+        },
-+    }
-+}
-+
-+/// A `GlobalAddr` instruction defining `dest` to point at `literal`.
-+fn global_addr(dest: Value, literal: &str) -> Instruction {
-+    Instruction::GlobalAddr {
-+        dest,
-+        name: literal.to_string(),
-+    }
-+}
-+
-+/// `fwrite(ptr, 1, len, stream)` with an unused result — the byte-exact
-+/// replacement for conversion-free stream writes.  size_t width follows the
-+/// target exactly like the frontend's own fwrite lowering (U64 LP64,
-+/// U32 ILP32; the constants stay I64 in both cases, as lowered).
-+fn fwrite_call(ptr: Operand, len: usize, stream: Operand, size_t_is_u32: bool) -> Instruction {
-+    let sz = if size_t_is_u32 { IrType::U32 } else { IrType::U64 };
-+    mk_call(
-+        "fwrite",
-+        vec![
-+            ptr,
-+            Operand::Const(IrConst::I64(1)),
-+            Operand::Const(IrConst::I64(len as i64)),
-+            stream,
-+        ],
-+        vec![IrType::Ptr, sz, sz, IrType::Ptr],
-+    )
-+}
-+
-+/// Classification context for one function.
-+struct FoldCtx<'a> {
-+    defs: FxHashMap<u32, Def>,
-+    strings: &'a FxHashMap<String, String>,
-+}
-+
-+impl FoldCtx<'_> {
-+    fn const_int(&self, op: &Operand) -> Option<i64> {
-+        const_int(&self.defs, op, 0)
-+    }
-+
-+    fn const_string(&self, op: &Operand) -> Option<&str> {
-+        const_string(&self.defs, self.strings, op, 0)
-+    }
-+}
-+
-+/// Decide the fold for one hardened call site.  All call-shape gates
-+/// (result unused, flag == 1, constant NUL-free format) are checked here;
-+/// `next_val` is the next free value id for a stripped-literal definition.
-+#[allow(clippy::too_many_arguments)]
-+fn classify(
-+    ctx: &FoldCtx,
-+    callee: &str,
-+    info: &CallInfo,
-+    stream_first: bool,
-+    variadic: bool,
-+    plain: bool,
-+    size_t_is_u32: bool,
-+    next_val: u32,
-+    fresh_literal: &str,
-+) -> Option<Decision> {
-+    // Layout: hardened calls carry a flag argument; plain calls do not.
-+    //   hardened: [stream,] flag, fmt[, varargs...]   fmt_idx = 1 + stream?
-+    //   plain:    [stream,] fmt[, varargs...]         fmt_idx = stream?
-+    // The flag gate applies only to the hardened family (plain calls have
-+    // no fortify flag; their only gates are result-unused + const format).
-+    let has_flag = !plain;
-+    let (stream_idx, flag_idx, fmt_idx): (Option<usize>, usize, usize) = match (stream_first, has_flag) {
-+        (true, true) => (Some(0), 1, 2),
-+        (true, false) => (Some(0), 0, 1),
-+        (false, true) => (None, 0, 1),
-+        (false, false) => (None, 0, 0),
-+    };
-+    if info.args.len() <= fmt_idx {
-+        return None;
-+    }
-+    // flag must be provably 1 (hardened family only).
-+    if has_flag && ctx.const_int(&info.args[flag_idx]) != Some(1) {
-+        return None;
-+    }
-+    // Format must be a NUL-free constant string.
-+    let fmt = ctx.const_string(&info.args[fmt_idx])?;
-+    if fmt.contains('\0') {
-+        return None;
-+    }
-+
-+    let stream_op: Option<Operand> = stream_idx.map(|i| info.args[i].clone());
-+    let fmt_op = info.args[fmt_idx].clone();
-+
-+    // Replacement helpers.  The printf family folds to stdout routines
-+    // (putchar/puts); the fprintf family reuses the stream operand verbatim
-+    // (fputc/fputs).
-+    let char_call = |plain: &str, streamed: &str, c: i32| {
-+        let c = Operand::Const(IrConst::I32(c));
-+        match &stream_op {
-+            None => mk_call(plain, vec![c], vec![IrType::I32]),
-+            Some(st) => mk_call(
-+                streamed,
-+                vec![c, st.clone()],
-+                vec![IrType::I32, IrType::Ptr],
-+            ),
+-    // Helper: resolve a MachOperand — replace Vreg with StackSlot if possible
+-    let resolve_op = |op: &MachOperand| -> MachOperand {
++    // WIDTH SOUNDNESS: a spilled vreg's slot is 4 bytes (small slot) or 8
++    // bytes. Substituting it into an instruction whose size is WIDER than
++    // the slot makes the emitter read bytes past the slot — e.g.
++    // `cmpq $0, 28(%rsp)` on a 4-byte slot pulls the adjacent slot's
++    // garbage into the high 32 bits (kernel lib/zstd
++    // ZSTD_decodeLiteralsBlock: the 64-bit `!lhlCode` predicate read
++    // `flags` from the neighboring slot and took the wrong HUF dispatch).
++    // A register-form consumer is safe — a `movl` reload zero-extends —
++    // but memory-operand substitution silently loses that extension.
++    // Refuse the substitution when the instruction size exceeds the slot
++    // width: the leftover Vreg trips has_unresolvable_vreg and the
++    // buffered window falls back to the default (accumulator) path, which
++    // loads every value at its true width.
++    let slot_fits = |id: &u32, inst_size: OpSize| -> bool {
++        if state.is_small_slot(*id) {
++            // 4-byte slot: only 8/16/32-bit reads are in-bounds.
++            matches!(inst_size, OpSize::S8 | OpSize::S16 | OpSize::S32)
++        } else {
++            // 8-byte slot: every instruction width reads in-bounds.
++            true
 +        }
 +    };
-+    let fputsish = |s: Operand, st: Operand| {
-+        mk_call("fputs", vec![s, st], vec![IrType::Ptr, IrType::Ptr])
-+    };
 +
-+    // ---- PLAIN (non-hardened) family -------------------------------------
-+    // Same oracle discipline as the hardened matrix: only shapes GCC's -O2
-+    // asm actually folds; everything else keeps the original call.
-+    if plain {
-+        let bytes = fmt.as_bytes();
-+        if bytes.is_empty() {
-+            return Some(Decision { insts: Vec::new(), new_literal: None, extra_values: 0 });
-+        }
-+        if bytes.len() == 1 {
-+            return Some(Decision {
-+                insts: vec![char_call("putchar", "fputc", bytes[0] as i32)],
-+                new_literal: None,
-+                extra_values: 0,
-+            });
-+        }
-+        // Exactly one variadic argument available (plain variadic variants
-+        // only; the v- variants carry a va_list that cannot be inspected).
-+        let one_vararg = variadic && info.args.len() == fmt_idx + 2;
-+        let arg_op = || info.args[fmt_idx + 1].clone();
-+        // "%c" + constant, variadic variants only.
-+        if one_vararg && fmt == "%c" {
-+            let c = ctx.const_int(&arg_op())?;
-+            return Some(Decision {
-+                insts: vec![char_call("putchar", "fputc", c as i32)],
-+                new_literal: None,
-+                extra_values: 0,
-+            });
-+        }
-+        // "%s\n" + constant: puts(arg verbatim) — printf family only
-+        // (fprintf/vfprintf cannot append a newline to a stream write).
-+        if one_vararg && fmt == "%s\n" {
-+            if stream_op.is_none() {
-+                let s = ctx.const_string(&arg_op())?;
-+                if s.contains('\0') {
-+                    return None;
-+                }
-+                return Some(Decision {
-+                    insts: vec![mk_call("puts", vec![arg_op()], vec![IrType::Ptr])],
-+                    new_literal: None,
-+                    extra_values: 0,
-+                });
-+            }
-+            return None;
-+        }
-+        // "%s" + constant: ONLY the plain fprintf family folds (fwrite of
-+        // the verbatim argument); printf keeps the call (GCC oracle).
-+        if one_vararg && fmt == "%s" {
-+            let s = ctx.const_string(&arg_op())?;
-+            if s.contains('\0') {
-+                return None;
-+            }
-+            if let Some(st) = &stream_op {
-+                return Some(Decision {
-+                    insts: vec![fwrite_call(
-+                        arg_op(),
-+                        s.len(),
-+                        st.clone(),
-+                        size_t_is_u32,
-+                    )],
-+                    new_literal: None,
-+                    extra_values: 0,
-+                });
-+            }
-+            return None;
-+        }
-+        // Argument-independent % -free shapes.
-+        if !fmt.contains('%') {
-+            if fmt.ends_with('\n') {
-+                // printf AND vprintf families fold the trailing-newline
-+                // shape to puts of the stripped format; the fprintf family
-+                // writes the format verbatim via fwrite (newline kept).
-+                if stream_op.is_none() {
-+                    if callee == "printf" || callee == "vprintf" {
-+                        let stripped = fmt[..fmt.len() - 1].to_string();
-+                        return Some(Decision {
-+                            insts: vec![
-+                                global_addr(Value(next_val), fresh_literal),
-+                                mk_call(
-+                                    "puts",
-+                                    vec![Operand::Value(Value(next_val))],
-+                                    vec![IrType::Ptr],
-+                                ),
-+                            ],
-+                            new_literal: Some((fresh_literal.to_string(), stripped)),
-+                            extra_values: 1,
-+                        });
++    // Helper: resolve a MachOperand — replace Vreg with StackSlot if possible.
++    let resolve_op = |op: &MachOperand, inst_size: OpSize| -> MachOperand {
+         match op {
+             MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
+                 if let Some(slot) = state.get_slot(*id) {
+-                    MachOperand::StackSlot(slot.0)
++                    if slot_fits(id, inst_size) {
++                        MachOperand::StackSlot(slot.0)
++                    } else {
++                        op.clone()
 +                    }
-+                    // plain fprintf: % -free + trailing \n → fwrite verbatim
-+                    // (handled by the generic % -free arm below).
-+                }
-+            }
-+            // % -free, length >= 2:
-+            //   * plain printf (variadic, stdout): GCC KEEPS the call when
-+            //     the format does not end in a newline.
-+            //   * vprintf / fprintf / vfprintf: fwrite(fmt, 1, len, out).
-+            if !(callee == "printf" && !fmt.ends_with('\n')) {
-+                if let Some(st) = &stream_op {
-+                    return Some(Decision {
-+                    extra_values: 0,
-+                        insts: vec![fwrite_call(
-+                            fmt_op,
-+                            bytes.len(),
-+                            st.clone(),
-+                            size_t_is_u32,
-+                        )],
-+                        new_literal: None,
-+                    });
-+                }
-+                if callee == "vprintf" {
-+                    // vprintf has no stream operand in scope: splice a
-+                    // GlobalAddr of the extern `stdout` pointer variable
-+                    // PLUS a load through it — fwrite needs the FILE*
-+                    // VALUE (stdout), not the address of the variable
-+                    // (&stdout is an invalid stdio handle; glibc aborts
-+                    // with "invalid stdio handle").
-+                    let addr_id = Value(next_val);
-+                    let load_id = Value(next_val + 1);
-+                    return Some(Decision {
-+                        insts: vec![
-+                            global_addr(addr_id, "stdout"),
-+                            Instruction::Load {
-+                                dest: load_id,
-+                                ptr: addr_id,
-+                                ty: IrType::Ptr,
-+                                seg_override: crate::common::types::AddressSpace::Default,
-+                                volatile: false,
-+                            },
-+                            fwrite_call(
-+                                fmt_op,
-+                                bytes.len(),
-+                                Operand::Value(load_id),
-+                                size_t_is_u32,
-+                            ),
-+                        ],
-+                        new_literal: None,
-+                        extra_values: 2,
-+                    });
-+                }
-+            }
-+        }
-+        return None;
-+    }
-+    // ---- hardened (_chk) family below ------------------------------------
-+
-+    // Argument-dependent shapes (variadic variants with exactly one tail arg).
-+    if variadic && info.args.len() == fmt_idx + 2 {
-+        let arg_op = info.args[fmt_idx + 1].clone();
-+        if fmt == "%s" {
-+            let s = ctx.const_string(&arg_op)?;
-+            if s.contains('\0') {
-+                return None;
-+            }
-+            let bytes = s.as_bytes();
-+            if bytes.is_empty() {
-+                return Some(Decision { insts: Vec::new(), new_literal: None, extra_values: 0 });
-+            }
-+            if bytes.len() == 1 {
-+                return Some(Decision {
-+                    insts: vec![char_call("putchar", "fputc", bytes[0] as i32)],
-+                    new_literal: None,
-+                    extra_values: 0,
-+                });
-+            }
-+            // Multi-byte constant: the fprintf family folds to fputs of the
-+            // verbatim argument; the printf family folds ONLY when the
-+            // argument ends in a newline — puts of the stripped argument
-+            // (GCC pools the stripped text as a fresh literal; the argument
-+            // is data, so a '%' inside it needs no refusal).
-+            if let Some(st) = stream_op {
-+                return Some(Decision {
-+                    insts: vec![fputsish(arg_op, st)],
-+                    new_literal: None,
-+                    extra_values: 0,
-+                });
-+            }
-+            if !s.ends_with('\n') {
-+                return None;
-+            }
-+            let stripped = s[..s.len() - 1].to_string();
-+            return Some(Decision {
-+                insts: vec![
-+                    global_addr(Value(next_val), fresh_literal),
-+                    mk_call("puts", vec![Operand::Value(Value(next_val))], vec![IrType::Ptr]),
-+                ],
-+                new_literal: Some((fresh_literal.to_string(), stripped)),
-+                extra_values: 1,
-+            });
-+        }
-+        if fmt == "%c" {
-+            let c = ctx.const_int(&arg_op)?;
-+            return Some(Decision {
-+                insts: vec![char_call("putchar", "fputc", c as i32)],
-+                new_literal: None,
-+                extra_values: 0,
-+            });
-+        }
-+        if fmt == "%s\n" {
-+            // printf family: puts(arg) verbatim.  fprintf family: refused
-+            // (fputs cannot append; puts cannot target the stream).
-+            if stream_op.is_none() {
-+                // The argument must itself be a constant string (its global
-+                // address operand is reused verbatim).
-+                let s = ctx.const_string(&arg_op)?;
-+                if s.contains('\0') {
-+                    return None;
-+                }
-+                return Some(Decision {
-+                    extra_values: 0,
-+                    insts: vec![mk_call("puts", vec![arg_op], vec![IrType::Ptr])],
-+                    new_literal: None,
-+                });
-+            }
-+            return None;
-+        }
-+    }
-+
-+    // Argument-independent shapes.
-+    let bytes = fmt.as_bytes();
-+    if bytes.is_empty() {
-+        return Some(Decision { insts: Vec::new(), new_literal: None, extra_values: 0 });
-+    }
-+    if bytes.len() == 1 {
-+        return Some(Decision {
-+                    extra_values: 0,
-+            insts: vec![char_call("putchar", "fputc", bytes[0] as i32)],
-+            new_literal: None,
-+        });
-+    }
-+    if !fmt.contains('%') {
-+        if stream_op.is_none() {
-+            // printf family: only the trailing-newline shape folds to puts,
-+            // with the newline stripped into a fresh literal.
-+            if fmt.ends_with('\n') {
-+                let stripped = fmt[..fmt.len() - 1].to_string();
-+                let addr = global_addr(Value(next_val), fresh_literal);
-+                let call = mk_call(
-+                    "puts",
-+                    vec![Operand::Value(Value(next_val))],
-+                    vec![IrType::Ptr],
-+                );
-+                return Some(Decision {
-+                    extra_values: 1,
-+                    insts: vec![addr, call],
-+                    new_literal: Some((fresh_literal.to_string(), stripped)),
-+                });
-+            }
-+            // % -free, no trailing newline, len>=2: GCC keeps the call.
-+            return None;
-+        }
-+        // fprintf family: every % -free shape of len>=2 folds to fputs,
-+        // newline KEPT (fputs does not append).
-+        let st = stream_op.unwrap();
-+        return Some(Decision {
-+            extra_values: 0,
-+            insts: vec![fputsish(fmt_op, st)],
-+            new_literal: None,
-+        });
-+    }
-+    None
-+}
-+
-+/// Entry point: fold every eligible hardened or plain stdio call in the
-+/// module.  `size_t_is_u32` selects fwrite's size_t width (ILP32 targets).
-+pub fn run(module: &mut IrModule, size_t_is_u32: bool) {
-+    let strings: FxHashMap<String, String> = module
-+        .string_literals
-+        .iter()
-+        .map(|(name, s)| (name.clone(), s.clone()))
-+        .collect();
-+    // Fresh literal labels for stripped-newline puts variants.  The counter
-+    // starts past the existing pool and skips any (impossible, but cheap to
-+    // guard) collision.
-+    let mut literal_counter = module.string_literals.len();
-+    let mut pending_literals: Vec<(String, String)> = Vec::new();
-+
-+    for func in &mut module.functions {
-+        if func.is_declaration {
-+            continue;
-+        }
-+        let mut defs: FxHashMap<u32, Def> = FxHashMap::default();
-+        for block in &func.blocks {
-+            for inst in &block.instructions {
-+                match inst {
-+                    Instruction::Copy { dest, src } => {
-+                        defs.insert(dest.0, Def::CopyOf(src.clone()));
-+                    }
-+                    Instruction::Cast { dest, src, .. } => {
-+                        defs.insert(dest.0, Def::CastFrom(src.clone()));
-+                    }
-+                    Instruction::GlobalAddr { dest, name } => {
-+                        defs.insert(dest.0, Def::GlobalString(name.clone()));
-+                    }
-+                    _ => {}
-+                }
-+            }
-+        }
-+        let ctx = FoldCtx {
-+            defs,
-+            strings: &strings,
-+        };
-+
-+        let mut next_val = func.next_value_id.max(max_value_id(func) + 1);
-+        let mut decisions: Vec<(usize, usize, Decision)> = Vec::new();
-+        for (bi, block) in func.blocks.iter().enumerate() {
-+            for (ii, inst) in block.instructions.iter().enumerate() {
-+                let Instruction::Call { func: callee, info } = inst else {
-+                    continue;
-+                };
-+                // Result must be unused (absent or dead).
-+                if let Some(dest) = info.dest {
-+                    if !value_unused(func, dest) {
-+                        continue;
-+                    }
-+                }
-+                let (stream_first, variadic, plain) = match callee.as_str() {
-+                    "__printf_chk" => (false, true, false),
-+                    "__vprintf_chk" => (false, false, false),
-+                    "__fprintf_chk" => (true, true, false),
-+                    "__vfprintf_chk" => (true, false, false),
-+                    "printf" => (false, true, true),
-+                    "vprintf" => (false, false, true),
-+                    "fprintf" => (true, true, true),
-+                    "vfprintf" => (true, false, true),
-+                    _ => continue,
-+                };
-+                let fresh = format!(".Lchkfold{}", literal_counter);
-+                if let Some(decision) = classify(
-+                    &ctx,
-+                    callee,
-+                    info,
-+                    stream_first,
-+                    variadic,
-+                    plain,
-+                    size_t_is_u32,
-+                    next_val,
-+                    &fresh,
-+                ) {
-+                    if decision.new_literal.is_some() {
-+                        literal_counter += 1;
-+                    }
-+                    if decision.extra_values > 0 {
-+                        next_val += decision.extra_values;
-+                    }
-+                    decisions.push((bi, ii, decision));
-+                }
-+            }
-+        }
-+        if decisions.is_empty() {
-+            continue;
-+        }
-+        // Any stripped-literal allocation above the cached next_value_id (or
-+        // above a stale cache found by the defensive max scan) must be
-+        // recorded: later passes size their per-value tables from
-+        // next_value_id (DCE's def_loc is def_len = max_value_id() + 1), and
-+        // an unrecorded id would be silently clipped out of those tables —
-+        // the definition then looks dead and DCE deletes it while the call
-+        // use survives (dangling use, codegen hard-gate panic).
-+        if next_val > func.next_value_id {
-+            func.next_value_id = next_val;
-+        }
-+        // Apply in reverse (block, index) order so removals stay index-stable.
-+        decisions.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-+        for (bi, ii, decision) in decisions.into_iter().rev() {
-+            let block = &mut func.blocks[bi];
-+            if decision.insts.is_empty() {
-+                block.instructions.remove(ii);
-+            } else {
-+                block.instructions.splice(ii..ii + 1, decision.insts);
-+            }
-+            if let Some(lit) = decision.new_literal {
-+                pending_literals.push(lit);
-+            }
-+        }
-+    }
-+    module.string_literals.extend(pending_literals);
-+}
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+    use crate::ir::instruction::{BasicBlock, Terminator};
-+    use crate::ir::reexports::BlockId;
-+
-+    /// Build a hardened call with the given dest/args/types.
-+    fn hardened_call(
-+        name: &str,
-+        dest: Option<u32>,
-+        args: Vec<Operand>,
-+        arg_types: Vec<IrType>,
-+    ) -> Instruction {
-+        let n = args.len();
-+        let variadic = matches!(name, "__printf_chk" | "__fprintf_chk");
-+        Instruction::Call {
-+            func: name.to_string(),
-+            info: CallInfo {
-+                dest: dest.map(Value),
-+                args,
-+                arg_types,
-+                return_type: IrType::I32,
-+                is_variadic: variadic,
-+                num_fixed_args: if variadic { n - 1 } else { n },
-+                struct_arg_sizes: vec![None; n],
-+                struct_arg_aligns: vec![None; n],
-+                struct_arg_classes: vec![Vec::new(); n],
-+                struct_arg_riscv_float_classes: vec![None; n],
-+                struct_arg_is_f128_sse: vec![false; n],
-+                ret_is_f128_sse: false,
-+                is_sret: false,
-+                is_fastcall: false,
-+                is_pure: false,
-+                is_const: false,
-+                ret_eightbyte_classes: Vec::new(),
-+            },
-+        }
-+    }
-+
-+    fn flat_calls(func: &IrFunction) -> Vec<String> {
-+        func.blocks
-+            .iter()
-+            .flat_map(|b| b.instructions.iter())
-+            .filter_map(|i| match i {
-+                Instruction::Call { func, .. } => Some(func.clone()),
-+                _ => None,
-+            })
-+            .collect()
-+    }
-+
-+    /// Standard staging prefix: v0 = flag 1 (Copy), v1..v4 = GlobalAddr of
-+    /// the standard literal set; next free id = 10.
-+    fn staging(insts: &mut Vec<Instruction>) {
-+        insts.push(Instruction::Copy {
-+            dest: Value(0),
-+            src: Operand::Const(IrConst::I32(1)),
-+        });
-+        for (id, name) in [
-+            (1u32, ".LstrA"),   // "hello\n"
-+            (2, ".LstrB"),      // "hello"
-+            (3, ".LstrC"),      // "a"
-+            (4, ".LstrEmpty"),  // ""
-+        ] {
-+            insts.push(Instruction::GlobalAddr {
-+                dest: Value(id),
-+                name: name.to_string(),
-+            });
-+        }
-+    }
-+
-+    fn run_module(func: IrFunction, strings: Vec<(String, String)>) -> IrFunction {
-+        let mut module = IrModule::default();
-+        module.string_literals = strings;
-+        module.functions = vec![func];
-+        run(&mut module, false);
-+        module.functions.pop().unwrap()
-+    }
-+
-+    fn simple_func(insts: Vec<Instruction>) -> IrFunction {
-+        let mut func = IrFunction::new("main".to_string(), IrType::I32, Vec::new(), false);
-+        func.next_value_id = 10;
-+        func.blocks.push(BasicBlock {
-+            label: BlockId(0),
-+            instructions: insts,
-+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
-+            source_spans: Vec::new(),
-+        });
-+        func
-+    }
-+
-+    fn std_strings() -> Vec<(String, String)> {
-+        vec![
-+            (".LstrA".to_string(), "hello\n".to_string()),
-+            (".LstrB".to_string(), "hello".to_string()),
-+            (".LstrC".to_string(), "a".to_string()),
-+            (".LstrEmpty".to_string(), String::new()),
-+        ]
-+    }
-+
-+    #[test]
-+    fn printf_chk_newline_terminated_folds_to_puts_stripped() {
-+        let mut insts = Vec::new();
-+        staging(&mut insts);
-+        insts.push(hardened_call(
-+            "__printf_chk",
-+            None,
-+            vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
-+            vec![IrType::I32, IrType::Ptr],
-+        ));
-+        let func = run_module(simple_func(insts), std_strings());
-+        let calls = flat_calls(&func);
-+        assert_eq!(calls, vec!["puts"], "hardened call replaced by puts");
-+        // The stripped literal was interned and is referenced by a fresh addr.
-+        let has_addr = func.blocks[0]
-+            .instructions
-+            .iter()
-+            .any(|i| matches!(i, Instruction::GlobalAddr { name, .. } if name.starts_with(".Lchkfold")));
-+        assert!(has_addr, "stripped literal GlobalAddr must be spliced in");
-+    }
-+
-+    #[test]
-+    fn printf_chk_non_newline_pctfree_stays() {
-+        let mut insts = Vec::new();
-+        staging(&mut insts);
-+        insts.push(hardened_call(
-+            "__printf_chk",
-+            None,
-+            vec![Operand::Value(Value(0)), Operand::Value(Value(2))],
-+            vec![IrType::I32, IrType::Ptr],
-+        ));
-+        let func = run_module(simple_func(insts), std_strings());
-+        assert_eq!(flat_calls(&func), vec!["__printf_chk"]);
-+    }
-+
-+    #[test]
-+    fn printf_chk_empty_format_deleted() {
-+        let mut insts = Vec::new();
-+        staging(&mut insts);
-+        insts.push(hardened_call(
-+            "__printf_chk",
-+            None,
-+            vec![Operand::Value(Value(0)), Operand::Value(Value(4))],
-+            vec![IrType::I32, IrType::Ptr],
-+        ));
-+        let func = run_module(simple_func(insts), std_strings());
-+        assert!(flat_calls(&func).is_empty(), "empty format deletes the call");
-+    }
-+
-+    #[test]
-+    fn printf_chk_single_char_folds_to_putchar() {
-+        let mut insts = Vec::new();
-+        staging(&mut insts);
-+        insts.push(hardened_call(
-+            "__printf_chk",
-+            None,
-+            vec![Operand::Value(Value(0)), Operand::Value(Value(3))],
-+            vec![IrType::I32, IrType::Ptr],
-+        ));
-+        let func = run_module(simple_func(insts), std_strings());
-+        assert_eq!(flat_calls(&func), vec!["putchar"]);
-+    }
-+
-+    #[test]
-+    fn printf_chk_pct_c_const_folds_to_putchar() {
-+        let mut insts = vec![
-+            Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(1)),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(1),
-+                name: ".LstrFmtC".to_string(),
-+            },
-+        ];
-+        insts.push(hardened_call(
-+            "__printf_chk",
-+            None,
-+            vec![
-+                Operand::Value(Value(0)),
-+                Operand::Value(Value(1)),
-+                Operand::Const(IrConst::I32(120)),
-+            ],
-+            vec![IrType::I32, IrType::Ptr, IrType::I32],
-+        ));
-+        let func = run_module(
-+            simple_func(insts),
-+            vec![(".LstrFmtC".to_string(), "%c".to_string())],
-+        );
-+        assert_eq!(flat_calls(&func), vec!["putchar"]);
-+    }
-+
-+    #[test]
-+    fn printf_chk_pct_s_const_stays() {
-+        let mut insts = vec![
-+            Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(1)),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(1),
-+                name: ".LstrFmtS".to_string(),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(2),
-+                name: ".LstrArg".to_string(),
-+            },
-+        ];
-+        insts.push(hardened_call(
-+            "__printf_chk",
-+            None,
-+            vec![
-+                Operand::Value(Value(0)),
-+                Operand::Value(Value(1)),
-+                Operand::Value(Value(2)),
-+            ],
-+            vec![IrType::I32, IrType::Ptr, IrType::Ptr],
-+        ));
-+        let func = run_module(
-+            simple_func(insts),
-+            vec![
-+                (".LstrFmtS".to_string(), "%s".to_string()),
-+                (".LstrArg".to_string(), "hello".to_string()),
-+            ],
-+        );
-+        assert_eq!(flat_calls(&func), vec!["__printf_chk"]);
-+    }
-+
-+    #[test]
-+    fn printf_chk_pct_s_newline_terminated_arg_strips_to_puts() {
-+        // "%s" + "hello\n": puts("hello") with the newline stripped into a
-+        // pooled fresh literal (GCC oracle: r6 of printf-chk-1.c).
-+        let mut insts = vec![
-+            Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(1)),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(1),
-+                name: ".LstrFmtS".to_string(),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(2),
-+                name: ".LstrArg".to_string(),
-+            },
-+        ];
-+        insts.push(hardened_call(
-+            "__printf_chk",
-+            None,
-+            vec![
-+                Operand::Value(Value(0)),
-+                Operand::Value(Value(1)),
-+                Operand::Value(Value(2)),
-+            ],
-+            vec![IrType::I32, IrType::Ptr, IrType::Ptr],
-+        ));
-+        let func = run_module(
-+            simple_func(insts),
-+            vec![
-+                (".LstrFmtS".to_string(), "%s".to_string()),
-+                (".LstrArg".to_string(), "hello\n".to_string()),
-+            ],
-+        );
-+        let calls = flat_calls(&func);
-+        assert_eq!(calls, vec!["puts"], "stripped-arg puts fold");
-+        assert!(
-+            func.blocks[0]
-+                .instructions
-+                .iter()
-+                .any(|i| matches!(i, Instruction::GlobalAddr { name, .. } if name.starts_with(".Lchkfold"))),
-+            "stripped literal interned"
-+        );
-+    }
-+
-+    #[test]
-+    fn printf_chk_pct_s_newline_folds_to_puts_of_arg() {
-+        let mut insts = vec![
-+            Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(1)),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(1),
-+                name: ".LstrFmtS".to_string(),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(2),
-+                name: ".LstrArg".to_string(),
-+            },
-+        ];
-+        insts.push(hardened_call(
-+            "__printf_chk",
-+            None,
-+            vec![
-+                Operand::Value(Value(0)),
-+                Operand::Value(Value(1)),
-+                Operand::Value(Value(2)),
-+            ],
-+            vec![IrType::I32, IrType::Ptr, IrType::Ptr],
-+        ));
-+        let func = run_module(
-+            simple_func(insts),
-+            vec![
-+                (".LstrFmtS".to_string(), "%s\n".to_string()),
-+                (".LstrArg".to_string(), "hello\n".to_string()),
-+            ],
-+        );
-+        assert_eq!(flat_calls(&func), vec!["puts"], "%s\n + const arg -> puts(arg)");
-+    }
-+
-+    #[test]
-+    fn printf_chk_result_used_stays() {
-+        let mut insts = Vec::new();
-+        staging(&mut insts);
-+        insts.push(hardened_call(
-+            "__printf_chk",
-+            Some(6),
-+            vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
-+            vec![IrType::I32, IrType::Ptr],
-+        ));
-+        // Consume the result so it is not dead.
-+        insts.push(Instruction::UnaryOp {
-+            dest: Value(9),
-+            op: crate::ir::reexports::IrUnaryOp::Neg,
-+            src: Operand::Value(Value(6)),
-+            ty: IrType::I32,
-+        });
-+        let func = run_module(simple_func(insts), std_strings());
-+        assert_eq!(flat_calls(&func), vec!["__printf_chk"]);
-+    }
-+
-+    #[test]
-+    fn printf_chk_flag_not_1_stays() {
-+        let mut insts = Vec::new();
-+        staging(&mut insts);
-+        // Override the flag value: v0 = 2.
-+        insts[0] = Instruction::Copy {
-+            dest: Value(0),
-+            src: Operand::Const(IrConst::I32(2)),
-+        };
-+        insts.push(hardened_call(
-+            "__printf_chk",
-+            None,
-+            vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
-+            vec![IrType::I32, IrType::Ptr],
-+        ));
-+        let func = run_module(simple_func(insts), std_strings());
-+        assert_eq!(flat_calls(&func), vec!["__printf_chk"]);
-+    }
-+
-+    #[test]
-+    fn fprintf_chk_pctfree_folds_to_fputs_with_stream() {
-+        let mut insts = vec![
-+            Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(1)),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(1),
-+                name: ".LstrB".to_string(),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(2),
-+                name: "stdout".to_string(),
-+            },
-+        ];
-+        insts.push(hardened_call(
-+            "__fprintf_chk",
-+            None,
-+            vec![
-+                Operand::Value(Value(2)),
-+                Operand::Value(Value(0)),
-+                Operand::Value(Value(1)),
-+            ],
-+            vec![IrType::Ptr, IrType::I32, IrType::Ptr],
-+        ));
-+        let func = run_module(simple_func(insts), std_strings());
-+        assert_eq!(flat_calls(&func), vec!["fputs"]);
-+        let info = match &func.blocks[0].instructions[3] {
-+            Instruction::Call { info, .. } => info,
-+            other => panic!("expected call, got {other:?}"),
-+        };
-+        assert!(
-+            matches!(info.args[1], Operand::Value(Value(2))),
-+            "stream operand reused verbatim"
-+        );
-+    }
-+
-+    #[test]
-+    fn fprintf_chk_pct_s_multi_byte_folds_to_fputs() {
-+        let mut insts = vec![
-+            Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(1)),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(1),
-+                name: ".LstrFmtS".to_string(),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(2),
-+                name: ".LstrArg".to_string(),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(3),
-+                name: "stdout".to_string(),
-+            },
-+        ];
-+        insts.push(hardened_call(
-+            "__fprintf_chk",
-+            None,
-+            vec![
-+                Operand::Value(Value(3)),
-+                Operand::Value(Value(0)),
-+                Operand::Value(Value(1)),
-+                Operand::Value(Value(2)),
-+            ],
-+            vec![IrType::Ptr, IrType::I32, IrType::Ptr, IrType::Ptr],
-+        ));
-+        let func = run_module(
-+            simple_func(insts),
-+            vec![
-+                (".LstrFmtS".to_string(), "%s".to_string()),
-+                (".LstrArg".to_string(), "hello".to_string()),
-+            ],
-+        );
-+        assert_eq!(flat_calls(&func), vec!["fputs"]);
-+    }
-+
-+    #[test]
-+    fn fprintf_chk_pct_s_newline_stays() {
-+        let mut insts = vec![
-+            Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(1)),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(1),
-+                name: ".LstrFmtS".to_string(),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(2),
-+                name: ".LstrArg".to_string(),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(3),
-+                name: "stdout".to_string(),
-+            },
-+        ];
-+        insts.push(hardened_call(
-+            "__fprintf_chk",
-+            None,
-+            vec![
-+                Operand::Value(Value(3)),
-+                Operand::Value(Value(0)),
-+                Operand::Value(Value(1)),
-+                Operand::Value(Value(2)),
-+            ],
-+            vec![IrType::Ptr, IrType::I32, IrType::Ptr, IrType::Ptr],
-+        ));
-+        let func = run_module(
-+            simple_func(insts),
-+            vec![
-+                (".LstrFmtS".to_string(), "%s\n".to_string()),
-+                (".LstrArg".to_string(), "hello\n".to_string()),
-+            ],
-+        );
-+        assert_eq!(flat_calls(&func), vec!["__fprintf_chk"]);
-+    }
-+
-+    #[test]
-+    fn vprintf_chk_newline_folds_but_pct_s_stays() {
-+        let mut insts = vec![
-+            Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(1)),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(1),
-+                name: ".LstrA".to_string(),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(2),
-+                name: ".LstrFmtS".to_string(),
-+            },
-+        ];
-+        insts.push(hardened_call(
-+            "__vprintf_chk",
-+            None,
-+            vec![
-+                Operand::Value(Value(0)),
-+                Operand::Value(Value(1)),
-+                Operand::Value(Value(8)),
-+            ],
-+            vec![IrType::I32, IrType::Ptr, IrType::Ptr],
-+        ));
-+        insts.push(hardened_call(
-+            "__vprintf_chk",
-+            None,
-+            vec![
-+                Operand::Value(Value(0)),
-+                Operand::Value(Value(2)),
-+                Operand::Value(Value(8)),
-+            ],
-+            vec![IrType::I32, IrType::Ptr, IrType::Ptr],
-+        ));
-+        let func = run_module(
-+            simple_func(insts),
-+            vec![
-+                (".LstrA".to_string(), "hello\n".to_string()),
-+                (".LstrFmtS".to_string(), "%s".to_string()),
-+            ],
-+        );
-+        let calls = flat_calls(&func);
-+        assert!(
-+            calls.contains(&"puts".to_string()),
-+            "vprintf_chk newline shape folds to puts: {calls:?}"
-+        );
-+        assert!(
-+            calls.contains(&"__vprintf_chk".to_string()),
-+            "vprintf_chk %s shape must stay: {calls:?}"
-+        );
-+        // The stripped literal's fresh value id MUST be recorded in
-+        // next_value_id: DCE sizes its def_loc table from max_value_id()
-+        // (= next_value_id - 1); an unrecorded id is clipped out, the
-+        // GlobalAddr def looks dead and is deleted while the call use
-+        // survives (dangling use → codegen hard-gate panic).
-+        assert!(
-+            func.next_value_id > 10,
-+            "next_value_id must cover the spliced literal id, got {}",
-+            func.next_value_id
-+        );
-+    }
-+
-+    #[test]
-+    fn vfprintf_chk_pctfree_folds_to_fputs_pct_s_stays() {
-+        let mut insts = vec![
-+            Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(1)),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(1),
-+                name: ".LstrB".to_string(),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(2),
-+                name: ".LstrFmtS".to_string(),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(3),
-+                name: "stdout".to_string(),
-+            },
-+        ];
-+        insts.push(hardened_call(
-+            "__vfprintf_chk",
-+            None,
-+            vec![
-+                Operand::Value(Value(3)),
-+                Operand::Value(Value(0)),
-+                Operand::Value(Value(1)),
-+                Operand::Value(Value(8)),
-+            ],
-+            vec![IrType::Ptr, IrType::I32, IrType::Ptr, IrType::Ptr],
-+        ));
-+        insts.push(hardened_call(
-+            "__vfprintf_chk",
-+            None,
-+            vec![
-+                Operand::Value(Value(3)),
-+                Operand::Value(Value(0)),
-+                Operand::Value(Value(2)),
-+                Operand::Value(Value(8)),
-+            ],
-+            vec![IrType::Ptr, IrType::I32, IrType::Ptr, IrType::Ptr],
-+        ));
-+        let func = run_module(
-+            simple_func(insts),
-+            vec![
-+                (".LstrB".to_string(), "hello".to_string()),
-+                (".LstrFmtS".to_string(), "%s".to_string()),
-+            ],
-+        );
-+        let calls = flat_calls(&func);
-+        assert!(
-+            calls.contains(&"fputs".to_string()),
-+            "vfprintf_chk % -free shape folds to fputs: {calls:?}"
-+        );
-+        assert!(
-+            calls.contains(&"__vfprintf_chk".to_string()),
-+            "vfprintf_chk %s shape must stay: {calls:?}"
-+        );
-+    }
-+
-+    #[test]
-+    fn plain_printf_newline_folds_but_pctfree_no_newline_stays() {
-+        let mut insts = Vec::new();
-+        staging(&mut insts);
-+        insts.push(hardened_call(
-+            "printf",
-+            None,
-+            vec![Operand::Value(Value(1))],
-+            vec![IrType::Ptr],
-+        ));
-+        insts.push(hardened_call(
-+            "printf",
-+            None,
-+            vec![Operand::Value(Value(2))],
-+            vec![IrType::Ptr],
-+        ));
-+        let func = run_module(simple_func(insts), std_strings());
-+        let calls = flat_calls(&func);
-+        assert_eq!(
-+            calls.iter().filter(|c| *c == "puts").count(),
-+            1,
-+            "printf(\"hello\\n\") -> puts(\"hello\")"
-+        );
-+        assert_eq!(
-+            calls.iter().filter(|c| *c == "printf").count(),
-+            1,
-+            "printf(\"hello\") stays (GCC oracle)"
-+        );
-+    }
-+
-+    #[test]
-+    fn plain_vprintf_pctfree_no_newline_folds_to_fwrite_stdout() {
-+        let mut insts = vec![
-+            Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(1)),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(1),
-+                name: ".LstrB".to_string(), // "hello" - no newline
-+            },
-+        ];
-+        insts.push(hardened_call(
-+            "vprintf",
-+            None,
-+            vec![Operand::Value(Value(1)), Operand::Value(Value(8))],
-+            vec![IrType::Ptr, IrType::Ptr],
-+        ));
-+        let func = run_module(simple_func(insts), std_strings());
-+        let calls = flat_calls(&func);
-+        assert_eq!(calls, vec!["fwrite"], "vprintf(\"hello\") -> fwrite");
-+        let info = match func.blocks[0]
-+            .instructions
-+            .iter()
-+            .find(|i| matches!(i, Instruction::Call { func, .. } if func == "fwrite"))
-+            .unwrap()
-+        {
-+            Instruction::Call { info, .. } => info,
-+            other => panic!("{other:?}"),
-+        };
-+        assert_eq!(info.args.len(), 4);
-+        assert!(
-+            matches!(info.args[0], Operand::Value(Value(1))),
-+            "format pointer reused"
-+        );
-+        assert!(
-+            matches!(info.args[1], Operand::Const(IrConst::I64(1))),
-+            "size 1"
-+        );
-+        assert!(
-+            matches!(info.args[2], Operand::Const(IrConst::I64(5))),
-+            "nmemb = len(\"hello\")"
-+        );
-+        // stdout GlobalAddr spliced before the call
-+        assert!(
-+            func.blocks[0]
-+                .instructions
-+                .iter()
-+                .any(|i| matches!(i, Instruction::GlobalAddr { name, .. } if name == "stdout")),
-+            "stdout addr spliced"
-+        );
-+        // next_value_id must cover the fresh id (DCE def_loc sizing)
-+        assert!(
-+            func.next_value_id > 8,
-+            "next_value_id must be recorded past the spliced id, got {}",
-+            func.next_value_id
-+        );
-+    }
-+
-+    #[test]
-+    fn plain_fprintf_pct_s_folds_to_fwrite_and_newline_stays() {
-+        let mut insts = vec![
-+            Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(1)),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(1),
-+                name: ".LstrFmtS".to_string(),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(2),
-+                name: ".LstrArg".to_string(), // "hello"
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(3),
-+                name: "stdout".to_string(),
-+            },
-+        ];
-+        insts.push(hardened_call(
-+            "fprintf",
-+            None,
-+            vec![
-+                Operand::Value(Value(3)),
-+                Operand::Value(Value(1)),
-+                Operand::Value(Value(2)),
-+            ],
-+            vec![IrType::Ptr, IrType::Ptr, IrType::Ptr],
-+        ));
-+        // "%s\n" must stay on the fprintf family (distinct literal).
-+        insts.push(Instruction::GlobalAddr {
-+            dest: Value(4),
-+            name: ".LstrFmtSN".to_string(),
-+        });
-+        insts.push(hardened_call(
-+            "fprintf",
-+            None,
-+            vec![
-+                Operand::Value(Value(3)),
-+                Operand::Value(Value(4)),
-+                Operand::Value(Value(2)),
-+            ],
-+            vec![IrType::Ptr, IrType::Ptr, IrType::Ptr],
-+        ));
-+        let func = run_module(
-+            simple_func(insts),
-+            vec![
-+                (".LstrFmtS".to_string(), "%s".to_string()),
-+                (".LstrFmtSN".to_string(), "%s\n".to_string()),
-+                (".LstrArg".to_string(), "hello".to_string()),
-+            ],
-+        );
-+        let calls = flat_calls(&func);
-+        assert_eq!(
-+            calls.iter().filter(|c| *c == "fwrite").count(),
-+            1,
-+            "fprintf(\"%s\", \"hello\") -> fwrite"
-+        );
-+        assert_eq!(
-+            calls.iter().filter(|c| *c == "fprintf").count(),
-+            1,
-+            "fprintf(\"%s\\n\", ...) stays"
-+        );
-+    }
-+
-+    #[test]
-+    fn plain_vfprintf_pctfree_folds_to_fwrite() {
-+        let mut insts = vec![
-+            Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(1)),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(1),
-+                name: ".LstrB".to_string(),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(2),
-+                name: "stdout".to_string(),
-+            },
-+        ];
-+        insts.push(hardened_call(
-+            "vfprintf",
-+            None,
-+            vec![
-+                Operand::Value(Value(2)),
-+                Operand::Value(Value(1)),
-+                Operand::Value(Value(8)),
-+            ],
-+            vec![IrType::Ptr, IrType::Ptr, IrType::Ptr],
-+        ));
-+        let func = run_module(simple_func(insts), std_strings());
-+        assert_eq!(flat_calls(&func), vec!["fwrite"]);
-+    }
-+
-+    #[test]
-+    fn plain_fprintf_single_char_folds_to_fputc() {
-+        let mut insts = vec![
-+            Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(1)),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(1),
-+                name: ".LstrC".to_string(), // "a"
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(2),
-+                name: "stdout".to_string(),
-+            },
-+        ];
-+        insts.push(hardened_call(
-+            "fprintf",
-+            None,
-+            vec![
-+                Operand::Value(Value(2)),
-+                Operand::Value(Value(1)),
-+            ],
-+            vec![IrType::Ptr, IrType::Ptr],
-+        ));
-+        let func = run_module(simple_func(insts), std_strings());
-+        assert_eq!(flat_calls(&func), vec!["fputc"]);
-+    }
-+
-+    #[test]
-+    fn plain_printf_pct_s_newline_folds_to_puts_of_arg() {
-+        let mut insts = vec![
-+            Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(1)),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(1),
-+                name: ".LstrFmtS".to_string(),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(2),
-+                name: ".LstrArg".to_string(),
-+            },
-+        ];
-+        insts.push(hardened_call(
-+            "printf",
-+            None,
-+            vec![
-+                Operand::Value(Value(0)) /*placeholder*/,
-+                Operand::Value(Value(1)),
-+                Operand::Value(Value(2)),
-+            ],
-+            vec![IrType::I32, IrType::Ptr, IrType::Ptr],
-+        ));
-+        let func = run_module(
-+            simple_func(insts),
-+            vec![
-+                (".LstrFmtS".to_string(), "%s\n".to_string()),
-+                (".LstrArg".to_string(), "hello\n".to_string()),
-+            ],
-+        );
-+        // NOTE: plain printf has NO flag argument: args are [fmt, arg]. The
-+        // placeholder above is wrong by construction, so rebuild properly.
-+        let mut insts2 = vec![
-+            Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(1)),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(1),
-+                name: ".LstrFmtS".to_string(),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(2),
-+                name: ".LstrArg".to_string(),
-+            },
-+        ];
-+        insts2.push(hardened_call(
-+            "printf",
-+            None,
-+            vec![Operand::Value(Value(1)), Operand::Value(Value(2))],
-+            vec![IrType::Ptr, IrType::Ptr],
-+        ));
-+        let _ = insts;
-+        let func2 = run_module(simple_func(insts2), vec![
-+            (".LstrFmtS".to_string(), "%s\n".to_string()),
-+            (".LstrArg".to_string(), "hello\n".to_string()),
-+        ]);
-+        assert_eq!(flat_calls(&func2), vec!["puts"], "printf(\"%s\\n\", S) -> puts(S)");
-+        assert_eq!(
-+            flat_calls(&func),
-+            vec!["printf"],
-+            "placeholder form has no constant fmt at index 0 -> stays"
-+        );
-+    }
-+
-+    #[test]
-+    fn embedded_nul_refuses() {
-+        let mut insts = vec![
-+            Instruction::Copy {
-+                dest: Value(0),
-+                src: Operand::Const(IrConst::I32(1)),
-+            },
-+            Instruction::GlobalAddr {
-+                dest: Value(1),
-+                name: ".LstrNul".to_string(),
-+            },
-+        ];
-+        insts.push(hardened_call(
-+            "__printf_chk",
-+            None,
-+            vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
-+            vec![IrType::I32, IrType::Ptr],
-+        ));
-+        let func = run_module(
-+            simple_func(insts),
-+            vec![(".LstrNul".to_string(), "a\0b".to_string())],
-+        );
-+        assert_eq!(flat_calls(&func), vec!["__printf_chk"]);
-+    }
-+}
-diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index e484970c..728f5075 100644
---- a/src/passes/mod.rs
-+++ b/src/passes/mod.rs
-@@ -25,6 +25,7 @@ pub(crate) mod dse;
- mod dead_statics;
- pub(crate) mod div_by_const;
- pub(crate) mod fp_const_hoist;
-+pub(crate) mod fortify_fold;
- pub(crate) mod global_addr_cse;
- pub(crate) mod gvn;
- pub(crate) mod if_convert;
-@@ -793,6 +794,9 @@ pub(crate) fn run_passes(
-             eprintln!("[PASS] o1 mem2reg");
+                 } else {
+                     op.clone()
+                 }
+@@ -3344,7 +3371,7 @@ fn resolve_stack_vregs(
+                 }
+                 MachInst::Mov {
+                     src: MachOperand::StackSlot(slot.0),
+-                    dst: resolve_op(dst),
++                    dst: resolve_op(dst, *size),
+                     size: *size,
+                 }
+             } else {
+@@ -3352,8 +3379,8 @@ fn resolve_stack_vregs(
+             }
          }
-         ip_purity::run(module);
-+        if !pass_disabled(&disabled, "fortifyfold") {
-+            fortify_fold::run(module, target.is_32bit());
-+        }
-         constant_fold::run(module);
-         copy_prop::run(module);
-         // Same f128-builtin fold as -O0 (see above).
-@@ -834,6 +838,10 @@ pub(crate) fn run_passes(
-     preloop_dump!("lowering(pre-O2)");
-     run_inline_phase(module, &disabled, allow_inline, optimize_for_size);
-     preloop_dump!("inline_phase");
-+    if !pass_disabled(&disabled, "fortifyfold") {
-+        fortify_fold::run(module, target.is_32bit());
-+        preloop_dump!("fortify_fold");
+         MachInst::Mov { src, dst, size } => MachInst::Mov {
+-            src: resolve_op(src),
+-            dst: resolve_op(dst),
++            src: resolve_op(src, *size),
++            dst: resolve_op(dst, *size),
+             size: *size,
+         },
+         MachInst::Alu { op, src, dst, size } => {
+@@ -3367,7 +3394,7 @@ fn resolve_stack_vregs(
+             }
+             MachInst::Alu {
+                 op: *op,
+-                src: resolve_op(src),
++                src: resolve_op(src, *size),
+                 dst: *dst,
+                 size: *size,
+             }
+@@ -3381,12 +3408,19 @@ fn resolve_stack_vregs(
+             // movzx/movsx accept a memory source: a slot-backed (spilled) src
+             // vreg can be resolved to StackSlot directly. The emitter formats
+             // the src through fmt_operand, so `movzbl slot, %eax` is emitted.
+-            // A slot-backed dst stays a vreg and is caught by
++            // The memory read is `from_size` bytes wide, which never exceeds
++            // the slot (S8/S16/S32 reads of a 4-byte small slot read the
++            // stored low bytes, exactly the value's bits). A slot-backed dst
++            // stays a vreg and is caught by
+             // has_unresolvable_vreg -> default-path fallback.
+             let src_resolved = match src {
+                 MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
+                     if let Some(slot) = state.get_slot(*id) {
+-                        MachOperand::StackSlot(slot.0)
++                        if slot_fits(id, *from_size) {
++                            MachOperand::StackSlot(slot.0)
++                        } else {
++                            src.clone()
++                        }
+                     } else {
+                         src.clone()
+                     }
+@@ -3409,7 +3443,11 @@ fn resolve_stack_vregs(
+             let src_resolved = match src {
+                 MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
+                     if let Some(slot) = state.get_slot(*id) {
+-                        MachOperand::StackSlot(slot.0)
++                        if slot_fits(id, *from_size) {
++                            MachOperand::StackSlot(slot.0)
++                        } else {
++                            src.clone()
++                        }
+                     } else {
+                         src.clone()
+                     }
+@@ -3424,18 +3462,18 @@ fn resolve_stack_vregs(
+             }
+         }
+         MachInst::Cmp { lhs, rhs, size } => MachInst::Cmp {
+-            lhs: resolve_op(lhs),
+-            rhs: resolve_op(rhs),
++            lhs: resolve_op(lhs, *size),
++            rhs: resolve_op(rhs, *size),
+             size: *size,
+         },
+         MachInst::Test { lhs, rhs, size } => MachInst::Test {
+-            lhs: resolve_op(lhs),
+-            rhs: resolve_op(rhs),
++            lhs: resolve_op(lhs, *size),
++            rhs: resolve_op(rhs, *size),
+             size: *size,
+         },
+         MachInst::Cmov { cc, src, dst, size } => MachInst::Cmov {
+             cc: *cc,
+-            src: resolve_op(src),
++            src: resolve_op(src, *size),
+             dst: *dst,
+             size: *size,
+         },
+@@ -3446,7 +3484,7 @@ fn resolve_stack_vregs(
+             size,
+         } => MachInst::Shift {
+             op: *op,
+-            amount: resolve_op(amount),
++            amount: resolve_op(amount, *size),
+             dst: *dst,
+             size: *size,
+         },
+@@ -3455,7 +3493,7 @@ fn resolve_stack_vregs(
+             signed,
+             size,
+         } => MachInst::Div {
+-            divisor: resolve_op(divisor),
++            divisor: resolve_op(divisor, *size),
+             signed: *signed,
+             size: *size,
+         },
+diff --git a/src/frontend/preprocessor/macro_defs.rs b/src/frontend/preprocessor/macro_defs.rs
+index 0d25fcf7..f08f0d9d 100644
+--- a/src/frontend/preprocessor/macro_defs.rs
++++ b/src/frontend/preprocessor/macro_defs.rs
+@@ -113,8 +113,22 @@ pub struct MacroTable {
+     macros: FxHashMap<String, MacroDef>,
+     /// Counter for the __COUNTER__ built-in macro. Increments on each expansion.
+     counter: Cell<usize>,
+-    /// Cached __LINE__ value. Updated by set_line(), expanded specially in expand_text.
+-    line_value: Cell<usize>,
++    /// Per-line __LINE__ resolver: maps a byte offset within the line being
++    /// expanded to its physical source line. Set once per processed line by
++    /// set_line_resolver().
++    line_resolver: std::cell::RefCell<super::text_processing::LineResolver>,
++    /// Absolute offset of the line being expanded within the comment-stripped
++    /// text. Macro expansion sees byte offsets relative to the line buffer;
++    /// resolve_line() adds this base to translate them into the resolver's
++    /// absolute coordinate space.
++    line_offset_base: Cell<usize>,
++    /// #line override: (target_line, source_line_at_directive). The stored
++    /// base is 1-based (as passed by process_directive); see resolve_line().
++    line_override: Cell<Option<(usize, usize)>>,
++    /// __LINE__ value pinned while a macro body is being expanded: per C11
++    /// §6.10.8, __LINE__ inside a macro body expands to the line of the
++    /// INVOCATION, not of the body text.
++    line_pinned: Cell<Option<usize>>,
+     /// Collects names of macros expanded during the current expand_line_reuse() call.
+     /// Used by the preprocessor to build macro expansion metadata for diagnostics
+     /// ("in expansion of macro 'X'" notes). Wrapped in RefCell because expansion
+@@ -141,7 +155,12 @@ impl MacroTable {
+         Self {
+             macros: FxHashMap::default(),
+             counter: Cell::new(0),
+-            line_value: Cell::new(1),
++            line_resolver: std::cell::RefCell::new(
++                super::text_processing::LineResolver::Flat(1),
++            ),
++            line_offset_base: Cell::new(0),
++            line_override: Cell::new(None),
++            line_pinned: Cell::new(None),
+             expanded_macros: std::cell::RefCell::new(Vec::new()),
+             track_expansions: Cell::new(false),
+             asm_mode: false,
+@@ -189,10 +208,37 @@ impl MacroTable {
+         self.macros.get(name)
+     }
+ 
+-    /// Set the current __LINE__ value without allocating a MacroDef.
+-    /// This avoids per-line allocation of MacroDef { name: "__LINE__", ... }.
+-    pub fn set_line(&self, line: usize) {
+-        self.line_value.set(line);
++    /// Set the line resolver for the line about to be expanded.
++    ///
++    /// `resolver` maps byte offsets within the line to 0-based physical
++    /// source lines (multi-line comment tails and spliced continuations put
++    /// several physical lines' bytes into one output line). `override_` is
++    /// the active `#line` directive state.
++    pub(super) fn set_line_resolver(
++        &self,
++        resolver: super::text_processing::LineResolver,
++        override_: Option<(usize, usize)>,
++        offset_base: usize,
++    ) {
++        *self.line_resolver.borrow_mut() = resolver;
++        self.line_override.set(override_);
++        self.line_offset_base.set(offset_base);
 +    }
-     // Fold strlen("literal") after inlining so __builtin_constant_p patterns
-     // (glibc _startup_fatal) resolve to 1 and the not-constant fallback
-     // disappears.
--- 
-2.47.3
-
++
++    /// Physical source line (0-based) of the byte at `offset` within the
++    /// current line, with the `#line` override applied.
++    #[inline]
++    fn resolve_line(&self, offset: usize) -> usize {
++        let phys = self
++            .line_resolver
++            .borrow()
++            .line_at(self.line_offset_base.get() + offset);
++        match self.line_override.get() {
++            // The stored base is 1-based (process_directive convention); the
++            // line right after `#line N` must be N.
++            Some((target, base)) => target + phys.saturating_sub(base),
++            None => phys + 1,
++        }
+     }
+ 
+     /// Set the __FILE__ macro body without allocating a full MacroDef.
+@@ -544,9 +590,14 @@ impl MacroTable {
+             return i;
+         }
+ 
+-        // Handle __LINE__ built-in
++        // Handle __LINE__ built-in: inside a macro expansion the value is
++        // pinned to the invocation line; at top level it is the physical
++        // line of this very token (per-offset resolution).
+         if ident == "__LINE__" {
+-            let val = self.line_value.get();
++            let val = match self.line_pinned.get() {
++                Some(v) => v,
++                None => self.resolve_line(start),
++            };
+             let mut buf = itoa::Buffer::new();
+             result.push_str(buf.format(val));
+             return i;
+@@ -751,6 +802,16 @@ impl MacroTable {
+                 j += 1;
+             }
+             if j < len && bytes[j] == b'(' {
++                // Pin __LINE__ to the invocation site for the whole expansion
++                // (body AND argument prescan): C11 §6.10.8 requires __LINE__
++                // in a macro body to expand to the line of the invocation.
++                // Body/argument offsets are not source-line offsets, so the
++                // per-offset resolver must not be consulted inside.
++                let ident_start = i.saturating_sub(ident.len());
++                let prev_pinned = self.line_pinned.get();
++                if prev_pinned.is_none() {
++                    self.line_pinned.set(Some(self.resolve_line(ident_start)));
++                }
+                 let (args, end_pos) = self.parse_macro_args(bytes, j);
+                 let mut i = end_pos;
+                 let (expanded, body_ended_with_func_ident) =
+@@ -770,6 +831,7 @@ impl MacroTable {
+                 i = new_i;
+                 let next = if i < len { Some(bytes[i]) } else { None };
+                 Self::append_with_paste_guard(result, &expanded, next);
++                self.line_pinned.set(prev_pinned);
+                 return i;
+             }
+             result.push_str(ident);
+@@ -778,12 +840,19 @@ impl MacroTable {
+ 
+         // Object-like macro
+         expanding.insert(ident.to_string());
++        // Pin __LINE__ to the invocation site (see function-like path above).
++        let ident_start = i.saturating_sub(ident.len());
++        let prev_pinned = self.line_pinned.get();
++        if prev_pinned.is_none() {
++            self.line_pinned.set(Some(self.resolve_line(ident_start)));
++        }
+         let expanded = self.expand_text(&mac.body, expanding);
+         expanding.remove(ident);
+ 
+         if let Some((func_expanded, end_pos)) =
+             self.try_resolve_objlike_to_funclike(&expanded, bytes, i, expanding)
+         {
++            self.line_pinned.set(prev_pinned);
+             result.push_str(&func_expanded);
+             return end_pos;
+         }
+@@ -796,6 +865,7 @@ impl MacroTable {
+ 
+         let next = if i < len { Some(bytes[i]) } else { None };
+         Self::append_with_paste_guard(result, &expanded, next);
++        self.line_pinned.set(prev_pinned);
+         i
+     }
+ 
+diff --git a/src/frontend/preprocessor/pipeline.rs b/src/frontend/preprocessor/pipeline.rs
+index 11744ae5..2ed0bc3a 100644
+--- a/src/frontend/preprocessor/pipeline.rs
++++ b/src/frontend/preprocessor/pipeline.rs
+@@ -8,11 +8,15 @@
+ use crate::common::fx_hash::{FxHashMap, FxHashSet};
+ use std::fmt::Write;
+ use std::path::PathBuf;
++use std::rc::Rc;
+ 
+ use super::builtin_macros::define_builtin_macros;
+ use super::conditionals::{evaluate_condition, ConditionalStack};
+ use super::macro_defs::{parse_define, MacroDef, MacroTable};
+-use super::text_processing::{split_first_word, strip_line_comment};
++use super::text_processing::{
++    split_first_word, strip_line_comment, CommentSegments, LineResolver, LineResolverData,
++    LineSegments,
++};
+ use super::utils::{is_ident_cont, is_ident_start};
+ 
+ /// Deduplicate a list of macro names, preserving order (first occurrence wins).
+@@ -208,9 +212,33 @@ impl Preprocessor {
+         // Phase 2: Line splicing (backslash-newline removal)
+         // Phase 3: Comment replacement
+         // So we must join continued lines BEFORE stripping comments.
+-        let source = self.join_continued_lines(source);
+-        let (source, line_map) = Self::strip_block_comments(&source);
++        //
++        // Both transforms return per-line source-position maps so __LINE__
++        // can resolve the PHYSICAL line of each token: splicing and comment
++        // collapse shift line numbers, and one output line may even contain
++        // bytes from several physical lines (tokens after a comment's
++        // closing `*/` or after a continuation splice).
++        let (joined, join_map) = self.join_continued_lines(source);
++        let (source, comment_map) = Self::strip_block_comments(&joined);
+         let mut output = String::with_capacity(source.len() + source.len() / 4);
++        // Absolute offset of the current line's first byte within the
++        // comment-stripped text: the base that translates the macro
++        // expander's line-relative offsets into the resolver's absolute
++        // coordinate space.
++        let mut stripped_line_start: usize = 0;
++        // Absolute offset of each JOINED-text line start. The join map's
++        // breakpoints live in joined-text coordinates; the macro expander
++        // queries in stripped-text coordinates (comments collapsed lines /
++        // removed bytes). Per-line delta = stripped_start - joined_start.
++        let joined_starts: Vec<usize> = {
++            let mut v = Vec::with_capacity(64);
++            let mut off = 0usize;
++            for jl in joined.lines() {
++                v.push(off);
++                off += jl.len() + 1;
++            }
++            v
++        };
+ 
+         // For included files, save and reset the conditional stack and line override
+         let saved_conditionals = if is_include {
+@@ -228,6 +256,11 @@ impl Preprocessor {
+         let mut pending_line = String::with_capacity(256);
+         let mut pending_newlines: usize = 0;
+ 
++        // Physical start line of the most recently processed line; used for
++        // the flat __LINE__ resolver when flushing accumulated multi-line
++        // macro invocations (their text spans lines, so per-line offsets do
++        // not apply).
++        let mut last_source_line_num: usize = 0;
+         // Track current line number in the preprocessed output for macro expansion metadata.
+         // Incremented whenever a newline is appended to the output string.
+         let mut pp_output_line: u32 = 0;
+@@ -251,21 +284,24 @@ impl Preprocessor {
+             self.drain_expansion_pragmas();
+             let trimmed = line.trim();
+ 
+-            // Map output line number to original source line number using the
+-            // line_map from comment stripping (accounts for removed newlines in
+-            // block comments).
+-            let source_line_num = line_map.get(line_num);
+-
+-            // Update __LINE__, accounting for any #line directive override
+-            let effective_line =
+-                if let Some((target_line, source_line_at_directive)) = self.line_override {
+-                    // After #line N, __LINE__ = N + (current_source_line - source_line_of_directive)
+-                    let offset = source_line_num.saturating_sub(source_line_at_directive);
+-                    target_line + offset
+-                } else {
+-                    source_line_num + 1
+-                };
+-            self.macros.set_line(effective_line);
++            // Build this output line's source-position resolver: comment
++            // breakpoints (if any) composed with the join map give the
++            // physical source line of every byte of the line.
++            let line_resolver = self.build_line_resolver(
++                line_num,
++                stripped_line_start,
++                &joined_starts,
++                &comment_map,
++                &join_map,
++            );
++            let source_line_num = line_resolver.line_at(stripped_line_start);
++            last_source_line_num = source_line_num;
++            self.macros.set_line_resolver(
++                line_resolver,
++                self.line_override,
++                stripped_line_start,
++            );
++            stripped_line_start += line.len() + 1;
+ 
+             // Directive handling: #if/#ifdef/#ifndef/#elif/#else/#endif must always
+             // be processed regardless of pending multi-line accumulation. Other
+@@ -361,6 +397,17 @@ impl Preprocessor {
+                 if !pending_line.is_empty() && !is_include {
+                     let after_hash = trimmed[1..].trim_start();
+                     if after_hash.starts_with("define") || after_hash.starts_with("undef") {
++                        // The accumulated text spans several physical lines;
++                        // expand it against a flat resolver (the current
++                        // line) rather than per-line offsets.
++                        // Flat resolver: the accumulated text spans several
++                        // physical lines, so per-offset resolution does not
++                        // apply; the offset base is irrelevant.
++                        self.macros.set_line_resolver(
++                            LineResolver::Flat(source_line_num),
++                            self.line_override,
++                            0,
++                        );
+                         let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
+                         self.drain_expansion_pragmas();
+                         pending_line.clear();
+@@ -370,6 +417,14 @@ impl Preprocessor {
+                         // (e.g. a function call with args spanning lines), flush the
+                         // pending tokens to output first. The included content must appear
+                         // after the preceding tokens, not before them.
++                        // Flat resolver: the accumulated text spans several
++                        // physical lines, so per-offset resolution does not
++                        // apply; the offset base is irrelevant.
++                        self.macros.set_line_resolver(
++                            LineResolver::Flat(source_line_num),
++                            self.line_override,
++                            0,
++                        );
+                         let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
+                         self.drain_expansion_pragmas();
+                         let expanded = self.resolve_has_macros_in_code(&expanded);
+@@ -426,6 +481,8 @@ impl Preprocessor {
+                 let output_len_before = output.len();
+                 self.accumulate_and_expand(
+                     line,
++                    source_line_num,
++                    stripped_line_start - line.len() - 1,
+                     &mut pending_line,
+                     &mut pending_newlines,
+                     &mut output,
+@@ -467,6 +524,11 @@ impl Preprocessor {
+ 
+         // Flush any remaining pending line
+         if !pending_line.is_empty() {
++            self.macros.set_line_resolver(
++                LineResolver::Flat(last_source_line_num),
++                self.line_override,
++                0,
++            );
+             let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
+             self.drain_expansion_pragmas();
+             let expanded = self.resolve_has_macros_in_code(&expanded);
+@@ -508,9 +570,111 @@ impl Preprocessor {
+     ///
+     /// The `expanding` parameter is a reusable FxHashSet that avoids per-line
+     /// allocation for macro expansion tracking.
++    /// Build the `__LINE__` resolver for one output line: comment-strip
++    /// breakpoints composed with the join map, or the flat fast path.
++    ///
++    /// `line_num` is the output (comment-stripped) line index; `comment_map`
++    /// is indexed by output line and carries `(stripped_offset,
++    /// joined_offset, joined_line)` breakpoints (absolute text coordinates);
++    /// `join_map` is indexed by joined line and carries
++    /// `(joined_offset, physical_line)` splice breakpoints in ABSOLUTE
++    /// joined-text coordinates. `stripped_line_start` is the output line's
++    /// absolute start in the stripped text and `joined_starts` holds every
++    /// joined line's absolute start; their difference is the coordinate
++    /// delta that translates splice breakpoints into the expander's
++    /// stripped-text coordinate space. Composition gives the physical line
++    /// of any byte.
++    fn build_line_resolver(
++        &self,
++        line_num: usize,
++        stripped_line_start: usize,
++        joined_starts: &[usize],
++        comment_map: &Option<Vec<CommentSegments>>,
++        join_map: &Option<Vec<LineSegments>>,
++    ) -> LineResolver {
++        let jm = join_map.as_deref();
++        // The joined line this output line starts at, and its absolute
++        // joined-text offset.
++        let (jl0, j_start): (usize, usize) =
++            match comment_map.as_deref().and_then(|c| c.get(line_num)) {
++                Some(CommentSegments::Mapped(pts)) => match pts.first() {
++                    Some(&(_, jo, jl)) => (jl, jo),
++                    None => (
++                        line_num,
++                        joined_starts.get(line_num).copied().unwrap_or(0),
++                    ),
++                },
++                Some(CommentSegments::Flat(jl)) => (
++                    *jl,
++                    joined_starts.get(*jl).copied().unwrap_or(0),
++                ),
++                None => (
++                    line_num,
++                    joined_starts.get(line_num).copied().unwrap_or(0),
++                ),
++            };
++        // Stripped start - joined start: comment stripping only removes
++        // bytes, so the stripped text never runs AHEAD of the joined text
++        // and the splice breakpoints shift LEFT by |delta|.
++        let delta = stripped_line_start as isize - j_start as isize;
++        // Build splice breakpoints in stripped coordinates: (o + delta, o,
++        // joined_line). Between breakpoints on this line the stripped and
++        // joined offsets advance in lockstep, so line_at()'s
++        // joined = jo + (abs - so) lands inside the same splice segment.
++        let splice_points = |pts: &[(usize, usize)], jl: usize| -> LineResolver {
++            LineResolver::Mapped(Rc::new(LineResolverData {
++                points: pts
++                    .iter()
++                    .map(|&(o, _)| {
++                        let so = (o as isize + delta).max(0) as usize;
++                        (so, o, jl)
++                    })
++                    .collect::<Vec<_>>()
++                    .into(),
++                join_map: jm.map(Rc::from).unwrap_or_else(|| Rc::from([])),
++            }))
++        };
++        match comment_map.as_deref() {
++            // No multi-line comments anywhere: the join map is the only
++            // possible source of line shifts (single-line comment removal
++            // shifts offsets, which the delta absorbs).
++            None => match jm.and_then(|j| j.get(line_num)) {
++                Some(LineSegments::Mapped(pts)) => splice_points(pts, line_num),
++                // Flat(phys): a standalone joined line. When earlier lines
++                // were spliced, phys is the PHYSICAL line and generally
++                // differs from the joined/output line number line_num.
++                Some(LineSegments::Flat(phys)) => LineResolver::Flat(*phys),
++                None => LineResolver::Flat(line_num),
++            },
++            Some(c) => {
++                let jm_rc: Rc<[LineSegments]> = jm.map(Rc::from).unwrap_or_else(|| Rc::from([]));
++                match c.get(line_num) {
++                    // Comment breakpoints on this line: they already carry
++                    // (stripped, joined) absolute pairs.
++                    Some(CommentSegments::Mapped(pts)) => {
++                        LineResolver::Mapped(Rc::new(LineResolverData {
++                            points: pts.clone(),
++                            join_map: jm_rc,
++                        }))
++                    }
++                    // No comment breakpoints on this line; the joined line it
++                    // came from decides via the join map's splice breakpoints.
++                    Some(CommentSegments::Flat(jl)) => match jm.and_then(|j| j.get(*jl)) {
++                        Some(LineSegments::Mapped(pts)) => splice_points(pts, *jl),
++                        Some(LineSegments::Flat(phys)) => LineResolver::Flat(*phys),
++                        None => LineResolver::Flat(*jl),
++                    },
++                    None => LineResolver::Flat(line_num),
++                }
++            }
++        }
++    }
++
+     fn accumulate_and_expand(
+         &self,
+         line: &str,
++        source_line_num: usize,
++        _line_start_abs: usize,
+         pending_line: &mut String,
+         pending_newlines: &mut usize,
+         output: &mut String,
+@@ -562,6 +726,16 @@ impl Preprocessor {
+                 if !Self::has_unbalanced_parens(pending_line)
+                     || *pending_newlines > MAX_PENDING_NEWLINES
+                 {
++                    // Accumulated text spans several physical lines: expand
++                    // against a flat resolver (the current line).
++                    // Flat resolver: per-offset resolution does not apply
++                    // to the multi-line accumulated buffer; the offset base
++                    // is irrelevant.
++                    self.macros.set_line_resolver(
++                        LineResolver::Flat(source_line_num),
++                        self.line_override,
++                        0,
++                    );
+                     let expanded = self.macros.expand_line_reuse(pending_line, expanding);
+                     // Check if the expanded result ends with a function-like macro
+                     // that needs args from the next line (chained macros).
+@@ -590,6 +764,16 @@ impl Preprocessor {
+                     // Keep accumulating.
+                 } else {
+                     // Parens balanced or next line didn't start with '(' - expand now.
++                    // Accumulated text spans several physical lines: expand
++                    // against a flat resolver (the current line).
++                    // Flat resolver: per-offset resolution does not apply
++                    // to the multi-line accumulated buffer; the offset base
++                    // is irrelevant.
++                    self.macros.set_line_resolver(
++                        LineResolver::Flat(source_line_num),
++                        self.line_override,
++                        0,
++                    );
+                     let expanded = self.macros.expand_line_reuse(pending_line, expanding);
+                     // Check if the expanded result itself ends with a function-like
+                     // macro name that needs args from the next line (chained macros).
+diff --git a/src/frontend/preprocessor/text_processing.rs b/src/frontend/preprocessor/text_processing.rs
+index da6d73ca..f1d7aaa8 100644
+--- a/src/frontend/preprocessor/text_processing.rs
++++ b/src/frontend/preprocessor/text_processing.rs
+@@ -16,24 +16,111 @@ use super::utils::{copy_literal_bytes_raw, skip_literal_bytes};
+ /// - `Identity`: output line == source line (no multi-line block comments).
+ ///   This is the common case and avoids allocating a Vec<usize>.
+ /// - `Mapped(Vec<usize>)`: line_map[output_line] = source_line.
+-pub(super) enum LineMap {
+-    /// Output line numbers equal source line numbers (common case).
+-    Identity,
+-    /// Explicit mapping from output line number to source line number.
+-    Mapped(Vec<usize>),
++/// Per-line source-position segments for exact `__LINE__` tracking.
++///
++/// One logical (output) line can contain bytes from several physical source
++/// lines: a spliced line (backslash-newline continuation) joins parts of
++/// several physical lines. C11 requires `__LINE__` to expand to the physical
++/// line of the token being expanded, so a single start-line number per
++/// output line is wrong for tokens that follow a splice point.
++///
++/// `Mapped` holds `(byte_offset, source_line)` breakpoints in ABSOLUTE
++/// joined-text coordinates: the source line of the byte at `offset` is the
++/// line of the last breakpoint with breakpoint offset <= `offset`.
++/// `Flat(n)` is the single-line fast path.
++#[derive(Debug, Clone)]
++pub(super) enum LineSegments {
++    /// The whole line comes from one source line.
++    Flat(usize),
++    /// (byte offset, 0-based source line) breakpoints.
++    Mapped(std::rc::Rc<[(usize, usize)]>),
++}
++
++impl LineSegments {
++    /// Source line (0-based) of the byte at `offset`.
++    #[inline]
++    pub(super) fn line_at(&self, offset: usize) -> usize {
++        match self {
++            LineSegments::Flat(n) => *n,
++            LineSegments::Mapped(segs) => {
++                let idx = segs.partition_point(|&(o, _)| o <= offset);
++                segs[idx.saturating_sub(1)].1
++            }
++        }
++    }
++
++}
++
++/// Per-output-line breakpoints produced by block-comment stripping.
++///
++/// `Flat(joined_line)` when the whole output line comes from one joined
++/// line; `Mapped` holds `(stripped_offset, joined_offset, joined_line)`
++/// breakpoints in ABSOLUTE text coordinates (byte positions in the
++/// comment-stripped and line-joined texts) and `joined_line` is 0-based in
++/// the already line-spliced input. The first breakpoint is the output
++/// line's own start.
++#[derive(Debug, Clone)]
++pub(super) enum CommentSegments {
++    Flat(usize),
++    Mapped(std::rc::Rc<[(usize, usize, usize)]>),
++}
++
++/// Resolver that maps a byte offset to the PHYSICAL source line (0-based)
++/// of that byte, for exact `__LINE__` expansion.
++///
++/// Two transformations shift line numbers: multi-line block comments are
++/// collapsed to one space (the comment's internal newlines disappear), and
++/// backslash-newline splices join several physical lines into one. The
++/// comment stripper records, per output line, `(stripped_offset,
++/// joined_offset, joined_line)` breakpoints in ABSOLUTE text coordinates
++/// (byte positions in the comment-stripped and line-joined texts); between
++/// two breakpoints the stripped and joined offsets advance in lockstep (no
++/// comment bytes are removed there), so the joined position of any byte is
++/// `breakpoint.joined_offset + (offset - breakpoint.stripped_offset)`. The
++/// join map then resolves the joined position to a physical line.
++///
++/// `Flat(n)` is the fast path: no breakpoints and no splicing, the physical
++/// line is simply `n` regardless of the offset.
++#[derive(Debug, Clone)]
++pub(super) enum LineResolver {
++    /// Fast path: physical line is the given 0-based line everywhere.
++    Flat(usize),
++    /// Breakpoints plus the shared join map.
++    Mapped(std::rc::Rc<LineResolverData>),
+ }
+ 
+-impl LineMap {
+-    /// Look up the source line for a given output line number.
++/// Shared data for a mapped line resolver.
++#[derive(Debug, Clone)]
++pub(super) struct LineResolverData {
++    /// (stripped_offset, joined_offset, joined_line) breakpoints; always
++    /// starts with (0, 0, first_joined_line).
++    pub(super) points: std::rc::Rc<[(usize, usize, usize)]>,
++    /// Join map (joined line -> physical segments); empty when the file has
++    /// no continuations (joined lines ARE physical lines).
++    pub(super) join_map: std::rc::Rc<[LineSegments]>,
++}
++
++impl LineResolver {
++    /// Physical source line (0-based) of the byte at `offset`.
+     #[inline]
+-    pub(super) fn get(&self, output_line: usize) -> usize {
++    pub(super) fn line_at(&self, offset: usize) -> usize {
+         match self {
+-            LineMap::Identity => output_line,
+-            LineMap::Mapped(v) => v.get(output_line).copied().unwrap_or(output_line),
++            LineResolver::Flat(n) => *n,
++            LineResolver::Mapped(data) => {
++                let idx = data.points.partition_point(|&(so, _, _)| so <= offset);
++                let (so, jo, jl) = data.points[idx.saturating_sub(1)];
++                let joined_off = jo + (offset - so);
++                data.join_map
++                    .get(jl)
++                    .map(|ls| ls.line_at(joined_off))
++                    .unwrap_or(jl)
++            }
+         }
+     }
++
+ }
+ 
++
+ /// Quick check for presence of comment markers (`/*` or `//`) in source bytes.
+ /// Scans for `/` bytes first, then checks the following byte. Since `/` is
+ /// relatively rare in C source (typically only in comments and division),
+@@ -94,38 +181,65 @@ impl Preprocessor {
+     }
+ 
+     /// Strip C-style block comments (/* ... */) and C++ line comments (// ...).
+-    /// Returns the stripped source and a `LineMap` for correct __LINE__ tracking.
++    /// Returns the stripped source and a per-output-line [`CommentSegments`]
++    /// map for correct `__LINE__` tracking.
+     ///
+-    /// The `LineMap` is either `Identity` (when no multi-line block comments
+-    /// shifted line numbering — the common case, avoiding a Vec allocation)
+-    /// or `Mapped(Vec<usize>)` with an explicit mapping from output line
+-    /// numbers to original source line numbers.
++    /// The map is `None` when no multi-line block comments shifted line
++    /// numbering (the common case, avoiding any allocation) and
++    /// `Some(Vec<CommentSegments>)` otherwise, with one entry per output line.
++    /// Each entry is either `Flat(joined_line)` or `Mapped(breakpoints)` with
++    /// `(stripped_offset, joined_offset, joined_line)` tuples, where
++    /// `joined_line` is 0-based in the (already line-spliced) input text and
++    /// the offsets are relative to the line start. Between two breakpoints
++    /// the stripped and joined offsets advance in lockstep, so the pipeline
++    /// can resolve the physical line of any byte by composing with the join
++    /// map from [`Self::join_continued_lines`].
+     ///
+-    /// Block comments are replaced with a single space (per C11 5.1.1.2 phase 3),
+-    /// which avoids breaking preprocessor directives that have block comments
+-    /// between `#` and the directive keyword (e.g., `#/*...\n...*/if 1`).
+-    /// Uses raw byte operations to preserve UTF-8 sequences in string literals.
+-    pub(super) fn strip_block_comments(source: &str) -> (std::borrow::Cow<'_, str>, LineMap) {
++    /// Block comments are replaced with a single space (per C11 5.1.1.2
++    /// phase 3), which avoids breaking preprocessor directives that have
++    /// block comments between `#` and the directive keyword (e.g.,
++    /// `#/*...\n...*/if 1`). Uses raw byte operations to preserve UTF-8
++    /// sequences in string literals.
++    pub(super) fn strip_block_comments(
++        source: &str,
++    ) -> (std::borrow::Cow<'_, str>, Option<Vec<CommentSegments>>) {
+         let bytes = source.as_bytes();
+         let len = bytes.len();
+ 
+-        // Fast path: if no block comment or line comment markers exist, return source as-is.
+-        // This avoids both the byte-by-byte scan and the Vec<u8> allocation.
++        // Fast path: if no block comment or line comment markers exist, return
++        // source as-is. This avoids both the byte-by-byte scan and the
++        // Vec<u8> allocation.
+         if !contains_comment_marker(bytes) {
+-            return (std::borrow::Cow::Borrowed(source), LineMap::Identity);
++            return (std::borrow::Cow::Borrowed(source), None);
+         }
+ 
+         let mut result: Vec<u8> = Vec::with_capacity(source.len());
+         let mut i = 0;
+-        // Track source line number (0-based) as we scan through input
++        // Track joined source line number (0-based) as we scan through input.
+         let mut src_line: usize = 0;
+-        // Whether any block comment spans multiple lines (shifts line numbering)
++        // Whether any block comment spans multiple lines (shifts line numbering).
+         let mut has_multiline_block_comment = false;
+-        // For each output line, record which source line it corresponds to
+-        // Only populated if has_multiline_block_comment becomes true
+-        let mut line_map: Vec<usize> = Vec::new();
+-        // Track the source line at the start of the current output line
++        // Per output line: Flat(joined line) or Mapped(breakpoints).
++        let mut line_map: Vec<CommentSegments> = Vec::new();
++        // Track the joined source line at the start of the current output line.
+         let mut current_output_line_src = 0usize;
++        // Breakpoints of the current output line: (stripped_offset,
++        // joined_offset, joined_line) in ABSOLUTE text coordinates; the
++        // first entry is the output line's own start.
++        let mut cur_points: Vec<(usize, usize, usize)> = vec![(0, 0, 0)];
++
++        // Close the current output line's map entry.
++        fn close_line(
++            line_map: &mut Vec<CommentSegments>,
++            cur_points: &mut Vec<(usize, usize, usize)>,
++            current_output_line_src: usize,
++        ) {
++            if cur_points.len() == 1 {
++                line_map.push(CommentSegments::Flat(current_output_line_src));
++            } else {
++                line_map.push(CommentSegments::Mapped(std::mem::take(cur_points).into()));
++            }
++        }
+ 
+         while i < len {
+             match bytes[i] {
+@@ -133,19 +247,30 @@ impl Preprocessor {
+                     // Copy string/char literals verbatim (don't strip comments inside)
+                     let old_i = i;
+                     i = copy_literal_bytes_raw(bytes, i, bytes[i], &mut result);
+-                    // Count newlines in the literal for source line tracking
+-                    for &b in &bytes[old_i..i] {
++                    // Count newlines in the literal for source line tracking.
++                    // Literal bytes are emitted verbatim, so joined offsets
++                    // advance in lockstep with stripped offsets.
++                    for (k, &b) in bytes[old_i..i].iter().enumerate() {
+                         if b == b'\n' {
+                             src_line += 1;
+                             if has_multiline_block_comment {
+-                                line_map.push(current_output_line_src);
++                                close_line(
++                                    &mut line_map,
++                                    &mut cur_points,
++                                    current_output_line_src,
++                                );
++                                // New output line starts right after the
++                                // literal's newline: absolute stripped
++                                // offset = result.len(), absolute joined
++                                // offset = old_i + k + 1.
++                                cur_points = vec![(result.len(), old_i + k + 1, src_line)];
+                             }
+                             current_output_line_src = src_line;
+                         }
+                     }
+                 }
+                 b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+-                    // Block comment - replace entire comment with a single space
++                    // Block comment - replace entire comment with a single space.
+                     i += 2;
+                     result.push(b' ');
+                     let comment_start_line = src_line;
+@@ -159,22 +284,32 @@ impl Preprocessor {
+                         }
+                         i += 1;
+                     }
+-                    // If block comment spanned multiple lines, we need the full line map
++                    // If block comment spanned multiple lines, we need the full map.
+                     if src_line > comment_start_line && !has_multiline_block_comment {
+                         has_multiline_block_comment = true;
+-                        // Retroactively build the line map for all output lines so far
+-                        // All previous lines had identity mapping (output line == source line)
++                        // Retroactively build the map for all output lines so
++                        // far: they had identity mapping (output line ==
++                        // joined source line).
+                         let output_lines_so_far = result.iter().filter(|&&b| b == b'\n').count();
+                         line_map.clear();
+                         line_map.reserve(output_lines_so_far + 16);
+                         for line_idx in 0..output_lines_so_far {
+-                            line_map.push(line_idx);
++                            line_map.push(CommentSegments::Flat(line_idx));
+                         }
+                     }
+-                    // Don't emit newlines - the comment is fully replaced by one space
++                    if src_line > comment_start_line {
++                        // Multi-line comment: tokens after the closing `*/`
++                        // are on `src_line`, not on the line where the
++                        // comment started. Record a breakpoint at the
++                        // comment end (absolute stripped offset =
++                        // result.len(), absolute joined offset = i) so
++                        // __LINE__ resolves them correctly.
++                        cur_points.push((result.len(), i, src_line));
++                    }
++                    // Don't emit newlines - the comment is fully replaced by one space.
+                 }
+                 b'/' if i + 1 < len && bytes[i + 1] == b'/' => {
+-                    // Line comment - skip to end of line
++                    // Line comment - skip to end of line.
+                     i += 2;
+                     while i < len && bytes[i] != b'\n' {
+                         i += 1;
+@@ -183,7 +318,10 @@ impl Preprocessor {
+                 b'\n' => {
+                     result.push(b'\n');
+                     if has_multiline_block_comment {
+-                        line_map.push(current_output_line_src);
++                        close_line(&mut line_map, &mut cur_points, current_output_line_src);
++                        // New output line starts at absolute stripped
++                        // offset result.len() = joined offset i + 1.
++                        cur_points = vec![(result.len(), i + 1, src_line + 1)];
+                     }
+                     src_line += 1;
+                     current_output_line_src = src_line;
+@@ -197,7 +335,7 @@ impl Preprocessor {
+         }
+         // Record the last line
+         if has_multiline_block_comment {
+-            line_map.push(current_output_line_src);
++            close_line(&mut line_map, &mut cur_points, current_output_line_src);
+         }
+ 
+         // Input was valid UTF-8, and we only removed/replaced ASCII characters
+@@ -205,53 +343,103 @@ impl Preprocessor {
+         let text = String::from_utf8(result)
+             .expect("comment stripping produced non-UTF8 (input was valid UTF-8)");
+         if has_multiline_block_comment {
+-            (std::borrow::Cow::Owned(text), LineMap::Mapped(line_map))
++            (std::borrow::Cow::Owned(text), Some(line_map))
+         } else {
+-            (std::borrow::Cow::Owned(text), LineMap::Identity)
++            (std::borrow::Cow::Owned(text), None)
+         }
+     }
+ 
++
+     /// Join lines that end with backslash (line continuation).
+     /// Also handles backslash followed by trailing whitespace before newline,
+     /// matching GCC/Clang behavior (GCC warns: "backslash and newline separated by space").
+     ///
+     /// Returns `Cow::Borrowed` when the source has no continuation backslashes
+     /// (the common case), avoiding a String allocation entirely.
+-    pub(super) fn join_continued_lines<'a>(&self, source: &'a str) -> std::borrow::Cow<'a, str> {
++    ///
++    /// When any line was spliced, also returns a per-joined-line
++    /// [`LineSegments`] map in PHYSICAL source-line coordinates with
++    /// ABSOLUTE joined-text byte offsets, so the pipeline can resolve the
++    /// physical line of tokens on spliced lines (tokens after a splice
++    /// point are on a later physical line than the joined line's start).
++    pub(super) fn join_continued_lines<'a>(
++        &self,
++        source: &'a str,
++    ) -> (std::borrow::Cow<'a, str>, Option<Vec<LineSegments>>) {
+         // Fast path: if the source contains no backslashes at all, there can't
+-        // be any line continuations. We check for '\' rather than "\\\n" because
+-        // GCC/Clang treat backslash + whitespace + newline as a continuation too.
++        // be any line continuations. We check for '\\' rather than "\\\\n"
++        // because GCC/Clang treat backslash + whitespace + newline as a
++        // continuation too.
+         if !source.contains('\\') {
+-            return std::borrow::Cow::Borrowed(source);
++            return (std::borrow::Cow::Borrowed(source), None);
+         }
+ 
+         let mut result = String::with_capacity(source.len());
+         let mut continuation = false;
++        let mut any_spliced = false;
++        // Breakpoints of the currently open joined line: (joined_offset,
++        // physical_line). A new physical part starts at the splice offset.
++        let mut segs: Vec<(usize, usize)> = Vec::new();
++        // Per joined line (in order): Flat(phys) or Mapped(splice points).
++        let mut map: Vec<LineSegments> = Vec::new();
++        // Physical line (0-based) of the physical line being processed.
++        let mut phys: usize = 0;
+ 
+         for line in source.lines() {
+             let bs_pos = Self::find_continuation_backslash(line);
+             if continuation {
+-                // This line continues from the previous
++                // This physical line is spliced onto the open joined line.
+                 if let Some(pos) = bs_pos {
++                    any_spliced = true;
++                    segs.push((result.len(), phys));
+                     result.push_str(&line[..pos]);
+-                    // Still continuing
++                    // Still continuing.
+                 } else {
++                    any_spliced = true;
++                    segs.push((result.len(), phys));
++                    map.push(LineSegments::Mapped(segs.clone().into()));
++                    segs.clear();
+                     result.push_str(line);
+                     result.push('\n');
+                     continuation = false;
+                 }
+             } else if let Some(pos) = bs_pos {
++                // Opens a new spliced joined line. The first physical part
++                // starts at the joined line's ABSOLUTE start offset
++                // (result.len() — all prior joined lines are already in
++                // `result`); every later part records its absolute start the
++                // same way, keeping the coordinate system uniform.
++                any_spliced = true;
++                segs.clear();
++                segs.push((result.len(), phys));
+                 result.push_str(&line[..pos]);
+                 continuation = true;
+             } else {
++                // Standalone joined line: closes immediately.
+                 result.push_str(line);
+                 result.push('\n');
++                map.push(LineSegments::Flat(phys));
+             }
++            phys += 1;
++        }
++
++        // A dangling continuation at EOF (GCC: "backslash-newline at end of
++        // file"): close the open joined line.
++        if continuation {
++            any_spliced = true;
++            map.push(LineSegments::Mapped(segs.clone().into()));
+         }
+ 
+-        std::borrow::Cow::Owned(result)
++        if any_spliced {
++            (std::borrow::Cow::Owned(result), Some(map))
++        } else {
++            // A backslash existed but never formed a continuation (e.g.
++            // inside a string literal); the text is unchanged.
++            (std::borrow::Cow::Owned(result), None)
++        }
+     }
+ 
++
+     /// Check if a line ends with a continuation backslash (optionally followed by whitespace).
+     /// Returns the byte position of the backslash if found, None otherwise.
+     pub(super) fn find_continuation_backslash(line: &str) -> Option<usize> {
+diff --git a/src/ir/lowering/expr_ops.rs b/src/ir/lowering/expr_ops.rs
+index 3fec6881..97eb9b91 100644
+--- a/src/ir/lowering/expr_ops.rs
++++ b/src/ir/lowering/expr_ops.rs
+@@ -733,45 +733,88 @@ impl Lowerer {
+             }
+             UnaryOp::LogicalNot => {
+                 let int_ty = crate::common::types::target_int_ir_type();
+-                let zero = if int_ty == IrType::I32 {
+-                    IrConst::I32(0)
+-                } else {
+-                    IrConst::I64(0)
+-                };
+                 let inner_ct = self.expr_ctype(inner);
+                 if inner_ct.is_complex() {
+                     // !complex_val => (real == 0) && (imag == 0)
+                     let val = self.lower_expr(inner);
+                     let ptr = self.operand_to_value(val);
+                     let bool_val = self.lower_complex_to_bool(ptr, &inner_ct);
+-                    // Negate: bool_val is 1 if nonzero, so !complex is (bool_val == 0)
+-                    let dest =
+-                        self.emit_cmp_val(IrCmpOp::Eq, bool_val, Operand::Const(zero), int_ty);
++                    // Negate: bool_val is 1 if nonzero, so !complex is
++                    // (bool_val == 0). Compare at the boolean's own width
++                    // (I32): comparing an I32 value at the target int width
++                    // (I64 on x86-64) is a width lie — if the boolean ever
++                    // spills to a 4-byte stack slot, the backend's
++                    // memory-operand forms would read 8 bytes, pulling
++                    // adjacent-slot garbage into the high 32 bits.
++                    let dest = self.emit_cmp_val(
++                        IrCmpOp::Eq,
++                        bool_val,
++                        Operand::Const(IrConst::I32(0)),
++                        IrType::I32,
++                    );
+                     Operand::Value(dest)
+                 } else {
+                     let inner_ty = self.infer_expr_type(inner);
+                     let val = self.lower_expr(inner);
+-                    let cmp_val = self.mask_float_sign_for_truthiness(val, inner_ty);
+-                    // Use the inner expression's type for comparison when it is
+-                    // a wide integer (I64/U64) on a 32-bit target. Otherwise a
+-                    // 64-bit value like 0x1_0000_0000 would be truncated to 32
+-                    // bits and incorrectly compare equal to zero. Float types
+-                    // are excluded because mask_float_sign_for_truthiness already
+-                    // reduces them to an I32 boolean on 32-bit targets.
+-                    let cmp_ty = if !inner_ty.is_float() && inner_ty.size() > int_ty.size() {
+-                        inner_ty
++                    // `!x` is (x == 0) at x's own (promoted) width. Every
++                    // Cmp operand must be defined at exactly the width the
++                    // compare declares: comparing a 32-bit value at 64-bit
++                    // width is only accidentally correct while the value
++                    // stays register-resident (x86-64 32-bit ops
++                    // zero-extend) and miscompiles once it spills — the
++                    // backend substitutes the 4-byte slot into a `cmpq`,
++                    // which reads 8 bytes (adjacent-slot garbage). Width
++                    // selection:
++                    // * sub-int: widen FIRST (narrow ops leave the high
++                    //   bits stale; the test must not observe them), then
++                    //   test at the widened (I32) width;
++                    // * 32-bit ints: test at 32 bits — the low 32 bits
++                    //   decide zero-ness, so this is identical to the
++                    //   zero-extended 64-bit test, one byte shorter, and
++                    //   reads exactly the 4 stored bytes of a small slot;
++                    // * 64-bit ints: test at 64 bits — REQUIRED on i686,
++                    //   where a 32-bit test would truncate e.g.
++                    //   0x1_0000_0000 to zero;
++                    // * floats: mask_float_sign_for_truthiness already
++                    //   produced a well-typed value (I64 on 64-bit
++                    //   targets, I32 boolean on i686 / for F128) — test
++                    //   at that type.
++                    let (cmp_val, cmp_ty) = if inner_ty.is_float() {
++                        let masked = self.mask_float_sign_for_truthiness(val, inner_ty);
++                        let t = if crate::common::types::target_is_32bit()
++                            || inner_ty == IrType::F128
++                        {
++                            IrType::I32
++                        } else {
++                            IrType::I64
++                        };
++                        (masked, t)
+                     } else {
+-                        int_ty
++                        match inner_ty {
++                            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => {
++                                let w = crate::common::types::widened_op_type(inner_ty);
++                                let widened = self.emit_cast_val(val, inner_ty, w);
++                                (Operand::Value(widened), w)
++                            }
++                            IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 => {
++                                (val, inner_ty)
++                            }
++                            // Pointers and anything else: test at the target
++                            // int width when the value is int-sized; preserve
++                            // the value's own width when it is genuinely
++                            // wider (I128/U128).
++                            _ => {
++                                if inner_ty.size() > int_ty.size() {
++                                    (val, inner_ty)
++                                } else {
++                                    (val, int_ty)
++                                }
++                            }
++                        }
+                     };
+                     let cmp_zero = match cmp_ty {
+                         IrType::I64 | IrType::U64 => IrConst::I64(0),
+-                        _ => {
+-                            if int_ty == IrType::I32 {
+-                                IrConst::I32(0)
+-                            } else {
+-                                IrConst::I64(0)
+-                            }
+-                        }
++                        _ => IrConst::I32(0),
+                     };
+                     let dest =
+                         self.emit_cmp_val(IrCmpOp::Eq, cmp_val, Operand::Const(cmp_zero), cmp_ty);
+diff --git a/tests/regression/logicalnot_float_complex.c b/tests/regression/logicalnot_float_complex.c
+new file mode 100644
+index 00000000..035f2a75
+--- /dev/null
++++ b/tests/regression/logicalnot_float_complex.c
+@@ -0,0 +1,40 @@
++/*
++ * `!x` on floating-point and complex operands.  Float truthiness goes
++ * through mask_float_sign_for_truthiness (sign-bit masking / F128 x87
++ * compare); the result is an I32 boolean that must be compared at its own
++ * width, never at the target-int width.  Complex truthiness is
++ * (real == 0) && (imag == 0).
++ */
++#include <stdio.h>
++#include <complex.h>
++
++#define NOINLINE __attribute__((noinline))
++
++NOINLINE int not_f(float x) { return !x; }
++NOINLINE int not_d(double x) { return !x; }
++NOINLINE int not_ld(long double x) { return !x; }
++NOINLINE int not_cf(float _Complex x) { return !x; }
++NOINLINE int not_cd(double _Complex x) { return !x; }
++
++int main(void) {
++    int r = 0;
++    r = r * 3 + not_f(0.0f);
++    r = r * 3 + not_f(-0.0f);            /* IEEE: -0.0 == 0.0 -> !x == 1 */
++    r = r * 3 + not_f(1.0f);
++    r = r * 3 + not_f(-1.0f);
++    r = r * 3 + not_f(0.0f / 0.0f * 0.0f); /* NaN (quiet) -> truthy */
++    r = r * 3 + not_d(0.0);
++    r = r * 3 + not_d(-0.0);
++    r = r * 3 + not_d(1e-300);           /* denormal-range magnitude */
++    r = r * 3 + not_ld(0.0L);
++    r = r * 3 + not_ld(-0.0L);
++    r = r * 3 + not_ld(2.0L);
++    r = r * 3 + not_cf(0.0f);
++    r = r * 3 + not_cf(1.0f);            /* real nonzero */
++    r = r * 3 + not_cf(I * 1.0f);        /* imag-only nonzero */
++    r = r * 3 + not_cd(0.0);
++    r = r * 3 + not_cd(-2.0 + 0.0 * I);
++    r = r * 3 + not_cd(0.0 + 3.0 * I);
++    printf("%d\n", r);
++    return 0;
++}
+diff --git a/tests/regression/logicalnot_width_types.c b/tests/regression/logicalnot_width_types.c
+new file mode 100644
+index 00000000..67eea7e5
+--- /dev/null
++++ b/tests/regression/logicalnot_width_types.c
+@@ -0,0 +1,47 @@
++/*
++ * `!x` must test x at x's own (promoted) width for every integer type,
++ * including sub-int types (which must be widened before the test — narrow
++ * ops leave stale high bits in a register) and 64-bit types on ILP32
++ * (a 32-bit test would truncate 0x1_0000_0000 to zero).  Regression for
++ * the LogicalNot width fix in the IR lowering (expr_ops.rs).
++ *
++ * Values deliberately include 64-bit numbers whose low 32 bits are zero:
++ * on a 32-bit target the old width-confused lowering reported `!x == 1`.
++ */
++#include <stdio.h>
++
++#define NOINLINE __attribute__((noinline))
++
++NOINLINE int not_uc(unsigned char x) { return !x; }
++NOINLINE int not_us(unsigned short x) { return !x; }
++NOINLINE int not_u(unsigned x) { return !x; }
++NOINLINE int not_ull(unsigned long long x) { return !x; }
++NOINLINE int not_ll(long long x) { return !x; }
++NOINLINE int not_p(const void *p) { return !p; }
++
++int main(void) {
++    /* sub-int boundary values */
++    int r = 0;
++    r = r * 3 + not_uc(0);
++    r = r * 3 + not_uc(1);
++    r = r * 3 + not_uc(0x100 - 1);      /* all storage bits set */
++    r = r * 3 + not_us(0);
++    r = r * 3 + not_us(0x10000 - 1);
++    /* 32-bit values (spill-sensitive: memory-operand cmp forms) */
++    r = r * 3 + not_u(0);
++    r = r * 3 + not_u(0x80000000u);
++    r = r * 3 + not_u(0xffffffffu);
++    /* 64-bit values with zero low halves */
++    r = r * 3 + not_ull(0);
++    r = r * 3 + not_ull(0x100000000ULL);   /* low 32 bits are zero */
++    r = r * 3 + not_ull(0x1000000000000000ULL);
++    r = r * 3 + not_ull(0xffffffff00000000ULL);
++    r = r * 3 + not_ull(1);
++    r = r * 3 + not_ll(-1);
++    r = r * 3 + not_ll(0x100000000LL);
++    /* pointers */
++    r = r * 3 + not_p(0);
++    r = r * 3 + not_p(&r);
++    printf("%d\n", r);
++    return 0;
++}
+diff --git a/tests/regression/pp_line_directive_line.c b/tests/regression/pp_line_directive_line.c
+new file mode 100644
+index 00000000..5818243d
+--- /dev/null
++++ b/tests/regression/pp_line_directive_line.c
+@@ -0,0 +1,21 @@
++/*
++ * #line overrides compose with physical-line resolution: after `#line N`
++ * the next physical line is N, and offsets advance by PHYSICAL lines
++ * (comment-collapse and splices shift the mapping, not the override).
++ */
++#include <stdio.h>
++int main(void) {
++    int before = __LINE__;
++#line 100
++    int first = __LINE__;
++    int second = __LINE__;
++    /* comment
++       spanning lines */ int after_comment = __LINE__;
++    int continued = 1 + \
++        2, after_splice = __LINE__;
++#line 500
++    int restarted = __LINE__;
++    printf("%d %d %d %d %d %d\n", before, first, second, after_comment,
++           after_splice, restarted);
++    return 0;
++}
+diff --git a/tests/regression/pp_line_macro_invocation.c b/tests/regression/pp_line_macro_invocation.c
+new file mode 100644
+index 00000000..0c75d7b7
+--- /dev/null
++++ b/tests/regression/pp_line_macro_invocation.c
+@@ -0,0 +1,23 @@
++/*
++ * __LINE__ inside a macro body expands to the line of the INVOCATION
++ * (C11 6.10.8), including when the invocation spans several physical
++ * lines: the pin is the line of the macro name token, not the line where
++ * argument collection happens to end.
++ */
++#include <stdio.h>
++#define HERE() (__LINE__)
++#define HERE_OBJ (__LINE__)
++#define WRAP(x) (x)
++#define WHERE() (__LINE__)
++#define CHAIN WHERE()
++#define SUM2(a, b) ((a) + (b))
++int main(void) {
++    int a = HERE();
++    int b = HERE_OBJ;
++    int c = WRAP(HERE());
++    int d = SUM2(1,
++                 2) + HERE();
++    int e = CHAIN;
++    printf("%d %d %d %d %d\n", a, b, c, d, e);
++    return 0;
++}
+diff --git a/tests/regression/pp_line_multiline_comment.c b/tests/regression/pp_line_multiline_comment.c
+new file mode 100644
+index 00000000..0d5062ae
+--- /dev/null
++++ b/tests/regression/pp_line_multiline_comment.c
+@@ -0,0 +1,19 @@
++/*
++ * __LINE__ after a multi-line block comment.  The comment's internal
++ * newlines disappear in translation phase 3, so the output line holding
++ * `tail` contains bytes of TWO physical lines; C11 requires __LINE__ to
++ * expand to the physical line of the token, i.e. the line of the closing
++ * comment end for tokens following the comment on the same output line.
++ */
++#include <stdio.h>
++int main(void) {
++    /* a block comment
++       that spans
++       three physical lines */
++    int after = __LINE__;
++    int x = 1; /* tail comment
++                  spanning lines */ int tail = __LINE__;
++    int simple = __LINE__;
++    printf("%d %d %d\n", after, tail, simple);
++    return 0;
++}
+diff --git a/tests/regression/pp_line_splice.c b/tests/regression/pp_line_splice.c
+new file mode 100644
+index 00000000..4cfc0623
+--- /dev/null
++++ b/tests/regression/pp_line_splice.c
+@@ -0,0 +1,18 @@
++/*
++ * __LINE__ across line splices (translation phase 2).  Tokens after a
++ * backslash-newline are on a LATER physical line than the joined line's
++ * start; a single per-output-line start number reports the wrong line.
++ */
++#include <stdio.h>
++#define ADD(a, b) ((a) + (b))
++int main(void) {
++    int a = 1 + \
++            2;
++    int spliced_token = \
++        __LINE__;
++    int after_splice = __LINE__;
++    int multi = ADD(1,
++                    2) + __LINE__;
++    printf("%d %d %d %d\n", a, spliced_token, after_splice, multi);
++    return 0;
++}
+diff --git a/tests/regression/smallslot_pred_spill_pressure.c b/tests/regression/smallslot_pred_spill_pressure.c
+new file mode 100644
+index 00000000..a9335171
+--- /dev/null
++++ b/tests/regression/smallslot_pred_spill_pressure.c
+@@ -0,0 +1,56 @@
++/*
++ * 64-bit predicates over spilled 32-bit values (kernel lib/zstd
++ * ZSTD_decodeLiteralsBlock shape: `if (!lhlCode)` with lhlCode resident in
++ * a 4-byte small slot).  The backend must never substitute a 4-byte stack
++ * slot into an 8-byte memory-operand compare: `cmpq $0, slot(%rsp)` reads
++ * 8 bytes and picks up the adjacent slot's bytes as the high half.
++ *
++ * Twelve live 32-bit locals per iteration force small-slot spilling; the
++ * 64-bit ! / == / relational predicates must observe exactly the stored 4
++ * bytes.  CCC_NO_SMALL_SLOTS=1 (suite A/B) re-runs this with 8-byte slots.
++ */
++#include <stdio.h>
++
++#define NOINLINE __attribute__((noinline))
++
++static unsigned seed = 0x12345678u;
++NOINLINE unsigned next(void) {
++    seed = seed * 1664525u + 1013904223u;
++    return seed;
++}
++
++NOINLINE unsigned decide(unsigned a, unsigned b, unsigned c, unsigned d) {
++    unsigned v0 = a, v1 = b, v2 = c, v3 = d;
++    unsigned v4 = a ^ b, v5 = b + c, v6 = c | d, v7 = d & a;
++    unsigned v8 = a - b, v9 = b * 3u, v10 = c >> 1, v11 = d << 1;
++    unsigned acc = 0;
++    /* every predicate is a 64-bit-truthiness question about a 32-bit value */
++    if (!v0) acc += 1;
++    if (!v1) acc += 2;
++    if (!v4) acc += 4;
++    if (!v8) acc += 8;
++    if (!(v5 ^ 0xdeadbeefu)) acc += 16;
++    if ((unsigned long long)v6 == (unsigned long long)v7) acc += 32;
++    if ((unsigned long long)v9 > (unsigned long long)0xffff0000u) acc += 64;
++    if (!(v10 | v11)) acc += 128;
++    /* keep all twelve live across the predicate cluster */
++    acc += v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10 + v11;
++    acc &= 0xffffu;
++    return acc;
++}
++
++int main(void) {
++    unsigned h = 0;
++    for (int i = 0; i < 2000; i++) {
++        /* Sequenced explicitly: the order of next() calls within one
++         * argument list is unspecified in C and may legitimately differ
++         * between compilers. */
++        unsigned a = next(), b = next(), c = next(), d = next();
++        h = h * 31 + decide(a, b, c, d);
++        /* biased values to hit the zero branches */
++        if ((i & 3) == 0) h = h * 31 + decide(0, 0, 0, 0);
++        if ((i & 7) == 1) h = h * 31 + decide(0xdeadbeefu, 0, 0xffffffffu, 0);
++    }
++    printf("%08x\n", h);
++    return 0;
++}
