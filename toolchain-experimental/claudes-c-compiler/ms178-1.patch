@@ -1,106 +1,646 @@
-From 46cf220e0049ac3a229cc4d097414085f6817805 Mon Sep 17 00:00:00 2001
-From: Z User <z@container>
-Date: Fri, 28 Aug 2026 20:03:35 +0000
-Subject: [PATCH] build: default .cargo linker to gcc/bfd, drop clang+mold pin
+From 31722e59cc894af90a8eee103a7320616327cea7 Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 21:10:54 +0000
+Subject: [PATCH 1/6] aarch64, call_abi: AAPCS64 16-byte-alignment for wide
+ va_arg and composites
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
-Neither clang nor mold is installed on the current research VM, so the
-pinned 'clang -fuse-ld=mold' pairing forced every build to fail or to
-rely on per-invocation CARGO_TARGET_*_LINKER/RUSTFLAGS overrides.
+va_arg(ap, __int128) lowered to the plain 8-byte GP scalar pattern
+(single ldr, gr_offs += 8), so every 128-bit vararg read garbage; and
+composites with 16-byte natural alignment were classified into
+consecutive GP registers, while the psABI (and GCC's aarch64 layout,
+verified against the oracle for named args: struct{int} align(16) lands
+in w0/w2/w4/w6 with odd registers skipped) requires even-aligned
+register pairs for ANY 16-byte-aligned composite, named or variadic.
 
-.cargo/config.toml now defaults to linker = "gcc" (GNU ld/bfd) for
-x86_64-unknown-linux-gnu; i686-unknown-linux-gnu keeps gcc + -m32. The
-reference recipe is scripts/build_lccc_o1_j2.sh (fastbuild, -O1, -j 2,
-foreground) with no environment overrides; verified end-to-end with a
-37 s fastbuild build and a compile/link/run smoke test.
+  * emit_va_arg_impl gains the 16-byte-granular GP arm: round the offset
+    UP to the alignment ((gr_offs + 15) & -16 — glibc's aarch64 va_arg
+    arithmetic, which is what makes the caller's odd-register skip
+    round-trip), read the pair when at least 16 bytes remain, else a
+    16-aligned __stack slot. The result is stored 16 bytes wide and the
+    dest is marked i128 by generation (VaArg) so later pair loads see
+    the full value.
+  * emit_va_arg_struct had the alignment rounding in the WRONG polarity
+    (and x2, #-16 rounds the offset DOWN, re-reading the skipped odd
+    slot); corrected to the same up-round plus a re-sign-extend before
+    the 64-bit uses.
+  * classify_args_core: the even-pair rounding now applies to any
+    composite with alignment > XLEN (was gated on regs_needed == 2,
+    missing single-register align-16 structs on BOTH riscv and aarch64),
+    and the split reg+stack fallback is suppressed when rounding was
+    applied (a split would violate the alignment contract).
+  * ARM align_struct_pairs is now true; the old "AAPCS64 does not
+    require even-aligned pairs" note was simply wrong (RISC-V GCC
+    round-trips the identical rule — also verified against its oracle).
 
-mold/wild remain differential test oracles only (tests/linker/). RULES.md
-rule 26 and DECISIONS.md gain a superseding session86 entry.
+Validation: va_arg_wide_struct passes on aarch64 AND riscv64 at GCC
+parity (was FAIL i128/u128/a16); targeted va128 probe exact (lo=12,
+hi=2^36); lib 1273/0/6; ARM 376/31/75 (was 375/32); x86 535/5 (same 5
+pre-existing).
 ---
- .cargo/config.toml         | 23 ++++++++++++-----------
- engineering/DECISIONS.md   | 12 ++++++++++++
- engineering/agent/RULES.md | 14 ++++++++------
- 3 files changed, 32 insertions(+), 17 deletions(-)
+ src/backend/arm/codegen/calls.rs    |  7 +++-
+ src/backend/arm/codegen/variadic.rs | 62 ++++++++++++++++++++++++++++-
+ src/backend/call_abi.rs             | 18 +++++++--
+ src/backend/generation.rs           |  7 ++++
+ 4 files changed, 88 insertions(+), 6 deletions(-)
 
-diff --git a/.cargo/config.toml b/.cargo/config.toml
-index d12d44e3..b55c3fbc 100644
---- a/.cargo/config.toml
-+++ b/.cargo/config.toml
-@@ -1,15 +1,16 @@
--# Use mold for fastest possible links on the constrained 2-vCPU research box.
--# Mold's i686 preset ("-m elf_i386") is enabled automatically when the target
--# is i686-unknown-linux-gnu; for the default x86_64 host target mold picks the
--# x86_64 preset.  This saves ~300-500 ms per rebuild and cuts peak RSS during
--# LTO/fastbuild links enough to stay out of OOM on the 2 GB VM.
-+# Default toolchain: gcc + GNU ld (bfd).
- #
--# scripts/build_lccc_fast.sh keeps this clang+mold pairing when both tools
--# are installed and falls back to gcc + GNU ld otherwise.
-+# gcc/bfd is the proven default pairing on this box. The previous
-+# clang+mold pin caused repeated build friction (and neither tool is
-+# even installed on the current research VM), so it is no longer
-+# pinned here. Explicit override is still possible per-invocation via
-+# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER if ever needed.
-+#
-+# Reference build recipe (foreground, constrained-memory safe):
-+#   scripts/build_lccc_o1_j2.sh   # fastbuild, -O1, -j 2, gcc/bfd
- [target.x86_64-unknown-linux-gnu]
--linker = "clang"
--rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-+linker = "gcc"
+diff --git a/src/backend/arm/codegen/calls.rs b/src/backend/arm/codegen/calls.rs
+index 6af68b42..d22943a9 100644
+--- a/src/backend/arm/codegen/calls.rs
++++ b/src/backend/arm/codegen/calls.rs
+@@ -20,7 +20,12 @@ impl ArmCodegen {
+             use_sysv_struct_classification: false,
+             use_riscv_float_struct_classification: false,
+             allow_struct_split_reg_stack: false,
+-            align_struct_pairs: false,
++            // Composites with 16-byte natural alignment are allocated at an
++            // even-aligned register pair (or a 16-aligned stack slot), for
++            // named AND variadic arguments — GCC's aarch64 layout places
++            // struct{int} align(16) at w0/w2/w4/w6, skipping odd registers
++            // (verified against the GCC oracle on named args).
++            align_struct_pairs: true,
+             sret_uses_dedicated_reg: true,
+             gcc_regparm_mode: false,
+         }
+diff --git a/src/backend/arm/codegen/variadic.rs b/src/backend/arm/codegen/variadic.rs
+index 40b2653b..a11b92d7 100644
+--- a/src/backend/arm/codegen/variadic.rs
++++ b/src/backend/arm/codegen/variadic.rs
+@@ -1,6 +1,7 @@
+ //! ArmCodegen: variadic function operations (va_arg, va_start, va_copy).
  
- [target.i686-unknown-linux-gnu]
--linker = "clang"
--rustflags = ["-C", "link-arg=-fuse-ld=mold", "-C", "link-arg=-m32"]
-+linker = "gcc"
-+rustflags = ["-C", "link-arg=-m32"]
-diff --git a/engineering/DECISIONS.md b/engineering/DECISIONS.md
-index ecf1b3b3..9586d894 100644
---- a/engineering/DECISIONS.md
-+++ b/engineering/DECISIONS.md
-@@ -655,6 +655,18 @@ anyway (the bullet carries the *why*).
-   the environment (`--config rustflags=[]` does NOT override the file).
-   Prebuilt static mold 2.42.0 user-local + `RUSTFLAGS="-C
-   link-arg=-fuse-ld=mold"` brings cold builds to ~3 m 10 s.
-+- **[history/session86 / agent/CARGO_CONFIG_GCC_BFD]** **Supersedes the
-+  session84 recipe above.** `.cargo/config.toml` now defaults to
-+  `linker = "gcc"` (GNU ld/bfd) for both x86_64-unknown-linux-gnu and
-+  i686-unknown-linux-gnu (the latter keeps `-m32`). Rationale: neither
-+  clang nor mold is installed on the current research VM, so the old pin
-+  forced every build either to fail or to rely on per-invocation
-+  environment overrides — a standing footgun. The reference recipe is now
-+  simply `scripts/build_lccc_o1_j2.sh` (fastbuild, `-O1`, `-j 2`,
-+  foreground, gcc/bfd) with no environment overrides needed. mold/wild
-+  remain available as **differential test oracles only**
-+  (`tests/linker/setup_oracles.sh`, git-HEAD builds) — they are build
-+  linkers nowhere.
- - **[history/session84/10]** Snapshot discipline: commit + regenerate the
-   `ms178-N.patch` + artifact + bundle immediately after every validated
-   fix (session 84 lost a fix to a mid-session wipe and re-implemented it);
-diff --git a/engineering/agent/RULES.md b/engineering/agent/RULES.md
-index e2db317f..138a1137 100644
---- a/engineering/agent/RULES.md
-+++ b/engineering/agent/RULES.md
-@@ -94,12 +94,14 @@ the evidence. Re-oracle and check gzip `longest_match` stack-mem after
+ use super::emit::{callee_saved_name, ArmCodegen};
++use crate::backend::generation::is_i128_type;
+ use crate::common::types::IrType;
+ use crate::ir::reexports::Value;
  
- ## Environment / process
+@@ -26,6 +27,59 @@ impl ArmCodegen {
+             self.emit_load_from_sp("x1", slot.0, "ldr");
+         }
  
--26. Build: `scripts/build_lccc_fast.sh` → `target/fastbuild/lccc`. Swap:
--    `scripts/ensure_swap.sh` on 2 GiB VMs (needs CAP_SYS_ADMIN; otherwise
--    rely on `-j2`). Mold-less sandboxes: pass
--    `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc` and `RUSTFLAGS` as
--    environment variables — `--config` does not override
--    `.cargo/config.toml`.
-+26. Build: `scripts/build_lccc_o1_j2.sh` → `target/fastbuild/lccc`
-+    (fastbuild, `-O1`, `-j 2`, foreground — lower parallelism on the
-+    4 GiB no-swap VM OOM-kills less). Swap: `scripts/ensure_swap.sh` on
-+    2 GiB VMs (needs CAP_SYS_ADMIN; otherwise rely on `-j2`).
-+    `.cargo/config.toml` defaults to gcc/bfd — no linker environment
-+    overrides are needed anymore; do not reintroduce clang/mold pins
-+    (mold/wild are differential test oracles only, see
-+    `tests/linker/setup_oracles.sh`).
- 27. Linker oracles (mold, wild) must be **git-HEAD builds**; stale release
-     binaries produced false failures. GAS/binutils pin: 2.47. Record
-     resolved oracle revisions in `ORACLE_REVISIONS.txt`.
++        if is_i128_type(result_ty) {
++            // AAPCS64 va_arg for a 16-byte-aligned type (C __int128 and the
++            // _Float128 U128 carrier): read 16 bytes at an ALIGNED GP pair
++            // slot of the register save area, or from the overflow area at
++            // a 16-byte-aligned __stack. Two conditions must hold for the
++            // register path: at least 16 bytes left (gr_offs <= -16) and
++            // (gr_top + gr_offs) 16-byte aligned — the alignment hole comes
++            // from odd-register args ahead of us, which GCC's layout skips
++            // exactly the same way on the caller side.
++            let label_id = self.state.next_label_id();
++            let label_stack = format!(".Lva_stack_{}", label_id);
++            let label_done = format!(".Lva_done_{}", label_id);
++
++            // Align the offset UP to a 16-byte boundary (glibc's aarch64
++            // va_arg does exactly (__gr_offs + 15) & -16). This is what
++            // makes the caller's even-register skip round-trip: an odd
++            // offs like -56 rounds to -48, i.e. the next aligned pair —
++            // rounding the ADDRESS down instead would re-read the skipped
++            // odd slot. Exhaustion test: aligned offs > -16 means the
++            // remaining register space cannot hold an aligned pair.
++            self.state.emit("    ldrsw x2, [x1, #24]");
++            self.state.emit("    add w2, w2, #15");
++            self.state.emit("    and w2, w2, #-16");
++            self.state.emit("    cmp w2, #-16");
++            self.state
++                .emit_fmt(format_args!("    b.gt {}", label_stack));
++            self.state.emit("    ldr x3, [x1, #8]");
++            self.state.emit("    add x3, x3, w2, sxtw");
++            self.state.emit("    ldr q0, [x3]");
++            self.state.emit("    add w2, w2, #16");
++            self.state.emit("    str w2, [x1, #24]");
++            self.state
++                .emit_fmt(format_args!("    b {}", label_done));
++
++            self.state.emit_fmt(format_args!("{}:", label_stack));
++            // Overflow path: round __stack up to 16 first (per AAPCS64),
++            // and mark the GP side exhausted.
++            self.state.emit("    str wzr, [x1, #24]");
++            self.state.emit("    ldr x3, [x1]");
++            self.state.emit("    add x3, x3, #15");
++            self.state.emit("    and x3, x3, #-16");
++            self.state.emit("    ldr q0, [x3]");
++            self.state.emit("    add x3, x3, #16");
++            self.state.emit("    str x3, [x1]");
++
++            self.state.emit_fmt(format_args!("{}:", label_done));
++            self.state.reg_cache.invalidate_all();
++            if let Some(slot) = self.state.get_slot(dest.0) {
++                self.emit_store_to_sp("q0", slot.0, "str");
++            }
++            return;
++        }
++
+         if is_f128 {
+             // AAPCS64: `long double` (fp128) variadic arguments are saved in the
+             // FP register save area (or, once __vr_offs is exhausted, on the
+@@ -258,7 +312,13 @@ impl ArmCodegen {
+         // Or: aligned_offs + total_reg_bytes is still negative (bit 63 set after sign-extend + add)
+         self.state.emit("    ldrsw x2, [x1, #24]"); // x2 = sign-extended __gr_offs
+         if eff_align == 16 {
+-            self.state.emit("    and x2, x2, #-16");
++            // Round the offset UP to the alignment (see the i128 va_arg
++            // arm): an odd aligned composite skips to the next even pair.
++            self.state.emit("    add w2, w2, #15");
++            self.state.emit("    and w2, w2, #-16");
++            // The 32-bit and zeroed the upper half of x2; every later use
++            // is 64-bit, so re-sign-extend.
++            self.state.emit("    sxtw x2, w2");
+         }
+         if total_reg_bytes <= 4095 {
+             self.state
+diff --git a/src/backend/call_abi.rs b/src/backend/call_abi.rs
+index fa71b2d2..4b8f21fb 100644
+--- a/src/backend/call_abi.rs
++++ b/src/backend/call_abi.rs
+@@ -813,12 +813,21 @@ fn classify_args_core(
+                     } else {
+                         size.div_ceil(slot_size)
+                     };
+-                    // RISC-V psABI: 2×XLEN-aligned structs must start at even register.
+-                    // Note: ARM AAPCS64 does NOT require even-aligned pairs for composites.
+-                    if regs_needed == 2 && config.align_struct_pairs {
++                    // Composites whose natural alignment exceeds XLEN are
++                    // allocated at an even-aligned register (pair) — the
++                    // RISC-V psABI requires it for 2×XLEN-aligned structs,
++                    // and AAPCS64 does the same for ANY 16-byte-aligned
++                    // composite, including single-register struct{int}
++                    // align(16) (GCC oracle: w0/w2/w4/w6 with odd registers
++                    // skipped). The rounding also applies on the va_arg side
++                    // (emit_va_arg_struct rounds __gr_offs the same way), so
++                    // caller and callee agree.
++                    let mut align_applied = false;
++                    if config.align_struct_pairs {
+                         let struct_align = info.struct_align.unwrap_or(slot_size);
+                         if struct_align > slot_size && int_idx % 2 != 0 {
+                             int_idx += 1; // skip to even register
++                            align_applied = true;
+                         }
+                     }
+                     if int_idx + regs_needed <= config.max_int_regs {
+@@ -827,7 +836,8 @@ fn classify_args_core(
+                             size,
+                         });
+                         int_idx += regs_needed;
+-                    } else if regs_needed == 2
++                    } else if !align_applied
++                        && regs_needed == 2
+                         && int_idx < config.max_int_regs
+                         && config.allow_struct_split_reg_stack
+                     {
+diff --git a/src/backend/generation.rs b/src/backend/generation.rs
+index b238675b..e3bff5f0 100644
+--- a/src/backend/generation.rs
++++ b/src/backend/generation.rs
+@@ -4983,6 +4983,13 @@ pub(super) fn generate_instruction(
+             va_list_ptr,
+             result_ty,
+         } => {
++            // A 128-bit va_arg result is definitionally a 128-bit value:
++            // without this marker, later pair loads via operand_to_x0_x1
++            // and friends would read only the low 8 bytes and zero-extend
++            // (the is_i128_value fast path would never fire).
++            if is_i128_type(*result_ty) {
++                cg.state().i128_values.insert(dest.0);
++            }
+             cg.emit_va_arg(dest, va_list_ptr, *result_ty);
+             clobber_after_call_like(cg);
+         }
+-- 
+2.47.3
+
+
+From 602f7480a28e00ab50b4ed9144e4f850e96568ed Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 21:11:03 +0000
+Subject: [PATCH 2/6] riscv: va_arg for __int128 and full-precision long double
+ varargs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+  * va_arg(ap, __int128) had no arm at all — it fell into the plain
+    8-byte scalar path and read half of every 128-bit vararg. New arm:
+    16-byte-aligned overflow-area read, 16-byte store to the dest slot
+    (the dest is marked i128 by generation's VaArg handling).
+  * va_arg(ap, long double) round-tripped through __trunctfdf2 and
+    stored only the low 8 bytes: every long-double vararg was silently
+    truncated to double precision. The full binary128 value is now
+    stored and registered as an f128 source (the same repair aarch64
+    received for va-arg-5/va-arg-6; riscv never got the equivalent).
+  * both new arms stage the value through t3/t4: the first cut used
+    t0/t1, clobbering t1 — the &va_list pointer needed for the
+    write-back — and store()ed the advanced pointer over constant data
+    (SIGSEGV inside the first vararg read, caught by the gdbstub).
+
+Validation: rvva probe (i128 sum + long double sum through 16-byte
+varargs) GCC-exact; va_arg_wide_struct passes on riscv64 (rc=0, was
+broken/segfaulting); lib 1273/0/6; ARM and x86 suites unchanged.
+---
+ src/backend/riscv/codegen/variadic.rs | 44 +++++++++++++++++++++------
+ 1 file changed, 34 insertions(+), 10 deletions(-)
+
+diff --git a/src/backend/riscv/codegen/variadic.rs b/src/backend/riscv/codegen/variadic.rs
+index 2c651e89..e0063c24 100644
+--- a/src/backend/riscv/codegen/variadic.rs
++++ b/src/backend/riscv/codegen/variadic.rs
+@@ -25,22 +25,46 @@ impl RiscvCodegen {
+         // Load the current va_list pointer value (points to next arg)
+         self.state.emit("    ld t2, 0(t1)");
+ 
+-        if result_ty.is_long_double() {
+-            // F128 (long double): 16 bytes, 16-byte aligned.
++        if crate::backend::generation::is_i128_type(result_ty) {
++            // __int128: 16 bytes, 16-byte aligned in the overflow area.
++            // The value rides t3/t4 — t1 holds the &va_list pointer for the
++            // write-back below, and t2 walks the arg pointer.
+             self.state.emit("    addi t2, t2, 15");
+             self.state.emit("    andi t2, t2, -16");
+-            self.state.emit("    ld a0, 0(t2)");
+-            self.state.emit("    ld a1, 8(t2)");
++            self.state.emit("    ld t3, 0(t2)");
++            self.state.emit("    ld t4, 8(t2)");
+             self.state.emit("    addi t2, t2, 16");
+             self.state.emit("    sd t2, 0(t1)");
+-            self.state.emit("    call __trunctfdf2");
+-            self.state.emit("    fmv.x.d t0, fa0");
+-        } else {
+-            // Standard 8-byte arg
+-            self.state.emit("    ld t0, 0(t2)");
+-            self.state.emit("    addi t2, t2, 8");
++            if let Some(slot) = self.state.get_slot(dest.0) {
++                self.emit_store_to_s0("t3", slot.0, "sd");
++                self.emit_store_to_s0("t4", slot.0 + 8, "sd");
++            }
++            return;
++        }
++        if result_ty.is_long_double() {
++            // F128 (long double): 16 bytes, 16-byte aligned. Store the FULL
++            // binary128 value — a __trunctfdf2 round-trip here silently
++            // truncated every long-double vararg to double precision
++            // (aarch64 fixed the identical defect for va-arg-5/va-arg-6;
++            // riscv never received the equivalent).
++            self.state.emit("    addi t2, t2, 15");
++            self.state.emit("    andi t2, t2, -16");
++            // Value rides t3/t4 (t1 = &va_list must survive the round trip).
++            self.state.emit("    ld t3, 0(t2)");
++            self.state.emit("    ld t4, 8(t2)");
++            self.state.emit("    addi t2, t2, 16");
+             self.state.emit("    sd t2, 0(t1)");
++            if let Some(slot) = self.state.get_slot(dest.0) {
++                self.emit_store_to_s0("t3", slot.0, "sd");
++                self.emit_store_to_s0("t4", slot.0 + 8, "sd");
++                self.state.track_f128_self(dest.0);
++            }
++            return;
+         }
++        // Standard 8-byte arg
++        self.state.emit("    ld t0, 0(t2)");
++        self.state.emit("    addi t2, t2, 8");
++        self.state.emit("    sd t2, 0(t1)");
+         self.store_t0_to(dest);
+     }
+ 
+-- 
+2.47.3
+
+
+From a715d37b3f9477d0dc3a8403a98eeac67e42e8f5 Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 21:11:12 +0000
+Subject: [PATCH 3/6] docs: landed register - wide va_arg + alignment across
+ aarch64/riscv64
+
+---
+ engineering/agent/BACKLOG.md | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
+index b709dadb..674e8456 100644
+--- a/engineering/agent/BACKLOG.md
++++ b/engineering/agent/BACKLOG.md
+@@ -322,7 +322,11 @@ the f128 tracker; pair loads prefer it; x9 dead-address-mov full-scan
+ soundness; f128_softfloat + f128_global_carrier green, 2026-08-28). · riscv f128-carrier
+ end-to-end (f128_in_gp_pairs classify arm, tracker-fed U128 load/store,
+ sign-bit intrinsic arms — F128Neg previously hit the silent SIMD no-op;
+-f128_softfloat + f128_global_carrier green on qemu-riscv64, 2026-08-28).
++f128_softfloat + f128_global_carrier green on qemu-riscv64, 2026-08-28). ·
++AAPCS64/RISC-V wide va_arg: __int128 va_arg arms both backends, long double
++varargs full precision on riscv, align-16 composites at even pairs (named +
++variadic, both arches — old "AAPCS64 needs no even pairs" note was wrong),
++va_arg_wide_struct green on aarch64 AND riscv64 (2026-08-28).
+ 
+ Rejected-with-evidence (never resubmit without new data): Agent B's
+ MAX_SMALL_INLINE_BLOCKS 12 / -Os cap removal / split-call-everywhere;
+-- 
+2.47.3
+
+
+From e89f1b1baa8107de6a32588729dcd395368e0f88 Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 21:30:52 +0000
+Subject: [PATCH 4/6] aarch64, riscv64: plain char is unsigned per target ABI
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Plain `char` was compiled as SIGNED on every target — an x86-64 default
+leaked into AArch64 and RISC-V64, where the SysV ABIs specify an
+unsigned plain char. Every `char c = 200` read back -56 instead of 200,
+every narrowing `(int)(char)x` sign-extended instead of zero-extending,
+and character constants kept their sign (C11 6.4.4.4p10) — so
+declaration and constant DISAGREED, e.g. tests/regression/
+cast_chain_fold.c produced a different hash than GCC (caught by the
+ARM differential suite).
+
+The distinction is resolved at the parse boundary: the parser is the
+only layer that can still tell plain `char` (target-defined rank) from
+explicit `signed char`, and TypeSpecifier::Char now unambiguously means
+explicit `signed char` — sema CType mapping, IR lowering (I8 vs U8
+decides load/store extension), and typeof/typedef round-trips stay
+flag-free. The driver records the target default process-globally
+before parsing (one target per driver binary); -fsigned-char /
+-funsigned-char override it and also flip character-constant values,
+matching GCC on both an x86 -funsigned-char and an AArch64
+-fsigned-char probe.
+
+Validation: char_signedness_target.c new, passes on x86-64, AArch64 and
+RISC-V64 with and without both flags (GCC parity on all); cast_chain_fold
+now matches GCC on AArch64; lib 1273/0/6; x86 536/5 (same 5 pre-existing);
+ARM 378/30/75 (was 376/31; also fixes the char probes in the wide-vaarg
+work); RISC-V va_arg_wide_struct re-verified rc=0.
+---
+ src/common/types.rs                       | 17 ++++++++
+ src/driver/cli.rs                         | 18 +++++++++
+ src/frontend/parser/types.rs              | 17 +++++++-
+ src/ir/lowering/expr.rs                   | 13 ++++--
+ tests/regression/char_signedness_target.c | 49 +++++++++++++++++++++++
+ 5 files changed, 109 insertions(+), 5 deletions(-)
+ create mode 100644 tests/regression/char_signedness_target.c
+
+diff --git a/src/common/types.rs b/src/common/types.rs
+index 5766969a..816fbae2 100644
+--- a/src/common/types.rs
++++ b/src/common/types.rs
+@@ -1437,6 +1437,23 @@ impl std::fmt::Display for CType {
+     }
+ }
+ 
++/// Whether the target's plain `char` is unsigned (AArch64 and RISC-V SysV
++/// ABIs specify unsigned char; x86-64/i686 use signed char). One target per
++/// driver process, so a process-global set by the driver before parsing is
++/// the single source of truth — the front end is otherwise target-blind.
++static CHAR_UNSIGNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++/// Record the target's plain-char signedness. Called once by the driver
++/// after the target is known, before any parsing/sema/lowering runs.
++pub fn set_char_unsigned(unsigned: bool) {
++    CHAR_UNSIGNED.store(unsigned, std::sync::atomic::Ordering::Relaxed);
++}
++
++/// The target's plain-char signedness (true: `char` behaves as `unsigned char`).
++pub fn char_is_unsigned() -> bool {
++    CHAR_UNSIGNED.load(std::sync::atomic::Ordering::Relaxed)
++}
++
+ impl CType {
+     /// Size in bytes, with struct/union layout lookup via context.
+     /// Uses the thread-local target pointer size for target-dependent types
+diff --git a/src/driver/cli.rs b/src/driver/cli.rs
+index 5d9e3d57..3fae0f04 100644
+--- a/src/driver/cli.rs
++++ b/src/driver/cli.rs
+@@ -195,6 +195,15 @@ impl Driver {
+         } else {
+             Target::X86_64
+         };
++        // Plain `char` signedness is target-defined (C11 6.7.2p5): unsigned
++        // on AArch64/RISC-V SysV, signed on x86. Recorded process-globally
++        // BEFORE any parsing/sema/lowering so every type resolution, cast,
++        // and character constant sees the target's answer. -funsigned-char /
++        // -fsigned-char override the default in the argument loop.
++        crate::common::types::set_char_unsigned(matches!(
++            self.target,
++            Target::Aarch64 | Target::Riscv64
++        ));
+ 
+         // Handle GCC query flags that exit immediately (before requiring input files).
+         // These are used by configure scripts to detect the compiler and target.
+@@ -833,6 +842,15 @@ impl Driver {
+                 arg if arg == "-fno-exceptions" => {
+                     self.exceptions = false;
+                 }
++                // Plain-char signedness overrides (GCC-compatible): these
++                // re-record the process-global AFTER the target default was
++                // installed, so they win regardless of order relative to it.
++                arg if arg == "-funsigned-char" => {
++                    crate::common::types::set_char_unsigned(true);
++                }
++                arg if arg == "-fsigned-char" => {
++                    crate::common::types::set_char_unsigned(false);
++                }
+                 arg if arg.starts_with("-std=") => {
+                     let std_value = &arg[5..];
+                     // GNU dialects: gnu89, gnu99, gnu11, gnu17, gnu23, etc.
+diff --git a/src/frontend/parser/types.rs b/src/frontend/parser/types.rs
+index 3ebb41c5..60cfa3e8 100644
+--- a/src/frontend/parser/types.rs
++++ b/src/frontend/parser/types.rs
+@@ -579,7 +579,7 @@ impl Parser {
+             has_short,
+             has_int: _,
+             has_unsigned,
+-            has_signed: _,
++            has_signed,
+             has_struct,
+             has_union,
+             has_enum,
+@@ -626,7 +626,20 @@ impl Parser {
+             if has_unsigned {
+                 TypeSpecifier::UnsignedChar
+             } else {
+-                TypeSpecifier::Char
++                // C11 6.7.2p5: plain char's signedness is target-defined —
++                // unsigned on AArch64/RISC-V SysV (unsigned char default),
++                // signed on x86. Resolving at the parse boundary makes
++                // TypeSpecifier::Char mean ONLY explicit `signed char`
++                // everywhere downstream (sema, IR lowering, typeof and
++                // typedef round-trips), so no later layer needs the flag.
++                if !has_signed && crate::common::types::char_is_unsigned() {
++                    // plain `char` on an unsigned-char target
++                    TypeSpecifier::UnsignedChar
++                } else {
++                    // `signed char` (explicit), or plain char on a
++                    // signed-char target
++                    TypeSpecifier::Char
++                }
+             }
+         } else if has_short {
+             if has_unsigned {
+diff --git a/src/ir/lowering/expr.rs b/src/ir/lowering/expr.rs
+index 155ed5c4..3101bd31 100644
+--- a/src/ir/lowering/expr.rs
++++ b/src/ir/lowering/expr.rs
+@@ -244,9 +244,16 @@ impl Lowerer {
+                 Operand::Const(IrConst::I128(v as i128))
+             }
+             Expr::CharLiteral(ch, _) => {
+-                // Sign-extend from signed char to int, matching GCC behavior.
+-                // '\xEF' should be -17, not 239, when char is signed.
+-                let val = *ch as u8 as i8 as i32;
++                // A character constant has type int and the value the target's
++                // plain char would hold (C11 6.4.4.4p10): sign-extended when
++                // char is signed (x86), zero-extended when unsigned
++                // (AArch64/RISC-V SysV). '\xEF' is -17 with signed char,
++                // 239 with unsigned char.
++                let val = if crate::common::types::char_is_unsigned() {
++                    *ch as u8 as i32
++                } else {
++                    *ch as u8 as i8 as i32
++                };
+                 Operand::Const(IrConst::I32(val))
+             }
+ 
+diff --git a/tests/regression/char_signedness_target.c b/tests/regression/char_signedness_target.c
+new file mode 100644
+index 00000000..d5029200
+--- /dev/null
++++ b/tests/regression/char_signedness_target.c
+@@ -0,0 +1,49 @@
++// Target plain-char signedness (C11 6.7.2p5, C11 6.4.4.4p10): the declared
++// `char` rank and character-constant values must AGREE on every target —
++// unsigned on AArch64/RISC-V SysV, signed on x86-64/i686 — and
++// -fsigned-char/-funsigned-char must flip both consistently. The exact
++// values are target-dependent, so the test pins the invariants that hold
++// everywhere: (unsigned char) round-trips exactly, `signed char` always
++// sign-extends, and plain char + a char constant never disagree.
++int main(void) {
++    // (unsigned char) always has 8 value bits, 0..255.
++    unsigned char u = 200;
++    if ((int)u != 200)
++        return 1;
++    if ((int)(unsigned char)0xFF != 255)
++        return 2;
++
++    // (signed char) always sign-extends.
++    signed char s = 200; // impl-defined conversion, -56 on every 8-bit-char target
++    if ((int)s != -56)
++        return 3;
++    if ((int)(signed char)0xFF != -1)
++        return 4;
++
++    // Plain char and character constants must take the SAME view: if
++    // plain char is signed, both are negative; if unsigned, both are in
++    // 128..255. A target where the declaration and the constant disagree
++    // (e.g. char c = 200 reads back -56 while '\xEF' is 239) is broken.
++    char c = 200;
++    int c_val = (int)c;
++    int lit_val = (int)(char)0xEF;
++    if (!((c_val == 200 && lit_val == 239) || (c_val == -56 && lit_val == -17)))
++        return 5;
++
++    // The plain-char view must equal the (signed char)/(unsigned char)
++    // view chosen by the target's CHAR_BITS-signedness, i.e. char, signed
++    // char and unsigned char are distinct TYPES but char matches exactly
++    // one of them in value behavior for these inputs.
++    if (c_val == -56 && (int)(char)0xFF != -1)
++        return 6;
++    if (c_val == 200 && (int)(char)0xFF != 255)
++        return 7;
++
++    // Char-typed arithmetic keeps target semantics either way.
++    char a = 100, b = 100;
++    int sum = (int)(char)(a + b); // 8-bit wraparound then char-extend
++    if (!((sum == -56 && c_val == -56) || (sum == 200 && c_val == 200)))
++        return 8;
++
++    return 0;
++}
+-- 
+2.47.3
+
+
+From b1f292f19c915031abdd1af33c6d27d4a2f3786f Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 21:31:50 +0000
+Subject: [PATCH 5/6] docs: state refresh - S08 wide va_arg + target char
+ signedness
+
+---
+ engineering/STATE.md | 26 ++++++++++++++++++++++++--
+ 1 file changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/engineering/STATE.md b/engineering/STATE.md
+index 568bb98f..bc6126c5 100644
+--- a/engineering/STATE.md
++++ b/engineering/STATE.md
+@@ -1,7 +1,6 @@
+ # Current compiler state
+ 
+-SHA at last doc refresh: **`f657de55`** (`ms178/lccc` main, PR #276; the
+-cross-backend ABI round = merged `ms178-2.patch`, plus PR #275 setcc
++SHA at last doc refresh: **`e89f1b1b`** (local S08 series over ms178/lccc main `2f5e9af3`/PR #281: 16-byte-granular va_arg on AArch64+RISC-V64 and target plain-char signedness).patch`, plus PR #275 setcc
+ hardening). Re-verify line numbers before editing. The item catalog is
+ [`agent/BACKLOG.md`](agent/BACKLOG.md); the active queue is
+ [`tasks/`](tasks/README.md); the negative-results ledger is
+@@ -118,3 +117,26 @@ Not all dead code should be deleted:
+    root-caused.
+ 6. Preserve `ExplicitLocation::{Reg,Accumulator}` and exact
+    `SlotAddr::Reg(PhysReg)`; no dummy frame offsets.
++
++## S08: wide va_arg + target char signedness (2026-08-28)
++
++- **16-byte-granular va_arg, AArch64 + RISC-V64**: `va_arg(ap, __int128)`
++  has dedicated 16-byte-aligned arms on both backends (AArch64 rounds
++  `__gr_offs` UP like glibc; RISC-V rounds the overflow-area POINTER);
++  `va_arg(ap, long double)` on RISC-V stores the full binary128 value
++  (was silently `__trunctfdf2`-truncated). The riscv arms stage values
++  through t3/t4 — t0/t1 clobbered the `&va_list` pointer needed for the
++  write-back (SIGSEGV). Align-16 composites now take even-aligned GP
++  pairs on BOTH arches, named and variadic (GCC oracles verified;
++  the old "AAPCS64 needs no even pairs" call_abi note was wrong and is
++  gone). `tests/regression/va_arg_wide_struct.c` green on aarch64 AND
++  riscv64; lib 1273/0/6; ARM 378/30/75; x86 536/5 (same 5 pre-existing).
++- **Target plain-char signedness**: plain `char` was compiled signed on
++  every target (x86 default leaking into AArch64/RISC-V SysV where char
++  is unsigned). Resolved at the parse boundary — the parser rewrites
++  plain char to UnsignedChar on unsigned-char targets, so downstream
++  CType/IR mappings stay unconditional; `-fsigned-char` /
++  `-funsigned-char` override (both directions GCC-verified). Caught by
++  cast_chain_fold.c GCC differential; new
++  `tests/regression/char_signedness_target.c` pins the
++  declaration-vs-constant agreement invariant on all targets.
+-- 
+2.47.3
+
+
+From 4a7b394b04304bf06d2f9870975ca3c34aab8bd8 Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 21:32:01 +0000
+Subject: [PATCH 6/6] ir: document parse-boundary plain-char resolution in
+ type_spec_to_ir
+
+---
+ src/ir/lowering/types.rs | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/ir/lowering/types.rs b/src/ir/lowering/types.rs
+index 76fdce47..85d80938 100644
+--- a/src/ir/lowering/types.rs
++++ b/src/ir/lowering/types.rs
+@@ -215,6 +215,10 @@ impl Lowerer {
+         match ts {
+             TypeSpecifier::Void => IrType::Void,
+             TypeSpecifier::Bool => IrType::U8,
++            // NOTE: plain char vs signed char is resolved at PARSE time (the
++            // parser emits UnsignedChar for plain char on unsigned-char
++            // targets), so TypeSpecifier::Char here always means explicit
++            // `signed char` and lowers to I8 unconditionally.
+             TypeSpecifier::Char => IrType::I8,
+             TypeSpecifier::UnsignedChar => IrType::U8,
+             TypeSpecifier::Short => IrType::I16,
 -- 
 2.47.3
 
