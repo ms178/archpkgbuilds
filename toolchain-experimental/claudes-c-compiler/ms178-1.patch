@@ -1,1947 +1,1228 @@
-From 16098a51052f6d9f43d0964c6f8c742ca95e9d16 Mon Sep 17 00:00:00 2001
+From fcefdcf0f33ad4a5414e0f665907cb9424ececfe Mon Sep 17 00:00:00 2001
 From: ms178 <ms178@users.noreply.github.com>
-Date: Fri, 28 Aug 2026 15:43:52 +0000
-Subject: [PATCH 1/8] elf: per-ISA TLS relocation classification (fixes STT_TLS
- on every RISC-V call)
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+Date: Fri, 28 Aug 2026 18:06:14 +0000
+Subject: [PATCH 1/7] aarch64: full-precision carrier plumbing (f128_softfloat
+ SIGSEGV + wrong -a)
 
-is_tls_reloc selected the relocation table by pointer size, so 64-bit
-targets used the x86-64 numbers. Relocation numbers are per-ISA
-namespaces, and RISC-V's collide head-on: R_RISCV_BRANCH=16, JAL=17,
-CALL=18, CALL_PLT=19 and PCREL_HI20=23 all sit inside x86-64's
-TLSGD..TPOFF32 range (16..=23). Every external function referenced by a
-lccc-riscv object was therefore stamped STT_TLS in .symtab and cross-GCC
-links rejected the object with "TLS reference ... mismatches non-TLS
-definition" — the entire RISC-V backend was unlinkable against glibc.
+Three interlocking defects, all rooted in the same blind spot: values
+lowered to the IrType::U128 _Float128 carrier carry 16 REAL bytes, but
+several backend paths treated untracked U128 data as an f64 to be
+extended, or truncated it to its low qword.
 
-Add a target ELF-machine thread-local (set from the pipeline alongside
-the other target globals, provided by Target::elf_machine) and give
-is_tls_reloc exact per-machine tables:
+1. eliminate_unused_x9_address_moves deleted `mov x9, xN` on a
+   single-instruction lookahead. After eliminate_move_chains folds the
+   chain (mov x9,x20 -> mov x9,x0) and propagate_register_copies
+   rewrites only the FIRST use (ldr x0,[x9] -> ldr x0,[x0]), the next
+   line looks clean while the second load of a 16-byte global carrier
+   (ldr x1,[x9,#8]) still reads x9 -> stale-register SIGSEGV. The pass
+   now scans to the first x9 read (mov kept), pure x9 redefinition
+   (mov dead), control-flow boundary, call (x9 caller-saved), or
+   function end before believing the mov is dead.
 
-- EM_386: unchanged (proven): 14..=19 | 24..=37 | 39..=41
-- EM_X86_64: unchanged (proven): 16..=23 | 29..=31 (GOTPCRELX/REX
-  deliberately excluded)
-- EM_AARCH64: 549..=551 (TLSLE ADD_TPREL_HI12/LO12/LO12_NC; numbers
-  verified by decoding TLS objects emitted by the installed aarch64
-  binutils)
-- EM_RISCV: 21..=22 (TLS_GOT/GD_HI20) | 29..=32 (TPREL_HI20, LO12_I/S,
-  TPREL_ADD); verified the same way
+2. F128Neg/F128Fabs/F128Copysign operand staging degraded untracked
+   carrier arguments to the __extenddftf2(low qword) fallback: -1.5F128
+   materialized as -0.0. U128 loads now record their destination as a
+   full-precision f128 source (track_f128_self), so the existing
+   tracked-source path stages all 16 bytes.
 
-Unit test pins all four tables including the exact collision numbers
-(19 = CALL_PLT not-TLS on RISC-V, TLSGD on x86-64).
+3. operand_to_x0_x1 loaded tracked F128 values by value type (8 bytes,
+   high half zeroed) when a U128-typed consumer asked for the pair,
+   truncating carrier results stored through U128-typed Stores. The
+   pair load now prefers the f128 tracker (direct and indirect homes),
+   and IrConst::LongDouble constants stage bit-exactly instead of
+   integer-reinterpreting the binary128 pattern. U128 stores of tracked
+   values propagate the tracking to the destination slot.
 
-Validation: lccc-riscv objects now link against riscv64 glibc (dynamic
-and static) and execute under qemu-riscv64 with GCC-identical output;
-x86-64 unit 1259/0/6 and corpus 506/0 unchanged.
+Validation: f128_softfloat rc=0 (was 139); new f128_global_carrier
+regression (GOT-load + negation + double negation, GCC-oracle parity);
+three new mutation-verified peephole unit tests (the survivor test
+fails against the old lookahead, verified by temporary revert);
+lib 1273/0/6; ARM 373 passed / 33 failed / 75 skipped (was 371/34,
+no regressions); x86 536/5 unchanged (5 pre-existing).
 ---
- src/backend/elf/symbol_table.rs | 94 +++++++++++++++++++++++++++++----
- src/backend/mod.rs              | 13 +++++
- src/common/types.rs             | 16 ++++++
- src/driver/pipeline.rs          |  2 +
- 4 files changed, 114 insertions(+), 11 deletions(-)
+ src/backend/arm/codegen/emit.rs        |  37 ++++++
+ src/backend/arm/codegen/memory.rs      |  43 +++++++
+ src/backend/arm/codegen/peephole.rs    | 169 ++++++++++++++++++++++---
+ tests/regression/f128_global_carrier.c |  34 +++++
+ 4 files changed, 266 insertions(+), 17 deletions(-)
+ create mode 100644 tests/regression/f128_global_carrier.c
 
-diff --git a/src/backend/elf/symbol_table.rs b/src/backend/elf/symbol_table.rs
-index 1171b0d3..bb936f81 100644
---- a/src/backend/elf/symbol_table.rs
-+++ b/src/backend/elf/symbol_table.rs
-@@ -250,16 +250,88 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
- /// under PGO builds, and only there because block alignment changed the
- /// GOT-layout path).
- fn is_tls_reloc(rtype: u32) -> bool {
--    if crate::common::types::target_is_32bit() {
--        // i386 R_386_TLS_*: TPOFF=14, IE=15, GOTIE=16, LE=17, GD=18, LDM=19,
--        // GD_32..TPOFF32 = 24..=37, GOTDESC=39, DESC_CALL=40, DESC=41.
--        matches!(rtype, 14..=19 | 24..=37 | 39..=41)
--    } else {
--        // x86-64 TLS relocations: DTPMOD64=16, DTPOFF64=17, TPOFF64=18,
--        // TLSGD=19, TLSLD=20, DTPOFF32=21, GOTTPOFF=22, TPOFF32=23,
--        // GOTPC32_TLSDESC=29, TLSDESC_CALL=30, TLSDESC=31.
--        // 41 (GOTPCRELX) and 42 (REX_GOTPCRELX) are relaxable GOT relocations,
--        // NOT TLS — deliberately excluded.
--        matches!(rtype, 16..=23 | 29..=31)
-+    // Relocation numbers are per-ISA namespaces: key off the ELF machine, NOT
-+    // the pointer size. The old `target_is_32bit()` split classified RISC-V
-+    // objects with the x86-64 table, where 16..=23 covers R_RISCV_BRANCH(16),
-+    // R_RISCV_JAL(17), R_RISCV_CALL(18), R_RISCV_CALL_PLT(19) and
-+    // R_RISCV_PCREL_HI20(23) — every external call symbol was stamped STT_TLS
-+    // and cross-GCC links rejected the object ("TLS reference mismatches
-+    // non-TLS definition"). Tables below list exactly the TLS-form reloc
-+    // numbers of each machine; anything else is not TLS.
-+    match crate::common::types::target_elf_machine() {
-+        crate::backend::elf::EM_386 => {
-+            // i386 R_386_TLS_*: TPOFF=14, IE=15, GOTIE=16, LE=17, GD=18, LDM=19,
-+            // GD_32..TPOFF32 = 24..=37, GOTDESC=39, DESC_CALL=40, DESC=41.
-+            matches!(rtype, 14..=19 | 24..=37 | 39..=41)
-+        }
-+        crate::backend::elf::EM_X86_64 => {
-+            // x86-64 TLS relocations: DTPMOD64=16, DTPOFF64=17, TPOFF64=18,
-+            // TLSGD=19, TLSLD=20, DTPOFF32=21, GOTTPOFF=22, TPOFF32=23,
-+            // GOTPC32_TLSDESC=29, TLSDESC_CALL=30, TLSDESC=31.
-+            // 41 (GOTPCRELX) and 42 (REX_GOTPCRELX) are relaxable GOT relocations,
-+            // NOT TLS — deliberately excluded.
-+            matches!(rtype, 16..=23 | 29..=31)
-+        }
-+        crate::backend::elf::EM_AARCH64 => {
-+            // AArch64 TLS: TLSLE_ADD_TPREL_HI12=549, ADD_TPREL_LO12=550,
-+            // LO12_NC=551 (numbers verified against the installed
-+            // aarch64 binutils by decoding emitted TLS objects).
-+            matches!(rtype, 549..=551)
-+        }
-+        crate::backend::elf::EM_RISCV => {
-+            // RISC-V TLS: TLS_GOT_HI20=21, TLS_GD_HI20=22, TPREL_HI20=29,
-+            // TPREL_LO12_I=30, TPREL_LO12_S=31, TPREL_ADD=32.
-+            matches!(rtype, 21..=22 | 29..=32)
-+        }
-+        _ => false,
-+    }
-+}
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+
-+    /// Regression: is_tls_reloc must key off the ELF machine, not the pointer
-+    /// size. The old target_is_32bit() split classified RISC-V objects with the
-+    /// x86-64 table — R_RISCV_CALL_PLT(19) fell inside x86-64's TLSGD=19..=
-+    /// TPOFF32=23 range and every external function symbol was stamped STT_TLS
-+    /// ("TLS reference mismatches non-TLS definition" at cross-GCC link).
-+    #[test]
-+    fn tls_classification_is_per_machine() {
-+        use crate::backend::elf::{EM_386, EM_AARCH64, EM_RISCV, EM_X86_64};
-+        use crate::common::types::{set_target_elf_machine, target_elf_machine};
-+
-+        // RISC-V: calls and PC-relative data references are NOT TLS.
-+        set_target_elf_machine(EM_RISCV);
-+        assert_eq!(target_elf_machine(), EM_RISCV);
-+        for r in [16u32 /*BRANCH*/, 17 /*JAL*/, 18 /*CALL*/, 19 /*CALL_PLT*/, 23 /*PCREL_HI20*/, 24 /*PCREL_LO12_I*/, 51 /*RELAX*/] {
-+            assert!(!is_tls_reloc(r), "RISC-V r{r} must not be TLS");
-+        }
-+        for r in [21u32, 22, 29, 30, 31, 32] {
-+            assert!(is_tls_reloc(r), "RISC-V r{r} must be TLS");
-+        }
-+
-+        // AArch64: call/jump/GOT relocations are NOT TLS; local-exec TPREL is.
-+        set_target_elf_machine(EM_AARCH64);
-+        for r in [257u32, 275, 282 /*JUMP26*/, 283 /*CALL26*/] {
-+            assert!(!is_tls_reloc(r), "AArch64 r{r} must not be TLS");
-+        }
-+        for r in [549u32, 550, 551] {
-+            assert!(is_tls_reloc(r), "AArch64 r{r} must be TLS");
-+        }
-+
-+        // x86-64: TLSGD=19 is TLS while GOTPCRELX=41 / REX_GOTPCRELX=42 are not.
-+        set_target_elf_machine(EM_X86_64);
-+        assert!(is_tls_reloc(19));
-+        assert!(is_tls_reloc(16));
-+        assert!(!is_tls_reloc(41));
-+        assert!(!is_tls_reloc(42));
-+
-+        // i386 keeps its proven table.
-+        set_target_elf_machine(EM_386);
-+        assert!(is_tls_reloc(14));
-+        assert!(is_tls_reloc(37));
-+        assert!(!is_tls_reloc(20));
-+        assert!(!is_tls_reloc(38));
-     }
- }
-diff --git a/src/backend/mod.rs b/src/backend/mod.rs
-index 3d1a2bae..a9f85cfb 100644
---- a/src/backend/mod.rs
-+++ b/src/backend/mod.rs
-@@ -322,6 +322,19 @@ impl Target {
-         }
-     }
- 
-+    /// ELF e_machine value for this target. Relocation-type number spaces are
-+    /// per ISA — classification of a reloc (e.g. TLS vs PLT call) must key off
-+    /// the machine, never off the pointer size (R_RISCV_CALL_PLT=19 collides
-+    /// with x86-64 R_X86_64_TLSGD=19).
-+    pub(crate) fn elf_machine(&self) -> u16 {
-+        match self {
-+            Target::I686 => elf::EM_386,
-+            Target::X86_64 => elf::EM_X86_64,
-+            Target::Aarch64 => elf::EM_AARCH64,
-+            Target::Riscv64 => elf::EM_RISCV,
-+        }
-+    }
-+
-     /// Get the assembler config for this target.
-     /// Only used when the `gcc_assembler` feature is enabled for GCC fallback.
-     #[cfg_attr(not(feature = "gcc_assembler"), allow(dead_code))]
-diff --git a/src/common/types.rs b/src/common/types.rs
-index d5797f0b..5766969a 100644
---- a/src/common/types.rs
-+++ b/src/common/types.rs
-@@ -15,6 +15,10 @@ thread_local! {
-     /// Whether long double is IEEE binary128 (f128). True for AArch64/RISC-V,
-     /// false for x86/i686 where long double is x87 80-bit.
-     static TARGET_LONG_DOUBLE_IS_F128: Cell<bool> = const { Cell::new(false) };
-+
-+    /// ELF e_machine of the current target (EM_X86_64 default). Relocation
-+    /// number spaces are per ISA; see `target_elf_machine`.
-+    static TARGET_ELF_MACHINE: Cell<u16> = const { Cell::new(62) };
-     /// Whether the current backend supports width-partitioned 4-byte spill
-     /// slots. Only the x86-64 backend's store/load paths are fully
-     /// width-consistent for small types (see state::is_small_slot); every
-@@ -49,6 +53,18 @@ pub fn target_is_32bit() -> bool {
-     target_ptr_size() == 4
- }
- 
-+/// Set the ELF e_machine for the current target. Relocation-type numbers are
-+/// per-ISA namespaces (R_RISCV_CALL_PLT=19 vs R_X86_64_TLSGD=19), so any
-+/// classification of a raw relocation number must consult this.
-+pub fn set_target_elf_machine(machine: u16) {
-+    TARGET_ELF_MACHINE.with(|c| c.set(machine));
-+}
-+
-+/// ELF e_machine of the current target.
-+pub fn target_elf_machine() -> u16 {
-+    TARGET_ELF_MACHINE.with(|c| c.get())
-+}
-+
- /// Set whether the target uses IEEE binary128 for long double (AArch64/RISC-V).
- pub fn set_target_long_double_is_f128(is_f128: bool) {
-     TARGET_LONG_DOUBLE_IS_F128.with(|c| c.set(is_f128));
-diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
-index 65a6e5d2..4383731b 100644
---- a/src/driver/pipeline.rs
-+++ b/src/driver/pipeline.rs
-@@ -531,6 +531,8 @@ impl Driver {
-             self.target,
-             Target::Aarch64 | Target::Riscv64
-         ));
-+        // Per-ISA relocation number space (see Target::elf_machine).
-+        crate::common::types::set_target_elf_machine(self.target.elf_machine());
-         // 4-byte width-partitioned spill slots are only enabled where the
-         // backend's store/load paths are proven width-consistent.  x86-64
-         // narrows ≤32-bit spills; i686 naturally accesses every non-wide
--- 
-2.47.3
-
-
-From 99b7a0dcf3dd7c81b6bd830a5c5acb0e6869332f Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Fri, 28 Aug 2026 16:39:32 +0000
-Subject: [PATCH 2/8] aarch64: fix rhs-alias-into-dest ALU ops for any lhs home
-
-When an ALU op's destination register was assigned the same machine
-register as the rhs operand's home, emit_int_binop_impl materialized the
-rhs AFTER writing dest, clobbering it (x86 two-address hazard, ARM side).
-The old fix only handled lhs-in-dest; generalize: whenever rhs-home ==
-dest-home, move lhs into place (operand_to_x0 when lhs itself aliases
-dest, plain operand otherwise) and emit 'op dest, x0|w0, rhs'.
-arm_csinc_select -O2 is GCC-exact again.
----
- src/backend/arm/codegen/alu.rs | 48 ++++++++++++++++++++--------------
- 1 file changed, 29 insertions(+), 19 deletions(-)
-
-diff --git a/src/backend/arm/codegen/alu.rs b/src/backend/arm/codegen/alu.rs
-index b1d2160c..4f0c6c4b 100644
---- a/src/backend/arm/codegen/alu.rs
-+++ b/src/backend/arm/codegen/alu.rs
-@@ -470,25 +470,35 @@ impl ArmCodegen {
-                     }
-                 }
-                 if let Some(rp) = rhs_phys {
--                    if lhs_phys.is_none() && rp.0 == dest_phys.0 {
--                        if let Operand::Value(lv) = lhs {
--                            if let Some(slot) = self.state.get_slot(lv.0) {
--                                let scratch = if use_32bit { "w0" } else { "x0" };
--                                self.emit_load_from_sp(scratch, slot.0, "ldr");
--                                let r = if use_32bit {
--                                    callee_saved_name_32(rp)
--                                } else {
--                                    callee_saved_name(rp)
--                                };
--                                let out = if use_32bit { dest_name_32 } else { dest_name };
--                                self.state.emit_fmt(format_args!(
--                                    "    {} {}, {}, {}",
--                                    mnemonic, out, scratch, r
--                                ));
--                                self.state.reg_cache.invalidate_acc();
--                                return;
--                            }
--                        }
-+                    let rhs_name = if use_32bit {
-+                        callee_saved_name_32(rp)
-+                    } else {
-+                        callee_saved_name(rp)
-+                    };
-+                    if rp.0 == dest_phys.0 {
-+                        // rhs lives in dest's home. The three-operand form
-+                        // `op dest, lhs, rhs` reads rhs AFTER dest is written,
-+                        // so dest==rhs turns the op into `lhs OP lhs` whenever
-+                        // lhs is not itself live in that register. This is the
-+                        // same machine constraint the allocator's half-open
-+                        // handoff does not model locally; the previous repair
-+                        // covered only a slotted VALUE lhs — a CONSTANT lhs
-+                        // (repro: `(int32_t)c - 2` with the result homed over
-+                        // the addend, arm_csinc_select main preheader:
-+                        // `mov x23,#-1; sub x23,x23,x23` computed 0) and a
-+                        // slotless lhs fell through to the broken form. Stage
-+                        // lhs through x0 — that path handles constants, stack
-+                        // homes and the accumulator uniformly — then read rhs
-+                        // from its (dest-named) home in the same instruction.
-+                        let scratch = if use_32bit { "w0" } else { "x0" };
-+                        self.operand_to_x0(lhs);
-+                        let out = if use_32bit { dest_name_32 } else { dest_name };
-+                        self.state.emit_fmt(format_args!(
-+                            "    {} {}, {}, {}",
-+                            mnemonic, out, scratch, rhs_name
-+                        ));
-+                        self.state.reg_cache.invalidate_acc();
-+                        return;
-                     }
-                     emit3!(|_, is32| if is32 {
-                         callee_saved_name_32(rp).to_string()
--- 
-2.47.3
-
-
-From 5cff4aada191d13d6635654a91b7ed7d42009bef Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Fri, 28 Aug 2026 16:39:32 +0000
-Subject: [PATCH 3/8] peephole: shared sp-displacement model for all frame-slot
- passes
-
-All AArch64 stack-slot passes matched stores/loads by RAW [sp,#off]
-while treating 'sub sp,#N' staging windows as transparent, so two stores
-at the same raw offset on opposite sides of a 'sub sp' were mispaired
-and live frame stores were retired (ap_half1 printf store dropper).
-
-Add sp_displacements(lines,kinds,n) -> Option<Vec<i64>>: per-line total
-sp displacement from a zero reset at .cfi_startproc. Models sub/add
-sp,sp,#imm, stp/ldp pre-indexed writeback [sp,#-N]! (disp+=N) and post-
-indexed [sp],#N (disp-=N); Nop lines are skipped (no sp effect); any
-unparseable sp form returns None and every consumer bails (fail closed).
-
-Wire the model into GDSE (frame coordinates in both phases),
-eliminate_overwritten_stores (all comparisons use raw+disp),
-eliminate_repeated_slot_loads (cache key (frame_byte,is_word)) and
-eliminate_adjacent_store_load (pair by frame byte incl. the ldrsw arm).
-test_adjacent_store_load_same_reg now asserts the observable forwarding
-instead of raw store survival.
----
- src/backend/arm/codegen/peephole.rs | 178 ++++++++++++++++++++++++----
- 1 file changed, 153 insertions(+), 25 deletions(-)
-
-diff --git a/src/backend/arm/codegen/peephole.rs b/src/backend/arm/codegen/peephole.rs
-index f06f57e9..d8d198ad 100644
---- a/src/backend/arm/codegen/peephole.rs
-+++ b/src/backend/arm/codegen/peephole.rs
-@@ -1436,8 +1436,15 @@ fn eliminate_repeated_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n
-     if std::env::var("CCC_NO_SLOT_LOAD_DEDUP").is_ok() {
-         return false;
-     }
--    // (offset, is_word) -> register holding the slot's content
--    let mut cached: FxHashMap<(i32, bool), u8> = FxHashMap::default();
-+    // (frame byte, is_word) -> register holding the slot's content.
-+    // Keys are ENTRY-sp-relative frame bytes (raw offset + sp displacement):
-+    // inside a `sub sp` staging window the same raw offset names a different
-+    // byte, and forwarding across that boundary would alias call arguments
-+    // with frame slots (see sp_displacements).
-+    let Some(disps) = sp_displacements(lines, kinds, n) else {
-+        return false;
-+    };
-+    let mut cached: FxHashMap<(i64, bool), u8> = FxHashMap::default();
-     let mut changed = false;
-     for i in 0..n {
-         match kinds[i] {
-@@ -1455,7 +1462,8 @@ fn eliminate_repeated_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n
-                 offset, is_word, ..
-             } => {
-                 // Invalidate entries overlapping the stored range.
--                let (lo, hi) = (offset, offset + if is_word { 4 } else { 8 });
-+                let lo = offset as i64 + disps[i];
-+                let hi = lo + if is_word { 4 } else { 8 };
-                 cached.retain(|&(off, word), _| {
-                     let (l2, h2) = (off, off + if word { 4 } else { 8 });
-                     h2 <= lo || l2 >= hi
-@@ -1467,7 +1475,8 @@ fn eliminate_repeated_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n
-                 offset,
-                 is_word,
-             } => {
--                if let Some(&prev) = cached.get(&(offset, is_word)) {
-+                let key = (offset as i64 + disps[i], is_word);
-+                if let Some(&prev) = cached.get(&key) {
-                     if prev == reg {
-                         kinds[i] = LineKind::Nop;
-                         changed = true;
-@@ -1496,7 +1505,7 @@ fn eliminate_repeated_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n
-                 // The load (or its mov replacement) writes `reg`: any entry
-                 // cached under it is stale. Then record the new mapping.
-                 cached.retain(|_, &mut r| r != reg);
--                cached.insert((offset, is_word), reg);
-+                cached.insert(key, reg);
-                 continue;
-             }
-             _ => {}
-@@ -1767,6 +1776,12 @@ fn forward_fp_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize)
- }
- 
- fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-+    // Pair store→load by FRAME BYTE (raw offset + sp displacement): the
-+    // outgoing-args staging window reuses raw offsets for different bytes
-+    // (see sp_displacements).
-+    let Some(disps) = sp_displacements(lines, kinds, n) else {
-+        return false;
-+    };
-     let mut changed = false;
-     let mut i = 0;
-     while i + 1 < n {
-@@ -1787,7 +1802,9 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
-                         reg: load_reg,
-                         offset: load_off,
-                         is_word: load_word,
--                    } if store_off == load_off && store_word == load_word => {
-+                    } if store_off as i64 + disps[i] == load_off as i64 + disps[j]
-+                        && store_word == load_word =>
-+                    {
-                         if store_reg == load_reg {
-                             // Same register: eliminate the load entirely
-                             kinds[j] = LineKind::Nop;
-@@ -1811,7 +1828,9 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
-                     LineKind::LoadswSp {
-                         reg: load_reg,
-                         offset: load_off,
--                    } if store_off == load_off && store_word => {
-+                    } if store_off as i64 + disps[i] == load_off as i64 + disps[j]
-+                        && store_word =>
-+                    {
-                         lines[j] =
-                             format!("    sxtw {}, {}", xreg_name(load_reg), wreg_name(store_reg));
-                         kinds[j] = LineKind::Sxtw {
-@@ -2601,7 +2620,72 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
-     changed
- }
- 
-+/// Entry-sp-relative displacement of sp at each line index (`disps[i]` is the
-+/// displacement in effect FOR line i's own accesses). `None` when the region
-+/// contains an sp write that cannot be modelled statically (register-indirect
-+/// adjustment) — slot-offset passes must then stay conservative.
-+///
-+/// Call argument staging (`sub sp, sp, #N` / `add sp, sp, #N` around the
-+/// outgoing-args area) and writeback push/pop pairs (`stp x9, x10,
-+/// [sp, #-16]!` ... `ldp x9, x10, [sp], #16`) move sp mid-function. Passes
-+/// that match slot offsets textually ("same [sp, #off]") would otherwise pair
-+/// accesses that resolve to DIFFERENT addresses across such an adjustment —
-+/// the aggregate_dse_soundness / alu_peepholes >8-argument call staging wrote
-+/// argument spills to frame slots and then read them through the shifted sp
-+/// while a deleted "duplicate" store had actually targeted a different byte.
-+/// Displacement resets at `.cfi_startproc` (every emitted function prologue).
-+fn sp_displacements(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Vec<i64>> {
-+    let mut disps = vec![0i64; n];
-+    let mut disp: i64 = 0;
-+    for i in 0..n {
-+        let t = lines[i].trim();
-+        if kinds[i] == LineKind::Nop {
-+            // Eliminated lines do not execute in the final program: their sp
-+            // effect is gone (their text lingers for the printer's skip).
-+            disps[i] = disp;
-+            continue;
-+        }
-+        if kinds[i] == LineKind::Directive && t.contains(".cfi_startproc") {
-+            disp = 0;
-+        }
-+        disps[i] = disp;
-+        // Apply line i's sp effect for subsequent lines.
-+        if let Some(body) = t.strip_prefix("stp ").or_else(|| t.strip_prefix("ldp ")) {
-+            if let Some(bracket) = body.find('[') {
-+                let addr = &body[bracket..];
-+                if addr.starts_with("[sp") {
-+                    if let Some(rest) = addr.strip_prefix("[sp, #") {
-+                        if let Some(stripped) = rest.strip_suffix("]!") {
-+                            // Pre-index writeback: sp += offset before access.
-+                            let off: i64 = stripped.parse().ok()?;
-+                            disp += -off;
-+                            continue;
-+                        }
-+                    }
-+                    if let Some(rest) = addr.strip_prefix("[sp], #") {
-+                        // Post-index writeback: sp += offset after access.
-+                        let end = rest.find(']')?;
-+                        let off: i64 = rest[..end].parse().ok()?;
-+                        disp -= off;
-+                        continue;
-+                    }
-+                }
-+            }
-+        }
-+        if (t.starts_with("sub ") || t.starts_with("add ")) && t.contains("sp, sp, #") {
-+            let off: i64 = t.rsplit('#').next()?.parse().ok()?;
-+            if t.starts_with("sub ") {
-+                disp += off;
-+            } else {
-+                disp -= off;
-+            }
-+        }
-+    }
-+    Some(disps)
-+}
-+
- fn gdse_one_function(lines: &[String], kinds: &mut [LineKind], start: usize, end: usize) -> bool {
-+    let mut changed = false;
-     // Safety check: if any instruction takes the address of sp (e.g., `add xN, sp, #off`),
-     // stack slots could be accessed through pointers, so we must not eliminate any stores.
-     // This is conservative but sound — it prevents miscompilation when arrays or structs
-@@ -2631,25 +2715,47 @@ fn gdse_one_function(lines: &[String], kinds: &mut [LineKind], start: usize, end
-         }
-     }
- 
--    // Phase 1: Collect all (offset, size) byte ranges that are loaded from.
-+    // Offsets are resolved through the shared sp-displacement model: a
-+    // `[sp, #N]` access inside an `sub sp` staging window reads frame byte
-+    // N + disp, not N (see sp_displacements for the miscompile history).
-+    let Some(disps) = sp_displacements(lines, kinds, end) else {
-+        return false;
-+    };
-+
-+    // Phase 1: Collect all (offset, size) byte ranges that are loaded from,
-+    // in ENTRY-sp-relative frame coordinates (raw offset + current sp disp).
-     // We must use byte-range overlap (not exact offset match) because a wide
-     // store (e.g. `str x` at offset 16, 8 bytes) can be partially read by a
-     // narrower load at a different offset (e.g. `ldr w` at offset 20, 4 bytes).
-     let mut loaded_ranges: Vec<(i32, i32)> = Vec::new(); // (offset, size)
-     for i in start..end {
-+        if kinds[i] == LineKind::Nop {
-+            continue;
-+        }
-+        let sp_disp = disps[i];
-+        let mut push_load = |off: i64, size: i32, out: &mut Vec<(i32, i32)>| {
-+            if let Ok(off) = i32::try_from(off) {
-+                out.push((off, size));
-+            }
-+        };
-         match kinds[i] {
-             LineKind::LoadSp {
-                 offset, is_word, ..
-             } => {
-                 let size = if is_word { 4 } else { 8 };
--                loaded_ranges.push((offset, size));
-+                push_load(offset as i64 + sp_disp, size, &mut loaded_ranges);
-             }
-             LineKind::LoadswSp { offset, .. } => {
--                loaded_ranges.push((offset, 4));
-+                push_load(offset as i64 + sp_disp, 4, &mut loaded_ranges);
-             }
-             _ => {
-                 // Check for loads in Other instructions (e.g., ldp, ldrb, ldrh, etc.)
-                 let trimmed = lines[i].trim();
-+                // Writeback forms move sp themselves (already tracked above);
-+                // their raw offset is pre/post-adjustment — skip classification.
-+                if trimmed.contains("]!") || trimmed.contains("], #") {
-+                    continue;
-+                }
-                 let load_size = if trimmed.starts_with("ldp ") {
-                     Some(16) // ldp loads two 8-byte registers
-                 } else if trimmed.starts_with("ldr x") || trimmed.starts_with("ldur x") {
-@@ -2671,7 +2777,7 @@ fn gdse_one_function(lines: &[String], kinds: &mut [LineKind], start: usize, end
-                 if let Some(sz) = load_size {
-                     if trimmed.contains("[sp") {
-                         if let Some(off) = extract_sp_offset(trimmed) {
--                            loaded_ranges.push((off, sz));
-+                            push_load(off as i64 + sp_disp, sz, &mut loaded_ranges);
-                         }
-                     }
-                 }
-@@ -2679,21 +2785,27 @@ fn gdse_one_function(lines: &[String], kinds: &mut [LineKind], start: usize, end
-         }
-     }
- 
--    // Phase 2: Remove stores whose byte range does not overlap any load range
--    let mut changed = false;
-+    // Phase 2: Remove stores whose byte range does not overlap any load range.
-+    // Stores use the same displacement-adjusted coordinates as the loads.
-     for i in start..end {
-+        if kinds[i] == LineKind::Nop {
-+            continue;
-+        }
-+        let sp_disp = disps[i];
-         if let LineKind::StoreSp {
-             offset, is_word, ..
-         } = kinds[i]
-         {
-             let store_size = if is_word { 4 } else { 8 };
--            let overlaps_any_load = loaded_ranges.iter().any(|&(load_off, load_sz)| {
--                // Two ranges [a, a+as) and [b, b+bs) overlap iff a < b+bs && b < a+as
--                offset < load_off + load_sz && load_off < offset + store_size
--            });
--            if !overlaps_any_load {
--                kinds[i] = LineKind::Nop;
--                changed = true;
-+            if let Ok(store_off) = i32::try_from(offset as i64 + sp_disp) {
-+                let overlaps_any_load = loaded_ranges.iter().any(|&(load_off, load_sz)| {
-+                    // Two ranges [a, a+as) and [b, b+bs) overlap iff a < b+bs && b < a+as
-+                    store_off < load_off + load_sz && load_off < store_off + store_size
-+                });
-+                if !overlaps_any_load {
-+                    kinds[i] = LineKind::Nop;
-+                    changed = true;
-+                }
-             }
-         }
-     }
-@@ -3158,6 +3270,15 @@ fn eliminate_overwritten_stores(lines: &[String], kinds: &mut [LineKind], n: usi
-     if std::env::var("CCC_NO_STORE_DSE").is_ok() {
-         return false;
-     }
-+    // "Same slot" means the same FRAME BYTE, not the same textual offset: the
-+    // outgoing-args staging window (`sub sp, sp, #N` ... `add sp, sp, #N`)
-+    // reuses small offsets for call arguments, and a write there must never
-+    // retire an entry-frame store at the same raw offset (see
-+    // sp_displacements for the miscompile history). Unmodellable sp writes
-+    // disable the pass for the whole file.
-+    let Some(disps) = sp_displacements(lines, kinds, n) else {
-+        return false;
-+    };
-     let mut changed = false;
-     for i in 0..n {
-         let LineKind::StoreSp {
-@@ -3169,6 +3290,7 @@ fn eliminate_overwritten_stores(lines: &[String], kinds: &mut [LineKind], n: usi
-             continue;
-         };
-         let size_i = if word_i { 4u32 } else { 8 };
-+        let eff_i = off_i as i64 + disps[i];
-         let mut j = i + 1;
-         let mut steps = 0;
-         while j < n && steps < 40 {
-@@ -3187,12 +3309,13 @@ fn eliminate_overwritten_stores(lines: &[String], kinds: &mut [LineKind], n: usi
-                     ..
-                 } => {
-                     let size_j = if word_j { 4u32 } else { 8 };
--                    if off_j == off_i && size_j >= size_i {
-+                    let eff_j = off_j as i64 + disps[j];
-+                    if eff_j == eff_i && size_j >= size_i {
-                         // Fully overwritten with no intervening read.
-                         kinds[i] = LineKind::Nop;
-                         changed = true;
-                     }
--                    if off_j < off_i + size_i as i32 && off_i < off_j + size_j as i32 {
-+                    if eff_j < eff_i + size_i as i64 && eff_i < eff_j + size_j as i64 {
-                         break; // overlapping store: stop either way
-                     }
-                     j += 1;
-@@ -3204,14 +3327,16 @@ fn eliminate_overwritten_stores(lines: &[String], kinds: &mut [LineKind], n: usi
-                     ..
-                 } => {
-                     let size_j = if word_j { 4u32 } else { 8 };
--                    if off_j < off_i + size_i as i32 && off_i < off_j + size_j as i32 {
-+                    let eff_j = off_j as i64 + disps[j];
-+                    if eff_j < eff_i + size_i as i64 && eff_i < eff_j + size_j as i64 {
-                         break; // reads our slot (or overlaps it)
-                     }
-                     j += 1;
-                     continue;
-                 }
-                 LineKind::LoadswSp { offset: off_j, .. } => {
--                    if off_j < off_i + size_i as i32 && off_i < off_j + 4 {
-+                    let eff_j = off_j as i64 + disps[j];
-+                    if eff_j < eff_i + size_i as i64 && eff_i < eff_j + 4 {
-                         break;
-                     }
-                     j += 1;
-@@ -3579,8 +3704,11 @@ mod tests {
-     fn test_adjacent_store_load_same_reg() {
-         let input = "    str x0, [sp, #16]\n    ldr x0, [sp, #16]\n    ret\n";
-         let result = peephole_optimize(input.to_string());
--        assert!(result.contains("str x0, [sp, #16]"));
-+        // The load is forwarded to the store's register; with the sole reader
-+        // gone, GDSE additionally retires the now-dead store (nothing else in
-+        // the frame reads slot 16). Assert the observable forwarding result.
-         assert!(!result.contains("ldr x0, [sp, #16]"));
-+        assert!(result.contains("ret"));
-     }
- 
-     #[test]
--- 
-2.47.3
-
-
-From d1039d74be79d02e2eb10b134bb060f707201d88 Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Fri, 28 Aug 2026 16:39:32 +0000
-Subject: [PATCH 4/8] vectorize: require canonical unit-stride GEP offsets
- (struct_stride fix)
-
-gep_uses_iv accepted ANY offset that merely depended on the IV, but the
-reduction transform models accesses as invariant_base + iv*elem_size,
-re-scales the offset chain by vec_width and (byte-IV path) relatches the
-IV in bytes. For struct streams (arr[i].i, byte stride 12) that model is
-wrong three ways at once:
-
-- find_reduction_byte_iv's Shl arm matched shl(mul(sext(i),12),2) as a
-  'byte IV' (misidentified stride-48 IV),
-- the vector body loaded elem_size*vec_width CONTIGUOUS bytes while the
-  elements actually span stride*vec_width (n=4: 1+2+3+4=10 instead of
-  22; q-register gather over adjacent struct fields),
-- the synthesized scalar remainder loop discarded the original offset
-  expression and re-addressed with i_rem*elem_size (i*4 instead of i*12;
-  n=3: 1+2+3=6 instead of 12),
-- with a dynamic limit the byte-IV bound rewrite produced
-  udiv(n,4)*48 against an IV still stepping +1: the vector loop ran
-  n/4*48 iterations for n>=4 (out-of-bounds reads; latent, the n=3
-  regression only showed the remainder path).
-
-Fix: gep_uses_iv takes the element size and now requires the canonical
-unit-stride shape iv*elem_size / (cast iv)*elem_size /
-(cast iv)<<log2(elem_size) via a strict iterative matcher
-(offset_is_canonical_unit_stride + scaled_operand_is_iv); raw-iv
-offsets, iv_derived shapes (iv+1), narrowing casts and any other
-derivation fail closed to the scalar loop. value_depends_on_iv (now
-unused) is removed. Thread elem_size through all 10 call sites
-(reduction sum/cast/dot, secondary accumulators, map dst/src - map
-already had the byte-IV gate, now gep_uses_iv agrees).
-
-aggregate_dse_soundness (struct_array_sum) passes; -O0..-O3 correct;
-ARM regression 359/44/75.
----
- src/passes/vectorize.rs | 319 ++++++++++++++++++++++++++++++----------
- 1 file changed, 238 insertions(+), 81 deletions(-)
-
-diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index ec8609bd..ef42e073 100644
---- a/src/passes/vectorize.rs
-+++ b/src/passes/vectorize.rs
-@@ -1873,7 +1873,8 @@ fn analyze_reduction_pattern(
-             }
-             false
-         };
--        if !gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived) && !marches_one_element()
-+        if !gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived, 4)
-+            && !marches_one_element()
-         {
-             if debug {
-                 eprintln!("[VEC-RED]   Max-reduction array GEP doesn't use IV");
-@@ -2101,10 +2102,17 @@ fn analyze_reduction_pattern(
-     let mut primary_loads: Vec<Value> = Vec::new();
-     let mut pattern = match added_inst {
-         // Simple sum pattern: sum += arr[i]
--        Instruction::Load { ptr, .. } => {
-+        Instruction::Load { ptr, ty, .. } => {
-             let array_gep = *ptr;
--            // Verify GEP uses IV
--            if !gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived) {
-+            // Verify GEP uses IV (canonical unit stride)
-+            if !gep_uses_iv(
-+                func,
-+                &loop_info.body,
-+                array_gep,
-+                iv,
-+                &iv_derived,
-+                reduction_element_size(*ty).unwrap_or(0),
-+            ) {
-                 if debug {
-                     eprintln!("[VEC-RED]   Array GEP doesn't use IV");
-                 }
-@@ -2186,8 +2194,15 @@ fn analyze_reduction_pattern(
-                 }
- 
-                 let array_gep = *ptr;
--                // Verify GEP uses IV
--                if !gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived) {
-+                // Verify GEP uses IV (canonical unit stride)
-+                if !gep_uses_iv(
-+                    func,
-+                    &loop_info.body,
-+                    array_gep,
-+                    iv,
-+                    &iv_derived,
-+                    reduction_element_size(*load_ty).unwrap_or(0),
-+                ) {
-                     if debug {
-                         eprintln!("[VEC-RED]   Array GEP doesn't use IV");
-                     }
-@@ -2334,10 +2349,22 @@ fn analyze_reduction_pattern(
-                 (element_type, element_type)
-             };
- 
--            // Verify both GEPs use IV
--            if !gep_uses_iv(func, &loop_info.body, array_a_gep, iv, &iv_derived)
--                || !gep_uses_iv(func, &loop_info.body, array_b_gep, iv, &iv_derived)
--            {
-+            // Verify both GEPs use IV (canonical unit stride)
-+            if !gep_uses_iv(
-+                func,
-+                &loop_info.body,
-+                array_a_gep,
-+                iv,
-+                &iv_derived,
-+                reduction_element_size(element_type).unwrap_or(0),
-+            ) || !gep_uses_iv(
-+                func,
-+                &loop_info.body,
-+                array_b_gep,
-+                iv,
-+                &iv_derived,
-+                reduction_element_size(element_type).unwrap_or(0),
-+            ) {
-                 if debug {
-                     eprintln!("[VEC-RED]   Array GEPs don't use IV");
-                 }
-@@ -2610,7 +2637,14 @@ fn analyze_secondary_accumulator(
-                     set_reject("second accumulator element type mismatch");
-                     return None;
-                 }
--                if !gep_uses_iv(func, &loop_info.body, *ptr, primary.iv, &iv_derived) {
-+                if !gep_uses_iv(
-+                    func,
-+                    &loop_info.body,
-+                    *ptr,
-+                    primary.iv,
-+                    &iv_derived,
-+                    reduction_element_size(primary.element_type).unwrap_or(0),
-+                ) {
-                     set_reject("second accumulator array index not based on IV");
-                     return None;
-                 }
-@@ -2641,9 +2675,21 @@ fn analyze_secondary_accumulator(
-                     set_reject("second dot product operands not loads");
-                     return None;
-                 };
--                if !gep_uses_iv(func, &loop_info.body, *ap, primary.iv, &iv_derived)
--                    || !gep_uses_iv(func, &loop_info.body, *bp, primary.iv, &iv_derived)
--                {
-+                if !gep_uses_iv(
-+                    func,
-+                    &loop_info.body,
-+                    *ap,
-+                    primary.iv,
-+                    &iv_derived,
-+                    reduction_element_size(primary.element_type).unwrap_or(0),
-+                ) || !gep_uses_iv(
-+                    func,
-+                    &loop_info.body,
-+                    *bp,
-+                    primary.iv,
-+                    &iv_derived,
-+                    reduction_element_size(primary.element_type).unwrap_or(0),
-+                ) {
-                     set_reject("second dot product array index not based on IV");
-                     return None;
-                 }
-@@ -3657,13 +3703,6 @@ fn analyze_map_pattern(
-         return None;
-     }
- 
--    // The destination GEP must be indexed by the IV.
--    if !gep_uses_iv(func, &loop_info.body, dst_gep, iv, &iv_derived) {
--        if debug {
--            eprintln!("[VEC-MAP]   GEPs don't use IV");
--        }
--        return None;
--    }
-     let elem_size = match elem_ty {
-         IrType::F64 | IrType::I64 | IrType::U64 => 8,
-         IrType::F32 | IrType::I32 | IrType::U32 => 4,
-@@ -3672,13 +3711,20 @@ fn analyze_map_pattern(
-             return None;
-         }
-     };
-+    // The destination GEP must be indexed by the IV (canonical unit stride).
-+    if !gep_uses_iv(func, &loop_info.body, dst_gep, iv, &iv_derived, elem_size) {
-+        if debug {
-+            eprintln!("[VEC-MAP]   GEPs don't use IV");
-+        }
-+        return None;
-+    }
-     if find_reduction_byte_iv(func, &loop_info.body, dst_gep, elem_size).is_none() {
-         set_reject("map access is not a contiguous element-size stride");
-         return None;
-     }
-     // Every source stream must be IV-indexed and contiguous as well.
-     for &(_, _, src_gep, _) in &load_infos {
--        if !gep_uses_iv(func, &loop_info.body, src_gep, iv, &iv_derived)
-+        if !gep_uses_iv(func, &loop_info.body, src_gep, iv, &iv_derived, elem_size)
-             || find_reduction_byte_iv(func, &loop_info.body, src_gep, elem_size).is_none()
-         {
-             set_reject("map source access is not a contiguous element-size stride");
-@@ -5633,6 +5679,7 @@ fn gep_uses_iv(
-     gep: Value,
-     iv: Value,
-     iv_derived: &FxHashSet<Value>,
-+    elem_size: u32,
- ) -> bool {
-     // Find the GEP instruction in the loop
-     for &block_idx in loop_blocks {
-@@ -5658,17 +5705,177 @@ fn gep_uses_iv(
-                     if !gep_base_is_loop_invariant(func, loop_blocks, *base, iv, iv_derived) {
-                         return false;
-                     }
--                    // Check if offset uses IV or IV-derived value
--                    if let Operand::Value(v) = offset {
--                        if v == &iv || iv_derived.contains(v) {
--                            return true;
--                        }
--                        // Also check if offset is computed from IV (e.g., iv * 8)
--                        // Trace back through multiply/add operations
--                        return value_depends_on_iv(func, loop_blocks, *v, iv, iv_derived);
--                    }
-+                    // The packed VecLoad consumes elem_size*vec_width
-+                    // CONTIGUOUS bytes per vector iteration, and the transform
-+                    // re-scales the whole offset chain by vec_width. That is
-+                    // only semantics-preserving when the scalar byte offset is
-+                    // exactly `iv * elem_size` (unit-stride stream of
-+                    // elements). Struct fields (`s[i].f`, byte stride 12) or
-+                    // any other affine-but-non-contiguous shape would load
-+                    // adjacent fields as if they were consecutive elements
-+                    // (struct_array_sum miscompile) — and the byte-IV bound
-+                    // rewrite over/under-covers the array. Require the
-+                    // canonical shape; anything else stays scalar.
-+                    return match offset {
-+                        Operand::Value(v) => offset_is_canonical_unit_stride(
-+                            func, *v, iv, iv_derived, elem_size,
-+                        ),
-+                        _ => false,
-+                    };
-+                }
-+            }
-+        }
-+    }
-+    false
-+}
-+
-+/// True when `v` is exactly the induction variable scaled by the element
-+/// size: `iv`, `sext/zext/copy(iv)`, `(cast(iv)) * elem_size`,
-+/// `elem_size * (cast(iv))`, or `(cast(iv)) << log2(elem_size)`.
-+///
-+/// GEP offsets in this IR are BYTE offsets (the remainder loop lowers
-+/// `a[i]` to `GEP(base, i*elem_size)`), so offset == raw iv means a
-+/// one-byte stride, which is only the canonical shape for elem_size == 1
-+/// (never vectorizable) — it is rejected here.
-+///
-+/// Every accepted form is closed under the two rewrites the transforms
-+/// perform: the vec_width scaling (`offset * w` covers w consecutive
-+/// elements) and the byte-IV relatch (the offset equals the byte-stepping
-+/// IV). Both require stride == elem_size exactly; this is the single gate
-+/// that keeps the contiguous-stream model honest.
-+fn offset_is_canonical_unit_stride(
-+    func: &IrFunction,
-+    v: Value,
-+    iv: Value,
-+    iv_derived: &FxHashSet<Value>,
-+    elem_size: u32,
-+) -> bool {
-+    if elem_size < 2 || !elem_size.is_power_of_two() {
-+        return false;
-+    }
-+    // Small iterative worklist instead of recursion: the chains are short
-+    // (cast/copy around a mul/shl), 8 hops is far beyond any real shape.
-+    let mut cur = v;
-+    for _ in 0..8 {
-+        if cur == iv || iv_derived.contains(&cur) {
-+            // A raw iv/cast-of-iv offset (no mul/shl) is a one-byte stride,
-+            // which is not the canonical elem_size shape for elem_size >= 2.
-+            return false;
-+        }
-+        let mut def: Option<&Instruction> = None;
-+        for block in &func.blocks {
-+            let found = block.instructions.iter().find(|i| i.dest() == Some(cur));
-+            if found.is_some() {
-+                def = found;
-+                break;
-+            }
-+        }
-+        let inst = match def {
-+            Some(i) => i,
-+            None => return false,
-+        };
-+        match inst {
-+            Instruction::Copy {
-+                src: Operand::Value(s),
-+                ..
-+            } => {
-+                cur = *s;
-+            }
-+            Instruction::Cast {
-+                src: Operand::Value(s),
-+                from_ty,
-+                to_ty,
-+                ..
-+            } => {
-+                // Accept only widening casts (sext/zext of the same value);
-+                // narrowing casts change the value — fail closed.
-+                if !(from_ty.is_integer() && to_ty.is_integer() && to_ty.size() >= from_ty.size())
-+                {
-+                    return false;
-+                }
-+                cur = *s;
-+            }
-+            Instruction::BinOp {
-+                op: IrBinOp::Mul,
-+                lhs: Operand::Value(a),
-+                rhs: Operand::Const(c),
-+                ..
-+            }
-+            | Instruction::BinOp {
-+                op: IrBinOp::Mul,
-+                lhs: Operand::Const(c),
-+                rhs: Operand::Value(a),
-+                ..
-+            } => {
-+                return c.to_i64() == Some(elem_size as i64)
-+                    && scaled_operand_is_iv(func, *a, iv, iv_derived);
-+            }
-+            Instruction::BinOp {
-+                op: IrBinOp::Shl,
-+                lhs: Operand::Value(a),
-+                rhs: Operand::Const(c),
-+                ..
-+            } => {
-+                return c.to_i64() == Some(elem_size.trailing_zeros() as i64)
-+                    && scaled_operand_is_iv(func, *a, iv, iv_derived);
-+            }
-+            _ => return false,
-+        }
-+    }
-+    false
-+}
-+
-+/// True when `v` is the IV or reaches it through widening casts / copies
-+/// only. Used as the scaled operand of the canonical `iv * elem_size` /
-+/// `iv << log2(elem_size)` offset forms; any other derivation fails closed.
-+fn scaled_operand_is_iv(
-+    func: &IrFunction,
-+    v: Value,
-+    iv: Value,
-+    iv_derived: &FxHashSet<Value>,
-+) -> bool {
-+    let mut cur = v;
-+    for _ in 0..8 {
-+        if cur == iv {
-+            return true;
-+        }
-+        // iv_derived holds IV-plus-constant shapes (iv+1 etc.), which are NOT
-+        // the canonical operand — only exact cast chains qualify beyond the
-+        // IV itself.
-+        let mut def: Option<&Instruction> = None;
-+        for block in &func.blocks {
-+            let found = block.instructions.iter().find(|i| i.dest() == Some(cur));
-+            if found.is_some() {
-+                def = found;
-+                break;
-+            }
-+        }
-+        let inst = match def {
-+            Some(i) => i,
-+            None => return false,
-+        };
-+        match inst {
-+            Instruction::Copy {
-+                src: Operand::Value(s),
-+                ..
-+            } => {
-+                cur = *s;
-+            }
-+            Instruction::Cast {
-+                src: Operand::Value(s),
-+                from_ty,
-+                to_ty,
-+                ..
-+            } => {
-+                // Accept only widening casts (sext/zext of the same value);
-+                // narrowing casts change the value — fail closed.
-+                if !(from_ty.is_integer() && to_ty.is_integer() && to_ty.size() >= from_ty.size())
-+                {
-+                    return false;
-                 }
-+                cur = *s;
-             }
-+            _ => return false,
-         }
-     }
-     false
-@@ -5712,56 +5919,6 @@ fn gep_base_is_loop_invariant(
-     true
- }
- 
--/// Check if a value depends on the IV (transitively through operations)
--fn value_depends_on_iv(
--    func: &IrFunction,
--    loop_blocks: &FxHashSet<usize>,
--    val: Value,
--    iv: Value,
--    iv_derived: &FxHashSet<Value>,
--) -> bool {
--    if val == iv || iv_derived.contains(&val) {
--        return true;
--    }
--
--    // Search for the instruction that produces this value
--    for &block_idx in loop_blocks {
--        let block = &func.blocks[block_idx];
--        for inst in &block.instructions {
--            if inst.dest() == Some(val) {
--                // Check if this instruction uses IV-derived values
--                match inst {
--                    Instruction::BinOp { lhs, rhs, .. } => {
--                        let lhs_uses_iv = if let Operand::Value(v) = lhs {
--                            v == &iv || iv_derived.contains(v)
--                        } else {
--                            false
--                        };
--                        let rhs_uses_iv = if let Operand::Value(v) = rhs {
--                            v == &iv || iv_derived.contains(v)
--                        } else {
--                            false
--                        };
--                        return lhs_uses_iv || rhs_uses_iv;
--                    }
--                    Instruction::Cast { src, .. } => {
--                        if let Operand::Value(v) = src {
--                            return v == &iv || iv_derived.contains(v);
--                        }
--                    }
--                    Instruction::Copy { dest: _, src } => {
--                        if let Operand::Value(v) = src {
--                            return v == &iv || iv_derived.contains(v);
--                        }
--                    }
--                    _ => {}
--                }
--            }
--        }
--    }
--    false
--}
--
- /// Find exit block (first successor outside the loop).
- fn find_exit(func: &IrFunction, loop_info: &loop_analysis::NaturalLoop) -> Option<usize> {
-     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
--- 
-2.47.3
-
-
-From ff1c06049c1fa2b3b28bc0b057ffd1453f4b43f8 Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Fri, 28 Aug 2026 16:54:57 +0000
-Subject: [PATCH 5/8] aarch64: complete NEON vector-intrinsic coverage (i64
- reductions were silently wrong)
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-emit_intrinsic_arm silently no-op'd any Vec intrinsic without a NEON
-arm. Three consequences, all observed:
-
-- VecLoadI64x2 lowered to NOTHING: the i64 reduction loop accumulated
-  v17 uninitialized (vectorize_sum_i64* family: rc=1, wrong sums).
-- VecMulI64x2 emitted 'mul v.2d', which does not exist in AArch64 NEON
-  (assembler error). Expand per 64-bit lane through GPRs (umov/mul/mov
-  v.d[i]); wrapping i64 multiply is exactly 'mul x,x,x'. Scratch is
-  confined to x0/x9; q0/q1 operands stay intact per lane. Differential
-  wraparound stress (2^62-scale products) is GCC-exact.
-- The 128-bit map/stencil forms (VecSub/Div/Sqrt F64x2|F32x4,
-  VecBroadcastI64x2, VecZeroF32x4, VecHorizontalAddF32x4, VecStore/
-  VecLoadI64x2) had no lowering either — one transform-match away from
-  the same silent-drop class. All implemented (fsub/fdiv/fsqrt .2d/.4s,
-  dup .2d from x0, eor zero, addv s0 horizontal).
-
-Every remaining Vec op (AVX2/x8 shapes and the widening adds) now hits
-an explicit unimplemented! naming the op — an x86-only shape leaking
-past the vectorizer target gate is a loud ICE, never wrong code.
-
-ARM regression 368/37/75 (was 360/45/75); lib tests 1270/0/6.
----
- src/backend/arm/codegen/intrinsics.rs | 158 +++++++++++++++++++++++---
- 1 file changed, 140 insertions(+), 18 deletions(-)
-
-diff --git a/src/backend/arm/codegen/intrinsics.rs b/src/backend/arm/codegen/intrinsics.rs
-index 9ac8abea..eb6c83e7 100644
---- a/src/backend/arm/codegen/intrinsics.rs
-+++ b/src/backend/arm/codegen/intrinsics.rs
-@@ -569,21 +569,55 @@ impl ArmCodegen {
-                 if let Some(d) = dest {
-                     let a = self.load_vector_value_128(&args[0], "q0");
-                     let b = self.load_vector_value_128(&args[1], "q1");
--                    let mnemonic = if *op == IntrinsicOp::VecAddI64x2 {
--                        "add"
--                    } else {
--                        "mul"
--                    };
--                    if let Some(name) = self.assigned_vector_reg(d.0) {
--                        self.state.vector_values.insert(d.0);
--                        self.state.emit_fmt(format_args!(
--                            "    {} {}.2d, {}.2d, {}.2d",
--                            mnemonic, name, a, b
--                        ));
-+                    if *op == IntrinsicOp::VecAddI64x2 {
-+                        if let Some(name) = self.assigned_vector_reg(d.0) {
-+                            self.state.vector_values.insert(d.0);
-+                            self.state.emit_fmt(format_args!(
-+                                "    add {}.2d, {}.2d, {}.2d",
-+                                name, a, b
-+                            ));
-+                        } else {
-+                            self.state
-+                                .emit_fmt(format_args!("    add v0.2d, {}.2d, {}.2d", a, b));
-+                            self.store_vector_value_128(d, "q0");
-+                        }
-                     } else {
--                        self.state
--                            .emit_fmt(format_args!("    {} v0.2d, {}.2d, {}.2d", mnemonic, a, b));
--                        self.store_vector_value_128(d, "q0");
-+                        // NEON has no 64-bit integer MUL (armasm rejects
-+                        // `mul v.2d`). Expand per 64-bit lane into GPRs:
-+                        // wrapping i64 multiply is exactly `mul x, x, x`.
-+                        // Scratch is confined to x0/x9; q0 (a) and q1 (b)
-+                        // stay intact until each lane's product is written.
-+                        let lane = |rd: &str, idx: u32| -> String {
-+                            format!("    mov {}.d[{}], x0", rd, idx)
-+                        };
-+                        let compute = |idx: u32| -> [String; 3] {
-+                            [
-+                                format!("    umov x0, {}.d[{}]", a, idx),
-+                                format!("    umov x9, {}.d[{}]", b, idx),
-+                                "    mul x0, x0, x9".to_string(),
-+                            ]
-+                        };
-+                        if let Some(name) = self.assigned_vector_reg(d.0) {
-+                            self.state.vector_values.insert(d.0);
-+                            for ins in compute(0) {
-+                                self.state.emit(&ins);
-+                            }
-+                            self.state.emit(lane(&name, 0).as_str());
-+                            for ins in compute(1) {
-+                                self.state.emit(&ins);
-+                            }
-+                            self.state.emit(lane(&name, 1).as_str());
-+                        } else {
-+                            for ins in compute(0) {
-+                                self.state.emit(&ins);
-+                            }
-+                            self.state.emit(lane("v0", 0).as_str());
-+                            for ins in compute(1) {
-+                                self.state.emit(&ins);
-+                            }
-+                            self.state.emit(lane("v0", 1).as_str());
-+                            self.store_vector_value_128(d, "q0");
-+                        }
-                     }
-                 }
-             }
-@@ -673,7 +707,10 @@ impl ArmCodegen {
- 
-             // Register-based vector operations (NEON 128-bit).
-             // Two-wide F64 (2×.2d) and four-wide I32 (4×.4s) for reductions.
--            IntrinsicOp::VecLoadF64x2 | IntrinsicOp::VecLoadF32x4 | IntrinsicOp::VecLoadI32x4 => {
-+            IntrinsicOp::VecLoadF64x2
-+            | IntrinsicOp::VecLoadF32x4
-+            | IntrinsicOp::VecLoadI32x4
-+            | IntrinsicOp::VecLoadI64x2 => {
-                 if let Some(d) = dest {
-                     let addr = self.vec_addr_from_args(&args[0], args.get(1));
-                     if let Some(name) = self.assigned_vector_reg(d.0) {
-@@ -689,7 +726,9 @@ impl ArmCodegen {
-                 }
-             }
- 
--            IntrinsicOp::VecZeroF64x2 | IntrinsicOp::VecZeroI32x4 => {
-+            IntrinsicOp::VecZeroF64x2
-+            | IntrinsicOp::VecZeroF32x4
-+            | IntrinsicOp::VecZeroI32x4 => {
-                 if let Some(d) = dest {
-                     if let Some(name) = self.assigned_vector_reg(d.0) {
-                         self.state.vector_values.insert(d.0);
-@@ -708,6 +747,10 @@ impl ArmCodegen {
-             | IntrinsicOp::VecMulF32x4
-             | IntrinsicOp::VecAddI32x4
-             | IntrinsicOp::VecSmaxI32x4
-+            | IntrinsicOp::VecSubF64x2
-+            | IntrinsicOp::VecDivF64x2
-+            | IntrinsicOp::VecSubF32x4
-+            | IntrinsicOp::VecDivF32x4
-             | IntrinsicOp::VecMulI32x4 => {
-                 if let Some(d) = dest {
-                     let a = self.load_vector_value_128(&args[0], "q0");
-@@ -715,8 +758,12 @@ impl ArmCodegen {
-                     let (mnemonic, suffix) = match op {
-                         IntrinsicOp::VecAddF64x2 => ("fadd", "2d"),
-                         IntrinsicOp::VecMulF64x2 => ("fmul", "2d"),
-+                        IntrinsicOp::VecSubF64x2 => ("fsub", "2d"),
-+                        IntrinsicOp::VecDivF64x2 => ("fdiv", "2d"),
-                         IntrinsicOp::VecAddF32x4 => ("fadd", "4s"),
-                         IntrinsicOp::VecMulF32x4 => ("fmul", "4s"),
-+                        IntrinsicOp::VecSubF32x4 => ("fsub", "4s"),
-+                        IntrinsicOp::VecDivF32x4 => ("fdiv", "4s"),
-                         IntrinsicOp::VecAddI32x4 => ("add", "4s"),
-                         IntrinsicOp::VecSmaxI32x4 => ("smax", "4s"),
-                         _ => ("mul", "4s"),
-@@ -774,9 +821,45 @@ impl ArmCodegen {
-                 }
-             }
- 
-+            IntrinsicOp::VecBroadcastI64x2 => {
-+                if let Some(d) = dest {
-+                    self.operand_to_x0(&args[0]);
-+                    if let Some(name) = self.assigned_vector_reg(d.0) {
-+                        self.state.vector_values.insert(d.0);
-+                        self.state.emit_fmt(format_args!("    dup {}.2d, x0", name));
-+                    } else {
-+                        self.state.emit("    dup v0.2d, x0");
-+                        self.store_vector_value_128(d, "q0");
-+                    }
-+                }
-+            }
-+
-+            IntrinsicOp::VecSqrtF64x2 | IntrinsicOp::VecSqrtF32x4 => {
-+                if let Some(d) = dest {
-+                    let a = self.load_vector_value_128(&args[0], "q0");
-+                    let suffix = if matches!(op, IntrinsicOp::VecSqrtF64x2) {
-+                        "2d"
-+                    } else {
-+                        "4s"
-+                    };
-+                    if let Some(name) = self.assigned_vector_reg(d.0) {
-+                        self.state.vector_values.insert(d.0);
-+                        self.state.emit_fmt(format_args!(
-+                            "    fsqrt {}.{}, {}.{}",
-+                            name, suffix, a, suffix
-+                        ));
-+                    } else {
-+                        self.state
-+                            .emit_fmt(format_args!("    fsqrt v0.{}, {}.{}", suffix, a, suffix));
-+                        self.store_vector_value_128(d, "q0");
-+                    }
-+                }
-+            }
-+
-             IntrinsicOp::VecStoreF64x2
-             | IntrinsicOp::VecStoreF32x4
--            | IntrinsicOp::VecStoreI32x4 => {
-+            | IntrinsicOp::VecStoreI32x4
-+            | IntrinsicOp::VecStoreI64x2 => {
-                 // Store one 128-bit vector to dest_ptr.
-                 if dest_ptr.is_some() {
-                     let src = self.load_vector_value_128(&args[0], "q0");
-@@ -818,6 +901,13 @@ impl ArmCodegen {
-                     self.store_x0_to(d);
-                 }
-             }
-+            IntrinsicOp::VecHorizontalAddF32x4 => {
-+                let a = self.load_vector_value_128(&args[0], "q0");
-+                self.state.emit_fmt(format_args!("    addv s0, {}.4s", a));
-+                if let Some(d) = dest {
-+                    self.store_float_reg(d, IrType::F32, "s0");
-+                }
-+            }
- 
-             // Not-yet-implemented register-based vector intrinsics for ARM.
-             IntrinsicOp::VecLoadF64x4
-@@ -831,7 +921,39 @@ impl ArmCodegen {
-             | IntrinsicOp::VecZeroI32x8 => {
-                 unimplemented!("4-wide/AVX vector intrinsics not implemented for ARM");
-             }
--            _ => { /* x86-only SIMD op on arm: no-op */ }
-+            // Any vector intrinsic that reaches here has no NEON lowering.
-+            // Dropping it silently would emit a read of an uninitialized
-+            // vector register (observed: VecLoadI64x2 lowered to nothing and
-+            // the reduction accumulated garbage). Fail the compilation loudly
-+            // instead — a frontend gate that leaks an x86-shaped op to ARM is
-+            // a bug we want to see, not paper over.
-+            IntrinsicOp::VecAddF32x8
-+            | IntrinsicOp::VecBroadcastF32x8
-+            | IntrinsicOp::VecBroadcastF64x4
-+            | IntrinsicOp::VecBroadcastI32x8
-+            | IntrinsicOp::VecDivF32x8
-+            | IntrinsicOp::VecFmaF32x8
-+            | IntrinsicOp::VecFmaF64x4
-+            | IntrinsicOp::VecHorizontalAddF32x8
-+            | IntrinsicOp::VecHorizontalMaxI32x8
-+            | IntrinsicOp::VecLoadF32x8
-+            | IntrinsicOp::VecMaddF32x8
-+            | IntrinsicOp::VecMaddF64x4
-+            | IntrinsicOp::VecMaxI32x8
-+            | IntrinsicOp::VecMulF32x8
-+            | IntrinsicOp::VecMulI32x8
-+            | IntrinsicOp::VecSqrtF32x8
-+            | IntrinsicOp::VecStoreF32x8
-+            | IntrinsicOp::VecStoreF64x4
-+            | IntrinsicOp::VecStoreI32x8
-+            | IntrinsicOp::VecWidenAddI32x4ToI64x2
-+            | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2 => {
-+                unimplemented!(
-+                    "AArch64: no NEON lowering for vector intrinsic {:?} (x86-only shape leaked past the vectorizer target gate)",
-+                    op
-+                );
-+            }
-+            _ => { /* x86-only scalar/SSE-builtin op on arm: no-op */ }
-         }
-     }
- 
--- 
-2.47.3
-
-
-From e90fc13e8dfb4952ff3939c212aa9412ac0af778 Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Fri, 28 Aug 2026 17:08:21 +0000
-Subject: [PATCH 6/8] aarch64: f128 sign-bit intrinsics + full-precision copy
- tracking
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Three fixes from the glibc_ld_copysign red-team:
-
-1. LDCopysign/LDFabs/F128Copysign/F128Fabs (and F128Neg for parity with
-   x86) had NO AArch64 lowering — they hit the silent x86-only no-op and
-   returned whatever was live in q0. Implement as pure GPR bit ops on
-   the slot-homed 16 bytes: AArch64 long double is binary128, so the
-   sign bit is bit 63 of the HIGH qword (mask materialized as
-   movz x10,#0x8000,lsl#48; bic/and/eor; no soft-float call, NaN payload
-   preserved). Dest is marked track_f128_self so later loads take the
-   16-byte path.
-
-2. Copy dropped f128 source tracking. The f128 operand loaders pick
-   between a 16-byte slot load and the lossy extend(f64(low qword))
-   fallback based on f128_load_sources; a Copy through an untracked
-   temporary silently downgraded every later compare/store of the copy
-   (observed at -O2: cs(-2.0L,3.0L)==2.0L compared the low qword
-   reinterpreted as a double). Propagate the entry in the shared default
-   emit_copy_value (RISC-V + any future backend) and in the AArch64
-   override. -O0/-O1 passed because no Copy existed there.
-
-3. emit_call_store_f128_result spilt q1 below sp and libcall'd
-   __trunctfdf2 on it after every f128-returning call — dead code: q1 is
-   caller-clobbered by the call (it held the second argument, not the
-   result), and the x0 'approximation' was overwritten before any
-   consumer. One libcall + two memory round-trips saved per f128 call.
-
-glibc_ld_copysign passes at -O0/-O1/-O2/-O3; ARM regression 369/36/75;
-lib tests 1270/0/6.
----
- src/backend/arm/codegen/calls.rs      | 11 ++---
- src/backend/arm/codegen/emit.rs       | 10 ++++
- src/backend/arm/codegen/intrinsics.rs | 66 +++++++++++++++++++++++++++
- src/backend/state.rs                  | 13 ++++++
- src/backend/traits.rs                 | 12 +++++
- 5 files changed, 106 insertions(+), 6 deletions(-)
-
-diff --git a/src/backend/arm/codegen/calls.rs b/src/backend/arm/codegen/calls.rs
-index eb1a56a0..2d1c2c73 100644
---- a/src/backend/arm/codegen/calls.rs
-+++ b/src/backend/arm/codegen/calls.rs
-@@ -324,12 +324,11 @@ impl ArmCodegen {
-             self.emit_store_to_sp("q0", slot.0, "str");
-             self.state.track_f128_self(dest.0);
-         }
--        self.state.emit("    sub sp, sp, #16");
--        self.state.emit("    str q1, [sp]");
--        self.state.emit("    bl __trunctfdf2");
--        self.state.emit("    fmov x0, d0");
--        self.state.emit("    ldr q1, [sp]");
--        self.state.emit("    add sp, sp, #16");
-+        // The q1 spill + __trunctfdf2 dance that used to live here was dead
-+        // code: q1 is caller-clobbered by the call (it held the second
-+        // argument, not the result), so it truncated garbage, and x0 was
-+        // overwritten before any consumer could read the "approximation".
-+        // One libcall + two memory round-trips saved per f128 call.
-         self.state.reg_cache.invalidate_all();
-         self.state.reg_cache.set_acc(dest.0, false);
-     }
 diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
-index 12c1ca15..1608c454 100644
+index 25facc23..ca3091b5 100644
 --- a/src/backend/arm/codegen/emit.rs
 +++ b/src/backend/arm/codegen/emit.rs
-@@ -2832,6 +2832,16 @@ impl ArchCodegen for ArmCodegen {
-                 self.emit_store_result(dest);
+@@ -1501,6 +1501,15 @@ impl ArmCodegen {
+                         self.state.emit("    mov x0, #0");
+                         self.state.emit("    mov x1, #0");
+                     }
++                    IrConst::LongDouble(_, f128_bytes) => {
++                        // _Float128 carrier constant: the 16 bytes ARE the
++                        // value — stage bit-exactly (an f64 conversion here
++                        // would integer-reinterpret the binary128 pattern).
++                        let lo = u64::from_le_bytes(f128_bytes[0..8].try_into().unwrap());
++                        let hi = u64::from_le_bytes(f128_bytes[8..16].try_into().unwrap());
++                        self.emit_load_imm64("x0", lo as i64);
++                        self.emit_load_imm64("x1", hi as i64);
++                    }
+                     _ => {
+                         // Other consts: load into x0, zero-extend high half
+                         self.operand_to_x0(op);
+@@ -1518,6 +1527,34 @@ impl ArmCodegen {
+                         // 128-bit value in 16-byte stack slot
+                         self.emit_load_from_sp("x0", slot.0, "ldr");
+                         self.emit_load_from_sp("x1", slot.0 + 8, "ldr");
++                    } else if let Some((src_id, offset, is_indirect)) =
++                        self.state.get_f128_source(v.0)
++                    {
++                        // Tracked full-precision F128 value consumed in a
++                        // 128-bit context (F128Neg/F128Fabs/F128Copysign
++                        // results are typed F128 but their U128-carrier
++                        // consumers need all 16 bytes). Loading by value
++                        // type here would fetch 8 bytes and zero the high
++                        // half, silently truncating the carrier (observed:
++                        // -a == -1.5F128 failed in f128_softfloat).
++                        if is_indirect {
++                            if let Some(ptr_slot) = self.state.get_slot(src_id) {
++                                self.emit_load_from_sp("x9", ptr_slot.0, "ldr");
++                                if offset != 0 {
++                                    self.emit_add_offset_to_addr_reg_impl(offset);
++                                }
++                                self.emit_load_pair_indirect_impl();
++                                return;
++                            }
++                        } else if let Some(src_slot) = self.state.get_slot(src_id) {
++                            let base = src_slot.0 + offset;
++                            self.emit_load_from_sp("x0", base, "ldr");
++                            self.emit_load_from_sp("x1", base + 8, "ldr");
++                            return;
++                        }
++                        // Tracker entry without a usable slot: fall through
++                        // to the typed load below.
++                        let _ = slot;
+                     } else {
+                         // Non-i128 value (e.g. shift amount): load 8 bytes, zero high
+                         // Check register allocation first, since register-allocated values
+diff --git a/src/backend/arm/codegen/memory.rs b/src/backend/arm/codegen/memory.rs
+index 5826ff3d..bf1bb512 100644
+--- a/src/backend/arm/codegen/memory.rs
++++ b/src/backend/arm/codegen/memory.rs
+@@ -252,6 +252,22 @@ impl ArmCodegen {
+                 }
              }
          }
-+
-+        // F128 copies must propagate full-precision source tracking — the
-+        // f128 operand loaders choose between a 16-byte slot load and the
-+        // lossy f64-extend fallback based on this entry (see the same
-+        // propagation in the shared default impl). Without it, a Copy
-+        // through an untracked temporary downgrades every later compare or
-+        // store of the copy to extend(f64(low qword)).
-+        if let Operand::Value(sv) = src {
-+            self.state.track_f128_copy(dest.0, sv.0);
-+        }
-     }
-     fn emit_save_acc(&mut self) {
-         self.state.emit("    mov x1, x0");
-diff --git a/src/backend/arm/codegen/intrinsics.rs b/src/backend/arm/codegen/intrinsics.rs
-index eb6c83e7..b283e06a 100644
---- a/src/backend/arm/codegen/intrinsics.rs
-+++ b/src/backend/arm/codegen/intrinsics.rs
-@@ -921,6 +921,72 @@ impl ArmCodegen {
-             | IntrinsicOp::VecZeroI32x8 => {
-                 unimplemented!("4-wide/AVX vector intrinsics not implemented for ARM");
-             }
-+            // Long-double / _Float128 sign-bit intrinsics. AArch64 long
-+            // double is IEEE binary128: sign bit 127 = bit 63 of the HIGH
-+            // qword (unlike x87 80-bit, where x86 patches byte 9). Pure GPR
-+            // bit ops on the slot-homed 16 bytes — no soft-float call, no
-+            // rounding of the quiet-bit payload, NaN sign preserved.
-+            IntrinsicOp::LDFabs | IntrinsicOp::F128Fabs => {
-+                if let Some(d) = dest {
-+                    self.emit_f128_operand_to_q0_full(&args[0]);
-+                    self.state.emit("    mov x0, v0.d[0]");
-+                    self.state.emit("    mov x9, v0.d[1]");
-+                    self.state.emit("    movz x10, #0x8000, lsl #48");
-+                    self.state.emit("    bic x9, x9, x10");
-+                    self.state.emit("    fmov d0, x0");
-+                    self.state.emit("    mov v0.d[1], x9");
-+                    if let Some(slot) = self.state.get_slot(d.0) {
-+                        self.emit_f128_store_q0_to_slot(slot);
-+                        // The dest slot now holds full-precision f128; mark
-+                        // it so later loads take the 16-byte path instead of
-+                        // the f64-extend fallback (wrong for copysign/fabs).
-+                        self.state.track_f128_self(d.0);
-+                    } else {
-+                        unimplemented!("LDFabs: dest is not slot-homed");
++        if crate::backend::generation::is_i128_type(ty) {
++            // U128-carrier store. When the stored value is a tracked
++            // full-precision F128 source (e.g. an F128Neg/F128Fabs result
++            // consumed by a U128-typed store), the destination slot ends up
++            // holding the full 16 bytes — record it so later F128 paths can
++            // read them instead of degrading to the f64-extend fallback.
++            crate::backend::traits::emit_store_default(self, val, ptr, ty);
++            if let Operand::Value(v) = val {
++                if self.state.get_f128_source(v.0).is_some() {
++                    if let Some(_dest_slot) = self.state.get_slot(ptr.0) {
++                        self.state.track_f128_self(ptr.0);
 +                    }
 +                }
 +            }
-+            IntrinsicOp::F128Neg => {
-+                if let Some(d) = dest {
-+                    self.emit_f128_operand_to_q0_full(&args[0]);
-+                    self.state.emit("    mov x0, v0.d[0]");
-+                    self.state.emit("    mov x9, v0.d[1]");
-+                    self.state.emit("    movz x10, #0x8000, lsl #48");
-+                    self.state.emit("    eor x9, x9, x10");
-+                    self.state.emit("    fmov d0, x0");
-+                    self.state.emit("    mov v0.d[1], x9");
-+                    if let Some(slot) = self.state.get_slot(d.0) {
-+                        self.emit_f128_store_q0_to_slot(slot);
-+                        self.state.track_f128_self(d.0);
-+                    } else {
-+                        unimplemented!("F128Neg: dest is not slot-homed");
-+                    }
-+                }
-+            }
-+            IntrinsicOp::LDCopysign | IntrinsicOp::F128Copysign => {
-+                // copysign(x, y): result = {x.lo, (x.hi & ~SIGN) | (y.hi & SIGN)}.
-+                if let Some(d) = dest {
-+                    self.emit_f128_operand_to_q0_full(&args[0]);
-+                    self.state.emit("    mov x0, v0.d[0]");
-+                    self.state.emit("    mov x1, v0.d[1]");
-+                    self.emit_f128_operand_to_q0_full(&args[1]);
-+                    self.state.emit("    mov x9, v0.d[1]");
-+                    self.state.emit("    movz x10, #0x8000, lsl #48");
-+                    self.state.emit("    and x9, x9, x10");
-+                    self.state.emit("    mvn x10, x10");
-+                    self.state.emit("    and x1, x1, x10");
-+                    self.state.emit("    orr x1, x1, x9");
-+                    self.state.emit("    fmov d0, x0");
-+                    self.state.emit("    mov v0.d[1], x1");
-+                    if let Some(slot) = self.state.get_slot(d.0) {
-+                        self.emit_f128_store_q0_to_slot(slot);
-+                        self.state.track_f128_self(d.0);
-+                    } else {
-+                        unimplemented!("LDCopysign: dest is not slot-homed");
-+                    }
-+                }
-+            }
-+
-             // Any vector intrinsic that reaches here has no NEON lowering.
-             // Dropping it silently would emit a read of an uninitialized
-             // vector register (observed: VecLoadI64x2 lowered to nothing and
-diff --git a/src/backend/state.rs b/src/backend/state.rs
-index 6f884356..aa8203d9 100644
---- a/src/backend/state.rs
-+++ b/src/backend/state.rs
-@@ -816,6 +816,19 @@ impl CodegenState {
-         self.f128_load_sources.get(&value_id).copied()
-     }
- 
-+    /// Propagate F128 source tracking through a Copy: `dest` receives the
-+    /// exact same source binding as `src` (the copy moves all 16 bytes, so
-+    /// every consumer of `dest` can read them from the same place `src`'s
-+    /// consumers would have). Without this, a Copy through an untracked
-+    /// temporary silently downgrades later uses to the lossy f64-extend
-+    /// fallback.
-+    #[inline]
-+    pub fn track_f128_copy(&mut self, dest_id: u32, src_id: u32) {
-+        if let Some(entry) = self.f128_load_sources.get(&src_id).copied() {
-+            self.f128_load_sources.insert(dest_id, entry);
-+        }
-+    }
-+
-     /// Returns true if the given symbol needs GOT indirection in PIC mode.
-     /// A symbol needs GOT if PIC is enabled AND it's not a local (static) symbol.
-     /// Local labels (starting with '.') are always PIC-safe via RIP-relative.
-diff --git a/src/backend/traits.rs b/src/backend/traits.rs
-index 752be829..c991ad0c 100644
---- a/src/backend/traits.rs
-+++ b/src/backend/traits.rs
-@@ -201,6 +201,18 @@ pub trait ArchCodegen {
-                 self.emit_store_result(dest);
-             }
-         }
-+
-+        // F128 copies must propagate full-precision source tracking. The
-+        // f128 operand loaders pick between a 16-byte slot load and the
-+        // lossy `extend(f64(low qword))` fallback based on this metadata;
-+        // a Copy through an untracked temporary used to drop it, silently
-+        // truncating every later compare/store of the copy (observed:
-+        // glibc_ld_copysign -O2, `cs(-2.0L,3.0L) == 2.0L` compared the
-+        // low qword reinterpreted as a double). SSA slots are per-value,
-+        // so redirecting reads at the source slot is exact.
-+        if let Operand::Value(sv) = src {
-+            self.state().track_f128_copy(dest.0, sv.0);
-+        }
-     }
- 
-     /// Load a stack/constant operand DIRECTLY into a physical register,
--- 
-2.47.3
-
-
-From f66a59057c3f9f29f1a816b5f39c5ccb27cc9444 Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Fri, 28 Aug 2026 17:41:37 +0000
-Subject: [PATCH 7/8] aarch64: honor AAPCS64 for _Float128 (IrType::U128
- carrier)
-
-_Float128 lowers to IrType::U128 with CallInfo.is_f128_sse /
-IrParam.is_f128_sse / ret_is_f128_sse set on both call sides, but the
-ARM backend ignored every one of those flags:
-
-  * classify_args_core emitted the x86-only CoreArgClass::F128SseReg
-    (one XMM register) for 16-byte _Float128 scalars unconditionally.
-    ARM consumed neither that class nor ret_is_f128_sse, so parameters
-    were staged into GP register pairs and returns took the i128
-    x0:x1 path - every _Float128 argument/return was garbage.
-
-  * classify_args_core now classifies per target: AAPCS64
-    (config.f128_in_fp_regs) assigns Q registers via F128FpReg with
-    F128Stack overflow, reusing the long-double machinery end to end;
-    x86-64 keeps F128SseReg (the branch is gated on f128_in_fp_regs,
-    which only ARM sets - x86/i686/riscv classification is untouched;
-    x86 suite and hand-checked passthru asm are byte-identical).
-
-  * the ARM return path now checks func_ret_is_f128_sse and loads the
-    16-byte carrier into q0 (slot-direct fast path; over-aligned and
-    register-resident fallbacks); the call-result store intercepts
-    call_ret_is_f128_sse and emits a single `str q0` instead of
-    routing U128 through the x0:x1 i128 pair.
-
-  * caller staging of carrier arguments no longer falls back to
-    __extenddftf2 for values that are already full 16-byte carriers:
-    F128Reg staging loads the source slot directly when the argument
-    type is U128, and I128 constants stage their bits bit-exactly
-    instead of integer-converting the binary128 pattern through
-    to_f64() (1.5F128 previously materialized as ~8.5e37).
-
-ARM regression: 371 passed / 34 failed / 75 skipped (was 369/36/75,
-no regressions); f1/f2/f3 oracle parity ident=1.50 add3=4.50
-mix=10.6875. Known-open, pre-existing and orthogonal: global-scope
-carrier loads miscompile through the x9 address peephole; RISC-V
-needs the f128_in_gp_pairs classification arm.
----
- src/backend/arm/codegen/calls.rs    | 30 +++++++++++++++++++++
- src/backend/arm/codegen/emit.rs     | 42 ++++++++++++++++++++++++++++-
- src/backend/arm/codegen/prologue.rs |  1 +
- src/backend/arm/codegen/returns.rs  | 41 +++++++++++++++++++++++++++-
- src/backend/call_abi.rs             | 22 ++++++++++++---
- 5 files changed, 131 insertions(+), 5 deletions(-)
-
-diff --git a/src/backend/arm/codegen/calls.rs b/src/backend/arm/codegen/calls.rs
-index 2d1c2c73..6af68b42 100644
---- a/src/backend/arm/codegen/calls.rs
-+++ b/src/backend/arm/codegen/calls.rs
-@@ -2,6 +2,8 @@
- 
- use super::emit::{callee_saved_name, ArmCodegen};
- use crate::backend::call_abi::{compute_stack_arg_space, CallAbiConfig, CallArgClass};
-+use crate::backend::generation::is_i128_type;
-+use crate::backend::traits::ArchCodegen;
- use crate::common::types::IrType;
- use crate::ir::reexports::{IrConst, Operand, Value};
- 
-@@ -319,6 +321,34 @@ impl ArmCodegen {
-         self.store_x0_x1_to(dest);
-     }
- 
-+    pub(super) fn set_call_ret_is_f128_sse_impl(&mut self, is_f128: bool) {
-+        self.call_ret_is_f128_sse = is_f128;
-+    }
-+
-+    /// Result-store dispatch: a _Float128 carrier (ret_is_f128_sse) arrives
-+    /// in Q0 per AAPCS64 — store all 16 bytes and mark the dest slot as a
-+    /// full-precision f128 source. Everything else keeps the shared
-+    /// dispatch (I128 pair / long double / FP / integer).
-+    pub(super) fn emit_call_store_result_impl(&mut self, dest: &Value, return_type: IrType) {
-+        if self.call_ret_is_f128_sse {
-+            self.emit_call_store_f128_result_impl(dest);
 +            return;
 +        }
-+        if is_i128_type(return_type) {
-+            self.emit_call_store_i128_result_impl(dest);
-+        } else if return_type.is_long_double() {
-+            self.emit_call_store_f128_result_impl(dest);
-+        } else if return_type == IrType::F32 {
-+            self.state.emit("    fmov w0, s0");
-+            self.emit_store_result(dest);
-+        } else if return_type.is_float() {
-+            self.state.emit("    fmov x0, d0");
-+            self.emit_store_result(dest);
-+        } else {
-+            self.emit_store_result(dest);
-+        }
-+    }
-+
-     pub(super) fn emit_call_store_f128_result_impl(&mut self, dest: &Value) {
-         if let Some(slot) = self.state.get_slot(dest.0) {
-             self.emit_store_to_sp("q0", slot.0, "str");
-diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
-index 1608c454..25facc23 100644
---- a/src/backend/arm/codegen/emit.rs
-+++ b/src/backend/arm/codegen/emit.rs
-@@ -221,6 +221,15 @@ pub struct ArmCodegen {
-     /// Frame size for the current function (needed for epilogue in terminators).
-     pub(super) current_frame_size: i64,
-     pub(super) current_return_type: IrType,
-+    /// Current function returns a _Float128 carried in IrType::U128 (the
-+    /// lowering's integer carrier). AAPCS64 puts it in Q0 exactly like
-+    /// long double; without this flag the return falls to the x0:x1
-+    /// integer-pair path.
-+    pub(super) func_ret_is_f128_sse: bool,
-+    /// The call just emitted returns a _Float128 carrier (ret_is_f128_sse
-+    /// from the CallInfo). The result arrives in Q0; the result store must
-+    /// take the 16-byte path instead of the x0:x1 pair.
-+    pub(super) call_ret_is_f128_sse: bool,
-     /// For variadic functions: offset from SP where the GP register save area starts (x0-x7).
-     pub(super) va_gp_save_offset: i64,
-     /// For variadic functions: offset from SP where the FP register save area starts (q0-q7).
-@@ -269,6 +278,8 @@ impl ArmCodegen {
-             fp_contract: crate::common::fp_contract::FpContract::default(),
-             current_frame_size: 0,
-             current_return_type: IrType::I64,
-+            func_ret_is_f128_sse: false,
-+            call_ret_is_f128_sse: false,
-             va_gp_save_offset: 0,
-             va_fp_save_offset: 0,
-             va_named_gp_count: 0,
-@@ -1841,6 +1852,7 @@ impl ArmCodegen {
-         let f128_temp_slots = self.emit_call_f128_var_args(
-             args,
-             arg_classes,
-+            arg_types,
-             &fp_reg_assignments,
-             slot_adjust,
-             extra_sp_adj,
-@@ -1880,6 +1892,7 @@ impl ArmCodegen {
-         &mut self,
-         args: &[Operand],
-         arg_classes: &[CallArgClass],
-+        arg_types: &[IrType],
-         fp_reg_assignments: &[(usize, usize)],
-         slot_adjust: i64,
-         extra_sp_adj: i64,
-@@ -1893,9 +1906,28 @@ impl ArmCodegen {
-             }
-             if let Operand::Value(v) = &args[arg_i] {
-                 let temp_off = f128_temp_idx * 16;
--                let loaded_full =
-+                let mut loaded_full =
-                     self.try_load_f128_full_precision(v.0, slot_adjust + extra_sp_adj, temp_off);
+         crate::backend::traits::emit_store_default(self, val, ptr, ty);
+     }
  
-+                // _Float128 lowered to the IrType::U128 carrier carries 16
-+                // REAL bytes in its own slot even though no f128 source
-+                // tracking vouches for it (U128 loads/stores do not feed
-+                // the tracker). Load directly instead of taking the
-+                // __extenddftf2 fallback, which would fabricate the value
-+                // from the low qword reinterpreted as a double.
-+                if !loaded_full
-+                    && arg_i < arg_types.len()
-+                    && arg_types[arg_i] == IrType::U128
-+                {
-+                    if let Some(slot) = self.state.get_slot(v.0) {
-+                        let adj = slot.0 + slot_adjust + extra_sp_adj;
-+                        self.emit_load_from_sp("q0", adj, "ldr");
-+                        self.state
-+                            .emit_fmt(format_args!("    str q0, [sp, #{}]", temp_off));
-+                        loaded_full = true;
+@@ -286,6 +302,33 @@ impl ArmCodegen {
+                 }
+             }
+         }
++        if crate::backend::generation::is_i128_type(ty) {
++            // U128-carrier load: the 16 raw bytes land in dest's own slot,
++            // so dest is a full-precision F128 source. Without this, an
++            // F128Neg/F128Fabs/F128Copysign operand staging on a freshly
++            // loaded _Float128 value degraded to the f64-extend fallback
++            // and produced -0.0 for -(-1.5F128)-shaped code.
++            if let Some(addr) = self.state.resolve_slot_addr(ptr.0) {
++                match addr {
++                    SlotAddr::OverAligned(slot, id) => {
++                        self.emit_alloca_aligned_addr_impl(slot, id);
++                        self.emit_load_pair_indirect_impl();
++                    }
++                    SlotAddr::Direct(slot) => self.emit_load_pair_from_slot_impl(slot),
++                    SlotAddr::Indirect(slot) => {
++                        self.emit_load_ptr_from_slot_impl(slot, ptr.0);
++                        self.emit_load_pair_indirect_impl();
++                    }
++                    SlotAddr::Reg(reg) => {
++                        self.emit_reg_to_addr(reg);
++                        self.emit_load_pair_indirect_impl();
 +                    }
 +                }
-+
-                 if !loaded_full {
-                     self.emit_load_arg_to_reg(
-                         &args[arg_i],
-@@ -1970,6 +2002,12 @@ impl ArmCodegen {
-             if let Operand::Const(c) = &args[arg_i] {
-                 let bytes = match c {
-                     IrConst::LongDouble(_, f128_bytes) => *f128_bytes,
-+                    // _Float128 lowered to the IrType::U128 carrier: the
-+                    // I128 constant IS the IEEE binary128 bit pattern.
-+                    // Stage it bit-exactly — a to_f64() here would
-+                    // integer-convert the pattern and fabricate a huge
-+                    // value out of 1.5L's bits (observed: ident(1.5F128)).
-+                    IrConst::I128(bits) => bits.to_le_bytes(),
-                     _ => {
-                         let f64_val = c.to_f64().unwrap_or(0.0);
-                         crate::ir::reexports::f64_to_f128_bytes(f64_val)
-@@ -3057,6 +3095,8 @@ impl ArchCodegen for ArmCodegen {
-         fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool) => emit_call_cleanup_impl;
-         fn emit_call_store_i128_result(&mut self, dest: &Value) => emit_call_store_i128_result_impl;
-         fn emit_call_store_f128_result(&mut self, dest: &Value) => emit_call_store_f128_result_impl;
-+        fn emit_call_store_result(&mut self, dest: &Value, return_type: IrType) => emit_call_store_result_impl;
-+        fn set_call_ret_is_f128_sse(&mut self, is_f128: bool) => set_call_ret_is_f128_sse_impl;
-         // globals
-         fn emit_global_addr(&mut self, dest: &Value, name: &str) => emit_global_addr_impl;
-         fn emit_label_addr(&mut self, dest: &Value, label: &str) => emit_label_addr_impl;
-diff --git a/src/backend/arm/codegen/prologue.rs b/src/backend/arm/codegen/prologue.rs
-index 35091fbb..4c516272 100644
---- a/src/backend/arm/codegen/prologue.rs
-+++ b/src/backend/arm/codegen/prologue.rs
-@@ -399,6 +399,7 @@ impl ArmCodegen {
- 
-     pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
-         self.current_return_type = func.return_type;
-+        self.func_ret_is_f128_sse = func.ret_is_f128_sse;
-         self.current_frame_size = frame_size;
-         self.frame_base_offset = None;
-         if self.conditional_increment_leaf {
-diff --git a/src/backend/arm/codegen/returns.rs b/src/backend/arm/codegen/returns.rs
-index 5630a878..b62829fb 100644
---- a/src/backend/arm/codegen/returns.rs
-+++ b/src/backend/arm/codegen/returns.rs
-@@ -1,6 +1,8 @@
- //! ArmCodegen: return operations.
- 
--use super::emit::ArmCodegen;
-+use super::emit::{callee_saved_name, ArmCodegen};
-+use crate::backend::state::SlotAddr;
-+use crate::backend::traits::ArchCodegen;
- use crate::common::types::IrType;
- use crate::ir::reexports::{Operand, Value};
- 
-@@ -13,10 +15,47 @@ impl ArmCodegen {
-                 self.emit_epilogue_and_ret_impl(frame_size);
-                 return;
-             }
-+            // _Float128 lowered to the IrType::U128 carrier: AAPCS64 still
-+            // returns it in Q0. The value is 16 slot bytes; load them whole.
-+            // (The full loader's f64-extend fallback would be wrong here:
-+            // U128-carrier loads/stores do not feed the f128 source
-+            // tracker, so the tracker cannot vouch for the slot contents —
-+            // but the slot IS the value, 16 bytes, by construction.)
-+            if self.func_ret_is_f128_sse {
-+                self.emit_f128_carrier_operand_to_q0(val);
-+                self.emit_epilogue_and_ret_impl(frame_size);
-+                return;
++                self.emit_store_acc_pair_impl(dest);
++                self.state.track_f128_self(dest.0);
 +            }
-         }
-         crate::backend::traits::emit_return_default(self, val, frame_size);
++            return;
++        }
+         crate::backend::traits::emit_load_default(self, dest, ptr, ty);
      }
  
-+    /// Load a _Float128-carrier operand into Q0: direct 16-byte slot load
-+    /// when the value is slot-homed (the normal carrier case), constants
-+    /// and tracked values through the full loader.
-+    pub(super) fn emit_f128_carrier_operand_to_q0(&mut self, op: &Operand) {
-+        if let Operand::Value(v) = op {
-+            match self.state.resolve_slot_addr(v.0) {
-+                Some(SlotAddr::Direct(slot)) => {
-+                    self.emit_load_from_sp("q0", slot.0, "ldr");
-+                    return;
-+                }
-+                Some(SlotAddr::Reg(reg)) => {
-+                    self.state
-+                        .emit_fmt(format_args!("    ldr q0, [{}]", callee_saved_name(reg)));
-+                    return;
-+                }
-+                Some(SlotAddr::OverAligned(slot, id)) => {
-+                    self.emit_alloca_aligned_addr(slot, id);
-+                    self.state.emit("    ldr q0, [x9]");
-+                    return;
-+                }
-+                _ => {}
+diff --git a/src/backend/arm/codegen/peephole.rs b/src/backend/arm/codegen/peephole.rs
+index d8d198ad..8ae7c2fe 100644
+--- a/src/backend/arm/codegen/peephole.rs
++++ b/src/backend/arm/codegen/peephole.rs
+@@ -607,6 +607,14 @@ pub fn peephole_optimize(asm: String) -> String {
+ /// overwrite of `dst` by an instruction that does not read it, or the end of
+ /// the function's text. Anything unrecognized (other memory ops, unknown
+ /// instruction kinds, calls) blocks the transform.
++/// Column-0 identifier label: the next function or data object, i.e. the
++/// end of the current function's text. Block labels start with '.', and
++/// inline-asm numeric local labels (`1:`) start with a digit — neither
++/// terminates the function's text.
++fn is_function_boundary(line: &str) -> bool {
++    line.ends_with(':') && line.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
++}
++
+ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+     fn mentions(line: &str, reg: u8) -> bool {
+         line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+@@ -617,13 +625,6 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
+             .filter(|tok| *tok == xreg_name(reg) || *tok == wreg_name(reg))
+             .count()
+     }
+-    // Column-0 identifier label: the next function or data object, i.e. the
+-    // end of the current function's text. Block labels start with '.', and
+-    // inline-asm numeric local labels (`1:`) start with a digit — neither
+-    // terminates the function's text.
+-    fn is_function_boundary(line: &str) -> bool {
+-        line.ends_with(':') && line.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+-    }
+     let mut changed = false;
+     for i in 0..n {
+         let LineKind::Move {
+@@ -1033,28 +1034,70 @@ fn written_gp_register(line: &str, kind: LineKind) -> Option<u8> {
+     }
+ }
+ 
+-/// Remove `mov x9, xN` immediately followed by a memory operation that already
+-/// addresses through xN. Regalloc-aware loads can make the legacy x9 setup dead.
++/// Remove `mov x9, xN` when x9's staged address is provably dead after the
++/// mov. Regalloc-aware loads and copy propagation can make the legacy x9
++/// setup dead.
++///
++/// Soundness requires a FULL dead-value scan, not a single-instruction
++/// lookahead: `propagate_register_copies` rewrites only the FIRST use of the
++/// copy (`ldr x0, [x9]` -> `ldr x0, [x0]`), so the instruction after the mov
++/// can look clean while a later instruction (`ldr x1, [x9, #8]` — the high
++/// half of a 16-byte _Float128-carrier global load) still reads x9. Deleting
++/// the mov on the one-line view left a stale-x9 SIGSEGV (f128_softfloat).
++/// The scan stops at the first x9 read (mov stays), the first pure x9
++/// redefinition (mov is dead past it), a control-flow boundary, a call (x9
++/// is caller-saved: a later read would need a fresh definition), or the
++/// end of the function.
+ fn eliminate_unused_x9_address_moves(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
++    fn mentions_x9(line: &str) -> bool {
++        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
++            .any(|tok| tok == "x9" || tok == "w9")
++    }
++    fn mentions_x9_count(line: &str) -> usize {
++        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
++            .filter(|&tok| tok == "x9" || tok == "w9")
++            .count()
++    }
+     let mut changed = false;
+-    for i in 0..n.saturating_sub(1) {
++    for i in 0..n {
+         let LineKind::Move {
+             dst: 9,
+-            src,
+             is_32bit: false,
++            ..
+         } = kinds[i]
+         else {
+             continue;
+         };
++        let mut dead = true;
+         let mut j = i + 1;
+-        while j < n && kinds[j] == LineKind::Nop {
++        while j < n {
++            if is_function_boundary(&lines[j]) {
++                break;
 +            }
-+        }
-+        self.emit_f128_operand_to_q0_full(op);
++            match kinds[j] {
++                LineKind::Nop | LineKind::Directive => {}
++                // Path ends: textually later lines belong to other paths, and
++                // a label can only be joined from before the mov (skipping it).
++                LineKind::Label | LineKind::Branch | LineKind::CondBranch
++                | LineKind::CmpBranch | LineKind::Ret | LineKind::Call => break,
++                _ => {
++                    if written_gp_register(&lines[j], kinds[j]) == Some(9)
++                        && mentions_x9_count(&lines[j]) == 1
++                    {
++                        // Pure redefinition of x9: the staged value is dead
++                        // past this instruction.
++                        break;
++                    }
++                    if mentions_x9(&lines[j]) {
++                        // A read (or read-modify-write) of x9: the mov is live.
++                        dead = false;
++                        break;
++                    }
++                }
++            }
+             j += 1;
+         }
+-        if j >= n || !matches!(kinds[j], LineKind::MemOther | LineKind::LoadsbReg) {
+-            continue;
+-        }
+-        let needle = format!("[{}", xreg_name(src));
+-        if lines[j].contains(&needle) && !lines[j].contains("[x9") {
++        if dead {
+             kinds[i] = LineKind::Nop;
+             changed = true;
+         }
+@@ -3987,6 +4030,98 @@ g:
+         );
+     }
+ 
++    // ── x9 address-mov dead-value soundness ─────────────────────────────
++    //
++    // Regression: a 16-byte carrier load stages its address with
++    // `mov x9, xN` and issues TWO loads (`ldr x0,[x9]`, `ldr x1,[x9,#8]`).
++    // Copy propagation rewrites only the FIRST use to `[xN]`; the old
++    // single-instruction lookahead in eliminate_unused_x9_address_moves
++    // then believed x9 dead and deleted the mov, leaving the second load
++    // reading a stale x9 (SIGSEGV on _Float128 globals).
++
++    #[test]
++    fn test_x9_address_mov_survives_second_use() {
++        let input = "\
++main:
++    adrp x0, :got:g
++    ldr x0, [x0, :got_lo12:g]
++    mov x20, x0
++    mov x9, x0
++    ldr x0, [x9]
++    ldr x1, [x9, #8]
++    str x0, [sp, #32]
++    str x1, [sp, #40]
++    ret
++g:
++    ret
++";
++        let result = peephole_optimize(input.to_string());
++        // Invariant: a surviving read of x9 must have a live definition.
++        // The broken pipeline produced `ldr x0, [x0]; ldr x1, [x9, #8]`
++        // with the defining mov deleted — the second half read a stale x9.
++        let stale_x9_read = result.contains("[x9") && !result.contains("mov x9,");
++        // Both halves must load the global's 16 bytes: half one from the
++        // GOT-resolved base (x0), half two from either a live x9 or the
++        // propagated base.
++        let second_half_ok = result.contains("ldr x1, [x9, #8]")
++            || result.contains("ldr x1, [x0, #8]")
++            || result.contains("mov x9,");
++        assert!(!stale_x9_read, "x9 read without a live definition:\n{}", result);
++        assert!(second_half_ok, "second carrier-load half lost:\n{}", result);
 +    }
 +
-     pub(super) fn emit_return_i128_to_regs_impl(&mut self) {
-         // x0:x1 already hold the i128 return value per AAPCS64 -- noop
-     }
++    #[test]
++    fn test_x9_address_mov_deleted_when_fully_dead() {
++        // Positive case: ALL uses rewritten to the source register -> the
++        // mov is provably dead and must still be removed.
++        let input = "\
++f:
++    mov x9, x24
++    ldr q0, [x24]
++    ldr q1, [x24, #16]
++    str q0, [sp, #16]
++    ret
++g:
++    ret
++";
++        let result = peephole_optimize(input.to_string());
++        assert!(
++            !result.contains("mov x9, x24"),
++            "dead address mov must be removed:\n{}",
++            result
++        );
++    }
++
++    #[test]
++    fn test_x9_address_mov_kept_across_redef_and_use() {
++        // x9 redefined (`mov x9, x5`) before its next read: the FIRST mov
++        // is dead past the redefinition and may go; the redefining mov must
++        // stay because `ldr x2, [x9]` reads it.
++        let input = "\
++f:
++    mov x9, x24
++    ldr x0, [x24]
++    mov x9, x5
++    ldr x2, [x9]
++    ret
++g:
++    ret
++";
++        let result = peephole_optimize(input.to_string());
++        assert!(
++            !result.contains("mov x9, x24"),
++            "mov dead before redefinition must be removed:\n{}",
++            result
++        );
++        // Either the redefining mov survives for the read, or the read was
++        // propagated straight to x5 — both keep x2 loading x5's value.
++        assert!(
++            result.contains("mov x9, x5") || result.contains("ldr x2, [x5]"),
++            "x2 must still load x5's value:\n{}",
++            result
++        );
++    }
++
+     // ── Address-alias soundness ────────────────────────────────────────
+ 
+     #[test]
+diff --git a/tests/regression/f128_global_carrier.c b/tests/regression/f128_global_carrier.c
+new file mode 100644
+index 00000000..0034a5d1
+--- /dev/null
++++ b/tests/regression/f128_global_carrier.c
+@@ -0,0 +1,34 @@
++// _Float128 globals and negation end-to-end (aarch64 carrier regression):
++// 1. a 16-byte global _Float128 must be loaded whole through the GOT address
++//    (the x9-address peephole once deleted the defining `mov x9, xN` after
++//    copy propagation rewrote only the FIRST use, leaving `ldr x1, [x9, #8]`
++//    reading a stale x9 -> SIGSEGV);
++// 2. unary minus must flip the sign bit of the full binary128 pattern
++//    (the F128Neg operand staging once degraded to the f64-extend fallback
++//    and U128-typed consumers truncated tracked results to 8 bytes).
++// Returns nonzero on the first failure.
++#include <stdio.h>
++
++_Float128 g_pos = 42.0F128;
++_Float128 g_neg = -1.5F128;
++
++static int fails = 0;
++#define CHECK(cond) do { if (!(cond)) { fails++; } } while (0)
++
++_Float128 negate(_Float128 x) { return -x; }
++
++int main(void) {
++    CHECK(g_pos == 42.0F128);
++    CHECK(g_neg == -1.5F128);
++    CHECK(-g_pos == -42.0F128);
++    _Float128 a = 1.5F128;
++    CHECK(negate(a) == -1.5F128);
++    CHECK(-a == -1.5F128);
++    CHECK(negate(g_pos) == -42.0F128);
++    _Float128 round = negate(negate(a));
++    CHECK(round == 1.5F128);
++    if (fails != 0) {
++        printf("f128_global_carrier: %d check(s) failed\n", fails);
++    }
++    return fails != 0;
++}
+-- 
+2.47.3
+
+
+From 386dc13d79ea98c6d0ba426f41abb2167146e481 Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 18:06:19 +0000
+Subject: [PATCH 2/7] docs: landed register - aarch64 f128-carrier plumbing +
+ x9 mov soundness
+
+---
+ engineering/agent/BACKLOG.md | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
+index 4b093d16..ae32905b 100644
+--- a/engineering/agent/BACKLOG.md
++++ b/engineering/agent/BACKLOG.md
+@@ -317,7 +317,9 @@ LK-04 (CASP/MOVW/.org/PREL64), LK-17 (pcre2), LK-26 (seg_fs lvalue stores,
+ same-block · backedge PRE · GVN disjoint epochs · FpContract tri-state ·
+ mcount/`-pg` family · 32 KiB boot gate PASS · i686 natural slots ·
+ width-partitioned slots · RISC-V va_arg struct{long double} · ci-codegen
+-gate.
++gate. · aarch64 f128-carrier full-precision plumbing (U128 loads/stores feed
++the f128 tracker; pair loads prefer it; x9 dead-address-mov full-scan
++soundness; f128_softfloat + f128_global_carrier green, 2026-08-28).
+ 
+ Rejected-with-evidence (never resubmit without new data): Agent B's
+ MAX_SMALL_INLINE_BLOCKS 12 / -Os cap removal / split-call-everywhere;
+-- 
+2.47.3
+
+
+From 7b083f631e08f512cfadff786523b0c7299fcada Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 18:17:18 +0000
+Subject: [PATCH 3/7] riscv: honor _Float128 (IrType::U128 carrier) across the
+ ABI
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+_Float128 lowers to the U128 carrier with is_f128_sse flagged on both
+call sides, but RISC-V fell through to the x86 F128SseReg classification
+and dropped the sign-bit intrinsics entirely:
+
+  * classify_args_core: new f128_in_gp_pairs arm (RISC-V only) assigns
+    an even-aligned GP register pair exactly like long double, with
+    F128Stack overflow. The x86 F128SseReg branch is now unreachable for
+    gp-pair targets; x86 classification is untouched (suite byte-checks
+    confirm identical x86-64 f128 asm).
+
+  * U128 loads record their destination as a full-precision f128 source
+    and U128 stores propagate tracking to slot-anchored destinations
+    (Direct/OverAligned only — Indirect/Reg homes do not anchor the
+    bytes), mirroring the aarch64 fix. Without it, F128Neg staging on a
+    freshly loaded carrier degraded to __extenddftf2(low qword) = -0.0.
+
+  * operand_to_t0_t1 prefers the f128 tracker (direct and indirect
+    homes) and stages IrConst::LongDouble carrier constants bit-exactly;
+    call pre-convert staging loads U128-typed arguments directly from
+    their slots and IrConst::I128 carrier constants stage their bits.
+
+  * the intrinsic dispatcher gains the five sign-bit arms (F128Neg,
+    LDFabs|F128Fabs, LDCopysign|F128Copysign) as pure high-qword sign
+    edits on the a0:a1 pair — previously F128Neg hit the silent
+    "x86-only SIMD no-op" catch-all and emitted nothing. Results store
+    through the frame pointer (s0); the sp-relative form was only valid
+    under call-staging adjustments.
+
+Validation: RISC-V f1/f5/f6/f7 probes at GCC-oracle parity, f128_softfloat
+rc=0 (was 1), f128_global_carrier rc=0; lib 1273/0/6; ARM 373/33/75 and
+x86 536/5 unchanged; x86-64 f128 passthru asm byte-identical.
+---
+ src/backend/call_abi.rs                 | 20 ++++++++
+ src/backend/riscv/codegen/calls.rs      | 28 ++++++++++--
+ src/backend/riscv/codegen/emit.rs       | 34 ++++++++++++++
+ src/backend/riscv/codegen/f128.rs       | 15 ++++++
+ src/backend/riscv/codegen/intrinsics.rs | 46 +++++++++++++++++++
+ src/backend/riscv/codegen/memory.rs     | 61 ++++++++++++++++++++++++-
+ 6 files changed, 200 insertions(+), 4 deletions(-)
+
 diff --git a/src/backend/call_abi.rs b/src/backend/call_abi.rs
-index a6a80f2b..b3d6e6a0 100644
+index b3d6e6a0..fa71b2d2 100644
 --- a/src/backend/call_abi.rs
 +++ b/src/backend/call_abi.rs
-@@ -644,9 +644,25 @@ fn classify_args_core(
+@@ -660,6 +660,26 @@ fn classify_args_core(
                  continue;
              }
  
--            // _Float128 (IEEE binary128): ONE 16-byte XMM register per the
--            // SysV psABI (not a two-eightbyte SSE struct). Overflow (all XMM
--            // regs consumed) goes to a 16-byte stack slot.
-+            // AAPCS64 (ARM): a _Float128 carrier (scalar or 16-byte
-+            // aggregate flagged is_f128_sse by the lowering) goes in a Q
-+            // register exactly like long double — the "SSE" naming of the
-+            // flag is SysV jargon, the class itself is target-relative.
-+            // Overflow takes a 16-byte-aligned stack slot (F128Stack
-+            // semantics), not the x86 SysV StructByValStack rollback.
-+            if info.is_f128_sse && size == 16 && config.f128_in_fp_regs {
-+                if float_idx < config.max_float_regs {
-+                    result.push(CoreArgClass::F128FpReg { reg_idx: float_idx });
-+                    float_idx += 1;
++            // RISC-V (soft-float-pair targets): a _Float128 carrier goes in
++            // an even-aligned GP register pair exactly like long double
++            // (f128_in_gp_pairs); overflow takes the F128Stack slot. The x86
++            // F128SseReg branch below must not fire — RISC-V has no XMM.
++            if info.is_f128_sse && size == 16 && config.f128_in_gp_pairs {
++                if config.align_i128_pairs && int_idx % 2 != 0 {
++                    int_idx += 1;
++                }
++                if int_idx + 1 < config.max_int_regs {
++                    result.push(CoreArgClass::F128GpPair {
++                        base_reg_idx: int_idx,
++                    });
++                    int_idx += 2;
 +                } else {
 +                    result.push(CoreArgClass::F128Stack);
++                    int_idx = config.max_int_regs;
 +                }
 +                continue;
 +            }
 +
-+            // x86-64 SysV: _Float128 (IEEE binary128) — ONE 16-byte XMM
-+            // register per the psABI (not a two-eightbyte SSE struct).
-+            // Overflow (all XMM regs consumed) goes to a 16-byte stack slot.
-             if info.is_f128_sse && size == 16 {
-                 if float_idx < config.max_float_regs {
-                     result.push(CoreArgClass::F128SseReg { reg_idx: float_idx });
+             // x86-64 SysV: _Float128 (IEEE binary128) — ONE 16-byte XMM
+             // register per the psABI (not a two-eightbyte SSE struct).
+             // Overflow (all XMM regs consumed) goes to a 16-byte stack slot.
+diff --git a/src/backend/riscv/codegen/calls.rs b/src/backend/riscv/codegen/calls.rs
+index 1553ac80..cc684df8 100644
+--- a/src/backend/riscv/codegen/calls.rs
++++ b/src/backend/riscv/codegen/calls.rs
+@@ -38,7 +38,7 @@ impl RiscvCodegen {
+         &mut self,
+         args: &[Operand],
+         arg_classes: &[CallArgClass],
+-        _arg_types: &[IrType],
++        arg_types: &[IrType],
+         _stack_arg_space: usize,
+     ) -> usize {
+         let mut f128_temp_space: i64 = 0;
+@@ -56,8 +56,24 @@ impl RiscvCodegen {
+                 if !matches!(arg_classes[i], CallArgClass::F128Reg { .. }) {
+                     continue;
+                 }
+-                if let Operand::Value(_) = arg {
+-                    self.emit_f128_operand_to_a0_a1(arg);
++                if let Operand::Value(v) = arg {
++                    // _Float128 lowered to the IrType::U128 carrier carries
++                    // 16 REAL bytes in its own slot even when no f128 source
++                    // tracking vouches for it. Load directly — the
++                    // __extenddftf2-style fallback inside
++                    // emit_f128_operand_to_a0_a1 would fabricate the value
++                    // from the low qword reinterpreted as a double.
++                    let mut staged = false;
++                    if i < arg_types.len() && arg_types[i] == IrType::U128 {
++                        if let Some(slot) = self.state.get_slot(v.0) {
++                            self.emit_load_from_s0("a0", slot.0, "ld");
++                            self.emit_load_from_s0("a1", slot.0 + 8, "ld");
++                            staged = true;
++                        }
++                    }
++                    if !staged {
++                        self.emit_f128_operand_to_a0_a1(arg);
++                    }
+                     self.emit_store_to_sp("a0", temp_offset, "sd");
+                     self.emit_store_to_sp("a1", temp_offset + 8, "sd");
+                     temp_offset += 16;
+@@ -312,6 +328,12 @@ impl RiscvCodegen {
+                     Operand::Const(ref c) => {
+                         let bytes = match c {
+                             IrConst::LongDouble(_, f128_bytes) => *f128_bytes,
++                            // _Float128 lowered to the IrType::U128 carrier:
++                            // the I128 constant IS the IEEE binary128 bit
++                            // pattern. Stage it bit-exactly — a to_f64()
++                            // here would integer-convert the pattern and
++                            // fabricate a huge value out of 1.5L's bits.
++                            IrConst::I128(bits) => bits.to_le_bytes(),
+                             _ => {
+                                 let f64_val = c.to_f64().unwrap_or(0.0);
+                                 crate::ir::reexports::f64_to_f128_bytes(f64_val)
+diff --git a/src/backend/riscv/codegen/emit.rs b/src/backend/riscv/codegen/emit.rs
+index be98e6be..ddb80725 100644
+--- a/src/backend/riscv/codegen/emit.rs
++++ b/src/backend/riscv/codegen/emit.rs
+@@ -426,6 +426,17 @@ impl RiscvCodegen {
+                     self.state.emit("    li t0, 0");
+                     self.state.emit("    li t1, 0");
+                 }
++                IrConst::LongDouble(_, f128_bytes) => {
++                    // _Float128 carrier constant: the 16 bytes ARE the
++                    // value — stage bit-exactly (an f64 conversion here
++                    // would integer-reinterpret the binary128 pattern).
++                    let lo = u64::from_le_bytes(f128_bytes[0..8].try_into().unwrap());
++                    let hi = u64::from_le_bytes(f128_bytes[8..16].try_into().unwrap());
++                    self.state
++                        .emit_fmt(format_args!("    li t0, {}", lo as i64));
++                    self.state
++                        .emit_fmt(format_args!("    li t1, {}", hi as i64));
++                }
+                 _ => {
+                     self.operand_to_t0(op);
+                     self.state.emit("    li t1, 0");
+@@ -439,6 +450,29 @@ impl RiscvCodegen {
+                     } else if self.state.is_i128_value(v.0) {
+                         self.emit_load_from_s0("t0", slot.0, "ld");
+                         self.emit_load_from_s0("t1", slot.0 + 8, "ld");
++                    } else if let Some((src_id, offset, is_indirect)) =
++                        self.state.get_f128_source(v.0)
++                    {
++                        // Tracked full-precision F128 value consumed in a
++                        // 128-bit context (intrinsic results are typed F128
++                        // but their U128-carrier consumers need all 16
++                        // bytes); a typed load would zero the high half.
++                        if is_indirect {
++                            if let Some(ptr_slot) = self.state.get_slot(src_id) {
++                                self.emit_load_from_s0("t5", ptr_slot.0, "ld");
++                                if offset != 0 {
++                                    self.emit_add_offset_to_addr_reg_impl(offset);
++                                }
++                                self.emit_load_pair_indirect_impl();
++                                return;
++                            }
++                        } else if let Some(src_slot) = self.state.get_slot(src_id) {
++                            let base = src_slot.0 + offset;
++                            self.emit_load_from_s0("t0", base, "ld");
++                            self.emit_load_from_s0("t1", base + 8, "ld");
++                            return;
++                        }
++                        let _ = slot;
+                     } else {
+                         if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                             let reg_name = callee_saved_name(reg);
+diff --git a/src/backend/riscv/codegen/f128.rs b/src/backend/riscv/codegen/f128.rs
+index 4c6f8f6a..0f34c27a 100644
+--- a/src/backend/riscv/codegen/f128.rs
++++ b/src/backend/riscv/codegen/f128.rs
+@@ -359,6 +359,21 @@ impl RiscvCodegen {
+         crate::backend::f128_softfloat::f128_operand_to_arg1(self, op);
+     }
+ 
++    /// Store the a0:a1 GP-pair carrier to a slot and mark it as a
++    /// full-precision F128 source (sign-bit intrinsics results).
++    pub(super) fn emit_f128_store_a0_a1_tracked(&mut self, dest_id: u32) {
++        if let Some(slot) = self.state.get_slot(dest_id) {
++            // Value slots are frame-pointer relative (s0); emit_store_to_sp
++            // addresses sp, which is only valid under a call-staging sp
++            // adjustment — an intrinsic runs with the unadjusted frame.
++            self.emit_store_to_s0("a0", slot.0, "sd");
++            self.emit_store_to_s0("a1", slot.0 + 8, "sd");
++            self.state.track_f128_self(dest_id);
++        } else {
++            unimplemented!("f128 sign-bit intrinsic: dest is not slot-homed");
++        }
++    }
++
+     /// Negate an F128 value with full precision.
+     pub(super) fn emit_f128_neg_full(&mut self, dest: &Value, src: &Operand) {
+         crate::backend::f128_softfloat::f128_neg(self, dest, src);
+diff --git a/src/backend/riscv/codegen/intrinsics.rs b/src/backend/riscv/codegen/intrinsics.rs
+index c37eb8db..7e7dae9f 100644
+--- a/src/backend/riscv/codegen/intrinsics.rs
++++ b/src/backend/riscv/codegen/intrinsics.rs
+@@ -378,6 +378,52 @@ impl RiscvCodegen {
+                 // RISC-V would use RVV (RISC-V Vector extension) differently
+                 unimplemented!("Register-based vector intrinsics not implemented for RISC-V");
+             }
++            // ── _Float128 / long double sign-bit intrinsics ─────────────
++            //
++            // The carrier (IrType::U128) holds the IEEE binary128 pattern in
++            // a0:a1 (GP pair, f128_in_gp_pairs). All three ops are pure
++            // sign-bit edits on the high qword — no soft-float call needed.
++            IntrinsicOp::F128Neg => {
++                if let Some(d) = dest {
++                    self.emit_f128_operand_to_a0_a1(&args[0]);
++                    // hi ^= SIGN
++                    self.state.emit("    li t2, 1");
++                    self.state.emit("    slli t2, t2, 63");
++                    self.state.emit("    xor a1, a1, t2");
++                    self.emit_f128_store_a0_a1_tracked(d.0);
++                }
++            }
++            IntrinsicOp::LDFabs | IntrinsicOp::F128Fabs => {
++                if let Some(d) = dest {
++                    self.emit_f128_operand_to_a0_a1(&args[0]);
++                    // hi &= ~SIGN (clear sign bit, preserve everything else)
++                    self.state.emit("    li t2, 1");
++                    self.state.emit("    slli t2, t2, 63");
++                    self.state.emit("    not t2, t2");
++                    self.state.emit("    and a1, a1, t2");
++                    self.emit_f128_store_a0_a1_tracked(d.0);
++                }
++            }
++            IntrinsicOp::LDCopysign | IntrinsicOp::F128Copysign => {
++                // copysign(x, y): result = {x.lo, (x.hi & ~SIGN) | (y.hi & SIGN)}
++                if let Some(d) = dest {
++                    self.emit_f128_operand_to_a0_a1(&args[1]);
++                    self.state.emit("    mv t3, a0");
++                    self.state.emit("    mv t4, a1");
++                    self.emit_f128_operand_to_a0_a1(&args[0]);
++                    self.state.emit("    li t2, 1");
++                    self.state.emit("    slli t2, t2, 63");
++                    self.state.emit("    and t4, t4, t2");
++                    self.state.emit("    not t2, t2");
++                    self.state.emit("    and a1, a1, t2");
++                    self.state.emit("    or a1, a1, t4");
++                    // NOTE: if args[0] staging took the lossy __extenddftf2
++                    // fallback it would clobber t3/t4 across the call — the
++                    // same accepted limitation as the AArch64 arm; tracked
++                    // carriers and constants never take that path.
++                    self.emit_f128_store_a0_a1_tracked(d.0);
++                }
++            }
+             _ => { /* x86-only SIMD op on riscv: no-op */ }
+         }
+     }
+diff --git a/src/backend/riscv/codegen/memory.rs b/src/backend/riscv/codegen/memory.rs
+index e3bcbdb0..1a39ef77 100644
+--- a/src/backend/riscv/codegen/memory.rs
++++ b/src/backend/riscv/codegen/memory.rs
+@@ -4,7 +4,7 @@ use super::emit::{callee_saved_name, RiscvCodegen};
+ use crate::backend::state::{SlotAddr, StackSlot};
+ use crate::backend::traits::ArchCodegen;
+ use crate::common::types::IrType;
+-use crate::ir::reexports::{Operand, Value};
++use crate::ir::reexports::{IrConst, Operand, Value};
+ 
+ impl RiscvCodegen {
+     // ---- Store/Load overrides ----
+@@ -14,6 +14,38 @@ impl RiscvCodegen {
+             crate::backend::f128_softfloat::f128_emit_store(self, val, ptr);
+             return;
+         }
++        if crate::backend::generation::is_i128_type(ty) {
++            // U128-carrier store: when the stored value is a tracked
++            // full-precision F128 source (F128Neg/F128Fabs/F128Copysign
++            // results consumed by a U128-typed store), the destination slot
++            // ends up holding the full 16 bytes — record it so later F128
++            // paths read them instead of the f64-extend fallback.
++            crate::backend::traits::emit_store_default(self, val, ptr, ty);
++            // Tracking is sound only when the destination slot anchors
++            // the bytes themselves (Direct alloca/value slot or an
++            // over-aligned alloca): an Indirect/Reg home stores THROUGH a
++            // pointer, so its own slot does not hold the data.
++            let slot_anchored = matches!(
++                self.state.resolve_slot_addr(ptr.0),
++                Some(SlotAddr::Direct(_) | SlotAddr::OverAligned(_, _))
++            );
++            let tracked_val = match val {
++                Operand::Value(v) => self.state.get_f128_source(v.0).is_some(),
++                // A constant stored through a U128-typed store IS the
++                // full-precision bit pattern by construction (LongDouble
++                // bytes, or the I128 carrier bits): the destination slot is
++                // a full-precision F128 source. Without this, a
++                // const-initialized local _Float128 forced every later
++                // intrinsic/argument staging into the lossy f64-extend
++                // fallback (observed: -1.5F128 negated to -0.0 on RISC-V).
++                Operand::Const(c) => matches!(c, IrConst::LongDouble(_, _) | IrConst::I128(_)),
++                _ => false,
++            };
++            if tracked_val && slot_anchored {
++                self.state.track_f128_self(ptr.0);
++            }
++            return;
++        }
+         crate::backend::traits::emit_store_default(self, val, ptr, ty);
+     }
+ 
+@@ -22,6 +54,33 @@ impl RiscvCodegen {
+             crate::backend::f128_softfloat::f128_emit_load(self, dest, ptr);
+             return;
+         }
++        if crate::backend::generation::is_i128_type(ty) {
++            // U128-carrier load: the 16 raw bytes land in dest's own slot,
++            // so dest is a full-precision F128 source. Without this,
++            // F128Neg/F128Fabs/F128Copysign staging on a freshly loaded
++            // _Float128 value degraded to the f64-extend fallback and
++            // produced -0.0 for -(-1.5F128)-shaped code.
++            if let Some(addr) = self.state.resolve_slot_addr(ptr.0) {
++                match addr {
++                    SlotAddr::OverAligned(slot, id) => {
++                        self.emit_alloca_aligned_addr_impl(slot, id);
++                        self.emit_load_pair_indirect_impl();
++                    }
++                    SlotAddr::Direct(slot) => self.emit_load_pair_from_slot_impl(slot),
++                    SlotAddr::Indirect(slot) => {
++                        self.emit_load_ptr_from_slot_impl(slot, ptr.0);
++                        self.emit_load_pair_indirect_impl();
++                    }
++                    SlotAddr::Reg(reg) => {
++                        self.emit_reg_to_addr(reg);
++                        self.emit_load_pair_indirect_impl();
++                    }
++                }
++                self.emit_store_acc_pair_impl(dest);
++                self.state.track_f128_self(dest.0);
++            }
++            return;
++        }
+         crate::backend::traits::emit_load_default(self, dest, ptr, ty);
+     }
+ 
 -- 
 2.47.3
 
 
-From a4308662a0eb1c5afdd4b4878eaec72a3a44eb25 Mon Sep 17 00:00:00 2001
+From 63bf028488310d5950c8268195969d8c17372605 Mon Sep 17 00:00:00 2001
 From: ms178 <ms178@users.noreply.github.com>
-Date: Fri, 28 Aug 2026 17:42:19 +0000
-Subject: [PATCH 8/8] docs: S06 follow-up - f128 carrier AAPCS64 fix, open
- peephole global-carrier bug + RISC-V gp-pair arm
+Date: Fri, 28 Aug 2026 18:17:25 +0000
+Subject: [PATCH 4/7] docs: landed register - riscv f128-carrier end-to-end
 
 ---
- updates/followup_2026-08-28_session09.md | 29 ++++++++++++++++++++++++
- 1 file changed, 29 insertions(+)
+ engineering/agent/BACKLOG.md | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
 
-diff --git a/updates/followup_2026-08-28_session09.md b/updates/followup_2026-08-28_session09.md
-index 7431164b..0d1ba3ae 100644
---- a/updates/followup_2026-08-28_session09.md
-+++ b/updates/followup_2026-08-28_session09.md
-@@ -116,3 +116,32 @@ are rejected with precise messages.
- APPLIES-CLEAN (validated with `git apply --check` on a pristine base
- worktree), zero garbage (no eprintln!/dbg!/TRACE/env-gated probes added;
- the pre-existing `resolve_pending_instructions` warning path untouched).
+diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
+index ae32905b..26c2dc53 100644
+--- a/engineering/agent/BACKLOG.md
++++ b/engineering/agent/BACKLOG.md
+@@ -319,7 +319,10 @@ mcount/`-pg` family · 32 KiB boot gate PASS · i686 natural slots ·
+ width-partitioned slots · RISC-V va_arg struct{long double} · ci-codegen
+ gate. · aarch64 f128-carrier full-precision plumbing (U128 loads/stores feed
+ the f128 tracker; pair loads prefer it; x9 dead-address-mov full-scan
+-soundness; f128_softfloat + f128_global_carrier green, 2026-08-28).
++soundness; f128_softfloat + f128_global_carrier green, 2026-08-28). · riscv f128-carrier
++end-to-end (f128_in_gp_pairs classify arm, tracker-fed U128 load/store,
++sign-bit intrinsic arms — F128Neg previously hit the silent SIMD no-op;
++f128_softfloat + f128_global_carrier green on qemu-riscv64, 2026-08-28).
+ 
+ Rejected-with-evidence (never resubmit without new data): Agent B's
+ MAX_SMALL_INLINE_BLOCKS 12 / -Os cap removal / split-call-everywhere;
+-- 
+2.47.3
+
+
+From 93b3dc650d3678a94d0dc90d7afdb5cdca82b5ec Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 18:25:26 +0000
+Subject: [PATCH 5/7] riscv: store the accumulator, not saved-acc t3, in typed
+ indirect stores
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+emit_store_default's Indirect/Reg arms resolve the target address into
+t5 and load the VALUE into the accumulator via emit_load_operand ->
+operand_to_t0, but RISC-V's emit_typed_store_indirect stored t3 — the
+emit_save_acc scratch — which holds an unrelated value unless the
+producer explicitly saved it. Every indirect store whose value was
+simply live in the accumulator wrote garbage (observed: F64 array
+element stores computed correct bits into t0 and then stored stale t3;
+vex_move_false_dep and any array-of-double code miscompiled on riscv64).
+
+ARM hit this same trap and its emit_typed_store_indirect already
+documents the fix ("Using x1 here stores an unrelated value for globals,
+heap fields, and all other indirect destinations"); RISC-V never
+received the equivalent.
+
+Validation: riscv64 array-store probes and the FP-chain differential now
+match GCC output exactly (were 0.0/garbage); ARM 375/32/75 and x86 537/5
+suites unchanged.
+---
+ src/backend/riscv/codegen/emit.rs | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/riscv/codegen/emit.rs b/src/backend/riscv/codegen/emit.rs
+index ddb80725..cd6bf10e 100644
+--- a/src/backend/riscv/codegen/emit.rs
++++ b/src/backend/riscv/codegen/emit.rs
+@@ -695,7 +695,12 @@ impl ArchCodegen for RiscvCodegen {
+         self.state.emit("    mv t3, t0");
+     }
+     fn emit_typed_store_indirect(&mut self, instr: &'static str, _ty: IrType) {
+-        self.state.emit_fmt(format_args!("    {} t3, 0(t5)", instr));
++        // The value rides the accumulator (t0) per the emit_store_default
++        // contract (emit_load_operand -> operand_to_t0); t3 is the SAVED-acc
++        // scratch and holds an unrelated value here. Storing t3 wrote
++        // garbage for every indirect store whose value wasn't explicitly
++        // saved first (observed: F64 array element stores on riscv64).
++        self.state.emit_fmt(format_args!("    {} t0, 0(t5)", instr));
+     }
+     fn emit_typed_load_indirect(&mut self, instr: &'static str) {
+         self.state.emit_fmt(format_args!("    {} t0, 0(t5)", instr));
+-- 
+2.47.3
+
+
+From 9243b80f8dd401f84ea49db7e497457098e1cd87 Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 18:25:26 +0000
+Subject: [PATCH 6/7] arm, riscv: scalar FP round/fma/copysign intrinsics (were
+ silently dropped)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+RoundScalarF64/F32, FmaScalarF64/F32 and CopysignF64/F32 were lowered
+only on x86 (ROUNDSD/VFMA/VANDPD); aarch64 and riscv64 fell into the
+intrinsics catch-all and emitted NOTHING, so rint/floor/ceil/trunc/
+copysign/fma read uninitialized registers and returned 0.0 (observed:
+vex_move_false_dep outputs DIFFER on both, any math.h-heavy code broken).
+
+  * aarch64: native FRINTN/M/P/Z (x86 ROUND imm8 modes map 1:1: 0=nearest-
+    even, 1=floor(-inf), 2=ceil(+inf), 3=trunc(zero)), FMADD, and sign-bit
+    and/or on the F64/F32 patterns for copysign.
+  * riscv64: FMADD.d/S and FSGNJ.d/S are native; the mode-selecting round
+    has no RV64D instruction, so route through the libm symbols (rint/
+    floor/ceil/trunc[f]) exactly as GCC's unfolded builtins do — fa0 is
+    the F64 ABI argument register.
+  * each staged operand bridges through t0 on riscv (operand_to_t0's only
+    target); the initial version bridged ft1/ft2 from stale t1/t2.
+
+New self-checking differential test scalar_fp_builtins (no libm needed
+on aarch64; -lm on riscv64 for the rounding symbols). Validation:
+aarch64 + riscv64 outputs byte-match GCC on vex_move_false_dep and the
+new test; ARM suite 375/32/75 (was 373/33); x86 suite 537/5 (test added);
+lib 1273/0/6.
+---
+ src/backend/arm/codegen/intrinsics.rs   | 74 ++++++++++++++++++++
+ src/backend/riscv/codegen/intrinsics.rs | 89 +++++++++++++++++++++++++
+ tests/regression/scalar_fp_builtins.c   | 39 +++++++++++
+ 3 files changed, 202 insertions(+)
+ create mode 100644 tests/regression/scalar_fp_builtins.c
+
+diff --git a/src/backend/arm/codegen/intrinsics.rs b/src/backend/arm/codegen/intrinsics.rs
+index b283e06a..30f27c27 100644
+--- a/src/backend/arm/codegen/intrinsics.rs
++++ b/src/backend/arm/codegen/intrinsics.rs
+@@ -399,6 +399,80 @@ impl ArmCodegen {
+             IntrinsicOp::SqrtF32 => self.emit_f32_unary_neon(dest, args, "fsqrt"),
+             IntrinsicOp::FabsF64 => self.emit_f64_unary_neon(dest, args, "fabs"),
+             IntrinsicOp::FabsF32 => self.emit_f32_unary_neon(dest, args, "fabs"),
++            // ── Scalar FP round/FMA/copysign ────────────────────────────────
++            // x86 lowered these to SSE ROUNDSD/VFMA/VANDPD; without arms here
++            // they hit the silent catch-all and produced uninitialized
++            // registers (observed: rint/floor/ceil/trunc/copysign/fma all
++            // returned 0.0 on aarch64, vex_move_false_dep outputs DIFFER).
++            IntrinsicOp::RoundScalarF64(imm) => {
++                // x86 ROUNDSD imm8 rounding modes map 1:1 onto AArch64
++                // FRINT* variants; bit 3 (precision mask) is not emitted.
++                let frint = match imm & 3 {
++                    0 => "frintn", // round to nearest, ties to even
++                    1 => "frintm", // toward -inf (floor)
++                    2 => "frintp", // toward +inf (ceil)
++                    3 => "frintz", // toward zero (trunc)
++                    _ => unreachable!("ROUND imm8 mode bits are 2 bits wide"),
++                };
++                self.emit_f64_unary_neon(dest, args, frint);
++            }
++            IntrinsicOp::RoundScalarF32(imm) => {
++                let frint = match imm & 3 {
++                    0 => "frintn",
++                    1 => "frintm",
++                    2 => "frintp",
++                    3 => "frintz",
++                    _ => unreachable!("ROUND imm8 mode bits are 2 bits wide"),
++                };
++                self.emit_f32_unary_neon(dest, args, frint);
++            }
++            IntrinsicOp::FmaScalarF64 => {
++                // dest = a*b + c, single rounding: native fmadd.
++                self.float_operand_to_reg(&args[0], IrType::F64, "d0");
++                self.float_operand_to_reg(&args[1], IrType::F64, "d1");
++                self.float_operand_to_reg(&args[2], IrType::F64, "d2");
++                self.state.emit("    fmadd d0, d0, d1, d2");
++                if let Some(d) = dest {
++                    self.store_float_reg(d, IrType::F64, "d0");
++                }
++            }
++            IntrinsicOp::FmaScalarF32 => {
++                self.float_operand_to_reg(&args[0], IrType::F32, "s0");
++                self.float_operand_to_reg(&args[1], IrType::F32, "s1");
++                self.float_operand_to_reg(&args[2], IrType::F32, "s2");
++                self.state.emit("    fmadd s0, s0, s1, s2");
++                if let Some(d) = dest {
++                    self.store_float_reg(d, IrType::F32, "s0");
++                }
++            }
++            IntrinsicOp::CopysignF64 => {
++                // result = |x| with y's sign bit: pure integer bit ops on
++                // the F64 bit patterns (no branch, no libm call).
++                self.float_operand_to_reg(&args[0], IrType::F64, "d0");
++                self.float_operand_to_reg(&args[1], IrType::F64, "d1");
++                self.state.emit("    fmov x0, d0");
++                self.state.emit("    fmov x1, d1");
++                self.state.emit("    and x0, x0, #0x7fffffffffffffff");
++                self.state.emit("    and x1, x1, #0x8000000000000000");
++                self.state.emit("    orr x0, x0, x1");
++                self.state.emit("    fmov d0, x0");
++                if let Some(d) = dest {
++                    self.store_float_reg(d, IrType::F64, "d0");
++                }
++            }
++            IntrinsicOp::CopysignF32 => {
++                self.float_operand_to_reg(&args[0], IrType::F32, "s0");
++                self.float_operand_to_reg(&args[1], IrType::F32, "s1");
++                self.state.emit("    fmov w0, s0");
++                self.state.emit("    fmov w1, s1");
++                self.state.emit("    and w0, w0, #0x7fffffff");
++                self.state.emit("    and w1, w1, #0x80000000");
++                self.state.emit("    orr w0, w0, w1");
++                self.state.emit("    fmov s0, w0");
++                if let Some(d) = dest {
++                    self.store_float_reg(d, IrType::F32, "s0");
++                }
++            }
+             // x86-specific SSE/AES-NI/CLMUL intrinsics - these are x86-only and should
+             // not appear in ARM codegen in practice. Cross-compiled code that conditionally
+             // uses these behind #ifdef __x86_64__ will have the calls dead-code eliminated.
+diff --git a/src/backend/riscv/codegen/intrinsics.rs b/src/backend/riscv/codegen/intrinsics.rs
+index 7e7dae9f..ade57ef8 100644
+--- a/src/backend/riscv/codegen/intrinsics.rs
++++ b/src/backend/riscv/codegen/intrinsics.rs
+@@ -244,6 +244,95 @@ impl RiscvCodegen {
+                     self.store_t0_to(d);
+                 }
+             }
++            // ── Scalar FP round/FMA/copysign ────────────────────────────────
++            // x86 lowered these to SSE ops; without arms they hit the silent
++            // catch-all and produced uninitialized registers.
++            IntrinsicOp::RoundScalarF64(imm) => {
++                // RV64D has no mode-selecting round instruction; route
++                // through libm (fa0 is the F64 ABI argument register).
++                let sym = match imm & 3 {
++                    0 => "rint",  // nearest, ties to even
++                    1 => "floor", // toward -inf
++                    2 => "ceil",  // toward +inf
++                    _ => "trunc", // toward zero
++                };
++                self.operand_to_t0(&args[0]);
++                self.state.emit("    fmv.d.x fa0, t0");
++                self.state
++                    .emit_fmt(format_args!("    call {}", sym));
++                self.state.emit("    fmv.x.d t0, fa0");
++                if let Some(d) = dest {
++                    self.store_t0_to(d);
++                }
++            }
++            IntrinsicOp::RoundScalarF32(imm) => {
++                let sym = match imm & 3 {
++                    0 => "rintf",
++                    1 => "floorf",
++                    2 => "ceilf",
++                    _ => "truncf",
++                };
++                self.operand_to_t0(&args[0]);
++                self.state.emit("    fmv.s.x fa0, t0");
++                self.state
++                    .emit_fmt(format_args!("    call {}", sym));
++                self.state.emit("    fmv.x.s t0, fa0");
++                if let Some(d) = dest {
++                    self.store_t0_to(d);
++                }
++            }
++            IntrinsicOp::FmaScalarF64 => {
++                // dest = a*b + c, single rounding: native fmadd.d.
++                // operand_to_t0 always targets t0, so each bridge must run
++                // immediately after its own load.
++                self.operand_to_t0(&args[0]);
++                self.state.emit("    fmv.d.x ft0, t0");
++                self.operand_to_t0(&args[1]);
++                self.state.emit("    fmv.d.x ft1, t0");
++                self.operand_to_t0(&args[2]);
++                self.state.emit("    fmv.d.x ft2, t0");
++                self.state.emit("    fmadd.d ft0, ft0, ft1, ft2");
++                self.state.emit("    fmv.x.d t0, ft0");
++                if let Some(d) = dest {
++                    self.store_t0_to(d);
++                }
++            }
++            IntrinsicOp::FmaScalarF32 => {
++                self.operand_to_t0(&args[0]);
++                self.state.emit("    fmv.s.x ft0, t0");
++                self.operand_to_t0(&args[1]);
++                self.state.emit("    fmv.s.x ft1, t0");
++                self.operand_to_t0(&args[2]);
++                self.state.emit("    fmv.s.x ft2, t0");
++                self.state.emit("    fmadd.s ft0, ft0, ft1, ft2");
++                self.state.emit("    fmv.x.s t0, ft0");
++                if let Some(d) = dest {
++                    self.store_t0_to(d);
++                }
++            }
++            IntrinsicOp::CopysignF64 => {
++                // native fsgnj.d: |rs1| with rs2's sign bit.
++                self.operand_to_t0(&args[0]);
++                self.state.emit("    fmv.d.x ft0, t0");
++                self.operand_to_t0(&args[1]);
++                self.state.emit("    fmv.d.x ft1, t0");
++                self.state.emit("    fsgnj.d ft0, ft0, ft1");
++                self.state.emit("    fmv.x.d t0, ft0");
++                if let Some(d) = dest {
++                    self.store_t0_to(d);
++                }
++            }
++            IntrinsicOp::CopysignF32 => {
++                self.operand_to_t0(&args[0]);
++                self.state.emit("    fmv.s.x ft0, t0");
++                self.operand_to_t0(&args[1]);
++                self.state.emit("    fmv.s.x ft1, t0");
++                self.state.emit("    fsgnj.s ft0, ft0, ft1");
++                self.state.emit("    fmv.x.s t0, ft0");
++                if let Some(d) = dest {
++                    self.store_t0_to(d);
++                }
++            }
+             IntrinsicOp::FabsF64 => {
+                 self.operand_to_t0(&args[0]);
+                 self.state.emit("    fmv.d.x ft0, t0");
+diff --git a/tests/regression/scalar_fp_builtins.c b/tests/regression/scalar_fp_builtins.c
+new file mode 100644
+index 00000000..ec202ef8
+--- /dev/null
++++ b/tests/regression/scalar_fp_builtins.c
+@@ -0,0 +1,39 @@
++// Scalar FP builtins end-to-end (rint/floor/ceil/trunc/copysign/fma/fabs/sqrt)
++// on every backend. These lower to RoundScalarF64/FmaScalarF64/CopysignF64
++// intrinsics; x86 got SSE lowering while aarch64 and riscv64 silently dropped
++// them in their intrinsic catch-alls (every result read uninitialized
++// registers -> 0.0). Self-checking so no libm link is needed.
++#include <stdio.h>
 +
-+## S06 — _Float128 carrier (IrType::U128) AAPCS64 fix — COMMITTED f66a5905 (7th commit)
++static int fails = 0;
++#define CHECK(cond) do { if (!(cond)) { fails++; } } while (0)
 +
-+Root cause was never the flag plumbing (verified both sides via CCC_DUMP_IR): classify_args_core
-+emitted x86-only CoreArgClass::F128SseReg unconditionally, and ARM ignored it plus ret_is_f128_sse.
-+Fix (all validated, x86 byte-identical):
-+- call_abi.rs: per-target classification, gated config.f128_in_fp_regs (ARM-only) -> F128FpReg/F128Stack.
-+- ARM: func/call_ret_is_f128_sse stash; return path loads carrier into q0 (slot-direct fast path,
-+  OverAligned/Reg fallbacks); call-result store intercepts with single `str q0`.
-+- Caller staging: U128-typed F128Reg var-args load the source slot directly; IrConst::I128 consts
-+  stage bit-exactly (to_f64() integer-converted 1.5F128's bits into ~8.5e37).
-+Results: lib 1270/0/6 exact; ARM 371/34F/75S (was 369/36F, no regressions); x86 535/5F identical
-+with and without the change (all 5 pre-existing); f1/f2/f3 GCC-oracle parity ident=1.50 add3=4.50 mix=10.6875.
++volatile double vx = -2.37519;
++volatile double vy = 2.0;
++volatile float fx = -2.5f;
++volatile float fy = 4.0f;
 +
-+### Open, in order (paused mid-investigation this session)
-+1. ARM peephole miscompiles GLOBAL-scope carrier loads: `mov x9,x20; ldr x0,[x9]; ldr x1,[x9,#8]`
-+   loses the mov while only ONE use is rewritten -> `ldr x0,[x0]; ldr x1,[x9,#8]` (stale x9, SIGSEGV).
-+   Repro /tmp/wd/f5g.c (global _Float128 g=42.0F128; printf((double)g)). Verified NOT
-+   eliminate_move_chains/eliminate_unused_x9_address_moves/propagate_address_aliases/
-+   eliminate_overwritten_moves in isolation (stepwise unit test). Next suspect:
-+   late propagate_register_copies (rewrites only the single next instruction) followed by a
-+   move-deletion pass (eliminate_dead_call_staging_moves?) that then sees x9 as unused.
-+   This is PRE-EXISTING (U128 global loads predate the carrier work) and is what still fails
-+   f128_softfloat (rc=139).
-+2. RISC-V: same carrier bug class — call_abi.rs needs `config.f128_in_gp_pairs` -> F128GpPair arm
-+   (variant exists, consumed at riscv calls.rs:46). _Float128 on RISC-V is broken today.
-+3. Then remaining ARM fails: vex_move_false_dep (DIFFER), va_arg_wide_struct (rc=1),
-+   cast_chain_fold, nested_functions, glibc_vstmxcsr audit; then xarch census porting.
-+
++int main(void) {
++    double x = vx, y = vy;
++    CHECK(__builtin_rint(x) == -2.0);
++    CHECK(__builtin_floor(x) == -3.0);
++    CHECK(__builtin_ceil(x) == -2.0);
++    CHECK(__builtin_trunc(x) == -2.0);
++    CHECK(__builtin_rint(y) == 2.0);
++    CHECK(__builtin_floor(y) == 2.0);
++    CHECK(__builtin_copysign(1.5, x) == -1.5);
++    CHECK(__builtin_copysign(1.5, y) == 1.5);
++    CHECK(__builtin_fma(x, y, 0.5) == -4.25038);
++    CHECK(__builtin_fabs(x) == 2.37519);
++    CHECK(__builtin_sqrt(__builtin_fabs(x)) == __builtin_sqrt(2.37519));
++    float f = fx, g = fy;
++    CHECK(__builtin_rintf(f) == -2.0f);
++    CHECK(__builtin_floorf(f) == -3.0f);
++    CHECK(__builtin_copysignf(1.0f, f) == -1.0f);
++    CHECK(__builtin_fmaf(f, g, 0.5f) == -9.5f);
++    CHECK(__builtin_fabsf(f) == 2.5f);
++    if (fails != 0) {
++        printf("scalar_fp_builtins: %d check(s) failed\n", fails);
++    }
++    return fails != 0;
++}
+-- 
+2.47.3
+
+
+From da6670dd64a6602465e3057bf7c012a5a0656cfc Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 18:25:38 +0000
+Subject: [PATCH 7/7] aarch64: gate f128 store-tracking on slot-anchored homes
+ + const carriers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Completion of the U128-carrier tracking in the aarch64 i128 store path:
+(1) tracking the destination is sound only for Direct/OverAligned homes
+— an Indirect/Reg destination stores THROUGH a pointer, so its own slot
+does not anchor the bytes and a self-track would redirect later F128
+reads at pointer bytes; (2) constants stored through a U128-typed store
+(LongDouble bytes / I128 carrier bits) are full-precision by
+construction — track them, mirroring the riscv fix that unblocked
+const-initialized _Float128 locals from the lossy f64-extend fallback.
+
+Validated as part of the f128 probe battery: aarch64 f128_softfloat,
+f128_global_carrier and f1-f7 all GCC-oracle parity; suites unchanged
+(ARM 375/32/75, x86 537/5, lib 1273/0/6).
+---
+ src/backend/arm/codegen/memory.rs | 28 ++++++++++++++++++++++------
+ 1 file changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/src/backend/arm/codegen/memory.rs b/src/backend/arm/codegen/memory.rs
+index bf1bb512..e57861c5 100644
+--- a/src/backend/arm/codegen/memory.rs
++++ b/src/backend/arm/codegen/memory.rs
+@@ -259,12 +259,28 @@ impl ArmCodegen {
+             // holding the full 16 bytes — record it so later F128 paths can
+             // read them instead of degrading to the f64-extend fallback.
+             crate::backend::traits::emit_store_default(self, val, ptr, ty);
+-            if let Operand::Value(v) = val {
+-                if self.state.get_f128_source(v.0).is_some() {
+-                    if let Some(_dest_slot) = self.state.get_slot(ptr.0) {
+-                        self.state.track_f128_self(ptr.0);
+-                    }
+-                }
++            // Tracking is sound only when the destination slot anchors
++            // the bytes themselves (Direct alloca/value slot or an
++            // over-aligned alloca): an Indirect/Reg home stores THROUGH a
++            // pointer, so its own slot does not hold the data.
++            let slot_anchored = matches!(
++                self.state.resolve_slot_addr(ptr.0),
++                Some(SlotAddr::Direct(_) | SlotAddr::OverAligned(_, _))
++            );
++            let tracked_val = match val {
++                Operand::Value(v) => self.state.get_f128_source(v.0).is_some(),
++                // A constant stored through a U128-typed store IS the
++                // full-precision bit pattern by construction (LongDouble
++                // bytes, or the I128 carrier bits): the destination slot is
++                // a full-precision F128 source. Without this, a
++                // const-initialized local _Float128 forced every later
++                // intrinsic/argument staging into the lossy f64-extend
++                // fallback (observed: -1.5F128 negated to -0.0 on RISC-V).
++                Operand::Const(c) => matches!(c, IrConst::LongDouble(_, _) | IrConst::I128(_)),
++                _ => false,
++            };
++            if tracked_val && slot_anchored {
++                self.state.track_f128_self(ptr.0);
+             }
+             return;
+         }
 -- 
 2.47.3
 
