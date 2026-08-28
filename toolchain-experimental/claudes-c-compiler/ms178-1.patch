@@ -1,1675 +1,1062 @@
-diff --git a/docs/history/2026-08-27-session87-v2-codegen-optimizations.md b/docs/history/2026-08-27-session87-v2-codegen-optimizations.md
-new file mode 100644
-index 00000000..e8643fb7
---- /dev/null
-+++ b/docs/history/2026-08-27-session87-v2-codegen-optimizations.md
-@@ -0,0 +1,138 @@
-+# Session 87 — v2 optimization round on rebased main: pass-gating bug, branchy range folds, i64 fast paths, hot-web steal
+diff --git a/scripts/run_regression_suite.sh b/scripts/run_regression_suite.sh
+index c120c959..977f69a6 100755
+--- a/scripts/run_regression_suite.sh
++++ b/scripts/run_regression_suite.sh
+@@ -118,4 +118,40 @@ echo "================================================================"
+ echo "regression suite: PASS=$pass FAIL=$fail SKIP=$skip (AB-diff failures: $ab_fail)"
+ if [[ ${#FAILED[@]} -gt 0 ]]; then printf 'failed: %s\n' "${FAILED[@]}"; fi
+ echo "================================================================"
 +
-+Date: 2026-08-27 (evening continuation)
-+Upstream base at session start: `3db0bbe2` (merge of PR #267 — the user
-+merged the session-86 codegen patch upstream; local tree was content-identical,
-+so the rebase was a pure fast-forward).
-+Session commits: `bc577150` (six optimizations), `6ef51495` (sext+zext fold)
-+Compiler build: `scripts/build_lccc_fast.sh` (fastbuild, Rust 1.98.0 -O1, -j2)
-+Kernel tree: linux-6.18.46 (unchanged from session 86; `.lccc-prepared`)
++# ── 32 KiB boot-code size gate (the e12597c7 lesson: a size regression in
++# the boot path went unnoticed for sessions because nothing measured it).
++# Metric: pre-pecompat content end ≤ 24,576 (the alignment-cliff boundary;
++# `.pecompat` forces 4096 alignment, so `_end` jumps in 4 KiB steps and
++# hides progress inside a step). Skipped entirely when the prepared kernel
++# tree is absent (bare CI containers) — a skip is reported, not a pass.
++if [[ -n "${KERNEL_DIR:-}" && -f "$KERNEL_DIR/arch/x86/boot/printf.c" ]]; then
++    boot_out="$WORK/bootgate"
++    # build_kernel_boot.sh exits non-zero when the 32 KiB gate itself fails —
++    # that is a MEASUREMENT, not a build error; parse the log either way.
++    boot_log=$(KERNEL_DIR="$KERNEL_DIR" \
++               LCCC="$REPO/target/fastbuild/lccc" \
++               LCCC_LD="$REPO/target/fastbuild/lccc-ld" \
++               OUT="$boot_out" \
++               timeout 600 bash "$REPO/scripts/build_kernel_boot.sh" 2>&1 || true)
++    text_size=$(echo "$boot_log" | awk '$1 == ".text" && $2 ~ /^[0-9]+$/ {s=$2} END {print s}')
++    if [[ -z "$text_size" ]]; then
++        echo "boot gate: FAIL (no .text measurement — build errored)"
++        echo "$boot_log" | tail -5
++        fail=$((fail+1))
++    else
++        # content_end = 1,166 (bstext..initdata) + .text + 30 (.text32)
++        content_end=$(( 1166 + text_size + 30 ))
++        if (( content_end <= 24576 )); then
++            echo "boot gate: PASS (pre-pecompat end $content_end ≤ 24,576; .text $text_size)"
++        else
++            echo "boot gate: FAIL (pre-pecompat end $content_end > 24,576; .text $text_size)"
++            echo "          .text budget: ≤ 23,380 — see updates/followup_2026-08-27_session06.md §3"
++            fail=$((fail+1))
++        fi
++    fi
++else
++    echo "boot gate: SKIP (KERNEL_DIR not set or tree not prepared)"
++fi
 +
-+## Objective (user task)
-+
-+Continue the codegen optimizations; find and fix inefficiencies, code bloat
-+and performance problems; deliver **v2 ms178-1.patch** with all new
-+optimizations, rebased on the new main; keep the deliverable autosaved,
-+no garbage/debug leftovers.
-+
-+## Headline results
-+
-+* **Setup corpus `.text` 24,716 → 24,240 (−476 bytes)** across seven
-+  validated changes. cargo 1205/0/6, regression suite 467/0/11 AB-diff 0,
-+  i64 runtime torture 5.4M checks green (all opt levels, fast paths on/off).
-+* **A latent pass-gating bug is fixed that had silently disabled the primary
-+  inliner for every -m16 -Os/-Oz compile** (substring matching in the
-+  disable list: "postinline" also disabled "inline"). This alone is −195 B
-+  on the corpus and re-opens inlining as a size lever for the boot code.
-+* **The 32 KiB gate is now fully understood as an alignment cliff** (below),
-+  not a smooth overflow: `_end` is dominated by `.pecompat`'s 4096-byte
-+  alignment (header.S `.p2align 12` — PE-header semantics). The gate passes
-+  iff `bstext+…+text32` ends ≤ 24,576; current end is 25,436 (−860 to go).
-+  Session 82's PASS and session 86's FAIL both sit on this cliff — this is
-+  the first time the mechanism is written down.
-+
-+## The changes (all validated individually)
-+
-+1. **`pass_disabled()` token-exact matching** (passes/mod.rs). The m16 size
-+   policy disables `postinline,ifconv,gaddrcse,licm`; every gate tested the
-+   comma list by SUBSTRING, so "postinline" also matched the "inline" gate —
-+   the primary size-aware inliner never ran on -m16 -Os/-Oz. Also "univsr"
-+   disabled "ivsr". Re-measured each disabled pass individually via the new
-+   `CCC_M16_KEEP` hook: all four still grow the corpus (ifconv +410, licm
-+   +367, gaddrcse +355, postinline +56) — the policy itself is correct and
-+   stays. Corpus −195.
-+2. **`range_check`: `resolve_bool_cmp()`** — phi/select arms carry the
-+   frontend's boolean-widening cast `(i32)(u8)cmp`; the Select fold looked
-+   up the arm value in `cmp_defs` and failed on the cast — **the Select-form
-+   range fold had never fired on standard lowering**. Now resolves through
-+   the widening cast. Verified on -m32 -O2 (is_my_digit emits GCC's
-+   `subl $48; cmpl $9; setbe` shape).
-+3. **`range_check`: `fold_phi_diamonds()`** — the branchy short-circuit form
-+   that survives when if_convert is off (the m16 profile): `Bcond: Cmp;
-+   CondBranch → Bcheck: Cmp+Cast; Branch → Bmerge: Phi([0,Bcond],[w,Bcheck])`
-+   folds to the unsigned-bias `sub+cmp` in Bcond; Bcheck dies. Fail-closed
-+   structural checks: exactly two phi arms, single-pred Bcheck, no other
-+   Bmerge preds, second cmp/cast not used outside the diamond. Corpus −175.
-+4. **i686 `emit_copy_value`: register→register copies** — one direct
-+   `movl %s,%d` instead of the eax relay (`movl %s,%eax; movl %eax,%d`);
-+   same-register (phi-coalesced) copies elide. Corpus −35.
-+5. **i686 `try_emit_i64_binop_fast/try_emit_i64_cmp_fast`** (i128_ops.rs) —
-+   64-bit And/Or/Xor/Add/Sub/Mul and all compares apply immediates and
-+   memory operands directly instead of the i128 stack staging
-+   (`pushl pair; op (%esp); addl $8`); identity folding for 0/−1 immediates;
-+   Eq/Ne collapse to the branchless xor-normalize-or-test. kstrtoull's
-+   overflow check was paying ~25 extra bytes per 64-bit ALU site.
-+   `CCC_NO_I64_FAST=1` disables. Corpus −21 net (string.c −138; small
-+   offsets elsewhere). Runtime torture: 20,000 random rounds × 27 checks ×
-+   all levels, against 32-bit-half reference implementations.
-+6. **regalloc Phase 2g: i686 hot-web steal** — phi-dest loop webs ranked by
-+   whole-web loop-weighted use count may displace colder holders (params)
-+   whose combined count is strictly lower; global cost accounting (the
-+   AArch64 loop-pin steal contract), plus the reg_hint guard. cmdline's
-+   `state` value now holds a register through the parse loop.
-+   `CCC_NO_HOT_WEB_STEAL` disables, `CCC_HOT_WEB_STEAL=k` tunes (default 3).
-+   Corpus −36.
-+7. **i686 peephole `fold_sext_zext_pairs`** — `movsbl SRC,%R32; movzbl
-+   %R8,%R32` → `movzbl SRC,%R32` (the `(u8)(i8)*p` shape; strncmp
-+   198 → 184). Corpus −14.
-+
-+## The 32 KiB gate — the alignment cliff (important for planning)
-+
-+`header.S` places `.pecompat` with `.p2align 12` (4096) — the EFI
-+mixed-mode PE header requirement. setup.ld links `.pecompat` right after
-+`.text32`, so the linker rounds the pre-pecompat content end up to the next
-+4096 boundary. Everything after (.rodata 1,394 + .videocards 84 + .data 140
-++ .signature 4 + .bss 4,960 ≈ 6,582 B) then lands at that boundary and
-+`_end = boundary + ~6,608`.
-+
-+* Content end ≤ 24,576 → `_end` ≈ 31,184 → **PASS** (session 82: content
-+  end 24,261, headroom 1,552 — exactly the recorded numbers).
-+* Content end 25,436 (now) → boundary 28,672 → `_end` 35,280 → **FAIL by
-+  2,512** — the same number session 86 measured, now decomposed:
-+  860 bytes of real code excess + 1,652 bytes of alignment waste inside the
-+  cliff window. GNU ld links the identical objects to the identical layout
-+  (verified) — this is kernel semantics, not an lccc-ld bug.
-+
-+**Gate math: `.text` ≤ 23,380 passes.** Current `.text` = 24,240 (−860).
-+
-+## GCC reference deltas after this session (per-file .text)
-+
-+string +1,883 (kstrtoull 996 vs 428, simple_strtoull 597 vs 279,
-+__div_u64_rem 186 vs 0), printf +1,620 (vsprintf 1,889 vs 1,121, number
-+1,290 vs 600), video +1,407, cpucheck +976, cmdline +790, video-vga +708,
-+edd +680, video-vesa +613, video-mode +612, cpuflags +568, main +347.
-+
-+## What did NOT work / was rejected
-+
-+* Re-enabling ifconv/licm/gaddrcse/postinline for m16: individually
-+  measured, all four grow the corpus (numbers above). Policy stays.
-+* Inlining `__div_u64_rem` (186 B standalone, GCC folds it away): the
-+  inliner's thresholds reject it (34 insts/3 blocks); forcing it is not
-+  obviously profitable under the current slot-heavy wide-value codegen —
-+  revisit after the RA work below.
-+* Deeper RA work in `number()`'s digit loop: ~7 live intermediates + the
-+  div's eax/edx hazard shape keep spilling; needs the hazard model to
-+  allow values BORN at a hazard point to claim the hazard's output
-+  register. Deferred (high value, high risk).
-+
-+## Next-session priorities
-+
-+1. **P0 — close the 860-byte gap to the gate cliff** (`.text` ≤ 23,380):
-+   number()/vsprintf loop RA (see below), the branch-form (control-flow)
-+   range fold — worth ~2-4 B × ~40 sites, the store-reload/scratch-slot
-+   elimination in number() (71 candidate pairs in one function).
-+2. **P0 — hazard-model refinement**: values defined BY a div (rem in %edx)
-+   should be able to claim %edx as home (born-at-hazard). Unlocks ecx/edx
-+   for the number() loop body.
-+3. **P1 — wire build_kernel_boot.sh into run_regression_suite.sh** (still
-+   not done; the cliff analysis makes the gate metric precise:
-+   pre-pecompat end ≤ 24,576).
-+4. **P1 — value-width map for Copy/phi dests** (byte slots, movb immediates)
-+   — cmdline's char state machine and myisspace sites.
-+5. **P2 — kstrtoull/simple_strtoull 64-bit multiply-accumulate chains**
-+   (res*base+val via mull/add/adc pairs like GCC).
-+
-+## Snapshot ledger
-+
-+`S03-s87-v2-codegen` — base `3db0bbe2`, head `6ef51495`, deliverable
-+ms178-1.patch regenerated (v2). All mirrors refreshed (workspace + PolarFS).
-diff --git a/src/backend/i686/codegen/emit.rs b/src/backend/i686/codegen/emit.rs
-index bea4255e..d1b48685 100644
---- a/src/backend/i686/codegen/emit.rs
-+++ b/src/backend/i686/codegen/emit.rs
-@@ -1663,6 +1663,9 @@ impl ArchCodegen for I686Codegen {
-     /// Override emit_binop to route I64/U64 through register-pair (eax:edx) arithmetic.
-     fn emit_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-         if matches!(ty, IrType::I64 | IrType::U64) {
-+            if self.try_emit_i64_binop_fast(dest, op, lhs, rhs) {
-+                return;
-+            }
-             self.emit_i128_binop(dest, op, lhs, rhs);
-             self.state.reg_cache.invalidate_all();
-             return;
-@@ -1691,6 +1694,11 @@ impl ArchCodegen for I686Codegen {
-             return;
-         }
-         if matches!(ty, IrType::I64 | IrType::U64) || crate::backend::generation::is_i128_type(ty) {
-+            if !crate::backend::generation::is_i128_type(ty)
-+                && self.try_emit_i64_cmp_fast(dest, op, lhs, rhs)
-+            {
-+                return;
-+            }
-             self.emit_i128_cmp(dest, op, lhs, rhs);
-             return;
-         }
-@@ -2322,6 +2330,40 @@ impl ArchCodegen for I686Codegen {
-             }
-         }
+ [[ $fail -eq 0 ]]
+diff --git a/src/backend/i686/codegen/alu.rs b/src/backend/i686/codegen/alu.rs
+index 026eee98..0cc7f3e0 100644
+--- a/src/backend/i686/codegen/alu.rs
++++ b/src/backend/i686/codegen/alu.rs
+@@ -30,6 +30,7 @@
  
-+        // Register→register copy: when the source value and the destination
-+        // value both hold non-accumulator GPR homes, emit ONE direct
-+        // `movl %src, %dest` instead of relaying through the accumulator
-+        // (`movl %s, %eax; movl %eax, %d`). Smaller per site, no accumulator
-+        // clobber (the register cache stays valid), no flags touched. A
-+        // same-register copy (phi-coalesced web transport) is elided
-+        // entirely. eax-homed sources/destinations stay on the generic path:
-+        // it already emits a single mov and maintains the accumulator cache.
-+        // Wide/f128/alloca values are excluded: their copies have
-+        // upper-word/segment semantics the single movl must not skip.
-+        if let Operand::Value(v) = src {
-+            if let (Some(sphys), Some(dphys)) = (
-+                self.reg_assignments.get(&v.0).copied(),
-+                self.reg_assignments.get(&dest.0).copied(),
-+            ) {
-+                if sphys.0 != 6
-+                    && dphys.0 != 6
-+                    && !self.state.is_wide_value(dest.0)
-+                    && !self.state.is_wide_value(v.0)
-+                    && !self.state.f128_direct_slots.contains(&dest.0)
-+                    && !self.state.f128_direct_slots.contains(&v.0)
-+                    && !self.state.is_alloca(v.0)
-+                {
-+                    if sphys != dphys {
-+                        let s = phys_reg_name(sphys);
-+                        let d = phys_reg_name(dphys);
-+                        emit!(self.state, "    movl %{}, %{}", s, d);
-+                    }
-+                    // Same home: the copy is a no-op.
-+                    return;
-+                }
-+            }
-+        }
-+
-         self.emit_load_operand(src);
-         self.emit_store_result(dest);
-     }
-diff --git a/src/backend/i686/codegen/i128_ops.rs b/src/backend/i686/codegen/i128_ops.rs
-index ee41a90d..b97dd9d3 100644
---- a/src/backend/i686/codegen/i128_ops.rs
-+++ b/src/backend/i686/codegen/i128_ops.rs
-@@ -8,9 +8,253 @@ use crate::backend::state::StackSlot;
- use crate::backend::traits::ArchCodegen;
+ use super::emit::{alu_mnemonic, shift_mnemonic, I686Codegen};
+ use super::magic_div::{magic_s32, magic_u32};
++use crate::backend::regalloc::PhysReg;
  use crate::common::types::IrType;
  use crate::emit;
--use crate::ir::reexports::{IrCmpOp, IrConst, Operand, Value};
-+use crate::ir::reexports::{IrBinOp, IrCmpOp, IrConst, Operand, Value};
- 
- impl I686Codegen {
-+    /// Direct 64-bit RHS reference for the i64 fast paths: a constant pair
-+    /// (immediates) or a wide value's slot pair (memory operands). This is
-+    /// what lets `res & mask`, `res * base` and 64-bit compares avoid the
-+    /// i128 stack-staging dance (`pushl` both halves, operate through
-+    /// `(%esp)`, `addl $8`) — the boot corpus' number parsers paid ~25
-+    /// extra bytes per 64-bit ALU site for it.
-+    fn i64_rhs_ref(&self, rhs: &Operand) -> Option<(String, String)> {
-+        match rhs {
-+            Operand::Const(c) => {
-+                let v: u128 = match c {
-+                    IrConst::I64(v) => *v as u128,
-+                    IrConst::I128(v) => (*v as u128) & 0xFFFF_FFFF_FFFF_FFFF,
-+                    IrConst::F64(f) => f.to_bits() as u128,
-+                    IrConst::Zero => 0,
-+                    other => other.to_i64()? as u128,
-+                };
-+                let lo = (v & 0xFFFF_FFFF) as i32;
-+                let hi = ((v >> 32) & 0xFFFF_FFFF) as i32;
-+                Some((format!("${}", lo), format!("${}", hi)))
-+            }
-+            Operand::Value(v) => {
-+                if !self.state.wide_values.contains(&v.0) {
-+                    return None;
+ use crate::ir::reexports::{IrBinOp, Operand, Value};
+@@ -570,6 +571,50 @@ impl I686Codegen {
+         rhs: &Operand,
+         _ty: IrType,
+     ) {
++        // Same-block div/rem pair fusion (compute_i686_divrem_pairs). The
++        // TAIL of a pair emits nothing — its result was stored by the HEAD's
++        // dual-store emission further up in this block. The HEAD emits one
++        // divl/idivl and stores its own result AND the partner's.
++        if matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) {
++            if self.divrem_tail_dests.contains(&dest.0)
++                && !self.divrem_broken_tails.contains(&dest.0)
++            {
++                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
++                    eprintln!("[DIVREM] tail-skip dest={}", dest.0);
 +                }
-+                let slot = self.state.get_slot(v.0)?;
-+                Some((self.slot_ref(slot), self.slot_ref_offset(slot, 4)))
++                // Tail: nothing to emit. The accumulator cache makes no
++                // claim about this dest (it was never staged through %eax),
++                // and its home/slot was written at the head.
++                return;
 +            }
-+            _ => None,
++            if self.divrem_broken_tails.contains(&dest.0) {
++                // Pair was broken at head-emission time (pathological home
++                // combination): both sides emit standalone divisions.
++                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
++                    eprintln!("[DIVREM] tail-broken dest={} (standalone)", dest.0);
++                }
++            } else if let Some(&(partner_dest, partner_from_eax)) =
++                self.divrem_head_partners.get(&dest.0)
++            {
++                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
++                    eprintln!(
++                        "[DIVREM] head-emit dest={} op={:?} partner={} partner_from_eax={}",
++                        dest.0, op, partner_dest, partner_from_eax
++                    );
++                }
++                let fused = self.emit_divrem_pair_head(
++                    dest, op, lhs, rhs, partner_dest, partner_from_eax,
++                );
++                if fused {
++                    return;
++                }
++                // Broken pair: fall through to the standalone path; the
++                // partner (tail) was marked broken above.
++                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
++                    eprintln!("[DIVREM] head-broken dest={} (standalone)", dest.0);
++                }
++            }
 +        }
-+    }
+         // Direct-to-dest path: skip the accumulator entirely when the dest
+         // has a register and both operands are register/slot/imm-resident.
+         if self.try_emit_int_binop_direct(dest, op, lhs, rhs) {
+@@ -683,7 +728,18 @@ impl I686Codegen {
+             IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+         );
+         let rhs_ref: String = if let Operand::Value(rv) = rhs {
+-            let direct = self.direct_reg_src_ref(rv);
++            // div/idiv: register-homed ALLOCAS also qualify as direct
++            // divisors. operand_to_ecx reads exactly `movl %home,%ecx` for
++            // them (the register holds the value), so `divl %home` is the
++            // identical read without the %ecx relay — which in turn keeps
++            // %ecx clean across the div for the register allocator's hazard
++            // model. %edx (dividend high half) and %eax (just clobbered by
++            // operand_to_eax(lhs)) stay excluded and stage through %ecx.
++            let direct = if div_like {
++                self.div_rhs_direct_ref(rv)
++            } else {
++                self.direct_reg_src_ref(rv)
++            };
+             if var_shift || (div_like && matches!(&direct, Some(r) if r == "%edx")) {
+                 self.operand_to_ecx(rhs);
+                 "%ecx".to_string()
+@@ -742,15 +798,148 @@ impl I686Codegen {
+             IrBinOp::SRem => {
+                 self.state.emit("    cltd");
+                 emit!(self.state, "    idivl {}", rhs_ref);
++                // Remainder born in %edx: when the dest is HOMED in %edx the
++                // relay through %eax (movl %edx,%eax; movl %eax,%edx) is a
++                // pure no-op pair — the result is already home.
++                if self.dest_reg(dest) == Some(PhysReg(5)) {
++                    self.state.reg_cache.invalidate_acc();
++                    return;
++                }
+                 self.state.emit("    movl %edx, %eax");
+             }
+             IrBinOp::URem => {
+                 self.state.emit("    xorl %edx, %edx");
+                 emit!(self.state, "    divl {}", rhs_ref);
++                if self.dest_reg(dest) == Some(PhysReg(5)) {
++                    self.state.reg_cache.invalidate_acc();
++                    return;
++                }
+                 self.state.emit("    movl %edx, %eax");
+             }
+         }
+         self.state.reg_cache.invalidate_acc();
+         self.store_eax_to(dest);
+     }
 +
-+    /// i64 ALU fast path (i686): load the LHS pair into %eax:%edx, then
-+    /// apply the RHS through immediates or direct memory operands — GCC's
-+    /// shape — instead of staging both operands through the stack. Handles
-+    /// Add/Sub/And/Or/Xor/Mul. Returns false (caller falls back to the i128
-+    /// path) for shapes it cannot express: `mull` has no immediate form, so
-+    /// a constant RHS multiplies through %ecx.
-+    pub(super) fn try_emit_i64_binop_fast(
++    /// Emit the HEAD of a fused same-block div/rem pair: one divl/idivl
++    /// computes both results; store the head's own result from its natural
++    /// output register (%edx for rem, %eax for div) and the partner's from
++    /// the register its flavour demands. Mirrors the general-path staging
++    /// (direct register-homed divisor incl. register-homed allocas, %ecx
++    /// staging otherwise).
++    ///
++    /// STORE ORDER IS LOAD-BEARING. The two results live in %eax (quotient)
++    /// and %edx (remainder) until stored. Storing the %eax side into a home
++    /// of %edx (`movl %eax,%edx`) destroys the remainder before it is
++    /// stored; symmetrically, storing the %edx side into an %eax home
++    /// destroys the quotient. The order below stores the %edx side first
++    /// unless that side's store writes %eax — and when BOTH conflict
++    /// (quotient homed %edx AND remainder homed %eax) no order works, so
++    /// the pair is BROKEN: this returns false, the caller falls through to
++    /// the standalone path, and the tail (marked in divrem_broken_tails)
++    /// emits its own division. The head is always emitted before the tail
++    /// (same block, earlier position), so the marker is set in time.
++    ///
++    /// Returns true when the fused emission completed.
++    fn emit_divrem_pair_head(
 +        &mut self,
 +        dest: &Value,
 +        op: IrBinOp,
 +        lhs: &Operand,
 +        rhs: &Operand,
++        partner_dest: u32,
++        partner_from_eax: bool,
 +    ) -> bool {
-+        if std::env::var_os("CCC_NO_I64_FAST").is_some() {
-+            return false;
-+        }
-+        if !matches!(
-+            op,
-+            IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor | IrBinOp::Mul
-+        ) {
-+            return false;
-+        }
-+        let Some((rlo, rhi)) = self.i64_rhs_ref(rhs) else {
-+            return false;
++        let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
++        let self_is_div = matches!(op, IrBinOp::UDiv | IrBinOp::SDiv);
++        self.operand_to_eax(lhs);
++        let rhs_ref: String = if let Operand::Value(rv) = rhs {
++            match self.div_rhs_direct_ref(rv) {
++                Some(r) => r,
++                None => {
++                    self.operand_to_ecx(rhs);
++                    "%ecx".to_string()
++                }
++            }
++        } else {
++            self.operand_to_ecx(rhs);
++            "%ecx".to_string()
 +        };
-+        let rlo_imm = rlo.starts_with('$');
-+        let rhi_imm = rhi.starts_with('$');
-+
-+        match op {
-+            IrBinOp::Mul => {
-+                self.emit_load_acc_pair(lhs);
-+                if !rlo_imm {
-+                    // Memory RHS: every product reads its operand directly —
-+                    // no stack staging at all.
-+                    self.state.emit("    movl %edx, %ecx");
-+                    emit!(self.state, "    imull {}, %ecx", rlo); // ahi*blo
-+                    self.state.emit("    movl %eax, %edx");
-+                    emit!(self.state, "    imull {}, %edx", rhi); // alo*bhi
-+                    self.state.emit("    addl %edx, %ecx");
-+                    emit!(self.state, "    mull {}", rlo); // eax:edx = alo*blo
-+                    self.state.emit("    addl %ecx, %edx");
-+                } else {
-+                    // Constant RHS: `mull` has no immediate form, so the low
-+                    // factor stages through %edx after the cross terms.
-+                    let blo = rlo.trim_start_matches('$');
-+                    let bhi = rhi.trim_start_matches('$');
-+                    self.state.emit("    movl %edx, %ecx");
-+                    emit!(self.state, "    imull ${}, %ecx", blo); // ahi*blo
-+                    self.state.emit("    movl %eax, %edx");
-+                    emit!(self.state, "    imull ${}, %edx", bhi); // alo*bhi
-+                    self.state.emit("    addl %edx, %ecx");
-+                    emit!(self.state, "    movl ${}, %edx", blo);
-+                    self.state.emit("    mull %edx"); // eax:edx = alo*blo
-+                    self.state.emit("    addl %ecx, %edx");
-+                }
-+            }
-+            IrBinOp::Add | IrBinOp::Sub => {
-+                self.emit_load_acc_pair(lhs);
-+                let (mn, mn_carry) = if op == IrBinOp::Add {
-+                    ("addl", "adcl")
-+                } else {
-+                    ("subl", "sbbl")
-+                };
-+                emit!(self.state, "    {} {}, %eax", mn, rlo);
-+                emit!(self.state, "    {} {}, %edx", mn_carry, rhi);
-+            }
-+            IrBinOp::And | IrBinOp::Or | IrBinOp::Xor => {
-+                self.emit_load_acc_pair(lhs);
-+                let mn = match op {
-+                    IrBinOp::And => "andl",
-+                    IrBinOp::Or => "orl",
-+                    _ => "xorl",
-+                };
-+                // Identity folding: x&0 / x|0 / x^0 = skip (zero-AND writes
-+                // zero, so emit `xorl reg,reg` for the 2-byte form); x&-1 /
-+                // x|-1 / x^-1 likewise reduce.
-+                let zero_lo = rlo_imm && rlo == "$0";
-+                let zero_hi = rhi_imm && rhi == "$0";
-+                let m1_lo = rlo_imm && rlo == "$-1";
-+                let m1_hi = rhi_imm && rhi == "$-1";
-+                if op == IrBinOp::And {
-+                    if zero_lo {
-+                        self.state.emit("    xorl %eax, %eax");
-+                    } else if !m1_lo {
-+                        emit!(self.state, "    andl {}, %eax", rlo);
-+                    }
-+                    if zero_hi {
-+                        self.state.emit("    xorl %edx, %edx");
-+                    } else if !m1_hi {
-+                        emit!(self.state, "    andl {}, %edx", rhi);
-+                    }
-+                } else if op == IrBinOp::Or {
-+                    if !zero_lo && !m1_lo {
-+                        emit!(self.state, "    orl {}, %eax", rlo);
-+                    } else if m1_lo {
-+                        self.state.emit("    movl $-1, %eax");
-+                    }
-+                    if !zero_hi && !m1_hi {
-+                        emit!(self.state, "    orl {}, %edx", rhi);
-+                    } else if m1_hi {
-+                        self.state.emit("    movl $-1, %edx");
-+                    }
-+                } else {
-+                    if !zero_lo {
-+                        emit!(self.state, "    xorl {}, %eax", rlo);
-+                    }
-+                    if !zero_hi {
-+                        emit!(self.state, "    xorl {}, %edx", rhi);
-+                    }
-+                }
-+            }
-+            _ => return false,
++        if signed {
++            self.state.emit("    cltd");
++            emit!(self.state, "    idivl {}", rhs_ref);
++        } else {
++            self.state.emit("    xorl %edx, %edx");
++            emit!(self.state, "    divl {}", rhs_ref);
 +        }
-+        self.emit_store_acc_pair(dest);
-+        self.state.reg_cache.invalidate_all();
++        self.state.reg_cache.invalidate_acc();
++
++        // Which value takes which output register:
++        //   div-flavoured dest -> %eax, rem-flavoured dest -> %edx.
++        let div_dest = if self_is_div {
++            *dest
++        } else {
++            Value(partner_dest)
++        };
++        let rem_dest = if self_is_div {
++            Value(partner_dest)
++        } else {
++            *dest
++        };
++        let _ = partner_from_eax; // flavour already encoded in the dest split above
++
++        let rem_home = self.dest_reg(&rem_dest).map(|p| p.0);
++        let div_home = self.dest_reg(&div_dest).map(|p| p.0);
++        // Immediately-consumed (accumulator-flow) values have neither a home
++        // nor a slot: their consumer reads %eax directly (see operand_to_eax's
++        // no-home fallback). The pair tail can never be one (the accumulator
++        // analysis excludes tails), so at most the HEAD's own dest is
++        // slotless — it must be materialised into %eax with a cache entry.
++        let rem_slotless =
++            rem_home.is_none() && self.state.get_slot(rem_dest.0).is_none();
++        let div_slotless =
++            div_home.is_none() && self.state.get_slot(div_dest.0).is_none();
++        // store_edx(rem) writes %eax iff rem is HOMED in %eax (PhysReg 6);
++        // store_eax(div) writes %edx iff div is HOMED in %edx (PhysReg 5).
++        let edx_side_writes_eax = rem_home == Some(6);
++        let eax_side_writes_edx = div_home == Some(5);
++
++        // Deadlock screening: combinations where NO store order preserves
++        // both results (each side's only copy sits in the register the other
++        // side's store must overwrite). Break the pair — both sides then
++        // emit standalone divisions, which is always correct.
++        if (edx_side_writes_eax && eax_side_writes_edx)
++            || (rem_slotless && eax_side_writes_edx)
++            || (div_slotless && edx_side_writes_eax)
++        {
++            self.divrem_broken_tails.insert(partner_dest);
++            return false;
++        }
++        if rem_slotless {
++            // Quotient out first (its store cannot touch %edx here); then
++            // move the remainder into %eax for its acc-flow consumer.
++            self.store_eax_to(&div_dest);
++            self.state.emit("    movl %edx, %eax");
++            self.state.reg_cache.set_acc(rem_dest.0, false);
++        } else if div_slotless {
++            // Remainder out first (its store cannot touch %eax here); the
++            // quotient is already in %eax — just claim the cache entry its
++            // consumer will read.
++            self.store_edx_to(&rem_dest);
++            self.state.reg_cache.set_acc(div_dest.0, false);
++        } else if edx_side_writes_eax {
++            // Quotient first (its store cannot touch %edx here); then the
++            // remainder store rewrites %eax — invalidate the acc claim the
++            // quotient store just made.
++            self.store_eax_to(&div_dest);
++            self.store_edx_to(&rem_dest);
++            self.state.reg_cache.invalidate_acc();
++        } else {
++            // Canonical order: remainder out of %edx first (homed there it
++            // is a no-op, leaving %edx free for the quotient's store).
++            self.store_edx_to(&rem_dest);
++            self.store_eax_to(&div_dest);
++        }
 +        true
 +    }
-+
-+    /// i64 compare fast path (i686): LHS pair in %eax:%edx, RHS applied
-+    /// through immediates or memory. Eq/Ne collapse to the branchless
-+    /// xor-normalize-or-test sequence (5 instructions); ordered compares
-+    /// keep the hi-then-lo label shape but read the RHS directly.
-+    pub(super) fn try_emit_i64_cmp_fast(
-+        &mut self,
-+        dest: &Value,
-+        op: IrCmpOp,
-+        lhs: &Operand,
-+        rhs: &Operand,
-+    ) -> bool {
-+        if std::env::var_os("CCC_NO_I64_FAST").is_some() {
-+            return false;
-+        }
-+        let Some((rlo, rhi)) = self.i64_rhs_ref(rhs) else {
-+            return false;
-+        };
-+        match op {
-+            IrCmpOp::Eq | IrCmpOp::Ne => {
-+                self.emit_load_acc_pair(lhs);
-+                emit!(self.state, "    xorl {}, %eax", rlo);
-+                emit!(self.state, "    xorl {}, %edx", rhi);
-+                self.state.emit("    orl %eax, %edx");
-+                let set = if op == IrCmpOp::Eq { "sete" } else { "setne" };
-+                emit!(self.state, "    {} %al", set);
-+                self.state.emit("    movzbl %al, %eax");
-+                self.state.reg_cache.invalidate_acc();
-+                self.store_eax_to(dest);
-+                true
-+            }
-+            IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge => {
-+                // Two-word signed compare: when the high words differ they
-+                // decide in the signed domain; otherwise the low words
-+                // decide in the unsigned domain. The hi-decided branch keeps
-+                // the signed setcc, the equal-hi fallthrough takes the
-+                // unsigned low setcc — the classic i386 sequence, minus the
-+                // stack staging of the i128 form.
-+                let label_id = self.state.next_label_id();
-+                let label_hi = format!(".Li64hidec_{}", label_id);
-+                let label_done = format!(".Li64done_{}", label_id);
-+                self.emit_load_acc_pair(lhs);
-+                emit!(self.state, "    cmpl {}, %edx", rhi);
-+                emit!(self.state, "    jne {}", label_hi);
-+                emit!(self.state, "    cmpl {}, %eax", rlo);
-+                let low_set = match op {
-+                    IrCmpOp::Slt => "setb",
-+                    IrCmpOp::Sle => "setbe",
-+                    IrCmpOp::Sgt => "seta",
-+                    IrCmpOp::Sge => "setae",
-+                    _ => unreachable!("signed i64 low-word cmp: {:?}", op),
-+                };
-+                emit!(self.state, "    {} %al", low_set);
-+                emit!(self.state, "    jmp {}", label_done);
-+                emit!(self.state, "{}:", label_hi);
-+                let high_set = match op {
-+                    IrCmpOp::Slt | IrCmpOp::Sle => "setl",
-+                    IrCmpOp::Sgt | IrCmpOp::Sge => "setg",
-+                    _ => unreachable!("signed i64 high-word cmp: {:?}", op),
-+                };
-+                emit!(self.state, "    {} %al", high_set);
-+                emit!(self.state, "{}:", label_done);
-+                self.state.emit("    movzbl %al, %eax");
-+                self.state.reg_cache.invalidate_acc();
-+                self.store_eax_to(dest);
-+                true
-+            }
-+            IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge => {
-+                let label_id = self.state.next_label_id();
-+                let label_hi = format!(".Li64u_{}", label_id);
-+                self.emit_load_acc_pair(lhs);
-+                emit!(self.state, "    cmpl {}, %edx", rhi);
-+                emit!(self.state, "    jne {}", label_hi);
-+                emit!(self.state, "    cmpl {}, %eax", rlo);
-+                emit!(self.state, "{}:", label_hi);
-+                // Unsigned: the SAME setcc serves both words (both compares
-+                // are in the unsigned domain), so the flags at the label
-+                // decide directly.
-+                let set = match op {
-+                    IrCmpOp::Ult => "setb",
-+                    IrCmpOp::Ule => "setbe",
-+                    IrCmpOp::Ugt => "seta",
-+                    IrCmpOp::Uge => "setae",
-+                    _ => unreachable!(),
-+                };
-+                emit!(self.state, "    {} %al", set);
-+                self.state.emit("    movzbl %al, %eax");
-+                self.state.reg_cache.invalidate_acc();
-+                self.store_eax_to(dest);
-+                true
-+            }
-+            _ => false,
-+        }
-+    }
-+
-+
-     pub(super) fn emit_sign_extend_acc_high_impl(&mut self) {
-         self.state.emit("    cltd");
-     }
-diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index c55aaf4c..62f5d358 100644
---- a/src/backend/i686/codegen/peephole.rs
-+++ b/src/backend/i686/codegen/peephole.rs
-@@ -5639,12 +5639,13 @@ pub fn peephole_optimize(asm: String) -> String {
-     // Phase 3.5: redundant zero-extension elimination (may expose dead
-     // stores and moves by shortening def-use chains, so it runs before DSE
-     // and the liveness cleanup).
-+    let pair_changed = fold_sext_zext_pairs(&mut store, &mut infos);
-     let zext_changed = eliminate_redundant_zext_i686(&mut store, &mut infos);
-     // Redundant SIGN-extension elimination runs right after: it turns
-     // `movsbl %al,%REG` into a `movl` copy or a no-op, which the cleanup
-     // loop below then propagates/deletes like any other move.
-     let sext_changed = eliminate_redundant_sign_ext_i686(&mut store, &mut infos);
--    if zext_changed || sext_changed {
-+    if pair_changed || zext_changed || sext_changed {
-         let mut changed3 = true;
-         let mut pass_count3 = 0;
-         while changed3 && pass_count3 < MAX_POST_GLOBAL_ITERATIONS {
-@@ -5739,11 +5740,116 @@ fn is_low_byte_register(name: &str) -> bool {
- ///
- /// The setup-code i686 emitter re-extends after EVERY sub-int operation
- /// (43 movzbl in video-bios.o alone, 15 of them provably redundant), because
--/// operand_to_eax cannot see the producer. Same state machine as the x86-64
--/// pass (redundant_ext.rs): flags cleared at labels/calls/barriers, updated
--/// by extensions, copies, and byte-preserving andl; anything else clears the
--/// written family. Fail-closed: implicit multi-register writers clear all.
-+/// `movsbl SRC, %R32` + `movzbl %R8, %R32` (same register family, adjacent)
-+/// → `movzbl SRC, %R32`: the zero-extension truncates the sign-extension's
-+/// high bits anyway, so the signed load is pure wasted work. The classic
-+/// source is `(u8)(i8)*p` char handling (strncmp/strchr) where the frontend
-+/// lowers the signed load and the unsigned cast as separate instructions.
-+/// Adjacency (nop lines aside) makes the sext's wider result provably dead:
-+/// nothing can read it between the two lines, and the movz overwrites the
-+/// register afterwards.
-+fn fold_sext_zext_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-+    let mut changed = false;
-+    let len = infos.len();
-+    let mut i = 0;
-+    while i + 1 < len {
-+        if infos[i].is_nop() || infos[i].is_barrier() {
-+            i += 1;
-+            continue;
-+        }
-+        if infos[i + 1].is_nop() {
-+            // Allow the pair to be separated by nop lines: find the next
-+            // real instruction, but a barrier or label kills the fold.
-+            let mut j = i + 1;
-+            while j < len && infos[j].is_nop() {
-+                j += 1;
-+            }
-+            if j >= len || infos[j].is_barrier() {
-+                i = j;
-+                continue;
-+            }
-+            if !try_fold_sext_zext_at(store, infos, i, j) {
-+                i += 1;
-+            } else {
-+                changed = true;
-+                i = j + 1;
-+            }
-+            continue;
-+        }
-+        if infos[i + 1].is_barrier() {
-+            i += 2;
-+            continue;
-+        }
-+        if try_fold_sext_zext_at(store, infos, i, i + 1) {
-+            changed = true;
-+            i += 2;
-+        } else {
-+            i += 1;
-+        }
-+    }
-+    changed
-+}
-+
-+fn try_fold_sext_zext_at(
-+    store: &mut LineStore,
-+    infos: &mut [LineInfo],
-+    sext_idx: usize,
-+    zext_idx: usize,
-+) -> bool {
-+    let sext = trimmed(store, &infos[sext_idx], sext_idx);
-+    let zext = trimmed(store, &infos[zext_idx], zext_idx);
-+    // movs{b,w}l SRC, %DST  followed by  movz{b,w}l %SRC-low, %DST
-+    let (byte_reg, sext_mnem, zext_mnem) = if sext.starts_with("movsbl ") {
-+        (true, "movsbl ", "movzbl ")
-+    } else if sext.starts_with("movswl ") {
-+        (false, "movswl ", "movzwl ")
-+    } else {
-+        return false;
-+    };
-+    let Some((src, sdst)) = sext.split_once(',') else {
-+        return false;
-+    };
-+    let src = src.strip_prefix(sext_mnem).unwrap_or(src).trim();
-+    let sdst = sdst.trim();
-+    let Some((zsrc, zdst)) = zext.split_once(',') else {
-+        return false;
-+    };
-+    let zsrc = zsrc.strip_prefix(zext_mnem).unwrap_or(zsrc).trim();
-+    let zdst = zdst.trim();
-+    if !zext.starts_with(zext_mnem) {
-+        return false;
-+    }
-+    if sdst != zdst {
-+        return false;
-+    }
-+    let sf = register_family(sdst);
-+    if sf > REG_GP_MAX {
-+        return false;
-+    }
-+    // The zext source register must be the sext destination's low part.
-+    let low_ok = if byte_reg {
-+        is_low_byte_register(zsrc) && register_family(zsrc) == sf
-+    } else {
-+        register_family(zsrc) == sf && zsrc.ends_with('x')
-+    };
-+    if !low_ok {
-+        return false;
-+    }
-+    // Fold: replace the sext with the zero-extending load, nop the zext.
-+    store.replace(
-+        sext_idx,
-+        format!("    {} {}, {}", if byte_reg { "movzbl" } else { "movzwl" }, src, zdst),
-+    );
-+    infos[sext_idx] = classify_line(store.get(sext_idx));
-+    infos[zext_idx].kind = LineKind::Nop;
-+    true
-+}
-+
- fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-+    // Same state machine as the x86-64 pass (redundant_ext.rs): flags cleared
-+    // at labels/calls/barriers, updated by extensions, copies, and
-+    // byte-preserving andl; anything else clears the written family.
-+    // Fail-closed: implicit multi-register writers clear all.
-     let mut changed = false;
-     let len = infos.len();
-     let mut is_byte = [false; 8]; // per family: value < 256
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index ae4f7a07..e3563eff 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -1922,6 +1922,137 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-         }
-         propagate_coalesce_members(&mut assignments, &coalesce_member_of);
-     }
-+    // Phase 2g (i686): hot-web steal on the narrow 4-register pool.
-+    //
-+    // Phase 1's start-point scan order is decisive on a pool this small:
-+    // long-lived parameters (defined at the entry, spanning every helper
-+    // call the m16 no-inline policy leaves behind) take ebx..ebp before any
-+    // loop-carried state is considered, and mode-3 eviction cannot displace
-+    // them afterwards — a victim whose next use lies anywhere inside the
-+    // incoming web's span is protected, which is exactly the params' shape.
-+    // The cmdline parser is the canonical case: option/buf/bufsize parked
-+    // three callee-saved registers while state/len/bufptr/opptr round-trip
-+    // stack slots on EVERY iteration — the exact inverse of GCC, which
-+    // keeps the loop values in registers and reloads the cold parameters
-+    // on the few paths that read them.
-+    //
-+    // Same contract as the AArch64 loop-pin steal above, tightened for the
-+    // narrow pool:
-+    //   * candidates are phi-dest loop webs ranked by the WHOLE web's
-+    //     loop-weighted use count (a state machine's leader alone
-+    //     undercounts: cmdline's `state` leader shows a fraction of the
-+    //     web's dispatch reads);
-+    //   * a register is stolen only when the combined use count of the
-+    //     holders it would displace is STRICTLY below the candidate's —
-+    //     global accounting, not the local future-use exchange that lost
-+    //     gzip when tried inside the scan (mode 5);
-+    //   * phi-web holders and ABI-hinted holders are never displaced;
-+    //   * the pass runs once, ranked, before Phase 2f's segment fill (the
-+    //     segment fill must not see co-holders the steal reasons about).
-+    let i686_narrow_pool = config
-+        .caller_saved_regs
-+        .iter()
-+        .any(|r| matches!(r.0, 4 | 5))
-+        && config.available_regs.iter().all(|r| r.0 <= 3);
-+    if !env_on("CCC_NO_HOT_WEB_STEAL")
-+        && i686_narrow_pool
-+        && !all_phi_pairs.is_empty()
-+    {
-+        let k: usize = std::env::var("CCC_HOT_WEB_STEAL")
-+            .ok()
-+            .and_then(|s| s.parse().ok())
-+            .unwrap_or(3);
-+        // Web-aware use count: the leader's own count plus every coalesce
-+        // member's (the state-machine webs the phi-coalesce machinery
-+        // propagates homes through).
-+        let web_use_count = |v: u32| -> u64 {
-+            let mut uc = use_count.get(&v).copied().unwrap_or(0);
-+            if let Some(members) = coalesce_groups.get(&v) {
-+                let total: u64 = members
-+                    .iter()
-+                    .map(|m| use_count.get(m).copied().unwrap_or(0))
-+                    .sum();
-+                uc = uc.max(total);
-+            }
-+            uc
-+        };
-+        let phi_pair_values: FxHashSet<u32> = phi_coalesce
-+            .iter()
-+            .flat_map(|c| [c.phi_dest, c.backedge_src])
-+            .collect();
-+        let mut candidates: Vec<(u32, u64)> = all_phi_pairs
-+            .iter()
-+            .map(|c| c.phi_dest)
-+            .filter(|v| eligible.contains(v))
-+            .filter(|v| iv_map.get(v).is_some_and(|&(s, e)| e > s))
-+            .map(|v| (v, web_use_count(v)))
-+            .filter(|&(_, count)| count >= 10)
-+            .collect();
-+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-+        candidates.dedup_by_key(|&mut (v, _)| v);
-+
-+        let overlaps_vid = |a: u32, b: u32| -> bool {
-+            match (iv_map.get(&a), iv_map.get(&b)) {
-+                (Some(&ia), Some(&ib)) => intervals_overlap(ia, ib),
-+                _ => false,
-+            }
-+        };
-+        let mut holders_by_reg: FxHashMap<u8, Vec<u32>> = FxHashMap::default();
-+        for (&v, &r) in &assignments {
-+            holders_by_reg.entry(r.0).or_default().push(v);
-+        }
-+
-+        let mut steals = 0;
-+        for &(vid, hot_count) in &candidates {
-+            if steals >= k || assignments.contains_key(&vid) {
-+                continue;
-+            }
-+            let mut best: Option<(u8, Vec<u32>, u64)> = None;
-+            for (&reg_id, holders) in &holders_by_reg {
-+                if !config.available_regs.iter().any(|r| r.0 == reg_id) {
-+                    continue;
-+                }
-+                if holders.iter().any(|h| {
-+                    phi_pair_values.contains(h) || config.reg_hints.contains_key(h)
-+                }) {
-+                    continue;
-+                }
-+                let evict: Vec<u32> = holders
-+                    .iter()
-+                    .copied()
-+                    .filter(|&h| overlaps_vid(h, vid))
-+                    .collect();
-+                if evict.is_empty() {
-+                    continue;
-+                }
-+                let cost: u64 = evict
-+                    .iter()
-+                    .map(|&h| use_count.get(&h).copied().unwrap_or(0))
-+                    .sum();
-+                if cost >= hot_count {
-+                    continue;
-+                }
-+                if best.as_ref().is_none_or(|&(_, _, c)| cost < c) {
-+                    best = Some((reg_id, evict, cost));
-+                }
-+            }
-+            if let Some((reg_id, evict, _)) = best {
-+                for &v in &evict {
-+                    evict_group(
-+                        &mut assignments,
-+                        &mut holders_by_reg,
-+                        v,
-+                        &coalesce_member_of,
-+                        &coalesce_groups,
-+                    );
-+                }
-+                assignments.insert(vid, PhysReg(reg_id));
-+                holders_by_reg.entry(reg_id).or_default().push(vid);
-+                steals += 1;
-+            }
-+        }
-+        propagate_coalesce_members(&mut assignments, &coalesce_member_of);
-+    }
-     // Phase 2f (all targets): fill holes in ALREADY-SAVED callee registers
-     // using the CFG-aware liveness segments. The primary scan deliberately
-     // retains one fat [def,last_use] interval per value, which is simple but
-diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index 17022907..e484970c 100644
---- a/src/passes/mod.rs
-+++ b/src/passes/mod.rs
-@@ -520,18 +520,18 @@ struct DisabledPasses {
- impl DisabledPasses {
-     fn from_env(disabled: &str) -> Self {
-         DisabledPasses {
--            cfg: disabled.contains("cfg"),
--            copyprop: disabled.contains("copyprop"),
--            narrow: disabled.contains("narrow"),
--            simplify: disabled.contains("simplify"),
--            constfold: disabled.contains("constfold"),
--            gvn: disabled.contains("gvn"),
--            licm: disabled.contains("licm"),
--            ifconv: disabled.contains("ifconv"),
--            dce: disabled.contains("dce"),
--            dse: disabled.contains("dse"),
--            ipcp: disabled.contains("ipcp"),
--            unroll: disabled.contains("unroll"),
-+            cfg: pass_disabled(&disabled, "cfg"),
-+            copyprop: pass_disabled(&disabled, "copyprop"),
-+            narrow: pass_disabled(&disabled, "narrow"),
-+            simplify: pass_disabled(&disabled, "simplify"),
-+            constfold: pass_disabled(&disabled, "constfold"),
-+            gvn: pass_disabled(&disabled, "gvn"),
-+            licm: pass_disabled(&disabled, "licm"),
-+            ifconv: pass_disabled(&disabled, "ifconv"),
-+            dce: pass_disabled(&disabled, "dce"),
-+            dse: pass_disabled(&disabled, "dse"),
-+            ipcp: pass_disabled(&disabled, "ipcp"),
-+            unroll: pass_disabled(&disabled, "unroll"),
-         }
-     }
  }
-@@ -565,11 +565,11 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
-     // Class-aware GlobalAddr CSE *before* the first GVN. GVN already CSEs
-     // GlobalAddr into same-block Copies, so a late-only run after
-     // post-structural-inline never sees duplicates.
--    if !disabled.contains("gaddrcse") {
-+    if !pass_disabled(&disabled, "gaddrcse") {
-         global_addr_cse::run_module(module);
-     }
-     iphase_dump!("global_addr_cse-pre-gvn");
--    if !disabled.contains("gvn") {
-+    if !pass_disabled(&disabled, "gvn") {
-         // Use the module context (GNU alias canonicalization, global epoch
-         // facts) exactly like the main pass loop: with the default context,
-         // loads across stores to GNU-alias'd globals are CSE'd and produce
-@@ -581,7 +581,7 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
-     constant_fold::run(module);
-     copy_prop::run(module);
- 
--    if !disabled.contains("inline") {
-+    if !pass_disabled(&disabled, "inline") {
-         if size_profile {
-             // -Os/-Oz: retain tiny/small and profitable one-use/loop
-             // inlines, but reject repeated cold medium-body expansion.
-@@ -688,11 +688,41 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
-     iphase_dump!("post-inline cleanup");
+diff --git a/src/backend/i686/codegen/emit.rs b/src/backend/i686/codegen/emit.rs
+index d1b48685..b113a4db 100644
+--- a/src/backend/i686/codegen/emit.rs
++++ b/src/backend/i686/codegen/emit.rs
+@@ -15,6 +15,7 @@ use crate::backend::regalloc::PhysReg;
+ use crate::backend::state::{CodegenState, StackSlot};
+ use crate::backend::traits::ArchCodegen;
+ use crate::common::fx_hash::FxHashMap;
++use crate::common::fx_hash::FxHashSet;
+ use crate::common::types::{AddressSpace, IrType};
+ use crate::delegate_to_impl;
+ use crate::emit;
+@@ -74,6 +75,21 @@ pub struct I686Codegen {
+     /// -Os/-Oz: prefer the shorter sequence (idiv/imul) over the faster one
+     /// (magic-number division, multi-instruction LEA multiply chains).
+     pub(super) optimize_for_size: bool,
++    /// Same-block div/rem pair analysis (see backend::regalloc::
++    /// compute_i686_divrem_pairs). Recomputed per function; the emitter uses
++    /// tail_dests/head_partners to fuse URem+UDiv couples into one divl.
++    pub(super) divrem_tail_dests: FxHashSet<u32>,
++    pub(super) divrem_head_partners: FxHashMap<u32, (u32, bool)>,
++    /// Pairs broken at emission time (pathological home combination — see
++    /// emit_divrem_pair_head): the tail must emit its own standalone
++    /// division even though the table lists it as a tail.
++    pub(super) divrem_broken_tails: FxHashSet<u32>,
++    /// Wide values whose IR definition is a ZERO-EXTENDING cast from a
++    /// 32-bit-or-smaller unsigned type (u32→u64, u8→u64, …): the high half
++    /// is provably zero, so 64-bit multiply/add with them drops the alo×bhi
++    /// cross term and carries with an immediate 0 — the parser hot shape
++    /// `res = res * base + val` (GCC: imull/mull/addl/adcl $0).
++    pub(super) zext_wide_values: FxHashSet<u32>,
  }
  
-+/// Exact-token pass-disable matching for the comma-separated list shared by
-+/// `CCC_DISABLE_PASSES` and the m16 size policy. The previous substring test
-+/// let a longer pass name disable an unrelated shorter one: the m16 policy's
-+/// "postinline" entry silently disabled the primary "inline" phase (every
-+/// -m16 -Os/-Oz compile ran without ANY inlining — the exact corpus where
-+/// helper inlining matters most), and "univsr" likewise disabled "ivsr".
-+/// Tokens are compared trimmed and exactly; "all" keeps its global meaning.
-+fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
-+    disabled
-+        .as_ref()
-+        .split(',')
-+        .any(|tok| {
-+            let tok = tok.trim();
-+            tok == "all" || tok == pass
-+        })
-+}
-+
- fn apply_m16_size_policy(disabled: &mut String, code16gcc: bool, opt_level: u32) {
-     if !code16gcc || opt_level < 4 {
-         return;
+ // Callee-saved physical register indices for i686
+@@ -141,6 +157,10 @@ impl I686Codegen {
+             current_return_type: IrType::I32,
+             is_variadic: false,
+             reg_assignments: FxHashMap::default(),
++            divrem_tail_dests: FxHashSet::default(),
++            divrem_head_partners: FxHashMap::default(),
++            divrem_broken_tails: FxHashSet::default(),
++            zext_wide_values: FxHashSet::default(),
+             used_callee_saved: Vec::new(),
+             va_named_stack_bytes: 0,
+             asm_scratch_idx: 0,
+@@ -257,6 +277,30 @@ impl I686Codegen {
+         None
      }
-+    // Measurement hook: CCC_M16_KEEP=<pass,...> removes individual passes
-+    // from the disable list so each can be A/B-measured in isolation. The
-+    // defaults are unchanged — this exists so the policy's entries stay
-+    // evidence-backed instead of cargo-culted from a conflated measurement.
-+    let keep: Vec<String> = std::env::var("CCC_M16_KEEP")
-+        .unwrap_or_default()
-+        .split(',')
-+        .filter(|s| !s.is_empty())
-+        .map(|s| s.trim().to_string())
-+        .collect();
-     for pass in ["postinline", "ifconv", "gaddrcse", "licm"] {
-+        if keep.iter().any(|k| k == pass) {
-+            continue;
+ 
++    /// Direct divisor source for div/idiv. Unlike `direct_reg_src_ref`,
++    /// register-homed ALLOCAS qualify: the divisor emission path stages a
++    /// register-homed operand with exactly `movl %home,%ecx` (see
++    /// operand_to_ecx's reg_assignments branch, which runs before the slot
++    /// path), so the home register holds the value and `divl %home` performs
++    /// the identical read without the %ecx relay. `%edx` (dividend high
++    /// half — divl would divide by edx:edx:eax) and `%eax` (clobbered by
++    /// operand_to_eax(lhs) moments before) are excluded; those home shapes
++    /// stage through %ecx exactly as before.
++    pub(super) fn div_rhs_direct_ref(&self, v: &Value) -> Option<String> {
++        if self.state.wide_values.contains(&v.0)
++            || self.state.f128_direct_slots.contains(&v.0)
++        {
++            return None;
 +        }
-         if !disabled.is_empty() {
-             disabled.push(',');
-         }
-@@ -733,7 +763,7 @@ pub(crate) fn run_passes(
-         eprintln!("{:#?}", module);
-         eprintln!("==== END IR ====");
-     }
--    if disabled.contains("all") {
-+    if pass_disabled(&disabled, "all") {
-         return;
-     }
- 
-@@ -818,7 +848,7 @@ pub(crate) fn run_passes(
-     // compile with an unreachable threshold (999999), paying a full module
-     // walk for guaranteed no-ops; now the walk is skipped entirely unless
-     // explicitly requested for experiments.
--    if std::env::var("CCC_OUTLINE_SWITCH").is_ok() && !disabled.contains("outline") {
-+    if std::env::var("CCC_OUTLINE_SWITCH").is_ok() && !pass_disabled(&disabled, "outline") {
-         outline_switch::run(module);
-     }
-     preloop_dump!("outline");
-@@ -827,20 +857,20 @@ pub(crate) fn run_passes(
-     // Converts self-recursive tail calls into back-edge branches before the
-     // main optimization loop so that LICM, IVSR, and GVN can optimize the
-     // resulting loops (e.g., hoist invariants, reduce induction variables).
--    if !disabled.contains("tce") {
-+    if !pass_disabled(&disabled, "tce") {
-         module.for_each_function(tail_call_elim::tail_calls_to_loops);
-     }
-     // Collapse the canonical accumulator-sum loop after TCE. This is a
-     // semantics-preserving closed form for the strict int/long recurrence and
-     // removes O(n) work without touching arbitrary loops.
--    if !disabled.contains("tail_sum_formula") {
-+    if !pass_disabled(&disabled, "tail_sum_formula") {
-         module.for_each_function(tail_call_elim::closed_form_tail_sum);
-     }
-     preloop_dump!("tce");
- 
-     // Binary recursion → iterative accumulator (e.g., Fibonacci).
-     // Runs after TCE so it catches patterns TCE can't handle (non-tail binary recursion).
--    if !disabled.contains("rec2iter") {
-+    if !pass_disabled(&disabled, "rec2iter") {
-         module.for_each_function(recursion_to_iter::recursion_to_iteration);
-     }
-     preloop_dump!("rec2iter");
-@@ -856,7 +886,7 @@ pub(crate) fn run_passes(
-     // uses the size-aware policy at -Os/-Oz, so running the unrestricted
-     // inliner unconditionally in this later phase defeats that decision and
-     // can clone medium helpers at every call site after the first cleanup.
--    if !disabled.contains("postinline") {
-+    if !pass_disabled(&disabled, "postinline") {
-         if optimize_for_size {
-             inline::run_size_optimized(module);
-         } else {
-@@ -902,7 +932,7 @@ pub(crate) fn run_passes(
-     // Second GlobalAddr CSE: post-structural inlining can clone callers and
-     // re-duplicate address materializations after the pre-GVN run.
-     // Pass name for CCC_DISABLE_PASSES: "gaddrcse".
--    if !disabled.contains("gaddrcse") {
-+    if !pass_disabled(&disabled, "gaddrcse") {
-         global_addr_cse::run_module(module);
-         module.for_each_function(dce::eliminate_dead_code);
-     }
-@@ -1011,7 +1041,7 @@ pub(crate) fn run_passes(
-         // sequences produce wrong results. Fall back to hardware idiv/div instead.
-         // TODO: Re-enable once i686 has proper 64-bit arithmetic support, or implement
-         // a 32-bit-aware variant that uses single-operand imull for mulhi.
--        if iter == 0 && !disabled.contains("divconst") && !target.is_32bit() {
-+        if iter == 0 && !pass_disabled(&disabled, "divconst") && !target.is_32bit() {
-             let n = timed_pass!(
-                 "div_by_const",
-                 run_on_visited(
-@@ -1068,7 +1098,7 @@ pub(crate) fn run_passes(
-                 target,
-                 crate::backend::Target::X86_64 | crate::backend::Target::Aarch64
-             )
--            && !disabled.contains("vectorize")
-+            && !pass_disabled(&disabled, "vectorize")
-         {
-             let vectorize_fn = match (target, fp_reassoc, fp_contract, x86_avx) {
-                 (crate::backend::Target::Aarch64, true, _, _) => {
-@@ -1108,7 +1138,7 @@ pub(crate) fn run_passes(
- 
-         // Unroll/vectorize can clone loop bodies that still contained
-         // GlobalAddr. Re-CSE is O(n) and idempotent once addresses live in entry.
--        if iter == 0 && !disabled.contains("gaddrcse") {
-+        if iter == 0 && !pass_disabled(&disabled, "gaddrcse") {
-             let n = timed_pass!(
-                 "global_addr_cse_post_unroll",
-                 global_addr_cse::run_module(module)
-@@ -1200,7 +1230,7 @@ pub(crate) fn run_passes(
-         // dependency between the two chains (ICC's Adler-32 rotation). Idempotent
-         // (the pattern no longer matches after the rewrite). Pass name for
-         // CCC_DISABLE_PASSES: "reassoc_accum".
--        if !disabled.contains("reassoc_accum") {
-+        if !pass_disabled(&disabled, "reassoc_accum") {
-             let n = timed_pass!(
-                 "reassoc_accum",
-                 run_on_visited(module, &dirty, &mut changed, reassoc_accum::run_function)
-@@ -1235,13 +1265,13 @@ pub(crate) fn run_passes(
-             let run_gvn = gvn_enabled && !dis.gvn && should_run!(5, 0, 1, 3);
-             let run_licm = !dis.licm && should_run!(6, 0, 1, 5);
-             let run_ivsr =
--                iter == 0 && std::env::var("CCC_NO_IVSR").is_err() && !disabled.contains("ivsr");
-+                iter == 0 && std::env::var("CCC_NO_IVSR").is_err() && !pass_disabled(&disabled, "ivsr");
-             // Un-IVSR only pays off on targets with scaled-index addressing
-             // (x86-64 SIB). Gated for diagnostics like the other loop passes.
-             let run_univsr = run_ivsr
-                 && matches!(target, crate::backend::Target::X86_64)
-                 && std::env::var("CCC_NO_UNIVSR").is_err()
--                && !disabled.contains("univsr");
-+                && !pass_disabled(&disabled, "univsr");
- 
-             if run_gvn || run_licm || run_ivsr {
-                 let (gvn_n, licm_n, ivsr_n) = run_gvn_licm_ivsr_shared(
-@@ -1300,7 +1330,7 @@ pub(crate) fn run_passes(
-         // as Linux __ffs are initially CFG diamonds; only this placement sees
-         // the parallel value/count Select chains needed for Ctz recognition.
-         // The pass is idempotent and remains behind the normal disable switch.
--        if !disabled.contains("bit_idioms") {
-+        if !pass_disabled(&disabled, "bit_idioms") {
-             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
-             let n = timed_pass!(
-                 "bit_idioms_post_ifconv",
-@@ -1319,7 +1349,7 @@ pub(crate) fn run_passes(
-         // short-circuit branches. Idempotent and O(instructions), so it also
-         // folds Selects produced earlier (mem2reg in the pre-loop phase).
-         // Pass name for CCC_DISABLE_PASSES: "range_fold".
--        if !disabled.contains("range_fold") {
-+        if !pass_disabled(&disabled, "range_fold") {
-             let n = timed_pass!(
-                 "range_fold",
-                 run_on_visited(module, &dirty, &mut changed, range_check::run_function)
-@@ -1335,7 +1365,7 @@ pub(crate) fn run_passes(
-         // consumes the BitTest op (IS-06). Runs right after range_fold so
-         // folded ranges join the chain as bit runs.
-         // Pass name for CCC_DISABLE_PASSES: "set_membership".
--        if !disabled.contains("set_membership") {
-+        if !pass_disabled(&disabled, "set_membership") {
-             let n = timed_pass!(
-                 "set_membership",
-                 run_on_visited(module, &dirty, &mut changed, set_membership::run_function)
-@@ -1494,8 +1524,8 @@ pub(crate) fn run_passes(
-     // CCC_DISABLE_PASSES=latevec disables.
-     if matches!(target, crate::backend::Target::Aarch64)
-         && !optimize_for_size
--        && !disabled.contains("latevec")
--        && !disabled.contains("vectorize")
-+        && !pass_disabled(&disabled, "latevec")
-+        && !pass_disabled(&disabled, "vectorize")
-     {
-         let n = module.for_each_function(vectorize::vectorize_function_two_wide_late);
-         if n > 0 {
-@@ -1520,8 +1550,8 @@ pub(crate) fn run_passes(
-     // cleanup contract as the AArch64 branch above.
-     if matches!(target, crate::backend::Target::X86_64)
-         && !optimize_for_size
--        && !disabled.contains("latevec")
--        && !disabled.contains("vectorize")
-+        && !pass_disabled(&disabled, "latevec")
-+        && !pass_disabled(&disabled, "vectorize")
-     {
-         let n = module.for_each_function(vectorize::vectorize_function_late);
-         if n > 0 {
-@@ -1555,7 +1585,7 @@ pub(crate) fn run_passes(
-     // becomes SSA dataflow). Hardened rewrite of levkropp's 0980060d pass:
-     // default-closed transfer function, volatile/escape/segment guards.
-     // Iterate: each round can expose new dead stores for the next.
--    if !disabled.contains("slforward") {
-+    if !pass_disabled(&disabled, "slforward") {
-         for _ in 0..4 {
-             if module.for_each_function(store_load_forward::run) == 0 {
-                 break;
-@@ -1587,7 +1617,7 @@ pub(crate) fn run_passes(
-     // Late redundant-load elimination: post-IVSR field accesses have constant
-     // offsets, so same-address loads merge when intervening stores are
-     // provably non-aliasing (volatile loads are exempt by construction).
--    if !disabled.contains("redundantloads") {
-+    if !pass_disabled(&disabled, "redundantloads") {
-         module.for_each_function(redundant_loads::run);
-         // Merged loads orphan their (now dead) address computations.
-         module.for_each_function(dce::eliminate_dead_code);
-@@ -1596,7 +1626,7 @@ pub(crate) fn run_passes(
-     // (t(t+1)/2 recurrences): carries the index as two counters instead of
-     // recomputing mul+corrected-div every iteration. Exact: t(t+1) is always
-     // even, so the accumulator is bit-identical including wraparound.
--    if !disabled.contains("quadsr") {
-+    if !pass_disabled(&disabled, "quadsr") {
-         module.for_each_function(quadratic_sr::run);
-         module.for_each_function(dce::eliminate_dead_code);
-     }
-@@ -1604,7 +1634,7 @@ pub(crate) fn run_passes(
-     // Hoist FP constants used in loop bodies into preheader Copies so they can
-     // stay in FP registers across the loop (AArch64 constant-pool literal loads
-     // otherwise sit in the loop's dependency path every iteration).
--    if !disabled.contains("fpconst") {
-+    if !pass_disabled(&disabled, "fpconst") {
-         module.for_each_function(fp_const_hoist::run);
-     }
- 
-@@ -1621,7 +1651,7 @@ pub(crate) fn run_passes(
-     //   in-place; hoisting them burns a register and a callee-saved push —
-     //   the old sieve regression the AArch64-only gate existed for).
-     // * i686: no-op (nothing this pass sees pays a 64-bit materialization).
--    if !disabled.contains("intconst")
-+    if !pass_disabled(&disabled, "intconst")
-         && matches!(
-             target,
-             crate::backend::Target::Aarch64 | crate::backend::Target::X86_64
-@@ -1631,7 +1661,7 @@ pub(crate) fn run_passes(
-         module.for_each_function(int_const_hoist::run);
-     }
- 
--    if !disabled.contains("bepre") {
-+    if !pass_disabled(&disabled, "bepre") {
-         let n = module.for_each_function(backedge_pre::run);
-         if n > 0 { module.for_each_function(dce::eliminate_dead_code); }
-     }
-@@ -1652,7 +1682,7 @@ pub(crate) fn run_passes(
-     // removes the temp alloca + Memcpy that vector intrinsic lowering introduces
-     // for `__m256i x = _mm256_*(...)`, writing results directly into the variable
-     // slot and enabling the backend's memory-operand folding.
--    if !disabled.contains("vecpromote") {
-+    if !pass_disabled(&disabled, "vecpromote") {
-         vector_temp_promotion::promote_vector_temps(module);
-     }
- 
-@@ -1660,14 +1690,14 @@ pub(crate) fn run_passes(
-     // the original alignment facts are still available. This must precede
-     // alignment relaxation: deleting a load can make its temporary's expensive
-     // >16-byte alignment completely unobservable.
--    if !disabled.contains("vecpromote") {
-+    if !pass_disabled(&disabled, "vecpromote") {
-         vector_temp_promotion::fuse_vector_loads(module);
-     }
- 
-     // Phase 11d: Relax only the alignment left unobservable by the final use
-     // set. Aligned/non-temporal, atomic, volatile, address-observing and
-     // unaudited intrinsic positions retain their required alignment.
--    if !disabled.contains("vecpromote") {
-+    if !pass_disabled(&disabled, "vecpromote") {
-         vector_temp_promotion::downgrade_nonescaping_vector_align(module);
-     }
- 
-diff --git a/src/passes/range_check.rs b/src/passes/range_check.rs
-index 45b59691..cf1c2f7f 100644
---- a/src/passes/range_check.rs
-+++ b/src/passes/range_check.rs
-@@ -145,6 +145,40 @@ fn follow_casts(
-     (v, chain)
- }
- 
-+/// Resolve a boolean-producing value to its defining `Cmp`, looking through
-+/// the boolean-widening cast the frontend emits after every comparison
-+/// (`(i32)(u8)cmp`). Phi arms and Select arms carry that cast; without this
-+/// resolution the fold never sees the comparison at all (which is why the
-+/// Select form never fired on standard lowering). Returns the value id of
-+/// the underlying Cmp.
-+fn resolve_bool_cmp(
-+    v: u32,
-+    cmp_defs: &[Option<(IrCmpOp, Operand, Operand, IrType)>],
-+    cast_defs: &[Option<(Operand, IrType, IrType)>],
-+) -> Option<u32> {
-+    if cmp_defs.get(v as usize).is_some_and(|d| d.is_some()) {
-+        return Some(v);
-+    }
-+    let (src, from_ty, to_ty) = cast_defs.get(v as usize)?.as_ref()?;
-+    let Operand::Value(sv) = src else {
-+        return None;
-+    };
-+    // Only the boolean widening (U8/I8 → wider integer); anything else is a
-+    // semantic cast the fold must not see through.
-+    if !matches!(
-+        (from_ty, to_ty),
-+        (IrType::I8 | IrType::U8, IrType::I16 | IrType::I32 | IrType::U32)
-+    ) {
-+        return None;
-+    }
-+    let s = sv.0;
-+    if cmp_defs.get(s as usize).is_some_and(|d| d.is_some()) {
-+        Some(s)
-+    } else {
++        if let Some(&phys) = self.reg_assignments.get(&v.0) {
++            if phys.0 == 5 || phys.0 == 6 {
++                return None; // %edx / %eax: stage through %ecx instead
++            }
++            return Some(format!("%{}", phys_reg_name(phys)));
++        }
 +        None
 +    }
-+}
 +
- /// Match the two arms of a short-circuit select against the same value and
- /// extract the constant range. `and_form`:
- ///   true  → `x >= lo && x <= hi` (inclusive both ends)
-@@ -213,13 +247,15 @@ fn try_fold_select(
-     }
- 
-     // Resolve the two arms. Both forms have exactly one constant arm and two
--    // comparison arms.
-+    // comparison arms. Arms may carry the boolean-widening cast — resolve
-+    // through it to the defining comparison.
-     let (cond_bound, other_bound, and_form): (Bound, Bound, bool) = {
-         let cond_id = match cond {
-             Operand::Value(v) => v.0,
-             _ => return None,
-         };
--        let cond_cmp = cmp_defs.get(cond_id as usize)?.as_ref()?;
-+        let cond_cmp_id = resolve_bool_cmp(cond_id, cmp_defs, cast_defs)?;
-+        let cond_cmp = cmp_defs.get(cond_cmp_id as usize)?.as_ref()?;
-         let cond_bound = canonicalize(cond_cmp.0, &cond_cmp.1, &cond_cmp.2, cond_cmp.3)?;
- 
-         // `&&`: Select(cond, other, 0).  `||`: Select(cond, 1, other).
-@@ -228,7 +264,8 @@ fn try_fold_select(
-                 Operand::Value(v) => v.0,
-                 _ => return None,
-             };
--            let other_cmp = cmp_defs.get(other_id as usize)?.as_ref()?;
-+            let other_cmp_id = resolve_bool_cmp(other_id, cmp_defs, cast_defs)?;
-+            let other_cmp = cmp_defs.get(other_cmp_id as usize)?.as_ref()?;
-             let other_bound = canonicalize(other_cmp.0, &other_cmp.1, &other_cmp.2, other_cmp.3)?;
-             (cond_bound, other_bound, true)
-         } else if matches!(true_val, Operand::Const(c) if c.to_i64() == Some(1)) {
-@@ -236,7 +273,8 @@ fn try_fold_select(
-                 Operand::Value(v) => v.0,
-                 _ => return None,
-             };
--            let other_cmp = cmp_defs.get(other_id as usize)?.as_ref()?;
-+            let other_cmp_id = resolve_bool_cmp(other_id, cmp_defs, cast_defs)?;
-+            let other_cmp = cmp_defs.get(other_cmp_id as usize)?.as_ref()?;
-             let other_bound = canonicalize(other_cmp.0, &other_cmp.1, &other_cmp.2, other_cmp.3)?;
-             (cond_bound, other_bound, false)
-         } else {
-@@ -312,6 +350,387 @@ fn try_fold_select(
-     Some(out)
- }
- 
-+/// Fold the PHI form of a short-circuit `&&`/`||` range predicate.
-+///
-+/// if_convert is disabled on the m16 size profile (measured: it grows the
-+/// boot corpus), so a value-context `x >= lo && x <= hi` — an inlined
-+/// isdigit/isxdigit-style predicate — stays a branch diamond whose merge is
-+/// a Phi:
-+///
-+///   Bcond:  %c1 = Cmp(<bound1>, x, K1)
-+///           CondBranch(%c1, Bcheck, Bmerge)        // either orientation
-+///   Bcheck: %c2 = Cmp(<bound2>, x, K2)
-+///           [%w  = Cast %c2 -> T]                  // boolean widening
-+///           Branch(Bmerge)
-+///   Bmerge: %p = Phi([Const 0|1, Bcond], [%w, Bcheck])
-+///           ... uses of %p ...
-+///
-+/// The backend materializes that Phi as two setcc + slot-store arms plus a
-+/// reload (~25 bytes where GCC needs one sub+cmp). When both bounds compare
-+/// the same value, replace the whole diamond with the unsigned-bias form
-+/// computed in Bcond:
-+///
-+///   %d = Sub(x, K1); %u = Cmp(Ule, %d, K2-K1); [Cast %u -> T]
-+///   Branch(Bmerge)                               // unconditional
-+///
-+/// with every use of %p replaced by %u. Bcheck becomes unreachable and is
-+/// dropped. All structural requirements are checked fail-closed: the Phi has
-+/// exactly the two diamond arms, Bcheck has Bcond as its only predecessor
-+/// and branches straight to Bmerge, Bmerge has no other predecessors, the
-+/// second comparison (and its widening cast) has no uses besides the Phi
-+/// arm, and the cast chain of both comparison operands matches. Nested
-+/// diamonds (`(a&&b) || (c&&d)`) simply fail the match and keep their
-+/// existing shape — the inner folds still apply.
-+fn fold_phi_diamonds(
-+    func: &mut IrFunction,
-+    cmp_defs: &[Option<(IrCmpOp, Operand, Operand, IrType)>],
-+    cast_defs: &[Option<(Operand, IrType, IrType)>],
-+    next_id: &mut u32,
-+) -> usize {
-+    use crate::common::fx_hash::{FxHashMap, FxHashSet};
-+
-+    if func.blocks.is_empty() {
-+        return 0;
-+    }
-+    let idx_of: FxHashMap<u32, usize> = func
-+        .blocks
-+        .iter()
-+        .enumerate()
-+        .map(|(i, b)| (b.label.0, i))
-+        .collect();
-+    let label_of: Vec<u32> = func.blocks.iter().map(|b| b.label.0).collect();
-+
-+    // Successor labels of a terminator (structural, no operand reading).
-+    fn succs(t: &Terminator) -> Vec<u32> {
-+        match t {
-+            Terminator::Branch(l) => vec![l.0],
-+            Terminator::CondBranch {
-+                true_label,
-+                false_label,
-+                ..
-+            } => vec![true_label.0, false_label.0],
-+            Terminator::Switch { cases, default, .. } => {
-+                let mut v: Vec<u32> = cases.iter().map(|(_, l)| l.0).collect();
-+                v.push(default.0);
-+                v
-+            }
-+            _ => Vec::new(),
-+        }
-+    }
-+
-+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); func.blocks.len()];
-+    for (i, b) in func.blocks.iter().enumerate() {
-+        for s in succs(&b.terminator) {
-+            if let Some(&j) = idx_of.get(&s) {
-+                preds[j].push(i);
-+            }
-+        }
-+    }
-+
-+    // Candidate merges: a block whose leading phis include a 2-incoming Phi
-+    // with one constant arm and one value arm.
-+    struct Cand {
-+        merge_idx: usize,
-+        phi_pos: usize,
-+    }
-+    let mut cands: Vec<Cand> = Vec::new();
-+    for (mi, block) in func.blocks.iter().enumerate() {
-+        for (pi, inst) in block.instructions.iter().enumerate() {
-+            if let Instruction::Phi { incoming, .. } = inst {
-+                if incoming.len() == 2 {
-+                    cands.push(Cand {
-+                        merge_idx: mi,
-+                        phi_pos: pi,
-+                    });
-+                }
-+            } else {
-+                break; // phis lead the block
-+            }
-+        }
-+    }
-+
-+    let mut changes = 0usize;
-+    let mut removed: FxHashSet<u32> = FxHashSet::default();
-+    for cand in cands {
-+        if removed.contains(&label_of[cand.merge_idx]) {
-+            continue;
-+        }
-+        let (phi_dest, phi_ty, const_arm, val_arm) = {
-+            let merge = &func.blocks[cand.merge_idx];
-+            let Instruction::Phi {
-+                dest,
-+                incoming,
-+                ty,
-+            } = &merge.instructions[cand.phi_pos]
-+            else {
-+                continue;
-+            };
-+            let a = &incoming[0];
-+            let b = &incoming[1];
-+            let (const_arm, val_arm) = match (&a.0, &b.0) {
-+                (Operand::Const(_), Operand::Value(_)) => (a, b),
-+                (Operand::Value(_), Operand::Const(_)) => (b, a),
-+                _ => continue,
-+            };
-+            (*dest, *ty, (const_arm.0, const_arm.1), (val_arm.0, val_arm.1))
-+        };
-+        // Constant arm must be 0 (&&) or 1 (||).
-+        let and_form = match const_arm.0 {
-+            Operand::Const(c) if c.to_i64() == Some(0) => true,
-+            Operand::Const(c) if c.to_i64() == Some(1) => false,
-+            _ => continue,
-+        };
-+
-+        let bcond_idx = match idx_of.get(&const_arm.1.0) {
-+            Some(&i) => i,
-+            None => continue,
-+        };
-+        let bcheck_idx = match idx_of.get(&val_arm.1.0) {
-+            Some(&i) => i,
-+            None => continue,
-+        };
-+        if bcond_idx == cand.merge_idx || bcheck_idx == cand.merge_idx || bcond_idx == bcheck_idx {
-+            continue;
-+        }
-+
-+        // Bcheck: single predecessor (Bcond), branches straight to Bmerge.
-+        if preds[cand.merge_idx].len() != 2
-+            || !preds[cand.merge_idx].contains(&bcond_idx)
-+            || !preds[cand.merge_idx].contains(&bcheck_idx)
-+        {
-+            continue;
-+        }
-+        if preds[bcheck_idx].len() != 1 || preds[bcheck_idx][0] != bcond_idx {
-+            continue;
-+        }
-+        let bcheck_label = label_of[bcheck_idx];
-+        let merge_label = label_of[cand.merge_idx];
-+        if !matches!(func.blocks[bcheck_idx].terminator, Terminator::Branch(l) if l.0 == merge_label)
-+        {
-+            continue;
-+        }
-+
-+        // Bcond must end in a CondBranch whose two targets are exactly
-+        // {Bcheck, Bmerge}; remember which side Bmerge is on so the first
-+        // comparison can be normalized to its "contributes to the phi"
-+        // sense.
-+        let (cond_val, merge_on_true) = {
-+            let bcond = &func.blocks[bcond_idx];
-+            let Terminator::CondBranch {
-+                cond: Operand::Value(cv),
-+                true_label,
-+                false_label,
-+            } = &bcond.terminator
-+            else {
-+                continue;
-+            };
-+            let t_ok = true_label.0 == bcheck_label || true_label.0 == merge_label;
-+            let f_ok = false_label.0 == bcheck_label || false_label.0 == merge_label;
-+            if !(t_ok && f_ok) || true_label == false_label {
-+                continue;
-+            }
-+            (*cv, true_label.0 == merge_label)
-+        };
-+
-+        // Resolve both comparisons (through boolean widenings).
-+        let Some(c1_id) = resolve_bool_cmp(cond_val.0, cmp_defs, cast_defs) else {
-+            continue;
-+        };
-+        let Some(c1) = cmp_defs.get(c1_id as usize).and_then(|d| d.as_ref()) else {
-+            continue;
-+        };
-+        // Normalize the first comparison to the sense that contributes to
-+        // the phi: the Bmerge edge carries the constant arm. For `&&` the
-+        // constant is 0 and the merge edge means "first test failed", so
-+        // the contributing sense is the branch edge to Bcheck; when Bmerge
-+        // is the TRUE target the comparison is inverted. For `||` (constant
-+        // 1 on the merge edge) it is the opposite.
-+        let negate = if and_form { merge_on_true } else { !merge_on_true };
-+        let c1_op = if negate {
-+            match c1.0 {
-+                IrCmpOp::Slt => IrCmpOp::Sge,
-+                IrCmpOp::Sle => IrCmpOp::Sgt,
-+                IrCmpOp::Sgt => IrCmpOp::Sle,
-+                IrCmpOp::Sge => IrCmpOp::Slt,
-+                IrCmpOp::Ult => IrCmpOp::Uge,
-+                IrCmpOp::Ule => IrCmpOp::Ugt,
-+                IrCmpOp::Ugt => IrCmpOp::Ule,
-+                IrCmpOp::Uge => IrCmpOp::Ult,
-+                IrCmpOp::Eq => IrCmpOp::Ne,
-+                IrCmpOp::Ne => IrCmpOp::Eq,
-+            }
-+        } else {
-+            c1.0
-+        };
-+        let val_id = match val_arm.0 {
-+            Operand::Value(v) => v.0,
-+            _ => continue,
-+        };
-+        let Some(c2_id) = resolve_bool_cmp(val_id, cmp_defs, cast_defs) else {
-+            continue;
-+        };
-+        let Some(c2) = cmp_defs.get(c2_id as usize).and_then(|d| d.as_ref()) else {
-+            continue;
-+        };
-+        let Some(bound1) = canonicalize(c1_op, &c1.1, &c1.2, c1.3) else {
-+            continue;
-+        };
-+        let Some(bound2) = canonicalize(c2.0, &c2.1, &c2.2, c2.3) else {
-+            continue;
-+        };
-+
-+        let Some(range) = extract_range(&bound1, &bound2, and_form, cast_defs) else {
-+            continue;
-+        };
-+        let span = range.hi - range.lo;
-+        if int_const(range.ty, span).is_none() {
-+            continue;
-+        }
-+        let Some(lo_const) = int_const(range.ty, range.lo) else {
-+            continue;
-+        };
-+
-+        // Narrow the compare to the operand's source width when the operand
-+        // is a widening cast of a byte/short (mirrors the Select path: GCC's
-+        // `add edx,62; cmp dl,29` byte-compare shape).
-+        let mut cmp_ty = range.ty;
-+        if let Some(Some((_, from_ty, to_ty))) = cast_defs.get(range.value.0 as usize) {
-+            if *to_ty == range.ty
-+                && from_ty.is_integer()
-+                && from_ty.size() < range.ty.size()
-+                && int_const(*from_ty, span).is_some()
-+            {
-+                cmp_ty = *from_ty;
-+            }
-+        }
-+        let Some(span_narrow_const) = int_const(cmp_ty, span) else {
-+            continue;
-+        };
-+
-+        // The second comparison (and its widening cast, when the phi arm
-+        // carries one) must have no uses OUTSIDE Bcheck and the phi arm:
-+        // Bcheck dies with the fold, taking its Cmp/Cast definitions along,
-+        // so any other live consumer would reference a dead value. Uses
-+        // inside Bcheck itself are exactly the instructions being deleted.
-+        let mut arm_ok = true;
-+        'outer: for block in &func.blocks {
-+            if block.label.0 == bcheck_label {
-+                continue;
-+            }
-+            for inst in &block.instructions {
-+                if let Instruction::Phi { dest, incoming, .. } = inst {
-+                    if dest.0 == phi_dest.0 {
-+                        continue;
-+                    }
-+                    if incoming
-+                        .iter()
-+                        .any(|(op, _)| matches!(op, Operand::Value(v) if v.0 == val_id || v.0 == c2_id))
-+                    {
-+                        arm_ok = false;
-+                        break 'outer;
-+                    }
-+                }
-+                let mut bad = false;
-+                inst.for_each_used_value(|id| {
-+                    if id == val_id || id == c2_id {
-+                        bad = true;
-+                    }
-+                });
-+                if bad {
-+                    arm_ok = false;
-+                    break 'outer;
-+                }
-+            }
-+        }
-+        if !arm_ok {
-+            continue;
-+        }
-+
-+        // Build the replacement: sub + unsigned compare (+ widening cast to
-+        // the phi's type when it is not the boolean type itself).
-+        let sub_dest = Value(*next_id);
-+        *next_id += 1;
-+        let cmp_dest = Value(*next_id);
-+        *next_id += 1;
-+        let mut new_insts = Vec::with_capacity(3);
-+        new_insts.push(Instruction::BinOp {
-+            dest: sub_dest,
-+            op: IrBinOp::Sub,
-+            lhs: Operand::Value(range.value),
-+            rhs: Operand::Const(lo_const),
-+            ty: range.ty,
-+        });
-+        let cmp_op = if and_form { IrCmpOp::Ule } else { IrCmpOp::Ugt };
-+        new_insts.push(Instruction::Cmp {
-+            dest: cmp_dest,
-+            op: cmp_op,
-+            lhs: Operand::Value(sub_dest),
-+            rhs: Operand::Const(span_narrow_const),
-+            ty: cmp_ty,
-+        });
-+        // Replacement value for the phi's uses.
-+        let replacement: Operand = if phi_ty == IrType::I8 || phi_ty == IrType::U8 {
-+            Operand::Value(cmp_dest)
-+        } else {
-+            let cast_dest = Value(*next_id);
-+            *next_id += 1;
-+            new_insts.push(Instruction::Cast {
-+                dest: cast_dest,
-+                src: Operand::Value(cmp_dest),
-+                from_ty: IrType::I8,
-+                to_ty: phi_ty,
-+            });
-+            Operand::Value(cast_dest)
-+        };
-+
-+        // Apply: splice into Bcond, unconditional branch to Bmerge, replace
-+        // phi uses, delete the phi and Bcheck.
-+        {
-+            let bcond = &mut func.blocks[bcond_idx];
-+            bcond.instructions.extend(new_insts);
-+            bcond.terminator = Terminator::Branch(crate::ir::reexports::BlockId(merge_label));
-+        }
-+        // Replace every use of phi_dest with the replacement.
-+        for block in &mut func.blocks {
-+            for inst in &mut block.instructions {
-+                inst.for_each_operand_mut(|op: &mut Operand| {
-+                    if let Operand::Value(v) = op {
-+                        if v.0 == phi_dest.0 {
-+                            *op = replacement;
-+                        }
-+                    }
-+                });
-+                if let Some(d) = inst.dest() {
-+                    if d.0 == phi_dest.0 {
-+                        // The phi itself is handled below; other redefs of
-+                        // the same id cannot exist in SSA.
-+                    }
-+                }
-+            }
-+            block.terminator.for_each_operand_mut(|op: &mut Operand| {
-+                if let Operand::Value(v) = op {
-+                    if v.0 == phi_dest.0 {
-+                        *op = replacement;
-+                    }
-+                }
-+            });
-+        }
-+        // Drop the phi from Bmerge.
-+        let merge = &mut func.blocks[cand.merge_idx];
-+        merge.instructions.remove(cand.phi_pos);
-+        // Drop Bcheck (unreachable: its only predecessor now branches to
-+        // Bmerge). Deferred removal keeps earlier indices valid for this
-+        // loop; later candidates re-check `removed`.
-+        removed.insert(bcheck_label);
-+        changes += 1;
-+    }
-+
-+    if !removed.is_empty() {
-+        func.blocks.retain(|b| !removed.contains(&b.label.0));
-+    }
-+    changes
-+}
-+
- /// Run the range-check fold over one function. Returns the number of folds.
- pub(crate) fn run_function(func: &mut IrFunction) -> usize {
-     let mut next_id = func.next_value_id;
-@@ -441,7 +860,9 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
+     /// Load the address of va_list storage into %edx.
+     ///
+     /// va_list_ptr is an IR value that holds a pointer to the va_list storage.
+@@ -505,6 +549,23 @@ impl I686Codegen {
          }
      }
  
--    let mut changes = 0usize;
-+    // Phi-diamond form (if-convert off, e.g. the m16 size profile): fold
-+    // first, while the def maps still describe the pre-fold structure.
-+    let mut changes = fold_phi_diamonds(func, &cmp_defs, &cast_defs, &mut next_id);
-     for (block_idx, block) in func.blocks.iter_mut().enumerate() {
-         let mut new_insts: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
-         let known_pos = block_known_pos_i32[block_idx];
-diff --git a/updates/followup_2026-08-27_session06.md b/updates/followup_2026-08-27_session06.md
++    /// Store %edx to a value's destination (register home or stack slot).
++    /// Mirror of `store_eax_to` for the remainder output of divl/idivl.
++    /// A dest homed in %edx needs no code — the value is born there.
++    pub(super) fn store_edx_to(&mut self, dest: &Value) {
++        if let Some(phys) = self.dest_reg(dest) {
++            if phys.0 == 5 {
++                // Destination homed in %edx: the remainder is already home.
++                return;
++            }
++            let reg = phys_reg_name(phys);
++            emit!(self.state, "    movl %edx, %{}", reg);
++        } else if let Some(slot) = self.state.get_slot(dest.0) {
++            let sr = self.slot_ref(slot);
++            emit!(self.state, "    movl %edx, {}", sr);
++        }
++    }
++
+     /// Return the store mnemonic for a given type.
+     pub(super) fn mov_store_for_type(&self, ty: IrType) -> &'static str {
+         match ty {
+diff --git a/src/backend/i686/codegen/i128_ops.rs b/src/backend/i686/codegen/i128_ops.rs
+index b97dd9d3..70bbd120 100644
+--- a/src/backend/i686/codegen/i128_ops.rs
++++ b/src/backend/i686/codegen/i128_ops.rs
+@@ -69,11 +69,34 @@ impl I686Codegen {
+         };
+         let rlo_imm = rlo.starts_with('$');
+         let rhi_imm = rhi.starts_with('$');
++        // Zero-extended RHS (a u8/u16/u32/ptr value widened to 64 bits): the
++        // high half is provably zero at the IR level, regardless of what the
++        // widening cast's slot machinery wrote there. This is the parser hot
++        // shape `res = res * base + val`: the alo*bhi cross product vanishes
++        // and the carry becomes an immediate 0 (GCC's imull/mull/addl/adcl
++        // $0 chain).
++        let rhs_zero_hi = rhi_imm && rhi == "$0"
++            || matches!(rhs, Operand::Value(v) if self.zext_wide_values.contains(&v.0));
+ 
+         match op {
+             IrBinOp::Mul => {
+                 self.emit_load_acc_pair(lhs);
+-                if !rlo_imm {
++                if rhs_zero_hi {
++                    // bhi = 0: alo*bhi and its accumulation vanish.
++                    if !rlo_imm {
++                        self.state.emit("    movl %edx, %ecx");
++                        emit!(self.state, "    imull {}, %ecx", rlo); // ahi*blo
++                        emit!(self.state, "    mull {}", rlo); // eax:edx = alo*blo
++                        self.state.emit("    addl %ecx, %edx");
++                    } else {
++                        let blo = rlo.trim_start_matches('$');
++                        self.state.emit("    movl %edx, %ecx");
++                        emit!(self.state, "    imull ${}, %ecx", blo); // ahi*blo
++                        emit!(self.state, "    movl ${}, %edx", blo);
++                        self.state.emit("    mull %edx"); // eax:edx = alo*blo
++                        self.state.emit("    addl %ecx, %edx");
++                    }
++                } else if !rlo_imm {
+                     // Memory RHS: every product reads its operand directly —
+                     // no stack staging at all.
+                     self.state.emit("    movl %edx, %ecx");
+@@ -106,7 +129,13 @@ impl I686Codegen {
+                     ("subl", "sbbl")
+                 };
+                 emit!(self.state, "    {} {}, %eax", mn, rlo);
+-                emit!(self.state, "    {} {}, %edx", mn_carry, rhi);
++                if rhs_zero_hi {
++                    // High half of the RHS is provably 0: carry with the
++                    // 3-byte immediate form instead of a memory operand.
++                    emit!(self.state, "    {} $0, %edx", mn_carry);
++                } else {
++                    emit!(self.state, "    {} {}, %edx", mn_carry, rhi);
++                }
+             }
+             IrBinOp::And | IrBinOp::Or | IrBinOp::Xor => {
+                 self.emit_load_acc_pair(lhs);
+@@ -117,9 +146,10 @@ impl I686Codegen {
+                 };
+                 // Identity folding: x&0 / x|0 / x^0 = skip (zero-AND writes
+                 // zero, so emit `xorl reg,reg` for the 2-byte form); x&-1 /
+-                // x|-1 / x^-1 likewise reduce.
++                // x|-1 / x^-1 likewise reduce. A zero-extended VALUE RHS has
++                // the same $0 high half by construction.
+                 let zero_lo = rlo_imm && rlo == "$0";
+-                let zero_hi = rhi_imm && rhi == "$0";
++                let zero_hi = (rhi_imm && rhi == "$0") || rhs_zero_hi;
+                 let m1_lo = rlo_imm && rlo == "$-1";
+                 let m1_hi = rhi_imm && rhi == "$-1";
+                 if op == IrBinOp::And {
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index 62f5d358..a21cbc1f 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -2357,9 +2357,28 @@ fn replace_att_source_reg(line: &str, old_reg: &str, new_reg: &str) -> Option<St
+     }
+     parts.push(cur);
+ 
+-    // A single operand is read-modify-write or a branch target: not a source.
++    // A single operand is read-modify-write (incl/neg/not/bswap…), a branch
++    // target, or a stack slot — EXCEPT for the single-operand forms whose one
++    // register operand is a pure SOURCE: `divl %reg` / `idivl %reg` (the
++    // divisor is read; the implicit results land in eax/edx), `push %reg`,
++    // and `jmp/call *%reg`. Rewriting the source of those is exactly as safe
++    // as rewriting a two-operand source. Everything else keeps refusing.
+     if parts.len() < 2 {
+-        return None;
++        let p0 = parts[0].trim();
++        if !(p0.starts_with('%')
++            && !p0.contains('(')
++            && (mnemonic.starts_with("div")
++                || mnemonic.starts_with("idiv")
++                || mnemonic.starts_with("push")
++                || ((mnemonic == "jmp" || mnemonic == "call") && p0.starts_with('*'))))
++        {
++            return None;
++        }
++        if !has_whole_word(p0, old_reg) {
++            return None;
++        }
++        let replaced = replace_whole_word(p0, old_reg, new_reg);
++        return Some(format!("{}{}{}{}", ws, mnemonic, " ", replaced));
+     }
+ 
+     let last = parts.len() - 1;
+diff --git a/src/backend/i686/codegen/prologue.rs b/src/backend/i686/codegen/prologue.rs
+index c74a8029..35f6a690 100644
+--- a/src/backend/i686/codegen/prologue.rs
++++ b/src/backend/i686/codegen/prologue.rs
+@@ -92,6 +92,49 @@ impl I686Codegen {
+         self.is_fastcall = func.is_fastcall;
+         self.current_return_type = func.return_type;
+ 
++        // Same-block div/rem pair fusion table (one divl serves a
++        // URem+UDiv couple with identical operands). Constant divisors pair
++        // only at -Os, where the magic-number strength reduction is off and
++        // the general divl path is guaranteed for both sides.
++        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs(
++            func,
++            self.optimize_for_size,
++        );
++        self.divrem_tail_dests = pairs.tail_dests;
++        self.divrem_head_partners = pairs.head_partners;
++        self.divrem_broken_tails.clear();
++
++        // Zero-extending wide casts (u8/u16/u32/ptr -> i64/u64): their high
++        // half is provably zero — the 64-bit ALU fast paths use this to drop
++        // the alo*bhi cross product and to carry with an immediate 0.
++        self.zext_wide_values.clear();
++        for block in &func.blocks {
++            for inst in &block.instructions {
++                if let crate::ir::reexports::Instruction::Cast {
++                    dest,
++                    src: crate::ir::reexports::Operand::Value(_),
++                    from_ty,
++                    to_ty,
++                } = inst
++                {
++                    let zext = matches!(
++                        (from_ty, to_ty),
++                        (
++                            crate::common::types::IrType::U8
++                                | crate::common::types::IrType::U16
++                                | crate::common::types::IrType::U32
++                                | crate::common::types::IrType::Ptr,
++                            crate::common::types::IrType::I64
++                                | crate::common::types::IrType::U64
++                        )
++                    );
++                    if zext {
++                        self.zext_wide_values.insert(dest.0);
++                    }
++                }
++            }
++        }
++
+         // Dynamic alloca (VLAs) requires the frame pointer to track the stack,
+         // since ESP changes by runtime-computed amounts.
+         if self.state.has_dyn_alloca {
+diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
+index e3563eff..b631ab01 100644
+--- a/src/backend/regalloc.rs
++++ b/src/backend/regalloc.rs
+@@ -56,6 +56,31 @@ pub fn analyze_accumulator_assignments(
+         return Vec::new();
+     }
+ 
++    // Fused div/rem pair tails emit no code — their dest is NOT staged into
++    // the accumulator at its IR def point (it was stored by the head). An
++    // accumulator chain starting from a tail dest would let the consumer
++    // read a stale %eax.
++    let divrem = compute_i686_divrem_pairs(func, false);
++    if !divrem.tail_dests.is_empty() {
++        let filtered: Vec<u32> = candidates
++            .into_iter()
++            .filter(|c| !divrem.tail_dests.contains(c))
++            .collect();
++        if filtered.is_empty() {
++            return Vec::new();
++        }
++        return analyze_accumulator_assignments_impl(func, policy, &filtered);
++    }
++    analyze_accumulator_assignments_impl(func, policy, &candidates.into_iter().collect::<Vec<u32>>())
++}
++
++fn analyze_accumulator_assignments_impl(
++    func: &IrFunction,
++    policy: AccumulatorPolicy,
++    candidates: &[u32],
++) -> Vec<AccumulatorAssignment> {
++    let candidates: Vec<u32> = candidates.to_vec();
++
+     let mut defs: FxHashMap<u32, u32> = FxHashMap::default();
+     let mut uses: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+     let mut pp = 0u32;
+@@ -377,6 +402,208 @@ fn overlaps_inclusive(iv: &LiveInterval, points: &[u32]) -> bool {
+     idx < points.len() && points[idx] <= iv.end
+ }
+ 
++/// Like `overlaps_inclusive`, but hazards at the interval's OWN definition
++/// point are birth, not clobber: every emitter shape stages its early writes
++/// (scratch relays, `%ecx` pointer materialisation) BEFORE the final
++/// destination write that constitutes the value's birth, so a hazard exactly
++/// at `iv.start` can never destroy a value that does not exist yet. This is
++/// what lets a `divl`-born remainder claim `%edx` and a GEP-born pointer
++/// claim `%ecx` across their own defining instruction.
++#[inline]
++fn overlaps_inclusive_skip_birth(iv: &LiveInterval, points: &[u32]) -> bool {
++    let idx = points.partition_point(|&p| p < iv.start);
++    // Skip a hazard exactly at the def point (birth), then require any
++    // remaining hazard to fall within (start, end].
++    let mut idx = idx;
++    if idx < points.len() && points[idx] == iv.start {
++        idx += 1;
++    }
++    idx < points.len() && points[idx] <= iv.end
++}
++
++// ── i686 div/rem same-block pair analysis ────────────────────────────────────
++
++/// Deterministic div/rem pair analysis shared by the i686 emitter and the
++/// register allocator's hazard scan. Both derive it from the same IR, so the
++/// two views can never disagree.
++///
++/// A pair is a `URem`/`UDiv` (or `SRem`/`SDiv`) couple in the SAME block with
++/// IDENTICAL operands. One `divl`/`idivl` computes both results: the head
++/// (first in emission order) emits the division and stores BOTH results
++/// immediately — its own from its natural output register (`%edx` for rem,
++/// `%eax` for div) and the partner's from the other output — while the tail
++/// emits NOTHING (its result was already stored at the head). Soundness does
++/// not depend on what lies between the two instructions: SSA operands cannot
++/// change, and both stores happen at the head, before anything else runs.
++///
++/// `allow_const_rhs` covers the constant-divisor strength-reduction path: at
++/// -O2 the emitter replaces constant divisions with magic-number sequences
++/// that never execute `divl`, so those pairs must not fuse. At -Os the magic
++/// path is disabled and constant pairs are legal. The register allocator
++/// always passes `false` — a tail it models as "emits nothing" must be one
++/// whose head provably emits the real division (non-constant RHS pairs never
++/// take the magic path, so they can never break).
++///
++/// The greedy pairing is order-stable: scanning forward, each still-unpaired
++/// division pairs with the next unpaired compatible division in the same
++/// block. Compatibility requires identical `lhs`/`rhs` operands and matching
++/// signedness (`URem` with `UDiv`/`URem`, `SRem` with `SDiv`/`SRem`); mixing
++/// flavours would change the executed instruction.
++pub(crate) struct I686DivRemPairs {
++    /// Dest value-ids of tail instructions — the emitter skips them entirely.
++    pub tail_dests: FxHashSet<u32>,
++    /// Head dest value-id -> (partner dest, partner result is the quotient in
++    /// `%eax`). `false` means the partner wants the remainder in `%edx`.
++    pub head_partners: FxHashMap<u32, (u32, bool)>,
++    /// `(block_idx, inst_idx)` of tail instructions, for the hazard scan
++    /// (which numbers program points with the same walk).
++    pub tail_points: FxHashSet<(usize, usize)>,
++    /// Tail dest value-id -> the head's PROGRAM POINT. The tail's result is
++    /// physically born at the head (dual-store); liveness intervals for tail
++    /// dests must start there, or register homes / stack slots could be
++    /// shared with values living between head and tail.
++    pub head_point_of_tail: FxHashMap<u32, u32>,
++}
++
++pub(crate) fn compute_i686_divrem_pairs(
++    func: &IrFunction,
++    allow_const_rhs: bool,
++) -> I686DivRemPairs {
++    let mut pairs = I686DivRemPairs {
++        tail_dests: FxHashSet::default(),
++        head_partners: FxHashMap::default(),
++        tail_points: FxHashSet::default(),
++        head_point_of_tail: FxHashMap::default(),
++    };
++    if std::env::var_os("CCC_NO_IR_DIVREM").is_some() {
++        return pairs;
++    }
++
++    // Program-point numbering identical to liveness/the hazard scan:
++    // one point per instruction, one per terminator.
++    let mut block_start: Vec<u32> = Vec::with_capacity(func.blocks.len());
++    let mut pt = 0u32;
++    for block in &func.blocks {
++        block_start.push(pt);
++        pt += block.instructions.len() as u32 + 1;
++    }
++
++    let is_gpr32_ty = |ty: &IrType| {
++        matches!(
++            ty,
++            IrType::I8
++                | IrType::U8
++                | IrType::I16
++                | IrType::U16
++                | IrType::I32
++                | IrType::U32
++                | IrType::Ptr
++        )
++    };
++    let div_flavor = |op: IrBinOp| -> Option<bool> {
++        // Some(true) = quotient (div), Some(false) = remainder, None = not div-like
++        match op {
++            IrBinOp::UDiv | IrBinOp::SDiv => Some(true),
++            IrBinOp::URem | IrBinOp::SRem => Some(false),
++            _ => None,
++        }
++    };
++    let is_signed = |op: IrBinOp| matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
++
++    for (bi, block) in func.blocks.iter().enumerate() {
++        // Collect this block's div-like instructions.
++        let mut cands: Vec<(usize, IrBinOp, &Operand, &Operand, bool, u32)> = Vec::new();
++        for (ii, inst) in block.instructions.iter().enumerate() {
++            if let Instruction::BinOp {
++                dest,
++                op,
++                ty,
++                lhs,
++                rhs,
++                ..
++            } = inst
++            {
++                if div_flavor(*op).is_some() && is_gpr32_ty(ty) {
++                    // Constant-RHS divisions only pair when the caller has
++                    // established the magic path is off (see doc comment).
++                    let rhs_ok = allow_const_rhs || !matches!(rhs, Operand::Const(_));
++                    if rhs_ok {
++                        cands.push((ii, *op, lhs, rhs, is_signed(*op), dest.0));
++                    }
++                }
++            }
++        }
++        if cands.len() < 2 {
++            continue;
++        }
++        let mut used = vec![false; cands.len()];
++        for i in 0..cands.len() {
++            if used[i] {
++                continue;
++            }
++            let (_, _, lhs_i, rhs_i, signed_i, dest_i) = &cands[i];
++            // Nearest unused compatible partner ahead in this block.
++            let mut mate: Option<usize> = None;
++            for j in (i + 1)..cands.len() {
++                if used[j] {
++                    continue;
++                }
++                let (_, _, lhs_j, rhs_j, signed_j, _) = &cands[j];
++                if signed_i == signed_j && lhs_i == lhs_j && rhs_i == rhs_j {
++                    mate = Some(j);
++                    break;
++                }
++            }
++            let Some(j) = mate else { continue };
++            used[i] = true;
++            used[j] = true;
++            let (_, op_j, _, _, _, dest_j) = &cands[j];
++            // Head = i (earlier), tail = j. The partner's result register:
++            // quotient ops read %eax, remainder ops read %edx.
++            let partner_from_eax = div_flavor(*op_j) == Some(true);
++            pairs.head_partners.insert(*dest_i, (*dest_j, partner_from_eax));
++            pairs.tail_dests.insert(*dest_j);
++            pairs.tail_points.insert((bi, cands[j].0));
++            pairs
++                .head_point_of_tail
++                .insert(*dest_j, block_start[bi] + cands[i].0 as u32);
++        }
++    }
++    pairs
++}
++
++/// DivRem pair tails are physically born at their HEAD's program point (the
++/// head's dual-store writes the tail's dest register/slot). Every consumer
++/// of liveness — register homes, stack-slot sharing, coalescing — must see
++/// the tail dest live from the head onward, otherwise the home/slot can be
++/// handed to another value in the head..tail window and silently clobbered.
++/// This patches both the fat intervals and the hole-aware segments, then
++/// restores the segments' `(start, value_id)` sort order.
++fn patch_divrem_tail_intervals(func: &IrFunction, liveness: &mut LivenessResult) {
++    let pairs = compute_i686_divrem_pairs(func, false);
++    if pairs.head_point_of_tail.is_empty() {
++        return;
++    }
++    let head_of = &pairs.head_point_of_tail;
++    for iv in &mut liveness.intervals {
++        if let Some(&hp) = head_of.get(&iv.value_id) {
++            if hp < iv.start {
++                iv.start = hp;
++            }
++        }
++    }
++    for seg in &mut liveness.segments {
++        if let Some(&hp) = head_of.get(&seg.value_id) {
++            if hp < seg.start {
++                seg.start = hp;
++            }
++        }
++    }
++    liveness
++        .segments
++        .sort_by(|a, b| (a.start, a.value_id).cmp(&(b.start, b.value_id)));
++}
++
+ fn loop_weight(depth: u32) -> u64 {
+     match depth {
+         0 => 1,
+@@ -699,6 +926,51 @@ fn build_coalesce_groups(
+         root
+     }
+ 
++    // Copy-latch webs (phi-elim form): a Copy destination with 2+
++    // definitions is a phi-elim latch. When the latch Copy{V <- s} sits
++    // IMMEDIATELY after s's defining instruction, s's def consumed V's old
++    // incarnation (it reads V) and s dies at the copy — s may share V's
++    // home, so `flags |= X` lowers to `orl $X, %reg` instead of a
++    // 3-instruction relay through a second register. Adjacency is the
++    // soundness anchor: with anything between s's def and the copy, a use
++    // of V's OLD incarnation could sit inside s's live range.
++    let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
++    let mut copy_dests: FxHashSet<u32> = FxHashSet::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Some(dest) = inst.dest() {
++                *def_count.entry(dest.0).or_insert(0) += 1;
++            }
++            if let Instruction::Copy { dest, .. } = inst {
++                copy_dests.insert(dest.0);
++            }
++        }
++    }
++    let latch_dests: FxHashSet<u32> = copy_dests
++        .into_iter()
++        .filter(|v| def_count.get(v).copied().unwrap_or(0) > 1)
++        .collect();
++    let mut latch_same_value: FxHashSet<(u32, u32)> = FxHashSet::default();
++    if !latch_dests.is_empty() {
++        for block in &func.blocks {
++            for w in block.instructions.windows(2) {
++                if let (prev, Instruction::Copy {
++                    dest: d,
++                    src: Operand::Value(s),
++                }) = (&w[0], &w[1])
++                {
++                    if latch_dests.contains(&d.0) {
++                        if let Some(pd) = prev.dest() {
++                            if pd.0 == s.0 {
++                                latch_same_value.insert((d.0, s.0));
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
+     for block in &func.blocks {
+         for inst in &block.instructions {
+             if let Instruction::Copy {
+@@ -731,7 +1003,12 @@ fn build_coalesce_groups(
+                     // edge may overlap and still share one home — exactly the
+                     // no-op-cast relaxation. This collapses switch-state and
+                     // loop-carried webs onto a single register/slot.
+-                    if phi_operands.contains(&d) || phi_dests.contains(&s) {
++                    // Adjacent copy-latch edges are the same story in the
++                    // phi-elim form (see latch_same_value above).
++                    if phi_operands.contains(&d)
++                        || phi_dests.contains(&s)
++                        || latch_same_value.contains(&(d, s))
++                    {
+                         same_value_edges.insert((d, s));
+                     }
+                 }
+@@ -780,11 +1057,25 @@ fn build_coalesce_groups(
+                     && load_def_types.get(&v.0).map(|&(ty, _)| ty) == Some(*from_ty)
+                     && load_uses >= 2;
+                 let (d, s) = (dest.0, v.0);
++                // ParamRef sources: the loop-carried-Copy rationale (the
++                // param's ABI home dies at a redefining Copy while the loop
++                // copy wants its own register) does NOT apply to a no-op
++                // same-width cast — the cast is a pure value-preserving view
++                // of an UNCHANGED parameter, so sharing the param's home is
++                // exactly the intended shape (number()'s `(u32)base` reading
++                // %edi directly at both div sites). Keep the exclusion for
++                // the sub-word widen case: there the source is a load whose
++                // register economics the ParamRef guard was protecting.
++                let src_ok = if noop32 {
++                    true
++                } else {
++                    !param_ref_values.contains(&s)
++                };
+                 if (noop32 || widen_from_load)
+                     && d != s
+                     && eligible.contains(&d)
+                     && eligible.contains(&s)
+-                    && !param_ref_values.contains(&s)
++                    && src_ok
+                 {
+                     parent.entry(d).or_insert(d);
+                     parent.entry(s).or_insert(s);
+@@ -918,6 +1209,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+ 
+     let is_32bit = crate::common::types::target_is_32bit();
+     let mut liveness = compute_live_intervals(func);
++    // DivRem pair tails are physically born at their head's dual-store;
++    // extend their intervals before ANY interval map is derived. Without
++    // this, homes/slots in the head..tail window get double-assigned.
++    patch_divrem_tail_intervals(func, &mut liveness);
+     // Extend live intervals for backend-folded index consumers BEFORE any
+     // interval map is derived (see RegAllocConfig::folded_index_uses).
+     if !config.folded_index_uses.is_empty() && !env_on("CCC_NO_FOLDED_INDEX_LIVENESS") {
+@@ -1378,7 +1673,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+                     .iter()
+                     .copied()
+                     .filter(|iv| base_ok(&assignments, iv))
+-                    .filter(|iv| !overlaps_inclusive(iv, reg_hazards))
++                    .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
+                     .collect();
+                 if env_on("CCC_DEBUG_RA_INTERVALS") {
+                     let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
+@@ -1692,7 +1987,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+                             && (x86_ordered_param_copies
+                                 || !param_restricted.contains(&iv.value_id))
+                     })
+-                    .filter(|iv| !overlaps_inclusive(iv, reg_hazards))
++                    .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
+                     .filter(|iv| {
+                         !holders
+                             .iter()
+@@ -4018,6 +4313,12 @@ fn collect_i686_scratch_hazard_points(
+     let mut edx: Vec<u32> = Vec::new();
+     let mut point: u32 = 0;
+ 
++    // Same-block div/rem pair tails emit no code (the head stored both
++    // results); see compute_i686_divrem_pairs for the soundness model.
++    // Conservative constant-RHS rule keeps the RA model a subset of what the
++    // emitter will actually fuse.
++    let divrem_pairs = compute_i686_divrem_pairs(func, false);
++
+     // Allocas with alignment ≤ 16 resolve to SlotAddr::Direct.
+     // Mirrors slot_assignment.rs: alloca_alignments only records > 16.
+     let mut direct_allocas: FxHashSet<u32> = FxHashSet::default();
+@@ -4053,9 +4354,25 @@ fn collect_i686_scratch_hazard_points(
+         ) || matches!(op, Operand::Const(IrConst::I64(v)) if *v >= i32::MIN as i64 && *v <= i32::MAX as i64)
+     };
+ 
+-    for block in &func.blocks {
+-        for inst in &block.instructions {
++    for (bi, block) in func.blocks.iter().enumerate() {
++        for (ii, inst) in block.instructions.iter().enumerate() {
++            // Fused same-block div/rem pairs: the TAIL instruction emits
++            // nothing (its result was stored by the head's dual-store
++            // emission earlier in the block), so it is a hazard for neither
++            // %ecx nor %edx. Conservative constant rule: only non-constant
++            // RHS pairs — those can never fall back to the magic-number
++            // path that would break the fusion.
++            let divrem_tail = divrem_pairs.tail_points.contains(&(bi, ii));
+             let (ecx_clean, edx_clean) = match inst {
++                Instruction::BinOp { op, ty, rhs, .. }
++                    if is_gpr32(ty) && divrem_tail
++                        && matches!(
++                            op,
++                            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
++                        ) =>
++                {
++                    (true, true)
++                }
+                 Instruction::BinOp { op, ty, rhs, .. } if is_gpr32(ty) => match op {
+                     IrBinOp::Add
+                     | IrBinOp::Sub
+diff --git a/updates/followup_2026-08-28_session07.md b/updates/followup_2026-08-28_session07.md
 new file mode 100644
-index 00000000..b3c07f28
+index 00000000..f8096526
 --- /dev/null
-+++ b/updates/followup_2026-08-27_session06.md
-@@ -0,0 +1,94 @@
-+# LCCC Follow-up / Kontinuität — Session 87 (2026-08-27, v2 round)
++++ b/updates/followup_2026-08-28_session07.md
+@@ -0,0 +1,114 @@
++# LCCC Follow-up / Kontinuität — Session 88 (2026-08-28, v3 round)
 +
-+**Scope:** v2 codegen optimization round on the rebased main (PR #267 merged
-+upstream); deliverable regeneration; 32 KiB gate mechanism fully decomposed.
++**Scope:** v3 codegen round on the rebased main (PR #268 merged upstream);
++four validated optimization families; 32 KiB boot gate wired as CI gate.
 +
-+**Base:** `origin/main @ 3db0bbe2` (fast-forward — local tree was content-identical)
-+**Session commits:** `bc577150`, `6ef51495`
-+**Deliverable:** ms178-1.patch (v2) — see §4.
++**Base:** `origin/main @ a96c684b` (fast-forward rebase — session-87 content
++already upstream, `git rebase` dropped all three local commits as duplicates)
++**Session commits:** `a680cefe`, `dc3c49a8`, `36db4f08`
++**Deliverable:** ms178-1.patch (v3) — 44,862 B, APPLIES-CLEAN on a fresh
++clone of `a96c684b`, zero garbage (env-gated traces follow the
++CCC_DEBUG_HAZARDS/CCC_DEBUG_RA house convention).
 +
 +---
 +
-+## 1. The rebase
++## 1. What v3 contains (each individually measured on the corpus)
 +
-+The user merged the session-86 codegen work upstream (PR #267, squashed as
-+`6cd4f289`). Local main and origin/main were content-identical (git diff
-+empty), so the rebase was `git reset --hard origin/main` — zero conflict
-+surface. **v2 builds on `3db0bbe2`.**
-+
-+## 2. The pass-gating bug (read this before touching pass lists)
-+
-+`CCC_DISABLE_PASSES` and the m16 size policy build one comma-separated list;
-+every pass gate tested it by **substring**. The m16 policy's `postinline`
-+entry therefore also disabled the `inline` gate: **every -m16 -Os/-Oz
-+compile ran with the primary inliner OFF** — the corpus where helper
-+inlining matters most. Session 82's "full pipeline grows cmdline.o 571→713"
-+measurement was taken with this bug active: the baseline had NO inlining and
-+the "full pipeline" added inline+postinline+ifconv+gaddrcse+licm TOGETHER.
-+The conflated measurement is now replaced by per-pass numbers
-+(CCC_M16_KEEP): ifconv +410, licm +367, gaddrcse +355, postinline +56 —
-+**all four m16 policy entries are individually correct**; the policy stays.
-+Fixed by `pass_disabled()` (exact token match). Also un-broke "univsr"
-+disabling "ivsr".
-+
-+## 3. The 32 KiB gate is an ALIGNMENT CLIFF (planning-critical)
-+
-+`.pecompat` requires 4096 alignment (header.S `.p2align 12`, PE-header
-+semantics; GNU ld produces the same layout on identical objects — verified).
-+The gate passes iff **pre-pecompat content ends ≤ 24,576**:
-+
-+```
-+content_end = 1,166 (bstext..initdata) + .text + 30 (.text32)
-+gate PASS   ⇔ content_end ≤ 24,576  ⇔ .text ≤ 23,380
-+```
-+
-+* Session 82 PASS: content end 24,261 → `_end` ≈ 31,216 (headroom 1,552).
-+* Session 86 FAIL: content end 25,912 → boundary 28,672 → `_end` 35,280.
-+* **Now: `.text` 24,240 → content end 25,436 → FAIL by 860 real bytes**
-+  (the recorded 2,512 = 860 excess + 1,652 alignment waste in the window).
-+
-+The gate metric for CI: **pre-pecompat content end**, not `_end` — _end
-+jumps in 4 KiB steps and hides progress inside a step.
-+
-+## 4. v2 deliverable contents (all individually measured on the corpus)
-+
-+| # | change | file | Δ.text |
++| # | change | where | corpus Δ.text |
 +|---|---|---|---:|
-+| 1 | token-exact pass gating (m16 inliner fix) | passes/mod.rs | −195 |
-+| 2 | bool-cast resolution for Select range fold | passes/range_check.rs | (part of −175) |
-+| 3 | phi-diamond branchy range fold | passes/range_check.rs | −175 |
-+| 4 | reg→reg direct copy emission | i686/codegen/emit.rs | −35 |
-+| 5 | i64 ALU/compare fast paths (no stack staging) | i686/codegen/i128_ops.rs | −21 |
-+| 6 | Phase 2g hot-web steal | backend/regalloc.rs | −36 |
-+| 7 | sext+zext pair fold | i686/codegen/peephole.rs | −14 |
-+| | **total** | | **−476** |
++| 1 | direct div divisor from register home (incl. reg-homed allocas) | i686 alu.rs / emit.rs | −3 |
++| 2 | **IR-level div/rem pair fusion** (one divl serves URem+UDiv) | regalloc.rs + alu.rs + prologue.rs | (part of −79) |
++| 3 | birth-skip in the scratch-hazard filters (value spans own def) | regalloc.rs | (part of −79) |
++| 4 | peephole: single-operand pure-source rewrites (divl/push/jmp*) | peephole.rs | (part of −79) |
++| 5 | zext-RHS i64 fast paths (parser `res = res*base + val`) | i128_ops.rs + prologue.rs | −12 |
++| 6 | no-op-cast coalescing from ParamRef sources | regalloc.rs build_coalesce_groups | ±0 (enabler) |
++| 7 | **adjacent copy-latch web coalescing** (`flags |= X` → `orl $X,%reg`) | regalloc.rs build_coalesce_groups | −77 |
++| 8 | boot-gate CI wiring (pre-pecompat ≤ 24,576) | run_regression_suite.sh | — |
++| | **total** | 24,240 → **24,070** | **−170** |
 +
-+Validation: cargo 1205/0/6 · regression 467/0/11 AB-diff 0 · i64 torture
-+5.4M checks (20k rounds × 27 ops × 6 levels vs 32-bit-half references) ·
-+m16 corpus boot gate script runs clean end-to-end.
++## 2. The div/rem pair fusion (read this before touching it)
 +
-+## 5. Environment notes (unchanged from session 05)
++`compute_i686_divrem_pairs(func, allow_const_rhs)` — deterministic same-block
++analysis shared by emitter and RA (both derive from the same IR, the two
++views cannot disagree). A pair is a URem/UDiv (SRem/SDiv) couple with
++IDENTICAL operands; the HEAD emits one divl and dual-stores both results, the
++TAIL emits nothing. THREE soundness traps were found by the death-signal
++torture (11 cases × 20k rounds; fusing on/off; GCC reference):
 +
-+Same sandbox constraints: 2 vCPU / 4.1 GiB / no swap possible, clang/mold
-+absent, 32-bit syscalls blocked by seccomp (death-signal harness for runtime
-+tests), tools in `/home/z/.local-tools` (source env.sh), cargo needs
-+`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc RUSTFLAGS=""`.
++1. **Tail liveness**: the tail's dest is physically born at the HEAD's
++   dual-store. `patch_divrem_tail_intervals` extends tail-dest liveness to
++   the head point BEFORE any interval map is derived — otherwise homes/slots
++   in the head..tail window get double-assigned (torture cases 2/5/9/10).
++2. **Store order**: the two results live in %eax/%edx until stored. Storing
++   the %eax side into a %edx home destroys the remainder first. Home-aware
++   ordering + pair-BREAKING for the deadlock combos (quo@%edx ∧ rem@%eax;
++   slotless-vs-clobber). Broken pairs emit two standalone divisions.
++3. **Acc-flow slotless dests**: immediately-consumed values have no home and
++   no slot; their consumer reads %eax directly. A slotless pair side must be
++   materialised into %eax with a cache entry; the accumulator analysis
++   excludes pair tails outright.
 +
-+## 6. Next-session entry points (priority order)
++Kill switches: `CCC_NO_IR_DIVREM` (table), `CCC_DEBUG_DIVREM` (trace).
 +
-+1. **P0 — close the 860 B to the cliff** (`.text` ≤ 23,380): number()/vsprintf
-+   loop spills (71 store-reload pairs in number() alone), branch-form range
-+   fold (~40 sites × 2-4 B), scratch-slot store-store elimination.
-+2. **P0 — born-at-hazard register homes**: a value defined BY divl (rem in
-+   %edx) must be able to claim %edx — the current `overlaps_inclusive`
-+   hazard scan excludes it, keeping the whole number() loop slotted.
-+3. **P1 — wire build_kernel_boot.sh into run_regression_suite.sh**, gate on
-+   pre-pecompat content end ≤ 24,576.
-+4. **P1 — value-width map for Copy/phi dests** (byte slots + movb immediates).
-+5. **P2 — 64-bit multiply-accumulate chains** for the parsers (mull+add/adc).
++## 3. The copy-latch web coalescing (the vsprintf flag parser)
 +
-+## 7. Snapshot ledger
++The frontend lowers C `flags |= X` state loops WITHOUT Phi instructions —
++the loop-carried variable is a Copy destination with 2+ definitions (the
++phi-elim latch form). The phi-congruence machinery only looked at real Phi
++instructions, so every `flags |= X` arm paid a 3-instruction relay
++(`movl %ebp,%edx; orl $4,%edx; movl %edx,%ebp`) while GCC emits
++`orl $4,%ebp`. The fix treats latch Copies whose source is defined by the
++IMMEDIATELY preceding instruction as same-value edges. **Adjacency is the
++soundness anchor**: with anything between the source's def and the copy, a
++use of the OLD incarnation could sit inside the source's live range.
++vsprintf's five flag arms are now the 1-instruction form.
 +
-+`S03-s87-v2-codegen` — base `3db0bbe2`, head `6ef51495`, v2 deliverable
-+APPLIES-CLEAN. Artifacts: workspace mirror + PolarFS
-+(/tmp/my-project/lccc-artifacts: tarball, bundle, per-commit series).
++## 4. Boot-gate CI (the e12597c7 lesson, mechanized)
++
++`run_regression_suite.sh` now runs `build_kernel_boot.sh` when `KERNEL_DIR`
++is prepared and fails on pre-pecompat content end > 24,576. The script's
++non-zero exit on a gate FAIL is a measurement, not an error (parsed either
++way). Without KERNEL_DIR: honest SKIP. The gate is RED until the .text
++budget (≤ 23,380) is met — that is its job.
++
++## 5. Validation
++
++* divrem torture: 11 cases × 20k rounds (fusion on/off + GCC ref) — green
++* zext torture: 11 cases × 50k rounds (fast/fallback/GCC ref) — green
++* i64 torture: 20k rounds × 27 ops (session-87 harness) — green
++* regression suite 467/0, AB-diff 0 · cargo --lib 1205/0/6
++* corpus .text reproduced exactly from the deliverable tree
++
++## 6. Environment notes
++
++Unchanged from session 87 (same sandbox class). Torture binaries are
++freestanding `-nostdlib -static` (32-bit syscalls blocked by seccomp — the
++death-signal verdict: int3=pass, ud2/SIGSEGV=fail-at-case). The torture
++sources live in `/home/z/kernel-work/torture/` (divrem_torture.c,
++zext_torture.c) — candidates for tests/ in a future round.
++
++## 7. Next-session entry points (priority order)
++
++1. **P0 — i64 mul-accumulate chain fusion**: `res = res*base + val` still
++   round-trips the product through slots (4 mem ops/iteration) and stages
++   the zext casts (3 dead store insns for the never-read high halves).
++   GCC's 9-insn shape is documented in §analysis; needs virtual zext casts
++   (never-materialized) + source-liveness extension (folded_index_uses
++   pattern) + a mul→add chain table mirroring the divrem design.
++   string.c: kstrtoull +154, simple_strtoull +80 vs GCC.
++2. **P0 — RA Phase 2h (iterated hazard refinement)**: div points are
++   %ecx-clean when the divisor is register-homed (∉ edx/eax); folded
++   index-chain GEPs (base=GlobalAddr, offset unhomed) are clean for %edx —
++   two fixpoint iterations after Phase 2g would let the number() digit loop
++   claim %edx for the remainder and fire the indexed load
++   (`movsbl digits(,%edx),%eax` — −5 insns/iteration).
++3. **P1 — video.c family** (+363/+224/+169/+160/+114): systematic ~1.5×
++   excess, not yet analyzed in depth; likely state-machine + RA pressure.
++4. **P1 — value-width map** for Copy/phi dests (byte slots, movb immediates).
++5. **P2 — vsprintf body** (+443 excess remains after the flag-loop fix).
++
++## 8. Snapshot ledger
++
++`S02-v3-s88-codegen` — base `a96c684b`, head `36db4f08`, deliverable
++APPLIES-CLEAN. Artifacts: /home/z/my-project/lccc-artifacts (+ PolarFS
++mirror recommended before handoff).
