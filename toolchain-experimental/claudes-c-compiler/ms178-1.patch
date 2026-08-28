@@ -1,201 +1,1423 @@
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index a6144c2..f846ef2 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -3862,18 +3862,46 @@ impl ArchCodegen for X86Codegen {
-                         reject = true;
-                     }
-                 }
--                // Allow alloca bases (ISel handles via AllocaAddr + leaq)
--                if !state.is_alloca(base.0) {
--                    if let Some(r) = ra.get(&base.0) {
--                        if r.0 >= 20 {
--                            reject = true;
--                        }
--                    }
--                    if !ra.contains_key(&base.0) && state.get_slot(base.0).is_none() {
-+                // Allow alloca bases (ISel handles via AllocaAddr + leaq).
-+                // Non-alloca bases must be register-homed: ISel emits
-+                // `Lea { base: Vreg }` for a stack-homed pointer, and
-+                // resolve_stack_vregs cannot rewrite that to a SIB off the
-+                // slot — the slot holds the POINTER VALUE, not an address
-+                // to index. Fallback then re-emits with empty fold maps.
-+                if !state.is_alloca(base.0) && !ra.contains_key(&base.0) {
-+                    reject = true;
+From 0aea6e625863fdcee5110e52a18d98c0b2f22376 Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 22:43:57 +0000
+Subject: [PATCH 1/4] =?UTF-8?q?aarch64:=20three=20peephole=20passes=20?=
+ =?UTF-8?q?=E2=80=94=20zext-mask=20fold,=20ANDS/TST=20fusion,=20dead=20pre?=
+ =?UTF-8?q?-ret=20moves?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Census-vs-GCC gaps on AArch64 (xarch probes): every widening cast emitted
+a redundant `and x0, x0, #0xff/#0xffff` re-mask; every `(a & b) != 0`
+bool gate burned a `cmp` after the `and`; return staging left dead
+`mov xN, xS` writes (bool_gate shaped: 15 -> 12 insns; load_cmp loop
+loses one instruction per iteration).
+
+  * eliminate_redundant_zext_and: forward width-bound tracking
+    (value < 2^w) per basic-block region. Producers: zero-extending
+    loads (ldrb/ldurb/ldarb/... = 8, ldrh family = 16), previous masks,
+    unshifted immediates, ubfx #0,#w, uxtb/uxth, register moves (w-form
+    clamps to 32); everything else widens to its form (w-write = 32,
+    x-write/calls/labels = no info). `and d, s, #mask` with
+    bound(s) <= mask width rewrites to `mov d, s` (value-identical,
+    flags untouched). Soundness pins: the source bound is captured
+    BEFORE the destination update (in-place `and x0, x0, #mask` used to
+    validate itself against its own post-mask bound and delete a
+    semantically required truncation after `sxth` — caught by
+    cast_chain_fold/sqlite_yy_shift differential); shifted `movz`
+    rewrites the register so the old bound is dropped, not kept;
+    ands sets flags and is never rewritten.
+  * fuse_and_cmp_zero: `and wA, wB, C; cmp wA, #0` + N/Z/V-only
+    consumer (eq/ne/mi/pl/ge/lt/gt/le/vs/vc) -> `ands wA, wB, C`, cmp
+    deleted. Exactness: N/Z identical (same value), V=0 on both sides;
+    C differs (shifter carry vs borrow-never), so C-consuming
+    conditions are excluded. The operand tail is preserved verbatim
+    (shifted-register forms). CCC_NO_AND_TST_FUSION kill switch.
+  * eliminate_dead_pre_ret_moves: `mov xD, xS` (dst in 1..=28 — x0 is
+    the return register and x30 is read by ret) with no read of xD
+    before the ret is dead and deleted; a pure redefinition also proves
+    death. Any ambiguous mention aborts.
+
+Validation: lib 1282/0/6 (9 new unit tests incl. the self-validating
+mask regression); ARM 378/30/75 = baseline with all passes active;
+x86 536/5 unchanged; f128 battery (softfloat, global_carrier,
+scalar_fp_builtins, vex_move_false_dep, param_home_order,
+preserves_gp_param, glibc_f128_casts/builtins) all green on qemu.
+---
+ src/backend/arm/codegen/peephole.rs | 681 +++++++++++++++++++++++++++-
+ 1 file changed, 672 insertions(+), 9 deletions(-)
+
+diff --git a/src/backend/arm/codegen/peephole.rs b/src/backend/arm/codegen/peephole.rs
+index 8ae7c2fe..24dc657f 100644
+--- a/src/backend/arm/codegen/peephole.rs
++++ b/src/backend/arm/codegen/peephole.rs
+@@ -518,6 +518,9 @@ pub fn peephole_optimize(asm: String) -> String {
+         changed |= eliminate_self_moves(&mut kinds, n);
+         changed |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
+         changed |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
++        changed |= eliminate_redundant_zext_and(&mut lines, &mut kinds, n);
++        changed |= fuse_and_cmp_zero(&mut lines, &mut kinds, n);
++        changed |= eliminate_dead_pre_ret_moves(&mut lines, &mut kinds, n);
+         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
+         changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
+         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
+@@ -567,6 +570,9 @@ pub fn peephole_optimize(asm: String) -> String {
+             changed2 |= eliminate_self_moves(&mut kinds, n);
+             changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
+             changed2 |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
++            changed2 |= eliminate_redundant_zext_and(&mut lines, &mut kinds, n);
++            changed2 |= fuse_and_cmp_zero(&mut lines, &mut kinds, n);
++            changed2 |= eliminate_dead_pre_ret_moves(&mut lines, &mut kinds, n);
+             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
+             changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
+             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
+@@ -2116,6 +2122,566 @@ fn eliminate_redundant_sxtb(lines: &mut [String], kinds: &mut [LineKind], n: usi
+     changed
+ }
+ 
++
++// ── Redundant zero-extension mask elimination ────────────────────────────────
++//
++// The cast emitters stage through x0 and mask every widening/narrowing cast
++// (`and x0, x0, #0xff` for U8, #0xffff for U16), even when the value already
++// satisfies the mask because it came from an `ldrb`/`ldrh` (zero-extending
++// loads), a narrower mask, or a small immediate. AArch64 has no need for the
++// re-mask; GCC drops it (zext_chain/load_cmp compile the mask away entirely).
++//
++// Forward knowledge tracking, one pass per basic-block-shaped region: for
++// every x-register we track a WIDTH bound w meaning value(x-reg) < 2^w
++// (all bits at index >= w are zero). Producers: zero-extending loads
++// (w=8/16), 32-bit writes (w=32), a previous mask (its width), small
++// immediates, ubfx #0,#w, uxtb/uxth, xzr (w=0), and register moves (the
++// bound transfers; a w-form move clamps to 32). Everything else that
++// writes a register widens the bound to its form (32 for w-form writes,
++// 64 = no information for x-form writes): precisely for the classified
++// kinds, and CONSERVATIVELY (full reset to 64) for the unclassified
++// Other/MemOther kinds -- matching the soundness stance of
++// eliminate_redundant_sxtw above. Labels, branches, calls and returns are
++// barriers (no cross-block knowledge).
++//
++// Fire condition: value(s) < 2^mask_width, i.e. bound(s) <= mask_width.
++// Note the direction -- a 32-bit bound says NOTHING about bits 31:8, so a
++// generic w-form write never fires an #0xff mask; a tight 8-bit bound from
++// ldrb fires both #0xff and #0xffff masks.
++//
++// Rewrite: `and d, s, #mask` with knowledge(s) >= mask width becomes
++// `mov d, s` — value-identical — and the existing move-chain/self-move
++// passes clean the copy up. `and` does not read flags and the rewrite does
++// not write any, so no flag state is disturbed.
++//
++// Example (zext_chain, per iteration):
++//   ldrb w5, [x19, x1]     ldrb w5, [x19, x1]
++//   and  w4, w5, #0xff  →  mov  w4, w5     (then propagated away)
++//   mov  x0, x4            mov  x0, x5
++
++fn zext_mask_bits(imm: &str) -> Option<u8> {
++    match imm.trim() {
++        "#0xff" => Some(8),
++        "#0xffff" => Some(16),
++        _ => None,
++    }
++}
++
++/// Width bound contributed by a destination's REGISTER FORM: a w-form
++/// write produces a value < 2^32 (bits 63:32 zeroed); an x-form write
++/// carries no bound. Used as the base rule for classified writes.
++const ZEXT_NO_INFO: u8 = 64;
++
++fn form_zero_width(op: &str) -> u8 {
++    if op.starts_with('w') {
++        32
++    } else {
++        ZEXT_NO_INFO
++    }
++}
++
++/// Destination register of an instruction whose first comma-operand is the
++/// written register (all AArch64 ALU/move/load forms), or REG_NONE.
++fn first_operand_reg(line: &str) -> u8 {
++    let Some(rest) = line.trim().split_once(' ').map(|(_, r)| r) else {
++        return REG_NONE;
++    };
++    let Some((d, _)) = rest.split_once(',') else {
++        return REG_NONE;
++    };
++    parse_reg(d.trim())
++}
++
++/// Kill knowledge for a post-indexed writeback base (`..., [xN], #imm`).
++fn kill_writeback_base(line: &str, zext: &mut [u8; 33]) {
++    let t = line.trim();
++    let Some(bracket) = t.find('[') else { return };
++    let Some(close) = t[bracket..].find(']') else { return };
++    let inner = &t[bracket + 1..bracket + close];
++    // Post-index (`[xN], #imm`) or pre-index (`[xN, #imm]!`) writeback both
++    // redefine the base register.
++    if let Some((_, after)) = t.split_once(']') {
++        let after = after.trim_start();
++        if after.starts_with('!') || after.starts_with('#') || after.starts_with(", #") {
++            // Writeback base becomes base+imm: arbitrary 64-bit.
++            if let Some((base, _)) = inner.split_once(',') {
++                let r = parse_reg(base.trim());
++                if r < 31 {
++                    zext[r as usize] = ZEXT_NO_INFO;
 +                }
-+                if let Some(r) = ra.get(&base.0) {
-+                    if r.0 >= 20 {
-                         reject = true;
-                     }
-                 }
-             }
-+            // 64-bit Add is selected as Lea (base + index). A stack-homed
-+            // operand becomes MachReg::Vreg; Lea cannot encode it, and
-+            // substituting the slot as the Lea base would compute
-+            // `&slot + index` instead of `*slot + index`. The unresolvable
-+            // Vreg forces a default-path replay with empty GEP/global-addr
-+            // fold maps, which ICEs on values the skipped producers never
-+            // homed (kernel tracing_iter_reset: RELOC_HIDE ptr +
-+            // `__per_cpu_offset[cpu]` after an indexed-sym load).
-+            crate::ir::reexports::Instruction::BinOp {
-+                op: crate::ir::reexports::IrBinOp::Add,
-+                lhs,
-+                rhs,
-+                ty,
-+                ..
-+            } if ty.size() == 8 && !ty.is_float() => {
-+                let add_op_is_phys = |op: &crate::ir::reexports::Operand| match op {
-+                    crate::ir::reexports::Operand::Const(_) => true,
-+                    crate::ir::reexports::Operand::Value(v) => ra
-+                        .get(&v.0)
-+                        .is_some_and(|r| r.0 < 20),
-+                };
-+                if !add_op_is_phys(lhs) || !add_op_is_phys(rhs) {
-+                    reject = true;
++            } else if !inner.is_empty() {
++                let r = parse_reg(inner.trim());
++                if r < 31 {
++                    zext[r as usize] = ZEXT_NO_INFO;
 +                }
 +            }
-             _ => {}
-         }
-         // Dest must have a register for ALU/Shift/Neg/Not (two-address instructions).
-@@ -3984,6 +4012,9 @@ impl ArchCodegen for X86Codegen {
-                         eprintln!("[MI-FALLBACK]   unresolvable: {mi:?}");
-                     }
-                 }
-+                for inst in &self.machinst_buf_ir {
-+                    eprintln!("[MI-FALLBACK]   ir: {inst:?}");
-+                }
-             }
-             // CORRECTNESS: never delete instructions. Re-emit the buffered IR
-             // through the default (accumulator) codegen path, which handles
-diff --git a/src/ir/lowering/expr_types.rs b/src/ir/lowering/expr_types.rs
-index a9a3e5a..5f4bc9b 100644
---- a/src/ir/lowering/expr_types.rs
-+++ b/src/ir/lowering/expr_types.rs
-@@ -1495,9 +1495,12 @@ impl Lowerer {
-                 None
-             }
-             Expr::AddressOf(inner, _) => {
--                // Address-of wraps in Pointer
-+                // Address-of wraps in Pointer. Named address spaces (`__seg_gs`
-+                // / `__seg_fs`) qualify the object, so `&gs_var` is
-+                // `T __seg_gs *`, not a generic pointer.
-                 if let Some(inner_ct) = self.get_expr_ctype(inner) {
--                    return Some(CType::Pointer(Box::new(inner_ct), AddressSpace::Default));
-+                    let space = self.get_addr_space_of_struct_expr(inner);
-+                    return Some(CType::Pointer(Box::new(inner_ct), space));
-                 }
-                 None
-             }
-@@ -1883,7 +1886,8 @@ impl Lowerer {
-                     .get_expr_ctype(inner)
-                     .or_else(|| self.get_expr_ctype_with_scope(inner, scope))
-                 {
--                    return Some(CType::Pointer(Box::new(inner_ct), AddressSpace::Default));
-+                    let space = self.get_addr_space_of_struct_expr(inner);
-+                    return Some(CType::Pointer(Box::new(inner_ct), space));
-                 }
-                 None
-             }
-diff --git a/src/ir/lowering/pointer_analysis.rs b/src/ir/lowering/pointer_analysis.rs
-index 77f269a..8498640 100644
---- a/src/ir/lowering/pointer_analysis.rs
-+++ b/src/ir/lowering/pointer_analysis.rs
-@@ -482,16 +482,30 @@ impl Lowerer {
-     /// Get the address space of a pointer expression (e.g., `__seg_gs` from a
-     /// `typeof(x) __seg_gs *` cast). Returns `AddressSpace::Default` if unknown
-     /// or the expression is not a pointer with a named address space.
-+    ///
-+    /// Named address spaces live on the *object*, not only on pointer types.
-+    /// Linux `this_cpu_read_const(pcp)` expands to `*(typeof(pcp) *)&(pcp)`:
-+    /// `typeof` currently drops `__seg_gs` so the cast type is a generic
-+    /// pointer, but the operand is still `&pcp` of a GS/FS variable. Walk
-+    /// through Default-space casts to the address-of operand so the load
-+    /// keeps the `%gs:`/`%fs:` prefix (direct `return pcp` already does).
-     pub(super) fn get_addr_space_of_ptr_expr(&self, expr: &Expr) -> AddressSpace {
--        // Try CType-based resolution first
-         if let Some(CType::Pointer(_, addr_space)) = self.get_expr_ctype(expr) {
--            return addr_space;
-+            if addr_space != AddressSpace::Default {
-+                return addr_space;
++        }
++    }
++}
++
++fn eliminate_redundant_zext_and(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
++    if std::env::var("CCC_NO_ZEXT_MASK_FOLD").is_ok() {
++        return false;
++    }
++    let mut zext = [ZEXT_NO_INFO; 33];
++    zext[32] = 0; // xzr/wzr is all-zero and unwritable
++    let mut changed = false;
++    for i in 0..n {
++        match kinds[i] {
++            LineKind::Label
++            | LineKind::Branch
++            | LineKind::CondBranch
++            | LineKind::CmpBranch
++            | LineKind::Call
++            | LineKind::Ret => {
++                zext = [ZEXT_NO_INFO; 33];
++                zext[32] = 0;
++                continue;
 +            }
-         }
--        // For cast expressions, check the target type directly
--        if let Expr::Cast(TypeSpecifier::Pointer(_, addr_space), _, _) = expr {
--            return *addr_space;
-+        match expr {
-+            Expr::Cast(TypeSpecifier::Pointer(_, addr_space), inner, _) => {
-+                if *addr_space != AddressSpace::Default {
-+                    return *addr_space;
++            LineKind::Directive | LineKind::Nop => continue,
++            _ => {}
++        }
++        let t = lines[i].trim();
++        let Some(sp) = t.find(' ') else { continue };
++        let mnemonic = &t[..sp];
++        let rest = &t[sp + 1..];
++        match mnemonic {
++            // Zero-extending loads: bits above the access size are zero.
++            "ldrb" | "ldurb" | "ldarb" | "ldaprb" | "ldtrb" | "ldrab" => {
++                if let Some((d, _)) = rest.split_once(',') {
++                    let dst = parse_reg(d.trim());
++                    if dst < 32 {
++                        zext[dst as usize] = 8;
++                    }
 +                }
-+                self.get_addr_space_of_ptr_expr(inner)
++                kill_writeback_base(t, &mut zext);
 +            }
-+            Expr::Cast(_, inner, _) => self.get_addr_space_of_ptr_expr(inner),
-+            Expr::AddressOf(inner, _) => self.get_addr_space_of_struct_expr(inner),
-+            _ => AddressSpace::Default,
-         }
--        AddressSpace::Default
++            "ldrh" | "ldurh" | "ldarh" | "ldaprh" | "ldtrh" => {
++                if let Some((d, _)) = rest.split_once(',') {
++                    let dst = parse_reg(d.trim());
++                    if dst < 32 {
++                        zext[dst as usize] = 16;
++                    }
++                }
++                kill_writeback_base(t, &mut zext);
++            }
++            // Masks produce exactly their own width of known zeros. NOTE:
++            // `ands` also SETS FLAGS — its value knowledge is tracked, but
++            // it is never rewritten (a `mov` replacement would drop the
++            // flag definitions).
++            "and" | "ands" => {
++                let is_ands = mnemonic == "ands";
++                let mut ops = rest.split(',');
++                let dst = ops.next().map(|o| parse_reg(o.trim())).unwrap_or(REG_NONE);
++                let src = ops.next().map(|o| parse_reg(o.trim())).unwrap_or(REG_NONE);
++                let third = ops.next();
++                // Capture the source bound BEFORE writing the destination:
++                // for the in-place form `and x0, x0, #mask` (dst == src) the
++                // destination update below would otherwise overwrite the
++                // very bound the redundancy check reads — the mask would
++                // then validate itself (e.g. an #0xffff truncation after
++                // `sxth` saw its own 16-bit result instead of the 64-bit
++                // sign-extended input and deleted itself — cast_chain_fold,
++                // sqlite_yy_shift miscompiles).
++                let src_bound = if src < 32 { zext[src as usize] } else { ZEXT_NO_INFO };
++                if dst < 32 {
++                    let w = third.and_then(zext_mask_bits).unwrap_or_else(|| {
++                        let dform = rest.split(',').next().unwrap_or("").trim();
++                        form_zero_width(dform)
++                    });
++                    zext[dst as usize] = w;
++                }
++                // A plain-AND mask whose source is already wider-known is
++                // redundant: value-identical `mov`, flags untouched (`and`
++                // reads no flags and writes none).
++                if !is_ands {
++                    if let Some(bits) = third.and_then(zext_mask_bits) {
++                        if src < 32 && src_bound <= bits {
++                            let dform = rest.split(',').next().unwrap_or("").trim();
++                            let sform = rest
++                                .split(',')
++                                .nth(1)
++                                .unwrap_or("")
++                                .trim()
++                                .to_string();
++                            let is32 = dform.starts_with('w');
++                            let new = format!("    mov {}, {}", dform, sform);
++                            kinds[i] = LineKind::Move {
++                                dst,
++                                src,
++                                is_32bit: is32,
++                            };
++                            lines[i] = new;
++                            changed = true;
++                        }
++                    }
++                }
++            }
++            // ubfx wD, ..., #0, #w yields w known-zero bits when lsb == 0.
++            "ubfx" => {
++                // Operands: dst, src, #lsb, #width.
++                let mut ops = rest.split(',');
++                let dst = ops.next().map(|o| parse_reg(o.trim())).unwrap_or(REG_NONE);
++                let lsb: Option<u32> = ops
++                    .nth(2)
++                    .and_then(|o| o.trim().strip_prefix('#'))
++                    .and_then(|o| o.trim().parse().ok());
++                let width: Option<u32> = ops
++                    .next()
++                    .and_then(|o| o.trim().strip_prefix('#'))
++                    .and_then(|o| o.trim().parse().ok());
++                if dst < 32 {
++                    zext[dst as usize] = if lsb == Some(0) {
++                        width.map(|w| w.clamp(0, 63) as u8).unwrap_or(0)
++                    } else {
++                        form_zero_width(rest.split(',').next().unwrap_or("").trim())
++                    };
++                }
++            }
++            "uxtb" | "uxth" => {
++                if let Some((d, _)) = rest.split_once(',') {
++                    let dst = parse_reg(d.trim());
++                    if dst < 32 {
++                        zext[dst as usize] = if mnemonic == "uxtb" { 8 } else { 16 };
++                    }
++                }
++            }
++            // adrp: page-aligned (bits 11:0 zero) is an ALIGNMENT fact,
++            // not a width bound -- value(adrp) is generally >= 2^12. No
++            // width information here; the x-form base rule applies.
++            "adrp" => {}
++            "mov" | "movz" => {
++                let mut ops = rest.split(',');
++                let dform = ops.next().unwrap_or("").trim().to_string();
++                let srcop = ops.next().unwrap_or("").trim().to_string();
++                let dst = parse_reg(&dform);
++                // `movz xD, #imm, lsl #n` shifts — the immediate's width no
++                // longer bounds the register's zero bits (e.g. lsl #48 puts
++                // non-zero bits high). The register IS written, so the old
++                // bound must not survive: fall back to the form rule.
++                let shifted = rest.contains(", lsl") || rest.contains(", lsl ");
++                if dst < 32 && shifted {
++                    zext[dst as usize] = form_zero_width(&dform);
++                }
++                if dst < 32 && !shifted {
++                    if let Some(immv) = srcop.strip_prefix('#') {
++                        // mov/movz with a non-negative immediate: the value's
++                        // known zero width is the immediate's significant
++                        // width rounded up to 8/16/32.
++                        if let Ok(v) = u64::from_str_radix(
++                            immv.trim_start_matches("0x"),
++                            if immv.starts_with("0x") { 16 } else { 10 },
++                        ) {
++                            zext[dst as usize] = if v <= 0xff {
++                                8
++                            } else if v <= 0xffff {
++                                16
++                            } else {
++                                32
++                            };
++                        } else {
++                            zext[dst as usize] = form_zero_width(&dform);
++                        }
++                    } else {
++                        let src = parse_reg(&srcop);
++                        if src < 32 {
++                            // Copy: the written value keeps the source's
++                            // width bound; a w-form write additionally
++                            // zeroes bits 63:32, clamping the bound at 32.
++                            zext[dst as usize] = if dform.starts_with('w') {
++                                zext[src as usize].min(32)
++                            } else {
++                                zext[src as usize]
++                            };
++                        } else {
++                            zext[dst as usize] = form_zero_width(&dform);
++                        }
++                    }
++                }
++            }
++            // Everything else with a classified single destination: the form
++            // of the destination fixes the base knowledge.
++            _ => match kinds[i] {
++                LineKind::Alu => {
++                    let dst = first_operand_reg(t);
++                    if dst < 32 {
++                        let dform = t
++                            .split_once(' ')
++                            .and_then(|(_, r)| r.split(',').next())
++                            .unwrap_or("")
++                            .trim();
++                        zext[dst as usize] = form_zero_width(dform);
++                    }
++                }
++                // Move-family mnemonics movn/movk reach here: movn writes a
++                // complemented immediate (unknown zeros — form rule), movk
++                // patches mid-bits (form rule). Both are captured by the
++                // destination-form base rule below.
++                LineKind::Move { dst, src, is_32bit } => {
++                    if dst < 32 {
++                        // Reached only for forms the mov/movz mnemonic arm
++                        // does not cover (movn/movk); transfer conservatively.
++                        let _ = src;
++                        zext[dst as usize] = if is_32bit { 32 } else { ZEXT_NO_INFO };
++                    }
++                }
++                LineKind::MoveImm { dst } | LineKind::MoveWide { dst } => {
++                    if dst < 32 {
++                        let dform = t
++                            .split_once(' ')
++                            .and_then(|(_, r)| r.split(',').next())
++                            .unwrap_or("")
++                            .trim()
++                            .to_string();
++                        zext[dst as usize] = form_zero_width(&dform);
++                    }
++                }
++                LineKind::LoadSp { reg, is_word, .. } => {
++                    if reg < 32 {
++                        // w-form: value < 2^32; x-form: arbitrary 64-bit.
++                        zext[reg as usize] = if is_word { 32 } else { ZEXT_NO_INFO };
++                    }
++                }
++                LineKind::LoadswSp { reg, .. } => {
++                    if reg < 32 {
++                        // ldrsw sign-extends: bits 63:32 may be all ones.
++                        zext[reg as usize] = ZEXT_NO_INFO;
++                    }
++                }
++                LineKind::LoadPairSp => {
++                    // ldp wA, wB / ldp xA, xB — both destinations.
++                    let mut ops = rest.split(',');
++                    if let Some(a) = ops.next() {
++                        let r = parse_reg(a.trim());
++                        if r < 32 {
++                            zext[r as usize] = form_zero_width(a.trim());
++                        }
++                    }
++                    if let Some(b) = ops.next() {
++                        let r = parse_reg(b.trim());
++                        if r < 32 {
++                            zext[r as usize] = form_zero_width(b.trim());
++                        }
++                    }
++                }
++                // cmp/cmn write no GP registers; stores write none (sp-based
++                // forms carry no writeback in this backend); sxtw/ldrsb
++                // produce sign-extended values (base form rule below).
++                LineKind::Compare | LineKind::StoreSp { .. } | LineKind::StorePairSp => {}
++                LineKind::Sxtw { dst, .. } => {
++                    if dst < 32 {
++                        // Sign-extended: bits 63:32 copy bit 31 (may be set).
++                        zext[dst as usize] = ZEXT_NO_INFO;
++                    }
++                }
++                LineKind::LoadsbReg => {
++                    let d = first_operand_reg(t);
++                    if d < 32 {
++                        // ldrsb sign-extends: no width bound.
++                        zext[d as usize] = ZEXT_NO_INFO;
++                    }
++                }
++                // Unknown shape: reset everything (conservative).
++                _ => {
++                    zext = [ZEXT_NO_INFO; 33];
++                    zext[32] = 0;
++                }
++            },
++        }
++    }
++    changed
++}
++
++// ── AND + CMP #0 fusion (AArch64 TST) ────────────────────────────────────────
++//
++// `and wA, wB, C` immediately followed by `cmp wA, #0` and an N/Z/V-based
++// flag consumer burns an instruction: ANDS computes the same value, writes
++// the same destination register, and sets N/Z/V from the identical result.
++// Fuse to `ands wA, wB, C` and delete the compare:
++//
++//   and  w5, w19, w20        ands w5, w19, w20
++//   cmp  w5, #0          →   cset x0, ne
++//   cset x0, ne
++//
++// Exactness (ARM ARM): for `cmp x, #0` N = bit31(x), Z = (x == 0), C = 1,
++// V = 0. For `ands` N and Z are identical (same value); V = 0 always
++// (logical ops). C differs (shifter carry), so C-consuming conditions
++// (hs/lo/cs/cc/hi/ls) are excluded. Allowed set uses only N/Z/V:
++// eq/ne/mi/pl/ge/lt/gt/le/vs/vc (for ge/lt/gt/le note V is 0 on BOTH sides,
++// so N-vs-V relations are identical).
++//
++// The ANDS keeps writing wA, so no liveness is required; the immediate form
++// shares AND's encoder, so any valid `and #imm` is a valid `ands #imm`.
++
++fn nzv_condition(cc: &str) -> bool {
++    matches!(
++        cc,
++        "eq" | "ne" | "mi" | "pl" | "ge" | "lt" | "gt" | "le" | "vs" | "vc"
++    )
++}
++
++fn fuse_and_cmp_zero(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
++    if std::env::var("CCC_NO_AND_TST_FUSION").is_ok() {
++        return false;
++    }
++    let mut changed = false;
++    for i in 0..n.saturating_sub(2) {
++        if kinds[i] != LineKind::Alu {
++            continue;
++        }
++        let t = lines[i].trim();
++        if !t.starts_with("and ") {
++            continue;
++        }
++        let mut ops = t[4..].splitn(3, ',');
++        let dform = ops.next().unwrap_or("").trim().to_string();
++        let sform = ops.next().unwrap_or("").trim().to_string();
++        // Tail kept VERBATIM (may contain shifted-register operands such as
++        // `x2, lsl #3` — ands accepts the identical operand encoding).
++        let cform = ops.next().unwrap_or("").trim().to_string();
++        let dst = parse_reg(&dform);
++        if dst == REG_NONE || dst >= 32 {
++            continue;
++        }
++        // i+1: cmp <same reg>, #0 (or xzr/wzr)
++        let t1 = lines[i + 1].trim();
++        if kinds[i + 1] != LineKind::Compare || !t1.starts_with("cmp ") {
++            continue;
++        }
++        let mut cops = t1[4..].split(',');
++        let creg = cops.next().unwrap_or("").trim();
++        let cimm = cops.next().unwrap_or("").trim();
++        if creg != dform || !(cimm == "#0" || cimm == "xzr" || cimm == "wzr") {
++            continue;
++        }
++        // i+2: an N/Z/V-only flag consumer.
++        let t2 = lines[i + 2].trim();
++        let cc_ok = if let Some(rest) = t2.strip_prefix("b.") {
++            rest.split_once(' ').map(|(cc, _)| nzv_condition(cc)).unwrap_or(false)
++        } else if t2.starts_with("cset ") || t2.starts_with("csetm ") {
++            t2.split_once(' ')
++                .and_then(|(_, tail)| tail.split(',').nth(1))
++                .map(|cc| nzv_condition(cc.trim()))
++                .unwrap_or(false)
++        } else {
++            false
++        };
++        if !cc_ok {
++            continue;
++        }
++        lines[i] = format!("    ands {}, {}, {}", dform, sform, cform);
++        kinds[i] = LineKind::Alu;
++        lines[i + 1] = String::new();
++        kinds[i + 1] = LineKind::Nop;
++        changed = true;
++    }
++    changed
++}
++
++
++// ── Dead move before return ──────────────────────────────────────────────────
++//
++// Return staging can leave `mov xD, xS` writes whose destination is the
++// value's register-allocation home rather than the ABI return register x0 —
++// e.g. bool-gate-shaped functions end
++//   cset x0, ne ; sxtw x0, w0 ; mov x5, x0 ; <epilogue restores> ; ret
++// where x5 is never read again. `ret` reads no general-purpose register
++// except x30 (lr), so a move whose destination is not mentioned again
++// before the ret (a later pure redefinition also proves death) is dead.
++//
++// The scan is the eliminate_dead_call_staging_moves shape, tightened for
++// the no-call path: every instruction between the move and the ret must
++// either not mention the destination, or provably only WRITE it (Move from
++// a different source, MoveImm, LoadSp, Sxtw from a different source, Alu
++// writing a different register). Anything ambiguous — unknown kinds, memory
++// ops, calls, control flow — aborts the scan (move stays). Destinations
++// x29 (fp), x30 (lr: `ret` reads it), sp and xzr are excluded.
++fn eliminate_dead_pre_ret_moves(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
++    if std::env::var("CCC_NO_DEAD_PRE_RET").is_ok() {
++        return false;
++    }
++    fn mentions_reg(line: &str, reg: u8) -> bool {
++        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
++            .any(|token| token == xreg_name(reg) || token == wreg_name(reg))
++    }
++    /// True when the line writes `reg` and provably does not read it.
++    fn pure_write(line: &str, kind: &LineKind, reg: u8) -> bool {
++        match kind {
++            LineKind::Move { dst, src, .. } => *dst == reg && *src != reg,
++            LineKind::MoveImm { dst } | LineKind::MoveWide { dst } => *dst == reg,
++            LineKind::LoadSp { reg: d, .. } | LineKind::LoadswSp { reg: d, .. } => *d == reg,
++            LineKind::LoadPairSp => {
++                // ldp d, other — both destinations; reg must be one and the
++                // other must differ.
++                let rest = line.trim().split_once(' ').map(|(_, r)| r).unwrap_or("");
++                let mut ops = rest.split(',');
++                let a = ops.next().map(|o| parse_reg(o.trim())).unwrap_or(REG_NONE);
++                let b = ops.next().map(|o| parse_reg(o.trim())).unwrap_or(REG_NONE);
++                (a == reg) != (b == reg)
++            }
++            LineKind::Sxtw { dst, src } => *dst == reg && *src != reg,
++            LineKind::Alu => {
++                // Alu writes its first operand and reads the rest (for
++                // read-modify forms the source operands may name the same
++                // register — those are NOT pure writes). Memory operands
++                // like `[x19, x1]` never parse to `reg` unless reg is
++                // genuinely named, which the all-check treats as a read.
++                let d = first_operand_reg(line);
++                if d != reg {
++                    return false;
++                }
++                let rest = line.trim().split_once(' ').map(|(_, r)| r).unwrap_or("");
++                rest.split(',').skip(1).all(|o| parse_reg(o.trim()) != reg)
++            }
++            _ => false,
++        }
++    }
++    let mut changed = false;
++    for i in 0..n {
++        // Destinations: GP registers 1..=28. Excluded: x0 — THE RETURN
++        // REGISTER; `ret` hands x0 to the caller, so a late write to it is
++        // observable even when nothing in this function reads it (aarch64
++        // regression seeds: deleting `mov w0, w0` before ret changed the
++        // returned value — the 32-bit form zero-extends x0). Also excluded:
++        // x29 (fp), x30 (lr — `ret` reads it), sp, xzr.
++        let dst = match kinds[i] {
++            LineKind::Move { dst, .. } if (1..=28).contains(&dst) => dst,
++            _ => continue,
++        };
++        let mut j = i + 1;
++        let mut dead = false;
++        while j < n {
++            match kinds[j] {
++                LineKind::Nop | LineKind::Directive => {}
++                LineKind::Ret => {
++                    dead = true;
++                    break;
++                }
++                LineKind::Label
++                | LineKind::Branch
++                | LineKind::CondBranch
++                | LineKind::CmpBranch
++                | LineKind::Call => break,
++                _ => {
++                    if mentions_reg(&lines[j], dst) {
++                        if pure_write(&lines[j], &kinds[j], dst) {
++                            dead = true; // overwritten unread: move is dead
++                        }
++                        break;
++                    }
++                }
++            }
++            j += 1;
++        }
++        if dead {
++            kinds[i] = LineKind::Nop;
++            lines[i] = String::new();
++            changed = true;
++        }
++    }
++    changed
++}
++
+ // ── Pass 4: Move chain optimization ──────────────────────────────────────────
+ //
+ // Pattern: mov A, B  ;  mov C, A → mov C, B
+@@ -3756,12 +4322,13 @@ mod tests {
+ 
+     #[test]
+     fn test_adjacent_store_load_diff_reg() {
+-        let input = "    str x0, [sp, #16]\n    ldr x1, [sp, #16]\n    ret\n";
++        let input = "    str x0, [sp, #16]\n    ldr x1, [sp, #16]\n    add x2, x1, #1\n    ret\n";
+         let result = peephole_optimize(input.to_string());
+-        // The load is replaced with mov, and then DSE removes the now-dead store
+-        // (no remaining loads from offset 16), leaving just the mov and ret.
+-        assert!(!result.contains("ldr x1, [sp, #16]"));
+-        assert!(result.contains("mov x1, x0"));
++        // The load must never reach the final text: it is replaced by the
++        // store's value (mov or propagated copy), and the then-dead store
++        // is removed by DSE.
++        assert!(!result.contains("ldr x1, [sp, #16]"), "load kept:\n{}", result);
++        assert!(!result.contains("str x0, [sp, #16]"), "dead store kept:\n{}", result);
      }
  
-     /// Get the address space of a struct/union variable expression (for `.` member access).
-diff --git a/tests/regression/check_percpu_reloc_hide_ice.sh b/tests/regression/check_percpu_reloc_hide_ice.sh
-new file mode 100755
-index 0000000..d32f562
---- /dev/null
-+++ b/tests/regression/check_percpu_reloc_hide_ice.sh
-@@ -0,0 +1,56 @@
-+#!/usr/bin/env bash
-+# Kernel tracing_iter_reset ICE (session 2026-08-29):
-+#
-+#   per_cpu_ptr(iter->array_buffer->data, cpu)->skipped_entries = 0
-+#
-+# lowers as RELOC_HIDE empty-asm (stack-homed ptr) + indexed-sym load of
-+# `__per_cpu_offset` (register-homed) + Add + const GEP + store.
-+# MachInst selected the Add as `Lea { base: Vreg(asm_out), index: Phys }`.
-+# The Vreg is unresolvable (the slot holds the pointer VALUE, not an
-+# address to SIB-index), so flush_machinst replayed with empty fold maps
-+# and operand_to_rax panicked on a homeless value.
-+#
-+# Gate: this kernel-shaped TU must compile, and the store must go through
-+# `base + per_cpu_offset[cpu] + 72`.
-+set -euo pipefail
-+CCC=${CCC:-./target/fastbuild/lccc}
-+tmp=${TMPDIR:-/tmp}/lccc-percpu-reloc-hide.$$
-+trap 'rm -rf "$tmp"' EXIT
-+mkdir -p "$tmp"
-+cat >"$tmp/t.c" <<'C'
-+extern unsigned long __per_cpu_offset[];
+     #[test]
+@@ -3791,16 +4358,21 @@ mod tests {
+ 
+     #[test]
+     fn test_move_chain() {
+-        let input = "    mov x0, x14\n    mov x13, x0\n    ret\n";
++        // The copy-of-copy chain must not survive: the fold (or equivalent
++        // copy propagation) rewrites the sole read of x13 to its source, so
++        // `mov x13, x0` disappears in one form or another.
++        let input = "    mov x0, x14\n    mov x13, x0\n    add x15, x13, #1\n    ret\n";
+         let result = peephole_optimize(input.to_string());
+-        assert!(result.contains("mov x13, x14"));
++        assert!(!result.contains("mov x13, x0"), "chain not folded:\n{}", result);
++        assert!(result.contains("add x15, x14, #1"), "value flow lost:\n{}", result);
+     }
+ 
+     #[test]
+     fn test_move_imm_chain() {
+-        let input = "    mov x0, #0\n    mov x14, x0\n    ret\n";
++        let input = "    mov x0, #0\n    mov x14, x0\n    add x15, x14, #1\n    ret\n";
+         let result = peephole_optimize(input.to_string());
+-        assert!(result.contains("mov x14, #0"));
++        assert!(!result.contains("mov x14, x0"), "chain not folded:\n{}", result);
++        assert!(result.contains("mov x14, #0"), "immediate not retargeted:\n{}", result);
+     }
+ 
+     #[test]
+@@ -4698,4 +5270,95 @@ f:
+         let n = lines.len();
+         assert!(!sink_loop_carried_stores(&mut lines, &mut kinds, n));
+     }
 +
-+struct percpu_data {
-+    char pad[72];
-+    unsigned long skipped_entries;
-+};
-+struct array_buffer {
-+    void *buffer;
-+    struct percpu_data *data;
-+};
-+struct trace_iterator {
-+    void *pad0;
-+    void *pad1;
-+    struct array_buffer *array_buffer;
-+};
++    // ── eliminate_dead_pre_ret_moves ──────────────────────────────────────
 +
-+#define RELOC_HIDE(ptr, off)					\
-+  ({ unsigned long __ptr;					\
-+     __asm__ ("" : "=r"(__ptr) : "0"(ptr));		\
-+     (typeof(ptr)) (__ptr + (off)); })
++    #[test]
++    fn test_dead_pre_ret_move_removed() {
++        // Staged-to-home move whose destination nothing reads before the
++        // ret (bool_gate shape): dead, removed.
++        let input = "f:\n    cset x0, ne\n    sxtw x0, w0\n    mov x5, x0\n    ret\n";
++        let result = peephole_optimize(input.to_string());
++        assert!(!result.contains("mov x5, x0"), "dead staging mov kept:\n{}", result);
++    }
 +
-+void tracing_iter_reset(struct trace_iterator *iter, int cpu)
-+{
-+    struct percpu_data *p = RELOC_HIDE(iter->array_buffer->data, __per_cpu_offset[cpu]);
-+    p->skipped_entries = 0;
-+}
-+C
-+# Kernel-like flags that hit the ICE in the full TU (mcmodel=kernel
-+# indexed-sym load of __per_cpu_offset into a GPR, frame pointer on).
-+"$CCC" -O2 -mcmodel=kernel -fno-pic -fno-PIE -mno-sse -mno-red-zone \
-+    -fno-omit-frame-pointer -c "$tmp/t.c" -o "$tmp/t.o"
-+"$CCC" -O2 -mcmodel=kernel -fno-pic -fno-PIE -mno-sse -mno-red-zone \
-+    -fno-omit-frame-pointer -S "$tmp/t.c" -o "$tmp/t.s"
-+# Indexed load of the per-cpu offset table, then a store at +72 (0x48).
-+grep -q '__per_cpu_offset' "$tmp/t.s"
-+grep -Eq 'movq[[:space:]]+\$0,[[:space:]]*72\(|movq[[:space:]]+\$0,[[:space:]]*\(|leaq[[:space:]]+72\(' "$tmp/t.s"
++    #[test]
++    fn test_dead_pre_ret_x0_return_reg_kept() {
++        // A write to x0 immediately before ret IS the return value: kept.
++        let input = "f:\n    mov x0, x5\n    ret\n";
++        let result = peephole_optimize(input.to_string());
++        assert!(result.contains("mov x0, x5"), "return-register write deleted:\n{}", result);
++    }
++
++    #[test]
++    fn test_dead_pre_ret_w0_zext_semantics_kept() {
++        // `mov w0, w0` is a 32-bit write that zero-extends x0's low half —
++        // observable through the caller's view of x0. Never delete.
++        let input = "f:\n    mov x0, x22\n    mov w0, w0\n    ret\n";
++        let result = peephole_optimize(input.to_string());
++        assert!(result.contains("mov w0, w0"), "zext-into-x0 deleted:\n{}", result);
++    }
++
++    #[test]
++    fn test_dead_pre_ret_read_blocks_removal() {
++        // The move's destination is read by a store through an argument
++        // pointer (which DSE cannot prove dead): the move is live and the
++        // whole sequence must survive verbatim.
++        let input = "f:\n    mov x5, x0\n    str x5, [x19]\n    ret\n";
++        let result = peephole_optimize(input.to_string());
++        assert!(result.contains("mov x5, x0"), "live move deleted:\n{}", result);
++        assert!(result.contains("str x5, [x19]"), "store lost:\n{}", result);
++    }
++
++    // ── fuse_and_cmp_zero ─────────────────────────────────────────────────
++
++    #[test]
++    fn test_and_cmp_fused_to_ands() {
++        let input = "f:\n    and w5, w19, w20\n    cmp w5, #0\n    cset x0, ne\n    ret\n";
++        let result = peephole_optimize(input.to_string());
++        assert!(result.contains("ands w5, w19, w20"), "fusion missed:\n{}", result);
++        assert!(!result.contains("cmp w5, #0"), "cmp kept after fusion:\n{}", result);
++    }
++
++    #[test]
++    fn test_and_cmp_ccond_not_fused() {
++        // b.cs consumes the C flag: cmp #0 sets C=1, ands sets the shifter
++        // carry — the flags differ, so no fusion.
++        let input = "f:\n    and w5, w19, w20\n    cmp w5, #0\n    b.cs .L1\n    ret\n.L1:\n    ret\n";
++        let result = peephole_optimize(input.to_string());
++        assert!(!result.contains("ands w5"), "C-consumer fused:\n{}", result);
++        assert!(result.contains("cmp w5, #0"), "cmp dropped for C-consumer:\n{}", result);
++    }
++
++    // ── eliminate_redundant_zext_and ──────────────────────────────────────
++
++    #[test]
++    fn test_zext_and_after_ldrb_removed() {
++        // ldrb already zero-extends: the #0xff re-mask is a no-op.
++        let input = "f:\n    ldrb w5, [x19, x1]\n    and w4, w5, #0xff\n    add x9, x4, #1\n    ret\n";
++        let result = peephole_optimize(input.to_string());
++        assert!(
++            !result.contains("and w4, w5, #0xff"),
++            "redundant mask kept:\n{}",
++            result
++        );
++        assert!(result.contains("mov w4, w5"), "mask not rewritten to mov:\n{}", result);
++    }
++
++    #[test]
++    fn test_zext_and_unknown_source_kept() {
++        // w6's high bits are unknown: the mask is semantically required.
++        let input = "f:\n    mov w4, w6\n    and w5, w4, #0xff\n    add x9, x5, #1\n    ret\n";
++        let result = peephole_optimize(input.to_string());
++        assert!(result.contains("and w5, w4, #0xff"), "needed mask removed:\n{}", result);
++    }
++
++    #[test]
++    fn test_zext_and_never_rewrites_ands() {
++        // ands defines flags for the cset: value-redundant or not, it must
++        // stay an ands.
++        let input = "f:\n    ldrb w5, [x19, x1]\n    ands w4, w5, #0xff\n    cset x9, ne\n    ret\n";
++        let result = peephole_optimize(input.to_string());
++        assert!(result.contains("ands w4, w5, #0xff"), "flag-setting ands rewritten:\n{}", result);
++    }
+ }
+-- 
+2.47.3
+
+
+From fd4bfd9bc4fd4602b7a8f5584b276c3705200d67 Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 23:24:49 +0000
+Subject: [PATCH 2/4] aarch64: fix trampoline encodings; executable GNU_STACK
+ in builtin linker
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Address-taken nested functions segfaulted under every call shape
+(nested_functions rc=139; two independent defects):
+
+1. Trampoline literal encodings were off by one word. The imm19 of an
+   AArch64 LDR (literal) is the byte offset / 4, but both hand-coded
+   words were computed from the WORD offset, so `ldr x18` read the
+   literal-slot padding at +12 (a nop) and `ldr x17` read half the
+   static-chain doubleword at +20 instead of the function pointer at
+   +24. Every trampoline call jumped through garbage.
+
+   The two data words live at +16/+24 in a 32-byte, 16-aligned buffer
+   (ir/lowering/nested_functions.rs allocates 32B@16; unchanged), so the
+   correct encodings are 0x5800_0092 (ldr x18, [pc+#16], imm19=4) and
+   0x5800_00B1 (ldr x17, [pc+#20], imm19=5). GCC 14.2 emits the same
+   x17 word byte-for-byte inside its 40-byte, BTI-marked trampoline
+   (`bti c; ldr x17,[pc+#20]; ldr x18,[pc+#24]; br`, data +24/+32).
+   `bti c` is deliberately still omitted: lccc emits no
+   .note.gnu.property yet, so a BTI instruction would itself fault once
+   BTI is enabled kernel- or toolchain-side. Revisit together with BTI
+   support. Module doc rewritten with the derived encodings and the
+   GCC reference layout.
+
+2. The builtin AArch64 linker always emitted PT_GNU_STACK as RW.
+   lccc's backend marks `.note.GNU-stack,"x"` for units that initialise
+   trampolines, and binutils ORs all input notes into the final
+   PT_GNU_STACK flags; the hand-written emitters must mirror that.
+   Without PF_X, the kernel refuses to execute the trampoline and the
+   first indirect nested call dies with SIGSEGV even with correct
+   words. All three emitters (emit_static, emit_dynamic, emit_shared)
+   now scan every input's sections and set PF_X when any
+   `.note.GNU-stack` carries SHF_EXECINSTR — the exact policy
+   i686/linker/emit.rs (and shared.rs) already implements.
+
+Verified: nested_functions rc=0 under qemu-aarch64 (was rc=139);
+trampoline words printed by a probe are 58000092 580000b1 d61f0220
+d503201f with f0(f2,&i)=8, i=7 (GCC 14.2 agrees); readelf shows RWE
+GNU_STACK only for trampoline units; full ARM differential corpus
+379 passed / 93 failed vs 377/95 baseline (fail set otherwise
+identical); cargo test --lib 1282 passed under -D warnings.
+---
+ src/backend/arm/codegen/nested_fn.rs   | 17 +++++++++++++----
+ src/backend/arm/linker/emit_dynamic.rs | 20 +++++++++++++++++++-
+ src/backend/arm/linker/emit_shared.rs  | 19 ++++++++++++++++++-
+ src/backend/arm/linker/emit_static.rs  | 23 +++++++++++++++++++++--
+ 4 files changed, 71 insertions(+), 8 deletions(-)
+
+diff --git a/src/backend/arm/codegen/nested_fn.rs b/src/backend/arm/codegen/nested_fn.rs
+index 21a9c53c..eca86d61 100644
+--- a/src/backend/arm/codegen/nested_fn.rs
++++ b/src/backend/arm/codegen/nested_fn.rs
+@@ -11,14 +11,23 @@
+ //! `state.requires_executable_stack`):
+ //!
+ //! ```text
+-//! +0:  58000072   ldr x18, [pc, #12]   ; chain from literal at +16
+-//! +4:  58000091   ldr x17, [pc, #16]   ; func  from literal at +24
++//! +0:  58000092   ldr x18, [pc, #16]   ; chain from literal at +16
++//! +4:  580000b1   ldr x17, [pc, #20]   ; func  from literal at +24
+ //! +8:  d61f0220   br  x17
+ //! +12: d503201f   nop                  (keeps the literals 8-byte aligned)
+ //! +16: <chain value, 8 bytes>
+ //! +24: <function address, 8 bytes>
+ //! ```
+ //!
++//! (The original words encoded imm19 = 3/4 — byte offsets 12/20 from the
++//! instruction — so both loads read four bytes short of their literals and
++//! every address-taken chain-using nested call jumped through garbage.
++//! Found by diffing qemu's trampoline disassembly against the stored
++//! words; the x17 encoding now matches GCC 14.2's emitted trampoline
++//! byte-for-byte. GCC additionally prefixes `bti c` because GCC binaries
++//! are BTI-marked; lccc does not yet emit .note.gnu.property BTI, so the
++//! landing pad is unnecessary here — revisit together with BTI support.)
++//!
+ //! The `ldr (literal)` forms make the trampoline position-independent:
+ //! pc-relative data requires no relocation patching at runtime, and no
+ //! absolute stack address ever needs to be embedded. This mirrors GCC's
+@@ -79,8 +88,8 @@ impl ArmCodegen {
+         }
+         // 4. Code words (encodings derived in the module docs).
+         const CODE: [(i64, u32); 4] = [
+-            (0, 0x5800_0072), // ldr x18, [pc, #12]
+-            (4, 0x5800_0091), // ldr x17, [pc, #16]
++            (0, 0x5800_0092), // ldr x18, [pc, #16] -> chain literal at +16
++            (4, 0x5800_00B1), // ldr x17, [pc, #20] -> func literal at +24
+             (8, 0xD61F_0220), // br x17
+             (12, 0xD503_201F), // nop
+         ];
+diff --git a/src/backend/arm/linker/emit_dynamic.rs b/src/backend/arm/linker/emit_dynamic.rs
+index 5ae5b9e5..56492f21 100644
+--- a/src/backend/arm/linker/emit_dynamic.rs
++++ b/src/backend/arm/linker/emit_dynamic.rs
+@@ -648,7 +648,25 @@ pub(super) fn emit_dynamic_executable(
+         8,
+     );
+     ph += 56;
+-    wphdr(&mut out, ph, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0x10);
++    // GNU_STACK — OR of all input notes (trampoline units mark the note
++    // SHF_EXECINSTR); without PF_X an address-taken nested function
++    // segfaults on its first indirect call. (Mirrors i686/linker/emit.rs.)
++    let exec_stack = objects.iter().any(|obj| {
++        obj.sections
++            .iter()
++            .any(|s| s.name == ".note.GNU-stack" && (s.flags & SHF_EXECINSTR) != 0)
++    });
++    wphdr(
++        &mut out,
++        ph,
++        PT_GNU_STACK,
++        PF_R | PF_W | if exec_stack { PF_X } else { 0 },
++        0,
++        0,
++        0,
++        0,
++        0x10,
++    );
+     ph += 56;
+     if has_tls {
+         wphdr(
+diff --git a/src/backend/arm/linker/emit_shared.rs b/src/backend/arm/linker/emit_shared.rs
+index bd17bac0..e66272fd 100644
+--- a/src/backend/arm/linker/emit_shared.rs
++++ b/src/backend/arm/linker/emit_shared.rs
+@@ -848,7 +848,24 @@ pub(super) fn emit_shared_library(
+         8,
+     );
+     ph += 56;
+-    wphdr(&mut out, ph, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0x10);
++    // GNU_STACK — OR of all input notes (trampoline units mark the note
++    // SHF_EXECINSTR). (Mirrors i686/linker/shared.rs.)
++    let exec_stack = objects.iter().any(|obj| {
++        obj.sections
++            .iter()
++            .any(|s| s.name == ".note.GNU-stack" && (s.flags & SHF_EXECINSTR) != 0)
++    });
++    wphdr(
++        &mut out,
++        ph,
++        PT_GNU_STACK,
++        PF_R | PF_W | if exec_stack { PF_X } else { 0 },
++        0,
++        0,
++        0,
++        0,
++        0x10,
++    );
+     ph += 56;
+     if has_tls {
+         wphdr(
+diff --git a/src/backend/arm/linker/emit_static.rs b/src/backend/arm/linker/emit_static.rs
+index 9ac88ad2..8e0582c6 100644
+--- a/src/backend/arm/linker/emit_static.rs
++++ b/src/backend/arm/linker/emit_static.rs
+@@ -816,8 +816,27 @@ pub(super) fn emit_executable(
+         ph += 56;
+     }
+ 
+-    // GNU_STACK
+-    wphdr(&mut out, ph, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0x10);
++    // GNU_STACK — executable when any input's .note.GNU-stack marks
++    // SHF_EXECINSTR (binutils ORs all input notes into the final flags).
++    // The compiler emits the executable note whenever a unit initialises
++    // nested-function trampolines; a non-executable stack segfaults on the
++    // first indirect nested call. (Mirrors i686/linker/emit.rs.)
++    let exec_stack = objects.iter().any(|obj| {
++        obj.sections
++            .iter()
++            .any(|s| s.name == ".note.GNU-stack" && (s.flags & SHF_EXECINSTR) != 0)
++    });
++    wphdr(
++        &mut out,
++        ph,
++        PT_GNU_STACK,
++        PF_R | PF_W | if exec_stack { PF_X } else { 0 },
++        0,
++        0,
++        0,
++        0,
++        0x10,
++    );
+     ph += 56;
+ 
+     // PT_GNU_EH_FRAME: points to .eh_frame_hdr for stack unwinding
+-- 
+2.47.3
+
+
+From c5623a7691149f25e18b9c45580191f2b2c409d5 Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 23:24:58 +0000
+Subject: [PATCH 3/4] loop_unroll: thread loop-carried phis through partial
+ unroll
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+do_unroll rethreaded only the IV phi through the exit-check chain. Any
+OTHER header phi — a reduction accumulator, a marching pointer — kept
+reading its pre-iteration value inside every clone: the clone's update
+became dead, DCE deleted it, and the loop silently skipped k-1 of every
+k elements whenever the runtime trip count hit the unrolled fast path.
+lea_sib_fold printed "45 18" instead of "45 25": the vectorized body
+consumed 4 elements, the remainder loop ran under a 4x partial unroll,
+and the final element's add fed a phi that never saw it.
+
+Three coupled fixes in do_unroll:
+
+1. Carried-phi threading. Collect every non-IV header phi whose
+   latch-incoming operand is a value L0 (the original body's update).
+   Clone j reads prev_j = L0 renamed by clone j-1's value map (L0
+   itself for clone 0); the header phi's latch incoming becomes the
+   last clone's copy (step 4b). Substitution uses the canonical
+   subst_value_with_operand AFTER the clone's own vmap rename —
+   substituting before would let the vmap re-rename the injected value
+   onto the clone's own id, producing self-referencing adds.
+
+2. Exit-edge updates (step 5). For exit-block phis fed by the header,
+   the value on each NEW exit-check edge is the latch-incoming operand
+   renamed by the last executed clone's map — NOT the header-edge
+   operand, which on the path preheader->header->body->exit_check is
+   still the preheader value because the phi's update rides the latch
+   edge the early exit never takes. The IV uses the check block's own
+   prev+step result.
+
+3. Exit phis for lowered loops (step 5b). When the exit block has NO
+   header-fed phi for the IV or a carried value (later passes may have
+   already lowered loop phis to explicit edge copies), readers after
+   the loop still use the header phi's dest SSA name and would observe
+   the stale preheader value on the new edges. Insert a proper exit
+   phi — fresh dest, the header phi itself on the header edge, the
+   threaded edge values on the new check edges — and rewrite readers
+   in the post-exit region (reachable from exit without re-entering
+   the loop; other blocks' phis skipped as per-edge selectors). This
+   keeps the IR in SSA: an earlier attempt wrote explicit copies into
+   the check blocks and redefined the phi dests, which broke the
+   unique-def invariant (test_value_ids_unique_after_unroll caught it).
+
+The F32-only residual rejection and the expansion budgets are
+untouched, per the recorded session61/session75 decisions.
+
+Verified: lea_sib_fold now prints "45 25" (GCC 14.2 parity); a
+4-backend differential probe (remainder shapes 0..4, runtime-trip
+accumulator, IV-after-loop, two carried phis; n=0..20) is ALL OK on
+x86-64, i686, AArch64 and RISC-V64; cargo test --lib 1282 passed under
+-D warnings; ARM corpus 379/93 (lea_sib_fold leaves the fail set, no
+new failures); x86 corpus 508/0; check_* fixture suite unchanged at
+the 5 documented pre-existing fails; benchmark corpus -O2 instruction
+counts identical to baseline (6036 -> 6036, 38/38 programs).
+---
+ src/passes/loop_unroll.rs | 273 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 269 insertions(+), 4 deletions(-)
+
+diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
+index 58d594be..ad43ea66 100644
+--- a/src/passes/loop_unroll.rs
++++ b/src/passes/loop_unroll.rs
+@@ -1852,6 +1852,32 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
+     func.next_value_id = next_val;
+ 
+     // ── Build new blocks (read-only access to func.blocks) ───────────────────
++    //
++    // Loop-carried phi threading: the IV phi is rethreaded through the
++    // exit-check chain by construction (iv_vals), but ANY OTHER header phi
++    // — a reduction accumulator, a marching pointer — must also advance one
++    // step per unrolled iteration. Without threading, every clone reads the
++    // phi's CURRENT value (the pre-iteration one), the clone's update
++    // becomes dead, DCE deletes it, and the loop silently skips k-1 of
++    // every k elements (lea_sib_fold: 45 18 instead of 45 25). Thread:
++    //   clone j reads prev_j(H), where prev_0(H) = H's latch-incoming
++    //   operand L0 (defined by the original body — the original body's
++    //   update), and prev_{j+1}(H) = clone_j's renamed copy of L0; and the
++    //   header phi's latch incoming becomes the last clone's copy.
++    let mut carried: Vec<(u32, Operand, IrType)> = Vec::new(); // (phi id, L0, ty)
++    for inst in &func.blocks[c.header].instructions {
++        if let Instruction::Phi { dest, incoming, ty } = inst {
++            if dest.0 == c.iv_phi.0 {
++                continue;
++            }
++            if let Some((op, lbl)) = incoming.iter().find(|(_, l)| *l == latch_label) {
++                if let Operand::Value(_) = op {
++                    carried.push((dest.0, op.clone(), ty.clone()));
++                }
++            }
++        }
++    }
++
+     let mut new_blocks: Vec<BasicBlock> = Vec::new();
+ 
+     for j in 0..num_new {
+@@ -1933,12 +1959,45 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
+         for (i, &bi) in c.body_work.iter().enumerate() {
+             let orig = &func.blocks[bi];
+ 
++            // Reads of carried phis in this clone see the previous
++            // iteration's update: L0 for clone 0 (the original body's
++            // result), clone j-1's renamed copy of L0 for clone j > 0.
++            let prev_carried: FxHashMap<u32, Operand> = carried
++                .iter()
++                .map(|(hid, l0, _ty)| {
++                    let prev = if j == 0 {
++                        l0.clone()
++                    } else {
++                        match l0 {
++                            Operand::Value(lv) => {
++                                match clone_vmaps[j - 1].get(&lv.0) {
++                                    Some(nv) => Operand::Value(Value(*nv)),
++                                    None => l0.clone(),
++                                }
++                            }
++                            other => other.clone(),
++                        }
++                    };
++                    (*hid, prev)
++                })
++                .collect();
++
++            // Rename order matters: the clone's own vmap first (it maps
++            // ORIGINAL body values, including L0, to this clone's copies —
++            // substituting the threaded prev value before that would let
++            // the vmap re-rename the injected value onto this clone's own
++            // id, producing self-referencing adds and killing the original
++            // body). The threaded prev values are final names from other
++            // blocks; substitute them after, untouched by this clone's map.
+             let new_insts: Vec<Instruction> = orig
+                 .instructions
+                 .iter()
+                 .map(|inst| {
+                     let mut cloned = inst.clone();
+                     replace_values_in_inst(&mut cloned, vmap);
++                    for (hid, prev) in &prev_carried {
++                        subst_value_with_operand(&mut cloned, *hid, prev);
++                    }
+                     rename_inst_dest(&mut cloned, vmap);
+                     cloned
+                 })
+@@ -1990,10 +2049,62 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
+         }
+     }
+ 
+-    // Step 5: For any phi in the exit block that has an incoming from header,
+-    // add the same value as incoming from each new exit-check block.
++    // Step 4b: retarget every carried header phi's latch incoming to the
++    // last clone's copy of the original body's update (the latch now runs
++    // after clone num_new-1, not after the original body).
++    for (hid, l0, _ty) in &carried {
++        if let Operand::Value(lv) = l0 {
++            if let Some(nv) = clone_vmaps[num_new - 1].get(&lv.0) {
++                for inst in &mut func.blocks[c.header].instructions {
++                    if let Instruction::Phi { dest, incoming, .. } = inst {
++                        if dest.0 == *hid {
++                            for (op, lbl) in incoming.iter_mut() {
++                                if *lbl == latch_label {
++                                    *op = Operand::Value(Value(*nv));
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    // Step 5: For any phi in the exit block that has an incoming from
++    // header, add the value that phi would hold on each new exit-check
++    // edge. Classification (this is NOT simply the header edge's operand —
++    // on the path preheader→header→body→exit_check→exit the header phi took
++    // its PREHEADER value, because its update rides the latch edge, which
++    // the early exit never takes; using the header operand here silently
++    // dropped the last executed body's contribution — lea_sib_fold printed
++    // 18 instead of 25 for the final remainder element):
++    //   * `Value(c.iv_phi)`: the check block itself computes iv_vals[j]
++    //     (prev + step) BEFORE the exit compare, so that value is live.
++    //   * `Value(v)` naming another header phi H (loop-carried
++    //     accumulator): the would-be update is H's latch-incoming operand;
++    //     on exit_check_j's edge the original body and clones 1..=j-1 have
++    //     executed, so the live copy is that operand renamed by clone
++    //     j-1's value map (unrenamed for j = 0 — the original body).
++    //   * anything else (constants, loop-invariant values): identical on
++    //     every path; reused as-is.
+     if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == c.exit_target) {
+-        // Collect (phi_index, value) pairs where value came from the header.
++        // The header phis' latch-incoming operands, by value id.
++        let latch_incoming: FxHashMap<u32, Operand> = func.blocks[c.header]
++            .instructions
++            .iter()
++            .filter_map(|inst| {
++                if let Instruction::Phi { dest, incoming, .. } = inst {
++                    incoming
++                        .iter()
++                        .find(|(_, lbl)| *lbl == latch_label)
++                        .map(|(op, _)| (dest.0, op.clone()))
++                } else {
++                    None
++                }
++            })
++            .collect();
++
++        // Collect (phi_index, header-incoming value) pairs.
+         let phi_header_vals: Vec<(usize, Operand)> = func.blocks[exit_bi]
+             .instructions
+             .iter()
+@@ -2011,14 +2122,168 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
+             .collect();
+ 
+         for (phi_idx, op) in phi_header_vals {
++            // Per-edge incoming for this exit phi.
++            let edge_val = |j: usize| -> Operand {
++                match op {
++                    Operand::Value(v) if v == c.iv_phi => Operand::Value(iv_vals[j]),
++                    Operand::Value(v) => {
++                        match latch_incoming.get(&v.0) {
++                            Some(l) if j == 0 => l.clone(),
++                            Some(l) => {
++                                // Rename through the last executed clone's map.
++                                let mut renamed = l.clone();
++                                if let Operand::Value(lv) = renamed {
++                                    if let Some(nv) = clone_vmaps[j - 1].get(&lv.0) {
++                                        renamed = Operand::Value(Value(*nv));
++                                    }
++                                }
++                                renamed
++                            }
++                            // Not a header phi: loop-invariant on this path.
++                            None => op.clone(),
++                        }
++                    }
++                    other => other,
++                }
++            };
+             for j in 0..num_new {
++                let val = edge_val(j);
+                 if let Instruction::Phi { incoming, .. } =
+                     &mut func.blocks[exit_bi].instructions[phi_idx]
+                 {
+-                    incoming.push((op, ec_labels[j]));
++                    incoming.push((val, ec_labels[j]));
++                }
++            }
++        }
++    }
++
++    // Step 5b: If the exit block has NO phi fed by the header for a
++    // carried value (or the IV), readers after the loop still use the
++    // header phi's dest SSA name directly. On the NEW exit-check edges
++    // that name holds its PREHEADER value (the phi's update rides the
++    // latch edge, which an early exit never takes), so every contribution
++    // of the last executed body was silently dropped (lea_sib_fold printed
++    // 45 18 instead of 45 25). Insert a proper exit phi — dest fresh, with
++    // the header phi itself on the header edge and the threaded edge values
++    // on the new check edges — and rewrite the post-exit readers to it.
++    // (Earlier passes in the pipeline may already have lowered loop phis to
++    // explicit edge copies, which is exactly the case this step heals.)
++    {
++        let loop_labels: FxHashSet<BlockId> = c
++            .body_work
++            .iter()
++            .map(|&bi| func.blocks[bi].label)
++            .chain(std::iter::once(header_label))
++            .chain(std::iter::once(latch_label))
++            .collect();
++        let exit_idx = match func.blocks.iter().position(|b| b.label == c.exit_target) {
++            Some(i) => i,
++            None => {
++                func.blocks.extend(new_blocks);
++                return true;
++            }
++        };
++
++        // Values needing an exit phi: the IV (edge value = the check
++        // block's prev+step result) and every carried phi (edge value = the
++        // latch incoming renamed by the last executed clone's map).
++        let mut need: Vec<(Value, Vec<Operand>, IrType)> = Vec::new();
++        {
++            let mut iv_edges = Vec::with_capacity(num_new);
++            for j in 0..num_new {
++                iv_edges.push(Operand::Value(iv_vals[j]));
++            }
++            let iv_ty = func.blocks[c.header]
++                .instructions
++                .iter()
++                .find_map(|inst| match inst {
++                    Instruction::Phi { dest, ty, .. } if dest.0 == c.iv_phi.0 => Some(ty.clone()),
++                    _ => None,
++                })
++                .unwrap_or(c.iv_ty.clone());
++            need.push((c.iv_phi, iv_edges, iv_ty));
++        }
++        for (hid, l0, hty) in &carried {
++            let mut edges = Vec::with_capacity(num_new);
++            for j in 0..num_new {
++                let ev = match l0 {
++                    Operand::Value(lv) if j > 0 => {
++                        match clone_vmaps[j - 1].get(&lv.0) {
++                            Some(nv) => Operand::Value(Value(*nv)),
++                            None => l0.clone(),
++                        }
++                    }
++                    _ => l0.clone(),
++                };
++                edges.push(ev);
++            }
++            need.push((Value(*hid), edges, hty.clone()));
++        }
++
++        // Existing phis in the exit block that already take the header as a
++        // predecessor, keyed by the header-edge operand's value id.
++        let mut existing: FxHashMap<u32, ()> = FxHashMap::default();
++        for inst in &func.blocks[exit_idx].instructions {
++            if let Instruction::Phi { incoming, .. } = inst {
++                if let Some((Operand::Value(v), lbl)) =
++                    incoming.iter().find(|(_, l)| *l == header_label)
++                {
++                    existing.insert(v.0, ());
++                }
++            }
++        }
++
++        for (dest, edges, pty) in &need {
++            if existing.contains_key(&dest.0) {
++                continue; // Step 5 already threaded this phi's edges
++            }
++            let new_phi = Value(next_val);
++            next_val += 1;
++            let mut incoming: Vec<(Operand, BlockId)> = Vec::with_capacity(num_new + 1);
++            incoming.push((Operand::Value(*dest), header_label));
++            for (j, ev) in edges.iter().enumerate() {
++                incoming.push((ev.clone(), ec_labels[j]));
++            }
++            func.blocks[exit_idx]
++                .instructions
++                .insert(0, Instruction::Phi { dest: new_phi, incoming, ty: pty.clone() });
++
++            // Rewrite readers of `dest` in the post-exit region: every block
++            // reachable from the exit block without re-entering the loop.
++            let mut stack: Vec<usize> = vec![exit_idx];
++            let mut visited: FxHashSet<usize> = FxHashSet::from_iter([exit_idx]);
++            while let Some(bi) = stack.pop() {
++                let in_loop = loop_labels.contains(&func.blocks[bi].label);
++                if !in_loop {
++                    for inst in &mut func.blocks[bi].instructions {
++                        if matches!(inst, Instruction::Phi { .. }) {
++                            continue; // other blocks' phis select per-edge
++                        }
++                        subst_value_with_operand(inst, dest.0, &Operand::Value(new_phi));
++                    }
++                }
++                let succs: Vec<BlockId> = match &func.blocks[bi].terminator {
++                    Terminator::Branch(l) => vec![*l],
++                    Terminator::CondBranch { true_label, false_label, .. } => {
++                        vec![*true_label, *false_label]
++                    }
++                    _ => vec![],
++                };
++                for l in succs {
++                    if loop_labels.contains(&l) {
++                        continue;
++                    }
++                    if let Some(si) =
++                        func.blocks.iter().position(|b| b.label == l)
++                    {
++                        if visited.insert(si) {
++                            stack.push(si);
++                        }
++                    }
+                 }
+             }
+         }
++        func.next_value_id = next_val;
+     }
+ 
+     // Step 6: Append all new blocks.
+-- 
+2.47.3
+
+
+From e0ea7a9771d13225910aeb58a3b296419fac5e46 Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 23:25:48 +0000
+Subject: [PATCH 4/4] =?UTF-8?q?docs:=20S10=20session=20followup=20?=
+ =?UTF-8?q?=E2=80=94=20trampoline=20+=20unroll=20fixes,=20gates,=20oracle?=
+ =?UTF-8?q?=20reference?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../FOLLOWUP-2026-08-28-kernel-boot.md        | 29 +++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/engineering/FOLLOWUP-2026-08-28-kernel-boot.md b/engineering/FOLLOWUP-2026-08-28-kernel-boot.md
+index e36c80ce..eb4f5640 100644
+--- a/engineering/FOLLOWUP-2026-08-28-kernel-boot.md
++++ b/engineering/FOLLOWUP-2026-08-28-kernel-boot.md
+@@ -200,3 +200,32 @@ real-mode setup.
+   `/home/user/build-lccc5.log`.
+ * Boot logs: `/tmp/boot-gcc.log` (working GCC boot, 157 lines), `/tmp/bisect/o.*.log`.
+ * Auto-saved patch: `/home/user/ms178-1.patch` (snapshot S05).
++
++## Session S10 (c5623a76) — trampoline + unroll defects fixed, two pre-existing ARM fails retired
++
++- **nested_functions (rc=139) FIXED** (fd4bfd9b, 2 defects): (1) AArch64 trampoline
++  `ldr (literal)` imm19 values were word-offsets, not byte/4 — x18 read the nop pad
++  at +12, x17 read half the chain at +20; correct words 0x5800_0092/0x5800_00B1
++  (data at +16/+24; x17 word byte-identical to GCC 14.2). (2) The builtin AArch64
++  linker hardcoded RW PT_GNU_STACK; trampoline units emit `.note.GNU-stack,"x"` and
++  the emitters must OR input notes into PF_X (i686 already did). All three emitters
++  fixed; `bti c` still omitted until lccc emits .note.gnu.property (revisit with BTI).
++- **lea_sib_fold (45 18 vs 45 25) FIXED** (c5623a76): mid-end, in
++  `loop_unroll::do_unroll` — only the IV phi was threaded through the clone chain,
++  so other loop-carried phis (accumulators) read stale values in every clone, their
++  updates died, and k-1 of every k elements were dropped; the early-exit edges also
++  carried the preheader phi value. Fixes: carried-phi threading (clone j reads
++  clone j-1's renamed latch operand; header latch-incoming = last clone's copy),
++  correct per-edge values for header-fed exit phis, and step 5b inserting real exit
++  phis + post-exit reader rewrites when phis were already lowered (unique-def
++  invariant preserved — an explicit-copy variant was caught by
++  test_value_ids_unique_after_unroll and replaced).
++- Gates: lib 1282/0 (-D warnings); ARM 379/93 A/B vs 377/95 (fail set otherwise
++  identical); x86 corpus 508/0; check_* suite at its 5 documented pre-existing
++  fails; 4-backend differential (remainder shapes, IV-after-loop, multi-carried)
++  ALL OK; benchmark corpus instruction counts identical (6036→6036).
++- Oracle (artifacts/evidence/oracle-S10.md): peep probe lccc 34 insns vs GCC 16.1
++  48 (1.41x smaller); tramp probe words match GCC.
++- Open: i686 trampoline emitter audit (emit_init_trampoline_impl) for the same
++  hand-encoding bug class; ARM byte-loop shape thread; the 93-fail ARM corpus is
++  dominated by x86-artifact tests (harness may need arch filtering).
+-- 
+2.47.3
+
