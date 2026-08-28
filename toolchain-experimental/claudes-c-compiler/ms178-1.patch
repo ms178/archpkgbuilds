@@ -1,646 +1,1291 @@
-From 31722e59cc894af90a8eee103a7320616327cea7 Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Fri, 28 Aug 2026 21:10:54 +0000
-Subject: [PATCH 1/6] aarch64, call_abi: AAPCS64 16-byte-alignment for wide
- va_arg and composites
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-va_arg(ap, __int128) lowered to the plain 8-byte GP scalar pattern
-(single ldr, gr_offs += 8), so every 128-bit vararg read garbage; and
-composites with 16-byte natural alignment were classified into
-consecutive GP registers, while the psABI (and GCC's aarch64 layout,
-verified against the oracle for named args: struct{int} align(16) lands
-in w0/w2/w4/w6 with odd registers skipped) requires even-aligned
-register pairs for ANY 16-byte-aligned composite, named or variadic.
-
-  * emit_va_arg_impl gains the 16-byte-granular GP arm: round the offset
-    UP to the alignment ((gr_offs + 15) & -16 — glibc's aarch64 va_arg
-    arithmetic, which is what makes the caller's odd-register skip
-    round-trip), read the pair when at least 16 bytes remain, else a
-    16-aligned __stack slot. The result is stored 16 bytes wide and the
-    dest is marked i128 by generation (VaArg) so later pair loads see
-    the full value.
-  * emit_va_arg_struct had the alignment rounding in the WRONG polarity
-    (and x2, #-16 rounds the offset DOWN, re-reading the skipped odd
-    slot); corrected to the same up-round plus a re-sign-extend before
-    the 64-bit uses.
-  * classify_args_core: the even-pair rounding now applies to any
-    composite with alignment > XLEN (was gated on regs_needed == 2,
-    missing single-register align-16 structs on BOTH riscv and aarch64),
-    and the split reg+stack fallback is suppressed when rounding was
-    applied (a split would violate the alignment contract).
-  * ARM align_struct_pairs is now true; the old "AAPCS64 does not
-    require even-aligned pairs" note was simply wrong (RISC-V GCC
-    round-trips the identical rule — also verified against its oracle).
-
-Validation: va_arg_wide_struct passes on aarch64 AND riscv64 at GCC
-parity (was FAIL i128/u128/a16); targeted va128 probe exact (lo=12,
-hi=2^36); lib 1273/0/6; ARM 376/31/75 (was 375/32); x86 535/5 (same 5
-pre-existing).
----
- src/backend/arm/codegen/calls.rs    |  7 +++-
- src/backend/arm/codegen/variadic.rs | 62 ++++++++++++++++++++++++++++-
- src/backend/call_abi.rs             | 18 +++++++--
- src/backend/generation.rs           |  7 ++++
- 4 files changed, 88 insertions(+), 6 deletions(-)
-
-diff --git a/src/backend/arm/codegen/calls.rs b/src/backend/arm/codegen/calls.rs
-index 6af68b42..d22943a9 100644
---- a/src/backend/arm/codegen/calls.rs
-+++ b/src/backend/arm/codegen/calls.rs
-@@ -20,7 +20,12 @@ impl ArmCodegen {
-             use_sysv_struct_classification: false,
-             use_riscv_float_struct_classification: false,
-             allow_struct_split_reg_stack: false,
--            align_struct_pairs: false,
-+            // Composites with 16-byte natural alignment are allocated at an
-+            // even-aligned register pair (or a 16-aligned stack slot), for
-+            // named AND variadic arguments — GCC's aarch64 layout places
-+            // struct{int} align(16) at w0/w2/w4/w6, skipping odd registers
-+            // (verified against the GCC oracle on named args).
-+            align_struct_pairs: true,
-             sret_uses_dedicated_reg: true,
-             gcc_regparm_mode: false,
-         }
-diff --git a/src/backend/arm/codegen/variadic.rs b/src/backend/arm/codegen/variadic.rs
-index 40b2653b..a11b92d7 100644
---- a/src/backend/arm/codegen/variadic.rs
-+++ b/src/backend/arm/codegen/variadic.rs
-@@ -1,6 +1,7 @@
- //! ArmCodegen: variadic function operations (va_arg, va_start, va_copy).
- 
- use super::emit::{callee_saved_name, ArmCodegen};
-+use crate::backend::generation::is_i128_type;
- use crate::common::types::IrType;
- use crate::ir::reexports::Value;
- 
-@@ -26,6 +27,59 @@ impl ArmCodegen {
-             self.emit_load_from_sp("x1", slot.0, "ldr");
-         }
- 
-+        if is_i128_type(result_ty) {
-+            // AAPCS64 va_arg for a 16-byte-aligned type (C __int128 and the
-+            // _Float128 U128 carrier): read 16 bytes at an ALIGNED GP pair
-+            // slot of the register save area, or from the overflow area at
-+            // a 16-byte-aligned __stack. Two conditions must hold for the
-+            // register path: at least 16 bytes left (gr_offs <= -16) and
-+            // (gr_top + gr_offs) 16-byte aligned — the alignment hole comes
-+            // from odd-register args ahead of us, which GCC's layout skips
-+            // exactly the same way on the caller side.
-+            let label_id = self.state.next_label_id();
-+            let label_stack = format!(".Lva_stack_{}", label_id);
-+            let label_done = format!(".Lva_done_{}", label_id);
+diff --git a/.gitignore b/.gitignore
+index cc3fcbc5..f8179797 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -69,3 +69,8 @@ zlib-ng-validation/
+ # (got swept by git add -A in aa1956b and 12eed2b)
+ /-
+ .base_ref
 +
-+            // Align the offset UP to a 16-byte boundary (glibc's aarch64
-+            // va_arg does exactly (__gr_offs + 15) & -16). This is what
-+            // makes the caller's even-register skip round-trip: an odd
-+            // offs like -56 rounds to -48, i.e. the next aligned pair —
-+            // rounding the ADDRESS down instead would re-read the skipped
-+            // odd slot. Exhaustion test: aligned offs > -16 means the
-+            // remaining register space cannot hold an aligned pair.
-+            self.state.emit("    ldrsw x2, [x1, #24]");
-+            self.state.emit("    add w2, w2, #15");
-+            self.state.emit("    and w2, w2, #-16");
-+            self.state.emit("    cmp w2, #-16");
-+            self.state
-+                .emit_fmt(format_args!("    b.gt {}", label_stack));
-+            self.state.emit("    ldr x3, [x1, #8]");
-+            self.state.emit("    add x3, x3, w2, sxtw");
-+            self.state.emit("    ldr q0, [x3]");
-+            self.state.emit("    add w2, w2, #16");
-+            self.state.emit("    str w2, [x1, #24]");
-+            self.state
-+                .emit_fmt(format_args!("    b {}", label_done));
-+
-+            self.state.emit_fmt(format_args!("{}:", label_stack));
-+            // Overflow path: round __stack up to 16 first (per AAPCS64),
-+            // and mark the GP side exhausted.
-+            self.state.emit("    str wzr, [x1, #24]");
-+            self.state.emit("    ldr x3, [x1]");
-+            self.state.emit("    add x3, x3, #15");
-+            self.state.emit("    and x3, x3, #-16");
-+            self.state.emit("    ldr q0, [x3]");
-+            self.state.emit("    add x3, x3, #16");
-+            self.state.emit("    str x3, [x1]");
-+
-+            self.state.emit_fmt(format_args!("{}:", label_done));
-+            self.state.reg_cache.invalidate_all();
-+            if let Some(slot) = self.state.get_slot(dest.0) {
-+                self.emit_store_to_sp("q0", slot.0, "str");
-+            }
-+            return;
-+        }
-+
-         if is_f128 {
-             // AAPCS64: `long double` (fp128) variadic arguments are saved in the
-             // FP register save area (or, once __vr_offs is exhausted, on the
-@@ -258,7 +312,13 @@ impl ArmCodegen {
-         // Or: aligned_offs + total_reg_bytes is still negative (bit 63 set after sign-extend + add)
-         self.state.emit("    ldrsw x2, [x1, #24]"); // x2 = sign-extended __gr_offs
-         if eff_align == 16 {
--            self.state.emit("    and x2, x2, #-16");
-+            // Round the offset UP to the alignment (see the i128 va_arg
-+            // arm): an odd aligned composite skips to the next even pair.
-+            self.state.emit("    add w2, w2, #15");
-+            self.state.emit("    and w2, w2, #-16");
-+            // The 32-bit and zeroed the upper half of x2; every later use
-+            // is 64-bit, so re-sign-extend.
-+            self.state.emit("    sxtw x2, w2");
-         }
-         if total_reg_bytes <= 4095 {
-             self.state
-diff --git a/src/backend/call_abi.rs b/src/backend/call_abi.rs
-index fa71b2d2..4b8f21fb 100644
---- a/src/backend/call_abi.rs
-+++ b/src/backend/call_abi.rs
-@@ -813,12 +813,21 @@ fn classify_args_core(
-                     } else {
-                         size.div_ceil(slot_size)
-                     };
--                    // RISC-V psABI: 2×XLEN-aligned structs must start at even register.
--                    // Note: ARM AAPCS64 does NOT require even-aligned pairs for composites.
--                    if regs_needed == 2 && config.align_struct_pairs {
-+                    // Composites whose natural alignment exceeds XLEN are
-+                    // allocated at an even-aligned register (pair) — the
-+                    // RISC-V psABI requires it for 2×XLEN-aligned structs,
-+                    // and AAPCS64 does the same for ANY 16-byte-aligned
-+                    // composite, including single-register struct{int}
-+                    // align(16) (GCC oracle: w0/w2/w4/w6 with odd registers
-+                    // skipped). The rounding also applies on the va_arg side
-+                    // (emit_va_arg_struct rounds __gr_offs the same way), so
-+                    // caller and callee agree.
-+                    let mut align_applied = false;
-+                    if config.align_struct_pairs {
-                         let struct_align = info.struct_align.unwrap_or(slot_size);
-                         if struct_align > slot_size && int_idx % 2 != 0 {
-                             int_idx += 1; // skip to even register
-+                            align_applied = true;
-                         }
-                     }
-                     if int_idx + regs_needed <= config.max_int_regs {
-@@ -827,7 +836,8 @@ fn classify_args_core(
-                             size,
-                         });
-                         int_idx += regs_needed;
--                    } else if regs_needed == 2
-+                    } else if !align_applied
-+                        && regs_needed == 2
-                         && int_idx < config.max_int_regs
-                         && config.allow_struct_split_reg_stack
-                     {
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index b238675b..e3bff5f0 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -4983,6 +4983,13 @@ pub(super) fn generate_instruction(
-             va_list_ptr,
-             result_ty,
-         } => {
-+            // A 128-bit va_arg result is definitionally a 128-bit value:
-+            // without this marker, later pair loads via operand_to_x0_x1
-+            // and friends would read only the low 8 bytes and zero-extend
-+            // (the is_i128_value fast path would never fire).
-+            if is_i128_type(*result_ty) {
-+                cg.state().i128_values.insert(dest.0);
-+            }
-             cg.emit_va_arg(dest, va_list_ptr, *result_ty);
-             clobber_after_call_like(cg);
-         }
--- 
-2.47.3
-
-
-From 602f7480a28e00ab50b4ed9144e4f850e96568ed Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Fri, 28 Aug 2026 21:11:03 +0000
-Subject: [PATCH 2/6] riscv: va_arg for __int128 and full-precision long double
- varargs
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-  * va_arg(ap, __int128) had no arm at all — it fell into the plain
-    8-byte scalar path and read half of every 128-bit vararg. New arm:
-    16-byte-aligned overflow-area read, 16-byte store to the dest slot
-    (the dest is marked i128 by generation's VaArg handling).
-  * va_arg(ap, long double) round-tripped through __trunctfdf2 and
-    stored only the low 8 bytes: every long-double vararg was silently
-    truncated to double precision. The full binary128 value is now
-    stored and registered as an f128 source (the same repair aarch64
-    received for va-arg-5/va-arg-6; riscv never got the equivalent).
-  * both new arms stage the value through t3/t4: the first cut used
-    t0/t1, clobbering t1 — the &va_list pointer needed for the
-    write-back — and store()ed the advanced pointer over constant data
-    (SIGSEGV inside the first vararg read, caught by the gdbstub).
-
-Validation: rvva probe (i128 sum + long double sum through 16-byte
-varargs) GCC-exact; va_arg_wide_struct passes on riscv64 (rc=0, was
-broken/segfaulting); lib 1273/0/6; ARM and x86 suites unchanged.
----
- src/backend/riscv/codegen/variadic.rs | 44 +++++++++++++++++++++------
- 1 file changed, 34 insertions(+), 10 deletions(-)
-
-diff --git a/src/backend/riscv/codegen/variadic.rs b/src/backend/riscv/codegen/variadic.rs
-index 2c651e89..e0063c24 100644
---- a/src/backend/riscv/codegen/variadic.rs
-+++ b/src/backend/riscv/codegen/variadic.rs
-@@ -25,22 +25,46 @@ impl RiscvCodegen {
-         // Load the current va_list pointer value (points to next arg)
-         self.state.emit("    ld t2, 0(t1)");
- 
--        if result_ty.is_long_double() {
--            // F128 (long double): 16 bytes, 16-byte aligned.
-+        if crate::backend::generation::is_i128_type(result_ty) {
-+            // __int128: 16 bytes, 16-byte aligned in the overflow area.
-+            // The value rides t3/t4 — t1 holds the &va_list pointer for the
-+            // write-back below, and t2 walks the arg pointer.
-             self.state.emit("    addi t2, t2, 15");
-             self.state.emit("    andi t2, t2, -16");
--            self.state.emit("    ld a0, 0(t2)");
--            self.state.emit("    ld a1, 8(t2)");
-+            self.state.emit("    ld t3, 0(t2)");
-+            self.state.emit("    ld t4, 8(t2)");
-             self.state.emit("    addi t2, t2, 16");
-             self.state.emit("    sd t2, 0(t1)");
--            self.state.emit("    call __trunctfdf2");
--            self.state.emit("    fmv.x.d t0, fa0");
--        } else {
--            // Standard 8-byte arg
--            self.state.emit("    ld t0, 0(t2)");
--            self.state.emit("    addi t2, t2, 8");
-+            if let Some(slot) = self.state.get_slot(dest.0) {
-+                self.emit_store_to_s0("t3", slot.0, "sd");
-+                self.emit_store_to_s0("t4", slot.0 + 8, "sd");
-+            }
-+            return;
-+        }
-+        if result_ty.is_long_double() {
-+            // F128 (long double): 16 bytes, 16-byte aligned. Store the FULL
-+            // binary128 value — a __trunctfdf2 round-trip here silently
-+            // truncated every long-double vararg to double precision
-+            // (aarch64 fixed the identical defect for va-arg-5/va-arg-6;
-+            // riscv never received the equivalent).
-+            self.state.emit("    addi t2, t2, 15");
-+            self.state.emit("    andi t2, t2, -16");
-+            // Value rides t3/t4 (t1 = &va_list must survive the round trip).
-+            self.state.emit("    ld t3, 0(t2)");
-+            self.state.emit("    ld t4, 8(t2)");
-+            self.state.emit("    addi t2, t2, 16");
-             self.state.emit("    sd t2, 0(t1)");
-+            if let Some(slot) = self.state.get_slot(dest.0) {
-+                self.emit_store_to_s0("t3", slot.0, "sd");
-+                self.emit_store_to_s0("t4", slot.0 + 8, "sd");
-+                self.state.track_f128_self(dest.0);
-+            }
-+            return;
-         }
-+        // Standard 8-byte arg
-+        self.state.emit("    ld t0, 0(t2)");
-+        self.state.emit("    addi t2, t2, 8");
-+        self.state.emit("    sd t2, 0(t1)");
-         self.store_t0_to(dest);
-     }
- 
--- 
-2.47.3
-
-
-From a715d37b3f9477d0dc3a8403a98eeac67e42e8f5 Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Fri, 28 Aug 2026 21:11:12 +0000
-Subject: [PATCH 3/6] docs: landed register - wide va_arg + alignment across
- aarch64/riscv64
-
----
- engineering/agent/BACKLOG.md | 6 +++++-
- 1 file changed, 5 insertions(+), 1 deletion(-)
-
-diff --git a/engineering/agent/BACKLOG.md b/engineering/agent/BACKLOG.md
-index b709dadb..674e8456 100644
---- a/engineering/agent/BACKLOG.md
-+++ b/engineering/agent/BACKLOG.md
-@@ -322,7 +322,11 @@ the f128 tracker; pair loads prefer it; x9 dead-address-mov full-scan
- soundness; f128_softfloat + f128_global_carrier green, 2026-08-28). · riscv f128-carrier
- end-to-end (f128_in_gp_pairs classify arm, tracker-fed U128 load/store,
- sign-bit intrinsic arms — F128Neg previously hit the silent SIMD no-op;
--f128_softfloat + f128_global_carrier green on qemu-riscv64, 2026-08-28).
-+f128_softfloat + f128_global_carrier green on qemu-riscv64, 2026-08-28). ·
-+AAPCS64/RISC-V wide va_arg: __int128 va_arg arms both backends, long double
-+varargs full precision on riscv, align-16 composites at even pairs (named +
-+variadic, both arches — old "AAPCS64 needs no even pairs" note was wrong),
-+va_arg_wide_struct green on aarch64 AND riscv64 (2026-08-28).
- 
- Rejected-with-evidence (never resubmit without new data): Agent B's
- MAX_SMALL_INLINE_BLOCKS 12 / -Os cap removal / split-call-everywhere;
--- 
-2.47.3
-
-
-From e89f1b1baa8107de6a32588729dcd395368e0f88 Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Fri, 28 Aug 2026 21:30:52 +0000
-Subject: [PATCH 4/6] aarch64, riscv64: plain char is unsigned per target ABI
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Plain `char` was compiled as SIGNED on every target — an x86-64 default
-leaked into AArch64 and RISC-V64, where the SysV ABIs specify an
-unsigned plain char. Every `char c = 200` read back -56 instead of 200,
-every narrowing `(int)(char)x` sign-extended instead of zero-extending,
-and character constants kept their sign (C11 6.4.4.4p10) — so
-declaration and constant DISAGREED, e.g. tests/regression/
-cast_chain_fold.c produced a different hash than GCC (caught by the
-ARM differential suite).
-
-The distinction is resolved at the parse boundary: the parser is the
-only layer that can still tell plain `char` (target-defined rank) from
-explicit `signed char`, and TypeSpecifier::Char now unambiguously means
-explicit `signed char` — sema CType mapping, IR lowering (I8 vs U8
-decides load/store extension), and typeof/typedef round-trips stay
-flag-free. The driver records the target default process-globally
-before parsing (one target per driver binary); -fsigned-char /
--funsigned-char override it and also flip character-constant values,
-matching GCC on both an x86 -funsigned-char and an AArch64
--fsigned-char probe.
-
-Validation: char_signedness_target.c new, passes on x86-64, AArch64 and
-RISC-V64 with and without both flags (GCC parity on all); cast_chain_fold
-now matches GCC on AArch64; lib 1273/0/6; x86 536/5 (same 5 pre-existing);
-ARM 378/30/75 (was 376/31; also fixes the char probes in the wide-vaarg
-work); RISC-V va_arg_wide_struct re-verified rc=0.
----
- src/common/types.rs                       | 17 ++++++++
- src/driver/cli.rs                         | 18 +++++++++
- src/frontend/parser/types.rs              | 17 +++++++-
- src/ir/lowering/expr.rs                   | 13 ++++--
- tests/regression/char_signedness_target.c | 49 +++++++++++++++++++++++
- 5 files changed, 109 insertions(+), 5 deletions(-)
- create mode 100644 tests/regression/char_signedness_target.c
-
-diff --git a/src/common/types.rs b/src/common/types.rs
-index 5766969a..816fbae2 100644
---- a/src/common/types.rs
-+++ b/src/common/types.rs
-@@ -1437,6 +1437,23 @@ impl std::fmt::Display for CType {
-     }
- }
- 
-+/// Whether the target's plain `char` is unsigned (AArch64 and RISC-V SysV
-+/// ABIs specify unsigned char; x86-64/i686 use signed char). One target per
-+/// driver process, so a process-global set by the driver before parsing is
-+/// the single source of truth — the front end is otherwise target-blind.
-+static CHAR_UNSIGNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-+
-+/// Record the target's plain-char signedness. Called once by the driver
-+/// after the target is known, before any parsing/sema/lowering runs.
-+pub fn set_char_unsigned(unsigned: bool) {
-+    CHAR_UNSIGNED.store(unsigned, std::sync::atomic::Ordering::Relaxed);
-+}
-+
-+/// The target's plain-char signedness (true: `char` behaves as `unsigned char`).
-+pub fn char_is_unsigned() -> bool {
-+    CHAR_UNSIGNED.load(std::sync::atomic::Ordering::Relaxed)
-+}
-+
- impl CType {
-     /// Size in bytes, with struct/union layout lookup via context.
-     /// Uses the thread-local target pointer size for target-dependent types
-diff --git a/src/driver/cli.rs b/src/driver/cli.rs
-index 5d9e3d57..3fae0f04 100644
---- a/src/driver/cli.rs
-+++ b/src/driver/cli.rs
-@@ -195,6 +195,15 @@ impl Driver {
-         } else {
-             Target::X86_64
-         };
-+        // Plain `char` signedness is target-defined (C11 6.7.2p5): unsigned
-+        // on AArch64/RISC-V SysV, signed on x86. Recorded process-globally
-+        // BEFORE any parsing/sema/lowering so every type resolution, cast,
-+        // and character constant sees the target's answer. -funsigned-char /
-+        // -fsigned-char override the default in the argument loop.
-+        crate::common::types::set_char_unsigned(matches!(
-+            self.target,
-+            Target::Aarch64 | Target::Riscv64
-+        ));
- 
-         // Handle GCC query flags that exit immediately (before requiring input files).
-         // These are used by configure scripts to detect the compiler and target.
-@@ -833,6 +842,15 @@ impl Driver {
-                 arg if arg == "-fno-exceptions" => {
-                     self.exceptions = false;
-                 }
-+                // Plain-char signedness overrides (GCC-compatible): these
-+                // re-record the process-global AFTER the target default was
-+                // installed, so they win regardless of order relative to it.
-+                arg if arg == "-funsigned-char" => {
-+                    crate::common::types::set_char_unsigned(true);
-+                }
-+                arg if arg == "-fsigned-char" => {
-+                    crate::common::types::set_char_unsigned(false);
-+                }
-                 arg if arg.starts_with("-std=") => {
-                     let std_value = &arg[5..];
-                     // GNU dialects: gnu89, gnu99, gnu11, gnu17, gnu23, etc.
-diff --git a/src/frontend/parser/types.rs b/src/frontend/parser/types.rs
-index 3ebb41c5..60cfa3e8 100644
---- a/src/frontend/parser/types.rs
-+++ b/src/frontend/parser/types.rs
-@@ -579,7 +579,7 @@ impl Parser {
-             has_short,
-             has_int: _,
-             has_unsigned,
--            has_signed: _,
-+            has_signed,
-             has_struct,
-             has_union,
-             has_enum,
-@@ -626,7 +626,20 @@ impl Parser {
-             if has_unsigned {
-                 TypeSpecifier::UnsignedChar
-             } else {
--                TypeSpecifier::Char
-+                // C11 6.7.2p5: plain char's signedness is target-defined —
-+                // unsigned on AArch64/RISC-V SysV (unsigned char default),
-+                // signed on x86. Resolving at the parse boundary makes
-+                // TypeSpecifier::Char mean ONLY explicit `signed char`
-+                // everywhere downstream (sema, IR lowering, typeof and
-+                // typedef round-trips), so no later layer needs the flag.
-+                if !has_signed && crate::common::types::char_is_unsigned() {
-+                    // plain `char` on an unsigned-char target
-+                    TypeSpecifier::UnsignedChar
-+                } else {
-+                    // `signed char` (explicit), or plain char on a
-+                    // signed-char target
-+                    TypeSpecifier::Char
-+                }
-             }
-         } else if has_short {
-             if has_unsigned {
-diff --git a/src/ir/lowering/expr.rs b/src/ir/lowering/expr.rs
-index 155ed5c4..3101bd31 100644
---- a/src/ir/lowering/expr.rs
-+++ b/src/ir/lowering/expr.rs
-@@ -244,9 +244,16 @@ impl Lowerer {
-                 Operand::Const(IrConst::I128(v as i128))
-             }
-             Expr::CharLiteral(ch, _) => {
--                // Sign-extend from signed char to int, matching GCC behavior.
--                // '\xEF' should be -17, not 239, when char is signed.
--                let val = *ch as u8 as i8 as i32;
-+                // A character constant has type int and the value the target's
-+                // plain char would hold (C11 6.4.4.4p10): sign-extended when
-+                // char is signed (x86), zero-extended when unsigned
-+                // (AArch64/RISC-V SysV). '\xEF' is -17 with signed char,
-+                // 239 with unsigned char.
-+                let val = if crate::common::types::char_is_unsigned() {
-+                    *ch as u8 as i32
-+                } else {
-+                    *ch as u8 as i8 as i32
-+                };
-                 Operand::Const(IrConst::I32(val))
-             }
- 
-diff --git a/tests/regression/char_signedness_target.c b/tests/regression/char_signedness_target.c
++# QEMU TCG plugin API header — GPLv2+ upstream, fetched on demand by
++# scripts/qemu_icount_plugin/build.sh; never vendored into this permissive tree.
++/scripts/qemu_icount_plugin/qemu-plugin.h
++/scripts/qemu_icount_plugin/*.so
+diff --git a/engineering/FOLLOWUP-2026-08-28-kernel-boot.md b/engineering/FOLLOWUP-2026-08-28-kernel-boot.md
 new file mode 100644
-index 00000000..d5029200
+index 00000000..e36c80ce
 --- /dev/null
-+++ b/tests/regression/char_signedness_target.c
-@@ -0,0 +1,49 @@
-+// Target plain-char signedness (C11 6.7.2p5, C11 6.4.4.4p10): the declared
-+// `char` rank and character-constant values must AGREE on every target —
-+// unsigned on AArch64/RISC-V SysV, signed on x86-64/i686 — and
-+// -fsigned-char/-funsigned-char must flip both consistently. The exact
-+// values are target-dependent, so the test pins the invariants that hold
-+// everywhere: (unsigned char) round-trips exactly, `signed char` always
-+// sign-extends, and plain char + a char constant never disagree.
-+int main(void) {
-+    // (unsigned char) always has 8 value bits, 0..255.
-+    unsigned char u = 200;
-+    if ((int)u != 200)
-+        return 1;
-+    if ((int)(unsigned char)0xFF != 255)
-+        return 2;
++++ b/engineering/FOLLOWUP-2026-08-28-kernel-boot.md
+@@ -0,0 +1,202 @@
++# Follow-up work document — 2026-08-28
 +
-+    // (signed char) always sign-extends.
-+    signed char s = 200; // impl-defined conversion, -56 on every 8-bit-char target
-+    if ((int)s != -56)
-+        return 3;
-+    if ((int)(signed char)0xFF != -1)
-+        return 4;
++**Task:** build and boot the user's custom kernel (`linux-cachymod-6.18`, i.e. `linux-6.18.46`
+++ the 26 `archpkgbuilds/packages/linux-cachymod-6.18` patches) with **lccc + lccc-ld**,
++using a default config. Hard gate: `arch/x86/boot` setup must satisfy `_end <= 0x8000`
++(32768 B).
 +
-+    // Plain char and character constants must take the SAME view: if
-+    // plain char is signed, both are negative; if unsigned, both are in
-+    // 128..255. A target where the declaration and the constant disagree
-+    // (e.g. char c = 200 reads back -56 while '\xEF' is 239) is broken.
-+    char c = 200;
-+    int c_val = (int)c;
-+    int lit_val = (int)(char)0xEF;
-+    if (!((c_val == 200 && lit_val == 239) || (c_val == -56 && lit_val == -17)))
-+        return 5;
++**Status at end of session**
 +
-+    // The plain-char view must equal the (signed char)/(unsigned char)
-+    // view chosen by the target's CHAR_BITS-signedness, i.e. char, signed
-+    // char and unsigned char are distinct TYPES but char matches exactly
-+    // one of them in value behavior for these inputs.
-+    if (c_val == -56 && (int)(char)0xFF != -1)
-+        return 6;
-+    if (c_val == 200 && (int)(char)0xFF != 255)
-+        return 7;
++| Requirement | Status |
++|---|---|
++| Compiles end-to-end with lccc + lccc-ld | **DONE** — 1015 TUs, 0 errors |
++| 32 KiB setup gate | **PASS** — `_end = 0x7600` (30208 B) |
++| objtool clean | **4 warnings left** (was an "empty alternative entry" flood); GCC reference = 0 |
++| Boots under QEMU | **NOT YET** — root-caused to a single precise defect (below) |
 +
-+    // Char-typed arithmetic keeps target semantics either way.
-+    char a = 100, b = 100;
-+    int sum = (int)(char)(a + b); // 8-bit wraparound then char-extend
-+    if (!((sum == -56 && c_val == -56) || (sum == 200 && c_val == 200)))
-+        return 8;
++---
 +
++## 1. Accomplished this session
++
++### 1.1 Two real assembler bugs found and fixed
++
++Both live in `src/backend/elf_writer_common.rs`, in the deferred `.skip` machinery that the
++kernel's `ALTERNATIVE()` macro depends on (a `.skip` whose size is a symbolic expression
++involving labels that are only known after the section layout is final).
++
++**Bug A — deferred `.skip` fill bytes dragged preceding same-offset labels forward.**
++`resolve_deferred_skips` spliced the fill bytes at `offset`, then advanced every label with
++`loff >= offset`. A label defined *immediately before* the `.skip` also has `loff == offset`,
++so it got pushed forward with the fill. In the kernel's
++`.byte 773b-771b` idiom (the recorded source length of an ALTERNATIVE region) this collapsed
++the difference to **0**, so objtool reported "empty alternative entry" and the boot-time
++alternative patcher would have patched **zero bytes** — the SMAP/lfence-style alternatives
++would silently never take effect. No diagnostic was emitted anywhere.
++
++*Fix:* `deferred_skips` became `Vec<DeferredSkip>`; the new struct carries
++`labels_at_offset` / `numeric_at_offset` snapshots taken (via `snapshot_labels_at`) at the
++moment the skip is deferred. Both label-adjust loops now shift a label only if it is strictly
++after the gap, **or** sits at the gap start and is **not** in the snapshot. Relocations,
++jumps, alignment markers and deferred diffs keep the original `>=` semantics.
++
++**Bug B — two deferred skips at the same offset were spliced in the wrong order.**
++The sort was written as
++`skips.sort_by(|a,b| a.sec.key().then(a.offset.cmp(&b.offset)).reverse())`.
++`.reverse()` was applied to the *comparator's `Ordering`*, not to the vector, so the sort was
++descending but **stable** — ties kept source order. Since each splice *inserts* at `offset`
++(pushing already-inserted bytes right), source order puts the second gap's fill **before**
++the first gap's fill, silently permuting the section contents.
++
++Evidence (`/tmp/asmtest/two_marks.S`, two consecutive empty-original ALTERNATIVEs with
++different fill bytes):
++
++```
++GAS  .text:  90 eb 04 | 90 90 90 | cc | c3
++LCCC .text:  90 eb 04 | cc | 90 90 90 | c3      <- gaps swapped
++```
++
++Critically, **every recorded length still looked correct** — only the byte pattern revealed
++it. *Fix:* sort ascending (stable) then `skips.reverse()`, which yields descending offsets
++with ties in reverse source order.
++
++### 1.2 Validation of the fixes
++
++* `/tmp/asmtest/two_marks.S` — LCCC `.text` now byte-identical to GAS (`90eb0490 9090ccc3`).
++* `/tmp/asmtest/two_dbg.S` — gap lengths `00 03 03 / 00 03 03`, matching GAS exactly
++  (previously `00 06 06 / 00 00 00`).
++* `/tmp/asmtest/two_blocks.S` — `.altinstructions` now `3/3` and `3/3` (previously `6/3`, `0/3`).
++* `/tmp/asmtest/diag.S`, `negskip.S`, and the full `matrix.py` differential harness: all ok.
++* **Real kernel file:** `cmp_alt.py` on `fs/readdir.o` (12 `alt_instr` entries) went
++  **12 mismatching → 0 mismatching** against the GCC-built reference object.
++* `tests/regression/kernel_altinstr_layout.c` extended with **Case 2c** (two consecutive
++  empty-original ALTERNATIVEs). Because length checks alone cannot catch Bug B, the case uses
++  **distinct fill bytes (`0x90` / `0xcc`) and verifies the byte pattern at runtime**.
++  Passes under both lccc and gcc. (Negative control — reverting the fix and re-running the
++  test — has **not** been done yet; it was deliberately skipped because rebuilding lccc
++  mid-kernel-build would have swapped the binary out from under the running build.)
++
++### 1.3 Kernel build results (lccc, after both fixes)
++
++```
++1015 translation units, 0 errors, ~22 min (-j2)
++vmlinux            20017016 B   (gcc reference: 15483712 B -> lccc is +29 %)
++bzImage             4318208 B   (gcc reference: 3593216 B)
++setup.bin             25248 B   (gcc reference:   14748 B)
++setup _end       0x7600 = 30208 B <= 32768  -> GATE PASS
++objtool warnings          4     (gcc reference: 0)
++```
++
++Remaining objtool warnings (all present only in the lccc build; addresses stripped):
++
++```
++arch/x86/kernel/signal_64.o: x64_setup_rt_frame+: return with UACCESS enabled
++init/main.o:                 start_kernel+:       rest_init() missing __noreturn
++kernel/exit.o:               __do_sys_waitid+:    return with UACCESS enabled
++kernel/sched/fair.o:         dequeue_entities+:   unreachable instruction
++```
++
++### 1.4 Boot-failure bisect (the main result)
++
++QEMU (`-m 512 -smp 2 -accel tcg,thread=multi`, serial log) produced zero bytes for the lccc
++image while the GCC reference produced 157 lines including the validation markers. Bisecting
++by swapping image halves:
++
++| Image | Result |
++|---|---|
++| gcc setup + gcc payload | **BOOTS** (157 lines) |
++| **lccc setup + gcc payload (hybrid A)** | **BOOTS** (157 lines) |
++| **gcc setup + lccc payload (hybrid B)** | **HANGS** (0 lines) |
++| lccc setup + lccc payload | HANGS (0 lines) |
++
++=> **lccc's real-mode setup code (`arch/x86/boot`, 16-bit) is correct.** The fault is in
++`vmlinux.bin`, i.e. `arch/x86/boot/compressed/*` and/or the decompressed kernel.
++
++Live register dump (QMP `human-monitor-command 'info registers'`, 25 s into the boot):
++
++```
++RIP=0x221bdf3  HLT=1  CR0=0x80050033 (paging on)  CR3=0x225a000
++code at RIP:  eb fd    jmp 0x221bdf2        ; preceded by f4 (hlt)
++```
++
++`f4 eb fd` is the `while (1) asm("hlt")` infinite halt GCC-style compilers emit for the
++kernel's `error()`/dead-end paths. Searching vmlinux for that 3-byte signature and scoring
++candidates by how many sampled stack words fall inside the image localised it to:
++
++```
++HALT LOOP IS IN: fpu__init_system+0x11e
++stack: fpu__init_system+0xfb, detect_art+0x1a1, early_cpu_init+0x162,
++       tsc_early_init+0x161, alternative_instructions+0x11
++```
++
++Disassembling `fpu__init_system` in both vmlinux images shows **identical control flow**:
++
++```
++GCC :  mov __pi_boot_cpu_data+0x30,%rax ; test $0x1,%al ; jne <continue>
++       ... else: _printk("..."); hlt ; jmp -3
++LCCC:  mov __pi_boot_cpu_data+0x30,%rax ; and $1 ; cmp $0 ; setne ; test ; je <panic>
++       ... panic path: _printk("..."); hlt ; jmp -3
++```
++
++Both halt iff `boot_cpu_data.x86_capability[0]` bit 0 (`X86_FEATURE_FPU`) is clear.
++`__pi_boot_cpu_data` and `boot_cpu_data` are correctly aliased at the same address with the
++same size (`0x150`) in **both** builds, and the static initializer is **all zeros in both**
++builds — so the bit is set at *runtime* by the CPUID path.
++
++**Conclusion:** the lccc-built kernel never sets `boot_cpu_data.x86_capability[0]` bit 0
++before `fpu__init_system()` tests it. The defect is therefore in the **CPU feature
++detection path** — `early_cpu_init()` / `identify_cpu()` / `get_cpu_cap()` and the `CPUID`
++inline-asm / capability-bit-setting helpers in `arch/x86/kernel/cpu/common.c`,
++`arch/x86/lib/cpu.c` (or their callees) — not in the alternative machinery and not in the
++real-mode setup.
++
++---
++
++## 2. To-do (ordered by expected impact)
++
++1. **Fix the CPU-feature-detection miscompile (blocker for booting).**
++   Narrow it further with a targeted A/B: compile *only* `arch/x86/kernel/cpu/common.c`,
++   `arch/x86/kernel/cpu/intel.c`, `arch/x86/lib/cpu.c` etc. with gcc into the otherwise
++   lccc-built vmlinux, bisecting which TU restores the FPU bit. Then reduce that TU.
++   Prime suspects: `cpuid`/`cpuid_count` inline asm constraints, `set_cpu_cap()` bit
++   manipulation, `memcpy` of `struct cpuinfo_x86`, and any `__builtin_cpu_supports`-style
++   construct. The `f4 eb fd`-signature + QMP register-dump technique in §1.4 is reusable and
++   cheap (~30 s per experiment).
++2. **Negative control for Bug B.** Temporarily revert the `skips.reverse()` change, rebuild
++   lccc, and confirm the new Case 2c in `tests/regression/kernel_altinstr_layout.c` actually
++   FAILS. This must be done **when no kernel build is running** (rebuilding swaps the binary
++   out from under an in-flight build).
++3. **Zero out the 4 remaining objtool warnings.** "return with UACCESS enabled" is
++   potentially a real correctness issue (stac/clac pairing), not just noise.
++4. **Code-size gap.** lccc `vmlinux` is +29 % vs gcc. Once it boots, profile the biggest
++   deltas — with the icount harness now proven, size is a good proxy for the perf work.
++5. **Then** the in-QEMU A/B performance work (`scripts/in_vm_codegen_bench.sh`,
++   `scripts/qemu_icount_plugin/`) that the boot gate has been blocking.
++
++## 3. Gaps, risks and technical debt
++
++* The deferred-`.skip` subsystem still has **no negative-control coverage for Bug A** either
++  (Case 2b passes, but has not been shown to fail on the pre-fix compiler).
++* No unit tests exercise the `DeferredSkip` snapshot logic directly; all coverage is
++  end-to-end assembly-level.
++* `resolve_deferred_skips` is called, then `relax_jumps()` runs again afterwards. The
++  interaction between the two passes is only covered indirectly; the reasoning in the
++  session notes about it did not match observed behaviour, so it deserves a careful re-read
++  with instrumentation rather than more inference.
++* The kernel can only be built **in-tree** in this tree (`O=` is rejected: "source tree is
++  not clean", and `make clean` does not satisfy it), so gcc-reference and lccc builds must
++  run **sequentially** with a `make clean` between them, copying outputs out first.
++* Disk is tight: 25 G root, ~6 G free. The 1.7 G kernel tree plus two 15–20 MB vmlinux
++  copies per configuration is near the practical limit.
++
++## 4. Artifacts
++
++* `/home/user/artifacts/kernels/lccc-fixed-boot-bisect/` — `vmlinux.lccc`, `bzImage.lccc`,
++  `setup.bin.lccc`, `hybA.bin`, `hybB.bin`, `build.log`.
++* `/home/user/artifacts/kernels/` — GCC reference: `bzImage.gcc`, `vmlinux.gcc`,
++  `setup.bin.gcc`.
++* `/home/user/artifacts/repro/` — the assembly reducers (`two_marks.S`, `two_dbg.S`,
++  `two_blocks.S`, `two_distinct.S`, `diag.S`, `negskip.S`) plus `matrix.py` and `cmp_alt.py`.
++* Build logs: `/home/user/kernel-build-lccc3.log`, `/home/user/gcc-kbuild.log`,
++  `/home/user/build-lccc5.log`.
++* Boot logs: `/tmp/boot-gcc.log` (working GCC boot, 157 lines), `/tmp/bisect/o.*.log`.
++* Auto-saved patch: `/home/user/ms178-1.patch` (snapshot S05).
+diff --git a/scripts/build_lccc_fast.sh b/scripts/build_lccc_fast.sh
+index 23fce794..5d099d28 100755
+--- a/scripts/build_lccc_fast.sh
++++ b/scripts/build_lccc_fast.sh
+@@ -33,30 +33,36 @@ export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
+ # (gcc >= 12 resolves -fuse-ld=mold to ld.mold on PATH) so the fast-linker
+ # preference survives with only mold installed (e.g. conda-forge mold next
+ # to a system gcc).
+-# CARGO_TARGET_*_LINKER alone is not enough: the committed rustflags still
+-# pass `-fuse-ld=mold`, so we override both via `cargo --config`.
++# `--config` overrides the *linker*, but it cannot CANCEL the committed
++# `target.<triple>.rustflags` entry that passes `-fuse-ld=mold`: cargo keeps
++# the config-file value for a key it also finds on the command line, so
++# `--config 'target...rustflags=[]'` leaves `-fuse-ld=mold` in every link and
++# the build dies with "collect2: fatal error: cannot find 'ld'" on hosts
++# without mold.  The RUSTFLAGS environment variable is the only override that
++# outranks every config file, so the linker mode is expressed through it.
+ cargo_config=()
++rustflags=""
+ if command -v clang >/dev/null 2>&1 && command -v mold >/dev/null 2>&1; then
+-    : # keep .cargo/config.toml (clang -fuse-ld=mold)
++    : # keep .cargo/config.toml (clang driver, -fuse-ld=mold)
++    # Reproduce the committed flags explicitly: RUSTFLAGS is authoritative in
++    # every mode, so it must not silently drop the mold preference.
++    rustflags="-C link-arg=-fuse-ld=mold"
+ elif command -v ld.mold >/dev/null 2>&1; then
+     # mold without clang: gcc driver + mold backend. `-fuse-ld=mold` requires
+     # an `ld.mold` on PATH (the conda-forge/make-install symlink layout);
+     # `command -v ld.mold` guarantees that exact resolution.
+-    cargo_config=(
++    cargo_config+=(
+         --config 'target.x86_64-unknown-linux-gnu.linker="gcc"'
+-        --config 'target.x86_64-unknown-linux-gnu.rustflags=["-C","link-arg=-fuse-ld=mold"]'
+         --config 'target.i686-unknown-linux-gnu.linker="gcc"'
+-        --config 'target.i686-unknown-linux-gnu.rustflags=["-C","link-arg=-fuse-ld=mold","-C","link-arg=-m32"]'
+     )
++    rustflags="-C link-arg=-fuse-ld=mold"
+     printf '%s\n' "note: clang not found; linking with gcc driver + mold backend"
+ else
+-    cargo_config=(
++    cargo_config+=(
+         --config 'target.x86_64-unknown-linux-gnu.linker="gcc"'
+-        --config 'target.x86_64-unknown-linux-gnu.rustflags=[]'
+         --config 'target.i686-unknown-linux-gnu.linker="gcc"'
+-        --config 'target.i686-unknown-linux-gnu.rustflags=["-C","link-arg=-m32"]'
+     )
+-    printf '%s\n' "note: clang/mold not found; linking with gcc + GNU ld"
++    printf '%s\n' "note: clang/mold not found; linking with gcc + GNU ld (bfd)"
+ fi
+ 
+ printf '%s\n' "Building LCCC (fastbuild profile: -O1, no LTO, incremental)"
+@@ -70,8 +76,13 @@ printf '%s\n' "Building LCCC (fastbuild profile: -O1, no LTO, incremental)"
+ #
+ # Set LCCC_ALLOW_WARNINGS=1 for a scratch build mid-refactor.
+ if [ "${LCCC_ALLOW_WARNINGS:-0}" != "1" ]; then
+-    export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
++    rustflags="${rustflags:+$rustflags }-D warnings"
+ fi
++# Export unconditionally: RUSTFLAGS outranks every config file, so it is the
++# single authoritative source of rustc flags in all three link modes. (Only the
++# host target is built here; the i686 `-m32` link arg in .cargo/config.toml
++# applies to `--target i686-unknown-linux-gnu`, which this script never uses.)
++export RUSTFLAGS="$rustflags"
+ 
+ exec cargo build --profile fastbuild --locked -j "${CARGO_BUILD_JOBS}" \
+     "${cargo_config[@]}"
+diff --git a/scripts/in_vm_codegen_bench.sh b/scripts/in_vm_codegen_bench.sh
+new file mode 100755
+index 00000000..dd6301f8
+--- /dev/null
++++ b/scripts/in_vm_codegen_bench.sh
+@@ -0,0 +1,230 @@
++#!/usr/bin/env bash
++# ============================================================================
++# in_vm_codegen_bench.sh — deterministic, variance-free generated-code
++# comparison of two kernels (or two builds of one kernel) under QEMU TCG.
++#
++# WHY INSTRUCTION COUNTS AND NOT SECONDS
++# --------------------------------------
++# The research host has no hardware PMU, and wall-clock time under TCG is
++# dominated by host jitter, so neither cycles nor seconds are a usable
++# code-quality signal. Under TCG *with -icount* the guest clock is virtual:
++# identical inputs retire an identical instruction stream, run after run.
++# Three runs of a fixed image with -icount all reported exactly 8,900,714
++# instructions; the same image without -icount varied by ~0.1 %. Instruction
++# count is therefore the metric: exact, reproducible, and directly
++# proportional to generated-code quality for a fixed workload.
++#
++# WHAT IT MEASURES
++# ----------------
++#   * whole-boot instruction count (everything from reset to the guest's
++#     poweroff), optionally
++#   * per-function counts, using [start,end) ranges taken from `nm -S` of the
++#     corresponding vmlinux, so a hot kernel function can be compared directly
++#     between two compilers.
++#
++# The guest workload is a single static binary built ONCE with the host gcc and
++# reused for every kernel, so the userspace contribution is a constant and any
++# instruction delta is attributable to the kernel build under test.
++#
++# The script refuses to report a comparison if any run disagrees with its
++# siblings: a non-deterministic measurement is not evidence.
++#
++# Usage:
++#   in_vm_codegen_bench.sh --a <bzImage> [--a-vmlinux <vmlinux>] \
++#                          --b <bzImage> [--b-vmlinux <vmlinux>] \
++#                          [--reps N] [--functions fn1,fn2,...] \
++#                          [--out <dir>]
++#
++# Requires: qemu-system-x86_64 (plugins enabled), a static busybox, gcc,
++#           cpio, gzip, nm; scripts/qemu_icount_plugin/build.sh for the plugin.
++# ============================================================================
++set -euo pipefail
++
++here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
++plugin_dir="$here/qemu_icount_plugin"
++plugin="$plugin_dir/lccc_icount.so"
++
++A=""; B=""; A_VMLINUX=""; B_VMLINUX=""
++REPS=${REPS:-3}
++FUNCS=""
++OUT=${OUT:-/tmp/in-vm-bench}
++QEMU=${QEMU:-qemu-system-x86_64}
++BUSYBOX=${BUSYBOX:-/bin/busybox}
++GUEST_CC=${GUEST_CC:-gcc}
++
++die() { printf 'error: %s\n' "$*" >&2; exit 1; }
++
++while [[ $# -gt 0 ]]; do
++    case $1 in
++        --a) A=$2; shift 2;;
++        --b) B=$2; shift 2;;
++        --a-vmlinux) A_VMLINUX=$2; shift 2;;
++        --b-vmlinux) B_VMLINUX=$2; shift 2;;
++        --reps) REPS=$2; shift 2;;
++        --functions) FUNCS=$2; shift 2;;
++        --out) OUT=$2; shift 2;;
++        -h|--help) sed -n '2,40p' "$0"; exit 0;;
++        *) die "unknown argument: $1";;
++    esac
++done
++
++[[ -n $A && -n $B ]] || die "--a and --b are required"
++[[ -f $A ]] || die "bzImage A not found: $A"
++[[ -f $B ]] || die "bzImage B not found: $B"
++command -v "$QEMU" >/dev/null 2>&1 || die "qemu missing: $QEMU"
++[[ -x $BUSYBOX ]] || die "static busybox missing: $BUSYBOX"
++file "$BUSYBOX" 2>/dev/null | grep -q static || echo "warning: $BUSYBOX is not static" >&2
++
++mkdir -p "$OUT"
++
++# ---- 1. plugin ---------------------------------------------------------------
++if [[ ! -f $plugin ]]; then
++    "$plugin_dir/build.sh" "$plugin_dir" >/dev/null
++fi
++[[ -f $plugin ]] || die "TCG plugin not built: $plugin"
++
++# ---- 2. guest workload: one static binary shared by every kernel -------------
++# Kernel-code-heavy and reproducible: syscall traffic, memory traffic and
++# integer work, all bounded so the runtime stays short under TCG.
++cat > "$OUT/workload.c" <<'EOF'
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <time.h>
++
++/* Fixed-seed PRNG so the workload is bit-identical on every run. */
++static unsigned long s = 0x12345678UL;
++static unsigned long rnd(void){ s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; }
++
++#define N  (1u << 16)
++static unsigned char buf[N], tmp[N];
++
++static unsigned long crc32_tab(void){
++    unsigned long c = 0;
++    for (unsigned long i = 0; i < 256; i++){
++        unsigned long v = i;
++        for (int k = 0; k < 8; k++) v = (v & 1) ? 0xEDB88320UL ^ (v >> 1) : (v >> 1);
++        c += v;
++    }
++    return c;
++}
++static unsigned long crc32(const unsigned char *p, size_t n){
++    static unsigned long tab[256]; static int init = 0;
++    if (!init){ for (unsigned long i=0;i<256;i++){ unsigned long v=i;
++        for(int k=0;k<8;k++) v=(v&1)?0xEDB88320UL^(v>>1):(v>>1); tab[i]=v;} init=1; }
++    unsigned long c = 0xFFFFFFFFUL;
++    for (size_t i = 0; i < n; i++) c = tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
++    return c ^ 0xFFFFFFFFUL;
++}
++
++int main(void){
++    unsigned long acc = crc32_tab();
++    for (int r = 0; r < 8; r++){
++        for (size_t i = 0; i < N; i++) buf[i] = (unsigned char)(rnd() >> 13);
++        acc ^= crc32(buf, N);
++        memcpy(tmp, buf, N);            /* exercises the kernel's copy paths   */
++        acc ^= crc32(tmp, N) + memcmp(tmp, buf, N);
++    }
++    /* syscall traffic: page faults, brk, file I/O */
++    for (int r = 0; r < 32; r++){
++        int fd = open("/proc/self/stat", O_RDONLY);
++        if (fd >= 0){ char b[512]; ssize_t n = read(fd, b, sizeof b); if (n > 0) acc ^= crc32((unsigned char*)b, (size_t)n); close(fd); }
++        void *p = malloc(1u << 16); memset(p, (int)(r & 0xFF), 1u << 16);
++        acc ^= crc32((unsigned char*)p, 1u << 16); free(p);
++    }
++    printf("WORKLOAD_CHECKSUM %lu\n", acc);
 +    return 0;
 +}
--- 
-2.47.3
-
-
-From b1f292f19c915031abdd1af33c6d27d4a2f3786f Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Fri, 28 Aug 2026 21:31:50 +0000
-Subject: [PATCH 5/6] docs: state refresh - S08 wide va_arg + target char
- signedness
-
----
- engineering/STATE.md | 26 ++++++++++++++++++++++++--
- 1 file changed, 24 insertions(+), 2 deletions(-)
-
-diff --git a/engineering/STATE.md b/engineering/STATE.md
-index 568bb98f..bc6126c5 100644
---- a/engineering/STATE.md
-+++ b/engineering/STATE.md
-@@ -1,7 +1,6 @@
- # Current compiler state
++EOF
++if [[ ! -x "$OUT/workload" ]] || [[ "$OUT/workload.c" -nt "$OUT/workload" ]]; then
++    "$GUEST_CC" -O2 -static -o "$OUT/workload" "$OUT/workload.c"
++fi
++
++# ---- 3. initramfs ------------------------------------------------------------
++rm -rf "$OUT/root"; mkdir -p "$OUT/root/bin" "$OUT/root/proc" "$OUT/root/sys" "$OUT/root/dev"
++cat > "$OUT/root/init" <<'EOF'
++#!/bin/busybox sh
++mount -t proc proc /proc
++mount -t sysfs sys /sys
++mount -t devtmpfs devtmpfs /dev
++echo "==== IN-VM BENCH BEGIN ===="
++/bin/workload
++echo "==== IN-VM BENCH END ===="
++poweroff -f
++EOF
++chmod +x "$OUT/root/init"
++cp "$BUSYBOX"  "$OUT/root/bin/busybox"
++cp "$OUT/workload" "$OUT/root/bin/workload"
++ln -sf busybox "$OUT/root/bin/sh"
++( cd "$OUT/root" && find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -1 > "$OUT/initramfs.cpio.gz" )
++
++# ---- 4. optional per-function ranges ----------------------------------------
++range_args() { # range_args <vmlinux>
++    local vmlinux=$1 out_args="" fn
++    [[ -n $FUNCS && -n $vmlinux && -f $vmlinux ]] || { printf ''; return 0; }
++    IFS=',' read -ra fns <<< "$FUNCS"
++    for fn in "${fns[@]}"; do
++        local line
++        line=$(nm -S --defined-only "$vmlinux" 2>/dev/null | awk -v f="$fn" '$4==f {print $1" "$2; exit}')
++        if [[ -z $line ]]; then echo "warning: symbol not found in $vmlinux: $fn" >&2; continue; fi
++        local start size end
++        start=$(awk '{print $1}' <<<"$line")
++        size=$(awk '{print $2}' <<<"$line")
++        end=$(printf '0x%x\n' $(( 0x$start + 0x$size )))
++        out_args+=",$fn=0x$start:$end"
++    done
++    printf '%s' "$out_args"
++}
++
++# ---- 5. run one kernel REPS times and assert determinism --------------------
++measure() { # measure <label> <bzImage> <vmlinux>
++    local label=$1 bz=$2 vmlinux=$3
++    local ranges i counts=() json
++    ranges=$(range_args "$vmlinux")
++    for ((i = 1; i <= REPS; i++)); do
++        timeout 1800 "$QEMU" -m 512 -smp 1 \
++            -kernel "$bz" -initrd "$OUT/initramfs.cpio.gz" \
++            -nographic -no-reboot -display none \
++            -accel tcg,thread=single \
++            -icount shift=0,align=off,sleep=off \
++            -plugin "$plugin${ranges}",out="$OUT/$label.$i.json" \
++            -append "console=ttyS0,115200 nokaslr panic=-1" \
++            </dev/null > "$OUT/$label.$i.log" 2>&1 || true
++        json="$OUT/$label.$i.json"
++        [[ -f $json ]] || { echo "  run $i: NO RESULT"; return 1; }
++        counts+=( "$(awk -F'[:,]' '/total_insns/{gsub(/[ "]/,"",$2); print $2}' "$json")" )
++    done
++    # Determinism is mandatory: a varying count is not a measurement.
++    local c first=${counts[0]}
++    for c in "${counts[@]}"; do
++        if [[ $c != "$first" ]]; then
++            printf '  %s: NON-DETERMINISTIC across %d reps: %s\n' "$label" "$REPS" "${counts[*]}" >&2
++            return 2
++        fi
++    done
++    printf '%s' "$first"
++}
++
++echo "in-vm codegen benchmark (deterministic instruction counts, reps=$REPS)"
++printf '  A: %s\n' "$A"
++printf '  B: %s\n' "$B"
++
++A_INSNS=$(measure A "$A" "$A_VMLINUX") || die "measurement A failed"
++B_INSNS=$(measure B "$B" "$B_VMLINUX") || die "measurement B failed"
++
++echo
++printf '  A instructions: %s\n' "$A_INSNS"
++printf '  B instructions: %s\n' "$B_INSNS"
++python3 - "$A_INSNS" "$B_INSNS" <<'PY'
++import sys
++a, b = int(sys.argv[1]), int(sys.argv[2])
++d = b - a
++pct = 100.0 * d / b if b else 0.0
++print(f"  delta (A-B): {d:+d}  ({pct:+.3f} % vs B)")
++print(f"  A/B ratio  : {a/b:.6f}" if b else "  A/B ratio  : n/a")
++PY
++echo
++echo "artifacts: $OUT"
+diff --git a/scripts/qemu_icount_plugin/build.sh b/scripts/qemu_icount_plugin/build.sh
+new file mode 100755
+index 00000000..01a82960
+--- /dev/null
++++ b/scripts/qemu_icount_plugin/build.sh
+@@ -0,0 +1,62 @@
++#!/usr/bin/env bash
++# ============================================================================
++# build.sh — compile lccc_icount.so, the deterministic TCG instruction counter.
++#
++# The research host exposes no hardware PMU (virtualised x86-64, no perf-event
++# passthrough), and wall-clock timing under TCG is dominated by host jitter, so
++# neither cycles nor seconds are usable code-quality signals here.
++#
++# TCG with `-icount` makes guest execution deterministic: identical inputs
++# retire an identical instruction stream, run after run (verified: three runs
++# of a fixed boot image all reported exactly 8,900,714 instructions, whereas
++# the same image without `-icount` varied by ~0.1 %).  Counting those
++# instructions therefore yields an exact, zero-variance metric that is directly
++# proportional to generated-code quality for a fixed workload.
++#
++# The plugin is loaded with:
++#     qemu-system-x86_64 -plugin ./lccc_icount.so,out=counts.json[,NAME=0xS:0xE]
++# and must be paired with -icount to be deterministic.
++#
++# Note: QEMU *user*-mode (qemu-x86_64) in the reference distro build has no
++# plugin support ("unknown option 'plugin'"); this is system-mode only.
++#
++# Requirements: gcc, glib-2.0 headers (libglib2.0-dev), curl.
++# Usage: build.sh [output-dir]
++# ============================================================================
++set -euo pipefail
++
++here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
++out=${1:-$here}
++qemu_ver=${QEMU_VERSION:-v10.0.11}
++header="$here/qemu-plugin.h"
++
++mkdir -p "$out"
++
++# The QEMU plugin API header is versioned against the QEMU binary: a mismatch
++# makes QEMU reject the .so at load time. Fetch the header matching the
++# installed QEMU by default and allow an explicit override.
++#
++# It is deliberately NOT vendored: qemu-plugin.h is GPLv2+ while this tree is
++# CC0 / MIT-OR-Apache-2.0-OR-BSD-2-Clause, and the header is only needed at
++# build time. .gitignore keeps a fetched copy out of `git add -A`.
++if [[ ! -f "$header" ]]; then
++    if command -v qemu-system-x86_64 >/dev/null 2>&1; then
++        installed=$(qemu-system-x86_64 --version | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
++        [[ -n $installed ]] && qemu_ver="v$installed"
++    fi
++    printf 'fetching qemu-plugin.h for %s\n' "$qemu_ver"
++    curl -sSfL -o "$header" \
++        "https://raw.githubusercontent.com/qemu/qemu/${qemu_ver}/include/qemu/qemu-plugin.h" \
++        || { printf 'error: cannot fetch qemu-plugin.h (set QEMU_VERSION or place it next to this script)\n' >&2; exit 1; }
++fi
++
++if ! pkg-config --exists glib-2.0; then
++    printf 'error: glib-2.0 development headers are required (apt: libglib2.0-dev)\n' >&2
++    exit 1
++fi
++
++gcc -shared -fPIC -O2 -Wall -Wextra \
++    -I"$here" $(pkg-config --cflags glib-2.0) \
++    -o "$out/lccc_icount.so" "$here/lccc_icount.c"
++
++printf 'built: %s\n' "$out/lccc_icount.so"
+diff --git a/scripts/qemu_icount_plugin/lccc_icount.c b/scripts/qemu_icount_plugin/lccc_icount.c
+new file mode 100644
+index 00000000..8452e75c
+--- /dev/null
++++ b/scripts/qemu_icount_plugin/lccc_icount.c
+@@ -0,0 +1,208 @@
++/*
++ * lccc_icount.c — deterministic guest instruction counter (QEMU TCG plugin).
++ *
++ * WHY THIS EXISTS
++ * ---------------
++ * The research box has no hardware PMU (virtualised, no perf event
++ * passthrough, and wall-clock measurements under TCG are dominated by host
++ * jitter).  Runtime is therefore useless as a code-quality signal here.
++ *
++ * Under TCG with `-icount`, guest execution is *deterministic*: the same
++ * binary executing the same workload retires exactly the same instruction
++ * sequence, every run.  Counting those instructions gives an exact,
++ * zero-variance metric that is directly proportional to code quality for a
++ * fixed workload — which is precisely what is needed to compare a kernel (or
++ * a benchmark) built by LCCC against the same source built by GCC/Clang.
++ *
++ * WHAT IT MEASURES
++ * ----------------
++ *   * total guest instructions retired (whole VM)
++ *   * instructions per optionally-named virtual address range, e.g. one
++ *     function or one object file's text, passed as name=START:END in hex
++ *
++ * Cost model note: a per-instruction callback is far too slow.  The plugin
++ * registers ONE execution callback on the LAST instruction of each translated
++ * block and credits the block's whole instruction count when it executes —
++ * the standard TCG-plugin accounting trick.  A block is attributed to the
++ * range containing its first instruction; blocks spanning a boundary are
++ * attributed by entry address (documented, and exact for range boundaries
++ * placed on function symbols, which is the intended usage).
++ *
++ * USAGE
++ * -----
++ *   qemu-system-x86_64 -plugin ./lccc_icount.so,out=/tmp/counts.json \
++ *       -plugin-arg ...            # (args are passed after the comma)
++ *
++ * Build:
++ *   gcc -shared -fPIC -O2 -o lccc_icount.so lccc_icount.c \
++ *       -I<dir containing qemu-plugin.h>
++ *
++ * This file is MIT-licensed; qemu-plugin.h itself is GPLv2+ (QEMU).
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++#include <inttypes.h>
++
++#include "qemu-plugin.h"
++
++QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
++
++#define MAX_RANGES 32
++
++typedef struct {
++    char     name[64];
++    uint64_t start;
++    uint64_t end;
++} range_t;
++
++static range_t   ranges[MAX_RANGES];
++static int       nranges;
++
++static uint64_t  g_total_insns;
++static uint64_t  g_total_tbs;
++static uint64_t  g_range_insns[MAX_RANGES];
++static const char *g_out_path;
++
++/* Accounting payload for one translated block. */
++typedef struct {
++    uint32_t n_insns;
++    int32_t  range_idx;   /* -1 = outside every named range */
++} tb_info_t;
++
++static void
++tb_exec(unsigned int vcpu_index, void *userdata)
++{
++    tb_info_t *ti = (tb_info_t *)userdata;
++    (void)vcpu_index;
++
++    __atomic_add_fetch(&g_total_insns, ti->n_insns, __ATOMIC_RELAXED);
++    __atomic_add_fetch(&g_total_tbs, 1, __ATOMIC_RELAXED);
++    if (ti->range_idx >= 0) {
++        __atomic_add_fetch(&g_range_insns[ti->range_idx], ti->n_insns,
++                           __ATOMIC_RELAXED);
++    }
++}
++
++static void
++tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
++{
++    size_t n;
++    uint64_t vaddr;
++    tb_info_t *ti;
++    int i;
++
++    (void)id;
++    n = qemu_plugin_tb_n_insns(tb);
++    if (n == 0) {
++        return;
++    }
++
++    vaddr = qemu_plugin_insn_vaddr(qemu_plugin_tb_get_insn(tb, 0));
++
++    ti = (tb_info_t *)malloc(sizeof(*ti));
++    if (!ti) {
++        return;
++    }
++    ti->n_insns = (uint32_t)n;
++    ti->range_idx = -1;
++    for (i = 0; i < nranges; i++) {
++        if (vaddr >= ranges[i].start && vaddr < ranges[i].end) {
++            ti->range_idx = i;
++            break;
++        }
++    }
++
++    qemu_plugin_register_vcpu_insn_exec_cb(
++        qemu_plugin_tb_get_insn(tb, n - 1),
++        tb_exec, QEMU_PLUGIN_CB_NO_REGS, ti);
++}
++
++static void
++report(qemu_plugin_id_t id, void *userdata)
++{
++    FILE *f;
++    int i;
++    char line[256];
++
++    (void)id;
++    (void)userdata;
++
++    f = g_out_path ? fopen(g_out_path, "w") : NULL;
++    if (!f) {
++        f = stdout;
++    }
++
++    fprintf(f, "{\n");
++    fprintf(f, "  \"total_insns\": %" PRIu64 ",\n", g_total_insns);
++    fprintf(f, "  \"total_blocks\": %" PRIu64 ",\n", g_total_tbs);
++    fprintf(f, "  \"ranges\": {\n");
++    for (i = 0; i < nranges; i++) {
++        fprintf(f, "    \"%s\": {\"start\": \"0x%" PRIx64 "\", "
++                   "\"end\": \"0x%" PRIx64 "\", \"insns\": %" PRIu64 "}%s\n",
++                ranges[i].name, ranges[i].start, ranges[i].end,
++                g_range_insns[i], (i + 1 < nranges) ? "," : "");
++    }
++    fprintf(f, "  }\n");
++    fprintf(f, "}\n");
++
++    /* Human-readable mirror on the console/monitor. */
++    snprintf(line, sizeof(line),
++             "LCCC_ICOUNT total_insns=%" PRIu64 " blocks=%" PRIu64 "\n",
++             g_total_insns, g_total_tbs);
++    qemu_plugin_outs(line);
++    for (i = 0; i < nranges; i++) {
++        /* %.63s bounds the copy to the 64-byte name field, so the 256-byte
++         * buffer can never be overrun regardless of the range count. */
++        snprintf(line, sizeof(line),
++                 "LCCC_ICOUNT range %.63s [0x%" PRIx64 ",0x%" PRIx64 ") = %"
++                 PRIu64 "\n",
++                 ranges[i].name, ranges[i].start, ranges[i].end,
++                 g_range_insns[i]);
++        qemu_plugin_outs(line);
++    }
++
++    if (f != stdout) {
++        fclose(f);
++    }
++}
++
++QEMU_PLUGIN_EXPORT int
++qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
++                    int argc, char **argv)
++{
++    int i;
++
++    (void)info;
++
++    for (i = 0; i < argc; i++) {
++        if (strncmp(argv[i], "out=", 4) == 0) {
++            g_out_path = argv[i] + 4;
++        } else if (strchr(argv[i], '=') && strchr(argv[i], ':')) {
++            /* name=0xSTART:0xEND */
++            const char *eq = strchr(argv[i], '=');
++            const char *colon = strchr(eq + 1, ':');
++            if (nranges < MAX_RANGES && eq && colon) {
++                range_t *r = &ranges[nranges++];
++                size_t nlen = (size_t)(eq - argv[i]);
++                if (nlen >= sizeof(r->name)) {
++                    nlen = sizeof(r->name) - 1;
++                }
++                memcpy(r->name, argv[i], nlen);
++                r->name[nlen] = '\0';
++                r->start = strtoull(eq + 1, NULL, 0);
++                r->end   = strtoull(colon + 1, NULL, 0);
++            }
++        }
++    }
++
++    g_total_insns = 0;
++    g_total_tbs = 0;
++    memset(g_range_insns, 0, sizeof(g_range_insns));
++
++    qemu_plugin_register_vcpu_tb_trans_cb(id, tb_trans);
++    qemu_plugin_register_atexit_cb(id, report, NULL);
++    return 0;
++}
+diff --git a/src/backend/arm/codegen/memory.rs b/src/backend/arm/codegen/memory.rs
+index e57861c5..bff75b7f 100644
+--- a/src/backend/arm/codegen/memory.rs
++++ b/src/backend/arm/codegen/memory.rs
+@@ -277,7 +277,10 @@ impl ArmCodegen {
+                 // intrinsic/argument staging into the lossy f64-extend
+                 // fallback (observed: -1.5F128 negated to -0.0 on RISC-V).
+                 Operand::Const(c) => matches!(c, IrConst::LongDouble(_, _) | IrConst::I128(_)),
+-                _ => false,
++                // Exhaustive on purpose: `Operand` is exactly {Value, Const}.
++                // A future variant must force an explicit decision here rather
++                // than silently degrading to "not a full-precision source",
++                // which is how the lossy f64-extend fallback regressed.
+             };
+             if tracked_val && slot_anchored {
+                 self.state.track_f128_self(ptr.0);
+diff --git a/src/backend/elf_writer_common.rs b/src/backend/elf_writer_common.rs
+index 7344791d..c18d550c 100644
+--- a/src/backend/elf_writer_common.rs
++++ b/src/backend/elf_writer_common.rs
+@@ -552,6 +552,38 @@ fn tokenize_expr(expr: &str) -> Result<Vec<ExprToken>, String> {
+ /// Contains all the common logic for building ELF relocatable objects
+ /// from parsed assembly items. Architecture-specific behavior is
+ /// provided through the `X86Arch` trait parameter.
++/// A `.skip` whose size is not a compile-time constant at emission time
++/// (it references labels that are not yet resolved), so its fill bytes are
++/// spliced in later by `resolve_deferred_skips`.
++#[derive(Clone, Debug)]
++pub struct DeferredSkip {
++    /// Section the `.skip` was emitted into.
++    pub sec_idx: usize,
++    /// Section offset the gap starts at (== section length at emission time).
++    pub offset: usize,
++    /// Unresolved size expression.
++    pub expr: String,
++    /// Fill byte (the `.skip size, fill` second operand; 0 when omitted).
++    pub fill: u8,
++    /// Labels already sitting at exactly `offset` when the `.skip` was seen.
++    ///
++    /// A label defined immediately BEFORE the skip and one defined
++    /// immediately AFTER it both record the very same offset, because the
++    /// gap has no length yet. The two must be treated differently: the
++    /// fill bytes are inserted *after* the former and *before* the latter.
++    /// Without this snapshot the adjustment loop below (which keys on
++    /// `loff >= offset`) shifts both, so a preceding label is dragged
++    /// forward by the gap and any difference against it collapses —
++    /// observed as the kernel's `.byte 773b-771b` (total source length of an
++    /// ALTERNATIVE with an empty old instruction) assembling as 0 instead of
++    /// the padded length, which objtool reports as "empty alternative entry"
++    /// and which makes boot-time alternative patching a no-op.
++    pub labels_at_offset: Vec<String>,
++    /// Same, for numeric local labels: (label number, index into that
++    /// number's definition list).
++    pub numeric_at_offset: Vec<(String, usize)>,
++}
++
+ pub struct ElfWriterCore<A: X86Arch> {
+     sections: Vec<Section>,
+     symbols: Vec<SymbolInfo>,
+@@ -593,8 +625,8 @@ pub struct ElfWriterCore<A: X86Arch> {
+     /// the versioned alias).
+     symver_flags: FxHashMap<String, (String, crate::backend::x86::assembler::parser::SymverFlag)>,
+     section_stack: Vec<(Option<usize>, Option<usize>)>,
+-    /// Deferred `.skip` expressions: (section_index, offset, expression, fill_byte).
+-    deferred_skips: Vec<(usize, usize, String, u8)>,
++    /// Deferred `.skip` expressions with symbolic sizes (see `DeferredSkip`).
++    deferred_skips: Vec<DeferredSkip>,
+     /// Deferred byte-sized symbol diffs: (section_index, offset, sym_a, sym_b, size, addend).
+     deferred_byte_diffs: Vec<(usize, usize, String, String, usize, i64)>,
+     /// Deferred ULEB/SLEB128 symbol diffs: (section, offset, sym_a, sym_b, addend, signed).
+@@ -995,8 +1027,19 @@ impl<A: X86Arch> ElfWriterCore<A> {
+                         section.data.extend(std::iter::repeat_n(*fill, n));
+                     } else {
+                         let offset = self.sections[sec_idx].data.len();
+-                        self.deferred_skips
+-                            .push((sec_idx, offset, expr.clone(), *fill));
++                        // Remember which labels are already parked at this
++                        // exact offset: they precede the gap and must stay put
++                        // when the fill bytes are spliced in later.
++                        let (labels_at_offset, numeric_at_offset) =
++                            self.snapshot_labels_at(sec_idx, offset);
++                        self.deferred_skips.push(DeferredSkip {
++                            sec_idx,
++                            offset,
++                            expr: expr.clone(),
++                            fill: *fill,
++                            labels_at_offset,
++                            numeric_at_offset,
++                        });
+                     }
+                 } else {
+                     // Simple integer parse for architectures without deferred skip support
+@@ -1664,11 +1707,60 @@ impl<A: X86Arch> ElfWriterCore<A> {
  
--SHA at last doc refresh: **`f657de55`** (`ms178/lccc` main, PR #276; the
--cross-backend ABI round = merged `ms178-2.patch`, plus PR #275 setcc
-+SHA at last doc refresh: **`e89f1b1b`** (local S08 series over ms178/lccc main `2f5e9af3`/PR #281: 16-byte-granular va_arg on AArch64+RISC-V64 and target plain-char signedness).patch`, plus PR #275 setcc
- hardening). Re-verify line numbers before editing. The item catalog is
- [`agent/BACKLOG.md`](agent/BACKLOG.md); the active queue is
- [`tasks/`](tasks/README.md); the negative-results ledger is
-@@ -118,3 +117,26 @@ Not all dead code should be deleted:
-    root-caused.
- 6. Preserve `ExplicitLocation::{Reg,Accumulator}` and exact
-    `SlotAddr::Reg(PhysReg)`; no dummy frame offsets.
+     // ─── Deferred skip resolution (x86-64 and i686) ──────────────────
+ 
++    /// Snapshot the labels positioned at exactly `offset` in `sec_idx`.
++    ///
++    /// Taken when a `.skip` with a symbolic size is deferred. At that moment
++    /// the gap has no length, so a label defined immediately before the
++    /// `.skip` and one defined immediately after it share the same recorded
++    /// offset and are otherwise indistinguishable later on.
++    fn snapshot_labels_at(
++        &self,
++        sec_idx: usize,
++        offset: usize,
++    ) -> (Vec<String>, Vec<(String, usize)>) {
++        let off = offset as u64;
++        let mut plain = Vec::new();
++        for (name, &(lsec, loff)) in self.label_positions.iter() {
++            if lsec == sec_idx && loff == off {
++                plain.push(name.clone());
++            }
++        }
++        let mut numeric = Vec::new();
++        for (num, positions) in self.numeric_label_positions.iter() {
++            for (i, &(lsec, loff)) in positions.iter().enumerate() {
++                if lsec == sec_idx && loff == off {
++                    numeric.push((num.clone(), i));
++                }
++            }
++        }
++        (plain, numeric)
++    }
 +
-+## S08: wide va_arg + target char signedness (2026-08-28)
+     fn resolve_deferred_skips(&mut self) -> Result<(), String> {
+         let mut skips = std::mem::take(&mut self.deferred_skips);
+-        skips.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).reverse());
+-
+-        for (sec_idx, offset, expr, fill) in &skips {
++        // Ties (two deferred skips at the SAME offset) must be spliced in
++        // REVERSE source order. Each splice inserts at `offset`, pushing
++        // already-inserted bytes to the right, so processing them in source
++        // order would put the second gap's fill BEFORE the first gap's fill
++        // and silently permute the section contents (observed as
++        // `cc 90 90 90` where GNU as emits `90 90 90 cc`). `sort_by` is
++        // stable, so reversing the VECTOR (rather than negating the
++        // comparator, which leaves ties in source order) is what yields
++        // descending offsets with reversed ties.
++        skips.sort_by(|a, b| a.sec_idx.cmp(&b.sec_idx).then(a.offset.cmp(&b.offset)));
++        skips.reverse();
 +
-+- **16-byte-granular va_arg, AArch64 + RISC-V64**: `va_arg(ap, __int128)`
-+  has dedicated 16-byte-aligned arms on both backends (AArch64 rounds
-+  `__gr_offs` UP like glibc; RISC-V rounds the overflow-area POINTER);
-+  `va_arg(ap, long double)` on RISC-V stores the full binary128 value
-+  (was silently `__trunctfdf2`-truncated). The riscv arms stage values
-+  through t3/t4 — t0/t1 clobbered the `&va_list` pointer needed for the
-+  write-back (SIGSEGV). Align-16 composites now take even-aligned GP
-+  pairs on BOTH arches, named and variadic (GCC oracles verified;
-+  the old "AAPCS64 needs no even pairs" call_abi note was wrong and is
-+  gone). `tests/regression/va_arg_wide_struct.c` green on aarch64 AND
-+  riscv64; lib 1273/0/6; ARM 378/30/75; x86 536/5 (same 5 pre-existing).
-+- **Target plain-char signedness**: plain `char` was compiled signed on
-+  every target (x86 default leaking into AArch64/RISC-V SysV where char
-+  is unsigned). Resolved at the parse boundary — the parser rewrites
-+  plain char to UnsignedChar on unsigned-char targets, so downstream
-+  CType/IR mappings stay unconditional; `-fsigned-char` /
-+  `-funsigned-char` override (both directions GCC-verified). Caught by
-+  cast_chain_fold.c GCC differential; new
-+  `tests/regression/char_signedness_target.c` pins the
-+  declaration-vs-constant agreement invariant on all targets.
--- 
-2.47.3
-
-
-From 4a7b394b04304bf06d2f9870975ca3c34aab8bd8 Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Fri, 28 Aug 2026 21:32:01 +0000
-Subject: [PATCH 6/6] ir: document parse-boundary plain-char resolution in
- type_spec_to_ir
-
----
- src/ir/lowering/types.rs | 4 ++++
- 1 file changed, 4 insertions(+)
-
-diff --git a/src/ir/lowering/types.rs b/src/ir/lowering/types.rs
-index 76fdce47..85d80938 100644
---- a/src/ir/lowering/types.rs
-+++ b/src/ir/lowering/types.rs
-@@ -215,6 +215,10 @@ impl Lowerer {
-         match ts {
-             TypeSpecifier::Void => IrType::Void,
-             TypeSpecifier::Bool => IrType::U8,
-+            // NOTE: plain char vs signed char is resolved at PARSE time (the
-+            // parser emits UnsignedChar for plain char on unsigned-char
-+            // targets), so TypeSpecifier::Char here always means explicit
-+            // `signed char` and lowers to I8 unconditionally.
-             TypeSpecifier::Char => IrType::I8,
-             TypeSpecifier::UnsignedChar => IrType::U8,
-             TypeSpecifier::Short => IrType::I16,
--- 
-2.47.3
-
++        for skip in &skips {
++            // Destructure by reference: `skips` is detached from `self`, so
++            // the mutable borrows of `self` below are sound.
++            let DeferredSkip {
++                sec_idx,
++                offset,
++                expr,
++                fill,
++                labels_at_offset,
++                numeric_at_offset,
++            } = skip;
+             // Temporarily insert "." (current position) into label_positions so
+             // expressions like "0b + 16 - ." can reference the directive's offset.
+             self.label_positions
+@@ -1688,15 +1780,38 @@ impl<A: X86Arch> ElfWriterCore<A> {
+                 .data
+                 .splice(*offset..*offset, fill_bytes);
+ 
+-            // Adjust label positions
+-            for (_, (lsec, loff)) in self.label_positions.iter_mut() {
+-                if *lsec == *sec_idx && (*loff as usize) >= *offset {
++            // Adjust label positions.
++            //
++            // A label moves iff it lies strictly after the gap, or sits
++            // exactly at the gap start but was defined *after* the `.skip`.
++            // The second clause is what distinguishes the two kinds of
++            // same-offset label: `labels_at_offset` holds the ones that were
++            // already there when the skip was deferred, and those must stay
++            // put. Relocations, jumps, alignment markers and deferred diffs
++            // below keep `>=` because they are always emitted by items that
++            // follow the `.skip` in the stream.
++            for (name, (lsec, loff)) in self.label_positions.iter_mut() {
++                if *lsec != *sec_idx {
++                    continue;
++                }
++                let at_gap = (*loff as usize) == *offset;
++                let after = (*loff as usize) > *offset
++                    || (at_gap && !labels_at_offset.iter().any(|n| n == name));
++                if after {
+                     *loff += count as u64;
+                 }
+             }
+-            for (_, positions) in self.numeric_label_positions.iter_mut() {
+-                for (lsec, loff) in positions.iter_mut() {
+-                    if *lsec == *sec_idx && (*loff as usize) >= *offset {
++            for (num, positions) in self.numeric_label_positions.iter_mut() {
++                for (i, (lsec, loff)) in positions.iter_mut().enumerate() {
++                    if *lsec != *sec_idx {
++                        continue;
++                    }
++                    let at_gap = (*loff as usize) == *offset;
++                    let preceded = numeric_at_offset
++                        .iter()
++                        .any(|(n, idx)| n == num && *idx == i);
++                    let after = (*loff as usize) > *offset || (at_gap && !preceded);
++                    if after {
+                         *loff += count as u64;
+                     }
+                 }
+@@ -1767,9 +1882,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
+                 marker.offset -= delta as usize;
+             }
+         }
+-        for (skip_sec, skip_off, _, _) in self.deferred_skips.iter_mut() {
+-            if *skip_sec == sec_idx && *skip_off >= from {
+-                *skip_off -= delta as usize;
++        for skip in self.deferred_skips.iter_mut() {
++            if skip.sec_idx == sec_idx && skip.offset >= from {
++                skip.offset -= delta as usize;
+             }
+         }
+     }
+@@ -2765,9 +2880,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
+                                     marker.offset -= shrink;
+                                 }
+                             }
+-                            for (s_idx, s_off, _, _) in self.deferred_skips.iter_mut() {
+-                                if *s_idx == sec_idx && *s_off > offset {
+-                                    *s_off -= shrink;
++                            for skip in self.deferred_skips.iter_mut() {
++                                if skip.sec_idx == sec_idx && skip.offset > offset {
++                                    skip.offset -= shrink;
+                                 }
+                             }
+                             for (s_idx, s_off, _, _, _, _) in self.deferred_byte_diffs.iter_mut() {
+@@ -2848,9 +2963,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
+                                     marker.offset += grow;
+                                 }
+                             }
+-                            for (s_idx, s_off, _, _) in self.deferred_skips.iter_mut() {
+-                                if *s_idx == sec_idx && *s_off > offset {
+-                                    *s_off += grow;
++                            for skip in self.deferred_skips.iter_mut() {
++                                if skip.sec_idx == sec_idx && skip.offset > offset {
++                                    skip.offset += grow;
+                                 }
+                             }
+                             for (s_idx, s_off, _, _, _, _) in self.deferred_byte_diffs.iter_mut() {
+@@ -3039,9 +3154,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
+             }
+         }
+         // Update deferred skips and byte diffs
+-        for (skip_sec, skip_off, _, _) in self.deferred_skips.iter_mut() {
+-            if *skip_sec == sec_idx && *skip_off >= at_offset {
+-                *skip_off = (*skip_off as i64 + delta) as usize;
++        for skip in self.deferred_skips.iter_mut() {
++            if skip.sec_idx == sec_idx && skip.offset >= at_offset {
++                skip.offset = (skip.offset as i64 + delta) as usize;
+             }
+         }
+         for (bd_sec, bd_off, _, _, _, _) in self.deferred_byte_diffs.iter_mut() {
+diff --git a/src/backend/riscv/codegen/memory.rs b/src/backend/riscv/codegen/memory.rs
+index 1a39ef77..b7d043fc 100644
+--- a/src/backend/riscv/codegen/memory.rs
++++ b/src/backend/riscv/codegen/memory.rs
+@@ -39,7 +39,10 @@ impl RiscvCodegen {
+                 // intrinsic/argument staging into the lossy f64-extend
+                 // fallback (observed: -1.5F128 negated to -0.0 on RISC-V).
+                 Operand::Const(c) => matches!(c, IrConst::LongDouble(_, _) | IrConst::I128(_)),
+-                _ => false,
++                // Exhaustive on purpose: `Operand` is exactly {Value, Const}.
++                // A future variant must force an explicit decision here rather
++                // than silently degrading to "not a full-precision source",
++                // which is how the lossy f64-extend fallback regressed.
+             };
+             if tracked_val && slot_anchored {
+                 self.state.track_f128_self(ptr.0);
+diff --git a/tests/regression/kernel_altinstr_layout.c b/tests/regression/kernel_altinstr_layout.c
+index 0ca85513..97475fbe 100644
+--- a/tests/regression/kernel_altinstr_layout.c
++++ b/tests/regression/kernel_altinstr_layout.c
+@@ -39,6 +39,13 @@ extern unsigned int region_a_len, region_b_len, region_scaled;
+ extern unsigned int named_addend, named_scaled;
+ extern int neg_plain, neg_addend, neg_scaled;
+ extern unsigned int rep_last;
++extern struct alt_len alt_empty;
++extern unsigned int empty_orig_len, empty_pad_len;
++extern struct alt_len alt_two_a, alt_two_b;
++extern unsigned int two_pad_a, two_pad_b;
++/* Both gaps are 3 bytes of padding but with DIFFERENT fill bytes, so the
++ * byte pattern distinguishes source order from spliced-backwards order. */
++extern unsigned char *two_fill_a, *two_fill_b;
+ 
+ /* --- Case 1+2: a jump inside the measured region that relaxation shrinks.
+  * The original is padded up to the replacement's length. orig_len must equal
+@@ -76,6 +83,111 @@ asm(".text\n"
+     "  ret\n"
+     ".size probe_a, .-probe_a\n");
+ 
++/* --- Case 2b: an ALTERNATIVE whose ORIGINAL instruction is EMPTY.
++ *
++ * This is the shape the kernel uses to patch in an instruction that old CPUs
++ * do not have at all (`ALTERNATIVE("", "stac", X86_FEATURE_SMAP)`), and it is
++ * what produced "empty alternative entry" on every LCCC-built object.
++ *
++ * `780:` and `781:` coincide because the original is zero bytes long, so the
++ * deferred `.skip` gap starts at an offset that labels defined BEFORE it
++ * already occupy. The fill bytes must be inserted AFTER those labels. If the
++ * gap drags them forward instead, `782b-780b` collapses to 0, the recorded
++ * source length is zero, and boot-time alternative patching becomes a no-op:
++ * the SMAP/lfence-style alternatives silently never take effect. No
++ * diagnostic is emitted anywhere along the way. */
++asm(".text\n"
++    ".globl probe_empty\n"
++    ".type probe_empty, @function\n"
++    "probe_empty:\n"
++    "  nop\n"
++    "780:\n"
++    "781:\n"
++    "  .skip -(((784f-783f)-(781b-780b)) > 0) * ((784f-783f)-(781b-780b)),0x90\n"
++    "782:\n"
++    "  .pushsection .altinstr_replacement,\"ax\"\n"
++    "783:\n"
++    "  stac\n"                       /* 0f 01 cb — 3 bytes */
++    "784:\n"
++    "  .popsection\n"
++    "  .pushsection .data\n"
++    "  .globl alt_empty\n"
++    "alt_empty:\n"
++    "  .byte 782b-780b\n"            /* padded source length: 3 */
++    "  .byte 784b-783b\n"            /* replacement length:   3 */
++    "  .globl empty_orig_len\n"
++    "empty_orig_len:\n"
++    "  .long 781b-780b\n"            /* unpadded original:    0 */
++    "  .globl empty_pad_len\n"
++    "empty_pad_len:\n"
++    "  .long 782b-781b\n"            /* padding really emitted: 3 */
++    "  .popsection\n"
++    "  ret\n"
++    ".size probe_empty, .-probe_empty\n");
++
++/* --- Case 2c: TWO CONSECUTIVE empty-original ALTERNATIVEs.
++ *
++ * Neither original emits a byte, so both deferred `.skip` gaps start at the
++ * SAME section offset. Splicing them in source order pushes the first gap's
++ * fill bytes to the right of the second gap's, silently permuting the code
++ * (observed as `cc 90 90 90` where GNU as emits `90 90 90 cc`) even though
++ * every recorded LENGTH still looks correct. The two gaps must instead be
++ * materialised in reverse source order, which leaves the section contents in
++ * source order.
++ *
++ * This is the nested-ALTERNATIVE / back-to-back-ALTERNATIVE shape; six of the
++ * twelve entries in `fs/readdir.o` were affected. Length checks alone cannot
++ * catch it, so the fill bytes are distinct and checked at runtime. */
++asm(".text\n"
++    ".globl probe_two\n"
++    ".type probe_two, @function\n"
++    "probe_two:\n"
++    "  nop\n"
++    "  jmp .Ltwo_out\n"
++    "790:\n"
++    "791:\n"
++    "  .skip -(((794f-793f)-(791b-790b)) > 0) * ((794f-793f)-(791b-790b)),0x90\n"
++    "792:\n"
++    "  .pushsection .altinstr_replacement,\"ax\"\n"
++    "793:\n"
++    "  stac\n"                       /* 0f 01 cb - 3 bytes */
++    "794:\n"
++    "  .popsection\n"
++    "795:\n"
++    "796:\n"
++    "  .skip -(((799f-798f)-(796b-795b)) > 0) * ((799f-798f)-(796b-795b)),0xcc\n"
++    "797:\n"
++    "  .pushsection .altinstr_replacement,\"ax\"\n"
++    "798:\n"
++    "  stac\n"                       /* 0f 01 cb - 3 bytes */
++    "799:\n"
++    "  .popsection\n"
++    "  .pushsection .data\n"
++    "  .globl alt_two_a\n"
++    "alt_two_a:\n"
++    "  .byte 792b-790b\n"            /* first entry padded length:  3 */
++    "  .byte 794b-793b\n"            /* first entry replacement len: 3 */
++    "  .globl alt_two_b\n"
++    "alt_two_b:\n"
++    "  .byte 797b-795b\n"            /* second entry padded length:  3 */
++    "  .byte 799b-798b\n"            /* second entry replacement len: 3 */
++    "  .globl two_pad_a\n"
++    "two_pad_a:\n"
++    "  .long 792b-791b\n"            /* first gap fill:  3 */
++    "  .globl two_pad_b\n"
++    "two_pad_b:\n"
++    "  .long 797b-796b\n"            /* second gap fill: 3 */
++    "  .globl two_fill_a\n"
++    "two_fill_a:\n"
++    "  .quad 791b\n"                 /* first gap, must be 90 90 90 */
++    "  .globl two_fill_b\n"
++    "two_fill_b:\n"
++    "  .quad 796b\n"                 /* second gap, must be cc cc cc */
++    "  .popsection\n"
++    ".Ltwo_out:\n"
++    "  ret\n"
++    ".size probe_two, .-probe_two\n");
++
+ /* --- Case 3: a `.p2align 4` AFTER a resolved `.skip`. The following symbol
+  * must be 16-byte aligned; a stale marker offset silently mis-pads it. */
+ asm(".text\n"
+@@ -198,6 +310,34 @@ int main(void)
+                fail = 1;
+        }
+ 
++       /* Case 2b: an empty original is padded UP to the replacement length,
++        * and the padding is inserted after the coincident 780:/781: labels.
++        * orig_len == 0 here is exactly the "empty alternative entry" defect:
++        * the kernel would patch zero bytes. */
++       if (alt_empty.orig_len != 3) {
++               printf("FAIL alt_empty orig_len=%u expected 3 (empty original "
++                      "not padded to replacement length)\n",
++                      alt_empty.orig_len);
++               fail = 1;
++       }
++       if (alt_empty.repl_len != 3) {
++               printf("FAIL alt_empty repl_len=%u expected 3\n",
++                      alt_empty.repl_len);
++               fail = 1;
++       }
++       /* The unpadded original really is empty... */
++       if (empty_orig_len != 0) {
++               printf("FAIL empty_orig_len=%u expected 0\n", empty_orig_len);
++               fail = 1;
++       }
++       /* ...and the gap it opened is exactly the replacement length. If the
++        * preceding labels had been dragged forward by the fill bytes, this
++        * would read 0 and orig_len above would read 0 too. */
++       if (empty_pad_len != 3) {
++               printf("FAIL empty_pad_len=%u expected 3\n", empty_pad_len);
++               fail = 1;
++       }
++
+        /* A `.p2align 4` after a resolved `.skip` must really align. */
+        if (((unsigned long)(void *)aligned_after_skip & 0xf) != 0) {
+                printf("FAIL aligned_after_skip=%p not 16-byte aligned\n",
+@@ -262,6 +402,51 @@ int main(void)
+ 		fail = 1;
+ 	}
+ 
++	/* Case 2c: two consecutive empty originals, each padded to 3 bytes, in
++	 * source order and with the right fill byte in each gap. */
++	if (alt_two_a.orig_len != 3) {
++		printf("FAIL alt_two_a orig_len=%u expected 3\n",
++		       alt_two_a.orig_len);
++		fail = 1;
++	}
++	if (alt_two_a.repl_len != 3) {
++		printf("FAIL alt_two_a repl_len=%u expected 3\n",
++		       alt_two_a.repl_len);
++		fail = 1;
++	}
++	if (alt_two_b.orig_len != 3) {
++		printf("FAIL alt_two_b orig_len=%u expected 3\n",
++		       alt_two_b.orig_len);
++		fail = 1;
++	}
++	if (alt_two_b.repl_len != 3) {
++		printf("FAIL alt_two_b repl_len=%u expected 3\n",
++		       alt_two_b.repl_len);
++		fail = 1;
++	}
++	if (two_pad_a != 3) {
++		printf("FAIL two_pad_a=%u expected 3\n", two_pad_a);
++		fail = 1;
++	}
++	if (two_pad_b != 3) {
++		printf("FAIL two_pad_b=%u expected 3\n", two_pad_b);
++		fail = 1;
++	}
++	if (two_fill_a[0] != 0x90 || two_fill_a[1] != 0x90 ||
++	    two_fill_a[2] != 0x90) {
++		printf("FAIL gap 1 fill = %02x %02x %02x expected 90 90 90 "
++		       "(gaps spliced in the wrong order)\n",
++		       two_fill_a[0], two_fill_a[1], two_fill_a[2]);
++		fail = 1;
++	}
++	if (two_fill_b[0] != 0xcc || two_fill_b[1] != 0xcc ||
++	    two_fill_b[2] != 0xcc) {
++		printf("FAIL gap 2 fill = %02x %02x %02x expected cc cc cc "
++		       "(gaps spliced in the wrong order)\n",
++		       two_fill_b[0], two_fill_b[1], two_fill_b[2]);
++		fail = 1;
++	}
++
+        if (fail)
+                return 1;
+        printf("PASS kernel_altinstr_layout\n");
