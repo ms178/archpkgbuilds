@@ -1,1062 +1,160 @@
-diff --git a/scripts/run_regression_suite.sh b/scripts/run_regression_suite.sh
-index c120c959..977f69a6 100755
---- a/scripts/run_regression_suite.sh
-+++ b/scripts/run_regression_suite.sh
-@@ -118,4 +118,40 @@ echo "================================================================"
- echo "regression suite: PASS=$pass FAIL=$fail SKIP=$skip (AB-diff failures: $ab_fail)"
- if [[ ${#FAILED[@]} -gt 0 ]]; then printf 'failed: %s\n' "${FAILED[@]}"; fi
- echo "================================================================"
-+
-+# ── 32 KiB boot-code size gate (the e12597c7 lesson: a size regression in
-+# the boot path went unnoticed for sessions because nothing measured it).
-+# Metric: pre-pecompat content end ≤ 24,576 (the alignment-cliff boundary;
-+# `.pecompat` forces 4096 alignment, so `_end` jumps in 4 KiB steps and
-+# hides progress inside a step). Skipped entirely when the prepared kernel
-+# tree is absent (bare CI containers) — a skip is reported, not a pass.
-+if [[ -n "${KERNEL_DIR:-}" && -f "$KERNEL_DIR/arch/x86/boot/printf.c" ]]; then
-+    boot_out="$WORK/bootgate"
-+    # build_kernel_boot.sh exits non-zero when the 32 KiB gate itself fails —
-+    # that is a MEASUREMENT, not a build error; parse the log either way.
-+    boot_log=$(KERNEL_DIR="$KERNEL_DIR" \
-+               LCCC="$REPO/target/fastbuild/lccc" \
-+               LCCC_LD="$REPO/target/fastbuild/lccc-ld" \
-+               OUT="$boot_out" \
-+               timeout 600 bash "$REPO/scripts/build_kernel_boot.sh" 2>&1 || true)
-+    text_size=$(echo "$boot_log" | awk '$1 == ".text" && $2 ~ /^[0-9]+$/ {s=$2} END {print s}')
-+    if [[ -z "$text_size" ]]; then
-+        echo "boot gate: FAIL (no .text measurement — build errored)"
-+        echo "$boot_log" | tail -5
-+        fail=$((fail+1))
-+    else
-+        # content_end = 1,166 (bstext..initdata) + .text + 30 (.text32)
-+        content_end=$(( 1166 + text_size + 30 ))
-+        if (( content_end <= 24576 )); then
-+            echo "boot gate: PASS (pre-pecompat end $content_end ≤ 24,576; .text $text_size)"
-+        else
-+            echo "boot gate: FAIL (pre-pecompat end $content_end > 24,576; .text $text_size)"
-+            echo "          .text budget: ≤ 23,380 — see updates/followup_2026-08-27_session06.md §3"
-+            fail=$((fail+1))
-+        fi
-+    fi
-+else
-+    echo "boot gate: SKIP (KERNEL_DIR not set or tree not prepared)"
-+fi
-+
- [[ $fail -eq 0 ]]
-diff --git a/src/backend/i686/codegen/alu.rs b/src/backend/i686/codegen/alu.rs
-index 026eee98..0cc7f3e0 100644
---- a/src/backend/i686/codegen/alu.rs
-+++ b/src/backend/i686/codegen/alu.rs
-@@ -30,6 +30,7 @@
- 
- use super::emit::{alu_mnemonic, shift_mnemonic, I686Codegen};
- use super::magic_div::{magic_s32, magic_u32};
-+use crate::backend::regalloc::PhysReg;
- use crate::common::types::IrType;
- use crate::emit;
- use crate::ir::reexports::{IrBinOp, Operand, Value};
-@@ -570,6 +571,50 @@ impl I686Codegen {
-         rhs: &Operand,
-         _ty: IrType,
-     ) {
-+        // Same-block div/rem pair fusion (compute_i686_divrem_pairs). The
-+        // TAIL of a pair emits nothing — its result was stored by the HEAD's
-+        // dual-store emission further up in this block. The HEAD emits one
-+        // divl/idivl and stores its own result AND the partner's.
-+        if matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) {
-+            if self.divrem_tail_dests.contains(&dest.0)
-+                && !self.divrem_broken_tails.contains(&dest.0)
-+            {
-+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-+                    eprintln!("[DIVREM] tail-skip dest={}", dest.0);
-+                }
-+                // Tail: nothing to emit. The accumulator cache makes no
-+                // claim about this dest (it was never staged through %eax),
-+                // and its home/slot was written at the head.
-+                return;
-+            }
-+            if self.divrem_broken_tails.contains(&dest.0) {
-+                // Pair was broken at head-emission time (pathological home
-+                // combination): both sides emit standalone divisions.
-+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-+                    eprintln!("[DIVREM] tail-broken dest={} (standalone)", dest.0);
-+                }
-+            } else if let Some(&(partner_dest, partner_from_eax)) =
-+                self.divrem_head_partners.get(&dest.0)
-+            {
-+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-+                    eprintln!(
-+                        "[DIVREM] head-emit dest={} op={:?} partner={} partner_from_eax={}",
-+                        dest.0, op, partner_dest, partner_from_eax
-+                    );
-+                }
-+                let fused = self.emit_divrem_pair_head(
-+                    dest, op, lhs, rhs, partner_dest, partner_from_eax,
-+                );
-+                if fused {
-+                    return;
-+                }
-+                // Broken pair: fall through to the standalone path; the
-+                // partner (tail) was marked broken above.
-+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-+                    eprintln!("[DIVREM] head-broken dest={} (standalone)", dest.0);
-+                }
-+            }
-+        }
-         // Direct-to-dest path: skip the accumulator entirely when the dest
-         // has a register and both operands are register/slot/imm-resident.
-         if self.try_emit_int_binop_direct(dest, op, lhs, rhs) {
-@@ -683,7 +728,18 @@ impl I686Codegen {
-             IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
-         );
-         let rhs_ref: String = if let Operand::Value(rv) = rhs {
--            let direct = self.direct_reg_src_ref(rv);
-+            // div/idiv: register-homed ALLOCAS also qualify as direct
-+            // divisors. operand_to_ecx reads exactly `movl %home,%ecx` for
-+            // them (the register holds the value), so `divl %home` is the
-+            // identical read without the %ecx relay — which in turn keeps
-+            // %ecx clean across the div for the register allocator's hazard
-+            // model. %edx (dividend high half) and %eax (just clobbered by
-+            // operand_to_eax(lhs)) stay excluded and stage through %ecx.
-+            let direct = if div_like {
-+                self.div_rhs_direct_ref(rv)
-+            } else {
-+                self.direct_reg_src_ref(rv)
-+            };
-             if var_shift || (div_like && matches!(&direct, Some(r) if r == "%edx")) {
-                 self.operand_to_ecx(rhs);
-                 "%ecx".to_string()
-@@ -742,15 +798,148 @@ impl I686Codegen {
-             IrBinOp::SRem => {
-                 self.state.emit("    cltd");
-                 emit!(self.state, "    idivl {}", rhs_ref);
-+                // Remainder born in %edx: when the dest is HOMED in %edx the
-+                // relay through %eax (movl %edx,%eax; movl %eax,%edx) is a
-+                // pure no-op pair — the result is already home.
-+                if self.dest_reg(dest) == Some(PhysReg(5)) {
-+                    self.state.reg_cache.invalidate_acc();
-+                    return;
-+                }
-                 self.state.emit("    movl %edx, %eax");
-             }
-             IrBinOp::URem => {
-                 self.state.emit("    xorl %edx, %edx");
-                 emit!(self.state, "    divl {}", rhs_ref);
-+                if self.dest_reg(dest) == Some(PhysReg(5)) {
-+                    self.state.reg_cache.invalidate_acc();
-+                    return;
-+                }
-                 self.state.emit("    movl %edx, %eax");
-             }
-         }
-         self.state.reg_cache.invalidate_acc();
-         self.store_eax_to(dest);
-     }
-+
-+    /// Emit the HEAD of a fused same-block div/rem pair: one divl/idivl
-+    /// computes both results; store the head's own result from its natural
-+    /// output register (%edx for rem, %eax for div) and the partner's from
-+    /// the register its flavour demands. Mirrors the general-path staging
-+    /// (direct register-homed divisor incl. register-homed allocas, %ecx
-+    /// staging otherwise).
-+    ///
-+    /// STORE ORDER IS LOAD-BEARING. The two results live in %eax (quotient)
-+    /// and %edx (remainder) until stored. Storing the %eax side into a home
-+    /// of %edx (`movl %eax,%edx`) destroys the remainder before it is
-+    /// stored; symmetrically, storing the %edx side into an %eax home
-+    /// destroys the quotient. The order below stores the %edx side first
-+    /// unless that side's store writes %eax — and when BOTH conflict
-+    /// (quotient homed %edx AND remainder homed %eax) no order works, so
-+    /// the pair is BROKEN: this returns false, the caller falls through to
-+    /// the standalone path, and the tail (marked in divrem_broken_tails)
-+    /// emits its own division. The head is always emitted before the tail
-+    /// (same block, earlier position), so the marker is set in time.
-+    ///
-+    /// Returns true when the fused emission completed.
-+    fn emit_divrem_pair_head(
-+        &mut self,
-+        dest: &Value,
-+        op: IrBinOp,
-+        lhs: &Operand,
-+        rhs: &Operand,
-+        partner_dest: u32,
-+        partner_from_eax: bool,
-+    ) -> bool {
-+        let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
-+        let self_is_div = matches!(op, IrBinOp::UDiv | IrBinOp::SDiv);
-+        self.operand_to_eax(lhs);
-+        let rhs_ref: String = if let Operand::Value(rv) = rhs {
-+            match self.div_rhs_direct_ref(rv) {
-+                Some(r) => r,
-+                None => {
-+                    self.operand_to_ecx(rhs);
-+                    "%ecx".to_string()
-+                }
-+            }
-+        } else {
-+            self.operand_to_ecx(rhs);
-+            "%ecx".to_string()
-+        };
-+        if signed {
-+            self.state.emit("    cltd");
-+            emit!(self.state, "    idivl {}", rhs_ref);
-+        } else {
-+            self.state.emit("    xorl %edx, %edx");
-+            emit!(self.state, "    divl {}", rhs_ref);
-+        }
-+        self.state.reg_cache.invalidate_acc();
-+
-+        // Which value takes which output register:
-+        //   div-flavoured dest -> %eax, rem-flavoured dest -> %edx.
-+        let div_dest = if self_is_div {
-+            *dest
-+        } else {
-+            Value(partner_dest)
-+        };
-+        let rem_dest = if self_is_div {
-+            Value(partner_dest)
-+        } else {
-+            *dest
-+        };
-+        let _ = partner_from_eax; // flavour already encoded in the dest split above
-+
-+        let rem_home = self.dest_reg(&rem_dest).map(|p| p.0);
-+        let div_home = self.dest_reg(&div_dest).map(|p| p.0);
-+        // Immediately-consumed (accumulator-flow) values have neither a home
-+        // nor a slot: their consumer reads %eax directly (see operand_to_eax's
-+        // no-home fallback). The pair tail can never be one (the accumulator
-+        // analysis excludes tails), so at most the HEAD's own dest is
-+        // slotless — it must be materialised into %eax with a cache entry.
-+        let rem_slotless =
-+            rem_home.is_none() && self.state.get_slot(rem_dest.0).is_none();
-+        let div_slotless =
-+            div_home.is_none() && self.state.get_slot(div_dest.0).is_none();
-+        // store_edx(rem) writes %eax iff rem is HOMED in %eax (PhysReg 6);
-+        // store_eax(div) writes %edx iff div is HOMED in %edx (PhysReg 5).
-+        let edx_side_writes_eax = rem_home == Some(6);
-+        let eax_side_writes_edx = div_home == Some(5);
-+
-+        // Deadlock screening: combinations where NO store order preserves
-+        // both results (each side's only copy sits in the register the other
-+        // side's store must overwrite). Break the pair — both sides then
-+        // emit standalone divisions, which is always correct.
-+        if (edx_side_writes_eax && eax_side_writes_edx)
-+            || (rem_slotless && eax_side_writes_edx)
-+            || (div_slotless && edx_side_writes_eax)
-+        {
-+            self.divrem_broken_tails.insert(partner_dest);
-+            return false;
-+        }
-+        if rem_slotless {
-+            // Quotient out first (its store cannot touch %edx here); then
-+            // move the remainder into %eax for its acc-flow consumer.
-+            self.store_eax_to(&div_dest);
-+            self.state.emit("    movl %edx, %eax");
-+            self.state.reg_cache.set_acc(rem_dest.0, false);
-+        } else if div_slotless {
-+            // Remainder out first (its store cannot touch %eax here); the
-+            // quotient is already in %eax — just claim the cache entry its
-+            // consumer will read.
-+            self.store_edx_to(&rem_dest);
-+            self.state.reg_cache.set_acc(div_dest.0, false);
-+        } else if edx_side_writes_eax {
-+            // Quotient first (its store cannot touch %edx here); then the
-+            // remainder store rewrites %eax — invalidate the acc claim the
-+            // quotient store just made.
-+            self.store_eax_to(&div_dest);
-+            self.store_edx_to(&rem_dest);
-+            self.state.reg_cache.invalidate_acc();
-+        } else {
-+            // Canonical order: remainder out of %edx first (homed there it
-+            // is a no-op, leaving %edx free for the quotient's store).
-+            self.store_edx_to(&rem_dest);
-+            self.store_eax_to(&div_dest);
-+        }
-+        true
+diff --git a/scripts/build_kernel_vm.sh b/scripts/build_kernel_vm.sh
+index 8879e682..72c67f64 100755
+--- a/scripts/build_kernel_vm.sh
++++ b/scripts/build_kernel_vm.sh
+@@ -63,10 +63,38 @@ if [[ ! -f .lccc-vm-config ]]; then
+     echo "build_kernel_vm: modules must stay disabled for milestone 1" >&2
+     exit 1
+   }
++  # A `choice` symbol without a default (RANDSTRUCT on 6.18.4x) cannot be
++  # auto-answered by a mid-build `syncconfig` re-run: with stdin closed it
++  # dies with "Error in reading or end of file" AFTER hundreds of objects
++  # compiled. olddefconfig answers it, but the kernel re-runs syncconfig
++  # whenever the config is touched, so VERIFY the config is fully answered
++  # up front: a syncconfig dry-run here fails in seconds, not after the
++  # compile phase.
++  make ARCH=x86_64 syncconfig >/dev/null || {
++    echo "build_kernel_vm: syncconfig cannot auto-answer the config (stale .config?); regenerating" >&2
++    make ARCH=x86_64 allnoconfig >/dev/null
++    scripts/kconfig/merge_config.sh -m .config "$FRAGMENT" >/dev/null
++    make ARCH=x86_64 olddefconfig >/dev/null
++    make ARCH=x86_64 syncconfig >/dev/null || {
++      echo "build_kernel_vm: config still fails syncconfig after regeneration" >&2
++      exit 1
 +    }
- }
-diff --git a/src/backend/i686/codegen/emit.rs b/src/backend/i686/codegen/emit.rs
-index d1b48685..b113a4db 100644
---- a/src/backend/i686/codegen/emit.rs
-+++ b/src/backend/i686/codegen/emit.rs
-@@ -15,6 +15,7 @@ use crate::backend::regalloc::PhysReg;
- use crate::backend::state::{CodegenState, StackSlot};
- use crate::backend::traits::ArchCodegen;
- use crate::common::fx_hash::FxHashMap;
-+use crate::common::fx_hash::FxHashSet;
- use crate::common::types::{AddressSpace, IrType};
- use crate::delegate_to_impl;
- use crate::emit;
-@@ -74,6 +75,21 @@ pub struct I686Codegen {
-     /// -Os/-Oz: prefer the shorter sequence (idiv/imul) over the faster one
-     /// (magic-number division, multi-instruction LEA multiply chains).
-     pub(super) optimize_for_size: bool,
-+    /// Same-block div/rem pair analysis (see backend::regalloc::
-+    /// compute_i686_divrem_pairs). Recomputed per function; the emitter uses
-+    /// tail_dests/head_partners to fuse URem+UDiv couples into one divl.
-+    pub(super) divrem_tail_dests: FxHashSet<u32>,
-+    pub(super) divrem_head_partners: FxHashMap<u32, (u32, bool)>,
-+    /// Pairs broken at emission time (pathological home combination — see
-+    /// emit_divrem_pair_head): the tail must emit its own standalone
-+    /// division even though the table lists it as a tail.
-+    pub(super) divrem_broken_tails: FxHashSet<u32>,
-+    /// Wide values whose IR definition is a ZERO-EXTENDING cast from a
-+    /// 32-bit-or-smaller unsigned type (u32→u64, u8→u64, …): the high half
-+    /// is provably zero, so 64-bit multiply/add with them drops the alo×bhi
-+    /// cross term and carries with an immediate 0 — the parser hot shape
-+    /// `res = res * base + val` (GCC: imull/mull/addl/adcl $0).
-+    pub(super) zext_wide_values: FxHashSet<u32>,
- }
++  }
+   touch .lccc-vm-config
+ fi
  
- // Callee-saved physical register indices for i686
-@@ -141,6 +157,10 @@ impl I686Codegen {
-             current_return_type: IrType::I32,
-             is_variadic: false,
-             reg_assignments: FxHashMap::default(),
-+            divrem_tail_dests: FxHashSet::default(),
-+            divrem_head_partners: FxHashMap::default(),
-+            divrem_broken_tails: FxHashSet::default(),
-+            zext_wide_values: FxHashSet::default(),
-             used_callee_saved: Vec::new(),
-             va_named_stack_bytes: 0,
-             asm_scratch_idx: 0,
-@@ -257,6 +277,30 @@ impl I686Codegen {
-         None
-     }
- 
-+    /// Direct divisor source for div/idiv. Unlike `direct_reg_src_ref`,
-+    /// register-homed ALLOCAS qualify: the divisor emission path stages a
-+    /// register-homed operand with exactly `movl %home,%ecx` (see
-+    /// operand_to_ecx's reg_assignments branch, which runs before the slot
-+    /// path), so the home register holds the value and `divl %home` performs
-+    /// the identical read without the %ecx relay. `%edx` (dividend high
-+    /// half — divl would divide by edx:edx:eax) and `%eax` (clobbered by
-+    /// operand_to_eax(lhs) moments before) are excluded; those home shapes
-+    /// stage through %ecx exactly as before.
-+    pub(super) fn div_rhs_direct_ref(&self, v: &Value) -> Option<String> {
-+        if self.state.wide_values.contains(&v.0)
-+            || self.state.f128_direct_slots.contains(&v.0)
-+        {
-+            return None;
-+        }
-+        if let Some(&phys) = self.reg_assignments.get(&v.0) {
-+            if phys.0 == 5 || phys.0 == 6 {
-+                return None; // %edx / %eax: stage through %ecx instead
-+            }
-+            return Some(format!("%{}", phys_reg_name(phys)));
-+        }
-+        None
-+    }
-+
-     /// Load the address of va_list storage into %edx.
-     ///
-     /// va_list_ptr is an IR value that holds a pointer to the va_list storage.
-@@ -505,6 +549,23 @@ impl I686Codegen {
-         }
-     }
- 
-+    /// Store %edx to a value's destination (register home or stack slot).
-+    /// Mirror of `store_eax_to` for the remainder output of divl/idivl.
-+    /// A dest homed in %edx needs no code — the value is born there.
-+    pub(super) fn store_edx_to(&mut self, dest: &Value) {
-+        if let Some(phys) = self.dest_reg(dest) {
-+            if phys.0 == 5 {
-+                // Destination homed in %edx: the remainder is already home.
-+                return;
-+            }
-+            let reg = phys_reg_name(phys);
-+            emit!(self.state, "    movl %edx, %{}", reg);
-+        } else if let Some(slot) = self.state.get_slot(dest.0) {
-+            let sr = self.slot_ref(slot);
-+            emit!(self.state, "    movl %edx, {}", sr);
-+        }
-+    }
-+
-     /// Return the store mnemonic for a given type.
-     pub(super) fn mov_store_for_type(&self, ty: IrType) -> &'static str {
-         match ty {
-diff --git a/src/backend/i686/codegen/i128_ops.rs b/src/backend/i686/codegen/i128_ops.rs
-index b97dd9d3..70bbd120 100644
---- a/src/backend/i686/codegen/i128_ops.rs
-+++ b/src/backend/i686/codegen/i128_ops.rs
-@@ -69,11 +69,34 @@ impl I686Codegen {
-         };
-         let rlo_imm = rlo.starts_with('$');
-         let rhi_imm = rhi.starts_with('$');
-+        // Zero-extended RHS (a u8/u16/u32/ptr value widened to 64 bits): the
-+        // high half is provably zero at the IR level, regardless of what the
-+        // widening cast's slot machinery wrote there. This is the parser hot
-+        // shape `res = res * base + val`: the alo*bhi cross product vanishes
-+        // and the carry becomes an immediate 0 (GCC's imull/mull/addl/adcl
-+        // $0 chain).
-+        let rhs_zero_hi = rhi_imm && rhi == "$0"
-+            || matches!(rhs, Operand::Value(v) if self.zext_wide_values.contains(&v.0));
- 
-         match op {
-             IrBinOp::Mul => {
-                 self.emit_load_acc_pair(lhs);
--                if !rlo_imm {
-+                if rhs_zero_hi {
-+                    // bhi = 0: alo*bhi and its accumulation vanish.
-+                    if !rlo_imm {
-+                        self.state.emit("    movl %edx, %ecx");
-+                        emit!(self.state, "    imull {}, %ecx", rlo); // ahi*blo
-+                        emit!(self.state, "    mull {}", rlo); // eax:edx = alo*blo
-+                        self.state.emit("    addl %ecx, %edx");
-+                    } else {
-+                        let blo = rlo.trim_start_matches('$');
-+                        self.state.emit("    movl %edx, %ecx");
-+                        emit!(self.state, "    imull ${}, %ecx", blo); // ahi*blo
-+                        emit!(self.state, "    movl ${}, %edx", blo);
-+                        self.state.emit("    mull %edx"); // eax:edx = alo*blo
-+                        self.state.emit("    addl %ecx, %edx");
-+                    }
-+                } else if !rlo_imm {
-                     // Memory RHS: every product reads its operand directly —
-                     // no stack staging at all.
-                     self.state.emit("    movl %edx, %ecx");
-@@ -106,7 +129,13 @@ impl I686Codegen {
-                     ("subl", "sbbl")
-                 };
-                 emit!(self.state, "    {} {}, %eax", mn, rlo);
--                emit!(self.state, "    {} {}, %edx", mn_carry, rhi);
-+                if rhs_zero_hi {
-+                    // High half of the RHS is provably 0: carry with the
-+                    // 3-byte immediate form instead of a memory operand.
-+                    emit!(self.state, "    {} $0, %edx", mn_carry);
-+                } else {
-+                    emit!(self.state, "    {} {}, %edx", mn_carry, rhi);
-+                }
-             }
-             IrBinOp::And | IrBinOp::Or | IrBinOp::Xor => {
-                 self.emit_load_acc_pair(lhs);
-@@ -117,9 +146,10 @@ impl I686Codegen {
-                 };
-                 // Identity folding: x&0 / x|0 / x^0 = skip (zero-AND writes
-                 // zero, so emit `xorl reg,reg` for the 2-byte form); x&-1 /
--                // x|-1 / x^-1 likewise reduce.
-+                // x|-1 / x^-1 likewise reduce. A zero-extended VALUE RHS has
-+                // the same $0 high half by construction.
-                 let zero_lo = rlo_imm && rlo == "$0";
--                let zero_hi = rhi_imm && rhi == "$0";
-+                let zero_hi = (rhi_imm && rhi == "$0") || rhs_zero_hi;
-                 let m1_lo = rlo_imm && rlo == "$-1";
-                 let m1_hi = rhi_imm && rhi == "$-1";
-                 if op == IrBinOp::And {
-diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index 62f5d358..a21cbc1f 100644
---- a/src/backend/i686/codegen/peephole.rs
-+++ b/src/backend/i686/codegen/peephole.rs
-@@ -2357,9 +2357,28 @@ fn replace_att_source_reg(line: &str, old_reg: &str, new_reg: &str) -> Option<St
-     }
-     parts.push(cur);
- 
--    // A single operand is read-modify-write or a branch target: not a source.
-+    // A single operand is read-modify-write (incl/neg/not/bswap…), a branch
-+    // target, or a stack slot — EXCEPT for the single-operand forms whose one
-+    // register operand is a pure SOURCE: `divl %reg` / `idivl %reg` (the
-+    // divisor is read; the implicit results land in eax/edx), `push %reg`,
-+    // and `jmp/call *%reg`. Rewriting the source of those is exactly as safe
-+    // as rewriting a two-operand source. Everything else keeps refusing.
-     if parts.len() < 2 {
--        return None;
-+        let p0 = parts[0].trim();
-+        if !(p0.starts_with('%')
-+            && !p0.contains('(')
-+            && (mnemonic.starts_with("div")
-+                || mnemonic.starts_with("idiv")
-+                || mnemonic.starts_with("push")
-+                || ((mnemonic == "jmp" || mnemonic == "call") && p0.starts_with('*'))))
-+        {
-+            return None;
-+        }
-+        if !has_whole_word(p0, old_reg) {
-+            return None;
-+        }
-+        let replaced = replace_whole_word(p0, old_reg, new_reg);
-+        return Some(format!("{}{}{}{}", ws, mnemonic, " ", replaced));
-     }
- 
-     let last = parts.len() - 1;
-diff --git a/src/backend/i686/codegen/prologue.rs b/src/backend/i686/codegen/prologue.rs
-index c74a8029..35f6a690 100644
---- a/src/backend/i686/codegen/prologue.rs
-+++ b/src/backend/i686/codegen/prologue.rs
-@@ -92,6 +92,49 @@ impl I686Codegen {
-         self.is_fastcall = func.is_fastcall;
-         self.current_return_type = func.return_type;
- 
-+        // Same-block div/rem pair fusion table (one divl serves a
-+        // URem+UDiv couple with identical operands). Constant divisors pair
-+        // only at -Os, where the magic-number strength reduction is off and
-+        // the general divl path is guaranteed for both sides.
-+        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs(
-+            func,
-+            self.optimize_for_size,
-+        );
-+        self.divrem_tail_dests = pairs.tail_dests;
-+        self.divrem_head_partners = pairs.head_partners;
-+        self.divrem_broken_tails.clear();
-+
-+        // Zero-extending wide casts (u8/u16/u32/ptr -> i64/u64): their high
-+        // half is provably zero — the 64-bit ALU fast paths use this to drop
-+        // the alo*bhi cross product and to carry with an immediate 0.
-+        self.zext_wide_values.clear();
-+        for block in &func.blocks {
-+            for inst in &block.instructions {
-+                if let crate::ir::reexports::Instruction::Cast {
-+                    dest,
-+                    src: crate::ir::reexports::Operand::Value(_),
-+                    from_ty,
-+                    to_ty,
-+                } = inst
-+                {
-+                    let zext = matches!(
-+                        (from_ty, to_ty),
-+                        (
-+                            crate::common::types::IrType::U8
-+                                | crate::common::types::IrType::U16
-+                                | crate::common::types::IrType::U32
-+                                | crate::common::types::IrType::Ptr,
-+                            crate::common::types::IrType::I64
-+                                | crate::common::types::IrType::U64
-+                        )
-+                    );
-+                    if zext {
-+                        self.zext_wide_values.insert(dest.0);
-+                    }
-+                }
-+            }
-+        }
-+
-         // Dynamic alloca (VLAs) requires the frame pointer to track the stack,
-         // since ESP changes by runtime-computed amounts.
-         if self.state.has_dyn_alloca {
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index e3563eff..b631ab01 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -56,6 +56,31 @@ pub fn analyze_accumulator_assignments(
-         return Vec::new();
-     }
- 
-+    // Fused div/rem pair tails emit no code — their dest is NOT staged into
-+    // the accumulator at its IR def point (it was stored by the head). An
-+    // accumulator chain starting from a tail dest would let the consumer
-+    // read a stale %eax.
-+    let divrem = compute_i686_divrem_pairs(func, false);
-+    if !divrem.tail_dests.is_empty() {
-+        let filtered: Vec<u32> = candidates
-+            .into_iter()
-+            .filter(|c| !divrem.tail_dests.contains(c))
-+            .collect();
-+        if filtered.is_empty() {
-+            return Vec::new();
-+        }
-+        return analyze_accumulator_assignments_impl(func, policy, &filtered);
-+    }
-+    analyze_accumulator_assignments_impl(func, policy, &candidates.into_iter().collect::<Vec<u32>>())
+ start=$(date +%s)
++# Refresh include/config/auto.conf SERIALLY before the parallel build.  A
++# -j2 `bzImage` re-runs syncconfig as part of `prepare`, and when auto.conf
++# is stale that re-run can prompt for NEW symbols (cc-option-dependent
++# visibility differs between the config-generation and build contexts) and
++# die with "Error in reading or end of file" — after the config phase
++# already passed.  A serial syncconfig here makes the build's own
++# syncconfig a no-op (auto.conf is fresh), eliminating the race entirely.
++make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC=gcc syncconfig >/dev/null || {
++  echo "build_kernel_vm: serial syncconfig refresh failed" >&2
++  exit 1
 +}
-+
-+fn analyze_accumulator_assignments_impl(
-+    func: &IrFunction,
-+    policy: AccumulatorPolicy,
-+    candidates: &[u32],
-+) -> Vec<AccumulatorAssignment> {
-+    let candidates: Vec<u32> = candidates.to_vec();
-+
-     let mut defs: FxHashMap<u32, u32> = FxHashMap::default();
-     let mut uses: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-     let mut pp = 0u32;
-@@ -377,6 +402,208 @@ fn overlaps_inclusive(iv: &LiveInterval, points: &[u32]) -> bool {
-     idx < points.len() && points[idx] <= iv.end
- }
+ echo "build: make CC=$LCCC LD=$LCCC_LD HOSTCC=gcc -j$JOBS bzImage (log: $LOG)"
+ set +e
+ make ARCH=x86_64 \
+diff --git a/scripts/codegen_oracle.py b/scripts/codegen_oracle.py
+index e55a67f4..9ff283d2 100644
+--- a/scripts/codegen_oracle.py
++++ b/scripts/codegen_oracle.py
+@@ -332,6 +332,10 @@ def _markdown(results: list[dict[str, Any]], path: Path) -> None:
  
-+/// Like `overlaps_inclusive`, but hazards at the interval's OWN definition
-+/// point are birth, not clobber: every emitter shape stages its early writes
-+/// (scratch relays, `%ecx` pointer materialisation) BEFORE the final
-+/// destination write that constitutes the value's birth, so a hazard exactly
-+/// at `iv.start` can never destroy a value that does not exist yet. This is
-+/// what lets a `divl`-born remainder claim `%edx` and a GEP-born pointer
-+/// claim `%ecx` across their own defining instruction.
-+#[inline]
-+fn overlaps_inclusive_skip_birth(iv: &LiveInterval, points: &[u32]) -> bool {
-+    let idx = points.partition_point(|&p| p < iv.start);
-+    // Skip a hazard exactly at the def point (birth), then require any
-+    // remaining hazard to fall within (start, end].
-+    let mut idx = idx;
-+    if idx < points.len() && points[idx] == iv.start {
-+        idx += 1;
-+    }
-+    idx < points.len() && points[idx] <= iv.end
-+}
-+
-+// ── i686 div/rem same-block pair analysis ────────────────────────────────────
-+
-+/// Deterministic div/rem pair analysis shared by the i686 emitter and the
-+/// register allocator's hazard scan. Both derive it from the same IR, so the
-+/// two views can never disagree.
-+///
-+/// A pair is a `URem`/`UDiv` (or `SRem`/`SDiv`) couple in the SAME block with
-+/// IDENTICAL operands. One `divl`/`idivl` computes both results: the head
-+/// (first in emission order) emits the division and stores BOTH results
-+/// immediately — its own from its natural output register (`%edx` for rem,
-+/// `%eax` for div) and the partner's from the other output — while the tail
-+/// emits NOTHING (its result was already stored at the head). Soundness does
-+/// not depend on what lies between the two instructions: SSA operands cannot
-+/// change, and both stores happen at the head, before anything else runs.
-+///
-+/// `allow_const_rhs` covers the constant-divisor strength-reduction path: at
-+/// -O2 the emitter replaces constant divisions with magic-number sequences
-+/// that never execute `divl`, so those pairs must not fuse. At -Os the magic
-+/// path is disabled and constant pairs are legal. The register allocator
-+/// always passes `false` — a tail it models as "emits nothing" must be one
-+/// whose head provably emits the real division (non-constant RHS pairs never
-+/// take the magic path, so they can never break).
-+///
-+/// The greedy pairing is order-stable: scanning forward, each still-unpaired
-+/// division pairs with the next unpaired compatible division in the same
-+/// block. Compatibility requires identical `lhs`/`rhs` operands and matching
-+/// signedness (`URem` with `UDiv`/`URem`, `SRem` with `SDiv`/`SRem`); mixing
-+/// flavours would change the executed instruction.
-+pub(crate) struct I686DivRemPairs {
-+    /// Dest value-ids of tail instructions — the emitter skips them entirely.
-+    pub tail_dests: FxHashSet<u32>,
-+    /// Head dest value-id -> (partner dest, partner result is the quotient in
-+    /// `%eax`). `false` means the partner wants the remainder in `%edx`.
-+    pub head_partners: FxHashMap<u32, (u32, bool)>,
-+    /// `(block_idx, inst_idx)` of tail instructions, for the hazard scan
-+    /// (which numbers program points with the same walk).
-+    pub tail_points: FxHashSet<(usize, usize)>,
-+    /// Tail dest value-id -> the head's PROGRAM POINT. The tail's result is
-+    /// physically born at the head (dual-store); liveness intervals for tail
-+    /// dests must start there, or register homes / stack slots could be
-+    /// shared with values living between head and tail.
-+    pub head_point_of_tail: FxHashMap<u32, u32>,
-+}
-+
-+pub(crate) fn compute_i686_divrem_pairs(
-+    func: &IrFunction,
-+    allow_const_rhs: bool,
-+) -> I686DivRemPairs {
-+    let mut pairs = I686DivRemPairs {
-+        tail_dests: FxHashSet::default(),
-+        head_partners: FxHashMap::default(),
-+        tail_points: FxHashSet::default(),
-+        head_point_of_tail: FxHashMap::default(),
-+    };
-+    if std::env::var_os("CCC_NO_IR_DIVREM").is_some() {
-+        return pairs;
-+    }
-+
-+    // Program-point numbering identical to liveness/the hazard scan:
-+    // one point per instruction, one per terminator.
-+    let mut block_start: Vec<u32> = Vec::with_capacity(func.blocks.len());
-+    let mut pt = 0u32;
-+    for block in &func.blocks {
-+        block_start.push(pt);
-+        pt += block.instructions.len() as u32 + 1;
-+    }
-+
-+    let is_gpr32_ty = |ty: &IrType| {
-+        matches!(
-+            ty,
-+            IrType::I8
-+                | IrType::U8
-+                | IrType::I16
-+                | IrType::U16
-+                | IrType::I32
-+                | IrType::U32
-+                | IrType::Ptr
-+        )
-+    };
-+    let div_flavor = |op: IrBinOp| -> Option<bool> {
-+        // Some(true) = quotient (div), Some(false) = remainder, None = not div-like
-+        match op {
-+            IrBinOp::UDiv | IrBinOp::SDiv => Some(true),
-+            IrBinOp::URem | IrBinOp::SRem => Some(false),
-+            _ => None,
-+        }
-+    };
-+    let is_signed = |op: IrBinOp| matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
-+
-+    for (bi, block) in func.blocks.iter().enumerate() {
-+        // Collect this block's div-like instructions.
-+        let mut cands: Vec<(usize, IrBinOp, &Operand, &Operand, bool, u32)> = Vec::new();
-+        for (ii, inst) in block.instructions.iter().enumerate() {
-+            if let Instruction::BinOp {
-+                dest,
-+                op,
-+                ty,
-+                lhs,
-+                rhs,
-+                ..
-+            } = inst
-+            {
-+                if div_flavor(*op).is_some() && is_gpr32_ty(ty) {
-+                    // Constant-RHS divisions only pair when the caller has
-+                    // established the magic path is off (see doc comment).
-+                    let rhs_ok = allow_const_rhs || !matches!(rhs, Operand::Const(_));
-+                    if rhs_ok {
-+                        cands.push((ii, *op, lhs, rhs, is_signed(*op), dest.0));
-+                    }
-+                }
-+            }
-+        }
-+        if cands.len() < 2 {
-+            continue;
-+        }
-+        let mut used = vec![false; cands.len()];
-+        for i in 0..cands.len() {
-+            if used[i] {
-+                continue;
-+            }
-+            let (_, _, lhs_i, rhs_i, signed_i, dest_i) = &cands[i];
-+            // Nearest unused compatible partner ahead in this block.
-+            let mut mate: Option<usize> = None;
-+            for j in (i + 1)..cands.len() {
-+                if used[j] {
-+                    continue;
-+                }
-+                let (_, _, lhs_j, rhs_j, signed_j, _) = &cands[j];
-+                if signed_i == signed_j && lhs_i == lhs_j && rhs_i == rhs_j {
-+                    mate = Some(j);
-+                    break;
-+                }
-+            }
-+            let Some(j) = mate else { continue };
-+            used[i] = true;
-+            used[j] = true;
-+            let (_, op_j, _, _, _, dest_j) = &cands[j];
-+            // Head = i (earlier), tail = j. The partner's result register:
-+            // quotient ops read %eax, remainder ops read %edx.
-+            let partner_from_eax = div_flavor(*op_j) == Some(true);
-+            pairs.head_partners.insert(*dest_i, (*dest_j, partner_from_eax));
-+            pairs.tail_dests.insert(*dest_j);
-+            pairs.tail_points.insert((bi, cands[j].0));
-+            pairs
-+                .head_point_of_tail
-+                .insert(*dest_j, block_start[bi] + cands[i].0 as u32);
-+        }
-+    }
-+    pairs
-+}
-+
-+/// DivRem pair tails are physically born at their HEAD's program point (the
-+/// head's dual-store writes the tail's dest register/slot). Every consumer
-+/// of liveness — register homes, stack-slot sharing, coalescing — must see
-+/// the tail dest live from the head onward, otherwise the home/slot can be
-+/// handed to another value in the head..tail window and silently clobbered.
-+/// This patches both the fat intervals and the hole-aware segments, then
-+/// restores the segments' `(start, value_id)` sort order.
-+fn patch_divrem_tail_intervals(func: &IrFunction, liveness: &mut LivenessResult) {
-+    let pairs = compute_i686_divrem_pairs(func, false);
-+    if pairs.head_point_of_tail.is_empty() {
-+        return;
-+    }
-+    let head_of = &pairs.head_point_of_tail;
-+    for iv in &mut liveness.intervals {
-+        if let Some(&hp) = head_of.get(&iv.value_id) {
-+            if hp < iv.start {
-+                iv.start = hp;
-+            }
-+        }
-+    }
-+    for seg in &mut liveness.segments {
-+        if let Some(&hp) = head_of.get(&seg.value_id) {
-+            if hp < seg.start {
-+                seg.start = hp;
-+            }
-+        }
-+    }
-+    liveness
-+        .segments
-+        .sort_by(|a, b| (a.start, a.value_id).cmp(&(b.start, b.value_id)));
-+}
-+
- fn loop_weight(depth: u32) -> u64 {
-     match depth {
-         0 => 1,
-@@ -699,6 +926,51 @@ fn build_coalesce_groups(
-         root
-     }
  
-+    // Copy-latch webs (phi-elim form): a Copy destination with 2+
-+    // definitions is a phi-elim latch. When the latch Copy{V <- s} sits
-+    // IMMEDIATELY after s's defining instruction, s's def consumed V's old
-+    // incarnation (it reads V) and s dies at the copy — s may share V's
-+    // home, so `flags |= X` lowers to `orl $X, %reg` instead of a
-+    // 3-instruction relay through a second register. Adjacency is the
-+    // soundness anchor: with anything between s's def and the copy, a use
-+    // of V's OLD incarnation could sit inside s's live range.
-+    let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
-+    let mut copy_dests: FxHashSet<u32> = FxHashSet::default();
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            if let Some(dest) = inst.dest() {
-+                *def_count.entry(dest.0).or_insert(0) += 1;
-+            }
-+            if let Instruction::Copy { dest, .. } = inst {
-+                copy_dests.insert(dest.0);
-+            }
-+        }
-+    }
-+    let latch_dests: FxHashSet<u32> = copy_dests
-+        .into_iter()
-+        .filter(|v| def_count.get(v).copied().unwrap_or(0) > 1)
-+        .collect();
-+    let mut latch_same_value: FxHashSet<(u32, u32)> = FxHashSet::default();
-+    if !latch_dests.is_empty() {
-+        for block in &func.blocks {
-+            for w in block.instructions.windows(2) {
-+                if let (prev, Instruction::Copy {
-+                    dest: d,
-+                    src: Operand::Value(s),
-+                }) = (&w[0], &w[1])
-+                {
-+                    if latch_dests.contains(&d.0) {
-+                        if let Some(pd) = prev.dest() {
-+                            if pd.0 == s.0 {
-+                                latch_same_value.insert((d.0, s.0));
-+                            }
-+                        }
-+                    }
-+                }
-+            }
-+        }
-+    }
+ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
++    argv = list(sys.argv[1:] if argv is None else argv)
++    # Dash-leading flag values ("--local-flags -O3", "--flags -O3 ...") are
++    # rejected by argparse as options; join them exactly like godbolt.py.
++    argv = godbolt.join_dash_values(argv)
+     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+     parser.add_argument("sources", nargs="+", type=Path)
+     parser.add_argument("--function", action="append", default=[], help="function to isolate; repeatable")
+diff --git a/scripts/godbolt.py b/scripts/godbolt.py
+index b25a315c..bbe04f4f 100644
+--- a/scripts/godbolt.py
++++ b/scripts/godbolt.py
+@@ -391,13 +391,48 @@ def build_parser() -> argparse.ArgumentParser:
+     return parser
+ 
+ 
++DASH_VALUE_OPTIONS = {"--flags", "--local-flags"}
 +
-     for block in &func.blocks {
-         for inst in &block.instructions {
-             if let Instruction::Copy {
-@@ -731,7 +1003,12 @@ fn build_coalesce_groups(
-                     // edge may overlap and still share one home — exactly the
-                     // no-op-cast relaxation. This collapses switch-state and
-                     // loop-carried webs onto a single register/slot.
--                    if phi_operands.contains(&d) || phi_dests.contains(&s) {
-+                    // Adjacent copy-latch edges are the same story in the
-+                    // phi-elim form (see latch_same_value above).
-+                    if phi_operands.contains(&d)
-+                        || phi_dests.contains(&s)
-+                        || latch_same_value.contains(&(d, s))
-+                    {
-                         same_value_edges.insert((d, s));
-                     }
++
++def join_dash_values(argv: list[str]) -> list[str]:
++    """Join ``--flags -O3`` → ``--flags=-O3`` so dash-leading flag values parse.
++
++    argparse treats a token beginning with ``-`` as an option, so the natural
++    spelling ``godbolt.py compile gcc16.2 f.c --flags -O3`` dies with
++    ``argument --flags: expected one argument``.  ``--flags=-O3`` works, but
++    the spaced form is what every docstring and example in this repo shows,
++    so the CLI must accept it.  Only the known value options are rewritten;
++    ``--flags -O3 --function f`` must not swallow ``--function``.
++    """
++    out: list[str] = []
++    i = 0
++    while i < len(argv):
++        token = argv[i]
++        if token in DASH_VALUE_OPTIONS:
++            # A value that starts with '-' is still a value if it is a
++            # single-dash token (-O3, -march=...): this CLI has no single-dash
++            # options other than -h, which never follows --flags.  Joining
++            # makes both "--flags -O3" and "--flags=-O3" work.
++            nxt = argv[i + 1] if i + 1 < len(argv) else None
++            if nxt is not None and (not nxt.startswith("-") or re.match(r"^-[^-]", nxt)):
++                out.append(f"{token}={nxt}")
++                i += 2
++                continue
++            out.append(token)  # let argparse report the missing value
++            i += 1
++            continue
++        out.append(token)
++        i += 1
++    return out
++
++
+ def main(argv: list[str] | None = None) -> int:
+     argv = list(sys.argv[1:] if argv is None else argv)
+     # Backward-compatible spelling: godbolt.py <compiler-id> <source> ...
+     if argv and argv[0] not in {"list", "compile", "compare", "-h", "--help"}:
+         argv.insert(0, "compile")
+     parser = build_parser()
+-    args = parser.parse_args(argv)
++    args = parser.parse_args(join_dash_values(argv))
+     if not hasattr(args, "func"):
+         parser.print_help(sys.stderr)
+         return 2
+diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+index 25426bcd..9283dc29 100644
+--- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
++++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+@@ -1946,10 +1946,27 @@ pub(super) fn fold_accumulator_alu_store(store: &mut LineStore, infos: &mut [Lin
+         // until it is overwritten. The transform does `OP mem, %REGd`, which
+         // DESTROYS %REGd; if %REGd is read before being overwritten (or is live
+         // on another edge at a barrier), the transform is unsound.
++        //
++        // ms178 (session 32): the old scan had TWO soundness holes that
++        // miscompiled HUF_readDTableX2_wksp -O2 (kernel zstd):
++        //   1. It was limited to a 16-instruction window (`n < j + 16`). A
++        //      register whose next use lay beyond the window (e.g. a value
++        //      homed in %r13 whose live range continues into a loop whose
++        //      header is >16 instructions away) was treated as dead, the fold
++        //      fired, and the loop read the clobbered register — nbBits became
++        //      scaleLog (12-11=1) and HUF_fillDTableX2ForWeight overflowed the
++        //      DTable with length=1<<11.
++        //   2. In the fallback arm, an instruction that merely REFERENCES the
++        //      source register (`tn.contains(src_reg32)`) was treated as
++        //      benign and skipped. A reference is a READ: the fold destroys
++        //      the value, so any read before the next overwrite is fatal.
++        //   The scan must therefore run to the next barrier (labels/branches
++        //   delimit the region where liveness can be proven block-locally) and
++        //   treat ANY reference that is not a recognized overwrite as a use.
+         let src_bit = 1u16 << src_family;
+         let mut n = j + 1;
+         let mut src_safe = true;
+-        while n < len && n < j + 16 {
++        while n < len {
+             if infos[n].is_nop() {
+                 n += 1;
+                 continue;
+@@ -1970,11 +1987,9 @@ pub(super) fn fold_accumulator_alu_store(store: &mut LineStore, infos: &mut [Lin
+                 LineKind::LoadRbp { reg, .. } if reg == src_family => break,
+                 LineKind::Other { dest_reg } if dest_reg == src_family => break,
+                 _ => {
+-                    let tn = infos[n].trimmed(store.get(n));
+-                    if tn.contains(&*src_reg32) {
+-                        n += 1;
+-                        continue;
+-                    }
++                    // Any other reference to the source family is a READ of
++                    // the value the fold is about to destroy (or an
++                    // unrecognized write form): not provably safe.
+                     src_safe = false;
+                     break;
                  }
-@@ -780,11 +1057,25 @@ fn build_coalesce_groups(
-                     && load_def_types.get(&v.0).map(|&(ty, _)| ty) == Some(*from_ty)
-                     && load_uses >= 2;
-                 let (d, s) = (dest.0, v.0);
-+                // ParamRef sources: the loop-carried-Copy rationale (the
-+                // param's ABI home dies at a redefining Copy while the loop
-+                // copy wants its own register) does NOT apply to a no-op
-+                // same-width cast — the cast is a pure value-preserving view
-+                // of an UNCHANGED parameter, so sharing the param's home is
-+                // exactly the intended shape (number()'s `(u32)base` reading
-+                // %edi directly at both div sites). Keep the exclusion for
-+                // the sub-word widen case: there the source is a load whose
-+                // register economics the ParamRef guard was protecting.
-+                let src_ok = if noop32 {
-+                    true
-+                } else {
-+                    !param_ref_values.contains(&s)
-+                };
-                 if (noop32 || widen_from_load)
-                     && d != s
-                     && eligible.contains(&d)
-                     && eligible.contains(&s)
--                    && !param_ref_values.contains(&s)
-+                    && src_ok
-                 {
-                     parent.entry(d).or_insert(d);
-                     parent.entry(s).or_insert(s);
-@@ -918,6 +1209,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
- 
-     let is_32bit = crate::common::types::target_is_32bit();
-     let mut liveness = compute_live_intervals(func);
-+    // DivRem pair tails are physically born at their head's dual-store;
-+    // extend their intervals before ANY interval map is derived. Without
-+    // this, homes/slots in the head..tail window get double-assigned.
-+    patch_divrem_tail_intervals(func, &mut liveness);
-     // Extend live intervals for backend-folded index consumers BEFORE any
-     // interval map is derived (see RegAllocConfig::folded_index_uses).
-     if !config.folded_index_uses.is_empty() && !env_on("CCC_NO_FOLDED_INDEX_LIVENESS") {
-@@ -1378,7 +1673,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                     .iter()
-                     .copied()
-                     .filter(|iv| base_ok(&assignments, iv))
--                    .filter(|iv| !overlaps_inclusive(iv, reg_hazards))
-+                    .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
-                     .collect();
-                 if env_on("CCC_DEBUG_RA_INTERVALS") {
-                     let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
-@@ -1692,7 +1987,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                             && (x86_ordered_param_copies
-                                 || !param_restricted.contains(&iv.value_id))
-                     })
--                    .filter(|iv| !overlaps_inclusive(iv, reg_hazards))
-+                    .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
-                     .filter(|iv| {
-                         !holders
-                             .iter()
-@@ -4018,6 +4313,12 @@ fn collect_i686_scratch_hazard_points(
-     let mut edx: Vec<u32> = Vec::new();
-     let mut point: u32 = 0;
- 
-+    // Same-block div/rem pair tails emit no code (the head stored both
-+    // results); see compute_i686_divrem_pairs for the soundness model.
-+    // Conservative constant-RHS rule keeps the RA model a subset of what the
-+    // emitter will actually fuse.
-+    let divrem_pairs = compute_i686_divrem_pairs(func, false);
-+
-     // Allocas with alignment ≤ 16 resolve to SlotAddr::Direct.
-     // Mirrors slot_assignment.rs: alloca_alignments only records > 16.
-     let mut direct_allocas: FxHashSet<u32> = FxHashSet::default();
-@@ -4053,9 +4354,25 @@ fn collect_i686_scratch_hazard_points(
-         ) || matches!(op, Operand::Const(IrConst::I64(v)) if *v >= i32::MIN as i64 && *v <= i32::MAX as i64)
-     };
- 
--    for block in &func.blocks {
--        for inst in &block.instructions {
-+    for (bi, block) in func.blocks.iter().enumerate() {
-+        for (ii, inst) in block.instructions.iter().enumerate() {
-+            // Fused same-block div/rem pairs: the TAIL instruction emits
-+            // nothing (its result was stored by the head's dual-store
-+            // emission earlier in the block), so it is a hazard for neither
-+            // %ecx nor %edx. Conservative constant rule: only non-constant
-+            // RHS pairs — those can never fall back to the magic-number
-+            // path that would break the fusion.
-+            let divrem_tail = divrem_pairs.tail_points.contains(&(bi, ii));
-             let (ecx_clean, edx_clean) = match inst {
-+                Instruction::BinOp { op, ty, rhs, .. }
-+                    if is_gpr32(ty) && divrem_tail
-+                        && matches!(
-+                            op,
-+                            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
-+                        ) =>
-+                {
-+                    (true, true)
-+                }
-                 Instruction::BinOp { op, ty, rhs, .. } if is_gpr32(ty) => match op {
-                     IrBinOp::Add
-                     | IrBinOp::Sub
-diff --git a/updates/followup_2026-08-28_session07.md b/updates/followup_2026-08-28_session07.md
-new file mode 100644
-index 00000000..f8096526
---- /dev/null
-+++ b/updates/followup_2026-08-28_session07.md
-@@ -0,0 +1,114 @@
-+# LCCC Follow-up / Kontinuität — Session 88 (2026-08-28, v3 round)
-+
-+**Scope:** v3 codegen round on the rebased main (PR #268 merged upstream);
-+four validated optimization families; 32 KiB boot gate wired as CI gate.
-+
-+**Base:** `origin/main @ a96c684b` (fast-forward rebase — session-87 content
-+already upstream, `git rebase` dropped all three local commits as duplicates)
-+**Session commits:** `a680cefe`, `dc3c49a8`, `36db4f08`
-+**Deliverable:** ms178-1.patch (v3) — 44,862 B, APPLIES-CLEAN on a fresh
-+clone of `a96c684b`, zero garbage (env-gated traces follow the
-+CCC_DEBUG_HAZARDS/CCC_DEBUG_RA house convention).
-+
-+---
-+
-+## 1. What v3 contains (each individually measured on the corpus)
-+
-+| # | change | where | corpus Δ.text |
-+|---|---|---|---:|
-+| 1 | direct div divisor from register home (incl. reg-homed allocas) | i686 alu.rs / emit.rs | −3 |
-+| 2 | **IR-level div/rem pair fusion** (one divl serves URem+UDiv) | regalloc.rs + alu.rs + prologue.rs | (part of −79) |
-+| 3 | birth-skip in the scratch-hazard filters (value spans own def) | regalloc.rs | (part of −79) |
-+| 4 | peephole: single-operand pure-source rewrites (divl/push/jmp*) | peephole.rs | (part of −79) |
-+| 5 | zext-RHS i64 fast paths (parser `res = res*base + val`) | i128_ops.rs + prologue.rs | −12 |
-+| 6 | no-op-cast coalescing from ParamRef sources | regalloc.rs build_coalesce_groups | ±0 (enabler) |
-+| 7 | **adjacent copy-latch web coalescing** (`flags |= X` → `orl $X,%reg`) | regalloc.rs build_coalesce_groups | −77 |
-+| 8 | boot-gate CI wiring (pre-pecompat ≤ 24,576) | run_regression_suite.sh | — |
-+| | **total** | 24,240 → **24,070** | **−170** |
-+
-+## 2. The div/rem pair fusion (read this before touching it)
-+
-+`compute_i686_divrem_pairs(func, allow_const_rhs)` — deterministic same-block
-+analysis shared by emitter and RA (both derive from the same IR, the two
-+views cannot disagree). A pair is a URem/UDiv (SRem/SDiv) couple with
-+IDENTICAL operands; the HEAD emits one divl and dual-stores both results, the
-+TAIL emits nothing. THREE soundness traps were found by the death-signal
-+torture (11 cases × 20k rounds; fusing on/off; GCC reference):
-+
-+1. **Tail liveness**: the tail's dest is physically born at the HEAD's
-+   dual-store. `patch_divrem_tail_intervals` extends tail-dest liveness to
-+   the head point BEFORE any interval map is derived — otherwise homes/slots
-+   in the head..tail window get double-assigned (torture cases 2/5/9/10).
-+2. **Store order**: the two results live in %eax/%edx until stored. Storing
-+   the %eax side into a %edx home destroys the remainder first. Home-aware
-+   ordering + pair-BREAKING for the deadlock combos (quo@%edx ∧ rem@%eax;
-+   slotless-vs-clobber). Broken pairs emit two standalone divisions.
-+3. **Acc-flow slotless dests**: immediately-consumed values have no home and
-+   no slot; their consumer reads %eax directly. A slotless pair side must be
-+   materialised into %eax with a cache entry; the accumulator analysis
-+   excludes pair tails outright.
-+
-+Kill switches: `CCC_NO_IR_DIVREM` (table), `CCC_DEBUG_DIVREM` (trace).
-+
-+## 3. The copy-latch web coalescing (the vsprintf flag parser)
-+
-+The frontend lowers C `flags |= X` state loops WITHOUT Phi instructions —
-+the loop-carried variable is a Copy destination with 2+ definitions (the
-+phi-elim latch form). The phi-congruence machinery only looked at real Phi
-+instructions, so every `flags |= X` arm paid a 3-instruction relay
-+(`movl %ebp,%edx; orl $4,%edx; movl %edx,%ebp`) while GCC emits
-+`orl $4,%ebp`. The fix treats latch Copies whose source is defined by the
-+IMMEDIATELY preceding instruction as same-value edges. **Adjacency is the
-+soundness anchor**: with anything between the source's def and the copy, a
-+use of the OLD incarnation could sit inside the source's live range.
-+vsprintf's five flag arms are now the 1-instruction form.
-+
-+## 4. Boot-gate CI (the e12597c7 lesson, mechanized)
-+
-+`run_regression_suite.sh` now runs `build_kernel_boot.sh` when `KERNEL_DIR`
-+is prepared and fails on pre-pecompat content end > 24,576. The script's
-+non-zero exit on a gate FAIL is a measurement, not an error (parsed either
-+way). Without KERNEL_DIR: honest SKIP. The gate is RED until the .text
-+budget (≤ 23,380) is met — that is its job.
-+
-+## 5. Validation
-+
-+* divrem torture: 11 cases × 20k rounds (fusion on/off + GCC ref) — green
-+* zext torture: 11 cases × 50k rounds (fast/fallback/GCC ref) — green
-+* i64 torture: 20k rounds × 27 ops (session-87 harness) — green
-+* regression suite 467/0, AB-diff 0 · cargo --lib 1205/0/6
-+* corpus .text reproduced exactly from the deliverable tree
-+
-+## 6. Environment notes
-+
-+Unchanged from session 87 (same sandbox class). Torture binaries are
-+freestanding `-nostdlib -static` (32-bit syscalls blocked by seccomp — the
-+death-signal verdict: int3=pass, ud2/SIGSEGV=fail-at-case). The torture
-+sources live in `/home/z/kernel-work/torture/` (divrem_torture.c,
-+zext_torture.c) — candidates for tests/ in a future round.
-+
-+## 7. Next-session entry points (priority order)
-+
-+1. **P0 — i64 mul-accumulate chain fusion**: `res = res*base + val` still
-+   round-trips the product through slots (4 mem ops/iteration) and stages
-+   the zext casts (3 dead store insns for the never-read high halves).
-+   GCC's 9-insn shape is documented in §analysis; needs virtual zext casts
-+   (never-materialized) + source-liveness extension (folded_index_uses
-+   pattern) + a mul→add chain table mirroring the divrem design.
-+   string.c: kstrtoull +154, simple_strtoull +80 vs GCC.
-+2. **P0 — RA Phase 2h (iterated hazard refinement)**: div points are
-+   %ecx-clean when the divisor is register-homed (∉ edx/eax); folded
-+   index-chain GEPs (base=GlobalAddr, offset unhomed) are clean for %edx —
-+   two fixpoint iterations after Phase 2g would let the number() digit loop
-+   claim %edx for the remainder and fire the indexed load
-+   (`movsbl digits(,%edx),%eax` — −5 insns/iteration).
-+3. **P1 — video.c family** (+363/+224/+169/+160/+114): systematic ~1.5×
-+   excess, not yet analyzed in depth; likely state-machine + RA pressure.
-+4. **P1 — value-width map** for Copy/phi dests (byte slots, movb immediates).
-+5. **P2 — vsprintf body** (+443 excess remains after the flag-loop fix).
-+
-+## 8. Snapshot ledger
-+
-+`S02-v3-s88-codegen` — base `a96c684b`, head `36db4f08`, deliverable
-+APPLIES-CLEAN. Artifacts: /home/z/my-project/lccc-artifacts (+ PolarFS
-+mirror recommended before handoff).
