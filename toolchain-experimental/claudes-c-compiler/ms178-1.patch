@@ -1,2329 +1,963 @@
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index eddf17b..b238675 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -777,6 +777,87 @@ pub(crate) fn collect_gep_fold_base_links(func: &IrFunction) -> FxHashMap<u32, V
-     out
- }
- 
-+/// Dest values of INDEXED-fold GEPs (the `base + index*scale` SIB shape),
-+/// plus their GlobalAddr BASES. The GEP dests are single-use address
-+/// temporaries: when the fold fires (the index holds a register), the GEP
-+/// emits NOTHING; when it does not, the fallback materialises through
-+/// %eax/%ecx staging and a slot is exactly as good as a register. The
-+/// GlobalAddr bases are the same steal-risk class with a sharper failure
-+/// mode: vsprintf number()'s digit table homed `digits` in %edx
-+/// [def..access] — that 2-point holder blocked the loop-carried remainder
-+/// (born in %edx at the fused div, [div..access]) from the register, the
-+/// load then unfolded to the 4-instruction `digits+r` materialisation, and
-+/// the fold's sym form never fired. Denied %edx/%ecx, the base either
-+/// takes a callee-saved home (reg-base SIB, still a single-instruction
-+/// load) or none at all (sym form `sym(,%idx,scale)`, base skipped as a
-+/// dead GlobalAddr) — both leave the caller-saved pool to the index.
-+pub(crate) fn collect_i686_scratch_denials(func: &IrFunction) -> FxHashSet<u32> {
-+    let use_counts = count_value_uses(func);
-+    let stab = analyze_base_stability(func);
-+    let m = build_indexed_gep_map(func, &use_counts, &stab);
-+    let mut out: FxHashSet<u32> = m.keys().copied().collect();
-+    let mut global_addrs: FxHashSet<u32> = FxHashSet::default();
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            if let Instruction::GlobalAddr { dest, .. } = inst {
-+                global_addrs.insert(dest.0);
-+            }
-+        }
-+    }
-+    for info in m.values() {
-+        if global_addrs.contains(&info.base.0) {
-+            out.insert(info.base.0);
-+        }
-+    }
-+    // LOAD dests consuming indexed GEPs: their %edx/%ecx homes are worthless
-+    // (the access is a single instruction and the value flows through the
-+    // accumulator either way), while an %edx home at the access point is a
-+    // PRIORITY INVERSION — it both creates an edx hazard at the load (the
-+    // store-to-home write) and occupies the register the SIB INDEX needs.
-+    // vsprintf number()'s digit loop measured exactly this: the digit-char
-+    // dest took %edx in Phase 2 (loads were never edx hazards there), which
-+    // blocked the loop-carried remainder (born at the fused div, the load's
-+    // natural SIB index) from %edx in every later phase — the load unfolded
-+    // to base+addl staging and the digits GlobalAddr rematerialised inside
-+    // the loop. Store VALUES are deliberately NOT denied: a register home is
-+    // read directly by direct_store_src (`movl %edx, mem`), which is a win.
-+    // Denied values keep every other home path (callee-saved Phases 1/2c/2f,
-+    // %eax Phase 2e).
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            if let Instruction::Load { ptr, dest, .. } = inst {
-+                if m.contains_key(&ptr.0) {
-+                    out.insert(dest.0);
-+                }
-+            }
-+        }
-+    }
-+    // DIV QUOTIENT dests: a quotient is BORN in %eax (divl/idivl write the
-+    // quotient to eax, the remainder to edx) — an %edx home is a
-+    // wrong-birth-register home requiring a pointless `movl %eax,%edx`, and
-+    // it occupies %edx across the div point exactly where the REMAINDER (the
-+    // value actually born in %edx) and the div-adjacent index chains need it.
-+    // number()'s digit loop: the quotient's [div..cast] %edx interval
-+    // fragmented the register across the remainder->GEP-index chain
-+    // [div..load], blocking the SIB fold. The quotient keeps %eax (Phase 2e,
-+    // its birth register) and callee-saved homes — GCC's shape (`movl %eax,
-+    // %ebp` after the div). Remainder dests are deliberately NOT denied:
-+    // %edx is THEIR birth register.
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            if let Instruction::BinOp {
-+                dest,
-+                op: IrBinOp::UDiv | IrBinOp::SDiv,
-+                ..
-+            } = inst
-+            {
-+                out.insert(dest.0);
-+            }
-+        }
-+    }
-+    out
-+}
-+
- /// Union of the per-kind folded-GEP consumption links (index + base) for
- /// backends that fold BOTH forms. Each backend must pass exactly the links
- /// for the forms its emitter actually consumes at the access position;
-@@ -2496,7 +2577,8 @@ fn detect_mul_add_fusions(
-         };
-         if (mul_ty.is_float() && !fuse_float)
-             || matches!(mul_ty, IrType::F128 | IrType::I128 | IrType::U128)
--            || (crate::common::types::target_is_32bit() && matches!(mul_ty, IrType::I64 | IrType::U64))
-+            || (crate::common::types::target_is_32bit()
-+                && matches!(mul_ty, IrType::I64 | IrType::U64))
-         {
-             continue;
-         }
-@@ -3132,10 +3214,8 @@ fn emit_functions_and_sections(
-             emit_switch_to_section(cg, &sect);
-             if let Some(&alignment) = module.function_alignments.get(&func.name) {
-                 if alignment > 1 && alignment.is_power_of_two() {
--                    cg.state().emit_fmt(format_args!(
--                        ".p2align {}",
--                        alignment.trailing_zeros()
--                    ));
-+                    cg.state()
-+                        .emit_fmt(format_args!(".p2align {}", alignment.trailing_zeros()));
-                 }
-             }
-             generate_function(cg, func, source_mgr, file_table);
-@@ -3424,7 +3504,8 @@ fn generate_function(
-                     let ptr_align = crate::common::types::target_ptr_size();
-                     let ptr_dir = cg.ptr_directive();
-                     cg.state().emit_fmt(format_args!(".align {}", ptr_align));
--                    cg.state().emit_fmt(format_args!("{} {}", ptr_dir.as_str(), lbl));
-+                    cg.state()
-+                        .emit_fmt(format_args!("{} {}", ptr_dir.as_str(), lbl));
-                     emit_switch_to_section(cg, &func_sect);
-                 }
-                 if mc.nop {
-@@ -3451,8 +3532,8 @@ fn generate_function(
-                     // the parent PC through the frame; GCC measures to the
-                     // same shape and rejects -pg with -fomit-frame-pointer.
-                     // The label is emitted at the site only when recording.
--                    cg.state().pending_classic_mcount_label =
--                        mcount_label.or_else(|| Some(format!(".LMC{}", cg.state().next_label_id())));
-+                    cg.state().pending_classic_mcount_label = mcount_label
-+                        .or_else(|| Some(format!(".LMC{}", cg.state().next_label_id())));
-                 }
-             } else if !cg.state().mcount_unsupported_warned {
-                 cg.state().mcount_unsupported_warned = true;
-@@ -3739,6 +3820,63 @@ fn generate_function(
-                 foldable_folds.insert(*dest);
-             }
-         }
-+        // Indexed-fold GlobalAddr BASES: a symbol whose EVERY use is the
-+        // base of a guaranteed-folded indexed GEP never materializes — the
-+        // SIB memory operand embeds the symbol directly (sym(,%idx,scale)).
-+        // Without this, vsprintf number()'s digit table kept a dead
-+        // `movl $digits, slot` inside the loop after the load folded.
-+        // Guard: ALL of the base's uses must be bases of foldable folds
-+        // (use-count equality; a base shared with any other consumer — a
-+        // direct Load, an unfolded GEP, a Store value — still materializes).
-+        // Store-fed folds keep their base: the value-staging fallback
-+        // (`rematerialize_skipped_indexed`) may re-emit the GEP and read it.
-+        {
-+            let mut folded_base_uses: FxHashMap<u32, u32> = FxHashMap::default();
-+            for dest in &foldable_folds {
-+                if let Some(info) = indexed_gep_map.get(dest) {
-+                    if global_addr_map.contains_key(&info.base.0) {
-+                        *folded_base_uses.entry(info.base.0).or_insert(0) += 1;
-+                    }
-+                }
-+            }
-+            let mut has_store_consumer0: FxHashSet<u32> = FxHashSet::default();
-+            for block in &func.blocks {
-+                for inst in &block.instructions {
-+                    if let Instruction::Store { ptr, .. } = inst {
-+                        if foldable_folds.contains(&ptr.0) {
-+                            if let Some(info) = indexed_gep_map.get(&ptr.0) {
-+                                has_store_consumer0.insert(info.base.0);
-+                            }
-+                        }
-+                    }
-+                }
-+            }
-+            for (base, folded_uses) in folded_base_uses {
-+                let total = value_use_counts[base as usize];
-+                if total != folded_uses || has_store_consumer0.contains(&base) {
-+                    continue;
-+                }
-+                // SYM-FORM GUARANTEE: the materialisation may be skipped
-+                // only when the base value has NO register home. A homed
-+                // base makes `can_indexed_addr_fold` fold via the
-+                // REGISTER-base arm, and the emitter's first dispatch
-+                // (`emit_load_indexed`) then consumes the base register in
-+                // the SIB operand — a register the skipped `leaq/movl`
-+                // would have written (narrow_compare_constant_semantics:
-+                // `movzwl (%rbx,%r14,2)` read a never-written %rbx). An
-+                // UNHOMED base cannot take the register form (GlobalAddrs
-+                // are not allocas, so the frame-SIB arm refuses too), and
-+                // the fold only became foldable through the symbol arm —
-+                // which had already verified `supports_indexed_sym_base`,
-+                // `rip_rel_blocked` (the emitter's GOT verdict agrees, see
-+                // emit_load_indexed_sym_impl) and a register-resident
-+                // index. The symbol form therefore cannot refuse, and it
-+                // never reads the base's (now never-written) slot.
-+                if cg.get_phys_reg_for_value(base).is_none() {
-+                    dead_global_addrs.insert(base);
-+                }
-+            }
-+        }
-         let mut has_store_consumer: FxHashSet<u32> = FxHashSet::default();
-         for block in &func.blocks {
-             for inst in &block.instructions {
-diff --git a/src/backend/i686/codegen/casts.rs b/src/backend/i686/codegen/casts.rs
-index 15563dd..97475e1 100644
---- a/src/backend/i686/codegen/casts.rs
-+++ b/src/backend/i686/codegen/casts.rs
-@@ -187,6 +187,16 @@ impl I686Codegen {
-                         | (IrType::U64, IrType::U64)
-                 ) =>
-             {
-+                // DEAD no-op of a FUSED mul-acc chain (single-use dest whose
-+                // only reader — the chain — emitted nothing): suppress the
-+                // slot-pair copy. Never reached for rejected chains, whose
-+                // no-ops must still materialise for the standalone tail.
-+                if self.mulacc_virtual_casts.contains(&dest.0) {
-+                    if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-+                        eprintln!("[MULACC] virtual no-op cast dest={} (emits nothing)", dest.0);
-+                    }
-+                    return;
-+                }
-                 self.emit_load_acc_pair(src);
-                 self.emit_store_acc_pair(dest);
-                 self.state.reg_cache.invalidate_all();
-@@ -194,6 +204,18 @@ impl I686Codegen {
- 
-             // --- Widening casts to I64/U64 need full 8-byte store ---
-             CastKind::IntWiden { .. } if matches!(to_ty, IrType::I64 | IrType::U64) => {
-+                // VIRTUAL feeder of a fused mul-acc chain: the zext emits
-+                // NOTHING — its high half is provably zero and the fused
-+                // chain head references the 32-bit source directly (see
-+                // resolve_mulacc_plans; mulacc_virtual_casts is populated
-+                // only for single-use feeds of FUSED chains, so the cast's
-+                // dest has no other reader).
-+                if self.mulacc_virtual_casts.contains(&dest.0) {
-+                    if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-+                        eprintln!("[MULACC] virtual widening feeder dest={} (emits nothing)", dest.0);
-+                    }
-+                    return;
-+                }
-                 self.operand_to_eax(src);
-                 self.emit_cast_instrs_impl(from_ty, to_ty);
-                 // Set high half: sign-extend for signed sources, zero-extend for unsigned
-diff --git a/src/backend/i686/codegen/emit.rs b/src/backend/i686/codegen/emit.rs
-index b113a4d..ed0f5f6 100644
---- a/src/backend/i686/codegen/emit.rs
-+++ b/src/backend/i686/codegen/emit.rs
-@@ -24,6 +24,8 @@ use crate::ir::reexports::{
-     IrUnaryOp, Operand, Value,
- };
- 
-+use super::i128_ops::MulAccPlan;
-+
- /// i686 code generator. Implements the ArchCodegen trait for the shared framework.
- /// Uses cdecl calling convention with no register allocation (accumulator-based).
- pub struct I686Codegen {
-@@ -84,6 +86,18 @@ pub struct I686Codegen {
-     /// emit_divrem_pair_head): the tail must emit its own standalone
-     /// division even though the table lists it as a tail.
-     pub(super) divrem_broken_tails: FxHashSet<u32>,
-+    /// Resolved mul-accumulate chain plans (see backend::regalloc::
-+    /// compute_i686_mulacc_chains). Only FUSED chains are listed; each plan
-+    /// carries the resolved operand references for the fused head emission.
-+    pub(super) mulacc_plans: Vec<MulAccPlan>,
-+    /// head (Mul) dest value-id -> index into mulacc_plans.
-+    pub(super) mulacc_head_of: FxHashMap<u32, usize>,
-+    /// FUSED tail (Add) dest value-ids — emit nothing (the head stored the
-+    /// fused result).
-+    pub(super) mulacc_fused_tails: FxHashSet<u32>,
-+    /// ZExt cast dests that are VIRTUAL feeders of a fused chain: the cast
-+    /// emits nothing; the fused head references the 32-bit source directly.
-+    pub(super) mulacc_virtual_casts: FxHashSet<u32>,
-     /// Wide values whose IR definition is a ZERO-EXTENDING cast from a
-     /// 32-bit-or-smaller unsigned type (u32→u64, u8→u64, …): the high half
-     /// is provably zero, so 64-bit multiply/add with them drops the alo×bhi
-@@ -160,6 +174,10 @@ impl I686Codegen {
-             divrem_tail_dests: FxHashSet::default(),
-             divrem_head_partners: FxHashMap::default(),
-             divrem_broken_tails: FxHashSet::default(),
-+            mulacc_plans: Vec::new(),
-+            mulacc_head_of: FxHashMap::default(),
-+            mulacc_fused_tails: FxHashSet::default(),
-+            mulacc_virtual_casts: FxHashSet::default(),
-             zext_wide_values: FxHashSet::default(),
-             used_callee_saved: Vec::new(),
-             va_named_stack_bytes: 0,
-@@ -287,9 +305,7 @@ impl I686Codegen {
-     /// operand_to_eax(lhs) moments before) are excluded; those home shapes
-     /// stage through %ecx exactly as before.
-     pub(super) fn div_rhs_direct_ref(&self, v: &Value) -> Option<String> {
--        if self.state.wide_values.contains(&v.0)
--            || self.state.f128_direct_slots.contains(&v.0)
--        {
-+        if self.state.wide_values.contains(&v.0) || self.state.f128_direct_slots.contains(&v.0) {
-             return None;
-         }
-         if let Some(&phys) = self.reg_assignments.get(&v.0) {
-@@ -1724,6 +1740,26 @@ impl ArchCodegen for I686Codegen {
-     /// Override emit_binop to route I64/U64 through register-pair (eax:edx) arithmetic.
-     fn emit_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-         if matches!(ty, IrType::I64 | IrType::U64) {
-+            // Fused mul-acc chain HEAD (the Mul): the whole res*base+val
-+            // expression emits here; the tail Add and the virtual feeder
-+            // zexts emit nothing (compute_i686_mulacc_chains soundness model).
-+            if op == IrBinOp::Mul {
-+                if let Some(&pi) = self.mulacc_head_of.get(&dest.0) {
-+                    if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-+                        eprintln!("[MULACC] head-emit dest={} plan={}", dest.0, pi);
-+                    }
-+                    self.emit_mulacc_chain_head(pi);
-+                    return;
-+                }
-+            }
-+            // Fused mul-acc chain TAIL (the Add): nothing to emit — the
-+            // fused head stored the result at the Mul's program point.
-+            if op == IrBinOp::Add && self.mulacc_fused_tails.contains(&dest.0) {
-+                if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-+                    eprintln!("[MULACC] tail-skip dest={}", dest.0);
-+                }
-+                return;
-+            }
-             if self.try_emit_i64_binop_fast(dest, op, lhs, rhs) {
-                 return;
-             }
-@@ -1993,7 +2029,11 @@ impl ArchCodegen for I686Codegen {
-     fn callee_pops_bytes_for_sret(&self, is_sret: bool) -> usize {
-         // Under -mregparm>=1 the sret pointer is passed in %eax, not pushed,
-         // so the callee's plain `ret` pops nothing (mirrors emit_epilogue).
--        if is_sret && self.regparm == 0 { 4 } else { 0 }
-+        if is_sret && self.regparm == 0 {
-+            4
-+        } else {
-+            0
-+        }
-     }
- 
-     // ---- Control flow ----
-@@ -2321,9 +2361,7 @@ impl ArchCodegen for I686Codegen {
-             // destination; the range fallback preserves standalone constants
-             // that genuinely cannot fit one 32-bit word.
-             Operand::Const(IrConst::I64(v)) => {
--                self.state.is_wide_value(dest.0)
--                    || *v < i32::MIN as i64
--                    || *v > u32::MAX as i64
-+                self.state.is_wide_value(dest.0) || *v < i32::MIN as i64 || *v > u32::MAX as i64
-             }
-             _ => false,
-         };
-@@ -2376,9 +2414,7 @@ impl ArchCodegen for I686Codegen {
-         // Wide dests are excluded: store_eax_to zero-fills their upper word,
-         // which this single 4-byte store must not skip.
-         if let Operand::Const(_) = src {
--            if !self.reg_assignments.contains_key(&dest.0)
--                && !self.state.is_wide_value(dest.0)
--            {
-+            if !self.reg_assignments.contains_key(&dest.0) && !self.state.is_wide_value(dest.0) {
-                 if let Some(slot) = self.state.get_slot(dest.0) {
-                     // Reuse the store path's immediate formatter so accepted
-                     // constant kinds and width masking stay in one place.
-@@ -2780,7 +2816,7 @@ impl I686Codegen {
-         s.emit("    shrl %eax");
-         s.emit("    shrl %cl, %eax"); // q = qs >> (1+i)
-         s.emit("    movl %eax, %edi"); // edi = q
--        // Verify: compute a - q*b, adjust if negative
-+                                       // Verify: compute a - q*b, adjust if negative
-         s.emit("    mull 20(%esp)"); // edx:eax = q * B_lo
-         s.emit("    movl 12(%esp), %ebx");
-         s.emit("    movl 16(%esp), %ecx"); // ecx:ebx = a
-@@ -2909,7 +2945,7 @@ impl I686Codegen {
-         s.emit("    xorl %ecx, %edi"); // edi = sign of result (bit 31)
-         s.emit("    movl 16(%esp), %eax"); // A_lo
-         s.emit("    movl 24(%esp), %ebx"); // B_lo
--        // Negate A if negative
-+                                           // Negate A if negative
-         s.emit("    testl %edx, %edx");
-         s.emit("    jns .Ldiv_a_pos");
-         s.emit("    negl %eax");
-@@ -2963,7 +2999,7 @@ impl I686Codegen {
-         s.emit("    movl %edx, %edi"); // save A_hi sign (remainder sign = dividend sign)
-         s.emit("    movl 16(%esp), %eax"); // A_lo
-         s.emit("    movl 24(%esp), %ebx"); // B_lo
--        // Negate A if negative
-+                                           // Negate A if negative
-         s.emit("    testl %edx, %edx");
-         s.emit("    jns .Lmod_a_pos");
-         s.emit("    negl %eax");
-diff --git a/src/backend/i686/codegen/i128_ops.rs b/src/backend/i686/codegen/i128_ops.rs
-index 68100dc..fe6e911 100644
---- a/src/backend/i686/codegen/i128_ops.rs
-+++ b/src/backend/i686/codegen/i128_ops.rs
-@@ -1,16 +1,413 @@
- //! I686Codegen: 128-bit (i128) and 64-bit pair operations.
- //!
- //! On i686, "i128" operations actually operate on 64-bit values using eax:edx pairs.
--//! This module also contains the i64 bit-manipulation helpers.
-+//! This module also contains the i64 bit-manipulation helpers and the
-+//! mul-accumulate chain fusion (`res = res*base + val`, the kstrtoull/
-+//! simple_strtoull parser hot shape).
- 
--use super::emit::I686Codegen;
-+use super::emit::{phys_reg_name, I686Codegen};
-+use crate::backend::regalloc::compute_i686_mulacc_chains;
- use crate::backend::state::StackSlot;
- use crate::backend::traits::ArchCodegen;
- use crate::common::types::IrType;
- use crate::emit;
- use crate::ir::reexports::{IrBinOp, IrCmpOp, IrConst, Operand, Value};
- 
-+/// A FUSED mul-acc chain, with every operand reference resolved against the
-+/// FINAL register allocation (homes + slots). Produced by
-+/// `resolve_mulacc_plans` after the RA; consumed by `emit_mulacc_chain_head`.
-+///
-+/// References are stored as Slot/Reg/Imm TOKENS, never pre-formatted
-+/// strings: `slot_ref()` is only valid once the prologue has established
-+/// `frame_base_offset` (at plan time it is still zero/stale), and formatting
-+/// at emission time keeps every ref correct by construction.
-+pub(super) struct MulAccPlan {
-+    /// The tail (Add) dest t2 — the fused store target.
-+    pub tail_dest: u32,
-+    /// The Mul's lhs (res) — loaded into %eax:%edx by emit_load_acc_pair.
-+    pub lhs: Operand,
-+    /// Low-half reference of the rhs (base).
-+    pub rhs_lo: MulRef,
-+    /// The addend (val) low-half reference.
-+    pub addend_lo: MulRef,
-+    /// How the addend's high half is produced.
-+    pub addend_hi: AddendHi,
-+}
-+
-+/// Resolved operand reference for the fused chain emission.
-+#[derive(Debug, Clone)]
-+pub(super) enum MulRef {
-+    /// 32-bit immediate.
-+    Imm(i32),
-+    /// Safe register home (∉ {eax,edx,ecx}).
-+    Reg(crate::backend::regalloc::PhysReg),
-+    /// 32-bit slot (narrow value) or a wide slot's low half.
-+    Slot(StackSlot),
-+    /// A wide slot's high half.
-+    SlotHi(StackSlot),
-+}
-+
-+/// Addend high-half production for the fused accumulate.
-+#[derive(Debug, Clone)]
-+pub(super) enum AddendHi {
-+    /// The high half is this immediate (zext → 0, sext-const → hi bits).
-+    Imm(i32),
-+    /// High half = sign replication of the low source (sext feeder):
-+    /// `movl src,%ecx; sarl $31,%ecx` before the add.
-+    Sext,
-+    /// High half readable from this reference (materialized slot's high
-+    /// word).
-+    Ref(MulRef),
-+}
-+
- impl I686Codegen {
-+    /// Resolve mul-acc chain plans AFTER register allocation (homes/slots
-+    /// final) — called at the end of calculate_stack_space_impl. A chain
-+    /// fuses only when every operand reference is resolvable and safe:
-+    ///
-+    /// - tail dest t2 must have a slot pair (wide values are slot-based; a
-+    ///   slotless dest cannot take the fused dual store).
-+    /// - a VIRTUAL feeder (cast emits nothing) requires its 32-bit source to
-+    ///   be directly referenceable: register home ∉ {eax,edx,ecx} (the fused
-+    ///   sequence clobbers all three BEFORE the addend read), or a slot, or
-+    ///   an immediate. Otherwise the feeder MATERIALIZES (cast emits its
-+    ///   stores) and the head reads the cast dest's slot pair — except
-+    ///   when the cast sits between head and tail (slot not yet written).
-+    /// - the rhs (base) must be zext-provable (3-term product shape) or a
-+    ///   zero-high constant; the addend may be ANY materialized-before-head
-+    ///   wide value (both halves readable from its slot pair), a constant
-+    ///   (lo+hi immediates), or a feeder.
-+    pub(super) fn resolve_mulacc_plans(&mut self, func: &crate::ir::reexports::IrFunction) {
-+        self.mulacc_plans.clear();
-+        self.mulacc_head_of.clear();
-+        self.mulacc_fused_tails.clear();
-+        self.mulacc_virtual_casts.clear();
-+        if std::env::var_os("CCC_NO_MULACC").is_some() {
-+            return;
-+        }
-+        let table = compute_i686_mulacc_chains(func);
-+        if table.chains.is_empty() {
-+            return;
-+        }
-+
-+        // Widening cast dest -> (source operand, from_ty).
-+        let mut feeder_src: crate::common::fx_hash::FxHashMap<u32, (Operand, IrType)> =
-+            crate::common::fx_hash::FxHashMap::default();
-+        for block in &func.blocks {
-+            for inst in &block.instructions {
-+                if let crate::ir::reexports::Instruction::Cast {
-+                    dest,
-+                    src,
-+                    from_ty,
-+                    to_ty,
-+                } = inst
-+                {
-+                    let widening = matches!(
-+                        (from_ty, to_ty),
-+                        (
-+                            IrType::U8
-+                                | IrType::U16
-+                                | IrType::U32
-+                                | IrType::Ptr
-+                                | IrType::I8
-+                                | IrType::I16
-+                                | IrType::I32,
-+                            IrType::I64 | IrType::U64
-+                        )
-+                    );
-+                    if widening {
-+                        feeder_src.insert(dest.0, (src.clone(), *from_ty));
-+                    }
-+                }
-+            }
-+        }
-+
-+        for chain in &table.chains {
-+            // ---- Shared reference helpers (final RA; TOKENS, not strings). ----
-+            // NARROW (32-bit) source reference: safe register home
-+            // (∉ {eax,edx,ecx} — the fused sequence's scratch set), or slot.
-+            fn narrow_ref_of(cg: &I686Codegen, v: &Value) -> Option<MulRef> {
-+                if cg.state.wide_values.contains(&v.0) {
-+                    return None;
-+                }
-+                if let Some(&phys) = cg.reg_assignments.get(&v.0) {
-+                    if matches!(phys.0, 4 | 5 | 6) {
-+                        return None;
-+                    }
-+                    return Some(MulRef::Reg(phys));
-+                }
-+                cg.state.get_slot(v.0).map(MulRef::Slot)
-+            }
-+            // WIDE value slot-pair references (low, high).
-+            fn wide_pair_refs(cg: &I686Codegen, v: &Value) -> Option<(MulRef, MulRef)> {
-+                let slot = cg.state.get_slot(v.0)?;
-+                Some((MulRef::Slot(slot), MulRef::SlotHi(slot)))
-+            }
-+            // RHS (base) low-half reference: zext-provable only.
-+            fn resolve_rhs_lo(
-+                cg: &I686Codegen,
-+                op: &Operand,
-+                feeder: Option<u32>,
-+                feeder_src: &crate::common::fx_hash::FxHashMap<u32, (Operand, IrType)>,
-+            ) -> Option<MulRef> {
-+                match op {
-+                    Operand::Const(c) => {
-+                        let v = c.to_i64()?;
-+                        if (v as u128) >> 32 != 0 {
-+                            return None;
-+                        }
-+                        Some(MulRef::Imm(v as i32))
-+                    }
-+                    Operand::Value(v) => {
-+                        if let Some(fdest) = feeder {
-+                            let Some((src, from_ty)) = feeder_src.get(&fdest) else {
-+                                return None;
-+                            };
-+                            if from_ty.is_signed() {
-+                                return None; // sext base: bhi unprovable
-+                            }
-+                            match src {
-+                                Operand::Const(c) => {
-+                                    let v = c.to_i64()?;
-+                                    if (v as u128) >> 32 != 0 {
-+                                        return None;
-+                                    }
-+                                    Some(MulRef::Imm(v as i32))
-+                                }
-+                                Operand::Value(sv) => {
-+                                    if let Some(r) = narrow_ref_of(cg, sv) {
-+                                        return Some(r);
-+                                    }
-+                                    // Materialized fallback: zext slot low half.
-+                                    if !cg.zext_wide_values.contains(&v.0) {
-+                                        return None;
-+                                    }
-+                                    wide_pair_refs(cg, v).map(|(lo, _)| lo)
-+                                }
-+                            }
-+                        } else {
-+                            // Materialized / cross-block zext dest.
-+                            if !cg.zext_wide_values.contains(&v.0) {
-+                                return None;
-+                            }
-+                            wide_pair_refs(cg, v).map(|(lo, _)| lo)
-+                        }
-+                    }
-+                }
-+            }
-+            // ADDEND (lo, hi) references.
-+            fn resolve_addend_ref(
-+                cg: &I686Codegen,
-+                op: &Operand,
-+                feeder: Option<u32>,
-+                after_head: bool,
-+                feeder_src: &crate::common::fx_hash::FxHashMap<u32, (Operand, IrType)>,
-+            ) -> Option<(MulRef, AddendHi)> {
-+                match op {
-+                    Operand::Const(c) => {
-+                        let v = c.to_i64()?;
-+                        let lo = (v & 0xFFFF_FFFF) as i32;
-+                        let hi = ((v as u128 >> 32) & 0xFFFF_FFFF) as i32;
-+                        Some((MulRef::Imm(lo), AddendHi::Imm(hi)))
-+                    }
-+                    Operand::Value(v) => {
-+                        if let Some(fdest) = feeder {
-+                            let Some((src, from_ty)) = feeder_src.get(&fdest) else {
-+                                return None;
-+                            };
-+                            match src {
-+                                Operand::Const(c) => resolve_addend_ref(
-+                                    cg,
-+                                    &Operand::Const(c.clone()),
-+                                    None,
-+                                    false,
-+                                    feeder_src,
-+                                ),
-+                                Operand::Value(sv) => {
-+                                    if let Some(r) = narrow_ref_of(cg, sv) {
-+                                        let hi = if from_ty.is_signed() {
-+                                            AddendHi::Sext
-+                                        } else {
-+                                            AddendHi::Imm(0)
-+                                        };
-+                                        return Some((r, hi));
-+                                    }
-+                                    if after_head {
-+                                        return None; // slot not yet written
-+                                    }
-+                                    // Materialized fallback: slot pair.
-+                                    let (lo, hi) = wide_pair_refs(cg, v)?;
-+                                    Some((lo, AddendHi::Ref(hi)))
-+                                }
-+                            }
-+                        } else {
-+                            // Materialized / cross-block value: slot pair.
-+                            if after_head {
-+                                return None;
-+                            }
-+                            let (lo, hi) = wide_pair_refs(cg, v)?;
-+                            Some((lo, AddendHi::Ref(hi)))
-+                        }
-+                    }
-+                }
-+            }
-+
-+            let Some(rhs_lo) = resolve_rhs_lo(self, &chain.rhs, chain.rhs_feeder, &feeder_src)
-+            else {
-+                if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-+                    eprintln!(
-+                        "[MULACC] chain head={} tail={} REJECTED (rhs unresolved)",
-+                        chain.head_dest, chain.tail_dest
-+                    );
-+                }
-+                continue;
-+            };
-+            let Some((addend_lo, addend_hi)) = resolve_addend_ref(
-+                self,
-+                &chain.addend,
-+                chain.addend_feeder,
-+                chain.addend_cast_after_head,
-+                &feeder_src,
-+            ) else {
-+                if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-+                    eprintln!(
-+                        "[MULACC] chain head={} tail={} REJECTED (addend unresolved)",
-+                        chain.head_dest, chain.tail_dest
-+                    );
-+                }
-+                continue;
-+            };
-+            // t2 must take the fused dual store.
-+            if self.state.get_slot(chain.tail_dest).is_none() {
-+                if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-+                    eprintln!(
-+                        "[MULACC] chain head={} tail={} REJECTED (tail dest slotless)",
-+                        chain.head_dest, chain.tail_dest
-+                    );
-+                }
-+                continue;
-+            }
-+            // Virtualize the feeders whose source ref was taken directly
-+            // (exactly the narrow_ref_of outcome: safe register home or slot).
-+            for f in chain.feeders() {
-+                let src_direct = match feeder_src.get(&f) {
-+                    Some((Operand::Value(sv), _)) => narrow_ref_of(self, sv).is_some(),
-+                    Some((Operand::Const(_), _)) => true,
-+                    _ => false,
-+                };
-+                if src_direct {
-+                    self.mulacc_virtual_casts.insert(f);
-+                }
-+            }
-+            // Crossed single-use no-op casts are dead: their only reader
-+            // (the chain) now emits nothing. Suppress their slot-pair
-+            // copies via the same virtual set (checked in the I64<->U64
-+            // same-size cast branch). Sound only for FUSED chains — this
-+            // code path is reached exclusively after acceptance.
-+            for d in &chain.dead_nop_casts {
-+                self.mulacc_virtual_casts.insert(*d);
-+            }
-+            if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-+                eprintln!(
-+                    "[MULACC] chain head={} tail={} FUSED (rhs_lo={:?} addend_lo={:?} addend_hi={:?} rhs_feeder={:?} addend_feeder={:?})",
-+                    chain.head_dest,
-+                    chain.tail_dest,
-+                    rhs_lo,
-+                    addend_lo,
-+                    addend_hi,
-+                    chain.rhs_feeder,
-+                    chain.addend_feeder,
-+                );
-+            }
-+            let plan = MulAccPlan {
-+                tail_dest: chain.tail_dest,
-+                lhs: chain.lhs.clone(),
-+                rhs_lo,
-+                addend_lo,
-+                addend_hi,
-+            };
-+            self.mulacc_head_of
-+                .insert(chain.head_dest, self.mulacc_plans.len());
-+            self.mulacc_fused_tails.insert(chain.tail_dest);
-+            self.mulacc_plans.push(plan);
-+        }
-+    }
-+
-+    /// Format a resolved reference token AT EMISSION TIME — `slot_ref()` is
-+    /// only valid once the prologue has established `frame_base_offset`
-+    /// (zero/stale at plan time).
-+    fn mulref_str(&self, r: &MulRef) -> String {
-+        match r {
-+            MulRef::Imm(v) => format!("${}", v),
-+            MulRef::Reg(p) => format!("%{}", phys_reg_name(*p)),
-+            MulRef::Slot(s) => self.slot_ref(*s),
-+            MulRef::SlotHi(s) => self.slot_ref_offset(*s, 4),
-+        }
-+    }
-+
-+    /// Emit the FUSED mul-acc chain head: the whole `res*base + val`
-+    /// expression in GCC's shape — product through the 3-term zero-high-half
-+    /// form, addend added in place, single dual store to the tail dest.
-+    /// The product temp is never stored (single use, consumed here).
-+    pub(super) fn emit_mulacc_chain_head(&mut self, plan_idx: usize) {
-+        // Clone the plan out first: emission needs &mut self throughout.
-+        let (lhs, rhs_lo_t, addend_lo_t, addend_hi, tail_dest) = {
-+            let plan = &self.mulacc_plans[plan_idx];
-+            (
-+                plan.lhs.clone(),
-+                plan.rhs_lo.clone(),
-+                plan.addend_lo.clone(),
-+                plan.addend_hi.clone(),
-+                plan.tail_dest,
-+            )
-+        };
-+        let rhs_lo = self.mulref_str(&rhs_lo_t);
-+        let addend_lo = self.mulref_str(&addend_lo_t);
-+        let addend_hi_is_zero = matches!(&addend_hi, AddendHi::Imm(0));
-+        let addend_lo_zero = matches!(&addend_lo_t, MulRef::Imm(0));
-+        let tail = Value(tail_dest);
-+
-+        // res pair -> %eax:%edx
-+        self.emit_load_acc_pair(&lhs);
-+        if let MulRef::Imm(blo) = rhs_lo_t {
-+            // mull has no immediate form: stage the low factor through %edx.
-+            self.state.emit("    movl %edx, %ecx");
-+            emit!(self.state, "    imull ${}, %ecx", blo); // ahi*blo
-+            emit!(self.state, "    movl ${}, %edx", blo);
-+            self.state.emit("    mull %edx"); // eax:edx = alo*blo
-+        } else {
-+            self.state.emit("    movl %edx, %ecx");
-+            emit!(self.state, "    imull {}, %ecx", rhs_lo); // ahi*blo
-+            emit!(self.state, "    mull {}", rhs_lo); // eax:edx = alo*blo
-+        }
-+        self.state.emit("    addl %ecx, %edx");
-+        // Fused accumulate.
-+        if !(addend_hi_is_zero && addend_lo_zero) {
-+            match &addend_hi {
-+                AddendHi::Imm(hi) => {
-+                    emit!(self.state, "    addl {}, %eax", addend_lo);
-+                    emit!(self.state, "    adcl ${}, %edx", hi);
-+                }
-+                AddendHi::Sext => {
-+                    // hi = sign replication of the source: stage through
-+                    // %ecx (dead after the cross-term add above).
-+                    emit!(self.state, "    movl {}, %ecx", addend_lo);
-+                    self.state.emit("    sarl $31, %ecx");
-+                    emit!(self.state, "    addl {}, %eax", addend_lo);
-+                    self.state.emit("    adcl %ecx, %edx");
-+                }
-+                AddendHi::Ref(hi_ref) => {
-+                    let hi = self.mulref_str(hi_ref);
-+                    emit!(self.state, "    addl {}, %eax", addend_lo);
-+                    emit!(self.state, "    adcl {}, %edx", hi);
-+                }
-+            }
-+        }
-+        // Single dual store: ONLY the tail dest (the product is dead).
-+        self.emit_store_acc_pair(&tail);
-+        self.state.reg_cache.invalidate_all();
-+    }
-+
-     /// Direct 64-bit RHS reference for the i64 fast paths: a constant pair
-     /// (immediates) or a wide value's slot pair (memory operands). This is
-     /// what lets `res & mask`, `res * base` and 64-bit compares avoid the
-@@ -209,8 +606,17 @@ impl I686Codegen {
-         match op {
-             IrCmpOp::Eq | IrCmpOp::Ne => {
-                 self.emit_load_acc_pair(lhs);
--                emit!(self.state, "    xorl {}, %eax", rlo);
--                emit!(self.state, "    xorl {}, %edx", rhi);
-+                // Identity-fold zero XORs: `x ^ 0` is the archetypal
-+                // `res & mask != 0` gate's constant — emitting literal
-+                // `xorl $0, %reg` NOPs wasted 2 instructions per gate.
-+                // Skipping only the zero arms keeps every combination
-+                // sound: `orl %eax, %edx` folds whatever halves survive.
-+                if rlo != "$0" {
-+                    emit!(self.state, "    xorl {}, %eax", rlo);
-+                }
-+                if rhi != "$0" {
-+                    emit!(self.state, "    xorl {}, %edx", rhi);
-+                }
-                 self.state.emit("    orl %eax, %edx");
-                 let set = if op == IrCmpOp::Eq { "sete" } else { "setne" };
-                 emit!(self.state, "    {} %al", set);
-@@ -282,7 +688,6 @@ impl I686Codegen {
-         }
-     }
- 
--
-     pub(super) fn emit_sign_extend_acc_high_impl(&mut self) {
-         self.state.emit("    cltd");
-     }
+From 7569cdb01cc14070a7ab25185dcc77b38580522b Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 15:02:25 +0000
+Subject: [PATCH 1/3] =?UTF-8?q?i686:=20fuse=5Fsetcc=5Fbranch=20hardening?=
+ =?UTF-8?q?=20=E2=80=94=20classifier-independent=20flags-reader=20checks;?=
+ =?UTF-8?q?=20mulacc/setCC=20differential=20regression=20tests;=20stmt-exp?=
+ =?UTF-8?q?r=20test=20fix?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+fuse_setcc_branch (Agent Z, #274) audit follow-ups:
+
+1. is_flags_reader now consults is_cond_jcc() — the authoritative
+   mnemonic list — before the LineKind-based check. The classifier keys
+   is_conditional_jump on the second character, so `jc` classifies as
+   Other while `jnc` classifies as CondJmp; a post-branch reader of that
+   spelling escaped the post-jcc guard and would have consumed the
+   producer's flags after the rewrite (caught by the new
+   setcc_fuse_refuses_jcc_reader_after_branch with a `jc` after the
+   branch — the fusion emitted jne and changed the reader's condition).
+
+2. The deadness scan now stops at any conditional-jump spelling
+   (is_cond_jcc): the branch target may rejoin and read the carrier, so
+   the provable dead window ends at the branch, not at the classifier's
+   kind for it.
+
+3. Red-team tests for the fusion: dead window (setCC..relay dropped,
+   jcc rewritten onto the producer CC with identical branch polarity),
+   je-inversion, movzwl/AH-garbage carrier refusal, post-branch jcc
+   reader refusal (jc spelling), setCC reader behind the fallthrough
+   label refusal, writer-before-reader allowance, and the live-bool
+   window-kept shape. cmpl-headed producers make refusals observable
+   (no other pass may drop a cmpl-headed setCC test) and make a wrong
+   fusion's je->jne rewrite detectable.
+
+4. mulacc differential tests (GCC-oracle): kstrtoull-shaped chains with
+   overflow gates, sext/negative addend feeders, hi-zero boundary bases
+   (0xFFFFFFFF) vs rejected >=2^32 bases, and the single-use no-op cast
+   sandwich rule (multi-use casts must break the chain). All byte-exact
+   vs GCC -O2 at every level, fusion on and off.
+
+5. stmt_expr_asm_typeof returned 42 (the payload it asserts on) instead
+   of 0; the runner's exit-0 protocol requires a real success code. Both
+   lccc and GCC returned 42 — a test-expectation defect, not a codegen
+   one.
+
+Validation: unit 1258/0/6, regression corpus 516 total with the two
+-m32 run-fails resolved as environment (missing i386 crt; binaries
+were linked without crt1.o and crashed at the final ret — with
+libc6-dev-i386 installed both exit 0), sqlite_varint miscompile
+(pre-existing, under investigation) documented separately.
+---
+ src/backend/i686/codegen/peephole.rs          | 165 +++++++++++++++---
+ tests/regression/mulacc_chain_u64.c           |  68 ++++++++
+ tests/regression/mulacc_chain_u64.flags       |   1 +
+ tests/regression/mulacc_nop_cast_sandwich.c   |  55 ++++++
+ .../regression/mulacc_nop_cast_sandwich.flags |   1 +
+ tests/regression/mulacc_sext_addend.c         |  50 ++++++
+ tests/regression/mulacc_sext_addend.flags     |   1 +
+ tests/regression/setcc_bool_gate.c            |  45 +++++
+ tests/regression/setcc_bool_gate.flags        |   1 +
+ tests/regression/stmt_expr_asm_typeof.c       |   6 +-
+ 10 files changed, 372 insertions(+), 21 deletions(-)
+ create mode 100644 tests/regression/mulacc_chain_u64.c
+ create mode 100644 tests/regression/mulacc_chain_u64.flags
+ create mode 100644 tests/regression/mulacc_nop_cast_sandwich.c
+ create mode 100644 tests/regression/mulacc_nop_cast_sandwich.flags
+ create mode 100644 tests/regression/mulacc_sext_addend.c
+ create mode 100644 tests/regression/mulacc_sext_addend.flags
+ create mode 100644 tests/regression/setcc_bool_gate.c
+ create mode 100644 tests/regression/setcc_bool_gate.flags
+
 diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index c523ea9..bbb36c0 100644
+index bbb36c02..e7d94324 100644
 --- a/src/backend/i686/codegen/peephole.rs
 +++ b/src/backend/i686/codegen/peephole.rs
-@@ -3640,6 +3640,324 @@ fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
-     changed
- }
+@@ -3694,8 +3694,17 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+         )
+     }
+     /// Lines whose EXECUTION READS the flags (jcc/setcc/cmov).
++    ///
++    /// The mnemonic check is authoritative, not the classifier: the
++    /// LineKind-based arm misses synonyms the classifier folds into
++    /// Other — `is_conditional_jump` keys on the second character, so
++    /// `jc` classifies as Other while `jnc` classifies as CondJmp. A
++    /// flags reader that slips through here would let the fusion hand
++    /// it the producer's flags instead of the dropped test's (caught by
++    /// setcc_fuse_refuses_jcc_reader_after_branch with a `jc`).
+     fn is_flags_reader(kind: LineKind, s: &str) -> bool {
+         matches!(kind, LineKind::CondJmp | LineKind::SetCC { .. })
++            || is_cond_jcc(s)
+             || s.split_whitespace().next().unwrap_or("").starts_with("cmov")
+     }
  
-+// ── Pass: setCC-bool test/branch fusion ──────────────────────────────────────
-+
-+/// Fuse `setCC %r8; movzbl %r8, %r32; [movl relays]; testl A, B; {je|jne}`:
-+/// the test is REDUNDANT — `movzbl` and `movl` preserve EFLAGS, so the
-+/// original producer's flags (the ones the setCC consumed) are still live at
-+/// the conditional jump, and `je`-after-test ⇔ (bool == 0) ⇔ CC false.
-+///
-+/// The i64 `res & mask != 0` gates (kstrtoull's overflow check) lower to
-+/// exactly this shape with a register relay: `orl; setne %al; movzbl;
-+/// movl %eax,%edx; testl %eax,%edx; je` — none of which the Cmp-headed
-+/// fuse_compare_and_branch or the and/or/xor-headed
-+/// eliminate_redundant_test_i686 can match (cross-register test + relay).
-+///
-+/// When the bool is dead after the branch (bounded written-before-read scan
-+/// for every carrier register, no unmatched slot stores — the window admits
-+/// none), the whole setCC..relay window is NOPed; otherwise only the test
-+/// is dropped. In both cases the jcc is rewritten: `je`→`j<inv(CC)>`,
-+/// `jne`→`j<CC>` on the surviving producer flags.
-+///
-+/// Soundness gates:
-+///  * the window (setCC..test) contains ONLY flag-preserving carrier moves
-+///    (movzbl same-family, movl reg-reg from a carrier) — any other line,
-+///    label, or branch bails;
-+///  * the tested operands are both carriers of the bool;
-+///  * after the jcc, a bounded scan requires a flags WRITER before any
-+///    flags READER — otherwise a later reader could observe the producer's
-+///    flags where the test's were intended (strictly stricter than the
-+///    existing fuse_compare_and_branch, which relies on the emitter's
-+///    always-produce-before-consume discipline alone).
-+fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-+    if std::env::var_os("CCC_NO_SETCC_BRANCH").is_some() {
-+        return false;
-+    }
-+    /// Instruction mnemonics that WRITE the flags register.
-+    fn is_flags_writer(s: &str) -> bool {
-+        let m = s.split_whitespace().next().unwrap_or("");
-+        matches!(
-+            m,
-+            "addl" | "addw" | "addb"
-+                | "subl" | "subw" | "subb"
-+                | "adcl" | "sbbl"
-+                | "andl" | "andw" | "andb"
-+                | "orl" | "orw" | "orb"
-+                | "xorl" | "xorw" | "xorb"
-+                | "cmpl" | "cmpw" | "cmpb"
-+                | "testl" | "testw" | "testb"
-+                | "shll" | "shrl" | "sarl"
-+                | "roll" | "rorl" | "rcll" | "rcrl"
-+                | "imull" | "mull" | "idivl" | "divl"
-+                | "incl" | "decl" | "negl"
-+                | "negw" | "negb"
-+        )
-+    }
-+    /// Lines whose EXECUTION READS the flags (jcc/setcc/cmov).
-+    fn is_flags_reader(kind: LineKind, s: &str) -> bool {
-+        matches!(kind, LineKind::CondJmp | LineKind::SetCC { .. })
-+            || s.split_whitespace().next().unwrap_or("").starts_with("cmov")
-+    }
-+
-+    let len = infos.len();
-+    let mut changed = false;
-+    let mut i = 0;
-+    while i < len {
-+        let (cc, byte_reg) = match infos[i].kind {
-+            LineKind::SetCC { reg } => {
-+                let s = trimmed(store, &infos[i], i);
-+                match parse_setcc(s) {
-+                    Some(cc) if reg <= REG_GP_MAX => (cc, reg),
-+                    _ => {
-+                        i += 1;
-+                        continue;
-+                    }
-+                }
-+            }
-+            _ => {
-+                i += 1;
-+                continue;
-+            }
-+        };
-+        // Next non-nop: movz{b,w}l %r8, %r32 (same family) — the bool lands
-+        // in the full register.
-+        let mut j = i + 1;
-+        while j < len && (infos[j].is_nop() || is_debug_location(store, infos, j)) {
-+            j += 1;
-+        }
-+        if j >= len {
-+            break;
-+        }
-+        let mz = trimmed(store, &infos[j], j);
-+        let carrier = if let Some(rest) = mz.strip_prefix("movzbl ") {
-+            let mut it = rest.split(',');
-+            let src = it.next().unwrap_or("").trim();
-+            let dst = it.next().unwrap_or("").trim();
-+            if it.next().is_some() || !src.starts_with('%') || !dst.starts_with('%') {
-+                None
-+            } else {
-+                let sf = register_family(src);
-+                let df = register_family(dst);
-+                if sf == byte_reg && sf == df && df <= REG_GP_MAX {
-+                    Some(df)
-+                } else {
-+                    None
-+                }
-+            }
-+        } else if let Some(rest) = mz.strip_prefix("movzwl ") {
-+            let mut it = rest.split(',');
-+            let src = it.next().unwrap_or("").trim();
-+            let dst = it.next().unwrap_or("").trim();
-+            if it.next().is_some() || !src.starts_with('%') || !dst.starts_with('%') {
-+                None
-+            } else {
-+                let sf = register_family(src);
-+                let df = register_family(dst);
-+                if sf == byte_reg && sf == df && df <= REG_GP_MAX {
-+                    Some(df)
-+                } else {
-+                    None
-+                }
-+            }
-+        } else {
-+            None
-+        };
-+        let Some(carrier) = carrier else {
-+            i += 1;
-+            continue;
-+        };
-+        // Window: movl relays then the test. No stores, labels, branches.
-+        let mut carriers = [REG_NONE; 4];
-+        carriers[0] = carrier;
-+        let mut carrier_count = 1usize;
-+        let mut window: Vec<usize> = Vec::new();
-+        let mut test_idx = None;
-+        let mut k = j + 1;
-+        let mut scanned = 0;
-+        while k < len && scanned < 6 {
-+            if infos[k].is_nop() || is_debug_location(store, infos, k) {
-+                k += 1;
-+                continue;
-+            }
-+            if infos[k].is_barrier() {
-+                break;
-+            }
-+            let s = trimmed(store, &infos[k], k);
-+            if let Some(rest) = s.strip_prefix("movl ") {
-+                let mut it = rest.split(',');
-+                let src = it.next().unwrap_or("").trim();
-+                let dst = it.next().unwrap_or("").trim();
-+                let sf = register_family(src);
-+                let df = register_family(dst);
-+                if it.next().is_some()
-+                    || !src.starts_with('%')
-+                    || !dst.starts_with('%')
-+                    || sf == REG_NONE
-+                    || sf > REG_GP_MAX
-+                    || df > REG_GP_MAX
-+                    || dst.contains('(')
-+                {
-+                    break; // slot store or odd form: bail (strict window)
-+                }
-+                if (0..carrier_count).any(|c| carriers[c] == sf) {
-+                    if df != sf && (0..carrier_count).all(|c| carriers[c] != df) {
-+                        if carrier_count < carriers.len() {
-+                            carriers[carrier_count] = df;
-+                            carrier_count += 1;
-+                            window.push(k);
-+                            k += 1;
-+                            scanned += 1;
-+                            continue;
-+                        }
-+                    } else if df == sf {
-+                        // movl %eax, %eax: no-op relay, skip
-+                        k += 1;
-+                        scanned += 1;
-+                        continue;
-+                    }
-+                }
-+                break;
-+            }
-+            if let Some(rest) = s.strip_prefix("testl ") {
-+                let mut it = rest.split(',');
-+                let a = it.next().unwrap_or("").trim();
-+                let b = it.next().unwrap_or("").trim();
-+                if it.next().is_some() || !a.starts_with('%') || !b.starts_with('%') {
-+                    break;
-+                }
-+                let af = register_family(a);
-+                let bf = register_family(b);
-+                let a_c = (0..carrier_count).any(|c| carriers[c] == af);
-+                let b_c = (0..carrier_count).any(|c| carriers[c] == bf);
-+                if a_c && b_c {
-+                    test_idx = Some(k);
-+                    k += 1;
-+                    break;
-+                }
-+            }
-+            break;
-+        }
-+        let Some(test_idx) = test_idx else {
-+            i += 1;
-+            continue;
-+        };
-+        // Next non-nop after the test: je/jne.
-+        let mut t = test_idx + 1;
-+        while t < len && (infos[t].is_nop() || is_debug_location(store, infos, t)) {
-+            t += 1;
-+        }
-+        if t >= len {
-+            i += 1;
-+            continue;
-+        }
-+        let jl = trimmed(store, &infos[t], t);
-+        let (is_jne, target) = if let Some(x) = jl.strip_prefix("jne ") {
-+            (true, x.trim())
-+        } else if let Some(x) = jl.strip_prefix("je ") {
-+            (false, x.trim())
-+        } else {
-+            i += 1;
-+            continue;
-+        };
-+        // Post-jcc guard: a flags writer must precede any flags reader on
-+        // the fallthrough path (bounded scan; barriers stop it — a label
-+        // ends the guaranteed-straight-line region conservatively).
-+        let mut ok_after = true;
-+        let mut m = t + 1;
-+        let mut cnt = 0;
-+        while m < len && cnt < 16 {
-+            if infos[m].is_nop() || is_debug_location(store, infos, m) {
+@@ -3744,21 +3753,12 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+                     None
+                 }
+             }
+-        } else if let Some(rest) = mz.strip_prefix("movzwl ") {
+-            let mut it = rest.split(',');
+-            let src = it.next().unwrap_or("").trim();
+-            let dst = it.next().unwrap_or("").trim();
+-            if it.next().is_some() || !src.starts_with('%') || !dst.starts_with('%') {
+-                None
+-            } else {
+-                let sf = register_family(src);
+-                let df = register_family(dst);
+-                if sf == byte_reg && sf == df && df <= REG_GP_MAX {
+-                    Some(df)
+-                } else {
+-                    None
+-                }
+-            }
++        // movzwl is deliberately NOT accepted here: setCC writes only the
++        // low BYTE of its destination, so `movzwl %ax, %r32` would import
++        // whatever the high byte of %ax held into the bool — the fused test
++        // (and the branch rewritten onto the producer CC) would then observe
++        // garbage bits, not the 0/1 bool. movzbl is the only zero-extend of
++        // a setCC result that is exact by construction.
+         } else {
+             None
+         };
+@@ -3860,8 +3860,16 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+             continue;
+         };
+         // Post-jcc guard: a flags writer must precede any flags reader on
+-        // the fallthrough path (bounded scan; barriers stop it — a label
+-        // ends the guaranteed-straight-line region conservatively).
++        // the fallthrough path. ORDER MATTERS: the reader check runs BEFORE
++        // the barrier check because a CondJmp is both a reader and a
++        // barrier — after the rewrite it would consume the producer's
++        // flags instead of the dropped test's. Labels are SKIPPED, not
++        // barriers: the fallthrough physically continues into the next
++        // block, so a reader there sees the changed flags too. The scan
++        // still stops at true control/analysis boundaries (call destroys
++        // the flags entirely; jmp/ret leave the path; push/pop/esp fences
++        // are handled by their own barrier classes) and at any flag-
++        // preserving instruction it keeps scanning.
+         let mut ok_after = true;
+         let mut m = t + 1;
+         let mut cnt = 0;
+@@ -3870,9 +3878,6 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+                 m += 1;
+                 continue;
+             }
+-            if infos[m].is_barrier() {
+-                break;
+-            }
+             let s2 = trimmed(store, &infos[m], m);
+             if is_flags_writer(s2) {
+                 break;
+@@ -3881,6 +3886,13 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+                 ok_after = false;
+                 break;
+             }
++            if infos[m].kind == LineKind::Label {
 +                m += 1;
 +                continue;
 +            }
 +            if infos[m].is_barrier() {
 +                break;
 +            }
-+            let s2 = trimmed(store, &infos[m], m);
-+            if is_flags_writer(s2) {
-+                break;
-+            }
-+            if is_flags_reader(infos[m].kind, s2) {
-+                ok_after = false;
-+                break;
-+            }
-+            m += 1;
-+            cnt += 1;
-+        }
-+        if !ok_after {
-+            i += 1;
-+            continue;
-+        }
-+        // Bool deadness: every carrier written-before-read after the jcc.
-+        let mut bool_dead = true;
-+        for c in (0..carrier_count).map(|c| carriers[c]) {
-+            let mut k2 = t + 1;
-+            let mut cnt2 = 0;
-+            let mut dead = false;
-+            while k2 < len && cnt2 < 24 {
-+                if infos[k2].is_nop() || is_debug_location(store, infos, k2) {
-+                    k2 += 1;
-+                    continue;
-+                }
-+                if infos[k2].is_barrier() {
-+                    break;
-+                }
-+                let s3 = trimmed(store, &infos[k2], k2);
-+                let written = match infos[k2].kind {
-+                    LineKind::Other { dest_reg } => dest_reg == c,
-+                    LineKind::Move { dst, .. } => dst == c,
-+                    LineKind::LoadEbp { reg, .. } => reg == c,
-+                    LineKind::SetCC { reg } => reg == c,
-+                    _ => false,
-+                };
-+                if written && !line_reads_dest_source(s3, c) {
-+                    dead = true;
-+                    break;
-+                }
-+                if line_references_reg(s3, c) || line_writes_reg_implicitly(s3, c) {
-+                    break;
-+                }
-+                k2 += 1;
-+                cnt2 += 1;
-+            }
-+            if !dead {
-+                bool_dead = false;
-+                break;
-+            }
-+        }
-+        // Rewrite: drop the test; rewrite the jcc onto the producer flags.
-+        let fused_cc = if is_jne {
-+            cc.to_string()
-+        } else {
-+            match invert_cc(cc) {
-+                Some(inv) => inv.to_string(),
-+                None => {
-+                    i += 1;
-+                    continue;
-+                }
-+            }
-+        };
-+        infos[test_idx].kind = LineKind::Nop;
-+        if bool_dead {
-+            infos[i].kind = LineKind::Nop; // setCC
-+            infos[j].kind = LineKind::Nop; // movzbl
-+            for w in &window {
-+                infos[*w].kind = LineKind::Nop; // relays
-+            }
-+        }
-+        store.replace(t, format!("    j{} {}", fused_cc, target));
-+        infos[t] = LineInfo {
-+            kind: LineKind::CondJmp,
-+            trim_start: 4,
-+            has_indirect_mem: false,
-+            ebp_offset: EBP_OFFSET_NONE,
-+        };
-+        changed = true;
-+        i = t + 1;
-+    }
-+    changed
-+}
-+
- // ── Pass: redundant testl-after-logical elimination ─────────────────────────
- 
- /// `andl`/`orl` (any operand form) and the `xorl %R,%R` zero idiom set
-@@ -7438,6 +7756,7 @@ pub fn peephole_optimize(asm: String) -> String {
-     let global_changed = global_changed | eliminate_dead_reg_moves(&store, &mut infos);
-     let global_changed = global_changed | eliminate_dead_stores(&store, &mut infos);
-     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
-+    let global_changed = global_changed | fuse_setcc_branch(&mut store, &mut infos);
-     let global_changed = global_changed | fold_memory_operands(&mut store, &mut infos);
-     let global_changed = global_changed | eliminate_redundant_test_i686(&mut store, &mut infos);
-     let global_changed = global_changed | fuse_sext_testb(&mut store, &mut infos);
-@@ -7454,6 +7773,7 @@ pub fn peephole_optimize(asm: String) -> String {
-             changed2 |= forward_slot_loads(&mut store, &mut infos);
-             changed2 |= eliminate_dead_reg_moves(&store, &mut infos);
-             changed2 |= eliminate_dead_stores(&store, &mut infos);
-+            changed2 |= fuse_setcc_branch(&mut store, &mut infos);
-             changed2 |= fold_memory_operands(&mut store, &mut infos);
-             changed2 |= eliminate_redundant_test_i686(&mut store, &mut infos);
-             changed2 |= fuse_sext_testb(&mut store, &mut infos);
-diff --git a/src/backend/i686/codegen/prologue.rs b/src/backend/i686/codegen/prologue.rs
-index 35f6a69..cd50d8a 100644
---- a/src/backend/i686/codegen/prologue.rs
-+++ b/src/backend/i686/codegen/prologue.rs
-@@ -96,10 +96,8 @@ impl I686Codegen {
-         // URem+UDiv couple with identical operands). Constant divisors pair
-         // only at -Os, where the magic-number strength reduction is off and
-         // the general divl path is guaranteed for both sides.
--        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs(
--            func,
--            self.optimize_for_size,
--        );
-+        let pairs =
-+            crate::backend::regalloc::compute_i686_divrem_pairs(func, self.optimize_for_size);
-         self.divrem_tail_dests = pairs.tail_dests;
-         self.divrem_head_partners = pairs.head_partners;
-         self.divrem_broken_tails.clear();
-@@ -124,8 +122,7 @@ impl I686Codegen {
-                                 | crate::common::types::IrType::U16
-                                 | crate::common::types::IrType::U32
-                                 | crate::common::types::IrType::Ptr,
--                            crate::common::types::IrType::I64
--                                | crate::common::types::IrType::U64
-+                            crate::common::types::IrType::I64 | crate::common::types::IrType::U64
-                         )
-                     );
-                     if zext {
-@@ -352,7 +349,7 @@ impl I686Codegen {
- 
-         self.state.ra_accumulator_values =
-             accumulator_assignments.iter().map(|a| a.value_id).collect();
--        calculate_stack_space_common(
-+        let space = calculate_stack_space_common(
-             &mut self.state,
-             func,
-             callee_saved_bytes,
-@@ -378,7 +375,12 @@ impl I686Codegen {
-             &reg_assigned,
-             callee_saved_set,
-             cached_liveness,
--        )
-+        );
-+        // Mul-acc chain plans resolve AFTER the RA and slot assignment:
-+        // fusibility depends on the final register homes and stack slots
-+        // (see compute_i686_mulacc_chains / resolve_mulacc_plans).
-+        self.resolve_mulacc_plans(func);
-+        space
-     }
- 
-     // ---- aligned_frame_size ----
-diff --git a/src/backend/liveness.rs b/src/backend/liveness.rs
-index eb38fe1..b278829 100644
---- a/src/backend/liveness.rs
-+++ b/src/backend/liveness.rs
-@@ -290,6 +290,9 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
-         &alloca_set,
-         &id_to_dense,
-         &ps.copy_src,
-+        &ps.def_points,
-+        &ps.block_start_points,
-+        &ps.block_end_points,
-         &mut ps.last_use_points,
-         &mut ps.block_gen,
-     );
-@@ -692,6 +695,9 @@ fn extend_gep_base_liveness(
-     alloca_set: &FxHashSet<u32>,
-     id_to_dense: &FxHashMap<u32, usize>,
-     copy_src: &FxHashMap<u32, Vec<u32>>,
-+    def_points: &[u32],
-+    block_start_points: &[u32],
-+    block_end_points: &[u32],
-     last_use_points: &mut [u32],
-     block_gen: &mut [BitSet],
- ) -> FxHashSet<u32> {
-@@ -844,6 +850,8 @@ fn extend_gep_base_liveness(
-                         bi,
-                         alloca_set,
-                         id_to_dense,
-+                        def_points,
-+                        &(block_start_points[bi], block_end_points[bi]),
-                         copy_src,
-                         last_use_points,
-                         block_gen,
-@@ -856,6 +864,8 @@ fn extend_gep_base_liveness(
-                             bi,
-                             alloca_set,
-                             id_to_dense,
-+                            def_points,
-+                            &(block_start_points[bi], block_end_points[bi]),
-                             copy_src,
-                             last_use_points,
-                             block_gen,
-@@ -872,12 +882,25 @@ fn extend_gep_base_liveness(
- }
- 
- /// Extend `start_id` and every Copy-chain source (all phi-elim preds) to `point`.
-+///
-+/// The `block_gen` insertion — which keeps the value live at the consuming
-+/// block's ENTRY so liveness propagates through intermediate blocks — is
-+/// applied ONLY when the value's def is OUTSIDE the consuming block
-+/// (cross-block fold). A value defined in the same block is NOT upward-
-+/// exposed: inserting it into gen anyway inflated its fat interval to the
-+/// whole block span (single-block functions: the whole function), which
-+/// masqueraded as register pressure and blocked homes for values whose real
-+/// ranges are a few instructions (vsprintf number()'s `num % base` digit
-+/// index measured [0..22] instead of [12..15]).
-+#[allow(clippy::too_many_arguments)]
- fn extend_use_following_copies(
-     start_id: u32,
-     point: u32,
-     block_idx: usize,
-     alloca_set: &FxHashSet<u32>,
-     id_to_dense: &FxHashMap<u32, usize>,
-+    def_points: &[u32],
-+    block_range: &(u32, u32),
-     copy_src: &FxHashMap<u32, Vec<u32>>,
-     last_use_points: &mut [u32],
-     block_gen: &mut [BitSet],
-@@ -896,7 +919,15 @@ fn extend_use_following_copies(
-             if *entry == u32::MAX || point > *entry {
-                 *entry = point;
-             }
--            block_gen[block_idx].insert(dense);
-+            // Only values whose def is NOT inside the consuming block are
-+            // live at its entry. SSA dominance guarantees a same-block def
-+            // precedes the use, so the fat interval already covers it.
-+            let def_in_block = def_points[dense] != u32::MAX
-+                && def_points[dense] >= block_range.0
-+                && def_points[dense] <= block_range.1;
-+            if !def_in_block {
-+                block_gen[block_idx].insert(dense);
-+            }
+             m += 1;
+             cnt += 1;
          }
-         if let Some(srcs) = copy_src.get(&id) {
-             for &src in srcs {
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index b631ab0..c99a7eb 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -10,8 +10,8 @@
- 
- use super::live_range::{self, LinearScanAllocator};
- use super::liveness::{
--    LiveInterval, LivenessResult, compute_live_intervals, for_each_operand_in_instruction,
--    for_each_operand_in_terminator, for_each_value_use_in_instruction,
-+    compute_live_intervals, for_each_operand_in_instruction, for_each_operand_in_terminator,
-+    for_each_value_use_in_instruction, LiveInterval, LivenessResult,
- };
- use crate::common::fx_hash::{FxHashMap, FxHashSet};
- use crate::common::types::IrType;
-@@ -71,7 +71,11 @@ pub fn analyze_accumulator_assignments(
-         }
-         return analyze_accumulator_assignments_impl(func, policy, &filtered);
-     }
--    analyze_accumulator_assignments_impl(func, policy, &candidates.into_iter().collect::<Vec<u32>>())
-+    analyze_accumulator_assignments_impl(
-+        func,
-+        policy,
-+        &candidates.into_iter().collect::<Vec<u32>>(),
-+    )
- }
- 
- fn analyze_accumulator_assignments_impl(
-@@ -561,7 +565,9 @@ pub(crate) fn compute_i686_divrem_pairs(
-             // Head = i (earlier), tail = j. The partner's result register:
-             // quotient ops read %eax, remainder ops read %edx.
-             let partner_from_eax = div_flavor(*op_j) == Some(true);
--            pairs.head_partners.insert(*dest_i, (*dest_j, partner_from_eax));
-+            pairs
-+                .head_partners
-+                .insert(*dest_i, (*dest_j, partner_from_eax));
-             pairs.tail_dests.insert(*dest_j);
-             pairs.tail_points.insert((bi, cands[j].0));
-             pairs
-@@ -604,6 +610,492 @@ fn patch_divrem_tail_intervals(func: &IrFunction, liveness: &mut LivenessResult)
-         .sort_by(|a, b| (a.start, a.value_id).cmp(&(b.start, b.value_id)));
- }
- 
-+/// One detected `t2 = t + v` tail of a mul-accumulate chain, where `t` is a
-+/// same-block i64 Mul whose ONLY use is this Add. The emitter fuses the whole
-+/// `res*base + val` expression at the Mul (the head): it computes the product
-+/// in %eax:%edx with the zero-high-half short shape, adds the (provably
-+/// zero-extended) addend in place, and stores ONLY the tail dest. The tail
-+/// emits nothing. The product `t` is dead-by-construction (single use) and is
-+/// never stored, eliminating the slot round-trip.
-+#[derive(Debug, Clone)]
-+pub(crate) struct MulAccChain {
-+    /// Dest of the head (Mul) instruction `t`.
-+    pub head_dest: u32,
-+    /// Dest of the tail (Add) instruction `t2`.
-+    pub tail_dest: u32,
-+    /// Program point of the head (Mul) instruction.
-+    pub head_point: u32,
-+    /// The Mul's lhs (res).
-+    pub lhs: Operand,
-+    /// The Mul's rhs (base): i64 constant with zero high half, or a Value.
-+    pub rhs: Operand,
-+    /// If the rhs is a single-use zext cast whose 32-bit source is defined
-+    /// before the head, its dest value-id (a VIRTUAL feeder candidate: the
-+    /// cast may emit nothing and the head references the source directly).
-+    pub rhs_feeder: Option<u32>,
-+    /// The Add's rhs (addend val): i64 constant with zero high half, or a
-+    /// Value that is a zext-widening cast dest (or a feeder).
-+    pub addend: Operand,
-+    /// Feeder candidate for the addend (same rules as `rhs_feeder`).
-+    pub addend_feeder: Option<u32>,
-+    /// True when the addend's defining zext cast sits BETWEEN head and tail:
-+    /// the addend is then only readable through its feeder source (the cast
-+    /// dest's slot is not yet written at the head point).
-+    pub addend_cast_after_head: bool,
-+    /// Single-use I64<->U64 no-op cast dests crossed by the operand
-+    /// canonicalization (rhs and/or addend). Their ONLY reader is the chain
-+    /// (the tail or the head operand position); when the chain fuses, that
-+    /// reader emits nothing, so these casts are DEAD and the emitter
-+    /// suppresses their slot-pair copies.
-+    pub dead_nop_casts: Vec<u32>,
-+}
-+
-+impl MulAccChain {
-+    /// Feeder candidates (zext cast dests) feeding this chain.
-+    pub fn feeders(&self) -> impl Iterator<Item = u32> + '_ {
-+        self.rhs_feeder.into_iter().chain(self.addend_feeder)
-+    }
-+}
-+
-+pub(crate) struct I686MulAccChains {
-+    /// All detected chains (the emitter resolves fusibility per chain AFTER
-+    /// register allocation, when homes/slots are final).
-+    pub chains: Vec<MulAccChain>,
-+    /// head (Mul) dest -> index into `chains`.
-+    pub head_of: FxHashMap<u32, usize>,
-+    /// tail (Add) dest -> index into `chains`.
-+    pub tail_of: FxHashMap<u32, usize>,
-+}
-+
-+/// Same-block i64 mul-accumulate chain analysis — the parser hot shape
-+/// `res = res*base + val` (kstrtoull/simple_strtoull). Deterministic,
-+/// derived from the same IR by emitter and RA (mirrors the divrem-pair
-+/// contract). Conditions:
-+///
-+/// - Head: an `I64/U64 Mul` whose result `t` has exactly ONE use in the
-+///   whole function: the tail Add. (Otherwise the product must exist
-+///   independently and cannot be folded into the fused store.)
-+/// - Tail: an `I64/U64 Add(t, v)` in the same block, after the head.
-+/// - The rhs (base) and the addend (val) must each be either an i64 constant
-+///   with a provably zero high half (< 2^32), or the dest of a
-+///   ZERO-extending cast (u8/u16/u32/ptr -> i64/u64) — the high half is then
-+///   provably zero, so the fused `adcl $0` and the 3-term product shape are
-+///   sound. Sign-extending casts and general 64-bit values reject the chain.
-+/// - A zext operand with a single function-wide use becomes a VIRTUAL
-+///   feeder candidate: its cast may emit nothing, and the head reads the
-+///   32-bit SOURCE directly. The source must be defined before the head
-+///   (SSA gives this for free for the rhs; for the addend the cast may sit
-+///   between head and tail, so the source's def point is checked).
-+///
-+/// Kill switch: `CCC_NO_MULACC` (both the RA patch and the emitter respect it).
-+pub(crate) fn compute_i686_mulacc_chains(func: &IrFunction) -> I686MulAccChains {
-+    let mut out = I686MulAccChains {
-+        chains: Vec::new(),
-+        head_of: FxHashMap::default(),
-+        tail_of: FxHashMap::default(),
-+    };
-+    if std::env::var_os("CCC_NO_MULACC").is_some() {
-+        return out;
-+    }
-+
-+    // Program-point numbering identical to liveness/the hazard scan.
-+    let mut block_start: Vec<u32> = Vec::with_capacity(func.blocks.len());
-+    let mut pt = 0u32;
-+    for block in &func.blocks {
-+        block_start.push(pt);
-+        pt += block.instructions.len() as u32 + 1;
-+    }
-+
-+    // Function-wide use counts (instructions + terminators).
-+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            for_each_operand_in_instruction(inst, |op| {
-+                if let Operand::Value(v) = op {
-+                    *use_count.entry(v.0).or_insert(0) += 1;
-+                }
-+            });
-+        }
-+        for_each_operand_in_terminator(&block.terminator, |op| {
-+            if let Operand::Value(v) = op {
-+                *use_count.entry(v.0).or_insert(0) += 1;
-+            }
-+        });
-+    }
-+
-+    let is_wide_ty = |ty: &IrType| matches!(ty, IrType::I64 | IrType::U64);
-+    let zext_from = |from_ty: &IrType, to_ty: &IrType| {
-+        matches!(
-+            (from_ty, to_ty),
-+            (
-+                IrType::U8 | IrType::U16 | IrType::U32 | IrType::Ptr,
-+                IrType::I64 | IrType::U64
-+            )
-+        )
-+    };
-+    // Constant with provably zero high half.
-+    let const_hi_zero = |op: &Operand| match op {
-+        Operand::Const(IrConst::Zero) => true,
-+        Operand::Const(c) => c.to_i64().is_some_and(|v| {
-+            let v = v as u128 & 0xFFFF_FFFF_FFFF_FFFF;
-+            v >> 32 == 0
-+        }),
-+        _ => false,
-+    };
-+
-+    // Same-size wide reinterpretation casts (I64<->U64): bit-identical
-+    // values; their emitter materialisation is a slot-pair copy. The chain
-+    // analysis canonicalizes operands THROUGH them so a C sandwich like
-+    // `res*base + (u64)(s64)val` still exposes its real widening feeder.
-+    // SOUNDNESS: the lookthrough only crosses a no-op cast whose dest has a
-+    // SINGLE use — the chain consuming it. A multi-use no-op dest keeps
-+    // other readers, its copy must materialise, and that copy reads the
-+    // feeder's slot: crossing it would leave the copy reading the
-+    // never-written slot of a VIRTUALIZED feeder (use-after-death).
-+    // Crossed single-use no-op dests are recorded: they are dead when the
-+    // chain fuses (their one reader, the tail, emits nothing) and the
-+    // emitter then suppresses the copy. Depth-capped against pathological
-+    // chains; beyond the cap the operand resolves as-is.
-+    let mut wide_nop_casts: FxHashMap<u32, Operand> = FxHashMap::default();
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            if let Instruction::Cast {
-+                dest,
-+                src,
-+                from_ty,
-+                to_ty,
-+            } = inst
-+            {
-+                if is_wide_ty(from_ty) && is_wide_ty(to_ty) {
-+                    wide_nop_casts.insert(dest.0, src.clone());
-+                }
-+            }
-+        }
-+    }
-+    // (canonical operand, single-use no-op cast dests crossed on the way)
-+    let canon = |op: &Operand| -> (Operand, Vec<u32>) {
-+        let mut crossed = Vec::new();
-+        let mut cur = op.clone();
-+        for _ in 0..8 {
-+            match &cur {
-+                Operand::Value(v) => {
-+                    let single_use = use_count.get(&v.0).copied().unwrap_or(0) == 1;
-+                    match wide_nop_casts.get(&v.0) {
-+                        Some(next) if single_use => {
-+                            crossed.push(v.0);
-+                            cur = next.clone();
-+                        }
-+                        _ => break,
-+                    }
-+                }
-+                _ => break,
-+            }
-+        }
-+        (cur, crossed)
-+    };
-+
-+    for (bi, block) in func.blocks.iter().enumerate() {
-+        // Widening (to i64/u64) cast dests in this block:
-+        // dest -> (src operand, inst idx, is_zext). Sext casts qualify as
-+        // ADDEND feeders only (their high half is the sign replication).
-+        let mut widening_casts: FxHashMap<u32, (Operand, usize, bool)> = FxHashMap::default();
-+        // Def points of every value defined in this block (params are
-+        // entry-defined: point 0 dominates everything).
-+        let mut def_point: FxHashMap<u32, u32> = FxHashMap::default();
-+        // i64 Muls: (inst idx, dest, lhs, rhs).
-+        let mut muls: Vec<(usize, u32, Operand, Operand, Vec<u32>)> = Vec::new();
-+        for (ii, inst) in block.instructions.iter().enumerate() {
-+            match inst {
-+                Instruction::Cast {
-+                    dest,
-+                    src,
-+                    from_ty,
-+                    to_ty,
-+                } => {
-+                    if is_wide_ty(to_ty)
-+                        && !is_wide_ty(from_ty)
-+                        && matches!(
-+                            from_ty,
-+                            IrType::U8
-+                                | IrType::U16
-+                                | IrType::U32
-+                                | IrType::Ptr
-+                                | IrType::I8
-+                                | IrType::I16
-+                                | IrType::I32
-+                        )
-+                    {
-+                        let z = zext_from(from_ty, to_ty);
-+                        widening_casts.insert(dest.0, (src.clone(), ii, z));
-+                    }
-+                    def_point.insert(dest.0, block_start[bi] + ii as u32);
-+                }
-+                Instruction::BinOp {
-+                    dest,
-+                    op: IrBinOp::Mul,
-+                    ty,
-+                    lhs,
-+                    rhs,
-+                    ..
-+                } if is_wide_ty(ty) => {
-+                    def_point.insert(dest.0, block_start[bi] + ii as u32);
-+                    // Canonicalize the rhs through single-use I64<->U64
-+                    // no-op casts; the crossed dests die with the chain.
-+                    let (rhs_canon, rhs_dead_nops) = canon(rhs);
-+                    muls.push((ii, dest.0, lhs.clone(), rhs_canon, rhs_dead_nops));
-+                }
-+                Instruction::BinOp { dest, .. } => {
-+                    def_point.insert(dest.0, block_start[bi] + ii as u32);
-+                }
-+                _ => {
-+                    // Other defining instructions (Load, UnaryOp, Cmp, ...).
-+                    if let Some(dest) = inst.dest() {
-+                        def_point.insert(dest.0, block_start[bi] + ii as u32);
-+                    }
-+                }
-+            }
-+        }
-+
-+        // Source of `op` defined (strictly) before `limit` in this block, or
-+        // defined elsewhere (params / other blocks) — always available.
-+        let src_available_before = |op: &Operand, limit: u32| -> bool {
-+            match op {
-+                Operand::Const(_) => true,
-+                Operand::Value(v) => match def_point.get(&v.0) {
-+                    Some(&dp) => dp < limit,
-+                    None => true, // defined in another block / param
-+                },
-+            }
-+        };
-+
-+        // Resolve the MUL's RHS (base): zext-provable or zero-high constant
-+        // only — the fused 3-term product shape needs bhi = 0. `op` is
-+        // ALREADY canonicalized (I64<->U64 no-op casts stripped) by the
-+        // muls-table builder.
-+        let resolve_rhs = |op: &Operand, use_point: u32| -> Option<(Operand, Option<u32>)> {
-+            match op {
-+                Operand::Const(_) if const_hi_zero(op) => Some((op.clone(), None)),
-+                Operand::Value(v) => {
-+                    let single_use = use_count.get(&v.0).copied().unwrap_or(0) == 1;
-+                    if let Some((src, _cast_idx, is_zext)) = widening_casts.get(&v.0) {
-+                        if !is_zext {
-+                            return None; // sext base: bhi unprovable
-+                        }
-+                        // SSA guarantees the cast precedes the head (the
-+                        // Mul uses v), so the source is available there.
-+                        if single_use && src_available_before(src, use_point) {
-+                            Some((op.clone(), Some(v.0)))
-+                        } else {
-+                            // Materialized zext before the head: readable
-+                            // from the slot low half.
-+                            Some((op.clone(), None))
-+                        }
-+                    } else {
-+                        // Cross-block zext dest: the emitter's zext proof
-+                        // (zext_wide_values) gates it. Same-block non-cast
-+                        // defs are not provably zero-high.
-+                        match def_point.get(&v.0) {
-+                            Some(_) => None,
-+                            None => Some((op.clone(), None)),
-+                        }
-+                    }
-+                }
-+                _ => None,
-+            }
-+        };
-+
-+        // Resolve the ADDEND (val): far more permissive — both halves are
-+        // readable from a materialized slot pair, so ANY wide value defined
-+        // (or materialized) before the head works; constants carry lo+hi;
-+        // single-use widening casts (zext OR sext) become feeder candidates.
-+        // `op` is ALREADY canonicalized by the tail-loop caller.
-+        let resolve_addend =
-+            |op: &Operand, use_point: u32, after_head: bool| -> Option<(Operand, Option<u32>)> {
-+                match op {
-+                    Operand::Const(c) if c.to_i64().is_some() => Some((op.clone(), None)),
-+                    Operand::Value(v) => {
-+                        let single_use = use_count.get(&v.0).copied().unwrap_or(0) == 1;
-+                        if let Some((src, cast_idx, _is_zext)) = widening_casts.get(&v.0) {
-+                            if single_use && src_available_before(src, use_point) {
-+                                Some((op.clone(), Some(v.0)))
-+                            } else if (block_start[bi] + *cast_idx as u32) < use_point {
-+                                // Multi-use widening cast before the head:
-+                                // materialized, both halves in its slot pair.
-+                                Some((op.clone(), None))
-+                            } else {
-+                                // Cast between head and tail, not a feeder: its
-+                                // slot is not yet written at the head point.
-+                                None
-+                            }
-+                        } else {
-+                            // Non-cast Value: sound iff defined before the head
-+                            // (materialized with a slot) or cross-block.
-+                            match def_point.get(&v.0) {
-+                                Some(&dp) if dp < use_point => Some((op.clone(), None)),
-+                                Some(_) => None,
-+                                None => Some((op.clone(), None)),
-+                            }
-+                        }
-+                    }
-+                    _ => None,
-+                }
-+            };
-+
-+        // Tail Adds: t2 = Add(t, v).
-+        for (ii, inst) in block.instructions.iter().enumerate() {
-+            let Instruction::BinOp {
-+                dest,
-+                op: IrBinOp::Add,
-+                ty,
-+                lhs,
-+                rhs,
-+                ..
-+            } = inst
-+            else {
-+                continue;
-+            };
-+            if !is_wide_ty(ty) {
-+                continue;
-+            }
-+            let Operand::Value(t) = lhs else { continue };
-+            // Head: a same-block i64 Mul defining t, before this Add.
-+            let Some(&(mul_idx, head_dest, ref head_lhs, ref head_rhs, ref rhs_dead_nops)) =
-+                muls.iter().find(|(mi, md, ..)| *md == t.0 && *mi < ii)
-+            else {
-+                continue;
-+            };
-+            // t's single use must be this Add.
-+            if use_count.get(&t.0).copied().unwrap_or(0) != 1 {
-+                continue;
-+            }
-+            let head_point = block_start[bi] + mul_idx as u32;
-+            // Addend: value use point is the head (the fused add reads it at
-+            // the head); after_head marks materializations sitting between
-+            // head and tail (unreadable at the head point). Computed on the
-+            // CANONICAL addend operand (through single-use I64<->U64 no-op
-+            // casts; the crossed dests die with the chain).
-+            let (addend_canon, addend_dead_nops) = canon(rhs);
-+            let after_head = match &addend_canon {
-+                Operand::Value(v) => widening_casts
-+                    .get(&v.0)
-+                    .is_some_and(|(_, ci, _)| *ci > mul_idx),
-+                _ => false,
-+            };
-+            let Some((addend, addend_feeder)) =
-+                resolve_addend(&addend_canon, head_point, after_head)
-+            else {
-+                continue;
-+            };
-+            // RHS: SSA guarantees the cast (if any) is before the head.
-+            let Some((rhs_op, rhs_feeder)) = resolve_rhs(head_rhs, head_point) else {
-+                continue;
-+            };
-+            let mut dead_nop_casts = rhs_dead_nops.clone();
-+            dead_nop_casts.extend(addend_dead_nops.iter().copied());
-+            let chain = MulAccChain {
-+                head_dest,
-+                tail_dest: dest.0,
-+                head_point,
-+                lhs: head_lhs.clone(),
-+                rhs: rhs_op,
-+                rhs_feeder,
-+                addend,
-+                addend_feeder,
-+                addend_cast_after_head: after_head,
-+                dead_nop_casts,
-+            };
-+            out.head_of.insert(head_dest, out.chains.len());
-+            out.tail_of.insert(dest.0, out.chains.len());
-+            out.chains.push(chain);
-+        }
-+    }
-+    out
-+}
-+
-+/// Mul-acc chain tails are physically born at their HEAD's fused store; the
-+/// fused head also reads the feeder SOURCES (whose natural death is their
-+//  zext cast, potentially before the head). Patch both interval families
-+/// before any interval map is derived — the divrem-tail contract.
-+fn patch_mulacc_intervals(func: &IrFunction, liveness: &mut LivenessResult) {
-+    let chains = compute_i686_mulacc_chains(func);
-+    if chains.chains.is_empty() {
-+        return;
-+    }
-+    // Feeder cast dest -> source operand (re-walked here; the table keeps
-+    // only value-ids so the emitter can re-resolve against final homes).
-+    let mut feeder_cast_src: FxHashMap<u32, Operand> = FxHashMap::default();
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            if let Instruction::Cast {
-+                dest,
-+                src,
-+                from_ty,
-+                to_ty,
-+            } = inst
-+            {
-+                // ALL widening feeders (zext AND sext): the fused head reads
-+                // the 32-bit SOURCE directly in both cases — zext for the
-+                // rhs (bhi=0 proof), sext for the addend (AddendHi::Sext,
-+                // sarl replication). Restricting the source-liveness
-+                // extension to zext feeders left a use-after-death window
-+                // for SEXT addend feeders whose cast precedes the head:
-+                // the source's interval ended at the cast, the RA reused
-+                // its home between cast and head, and the fused head read
-+                // the clobbered register.
-+                let widening = matches!(
-+                    (from_ty, to_ty),
-+                    (
-+                        IrType::U8
-+                            | IrType::U16
-+                            | IrType::U32
-+                            | IrType::Ptr
-+                            | IrType::I8
-+                            | IrType::I16
-+                            | IrType::I32,
-+                        IrType::I64 | IrType::U64
-+                    )
-+                );
-+                if widening {
-+                    feeder_cast_src.insert(dest.0, src.clone());
-+                }
-+            }
-+        }
-+    }
-+    for chain in &chains.chains {
-+        // Tail dest born at the head point.
-+        for iv in &mut liveness.intervals {
-+            if iv.value_id == chain.tail_dest && chain.head_point < iv.start {
-+                iv.start = chain.head_point;
-+            }
-+        }
-+        for seg in &mut liveness.segments {
-+            if seg.value_id == chain.tail_dest && chain.head_point < seg.start {
-+                seg.start = chain.head_point;
-+            }
-+        }
-+        // Feeder sources live until the head point.
-+        for f in chain.feeders() {
-+            let Some(src) = feeder_cast_src.get(&f) else {
-+                continue;
-+            };
-+            let Operand::Value(sv) = src else { continue };
-+            for iv in &mut liveness.intervals {
-+                if iv.value_id == sv.0 && iv.end < chain.head_point {
-+                    iv.end = chain.head_point;
-+                }
-+            }
-+            for seg in &mut liveness.segments {
-+                if seg.value_id == sv.0 && seg.end < chain.head_point {
-+                    seg.end = chain.head_point;
-+                }
-+            }
-+        }
-+    }
-+    liveness
-+        .segments
-+        .sort_by(|a, b| (a.start, a.value_id).cmp(&(b.start, b.value_id)));
-+}
-+
- fn loop_weight(depth: u32) -> u64 {
-     match depth {
-         0 => 1,
-@@ -742,6 +1234,44 @@ fn collect_safe_folded_index_homes(
-             }
-         }
-     }
-+    // RA-23 follow-up: fresh-arithmetic hidden indexes. A value whose def is
-+    // a pure BinOp (URem/Shl/Add/... — born fresh each iteration, never a
-+    // Copy/Phi web member) and whose SINGLE function-wide use feeds a folded
-+    // GEP's offset chain. vsprintf number()'s digit loop: the URem remainder
-+    // is the natural index of the digits load; keeping it eligible lets the
-+    // caller-saved phases home it in %edx (born there at the fused div) and
-+    // the load folds to `movsbl digits(,%edx),%eax` — GCC's shape, −5
-+    // instructions per iteration. Single-use ⇒ the value is the source of
-+    // no Copy and the dest of no Phi ⇒ no coalescing web ⇒ none of the RA-23
-+    // materialization ambiguity the narrow And-mask exception guards against;
-+    // the emitter still folds only when a physical home was actually
-+    // assigned, and an unhomed value keeps its accumulator-flow shape.
-+    let mut use_counts: FxHashMap<u32, u32> = FxHashMap::default();
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            for_each_operand_in_instruction(inst, |op| {
-+                if let Operand::Value(v) = op {
-+                    *use_counts.entry(v.0).or_insert(0) += 1;
-+                }
-+            });
-+        }
-+        for_each_operand_in_terminator(&block.terminator, |op| {
-+            if let Operand::Value(v) = op {
-+                *use_counts.entry(v.0).or_insert(0) += 1;
-+            }
-+        });
-+    }
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            if let Instruction::BinOp { dest, .. } = inst {
-+                if folded_index_uses.contains_key(&dest.0)
-+                    && use_counts.get(&dest.0).copied() == Some(1)
-+                {
-+                    result.insert(dest.0);
-+                }
-+            }
-+        }
-+    }
-     result
- }
- 
-@@ -954,10 +1484,13 @@ fn build_coalesce_groups(
-     if !latch_dests.is_empty() {
-         for block in &func.blocks {
-             for w in block.instructions.windows(2) {
--                if let (prev, Instruction::Copy {
--                    dest: d,
--                    src: Operand::Value(s),
--                }) = (&w[0], &w[1])
-+                if let (
-+                    prev,
-+                    Instruction::Copy {
-+                        dest: d,
-+                        src: Operand::Value(s),
-+                    },
-+                ) = (&w[0], &w[1])
-                 {
-                     if latch_dests.contains(&d.0) {
-                         if let Some(pd) = prev.dest() {
-@@ -1193,7 +1726,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-             )
-         })
-     });
--    if has_builtin_setjmp || (config.available_regs.is_empty() && config.caller_saved_regs.is_empty()) {
-+    if has_builtin_setjmp
-+        || (config.available_regs.is_empty() && config.caller_saved_regs.is_empty())
-+    {
-         return RegAllocResult {
-             assignments: FxHashMap::default(),
-             accumulator_assignments: if has_builtin_setjmp {
-@@ -1213,6 +1748,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-     // extend their intervals before ANY interval map is derived. Without
-     // this, homes/slots in the head..tail window get double-assigned.
-     patch_divrem_tail_intervals(func, &mut liveness);
-+    // Mul-acc chain tails are born at their head's fused store, and the
-+    // virtual feeder sources live until the head reads them — same contract.
-+    patch_mulacc_intervals(func, &mut liveness);
-     // Extend live intervals for backend-folded index consumers BEFORE any
-     // interval map is derived (see RegAllocConfig::folded_index_uses).
-     if !config.folded_index_uses.is_empty() && !env_on("CCC_NO_FOLDED_INDEX_LIVENESS") {
-@@ -1264,6 +1802,18 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-         .first()
-         .is_some_and(|r| (20..=33).contains(&r.0));
-     let non_gpr_values = collect_non_gpr_values(func, is_32bit);
-+    // Dest values of indexed-fold GEPs: single-use address temporaries whose
-+    // register home is worthless when the SIB fold fires (they emit nothing)
-+    // and no better than a slot when it does not. Denied %ecx/%edx homes on
-+    // the i686 caller-saved pool so the loop-carried INDEX can claim the
-+    // register instead (Phase 2/2d/2h filters; see
-+    // collect_i686_scratch_denials for the full denial policy: indexed-GEP
-+    // dests, their GlobalAddr bases and load dests, and div quotients).
-+    let scratch_denied = if is_32bit {
-+        crate::backend::generation::collect_i686_scratch_denials(func)
-+    } else {
-+        FxHashSet::default()
-+    };
-     // Values consumed as call arguments: their last read happens in the call's
-     // argument staging, which writes the ABI arg registers in order. A home in
-     // one of those registers (rdi/rsi/rdx/r8/r9 on x86-64) is clobbered by an
-@@ -1673,6 +2223,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                     .iter()
-                     .copied()
-                     .filter(|iv| base_ok(&assignments, iv))
-+                    .filter(|iv| !scratch_denied.contains(&iv.value_id))
-                     .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
-                     .collect();
-                 if env_on("CCC_DEBUG_RA_INTERVALS") {
-@@ -1960,8 +2511,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-             }
-         }
-         if !ecx_clean_ptrs.is_empty() {
--            let (ecx_hazards2, edx_hazards2) =
--                collect_i686_scratch_hazard_points(func, &non_gpr_values, &ecx_clean_ptrs);
-+            let (ecx_hazards2, edx_hazards2) = collect_i686_scratch_hazard_points_refined(
-+                func,
-+                &non_gpr_values,
-+                &ecx_clean_ptrs,
-+                Some(&assignments),
-+            );
-             for (reg, reg_hazards) in [(PhysReg(5), &edx_hazards2), (PhysReg(4), &ecx_hazards2)] {
-                 if !config.caller_saved_regs.contains(&reg) {
-                     continue;
-@@ -1984,6 +2539,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                     .filter(|iv| {
-                         !assignments.contains_key(&iv.value_id)
-                             && !call_spanning.contains(&iv.value_id)
-+                            && !scratch_denied.contains(&iv.value_id)
-                             && (x86_ordered_param_copies
-                                 || !param_restricted.contains(&iv.value_id))
-                     })
-@@ -2249,10 +2805,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-         .iter()
-         .any(|r| matches!(r.0, 4 | 5))
-         && config.available_regs.iter().all(|r| r.0 <= 3);
--    if !env_on("CCC_NO_HOT_WEB_STEAL")
--        && i686_narrow_pool
--        && !all_phi_pairs.is_empty()
--    {
-+    if !env_on("CCC_NO_HOT_WEB_STEAL") && i686_narrow_pool && !all_phi_pairs.is_empty() {
-         let k: usize = std::env::var("CCC_HOT_WEB_STEAL")
-             .ok()
-             .and_then(|s| s.parse().ok())
-@@ -2307,9 +2860,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                 if !config.available_regs.iter().any(|r| r.0 == reg_id) {
-                     continue;
+@@ -3903,6 +3915,14 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+                     break;
                  }
--                if holders.iter().any(|h| {
--                    phi_pair_values.contains(h) || config.reg_hints.contains_key(h)
--                }) {
-+                if holders
-+                    .iter()
-+                    .any(|h| phi_pair_values.contains(h) || config.reg_hints.contains_key(h))
-+                {
-                     continue;
-                 }
-                 let evict: Vec<u32> = holders
-@@ -2348,6 +2902,173 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-         }
-         propagate_coalesce_members(&mut assignments, &coalesce_member_of);
+                 let s3 = trimmed(store, &infos[k2], k2);
++                // A conditional branch of ANY synonym spelling ends the
++                // provable region: its target may rejoin and read the
++                // carrier. (The classifier may fold rare spellings like
++                // `jc` into Other — is_cond_jcc is the authoritative
++                // mnemonic list.)
++                if is_cond_jcc(s3) {
++                    break;
++                }
+                 let written = match infos[k2].kind {
+                     LineKind::Other { dest_reg } => dest_reg == c,
+                     LineKind::Move { dst, .. } => dst == c,
+@@ -10889,6 +10909,111 @@ mod tests {
+         assert_eq!(r.matches("xorl %eax, %eax").count(), 2, "both kept: {}", r);
      }
-+
-+    // Phase 2h (i686): iterated hazard refinement.  Phase 2/2d treated every
-+    // Div/Rem as an %ecx hazard (divisor staging) and every gpr32 Load as an
-+    // %edx hazard.  With the final Phase-1..2g assignments in hand, two
-+    // hazard classes refine (see collect_i686_scratch_hazard_points_refined):
-+    // div/rem with a register-homed divisor ∉ {edx,eax} is %ecx-clean, and
-+    // GEP-pointer loads are %edx-clean.  Each round hands the newly-free
-+    // caller-saved registers to still-unassigned values — which can unlock
-+    // the next round's refinements (a value homed by round 1 can be the
-+    // direct divisor that cleans round 2's div points).  Two rounds capture
-+    // the practical fixpoint; each round is the Phase-2d model: no overlap
-+    // with refined hazards NOR with existing holders of the register.
+ 
++    // ── fuse_setcc_branch red-team tests ──
 +    //
-+    // Boot-corpus payoff: vsprintf number()'s digit loop — the remainder is
-+    // born in %edx at the fused div, survives the digits GEP (edx-clean) and
-+    // the indexed load (refined edx-clean), so it keeps %edx and the load
-+    // folds to `movsbl digits(,%edx),%eax` — GCC's shape, −5 insns/iter.
-+    if !env_on("CCC_NO_ITERATED_HAZARD")
-+        && config
-+            .caller_saved_regs
-+            .iter()
-+            .any(|r| matches!(r.0, 4 | 5))
-+    {
-+        // Phase 2d's pointer-cleanliness set (loads whose pointers stage no
-+        // %ecx) — recomputed here for the refined hazard collection.
-+        let ecx_clean_ptrs_2h: FxHashSet<u32> = {
-+            let mut alloca_dests: FxHashSet<u32> = FxHashSet::default();
-+            for block in &func.blocks {
-+                for inst in &block.instructions {
-+                    if let Instruction::Alloca { dest, .. } = inst {
-+                        alloca_dests.insert(dest.0);
-+                    }
-+                }
-+            }
-+            let mut ptr_all_clean: FxHashMap<u32, bool> = FxHashMap::default();
-+            for block in &func.blocks {
-+                for inst in &block.instructions {
-+                    if let Instruction::Load { ptr, dest, ty, .. } = inst {
-+                        let gpr32 = matches!(
-+                            ty,
-+                            IrType::I8
-+                                | IrType::U8
-+                                | IrType::I16
-+                                | IrType::U16
-+                                | IrType::I32
-+                                | IrType::U32
-+                                | IrType::Ptr
-+                        );
-+                        if !gpr32 {
-+                            continue;
-+                        }
-+                        let clean_here = assignments.contains_key(&ptr.0)
-+                            && !alloca_dests.contains(&ptr.0)
-+                            && assignments.contains_key(&dest.0);
-+                        *ptr_all_clean.entry(ptr.0).or_insert(true) &= clean_here;
-+                    }
-+                }
-+            }
-+            let mut set: FxHashSet<u32> = ptr_all_clean
-+                .into_iter()
-+                .filter(|(_, c)| *c)
-+                .map(|(v, _)| v)
-+                .collect();
-+            for &v in &config.never_materialized {
-+                set.insert(v);
-+            }
-+            set
-+        };
-+        for round in 0..2 {
-+            let (ecx_hazards_h, edx_hazards_h) = collect_i686_scratch_hazard_points_refined(
-+                func,
-+                &non_gpr_values,
-+                &ecx_clean_ptrs_2h,
-+                Some(&assignments),
-+            );
-+            if env_on("CCC_DEBUG_RA_INTERVALS") {
-+                eprintln!(
-+                    "[RA-P2h] fn={} round={} refined edx_hazards={:?}",
-+                    func.name, round, edx_hazards_h
-+                );
-+            }
-+            let mut assigned_this_round = 0usize;
-+            for (reg, reg_hazards) in [(PhysReg(5), &edx_hazards_h), (PhysReg(4), &ecx_hazards_h)] {
-+                if !config.caller_saved_regs.contains(&reg) {
-+                    continue;
-+                }
-+                let holders: Vec<(u32, u32)> = assignments
-+                    .iter()
-+                    .filter(|(_, &r)| r == reg)
-+                    .filter_map(|(&v, _)| iv_map.get(&v).copied())
-+                    .collect();
-+                if round == 0 && env_on("CCC_DEBUG_RA_INTERVALS") {
-+                    let holders_dbg: Vec<String> = assignments
-+                        .iter()
-+                        .filter(|(_, &r)| r == reg)
-+                        .filter_map(|(&v, _)| {
-+                            iv_map
-+                                .get(&v)
-+                                .map(|iv| format!("v{}[{}..{}]", v, iv.0, iv.1))
-+                        })
-+                        .collect();
-+                    eprintln!(
-+                        "[RA-P2h] fn={} reg={:?} holders={:?}",
-+                        func.name, reg, holders_dbg
-+                    );
-+                }
-+                let intervals: Vec<LiveInterval> = scan_ivs
-+                    .iter()
-+                    .copied()
-+                    .filter(|iv| {
-+                        !assignments.contains_key(&iv.value_id)
-+                            && !call_spanning.contains(&iv.value_id)
-+                            && !scratch_denied.contains(&iv.value_id)
-+                            && (x86_ordered_param_copies
-+                                || !param_restricted.contains(&iv.value_id))
-+                    })
-+                    .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
-+                    .filter(|iv| {
-+                        !holders
-+                            .iter()
-+                            .any(|&h| intervals_overlap((iv.start, iv.end), h))
-+                    })
-+                    .collect();
-+                if env_on("CCC_DEBUG_RA_INTERVALS") {
-+                    #[allow(unused_mut)]
-+                    let mut unassigned: Vec<String> = scan_ivs
-+                        .iter()
-+                        .filter(|iv| {
-+                            !assignments.contains_key(&iv.value_id)
-+                                && !call_spanning.contains(&iv.value_id)
-+                                && !scratch_denied.contains(&iv.value_id)
-+                                && (x86_ordered_param_copies
-+                                    || !param_restricted.contains(&iv.value_id))
-+                        })
-+                        .map(|iv| format!("{}:[{}..{}]", iv.value_id, iv.start, iv.end))
-+                        .collect();
-+                    let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
-+                    eprintln!(
-+                        "[RA-P2h] fn={} round={} reg={:?} unassigned={:?} candidates={:?}",
-+                        func.name, round, reg, unassigned, cands
-+                    );
-+                }
-+                if intervals.is_empty() {
-+                    continue;
-+                }
-+                let ranges = build_gpr_ranges(&intervals);
-+                let mut alloc = LinearScanAllocator::new(ranges, vec![reg]);
-+                alloc.run();
-+                for (vid, r) in alloc.assignments {
-+                    assignments.insert(vid, r);
-+                    caller_used_regs_set.insert(r.0);
-+                    assigned_this_round += 1;
-+                }
-+            }
-+            propagate_coalesce_members(&mut assignments, &coalesce_member_of);
-+            if assigned_this_round == 0 {
-+                break;
-+            }
-+            if env_on("CCC_DEBUG_RA_INTERVALS") {
-+                eprintln!(
-+                    "[RA-P2h] fn={} round={} assigned={}",
-+                    func.name, round, assigned_this_round
-+                );
-+            }
-+        }
++    // Canonical fused shape (the emitter's real relay chain):
++    //   orl; setne %al; movzbl %al,%eax; movl %eax,%edx; testl %eax,%edx; jne
++    // The test is redundant: setCC→movzbl→movl all preserve EFLAGS, so the
++    // jcc can read the producer's ZF (identical: bool==0 ⇔ or-result==0).
++
++    #[test]
++    fn setcc_fuse_drops_dead_window() {
++        // Both carriers rewritten before any read or label: the whole
++        // window (setCC..relay) is dead and disappears. invert_cc("ne")
++        // == "e", so the rewritten je is textually unchanged but now
++        // consumes the producer's flags.
++        let asm = "f:\n    orl %ebx, %eax\n    setne %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n    movl $7, %eax\n    movl $8, %edx\n    xorl %ecx, %ecx\n.L1:\n    movl %ecx, %eax\n    ret\n";
++        let r = peephole_optimize(asm.to_string());
++        assert!(!r.contains("testl"), "test dropped: {}", r);
++        assert!(!r.contains("setne"), "dead window NOPed: {}", r);
++        assert!(r.contains("je .L1"), "branch onto producer flags: {}", r);
 +    }
 +
-     // Phase 2f (all targets): fill holes in ALREADY-SAVED callee registers
-     // using the CFG-aware liveness segments. The primary scan deliberately
-     // retains one fat [def,last_use] interval per value, which is simple but
-@@ -2505,7 +3226,6 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-         }
-     }
- 
--
-     if env_on("CCC_DEBUG_RA") {
-         let mut v: Vec<(u32, u8)> = assignments.iter().map(|(k, r)| (*k, r.0)).collect();
-         v.sort_unstable();
-@@ -4156,7 +4876,8 @@ fn collect_f64_values(func: &IrFunction) -> FxHashSet<u32> {
-                         | O::RoundScalarF32(_)
-                         | O::CopysignF64
-                         | O::CopysignF32
--                ) => {
-+                ) =>
-+                {
-                     f64_values.insert(d.0);
-                 }
-                 _ => {}
-@@ -4307,6 +5028,27 @@ fn collect_i686_scratch_hazard_points(
-     func: &IrFunction,
-     wide: &FxHashSet<u32>,
-     ecx_clean_load_ptrs: &FxHashSet<u32>,
-+) -> (Vec<u32>, Vec<u32>) {
-+    collect_i686_scratch_hazard_points_refined(func, wide, ecx_clean_load_ptrs, None)
++    #[test]
++    fn setcc_fuse_inverts_for_je() {
++        // sete's CC is "e": je (bool==0) inverts to jne (producer != 0).
++        let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n    movl $7, %eax\n    movl $8, %edx\n    xorl %ecx, %ecx\n.L1:\n    movl %ecx, %eax\n    ret\n";
++        let r = peephole_optimize(asm.to_string());
++        assert!(!r.contains("testl"), "test dropped: {}", r);
++        assert!(r.contains("jne .L1"), "je(sete) -> jne(producer inverted): {}", r);
++    }
++
++    // REGRESSION (audit finding): setCC writes only the low BYTE of its
++    // destination. `movzwl %ax, %r32` imports AH — garbage — into the
++    // bool, so ZF would not reflect it. The fusion must be refused and
++    // the window left untouched.
++    #[test]
++    fn setcc_fuse_refuses_movzwl_carrier() {
++        let asm = "f:\n    orl %ebx, %eax\n    setne %al\n    movzwl %ax, %edx\n    testl %eax, %edx\n    je .L1\n    xorl %ecx, %ecx\n.L1:\n    movl %ecx, %eax\n    ret\n";
++        let r = peephole_optimize(asm.to_string());
++        assert!(r.contains("testl %eax, %edx"), "test kept: {}", r);
++        assert!(r.contains("movzwl %ax, %edx"), "carrier kept: {}", r);
++    }
++
++    // REGRESSION (audit finding): a CondJmp after the fused branch is a
++    // flags READER (reader-check must precede the barrier check): after
++    // the rewrite it would consume the producer's flags instead of the
++    // dropped test's. The fusion must be refused.
++    #[test]
++    fn setcc_fuse_refuses_jcc_reader_after_branch() {
++        // Producer is a cmpl (no other pass may drop a cmpl-headed setCC
++        // test), and a WRONG fusion would rewrite je -> jne (invert of
++        // "e") — observable. The following jc is a flags reader the guard
++        // must see (reader-check before the barrier check).
++        let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n    jc .L2\n.L1:\n    xorl %ecx, %ecx\n    jmp .L3\n.L2:\n    xorl %ecx, %ecx\n.L3:\n    movl %ecx, %eax\n    ret\n";
++        let r = peephole_optimize(asm.to_string());
++        // The wrong-fusion signature is `jne` (invert of "e"). Other sound
++        // passes may normalize the redundant test's operands, so assert on
++        // the branch pair's semantics, not the test's exact spelling.
++        assert!(!r.contains("jne .L1"), "fusion must be refused: {}", r);
++        assert!(r.contains("testl"), "test kept: {}", r);
++        assert!(r.contains("je .L1"), "jcc untouched: {}", r);
++        assert!(r.contains("jc .L2"), "following reader untouched: {}", r);
++    }
++
++    // The guard skips block labels (the fallthrough physically enters the
++    // next block): a setCC there would read the producer's flags instead
++    // of the bool's. Refuse.
++    #[test]
++    fn setcc_fuse_refuses_setcc_reader_behind_label() {
++        // The guard skips the block label (fallthrough enters the next
++        // block) and must find the setCC reader there. cmpl producer: no
++        // other pass may drop this test, and a wrong fusion would show
++        // jne (invert of "e").
++        let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n.L1:\n    setne %cl\n    movzbl %cl, %ecx\n    movl %ecx, %eax\n    ret\n";
++        let r = peephole_optimize(asm.to_string());
++        assert!(!r.contains("jne .L1"), "fusion must be refused: {}", r);
++        assert!(r.contains("testl"), "test kept: {}", r);
++        // (je .L1 may additionally be deleted by the branch-to-next rule —
++        // also sound: the target IS the fallthrough here.)
++    }
++
++    // A flags WRITER between the branch and a later reader makes the fuse
++    // safe: the reader sees the writer's flags either way.
++    #[test]
++    fn setcc_fuse_allows_writer_before_reader() {
++        let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n.L1:\n    cmpl $2, %ecx\n    setne %cl\n    movzbl %cl, %ecx\n    movl %ecx, %eax\n    ret\n";
++        let r = peephole_optimize(asm.to_string());
++        // je targets the immediate fallthrough, so the (correct) branch
++        // elimination drops it entirely; the writer (cmpl) makes dropping
++        // the test safe for the later setCC reader.
++        assert!(!r.contains("testl %eax, %edx"), "test dropped: {}", r);
++        assert!(!r.contains("je .L1"), "branch to next removed: {}", r);
++        assert!(r.contains("cmpl $2, %ecx"), "flag writer present: {}", r);
++    }
++
++    // The bool is alive after the branch (stored to a slot): only the test
++    // may drop; the setCC/movzbl/relay window must survive intact.
++    #[test]
++    fn setcc_fuse_keeps_window_for_live_bool() {
++        let asm = "f:\n    orl %ebx, %eax\n    setne %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n.L1:\n    movl %edx, 8(%esp)\n    xorl %ecx, %ecx\n    movl 8(%esp), %eax\n    ret\n";
++        let r = peephole_optimize(asm.to_string());
++        assert!(!r.contains("testl %eax, %edx"), "test dropped: {}", r);
++        assert!(r.contains("setne %al"), "setCC kept (bool live): {}", r);
++        assert!(r.contains("movzbl %al, %eax"), "movzbl kept: {}", r);
++        assert!(r.contains("movl %eax, %edx"), "relay kept: {}", r);
++    }
++
+     // ── P16 constant staging through a register (numeric and symbol).
+     #[test]
+     fn const_staging_numeric_folded() {
+diff --git a/tests/regression/mulacc_chain_u64.c b/tests/regression/mulacc_chain_u64.c
+new file mode 100644
+index 00000000..c40b3766
+--- /dev/null
++++ b/tests/regression/mulacc_chain_u64.c
+@@ -0,0 +1,68 @@
++/* mul-accumulate chain fusion (i686): the parser hot shape
++ *   res = res * base + (u64)digit
++ * with kstrtoull-style overflow gates. The fused head computes the whole
++ * expression at the Mul point (3-term zero-high-half product + addend)
++ * and dual-stores only the tail; feeder zexts are virtual. Any error in
++ * the high-half accounting, feeder liveness, or the add paths shows up
++ * as a wrong digest here. Values include wraparound and the 2^32/2^63
++ * boundaries the plan resolver reasons about. */
++#include <stdio.h>
++#include <stdint.h>
++
++static uint64_t parse10(const char *s) {
++    uint64_t res = 0;
++    while (*s >= '0' && *s <= '9') {
++        uint64_t d = (uint64_t)(*s - '0');
++        int ov = res >= (~0ULL - d) / 10 + 1 && (res > (~0ULL - d) / 10 || d > (~0ULL - res * 10));
++        res = res * 10 + d;
++        if (ov) res ^= 0xA5A5A5A5A5A5A5A5ULL; /* perturb, keep going */
++        s++;
++    }
++    return res;
 +}
 +
-+/// Assignment-aware hazard refinement (Phase 2h). `assignments` carries the
-+/// CURRENT register homes; when present, two conservative-hazard classes are
-+/// refined:
-+///
-+/// (a) Div/Rem with a register-homed divisor (∉ {edx,eax} — div_rhs_direct_ref's
-+///     contract): the emitter reads the divisor directly (`divl %reg`), so the
-+///     point is %ecx-clean. Constant divisors always stage through %ecx
-+///     (-Os) or take the magic-number path (-O2+) — never clean.
-+/// (b) gpr32 Loads whose pointer is a GetElementPtr: %edx-clean. Both the
-+///     folded indexed form (a single instruction) and the GEP-materialising
-+///     fallback (staging through %eax/%ecx) leave %edx untouched — unless
-+///     the load's DEST is homed in %edx (the store-to-home writes it).
-+fn collect_i686_scratch_hazard_points_refined(
-+    func: &IrFunction,
-+    wide: &FxHashSet<u32>,
-+    ecx_clean_load_ptrs: &FxHashSet<u32>,
-+    assignments: Option<&FxHashMap<u32, PhysReg>>,
- ) -> (Vec<u32>, Vec<u32>) {
-     use crate::ir::reexports::{IrBinOp, IrUnaryOp};
-     let mut ecx: Vec<u32> = Vec::new();
-@@ -4319,6 +5061,16 @@ fn collect_i686_scratch_hazard_points(
-     // emitter will actually fuse.
-     let divrem_pairs = compute_i686_divrem_pairs(func, false);
- 
-+    // Values defined by a GetElementPtr (refinement (b)).
-+    let mut gep_defined: FxHashSet<u32> = FxHashSet::default();
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            if let Instruction::GetElementPtr { dest, .. } = inst {
-+                gep_defined.insert(dest.0);
-+            }
-+        }
++/* digit feeder through a byte cast between head and tail (after_head) */
++static uint64_t parse16(const char *s) {
++    uint64_t res = 0;
++    for (;;) {
++        char c = *s;
++        unsigned v;
++        if (c >= '0' && c <= '9') v = (unsigned)(c - '0');
++        else if (c >= 'a' && c <= 'f') v = (unsigned)(c - 'a' + 10);
++        else break;
++        res = res * 16 + (uint64_t)v;
++        s++;
 +    }
++    return res;
++}
 +
-     // Allocas with alignment ≤ 16 resolve to SlotAddr::Direct.
-     // Mirrors slot_assignment.rs: alloca_alignments only records > 16.
-     let mut direct_allocas: FxHashSet<u32> = FxHashSet::default();
-@@ -4365,7 +5117,8 @@ fn collect_i686_scratch_hazard_points(
-             let divrem_tail = divrem_pairs.tail_points.contains(&(bi, ii));
-             let (ecx_clean, edx_clean) = match inst {
-                 Instruction::BinOp { op, ty, rhs, .. }
--                    if is_gpr32(ty) && divrem_tail
-+                    if is_gpr32(ty)
-+                        && divrem_tail
-                         && matches!(
-                             op,
-                             IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
-@@ -4383,9 +5136,38 @@ fn collect_i686_scratch_hazard_points(
-                     | IrBinOp::Shl
-                     | IrBinOp::AShr
-                     | IrBinOp::LShr => (const_imm(rhs), true),
-+                    IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => {
-+                        // Refinement (a): a register-homed divisor (∉
-+                        // {edx,eax}) is read directly (`divl %reg`) — the
-+                        // point is %ecx-clean. %edx always receives the
-+                        // remainder/quotient write. Constant divisors stage
-+                        // through %ecx (or go magic) — never clean.
-+                        let direct_divisor = match (rhs, assignments) {
-+                            (Operand::Value(rv), Some(asg)) => {
-+                                asg.get(&rv.0).is_some_and(|&p| p.0 != 5 && p.0 != 6)
-+                            }
-+                            _ => false,
-+                        };
-+                        (direct_divisor, false)
-+                    }
-                     _ => (false, false),
-                 },
-                 Instruction::Cmp { ty, rhs, .. } if is_gpr32(ty) => (const_imm(rhs), true),
-+                // gpr32↔gpr32 casts stage only through %eax: the same-size
-+                // kinds are pure no-ops (Noop / UnsignedToSignedSameSize emit
-+                // nothing; coalesced members never even reach here) and the
-+                // narrowing kinds are sub-register movs{x}l/movz{x}l on %eax,
-+                // all wrapped in operand_to_eax/store_eax_to. The old
-+                // catch-all (false, false) marked vsprintf number()'s two
-+                // U32→I32 casts as %edx hazards inside the digit loop and
-+                // kept the URem remainder (the folded load's natural index,
-+                // born in %edx at the fused div) out of its own birth
-+                // register.
-+                Instruction::Cast { from_ty, to_ty, .. }
-+                    if is_gpr32(from_ty) && is_gpr32(to_ty) =>
-+                {
-+                    (true, true)
-+                }
-                 Instruction::Copy { dest, src } => match src {
-                     Operand::Value(v) => {
-                         let c = !wide.contains(&v.0) && !wide.contains(&dest.0);
-@@ -4413,6 +5195,7 @@ fn collect_i686_scratch_hazard_points(
-                 Instruction::Load {
-                     ty,
-                     ptr,
-+                    dest,
-                     seg_override,
-                     ..
-                 } if is_gpr32(ty) => {
-@@ -4428,7 +5211,20 @@ fn collect_i686_scratch_hazard_points(
-                     let clean = (direct_allocas.contains(&ptr.0)
-                         || ecx_clean_load_ptrs.contains(&ptr.0))
-                         && *seg_override == crate::common::types::AddressSpace::Default;
--                    (clean, true)
-+                    // Refinement (b): a GEP-pointer load leaves %edx
-+                    // untouched — the folded indexed form is a single
-+                    // instruction and the GEP-materialising fallback stages
-+                    // through %eax/%ecx — unless the load's DEST is homed in
-+                    // %edx (the store-to-home writes it).
-+                    let edx_clean = if gep_defined.contains(&ptr.0) {
-+                        match assignments {
-+                            Some(asg) => asg.get(&dest.0) != Some(&PhysReg(5)),
-+                            None => false, // dest homes unknown: conservative
-+                        }
-+                    } else {
-+                        true
-+                    };
-+                    (clean, edx_clean)
++/* constant base at the hi-zero boundary and a u32 feeder */
++static uint64_t mix(uint32_t seed) {
++    uint64_t h = seed;
++    for (int i = 0; i < 8; i++) {
++        h = h * 0xFFFFFFFFu + (uint64_t)(seed + (uint32_t)i * 2654435761u);
++        h ^= h >> 13;
++    }
++    return h;
++}
++
++int main(void) {
++    printf("A=%016llx\n", (unsigned long long)parse10("0"));
++    printf("B=%016llx\n", (unsigned long long)parse10("18446744073709551615"));
++    printf("C=%016llx\n", (unsigned long long)parse10("18446744073709551616"));
++    printf("D=%016llx\n", (unsigned long long)parse10("99999999999999999999"));
++    printf("E=%016llx\n", (unsigned long long)parse16("deadbeefcafebabe"));
++    printf("F=%016llx\n", (unsigned long long)parse16("0000000000000000"));
++    printf("G=%016llx\n", (unsigned long long)mix(0u));
++    printf("H=%016llx\n", (unsigned long long)mix(0xFFFFFFFFu));
++    printf("I=%016llx\n", (unsigned long long)mix(0x80000000u));
++    /* overflow-gate shape: (res & mask) != 0 drives a branch (setCC fusion) */
++    uint64_t r = 1;
++    for (int i = 0; i < 40; i++) {
++        r = r * 10 + (uint64_t)i;
++        if ((r & 0x8000000000000000ULL) != 0) r &= 0x7FFFFFFFFFFFFFFFULL;
++        if (r >= 1844674407370955161ULL) r /= 10;
++    }
++    printf("J=%016llx\n", (unsigned long long)r);
++    return 0;
++}
+diff --git a/tests/regression/mulacc_chain_u64.flags b/tests/regression/mulacc_chain_u64.flags
+new file mode 100644
+index 00000000..3a3b5796
+--- /dev/null
++++ b/tests/regression/mulacc_chain_u64.flags
+@@ -0,0 +1 @@
++-O2
+diff --git a/tests/regression/mulacc_nop_cast_sandwich.c b/tests/regression/mulacc_nop_cast_sandwich.c
+new file mode 100644
+index 00000000..850493d2
+--- /dev/null
++++ b/tests/regression/mulacc_nop_cast_sandwich.c
+@@ -0,0 +1,55 @@
++/* The canon walk may only cross SINGLE-USE no-op I64<->U64 casts (audit
++ * refinement): multi-use or value-changing casts must break the chain.
++ * These shapes sandwich the head/tail between aliases, splits and joins
++ * that stress that rule; every fused or rejected variant must print the
++ * same values as GCC. */
++#include <stdio.h>
++#include <stdint.h>
++
++static uint64_t digest;
++
++static void sink(uint64_t v) { digest = digest * 31 + v; }
++
++/* (u64)(s64)x: canonical no-op; use it TWICE (multi-use) — the chain
++ * through x must not be built (single-use rule) but the value must be. */
++static uint64_t multi_use(int32_t x) {
++    uint64_t a = (uint64_t)(int64_t)x * 10 + 5;
++    uint64_t b = (uint64_t)(int64_t)x * 7;
++    return a + b;
++}
++
++/* split: chain result consumed by both a 32-bit and a 64-bit use */
++static uint64_t split_use(uint32_t seed) {
++    uint64_t h = seed;
++    h = h * 6364136223846793005ull + 1442695040888963407ull;
++    uint32_t lo = (uint32_t)h;
++    uint64_t out = (h >> 32) ^ lo;
++    sink(out);
++    return out;
++}
++
++/* nested: a chain whose addend is itself a chain result */
++static uint64_t nested(uint32_t seed) {
++    uint64_t inner = (uint64_t)seed * 2654435761u + 12345u;
++    uint64_t outer = inner * 0xFFFFFFFFull + (uint64_t)(uint32_t)inner;
++    return outer;
++}
++
++/* self-referential wraparound */
++static uint64_t wrap(uint32_t seed) {
++    uint64_t r = seed;
++    for (int i = 0; i < 16; i++)
++        r = r * 0xFFFFFFFFull + r;
++    return r;
++}
++
++int main(void) {
++    volatile int32_t x = -1000000;
++    volatile uint32_t s = 0xDEADBEEFu;
++    printf("A=%016llx\n", (unsigned long long)multi_use(x));
++    for (int i = 0; i < 4; i++) printf("B%d=%016llx\n", i, (unsigned long long)split_use(s + (uint32_t)i));
++    printf("C=%016llx\n", (unsigned long long)nested(s));
++    printf("D=%016llx\n", (unsigned long long)wrap(s));
++    printf("DIG=%016llx\n", (unsigned long long)digest);
++    return 0;
++}
+diff --git a/tests/regression/mulacc_nop_cast_sandwich.flags b/tests/regression/mulacc_nop_cast_sandwich.flags
+new file mode 100644
+index 00000000..3a3b5796
+--- /dev/null
++++ b/tests/regression/mulacc_nop_cast_sandwich.flags
+@@ -0,0 +1 @@
++-O2
+diff --git a/tests/regression/mulacc_sext_addend.c b/tests/regression/mulacc_sext_addend.c
+new file mode 100644
+index 00000000..7b759123
+--- /dev/null
++++ b/tests/regression/mulacc_sext_addend.c
+@@ -0,0 +1,50 @@
++/* mul-accumulate with SIGNED addend feeders and negative constants
++ * (i686 fused head): AddendHi::Sext (movl/sarl high replication) and
++ * Imm(hi<0) paths must be exact for negative values; bases at the
++ * hi-zero boundary (0xFFFFFFFF) fuse while 2^32 bases must reject the
++ * chain and take the generic 64-bit path — both must agree with GCC. */
++#include <stdio.h>
++#include <stdint.h>
++
++int main(void) {
++    volatile int32_t neg = -7;
++    volatile int32_t small = 3;
++    volatile uint32_t u = 4000000000u;
++
++    /* sext feeder addend (i32 -> i64), negative */
++    int64_t a = 1;
++    for (int i = 0; i < 6; i++) a = a * 5 + (int64_t)neg;
++    printf("A=%lld\n", (long long)a);
++
++    /* sext feeder addend, positive, alternating sign */
++    int64_t b = 2;
++    for (int i = 0; i < 6; i++) b = b * 3 + (int64_t)(i % 2 ? neg : small);
++    printf("B=%lld\n", (long long)b);
++
++    /* negative constant addend: hi = -1 path */
++    int64_t c = 10;
++    for (int i = 0; i < 5; i++) c = c * 7 + (-5);
++    printf("C=%lld\n", (long long)c);
++
++    /* base = 0xFFFFFFFF: hi-zero-provable constant, must fuse correctly */
++    uint64_t d = 1;
++    for (int i = 0; i < 4; i++) d = d * 0xFFFFFFFFull + (uint64_t)u;
++    printf("D=%016llx\n", (unsigned long long)d);
++
++    /* base >= 2^32 through a value the analyzer cannot prove: generic path */
++    volatile uint64_t big = 0x100000000ull;
++    uint64_t e = 1;
++    for (int i = 0; i < 3; i++) e = e * big + (uint64_t)u;
++    printf("E=%016llx\n", (unsigned long long)e);
++
++    /* signed overflow wraparound in the fused shape (UB-free unsigned math) */
++    uint64_t f = 0;
++    for (int i = 0; i < 20; i++) f = f * 10 + (uint64_t)(neg);
++    printf("F=%016llx\n", (unsigned long long)f);
++
++    /* u32 zext feeder with values above 2^31 (sign-bit set) */
++    uint64_t g = 1;
++    for (int i = 0; i < 5; i++) g = g * 10 + (uint64_t)(u + (uint32_t)i);
++    printf("G=%016llx\n", (unsigned long long)g);
++    return 0;
++}
+diff --git a/tests/regression/mulacc_sext_addend.flags b/tests/regression/mulacc_sext_addend.flags
+new file mode 100644
+index 00000000..3a3b5796
+--- /dev/null
++++ b/tests/regression/mulacc_sext_addend.flags
+@@ -0,0 +1 @@
++-O2
+diff --git a/tests/regression/setcc_bool_gate.c b/tests/regression/setcc_bool_gate.c
+new file mode 100644
+index 00000000..9b1c2ed8
+--- /dev/null
++++ b/tests/regression/setcc_bool_gate.c
+@@ -0,0 +1,45 @@
++/* setCC -> test -> cond-branch fusion (i686): the bool relay window is
++ * dropped when the test is redundant, kept when the bool is live, and
++ * REFUSED when a flags reader follows (a following jcc would read the
++ * producer's flags after the rewrite). Every shape must match GCC. */
++#include <stdio.h>
++#include <stdint.h>
++
++volatile uint32_t inputs[9] = {0u, 1u, 2u, 7u, 0x80000000u, 0xFFFFFFFFu, 3u, 12u, 0x7FFFFFFFu};
++
++/* (v & mask) != 0 as a direct branch: window fully dead */
++static uint32_t gated(uint32_t v) {
++    if ((v & 0x80000000u) != 0) return v ^ 0x12345678u;
++    return v + 1;
++}
++
++/* same test, bool STORED after the branch: window must survive */
++static uint32_t gated_store(uint32_t v) {
++    int big = (v & 0x80000000u) != 0;
++    if (big) return v ^ 0x87654321u;
++    return (uint32_t)big + v * 3;
++}
++
++/* inverted compare: == 0 as the taken side (je shape, sete producer) */
++static uint32_t zero_or_not(uint32_t v) {
++    int z = (v & 0xFFFFu) == 0;
++    if (z) return 0xC0DEu;
++    return v ^ 0xC0DEu;
++}
++
++/* a flags READER after the branch (carry from the mask-and is not used,
++ * but the emitter's shape must still be exact): forced via inline asm
++ * jcc on the SAME values is out of scope — instead use a nested test. */
++static uint32_t chained(uint32_t v) {
++    uint32_t r = (v & 1u) ? 10u : 20u;
++    uint32_t q = (v & 2u) ? r + 1 : r - 1;
++    return q;
++}
++
++int main(void) {
++    for (int i = 0; i < 9; i++) printf("g%d=%08x\n", i, gated(inputs[i]));
++    for (int i = 0; i < 9; i++) printf("s%d=%08x\n", i, gated_store(inputs[i]));
++    for (int i = 0; i < 9; i++) printf("z%d=%08x\n", i, zero_or_not(inputs[i]));
++    for (int i = 0; i < 9; i++) printf("c%d=%08x\n", i, chained(inputs[i]));
++    return 0;
++}
+diff --git a/tests/regression/setcc_bool_gate.flags b/tests/regression/setcc_bool_gate.flags
+new file mode 100644
+index 00000000..3a3b5796
+--- /dev/null
++++ b/tests/regression/setcc_bool_gate.flags
+@@ -0,0 +1 @@
++-O2
+diff --git a/tests/regression/stmt_expr_asm_typeof.c b/tests/regression/stmt_expr_asm_typeof.c
+index 733bbb57..7bac63e5 100644
+--- a/tests/regression/stmt_expr_asm_typeof.c
++++ b/tests/regression/stmt_expr_asm_typeof.c
+@@ -32,5 +32,9 @@ int main(void) {
+     // typeof of that is `struct dst_entry`. The cast `(typeof(...)*)(p)`
+     // is `struct dst_entry *`. q->x should be 42.
+     typeof(({ __xchg(p, 8); })) *q = (typeof(({ __xchg(p, 8); })) *)(p);
+-    return (q != NULL) ? q->x : -1;
++    // The runner protocol requires exit 0: success is q pointing at
++    // global_dst with the expected payload, not the payload itself
++    // (the original form returned 42 == q->x, failing the exit-0 check
++    // for every compiler).
++    return (q == &global_dst && q->x == 42) ? 0 : -1;
+ }
+-- 
+2.47.3
+
+
+From 7df4089c78e96185d63e91f402327747c8e36ac7 Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 15:13:59 +0000
+Subject: [PATCH 2/3] x86: fix two pre-existing miscompiles surfaced by the
+ corpus
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+1. MachInst two-address aliasing (sqlite_varint, benchmark corpus):
+
+   The simple-ALU lowering emits `mov lhs,dst; alu rhs,dst`, which reads
+   rhs AFTER dst is written. The register allocator only guarantees the
+   IR's read-then-write semantics, so homing rhs and dest in one register
+   is legal there — and the machine form silently computed `lhs OP lhs`.
+   sqlite3GetVarint's `b <<= 14; b |= *p` hit exactly this: the byte load
+   and the dest homed to %edx, the OR became `or %edx,%edx`, and every
+   9-byte varint decoded wrong (check_known_values bailed, rc=2, no
+   output). Lowering now enforces the machine constraint at ISel time:
+   commutative ops (Add/And/Or/Xor/Mul) swap operands so the surviving
+   source is the register-homed non-dest one; Sub and both-alias shapes
+   fall back to the mature emitter (lower_binop now returns bool and the
+   dispatcher honours it). Flags are not observable through IR BinOp, so
+   the swap is transparent. Bisection path: MI_DISABLE_KINDS=binop /
+   CCC_NO_MACHINST / CCC_NO_BLOCK_RELAYOUT / CCC_NO_LEAF_PARAM_GPR all
+   masked it; the MI stream contained the OR, the final asm did not.
+
+2. F128 intrinsic results (glibc_f128_builtins):
+
+   Intrinsic::result_type() returned None for F128Fabs/F128Neg/
+   F128Copysign, so the stack-slot allocator reserved 8 bytes for their
+   destinations while the codegen stores 16 (movdqu). The store overwrote
+   the adjacent slot: copysign's result temp at 0x18(%rsp) clobbered the
+   operand's 16-byte slot at 0x20, corrupting the operand for every
+   subsequent operation (the second copysign read a half-garbage x and
+   produced high=low qword duplication). result_type() now reports F128
+   for the three bit-op builtins, sizing their slots correctly. Reduced
+   to three intrinsics off one operand + eq128 calls.
+
+Validation: regression corpus 506/506 executable tests green (10
+legitimate skip-compares where GCC cannot build its oracle), unit
+1258/0/6, compat 20/20, boot gate PASS at _end=31168 with the flat
+setup image byte-identical to the ld.bfd oracle.
+---
+ src/backend/x86/codegen/isel.rs | 58 +++++++++++++++++++++++++++------
+ src/ir/instruction.rs           | 11 +++++++
+ 2 files changed, 59 insertions(+), 10 deletions(-)
+
+diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
+index 22a57afa..5a9a1442 100644
+--- a/src/backend/x86/codegen/isel.rs
++++ b/src/backend/x86/codegen/isel.rs
+@@ -218,6 +218,11 @@ fn lea_scale_for_mul(imm: i64) -> Option<u8> {
+ // ── BinOp Lowering ───────────────────────────────────────────────────────
+ 
+ /// Lower an IR BinOp instruction to MachInst sequence.
++///
++/// Returns false when this operation cannot be lowered safely under the
++/// current register assignment (the caller must re-emit it through the
++/// default, mature path — which sequences its moves with read-then-write
++/// IR semantics). `out` is untouched when false is returned.
+ pub fn lower_binop(
+     dest: &Value,
+     op: IrBinOp,
+@@ -226,7 +231,7 @@ pub fn lower_binop(
+     ty: IrType,
+     ra: &FxHashMap<u32, PhysReg>,
+     out: &mut Vec<MachInst>,
+-) {
++) -> bool {
+     let size = OpSize::from_ir_type(ty);
+     let dst = value_to_reg(dest, ra);
+ 
+@@ -243,7 +248,7 @@ pub fn lower_binop(
+                     offset: 0,
+                     dst,
+                 });
+-                return;
++                return true;
+             }
+             (Operand::Value(base), Operand::Const(_)) => {
+                 if let Some(offset) = const_as_imm32(rhs) {
+@@ -253,7 +258,7 @@ pub fn lower_binop(
+                         offset,
+                         dst,
+                     });
+-                    return;
++                    return true;
                  }
-                 Instruction::Store {
-                     ty,
-@@ -5259,7 +6055,8 @@ mod phi_coalesce_tests {
-         // Reduced from gcc.c-torture/execute/pr51933.c after GVN merged two
-         // `i + 1` values.  The backend may fold the GEP into Store, so the
-         // address dependency on old `i` remains live past the next-IV def.
--        let mut func = IrFunction::new("deferred_gep_index".to_string(), IrType::I32, vec![], false);
-+        let mut func =
-+            IrFunction::new("deferred_gep_index".to_string(), IrType::I32, vec![], false);
-         func.blocks = vec![
-             block(
-                 0,
+             }
+             (Operand::Const(_), Operand::Value(base)) => {
+@@ -264,7 +269,7 @@ pub fn lower_binop(
+                         offset,
+                         dst,
+                     });
+-                    return;
++                    return true;
+                 }
+             }
+             _ => {}
+@@ -283,7 +288,7 @@ pub fn lower_binop(
+                         offset: 0,
+                         dst,
+                     });
+-                    return;
++                    return true;
+                 }
+                 if imm != 0 && imm != 1 {
+                     let src = match lhs {
+@@ -299,13 +304,45 @@ pub fn lower_binop(
+                         dst,
+                         size,
+                     });
+-                    return;
++                    return true;
+                 }
+             }
+         }
++        // Two-address aliasing constraint: the lowered form
++        // `mov lhs,dst; alu rhs,dst` reads rhs AFTER dst has been written,
++        // but the allocator only guarantees the IR's read-then-write
++        // semantics — homing rhs and dest in one register is legal there
++        // (dest is born at this instruction, rhs dies at it). The machine
++        // form would silently compute `lhs OP lhs` instead of
++        // `lhs OP rhs`. Repro: sqlite3GetVarint's `b <<= 14; b |= *p` —
++        // the byte load and dest homed to %edx produced `or %edx,%edx`,
++        // dropping the byte and mis-decoding every 9-byte varint.
++        //
++        // Commutative ops (Add/And/Or/Xor/Mul) swap the operands so the
++        // register-homed non-dest operand is the one that survives the
++        // mov; Sub (and any shape where the surviving operand would still
++        // alias dst) falls back to the mature emitter. Flags are not
++        // observable through IR BinOp, so the swap is semantically
++        // transparent.
++        let rhs_home_is_dst = matches!(rhs, Operand::Value(v) if v.0 != dest.0)
++            && matches!(rhs, Operand::Value(v) if value_to_reg(v, ra) == value_to_reg(dest, ra))
++            && matches!(value_to_reg(dest, ra), MachReg::Phys(_));
++        if rhs_home_is_dst {
++            let lhs_survives = match lhs {
++                Operand::Const(_) => true,
++                Operand::Value(v) => value_to_reg(v, ra) != value_to_reg(dest, ra),
++            };
++            let commutative = !matches!(op, IrBinOp::Sub);
++            if commutative && lhs_survives {
++                emit_mov_operand_r(rhs, dst, size, ra, out);
++                emit_alu_operand_r(alu_op, lhs, dst, size, ra, out);
++                return true;
++            }
++            return false;
++        }
+         emit_mov_operand_r(lhs, dst, size, ra, out);
+         emit_alu_operand_r(alu_op, rhs, dst, size, ra, out);
+-        return;
++        return true;
+     }
+ 
+     // ── Shift operations ─────────────────────────────────────────────
+@@ -328,7 +365,7 @@ pub fn lower_binop(
+                 size,
+             });
+         }
+-        return;
++        return true;
+     }
+ 
+     // ── Division and remainder ───────────────────────────────────────
+@@ -359,6 +396,7 @@ pub fn lower_binop(
+                 dst: MachOperand::Reg(dst),
+                 size,
+             });
++            true
+         }
+         IrBinOp::UDiv | IrBinOp::URem => {
+             emit_mov_operand_r(lhs, MachReg::Phys(RAX), size, ra, out);
+@@ -383,6 +421,7 @@ pub fn lower_binop(
+                 dst: MachOperand::Reg(dst),
+                 size,
+             });
++            true
+         }
+         _ => unreachable!("unhandled binop: {:?}", op),
+     }
+@@ -897,8 +936,7 @@ pub fn lower_instruction_typed(
+             if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+                 return false;
+             }
+-            lower_binop(dest, *op, lhs, rhs, *ty, ra, out);
+-            true
++            lower_binop(dest, *op, lhs, rhs, *ty, ra, out)
+         }
+         Instruction::Load {
+             dest,
+diff --git a/src/ir/instruction.rs b/src/ir/instruction.rs
+index f11b55de..30a17a01 100644
+--- a/src/ir/instruction.rs
++++ b/src/ir/instruction.rs
+@@ -642,6 +642,17 @@ impl Instruction {
+                 | IntrinsicOp::CopysignF64 => {
+                     Some(IrType::F64)
+                 }
++                // The bit-op F128 builtins produce a full _Float128. Their
++                // codegen stores 16 bytes (movdqu) to the dest's home; a
++                // None here made the slot allocator reserve only 8 bytes,
++                // so the store overflowed into the adjacent slot and
++                // corrupted the neighbouring value (glibc_f128_builtins:
++                // copysign's result temp at 0x18 overwrote the operand's
++                // slot at 0x20, mis-decoding every later operation that
++                // read the operand).
++                IntrinsicOp::F128Fabs
++                | IntrinsicOp::F128Neg
++                | IntrinsicOp::F128Copysign => Some(IrType::F128),
+                 _ => None,
+             },
+             Instruction::GetReturnF128Second { .. } => Some(IrType::F128),
+-- 
+2.47.3
+
+
+From 08b7a547254357dde2028c9ddc4bd1014e11835d Mon Sep 17 00:00:00 2001
+From: ms178 <ms178@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 15:14:35 +0000
+Subject: [PATCH 3/3] =?UTF-8?q?docs:=20session=2090=20follow-up=20?=
+ =?UTF-8?q?=E2=80=94=20Agent-Z=20audit=20closure,=20two=20miscompile=20fix?=
+ =?UTF-8?q?es,=20all-green=20corpus?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ updates/followup_2026-08-28_session09.md | 139 +++++++++++++++++++++++
+ 1 file changed, 139 insertions(+)
+ create mode 100644 updates/followup_2026-08-28_session09.md
+
+diff --git a/updates/followup_2026-08-28_session09.md b/updates/followup_2026-08-28_session09.md
+new file mode 100644
+index 00000000..8748e880
+--- /dev/null
++++ b/updates/followup_2026-08-28_session09.md
+@@ -0,0 +1,139 @@
++# LCCC Follow-up / Kontinuität — Session 90 (2026-08-28, Agent-Z audit + miscompile round)
++
++**Scope:** audit and perfect Agent Z's `fuse_setcc_branch` (PR #274 body);
++close the audit with red-team regression tests; resolve every corpus
++failure down to root cause; keep the deliverable applies-clean on latest
++main.
++
++**Base:** `origin/main @ 2b53a6ec` (PR #273 = v7 peephole `9a540781`,
++PR #274 = Agent Z `0fbf334a`)
++**Session commits:** `7569cdb0` (fuse_setcc_branch hardening + differential
++tests), `7df4089c` (two pre-existing miscompiles surfaced by the corpus)
++**Deliverable:** ms178-1.patch — APPLIES-CLEAN on fresh `2b53a6ec`.
++
++---
++
++## 1. Validation state (all measured this session)
++
++| suite | result |
++|---|---|
++| unit (`cargo test --lib`) | **1258 pass / 0 fail / 6 ignored** |
++| regression corpus (`run_regression.py`, regression + benchmark dirs) | **506 pass / 0 fail** / 10 skip-compare (GCC cannot build the oracle — lccc self-checks pass) / 0 skip-run |
++| compat_test.sh (GCC differential) | **20/20** |
++| boot gate (`build_kernel_boot.sh`) | **PASS, `_end=31168`** (headroom 1600 B), flat setup image **byte-identical** to the ld.bfd oracle |
++| mulacc/setCC differential (4 new GCC-oracle tests) | byte-exact vs GCC -O2, fusion ON and OFF (`CCC_NO_MULACC`, `CCC_NO_SETCC_BRANCH`) |
++
++## 2. fuse_setcc_branch — audit closed, hardening landed
++
++The full semantic audit of Agent Z's fusion (1,809 lines) closed with two
++code-level defects fixed and locked by tests:
++
++1. **movzwl carrier arm deleted.** setCC writes only the low BYTE of its
++   destination; `movzwl %ax` imports AH — garbage — into the bool, so ZF
++   would not reflect it. The fusion must refuse that carrier
++   (`setcc_fuse_refuses_movzwl_carrier`).
++2. **Post-jcc guard made classifier-independent.** The reader check must
++   run before the barrier check (a CondJmp is both), labels are skipped
++   (fallthrough enters the next block), AND — the new part — the reader
++   test consults `is_cond_jcc()`, the authoritative mnemonic list. The
++   classifier keys `is_conditional_jump` on the *second* character, so
++   `jc` classifies as Other while `jnc` classifies as CondJmp; a `jc`
++   after the branch escaped the guard and the fusion fired, handing the
++   reader the producer's flags (repro: je→jne rewrite in
++   `setcc_fuse_refuses_jcc_reader_after_branch`). The deadness scan now
++   also stops at any conditional-jump spelling (its target may rejoin and
++   read the carrier).
++3. Red-team suite (7 tests): dead window, je inversion, movzwl refusal,
++   post-branch jcc reader refusal (`jc` spelling), setCC reader behind
++   the fallthrough label refusal, writer-before-reader allowance,
++   live-bool window-kept shape. cmpl-headed producers make every refusal
++   *observable* (no other pass may drop a cmpl-headed setCC test, and a
++   wrong fusion's je→jne rewrite is detectable in the output text).
++4. Liveness def-point numbering re-verified end-to-end (per-instruction
++   points; mulacc `block_start + ii` defs match exactly) — Agent Z's
++   def-point gate is sound.
++
++## 3. Corpus failures — all five resolved to root cause
++
++Starting corpus state on `2b53a6ec` was **501/5** (the earlier "474/0/11"
++baseline predates the benchmark dir being swept and the i386 loader being
++installed). All five:
++
++1. **sqlite_varint — REAL MISCOMPILE, fixed (`7df4089c`).** MachInst
++   two-address lowering (`mov lhs,dst; alu rhs,dst`) reads rhs *after*
++   writing dst, but the allocator only guarantees IR read-then-write
++   semantics; rhs and dest legally shared %edx and the OR became
++   `or %edx,%edx` (sqlite3GetVarint `b |= *p`, every 9-byte varint wrong).
++   ISel now enforces the machine constraint: commutative ops swap
++   operands, Sub/both-alias falls back to the mature emitter
++   (`lower_binop` → bool). Bisection: `CCC_MI_DISABLE_KINDS=binop`,
++   `CCC_NO_MACHINST`, `CCC_NO_BLOCK_RELAYOUT`, `CCC_NO_LEAF_PARAM_GPR`
++   all masked it; the MI stream contained the OR, the final asm did not.
++2. **glibc_f128_builtins — REAL MISCOMPILE, fixed (`7df4089c`).**
++   `Intrinsic::result_type()` returned None for F128Fabs/Neg/Copysign, so
++   their destinations got 8-byte slots while codegen stores 16 (movdqu);
++   the store overflowed into the neighbouring slot and corrupted the
++   operand for later ops. `result_type()` now reports F128 for the three
++   bit-op builtins.
++3. **stmt_expr_asm_typeof — TEST defect, fixed (`7569cdb0`).** It returned
++   42 (the asserted payload) instead of 0; both lccc and GCC returned 42.
++4+5. **i686_fused_mul_add_operand_order, segment_fill_copy_alias —
++   environment, resolved.** `-m32` exes were linked without crt1.o (no
++   `libc6-dev-i386` on the host), so main's final `ret` popped argc and
++   jumped to 1 — *after* the program computed correctly. They were
++   skip-run before (no i386 loader; the 11 baseline skips); installing
++   the loader (via gdb's lib32 pull-in) unmasked them. With
++   `libc6-dev-i386` installed both exit 0 — and the whole -m32 corpus now
++   genuinely executes, which is strictly better i686 coverage.
++
++## 4. New coverage
++
++- `mulacc_chain_u64.c`: kstrtoull-shaped chains with overflow gates,
++  wraparound, 2^32/2^63 boundaries.
++- `mulacc_sext_addend.c`: sext/negative addend feeders, negative constant
++  addends, hi-zero boundary base 0xFFFFFFFF vs rejected >=2^32 bases,
++  sign-bit-set u32 feeders.
++- `mulacc_nop_cast_sandwich.c`: multi-use no-op cast sandwiches, split
++  uses, nested chains, self-referential wraparound (the single-use canon
++  rule).
++- `setcc_bool_gate.c`: window-dead, window-kept (bool stored), sete/je
++  inverted shape, chained selects.
++
++All GCC-oracle compared byte-exact at -O2, fusion on and off.
++
++## 5. Lessons that cost time — do not re-learn them
++
++- The runner sweeps `tests/regression/` **and** `tests/benchmark/programs/`;
++  a `.flags` file (e.g. `-m32 -O0`) overrides the `-O2` default — hand
++  runs without it reproduce nothing.
++- `tests/compat_test.sh` needs plain `LCCC_BIN=./target/fastbuild/lccc`
++  (it appends `-I` itself; a raw include dir makes the driver fail).
++- gdb's install pulls `libc6-i386` (the loader appears → -m32 runs →
++  crt-less links crash at exit); install `libc6-dev-i386` in the same
++  breath or the -m32 corpus reports phantom segfaults.
++- The MI stream (`CCC_MI_STREAM=1`) proves what MachInst emitted; diff
++  *that* against the final asm before suspecting the emitter — the peephole
++  phase is innocent in this class of bug.
++- Test-expectation pitfalls in this round: another pass may normalize a
++  redundant test's operands (`testl %eax,%edx` → `%eax,%eax`) or delete a
++  branch-to-next; assert on the *observable semantics* (jne present/absent,
++  testl family present), not exact spellings.
++
++## 6. Next-session entry points (priority order)
++
++1. **CCC_PEEPHOLE_SKIP plumbing for the i686 text pipeline** (still
++   x86-64-only; peephole_ab.py cannot A/B i686 patterns).
++2. P0 levers (memset→rep stosl, video family, census-v2 callee-saves) —
++   boot gate has 1600 bytes of `_end` headroom and the gate now reports
++   PASS with room; per-function insn excess table unchanged from session 89.
++3. Unit tests still missing for P5-sym/P13/P14/threading/redundant-jCC/
++   propagate (i686 peephole).
++4. RA accumulator machine + allocatable ebx/esi/edi (the big per-function
++   excesses: set_video +169, vga_set_mode +137, vsprintf +118).
++
++## 7. Snapshot ledger
++
++`S04-az-audit-miscompiles` — base `2b53a6ec`, head `7df4089c`,
++deliverable ms178-1.patch APPLIES-CLEAN on fresh `2b53a6ec` (validated
++with `git apply --check`), zero garbage (no trace probes; the temporary
++`CCC_SETCC_TRACE` eprintlns were removed before commit).
+-- 
+2.47.3
+
