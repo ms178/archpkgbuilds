@@ -1,1273 +1,738 @@
-From 7ecdd4e84281d84c5adf3453d776f078261613f4 Mon Sep 17 00:00:00 2001
-From: lccc-agent <agent@lccc.local>
-Date: Sat, 29 Aug 2026 12:09:30 +0000
-Subject: [PATCH 1/4] x86-64: fold single-use widening casts into narrow
- compares (PF-15)
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-`(int)a < (int)b` on char/short operands widened BOTH operands to
-32/64-bit and then executed a 32/64-bit compare — three extension moves
-where GCC emits one `cmpb`/`cmpw` on the original bytes (its `scmp`
-shape: xorl/cmpb/setl/ret). Byte-sized comparisons are ubiquitous in
-real code (string/protocol parsers, zlib longest_match inner loops);
-every one paid two dead widening moves plus a wide compare.
-
-Mechanism — defer, then fold at the compare:
-
-* A single-use widening Cast (I8/U8/I16/U16 -> 32/64-bit) with a GPR
-  destination and a reg- or slot-homed source DEFERS its extending move
-  (two pending slots) instead of emitting it.
-
-* The consuming Cmp folds the recorded pair into ONE narrow compare on
-  the original sources; a constant rhs folds too when it fits the
-  narrow domain exactly. Anything else flushes the recorded moves
-  unchanged, so the defer is invisible to every non-matching consumer.
-
-* Flag-exactness matrix (proved in the code): sext+sext keeps the
-  signed setcc family (sign extension is order-preserving); zext+zext
-  maps every opcode onto the unsigned family (zero-extended values are
-  non-negative, where signed and unsigned order coincide); mixed
-  extensions and out-of-domain constants are refused and materialize
-  the widens instead.
-
-Soundness (the three hazards, each with an explicit guard):
-
-* Home clobbering between defer and consume: RA may reuse the first
-  source's register for the second cast's destination once the source's
-  only modelled use (the deferred move) ends its live range. The record
-  path refuses (and flushes) when a later cast's destination equals an
-  earlier deferred source's register. The reversed aliasing is
-  impossible: the two SSA ranges overlap by construction. Slot sources
-  are safe because nothing is emitted between record and consume.
-
-* Dispatch bypass: fusion paths, MachInst queueing, and the instruction
-  dispatch all bypass each other, so the flush/fold discipline lives at
-  the single per-instruction loop head every lowering path shares. The
-  fold happens BEFORE MachInst sees the compare; folded compares emit on
-  the classic path, so MachInst's audited gates are untouched.
-
-* Lost records: every refusal path that has already taken records
-  re-emits the taken widening moves explicitly; take-pair restores on
-  any mismatch. A deferred move can never silently vanish.
-
-Unsigned widening casts are gated away from MachInst ISel when they
-match the defer shape (the mature path is the pre-MachInst default, so
-the gate only routes work back to audited code; try_record re-checks
-every condition and emits normally on any mismatch).
-
-The compare itself emits through the existing typed emitter, so slot
-and register sources keep all existing addressing behaviour.
-
-Validated: exhaustive byte-domain suites (all 8 compare shapes x all
-65536 input pairs) and strided 16-bit suites pass bit-identically to
-GCC; new regression test tests/regression/byte_cmp_narrow.c pins the
-shapes end-to-end against GCC; lib gate 1302 passed / 0 failed under
--D warnings; x86-64 regression corpus 960 passed / 0 failed; i686
-corpus unchanged at its known 403/76 (separate backend); godbolt
-x86-64 oracle census unchanged (6278 vs GCC 5773 instructions, same
-per-program profile as the pre-change baseline). Trace: CCC_DEBUG_PF15.
----
- src/backend/generation.rs              |  51 +++
- src/backend/traits.rs                  |  26 ++
- src/backend/x86/codegen/cast_ops.rs    | 509 +++++++++++++++++++++----
- src/backend/x86/codegen/comparison.rs  |   5 +
- src/backend/x86/codegen/emit.rs        |  53 +++
- tests/regression/byte_cmp_narrow.c     |  64 ++++
- tests/regression/byte_cmp_narrow.flags |   1 +
- 7 files changed, 625 insertions(+), 84 deletions(-)
- create mode 100644 tests/regression/byte_cmp_narrow.c
- create mode 100644 tests/regression/byte_cmp_narrow.flags
-
-diff --git a/src/backend/generation.rs b/src/backend/generation.rs
-index e3bff5f0..8331c55a 100644
---- a/src/backend/generation.rs
-+++ b/src/backend/generation.rs
-@@ -4301,6 +4301,38 @@ fn generate_function(
-                 cg.state().invalidate_vec_scratch_peephole();
-             }
- 
-+            // PF-15 deferred narrowing widens: every instruction other than
-+            // the two self-managing kinds flushes the recorded moves before
-+            // ANY lowering runs (fusion paths, MachInst queueing, and the
-+            // generate_instruction dispatch all bypass each other, so this
-+            // loop head is the only point that sees every instruction). A
-+            // Cast records or flushes inside its emitter; a Cmp folds the
-+            // pair into a narrow compare or flushes right here — including
-+            // when MachInst would have lowered it.
-+            if !matches!(inst, Instruction::Cmp { .. } | Instruction::Cast { .. }) {
-+                cg.flush_pending_widen();
-+            }
-+            if let Instruction::Cmp {
-+                dest,
-+                op: cmp_op,
-+                lhs: cmp_lhs,
-+                rhs: cmp_rhs,
-+                ..
-+            } = inst
-+            {
-+                if let Some((nl, nr, nty, nop)) =
-+                    cg.narrow_cmp_operands(dest.0, *cmp_op, cmp_lhs, cmp_rhs)
-+                {
-+                    // Folded: emit the narrow compare on the classic path
-+                    // (cmpb/cmpw). MachInst never sees the rewritten shape,
-+                    // so its per-instruction gates stay exactly as audited.
-+                    cg.flush_machinst();
-+                    cg.emit_cmp(dest, nop, &nl, &nr, nty);
-+                    cg.state().current_program_point += 1;
-+                    continue;
-+                }
-+            }
-+
-             if let Instruction::BinOp {
-                 dest,
-                 op: IrBinOp::Mul,
-@@ -4537,6 +4569,10 @@ fn generate_function(
-             );
-             cg.state().current_program_point += 1;
-         }
-+        // Defensive PF-15 flush: a deferred widen whose single consumer
-+        // was eliminated after use counting must never leak between
-+        // blocks. No-op whenever every record was consumed or flushed.
-+        cg.flush_pending_widen();
- 
-         cg.flush_machinst();
-         cg.flush_vecreg_liveout();
-@@ -4650,6 +4686,15 @@ pub(super) fn generate_instruction(
-     remat_global_addrs: &FxHashSet<u32>,
-     const_addr_vals: &FxHashMap<u32, i64>,
- ) {
-+    // PF-15 deferred narrowing widens: every instruction other than the
-+    // two self-managing kinds flushes the recorded moves first, so the
-+    // defer is invisible to all non-matching consumers. A Cast records or
-+    // flushes inside its emitter (try_record_pending_widen's refusal
-+    // contract); a Cmp folds the pair into a narrow compare or flushes in
-+    // its own dispatch arm below — including when MachInst lowers it.
-+    if !matches!(inst, Instruction::Cmp { .. } | Instruction::Cast { .. }) {
-+        cg.flush_pending_widen();
-+    }
-     match inst {
-         // GNU C nested-function support (static chain / trampoline /
-         // non-local goto). x86-only; the trait defaults fail closed on
-@@ -4804,6 +4849,9 @@ pub(super) fn generate_instruction(
-             rhs,
-             ty,
-         } => {
-+            // PF-15 consume happened at the per-instruction loop head (the
-+            // only point all lowering paths share). Deferred widens are
-+            // materialized or folded by the time we get here.
-             cg.emit_cmp(dest, *op, lhs, rhs, *ty);
-         }
-         Instruction::Cast {
-@@ -5384,6 +5432,9 @@ fn generate_terminator(
-     frame_size: i64,
-     block_label: u32,
- ) {
-+    // PF-15: a terminator ends the compare's adjacency window — flush any
-+    // deferred widening moves before control flow leaves the block.
-+    cg.flush_pending_widen();
-     match term {
-         Terminator::Return(val) => {
-             cg.emit_return(val.as_ref(), frame_size);
-diff --git a/src/backend/traits.rs b/src/backend/traits.rs
-index c991ad0c..69efb49e 100644
---- a/src/backend/traits.rs
-+++ b/src/backend/traits.rs
-@@ -2196,6 +2196,32 @@ pub trait ArchCodegen {
-     //    loudly instead of emitting wrong code.
- 
-     /// Read the incoming static-chain register into `dest`.
-+    /// Flush deferred narrowing widening moves (PF-15, x86-64). Default:
-+    /// nothing is ever deferred on this target.
-+    fn flush_pending_widen(&mut self) {
-+        let _ = self;
-+    }
-+
-+    /// PF-15: consume a deferred narrowing-widen compare (x86-64). Called
-+    /// from the Cmp dispatch arm before any lowering; on Some the caller
-+    /// emits the compare from the returned (lhs, rhs, ty, op) instead.
-+    /// Default: never folds (returns None).
-+    fn narrow_cmp_operands(
-+        &mut self,
-+        _dest: u32,
-+        op: crate::ir::reexports::IrCmpOp,
-+        lhs: &crate::ir::reexports::Operand,
-+        rhs: &crate::ir::reexports::Operand,
-+    ) -> Option<(
-+        crate::ir::reexports::Operand,
-+        crate::ir::reexports::Operand,
-+        crate::common::types::IrType,
-+        crate::ir::reexports::IrCmpOp,
-+    )> {
-+        let _ = (op, lhs, rhs);
-+        None
-+    }
-+
-     fn emit_get_static_chain(&mut self, _dest: &Value) {
-         unimplemented_target("nested functions (static chain)");
-     }
-diff --git a/src/backend/x86/codegen/cast_ops.rs b/src/backend/x86/codegen/cast_ops.rs
-index da5ee66b..c5655ea0 100644
---- a/src/backend/x86/codegen/cast_ops.rs
-+++ b/src/backend/x86/codegen/cast_ops.rs
-@@ -3,9 +3,31 @@
- use super::emit::X86Codegen;
- use crate::backend::generation::is_i128_type;
- use crate::common::types::IrType;
-+use crate::backend::regalloc::PhysReg;
- use crate::ir::reexports::{IrConst, Operand, Value};
- 
-+/// One deferred widening move (PF-15): the Cast was eligible but its
-+/// emission is postponed until the consuming compare (or any other next
-+/// instruction) decides. See `X86Codegen::pending_widen` for the full
-+/// soundness contract.
-+pub(super) struct PendingWiden {
-+    /// Cast destination value (single-use; the use is the consumer).
-+    pub dest: u32,
-+    /// Cast source operand (always `Operand::Value`, reg- or slot-homed).
-+    pub src: Operand,
-+    /// Narrow source type (I8/U8/I16/U16) — the compare's new width.
-+    pub from_ty: IrType,
-+    /// Destination register home the widening move would have written.
-+    pub dest_phys: PhysReg,
-+}
-+
- impl X86Codegen {
-+    fn pf15_trace(&self, msg: &str) {
-+        if std::env::var_os("CCC_DEBUG_PF15").is_some() {
-+            eprintln!("[pf15] {msg}");
-+        }
-+    }
-+
-     pub(super) fn emit_cast_instrs_impl(&mut self, from_ty: IrType, to_ty: IrType) {
-         self.emit_cast_instrs_x86(from_ty, to_ty);
-     }
-@@ -195,6 +217,18 @@ impl X86Codegen {
-                 return;
-             }
-         }
-+        // PF-15 narrowing-widen defer: a single-use widening cast from a
-+        // byte/half type is NOT emitted here — it is recorded and the
-+        // consuming compare (if it is one) folds it into a narrow `cmpb`/
-+        // `cmpw` on the original source. Any other consumer flushes the
-+        // recorded move first, making the defer invisible. try_record
-+        // returns false for every non-eligible shape (flushing whatever is
-+        // deferred — its own emission could clobber a deferred source
-+        // home) and this cast then emits normally below.
-+        if self.try_record_pending_widen(dest, src, from_ty, to_ty) {
-+            return;
-+        }
-+
-         // Register-direct integer casts: bypass the accumulator when the destination
-         // has a physical register. Instead of load→cast→store through %rax, emit the
-         // cast instruction directly targeting the destination register.
-@@ -416,6 +450,393 @@ impl X86Codegen {
-     /// Key optimization: when the source is a stack slot, fuse the load and cast
-     /// into a single instruction (e.g., `movslq -N(%rsp), %r12`), saving 2 instructions
-     /// vs the accumulator path (`movq -N(%rsp), %rax; cltq; movq %rax, %r12`).
-+    /// Emit the widening move for an IntWiden cast into a register home,
-+    /// from either a register or a slot source. This is the SINGLE
-+    /// definition of the widening sequences: the register-direct cast path
-+    /// and the PF-15 deferred-widen flush both route through it, so the
-+    /// deferred form is bit-identical to the immediate form.
-+    fn emit_int_widen_move(&mut self, src: &Operand, ft: IrType, dest_phys: PhysReg) {
-+        use super::emit::{phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
-+        let dest_64 = phys_reg_name(dest_phys);
-+        let dest_32 = phys_reg_name_32(dest_phys);
-+        let src_phys = self.operand_reg(src);
-+        let src_slot = match src {
-+            Operand::Value(v) => self.state.get_slot(v.0).map(|sl| sl.0),
-+            _ => None,
-+        };
-+        if let Some(src_reg) = src_phys {
-+            // Source is in a register — emit reg-to-reg extending move.
-+            let src_typed = typed_phys_reg_name(src_reg, ft);
-+            if ft.is_signed() {
-+                match ft.size() {
-+                    1 => self
-+                        .state
-+                        .emit_fmt(format_args!("    movsbq %{}, %{}", src_typed, dest_64)),
-+                    2 => self
-+                        .state
-+                        .emit_fmt(format_args!("    movswq %{}, %{}", src_typed, dest_64)),
-+                    4 => self.state.emit_fmt(format_args!(
-+                        "    movslq %{}, %{}",
-+                        phys_reg_name_32(src_reg),
-+                        dest_64
-+                    )),
-+                    _ => {
-+                        self.operand_to_callee_reg(src, dest_phys);
-+                    }
-+                }
-+            } else {
-+                match ft.size() {
-+                    1 => self
-+                        .state
-+                        .emit_fmt(format_args!("    movzbl %{}, %{}", src_typed, dest_32)),
-+                    2 => self
-+                        .state
-+                        .emit_fmt(format_args!("    movzwl %{}, %{}", src_typed, dest_32)),
-+                    4 => {
-+                        let src_32 = phys_reg_name_32(src_reg);
-+                        self.state
-+                            .emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
-+                    }
-+                    _ => {
-+                        self.operand_to_callee_reg(src, dest_phys);
-+                    }
-+                }
-+            }
-+        } else if let Some(slot_off) = src_slot {
-+            // Source is a stack slot — emit fused load+extend directly to
-+            // dest. Uses emit_instr_rbp_reg which handles rbp/rsp
-+            // addressing automatically.
-+            if ft.is_signed() {
-+                match ft.size() {
-+                    1 => self.state.out.emit_instr_rbp_reg("    movsbq", slot_off, dest_64),
-+                    2 => self.state.out.emit_instr_rbp_reg("    movswq", slot_off, dest_64),
-+                    4 => self.state.out.emit_instr_rbp_reg("    movslq", slot_off, dest_64),
-+                    _ => self.state.out.emit_instr_rbp_reg("    movq", slot_off, dest_64),
-+                }
-+            } else {
-+                match ft.size() {
-+                    1 => self.state.out.emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
-+                    2 => self.state.out.emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
-+                    4 => self.state.out.emit_instr_rbp_reg("    movl", slot_off, dest_32),
-+                    _ => self.state.out.emit_instr_rbp_reg("    movq", slot_off, dest_64),
-+                }
-+            }
-+        } else {
-+            // No stable home: stage through the accumulator (the generic
-+            // cast path would have done the same). Only reachable from the
-+            // flush side; the record path refuses home-less sources.
-+            self.operand_to_callee_reg(src, dest_phys);
-+        }
-+    }
-+
-+    /// PF-15 record path. Returns true when the cast's widening move was
-+    /// DEFERRED (nothing emitted); false when the cast must emit normally.
-+    ///
-+    /// Eligibility: widening cast from a byte/half type to a 32/64-bit
-+    /// type, destination in a GPR home, source a Value with a stable home
-+    /// (register or slot), destination used exactly once. The consumer
-+    /// match (is that single use an integer compare of two such casts?)
-+    /// happens at the compare; any other consumer simply flushes.
-+    ///
-+    /// Refusal contract: the caller emits this cast normally, and those
-+    /// emissions (register moves, slot stores) may legally clobber a
-+    /// deferred source's home — RA reused it the moment the deferred
-+    /// source's only modelled use (this cast) stopped covering it. Any
-+    /// refusal therefore flushes the deferred moves FIRST.
-+    fn try_record_pending_widen(
-+        &mut self,
-+        dest: &Value,
-+        src: &Operand,
-+        from_ty: IrType,
-+        to_ty: IrType,
-+    ) -> bool {
-+        macro_rules! refuse {
-+            ($why:expr) => {{
-+                self.pf15_trace(concat!("refuse: ", $why));
-+                self.flush_pending_widen_impl();
-+                return false;
-+            }};
-+        }
-+        if !matches!(
-+            from_ty,
-+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
-+        ) {
-+            refuse!("from_ty");
-+        }
-+        if to_ty.is_float() || !(to_ty.size() == 4 || to_ty.size() == 8) || is_i128_type(to_ty) {
-+            refuse!("to_ty");
-+        }
-+        if self.value_use_counts.get(&dest.0).copied() != Some(1) {
-+            refuse!("use_count");
-+        }
-+        let src_val = match src {
-+            Operand::Value(v) => v.0,
-+            _ => refuse!("src_not_value"),
-+        };
-+        let Some(dest_phys) = self.dest_reg(dest) else {
-+            refuse!("no_dest_reg");
-+        };
-+        if super::emit::is_xmm_reg(dest_phys) {
-+            refuse!("xmm_dest");
-+        }
-+        let src_reg = self.operand_reg(src);
-+        let src_slot = self.state.get_slot(src_val).map(|sl| sl.0);
-+        if src_reg.is_none() && src_slot.is_none() {
-+            refuse!("no_src_home");
-+        }
-+        // A deferred cast must not be shadowed by another deferred cast
-+        // whose widening move would clobber this cast's source register
-+        // home before the compare (or a flush) reads it. RA may legally
-+        // hand this destination the first source's home: the source's only
-+        // modelled use is this deferred move, so its range appears to end
-+        // here. Conflict => flush the earlier moves and emit this cast
-+        // normally (the transform degrades, never miscompiles).
-+        for slot in 0..2 {
-+            let pending_src = self.pending_widen[slot]
-+                .as_ref()
-+                .map(|p| match &p.src {
-+                    Operand::Value(v) => Some(v.0),
-+                    _ => None,
-+                })
-+                .flatten();
-+            if let Some(pv) = pending_src {
-+                if self.reg_assignments.get(&pv).copied() == Some(dest_phys) {
-+                    refuse!("conflict with earlier pending src home");
-+                }
-+            }
-+        }
-+        // Slots are never full here: only a Cmp consumes a full pair and
-+        // every non-Cmp/Cast dispatch flushes first (generate_instruction).
-+        // Belt-and-braces: if they somehow are, fall back to normal emit.
-+        if self.pending_widen.iter().all(|p| p.is_some()) {
-+            refuse!("both slots full");
-+        }
-+        let free = if self.pending_widen[0].is_none() {
-+            0
-+        } else {
-+            1
-+        };
-+        self.pending_widen[free] = Some(PendingWiden {
-+            dest: dest.0,
-+            src: src.clone(),
-+            from_ty,
-+            dest_phys,
-+        });
-+        self.pf15_trace("record");
-+        true
-+    }
-+
-+    /// Emit any deferred widening moves, in program order. Called by the
-+    /// generate_instruction pre-dispatch hook for every non-Cmp/non-Cast
-+    /// instruction, on every refused cast, by the compare-replay exits,
-+    /// and on any compare that does not (or only partially) match.
-+    pub(super) fn flush_pending_widen_impl(&mut self) {
-+        for slot in 0..2 {
-+            if let Some(p) = self.pending_widen[slot].take() {
-+                self.emit_int_widen_move(&p.src, p.from_ty, p.dest_phys);
-+            }
-+        }
-+    }
-+
-+    /// If `lhs`/`rhs` are exactly the two recorded deferred casts (in
-+    /// either order), take both records and return
-+    /// `((lhs_src, lhs_ty, lhs_signed), (rhs_src, rhs_ty, rhs_signed))`.
-+    /// Leaves the records untouched on any mismatch — a lone pending is
-+    /// NEVER silently dropped here (its widening move would otherwise
-+    /// never be emitted and the consumer would read garbage).
-+    #[allow(clippy::type_complexity)]
-+    fn take_pending_widen_pair(
-+        &mut self,
-+        lhs: &Operand,
-+        rhs: &Operand,
-+    ) -> Option<(
-+        (Operand, IrType, bool, PhysReg),
-+        (Operand, IrType, bool, PhysReg),
-+    )> {
-+        let (lv, rv) = match (lhs, rhs) {
-+            (Operand::Value(l), Operand::Value(r)) => (l.0, r.0),
-+            _ => {
-+                self.pf15_trace("take_pair: operands not both values");
-+                return None;
-+            }
-+        };
-+        let p0 = self.pending_widen[0].take();
-+        let p1 = self.pending_widen[1].take();
-+        if p0.is_none() || p1.is_none() {
-+            // Partial occupancy: restore whatever was taken and refuse.
-+            self.pf15_trace("take_pair: partial occupancy");
-+            if let Some(a) = p0 {
-+                self.pending_widen[0] = Some(a);
-+            }
-+            if let Some(b) = p1 {
-+                self.pending_widen[1] = Some(b);
-+            }
-+            return None;
-+        }
-+        let a = p0.unwrap();
-+        let b = p1.unwrap();
-+        // Positional match, both orders.
-+        if a.dest == lv && b.dest == rv {
-+            let sa = a.from_ty.is_signed();
-+            let sb = b.from_ty.is_signed();
-+            return Some((
-+                (a.src, a.from_ty, sa, a.dest_phys),
-+                (b.src, b.from_ty, sb, b.dest_phys),
-+            ));
-+        }
-+        if a.dest == rv && b.dest == lv {
-+            let sa = b.from_ty.is_signed();
-+            let sb = a.from_ty.is_signed();
-+            return Some((
-+                (b.src, b.from_ty, sa, b.dest_phys),
-+                (a.src, a.from_ty, sb, a.dest_phys),
-+            ));
-+        }
-+        // Mismatch: restore and report.
-+        self.pf15_trace("take_pair: dest mismatch");
-+        self.pending_widen[0] = Some(a);
-+        self.pending_widen[1] = Some(b);
-+        None
-+    }
-+
-+    /// PF-15 consume path, called from the generate_instruction Cmp arm
-+    /// BEFORE emit_cmp — including when MachInst will lower the compare —
-+    /// so every possible consumer sees either a folded narrow compare or
-+    /// fully materialized widening moves, never a half-deferred state.
-+    ///
-+    /// Full-pair shape `cmp(cast a, cast b)`: folds to
-+    /// `(src_a, src_b, narrow_ty, mapped_op)` when the extension/opcode
-+    /// compatibility matrix accepts; the two widening moves are then never
-+    /// emitted at all. Single-side shape `cmp(cast a, C)`: folds when the
-+    /// constant fits the narrow domain exactly under the same matrix.
-+    /// Everything else: flush the deferred moves and return None (the
-+    /// caller emits the wide compare from the original operands).
-+    ///
-+    /// Flag-exactness matrix (the defer-side contract lives on
-+    /// `X86Codegen::pending_widen`):
-+    ///   * sext+sext: sign-extension is order-preserving, so the narrow
-+    ///     signed compare produces flag-identical answers for the signed
-+    ///     setcc family {eq, ne, slt, sle, sgt, sge}. Unsigned opcodes on
-+    ///     sign-extended operands compare negated bit patterns — refused.
-+    ///   * zext+zext: zero-extension makes both values non-negative, where
-+    ///     signed and unsigned relational order coincide; every IR opcode
-+    ///     maps onto the unsigned narrow set {eq, ne, ult, ule, ugt, uge}.
-+    ///   * mixed sext/zext: the widened values diverge (0xFF -> -1 vs
-+    ///     255) — refused.
-+    ///   * const rhs: allowed inside the narrow type's exact domain, with
-+    ///     the same per-extension opcode sets (a negative constant can
-+    ///     never compare against a zero-extended value; unsigned opcodes
-+    ///     on sign-extended operands are refused, as above).
-+    #[allow(clippy::type_complexity)]
-+    pub(super) fn narrow_cmp_operands_impl(
-+        &mut self,
-+        dest: u32,
-+        op: crate::ir::reexports::IrCmpOp,
-+        lhs: &Operand,
-+        rhs: &Operand,
-+    ) -> Option<(
-+        Operand,
-+        Operand,
-+        IrType,
-+        crate::ir::reexports::IrCmpOp,
-+    )> {
-+        use crate::ir::reexports::IrCmpOp;
-+        // Compare-replay dests re-emit the comparison at a DISTANT consumer
-+        // (cmov/jcc far from here). The adjacency guarantee that keeps the
-+        // deferred sources' homes intact does not reach there: materialize.
-+        if self.cmp_replay.contains_key(&dest) {
-+            self.pf15_trace("narrow: replay dest, flushing");
-+            self.flush_pending_widen_impl();
-+            return None;
-+        }
-+        self.pf15_trace("narrow: entered");
-+        let op_map_zext = |op: IrCmpOp| -> IrCmpOp {
-+            match op {
-+                IrCmpOp::Slt => IrCmpOp::Ult,
-+                IrCmpOp::Sle => IrCmpOp::Ule,
-+                IrCmpOp::Sgt => IrCmpOp::Ugt,
-+                IrCmpOp::Sge => IrCmpOp::Uge,
-+                signed_or_unsigned_keep => signed_or_unsigned_keep,
-+            }
-+        };
-+        let signed_only = |op: IrCmpOp| -> Option<IrCmpOp> {
-+            match op {
-+                IrCmpOp::Eq
-+                | IrCmpOp::Ne
-+                | IrCmpOp::Slt
-+                | IrCmpOp::Sle
-+                | IrCmpOp::Sgt
-+                | IrCmpOp::Sge => Some(op),
-+                _ => None,
-+            }
-+        };
-+        // Full-pair shape.
-+        if let Some(((lsrc, lty, lsign, ldest), (rsrc, rty, rsign, rdest))) =
-+            self.take_pending_widen_pair(lhs, rhs)
-+        {
-+            let folded = if lty != rty {
-+                None
-+            } else if lsign && rsign {
-+                signed_only(op).map(|m| (lsrc.clone(), rsrc.clone(), lty, m))
-+            } else if !lsign && !rsign {
-+                Some((lsrc.clone(), rsrc.clone(), lty, op_map_zext(op)))
-+            } else {
-+                None // mixed sext/zext: widened values diverge
-+            };
-+            self.pf15_trace(if folded.is_some() { "pair FOLD" } else { "pair matrix refuse" });
-+            if let Some(f) = folded {
-+                return Some(f);
-+            }
-+            // Refused: the records are already taken OUT of the slots, so
-+            // re-emit both widening moves explicitly, in program order.
-+            self.emit_int_widen_move(&lsrc, lty, ldest);
-+            self.emit_int_widen_move(&rsrc, rty, rdest);
-+            return None;
-+        }
-+        // Single-side const shape: cmp(cast(x), C) with C in the narrow
-+        // domain. (Cmp with a constant lhs is canonicalized to rhs
-+        // upstream; a const lhs here simply takes the flush path below.)
-+        if self.pending_widen[1].is_some() {
-+            self.flush_pending_widen_impl();
-+            return None;
-+        }
-+        let (src, from_ty, dest_phys) = match (lhs, self.pending_widen[0].take()) {
-+            (Operand::Value(v), Some(p)) if p.dest == v.0 => (p.src, p.from_ty, p.dest_phys),
-+            (_, other) => {
-+                self.pending_widen[0] = other;
-+                self.flush_pending_widen_impl();
-+                return None;
-+            }
-+        };
-+        let (lo, hi) = if from_ty.is_signed() {
-+            (
-+                -(1i64 << (from_ty.size() * 8 - 1)),
-+                (1i64 << (from_ty.size() * 8 - 1)) - 1,
-+            )
-+        } else {
-+            (0i64, (1i64 << (from_ty.size() * 8)) - 1)
-+        };
-+        let folded = match rhs {
-+            Operand::Const(c) => match c.clone().to_i64() {
-+                Some(cv) if (lo..=hi).contains(&cv) => {
-+                    if from_ty.is_signed() {
-+                        signed_only(op).map(|m| (src.clone(), rhs.clone(), from_ty, m))
-+                    } else {
-+                        Some((src.clone(), rhs.clone(), from_ty, op_map_zext(op)))
-+                    }
-+                }
-+                _ => None,
-+            },
-+            _ => None,
-+        };
-+        if let Some(f) = folded {
-+            return Some(f);
-+        }
-+        // Refused after take: re-emit the taken widening move explicitly.
-+        self.emit_int_widen_move(&src, from_ty, dest_phys);
-+        None
-+    }
-+
-     fn try_emit_cast_reg_direct(
-         &mut self,
-         _dest: &Value,
-@@ -456,90 +877,10 @@ impl X86Codegen {
-             }
-             CastKind::IntWiden { from_ty: ft, .. } => {
-                 // Widen: sign or zero extend from smaller to larger type.
--                if let Some(src_reg) = src_phys {
--                    // Source is in a register — emit reg-to-reg extending move.
--                    let src_typed = typed_phys_reg_name(src_reg, ft);
--                    if ft.is_signed() {
--                        match ft.size() {
--                            1 => self
--                                .state
--                                .emit_fmt(format_args!("    movsbq %{}, %{}", src_typed, dest_64)),
--                            2 => self
--                                .state
--                                .emit_fmt(format_args!("    movswq %{}, %{}", src_typed, dest_64)),
--                            4 => self.state.emit_fmt(format_args!(
--                                "    movslq %{}, %{}",
--                                phys_reg_name_32(src_reg),
--                                dest_64
--                            )),
--                            _ => {
--                                self.operand_to_callee_reg(src, dest_phys);
--                            }
--                        }
--                    } else {
--                        match ft.size() {
--                            1 => self
--                                .state
--                                .emit_fmt(format_args!("    movzbl %{}, %{}", src_typed, dest_32)),
--                            2 => self
--                                .state
--                                .emit_fmt(format_args!("    movzwl %{}, %{}", src_typed, dest_32)),
--                            4 => {
--                                let src_32 = phys_reg_name_32(src_reg);
--                                self.state
--                                    .emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
--                            }
--                            _ => {
--                                self.operand_to_callee_reg(src, dest_phys);
--                            }
--                        }
--                    }
--                } else if let Some(slot_off) = src_slot {
--                    // Source is a stack slot — emit fused load+extend directly to dest.
--                    // Uses emit_instr_rbp_reg which handles rbp/rsp addressing automatically.
--                    if ft.is_signed() {
--                        match ft.size() {
--                            1 => self
--                                .state
--                                .out
--                                .emit_instr_rbp_reg("    movsbq", slot_off, dest_64),
--                            2 => self
--                                .state
--                                .out
--                                .emit_instr_rbp_reg("    movswq", slot_off, dest_64),
--                            4 => self
--                                .state
--                                .out
--                                .emit_instr_rbp_reg("    movslq", slot_off, dest_64),
--                            _ => self
--                                .state
--                                .out
--                                .emit_instr_rbp_reg("    movq", slot_off, dest_64),
--                        }
--                    } else {
--                        match ft.size() {
--                            1 => self
--                                .state
--                                .out
--                                .emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
--                            2 => self
--                                .state
--                                .out
--                                .emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
--                            4 => self
--                                .state
--                                .out
--                                .emit_instr_rbp_reg("    movl", slot_off, dest_32),
--                            _ => self
--                                .state
--                                .out
--                                .emit_instr_rbp_reg("    movq", slot_off, dest_64),
--                        }
--                    }
--                } else {
--                    return false;
--                }
--                return true;
-+                // (Single definition shared with the PF-15 deferred-widen
-+                // flush — emit_int_widen_move above.)
-+                self.emit_int_widen_move(src, ft, dest_phys);
-+                true
-             }
-             CastKind::IntNarrow { to_ty: t } => {
-                 // Narrow: truncate to the target width.
-diff --git a/src/backend/x86/codegen/comparison.rs b/src/backend/x86/codegen/comparison.rs
-index 59c1a1b1..8b06ef71 100644
---- a/src/backend/x86/codegen/comparison.rs
-+++ b/src/backend/x86/codegen/comparison.rs
-@@ -155,6 +155,11 @@ impl X86Codegen {
-         // comparison from the recorded operands right before its cmov/jcc.
-         // Emitting the cmp here too would double the compare in the hot loop.
-         if self.cmp_replay.contains_key(&dest.0) {
-+            // The comparison re-emits later from the recorded operands, so
-+            // any deferred narrowing widens (PF-15) must materialize NOW:
-+            // the replay will read these homes at a distance where the
-+            // adjacency guarantee no longer holds.
-+            self.flush_pending_widen_impl();
-             return;
-         }
-         self.emit_int_cmp_insn_typed(lhs, rhs, ty);
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 5930c4af..27588bae 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -463,6 +463,23 @@ pub struct X86Codegen {
-     /// Pending condition flags from a fused Cmp: (cmp dest value, cmp opcode).
-     /// Set by the Cmp emitter when the consumer is the next instruction.
-     pub(super) pending_cmp: Option<(u32, crate::ir::reexports::IrCmpOp)>,
-+    /// PF-15 deferred narrowing widen (2026-08-29): a single-use widening
-+    /// Cast from a byte/half type whose result feeds an integer compare
-+    /// DEFERS its extending move and records itself here (two slots: both
-+    /// operands of a compare may be widening casts). The next Cmp consumes
-+    /// the pair and emits one `cmpb`/`cmpw` on the ORIGINAL sources --
-+    /// exactly GCC's shape -- instead of two extends plus a 32/64-bit
-+    /// compare (PF-15: `a < b` on signed chars widened both operands three
-+    /// times). Any other instruction flushes the deferred moves unchanged,
-+    /// so the transform is invisible to every non-matching consumer.
-+    /// Soundness rests on the record-time conflict rule in
-+    /// `try_record_pending_widen`: a second cast whose destination home
-+    /// equals the first cast's source register home is refused (the RA may
-+    /// reuse the first source's home for the second destination once the
-+    /// source's only modelled use -- the deferred move -- leaves its live
-+    /// range), and the reversed aliasing (first dest == second source) is
-+    /// impossible because the two SSA ranges overlap by construction.
-+    pub(super) pending_widen: [Option<super::cast_ops::PendingWiden>; 2],
-     /// Pending FP condition flags from a fused float Cmp: (cmp dest value,
-     /// pre-computed jcc). FP ucomisd sets EFLAGS with different semantics
-     /// than integer cmp (ordered via CF/ZF/PF; `ja`/`jae`/`jb`/`jbe` map to
-@@ -696,6 +713,7 @@ impl X86Codegen {
-             fold_skip_cast: None,
-             value_types: FxHashMap::default(),
-             pending_cmp: None,
-+            pending_widen: [None, None],
-             pending_fp_cmp: None,
-             current_func: None,
-             ivsr_pointers: FxHashMap::default(),
-@@ -3603,6 +3621,20 @@ impl ArchCodegen for X86Codegen {
-         self.reg_assignments.contains_key(&vid)
-     }
- 
-+    fn flush_pending_widen(&mut self) {
-+        self.flush_pending_widen_impl();
-+    }
-+
-+    fn narrow_cmp_operands(
-+        &mut self,
-+        dest: u32,
-+        op: crate::ir::reexports::IrCmpOp,
-+        lhs: &Operand,
-+        rhs: &Operand,
-+    ) -> Option<(Operand, Operand, IrType, crate::ir::reexports::IrCmpOp)> {
-+        self.narrow_cmp_operands_impl(dest, op, lhs, rhs)
-+    }
-+
-     fn state(&mut self) -> &mut CodegenState {
-         &mut self.state
-     }
-@@ -3782,6 +3814,27 @@ impl ArchCodegen for X86Codegen {
-         // boolean is never needlessly materialized (gzip huft_build regression).
-         match inst {
-             crate::ir::reexports::Instruction::Select { .. } => return false,
-+            // PF-15: single-use widening casts from byte/half types stay on
-+            // the mature path, where try_record_pending_widen can defer them
-+            // into a narrow compare. MachInst would emit the extending move
-+            // eagerly, which forecloses the fold. Eligibility mirrors
-+            // try_record_pending_widen (the record path re-checks everything
-+            // and emits normally on any mismatch, so a lenient gate here is
-+            // merely an optimization hint, never a correctness input).
-+            crate::ir::reexports::Instruction::Cast {
-+                dest,
-+                from_ty,
-+                to_ty,
-+                ..
-+            } if matches!(
-+                from_ty,
-+                IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
-+            ) && !to_ty.is_float()
-+                && (to_ty.size() == 4 || to_ty.size() == 8)
-+                && self.value_use_counts.get(&dest.0).copied() == Some(1) =>
-+            {
-+                return false;
-+            }
-             crate::ir::reexports::Instruction::Cmp { dest, .. }
-                 if self.fused_cmp_dests.contains_key(&dest.0)
-                     || self.cmp_replay.contains_key(&dest.0) =>
-diff --git a/tests/regression/byte_cmp_narrow.c b/tests/regression/byte_cmp_narrow.c
+diff --git a/.base_ref b/.base_ref
+index fb6f470..629147d 100644
+--- a/.base_ref
++++ b/.base_ref
+@@ -1 +1 @@
+-cfc89a1cad14a22176ec321a0a41ea47686dff0e
++90b6d878e004df63ed4d3f23e17639e218037f90
+diff --git a/engineering/FOLLOWUP-2026-08-29-misc-zstd-oracle.md b/engineering/FOLLOWUP-2026-08-29-misc-zstd-oracle.md
 new file mode 100644
-index 00000000..1720c065
+index 0000000..70c18f4
 --- /dev/null
-+++ b/tests/regression/byte_cmp_narrow.c
-@@ -0,0 +1,64 @@
-+/* PF-15: single-use widening byte/half casts feeding an integer compare
-+ * must fold into one narrow cmpb/cmpw on the ORIGINAL sources (GCC's
-+ * exact shape) whenever the extension/opcode compatibility matrix allows
-+ * — sext pairs keep the signed setcc family, zext pairs map every opcode
-+ * onto the unsigned family, mixed extensions and out-of-domain constants
-+ * are refused (materializing both widening moves instead). The harness
-+ * compares program output against GCC, so any wrong flag mapping or a
-+ * missing deferred widening move shows up as a mismatch on some input
-+ * combination. Exhaustive over the byte domains; strided over the half
-+ * domains. */
-+#include <stdio.h>
++++ b/engineering/FOLLOWUP-2026-08-29-misc-zstd-oracle.md
+@@ -0,0 +1,55 @@
++# Follow-up — 2026-08-29: preboot ZSTD, rebase onto `90b6d87`
 +
-+static volatile int v_zero = 0;
++**Base.** `ms178/lccc` main `90b6d87` (PR #295 merge). Workspace was truncated
++(no `.git`, no kernel tree); restored by cloning main, rustup 1.98.0, 8G
++swap, `prepare_kernel_tree.sh` for linux-cachymod **6.18.47**.
 +
-+int scmp(signed char a, signed char b) { return a < b; }
-+int sge(signed char a, signed char b) { return a >= b; }
-+int seq(signed char a, signed char b) { return a == b; }
-+int ucmp(unsigned char a, unsigned char b) { return a < b; }
-+int uge(unsigned char a, unsigned char b) { return a >= b; }
-+int ub_mix(unsigned char a, signed char b) { return a < b; }
-+int slt16(short a, short b) { return a < b; }
-+int ule16(unsigned short a, unsigned short b) { return a <= b; }
-+int c_sext(signed char a) { return a < 100; }
-+int c_zext(unsigned char a) { return a >= 200; }
-+int c_sixteen(unsigned short a) { return a == 65535; }
++## This session
 +
-+int main(void) {
-+    int fails = 0;
-+    for (int a = -128; a <= 127; a++) {
-+        for (int b = -128; b <= 127; b++) {
-+            unsigned char ua = (unsigned char)a;
-+            unsigned char ub = (unsigned char)b;
-+            if (scmp(a, b) != (a < b)) fails++;
-+            if (sge(a, b) != (a >= b)) fails++;
-+            if (seq(a, b) != (a == b)) fails++;
-+            if (ucmp(ua, ub) != (ua < ub)) fails++;
-+            if (uge(ua, ub) != (ua >= ub)) fails++;
-+            if (ub_mix(ua, b) != (ua < b)) fails++;
-+            if (c_sext(a) != (a < 100)) fails++;
-+            if (c_zext(ua) != (ua >= 200)) fails++;
-+            if (fails > 40) { printf("FAILS %d\n", fails); return 1; }
-+        }
-+    }
-+    for (int a = -32768; a <= 32767; a += 7) {
-+        for (int b = -32768; b <= 32767; b += 11) {
-+            unsigned short ua = (unsigned short)a;
-+            unsigned short ub = (unsigned short)b;
-+            if (slt16(a, b) != (a < b)) fails++;
-+            if (ule16(ua, ub) != (ua <= ub)) fails++;
-+            if (c_sixteen(ua) != (ua == 65535)) fails++;
-+            if (fails > 40) { printf("FAILS %d\n", fails); return 1; }
-+        }
-+    }
-+    /* Deferred-widen interaction with a volatile sink: the loads around
-+     * the compare must not reorder the widening moves' liveness. */
-+    if (v_zero == 0) {
-+        signed char s = -1;
-+        unsigned char u = 1;
-+        if (!(scmp(s, 0) == 1 && ucmp(u, 0) == 0 && ub_mix(u, s) == 0)) fails++;
-+    }
-+    if (fails != 0) { printf("FAILS %d\n", fails); return 1; }
-+    printf("byte-cmp-narrow OK\n");
-+    return 0;
-+}
-diff --git a/tests/regression/byte_cmp_narrow.flags b/tests/regression/byte_cmp_narrow.flags
++### Sticky `-mno-sse` (still required)
++
++`-march=native` / CPU profiles used to clear `no_sse`. Kernel decompressor
++passes `-mno-sse` then Cachy `-march=native`; GCC keeps the disable.
++
++Fix in `src/driver/cli.rs` + `pipeline.rs`: `sse_explicitly_disabled`.
++`-mno-sse` is sticky against `-march=native` in either order; explicit
++`-msse`/`-msse2` re-enables. Tests: `mno_sse_survives_march_native`,
++`msse_reenable_after_mno_sse`. Runtime: `tests/regression/mno_sse_memcpy16`.
++
++### P0 ZSTD on latest main: userspace oracle of **real `misc.o`** MATCHES
++
++Previous sessions: standalone `__decompress` MATCH, combined LCCC `misc.o`
++HLT `ZSTD-compressed data is corrupt` in QEMU; gcc `misc.o` booted.
++
++On **`90b6d87` + sticky SSE**, the same `misc.c` TU compiled with compressed
++flags (`-O2 -fPIE -mcmodel=small -mno-sse`) **decompresses**:
++
++| payload | gcc `misc.o` | lccc `misc.o` |
++|---|---|---|
++| patterned 256 / 320 / 1K / 4K / 64K ± 4-byte size trailer | DECOMPRESS-OK | DECOMPRESS-OK |
++| `vmlinux.bin` 16 539 648 B, zstd `-6 --ultra` + 4-byte trailer (4 129 387 B) | DECOMPRESS-OK | DECOMPRESS-OK |
++
++Driver: `/tmp/zstd-oracle/misc_driver.c` (linked against `misc.o`; `error()`
++longjmps; “Kernel is not a valid ELF file” after success is `parse_elf` on
++non-ELF patterned data / stripped `vmlinux.bin` without PT_LOAD layout).
++Do **not** use libc `malloc` — `misc.c` exports `MALLOC_VISIBLE malloc`.
++Do **not** compile the string helpers at `-O2` without `-fno-builtin` (gcc
++turns `memset` into a recursive call).
++
++Likely already fixed upstream by **#294** (cast from-width: source type from
++the defining instruction’s actual width, pr81588) and/or **#295** (narrow
++compares / non-negative immediates). The earlier #291 unsigned-only Copy
++restriction is in tree.
++
++**QEMU boot is still the gate.** Userspace does not exercise PIE relocate of
++the compressed stub, `extract_kernel`, IDT, or in-place overlap. Need a
++bzImage (intact `vmlinux` + lccc compressed objects + lccc-ld). Tree was
++truncated so `arch/x86/boot/compressed/*.o` and EFI stub / `startup/lib.a`
++must be rebuilt; do **not** `make bzImage` as a file target with
++`-mcmodel=kernel`.
++
++## Do not re-open
++
++Early IDT `.fill`; `-u`; `earlyprintk=`; `.Lcommon_startup_64`; blaming
++standalone unzstd / `string.o` memcpy; `BOOT_HEAP_SIZE` as 4 MiB (x86 ZSTD
++is `0x30000`); extra `\\\"` on `KBUILD_MODNAME` (must be `'"misc"'`).
+diff --git a/scripts/preboot_misc.cflags.rsp b/scripts/preboot_misc.cflags.rsp
 new file mode 100644
-index 00000000..3a3b5796
+index 0000000..ba2a427
 --- /dev/null
-+++ b/tests/regression/byte_cmp_narrow.flags
-@@ -0,0 +1 @@
++++ b/scripts/preboot_misc.cflags.rsp
+@@ -0,0 +1,42 @@
++-m64
 +-O2
--- 
-2.47.3
-
-
-From 4650ed81caf8ac4c0df3920cd14aa366d0fcc8f2 Mon Sep 17 00:00:00 2001
-From: lccc-agent <agent@lccc.local>
-Date: Sat, 29 Aug 2026 12:09:30 +0000
-Subject: [PATCH 2/4] arm: document why the divrem fusion's fixed x1/x2/x3 uses
- need no RA exclusion
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Red-team audit follow-up: emit_divrem_pair_head_arm uses x1/x2 as fixed
-operand registers and x3 as the msub scratch. That is sound WITHOUT any
-allocator exclusion (unlike x86-64, where %rdx must be excluded from
-dividing functions) because the ARM allocator only ever assigns
-x4-x8/x13/x14 (ARM_CALLER_SAVED) and x19-x28 (ARM_CALLEE_SAVED) —
-x1/x2/x3 are in no allocatable pool. The x86 rule and the ARM pool are
-now cross-referenced in both places so a future allocator change cannot
-silently invalidate either assumption.
----
- src/backend/arm/codegen/alu.rs | 6 ++++++
- 1 file changed, 6 insertions(+)
-
-diff --git a/src/backend/arm/codegen/alu.rs b/src/backend/arm/codegen/alu.rs
-index 454d37ea..70cc8862 100644
---- a/src/backend/arm/codegen/alu.rs
-+++ b/src/backend/arm/codegen/alu.rs
-@@ -763,6 +763,12 @@ impl ArmCodegen {
-     ) {
-         let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
-         let self_is_div = matches!(op, IrBinOp::UDiv | IrBinOp::SDiv);
-+        // x1/x2 (operands) and x3 (remainder scratch) are used as FIXED
-+        // registers here. That is sound without any RA exclusion because
-+        // the ARM allocator only ever assigns x4, x5, x6, x7, x8, x13, x14
-+        // (ARM_CALLER_SAVED) and x19-x28 (ARM_CALLEE_SAVED) — x1/x2/x3 are
-+        // in no pool (audited 2026-08-29; x86's counterpart needs the %rdx
-+        // exclusion because x86's allocatable pool includes rdx).
-         self.operand_to_x0(lhs);
-         self.state.emit("    mov x1, x0");
-         self.operand_to_x0(rhs);
--- 
-2.47.3
-
-
-From ce6b8b2e9ab9f0e27740ff0970ba305f0223f76e Mon Sep 17 00:00:00 2001
-From: lccc-agent <agent@lccc.local>
-Date: Sat, 29 Aug 2026 12:15:58 +0000
-Subject: [PATCH 3/4] x86-64: fuse compares through flag-neutral widening moves
- (IS-07)
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-The clamp idiom `x > 100 ? 100 : x` lowered as
-cmp/select/select-with-widened-arm lost its flag fusion: the select's
-arm value needed an I32->I64 widening (`movslq %edi, %rdx`) BETWEEN the
-cmp and the select, and the fusion chain walk treated any intervening
-instruction as a chain breaker — falling back to
-setcc+movzbl+testq+cmovne (4 extra instructions per clamp).
-
-The chain walk now steps over widening integer casts of UNRELATED
-values: their emission is pure data movement on every path (mature
-direct move, accumulator staging, MachInst-queued movslq) and leaves
-EFLAGS untouched, so the compare's flags are still live at the select.
-The Cmp destination's single-use invariant is checked before the walk,
-so the boolean is still consumed by exactly the same select.
-
-Deliberately NOT accepted as transparent: UnaryOp (Neg/Not write
-flags), BinOp (writes flags), GEP (scaled indices may emit imul), and
-anything touching memory or the pending boolean — those break the walk
-exactly as before.
-
-`limit` now emits cmp/movslq/movq/cmovg (the setcc chain is gone);
-measured on the clamp trio with GCC as reference. Validated: lib gate
-1302/0 under -D warnings; x86-64 corpus 962/0; i686 failure set
-unchanged; godbolt x86-64 census unchanged. The remaining known gap —
-nested selects whose producer cmps interleave
-(cmp9, cmp14, select(cond=14), select(cond=9): the outer select's
-producer flags are clobbered by the inner cmp) — needs emission
-reordering against flag liveness and is recorded for a follow-up.
----
- src/backend/x86/codegen/prologue.rs | 40 +++++++++++++++++++++++++++++
- 1 file changed, 40 insertions(+)
-
-diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
-index 75b26a0e..bb70e424 100644
---- a/src/backend/x86/codegen/prologue.rs
-+++ b/src/backend/x86/codegen/prologue.rs
-@@ -799,6 +799,46 @@ impl X86Codegen {
-                                     cur = cd.0;
-                                     k += 1;
-                                 }
-+                                // IS-07: a flag-neutral, side-effect-free,
-+                                // boolean-independent data movement between
-+                                // the Cmp and its Select consumer does not
-+                                // disturb the fusion — the flags survive
-+                                // mov/movz/movs/lea untouched, and the Cmp's
-+                                // boolean is still consumed by the SAME
-+                                // select (use_counts==1 on the Cmp dest is
-+                                // checked before the walk starts). This is
-+                                // the `limit` clamp shape:
-+                                //   cmp x>100; movslq x, x64; select(100, x64)
-+                                // which previously lost the fusion to the
-+                                // intervening widening move and fell back to
-+                                // setcc+movzbl+testq+cmovne (4 extra
-+                                // instructions). These instructions are NOT
-+                                // boolean forwarding (their values must and
-+                                // do emit normally) — they are transparent
-+                                // to the handshake, so they are neither
-+                                // chained nor added to fused_forward.
-+                                // Accepted kind: a widening integer cast of
-+                                // an UNRELATED value — its emission (any
-+                                // path: mature direct move, accumulator
-+                                // staging, or a MachInst-queued movslq) is
-+                                // pure data movement and leaves EFLAGS
-+                                // untouched. Deliberately NOT accepted:
-+                                // UnaryOp (Neg/Not write flags), BinOp
-+                                // (writes flags), GEP (scaled indices may
-+                                // emit imul — writes flags), anything that
-+                                // touches memory or the pending boolean.
-+                                Instruction::Cast {
-+                                    src: Operand::Value(sv),
-+                                    from_ty: ft,
-+                                    to_ty: tt,
-+                                    ..
-+                                } if sv.0 != cur
-+                                    && ft.is_integer()
-+                                    && tt.is_integer()
-+                                    && tt.size() > ft.size() =>
-+                                {
-+                                    k += 1;
-+                                }
-                                 Instruction::Select {
-                                     cond: Operand::Value(v),
-                                     ..
--- 
-2.47.3
-
-
-From 94e002cbd9182c3717b376d97cdfde15c28288fb Mon Sep 17 00:00:00 2001
-From: lccc-agent <agent@lccc.local>
-Date: Sat, 29 Aug 2026 12:15:58 +0000
-Subject: [PATCH 4/4] x86-64: materialize non-negative immediates with movl
- (PF-16)
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-`movq $imm32, %r64` assembles to REX.W C7 /0 (7 bytes). For immediate
-values >= 0, `movl $imm, %r32` (B8+r, 5 bytes, no REX) writes the
-identical canonical 64-bit value — a 32-bit destination write
-zero-extends, which equals the q-form's sign extension exactly when the
-immediate's high bit is clear. Negative immediates keep the q-form
-(movl would zero-extend the wrong value), and magnitudes beyond
-imm32 keep movabsq. The register-direct constant-materialization sites
-(I8/I16/I32/I64 consts into a target register, both the PhysReg and
-register-name variants) and the two flag-neutral `movq $0` clears in
-the compare emitter now pick the shortest correct form; the $0 sites
-additionally drop to movl (same zero-canonical value, neither form
-touches flags, two bytes shorter).
-
-Instruction counts are unchanged by construction (one mov either way),
-so the oracle census is stable; the win is 2 bytes + a dropped REX
-prefix per immediate in switch jump-table staging, GEP offsets, and
-compare-materialization paths.
-
-Validated: value-checked kernels (positive/negative/beyond-imm32
-immediates against expected 64-bit results), lib gate 1302/0 under
--D warnings, x86-64 corpus 962/0, i686 failure set byte-identical,
-godbolt x86-64 census unchanged at 6278/5773.
----
- src/backend/x86/codegen/comparison.rs |   8 +-
- src/backend/x86/codegen/emit.rs       | 109 +++++++++++++++++++++-----
- 2 files changed, 94 insertions(+), 23 deletions(-)
-
-diff --git a/src/backend/x86/codegen/comparison.rs b/src/backend/x86/codegen/comparison.rs
-index 8b06ef71..1cedbce8 100644
---- a/src/backend/x86/codegen/comparison.rs
-+++ b/src/backend/x86/codegen/comparison.rs
-@@ -694,7 +694,9 @@ impl X86Codegen {
-                 self.state.reg_cache.invalidate_acc();
-             }
-             if c.is_zero() {
--                self.state.emit_fmt(format_args!("    movq $0, %{}", reg64));
-+                // PF-16: movl $0 writes the same canonical value (zero-extend)
-+                // two bytes shorter; neither form touches flags.
-+                self.state.emit_fmt(format_args!("    movl $0, %{}", super::emit::reg_name_to_32(&reg64)));
-                 return;
-             }
-             match c {
-@@ -744,7 +746,9 @@ impl X86Codegen {
++-std=gnu18
++-fno-strict-aliasing
++-fPIE
++-fno-jump-tables
++-mcmodel=small
++-mno-red-zone
++-mno-mmx
++-mno-sse
++-ffreestanding
++-fshort-wchar
++-fno-stack-protector
++-fno-asynchronous-unwind-tables
++-Wno-pointer-sign
++-Wno-address-of-packed-member
++-nostdinc
++-I/home/user/kernel-work/linux-6.18.47/arch/x86/boot/compressed
++-I/home/user/kernel-work/linux-6.18.47/arch/x86/boot
++-I/home/user/kernel-work/linux-6.18.47/arch/x86/include
++-I/home/user/kernel-work/linux-6.18.47/arch/x86/include/generated
++-I/home/user/kernel-work/linux-6.18.47/include
++-I/home/user/kernel-work/linux-6.18.47/include/generated
++-I/home/user/kernel-work/linux-6.18.47/include/uapi
++-I/home/user/kernel-work/linux-6.18.47/arch/x86/include/uapi
++-I/home/user/kernel-work/linux-6.18.47/arch/x86/include/generated/uapi
++-I/home/user/kernel-work/linux-6.18.47/include/generated/uapi
++-include
++/home/user/kernel-work/linux-6.18.47/include/linux/compiler-version.h
++-include
++/home/user/kernel-work/linux-6.18.47/include/linux/kconfig.h
++-include
++/home/user/kernel-work/linux-6.18.47/include/linux/compiler_types.h
++-include
++/home/user/kernel-work/linux-6.18.47/include/linux/hidden.h
++-D__KERNEL__
++-DCC_USING_FENTRY
++-DDISABLE_BRANCH_PROFILING
++-D__DISABLE_EXPORTS
++-DKBUILD_BASENAME='"misc"'
++-DKBUILD_MODNAME='"misc"'
++-DKBUILD_MODFILE='"arch/x86/boot/compressed/misc"'
+diff --git a/scripts/preboot_misc_driver.c b/scripts/preboot_misc_driver.c
+new file mode 100644
+index 0000000..f2b8d66
+--- /dev/null
++++ b/scripts/preboot_misc_driver.c
+@@ -0,0 +1,124 @@
++#define _GNU_SOURCE
++#include <setjmp.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <sys/mman.h>
++
++extern unsigned long decompress_kernel(unsigned char *outbuf, unsigned long virt_addr,
++				       void (*error)(char *x));
++
++unsigned char input_data[8 * 1024 * 1024];
++unsigned int input_len, output_len;
++
++void accept_memory(void) {}
++void choose_random_location(void) {}
++void cleanup_exception_handling(void) {}
++int cmdline_find_option_bool(const char *o) { (void)o; return 0; }
++void early_tdx_detect(void) {}
++unsigned long get_rsdp_addr(void) { return 0; }
++int init_unaccepted_memory(void) { return 0; }
++unsigned long sev_status;
++
++static jmp_buf jb;
++static char last_err[256];
++void error(char *x)
++{
++	snprintf(last_err, sizeof last_err, "%s", x ? x : "(null)");
++	longjmp(jb, 1);
++}
++
++static unsigned char outbuf[20 * 1024 * 1024];
++static unsigned char zscratch[6 * 1024 * 1024];
++static unsigned char plainbuf[20 * 1024 * 1024];
++
++static int run(const char *tag, unsigned char *z, unsigned zlen,
++	       unsigned char *plain, unsigned plen, int check_plain)
++{
++	if (zlen > sizeof input_data || plen > sizeof outbuf) {
++		fprintf(stderr, "%s too big\n", tag);
++		return 1;
++	}
++	memcpy(input_data, z, zlen);
++	input_len = zlen;
++	output_len = plen;
++	memset(outbuf, 0, plen);
++	last_err[0] = 0;
++	unsigned long ret = 0;
++	if (setjmp(jb) == 0)
++		ret = decompress_kernel(outbuf, 0xffffffff81000000UL, error);
++	int fail = 0;
++	if (last_err[0]) {
++		if (strstr(last_err, "not a valid ELF")) {
++			if (check_plain && memcmp(outbuf, plain, plen) != 0) {
++				printf("%s DECOMPRESS-OK-but-MISMATCH\n", tag);
++				fail = 1;
++			} else {
++				printf("%s DECOMPRESS-OK (parse_elf)\n", tag);
++			}
++		} else {
++			printf("%s FAIL error=%s ret=%lx\n", tag, last_err, ret);
++			fail = 1;
++		}
++	} else if (ret == ~0UL) {
++		printf("%s FAIL ULONG_MAX\n", tag);
++		fail = 1;
++	} else {
++		printf("%s returned entry=%lx\n", tag, ret);
++	}
++	return fail;
++}
++
++/* Host libc I/O: do not call malloc (hijacked by misc.c's bump allocator). */
++static unsigned read_path(const char *path, unsigned char *dst, unsigned cap)
++{
++	int fd = open(path, O_RDONLY);
++	if (fd < 0) { perror(path); exit(2); }
++	unsigned n = 0;
++	for (;;) {
++		ssize_t r = read(fd, dst + n, cap - n);
++		if (r < 0) { perror("read"); exit(2); }
++		if (r == 0) break;
++		n += (unsigned)r;
++		if (n == cap) break;
++	}
++	close(fd);
++	return n;
++}
++
++int main(int argc, char **argv)
++{
++	int fails = 0;
++	int sizes[] = {256, 320, 1024, 4096, 65536};
++	for (int si = 0; si < 5; si++) {
++		int n = sizes[si];
++		for (int i = 0; i < n; i++) plainbuf[i] = (unsigned char)(i & 255);
++		char zpath[80];
++		snprintf(zpath, sizeof zpath, "/tmp/zstd-oracle/p%d.zst", n);
++		/* Use already-created files from previous run if present. */
++		if (access(zpath, R_OK) != 0) {
++			char cmd[256];
++			snprintf(cmd, sizeof cmd,
++				 "python3 -c \"open('/tmp/t','wb').write(bytes(i&255 for i in range(%d)))\" && zstd -q -f -6 --ultra -o %s /tmp/t",
++				 n, zpath);
++			if (system(cmd) != 0) { fprintf(stderr, "zstd failed\n"); return 2; }
++		}
++		unsigned zlen = read_path(zpath, zscratch, sizeof zscratch);
++		char tag[80];
++		snprintf(tag, sizeof tag, "pattern-%d", n);
++		fails += run(tag, zscratch, zlen, plainbuf, n, 1);
++		memcpy(zscratch + zlen, &n, 4); /* LE size on little-endian host */
++		snprintf(tag, sizeof tag, "pattern-%d-trailer4", n);
++		fails += run(tag, zscratch, zlen + 4, plainbuf, n, 1);
++	}
++	if (argc >= 3) {
++		unsigned zlen = read_path(argv[1], zscratch, sizeof zscratch);
++		unsigned plen = read_path(argv[2], plainbuf, sizeof plainbuf);
++		fails += run("piggy", zscratch, zlen, plainbuf, plen, 1);
++	}
++	return fails ? 1 : 0;
++}
+diff --git a/scripts/qemu_boot_test.sh b/scripts/qemu_boot_test.sh
+index 92ef005..c3adeb2 100755
+--- a/scripts/qemu_boot_test.sh
++++ b/scripts/qemu_boot_test.sh
+@@ -67,7 +67,7 @@ timeout 600 "$QEMU" -m 512 -smp 2 \
+     -kernel "$BZIMAGE" -initrd "$WORK/initramfs.cpio.gz" \
+     -nographic -no-reboot \
+     -accel tcg,thread=multi \
+-    -append "console=ttyS0,115200 nokaslr panic=-1" > "$LOG" 2>&1 || true
++    -append "console=ttyS0,115200 nokaslr panic=-1 vga=normal" > "$LOG" 2>&1 || true
+ 
+ # ---- verdict ------------------------------------------------------------------
+ fail=0
+diff --git a/scripts/zstd_preboot_oracle.sh b/scripts/zstd_preboot_oracle.sh
+new file mode 100755
+index 0000000..d9dc194
+--- /dev/null
++++ b/scripts/zstd_preboot_oracle.sh
+@@ -0,0 +1,222 @@
++#!/usr/bin/env bash
++# Userspace oracle of the preboot ZSTD path (misc.c's decompress_kernel call).
++# Compiles a TU that #includes decompress_unzstd.c with STATIC+MALLOC_VISIBLE
++# like arch/x86/boot/compressed/misc.c, then calls
++#   __decompress(input_data, input_len, NULL, NULL, out, output_len, NULL, error)
++# where input_len/output_len are extern unsigned int (the piggy.S types).
++set -euo pipefail
++
++K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.47}
++LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
++OUT=${OUT:-/tmp/zstd-oracle}
++mkdir -p "$OUT"
++
++# Compressed-boot flags (arch/x86/boot/compressed/Makefile), plus userspace
++# linkability. Do NOT add -mcmodel=kernel. Do NOT pass -fno-builtin memset
++# (that was a harness SEGV).
++CFLAGS_COMMON="-m64 -O2 -std=gnu18 -fno-strict-aliasing -fPIE -fno-jump-tables \
++  -mcmodel=small -mno-red-zone -mno-mmx -mno-sse -ffreestanding \
++  -fno-stack-protector -fno-asynchronous-unwind-tables -fshort-wchar \
++  -Wno-pointer-sign -Wno-address-of-packed-member"
++
++# KBUILD_MODNAME/MODFILE must be C strings. Keep them in a response file
++# so unquoted expansion cannot eat the quotes.
++cat > "$OUT/cflags.rsp" <<RSP
++-nostdinc
++-I$K/arch/x86/boot/compressed
++-I$K/arch/x86/include
++-I$K/arch/x86/include/generated
++-I$K/include
++-I$K/include/generated
++-I$K/include/uapi
++-I$K/arch/x86/include/uapi
++-I$K/arch/x86/include/generated/uapi
++-I$K/include/generated/uapi
++-I$K/lib
++-include
++$K/include/linux/compiler-version.h
++-include
++$K/include/linux/kconfig.h
++-include
++$K/include/linux/compiler_types.h
++-include
++$K/include/linux/hidden.h
++-D__KERNEL__
++-D_SETUP
++-DDISABLE_BRANCH_PROFILING
++-D__DISABLE_EXPORTS
++-DKBUILD_BASENAME='"oracle"'
++-DKBUILD_MODNAME='"oracle"'
++-DKBUILD_MODFILE='"arch/x86/boot/compressed/oracle"'
++RSP
++
++# --- oracle TU: same include shape as misc.c, minus extract_kernel ----------
++cat > "$OUT/oracle.c" <<'EOF'
++#define STATIC		static
++#define MALLOC_VISIBLE
++#include <linux/decompress/mm.h>
++#define memzero(s, n)	memset((s), 0, (n))
++#ifndef memmove
++#define memmove memmove
++void *memmove(void *dest, const void *src, size_t n);
++#endif
++void *memset(void *s, int c, size_t n);
++void *memcpy(void *dest, const void *src, size_t n);
++
++memptr free_mem_ptr;
++memptr free_mem_end_ptr;
++
++#include "/home/user/kernel-work/linux-6.18.47/lib/decompress_unzstd.c"
++
++enum { BOOT_HEAP_SIZE = 0x30000 };
++static unsigned char boot_heap[BOOT_HEAP_SIZE] __attribute__((aligned(8)));
++
++extern unsigned char input_data[];
++extern unsigned int input_len, output_len;
++
++int preboot_decompress(unsigned char *outbuf, void (*error)(char *x))
++{
++	free_mem_ptr = (unsigned long)boot_heap;
++	free_mem_end_ptr = free_mem_ptr + sizeof(boot_heap);
++	return __decompress(input_data, input_len, 0, 0, outbuf, output_len,
++			    0, error);
++}
++
++int preboot_decompress_sized(unsigned char *in, unsigned int in_len,
++			     unsigned char *out, unsigned int out_len,
++			     void (*error)(char *x))
++{
++	free_mem_ptr = (unsigned long)boot_heap;
++	free_mem_end_ptr = free_mem_ptr + sizeof(boot_heap);
++	return __decompress(in, in_len, 0, 0, out, out_len, 0, error);
++}
++EOF
++
++# --- driver -----------------------------------------------------------------
++cat > "$OUT/driver.c" <<'EOF'
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <sys/mman.h>
++
++extern int preboot_decompress(unsigned char *outbuf, void (*error)(char *x));
++extern int preboot_decompress_sized(unsigned char *in, unsigned int in_len,
++				    unsigned char *out, unsigned int out_len,
++				    void (*error)(char *x));
++
++unsigned char *input_data;
++unsigned int input_len, output_len;
++
++static char last_err[256];
++static void on_error(char *x)
++{
++	snprintf(last_err, sizeof last_err, "%s", x ? x : "(null)");
++	fprintf(stderr, "error: %s\n", last_err);
++}
++
++static int run_one(const char *tag, unsigned char *in, unsigned in_len,
++		   unsigned char *expect, unsigned expect_len, int via_extern)
++{
++	unsigned char *out = calloc(1, expect_len + 64);
++	int rc;
++	last_err[0] = 0;
++	if (via_extern) {
++		input_data = in;
++		input_len = in_len;
++		output_len = expect_len;
++		rc = preboot_decompress(out, on_error);
++	} else {
++		rc = preboot_decompress_sized(in, in_len, out, expect_len, on_error);
++	}
++	if (rc < 0) {
++		printf("%s FAIL rc=%d err=%s\n", tag, rc, last_err);
++		free(out);
++		return 1;
++	}
++	if (memcmp(out, expect, expect_len) != 0) {
++		printf("%s FAIL mismatch\n", tag);
++		free(out);
++		return 1;
++	}
++	printf("%s MATCH %u -> %u\n", tag, in_len, expect_len);
++	free(out);
++	return 0;
++}
++
++static unsigned char *read_all(const char *path, unsigned *n)
++{
++	int fd = open(path, O_RDONLY);
++	if (fd < 0) { perror(path); exit(2); }
++	struct stat st;
++	fstat(fd, &st);
++	unsigned char *p = malloc(st.st_size);
++	if (read(fd, p, st.st_size) != st.st_size) { perror("read"); exit(2); }
++	close(fd);
++	*n = (unsigned)st.st_size;
++	return p;
++}
++
++int main(int argc, char **argv)
++{
++	int fails = 0;
++	/* Patterned 256 / 320 / 4K like the previous oracle table. */
++	for (int n = 256; n <= 4096; n = (n == 256 ? 320 : n == 320 ? 1024 : n == 1024 ? 4096 : 8192)) {
++		unsigned char *plain = malloc(n);
++		for (int i = 0; i < n; i++) plain[i] = (unsigned char)(i & 255);
++		char zpath[64];
++		snprintf(zpath, sizeof zpath, "/tmp/zstd-oracle/p%d.zst", n);
++		char cmd[256];
++		snprintf(cmd, sizeof cmd, "zstd -q -f -6 --ultra -o %s", zpath);
++		FILE *w = popen(cmd, "w");
++		fwrite(plain, 1, n, w);
++		pclose(w);
++		unsigned zlen;
++		unsigned char *z = read_all(zpath, &zlen);
++		char tag[64];
++		snprintf(tag, sizeof tag, "pattern-%d-args", n);
++		fails += run_one(tag, z, zlen, plain, n, 0);
++		snprintf(tag, sizeof tag, "pattern-%d-extern", n);
++		fails += run_one(tag, z, zlen, plain, n, 1);
++		/* 4-byte LE size trailer like size_append */
++		unsigned char *zt = malloc(zlen + 4);
++		memcpy(zt, z, zlen);
++		zt[zlen] = n & 255; zt[zlen+1] = (n >> 8) & 255;
++		zt[zlen+2] = (n >> 16) & 255; zt[zlen+3] = (n >> 24) & 255;
++		snprintf(tag, sizeof tag, "pattern-%d-trailer-extern", n);
++		fails += run_one(tag, zt, zlen + 4, plain, n, 1);
++		free(plain); free(z); free(zt);
++	}
++
++	if (argc >= 3) {
++		unsigned zlen, plen;
++		unsigned char *z = read_all(argv[1], &zlen);
++		unsigned char *p = read_all(argv[2], &plen);
++		fails += run_one("piggy-args", z, zlen, p, plen, 0);
++		fails += run_one("piggy-extern", z, zlen, p, plen, 1);
++		free(z); free(p);
++	}
++	return fails ? 1 : 0;
++}
++EOF
++
++compile_one() {
++  local cc=$1 name=$2
++  echo "CC  oracle ($name)"
++  $cc $CFLAGS_COMMON @"$OUT/cflags.rsp" -c "$OUT/oracle.c" -o "$OUT/oracle-$name.o"
++  echo "CC  driver ($name)"
++  # driver is userspace; use host gcc always for libc
++  gcc -O2 -fPIE -c "$OUT/driver.c" -o "$OUT/driver.o"
++  gcc -pie -o "$OUT/oracle-$name" "$OUT/driver.o" "$OUT/oracle-$name.o"
++}
++
++compile_one gcc gcc
++compile_one "$LCCC" lccc
++
++echo "==== gcc ===="
++"$OUT/oracle-gcc" || true
++echo "==== lccc ===="
++"$OUT/oracle-lccc" || true
+diff --git a/src/driver/cli.rs b/src/driver/cli.rs
+index 3fae0f0..96926a1 100644
+--- a/src/driver/cli.rs
++++ b/src/driver/cli.rs
+@@ -43,7 +43,9 @@ fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
+ 
+ impl Driver {
+     fn enable_x86_avx_profile(&mut self) {
+-        self.no_sse = false;
++        if !self.sse_explicitly_disabled {
++            self.no_sse = false;
++        }
+         self.enable_avx = true;
+         self.enable_sse4_2 = true;
+         self.enable_sse4_1 = true;
+@@ -131,7 +133,9 @@ impl Driver {
+         self.enable_avx512vp2intersect = true;
+     }
+     fn enable_x86_nehalem_profile(&mut self) {
+-        self.no_sse = false;
++        if !self.sse_explicitly_disabled {
++            self.no_sse = false;
++        }
+         self.enable_sse3 = true;
+         self.enable_ssse3 = true;
+         self.enable_sse4_1 = true;
+@@ -906,7 +910,19 @@ impl Driver {
+                         self.target = Target::X86_64;
                      }
                  }
-                 IrConst::Zero => {
--                    self.state.emit_fmt(format_args!("    movq $0, %{}", reg64));
-+                    // PF-16: movl $0 writes the same canonical value (zero-extend)
-+                // two bytes shorter; neither form touches flags.
-+                self.state.emit_fmt(format_args!("    movl $0, %{}", super::emit::reg_name_to_32(&reg64)));
+-                "-mno-sse" | "-mno-sse2" => self.no_sse = true,
++                "-mno-sse" | "-mno-sse2" => {
++                    // Sticky disable: later `-march=native` / CPU profiles must
++                    // not revive SSE. GCC keeps `-mno-sse` in either flag order
++                    // (kernel decompressor: `-mno-sse` then Cachy `-march=native`).
++                    self.no_sse = true;
++                    self.sse_explicitly_disabled = true;
++                    self.enable_sse3 = false;
++                    self.enable_ssse3 = false;
++                    self.enable_sse4_1 = false;
++                    self.enable_sse4_2 = false;
++                    self.enable_avx = false;
++                    self.enable_avx2 = false;
++                }
+                 "-mno-mmx" | "-mno-3dnow" => {}
+                 // ── Kernel -m flags with per-flag semantic justification ──
+                 // (The blanket -mno-* fallback below covers pure ISA-disable
+@@ -1078,10 +1094,14 @@ impl Driver {
+                 "-msse3" => {
+                     self.enable_sse3 = true;
                  }
-             }
-             let _ = reg32;
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 27588bae..ffe75002 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -76,7 +76,7 @@ pub(super) const X86_XMM_REGS: [PhysReg; 14] = [
+-                // Baseline x86-64 ISA flags: accepted as no-ops (SSE2/MMX are
+-                // always on for x86-64). Build systems (zlib-ng cmake, kernel
+-                // Makefiles) probe with them before enabling SIMD sources.
+-                "-msse2" | "-msse" | "-mmmx" => {}
++                // Baseline x86-64 ISA flags. SSE2/MMX are the x86-64 default,
++                // but `-msse`/`-msse2` after `-mno-sse` must re-enable SSE
++                // (GCC last-explicit-ISA-flag wins; `-march=native` does not).
++                "-mmmx" => {}
++                "-msse2" | "-msse" => {
++                    self.no_sse = false;
++                    self.sse_explicitly_disabled = false;
++                }
+                 "-m3dnow" => return Err("3DNow! is unsupported".to_string()),
+                 "-mgeneral-regs-only" => self.general_regs_only = true,
+                 "-mcmodel=kernel" => self.code_model_kernel = true,
+@@ -1168,27 +1188,29 @@ impl Driver {
+                                 // also reads the host CPUID).
+                                 #[cfg(target_arch = "x86_64")]
+                                 {
+-                                    self.no_sse = false;
+-                                    if std::arch::is_x86_feature_detected!("sse3") {
+-                                        self.enable_sse3 = true;
+-                                    }
+-                                    if std::arch::is_x86_feature_detected!("ssse3") {
+-                                        self.enable_ssse3 = true;
+-                                    }
+-                                    if std::arch::is_x86_feature_detected!("sse4.1") {
+-                                        self.enable_sse4_1 = true;
+-                                    }
+-                                    if std::arch::is_x86_feature_detected!("sse4.2") {
+-                                        self.enable_sse4_2 = true;
+-                                    }
+-                                    if std::arch::is_x86_feature_detected!("avx") {
+-                                        self.enable_avx = true;
+-                                    }
+-                                    if std::arch::is_x86_feature_detected!("avx2") {
+-                                        self.enable_avx2 = true;
+-                                    }
+-                                    if std::arch::is_x86_feature_detected!("fma") {
+-                                        self.enable_fma = true;
++                                    if !self.sse_explicitly_disabled {
++                                        self.no_sse = false;
++                                        if std::arch::is_x86_feature_detected!("sse3") {
++                                            self.enable_sse3 = true;
++                                        }
++                                        if std::arch::is_x86_feature_detected!("ssse3") {
++                                            self.enable_ssse3 = true;
++                                        }
++                                        if std::arch::is_x86_feature_detected!("sse4.1") {
++                                            self.enable_sse4_1 = true;
++                                        }
++                                        if std::arch::is_x86_feature_detected!("sse4.2") {
++                                            self.enable_sse4_2 = true;
++                                        }
++                                        if std::arch::is_x86_feature_detected!("avx") {
++                                            self.enable_avx = true;
++                                        }
++                                        if std::arch::is_x86_feature_detected!("avx2") {
++                                            self.enable_avx2 = true;
++                                        }
++                                        if std::arch::is_x86_feature_detected!("fma") {
++                                            self.enable_fma = true;
++                                        }
+                                     }
+                                     if std::arch::is_x86_feature_detected!("bmi1") {
+                                         self.enable_bmi = true;
+@@ -1202,17 +1224,19 @@ impl Driver {
+                                     if std::arch::is_x86_feature_detected!("movbe") {
+                                         self.enable_movbe = true;
+                                     }
+-                                    if std::arch::is_x86_feature_detected!("aes") {
+-                                        self.enable_aes = true;
+-                                    }
+-                                    if std::arch::is_x86_feature_detected!("pclmulqdq") {
+-                                        self.enable_pclmul = true;
+-                                    }
+-                                    if std::arch::is_x86_feature_detected!("f16c") {
+-                                        self.enable_f16c = true;
+-                                    }
+-                                    if std::arch::is_x86_feature_detected!("avx512f") {
+-                                        self.enable_x86_avx512_profile();
++                                    if !self.sse_explicitly_disabled {
++                                        if std::arch::is_x86_feature_detected!("aes") {
++                                            self.enable_aes = true;
++                                        }
++                                        if std::arch::is_x86_feature_detected!("pclmulqdq") {
++                                            self.enable_pclmul = true;
++                                        }
++                                        if std::arch::is_x86_feature_detected!("f16c") {
++                                            self.enable_f16c = true;
++                                        }
++                                        if std::arch::is_x86_feature_detected!("avx512f") {
++                                            self.enable_x86_avx512_profile();
++                                        }
+                                     }
+                                 }
+                                 #[cfg(not(target_arch = "x86_64"))]
+@@ -1866,6 +1890,41 @@ mod cli_tests {
+         assert!(d.parse_cli_args(&args).is_ok());
+     }
  
- /// Convert a 64-bit register name string to its 32-bit sub-register name.
- /// Used for `xorl %eXX, %eXX` zeroing idiom (shorter encoding, breaks dependencies).
--fn reg_name_to_32(name: &str) -> &'static str {
-+pub(super) fn reg_name_to_32(name: &str) -> &'static str {
-     match name {
-         "rax" => "eax",
-         "rbx" => "ebx",
-@@ -1195,17 +1195,61 @@ impl X86Codegen {
-                         "    xorl %{0}, %{0}",
-                         phys_reg_name_32(target)
-                     )),
--                    IrConst::I8(v) => self
--                        .state
--                        .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, target_name)),
--                    IrConst::I16(v) => self
--                        .state
--                        .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, target_name)),
--                    IrConst::I32(v) => self
--                        .state
--                        .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, target_name)),
-+                    // PF-16: non-negative immediates write the 32-bit name
-+                    // with movl — the 32-bit write zero-extends to the same
-+                    // 64-bit value a `movq $imm32` sign-extension would
-+                    // produce, saving the REX prefix and two bytes. Negative
-+                    // immediates sign-extend; movl would zero-extend instead
-+                    // — they keep the q-form.
-+                    IrConst::I8(v) => {
-+                        let x = *v as i64;
-+                        if x >= 0 {
-+                            self.state.emit_fmt(format_args!(
-+                                "    movl ${}, %{}",
-+                                x,
-+                                phys_reg_name_32(target)
-+                            ));
-+                        } else {
-+                            self.state
-+                                .emit_fmt(format_args!("    movq ${}, %{}", x, target_name));
-+                        }
-+                    }
-+                    IrConst::I16(v) => {
-+                        let x = *v as i64;
-+                        if x >= 0 {
-+                            self.state.emit_fmt(format_args!(
-+                                "    movl ${}, %{}",
-+                                x,
-+                                phys_reg_name_32(target)
-+                            ));
-+                        } else {
-+                            self.state
-+                                .emit_fmt(format_args!("    movq ${}, %{}", x, target_name));
-+                        }
-+                    }
-+                    IrConst::I32(v) => {
-+                        let x = *v as i64;
-+                        if x >= 0 {
-+                            self.state.emit_fmt(format_args!(
-+                                "    movl ${}, %{}",
-+                                x,
-+                                phys_reg_name_32(target)
-+                            ));
-+                        } else {
-+                            self.state
-+                                .emit_fmt(format_args!("    movq ${}, %{}", x, target_name));
-+                        }
-+                    },
-                     IrConst::I64(v) => {
--                        if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
-+                        if *v >= 0 && *v <= i32::MAX as i64 {
-+                            // PF-16: fits and non-negative — 5-byte movl,
-+                            // zero-extension equals the sign-extended q-form.
-+                            self.state.out.emit_instr_imm_reg(
-+                                "    movl",
-+                                *v,
-+                                phys_reg_name_32(target),
-+                            );
-+                        } else if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
-                             self.state
-                                 .out
-                                 .emit_instr_imm_reg("    movq", *v, target_name);
-@@ -2738,17 +2782,40 @@ impl X86Codegen {
-                 IrConst::I64(0) => self
-                     .state
-                     .emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg))),
--                IrConst::I8(v) => self
--                    .state
--                    .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, reg)),
--                IrConst::I16(v) => self
--                    .state
--                    .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, reg)),
--                IrConst::I32(v) => self
--                    .state
--                    .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, reg)),
-+                // PF-16: non-negative immediates via movl (see site above).
-+                IrConst::I8(v) => {
-+                    let x = *v as i64;
-+                    if x >= 0 {
-+                        self.state
-+                            .emit_fmt(format_args!("    movl ${}, %{}", x, reg_name_to_32(reg)));
-+                    } else {
-+                        self.state.emit_fmt(format_args!("    movq ${}, %{}", x, reg));
-+                    }
-+                }
-+                IrConst::I16(v) => {
-+                    let x = *v as i64;
-+                    if x >= 0 {
-+                        self.state
-+                            .emit_fmt(format_args!("    movl ${}, %{}", x, reg_name_to_32(reg)));
-+                    } else {
-+                        self.state.emit_fmt(format_args!("    movq ${}, %{}", x, reg));
-+                    }
-+                }
-+                IrConst::I32(v) => {
-+                    let x = *v as i64;
-+                    if x >= 0 {
-+                        self.state
-+                            .emit_fmt(format_args!("    movl ${}, %{}", x, reg_name_to_32(reg)));
-+                    } else {
-+                        self.state.emit_fmt(format_args!("    movq ${}, %{}", x, reg));
-+                    }
-+                },
-                 IrConst::I64(v) => {
--                    if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
-+                    if *v >= 0 && *v <= i32::MAX as i64 {
-+                        self.state
-+                            .out
-+                            .emit_instr_imm_reg("    movl", *v, reg_name_to_32(reg));
-+                    } else if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
-                         self.state.out.emit_instr_imm_reg("    movq", *v, reg);
-                     } else {
-                         self.state.out.emit_instr_imm_reg("    movabsq", *v, reg);
--- 
-2.47.3
-
++    /// Kernel decompressor: `-mno-sse` then Cachy `-march=native`. GCC keeps
++    /// the disable; LCCC must not revive SSE via the native CPUID probe.
++    #[test]
++    fn mno_sse_survives_march_native() {
++        let mut d = Driver::new();
++        let args: Vec<String> = ["ccc", "-mno-sse", "-march=native", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d.parse_cli_args(&args).is_ok());
++        assert!(d.no_sse, "explicit -mno-sse must survive -march=native");
++        assert!(d.sse_explicitly_disabled);
++        // Reverse order: later -mno-sse still wins.
++        let mut d2 = Driver::new();
++        let args2: Vec<String> = ["ccc", "-march=native", "-mno-sse", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d2.parse_cli_args(&args2).is_ok());
++        assert!(d2.no_sse);
++    }
++
++    /// An explicit `-msse` after `-mno-sse` re-enables (GCC last ISA flag).
++    #[test]
++    fn msse_reenable_after_mno_sse() {
++        let mut d = Driver::new();
++        let args: Vec<String> = ["ccc", "-mno-sse", "-msse", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d.parse_cli_args(&args).is_ok());
++        assert!(!d.no_sse);
++        assert!(!d.sse_explicitly_disabled);
++    }
++
+     #[test]
+     fn fp_reassociation_requires_explicit_flag_and_last_option_wins() {
+         let mut strict = Driver::new();
+diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
+index 319b2f6..6f08bbe 100644
+--- a/src/driver/pipeline.rs
++++ b/src/driver/pipeline.rs
+@@ -142,6 +142,10 @@ pub struct Driver {
+     /// any SSE/SSE2/AVX instructions (movdqu, movss, movsd, etc.).
+     /// The Linux kernel uses -mno-sse to avoid FPU state in kernel code.
+     pub(super) no_sse: bool,
++    /// Set by an explicit `-mno-sse`/`-mno-sse2`. `-march=native` and CPU
++    /// profiles must not re-enable SSE after that: GCC keeps the disable
++    /// (kernel decompressor: `-mno-sse` then Cachy `-march=native`).
++    pub(super) sse_explicitly_disabled: bool,
+     pub(super) skip_rax_setup: bool,
+     /// -mno-80387/-mno-fp-ret-in-387: no x87 instructions or x87 FP returns.
+     /// Recorded so FP codegen can fail closed on long-double paths.
+@@ -419,6 +423,7 @@ impl Driver {
+             cf_protection_branch: false,
+             cf_protection_value: None,
+             no_sse: false,
++            sse_explicitly_disabled: false,
+             skip_rax_setup: false,
+             no_x87: false,
+             indirect_branch_thunk_inline: false,
+diff --git a/tests/regression/mno_sse_memcpy16.c b/tests/regression/mno_sse_memcpy16.c
+new file mode 100644
+index 0000000..2751768
+--- /dev/null
++++ b/tests/regression/mno_sse_memcpy16.c
+@@ -0,0 +1,25 @@
++/* 16-byte memcpy must stay GPR under `-mno-sse -march=native`.
++ * Kernel decompressor pairs those flags; a `movdqu` is #UD (CR4.OSFXSR=0). */
++#include <stdio.h>
++#include <stdint.h>
++#include <string.h>
++
++__attribute__((noinline)) void copy16(void *d, const void *s)
++{
++	__builtin_memcpy(d, s, 16);
++}
++
++int main(void)
++{
++	uint8_t src[16], dst[16];
++	for (int i = 0; i < 16; i++)
++		src[i] = (uint8_t)(0xA0 + i);
++	memset(dst, 0x5A, 16);
++	copy16(dst, src);
++	if (memcmp(dst, src, 16) != 0) {
++		printf("FAIL\n");
++		return 1;
++	}
++	printf("OK mno_sse_memcpy16\n");
++	return 0;
++}
+diff --git a/tests/regression/mno_sse_memcpy16.flags b/tests/regression/mno_sse_memcpy16.flags
+new file mode 100644
+index 0000000..fca8375
+--- /dev/null
++++ b/tests/regression/mno_sse_memcpy16.flags
+@@ -0,0 +1 @@
++-mno-sse -march=native
