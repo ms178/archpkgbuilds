@@ -1,1306 +1,684 @@
-From a0efe1452516ccc598790864ed9de3fe7b643c00 Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Sat, 29 Aug 2026 11:04:07 +0000
-Subject: [PATCH 1/5] sema: enable -Wincompatible-pointer-types in all enable
- sets
-
-The IncompatiblePointerTypes warning kind had an emit site and a flag
-name but was absent from WarningConfig's default set (all()), wall_set()
-and from_flag_name() - permanently invisible dead code despite the
-comment claiming GCC parity. Enable it in all three layers so that
-assignments between incompatible pointer types warn by default and the
--Wincompatible-pointer-types flag parses, matching GCC.
----
- src/common/error.rs | 3 +++
- 1 file changed, 3 insertions(+)
-
-diff --git a/src/common/error.rs b/src/common/error.rs
-index 2c713185..d3574026 100644
---- a/src/common/error.rs
-+++ b/src/common/error.rs
-@@ -135,6 +135,7 @@ impl WarningKind {
-             "implicit" => Some(WarningKind::ImplicitFunctionDeclaration),
-             "cpp" => Some(WarningKind::Cpp),
-             "return-type" => Some(WarningKind::ReturnType),
-+            "incompatible-pointer-types" => Some(WarningKind::IncompatiblePointerTypes),
-             _ => None,
-         }
-     }
-@@ -145,6 +146,7 @@ impl WarningKind {
-             WarningKind::ImplicitFunctionDeclaration,
-             WarningKind::Cpp,
-             WarningKind::ReturnType,
-+            WarningKind::IncompatiblePointerTypes,
-             // WarningKind::Undeclared is now a hard error, not a warning
-         ]
-     }
-@@ -162,6 +164,7 @@ impl WarningKind {
-             WarningKind::ImplicitFunctionDeclaration,
-             WarningKind::Cpp,
-             WarningKind::ReturnType,
-+            WarningKind::IncompatiblePointerTypes,
-         ]
-     }
- }
--- 
-2.47.3
-
-
-From 6ad1892e70e3d5996dbab349da8c3bdc387feb74 Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Sat, 29 Aug 2026 11:04:23 +0000
-Subject: [PATCH 2/5] vectorize+simd: fix stencil use-before-def and dead-dest
- ICE
-
-Two defects in the vectorizer/SIMD interaction (found via the
-select-in-loop abs-fold shape `d[i] = a[i] < 0 ? -a[i] : a[i]`, which
-the if-converter turns into a loop-local Select):
-
-1. The stencil transform's emit_recursive catch-all arm broadcast ANY
-   unhandled loop-local definition into the PREHEADER. A loop-local
-   value broadcast before the loop is a use-before-def dominance
-   violation: the broadcast reads the value's uninitialized home and
-   the result is reused for every iteration (observed: a stale
-   pre-loop value stored to the output array, all results wrong). The
-   arm's "invariant leaf" comment was wrong - invariant leaves never
-   reach it, because defs.get(node)? already bails on values defined
-   outside the loop (defs holds loop-body definitions only). The arm
-   is now `None`: the transform declines such patterns and the scalar
-   loop runs.
-
-2. Dead vector intrinsic destinations ICEd the x86 backend: a dead
-   dest has neither a register home nor a slot and the store fallback
-   panicked (avx_store_dest location-less dest). emit_simd_op now
-   skips intrinsics whose dest has zero uses - every op reachable
-   there is a pure computation or an ordinary-memory load, so the
-   skip removes no observable behaviour.
-
-Validated: the abs-select kernel now matches GCC output exactly
-(previously all-wrong stores); lib tests green.
----
- src/backend/x86/codegen/intrinsics_simd.rs | 20 ++++++++++++++++++
- src/passes/vectorize.rs                    | 24 ++++++++++++----------
- 2 files changed, 33 insertions(+), 11 deletions(-)
-
-diff --git a/src/backend/x86/codegen/intrinsics_simd.rs b/src/backend/x86/codegen/intrinsics_simd.rs
-index 6c09b6ac..b45fa4d8 100644
---- a/src/backend/x86/codegen/intrinsics_simd.rs
-+++ b/src/backend/x86/codegen/intrinsics_simd.rs
-@@ -310,6 +310,26 @@ impl X86Codegen {
-             // real operands: dummy/imm dropped, imm re-appended last).
-             return self.emit_simd_scalar(dest, op, args);
-         };
-+        // Dead-dest skip: a vector intrinsic whose result has no uses is
-+        // dead code (every op reachable here is a pure computation or a
-+        // load from ordinary memory — volatile accesses never arrive as
-+        // vector intrinsics with dead dests). Emitting it would only risk
-+        // ICEs on location-less destinations (a dead value has neither a
-+        // register home nor a slot; avx_store_dest's fallback path panics
-+        // there). A dead value must never ICE codegen.
-+        if self
-+            .state
-+            .value_use_counts
-+            .get(dptr.0 as usize)
-+            .copied()
-+            .unwrap_or(0)
-+            == 0
-+        {
-+            if std::env::var_os("CCC_DEBUG_SIMD").is_some() {
-+                eprintln!("[SIMD] skipping dead dest {} op {:?}", dptr.0, op);
-+            }
-+            return true;
-+        }
-         match op {
-             // ---- 512-bit packed integer binary ----
-             Paddb512 => {
-diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index ef42e073..81d27c41 100644
---- a/src/passes/vectorize.rs
-+++ b/src/passes/vectorize.rs
-@@ -5304,17 +5304,19 @@ fn emit_stencil_expr(
-                 }
-                 _ => None,
-             },
--            // Invariant leaf reached as a Value (defined outside the loop):
--            // broadcast it.
--            _ => broadcast(
--                &Operand::Value(node),
--                func,
--                broadcast_op,
--                preheader_idx,
--                next_val_id,
--                changes,
--                cache,
--            ),
-+            // Any other loop-local definition (Select, Copy, Load, Call,
-+            // Phi, ...) can NEVER be soundly broadcast: the broadcast lands
-+            // in the preheader, but the value is defined inside the loop —
-+            // a use-before-def dominance violation (the broadcast reads the
-+            // value's uninitialized home and is then reused for every
-+            // iteration). True invariant leaves never reach this match (the
-+            // `defs.get(node)?` above already bailed on them; the per-arm
-+            // `is_invariant` checks broadcast operands directly), so this
-+            // arm's historical "invariant leaf" comment was wrong: it only
-+            // ever matched loop-local defs. Fail soft — return None so the
-+            // stencil transform declines the pattern and the scalar loop
-+            // runs.
-+            _ => None,
-         }
-     }
- 
--- 
-2.47.3
-
-
-From b483890a20f6c0efe051015a3cea9bcaa9e2f5e6 Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Sat, 29 Aug 2026 11:04:59 +0000
-Subject: [PATCH 3/5] divrem: same-block div/rem pair fusion for x86-64 and
- AArch64
-
-A div/rem couple with identical operands (the hash-table and modulo
-pattern `q = x/y; r = x%y`) executed TWO hardware divides on x86-64 and
-AArch64 although one divide produces both results. The i686 backend has
-fused them since v3 (shared compute_i686_divrem_pairs + emitter dual
-store); this commit ports the fusion to the remaining two targets and
-fixes a latent soundness hole in the i686 gate:
-
-* The shared pairing function is now target-aware (DivRemTarget):
-  i686 pairs 32-bit ops, x86-64 additionally pairs 64-bit (divq/idivq),
-  AArch64 pairs both widths. RISC-V never pairs: div and rem are
-  separate single-uop instructions there and the msub shape would be
-  three operations instead of two.
-
-* Red-team fix (latent i686 miscompile): the pairing function accepted
-  constant-RHS pairs when the caller claimed the magic-number path was
-  off (-Os). The register allocator always passed `false` while the
-  i686 emitter passed `optimize_for_size` - an RA model narrower than
-  the emitter's fusion is exactly unsound (the RA models a tail as
-  emitting nothing). Constant-RHS pairs are now excluded
-  unconditionally at every level, making the RA model exact.
-
-* x86-64 emitter: pair heads emit ONE divq/idivl and dual-store
-  (quotient from %rax, remainder from %rdx), tails emit nothing; the
-  store ordering handles slotless heads and dead dests; %rdx stays
-  excluded from allocation in dividing functions (pre-existing rule).
-  The MachInst ISel path now rejects pair heads/tails so they reach
-  the classic emitter (previously the fusion never fired for
-  register-homed results).
-
-* AArch64 emitter: pair heads emit GCC's exact shape - one
-  sdiv/udiv, remainder folded as msub; dead tails skip the msub
-  (unlike x86's free dual-output it costs a cycle). The head's own
-  result lands in x0 in both orderings.
-
-Measured: hash-mod kernel (4M variable-divisor pairs) 26.7 ms -> 17.1 ms
-(1.56x), now matching GCC on the same binary shape; constant-divisor
-control unchanged. Cross-TU torture (lccc-compiled impl against a
-GCC-compiled reference, 200k rounds x 5 signatures with adversarial
-edge values) passes 0 failures; x86-64 regression corpus 960/0.
----
- src/backend/arm/codegen/alu.rs       | 106 +++++++++++++
- src/backend/arm/codegen/emit.rs      |  10 +-
- src/backend/arm/codegen/prologue.rs  |  16 ++
- src/backend/i686/codegen/prologue.rs |  13 +-
- src/backend/regalloc.rs              |  80 +++++++---
- src/backend/x86/codegen/alu.rs       | 213 ++++++++++++++++++++++++++-
- src/backend/x86/codegen/emit.rs      |  35 +++++
- src/backend/x86/codegen/prologue.rs  |  14 ++
- 8 files changed, 462 insertions(+), 25 deletions(-)
-
-diff --git a/src/backend/arm/codegen/alu.rs b/src/backend/arm/codegen/alu.rs
-index 4f0c6c4b..454d37ea 100644
---- a/src/backend/arm/codegen/alu.rs
-+++ b/src/backend/arm/codegen/alu.rs
-@@ -287,6 +287,31 @@ impl ArmCodegen {
-     ) {
-         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
- 
-+        // Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
-+        // AArch64 target). The TAIL of a pair emits nothing — its result was
-+        // stored by the HEAD's sdiv+msub dual-store further up in this block
-+        // (exactly GCC's shape: one divide, the remainder folded as
-+        // lhs - q*rhs). Dead tails skip the msub entirely — unlike x86's
-+        // free dual-output, the msub costs a cycle on AArch64.
-+        if matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) {
-+            if self.divrem_tail_dests.contains(&dest.0) {
-+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-+                    eprintln!("[DIVREM-ARM] tail-skip dest={}", dest.0);
-+                }
-+                return;
-+            }
-+            if let Some(&partner_dest) = self.divrem_head_partners.get(&dest.0) {
-+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-+                    eprintln!(
-+                        "[DIVREM-ARM] head-emit dest={} op={:?} partner={}",
-+                        dest.0, op, partner_dest
-+                    );
-+                }
-+                self.emit_divrem_pair_head_arm(dest, op, lhs, rhs, use_32bit, partner_dest);
-+                return;
-+            }
-+        }
-+
-         // Strength reduction: UDiv/URem by power-of-2 constant
-         if let Some(shift) = Self::const_as_power_of_2(rhs) {
-             if op == IrBinOp::UDiv {
-@@ -694,6 +719,87 @@ impl ArmCodegen {
-         self.store_x0_to(dest);
-     }
- 
-+    /// Store x3 (the fused pair's second result) to a value's location.
-+    /// Mirror of `store_x0_to` with the source register changed; no
-+    /// accumulator claim (the value sits in x3, not the x0 accumulator).
-+    pub(super) fn store_x3_to(&mut self, dest: &Value, use_32bit: bool) {
-+        let src = if use_32bit { "w3" } else { "x3" };
-+        if self
-+            .state
-+            .value_use_counts
-+            .get(dest.0 as usize)
-+            .copied()
-+            .unwrap_or(0)
-+            == 0
-+        {
-+            return;
-+        }
-+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
-+            if is_arm_fp_phys(reg) {
-+                self.state
-+                    .emit_fmt(format_args!("    fmov d{}, {}", reg.0 - 24, src));
-+            } else {
-+                let reg_name = callee_saved_name(reg);
-+                self.state
-+                    .emit_fmt(format_args!("    mov {}, {}", reg_name, src));
-+            }
-+        } else if let Some(slot) = self.state.get_slot(dest.0) {
-+            self.emit_store_to_sp(src, slot.0, "str");
-+        }
-+    }
-+
-+    /// Emit one divide serving a same-block div/rem pair (GCC's sdiv+msub
-+    /// shape) and store BOTH results. The head's own result always lands in
-+    /// x0; the partner's result is materialised in x3 via msub (quotient
-+    /// heads) or taken directly from x3 (remainder heads).
-+    fn emit_divrem_pair_head_arm(
-+        &mut self,
-+        dest: &Value,
-+        op: IrBinOp,
-+        lhs: &Operand,
-+        rhs: &Operand,
-+        use_32bit: bool,
-+        partner_dest: u32,
-+    ) {
-+        let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
-+        let self_is_div = matches!(op, IrBinOp::UDiv | IrBinOp::SDiv);
-+        self.operand_to_x0(lhs);
-+        self.state.emit("    mov x1, x0");
-+        self.operand_to_x0(rhs);
-+        self.state.emit("    mov x2, x0");
-+        let div_mnem = if signed { "sdiv" } else { "udiv" };
-+        let w = if use_32bit { "w" } else { "x" };
-+        let tail = Value(partner_dest);
-+        let tail_dead = self
-+            .state
-+            .value_use_counts
-+            .get(partner_dest as usize)
-+            .copied()
-+            .unwrap_or(0)
-+            == 0;
-+        if self_is_div {
-+            // Quotient head: x0 = q directly; remainder = lhs - q*rhs in x3.
-+            self.state
-+                .emit_fmt(format_args!("    {} {}0, {}1, {}2", div_mnem, w, w, w));
-+            if !tail_dead {
-+                self.state
-+                    .emit_fmt(format_args!("    msub {}3, {}0, {}2, {}1", w, w, w, w));
-+                self.store_x3_to(&tail, use_32bit);
-+            }
-+            self.store_x0_to(dest);
-+        } else {
-+            // Remainder head: x3 = q feeds the msub that produces x0 = r.
-+            self.state
-+                .emit_fmt(format_args!("    {} {}3, {}1, {}2", div_mnem, w, w, w));
-+            self.state
-+                .emit_fmt(format_args!("    msub {}0, {}3, {}2, {}1", w, w, w, w));
-+            if !tail_dead {
-+                self.store_x3_to(&tail, use_32bit);
-+            }
-+            self.store_x0_to(dest);
-+        }
-+    }
-+
-     pub(super) fn emit_copy_i128_impl(&mut self, dest: &Value, src: &Operand) {
-         self.operand_to_x0_x1(src);
-         self.store_x0_x1_to(dest);
-diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
-index ca3091b5..da844db6 100644
---- a/src/backend/arm/codegen/emit.rs
-+++ b/src/backend/arm/codegen/emit.rs
-@@ -8,7 +8,7 @@ use crate::backend::regalloc::PhysReg;
- use crate::backend::state::{CodegenState, StackSlot};
- use crate::backend::traits::ArchCodegen;
- use crate::common::fp_contract::FpContract;
--use crate::common::fx_hash::FxHashMap;
-+use crate::common::fx_hash::{FxHashMap, FxHashSet};
- use crate::common::types::IrType;
- use crate::delegate_to_impl;
- use crate::ir::reexports::{
-@@ -241,6 +241,12 @@ pub struct ArmCodegen {
-     /// Total bytes of named (non-variadic) params passed on the stack.
-     /// This includes all stack-passed scalars, F128, I128, and structs with alignment.
-     pub(super) va_named_stack_bytes: usize,
-+    /// Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
-+    /// AArch64 target): dest value-ids of TAIL instructions — they emit
-+    /// nothing because the HEAD's sdiv+msub dual-store wrote their result.
-+    pub(super) divrem_tail_dests: FxHashSet<u32>,
-+    /// Head dest value-id -> partner (tail) dest value-id.
-+    pub(super) divrem_head_partners: FxHashMap<u32, u32>,
-     /// Scratch register index for inline asm GP register allocation
-     pub(super) asm_scratch_idx: usize,
-     /// Scratch register index for inline asm FP register allocation
-@@ -285,6 +291,8 @@ impl ArmCodegen {
-             va_named_gp_count: 0,
-             va_named_fp_count: 0,
-             va_named_stack_bytes: 0,
-+            divrem_tail_dests: FxHashSet::default(),
-+            divrem_head_partners: FxHashMap::default(),
-             asm_scratch_idx: 0,
-             asm_fp_scratch_idx: 0,
-             reg_assignments: FxHashMap::default(),
-diff --git a/src/backend/arm/codegen/prologue.rs b/src/backend/arm/codegen/prologue.rs
-index 4c516272..6782b9d7 100644
---- a/src/backend/arm/codegen/prologue.rs
-+++ b/src/backend/arm/codegen/prologue.rs
-@@ -171,6 +171,22 @@ impl ArmCodegen {
-         self.loop_promoted_f64_values = func.loop_promoted_f64_values.clone();
-         self.conditional_increment_leaf = false;
-         self.conditional_increment_leaf_condition_32 = false;
-+
-+        // Same-block div/rem pair fusion table: one sdiv/udiv serves a
-+        // div+rem couple with identical operands (the remainder comes from
-+        // msub, exactly GCC's shape). Constant-RHS pairs never fuse
-+        // (the strength reducer may claim them; the RA model must stay
-+        // exact).
-+        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs(
-+            func,
-+            crate::backend::regalloc::DivRemTarget::AArch64,
-+        );
-+        self.divrem_tail_dests = pairs.tail_dests;
-+        self.divrem_head_partners = pairs
-+            .head_partners
-+            .into_iter()
-+            .map(|(k, (partner, _))| (k, partner))
-+            .collect();
-         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
-         Self::prescan_inline_asm_callee_saved(func, &mut asm_clobbered_regs);
-         let base_regs: &[PhysReg] = if func.is_variadic {
-diff --git a/src/backend/i686/codegen/prologue.rs b/src/backend/i686/codegen/prologue.rs
-index cd50d8ab..0ce3d105 100644
---- a/src/backend/i686/codegen/prologue.rs
-+++ b/src/backend/i686/codegen/prologue.rs
-@@ -93,11 +93,14 @@ impl I686Codegen {
-         self.current_return_type = func.return_type;
- 
-         // Same-block div/rem pair fusion table (one divl serves a
--        // URem+UDiv couple with identical operands). Constant divisors pair
--        // only at -Os, where the magic-number strength reduction is off and
--        // the general divl path is guaranteed for both sides.
--        let pairs =
--            crate::backend::regalloc::compute_i686_divrem_pairs(func, self.optimize_for_size);
-+        // URem+UDiv couple with identical operands). Constant-RHS pairs
-+        // never fuse (compute_i686_divrem_pairs excludes them
-+        // unconditionally): the magic-number path may claim them at any
-+        // optimisation level, and the RA model must stay exact.
-+        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs(
-+            func,
-+            crate::backend::regalloc::DivRemTarget::I686,
-+        );
-         self.divrem_tail_dests = pairs.tail_dests;
-         self.divrem_head_partners = pairs.head_partners;
-         self.divrem_broken_tails.clear();
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index c99a7eb3..e80c65c4 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -60,7 +60,10 @@ pub fn analyze_accumulator_assignments(
-     // the accumulator at its IR def point (it was stored by the head). An
-     // accumulator chain starting from a tail dest would let the consumer
-     // read a stale %eax.
--    let divrem = compute_i686_divrem_pairs(func, false);
-+    let divrem = match divrem_target_for_current_arch() {
-+        Some(t) => compute_i686_divrem_pairs(func, t),
-+        None => return Vec::new(),
-+    };
-     if !divrem.tail_dests.is_empty() {
-         let filtered: Vec<u32> = candidates
-             .into_iter()
-@@ -440,19 +443,48 @@ fn overlaps_inclusive_skip_birth(iv: &LiveInterval, points: &[u32]) -> bool {
- /// not depend on what lies between the two instructions: SSA operands cannot
- /// change, and both stores happen at the head, before anything else runs.
- ///
--/// `allow_const_rhs` covers the constant-divisor strength-reduction path: at
--/// -O2 the emitter replaces constant divisions with magic-number sequences
--/// that never execute `divl`, so those pairs must not fuse. At -Os the magic
--/// path is disabled and constant pairs are legal. The register allocator
--/// always passes `false` — a tail it models as "emits nothing" must be one
--/// whose head provably emits the real division (non-constant RHS pairs never
--/// take the magic path, so they can never break).
-+/// Constant-RHS divisions never pair: at -O2 the emitters replace constant
-+/// divisions with magic-number sequences that never execute the hardware
-+/// divide, so a fused pair there would be dead code feeding nothing (and
-+/// keeping the emitter side unconditional is the only model the register
-+/// allocator can share soundly — the RA always models exactly what every
-+/// optimisation level emits for these pairs).
-+///
-+/// The `target` gate selects the operand width class per backend: i686 pairs
-+/// 32-bit GPR ops, x86-64 additionally pairs 64-bit ops (divq/idivq), and
-+/// AArch64 pairs both (sdiv/udiv + msub shape). RISC-V never pairs: div and
-+/// rem are separate single-uop instructions there and the sdiv+msub shape
-+/// would be three operations instead of two.
-+///
-+/// The function name keeps the historical `I686` prefix in the pair struct
-+/// (the shape originated there); the shared RA consumes pairs for every
-+/// target the gate enables.
-+///
- ///
- /// The greedy pairing is order-stable: scanning forward, each still-unpaired
- /// division pairs with the next unpaired compatible division in the same
- /// block. Compatibility requires identical `lhs`/`rhs` operands and matching
- /// signedness (`URem` with `UDiv`/`URem`, `SRem` with `SDiv`/`SRem`); mixing
- /// flavours would change the executed instruction.
-+/// Per-backend div/rem fusion gate (see `compute_i686_divrem_pairs`).
-+#[derive(Clone, Copy, PartialEq, Eq)]
-+pub(crate) enum DivRemTarget {
-+    I686,
-+    X86_64,
-+    AArch64,
-+}
-+
-+/// The fusion target for the CURRENT compilation unit, or None where fusion
-+/// never pays (RISC-V and any non-registered target).
-+pub(crate) fn divrem_target_for_current_arch() -> Option<DivRemTarget> {
-+    match crate::common::types::target_elf_machine() {
-+        crate::backend::elf::EM_386 => Some(DivRemTarget::I686),
-+        crate::backend::elf::EM_X86_64 => Some(DivRemTarget::X86_64),
-+        crate::backend::elf::EM_AARCH64 => Some(DivRemTarget::AArch64),
-+        _ => None,
-+    }
-+}
-+
- pub(crate) struct I686DivRemPairs {
-     /// Dest value-ids of tail instructions — the emitter skips them entirely.
-     pub tail_dests: FxHashSet<u32>,
-@@ -471,7 +503,7 @@ pub(crate) struct I686DivRemPairs {
- 
- pub(crate) fn compute_i686_divrem_pairs(
-     func: &IrFunction,
--    allow_const_rhs: bool,
-+    target: DivRemTarget,
- ) -> I686DivRemPairs {
-     let mut pairs = I686DivRemPairs {
-         tail_dests: FxHashSet::default(),
-@@ -492,6 +524,7 @@ pub(crate) fn compute_i686_divrem_pairs(
-         pt += block.instructions.len() as u32 + 1;
-     }
- 
-+    let pairs_64 = target != DivRemTarget::I686;
-     let is_gpr32_ty = |ty: &IrType| {
-         matches!(
-             ty,
-@@ -502,7 +535,7 @@ pub(crate) fn compute_i686_divrem_pairs(
-                 | IrType::I32
-                 | IrType::U32
-                 | IrType::Ptr
--        )
-+        ) || (pairs_64 && matches!(ty, IrType::I64 | IrType::U64))
-     };
-     let div_flavor = |op: IrBinOp| -> Option<bool> {
-         // Some(true) = quotient (div), Some(false) = remainder, None = not div-like
-@@ -528,10 +561,11 @@ pub(crate) fn compute_i686_divrem_pairs(
-             } = inst
-             {
-                 if div_flavor(*op).is_some() && is_gpr32_ty(ty) {
--                    // Constant-RHS divisions only pair when the caller has
--                    // established the magic path is off (see doc comment).
--                    let rhs_ok = allow_const_rhs || !matches!(rhs, Operand::Const(_));
--                    if rhs_ok {
-+                    // Constant-RHS divisions NEVER pair: the emitters may
-+                    // strength-reduce them to magic sequences, so the RA
-+                    // model ("tail emits nothing, head emits the divide")
-+                    // would not describe the emitted code.
-+                    if !matches!(rhs, Operand::Const(_)) {
-                         cands.push((ii, *op, lhs, rhs, is_signed(*op), dest.0));
-                     }
-                 }
-@@ -586,7 +620,10 @@ pub(crate) fn compute_i686_divrem_pairs(
- /// This patches both the fat intervals and the hole-aware segments, then
- /// restores the segments' `(start, value_id)` sort order.
- fn patch_divrem_tail_intervals(func: &IrFunction, liveness: &mut LivenessResult) {
--    let pairs = compute_i686_divrem_pairs(func, false);
-+    let Some(target) = divrem_target_for_current_arch() else {
-+        return;
-+    };
-+    let pairs = compute_i686_divrem_pairs(func, target);
-     if pairs.head_point_of_tail.is_empty() {
-         return;
-     }
-@@ -5057,9 +5094,16 @@ fn collect_i686_scratch_hazard_points_refined(
- 
-     // Same-block div/rem pair tails emit no code (the head stored both
-     // results); see compute_i686_divrem_pairs for the soundness model.
--    // Conservative constant-RHS rule keeps the RA model a subset of what the
--    // emitter will actually fuse.
--    let divrem_pairs = compute_i686_divrem_pairs(func, false);
-+    // Constant-RHS divisions never pair, so the model is exact.
-+    let divrem_pairs = match divrem_target_for_current_arch() {
-+        Some(t) => compute_i686_divrem_pairs(func, t),
-+        None => I686DivRemPairs {
-+            tail_dests: Default::default(),
-+            head_partners: Default::default(),
-+            tail_points: Default::default(),
-+            head_point_of_tail: Default::default(),
-+        },
-+    };
- 
-     // Values defined by a GetElementPtr (refinement (b)).
-     let mut gep_defined: FxHashSet<u32> = FxHashSet::default();
-diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
-index cf465bf8..1a300ca0 100644
---- a/src/backend/x86/codegen/alu.rs
-+++ b/src/backend/x86/codegen/alu.rs
-@@ -1,6 +1,6 @@
- //! X86Codegen: integer/float arithmetic, unary ops, binop, copy.
- 
--use super::emit::{shift_mnemonic, X86Codegen};
-+use super::emit::{phys_reg_name, shift_mnemonic, X86Codegen};
- use crate::backend::regalloc::PhysReg;
- use crate::backend::traits::ArchCodegen;
- use crate::common::types::IrType;
-@@ -319,6 +319,171 @@ impl X86Codegen {
- 
-     // ---- Binop ----
- 
-+    /// Store %rdx (division remainder) to a value's location. Mirror of
-+    /// `store_rax_to` with the source register changed; the accumulator
-+    /// case cannot arise for remainders (pair tails are excluded from
-+    /// accumulator chains by the shared RA filter), but a dead remainder
-+    /// (use count 0) skips the store entirely.
-+    pub(super) fn store_rdx_to(&mut self, dest: &Value, use_32bit: bool) {
-+        if self
-+            .state
-+            .value_use_counts
-+            .get(dest.0 as usize)
-+            .copied()
-+            .unwrap_or(0)
-+            == 0
-+        {
-+            return;
-+        }
-+        let use_small = use_32bit && self.state.is_small_slot(dest.0);
-+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
-+            let reg_name = phys_reg_name(reg);
-+            if super::emit::is_xmm_reg(reg) {
-+                // Integer value parked in an XMM home (bit-punned float word).
-+                self.state
-+                    .emit_fmt(format_args!("    movq %rdx, %{}", reg_name));
-+            } else {
-+                // Always movq for register stores (movl would zero-extend and
-+                // corrupt negative I32 remainders flowing into 64-bit uses).
-+                self.state
-+                    .out
-+                    .emit_instr_reg_reg("    movq", "rdx", reg_name);
-+            }
-+        } else if let Some(slot) = self.state.get_slot(dest.0) {
-+            if use_small {
-+                self.state.out.emit_instr_reg_rbp("    movl", "edx", slot.0);
-+            } else {
-+                self.state.out.emit_instr_reg_rbp("    movq", "rdx", slot.0);
-+            }
-+        } else if self.state.is_accumulator_location(dest.0) {
-+            // Accumulator location means %rax residency — a remainder can
-+            // never claim it directly. Route through %rax: the consumer's
-+            // operand_to_rax finds it there.
-+            if use_32bit {
-+                self.state.emit("    movl %edx, %eax");
-+            } else {
-+                self.state.emit("    movq %rdx, %rax");
-+            }
-+            self.state.reg_cache.set_acc(dest.0, false);
-+        } else {
-+            panic!(
-+                "x86 codegen: live remainder value {} has no assigned location",
-+                dest.0
-+            );
-+        }
-+    }
-+
-+    /// Emit one divide serving a same-block div/rem pair and store BOTH
-+    /// results. Returns false when the home combination is unstoreable
-+    /// (deadlock) — the caller falls back to standalone divisions for both
-+    /// sides and the tail is marked broken.
-+    fn emit_divrem_pair_head(
-+        &mut self,
-+        dest: &Value,
-+        op: IrBinOp,
-+        lhs: &Operand,
-+        rhs: &Operand,
-+        ty: IrType,
-+        partner_dest: u32,
-+        _partner_from_eax: bool,
-+    ) -> bool {
-+        let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
-+        let self_is_div = matches!(op, IrBinOp::UDiv | IrBinOp::SDiv);
-+        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
-+        if use_32bit {
-+            self.operand_to_eax(lhs);
-+        } else {
-+            self.operand_to_rax(lhs);
-+        }
-+        self.operand_to_rcx(rhs);
-+        if signed {
-+            if use_32bit {
-+                self.state.emit("    cltd");
-+                self.state.emit("    idivl %ecx");
-+            } else {
-+                self.state.emit("    cqto");
-+                self.state.emit("    idivq %rcx");
-+            }
-+        } else {
-+            self.state.emit("    xorl %edx, %edx");
-+            if use_32bit {
-+                self.state.emit("    divl %ecx");
-+            } else {
-+                self.state.emit("    divq %rcx");
-+            }
-+        }
-+        self.state.reg_cache.invalidate_acc();
-+
-+        // Which value takes which output register:
-+        //   div-flavoured dest -> %rax, rem-flavoured dest -> %rdx.
-+        let div_dest = if self_is_div { *dest } else { Value(partner_dest) };
-+        let rem_dest = if self_is_div { Value(partner_dest) } else { *dest };
-+
-+        let rem_home = self.dest_reg(&rem_dest);
-+        let div_home = self.dest_reg(&div_dest);
-+        // Immediately-consumed (accumulator-flow) values have neither a home
-+        // nor a slot: their consumer reads %rax directly. The pair tail can
-+        // never be one (the accumulator analysis excludes tails), so at most
-+        // the HEAD's own dest is slotless.
-+        let rem_slotless =
-+            rem_home.is_none() && self.state.get_slot(rem_dest.0).is_none();
-+        let div_slotless =
-+            div_home.is_none() && self.state.get_slot(div_dest.0).is_none();
-+        // store_rdx(rem) writes %rax iff rem is HOMED in %rdx... impossible
-+        // here: %rdx (PhysReg 16) is excluded from allocation in any function
-+        // containing division (prologue). store_rax(div) writes %rdx iff the
-+        // quotient is HOMED in %rdx — same exclusion. Keep the screening
-+        // shape for defence against future allocator changes.
-+        let rdx_phys = crate::backend::regalloc::PhysReg(16);
-+        let rem_in_rdx = rem_home == Some(rdx_phys);
-+        let div_in_rdx = div_home == Some(rdx_phys);
-+        let _ = rem_in_rdx; // cannot occur; see comment above
-+
-+        // Deadlock screening (mirrors the i686 fusion; with %rdx excluded
-+        // from allocation only the slotless combinations can trigger).
-+        if (rem_in_rdx && div_in_rdx)
-+            || (rem_slotless && div_in_rdx)
-+            || (div_slotless && rem_in_rdx)
-+        {
-+            self.divrem_broken_tails.insert(partner_dest);
-+            return false;
-+        }
-+        let div_dead = self
-+            .state
-+            .value_use_counts
-+            .get(div_dest.0 as usize)
-+            .copied()
-+            .unwrap_or(0)
-+            == 0;
-+        if rem_slotless {
-+            // Remainder must reach %rax for its acc-flow consumer. Store the
-+            // quotient first (its store cannot touch %rdx), then move the
-+            // remainder into %rax.
-+            self.store_rax_to(&div_dest);
-+            if use_32bit {
-+                self.state.emit("    movl %edx, %eax");
-+            } else {
-+                self.state.emit("    movq %rdx, %rax");
-+            }
-+            self.state.reg_cache.set_acc(rem_dest.0, false);
-+        } else if div_slotless {
-+            // Quotient stays in %rax for its acc-flow consumer; store the
-+            // remainder first (its store cannot touch %rax).
-+            self.store_rdx_to(&rem_dest, use_32bit);
-+            self.state.reg_cache.set_acc(div_dest.0, false);
-+        } else {
-+            // Canonical order: remainder out of %rdx first (its store cannot
-+            // touch %rax — see screening), then the quotient store.
-+            self.store_rdx_to(&rem_dest, use_32bit);
-+            if !div_dead {
-+                self.store_rax_to(&div_dest);
-+            } else {
-+                self.state.reg_cache.invalidate_acc();
-+            }
-+        }
-+        true
-+    }
-+
-     pub(super) fn emit_int_binop_impl(
-         &mut self,
-         dest: &Value,
-@@ -330,6 +495,52 @@ impl X86Codegen {
-         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
-         let is_unsigned = ty.is_unsigned();
- 
-+        // Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
-+        // X86_64 target). The TAIL of a pair emits nothing — its result was
-+        // stored by the HEAD's dual-store emission further up in this block
-+        // (one divq/idivq instead of two: the remainder is free with the
-+        // quotient on x86). The HEAD emits one divide and stores its own
-+        // result AND the partner's.
-+        if matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) {
-+            if self.divrem_tail_dests.contains(&dest.0)
-+                && !self.divrem_broken_tails.contains(&dest.0)
-+            {
-+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-+                    eprintln!("[DIVREM] tail-skip dest={}", dest.0);
-+                }
-+                // Tail: nothing to emit. The accumulator cache makes no
-+                // claim about this dest (it was never staged through %rax),
-+                // and its home/slot was written at the head.
-+                return;
-+            }
-+            if self.divrem_broken_tails.contains(&dest.0) {
-+                // Pair was broken at head-emission time (pathological home
-+                // combination): both sides emit standalone divisions.
-+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-+                    eprintln!("[DIVREM] tail-broken dest={} (standalone)", dest.0);
-+                }
-+            } else if let Some(&(partner_dest, partner_from_eax)) =
-+                self.divrem_head_partners.get(&dest.0)
-+            {
-+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-+                    eprintln!(
-+                        "[DIVREM] head-emit dest={} op={:?} partner={} partner_from_eax={}",
-+                        dest.0, op, partner_dest, partner_from_eax
-+                    );
-+                }
-+                let fused =
-+                    self.emit_divrem_pair_head(dest, op, lhs, rhs, ty, partner_dest, partner_from_eax);
-+                if fused {
-+                    return;
-+                }
-+                // Broken pair: fall through to the standalone path; the
-+                // partner (tail) was marked broken above.
-+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-+                    eprintln!("[DIVREM] head-broken dest={} (standalone)", dest.0);
-+                }
-+            }
-+        }
-+
-         // Register-direct path. An XMM-homed dest (integer value the RA
-         // parked in an XMM register: bit-punned float words) has no GPR
-         // sub-register names — emit_alu_reg_direct would hit
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index f846ef23..5930c4af 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -358,6 +358,17 @@ pub struct X86Codegen {
-     pub(super) reg_save_area_offset: i64,
-     /// Whether the current function is variadic
-     pub(super) is_variadic: bool,
-+    /// Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
-+    /// X86_64 target): dest value-ids of TAIL instructions — they emit
-+    /// nothing because the HEAD's dual-store wrote their result.
-+    pub(super) divrem_tail_dests: FxHashSet<u32>,
-+    /// Head dest value-id -> (partner tail dest, partner result is the
-+    /// quotient in %rax). `false` means the partner wants the remainder
-+    /// in %rdx.
-+    pub(super) divrem_head_partners: FxHashMap<u32, (u32, bool)>,
-+    /// Tails whose pair was broken at head-emission time (pathological home
-+    /// combination): they must emit their own standalone division.
-+    pub(super) divrem_broken_tails: FxHashSet<u32>,
-     /// Whether the register save area must preserve GP argument registers:
-     /// true when any va_arg in the body reads INTEGER class, or the va_list
-     /// escapes to a callee (which may read any class).
-@@ -653,6 +664,9 @@ impl X86Codegen {
-             num_named_stack_bytes: 0,
-             reg_save_area_offset: 0,
-             is_variadic: false,
-+            divrem_tail_dests: FxHashSet::default(),
-+            divrem_head_partners: FxHashMap::default(),
-+            divrem_broken_tails: FxHashSet::default(),
-             vararg_gp_save: true,
-             vararg_fp_save: true,
-             asm_scratch_idx: 0,
-@@ -3686,6 +3700,27 @@ impl ArchCodegen for X86Codegen {
-         {
-             return false;
-         }
-+        // Div/rem pair heads and tails must stay on the classic emitter path:
-+        // the fusion (emit_divrem_pair_head) lives there and the MachInst
-+        // lowering emits standalone divisions for each side, which would both
-+        // duplicate the divide and skip the tail elimination.
-+        if let crate::ir::reexports::Instruction::BinOp {
-+            dest,
-+            op:
-+                crate::ir::reexports::IrBinOp::SDiv
-+                | crate::ir::reexports::IrBinOp::UDiv
-+                | crate::ir::reexports::IrBinOp::SRem
-+                | crate::ir::reexports::IrBinOp::URem,
-+            ..
-+        } = inst
-+        {
-+            if self.divrem_tail_dests.contains(&dest.0)
-+                || self.divrem_head_partners.contains_key(&dest.0)
-+                || self.divrem_broken_tails.contains(&dest.0)
-+            {
-+                return false;
-+            }
-+        }
-         // W2 Load->Cast folding is a two-instruction runtime handshake: the
-         // default Load emitter redirects into the Cast destination and arms
-         // fold_skip_cast; the default Cast emitter consumes that handshake.
-diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
-index 0f915b27..75b26a0e 100644
---- a/src/backend/x86/codegen/prologue.rs
-+++ b/src/backend/x86/codegen/prologue.rs
-@@ -90,6 +90,20 @@ impl X86Codegen {
-         // Store function pointer for indexed addressing detection
-         self.current_func = Some(func as *const IrFunction);
- 
-+        // Same-block div/rem pair fusion table (one divq/divl serves a
-+        // URem+UDiv couple with identical operands). Constant-RHS pairs
-+        // never fuse (compute_i686_divrem_pairs excludes them
-+        // unconditionally): the magic-number path may claim them, and the
-+        // RA model must stay exact. The X86_64 target pairs 64-bit ops in
-+        // addition to the 32-bit classes.
-+        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs(
-+            func,
-+            crate::backend::regalloc::DivRemTarget::X86_64,
-+        );
-+        self.divrem_tail_dests = pairs.tail_dests;
-+        self.divrem_head_partners = pairs.head_partners;
-+        self.divrem_broken_tails.clear();
-+
-         // Analyze IVSR patterns for Phase 9b indexed addressing optimization
-         self.analyze_ivsr_pointers(func);
- 
--- 
-2.47.3
-
-
-From f9114e0756853f6df9d84a7ea9bd2442f1ec0fff Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Sat, 29 Aug 2026 11:04:59 +0000
-Subject: [PATCH 4/5] x86-64 peephole: compare-branch fusion flags-reader guard
- + register relays
-
-Two changes to fuse_compare_and_branch:
-
-* Soundness (latent miscompile): the fusion replaces
-  `setCC; testq %rax; jCC target` with a direct `jCC' target` that
-  reads the PRODUCER cmp's flags. The fall-through path previously
-  carried the DROPPED testq's flags; any reader (cmov, setCC, adc,
-  sbb, a conditional jump, pushfq) on the fall-through before the next
-  full flag writer now observes the wrong flag state. The pass refuses
-  the fusion when such a reader is in the observation window (64
-  lines). inc/dec deliberately do not end the window: they preserve
-  CF, so a later adc would still see the fused cmp's carry.
-
-* New capability: the boolean relay may now land in any register
-  (`setCC %al; movzbq %al, %rX; testq %rX, %rX; jCC`) - RA-homed
-  booleans previously blocked the fusion entirely. Non-rax carriers
-  are gated on exact FileLiveness: both the carrier and %rax must be
-  provably dead after the fused jump, since their definitions are
-  being removed. The legacy rax path keeps its corpus-validated
-  contract. A rax test after a non-rax relay is still a different
-  value and refuses to fuse (zlib-ng zng_deflateSetParams shape,
-  pinned by an existing test).
----
- .../codegen/peephole/passes/compare_branch.rs | 150 +++++++++++++++++-
- 1 file changed, 142 insertions(+), 8 deletions(-)
-
-diff --git a/src/backend/x86/codegen/peephole/passes/compare_branch.rs b/src/backend/x86/codegen/peephole/passes/compare_branch.rs
-index a539b8dc..5f555e08 100644
---- a/src/backend/x86/codegen/peephole/passes/compare_branch.rs
-+++ b/src/backend/x86/codegen/peephole/passes/compare_branch.rs
-@@ -4,6 +4,7 @@
- //! eliminating the boolean materialization overhead from the codegen model.
- 
- use super::super::types::*;
-+use super::liveness::FileLiveness;
- 
- /// Maximum number of store/load offsets tracked during compare-and-branch fusion.
- const MAX_TRACKED_STORE_LOAD_OFFSETS: usize = 4;
-@@ -28,6 +29,54 @@ fn parse_stack_operand(text: &str, source: bool) -> Option<(u8, i32)> {
-     None
+diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+index 9283dc2..b110ae3 100644
+--- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
++++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+@@ -168,20 +168,46 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
+                                 // leave garbage in %rax. Extract the source (first
+                                 // operand) and refuse to treat rax-reading sources as
+                                 // an overwrite.
++                                //
++                                // The source operand spans up to the LAST comma:
++                                // SIB-addressing forms like
++                                // `leaq (%rax, %rax, 2), %rax` contain commas inside
++                                // the parens, so a first-comma split would cut the
++                                // source at "(%rax" and lose the register reference.
++                                //
++                                // register_family_fast only matches bare "%reg"
++                                // operands (it returns REG_NONE for anything not
++                                // starting with '%'), so memory forms that READ %rax
++                                // — `movq (%rax), %rax` loads through it,
++                                // `-16(%rbp,%rax,8)` uses it as index — must be
++                                // detected textually. gcc.c-torture 931004-11 (both
++                                // miscompilation modes) pins this: `xorl %eax,%eax`
++                                // materializing a zero index was removed before
++                                // `leaq (%rax, %rax, 2), %rax`, leaving the entry
++                                // value of %rax scaled into the element address.
+                                 // "movq %r12, %rax" -> src = "%r12"; "movl %eax, %eax" -> src = "%eax".
+                                 let src = nj
+-                                    .split_once(',')
+-                                    .map(|(s, _)| {
+-                                        // Strip the leading mnemonic (first whitespace token).
+-                                        let mut toks = s.splitn(2, char::is_whitespace);
+-                                        let _mnemonic = toks.next();
+-                                        toks.next().unwrap_or("").trim()
+-                                    })
+-                                    .unwrap_or("");
++                                    .rsplit_once(',')
++                                    .map(|(s, _)| s)
++                                    .unwrap_or(nj)
++                                    .splitn(2, char::is_whitespace)
++                                    .nth(1)
++                                    .unwrap_or("")
++                                    .trim();
+                                 let src_fam = register_family_fast(src);
+-                                // Source must not be the %rax family. REG_NONE (255) for
+-                                // memory/immediate sources -> overwrites (%rax not read).
+-                                src_fam != 0
++                                // Source must not reference the %rax family —
++                                // register form (family 0) or memory/index form
++                                // (textual check; REG_NONE covers all parenthesized
++                                // forms and immediates, and immediates never name
++                                // a register).
++                                let src_touches_rax = src_fam == 0
++                                    || src.contains("%rax")
++                                    || src.contains("%eax")
++                                    || src.contains("%ax")
++                                    || src.contains("%al")
++                                    || src.contains("%ah");
++                                // Overwrite only when the source cannot read %rax.
++                                !src_touches_rax
+                             } else {
+                                 false
+                             }
+diff --git a/src/frontend/parser/ast.rs b/src/frontend/parser/ast.rs
+index 9162001..9b41118 100644
+--- a/src/frontend/parser/ast.rs
++++ b/src/frontend/parser/ast.rs
+@@ -353,6 +353,10 @@ pub struct Declaration {
+     /// Clang __attribute__((ext_vector_type(N))): number of vector elements.
+     /// Resolved to total bytes in lowering via N * sizeof(element_type).
+     pub ext_vector_nelem: Option<usize>,
++    /// Deferred vector_size(EXPR): EXPR was not parse-time evaluable (e.g.
++    /// `16 * sizeof(some_typedef)`); resolved in sema where typedef sizes are
++    /// known.
++    pub vector_size_expr: Option<Box<Expr>>,
+     pub span: Span,
  }
  
-+/// True when the instruction READS the EFLAGS register without rewriting it
-+/// (or rewrites only part of it — see `flags_partial_writers`). A reader on
-+/// the fall-through path after a fused jcc would observe the PRODUCER cmp's
-+/// flags instead of the dropped `testq`'s flags: the fusion must refuse.
-+fn flags_reader(t: &str) -> bool {
-+    const READERS: &[&str] = &[
-+        "cmov", "set", "adc", "sbb", "rcl", "rcr", "pushfq", "popfq", "sahf", "lahf",
-+    ];
-+    READERS.iter().any(|p| t.starts_with(p))
-+        || (t.starts_with('j') && !t.starts_with("jmp"))
-+}
-+
-+/// True when the instruction ends the flags-observation window: it rewrites
-+/// all six arithmetic flags, so any later reader observes ITS flags on both
-+/// the original and the fused path. `inc`/`dec` deliberately do NOT qualify
-+/// (they preserve CF, so a later `adc` would still see the dropped
-+/// producer's vs. the fused cmp's carry).
-+fn flags_full_writer(t: &str) -> bool {
-+    const WRITERS: &[&str] = &[
-+        "cmp", "test", "add", "sub", "and", "or", "xor", "neg", "mul", "imul", "div",
-+        "idiv", "shl", "shr", "sar", "sal", "rol", "ror", "bt", "bts", "btr", "btc",
-+        "popfq", "clc", "stc", "cmc", "call", "ret", "jmp",
-+    ];
-+    WRITERS.iter().any(|p| t.starts_with(p))
-+}
-+
-+/// Parse `testq %rX, %rX` / `testl %eXd, %eXd` / `testb %rXb, %rXb` as a
-+/// single-register test of a 64/32/8-bit register name. Returns the register
-+/// text.
-+fn parse_self_test(t: &str) -> Option<&str> {
-+    for (mnem, w) in [("testq %", 1), ("testl %", 1), ("testb %", 1)] {
-+        if let Some(rest) = t.strip_prefix(mnem) {
-+            let mut parts = rest.split(", ");
-+            let a = parts.next()?.trim();
-+            let b = parts.next()?.trim();
-+            if a == b && !a.contains(',') && !a.contains('(') {
-+                // Return a 'static slice of the register text.
-+                let start = mnem.len();
-+                let end = start + a.len();
-+                let full = t;
-+                let leaked = &full[start..end];
-+                return Some(leaked);
+@@ -410,6 +414,11 @@ impl Declaration {
+     pub fn set_typedef(&mut self, v: bool) {
+         self.set_flag(decl_flag::TYPEDEF, v)
+     }
++    /// Attach the deferred (parse-time unevaluable) vector_size expression.
++    #[inline]
++    pub fn set_vector_size_expr(&mut self, e: Option<Box<Expr>>) {
++        self.vector_size_expr = e;
++    }
+     #[inline]
+     pub fn set_const(&mut self, v: bool) {
+         self.set_flag(decl_flag::CONST, v)
+@@ -467,6 +476,7 @@ impl Declaration {
+             address_space,
+             vector_size,
+             ext_vector_nelem,
++            vector_size_expr: None,
+             span,
+         }
+     }
+@@ -517,6 +527,7 @@ impl std::fmt::Debug for Declaration {
+             .field("address_space", &self.address_space)
+             .field("vector_size", &self.vector_size)
+             .field("ext_vector_nelem", &self.ext_vector_nelem)
++            .field("vector_size_expr", &self.vector_size_expr)
+             .field("span", &self.span)
+             .finish()
+     }
+diff --git a/src/frontend/parser/declarations.rs b/src/frontend/parser/declarations.rs
+index d28fad3..c839f01 100644
+--- a/src/frontend/parser/declarations.rs
++++ b/src/frontend/parser/declarations.rs
+@@ -133,6 +133,8 @@ impl Parser {
+                 self.attrs.parsing_ext_vector_nelem.take(),
+                 start,
+             );
++                let _dbg_vs = d.vector_size_expr.is_some();
++            d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
+             d.set_static(self.attrs.parsing_static());
+             d.set_extern(self.attrs.parsing_extern());
+             d.set_typedef(self.attrs.parsing_typedef());
+@@ -725,7 +727,7 @@ impl Parser {
+         let is_typedef = self.attrs.parsing_typedef();
+         let is_transparent_union = self.attrs.parsing_transparent_union();
+         self.attrs.set_transparent_union(false);
+-        self.register_typedefs(&declarators);
++        self.register_typedefs(&type_spec, &declarators);
+ 
+         self.expect_after(&TokenKind::Semicolon, "after declaration");
+         let mut d = Declaration::new(
+@@ -739,6 +741,7 @@ impl Parser {
+             self.attrs.parsing_ext_vector_nelem.take(),
+             start,
+         );
++            d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
+         d.set_static(self.attrs.parsing_static());
+         d.set_extern(self.attrs.parsing_extern());
+         d.set_typedef(is_typedef);
+@@ -798,6 +801,7 @@ impl Parser {
+                 self.attrs.parsing_ext_vector_nelem.take(),
+                 start,
+             );
++                d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
+             d.set_static(is_static);
+             d.set_extern(is_extern);
+             d.set_typedef(self.attrs.parsing_typedef());
+@@ -909,6 +913,7 @@ impl Parser {
+             self.attrs.parsing_ext_vector_nelem.take(),
+             start,
+         );
++            d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
+         d.set_static(is_static);
+         d.set_extern(is_extern);
+         d.set_typedef(is_typedef);
+@@ -1328,17 +1333,48 @@ impl Parser {
+     }
+ 
+     /// Register typedef names from declarators, if parsing_typedef is set.
+-    fn register_typedefs(&mut self, declarators: &[InitDeclarator]) {
++    fn register_typedefs(&mut self, type_spec: &TypeSpecifier, declarators: &[InitDeclarator]) {
+         if self.attrs.parsing_typedef() {
+             for decl in declarators {
+                 if !decl.name.is_empty() {
+                     self.typedefs.insert(decl.name.clone());
++                    // Record the typedef's full type (base spec + derived
++                    // pointer/array layers) so parse-time constant
++                    // expressions can resolve sizeof(typedef) — required for
++                    // e.g. `__attribute__((vector_size(16 * sizeof(int64_t))))`.
++                    self.typedef_type_specs.insert(
++                        decl.name.clone(),
++                        self.typedef_spec_with_derived(type_spec.clone(), &decl.derived),
++                    );
+                 }
+             }
+             self.attrs.set_typedef(false);
+         }
+     }
+ 
++    /// Fold declarator-derived pointer/array layers into a TypeSpecifier so
++    /// parser-side `sizeof(typedef)` resolves through the stored spec.
++    /// Function-derived layers are left as-is: vector_size on function
++    /// typedefs is not a valid C construct and those stay sema-deferred.
++    fn typedef_spec_with_derived(
++        &self,
++        mut spec: TypeSpecifier,
++        derived: &[DerivedDeclarator],
++    ) -> TypeSpecifier {
++        for d in derived {
++            match d {
++                DerivedDeclarator::Pointer => {
++                    spec = TypeSpecifier::Pointer(Box::new(spec), AddressSpace::Default);
++                }
++                DerivedDeclarator::Array(n) => {
++                    spec = TypeSpecifier::Array(Box::new(spec), n.clone());
++                }
++                _ => {}
 +            }
 +        }
++        spec
 +    }
-+    None
-+}
 +
- pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-     let mut changed = false;
-     let len = store.len();
-@@ -71,6 +120,10 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
-         // Track StoreRbp offsets so we can bail out if any store's slot is
-         // potentially read by another basic block (no matching load nearby).
-         let mut test_idx = None;
-+        // Final carrier of the boolean: %rax/%eax (legacy, corpus-validated
-+        // contract) or a register-relay destination (%rX — NEW capability,
-+        // gated on exact liveness below).
-+        let mut relay_reg: Option<String> = None;
-         let mut store_offsets: [(u8, i32); MAX_TRACKED_STORE_LOAD_OFFSETS] =
-             [(0, 0); MAX_TRACKED_STORE_LOAD_OFFSETS];
-         let mut store_count = 0usize;
-@@ -79,16 +132,28 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
-             let si = seq_indices[scan];
-             let line = infos[si].trimmed(store.get(si));
- 
--            // Skip zero-extend of setcc result ONLY when it lands in %rax/%eax.
--            // `movzbl %al, %r12d` leaves the boolean in r12; a later
--            // `testq %rax, %rax` is then a DIFFERENT value (zlib-ng
--            // zng_deflateSetParams: size<4's setb was fused with the
--            // test of a slotted `new_strategy`, so a 4-byte buffer
--            // became Z_BUF_ERROR).
-+            // Relay hop of the setcc result: `movzbq %al, %rax` /
-+            // `movzbl %al, %eax` (legacy rax carrier, corpus-validated) or a
-+            // register relay `movzbq %al, %rX` / `movzbl %al, %rXd` (RA-homed
-+            // booleans). A later test MUST be of the relay's destination —
-+            // a test of a different register is a DIFFERENT value (zlib-ng
-+            // zng_deflateSetParams: size<4's setb was fused with the test of
-+            // a slotted `new_strategy`, so a 4-byte buffer became
-+            // Z_BUF_ERROR).
-             if line == "movzbq %al, %rax" || line == "movzbl %al, %eax" {
-                 scan += 1;
-                 continue;
-             }
-+            if let Some(dst) = line
-+                .strip_prefix("movzbq %al, %")
-+                .or_else(|| line.strip_prefix("movzbl %al, %"))
-+            {
-+                if !dst.contains(',') && !dst.contains('(') {
-+                    relay_reg = Some(dst.trim().to_string());
-+                    scan += 1;
-+                    continue;
-+                }
-+            }
-             // Skip store/load to rbp (pre-parsed fast check).
-             if let LineKind::StoreRbp { offset, .. } = infos[si].kind {
-                 if store_count < MAX_TRACKED_STORE_LOAD_OFFSETS {
-@@ -122,11 +187,24 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
-                 scan += 1;
-                 continue;
-             }
--            // Check for test
--            if line == "testq %rax, %rax" || line == "testl %eax, %eax" {
-+            // Check for test: legacy rax carrier (ONLY when no non-rax
-+            // relay intervenes — a rax test after `movzbl %al, %r12d` tests
-+            // a DIFFERENT value), or a test of the relay's destination
-+            // register.
-+            if relay_reg.is_none()
-+                && (line == "testq %rax, %rax" || line == "testl %eax, %eax")
-+            {
-                 test_idx = Some(scan);
-                 break;
-             }
-+            if let Some(relay) = relay_reg.clone() {
-+                if line == format!("testq %{}, %{}", relay, relay)
-+                    || line == format!("testl %{}, %{}", relay, relay)
-+                {
-+                    test_idx = Some(scan);
-+                    break;
-+                }
-+            }
-             break;
+     /// Check whether an expression contains identifiers that are NOT enum constants.
+     /// Such identifiers are variables/parameters, which make the expression not a
+     /// valid integer constant expression (C11 6.6).
+diff --git a/src/frontend/parser/parse.rs b/src/frontend/parser/parse.rs
+index 100a957..5ce8c8e 100644
+--- a/src/frontend/parser/parse.rs
++++ b/src/frontend/parser/parse.rs
+@@ -174,6 +174,10 @@ pub(super) struct ParsedDeclAttrs {
+     pub parsing_symver: Option<String>,
+     /// `__attribute__((vector_size(N)))` total vector size in bytes.
+     pub parsing_vector_size: Option<usize>,
++    /// `__attribute__((vector_size(EXPR)))` whose EXPR was not parse-time
++    /// evaluable (e.g. `16 * sizeof(some_typedef)`): the raw expression is
++    /// deferred to sema, where typedef sizes are fully resolved.
++    pub parsing_vector_size_expr: Option<Box<Expr>>,
+     /// `__attribute__((ext_vector_type(N)))` number of vector elements.
+     /// Converted to total byte size in lowering using sizeof(element_type) * N.
+     pub parsing_ext_vector_nelem: Option<usize>,
+@@ -440,6 +444,11 @@ pub struct Parser {
+     pub(super) tokens: Vec<Token>,
+     pub(super) pos: usize,
+     pub(super) typedefs: FxHashSet<String>,
++    /// Type specifier each typedef name was declared with (parser-side, for
++    /// parse-time sizeof(typedef) resolution in constant expressions such as
++    /// `__attribute__((vector_size(16 * sizeof(int64_t))))`).  Chained
++    /// typedefs, pointers and arrays fold into the stored spec recursively.
++    pub(super) typedef_type_specs: FxHashMap<String, TypeSpecifier>,
+     /// Typedef names shadowed by local variable declarations in the current scope.
+     pub(super) shadowed_typedefs: FxHashSet<String>,
+     /// Accumulated declaration attributes from the current parse_type_specifier pass.
+@@ -482,6 +491,7 @@ impl Parser {
+             tokens,
+             pos: 0,
+             typedefs: Self::builtin_typedefs_cached(),
++            typedef_type_specs: FxHashMap::default(),
+             shadowed_typedefs: FxHashSet::default(),
+             attrs: ParsedDeclAttrs::default(),
+             pragma_pack_stack: Vec::with_capacity(4),
+@@ -1375,6 +1385,61 @@ impl Parser {
          }
+     }
  
-@@ -198,6 +276,62 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
-             continue;
++    /// Parse-time constant evaluation with parser-side typedef size
++    /// resolution: handles `sizeof(typedef-name)` inside vector_size
++    /// expressions (e.g. `16 * sizeof(int64_t)`), which the shared static
++    /// evaluator cannot resolve because typedef sizes live in parser state
++    /// (`typedef_type_specs`).  Falls back to `None` for struct/union-typedef
++    /// sizes, which remain deferred to sema via
++    /// `parsing_vector_size_expr`.
++    fn eval_vector_size_with_typedefs(&self, expr: &Expr) -> Option<i64> {
++        match expr {
++            Expr::BinaryOp(op, lhs, rhs, _) => {
++                let l = self.eval_vector_size_with_typedefs(lhs)?;
++                let r = self.eval_vector_size_with_typedefs(rhs)?;
++                match op {
++                    BinOp::Add => Some(l.wrapping_add(r)),
++                    BinOp::Sub => Some(l.wrapping_sub(r)),
++                    BinOp::Mul => Some(l.wrapping_mul(r)),
++                    BinOp::Div if r != 0 => Some(l.wrapping_div(r)),
++                    BinOp::Mod if r != 0 => Some(l.wrapping_rem(r)),
++                    BinOp::Shl => Some(l.wrapping_shl(r as u32)),
++                    BinOp::Shr => Some(l.wrapping_shr(r as u32)),
++                    BinOp::BitOr => Some(l | r),
++                    BinOp::BitAnd => Some(l & r),
++                    BinOp::BitXor => Some(l ^ r),
++                    _ => None,
++                }
++            }
++            Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
++                Some(self.eval_vector_size_with_typedefs(inner)?.wrapping_neg())
++            }
++            Expr::UnaryOp(UnaryOp::Plus, inner, _) => self.eval_vector_size_with_typedefs(inner),
++            Expr::Sizeof(arg, _) => match arg.as_ref() {
++                SizeofArg::Type(ts) => {
++                    // Walk typedef chains to their base spec: the stored spec
++                    // for a chained typedef (`typedef a_t b_t;`) is itself a
++                    // TypedefName, and the static try_sizeof_type_spec cannot
++                    // resolve those.  Chains are acyclic (a typedef name is
++                    // only usable after its declaration), so this terminates.
++                    let mut spec: &TypeSpecifier = ts;
++                    loop {
++                        match spec {
++                            TypeSpecifier::TypedefName(name) => {
++                                spec = self.typedef_type_specs.get(name)?;
++                            }
++                            other => {
++                                return Some(Self::try_sizeof_type_spec(other)? as i64);
++                            }
++                        }
++                    }
++                }
++                _ => None,
++            },
++            _ => Self::eval_const_int_expr(expr),
++        }
++    }
++
+     /// Parse vector_size(expr) attribute.
+     fn parse_vector_size_attr(&mut self) {
+         if !matches!(self.peek(), TokenKind::LParen) {
+@@ -1394,6 +1459,16 @@ impl Parser {
          };
+         if let Some(size) = Self::eval_const_int_expr_with_enums(&expr, enums, tag_aligns) {
+             self.attrs.parsing_vector_size = Some(size as usize);
++        } else if let Some(size) = self.eval_vector_size_with_typedefs(&expr) {
++            // The static evaluator cannot resolve sizeof(typedef-name)
++            // (typedef sizes live in parser state); retry with the
++            // typedef-aware walk so e.g. `vector_size(16 * sizeof(int64_t))`
++            // resolves right here.
++            self.attrs.parsing_vector_size = Some(size as usize);
++        } else {
++            // Not parse-time evaluable (e.g. sizeof(struct typedef)): defer
++            // the raw expression to sema, where all sizes are resolved.
++            self.attrs.parsing_vector_size_expr = Some(Box::new(expr));
+         }
+         if matches!(self.peek(), TokenKind::RParen) {
+             self.advance();
+diff --git a/src/frontend/sema/analysis.rs b/src/frontend/sema/analysis.rs
+index 445d040..b1c104b 100644
+--- a/src/frontend/sema/analysis.rs
++++ b/src/frontend/sema/analysis.rs
+@@ -362,6 +362,24 @@ impl SemanticAnalyzer {
  
-+        // NEW capability gate: a non-rax carrier relay is only sound when
-+        // BOTH the carrier register and %rax are dead after the fused jump
-+        // (their definitions are being NOPed; a live later reader would see
-+        // stale values). The legacy rax path keeps its corpus-validated
-+        // contract (no deadness check; the relay lands in %rax whose byte
-+        // the setCC wrote and the test consumed).
-+        let relay_fam = relay_reg
+     // === Declaration analysis ===
+ 
++    /// Resolve a declaration's vector size: explicit total bytes
++    /// (`vector_size`), element-count × element size (`ext_vector_type`), or
++    /// a deferred expression (`vector_size(EXPR)` not evaluable at parse
++    /// time — e.g. `16 * sizeof(some_typedef)` — resolved here where typedef
++    /// sizes are known via the type context).
++    fn resolve_decl_vector_size(&self, decl: &Declaration, elem_size: usize) -> Option<usize> {
++        if let Some(vs) = decl.vector_size {
++            return Some(vs);
++        }
++        if let Some(n) = decl.ext_vector_nelem {
++            return Some(n * elem_size);
++        }
++        decl.vector_size_expr
 +            .as_deref()
-+            .map(register_family_fast)
-+            .filter(|&f| f != REG_NONE);
-+        if let Some(fam) = relay_fam {
-+            let mut lv = FileLiveness::new(store, infos);
-+            let jcc_pos = seq_indices[test_scan + 1];
-+            let relay_dead = lv.live_after(jcc_pos, fam) == Some(false);
-+            let al_dead = lv.live_after(jcc_pos, 0) == Some(false);
-+            if !relay_dead || !al_dead {
-+                if std::env::var_os("CCC_DEBUG_CMP_FUSE").is_some() {
-+                    eprintln!(
-+                        "[CMPFUSE] refusing relay carrier {:?} (relay_dead={} al_dead={})",
-+                        relay_reg, relay_dead, al_dead
-+                    );
-+                }
-+                i += 1;
-+                continue;
-+            }
-+        }
-+
-+        // Flags-reader guard (pure correctness, applies to every fusion):
-+        // the fall-through path after the fused jcc now carries the
-+        // PRODUCER cmp's flags where the dropped `testq`'s flags used to
-+        // be. A reader (cmov/setCC/adc/sbb/conditional jump/pushfq) before
-+        // the next full flag writer would observe the wrong flags.
-+        let guard_end = (seq_indices[test_scan + 1] + 64).min(len);
-+        let mut flags_hazard = false;
-+        for g in (seq_indices[test_scan + 1] + 1)..guard_end {
-+            if infos[g].is_nop() || matches!(infos[g].kind, LineKind::Directive | LineKind::Empty)
-+            {
-+                continue;
-+            }
-+            let gt = infos[g].trimmed(store.get(g)).to_string();
-+            if flags_reader(&gt) {
-+                flags_hazard = true;
-+                break;
-+            }
-+            if flags_full_writer(&gt) {
-+                break;
-+            }
-+        }
-+        if flags_hazard {
-+            if std::env::var_os("CCC_DEBUG_CMP_FUSE").is_some() {
-+                eprintln!("[CMPFUSE] flags-reader hazard after fused jcc — refusing");
-+            }
-+            i += 1;
-+            continue;
-+        }
-+
-         let fused_cc = if is_jne { cc } else { invert_cc(cc) };
-         let fused_jcc = format!("    j{} {}", fused_cc, branch_target);
- 
--- 
-2.47.3
-
-
-From 02b8cdd6ff14b3a1b7899da027c74fc5e1818e63 Mon Sep 17 00:00:00 2001
-From: ms178 <ms178@users.noreply.github.com>
-Date: Sat, 29 Aug 2026 11:21:10 +0000
-Subject: [PATCH 5/5] i686 peephole: fix two body-deletion miscompiles in
- block-rewrite passes
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Upstream's bool-phi merge-diamond threading (41c89b2d) started emitting
-constant-merge diamond shapes that two v7-era i686 peephole passes
-mishandled. Both bugs delete the SAME computation on SOME predecessor
-paths while keeping it on others — invisible to tests whose merged
-bodies had no observable effect, and latent until the new IR shapes
-arrived:
-
-1. Pattern 8 (identical adjacent block tail-merge) deleted Y's body —
-   the SURVIVING copy — along with X's duplicate.  X becomes `jmp Y`,
-   so every X-side predecessor must execute Y's body through the jump;
-   deleting it left the merged computation nowhere.  With both arms of
-   a bool diamond storing the same constant, the store vanished and
-   consumers read stale stack garbage.  The existing unit test used
-   flag-dead xor pairs, so the deletion was unobservable there.  Y's
-   body now survives; a new unit test pins it with an observable store.
-
-2. else_hoist_diamonds assumed the else block's only predecessor is
-   the jCC it rewrites.  A second branch can target the same
-   constant-else block (the multi-arm shape `if (a) ... else if (b)
-   ...` compiles to two jCCs into one shared else).  Hoisting the else
-   stores above the rewritten jCC silently removes them from the other
-   predecessor's path.  A reference census now vetoes the transform
-   when any other branch targets the else label.
-
-Validated: upstream bool_thread_merges now passes on i686 (and five
-more corpus tests that were silent victims of the same two bugs:
-adler_inline_tail, inline_return_param_phi, range_check_fold,
-stencil_vectorize, tce_loop_phi_param_retarget); i686 corpus 403
-passed / 76 known fails / 0 new failures; x86-64 corpus 960/0; lib
-gate 1302 passed / 0 failed under -D warnings.
----
- src/backend/i686/codegen/peephole.rs | 91 ++++++++++++++++++++++++++--
- 1 file changed, 85 insertions(+), 6 deletions(-)
-
-diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
-index f8fce2d0..2cffe1de 100644
---- a/src/backend/i686/codegen/peephole.rs
-+++ b/src/backend/i686/codegen/peephole.rs
-@@ -6000,8 +6000,9 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-         // Pattern 8: identical adjacent block tail-merge.  When block X is
-         // `[insns] jmp L`, is immediately followed by block Y holding the
-         // SAME insns (text-identical), and Y falls through into L, X's body
--        // becomes `jmp Y` and the duplicated insns plus X's original jump
--        // disappear.  Text-identical insns set identical flags, so any flag
-+        // becomes `jmp Y`; X's duplicated insns and X's original jump
-+        // disappear, while Y's copy survives and serves both predecessor
-+        // sets.  Text-identical insns set identical flags, so any flag
-         // consumer at L observes the same state.
-         {
-             let mut i = fstart;
-@@ -6099,7 +6100,15 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                     i += 1;
-                     continue;
-                 }
--                // X -> jmp Y; duplicated body + original jmp reclaimed.
-+                // X -> jmp Y; X's duplicated body and X's original jmp are
-+                // reclaimed.  Y's body is the SURVIVING copy and MUST stay:
-+                // every predecessor of X (and X's own fall-in) now executes
-+                // it via the jmp, and Y's other predecessors always did.
-+                // Deleting it as well left the merged computation nowhere —
-+                // observed as a miscompile where both arms of a bool-merge
-+                // diamond stored the same constant and the store vanished
-+                // (upstream bool_thread_merges regression, `a && b` value
-+                // context: got stale stack garbage instead of the constant).
-                 // The jmp overwrites X's first body line (never i+1: the
-                 // collector may have skipped nops after the label).
-                 let xj = insns[0];
-@@ -6113,9 +6122,6 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-                     infos[x].kind = LineKind::Nop;
-                 }
-                 infos[k].kind = LineKind::Nop;
--                for &x in &y_insns {
--                    infos[x].kind = LineKind::Nop;
--                }
-                 changed = true;
-                 i += 1;
-             }
-@@ -7716,6 +7722,39 @@ fn else_hoist_diamonds(asm: String) -> String {
-             i += 1;
-             continue;
-         }
-+        // The else block must have EXACTLY ONE predecessor: the jCC being
-+        // rewritten.  The else body sits between `jmp Ljoin` and `Ljoin:`,
-+        // so fallthrough entry is impossible, but another branch (the
-+        // merge-diamond shape `if (a) ok = 1; else if (b) ...` compiles to
-+        // two jCCs targeting the same constant-else block) can jump here
-+        // directly.  Hoisting its stores above this jCC silently removes
-+        // them from THAT predecessor's path (observed as a miscompile of
-+        // the upstream bool_thread_merges regression: the a==0 arm read
-+        // stale stack garbage instead of the constant).  Census every
-+        // branch target in the function: any reference to the else label
-+        // other than lines[i] vetoes the transform.
-+        let mut else_refs = 0usize;
-+        for (li, l) in lines.iter().enumerate() {
-+            if li == i {
-+                continue;
-+            }
-+            let t = l.trim();
-+            if t.ends_with(':') || t.is_empty() {
-+                continue;
-+            }
-+            let is_branch = t.starts_with("j")
-+                || t.starts_with("call")
-+                || t.starts_with("ret");
-+            if is_branch
-+                && t.split_whitespace().next_back().map(|x| x == else_target).unwrap_or(false)
-+            {
-+                else_refs += 1;
-+            }
-+        }
-+        if else_refs != 0 {
-+            i += 1;
-+            continue;
-+        }
-         // Rewrite:
-         //   ... producer          ... producer
-         //   jCC Lelse             <else stores>        (hoisted)
-@@ -8944,6 +8983,46 @@ mod tests {
-         assert!(!result.contains("xorl %eax, %eax\n    xorl %edx, %edx\n    jmp"), "{result}");
-     }
- 
-+    #[test]
-+    fn fold_reg_copy_tail_merge_keeps_surviving_body() {
-+        // Pattern 8 must keep Y's body: it is the surviving copy.  Both
-+        // arms of this diamond store the same constant to a stack slot;
-+        // the merged code must still store it on every path (a regression
-+        // here miscompiled the bool-merge shape `int ok = a && b;` where
-+        // the constant 0/1 the arms staged was silently dropped and the
-+        // consumer read stale stack garbage).
-+        let asm = concat!(
-+            "f:\n",
-+            ".cfi_startproc\n",
-+            "    testl %eax, %eax\n",
-+            "    je .LY\n",
-+            ".LX:\n",
-+            "    movl $22, 8(%esp)\n",
-+            "    jmp .LJ\n",
-+            ".LY:\n",
-+            "    movl $22, 8(%esp)\n",
-+            ".LJ:\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+            ".size f, .-f\n",
-+        )
-+        .to_string();
-+        let result = peephole_optimize(asm);
-+        let stores = result.matches("movl $22, 8(%esp)").count();
-+        assert!(
-+            stores == 1,
-+            "tail-merge must keep exactly one surviving store (found {}):\n{}",
-+            stores,
-+            result
-+        );
-+        // .LY must still be reachable and hold the store: no empty Y.
-+        assert!(
-+            result.contains(".LY:\n    movl $22, 8(%esp)"),
-+            "surviving block body must not be deleted:\n{}",
-+            result
-+        );
++            .and_then(|e| self.eval_const_expr(e))
++            .map(|v| v as usize)
 +    }
 +
-     #[test]
-     fn fold_reg_copy_no_test_fold_when_copy_is_live() {
-         // `movl %eax,%edx` where %edx is genuinely consumed must NOT have
--- 
-2.47.3
-
+     fn analyze_declaration(&mut self, decl: &Declaration, _is_global: bool) {
+         // Register enum constants from this declaration's type specifier.
+         // This recursively walks into struct/union fields to find inline
+@@ -492,7 +510,8 @@ impl SemanticAnalyzer {
+                 // lr_vector at offset 96 instead of 192 in the gen-as-const
+                 // pipeline, and elf/dl-trampoline.S failed its
+                 // "LR_VECTOR_OFFSET must be multiple of VEC_SIZE" #error.
+-                let resolved_ctype = match decl.resolve_vector_size(resolved_ctype.size()) {
++                let resolved_ctype = match self.resolve_decl_vector_size(decl, resolved_ctype.size())
++                {
+                     Some(vs) => CType::Vector(Box::new(resolved_ctype), vs),
+                     None => resolved_ctype,
+                 };
+@@ -534,6 +553,26 @@ impl SemanticAnalyzer {
+             return; // typedefs don't declare variables
+         }
+ 
++        // Declaration-level __attribute__((vector_size(N))) /
++        // __attribute__((ext_vector_type(N))): apply the Vector wrap here for
++        // VARIABLE declarations.  Builtin element types already carry the
++        // wrap inside their resolved TypeSpecifier (the parser attaches the
++        // attribute to the specifier itself); when the element type is a
++        // typedef name, however, the attribute is parsed after the typedef
++        // name and lands in decl.vector_size, and without this wrap the
++        // object collapses to its element type: partial initializers and
++        // element stores overrun the (too small) object and element indexing
++        // dereferences the first element's value as a base address
++        // (gcc.c-torture pr123625: SEGV + wrong checksum on both backends at
++        // every opt level).  Mirrors the typedef path above; the matches!
++        // guard keeps already-wrapped specifiers from being wrapped twice.
++        let base_type = match self.resolve_decl_vector_size(decl, base_type.size()) {
++            Some(vs) if !matches!(base_type, CType::Vector(_, _)) => {
++                CType::Vector(Box::new(base_type), vs)
++            }
++            _ => base_type,
++        };
++
+         for init_decl in &decl.declarators {
+             let mut full_type = if init_decl.derived.is_empty() {
+                 base_type.clone()
+diff --git a/src/ir/lowering/expr_access.rs b/src/ir/lowering/expr_access.rs
+index c7b9c65..e763c99 100644
+--- a/src/ir/lowering/expr_access.rs
++++ b/src/ir/lowering/expr_access.rs
+@@ -213,7 +213,15 @@ impl Lowerer {
+         }
+ 
+         let src = self.lower_expr(inner);
+-        let mut from_ty = self.get_expr_type(inner);
++        // Use the VALUE type (the defining instruction's actual result width,
++        // mirroring lower_arithmetic_binop), not the storage-level annotation.
++        // get_expr_type reports the widened carrier type (I64 for int-op-
++        // literal on LP64), which made `(long long)(4 * x)` — the inner mul
++        // materialized as a 32-bit imull with a 4-byte home — look like an
++        // I64->I64 identity: the zero-extension was dropped and the later
++        // 64-bit compare read the stale upper half of the 4-byte home
++        // (gcc.c-torture pr81588, amd64 at every opt level).
++        let mut from_ty = self.value_ir_type(inner);
+         let to_ty = self.type_spec_to_ir(target_type);
+ 
+         if let Expr::Identifier(name, _) = inner {
+diff --git a/src/ir/lowering/expr_assign.rs b/src/ir/lowering/expr_assign.rs
+index b065bbe..0e732e7 100644
+--- a/src/ir/lowering/expr_assign.rs
++++ b/src/ir/lowering/expr_assign.rs
+@@ -1133,7 +1133,7 @@ impl Lowerer {
+     // ===== Vector type helpers =====
+ 
+     /// Get the IR type for a vector element CType.
+-    fn vector_elem_ir_type(elem_ct: &CType) -> IrType {
++    pub(super) fn vector_elem_ir_type(elem_ct: &CType) -> IrType {
+         IrType::from_ctype(elem_ct)
+     }
+ 
+diff --git a/src/ir/lowering/expr_ops.rs b/src/ir/lowering/expr_ops.rs
+index 97eb9b9..1c38f6f 100644
+--- a/src/ir/lowering/expr_ops.rs
++++ b/src/ir/lowering/expr_ops.rs
+@@ -1361,6 +1361,17 @@ impl Lowerer {
+             return result;
+         }
+ 
++        // Vector ++/--: per GCC vector extensions the update is element-wise
++        // (v ± 1 with the scalar splatted to all lanes).  A vector lvalue
++        // lowers to its base address, so the generic pointer arm below would
++        // step the whole object by sizeof(vector) and corrupt every lane
++        // (gcc.c-torture pr123753: `u.w--` yielded 0xfff8 in lane 0 instead
++        // of 0xffff).
++        let inner_ct = self.expr_ctype(inner);
++        if inner_ct.is_vector() {
++            return self.lower_vector_inc_dec(inner, is_inc, return_new, &inner_ct);
++        }
++
+         let ty = self.get_expr_type(inner);
+         if let Some(lv) = self.lower_lvalue(inner) {
+             let loaded = self.load_lvalue_typed(&lv, ty);
+@@ -1396,6 +1407,157 @@ impl Lowerer {
+         self.lower_expr(inner)
+     }
+ 
++    /// Lower vector `++`/`--` (pre- and post-forms) element-wise, per GCC
++    /// vector extensions: `v++` ≡ `tmp = v; v = v + 1;` with the scalar 1
++    /// splatted to every lane.  The result operand follows the vector-value
++    /// convention of `lower_vector_binary_op` (an address): the updated
++    /// object for the pre-form / discarded post-form, and a fresh
++    /// element-wise snapshot for a *used* post-form so callers observe the
++    /// pre-update value (C11 6.5.2.4).
++    fn lower_vector_inc_dec(
++        &mut self,
++        inner: &Expr,
++        is_inc: bool,
++        return_new: bool,
++        vec_ct: &CType,
++    ) -> Operand {
++        let (elem_ct, num_elems) = match vec_ct.vector_info() {
++            Some(v) => v,
++            None => return self.lower_expr(inner),
++        };
++        let total_size = match vec_ct {
++            CType::Vector(_, ts) => *ts,
++            _ => return self.lower_expr(inner),
++        };
++        let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
++        let elem_size = elem_ct.size();
++        let ir_op = if is_inc { IrBinOp::Add } else { IrBinOp::Sub };
++        // Integer elements compute in the widened op type and truncate on
++        // store (same convention as the scalar inc/dec path); float elements
++        // step by exactly 1.0 in their own width.
++        let (step, binop_ty): (IrConst, IrType) = if elem_ct.is_floating() {
++            match elem_ir_ty {
++                IrType::F32 => (IrConst::F32(1.0), IrType::F32),
++                IrType::F128 => (IrConst::long_double(1.0), IrType::F128),
++                _ => (IrConst::F64(1.0), IrType::F64),
++            }
++        } else {
++            let wt = widened_op_type(elem_ir_ty);
++            if wt == IrType::I32 {
++                (IrConst::I32(1), IrType::I32)
++            } else {
++                (IrConst::I64(1), IrType::I64)
++            }
++        };
++        let ptr_int_ty = crate::common::types::target_int_ir_type();
++        let lv = match self.lower_lvalue(inner) {
++            Some(lv) => lv,
++            None => return self.lower_expr(inner),
++        };
++        let volatile = lv.volatile || self.expr_access_is_volatile(inner);
++        let seg = self.lvalue_addr_space(&lv);
++        let base = self.lvalue_addr(&lv);
++
++        // Post-form with a used result: element-wise snapshot of the old
++        // value before the update (C11 6.5.2.4: the result is the prior
++        // value).  Discarded post-forms need no snapshot.
++        let old_copy = if !return_new && !self.discard_expr_result {
++            let old_alloca = self.emit_entry_alloca(IrType::Ptr, total_size, total_size, false);
++            for i in 0..num_elems {
++                let off = i * elem_size;
++                let src = if off > 0 {
++                    self.emit_binop_val(
++                        IrBinOp::Add,
++                        Operand::Value(base),
++                        Operand::Const(IrConst::ptr_int(off as i64)),
++                        ptr_int_ty,
++                    )
++                } else {
++                    base
++                };
++                let e = self.fresh_value();
++                self.emit(Instruction::Load {
++                    volatile,
++                    dest: e,
++                    ptr: src,
++                    ty: elem_ir_ty,
++                    seg_override: seg,
++                });
++                let dst = if off > 0 {
++                    self.emit_binop_val(
++                        IrBinOp::Add,
++                        Operand::Value(old_alloca),
++                        Operand::Const(IrConst::ptr_int(off as i64)),
++                        ptr_int_ty,
++                    )
++                } else {
++                    old_alloca
++                };
++                self.emit(Instruction::Store {
++                    volatile,
++                    val: Operand::Value(e),
++                    ptr: dst,
++                    ty: elem_ir_ty,
++                    seg_override: seg,
++                });
++            }
++            Some(old_alloca)
++        } else {
++            None
++        };
++
++        for i in 0..num_elems {
++            let off = i * elem_size;
++            let ep = if off > 0 {
++                self.emit_binop_val(
++                    IrBinOp::Add,
++                    Operand::Value(base),
++                    Operand::Const(IrConst::ptr_int(off as i64)),
++                    ptr_int_ty,
++                )
++            } else {
++                base
++            };
++            let e = self.fresh_value();
++            self.emit(Instruction::Load {
++                volatile,
++                dest: e,
++                ptr: ep,
++                ty: elem_ir_ty,
++                seg_override: seg,
++            });
++            let cur = if binop_ty != elem_ir_ty {
++                self.emit_implicit_cast(Operand::Value(e), elem_ir_ty, binop_ty)
++            } else {
++                Operand::Value(e)
++            };
++            let nw = self.emit_binop_val(ir_op, cur, Operand::Const(step), binop_ty);
++            let nw = if binop_ty != elem_ir_ty {
++                self.emit_implicit_cast(Operand::Value(nw), binop_ty, elem_ir_ty)
++            } else {
++                Operand::Value(nw)
++            };
++            self.emit(Instruction::Store {
++                volatile,
++                val: nw,
++                ptr: ep,
++                ty: elem_ir_ty,
++                seg_override: seg,
++            });
++        }
++
++        if return_new {
++            Operand::Value(base)
++        } else {
++            match old_copy {
++                Some(old) => Operand::Value(old),
++                // Discarded post-form result: nothing reads it, the updated
++                // object's address is a valid vector-valued operand.
++                None => Operand::Value(base),
++            }
++        }
++    }
++
+     fn try_lower_bitfield_inc_dec(
+         &mut self,
+         inner: &Expr,
+diff --git a/tests/regression/vec_incdec_elementwise.c b/tests/regression/vec_incdec_elementwise.c
+new file mode 100644
+index 0000000..1df80d1
+--- /dev/null
++++ b/tests/regression/vec_incdec_elementwise.c
+@@ -0,0 +1,34 @@
++// Regression pin: vector ++/-- must step by one ELEMENT per lane (GCC
++// vector extensions: v-- == v = v - 1 with the scalar splatted).  The
++// generic scalar/pointer inc/dec path stepped the whole object by
++// sizeof(vector), corrupting every lane (pr123753: u.w-- produced
++// 0xfff8 in lane 0 instead of 0xffff).
++typedef int V __attribute__((__vector_size__ (8)));
++typedef short W __attribute__((__vector_size__ (8)));
++union { unsigned short u[4]; W w; } u;
++V v;
++
++V
++foo ()
++{
++  u.w--;
++  V r = v + u.u[0];
++  return r;
++}
++
++int
++main ()
++{
++  if (sizeof (int) != 4 || sizeof (short) != 2)
++    return 0;
++  V x = foo ();
++  if (x[0] != (unsigned short) -1 || x[1] != (unsigned short) -1)
++    __builtin_abort ();
++  W t = (W){0, 0, 0, 0};
++  W pre = --t;
++  if (((unsigned short *) &t)[0] != 0xffff)
++    __builtin_abort ();
++  if (((unsigned short *) &pre)[0] != 0xffff)
++    __builtin_abort ();
++  return 0;
++}
+diff --git a/tests/regression/vec_incdec_elementwise.flags b/tests/regression/vec_incdec_elementwise.flags
+new file mode 100644
+index 0000000..b13fc40
+--- /dev/null
++++ b/tests/regression/vec_incdec_elementwise.flags
+@@ -0,0 +1,2 @@
++-O0
++-O2
+diff --git a/tests/regression/vec_typedef_chain_size.c b/tests/regression/vec_typedef_chain_size.c
+new file mode 100644
+index 0000000..4a3c898
+--- /dev/null
++++ b/tests/regression/vec_typedef_chain_size.c
+@@ -0,0 +1,27 @@
++// Regression pin (both backends, all levels): vector_size may take an
++// expression involving sizeof of a CHAINED typedef, per GCC vector
++// extensions used pervasively in the torture suite (pr123625 et al).
++// The parse-time constant evaluator must walk the typedef chain to its
++// base spec; if the size expression stays unevaluable the attribute is
++// dropped and the vector object collapses to its 8-byte element type
++// (stores overrun the object, indexing dereferences element values).
++#include <stdint.h>
++#define BS_VEC(type, num) type __attribute__((vector_size(num * sizeof(type))))
++typedef long long base_t;
++typedef base_t mid_t;
++typedef mid_t leaf_t;
++
++int main (void)
++{
++  BS_VEC (leaf_t, 16) v = { 1, 8096386231136, 9039249955151 };
++  if (sizeof (v) != 128)
++    return 1;
++  if (v[1] != 8096386231136 || v[2] != 9039249955151)
++    return 2;
++  long long s = 0;
++  for (uint32_t i = 0; i < 16; i++)
++    s += v[i];
++  if (s != 17135636186288)
++    return 3;
++  return 0;
++}
+diff --git a/tests/regression/vec_typedef_chain_size.flags b/tests/regression/vec_typedef_chain_size.flags
+new file mode 100644
+index 0000000..b13fc40
+--- /dev/null
++++ b/tests/regression/vec_typedef_chain_size.flags
+@@ -0,0 +1,2 @@
++-O0
++-O2
