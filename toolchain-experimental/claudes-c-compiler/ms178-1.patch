@@ -1,851 +1,208 @@
-From 273720ad5f29e563995053eed274d1b43011f52f Mon Sep 17 00:00:00 2001
-From: lccc-agent <agent@lccc.local>
-Date: Sat, 29 Aug 2026 13:15:39 +0000
-Subject: [PATCH 1/5] x86-64: compare-replay from register homes via RA
- interval extension (IS-07/IS-09)
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Compare-replay — the Cmp skips setcc/movzbl entirely and its Select/
-CondBranch consumer re-emits the compare from recorded operands right
-before the cmov/jcc — was restricted to SLOT-homed operands ever since
-the sqlite3 yy_shift miscompile: a register-homed operand's live range
-ended at the ORIGINAL Cmp position, the allocator freed the register, a
-later-defined value reused it, and the replayed compare read the wrong
-value (state+415 instead of state).
-
-The real defect was a missing RA contract, not the mechanism: the
-backend reads the operands at the CONSUMER position, and nothing told
-the allocator. This commit supplies that contract through the existing
-folded_index_uses channel (whose documented semantics — "the backend
-reads this value at the consumer's position" — cover replay exactly):
-
-* The replay candidate scan moves to
-  comparison::compute_cmp_replay_scan, a pure IR function consumed by
-  BOTH the prologue (emitter contract) and the RA-link builder — the
-  allocator and emitter can never disagree about which operands are
-  read where. Each link maps an operand value to its Cmp DEST, whose
-  single use IS the consumer: extending the operand's interval to the
-  dest's end covers the replay position precisely.
-
-* The pre-RA scan accepts every Value operand optimistically; the
-  home decision moves to post-RA pruning with homes final:
-  pre-existing slot -> always safe; register assignment -> safe under
-  the interval extension (refused when CCC_NO_FOLDED_INDEX_LIVENESS
-  disables it); neither home -> safe only if the allocator will grant a
-  spill slot; never-materialized values prune the entry (the Cmp then
-  materializes its boolean normally — fallback, never miscompile).
-
-Results: `x > hi ? hi : x` chains now replay the second compare from
-register homes — clamp emits cmp/cmovg/cmpl/cmovl where it emitted
-setl+movzbl+testq+cmovne (4 instructions saved per clamp link); the
-sqlite hazard shape replays off a register the RA provably keeps (the
-add is steered to a scratch). Census: 6278 -> 6258 instructions vs GCC
-5773; gzip_crc32 and zlib_ng_adler32 each shed further instructions.
-
-Validated: exhaustive clamp (11^3 input space) and state-select
-(-100..800 strided) suites bit-identical to GCC; lib gate 1302/0 under
--D warnings; x86-64 regression corpus 966/0 (sqlite corpus tests
-included); i686 failure set unchanged; godbolt x86-64 census improved
-with no per-program regressions.
----
- src/backend/x86/codegen/comparison.rs | 115 +++++++++++++++++
- src/backend/x86/codegen/emit.rs       |   7 +
- src/backend/x86/codegen/prologue.rs   | 178 ++++++++++++--------------
- 3 files changed, 204 insertions(+), 96 deletions(-)
-
-diff --git a/src/backend/x86/codegen/comparison.rs b/src/backend/x86/codegen/comparison.rs
-index 1cedbce8..736b1bbd 100644
---- a/src/backend/x86/codegen/comparison.rs
-+++ b/src/backend/x86/codegen/comparison.rs
-@@ -5,6 +5,121 @@ use crate::backend::regalloc::PhysReg;
- use crate::common::types::IrType;
- use crate::ir::reexports::{BlockId, IrCmpOp, IrConst, Operand, Value};
+diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
+index 319b2f6..e2c2f90 100644
+--- a/src/driver/pipeline.rs
++++ b/src/driver/pipeline.rs
+@@ -1962,6 +1962,27 @@ impl Driver {
+         // in the current iteration of a loop). Stack size reduction is handled
+         // by copy coalescing in codegen instead.
  
-+/// IR-level scan for compare-replay candidates, shared by the x86-64
-+/// prologue (which consumes `replay` as the emitter contract) and the RA
-+/// link builder (which consumes `operand_links` to extend operand live
-+/// intervals) — allocator and emitter can never disagree about which
-+/// values the backend reads at the consumer position.
-+///
-+/// A Cmp is a replay candidate when its destination has exactly one use,
-+/// the compare is an integer compare of non-wide type, it is not already
-+/// handled by the better ADJACENT flag fusion (`fused`), and that single
-+/// use is a same-block Select or the block-terminator CondBranch. The
-+/// consumer then re-emits the comparison from the recorded operands right
-+/// before its cmov/jcc instead of testing a materialized boolean.
-+///
-+/// `operand_links` maps each Value operand to the Cmp DEST: the dest's
-+/// single use IS the consumer, so the dest's live-interval end marks the
-+/// replay position. Extending the operand's interval to that end (via
-+/// RegAllocConfig::folded_index_uses, whose contract — "the backend reads
-+/// this value at the consumer's position" — covers this case exactly)
-+/// guarantees register homes survive intervening instructions. Operands
-+/// that end up with no home at all (never-materialized values) are
-+/// pruned post-RA by the prologue; slot-homed operands never needed the
-+/// extension (the slot is written at every definition).
-+pub(crate) struct CmpReplayScan {
-+    pub replay: crate::common::fx_hash::FxHashMap<
-+        u32,
-+        (IrCmpOp, Operand, Operand, IrType),
-+    >,
-+    pub operand_links:
-+        crate::common::fx_hash::FxHashMap<u32, Vec<u32>>,
++        // Backend IR-integrity gate (runs at EVERY opt level): no block may
++        // reach codegen without a predecessor path from the entry block.
++        // A nested short-circuit fold inside the frontend's recursive
++        // lower_condition_branch (fold_comparison_pair: `(x==0)||(x!=0)`
++        // -> true) terminates the current block with an unconditional
++        // branch while the outer `||` arm's rhs_label block has already
++        // been created and is lowered into afterwards. The stranded block
++        // is unreachable and its operands may reference values whose
++        // definitions were removed together with the folded branch
++        // (gcc.c-torture 20000314-1 at -O0: the `*(char *) winds` arm kept
++        // a Load whose pointer value lost its def; the x86 backend's
++        // session-26 hard gate — correctly — refuses to materialise a
++        // value with no home and the compile ICE'd). -O0 skips the pass
++        // pipeline entirely, so cfg_simplify's copy of this logic never
++        // ran there; late -O1+ transforms (bool_thread, phi elimination)
++        // can in principle strand blocks after the last simplify_cfg
++        // round, so the gate runs unconditionally right before codegen.
++        // Unreachable code has no observable semantics — removal is
++        // always sound and touches no reachable instruction.
++        crate::passes::cfg_simplify::for_each_function_eliminate_unreachable(&mut module);
++
+         // Generate assembly using target-specific codegen
+         let t8 = std::time::Instant::now();
+         let opts = crate::backend::CodegenOptions {
+diff --git a/src/passes/cfg_simplify.rs b/src/passes/cfg_simplify.rs
+index b0116c0..8cd5328 100644
+--- a/src/passes/cfg_simplify.rs
++++ b/src/passes/cfg_simplify.rs
+@@ -38,6 +38,13 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
+     simplify_cfg(func)
+ }
+ 
++/// Module-level entry for the driver's pre-codegen integrity gate: strips
++/// unreachable blocks from every defined function. See
++/// `eliminate_unreachable_blocks` for the full soundness argument.
++pub(crate) fn for_each_function_eliminate_unreachable(module: &mut crate::ir::module::IrModule) -> usize {
++    module.for_each_function(eliminate_unreachable_blocks)
 +}
 +
-+pub(crate) fn compute_cmp_replay_scan(
-+    func: &crate::ir::reexports::IrFunction,
-+    use_counts: &crate::common::fx_hash::FxHashMap<u32, u32>,
-+    fused: &crate::common::fx_hash::FxHashMap<u32, u32>,
-+) -> CmpReplayScan {
-+    let mut replay = crate::common::fx_hash::FxHashMap::default();
-+    let mut operand_links: crate::common::fx_hash::FxHashMap<u32, Vec<u32>> =
-+        crate::common::fx_hash::FxHashMap::default();
-+    for block in &func.blocks {
-+        let insts = &block.instructions;
-+        for (ii, inst) in insts.iter().enumerate() {
-+            let (cdest, cop, clhs, crhs, cty) = match inst {
-+                crate::ir::reexports::Instruction::Cmp {
-+                    dest,
-+                    op,
-+                    lhs,
-+                    rhs,
-+                    ty,
-+                } => (dest.0, *op, lhs.clone(), rhs.clone(), *ty),
-+                _ => continue,
-+            };
-+            if use_counts.get(&cdest).copied().unwrap_or(0) != 1 {
-+                continue;
-+            }
-+            // Integer comparisons only: float comparisons use ucomiss/
-+            // ucomisd with a different flag contract (PF for NaN, the
-+            // setnp/sete dance) — replaying them as integer cmps produces
-+            // wrong selects (simd_sse2_arith regression). WIDE (I128)
-+            // compares are excluded too: emit_cmp routes them to
-+            // emit_i128_cmp, which ignores cmp_replay AND could not be
-+            // replayed by emit_int_cmp_replay_insn (multi-instruction
-+            // 128-bit compare).
-+            if !cty.is_integer() || crate::backend::generation::is_wide_int_type(cty) {
-+                continue;
-+            }
-+            // Already handled by the (better) adjacent fusion.
-+            if fused.contains_key(&cdest) {
-+                continue;
-+            }
-+            // The single use must be a Select in this block or the
-+            // block-terminator CondBranch.
-+            let mut used_by_select = false;
-+            for (jj, other) in insts.iter().enumerate() {
-+                if jj == ii {
-+                    continue;
-+                }
-+                if let crate::ir::reexports::Instruction::Select {
-+                    cond: Operand::Value(v),
-+                    ..
-+                } = other
-+                {
-+                    if v.0 == cdest {
-+                        used_by_select = true;
-+                        break;
-+                    }
-+                }
-+            }
-+            if !used_by_select {
-+                if let crate::ir::reexports::Terminator::CondBranch {
-+                    cond: Operand::Value(v),
-+                    ..
-+                } = &block.terminator
-+                {
-+                    if v.0 == cdest {
-+                        used_by_select = true;
-+                    }
-+                }
-+            }
-+            if used_by_select {
-+                for op in [&clhs, &crhs] {
-+                    if let Operand::Value(v) = op {
-+                        operand_links.entry(v.0).or_default().push(cdest);
-+                    }
-+                }
-+                replay.insert(cdest, (cop, clhs, crhs, cty));
-+            }
-+        }
-+    }
-+    CmpReplayScan {
-+        replay,
-+        operand_links,
-+    }
-+}
-+
- impl X86Codegen {
-     pub(super) fn emit_float_cmp_impl(
-         &mut self,
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index ffe75002..1ed678b1 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -443,6 +443,12 @@ pub struct X86Codegen {
-     /// recorded operands and uses cmovcc/jcc directly instead of testing the
-     /// materialized boolean (setcc/movzbl/testq chain). Keyed by Cmp dest.
-     pub(super) cmp_replay: FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
-+    /// CMP-REPLAY operand -> consumer links built with `cmp_replay` (IS-09):
-+    /// merged into the RA's folded_index_uses so register-homed replay
-+    /// operands keep their homes until the consumer re-emits the compare.
-+    /// Cleared after the merge; exists only to bridge the pre-RA scan and
-+    /// the RA invocation inside this very large prepare function.
-+    pub(super) cmp_replay_operand_links: FxHashMap<u32, Vec<u32>>,
-     /// Number of uses of each SSA value (instructions + terminators).
-     pub(super) value_use_counts: FxHashMap<u32, u32>,
-     /// W2 Load->Cast fold (2026-08-10): load dest value id -> the register of
-@@ -707,6 +713,7 @@ impl X86Codegen {
-             fused_cmp_dests: FxHashMap::default(),
-             fused_forward_dests: FxHashSet::default(),
-             cmp_replay: FxHashMap::default(),
-+            cmp_replay_operand_links: FxHashMap::default(),
-             value_use_counts: FxHashMap::default(),
-             load_cast_fold: FxHashMap::default(),
-             folded_cast_dests: FxHashSet::default(),
-diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
-index bb70e424..fcccea3d 100644
---- a/src/backend/x86/codegen/prologue.rs
-+++ b/src/backend/x86/codegen/prologue.rs
-@@ -895,101 +895,22 @@ impl X86Codegen {
-             // cmovcc/jcc directly. This removes the
-             // setcc/movzbl + testq (3 instructions) per select in hot loops.
-             //
--            // Soundness: the Cmp dest has exactly one use (the consumer), the
--            // operands are pure SSA values (side-effect-free re-materialization
--            // at the consumer; the accumulator cache is invalidated first so a
--            // value that only lived in %rax is reloaded from its slot), and the
--            // replayed cmp is emitted immediately before the cmov/jcc with no
--            // intervening flag mutation.
--            let mut cmp_replay: FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)> =
--                FxHashMap::default();
--            for block in &func.blocks {
--                let insts = &block.instructions;
--                for (ii, inst) in insts.iter().enumerate() {
--                    let (cdest, cop, clhs, crhs, cty) = match inst {
--                        Instruction::Cmp {
--                            dest,
--                            op,
--                            lhs,
--                            rhs,
--                            ty,
--                        } => (dest.0, *op, lhs.clone(), rhs.clone(), *ty),
--                        _ => continue,
--                    };
--                    if use_counts.get(&cdest).copied().unwrap_or(0) != 1 {
--                        continue;
--                    }
--                    // Integer comparisons only: float comparisons use ucomiss/
--                    // ucomisd with a different flag contract (PF for NaN, the
--                    // setnp/sete dance) — replaying them as integer cmps
--                    // produces wrong selects (simd_sse2_arith regression).
--                    // WIDE (I128) compares are excluded too: emit_cmp routes
--                    // them to emit_i128_cmp, which ignores cmp_replay AND
--                    // could not be replayed by emit_int_cmp_replay_insn
--                    // (multi-instruction 128-bit compare).
--                    if !cty.is_integer() || crate::backend::generation::is_wide_int_type(cty) {
--                        continue;
--                    }
--                    // Replay soundness: the operands are re-materialized at the
--                    // consumer via a STACK-SLOT load. A register assignment is
--                    // NOT a stable location here: the allocator sized the
--                    // operand's live range against the ORIGINAL Cmp position,
--                    // but the replay executes LATER (after intervening
--                    // instructions), and a later-defined value may share the
--                    // register — the replay would compare the wrong value
--                    // (sqlite3 yy_shift: `state > 599 ? state+415 : state`
--                    // compared state+415 instead of state because the Cmp lhs
--                    // register had been reused by the +415 add). Slot-only
--                    // operands are always safe: store_rax_to writes the slot
--                    // for every non-register-allocated value.
--                    let op_has_location = |op: &Operand| -> bool {
--                        match op {
--                            Operand::Const(_) => true,
--                            Operand::Value(v) => self.state.get_slot(v.0).is_some(),
--                        }
--                    };
--                    if !op_has_location(&clhs) || !op_has_location(&crhs) {
--                        continue;
--                    }
--                    // Already handled by the (better) adjacent fusion.
--                    if fused.contains_key(&cdest) {
--                        continue;
--                    }
--                    // The single use must be a Select in this block or the
--                    // block-terminator CondBranch.
--                    let mut used_by_select = false;
--                    for (jj, other) in insts.iter().enumerate() {
--                        if jj == ii {
--                            continue;
--                        }
--                        if let Instruction::Select {
--                            cond: Operand::Value(v),
--                            ..
--                        } = other
--                        {
--                            if v.0 == cdest {
--                                used_by_select = true;
--                                break;
--                            }
--                        }
--                    }
--                    if !used_by_select {
--                        if let Terminator::CondBranch {
--                            cond: Operand::Value(v),
--                            ..
--                        } = &block.terminator
--                        {
--                            if v.0 == cdest {
--                                used_by_select = true;
--                            }
--                        }
--                    }
--                    if used_by_select {
--                        cmp_replay.insert(cdest, (cop, clhs, crhs, cty));
--                    }
--                }
--            }
--            self.cmp_replay = cmp_replay;
-+            // Candidate selection lives in
-+            // comparison::compute_cmp_replay_scan — the SAME function the
-+            // RA-link builder consumes below, so allocator and emitter can
-+            // never disagree about which operands are read at the consumer
-+            // position.
-+            //
-+            // Home soundness is decided POST-RA (prune_replay_entries): a
-+            // register-homed operand is safe because its interval was
-+            // extended to the consumer position through RegAllocConfig::
-+            // folded_index_uses; a slot-homed operand is always safe; an
-+            // operand with no home at all (never-materialized) prunes the
-+            // entry (the Cmp then materializes its boolean normally).
-+            let replay_scan =
-+                super::comparison::compute_cmp_replay_scan(func, &use_counts, &fused);
-+            self.cmp_replay_operand_links = replay_scan.operand_links;
-+            self.cmp_replay = replay_scan.replay;
+ /// Simplify the CFG of a single function.
+ /// Iterates until no more simplifications are possible (fixpoint).
+ ///
+@@ -60,7 +67,7 @@ pub(crate) fn simplify_cfg(func: &mut IrFunction) -> usize {
+         changed += fold_constant_switches(func, &label_to_idx);
+         changed += simplify_redundant_cond_branches(func);
+         changed += thread_jump_chains(func, &label_to_idx);
+-        changed += remove_dead_blocks(func, &label_to_idx);
++        changed += eliminate_unreachable_blocks(func);
+         changed += simplify_trivial_phis(func);
+         changed += merge_single_pred_blocks(func);
+         if changed == 0 {
+@@ -775,13 +782,33 @@ fn would_create_phi_conflict(
+ // Sub-pass: dead block elimination
+ // ---------------------------------------------------------------------------
  
-             self.fused_cmp_dests = fused;
-             self.fused_forward_dests = fused_forward;
-@@ -1253,9 +1174,74 @@ impl X86Codegen {
-                 // plus indexed-fold base AND index intervals to their consumers,
-                 // so every address register survives intervening calls and value
-                 // staging (zlib-ng gz_reset NULL-store crash class).
--                crate::backend::generation::collect_folded_gep_links_all(func),
-+                {
-+                    // CMP-REPLAY operand reads (IS-09): the consumer re-emits
-+                    // the comparison at the SELECT/CondBranch position, so a
-+                    // REGISTER-homed operand's interval must extend to the
-+                    // consumer — otherwise the allocator frees the register
-+                    // at the original Cmp position and a later-defined value
-+                    // reuses it (sqlite3 yy_shift compared state+415 instead
-+                    // of state). The links map each operand to its Cmp dest,
-+                    // whose single use marks the replay position; the
-+                    // extension then treats the replayed read exactly like
-+                    // the folded-GEP address reads this map already covers.
-+                    // Links are a SUPERSET of what the emitter finally
-+                    // accepts (built with an empty fused set is not needed:
-+                    // the scan skipped fused dests, and those operands keep
-+                    // their normal adjacency-synchronized ranges) — a
-+                    // retained link for a pruned entry only over-constrains
-+                    // the allocator, never under-constrains.
-+                    let mut links = crate::backend::generation::collect_folded_gep_links_all(func);
-+                    for (operand, dests) in &self.cmp_replay_operand_links {
-+                        links.entry(*operand).or_default().extend(dests.iter().copied());
-+                    }
-+                    links
-+                }
-             );
+-/// Remove blocks that have no predecessors (except the entry block, blocks[0]).
+-/// Returns the number of blocks removed.
+-fn remove_dead_blocks(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, usize>) -> usize {
++/// Backend IR-integrity gate: remove every block unreachable from the entry
++/// block, keeping the roots that carry observable semantics (LabelAddr /
++/// static-local init labels, asm-goto targets). Runs verbatim at -O1+ as
++/// part of simplify_cfg and — via the driver's pre-codegen hook — at every
++/// opt level, so no backend can ever be handed a block without a
++/// predecessor path from the entry block.
++///
++/// Why the -O0 hook exists: -O0 skips the optimizer entirely, but the
++/// FRONTEND can still strand blocks. A nested short-circuit fold inside a
++/// recursive `lower_condition_branch` (fold_comparison_pair:
++/// `(x==0)||(x!=0)` -> true) terminates the current block with an
++/// unconditional branch while the outer `||` arm's rhs_label block has
++/// already been created and is lowered into afterwards. The stranded block
++/// is unreachable, and its operands may reference values whose definitions
++/// were removed together with the folded branch (gcc.c-torture
++/// 20000314-1: the `*(char *) winds` arm kept a Load whose pointer value
++/// lost its def; the x86 backend's session-26 hard gate — correctly —
++/// refuses to materialise a value with no home and the compile ICEs).
++/// Unreachable code has no observable semantics, so removing it is always
++/// sound; reachable code is untouched. Phis and asm-goto label references
++/// in surviving blocks are cleaned up below.
++pub(crate) fn eliminate_unreachable_blocks(func: &mut IrFunction) -> usize {
+     if func.blocks.len() <= 1 {
+         return 0;
+     }
  
-+        // ── CMP-REPLAY post-RA home pruning (IS-09) ─────────────────────────
-+        // The scan accepted every Value operand optimistically; now that
-+        // homes are final, keep only entries whose operands are readable at
-+        // the replay point:
-+        //   * pre-existing stack slot (param/alloca)  — always safe: the
-+        //     slot is written at the definition and never reused while the
-+        //     SSA value is live;
-+        //   * register assignment — safe because the operand's interval was
-+        //     extended to the consumer position via the folded_index links
-+        //     (unless the extension is disabled: CCC_NO_FOLDED_INDEX_LIVENESS
-+        //     removes the guarantee, so reg-homed operands revert to
-+        //     refused);
-+        //   * neither — safe only when the allocator will hand the value a
-+        //     spill slot (every non-never-materialized value gets one).
-+        //     never-materialized values have no home at all: reading one at
-+        //     the replay would consume stale register/slot state — prune.
-+        {
-+            let ext_active = std::env::var_os("CCC_NO_FOLDED_INDEX_LIVENESS").is_none();
-+            let mut prune: Vec<u32> = Vec::new();
-+            for (cdest, (_op, lhs, rhs, _ty)) in self.cmp_replay.iter() {
-+                let readable = |op: &Operand| -> bool {
-+                    match op {
-+                        Operand::Const(_) => true,
-+                        Operand::Value(v) => {
-+                            if self.state.get_slot(v.0).is_some() {
-+                                return true;
-+                            }
-+                            if self.reg_assignments.contains_key(&v.0) {
-+                                return ext_active;
-+                            }
-+                            !self.state.never_materialized_values.contains(&v.0)
-+                        }
-+                    }
-+                };
-+                if !readable(lhs) || !readable(rhs) {
-+                    prune.push(*cdest);
-+                }
-+            }
-+            for d in prune {
-+                self.cmp_replay.remove(&d);
-+            }
-+        }
-+
-         // MachInst is profitable on straight-line and modest-CFG code, but its
-         // current local scheduler regressed gzip's large hot loops by ~3% even
-         // while shrinking them. Keep it default-on selectively: functions with
--- 
-2.47.3
-
-
-From 61880398ad678385c3601d0321695cb3f601d550 Mon Sep 17 00:00:00 2001
-From: lccc-agent <agent@lccc.local>
-Date: Sat, 29 Aug 2026 13:19:55 +0000
-Subject: [PATCH 2/5] x86-64: widen Clz/Ctz/Popcount results through the
- unsigned path (PF-16b)
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-`(long)__builtin_clz(x)` emitted lzcntl + cltq — but lzcntl writes
-%eax, which zeroes bits 32..63 on x86-64, and the result is <= 32, so
-bits 31..63 are provably zero: the cltq sign-extension is bit-identical
-to the zero-extension the hardware already performed. Same for ctz,
-popcount, and the 8/16-bit forms (movsbq/movswq on non-negative bytes
-vs movzbl/movzwl).
-
-Mechanism: the prologue records Clz/Ctz/Popcount destinations of at
-most 32-bit types in bitop_nonneg_values (per-definition — values
-DERIVED from a bitop result can wrap negative and are deliberately not
-propagated). Widening casts of such values to 64-bit reclassify
-from_ty to its unsigned peer, so every downstream path (register-
-direct, slot, accumulator) emits the cheap zero form; a MachInst gate
-routes the same shapes to the mature emitter, which MI would otherwise
-sign-extend eagerly. The acc-residency elision (dropping movl
-%eax,%eax when the value is provably canonical in %rax) was considered
-and REJECTED: the accumulator cache's residency invariant does not
-prove rax[63:32]==0 for arbitrary 32-bit residents, and the elision
-would rest on an unproven assumption — 3 bytes are not worth it.
-
-Validated: ffs/clz/popcount kernels lose the cltq (bit-identical
-results); lib gate 1302/0 under -D warnings; x86-64 corpus 966/0;
-godbolt census unchanged at 6258/5773 (the benchmark set contains no
-clz-widen shape — the win is on the ffs1-class gap recorded in the
-backlog).
----
- src/backend/x86/codegen/cast_ops.rs | 22 ++++++++++++++++++++++
- src/backend/x86/codegen/emit.rs     | 26 ++++++++++++++++++++++++++
- src/backend/x86/codegen/prologue.rs | 22 ++++++++++++++++++++++
- 3 files changed, 70 insertions(+)
-
-diff --git a/src/backend/x86/codegen/cast_ops.rs b/src/backend/x86/codegen/cast_ops.rs
-index c5655ea0..7676e5ec 100644
---- a/src/backend/x86/codegen/cast_ops.rs
-+++ b/src/backend/x86/codegen/cast_ops.rs
-@@ -228,6 +228,28 @@ impl X86Codegen {
-         if self.try_record_pending_widen(dest, src, from_ty, to_ty) {
-             return;
-         }
-+        // PF-16b: widening casts of Clz/Ctz/Popcount results (bit31
-+        // provably zero, upper bits zeroed by the 32-bit write itself)
-+        // take the UNSIGNED path: zero-extension equals the required
-+        // sign-extension, and movl/movzbl beats cltq/movslq/movsbq on
-+        // length and decoded opacity. The rewrite is a pure from_ty
-+        // reclassification — every downstream unsigned path (register-
-+        // direct, slot, accumulator) then emits the zero form.
-+        let from_ty = if from_ty.is_signed()
-+            && !from_ty.is_float()
-+            && from_ty.size() <= 4
-+            && to_ty.size() == 8
-+            && !to_ty.is_float()
-+            && matches!(src, Operand::Value(v) if self.bitop_nonneg_values.contains(&v.0))
-+        {
-+            match from_ty {
-+                IrType::I8 => IrType::U8,
-+                IrType::I16 => IrType::U16,
-+                _ => IrType::U32,
-+            }
-+        } else {
-+            from_ty
-+        };
- 
-         // Register-direct integer casts: bypass the accumulator when the destination
-         // has a physical register. Instead of load→cast→store through %rax, emit the
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 1ed678b1..feedbaa3 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -425,6 +425,16 @@ pub struct X86Codegen {
-     /// Set of value IDs that need sign-extension because they're used in 64-bit
-     /// contexts (Cast to I64, GEP operands). Values NOT in this set can skip movslq.
-     pub(super) needs_sext_values: FxHashSet<u32>,
-+    /// Values whose low-32 form is PROVABLY NON-NEGATIVE because they are
-+    /// the result of a Clz/Ctz/Popcount on a type of at most 32 bits
-+    /// (PF-16b). Any 32-bit register write zeroes bits 32..63 on x86-64,
-+    /// and these results are <= their bit width, so bits 31..63 are all
-+    /// zero: ZERO-extension of the 32-bit form equals the required
-+    /// SIGN-extension. Widening casts of such values take the cheaper
-+    /// unsigned path (movl, no REX-prefixed movs) instead of cltq/movslq.
-+    /// Membership is per-definition — derived values (adds etc. on top of
-+    /// a bitop result can wrap negative) are deliberately NOT propagated.
-+    pub(super) bitop_nonneg_values: FxHashSet<u32>,
-     /// Cmp destinations whose result is consumed ONLY by the immediately
-     /// following Select/CondBranch (same block, possibly after a flag-neutral
-     /// Copy chain): maps the Cmp dest to the chain-end value the consumer
-@@ -710,6 +720,7 @@ impl X86Codegen {
-             optimize_for_size: false,
-             skip_i32_sext: false,
-             needs_sext_values: FxHashSet::default(),
-+            bitop_nonneg_values: FxHashSet::default(),
-             fused_cmp_dests: FxHashMap::default(),
-             fused_forward_dests: FxHashSet::default(),
-             cmp_replay: FxHashMap::default(),
-@@ -3909,6 +3920,21 @@ impl ArchCodegen for X86Codegen {
-             {
-                 return false;
++    let label_to_idx = build_label_to_idx(func);
+     // Compute the set of blocks reachable from the entry block via BFS.
+     let entry = func.blocks[0].label;
+     let mut reachable = FxHashSet::default();
+diff --git a/src/passes/loop_rotate.rs b/src/passes/loop_rotate.rs
+index 189e7d8..5081b86 100644
+--- a/src/passes/loop_rotate.rs
++++ b/src/passes/loop_rotate.rs
+@@ -266,6 +266,25 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
+         closure.iter().map(|&i| header_insts[i].clone()).collect();
+     // (phi_dest, phi_ty, preheader_incoming, latch_incoming)
+     let mut phi_info: Vec<(u32, IrType, (BlockId, Operand), Operand)> = Vec::new();
++    // v18 Guard C: a header phi may have MULTIPLE non-latch incomings when
++    // the loop header has several outside predecessors (e.g. two exits of a
++    // preceding loop both flowing into this loop's header, or a break edge
++    // and a normal-exit edge merging at the header). The rotation's
++    // step-6.6 self-loop phi records exactly ONE preheader incoming
++    // (`(pre_op, pre_label)`), and the step-6/6.5 rewiring moves every
++    // original header predecessor onto the cloned guard — so after rotation
++    // the body's real entry edge comes from the GUARD block, while the
++    // self-loop phi's init incoming still names one of the ORIGINAL
++    // preheader labels. That label is no longer a predecessor of the phi's
++    // block: phi elimination then places the init copies on a dead edge,
++    // the live entry edge carries NO init, and the first iteration reads
++    // an undefined value (observed: loop_rotate_default_enable.c shape 4 —
++    // `sum_with_call(50)` accumulated garbage; the miscompile hid for
++    // months because a fresh stack page made the undefined slot read 0).
++    // The general fix — routing the init through the guard's own phis —
++    // is a future enhancement; bailing keeps rotation sound (same policy
++    // as Guard A/B).
++    let mut multi_pre_header = false;
+     for inst in header_insts {
+         if let Instruction::Phi {
+             dest,
+@@ -273,15 +292,29 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
+             ty,
+         } = inst
+         {
+-            let mut pre = None;
++            let mut pre: Option<(BlockId, Operand)> = None;
+             let mut lat = None;
+             for (op, lbl) in incoming {
+                 if *lbl == latch_label {
+                     lat = Some(*op);
++                } else if pre.is_some() && pre.as_ref().unwrap().0 != *lbl {
++                    // Second DISTINCT outside predecessor: the single-pre
++                    // self-loop phi shape cannot represent this header.
++                    multi_pre_header = true;
++                    break;
+                 } else {
+                     pre = Some((*lbl, *op));
+                 }
              }
-+            // PF-16b: widening casts of provably-nonnegative bitop results
-+            // reclassify to the unsigned path in the mature emitter; MachInst
-+            // would sign-extend eagerly (cltq/movslq) and foreclose that.
-+            crate::ir::reexports::Instruction::Cast {
-+                src: Operand::Value(sv),
-+                from_ty,
-+                to_ty,
-+                ..
-+            } if from_ty.is_signed()
-+                && from_ty.size() <= 4
-+                && to_ty.size() == 8
-+                && self.bitop_nonneg_values.contains(&sv.0) =>
-+            {
++            if multi_pre_header {
++                if debug {
++                    eprintln!(
++                        "[ROT] header phi v{} has >1 non-latch incoming — bail (Guard C)",
++                        dest.0
++                    );
++                }
 +                return false;
 +            }
-             crate::ir::reexports::Instruction::Cmp { dest, .. }
-                 if self.fused_cmp_dests.contains_key(&dest.0)
-                     || self.cmp_replay.contains_key(&dest.0) =>
-diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
-index fcccea3d..bfd4feab 100644
---- a/src/backend/x86/codegen/prologue.rs
-+++ b/src/backend/x86/codegen/prologue.rs
-@@ -610,6 +610,28 @@ impl X86Codegen {
-         self.skip_i32_sext = needs_sext_set.is_empty();
-         self.needs_sext_values = needs_sext_set;
- 
-+        // PF-16b: Clz/Ctz/Popcount on <=32-bit types produce results in
-+        // [0, bitwidth] — bit 31 is provably zero, so their widening casts
-+        // can take the unsigned (movl) path (see bitop_nonneg_values).
-+        {
-+            let mut nonneg = crate::common::fx_hash::FxHashSet::default();
-+            for block in &func.blocks {
-+                for inst in &block.instructions {
-+                    if let Instruction::UnaryOp { dest, op, ty, .. } = inst {
-+                        if matches!(
-+                            op,
-+                            crate::ir::reexports::IrUnaryOp::Clz
-+                                | crate::ir::reexports::IrUnaryOp::Ctz
-+                                | crate::ir::reexports::IrUnaryOp::Popcount
-+                        ) && !ty.is_float() && ty.size() <= 4 {
-+                            nonneg.insert(dest.0);
-+                        }
-+                    }
-+                }
-+            }
-+            self.bitop_nonneg_values = nonneg;
-+        }
-+
-         // ── Value type map, use counts and Cmp→consumer flag fusion ──────
-         //
-         // The codegen emits IR instructions strictly in order. When a Cmp's
--- 
-2.47.3
-
-
-From 46eb3abfd639b2d8f74cec4eef3e9f4e9cd4c4a2 Mon Sep 17 00:00:00 2001
-From: lccc-agent <agent@lccc.local>
-Date: Sat, 29 Aug 2026 13:20:50 +0000
-Subject: [PATCH 3/5] x86-64: regression test for compare-replay across calls
- and distant consumers
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Pins the replay-from-register capability end-to-end against GCC: a cmp
-whose boolean is consumed by a Select or CondBranch AFTER a call
-(caller-saved registers must survive via callee-saved assignment or
-spill — the RA interval extension makes the post-call read visible to
-the allocator), after long ALU chains, under heavy spilling, in the
-two-cmp interleaved-select family, and at block terminators. Each
-shape is exhaustively checked over boundary values (INT_MIN, INT_MAX,
-power-of-two boundaries) against independently computed expectations.
----
- tests/regression/cmp_replay_far.c     | 49 +++++++++++++++++++++++++++
- tests/regression/cmp_replay_far.flags |  1 +
- 2 files changed, 50 insertions(+)
- create mode 100644 tests/regression/cmp_replay_far.c
- create mode 100644 tests/regression/cmp_replay_far.flags
-
-diff --git a/tests/regression/cmp_replay_far.c b/tests/regression/cmp_replay_far.c
+             if let (Some(pre), Some(lat)) = (pre, lat) {
+                 phi_info.push((dest.0, *ty, pre, lat));
+             }
+diff --git a/tests/regression/sc_nested_fold_unreachable.c b/tests/regression/sc_nested_fold_unreachable.c
 new file mode 100644
-index 00000000..cebe2f2e
+index 0000000..1296666
 --- /dev/null
-+++ b/tests/regression/cmp_replay_far.c
-@@ -0,0 +1,49 @@
-+#include <stdio.h>
++++ b/tests/regression/sc_nested_fold_unreachable.c
+@@ -0,0 +1,37 @@
++/*
++ * Regression pin: nested short-circuit fold must not strand blocks.
++ *
++ * Derived from gcc.c-torture/execute/20000314-1.c. The frontend's
++ * fold_comparison_pair ((x==0)||(x!=0) -> true) fires inside the recursive
++ * lower_condition_branch of the OUTER `||`, which has already created and
++ * lowered into its rhs_label block. The stranded block referenced a value
++ * (the `winds` pointer load) whose definition was removed together with the
++ * folded branch. At -O0 no cfg cleanup ran, the block reached the x86
++ * backend, and the session-26 hard gate (correctly refusing to fabricate a
++ * home-less operand) ICE'd the compile. The driver now strips unreachable
++ * blocks before codegen at every opt level.
++ *
++ * Contract:
++ *   1. compiles at -O0/-O1/-O2 on both backends (no ICE),
++ *   2. `winds` stays a real runtime variable (while-loop shape preserved),
++ *   3. the tautology `(winds==0)||(winds!=0)` short-circuits the dangerous
++ *      `*(char *) winds` dereference, so the program exits 0, never aborts.
++ */
++void exit(int);
++void abort(void);
 +
-+int g(int x) { return x * 3; }
-+/* cmp -> CALL -> select: operands must survive the call; replay reads post-call. */
-+int across_call(int a, int b, int c) { int cond = a > b; g(0); return cond ? c : a; }
-+/* cmp -> many ALU ops -> select */
-+int far_select(int a, int b) {
-+    int cond = a >= b;
-+    int t = a * 3 + b * 7 - (a ^ 5);
-+    t ^= t >> 3;
-+    return cond ? t : a - b;
++int main(void)
++{
++  long winds = 0;
++
++  while (winds != 0)
++    {
++      if (*(char *) winds)
++	break;
++    }
++
++  if (winds == 0 || winds != 0 || *(char *) winds)
++    exit (0);
++
++  abort ();
 +}
-+/* two cmps, interleaved selects (the clamp family) */
-+int two_cmp(int a, int b, int c) {
-+    int c1 = a < b;
-+    int c2 = b < c;
-+    int s2 = c2 ? c : b;
-+    return c1 ? s2 : a;
-+}
-+/* cmp -> select where operand is re-staged through slots (force spills) */
-+int spill_heavy(int a, int b) {
-+    int cond = a != b;
-+    int v0=a*1,v1=a*2,v2=a*3,v3=a*4,v4=a*5,v5=a*6,v6=a*7,v7=a*8,v8=a*9;
-+    int s = v0+v1+v2+v3+v4+v5+v6+v7+v8;
-+    return cond ? s + b : a - s;
-+}
-+/* CondBranch terminator consumer with intervening op */
-+int branch_far(int a, int b) { int cond = a <= b; int t = a - b * 2; if (cond) return t; return b; }
-+int main(void) {
-+    int fails = 0;
-+    int vals[] = {-2147483647-1, -65536, -101, -3, 0, 2, 17, 101, 65536, 2147483647};
-+    for (int i = 0; i < 10; i++)
-+      for (int j = 0; j < 10; j++)
-+        for (int k = 0; k < 10; k++) {
-+            int a=vals[i], b=vals[j], c=vals[k];
-+            if (across_call(a,b,c) != ((a>b)?c:a)) fails++;
-+            if (far_select(a,b) != ((a>=b)?(a*3+b*7-(a^5))^((a*3+b*7-(a^5))>>3):a-b)) fails++;
-+            if (two_cmp(a,b,c) != ((a<b)?((b<c)?c:b):a)) fails++;
-+            if (branch_far(a,b) != ((a<=b)?a-b*2:b)) fails++;
-+            /* spill_heavy reference */
-+            {
-+                int cond=a!=b, s=0;
-+                for (int m=1;m<=9;m++) s+=a*m;
-+                if (spill_heavy(a,b) != (cond?s+b:a-s)) fails++;
-+            }
-+        }
-+    printf("fails=%d\n", fails);
-+    return fails != 0;
-+}
-diff --git a/tests/regression/cmp_replay_far.flags b/tests/regression/cmp_replay_far.flags
+diff --git a/tests/regression/sc_nested_fold_unreachable.flags b/tests/regression/sc_nested_fold_unreachable.flags
 new file mode 100644
-index 00000000..3a3b5796
+index 0000000..b13fc40
 --- /dev/null
-+++ b/tests/regression/cmp_replay_far.flags
-@@ -0,0 +1 @@
++++ b/tests/regression/sc_nested_fold_unreachable.flags
+@@ -0,0 +1,2 @@
++-O0
 +-O2
--- 
-2.47.3
-
-
-From 2f3fd88be66ecff6b926200afa29e5a82f36e019 Mon Sep 17 00:00:00 2001
-From: lccc-agent <agent@lccc.local>
-Date: Sat, 29 Aug 2026 13:40:21 +0000
-Subject: [PATCH 4/5] arm/a64: fold large compare constants into cmp/cmn with
- lsl #12 shift
-
-A64 cmp/cmn encode a 12-bit immediate optionally shifted left by 12.
-const_as_cmp_imm12/const_as_cmn_imm12 now return (imm, shift) and also
-accept page-aligned unsigned constants in (4095, 0xFFF000], so e.g.
-x == 4096 emits 'cmp w19, #1, lsl #12' instead of materializing a
-register with movz and comparing against it.
-
-Unit tests updated; full gcc.c-torture/execute A64 corpus: 1649 pass /
-25 fail / 2 skip, fail set byte-identical to the pre-change baseline.
----
- src/backend/arm/codegen/emit.rs | 61 +++++++++++++++++++++++----------
- 1 file changed, 43 insertions(+), 18 deletions(-)
-
-diff --git a/src/backend/arm/codegen/emit.rs b/src/backend/arm/codegen/emit.rs
-index da844db6..9835bbbf 100644
---- a/src/backend/arm/codegen/emit.rs
-+++ b/src/backend/arm/codegen/emit.rs
-@@ -755,22 +755,39 @@ impl ArmCodegen {
-     }
- 
-     /// Check for the unshifted immediate form of CMP (0..=4095).
--    fn const_as_cmp_imm12(c: &IrConst, ty: IrType) -> Option<u64> {
-+    /// CMP immediate in one of the two AArch64 encodable forms:
-+    /// `#imm12` (0..=4095) or `#imm12, LSL #12` (nonzero multiples of
-+    /// 4096 up to 0xFFF000). Returns (imm12, shift). The shifted form
-+    /// kills a movz/movk materialisation + register compare for the
-+    /// page-aligned constant family (4096, 65536, 0x1000*k).
-+    fn const_as_cmp_imm12(c: &IrConst, ty: IrType) -> Option<(u64, u32)> {
-         let value = Self::normalized_cmp_const(c, ty)?;
--        (value <= 4095).then_some(value)
-+        if value <= 4095 {
-+            return Some((value, 0));
-+        }
-+        if value <= 0xFFF000 && value & 0xFFF == 0 {
-+            return Some((value >> 12, 12));
-+        }
-+        None
-     }
- 
-     /// Check whether CMN with an imm12 is bit-exact at the actual machine
-     /// compare width. Testing the full-width two's-complement relation avoids
-     /// treating a narrow unsigned 0xfffe as 32-bit -2.
--    fn const_as_cmn_imm12(c: &IrConst, ty: IrType) -> Option<u64> {
-+    fn const_as_cmn_imm12(c: &IrConst, ty: IrType) -> Option<(u64, u32)> {
-         let value = Self::normalized_cmp_const(c, ty)?;
-         let negated = if ty.size() <= 4 {
-             (value as u32).wrapping_neg() as u64
-         } else {
-             value.wrapping_neg()
-         };
--        (1..=4095).contains(&negated).then_some(negated)
-+        if (1..=4095).contains(&negated) {
-+            return Some((negated, 0));
-+        }
-+        if negated != 0 && negated <= 0xFFF000 && negated & 0xFFF == 0 {
-+            return Some((negated >> 12, 12));
-+        }
-+        None
-     }
- 
-     /// Get the register name for a Value if it has a register assignment.
-@@ -838,15 +855,17 @@ impl ArmCodegen {
- 
-                 // cmp reg, #imm12
-                 if let Operand::Const(c) = rhs {
--                    if let Some(imm) = Self::const_as_cmp_imm12(c, ty) {
-+                    if let Some((imm, sh)) = Self::const_as_cmp_imm12(c, ty) {
-+                        let suffix = if sh == 12 { ", lsl #12" } else { "" };
-                         self.state
--                            .emit_fmt(format_args!("    cmp {}, #{}", lhs_reg, imm));
-+                            .emit_fmt(format_args!("    cmp {}, #{}{}", lhs_reg, imm, suffix));
-                         return;
-                     }
-                     // cmn reg, #imm12 (for negative constants)
--                    if let Some(imm) = Self::const_as_cmn_imm12(c, ty) {
-+                    if let Some((imm, sh)) = Self::const_as_cmn_imm12(c, ty) {
-+                        let suffix = if sh == 12 { ", lsl #12" } else { "" };
-                         self.state
--                            .emit_fmt(format_args!("    cmn {}, #{}", lhs_reg, imm));
-+                            .emit_fmt(format_args!("    cmn {}, #{}{}", lhs_reg, imm, suffix));
-                         return;
-                     }
-                 }
-@@ -896,21 +915,27 @@ impl ArmCodegen {
- 
-         // Try: lhs in x0 (accumulator), rhs is immediate
-         if let Operand::Const(c) = rhs {
--            if let Some(imm) = Self::const_as_cmp_imm12(c, ty) {
-+            if let Some((imm, sh)) = Self::const_as_cmp_imm12(c, ty) {
-+                let suffix = if sh == 12 { ", lsl #12" } else { "" };
-                 self.operand_to_x0(lhs);
-                 if use_32bit {
--                    self.state.emit_fmt(format_args!("    cmp w0, #{}", imm));
-+                    self.state
-+                        .emit_fmt(format_args!("    cmp w0, #{}{}", imm, suffix));
-                 } else {
--                    self.state.emit_fmt(format_args!("    cmp x0, #{}", imm));
-+                    self.state
-+                        .emit_fmt(format_args!("    cmp x0, #{}{}", imm, suffix));
-                 }
-                 return;
-             }
--            if let Some(imm) = Self::const_as_cmn_imm12(c, ty) {
-+            if let Some((imm, sh)) = Self::const_as_cmn_imm12(c, ty) {
-+                let suffix = if sh == 12 { ", lsl #12" } else { "" };
-                 self.operand_to_x0(lhs);
-                 if use_32bit {
--                    self.state.emit_fmt(format_args!("    cmn w0, #{}", imm));
-+                    self.state
-+                        .emit_fmt(format_args!("    cmn w0, #{}{}", imm, suffix));
-                 } else {
--                    self.state.emit_fmt(format_args!("    cmn x0, #{}", imm));
-+                    self.state
-+                        .emit_fmt(format_args!("    cmn x0, #{}{}", imm, suffix));
-                 }
-                 return;
-             }
-@@ -3250,7 +3275,7 @@ mod compare_immediate_tests {
-         );
-         assert_eq!(
-             ArmCodegen::const_as_cmp_imm12(&IrConst::I8(-2), IrType::U8),
--            Some(254)
-+            Some((254, 0))
-         );
-     }
- 
-@@ -3262,15 +3287,15 @@ mod compare_immediate_tests {
-         );
-         assert_eq!(
-             ArmCodegen::const_as_cmn_imm12(&IrConst::I16(-2), IrType::I16),
--            Some(2)
-+            Some((2, 0))
-         );
-         assert_eq!(
-             ArmCodegen::const_as_cmn_imm12(&IrConst::I32(-2), IrType::U32),
--            Some(2)
-+            Some((2, 0))
-         );
-         assert_eq!(
-             ArmCodegen::const_as_cmn_imm12(&IrConst::I64(-2), IrType::U64),
--            Some(2)
-+            Some((2, 0))
-         );
-     }
- }
--- 
-2.47.3
-
-
-From 28588f71417b4244d2f9fb922e934fa92639fb12 Mon Sep 17 00:00:00 2001
-From: lccc-agent <agent@lccc.local>
-Date: Sat, 29 Aug 2026 13:40:21 +0000
-Subject: [PATCH 5/5] aarch64_execute_suite: demote non-2.47 gas to a warning
-
-Debian 13 ships GNU as 2.44. The corpus run that validated the
-lsl #12 compare-immediate change (1649/25/2, fail set identical to
-baseline) assembled and executed with 2.44, so keep 2.47 as the
-reference version but no longer hard-fail on older toolchains.
----
- scripts/aarch64_execute_suite.py | 8 +++++++-
- 1 file changed, 7 insertions(+), 1 deletion(-)
-
-diff --git a/scripts/aarch64_execute_suite.py b/scripts/aarch64_execute_suite.py
-index 5838dbde..380dcd92 100644
---- a/scripts/aarch64_execute_suite.py
-+++ b/scripts/aarch64_execute_suite.py
-@@ -226,8 +226,14 @@ def parse_args() -> argparse.Namespace:
- def main() -> int:
-     args = parse_args()
-     assembler_version = tool_version([str(args.assembler), "--version"])
-+    if "GNU assembler" not in assembler_version:
-+        raise SystemExit(f"error: --assembler must be GNU as, got: {assembler_version}")
-     if "2.47" not in assembler_version:
--        raise SystemExit(f"error: --assembler must be GNU as 2.47, got: {assembler_version}")
-+        # The reference environment pins GNU as 2.47; older assemblers still
-+        # encode everything lccc emits (validated against the full
-+        # gcc.c-torture/execute corpus with gas 2.44), so this is advisory.
-+        print(f"warning: --assembler validated against GNU as 2.47, got: {assembler_version}")
-+
-     tools = Toolchain(
-         corpus_root=args.corpus.resolve(),
-         lccc=args.lccc.resolve(),
--- 
-2.47.3
-
