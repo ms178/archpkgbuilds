@@ -1,208 +1,546 @@
-diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
-index 319b2f6..e2c2f90 100644
---- a/src/driver/pipeline.rs
-+++ b/src/driver/pipeline.rs
-@@ -1962,6 +1962,27 @@ impl Driver {
-         // in the current iteration of a loop). Stack size reduction is handled
-         // by copy coalescing in codegen instead.
- 
-+        // Backend IR-integrity gate (runs at EVERY opt level): no block may
-+        // reach codegen without a predecessor path from the entry block.
-+        // A nested short-circuit fold inside the frontend's recursive
-+        // lower_condition_branch (fold_comparison_pair: `(x==0)||(x!=0)`
-+        // -> true) terminates the current block with an unconditional
-+        // branch while the outer `||` arm's rhs_label block has already
-+        // been created and is lowered into afterwards. The stranded block
-+        // is unreachable and its operands may reference values whose
-+        // definitions were removed together with the folded branch
-+        // (gcc.c-torture 20000314-1 at -O0: the `*(char *) winds` arm kept
-+        // a Load whose pointer value lost its def; the x86 backend's
-+        // session-26 hard gate — correctly — refuses to materialise a
-+        // value with no home and the compile ICE'd). -O0 skips the pass
-+        // pipeline entirely, so cfg_simplify's copy of this logic never
-+        // ran there; late -O1+ transforms (bool_thread, phi elimination)
-+        // can in principle strand blocks after the last simplify_cfg
-+        // round, so the gate runs unconditionally right before codegen.
-+        // Unreachable code has no observable semantics — removal is
-+        // always sound and touches no reachable instruction.
-+        crate::passes::cfg_simplify::for_each_function_eliminate_unreachable(&mut module);
+diff --git a/engineering/FOLLOWUP-2026-08-29-sticky-sse-holes.md b/engineering/FOLLOWUP-2026-08-29-sticky-sse-holes.md
+new file mode 100644
+index 0000000..1bb15d3
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-08-29-sticky-sse-holes.md
+@@ -0,0 +1,57 @@
++# Follow-up — 2026-08-29: sticky `-mno-sse` holes after #296
 +
-         // Generate assembly using target-specific codegen
-         let t8 = std::time::Instant::now();
-         let opts = crate::backend::CodegenOptions {
-diff --git a/src/passes/cfg_simplify.rs b/src/passes/cfg_simplify.rs
-index b0116c0..8cd5328 100644
---- a/src/passes/cfg_simplify.rs
-+++ b/src/passes/cfg_simplify.rs
-@@ -38,6 +38,13 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
-     simplify_cfg(func)
- }
++**Base.** `ms178/lccc` main `b416d21` (#299). Sticky `-mno-sse` vs
++`-march=native` is already in #296 (`6f668f0`).
++
++## Holes
++
++1. **CPU profiles still set AVX bits.** `enable_x86_avx*_profile` only
++   skipped `no_sse = false` when `sse_explicitly_disabled`.
++   `-mno-sse -march=haswell` therefore still set `enable_avx2`.
++2. **64-byte memcpy YMM path.** `emit_memcpy_impl_impl` selected
++   `vmovdqu` on `avx2_enabled` without `!no_sse`. Combined with (1),
++   `-mno-sse -march=haswell` could emit YMM while CR4.OSFXSR=0.
++3. **Explicit `-mavx` after `-mno-sse`.** GCC last-ISA-flag wins; we
++   now clear the sticky latch on `-mavx`/`-mavx2` (same as `-msse`).
++4. **`-mgeneral-regs-only`.** Now latches sticky `-mno-sse` (kernel
++   decompressor / realmode also pass this).
++
++Integer BMI/LZCNT/MOVBE from v3 profiles remain enabled under
++`-mno-sse` (not SSE).
++
++## Tests
++
++- `mno_sse_survives_march_haswell_without_avx`
++- `mavx_reenable_after_mno_sse`
++- `tests/regression/mno_sse_memcpy64.c` (freestanding `-mno-sse
++  -march=haswell` must not emit xmm/ymm)
++
++## QEMU path
++
++`scripts/build_kernel_compressed.sh` wraps intact
++`kernel-work/intact/vmlinux` with LCCC compressed objects + lccc-ld.
++Do **not** `make bzImage` as a file target. Piggy is `zstd -6 --ultra`
+++ 4-byte LE size. SIMD audit of `compressed/vmlinux` must show no
++xmm/ymm.
++
++`build_kernel_boot.sh` must pass `-DSVGA_MODE=NORMAL_VGA` when assembling
++`header.S` (kbuild does). Without it `vid_mode` is ASK_VGA and setup
++blocks 30s on a VGA prompt (`Press <ENTER> to see video modes`).
++
++## QEMU result (this session)
++
++Sticky-SSE holes are **not** the remaining ZSTD abort.
++
++| wrap | QMP after ~8s |
++|---|---|
++| lccc `misc.o` -O2 / -O1 / -O0 | CS64 RIP ~`0x221xxxx` `hlt; jmp $-1`, RBX → `"ZSTD-compressed data is corrupt"` |
++| **gcc** `misc.o` -O2, **all other objects lccc**, lccc-ld | RIP `ffffffff81efa85e` (uncompressed kernel VA). Decompress **succeeded**. |
++
++Piggy is intact (`28 b5 2f fd`, `input_len=4127535`, `output_len=18638776`).
++Userspace `zstd_preboot_oracle.sh` of a **decompress-only** TU still MATCHES;
++the failing TU is full `misc.c` (extract_kernel + STATIC `__decompress`).
++`-O0` still fails (undefined `accept_memory` stubbed), so this is **lowering /
++codegen**, not `simplify`/`gvn`/`vectorize`.
++
++Do not relink intact `vmlinux`. Next: O0 codegen of `decompress_kernel` /
++`__decompress` in `misc.c` vs gcc (same flags, lccc-ld).
+diff --git a/scripts/build_kernel_boot.sh b/scripts/build_kernel_boot.sh
+index 6101ac8..400fd05 100755
+--- a/scripts/build_kernel_boot.sh
++++ b/scripts/build_kernel_boot.sh
+@@ -28,7 +28,7 @@ OUT=${OUT:-/tmp/bootbuild}
  
-+/// Module-level entry for the driver's pre-codegen integrity gate: strips
-+/// unreachable blocks from every defined function. See
-+/// `eliminate_unreachable_blocks` for the full soundness argument.
-+pub(crate) fn for_each_function_eliminate_unreachable(module: &mut crate::ir::module::IrModule) -> usize {
-+    module.for_each_function(eliminate_unreachable_blocks)
+ cd "$K"
+ 
+-RMF="-std=gnu11 -m16 -g -Os -march=i386 -mregparm=3 -fno-strict-aliasing -fomit-frame-pointer -fno-pic -mno-mmx -mno-sse -mpreferred-stack-boundary=2 -ffreestanding -ffunction-sections -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -fno-jump-tables -Wall -Wstrict-prototypes -Wno-address-of-packed-member"
++RMF="-std=gnu11 -m16 -g -Os -march=i386 -mregparm=3 -fno-strict-aliasing -fomit-frame-pointer -fno-pic -mno-mmx -mno-sse -mpreferred-stack-boundary=2 -ffreestanding -ffunction-sections -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -fno-jump-tables -Wall -Wstrict-prototypes -Wno-address-of-packed-member -DSVGA_MODE=NORMAL_VGA"
+ INC="-nostdinc -Iarch/x86/boot -Iarch/x86/include -Iarch/x86/include/generated -Iinclude -Iinclude/generated -Iinclude/uapi -Iarch/x86/include/uapi -Iarch/x86/include/generated/uapi -Iinclude/generated/uapi -include include/linux/compiler-version.h -include include/linux/kconfig.h -include include/linux/compiler_types.h -D__KERNEL__ -D_SETUP -DDISABLE_BRANCH_PROFILING -D__DISABLE_EXPORTS"
+ 
+ mkdir -p "$OUT"
+diff --git a/scripts/build_kernel_compressed.sh b/scripts/build_kernel_compressed.sh
+new file mode 100755
+index 0000000..acd8c45
+--- /dev/null
++++ b/scripts/build_kernel_compressed.sh
+@@ -0,0 +1,235 @@
++#!/usr/bin/env bash
++# ============================================================================
++# build_kernel_compressed.sh — wrap an intact vmlinux in an LCCC-built
++# x86 decompressor + real-mode setup, producing arch/x86/boot/bzImage.
++#
++# NEVER invoke top-level `make bzImage` or a compressed *file* target:
++# those leak KBUILD_CFLAGS (`-mcmodel=kernel -fno-PIE -march=native`) into
++# the PIE decompressor. Compile every compressed TU with the flags from
++# arch/x86/boot/compressed/Makefile:
++#   -O2 -fPIE -mcmodel=small -mno-sse -mno-mmx -ffreestanding
++#
++# Payload: INTACT_VMLINUX (default kernel-work/intact/vmlinux). Do not relink
++# that ELF. Piggy is `zstd -6 --ultra` plus a 4-byte LE uncompressed size.
++#
++# Usage:
++#   KERNEL_DIR=... LCCC=... LCCC_LD=... INTACT_VMLINUX=... \
++#     build_kernel_compressed.sh
++# ============================================================================
++set -euo pipefail
++
++K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.47}
++LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
++LCCC_LD=${LCCC_LD:-/home/user/lccc/target/fastbuild/lccc-ld}
++INTACT=${INTACT_VMLINUX:-/home/user/kernel-work/intact/vmlinux}
++C=$K/arch/x86/boot/compressed
++B=$K/arch/x86/boot
++S=$K/arch/x86/boot/startup
++OUT=${OUT:-/tmp/lccc-compressed}
++
++[[ -d "$K" ]] || { echo "kernel tree missing: $K" >&2; exit 1; }
++[[ -x "$LCCC" ]] || { echo "lccc missing: $LCCC" >&2; exit 1; }
++[[ -x "$LCCC_LD" ]] || { echo "lccc-ld missing: $LCCC_LD" >&2; exit 1; }
++[[ -f "$INTACT" ]] || { echo "intact vmlinux missing: $INTACT" >&2; exit 1; }
++
++mkdir -p "$OUT"
++cd "$K"
++
++# ---- 1. VM config so the stub is EFI/KASLR/SEV-free (QEMU -kernel path) ----
++if [[ ! -f .lccc-vm-config ]]; then
++  echo "config: allnoconfig + kernel-vm.fragment"
++  make ARCH=x86_64 allnoconfig >/dev/null
++  scripts/kconfig/merge_config.sh -m .config \
++    /home/user/lccc/scripts/kernel-vm.fragment >/dev/null
++  make ARCH=x86_64 olddefconfig >/dev/null
++  make ARCH=x86_64 syncconfig >/dev/null
++  # timeconst.h / asm-offsets must match HZ_800 from the fragment.
++  make ARCH=x86_64 HOSTCC=gcc CC=gcc prepare >/dev/null
++  touch .lccc-vm-config
++fi
++grep -q '^CONFIG_KERNEL_ZSTD=y$' .config || {
++  echo "CONFIG_KERNEL_ZSTD is not set" >&2
++  exit 1
 +}
 +
- /// Simplify the CFG of a single function.
- /// Iterates until no more simplifications are possible (fixpoint).
- ///
-@@ -60,7 +67,7 @@ pub(crate) fn simplify_cfg(func: &mut IrFunction) -> usize {
-         changed += fold_constant_switches(func, &label_to_idx);
-         changed += simplify_redundant_cond_branches(func);
-         changed += thread_jump_chains(func, &label_to_idx);
--        changed += remove_dead_blocks(func, &label_to_idx);
-+        changed += eliminate_unreachable_blocks(func);
-         changed += simplify_trivial_phis(func);
-         changed += merge_single_pred_blocks(func);
-         if changed == 0 {
-@@ -775,13 +782,33 @@ fn would_create_phi_conflict(
- // Sub-pass: dead block elimination
- // ---------------------------------------------------------------------------
++# Do not put intact vmlinux at $K/vmlinux — kbuild would treat it as a
++# rebuildable goal. Work from a copy under $OUT.
++cp -f "$INTACT" "$OUT/vmlinux"
++chmod a-w "$OUT/vmlinux" || true
++
++# ---- 2. voffset.h from the intact ELF (misc.o needs VO_* ) -----------------
++sed_voffset='s/^\([0-9a-fA-F]*\) [ABbCDGRSTtVW] \(_text\|__start_rodata\|_sinittext\|__inittext_end\|__bss_start\|_end\)$/#define VO_\2 _AC(0x\1,UL)/p'
++nm "$OUT/vmlinux" | sed -n "$sed_voffset" > "$B/voffset.h"
++echo "voffset.h:"
++cat "$B/voffset.h"
++
++# ---- 3. piggy: vmlinux.bin + zstd -6 --ultra + 4-byte LE size --------------
++echo "OBJCOPY vmlinux.bin"
++objcopy -R .comment -S "$OUT/vmlinux" "$C/vmlinux.bin"
++plain_sz=$(stat -c%s "$C/vmlinux.bin")
++echo "ZSTD vmlinux.bin.zst (${plain_sz} bytes uncompressed)"
++# size_append: 4-byte little-endian uncompressed size of vmlinux.bin.all
++python3 - "$C/vmlinux.bin" "$C/vmlinux.bin.zst" <<'PY'
++import struct, subprocess, sys
++plain, out = sys.argv[1], sys.argv[2]
++raw = subprocess.check_output(["zstd", "-6", "--ultra", "-c", plain])
++size = open(plain, "rb").seek(0, 2)
++open(plain, "rb").seek(0)
++import os
++size = os.path.getsize(plain)
++open(out, "wb").write(raw + struct.pack("<I", size))
++print(f"piggy payload {len(raw)} + 4-byte size {size}")
++PY
++
++if [[ ! -x "$C/mkpiggy" ]]; then
++  gcc -O2 -I"$K/tools/include" "$C/mkpiggy.c" -o "$C/mkpiggy"
++fi
++"$C/mkpiggy" "$C/vmlinux.bin.zst" > "$C/piggy.S"
++echo "MKPIGGY piggy.S"
++
++# ---- 4. flags (compressed/Makefile; -mno-sse last, sticky in lccc) ---------
++INC=(
++  -nostdinc
++  -I"$C" -I"$K/arch/x86/include" -I"$K/arch/x86/include/generated"
++  -I"$K/include" -I"$K/include/generated"
++  -I"$K/arch/x86/include/uapi" -I"$K/arch/x86/include/generated/uapi"
++  -I"$K/include/uapi" -I"$K/include/generated/uapi"
++  -include "$K/include/linux/compiler-version.h"
++  -include "$K/include/linux/kconfig.h"
++  -include "$K/include/linux/compiler_types.h"
++  -include "$K/include/linux/hidden.h"
++)
++CF=(
++  -std=gnu18 -m64 -O2 -fno-strict-aliasing -fPIE -fno-jump-tables
++  -Wundef -DDISABLE_BRANCH_PROFILING -mcmodel=small -mno-red-zone
++  -mno-mmx -ffreestanding -fshort-wchar -fno-stack-protector
++  -Wno-pointer-sign -fno-asynchronous-unwind-tables -D__DISABLE_EXPORTS
++  -D__KERNEL__ -fno-strict-overflow -mno-sse
++)
++cc() { # cc <stem>
++  local s=$1
++  echo "CC   $s.c"
++  "$LCCC" "${INC[@]}" "${CF[@]}" \
++    -DKBUILD_BASENAME="\"$s\"" \
++    -DKBUILD_MODNAME="\"$s\"" \
++    -DKBUILD_MODFILE="\"arch/x86/boot/compressed/$s\"" \
++    -c "$C/$s.c" -o "$C/$s.o"
++}
++as() { # as <stem> [src]
++  local s=$1 src=${2:-$C/$1.S}
++  echo "AS   $(basename "$src")"
++  "$LCCC" "${INC[@]}" "${CF[@]}" -D__ASSEMBLY__ \
++    -c "$src" -o "$C/$s.o"
++}
++
++# ---- 5. startup/lib.a (x86_64 decompressor always pulls this in) -----------
++echo "CC   startup"
++ST_CF=(
++  -std=gnu11 -m64 -Os -fPIC -mcmodel=small -fno-stack-protector
++  -fno-jump-tables -ffreestanding -fno-asynchronous-unwind-tables
++  -D__DISABLE_EXPORTS -DDISABLE_BRANCH_PROFILING -D__NO_FORTIFY -D__KERNEL__
++  -mno-mmx -mno-sse
++)
++st_cc() {
++  local s=$1
++  "$LCCC" "${INC[@]}" "${ST_CF[@]}" \
++    -DKBUILD_BASENAME="\"$s\"" -DKBUILD_MODNAME="\"$s\"" \
++    -c "$S/$s.c" -o "$S/$s.o"
++  objcopy --prefix-symbols=__pi_ "$S/$s.o" "$S/$s.pi.o"
++}
++st_cc gdt_idt
++st_cc map_kernel
++"$LCCC" "${INC[@]}" "${ST_CF[@]}" -D__ASSEMBLY__ -c "$S/la57toggle.S" -o "$S/la57toggle.o"
++rm -f "$S/lib.a"
++ar rcs "$S/lib.a" "$S/gdt_idt.pi.o" "$S/map_kernel.pi.o" "$S/la57toggle.o"
++echo "AR   startup/lib.a"
++
++# ---- 6. compressed objects -------------------------------------------------
++cc misc
++cc string
++cc cmdline
++cc error
++cc cpuflags
++cc ident_map_64
++cc idt_64
++cc pgtable_64
++if grep -q '^CONFIG_EARLY_PRINTK=y$' .config; then
++  cc early_serial_console
++fi
++as head_64
++as idt_handlers_64
++as kernel_info
++as piggy "$C/piggy.S"
++
++# linker script
++echo "CPP  vmlinux.lds"
++# Match scripts/Makefile.build cmd_cpp_lds_S: -P -U$(ARCH) -D__ASSEMBLY__
++# -DLINKER_SCRIPT so ALIGN() stays a linker token, not gas `.balign`.
++gcc -E -P -Ux86_64 -Ux86 -D__ASSEMBLY__ -DLINKER_SCRIPT \
++  -nostdinc \
++  -I"$K/arch/x86/include" -I"$K/arch/x86/include/generated" \
++  -I"$K/include" -I"$K/include/generated" \
++  -I"$K/arch/x86/include/uapi" -I"$K/arch/x86/include/generated/uapi" \
++  -I"$K/include/uapi" -I"$K/include/generated/uapi" \
++  -include "$K/include/linux/kconfig.h" \
++  "$C/vmlinux.lds.S" -o "$C/vmlinux.lds"
++grep -n 'balign' "$C/vmlinux.lds" && {
++  echo "vmlinux.lds still contains .balign — preprocessor flags wrong" >&2
++  exit 1
++}
++
++# ---- 7. link compressed/vmlinux with lccc-ld --------------------------------
++OBJS=(
++  "$C/kernel_info.o" "$C/head_64.o" "$C/misc.o" "$C/string.o"
++  "$C/cmdline.o" "$C/error.o" "$C/piggy.o" "$C/cpuflags.o"
++  "$C/ident_map_64.o" "$C/idt_64.o" "$C/idt_handlers_64.o"
++  "$C/pgtable_64.o"
++)
++grep -q '^CONFIG_EARLY_PRINTK=y$' .config && OBJS+=("$C/early_serial_console.o")
++
++echo "LD   compressed/vmlinux"
++"$LCCC_LD" -m elf_x86_64 --no-ld-generated-unwind-info \
++  -pie --no-dynamic-linker -z noexecstack \
++  -T "$C/vmlinux.lds" "${OBJS[@]}" "$S/lib.a" \
++  -o "$C/vmlinux"
++
++echo "compressed/vmlinux symbols:"
++nm -n "$C/vmlinux" | grep -E ' (startup_64|input_data|_text|_end|z_input_len)$' || true
++# SIMD audit of the decompressor (CR4.OSFXSR=0 until extract_kernel finishes)
++if objdump -d "$C/vmlinux" | grep -E '[[:space:]](v?mov[ua]p[sd]|v?movdqu|v?movaps|addps|mulps|xmm|ymm)' | grep -v 'objdump' | head; then
++  echo "WARNING: SIMD ops in compressed/vmlinux" >&2
++else
++  echo "SIMD audit: no xmm/ymm in compressed/vmlinux"
++fi
++
++# ---- 8. zoffset.h + real-mode setup ----------------------------------------
++sed_zoffset='s/^\([0-9a-fA-F]*\) [a-zA-Z] \(startup_32\|efi.._stub_entry\|efi\(32\)\?_pe_entry\|input_data\|kernel_info\|_end\|_ehead\|_text\|_e\?data\|_e\?sbat\|z_.*\)$/#define ZO_\2 0x\1/p'
++nm "$C/vmlinux" | sed -n "$sed_zoffset" > "$B/zoffset.h"
++echo "zoffset.h:"
++cat "$B/zoffset.h"
++
++echo "setup (build_kernel_boot.sh)"
++OUT="$OUT/setup" /home/user/lccc/scripts/build_kernel_boot.sh
++# header.o was compiled against a stub zoffset in that script if it ran
++# before zoffset existed; recompile header.o with the real one and relink.
++RMF="-std=gnu11 -m16 -g -Os -march=i386 -mregparm=3 -fno-strict-aliasing -fomit-frame-pointer -fno-pic -mno-mmx -mno-sse -mpreferred-stack-boundary=2 -ffreestanding -ffunction-sections -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -fno-jump-tables -DSVGA_MODE=NORMAL_VGA"
++SINC="-nostdinc -I$B -I$K/arch/x86/include -I$K/arch/x86/include/generated -I$K/include -I$K/include/generated -I$K/include/uapi -I$K/arch/x86/include/uapi -I$K/arch/x86/include/generated/uapi -I$K/include/generated/uapi -include $K/include/linux/compiler-version.h -include $K/include/linux/kconfig.h -include $K/include/linux/compiler_types.h -D__KERNEL__ -D_SETUP -DDISABLE_BRANCH_PROFILING -D__DISABLE_EXPORTS"
++echo "CC   header.S (real zoffset.h)"
++"$LCCC" $SINC $RMF -D__ASSEMBLY__ -I"$B" -c "$B/header.S" -o "$OUT/setup/header.o"
++SETUP_LD="$OUT/setup/setup-gc.ld"
++SETUP_OBJS=(a20 bioscall cmdline copy cpu cpuflags cpucheck early_serial_console
++            edd header main memory pm pmjump printf regs string tty video
++            video-mode version video-vga video-vesa video-bios)
++SO=()
++for o in "${SETUP_OBJS[@]}"; do SO+=("$OUT/setup/$o.o"); done
++"$LCCC_LD" --gc-sections -m elf_i386 -z noexecstack -T "$SETUP_LD" \
++  "${SO[@]}" -o "$B/setup.elf"
++objcopy -O binary "$B/setup.elf" "$B/setup.bin"
++objcopy -O binary -R .note -R .comment -S "$C/vmlinux" "$B/vmlinux.bin"
++
++# ---- 9. bzImage = setup.bin (4k padded) + compressed vmlinux.bin -----------
++echo "BUILD bzImage"
++(dd if="$B/setup.bin" bs=4k conv=sync status=none; cat "$B/vmlinux.bin") > "$B/bzImage"
++ls -l "$B/bzImage" "$C/vmlinux" "$B/setup.bin"
++sha256sum "$B/bzImage"
++echo "build_kernel_compressed: SUCCESS"
+diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
+index 316810c..c993660 100644
+--- a/src/backend/x86/codegen/memory.rs
++++ b/src/backend/x86/codegen/memory.rs
+@@ -2559,7 +2559,11 @@ impl X86Codegen {
+         // explicit vzeroupper prevents any later legacy-SSE transition. Smaller
+         // 32/48-byte copies stay XMM (the vzeroupper cost erases their one- or
+         // two-instruction saving in hot struct loops).
+-        if size == 64 && self.avx2_enabled && std::env::var_os("CCC_NO_64B_YMM_COPY").is_none() {
++        if size == 64
++            && self.avx2_enabled
++            && !self.no_sse
++            && std::env::var_os("CCC_NO_64B_YMM_COPY").is_none()
++        {
+             self.state.emit("    vmovdqu (%rsi), %ymm0");
+             self.state.emit("    vmovdqu %ymm0, (%rdi)");
+             self.state.emit("    vmovdqu 32(%rsi), %ymm1");
+diff --git a/src/driver/cli.rs b/src/driver/cli.rs
+index 96926a1..75380e0 100644
+--- a/src/driver/cli.rs
++++ b/src/driver/cli.rs
+@@ -43,9 +43,13 @@ fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
  
--/// Remove blocks that have no predecessors (except the entry block, blocks[0]).
--/// Returns the number of blocks removed.
--fn remove_dead_blocks(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, usize>) -> usize {
-+/// Backend IR-integrity gate: remove every block unreachable from the entry
-+/// block, keeping the roots that carry observable semantics (LabelAddr /
-+/// static-local init labels, asm-goto targets). Runs verbatim at -O1+ as
-+/// part of simplify_cfg and — via the driver's pre-codegen hook — at every
-+/// opt level, so no backend can ever be handed a block without a
-+/// predecessor path from the entry block.
-+///
-+/// Why the -O0 hook exists: -O0 skips the optimizer entirely, but the
-+/// FRONTEND can still strand blocks. A nested short-circuit fold inside a
-+/// recursive `lower_condition_branch` (fold_comparison_pair:
-+/// `(x==0)||(x!=0)` -> true) terminates the current block with an
-+/// unconditional branch while the outer `||` arm's rhs_label block has
-+/// already been created and is lowered into afterwards. The stranded block
-+/// is unreachable, and its operands may reference values whose definitions
-+/// were removed together with the folded branch (gcc.c-torture
-+/// 20000314-1: the `*(char *) winds` arm kept a Load whose pointer value
-+/// lost its def; the x86 backend's session-26 hard gate — correctly —
-+/// refuses to materialise a value with no home and the compile ICEs).
-+/// Unreachable code has no observable semantics, so removing it is always
-+/// sound; reachable code is untouched. Phis and asm-goto label references
-+/// in surviving blocks are cleaned up below.
-+pub(crate) fn eliminate_unreachable_blocks(func: &mut IrFunction) -> usize {
-     if func.blocks.len() <= 1 {
-         return 0;
+ impl Driver {
+     fn enable_x86_avx_profile(&mut self) {
+-        if !self.sse_explicitly_disabled {
+-            self.no_sse = false;
++        // Explicit `-mno-sse` is sticky against `-march=` CPU profiles (GCC).
++        // Do not set AVX/SSE feature bits either: `avx2_enabled` would otherwise
++        // still select `vmovdqu` for 64-byte copies while CR4.OSFXSR=0.
++        if self.sse_explicitly_disabled {
++            return;
+         }
++        self.no_sse = false;
+         self.enable_avx = true;
+         self.enable_sse4_2 = true;
+         self.enable_sse4_1 = true;
+@@ -54,25 +58,38 @@ impl Driver {
      }
- 
-+    let label_to_idx = build_label_to_idx(func);
-     // Compute the set of blocks reachable from the entry block via BFS.
-     let entry = func.blocks[0].label;
-     let mut reachable = FxHashSet::default();
-diff --git a/src/passes/loop_rotate.rs b/src/passes/loop_rotate.rs
-index 189e7d8..5081b86 100644
---- a/src/passes/loop_rotate.rs
-+++ b/src/passes/loop_rotate.rs
-@@ -266,6 +266,25 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
-         closure.iter().map(|&i| header_insts[i].clone()).collect();
-     // (phi_dest, phi_ty, preheader_incoming, latch_incoming)
-     let mut phi_info: Vec<(u32, IrType, (BlockId, Operand), Operand)> = Vec::new();
-+    // v18 Guard C: a header phi may have MULTIPLE non-latch incomings when
-+    // the loop header has several outside predecessors (e.g. two exits of a
-+    // preceding loop both flowing into this loop's header, or a break edge
-+    // and a normal-exit edge merging at the header). The rotation's
-+    // step-6.6 self-loop phi records exactly ONE preheader incoming
-+    // (`(pre_op, pre_label)`), and the step-6/6.5 rewiring moves every
-+    // original header predecessor onto the cloned guard — so after rotation
-+    // the body's real entry edge comes from the GUARD block, while the
-+    // self-loop phi's init incoming still names one of the ORIGINAL
-+    // preheader labels. That label is no longer a predecessor of the phi's
-+    // block: phi elimination then places the init copies on a dead edge,
-+    // the live entry edge carries NO init, and the first iteration reads
-+    // an undefined value (observed: loop_rotate_default_enable.c shape 4 —
-+    // `sum_with_call(50)` accumulated garbage; the miscompile hid for
-+    // months because a fresh stack page made the undefined slot read 0).
-+    // The general fix — routing the init through the guard's own phis —
-+    // is a future enhancement; bailing keeps rotation sound (same policy
-+    // as Guard A/B).
-+    let mut multi_pre_header = false;
-     for inst in header_insts {
-         if let Instruction::Phi {
-             dest,
-@@ -273,15 +292,29 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
-             ty,
-         } = inst
-         {
--            let mut pre = None;
-+            let mut pre: Option<(BlockId, Operand)> = None;
-             let mut lat = None;
-             for (op, lbl) in incoming {
-                 if *lbl == latch_label {
-                     lat = Some(*op);
-+                } else if pre.is_some() && pre.as_ref().unwrap().0 != *lbl {
-+                    // Second DISTINCT outside predecessor: the single-pre
-+                    // self-loop phi shape cannot represent this header.
-+                    multi_pre_header = true;
-+                    break;
-                 } else {
-                     pre = Some((*lbl, *op));
-                 }
-             }
-+            if multi_pre_header {
-+                if debug {
-+                    eprintln!(
-+                        "[ROT] header phi v{} has >1 non-latch incoming — bail (Guard C)",
-+                        dest.0
-+                    );
+     fn enable_x86_avx2_profile(&mut self) {
+         self.enable_x86_avx_profile();
++        if self.sse_explicitly_disabled {
++            return;
++        }
+         self.enable_avx2 = true;
+     }
+     fn enable_x86_v3_profile(&mut self) {
+         self.enable_x86_avx2_profile();
+-        self.enable_f16c = true;
+-        self.enable_fma = true;
++        // BMI/LZCNT/MOVBE are integer ISA and remain legal under `-mno-sse`.
+         self.enable_bmi = true;
+         self.enable_bmi2 = true;
+         self.enable_lzcnt = true;
+         self.enable_movbe = true;
++        if self.sse_explicitly_disabled {
++            return;
++        }
++        self.enable_f16c = true;
++        self.enable_fma = true;
+     }
+     fn enable_x86_haswell_profile(&mut self) {
+         self.enable_x86_v3_profile();
++        if self.sse_explicitly_disabled {
++            return;
++        }
+         self.enable_aes = true;
+         self.enable_pclmul = true;
+         self.enable_rdrnd = true;
+     }
+     fn enable_x86_avx512_profile(&mut self) {
+         self.enable_x86_v3_profile();
++        if self.sse_explicitly_disabled {
++            return;
++        }
+         self.enable_avx512f = true;
+         self.enable_avx512cd = true;
+         self.enable_avx512dq = true;
+@@ -111,6 +128,9 @@ impl Driver {
+     }
+     fn enable_x86_knl_profile(&mut self) {
+         self.enable_x86_v3_profile();
++        if self.sse_explicitly_disabled {
++            return;
++        }
+         self.enable_pclmul = true;
+         self.enable_rdrnd = true;
+         self.enable_avx512f = true;
+@@ -120,6 +140,9 @@ impl Driver {
+     }
+     fn enable_x86_znver3_profile(&mut self) {
+         self.enable_x86_haswell_profile();
++        if self.sse_explicitly_disabled {
++            return;
++        }
+         self.enable_vaes = true;
+         self.enable_vpclmulqdq = true;
+     }
+@@ -133,9 +156,10 @@ impl Driver {
+         self.enable_avx512vp2intersect = true;
+     }
+     fn enable_x86_nehalem_profile(&mut self) {
+-        if !self.sse_explicitly_disabled {
+-            self.no_sse = false;
++        if self.sse_explicitly_disabled {
++            return;
+         }
++        self.no_sse = false;
+         self.enable_sse3 = true;
+         self.enable_ssse3 = true;
+         self.enable_sse4_1 = true;
+@@ -167,6 +191,9 @@ impl Driver {
+     }
+     fn enable_x86_alderlake_profile(&mut self) {
+         self.enable_x86_haswell_profile();
++        if self.sse_explicitly_disabled {
++            return;
++        }
+         self.enable_avxvnni = true;
+         self.enable_gfni = true;
+         self.enable_vaes = true;
+@@ -1068,8 +1095,15 @@ impl Driver {
+                 "-mxsave" | "-mxsaveopt" | "-mxsavec" | "-mno-xsave" | "-mno-xsaveopt"
+                 | "-mno-xsavec" => {}
+                 "-mno-vpclmulqdq" => self.enable_vpclmulqdq = false,
+-                "-mavx2" => self.enable_x86_avx2_profile(),
++                "-mavx2" => {
++                    // Explicit ISA enable wins over a prior `-mno-sse` (GCC).
++                    self.no_sse = false;
++                    self.sse_explicitly_disabled = false;
++                    self.enable_x86_avx2_profile();
 +                }
-+                return false;
-+            }
-             if let (Some(pre), Some(lat)) = (pre, lat) {
-                 phi_info.push((dest.0, *ty, pre, lat));
-             }
-diff --git a/tests/regression/sc_nested_fold_unreachable.c b/tests/regression/sc_nested_fold_unreachable.c
+                 "-mavx" => {
++                    self.no_sse = false;
++                    self.sse_explicitly_disabled = false;
+                     self.enable_avx = true;
+                     self.enable_sse4_2 = true;
+                     self.enable_sse4_1 = true;
+@@ -1103,7 +1137,17 @@ impl Driver {
+                     self.sse_explicitly_disabled = false;
+                 }
+                 "-m3dnow" => return Err("3DNow! is unsupported".to_string()),
+-                "-mgeneral-regs-only" => self.general_regs_only = true,
++                "-mgeneral-regs-only" => {
++                    self.general_regs_only = true;
++                    self.no_sse = true;
++                    self.sse_explicitly_disabled = true;
++                    self.enable_sse3 = false;
++                    self.enable_ssse3 = false;
++                    self.enable_sse4_1 = false;
++                    self.enable_sse4_2 = false;
++                    self.enable_avx = false;
++                    self.enable_avx2 = false;
++                }
+                 "-mcmodel=kernel" => self.code_model_kernel = true,
+                 "-mcmodel=small" | "-mcmodel=medlow" | "-mcmodel=medium" | "-mcmodel=medany"
+                 | "-mcmodel=large" => {
+@@ -2136,4 +2180,32 @@ mod cli_tests {
+         d2.parse_cli_args(&args2).ok();
+         assert!(d2.linker_ordered_items.iter().any(|i| i == "-Wl,-e,main"));
+     }
++
++    /// `-mno-sse -march=haswell` must not set AVX2: the 64-byte memcpy path
++    /// keys off `avx2_enabled` and would otherwise emit `vmovdqu`.
++    #[test]
++    fn mno_sse_survives_march_haswell_without_avx() {
++        let mut d = Driver::new();
++        let args: Vec<String> = ["ccc", "-mno-sse", "-march=haswell", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d.parse_cli_args(&args).is_ok());
++        assert!(d.no_sse);
++        assert!(!d.enable_avx);
++        assert!(!d.enable_avx2);
++        assert!(d.enable_bmi, "integer BMI remains legal under -mno-sse");
++    }
++
++    #[test]
++    fn mavx_reenable_after_mno_sse() {
++        let mut d = Driver::new();
++        let args: Vec<String> = ["ccc", "-mno-sse", "-mavx", "x.c"]
++            .iter()
++            .map(|s| s.to_string())
++            .collect();
++        assert!(d.parse_cli_args(&args).is_ok());
++        assert!(!d.no_sse);
++        assert!(d.enable_avx);
++    }
+ }
+diff --git a/tests/regression/mno_sse_memcpy64.c b/tests/regression/mno_sse_memcpy64.c
 new file mode 100644
-index 0000000..1296666
+index 0000000..20504f0
 --- /dev/null
-+++ b/tests/regression/sc_nested_fold_unreachable.c
-@@ -0,0 +1,37 @@
-+/*
-+ * Regression pin: nested short-circuit fold must not strand blocks.
-+ *
-+ * Derived from gcc.c-torture/execute/20000314-1.c. The frontend's
-+ * fold_comparison_pair ((x==0)||(x!=0) -> true) fires inside the recursive
-+ * lower_condition_branch of the OUTER `||`, which has already created and
-+ * lowered into its rhs_label block. The stranded block referenced a value
-+ * (the `winds` pointer load) whose definition was removed together with the
-+ * folded branch. At -O0 no cfg cleanup ran, the block reached the x86
-+ * backend, and the session-26 hard gate (correctly refusing to fabricate a
-+ * home-less operand) ICE'd the compile. The driver now strips unreachable
-+ * blocks before codegen at every opt level.
-+ *
-+ * Contract:
-+ *   1. compiles at -O0/-O1/-O2 on both backends (no ICE),
-+ *   2. `winds` stays a real runtime variable (while-loop shape preserved),
-+ *   3. the tautology `(winds==0)||(winds!=0)` short-circuits the dangerous
-+ *      `*(char *) winds` dereference, so the program exits 0, never aborts.
-+ */
-+void exit(int);
-+void abort(void);
++++ b/tests/regression/mno_sse_memcpy64.c
+@@ -0,0 +1,26 @@
++/* 64-byte memcpy under `-mno-sse -march=haswell` must not use ymm/xmm.
++ * The 64-byte YMM fast path keys off avx2_enabled; sticky -mno-sse must
++ * keep that path closed (CR4.OSFXSR=0 in the kernel decompressor). */
++#include <stdio.h>
++#include <stdint.h>
++#include <string.h>
++
++__attribute__((noinline)) void copy64(void *d, const void *s)
++{
++	__builtin_memcpy(d, s, 64);
++}
 +
 +int main(void)
 +{
-+  long winds = 0;
-+
-+  while (winds != 0)
-+    {
-+      if (*(char *) winds)
-+	break;
-+    }
-+
-+  if (winds == 0 || winds != 0 || *(char *) winds)
-+    exit (0);
-+
-+  abort ();
++	uint8_t src[64], dst[64];
++	for (int i = 0; i < 64; i++)
++		src[i] = (uint8_t)(0x40 + i);
++	memset(dst, 0xA5, 64);
++	copy64(dst, src);
++	if (memcmp(dst, src, 64) != 0) {
++		printf("FAIL\n");
++		return 1;
++	}
++	printf("OK mno_sse_memcpy64\n");
++	return 0;
 +}
-diff --git a/tests/regression/sc_nested_fold_unreachable.flags b/tests/regression/sc_nested_fold_unreachable.flags
+diff --git a/tests/regression/mno_sse_memcpy64.flags b/tests/regression/mno_sse_memcpy64.flags
 new file mode 100644
-index 0000000..b13fc40
+index 0000000..d59f013
 --- /dev/null
-+++ b/tests/regression/sc_nested_fold_unreachable.flags
-@@ -0,0 +1,2 @@
-+-O0
-+-O2
++++ b/tests/regression/mno_sse_memcpy64.flags
+@@ -0,0 +1 @@
++-mno-sse -march=haswell
