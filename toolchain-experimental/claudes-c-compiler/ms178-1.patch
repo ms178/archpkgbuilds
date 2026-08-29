@@ -1,566 +1,746 @@
-diff --git a/engineering/FOLLOWUP-2026-08-29-early-idt-fill.md b/engineering/FOLLOWUP-2026-08-29-early-idt-fill.md
-new file mode 100644
-index 0000000..29b6561
---- /dev/null
-+++ b/engineering/FOLLOWUP-2026-08-29-early-idt-fill.md
-@@ -0,0 +1,45 @@
-+# Follow-up — 2026-08-29: early IDT stub `.fill` over-pad
-+
-+**Symptom.** 64-bit kernel reached long mode then halted in
-+`early_fixup_exception` → `pv_ops` `native_halt`. pt_regs.ip was
-+`ffffffff83903aa7`, the `endbr64` of the #GP stub. IDT[n] is
-+`early_idt_handler_array + n * EARLY_IDT_HANDLER_SIZE` (13 with IBT).
-+
-+**Not this bug.** CPUID/FPU userspace is fine. Do not “fix”
-+`.Lcommon_startup_64` (the quad at `ffffffff83a449c8` is
-+`common_startup_64`). Do not pass `earlyprintk=` on this bzImage
-+(16-bit `early_serial_init` livelocks). Do not re-land `-u`.
-+
-+**Root cause.** `arch/x86/kernel/head_64.S`:
-+
-+```
-+.fill early_idt_handler_array + i*EARLY_IDT_HANDLER_SIZE - ., 1, 0xcc
-+```
-+
-+after each stub (`i = i + 1` inside `.rept`). The assembler lowered
-+that to a deferred `SkipExpr`. Jump relaxation first *speculatively
-+shortens* every `jmp early_idt_handler_common` (even ones that cannot
-+fit in rel8), then sizes the skip against the short layout, then grows
-+the jmps back to rel32. Extra `0xcc` bytes stay behind.
-+
-+Hex dump of vmlinux:
-+
-+- vec0–7: 13-byte body, no extra fill
-+- vec8 (errcode): 11-byte body + 2×cc = 13
-+- **vec9 (no err): 13-byte body + 2×cc = 15** ← first overflow
-+- later slots accumulate more `cc`
-+
-+From vector 9 the IDT slots no longer land on stub entry points; #GP
-+hits padding / mid-instruction.
-+
-+**Fix.** `LABEL + N - .` (named label, not numeric `0b`) is a
-+location-counter *target*. Lower it to `.org LABEL+N` with the fill
-+byte, and restretch org padding after jump relaxation. Org padding
-+must keep the fill byte (0xcc), not multi-byte NOPs.
-+
-+**Regression.** `early_idt_handler_fill_slots_are_exact` and
-+`parse_org_style_skip_recognizes_named_label_dot_diff` in
-+`elf_writer_common.rs`.
-+
-+**Also in this patch.** i386 `-T` archive load now seeds `-u` the same
-+way as x86-64 (`script_undefined_pulls_archive_i386`).
-diff --git a/src/backend/elf_writer_common.rs b/src/backend/elf_writer_common.rs
-index c18d550..1968b63 100644
---- a/src/backend/elf_writer_common.rs
-+++ b/src/backend/elf_writer_common.rs
-@@ -19,10 +19,8 @@
- use crate::backend::elf::{
-     self as elf_mod, parse_section_flags, resolve_numeric_labels, ElfConfig, ObjReloc, ObjSection,
-     ObjSymbol, SymbolTableInput, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS,
--    STB_GLOBAL,
--    STB_LOCAL,
--    STB_WEAK, STT_FUNC, STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_TLS, STV_DEFAULT, STV_HIDDEN,
--    STV_INTERNAL, STV_PROTECTED,
-+    STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FUNC, STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_TLS,
-+    STV_DEFAULT, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED,
- };
- use crate::backend::x86::assembler::parser::*;
- use crate::common::fx_hash::FxHashMap;
-@@ -229,8 +227,17 @@ struct AlignMarker {
- enum AlignMarkerKind {
-     /// .balign N — pad to N-byte boundary.
-     Align(u32),
--    /// .org label + offset — advance to a fixed position.
--    Org { label: String, addend: i64 },
-+    /// .org label + offset — advance to a fixed position, filling with `fill`.
-+    ///
-+    /// `fill` is load-bearing: GAS pads `.org` with its fill byte (default 0)
-+    /// even in an executable section. Regenerating the run with multi-byte
-+    /// NOPs would change the bytes the kernel's IDT stub `.fill …, 1, 0xcc`
-+    /// (lowered to `.org`) depends on.
-+    Org {
-+        label: String,
-+        addend: i64,
-+        fill: u8,
-+    },
- }
- 
- /// A pending `(a - b) * scale + addend` datum, folded once both labels are
-@@ -387,6 +394,67 @@ pub(crate) fn exec_padding(count: usize, after_insn: bool) -> Vec<u8> {
-     out
- }
- 
-+/// `.fill LABEL + N - ., 1, FILL` (and the equivalent `.skip`) is a
-+/// location-counter *target*, not a one-shot gap.
-+///
-+/// Jump relaxation changes instruction sizes after a deferred skip is
-+/// first measured. Sizing `LABEL + N - .` against the pre-growth layout
-+/// leaves extra fill bytes once a nearby `jmp` grows from rel8 back to
-+/// rel32 — observed as Linux `early_idt_handler_array` slots overflowing
-+/// `EARLY_IDT_HANDLER_SIZE` (13 with IBT) from vector 9 onwards, so the
-+/// IDT entry for #GP pointed into `int3` padding and the kernel halted
-+/// in `early_fixup_exception`.
-+///
-+/// Lowering the shape to `.org LABEL+N` reuses the post-relaxation org
-+/// fixup, matching GAS. Numeric local labels (`0b + 16 - .`, the
-+/// ALTERNATIVE pad) stay on the deferred-skip path: their skip/relax
-+/// order is already tuned and they are not named-symbol targets.
-+pub(crate) fn parse_org_style_skip(expr: &str) -> Option<(String, i64)> {
-+    let s = expr.trim();
-+    let without_dot = {
-+        let t = s.trim_end();
-+        if let Some(rest) = t.strip_suffix("-.") {
-+            rest
-+        } else if let Some(rest) = t.strip_suffix('.') {
-+            let rest = rest.trim_end();
-+            rest.strip_suffix('-')?
-+        } else {
-+            return None;
-+        }
-+    };
-+    let without_dot = without_dot.trim();
-+    if without_dot.is_empty() {
-+        return None;
-+    }
-+    let bytes = without_dot.as_bytes();
-+    // Numeric local labels (`0b`, `1f`) keep the deferred-skip path.
-+    if bytes[0].is_ascii_digit() {
-+        return None;
-+    }
-+    if !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_' || bytes[0] == b'.') {
-+        return None;
-+    }
-+    let mut i = 1;
-+    while i < bytes.len()
-+        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.')
-+    {
-+        i += 1;
-+    }
-+    let ident = &without_dot[..i];
-+    let rest = without_dot[i..].trim();
-+    if rest.is_empty() {
-+        return Some((ident.to_string(), 0));
-+    }
-+    if !(rest.starts_with('+') || rest.starts_with('-')) {
-+        return None;
-+    }
-+    if rest.bytes().any(|b| b.is_ascii_alphabetic() || b == b'_') {
-+        return None;
-+    }
-+    let addend = crate::backend::asm_expr::parse_integer_expr(rest).ok()?;
-+    Some((ident.to_string(), addend))
+diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
+index ebf1903d..7ec7fcd5 100644
+--- a/src/backend/x86/codegen/peephole/passes/mod.rs
++++ b/src/backend/x86/codegen/peephole/passes/mod.rs
+@@ -296,6 +296,13 @@ fn pin_address_taken_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
+ ///    the functionality of local store-load forwarding across wider windows.
+ /// 3. Run local passes one more time to clean up opportunities exposed by the
+ ///    global passes (max `MAX_POST_GLOBAL_ITERATIONS` iterations).
++/// Cheap line estimate: count newline bytes (no allocation, no splitting).
++/// Used by the size-adaptive peephole gate; for LF-terminated text the
++/// newline count equals the line count, and the gate only needs a bound.
++fn line_count_estimate(asm: &str) -> usize {
++    asm.as_bytes().iter().filter(|&&b| b == b'\n').count()
 +}
 +
- /// Parse a `.skip`/`.space` size that is a self-contained constant.
- ///
- /// Returns `None` for anything referencing a symbol, so genuinely
-@@ -787,12 +855,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                 // is always PROGBITS). For custom sections the type change is
-                 // an error — mixing e.g. @nobits and @progbits content in one
-                 // section would silently drop one of them.
--                if let Some(well_known) =
--                    crate::backend::elf::well_known_section_type(name)
--                {
-+                if let Some(well_known) = crate::backend::elf::well_known_section_type(name) {
-                     eprintln!(
-                         "warning: ignoring incorrect section type for {name} (@{} requested)",
--                        if well_known == SHT_NOBITS { "nobits" } else { "progbits" }
-+                        if well_known == SHT_NOBITS {
-+                            "nobits"
-+                        } else {
-+                            "progbits"
-+                        }
-                     );
-                     return Ok(idx);
-                 }
-@@ -1025,6 +1095,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                     if let Some(n) = parse_const_skip(expr) {
-                         let section = self.current_section_mut()?;
-                         section.data.extend(std::iter::repeat_n(*fill, n));
-+                    } else if let Some((sym, addend)) = parse_org_style_skip(expr) {
-+                        // `LABEL + N - .` is a location-counter target. Emit
-+                        // it as `.org` so jump relaxation can restretch the
-+                        // padding (early_idt_handler_array).
-+                        self.process_org(&sym, addend, *fill)?;
-                     } else {
-                         let offset = self.sections[sec_idx].data.len();
-                         // Remember which labels are already parked at this
-@@ -1138,7 +1213,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                         // build() after all items are parsed).
-                         self.symver_refs.insert(name.clone(), ver_string.clone());
-                         if let Some(f) = flag {
--                            self.symver_flags.insert(name.clone(), (ver_string.clone(), *f));
-+                            self.symver_flags
-+                                .insert(name.clone(), (ver_string.clone(), *f));
-                         }
-                     }
-                 }
-@@ -1230,6 +1306,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                 kind: AlignMarkerKind::Org {
-                     label: sym.to_string(),
-                     addend: offset,
-+                    fill,
-                 },
-                 after_insn,
-             });
-@@ -1249,12 +1326,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
- 
-     fn ensure_section(&mut self) -> Result<(), String> {
-         if self.current_section.is_none() {
--            let idx = self.get_or_create_section(
--                ".text",
--                SHT_PROGBITS,
--                SHF_ALLOC | SHF_EXECINSTR,
--                None,
--            )?;
-+            let idx =
-+                self.get_or_create_section(".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, None)?;
-             self.current_section = Some(idx);
-         }
-         Ok(())
-@@ -1625,9 +1698,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                 eprintln!("[C16] dispatch code16 for {}", instr.mnemonic);
-             }
-             A::encode_instruction_code16(instr, base_offset)?
--        } else if (self.code_mode == 16 || self.code_mode == 17)
--            && A::default_code_mode() == 64
--        {
-+        } else if (self.code_mode == 16 || self.code_mode == 17) && A::default_code_mode() == 64 {
-             // .code16/.code16gcc inside a 64-bit TU: real-mode code must be
-             // assembled via the -m16 (i686) path where operand-size
-             // semantics are modeled. Encoding it with the 64-bit encoder
-@@ -3061,7 +3132,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                     }
-                     (current_offset + a - 1) & !(a - 1)
-                 }
--                AlignMarkerKind::Org { label, addend } => {
-+                AlignMarkerKind::Org {
-+                    label,
-+                    addend,
-+                    fill: _,
-+                } => {
-                     if label.is_empty() {
-                         *addend as usize
-                     } else if let Some(&(l_sec, l_off)) = self.label_positions.get(label.as_str()) {
-@@ -3091,7 +3166,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
-                 let start = current_offset;
-                 let old_end = start + existing_padding;
-                 let after_insn = self.sections[sec_idx].align_markers[marker_idx].after_insn;
--                let new_bytes = section_padding(needed_padding, is_exec, after_insn);
-+                // `.org` / org-style `.fill LABEL+N-.` pad with the fill
-+                // byte, not multi-byte NOPs, even in an executable section.
-+                let new_bytes = match &kind {
-+                    AlignMarkerKind::Org { fill, .. } => vec![*fill; needed_padding],
-+                    AlignMarkerKind::Align(_) => {
-+                        section_padding(needed_padding, is_exec, after_insn)
-+                    }
-+                };
-                 debug_assert_eq!(new_bytes.len(), needed_padding);
-                 if old_end <= self.sections[sec_idx].data.len() {
-                     self.sections[sec_idx]
-@@ -3523,7 +3605,8 @@ mod tests {
-         let shstr = {
-             let shstr_idx = u16::from_le_bytes(obj[62..64].try_into().unwrap()) as usize;
-             let off = e_shoff + shstr_idx * e_shentsize;
--            let sh_offset = u64::from_le_bytes(obj[off + 24..off + 32].try_into().unwrap()) as usize;
-+            let sh_offset =
-+                u64::from_le_bytes(obj[off + 24..off + 32].try_into().unwrap()) as usize;
-             let sh_size = u64::from_le_bytes(obj[off + 32..off + 40].try_into().unwrap()) as usize;
-             &obj[sh_offset..sh_offset + sh_size]
-         };
-@@ -3535,7 +3618,9 @@ mod tests {
-                 end += 1;
-             }
-             if &shstr[name_off..end] == name.as_bytes() {
--                return Some(u32::from_le_bytes(obj[off + 4..off + 8].try_into().unwrap()));
-+                return Some(u32::from_le_bytes(
-+                    obj[off + 4..off + 8].try_into().unwrap(),
-+                ));
-             }
-         }
-         None
-@@ -3572,4 +3657,108 @@ mod tests {
-         assert_eq!(sec_type_of(&data, ".data"), Some(1 /* SHT_PROGBITS */));
-         let _ = std::fs::remove_dir_all(&dir);
+ pub fn peephole_optimize(mut asm: String) -> String {
+     // ms178 debug: dump pre-peephole asm
+     if let Ok(path) = std::env::var("CCC_DUMP_ASM") {
+@@ -324,6 +331,18 @@ pub fn peephole_optimize(mut asm: String) -> String {
+     if std::env::var("CCC_NO_PEEPHOLE").is_ok() {
+         return asm;
      }
-+
-+    fn section_bytes(obj: &[u8], name: &str) -> Option<Vec<u8>> {
-+        let e_shoff = u64::from_le_bytes(obj[40..48].try_into().unwrap()) as usize;
-+        let e_shentsize = u16::from_le_bytes(obj[58..60].try_into().unwrap()) as usize;
-+        let e_shnum = u16::from_le_bytes(obj[60..62].try_into().unwrap()) as usize;
-+        let shstr = {
-+            let shstr_idx = u16::from_le_bytes(obj[62..64].try_into().unwrap()) as usize;
-+            let off = e_shoff + shstr_idx * e_shentsize;
-+            let sh_offset =
-+                u64::from_le_bytes(obj[off + 24..off + 32].try_into().unwrap()) as usize;
-+            let sh_size = u64::from_le_bytes(obj[off + 32..off + 40].try_into().unwrap()) as usize;
-+            &obj[sh_offset..sh_offset + sh_size]
-+        };
-+        for i in 0..e_shnum {
-+            let off = e_shoff + i * e_shentsize;
-+            let name_off = u32::from_le_bytes(obj[off..off + 4].try_into().unwrap()) as usize;
-+            let mut end = name_off;
-+            while shstr[end] != 0 {
-+                end += 1;
-+            }
-+            if &shstr[name_off..end] == name.as_bytes() {
-+                let sh_offset =
-+                    u64::from_le_bytes(obj[off + 24..off + 32].try_into().unwrap()) as usize;
-+                let sh_size =
-+                    u64::from_le_bytes(obj[off + 32..off + 40].try_into().unwrap()) as usize;
-+                return Some(obj[sh_offset..sh_offset + sh_size].to_vec());
-+            }
-+        }
-+        None
++    // Size-adaptive gate: pathological machine-generated files (the torture
++    // memcpy-ax corpus expands to ~486k asm lines / ~246k instructions) pay a
++    // full pass-mix sweep measured at ~58 s while the output is byte-identical
++    // to the un-peepholed text — straight-line constant-size memset/memcpy
++    // expansions contain none of the staging/relay patterns the passes match.
++    // Real-world objects are orders of magnitude smaller (gzip -O2 links from
++    // ~20k asm lines), so a 150k-line threshold keeps every realistic file on
++    // the full pass mix while bounding worst-case compile time. Opt back in
++    // with CCC_FORCE_PEEPHOLE=1 (bisection hook, mirrors CCC_PEEPHOLE_PHASE4).
++    if line_count_estimate(&asm) > 150_000 && std::env::var("CCC_FORCE_PEEPHOLE").is_err() {
++        return asm;
 +    }
-+
-+    /// Linux `early_idt_handler_array` (head_64.S): each stub is
-+    /// `endbr64; [push $0;] push $n; jmp common` padded with
-+    /// `.fill array + (i+1)*SIZE - ., 1, 0xcc` to exactly SIZE bytes.
-+    /// The jmp is far, so it stays rel32 (5 bytes). No-error body is 13
-+    /// bytes; error-code body is 11 + 2×cc. Slots must not grow when
-+    /// jump relaxation runs.
-+    #[test]
-+    fn early_idt_handler_fill_slots_are_exact() {
-+        let dir = std::env::temp_dir().join(format!(
-+            "lccc_idt_{}_{}",
-+            std::process::id(),
-+            std::thread::current().name().unwrap_or("t")
-+        ));
-+        std::fs::create_dir_all(&dir).unwrap();
-+        let out = dir.join("idt.o");
-+        let asm = concat!(
-+            ".text\n",
-+            ".globl array\n",
-+            "array:\n",
-+            "i = 0\n",
-+            ".rept 12\n",
-+            "    endbr64\n",
-+            "    .if (i == 8) || (i == 10)\n",
-+            "        pushq $i\n",
-+            "    .else\n",
-+            "        pushq $0\n",
-+            "        pushq $i\n",
-+            "    .endif\n",
-+            "    jmp common\n",
-+            "    .fill array + (i + 1) * 13 - ., 1, 0xcc\n",
-+            "    i = i + 1\n",
-+            ".endr\n",
-+            ".skip 400, 0x90\n",
-+            "common:\n",
-+            "    ret\n",
-+        );
-+        assemble(asm, out.to_str().unwrap()).expect("assemble early_idt shape");
-+        let obj = std::fs::read(&out).unwrap();
-+        let text = section_bytes(&obj, ".text").expect(".text");
-+        const SIZE: usize = 13;
-+        for n in 0..12 {
-+            let off = n * SIZE;
-+            assert_eq!(
-+                &text[off..off + 4],
-+                &[0xf3, 0x0f, 0x1e, 0xfa],
-+                "vector {n} does not start at {off}: next 8 = {:02x?}",
-+                &text[off..off + 8.min(text.len() - off)]
+     let skip_phase1 = std::env::var("CCC_NO_PEEPHOLE_PHASE1").is_ok();
+     let skip_phase2 = std::env::var("CCC_NO_PEEPHOLE_PHASE2").is_ok();
+     let skip_phase3 = std::env::var("CCC_NO_PEEPHOLE_PHASE3").is_ok();
+@@ -360,6 +379,12 @@ pub fn peephole_optimize(mut asm: String) -> String {
+     let skip_phase2 = skip_phase2;
+     let skip_phase3 = skip_phase3;
+     let max_phase1_iters = MAX_LOCAL_PASS_ITERATIONS;
++    // CCC_TIME_PEEPHOLE=1: per-iteration/per-phase wall-time trace on stderr.
++    // The optimizer is text-based, so pathological generated files (e.g. the
++    // torture memcpy-ax corpus: ~486k asm lines) make per-pass cost visible;
++    // this is the measurement hook for keeping the pass mix linear-ish.
++    let time_peephole = std::env::var("CCC_TIME_PEEPHOLE").is_ok();
++    let peephole_total = if time_peephole { Some(std::time::Instant::now()) } else { None };
+ 
+     // Pin parameter pre-store instructions: `movq %arg_reg, %callee_saved_reg`
+     // that appear in the prologue area (before the first function call).
+@@ -453,6 +478,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
+     let mut changed = true;
+     let mut pass_count = 0;
+     while changed && pass_count < max_phase1_iters && !skip_phase1 {
++        let iter_start = if time_peephole { Some(std::time::Instant::now()) } else { None };
+         changed = false;
+         let local_changed = if sk("combined") {
+             false
+@@ -618,10 +644,18 @@ pub fn peephole_optimize(mut asm: String) -> String {
+                 changed |= push_pop::eliminate_binop_push_pop_pattern(&mut store, &mut infos);
+             }
+         }
++        if let Some(s) = iter_start {
++            eprintln!(
++                "[PEEPHOLE-TIME] phase1 iteration {}: {:.1} ms",
++                pass_count,
++                s.elapsed().as_secs_f64() * 1e3
 +            );
 +        }
-+        assert_ne!(text[10 * SIZE], 0xcc, "vector 10 drifted into padding");
-+        for n in [8usize, 10] {
-+            let off = n * SIZE;
-+            assert_eq!(text[off + 11], 0xcc, "vec {n} missing fill");
-+            assert_eq!(text[off + 12], 0xcc, "vec {n} missing fill");
-+        }
-+        let _ = std::fs::remove_dir_all(&dir);
-+    }
-+
-+    #[test]
-+    fn parse_org_style_skip_recognizes_named_label_dot_diff() {
-+        use super::parse_org_style_skip;
-+        assert_eq!(
-+            parse_org_style_skip("early_idt_handler_array + 9 * 13 - ."),
-+            Some(("early_idt_handler_array".into(), 117))
-+        );
-+        assert_eq!(
-+            parse_org_style_skip("array+13-."),
-+            Some(("array".into(), 13))
-+        );
-+        assert_eq!(parse_org_style_skip("array - ."), Some(("array".into(), 0)));
-+        assert_eq!(parse_org_style_skip("0b + 16 - ."), None);
-+        assert_eq!(parse_org_style_skip("16"), None);
-+    }
- }
-diff --git a/src/backend/i686/linker/input.rs b/src/backend/i686/linker/input.rs
-index 2bc73f4..dd49a39 100644
---- a/src/backend/i686/linker/input.rs
-+++ b/src/backend/i686/linker/input.rs
-@@ -337,7 +337,7 @@ pub(super) fn load_and_parse_objects(
+         pass_count += 1;
      }
  
-     // Demand-driven archive member extraction
--    resolve_archive_members(&mut inputs, &mut archive_pool, defsym_defs);
-+    resolve_archive_members(&mut inputs, &mut archive_pool, defsym_defs, &[]);
- 
-     Ok((inputs, archive_pool))
- }
-@@ -347,6 +347,7 @@ pub(super) fn resolve_archive_members(
-     inputs: &mut Vec<InputObject>,
-     archive_pool: &mut Vec<InputObject>,
-     defsym_defs: &[(String, String)],
-+    extra_undefined: &[String],
- ) {
-     let mut defined: FxHashSet<String> = FxHashSet::default();
-     let mut undefined: FxHashSet<String> = FxHashSet::default();
-@@ -365,6 +366,16 @@ pub(super) fn resolve_archive_members(
-     }
-     undefined.retain(|s| !defined.contains(s));
- 
-+    // `-u SYM` / `--undefined=SYM` on a script-driven i386 link (Linux
-+    // real-mode setup.elf) must pull archive members the same way the
-+    // x86-64 `-T` path does. Without this seed, EFI stub objects that
-+    // only appear in an archive stay out of the image.
-+    for name in extra_undefined {
-+        if !defined.contains(name) {
-+            undefined.insert(name.clone());
-+        }
-+    }
-+
-     // For --defsym aliases (e.g. fmod=__ieee754_fmod), if the alias is
-     // undefined we also need the target symbol to be pulled from archives.
-     for (alias, target) in defsym_defs {
-diff --git a/src/backend/i686/linker/mod.rs b/src/backend/i686/linker/mod.rs
-index 8679daa..82d4f04 100644
---- a/src/backend/i686/linker/mod.rs
-+++ b/src/backend/i686/linker/mod.rs
-@@ -68,6 +68,7 @@ pub use link::link_shared;
- /// still follows the i686 linker's demand-driven fixed-point algorithm.
- pub fn load_inputs_for_script(
-     input_paths: &[(String, bool)],
-+    extra_undefined: &[String],
- ) -> Result<Vec<linker_common::Elf64Object>, String> {
-     use parse::{parse_archive, parse_elf32, parse_thin_archive_i686};
-     use types::{InputObject, SHT_NOBITS};
-@@ -102,7 +103,7 @@ pub fn load_inputs_for_script(
-             direct.push(parse_elf32(&data, path)?);
+     // Phase 2: Expensive global passes (run once)
++    let phase2_start = if time_peephole { Some(std::time::Instant::now()) } else { None };
+     let global_changed = if skip_phase2 {
+         false
+     } else {
+@@ -667,6 +701,9 @@ pub fn peephole_optimize(mut asm: String) -> String {
          }
+         global_changed
+     };
++    if let Some(s) = phase2_start {
++        eprintln!("[PEEPHOLE-TIME] phase2: {:.1} ms", s.elapsed().as_secs_f64() * 1e3);
++    }
+ 
+     // Phase 3: One more local cleanup if global passes made changes.
+     if global_changed && !skip_phase3 {
+@@ -853,6 +890,10 @@ pub fn peephole_optimize(mut asm: String) -> String {
+         identical_blocks::merge_identical_blocks(&mut store, &mut infos);
      }
--    input::resolve_archive_members(&mut direct, &mut archive_pool, &[]);
-+    input::resolve_archive_members(&mut direct, &mut archive_pool, &[], extra_undefined);
  
-     Ok(direct
-         .into_iter()
-diff --git a/src/bin/lccc_ld.rs b/src/bin/lccc_ld.rs
-index f1d0963..d9d56a8 100644
---- a/src/bin/lccc_ld.rs
-+++ b/src/bin/lccc_ld.rs
-@@ -569,7 +569,7 @@ fn run(args: &[String]) -> Result<(), String> {
-     // ------------------------------------------------------------------
-     if let Some(script_path) = script_path {
-         let mut objects = if elf_i386 {
--            lccc::linker_entry::load_inputs_i386_script(&inputs)?
-+            lccc::linker_entry::load_inputs_i386_script(&inputs, &undefined_symbols)?
-         } else {
-             let mut objects = Vec::new();
-             lccc::linker_entry::load_inputs_x86(&inputs, &mut objects, &undefined_symbols)?;
-diff --git a/src/linker_entry.rs b/src/linker_entry.rs
-index 97dbfc4..bed2a11 100644
---- a/src/linker_entry.rs
-+++ b/src/linker_entry.rs
-@@ -41,8 +41,12 @@ pub fn load_inputs_x86(
++    if let Some(s) = peephole_total {
++        eprintln!("[PEEPHOLE-TIME] total: {:.1} ms", s.elapsed().as_secs_f64() * 1e3);
++    }
++
+     // Phase 9: Re-run the always-on text passes on the FINAL text. The early
+     // pushfq/popfq elimination is conservative about rsp-relative memory
+     // operands, and the local passes frequently remove/rewrite exactly those
+diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
+index 4383731b..319b2f6c 100644
+--- a/src/driver/pipeline.rs
++++ b/src/driver/pipeline.rs
+@@ -1659,6 +1659,11 @@ impl Driver {
+         }
+         let t7 = std::time::Instant::now();
+         eliminate_phis(&mut module);
++        if std::env::var("CCC_DUMP_IR_PHI").is_ok() {
++            eprintln!("==== IR after eliminate_phis ====");
++            eprintln!("{:#?}", module);
++            eprintln!("==== END IR after eliminate_phis ====");
++        }
+         if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
+             crate::passes::validate_unique_defs(&module, "backend:eliminate_phis");
+         }
+diff --git a/src/passes/constant_fold.rs b/src/passes/constant_fold.rs
+index e286b910..edb0683b 100644
+--- a/src/passes/constant_fold.rs
++++ b/src/passes/constant_fold.rs
+@@ -533,6 +533,34 @@ fn try_fold_with_map(
+                     src: Operand::Const(IrConst::I32(result as i32)),
+                 });
+             }
++            // Self-comparison of identical integer values: x == x => 1 and
++            // x != x / x < x / x > x => 0 (plus the always-true <=/>= forms).
++            // This catches equalities that only emerge after copy propagation:
++            // gcc.c-torture shiftopt-1 folds shift identities into Copies, so
++            // `(x >> 0) != x` becomes Cmp(Ne, v, v) only once those Copies are
++            // propagated. Integer types only — a floating-point x == x is the
++            // NaN test and must be preserved (the float arms above already
++            // returned for those).
++            if !ty.is_128bit() {
++                let same_value = matches!(
++                    (lhs, rhs),
++                    (Operand::Value(a), Operand::Value(b)) if a == b
++                );
++                if same_value {
++                    let result: i32 = match op {
++                        IrCmpOp::Eq | IrCmpOp::Sle | IrCmpOp::Sge | IrCmpOp::Ule | IrCmpOp::Uge => {
++                            1
++                        }
++                        IrCmpOp::Ne | IrCmpOp::Slt | IrCmpOp::Sgt | IrCmpOp::Ult | IrCmpOp::Ugt => {
++                            0
++                        }
++                    };
++                    return Some(Instruction::Copy {
++                        dest: *dest,
++                        src: Operand::Const(IrConst::I32(result)),
++                    });
++                }
++            }
+             let lhs_const = as_i64_const_mapped(lhs, const_map)?;
+             let rhs_const = as_i64_const_mapped(rhs, const_map)?;
+             // Truncate operands to the comparison type's width before comparing.
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index 728f5075..81712529 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -789,6 +789,14 @@ pub(crate) fn run_passes(
+     // predictable for faster debug-style builds while still removing obvious
+     // dead/copy/constant IR introduced by lowering.
+     if opt_level == 1 {
++        // Parameter allocas are promoted up front so the folding passes
++        // below see ParamRef-SSA operands (range_fold + simplify need that
++        // shape to fold 20041114-1's unsigned-range disjunction). The
++        // reassociation single-use guard in simplify.rs removed the one
++        // rewrite that mis-compiled this shape (va-arg-21's glibc
++        // extern-inline vprintf body: the multi-use reassociation re-based a
++        // def onto a different register web while the inlined va_list ABI
++        // kept the old home).
+         crate::ir::mem2reg::promote_allocas_with_params(module);
+         if time_passes {
+             eprintln!("[PASS] o1 mem2reg");
+@@ -799,6 +807,53 @@ pub(crate) fn run_passes(
+         }
+         constant_fold::run(module);
+         copy_prop::run(module);
++        // Local simplifier at -O1: shift identity folds (x>>0 -> x, 0<<x -> 0,
++        // all-ones arithmetic shr), `fabs(x) < 0.0` -> false and related
++        // per-instruction canonicalizations. gcc.c-torture shiftopt-1 and
++        // 20020720-1 leave their link_error calls reachable without these
++        // folds; GCC's front end / match.pd applies them at every level, so
++        // -O1 parity requires them here. One linear per-function sweep keeps
++        // the -O1 tier cheap and predictable.
++        if !pass_disabled(&disabled, "simplify") {
++            simplify::run_with_config(module, true);
++        }
++        // Inlining at -O1: GCC's -O1 tier inlines always_inline and
++        // extern-inline functions plus called-once/small static helpers, and
++        // several torture cases depend on the resulting constant propagation
++        // (20010119-1: __builtin_constant_p through extern inline; 990208-1:
++        // label-address static inline must duplicate per call site; bcp-1:
++        // opt0/opt1 inlined-constant answers). The inliner's own size and
++        // budget heuristics bound the expansion. Range-check folding runs
++        // after the post-inline promotion below: the fold matches on SSA
++        // compare operands, which only exist for actuals once param allocas
++        // are promoted (same rationale as the -O2 loop, which runs
++        // range_fold after mem2reg).
++        if !pass_disabled(&disabled, "inline") {
++            inline::run(module);
++        }
++        // Post-inline parameter promotion: with the inliner done, param
++        // allocas can become SSA values. Constants passed through inlined
++        // calls (20010119-1: a = 10) become visible to the propagation
++        // chain below, exactly like the -O2 tier's post-inline mem2reg.
++        crate::ir::mem2reg::promote_allocas_with_params(module);
++        // Range-check folding at -O1 (same transform as the -O2 loop's
++        // "range_fold" pass): (x >= lo && x <= hi) ->
++        // (unsigned)(x - lo) <= (hi - lo) plus the complement form.
++        // gcc.c-torture 20041114-1 needs it at -O1; the pass is
++        // O(instructions), idempotent, and runs before DCE so folded
++        // comparisons feed the same cleanup chain as at -O2.
++        if !pass_disabled(&disabled, "range_fold") {
++            module.for_each_function(range_check::run_function);
++        }
++        // Second copy-prop + constant-fold round: simplify rewrites shift
++        // identities into Copies (x>>0 => Copy(x)), so comparisons against the
++        // original value only become identical-operand compares after the new
++        // Copies are propagated (gcc.c-torture shiftopt-1: `(x >> 0) != x`).
++        // The -O2+ tier reaches the same fixpoint via its iterative loop; at
++        // -O1 this explicit second round keeps the tier loop-free while
++        // preserving parity. Both passes are linear and idempotent.
++        copy_prop::run(module);
++        constant_fold::run(module);
+         // Same f128-builtin fold as -O0 (see above).
+         simplify::fold_math_intrinsic_calls(module);
+         module.for_each_function(dce::eliminate_dead_code);
+@@ -808,9 +863,20 @@ pub(crate) fn run_passes(
+         module.for_each_function(store_load_forward::run);
+         constant_fold::run(module);
+         module.for_each_function(cfg_simplify::simplify_cfg);
++        // Resolve remaining __builtin_constant_p queries BEFORE the final DCE:
++        // an unresolved IsConstant node keeps both select arms alive, so the
++        // not-taken arm's calls (20010119-1: undef()) only become removable
++        // after resolution. The final DCE then collects them; previously the
++        // resolver ran last and the dead branches survived to codegen.
++        constant_fold::resolve_remaining_is_constant(module);
++        // Post-resolution prune: resolving IsConstant turns previously
++        // both-arms-alive diamonds into constant branches, so one more
++        // cfg_simplify + DCE round folds the taken edge and deletes the
++        // dead arm's blocks (20010119-1: undef() inside the extern-inline
++        // body's not-constant arm reached codegen before this round).
++        module.for_each_function(cfg_simplify::simplify_cfg);
+         module.for_each_function(dce::eliminate_dead_code);
+         resolve_asm::resolve_inline_asm_symbols(module);
+-        constant_fold::resolve_remaining_is_constant(module);
+         if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {
+             eprintln!("==== IR after all passes (opt_level={}) ====", opt_level);
+             eprintln!("{:#?}", module);
+diff --git a/src/passes/simplify.rs b/src/passes/simplify.rs
+index 84b2219a..fb2a7acc 100644
+--- a/src/passes/simplify.rs
++++ b/src/passes/simplify.rs
+@@ -66,14 +66,33 @@ use crate::ir::reexports::{
+     Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction, IrModule, IrUnaryOp, Operand,
+     Value,
+ };
++use crate::ir::instruction::Terminator;
+ 
+ /// Run algebraic simplification on the module.
+ /// Returns the number of instructions simplified.
+ pub fn run(module: &mut IrModule) -> usize {
+-    module.for_each_function(simplify_function)
++    run_with_config(module, false)
++}
++
++/// `fill_use_counts` enables the reassociation single-use profitability
++/// guard. It is requested by the -O1 tier, where the guard is REQUIRED for
++/// correctness (va-arg-21: the inlined glibc extern-inline vprintf body kept
++/// a stale register home after a multi-use reassociation re-based its def;
++/// 20050124-1 on i686: the k++ arm's leal landed in %edx while the
++/// phi-eliminated merge read %ecx). The -O2+ tiers keep the historical
++/// always-reassociate behavior: there the reassociations also serve as
++/// canonicalization for downstream vectorizer pattern matching, and blocking
++/// them changes which shape reaches the vectorizer (affine_map_vectorization
++/// regressed when the guard was active at -O2).
++pub fn run_with_config(module: &mut IrModule, fill_use_counts: bool) -> usize {
++    module.for_each_function(|f| simplify_function_with_config(f, fill_use_counts))
  }
  
- /// Load ELF32/i386 objects and archives for a script-driven link.
--pub fn load_inputs_i386_script(inputs: &[(String, bool)]) -> Result<Vec<Elf64Object>, String> {
--    crate::backend::i686::linker::load_inputs_for_script(inputs)
-+/// `undefined` are `-u`/`--undefined` symbols that must pull archive members.
-+pub fn load_inputs_i386_script(
-+    inputs: &[(String, bool)],
-+    undefined: &[String],
-+) -> Result<Vec<Elf64Object>, String> {
-+    crate::backend::i686::linker::load_inputs_for_script(inputs, undefined)
+ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
++    simplify_function_with_config(func, false)
++}
++
++fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -> usize {
+     let mut total = 0;
+ 
+     // Build def maps for chain optimizations: Value -> defining instruction
+@@ -94,6 +113,75 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
+     // gcc.c-torture 20020720-1: `if (fabs(x) < 0.0) link_error();`
+     let mut is_fabs = vec![false; max_id + 1];
+ 
++    // Use counts for the reassociation profitability guards. A reassociation
++    // such as (x + C1) + C2 => x + (C1 + C2) only *removes work* when the
++    // folded intermediate has no other consumers; with multiple uses the
++    // rewrite merely re-bases the def onto a different value web without
++    // deleting anything, which on i686 splits coalesced register homes
++    // (gcc.c-torture 20050124-1: the k++ arm's leal landed in %edx while the
++    // phi-eliminated merge expected %ecx). Count every value operand read by
++    // instructions and terminators; over-counting is safe (the guard only
++    // becomes more conservative).
++    let mut use_counts = vec![0u32; if fill_use_counts { max_id + 1 } else { 0 }];
++    {
++        let mut bump = |op: &Operand, uc: &mut Vec<u32>| {
++            if let Operand::Value(v) = op {
++                let id = v.0 as usize;
++                if id < uc.len() {
++                    uc[id] += 1;
++                }
++            }
++        };
++        for block in &func.blocks {
++            for inst in &block.instructions {
++                match inst {
++                    Instruction::Copy { src, .. }
++                    | Instruction::Cast { src, .. }
++                    | Instruction::UnaryOp { src, .. } => {
++                        bump(src, &mut use_counts);
++                    }
++                    Instruction::Load { ptr, .. } => {
++                        bump(&Operand::Value(*ptr), &mut use_counts);
++                    }
++                    Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
++                        bump(lhs, &mut use_counts);
++                        bump(rhs, &mut use_counts);
++                    }
++                    Instruction::Store { ptr, val, .. } => {
++                        bump(&Operand::Value(*ptr), &mut use_counts);
++                        bump(val, &mut use_counts);
++                    }
++                    Instruction::Select {
++                        true_val,
++                        false_val,
++                        cond,
++                        ..
++                    } => {
++                        bump(true_val, &mut use_counts);
++                        bump(false_val, &mut use_counts);
++                        bump(cond, &mut use_counts);
++                    }
++                    Instruction::Phi { incoming, .. } => {
++                        for (op, _) in incoming {
++                            bump(op, &mut use_counts);
++                        }
++                    }
++                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
++                        for arg in &info.args {
++                            bump(arg, &mut use_counts);
++                        }
++                    }
++                    _ => {}
++                }
++            }
++            match &block.terminator {
++                Terminator::CondBranch { cond, .. } => bump(cond, &mut use_counts),
++                Terminator::Return(Some(v)) => bump(v, &mut use_counts),
++                _ => {}
++            }
++        }
++    }
++
+     // Collect definitions - first pass: mark Cmp results as boolean
+     for block in &func.blocks {
+         for inst in &block.instructions {
+@@ -303,6 +391,7 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
+                 &neg_defs,
+                 &is_boolean,
+                 &value_types,
++                &use_counts,
+             ) {
+                 *inst = simplified;
+                 total += 1;
+@@ -383,6 +472,7 @@ fn try_simplify_with_types(
+     neg_defs: &[Option<NegDef>],
+     is_boolean: &[bool],
+     value_types: &[Option<IrType>],
++    use_counts: &[u32],
+ ) -> Option<Instruction> {
+     match inst {
+         Instruction::BinOp {
+@@ -391,7 +481,9 @@ fn try_simplify_with_types(
+             lhs,
+             rhs,
+             ty,
+-        } => simplify_binop(*dest, *op, lhs, rhs, *ty, cast_defs, binop_defs, neg_defs),
++        } => simplify_binop(
++            *dest, *op, lhs, rhs, *ty, cast_defs, binop_defs, neg_defs, use_counts,
++        ),
+         Instruction::Cast {
+             dest,
+             src,
+@@ -518,6 +610,7 @@ fn try_simplify(
+         neg_defs,
+         is_boolean,
+         &[],
++        &[],
+     )
  }
  
- /// Append a synthetic object carrying an empty `.note.gnu.build-id`
-diff --git a/tests/linker/run_linker_tests.py b/tests/linker/run_linker_tests.py
-index c52576f..50bd542 100644
---- a/tests/linker/run_linker_tests.py
-+++ b/tests/linker/run_linker_tests.py
-@@ -1505,6 +1505,72 @@ def _script_undefined_archive_test(args, oracles):
-     finally:
-         shutil.rmtree(td, ignore_errors=True)
+@@ -1196,6 +1289,7 @@ fn simplify_binop(
+     cast_defs: &[Option<CastDef>],
+     binop_defs: &[Option<BinOpDef>],
+     neg_defs: &[Option<NegDef>],
++    use_counts: &[u32],
+ ) -> Option<Instruction> {
+     let lhs_zero = is_zero(lhs);
+     let rhs_zero = is_zero(rhs);
+@@ -1218,7 +1312,7 @@ fn simplify_binop(
+                     return Some(Instruction::Copy { dest, src: *rhs });
+                 }
+                 // Reassociation: (x + C1) + C2 => x + (C1 + C2)
+-                if let Some(inst) = try_reassociate_add(dest, lhs, rhs, ty, binop_defs) {
++                if let Some(inst) = try_reassociate_add(dest, lhs, rhs, ty, binop_defs, use_counts) {
+                     return Some(inst);
+                 }
+             }
+@@ -1238,7 +1332,7 @@ fn simplify_binop(
+             if !is_float {
+                 // Reassociation: (x + C1) - C2 => x + (C1 - C2)
+                 // Also: (x - C1) - C2 => x - (C1 + C2)
+-                if let Some(inst) = try_reassociate_sub(dest, lhs, rhs, ty, binop_defs) {
++                if let Some(inst) = try_reassociate_sub(dest, lhs, rhs, ty, binop_defs, use_counts) {
+                     return Some(inst);
+                 }
+                 // x - (neg y) => x + y (eliminate negation)
+@@ -1300,7 +1394,7 @@ fn simplify_binop(
+             }
+             // Reassociation: (x * C1) * C2 => x * (C1 * C2) (integers only)
+             if !is_float {
+-                if let Some(inst) = try_reassociate_mul(dest, lhs, rhs, ty, binop_defs) {
++                if let Some(inst) = try_reassociate_mul(dest, lhs, rhs, ty, binop_defs, use_counts) {
+                     return Some(inst);
+                 }
+             }
+@@ -1443,7 +1537,7 @@ fn simplify_binop(
+             }
+             // Reassociation: (x & C1) & C2 => x & (C1 & C2)
+             if let Some(inst) =
+-                try_reassociate_bitwise(dest, IrBinOp::And, lhs, rhs, ty, binop_defs)
++                try_reassociate_bitwise(dest, IrBinOp::And, lhs, rhs, ty, binop_defs, use_counts)
+             {
+                 return Some(inst);
+             }
+@@ -1469,7 +1563,7 @@ fn simplify_binop(
+                 return Some(Instruction::Copy { dest, src: *lhs });
+             }
+             // Reassociation: (x | C1) | C2 => x | (C1 | C2)
+-            if let Some(inst) = try_reassociate_bitwise(dest, IrBinOp::Or, lhs, rhs, ty, binop_defs)
++            if let Some(inst) = try_reassociate_bitwise(dest, IrBinOp::Or, lhs, rhs, ty, binop_defs, use_counts)
+             {
+                 return Some(inst);
+             }
+@@ -1492,7 +1586,7 @@ fn simplify_binop(
+             }
+             // Reassociation: (x ^ C1) ^ C2 => x ^ (C1 ^ C2)
+             if let Some(inst) =
+-                try_reassociate_bitwise(dest, IrBinOp::Xor, lhs, rhs, ty, binop_defs)
++                try_reassociate_bitwise(dest, IrBinOp::Xor, lhs, rhs, ty, binop_defs, use_counts)
+             {
+                 return Some(inst);
+             }
+@@ -1519,7 +1613,7 @@ fn simplify_binop(
+             }
+             // Reassociation: (x << C1) << C2 => x << (C1 + C2)
+             // Also for >>: (x >> C1) >> C2 => x >> (C1 + C2)
+-            if let Some(inst) = try_reassociate_shift(dest, op, lhs, rhs, ty, binop_defs) {
++            if let Some(inst) = try_reassociate_shift(dest, op, lhs, rhs, ty, binop_defs, use_counts) {
+                 return Some(inst);
+             }
+         }
+@@ -1691,17 +1785,45 @@ fn combine_add_consts(c1: i64, c2: i64, ty: IrType) -> i64 {
  
+ /// Try reassociating addition: (x + C1) + C2 => x + (C1 + C2)
+ /// Also handles: C2 + (x + C1) => x + (C1 + C2)
++/// Reassociation profitability guard: folding through an intermediate whose
++/// value has other consumers re-bases the def onto a different register web
++/// without deleting any instruction (work-neutral at best). On i686 that web
++/// split changed the def's home register while the phi-eliminated merge kept
++/// the old expectation, miscompiling gcc.c-torture 20050124-1 (the k++ arm's
++/// `leal` landed in %edx while the merge read %ecx). Only fold through
++/// single-use intermediates so the intermediate's def actually dies and the
++/// rewrite is a strict win. An empty use_counts slice (test entry points)
++/// keeps the historical behavior.
++fn reassociation_unprofitable(intermediate: &Operand, use_counts: &[u32]) -> bool {
++    if use_counts.is_empty() {
++        return false;
++    }
++    // Bisection kill-switch (mirrors the other CCC_NO_* hooks): forces the
++    // historical always-reassociate behavior.
++    if std::env::var("CCC_NO_REASSOC_GUARD").is_ok() {
++        return false;
++    }
++    match intermediate {
++        Operand::Value(v) => use_counts.get(v.0 as usize).copied().unwrap_or(0) > 1,
++        _ => false,
++    }
++}
 +
-+def _script_undefined_archive_test_i386(args, oracles):
-+    """ELF32 `-T` links must honour `-u SYM` against archives.
+ fn try_reassociate_add(
+     dest: Value,
+     lhs: &Operand,
+     rhs: &Operand,
+     ty: IrType,
+     binop_defs: &[Option<BinOpDef>],
++    use_counts: &[u32],
+ ) -> Option<Instruction> {
+     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
+     if matches!(ty, IrType::I128 | IrType::U128) {
+         return None;
+     }
++    if reassociation_unprofitable(lhs, use_counts) {
++        return None;
++    }
+     // Pattern: (x + C1) + C2 or (x - C1) + C2
+     if let Operand::Const(c2) = rhs {
+         let c2_val = c2.to_i64()?;
+@@ -1810,11 +1932,15 @@ fn try_reassociate_sub(
+     rhs: &Operand,
+     ty: IrType,
+     binop_defs: &[Option<BinOpDef>],
++    use_counts: &[u32],
+ ) -> Option<Instruction> {
+     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
+     if matches!(ty, IrType::I128 | IrType::U128) {
+         return None;
+     }
++    if reassociation_unprofitable(lhs, use_counts) {
++        return None;
++    }
+     let c2_val = match rhs {
+         Operand::Const(c) => c.to_i64()?,
+         _ => return None,
+@@ -1887,11 +2013,15 @@ fn try_reassociate_bitwise(
+     rhs: &Operand,
+     ty: IrType,
+     binop_defs: &[Option<BinOpDef>],
++    use_counts: &[u32],
+ ) -> Option<Instruction> {
+     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
+     if matches!(ty, IrType::I128 | IrType::U128) {
+         return None;
+     }
++    if reassociation_unprofitable(lhs, use_counts) {
++        return None;
++    }
+     // Pattern: (x op C1) op C2
+     let c2_val = match rhs {
+         Operand::Const(c) => c.to_i64()?,
+@@ -1962,11 +2092,15 @@ fn try_reassociate_shift(
+     rhs: &Operand,
+     ty: IrType,
+     binop_defs: &[Option<BinOpDef>],
++    use_counts: &[u32],
+ ) -> Option<Instruction> {
+     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
+     if matches!(ty, IrType::I128 | IrType::U128) {
+         return None;
+     }
++    if reassociation_unprofitable(lhs, use_counts) {
++        return None;
++    }
+     let c2_val = match rhs {
+         Operand::Const(c) => c.to_i64()?,
+         _ => return None,
+@@ -2023,11 +2157,15 @@ fn try_reassociate_mul(
+     rhs: &Operand,
+     ty: IrType,
+     binop_defs: &[Option<BinOpDef>],
++    use_counts: &[u32],
+ ) -> Option<Instruction> {
+     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
+     if matches!(ty, IrType::I128 | IrType::U128) {
+         return None;
+     }
++    if reassociation_unprofitable(lhs, use_counts) || reassociation_unprofitable(rhs, use_counts) {
++        return None;
++    }
+ 
+     // Helper: try pattern (expr * C1) * C2 where expr is on one side and C2 on the other.
+     let try_pattern = |expr_side: &Operand, const_side: &Operand| -> Option<Instruction> {
+@@ -3902,6 +4040,7 @@ mod tests {
+             &[],
+             &binops,
+             &[],
++            &[],
+         )
+         .unwrap();
+         match got {
+@@ -3944,6 +4083,7 @@ mod tests {
+             &casts,
+             &binops,
+             &[],
++            &[],
+         )
+         .unwrap();
+         match got {
+@@ -3980,6 +4120,7 @@ mod tests {
+             &[],
+             &[],
+             &[],
++            &[],
+         )
+         .unwrap();
+         assert!(
+diff --git a/tests/regression/extern_inline_bcp_specialization.c b/tests/regression/extern_inline_bcp_specialization.c
+new file mode 100644
+index 00000000..6a415005
+--- /dev/null
++++ b/tests/regression/extern_inline_bcp_specialization.c
+@@ -0,0 +1,23 @@
++// Regression pin (O1): extern-inline bodies must be inlined at -O1 and their
++// __builtin_constant_p queries resolved to 1 after argument specialization,
++// with the not-constant fallback arm (undef) folded away and deleted. If the
++// inliner, the IsConstant resolver, or the post-resolution CFG prune
++// regresses, `undef` stays referenced and the link step fails.
++extern void undef (void);
++extern void exit (int);
 +
-+    Linux's real-mode `setup.elf` is `lccc-ld -m elf_i386 -T setup.ld -u …`.
-+    The x86-64 script path already seeded `-u`; the i386 loader used to
-+    pass an empty extra-undefined list into archive extraction.
-+    """
-+    name = "script_undefined_pulls_archive_i386"
-+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
-+    try:
-+        with open(os.path.join(td, "pe.c"), "w") as f:
-+            f.write("extern int efi_is64;\n"
-+                    "int efi_pe_entry(void){ return efi_is64; }\n")
-+        with open(os.path.join(td, "mixed.c"), "w") as f:
-+            f.write("int efi_is64 = 1;\n"
-+                    "void efi32_stub_entry(void){}\n")
-+        with open(os.path.join(td, "head.c"), "w") as f:
-+            f.write("int startup_32(void){ return 0; }\n")
-+        with open(os.path.join(td, "t.lds"), "w") as f:
-+            f.write("OUTPUT_FORMAT(\"elf32-i386\")\n"
-+                    "OUTPUT_ARCH(i386)\n"
-+                    "ENTRY(startup_32)\n"
-+                    "SECTIONS {\n"
-+                    "  . = 0;\n"
-+                    "  .text : { *(.text*) }\n"
-+                    "  .data : { *(.data*) *(.rodata*) *(.bss*) *(COMMON) }\n"
-+                    "  /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }\n"
-+                    "}\n")
-+        for src in ("pe.c", "mixed.c", "head.c"):
-+            r = sh([CC, "-m32", "-c", "-O1", "-ffreestanding", "-fno-pic",
-+                    "-fno-asynchronous-unwind-tables", "-fno-stack-protector",
-+                    src], cwd=td)
-+            if r.returncode != 0:
-+                return Result(name, "SKIP", r.stderr.decode()[:150])
-+        r = sh(["ar", "rcs", "libstub.a", "pe.o"], cwd=td)
-+        if r.returncode != 0:
-+            return Result(name, "SKIP", "ar libstub failed")
-+        r = sh(["ar", "rcs", "libstartup.a", "mixed.o"], cwd=td)
-+        if r.returncode != 0:
-+            return Result(name, "SKIP", "ar startup failed")
-+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
-+        common = ["-m", "elf_i386", "-u", "efi_pe_entry",
-+                  "-T", "t.lds", "head.o", "libstub.a", "libstartup.a"]
-+        r = sh([lccc_ld] + common + ["-o", "out.lccc"], cwd=td)
-+        if r.returncode != 0:
-+            return Result(name, "FAIL",
-+                          f"lccc-ld -m elf_i386 -T -u failed: {r.stderr.decode()[:400]}")
-+        nm = sh(["nm", "out.lccc"], cwd=td).stdout.decode()
-+        for required in ("efi_pe_entry", "efi_is64", "efi32_stub_entry"):
-+            if not re.search(rf"\b{required}$", nm, re.M):
-+                return Result(name, "FAIL",
-+                              f"-u did not pull archive member defining {required}")
-+        r = sh([lccc_ld, "-m", "elf_i386", "-T", "t.lds",
-+                "head.o", "libstub.a", "libstartup.a", "-o", "out.nou"], cwd=td)
-+        if r.returncode == 0:
-+            nm_nou = sh(["nm", "out.nou"], cwd=td).stdout.decode()
-+            if re.search(r"\befi_pe_entry$", nm_nou, re.M):
-+                return Result(name, "FAIL",
-+                              "archive member pulled without -u (over-broad extract)")
-+        return Result(name, "PASS")
-+    except Exception as e:
-+        return Result(name, "FAIL", f"harness exception: {e!r}")
-+    finally:
-+        shutil.rmtree(td, ignore_errors=True)
++void bar (unsigned x) { }
++void baz (unsigned x) { }
 +
- VDSO_SCRIPT = r"""
- PHDRS {
-  text PT_LOAD FILEHDR PHDRS FLAGS(5);
-@@ -4489,6 +4555,7 @@ def main():
-     if (not args.filter or "undefined" in args.filter or "efi" in args.filter) \
-             and (not args.tag or args.tag == "script"):
-         results.append(_script_undefined_archive_test(args, oracles))
-+        results.append(_script_undefined_archive_test_i386(args, oracles))
-     if (not args.filter or "vdso" in args.filter) and (not args.tag or args.tag == "script"):
-         results.append(_vdso_script_test(args, oracles))
-     if (not args.filter or "elf32" in args.filter or "kernel" in args.filter) \
++extern inline void foo (int a, int b)
++{
++  int c = 0;
++  while (c++ < b)
++    (__builtin_constant_p (a) ? ((a) > 20000 ? undef () : bar (a)) : baz (a));
++}
++
++int main (void)
++{
++  foo (10, 100);
++  exit (0);
++}
+diff --git a/tests/regression/extern_inline_bcp_specialization.flags b/tests/regression/extern_inline_bcp_specialization.flags
+new file mode 100644
+index 00000000..11c863a6
+--- /dev/null
++++ b/tests/regression/extern_inline_bcp_specialization.flags
+@@ -0,0 +1 @@
++-O1
+diff --git a/tests/regression/o1_fabs_nonnegative.c b/tests/regression/o1_fabs_nonnegative.c
+new file mode 100644
+index 00000000..2e30afd4
+--- /dev/null
++++ b/tests/regression/o1_fabs_nonnegative.c
+@@ -0,0 +1,18 @@
++// Regression pin (O1): fabs(x) < 0.0 is always false (NaN included); the
++// comparison fold must apply at -O1 (gcc.c-torture 20020720-1 shape).
++extern double fabs (double);
++extern void link_error (void);
++
++void foo (double x)
++{
++  double p = fabs (x);
++  double q = 0.0;
++  if (p < q)
++    link_error ();
++}
++
++int main (void)
++{
++  foo (1.0);
++  return 0;
++}
+diff --git a/tests/regression/o1_fabs_nonnegative.flags b/tests/regression/o1_fabs_nonnegative.flags
+new file mode 100644
+index 00000000..11c863a6
+--- /dev/null
++++ b/tests/regression/o1_fabs_nonnegative.flags
+@@ -0,0 +1 @@
++-O1
+diff --git a/tests/regression/o1_range_check_fold.c b/tests/regression/o1_range_check_fold.c
+new file mode 100644
+index 00000000..db559827
+--- /dev/null
++++ b/tests/regression/o1_range_check_fold.c
+@@ -0,0 +1,20 @@
++// Regression pin (O1): range-check folding must run at -O1.
++// gcc.c-torture 20041114-1: var <= 0 || (unsigned)(var - 1) < UINT_MAX is
++// always true; if the fold is missing at -O1 the link_failure call survives.
++#include <limits.h>
++
++void link_failure (void);
++
++volatile int v;
++
++void foo (int var)
++{
++  if (!(var <= 0 || ((long unsigned) (unsigned) (var - 1) < UINT_MAX)))
++    link_failure ();
++}
++
++int main (void)
++{
++  foo (v);
++  return 0;
++}
+diff --git a/tests/regression/o1_range_check_fold.flags b/tests/regression/o1_range_check_fold.flags
+new file mode 100644
+index 00000000..11c863a6
+--- /dev/null
++++ b/tests/regression/o1_range_check_fold.flags
+@@ -0,0 +1 @@
++-O1
+diff --git a/tests/regression/self_cmp_after_copyprop.c b/tests/regression/self_cmp_after_copyprop.c
+new file mode 100644
+index 00000000..6c30eedb
+--- /dev/null
++++ b/tests/regression/self_cmp_after_copyprop.c
+@@ -0,0 +1,30 @@
++// Regression pin (O1): identical-operand integer compares must fold once the
++// shift identity Copies are propagated. gcc.c-torture shiftopt-1 shape: the
++// compare becomes Cmp(Ne, v, v) only after copy propagation, so the fold has
++// to live in the constant folder, not the front end. If the fold regresses,
++// the call to the deliberately undefined link_error survives the link step.
++extern void link_error (void);
++
++int
++stest (int x)
++{
++  if (x >> 0 != x)
++    link_error ();
++  if (x << 0 != x)
++    link_error ();
++  if (0 << x != 0)
++    link_error ();
++  if (0 >> x != 0)
++    link_error ();
++  if (-1 >> x != -1)
++    link_error ();
++  if (~0 >> x != ~0)
++    link_error ();
++  return x;
++}
++
++int
++main (void)
++{
++  return stest (3) == 3 ? 0 : 1;
++}
+diff --git a/tests/regression/self_cmp_after_copyprop.flags b/tests/regression/self_cmp_after_copyprop.flags
+new file mode 100644
+index 00000000..11c863a6
+--- /dev/null
++++ b/tests/regression/self_cmp_after_copyprop.flags
+@@ -0,0 +1 @@
++-O1
