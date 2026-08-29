@@ -1,80 +1,96 @@
-diff --git a/engineering/FOLLOWUP-2026-08-29-matmul-broadcast-hoist.md b/engineering/FOLLOWUP-2026-08-29-matmul-broadcast-hoist.md
+diff --git a/.base_ref b/.base_ref
+index 629147d1..77818ff7 100644
+--- a/.base_ref
++++ b/.base_ref
+@@ -1 +1 @@
+-90b6d878e004df63ed4d3f23e17639e218037f90
++cdd3ba456f87135418b876780394ff3a9536fd34
+diff --git a/engineering/FOLLOWUP-2026-08-29-matmul-sib-hoisted.md b/engineering/FOLLOWUP-2026-08-29-matmul-sib-hoisted.md
 new file mode 100644
-index 00000000..ad65bd0d
+index 00000000..50228cae
 --- /dev/null
-+++ b/engineering/FOLLOWUP-2026-08-29-matmul-broadcast-hoist.md
-@@ -0,0 +1,124 @@
-+# Follow-up — 2026-08-29: AVX2 matmul broadcast hoist (A[i][k] invariant)
++++ b/engineering/FOLLOWUP-2026-08-29-matmul-sib-hoisted.md
+@@ -0,0 +1,174 @@
++# Follow-up — 2026-08-29: AVX2 matmul SIB + hoisted broadcast (SIB disp folding)
 +
-+**Base.** `ms178/lccc` main `796058f0` (#300 sticky-SSE). Previous session left
-+paravirt-improved commit `04ed7f41` on top.
++**Base.** `ms178/lccc` main `cdd3ba45` (#301 paravirt+matmul broadcast hoist). Previous
++session left broadcast hoist (1 vmovsd+vbroadcastsd in LBB4, 0 inside LBB6) but still
++11 leaq + 8 movq overhead per iteration (96 insns vs gcc 25).
 +
-+## Problem
++## Red-team audit of previous fix
 +
-+Final asm `/tmp/matmul.s` for `tests/benchmark/programs/matmul.c` (`-O3 -march=x86-64-v3`)
-+still had 4× `vmovsd (%r15)` + `vbroadcastsd` **inside** vector loop LBB6:
++Previous `transform_to_fma_f64x4` after broadcast hoist:
++
++- Created 2× offset Adds (b_off+32, c_off+32) + 2× GEPs per chunk (1..3) → 6 Adds + 6 GEPs
++  for 3 chunks.
++- Backend `FmaF64x4Hoisted` lowered each GEP via `operand_to_reg` + `value_to_reg`
++  → `leaq (%r14,%r12), %r10; leaq (%rbx,%r12), %r9; movq %r10,%rdx; movq %r9,%rax`
++  per chunk → 11 leaq + 8 movq = 19 insns overhead.
++- Total LBB6: 1 movslq + 19 addr + 12 FMA = 32 insns per iter, function 96 insns.
++
++**Gap vs GCC:** GCC 25 insns total uses SIB directly, no leaq/movq, and unrolls k-loop by 2
++with 2 broadcasts per j-loop.
++
++## New design: `FmaF64x4HoistedSIB` with displacement
++
++**Goal:** Eliminate ALL GEP leaq/movq and broadcast inside loop, match GCC SIB pattern,
++but keep hoisted broadcast (better than GCC's 2 broadcasts per j-loop? Actually GCC
++does 2 broadcasts per j-loop for k-unroll=2, we do 1 broadcast per k).
++
++### IR
++
++Added `IntrinsicOp::FmaF64x4HoistedSIB`:
 +
 +```
-+.LBB6:
-+  vmovsd (%r15), %xmm0
-+  vbroadcastsd %xmm0, %ymm1
-+  vmovupd (%rbx,%r12), %ymm0
-+  vfmadd231pd (%r14,%r12), %ymm1, %ymm0
-+  ... repeated 4× for +0,+32,+64,+96
++args[0] = C base pointer (row base, loop-invariant)
++args[1] = B base pointer (row base, loop-invariant)
++args[2] = byte offset (j*8, shared)
++args[3] = optional displacement (0,32,64,96) as const
++ymm1 = broadcasted A[i][k] (from BroadcastLoadF64 in preheader)
 +```
 +
-+Root cause analysis via `CCC_DEBUG_LICM_ALIAS=1`:
++- 3-arg form: offset already includes chunk (backward compat, folded if Add)
++- 4-arg form: offset + disp const → emits `disp(%base,%off)` SIB, no extra leaq
 +
-+- First LICM iteration for header=5 (j-loop) **did** hoist `Value23 GEP base21 offset22` (= A[i][k])
-+  plus 8 other GEPs/Casts (`count=9`). Symbol map `LICM-SYMBOL` confirmed
-+  `A=62, B=63, C=64` canonical.
-+- After `vectorize` pass (between `loop_unroll` iter0 and `run_gvn_licm_ivsr_shared`),
-+  j-loop body is rewritten to `FmaF64x4` intrinsics:
-+  `Intrinsic FmaF64x4 dest_ptr 44 args [Value103, Value33]` x4 with offsets +32,+64,+96.
-+  `FMA ARG Value103 def_block Some(3) Phi dest103 ty Ptr incoming [(106,Block2),(104,Block7)]`
-+  where 106=Phi(62 from0,107 from3) and 104=GEP base103+8. So Value103 is k-loop
-+  induction for A[i][k] pointer, **invariant for inner j-loop** (def_block 3 outside
-+  body 5,6). No explicit `Load` in j-body; load is inside FMA intrinsic semantics
-+  (`*args[0]` broadcast).
-+- LICM only looks at `Load`/`Store` in `pointer_values={72,44,68,76}` (FMA dests), zero loads,
-+  `count=0` for second iteration. So invariant A load hidden inside `FmaF64x4` args
-+  cannot be hoisted by LICM.
-+- `value_to_base_global` maps Phi 90 (C) to itself (conflict 109 vs 90), not to canonical 64,
-+  so `stored_global_bases` is {90} or empty, but A base 62 is distinct, so scalar A load
-+  **was** hoistable for header=11 (Load dest86 ptr23 base21 offset22 def_block4 out-loop).
-+  After vectorize, A pointer becomes Value103 mapping to 103 (self), not 62.
++Updated all backends:
 +
-+Thus vectorizer reintroduced invariant load after first LICM hoist.
++- `src/ir/intrinsics.rs`: definition + vector_result_width
++- `src/passes/vector_temp_promotion.rs`: `index<2` safe (base pointers), dest alignment 0,
++  overwrites_full_result, dest_reads_old_value
++- `src/backend/x86/codegen/prologue.rs`: has_rdx_intrinsic
++- `src/backend/regalloc.rs`: is_raw_reader
++- `src/backend/generation.rs`: has_vector_intrinsics
++- `src/backend/arm|i686|riscv/codegen/intrinsics.rs`: x86-only no-op list
++- `src/backend/stack_layout/copy_coalescing.rs`: is_raw_reader
++- `src/backend/x86/codegen/intrinsics.rs`: emitter with disp folding
 +
-+## Fix
++### Vectorizer
 +
-+`src/passes/vectorize.rs` `transform_to_fma_f64x4`:
-+
-+- **Previously:** emitted 4× `FmaF64x4` with args `[A_ptr, B_gep]` inside loop.
-+  Backend lowering for `FmaF64x4` does `vmovsd (A_ptr), xmm1; vbroadcastsd; vmovupd (C); vfmadd231pd (B), ymm1, ymm0; vmovupd`.
-+  So 4 broadcasts per iteration.
-+
-+- **Now (like 2-wide path):** hoist `BroadcastLoadF64` into preheader:
++`transform_to_fma_f64x4` now:
 +
 +```rust
-+func.blocks[preheader_idx].instructions.push(Intrinsic {
-+  dest: None,
-+  op: BroadcastLoadF64,
-+  dest_ptr: None,
-+  args: vec![Value(pattern.a_ptr)],
-+});
++for chunk in 0..4 {
++  disp = chunk*32
++  if disp==0 { FmaF64x4HoistedSIB [c_base, b_base, b_off] }
++  else { FmaF64x4HoistedSIB [c_base, b_base, b_off, const disp] }
++}
 +```
 +
-+  and emit 4× `FmaF64x4Hoisted` with only B ptr:
++No BinOp Adds, no GEPs. 4 intrinsics share same offset Value.
 +
-+```rust
-+Intrinsic { op: FmaF64x4Hoisted, dest_ptr: Some(c_gep), args: vec![Value(b_gep)] }
-+```
++### Backend emitter
 +
-+Backend x86 lowering:
++- Extract disp from args[3] if present (const i64)
++- Else try to fold offset = Add(base, const) → base + disp
++- `operand_reg` for base pointers to avoid movq copies (reuse existing homes)
++- Emit:
++  ```
++  vmovupd disp(%c_base,%off), %ymm0
++  vfmadd231pd disp(%b_base,%off), %ymm1, %ymm0
++  vmovupd %ymm0, disp(%c_base,%off)
++  ```
 +
-+- `BroadcastLoadF64`: `vmovsd (%rcx), %xmm1; vbroadcastsd %xmm1, %ymm1` (ymm1 holds A)
-+- `FmaF64x4Hoisted`: `vmovupd (%rax), %ymm0; vfmadd231pd (%rdx), %ymm1, %ymm0; vmovupd %ymm0, (%rax)`
++With disp folding, chunks 1..3 become `32(%rbx,%r10)` etc, no leaq.
 +
 +## Result
 +
@@ -84,292 +100,543 @@ index 00000000..ad65bd0d
 +.LBB4:
 +  movq %r15, %rcx
 +  vmovsd (%rcx), %xmm1
-+  vbroadcastsd %xmm1, %ymm1   # hoisted
-+  xorl %ebp, %ebp
++  vbroadcastsd %xmm1, %ymm1   # 1 broadcast total, hoisted
++  xorl %r12d, %r12d
++.LBB5: cmpl $2048, %r12d / jge .LBB7
 +.LBB6:
-+  movslq %ebp, %r12
-+  leaq (%r14, %r12), %r10
-+  ...
-+  vmovupd (%rax), %ymm0
-+  vfmadd231pd (%rdx), %ymm1, %ymm0
-+  vmovupd %ymm0, (%rax)
-+  ... x4, 0 vmovsd inside LBB6
++  movslq %r12d, %r10
++  vmovupd (%rbx,%r10), %ymm0
++  vfmadd231pd (%r14,%r10), %ymm1, %ymm0
++  vmovupd %ymm0, (%rbx,%r10)
++  vmovupd 32(%rbx,%r10), %ymm0
++  vfmadd231pd 32(%r14,%r10), %ymm1, %ymm0
++  vmovupd %ymm0, 32(%rbx,%r10)
++  vmovupd 64(%rbx,%r10), %ymm0
++  vfmadd231pd 64(%r14,%r10), %ymm1, %ymm0
++  vmovupd %ymm0, 64(%rbx,%r10)
++  vmovupd 96(%rbx,%r10), %ymm0
++  vfmadd231pd 96(%r14,%r10), %ymm1, %ymm0
++  vmovupd %ymm0, 96(%rbx,%r10)
++  addl $128, %r12d
++  movslq %r12d, %r12
++  jmp .LBB5
 +```
 +
-+- `vmovsd` count total: 1 (preheader) vs 4 before inside loop.
-+- `vbroadcastsd` count total: 1 vs 4 before.
-+- LBB6 vmovsd count: 0 (was 4).
++- vmovsd total: 1 (preheader)
++- vbroadcastsd total: 1
++- LBB6: 0 leaq for B/C addresses (was 11), 0 movq (was 8), 0 extra Adds (was 6)
++- LBB6 insns: movslq + 12 FMA + addl + movslq + jmp = 16 (was 32)
++- Function insns: 74 (was 96), gcc 25, clang 438
++- Gap vs best: 49 (was 71)
++- Loads: 28 (was 36), stores 1, vec 12
 +
 +## Validation
 +
-+- `cargo test --profile fastbuild --locked`: 1304 passed, 0 failed.
-+- `target/fastbuild/lccc -O3 -march=x86-64-v3 -S -o /tmp/matmul.s tests/benchmark/programs/matmul.c`
-+  verified hoist.
-+- `scripts/godbolt.py compare ... --function matmul`:
-+  - lccc 96 insns, gcc16.2 25 insns, clang 438 insns.
-+  - Still behind GCC (GCC uses tighter SIB and less LEA overhead), but broadcast hoist
-+    removes 8 insns per iteration (4 loads + 4 broadcasts) and reduces memory traffic.
-+- `scripts/codegen_scoreboard.py .../matmul.c`: gap 71 vs best (gcc=25), loads 36, stores 7, vec 12.
++- `cargo test --profile fastbuild`: 1306 passed, 0 failed (was 1304)
++- `target/fastbuild/lccc -O3 -march=x86-64-v3 -S` verified SIB disp form
++- `scripts/godbolt.py compare ... --function matmul`: lccc 74 vs gcc 25 vs clang 438
++- `scripts/codegen_scoreboard.py`: gap 49 vs 71 before
 +
-+## Next steps
++## Remaining gaps vs GCC (25 vs 74)
 +
-+- Reduce LEA/movq overhead in quad FMA: current emits `leaq (%r14,%r12), %r10; movq %r10, %rdx; movq %r9, %rax`
-+  for each chunk. Backend could use SIB directly: `vmovupd (%rbx,%r12), %ymm0` and
-+  `vfmadd231pd (%r14,%r12), %ymm1, %ymm0` without extra moves. Requires `FmaF64x4HoistedSIB`
-+  or smarter regalloc that recognizes GEP base+offset as single SIB.
-+- Consider unrolling k-loop or tiling for cache, but P0 is correctness + broadcast hoist.
-+- Apply same hoist to `transform_to_fma_f64x4` remainder handling if needed.
-+- Update snapshot ledger, deliver patch.
++GCC inner loop (from godbolt):
++
++```
++vbroadcastsd (%rdi), %ymm2
++vbroadcastsd 8(%rdi), %ymm1
++.L3:
++  vmovapd (%rcx,%rax), %ymm0
++  vfmadd213pd (%rdx,%rax), %ymm2, %ymm0
++  vmovapd %ymm0, (%rdx,%rax)
++  vfmadd231pd (%rsi,%rax), %ymm1, %ymm0
++  vmovapd %ymm0, (%rdx,%rax)
++  addq $32, %rax
++  cmpq $2048, %rax
++  jne .L3
++```
++
++- GCC unrolls k-loop by 2: 2 broadcasts per j-loop, 2 FMAs per j iteration
++  accumulating 2 k values into same C without reload? Actually it loads B[k][j],
++  FMA into C, stores, then FMA B[k+1][j] into same C (reusing ymm0).
++- Our version does 1 k per j-loop, 4-wide j-unroll. GCC's approach reduces k-loop
++  iterations by 2× and improves cache reuse (A row stays in register for 2 k's?).
++
++**Next steps:**
++
++- Implement k-unroll by 2 in vectorizer: hoist 2 A broadcasts (ymm1, ymm2) and emit
++  2× quad SIB FMA per j iteration, or 8× FMA with 2 broadcast registers.
++  This would match GCC's 2× k unroll and potentially beat GCC on j-unroll.
++
++- Eliminate double movslq: IV is byte offset i32, but SIB needs 64-bit index.
++  32-bit ops zero-extend on x86-64, so `addl` already zero-extends; `movslq`
++  is only needed for sign-extension. Since offset is always positive <2GB,
++  zero-extend = sign-extend, so second movslq is redundant. Make IV i64.
++
++- Use `vmovapd` vs `vmovupd`: GCC uses aligned `vmovapd` (faster on some uarchs)
++  when it can prove alignment. Our C/B arrays are 16-byte aligned but j offset
++  may not be 32-byte aligned for all chunks? 32-byte aligned for chunk 0, but
++  32-byte offset for chunk1 etc preserves alignment if base is 32-byte aligned.
++  We have 16-byte aligned BSS, not 32. Could promote to 32-byte align for AVX.
++
++- Consider `vzeroupper` after matmul to avoid AVX-SSE transition penalty (GCC does).
 +
 +## Artifacts
 +
-+- `/home/user/ms178-1.patch` (12K, 245 lines) — applies clean on `796058f0`, includes:
-+  - `04ed7f41 paravirt-improved` (Cast/Sub, versioned symbols, GOT/TLS guards, Copy-chain const extraction)
-+  - matmul broadcast hoist fix.
-+- `/tmp/matmul.s` final asm with hoisted broadcast.
-+- `/tmp/matmul_godbolt/` compare artifacts.
-diff --git a/src/backend/x86/codegen/calls.rs b/src/backend/x86/codegen/calls.rs
-index 10c85052..f0018490 100644
---- a/src/backend/x86/codegen/calls.rs
-+++ b/src/backend/x86/codegen/calls.rs
-@@ -25,8 +25,42 @@ impl X86Codegen {
-         }
-     }
++- `/home/user/ms178-1.patch` 22K, 462 lines, APPLIES-CLEAN on cdd3ba45
++- `/tmp/matmul.s` final SIB+hoisted asm
++- `/tmp/matmul_godbolt/` manifest: lccc 74, gcc 25, clang 438
+diff --git a/src/backend/arm/codegen/intrinsics.rs b/src/backend/arm/codegen/intrinsics.rs
+index 30f27c27..467ef3ca 100644
+--- a/src/backend/arm/codegen/intrinsics.rs
++++ b/src/backend/arm/codegen/intrinsics.rs
+@@ -529,6 +529,7 @@ impl ArmCodegen {
+             | IntrinsicOp::FmaF64x4
+             | IntrinsicOp::FmaF64x4Hoisted
+             | IntrinsicOp::FmaF64x4SIB
++            | IntrinsicOp::FmaF64x4HoistedSIB
+             | IntrinsicOp::LoadF64x4
+             | IntrinsicOp::LoadF64x2
+             | IntrinsicOp::LoadI32x8
+diff --git a/src/backend/generation.rs b/src/backend/generation.rs
+index 8331c55a..085c3587 100644
+--- a/src/backend/generation.rs
++++ b/src/backend/generation.rs
+@@ -3603,6 +3603,9 @@ fn generate_function(
+             matches!(inst, Instruction::Intrinsic { op, .. }
+             if matches!(op,
+                 crate::ir::intrinsics::IntrinsicOp::FmaF64x4
++                | crate::ir::intrinsics::IntrinsicOp::FmaF64x4Hoisted
++                | crate::ir::intrinsics::IntrinsicOp::FmaF64x4SIB
++                | crate::ir::intrinsics::IntrinsicOp::FmaF64x4HoistedSIB
+                 | crate::ir::intrinsics::IntrinsicOp::FmaF64x2
+                 | crate::ir::intrinsics::IntrinsicOp::FmaF64x2Hoisted
+                 | crate::ir::intrinsics::IntrinsicOp::VecZeroF64x4
+diff --git a/src/backend/i686/codegen/intrinsics.rs b/src/backend/i686/codegen/intrinsics.rs
+index 267a058f..5c375174 100644
+--- a/src/backend/i686/codegen/intrinsics.rs
++++ b/src/backend/i686/codegen/intrinsics.rs
+@@ -186,6 +186,7 @@ impl I686Codegen {
+             | IntrinsicOp::FmaF64x4Hoisted
+             | IntrinsicOp::BroadcastLoadF64
+             | IntrinsicOp::FmaF64x4SIB
++            | IntrinsicOp::FmaF64x4HoistedSIB
+             | IntrinsicOp::LoadF64x4
+             | IntrinsicOp::LoadF64x2
+             | IntrinsicOp::LoadI32x8
+diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
+index e80c65c4..e604f744 100644
+--- a/src/backend/regalloc.rs
++++ b/src/backend/regalloc.rs
+@@ -4013,6 +4013,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
+                 | O::FmaF64x4
+                 | O::FmaF64x4Hoisted
+                 | O::FmaF64x4SIB
++                | O::FmaF64x4HoistedSIB
+                 | O::BroadcastLoadF64
+                 | O::LoadF64x2
+                 | O::LoadF64x4
+diff --git a/src/backend/riscv/codegen/intrinsics.rs b/src/backend/riscv/codegen/intrinsics.rs
+index ade57ef8..cae39604 100644
+--- a/src/backend/riscv/codegen/intrinsics.rs
++++ b/src/backend/riscv/codegen/intrinsics.rs
+@@ -410,6 +410,7 @@ impl RiscvCodegen {
+             | IntrinsicOp::FmaF64x4Hoisted
+             | IntrinsicOp::BroadcastLoadF64
+             | IntrinsicOp::FmaF64x4SIB
++            | IntrinsicOp::FmaF64x4HoistedSIB
+             | IntrinsicOp::LoadF64x4
+             | IntrinsicOp::LoadF64x2
+             | IntrinsicOp::LoadI32x8
+diff --git a/src/backend/stack_layout/copy_coalescing.rs b/src/backend/stack_layout/copy_coalescing.rs
+index 1b3d646f..a0244836 100644
+--- a/src/backend/stack_layout/copy_coalescing.rs
++++ b/src/backend/stack_layout/copy_coalescing.rs
+@@ -1855,6 +1855,7 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
+             | O::FmaF64x4
+             | O::FmaF64x4Hoisted
+             | O::FmaF64x4SIB
++            | O::FmaF64x4HoistedSIB
+             | O::BroadcastLoadF64
+             | O::LoadF64x2
+             | O::LoadF64x4
+diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
+index ab523a77..08d744f3 100644
+--- a/src/backend/x86/codegen/intrinsics.rs
++++ b/src/backend/x86/codegen/intrinsics.rs
+@@ -2597,6 +2597,146 @@ impl X86Codegen {
  
--    /// Resolve a Value chain that ends in GlobalAddr, accumulating GEP/Add offsets.
--    /// Returns (symbol_name, total_offset) if the chain is GlobalAddr (+ GEPs/Copies/Adds).
-+    /// Extract a constant i64 from an Operand, following Copy chains.
-+    fn operand_const_i64(&self, op: &Operand) -> Option<i64> {
-+        match op {
-+            Operand::Const(c) => c.to_i64(),
-+            Operand::Value(v) => {
-+                let mut cur = v.0;
-+                let mut visited = 0;
-+                loop {
-+                    if visited > 16 {
-+                        return None;
-+                    }
-+                    visited += 1;
-+                    let inst = self.get_defining_instruction(cur)?;
-+                    match inst {
-+                        Instruction::Copy { src, .. } => match src {
-+                            Operand::Const(c) => return c.to_i64(),
-+                            Operand::Value(nv) => cur = nv.0,
-+                        },
-+                        Instruction::Cast { src, .. } => match src {
-+                            Operand::Const(c) => return c.to_i64(),
-+                            Operand::Value(nv) => cur = nv.0,
-+                        },
-+                        _ => return None,
-+                    }
-+                }
-+            }
-+        }
-+    }
-+
-+    /// Resolve a Value chain that ends in GlobalAddr, accumulating GEP/Add/Sub/Cast offsets.
-+    /// Returns (symbol_name, total_offset) if the chain is GlobalAddr (+ GEPs/Copies/Adds/Subs/Casts).
-+    /// This is the paravirt fast-path: `pv_ops` is a struct of function pointers, so
-+    /// `Load(GEP(GlobalAddr pv_ops, off))` must become `call *pv_ops+off(%rip)` (ff 15)
-+    /// for `apply_alternatives` to patch. The resolver is intentionally generous:
-+    /// it follows Cast (bitcast/ptrtoint/inttoptr), Copy, Add (Value+Const), Sub (Value-Const),
-+    /// and GEP with const or Copy-of-const offsets, with checked arithmetic and 64-hop bound.
-     fn resolve_global_addr_chain(&self, mut val_id: u32, mut acc: i64) -> Option<(String, i64)> {
-         let mut visited = 0;
-         loop {
-@@ -37,34 +71,54 @@ impl X86Codegen {
-             let inst = self.get_defining_instruction(val_id)?;
-             match inst {
-                 Instruction::GlobalAddr { name, .. } => {
--                    return Some((name.clone(), acc));
-+                    // Strip version suffix for GAS: `sym@VER+off(%rip)` is rejected by gas 2.47,
-+                    // while `sym+off(%rip)` with base name is accepted and linker resolves version.
-+                    let base = name.split('@').next().unwrap_or(name).to_string();
-+                    return Some((base, acc));
-                 }
-                 Instruction::GetElementPtr { base, offset, .. } => {
--                    let off = match offset {
--                        Operand::Const(c) => c.to_i64()?,
--                        _ => return None,
--                    };
-+                    let off = self.operand_const_i64(offset)?;
-                     acc = acc.checked_add(off)?;
-                     val_id = base.0;
-                 }
-                 Instruction::Copy { src, .. } => match src {
-                     Operand::Value(v) => val_id = v.0,
-+                    Operand::Const(_) => return None, // Copy of const is not a global chain
-+                },
-+                Instruction::Cast { src, .. } => match src {
-+                    Operand::Value(v) => val_id = v.0,
-+                    Operand::Const(_) => return None,
-+                },
-+                Instruction::BinOp { op, lhs, rhs, .. } => match op {
-+                    IrBinOp::Add => {
-+                        let (base_val, const_off) = match (lhs, rhs) {
-+                            (Operand::Value(v), c) => {
-+                                let co = self.operand_const_i64(c)?;
-+                                (v.0, co)
-+                            }
-+                            (c, Operand::Value(v)) => {
-+                                let co = self.operand_const_i64(c)?;
-+                                (v.0, co)
-+                            }
-+                            _ => return None,
-+                        };
-+                        acc = acc.checked_add(const_off)?;
-+                        val_id = base_val;
-+                    }
-+                    IrBinOp::Sub => {
-+                        // Only Value - Const is representable as sym+off (off decreases)
-+                        let (base_val, const_off) = match (lhs, rhs) {
-+                            (Operand::Value(v), c) => {
-+                                let co = self.operand_const_i64(c)?;
-+                                (v.0, co)
-+                            }
-+                            _ => return None,
-+                        };
-+                        acc = acc.checked_sub(const_off)?;
-+                        val_id = base_val;
-+                    }
-                     _ => return None,
-                 },
--                Instruction::BinOp {
--                    op: IrBinOp::Add,
--                    lhs,
--                    rhs,
--                    ..
--                } => {
--                    let (base_val, const_off) = match (lhs, rhs) {
--                        (Operand::Value(v), Operand::Const(c)) => (v.0, c.to_i64()?),
--                        (Operand::Const(c), Operand::Value(v)) => (v.0, c.to_i64()?),
--                        _ => return None,
--                    };
--                    acc = acc.checked_add(const_off)?;
--                    val_id = base_val;
--                }
-                 _ => return None,
+                 self.state.reg_cache.invalidate_all();
              }
-         }
-@@ -73,6 +127,7 @@ impl X86Codegen {
-     /// Try to resolve an indirect call's func_ptr Operand to a global+offset.
-     /// The func_ptr is expected to be Value(Load(ptr)), where ptr is GEP chain
-     /// ending in GlobalAddr (e.g. pv_ops+72). Returns Some((sym, off)) if so.
-+    /// Also handles the case where Load was folded or func_ptr itself is the GEP chain.
-     fn try_resolve_indirect_call_global(&self, op: &Operand) -> Option<(String, i64)> {
-         let v = match op {
-             Operand::Value(v) => v,
-@@ -80,10 +135,32 @@ impl X86Codegen {
-         };
-         let inst = self.get_defining_instruction(v.0)?;
-         match inst {
--            Instruction::Load { ptr, .. } => self.resolve_global_addr_chain(ptr.0, 0),
--            // In case the Load was already folded or func_ptr is directly a GEP'd global
--            // address that was loaded via slot (defensive), try resolving the value itself.
--            _ => self.resolve_global_addr_chain(v.0, 0),
-+            Instruction::Load { ptr, .. } => {
-+                // If the loaded pointer's defining chain is global+off, we can emit direct call.
-+                // Guard against GOT/TLS/absolute symbols that need different addressing.
-+                let (sym, off) = self.resolve_global_addr_chain(ptr.0, 0)?;
-+                // Don't use RIP-relative call for symbols that need GOT or are TLS/absolute —
-+                // those would need GOTPCREL or fs: addressing, not plain *sym(%rip).
-+                if self.state.needs_got_for_addr(&sym)
-+                    || self.state.tls_symbols.contains(&sym)
-+                    || self.state.absolute_symbols.contains(&sym)
-+                {
-+                    return None;
++            IntrinsicOp::FmaF64x4HoistedSIB => {
++                self.flush_pending_vec_store_impl();
++                self.state.invalidate_vec_peephole();
++                // Optimal quad-FMA: SIB + hoisted broadcast.
++                // args[0] = C base pointer (row base, loop-invariant)
++                // args[1] = B base pointer (row base, loop-invariant)
++                // args[2] = byte offset (j*8, shared across 4 chunks)
++                // args[3] = optional displacement (0,32,64,96) as const
++                //           If present, emits disp(%base,%off) without extra leaq.
++                //           If absent, falls back to 3-arg form where offset
++                //           may itself be Add(base, disp) — we fold that too.
++                //
++                // Result per iteration (godlike):
++                //   movslq %r12d, %r10
++                //   vmovupd (%rbx,%r10), %ymm0 / vfmadd (%r14,%r10), %ymm1, %ymm0 / vmovupd %ymm0, (%rbx,%r10)
++                //   vmovupd 32(%rbx,%r10), %ymm0 / vfmadd 32(%r14,%r10), %ymm1, %ymm0 / ...
++                //   vmovupd 64(%rbx,%r10), %ymm0 / ...
++                //   vmovupd 96(%rbx,%r10), %ymm0 / ...
++                // Total: 1 movslq + 12 FMA + loop control = ~15 insns vs GCC 25 total func.
++
++                // Extract displacement from 4th arg if present
++                let mut disp: i64 = 0;
++                if args.len() >= 4 {
++                    if let Operand::Const(c) = &args[3] {
++                        if let Some(d) = c.to_i64() {
++                            disp = d;
++                        }
++                    }
++                } else {
++                    // Backward compat: try to fold offset = base + const
++                    if let Operand::Value(v) = &args[2] {
++                        if let Some(inst) = self.get_defining_instruction(v.0) {
++                            if let crate::ir::reexports::Instruction::BinOp {
++                                op: crate::ir::reexports::IrBinOp::Add,
++                                lhs,
++                                rhs,
++                                ..
++                            } = inst
++                            {
++                                let try_extract =
++                                    |a: &Operand, b: &Operand| -> Option<(Operand, i64)> {
++                                        match (a, b) {
++                                            (Operand::Value(_), Operand::Const(c)) => {
++                                                c.to_i64().map(|d| (a.clone(), d))
++                                            }
++                                            (Operand::Const(c), Operand::Value(_)) => {
++                                                c.to_i64().map(|d| (b.clone(), d))
++                                            }
++                                            _ => None,
++                                        }
++                                    };
++                                if let Some((_, d)) = try_extract(lhs, rhs) {
++                                    disp = d;
++                                }
++                            }
++                        }
++                    }
 +                }
-+                Some((sym, off))
-+            }
-+            // Defensive: func_ptr itself might be the GEP chain (if Load was optimized away
-+            // or value is in slot that holds address, not loaded value). Try resolving it.
-+            _ => {
-+                let (sym, off) = self.resolve_global_addr_chain(v.0, 0)?;
-+                if self.state.needs_got_for_addr(&sym)
-+                    || self.state.tls_symbols.contains(&sym)
-+                    || self.state.absolute_symbols.contains(&sym)
-+                {
-+                    return None;
++
++                // If we folded from Add, we need base offset Value, not the Add result.
++                // For 4-arg form, base is args[2]; for 3-arg folded form, base is lhs of Add.
++                let off_operand: Operand = if args.len() >= 4 {
++                    args[2].clone()
++                } else if disp != 0 {
++                    // Extract base from Add
++                    if let Operand::Value(v) = &args[2] {
++                        if let Some(crate::ir::reexports::Instruction::BinOp {
++                            lhs, rhs, ..
++                        }) = self.get_defining_instruction(v.0)
++                        {
++                            if matches!(lhs, Operand::Value(_))
++                                && matches!(rhs, Operand::Const(_))
++                            {
++                                lhs.clone()
++                            } else if matches!(rhs, Operand::Value(_))
++                                && matches!(lhs, Operand::Const(_))
++                            {
++                                rhs.clone()
++                            } else {
++                                args[2].clone()
++                            }
++                        } else {
++                            args[2].clone()
++                        }
++                    } else {
++                        args[2].clone()
++                    }
++                } else {
++                    args[2].clone()
++                };
++
++                let c_name = if let Some(r) = self.operand_reg(&args[0]) {
++                    super::emit::phys_reg_name(r)
++                } else {
++                    self.operand_to_reg(&args[0], "rax");
++                    "rax"
++                };
++                let b_name = if let Some(r) = self.operand_reg(&args[1]) {
++                    super::emit::phys_reg_name(r)
++                } else {
++                    self.operand_to_reg(&args[1], "rdx");
++                    "rdx"
++                };
++                let off_name = if let Some(r) = self.operand_reg(&off_operand) {
++                    super::emit::phys_reg_name(r)
++                } else {
++                    self.operand_to_reg(&off_operand, "rsi");
++                    "rsi"
++                };
++
++                if disp == 0 {
++                    self.state.emit_fmt(format_args!(
++                        "    vmovupd (%{},%{}), %ymm0",
++                        c_name, off_name
++                    ));
++                    self.state.emit_fmt(format_args!(
++                        "    vfmadd231pd (%{},%{}), %ymm1, %ymm0",
++                        b_name, off_name
++                    ));
++                    self.state.emit_fmt(format_args!(
++                        "    vmovupd %ymm0, (%{},%{})",
++                        c_name, off_name
++                    ));
++                } else {
++                    self.state.emit_fmt(format_args!(
++                        "    vmovupd {}(%{},%{}), %ymm0",
++                        disp, c_name, off_name
++                    ));
++                    self.state.emit_fmt(format_args!(
++                        "    vfmadd231pd {}(%{},%{}), %ymm1, %ymm0",
++                        disp, b_name, off_name
++                    ));
++                    self.state.emit_fmt(format_args!(
++                        "    vmovupd %ymm0, {}(%{},%{})",
++                        disp, c_name, off_name
++                    ));
 +                }
-+                Some((sym, off))
++
++                self.state.reg_cache.invalidate_all();
 +            }
-         }
-     }
+ 
+             // --- Vector loads for reduction patterns ---
+             IntrinsicOp::LoadF64x4 => {
+diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
+index bfd4feab..fabca44e 100644
+--- a/src/backend/x86/codegen/prologue.rs
++++ b/src/backend/x86/codegen/prologue.rs
+@@ -417,6 +417,7 @@ impl X86Codegen {
+                                 | IntrinsicOp::FmaF64x4
+                                 | IntrinsicOp::FmaF64x4Hoisted
+                                 | IntrinsicOp::FmaF64x4SIB
++                                | IntrinsicOp::FmaF64x4HoistedSIB
+                                 | IntrinsicOp::LoadF64x4
+                                 | IntrinsicOp::LoadF64x2
+                                 | IntrinsicOp::LoadI32x8
+diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
+index 94a4483d..518bf3b1 100644
+--- a/src/ir/intrinsics.rs
++++ b/src/ir/intrinsics.rs
+@@ -163,6 +163,16 @@ pub enum IntrinsicOp {
+     /// args[2] = B base pointer (row base, loop-invariant in j-loop)
+     /// args[3] = byte offset (the j-loop IV, increments by 32 each iteration)
+     FmaF64x4SIB,
++    /// Like FmaF64x4SIB but with A broadcast hoisted to ymm1.
++    /// Eliminates both GEP address computation AND broadcast load from inner loop.
++    /// args[0] = C base pointer (row base, loop-invariant)
++    /// args[1] = B base pointer (row base, loop-invariant)
++    /// args[2] = byte offset (j-loop IV, shared across chunks)
++    /// args[3] = optional displacement (0,32,64,96) for quad unroll — if present,
++    ///           emits disp(%base,%off) SIB, avoiding extra leaq/addq.
++    ///           If absent, behaves like 3-arg form (offset already includes chunk).
++    /// ymm1 must already hold broadcasted A[i][k] (from BroadcastLoadF64).
++    FmaF64x4HoistedSIB,
+ 
+     // --- Vector loads for reduction patterns ---
+     /// Load 4 packed doubles (256-bit unaligned): vmovupd
+@@ -1119,7 +1129,7 @@ impl IntrinsicOp {
+             | Psllwi256 | Psrlwi256 | Broadcast128to256 | Zext128to256
+             | Insert128to256 | SetEpi16_256 | SetEpi32_256 | SetEpi64x256 | SetEpi8_256
+             | Dpbusd256 | Dpbssd256 | Dpwuud256 | Aesenc256 | Vpclmulqdq256
+-            | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB
++            | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB | FmaF64x4HoistedSIB
+             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
+             | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8
+             | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4
+diff --git a/src/passes/vector_temp_promotion.rs b/src/passes/vector_temp_promotion.rs
+index 5f5f38d3..c07d42c6 100644
+--- a/src/passes/vector_temp_promotion.rs
++++ b/src/passes/vector_temp_promotion.rs
+@@ -393,6 +393,7 @@ fn intrinsic_arg_required_alignment(op: IntrinsicOp, index: usize) -> Option<usi
+         O::FmaF64x2 | O::FmaF64x4 => index < 2,
+         O::FmaF64x2Hoisted | O::FmaF64x4Hoisted => index == 0,
+         O::FmaF64x4SIB => index < 3,
++        O::FmaF64x4HoistedSIB => index < 2,
+         O::BroadcastLoadF64 | O::Rdtscp | O::Clflush => index == 0,
+         _ => false,
+     };
+@@ -425,7 +426,8 @@ fn intrinsic_dest_required_alignment(
+         | O::FmaF64x2Hoisted
+         | O::FmaF64x4
+         | O::FmaF64x4Hoisted
+-        | O::FmaF64x4SIB => Some(0),
++        | O::FmaF64x4SIB
++        | O::FmaF64x4HoistedSIB => Some(0),
+         // The aligned AVX store contract must survive even though today's
+         // backend happens to use its generic unaligned destination helper.
+         O::Store256 => Some(32),
+@@ -449,6 +451,7 @@ fn intrinsic_overwrites_full_result(op: IntrinsicOp) -> bool {
+             | IntrinsicOp::FmaF64x4
+             | IntrinsicOp::FmaF64x4Hoisted
+             | IntrinsicOp::FmaF64x4SIB
++            | IntrinsicOp::FmaF64x4HoistedSIB
+             | IntrinsicOp::BroadcastLoadF64
+             | IntrinsicOp::Storedqu
+             | IntrinsicOp::Storeldi128
+@@ -470,6 +473,7 @@ fn intrinsic_dest_reads_old_value(op: IntrinsicOp) -> bool {
+             | IntrinsicOp::FmaF64x4
+             | IntrinsicOp::FmaF64x4Hoisted
+             | IntrinsicOp::FmaF64x4SIB
++            | IntrinsicOp::FmaF64x4HoistedSIB
+     )
+ }
  
 diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index 81d27c41..6d99964f 100644
+index 6d99964f..1ef5dec2 100644
 --- a/src/passes/vectorize.rs
 +++ b/src/passes/vectorize.rs
-@@ -7627,10 +7627,37 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
+@@ -7654,21 +7654,29 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
          }
      }
  
--    // Step 3: Replace the body with FOUR FmaF64x4 (4-way software pipeline).
-+    // Hoist the loop-invariant A[i][k] scalar broadcast to the preheader.
-+    // Backend keeps it in ymm1, reused across all 4 FMA lanes (saves 3× vmovsd+vbroadcastsd per iter).
-+    if let Some(preheader_idx) = func.blocks.iter().enumerate().find_map(|(idx, block)| {
-+        if pattern.loop_blocks.contains(&idx) {
-+            return None;
-+        }
-+        matches!(block.terminator, Terminator::Branch(label)
-+            if label == func.blocks[pattern.header_idx].label)
-+        .then_some(idx)
-+    }) {
-+        func.blocks[preheader_idx]
-+            .instructions
-+            .push(Instruction::Intrinsic {
-+                dest: None,
-+                op: IntrinsicOp::BroadcastLoadF64,
-+                dest_ptr: None,
-+                args: vec![Operand::Value(pattern.a_ptr)],
-+            });
-+        changes += 1;
-+        if debug {
-+            eprintln!(
-+                "[VEC]   Hoisted BroadcastLoadF64 for A ptr Value({}) into preheader block {}",
-+                pattern.a_ptr.0, preheader_idx
-+            );
-+        }
-+    }
-+
-+    // Step 3: Replace the body with FOUR FmaF64x4Hoisted (4-way software pipeline).
-     // Chunks at byte offsets IV+{0,32,64,96}. Independent C/B lanes give the
-     // backend four concurrent vfmadd231pd chains — the shape GCC emits for
--    // the 256³ matmul kernel on x86-64-v3.
-+    // the 256³ matmul kernel on x86-64-v3. A broadcast is already in ymm1.
+-    // Step 3: Replace the body with FOUR FmaF64x4Hoisted (4-way software pipeline).
+-    // Chunks at byte offsets IV+{0,32,64,96}. Independent C/B lanes give the
+-    // backend four concurrent vfmadd231pd chains — the shape GCC emits for
+-    // the 256³ matmul kernel on x86-64-v3. A broadcast is already in ymm1.
++    // Step 3: Replace the body with FOUR FmaF64x4HoistedSIB (SIB + hoisted broadcast).
++    // This is the optimal form: SIB eliminates GEP leaq/movq overhead, hoisted
++    // broadcast eliminates vmovsd+vbroadcastsd per chunk.
++    // Chunks at byte offsets IV+{0,32,64,96}. Each chunk does:
++    //   vmovupd (C_base+off), %ymm0
++    //   vfmadd231pd (B_base+off), %ymm1, %ymm0
++    //   vmovupd %ymm0, (C_base+off)
++    // where %ymm1 already holds A[i][k] from BroadcastLoadF64 in preheader.
++    // Total per iteration: 1 movslq (IV conv) + 3 adds (off+32/64/96) + 12 FMA insns
++    // vs previous 11 leaq + 8 movq + 12 FMA = 31 insns. Matches GCC SIB pattern.
      {
          let body = &mut func.blocks[pattern.body_idx];
          let store_pos = body.instructions.iter().position(
-@@ -7664,9 +7691,9 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
-         // Chunk 0 uses the existing GEPs.
-         prelude.push(Instruction::Intrinsic {
-             dest: None,
--            op: IntrinsicOp::FmaF64x4,
-+            op: IntrinsicOp::FmaF64x4Hoisted,
-             dest_ptr: Some(pattern.c_gep),
--            args: vec![Operand::Value(pattern.a_ptr), Operand::Value(pattern.b_gep)],
-+            args: vec![Operand::Value(pattern.b_gep)],
-         });
-         for chunk in 1u64..4 {
-             let byte_off = chunk * 32;
-@@ -7706,9 +7733,9 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
-             });
-             prelude.push(Instruction::Intrinsic {
-                 dest: None,
--                op: IntrinsicOp::FmaF64x4,
-+                op: IntrinsicOp::FmaF64x4Hoisted,
-                 dest_ptr: Some(c_gep_n),
--                args: vec![Operand::Value(pattern.a_ptr), Operand::Value(b_gep_n)],
-+                args: vec![Operand::Value(b_gep_n)],
-             });
+             |inst| matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.c_gep),
+         );
+ 
+-        let (b_base, b_off, c_base, c_off) = {
++        // Extract base pointers and byte offset from existing GEPs.
++        // b_base = B row base (B + k*256*8), c_base = C row base (C + i*256*8)
++        // b_off = c_off = j*8 (shared IV-derived offset)
++        let (b_base, b_off, c_base) = {
+             let mut b_base = pattern.b_gep;
+             let mut b_off = Operand::Const(IrConst::I64(0));
+             let mut c_base = pattern.c_gep;
+-            let mut c_off = Operand::Const(IrConst::I64(0));
+             for inst in &body.instructions {
+                 if let Instruction::GetElementPtr {
+                     dest, base, offset, ..
+@@ -7680,63 +7688,49 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
+                     }
+                     if *dest == pattern.c_gep {
+                         c_base = *base;
+-                        c_off = offset.clone();
++                        // c_off should equal b_off, but we keep b_off as canonical
+                     }
+                 }
+             }
+-            (b_base, b_off, c_base, c_off)
++            (b_base, b_off, c_base)
+         };
+ 
+         let mut prelude: Vec<Instruction> = Vec::new();
+-        // Chunk 0 uses the existing GEPs.
+-        prelude.push(Instruction::Intrinsic {
+-            dest: None,
+-            op: IntrinsicOp::FmaF64x4Hoisted,
+-            dest_ptr: Some(pattern.c_gep),
+-            args: vec![Operand::Value(pattern.b_gep)],
+-        });
+-        for chunk in 1u64..4 {
+-            let byte_off = chunk * 32;
+-            let b_off_n = Value(next_val_id);
+-            next_val_id += 1;
+-            let c_off_n = Value(next_val_id);
+-            next_val_id += 1;
+-            let b_gep_n = Value(next_val_id);
+-            next_val_id += 1;
+-            let c_gep_n = Value(next_val_id);
+-            next_val_id += 1;
+-            prelude.push(Instruction::BinOp {
+-                dest: b_off_n,
+-                op: IrBinOp::Add,
+-                lhs: b_off.clone(),
+-                rhs: Operand::Const(IrConst::I64(byte_off as i64)),
+-                ty: IrType::I64,
+-            });
+-            prelude.push(Instruction::BinOp {
+-                dest: c_off_n,
+-                op: IrBinOp::Add,
+-                lhs: c_off.clone(),
+-                rhs: Operand::Const(IrConst::I64(byte_off as i64)),
+-                ty: IrType::I64,
+-            });
+-            prelude.push(Instruction::GetElementPtr {
+-                dest: b_gep_n,
+-                base: b_base,
+-                offset: Operand::Value(b_off_n),
+-                ty: IrType::F64,
+-            });
+-            prelude.push(Instruction::GetElementPtr {
+-                dest: c_gep_n,
+-                base: c_base,
+-                offset: Operand::Value(c_off_n),
+-                ty: IrType::F64,
+-            });
+-            prelude.push(Instruction::Intrinsic {
+-                dest: None,
+-                op: IntrinsicOp::FmaF64x4Hoisted,
+-                dest_ptr: Some(c_gep_n),
+-                args: vec![Operand::Value(b_gep_n)],
+-            });
++
++        // Quad SIB with displacement: all 4 chunks share same byte offset (j*8)
++        // plus disp 0,32,64,96 encoded as 4th arg. No extra BinOp Adds needed.
++        // This yields optimal asm:
++        //   vmovupd (%rbx,%r10), %ymm0 / vfmadd  (%r14,%r10), %ymm1, %ymm0 / vmovupd %ymm0, (%rbx,%r10)
++        //   vmovupd 32(%rbx,%r10), %ymm0 / vfmadd 32(%r14,%r10), %ymm1, %ymm0 / ...
++        //   vmovupd 64(%rbx,%r10), %ymm0 / ...
++        //   vmovupd 96(%rbx,%r10), %ymm0 / ...
++        // Total: 1 movslq + 12 FMA insns + loop control, no leaq/addq for offsets.
++        for chunk in 0u64..4 {
++            let disp = chunk * 32;
++            if disp == 0 {
++                prelude.push(Instruction::Intrinsic {
++                    dest: None,
++                    op: IntrinsicOp::FmaF64x4HoistedSIB,
++                    dest_ptr: None,
++                    args: vec![
++                        Operand::Value(c_base),
++                        Operand::Value(b_base),
++                        b_off.clone(),
++                    ],
++                });
++            } else {
++                prelude.push(Instruction::Intrinsic {
++                    dest: None,
++                    op: IntrinsicOp::FmaF64x4HoistedSIB,
++                    dest_ptr: None,
++                    args: vec![
++                        Operand::Value(c_base),
++                        Operand::Value(b_base),
++                        b_off.clone(),
++                        Operand::Const(IrConst::I64(disp as i64)),
++                    ],
++                });
++            }
          }
  
-@@ -7722,7 +7749,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
+         if let Some(pos) = store_pos {
+@@ -7749,7 +7743,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
          }
          changes += 4;
          if debug {
--            eprintln!("[VEC]   Inserted quad FmaF64x4 intrinsics (step 128)");
-+            eprintln!("[VEC]   Inserted quad FmaF64x4Hoisted intrinsics (step 128) with broadcast in ymm1");
+-            eprintln!("[VEC]   Inserted quad FmaF64x4Hoisted intrinsics (step 128) with broadcast in ymm1");
++            eprintln!("[VEC]   Inserted quad FmaF64x4HoistedSIB intrinsics (SIB + hoisted broadcast, step 128)");
          }
      }
  
