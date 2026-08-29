@@ -1,684 +1,1273 @@
-diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-index 9283dc2..b110ae3 100644
---- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-+++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
-@@ -168,20 +168,46 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
-                                 // leave garbage in %rax. Extract the source (first
-                                 // operand) and refuse to treat rax-reading sources as
-                                 // an overwrite.
-+                                //
-+                                // The source operand spans up to the LAST comma:
-+                                // SIB-addressing forms like
-+                                // `leaq (%rax, %rax, 2), %rax` contain commas inside
-+                                // the parens, so a first-comma split would cut the
-+                                // source at "(%rax" and lose the register reference.
-+                                //
-+                                // register_family_fast only matches bare "%reg"
-+                                // operands (it returns REG_NONE for anything not
-+                                // starting with '%'), so memory forms that READ %rax
-+                                // — `movq (%rax), %rax` loads through it,
-+                                // `-16(%rbp,%rax,8)` uses it as index — must be
-+                                // detected textually. gcc.c-torture 931004-11 (both
-+                                // miscompilation modes) pins this: `xorl %eax,%eax`
-+                                // materializing a zero index was removed before
-+                                // `leaq (%rax, %rax, 2), %rax`, leaving the entry
-+                                // value of %rax scaled into the element address.
-                                 // "movq %r12, %rax" -> src = "%r12"; "movl %eax, %eax" -> src = "%eax".
-                                 let src = nj
--                                    .split_once(',')
--                                    .map(|(s, _)| {
--                                        // Strip the leading mnemonic (first whitespace token).
--                                        let mut toks = s.splitn(2, char::is_whitespace);
--                                        let _mnemonic = toks.next();
--                                        toks.next().unwrap_or("").trim()
--                                    })
--                                    .unwrap_or("");
-+                                    .rsplit_once(',')
-+                                    .map(|(s, _)| s)
-+                                    .unwrap_or(nj)
-+                                    .splitn(2, char::is_whitespace)
-+                                    .nth(1)
-+                                    .unwrap_or("")
-+                                    .trim();
-                                 let src_fam = register_family_fast(src);
--                                // Source must not be the %rax family. REG_NONE (255) for
--                                // memory/immediate sources -> overwrites (%rax not read).
--                                src_fam != 0
-+                                // Source must not reference the %rax family —
-+                                // register form (family 0) or memory/index form
-+                                // (textual check; REG_NONE covers all parenthesized
-+                                // forms and immediates, and immediates never name
-+                                // a register).
-+                                let src_touches_rax = src_fam == 0
-+                                    || src.contains("%rax")
-+                                    || src.contains("%eax")
-+                                    || src.contains("%ax")
-+                                    || src.contains("%al")
-+                                    || src.contains("%ah");
-+                                // Overwrite only when the source cannot read %rax.
-+                                !src_touches_rax
-                             } else {
-                                 false
-                             }
-diff --git a/src/frontend/parser/ast.rs b/src/frontend/parser/ast.rs
-index 9162001..9b41118 100644
---- a/src/frontend/parser/ast.rs
-+++ b/src/frontend/parser/ast.rs
-@@ -353,6 +353,10 @@ pub struct Declaration {
-     /// Clang __attribute__((ext_vector_type(N))): number of vector elements.
-     /// Resolved to total bytes in lowering via N * sizeof(element_type).
-     pub ext_vector_nelem: Option<usize>,
-+    /// Deferred vector_size(EXPR): EXPR was not parse-time evaluable (e.g.
-+    /// `16 * sizeof(some_typedef)`); resolved in sema where typedef sizes are
-+    /// known.
-+    pub vector_size_expr: Option<Box<Expr>>,
-     pub span: Span,
- }
- 
-@@ -410,6 +414,11 @@ impl Declaration {
-     pub fn set_typedef(&mut self, v: bool) {
-         self.set_flag(decl_flag::TYPEDEF, v)
-     }
-+    /// Attach the deferred (parse-time unevaluable) vector_size expression.
-+    #[inline]
-+    pub fn set_vector_size_expr(&mut self, e: Option<Box<Expr>>) {
-+        self.vector_size_expr = e;
-+    }
-     #[inline]
-     pub fn set_const(&mut self, v: bool) {
-         self.set_flag(decl_flag::CONST, v)
-@@ -467,6 +476,7 @@ impl Declaration {
-             address_space,
-             vector_size,
-             ext_vector_nelem,
-+            vector_size_expr: None,
-             span,
-         }
-     }
-@@ -517,6 +527,7 @@ impl std::fmt::Debug for Declaration {
-             .field("address_space", &self.address_space)
-             .field("vector_size", &self.vector_size)
-             .field("ext_vector_nelem", &self.ext_vector_nelem)
-+            .field("vector_size_expr", &self.vector_size_expr)
-             .field("span", &self.span)
-             .finish()
-     }
-diff --git a/src/frontend/parser/declarations.rs b/src/frontend/parser/declarations.rs
-index d28fad3..c839f01 100644
---- a/src/frontend/parser/declarations.rs
-+++ b/src/frontend/parser/declarations.rs
-@@ -133,6 +133,8 @@ impl Parser {
-                 self.attrs.parsing_ext_vector_nelem.take(),
-                 start,
-             );
-+                let _dbg_vs = d.vector_size_expr.is_some();
-+            d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
-             d.set_static(self.attrs.parsing_static());
-             d.set_extern(self.attrs.parsing_extern());
-             d.set_typedef(self.attrs.parsing_typedef());
-@@ -725,7 +727,7 @@ impl Parser {
-         let is_typedef = self.attrs.parsing_typedef();
-         let is_transparent_union = self.attrs.parsing_transparent_union();
-         self.attrs.set_transparent_union(false);
--        self.register_typedefs(&declarators);
-+        self.register_typedefs(&type_spec, &declarators);
- 
-         self.expect_after(&TokenKind::Semicolon, "after declaration");
-         let mut d = Declaration::new(
-@@ -739,6 +741,7 @@ impl Parser {
-             self.attrs.parsing_ext_vector_nelem.take(),
-             start,
-         );
-+            d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
-         d.set_static(self.attrs.parsing_static());
-         d.set_extern(self.attrs.parsing_extern());
-         d.set_typedef(is_typedef);
-@@ -798,6 +801,7 @@ impl Parser {
-                 self.attrs.parsing_ext_vector_nelem.take(),
-                 start,
-             );
-+                d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
-             d.set_static(is_static);
-             d.set_extern(is_extern);
-             d.set_typedef(self.attrs.parsing_typedef());
-@@ -909,6 +913,7 @@ impl Parser {
-             self.attrs.parsing_ext_vector_nelem.take(),
-             start,
-         );
-+            d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
-         d.set_static(is_static);
-         d.set_extern(is_extern);
-         d.set_typedef(is_typedef);
-@@ -1328,17 +1333,48 @@ impl Parser {
-     }
- 
-     /// Register typedef names from declarators, if parsing_typedef is set.
--    fn register_typedefs(&mut self, declarators: &[InitDeclarator]) {
-+    fn register_typedefs(&mut self, type_spec: &TypeSpecifier, declarators: &[InitDeclarator]) {
-         if self.attrs.parsing_typedef() {
-             for decl in declarators {
-                 if !decl.name.is_empty() {
-                     self.typedefs.insert(decl.name.clone());
-+                    // Record the typedef's full type (base spec + derived
-+                    // pointer/array layers) so parse-time constant
-+                    // expressions can resolve sizeof(typedef) — required for
-+                    // e.g. `__attribute__((vector_size(16 * sizeof(int64_t))))`.
-+                    self.typedef_type_specs.insert(
-+                        decl.name.clone(),
-+                        self.typedef_spec_with_derived(type_spec.clone(), &decl.derived),
-+                    );
-                 }
+From 7ecdd4e84281d84c5adf3453d776f078261613f4 Mon Sep 17 00:00:00 2001
+From: lccc-agent <agent@lccc.local>
+Date: Sat, 29 Aug 2026 12:09:30 +0000
+Subject: [PATCH 1/4] x86-64: fold single-use widening casts into narrow
+ compares (PF-15)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`(int)a < (int)b` on char/short operands widened BOTH operands to
+32/64-bit and then executed a 32/64-bit compare — three extension moves
+where GCC emits one `cmpb`/`cmpw` on the original bytes (its `scmp`
+shape: xorl/cmpb/setl/ret). Byte-sized comparisons are ubiquitous in
+real code (string/protocol parsers, zlib longest_match inner loops);
+every one paid two dead widening moves plus a wide compare.
+
+Mechanism — defer, then fold at the compare:
+
+* A single-use widening Cast (I8/U8/I16/U16 -> 32/64-bit) with a GPR
+  destination and a reg- or slot-homed source DEFERS its extending move
+  (two pending slots) instead of emitting it.
+
+* The consuming Cmp folds the recorded pair into ONE narrow compare on
+  the original sources; a constant rhs folds too when it fits the
+  narrow domain exactly. Anything else flushes the recorded moves
+  unchanged, so the defer is invisible to every non-matching consumer.
+
+* Flag-exactness matrix (proved in the code): sext+sext keeps the
+  signed setcc family (sign extension is order-preserving); zext+zext
+  maps every opcode onto the unsigned family (zero-extended values are
+  non-negative, where signed and unsigned order coincide); mixed
+  extensions and out-of-domain constants are refused and materialize
+  the widens instead.
+
+Soundness (the three hazards, each with an explicit guard):
+
+* Home clobbering between defer and consume: RA may reuse the first
+  source's register for the second cast's destination once the source's
+  only modelled use (the deferred move) ends its live range. The record
+  path refuses (and flushes) when a later cast's destination equals an
+  earlier deferred source's register. The reversed aliasing is
+  impossible: the two SSA ranges overlap by construction. Slot sources
+  are safe because nothing is emitted between record and consume.
+
+* Dispatch bypass: fusion paths, MachInst queueing, and the instruction
+  dispatch all bypass each other, so the flush/fold discipline lives at
+  the single per-instruction loop head every lowering path shares. The
+  fold happens BEFORE MachInst sees the compare; folded compares emit on
+  the classic path, so MachInst's audited gates are untouched.
+
+* Lost records: every refusal path that has already taken records
+  re-emits the taken widening moves explicitly; take-pair restores on
+  any mismatch. A deferred move can never silently vanish.
+
+Unsigned widening casts are gated away from MachInst ISel when they
+match the defer shape (the mature path is the pre-MachInst default, so
+the gate only routes work back to audited code; try_record re-checks
+every condition and emits normally on any mismatch).
+
+The compare itself emits through the existing typed emitter, so slot
+and register sources keep all existing addressing behaviour.
+
+Validated: exhaustive byte-domain suites (all 8 compare shapes x all
+65536 input pairs) and strided 16-bit suites pass bit-identically to
+GCC; new regression test tests/regression/byte_cmp_narrow.c pins the
+shapes end-to-end against GCC; lib gate 1302 passed / 0 failed under
+-D warnings; x86-64 regression corpus 960 passed / 0 failed; i686
+corpus unchanged at its known 403/76 (separate backend); godbolt
+x86-64 oracle census unchanged (6278 vs GCC 5773 instructions, same
+per-program profile as the pre-change baseline). Trace: CCC_DEBUG_PF15.
+---
+ src/backend/generation.rs              |  51 +++
+ src/backend/traits.rs                  |  26 ++
+ src/backend/x86/codegen/cast_ops.rs    | 509 +++++++++++++++++++++----
+ src/backend/x86/codegen/comparison.rs  |   5 +
+ src/backend/x86/codegen/emit.rs        |  53 +++
+ tests/regression/byte_cmp_narrow.c     |  64 ++++
+ tests/regression/byte_cmp_narrow.flags |   1 +
+ 7 files changed, 625 insertions(+), 84 deletions(-)
+ create mode 100644 tests/regression/byte_cmp_narrow.c
+ create mode 100644 tests/regression/byte_cmp_narrow.flags
+
+diff --git a/src/backend/generation.rs b/src/backend/generation.rs
+index e3bff5f0..8331c55a 100644
+--- a/src/backend/generation.rs
++++ b/src/backend/generation.rs
+@@ -4301,6 +4301,38 @@ fn generate_function(
+                 cg.state().invalidate_vec_scratch_peephole();
              }
-             self.attrs.set_typedef(false);
-         }
-     }
  
-+    /// Fold declarator-derived pointer/array layers into a TypeSpecifier so
-+    /// parser-side `sizeof(typedef)` resolves through the stored spec.
-+    /// Function-derived layers are left as-is: vector_size on function
-+    /// typedefs is not a valid C construct and those stay sema-deferred.
-+    fn typedef_spec_with_derived(
-+        &self,
-+        mut spec: TypeSpecifier,
-+        derived: &[DerivedDeclarator],
-+    ) -> TypeSpecifier {
-+        for d in derived {
-+            match d {
-+                DerivedDeclarator::Pointer => {
-+                    spec = TypeSpecifier::Pointer(Box::new(spec), AddressSpace::Default);
-+                }
-+                DerivedDeclarator::Array(n) => {
-+                    spec = TypeSpecifier::Array(Box::new(spec), n.clone());
-+                }
-+                _ => {}
++            // PF-15 deferred narrowing widens: every instruction other than
++            // the two self-managing kinds flushes the recorded moves before
++            // ANY lowering runs (fusion paths, MachInst queueing, and the
++            // generate_instruction dispatch all bypass each other, so this
++            // loop head is the only point that sees every instruction). A
++            // Cast records or flushes inside its emitter; a Cmp folds the
++            // pair into a narrow compare or flushes right here — including
++            // when MachInst would have lowered it.
++            if !matches!(inst, Instruction::Cmp { .. } | Instruction::Cast { .. }) {
++                cg.flush_pending_widen();
 +            }
-+        }
-+        spec
++            if let Instruction::Cmp {
++                dest,
++                op: cmp_op,
++                lhs: cmp_lhs,
++                rhs: cmp_rhs,
++                ..
++            } = inst
++            {
++                if let Some((nl, nr, nty, nop)) =
++                    cg.narrow_cmp_operands(dest.0, *cmp_op, cmp_lhs, cmp_rhs)
++                {
++                    // Folded: emit the narrow compare on the classic path
++                    // (cmpb/cmpw). MachInst never sees the rewritten shape,
++                    // so its per-instruction gates stay exactly as audited.
++                    cg.flush_machinst();
++                    cg.emit_cmp(dest, nop, &nl, &nr, nty);
++                    cg.state().current_program_point += 1;
++                    continue;
++                }
++            }
++
+             if let Instruction::BinOp {
+                 dest,
+                 op: IrBinOp::Mul,
+@@ -4537,6 +4569,10 @@ fn generate_function(
+             );
+             cg.state().current_program_point += 1;
+         }
++        // Defensive PF-15 flush: a deferred widen whose single consumer
++        // was eliminated after use counting must never leak between
++        // blocks. No-op whenever every record was consumed or flushed.
++        cg.flush_pending_widen();
+ 
+         cg.flush_machinst();
+         cg.flush_vecreg_liveout();
+@@ -4650,6 +4686,15 @@ pub(super) fn generate_instruction(
+     remat_global_addrs: &FxHashSet<u32>,
+     const_addr_vals: &FxHashMap<u32, i64>,
+ ) {
++    // PF-15 deferred narrowing widens: every instruction other than the
++    // two self-managing kinds flushes the recorded moves first, so the
++    // defer is invisible to all non-matching consumers. A Cast records or
++    // flushes inside its emitter (try_record_pending_widen's refusal
++    // contract); a Cmp folds the pair into a narrow compare or flushes in
++    // its own dispatch arm below — including when MachInst lowers it.
++    if !matches!(inst, Instruction::Cmp { .. } | Instruction::Cast { .. }) {
++        cg.flush_pending_widen();
++    }
+     match inst {
+         // GNU C nested-function support (static chain / trampoline /
+         // non-local goto). x86-only; the trait defaults fail closed on
+@@ -4804,6 +4849,9 @@ pub(super) fn generate_instruction(
+             rhs,
+             ty,
+         } => {
++            // PF-15 consume happened at the per-instruction loop head (the
++            // only point all lowering paths share). Deferred widens are
++            // materialized or folded by the time we get here.
+             cg.emit_cmp(dest, *op, lhs, rhs, *ty);
+         }
+         Instruction::Cast {
+@@ -5384,6 +5432,9 @@ fn generate_terminator(
+     frame_size: i64,
+     block_label: u32,
+ ) {
++    // PF-15: a terminator ends the compare's adjacency window — flush any
++    // deferred widening moves before control flow leaves the block.
++    cg.flush_pending_widen();
+     match term {
+         Terminator::Return(val) => {
+             cg.emit_return(val.as_ref(), frame_size);
+diff --git a/src/backend/traits.rs b/src/backend/traits.rs
+index c991ad0c..69efb49e 100644
+--- a/src/backend/traits.rs
++++ b/src/backend/traits.rs
+@@ -2196,6 +2196,32 @@ pub trait ArchCodegen {
+     //    loudly instead of emitting wrong code.
+ 
+     /// Read the incoming static-chain register into `dest`.
++    /// Flush deferred narrowing widening moves (PF-15, x86-64). Default:
++    /// nothing is ever deferred on this target.
++    fn flush_pending_widen(&mut self) {
++        let _ = self;
 +    }
 +
-     /// Check whether an expression contains identifiers that are NOT enum constants.
-     /// Such identifiers are variables/parameters, which make the expression not a
-     /// valid integer constant expression (C11 6.6).
-diff --git a/src/frontend/parser/parse.rs b/src/frontend/parser/parse.rs
-index 100a957..5ce8c8e 100644
---- a/src/frontend/parser/parse.rs
-+++ b/src/frontend/parser/parse.rs
-@@ -174,6 +174,10 @@ pub(super) struct ParsedDeclAttrs {
-     pub parsing_symver: Option<String>,
-     /// `__attribute__((vector_size(N)))` total vector size in bytes.
-     pub parsing_vector_size: Option<usize>,
-+    /// `__attribute__((vector_size(EXPR)))` whose EXPR was not parse-time
-+    /// evaluable (e.g. `16 * sizeof(some_typedef)`): the raw expression is
-+    /// deferred to sema, where typedef sizes are fully resolved.
-+    pub parsing_vector_size_expr: Option<Box<Expr>>,
-     /// `__attribute__((ext_vector_type(N)))` number of vector elements.
-     /// Converted to total byte size in lowering using sizeof(element_type) * N.
-     pub parsing_ext_vector_nelem: Option<usize>,
-@@ -440,6 +444,11 @@ pub struct Parser {
-     pub(super) tokens: Vec<Token>,
-     pub(super) pos: usize,
-     pub(super) typedefs: FxHashSet<String>,
-+    /// Type specifier each typedef name was declared with (parser-side, for
-+    /// parse-time sizeof(typedef) resolution in constant expressions such as
-+    /// `__attribute__((vector_size(16 * sizeof(int64_t))))`).  Chained
-+    /// typedefs, pointers and arrays fold into the stored spec recursively.
-+    pub(super) typedef_type_specs: FxHashMap<String, TypeSpecifier>,
-     /// Typedef names shadowed by local variable declarations in the current scope.
-     pub(super) shadowed_typedefs: FxHashSet<String>,
-     /// Accumulated declaration attributes from the current parse_type_specifier pass.
-@@ -482,6 +491,7 @@ impl Parser {
-             tokens,
-             pos: 0,
-             typedefs: Self::builtin_typedefs_cached(),
-+            typedef_type_specs: FxHashMap::default(),
-             shadowed_typedefs: FxHashSet::default(),
-             attrs: ParsedDeclAttrs::default(),
-             pragma_pack_stack: Vec::with_capacity(4),
-@@ -1375,6 +1385,61 @@ impl Parser {
-         }
++    /// PF-15: consume a deferred narrowing-widen compare (x86-64). Called
++    /// from the Cmp dispatch arm before any lowering; on Some the caller
++    /// emits the compare from the returned (lhs, rhs, ty, op) instead.
++    /// Default: never folds (returns None).
++    fn narrow_cmp_operands(
++        &mut self,
++        _dest: u32,
++        op: crate::ir::reexports::IrCmpOp,
++        lhs: &crate::ir::reexports::Operand,
++        rhs: &crate::ir::reexports::Operand,
++    ) -> Option<(
++        crate::ir::reexports::Operand,
++        crate::ir::reexports::Operand,
++        crate::common::types::IrType,
++        crate::ir::reexports::IrCmpOp,
++    )> {
++        let _ = (op, lhs, rhs);
++        None
++    }
++
+     fn emit_get_static_chain(&mut self, _dest: &Value) {
+         unimplemented_target("nested functions (static chain)");
      }
+diff --git a/src/backend/x86/codegen/cast_ops.rs b/src/backend/x86/codegen/cast_ops.rs
+index da5ee66b..c5655ea0 100644
+--- a/src/backend/x86/codegen/cast_ops.rs
++++ b/src/backend/x86/codegen/cast_ops.rs
+@@ -3,9 +3,31 @@
+ use super::emit::X86Codegen;
+ use crate::backend::generation::is_i128_type;
+ use crate::common::types::IrType;
++use crate::backend::regalloc::PhysReg;
+ use crate::ir::reexports::{IrConst, Operand, Value};
  
-+    /// Parse-time constant evaluation with parser-side typedef size
-+    /// resolution: handles `sizeof(typedef-name)` inside vector_size
-+    /// expressions (e.g. `16 * sizeof(int64_t)`), which the shared static
-+    /// evaluator cannot resolve because typedef sizes live in parser state
-+    /// (`typedef_type_specs`).  Falls back to `None` for struct/union-typedef
-+    /// sizes, which remain deferred to sema via
-+    /// `parsing_vector_size_expr`.
-+    fn eval_vector_size_with_typedefs(&self, expr: &Expr) -> Option<i64> {
-+        match expr {
-+            Expr::BinaryOp(op, lhs, rhs, _) => {
-+                let l = self.eval_vector_size_with_typedefs(lhs)?;
-+                let r = self.eval_vector_size_with_typedefs(rhs)?;
-+                match op {
-+                    BinOp::Add => Some(l.wrapping_add(r)),
-+                    BinOp::Sub => Some(l.wrapping_sub(r)),
-+                    BinOp::Mul => Some(l.wrapping_mul(r)),
-+                    BinOp::Div if r != 0 => Some(l.wrapping_div(r)),
-+                    BinOp::Mod if r != 0 => Some(l.wrapping_rem(r)),
-+                    BinOp::Shl => Some(l.wrapping_shl(r as u32)),
-+                    BinOp::Shr => Some(l.wrapping_shr(r as u32)),
-+                    BinOp::BitOr => Some(l | r),
-+                    BinOp::BitAnd => Some(l & r),
-+                    BinOp::BitXor => Some(l ^ r),
-+                    _ => None,
++/// One deferred widening move (PF-15): the Cast was eligible but its
++/// emission is postponed until the consuming compare (or any other next
++/// instruction) decides. See `X86Codegen::pending_widen` for the full
++/// soundness contract.
++pub(super) struct PendingWiden {
++    /// Cast destination value (single-use; the use is the consumer).
++    pub dest: u32,
++    /// Cast source operand (always `Operand::Value`, reg- or slot-homed).
++    pub src: Operand,
++    /// Narrow source type (I8/U8/I16/U16) — the compare's new width.
++    pub from_ty: IrType,
++    /// Destination register home the widening move would have written.
++    pub dest_phys: PhysReg,
++}
++
+ impl X86Codegen {
++    fn pf15_trace(&self, msg: &str) {
++        if std::env::var_os("CCC_DEBUG_PF15").is_some() {
++            eprintln!("[pf15] {msg}");
++        }
++    }
++
+     pub(super) fn emit_cast_instrs_impl(&mut self, from_ty: IrType, to_ty: IrType) {
+         self.emit_cast_instrs_x86(from_ty, to_ty);
+     }
+@@ -195,6 +217,18 @@ impl X86Codegen {
+                 return;
+             }
+         }
++        // PF-15 narrowing-widen defer: a single-use widening cast from a
++        // byte/half type is NOT emitted here — it is recorded and the
++        // consuming compare (if it is one) folds it into a narrow `cmpb`/
++        // `cmpw` on the original source. Any other consumer flushes the
++        // recorded move first, making the defer invisible. try_record
++        // returns false for every non-eligible shape (flushing whatever is
++        // deferred — its own emission could clobber a deferred source
++        // home) and this cast then emits normally below.
++        if self.try_record_pending_widen(dest, src, from_ty, to_ty) {
++            return;
++        }
++
+         // Register-direct integer casts: bypass the accumulator when the destination
+         // has a physical register. Instead of load→cast→store through %rax, emit the
+         // cast instruction directly targeting the destination register.
+@@ -416,6 +450,393 @@ impl X86Codegen {
+     /// Key optimization: when the source is a stack slot, fuse the load and cast
+     /// into a single instruction (e.g., `movslq -N(%rsp), %r12`), saving 2 instructions
+     /// vs the accumulator path (`movq -N(%rsp), %rax; cltq; movq %rax, %r12`).
++    /// Emit the widening move for an IntWiden cast into a register home,
++    /// from either a register or a slot source. This is the SINGLE
++    /// definition of the widening sequences: the register-direct cast path
++    /// and the PF-15 deferred-widen flush both route through it, so the
++    /// deferred form is bit-identical to the immediate form.
++    fn emit_int_widen_move(&mut self, src: &Operand, ft: IrType, dest_phys: PhysReg) {
++        use super::emit::{phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
++        let dest_64 = phys_reg_name(dest_phys);
++        let dest_32 = phys_reg_name_32(dest_phys);
++        let src_phys = self.operand_reg(src);
++        let src_slot = match src {
++            Operand::Value(v) => self.state.get_slot(v.0).map(|sl| sl.0),
++            _ => None,
++        };
++        if let Some(src_reg) = src_phys {
++            // Source is in a register — emit reg-to-reg extending move.
++            let src_typed = typed_phys_reg_name(src_reg, ft);
++            if ft.is_signed() {
++                match ft.size() {
++                    1 => self
++                        .state
++                        .emit_fmt(format_args!("    movsbq %{}, %{}", src_typed, dest_64)),
++                    2 => self
++                        .state
++                        .emit_fmt(format_args!("    movswq %{}, %{}", src_typed, dest_64)),
++                    4 => self.state.emit_fmt(format_args!(
++                        "    movslq %{}, %{}",
++                        phys_reg_name_32(src_reg),
++                        dest_64
++                    )),
++                    _ => {
++                        self.operand_to_callee_reg(src, dest_phys);
++                    }
++                }
++            } else {
++                match ft.size() {
++                    1 => self
++                        .state
++                        .emit_fmt(format_args!("    movzbl %{}, %{}", src_typed, dest_32)),
++                    2 => self
++                        .state
++                        .emit_fmt(format_args!("    movzwl %{}, %{}", src_typed, dest_32)),
++                    4 => {
++                        let src_32 = phys_reg_name_32(src_reg);
++                        self.state
++                            .emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
++                    }
++                    _ => {
++                        self.operand_to_callee_reg(src, dest_phys);
++                    }
 +                }
 +            }
-+            Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
-+                Some(self.eval_vector_size_with_typedefs(inner)?.wrapping_neg())
++        } else if let Some(slot_off) = src_slot {
++            // Source is a stack slot — emit fused load+extend directly to
++            // dest. Uses emit_instr_rbp_reg which handles rbp/rsp
++            // addressing automatically.
++            if ft.is_signed() {
++                match ft.size() {
++                    1 => self.state.out.emit_instr_rbp_reg("    movsbq", slot_off, dest_64),
++                    2 => self.state.out.emit_instr_rbp_reg("    movswq", slot_off, dest_64),
++                    4 => self.state.out.emit_instr_rbp_reg("    movslq", slot_off, dest_64),
++                    _ => self.state.out.emit_instr_rbp_reg("    movq", slot_off, dest_64),
++                }
++            } else {
++                match ft.size() {
++                    1 => self.state.out.emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
++                    2 => self.state.out.emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
++                    4 => self.state.out.emit_instr_rbp_reg("    movl", slot_off, dest_32),
++                    _ => self.state.out.emit_instr_rbp_reg("    movq", slot_off, dest_64),
++                }
 +            }
-+            Expr::UnaryOp(UnaryOp::Plus, inner, _) => self.eval_vector_size_with_typedefs(inner),
-+            Expr::Sizeof(arg, _) => match arg.as_ref() {
-+                SizeofArg::Type(ts) => {
-+                    // Walk typedef chains to their base spec: the stored spec
-+                    // for a chained typedef (`typedef a_t b_t;`) is itself a
-+                    // TypedefName, and the static try_sizeof_type_spec cannot
-+                    // resolve those.  Chains are acyclic (a typedef name is
-+                    // only usable after its declaration), so this terminates.
-+                    let mut spec: &TypeSpecifier = ts;
-+                    loop {
-+                        match spec {
-+                            TypeSpecifier::TypedefName(name) => {
-+                                spec = self.typedef_type_specs.get(name)?;
-+                            }
-+                            other => {
-+                                return Some(Self::try_sizeof_type_spec(other)? as i64);
-+                            }
-+                        }
++        } else {
++            // No stable home: stage through the accumulator (the generic
++            // cast path would have done the same). Only reachable from the
++            // flush side; the record path refuses home-less sources.
++            self.operand_to_callee_reg(src, dest_phys);
++        }
++    }
++
++    /// PF-15 record path. Returns true when the cast's widening move was
++    /// DEFERRED (nothing emitted); false when the cast must emit normally.
++    ///
++    /// Eligibility: widening cast from a byte/half type to a 32/64-bit
++    /// type, destination in a GPR home, source a Value with a stable home
++    /// (register or slot), destination used exactly once. The consumer
++    /// match (is that single use an integer compare of two such casts?)
++    /// happens at the compare; any other consumer simply flushes.
++    ///
++    /// Refusal contract: the caller emits this cast normally, and those
++    /// emissions (register moves, slot stores) may legally clobber a
++    /// deferred source's home — RA reused it the moment the deferred
++    /// source's only modelled use (this cast) stopped covering it. Any
++    /// refusal therefore flushes the deferred moves FIRST.
++    fn try_record_pending_widen(
++        &mut self,
++        dest: &Value,
++        src: &Operand,
++        from_ty: IrType,
++        to_ty: IrType,
++    ) -> bool {
++        macro_rules! refuse {
++            ($why:expr) => {{
++                self.pf15_trace(concat!("refuse: ", $why));
++                self.flush_pending_widen_impl();
++                return false;
++            }};
++        }
++        if !matches!(
++            from_ty,
++            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
++        ) {
++            refuse!("from_ty");
++        }
++        if to_ty.is_float() || !(to_ty.size() == 4 || to_ty.size() == 8) || is_i128_type(to_ty) {
++            refuse!("to_ty");
++        }
++        if self.value_use_counts.get(&dest.0).copied() != Some(1) {
++            refuse!("use_count");
++        }
++        let src_val = match src {
++            Operand::Value(v) => v.0,
++            _ => refuse!("src_not_value"),
++        };
++        let Some(dest_phys) = self.dest_reg(dest) else {
++            refuse!("no_dest_reg");
++        };
++        if super::emit::is_xmm_reg(dest_phys) {
++            refuse!("xmm_dest");
++        }
++        let src_reg = self.operand_reg(src);
++        let src_slot = self.state.get_slot(src_val).map(|sl| sl.0);
++        if src_reg.is_none() && src_slot.is_none() {
++            refuse!("no_src_home");
++        }
++        // A deferred cast must not be shadowed by another deferred cast
++        // whose widening move would clobber this cast's source register
++        // home before the compare (or a flush) reads it. RA may legally
++        // hand this destination the first source's home: the source's only
++        // modelled use is this deferred move, so its range appears to end
++        // here. Conflict => flush the earlier moves and emit this cast
++        // normally (the transform degrades, never miscompiles).
++        for slot in 0..2 {
++            let pending_src = self.pending_widen[slot]
++                .as_ref()
++                .map(|p| match &p.src {
++                    Operand::Value(v) => Some(v.0),
++                    _ => None,
++                })
++                .flatten();
++            if let Some(pv) = pending_src {
++                if self.reg_assignments.get(&pv).copied() == Some(dest_phys) {
++                    refuse!("conflict with earlier pending src home");
++                }
++            }
++        }
++        // Slots are never full here: only a Cmp consumes a full pair and
++        // every non-Cmp/Cast dispatch flushes first (generate_instruction).
++        // Belt-and-braces: if they somehow are, fall back to normal emit.
++        if self.pending_widen.iter().all(|p| p.is_some()) {
++            refuse!("both slots full");
++        }
++        let free = if self.pending_widen[0].is_none() {
++            0
++        } else {
++            1
++        };
++        self.pending_widen[free] = Some(PendingWiden {
++            dest: dest.0,
++            src: src.clone(),
++            from_ty,
++            dest_phys,
++        });
++        self.pf15_trace("record");
++        true
++    }
++
++    /// Emit any deferred widening moves, in program order. Called by the
++    /// generate_instruction pre-dispatch hook for every non-Cmp/non-Cast
++    /// instruction, on every refused cast, by the compare-replay exits,
++    /// and on any compare that does not (or only partially) match.
++    pub(super) fn flush_pending_widen_impl(&mut self) {
++        for slot in 0..2 {
++            if let Some(p) = self.pending_widen[slot].take() {
++                self.emit_int_widen_move(&p.src, p.from_ty, p.dest_phys);
++            }
++        }
++    }
++
++    /// If `lhs`/`rhs` are exactly the two recorded deferred casts (in
++    /// either order), take both records and return
++    /// `((lhs_src, lhs_ty, lhs_signed), (rhs_src, rhs_ty, rhs_signed))`.
++    /// Leaves the records untouched on any mismatch — a lone pending is
++    /// NEVER silently dropped here (its widening move would otherwise
++    /// never be emitted and the consumer would read garbage).
++    #[allow(clippy::type_complexity)]
++    fn take_pending_widen_pair(
++        &mut self,
++        lhs: &Operand,
++        rhs: &Operand,
++    ) -> Option<(
++        (Operand, IrType, bool, PhysReg),
++        (Operand, IrType, bool, PhysReg),
++    )> {
++        let (lv, rv) = match (lhs, rhs) {
++            (Operand::Value(l), Operand::Value(r)) => (l.0, r.0),
++            _ => {
++                self.pf15_trace("take_pair: operands not both values");
++                return None;
++            }
++        };
++        let p0 = self.pending_widen[0].take();
++        let p1 = self.pending_widen[1].take();
++        if p0.is_none() || p1.is_none() {
++            // Partial occupancy: restore whatever was taken and refuse.
++            self.pf15_trace("take_pair: partial occupancy");
++            if let Some(a) = p0 {
++                self.pending_widen[0] = Some(a);
++            }
++            if let Some(b) = p1 {
++                self.pending_widen[1] = Some(b);
++            }
++            return None;
++        }
++        let a = p0.unwrap();
++        let b = p1.unwrap();
++        // Positional match, both orders.
++        if a.dest == lv && b.dest == rv {
++            let sa = a.from_ty.is_signed();
++            let sb = b.from_ty.is_signed();
++            return Some((
++                (a.src, a.from_ty, sa, a.dest_phys),
++                (b.src, b.from_ty, sb, b.dest_phys),
++            ));
++        }
++        if a.dest == rv && b.dest == lv {
++            let sa = b.from_ty.is_signed();
++            let sb = a.from_ty.is_signed();
++            return Some((
++                (b.src, b.from_ty, sa, b.dest_phys),
++                (a.src, a.from_ty, sb, a.dest_phys),
++            ));
++        }
++        // Mismatch: restore and report.
++        self.pf15_trace("take_pair: dest mismatch");
++        self.pending_widen[0] = Some(a);
++        self.pending_widen[1] = Some(b);
++        None
++    }
++
++    /// PF-15 consume path, called from the generate_instruction Cmp arm
++    /// BEFORE emit_cmp — including when MachInst will lower the compare —
++    /// so every possible consumer sees either a folded narrow compare or
++    /// fully materialized widening moves, never a half-deferred state.
++    ///
++    /// Full-pair shape `cmp(cast a, cast b)`: folds to
++    /// `(src_a, src_b, narrow_ty, mapped_op)` when the extension/opcode
++    /// compatibility matrix accepts; the two widening moves are then never
++    /// emitted at all. Single-side shape `cmp(cast a, C)`: folds when the
++    /// constant fits the narrow domain exactly under the same matrix.
++    /// Everything else: flush the deferred moves and return None (the
++    /// caller emits the wide compare from the original operands).
++    ///
++    /// Flag-exactness matrix (the defer-side contract lives on
++    /// `X86Codegen::pending_widen`):
++    ///   * sext+sext: sign-extension is order-preserving, so the narrow
++    ///     signed compare produces flag-identical answers for the signed
++    ///     setcc family {eq, ne, slt, sle, sgt, sge}. Unsigned opcodes on
++    ///     sign-extended operands compare negated bit patterns — refused.
++    ///   * zext+zext: zero-extension makes both values non-negative, where
++    ///     signed and unsigned relational order coincide; every IR opcode
++    ///     maps onto the unsigned narrow set {eq, ne, ult, ule, ugt, uge}.
++    ///   * mixed sext/zext: the widened values diverge (0xFF -> -1 vs
++    ///     255) — refused.
++    ///   * const rhs: allowed inside the narrow type's exact domain, with
++    ///     the same per-extension opcode sets (a negative constant can
++    ///     never compare against a zero-extended value; unsigned opcodes
++    ///     on sign-extended operands are refused, as above).
++    #[allow(clippy::type_complexity)]
++    pub(super) fn narrow_cmp_operands_impl(
++        &mut self,
++        dest: u32,
++        op: crate::ir::reexports::IrCmpOp,
++        lhs: &Operand,
++        rhs: &Operand,
++    ) -> Option<(
++        Operand,
++        Operand,
++        IrType,
++        crate::ir::reexports::IrCmpOp,
++    )> {
++        use crate::ir::reexports::IrCmpOp;
++        // Compare-replay dests re-emit the comparison at a DISTANT consumer
++        // (cmov/jcc far from here). The adjacency guarantee that keeps the
++        // deferred sources' homes intact does not reach there: materialize.
++        if self.cmp_replay.contains_key(&dest) {
++            self.pf15_trace("narrow: replay dest, flushing");
++            self.flush_pending_widen_impl();
++            return None;
++        }
++        self.pf15_trace("narrow: entered");
++        let op_map_zext = |op: IrCmpOp| -> IrCmpOp {
++            match op {
++                IrCmpOp::Slt => IrCmpOp::Ult,
++                IrCmpOp::Sle => IrCmpOp::Ule,
++                IrCmpOp::Sgt => IrCmpOp::Ugt,
++                IrCmpOp::Sge => IrCmpOp::Uge,
++                signed_or_unsigned_keep => signed_or_unsigned_keep,
++            }
++        };
++        let signed_only = |op: IrCmpOp| -> Option<IrCmpOp> {
++            match op {
++                IrCmpOp::Eq
++                | IrCmpOp::Ne
++                | IrCmpOp::Slt
++                | IrCmpOp::Sle
++                | IrCmpOp::Sgt
++                | IrCmpOp::Sge => Some(op),
++                _ => None,
++            }
++        };
++        // Full-pair shape.
++        if let Some(((lsrc, lty, lsign, ldest), (rsrc, rty, rsign, rdest))) =
++            self.take_pending_widen_pair(lhs, rhs)
++        {
++            let folded = if lty != rty {
++                None
++            } else if lsign && rsign {
++                signed_only(op).map(|m| (lsrc.clone(), rsrc.clone(), lty, m))
++            } else if !lsign && !rsign {
++                Some((lsrc.clone(), rsrc.clone(), lty, op_map_zext(op)))
++            } else {
++                None // mixed sext/zext: widened values diverge
++            };
++            self.pf15_trace(if folded.is_some() { "pair FOLD" } else { "pair matrix refuse" });
++            if let Some(f) = folded {
++                return Some(f);
++            }
++            // Refused: the records are already taken OUT of the slots, so
++            // re-emit both widening moves explicitly, in program order.
++            self.emit_int_widen_move(&lsrc, lty, ldest);
++            self.emit_int_widen_move(&rsrc, rty, rdest);
++            return None;
++        }
++        // Single-side const shape: cmp(cast(x), C) with C in the narrow
++        // domain. (Cmp with a constant lhs is canonicalized to rhs
++        // upstream; a const lhs here simply takes the flush path below.)
++        if self.pending_widen[1].is_some() {
++            self.flush_pending_widen_impl();
++            return None;
++        }
++        let (src, from_ty, dest_phys) = match (lhs, self.pending_widen[0].take()) {
++            (Operand::Value(v), Some(p)) if p.dest == v.0 => (p.src, p.from_ty, p.dest_phys),
++            (_, other) => {
++                self.pending_widen[0] = other;
++                self.flush_pending_widen_impl();
++                return None;
++            }
++        };
++        let (lo, hi) = if from_ty.is_signed() {
++            (
++                -(1i64 << (from_ty.size() * 8 - 1)),
++                (1i64 << (from_ty.size() * 8 - 1)) - 1,
++            )
++        } else {
++            (0i64, (1i64 << (from_ty.size() * 8)) - 1)
++        };
++        let folded = match rhs {
++            Operand::Const(c) => match c.clone().to_i64() {
++                Some(cv) if (lo..=hi).contains(&cv) => {
++                    if from_ty.is_signed() {
++                        signed_only(op).map(|m| (src.clone(), rhs.clone(), from_ty, m))
++                    } else {
++                        Some((src.clone(), rhs.clone(), from_ty, op_map_zext(op)))
 +                    }
 +                }
 +                _ => None,
 +            },
-+            _ => Self::eval_const_int_expr(expr),
++            _ => None,
++        };
++        if let Some(f) = folded {
++            return Some(f);
 +        }
++        // Refused after take: re-emit the taken widening move explicitly.
++        self.emit_int_widen_move(&src, from_ty, dest_phys);
++        None
 +    }
 +
-     /// Parse vector_size(expr) attribute.
-     fn parse_vector_size_attr(&mut self) {
-         if !matches!(self.peek(), TokenKind::LParen) {
-@@ -1394,6 +1459,16 @@ impl Parser {
-         };
-         if let Some(size) = Self::eval_const_int_expr_with_enums(&expr, enums, tag_aligns) {
-             self.attrs.parsing_vector_size = Some(size as usize);
-+        } else if let Some(size) = self.eval_vector_size_with_typedefs(&expr) {
-+            // The static evaluator cannot resolve sizeof(typedef-name)
-+            // (typedef sizes live in parser state); retry with the
-+            // typedef-aware walk so e.g. `vector_size(16 * sizeof(int64_t))`
-+            // resolves right here.
-+            self.attrs.parsing_vector_size = Some(size as usize);
-+        } else {
-+            // Not parse-time evaluable (e.g. sizeof(struct typedef)): defer
-+            // the raw expression to sema, where all sizes are resolved.
-+            self.attrs.parsing_vector_size_expr = Some(Box::new(expr));
-         }
-         if matches!(self.peek(), TokenKind::RParen) {
-             self.advance();
-diff --git a/src/frontend/sema/analysis.rs b/src/frontend/sema/analysis.rs
-index 445d040..b1c104b 100644
---- a/src/frontend/sema/analysis.rs
-+++ b/src/frontend/sema/analysis.rs
-@@ -362,6 +362,24 @@ impl SemanticAnalyzer {
- 
-     // === Declaration analysis ===
- 
-+    /// Resolve a declaration's vector size: explicit total bytes
-+    /// (`vector_size`), element-count × element size (`ext_vector_type`), or
-+    /// a deferred expression (`vector_size(EXPR)` not evaluable at parse
-+    /// time — e.g. `16 * sizeof(some_typedef)` — resolved here where typedef
-+    /// sizes are known via the type context).
-+    fn resolve_decl_vector_size(&self, decl: &Declaration, elem_size: usize) -> Option<usize> {
-+        if let Some(vs) = decl.vector_size {
-+            return Some(vs);
-+        }
-+        if let Some(n) = decl.ext_vector_nelem {
-+            return Some(n * elem_size);
-+        }
-+        decl.vector_size_expr
-+            .as_deref()
-+            .and_then(|e| self.eval_const_expr(e))
-+            .map(|v| v as usize)
-+    }
-+
-     fn analyze_declaration(&mut self, decl: &Declaration, _is_global: bool) {
-         // Register enum constants from this declaration's type specifier.
-         // This recursively walks into struct/union fields to find inline
-@@ -492,7 +510,8 @@ impl SemanticAnalyzer {
-                 // lr_vector at offset 96 instead of 192 in the gen-as-const
-                 // pipeline, and elf/dl-trampoline.S failed its
-                 // "LR_VECTOR_OFFSET must be multiple of VEC_SIZE" #error.
--                let resolved_ctype = match decl.resolve_vector_size(resolved_ctype.size()) {
-+                let resolved_ctype = match self.resolve_decl_vector_size(decl, resolved_ctype.size())
-+                {
-                     Some(vs) => CType::Vector(Box::new(resolved_ctype), vs),
-                     None => resolved_ctype,
-                 };
-@@ -534,6 +553,26 @@ impl SemanticAnalyzer {
-             return; // typedefs don't declare variables
-         }
- 
-+        // Declaration-level __attribute__((vector_size(N))) /
-+        // __attribute__((ext_vector_type(N))): apply the Vector wrap here for
-+        // VARIABLE declarations.  Builtin element types already carry the
-+        // wrap inside their resolved TypeSpecifier (the parser attaches the
-+        // attribute to the specifier itself); when the element type is a
-+        // typedef name, however, the attribute is parsed after the typedef
-+        // name and lands in decl.vector_size, and without this wrap the
-+        // object collapses to its element type: partial initializers and
-+        // element stores overrun the (too small) object and element indexing
-+        // dereferences the first element's value as a base address
-+        // (gcc.c-torture pr123625: SEGV + wrong checksum on both backends at
-+        // every opt level).  Mirrors the typedef path above; the matches!
-+        // guard keeps already-wrapped specifiers from being wrapped twice.
-+        let base_type = match self.resolve_decl_vector_size(decl, base_type.size()) {
-+            Some(vs) if !matches!(base_type, CType::Vector(_, _)) => {
-+                CType::Vector(Box::new(base_type), vs)
-+            }
-+            _ => base_type,
-+        };
-+
-         for init_decl in &decl.declarators {
-             let mut full_type = if init_decl.derived.is_empty() {
-                 base_type.clone()
-diff --git a/src/ir/lowering/expr_access.rs b/src/ir/lowering/expr_access.rs
-index c7b9c65..e763c99 100644
---- a/src/ir/lowering/expr_access.rs
-+++ b/src/ir/lowering/expr_access.rs
-@@ -213,7 +213,15 @@ impl Lowerer {
-         }
- 
-         let src = self.lower_expr(inner);
--        let mut from_ty = self.get_expr_type(inner);
-+        // Use the VALUE type (the defining instruction's actual result width,
-+        // mirroring lower_arithmetic_binop), not the storage-level annotation.
-+        // get_expr_type reports the widened carrier type (I64 for int-op-
-+        // literal on LP64), which made `(long long)(4 * x)` — the inner mul
-+        // materialized as a 32-bit imull with a 4-byte home — look like an
-+        // I64->I64 identity: the zero-extension was dropped and the later
-+        // 64-bit compare read the stale upper half of the 4-byte home
-+        // (gcc.c-torture pr81588, amd64 at every opt level).
-+        let mut from_ty = self.value_ir_type(inner);
-         let to_ty = self.type_spec_to_ir(target_type);
- 
-         if let Expr::Identifier(name, _) = inner {
-diff --git a/src/ir/lowering/expr_assign.rs b/src/ir/lowering/expr_assign.rs
-index b065bbe..0e732e7 100644
---- a/src/ir/lowering/expr_assign.rs
-+++ b/src/ir/lowering/expr_assign.rs
-@@ -1133,7 +1133,7 @@ impl Lowerer {
-     // ===== Vector type helpers =====
- 
-     /// Get the IR type for a vector element CType.
--    fn vector_elem_ir_type(elem_ct: &CType) -> IrType {
-+    pub(super) fn vector_elem_ir_type(elem_ct: &CType) -> IrType {
-         IrType::from_ctype(elem_ct)
-     }
- 
-diff --git a/src/ir/lowering/expr_ops.rs b/src/ir/lowering/expr_ops.rs
-index 97eb9b9..1c38f6f 100644
---- a/src/ir/lowering/expr_ops.rs
-+++ b/src/ir/lowering/expr_ops.rs
-@@ -1361,6 +1361,17 @@ impl Lowerer {
-             return result;
-         }
- 
-+        // Vector ++/--: per GCC vector extensions the update is element-wise
-+        // (v ± 1 with the scalar splatted to all lanes).  A vector lvalue
-+        // lowers to its base address, so the generic pointer arm below would
-+        // step the whole object by sizeof(vector) and corrupt every lane
-+        // (gcc.c-torture pr123753: `u.w--` yielded 0xfff8 in lane 0 instead
-+        // of 0xffff).
-+        let inner_ct = self.expr_ctype(inner);
-+        if inner_ct.is_vector() {
-+            return self.lower_vector_inc_dec(inner, is_inc, return_new, &inner_ct);
-+        }
-+
-         let ty = self.get_expr_type(inner);
-         if let Some(lv) = self.lower_lvalue(inner) {
-             let loaded = self.load_lvalue_typed(&lv, ty);
-@@ -1396,6 +1407,157 @@ impl Lowerer {
-         self.lower_expr(inner)
-     }
- 
-+    /// Lower vector `++`/`--` (pre- and post-forms) element-wise, per GCC
-+    /// vector extensions: `v++` ≡ `tmp = v; v = v + 1;` with the scalar 1
-+    /// splatted to every lane.  The result operand follows the vector-value
-+    /// convention of `lower_vector_binary_op` (an address): the updated
-+    /// object for the pre-form / discarded post-form, and a fresh
-+    /// element-wise snapshot for a *used* post-form so callers observe the
-+    /// pre-update value (C11 6.5.2.4).
-+    fn lower_vector_inc_dec(
-+        &mut self,
-+        inner: &Expr,
-+        is_inc: bool,
-+        return_new: bool,
-+        vec_ct: &CType,
-+    ) -> Operand {
-+        let (elem_ct, num_elems) = match vec_ct.vector_info() {
-+            Some(v) => v,
-+            None => return self.lower_expr(inner),
-+        };
-+        let total_size = match vec_ct {
-+            CType::Vector(_, ts) => *ts,
-+            _ => return self.lower_expr(inner),
-+        };
-+        let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
-+        let elem_size = elem_ct.size();
-+        let ir_op = if is_inc { IrBinOp::Add } else { IrBinOp::Sub };
-+        // Integer elements compute in the widened op type and truncate on
-+        // store (same convention as the scalar inc/dec path); float elements
-+        // step by exactly 1.0 in their own width.
-+        let (step, binop_ty): (IrConst, IrType) = if elem_ct.is_floating() {
-+            match elem_ir_ty {
-+                IrType::F32 => (IrConst::F32(1.0), IrType::F32),
-+                IrType::F128 => (IrConst::long_double(1.0), IrType::F128),
-+                _ => (IrConst::F64(1.0), IrType::F64),
-+            }
-+        } else {
-+            let wt = widened_op_type(elem_ir_ty);
-+            if wt == IrType::I32 {
-+                (IrConst::I32(1), IrType::I32)
-+            } else {
-+                (IrConst::I64(1), IrType::I64)
-+            }
-+        };
-+        let ptr_int_ty = crate::common::types::target_int_ir_type();
-+        let lv = match self.lower_lvalue(inner) {
-+            Some(lv) => lv,
-+            None => return self.lower_expr(inner),
-+        };
-+        let volatile = lv.volatile || self.expr_access_is_volatile(inner);
-+        let seg = self.lvalue_addr_space(&lv);
-+        let base = self.lvalue_addr(&lv);
-+
-+        // Post-form with a used result: element-wise snapshot of the old
-+        // value before the update (C11 6.5.2.4: the result is the prior
-+        // value).  Discarded post-forms need no snapshot.
-+        let old_copy = if !return_new && !self.discard_expr_result {
-+            let old_alloca = self.emit_entry_alloca(IrType::Ptr, total_size, total_size, false);
-+            for i in 0..num_elems {
-+                let off = i * elem_size;
-+                let src = if off > 0 {
-+                    self.emit_binop_val(
-+                        IrBinOp::Add,
-+                        Operand::Value(base),
-+                        Operand::Const(IrConst::ptr_int(off as i64)),
-+                        ptr_int_ty,
-+                    )
-+                } else {
-+                    base
-+                };
-+                let e = self.fresh_value();
-+                self.emit(Instruction::Load {
-+                    volatile,
-+                    dest: e,
-+                    ptr: src,
-+                    ty: elem_ir_ty,
-+                    seg_override: seg,
-+                });
-+                let dst = if off > 0 {
-+                    self.emit_binop_val(
-+                        IrBinOp::Add,
-+                        Operand::Value(old_alloca),
-+                        Operand::Const(IrConst::ptr_int(off as i64)),
-+                        ptr_int_ty,
-+                    )
-+                } else {
-+                    old_alloca
-+                };
-+                self.emit(Instruction::Store {
-+                    volatile,
-+                    val: Operand::Value(e),
-+                    ptr: dst,
-+                    ty: elem_ir_ty,
-+                    seg_override: seg,
-+                });
-+            }
-+            Some(old_alloca)
-+        } else {
-+            None
-+        };
-+
-+        for i in 0..num_elems {
-+            let off = i * elem_size;
-+            let ep = if off > 0 {
-+                self.emit_binop_val(
-+                    IrBinOp::Add,
-+                    Operand::Value(base),
-+                    Operand::Const(IrConst::ptr_int(off as i64)),
-+                    ptr_int_ty,
-+                )
-+            } else {
-+                base
-+            };
-+            let e = self.fresh_value();
-+            self.emit(Instruction::Load {
-+                volatile,
-+                dest: e,
-+                ptr: ep,
-+                ty: elem_ir_ty,
-+                seg_override: seg,
-+            });
-+            let cur = if binop_ty != elem_ir_ty {
-+                self.emit_implicit_cast(Operand::Value(e), elem_ir_ty, binop_ty)
-+            } else {
-+                Operand::Value(e)
-+            };
-+            let nw = self.emit_binop_val(ir_op, cur, Operand::Const(step), binop_ty);
-+            let nw = if binop_ty != elem_ir_ty {
-+                self.emit_implicit_cast(Operand::Value(nw), binop_ty, elem_ir_ty)
-+            } else {
-+                Operand::Value(nw)
-+            };
-+            self.emit(Instruction::Store {
-+                volatile,
-+                val: nw,
-+                ptr: ep,
-+                ty: elem_ir_ty,
-+                seg_override: seg,
-+            });
-+        }
-+
-+        if return_new {
-+            Operand::Value(base)
-+        } else {
-+            match old_copy {
-+                Some(old) => Operand::Value(old),
-+                // Discarded post-form result: nothing reads it, the updated
-+                // object's address is a valid vector-valued operand.
-+                None => Operand::Value(base),
-+            }
-+        }
-+    }
-+
-     fn try_lower_bitfield_inc_dec(
+     fn try_emit_cast_reg_direct(
          &mut self,
-         inner: &Expr,
-diff --git a/tests/regression/vec_incdec_elementwise.c b/tests/regression/vec_incdec_elementwise.c
+         _dest: &Value,
+@@ -456,90 +877,10 @@ impl X86Codegen {
+             }
+             CastKind::IntWiden { from_ty: ft, .. } => {
+                 // Widen: sign or zero extend from smaller to larger type.
+-                if let Some(src_reg) = src_phys {
+-                    // Source is in a register — emit reg-to-reg extending move.
+-                    let src_typed = typed_phys_reg_name(src_reg, ft);
+-                    if ft.is_signed() {
+-                        match ft.size() {
+-                            1 => self
+-                                .state
+-                                .emit_fmt(format_args!("    movsbq %{}, %{}", src_typed, dest_64)),
+-                            2 => self
+-                                .state
+-                                .emit_fmt(format_args!("    movswq %{}, %{}", src_typed, dest_64)),
+-                            4 => self.state.emit_fmt(format_args!(
+-                                "    movslq %{}, %{}",
+-                                phys_reg_name_32(src_reg),
+-                                dest_64
+-                            )),
+-                            _ => {
+-                                self.operand_to_callee_reg(src, dest_phys);
+-                            }
+-                        }
+-                    } else {
+-                        match ft.size() {
+-                            1 => self
+-                                .state
+-                                .emit_fmt(format_args!("    movzbl %{}, %{}", src_typed, dest_32)),
+-                            2 => self
+-                                .state
+-                                .emit_fmt(format_args!("    movzwl %{}, %{}", src_typed, dest_32)),
+-                            4 => {
+-                                let src_32 = phys_reg_name_32(src_reg);
+-                                self.state
+-                                    .emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
+-                            }
+-                            _ => {
+-                                self.operand_to_callee_reg(src, dest_phys);
+-                            }
+-                        }
+-                    }
+-                } else if let Some(slot_off) = src_slot {
+-                    // Source is a stack slot — emit fused load+extend directly to dest.
+-                    // Uses emit_instr_rbp_reg which handles rbp/rsp addressing automatically.
+-                    if ft.is_signed() {
+-                        match ft.size() {
+-                            1 => self
+-                                .state
+-                                .out
+-                                .emit_instr_rbp_reg("    movsbq", slot_off, dest_64),
+-                            2 => self
+-                                .state
+-                                .out
+-                                .emit_instr_rbp_reg("    movswq", slot_off, dest_64),
+-                            4 => self
+-                                .state
+-                                .out
+-                                .emit_instr_rbp_reg("    movslq", slot_off, dest_64),
+-                            _ => self
+-                                .state
+-                                .out
+-                                .emit_instr_rbp_reg("    movq", slot_off, dest_64),
+-                        }
+-                    } else {
+-                        match ft.size() {
+-                            1 => self
+-                                .state
+-                                .out
+-                                .emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
+-                            2 => self
+-                                .state
+-                                .out
+-                                .emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
+-                            4 => self
+-                                .state
+-                                .out
+-                                .emit_instr_rbp_reg("    movl", slot_off, dest_32),
+-                            _ => self
+-                                .state
+-                                .out
+-                                .emit_instr_rbp_reg("    movq", slot_off, dest_64),
+-                        }
+-                    }
+-                } else {
+-                    return false;
+-                }
+-                return true;
++                // (Single definition shared with the PF-15 deferred-widen
++                // flush — emit_int_widen_move above.)
++                self.emit_int_widen_move(src, ft, dest_phys);
++                true
+             }
+             CastKind::IntNarrow { to_ty: t } => {
+                 // Narrow: truncate to the target width.
+diff --git a/src/backend/x86/codegen/comparison.rs b/src/backend/x86/codegen/comparison.rs
+index 59c1a1b1..8b06ef71 100644
+--- a/src/backend/x86/codegen/comparison.rs
++++ b/src/backend/x86/codegen/comparison.rs
+@@ -155,6 +155,11 @@ impl X86Codegen {
+         // comparison from the recorded operands right before its cmov/jcc.
+         // Emitting the cmp here too would double the compare in the hot loop.
+         if self.cmp_replay.contains_key(&dest.0) {
++            // The comparison re-emits later from the recorded operands, so
++            // any deferred narrowing widens (PF-15) must materialize NOW:
++            // the replay will read these homes at a distance where the
++            // adjacency guarantee no longer holds.
++            self.flush_pending_widen_impl();
+             return;
+         }
+         self.emit_int_cmp_insn_typed(lhs, rhs, ty);
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 5930c4af..27588bae 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -463,6 +463,23 @@ pub struct X86Codegen {
+     /// Pending condition flags from a fused Cmp: (cmp dest value, cmp opcode).
+     /// Set by the Cmp emitter when the consumer is the next instruction.
+     pub(super) pending_cmp: Option<(u32, crate::ir::reexports::IrCmpOp)>,
++    /// PF-15 deferred narrowing widen (2026-08-29): a single-use widening
++    /// Cast from a byte/half type whose result feeds an integer compare
++    /// DEFERS its extending move and records itself here (two slots: both
++    /// operands of a compare may be widening casts). The next Cmp consumes
++    /// the pair and emits one `cmpb`/`cmpw` on the ORIGINAL sources --
++    /// exactly GCC's shape -- instead of two extends plus a 32/64-bit
++    /// compare (PF-15: `a < b` on signed chars widened both operands three
++    /// times). Any other instruction flushes the deferred moves unchanged,
++    /// so the transform is invisible to every non-matching consumer.
++    /// Soundness rests on the record-time conflict rule in
++    /// `try_record_pending_widen`: a second cast whose destination home
++    /// equals the first cast's source register home is refused (the RA may
++    /// reuse the first source's home for the second destination once the
++    /// source's only modelled use -- the deferred move -- leaves its live
++    /// range), and the reversed aliasing (first dest == second source) is
++    /// impossible because the two SSA ranges overlap by construction.
++    pub(super) pending_widen: [Option<super::cast_ops::PendingWiden>; 2],
+     /// Pending FP condition flags from a fused float Cmp: (cmp dest value,
+     /// pre-computed jcc). FP ucomisd sets EFLAGS with different semantics
+     /// than integer cmp (ordered via CF/ZF/PF; `ja`/`jae`/`jb`/`jbe` map to
+@@ -696,6 +713,7 @@ impl X86Codegen {
+             fold_skip_cast: None,
+             value_types: FxHashMap::default(),
+             pending_cmp: None,
++            pending_widen: [None, None],
+             pending_fp_cmp: None,
+             current_func: None,
+             ivsr_pointers: FxHashMap::default(),
+@@ -3603,6 +3621,20 @@ impl ArchCodegen for X86Codegen {
+         self.reg_assignments.contains_key(&vid)
+     }
+ 
++    fn flush_pending_widen(&mut self) {
++        self.flush_pending_widen_impl();
++    }
++
++    fn narrow_cmp_operands(
++        &mut self,
++        dest: u32,
++        op: crate::ir::reexports::IrCmpOp,
++        lhs: &Operand,
++        rhs: &Operand,
++    ) -> Option<(Operand, Operand, IrType, crate::ir::reexports::IrCmpOp)> {
++        self.narrow_cmp_operands_impl(dest, op, lhs, rhs)
++    }
++
+     fn state(&mut self) -> &mut CodegenState {
+         &mut self.state
+     }
+@@ -3782,6 +3814,27 @@ impl ArchCodegen for X86Codegen {
+         // boolean is never needlessly materialized (gzip huft_build regression).
+         match inst {
+             crate::ir::reexports::Instruction::Select { .. } => return false,
++            // PF-15: single-use widening casts from byte/half types stay on
++            // the mature path, where try_record_pending_widen can defer them
++            // into a narrow compare. MachInst would emit the extending move
++            // eagerly, which forecloses the fold. Eligibility mirrors
++            // try_record_pending_widen (the record path re-checks everything
++            // and emits normally on any mismatch, so a lenient gate here is
++            // merely an optimization hint, never a correctness input).
++            crate::ir::reexports::Instruction::Cast {
++                dest,
++                from_ty,
++                to_ty,
++                ..
++            } if matches!(
++                from_ty,
++                IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
++            ) && !to_ty.is_float()
++                && (to_ty.size() == 4 || to_ty.size() == 8)
++                && self.value_use_counts.get(&dest.0).copied() == Some(1) =>
++            {
++                return false;
++            }
+             crate::ir::reexports::Instruction::Cmp { dest, .. }
+                 if self.fused_cmp_dests.contains_key(&dest.0)
+                     || self.cmp_replay.contains_key(&dest.0) =>
+diff --git a/tests/regression/byte_cmp_narrow.c b/tests/regression/byte_cmp_narrow.c
 new file mode 100644
-index 0000000..1df80d1
+index 00000000..1720c065
 --- /dev/null
-+++ b/tests/regression/vec_incdec_elementwise.c
-@@ -0,0 +1,34 @@
-+// Regression pin: vector ++/-- must step by one ELEMENT per lane (GCC
-+// vector extensions: v-- == v = v - 1 with the scalar splatted).  The
-+// generic scalar/pointer inc/dec path stepped the whole object by
-+// sizeof(vector), corrupting every lane (pr123753: u.w-- produced
-+// 0xfff8 in lane 0 instead of 0xffff).
-+typedef int V __attribute__((__vector_size__ (8)));
-+typedef short W __attribute__((__vector_size__ (8)));
-+union { unsigned short u[4]; W w; } u;
-+V v;
++++ b/tests/regression/byte_cmp_narrow.c
+@@ -0,0 +1,64 @@
++/* PF-15: single-use widening byte/half casts feeding an integer compare
++ * must fold into one narrow cmpb/cmpw on the ORIGINAL sources (GCC's
++ * exact shape) whenever the extension/opcode compatibility matrix allows
++ * — sext pairs keep the signed setcc family, zext pairs map every opcode
++ * onto the unsigned family, mixed extensions and out-of-domain constants
++ * are refused (materializing both widening moves instead). The harness
++ * compares program output against GCC, so any wrong flag mapping or a
++ * missing deferred widening move shows up as a mismatch on some input
++ * combination. Exhaustive over the byte domains; strided over the half
++ * domains. */
++#include <stdio.h>
 +
-+V
-+foo ()
-+{
-+  u.w--;
-+  V r = v + u.u[0];
-+  return r;
-+}
++static volatile int v_zero = 0;
 +
-+int
-+main ()
-+{
-+  if (sizeof (int) != 4 || sizeof (short) != 2)
++int scmp(signed char a, signed char b) { return a < b; }
++int sge(signed char a, signed char b) { return a >= b; }
++int seq(signed char a, signed char b) { return a == b; }
++int ucmp(unsigned char a, unsigned char b) { return a < b; }
++int uge(unsigned char a, unsigned char b) { return a >= b; }
++int ub_mix(unsigned char a, signed char b) { return a < b; }
++int slt16(short a, short b) { return a < b; }
++int ule16(unsigned short a, unsigned short b) { return a <= b; }
++int c_sext(signed char a) { return a < 100; }
++int c_zext(unsigned char a) { return a >= 200; }
++int c_sixteen(unsigned short a) { return a == 65535; }
++
++int main(void) {
++    int fails = 0;
++    for (int a = -128; a <= 127; a++) {
++        for (int b = -128; b <= 127; b++) {
++            unsigned char ua = (unsigned char)a;
++            unsigned char ub = (unsigned char)b;
++            if (scmp(a, b) != (a < b)) fails++;
++            if (sge(a, b) != (a >= b)) fails++;
++            if (seq(a, b) != (a == b)) fails++;
++            if (ucmp(ua, ub) != (ua < ub)) fails++;
++            if (uge(ua, ub) != (ua >= ub)) fails++;
++            if (ub_mix(ua, b) != (ua < b)) fails++;
++            if (c_sext(a) != (a < 100)) fails++;
++            if (c_zext(ua) != (ua >= 200)) fails++;
++            if (fails > 40) { printf("FAILS %d\n", fails); return 1; }
++        }
++    }
++    for (int a = -32768; a <= 32767; a += 7) {
++        for (int b = -32768; b <= 32767; b += 11) {
++            unsigned short ua = (unsigned short)a;
++            unsigned short ub = (unsigned short)b;
++            if (slt16(a, b) != (a < b)) fails++;
++            if (ule16(ua, ub) != (ua <= ub)) fails++;
++            if (c_sixteen(ua) != (ua == 65535)) fails++;
++            if (fails > 40) { printf("FAILS %d\n", fails); return 1; }
++        }
++    }
++    /* Deferred-widen interaction with a volatile sink: the loads around
++     * the compare must not reorder the widening moves' liveness. */
++    if (v_zero == 0) {
++        signed char s = -1;
++        unsigned char u = 1;
++        if (!(scmp(s, 0) == 1 && ucmp(u, 0) == 0 && ub_mix(u, s) == 0)) fails++;
++    }
++    if (fails != 0) { printf("FAILS %d\n", fails); return 1; }
++    printf("byte-cmp-narrow OK\n");
 +    return 0;
-+  V x = foo ();
-+  if (x[0] != (unsigned short) -1 || x[1] != (unsigned short) -1)
-+    __builtin_abort ();
-+  W t = (W){0, 0, 0, 0};
-+  W pre = --t;
-+  if (((unsigned short *) &t)[0] != 0xffff)
-+    __builtin_abort ();
-+  if (((unsigned short *) &pre)[0] != 0xffff)
-+    __builtin_abort ();
-+  return 0;
 +}
-diff --git a/tests/regression/vec_incdec_elementwise.flags b/tests/regression/vec_incdec_elementwise.flags
+diff --git a/tests/regression/byte_cmp_narrow.flags b/tests/regression/byte_cmp_narrow.flags
 new file mode 100644
-index 0000000..b13fc40
+index 00000000..3a3b5796
 --- /dev/null
-+++ b/tests/regression/vec_incdec_elementwise.flags
-@@ -0,0 +1,2 @@
-+-O0
++++ b/tests/regression/byte_cmp_narrow.flags
+@@ -0,0 +1 @@
 +-O2
-diff --git a/tests/regression/vec_typedef_chain_size.c b/tests/regression/vec_typedef_chain_size.c
-new file mode 100644
-index 0000000..4a3c898
---- /dev/null
-+++ b/tests/regression/vec_typedef_chain_size.c
-@@ -0,0 +1,27 @@
-+// Regression pin (both backends, all levels): vector_size may take an
-+// expression involving sizeof of a CHAINED typedef, per GCC vector
-+// extensions used pervasively in the torture suite (pr123625 et al).
-+// The parse-time constant evaluator must walk the typedef chain to its
-+// base spec; if the size expression stays unevaluable the attribute is
-+// dropped and the vector object collapses to its 8-byte element type
-+// (stores overrun the object, indexing dereferences element values).
-+#include <stdint.h>
-+#define BS_VEC(type, num) type __attribute__((vector_size(num * sizeof(type))))
-+typedef long long base_t;
-+typedef base_t mid_t;
-+typedef mid_t leaf_t;
-+
-+int main (void)
-+{
-+  BS_VEC (leaf_t, 16) v = { 1, 8096386231136, 9039249955151 };
-+  if (sizeof (v) != 128)
-+    return 1;
-+  if (v[1] != 8096386231136 || v[2] != 9039249955151)
-+    return 2;
-+  long long s = 0;
-+  for (uint32_t i = 0; i < 16; i++)
-+    s += v[i];
-+  if (s != 17135636186288)
-+    return 3;
-+  return 0;
-+}
-diff --git a/tests/regression/vec_typedef_chain_size.flags b/tests/regression/vec_typedef_chain_size.flags
-new file mode 100644
-index 0000000..b13fc40
---- /dev/null
-+++ b/tests/regression/vec_typedef_chain_size.flags
-@@ -0,0 +1,2 @@
-+-O0
-+-O2
+-- 
+2.47.3
+
+
+From 4650ed81caf8ac4c0df3920cd14aa366d0fcc8f2 Mon Sep 17 00:00:00 2001
+From: lccc-agent <agent@lccc.local>
+Date: Sat, 29 Aug 2026 12:09:30 +0000
+Subject: [PATCH 2/4] arm: document why the divrem fusion's fixed x1/x2/x3 uses
+ need no RA exclusion
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Red-team audit follow-up: emit_divrem_pair_head_arm uses x1/x2 as fixed
+operand registers and x3 as the msub scratch. That is sound WITHOUT any
+allocator exclusion (unlike x86-64, where %rdx must be excluded from
+dividing functions) because the ARM allocator only ever assigns
+x4-x8/x13/x14 (ARM_CALLER_SAVED) and x19-x28 (ARM_CALLEE_SAVED) —
+x1/x2/x3 are in no allocatable pool. The x86 rule and the ARM pool are
+now cross-referenced in both places so a future allocator change cannot
+silently invalidate either assumption.
+---
+ src/backend/arm/codegen/alu.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/backend/arm/codegen/alu.rs b/src/backend/arm/codegen/alu.rs
+index 454d37ea..70cc8862 100644
+--- a/src/backend/arm/codegen/alu.rs
++++ b/src/backend/arm/codegen/alu.rs
+@@ -763,6 +763,12 @@ impl ArmCodegen {
+     ) {
+         let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
+         let self_is_div = matches!(op, IrBinOp::UDiv | IrBinOp::SDiv);
++        // x1/x2 (operands) and x3 (remainder scratch) are used as FIXED
++        // registers here. That is sound without any RA exclusion because
++        // the ARM allocator only ever assigns x4, x5, x6, x7, x8, x13, x14
++        // (ARM_CALLER_SAVED) and x19-x28 (ARM_CALLEE_SAVED) — x1/x2/x3 are
++        // in no pool (audited 2026-08-29; x86's counterpart needs the %rdx
++        // exclusion because x86's allocatable pool includes rdx).
+         self.operand_to_x0(lhs);
+         self.state.emit("    mov x1, x0");
+         self.operand_to_x0(rhs);
+-- 
+2.47.3
+
+
+From ce6b8b2e9ab9f0e27740ff0970ba305f0223f76e Mon Sep 17 00:00:00 2001
+From: lccc-agent <agent@lccc.local>
+Date: Sat, 29 Aug 2026 12:15:58 +0000
+Subject: [PATCH 3/4] x86-64: fuse compares through flag-neutral widening moves
+ (IS-07)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The clamp idiom `x > 100 ? 100 : x` lowered as
+cmp/select/select-with-widened-arm lost its flag fusion: the select's
+arm value needed an I32->I64 widening (`movslq %edi, %rdx`) BETWEEN the
+cmp and the select, and the fusion chain walk treated any intervening
+instruction as a chain breaker — falling back to
+setcc+movzbl+testq+cmovne (4 extra instructions per clamp).
+
+The chain walk now steps over widening integer casts of UNRELATED
+values: their emission is pure data movement on every path (mature
+direct move, accumulator staging, MachInst-queued movslq) and leaves
+EFLAGS untouched, so the compare's flags are still live at the select.
+The Cmp destination's single-use invariant is checked before the walk,
+so the boolean is still consumed by exactly the same select.
+
+Deliberately NOT accepted as transparent: UnaryOp (Neg/Not write
+flags), BinOp (writes flags), GEP (scaled indices may emit imul), and
+anything touching memory or the pending boolean — those break the walk
+exactly as before.
+
+`limit` now emits cmp/movslq/movq/cmovg (the setcc chain is gone);
+measured on the clamp trio with GCC as reference. Validated: lib gate
+1302/0 under -D warnings; x86-64 corpus 962/0; i686 failure set
+unchanged; godbolt x86-64 census unchanged. The remaining known gap —
+nested selects whose producer cmps interleave
+(cmp9, cmp14, select(cond=14), select(cond=9): the outer select's
+producer flags are clobbered by the inner cmp) — needs emission
+reordering against flag liveness and is recorded for a follow-up.
+---
+ src/backend/x86/codegen/prologue.rs | 40 +++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/src/backend/x86/codegen/prologue.rs b/src/backend/x86/codegen/prologue.rs
+index 75b26a0e..bb70e424 100644
+--- a/src/backend/x86/codegen/prologue.rs
++++ b/src/backend/x86/codegen/prologue.rs
+@@ -799,6 +799,46 @@ impl X86Codegen {
+                                     cur = cd.0;
+                                     k += 1;
+                                 }
++                                // IS-07: a flag-neutral, side-effect-free,
++                                // boolean-independent data movement between
++                                // the Cmp and its Select consumer does not
++                                // disturb the fusion — the flags survive
++                                // mov/movz/movs/lea untouched, and the Cmp's
++                                // boolean is still consumed by the SAME
++                                // select (use_counts==1 on the Cmp dest is
++                                // checked before the walk starts). This is
++                                // the `limit` clamp shape:
++                                //   cmp x>100; movslq x, x64; select(100, x64)
++                                // which previously lost the fusion to the
++                                // intervening widening move and fell back to
++                                // setcc+movzbl+testq+cmovne (4 extra
++                                // instructions). These instructions are NOT
++                                // boolean forwarding (their values must and
++                                // do emit normally) — they are transparent
++                                // to the handshake, so they are neither
++                                // chained nor added to fused_forward.
++                                // Accepted kind: a widening integer cast of
++                                // an UNRELATED value — its emission (any
++                                // path: mature direct move, accumulator
++                                // staging, or a MachInst-queued movslq) is
++                                // pure data movement and leaves EFLAGS
++                                // untouched. Deliberately NOT accepted:
++                                // UnaryOp (Neg/Not write flags), BinOp
++                                // (writes flags), GEP (scaled indices may
++                                // emit imul — writes flags), anything that
++                                // touches memory or the pending boolean.
++                                Instruction::Cast {
++                                    src: Operand::Value(sv),
++                                    from_ty: ft,
++                                    to_ty: tt,
++                                    ..
++                                } if sv.0 != cur
++                                    && ft.is_integer()
++                                    && tt.is_integer()
++                                    && tt.size() > ft.size() =>
++                                {
++                                    k += 1;
++                                }
+                                 Instruction::Select {
+                                     cond: Operand::Value(v),
+                                     ..
+-- 
+2.47.3
+
+
+From 94e002cbd9182c3717b376d97cdfde15c28288fb Mon Sep 17 00:00:00 2001
+From: lccc-agent <agent@lccc.local>
+Date: Sat, 29 Aug 2026 12:15:58 +0000
+Subject: [PATCH 4/4] x86-64: materialize non-negative immediates with movl
+ (PF-16)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`movq $imm32, %r64` assembles to REX.W C7 /0 (7 bytes). For immediate
+values >= 0, `movl $imm, %r32` (B8+r, 5 bytes, no REX) writes the
+identical canonical 64-bit value — a 32-bit destination write
+zero-extends, which equals the q-form's sign extension exactly when the
+immediate's high bit is clear. Negative immediates keep the q-form
+(movl would zero-extend the wrong value), and magnitudes beyond
+imm32 keep movabsq. The register-direct constant-materialization sites
+(I8/I16/I32/I64 consts into a target register, both the PhysReg and
+register-name variants) and the two flag-neutral `movq $0` clears in
+the compare emitter now pick the shortest correct form; the $0 sites
+additionally drop to movl (same zero-canonical value, neither form
+touches flags, two bytes shorter).
+
+Instruction counts are unchanged by construction (one mov either way),
+so the oracle census is stable; the win is 2 bytes + a dropped REX
+prefix per immediate in switch jump-table staging, GEP offsets, and
+compare-materialization paths.
+
+Validated: value-checked kernels (positive/negative/beyond-imm32
+immediates against expected 64-bit results), lib gate 1302/0 under
+-D warnings, x86-64 corpus 962/0, i686 failure set byte-identical,
+godbolt x86-64 census unchanged at 6278/5773.
+---
+ src/backend/x86/codegen/comparison.rs |   8 +-
+ src/backend/x86/codegen/emit.rs       | 109 +++++++++++++++++++++-----
+ 2 files changed, 94 insertions(+), 23 deletions(-)
+
+diff --git a/src/backend/x86/codegen/comparison.rs b/src/backend/x86/codegen/comparison.rs
+index 8b06ef71..1cedbce8 100644
+--- a/src/backend/x86/codegen/comparison.rs
++++ b/src/backend/x86/codegen/comparison.rs
+@@ -694,7 +694,9 @@ impl X86Codegen {
+                 self.state.reg_cache.invalidate_acc();
+             }
+             if c.is_zero() {
+-                self.state.emit_fmt(format_args!("    movq $0, %{}", reg64));
++                // PF-16: movl $0 writes the same canonical value (zero-extend)
++                // two bytes shorter; neither form touches flags.
++                self.state.emit_fmt(format_args!("    movl $0, %{}", super::emit::reg_name_to_32(&reg64)));
+                 return;
+             }
+             match c {
+@@ -744,7 +746,9 @@ impl X86Codegen {
+                     }
+                 }
+                 IrConst::Zero => {
+-                    self.state.emit_fmt(format_args!("    movq $0, %{}", reg64));
++                    // PF-16: movl $0 writes the same canonical value (zero-extend)
++                // two bytes shorter; neither form touches flags.
++                self.state.emit_fmt(format_args!("    movl $0, %{}", super::emit::reg_name_to_32(&reg64)));
+                 }
+             }
+             let _ = reg32;
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 27588bae..ffe75002 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -76,7 +76,7 @@ pub(super) const X86_XMM_REGS: [PhysReg; 14] = [
+ 
+ /// Convert a 64-bit register name string to its 32-bit sub-register name.
+ /// Used for `xorl %eXX, %eXX` zeroing idiom (shorter encoding, breaks dependencies).
+-fn reg_name_to_32(name: &str) -> &'static str {
++pub(super) fn reg_name_to_32(name: &str) -> &'static str {
+     match name {
+         "rax" => "eax",
+         "rbx" => "ebx",
+@@ -1195,17 +1195,61 @@ impl X86Codegen {
+                         "    xorl %{0}, %{0}",
+                         phys_reg_name_32(target)
+                     )),
+-                    IrConst::I8(v) => self
+-                        .state
+-                        .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, target_name)),
+-                    IrConst::I16(v) => self
+-                        .state
+-                        .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, target_name)),
+-                    IrConst::I32(v) => self
+-                        .state
+-                        .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, target_name)),
++                    // PF-16: non-negative immediates write the 32-bit name
++                    // with movl — the 32-bit write zero-extends to the same
++                    // 64-bit value a `movq $imm32` sign-extension would
++                    // produce, saving the REX prefix and two bytes. Negative
++                    // immediates sign-extend; movl would zero-extend instead
++                    // — they keep the q-form.
++                    IrConst::I8(v) => {
++                        let x = *v as i64;
++                        if x >= 0 {
++                            self.state.emit_fmt(format_args!(
++                                "    movl ${}, %{}",
++                                x,
++                                phys_reg_name_32(target)
++                            ));
++                        } else {
++                            self.state
++                                .emit_fmt(format_args!("    movq ${}, %{}", x, target_name));
++                        }
++                    }
++                    IrConst::I16(v) => {
++                        let x = *v as i64;
++                        if x >= 0 {
++                            self.state.emit_fmt(format_args!(
++                                "    movl ${}, %{}",
++                                x,
++                                phys_reg_name_32(target)
++                            ));
++                        } else {
++                            self.state
++                                .emit_fmt(format_args!("    movq ${}, %{}", x, target_name));
++                        }
++                    }
++                    IrConst::I32(v) => {
++                        let x = *v as i64;
++                        if x >= 0 {
++                            self.state.emit_fmt(format_args!(
++                                "    movl ${}, %{}",
++                                x,
++                                phys_reg_name_32(target)
++                            ));
++                        } else {
++                            self.state
++                                .emit_fmt(format_args!("    movq ${}, %{}", x, target_name));
++                        }
++                    },
+                     IrConst::I64(v) => {
+-                        if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
++                        if *v >= 0 && *v <= i32::MAX as i64 {
++                            // PF-16: fits and non-negative — 5-byte movl,
++                            // zero-extension equals the sign-extended q-form.
++                            self.state.out.emit_instr_imm_reg(
++                                "    movl",
++                                *v,
++                                phys_reg_name_32(target),
++                            );
++                        } else if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
+                             self.state
+                                 .out
+                                 .emit_instr_imm_reg("    movq", *v, target_name);
+@@ -2738,17 +2782,40 @@ impl X86Codegen {
+                 IrConst::I64(0) => self
+                     .state
+                     .emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg))),
+-                IrConst::I8(v) => self
+-                    .state
+-                    .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, reg)),
+-                IrConst::I16(v) => self
+-                    .state
+-                    .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, reg)),
+-                IrConst::I32(v) => self
+-                    .state
+-                    .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, reg)),
++                // PF-16: non-negative immediates via movl (see site above).
++                IrConst::I8(v) => {
++                    let x = *v as i64;
++                    if x >= 0 {
++                        self.state
++                            .emit_fmt(format_args!("    movl ${}, %{}", x, reg_name_to_32(reg)));
++                    } else {
++                        self.state.emit_fmt(format_args!("    movq ${}, %{}", x, reg));
++                    }
++                }
++                IrConst::I16(v) => {
++                    let x = *v as i64;
++                    if x >= 0 {
++                        self.state
++                            .emit_fmt(format_args!("    movl ${}, %{}", x, reg_name_to_32(reg)));
++                    } else {
++                        self.state.emit_fmt(format_args!("    movq ${}, %{}", x, reg));
++                    }
++                }
++                IrConst::I32(v) => {
++                    let x = *v as i64;
++                    if x >= 0 {
++                        self.state
++                            .emit_fmt(format_args!("    movl ${}, %{}", x, reg_name_to_32(reg)));
++                    } else {
++                        self.state.emit_fmt(format_args!("    movq ${}, %{}", x, reg));
++                    }
++                },
+                 IrConst::I64(v) => {
+-                    if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
++                    if *v >= 0 && *v <= i32::MAX as i64 {
++                        self.state
++                            .out
++                            .emit_instr_imm_reg("    movl", *v, reg_name_to_32(reg));
++                    } else if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
+                         self.state.out.emit_instr_imm_reg("    movq", *v, reg);
+                     } else {
+                         self.state.out.emit_instr_imm_reg("    movabsq", *v, reg);
+-- 
+2.47.3
+
