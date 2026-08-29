@@ -1,546 +1,375 @@
-diff --git a/engineering/FOLLOWUP-2026-08-29-sticky-sse-holes.md b/engineering/FOLLOWUP-2026-08-29-sticky-sse-holes.md
+diff --git a/engineering/FOLLOWUP-2026-08-29-matmul-broadcast-hoist.md b/engineering/FOLLOWUP-2026-08-29-matmul-broadcast-hoist.md
 new file mode 100644
-index 0000000..1bb15d3
+index 00000000..ad65bd0d
 --- /dev/null
-+++ b/engineering/FOLLOWUP-2026-08-29-sticky-sse-holes.md
-@@ -0,0 +1,57 @@
-+# Follow-up — 2026-08-29: sticky `-mno-sse` holes after #296
++++ b/engineering/FOLLOWUP-2026-08-29-matmul-broadcast-hoist.md
+@@ -0,0 +1,124 @@
++# Follow-up — 2026-08-29: AVX2 matmul broadcast hoist (A[i][k] invariant)
 +
-+**Base.** `ms178/lccc` main `b416d21` (#299). Sticky `-mno-sse` vs
-+`-march=native` is already in #296 (`6f668f0`).
++**Base.** `ms178/lccc` main `796058f0` (#300 sticky-SSE). Previous session left
++paravirt-improved commit `04ed7f41` on top.
 +
-+## Holes
++## Problem
 +
-+1. **CPU profiles still set AVX bits.** `enable_x86_avx*_profile` only
-+   skipped `no_sse = false` when `sse_explicitly_disabled`.
-+   `-mno-sse -march=haswell` therefore still set `enable_avx2`.
-+2. **64-byte memcpy YMM path.** `emit_memcpy_impl_impl` selected
-+   `vmovdqu` on `avx2_enabled` without `!no_sse`. Combined with (1),
-+   `-mno-sse -march=haswell` could emit YMM while CR4.OSFXSR=0.
-+3. **Explicit `-mavx` after `-mno-sse`.** GCC last-ISA-flag wins; we
-+   now clear the sticky latch on `-mavx`/`-mavx2` (same as `-msse`).
-+4. **`-mgeneral-regs-only`.** Now latches sticky `-mno-sse` (kernel
-+   decompressor / realmode also pass this).
++Final asm `/tmp/matmul.s` for `tests/benchmark/programs/matmul.c` (`-O3 -march=x86-64-v3`)
++still had 4× `vmovsd (%r15)` + `vbroadcastsd` **inside** vector loop LBB6:
 +
-+Integer BMI/LZCNT/MOVBE from v3 profiles remain enabled under
-+`-mno-sse` (not SSE).
++```
++.LBB6:
++  vmovsd (%r15), %xmm0
++  vbroadcastsd %xmm0, %ymm1
++  vmovupd (%rbx,%r12), %ymm0
++  vfmadd231pd (%r14,%r12), %ymm1, %ymm0
++  ... repeated 4× for +0,+32,+64,+96
++```
 +
-+## Tests
++Root cause analysis via `CCC_DEBUG_LICM_ALIAS=1`:
 +
-+- `mno_sse_survives_march_haswell_without_avx`
-+- `mavx_reenable_after_mno_sse`
-+- `tests/regression/mno_sse_memcpy64.c` (freestanding `-mno-sse
-+  -march=haswell` must not emit xmm/ymm)
++- First LICM iteration for header=5 (j-loop) **did** hoist `Value23 GEP base21 offset22` (= A[i][k])
++  plus 8 other GEPs/Casts (`count=9`). Symbol map `LICM-SYMBOL` confirmed
++  `A=62, B=63, C=64` canonical.
++- After `vectorize` pass (between `loop_unroll` iter0 and `run_gvn_licm_ivsr_shared`),
++  j-loop body is rewritten to `FmaF64x4` intrinsics:
++  `Intrinsic FmaF64x4 dest_ptr 44 args [Value103, Value33]` x4 with offsets +32,+64,+96.
++  `FMA ARG Value103 def_block Some(3) Phi dest103 ty Ptr incoming [(106,Block2),(104,Block7)]`
++  where 106=Phi(62 from0,107 from3) and 104=GEP base103+8. So Value103 is k-loop
++  induction for A[i][k] pointer, **invariant for inner j-loop** (def_block 3 outside
++  body 5,6). No explicit `Load` in j-body; load is inside FMA intrinsic semantics
++  (`*args[0]` broadcast).
++- LICM only looks at `Load`/`Store` in `pointer_values={72,44,68,76}` (FMA dests), zero loads,
++  `count=0` for second iteration. So invariant A load hidden inside `FmaF64x4` args
++  cannot be hoisted by LICM.
++- `value_to_base_global` maps Phi 90 (C) to itself (conflict 109 vs 90), not to canonical 64,
++  so `stored_global_bases` is {90} or empty, but A base 62 is distinct, so scalar A load
++  **was** hoistable for header=11 (Load dest86 ptr23 base21 offset22 def_block4 out-loop).
++  After vectorize, A pointer becomes Value103 mapping to 103 (self), not 62.
 +
-+## QEMU path
++Thus vectorizer reintroduced invariant load after first LICM hoist.
 +
-+`scripts/build_kernel_compressed.sh` wraps intact
-+`kernel-work/intact/vmlinux` with LCCC compressed objects + lccc-ld.
-+Do **not** `make bzImage` as a file target. Piggy is `zstd -6 --ultra`
-++ 4-byte LE size. SIMD audit of `compressed/vmlinux` must show no
-+xmm/ymm.
++## Fix
 +
-+`build_kernel_boot.sh` must pass `-DSVGA_MODE=NORMAL_VGA` when assembling
-+`header.S` (kbuild does). Without it `vid_mode` is ASK_VGA and setup
-+blocks 30s on a VGA prompt (`Press <ENTER> to see video modes`).
++`src/passes/vectorize.rs` `transform_to_fma_f64x4`:
 +
-+## QEMU result (this session)
++- **Previously:** emitted 4× `FmaF64x4` with args `[A_ptr, B_gep]` inside loop.
++  Backend lowering for `FmaF64x4` does `vmovsd (A_ptr), xmm1; vbroadcastsd; vmovupd (C); vfmadd231pd (B), ymm1, ymm0; vmovupd`.
++  So 4 broadcasts per iteration.
 +
-+Sticky-SSE holes are **not** the remaining ZSTD abort.
++- **Now (like 2-wide path):** hoist `BroadcastLoadF64` into preheader:
 +
-+| wrap | QMP after ~8s |
-+|---|---|
-+| lccc `misc.o` -O2 / -O1 / -O0 | CS64 RIP ~`0x221xxxx` `hlt; jmp $-1`, RBX → `"ZSTD-compressed data is corrupt"` |
-+| **gcc** `misc.o` -O2, **all other objects lccc**, lccc-ld | RIP `ffffffff81efa85e` (uncompressed kernel VA). Decompress **succeeded**. |
++```rust
++func.blocks[preheader_idx].instructions.push(Intrinsic {
++  dest: None,
++  op: BroadcastLoadF64,
++  dest_ptr: None,
++  args: vec![Value(pattern.a_ptr)],
++});
++```
 +
-+Piggy is intact (`28 b5 2f fd`, `input_len=4127535`, `output_len=18638776`).
-+Userspace `zstd_preboot_oracle.sh` of a **decompress-only** TU still MATCHES;
-+the failing TU is full `misc.c` (extract_kernel + STATIC `__decompress`).
-+`-O0` still fails (undefined `accept_memory` stubbed), so this is **lowering /
-+codegen**, not `simplify`/`gvn`/`vectorize`.
++  and emit 4× `FmaF64x4Hoisted` with only B ptr:
 +
-+Do not relink intact `vmlinux`. Next: O0 codegen of `decompress_kernel` /
-+`__decompress` in `misc.c` vs gcc (same flags, lccc-ld).
-diff --git a/scripts/build_kernel_boot.sh b/scripts/build_kernel_boot.sh
-index 6101ac8..400fd05 100755
---- a/scripts/build_kernel_boot.sh
-+++ b/scripts/build_kernel_boot.sh
-@@ -28,7 +28,7 @@ OUT=${OUT:-/tmp/bootbuild}
- 
- cd "$K"
- 
--RMF="-std=gnu11 -m16 -g -Os -march=i386 -mregparm=3 -fno-strict-aliasing -fomit-frame-pointer -fno-pic -mno-mmx -mno-sse -mpreferred-stack-boundary=2 -ffreestanding -ffunction-sections -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -fno-jump-tables -Wall -Wstrict-prototypes -Wno-address-of-packed-member"
-+RMF="-std=gnu11 -m16 -g -Os -march=i386 -mregparm=3 -fno-strict-aliasing -fomit-frame-pointer -fno-pic -mno-mmx -mno-sse -mpreferred-stack-boundary=2 -ffreestanding -ffunction-sections -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -fno-jump-tables -Wall -Wstrict-prototypes -Wno-address-of-packed-member -DSVGA_MODE=NORMAL_VGA"
- INC="-nostdinc -Iarch/x86/boot -Iarch/x86/include -Iarch/x86/include/generated -Iinclude -Iinclude/generated -Iinclude/uapi -Iarch/x86/include/uapi -Iarch/x86/include/generated/uapi -Iinclude/generated/uapi -include include/linux/compiler-version.h -include include/linux/kconfig.h -include include/linux/compiler_types.h -D__KERNEL__ -D_SETUP -DDISABLE_BRANCH_PROFILING -D__DISABLE_EXPORTS"
- 
- mkdir -p "$OUT"
-diff --git a/scripts/build_kernel_compressed.sh b/scripts/build_kernel_compressed.sh
-new file mode 100755
-index 0000000..acd8c45
---- /dev/null
-+++ b/scripts/build_kernel_compressed.sh
-@@ -0,0 +1,235 @@
-+#!/usr/bin/env bash
-+# ============================================================================
-+# build_kernel_compressed.sh — wrap an intact vmlinux in an LCCC-built
-+# x86 decompressor + real-mode setup, producing arch/x86/boot/bzImage.
-+#
-+# NEVER invoke top-level `make bzImage` or a compressed *file* target:
-+# those leak KBUILD_CFLAGS (`-mcmodel=kernel -fno-PIE -march=native`) into
-+# the PIE decompressor. Compile every compressed TU with the flags from
-+# arch/x86/boot/compressed/Makefile:
-+#   -O2 -fPIE -mcmodel=small -mno-sse -mno-mmx -ffreestanding
-+#
-+# Payload: INTACT_VMLINUX (default kernel-work/intact/vmlinux). Do not relink
-+# that ELF. Piggy is `zstd -6 --ultra` plus a 4-byte LE uncompressed size.
-+#
-+# Usage:
-+#   KERNEL_DIR=... LCCC=... LCCC_LD=... INTACT_VMLINUX=... \
-+#     build_kernel_compressed.sh
-+# ============================================================================
-+set -euo pipefail
++```rust
++Intrinsic { op: FmaF64x4Hoisted, dest_ptr: Some(c_gep), args: vec![Value(b_gep)] }
++```
 +
-+K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.47}
-+LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
-+LCCC_LD=${LCCC_LD:-/home/user/lccc/target/fastbuild/lccc-ld}
-+INTACT=${INTACT_VMLINUX:-/home/user/kernel-work/intact/vmlinux}
-+C=$K/arch/x86/boot/compressed
-+B=$K/arch/x86/boot
-+S=$K/arch/x86/boot/startup
-+OUT=${OUT:-/tmp/lccc-compressed}
++Backend x86 lowering:
 +
-+[[ -d "$K" ]] || { echo "kernel tree missing: $K" >&2; exit 1; }
-+[[ -x "$LCCC" ]] || { echo "lccc missing: $LCCC" >&2; exit 1; }
-+[[ -x "$LCCC_LD" ]] || { echo "lccc-ld missing: $LCCC_LD" >&2; exit 1; }
-+[[ -f "$INTACT" ]] || { echo "intact vmlinux missing: $INTACT" >&2; exit 1; }
++- `BroadcastLoadF64`: `vmovsd (%rcx), %xmm1; vbroadcastsd %xmm1, %ymm1` (ymm1 holds A)
++- `FmaF64x4Hoisted`: `vmovupd (%rax), %ymm0; vfmadd231pd (%rdx), %ymm1, %ymm0; vmovupd %ymm0, (%rax)`
 +
-+mkdir -p "$OUT"
-+cd "$K"
++## Result
 +
-+# ---- 1. VM config so the stub is EFI/KASLR/SEV-free (QEMU -kernel path) ----
-+if [[ ! -f .lccc-vm-config ]]; then
-+  echo "config: allnoconfig + kernel-vm.fragment"
-+  make ARCH=x86_64 allnoconfig >/dev/null
-+  scripts/kconfig/merge_config.sh -m .config \
-+    /home/user/lccc/scripts/kernel-vm.fragment >/dev/null
-+  make ARCH=x86_64 olddefconfig >/dev/null
-+  make ARCH=x86_64 syncconfig >/dev/null
-+  # timeconst.h / asm-offsets must match HZ_800 from the fragment.
-+  make ARCH=x86_64 HOSTCC=gcc CC=gcc prepare >/dev/null
-+  touch .lccc-vm-config
-+fi
-+grep -q '^CONFIG_KERNEL_ZSTD=y$' .config || {
-+  echo "CONFIG_KERNEL_ZSTD is not set" >&2
-+  exit 1
-+}
++`/tmp/matmul.s` after fix:
 +
-+# Do not put intact vmlinux at $K/vmlinux — kbuild would treat it as a
-+# rebuildable goal. Work from a copy under $OUT.
-+cp -f "$INTACT" "$OUT/vmlinux"
-+chmod a-w "$OUT/vmlinux" || true
++```
++.LBB4:
++  movq %r15, %rcx
++  vmovsd (%rcx), %xmm1
++  vbroadcastsd %xmm1, %ymm1   # hoisted
++  xorl %ebp, %ebp
++.LBB6:
++  movslq %ebp, %r12
++  leaq (%r14, %r12), %r10
++  ...
++  vmovupd (%rax), %ymm0
++  vfmadd231pd (%rdx), %ymm1, %ymm0
++  vmovupd %ymm0, (%rax)
++  ... x4, 0 vmovsd inside LBB6
++```
 +
-+# ---- 2. voffset.h from the intact ELF (misc.o needs VO_* ) -----------------
-+sed_voffset='s/^\([0-9a-fA-F]*\) [ABbCDGRSTtVW] \(_text\|__start_rodata\|_sinittext\|__inittext_end\|__bss_start\|_end\)$/#define VO_\2 _AC(0x\1,UL)/p'
-+nm "$OUT/vmlinux" | sed -n "$sed_voffset" > "$B/voffset.h"
-+echo "voffset.h:"
-+cat "$B/voffset.h"
++- `vmovsd` count total: 1 (preheader) vs 4 before inside loop.
++- `vbroadcastsd` count total: 1 vs 4 before.
++- LBB6 vmovsd count: 0 (was 4).
 +
-+# ---- 3. piggy: vmlinux.bin + zstd -6 --ultra + 4-byte LE size --------------
-+echo "OBJCOPY vmlinux.bin"
-+objcopy -R .comment -S "$OUT/vmlinux" "$C/vmlinux.bin"
-+plain_sz=$(stat -c%s "$C/vmlinux.bin")
-+echo "ZSTD vmlinux.bin.zst (${plain_sz} bytes uncompressed)"
-+# size_append: 4-byte little-endian uncompressed size of vmlinux.bin.all
-+python3 - "$C/vmlinux.bin" "$C/vmlinux.bin.zst" <<'PY'
-+import struct, subprocess, sys
-+plain, out = sys.argv[1], sys.argv[2]
-+raw = subprocess.check_output(["zstd", "-6", "--ultra", "-c", plain])
-+size = open(plain, "rb").seek(0, 2)
-+open(plain, "rb").seek(0)
-+import os
-+size = os.path.getsize(plain)
-+open(out, "wb").write(raw + struct.pack("<I", size))
-+print(f"piggy payload {len(raw)} + 4-byte size {size}")
-+PY
++## Validation
 +
-+if [[ ! -x "$C/mkpiggy" ]]; then
-+  gcc -O2 -I"$K/tools/include" "$C/mkpiggy.c" -o "$C/mkpiggy"
-+fi
-+"$C/mkpiggy" "$C/vmlinux.bin.zst" > "$C/piggy.S"
-+echo "MKPIGGY piggy.S"
++- `cargo test --profile fastbuild --locked`: 1304 passed, 0 failed.
++- `target/fastbuild/lccc -O3 -march=x86-64-v3 -S -o /tmp/matmul.s tests/benchmark/programs/matmul.c`
++  verified hoist.
++- `scripts/godbolt.py compare ... --function matmul`:
++  - lccc 96 insns, gcc16.2 25 insns, clang 438 insns.
++  - Still behind GCC (GCC uses tighter SIB and less LEA overhead), but broadcast hoist
++    removes 8 insns per iteration (4 loads + 4 broadcasts) and reduces memory traffic.
++- `scripts/codegen_scoreboard.py .../matmul.c`: gap 71 vs best (gcc=25), loads 36, stores 7, vec 12.
 +
-+# ---- 4. flags (compressed/Makefile; -mno-sse last, sticky in lccc) ---------
-+INC=(
-+  -nostdinc
-+  -I"$C" -I"$K/arch/x86/include" -I"$K/arch/x86/include/generated"
-+  -I"$K/include" -I"$K/include/generated"
-+  -I"$K/arch/x86/include/uapi" -I"$K/arch/x86/include/generated/uapi"
-+  -I"$K/include/uapi" -I"$K/include/generated/uapi"
-+  -include "$K/include/linux/compiler-version.h"
-+  -include "$K/include/linux/kconfig.h"
-+  -include "$K/include/linux/compiler_types.h"
-+  -include "$K/include/linux/hidden.h"
-+)
-+CF=(
-+  -std=gnu18 -m64 -O2 -fno-strict-aliasing -fPIE -fno-jump-tables
-+  -Wundef -DDISABLE_BRANCH_PROFILING -mcmodel=small -mno-red-zone
-+  -mno-mmx -ffreestanding -fshort-wchar -fno-stack-protector
-+  -Wno-pointer-sign -fno-asynchronous-unwind-tables -D__DISABLE_EXPORTS
-+  -D__KERNEL__ -fno-strict-overflow -mno-sse
-+)
-+cc() { # cc <stem>
-+  local s=$1
-+  echo "CC   $s.c"
-+  "$LCCC" "${INC[@]}" "${CF[@]}" \
-+    -DKBUILD_BASENAME="\"$s\"" \
-+    -DKBUILD_MODNAME="\"$s\"" \
-+    -DKBUILD_MODFILE="\"arch/x86/boot/compressed/$s\"" \
-+    -c "$C/$s.c" -o "$C/$s.o"
-+}
-+as() { # as <stem> [src]
-+  local s=$1 src=${2:-$C/$1.S}
-+  echo "AS   $(basename "$src")"
-+  "$LCCC" "${INC[@]}" "${CF[@]}" -D__ASSEMBLY__ \
-+    -c "$src" -o "$C/$s.o"
-+}
++## Next steps
 +
-+# ---- 5. startup/lib.a (x86_64 decompressor always pulls this in) -----------
-+echo "CC   startup"
-+ST_CF=(
-+  -std=gnu11 -m64 -Os -fPIC -mcmodel=small -fno-stack-protector
-+  -fno-jump-tables -ffreestanding -fno-asynchronous-unwind-tables
-+  -D__DISABLE_EXPORTS -DDISABLE_BRANCH_PROFILING -D__NO_FORTIFY -D__KERNEL__
-+  -mno-mmx -mno-sse
-+)
-+st_cc() {
-+  local s=$1
-+  "$LCCC" "${INC[@]}" "${ST_CF[@]}" \
-+    -DKBUILD_BASENAME="\"$s\"" -DKBUILD_MODNAME="\"$s\"" \
-+    -c "$S/$s.c" -o "$S/$s.o"
-+  objcopy --prefix-symbols=__pi_ "$S/$s.o" "$S/$s.pi.o"
-+}
-+st_cc gdt_idt
-+st_cc map_kernel
-+"$LCCC" "${INC[@]}" "${ST_CF[@]}" -D__ASSEMBLY__ -c "$S/la57toggle.S" -o "$S/la57toggle.o"
-+rm -f "$S/lib.a"
-+ar rcs "$S/lib.a" "$S/gdt_idt.pi.o" "$S/map_kernel.pi.o" "$S/la57toggle.o"
-+echo "AR   startup/lib.a"
++- Reduce LEA/movq overhead in quad FMA: current emits `leaq (%r14,%r12), %r10; movq %r10, %rdx; movq %r9, %rax`
++  for each chunk. Backend could use SIB directly: `vmovupd (%rbx,%r12), %ymm0` and
++  `vfmadd231pd (%r14,%r12), %ymm1, %ymm0` without extra moves. Requires `FmaF64x4HoistedSIB`
++  or smarter regalloc that recognizes GEP base+offset as single SIB.
++- Consider unrolling k-loop or tiling for cache, but P0 is correctness + broadcast hoist.
++- Apply same hoist to `transform_to_fma_f64x4` remainder handling if needed.
++- Update snapshot ledger, deliver patch.
 +
-+# ---- 6. compressed objects -------------------------------------------------
-+cc misc
-+cc string
-+cc cmdline
-+cc error
-+cc cpuflags
-+cc ident_map_64
-+cc idt_64
-+cc pgtable_64
-+if grep -q '^CONFIG_EARLY_PRINTK=y$' .config; then
-+  cc early_serial_console
-+fi
-+as head_64
-+as idt_handlers_64
-+as kernel_info
-+as piggy "$C/piggy.S"
++## Artifacts
 +
-+# linker script
-+echo "CPP  vmlinux.lds"
-+# Match scripts/Makefile.build cmd_cpp_lds_S: -P -U$(ARCH) -D__ASSEMBLY__
-+# -DLINKER_SCRIPT so ALIGN() stays a linker token, not gas `.balign`.
-+gcc -E -P -Ux86_64 -Ux86 -D__ASSEMBLY__ -DLINKER_SCRIPT \
-+  -nostdinc \
-+  -I"$K/arch/x86/include" -I"$K/arch/x86/include/generated" \
-+  -I"$K/include" -I"$K/include/generated" \
-+  -I"$K/arch/x86/include/uapi" -I"$K/arch/x86/include/generated/uapi" \
-+  -I"$K/include/uapi" -I"$K/include/generated/uapi" \
-+  -include "$K/include/linux/kconfig.h" \
-+  "$C/vmlinux.lds.S" -o "$C/vmlinux.lds"
-+grep -n 'balign' "$C/vmlinux.lds" && {
-+  echo "vmlinux.lds still contains .balign — preprocessor flags wrong" >&2
-+  exit 1
-+}
-+
-+# ---- 7. link compressed/vmlinux with lccc-ld --------------------------------
-+OBJS=(
-+  "$C/kernel_info.o" "$C/head_64.o" "$C/misc.o" "$C/string.o"
-+  "$C/cmdline.o" "$C/error.o" "$C/piggy.o" "$C/cpuflags.o"
-+  "$C/ident_map_64.o" "$C/idt_64.o" "$C/idt_handlers_64.o"
-+  "$C/pgtable_64.o"
-+)
-+grep -q '^CONFIG_EARLY_PRINTK=y$' .config && OBJS+=("$C/early_serial_console.o")
-+
-+echo "LD   compressed/vmlinux"
-+"$LCCC_LD" -m elf_x86_64 --no-ld-generated-unwind-info \
-+  -pie --no-dynamic-linker -z noexecstack \
-+  -T "$C/vmlinux.lds" "${OBJS[@]}" "$S/lib.a" \
-+  -o "$C/vmlinux"
-+
-+echo "compressed/vmlinux symbols:"
-+nm -n "$C/vmlinux" | grep -E ' (startup_64|input_data|_text|_end|z_input_len)$' || true
-+# SIMD audit of the decompressor (CR4.OSFXSR=0 until extract_kernel finishes)
-+if objdump -d "$C/vmlinux" | grep -E '[[:space:]](v?mov[ua]p[sd]|v?movdqu|v?movaps|addps|mulps|xmm|ymm)' | grep -v 'objdump' | head; then
-+  echo "WARNING: SIMD ops in compressed/vmlinux" >&2
-+else
-+  echo "SIMD audit: no xmm/ymm in compressed/vmlinux"
-+fi
-+
-+# ---- 8. zoffset.h + real-mode setup ----------------------------------------
-+sed_zoffset='s/^\([0-9a-fA-F]*\) [a-zA-Z] \(startup_32\|efi.._stub_entry\|efi\(32\)\?_pe_entry\|input_data\|kernel_info\|_end\|_ehead\|_text\|_e\?data\|_e\?sbat\|z_.*\)$/#define ZO_\2 0x\1/p'
-+nm "$C/vmlinux" | sed -n "$sed_zoffset" > "$B/zoffset.h"
-+echo "zoffset.h:"
-+cat "$B/zoffset.h"
-+
-+echo "setup (build_kernel_boot.sh)"
-+OUT="$OUT/setup" /home/user/lccc/scripts/build_kernel_boot.sh
-+# header.o was compiled against a stub zoffset in that script if it ran
-+# before zoffset existed; recompile header.o with the real one and relink.
-+RMF="-std=gnu11 -m16 -g -Os -march=i386 -mregparm=3 -fno-strict-aliasing -fomit-frame-pointer -fno-pic -mno-mmx -mno-sse -mpreferred-stack-boundary=2 -ffreestanding -ffunction-sections -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -fno-jump-tables -DSVGA_MODE=NORMAL_VGA"
-+SINC="-nostdinc -I$B -I$K/arch/x86/include -I$K/arch/x86/include/generated -I$K/include -I$K/include/generated -I$K/include/uapi -I$K/arch/x86/include/uapi -I$K/arch/x86/include/generated/uapi -I$K/include/generated/uapi -include $K/include/linux/compiler-version.h -include $K/include/linux/kconfig.h -include $K/include/linux/compiler_types.h -D__KERNEL__ -D_SETUP -DDISABLE_BRANCH_PROFILING -D__DISABLE_EXPORTS"
-+echo "CC   header.S (real zoffset.h)"
-+"$LCCC" $SINC $RMF -D__ASSEMBLY__ -I"$B" -c "$B/header.S" -o "$OUT/setup/header.o"
-+SETUP_LD="$OUT/setup/setup-gc.ld"
-+SETUP_OBJS=(a20 bioscall cmdline copy cpu cpuflags cpucheck early_serial_console
-+            edd header main memory pm pmjump printf regs string tty video
-+            video-mode version video-vga video-vesa video-bios)
-+SO=()
-+for o in "${SETUP_OBJS[@]}"; do SO+=("$OUT/setup/$o.o"); done
-+"$LCCC_LD" --gc-sections -m elf_i386 -z noexecstack -T "$SETUP_LD" \
-+  "${SO[@]}" -o "$B/setup.elf"
-+objcopy -O binary "$B/setup.elf" "$B/setup.bin"
-+objcopy -O binary -R .note -R .comment -S "$C/vmlinux" "$B/vmlinux.bin"
-+
-+# ---- 9. bzImage = setup.bin (4k padded) + compressed vmlinux.bin -----------
-+echo "BUILD bzImage"
-+(dd if="$B/setup.bin" bs=4k conv=sync status=none; cat "$B/vmlinux.bin") > "$B/bzImage"
-+ls -l "$B/bzImage" "$C/vmlinux" "$B/setup.bin"
-+sha256sum "$B/bzImage"
-+echo "build_kernel_compressed: SUCCESS"
-diff --git a/src/backend/x86/codegen/memory.rs b/src/backend/x86/codegen/memory.rs
-index 316810c..c993660 100644
---- a/src/backend/x86/codegen/memory.rs
-+++ b/src/backend/x86/codegen/memory.rs
-@@ -2559,7 +2559,11 @@ impl X86Codegen {
-         // explicit vzeroupper prevents any later legacy-SSE transition. Smaller
-         // 32/48-byte copies stay XMM (the vzeroupper cost erases their one- or
-         // two-instruction saving in hot struct loops).
--        if size == 64 && self.avx2_enabled && std::env::var_os("CCC_NO_64B_YMM_COPY").is_none() {
-+        if size == 64
-+            && self.avx2_enabled
-+            && !self.no_sse
-+            && std::env::var_os("CCC_NO_64B_YMM_COPY").is_none()
-+        {
-             self.state.emit("    vmovdqu (%rsi), %ymm0");
-             self.state.emit("    vmovdqu %ymm0, (%rdi)");
-             self.state.emit("    vmovdqu 32(%rsi), %ymm1");
-diff --git a/src/driver/cli.rs b/src/driver/cli.rs
-index 96926a1..75380e0 100644
---- a/src/driver/cli.rs
-+++ b/src/driver/cli.rs
-@@ -43,9 +43,13 @@ fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
- 
- impl Driver {
-     fn enable_x86_avx_profile(&mut self) {
--        if !self.sse_explicitly_disabled {
--            self.no_sse = false;
-+        // Explicit `-mno-sse` is sticky against `-march=` CPU profiles (GCC).
-+        // Do not set AVX/SSE feature bits either: `avx2_enabled` would otherwise
-+        // still select `vmovdqu` for 64-byte copies while CR4.OSFXSR=0.
-+        if self.sse_explicitly_disabled {
-+            return;
++- `/home/user/ms178-1.patch` (12K, 245 lines) — applies clean on `796058f0`, includes:
++  - `04ed7f41 paravirt-improved` (Cast/Sub, versioned symbols, GOT/TLS guards, Copy-chain const extraction)
++  - matmul broadcast hoist fix.
++- `/tmp/matmul.s` final asm with hoisted broadcast.
++- `/tmp/matmul_godbolt/` compare artifacts.
+diff --git a/src/backend/x86/codegen/calls.rs b/src/backend/x86/codegen/calls.rs
+index 10c85052..f0018490 100644
+--- a/src/backend/x86/codegen/calls.rs
++++ b/src/backend/x86/codegen/calls.rs
+@@ -25,8 +25,42 @@ impl X86Codegen {
          }
-+        self.no_sse = false;
-         self.enable_avx = true;
-         self.enable_sse4_2 = true;
-         self.enable_sse4_1 = true;
-@@ -54,25 +58,38 @@ impl Driver {
      }
-     fn enable_x86_avx2_profile(&mut self) {
-         self.enable_x86_avx_profile();
-+        if self.sse_explicitly_disabled {
-+            return;
-+        }
-         self.enable_avx2 = true;
-     }
-     fn enable_x86_v3_profile(&mut self) {
-         self.enable_x86_avx2_profile();
--        self.enable_f16c = true;
--        self.enable_fma = true;
-+        // BMI/LZCNT/MOVBE are integer ISA and remain legal under `-mno-sse`.
-         self.enable_bmi = true;
-         self.enable_bmi2 = true;
-         self.enable_lzcnt = true;
-         self.enable_movbe = true;
-+        if self.sse_explicitly_disabled {
-+            return;
-+        }
-+        self.enable_f16c = true;
-+        self.enable_fma = true;
-     }
-     fn enable_x86_haswell_profile(&mut self) {
-         self.enable_x86_v3_profile();
-+        if self.sse_explicitly_disabled {
-+            return;
-+        }
-         self.enable_aes = true;
-         self.enable_pclmul = true;
-         self.enable_rdrnd = true;
-     }
-     fn enable_x86_avx512_profile(&mut self) {
-         self.enable_x86_v3_profile();
-+        if self.sse_explicitly_disabled {
-+            return;
-+        }
-         self.enable_avx512f = true;
-         self.enable_avx512cd = true;
-         self.enable_avx512dq = true;
-@@ -111,6 +128,9 @@ impl Driver {
-     }
-     fn enable_x86_knl_profile(&mut self) {
-         self.enable_x86_v3_profile();
-+        if self.sse_explicitly_disabled {
-+            return;
-+        }
-         self.enable_pclmul = true;
-         self.enable_rdrnd = true;
-         self.enable_avx512f = true;
-@@ -120,6 +140,9 @@ impl Driver {
-     }
-     fn enable_x86_znver3_profile(&mut self) {
-         self.enable_x86_haswell_profile();
-+        if self.sse_explicitly_disabled {
-+            return;
-+        }
-         self.enable_vaes = true;
-         self.enable_vpclmulqdq = true;
-     }
-@@ -133,9 +156,10 @@ impl Driver {
-         self.enable_avx512vp2intersect = true;
-     }
-     fn enable_x86_nehalem_profile(&mut self) {
--        if !self.sse_explicitly_disabled {
--            self.no_sse = false;
-+        if self.sse_explicitly_disabled {
-+            return;
-         }
-+        self.no_sse = false;
-         self.enable_sse3 = true;
-         self.enable_ssse3 = true;
-         self.enable_sse4_1 = true;
-@@ -167,6 +191,9 @@ impl Driver {
-     }
-     fn enable_x86_alderlake_profile(&mut self) {
-         self.enable_x86_haswell_profile();
-+        if self.sse_explicitly_disabled {
-+            return;
-+        }
-         self.enable_avxvnni = true;
-         self.enable_gfni = true;
-         self.enable_vaes = true;
-@@ -1068,8 +1095,15 @@ impl Driver {
-                 "-mxsave" | "-mxsaveopt" | "-mxsavec" | "-mno-xsave" | "-mno-xsaveopt"
-                 | "-mno-xsavec" => {}
-                 "-mno-vpclmulqdq" => self.enable_vpclmulqdq = false,
--                "-mavx2" => self.enable_x86_avx2_profile(),
-+                "-mavx2" => {
-+                    // Explicit ISA enable wins over a prior `-mno-sse` (GCC).
-+                    self.no_sse = false;
-+                    self.sse_explicitly_disabled = false;
-+                    self.enable_x86_avx2_profile();
+ 
+-    /// Resolve a Value chain that ends in GlobalAddr, accumulating GEP/Add offsets.
+-    /// Returns (symbol_name, total_offset) if the chain is GlobalAddr (+ GEPs/Copies/Adds).
++    /// Extract a constant i64 from an Operand, following Copy chains.
++    fn operand_const_i64(&self, op: &Operand) -> Option<i64> {
++        match op {
++            Operand::Const(c) => c.to_i64(),
++            Operand::Value(v) => {
++                let mut cur = v.0;
++                let mut visited = 0;
++                loop {
++                    if visited > 16 {
++                        return None;
++                    }
++                    visited += 1;
++                    let inst = self.get_defining_instruction(cur)?;
++                    match inst {
++                        Instruction::Copy { src, .. } => match src {
++                            Operand::Const(c) => return c.to_i64(),
++                            Operand::Value(nv) => cur = nv.0,
++                        },
++                        Instruction::Cast { src, .. } => match src {
++                            Operand::Const(c) => return c.to_i64(),
++                            Operand::Value(nv) => cur = nv.0,
++                        },
++                        _ => return None,
++                    }
 +                }
-                 "-mavx" => {
-+                    self.no_sse = false;
-+                    self.sse_explicitly_disabled = false;
-                     self.enable_avx = true;
-                     self.enable_sse4_2 = true;
-                     self.enable_sse4_1 = true;
-@@ -1103,7 +1137,17 @@ impl Driver {
-                     self.sse_explicitly_disabled = false;
++            }
++        }
++    }
++
++    /// Resolve a Value chain that ends in GlobalAddr, accumulating GEP/Add/Sub/Cast offsets.
++    /// Returns (symbol_name, total_offset) if the chain is GlobalAddr (+ GEPs/Copies/Adds/Subs/Casts).
++    /// This is the paravirt fast-path: `pv_ops` is a struct of function pointers, so
++    /// `Load(GEP(GlobalAddr pv_ops, off))` must become `call *pv_ops+off(%rip)` (ff 15)
++    /// for `apply_alternatives` to patch. The resolver is intentionally generous:
++    /// it follows Cast (bitcast/ptrtoint/inttoptr), Copy, Add (Value+Const), Sub (Value-Const),
++    /// and GEP with const or Copy-of-const offsets, with checked arithmetic and 64-hop bound.
+     fn resolve_global_addr_chain(&self, mut val_id: u32, mut acc: i64) -> Option<(String, i64)> {
+         let mut visited = 0;
+         loop {
+@@ -37,34 +71,54 @@ impl X86Codegen {
+             let inst = self.get_defining_instruction(val_id)?;
+             match inst {
+                 Instruction::GlobalAddr { name, .. } => {
+-                    return Some((name.clone(), acc));
++                    // Strip version suffix for GAS: `sym@VER+off(%rip)` is rejected by gas 2.47,
++                    // while `sym+off(%rip)` with base name is accepted and linker resolves version.
++                    let base = name.split('@').next().unwrap_or(name).to_string();
++                    return Some((base, acc));
                  }
-                 "-m3dnow" => return Err("3DNow! is unsupported".to_string()),
--                "-mgeneral-regs-only" => self.general_regs_only = true,
-+                "-mgeneral-regs-only" => {
-+                    self.general_regs_only = true;
-+                    self.no_sse = true;
-+                    self.sse_explicitly_disabled = true;
-+                    self.enable_sse3 = false;
-+                    self.enable_ssse3 = false;
-+                    self.enable_sse4_1 = false;
-+                    self.enable_sse4_2 = false;
-+                    self.enable_avx = false;
-+                    self.enable_avx2 = false;
+                 Instruction::GetElementPtr { base, offset, .. } => {
+-                    let off = match offset {
+-                        Operand::Const(c) => c.to_i64()?,
+-                        _ => return None,
+-                    };
++                    let off = self.operand_const_i64(offset)?;
+                     acc = acc.checked_add(off)?;
+                     val_id = base.0;
+                 }
+                 Instruction::Copy { src, .. } => match src {
+                     Operand::Value(v) => val_id = v.0,
++                    Operand::Const(_) => return None, // Copy of const is not a global chain
++                },
++                Instruction::Cast { src, .. } => match src {
++                    Operand::Value(v) => val_id = v.0,
++                    Operand::Const(_) => return None,
++                },
++                Instruction::BinOp { op, lhs, rhs, .. } => match op {
++                    IrBinOp::Add => {
++                        let (base_val, const_off) = match (lhs, rhs) {
++                            (Operand::Value(v), c) => {
++                                let co = self.operand_const_i64(c)?;
++                                (v.0, co)
++                            }
++                            (c, Operand::Value(v)) => {
++                                let co = self.operand_const_i64(c)?;
++                                (v.0, co)
++                            }
++                            _ => return None,
++                        };
++                        acc = acc.checked_add(const_off)?;
++                        val_id = base_val;
++                    }
++                    IrBinOp::Sub => {
++                        // Only Value - Const is representable as sym+off (off decreases)
++                        let (base_val, const_off) = match (lhs, rhs) {
++                            (Operand::Value(v), c) => {
++                                let co = self.operand_const_i64(c)?;
++                                (v.0, co)
++                            }
++                            _ => return None,
++                        };
++                        acc = acc.checked_sub(const_off)?;
++                        val_id = base_val;
++                    }
+                     _ => return None,
+                 },
+-                Instruction::BinOp {
+-                    op: IrBinOp::Add,
+-                    lhs,
+-                    rhs,
+-                    ..
+-                } => {
+-                    let (base_val, const_off) = match (lhs, rhs) {
+-                        (Operand::Value(v), Operand::Const(c)) => (v.0, c.to_i64()?),
+-                        (Operand::Const(c), Operand::Value(v)) => (v.0, c.to_i64()?),
+-                        _ => return None,
+-                    };
+-                    acc = acc.checked_add(const_off)?;
+-                    val_id = base_val;
+-                }
+                 _ => return None,
+             }
+         }
+@@ -73,6 +127,7 @@ impl X86Codegen {
+     /// Try to resolve an indirect call's func_ptr Operand to a global+offset.
+     /// The func_ptr is expected to be Value(Load(ptr)), where ptr is GEP chain
+     /// ending in GlobalAddr (e.g. pv_ops+72). Returns Some((sym, off)) if so.
++    /// Also handles the case where Load was folded or func_ptr itself is the GEP chain.
+     fn try_resolve_indirect_call_global(&self, op: &Operand) -> Option<(String, i64)> {
+         let v = match op {
+             Operand::Value(v) => v,
+@@ -80,10 +135,32 @@ impl X86Codegen {
+         };
+         let inst = self.get_defining_instruction(v.0)?;
+         match inst {
+-            Instruction::Load { ptr, .. } => self.resolve_global_addr_chain(ptr.0, 0),
+-            // In case the Load was already folded or func_ptr is directly a GEP'd global
+-            // address that was loaded via slot (defensive), try resolving the value itself.
+-            _ => self.resolve_global_addr_chain(v.0, 0),
++            Instruction::Load { ptr, .. } => {
++                // If the loaded pointer's defining chain is global+off, we can emit direct call.
++                // Guard against GOT/TLS/absolute symbols that need different addressing.
++                let (sym, off) = self.resolve_global_addr_chain(ptr.0, 0)?;
++                // Don't use RIP-relative call for symbols that need GOT or are TLS/absolute —
++                // those would need GOTPCREL or fs: addressing, not plain *sym(%rip).
++                if self.state.needs_got_for_addr(&sym)
++                    || self.state.tls_symbols.contains(&sym)
++                    || self.state.absolute_symbols.contains(&sym)
++                {
++                    return None;
 +                }
-                 "-mcmodel=kernel" => self.code_model_kernel = true,
-                 "-mcmodel=small" | "-mcmodel=medlow" | "-mcmodel=medium" | "-mcmodel=medany"
-                 | "-mcmodel=large" => {
-@@ -2136,4 +2180,32 @@ mod cli_tests {
-         d2.parse_cli_args(&args2).ok();
-         assert!(d2.linker_ordered_items.iter().any(|i| i == "-Wl,-e,main"));
++                Some((sym, off))
++            }
++            // Defensive: func_ptr itself might be the GEP chain (if Load was optimized away
++            // or value is in slot that holds address, not loaded value). Try resolving it.
++            _ => {
++                let (sym, off) = self.resolve_global_addr_chain(v.0, 0)?;
++                if self.state.needs_got_for_addr(&sym)
++                    || self.state.tls_symbols.contains(&sym)
++                    || self.state.absolute_symbols.contains(&sym)
++                {
++                    return None;
++                }
++                Some((sym, off))
++            }
+         }
      }
-+
-+    /// `-mno-sse -march=haswell` must not set AVX2: the 64-byte memcpy path
-+    /// keys off `avx2_enabled` and would otherwise emit `vmovdqu`.
-+    #[test]
-+    fn mno_sse_survives_march_haswell_without_avx() {
-+        let mut d = Driver::new();
-+        let args: Vec<String> = ["ccc", "-mno-sse", "-march=haswell", "x.c"]
-+            .iter()
-+            .map(|s| s.to_string())
-+            .collect();
-+        assert!(d.parse_cli_args(&args).is_ok());
-+        assert!(d.no_sse);
-+        assert!(!d.enable_avx);
-+        assert!(!d.enable_avx2);
-+        assert!(d.enable_bmi, "integer BMI remains legal under -mno-sse");
+ 
+diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
+index 81d27c41..6d99964f 100644
+--- a/src/passes/vectorize.rs
++++ b/src/passes/vectorize.rs
+@@ -7627,10 +7627,37 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
+         }
+     }
+ 
+-    // Step 3: Replace the body with FOUR FmaF64x4 (4-way software pipeline).
++    // Hoist the loop-invariant A[i][k] scalar broadcast to the preheader.
++    // Backend keeps it in ymm1, reused across all 4 FMA lanes (saves 3× vmovsd+vbroadcastsd per iter).
++    if let Some(preheader_idx) = func.blocks.iter().enumerate().find_map(|(idx, block)| {
++        if pattern.loop_blocks.contains(&idx) {
++            return None;
++        }
++        matches!(block.terminator, Terminator::Branch(label)
++            if label == func.blocks[pattern.header_idx].label)
++        .then_some(idx)
++    }) {
++        func.blocks[preheader_idx]
++            .instructions
++            .push(Instruction::Intrinsic {
++                dest: None,
++                op: IntrinsicOp::BroadcastLoadF64,
++                dest_ptr: None,
++                args: vec![Operand::Value(pattern.a_ptr)],
++            });
++        changes += 1;
++        if debug {
++            eprintln!(
++                "[VEC]   Hoisted BroadcastLoadF64 for A ptr Value({}) into preheader block {}",
++                pattern.a_ptr.0, preheader_idx
++            );
++        }
 +    }
 +
-+    #[test]
-+    fn mavx_reenable_after_mno_sse() {
-+        let mut d = Driver::new();
-+        let args: Vec<String> = ["ccc", "-mno-sse", "-mavx", "x.c"]
-+            .iter()
-+            .map(|s| s.to_string())
-+            .collect();
-+        assert!(d.parse_cli_args(&args).is_ok());
-+        assert!(!d.no_sse);
-+        assert!(d.enable_avx);
-+    }
- }
-diff --git a/tests/regression/mno_sse_memcpy64.c b/tests/regression/mno_sse_memcpy64.c
-new file mode 100644
-index 0000000..20504f0
---- /dev/null
-+++ b/tests/regression/mno_sse_memcpy64.c
-@@ -0,0 +1,26 @@
-+/* 64-byte memcpy under `-mno-sse -march=haswell` must not use ymm/xmm.
-+ * The 64-byte YMM fast path keys off avx2_enabled; sticky -mno-sse must
-+ * keep that path closed (CR4.OSFXSR=0 in the kernel decompressor). */
-+#include <stdio.h>
-+#include <stdint.h>
-+#include <string.h>
-+
-+__attribute__((noinline)) void copy64(void *d, const void *s)
-+{
-+	__builtin_memcpy(d, s, 64);
-+}
-+
-+int main(void)
-+{
-+	uint8_t src[64], dst[64];
-+	for (int i = 0; i < 64; i++)
-+		src[i] = (uint8_t)(0x40 + i);
-+	memset(dst, 0xA5, 64);
-+	copy64(dst, src);
-+	if (memcmp(dst, src, 64) != 0) {
-+		printf("FAIL\n");
-+		return 1;
-+	}
-+	printf("OK mno_sse_memcpy64\n");
-+	return 0;
-+}
-diff --git a/tests/regression/mno_sse_memcpy64.flags b/tests/regression/mno_sse_memcpy64.flags
-new file mode 100644
-index 0000000..d59f013
---- /dev/null
-+++ b/tests/regression/mno_sse_memcpy64.flags
-@@ -0,0 +1 @@
-+-mno-sse -march=haswell
++    // Step 3: Replace the body with FOUR FmaF64x4Hoisted (4-way software pipeline).
+     // Chunks at byte offsets IV+{0,32,64,96}. Independent C/B lanes give the
+     // backend four concurrent vfmadd231pd chains — the shape GCC emits for
+-    // the 256³ matmul kernel on x86-64-v3.
++    // the 256³ matmul kernel on x86-64-v3. A broadcast is already in ymm1.
+     {
+         let body = &mut func.blocks[pattern.body_idx];
+         let store_pos = body.instructions.iter().position(
+@@ -7664,9 +7691,9 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
+         // Chunk 0 uses the existing GEPs.
+         prelude.push(Instruction::Intrinsic {
+             dest: None,
+-            op: IntrinsicOp::FmaF64x4,
++            op: IntrinsicOp::FmaF64x4Hoisted,
+             dest_ptr: Some(pattern.c_gep),
+-            args: vec![Operand::Value(pattern.a_ptr), Operand::Value(pattern.b_gep)],
++            args: vec![Operand::Value(pattern.b_gep)],
+         });
+         for chunk in 1u64..4 {
+             let byte_off = chunk * 32;
+@@ -7706,9 +7733,9 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
+             });
+             prelude.push(Instruction::Intrinsic {
+                 dest: None,
+-                op: IntrinsicOp::FmaF64x4,
++                op: IntrinsicOp::FmaF64x4Hoisted,
+                 dest_ptr: Some(c_gep_n),
+-                args: vec![Operand::Value(pattern.a_ptr), Operand::Value(b_gep_n)],
++                args: vec![Operand::Value(b_gep_n)],
+             });
+         }
+ 
+@@ -7722,7 +7749,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern)
+         }
+         changes += 4;
+         if debug {
+-            eprintln!("[VEC]   Inserted quad FmaF64x4 intrinsics (step 128)");
++            eprintln!("[VEC]   Inserted quad FmaF64x4Hoisted intrinsics (step 128) with broadcast in ymm1");
+         }
+     }
+ 
