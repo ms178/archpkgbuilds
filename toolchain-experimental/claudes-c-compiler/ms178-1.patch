@@ -1,799 +1,198 @@
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index e604f744..f627e110 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -191,6 +191,53 @@ pub struct RegAllocResult {
- /// Whether x86 can preserve incoming parameters directly in caller-saved homes.
- /// ParamRefs must execute in the entry prefix before any generated instruction
- /// can clobber ABI argument registers, and the function must be call-free.
-+/// RISC-V analog of [`x86_param_caller_homes_safe`]: integer ABI slot i is
-+/// register a_i, so a call-free function whose ParamRefs all run in the
-+/// entry prefix (before any generated instruction can clobber a0–a7) can
-+/// keep its scalar parameters directly in their incoming registers — the
-+/// ParamRef emits nothing at all when the home matches the incoming reg.
-+pub fn riscv_param_caller_homes_safe(func: &IrFunction) -> bool {
-+    if func.blocks.is_empty() || env_on("CCC_NO_LEAF_PARAM_GPR") {
-+        return false;
-+    }
-+    if func.blocks.len() > 1 && func.params.len() > 8 {
-+        return false;
-+    }
-+    if func.blocks.iter().any(|b| {
-+        b.instructions.iter().any(|inst| {
-+            matches!(
-+                inst,
-+                Instruction::Call { .. }
-+                    | Instruction::CallIndirect { .. }
-+                    | Instruction::InlineAsm { .. }
-+            )
-+        })
-+    }) {
-+        return false;
-+    }
-+    for (bi, block) in func.blocks.iter().enumerate() {
-+        if bi != 0 {
-+            if block
-+                .instructions
-+                .iter()
-+                .any(|inst| matches!(inst, Instruction::ParamRef { .. }))
-+            {
-+                return false;
-+            }
-+            continue;
-+        }
-+        let mut seen_code = false;
-+        for inst in &block.instructions {
-+            match inst {
-+                Instruction::Alloca { .. } | Instruction::ParamRef { .. } if !seen_code => {}
-+                Instruction::ParamRef { .. } => return false,
-+                _ => seen_code = true,
-+            }
-+        }
-+    }
-+    true
-+}
-+
- pub fn x86_param_caller_homes_safe(func: &IrFunction) -> bool {
-     if func.blocks.is_empty() || env_on("CCC_NO_LEAF_PARAM_GPR") {
-         return false;
-@@ -1983,6 +2030,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-         && config.available_regs.iter().any(|r| r.0 == 1)
-         && config.caller_saved_regs.iter().any(|r| r.0 == 10)
-         && x86_param_caller_homes_safe(func);
-+    // riscv64: same lever for the a0–a7 pool.  Param homes are pinned to
-+    // their incoming registers by the ABI hints, so the "ordered copies"
-+    // degenerate to zero instructions per ParamRef.
-+    let riscv_ordered_param_copies = config.available_regs.iter().any(|r| r.0 == 11)
-+        && config.caller_saved_regs.iter().any(|r| r.0 == 12)
-+        && riscv_param_caller_homes_safe(func);
-+    let ordered_param_homes = x86_ordered_param_copies || riscv_ordered_param_copies;
-     let mut param_ref_values: FxHashSet<u32> = FxHashSet::default();
-     for block in &func.blocks {
-         for inst in &block.instructions {
-@@ -2062,6 +2116,39 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-             param_restricted.insert(*leader);
-         }
-     }
-+    // riscv entry-prefix write guard: a value BORN before a still-unexecuted
-+    // ParamRef must never take a caller-saved (a-reg) home — its defining
-+    // instruction would write the incoming argument register out from under
-+    // the not-yet-run ParamRef (GetStaticChain's chain value homed in a0
-+    // destroyed the incoming parameter before its ParamRef ran: the nested
-+    // `x == lim` compare then read the chain twice and returned the wrong
-+    // arm).  The x86 path never saw this because its entry prefix is
-+    // ParamRef-only by construction; the riscv entry prefix interleaves
-+    // GetStaticChain/Alloca defs, so the guard is computed from the actual
-+    // instruction order.  Params themselves are exempt (their homes are the
-+    // hinted incoming registers, written by nobody but the caller).
-+    let riscv_entry_guard: FxHashSet<u32> = if
-+        config.available_regs.iter().any(|r| r.0 == 11)
-+            && config.caller_saved_regs.iter().any(|r| r.0 == 12)
-+    {
-+        let mut guard = FxHashSet::default();
-+        if let Some(block0) = func.blocks.first() {
-+            let mut later_params: usize = 0;
-+            for inst in block0.instructions.iter().rev() {
-+                if let Instruction::ParamRef { dest, .. } = inst {
-+                    later_params += 1;
-+                    let _ = dest;
-+                } else if later_params > 0 {
-+                    if let Some(d) = inst.dest() {
-+                        guard.insert(d.0);
-+                    }
-+                }
-+            }
-+        }
-+        guard
-+    } else {
-+        FxHashSet::default()
-+    };
- 
-     // Hole-aware call spanning (the "80% of LLVM's split" win): a value needs
-     // a callee-saved home only when a call point falls INSIDE one of its live
-@@ -2242,7 +2329,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-         let base_ok = |assignments: &FxHashMap<u32, PhysReg>, iv: &LiveInterval| {
-             !assignments.contains_key(&iv.value_id)
-                 && !call_spanning.contains(&iv.value_id)
--                && (x86_ordered_param_copies || !param_restricted.contains(&iv.value_id))
-+                && (ordered_param_homes || !param_restricted.contains(&iv.value_id))
-+                && !riscv_entry_guard.contains(&iv.value_id)
-         };
- 
-         if let Some((ecx_hazards, edx_hazards)) = hazards {
-@@ -2577,8 +2665,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                         !assignments.contains_key(&iv.value_id)
-                             && !call_spanning.contains(&iv.value_id)
-                             && !scratch_denied.contains(&iv.value_id)
--                            && (x86_ordered_param_copies
-+                            && (ordered_param_homes
-                                 || !param_restricted.contains(&iv.value_id))
-+                            && !riscv_entry_guard.contains(&iv.value_id)
-                     })
-                     .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
-                     .filter(|iv| {
-@@ -2698,7 +2787,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-             .filter(|iv| {
-                 !assignments.contains_key(&iv.value_id)
-                     && !call_spanning.contains(&iv.value_id)
--                    && (x86_ordered_param_copies || !param_restricted.contains(&iv.value_id))
-+                    && (ordered_param_homes || !param_restricted.contains(&iv.value_id))
-+                && !riscv_entry_guard.contains(&iv.value_id)
-             })
-             .filter(|iv| {
-                 let idx = eax_hazards.partition_point(|&p| p <= iv.start);
-@@ -3052,8 +3142,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                         !assignments.contains_key(&iv.value_id)
-                             && !call_spanning.contains(&iv.value_id)
-                             && !scratch_denied.contains(&iv.value_id)
--                            && (x86_ordered_param_copies
-+                            && (ordered_param_homes
-                                 || !param_restricted.contains(&iv.value_id))
-+                            && !riscv_entry_guard.contains(&iv.value_id)
-                     })
-                     .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
-                     .filter(|iv| {
-@@ -3070,8 +3161,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
-                             !assignments.contains_key(&iv.value_id)
-                                 && !call_spanning.contains(&iv.value_id)
-                                 && !scratch_denied.contains(&iv.value_id)
--                                && (x86_ordered_param_copies
-+                                && (ordered_param_homes
-                                     || !param_restricted.contains(&iv.value_id))
-+                            && !riscv_entry_guard.contains(&iv.value_id)
-                         })
-                         .map(|iv| format!("{}:[{}..{}]", iv.value_id, iv.start, iv.end))
-                         .collect();
+From 444286595852d9f52a6895a271bbf4ea8f4eb0f4 Mon Sep 17 00:00:00 2001
+From: ms178 <19559105+ms178@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 01:18:08 +0000
+Subject: [PATCH] codegen: reject float-involving casts in no-home
+ materialization fallbacks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+PR #306 (x86-64) and PR #308 (RISC-V) added consumer-side fallbacks that
+materialize a home-less value through its defining instruction when that
+is a Copy or a 'same-size' Cast, keyed only on from_ty.size() ==
+to_ty.size(). Same-size float<->int casts are VALUE conversions, not
+bitcasts: (long long)3.0 must cvttsd2si to 3, not re-publish the raw bits
+0x4008000000000000; (double)ptr is cvtsi2sdq, not a movq bitcast (the
+in-repo check_ptr_to_float_cast precedent). The unguarded fallback would
+have silently miscompiled those shapes instead of failing the HARD GATE.
+
+Every other same-size-cast fold in this repo (global_addr_cse.rs x2,
+simplify.rs, generation.rs x2) already refuses float-involving pairs.
+Centralize that rule as IrType::cast_is_bitidentical_nop (same size,
+neither side floating) and use it at all three fallback sites:
+x86-64 operand_to_rax, x86-64 value_to_reg_inner, and the RISC-V
+operand-to-t0 port. Anything the predicate rejects still reaches the
+loud HARD GATE — the session-26 soundness guarantee is preserved.
+
+Unit tests pin both directions for every same-size type pair the IR's
+lower_cast can emit (int no-ops accepted; F64<->I64, F32<->I32,
+Ptr->F64, U128<->F128 rejected; size-changing casts always rejected).
+
+Validation: cargo unit tests 3/3 new (+1314 total green); regression
+suite 497/0/13 with zero fallback hits; boot gate PASS (_end 31184,
+headroom 1584, ld.bfd oracle byte-identical) — the fix is
+behavior-preserving hardening on all corpora.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ src/backend/riscv/codegen/emit.rs |  8 +++-
+ src/backend/x86/codegen/emit.rs   | 18 ++++++--
+ src/common/types.rs               | 68 +++++++++++++++++++++++++++++++
+ 3 files changed, 90 insertions(+), 4 deletions(-)
+
 diff --git a/src/backend/riscv/codegen/emit.rs b/src/backend/riscv/codegen/emit.rs
-index 25657b62..873e6580 100644
+index 25657b62..9853b22b 100644
 --- a/src/backend/riscv/codegen/emit.rs
 +++ b/src/backend/riscv/codegen/emit.rs
-@@ -36,6 +36,11 @@ pub(super) const CALL_TEMP_CALLEE_SAVED: [PhysReg; 5] =
-     [PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5), PhysReg(6)];
- 
- /// Map a PhysReg index to its RISC-V register name.
-+///
-+/// The allocator-visible GPR space: 1..=11 are the callee-saved s1–s11,
-+/// 12..=19 are the caller-saved argument registers a0–a7 (Phase-2 homes;
-+/// never saved/restored by the prologue).  Emitter scratch (t0–t6, t2 =
-+/// static chain / indirect-call target) is outside the pool.
- pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
-     match reg.0 {
-         1 => "s1",
-@@ -49,7 +54,15 @@ pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
-         9 => "s9",
-         10 => "s10",
-         11 => "s11",
--        _ => unreachable!("invalid RISC-V callee-saved register index"),
-+        12 => "a0",
-+        13 => "a1",
-+        14 => "a2",
-+        15 => "a3",
-+        16 => "a4",
-+        17 => "a5",
-+        18 => "a6",
-+        19 => "a7",
-+        _ => unreachable!("invalid RISC-V allocatable register index"),
-     }
- }
- 
-@@ -131,6 +144,10 @@ pub struct RiscvCodegen {
-     /// Current function (for definition lookups in consumer-side
-     /// rematerialisation gates; raw pointer mirrors the x86-64 backend).
-     pub(super) current_func: Option<*const IrFunction>,
-+    /// Frameless-leaf mode: no call points, no stack traffic, zero frame —
-+    /// the prologue/epilogue (ra/s0 saves, sp adjust, s0 setup) are skipped
-+    /// entirely and the function is entered and left through `ra` untouched.
-+    pub(super) frameless_leaf: bool,
- }
- 
- impl RiscvCodegen {
-@@ -150,6 +167,7 @@ impl RiscvCodegen {
-             used_callee_saved: Vec::new(),
-             no_relax: false,
-             current_func: None,
-+            frameless_leaf: false,
-         }
-     }
- 
-diff --git a/src/backend/riscv/codegen/peephole.rs b/src/backend/riscv/codegen/peephole.rs
-index 25f3a023..d11ab28f 100644
---- a/src/backend/riscv/codegen/peephole.rs
-+++ b/src/backend/riscv/codegen/peephole.rs
-@@ -796,6 +796,21 @@ fn eliminate_self_moves(kinds: &mut [LineKind], n: usize) -> bool {
-             if dst == src {
-                 kinds[i] = LineKind::Nop;
-                 changed = true;
-+                continue;
-+            }
-+            // Identical consecutive duplicate: `mv D, S` immediately after
-+            // `mv D, S` (store-result staging followed by the identical
-+            // return-value staging).  The second move is a no-op — same
-+            // source still live, same destination.  Scan only across Nops
-+            // so any intervening instruction (which may read D or redefine
-+            // S) keeps the move.
-+            let mut j = i + 1;
-+            while j < n && kinds[j] == LineKind::Nop {
-+                j += 1;
-+            }
-+            if j < n && kinds[j] == (LineKind::Move { dst, src }) {
-+                kinds[j] = LineKind::Nop;
-+                changed = true;
+@@ -440,6 +440,12 @@ impl RiscvCodegen {
+                     // (U64<->I64 etc) or a Copy whose SOURCE has a home —
+                     // materialize the source instead (x86-64
+                     // print_cfs_group_stats precedent).
++                    //
++                    // Float-involving casts are value conversions
++                    // (fcvt.d.l / fcvt.l.d), never bit-identical re-labels —
++                    // cast_is_bitidentical_nop is the shared predicate the
++                    // repo's other same-size-cast folds honor; anything it
++                    // rejects still reaches the loud gate below.
+                     let fallback_src: Option<Operand> = self
+                         .get_defining_instruction(v.0)
+                         .and_then(|def_inst| match def_inst {
+@@ -449,7 +455,7 @@ impl RiscvCodegen {
+                                 to_ty,
+                                 ..
+                             } => {
+-                                if from_ty.size() == to_ty.size() {
++                                if IrType::cast_is_bitidentical_nop(*from_ty, *to_ty) {
+                                     Some(src.clone())
+                                 } else {
+                                     None
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 50e0f36a..c71c382b 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -1555,11 +1555,20 @@ impl X86Codegen {
+                     // Load is cast to I64 for a Cmp Slt — the cast had no home
+                     // due to RA coalesce miss, but its source does.
+                     // Clone def info to avoid borrow conflicts.
++                    //
++                    // Float-involving casts are NOT bit-identical: (long
++                    // long)3.0 must cvttsd2si to 3, not re-publish the raw
++                    // bits 0x4008000000000000; (double)ptr is cvtsi2sdq, not
++                    // a movq bitcast (check_ptr_to_float_cast precedent).
++                    // cast_is_bitidentical_nop is the shared predicate every
++                    // other same-size-cast fold in this repo already honors;
++                    // anything it rejects still reaches the loud HARD GATE
++                    // below rather than silently fabricating wrong values.
+                     let fallback_src = {
+                         if let Some(def_inst) = self.get_defining_instruction(v.0) {
+                             match def_inst {
+                                 crate::ir::reexports::Instruction::Cast { src, from_ty, to_ty, .. } => {
+-                                    if from_ty.size() == to_ty.size() {
++                                    if IrType::cast_is_bitidentical_nop(*from_ty, *to_ty) {
+                                         Some(src.clone())
+                                     } else {
+                                         None
+@@ -2432,12 +2441,15 @@ impl X86Codegen {
+                 self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
              }
-         }
-     }
-diff --git a/src/backend/riscv/codegen/prologue.rs b/src/backend/riscv/codegen/prologue.rs
-index 254434d6..a6713c37 100644
---- a/src/backend/riscv/codegen/prologue.rs
-+++ b/src/backend/riscv/codegen/prologue.rs
-@@ -12,6 +12,104 @@ use crate::ir::reexports::IrFunction;
- impl RiscvCodegen {
-     // ---- calculate_stack_space ----
- 
-+    /// IR-level eligibility for the caller-saved (a0–a7) register pool.
-+    ///
-+    /// The Phase-2 allocator homes only non-call-spanning values in the
-+    /// caller-saved pool, which makes every IR-visible call safe (the same
-+    /// model x86-64/i686/AArch64 already run).  What the shared liveness
-+    /// cannot see on RISC-V are EMITTER-side a-register clobberers that are
-+    /// not IR call points: the F128 soft-float helper sequences, the i128
-+    /// helper calls, libm calls from the RoundScalar intrinsics, and the
-+    /// a2–a5 scratch usage inside the atomic RMW sequences.  An eligible
-+    /// function therefore contains only instructions whose emitters touch
-+    /// t-regs and s-regs exclusively, over scalar (<=64-bit integer /
-+    /// F32/F64/Ptr) types.  Anything else keeps the pure callee-saved pool.
-+    fn riscv_caller_pool_eligible(func: &IrFunction) -> bool {
-+        use crate::ir::reexports::{Instruction, IrConst, Operand};
-+        if std::env::var_os("CCC_NO_RISCV_CALLER_POOL").is_some() {
-+            return false;
-+        }
-+        let scalar = |ty: &IrType| {
-+            matches!(
-+                ty,
-+                IrType::I8
-+                    | IrType::I16
-+                    | IrType::I32
-+                    | IrType::I64
-+                    | IrType::U8
-+                    | IrType::U16
-+                    | IrType::U32
-+                    | IrType::U64
-+                    | IrType::F32
-+                    | IrType::F64
-+                    | IrType::Ptr
-+            )
-+        };
-+        for block in &func.blocks {
-+            for inst in &block.instructions {
-+                match inst {
-+                    Instruction::BinOp { ty, .. }
-+                    | Instruction::UnaryOp { ty, .. }
-+                    | Instruction::Cmp { ty, .. }
-+                    | Instruction::Load { ty, .. }
-+                    | Instruction::Store { ty, .. }
-+                    | Instruction::Select { ty, .. }
-+                    | Instruction::ParamRef { ty, .. }
-+                    | Instruction::Alloca { ty, .. } => {
-+                        if !scalar(ty) {
-+                            return false;
-+                        }
-+                    }
-+                    Instruction::Cast { from_ty, to_ty, .. } => {
-+                        if !scalar(from_ty) || !scalar(to_ty) {
-+                            return false;
-+                        }
-+                    }
-+                    // A Copy has no type of its own; a widened or 128-bit
-+                    // constant always flows through a typed producer, but
-+                    // the F128/I128 constant CARRIERS are checked here so a
-+                    // bare const copy cannot slip through.
-+                    Instruction::Copy { src, .. } => {
-+                        if let Operand::Const(c) = src {
-+                            if matches!(c, IrConst::LongDouble(..) | IrConst::I128(..)) {
-+                                return false;
-+                            }
-+                        }
-+                    }
-+                    Instruction::GetElementPtr { .. }
-+                    | Instruction::GlobalAddr { .. }
-+                    | Instruction::LabelAddr { .. }
-+                    | Instruction::GetStaticChain { .. }
-+                    | Instruction::SetStaticChain { .. } => {}
-+                    // Everything else (calls, inline asm, memcpys, atomics,
-+                    // intrinsics, varargs, F128/i128 carriers, non-local
-+                    // goto plumbing, dynamic allocas) keeps the pure
-+                    // callee-saved pool.
-+                    _ => return false,
-+                }
-+            }
-+        }
-+        true
-+    }
-+
-+    /// Whether the function contains any IR-visible call point.  Used by the
-+    /// frameless-leaf gate: without a prologue the return address stays in
-+    /// `ra`, so any call would clobber it before the closing `ret`.
-+    fn riscv_is_call_free(func: &IrFunction) -> bool {
-+        use crate::ir::reexports::Instruction;
-+        !func.blocks.iter().any(|block| {
-+            block.instructions.iter().any(|inst| {
-+                matches!(
-+                    inst,
-+                    Instruction::Call { .. }
-+                        | Instruction::CallIndirect { .. }
-+                        | Instruction::InlineAsm { .. }
-+                        | Instruction::Memcpy { .. }
-+                )
-+            })
-+        })
-+    }
-+
-     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
-         // Clz/Ctz/Popcount on ≤32-bit integer types produce results in
-         // [0, bitwidth] — the count is built from 0 upward in a full 64-bit
-@@ -81,15 +179,46 @@ impl RiscvCodegen {
-         if self.state.disable_regalloc {
-             available_regs.clear();
-         }
-+        // Caller-saved Phase-2 pool: a0–a7 for emitter-safe functions (see
-+        // riscv_caller_pool_eligible).  The allocator only homes non-
-+        // call-spanning values there, and its call_arg_regs wave split keeps
-+        // argument-consumed values out of the staging targets, so the call
-+        // argument staging (which writes a0–a7 in ABI order) can never pull
-+        // a live value out from under a later argument.  t-regs stay reserved
-+        // as emitter scratch (t0 acc / t1 secondary / t2 static chain and
-+        // indirect-call target / t3–t5 call staging / t6 jump tables).
-+        let caller_saved_regs: Vec<crate::backend::regalloc::PhysReg> =
-+            if !self.state.disable_regalloc
-+                && !self.is_variadic
-+                && !func.uses_sret
-+                && Self::riscv_caller_pool_eligible(func)
-+                // The entry-prefix write guard is computed from block 0
-+                // alone; opening the pool is only sound when every ParamRef
-+                // really sits in that entry prefix (generation's lowering
-+                // contract).  Belt and suspenders: refuse the pool outright
-+                // otherwise.  Also re-asserts call-freeness.
-+                && crate::backend::regalloc::riscv_param_caller_homes_safe(func)
-+            {
-+                (12..=19)
-+                    .map(crate::backend::regalloc::PhysReg)
-+                    .collect()
-+            } else {
-+                Vec::new()
-+            };
-+        let call_arg_regs = caller_saved_regs.clone();
-         let (reg_assigned, cached_liveness, _caller_save_spans, accumulator_assignments) =
--            crate::backend::generation::run_regalloc_and_merge_clobbers(
-+            crate::backend::generation::run_regalloc_and_merge_clobbers_ex(
-                 func,
-                 available_regs,
--                Vec::new(),
-+                caller_saved_regs,
-                 &asm_clobbered_regs,
-                 &mut self.reg_assignments,
-                 &mut self.used_callee_saved,
-                 true, // RISC-V asm emitter checks reg_assignments for inline asm operands
-+                None,
-+                call_arg_regs,
-+                Vec::new(),
-+                crate::common::fx_hash::FxHashMap::default(),
-             );
- 
-         self.state.ra_accumulator_values =
-@@ -132,6 +261,39 @@ impl RiscvCodegen {
-     pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
-         self.current_return_type = func.return_type;
-         self.current_frame_size = frame_size;
-+        // Frameless leaf: the 16-byte frame is EXACTLY the ra/s0 save
-+        // reservation (no slots, no allocas, no callee saves) plus
-+        // call-free plus every parameter in a register — there is NOTHING
-+        // to set up: sp stays where the caller left it, ra/s0 are
-+        // untouched, and the closing `ret` returns directly.  Stack-passed
-+        // parameters would need s0 == entry sp, so they disqualify.
-+        // (frame_size floors at 16 because the stack-space computation
-+        // always reserves room for the ra/s0 saves the frameless form
-+        // no longer makes; anything above 16 means real frame content.)
-+        self.frameless_leaf = frame_size == 16
-+            && !self.is_variadic
-+            && !func.uses_sret
-+            && Self::riscv_is_call_free(func)
-+            && Self::riscv_caller_pool_eligible(func)
-+            && {
-+                let mut config = self.call_abi_config_impl();
-+                config.variadic_floats_in_gp = func.is_variadic;
-+                let classes = crate::backend::call_abi::classify_params(func, &config);
-+                !classes.iter().any(|c| {
-+                    matches!(
-+                        c,
-+                        crate::backend::call_abi::ParamClass::StackScalar { .. }
-+                            | crate::backend::call_abi::ParamClass::I128Stack { .. }
-+                            | crate::backend::call_abi::ParamClass::F128Stack { .. }
-+                            | crate::backend::call_abi::ParamClass::F128AlwaysStack { .. }
-+                            | crate::backend::call_abi::ParamClass::StructStack { .. }
-+                            | crate::backend::call_abi::ParamClass::StructSplitRegStack { .. }
-+                    )
-+                })
-+            };
-+        if self.frameless_leaf {
-+            return;
-+        }
-         self.emit_prologue_riscv(frame_size);
- 
-         // Save callee-saved registers used by the register allocator.
-@@ -147,6 +309,9 @@ impl RiscvCodegen {
-     // ---- emit_epilogue ----
- 
-     pub(super) fn emit_epilogue_impl(&mut self, frame_size: i64) {
-+        if self.frameless_leaf {
-+            return;
-+        }
-         // Restore callee-saved registers before epilogue.
-         let used_regs = self.used_callee_saved.clone();
-         for (i, &reg) in used_regs.iter().enumerate() {
-@@ -676,9 +841,37 @@ impl RiscvCodegen {
- 
-         match class {
-             ParamClass::IntReg { reg_idx } => {
--                self.state
--                    .emit_fmt(format_args!("    mv t0, {}", RISCV_ARG_REGS[reg_idx]));
--                self.store_t0_to(dest);
-+                // Home-aware fast paths: a register-homed destination is a
-+                // single move (none at all when the home IS the incoming
-+                // register); only a slot destination needs the t0 round
-+                // trip.  Sub-64-bit homes keep the sign/zero-filling extend
-+                // (canonical-form discipline: homes hold sext/zext values).
-+                let home = self.reg_assignments.get(&dest.0).copied();
-+                let is_word64 =
-+                    matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr);
-+                if let Some(home) = home {
-+                    let home_name = callee_saved_name(home);
-+                    let arg = RISCV_ARG_REGS[reg_idx];
-+                    if is_word64 {
-+                        if home_name != arg {
-+                            self.state
-+                                .emit_fmt(format_args!("    mv {}, {}", home_name, arg));
-+                        }
-+                    } else if home_name == arg {
-+                        // Home IS the incoming register: extend in place —
-+                        // one instruction, no staging round trip.
-+                        Self::emit_extend_reg(&mut self.state, arg, arg, ty);
-+                    } else {
-+                        Self::emit_extend_reg(&mut self.state, RISCV_ARG_REGS[reg_idx], "t0", ty);
-+                        if home_name != "t0" {
-+                            self.state
-+                                .emit_fmt(format_args!("    mv {}, t0", home_name));
-+                        }
-+                    }
-+                } else {
-+                    Self::emit_extend_reg(&mut self.state, RISCV_ARG_REGS[reg_idx], "t0", ty);
-+                    self.store_t0_to(dest);
-+                }
-             }
-             ParamClass::FloatReg { reg_idx } => {
-                 let float_arg_regs = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
-@@ -705,6 +898,10 @@ impl RiscvCodegen {
-     // ---- emit_epilogue_and_ret ----
- 
-     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
-+        if self.frameless_leaf {
-+            self.state.emit("    ret");
-+            return;
-+        }
-         // Restore callee-saved registers before frame teardown.
-         let used_regs = self.used_callee_saved.clone();
-         for (i, &reg) in used_regs.iter().enumerate() {
-diff --git a/src/backend/riscv/linker/emit_exec.rs b/src/backend/riscv/linker/emit_exec.rs
-index 01f52261..ba355904 100644
---- a/src/backend/riscv/linker/emit_exec.rs
-+++ b/src/backend/riscv/linker/emit_exec.rs
-@@ -19,6 +19,7 @@ use crate::backend::elf::{
-     DT_PREINIT_ARRAYSZ, DT_RELA, DT_RELAENT, DT_RELASZ, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB,
-     DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM, EM_RISCV as EM_RISCV_ELF, ET_EXEC, PF_R, PF_W, PF_X,
-     PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_NOTE, PT_TLS,
-+    STT_FUNC, STT_GNU_IFUNC,
- };
- 
- const PT_GNU_EH_FRAME: u32 = 0x6474e550;
-@@ -287,6 +288,40 @@ pub fn emit_executable(
-         vaddr += plt_size;
-     }
- 
-+    // IFUNC support for static executables: GNU ld's .iplt/.rela.iplt scheme
-+    // (port of the AArch64 linker's emit_static design to rv64).  Every ifunc
-+    // becomes a 16-byte IPLT stub that jumps through a dedicated GOT slot; the
-+    // slot carries R_RISCV_IRELATIVE (addend = resolver address) so glibc's
-+    // static startup — which walks __rela_iplt_start .. __rela_iplt_end —
-+    // resolves it before main.  Without this the slot keeps its link-time
-+    // value, glibc's memcpy/strlen pointers point into .bss, and the first
-+    // startup TLS-image copy fetches data as code: SIGSEGV before main in
-+    // every ifunc-consuming static binary (e.g. any glibc static link).
-+    let ifunc_names: Vec<String> = if is_static {
-+        let mut names: Vec<String> = global_syms
-+            .iter()
-+            .filter(|(_, g)| g.sym_type == STT_GNU_IFUNC && g.defined)
-+            .map(|(n, _)| n.clone())
-+            .collect();
-+        names.sort();
-+        names
-+    } else {
-+        Vec::new()
-+    };
-+    let ifunc_count = ifunc_names.len() as u64;
-+    let iplt_size = ifunc_count * 16;
-+
-+    let mut iplt_vaddr = 0u64;
-+    let mut iplt_offset = 0u64;
-+    if iplt_size > 0 {
-+        vaddr = align_up(vaddr, 16);
-+        file_offset = align_up(file_offset, 16);
-+        iplt_vaddr = vaddr;
-+        iplt_offset = file_offset;
-+        file_offset += iplt_size;
-+        vaddr += iplt_size;
-+    }
-+
-     // Assign vaddrs to RX sections (alloc, non-write)
-     let mut section_vaddrs: Vec<u64> = vec![0; merged_sections.len()];
-     let mut section_offsets: Vec<u64> = vec![0; merged_sections.len()];
-@@ -376,6 +411,32 @@ pub fn emit_executable(
-     let relro_end_offset = file_offset;
-     let relro_end_vaddr = vaddr;
- 
-+    // IFUNC GOT slots (one 8-byte slot per ifunc, initial content = its IPLT
-+    // stub address) and the R_RISCV_IRELATIVE table (.rela.iplt: Elf64_Rela
-+    // { r_offset = slot VA, r_info = IRELATIVE, r_addend = resolver VA }).
-+    // Kept OUTSIDE the RELRO region: glibc's startup writes the resolved
-+    // implementation into each slot before main runs.
-+    let mut irel_slot_vaddr = 0u64;
-+    let mut irel_slot_offset = 0u64;
-+    let mut irela_vaddr = 0u64;
-+    let mut irela_offset = 0u64;
-+    let irela_size = ifunc_count * 24;
-+    if ifunc_count > 0 {
-+        vaddr = align_up(vaddr, 8);
-+        file_offset = align_up(file_offset, 8);
-+        irel_slot_vaddr = vaddr;
-+        irel_slot_offset = file_offset;
-+        file_offset += ifunc_count * 8;
-+        vaddr += ifunc_count * 8;
-+
-+        vaddr = align_up(vaddr, 8);
-+        file_offset = align_up(file_offset, 8);
-+        irela_vaddr = vaddr;
-+        irela_offset = file_offset;
-+        file_offset += irela_size;
-+        vaddr += irela_size;
-+    }
-+
-     // .got.plt (only for dynamic binaries)
-     let mut got_plt_vaddr = 0u64;
-     let mut got_plt_offset = 0u64;
-@@ -531,6 +592,26 @@ pub fn emit_executable(
-         }
-     }
- 
-+    // IFUNC: capture resolver addresses (the symbol's resolved value IS the
-+    // resolver — an ifunc definition is the resolver function), then redirect
-+    // every ifunc symbol to its IPLT stub and retype it STT_FUNC so all
-+    // relocation paths treat it as a plain function.
-+    let ifunc_syms: Vec<(String, u64)> = ifunc_names
-+        .iter()
-+        .map(|name| {
-+            (
-+                name.clone(),
-+                global_syms.get(name).map(|g| g.value).unwrap_or(0),
-+            )
-+        })
-+        .collect();
-+    for (i, (name, _resolver)) in ifunc_syms.iter().enumerate() {
-+        if let Some(g) = global_syms.get_mut(name) {
-+            g.value = iplt_vaddr + i as u64 * 16;
-+            g.sym_type = STT_FUNC;
-+        }
-+    }
-+
-     // Define linker-provided symbols
-     let sdata_vaddr = merged_map
-         .get(".sdata")
-@@ -588,8 +669,8 @@ pub fn emit_executable(
-         fini_array_size: fini_end - fini_start,
-         preinit_array_start: preinit_start,
-         preinit_array_size: preinit_end - preinit_start,
--        rela_iplt_start: 0,
--        rela_iplt_size: 0,
-+        rela_iplt_start: irela_vaddr,
-+        rela_iplt_size: irela_size,
-     };
- 
-     {
-@@ -804,6 +885,44 @@ pub fn emit_executable(
-         }
-     }
- 
-+    // ── Phase 9c: Build IPLT stubs, IFUNC GOT slots and .rela.iplt ──────
-+
-+    let mut iplt_data = vec![0u8; iplt_size as usize];
-+    let mut irel_slot_data = vec![0u8; (ifunc_count * 8) as usize];
-+    let mut irela_data = Vec::with_capacity(irela_size as usize);
-+    for (i, (_name, resolver)) in ifunc_syms.iter().enumerate() {
-+        let stub_addr = iplt_vaddr + i as u64 * 16;
-+        let slot_addr = irel_slot_vaddr + i as u64 * 8;
-+
-+        // Slot initial content: the IPLT stub address (GNU ld semantics — a
-+        // sane value even if IRELATIVE processing were skipped; glibc's
-+        // startup overwrites it with the resolver's choice).
-+        let slot_off = i * 8;
-+        irel_slot_data[slot_off..slot_off + 8].copy_from_slice(&stub_addr.to_le_bytes());
-+
-+        // R_RISCV_IRELATIVE (58): slot := resolver(slot_addend) at startup.
-+        irela_data.extend_from_slice(&slot_addr.to_le_bytes());
-+        irela_data.extend_from_slice(&58u64.to_le_bytes());
-+        irela_data.extend_from_slice(&(*resolver as i64).to_le_bytes());
-+
-+        // Stub (GNU .iplt encoding):
-+        //   auipc t3, hi(delta)        t3 = stub_pc + hi<<12
-+        //   ld    t3, lo(delta)(t3)    t3 = *slot
-+        //   jalr  t1, t3
-+        //   nop
-+        let delta = slot_addr as i64 - stub_addr as i64;
-+        let hi = (delta + 0x800) >> 12;
-+        let lo = delta - (hi << 12);
-+        let auipc = 0x17u32 | (28 << 7) | (((hi as u32) & 0xFFFFF) << 12);
-+        let ld = (((lo as u32) & 0xFFF) << 20) | (28 << 15) | (3 << 12) | (28 << 7) | 0x03;
-+        let jalr: u32 = (28 << 15) | (6 << 7) | 0x67; // jalr t1, 0(t3)
-+        let stub_off = (i as u64 * 16) as usize;
-+        iplt_data[stub_off..stub_off + 4].copy_from_slice(&auipc.to_le_bytes());
-+        iplt_data[stub_off + 4..stub_off + 8].copy_from_slice(&ld.to_le_bytes());
-+        iplt_data[stub_off + 8..stub_off + 12].copy_from_slice(&jalr.to_le_bytes());
-+        iplt_data[stub_off + 12..stub_off + 16].copy_from_slice(&0x13u32.to_le_bytes());
-+    }
-+
-     // ── Phase 10: Build .dynamic section ────────────────────────────────
- 
-     let mut dynamic_data = Vec::new();
-@@ -1067,6 +1186,14 @@ pub fn emit_executable(
-         elf.extend_from_slice(&plt_data);
-     }
- 
-+    // IPLT stubs sit in the RX segment between the PLT block and the merged
-+    // text sections; write them before any later (higher-offset) region so
-+    // the pad_to calls stay monotone.
-+    if iplt_size > 0 {
-+        pad_to(&mut elf, iplt_offset as usize);
-+        elf.extend_from_slice(&iplt_data);
-+    }
-+
-     // Write RX merged sections
-     for &si in sec_indices {
-         let ms = &merged_sections[si];
-@@ -1106,6 +1233,13 @@ pub fn emit_executable(
-         elf.extend_from_slice(&got_data);
-     }
- 
-+    if ifunc_count > 0 {
-+        pad_to(&mut elf, irel_slot_offset as usize);
-+        elf.extend_from_slice(&irel_slot_data);
-+        pad_to(&mut elf, irela_offset as usize);
-+        elf.extend_from_slice(&irela_data);
-+    }
-+
-     if !is_static {
-         pad_to(&mut elf, got_plt_offset as usize);
-         elf.extend_from_slice(&got_plt_data);
-diff --git a/src/backend/stack_layout/regalloc_helpers.rs b/src/backend/stack_layout/regalloc_helpers.rs
-index 6c184d1a..d285bd14 100644
---- a/src/backend/stack_layout/regalloc_helpers.rs
-+++ b/src/backend/stack_layout/regalloc_helpers.rs
-@@ -102,6 +102,21 @@ fn collect_abi_reg_hints(
-             Some(PhysReg(6)),
-             Some(PhysReg(7)),
-         ]
-+    } else if available_regs.iter().any(|r| r.0 == 11) && caller_saved_regs.iter().any(|r| r.0 == 12)
-+    {
-+        // riscv64: the caller pool is a0–a7 (PhysReg 12..19) and integer
-+        // ABI slot i IS a_i — pinning the param home to its incoming
-+        // register makes the ParamRef a no-op for the common shape.
-+        vec![
-+            Some(PhysReg(12)),
-+            Some(PhysReg(13)),
-+            Some(PhysReg(14)),
-+            Some(PhysReg(15)),
-+            Some(PhysReg(16)),
-+            Some(PhysReg(17)),
-+            Some(PhysReg(18)),
-+            Some(PhysReg(19)),
-+        ]
-     } else {
-         return hints;
-     };
-@@ -338,6 +353,10 @@ pub fn run_regalloc_and_merge_clobbers_ex(
-     let reg_hints = collect_abi_reg_hints(func, &available_regs, &caller_saved_regs);
-     let accumulator_policy = if caller_saved_regs.iter().any(|r| r.0 == 10)
-         || (caller_saved_regs.is_empty() && available_regs.iter().any(|r| r.0 == 1))
-+        // riscv64 with the caller-saved a0–a7 pool open (s11 + a0 in the
-+        // combined pools is a unique signature): keep the same LhsFirst
-+        // policy the callee-only pool ran.
-+        || (available_regs.iter().any(|r| r.0 == 11) && caller_saved_regs.iter().any(|r| r.0 == 12))
-     {
-         super::super::regalloc::AccumulatorPolicy {
-             operand_order: super::super::regalloc::AccumulatorOperandOrder::LhsFirst,
-diff --git a/src/ir/lowering/expr_calls.rs b/src/ir/lowering/expr_calls.rs
-index 2448402a..a6f23b6f 100644
---- a/src/ir/lowering/expr_calls.rs
-+++ b/src/ir/lowering/expr_calls.rs
-@@ -204,7 +204,23 @@ impl Lowerer {
- 
-         // Detect variadic status early (needed for complex arg decomposition)
-         let call_is_variadic = if let Expr::Identifier(name, _) = stripped_func {
--            self.is_function_variadic(name)
-+            if self.is_func_ptr_variable(name) {
-+                // Call through a function-pointer variable: the POINTED-TO
-+                // signature decides.  Its `...` makes the call variadic —
-+                // floats belong in GP regs on rv64, AL=1 on x86-64, GP-only
-+                // on aarch64.  is_function_variadic only knows function
-+                // definitions, so `int (*fp)(char*, ...) -> f(fp);
-+                // (*fp)(b, "%.0f", 5.0)` sent the double to fa0 instead of
-+                // a2 and aborted glibc's vsprintf (gcc.c-torture 930513-1).
-+                self.func_meta
-+                    .ptr_sigs
-+                    .get(name.as_str())
-+                    .or_else(|| self.func_meta.sigs.get(name.as_str()))
-+                    .map(|sig| sig.is_variadic)
-+                    .unwrap_or(false)
-+            } else {
-+                self.is_function_variadic(name)
-+            }
          } else {
-             false
-         };
-@@ -1186,6 +1202,22 @@ impl Lowerer {
-                 // Use the comprehensive is_function_pointer_deref check which also handles
-                 // cases where c_type is None but ptr_sigs or known_functions provide info.
-                 let is_noop_deref = self.is_function_pointer_deref(inner);
-+                // A call through a dereferenced function pointer still follows
-+                // the pointed-to type's signature: if that type declares `...`,
-+                // the call IS variadic (floats belong in GP regs on rv64, AL=1
-+                // on x86-64, GP-only on aarch64).  The hard-coded `false` sent
-+                // the 5.0 of `(*fp)(buf, "%.0f", 5.0)` to fa0 instead of a2 and
-+                // aborted glibc's vsprintf on rv64 (gcc.c-torture 930513-1).
-+                let deref_variadic = match &**inner {
-+                    Expr::Identifier(name, _) => self
-+                        .func_meta
-+                        .ptr_sigs
-+                        .get(name.as_str())
-+                        .or_else(|| self.func_meta.sigs.get(name.as_str()))
-+                        .map(|sig| sig.is_variadic)
-+                        .unwrap_or(false),
-+                    _ => false,
-+                };
-                 let n = arg_vals.len();
-                 let sas = struct_arg_sizes;
-                 let saa = struct_arg_aligns;
-@@ -1205,7 +1237,7 @@ impl Lowerer {
-                         args: arg_vals,
-                         arg_types,
-                         return_type: indirect_ret_ty,
--                        is_variadic: false,
-+                        is_variadic: deref_variadic,
-                         num_fixed_args: n,
-                         struct_arg_sizes: sas,
-                         struct_arg_aligns: saa,
+-            // Try to resolve through Copy or same-size Cast (U64<->I64 no-op)
++            // Try to resolve through Copy or same-size Cast (U64<->I64 no-op).
++            // Float-involving same-size casts are value conversions, never
++            // bitcasts — cast_is_bitidentical_nop is the shared predicate
++            // (see operand_to_rax's fallback for the full rationale).
+             let source = self.get_defining_instruction(val.0).and_then(|inst| {
+                 match inst {
+                     crate::ir::reexports::Instruction::Copy { src, .. } => Some(src.clone()),
+                     crate::ir::reexports::Instruction::Cast { src, from_ty, to_ty, .. }
+-                        if from_ty.size() == to_ty.size() =>
++                        if IrType::cast_is_bitidentical_nop(*from_ty, *to_ty) =>
+                     {
+                         Some(src.clone())
+                     }
+diff --git a/src/common/types.rs b/src/common/types.rs
+index 7994b231..6531dbb2 100644
+--- a/src/common/types.rs
++++ b/src/common/types.rs
+@@ -2092,6 +2092,23 @@ impl IrType {
+         matches!(self, IrType::F128)
+     }
+ 
++    /// Whether a `Cast` from `from` to `to` is a machine-level no-op whose
++    /// result is bit-identical to its source (same size, neither side
++    /// floating). This is the ONLY class of cast that consumer-side
++    /// materialization fallbacks may resolve through the source value.
++    ///
++    /// Same-size float<->int casts are VALUE conversions, not bitcasts:
++    /// `(long long)3.0` is cvttsd2si (result 3), while the bit pattern of
++    /// 3.0 is 0x4008000000000000; `(double)ptr` is cvtsi2sdq, while
++    /// `movq %rax,%xmm0` would re-interpret the address bits (the
++    /// check_ptr_to_float_cast precedent). The float guard mirrors the
++    /// in-repo convention: global_addr_cse.rs, simplify.rs and
++    /// generation.rs already refuse to fold float-involving same-size
++    /// casts for exactly this reason.
++    pub fn cast_is_bitidentical_nop(from: IrType, to: IrType) -> bool {
++        from.size() == to.size() && !from.is_float() && !to.is_float()
++    }
++
+     /// Whether this is a 128-bit integer type (I128 or U128).
+     pub fn is_128bit(&self) -> bool {
+         matches!(self, IrType::I128 | IrType::U128)
+@@ -2196,3 +2213,54 @@ impl IrType {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod cast_nop_tests {
++    use super::IrType;
++
++    /// The cast_is_bitidentical_nop predicate is the shared contract for every
++    /// consumer-side "materialize through the cast's source" fallback. A wrong
++    /// true here is a silent miscompile (bitcast instead of value conversion);
++    /// a wrong false is merely a missed optimization that falls back to the
++    /// loud HARD GATE. Pin both directions for every same-size type pair that
++    /// the IR's lower_cast can emit.
++    #[test]
++    fn same_size_int_casts_are_noops() {
++        // The print_cfs_group_stats shape (PR #306's intended case).
++        assert!(IrType::cast_is_bitidentical_nop(IrType::U64, IrType::I64));
++        assert!(IrType::cast_is_bitidentical_nop(IrType::I64, IrType::U64));
++        assert!(IrType::cast_is_bitidentical_nop(IrType::U32, IrType::I32));
++        assert!(IrType::cast_is_bitidentical_nop(IrType::U16, IrType::I16));
++        assert!(IrType::cast_is_bitidentical_nop(IrType::U8, IrType::I8));
++        // 128-bit integer sign flavors share a 16-byte representation.
++        assert!(IrType::cast_is_bitidentical_nop(IrType::U128, IrType::I128));
++    }
++
++    #[test]
++    fn same_size_float_int_casts_are_value_conversions() {
++        // (long long)d / (int)f — cvttsd2si/cvttss2si, NOT bitcasts.
++        assert!(!IrType::cast_is_bitidentical_nop(IrType::F64, IrType::I64));
++        assert!(!IrType::cast_is_bitidentical_nop(IrType::F32, IrType::I32));
++        // (double)ll / (float)i — cvtsi2sdq/cvtsi2ss.
++        assert!(!IrType::cast_is_bitidentical_nop(IrType::I64, IrType::F64));
++        assert!(!IrType::cast_is_bitidentical_nop(IrType::I32, IrType::F32));
++        // (double)ptr — the check_ptr_to_float_cast precedent (8 == 8 bytes).
++        assert!(!IrType::cast_is_bitidentical_nop(IrType::Ptr, IrType::F64));
++        // U128 carrier -> F128 (both 16 bytes on LP64): soft-float conversion.
++        assert!(!IrType::cast_is_bitidentical_nop(IrType::U128, IrType::F128));
++        assert!(!IrType::cast_is_bitidentical_nop(IrType::F128, IrType::U128));
++    }
++
++    #[test]
++    fn size_changing_casts_are_never_noops() {
++        // fpext/fptrunc and widening/narrowing all change the representation.
++        assert!(!IrType::cast_is_bitidentical_nop(IrType::F32, IrType::F64));
++        assert!(!IrType::cast_is_bitidentical_nop(IrType::F64, IrType::F32));
++        assert!(!IrType::cast_is_bitidentical_nop(IrType::I32, IrType::I64));
++        assert!(!IrType::cast_is_bitidentical_nop(IrType::I64, IrType::I32));
++        assert!(!IrType::cast_is_bitidentical_nop(IrType::I8, IrType::I32));
++        // i686: F128 is 12 bytes there but still a float — excluded by class.
++        assert!(!IrType::cast_is_bitidentical_nop(IrType::F128, IrType::F64));
++        assert!(!IrType::cast_is_bitidentical_nop(IrType::F64, IrType::F128));
++    }
++}
+-- 
+2.47.3
+
