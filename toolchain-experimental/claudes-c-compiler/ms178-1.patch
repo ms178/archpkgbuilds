@@ -1,882 +1,1366 @@
-diff --git a/scripts/qemu_boot_test.sh b/scripts/qemu_boot_test.sh
-index c3adeb29..3d4bd5d1 100755
---- a/scripts/qemu_boot_test.sh
-+++ b/scripts/qemu_boot_test.sh
-@@ -62,8 +62,27 @@ chmod +x "$WORK/root/bin/busybox"
- ( cd "$WORK/root" && find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -1 > "$WORK/initramfs.cpio.gz" )
- 
- # ---- boot --------------------------------------------------------------------
--echo "boot: $QEMU -kernel $BZIMAGE (log: $LOG)"
-+# QEMU loads its PC BIOS from the compiled-in data dir; a locally extracted
-+# qemu package (no root install) must point -L at its firmware directory.
-+# QEMU_DATA_DIR selects it explicitly; otherwise a share/{qemu,seabios}
-+# directory next to the qemu binary is auto-detected.
-+qemu_l=()
-+if [[ -n ${QEMU_DATA_DIR:-} ]]; then
-+    [[ -f "$QEMU_DATA_DIR/bios-256k.bin" ]] || {
-+        echo "qemu_boot_test: QEMU_DATA_DIR has no bios-256k.bin: $QEMU_DATA_DIR" >&2
-+        exit 1
-+    }
-+    qemu_l=(-L "$QEMU_DATA_DIR")
-+else
-+    qdir=$(dirname "$(command -v "$QEMU")")
-+    for d in "$qdir/../share/qemu" "$qdir/../share/seabios"; do
-+        if [[ -f "$d/bios-256k.bin" ]]; then qemu_l=(-L "$d"); break; fi
-+    done
-+fi
-+
-+echo "boot: $QEMU ${qemu_l[*]} -kernel $BZIMAGE (log: $LOG)"
- timeout 600 "$QEMU" -m 512 -smp 2 \
-+    "${qemu_l[@]}" \
-     -kernel "$BZIMAGE" -initrd "$WORK/initramfs.cpio.gz" \
-     -nographic -no-reboot \
-     -accel tcg,thread=multi \
-diff --git a/src/backend/i686/codegen/alu.rs b/src/backend/i686/codegen/alu.rs
-index 0cc7f3e0..9fe5591d 100644
---- a/src/backend/i686/codegen/alu.rs
-+++ b/src/backend/i686/codegen/alu.rs
-@@ -62,39 +62,83 @@ impl I686Codegen {
-     }
- 
-     pub(super) fn emit_int_clz_impl(&mut self, ty: IrType) {
-+        if self.lzcnt_enabled {
-+            match ty {
-+                IrType::I8 | IrType::U8 => {
-+                    // clz8(x) = lzcnt32(x & 0xff) - 24. The mask kills dirty high
-+                    // bits so the count is width-correct.
-+                    self.state.emit("    andl $0xff, %eax");
-+                    self.state.emit("    lzcntl %eax, %eax");
-+                    self.state.emit("    subl $24, %eax");
-+                }
-+                IrType::I16 | IrType::U16 => {
-+                    self.state.emit("    lzcntw %ax, %ax");
-+                    // lzcntw leaves %eax[31:16] unchanged — zero-extend so the
-+                    // stored 32-bit result is width-correct.
-+                    self.state.emit("    movzwl %ax, %eax");
-+                }
-+                _ => {
-+                    self.state.emit("    lzcntl %eax, %eax");
-+                }
-+            }
-+            return;
-+        }
-+        // Baseline i686/x86-64-v1 has no LZCNT: F3 0F BD decodes as BSR on
-+        // such CPUs and silently returns the MSB *index* instead of the
-+        // leading-zero *count*. The BSR+XOR fallback keeps the IR's defined
-+        // Clz(0) == width semantics (constant folding matches).
-         match ty {
-             IrType::I8 | IrType::U8 => {
--                // clz8(x) = lzcnt32(x & 0xff) - 24. The mask kills dirty high
--                // bits so the count is width-correct.
-                 self.state.emit("    andl $0xff, %eax");
--                self.state.emit("    lzcntl %eax, %eax");
-+                self.emit_clz32_baseline("eax", "eax");
-                 self.state.emit("    subl $24, %eax");
-             }
-             IrType::I16 | IrType::U16 => {
--                self.state.emit("    lzcntw %ax, %ax");
--                // lzcntw leaves %eax[31:16] unchanged — zero-extend so the
--                // stored 32-bit result is width-correct.
-+                // clz16(x) = clz32(zext16(x)) - 16 == 15 - msb16(x);
-+                // clz32(zext(0)) - 16 = 32 - 16 = 16 == lzcntw(0) ✓
-                 self.state.emit("    movzwl %ax, %eax");
-+                self.emit_clz32_baseline("eax", "eax");
-+                self.state.emit("    subl $16, %eax");
-             }
-             _ => {
--                self.state.emit("    lzcntl %eax, %eax");
-+                self.emit_clz32_baseline("eax", "eax");
-             }
-         }
-     }
- 
-     pub(super) fn emit_int_ctz_impl(&mut self, ty: IrType) {
-+        if self.lzcnt_enabled {
-+            match ty {
-+                IrType::I8 | IrType::U8 => {
-+                    // Force a stop bit above the value so tzcnt(0) yields 8, not 32.
-+                    self.state.emit("    orl $0x100, %eax");
-+                    self.state.emit("    tzcntl %eax, %eax");
-+                }
-+                IrType::I16 | IrType::U16 => {
-+                    self.state.emit("    orl $0x10000, %eax");
-+                    self.state.emit("    tzcntl %eax, %eax");
-+                }
-+                _ => {
-+                    self.state.emit("    tzcntl %eax, %eax");
-+                }
-+            }
-+            return;
-+        }
-+        // TZCNT (F3 0F BC) decodes as plain BSF on CPUs without the feature;
-+        // BSF == TZCNT for every nonzero input. The stop-bit trick keeps the
-+        // narrow types' defined zero results (8 / 16) without a branch; the
-+        // 32-bit case needs the explicit fixup for Ctz(0) == 32.
-         match ty {
-             IrType::I8 | IrType::U8 => {
--                // Force a stop bit above the value so tzcnt(0) yields 8, not 32.
-                 self.state.emit("    orl $0x100, %eax");
--                self.state.emit("    tzcntl %eax, %eax");
-+                self.state.emit("    bsfl %eax, %eax");
-             }
-             IrType::I16 | IrType::U16 => {
-                 self.state.emit("    orl $0x10000, %eax");
--                self.state.emit("    tzcntl %eax, %eax");
-+                self.state.emit("    bsfl %eax, %eax");
-             }
-             _ => {
--                self.state.emit("    tzcntl %eax, %eax");
-+                self.emit_ctz32_baseline("eax", "eax");
-             }
-         }
-     }
-@@ -121,14 +165,35 @@ impl I686Codegen {
-                 // The value may be sign-extended; mask to the width so the
-                 // sign bits are not counted.
-                 self.state.emit("    andl $0xff, %eax");
--                self.state.emit("    popcntl %eax, %eax");
-             }
-             IrType::I16 | IrType::U16 => {
-                 self.state.emit("    andl $0xffff, %eax");
--                self.state.emit("    popcntl %eax, %eax");
-             }
--            _ => self.state.emit("    popcntl %eax, %eax"),
-+            _ => {}
-         }
-+        if self.popcnt_enabled {
-+            self.state.emit("    popcntl %eax, %eax");
-+            return;
-+        }
-+        // POPCNT (0F B8) is #UD on CPUs without the feature (Nehalem/
-+        // Barcelona era). Baseline shr/adc loop, result in %eax, scratch %ecx.
-+        // %ecx is NOT free: -mregparm=3 passes the third integer argument in
-+        // it and the emitter may stage live values there. Preserve it across
-+        // the loop (no calls inside, so the transient push is safe).
-+        self.state.emit("    pushl %ecx");
-+        self.state.emit("    movl %eax, %ecx");
-+        self.state.emit("    xorl %eax, %eax");
-+        let top = self.state.fresh_label("pop_loop");
-+        let done = self.state.fresh_label("pop_done");
-+        self.state.emit("    testl %ecx, %ecx");
-+        self.state.out.emit_jcc_label("    jz", &done);
-+        self.state.out.emit_named_label(&top);
-+        self.state.emit("    shrl $1, %ecx");
-+        self.state.emit("    adcl $0, %eax");
-+        self.state.emit("    testl %ecx, %ecx");
-+        self.state.out.emit_jcc_label("    jnz", &top);
-+        self.state.out.emit_named_label(&done);
-+        self.state.emit("    popl %ecx");
-     }
- 
-     /// Operand location for the direct-to-dest ALU path.
 diff --git a/src/backend/i686/codegen/emit.rs b/src/backend/i686/codegen/emit.rs
-index 21f28cbf..263f5836 100644
+index 21f28cbf..02ca8aa8 100644
 --- a/src/backend/i686/codegen/emit.rs
 +++ b/src/backend/i686/codegen/emit.rs
-@@ -77,6 +77,16 @@ pub struct I686Codegen {
-     /// -Os/-Oz: prefer the shorter sequence (idiv/imul) over the faster one
-     /// (magic-number division, multi-instruction LEA multiply chains).
-     pub(super) optimize_for_size: bool,
-+    /// True when the target has LZCNT/ABM (-mlzcnt or an enabling -march).
-+    /// LZCNT/TZCNT are NOT baseline i686 ISA: the F3-prefixed encodings
-+    /// decode as BSR/BSF on CPUs without the feature and silently return
-+    /// the bit index instead of a zero count. When false, Clz/Ctz lower to
-+    /// BSR/BSF sequences with an explicit zero fixup preserving the IR's
-+    /// defined Clz(0)/Ctz(0) == width semantics.
-+    pub(super) lzcnt_enabled: bool,
-+    /// True when the target has POPCNT (-mpopcnt or an enabling -march).
-+    /// When false, Popcount lowers to an shr/adc bit loop.
-+    pub(super) popcnt_enabled: bool,
-     /// Same-block div/rem pair analysis (see backend::regalloc::
-     /// compute_i686_divrem_pairs). Recomputed per function; the emitter uses
-     /// tail_dests/head_partners to fuse URem+UDiv couples into one divl.
-@@ -309,6 +319,8 @@ impl I686Codegen {
-             frame_base_offset: 0,
-             esp_adjust: 0,
-             optimize_for_size: false,
-+            lzcnt_enabled: false,
-+            popcnt_enabled: false,
-         }
-     }
+@@ -39,6 +39,15 @@ pub struct I686Codegen {
+     pub(super) used_callee_saved: Vec<PhysReg>,
+     /// Total stack bytes consumed by named parameters (for va_start computation).
+     pub(super) va_named_stack_bytes: usize,
++    /// Bytes of the caller's stack argument area (cdecl stack args of THIS
++    /// function).  Used by __builtin_apply_args to snapshot the incoming
++    /// argument area.  Set in the prologue walk from call_abi classification.
++    pub(super) incoming_stack_arg_bytes: i64,
++    /// Offset from %ebp to the post-prologue %esp baseline:
++    /// callee_saved_bytes + frame_size.  Valid in BOTH frame-pointer modes
++    /// (unlike frame_base_offset, which is only meaningful under FPO).  Used
++    /// by DoBuiltinApply to restore %esp after its untracked staging subl.
++    pub(super) esp_baseline_offset: i64,
+     /// Scratch register allocation index for inline asm GP registers.
+     pub(super) asm_scratch_idx: usize,
+     /// Scratch register allocation index for inline asm XMM registers.
+@@ -296,6 +305,8 @@ impl I686Codegen {
+             zext_wide_values: FxHashSet::default(),
+             used_callee_saved: Vec::new(),
+             va_named_stack_bytes: 0,
++            incoming_stack_arg_bytes: 0,
++            esp_baseline_offset: 0,
+             asm_scratch_idx: 0,
+             asm_xmm_scratch_idx: 0,
+             is_fastcall: false,
+diff --git a/src/backend/i686/codegen/intrinsics.rs b/src/backend/i686/codegen/intrinsics.rs
+index 5c375174..24bcbaff 100644
+--- a/src/backend/i686/codegen/intrinsics.rs
++++ b/src/backend/i686/codegen/intrinsics.rs
+@@ -10,6 +10,7 @@
+ //! - x87 FPU math (sqrt, fabs) for F32/F64
  
-@@ -337,6 +349,8 @@ impl I686Codegen {
-             _ => 16,
-         };
-         self.optimize_for_size = opts.optimize_for_size;
-+        self.lzcnt_enabled = opts.lzcnt;
-+        self.popcnt_enabled = opts.popcnt;
-     }
+ use super::emit::I686Codegen;
++use crate::backend::traits::ArchCodegen;
+ use crate::emit;
+ use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value};
  
-     // --- i686 helper methods ---
-@@ -1356,6 +1370,36 @@ pub(super) fn shift_mnemonic(op: IrBinOp) -> &'static str {
- // The result of clz/ctz/popcount is a small integer (0-64) that fits in eax,
- // so we zero edx to produce a proper I64 result.
- impl I686Codegen {
-+    /// clz32 on a 32-bit register without LZCNT: 31 - BSR(src) into dst.
-+    /// BSR leaves dst undefined for src == 0; the explicit fixup preserves
-+    /// the IR's defined Clz(0) == 32 semantics (constant folding matches).
-+    pub(super) fn emit_clz32_baseline(&mut self, src: &str, dst: &str) {
-+        let nz = self.state.fresh_label("clz_nz");
-+        let done = self.state.fresh_label("clz_done");
-+        emit!(self.state, "    testl %{s}, %{s}", s = src);
-+        emit!(self.state, "    jnz {}", nz);
-+        emit!(self.state, "    movl $32, %{d}", d = dst);
-+        emit!(self.state, "    jmp {}", done);
-+        emit!(self.state, "{}:", nz);
-+        emit!(self.state, "    bsrl %{s}, %{d}", s = src, d = dst);
-+        emit!(self.state, "    xorl $31, %{d}", d = dst);
-+        emit!(self.state, "{}:", done);
-+    }
-+
-+    /// ctz32 on a 32-bit register without TZCNT: BSF(src) into dst, with
-+    /// the zero fixup so Ctz(0) == 32 holds.
-+    pub(super) fn emit_ctz32_baseline(&mut self, src: &str, dst: &str) {
-+        let nz = self.state.fresh_label("ctz_nz");
-+        let done = self.state.fresh_label("ctz_done");
-+        emit!(self.state, "    testl %{s}, %{s}", s = src);
-+        emit!(self.state, "    jnz {}", nz);
-+        emit!(self.state, "    movl $32, %{d}", d = dst);
-+        emit!(self.state, "    jmp {}", done);
-+        emit!(self.state, "{}:", nz);
-+        emit!(self.state, "    bsfl %{s}, %{d}", s = src, d = dst);
-+        emit!(self.state, "{}:", done);
-+    }
-+
-     /// clzll(x): Count leading zeros of 64-bit value in eax:edx.
-     /// If high half (edx) != 0, result = lzcnt(edx).
-     /// Otherwise, result = 32 + lzcnt(eax).
-@@ -1366,12 +1410,20 @@ impl I686Codegen {
-         self.state.emit("    testl %edx, %edx");
-         emit!(self.state, "    je {}", hi_zero);
-         // High half is non-zero: result = lzcnt(edx)
--        self.state.emit("    lzcntl %edx, %eax");
-+        if self.lzcnt_enabled {
-+            self.state.emit("    lzcntl %edx, %eax");
-+        } else {
-+            self.emit_clz32_baseline("edx", "eax");
-+        }
-         self.state.emit("    xorl %edx, %edx");
-         emit!(self.state, "    jmp {}", done);
-         // High half is zero: result = 32 + lzcnt(eax)
-         emit!(self.state, "{}:", hi_zero);
--        self.state.emit("    lzcntl %eax, %eax");
-+        if self.lzcnt_enabled {
-+            self.state.emit("    lzcntl %eax, %eax");
-+        } else {
-+            self.emit_clz32_baseline("eax", "eax");
-+        }
-         self.state.emit("    addl $32, %eax");
-         self.state.emit("    xorl %edx, %edx");
-         emit!(self.state, "{}:", done);
-@@ -1387,12 +1439,20 @@ impl I686Codegen {
-         self.state.emit("    testl %eax, %eax");
-         emit!(self.state, "    je {}", lo_zero);
-         // Low half is non-zero: result = tzcnt(eax)
--        self.state.emit("    tzcntl %eax, %eax");
-+        if self.lzcnt_enabled {
-+            self.state.emit("    tzcntl %eax, %eax");
-+        } else {
-+            self.emit_ctz32_baseline("eax", "eax");
-+        }
-         self.state.emit("    xorl %edx, %edx");
-         emit!(self.state, "    jmp {}", done);
-         // Low half is zero: result = 32 + tzcnt(edx)
-         emit!(self.state, "{}:", lo_zero);
--        self.state.emit("    tzcntl %edx, %eax");
-+        if self.lzcnt_enabled {
-+            self.state.emit("    tzcntl %edx, %eax");
-+        } else {
-+            self.emit_ctz32_baseline("edx", "eax");
-+        }
-         self.state.emit("    addl $32, %eax");
-         self.state.emit("    xorl %edx, %edx");
-         emit!(self.state, "{}:", done);
-@@ -1401,12 +1461,57 @@ impl I686Codegen {
-     /// popcountll(x): Population count of 64-bit value in eax:edx.
-     /// result = popcount(eax) + popcount(edx)
-     pub(super) fn emit_i64_popcount(&mut self) {
--        self.state.emit("    popcntl %edx, %ecx");
--        self.state.emit("    popcntl %eax, %eax");
-+        if self.popcnt_enabled {
-+            self.state.emit("    popcntl %edx, %ecx");
-+            self.state.emit("    popcntl %eax, %eax");
-+            self.state.emit("    addl %ecx, %eax");
-+            self.state.emit("    xorl %edx, %edx");
-+            return;
-+        }
-+        // POPCNT is #UD on i686 CPUs without the feature (SSE4.2 era /
-+        // -mpopcnt). Baseline: count each half with the shr/adc loop.
-+        self.emit_popcount32_baseline("edx", "ecx");
-+        // careful: the loop for eax must not clobber ecx — count eax into
-+        // edx's old role is unnecessary; count eax into eax directly.
-+        self.emit_popcount32_baseline_eax_preserving_ecx();
-         self.state.emit("    addl %ecx, %eax");
-         self.state.emit("    xorl %edx, %edx");
-     }
- 
-+    /// 32-bit popcount of `src` into `dst` without POPCNT (shr/adc loop).
-+    /// May only use the two named registers.
-+    pub(super) fn emit_popcount32_baseline(&mut self, src: &str, dst: &str) {
-+        let top = self.state.fresh_label("pop_loop");
-+        let done = self.state.fresh_label("pop_done");
-+        emit!(self.state, "    xorl %{d}, %{d}", d = dst);
-+        emit!(self.state, "    testl %{s}, %{s}", s = src);
-+        emit!(self.state, "    jz {}", done);
-+        emit!(self.state, "{}:", top);
-+        emit!(self.state, "    shrl $1, %{s}", s = src);
-+        emit!(self.state, "    adcl $0, %{d}", d = dst);
-+        emit!(self.state, "    testl %{s}, %{s}", s = src);
-+        emit!(self.state, "    jnz {}", top);
-+        emit!(self.state, "{}:", done);
-+    }
-+
-+    /// popcount(eax) -> eax without POPCNT and without touching %ecx
-+    /// (used by emit_i64_popcount, which keeps the edx count in %ecx).
-+    fn emit_popcount32_baseline_eax_preserving_ecx(&mut self) {
-+        // Count into edx (already consumed as the high half input).
-+        let top = self.state.fresh_label("pop_lo");
-+        let done = self.state.fresh_label("pop_dn");
-+        self.state.emit("    xorl %edx, %edx");
-+        self.state.emit("    testl %eax, %eax");
-+        emit!(self.state, "    jz {}", done);
-+        emit!(self.state, "{}:", top);
-+        self.state.emit("    shrl $1, %eax");
-+        self.state.emit("    adcl $0, %edx");
-+        self.state.emit("    testl %eax, %eax");
-+        emit!(self.state, "    jnz {}", top);
-+        emit!(self.state, "{}:", done);
-+        self.state.emit("    movl %edx, %eax");
-+    }
-+
-     /// bswap64(x): Byte-swap 64-bit value in eax:edx.
-     /// result_lo = bswap(high), result_hi = bswap(low)
-     pub(super) fn emit_i64_bswap(&mut self) {
-diff --git a/src/backend/mod.rs b/src/backend/mod.rs
-index a9f85cfb..b2b919d3 100644
---- a/src/backend/mod.rs
-+++ b/src/backend/mod.rs
-@@ -137,6 +137,21 @@ pub(crate) struct CodegenOptions {
-     /// Gates scalar ANDN selection; emitting it without this contract would
-     /// introduce SIGILL on baseline x86-64.
-     pub(crate) bmi1: bool,
-+    /// Whether the target has LZCNT (`-mlzcnt`, ABM, or an enabling
-+    /// `-march` such as x86-64-v3). LZCNT/TZCNT are NOT baseline x86-64:
-+    /// on CPUs without the feature the F3-prefixed encodings (F3 0F BD/BC)
-+    /// decode as BSR/BSF and silently return the bit INDEX instead of a
-+    /// zero COUNT — no #UD, just wrong data (observed as the preboot ZSTD
-+    /// decoder's "corruption detected" when an lccc-built kernel boots on
-+    /// QEMU's default qemu64 TCG CPU). Gates the Clz/Ctz lowering; the
-+    /// fallback is BSR/BSF plus an explicit zero fixup so the IR's defined
-+    /// Clz(0)/Ctz(0) == width semantics (matching constant folding) hold.
-+    pub(crate) lzcnt: bool,
-+    /// Whether the target has POPCNT (`-mpopcnt` or an enabling `-march`
-+    /// such as x86-64-v2/Nehalem). 0F B8 is #UD on pre-Nehalem x86-64.
-+    /// Gates the Popcount lowering; the fallback is an shr/adc bit loop
-+    /// in %rax/%rcx.
-+    pub(crate) popcnt: bool,
-     /// Whether the target has AVX2 (`-mavx2` or an enabling `-march`).
-     pub(crate) avx2: bool,
-     /// Whether the target has AVX-512F (from -mavx512f / -march=*avx512*).
-diff --git a/src/backend/x86/codegen/alu.rs b/src/backend/x86/codegen/alu.rs
-index 1a300ca0..27f1c888 100644
---- a/src/backend/x86/codegen/alu.rs
-+++ b/src/backend/x86/codegen/alu.rs
-@@ -136,37 +136,130 @@ impl X86Codegen {
-         }
-     }
- 
-+    /// 32-bit leading-zero count of %eax without LZCNT: 31 - BSR(x).
-+    /// BSR leaves its destination undefined for x == 0, so the zero case is
-+    /// fixed up explicitly — this preserves the IR's defined
-+    /// Clz(0) == width semantics, which constant folding guarantees.
-+    fn emit_clz32_rax_baseline(&mut self) {
-+        let nz = self.state.fresh_label("clz_nz");
-+        let done = self.state.fresh_label("clz_done");
-+        self.state.emit("    testl %eax, %eax");
-+        self.state.out.emit_jcc_label("    jnz", &nz);
-+        self.state.emit("    movl $32, %eax");
-+        self.state.out.emit_jmp_label(&done);
-+        self.state.out.emit_named_label(&nz);
-+        self.state.emit("    bsrl %eax, %eax");
-+        self.state.emit("    xorl $31, %eax");
-+        self.state.out.emit_named_label(&done);
-+    }
-+
-+    /// 32-bit trailing-zero count of %eax without TZCNT: BSF(x).
-+    /// BSF's destination is undefined for x == 0; the fixup keeps the
-+    /// defined Ctz(0) == 32 semantics.
-+    fn emit_ctz32_rax_baseline(&mut self) {
-+        let nz = self.state.fresh_label("ctz_nz");
-+        let done = self.state.fresh_label("ctz_done");
-+        self.state.emit("    testl %eax, %eax");
-+        self.state.out.emit_jcc_label("    jnz", &nz);
-+        self.state.emit("    movl $32, %eax");
-+        self.state.out.emit_jmp_label(&done);
-+        self.state.out.emit_named_label(&nz);
-+        self.state.emit("    bsfl %eax, %eax");
-+        self.state.out.emit_named_label(&done);
-+    }
-+
-     pub(super) fn emit_int_clz_impl(&mut self, ty: IrType) {
-+        if self.lzcnt_enabled {
-+            match ty {
-+                IrType::I8 | IrType::U8 => {
-+                    // clz8(x) = lzcnt32(zext(x)) - 24.
-+                    self.state.emit("    movzbl %al, %eax");
-+                    self.state.emit("    lzcntl %eax, %eax");
-+                    self.state.emit("    subl $24, %eax");
-+                }
-+                IrType::I16 | IrType::U16 => {
-+                    self.state.emit("    movzwl %ax, %eax");
-+                    self.state.emit("    lzcntl %eax, %eax");
-+                    self.state.emit("    subl $16, %eax");
-+                }
-+                IrType::I32 | IrType::U32 => self.state.emit("    lzcntl %eax, %eax"),
-+                _ => self.state.emit("    lzcntq %rax, %rax"),
-+            }
-+            return;
-+        }
-+        // Baseline x86-64 has no LZCNT: the F3 0F BD encoding decodes as BSR
-+        // on CPUs without ABM and silently yields the MSB *index* instead of
-+        // the leading-zero *count* (bit-flipped result, no fault). This
-+        // corrupted the preboot ZSTD decoder's FSE/Huffman table builds when
-+        // an lccc-built kernel booted on QEMU's default qemu64 TCG CPU.
-         match ty {
-             IrType::I8 | IrType::U8 => {
--                // clz8(x) = lzcnt32(zext(x)) - 24.
-                 self.state.emit("    movzbl %al, %eax");
--                self.state.emit("    lzcntl %eax, %eax");
-+                self.emit_clz32_rax_baseline();
-                 self.state.emit("    subl $24, %eax");
-             }
-             IrType::I16 | IrType::U16 => {
-                 self.state.emit("    movzwl %ax, %eax");
--                self.state.emit("    lzcntl %eax, %eax");
-+                self.emit_clz32_rax_baseline();
-                 self.state.emit("    subl $16, %eax");
-             }
--            IrType::I32 | IrType::U32 => self.state.emit("    lzcntl %eax, %eax"),
--            _ => self.state.emit("    lzcntq %rax, %rax"),
-+            IrType::I32 | IrType::U32 => self.emit_clz32_rax_baseline(),
-+            _ => {
-+                let nz = self.state.fresh_label("clz_nz");
-+                let done = self.state.fresh_label("clz_done");
-+                self.state.emit("    testq %rax, %rax");
-+                self.state.out.emit_jcc_label("    jnz", &nz);
-+                self.state.emit("    movl $64, %eax");
-+                self.state.out.emit_jmp_label(&done);
-+                self.state.out.emit_named_label(&nz);
-+                self.state.emit("    bsrq %rax, %rax");
-+                self.state.emit("    xorq $63, %rax");
-+                self.state.out.emit_named_label(&done);
-+            }
-         }
-     }
- 
-     pub(super) fn emit_int_ctz_impl(&mut self, ty: IrType) {
-+        if self.lzcnt_enabled {
-+            match ty {
-+                IrType::I8 | IrType::U8 => {
-+                    // Zero-extend so only the real low byte's trailing zeros count.
-+                    self.state.emit("    movzbl %al, %eax");
-+                    self.state.emit("    tzcntl %eax, %eax");
-+                }
-+                IrType::I16 | IrType::U16 => {
-+                    self.state.emit("    movzwl %ax, %eax");
-+                    self.state.emit("    tzcntl %eax, %eax");
-+                }
-+                IrType::I32 | IrType::U32 => self.state.emit("    tzcntl %eax, %eax"),
-+                _ => self.state.emit("    tzcntq %rax, %rax"),
-+            }
-+            return;
-+        }
-+        // TZCNT (F3 0F BC) decodes as plain BSF without the feature; the two
-+        // agree for every nonzero input, but BSF's result is undefined for
-+        // zero, so the zero case is fixed up to preserve Ctz(0) == width.
-         match ty {
-             IrType::I8 | IrType::U8 => {
--                // Zero-extend so only the real low byte's trailing zeros count.
-                 self.state.emit("    movzbl %al, %eax");
--                self.state.emit("    tzcntl %eax, %eax");
-+                self.emit_ctz32_rax_baseline();
-             }
-             IrType::I16 | IrType::U16 => {
-                 self.state.emit("    movzwl %ax, %eax");
--                self.state.emit("    tzcntl %eax, %eax");
-+                self.emit_ctz32_rax_baseline();
-+            }
-+            IrType::I32 | IrType::U32 => self.emit_ctz32_rax_baseline(),
-+            _ => {
-+                let nz = self.state.fresh_label("ctz_nz");
-+                let done = self.state.fresh_label("ctz_done");
-+                self.state.emit("    testq %rax, %rax");
-+                self.state.out.emit_jcc_label("    jnz", &nz);
-+                self.state.emit("    movl $64, %eax");
-+                self.state.out.emit_jmp_label(&done);
-+                self.state.out.emit_named_label(&nz);
-+                self.state.emit("    bsfq %rax, %rax");
-+                self.state.out.emit_named_label(&done);
-             }
--            IrType::I32 | IrType::U32 => self.state.emit("    tzcntl %eax, %eax"),
--            _ => self.state.emit("    tzcntq %rax, %rax"),
-         }
-     }
- 
-@@ -181,17 +274,62 @@ impl X86Codegen {
-     }
- 
-     pub(super) fn emit_int_popcount_impl(&mut self, ty: IrType) {
--        match ty {
--            IrType::I8 | IrType::U8 => {
--                self.state.emit("    movzbl %al, %eax");
--                self.state.emit("    popcntl %eax, %eax");
-+        let narrow = matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16);
-+        if narrow {
-+            match ty {
-+                IrType::I8 | IrType::U8 => self.state.emit("    movzbl %al, %eax"),
-+                _ => self.state.emit("    movzwl %ax, %eax"),
-             }
--            IrType::I16 | IrType::U16 => {
--                self.state.emit("    movzwl %ax, %eax");
-+        }
-+        if self.popcnt_enabled {
-+            if narrow {
-+                self.state.emit("    popcntl %eax, %eax");
-+            } else if matches!(ty, IrType::I32 | IrType::U32) {
-                 self.state.emit("    popcntl %eax, %eax");
-+            } else {
-+                self.state.emit("    popcntq %rax, %rax");
-             }
--            IrType::I32 | IrType::U32 => self.state.emit("    popcntl %eax, %eax"),
--            _ => self.state.emit("    popcntq %rax, %rax"),
-+            return;
-+        }
-+        // POPCNT (0F B8) is #UD on pre-Nehalem/Barcelona x86-64 — it is a
-+        // v2 feature, not v1. Baseline fallback: shift each bit into CF and
-+        // accumulate with adc, iterating only while bits remain.
-+        //
-+        // %rcx is NOT free here: the surrounding accumulator-mode code may
-+        // have staged a live value in it (e.g. a 64-bit multiply constant
-+        // reused by a following `imulq %rcx`). Preserve it across the loop
-+        // with a push/pop pair; the loop body contains no call, so the
-+        // transient 8-byte stack excursion is safe at any alignment.
-+        if narrow || matches!(ty, IrType::I32 | IrType::U32) {
-+            self.state.emit("    pushq %rcx");
-+            self.state.emit("    movl %eax, %ecx");
-+            self.state.emit("    xorl %eax, %eax");
-+            let top = self.state.fresh_label("pop32_loop");
-+            let done = self.state.fresh_label("pop32_done");
-+            self.state.emit("    testl %ecx, %ecx");
-+            self.state.out.emit_jcc_label("    jz", &done);
-+            self.state.out.emit_named_label(&top);
-+            self.state.emit("    shrl $1, %ecx");
-+            self.state.emit("    adcl $0, %eax");
-+            self.state.emit("    testl %ecx, %ecx");
-+            self.state.out.emit_jcc_label("    jnz", &top);
-+            self.state.out.emit_named_label(&done);
-+            self.state.emit("    popq %rcx");
-+        } else {
-+            self.state.emit("    pushq %rcx");
-+            self.state.emit("    movq %rax, %rcx");
-+            self.state.emit("    xorl %eax, %eax");
-+            let top = self.state.fresh_label("pop64_loop");
-+            let done = self.state.fresh_label("pop64_done");
-+            self.state.emit("    testq %rcx, %rcx");
-+            self.state.out.emit_jcc_label("    jz", &done);
-+            self.state.out.emit_named_label(&top);
-+            self.state.emit("    shrq $1, %rcx");
-+            self.state.emit("    adcq $0, %rax");
-+            self.state.emit("    testq %rcx, %rcx");
-+            self.state.out.emit_jcc_label("    jnz", &top);
-+            self.state.out.emit_named_label(&done);
-+            self.state.emit("    popq %rcx");
-         }
-     }
- 
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index c71c382b..34798399 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -416,6 +416,14 @@ pub struct X86Codegen {
-     pub(super) vec_const_counter: u32,
-     /// True when the target has BMI1; enables scalar ANDN fusion.
-     pub(super) bmi1_enabled: bool,
-+    /// True when the target has LZCNT/ABM (-mlzcnt or an enabling -march).
-+    /// When false, Clz/Ctz lower to BSR/BSF sequences with an explicit zero
-+    /// fixup: F3-prefixed LZCNT/TZCNT decode as BSR/BSF on CPUs without the
-+    /// feature and silently return wrong counts.
-+    pub(super) lzcnt_enabled: bool,
-+    /// True when the target has POPCNT (-mpopcnt or an enabling -march).
-+    /// When false, Popcount lowers to an shr/adc bit loop.
-+    pub(super) popcnt_enabled: bool,
-     /// True when the target has AVX2; gates YMM constant-size copies.
-     pub(super) avx2_enabled: bool,
-     /// True when the target has AVX-512F; enables EVEX GPR-source broadcasts.
-@@ -722,6 +730,8 @@ impl X86Codegen {
-             vec_const_labels: crate::common::fx_hash::FxHashMap::default(),
-             vec_const_counter: 0,
-             bmi1_enabled: false,
-+            lzcnt_enabled: false,
-+            popcnt_enabled: false,
-             avx2_enabled: false,
-             avx512_enabled: false,
-             optimize_for_size: false,
-@@ -825,6 +835,8 @@ impl X86Codegen {
-         self.set_code_model_kernel(opts.code_model_kernel);
-         self.set_no_jump_tables(opts.no_jump_tables);
-         self.bmi1_enabled = opts.bmi1;
-+        self.lzcnt_enabled = opts.lzcnt;
-+        self.popcnt_enabled = opts.popcnt;
-         self.avx2_enabled = opts.avx2;
-         self.avx512_enabled = opts.avx512;
-         self.state.emit_cfi = opts.emit_cfi;
-diff --git a/src/backend/x86/codegen/float_ops.rs b/src/backend/x86/codegen/float_ops.rs
-index 5b8ae3a3..0437a2ba 100644
---- a/src/backend/x86/codegen/float_ops.rs
-+++ b/src/backend/x86/codegen/float_ops.rs
-@@ -853,7 +853,7 @@ impl X86Codegen {
-                             self.state.reg_cache.invalidate_acc();
-                             return;
-                         }
--                        IrUnaryOp::Popcount => {
-+                        IrUnaryOp::Popcount if self.popcnt_enabled => {
-                             // popcnt is two-operand: popcnt %src, %dest
-                             if let Some(s_reg) = self.operand_reg(src) {
-                                 if !is_xmm_reg(s_reg) {
-@@ -878,7 +878,8 @@ impl X86Codegen {
-                             self.state.reg_cache.invalidate_acc();
-                             return;
-                         }
--                        _ => {} // Clz, Ctz — complex multi-instruction, fall through to default
-+                        _ => {} // Clz, Ctz — complex multi-instruction; Popcount without
-+                                // -mpopcnt falls through to the shr/adc loop fallback.
-                     }
+@@ -153,6 +154,192 @@ impl I686Codegen {
                  }
              }
-diff --git a/src/driver/cli.rs b/src/driver/cli.rs
-index 75380e05..c7a35433 100644
---- a/src/driver/cli.rs
-+++ b/src/driver/cli.rs
-@@ -70,6 +70,8 @@ impl Driver {
-         self.enable_bmi2 = true;
-         self.enable_lzcnt = true;
-         self.enable_movbe = true;
-+        // x86-64-v3 is a superset of v2, which added POPCNT.
-+        self.enable_popcnt = true;
-         if self.sse_explicitly_disabled {
-             return;
+ 
++            // --- GCC local-frame setjmp/longjmp (mirrors the x86-64 lowering
++            // in backend/x86/codegen/intrinsics.rs) ---
++            //
++            // jmp_buf layout (native words, little-endian):
++            //   [0] = %ebp   frame pointer of the setjmp frame
++            //   [1] = resume label address (returns 1)
++            //   [2] = %esp   stack pointer of the setjmp frame
++            //
++            // Callers must keep values live across __builtin_setjmp in memory;
++            // the pipeline marks every alloca volatile in functions containing
++            // the intrinsic and disables register allocation for them, so the
++            // frame slots are authoritative after the longjmp lands.
++            IntrinsicOp::BuiltinSetjmp => {
++                let buffer = args.first().expect("BuiltinSetjmp requires a buffer");
++                self.operand_to_eax(buffer);
++                // EAX holds the buffer pointer; EDX is our only scratch and is
++                // dead here (functions with __builtin_setjmp have no register
++                // allocation, so no live value can hide in it).
++                self.state.emit("    movl %eax, %edx");
++                let resume = self.state.fresh_label("builtin_setjmp_resume");
++                let done = self.state.fresh_label("builtin_setjmp_done");
++                self.state.emit("    movl %ebp, 0(%edx)");
++                emit!(self.state, "    movl ${}, %eax", resume);
++                self.state.emit("    movl %eax, 4(%edx)");
++                self.state.emit("    movl %esp, 8(%edx)");
++                self.state.emit("    xorl %eax, %eax");
++                self.state.out.emit_jmp_label(&done);
++                self.state.out.emit_named_label(&resume);
++                self.state.emit("    movl $1, %eax");
++                self.state.out.emit_named_label(&done);
++                self.state.reg_cache.invalidate_acc();
++                if let Some(dest) = dest {
++                    self.store_eax_to(dest);
++                }
++            }
++            IntrinsicOp::BuiltinLongjmp => {
++                let buffer = args.first().expect("BuiltinLongjmp requires a buffer");
++                self.operand_to_eax(buffer);
++                // EAX keeps the buffer pointer across the %esp restore, so all
++                // three words are read from a stable base.  This call never
++                // returns: %esp/%ebp return to the setjmp frame and control
++                // jumps to its resume label.
++                self.state.emit("    movl 8(%eax), %edx");
++                self.state.emit("    movl 4(%eax), %ecx");
++                self.state.emit("    movl %edx, %esp");
++                self.state.emit("    movl 0(%eax), %edx");
++                self.state.emit("    movl %edx, %ebp");
++                self.state.emit("    jmp *%ecx");
++                self.state.reg_cache.invalidate_all();
++            }
++
++            // --- GCC __builtin_apply family ---
++            //
++            // Save-area layout (i686):
++            //   [0]  incoming %eax   (regparm arg 0 — current value at the
++            //                        apply_args call, matching GCC's semantics)
++            //   [4]  incoming %edx   (regparm arg 1)
++            //   [8]  incoming %ecx   (regparm arg 2)
++            //   [16..16+N)           caller's stack argument area (N =
++            //                        incoming_stack_arg_bytes)
++            // Save-area size: 16 + N (ApplyArgsAreaSize).
++            IntrinsicOp::ApplyArgsAreaSize => {
++                if let Some(d) = dest {
++                    emit!(
++                        self.state,
++                        "    movl ${}, %eax",
++                        16 + self.incoming_stack_arg_bytes
++                    );
++                    self.store_eax_to(d);
++                }
++            }
++            IntrinsicOp::SaveApplyArgs => {
++                let area_owned: Operand = dest_ptr
++                    .as_ref()
++                    .map(|v| Operand::Value(*v))
++                    .or_else(|| args.first().cloned())
++                    .expect("SaveApplyArgs requires an area pointer");
++                let area_op = &area_owned;
++                // Callee-saved + arg-register preservation.  A frame pointer is
++                // guaranteed: ApplyArgs lowers through DynAlloca, and dynamic
++                // allocas force %ebp.
++                self.state.emit("    pushl %eax");
++                self.esp_adjust += 4;
++                self.state.emit("    pushl %esi");
++                self.esp_adjust += 4;
++                self.state.emit("    pushl %edi");
++                self.esp_adjust += 4;
++                self.operand_to_eax(area_op);
++                self.state.emit("    movl %eax, %edi");
++                // Snapshot the (possibly regparm) incoming register args.
++                self.state.emit("    movl %edx, 4(%edi)");
++                self.state.emit("    movl %ecx, 8(%edi)");
++                // Original %eax sits at 8(%esp): three pushes, top = saved %edi.
++                self.state.emit("    movl 8(%esp), %eax");
++                self.state.emit("    movl %eax, 0(%edi)");
++                // Copy the caller's stack argument area.
++                self.state.emit("    leal 8(%ebp), %esi");
++                self.state.emit("    addl $16, %edi");
++                emit!(self.state, "    movl ${}, %ecx", self.incoming_stack_arg_bytes);
++                self.state.emit("    cld");
++                self.state.emit("    rep movsb");
++                self.state.emit("    popl %edi");
++                self.esp_adjust -= 4;
++                self.state.emit("    popl %esi");
++                self.esp_adjust -= 4;
++                self.state.emit("    popl %eax");
++                self.esp_adjust -= 4;
++                self.state.reg_cache.invalidate_acc();
++            }
++            IntrinsicOp::DoBuiltinApply => {
++                // args: [func, save_area, result_area, size]
++                debug_assert!(args.len() >= 4, "DoBuiltinApply requires 4 operands");
++                let tracked = self.esp_adjust;
++                // Callee-saved preservation: %esi (area), %edi (staging dest),
++                // %ebx (function pointer).  A frame pointer is guaranteed via
++                // the DynAlloca areas the lowering emits.
++                self.state.emit("    pushl %esi");
++                self.esp_adjust += 4;
++                self.state.emit("    pushl %edi");
++                self.esp_adjust += 4;
++                self.state.emit("    pushl %ebx");
++                self.esp_adjust += 4;
++                self.emit_load_operand(&args[0]); // func
++                self.state.emit("    movl %eax, %ebx");
++                self.emit_load_operand(&args[1]); // save_area
++                self.state.emit("    movl %eax, %esi");
++                self.emit_load_operand(&args[3]); // size
++                self.state.emit("    movl %eax, %edx");
++                // Stage `size` (16-aligned) bytes of stack arguments from the
++                // save area.  This %esp adjustment is deliberately NOT tracked:
++                // it is undone by the ebp-relative lea below, and no tracked
++                // (esp-relative) slot is touched in between — every operand
++                // load here is ebp-relative.
++                self.state.emit("    leal 15(%edx), %eax");
++                self.state.emit("    andl $-16, %eax");
++                self.state.emit("    subl %eax, %esp");
++                self.state.emit("    movl %edx, %ecx");
++                self.state.emit("    leal 16(%esi), %esi"); // skip reg block
++                self.state.emit("    movl %esp, %edi");
++                self.state.emit("    cld");
++                self.state.emit("    rep movsb");
++                // Restore the regparm argument registers from the save block.
++                self.state.emit("    subl %edx, %esi"); // back to area base
++                self.state.emit("    movl 4(%esi), %edx");
++                self.state.emit("    movl 8(%esi), %ecx");
++                self.state.emit("    movl 0(%esi), %eax");
++                self.state.emit("    call *%ebx");
++                // Discard the staging region and return %esp to the tracked
++                // position: baseline + entry-esp_adjust + the three pushes.
++                emit!(
++                    self.state,
++                    "    leal -{}(%ebp), %esp",
++                    self.esp_baseline_offset + tracked + 12
++                );
++                // Capture the return value: result[0]=%eax, result[4]=%edx.
++                // (x87 returns are not captured; __builtin_return consumers on
++                // i686 read the integer half exactly like GCC's ax/dx block.)
++                self.state.emit("    pushl %edx");
++                self.esp_adjust += 4;
++                self.state.emit("    pushl %eax");
++                self.esp_adjust += 4;
++                self.emit_load_operand(&args[2]); // result_area
++                self.state.emit("    movl %eax, %edi");
++                self.state.emit("    popl %eax");
++                self.esp_adjust -= 4;
++                self.state.emit("    movl %eax, 0(%edi)");
++                self.state.emit("    popl %eax");
++                self.esp_adjust -= 4;
++                self.state.emit("    movl %eax, 4(%edi)");
++                self.state.emit("    popl %ebx");
++                self.esp_adjust -= 4;
++                self.state.emit("    popl %edi");
++                self.esp_adjust -= 4;
++                self.state.emit("    popl %esi");
++                self.esp_adjust -= 4;
++                self.state.reg_cache.invalidate_all();
++            }
++            IntrinsicOp::RestoreApplyResult => {
++                let block = args.first().expect("RestoreApplyResult requires a block");
++                self.operand_to_eax(block);
++                self.state.emit("    movl %eax, %esi");
++                self.state.emit("    movl 0(%esi), %eax");
++                self.state.emit("    movl 4(%esi), %edx");
++                self.state.reg_cache.invalidate_all();
++            }
++
+             // --- Floating-point intrinsics via x87 FPU ---
+             IntrinsicOp::SqrtF64 => {
+                 self.emit_f64_unary_x87(&args[0], "fsqrt", dest);
+diff --git a/src/backend/i686/codegen/peephole.rs b/src/backend/i686/codegen/peephole.rs
+index 2cffe1de..159de5c0 100644
+--- a/src/backend/i686/codegen/peephole.rs
++++ b/src/backend/i686/codegen/peephole.rs
+@@ -5286,7 +5286,17 @@ fn staging_reads_safe(
+     reg: RegId,
+     excluded: &[usize],
+ ) -> bool {
++    // `pending_excluded` tracks whether a DELETED definition of `reg` has
++    // been passed without an intervening pure redefinition.  A read of `reg`
++    // that satisfies the forward `dominated` check can still observe the
++    // deleted value when the dominating definition precedes the deleted
++    // write: `movl 16(%esp),%eax; movl %esi,%eax; subl $-6,%eax` (deleted)
++    // feeding `movl (%ecx,%eax,4),%eax` was judged "dominated" by the
++    // earlier slot load, so the range-check fusion deleted the subl and the
++    // jump-table fetch indexed a stale register
++    // (gcc.c-torture execute/20011109-1.c @O1/O2).
+     let mut dominated = false;
++    let mut pending_excluded = false;
+     let mut k = fstart;
+     while k < fend {
+         if infos[k].is_nop() || is_debug_location(store, infos, k) {
+@@ -5294,6 +5304,7 @@ fn staging_reads_safe(
+             continue;
          }
-@@ -156,6 +158,10 @@ impl Driver {
-         self.enable_avx512vp2intersect = true;
+         if excluded.contains(&k) {
++            pending_excluded = true;
+             k += 1;
+             continue;
+         }
+@@ -5309,8 +5320,9 @@ fn staging_reads_safe(
+         if line_references_reg(line, reg) {
+             if line_writes_reg_purely(line, reg) {
+                 dominated = true;
++                pending_excluded = false;
+             } else {
+-                if !dominated {
++                if !dominated || pending_excluded {
+                     return false;
+                 }
+                 dominated = true;
+@@ -5318,6 +5330,7 @@ fn staging_reads_safe(
+         }
+         if infos[k].kind == LineKind::Call && matches!(reg, REG_EAX | REG_ECX | REG_EDX) {
+             dominated = true;
++            pending_excluded = false;
+         }
+         k += 1;
      }
-     fn enable_x86_nehalem_profile(&mut self) {
-+        // POPCNT shipped with Nehalem/Barcelona and is part of the
-+        // x86-64-v2 baseline contract; like BMI/LZCNT it is integer ISA
-+        // and stays legal under `-mno-sse`.
-+        self.enable_popcnt = true;
-         if self.sse_explicitly_disabled {
-             return;
+@@ -5354,6 +5367,13 @@ fn census_reg_reads(
+ 
+ /// Rewrite every branch in `[fstart, fend)` whose target is `from_name` to
+ /// target `to_name` instead.  Returns the number of rewritten branches.
++///
++/// Also rewrites whole-word references to `from_name` inside `.long`/`.quad`
++/// data directives: jump tables hold ` .long LABEL - BASE` entries that bind
++/// just as strongly as branch targets.  Threaded labels whose definition is
++/// removed must not survive in table data, or the entry resolves to an
++/// undefined symbol and the indirect jump lands on garbage
++/// (gcc.c-torture execute/20011109-1.c @O1/O2, SIGSEGV in foo(1)).
+ fn retarget_label_refs(
+     store: &mut LineStore,
+     infos: &mut [LineInfo],
+@@ -5364,7 +5384,27 @@ fn retarget_label_refs(
+ ) -> usize {
+     let mut n = 0;
+     for i in fstart..fend {
+-        if infos[i].is_nop() || !matches!(infos[i].kind, LineKind::Jmp | LineKind::CondJmp) {
++        if infos[i].is_nop() {
++            continue;
++        }
++        if matches!(infos[i].kind, LineKind::Directive) {
++            // Jump-table data references: `.long LABEL - BASE` /
++            // `.long BASE - LABEL`.  Replace whole-word label tokens only
++            // (`.LBB7` must not match `.LBB77`).
++            let line = trimmed(store, &infos[i], i);
++            if !(line.starts_with(".long ") || line.starts_with(".quad ")) {
++                continue;
++            }
++            if !label_referenced_whole_word(&line, from_name) {
++                continue;
++            }
++            let new_line = replace_label_whole_word(&line, from_name, to_name);
++            store.replace(i, format!("    {}", new_line));
++            infos[i] = classify_line(store.get(i));
++            n += 1;
++            continue;
++        }
++        if !matches!(infos[i].kind, LineKind::Jmp | LineKind::CondJmp) {
+             continue;
          }
-@@ -1020,6 +1026,7 @@ impl Driver {
-                 "-mbmi" => self.enable_bmi = true,
-                 "-mbmi2" => self.enable_bmi2 = true,
-                 "-mlzcnt" => self.enable_lzcnt = true,
-+                "-mpopcnt" => self.enable_popcnt = true,
-                 "-mmovbe" => self.enable_movbe = true,
-                 "-mrdrnd" => self.enable_rdrnd = true,
-                 // AVX-512 / AVX10 feature flags (completeness; backend coverage
-@@ -1080,6 +1087,7 @@ impl Driver {
-                 "-mno-bmi" => self.enable_bmi = false,
-                 "-mno-bmi2" => self.enable_bmi2 = false,
-                 "-mno-lzcnt" => self.enable_lzcnt = false,
-+                "-mno-popcnt" => self.enable_popcnt = false,
-                 "-mno-movbe" => self.enable_movbe = false,
-                 "-mno-rdrnd" => self.enable_rdrnd = false,
-                 "-mno-avx512f" => self.enable_avx512f = false,
-@@ -1265,6 +1273,9 @@ impl Driver {
-                                     if std::arch::is_x86_feature_detected!("lzcnt") {
-                                         self.enable_lzcnt = true;
-                                     }
-+                                    if std::arch::is_x86_feature_detected!("popcnt") {
-+                                        self.enable_popcnt = true;
+         let line = trimmed(store, &infos[i], i);
+@@ -5383,6 +5423,66 @@ fn retarget_label_refs(
+     n
+ }
+ 
++/// Whether `name` appears in `text` as a whole word (identifier-boundary
++/// delimited on both sides).  Used by retarget_label_refs for data directives.
++fn label_referenced_whole_word(text: &str, name: &str) -> bool {
++    let bytes = text.as_bytes();
++    let nb = name.as_bytes();
++    if nb.len() > bytes.len() {
++        return false;
++    }
++    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$';
++    let mut start = 0usize;
++    while start + nb.len() <= bytes.len() {
++        if &bytes[start..start + nb.len()] == nb
++            && (start == 0 || !is_word(bytes[start - 1]))
++            && (start + nb.len() == bytes.len() || !is_word(bytes[start + nb.len()]))
++        {
++            return true;
++        }
++        start += 1;
++    }
++    false
++}
++
++/// Replace every whole-word occurrence of `from` with `to` in `text`.
++fn replace_label_whole_word(text: &str, from: &str, to: &str) -> String {
++    let bytes = text.as_bytes();
++    let nb = from.as_bytes();
++    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$';
++    let mut out = String::with_capacity(text.len() + to.len());
++    let mut i = 0usize;
++    while i < bytes.len() {
++        if i + nb.len() <= bytes.len()
++            && &bytes[i..i + nb.len()] == nb
++            && (i == 0 || !is_word(bytes[i - 1]))
++            && (i + nb.len() == bytes.len() || !is_word(bytes[i + nb.len()]))
++        {
++            out.push_str(to);
++            i += nb.len();
++        } else {
++            let ch_len = utf8_char_len(bytes[i]);
++            out.push_str(&text[i..i + ch_len]);
++            i += ch_len;
++        }
++    }
++    out
++}
++
++fn utf8_char_len(b: u8) -> usize {
++    if b < 0x80 {
++        1
++    } else if b >> 5 == 0b110 {
++        2
++    } else if b >> 4 == 0b1110 {
++        3
++    } else if b >> 3 == 0b11110 {
++        4
++    } else {
++        1
++    }
++}
++
+ /// Jump threading through trivial blocks.  A trivial block is a `.L` label
+ /// whose body is exactly one unconditional `jmp X` (nops/directives aside)
+ /// that nothing falls into.  Every branch to the label is retargeted to X
+diff --git a/src/backend/i686/codegen/prologue.rs b/src/backend/i686/codegen/prologue.rs
+index 77d08472..3af81697 100644
+--- a/src/backend/i686/codegen/prologue.rs
++++ b/src/backend/i686/codegen/prologue.rs
+@@ -141,11 +141,37 @@ impl I686Codegen {
+             self.omit_frame_pointer = false;
+         }
+ 
++        // __builtin_frame_address(0) and __builtin_setjmp read %ebp directly;
++        // under -fomit-frame-pointer the register would hold a stale
++        // caller-owned value.  Mirror the has_frame_address veto the x86-64
++        // pipeline applies in backend/generation.rs.
++        // gcc.c-torture execute/frame-address.c caught this: at -O1/-O2 the
++        // noipa helper containing the intrinsic lost its frame pointer while
++        // its caller (holding a dynamic alloca) kept one, so the stack-address
++        // containment check failed and the test aborted.
++        if func.blocks.iter().any(|block| {
++            block.instructions.iter().any(|inst| {
++                matches!(
++                    inst,
++                    crate::ir::reexports::Instruction::Intrinsic {
++                        op: crate::ir::intrinsics::IntrinsicOp::FrameAddress
++                            | crate::ir::intrinsics::IntrinsicOp::BuiltinSetjmp,
++                        ..
++                    }
++                )
++            })
++        }) {
++            self.omit_frame_pointer = false;
++        }
++
+         // Compute named parameter stack bytes for va_start (variadic functions).
+-        if func.is_variadic {
++        {
+             let config = self.call_abi_config();
+             let classification = crate::backend::call_abi::classify_params_full(func, &config);
+-            self.va_named_stack_bytes = classification.total_stack_bytes;
++            self.incoming_stack_arg_bytes = classification.total_stack_bytes as i64;
++            if func.is_variadic {
++                self.va_named_stack_bytes = classification.total_stack_bytes;
++            }
+         }
+ 
+         // Run register allocator before stack space computation.
+@@ -454,6 +480,11 @@ impl I686Codegen {
+             emit!(self.state, "    subl ${}, %esp", frame_size);
+         }
+ 
++        // Post-prologue %esp baseline (ebp-relative), valid in both frame
++        // pointer modes: %esp at esp_adjust==0 equals %ebp minus this value.
++        // DoBuiltinApply uses it to restore %esp after its untracked staging.
++        self.esp_baseline_offset = self.used_callee_saved.len() as i64 * 4 + frame_size;
++
+         if self.omit_frame_pointer {
+             let callee_saved_bytes = self.used_callee_saved.len() as i64 * 4;
+             self.frame_base_offset = callee_saved_bytes + frame_size;
+diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
+index f627e110..0ab6e365 100644
+--- a/src/backend/regalloc.rs
++++ b/src/backend/regalloc.rs
+@@ -1810,7 +1810,23 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+             )
+         })
+     });
++    // __builtin_apply performs an indirect call from inside the intrinsic and
++    // clobbers every argument/caller-saved register plus rax/rdx/xmm0 (resp.
++    // eax/edx on i686).  Register-homed values would be silently invalidated,
++    // so such functions fall back to pure memory allocation.
++    let has_builtin_apply = func.blocks.iter().any(|b| {
++        b.instructions.iter().any(|i| {
++            matches!(
++                i,
++                Instruction::Intrinsic {
++                    op: crate::ir::intrinsics::IntrinsicOp::DoBuiltinApply,
++                    ..
++                }
++            )
++        })
++    });
+     if has_builtin_setjmp
++        || has_builtin_apply
+         || (config.available_regs.is_empty() && config.caller_saved_regs.is_empty())
+     {
+         return RegAllocResult {
+diff --git a/src/backend/stack_layout/slot_assignment.rs b/src/backend/stack_layout/slot_assignment.rs
+index 950facc4..48b40881 100644
+--- a/src/backend/stack_layout/slot_assignment.rs
++++ b/src/backend/stack_layout/slot_assignment.rs
+@@ -16,6 +16,24 @@ use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Terminator
+ 
+ use super::{BlockLocalValue, DeferredSlot, MultiBlockValue, StackLayoutContext};
+ 
++/// Whether `func` contains a `__builtin_setjmp` intrinsic (a returns-twice
++/// function).  Such functions must never rely on liveness models that only
++/// cover the ordinary CFG: the resume edge from any call that longjmps back
++/// into the setjmp frame re-enters the function at the setjmp site.
++pub(crate) fn has_builtin_setjmp(func: &IrFunction) -> bool {
++    func.blocks.iter().any(|block| {
++        block.instructions.iter().any(|inst| {
++            matches!(
++                inst,
++                Instruction::Intrinsic {
++                    op: crate::ir::intrinsics::IntrinsicOp::BuiltinSetjmp,
++                    ..
++                }
++            )
++        })
++    })
++}
++
+ /// Determine if a non-alloca value can be assigned to a block-local pool slot (Tier 3).
+ /// Returns `Some(def_block_idx)` if the value is defined and used only within a
+ /// single block, making it safe to share stack space with values from other blocks.
+@@ -1029,7 +1047,20 @@ pub(super) fn assign_tier2_liveness_packed_slots(
+     // RA-23 makes accumulator homes explicit and the caller quarantines
+     // copy/phi/multi-def webs whose edge semantics are resolved later. Ordinary
+     // SSA values use hole-aware closed-boundary coloring by default.
+-    if !coalesce || std::env::var_os("CCC_NO_TIER2_GRAPH").is_some() {
++    //
++    // Returns-twice functions (__builtin_setjmp) must never use packed slots:
++    // the resume edge from any call that longjmps back into the setjmp frame
++    // is not modeled by the plain-CFG liveness that drives the packing, so a
++    // packed slot can be handed to an unrelated value in another block while
++    // a setjmp-live value still occupies it.  gcc.c-torture
++    // execute/built-in-setjmp.c at -O2 caught exactly this: the "test" string
++    // pointer's slot was reused by the alloca/loop else-branch, so after the
++    // longjmp landed, strcmp compared against a clobbered pointer and the
++    // test aborted.  Fall back to distinct permanent slots instead.
++    if !coalesce
++        || std::env::var_os("CCC_NO_TIER2_GRAPH").is_some()
++        || has_builtin_setjmp(func)
++    {
+         for mbv in multi_block_values {
+             let (slot, new_space) = assign_slot(*non_local_space, mbv.slot_size, 0);
+             state.value_locations.insert(mbv.dest_id, StackSlot(slot));
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index c71c382b..0a616ee6 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -5,7 +5,7 @@ use crate::backend::common::PtrDirective;
+ use crate::backend::inline_asm::emit_inline_asm_common;
+ use crate::backend::regalloc::PhysReg;
+ use crate::backend::state::{CodegenState, StackSlot};
+-use crate::backend::traits::ArchCodegen;
++use crate::backend::traits::{ArchCodegen, MAX_JUMP_TABLE_RANGE, MIN_JUMP_TABLE_CASES, MIN_JUMP_TABLE_DENSITY_PERCENT};
+ use crate::common::fx_hash::{FxHashMap, FxHashSet};
+ use crate::common::types::{AddressSpace, IrType};
+ use crate::delegate_to_impl;
+@@ -620,6 +620,83 @@ pub(super) struct IvsrPointerInfo {
+ }
+ 
+ impl X86Codegen {
++    /// Compare the low 64-bit half of a 128-bit switch value (already in
++    /// %rax) against `case_val` and branch to `label` on equality.  The sign
++    /// class of the case has already been verified against the high half.
++    fn emit_switch_case_branch_128_low(&mut self, case_val: i64, label: &str) {
++        if case_val == 0 {
++            self.state.emit("    testq %rax, %rax");
++        } else if case_val >= i32::MIN as i64 && case_val <= i32::MAX as i64 {
++            self.state
++                .out
++                .emit_instr_imm_reg("    cmpq", case_val, "rax");
++        } else {
++            self.state
++                .out
++                .emit_instr_imm_reg("    movabsq", case_val, "rcx");
++            self.state.emit("    cmpq %rcx, %rax");
++        }
++        self.state.out.emit_jcc_label("    je", label);
++    }
++
++    /// Density-based switch lowering for native-width values: the trait
++    /// default's logic (jump table with PGO case hoisting, or a sparse
++    /// compare chain), reproduced here so the 128-bit path can coexist in
++    /// the override above.
++    fn emit_switch_native(
++        &mut self,
++        val: &Operand,
++        cases: &[(i64, BlockId)],
++        default: &BlockId,
++        ty: IrType,
++    ) {
++        let hint = crate::pgo::take_switch_hint();
++        let force_chain = hint.map(|h| h.force_chain).unwrap_or(false);
++        let use_jump_table = if self.state_ref().no_jump_tables || force_chain {
++            false
++        } else if cases.len() >= MIN_JUMP_TABLE_CASES {
++            let min_val = cases
++                .iter()
++                .map(|&(v, _)| v)
++                .min()
++                .expect("switch must have cases");
++            let max_val = cases
++                .iter()
++                .map(|&(v, _)| v)
++                .max()
++                .expect("switch must have cases");
++            let range_i128 = max_val as i128 - min_val as i128 + 1;
++            let range_ok = range_i128 > 0 && range_i128 <= MAX_JUMP_TABLE_RANGE as i128;
++            range_ok && cases.len() * 100 / (range_i128 as usize) >= MIN_JUMP_TABLE_DENSITY_PERCENT
++        } else {
++            false
++        };
++
++        if use_jump_table {
++            let mut cases2: Vec<(i64, BlockId)> = cases.to_vec();
++            let mut hoist: Option<(i64, BlockId)> = None;
++            if let Some(h) = hint {
++                if let Some((hv, ht)) = h.hot_case {
++                    if let Some(pos) = cases2.iter().position(|&(v, t)| v == hv && t.0 == ht) {
++                        hoist = Some(cases2.remove(pos));
++                    }
++                }
++            }
++            if let Some((hv, ht)) = hoist {
++                self.emit_load_operand(val);
++                self.emit_switch_case_branch(hv, &ht.as_label(), ty);
++            }
++            self.emit_switch_jump_table(val, &cases2, default, ty);
++        } else {
++            self.emit_load_operand(val);
++            for &(case_val, target) in cases {
++                let label = target.as_label();
++                self.emit_switch_case_branch(case_val, &label, ty);
++            }
++            self.emit_branch_to_block(*default);
++        }
++    }
++
+     /// Emit a retpoline-protected indirect CALL through `reg`.
+     ///
+     /// thunk-inline (kernel vDSO: userspace code that cannot reference the
+@@ -4384,6 +4461,66 @@ impl ArchCodegen for X86Codegen {
+         self.emit_retpoline_jump("rax");
+     }
+ 
++    fn emit_switch(
++        &mut self,
++        val: &Operand,
++        cases: &[(i64, BlockId)],
++        default: &BlockId,
++        ty: IrType,
++    ) {
++        // 128-bit switches need an explicit high-half guard: the compare
++        // chain and the jump table below operate on the low 64-bit half only
++        // (%rax), so a case value representable in i64 matches only when the
++        // high half is its sign extension — 0 for non-negative cases, -1 for
++        // negative ones.  Without the guard, ((__int128)1 << 64) matched
++        // `case 0` (gcc.c-torture execute/pr122943.c).
++        if matches!(ty, IrType::I128 | IrType::U128) && !cases.is_empty() {
++            let has_nonneg = cases.iter().any(|&(v, _)| v >= 0);
++            let has_neg = cases.iter().any(|&(v, _)| v < 0);
++            if has_neg && has_nonneg {
++                // Mixed sign classes: two guarded chains.
++                //   high == 0  -> non-negative chain
++                //   high == -1 -> negative chain
++                //   else       -> default
++                self.emit_load_acc_pair(val); // %rax = low, %rdx = high
++                let nonneg_chain = self.state.fresh_label("switch128_nonneg");
++                let neg_chain = self.state.fresh_label("switch128_neg");
++                self.state.out.emit_instr_imm_reg("    cmpq", 0, "rdx");
++                self.state.out.emit_jcc_label("    je", &nonneg_chain);
++                self.state.out.emit_instr_imm_reg("    cmpq", -1, "rdx");
++                self.state.out.emit_jcc_label("    je", &neg_chain);
++                self.emit_branch_to_block(*default);
++                self.state.out.emit_named_label(&nonneg_chain);
++                for &(case_val, target) in cases.iter().filter(|&&(v, _)| v >= 0) {
++                    let label = target.as_label();
++                    self.emit_switch_case_branch_128_low(case_val, &label);
++                }
++                self.emit_branch_to_block(*default);
++                self.state.out.emit_named_label(&neg_chain);
++                for &(case_val, target) in cases.iter().filter(|&&(v, _)| v < 0) {
++                    let label = target.as_label();
++                    self.emit_switch_case_branch_128_low(case_val, &label);
++                }
++                self.emit_branch_to_block(*default);
++            } else {
++                // Single sign class: one guard, then the low-half chain.
++                let required_high: i64 = if has_neg { -1 } else { 0 };
++                self.emit_load_acc_pair(val); // %rax = low, %rdx = high
++                self.state
++                    .out
++                    .emit_instr_imm_reg("    cmpq", required_high, "rdx");
++                self.state.out.emit_jcc_label("    jne", &default.as_label());
++                for &(case_val, target) in cases {
++                    let label = target.as_label();
++                    self.emit_switch_case_branch_128_low(case_val, &label);
++                }
++                self.emit_branch_to_block(*default);
++            }
++            return;
++        }
++        self.emit_switch_native(val, cases, default, ty);
++    }
++
+     fn emit_switch_case_branch(&mut self, case_val: i64, label: &str, ty: IrType) {
+         let use_32bit = matches!(
+             ty,
+diff --git a/src/backend/x86/codegen/intrinsics.rs b/src/backend/x86/codegen/intrinsics.rs
+index 08d744f3..8fdd68be 100644
+--- a/src/backend/x86/codegen/intrinsics.rs
++++ b/src/backend/x86/codegen/intrinsics.rs
+@@ -1016,6 +1016,101 @@ impl X86Codegen {
+                 self.state.emit("    jmp *%rdx");
+                 self.state.reg_cache.invalidate_all();
+             }
++
++            // --- GCC __builtin_apply family ---
++            //
++            // Save-area layout (x86-64 SysV, 184 bytes):
++            //   [0..48)   rdi, rsi, rdx, rcx, r8, r9   (integer argument regs)
++            //   [48]      al                            (SSE vararg count)
++            //   [56..184) xmm0..xmm7                    (SSE argument regs)
++            IntrinsicOp::ApplyArgsAreaSize => {
++                if let Some(d) = dest {
++                    self.state.emit("    movl $184, %eax");
++                    self.store_rax_to(d);
++                }
++            }
++            IntrinsicOp::SaveApplyArgs => {
++                let area_owned: Operand = dest_ptr
++                    .as_ref()
++                    .map(|v| Operand::Value(*v))
++                    .or_else(|| args.first().cloned())
++                    .expect("SaveApplyArgs requires an area pointer");
++                let area_op = &area_owned;
++                // Read-only on the argument registers: no live value is
++                // clobbered (r10/r11 are the reserved call-staging scratch
++                // pair).  movups keeps this correct regardless of the area's
++                // runtime alignment.
++                self.operand_to_reg(area_op, "r10");
++                self.state.emit("    movq %rdi, 0(%r10)");
++                self.state.emit("    movq %rsi, 8(%r10)");
++                self.state.emit("    movq %rdx, 16(%r10)");
++                self.state.emit("    movq %rcx, 24(%r10)");
++                self.state.emit("    movq %r8, 32(%r10)");
++                self.state.emit("    movq %r9, 40(%r10)");
++                self.state.emit("    movb %al, 48(%r10)");
++                self.state.emit("    testb %al, %al");
++                let no_sse = self.state.fresh_label("apply_args_no_sse");
++                self.state.out.emit_jmp_label(&no_sse);
++                for (i, reg) in [
++                    "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
++                ]
++                .iter()
++                .enumerate()
++                {
++                    self.state
++                        .emit_fmt(format_args!("    movups %{}, {}(%r10)", reg, 56 + i * 16));
++                }
++                self.state.out.emit_named_label(&no_sse);
++                self.state.reg_cache.invalidate_acc();
++            }
++            IntrinsicOp::DoBuiltinApply => {
++                // args: [func, save_area, result_area, size (unused: the
++                // SysV protocol is entirely register-passed; `size` is only
++                // meaningful for i686 stack arguments)]
++                let func = args.first().expect("DoBuiltinApply requires func");
++                let area = args.get(1).expect("DoBuiltinApply requires save area");
++                let result = args.get(2).expect("DoBuiltinApply requires result area");
++                self.operand_to_reg(area, "r10");
++                self.operand_to_reg(func, "r11");
++                self.state.emit("    movq 0(%r10), %rdi");
++                self.state.emit("    movq 8(%r10), %rsi");
++                self.state.emit("    movq 16(%r10), %rdx");
++                self.state.emit("    movq 24(%r10), %rcx");
++                self.state.emit("    movq 32(%r10), %r8");
++                self.state.emit("    movq 40(%r10), %r9");
++                // al must hold the SSE argument count for the callee's
++                // varargs register-save prologue, whether or not it uses it.
++                self.state.emit("    movzbl 48(%r10), %eax");
++                self.state.emit("    testb %al, %al");
++                let no_sse = self.state.fresh_label("apply_no_sse");
++                self.state.out.emit_jmp_label(&no_sse);
++                for (i, reg) in [
++                    "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
++                ]
++                .iter()
++                .enumerate()
++                {
++                    self.state
++                        .emit_fmt(format_args!("    movups {}(%r10), %{}", 56 + i * 16, reg));
++                }
++                self.state.out.emit_named_label(&no_sse);
++                self.state.emit("    call *%r11");
++                // Capture the return value: result[0]=rax, result[8]=rdx,
++                // result[16]=xmm0 (movups: alignment-agnostic).
++                self.operand_to_reg(result, "r10");
++                self.state.emit("    movq %rax, 0(%r10)");
++                self.state.emit("    movq %rdx, 8(%r10)");
++                self.state.emit("    movups %xmm0, 16(%r10)");
++                self.state.reg_cache.invalidate_all();
++            }
++            IntrinsicOp::RestoreApplyResult => {
++                let block = args.first().expect("RestoreApplyResult requires a block");
++                self.operand_to_reg(block, "r10");
++                self.state.emit("    movq 0(%r10), %rax");
++                self.state.emit("    movq 8(%r10), %rdx");
++                self.state.emit("    movups 16(%r10), %xmm0");
++                self.state.reg_cache.invalidate_acc();
++            }
+             IntrinsicOp::FrameAddress => {
+                 // __builtin_frame_address(0): return current frame pointer (rbp)
+                 self.state.emit("    movq %rbp, %rax");
+diff --git a/src/backend/x86/codegen/peephole/passes/local_patterns.rs b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+index b110ae36..056cfbc9 100644
+--- a/src/backend/x86/codegen/peephole/passes/local_patterns.rs
++++ b/src/backend/x86/codegen/peephole/passes/local_patterns.rs
+@@ -851,9 +851,66 @@ pub(super) fn eliminate_dead_sign_extensions(
+                         size,
+                     } => {
+                         // Narrow store persists only the low bits: the cltq
+-                        // upper half is discarded by the store itself.
++                        // upper half is discarded by the store itself — BUT
++                        // only if no later full-width %rax consumer observes
++                        // the extended bits before %rax is rewritten.
++                        // `cltq; movl %eax,M; movq %rax,N; cmpq N(%rbp),%rax`
++                        // (the add_overflow truncate/extend round-trip,
++                        // gcc.c-torture execute/pr122943.c) previously
++                        // eliminated the cltq on the narrow store alone,
++                        // leaving the stale wide value in the full-width
++                        // store's slot.
+                         if !matches!(size, MoveSize::Q) {
+-                            can_eliminate = true;
++                            let mut k2 = j + 1;
++                            let mut narrow_only = true;
++                            let mut scans2 = 0usize;
++                            while k2 < len && scans2 < 64 {
++                                scans2 += 1;
++                                if infos[k2].is_nop() {
++                                    k2 += 1;
++                                    continue;
++                                }
++                                if infos[k2].is_barrier() {
++                                    // Conservative: the extension may escape.
++                                    narrow_only = false;
++                                    break;
++                                }
++                                match infos[k2].kind {
++                                    // Full-width store of %rax observes the
++                                    // extended upper half.
++                                    LineKind::StoreRbp {
++                                        reg: 0,
++                                        size: MoveSize::Q,
++                                        ..
++                                    } => {
++                                        narrow_only = false;
++                                        break;
 +                                    }
-                                     if std::arch::is_x86_feature_detected!("movbe") {
-                                         self.enable_movbe = true;
-                                     }
-diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
-index 28caceb1..f04b6a4f 100644
---- a/src/driver/pipeline.rs
-+++ b/src/driver/pipeline.rs
-@@ -173,6 +173,7 @@ pub struct Driver {
-     pub(super) enable_bmi: bool,
-     pub(super) enable_bmi2: bool,
-     pub(super) enable_lzcnt: bool,
-+    pub(super) enable_popcnt: bool,
-     pub(super) enable_movbe: bool,
-     pub(super) enable_rdrnd: bool,
-     // AVX-512 family (accepted for -march/-m flag completeness; the backend
-@@ -441,6 +442,7 @@ impl Driver {
-             enable_bmi: false,
-             enable_bmi2: false,
-             enable_lzcnt: false,
-+            enable_popcnt: false,
-             enable_movbe: false,
-             enable_rdrnd: false,
-             enable_avx512f: false,
-@@ -2021,6 +2023,8 @@ impl Driver {
-             code_model_kernel: self.code_model_kernel,
-             no_jump_tables: self.no_jump_tables,
-             bmi1: self.enable_bmi,
-+            lzcnt: self.enable_lzcnt,
-+            popcnt: self.enable_popcnt,
-             avx2: self.enable_avx2,
-             avx512: self.enable_avx512f,
-             no_relax: self.riscv_no_relax,
-diff --git a/tests/regression/check_clz_ctz_target_isa.sh b/tests/regression/check_clz_ctz_target_isa.sh
-new file mode 100755
-index 00000000..14010835
---- /dev/null
-+++ b/tests/regression/check_clz_ctz_target_isa.sh
-@@ -0,0 +1,67 @@
-+#!/usr/bin/env bash
-+# Emission gate for the bit-manipulation ISA contract:
-+#   - default / -march=x86-64 / -march=x86-64-v1  -> NO lzcnt/tzcnt/popcnt
-+#     (they are v2/v3 features; F3-prefixed LZCNT/TZCNT decode as BSR/BSF
-+#     on non-ABM CPUs and silently return inverted counts — the exact bug
-+#     that aborted the lccc-built preboot ZSTD decoder on QEMU's qemu64)
-+#   - -march=x86-64-v2                             -> popcnt only
-+#   - -mlzcnt -mpopcnt / -march=x86-64-v3          -> all three
-+# The runtime semantics themselves are covered differentially by
-+# clz_ctz_popcount_target_isa.c; this script pins the INSTRUCTION choice.
-+set -euo pipefail
-+
-+repo=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
-+ccc=${CCC:-$repo/target/fastbuild/lccc}
-+src=$repo/tests/regression/clz_ctz_popcount_target_isa.c
-+inc=${GCC_INC:-$(gcc -print-file-name=include)}
-+tmp=$(mktemp -d)
-+trap 'rm -rf "$tmp"' EXIT
-+
-+emit() { # emit <label> <flags...>
-+    local label=$1; shift
-+    "$ccc" -O2 "$@" -I"$inc" -S "$src" -o "$tmp/$label.s"
-+}
-+
-+count() { grep -cE '\b(lzcnt|tzcnt)[bwlq]?\b' "$1" || true; }
-+countpop() { grep -cE '\bpopcnt[bwlq]?\b' "$1" || true; }
-+countbsr() { grep -cE '\bbsr[bwlq]?\b|\bbsf[bwlq]?\b' "$1" || true; }
-+
-+fail=0
-+check() { # check <desc> <actual> <expected>
-+    local desc=$1
-+    if [[ "$2" != "$3" ]]; then
-+        echo "FAIL: $desc — got '$2', want '$3'" >&2
-+        fail=1
-+    fi
-+}
-+
-+for cfg in default "march-x86-64" "march-v1"; do
-+    case $cfg in
-+        default)      emit default ;;
-+        march-x86-64) emit march-x86-64 -march=x86-64 ;;
-+        march-v1)     emit march-v1 -march=x86-64-v1 ;;
-+    esac
-+    d=$tmp/$cfg.s
-+    check "$cfg lzcnt/tzcnt emission" "$(count $d)" 0
-+    check "$cfg popcnt emission" "$(countpop $d)" 0
-+    # the baseline fallback must actually be BSR/BSF-based, not nothing
-+    if [[ "$(countbsr $d)" -eq 0 ]]; then
-+        echo "FAIL: $cfg produced neither lzcnt nor bsr/bsf — lowering missing" >&2
-+        fail=1
-+    fi
-+done
-+
-+emit v2 -march=x86-64-v2
-+check "v2 lzcnt/tzcnt emission" "$(count $tmp/v2.s)" 0
-+[[ "$(countpop $tmp/v2.s)" -gt 0 ]] || { echo "FAIL: v2 did not enable popcnt" >&2; fail=1; }
-+
-+emit v3 -march=x86-64-v3
-+[[ "$(count $tmp/v3.s)" -gt 0 ]] || { echo "FAIL: v3 did not enable lzcnt" >&2; fail=1; }
-+[[ "$(countpop $tmp/v3.s)" -gt 0 ]] || { echo "FAIL: v3 did not enable popcnt" >&2; fail=1; }
-+
-+emit explicit -mlzcnt -mpopcnt
-+[[ "$(count $tmp/explicit.s)" -gt 0 ]] || { echo "FAIL: -mlzcnt ignored" >&2; fail=1; }
-+[[ "$(countpop $tmp/explicit.s)" -gt 0 ]] || { echo "FAIL: -mpopcnt ignored" >&2; fail=1; }
-+
-+if [[ $fail -ne 0 ]]; then exit 1; fi
-+echo "clz/ctz/popcount ISA emission gates: PASS"
-diff --git a/tests/regression/clz_ctz_popcount_target_isa.c b/tests/regression/clz_ctz_popcount_target_isa.c
++                                    // %eax-only store: upper half still stale.
++                                    LineKind::StoreRbp { reg: 0, .. } => {
++                                        k2 += 1;
++                                        continue;
++                                    }
++                                    // Anything that REWRITES %rax makes the
++                                    // stale extension irrelevant.
++                                    LineKind::LoadRbp { reg: 0, .. }
++                                    | LineKind::Other { dest_reg: 0 } => break,
++                                    // Any other %rax reference (e.g. a 64-bit
++                                    // `cmpq M(%rbp), %rax` or `movq %rax, %rX`)
++                                    // may observe the upper half.
++                                    _ => {
++                                        if infos[k2].reg_refs & 1 != 0 {
++                                            narrow_only = false;
++                                            break;
++                                        }
++                                        k2 += 1;
++                                        continue;
++                                    }
++                                }
++                            }
++                            if narrow_only {
++                                can_eliminate = true;
++                            }
+                             break;
+                         }
+                         let mut k = j + 1;
+diff --git a/src/frontend/sema/builtins.rs b/src/frontend/sema/builtins.rs
+index ed0ab1ea..1780f056 100644
+--- a/src/frontend/sema/builtins.rs
++++ b/src/frontend/sema/builtins.rs
+@@ -237,6 +237,18 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
+         "__builtin_longjmp",
+         BuiltinInfo::intrinsic(BuiltinIntrinsic::BuiltinLongjmp),
+     );
++    m.insert(
++        "__builtin_apply_args",
++        BuiltinInfo::intrinsic(BuiltinIntrinsic::ApplyArgs),
++    );
++    m.insert(
++        "__builtin_apply",
++        BuiltinInfo::intrinsic(BuiltinIntrinsic::Apply),
++    );
++    m.insert(
++        "__builtin_return",
++        BuiltinInfo::intrinsic(BuiltinIntrinsic::BuiltinReturn),
++    );
+     m.insert("__builtin_extract_return_addr", BuiltinInfo::identity());
+     m.insert(
+         "__builtin_thread_pointer",
+@@ -2914,6 +2926,12 @@ pub enum BuiltinIntrinsic {
+     BuiltinSetjmp,
+     /// __builtin_longjmp(buffer, 1) -> non-local transfer.
+     BuiltinLongjmp,
++    /// __builtin_apply_args() -> void* save area with the incoming arguments.
++    ApplyArgs,
++    /// __builtin_apply(func, args, size) -> void* result block.
++    Apply,
++    /// __builtin_return(block) -> returns from the current function.
++    BuiltinReturn,
+     /// __builtin_ia32_rdtsc() - 64-bit timestamp counter
+     X86Rdtsc,
+     /// __builtin_ia32_rdtscp(&aux) - rdtscp with aux store
+diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
+index 518bf3b1..6c4d3fa1 100644
+--- a/src/ir/intrinsics.rs
++++ b/src/ir/intrinsics.rs
+@@ -84,6 +84,24 @@ pub enum IntrinsicOp {
+     BuiltinSetjmp,
+     /// GCC's local-frame longjmp primitive. Args: user buffer pointer, value.
+     BuiltinLongjmp,
++    /// __builtin_apply_args support: emits the target-specific save-area size
++    /// in bytes (x86-64: 6 int arg regs + al + 8 XMM arg regs = 184; i686:
++    /// 16-byte incoming-register block + the caller's stack argument area).
++    /// dest = size in bytes.
++    ApplyArgsAreaSize,
++    /// __builtin_apply_args(): snapshot the incoming argument registers (and
++    /// on i686 the caller's stack argument area) into the save area.
++    /// dest_ptr = save area.  Reads arg registers; writes only the area.
++    SaveApplyArgs,
++    /// __builtin_apply(func, args, size): restore argument registers from the
++    /// save area (i686: re-stage `size` bytes of stack arguments), perform the
++    /// indirect call, and capture the result into the result area.
++    /// Args: [func_ptr, save_area, result_area, size].
++    DoBuiltinApply,
++    /// __builtin_return(block): load the current function's return value from
++    /// the result block produced by __builtin_apply and return.
++    /// Args: [result_area].  Terminates the block.
++    RestoreApplyResult,
+     /// __builtin_thread_pointer() - returns thread pointer (TLS base address)
+     ThreadPointer,
+     /// Scalar square root: sqrtsd/sqrtss on x86, fsqrt on ARM/RISC-V
+diff --git a/src/ir/lowering/expr_builtins.rs b/src/ir/lowering/expr_builtins.rs
+index 114adb35..0f9fa333 100644
+--- a/src/ir/lowering/expr_builtins.rs
++++ b/src/ir/lowering/expr_builtins.rs
+@@ -898,6 +898,102 @@ impl Lowerer {
+                 });
+                 Some(Operand::Value(dest))
+             }
++            BuiltinIntrinsic::ApplyArgs => {
++                // __builtin_apply_args():
++                //   1. area_size = Intrinsic{ApplyArgsAreaSize} (target-specific
++                //      constant computed by the backend, which knows the
++                //      incoming argument classification)
++                //   2. area = DynAlloca(area_size, align=16) — survives across
++                //      calls (it lives inside our own frame) and forces a
++                //      frame pointer, which the i686 save arm relies on.
++                //   3. Intrinsic{SaveApplyArgs, dest_ptr: area}
++                // The result is the area pointer, valid as __builtin_apply's
++                // second argument.
++                let size_val = self.fresh_value();
++                self.emit(Instruction::Intrinsic {
++                    dest: Some(size_val),
++                    op: IntrinsicOp::ApplyArgsAreaSize,
++                    dest_ptr: None,
++                    args: Vec::new(),
++                });
++                let area = self.fresh_value();
++                self.emit(Instruction::DynAlloca {
++                    dest: area,
++                    size: Operand::Value(size_val),
++                    align: 16,
++                });
++                self.emit(Instruction::Intrinsic {
++                    dest: None,
++                    op: IntrinsicOp::SaveApplyArgs,
++                    dest_ptr: Some(area),
++                    args: vec![Operand::Value(area)],
++                });
++                Some(Operand::Value(area))
++            }
++            BuiltinIntrinsic::Apply => {
++                // __builtin_apply(func, args, size):
++                //   result = DynAlloca(APPLY_RESULT_SIZE, align=16)
++                //   Intrinsic{DoBuiltinApply, args: [func, args, result, size]}
++                // The backend restores the argument registers from the save
++                // area (i686 additionally re-stages `size` bytes of stack
++                // arguments), performs the indirect call, and captures the
++                // return value (rax/rdx/xmm0 resp. eax/edx) into the result
++                // area.  The result area pointer is __builtin_apply's return
++                // value (consumed by __builtin_return).
++                let func = args
++                    .first()
++                    .map(|arg| self.lower_expr(arg))
++                    .unwrap_or(Operand::Const(IrConst::I64(0)));
++                let save_area = args
++                    .get(1)
++                    .map(|arg| self.lower_expr(arg))
++                    .unwrap_or(Operand::Const(IrConst::I64(0)));
++                let size = args
++                    .get(2)
++                    .map(|arg| self.lower_expr(arg))
++                    .unwrap_or(Operand::Const(IrConst::I64(0)));
++                let result = self.fresh_value();
++                // Result block: x86-64 stores rax(8) + rdx(8) + xmm0(16);
++                // i686 stores eax(4) + edx(4).  A uniform 32 bytes keeps the
++                // lowering target-independent.
++                self.emit(Instruction::DynAlloca {
++                    dest: result,
++                    size: Operand::Const(IrConst::I64(32)),
++                    align: 16,
++                });
++                self.emit(Instruction::Intrinsic {
++                    dest: None,
++                    op: IntrinsicOp::DoBuiltinApply,
++                    dest_ptr: None,
++                    args: vec![
++                        func,
++                        save_area,
++                        Operand::Value(result),
++                        size,
++                    ],
++                });
++                Some(Operand::Value(result))
++            }
++            BuiltinIntrinsic::BuiltinReturn => {
++                // __builtin_return(block): restore the return registers from
++                // the block, then return from the current function.  Code
++                // after the builtin is unreachable; start a dead block like
++                // __builtin_unreachable does.
++                let block = args
++                    .first()
++                    .map(|arg| self.lower_expr(arg))
++                    .unwrap_or(Operand::Const(IrConst::I64(0)));
++                self.emit(Instruction::Intrinsic {
++                    dest: None,
++                    op: IntrinsicOp::RestoreApplyResult,
++                    dest_ptr: None,
++                    args: vec![block],
++                });
++                self.terminate(Terminator::Return(None));
++                let dead_label = self.fresh_label();
++                self.start_block(dead_label);
++                Some(Operand::Const(IrConst::I64(0)))
++            }
+             BuiltinIntrinsic::BuiltinLongjmp => {
+                 let buffer = args
+                     .first()
+diff --git a/src/passes/ip_purity.rs b/src/passes/ip_purity.rs
+index f5decdf5..beb0384e 100644
+--- a/src/passes/ip_purity.rs
++++ b/src/passes/ip_purity.rs
+@@ -273,6 +273,25 @@ fn analyze_function_purity(
+                 | Instruction::StackRestore { .. } => {
+                     return (false, false);
+                 }
++                // Non-local control flow intrinsics: __builtin_setjmp returns
++                // twice and __builtin_longjmp never returns.  Classifying them
++                // as purity-neutral let DCE delete the very calls that perform
++                // the longjmp (gcc.c-torture execute/pr60003.c at -O1/-O2,
++                // where foo's `while (1) { a = 1; bar (); }` loop collapsed to
++                // an empty infinite loop).  They must be treated exactly like
++                // NonlocalGoto: neither pure nor const.
++                Instruction::Intrinsic { op, .. }
++                    if matches!(
++                        op,
++                        crate::ir::intrinsics::IntrinsicOp::BuiltinSetjmp
++                            | crate::ir::intrinsics::IntrinsicOp::BuiltinLongjmp
++                            | crate::ir::intrinsics::IntrinsicOp::SaveApplyArgs
++                            | crate::ir::intrinsics::IntrinsicOp::DoBuiltinApply
++                            | crate::ir::intrinsics::IntrinsicOp::RestoreApplyResult
++                    ) =>
++                {
++                    return (false, false);
++                }
+                 // Pure value computations / addressing
+                 Instruction::Alloca { .. }
+                 | Instruction::BinOp { .. }
+diff --git a/tests/regression/add_overflow_roundtrip.c b/tests/regression/add_overflow_roundtrip.c
 new file mode 100644
-index 00000000..364ca8c6
+index 00000000..dd17474f
 --- /dev/null
-+++ b/tests/regression/clz_ctz_popcount_target_isa.c
-@@ -0,0 +1,69 @@
-+/*
-+ * clz/ctz/popcount must respect the TARGET ISA contract, not the build
-+ * host's. LZCNT/TZCNT/POPCNT are x86-64-v2/v3 features; the baseline
-+ * (v1) fallbacks must produce identical results to the native paths,
-+ * including the defined-at-zero semantics the IR guarantees
-+ * (Clz(0)/Ctz(0) == width for 32/64-bit operands via constant folding).
-+ *
-+ * Differential vs GCC over edge patterns; every value printed was chosen
-+ * to expose the BSR-vs-LZCNT decode difference on non-ABM CPUs:
-+ * bit-31-set words (bsr gives 31, lzcnt gives 0) and the zero word
-+ * (BSR/BSF leave the destination undefined; the fallback must fix it).
-+ */
-+#include <stdio.h>
++++ b/tests/regression/add_overflow_roundtrip.c
+@@ -0,0 +1,40 @@
++/* __builtin_add_overflow: the truncate/extend-back round-trip must observe
++ * the truncated value, not the stale wide accumulator.  The peephole's
++ * dead-sign-extension pass used to delete the cltq feeding the full-width
++ * store of the extended-back value (it saw only the preceding narrow
++ * movl %eax store), so the Ne compare compared the wide value against
++ * itself and overflow was never reported.  Cases: constant and variable
++ * wide operands, result narrower than the mathematical sum. */
++extern void abort(void);
 +
-+static int clz32(unsigned x) { return __builtin_clz(x); }
-+static int ctz32(unsigned x) { return __builtin_ctz(x); }
-+static int clz64(unsigned long x) { return __builtin_clzl(x); }
-+static int ctz64(unsigned long x) { return __builtin_ctzl(x); }
-+static int pc32(unsigned x) { return __builtin_popcount(x); }
-+static int pc64(unsigned long x) { return __builtin_popcountl(x); }
++int u, v;
 +
-+static unsigned long long mix(unsigned long long h, unsigned long long v)
++__attribute__((noipa)) static int ov_const(void)
 +{
-+	return (h ^ v) * 0x9e3779b97f4a7c15ULL + 0x2545f4914f6cdd1dULL;
++  /* 8719476735 does not fit int: overflow must be reported */
++  return __builtin_add_overflow(8719476735LL, u, &v);
++}
++
++__attribute__((noipa)) static int ov_var(long long w)
++{
++  return __builtin_add_overflow(w, u, &v);
++}
++
++__attribute__((noipa)) static int ov_fit(void)
++{
++  /* 2147483647 + 0 fits int exactly: no overflow */
++  return __builtin_add_overflow(2147483647LL, u, &v);
 +}
 +
 +int main(void)
 +{
-+	unsigned long long h = 1469598103934665603ULL;
-+	/* Word patterns that differ between BSR and LZCNT semantics. */
-+	static const unsigned w32[] = {
-+		0x00000001u, 0x00000008u, 0x0000ffffu, 0x00010000u,
-+		0x7fffffffu, 0x80000000u, 0x80000001u, 0xaaaaaaaau,
-+		0x55555555u, 0xfffffffeu, 0xffffffffu,
-+	};
-+	static const unsigned long w64[] = {
-+		0x0000000000000001ul, 0x0000000100000000ul, 0x00000000fffffffful,
-+		0xffffffff00000000ul, 0x8000000000000000ul, 0x7ffffffffffffffful,
-+		0xaaaaaaaaaaaaaaaaul, 0x5555555555555555ul, 0xfffffffffffffffeul,
-+		0xfffffffffffffffful,
-+	};
-+
-+	for (unsigned i = 0; i < sizeof(w32) / sizeof(w32[0]); i++) {
-+		unsigned x = w32[i];
-+		h = mix(h, (unsigned long)clz32(x));
-+		h = mix(h, (unsigned long)ctz32(x));
-+		h = mix(h, (unsigned)pc32(x));
-+		/* rotate one bit to vary low bits across patterns */
-+		x = (x << 1) | (x >> 31);
-+		h = mix(h, (unsigned long)clz32(x));
-+		h = mix(h, (unsigned long)ctz32(x));
-+		h = mix(h, (unsigned)pc32(x));
-+	}
-+	for (unsigned i = 0; i < sizeof(w64) / sizeof(w64[0]); i++) {
-+		unsigned long x = w64[i];
-+		h = mix(h, (unsigned long)clz64(x));
-+		h = mix(h, (unsigned long)ctz64(x));
-+		h = mix(h, (unsigned)pc64(x));
-+	}
-+	/* NOTE: zero inputs are deliberately NOT hashed — gcc treats
-+	 * __builtin_clz(0)/ctz(0) as UB and constant-folds them to values
-+	 * that differ from lccc's defined Clz(0)/Ctz(0) == width contract.
-+	 * The defined-zero semantics are pinned by the compiler's own
-+	 * constant folder and the emission checks, not by this differential
-+	 * (which must stay meaningful under gcc). */
-+
-+	printf("%016llx\n", h);
-+	return 0;
++  if (ov_const() != 1)
++    abort();
++  if (ov_var(8719476735LL) != 1)
++    abort();
++  if (ov_var(2147483647LL) != 0)
++    abort();
++  if (ov_fit() != 0)
++    abort();
++  return 0;
 +}
+diff --git a/tests/regression/builtin_apply_return.c b/tests/regression/builtin_apply_return.c
+new file mode 100644
+index 00000000..d9672fc1
+--- /dev/null
++++ b/tests/regression/builtin_apply_return.c
+@@ -0,0 +1,37 @@
++/* __builtin_apply/__builtin_apply_args/__builtin_return: the forwarding
++ * triangle.  apply_args snapshots the current function's incoming arguments
++ * (integer registers + al + XMM argument registers on x86-64; the register
++ * block plus the caller's stack argument area on i686), apply re-delivers
++ * them to the target and captures its return value into a result block, and
++ * builtin_return returns that value from the current function.  A correct
++ * implementation makes forward() behave exactly like add3().  (Modeled on
++ * gcc.c-torture execute/pr47237.c plus the value-returning path.) */
++extern void abort(void);
++
++static int add3(int a, int b, int c)
++{
++  return a + b * 2 + c * 3;
++}
++
++static int forward(int a, int b, int c)
++{
++  void *r = __builtin_apply(add3, __builtin_apply_args(), 24);
++  __builtin_return(r);
++}
++
++static int forward_zero(int a, int b, int c)
++{
++  void *r = __builtin_apply(add3, __builtin_apply_args(), 24);
++  __builtin_return(r);
++}
++
++int main(void)
++{
++  if (forward(5, 6, 7) != 38)
++    abort();
++  if (forward(1, 0, 0) != 1)
++    abort();
++  if (forward_zero(-3, 4, 10) != -3 + 8 + 30)
++    abort();
++  return 0;
++}
+diff --git a/tests/regression/builtin_setjmp_longjmp_dce.c b/tests/regression/builtin_setjmp_longjmp_dce.c
+new file mode 100644
+index 00000000..152e0d00
+--- /dev/null
++++ b/tests/regression/builtin_setjmp_longjmp_dce.c
+@@ -0,0 +1,53 @@
++/* __builtin_setjmp is returns-twice and __builtin_longjmp never returns.
++ * Interprocedural purity analysis must classify both intrinsics as effectful:
++ * when it treated them as purity-neutral, DCE deleted the call chain that
++ * performs the longjmp, `a = 1` became dead relative to a deleted call, and
++ * the function collapsed to an empty infinite loop (gcc.c-torture
++ * execute/pr60003.c at -O1/-O2).  A correct build reaches the resume path
++ * with `a = 1` still observable and returns x. */
++extern void abort(void);
++
++unsigned long long jmp_buf[5];
++
++__attribute__((noinline, noclone)) void
++baz (void)
++{
++  __builtin_longjmp (&jmp_buf, 1);
++}
++
++__attribute__((noinline, noclone)) void
++bar (void)
++{
++  baz ();
++}
++
++__attribute__((noinline, noclone)) int
++foo (int x)
++{
++  int a = 0;
++
++  if (__builtin_setjmp (&jmp_buf) == 0)
++    {
++      while (1)
++	{
++	  a = 1;
++	  bar ();
++	}
++    }
++  else
++    {
++      if (a == 0)
++	return 0;
++      else
++	return x;
++    }
++}
++
++int
++main ()
++{
++  if (foo (1) == 0)
++    abort ();
++
++  return 0;
++}
+diff --git a/tests/regression/builtin_setjmp_longjmp_dce.flags b/tests/regression/builtin_setjmp_longjmp_dce.flags
+new file mode 100644
+index 00000000..3a3b5796
+--- /dev/null
++++ b/tests/regression/builtin_setjmp_longjmp_dce.flags
+@@ -0,0 +1 @@
++-O2
+diff --git a/tests/regression/builtin_setjmp_slot_reuse.c b/tests/regression/builtin_setjmp_slot_reuse.c
+new file mode 100644
+index 00000000..c213e16d
+--- /dev/null
++++ b/tests/regression/builtin_setjmp_slot_reuse.c
+@@ -0,0 +1,44 @@
++/* Values defined before __builtin_setjmp and consumed on the resume path must
++ * keep their stack slots: returns-twice functions may not pack stack slots by
++ * plain-CFG liveness, because the resume edge from any call that longjmps is
++ * invisible to that liveness.  At -O2 the tier-2 liveness packing handed the
++ * .rodata "test" pointer's slot to the else-branch's loop bookkeeping value,
++ * so after the longjmp landed strcmp compared against a clobbered pointer and
++ * the test aborted (gcc.c-torture execute/built-in-setjmp.c). */
++#include <stdlib.h>
++#include <string.h>
++
++void *buf[20];
++
++__attribute__((noinline)) void
++sub2 (void)
++{
++  __builtin_longjmp (buf, 1);
++}
++
++int
++main ()
++{
++  char *p = (char *) __builtin_alloca (20);
++
++  strcpy (p, "test");
++
++  if (__builtin_setjmp (buf))
++    {
++      if (strcmp (p, "test") != 0)
++	abort ();
++
++      exit (0);
++    }
++
++  {
++    int *q = (int *) __builtin_alloca (p[2] * sizeof (int));
++    int i;
++
++    for (i = 0; i < p[2]; i++)
++      q[i] = 0;
++
++    while (1)
++      sub2 ();
++  }
++}
+diff --git a/tests/regression/builtin_setjmp_slot_reuse.flags b/tests/regression/builtin_setjmp_slot_reuse.flags
+new file mode 100644
+index 00000000..3a3b5796
+--- /dev/null
++++ b/tests/regression/builtin_setjmp_slot_reuse.flags
+@@ -0,0 +1 @@
++-O2
+diff --git a/tests/regression/switch_i128_high_half.c b/tests/regression/switch_i128_high_half.c
+new file mode 100644
+index 00000000..5385fc53
+--- /dev/null
++++ b/tests/regression/switch_i128_high_half.c
+@@ -0,0 +1,64 @@
++/* 128-bit switch: a case value representable in i64 matches only when the
++ * high half of the switch expression is the sign extension of that case
++ * value (0 for non-negative cases, -1 for negative ones).  The compare
++ * chain operates on the low 64-bit half, so ((__int128)1 << 64) must NOT
++ * match `case 0` (gcc.c-torture execute/pr122943.c). */
++extern void abort(void);
++
++__attribute__((noipa)) static unsigned char baz(__int128 val)
++{
++  unsigned char result = 0;
++  switch (val)
++    {
++    case 0: result = 1; break;
++    case 1: result = 2; break;
++    case 2: result = 3; break;
++    default: break;
++    }
++  return result;
++}
++
++__attribute__((noipa)) static unsigned char mixed(__int128 val)
++{
++  unsigned char result = 0;
++  switch (val)
++    {
++    case -1: result = 1; break;
++    case 1: result = 2; break;
++    case 2: result = 3; break;
++    default: break;
++    }
++  return result;
++}
++
++int main(void)
++{
++  __int128 one_shift_64 = (__int128)1 << 64;
++  if (baz(0) != 1)
++    abort();
++  if (baz(1) != 2)
++    abort();
++  if (baz(2) != 3)
++    abort();
++  if (baz(-1) != 0)
++    abort();
++  if (baz(one_shift_64) != 0)
++    abort();
++  if (baz(-one_shift_64) != 0)
++    abort();
++  if (baz(((__int128)1 << 64) + 1) != 0)
++    abort();
++  if (baz(((__int128)-1 << 64) | 1) != 0) /* high=-1, low=1: no case */
++    abort();
++  if (mixed(-1) != 1)
++    abort();
++  if (mixed(1) != 2)
++    abort();
++  if (mixed(2) != 3)
++    abort();
++  if (mixed(one_shift_64) != 0)
++    abort();
++  if (mixed(0) != 0)
++    abort();
++  return 0;
++}
+diff --git a/tests/regression/switch_i128_high_half.env b/tests/regression/switch_i128_high_half.env
+new file mode 100644
+index 00000000..302f3e0a
+--- /dev/null
++++ b/tests/regression/switch_i128_high_half.env
+@@ -0,0 +1,5 @@
++# GCC 14.2 -O2 miscompiles 128-bit switch compare chains (upstream
++# PR122943 was filed against exactly this area; the torture harness
++# reference-runs pr122943.c at -O2 and aborts 20/20).  The oracle cannot
++# validate this pin; lccc-only semantics.
++LCCC_NO_COMPARE=1
