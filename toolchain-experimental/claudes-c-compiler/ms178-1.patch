@@ -1,84 +1,141 @@
-diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
-index 14edc114..8a3d1234 100644
---- a/src/backend/regalloc.rs
-+++ b/src/backend/regalloc.rs
-@@ -1549,6 +1549,7 @@ fn build_coalesce_groups(
-     // soundness anchor: with anything between s's def and the copy, a use
-     // of V's OLD incarnation could sit inside s's live range.
-     let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
-+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
-     let mut copy_dests: FxHashSet<u32> = FxHashSet::default();
-     for block in &func.blocks {
-         for inst in &block.instructions {
-@@ -1558,7 +1559,13 @@ fn build_coalesce_groups(
-             if let Instruction::Copy { dest, .. } = inst {
-                 copy_dests.insert(dest.0);
-             }
-+            inst.for_each_used_value(|u| {
-+                *use_count.entry(u).or_insert(0) += 1;
-+            });
-         }
-+        block
-+            .terminator
-+            .for_each_used_value(|u| *use_count.entry(u).or_insert(0) += 1);
-     }
-     let latch_dests: FxHashSet<u32> = copy_dests
-         .into_iter()
-@@ -1578,7 +1585,23 @@ fn build_coalesce_groups(
-                 {
-                     if latch_dests.contains(&d.0) {
-                         if let Some(pd) = prev.dest() {
--                            if pd.0 == s.0 {
-+                            // The latch-same-value relaxation is only sound when
-+                            // the source `s` is single-use and therefore dies at
-+                            // this copy. If `s` has another use later (e.g. a
-+                            // loop-invariant like a bound operand that is re-used
-+                            // in the loop header), then `s` is live across the
-+                            // latch copy and holds a DIFFERENT value than `d`
-+                            // after `d` is redefined — coalescing them lets the
-+                            // latch redefinition corrupt `s` (the HUF rankVal
-+                            // loop's `minBits` operand is exactly this shape and
-+                            // previously turned the outer-loop bound into a
-+                            // `consumed`-dependent value, running the loop one
-+                            // iteration short and leaving the HUF DTable half
-+                            // built, which made zstd's 4X2 HUF fast loop spin
-+                            // forever on a zeroed table slot). Requiring
-+                            // use_count == 1 restores the "s dies at the copy"
-+                            // invariant.
-+                            if pd.0 == s.0 && use_count.get(&s.0).copied().unwrap_or(0) == 1 {
-                                 latch_same_value.insert((d.0, s.0));
-                             }
-                         }
-diff --git a/src/passes/narrow.rs b/src/passes/narrow.rs
-index a0fd445d..4872f142 100644
---- a/src/passes/narrow.rs
-+++ b/src/passes/narrow.rs
-@@ -721,19 +721,24 @@ fn narrow_binops_without_cast(
-                     operand_narrow_type(lhs, &load_type_map, widen_map, narrowed_map);
-                 let rhs_narrow_ty =
-                     operand_narrow_type(rhs, &load_type_map, widen_map, narrowed_map);
-+                // Keep the narrowed operand's signedness aligned with the
-+                // original 64-bit BinOp type. Picking the "other" 32-bit
-+                // signedness can change the value when widened back to 64 bits
-+                // (sign-extend vs zero-extend) even when low bits match
-+                // (Regehr yarpgen fix 4d9913e7).
-+                let op_narrow_ty = if *ty == IrType::I64 { IrType::I32 } else { IrType::U32 };
- 
-                 let target_ty = match (lhs_narrow_ty, rhs_narrow_ty) {
--                    (Some(lt), Some(rt)) if lt == rt => lt,
--                    (Some(lt), Some(rt)) if lt.size() == rt.size() => lt,
-+                    (Some(lt), Some(rt)) if lt == rt && lt == op_narrow_ty => lt,
-                     (Some(t), None) => {
--                        if try_narrow_const_operand(rhs, t).is_some() {
-+                        if t == op_narrow_ty && try_narrow_const_operand(rhs, t).is_some() {
-                             t
-                         } else {
-                             continue;
-                         }
-                     }
-                     (None, Some(t)) => {
--                        if try_narrow_const_operand(lhs, t).is_some() {
-+                        if t == op_narrow_ty && try_narrow_const_operand(lhs, t).is_some() {
-                             t
-                         } else {
-                             continue;
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index da7c8b89..12143356 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -3154,15 +3154,43 @@ impl X86Codegen {
+                 _ => false,
+             };
+             if lhs_in_acc {
+-                // LHS is in %rax — save it to dest first, then copy rhs (from dest) to %rax
+-                self.state
+-                    .out
+-                    .emit_instr_reg_reg("    movq", "rax", dest_name);
+-                let rhs_name = phys_reg_name(rhs_phys.unwrap());
+-                self.state
+-                    .out
+-                    .emit_instr_reg_reg("    movq", rhs_name, "rax");
+-                self.state.reg_cache.invalidate_acc();
++                // RA-09: lhs is in %rax and rhs's home IS the dest register.
++                // The old code saved lhs into dest (`movq %rax,%dest`) and then
++                // re-read "rhs" from dest (`movq %dest,%rax`) — but that first
++                // move clobbered rhs's value, so the re-read returned lhs, and
++                // `op %rax,%dest` computed `lhs op lhs` (a self-op / miscompile,
++                // e.g. base.c `xorl %ebx,%ebx` when 131/128/132 all homed rbx).
++                // Both operands are already staged correctly: lhs in %rax, rhs
++                // in dest. The common tail `op %rax, %dest` then computes
++                // `rhs op lhs` into dest, which equals `lhs op rhs` for every
++                // commutative ALU op (Add/And/Or/Xor/Mul). Sub is non-commutative
++                // and must preserve operand order (lhs - rhs), so it is staged
++                // through %rax below before the tail.
++                if op == IrBinOp::Sub {
++                    let rhs_name = phys_reg_name(rhs_phys.unwrap());
++                    let rhs_name_32 = phys_reg_name_32(rhs_phys.unwrap());
++                    if use_32bit {
++                        self.state
++                            .emit_fmt(format_args!("    subl %{}, %eax", rhs_name_32));
++                        self.state
++                            .emit_fmt(format_args!("    movl %eax, %{}", dest_name_32));
++                        self.emit_sext32_for_value(
++                            dest_name_32,
++                            dest_name,
++                            is_unsigned,
++                            dest_value_id,
++                        );
++                    } else {
++                        self.state
++                            .emit_fmt(format_args!("    subq %{}, %rax", rhs_name));
++                        self.state
++                            .emit_fmt(format_args!("    movq %rax, %{}", dest_name));
++                    }
++                    self.state.reg_cache.invalidate_acc();
++                    return;
++                }
++                // Commutative: leave lhs in %rax, rhs in dest. The tail emits
++                // `op %rax, %dest`.
+             } else {
+                 self.operand_to_rax(rhs);
+                 self.operand_to_callee_reg(lhs, dest_phys);
+diff --git a/tests/regression/ra09_selfop_xor.c b/tests/regression/ra09_selfop_xor.c
+new file mode 100644
+index 00000000..3714959a
+--- /dev/null
++++ b/tests/regression/ra09_selfop_xor.c
+@@ -0,0 +1,71 @@
++/* Regression (RA-09): register self-op miscompile in emit_alu_reg_direct.
++ *
++ * Pattern: a memory load whose result is consumed by a commutative ALU
++ * (Xor) whose dest AND rhs both get the SAME callee-saved register, while
++ * the load is materialized through the accumulator (%rax). Under O3/Os the
++ * HOT_LOOP phase-1 allocator homed the shift result and the xor dest on the
++ * same register; the old emitter then ran the "save lhs to dest, re-read rhs"
++ * dance which clobbered rhs with lhs and emitted a self-op:
++ *
++ *     movl 168(%rsp), %ebx     ; load a[14]  (materialized via dest reg)
++ *     xorl %ebx, %ebx          ; a[14] ^= a[14]  -- WRONG, was ^= acc>>31
++ *
++ * Emitter fix: when lhs is already in %rax and rhs's home IS the dest
++ * register, leave lhs in %rax and let the 2-operand tail emit
++ * `op %rax, %dest` (= rhs op lhs == lhs op rhs for commutative ALU).
++ *
++ * Differential vs GCC. Deterministic: reproduces on -O0/-O2/-O3.
++ */
++#include <stdint.h>
++#include <stdio.h>
++#include <inttypes.h>
++
++static volatile uint32_t observed;
++
++struct pair { uint32_t lo; uint32_t hi; };
++struct bits { unsigned a:3; unsigned b:5; unsigned c:8; };
++
++static uint64_t rotl64(uint64_t x, unsigned n) {
++  n &= 63u; return n ? ((x << n) | (x >> ((64u - n) & 63u))) : x;
++}
++static uint64_t mix(uint64_t x, uint64_t y, unsigned n) {
++  x ^= rotl64(y + UINT64_C(0x9e3779b97f4a7c15), n);
++  x *= UINT64_C(0xbf58476d1ce4e5b9);
++  x ^= x >> 29; return x;
++}
++static struct pair step_pair(struct pair p, uint32_t x) {
++  p.lo = (p.lo + x) ^ (p.hi >> 3);
++  p.hi = (p.hi * UINT32_C(1664525)) + UINT32_C(1013904223) + p.lo;
++  return p;
++}
++static uint64_t postdec_path(uint32_t n, uint64_t seed) {
++  uint64_t sum = seed;
++  do { sum = mix(sum, (uint64_t)n + UINT64_C(17), n); } while (n-- != 0);
++  return sum;
++}
++static uint64_t wide_path(uint64_t a, uint64_t b) {
++  __int128 x = ((__int128)(uint64_t)a << 32) | (uint32_t)b;
++  x = x * 3 + 7;
++  return (uint64_t)x ^ (uint64_t)(x >> 64);
++}
++
++int main(void) {
++  uint64_t acc = UINT64_C(0xdcf4bb99f4bea973);
++  uint64_t salt = UINT64_C(0xd95bafc8f2a4d27b);
++  uint32_t a[16];
++  struct pair p = { UINT32_C(1), UINT32_C(2) };
++  struct bits bf = { 0, 0, 0 };
++  for (unsigned i = 0; i < 16; ++i) a[i] = (uint32_t)(acc >> (i & 31u)) ^ (i * UINT32_C(0x45d9f3b));
++  bf.a = (unsigned)(acc >> 53u); bf.b = (unsigned)(salt >> 60u); bf.c = bf.a + bf.b;
++  acc += (uint64_t)(bf.a | (bf.b << 3) | (bf.c << 8));
++  a[14] ^= (uint32_t)(acc >> 31u); acc += a[14];
++  p = step_pair(p, (uint32_t)(acc + UINT32_C(0x47733e84))); acc ^= ((uint64_t)p.hi << 32) | p.lo;
++  acc ^= postdec_path(7u, salt);
++  acc ^= wide_path(acc, salt);
++  for (unsigned j = 0; j < 16; ++j) {
++    unsigned k = (unsigned)((acc + j) & 15u);
++    a[k] = (uint32_t)mix(a[k], acc ^ j, j);
++    acc ^= ((uint64_t)a[k] << ((j & 7u) * 8u));
++  }
++  printf("%016" PRIx64 " %08" PRIx32 "\n", acc, observed);
++}
+diff --git a/tests/regression/ra09_selfop_xor.flags b/tests/regression/ra09_selfop_xor.flags
+new file mode 100644
+index 00000000..d15a7108
+--- /dev/null
++++ b/tests/regression/ra09_selfop_xor.flags
+@@ -0,0 +1 @@
++-O3
