@@ -1,141 +1,1509 @@
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index da7c8b89..12143356 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -3154,15 +3154,43 @@ impl X86Codegen {
-                 _ => false,
-             };
-             if lhs_in_acc {
--                // LHS is in %rax — save it to dest first, then copy rhs (from dest) to %rax
--                self.state
--                    .out
--                    .emit_instr_reg_reg("    movq", "rax", dest_name);
--                let rhs_name = phys_reg_name(rhs_phys.unwrap());
--                self.state
--                    .out
--                    .emit_instr_reg_reg("    movq", rhs_name, "rax");
--                self.state.reg_cache.invalidate_acc();
-+                // RA-09: lhs is in %rax and rhs's home IS the dest register.
-+                // The old code saved lhs into dest (`movq %rax,%dest`) and then
-+                // re-read "rhs" from dest (`movq %dest,%rax`) — but that first
-+                // move clobbered rhs's value, so the re-read returned lhs, and
-+                // `op %rax,%dest` computed `lhs op lhs` (a self-op / miscompile,
-+                // e.g. base.c `xorl %ebx,%ebx` when 131/128/132 all homed rbx).
-+                // Both operands are already staged correctly: lhs in %rax, rhs
-+                // in dest. The common tail `op %rax, %dest` then computes
-+                // `rhs op lhs` into dest, which equals `lhs op rhs` for every
-+                // commutative ALU op (Add/And/Or/Xor/Mul). Sub is non-commutative
-+                // and must preserve operand order (lhs - rhs), so it is staged
-+                // through %rax below before the tail.
-+                if op == IrBinOp::Sub {
-+                    let rhs_name = phys_reg_name(rhs_phys.unwrap());
-+                    let rhs_name_32 = phys_reg_name_32(rhs_phys.unwrap());
-+                    if use_32bit {
-+                        self.state
-+                            .emit_fmt(format_args!("    subl %{}, %eax", rhs_name_32));
-+                        self.state
-+                            .emit_fmt(format_args!("    movl %eax, %{}", dest_name_32));
-+                        self.emit_sext32_for_value(
-+                            dest_name_32,
-+                            dest_name,
-+                            is_unsigned,
-+                            dest_value_id,
-+                        );
-+                    } else {
-+                        self.state
-+                            .emit_fmt(format_args!("    subq %{}, %rax", rhs_name));
-+                        self.state
-+                            .emit_fmt(format_args!("    movq %rax, %{}", dest_name));
-+                    }
-+                    self.state.reg_cache.invalidate_acc();
-+                    return;
-+                }
-+                // Commutative: leave lhs in %rax, rhs in dest. The tail emits
-+                // `op %rax, %dest`.
-             } else {
-                 self.operand_to_rax(rhs);
-                 self.operand_to_callee_reg(lhs, dest_phys);
-diff --git a/tests/regression/ra09_selfop_xor.c b/tests/regression/ra09_selfop_xor.c
+diff --git a/.base_ref b/.base_ref
+index 4117c3d..fae4e94 100644
+--- a/.base_ref
++++ b/.base_ref
+@@ -1 +1 @@
+-4630de024fccbb20d2b6e4b3ee846bb3e146e5d5
++1a9bf60b2e48b6f1f3ed0b86cf059d4f8385acc5
+diff --git a/engineering/FOLLOWUP-2026-08-31-sqlite-sib-call-clobber.md b/engineering/FOLLOWUP-2026-08-31-sqlite-sib-call-clobber.md
 new file mode 100644
-index 00000000..3714959a
+index 0000000..65fe465
 --- /dev/null
-+++ b/tests/regression/ra09_selfop_xor.c
-@@ -0,0 +1,71 @@
-+/* Regression (RA-09): register self-op miscompile in emit_alu_reg_direct.
++++ b/engineering/FOLLOWUP-2026-08-31-sqlite-sib-call-clobber.md
+@@ -0,0 +1,57 @@
++# Follow-up — 2026-08-31: sqlite3 CREATE TABLE SIB call-clobber
++
++**Base.** `ms178/lccc` main `1a9bf60` + local `7b5f265` (pp-join-map-rc).
++sqlite 3.53.4 amalgamation, Arch PKGBUILD features, `-O2 -fPIC`.
++
++## Bug
++
++`CREATE TABLE t(a);` SIGSEGV in inlined `sqlite3DbStrNDup` from
++`vdbeChangeP4Full` (`0x4c0800`). Post-memcpy:
++
++```
++movslq %r10d, %r10
++movb   $0, (%rbp, %r10, 1)    ; 0x4c0b2f
++```
++
++`%r10` was the I32 Copy dest of `n` after the `n==0` diamond
++(`if (n==0) n = sqlite3Strlen30(zP4)`). Lookaside + `memcpy` clobbered it.
++The i64 widen of `n` was spilled to `0x30(%rsp)` and reloaded into unused
++`%r11`; SIB used the stale `%r10`.
++
++## Root cause
++
++`resolve_index` peels Cast/Shl/Mul/Add (not Copy). Folded index = multi-def
++Copy dest. RA stretch multi-def merged `required = [GEP.start, Store]`.
++GEP is **after** memcpy, so memcpy ∉ required → not `call_spanning` →
++Phase 2 caller-saved `%r10`. Copy/Cast not adjacent → not `never_materialized`.
++Single-def last-segment stretch *would* have covered Cast→Store including
++the call; sqlite is the multi-def case.
++
++Do **not** peel Copy in `resolve_index` (ParamRef `n` dies at Copy / `%r15`
++reused for `p->db`). Do **not** refuse all caller-saved SIB indexes
++(vsprintf digit loop wants `%edx`).
++
++## Fix
++
++`src/backend/regalloc.rs`: multi-def required span starts at the last
++IR-visible **segment** end of the index when it is not live at GEP.start
++(the fat envelope of the join block already runs through memcpy+GEP+Store,
++so `bounds_of[idx].end` is not the Cast). That fills `[Cast, Store]`
++including memcpy. A covering segment at the GEP keeps historical
++`[GEP, Store]` (vsprintf digit latch).
++
++## Tests
++
++- `phi_coalesce_tests::multi_def_peeled_index_covers_call_before_gep`
++- `tests/regression/sqlite_strndup_sib_call.c` (`-O2 -fPIC`)
++- sqlite amalgamation: `CREATE TABLE` + INSERT + SELECT
++
++## Still open
++
++- PF-17: 15 loop-rotate miscompile shapes; rotate stays opt-in
++  (`CCC_LOOP_ROTATE=1`) until they are root-caused.
++- ZSTD P0: userspace oracle MATCH on `90b6d87`; QEMU boot still the gate.
++- Optional belt: refuse SIB if the index home is not live-after-call
++  (needs call_points on X86Codegen). Not required once RA is sound.
++- Do not enable MachInst on large loops; gzip `longest_match` stack-mem
++  must not rise.
+diff --git a/engineering/notes/2026-09-01-pf17-remaining-three.md b/engineering/notes/2026-09-01-pf17-remaining-three.md
+new file mode 100644
+index 0000000..005120b
+--- /dev/null
++++ b/engineering/notes/2026-09-01-pf17-remaining-three.md
+@@ -0,0 +1,36 @@
++# PF-17 remaining-three (alu / huft / simd) — 2026-09-01
++
++Rotate-ON vs GCC -O2 on the 19-name PF-17 A/B: **19 MATCH / 0 FAIL**.
++Rotation stays opt-in. Snapshot after this note.
++
++## Fixes landed this session
++
++| File | What |
++|---|---|
++| `src/passes/loop_rotate.rs` | Guard D (`while (--i)` latch incoming defined in header); Guard E (skip nested loops) |
++| `src/passes/univsr.rs` | Skip rotated self-loop pointer phis; unit tests on unrotated 3-block shape + `skip_rotated_self_loop_pointer_ivs` |
++| `src/passes/loop_unroll.rs` | Two-block complete unroll: outside uses → last clone dest; header phi → Copy(init), not Copy(final) |
++| `src/passes/backedge_pre.rs` | (prior this thread) `schedule_eprime_early` current-IR latest_dep |
++| `tests/regression/loop_rotate_seq_loops.{c,env}` | Pred-label sequential loops |
++| `tests/regression/loop_rotate_while_dec.{c,env}` | gzip-style `while (--i)` prefix walk |
++
++Earlier in the same PF-17 arc: pred-label Option A `(pre_op, header_label)`.
++
++## Do not re-debug
++
++- Isolated alu loop1 / loop2 / alu12 (drop ys) each MATCH under rotation.
++- `CCC_LOOP_ROTATE=` empty still enables the pass (`is_err()` is false). Use `env -u`.
++- Disabling bepre does not fix alu/huft/simd.
++- `CCC_DISABLE_PASSES=inline` does **not** stop static inlining; `__attribute__((noinline))` does.
++- Tight Guard E ("cond uses a foreign header phi") is not enough after copy-prop.
++
++## ZSTD P0
++
++Userspace oracle MATCH on an earlier SHA. QEMU boot (`ZSTD-compressed data is corrupt`) is the gate. **Kernel tree and qemu are absent in this sandbox** — cannot close ZSTD this session.
++
++## Next session
++
++1. Full regression corpus with `CCC_LOOP_ROTATE=1` (474 / 0 / 11 is the bar for default-ON).
++2. Sound nested-loop rotation (replace Guard E) if 9-worst / loop_patterns still show the double-jump preheader on inner loops.
++3. Fetch kernel tree + qemu; ZSTD P0 boot.
++4. Do not flip rotation default until (1) is green.
+diff --git a/engineering/tasks/TASK-PF-17-LOOP-ROTATE-DEFAULT.md b/engineering/tasks/TASK-PF-17-LOOP-ROTATE-DEFAULT.md
+index 887b2b7..55ef426 100644
+--- a/engineering/tasks/TASK-PF-17-LOOP-ROTATE-DEFAULT.md
++++ b/engineering/tasks/TASK-PF-17-LOOP-ROTATE-DEFAULT.md
+@@ -54,3 +54,51 @@ fuzz · kernel corpus 15/15 · nbody 5M-step bit-identical to GCC.
+   or intrinsics (current guards — keep them).
+ - Do not trampoline the self-loop phi copy (it splits the rotation back
+   into body+latch; see DECISIONS.md v13 entry).
++- Do not drop Guard C (multi-preheader header phi), Guard D (`while (--i)`
++  latch incoming defined in the header), or Guard E (nested loops).
++- Do not revert IVSR pointer IVs that live in a rotated self-loop
++  (`univsr` skip); unrotated preheader+latch pointer IVs must still revert.
++- Do not put complete-unroll carried-phi Copies of the LAST clone dest in
++  the header (Copy-before-def). Copy INIT in the header; rewrite outside
++  uses to the last clone dest.
++
++## Session 2026-09-01 — remaining 3 of 15 root-caused
++
++The 19-name rotate-ON vs GCC -O2 A/B is **19 MATCH / 0 FAIL** (the original
++15 plus `loop_rotate_seq_loops` and `loop_rotate_while_dec`). Rotation
++stays **opt-in** (`CCC_LOOP_ROTATE=1`). Do not flip the default until the
++full 474-test corpus is green.
++
++Root causes (distinct; all three FAILs MATCH gcc with rotation OFF):
++
++1. **Pred-label (sequential loops)** — self-loop phi init incoming labeled
++   with the original preheader instead of the guard. Option A
++   `(pre_op, header_label)` + Guard C. Tests: `loop_rotate_seq_loops`,
++   `alloca_bare_builtin`, `bitops_builtins`, …
++2. **bepre hoist** — `schedule_eprime_early` used a stale `def_site` after
++   header-phi insert. Current-IR `latest_dep` + never insert inside the
++   phi cluster. Tests: `backedge_pre_int_recurrence`,
++   `backedge_pre_fp_multiuse`.
++3. **univsr × rotated pointer IVs (`alu_peepholes`)** — `detect_ivsr_pointer_ivs`
++   treated a rotated self-loop pointer phi (`incoming` from the phi's own
++   block) as an unrotated IVSR IV and reverted with the wrong index/base.
++   Skip self-incoming / self-terminating pointer phis. Unrotated
++   preheader+latch IVs still revert (SIB). Test: `alu_peepholes`.
++4. **Guard D / `while (--i)` (`huft_build_crash`)** — cloned `i_next = i - 1`
++   rewrote `i` to the latch incoming, which is the header Sub itself, so
++   the backedge tested the loop-invariant `(g-1)-1`. Infinite pointer walk,
++   SIGSEGV. Bail when a header phi's latch incoming is a non-phi header
++   inst. Test: `huft_build_crash`, `loop_rotate_while_dec`.
++5. **Complete-unroll Copy-before-def + Guard E (`simd_crc_adler`)** —
++   two-block complete unroll replaced carried phis with `Copy phi = last_clone`
++   in the header (def is in a later clone). GVN/LICM then, after inlining
++   the remainder `for (; i < sz; i++)` into `for (sz = 1; …)`, froze `sz`
++   to 1 (adler sz=2 returned `00010001`). Fix: rewrite outside uses to the
++   last clone dest; Copy INIT in the header. Guard E: do not rotate a loop
++   nested inside another (tighter "cond uses outer-header phi" is not
++   enough — copy-prop hides the phi dest). Test: `simd_crc_adler`.
++
++Still open before default-ON: full corpus, 9-worst, nbody bit-identical,
++kernel 15/15, fuzz. Guard E is a correctness fence; nested inner loops
++no longer rotate (perf left on the table — a sound nested-rotate rewrite
++is future work).
+diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
+index 8a3d123..d6cf0db 100644
+--- a/src/backend/regalloc.rs
++++ b/src/backend/regalloc.rs
+@@ -1982,9 +1982,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+     // interval map is derived (see RegAllocConfig::folded_index_uses).
+     if !config.folded_index_uses.is_empty() && !env_on("CCC_NO_FOLDED_INDEX_LIVENESS") {
+         // value_id -> (start, end) from the consumer GEP-dest intervals. The
+-        // dest's START is the folded-away producer (the GEP / Cmp — the last
+-        // IR-visible read of the operand); its END is the access that
+-        // re-reads the operand RA-invisibly (SIB load/store, replayed cmp).
++        // dest's END is the access that re-reads the operand RA-invisibly
++        // (SIB load/store, replayed cmp). dest.start is the GEP / Cmp itself
++        // — NOT always the last IR-visible read of `idx`: `resolve_index`
++        // peels Cast/Shl/Mul/Add, so a peeled index's last IR use is the
++        // widening Cast sitting BEFORE the GEP (sqlite3 vdbeChangeP4Full).
+         let mut bounds_of: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
+         for iv in &liveness.intervals {
+             bounds_of.insert(iv.value_id, (iv.start, iv.end));
+@@ -2018,13 +2020,47 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
+         for (idx, dests) in &config.folded_index_uses {
+             let mut new_end: Option<u32> = None;
+             // Real-liveness ranges the operand must survive: one per
+-            // consumer, [producer position .. access position].
++            // consumer. dest.start is the GEP, but a peeled index's last
++            // IR use is typically a widening Cast / scale BEFORE the GEP
++            // (the GEP reads orig_offset). Starting required at dest.start
++            // then misses every call between that last IR use and the GEP:
++            // sqlite3 vdbeChangeP4Full inlined sqlite3DbStrNDup homes the
++            // multi-def I32 Copy of `n` in %r10, memcpy clobbers it, then
++            // ensure_sib_index_form movslqs the stale register for p[n]=0.
++            // required starts at the last IR-visible segment end when the
++            // index is not live at dest.start (fills Cast→Store including
++            // the call). A covering segment keeps [GEP, Store].
+             let mut required: Vec<(u32, u32)> = Vec::new();
++            // Fat interval end is the block envelope (join block runs through
++            // memcpy+GEP+Store), so it is NOT the last IR use. Use hole-aware
++            // segments: if idx is not live at dest.start, start required at
++            // the preceding segment end (the peeled Cast) so calls in the
++            // hole are covered. A covering segment keeps historical
++            // [GEP, Store] (vsprintf digit latch).
++            let idx_segs: Vec<(u32, u32)> = liveness
++                .segments
++                .iter()
++                .filter(|seg| seg.value_id == *idx)
++                .map(|seg| (seg.start, seg.end))
++                .collect();
+             for d in dests {
+                 if let Some(&(s, e)) = bounds_of.get(d) {
+                     new_end = Some(new_end.map_or(e, |x: u32| x.max(e)));
+                     if s < e {
+-                        required.push((s, e));
++                        let covering = idx_segs.iter().any(|&(ss, ee)| ss <= s && s < ee);
++                        let req_s = if covering {
++                            s
++                        } else {
++                            idx_segs
++                                .iter()
++                                .map(|&(_, ee)| ee)
++                                .filter(|&ee| ee <= s)
++                                .max()
++                                .unwrap_or(s)
++                        };
++                        if req_s < e {
++                            required.push((req_s, e));
++                        }
+                     }
+                 }
+             }
+@@ -6336,7 +6372,7 @@ fn uses_value(inst: &Instruction, val_id: u32) -> bool {
+ #[cfg(test)]
+ mod phi_coalesce_tests {
+     use super::*;
+-    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, Value};
++    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrCmpOp, Value};
+ 
+     #[test]
+     fn segment_interference_preserves_holes_and_half_open_handoffs() {
+@@ -6793,4 +6829,157 @@ mod phi_coalesce_tests {
+             "callee-saved home may still be shared across the call: {assignments:?}"
+         );
+     }
++
++    /// sqlite3 vdbeChangeP4Full: `if (n==0) n = strlen(z); memcpy; p[n]=0`.
++    /// The join Copy of I32 `n` is multi-def. `resolve_index` peels the
++    /// widening Cast so folded_index_uses keys on that Copy dest, whose last
++    /// IR use is the Cast — before memcpy — while the GEP (dest.start) sits
++    /// after it. Multi-def required must start at idx_ir_end so the Copy dest
++    /// is live across the call (callee-saved / spilled), not a clobbered %r10.
++    #[test]
++    fn multi_def_peeled_index_covers_call_before_gep() {
++        let mut func = IrFunction::new(
++            "vdbe_strndup_shape".to_string(),
++            IrType::Ptr,
++            vec![],
++            false,
++        );
++        func.blocks = vec![
++            block(
++                0,
++                vec![
++                    Instruction::Alloca {
++                        dest: Value(10),
++                        ty: IrType::I8,
++                        size: 64,
++                        align: 1,
++                        volatile: false,
++                        semantic_volatile: false,
++                    },
++                    Instruction::Copy {
++                        dest: Value(0),
++                        src: Operand::Const(IrConst::I32(5)),
++                    },
++                    Instruction::Cmp {
++                        dest: Value(2),
++                        op: IrCmpOp::Eq,
++                        lhs: Operand::Value(Value(0)),
++                        rhs: Operand::Const(IrConst::I32(0)),
++                        ty: IrType::I32,
++                    },
++                ],
++                Terminator::CondBranch {
++                    cond: Operand::Value(Value(2)),
++                    true_label: BlockId(1),
++                    false_label: BlockId(2),
++                },
++            ),
++            block(
++                1,
++                vec![
++                    Instruction::Copy {
++                        dest: Value(5),
++                        src: Operand::Const(IrConst::I32(4)),
++                    },
++                    Instruction::Copy {
++                        dest: Value(1),
++                        src: Operand::Value(Value(5)),
++                    },
++                ],
++                Terminator::Branch(BlockId(3)),
++            ),
++            block(
++                2,
++                vec![Instruction::Copy {
++                    dest: Value(1),
++                    src: Operand::Value(Value(0)),
++                }],
++                Terminator::Branch(BlockId(3)),
++            ),
++            block(
++                3,
++                vec![
++                    Instruction::Cast {
++                        dest: Value(3),
++                        src: Operand::Value(Value(1)),
++                        from_ty: IrType::I32,
++                        to_ty: IrType::I64,
++                    },
++                    Instruction::Memcpy {
++                        dest: Value(10),
++                        src: Value(10),
++                        size: 8,
++                    },
++                    Instruction::GetElementPtr {
++                        dest: Value(4),
++                        base: Value(10),
++                        offset: Operand::Value(Value(3)),
++                        ty: IrType::Ptr,
++                    },
++                    Instruction::Store {
++                        volatile: false,
++                        val: Operand::Const(IrConst::I8(0)),
++                        ptr: Value(4),
++                        ty: IrType::I8,
++                        seg_override: crate::common::types::AddressSpace::Default,
++                    },
++                ],
++                Terminator::Return(Some(Operand::Value(Value(10)))),
++            ),
++        ];
++        func.next_value_id = 11;
++
++        let mut folded = FxHashMap::default();
++        folded.insert(1u32, vec![4u32]);
++        let config = RegAllocConfig {
++            available_regs: vec![PhysReg(1), PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5)],
++            accumulator_policy: AccumulatorPolicy {
++                operand_order: AccumulatorOperandOrder::LhsFirst,
++                return_consumes_accumulator: false,
++            },
++            caller_saved_regs: vec![
++                PhysReg(10),
++                PhysReg(11),
++                PhysReg(12),
++                PhysReg(13),
++                PhysReg(14),
++                PhysReg(15),
++            ],
++            call_arg_regs: vec![PhysReg(14), PhysReg(15), PhysReg(12), PhysReg(13)],
++            indirect_target_regs: vec![PhysReg(11)],
++            allow_inline_asm_regalloc: false,
++            xmm_regs: Vec::new(),
++            never_materialized: FxHashSet::default(),
++            folded_index_uses: folded,
++            reg_hints: FxHashMap::default(),
++        };
++        let result = allocate_registers(&func, &config);
++        let liv = result.liveness.expect("liveness");
++        assert!(
++            !liv.call_points.is_empty(),
++            "Memcpy must be a call_point"
++        );
++        let segs: Vec<(u32, u32)> = liv
++            .segments
++            .iter()
++            .filter(|s| s.value_id == 1)
++            .map(|s| (s.start, s.end))
++            .collect();
++        let covered = liv
++            .call_points
++            .iter()
++            .any(|&cp| segs.iter().any(|&(s, e)| s <= cp && cp < e));
++        assert!(
++            covered,
++            "peeled multi-def index v1 must stay live across memcpy; segs={segs:?} calls={:?}",
++            liv.call_points
++        );
++        if let Some(home) = result.assignments.get(&1) {
++            assert!(
++                !matches!(home.0, 10 | 11 | 12 | 13 | 14 | 15 | 16),
++                "index live across memcpy must not take a caller-saved home (got r{})",
++                home.0
++            );
++        }
++    }
+ }
+diff --git a/src/frontend/preprocessor/pipeline.rs b/src/frontend/preprocessor/pipeline.rs
+index 2ed0bc3..70c275c 100644
+--- a/src/frontend/preprocessor/pipeline.rs
++++ b/src/frontend/preprocessor/pipeline.rs
+@@ -220,6 +220,14 @@ impl Preprocessor {
+         // closing `*/` or after a continuation splice).
+         let (joined, join_map) = self.join_continued_lines(source);
+         let (source, comment_map) = Self::strip_block_comments(&joined);
++        // Share the join map across every output line. `Rc::from(&[T])` copies
++        // the slice; doing that *per line* is Θ(N²) on amalgamations that have
++        // both a line-continuation and a multi-line block comment (sqlite3.c
++        // ~270k lines previously hung in `build_line_resolver` for minutes).
++        let join_map_rc: Rc<[LineSegments]> = match join_map.as_deref() {
++            Some(m) if !m.is_empty() => Rc::from(m),
++            _ => Rc::from([]),
++        };
+         let mut output = String::with_capacity(source.len() + source.len() / 4);
+         // Absolute offset of the current line's first byte within the
+         // comment-stripped text: the base that translates the macro
+@@ -292,7 +300,7 @@ impl Preprocessor {
+                 stripped_line_start,
+                 &joined_starts,
+                 &comment_map,
+-                &join_map,
++                &join_map_rc,
+             );
+             let source_line_num = line_resolver.line_at(stripped_line_start);
+             last_source_line_num = source_line_num;
+@@ -590,29 +598,21 @@ impl Preprocessor {
+         stripped_line_start: usize,
+         joined_starts: &[usize],
+         comment_map: &Option<Vec<CommentSegments>>,
+-        join_map: &Option<Vec<LineSegments>>,
++        join_map: &Rc<[LineSegments]>,
+     ) -> LineResolver {
+-        let jm = join_map.as_deref();
+-        // The joined line this output line starts at, and its absolute
+-        // joined-text offset.
+-        let (jl0, j_start): (usize, usize) =
+-            match comment_map.as_deref().and_then(|c| c.get(line_num)) {
+-                Some(CommentSegments::Mapped(pts)) => match pts.first() {
+-                    Some(&(_, jo, jl)) => (jl, jo),
+-                    None => (
+-                        line_num,
+-                        joined_starts.get(line_num).copied().unwrap_or(0),
+-                    ),
+-                },
+-                Some(CommentSegments::Flat(jl)) => (
+-                    *jl,
+-                    joined_starts.get(*jl).copied().unwrap_or(0),
+-                ),
+-                None => (
+-                    line_num,
+-                    joined_starts.get(line_num).copied().unwrap_or(0),
+-                ),
+-            };
++        let jm: &[LineSegments] = join_map.as_ref();
++        // Absolute joined-text offset of the joined line this output line
++        // starts at. (The joined-line index itself is recovered from the
++        // comment map / join map in the match below; only the offset is
++        // needed for the splice-breakpoint delta.)
++        let j_start: usize = match comment_map.as_deref().and_then(|c| c.get(line_num)) {
++            Some(CommentSegments::Mapped(pts)) => match pts.first() {
++                Some(&(_, jo, _)) => jo,
++                None => joined_starts.get(line_num).copied().unwrap_or(0),
++            },
++            Some(CommentSegments::Flat(jl)) => joined_starts.get(*jl).copied().unwrap_or(0),
++            None => joined_starts.get(line_num).copied().unwrap_or(0),
++        };
+         // Stripped start - joined start: comment stripping only removes
+         // bytes, so the stripped text never runs AHEAD of the joined text
+         // and the splice breakpoints shift LEFT by |delta|.
+@@ -621,6 +621,9 @@ impl Preprocessor {
+         // joined_line). Between breakpoints on this line the stripped and
+         // joined offsets advance in lockstep, so line_at()'s
+         // joined = jo + (abs - so) lands inside the same splice segment.
++        //
++        // The join map is a *shared* Rc cloned in O(1). Never `Rc::from`
++        // the whole slice here: that copy is Θ(file lines) per output line.
+         let splice_points = |pts: &[(usize, usize)], jl: usize| -> LineResolver {
+             LineResolver::Mapped(Rc::new(LineResolverData {
+                 points: pts
+@@ -631,14 +634,14 @@ impl Preprocessor {
+                     })
+                     .collect::<Vec<_>>()
+                     .into(),
+-                join_map: jm.map(Rc::from).unwrap_or_else(|| Rc::from([])),
++                join_map: Rc::clone(join_map),
+             }))
+         };
+         match comment_map.as_deref() {
+             // No multi-line comments anywhere: the join map is the only
+             // possible source of line shifts (single-line comment removal
+             // shifts offsets, which the delta absorbs).
+-            None => match jm.and_then(|j| j.get(line_num)) {
++            None => match jm.get(line_num) {
+                 Some(LineSegments::Mapped(pts)) => splice_points(pts, line_num),
+                 // Flat(phys): a standalone joined line. When earlier lines
+                 // were spliced, phys is the PHYSICAL line and generally
+@@ -647,19 +650,18 @@ impl Preprocessor {
+                 None => LineResolver::Flat(line_num),
+             },
+             Some(c) => {
+-                let jm_rc: Rc<[LineSegments]> = jm.map(Rc::from).unwrap_or_else(|| Rc::from([]));
+                 match c.get(line_num) {
+                     // Comment breakpoints on this line: they already carry
+                     // (stripped, joined) absolute pairs.
+                     Some(CommentSegments::Mapped(pts)) => {
+                         LineResolver::Mapped(Rc::new(LineResolverData {
+                             points: pts.clone(),
+-                            join_map: jm_rc,
++                            join_map: Rc::clone(join_map),
+                         }))
+                     }
+                     // No comment breakpoints on this line; the joined line it
+                     // came from decides via the join map's splice breakpoints.
+-                    Some(CommentSegments::Flat(jl)) => match jm.and_then(|j| j.get(*jl)) {
++                    Some(CommentSegments::Flat(jl)) => match jm.get(*jl) {
+                         Some(LineSegments::Mapped(pts)) => splice_points(pts, *jl),
+                         Some(LineSegments::Flat(phys)) => LineResolver::Flat(*phys),
+                         None => LineResolver::Flat(*jl),
+@@ -1223,3 +1225,72 @@ impl Default for Preprocessor {
+         Self::new()
+     }
+ }
++
++#[cfg(test)]
++mod line_resolver_share_tests {
++    use super::*;
++    use std::time::Instant;
++
++    /// One splice so `join_map` is `Some`; one multi-line comment so
++    /// `comment_map` is `Some`; then `n` ordinary lines. The old per-line
++    /// `Rc::from(join_map)` is Θ(n²) and hung sqlite3.c (~270k lines) in
++    /// `build_line_resolver` for minutes. After the shared-Rc fix this is
++    /// linear and must finish well under a second on the research VM.
++    fn spliced_commented_source(n: usize) -> String {
++        let mut src = String::with_capacity(n * 12 + 64);
++        src.push_str("int a = 1 + \\\n 2;\n");
++        src.push_str("/* multi\n   line comment */\n");
++        for i in 0..n {
++            src.push_str("int x");
++            src.push_str(&i.to_string());
++            src.push_str(";\n");
++        }
++        src.push_str("int line = __LINE__;\n");
++        src
++    }
++
++    #[test]
++    fn build_line_resolver_is_linear_on_large_spliced_commented_file() {
++        let n = 12_000usize;
++        let src = spliced_commented_source(n);
++        let mut pp = Preprocessor::new();
++        pp.set_filename("quadratic.c");
++        let t0 = Instant::now();
++        let out = pp.preprocess(&src);
++        let dt = t0.elapsed();
++        assert!(
++            dt.as_millis() < 4_000,
++            "preprocess of {n} spliced+commented lines took {dt:?} \
++             (quadratic join-map clone in build_line_resolver?)"
++        );
++        assert!(out.contains("int x0;"), "lost first generated decl");
++        assert!(
++            out.contains(&format!("int x{};", n - 1)),
++            "lost last generated decl"
++        );
++        assert!(
++            pp.errors().is_empty(),
++            "unexpected preprocess errors: {:?}",
++            pp.errors()
++        );
++    }
++
++    #[test]
++    fn spliced_commented_line_macro_matches_physical_line() {
++        // Physical lines:
++        //  1: int a = 1 + \
++        //  2:  2;
++        //  3: /* multi
++        //  4:    line comment */
++        //  5: int line = __LINE__;
++        // `__LINE__` on line 5 must expand to 5, not a joined/stripped index.
++        let src = "int a = 1 + \\\n 2;\n/* multi\n   line comment */\nint line = __LINE__;\n";
++        let mut pp = Preprocessor::new();
++        pp.set_filename("line.c");
++        let out = pp.preprocess(src);
++        assert!(
++            out.contains("int line = 5;"),
++            "__LINE__ after splice+comment must be physical 5, got:\n{out}"
++        );
++    }
++}
+diff --git a/src/passes/backedge_pre.rs b/src/passes/backedge_pre.rs
+index b9eedd4..12c7042 100644
+--- a/src/passes/backedge_pre.rs
++++ b/src/passes/backedge_pre.rs
+@@ -276,17 +276,33 @@ fn schedule_eprime_early(
+         matches!(inst, Instruction::BinOp { dest, .. } if dest.0 == rw.eprime_dest.0)
+     }) else { return };
+     let Instruction::BinOp { lhs, rhs, .. } = &block.instructions[cur_idx] else { return };
++    // Resolve operand defs against the *current* instruction list. The
++    // caller inserts the PRE phi into the header before this runs; when
++    // the loop is a rotated self-loop, header == eprime_block and that
++    // insert shifts every later index, so the `def_site` snapshot taken
++    // before the rewrite is stale. Using it moved `v*v` above `v = x+3`
++    // (use-before-def). backedge_pre_{int,fp}_* with CCC_LOOP_ROTATE=1.
+     let mut latest_dep: Option<usize> = None;
+     for op in [lhs, rhs] {
+         if let Operand::Value(v) = op {
+-            if let Some(&(db, di)) = def_site.get(&v.0) {
++            if let Some(di) = block.instructions.iter().position(|inst| {
++                inst.dest().map(|d| d.0) == Some(v.0)
++            }) {
++                latest_dep = Some(latest_dep.map_or(di, |old| old.max(di)));
++            } else if let Some(&(db, di)) = def_site.get(&v.0) {
+                 if db == block_idx {
+                     latest_dep = Some(latest_dep.map_or(di, |old| old.max(di)));
+                 }
+             }
+         }
+     }
+-    let insert_idx = latest_dep.map_or(0, |i| i.saturating_add(1));
++    // Never land inside the leading phi cluster (phis must stay first).
++    let first_non_phi = block
++        .instructions
++        .iter()
++        .position(|i| !matches!(i, Instruction::Phi { .. }))
++        .unwrap_or(0);
++    let insert_idx = latest_dep.map_or(first_non_phi, |i| i.saturating_add(1)).max(first_non_phi);
+     if insert_idx >= cur_idx {
+         return;
+     }
+diff --git a/src/passes/loop_rotate.rs b/src/passes/loop_rotate.rs
+index 5081b86..3dcd40c 100644
+--- a/src/passes/loop_rotate.rs
++++ b/src/passes/loop_rotate.rs
+@@ -126,9 +126,29 @@ pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
+         // inner latch becomes a conditional test).
+         let mut sorted: Vec<&NaturalLoop> = loops.iter().collect();
+         sorted.sort_by_key(|lp| lp.body.len());
++        let all_headers: crate::common::fx_hash::FxHashSet<usize> =
++            loops.iter().map(|lp| lp.header).collect();
+         let mut did = false;
+         for lp in sorted.into_iter() {
+-            if try_rotate_loop(func, lp, &cfg) {
++            // Guard E: do not rotate a loop nested inside another.
++            // After inlining, `for (; i < sz; i++)` sits inside
++            // `for (sz = 1; ...)`. Rotating the inner remainder is
++            // locally SSA-legal, but GVN+LICM on the combined CFG freeze
++            // the outer IV to its init (simd_crc_adler adler sz=2
++            // returned the sz=1 result 00010001). Outermost loops and
++            // sequential (non-nested) loops still rotate. A tighter
++            // "cond uses outer-header phi" check is not enough: after
++            // copy-prop `sz` is no longer the phi dest.
++            let nested = loops.iter().any(|outer| {
++                outer.header != lp.header && outer.body.contains(&lp.header)
++            });
++            if nested {
++                if std::env::var("CCC_DEBUG_LOOP_ROTATE").is_ok() {
++                    eprintln!("[ROT] nested loop header={} — bail (Guard E)", lp.header);
++                }
++                continue;
++            }
++            if try_rotate_loop(func, lp, &cfg, &all_headers) {
+                 total += 1;
+                 did = true;
+                 break; // CFG changed — rebuild before the next candidate.
+@@ -142,7 +162,12 @@ pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
+ }
+ 
+ /// Try to rotate one natural loop. Returns true if the transform was applied.
+-fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -> bool {
++fn try_rotate_loop(
++    func: &mut IrFunction,
++    lp: &NaturalLoop,
++    cfg: &CfgAnalysis,
++    all_headers: &FxHashSet<usize>,
++) -> bool {
+     let debug = std::env::var("CCC_DEBUG_LOOP_ROTATE").is_ok();
+     // 1. Single latch that is NOT the header (a self-loop is already rotated).
+     let Some(latch_idx) = lp.single_latch(&cfg.preds) else {
+@@ -257,6 +282,56 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
+         return false; // cond is loop-invariant — wouldn't terminate, bail
+     }
+ 
++    // Guard E: refuse to rotate when the cloned cond consumes a phi that
++    // lives in a DIFFERENT loop header. After inlining, a remainder loop
++    // `for (; i < sz; i++)` has `sz` as the IV of an outer counted loop.
++    // Rotating the inner loop is locally SSA-legal, but GVN+LICM on the
++    // combined CFG then freeze that outer IV to its init (simd_crc_adler
++    // adler sz=2 returned the sz=1 result 00010001). Constant-trip inner
++    // loops (`k < 8`) and loops whose limit is a param/invariant still
++    // rotate. Nested loops whose trip count is an outer IV do not.
++    {
++        let mut used_outside: Vec<u32> = Vec::new();
++        for &idx in &closure {
++            header_insts[idx].for_each_used_value(|v| {
++                if !def_idx.contains_key(&v) {
++                    used_outside.push(v);
++                }
++            });
++        }
++        // The cond value itself may be defined outside (rare); include it.
++        if !def_idx.contains_key(&cond_val.0) {
++            used_outside.push(cond_val.0);
++        }
++        let mut foreign_iv = false;
++        let mut foreign_phi = 0u32;
++        'scan: for vid in used_outside {
++            for (bi, block) in func.blocks.iter().enumerate() {
++                if bi == lp.header || !all_headers.contains(&bi) {
++                    continue;
++                }
++                for inst in &block.instructions {
++                    if let Instruction::Phi { dest, .. } = inst {
++                        if dest.0 == vid {
++                            foreign_iv = true;
++                            foreign_phi = vid;
++                            break 'scan;
++                        }
++                    }
++                }
++            }
++        }
++        if foreign_iv {
++            if debug {
++                eprintln!(
++                    "[ROT] cond uses foreign loop-header phi v{} — bail (Guard E, nested IV as trip limit)",
++                    foreign_phi
++                );
++            }
++            return false;
++        }
++    }
++
+     // 5.5 Collect owned snapshots of the closure instructions and the header
+     //     phi metadata so the immutable borrow of `func.blocks[header]` ends
+     //     before we take mutable borrows of `func.blocks[latch]` below. The
+@@ -327,6 +402,40 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
+         phi_latch_val.insert(phi_dest, lat);
+         phi_pre_val.insert(phi_dest, pre);
+     }
++
++    // Guard D: refuse to rotate when a header phi's latch incoming is
++    // defined by a NON-PHI instruction in the header. That is the
++    // `while (--i)` / header-decremented IV shape:
++    //
++    //   header: i = phi(g, i_next); i_next = i - 1; if i_next { body }
++    //   body:   ...; goto header
++    //
++    // Step 7 rewrites cloned-closure phi uses to the latch incoming, so
++    // the cloned `i_next' = i - 1` becomes `i_next' = i_next - 1` with
++    // `i_next` the GUARD's already-computed `g-1`. After rotation that
++    // value is loop-invariant, the backedge test is `(g-1)-1 != 0`
++    // forever, and the body walks off the end of the array (SIGSEGV on
++    // huft_build's `while (--i) { *xp++ = (j += *p++); }`, PF-17).
++    // Canonical `for (i = 0; i < n; i++)` is unaffected: its latch
++    // incoming is the body-defined `i + 1`.
++    for &(phi_dest, _, _, latch_op) in &phi_info {
++        let Operand::Value(v) = latch_op else {
++            continue;
++        };
++        let Some(&idx) = def_idx.get(&v.0) else {
++            continue; // defined outside the header (body / preheader)
++        };
++        if matches!(header_insts[idx], Instruction::Phi { .. }) {
++            continue; // cross-phi latch incoming: v17 rewrite handles this
++        }
++        if debug {
++            eprintln!(
++                "[ROT] header phi v{} latch incoming v{} is defined in the header (not a phi) — bail (Guard D, while(--i) shape)",
++                phi_dest, v.0
++            );
++        }
++        return false;
++    }
+     // The immutable header borrow (`header_insts`) ends here under NLL —
+     // its last use was the phi_info collection above. The mutable borrows
+     // of `func.blocks[...]` below are disjoint from that borrow. (A prior
+@@ -381,12 +490,27 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
+     }
+ 
+     // 6.6 Create a fresh self-loop phi in body_latch for each header phi.
+-    //     The new phi `i_loop = phi[header_label: v_pre, latch_label: v_latch]`
++    //     The new phi `i_loop = phi[header: v_pre, latch: v_latch]`
+     //     becomes the IV for the rotated self-loop. The header's original
+     //     phi is left in place (step 10 strips its latch incoming so
+     //     cfg_simplify collapses it to the preheader value — which is what
+     //     the guard now checks).
+     //
++    //     The init incoming MUST be labeled with the HEADER (the guard),
++    //     not the original preheader. After rotation the body's only
++    //     forward predecessor is the header's continue edge; the original
++    //     preheader still branches to the header. Naming the preheader
++    //     here records a dead edge: cfg_simplify then drops that incoming
++    //     (jump-threading + unreachable-block sweep) and collapses the
++    //     phi to a Copy of the latch operand, which is defined LATER in
++    //     the same block — use-before-def, garbage IV, SIGSEGV. Observed
++    //     on every function with a second sequential counted loop
++    //     (alloca_bare_builtin, alu_peepholes, bitops_builtins, huft,
++    //     arm_vec_load_offset, …): the first loop's preheader is the
++    //     entry and accidentally becomes a predecessor after header-merge,
++    //     so the bug hid there; the second loop's preheader is a
++    //     now-dead jump block. PF-17.
++    //
+     //     CRITICAL: uses of the header phi inside body_latch (e.g.
+     //     `load a[i]` or `i_next = i + 1`) must be rewritten to the new
+     //     `i_loop` BEFORE the cloned cond is appended — otherwise the body
+@@ -396,7 +520,7 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
+     let mut next_val = func.next_value_id;
+     let mut new_loop_phis: FxHashMap<u32, u32> = FxHashMap::default(); // header_phi_dest → new_loop_phi_dest
+     let mut new_phi_insts: Vec<Instruction> = Vec::with_capacity(phi_info.len());
+-    for &(phi_dest, phi_ty, (pre_label, pre_op), latch_op) in &phi_info {
++    for &(phi_dest, phi_ty, (_pre_label, pre_op), latch_op) in &phi_info {
+         let new_dest = Value(next_val);
+         next_val += 1;
+         new_loop_phis.insert(phi_dest, new_dest.0);
+@@ -404,7 +528,7 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
+             dest: new_dest,
+             ty: phi_ty,
+             incoming: vec![
+-                (pre_op, pre_label),
++                (pre_op, header_label),
+                 (latch_op, latch_label),
+             ],
+         });
+@@ -672,12 +796,20 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
+             // backedge writeback only fires on the next iteration's
+             // entry); reading it on the exit edge would lose the final
+             // iteration's contribution (off-by-one accumulator).
++            //
++            // Exception: when latch_op IS another header phi (cross-phi
++            // swap: `a_next = b`), that header phi collapses to its
++            // preheader value after step 10. The value we want on the
++            // test-exit edge is the corresponding new self-loop phi
++            // (start-of-this-iteration of the sibling), which is what
++            // rewrite_header_phi_operand substitutes.
++            let latch_for_exit = rewrite_header_phi_operand(latch_op, &new_loop_phis);
+             exit_phi_insts.push(Instruction::Phi {
+                 dest: nd,
+                 ty,
+                 incoming: vec![
+-                    (pre_op, header_label),      // guard-exit path: preheader value (0-trip)
+-                    (latch_op, latch_label),     // test-exit path: post-iteration value
++                    (pre_op, header_label),          // guard-exit path: preheader value (0-trip)
++                    (latch_for_exit, latch_label),   // test-exit path: post-iteration value
+                 ],
+             });
+         }
+@@ -728,6 +860,12 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
+ 
+     // 7. Clone the closure instructions to the latch, allocating fresh dest
+     //    IDs and rewriting: cloned refs → new dests, phi refs → latch values.
++    //    If a header phi's latch incoming is itself a header phi (cross-phi),
++    //    rewrite it to the new self-loop phi — the old header phi is about
++    //    to collapse to its preheader value in step 10.
++    for latch_op in phi_latch_val.values_mut() {
++        *latch_op = rewrite_header_phi_operand(*latch_op, &new_loop_phis);
++    }
+     let mut clone_map: FxHashMap<u32, u32> = FxHashMap::default();
+     let mut cloned_insts: Vec<Instruction> = Vec::with_capacity(closure_insts_owned.len());
+     for inst in &closure_insts_owned {
+@@ -796,6 +934,19 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
+     true
+ }
+ 
++/// If `op` is a header phi of the loop being rotated, rewrite it to the
++/// corresponding new self-loop phi. Needed whenever a latch incoming or
++/// cloned-closure operand still names the old header phi: after step 10
++/// that phi collapses to the preheader value.
++fn rewrite_header_phi_operand(op: Operand, new_loop_phis: &FxHashMap<u32, u32>) -> Operand {
++    if let Operand::Value(v) = op {
++        if let Some(&np) = new_loop_phis.get(&v.0) {
++            return Operand::Value(Value(np));
++        }
++    }
++    op
++}
++
+ /// Check if a block label is inside the loop body (or is the header).
+ fn is_in_loop(label: BlockId, label_to_idx: &FxHashMap<BlockId, usize>, lp: &NaturalLoop) -> bool {
+     label_to_idx
+diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
+index ad43ea6..71814d0 100644
+--- a/src/passes/loop_unroll.rs
++++ b/src/passes/loop_unroll.rs
+@@ -1356,7 +1356,6 @@ fn try_complete_unroll_two_block(
+     func.blocks[latch].terminator = Terminator::Branch(exit_target);
+     let _ = (body_entry, exit_cond_positive);
+ 
+-    let final_map: FxHashMap<u32, u32> = final_carried.iter().copied().collect();
+     let final_iv = Operand::Const(IrConst::from_i64(iv_init + trip * iv_step, iv_ty));
+     for (block_index, block) in func.blocks.iter_mut().enumerate() {
+         if lp.body.contains(&block_index) {
+@@ -1364,28 +1363,42 @@ fn try_complete_unroll_two_block(
+         }
+         for instruction in &mut block.instructions {
+             subst_value_with_operand(instruction, iv_phi.0, &final_iv);
++            for &(phi_id, final_id) in &final_carried {
++                subst_value_with_operand(
++                    instruction,
++                    phi_id,
++                    &Operand::Value(Value(final_id)),
++                );
++            }
+         }
+         subst_value_in_terminator(&mut block.terminator, iv_phi.0, &final_iv);
++        for &(phi_id, final_id) in &final_carried {
++            subst_value_in_terminator(
++                &mut block.terminator,
++                phi_id,
++                &Operand::Value(Value(final_id)),
++            );
++        }
+     }
+ 
+     func.blocks.extend(new_blocks);
+ 
+-    // Replace the (now dead) carried phis with Copies of their FINAL clone
+-    // values: OUTSIDE uses of the phi still reference its id, and this Copy
+-    // is what delivers the post-loop value to them (the pipeline's
+-    // copy-propagation then forwards the clone value directly into those
+-    // uses and the Copy dies — the original design, kept verbatim).
+-    for (phi_id, final_id) in final_map.iter() {
+-        for block in &mut func.blocks {
+-            for inst in &mut block.instructions {
+-                if let Instruction::Phi { dest, .. } = inst {
+-                    if dest.0 == *phi_id {
+-                        *inst = Instruction::Copy {
+-                            dest: Value(*phi_id),
+-                            src: Operand::Value(Value(*final_id)),
+-                        };
+-                    }
+-                }
++    // Header still executes once as a trampoline into the clone chain.
++    // Replace its (now dead) phis with Copies of the INIT values — the
++    // same as `try_complete_unroll_general`. The previous code copied the
++    // LAST clone's dest here, which is defined in a block that runs AFTER
++    // this header: Copy-before-def. GVN/copy-prop then forwarded that
++    // unordered value into inlined callers (simd_crc_adler adler sz=2
++    // returned 00010001 instead of 00bd00bc under CCC_LOOP_ROTATE=1).
++    // Outside uses were rewritten to the final clone dests above.
++    for inst in func.blocks[header].instructions.iter_mut() {
++        if let Instruction::Phi { dest, incoming, .. } = inst {
++            let init = incoming
++                .iter()
++                .find(|(_, lbl)| *lbl != latch_label)
++                .map(|(op, _)| *op);
++            if let Some(src) = init {
++                *inst = Instruction::Copy { dest: *dest, src };
+             }
+         }
+     }
+diff --git a/src/passes/univsr.rs b/src/passes/univsr.rs
+index 9b5489d..2581c1c 100644
+--- a/src/passes/univsr.rs
++++ b/src/passes/univsr.rs
+@@ -22,7 +22,9 @@
+ 
+ use crate::common::fx_hash::{FxHashMap, FxHashSet};
+ use crate::common::types::IrType;
+-use crate::ir::reexports::{BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
++use crate::ir::reexports::{
++    BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
++};
+ 
+ /// Information about an IVSR-created pointer IV that should be reverted to indexed form.
+ #[derive(Debug, Clone)]
+@@ -127,7 +129,41 @@ fn detect_ivsr_pointer_ivs(func: &IrFunction) -> Vec<IvsrPointerIV> {
+                     continue;
+                 }
+ 
++                // Rotated self-loop: the latch incoming is this block, and/or
++                // the terminator branches to self. univsr assumes a distinct
++                // preheader+latch; reverting IVs created by IVSR on a
++                // rotated body mis-addresses (alu_peepholes + CCC_LOOP_ROTATE).
++                let self_in = incoming.iter().any(|(_, lbl)| *lbl == block.label);
++                let self_term = is_rotated_self_loop_block(block);
++                if self_in || self_term {
++                    if std::env::var("LCCC_DEBUG_UNIVSR").is_ok() {
++                        eprintln!(
++                            "[univsr]   skip rotated self-loop ptr phi v{} in {:?} self_in={} self_term={} incomings={:?}",
++                            dest.0,
++                            block.label,
++                            self_in,
++                            self_term,
++                            incoming.iter().map(|(_, l)| l.0).collect::<Vec<_>>()
++                        );
++                    }
++                    continue;
++                }
++
+                 if let Some(ptr_iv) = analyze_pointer_phi(func, dest, incoming, block.label) {
++                    if std::env::var("LCCC_DEBUG_UNIVSR").is_ok() {
++                        eprintln!(
++                            "[univsr]   candidate v{} in {:?} self_in={} self_term={} incomings={:?} idx=v{} base=v{} off={} stride={}",
++                            dest.0,
++                            block.label,
++                            incoming.iter().any(|(_, lbl)| *lbl == block.label),
++                            is_rotated_self_loop_block(block),
++                            incoming.iter().map(|(_, l)| l.0).collect::<Vec<_>>(),
++                            ptr_iv.index_iv.0,
++                            ptr_iv.base_ptr.0,
++                            ptr_iv.init_offset,
++                            ptr_iv.stride
++                        );
++                    }
+                     result.push(ptr_iv);
+                 }
+             }
+@@ -794,6 +830,20 @@ fn remove_dead_pointer_iv_cycle(func: &mut IrFunction, ptr_iv: &IvsrPointerIV) {
+     }
+ }
+ 
++/// True if this block is a rotated self-loop header (branches to itself).
++fn is_rotated_self_loop_block(block: &crate::ir::reexports::BasicBlock) -> bool {
++    let self_label = block.label;
++    match &block.terminator {
++        Terminator::CondBranch {
++            true_label,
++            false_label,
++            ..
++        } => *true_label == self_label || *false_label == self_label,
++        Terminator::Branch(t) => *t == self_label,
++        _ => false,
++    }
++}
++
+ /// Check if a stride in bytes is valid for x86-64 SIB encoding (1, 2, 4, or 8 bytes).
+ #[inline(always)]
+ fn is_valid_sib_scale(stride: i64) -> bool {
+@@ -909,21 +959,43 @@ mod tests {
+     use crate::common::types::AddressSpace;
+     use crate::ir::reexports::{BasicBlock, IrCmpOp, Terminator};
+ 
+-    /// Two blocks: preheader (0) and loop header/body (1).
++    /// Unrotated loop: preheader (0) → header (1) ⇄ latch (2), exit (3).
++    /// Header phis take incoming from preheader and latch (not self); this is
++    /// the shape univsr is allowed to revert. Rotated self-loops are skipped.
+     fn make_test_function() -> IrFunction {
+         let mut f = IrFunction::new("test_kernel".to_string(), IrType::Void, Vec::new(), false);
+-        for i in 0..2u32 {
+-            f.blocks.push(BasicBlock {
+-                label: BlockId(i),
+-                instructions: Vec::new(),
+-                terminator: if i == 1 {
+-                    Terminator::Branch(BlockId(1))
+-                } else {
+-                    Terminator::Branch(BlockId(1))
+-                },
+-                source_spans: Vec::new(),
+-            });
+-        }
++        // 0: preheader
++        f.blocks.push(BasicBlock {
++            label: BlockId(0),
++            instructions: Vec::new(),
++            terminator: Terminator::Branch(BlockId(1)),
++            source_spans: Vec::new(),
++        });
++        // 1: header
++        f.blocks.push(BasicBlock {
++            label: BlockId(1),
++            instructions: Vec::new(),
++            terminator: Terminator::CondBranch {
++                cond: Operand::Const(IrConst::I32(1)),
++                true_label: BlockId(2),
++                false_label: BlockId(3),
++            },
++            source_spans: Vec::new(),
++        });
++        // 2: latch
++        f.blocks.push(BasicBlock {
++            label: BlockId(2),
++            instructions: Vec::new(),
++            terminator: Terminator::Branch(BlockId(1)),
++            source_spans: Vec::new(),
++        });
++        // 3: exit
++        f.blocks.push(BasicBlock {
++            label: BlockId(3),
++            instructions: Vec::new(),
++            terminator: Terminator::Return(None),
++            source_spans: Vec::new(),
++        });
+         f
+     }
+ 
+@@ -947,14 +1019,14 @@ mod tests {
+         }
+     }
+ 
+-    /// Canonical counter phi: i = phi [0 (from pre), i+1 (from latch)].
++    /// Canonical counter phi: i = phi [0 (from pre 0), i+1 (from latch 2)].
+     fn counter_phi(dest: u32, next: u32) -> Instruction {
+         Instruction::Phi {
+             dest: Value(dest),
+             ty: IrType::I64,
+             incoming: vec![
+                 (Operand::Const(IrConst::I64(0)), BlockId(0)),
+-                (Operand::Value(Value(next)), BlockId(1)),
++                (Operand::Value(Value(next)), BlockId(2)),
+             ],
+         }
+     }
+@@ -975,7 +1047,7 @@ mod tests {
+             ty: IrType::Ptr,
+             incoming: vec![
+                 (Operand::Value(Value(init)), BlockId(0)),
+-                (Operand::Value(Value(next)), BlockId(1)),
++                (Operand::Value(Value(next)), BlockId(2)),
+             ],
+         }
+     }
+@@ -1048,10 +1120,12 @@ mod tests {
+         });
+         assert!(has_shl, "stride 4 must scale the index with Shl");
+ 
+-        // The pointer IV cycle is broken: phi and increment GEP became Copies.
+-        let copies = func.blocks[1]
+-            .instructions
++        // The pointer IV cycle is broken: phi (header) and increment GEP (latch)
++        // became Copies.
++        let copies = func
++            .blocks
+             .iter()
++            .flat_map(|b| b.instructions.iter())
+             .filter(|inst| matches!(inst, Instruction::Copy { .. }))
+             .count();
+         assert_eq!(copies, 2, "phi + increment GEP must both become Copy(base)");
+@@ -1097,6 +1171,8 @@ mod tests {
+             load(3, 2, IrType::I32),
+             gep_const(4, 2, 4), // q = p + 4 bytes
+             load(5, 4, IrType::I32),
++        ];
++        f.blocks[2].instructions = vec![
+             counter_inc(6, 1),
+             gep_const(7, 2, 8), // stride 8
+         ];
+@@ -1131,9 +1207,8 @@ mod tests {
+             load(3, 2, IrType::I32),
+             store_val(3, 2, IrType::I32),
+             load(5, 2, IrType::I32),
+-            counter_inc(6, 1),
+-            gep_const(7, 2, 4),
+         ];
++        f.blocks[2].instructions = vec![counter_inc(6, 1), gep_const(7, 2, 4)];
+         f.next_value_id = 11;
+ 
+         assert_eq!(run_univsr(&mut f), 1);
+@@ -1213,6 +1288,8 @@ mod tests {
+             counter_phi(1, 6),
+             ptr_phi(2, 10, 7),
+             load(3, 2, IrType::I32),
++        ];
++        f.blocks[2].instructions = vec![
+             Instruction::BinOp {
+                 dest: Value(6),
+                 op: IrBinOp::Add,
+@@ -1250,6 +1327,8 @@ mod tests {
+             counter_phi(1, 6),
+             ptr_phi(2, 10, 7),
+             load(3, 2, IrType::I32),
++        ];
++        f.blocks[2].instructions = vec![
+             counter_inc(6, 1),
+             gep_const(7, 2, 4),
+             Instruction::Cmp {
+@@ -1292,9 +1371,8 @@ mod tests {
+                     info,
+                 }
+             },
+-            counter_inc(6, 1),
+-            gep_const(7, 2, 4),
+         ];
++        f.blocks[2].instructions = vec![counter_inc(6, 1), gep_const(7, 2, 4)];
+         f.next_value_id = 11;
+         assert_eq!(
+             run_univsr(&mut f),
+@@ -1326,9 +1404,8 @@ mod tests {
+                 ty: IrType::Ptr,
+                 seg_override: AddressSpace::Default,
+             },
+-            counter_inc(6, 1),
+-            gep_const(7, 2, 4),
+         ];
++        f.blocks[2].instructions = vec![counter_inc(6, 1), gep_const(7, 2, 4)];
+         f.next_value_id = 12;
+         assert_eq!(
+             run_univsr(&mut f),
+@@ -1340,8 +1417,62 @@ mod tests {
+     #[test]
+     fn no_ptr_phi_fast_path() {
+         let mut f = make_test_function();
+-        f.blocks[1].instructions = vec![counter_phi(1, 6), counter_inc(6, 1)];
++        f.blocks[1].instructions = vec![counter_phi(1, 6)];
++        f.blocks[2].instructions = vec![counter_inc(6, 1)];
+         f.next_value_id = 7;
+         assert_eq!(run_univsr(&mut f), 0);
+     }
++
++    #[test]
++    fn skip_rotated_self_loop_pointer_ivs() {
++        // Loop-rotate produces a do-while self-loop whose pointer phi latch
++        // incoming is the phi's own block. Reverting those IVs mis-addresses
++        // (alu_peepholes with CCC_LOOP_ROTATE=1).
++        let mut f = IrFunction::new("rotated".to_string(), IrType::Void, Vec::new(), false);
++        f.blocks.push(BasicBlock {
++            label: BlockId(0),
++            instructions: vec![Instruction::GlobalAddr {
++                dest: Value(10),
++                name: "arr".to_string(),
++            }],
++            terminator: Terminator::Branch(BlockId(1)),
++            source_spans: Vec::new(),
++        });
++        f.blocks.push(BasicBlock {
++            label: BlockId(1),
++            instructions: vec![
++                Instruction::Phi {
++                    dest: Value(1),
++                    ty: IrType::I64,
++                    incoming: vec![
++                        (Operand::Const(IrConst::I64(0)), BlockId(0)),
++                        (Operand::Value(Value(6)), BlockId(1)),
++                    ],
++                },
++                Instruction::Phi {
++                    dest: Value(2),
++                    ty: IrType::Ptr,
++                    incoming: vec![
++                        (Operand::Value(Value(10)), BlockId(0)),
++                        (Operand::Value(Value(7)), BlockId(1)),
++                    ],
++                },
++                load(3, 2, IrType::I32),
++                counter_inc(6, 1),
++                gep_const(7, 2, 4),
++            ],
++            terminator: Terminator::CondBranch {
++                cond: Operand::Const(IrConst::I32(1)),
++                true_label: BlockId(1),
++                false_label: BlockId(0),
++            },
++            source_spans: Vec::new(),
++        });
++        f.next_value_id = 11;
++        assert_eq!(
++            run_univsr(&mut f),
++            0,
++            "rotated self-loop pointer IVs must not be reverted"
++        );
++    }
+ }
+diff --git a/tests/regression/loop_rotate_seq_loops.c b/tests/regression/loop_rotate_seq_loops.c
+new file mode 100644
+index 0000000..1369f61
+--- /dev/null
++++ b/tests/regression/loop_rotate_seq_loops.c
+@@ -0,0 +1,25 @@
++/* PF-17: two sequential counted loops in one function.
 + *
-+ * Pattern: a memory load whose result is consumed by a commutative ALU
-+ * (Xor) whose dest AND rhs both get the SAME callee-saved register, while
-+ * the load is materialized through the accumulator (%rax). Under O3/Os the
-+ * HOT_LOOP phase-1 allocator homed the shift result and the xor dest on the
-+ * same register; the old emitter then ran the "save lhs to dest, re-read rhs"
-+ * dance which clobbered rhs with lhs and emitted a self-op:
++ * Rotation of the SECOND loop must take its self-loop-phi init incoming
++ * from the GUARD (header), not the original preheader label. The first
++ * loop's preheader is the entry and accidentally becomes a predecessor
++ * after header-merge, so the bug hid there; the second loop's preheader
++ * is a jump block that cfg_simplify then kills, collapsing the phi to a
++ * Copy of the latch operand (use-before-def, garbage IV).
 + *
-+ *     movl 168(%rsp), %ebx     ; load a[14]  (materialized via dest reg)
-+ *     xorl %ebx, %ebx          ; a[14] ^= a[14]  -- WRONG, was ^= acc>>31
-+ *
-+ * Emitter fix: when lhs is already in %rax and rhs's home IS the dest
-+ * register, leave lhs in %rax and let the 2-operand tail emit
-+ * `op %rax, %dest` (= rhs op lhs == lhs op rhs for commutative ALU).
-+ *
-+ * Differential vs GCC. Deterministic: reproduces on -O0/-O2/-O3.
++ * Companion .env sets CCC_LOOP_ROTATE=1. Differential vs GCC -O2.
 + */
-+#include <stdint.h>
 +#include <stdio.h>
-+#include <inttypes.h>
 +
-+static volatile uint32_t observed;
++int main(void) {
++    int a[8];
++    int s = 0;
++    int i;
++    for (i = 0; i < 8; i++)
++        a[i] = i + 1;
++    for (i = 0; i < 8; i++)
++        s += a[i];
++    /* 1+2+...+8 = 36 */
++    printf("%d\n", s);
++    return s != 36;
++}
+diff --git a/tests/regression/loop_rotate_seq_loops.env b/tests/regression/loop_rotate_seq_loops.env
+new file mode 100644
+index 0000000..e31d889
+--- /dev/null
++++ b/tests/regression/loop_rotate_seq_loops.env
+@@ -0,0 +1,2 @@
++# Exercise rotation of a second sequential counted loop (PF-17).
++CCC_LOOP_ROTATE=1
+diff --git a/tests/regression/loop_rotate_while_dec.c b/tests/regression/loop_rotate_while_dec.c
+new file mode 100644
+index 0000000..ce6ded2
+--- /dev/null
++++ b/tests/regression/loop_rotate_while_dec.c
+@@ -0,0 +1,44 @@
++/* PF-17 / Guard D: `while (--i)` must not rotate into an infinite loop.
++ *
++ * gzip huft_build does:
++ *   i = g;
++ *   x[1] = j = 0;
++ *   p = c + 1; xp = x + 2;
++ *   while (--i) { *xp++ = (j += *p++); }
++ *
++ * The IV update `i_next = i - 1` lives in the header (it IS the guard).
++ * Cloning that subtract onto the latch and rewriting the phi use to the
++ * latch incoming turns `i_next' = i - 1` into `i_next' = (g-1) - 1`, a
++ * loop-invariant. The backedge then never exits for g > 2 and the pointer
++ * walk SIGSEGVs. This test is the same shape with a bounded buffer. */
++#include <stdio.h>
++#include <stdint.h>
 +
-+struct pair { uint32_t lo; uint32_t hi; };
-+struct bits { unsigned a:3; unsigned b:5; unsigned c:8; };
-+
-+static uint64_t rotl64(uint64_t x, unsigned n) {
-+  n &= 63u; return n ? ((x << n) | (x >> ((64u - n) & 63u))) : x;
-+}
-+static uint64_t mix(uint64_t x, uint64_t y, unsigned n) {
-+  x ^= rotl64(y + UINT64_C(0x9e3779b97f4a7c15), n);
-+  x *= UINT64_C(0xbf58476d1ce4e5b9);
-+  x ^= x >> 29; return x;
-+}
-+static struct pair step_pair(struct pair p, uint32_t x) {
-+  p.lo = (p.lo + x) ^ (p.hi >> 3);
-+  p.hi = (p.hi * UINT32_C(1664525)) + UINT32_C(1013904223) + p.lo;
-+  return p;
-+}
-+static uint64_t postdec_path(uint32_t n, uint64_t seed) {
-+  uint64_t sum = seed;
-+  do { sum = mix(sum, (uint64_t)n + UINT64_C(17), n); } while (n-- != 0);
-+  return sum;
-+}
-+static uint64_t wide_path(uint64_t a, uint64_t b) {
-+  __int128 x = ((__int128)(uint64_t)a << 32) | (uint32_t)b;
-+  x = x * 3 + 7;
-+  return (uint64_t)x ^ (uint64_t)(x >> 64);
++__attribute__((noinline))
++uint32_t prefix_from_counts(const uint32_t *c, unsigned g) {
++    uint32_t x[16];
++    unsigned i = g;
++    uint32_t j = 0;
++    const uint32_t *p = c + 1;
++    uint32_t *xp = x + 2;
++    x[1] = 0;
++    while (--i) {
++        *xp++ = (j += *p++);
++    }
++    /* Fold the prefix table so a miscompile cannot hide behind "didn't crash". */
++    uint32_t h = x[1];
++    for (unsigned k = 2; k <= g; k++) {
++        h = h * 16777619u ^ x[k];
++    }
++    h ^= j * 0x9e3779b1u;
++    return h;
 +}
 +
 +int main(void) {
-+  uint64_t acc = UINT64_C(0xdcf4bb99f4bea973);
-+  uint64_t salt = UINT64_C(0xd95bafc8f2a4d27b);
-+  uint32_t a[16];
-+  struct pair p = { UINT32_C(1), UINT32_C(2) };
-+  struct bits bf = { 0, 0, 0 };
-+  for (unsigned i = 0; i < 16; ++i) a[i] = (uint32_t)(acc >> (i & 31u)) ^ (i * UINT32_C(0x45d9f3b));
-+  bf.a = (unsigned)(acc >> 53u); bf.b = (unsigned)(salt >> 60u); bf.c = bf.a + bf.b;
-+  acc += (uint64_t)(bf.a | (bf.b << 3) | (bf.c << 8));
-+  a[14] ^= (uint32_t)(acc >> 31u); acc += a[14];
-+  p = step_pair(p, (uint32_t)(acc + UINT32_C(0x47733e84))); acc ^= ((uint64_t)p.hi << 32) | p.lo;
-+  acc ^= postdec_path(7u, salt);
-+  acc ^= wide_path(acc, salt);
-+  for (unsigned j = 0; j < 16; ++j) {
-+    unsigned k = (unsigned)((acc + j) & 15u);
-+    a[k] = (uint32_t)mix(a[k], acc ^ j, j);
-+    acc ^= ((uint64_t)a[k] << ((j & 7u) * 8u));
-+  }
-+  printf("%016" PRIx64 " %08" PRIx32 "\n", acc, observed);
++    /* Bit-length counts similar to huft_build_crash's c[] after the first scan
++     * of {4,0,0,7,4,4,4,2,3,3,4,4,4,0,0,0,5,7,6} — g ends up 7. */
++    uint32_t c[16] = {0, 0, 1, 2, 8, 1, 1, 6, 0, 0, 0, 0, 0, 0, 0, 0};
++    uint32_t h = prefix_from_counts(c, 7);
++    printf("%u\n", h);
++    return 0;
 +}
-diff --git a/tests/regression/ra09_selfop_xor.flags b/tests/regression/ra09_selfop_xor.flags
+diff --git a/tests/regression/loop_rotate_while_dec.env b/tests/regression/loop_rotate_while_dec.env
 new file mode 100644
-index 00000000..d15a7108
+index 0000000..3531f48
 --- /dev/null
-+++ b/tests/regression/ra09_selfop_xor.flags
++++ b/tests/regression/loop_rotate_while_dec.env
 @@ -0,0 +1 @@
-+-O3
++CCC_LOOP_ROTATE=1
+diff --git a/tests/regression/pp_line_splice_and_multiline_comment.c b/tests/regression/pp_line_splice_and_multiline_comment.c
+new file mode 100644
+index 0000000..f378a90
+--- /dev/null
++++ b/tests/regression/pp_line_splice_and_multiline_comment.c
+@@ -0,0 +1,27 @@
++/*
++ * Preprocessor line-resolver: a file that has BOTH a backslash-newline
++ * splice (join_map is Some) AND a multi-line block comment (comment_map
++ * is Some) must still expand __LINE__ to the PHYSICAL source line.
++ *
++ * This is the sqlite3.c amalgamation shape in miniature. A prior
++ * build_line_resolver cloned the whole join_map into a fresh Rc on every
++ * output line (Θ(N²)); correctness of the shared-Rc path is pinned here,
++ * scale is pinned by the lib test
++ * build_line_resolver_is_linear_on_large_spliced_commented_file.
++ *
++ * Physical lines of interest (1-based, after this comment block):
++ *   splice opens on the `int a = 1 + \` line
++ *   `__LINE__` after the multi-line comment must match gcc.
++ */
++#include <stdio.h>
++int main(void) {
++    int a = 1 + \
++        2;
++    /* multi
++       line comment */
++    int after = __LINE__;
++    int b = 3 + \
++        4; int same = __LINE__;
++    printf("%d %d %d\n", after, same, a + b);
++    return 0;
++}
+diff --git a/tests/regression/sqlite_strndup_sib_call.c b/tests/regression/sqlite_strndup_sib_call.c
+new file mode 100644
+index 0000000..5a74f50
+--- /dev/null
++++ b/tests/regression/sqlite_strndup_sib_call.c
+@@ -0,0 +1,107 @@
++/* Regression (sqlite3 3.53.4 CREATE TABLE SIGSEGV in vdbeChangeP4Full):
++ *
++ *   if (n == 0) n = strlen(zP4);          // diamond: multi-def Copy of I32 n
++ *   p = malloc(n+1); memcpy(p, z, n); p[n] = 0;
++ *
++ * resolve_index peels the I32→I64 Cast, so folded SIB keys on the Copy dest.
++ * That dest's last IR use is the Cast, BEFORE memcpy; the GEP sits AFTER.
++ * Multi-def folded-index stretch historically merged required=[GEP, Store],
++ * so memcpy was not call-spanning, Phase 2 homed n in %r10, lookaside/memcpy
++ * clobbered it, and ensure_sib_index_form movslq'd the stale register for
++ * p[n]=0 (vdbeChangeP4Full @ 0x4c0800, bad store 0x4c0b2f).
++ *
++ * Differential vs GCC. Extra live pointer params recreate register pressure
++ * so n is a candidate for a caller-saved SIB index. */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++
++struct Lookaside {
++    uint16_t sz;
++    int nOut;
++    char *a, *b, *c, *d, *e, *f;
++};
++
++__attribute__((noinline))
++static char *dupn(struct Lookaside *db, const char *z, int n) {
++    char *p;
++    if (z == 0)
++        return 0;
++    if (n == 0)
++        n = (int)strlen(z);
++    size_t need = (size_t)n + 1;
++    if (need <= db->sz && db->a) {
++        p = db->a;
++        db->a = *(char **)p;
++        db->nOut++;
++    } else if (need <= db->sz && db->b) {
++        p = db->b;
++        db->b = *(char **)p;
++        db->nOut++;
++    } else if (need <= db->sz && db->c) {
++        p = db->c;
++        db->c = *(char **)p;
++        db->nOut++;
++    } else if (need <= db->sz && db->d) {
++        p = db->d;
++        db->d = *(char **)p;
++        db->nOut++;
++    } else if (need <= db->sz && db->e) {
++        p = db->e;
++        db->e = *(char **)p;
++        db->nOut++;
++    } else if (need <= db->sz && db->f) {
++        p = db->f;
++        db->f = *(char **)p;
++        db->nOut++;
++    } else {
++        p = malloc(need);
++    }
++    if (p) {
++        memcpy(p, z, (size_t)n);
++        p[n] = 0;
++    }
++    /* Keep lookaside pointers live across memcpy + p[n]=0 so the RA cannot
++     * drop them before the indexed store (sqlite's sqlite3DbMallocRawNN). */
++    if (db->a || db->b || db->c || db->d || db->e || db->f)
++        db->nOut += 0;
++    return p;
++}
++
++static int check(const char *z, int n) {
++    struct Lookaside db = {0};
++    db.sz = 8; /* force malloc path, matching a small lookaside */
++    char *p = dupn(&db, z, n);
++    if (!p)
++        return 1;
++    size_t expect = n == 0 ? strlen(z) : (size_t)n;
++    int bad = p[expect] != 0 || memcmp(p, z, expect) != 0;
++    /* terminator must not have landed at a stale (clobbered) index */
++    if (expect > 0 && p[expect - 1] == 0 && z[expect - 1] != 0)
++        bad = 1;
++    free(p);
++    return bad;
++}
++
++int main(void) {
++    static const char *cases[] = {
++        "hello-world-sqlite-p4",
++        "CREATE TABLE t(a,b,c)",
++        "x",
++        "0123456789abcdef0123456789abcdef",
++        "",
++    };
++    int fails = 0;
++    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
++        int n = (int)strlen(cases[i]);
++        fails += check(cases[i], n);
++        fails += check(cases[i], 0); /* diamond n==0 → strlen */
++    }
++    if (fails) {
++        fprintf(stderr, "FAIL %d\n", fails);
++        return 1;
++    }
++    puts("OK");
++    return 0;
++}
+diff --git a/tests/regression/sqlite_strndup_sib_call.flags b/tests/regression/sqlite_strndup_sib_call.flags
+new file mode 100644
+index 0000000..47ec216
+--- /dev/null
++++ b/tests/regression/sqlite_strndup_sib_call.flags
+@@ -0,0 +1 @@
++-O2 -fPIC
