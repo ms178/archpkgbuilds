@@ -1,232 +1,124 @@
-From d0ed3cf1f255c1b9d4f35daa8dd6f1c6653f88e6 Mon Sep 17 00:00:00 2001
+From 8d14ea626b115e7f79645e691634b7992a1a94ae Mon Sep 17 00:00:00 2001
 From: arena-agent <297053741+arena-agent@users.noreply.github.com>
-Date: Tue, 1 Sep 2026 20:07:56 +0000
-Subject: [PATCH] x86 typed ISel: narrow integer loads must define the full
- register home
+Date: Tue, 1 Sep 2026 20:54:49 +0000
+Subject: [PATCH] stack_layout: F128 Copy webs need wide slots (i686 x87 fstpt
+ overflow)
 
-The typed ISel Load arm emitted plain Movs at S8/S16 for narrow integer
-loads (`movb mem, %r9b`): only the sub-register is written, bits [8:64)
-of the home stay undefined. The BinOp arm refuses sub-32-bit types, so
-narrow-homed values routinely cross into the mature text path, whose
-lowering reads operands at their promoted width: pr60960 (v4qi lane
-division) materialized `movq %r9, %rax; divq %rcx` over homes whose
-upper 56/48 bits were garbage -> wrong quotient -> abort at -O1/-O2.
+Copy carries no result type after phi elimination/mem2reg, so a Copy of
+an F128 value (long double on i686: loads turned into copies, phi temps,
+x87 compare staging values) fell into the default 8-byte slot class.
+fstpt spills 10 raw bytes of 80-bit x87 data, so the store ran 2 bytes
+into the low half of the adjacent slot: va-arg-pack-1.c staged the
+global long double v5 into slot E+20 while the ld compare copy sat at
+E+12; the second fstpt overwrote v5's significand low word with ld's
+exponent, the reload produced garbage and the `v5 != ld` compare
+aborted at i686 -O1/-O2 (all levels upstream).
 
-Fix: narrow_defined_load() lowers 8/16-bit integer loads through the
-extending 32-bit-destination forms - Movzx (movzbl/movzwl) for unsigned
-source types, Movsx (movsbl/movswl) for signed ones - so writing the
-32-bit sub-register zeroes the upper half and the whole home is defined:
-narrow readers see the unchanged low byte, wide readers see the
-canonical extension of the value. Same instruction length as the plain
-forms and no partial-register false dependency; identical doctrine to
-the Cast lowering (zlib-ng zng_emit_dist) and to GCC/Clang lowering.
-Applied to all three load arms (alloca slot, register pointer,
-stack-pointer dereference).
+Fix: propagate F128-ness to a fixed point over Copy{src: Value} edges
+(mirroring the compact_i686_values inference) and give the whole web
+the 16-byte F128 slot class (>= the 12-byte i686 payload). Also treats
+Copy{src: Const(LongDouble)} webs uniformly. Target-independent:
+x86-64's 16-byte movdqu spills have the same overflow shape on an
+8-byte-classified web.
 
-Validation: pr60960 {O1,O2} EXIT=0 (was abort); unit suite 1480/0/6;
-regression suite 554/0/15 AB-diff 0.
+Validation: va-arg-pack-1.c i686 {O0,O1,O2} EXIT=0 (was abort O1/O2);
+unit suite 1480/0/6.
 ---
- src/backend/x86/codegen/isel.rs | 77 +++++++++++++++++++++++++++------
- 1 file changed, 63 insertions(+), 14 deletions(-)
+ src/backend/stack_layout/slot_assignment.rs | 53 ++++++++++++++++++++-
+ 1 file changed, 52 insertions(+), 1 deletion(-)
 
-diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
-index 45f6a67d..6ca63004 100644
---- a/src/backend/x86/codegen/isel.rs
-+++ b/src/backend/x86/codegen/isel.rs
-@@ -1061,6 +1061,52 @@ pub fn lower_instruction_ctx(
-     lower_instruction_typed(inst, reg_assignments, alloca_slots, None, out)
- }
+diff --git a/src/backend/stack_layout/slot_assignment.rs b/src/backend/stack_layout/slot_assignment.rs
+index 26ddfe76..ac862dd6 100644
+--- a/src/backend/stack_layout/slot_assignment.rs
++++ b/src/backend/stack_layout/slot_assignment.rs
+@@ -170,6 +170,53 @@ pub(super) fn classify_instructions(
+         }
+     }
  
-+/// Lower an integer load into a register home, DEFINING the full 64-bit
-+/// home for narrow (8/16-bit) types.
-+///
-+/// A plain `Mov` at S8/S16 renders as `movb mem, %r9b` / `movw mem, %r9w`:
-+/// only the sub-register is written, bits [8:64) of the home stay undefined.
-+/// The typed ISel accepts loads of every integer width, but the BinOp arm
-+/// refuses sub-32-bit types, so narrow-homed values routinely cross into
-+/// the mature text path, whose lowering reads operands at their promoted
-+/// width (e.g. U8 division materializes `movq %r9, %rax; divq`) and at
-+/// raw 64-bit homes (SIB-index construction). pr60960 (v4qi lane division)
-+/// consumed exactly such a garbage-extended home and aborted.
-+///
-+/// Emit the extending 32-bit-destination forms instead — `movzbl`/`movzwl`
-+/// for unsigned sources, `movsbl`/`movswl` for signed ones. Writing the
-+/// 32-bit sub-register zeroes the upper half, so the whole home is defined:
-+/// narrow readers see the unchanged low byte, wide readers see the
-+/// canonical extension of the value. Same instruction length as the plain
-+/// forms, no partial-register false dependency — identical to the mature
-+/// text path's lowering and to GCC/Clang (see the Cast lowering's
-+/// zlib-ng `zng_emit_dist` note for the same doctrine).
-+fn narrow_defined_load(ty: IrType, size: OpSize, src: MachOperand, dst: MachReg) -> MachInst {
-+    if size == OpSize::S8 || size == OpSize::S16 {
-+        if ty.is_signed() {
-+            MachInst::Movsx {
-+                src,
-+                dst,
-+                from_size: size,
-+                to_size: OpSize::S32,
++    // F128 Copy webs.  Copy carries no result type after phi elimination, so
++    // a Copy of an F128 value (loads that mem2reg turned into copies, phi
++    // elimination temps, staging values for x87 compares) would otherwise be
++    // classified by the default 8-byte arm.  fstpt spills 10 raw bytes of
++    // 80-bit x87 data, so an 8-byte slot lets the store run into the low half
++    // of the adjacent slot and corrupts it (observed as va-arg-pack-1.c
++    // aborting its long-double compare on i686 at -O1/-O2).  Propagate
++    // F128-ness to a fixed point over Copy{src: Value} edges and give the
++    // whole web the wide F128 slot class.  Target-independent: x86-64's
++    // 16-byte movdqu spills have exactly the same overflow shape.
++    let mut f128_web_values: FxHashSet<u32> = FxHashSet::default();
++    for block in &func.blocks {
++        for inst in &block.instructions {
++            if let Some(dest) = inst.dest() {
++                if inst.result_type() == Some(IrType::F128) {
++                    f128_web_values.insert(dest.0);
++                }
++                if let Instruction::Copy {
++                    dest,
++                    src: Operand::Const(IrConst::LongDouble(..)),
++                } = inst
++                {
++                    f128_web_values.insert(dest.0);
++                }
 +            }
-+        } else {
-+            MachInst::Movzx {
-+                src,
-+                dst,
-+                from_size: size,
-+                to_size: OpSize::S32,
-+            }
-+        }
-+    } else {
-+        MachInst::Mov {
-+            src,
-+            dst: MachOperand::Reg(dst),
-+            size,
 +        }
 +    }
-+}
++    loop {
++        let before = f128_web_values.len();
++        for block in &func.blocks {
++            for inst in &block.instructions {
++                if let Instruction::Copy {
++                    dest,
++                    src: Operand::Value(src),
++                } = inst
++                {
++                    if f128_web_values.contains(&src.0) {
++                        f128_web_values.insert(dest.0);
++                    }
++                }
++            }
++        }
++        if f128_web_values.len() == before {
++            break;
++        }
++    }
 +
- /// Lower with full context plus a value-type map for width-consistent
- /// Copy lowering. `value_types` may be None (tests); copies then keep the
- /// historical 64-bit width.
-@@ -1135,23 +1181,25 @@ fn lower_instruction_typed_inner(
-             let dst = value_to_reg(dest, ra);
-             // Alloca: load directly from stack slot
-             if let Some(&slot) = alloca_slots.get(&ptr.0) {
--                out.push(MachInst::Mov {
--                    src: MachOperand::StackSlot(slot),
--                    dst: MachOperand::Reg(dst),
-+                out.push(narrow_defined_load(
-+                    *ty,
-                     size,
--                });
-+                    MachOperand::StackSlot(slot),
-+                    dst,
-+                ));
-                 return true;
+     // Build set of values that are defined (as dest) by non-InlineAsm
+     // instructions. This identifies "indirect" asm output pointers:
+     //
+@@ -411,6 +458,7 @@ pub(super) fn classify_instructions(
+                     ctx,
+                     reg_assigned,
+                     &compact_i686_values,
++                    &f128_web_values,
+                     &mut collected_values,
+                     multi_block_values,
+                     block_local_values,
+@@ -423,6 +471,7 @@ pub(super) fn classify_instructions(
+                     ctx,
+                     reg_assigned,
+                     &compact_i686_values,
++                    &f128_web_values,
+                     &mut collected_values,
+                     multi_block_values,
+                     block_local_values,
+@@ -539,6 +588,7 @@ fn classify_value(
+     ctx: &StackLayoutContext,
+     reg_assigned: &FxHashMap<u32, PhysReg>,
+     compact_i686_values: &FxHashSet<u32>,
++    f128_web_values: &FxHashSet<u32>,
+     collected_values: &mut FxHashSet<u32>,
+     multi_block_values: &mut Vec<MultiBlockValue>,
+     block_local_values: &mut Vec<BlockLocalValue>,
+@@ -551,7 +601,8 @@ fn classify_value(
+                 src: Operand::Const(IrConst::LongDouble(..)),
+                 ..
              }
-             // Pointer in register: load via memory operand
-             if let Some(&phys) = ra.get(&ptr.0) {
--                out.push(MachInst::Mov {
--                    src: MachOperand::Mem {
-+                out.push(narrow_defined_load(
-+                    *ty,
-+                    size,
-+                    MachOperand::Mem {
-                         base: MachReg::Phys(phys),
-                         offset: 0,
-                     },
--                    dst: MachOperand::Reg(dst),
--                    size,
--                });
-+                    dst,
-+                ));
-                 return true;
-             }
-             // Pointer on stack: load ptr to rcx, then dereference
-@@ -1161,14 +1209,15 @@ fn lower_instruction_typed_inner(
-                 dst: MachOperand::Reg(MachReg::Phys(RCX)),
-                 size: OpSize::S64,
-             });
--            out.push(MachInst::Mov {
--                src: MachOperand::Mem {
-+            out.push(narrow_defined_load(
-+                *ty,
-+                size,
-+                MachOperand::Mem {
-                     base: MachReg::Phys(RCX),
-                     offset: 0,
-                 },
--                dst: MachOperand::Reg(dst),
--                size,
--            });
-+                dst,
-+            ));
-             true
-         }
-         Instruction::Store {
--- 
-2.47.3
-
-
-From ecc90b605cf751d58bd39268e23b5753642c4441 Mon Sep 17 00:00:00 2001
-From: arena-agent <297053741+arena-agent@users.noreply.github.com>
-Date: Tue, 1 Sep 2026 19:49:13 +0000
-Subject: [PATCH] x86 machinst emit: size-correct rax relay register names
- (movb/movw mem-relay)
-
-The mem-to-mem relays in Mov (2 sites), Cmp and Test hard-coded the relay
-register name as "eax" for S32 and "rax" for everything else. Since
-narrow stores stopped being refused by the typed ISel (PR #337), 8/16-bit
-Mov/Cmp/Test reach the relay and emitted unencodable 8/16-bit mnemonic
-with a 64-bit register operand (mnemonic size suffix vs register operand
-width mismatch, rejected by the assembler validator): 28 torture cases
-compile-failed at -O0. Name the relay via sized_reg_name(RAX, size)
-which yields %al/%ax/%eax/%rax.
-
-Validation: 28 affected torture cases x {O0,O1,O2} = 84/84 pass; unit
-suite green (1480/0/6).
----
- src/backend/x86/codegen/machinst_emit.rs | 21 +++++++++++++++------
- 1 file changed, 15 insertions(+), 6 deletions(-)
-
-diff --git a/src/backend/x86/codegen/machinst_emit.rs b/src/backend/x86/codegen/machinst_emit.rs
-index 140fc2ae..ea36db0b 100644
---- a/src/backend/x86/codegen/machinst_emit.rs
-+++ b/src/backend/x86/codegen/machinst_emit.rs
-@@ -310,12 +310,17 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
-             match (src, dst) {
-                 (MachOperand::Reg(a), MachOperand::Reg(b)) if a == b => return,
-                 (MachOperand::StackSlot(a), MachOperand::StackSlot(b)) if a == b => return,
--                // x86 can't do mem-to-mem moves. Use rax as relay.
-+                // x86 can't do mem-to-mem moves. Use rax as relay. The relay
-+                // register must be named at the INSTRUCTION's operand size:
-+                // `movb …, %rax` / `movw …, %rax` are unencodable (mnemonic
-+                // size suffix must match the register operand width) — narrow
-+                // sizes reach this relay for 8/16-bit loads/stores, so name
-+                // the sub-register (%al/%ax) via the canonical size table.
-                 (MachOperand::StackSlot(_), MachOperand::StackSlot(_)) => {
-                     let src_str = fmt_operand(src, *size, out);
-                     let dst_str = fmt_operand(dst, *size, out);
-                     let suffix = size.suffix();
--                    let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
-+                    let rax = sized_reg_name(RAX, *size);
-                     out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, src_str, rax));
-                     out.emit_fmt(format_args!("    mov{} %{}, {}", suffix, rax, dst_str));
-                     return;
-@@ -323,11 +328,11 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
-                 (MachOperand::Mem { .. }, MachOperand::Mem { .. })
-                 | (MachOperand::Mem { .. }, MachOperand::StackSlot(_))
-                 | (MachOperand::StackSlot(_), MachOperand::Mem { .. }) => {
--                    // Also mem-to-mem: use rax relay
-+                    // Also mem-to-mem: use rax relay (size-correct name, see above)
-                     let src_str = fmt_operand(src, *size, out);
-                     let dst_str = fmt_operand(dst, *size, out);
-                     let suffix = size.suffix();
--                    let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
-+                    let rax = sized_reg_name(RAX, *size);
-                     out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, src_str, rax));
-                     out.emit_fmt(format_args!("    mov{} %{}, {}", suffix, rax, dst_str));
-                     return;
-@@ -537,7 +542,9 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
-             );
-             if both_mem {
-                 let rhs_str = fmt_operand(&rhs, *size, out);
--                let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
-+                // Relay register named at operand size (%al/%ax/%eax/%rax):
-+                // a `movb …, %rax` relay load is unencodable.
-+                let rax = sized_reg_name(RAX, *size);
-                 out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, rhs_str, rax));
-                 let lhs_str = fmt_operand(&lhs, *size, out);
-                 // AT&T: cmp rhs, lhs
-@@ -571,7 +578,9 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
-             );
-             if both_mem {
-                 let rhs_str = fmt_operand(&rhs, *size, out);
--                let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
-+                // Relay register named at operand size (%al/%ax/%eax/%rax):
-+                // a `movb …, %rax` relay load is unencodable.
-+                let rax = sized_reg_name(RAX, *size);
-                 out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, rhs_str, rax));
-                 let lhs_str = fmt_operand(&lhs, *size, out);
-                 out.emit_fmt(format_args!("    test{} %{}, {}", suffix, rax, lhs_str));
+-        );
++        )
++        || f128_web_values.contains(&dest.0);
+ 
+     // Copy instructions have result_type() = None, so we must check whether
+     // the source operand is an I128 value. If it is, the Copy dest also needs
 -- 
 2.47.3
 
