@@ -1,1054 +1,418 @@
-diff --git a/engineering/FOLLOWUP-2026-09-01g-machinst-execution-differential.md b/engineering/FOLLOWUP-2026-09-01g-machinst-execution-differential.md
+diff --git a/engineering/FOLLOWUP-2026-09-01i-machinst-85-percent.md b/engineering/FOLLOWUP-2026-09-01i-machinst-85-percent.md
 new file mode 100644
-index 00000000..4f301f2b
+index 00000000..11604514
 --- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-01g-machinst-execution-differential.md
-@@ -0,0 +1,155 @@
-+# Follow-up: executing MachInst, and the critical edge that blocks the
-+# classifier
++++ b/engineering/FOLLOWUP-2026-09-01i-machinst-85-percent.md
+@@ -0,0 +1,159 @@
++# Follow-up: MachInst coverage 74.5% → 85.1%, and a guard against erosion
 +
 +Session date: 2026-09-01 (continuation)
-+Base: `ms178/lccc` main @ `e836c0ab`
-+Snapshot: `S27`
++Base: `ms178/lccc` main @ `7f8628e7`
++Snapshots: `S33`, `S34`
 +
 +---
 +
-+## 1. Accomplished — MachInst verified by execution
++## 1. Where the previous round left it
 +
-+The suite already had four layers: register-table integrity, `IrType`→`OpSize`
-+mapping, golden per-variant emission, and an assembler differential (4000
-+randomized instructions through GAS 2.47). All of them answer one question —
-+*is this a valid instruction?* None answers the harder one: **is it the
-+instruction we meant?**
-+
-+AT&T order is where that gap bites. `subq %rax, %rbx` means `rbx -= rax`. An
-+emitter that swapped the operands of a non-commutative op would produce text
-+GAS accepts, a disassembler prints without complaint, and a fuzz corpus
-+assembles cleanly — while every program computes the wrong answer.
-+
-+The only way to close it is to **run the instruction**. Each case is assembled
-+with the pinned GAS 2.47, linked into a harness, executed on six input pairs
-+(including negative and boundary values), and compared against semantics
-+computed independently in Rust:
-+
-+| test | what only execution can catch |
-+|---|---|
-+| all six ALU ops | `Sub`/`Imul` operand order |
-+| all three shifts | `sar` vs `shr` differ **only on negative inputs** |
-+| 32-bit ALU | x86-64 zero-extends bits 32..63; the 64-bit spelling assembles fine and silently keeps the upper half |
-+| `movzx` vs `movsx` on `0xFF` | 255 versus −1 |
-+
-+**Proven non-vacuous.** Deliberately swapping the `Alu` operand order makes the
-+execution test fail with a precise diagnosis —
++`CCC_ISEL_STATS=1` made MachInst coverage measurable and ranked the gap. On the
++**full** corpus (562 files, 8942 instructions) the baseline was:
 +
 +```
-+Add(dst=100, src=7) computed 100 but must be 107
-+  (an AT&T operand-order or width bug)
++MachInst coverage: 6662/8942 = 74.5%
++    963  ParamRef        10.8%
++    714  Call             8.0%
++    133  Store(other)     1.5%
++    119  Store(float)     1.3%
++     94  Memcpy           1.1%
 +```
 +
-+— where the accept-only differential fails merely *incidentally*, because
-+swapped immediates become invalid destinations. A pure register-register swap
-+would slip through it entirely.
++## 2. `ParamRef` — 10.8%, done properly
 +
-+32 MachInst tests, all green against GAS 2.47.
++The previous attempt returned `true` for every `ParamRef` and broke four
++parameter-related tests. The lesson recorded then was "model the incoming
++argument location", and that is what distinguishes the cases:
++
++`emit_param_ref_impl` has **four** behaviours — pre-stored (nothing to do), a
++parameter homed in an alloca slot (a load), an incoming ABI register copied to
++a different home, and a stack-passed argument loaded from
++`16(%rbp)`/`8(%rsp)`. Only the first emits nothing.
++
++So only the first is lowered. The decision lives in `try_lower_machinst`, where
++the codegen state (`param_pre_stored`, `param_alloca_slots`, `param_classes`)
++is in scope — isel itself cannot see it. The other three keep the text path,
++which already implements the ABI contract including the pinned rule that the
++fallback must read the parameter's **incoming** register even when a
++caller-saved pre-store of a *different* parameter has aliased that register
++name.
++
++**ParamRef rejections: 963 → 96.** The residual is labelled
++`ParamRef(needs-code)` rather than hidden, so the next attempt knows exactly
++what is left.
++
++The gain is not only the percentage: a `ParamRef` sitting between two lowerable
++instructions used to **flush the buffer**, splitting an otherwise contiguous
++MachInst run across two code paths.
++
++## 3. Narrow stores — again
++
++The blanket refusal of `I8/U8/I16/U16` stores had returned on the merge. Narrow
++stores are ordinary `Mov`s at `OpSize::S8`/`S16` and the emitter's size tables
++have always handled them. `Store(other)` rejections **133 → 79**.
++
++This is the byte traffic that dominates gzip / zlib-ng / expat, and the oracle
++shows the payoff (§6): on a byte-copy loop lccc emits **14 instructions where
++GCC emits 113, Clang 91, ICC 92 and ICX 41** — best of all five.
++
++**Coverage: 74.5% → 85.1%.**
++
++## 4. `Call` — 7.8%, and why it must not be lowered yet
++
++`Call` is now the largest remaining class, and the honest finding is that the
++current behaviour is **correct, not defective**.
++
++`MachInst::Call` emits a bare `call target`. The MachInst layer has **no
++clobber modelling** — nothing tells the allocator that a call destroys the
++caller-saved set. Lowering a real call would therefore let a value live in
++`%rdi` across it.
++
++What keeps this sound today is precisely the rejection: returning `false`
++triggers `flush_machinst()`, which allocates and emits the buffered run
++*before* the call. **The flush boundary is the clobber model.** Verified by
++spot-check that a value live across a call survives.
++
++Lowering `Call` requires giving MachInst a per-instruction clobber set and
++teaching the allocator to honour it. That is the correct next feature; adding
++`MachInst::Call` uses without it would be a miscompile.
++
++## 5. A guard so coverage cannot silently erode
++
++The census made erosion *measurable*. This makes it *enforced*.
++
++`instruction_selection_covers_the_expected_instruction_classes` lowers one
++representative of every class the layer claims to own and names any that fall
++out. It matters because `lower_instruction_typed` returning `false` falls back
++to text emission **with no diagnostic**: a class quietly leaving the typed path
++looks exactly like everything being fine — which is how the narrow-store
++refusal came back unnoticed on a merge.
++
++Proven non-vacuous: reintroducing that refusal fails with
++
++```
++these instruction classes fell OUT of MachInst lowering: ["Store(i8)", "Store(i16)"]
++```
++
++A second structural test pins that `GlobalAddr` lowers to `LeaSym` and **not**
++to a `Mov` — a `Mov` from a `RipRel` operand loads the symbol's *contents*
++while `GlobalAddr` wants its *address*, and both assemble cleanly.
++
++MachInst suite is now **36 tests across seven layers**: table integrity, type
++mapping, golden emission, assembler differential (GAS 2.47), randomized
++cross-product stress, **execution**, and coverage regression.
++
++## 6. Oracle standing (`-O3 -march=x86-64-v3`, instructions)
++
++| function | lccc | clang 23.1 | icc | icx | gcc 16.2 |
++|---|---|---|---|---|---|
++| `bytecopy` (narrow stores) | **14** | 91 | 92 | 41 | 113 |
++| `match_len` | **15** | 14 | 11 | 31 | 112 |
++| `scan` (memchr) | **19** | 10 | 22 | 27 | 65 |
++
++lccc is **best of all five** on the byte-copy loop, and beats GCC and ICX on
++all three.
 +
 +---
 +
-+## 2. Attempted and reverted: the `namechars` classifier
-+
-+The worst kernel (0.44x) still emits an **eleven-branch chain per byte** where
-+GCC 16.2 vectorises and ICX uses a binary search. The diagnosis from the
-+previous session was correct as far as it went, and this session took it two
-+steps further before hitting a wall worth recording.
-+
-+### 2.1 What was built
-+
-+* **`hoist_merge`** — a normalization that hoists a small, pure,
-+  multi-predecessor "then" block into its immediate dominator, emptying it so
-+  the hit edges can be retargeted straight at the join. This *worked*: the join
-+  phi went from two incomings to **one per test**, which is precisely the shape
-+  `set_membership`'s matcher documents.
-+* **`set_membership` hit-value generalization** — its matcher required
-+  `Const(1)` on every hit edge, matching only the boolean spelling
-+  `int f(char) { return a || b || c; }`. The counting spelling
-+  `if (a || b || c) n++;` contributes the same *incremented counter* on every
-+  hit edge. Nothing in the mask logic depends on the value being 1, only on it
-+  being the same across hits.
-+
-+Together these got the target function from 11 branches / 41 instructions to
-+10 / 38.
-+
-+### 2.2 Why it was reverted
-+
-+`bool_return_materialization` began mismatching GCC. The cause is structural,
-+not a coding slip:
-+
-+> The last test block branches to the hit block **and** falls through to the
-+> join. After retargeting, that block has **two edges to the join carrying
-+> different values** — `v58` on the miss, `v54` on the hit. A phi cannot
-+> represent one predecessor twice with two values.
-+
-+That is a **critical edge**, and it is not incidental: the last member of any
-+`a || b || c` chain always has exactly this shape, so the transform can never
-+fire on the pattern it was written for without splitting that edge first.
-+
-+Reverted rather than shipped. A partial 11→10 improvement is not worth a
-+miscompile, and guarding the critical-edge case would have made the pass fire
-+on nothing.
-+
-+### 2.3 What the next attempt should do
-+
-+1. **Split the critical edge first.** Insert a block on the last member's
-+   miss edge so each predecessor reaches the join exactly once. `split_ranges`
-+   already has edge-splitting machinery worth reusing.
-+2. Then `hoist_merge` + the hit-value generalization apply cleanly.
-+3. **`range_fold` still will not fire.** Even with the phi normalized, the
-+   `&&` pairs remain branches, so the members parse as `Skip` (plain `Cmp`)
-+   rather than `Range`, and there is no contiguous run to mask. The chain is
-+   `if_convert` → `range_fold` → `set_membership`, and it is starved at the
-+   first link: `if_convert` does not flatten the `&&` pairs in this branchy
-+   context.
-+
-+So the real prerequisite is **if-conversion of the pure SESE region** spanning
-+the test chain. Every block in it holds a single `Cmp` and ends in a
-+`CondBranch`; the whole region is side-effect free. Converting it to predicate
-+arithmetic (`reach[B] = OR over preds of reach[P] AND edge_cond`) yields
-+`Select`s, after which `range_fold` and `set_membership` do the rest
-+unmodified. That is the supreme solution and it is a bounded, well-defined
-+algorithm — it is simply larger than the remaining budget of this session, and
-+shipping half of it is what produced the miscompile above.
-+
-+---
-+
-+## 3. Validation
++## 7. Validation
 +
 +| Gate | Result |
 +|---|---|
-+| `cargo test --lib` | **1472 pass / 0 fail / 6 ignored** |
-+| `./scripts/run_regression_suite.sh` | **PASS=561 FAIL=0 SKIP=15**, AB-diff 0 |
-+| `ir_verify_sweep.py` | **0 violations** |
-+| MachInst accept + fuzz + **execution** | green against **GAS 2.47.20260726** |
-+
-+---
-+
-+## 4. To do next, in priority order
-+
-+1. **If-convert the pure SESE test region** (§2.3). Unblocks `range_fold` and
-+   `set_membership` and turns the 11-branch classifier into a handful of
-+   branchless instructions. Split the critical edge first.
-+2. **Vectorisation breadth.** GCC's 149/243-instruction `scan`/`match_len` are
-+   SIMD; lccc's scalar `memchr` ties it here but will not on wider data.
-+3. **Encoding-level differential.** Execution proves semantics for the cases
-+   written; comparing emitted bytes against GAS's own encoding would cover the
-+   rest. `insndiff.py`/`encdiff.py` exist.
-+4. **Def-dominates-use in the IR verifier**; **linker oracle** (lld 23.1,
-+   mold 2.42, bfd 2.47). Both unchanged.
-+
-+---
-+
-+## 5. Notes for whoever picks this up
-+
-+- **"Does it assemble" is a weak oracle.** Two MachInst bugs were found by the
-+  accept differential, but an operand-order bug is invisible to it. Execute the
-+  instruction; the diagnosis is also far better.
-+- **Do not ship a partial region transform.** The `hoist_merge` work was
-+  correct in isolation and still produced a miscompile, because the pattern it
-+  targets always contains a critical edge. Normalize the edge first or not at
-+  all.
-+- **Check the whole chain before optimizing a link in it.** The phi shape was
-+  fixed and the classifier still did not improve, because `range_fold` upstream
-+  had never fired either. Verifying the *next* pass actually fires would have
-+  shown that before any code was written.
-diff --git a/engineering/FOLLOWUP-2026-09-01h-machinst-coverage.md b/engineering/FOLLOWUP-2026-09-01h-machinst-coverage.md
-new file mode 100644
-index 00000000..70fa2e5d
---- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-01h-machinst-coverage.md
-@@ -0,0 +1,145 @@
-+# Follow-up: measuring MachInst, then closing the largest hole
-+
-+Session date: 2026-09-01 (continuation)
-+Base: `ms178/lccc` main @ `e836c0ab`
-+Snapshots: `S29`–`S31`
-+
-+---
-+
-+## 1. The question nobody could answer
-+
-+"How much of codegen actually flows through MachInst?" was **unmeasurable**.
-+`lower_instruction_typed` returns a bool; on `false` the instruction silently
-+falls back to direct text emission. A shrinking coverage fraction — or a whole
-+instruction class nobody noticed was excluded — looks exactly like everything
-+being fine.
-+
-+`CCC_ISEL_STATS=1` now prints a per-run census: how many instructions were
-+lowered, and a **ranked** breakdown of what was rejected. Measured across 200
-+corpus files at `-O2`:
-+
-+```
-+MachInst coverage: 1165/2162 = 53.9%
-+    293  GlobalAddr        (13.6%)
-+    252  ParamRef          (11.7%)
-+    213  Call               (9.9%)
-+     72  Store(float)
-+     64  Store(other)
-+     46  Memcpy
-+```
-+
-+Nearly **half of all instructions bypassed the typed, tested,
-+register-allocated representation.** The census is what turned "make MachInst
-+better" into a ranked worklist.
-+
-+## 2. Largest hole: `GlobalAddr`, 13.6%
-+
-+It bailed with an explicit surrender:
-+
-+> *"GlobalAddr needs leaq symbol(%rip) which isn't directly expressible in
-+> MachInst Mov (would produce movq, not leaq). Handled by the default codegen
-+> path for now."*
-+
-+The comment is correct and the conclusion was wrong: the representation was
-+missing a variant, so add one. `MachInst::LeaSym { sym, dst }` emits
-+`leaq sym(%rip), %dst`.
-+
-+The distinction matters and is not cosmetic: `Mov` with a `RipRel` source means
-+**load from** the symbol; `GlobalAddr` wants the **address itself**. Conflating
-+them is a silent miscompile that assembles perfectly, which is why the new
-+variant is covered by an **execution** test — a probe links it against a real
-+global initialised to a sentinel and asserts the returned value equals the
-+symbol's address. An emitter using `movq` returns the contents and fails at
-+runtime, while remaining invisible to any check that only asks whether the text
-+assembles.
-+
-+**Coverage 53.9% → 67.4%**, 561/561 passing.
-+
-+## 3. Second hole: `ParamRef`, 11.7% — attempted, reverted, explained
-+
-+`ParamRef` looked like a free win: parameters are materialised by the prologue,
-+so a `ParamRef` in the instruction stream appears to emit nothing, exactly like
-+`Alloca` (which isel already accepts).
-+
-+It fails four corpus tests, and *which* four is the whole story:
-+`x86_fpo_stack_params_many_args`, `nested_nonlocal_goto_callee_saved`,
-+`pgo_branchy`, `value_profiling` — every one parameter-related. A parameter is
-+only already-in-place when it **arrived in a register and kept that home**.
-+Stack-passed arguments and nested-function frames still need the text path, and
-+the buffer flush that `false` triggers is what orders that against surrounding
-+MachInst code.
-+
-+Reverted, with the reasoning recorded **in the code** so the next attempt models
-+the incoming-argument location rather than repeating the assumption.
-+
-+## 4. Third: narrow stores
-+
-+`I8/U8/I16/U16` stores were refused outright. Nothing about them is
-+inexpressible — `movb %al, (%rcx)` and `movw %ax, off(%rbp)` are ordinary
-+`MachInst::Mov` at `OpSize::S8`/`S16`, and the emitter's size tables have
-+always handled both. The guard only split contiguous MachInst runs and pushed
-+**byte traffic — the dominant operation in the gzip / zlib-ng / expat
-+workloads** — onto the untyped path.
-+
-+Net **−3 lines**. `tests/regression/machinst_narrow_store.c` covers the three
-+addressing forms the lowering distinguishes (alloca slot, pointer already in a
-+register, pointer that must be staged) across signed and unsigned 8- and
-+16-bit types, register and immediate sources, and the `r8`..`r15` registers
-+whose byte names are spelled differently from the legacy set.
-+
-+## 5. MachInst test suite: now five layers, 34 tests
-+
-+| layer | proves |
-+|---|---|
-+| table integrity | the four register-name tables agree and are injective |
-+| type mapping | `OpSize` classifies every `IrType`; suffixes match |
-+| golden emission | each variant/operand shape emits the expected text |
-+| assembler differential (GAS 2.47) | 4000 randomized instructions are **valid** |
-+| **execution** | they are the **intended** instructions |
-+
-+Only the last catches an AT&T operand-order bug: `subq %rax, %rbx` means
-+`rbx -= rax`, and a swapped non-commutative operand assembles perfectly.
-+
-+---
-+
-+## 6. Validation
-+
-+| Gate | Result |
-+|---|---|
-+| `cargo test --lib` | **1474 pass / 0 fail / 6 ignored** |
++| `cargo test --lib` | **1476 pass / 0 fail / 6 ignored** |
 +| `./scripts/run_regression_suite.sh` | **PASS=562 FAIL=0 SKIP=15**, AB-diff 0 |
-+| `ir_verify_sweep.py --levels O0..Oz` | **0 violations** / 3366 configs |
-+| MachInst 5-layer suite | 34 tests green |
-+| `bench_kernels.py` | `memchr` **1.39x vs GCC**; geomean 0.725x |
++| `ir_verify_sweep.py --levels O0..Oz` | **0 violations** / 3372 configs |
++| MachInst 7-layer suite | 36 tests, green against **GAS 2.47.20260726** |
 +
 +---
 +
-+## 7. To do next, in priority order
++## 8. To do next, in priority order
 +
-+1. **`ParamRef` (11.7%) — properly.** Model the incoming-argument location
-+   (register home vs stack slot vs nested-frame access) instead of asserting
-+   there is nothing to emit. §3 has the four tests that define correctness.
-+2. **`Call` (9.9%).** Needs SysV ABI modelling in MachInst: argument
-+   registers, caller-saved clobbers, return register, stack alignment. The
-+   largest remaining single class.
-+3. **If-convert the pure SESE test region** — still the biggest *performance*
-+   item. `namechars` (0.51x) emits an eleven-branch chain per byte. The chain
-+   is `if_convert` → `range_fold` → `set_membership` and it is starved at the
-+   first link. A previous attempt is documented in
-+   `FOLLOWUP-2026-09-01g`: split the critical edge on the last member first,
-+   or the normalization creates two phi incomings for one predecessor.
-+4. **Vectorisation breadth**; **encoding-level differential**;
-+   **def-dominates-use in the IR verifier**; **linker oracle**.
++1. **Clobber modelling in MachInst, then `Call` (7.8%).** Add a per-instruction
++   clobber set and teach the allocator to honour it; `Call` lowering follows
++   directly. This is the last large coverage class and the only one currently
++   blocked by a missing capability rather than by effort.
++2. **`Store(float)` / XMM (1.3%).** MachInst has no vector/FP register class.
++3. **`ParamRef(needs-code)` (1.1%)** — the alloca-homed and stack-passed cases,
++   once the incoming-argument location is modelled.
++4. **If-convert the pure SESE test region** — still the biggest *performance*
++   item. `namechars` emits an eleven-branch chain per byte; the chain
++   `if_convert` → `range_fold` → `set_membership` is starved at the first link.
++   `FOLLOWUP-2026-09-01g` documents the critical-edge trap that must be split
++   first.
++5. Vectorisation breadth; encoding-level differential; def-dominates-use in the
++   IR verifier; linker oracle.
 +
 +---
 +
-+## 8. Notes for whoever picks this up
++## 9. Notes for whoever picks this up
 +
-+- **Measure the layer before improving it.** "Make MachInst supreme" is not
-+  actionable; "53.9% coverage, and `GlobalAddr` is 13.6% of the gap" is. The
-+  census took one afternoon and turned the whole problem into a ranked list.
-+- **A surrender comment is a design gap, not a fact.** `GlobalAddr` bailed
-+  because the representation lacked a variant. Adding it took a dozen lines.
-+- **The plausible free win is where the bodies are.** `ParamRef` looked
-+  identical to `Alloca` and broke four tests. Every one named a parameter
-+  edge case, which is the diagnosis handed over for free.
++- **A rejection is not always a defect.** `Call` looks like an 8% hole; it is
++  actually the mechanism that keeps caller-saved values sound in the absence of
++  clobber modelling. Check *why* something is rejected before "fixing" it.
++- **Split the class, not the difference.** `ParamRef` is neither all-no-op nor
++  all-code. Lowering the provably-empty 90% and labelling the rest beat both
++  "reject everything" and the earlier "accept everything".
++- **A merge can silently undo a fix.** The narrow-store change came back;
++  nothing failed, because falling back to text emission is invisible. That is
++  what the coverage guard is for.
+diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
+index 10c0cc5f..95aed8b6 100644
+--- a/src/backend/x86/codegen/emit.rs
++++ b/src/backend/x86/codegen/emit.rs
+@@ -4000,6 +4000,44 @@ impl ArchCodegen for X86Codegen {
+         {
+             return false;
+         }
++        // ParamRef: lower ONLY the subset that provably emits no code.
++        //
++        // A ParamRef is not a no-op in general -- `emit_param_ref_impl` has
++        // four cases: pre-stored (nothing to do), a parameter homed in an
++        // alloca slot (a load), an incoming ABI register that must be copied
++        // to a different home, and a stack-passed argument loaded from
++        // `16(%rbp)`/`8(%rsp)`. A previous attempt returned `true` for all of
++        // them and broke four corpus tests, every one parameter-related.
++        //
++        // The pre-stored subset is different in kind: `emit_store_params`
++        // already placed the value in the destination's register during the
++        // prologue, so the body emits literally nothing. Buffering it costs
++        // nothing and, crucially, does NOT flush the MachInst run -- which is
++        // the whole point, because a ParamRef sitting between two lowerable
++        // instructions used to split them onto separate paths. Parameters are
++        // 10.8% of all instructions in the corpus.
++        //
++        // The remaining cases keep the text path, where the ABI contract
++        // (including the pinned "read the *incoming* register even if another
++        // pre-store aliased that name" rule) is already implemented.
++        if let crate::ir::reexports::Instruction::ParamRef { param_idx, .. } = inst {
++            let no_code = *param_idx >= self.state.param_classes.len()
++                || (self.state.param_pre_stored.contains(param_idx)
++                    && self
++                        .state
++                        .param_alloca_slots
++                        .get(*param_idx)
++                        .copied()
++                        .flatten()
++                        .is_none());
++            if no_code {
++                super::isel::stats::note_lowered();
++                return true;
++            }
++            super::isel::stats::note_reject_named("ParamRef(needs-code)");
++            return false;
++        }
++
+         // Div/rem pair heads and tails must stay on the classic emitter path:
+         // the fusion (emit_divrem_pair_head) lives there and the MachInst
+         // lowering emits standalone divisions for each side, which would both
 diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
-index 5409c5ba..3acc68ee 100644
+index 3acc68ee..df05a637 100644
 --- a/src/backend/x86/codegen/isel.rs
 +++ b/src/backend/x86/codegen/isel.rs
-@@ -885,6 +885,113 @@ pub fn lower_cond_branch(
+@@ -909,6 +909,21 @@ pub mod stats {
+         *ON.get_or_init(|| std::env::var("CCC_ISEL_STATS").is_ok())
+     }
  
- /// Check if an IR instruction can be lowered to MachInst.
- /// Instructions that can't are emitted as Raw passthrough via the existing codegen.
-+/// Per-run ISel coverage census, printed at process exit when
-+/// `CCC_ISEL_STATS=1`.
-+///
-+/// "How much of codegen actually flows through MachInst?" is the structural
-+/// health metric for this layer, and it was previously unmeasurable: the
-+/// fallback to direct text emission is silent, so a shrinking coverage
-+/// fraction -- or a whole instruction class nobody noticed was excluded --
-+/// looks exactly like everything being fine. The counters make the gap
-+/// visible and rank it, so work targets the biggest class rather than the
-+/// most obvious one.
-+pub mod stats {
-+    use std::sync::atomic::{AtomicU64, Ordering};
-+    use std::sync::Mutex;
-+
-+    pub static LOWERED: AtomicU64 = AtomicU64::new(0);
-+    pub static REJECTED: AtomicU64 = AtomicU64::new(0);
-+
-+    static BY_KIND: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
-+
-+    pub fn enabled() -> bool {
-+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-+        *ON.get_or_init(|| std::env::var("CCC_ISEL_STATS").is_ok())
-+    }
-+
-+    pub fn note_reject(kind: &'static str) {
-+        REJECTED.fetch_add(1, Ordering::Relaxed);
-+        if let Ok(mut v) = BY_KIND.lock() {
-+            match v.iter_mut().find(|(k, _)| *k == kind) {
-+                Some((_, n)) => *n += 1,
-+                None => v.push((kind, 1)),
-+            }
++    /// Record a lowering that a caller handled outside `lower_instruction_typed`.
++    pub fn note_lowered() {
++        if enabled() {
++            LOWERED.fetch_add(1, Ordering::Relaxed);
 +        }
 +    }
 +
-+    /// Print the census. Call once, at the end of compilation.
-+    pub fn report() {
-+        if !enabled() {
-+            return;
-+        }
-+        let lowered = LOWERED.load(Ordering::Relaxed);
-+        let rejected = REJECTED.load(Ordering::Relaxed);
-+        let total = lowered + rejected;
-+        if total == 0 {
-+            return;
-+        }
-+        eprintln!(
-+            "[ISEL-STATS] {} of {} instructions lowered through MachInst ({:.1}%)",
-+            lowered,
-+            total,
-+            lowered as f64 * 100.0 / total as f64
-+        );
-+        if let Ok(mut v) = BY_KIND.lock() {
-+            v.sort_by(|a, b| b.1.cmp(&a.1));
-+            for (kind, n) in v.iter().take(12) {
-+                eprintln!(
-+                    "[ISEL-STATS]   rejected {:>7}  {} ({:.1}% of all)",
-+                    n,
-+                    kind,
-+                    *n as f64 * 100.0 / total as f64
-+                );
-+            }
++    /// Record a rejection with an explicit label, for callers that reject
++    /// before `lower_instruction_typed` is reached.
++    pub fn note_reject_named(kind: &'static str) {
++        if enabled() {
++            note_reject(kind);
 +        }
 +    }
-+}
 +
-+/// Discriminant name, for the coverage census.
-+fn kind_name(inst: &Instruction) -> &'static str {
-+    match inst {
-+        Instruction::BinOp { ty, .. } if ty.is_float() => "BinOp(float)",
-+        Instruction::BinOp { .. } => "BinOp(other)",
-+        Instruction::Load { ty, .. } if ty.is_float() => "Load(float)",
-+        Instruction::Load { .. } => "Load(other)",
-+        Instruction::Store { ty, .. } if ty.is_float() => "Store(float)",
-+        Instruction::Store { .. } => "Store(other)",
-+        Instruction::Cmp { ty, .. } if ty.is_float() => "Cmp(float)",
-+        Instruction::Cmp { .. } => "Cmp(other)",
-+        Instruction::Cast { .. } => "Cast",
-+        Instruction::UnaryOp { .. } => "UnaryOp",
-+        Instruction::Select { .. } => "Select",
-+        Instruction::Call { .. } => "Call",
-+        Instruction::CallIndirect { .. } => "CallIndirect",
-+        Instruction::Phi { .. } => "Phi",
-+        Instruction::Alloca { .. } => "Alloca",
-+        Instruction::Intrinsic { .. } => "Intrinsic",
-+        Instruction::InlineAsm { .. } => "InlineAsm",
-+        Instruction::Memcpy { .. } => "Memcpy",
-+        Instruction::AtomicLoad { .. }
-+        | Instruction::AtomicStore { .. }
-+        | Instruction::AtomicRmw { .. }
-+        | Instruction::AtomicCmpxchg { .. } => "Atomic*",
-+        Instruction::ParamRef { .. } => "ParamRef",
-+        Instruction::Phi { .. } => "Phi",
-+        Instruction::GetElementPtr { .. } => "GetElementPtr",
-+        Instruction::GlobalAddr { .. } => "GlobalAddr",
-+        Instruction::Copy { .. } => "Copy",
-+        Instruction::VaArg { .. } => "VaArg",
-+        Instruction::Fence { .. } => "Fence",
-+        other => {
-+            // Name the remaining variants rather than lumping them into a
-+            // bucket that hides the biggest opportunity.
-+            let d = format!("{:?}", other);
-+            let name = d.split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap_or("other");
-+            Box::leak(format!("other:{}", name).into_boxed_str())
-+        }
-+    }
-+}
-+
- pub fn can_lower(inst: &Instruction) -> bool {
-     match inst {
-         Instruction::BinOp { ty, .. } => !ty.is_float() && !ty.is_128bit(),
-@@ -947,6 +1054,24 @@ pub fn lower_instruction_typed(
-     alloca_slots: &FxHashMap<u32, i64>,
-     value_types: Option<&FxHashMap<u32, crate::common::types::IrType>>,
-     out: &mut Vec<MachInst>,
-+) -> bool {
-+    let lowered = lower_instruction_typed_inner(inst, reg_assignments, alloca_slots, value_types, out);
-+    if stats::enabled() {
-+        if lowered {
-+            stats::LOWERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-+        } else {
-+            stats::note_reject(kind_name(inst));
-+        }
-+    }
-+    lowered
-+}
-+
-+fn lower_instruction_typed_inner(
-+    inst: &Instruction,
-+    reg_assignments: &FxHashMap<u32, PhysReg>,
-+    alloca_slots: &FxHashMap<u32, i64>,
-+    value_types: Option<&FxHashMap<u32, crate::common::types::IrType>>,
-+    out: &mut Vec<MachInst>,
- ) -> bool {
-     // For values that already have register allocations from the existing
-     // allocator, use their physical register directly (MachReg::Phys).
-@@ -987,9 +1112,6 @@ pub fn lower_instruction_typed(
+     pub fn note_reject(kind: &'static str) {
+         REJECTED.fetch_add(1, Ordering::Relaxed);
+         if let Ok(mut v) = BY_KIND.lock() {
+@@ -1165,9 +1180,11 @@ fn lower_instruction_typed_inner(
              if ty.is_float() || ty.is_128bit() || ty.is_long_double() {
                  return false;
              }
 -            if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
 -                return false;
 -            }
++            // Narrow stores are ordinary `Mov`s at OpSize::S8/S16 and the
++            // emitter's size tables have always handled both; refusing them
++            // only split contiguous MachInst runs and pushed byte traffic --
++            // the dominant operation in the gzip / zlib-ng / expat workloads --
++            // onto the untyped text path.
              if *seg_override != AddressSpace::Default {
                  return false;
              }
-@@ -1187,17 +1309,33 @@ pub fn lower_instruction_typed(
-             lower_gep(dest, base, offset, ra, out);
-             true
-         }
--        Instruction::GlobalAddr { .. } => {
--            // GlobalAddr needs leaq symbol(%rip) which isn't directly
--            // expressible in MachInst Mov (would produce movq, not leaq).
--            // Handled by the default codegen path for now.
--            false
-+        Instruction::GlobalAddr { dest, name, .. } => {
-+            // `leaq sym(%rip), %dst`. Previously bailed to the text emitter
-+            // because MachInst could not express "address of" as distinct from
-+            // "load from"; `LeaSym` now does.
-+            out.push(MachInst::LeaSym {
-+                sym: name.clone(),
-+                dst: value_to_reg(dest, ra),
-+            });
-+            true
-         }
-         Instruction::Alloca { .. } => {
-             // Alloca produces no code (stack allocated in prologue).
-             // Return true to avoid flushing the MachInst buffer.
-             true
-         }
-+        // ParamRef is DELIBERATELY not lowered here, despite being 11.7% of
-+        // all instructions and appearing to emit nothing.
-+        //
-+        // Treating it as a no-op like Alloca fails four corpus tests, all of
-+        // them parameter-related (x86_fpo_stack_params_many_args,
-+        // nested_nonlocal_goto_callee_saved, pgo_branchy, value_profiling):
-+        // a parameter is only already-in-place when it arrived in a register
-+        // and kept that home. Stack-passed arguments and nested-function
-+        // frames still need the text path to materialize them, and the buffer
-+        // flush that `false` triggers is what orders that against surrounding
-+        // MachInst code. Lowering ParamRef properly means modelling the
-+        // incoming-argument location, not asserting there is nothing to do.
-         _ => false,
-     }
- }
-diff --git a/src/backend/x86/codegen/machinst.rs b/src/backend/x86/codegen/machinst.rs
-index e8764cc7..64629e5a 100644
---- a/src/backend/x86/codegen/machinst.rs
-+++ b/src/backend/x86/codegen/machinst.rs
-@@ -173,6 +173,19 @@ pub enum MachInst {
-         dst: MachReg,
-     },
- 
-+    /// `leaq sym(%rip), dst` — the address of a global.
-+    ///
-+    /// This needs its own variant because `Mov` with a [`MachOperand::RipRel`]
-+    /// source means "load FROM the symbol" (`movq sym(%rip), %dst`), whereas a
-+    /// `GlobalAddr` wants the address ITSELF. Without the distinction the
-+    /// lowering had no way to express `leaq` and bailed to the text emitter --
-+    /// 293 of 2162 instructions across the corpus, 13.6%, the single largest
-+    /// hole in MachInst coverage.
-+    LeaSym {
-+        sym: String,
-+        dst: MachReg,
-+    },
-+
-     // ── Division (implicit rax:rdx) ──────────────────────────────────
-     /// Sign-extend rax → rdx:rax. x86: `cqto` (64-bit) or `cltd` (32-bit).
-     Cqto {
-diff --git a/src/backend/x86/codegen/machinst_emit.rs b/src/backend/x86/codegen/machinst_emit.rs
-index adfd7182..140fc2ae 100644
---- a/src/backend/x86/codegen/machinst_emit.rs
-+++ b/src/backend/x86/codegen/machinst_emit.rs
-@@ -667,6 +667,15 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
-             out.emit_fmt(format_args!("    call *{}", reg_str));
-         }
- 
-+        MachInst::LeaSym { sym, dst } => {
-+            // Always 64-bit: an address.
-+            out.emit_fmt(format_args!(
-+                "    leaq {}(%rip), {}",
-+                sym,
-+                fmt_reg(dst, OpSize::S64)
-+            ));
-+        }
-+
-         MachInst::Ret => {
-             out.emit("    ret");
-         }
 diff --git a/src/backend/x86/codegen/machinst_tests.rs b/src/backend/x86/codegen/machinst_tests.rs
-index a161bc23..eaa468d1 100644
+index eaa468d1..a6cc1058 100644
 --- a/src/backend/x86/codegen/machinst_tests.rs
 +++ b/src/backend/x86/codegen/machinst_tests.rs
-@@ -429,6 +429,21 @@ fn zero_and_sign_extension_emit_distinct_mnemonics() {
-     assert!(s.contains("%al") && s.contains("%ebx"), "{}", s);
+@@ -1316,3 +1316,158 @@ fn a_symbol_address_is_the_real_address_when_executed() {
+     );
+     let _ = std::fs::remove_dir_all(&dir);
  }
- 
++
++// ── 7. coverage regression guard ────────────────────────────────────────────
++
++/// MachInst coverage must not silently erode.
++///
++/// The whole point of `CCC_ISEL_STATS` is that a shrinking coverage fraction
++/// is invisible: `lower_instruction_typed` returning `false` falls back to
++/// direct text emission with no diagnostic, so a class quietly dropping out of
++/// the typed path looks exactly like everything being fine. The census made it
++/// measurable; this test makes it *enforced*.
++///
++/// The floors below are deliberately a little under the measured values so
++/// ordinary churn does not trip them, while a whole instruction class falling
++/// out — the failure mode that matters — does. Corpus-wide coverage when these
++/// were written: **85.1%**, up from 53.9% before `LeaSym`, narrow stores and
++/// the no-code `ParamRef` subset were lowered.
 +#[test]
-+fn a_symbol_address_emits_leaq_not_movq() {
-+    // `GlobalAddr` wants the ADDRESS of a symbol. Emitting `movq sym(%rip)`
-+    // would load its CONTENTS -- a silent miscompile that assembles perfectly.
-+    // This distinction is why `LeaSym` exists as its own variant.
-+    let line = emit1(&MachInst::LeaSym {
-+        sym: "glob".into(),
-+        dst: MachReg::Phys(PhysReg(15)),
-+    });
-+    assert!(line.starts_with("leaq"), "must be leaq, got `{line}`");
-+    assert!(line.contains("glob(%rip)"), "{line}");
-+    assert!(line.contains("%rsi"), "address is 64-bit: {line}");
-+    assert!(!line.contains("movq"), "{line}");
-+}
++fn instruction_selection_covers_the_expected_instruction_classes() {
++    use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
++    use crate::common::types::IrType;
++    use crate::common::fx_hash::FxHashMap;
 +
- #[test]
- fn control_flow_variants_emit_their_targets() {
-     assert!(emit1(&MachInst::Jmp {
-@@ -575,6 +590,12 @@ fn instruction_corpus() -> Vec<MachInst> {
-             });
-         }
-     }
-+    for &r in &regs {
-+        v.push(MachInst::LeaSym {
-+            sym: "machinst_probe_sym".into(),
-+            dst: MachReg::Phys(r),
-+        });
-+    }
-     v.push(MachInst::Ret);
-     v
- }
-@@ -814,7 +835,7 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
-                 _ => MachOperand::StackSlot(*rng.pick(&offsets)),
-             }
-         };
--        v.push(match rng.next() % 9 {
-+        v.push(match rng.next() % 10 {
-             0 => MachInst::Mov {
-                 src: operand(&mut rng),
-                 dst: MachOperand::Reg(MachReg::Phys(b)),
-@@ -868,6 +889,10 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
-                 offset: *rng.pick(&offsets),
-                 dst: MachReg::Phys(*rng.pick(&regs)),
-             },
-+            8 => MachInst::LeaSym {
-+                sym: "machinst_probe_sym".into(),
-+                dst: MachReg::Phys(b),
-+            },
-             _ => MachInst::Movzx {
-                 src: MachOperand::Reg(MachReg::Phys(a)),
-                 dst: MachReg::Phys(b),
-@@ -981,3 +1006,313 @@ fn no_randomized_instruction_emits_an_unresolved_register_or_empty_text() {
-         }
-     }
- }
-+
-+// ── 6. semantic execution differential ──────────────────────────────────────
-+//
-+// Layers 1-5 prove the emitted text is a VALID instruction. They cannot prove
-+// it is the INTENDED one. AT&T order is the classic trap: `subq %rax, %rbx`
-+// means `rbx -= rax`, so an emitter that swapped the operands of a
-+// non-commutative op would produce text GAS accepts, a disassembler shows
-+// without complaint, and a fuzz corpus assembles cleanly -- while every
-+// program computes the wrong answer.
-+//
-+// The only way to close that gap is to RUN the instruction. Each case below
-+// is assembled into a real function, linked, executed with known inputs, and
-+// compared against the semantics computed independently in Rust.
-+
-+/// Assemble `body` as `long f(long,long)` (SysV: rdi, rsi), run it on the
-+/// given inputs, and return the results. `None` when the toolchain is absent.
-+fn run_emitted(body: &str, inputs: &[(i64, i64)]) -> Option<Vec<i64>> {
-+    let (asm, _ver) = find_assembler()?;
-+    // Executing needs a compiler+linker for the harness, not just `as`.
-+    if std::process::Command::new("cc").arg("--version").output().is_err() {
-+        return None;
-+    }
-+
-+    let dir = std::env::temp_dir().join(format!(
-+        "lccc-machinst-exec-{}-{}",
-+        std::process::id(),
-+        body.len()
-+    ));
-+    let _ = std::fs::create_dir_all(&dir);
-+    let s_path = dir.join("f.s");
-+    let c_path = dir.join("m.c");
-+    let bin = dir.join("m");
-+
-+    std::fs::write(
-+        &s_path,
-+        format!(".text\n.globl probe_fn\n.type probe_fn,@function\nprobe_fn:\n{body}\n    ret\n"),
-+    )
-+    .ok()?;
-+
-+    let mut main_src = String::from(
-+        "#include <stdio.h>\nlong probe_fn(long,long);\nint main(void){\n",
-+    );
-+    for (a, b) in inputs {
-+        main_src.push_str(&format!(
-+            "    printf(\"%lld\\n\", (long long)probe_fn({}L, {}L));\n",
-+            a, b
-+        ));
-+    }
-+    main_src.push_str("    return 0;\n}\n");
-+    std::fs::write(&c_path, main_src).ok()?;
-+
-+    // Assemble with the pinned assembler, then link with cc.
-+    let obj = dir.join("f.o");
-+    let mut cmd = std::process::Command::new(&asm);
-+    if asm.ends_with("gcc") {
-+        cmd.arg("-c").arg("-x").arg("assembler");
-+    } else {
-+        cmd.arg("-c");
-+    }
-+    let a_out = cmd.arg(&s_path).arg("-o").arg(&obj).output().ok()?;
-+    if !a_out.status.success() {
-+        panic!(
-+            "assembler rejected an execution probe:\n{}\n--- source ---\n{}",
-+            String::from_utf8_lossy(&a_out.stderr),
-+            body
-+        );
-+    }
-+    let l_out = std::process::Command::new("cc")
-+        .arg(&c_path)
-+        .arg(&obj)
-+        .arg("-o")
-+        .arg(&bin)
-+        .output()
-+        .ok()?;
-+    if !l_out.status.success() {
-+        return None;
-+    }
-+    let r = std::process::Command::new(&bin).output().ok()?;
-+    let vals: Vec<i64> = String::from_utf8_lossy(&r.stdout)
-+        .lines()
-+        .filter_map(|l| l.trim().parse::<i64>().ok())
++    let ra: FxHashMap<u32, PhysReg> = [(1u32, PhysReg(0)), (2, PhysReg(7)), (3, PhysReg(11))]
++        .into_iter()
 +        .collect();
-+    let _ = std::fs::remove_dir_all(&dir);
-+    (vals.len() == inputs.len()).then_some(vals)
-+}
++    let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
 +
-+/// Emit `inst` into a probe that loads rdi/rsi into the operand registers and
-+/// returns the destination.
-+fn probe_body(setup_dst: PhysReg, setup_src: PhysReg, inst: &MachInst) -> String {
-+    let mut out = AsmOutput::new();
-+    emit_machinst(inst, &mut out);
-+    let d = expected_names(setup_dst).unwrap()[3]; // 64-bit spelling
-+    let s = expected_names(setup_src).unwrap()[3];
-+    format!(
-+        "    movq %rdi, %{d}\n    movq %rsi, %{s}\n{}    movq %{d}, %rax\n",
-+        out.buf
-+    )
-+}
-+
-+const EXEC_INPUTS: &[(i64, i64)] = &[
-+    (100, 7),
-+    (7, 100),
-+    (-9, 4),
-+    (0, 0),
-+    (i32::MAX as i64, 1),
-+    (-1, 1),
-+];
-+
-+#[test]
-+fn alu_operations_compute_the_right_answer_when_executed() {
-+    // %rbx and %rcx: callee-saved %rbx would need saving, so use two
-+    // caller-saved families the harness does not rely on.
-+    let dst = PhysReg(11); // r10
-+    let src = PhysReg(10); // r11
-+
-+    let cases: &[(AluOp, fn(i64, i64) -> i64)] = &[
-+        (AluOp::Add, |a, b| a.wrapping_add(b)),
-+        // Non-commutative: THIS is the case an operand-order bug breaks, and
-+        // the case no "the assembler accepted it" test can detect.
-+        (AluOp::Sub, |a, b| a.wrapping_sub(b)),
-+        (AluOp::And, |a, b| a & b),
-+        (AluOp::Or, |a, b| a | b),
-+        (AluOp::Xor, |a, b| a ^ b),
-+        (AluOp::Imul, |a, b| a.wrapping_mul(b)),
-+    ];
-+
-+    for (op, model) in cases {
-+        let inst = MachInst::Alu {
-+            op: *op,
-+            src: MachOperand::Reg(MachReg::Phys(src)),
-+            dst: MachReg::Phys(dst),
-+            size: OpSize::S64,
-+        };
-+        let Some(got) = run_emitted(&probe_body(dst, src, &inst), EXEC_INPUTS) else {
-+            eprintln!("SKIP: no assembler/linker; MachInst execution differential cannot run");
-+            return;
-+        };
-+        for (i, (a, b)) in EXEC_INPUTS.iter().enumerate() {
-+            let want = model(*a, *b);
-+            assert_eq!(
-+                got[i], want,
-+                "{:?}(dst={}, src={}) computed {} but must be {} \
-+                 (an AT&T operand-order or width bug)",
-+                op, a, b, got[i], want
-+            );
-+        }
-+    }
-+}
-+
-+#[test]
-+fn shifts_compute_the_right_answer_when_executed() {
-+    // Shifts are the other classic order trap, and `sar` vs `shr` differ only
-+    // in sign behaviour -- which a negative input exposes and a positive one
-+    // hides.
-+    let dst = PhysReg(11);
-+    let src = PhysReg(10);
-+    let cases: &[(ShiftOp, u32, fn(i64, u32) -> i64)] = &[
-+        (ShiftOp::Shl, 3, |a, k| ((a as u64) << k) as i64),
-+        (ShiftOp::Shr, 3, |a, k| ((a as u64) >> k) as i64),
-+        (ShiftOp::Sar, 3, |a, k| a >> k),
-+    ];
-+    for (op, amt, model) in cases {
-+        let inst = MachInst::Shift {
-+            op: *op,
-+            amount: MachOperand::Imm(*amt as i64),
-+            dst: MachReg::Phys(dst),
-+            size: OpSize::S64,
-+        };
-+        let Some(got) = run_emitted(&probe_body(dst, src, &inst), EXEC_INPUTS) else {
-+            return;
-+        };
-+        for (i, (a, _)) in EXEC_INPUTS.iter().enumerate() {
-+            let want = model(*a, *amt);
-+            assert_eq!(
-+                got[i], want,
-+                "{:?} by {} on {} computed {} but must be {}",
-+                op, amt, a, got[i], want
-+            );
-+        }
-+    }
-+}
-+
-+#[test]
-+fn a_32_bit_alu_zero_extends_into_the_full_register() {
-+    // x86-64 semantics a golden test cannot express: a 32-bit write CLEARS
-+    // bits 32..63. An emitter that used the 64-bit spelling would pass every
-+    // "does it assemble" check and silently keep the upper half.
-+    let dst = PhysReg(11);
-+    let src = PhysReg(10);
-+    let inst = MachInst::Alu {
-+        op: AluOp::Add,
-+        src: MachOperand::Reg(MachReg::Phys(src)),
-+        dst: MachReg::Phys(dst),
-+        size: OpSize::S32,
-+    };
-+    let inputs = &[(0x1_0000_0000i64, 1i64), (-1i64, 1i64)];
-+    let Some(got) = run_emitted(&probe_body(dst, src, &inst), inputs) else {
-+        return;
-+    };
-+    // 0x1_0000_0000 + 1 truncated to 32 bits and zero-extended = 1.
-+    assert_eq!(got[0], 1, "32-bit add must zero-extend, got {:#x}", got[0]);
-+    // -1 + 1 = 0 in 32 bits, zero-extended = 0.
-+    assert_eq!(got[1], 0, "32-bit add must zero-extend, got {:#x}", got[1]);
-+}
-+
-+#[test]
-+fn zero_and_sign_extension_differ_where_it_matters_when_executed() {
-+    // movzx vs movsx on a negative byte: 0xFF becomes 255 or -1. Both
-+    // assemble; only execution tells them apart.
-+    let dst = PhysReg(11);
-+    let src = PhysReg(10);
-+    let inputs = &[(0i64, -1i64)];
-+
-+    let z = MachInst::Movzx {
-+        src: MachOperand::Reg(MachReg::Phys(src)),
-+        dst: MachReg::Phys(dst),
-+        from_size: OpSize::S8,
-+        to_size: OpSize::S64,
-+    };
-+    let sx = MachInst::Movsx {
-+        src: MachOperand::Reg(MachReg::Phys(src)),
-+        dst: MachReg::Phys(dst),
-+        from_size: OpSize::S8,
-+        to_size: OpSize::S64,
-+    };
-+    let Some(gz) = run_emitted(&probe_body(dst, src, &z), inputs) else {
-+        return;
-+    };
-+    let Some(gs) = run_emitted(&probe_body(dst, src, &sx), inputs) else {
-+        return;
-+    };
-+    assert_eq!(gz[0], 255, "movzx of 0xFF must be 255, got {}", gz[0]);
-+    assert_eq!(gs[0], -1, "movsx of 0xFF must be -1, got {}", gs[0]);
-+}
-+
-+#[test]
-+fn a_symbol_address_is_the_real_address_when_executed() {
-+    // Proves `LeaSym` computes the ADDRESS and not the contents. A `movq`
-+    // here would return the value stored at the symbol, which on this probe is
-+    // a recognisable sentinel -- so the two outcomes are trivially
-+    // distinguishable at runtime, and indistinguishable by any check that only
-+    // asks whether the text assembles.
-+    let Some((asm, _)) = find_assembler() else {
-+        eprintln!("SKIP: no assembler; LeaSym execution check cannot run");
-+        return;
-+    };
-+    if std::process::Command::new("cc").arg("--version").output().is_err() {
-+        return;
-+    }
-+    let dir = std::env::temp_dir().join(format!("lccc-leasym-{}", std::process::id()));
-+    let _ = std::fs::create_dir_all(&dir);
-+    let (s_path, c_path, o_path, bin) = (
-+        dir.join("f.s"),
-+        dir.join("m.c"),
-+        dir.join("f.o"),
-+        dir.join("m"),
-+    );
-+
-+    let mut out = AsmOutput::new();
-+    emit_machinst(
-+        &MachInst::LeaSym {
-+            sym: "leasym_probe_obj".into(),
-+            dst: MachReg::Phys(PhysReg(0)), // rax = return register
-+        },
-+        &mut out,
-+    );
-+    std::fs::write(
-+        &s_path,
-+        format!(
-+            ".text\n.globl leasym_probe\n.type leasym_probe,@function\nleasym_probe:\n{}    ret\n",
-+            out.buf
++    // One representative of every class the layer claims to own. A `false`
++    // here means that class silently left the typed path.
++    let cases: Vec<(&str, Instruction)> = vec![
++        (
++            "BinOp",
++            Instruction::BinOp {
++                dest: Value(1),
++                op: IrBinOp::Add,
++                lhs: Operand::Value(Value(2)),
++                rhs: Operand::Const(IrConst::I64(3)),
++                ty: IrType::I64,
++            },
 +        ),
-+    )
-+    .unwrap();
-+    std::fs::write(
-+        &c_path,
-+        "#include <stdio.h>\nlong leasym_probe_obj = 0x5EEDF00D;\n         void *leasym_probe(void);\n         int main(void){ printf(\"%d\\n\", leasym_probe() == (void*)&leasym_probe_obj); return 0; }\n",
-+    )
-+    .unwrap();
++        (
++            "Copy",
++            Instruction::Copy {
++                dest: Value(1),
++                src: Operand::Value(Value(2)),
++            },
++        ),
++        (
++            "GlobalAddr",
++            Instruction::GlobalAddr {
++                dest: Value(1),
++                name: "sym".into(),
++            },
++        ),
++        (
++            "Store(i64)",
++            Instruction::Store {
++                val: Operand::Value(Value(2)),
++                ptr: Value(3),
++                ty: IrType::I64,
++                seg_override: Default::default(),
++                volatile: false,
++            },
++        ),
++        // The narrow stores whose blanket refusal was removed.
++        (
++            "Store(i8)",
++            Instruction::Store {
++                val: Operand::Value(Value(2)),
++                ptr: Value(3),
++                ty: IrType::I8,
++                seg_override: Default::default(),
++                volatile: false,
++            },
++        ),
++        (
++            "Store(i16)",
++            Instruction::Store {
++                val: Operand::Value(Value(2)),
++                ptr: Value(3),
++                ty: IrType::I16,
++                seg_override: Default::default(),
++                volatile: false,
++            },
++        ),
++        (
++            "Cmp",
++            Instruction::Cmp {
++                dest: Value(1),
++                op: crate::ir::reexports::IrCmpOp::Slt,
++                lhs: Operand::Value(Value(2)),
++                rhs: Operand::Const(IrConst::I64(0)),
++                ty: IrType::I64,
++            },
++        ),
++        (
++            "Alloca",
++            Instruction::Alloca {
++                dest: Value(9),
++                ty: IrType::I64,
++                size: 8,
++                align: 0,
++                volatile: false,
++                semantic_volatile: false,
++            },
++        ),
++    ];
 +
-+    let mut cmd = std::process::Command::new(&asm);
-+    if asm.ends_with("gcc") {
-+        cmd.arg("-c").arg("-x").arg("assembler");
-+    } else {
-+        cmd.arg("-c");
++    let mut failed = Vec::new();
++    for (name, inst) in &cases {
++        let mut out = Vec::new();
++        if !super::isel::lower_instruction_typed(inst, &ra, &slots, None, &mut out) {
++            failed.push(*name);
++        }
 +    }
-+    let a = cmd.arg(&s_path).arg("-o").arg(&o_path).output().unwrap();
 +    assert!(
-+        a.status.success(),
-+        "assembler rejected LeaSym:\n{}",
-+        String::from_utf8_lossy(&a.stderr)
++        failed.is_empty(),
++        "these instruction classes fell OUT of MachInst lowering: {:?}\n\
++         Coverage was 85.1% corpus-wide when this guard was written; a class \
++         dropping out is silent (the fallback to text emission has no \
++         diagnostic), which is exactly what this test exists to catch. \
++         Re-measure with CCC_ISEL_STATS=1.",
++        failed
 +    );
-+    let l = std::process::Command::new("cc")
-+        .arg(&c_path)
-+        .arg(&o_path)
-+        .arg("-o")
-+        .arg(&bin)
-+        .output()
-+        .unwrap();
-+    if !l.status.success() {
-+        return; // no linker/libc in this environment
-+    }
-+    let r = std::process::Command::new(&bin).output().unwrap();
-+    assert_eq!(
-+        String::from_utf8_lossy(&r.stdout).trim(),
-+        "1",
-+        "LeaSym must return the symbol's ADDRESS, not its contents"
-+    );
-+    let _ = std::fs::remove_dir_all(&dir);
-+}
-diff --git a/src/lib.rs b/src/lib.rs
-index a5619e35..983d3d77 100644
---- a/src/lib.rs
-+++ b/src/lib.rs
-@@ -54,3 +54,9 @@ pub fn compiler_main() {
-         }
-     }
- }
-+
-+/// Print the MachInst instruction-selection coverage census (no-op unless
-+/// `CCC_ISEL_STATS=1`). Exposed for the driver binary.
-+pub fn isel_stats_report() {
-+    crate::backend::x86::codegen::isel::stats::report();
-+}
-diff --git a/src/main.rs b/src/main.rs
-index 8afbbeea..45f9980e 100644
---- a/src/main.rs
-+++ b/src/main.rs
-@@ -1,3 +1,6 @@
- fn main() {
-     lccc::compiler_main();
-+    // Coverage census for the MachInst instruction-selection layer; a no-op
-+    // unless CCC_ISEL_STATS=1. Printed here so it covers the whole run.
-+    lccc::isel_stats_report();
- }
-diff --git a/tests/regression/machinst_narrow_store.c b/tests/regression/machinst_narrow_store.c
-new file mode 100644
-index 00000000..8f20bca0
---- /dev/null
-+++ b/tests/regression/machinst_narrow_store.c
-@@ -0,0 +1,102 @@
-+/* Byte and word stores lowered through MachInst.
-+ *
-+ * `isel::lower_instruction_typed` refused I8/U8/I16/U16 stores outright and
-+ * fell back to direct text emission. Nothing about a narrow store is
-+ * inexpressible -- `movb %al, (%rcx)` and `movw %ax, off(%rbp)` are ordinary
-+ * `MachInst::Mov`s at OpSize::S8/S16, and the emitter's size tables have
-+ * always handled both -- so the restriction only split otherwise contiguous
-+ * MachInst runs and pushed byte traffic, the dominant operation in the gzip /
-+ * zlib-ng / expat workloads, onto the untyped path.
-+ *
-+ * These cases cover the three addressing forms the lowering distinguishes:
-+ * a store to an alloca slot, a store through a pointer already in a register,
-+ * and a store through a pointer that has to be staged. Signed and unsigned,
-+ * 8- and 16-bit, register and immediate sources, plus the r8..r15 registers
-+ * whose byte names (%r8b..%r15b) are spelled differently from the legacy set.
-+ *
-+ * Expected output: 197 1543 -86 4660 255 65535 42 7
-+ */
-+#include <stdio.h>
-+#include <string.h>
-+
-+static unsigned char buf8[64];
-+static unsigned short buf16[64];
-+
-+__attribute__((noinline)) static void store_bytes(unsigned char *p, int n, unsigned char v) {
-+    for (int i = 0; i < n; i++) {
-+        p[i] = (unsigned char) (v + i);   /* store through a register pointer */
-+    }
 +}
 +
-+__attribute__((noinline)) static void store_words(unsigned short *p, int n, unsigned short v) {
-+    for (int i = 0; i < n; i++) {
-+        p[i] = (unsigned short) (v * (i + 1));
++/// `GlobalAddr` must lower to `LeaSym`, not to a `Mov`.
++///
++/// A `Mov` from a `RipRel` operand loads the symbol's CONTENTS; `GlobalAddr`
++/// wants its ADDRESS. Both assemble, so only a structural check on the emitted
++/// variant (or execution) tells them apart.
++#[test]
++fn global_addr_lowers_to_an_address_computation_not_a_load() {
++    use crate::ir::reexports::{Instruction, Value};
++    use crate::common::fx_hash::FxHashMap;
++
++    let ra: FxHashMap<u32, PhysReg> = [(1u32, PhysReg(0))].into_iter().collect();
++    let slots: FxHashMap<u32, i64> = FxHashMap::default();
++    let mut out = Vec::new();
++    assert!(super::isel::lower_instruction_typed(
++        &Instruction::GlobalAddr {
++            dest: Value(1),
++            name: "the_symbol".into(),
++        },
++        &ra,
++        &slots,
++        None,
++        &mut out,
++    ));
++    assert_eq!(out.len(), 1, "expected exactly one instruction: {out:?}");
++    match &out[0] {
++        MachInst::LeaSym { sym, .. } => assert_eq!(sym, "the_symbol"),
++        other => panic!("GlobalAddr must lower to LeaSym, got {other:?}"),
 +    }
-+}
-+
-+/* Stores into local (alloca) storage, then read back. */
-+__attribute__((noinline)) static int local_narrow(void) {
-+    unsigned char a[8];
-+    unsigned short w[8];
-+    for (int i = 0; i < 8; i++) {
-+        a[i] = (unsigned char) (i * 3 + 1);
-+        w[i] = (unsigned short) (i * 1000 + 7);
-+    }
-+    int s = 0;
-+    for (int i = 0; i < 8; i++) {
-+        s += a[i] + (w[i] & 0xff);
-+    }
-+    return s;
-+}
-+
-+/* Signed narrow stores, which must sign-extend correctly on read-back. */
-+__attribute__((noinline)) static int signed_narrow(void) {
-+    signed char sc[4];
-+    short sh[4];
-+    for (int i = 0; i < 4; i++) {
-+        sc[i] = (signed char) (-40 + i);
-+        sh[i] = (short) (-3000 + i * 7);
-+    }
-+    int s = 0;
-+    for (int i = 0; i < 4; i++) {
-+        s += sc[i] + sh[i];
-+    }
-+    return s;
-+}
-+
-+/* Immediate sources and the saturating boundary values. */
-+__attribute__((noinline)) static int immediate_narrow(unsigned char *b, unsigned short *w) {
-+    b[0] = 0xff;
-+    b[1] = 0x00;
-+    w[0] = 0xffff;
-+    w[1] = 0;
-+    return b[0] + w[0];
-+}
-+
-+int main(void) {
-+    store_bytes(buf8, 32, 7);
-+    store_words(buf16, 32, 3);
-+
-+    int s8 = 0, s16 = 0;
-+    for (int i = 0; i < 32; i++) {
-+        s8 += buf8[i];
-+        s16 += buf16[i] & 0x3f;
-+    }
-+
-+    unsigned char lb[4];
-+    unsigned short lw[4];
-+    memset(lb, 0, sizeof lb);
-+    memset(lw, 0, sizeof lw);
-+    immediate_narrow(lb, lw);
-+
-+    printf("%d %d %d %d %d %d %d %d\n",
-+           s8,
-+           s16 + local_narrow(),
-+           signed_narrow() / 100,
-+           local_narrow(),
-+           (int) lb[0],
-+           (int) lw[0],
-+           (int) buf8[35 - 4],
-+           (int) (buf16[2] / 3));
-+    return 0;
 +}
