@@ -1,124 +1,304 @@
-From 8d14ea626b115e7f79645e691634b7992a1a94ae Mon Sep 17 00:00:00 2001
-From: arena-agent <297053741+arena-agent@users.noreply.github.com>
-Date: Tue, 1 Sep 2026 20:54:49 +0000
-Subject: [PATCH] stack_layout: F128 Copy webs need wide slots (i686 x87 fstpt
- overflow)
-
-Copy carries no result type after phi elimination/mem2reg, so a Copy of
-an F128 value (long double on i686: loads turned into copies, phi temps,
-x87 compare staging values) fell into the default 8-byte slot class.
-fstpt spills 10 raw bytes of 80-bit x87 data, so the store ran 2 bytes
-into the low half of the adjacent slot: va-arg-pack-1.c staged the
-global long double v5 into slot E+20 while the ld compare copy sat at
-E+12; the second fstpt overwrote v5's significand low word with ld's
-exponent, the reload produced garbage and the `v5 != ld` compare
-aborted at i686 -O1/-O2 (all levels upstream).
-
-Fix: propagate F128-ness to a fixed point over Copy{src: Value} edges
-(mirroring the compact_i686_values inference) and give the whole web
-the 16-byte F128 slot class (>= the 12-byte i686 payload). Also treats
-Copy{src: Const(LongDouble)} webs uniformly. Target-independent:
-x86-64's 16-byte movdqu spills have the same overflow shape on an
-8-byte-classified web.
-
-Validation: va-arg-pack-1.c i686 {O0,O1,O2} EXIT=0 (was abort O1/O2);
-unit suite 1480/0/6.
----
- src/backend/stack_layout/slot_assignment.rs | 53 ++++++++++++++++++++-
- 1 file changed, 52 insertions(+), 1 deletion(-)
-
-diff --git a/src/backend/stack_layout/slot_assignment.rs b/src/backend/stack_layout/slot_assignment.rs
-index 26ddfe76..ac862dd6 100644
---- a/src/backend/stack_layout/slot_assignment.rs
-+++ b/src/backend/stack_layout/slot_assignment.rs
-@@ -170,6 +170,53 @@ pub(super) fn classify_instructions(
-         }
-     }
+diff --git a/backlog.md b/backlog.md
+index 4743ecaa..e127c168 100644
+--- a/backlog.md
++++ b/backlog.md
+@@ -19,7 +19,27 @@ was an improvement.
  
-+    // F128 Copy webs.  Copy carries no result type after phi elimination, so
-+    // a Copy of an F128 value (loads that mem2reg turned into copies, phi
-+    // elimination temps, staging values for x87 compares) would otherwise be
-+    // classified by the default 8-byte arm.  fstpt spills 10 raw bytes of
-+    // 80-bit x87 data, so an 8-byte slot lets the store run into the low half
-+    // of the adjacent slot and corrupts it (observed as va-arg-pack-1.c
-+    // aborting its long-double compare on i686 at -O1/-O2).  Propagate
-+    // F128-ness to a fixed point over Copy{src: Value} edges and give the
-+    // whole web the wide F128 slot class.  Target-independent: x86-64's
-+    // 16-byte movdqu spills have exactly the same overflow shape.
-+    let mut f128_web_values: FxHashSet<u32> = FxHashSet::default();
-+    for block in &func.blocks {
-+        for inst in &block.instructions {
-+            if let Some(dest) = inst.dest() {
-+                if inst.result_type() == Some(IrType::F128) {
-+                    f128_web_values.insert(dest.0);
-+                }
-+                if let Instruction::Copy {
-+                    dest,
-+                    src: Operand::Const(IrConst::LongDouble(..)),
-+                } = inst
-+                {
-+                    f128_web_values.insert(dest.0);
-+                }
-+            }
-+        }
-+    }
-+    loop {
-+        let before = f128_web_values.len();
-+        for block in &func.blocks {
-+            for inst in &block.instructions {
-+                if let Instruction::Copy {
-+                    dest,
-+                    src: Operand::Value(src),
-+                } = inst
-+                {
-+                    if f128_web_values.contains(&src.0) {
-+                        f128_web_values.insert(dest.0);
-+                    }
-+                }
-+            }
-+        }
-+        if f128_web_values.len() == before {
-+            break;
-+        }
-+    }
+ ## Tier 1 — measured, reproducible, largest first
+ 
+-### IV-DERIV-1 · Widen constant-offset derivatives of the induction variable
++### IV-DERIV-1 · Widen the induction variable's derived closure
++*Status:* designed, implemented, measured, **reverted for a miscompile**. Full
++record in `engineering/FOLLOWUP-2026-09-01l-iv-closure-attempt.md`.
 +
-     // Build set of values that are defined (as dest) by non-InlineAsm
-     // instructions. This identifies "indirect" asm output pointers:
-     //
-@@ -411,6 +458,7 @@ pub(super) fn classify_instructions(
-                     ctx,
-                     reg_assigned,
-                     &compact_i686_values,
-+                    &f128_web_values,
-                     &mut collected_values,
-                     multi_block_values,
-                     block_local_values,
-@@ -423,6 +471,7 @@ pub(super) fn classify_instructions(
-                     ctx,
-                     reg_assigned,
-                     &compact_i686_values,
-+                    &f128_web_values,
-                     &mut collected_values,
-                     multi_block_values,
-                     block_local_values,
-@@ -539,6 +588,7 @@ fn classify_value(
-     ctx: &StackLayoutContext,
-     reg_assigned: &FxHashMap<u32, PhysReg>,
-     compact_i686_values: &FxHashSet<u32>,
-+    f128_web_values: &FxHashSet<u32>,
-     collected_values: &mut FxHashSet<u32>,
-     multi_block_values: &mut Vec<MultiBlockValue>,
-     block_local_values: &mut Vec<BlockLocalValue>,
-@@ -551,7 +601,8 @@ fn classify_value(
-                 src: Operand::Const(IrConst::LongDouble(..)),
-                 ..
-             }
--        );
-+        )
-+        || f128_web_values.contains(&dest.0);
++*Measured prize (same-window A/B, before revert):* `sieve` **−26.5%**,
++`loop_patterns` **−6.5%**, `tls_seg_access` **−5.7%** (the worst kernel in the
++corpus), `histogram` −2.8%; `nbody` +3.2%.
++
++*Why it failed:* the closure collector admitted ops whose operand was not in
++the closure -- widening phi `v119` pulled in `And(v81, 31)` and
++`Mul(v76, 104729)` -- so the interval proof was attached to values it did not
++describe. Two other soundness bugs were found and fixed on the way and are
++documented: the `Or` range bound `hi | c` is not an upper bound (counterexample
++`x ∈ [1,2]`, `c = 2`), and the trip bound must come from the comparison the
++loop HEADER branches on, not from any comparison mentioning the counter.
++
++**Done when:** membership records, for each admitted member, which closure
++value it derives from, with a `debug_assert!` that the operand really is that
++value; and `scripts/check_benchmark_outputs.sh` stays green.
++
++### IV-DERIV-2 · (superseded heading kept for reference)
+ *Evidence:* `tls_seg_access` carries two `movslq` per iteration, one on the
+ loop-carried path. Widening the counter itself now works for every element
+ width (see closed items), but this loop's counter has genuine *arithmetic*
+@@ -138,6 +158,13 @@ violations — but none of them is dominance. That is how an SSA violation once
+ shipped past every gate. `verify.rs` already computes reachability;
+ Cooper-Harvey-Kennedy dominators over RPO is the next step.
  
-     // Copy instructions have result_type() = None, so we must check whether
-     // the source operand is an I128 value. If it is, the Copy dest also needs
--- 
-2.47.3
-
++### INF-BENCHGATE-1 · Run the benchmark output gate in CI
++`scripts/check_benchmark_outputs.sh` (new) compiles, runs and oracle-diffs
++every `tests/benchmark/programs/*.c` at -O0/-O1/-O2/-O3 in ~4 minutes with no
++timing. It exists because a miscompile passed all 563 regression tests: those
++kernels were only ever built by the timing harness, so nobody ran them during
++development. It should be unconditional in CI.
++
+ ### INF-FRESHCLONE-1 · CI must build from a fresh clone
+ `main` @ `7a6eb81d` did not build: commit `9a2ef83a` declared
+ `pub(crate) mod decimal;` but `src/common/decimal.rs` was never committed.
+diff --git a/engineering/FOLLOWUP-2026-09-01l-iv-closure-attempt.md b/engineering/FOLLOWUP-2026-09-01l-iv-closure-attempt.md
+new file mode 100644
+index 00000000..1b3cadfb
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-09-01l-iv-closure-attempt.md
+@@ -0,0 +1,143 @@
++# Follow-up: IV closure widening — designed, implemented, measured, reverted;
++# and the correctness gate that should have existed first
++
++Session date: 2026-09-01 (continuation)
++Base: `ms178/lccc` main @ `ece5fe42`
++Snapshot: `S40`
++
++---
++
++## 1. What was attempted, and why it is the right design
++
++Widening only the induction variable is inherently limited. The counter is
++rarely used bare: `a[i-1]`, `a[i+1]`, `a[(i & 7) + 1]`, `a[i * 3]` are the
++stencil, recurrence and struct-stride shapes, and each produces a **narrow
++derived value** that then feeds addressing. `analyze_iv_uses` bailed on any
++such use, so a loop like
++
++```c
++for (int i = 2; i <= 64; i++) { s[i] = s[i-1] + p; acc ^= s[(i&7)+1]; }
++```
++
++kept two `movslq` per iteration, one on the loop-carried dependency path.
++
++So the design was to widen the counter's whole **derived closure**, admitting a
++narrow op only when its value range is *proven* to fit in i32 by interval
++arithmetic seeded from the counter's own range — because `sext(a op b)` equals
++`sext(a) op sext(b)` exactly when the 32-bit `op` does not wrap. A loop whose
++bounds are not compile-time constants yields no range and is declined.
++
++It worked on the target shape: **both `movslq` eliminated** (2 → 0), and the
++same-window A/B was genuinely good:
++
++| kernel | closure on/off |
++|---|---|
++| `sieve` | **0.735** (−26.5%) |
++| `loop_patterns` | **0.935** (−6.5%) |
++| `tls_seg_access` | **0.943** (−5.7%) — the worst kernel in the corpus |
++| `histogram` | 0.972 |
++| `nbody` | 1.032 (loss) |
++
++## 2. Why it was reverted: a miscompile
++
++`sqlite_varint` printed `8e8824b0a241168` where GCC and the un-widened build
++both print `deedcdd4edc1c0f1`.
++
++Two soundness bugs were found and fixed along the way, and both are worth
++recording because they are easy to repeat:
++
++1. **The `Or` range bound was provably wrong.** `hi | c` is not an upper bound:
++   for `x ∈ [1,2]`, `c = 2`, the values are `1|2 = 3` and `2|2 = 2`, so the
++   maximum is 3 while `hi | c` is 2. An under-estimated interval admits a
++   member whose real range does not fit — exactly the unsoundness the table
++   exists to prevent. `Or` needs bitwise range analysis; it was removed.
++2. **The trip bound was read from the wrong comparison.** The first version
++   took any `Cmp` in the loop body that mentioned the counter. An inner
++   `if (i < k)` is not the trip bound, and a range derived from it is a
++   fabrication. Fixed to use only the comparison whose result the loop
++   *header's* branch consumes.
++
++Neither fixed `sqlite_varint`. Instrumenting the collector showed the real
++defect:
++
++```
++widened phi Value(119)
++  closure member v37 = And(v81, 31)        <- v81 is not v119
++  closure member v48 = Mul(v76, 104729)    <- v76 is not v119
++```
++
++**The collector admits ops whose operand is not in the closure at all**, so the
++range proof is attached to values it does not describe. That invalidates the
++entire safety argument, not one arm of it.
++
++I could not localize it with confidence in the time available, and a
++miscompile must never ship. Reverted. The design stands; the membership test
++needs rebuilding with the seed relation enforced explicitly (and asserted)
++rather than inferred from a map lookup that evidently succeeds for values that
++were never inserted.
++
++## 3. The infrastructure defect this exposed — and fixed
++
++**The miscompile passed all 563 regression tests.**
++
++`tests/benchmark/programs/*.c` are the largest, most realistic programs in the
++tree — SQLite varint, zlib-ng adler32, Expat scanning, glibc memcmp, Linux
++find_bit — and they were only ever compiled by `run_benchmarks.py`, which takes
++minutes because it times everything. Nobody ran them during development, and
++the regression corpus contains nothing with that loop shape.
++
++`scripts/check_benchmark_outputs.sh` closes the gap: compile, run, diff against
++the GCC oracle, **no timing**, so it finishes in ~4 minutes and can run on every
++change. It compares at `-O0 -O1 -O2 -O3`, because an
++optimisation-level-specific miscompile is still a miscompile and `-O0` vs `-O3`
++disagreeing is the cheapest possible signal.
++
++It found a bug in itself on the first run, which is worth keeping in the file:
++comparing lccc `-O0` against gcc `-O2` failed `tce_sum`, because that kernel
++recurses ten million deep and only survives via tail-call elimination. Both
++compilers must be asked the *same* question, so the reference is now rebuilt at
++the matching level. **152/152 pass.**
++
++Had this gate existed, the closure miscompile would have been caught in four
++minutes instead of surviving a full green test run.
++
++---
++
++## 4. Validation of the shipped state
++
++| Gate | Result |
++|---|---|
++| `cargo test --lib` | **1480 pass / 0 fail / 6 ignored** |
++| `./scripts/run_regression_suite.sh` | **PASS=563 FAIL=0 SKIP=15**, AB-diff 0 |
++| `scripts/check_benchmark_outputs.sh` | **PASS=152 FAIL=0** (new) |
++| `ir_verify_sweep.py --levels O0..Oz` | **0 violations** / 3378 configs |
++
++---
++
++## 5. To do next
++
++1. **Rebuild the closure membership test.** Track the seed relation
++   explicitly — record, for each admitted member, *which* closure value it
++   derives from, and `debug_assert!` that the operand really is that value.
++   The measured prize is large and already quantified above (`sieve` −26.5%,
++   `tls_seg_access` −5.7%, `loop_patterns` −6.5%), and the range machinery,
++   the two soundness fixes and the test corpus are all still in this document.
++2. **Run the new gate in CI.** It is fast enough to be unconditional.
++3. Unchanged: `PF-CLS-1` classifier chain, MachInst clobber modelling +
++   `Call`, `PF-TLS-1`, def-dominates-use in the verifier.
++
++---
++
++## 6. Kritik und Selbstkritik
++
++- I shipped nothing this cycle except a test gate, and the honest reason is
++  that I wrote a value-changing transform before writing the correctness gate
++  that could tell me whether it was safe. The gate took twenty minutes and
++  would have redirected the whole session.
++- Two of my three "fixes" during debugging were guesses that changed no
++  behaviour. The instrumentation that actually localized the defect — printing
++  each admitted member with its operand — should have been the first step, not
++  the fourth.
++- The measured wins are real and were obtained honestly (same-window A/B, all
++  outputs compared). They are not a reason to ship an unsound pass, and I am
++  explicitly not arguing that they are.
+diff --git a/scripts/check_benchmark_outputs.sh b/scripts/check_benchmark_outputs.sh
+new file mode 100755
+index 00000000..0e119c66
+--- /dev/null
++++ b/scripts/check_benchmark_outputs.sh
+@@ -0,0 +1,102 @@
++#!/usr/bin/env bash
++# Correctness gate over the benchmark corpus.
++#
++# WHY THIS EXISTS
++#
++# `tests/benchmark/programs/*.c` are real workload kernels -- SQLite varint,
++# zlib-ng adler32, Expat scanning, glibc memcmp, Linux find_bit -- and they are
++# the largest, most realistic programs in the tree. They were only ever
++# compiled by `run_benchmarks.py`, which takes minutes because it times
++# everything, so nobody ran them during ordinary development.
++#
++# That gap let a miscompile through: an induction-variable widening change
++# passed all 563 regression tests and `sqlite_varint` silently printed
++# `8e8824b0a241168` where GCC printed `deedcdd4edc1c0f1`. The regression corpus
++# simply contains nothing with that loop shape.
++#
++# This script closes the gap. It is correctness-only -- compile, run, diff
++# against the GCC oracle -- so it finishes in seconds and can be run on every
++# change, unlike the timing harness.
++#
++# Usage:
++#   scripts/check_benchmark_outputs.sh              # whole corpus
++#   scripts/check_benchmark_outputs.sh sqlite       # substring filter
++#
++# Environment:
++#   LCCC_BIN   compiler under test (default target/fastbuild/lccc)
++#   GCC_BIN    reference compiler  (default gcc)
++#   OPT        optimisation level to compare at (default: -O0 -O1 -O2 -O3)
++set -u
++
++REPO=${LCCC_REPO:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
++LCCC_BIN=${LCCC_BIN:-$REPO/target/fastbuild/lccc}
++GCC_BIN=${GCC_BIN:-gcc}
++FILTER=${1:-}
++LEVELS=${OPT:-"-O0 -O1 -O2 -O3"}
++
++if [[ ! -x $LCCC_BIN ]]; then
++    echo "error: $LCCC_BIN not found; build first" >&2
++    exit 2
++fi
++
++# Match what run_benchmarks.py passes, so a failure here reproduces there.
++GCC_INC=""
++for d in /usr/lib/gcc/x86_64-linux-gnu/*/include; do
++    [[ -d $d ]] && GCC_INC="-I$d"
++done
++
++WORK=$(mktemp -d -t lccc-benchcheck-XXXXXX)
++trap 'rm -rf "$WORK"' EXIT
++
++pass=0; fail=0; skip=0
++declare -a FAILED=()
++
++for src in "$REPO"/tests/benchmark/programs/*.c; do
++    name=$(basename "$src" .c)
++    [[ -n $FILTER && $name != *$FILTER* ]] && continue
++
++    # LCCC at every level: an optimisation-level-specific miscompile is still a
++    # miscompile, and -O0 vs -O3 disagreeing is the cheapest possible signal.
++    #
++    # The reference is rebuilt AT THE SAME LEVEL. Comparing lccc -O0 against
++    # gcc -O2 is not a correctness test: `tce_sum` recurses ten million deep
++    # and only survives because tail-call elimination turns it into a loop, so
++    # an unoptimised build legitimately overflows the stack. Both compilers
++    # must be asked the same question.
++    for lev in $LEVELS; do
++        ref_bin="$WORK/$name.ref$lev"
++        if ! "$GCC_BIN" "$lev" "$src" -o "$ref_bin" -lm 2>/dev/null \
++           && ! "$GCC_BIN" "$lev" "$src" -o "$ref_bin" 2>/dev/null; then
++            skip=$((skip+1)); continue
++        fi
++        ref_out=$(timeout 300 "$ref_bin" 2>&1); ref_ec=$?
++        if [[ $ref_ec -eq 124 ]]; then skip=$((skip+1)); continue; fi
++
++        bin="$WORK/$name$lev"
++        if ! "$LCCC_BIN" $GCC_INC "$lev" "$src" -o "$bin" 2>"$WORK/cc.err"; then
++            echo "FAIL  $name $lev (build: $(head -2 "$WORK/cc.err" | tr '\n' ' '))"
++            fail=$((fail+1)); FAILED+=("$name$lev:build"); continue
++        fi
++        out=$(timeout 300 "$bin" 2>&1); ec=$?
++        if [[ $ec -eq 124 ]]; then
++            echo "FAIL  $name $lev (timeout)"
++            fail=$((fail+1)); FAILED+=("$name$lev:timeout"); continue
++        fi
++        if [[ "$out|$ec" != "$ref_out|$ref_ec" ]]; then
++            echo "FAIL  $name $lev (output differs from GCC)"
++            echo "      gcc  : $(printf '%s' "$ref_out" | head -2)"
++            echo "      lccc : $(printf '%s' "$out" | head -2)"
++            fail=$((fail+1)); FAILED+=("$name$lev:oracle"); continue
++        fi
++        pass=$((pass+1))
++    done
++done
++
++echo
++echo "================================================================"
++echo "benchmark output gate: PASS=$pass FAIL=$fail SKIP=$skip"
++if [[ ${#FAILED[@]} -gt 0 ]]; then
++    printf 'failed: %s\n' "${FAILED[*]}"
++fi
++echo "================================================================"
++[[ $fail -eq 0 ]]
