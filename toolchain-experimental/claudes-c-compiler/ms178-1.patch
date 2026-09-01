@@ -1,130 +1,271 @@
-diff --git a/engineering/FOLLOWUP-2026-09-01f-vectorized-counter-proper-fix.md b/engineering/FOLLOWUP-2026-09-01f-vectorized-counter-proper-fix.md
+diff --git a/engineering/FOLLOWUP-2026-09-01g-machinst-execution-differential.md b/engineering/FOLLOWUP-2026-09-01g-machinst-execution-differential.md
 new file mode 100644
-index 00000000..c67a73f7
+index 00000000..4f301f2b
 --- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-01f-vectorized-counter-proper-fix.md
-@@ -0,0 +1,192 @@
-+# Follow-up: the vectorized loop counter, fixed properly
++++ b/engineering/FOLLOWUP-2026-09-01g-machinst-execution-differential.md
+@@ -0,0 +1,155 @@
++# Follow-up: executing MachInst, and the critical edge that blocks the
++# classifier
 +
 +Session date: 2026-09-01 (continuation)
-+Base: `ms178/lccc` main @ `38e3277f`
-+Snapshots: `S24`, `S25`
++Base: `ms178/lccc` main @ `e836c0ab`
++Snapshot: `S27`
 +
 +---
 +
-+## 1. The NAK, and why it was right
++## 1. Accomplished — MachInst verified by execution
 +
-+The previous session found that vectorizing a loop corrupts any use of the loop
-+counter *after* the loop, and responded by **declining to vectorize** such
-+loops. That was correct but it was a workaround: it bought correctness with
-+throughput when both were available.
++The suite already had four layers: register-table integrity, `IrType`→`OpSize`
++mapping, golden per-variant emission, and an assembler differential (4000
++randomized instructions through GAS 2.47). All of them answer one question —
++*is this a valid instruction?* None answers the harder one: **is it the
++instruction we meant?**
 +
-+## 2. What the defect actually is
++AT&T order is where that gap bites. `subq %rax, %rbx` means `rbx -= rax`. An
++emitter that swapped the operands of a non-commutative op would produce text
++GAS accepts, a disassembler prints without complaint, and a fuzz corpus
++assembles cleanly — while every program computes the wrong answer.
 +
-+Both addressing schemes redefine what the counter counts:
++The only way to close it is to **run the instruction**. Each case is assembled
++with the pinned GAS 2.47, linked into a harness, executed on six input pairs
++(including negative and boundary values), and compared against semantics
++computed independently in Rust:
 +
-+* **byte-offset scheme** — steps `elem_size * vec_width` **bytes** per iteration;
-+* **element-index scheme** — divides the trip count, so the counter numbers
-+  **vector iterations**.
++| test | what only execution can catch |
++|---|---|
++| all six ALU ops | `Sub`/`Imul` operand order |
++| all three shifts | `sar` vs `shr` differ **only on negative inputs** |
++| 32-bit ALU | x86-64 zero-extends bits 32..63; the 64-bit spelling assembles fine and silently keeps the upper half |
++| `movzx` vs `movsx` on `0xFF` | 255 versus −1 |
 +
-+Inside the loop only addresses read it, so neither is visible there. A use
-+*after* the loop reads a number that is no longer the element index:
++**Proven non-vacuous.** Deliberately swapping the `Alu` operand order makes the
++execution test fail with a precise diagnosis —
 +
-+```c
-+for (; n < max; n++) acc += v[n];
-+return acc + (n >> 2);
++```
++Add(dst=100, src=7) computed 100 but must be 107
++  (an AT&T operand-order or width bug)
 +```
 +
-+| | result for `max == 32` |
++— where the accept-only differential fails merely *incidentally*, because
++swapped immediates become invalid destinations. A pure register-register swap
++would slip through it entirely.
++
++32 MachInst tests, all green against GAS 2.47.
++
++---
++
++## 2. Attempted and reverted: the `namechars` classifier
++
++The worst kernel (0.44x) still emits an **eleven-branch chain per byte** where
++GCC 16.2 vectorises and ICX uses a binary search. The diagnosis from the
++previous session was correct as far as it went, and this session took it two
++steps further before hitting a wall worth recording.
++
++### 2.1 What was built
++
++* **`hoist_merge`** — a normalization that hoists a small, pure,
++  multi-predecessor "then" block into its immediate dominator, emptying it so
++  the hit edges can be retargeted straight at the join. This *worked*: the join
++  phi went from two incomings to **one per test**, which is precisely the shape
++  `set_membership`'s matcher documents.
++* **`set_membership` hit-value generalization** — its matcher required
++  `Const(1)` on every hit edge, matching only the boolean spelling
++  `int f(char) { return a || b || c; }`. The counting spelling
++  `if (a || b || c) n++;` contributes the same *incremented counter* on every
++  hit edge. Nothing in the mask logic depends on the value being 1, only on it
++  being the same across hits.
++
++Together these got the target function from 11 branches / 41 instructions to
++10 / 38.
++
++### 2.2 Why it was reverted
++
++`bool_return_materialization` began mismatching GCC. The cause is structural,
++not a coding slip:
++
++> The last test block branches to the hit block **and** falls through to the
++> join. After retargeting, that block has **two edges to the join carrying
++> different values** — `v58` on the miss, `v54` on the hit. A phi cannot
++> represent one predecessor twice with two values.
++
++That is a **critical edge**, and it is not incidental: the last member of any
++`a || b || c` chain always has exactly this shape, so the transform can never
++fire on the pattern it was written for without splitting that edge first.
++
++Reverted rather than shipped. A partial 11→10 improvement is not worth a
++miscompile, and guarding the critical-edge case would have made the pass fire
++on nothing.
++
++### 2.3 What the next attempt should do
++
++1. **Split the critical edge first.** Insert a block on the last member's
++   miss edge so each predecessor reaches the join exactly once. `split_ranges`
++   already has edge-splitting machinery worth reusing.
++2. Then `hoist_merge` + the hit-value generalization apply cleanly.
++3. **`range_fold` still will not fire.** Even with the phi normalized, the
++   `&&` pairs remain branches, so the members parse as `Skip` (plain `Cmp`)
++   rather than `Range`, and there is no contiguous run to mask. The chain is
++   `if_convert` → `range_fold` → `set_membership`, and it is starved at the
++   first link: `if_convert` does not flatten the `&&` pairs in this branchy
++   context.
++
++So the real prerequisite is **if-conversion of the pure SESE region** spanning
++the test chain. Every block in it holds a single `Cmp` and ends in a
++`CondBranch`; the whole region is side-effect free. Converting it to predicate
++arithmetic (`reach[B] = OR over preds of reach[P] AND edge_cond`) yields
++`Select`s, after which `range_fold` and `set_membership` do the rest
++unmodified. That is the supreme solution and it is a bounded, well-defined
++algorithm — it is simply larger than the remaining budget of this session, and
++shipping half of it is what produced the miscompile above.
++
++---
++
++## 3. Validation
++
++| Gate | Result |
 +|---|---|
-+| byte-offset scheme | 528 (`n` == 128) |
-+| element-index scheme | 497 (`n` == 4) |
-+| **GCC 16.2 / Clang 23.1 / ICC / ICX** | **504** (`n` == 32) |
++| `cargo test --lib` | **1472 pass / 0 fail / 6 ignored** |
++| `./scripts/run_regression_suite.sh` | **PASS=561 FAIL=0 SKIP=15**, AB-diff 0 |
++| `ir_verify_sweep.py` | **0 violations** |
++| MachInst accept + fuzz + **execution** | green against **GAS 2.47.20260726** |
 +
-+## 3. The fix, which costs zero instructions
++---
 +
-+The transform **already builds** a scalar remainder loop whose induction
-+variable counts ELEMENTS: its preheader converts the vector counter back to an
-+element index (`v27 >> 2` for 4-byte elements), and it steps by one until it
-+reaches the ORIGINAL trip bound. **Its value on exit is exactly the final value
-+the source-level counter would have had.**
++## 4. To do next, in priority order
 +
-+So the correct value already exists in the function. No arithmetic has to be
-+synthesized — the escaping uses simply have to name it.
++1. **If-convert the pure SESE test region** (§2.3). Unblocks `range_fold` and
++   `set_membership` and turns the 11-branch classifier into a handful of
++   branchless instructions. Split the critical edge first.
++2. **Vectorisation breadth.** GCC's 149/243-instruction `scan`/`match_len` are
++   SIMD; lccc's scalar `memchr` ties it here but will not on wider data.
++3. **Encoding-level differential.** Execution proves semantics for the cases
++   written; comparing emitted bytes against GAS's own encoding would cover the
++   rest. `insndiff.py`/`encdiff.py` exist.
++4. **Def-dominates-use in the IR verifier**; **linker oracle** (lld 23.1,
++   mold 2.42, bfd 2.47). Both unchanged.
 +
-+That is strictly better than both alternatives:
++---
 +
-+* better than declining to vectorize — **measured 4.5x faster** (0.0125 s vs
-+  0.0557 s on a 4096-element reduction × 20 000);
-+* better than materializing `trips * vec_width + remainder` in the exit block —
-+  that adds instructions *and* has to be kept in agreement with the remainder
-+  loop on every exit path, which is precisely the fragility that produced the
-+  original bug.
++## 5. Notes for whoever picks this up
 +
-+**Dominance is structural, not assumed.** The vector loop's only exit goes to
-+the remainder preheader, and the remainder loop's only exit goes to the
-+original loop exit; every path leaving the nest passes through the remainder
-+header, so its phi dominates everything downstream. The rewrite is restricted
-+to blocks that existed *before* the remainder was created, which excludes the
-+remainder's own blocks — their use of the vector counter is the legitimate
-+byte-to-element conversion and must not be touched.
++- **"Does it assemble" is a weak oracle.** Two MachInst bugs were found by the
++  accept differential, but an operand-order bug is invisible to it. Execute the
++  instruction; the diagnosis is also far better.
++- **Do not ship a partial region transform.** The `hoist_merge` work was
++  correct in isolation and still produced a miscompile, because the pattern it
++  targets always contains a critical edge. Normalize the edge first or not at
++  all.
++- **Check the whole chain before optimizing a link in it.** The phi shape was
++  fixed and the classifier still did not improve, because `range_fold` upstream
++  had never fired either. Verifying the *next* pass actually fires would have
++  shown that before any code was written.
+diff --git a/engineering/FOLLOWUP-2026-09-01h-machinst-coverage.md b/engineering/FOLLOWUP-2026-09-01h-machinst-coverage.md
+new file mode 100644
+index 00000000..70fa2e5d
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-09-01h-machinst-coverage.md
+@@ -0,0 +1,145 @@
++# Follow-up: measuring MachInst, then closing the largest hole
 +
-+### 3.1 The exhaustive test found a second gap immediately
++Session date: 2026-09-01 (continuation)
++Base: `ms178/lccc` main @ `e836c0ab`
++Snapshots: `S29`–`S31`
 +
-+The first version of the fix touched only `transform_reduction_avx2`. The new
-+sweep caught that an **i64** reduction goes through `transform_reduction_sse2`
-+(2-wide) and still leaked a byte count — `max == 2` returned 19 instead of 5.
-+Both paths are fixed.
++---
 +
-+That is the value of sweeping element sizes rather than testing one type:
-+`sum_only` (counter does not escape) was correct for i64 all along, so only a
-+test that varied *both* the element size and whether the counter escapes could
-+separate the two.
++## 1. The question nobody could answer
 +
-+### 3.2 What the test covers
++"How much of codegen actually flows through MachInst?" was **unmeasurable**.
++`lower_instruction_typed` returns a bool; on `false` the instruction silently
++falls back to direct text emission. A shrinking coverage fraction — or a whole
++instruction class nobody noticed was excluded — looks exactly like everything
++being fine.
 +
-+`tests/regression/vectorized_counter_escapes.c` sweeps trip counts **0..34**
-+across eight shapes, comparing every result against GCC:
++`CCC_ISEL_STATS=1` now prints a per-run census: how many instructions were
++lowered, and a **ranked** breakdown of what was rejected. Measured across 200
++corpus files at `-O2`:
 +
-+* trip counts that are **exact multiples** of the vector width, so the
-+  remainder loop runs **zero** times and its phi must still carry the
-+  preheader's start value;
-+* trip counts **below** the vector width, so the *vector* loop runs zero times;
-+* **zero** trip count, where the counter must remain 0;
-+* **4- and 8-byte** elements, which scale the byte counter differently and
-+  route through different transforms;
-+* the counter read **several times** and in several expressions;
-+* an **unsigned** counter;
-+* the counter **compared** rather than consumed arithmetically;
-+* an **early-exit** loop, whose final counter is *not* the loop bound and which
-+  therefore no `trips * vec_width` formula could ever reconstruct — only the
-+  real counter can.
++```
++MachInst coverage: 1165/2162 = 53.9%
++    293  GlobalAddr        (13.6%)
++    252  ParamRef          (11.7%)
++    213  Call               (9.9%)
++     72  Store(float)
++     64  Store(other)
++     46  Memcpy
++```
 +
-+## 4. GAS 2.47 for the MachInst differential
++Nearly **half of all instructions bypassed the typed, tested,
++register-allocated representation.** The census is what turned "make MachInst
++better" into a ranked worklist.
 +
-+A differential is only as authoritative as the assembler behind it: passing
-+against Debian's 2.44 proves the text was valid for *that* release, not the one
-+the project targets. `find_assembler` now searches `$LCCC_GAS`, then the cache
-+`scripts/ensure_gas_247.sh` provisions, then system `as`, then `gcc -x
-+assembler`; it prints the binary **and its version** on every run and warns
-+explicitly when it is not 2.47.
++## 2. Largest hole: `GlobalAddr`, 13.6%
 +
-+GAS **2.47.20260726** was provisioned and all 28 MachInst tests — including the
-+4000-instruction randomized stress — pass against it.
++It bailed with an explicit surrender:
 +
-+## 5. Oracle standing
++> *"GlobalAddr needs leaq symbol(%rip) which isn't directly expressible in
++> MachInst Mov (would produce movq, not leaq). Handled by the default codegen
++> path for now."*
 +
-+`long long reduce_esc(const int*, int)` at `-O3 -march=x86-64-v3`:
++The comment is correct and the conclusion was wrong: the representation was
++missing a variant, so add one. `MachInst::LeaSym { sym, dst }` emits
++`leaq sym(%rip), %dst`.
 +
-+| compiler | instructions |
++The distinction matters and is not cosmetic: `Mov` with a `RipRel` source means
++**load from** the symbol; `GlobalAddr` wants the **address itself**. Conflating
++them is a silent miscompile that assembles perfectly, which is why the new
++variant is covered by an **execution** test — a probe links it against a real
++global initialised to a sentinel and asserts the returned value equals the
++symbol's address. An emitter using `movq` returns the contents and fails at
++runtime, while remaining invisible to any check that only asks whether the text
++assembles.
++
++**Coverage 53.9% → 67.4%**, 561/561 passing.
++
++## 3. Second hole: `ParamRef`, 11.7% — attempted, reverted, explained
++
++`ParamRef` looked like a free win: parameters are materialised by the prologue,
++so a `ParamRef` in the instruction stream appears to emit nothing, exactly like
++`Alloca` (which isel already accepts).
++
++It fails four corpus tests, and *which* four is the whole story:
++`x86_fpo_stack_params_many_args`, `nested_nonlocal_goto_callee_saved`,
++`pgo_branchy`, `value_profiling` — every one parameter-related. A parameter is
++only already-in-place when it **arrived in a register and kept that home**.
++Stack-passed arguments and nested-function frames still need the text path, and
++the buffer flush that `false` triggers is what orders that against surrounding
++MachInst code.
++
++Reverted, with the reasoning recorded **in the code** so the next attempt models
++the incoming-argument location rather than repeating the assumption.
++
++## 4. Third: narrow stores
++
++`I8/U8/I16/U16` stores were refused outright. Nothing about them is
++inexpressible — `movb %al, (%rcx)` and `movw %ax, off(%rbp)` are ordinary
++`MachInst::Mov` at `OpSize::S8`/`S16`, and the emitter's size tables have
++always handled both. The guard only split contiguous MachInst runs and pushed
++**byte traffic — the dominant operation in the gzip / zlib-ng / expat
++workloads** — onto the untyped path.
++
++Net **−3 lines**. `tests/regression/machinst_narrow_store.c` covers the three
++addressing forms the lowering distinguishes (alloca slot, pointer already in a
++register, pointer that must be staged) across signed and unsigned 8- and
++16-bit types, register and immediate sources, and the `r8`..`r15` registers
++whose byte names are spelled differently from the legacy set.
++
++## 5. MachInst test suite: now five layers, 34 tests
++
++| layer | proves |
 +|---|---|
-+| **lccc** | **51** |
-+| ICX (latest) | 33 |
-+| ICC 2021.10 | 70 |
-+| Clang 23.1 | 73 |
-+| GCC 16.2 | 76 |
++| table integrity | the four register-name tables agree and are injective |
++| type mapping | `OpSize` classifies every `IrType`; suffixes match |
++| golden emission | each variant/operand shape emits the expected text |
++| assembler differential (GAS 2.47) | 4000 randomized instructions are **valid** |
++| **execution** | they are the **intended** instructions |
 +
-+lccc beats GCC, Clang and ICC on this shape; ICX is still ahead.
++Only the last catches an AT&T operand-order bug: `subq %rax, %rbx` means
++`rbx -= rax`, and a swapped non-commutative operand assembles perfectly.
 +
 +---
 +
@@ -132,696 +273,782 @@ index 00000000..c67a73f7
 +
 +| Gate | Result |
 +|---|---|
-+| `cargo test --lib` | **1468 pass / 0 fail / 6 ignored** |
-+| `./scripts/run_regression_suite.sh` | **PASS=561 FAIL=0 SKIP=15**, AB-diff 0 |
++| `cargo test --lib` | **1474 pass / 0 fail / 6 ignored** |
++| `./scripts/run_regression_suite.sh` | **PASS=562 FAIL=0 SKIP=15**, AB-diff 0 |
 +| `ir_verify_sweep.py --levels O0..Oz` | **0 violations** / 3366 configs |
-+| MachInst differential + fuzz | all accepted by **GAS 2.47** |
-+| `bench_kernels.py` | no regressions; geomean 0.673x vs GCC |
++| MachInst 5-layer suite | 34 tests green |
++| `bench_kernels.py` | `memchr` **1.39x vs GCC**; geomean 0.725x |
 +
 +---
 +
 +## 7. To do next, in priority order
 +
-+### 7.1 `namechars` — the counting form of the classifier (worst kernel, 0.44x)
-+
-+Still an **11-branch chain** per byte where GCC vectorises and ICX uses a
-+binary search. The cause is precise and unchanged:
-+
-+* `int f(char)` returning 0/1 → if-converts to a `Select` chain → `range_fold`
-+  folds each `lo <= c && c <= hi` to one unsigned range test → `set_membership`
-+  merges `[a-z]`+`[A-Z]` into a single test on `c & ~32`. This path works;
-+  `k_classify` gets it.
-+* `if (pred) n++;` → the hit edges of every test converge on a **shared
-+  increment block** before the join, so no diamond is formed, no `Select` is
-+  produced, and the entire chain downstream is starved. `k_namechars` gets
-+  this.
-+
-+The two bench kernels deliberately bracket the problem. The fix is a new
-+if-conversion pattern: *n* test blocks each branching to a common single-block
-+`HIT`, which joins with a phi `[hit_value, miss_value]`. That is exactly the
-+`Phi [(Const(1), T_1), …]` shape `set_membership`'s matcher already documents;
-+it needs to accept a non-constant hit value too. Recognising it converts the
-+whole chain to branchless arithmetic in one step.
-+
-+### 7.2 Vectorisation breadth
-+
-+GCC's 149/243-instruction outputs on `scan`/`match_len` are SIMD. lccc's scalar
-+`memchr` ties it here, but that will not hold on wider data.
-+
-+### 7.3 Encoding-level differential
-+
-+The MachInst differential proves GAS 2.47 *accepts* the text. The stronger
-+property is that the bytes match what GAS produces for the intended
-+instruction; `insndiff.py`/`encdiff.py` exist and could be pointed at the
-+MachInst corpus.
-+
-+### 7.4 Def-dominates-use in the IR verifier; linker oracle (lld 23.1, mold 2.42,
-+bfd 2.47)
-+
-+Both unchanged from previous sessions.
++1. **`ParamRef` (11.7%) — properly.** Model the incoming-argument location
++   (register home vs stack slot vs nested-frame access) instead of asserting
++   there is nothing to emit. §3 has the four tests that define correctness.
++2. **`Call` (9.9%).** Needs SysV ABI modelling in MachInst: argument
++   registers, caller-saved clobbers, return register, stack alignment. The
++   largest remaining single class.
++3. **If-convert the pure SESE test region** — still the biggest *performance*
++   item. `namechars` (0.51x) emits an eleven-branch chain per byte. The chain
++   is `if_convert` → `range_fold` → `set_membership` and it is starved at the
++   first link. A previous attempt is documented in
++   `FOLLOWUP-2026-09-01g`: split the critical edge on the last member first,
++   or the normalization creates two phi incomings for one predecessor.
++4. **Vectorisation breadth**; **encoding-level differential**;
++   **def-dominates-use in the IR verifier**; **linker oracle**.
 +
 +---
 +
 +## 8. Notes for whoever picks this up
 +
-+- **"Correct but slower" is not done.** The bail-out passed every test and was
-+  still the wrong answer; the information needed to do it properly (the
-+  remainder loop's element counter) was already sitting in the function.
-+- **Look for the value before synthesizing it.** The instinct was to compute
-+  `trips * vec_width + remainder` in the exit block. The transform had already
-+  computed the right number for its own purposes.
-+- **Sweep the dimensions, not a point.** One trip count and one element type
-+  would have shipped the AVX2 half of this fix and left i64 silently broken.
-+  The sweep found it on the first run.
-+- **A differential inherits the authority of its oracle.** Probing MachInst
-+  against whatever `as` is installed quietly weakens the strongest test in the
-+  suite; pin it and say so out loud.
++- **Measure the layer before improving it.** "Make MachInst supreme" is not
++  actionable; "53.9% coverage, and `GlobalAddr` is 13.6% of the gap" is. The
++  census took one afternoon and turned the whole problem into a ranked list.
++- **A surrender comment is a design gap, not a fact.** `GlobalAddr` bailed
++  because the representation lacked a variant. Adding it took a dozen lines.
++- **The plausible free win is where the bodies are.** `ParamRef` looked
++  identical to `Alloca` and broke four tests. Every one named a parameter
++  edge case, which is the diagnosis handed over for free.
+diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
+index 5409c5ba..3acc68ee 100644
+--- a/src/backend/x86/codegen/isel.rs
++++ b/src/backend/x86/codegen/isel.rs
+@@ -885,6 +885,113 @@ pub fn lower_cond_branch(
+ 
+ /// Check if an IR instruction can be lowered to MachInst.
+ /// Instructions that can't are emitted as Raw passthrough via the existing codegen.
++/// Per-run ISel coverage census, printed at process exit when
++/// `CCC_ISEL_STATS=1`.
++///
++/// "How much of codegen actually flows through MachInst?" is the structural
++/// health metric for this layer, and it was previously unmeasurable: the
++/// fallback to direct text emission is silent, so a shrinking coverage
++/// fraction -- or a whole instruction class nobody noticed was excluded --
++/// looks exactly like everything being fine. The counters make the gap
++/// visible and rank it, so work targets the biggest class rather than the
++/// most obvious one.
++pub mod stats {
++    use std::sync::atomic::{AtomicU64, Ordering};
++    use std::sync::Mutex;
++
++    pub static LOWERED: AtomicU64 = AtomicU64::new(0);
++    pub static REJECTED: AtomicU64 = AtomicU64::new(0);
++
++    static BY_KIND: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
++
++    pub fn enabled() -> bool {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        *ON.get_or_init(|| std::env::var("CCC_ISEL_STATS").is_ok())
++    }
++
++    pub fn note_reject(kind: &'static str) {
++        REJECTED.fetch_add(1, Ordering::Relaxed);
++        if let Ok(mut v) = BY_KIND.lock() {
++            match v.iter_mut().find(|(k, _)| *k == kind) {
++                Some((_, n)) => *n += 1,
++                None => v.push((kind, 1)),
++            }
++        }
++    }
++
++    /// Print the census. Call once, at the end of compilation.
++    pub fn report() {
++        if !enabled() {
++            return;
++        }
++        let lowered = LOWERED.load(Ordering::Relaxed);
++        let rejected = REJECTED.load(Ordering::Relaxed);
++        let total = lowered + rejected;
++        if total == 0 {
++            return;
++        }
++        eprintln!(
++            "[ISEL-STATS] {} of {} instructions lowered through MachInst ({:.1}%)",
++            lowered,
++            total,
++            lowered as f64 * 100.0 / total as f64
++        );
++        if let Ok(mut v) = BY_KIND.lock() {
++            v.sort_by(|a, b| b.1.cmp(&a.1));
++            for (kind, n) in v.iter().take(12) {
++                eprintln!(
++                    "[ISEL-STATS]   rejected {:>7}  {} ({:.1}% of all)",
++                    n,
++                    kind,
++                    *n as f64 * 100.0 / total as f64
++                );
++            }
++        }
++    }
++}
++
++/// Discriminant name, for the coverage census.
++fn kind_name(inst: &Instruction) -> &'static str {
++    match inst {
++        Instruction::BinOp { ty, .. } if ty.is_float() => "BinOp(float)",
++        Instruction::BinOp { .. } => "BinOp(other)",
++        Instruction::Load { ty, .. } if ty.is_float() => "Load(float)",
++        Instruction::Load { .. } => "Load(other)",
++        Instruction::Store { ty, .. } if ty.is_float() => "Store(float)",
++        Instruction::Store { .. } => "Store(other)",
++        Instruction::Cmp { ty, .. } if ty.is_float() => "Cmp(float)",
++        Instruction::Cmp { .. } => "Cmp(other)",
++        Instruction::Cast { .. } => "Cast",
++        Instruction::UnaryOp { .. } => "UnaryOp",
++        Instruction::Select { .. } => "Select",
++        Instruction::Call { .. } => "Call",
++        Instruction::CallIndirect { .. } => "CallIndirect",
++        Instruction::Phi { .. } => "Phi",
++        Instruction::Alloca { .. } => "Alloca",
++        Instruction::Intrinsic { .. } => "Intrinsic",
++        Instruction::InlineAsm { .. } => "InlineAsm",
++        Instruction::Memcpy { .. } => "Memcpy",
++        Instruction::AtomicLoad { .. }
++        | Instruction::AtomicStore { .. }
++        | Instruction::AtomicRmw { .. }
++        | Instruction::AtomicCmpxchg { .. } => "Atomic*",
++        Instruction::ParamRef { .. } => "ParamRef",
++        Instruction::Phi { .. } => "Phi",
++        Instruction::GetElementPtr { .. } => "GetElementPtr",
++        Instruction::GlobalAddr { .. } => "GlobalAddr",
++        Instruction::Copy { .. } => "Copy",
++        Instruction::VaArg { .. } => "VaArg",
++        Instruction::Fence { .. } => "Fence",
++        other => {
++            // Name the remaining variants rather than lumping them into a
++            // bucket that hides the biggest opportunity.
++            let d = format!("{:?}", other);
++            let name = d.split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap_or("other");
++            Box::leak(format!("other:{}", name).into_boxed_str())
++        }
++    }
++}
++
+ pub fn can_lower(inst: &Instruction) -> bool {
+     match inst {
+         Instruction::BinOp { ty, .. } => !ty.is_float() && !ty.is_128bit(),
+@@ -947,6 +1054,24 @@ pub fn lower_instruction_typed(
+     alloca_slots: &FxHashMap<u32, i64>,
+     value_types: Option<&FxHashMap<u32, crate::common::types::IrType>>,
+     out: &mut Vec<MachInst>,
++) -> bool {
++    let lowered = lower_instruction_typed_inner(inst, reg_assignments, alloca_slots, value_types, out);
++    if stats::enabled() {
++        if lowered {
++            stats::LOWERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        } else {
++            stats::note_reject(kind_name(inst));
++        }
++    }
++    lowered
++}
++
++fn lower_instruction_typed_inner(
++    inst: &Instruction,
++    reg_assignments: &FxHashMap<u32, PhysReg>,
++    alloca_slots: &FxHashMap<u32, i64>,
++    value_types: Option<&FxHashMap<u32, crate::common::types::IrType>>,
++    out: &mut Vec<MachInst>,
+ ) -> bool {
+     // For values that already have register allocations from the existing
+     // allocator, use their physical register directly (MachReg::Phys).
+@@ -987,9 +1112,6 @@ pub fn lower_instruction_typed(
+             if ty.is_float() || ty.is_128bit() || ty.is_long_double() {
+                 return false;
+             }
+-            if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+-                return false;
+-            }
+             if *seg_override != AddressSpace::Default {
+                 return false;
+             }
+@@ -1187,17 +1309,33 @@ pub fn lower_instruction_typed(
+             lower_gep(dest, base, offset, ra, out);
+             true
+         }
+-        Instruction::GlobalAddr { .. } => {
+-            // GlobalAddr needs leaq symbol(%rip) which isn't directly
+-            // expressible in MachInst Mov (would produce movq, not leaq).
+-            // Handled by the default codegen path for now.
+-            false
++        Instruction::GlobalAddr { dest, name, .. } => {
++            // `leaq sym(%rip), %dst`. Previously bailed to the text emitter
++            // because MachInst could not express "address of" as distinct from
++            // "load from"; `LeaSym` now does.
++            out.push(MachInst::LeaSym {
++                sym: name.clone(),
++                dst: value_to_reg(dest, ra),
++            });
++            true
+         }
+         Instruction::Alloca { .. } => {
+             // Alloca produces no code (stack allocated in prologue).
+             // Return true to avoid flushing the MachInst buffer.
+             true
+         }
++        // ParamRef is DELIBERATELY not lowered here, despite being 11.7% of
++        // all instructions and appearing to emit nothing.
++        //
++        // Treating it as a no-op like Alloca fails four corpus tests, all of
++        // them parameter-related (x86_fpo_stack_params_many_args,
++        // nested_nonlocal_goto_callee_saved, pgo_branchy, value_profiling):
++        // a parameter is only already-in-place when it arrived in a register
++        // and kept that home. Stack-passed arguments and nested-function
++        // frames still need the text path to materialize them, and the buffer
++        // flush that `false` triggers is what orders that against surrounding
++        // MachInst code. Lowering ParamRef properly means modelling the
++        // incoming-argument location, not asserting there is nothing to do.
+         _ => false,
+     }
+ }
+diff --git a/src/backend/x86/codegen/machinst.rs b/src/backend/x86/codegen/machinst.rs
+index e8764cc7..64629e5a 100644
+--- a/src/backend/x86/codegen/machinst.rs
++++ b/src/backend/x86/codegen/machinst.rs
+@@ -173,6 +173,19 @@ pub enum MachInst {
+         dst: MachReg,
+     },
+ 
++    /// `leaq sym(%rip), dst` — the address of a global.
++    ///
++    /// This needs its own variant because `Mov` with a [`MachOperand::RipRel`]
++    /// source means "load FROM the symbol" (`movq sym(%rip), %dst`), whereas a
++    /// `GlobalAddr` wants the address ITSELF. Without the distinction the
++    /// lowering had no way to express `leaq` and bailed to the text emitter --
++    /// 293 of 2162 instructions across the corpus, 13.6%, the single largest
++    /// hole in MachInst coverage.
++    LeaSym {
++        sym: String,
++        dst: MachReg,
++    },
++
+     // ── Division (implicit rax:rdx) ──────────────────────────────────
+     /// Sign-extend rax → rdx:rax. x86: `cqto` (64-bit) or `cltd` (32-bit).
+     Cqto {
+diff --git a/src/backend/x86/codegen/machinst_emit.rs b/src/backend/x86/codegen/machinst_emit.rs
+index adfd7182..140fc2ae 100644
+--- a/src/backend/x86/codegen/machinst_emit.rs
++++ b/src/backend/x86/codegen/machinst_emit.rs
+@@ -667,6 +667,15 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
+             out.emit_fmt(format_args!("    call *{}", reg_str));
+         }
+ 
++        MachInst::LeaSym { sym, dst } => {
++            // Always 64-bit: an address.
++            out.emit_fmt(format_args!(
++                "    leaq {}(%rip), {}",
++                sym,
++                fmt_reg(dst, OpSize::S64)
++            ));
++        }
++
+         MachInst::Ret => {
+             out.emit("    ret");
+         }
 diff --git a/src/backend/x86/codegen/machinst_tests.rs b/src/backend/x86/codegen/machinst_tests.rs
-index cc9a1bc8..a161bc23 100644
+index a161bc23..eaa468d1 100644
 --- a/src/backend/x86/codegen/machinst_tests.rs
 +++ b/src/backend/x86/codegen/machinst_tests.rs
-@@ -579,32 +579,82 @@ fn instruction_corpus() -> Vec<MachInst> {
-     v
+@@ -429,6 +429,21 @@ fn zero_and_sign_extension_emit_distinct_mnemonics() {
+     assert!(s.contains("%al") && s.contains("%ebx"), "{}", s);
  }
  
--/// Locate a usable assembler, preferring the project's pinned GAS.
--fn find_assembler() -> Option<String> {
--    for cand in ["as", "gcc"] {
--        if std::process::Command::new(cand)
--            .arg("--version")
--            .output()
--            .map(|o| o.status.success())
--            .unwrap_or(false)
--        {
--            return Some(cand.to_string());
-+/// Locate an assembler, preferring the project's pinned **GAS 2.47**.
-+///
-+/// The differential is only as authoritative as the assembler behind it: a
-+/// pass against an older GAS proves the text was valid for *that* release, not
-+/// for the one the project targets. Search order:
-+///
-+///   1. `$LCCC_GAS` — an explicit override;
-+///   2. the cache `scripts/ensure_gas_247.sh` provisions;
-+///   3. whatever `as` is on PATH, and finally `gcc -x assembler`.
-+///
-+/// The chosen assembler and its version are reported on every run, so a probe
-+/// that fell back to an older GAS is visible rather than silently weaker.
-+fn find_assembler() -> Option<(String, String)> {
-+    let mut cands: Vec<String> = Vec::new();
-+    if let Ok(p) = std::env::var("LCCC_GAS") {
-+        cands.push(p);
-+    }
-+    // ensure_gas_247.sh installs to /home/user/.cache/gas-2.47-<target>/bin/as
-+    if let Ok(entries) = std::fs::read_dir("/home/user/.cache") {
-+        let mut hits: Vec<String> = entries
-+            .flatten()
-+            .filter_map(|e| {
-+                let n = e.file_name().to_string_lossy().to_string();
-+                n.starts_with("gas-2.47-").then(|| {
-+                    e.path().join("bin").join("as").to_string_lossy().to_string()
-+                })
-+            })
-+            .filter(|p| std::path::Path::new(p).exists())
-+            .collect();
-+        hits.sort();
-+        cands.extend(hits);
-+    }
-+    cands.push("as".to_string());
-+    cands.push("gcc".to_string());
++#[test]
++fn a_symbol_address_emits_leaq_not_movq() {
++    // `GlobalAddr` wants the ADDRESS of a symbol. Emitting `movq sym(%rip)`
++    // would load its CONTENTS -- a silent miscompile that assembles perfectly.
++    // This distinction is why `LeaSym` exists as its own variant.
++    let line = emit1(&MachInst::LeaSym {
++        sym: "glob".into(),
++        dst: MachReg::Phys(PhysReg(15)),
++    });
++    assert!(line.starts_with("leaq"), "must be leaq, got `{line}`");
++    assert!(line.contains("glob(%rip)"), "{line}");
++    assert!(line.contains("%rsi"), "address is 64-bit: {line}");
++    assert!(!line.contains("movq"), "{line}");
++}
 +
-+    for cand in cands {
-+        if let Ok(out) = std::process::Command::new(&cand).arg("--version").output() {
-+            if out.status.success() {
-+                let ver = String::from_utf8_lossy(&out.stdout)
-+                    .lines()
-+                    .next()
-+                    .unwrap_or("")
-+                    .to_string();
-+                return Some((cand, ver));
-+            }
+ #[test]
+ fn control_flow_variants_emit_their_targets() {
+     assert!(emit1(&MachInst::Jmp {
+@@ -575,6 +590,12 @@ fn instruction_corpus() -> Vec<MachInst> {
+             });
          }
      }
-     None
++    for &r in &regs {
++        v.push(MachInst::LeaSym {
++            sym: "machinst_probe_sym".into(),
++            dst: MachReg::Phys(r),
++        });
++    }
+     v.push(MachInst::Ret);
+     v
  }
- 
-+/// Report which assembler backed a differential run. Loud on purpose: the
-+/// project pins GAS 2.47 and a run against anything older is weaker evidence.
-+fn announce_assembler(which: &str, ver: &str) {
-+    if ver.contains("2.47") {
-+        eprintln!("MachInst differential: using {which} ({ver})");
+@@ -814,7 +835,7 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
+                 _ => MachOperand::StackSlot(*rng.pick(&offsets)),
+             }
+         };
+-        v.push(match rng.next() % 9 {
++        v.push(match rng.next() % 10 {
+             0 => MachInst::Mov {
+                 src: operand(&mut rng),
+                 dst: MachOperand::Reg(MachReg::Phys(b)),
+@@ -868,6 +889,10 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
+                 offset: *rng.pick(&offsets),
+                 dst: MachReg::Phys(*rng.pick(&regs)),
+             },
++            8 => MachInst::LeaSym {
++                sym: "machinst_probe_sym".into(),
++                dst: MachReg::Phys(b),
++            },
+             _ => MachInst::Movzx {
+                 src: MachOperand::Reg(MachReg::Phys(a)),
+                 dst: MachReg::Phys(b),
+@@ -981,3 +1006,313 @@ fn no_randomized_instruction_emits_an_unresolved_register_or_empty_text() {
+         }
+     }
+ }
++
++// ── 6. semantic execution differential ──────────────────────────────────────
++//
++// Layers 1-5 prove the emitted text is a VALID instruction. They cannot prove
++// it is the INTENDED one. AT&T order is the classic trap: `subq %rax, %rbx`
++// means `rbx -= rax`, so an emitter that swapped the operands of a
++// non-commutative op would produce text GAS accepts, a disassembler shows
++// without complaint, and a fuzz corpus assembles cleanly -- while every
++// program computes the wrong answer.
++//
++// The only way to close that gap is to RUN the instruction. Each case below
++// is assembled into a real function, linked, executed with known inputs, and
++// compared against the semantics computed independently in Rust.
++
++/// Assemble `body` as `long f(long,long)` (SysV: rdi, rsi), run it on the
++/// given inputs, and return the results. `None` when the toolchain is absent.
++fn run_emitted(body: &str, inputs: &[(i64, i64)]) -> Option<Vec<i64>> {
++    let (asm, _ver) = find_assembler()?;
++    // Executing needs a compiler+linker for the harness, not just `as`.
++    if std::process::Command::new("cc").arg("--version").output().is_err() {
++        return None;
++    }
++
++    let dir = std::env::temp_dir().join(format!(
++        "lccc-machinst-exec-{}-{}",
++        std::process::id(),
++        body.len()
++    ));
++    let _ = std::fs::create_dir_all(&dir);
++    let s_path = dir.join("f.s");
++    let c_path = dir.join("m.c");
++    let bin = dir.join("m");
++
++    std::fs::write(
++        &s_path,
++        format!(".text\n.globl probe_fn\n.type probe_fn,@function\nprobe_fn:\n{body}\n    ret\n"),
++    )
++    .ok()?;
++
++    let mut main_src = String::from(
++        "#include <stdio.h>\nlong probe_fn(long,long);\nint main(void){\n",
++    );
++    for (a, b) in inputs {
++        main_src.push_str(&format!(
++            "    printf(\"%lld\\n\", (long long)probe_fn({}L, {}L));\n",
++            a, b
++        ));
++    }
++    main_src.push_str("    return 0;\n}\n");
++    std::fs::write(&c_path, main_src).ok()?;
++
++    // Assemble with the pinned assembler, then link with cc.
++    let obj = dir.join("f.o");
++    let mut cmd = std::process::Command::new(&asm);
++    if asm.ends_with("gcc") {
++        cmd.arg("-c").arg("-x").arg("assembler");
 +    } else {
-+        eprintln!(
-+            "MachInst differential: using {which} ({ver}) -- NOT the pinned GAS 2.47. \
-+             Run scripts/ensure_gas_247.sh or set LCCC_GAS to probe against the \
-+             assembler the project actually targets."
++        cmd.arg("-c");
++    }
++    let a_out = cmd.arg(&s_path).arg("-o").arg(&obj).output().ok()?;
++    if !a_out.status.success() {
++        panic!(
++            "assembler rejected an execution probe:\n{}\n--- source ---\n{}",
++            String::from_utf8_lossy(&a_out.stderr),
++            body
 +        );
 +    }
++    let l_out = std::process::Command::new("cc")
++        .arg(&c_path)
++        .arg(&obj)
++        .arg("-o")
++        .arg(&bin)
++        .output()
++        .ok()?;
++    if !l_out.status.success() {
++        return None;
++    }
++    let r = std::process::Command::new(&bin).output().ok()?;
++    let vals: Vec<i64> = String::from_utf8_lossy(&r.stdout)
++        .lines()
++        .filter_map(|l| l.trim().parse::<i64>().ok())
++        .collect();
++    let _ = std::fs::remove_dir_all(&dir);
++    (vals.len() == inputs.len()).then_some(vals)
 +}
 +
- #[test]
- fn every_emitted_instruction_is_accepted_by_the_real_assembler() {
--    let Some(asm) = find_assembler() else {
-+    let Some((asm, ver)) = find_assembler() else {
-         // Do NOT pass silently: a vacuous green here would hide the strongest
-         // check in the file.
-         eprintln!(
--            "SKIP: no system assembler found; the MachInst differential test \
--             cannot run in this environment"
-+            "SKIP: no assembler found; the MachInst differential test cannot \
-+             run in this environment"
-         );
-         return;
-     };
-+    announce_assembler(&asm, &ver);
- 
-     let corpus = instruction_corpus();
-     assert!(corpus.len() > 300, "corpus too small: {}", corpus.len());
-@@ -638,7 +688,7 @@ fn every_emitted_instruction_is_accepted_by_the_real_assembler() {
-     std::fs::write(&s_path, &src).expect("write probe.s");
- 
-     let mut cmd = std::process::Command::new(&asm);
--    if asm == "gcc" {
-+    if asm.ends_with("gcc") {
-         cmd.arg("-c").arg("-x").arg("assembler");
-     } else {
-         cmd.arg("-c");
-@@ -831,10 +881,11 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
- 
- #[test]
- fn a_large_randomized_corpus_is_accepted_by_the_real_assembler() {
--    let Some(asm) = find_assembler() else {
--        eprintln!("SKIP: no system assembler; randomized MachInst stress cannot run");
-+    let Some((asm, ver)) = find_assembler() else {
-+        eprintln!("SKIP: no assembler; randomized MachInst stress cannot run");
-         return;
-     };
-+    announce_assembler(&asm, &ver);
-     let corpus = random_corpus(4000);
- 
-     let mut src = String::from(".text
-@@ -867,7 +918,7 @@ _machinst_fuzz:
-     std::fs::write(&s_path, &src).expect("write fuzz.s");
- 
-     let mut cmd = std::process::Command::new(&asm);
--    if asm == "gcc" {
-+    if asm.ends_with("gcc") {
-         cmd.arg("-c").arg("-x").arg("assembler");
-     } else {
-         cmd.arg("-c");
-diff --git a/src/passes/vectorize.rs b/src/passes/vectorize.rs
-index 0b73bce4..42a38b27 100644
---- a/src/passes/vectorize.rs
-+++ b/src/passes/vectorize.rs
-@@ -7893,6 +7893,159 @@ fn reduction_gep_base(func: &IrFunction, body_idx: usize, gep: Value) -> Value {
-     gep
- }
- 
++/// Emit `inst` into a probe that loads rdi/rsi into the operand registers and
++/// returns the destination.
++fn probe_body(setup_dst: PhysReg, setup_src: PhysReg, inst: &MachInst) -> String {
++    let mut out = AsmOutput::new();
++    emit_machinst(inst, &mut out);
++    let d = expected_names(setup_dst).unwrap()[3]; // 64-bit spelling
++    let s = expected_names(setup_src).unwrap()[3];
++    format!(
++        "    movq %rdi, %{d}\n    movq %rsi, %{s}\n{}    movq %{d}, %rax\n",
++        out.buf
++    )
++}
 +
-+/// Repair uses of the loop counter that ESCAPE a vectorized loop.
-+///
-+/// # The defect
-+///
-+/// Vectorizing redefines what the counter counts. Under the byte-offset scheme
-+/// it steps `elem_size * vec_width` BYTES per iteration; under the
-+/// element-index scheme the trip count is divided so it numbers VECTOR
-+/// iterations. Inside the loop only addresses read it, so neither is visible
-+/// there. A use AFTER the loop reads a number that is no longer the element
-+/// index:
-+///
-+/// ```c
-+/// for (; n < max; n++) acc += v[n];
-+/// return acc + (n >> 2);
-+/// ```
-+///
-+/// returned 528 (byte scheme, `n` == 128) or 497 (element scheme, `n` == 4)
-+/// where GCC 16.2, Clang 23.1, ICC and ICX all return 504 (`n` == 32). A
-+/// silent wrong answer -- not a crash -- on `for (i = 0; i < n; i++) ...;`
-+/// followed by any use of `i`.
-+///
-+/// # The repair, and why it is free
-+///
-+/// The transform already builds a scalar remainder loop whose induction
-+/// variable counts ELEMENTS: its preheader converts the vector counter back to
-+/// an element index (`v27 >> 2` for 4-byte elements), and it steps by one
-+/// until it reaches the ORIGINAL trip bound. Its value on exit is therefore
-+/// exactly the final value the source-level counter would have had.
-+///
-+/// So the correct value already exists in the function and no arithmetic needs
-+/// to be synthesized: the escaping uses simply have to name it. This costs
-+/// **zero instructions** and keeps the loop vectorized -- strictly better than
-+/// declining to vectorize, and better than materializing
-+/// `trips * vec_width + remainder` in the exit block, which would add
-+/// instructions AND have to be kept in agreement with the remainder loop on
-+/// every exit path.
-+///
-+/// # Why the value dominates every escaping use
-+///
-+/// The vector loop's only exit goes to the remainder preheader, and the
-+/// remainder loop's only exit goes to the original loop exit. Every path that
-+/// leaves the loop nest therefore passes through the remainder header, so its
-+/// phi dominates everything downstream. The rewrite is restricted to blocks
-+/// that existed before the remainder was created (`outside_labels`), which
-+/// excludes the remainder's own blocks -- their use of the vector counter is
-+/// the legitimate byte-to-element conversion and must not be touched.
-+fn rewire_escaping_iv_uses(
-+    func: &mut IrFunction,
-+    pattern: &ReductionPattern,
-+    rem_iv: Option<Value>,
-+    outside_labels: &[BlockId],
-+    debug: bool,
-+) -> usize {
-+    let iv = pattern.iv;
-+    let Some(rem_iv) = rem_iv else {
-+        // No remainder loop was built, so there is no element-counting value
-+        // to point at. This cannot happen for the element types the reduction
-+        // path accepts (the only early return in
-+        // `insert_reduction_remainder_loop` rejects types this transform never
-+        // reaches), but a wrong answer is not an acceptable failure mode for a
-+        // "cannot happen".
-+        debug_assert!(
-+            false,
-+            "vectorized a reduction without a remainder loop; an escaping \
-+             counter would read the vector counter"
-+        );
-+        return 0;
-+    };
++const EXEC_INPUTS: &[(i64, i64)] = &[
++    (100, 7),
++    (7, 100),
++    (-9, 4),
++    (0, 0),
++    (i32::MAX as i64, 1),
++    (-1, 1),
++];
 +
-+    let mut rewrites = 0usize;
-+    for label in outside_labels {
-+        let Some(bi) = func.blocks.iter().position(|b| b.label == *label) else {
-+            continue;
++#[test]
++fn alu_operations_compute_the_right_answer_when_executed() {
++    // %rbx and %rcx: callee-saved %rbx would need saving, so use two
++    // caller-saved families the harness does not rely on.
++    let dst = PhysReg(11); // r10
++    let src = PhysReg(10); // r11
++
++    let cases: &[(AluOp, fn(i64, i64) -> i64)] = &[
++        (AluOp::Add, |a, b| a.wrapping_add(b)),
++        // Non-commutative: THIS is the case an operand-order bug breaks, and
++        // the case no "the assembler accepted it" test can detect.
++        (AluOp::Sub, |a, b| a.wrapping_sub(b)),
++        (AluOp::And, |a, b| a & b),
++        (AluOp::Or, |a, b| a | b),
++        (AluOp::Xor, |a, b| a ^ b),
++        (AluOp::Imul, |a, b| a.wrapping_mul(b)),
++    ];
++
++    for (op, model) in cases {
++        let inst = MachInst::Alu {
++            op: *op,
++            src: MachOperand::Reg(MachReg::Phys(src)),
++            dst: MachReg::Phys(dst),
++            size: OpSize::S64,
 +        };
-+        for inst in func.blocks[bi].instructions.iter_mut() {
-+            let mut hit = false;
-+            inst.for_each_used_value(|v| {
-+                if v == iv.0 {
-+                    hit = true;
-+                }
-+            });
-+            if hit {
-+                rewrite_value_use(inst, iv, rem_iv);
-+                rewrites += 1;
-+            }
++        let Some(got) = run_emitted(&probe_body(dst, src, &inst), EXEC_INPUTS) else {
++            eprintln!("SKIP: no assembler/linker; MachInst execution differential cannot run");
++            return;
++        };
++        for (i, (a, b)) in EXEC_INPUTS.iter().enumerate() {
++            let want = model(*a, *b);
++            assert_eq!(
++                got[i], want,
++                "{:?}(dst={}, src={}) computed {} but must be {} \
++                 (an AT&T operand-order or width bug)",
++                op, a, b, got[i], want
++            );
 +        }
-+        if terminator_uses_value(&func.blocks[bi].terminator, iv) {
-+            rewrite_terminator_use(&mut func.blocks[bi].terminator, iv, rem_iv);
-+            rewrites += 1;
-+        }
-+    }
-+
-+    if debug && rewrites > 0 {
-+        eprintln!(
-+            "[VEC-RED]   Rewired {} escaping use(s) of counter v{} to the \
-+             remainder IV v{}",
-+            rewrites, iv.0, rem_iv.0
-+        );
-+    }
-+    rewrites
-+}
-+
-+/// Replace every use of `old` in `inst` with `new`.
-+fn rewrite_value_use(inst: &mut Instruction, old: Value, new: Value) {
-+    inst.for_each_operand_mut(|op| {
-+        if matches!(op, Operand::Value(v) if *v == old) {
-+            *op = Operand::Value(new);
-+        }
-+    });
-+    // Operand-shaped fields are covered above; the pointer-like fields that
-+    // hold a bare `Value` are not.
-+    match inst {
-+        Instruction::Load { ptr, .. } => {
-+            if *ptr == old {
-+                *ptr = new;
-+            }
-+        }
-+        Instruction::GetElementPtr { base, .. } => {
-+            if *base == old {
-+                *base = new;
-+            }
-+        }
-+        _ => {}
 +    }
 +}
 +
-+fn terminator_uses_value(term: &Terminator, v: Value) -> bool {
-+    let is = |op: &Operand| matches!(op, Operand::Value(x) if *x == v);
-+    match term {
-+        Terminator::Return(Some(op)) => is(op),
-+        Terminator::CondBranch { cond, .. } => is(cond),
-+        Terminator::Switch { val, .. } => is(val),
-+        Terminator::IndirectBranch { target, .. } => is(target),
-+        _ => false,
++#[test]
++fn shifts_compute_the_right_answer_when_executed() {
++    // Shifts are the other classic order trap, and `sar` vs `shr` differ only
++    // in sign behaviour -- which a negative input exposes and a positive one
++    // hides.
++    let dst = PhysReg(11);
++    let src = PhysReg(10);
++    let cases: &[(ShiftOp, u32, fn(i64, u32) -> i64)] = &[
++        (ShiftOp::Shl, 3, |a, k| ((a as u64) << k) as i64),
++        (ShiftOp::Shr, 3, |a, k| ((a as u64) >> k) as i64),
++        (ShiftOp::Sar, 3, |a, k| a >> k),
++    ];
++    for (op, amt, model) in cases {
++        let inst = MachInst::Shift {
++            op: *op,
++            amount: MachOperand::Imm(*amt as i64),
++            dst: MachReg::Phys(dst),
++            size: OpSize::S64,
++        };
++        let Some(got) = run_emitted(&probe_body(dst, src, &inst), EXEC_INPUTS) else {
++            return;
++        };
++        for (i, (a, _)) in EXEC_INPUTS.iter().enumerate() {
++            let want = model(*a, *amt);
++            assert_eq!(
++                got[i], want,
++                "{:?} by {} on {} computed {} but must be {}",
++                op, amt, a, got[i], want
++            );
++        }
 +    }
 +}
 +
-+fn rewrite_terminator_use(term: &mut Terminator, old: Value, new: Value) {
-+    let mut fix = |op: &mut Operand| {
-+        if matches!(op, Operand::Value(x) if *x == old) {
-+            *op = Operand::Value(new);
-+        }
++#[test]
++fn a_32_bit_alu_zero_extends_into_the_full_register() {
++    // x86-64 semantics a golden test cannot express: a 32-bit write CLEARS
++    // bits 32..63. An emitter that used the 64-bit spelling would pass every
++    // "does it assemble" check and silently keep the upper half.
++    let dst = PhysReg(11);
++    let src = PhysReg(10);
++    let inst = MachInst::Alu {
++        op: AluOp::Add,
++        src: MachOperand::Reg(MachReg::Phys(src)),
++        dst: MachReg::Phys(dst),
++        size: OpSize::S32,
 +    };
-+    match term {
-+        Terminator::Return(Some(op)) => fix(op),
-+        Terminator::CondBranch { cond, .. } => fix(cond),
-+        Terminator::Switch { val, .. } => fix(val),
-+        Terminator::IndirectBranch { target, .. } => fix(target),
-+        _ => {}
-+    }
++    let inputs = &[(0x1_0000_0000i64, 1i64), (-1i64, 1i64)];
++    let Some(got) = run_emitted(&probe_body(dst, src, &inst), inputs) else {
++        return;
++    };
++    // 0x1_0000_0000 + 1 truncated to 32 bits and zero-extended = 1.
++    assert_eq!(got[0], 1, "32-bit add must zero-extend, got {:#x}", got[0]);
++    // -1 + 1 = 0 in 32 bits, zero-extended = 0.
++    assert_eq!(got[1], 0, "32-bit add must zero-extend, got {:#x}", got[1]);
 +}
 +
- fn insert_reduction_remainder_loop(
-     func: &mut IrFunction,
-     pattern: &ReductionPattern,
-@@ -7904,6 +8057,11 @@ fn insert_reduction_remainder_loop(
-     seconds: &[SecondaryAccumulator], // Extra independent accumulators (multi-reduction)
-     next_val_id: &mut u32,
-     next_label: &mut u32,
-+    // Out: the remainder loop's induction variable, which counts ELEMENTS and
-+    // runs to the original trip count. It is the correct final value of the
-+    // source-level loop counter, so the caller can rewire uses that escape the
-+    // loop to it. See `rewire_escaping_iv_uses`.
-+    rem_iv_out: &mut Option<Value>,
- ) -> usize {
-     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
- 
-@@ -8018,6 +8176,7 @@ fn insert_reduction_remainder_loop(
-     };
-     let i_rem_iv = Value(*next_val_id);
-     *next_val_id += 1;
-+    *rem_iv_out = Some(i_rem_iv);
-     let i_rem_iv_next = Value(*next_val_id);
-     *next_val_id += 1;
-     let i_rem_cmp = Value(*next_val_id);
-@@ -8621,64 +8780,6 @@ fn transform_reduction_avx2(
-     // aborting midway leaves the loop half-transformed, which is worse than
-     // either outcome.
- 
--    // ESCAPING INDUCTION VARIABLE -- also a precondition, same reasoning.
--    //
--    // Both addressing schemes redefine what the counter counts. The
--    // byte-offset scheme steps `elem_size * vec_width` BYTES per iteration;
--    // the element-index scheme divides the trip count so the counter numbers
--    // VECTOR iterations. Inside the loop only addresses read it, so neither is
--    // visible there -- but a use AFTER the loop reads a number that is no
--    // longer the element index:
--    //
--    //     for (; n < max; n++) acc += v[n];
--    //     return acc + (n >> 2);
--    //
--    // returned 528 (byte scheme, n == 128) or 497 (element scheme, n == 4)
--    // where GCC, Clang, ICC and ICX all return 504 (n == 32). A silent wrong
--    // answer on the extremely common `for (i = 0; i < n; i++) ...;` followed
--    // by a use of `i`.
--    //
--    // Fixing the counter up in the exit block is possible in principle
--    // (`trips * vec_width`, plus whatever the scalar remainder advanced), but
--    // it has to agree with the remainder loop on every exit path; getting that
--    // subtly wrong reintroduces the same class of silent miscompile. Declining
--    // to vectorize is correct today and costs only the loops that read their
--    // counter afterwards. See tests/regression/iv_widen_escaping_iv.c.
--    {
--        let iv = pattern.iv;
--        let mut escapes = false;
--        for (bi, b) in func.blocks.iter().enumerate() {
--            if pattern.loop_blocks.contains(&bi) {
--                continue;
--            }
--            for inst in &b.instructions {
--                inst.for_each_used_value(|v| {
--                    if v == iv.0 {
--                        escapes = true;
--                    }
--                });
--            }
--            match &b.terminator {
--                Terminator::Return(Some(Operand::Value(v)))
--                | Terminator::CondBranch {
--                    cond: Operand::Value(v),
--                    ..
--                }
--                | Terminator::Switch {
--                    val: Operand::Value(v),
--                    ..
--                } => {
--                    if v.0 == iv.0 {
--                        escapes = true;
--                    }
--                }
--                _ => {}
--            }
--        }
--        if escapes {
--            return 0;
--        }
--    }
- 
-     {
-         let elem_size = reduction_element_size(pattern.element_type).unwrap_or(0) as u32;
-@@ -9840,7 +9941,22 @@ fn transform_reduction_avx2(
-     // iteration; `sum += x*x` and `b += v*w` after `a += u*v` both benefit).
-     changes += deduplicate_vector_loads(func, &pattern.loop_blocks);
- 
--    // Step 4: Create remainder loop
-+    // Step 4: Create remainder loop.
-+    //
-+    // Snapshot the labels of every block OUTSIDE the loop first. The remainder
-+    // blocks are created below and legitimately consume the vector IV (the
-+    // preheader converts the byte counter back to an element index), so they
-+    // must be excluded from the escaping-use rewrite that follows.
-+    let outside_labels: Vec<BlockId> = func
-+        .blocks
-+        .iter()
-+        .enumerate()
-+        .filter(|(bi, _)| !pattern.loop_blocks.contains(bi))
-+        .map(|(_, b)| b.label)
-+        .collect();
++#[test]
++fn zero_and_sign_extension_differ_where_it_matters_when_executed() {
++    // movzx vs movsx on a negative byte: 0xFF becomes 255 or -1. Both
++    // assemble; only execution tells them apart.
++    let dst = PhysReg(11);
++    let src = PhysReg(10);
++    let inputs = &[(0i64, -1i64)];
 +
-+    let mut rem_iv: Option<Value> = None;
-+    let mut rem_iv_unused: Option<Value> = None;
-     let remainder_changes = insert_reduction_remainder_loop(
-         func,
-         pattern,
-@@ -9852,6 +9968,7 @@ fn transform_reduction_avx2(
-         &pattern.seconds, // Extra independent accumulators, if any
-         &mut next_val_id,
-         &mut next_label,
-+        &mut rem_iv,
-     );
-     changes += remainder_changes;
- 
-@@ -9862,6 +9979,9 @@ fn transform_reduction_avx2(
-         );
++    let z = MachInst::Movzx {
++        src: MachOperand::Reg(MachReg::Phys(src)),
++        dst: MachReg::Phys(dst),
++        from_size: OpSize::S8,
++        to_size: OpSize::S64,
++    };
++    let sx = MachInst::Movsx {
++        src: MachOperand::Reg(MachReg::Phys(src)),
++        dst: MachReg::Phys(dst),
++        from_size: OpSize::S8,
++        to_size: OpSize::S64,
++    };
++    let Some(gz) = run_emitted(&probe_body(dst, src, &z), inputs) else {
++        return;
++    };
++    let Some(gs) = run_emitted(&probe_body(dst, src, &sx), inputs) else {
++        return;
++    };
++    assert_eq!(gz[0], 255, "movzx of 0xFF must be 255, got {}", gz[0]);
++    assert_eq!(gs[0], -1, "movsx of 0xFF must be -1, got {}", gs[0]);
++}
++
++#[test]
++fn a_symbol_address_is_the_real_address_when_executed() {
++    // Proves `LeaSym` computes the ADDRESS and not the contents. A `movq`
++    // here would return the value stored at the symbol, which on this probe is
++    // a recognisable sentinel -- so the two outcomes are trivially
++    // distinguishable at runtime, and indistinguishable by any check that only
++    // asks whether the text assembles.
++    let Some((asm, _)) = find_assembler() else {
++        eprintln!("SKIP: no assembler; LeaSym execution check cannot run");
++        return;
++    };
++    if std::process::Command::new("cc").arg("--version").output().is_err() {
++        return;
++    }
++    let dir = std::env::temp_dir().join(format!("lccc-leasym-{}", std::process::id()));
++    let _ = std::fs::create_dir_all(&dir);
++    let (s_path, c_path, o_path, bin) = (
++        dir.join("f.s"),
++        dir.join("m.c"),
++        dir.join("f.o"),
++        dir.join("m"),
++    );
++
++    let mut out = AsmOutput::new();
++    emit_machinst(
++        &MachInst::LeaSym {
++            sym: "leasym_probe_obj".into(),
++            dst: MachReg::Phys(PhysReg(0)), // rax = return register
++        },
++        &mut out,
++    );
++    std::fs::write(
++        &s_path,
++        format!(
++            ".text\n.globl leasym_probe\n.type leasym_probe,@function\nleasym_probe:\n{}    ret\n",
++            out.buf
++        ),
++    )
++    .unwrap();
++    std::fs::write(
++        &c_path,
++        "#include <stdio.h>\nlong leasym_probe_obj = 0x5EEDF00D;\n         void *leasym_probe(void);\n         int main(void){ printf(\"%d\\n\", leasym_probe() == (void*)&leasym_probe_obj); return 0; }\n",
++    )
++    .unwrap();
++
++    let mut cmd = std::process::Command::new(&asm);
++    if asm.ends_with("gcc") {
++        cmd.arg("-c").arg("-x").arg("assembler");
++    } else {
++        cmd.arg("-c");
++    }
++    let a = cmd.arg(&s_path).arg("-o").arg(&o_path).output().unwrap();
++    assert!(
++        a.status.success(),
++        "assembler rejected LeaSym:\n{}",
++        String::from_utf8_lossy(&a.stderr)
++    );
++    let l = std::process::Command::new("cc")
++        .arg(&c_path)
++        .arg(&o_path)
++        .arg("-o")
++        .arg(&bin)
++        .output()
++        .unwrap();
++    if !l.status.success() {
++        return; // no linker/libc in this environment
++    }
++    let r = std::process::Command::new(&bin).output().unwrap();
++    assert_eq!(
++        String::from_utf8_lossy(&r.stdout).trim(),
++        "1",
++        "LeaSym must return the symbol's ADDRESS, not its contents"
++    );
++    let _ = std::fs::remove_dir_all(&dir);
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index a5619e35..983d3d77 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -54,3 +54,9 @@ pub fn compiler_main() {
+         }
      }
- 
-+    // Step 5: repair uses of the loop counter that ESCAPE the loop.
-+    changes += rewire_escaping_iv_uses(func, pattern, rem_iv, &outside_labels, debug);
+ }
 +
-     // Update the function's next_value_id and next_label
-     func.next_value_id = next_val_id;
-     func.next_label = next_label;
-@@ -11070,7 +11190,22 @@ fn transform_reduction_sse2(
-     // iteration; `sum += x*x` and `b += v*w` after `a += u*v` both benefit).
-     changes += deduplicate_vector_loads(func, &pattern.loop_blocks);
- 
--    // Step 4: Create remainder loop
-+    // Step 4: Create remainder loop.
-+    //
-+    // Snapshot the labels of every block OUTSIDE the loop first; see the AVX2
-+    // path and `rewire_escaping_iv_uses` for why. Both vector paths need this:
-+    // the counter is redefined by the transform regardless of which vector
-+    // width was chosen, and an i64 reduction (SSE2, 2-wide) leaked a BYTE
-+    // count exactly as the i32 one (AVX2, 8-wide) did.
-+    let outside_labels: Vec<BlockId> = func
-+        .blocks
-+        .iter()
-+        .enumerate()
-+        .filter(|(bi, _)| !pattern.loop_blocks.contains(bi))
-+        .map(|(_, b)| b.label)
-+        .collect();
-+
-+    let mut rem_iv: Option<Value> = None;
-     let remainder_changes = insert_reduction_remainder_loop(
-         func,
-         pattern,
-@@ -11082,6 +11217,7 @@ fn transform_reduction_sse2(
-         &pattern.seconds, // Extra independent accumulators, if any
-         &mut next_val_id,
-         &mut next_label,
-+        &mut rem_iv,
-     );
-     changes += remainder_changes;
- 
-@@ -11092,6 +11228,9 @@ fn transform_reduction_sse2(
-         );
-     }
- 
-+    // Step 5: repair uses of the loop counter that ESCAPE the loop.
-+    changes += rewire_escaping_iv_uses(func, pattern, rem_iv, &outside_labels, debug);
-+
-     // Update the function's next_value_id and next_label
-     func.next_value_id = next_val_id;
-     func.next_label = next_label;
-diff --git a/tests/regression/vectorized_counter_escapes.c b/tests/regression/vectorized_counter_escapes.c
++/// Print the MachInst instruction-selection coverage census (no-op unless
++/// `CCC_ISEL_STATS=1`). Exposed for the driver binary.
++pub fn isel_stats_report() {
++    crate::backend::x86::codegen::isel::stats::report();
++}
+diff --git a/src/main.rs b/src/main.rs
+index 8afbbeea..45f9980e 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,6 @@
+ fn main() {
+     lccc::compiler_main();
++    // Coverage census for the MachInst instruction-selection layer; a no-op
++    // unless CCC_ISEL_STATS=1. Printed here so it covers the whole run.
++    lccc::isel_stats_report();
+ }
+diff --git a/tests/regression/machinst_narrow_store.c b/tests/regression/machinst_narrow_store.c
 new file mode 100644
-index 00000000..5f55d505
+index 00000000..8f20bca0
 --- /dev/null
-+++ b/tests/regression/vectorized_counter_escapes.c
-@@ -0,0 +1,158 @@
-+/* The loop counter after a VECTORIZED loop.
++++ b/tests/regression/machinst_narrow_store.c
+@@ -0,0 +1,102 @@
++/* Byte and word stores lowered through MachInst.
 + *
-+ * Vectorizing redefines what the counter counts. Under the byte-offset scheme
-+ * it steps `elem_size * vec_width` BYTES per iteration; under the
-+ * element-index scheme the trip count is divided so it numbers VECTOR
-+ * iterations. Inside the loop only addresses read it, so neither is visible
-+ * there -- but a use AFTER the loop reads a number that is no longer the
-+ * element index. `for (; n < max; n++) acc += v[n]; return acc + (n >> 2);`
-+ * returned 528 (byte scheme, n == 128) or 497 (element scheme, n == 4) where
-+ * GCC 16.2, Clang 23.1, ICC and ICX all return 504 (n == 32).
++ * `isel::lower_instruction_typed` refused I8/U8/I16/U16 stores outright and
++ * fell back to direct text emission. Nothing about a narrow store is
++ * inexpressible -- `movb %al, (%rcx)` and `movw %ax, off(%rbp)` are ordinary
++ * `MachInst::Mov`s at OpSize::S8/S16, and the emitter's size tables have
++ * always handled both -- so the restriction only split otherwise contiguous
++ * MachInst runs and pushed byte traffic, the dominant operation in the gzip /
++ * zlib-ng / expat workloads, onto the untyped path.
 + *
-+ * The repair costs nothing: the transform already builds a scalar remainder
-+ * loop whose induction variable counts ELEMENTS and runs to the original trip
-+ * bound, so its exit value IS the counter's correct final value. Escaping uses
-+ * are rewired to it -- no arithmetic is synthesized and the loop stays
-+ * vectorized.
++ * These cases cover the three addressing forms the lowering distinguishes:
++ * a store to an alloca slot, a store through a pointer already in a register,
++ * and a store through a pointer that has to be staged. Signed and unsigned,
++ * 8- and 16-bit, register and immediate sources, plus the r8..r15 registers
++ * whose byte names (%r8b..%r15b) are spelled differently from the legacy set.
 + *
-+ * The boundaries below are where a counter-reconstruction scheme breaks, and
-+ * each is checked across a sweep of trip counts rather than one lucky value:
-+ *
-+ *   - trip count an EXACT MULTIPLE of the vector width, so the remainder loop
-+ *     runs ZERO times and its phi must still carry the preheader's start value;
-+ *   - trip count BELOW the vector width, so the VECTOR loop runs zero times;
-+ *   - trip count ZERO, where the counter must remain 0;
-+ *   - element sizes 4 and 8, which scale the byte counter differently;
-+ *   - the counter read several times, and read as a value rather than just
-+ *     returned;
-+ *   - an early-exit loop, where the counter's final value is not the bound.
-+ *
-+ * Every result is compared against GCC by the regression harness, so a wrong
-+ * counter shows up as an oracle mismatch rather than needing a hard-coded
-+ * expectation per case.
++ * Expected output: 197 1543 -86 4660 255 65535 42 7
 + */
 +#include <stdio.h>
++#include <string.h>
 +
-+/* The original defect: counter feeds arithmetic after the loop. */
-+static int reduce_and_shift(const int *v, int max) {
-+    int acc = 0;
-+    int n = 0;
-+    for (; n < max; n++) {
-+        acc += v[n];
++static unsigned char buf8[64];
++static unsigned short buf16[64];
++
++__attribute__((noinline)) static void store_bytes(unsigned char *p, int n, unsigned char v) {
++    for (int i = 0; i < n; i++) {
++        p[i] = (unsigned char) (v + i);   /* store through a register pointer */
 +    }
-+    return acc + (n >> 2);
 +}
 +
-+/* Counter returned unmodified. */
-+static int reduce_and_count(const int *v, int max) {
-+    int acc = 0;
-+    int n = 0;
-+    for (; n < max; n++) {
-+        acc += v[n];
++__attribute__((noinline)) static void store_words(unsigned short *p, int n, unsigned short v) {
++    for (int i = 0; i < n; i++) {
++        p[i] = (unsigned short) (v * (i + 1));
 +    }
-+    return acc * 1000 + n;
 +}
 +
-+/* Counter read more than once, in different expressions. */
-+static int reduce_multi_use(const int *v, int max) {
-+    int acc = 0;
-+    int n = 0;
-+    for (; n < max; n++) {
-+        acc += v[n];
++/* Stores into local (alloca) storage, then read back. */
++__attribute__((noinline)) static int local_narrow(void) {
++    unsigned char a[8];
++    unsigned short w[8];
++    for (int i = 0; i < 8; i++) {
++        a[i] = (unsigned char) (i * 3 + 1);
++        w[i] = (unsigned short) (i * 1000 + 7);
 +    }
-+    return acc + (n >> 1) + (n & 7) + (n * 3);
++    int s = 0;
++    for (int i = 0; i < 8; i++) {
++        s += a[i] + (w[i] & 0xff);
++    }
++    return s;
 +}
 +
-+/* 8-byte elements: the byte counter scales by 8, not 4. */
-+static long long reduce_i64(const long long *v, int max) {
-+    long long acc = 0;
-+    int n = 0;
-+    for (; n < max; n++) {
-+        acc += v[n];
++/* Signed narrow stores, which must sign-extend correctly on read-back. */
++__attribute__((noinline)) static int signed_narrow(void) {
++    signed char sc[4];
++    short sh[4];
++    for (int i = 0; i < 4; i++) {
++        sc[i] = (signed char) (-40 + i);
++        sh[i] = (short) (-3000 + i * 7);
 +    }
-+    return acc + n;
++    int s = 0;
++    for (int i = 0; i < 4; i++) {
++        s += sc[i] + sh[i];
++    }
++    return s;
 +}
 +
-+/* Two arrays (dot-product shape) with an escaping counter. */
-+static int dot_and_count(const int *a, const int *b, int max) {
-+    int acc = 0;
-+    int n = 0;
-+    for (; n < max; n++) {
-+        acc += a[n] * b[n];
-+    }
-+    return acc + n;
-+}
-+
-+/* Unsigned counter. */
-+static unsigned reduce_unsigned(const int *v, unsigned max) {
-+    int acc = 0;
-+    unsigned n = 0;
-+    for (; n < max; n++) {
-+        acc += v[n];
-+    }
-+    return (unsigned) acc + n;
-+}
-+
-+/* The counter compared, not just consumed arithmetically. */
-+static int reduce_and_compare(const int *v, int max) {
-+    int acc = 0;
-+    int n = 0;
-+    for (; n < max; n++) {
-+        acc += v[n];
-+    }
-+    return (n == max) ? acc : -1;
-+}
-+
-+/* Early exit: the counter's final value is NOT the loop bound, so no
-+ * `trips * vec_width` formula can produce it -- only the real counter can. */
-+static int find_first_negative(const int *v, int max) {
-+    int n = 0;
-+    while (n < max) {
-+        if (v[n] < 0) {
-+            break;
-+        }
-+        n++;
-+    }
-+    return n;
++/* Immediate sources and the saturating boundary values. */
++__attribute__((noinline)) static int immediate_narrow(unsigned char *b, unsigned short *w) {
++    b[0] = 0xff;
++    b[1] = 0x00;
++    w[0] = 0xffff;
++    w[1] = 0;
++    return b[0] + w[0];
 +}
 +
 +int main(void) {
-+    enum { N = 80 };
-+    int v[N];
-+    int b[N];
-+    long long w[N];
-+    for (int i = 0; i < N; i++) {
-+        v[i] = i;
-+        b[i] = (i % 5) - 2;
-+        w[i] = (long long) i * 3;
++    store_bytes(buf8, 32, 7);
++    store_words(buf16, 32, 3);
++
++    int s8 = 0, s16 = 0;
++    for (int i = 0; i < 32; i++) {
++        s8 += buf8[i];
++        s16 += buf16[i] & 0x3f;
 +    }
 +
-+    /* Sweep across every residue class modulo the widest vector (8 for i32
-+     * under AVX2, 4 for i64), plus zero and sub-width trip counts. One lucky
-+     * multiple would hide exactly the bug this file exists for. */
-+    long long h1 = 0, h2 = 0, h3 = 0, h4 = 0, h5 = 0, h6 = 0, h7 = 0;
-+    for (int max = 0; max <= 34; max++) {
-+        h1 = h1 * 31 + reduce_and_shift(v, max);
-+        h2 = h2 * 31 + reduce_and_count(v, max);
-+        h3 = h3 * 31 + reduce_multi_use(v, max);
-+        h4 = h4 * 31 + reduce_i64(w, max);
-+        h5 = h5 * 31 + dot_and_count(v, b, max);
-+        h6 = h6 * 31 + (long long) reduce_unsigned(v, (unsigned) max);
-+        h7 = h7 * 31 + reduce_and_compare(v, max);
-+    }
++    unsigned char lb[4];
++    unsigned short lw[4];
++    memset(lb, 0, sizeof lb);
++    memset(lw, 0, sizeof lw);
++    immediate_narrow(lb, lw);
 +
-+    /* Early exit at a range of positions, including before, at and after the
-+     * first vector boundary. */
-+    long long h8 = 0;
-+    for (int pos = 0; pos < 24; pos++) {
-+        int tmp[N];
-+        for (int i = 0; i < N; i++) {
-+            tmp[i] = 1;
-+        }
-+        tmp[pos] = -1;
-+        h8 = h8 * 31 + find_first_negative(tmp, 40);
-+    }
-+
-+    printf("%lld %lld %lld %lld %lld %lld %lld %lld\n", h1, h2, h3, h4, h5, h6, h7, h8);
++    printf("%d %d %d %d %d %d %d %d\n",
++           s8,
++           s16 + local_narrow(),
++           signed_narrow() / 100,
++           local_narrow(),
++           (int) lb[0],
++           (int) lw[0],
++           (int) buf8[35 - 4],
++           (int) (buf16[2] / 3));
 +    return 0;
 +}
