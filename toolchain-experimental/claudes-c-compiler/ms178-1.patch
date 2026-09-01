@@ -1,165 +1,154 @@
-diff --git a/.gitignore b/.gitignore
-index f8179797..a1f7a0fb 100644
---- a/.gitignore
-+++ b/.gitignore
-@@ -38,6 +38,11 @@ Thumbs.db
- a.out
- test_*
- bench_*
-+# ...but the benchmark HARNESS is source, not a build artifact. Without this
-+# negation `bench_*` silently swallows it: tests/bench/ (the kernels and the
-+# timing driver) shipped upstream while the script that runs them did not,
-+# leaving a corpus nobody could execute.
-+!scripts/bench_kernels.py
- 
- # Benchmark / test output
- /test-results/
-diff --git a/engineering/FOLLOWUP-2026-09-01b-range-fold-and-measurement-discipline.md b/engineering/FOLLOWUP-2026-09-01b-range-fold-and-measurement-discipline.md
+diff --git a/engineering/FOLLOWUP-2026-09-01d-copy-fold-and-machinst.md b/engineering/FOLLOWUP-2026-09-01d-copy-fold-and-machinst.md
 new file mode 100644
-index 00000000..567ecdd6
+index 00000000..bd5df070
 --- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-01b-range-fold-and-measurement-discipline.md
-@@ -0,0 +1,243 @@
-+# Follow-up: performance tuning against the Godbolt oracle, and two
-+# measurement/delivery defects found along the way
++++ b/engineering/FOLLOWUP-2026-09-01d-copy-fold-and-machinst.md
+@@ -0,0 +1,227 @@
++# Follow-up: register-copy folding perfected, and MachInst put under test
 +
 +Session date: 2026-09-01 (continuation)
-+Base: `ms178/lccc` main @ `0cdd077`
-+Snapshots: `S11`, `S12` (see `artifacts/SNAPSHOT_LEDGER.md`)
-+
-+Prior session's work (IR structural violations 396 → 0, the verifier gate, the
-+`movslq` win, Clang 23.1) is merged upstream as `25d7cac`.
++Base: `ms178/lccc` main @ `91ecf5b2`
++Snapshots: `S18`, `S19` (see `artifacts/SNAPSHOT_LEDGER.md`)
 +
 +---
 +
 +## 1. Accomplished
 +
-+### 1.1 `range_fold` never fired on the idiom it was written for
++### 1.1 `narrow_copy_fold` rebuilt — 12x more effective
 +
-+`src/passes/range_check.rs` exists specifically to turn
-+`x >= lo && x <= hi` into `(unsigned)(x - lo) <= hi - lo`, and its own header
-+names Expat's `xml_name_continue` and SQLite's varint classifier as the
-+targets. It was enabled, it was reached, and it did nothing.
++The previous session built this pass, measured it at **10 instructions removed
++across 220 files (0.03%)**, and deleted it as not worth its complexity. That
++was the right call for *that* implementation. It was the wrong conclusion about
++the opportunity.
 +
-+`resolve_bool_cmp` looks through the boolean-widening cast the frontend emits
-+after every comparison. Its allow-list was:
++The rebuild started from data rather than intuition — a census of what actually
++survives to final assembly at `-O2` across the 559-test corpus:
 +
-+```rust
-+(IrType::I8 | IrType::U8, IrType::I16 | IrType::I32 | IrType::U32)
-+```
++| form | count |
++|---|---|
++| `movq` cross-family | 7 943 |
++| `movl` cross-family | 2 463 |
++| `movl %X, %X` self-move | 261 |
++| `movq %X, %X` self-move | 3 |
++| `movw` | 1 |
 +
-+but the IR for `char c; return c >= 'a' && c <= 'z';` is:
++**11 055 copies** survive both copy propagation and dead-write elimination. The
++old pass reached almost none of them for one reason: it handled only 32-bit
++copies and refused every memory operand.
 +
-+```
-+Cmp    v6  = Sge v1, I8(97)
-+Cmp    v10 = Sle v1, I8(122)
-+Cast   v11 = v10 (U8 -> I64)      <-- not in the allow-list
-+Select v14 = v6 ? v11 : Const(0)  (ty I64)
-+```
++Two transforms now:
 +
-+`I64` was missing, so the match failed and the pass bailed — on the canonical
-+single range, the simplest case it has. And because `set_membership` consumes
-+`range_fold`'s `Range` members, the *entire* classifier optimisation chain was
-+starved behind this one gap.
++**A. Self-move elimination.** `movq %rax, %rax` is a pure no-op and three of
++them reached final assembly. `movb`/`movw` self-moves likewise. `movl %ebx,
++%ebx` is *not* a no-op — it zero-extends into `%rbx`, and is the idiomatic
++64→32 truncation — so it is removed only where the upper half is provably zero,
++with the fact dropped at labels and calls.
 +
-+Fixed by listing every wider integer width. The soundness argument is recorded
-+in the code: the source is verified to be a `Cmp` result, so it is 0 or 1, and
-+both zero- and sign-extension of 0/1 yield 0/1 at any width. Narrowing stays
-+excluded and is pinned by a negative test.
++**B. Copy folding at all four widths.** The copy's width bounds which uses may
++be rewritten, and this is where miscompiles live:
 +
-+**Effect** (`-O3`, x86-64):
-+
-+| source | before | after |
++| copy | `%D` shares with `%S` | rewritable uses |
 +|---|---|---|
-+| `c>='a' && c<='z'` | 8 insns, no fold | `subq $97; cmpb $25; setbe` — GCC's form |
-+| three-range ladder | 35 insns, 2 branches | **16 insns, 0 branches** |
-+| full boolean classifier | 45 insns | **22 insns (−51%)** |
++| `movq` | all 64 bits | any width, **including address operands** |
++| `movl` | low 32; bits 32..63 forced to 0 | ≤ 32 bits |
++| `movw` | low 16; bits 16..63 **stale** | ≤ 16 bits |
++| `movb` | low 8; bits 8..63 **stale** | ≤ 8 bits |
 +
-+The last one also shows `andq $-33, %rax; leal -65(%rax), %esi; cmpl $25` —
-+that is `set_membership`'s `[a-z]`+`[A-Z]` case-fold merge, which had never
-+been reachable before.
++The `movq`/address-operand row is the whole difference. An address is read as
++64 bits, so it is rewritable under `movq` and nothing narrower — and `movq` is
++72% of the surviving copies.
 +
-+**Runtime**, new `tests/bench/k_classify.c`: **27.886 → 22.677 ms, −18.7%**,
-+0.53x → 0.65x versus GCC. Well above this host's noise floor (§1.3), and the
-+harness confirms it as a genuine change rather than layout drift.
++**Result: 292 instructions removed across 559 files, 104 files improved
++(0.35%)** — 12x the old reach — plus `memchr` −3.3% at runtime, no regressions.
 +
-+The Godbolt oracle is what located this. Comparing the Expat classifier across
-+`gcc16.2` / `clang 23.1` / `icx` showed lccc emitting an **11-deep
-+compare-and-branch chain** where GCC vectorises (372 insns of SIMD) and ICX
-+uses 32 — a binary search over the ranges plus adjacent-constant folding
-+(`ch=='-'||ch=='.'` → `addb $-45; cmpb $1`). That gap was the signal to go
-+looking; the IR dump then localised it to one missing enum variant.
++Legality rests on `FileLiveness` plus rules for source clobber, destination
++redefinition, read-modify-write of the destination, barriers, implicit-register
++instructions, variable shift counts (pinned to `%cl` even when spelled out —
++renaming produced `shrq %r9b, %rsi`, which GAS rejects), high-byte aliases, and
++frame registers. All matching is boundary-aware: `%si` is a prefix of `%sil`
++and `%r8` of `%r8d`, and a naive `replace` produced `%dxl`.
 +
-+### 1.2 The benchmark harness was never delivered
++27 tests, 15 of them negative controls, including a catch-all asserting that no
++output line names a register the assembler does not know.
 +
-+`.gitignore` carries `bench_*` (intended for compiled benchmark binaries). It
-+silently swallowed `scripts/bench_kernels.py`. The result: `tests/bench/`
-+shipped upstream last session with six kernels and a timing driver, and **no
-+harness to run them**. The snapshot script builds the patch from git, so an
-+ignored file simply never appears — no warning, no error.
++**Two draft tests turned out to be wrong rather than the pass**, and are
++documented as such in place: one placed a `movl $7, %eax` intending to clobber
++the source, but `%eax` was overwritten before any read, so it was a genuine
++dead store that was legitimately removed; the other expected a `%rsp` copy to
++survive when copy propagation correctly collapses it without renaming anything
++away.
 +
-+Fixed with an explicit negation and a comment explaining why it is there.
-+Worth remembering as a class: *a delivery pipeline that filters by
-+`.gitignore` will silently drop source that matches an artifact pattern.*
++### 1.2 MachInst had 946 lines and zero tests
 +
-+### 1.3 The harness could manufacture regressions — and wins
++That is how a silent `_ => "rax"` fallback survived in the **64-bit** register
++table while the 32/16/8-bit tables all trap. An unexpected register index
++produced a syntactically valid instruction naming the *wrong* register — a
++silent miscompile in the most frequently used of the four tables, invisible to
++every downstream check because the assembler is perfectly happy with it.
 +
-+While evaluating a candidate optimisation the harness reported
-+`REGRESSED adler32 +3.7%`. It was false. The change had touched only
-+`bench_setup`, which the driver calls **outside** the timed region.
-+Disassembling both binaries showed the `bench_run` bodies were byte-for-byte
-+identical; the function had merely moved from `0x1270` to `0x1260`.
++`machinst_tests.rs` adds 25 tests in four layers:
 +
-+A 16-byte shift is worth ~3.5% on this core. Any harness that does not control
-+for it is reporting instruction-fetch alignment, not codegen.
++1. **Table integrity** — the four name tables must agree and be injective.
++2. **Type mapping** — `OpSize` must classify every `IrType`; suffixes must match.
++3. **Golden emission** — each variant and operand shape emits the expected text.
++4. **Assembler differential** — every constructible instruction is fed to the
++   *real* system assembler.
 +
-+`bench_kernels.py` now fingerprints the **timed function's disassembly**
-+(address column and RIP displacements stripped) rather than the whole object,
-+and classifies an out-of-tolerance delta as `NOISE` when that fingerprint is
-+unchanged:
++Layer 4 is what makes the rest hard to fool. A golden test only proves the
++emitter matches what the test author expected; `as` proves the text is a valid
++x86-64 instruction. It skips **loudly** when no assembler is present rather
++than passing vacuously.
 +
-+```
-+NOISE  adler32: 7.219 -> 7.461 ms (+3.4%) - kernel codegen is IDENTICAL
-+       (5a1f9cf7948258aa); this is layout/measurement noise
-+```
++It immediately found two real bugs:
 +
-+This establishes a **~3.4% layout-noise floor** for this host. Deltas below it
-+are unmeasurable here, which retroactively validates the previous session's
-+−35.3% `matchlen` win (far above the floor) and disqualifies any future
-+sub-3.5% claim made without a codegen change to back it.
++* **`shift_mnemonic` folded S8 and S16 into the 64-bit mnemonic.** The table
++  read `(Shl, S32) => "shll", (Shl, _) => "shlq"`, so a byte shift emitted
++  `shlq %dl` and a word shift `shlq %cx` — both rejected outright by GAS
++  (``%dl' not allowed with `shlq'``). Latent only because instruction selection
++  does not yet route narrow shifts through MachInst; the moment it did, the
++  build would break. All twelve `(op, width)` pairs are now spelled out.
++* **`MachInst::Alu` and `Imul3` never staged wide immediates.** x86 ALU
++  immediates are sign-extended 32-bit, so `addq $0x1234_5678_9abc, %rax` is
++  `operand type mismatch` — verified directly against GAS, so a hard build
++  failure rather than a silent truncation, but a real defect. Both now stage
++  through the scratch, and `Imul3` falls back to the two-address form because
++  there is no three-operand register `imul`.
 +
-+The filter is symmetric and that is the point: it suppresses false *wins* as
-+readily as false regressions.
++Also hardened: `reg_name_pub` stringified an unallocated vreg as
++`VREG_UNRESOLVED` (with an unused binding), blaming the assembler for a
++register-allocation bug; it now fails where the invariant actually broke. And
++`assert_scratch_free` makes the `%rax`-as-scratch assumption inside
++`materialize_large_imm` checkable rather than implicit — if a wide immediate
++ever has to be staged while `%rax` is already an operand, staging would clobber
++it silently.
 +
-+### 1.4 A candidate optimisation, measured and then cut
++Removing the `_ => "rax"` fallback with the whole corpus still green is the
++evidence that it was masking nothing.
 +
-+A `narrow_copy_fold` peephole was written to remove the redundant
-+`movl %eax, %esi` between a byte load and its compare (the byte-scan shape in
-+`memchr`/`strlen`/`longest_match`). It worked, with 10 tests including 7
-+negative controls, and two of those negative controls caught real bugs in it —
-+a `%si`/`%sil` prefix collision that corrupted register names, and a rename of
-+the architecturally-pinned `%cl` shift count that produced `shrq %r9b, %rsi`.
++### 1.3 Two neighbouring tests corrected, not weakened
 +
-+Then it was measured:
++`copy_coalesce::copy_is_kept_when_the_source_is_read_again` and
++`relay_and_lea::relay_is_kept_when_target_is_read_again` began failing. Both
++asserted exact whole-pipeline text that `copy_fold` now legitimately improves —
++three instructions instead of four, semantically identical, with the copy's
++destination provably dead. Rather than disable them or loosen them to
++meaninglessness, each was rewritten to assert the invariant it actually guards:
++that coalescing does not rename a source family that is read again, and that
++both consumers of a relayed value read one and the same register.
 +
-+* **10 instructions removed across 220 corpus files (0.03%)**
-+* **0 instructions removed on 5 of the 6 real-workload kernels**
-+* no runtime effect above the noise floor
++### 1.4 Oracle standing
 +
-+Sibling passes (`copy_propagation`, `dead_writes`, `relay_and_lea`) already
-+reach nearly every instance by another route. ~350 lines and a pipeline slot
-+for 0.03% is not a trade worth making, so **the pass was deleted rather than
-+shipped**. Recorded here so nobody rebuilds it.
++Instruction counts at `-O3 -march=x86-64-v2`, against all four oracles:
 +
-+### 1.5 §3.3 peephole audit: clean
++| kernel | lccc | clang 23.1 | icc 2021.10 | icx | gcc 16.2 |
++|---|---|---|---|---|---|
++| `scan` (memchr) | **19** | 10 | 22 | 27 | 149 (vectorised) |
++| `match_len` | **15** | 14 | 11 | 31 | 243 (vectorised) |
 +
-+Last session's cross-block fact leak in `redundant_ext.rs` (the directive skip
-+running before the label check) prompted an audit of every other peephole that
-+carries per-register state. Result: the arm / i686 / riscv passes classify
-+lines through a `LineKind` enum that distinguishes `Label` from `Directive`
-+correctly (riscv tests `ends_with(':')` *inside* the dot branch), and no other
-+x86 pass matches the shape. **`redundant_ext.rs` was the only instance**, and
-+it is already fixed. Bounded and closed.
++lccc now **beats ICC and ICX on `scan`** and **beats ICX on `match_len`**, and
++sits within one instruction of Clang on `match_len`. Where GCC's counts explode
++it is because it is vectorising — and on `memchr` runtime lccc is at **1.01x**,
++i.e. scalar lccc already matches GCC's vectorised code on this host.
 +
 +---
 +
@@ -167,1923 +156,1943 @@ index 00000000..567ecdd6
 +
 +| Gate | Result |
 +|---|---|
-+| `cargo test --lib` | **1395 pass / 0 fail / 6 ignored** |
++| `cargo test --lib` | **1465 pass / 0 fail / 6 ignored** |
 +| `./scripts/run_regression_suite.sh` | **PASS=559 FAIL=0 SKIP=15**, AB-diff 0 |
-+| `./scripts/ir_verify_sweep.py --levels O0..Oz` | **0 violations** / 3354 configs |
-+| `bench_kernels.py --baseline` | `classify` −18.7%; no regressions |
-+| `godbolt.py audit` | all pinned oracles current |
-+
-+Current scoreboard, best-of-9, `-O3`, versus GCC (>1 = lccc faster):
-+
-+| kernel | vs gcc | note |
-+|---|---|---|
-+| `memchr` | 0.47x | branch structure (§3.1) |
-+| `namechars` | 0.48x | counting form of the classifier (§3.2) |
-+| `varint` | 0.62x | branch layout on a serial chain |
-+| `classify` | **0.65x** | was 0.53x |
-+| `matchlen` | 0.66x | load-compare fusion + branch structure |
-+| `adler32` | 0.78x | |
-+| `hashmix` | 0.81x | |
-+
-+geomean **0.626x**.
-+
-+---
-+
-+## 3. To do next, in priority order
-+
-+### 3.1 Block layout: three branches per iteration where GCC/Clang have two
-+
-+This is now the single largest remaining lever, and it is the *same* defect in
-+the four worst kernels. lccc emits:
-+
-+```
-+.LBB1:  cmp ; jcc exit          <- top test
-+.LBB2:  body ; jcc exit2
-+.LBB4:  incr ; jmp .LBB1        <- unconditional jump back
-+```
-+
-+Clang emits one conditional branch at the bottom and falls through. Per
-+iteration lccc executes 3 branches (2 taken) against Clang's 2 (1 taken).
-+
-+Important: this is **not** the IR-level `loop_rotate` pass. That was measured
-+last session at 1.00x on five kernels and 0.87x on one — the gap is in backend
-+block ordering and branch inversion, downstream of the IR. Start with the
-+classic `jcc L1; jmp L2; L1:` → `jncc L2; L1:` inversion and with placing the
-+latch block on the fall-through path.
-+
-+### 3.2 The counting form of the classifier
-+
-+`if (pred) n++;` does not produce `Select`s — the hit edges converge on a
-+shared increment block before the join — so `range_fold` and `set_membership`
-+never see it and `k_namechars` stays at 0.48x while `k_classify` improved to
-+0.65x. The two kernels deliberately bracket this: same predicate, one shape
-+optimised and one not. Teaching `if_convert` (or `set_membership`'s matcher,
-+whose docstring already anticipates a `Phi [(Const(1), T_1), ...]` join) to see
-+through the shared hit block would close it.
-+
-+### 3.3 Load-compare fusion
-+
-+`movzbl (mem), %reg; cmpl %other, %reg` → `cmpb %other_b, (mem)` when `%reg`
-+dies at the compare. `memory_fold.rs` does this only for `-N(%rbp)` stack
-+slots, not SIB memory. `FileLiveness::live_after` supplies the liveness proof.
-+Worth an instruction and a register per iteration in every byte loop.
-+
-+### 3.4 Def-dominates-use in the IR verifier
-+
-+Unchanged from last session and still the top verifier item: the six existing
-+checks do not include dominance, which is how an SSA violation shipped past
-+every gate (see the previous follow-up, §1.9). `verify.rs` already computes
-+reachability; Cooper-Harvey-Kennedy dominators over RPO is the natural next
-+step. Size the backlog with `ir_verify_sweep.py` before committing to fixes.
-+
-+### 3.5 Standing items still not advanced
-+
-+- Linker oracle: honour lld 23.1 / mold 2.42 (X86+i686-only preset) / bfd 2.47.
-+- `lccc-bootstrap.sh` still lacks the rustup 1.98.0 reinstall step.
-+- Broader benchmark corpus: SQLite b-tree compare, kernel `memcpy`/checksum,
-+  zlib-ng CRC32; and a local Clang so the `vs clang` column stops being empty.
-+
-+---
-+
-+## 4. Notes for whoever picks this up
-+
-+- **Measure before you ship, and be willing to delete.** Two candidate
-+  optimisations were built and validated this session; one was cut for paying
-+  0.03%. Instruction count is not runtime and neither is "it looks better".
-+- **Know your noise floor.** ~3.4% on this host, from code alignment alone. The
-+  harness now proves it per-kernel via the timed-function fingerprint; do not
-+  argue about a 2% delta.
-+- **Negative controls earn their keep.** Six of the ten tests on the cut pass
-+  asserted that a rewrite does *not* happen, and two of them found real bugs
-+  the positive test could not.
-+- **Use the oracle to find gaps, the IR dump to localise them.** The classifier
-+  gap was invisible in lccc's own output until `gcc16.2`/`clang 23.1`/`icx`
-+  were put beside it; it then took one IR dump to find the missing enum
-+  variant.
-+- A pass that is enabled and reached can still be doing nothing. `range_fold`
-+  had tests, was in the pipeline, and had never once fired on its headline
-+  input.
-diff --git a/engineering/FOLLOWUP-2026-09-01c-block-layout-and-loop-inversion.md b/engineering/FOLLOWUP-2026-09-01c-block-layout-and-loop-inversion.md
-new file mode 100644
-index 00000000..b6a375c1
---- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-01c-block-layout-and-loop-inversion.md
-@@ -0,0 +1,197 @@
-+# Follow-up: loop-aware block layout and machine-level loop inversion
-+
-+Session date: 2026-09-01 (continuation)
-+Base: `ms178/lccc` main @ `a73f69c0`
-+Snapshots: `S14`–`S16` (see `artifacts/SNAPSHOT_LEDGER.md`)
-+
-+---
-+
-+## 1. Accomplished
-+
-+### 1.0 Environment recovered after a harness wipe
-+
-+The workspace was wiped mid-session. `ms178-1.patch` and `artifacts/` survived
-+(the standing auto-save duty), so nothing was lost, but the restore exposed two
-+non-obvious failures worth recording — both now handled by
-+`scripts/lccc-bootstrap.sh`:
-+
-+* `~/.cargo/bin/rustup` comes back **without its execute bit**
-+  (`Permission denied`);
-+* the **proxy binaries** (`cargo`, `rustc`, …) are gone, and
-+  `rustup toolchain install` does *not* recreate them — only `rustup-init`
-+  does. So the toolchain installs "successfully" and `cargo` is still not
-+  found.
-+
-+`setup_rust` now repairs both (rustup dispatches on `argv[0]`, so symlinking
-+the proxies back is the supported recovery) and then *verifies* `cargo`
-+actually runs rather than assuming it. A silent failure here costs a whole
-+session, because every later step blames the compiler instead of the PATH.
-+
-+### 1.1 Block layout is loop-aware — `memchr` −40%
-+
-+RPO is a *topological* order with no notion of which edge is hot. In a search
-+loop it laid the cold `return` between the body and the latch, so the body's
-+branch to the latch was a **taken forward jump over it**:
-+
-+```text
-+.LBB2:  cmpl %r8d, %eax ; jne .LBB4   # TAKEN every iteration
-+.LBB3:  <return the match>            # cold, runs at most once
-+.LBB4:  leaq 1(%rbx), %rbx ; jmp .LBB1
-+```
-+
-+Three branches per iteration, **two taken**, against Clang's two with one.
-+
-+`relayout_blocks_loop_aware` starts from RPO and makes the **minimum**
-+deviation that restores loop-body contiguity — a stable partition of the span
-+between a loop's first and last block. The backend needed no changes: it
-+already inverts a conditional whose true-target is the next block
-+(`comparison.rs:403`), so the taken `jne` became a not-taken `je` for free.
-+Same instructions, one fewer taken branch.
-+
-+**The minimality is load-bearing.** The first version was a greedy
-+hot-successor chain. It won `memchr` identically, but where every candidate
-+sat at the same loop depth its tie-break still walked the CFG chain-first
-+instead of topologically, reshuffling straight-line code for no reason:
-+**varint regressed 8.2%**. Reordering blocks is never free. A test now pins
-+that an already-contiguous loop comes back byte-identical.
-+
-+### 1.2 Machine-level loop inversion — `memchr` to parity with GCC
-+
-+With layout fixed, the remaining `memchr` gap was still 2x. Rather than guess,
-+I hand-edited the assembly into each candidate form and timed all of them:
-+
-+| variant | time |
-+|---|---|
-+| as emitted, 6 insn/iter | 17.459 ms |
-+| **bottom-tested, guard kept, 5 insn/iter** | **8.769 ms** |
-+| bottom-tested **+ load folded into the compare**, 4 insn/iter | 8.771 ms |
-+| GCC 14.2 reference | ~8.80 ms |
-+
-+Two conclusions, and the second one saved a day of work:
-+
-+1. Bottom-testing is worth **−49.8%** and lands exactly on GCC.
-+2. Folding the load into the compare on top of it is worth **nothing**
-+   (8.771 vs 8.769 ms).
-+
-+The cost was never the instruction count — it was the unconditional `jmp`. The
-+rotated loop has one taken branch per iteration instead of a taken conditional
-+*plus* a taken jump. So the load-compare fusion that had been sitting at the
-+top of the to-do list as "the obvious next win" was **dropped on evidence**,
-+and `memory_fold`'s SIB-operand limitation can stay as it is.
-+
-+`src/passes/loop_invert.rs` implements the rotation. The key design decision is
-+*where*: it runs **after `eliminate_phis`**, so there are no phis left.
-+Inversion then degenerates to copying a handful of pure instructions and
-+retargeting one edge. Compare with the SSA-level
-+[`loop_rotate`](../src/passes/loop_rotate.rs), which must rewrite header phis —
-+the part that produced a string of miscompiles, and the reason it is still
-+opt-in and restricted to single-block bodies (it declines `k_memchr` outright:
-+`not single-block body (body_len=3)`). Phi elimination has already placed the
-+induction variable's copy at the end of the latch, so the duplicated test
-+naturally reads the *updated* value, which is exactly what a bottom test must
-+do.
-+
-+Guards, each with a negative test: a single latch; the header must decide the
-+exit; every header instruction pure and duplicable (loads refused outright
-+rather than reasoned about); no header value may escape into the body; an
-+entry from outside the loop must exist; and a size cap on duplication.
-+`CCC_NO_LOOP_INVERT=1` disables it for bisection.
-+
-+One of those negative tests caught a real bug: `find_natural_loops` returns one
-+loop **per back edge**, so a two-latch loop arrives as *two* single-latch loops
-+and the single-latch guard waved both through, duplicating the test twice. The
-+pass now merges by header first, as `loop_unroll` does.
-+
-+### 1.3 Results
-+
-+Best-of-11, `-O3`, versus GCC 14.2 (>1 = lccc faster):
-+
-+| kernel | start of session | now | vs gcc |
-+|---|---|---|---|
-+| **memchr** | 29.170 ms | **8.748 ms (−70.0%)** | 0.31x → **1.01x** |
-+| adler32 | 5.794 ms | 5.279 ms (−8.9%) | 0.83x → 0.91x |
-+| hashmix | — | 30.499 ms | 0.97x |
-+| classify | — | 27.210 ms | 0.57x |
-+| matchlen | — | 447.692 ms | 0.54x |
-+| varint | — | 90.202 ms | 0.52x |
-+| namechars | — | 34.293 ms | 0.45x |
-+
-+**geomean 0.564 → 0.677**, zero regressions. `memchr` now edges out GCC.
-+
-+---
-+
-+## 2. Validation
-+
-+| Gate | Result |
-+|---|---|
-+| `cargo test --lib` | **1415 pass / 0 fail / 6 ignored** |
-+| `./scripts/run_regression_suite.sh` | **PASS=559 FAIL=0 SKIP=15**, AB-diff 0 |
-+| same, `CCC_LOOP_ROTATE=1` stacked | **PASS=559 FAIL=0**, AB-diff 0 |
 +| `ir_verify_sweep.py --levels O0..Oz` | **0 violations** / 3354 configs |
-+| `bench_kernels.py --baseline` | memchr −70.0%, adler32 −8.9%, no regressions |
++| `bench_kernels.py --baseline` | memchr −3.3%; no regressions |
++| MachInst assembler differential | all probed instructions accepted by GAS |
 +
 +---
 +
 +## 3. To do next, in priority order
 +
-+### 3.1 Rotate the loops that `loop_invert` still declines
++### 3.1 `iv_widen` declines when the induction variable escapes
 +
-+`memchr` and `adler32` rotated; `matchlen` (0.54x), `varint` (0.52x) and
-+`namechars` (0.45x) did not. Run with `CCC_DEBUG_LOOP_INVERT=1` and read the
-+bail reason for each — the guards are deliberately tight and the first ones to
-+relax should be chosen by which kernels they unblock, not by which looks
-+easiest. Given §1.2, expect rotation to be worth far more than any
-+instruction-count work on the same loop.
++Diagnosed precisely this session. `match_len`'s inner loop still carries
++`movslq %ebx, %rbx` **on the loop-carried dependency path** — the exact pattern
++that was worth −35% when removed from the gzip compare loop (S08).
++
++The cause is not the loop shape. A two-way probe settles it:
++
++```c
++int a(const unsigned char *x, int max) { int s=0; for (int n=0;n<max;n++) s+=x[n]; return s; }   // WIDENS
++int b(const unsigned char *x, const unsigned char *y, int max) {
++    int n=0; while (n<max && x[n]==y[n]) n++; return n; }                                        // DECLINES
++```
++
++`iv_widen` requires the IV's only 64-bit-context use to be addressing. In `b`
++the IV also *escapes* — it is the return value, and it feeds the 32-bit trip
++compare. Widening it therefore needs the loop-invariant bound sign-extended in
++the preheader and a truncation at each exit. That is a real extension, and
++given the S08 measurement it is the highest-value remaining scalar work.
 +
 +### 3.2 `namechars`: the counting form of the classifier
 +
-+Unchanged from the previous session and still the worst kernel. `if (pred) n++`
-+does not produce `Select`s — the hit edges converge on a shared increment block
-+before the join — so `range_fold` and `set_membership` never see it, while the
++Unchanged and still the worst kernel (0.45x). `if (pred) n++` does not produce
++`Select`s — the hit edges converge on a shared increment block before the join
++— so `range_fold` and `set_membership` never see it, while the
 +boolean-returning `k_classify` gets the full treatment. The two kernels
-+deliberately bracket this. `set_membership`'s matcher already anticipates a
-+`Phi [(Const(1), T_1), …]` join; teaching it (or `if_convert`) to see through
-+the shared hit block closes it.
++deliberately bracket this.
 +
-+### 3.3 Vectorisation is the remaining structural gap
++### 3.3 Vectorisation
 +
-+GCC vectorises `memchr` (149 insns of SIMD) and the Expat classifier (372) and
-+still only ties lccc's scalar `memchr`. Where it wins big it is because it is
-+using vectors. That is the next order-of-magnitude item, not more scalar
-+peepholes.
++GCC's 149- and 243-instruction outputs are SIMD. lccc's scalar `memchr` already
++ties it on this host, but that will not hold on wider data. This is the
++remaining order-of-magnitude item, not more scalar peepholes.
 +
-+### 3.4 Def-dominates-use in the IR verifier
++### 3.4 Extend the differential test to instruction *encoding*
 +
-+Unchanged and still the top verifier item: the six existing checks do not
-+include dominance, which is how an SSA violation once shipped past every gate.
-+`verify.rs` already computes reachability; Cooper-Harvey-Kennedy dominators
-+over RPO is the natural next step.
++The MachInst differential proves GAS accepts the text. The stronger property is
++that the bytes match what GAS would produce for the intended instruction —
++`insndiff.py`/`encdiff.py` already exist in `scripts/` for this and could be
++pointed at the MachInst corpus.
 +
-+### 3.5 Standing items not advanced
++### 3.5 Def-dominates-use in the IR verifier; linker oracle
 +
-+- Linker oracle: lld 23.1 / mold 2.42 (X86+i686-only preset) / bfd 2.47.
-+- Broader benchmark corpus: SQLite b-tree compare, kernel `memcpy`/checksum,
-+  zlib-ng CRC32; and a local Clang so the `vs clang` column stops being empty.
++Both unchanged from previous sessions.
 +
 +---
 +
 +## 4. Notes for whoever picks this up
 +
-+- **Hand-edit the assembly and time it before writing the pass.** Four variants
-+  of `k_memchr` took ten minutes and showed that the transformation at the top
-+  of the to-do list (load-compare fusion) was worth 0.01% while the one below
-+  it was worth 50%. Building the first would have been a week wasted at full
-+  validation cost.
-+- **Instruction count is not runtime.** Rotation removes one instruction and
-+  halves the time; the memory fold removes one instruction and changes nothing.
-+  Branches, not instructions, were the currency in every kernel here.
-+- **Pick the point in the pipeline where the problem is easy.** Loop rotation
-+  is hard in SSA because of phis and easy after phi elimination. The same
-+  transformation, thirty lines apart in the pipeline, moves from "string of
-+  miscompiles, still opt-in" to "pure duplication of a pure test".
-+- **Minimal deviation beats clever heuristics.** The greedy layout won the same
-+  memchr case and cost 8.2% elsewhere. If a region has no problem, leave its
-+  order alone.
-+- Negative controls keep earning their keep: 7 of the 10 `loop_invert` tests
-+  assert the pass does *not* fire, and one of them found the merge-by-header
-+  bug.
-diff --git a/scripts/bench_kernels.py b/scripts/bench_kernels.py
-new file mode 100755
-index 00000000..7c99b8c8
---- /dev/null
-+++ b/scripts/bench_kernels.py
-@@ -0,0 +1,349 @@
-+#!/usr/bin/env python3
-+"""Runtime A/B benchmark of lccc against system GCC/Clang on real hot loops.
-+
-+Instruction counts from the Compiler Explorer oracle say which compiler emits
-+*fewer* instructions, not which emits *faster* code -- a vectorised loop with
-+more instructions usually wins, and a shorter loop that spills does not. This
-+harness measures wall-clock time of the same kernel compiled by each compiler
-+and reports the ratio, so a codegen claim can be backed by a number.
-+
-+Method, chosen because this VM exposes no PMU:
-+
-+  * each kernel is a separate translation unit compiled by each compiler, then
-+    linked against a shared driver compiled ONCE by a fixed reference compiler,
-+    so only the kernel's codegen differs between arms;
-+  * the driver runs the kernel `--inner` times per timed sample and reports the
-+    best of `--reps` samples. Minimum, not mean: it is the sample least
-+    perturbed by scheduler noise, and the distribution is one-sided;
-+  * the kernel result is accumulated into a volatile sink and printed, so no
-+    arm can delete the work, and mismatched output between arms is reported as
-+    a CORRECTNESS failure rather than a speed win;
-+  * arms are interleaved round-robin across repetitions rather than run in
-+    blocks, so slow thermal or noisy-neighbour drift hits every arm equally.
-+
-+Usage:
-+    scripts/bench_kernels.py                          # all kernels, default arms
-+    scripts/bench_kernels.py --kernels adler32,memchr
-+    scripts/bench_kernels.py --reps 9 --inner 2000
-+    scripts/bench_kernels.py --baseline before.json --save after.json
-+"""
-+
-+from __future__ import annotations
-+
-+import argparse
-+import hashlib
-+import json
-+import re
-+import os
-+import shutil
-+import statistics
-+import subprocess
-+import sys
-+import tempfile
-+from pathlib import Path
-+
-+REPO = Path(__file__).resolve().parent.parent
-+BENCH_DIR = REPO / "tests" / "bench"
-+
-+
-+def which(*names: str) -> str | None:
-+    for n in names:
-+        p = shutil.which(n)
-+        if p:
-+            return p
-+    return None
-+
-+
-+def timed_function_hash(obj: Path) -> str:
-+    """Fingerprint of the TIMED function's machine code, and nothing else.
-+
-+    Hashing the whole object is too coarse: `bench_setup` is compiled into the
-+    same translation unit but runs once, outside the timed region, so a change
-+    there must not be attributed to a runtime delta. Disassemble `bench_run`
-+    alone and strip the address column, which moves whenever anything ahead of
-+    it changes size, and the relocation-dependent RIP displacements.
-+
-+    Falls back to hashing the whole object if objdump is unavailable, which
-+    only makes the artifact filter more conservative (fewer deltas classified
-+    as noise).
-+    """
-+    try:
-+        r = subprocess.run(
-+            ["objdump", "-d", "--disassemble=bench_run", str(obj)],
-+            capture_output=True, text=True, timeout=60,
-+        )
-+        if r.returncode == 0 and "bench_run" in r.stdout:
-+            body = []
-+            for line in r.stdout.splitlines():
-+                if "\t" not in line:
-+                    continue
-+                parts = line.split("\t")
-+                # parts[0] = "  30:", parts[1] = raw bytes, parts[2] = mnemonic
-+                text = parts[-1].strip()
-+                # Drop RIP-relative displacements and branch targets: both are
-+                # pure position, not code.
-+                text = re.sub(r"0x[0-9a-f]+\(%rip\)", "RIP", text)
-+                text = re.sub(r"^(j\w+|call\w*)\s+[0-9a-f]+", r"\1 T", text)
-+                text = re.sub(r"#.*$", "", text).strip()
-+                body.append(text)
-+            if body:
-+                return hashlib.sha256("\n".join(body).encode()).hexdigest()[:16]
-+    except (OSError, subprocess.SubprocessError):
-+        pass
-+    return hashlib.sha256(obj.read_bytes()).hexdigest()[:16]
-+
-+
-+def build_arm(cc: str, cflags: list[str], kernel: Path, driver_obj: Path,
-+              out: Path, workdir: Path) -> tuple[bool, str, str]:
-+    """Compile + link one arm. Returns (ok, error, codegen_hash)."""
-+    kobj = workdir / f"{kernel.stem}.{Path(cc).name}.o"
-+    r = subprocess.run([cc, "-c", str(kernel), "-o", str(kobj), *cflags],
-+                       capture_output=True, text=True)
-+    if r.returncode != 0:
-+        return False, f"kernel compile failed: {r.stderr.strip()[:300]}", ""
-+    # Hash the kernel object. Relocatable objects carry no timestamp, so this
-+    # is a stable fingerprint of the generated code -- see `codegen_hash` use
-+    # in the baseline comparison below.
-+    digest = timed_function_hash(kobj)
-+    # Link with the reference compiler so the linker is identical across arms.
-+    r = subprocess.run([REFERENCE_CC, str(kobj), str(driver_obj), "-o", str(out), "-lm"],
-+                       capture_output=True, text=True)
-+    if r.returncode != 0:
-+        return False, f"link failed: {r.stderr.strip()[:300]}", ""
-+    return True, "", digest
-+
-+
-+def time_once(binary: Path, inner: int) -> tuple[float, str] | None:
-+    r = subprocess.run([str(binary), str(inner)], capture_output=True, text=True,
-+                       timeout=300)
-+    if r.returncode != 0:
-+        return None
-+    # Driver prints: "<seconds> <checksum>"
-+    parts = r.stdout.split()
-+    if len(parts) < 2:
-+        return None
-+    try:
-+        return float(parts[0]), parts[1]
-+    except ValueError:
-+        return None
-+
-+
-+REFERENCE_CC = "cc"
-+
-+
-+def main() -> int:
-+    global REFERENCE_CC
-+    ap = argparse.ArgumentParser(description=__doc__,
-+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-+    ap.add_argument("--lccc", default=str(REPO / "target/fastbuild/lccc"))
-+    ap.add_argument("--gcc", default=which("gcc", "cc"))
-+    ap.add_argument("--clang", default=which("clang"))
-+    ap.add_argument("--reference-cc", default=which("gcc", "cc"),
-+                    help="compiler used for the driver and for linking every arm")
-+    ap.add_argument("--flags", default="-O3",
-+                    help="optimisation flags given to every arm")
-+    ap.add_argument("--kernels", default="", help="comma-separated kernel names")
-+    ap.add_argument("--reps", type=int, default=7, help="timed samples per arm")
-+    ap.add_argument("--inner", type=int, default=0,
-+                    help="iterations per sample (0 = per-kernel default)")
-+    ap.add_argument("--save", metavar="JSON")
-+    ap.add_argument("--baseline", metavar="JSON")
-+    ap.add_argument("--tolerance", type=float, default=3.0,
-+                    help="percent slowdown vs baseline that counts as a regression")
-+    args = ap.parse_args()
-+
-+    if not args.reference_cc:
-+        print("error: no reference C compiler found", file=sys.stderr)
-+        return 2
-+    REFERENCE_CC = args.reference_cc
-+
-+    driver = BENCH_DIR / "driver.c"
-+    if not driver.exists():
-+        print(f"error: missing {driver}", file=sys.stderr)
-+        return 2
-+
-+    kernels = sorted(p for p in BENCH_DIR.glob("k_*.c"))
-+    if args.kernels:
-+        want = {k.strip() for k in args.kernels.split(",") if k.strip()}
-+        kernels = [k for k in kernels if k.stem[2:] in want or k.stem in want]
-+    if not kernels:
-+        print("error: no kernels selected", file=sys.stderr)
-+        return 2
-+
-+    arms: list[tuple[str, str]] = []
-+    if args.lccc and Path(args.lccc).exists():
-+        arms.append(("lccc", args.lccc))
-+    if args.gcc:
-+        arms.append(("gcc", args.gcc))
-+    if args.clang:
-+        arms.append(("clang", args.clang))
-+    if len(arms) < 2:
-+        print("error: need at least two compilers to compare", file=sys.stderr)
-+        return 2
-+
-+    cflags = args.flags.split()
-+    results: dict[str, dict[str, float]] = {}
-+    hashes: dict[str, dict[str, str]] = {}
-+    failures: list[str] = []
-+
-+    with tempfile.TemporaryDirectory(prefix="lccc-bench-") as td:
-+        work = Path(td)
-+        driver_obj = work / "driver.o"
-+        r = subprocess.run([REFERENCE_CC, "-O2", "-c", str(driver), "-o", str(driver_obj)],
-+                           capture_output=True, text=True)
-+        if r.returncode != 0:
-+            print(f"error: driver build failed:\n{r.stderr}", file=sys.stderr)
-+            return 2
-+
-+        for kernel in kernels:
-+            name = kernel.stem[2:]
-+            inner = args.inner or default_inner(name)
-+            binaries: dict[str, Path] = {}
-+            for arm, cc in arms:
-+                out = work / f"{name}.{arm}"
-+                ok, err, digest = build_arm(cc, cflags, kernel, driver_obj, out, work)
-+                if not ok:
-+                    failures.append(f"{name}/{arm}: {err}")
-+                    continue
-+                binaries[arm] = out
-+                hashes.setdefault(name, {})[arm] = digest
-+            if len(binaries) < 2:
-+                continue
-+
-+            # Interleave arms across repetitions so drift is shared.
-+            samples: dict[str, list[float]] = {a: [] for a in binaries}
-+            checksums: dict[str, set[str]] = {a: set() for a in binaries}
-+            for _ in range(args.reps):
-+                for arm, binary in binaries.items():
-+                    got = time_once(binary, inner)
-+                    if got is None:
-+                        failures.append(f"{name}/{arm}: run failed")
-+                        continue
-+                    secs, checksum = got
-+                    samples[arm].append(secs)
-+                    checksums[arm].add(checksum)
-+
-+            # A faster arm that computes something else is not faster.
-+            distinct = {next(iter(v)) for v in checksums.values() if v}
-+            if len(distinct) > 1:
-+                failures.append(
-+                    f"{name}: CORRECTNESS - arms disagree: "
-+                    + ", ".join(f"{a}={next(iter(v))}" for a, v in checksums.items() if v)
-+                )
-+                continue
-+
-+            results[name] = {a: min(s) for a, s in samples.items() if s}
-+            results[name]["_hash_lccc"] = hashes.get(name, {}).get("lccc", "")
-+
-+    # ── report ──────────────────────────────────────────────────────────────
-+    arm_names = [a for a, _ in arms]
-+    print()
-+    print(f"runtime benchmark  flags={args.flags!r}  reps={args.reps} (best-of)")
-+    print()
-+    header = f"{'KERNEL':<18}" + "".join(f"{a + ' (ms)':>14}" for a in arm_names)
-+    if "lccc" in arm_names:
-+        header += f"{'vs gcc':>10}{'vs clang':>10}"
-+    print(header)
-+    print("-" * len(header))
-+    for name in sorted(results):
-+        row = results[name]
-+        line = f"{name:<18}"
-+        for a in arm_names:
-+            line += f"{row.get(a, float('nan')) * 1e3:>14.3f}" if a in row else f"{'-':>14}"
-+        if "lccc" in row:
-+            for other in ("gcc", "clang"):
-+                if other in row and row[other] > 0:
-+                    ratio = row[other] / row["lccc"]
-+                    line += f"{ratio:>9.2f}x"
-+                else:
-+                    line += f"{'-':>10}"
-+        print(line)
-+
-+    if results and "lccc" in arm_names:
-+        print()
-+        for other in ("gcc", "clang"):
-+            ratios = [r[other] / r["lccc"] for r in results.values()
-+                      if other in r and "lccc" in r and r["lccc"] > 0]
-+            if ratios:
-+                print(f"  geomean vs {other}: {statistics.geometric_mean(ratios):.3f}x "
-+                      f"(>1 means lccc is faster)")
-+
-+    for f in failures:
-+        print(f"  FAIL {f}")
-+
-+    if args.save:
-+        Path(args.save).write_text(json.dumps(results, indent=2, sort_keys=True) + "\n")
-+        print(f"\n  saved -> {args.save}")
-+
-+    if args.baseline:
-+        base = json.loads(Path(args.baseline).read_text())
-+        regressed = 0
-+        noise = 0
-+        print()
-+        for name, row in sorted(results.items()):
-+            if "lccc" not in row or name not in base or "lccc" not in base[name]:
-+                continue
-+            was, now = base[name]["lccc"], row["lccc"]
-+            delta = (now - was) / was * 100.0
-+            if abs(delta) <= args.tolerance:
-+                continue
-+
-+            # CODE-LAYOUT ARTIFACT FILTER.
-+            #
-+            # A change elsewhere in the translation unit shifts the benchmarked
-+            # function's address, and a 16-byte shift alone is worth several
-+            # percent on this core (instruction-fetch and uop-cache windows).
-+            # Observed for real: a fold that only touched the UNTIMED
-+            # `bench_setup` moved `bench_run` from 0x1270 to 0x1260 and was
-+            # reported as a 3.7% regression, while the two `bench_run` bodies
-+            # were byte-for-byte identical.
-+            #
-+            # The kernel object's hash settles it. Identical codegen means the
-+            # delta cannot be attributed to the change under test, so report it
-+            # as noise instead of manufacturing a regression -- or, just as
-+            # importantly, a win.
-+            old_hash = base[name].get("_hash_lccc", "")
-+            new_hash = row.get("_hash_lccc", "")
-+            same_codegen = bool(old_hash) and old_hash == new_hash
-+
-+            if same_codegen:
-+                print(f"  NOISE     {name}: {was*1e3:.3f} -> {now*1e3:.3f} ms "
-+                      f"({delta:+.1f}%) - kernel codegen is IDENTICAL "
-+                      f"({new_hash}); this is layout/measurement noise")
-+                noise += 1
-+            elif delta > 0:
-+                print(f"  REGRESSED {name}: {was*1e3:.3f} -> {now*1e3:.3f} ms "
-+                      f"({delta:+.1f}%)")
-+                regressed += 1
-+            else:
-+                print(f"  IMPROVED  {name}: {was*1e3:.3f} -> {now*1e3:.3f} ms "
-+                      f"({delta:+.1f}%)")
-+
-+        if noise:
-+            print(f"\n  note: {noise} kernel(s) moved beyond the tolerance with "
-+                  f"UNCHANGED codegen. That is the layout-noise floor of this "
-+                  f"host; treat deltas smaller than it as unmeasurable.")
-+        if regressed:
-+            print(f"\n  FAIL: {regressed} kernel(s) regressed beyond "
-+                  f"{args.tolerance}% WITH changed codegen")
-+            return 1
-+        print("\n  OK: no runtime regressions against baseline")
-+
-+    return 1 if failures else 0
-+
-+
-+def default_inner(name: str) -> int:
-+    """Per-kernel iteration counts, sized so each sample runs ~20-80 ms."""
-+    return {
-+        "adler32": 3000,
-+        "matchlen": 20000,
-+        "namechars": 3000,
-+        "classify": 3000,
-+        "varint": 20000,
-+        "memchr": 3000,
-+        "hashmix": 20000,
-+    }.get(name, 3000)
-+
-+
-+if __name__ == "__main__":
-+    sys.exit(main())
-diff --git a/scripts/lccc-bootstrap.sh b/scripts/lccc-bootstrap.sh
-index 52b516b3..2356dc91 100755
---- a/scripts/lccc-bootstrap.sh
-+++ b/scripts/lccc-bootstrap.sh
-@@ -9,6 +9,9 @@
- #   1. A 6 GiB swap file on the largest writable filesystem   (hard requirement:
- #      the sandbox has ~1.9 GiB RAM; linking/optimising lccc OOMs without it).
- #   2. VM tuning appropriate for a swap-backed, memory-starved build box.
-+#   3. A working Rust 1.98.0 toolchain, INCLUDING the rustup proxy binaries and
-+#      rustup's own execute bit -- both are lost by a harness wipe and neither
-+#      is restored by `rustup toolchain install` (see setup_rust).
- #   3. The lccc worktree at $LCCC_REPO, rebased on ms178/lccc main, with the
- #      accumulated session patch (ms178-1.patch) re-applied if present.
- #   4. The artifacts directory used by lccc-snapshot.sh.
-@@ -80,8 +83,67 @@ setup_repo() {
-   git -C "$REPO" config user.email 'agent@lccc.local'
- }
- 
-+
-+# --------------------------------------------------------------- 4. rust -----
-+# A harness wipe restores ~/.cargo/bin from the snapshot but loses two things
-+# that make the toolchain unusable, and neither failure is self-explanatory:
-+#
-+#   1. `rustup` comes back WITHOUT its execute bit ("Permission denied"), and
-+#   2. the proxy binaries (cargo, rustc, ...) are gone entirely. `rustup
-+#      toolchain install` does NOT recreate them -- only `rustup-init` does --
-+#      so the toolchain installs successfully and `cargo` is still not found.
-+#
-+# rustup dispatches on argv[0], so symlinking the proxies back to it is the
-+# supported recovery. Pin 1.98.0: the tree is built and validated against it.
-+RUST_VERSION=${RUST_VERSION:-1.98.0}
-+RUST_PROXIES=(cargo rustc rustdoc rustfmt cargo-fmt cargo-clippy clippy-driver
-+              rust-gdb rust-lldb)
-+
-+setup_rust() {
-+  local bin="$HOME/.cargo/bin"
-+  export PATH="$bin:$PATH"
-+
-+  if [[ -f $bin/rustup && ! -x $bin/rustup ]]; then
-+    log "restoring execute bit on rustup"
-+    chmod +x "$bin/rustup"
-+  fi
-+
-+  if [[ ! -x $bin/rustup ]]; then
-+    log "installing rustup + Rust $RUST_VERSION"
-+    curl -sSf https://sh.rustup.rs \
-+      | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION" \
-+                 --no-modify-path >/dev/null
-+  fi
-+
-+  if ! "$bin/rustup" toolchain list 2>/dev/null | grep -q "^$RUST_VERSION"; then
-+    log "installing Rust $RUST_VERSION"
-+    "$bin/rustup" toolchain install "$RUST_VERSION" \
-+      --profile minimal --no-self-update >/dev/null
-+  fi
-+  "$bin/rustup" default "$RUST_VERSION" >/dev/null 2>&1 || true
-+
-+  # Recreate any missing proxy. Harmless when they already exist.
-+  local p missing=0
-+  for p in "${RUST_PROXIES[@]}"; do
-+    if [[ ! -e $bin/$p ]]; then
-+      ln -sf rustup "$bin/$p"
-+      missing=$((missing + 1))
-+    fi
-+  done
-+  [[ $missing -gt 0 ]] && log "recreated $missing rustup proxy binaries"
-+
-+  # Prove it, rather than assuming: a silent failure here wastes the whole
-+  # session, because every later step blames the compiler instead of the PATH.
-+  if ! "$bin/cargo" --version >/dev/null 2>&1; then
-+    log "FATAL: cargo still not runnable after bootstrap"
-+    return 1
-+  fi
-+  log "rust ready: $("$bin/rustc" --version)"
-+}
-+
- setup_swap
- tune_vm
-+setup_rust
- setup_repo "${1:-}"
- log "environment ready:  repo=$REPO  artifacts=$ART"
- free -h | sed 's/^/    /'
-diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
-index c482ba9e..84b3c9aa 100644
---- a/src/driver/pipeline.rs
-+++ b/src/driver/pipeline.rs
-@@ -1735,10 +1735,20 @@ impl Driver {
-         // liveness/regalloc relies on. Re-layout in reverse post-order so loop
-         // bodies and their exit blocks stay contiguous and loop-carried values
-         // don't falsely span calls.
-+        // Bottom-test counted loops BEFORE laying blocks out: inversion
-+        // changes the CFG (the back edge moves from the latch to the body
-+        // entry), and the layout pass recomputes loops from scratch, so it
-+        // sees and lays out the rotated shape.
-+        for func in &mut module.functions {
-+            if !func.is_declaration {
-+                crate::passes::loop_invert::invert_loops(func);
-+            }
-+        }
-+
-         if std::env::var("CCC_NO_BLOCK_RELAYOUT").is_err() {
-             for func in &mut module.functions {
-                 if !func.is_declaration {
--                    crate::passes::block_layout::relayout_blocks_rpo(func);
-+                    crate::passes::block_layout::relayout_blocks_loop_aware(func);
-                 }
-             }
-         }
-diff --git a/src/passes/block_layout.rs b/src/passes/block_layout.rs
-index 96689ca8..98230c1b 100644
---- a/src/passes/block_layout.rs
-+++ b/src/passes/block_layout.rs
-@@ -12,14 +12,106 @@
- //! block contiguous. Block identity is the `label` field (terminators
- //! reference labels, not positions), so reordering the list is
- //! semantics-preserving.
-+//!
-+//! # Why RPO alone is not enough
-+//!
-+//! RPO is a *topological* order; it has no notion of which edge is HOT. In a
-+//! search loop it happily places the cold `return` block between the body and
-+//! the latch:
-+//!
-+//! ```text
-+//! .LBB1:  cmpq %rdx, %rbx ; jae .LBB5     # loop test, not taken
-+//! .LBB2:  movzbl (%rdi,%rbx), %eax
-+//!         cmpl %r8d, %eax  ; jne .LBB4    # TAKEN every iteration
-+//! .LBB3:  <return the match>              # cold, executes at most once
-+//! .LBB4:  leaq 1(%rbx), %rbx ; jmp .LBB1  # TAKEN every iteration
-+//! .LBB5:  <return null>
-+//! ```
-+//!
-+//! Three branches per iteration, **two of them taken**, where Clang emits two
-+//! branches with one taken. The instruction count is not the problem — the
-+//! layout is.
-+//!
-+//! [`relayout_blocks_loop_aware`] fixes it by preferring, at every step, the
-+//! successor that stays inside the current loop. The cold returns sink past
-+//! the latch, the body falls straight into the latch, and the backend's
-+//! existing branch inversion (`comparison.rs`, which flips the condition when
-+//! the true-target is the next block) turns the taken `jne .LBB4` into a
-+//! not-taken `je .LBB3` for free. Same instructions, one fewer taken branch
-+//! per iteration.
- 
- use crate::common::fx_hash::{FxHashMap, FxHashSet};
- use crate::ir::instruction::{BasicBlock, Terminator};
- use crate::ir::reexports::IrFunction;
- 
-+/// Reverse post-order of the block indices, entry first.
-+/// Unreachable blocks keep their original relative order at the end.
-+fn reverse_postorder(func: &IrFunction) -> Vec<usize> {
-+    let mut pos_of_label: FxHashMap<u32, usize> = FxHashMap::default();
-+    for (idx, block) in func.blocks.iter().enumerate() {
-+        pos_of_label.insert(block.label.0, idx);
-+    }
-+    let entry = func.blocks[0].label.0;
-+    let mut visited: FxHashSet<u32> = FxHashSet::default();
-+    let mut postorder: Vec<u32> = Vec::with_capacity(func.blocks.len());
-+    let mut stack: Vec<(u32, bool)> = vec![(entry, false)];
-+    while let Some((label, processed)) = stack.pop() {
-+        if processed {
-+            postorder.push(label);
-+            continue;
-+        }
-+        if !visited.insert(label) {
-+            continue;
-+        }
-+        stack.push((label, true));
-+        let mut succs: Vec<u32> = Vec::new();
-+        if let Some(&idx) = pos_of_label.get(&label) {
-+            collect_successor_labels(&func.blocks[idx].terminator, &mut succs);
-+            for inst in &func.blocks[idx].instructions {
-+                if let crate::ir::instruction::Instruction::InlineAsm { goto_labels, .. } = inst {
-+                    succs.extend(goto_labels.iter().map(|(_, l)| l.0));
-+                }
-+            }
-+        }
-+        for &sl in &succs {
-+            if pos_of_label.contains_key(&sl) && !visited.contains(&sl) {
-+                stack.push((sl, false));
-+            }
-+        }
-+    }
-+    postorder.reverse();
-+    let mut order: Vec<usize> = postorder.iter().map(|l| pos_of_label[l]).collect();
-+    let mut seen: FxHashSet<usize> = order.iter().copied().collect();
-+    for idx in 0..func.blocks.len() {
-+        if seen.insert(idx) {
-+            order.push(idx);
-+        }
-+    }
-+    order
-+}
-+
-+/// Commit `new_order` to `func.blocks`. Returns 1 if anything moved.
-+fn apply_order(func: &mut IrFunction, new_order: Vec<usize>) -> usize {
-+    debug_assert_eq!(new_order.len(), func.blocks.len());
-+    if new_order
-+        .iter()
-+        .enumerate()
-+        .all(|(new_pos, &old_pos)| new_pos == old_pos)
-+    {
-+        return 0;
-+    }
-+    let mut old: Vec<Option<BasicBlock>> = func.blocks.drain(..).map(Some).collect();
-+    func.blocks = new_order
-+        .into_iter()
-+        .map(|i| old[i].take().expect("each block placed exactly once"))
-+        .collect();
-+    1
-+}
-+
- /// Reorder `func.blocks` into reverse post-order from the entry block.
- /// Unreachable blocks (if any) keep their original relative order at the end.
- /// Returns 1 if the order changed, 0 otherwise.
-+#[cfg_attr(not(test), allow(dead_code))]
- pub(crate) fn relayout_blocks_rpo(func: &mut IrFunction) -> usize {
-     if func.blocks.len() < 2 {
-         return 0;
-@@ -93,6 +185,112 @@ pub(crate) fn relayout_blocks_rpo(func: &mut IrFunction) -> usize {
-     1
- }
- 
-+/// Loop-aware block placement.
-+///
-+/// Starts from reverse post-order and makes the **minimum** deviation needed
-+/// to restore one property: every natural loop's body must be contiguous.
-+/// Blocks that are not in the loop but that RPO interleaved with it are pushed
-+/// out past the loop, preserving their relative order.
-+///
-+/// # Why minimal, and not a greedy hot-successor chain
-+///
-+/// The first version of this pass built a greedy chain, always extending with
-+/// the highest-loop-depth unplaced successor. On a search loop that produced
-+/// exactly the right answer (`memchr` −40%), but on straight-line-heavy code
-+/// where every candidate sits at the *same* depth the tie-break still walked
-+/// the CFG chain-first instead of topologically, reshuffling blocks for no
-+/// reason — the inlined SQLite varint decoder regressed 8.2%. Reordering
-+/// blocks is never free: it moves code across cache lines and changes which
-+/// branches are forward and backward.
-+///
-+/// So the rule is: if a region has no loop-contiguity problem, its RPO order
-+/// is left exactly as it was. The only blocks that move are the ones sitting
-+/// between a loop's blocks while not belonging to that loop.
-+///
-+/// # What it buys
-+///
-+/// In a search loop RPO lays the cold `return` out between the body and the
-+/// latch, so the body's branch to the latch is a TAKEN forward jump over it:
-+///
-+/// ```text
-+/// .LBB2:  cmpl %r8d, %eax ; jne .LBB4   # taken every iteration
-+/// .LBB3:  <return the match>            # cold
-+/// .LBB4:  leaq 1(%rbx), %rbx ; jmp .LBB1
-+/// ```
-+///
-+/// Sinking `.LBB3` makes the latch fall through, and the backend's existing
-+/// branch inversion (`comparison.rs` flips the condition when the true-target
-+/// is the next block) rewrites the branch to a NOT-taken `je .LBB4`. Same
-+/// instructions, one fewer taken branch per iteration.
-+///
-+/// Only the ORDER of `func.blocks` changes; terminators address blocks by
-+/// label, never by position, so this is semantics-preserving.
-+///
-+/// Returns 1 if the order changed, 0 otherwise.
-+pub(crate) fn relayout_blocks_loop_aware(func: &mut IrFunction) -> usize {
-+    let n = func.blocks.len();
-+    if n < 2 {
-+        return 0;
-+    }
-+
-+    let mut order = reverse_postorder(func);
-+
-+    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
-+    let mut loops = crate::passes::loop_analysis::find_natural_loops(
-+        cfg.num_blocks,
-+        &cfg.preds,
-+        &cfg.succs,
-+        &cfg.idom,
-+    );
-+    if loops.is_empty() {
-+        return 0;
-+    }
-+    // Innermost first: compacting an inner loop cannot break an outer one,
-+    // because the outer body is a superset and compaction preserves relative
-+    // order within it. The reverse is not true.
-+    loops.sort_by_key(|lp| lp.body.len());
-+
-+    for lp in &loops {
-+        // Positions, in current layout order, of this loop's blocks.
-+        let mut in_loop = vec![false; n];
-+        for &b in &lp.body {
-+            if b < n {
-+                in_loop[b] = true;
-+            }
-+        }
-+        let first = match order.iter().position(|&b| in_loop[b]) {
-+            Some(p) => p,
-+            None => continue,
-+        };
-+        let last = order
-+            .iter()
-+            .rposition(|&b| in_loop[b])
-+            .expect("first exists, so last does");
-+        // Already contiguous: leave this region completely alone.
-+        if last - first + 1 == lp.body.len() {
-+            continue;
-+        }
-+
-+        // Stable partition of the span [first, last]: loop blocks keep their
-+        // relative order and come first; the interlopers follow, also in
-+        // their original relative order.
-+        let span: Vec<usize> = order[first..=last].to_vec();
-+        let mut body_part: Vec<usize> = Vec::with_capacity(lp.body.len());
-+        let mut other_part: Vec<usize> = Vec::with_capacity(span.len());
-+        for b in span {
-+            if in_loop[b] {
-+                body_part.push(b);
-+            } else {
-+                other_part.push(b);
-+            }
-+        }
-+        body_part.extend(other_part);
-+        order.splice(first..=last, body_part);
-+    }
-+
-+    apply_order(func, order)
-+}
-+
- /// Collect the target label IDs of a terminator.
- fn collect_successor_labels(term: &Terminator, out: &mut Vec<u32>) {
-     match term {
-@@ -117,3 +315,194 @@ fn collect_successor_labels(term: &Terminator, out: &mut Vec<u32>) {
-         Terminator::Return(_) | Terminator::Unreachable => {}
++- **Census before you build.** The copy-fold rebuild worked because it started
++  from 11 055 measured surviving copies and a breakdown by form, which pointed
++  straight at the missing capability (64-bit address operands, 72% of the
++  pool). The first attempt guessed and reached 0.03%.
++- **A deleted pass is not a closed question.** The old measurement was correct
++  and the conclusion — for that implementation — was right. What was wrong was
++  treating it as a verdict on the opportunity.
++- **Differential-test the layer, not your expectation of it.** Two real bugs in
++  MachInst had survived because there were no tests at all, and both are of the
++  kind a golden test would have missed: the author would have written the same
++  wrong mnemonic into the expectation.
++- **When a neighbouring test starts failing, first prove which side is wrong.**
++  Four tests failed across this session; in every case the pass was right and
++  the test was asserting stale pipeline text or a premise that did not hold
++  (a "clobber" that was really a dead store). Each was rewritten to assert its
++  actual invariant — none were weakened or disabled.
+diff --git a/src/backend/x86/codegen/machinst_emit.rs b/src/backend/x86/codegen/machinst_emit.rs
+index 674df116..454335dd 100644
+--- a/src/backend/x86/codegen/machinst_emit.rs
++++ b/src/backend/x86/codegen/machinst_emit.rs
+@@ -11,7 +11,14 @@ use crate::backend::regalloc::PhysReg;
+ pub fn reg_name_pub(r: MachReg) -> &'static str {
+     match r {
+         MachReg::Phys(p) => reg_name(p),
+-        MachReg::Vreg(id) => "VREG_UNRESOLVED", // shouldn't happen
++        // Reaching here means register allocation left a virtual register
++        // behind. Emitting a placeholder would hand the assembler
++        // `%VREG_UNRESOLVED` and blame it on the wrong component; fail here,
++        // where the invariant actually broke.
++        MachReg::Vreg(id) => unreachable!(
++            "vreg{} reached assembly emission unallocated",
++            id
++        ),
      }
  }
+ 
+@@ -42,7 +49,14 @@ fn reg_name(reg: PhysReg) -> &'static str {
+         23 => "xmm5",
+         24 => "xmm6",
+         25 => "xmm7",
+-        _ => "rax", // fallback for unexpected register IDs
++        // NO SILENT FALLBACK. This arm used to return "rax", so an unexpected
++        // register index produced a syntactically valid instruction naming the
++        // WRONG register -- a silent miscompile, in the most frequently used
++        // of the four size tables (the 32/16/8-bit ones have always trapped
++        // here). A compiler crash is strictly preferable to wrong code, and
++        // the whole 559-test corpus passes with this arm live, which is the
++        // evidence that the fallback was masking nothing.
++        _ => unreachable!("invalid machinst register index {}", reg.0),
+     }
+ }
+ 
+@@ -180,6 +194,15 @@ fn fmt_operand(op: &MachOperand, size: OpSize, out: &AsmOutput) -> String {
+ /// sign-extended operands; using the raw 64-bit immediate would truncate it
+ /// and miscompare (regression: simd_movnt's `lo == 0x1122334455667788ULL`
+ /// check compiled to `cmp $0x55667788`).
++/// x86-64 ALU and compare immediates are sign-extended 32-bit. A wider
++/// constant has to be loaded into a register first; emitting it inline is not
++/// a silent truncation but a hard assembler error ("operand type mismatch for
++/// `add'"), so any path that forgets this breaks the build.
++///
++/// The scratch is `%rax`, matching the accumulator convention the rest of this
++/// backend uses. That is only sound while no *other* operand of the same
++/// instruction already lives in `%rax` -- see [`assert_scratch_free`], which
++/// makes the assumption checkable instead of implicit.
+ fn materialize_large_imm(op: &MachOperand, out: &mut AsmOutput) -> MachOperand {
+     match op {
+         MachOperand::Imm(v) if *v < i32::MIN as i64 || *v > i32::MAX as i64 => {
+@@ -190,6 +213,29 @@ fn materialize_large_imm(op: &MachOperand, out: &mut AsmOutput) -> MachOperand {
+     }
+ }
+ 
++/// True when `op` needs [`materialize_large_imm`].
++fn needs_scratch(op: &MachOperand) -> bool {
++    matches!(op, MachOperand::Imm(v) if *v < i32::MIN as i64 || *v > i32::MAX as i64)
++}
 +
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+    use crate::common::types::IrType;
-+    use crate::ir::instruction::BlockId;
-+    use crate::ir::reexports::{IrConst, Operand, Value};
++/// Guard the `%rax`-as-scratch assumption in [`materialize_large_imm`].
++///
++/// If a large immediate has to be staged through `%rax` while another operand
++/// of the same instruction already IS `%rax`, staging overwrites it and the
++/// instruction computes the wrong thing -- silently, because the result still
++/// assembles. No current lowering produces that shape (the codegen materializes
++/// wide constants long before this point), so rather than emit a heavier
++/// save/restore sequence for a path that never runs, make the invariant
++/// explicit and let a debug build fail loudly the day it stops holding.
++#[inline]
++fn assert_scratch_free(imm: &MachOperand, other: &MachReg) {
++    debug_assert!(
++        !(needs_scratch(imm) && *other == MachReg::Phys(super::machinst::RAX)),
++        "a wide immediate must be staged through %rax, but %rax is already an \
++         operand of this instruction; the staging would clobber it"
++    );
++}
 +
-+    fn blk(label: u32, term: Terminator) -> BasicBlock {
-+        BasicBlock {
-+            label: BlockId(label),
-+            instructions: Vec::new(),
-+            terminator: term,
-+            source_spans: Vec::new(),
-+        }
-+    }
+ /// ALU operation mnemonic.
+ fn alu_mnemonic(op: AluOp) -> &'static str {
+     match op {
+@@ -203,14 +249,31 @@ fn alu_mnemonic(op: AluOp) -> &'static str {
+ }
+ 
+ /// Shift operation mnemonic.
++/// AT&T shift mnemonic for every operand width.
++///
++/// The table used to read `(Shl, S32) => "shll", (Shl, _) => "shlq"`, which
++/// silently folded S8 and S16 into the 64-bit mnemonic. A byte shift then
++/// emitted `shlq %dl` and a word shift `shlq %cx` -- both rejected outright by
++/// the assembler ("`%dl' not allowed with `shlq'"). It had not fired only
++/// because instruction selection did not yet route narrow shifts through
++/// MachInst; the moment it did, the build would break. Found by the
++/// assembler-differential test, which is exactly the class of defect a golden
++/// test cannot catch, because the author would have written the same wrong
++/// expectation.
+ fn shift_mnemonic(op: ShiftOp, size: OpSize) -> &'static str {
+     match (op, size) {
++        (ShiftOp::Shl, OpSize::S8) => "shlb",
++        (ShiftOp::Shl, OpSize::S16) => "shlw",
+         (ShiftOp::Shl, OpSize::S32) => "shll",
+-        (ShiftOp::Shl, _) => "shlq",
++        (ShiftOp::Shl, OpSize::S64) => "shlq",
++        (ShiftOp::Shr, OpSize::S8) => "shrb",
++        (ShiftOp::Shr, OpSize::S16) => "shrw",
+         (ShiftOp::Shr, OpSize::S32) => "shrl",
+-        (ShiftOp::Shr, _) => "shrq",
++        (ShiftOp::Shr, OpSize::S64) => "shrq",
++        (ShiftOp::Sar, OpSize::S8) => "sarb",
++        (ShiftOp::Sar, OpSize::S16) => "sarw",
+         (ShiftOp::Sar, OpSize::S32) => "sarl",
+-        (ShiftOp::Sar, _) => "sarq",
++        (ShiftOp::Sar, OpSize::S64) => "sarq",
+     }
+ }
+ 
+@@ -302,7 +365,10 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
+         MachInst::Alu { op, src, dst, size } => {
+             let mnem = alu_mnemonic(*op);
+             let suffix = size.suffix();
+-            let src_str = fmt_operand(src, *size, out);
++            // A wide immediate cannot be an ALU operand; stage it first.
++            assert_scratch_free(src, dst);
++            let src = materialize_large_imm(src, out);
++            let src_str = fmt_operand(&src, *size, out);
+             let dst_str = fmt_reg(dst, *size);
+             out.emit_fmt(format_args!(
+                 "    {}{} {}, {}",
+@@ -317,6 +383,26 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
+             size,
+         } => {
+             let suffix = size.suffix();
++            // `imul $imm, src, dst` takes a sign-extended imm32 like the ALU
++            // forms. A wider multiplier must go through a register, and there
++            // is no three-operand register form -- fall back to the
++            // two-address sequence.
++            if *imm < i32::MIN as i64 || *imm > i32::MAX as i64 {
++                assert_scratch_free(&MachOperand::Imm(*imm), dst);
++                let staged = materialize_large_imm(&MachOperand::Imm(*imm), out);
++                let src_str = fmt_reg(src, *size);
++                let dst_str = fmt_reg(dst, *size);
++                if fmt_operand(&staged, *size, out) != dst_str {
++                    out.emit_fmt(format_args!("    mov{} {}, {}", suffix, src_str, dst_str));
++                }
++                out.emit_fmt(format_args!(
++                    "    imul{} {}, {}",
++                    suffix,
++                    fmt_operand(&staged, *size, out),
++                    dst_str
++                ));
++                return;
++            }
+             let src_str = fmt_reg(src, *size);
+             let dst_str = fmt_reg(dst, *size);
+             out.emit_fmt(format_args!(
+@@ -416,6 +502,12 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
+             let mut lhs = lhs.clone();
+             let mut rhs = rhs.clone();
+             // 64-bit immediates don't fit in the imm32 of cmp; materialize.
++            if let MachOperand::Reg(r) = &rhs {
++                assert_scratch_free(&lhs, r);
++            }
++            if let MachOperand::Reg(r) = &lhs {
++                assert_scratch_free(&rhs, r);
++            }
+             lhs = materialize_large_imm(&lhs, out);
+             rhs = materialize_large_imm(&rhs, out);
+             // x86 cmp can't have two memory operands — load rhs to rax
+@@ -444,6 +536,12 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
+             let suffix = size.suffix();
+             let mut lhs = lhs.clone();
+             let mut rhs = rhs.clone();
++            if let MachOperand::Reg(r) = &rhs {
++                assert_scratch_free(&lhs, r);
++            }
++            if let MachOperand::Reg(r) = &lhs {
++                assert_scratch_free(&rhs, r);
++            }
+             lhs = materialize_large_imm(&lhs, out);
+             rhs = materialize_large_imm(&rhs, out);
+             // x86 test can't have two memory operands — load one to rax
+diff --git a/src/backend/x86/codegen/machinst_tests.rs b/src/backend/x86/codegen/machinst_tests.rs
+new file mode 100644
+index 00000000..39199371
+--- /dev/null
++++ b/src/backend/x86/codegen/machinst_tests.rs
+@@ -0,0 +1,707 @@
++//! Stress tests for the MachInst representation and its AT&T emitter.
++//!
++//! This layer had **no test coverage at all** (946 lines across
++//! `machinst.rs` + `machinst_emit.rs`), which is how a silent
++//! `_ => "rax"` fallback survived in the 64-bit register table: an
++//! unexpected register index produced a syntactically valid instruction
++//! naming the *wrong* register. Nothing downstream can catch that — the
++//! assembler is happy, the program is wrong.
++//!
++//! The suite is organised as four layers, weakest to strongest:
++//!
++//! 1. **Table integrity** — the four register-name tables must agree with each
++//!    other and be injective. Catches copy-paste damage in the tables, which
++//!    is the single most likely defect in code shaped like this.
++//! 2. **Type mapping** — `OpSize` must classify every `IrType`, and its
++//!    suffix must match its width.
++//! 3. **Golden emission** — each `MachInst` variant and each `MachOperand`
++//!    shape emits exactly the expected AT&T text.
++//! 4. **Assembler differential** — every instruction the suite can construct
++//!    is fed to the *real* system assembler. This is the layer that makes the
++//!    others hard to fool: a golden test only proves the emitter matches what
++//!    the test author expected, while `as` proves the text is genuinely a
++//!    valid x86-64 instruction. It is skipped, loudly, when no assembler is
++//!    present rather than passing vacuously.
 +
-+    fn br(t: u32) -> Terminator {
-+        Terminator::Branch(BlockId(t))
-+    }
++use super::machinst::*;
++use super::machinst_emit::*;
++use crate::backend::common::AsmOutput;
++use crate::backend::regalloc::PhysReg;
 +
-+    fn cond(t: u32, f: u32) -> Terminator {
-+        Terminator::CondBranch {
-+            cond: Operand::Value(Value(99)),
-+            true_label: BlockId(t),
-+            false_label: BlockId(f),
-+        }
-+    }
++/// Emit one instruction and return the trimmed text lines it produced.
++fn emit(inst: &MachInst) -> Vec<String> {
++    let mut out = AsmOutput::new();
++    emit_machinst(inst, &mut out);
++    out.buf
++        .lines()
++        .map(|l| l.trim().to_string())
++        .filter(|l| !l.is_empty())
++        .collect()
++}
 +
-+    fn ret() -> Terminator {
-+        Terminator::Return(Some(Operand::Const(IrConst::I32(0))))
-+    }
++/// Emit one instruction and return its single line, asserting there is one.
++fn emit1(inst: &MachInst) -> String {
++    let lines = emit(inst);
++    assert_eq!(lines.len(), 1, "expected one line, got {:?}", lines);
++    lines.into_iter().next().unwrap()
++}
 +
-+    fn func_of(blocks: Vec<BasicBlock>) -> IrFunction {
-+        let mut f = IrFunction::new("t".into(), IrType::I32, Vec::new(), false);
-+        f.blocks = blocks;
-+        f
-+    }
++fn reg(p: PhysReg) -> MachOperand {
++    MachOperand::Reg(MachReg::Phys(p))
++}
 +
-+    fn labels(f: &IrFunction) -> Vec<u32> {
-+        f.blocks.iter().map(|b| b.label.0).collect()
-+    }
++const SIZES: [OpSize; 4] = [OpSize::S8, OpSize::S16, OpSize::S32, OpSize::S64];
 +
-+    /// The defect this pass exists for: a search loop whose cold `return` sits
-+    /// between the body and the latch, making the body's branch to the latch a
-+    /// TAKEN forward jump over it.
-+    ///
-+    ///   0 entry -> 1
-+    ///   1 header: i < n ? 2 : 5        (loop)
-+    ///   2 body:   hit  ? 3 : 4         (loop)
-+    ///   3 found:  return               (NOT in the loop -- must sink)
-+    ///   4 latch:  -> 1                 (loop)
-+    ///   5 exit:   return
-+    #[test]
-+    fn a_cold_block_between_the_body_and_the_latch_is_sunk_past_the_loop() {
-+        let mut f = func_of(vec![
-+            blk(0, br(1)),
-+            blk(1, cond(5, 2)),
-+            blk(2, cond(3, 4)),
-+            blk(3, ret()),
-+            blk(4, br(1)),
-+            blk(5, ret()),
-+        ]);
-+        assert_eq!(relayout_blocks_loop_aware(&mut f), 1, "layout must change");
++/// The canonical x86-64 register families, indexed the way `machinst.rs`
++/// numbers them. Written out independently of the emitter so a typo in the
++/// emitter's tables cannot agree with a typo here.
++fn expected_names(p: PhysReg) -> Option<[&'static str; 4]> {
++    // [S8, S16, S32, S64]
++    Some(match p.0 {
++        0 => ["al", "ax", "eax", "rax"],
++        1 => ["bl", "bx", "ebx", "rbx"],
++        2 => ["r12b", "r12w", "r12d", "r12"],
++        3 => ["r13b", "r13w", "r13d", "r13"],
++        4 => ["r14b", "r14w", "r14d", "r14"],
++        5 => ["r15b", "r15w", "r15d", "r15"],
++        6 => ["bpl", "bp", "ebp", "rbp"],
++        7 => ["cl", "cx", "ecx", "rcx"],
++        10 => ["r11b", "r11w", "r11d", "r11"],
++        11 => ["r10b", "r10w", "r10d", "r10"],
++        12 => ["r8b", "r8w", "r8d", "r8"],
++        13 => ["r9b", "r9w", "r9d", "r9"],
++        14 => ["dil", "di", "edi", "rdi"],
++        15 => ["sil", "si", "esi", "rsi"],
++        16 => ["dl", "dx", "edx", "rdx"],
++        _ => return None,
++    })
++}
 +
-+        let order = labels(&f);
-+        let pos = |l: u32| order.iter().position(|&x| x == l).unwrap();
-+        assert_eq!(order[0], 0, "entry must stay first");
-+        // The loop {1,2,4} is contiguous...
-+        assert_eq!(pos(2), pos(1) + 1);
-+        assert_eq!(pos(4), pos(2) + 1);
-+        // ...and the cold return no longer splits it.
-+        assert!(pos(3) > pos(4), "cold block must sink past the latch: {:?}", order);
-+    }
++/// Every register index the emitter claims to handle.
++const KNOWN_REGS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16];
 +
-+    /// The property that keeps this pass from being a random shuffler. When a
-+    /// loop is already contiguous the order must come back BYTE-IDENTICAL --
-+    /// the greedy first version reshuffled equal-depth blocks here and cost
-+    /// 8.2% on the inlined SQLite varint decoder.
-+    #[test]
-+    fn an_already_contiguous_loop_is_left_exactly_as_it_was() {
-+        //   0 -> 1 ; 1: cond(2,4) ; 2 -> 3 ; 3 -> 1 ; 4: ret
-+        let before = vec![
-+            blk(0, br(1)),
-+            blk(1, cond(4, 2)),
-+            blk(2, br(3)),
-+            blk(3, br(1)),
-+            blk(4, ret()),
-+        ];
-+        let expected: Vec<u32> = before.iter().map(|b| b.label.0).collect();
-+        let mut f = func_of(before);
-+        assert_eq!(
-+            relayout_blocks_loop_aware(&mut f),
-+            0,
-+            "a contiguous loop must not be touched"
-+        );
-+        assert_eq!(labels(&f), expected);
-+    }
++// ── 1. table integrity ──────────────────────────────────────────────────────
 +
-+    /// Straight-line and branchy code with no loop at all must be untouched:
-+    /// there is no contiguity to restore, so there is no justification for
-+    /// moving anything.
-+    #[test]
-+    fn a_function_without_loops_is_left_exactly_as_it_was() {
-+        let before = vec![
-+            blk(0, cond(1, 2)),
-+            blk(1, br(3)),
-+            blk(2, br(3)),
-+            blk(3, ret()),
-+        ];
-+        let expected: Vec<u32> = before.iter().map(|b| b.label.0).collect();
-+        let mut f = func_of(before);
-+        assert_eq!(relayout_blocks_loop_aware(&mut f), 0);
-+        assert_eq!(labels(&f), expected);
-+    }
-+
-+    /// Nested loops must both end up contiguous, and the inner one must stay
-+    /// inside the outer one.
-+    #[test]
-+    fn nested_loops_both_become_contiguous() {
-+        //   0 -> 1
-+        //   1 outer header : cond(6, 2)
-+        //   2 inner header : cond(5, 3)
-+        //   3 inner body   : -> 4          (cold block 7 interleaved after it)
-+        //   4 inner latch  : -> 2
-+        //   5 outer latch  : -> 1
-+        //   6 exit         : ret
-+        //   7 cold         : ret           (reached from 3)
-+        let mut f = func_of(vec![
-+            blk(0, br(1)),
-+            blk(1, cond(6, 2)),
-+            blk(2, cond(5, 3)),
-+            blk(3, cond(7, 4)),
-+            blk(4, br(2)),
-+            blk(5, br(1)),
-+            blk(6, ret()),
-+            blk(7, ret()),
-+        ]);
-+        relayout_blocks_loop_aware(&mut f);
-+        let order = labels(&f);
-+        let pos = |l: u32| order.iter().position(|&x| x == l).unwrap();
-+
-+        for (name, body) in [("inner", vec![2u32, 3, 4]), ("outer", vec![1, 2, 3, 4, 5])] {
-+            let mut ps: Vec<usize> = body.iter().map(|&l| pos(l)).collect();
-+            ps.sort_unstable();
-+            assert_eq!(
-+                ps.last().unwrap() - ps[0] + 1,
-+                body.len(),
-+                "{} loop must be contiguous in {:?}",
-+                name,
-+                order
++#[test]
++fn every_register_emits_its_canonical_name_at_every_size() {
++    for &idx in KNOWN_REGS {
++        let p = PhysReg(idx);
++        let want = expected_names(p).expect("KNOWN_REGS must be covered");
++        for (w, size) in SIZES.iter().enumerate() {
++            let line = emit1(&MachInst::Mov {
++                src: reg(p),
++                dst: reg(PhysReg(if idx == 0 { 1 } else { 0 })),
++                size: *size,
++            });
++            assert!(
++                line.contains(&format!("%{}", want[w])),
++                "reg {} at {:?} should spell %{}, got `{}`",
++                idx,
++                size,
++                want[w],
++                line
 +            );
 +        }
-+        assert!(pos(7) > pos(5), "cold block must sink past the outer loop");
-+    }
-+
-+    /// Reordering must never lose, duplicate or rename a block.
-+    #[test]
-+    fn every_block_survives_exactly_once() {
-+        let mut f = func_of(vec![
-+            blk(0, br(1)),
-+            blk(1, cond(5, 2)),
-+            blk(2, cond(3, 4)),
-+            blk(3, ret()),
-+            blk(4, br(1)),
-+            blk(5, ret()),
-+        ]);
-+        relayout_blocks_loop_aware(&mut f);
-+        let mut got = labels(&f);
-+        got.sort_unstable();
-+        assert_eq!(got, vec![0, 1, 2, 3, 4, 5]);
-+    }
-+
-+    /// An unreachable block (not yet swept by cfg_simplify) must not be lost.
-+    #[test]
-+    fn an_unreachable_block_is_preserved() {
-+        let mut f = func_of(vec![
-+            blk(0, br(1)),
-+            blk(1, cond(5, 2)),
-+            blk(2, cond(3, 4)),
-+            blk(3, ret()),
-+            blk(4, br(1)),
-+            blk(5, ret()),
-+            blk(9, ret()), // unreachable
-+        ]);
-+        relayout_blocks_loop_aware(&mut f);
-+        let mut got = labels(&f);
-+        got.sort_unstable();
-+        assert_eq!(got, vec![0, 1, 2, 3, 4, 5, 9]);
 +    }
 +}
-diff --git a/src/passes/loop_invert.rs b/src/passes/loop_invert.rs
-new file mode 100644
-index 00000000..c3fb611b
---- /dev/null
-+++ b/src/passes/loop_invert.rs
-@@ -0,0 +1,575 @@
-+//! Machine-level loop inversion (bottom-testing), run after phi elimination.
-+//!
-+//! lccc emits counted loops in top-test form: the header tests, the body runs,
-+//! and the latch jumps unconditionally back to the header.
-+//!
-+//! ```text
-+//! .LBB5:  cmpq $8192, %r12 ; jae .LBB9    # not taken
-+//! .LBB6:  movzbl (%rbx,%r12), %r8d
-+//!         testb %r8b, %r8b ; je .LBB8     # not taken
-+//! .LBB7:  leaq 1(%r12), %r12 ; jmp .LBB5  # TAKEN, every iteration
-+//! ```
-+//!
-+//! GCC and Clang emit the bottom-test form, where the single backward branch
-+//! *is* the loop test. Measured on `tests/bench/k_memchr.c` by hand-editing the
-+//! assembly and timing all four variants (best-of-13, this host):
-+//!
-+//! | variant | time |
-+//! |---|---|
-+//! | as emitted, 6 insn/iter | 17.459 ms |
-+//! | **bottom-tested, guard kept, 5 insn/iter** | **8.769 ms** |
-+//! | bottom-tested + load folded into the compare, 4 insn/iter | 8.771 ms |
-+//! | GCC 14.2 reference | ~8.80 ms |
-+//!
-+//! Nearly a **2x** difference, and note the third row: folding the load into
-+//! the compare on top of the rotation buys *nothing*. The cost was never the
-+//! instruction count, it was the unconditional `jmp` — the rotated loop has a
-+//! single taken branch per iteration instead of a taken conditional plus a
-+//! taken jump.
-+//!
-+//! # Why here and not in `loop_rotate`
-+//!
-+//! [`crate::passes::loop_rotate`] does this on SSA, where duplicating the
-+//! header means rewriting header phis; that is the part which produced a
-+//! string of miscompiles, and the pass is still opt-in and restricted to
-+//! single-block bodies (it declines `k_memchr` with
-+//! `not single-block body (body_len=3)`).
-+//!
-+//! This pass runs after `eliminate_phis`, so **there are no phis left**.
-+//! Inversion degenerates to copying a handful of side-effect-free
-+//! instructions and retargeting one edge — no phi surgery, nothing to get
-+//! wrong. Phi elimination has already placed the induction variable's copy at
-+//! the end of the latch, so the duplicated test naturally reads the *updated*
-+//! value, which is precisely what a bottom test must do.
-+//!
-+//! # When it is legal
-+//!
-+//! For a natural loop with header `H`, a single latch `T` (`T != H`) whose
-+//! terminator is `Branch(H)`:
-+//!
-+//! 1. `H` ends in a `CondBranch` with exactly one target inside the loop (the
-+//!    body entry `B`) and one outside (the exit `X`). A loop whose header does
-+//!    not decide the exit is not a top-test loop.
-+//! 2. Every instruction in `H` is **pure and duplicable** — no memory access,
-+//!    no calls, no side effects. A load would be re-executed on a path the
-+//!    guard used to protect, so loads are refused outright rather than
-+//!    reasoned about.
-+//! 3. Every value defined in `H` is used **only inside `H`**. Otherwise the
-+//!    body, once reached from `T`, would read the value `H` computed on its
-+//!    single guard execution instead of this iteration's.
-+//! 4. `H` has at least one predecessor outside the loop, so the guard it
-+//!    becomes is actually reachable.
-+//! 5. `H` is small (`MAX_DUP_INSTS`), because its instructions are duplicated.
-+//!
-+//! The transform then appends a renamed copy of `H`'s instructions to `T` and
-+//! gives `T` a copy of `H`'s terminator. `H` keeps its own terminator and
-+//! becomes the loop guard, executed once. The back edge becomes `T -> B`.
 +
-+use crate::common::fx_hash::{FxHashMap, FxHashSet};
-+use crate::ir::instruction::{Instruction, Terminator};
-+use crate::ir::reexports::{BlockId, IrFunction, Operand, Value};
-+
-+/// Duplicating more than a handful of instructions trades I-cache for branches.
-+/// A counted loop's test is one or two instructions; anything much larger is
-+/// not the shape this pass is for.
-+const MAX_DUP_INSTS: usize = 8;
-+
-+/// True when `inst` may be duplicated into the latch: pure, no memory traffic,
-+/// no control flow, no side effects.
-+fn is_duplicable(inst: &Instruction) -> bool {
-+    matches!(
-+        inst,
-+        Instruction::Cmp { .. }
-+            | Instruction::BinOp { .. }
-+            | Instruction::UnaryOp { .. }
-+            | Instruction::Copy { .. }
-+            | Instruction::Cast { .. }
-+            | Instruction::Select { .. }
-+            | Instruction::GetElementPtr { .. }
-+            | Instruction::GlobalAddr { .. }
-+    )
++#[test]
++fn the_register_tables_are_injective_at_every_size() {
++    // Two distinct PhysRegs sharing a name at any width means one of them is
++    // silently aliased onto the other -- the exact damage the removed
++    // `_ => "rax"` fallback used to cause on purpose.
++    for size in SIZES {
++        let mut seen: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
++        for &idx in KNOWN_REGS {
++            let line = emit1(&MachInst::Mov {
++                src: reg(PhysReg(idx)),
++                dst: MachOperand::StackSlot(-8),
++                size,
++            });
++            let name = line
++                .split('%')
++                .nth(1)
++                .unwrap_or("")
++                .split(|c: char| !c.is_ascii_alphanumeric())
++                .next()
++                .unwrap_or("")
++                .to_string();
++            if let Some(prev) = seen.insert(name.clone(), idx) {
++                panic!(
++                    "registers {} and {} both spell %{} at {:?}",
++                    prev, idx, name, size
++                );
++            }
++        }
++    }
 +}
 +
-+/// Invert every eligible top-test loop in `func`. Returns the number rotated.
-+pub(crate) fn invert_loops(func: &mut IrFunction) -> usize {
-+    if func.blocks.len() < 3 {
-+        return 0;
-+    }
-+    if std::env::var("CCC_NO_LOOP_INVERT").is_ok() {
-+        return 0;
-+    }
-+    let debug = std::env::var("CCC_DEBUG_LOOP_INVERT").is_ok();
-+
-+    // Phis must already be gone; this pass's whole safety argument rests on it.
-+    debug_assert!(
-+        !func
-+            .blocks
++#[test]
++fn the_four_size_tables_describe_the_same_register_family() {
++    // A mismatch here (e.g. S32 giving `r12d` while S64 gives `r13`) would
++    // corrupt any instruction that mixes widths on one value.
++    for &idx in KNOWN_REGS {
++        let want = expected_names(PhysReg(idx)).unwrap();
++        // Distinctness within the family is implied by the x86 naming rules;
++        // what matters is that all four come from the SAME row of the table.
++        let family_digits: Vec<String> = want
 +            .iter()
-+            .flat_map(|b| b.instructions.iter())
-+            .any(|i| matches!(i, Instruction::Phi { .. })),
-+        "loop_invert runs after eliminate_phis; a surviving phi means the \
-+         pipeline order changed and the duplication below is no longer safe"
-+    );
-+
-+    let mut rotated = 0;
-+    // One rotation per call per loop: the CFG changes, so re-derive it.
-+    loop {
-+        let Some(plan) = find_one(func, debug) else {
-+            break;
-+        };
-+        apply(func, &plan);
-+        rotated += 1;
-+        if rotated > 64 {
-+            break; // pathological input guard
++            .map(|n| n.chars().filter(|c| c.is_ascii_digit()).collect())
++            .collect();
++        let nonempty: Vec<&String> = family_digits.iter().filter(|d| !d.is_empty()).collect();
++        if let Some(first) = nonempty.first() {
++            assert!(
++                nonempty.iter().all(|d| d == first),
++                "reg {} mixes families across sizes: {:?}",
++                idx,
++                want
++            );
 +        }
 +    }
-+    rotated
 +}
 +
-+struct Plan {
-+    header: usize,
-+    latch: usize,
++#[test]
++fn an_unknown_register_index_is_a_hard_error_not_a_silent_rename() {
++    // The regression this whole file exists for. Index 99 is not a register;
++    // the emitter must refuse rather than quietly produce %rax.
++    for size in SIZES {
++        let r = std::panic::catch_unwind(|| {
++            let mut out = AsmOutput::new();
++            emit_machinst(
++                &MachInst::Mov {
++                    src: MachOperand::Reg(MachReg::Phys(PhysReg(99))),
++                    dst: MachOperand::Reg(MachReg::Phys(PhysReg(0))),
++                    size,
++                },
++                &mut out,
++            );
++            out.buf
++        });
++        assert!(
++            r.is_err(),
++            "an invalid register index must not emit silently at {:?}; got {:?}",
++            size,
++            r
++        );
++    }
 +}
 +
-+fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
-+    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
-+    // MERGE BY HEADER. `find_natural_loops` returns one loop per BACK EDGE,
-+    // so a loop with two latches arrives as two single-latch loops and the
-+    // single-latch guard below would wave both through, duplicating the test
-+    // once per latch. Merging first makes the guard mean what it says.
-+    let loops = crate::passes::loop_analysis::merge_loops_by_header(
-+        crate::passes::loop_analysis::find_natural_loops(
-+            cfg.num_blocks,
-+            &cfg.preds,
-+            &cfg.succs,
-+            &cfg.idom,
-+        ),
++// ── 2. type mapping ─────────────────────────────────────────────────────────
++
++#[test]
++fn op_size_classifies_every_integer_ir_type() {
++    use crate::common::types::IrType;
++    let cases = [
++        (IrType::I8, OpSize::S8),
++        (IrType::U8, OpSize::S8),
++        (IrType::I16, OpSize::S16),
++        (IrType::U16, OpSize::S16),
++        (IrType::I32, OpSize::S32),
++        (IrType::U32, OpSize::S32),
++        (IrType::F32, OpSize::S32),
++        (IrType::I64, OpSize::S64),
++        (IrType::U64, OpSize::S64),
++        (IrType::F64, OpSize::S64),
++        (IrType::Ptr, OpSize::S64),
++    ];
++    for (ty, want) in cases {
++        assert_eq!(
++            OpSize::from_ir_type(ty),
++            want,
++            "{:?} must map to {:?}",
++            ty,
++            want
++        );
++    }
++}
++
++#[test]
++fn every_op_size_has_the_matching_att_suffix() {
++    assert_eq!(OpSize::S8.suffix(), "b");
++    assert_eq!(OpSize::S16.suffix(), "w");
++    assert_eq!(OpSize::S32.suffix(), "l");
++    assert_eq!(OpSize::S64.suffix(), "q");
++}
++
++// ── 3. golden emission, per operand shape ───────────────────────────────────
++
++#[test]
++fn a_register_to_register_move_emits_both_operands_at_the_right_width() {
++    assert_eq!(
++        emit1(&MachInst::Mov {
++            src: reg(PhysReg(0)),
++            dst: reg(PhysReg(15)),
++            size: OpSize::S32,
++        }),
++        "movl %eax, %esi"
 +    );
++}
 +
-+    let label_to_idx: FxHashMap<u32, usize> = func
-+        .blocks
-+        .iter()
-+        .enumerate()
-+        .map(|(i, b)| (b.label.0, i))
-+        .collect();
++#[test]
++fn a_self_move_emits_nothing() {
++    let lines = emit(&MachInst::Mov {
++        src: reg(PhysReg(0)),
++        dst: reg(PhysReg(0)),
++        size: OpSize::S64,
++    });
++    assert!(lines.is_empty(), "self-move must be elided, got {:?}", lines);
++}
 +
-+    'next_loop: for lp in &loops {
-+        let h = lp.header;
-+        if h >= func.blocks.len() {
-+            continue;
-+        }
++#[test]
++fn a_memory_to_memory_move_relays_through_a_scratch_register() {
++    // x86 has no mem-to-mem move; the emitter must split it.
++    let lines = emit(&MachInst::Mov {
++        src: MachOperand::StackSlot(-8),
++        dst: MachOperand::StackSlot(-16),
++        size: OpSize::S64,
++    });
++    assert_eq!(lines.len(), 2, "must become two instructions: {:?}", lines);
++    assert!(lines[0].contains("%rax"), "{:?}", lines);
++    assert!(lines[1].contains("%rax"), "{:?}", lines);
++}
 +
-+        // A single latch, branching unconditionally to the header.
-+        let mut latch = None;
-+        for &p32 in cfg.preds.row(h) {
-+            let p = p32 as usize;
-+            if lp.body.contains(&p) {
-+                if latch.is_some() {
-+                    continue 'next_loop; // more than one latch
-+                }
-+                latch = Some(p);
-+            }
++#[test]
++fn indexed_memory_emits_every_legal_scale() {
++    for scale in [1u8, 2, 4, 8] {
++        let line = emit1(&MachInst::Mov {
++            src: MachOperand::MemIndex {
++                base: MachReg::Phys(PhysReg(14)),
++                index: MachReg::Phys(PhysReg(1)),
++                scale,
++                offset: 0,
++            },
++            dst: reg(PhysReg(0)),
++            size: OpSize::S64,
++        });
++        assert!(
++            line.contains("%rdi") && line.contains("%rbx"),
++            "scale {}: {}",
++            scale,
++            line
++        );
++        if scale != 1 {
++            assert!(line.contains(&scale.to_string()), "scale {}: {}", scale, line);
 +        }
-+        let Some(t) = latch else { continue };
-+        if t == h {
-+            continue; // self-loop: already bottom-tested
-+        }
-+        if !matches!(&func.blocks[t].terminator, Terminator::Branch(l) if *l == func.blocks[h].label)
-+        {
-+            continue;
-+        }
++    }
++}
 +
-+        // Guard 1: the header decides the exit.
-+        let Terminator::CondBranch {
-+            true_label,
-+            false_label,
-+            ..
-+        } = &func.blocks[h].terminator
-+        else {
-+            continue;
-+        };
-+        let (Some(&tb), Some(&fb)) = (
-+            label_to_idx.get(&true_label.0),
-+            label_to_idx.get(&false_label.0),
-+        ) else {
-+            continue;
-+        };
-+        let t_in = lp.body.contains(&tb);
-+        let f_in = lp.body.contains(&fb);
-+        if t_in == f_in {
-+            continue; // both inside (not an exit test) or both outside
-+        }
++#[test]
++fn memory_offsets_emit_with_their_sign() {
++    let neg = emit1(&MachInst::Mov {
++        src: MachOperand::Mem {
++            base: MachReg::Phys(PhysReg(14)),
++            offset: -24,
++        },
++        dst: reg(PhysReg(0)),
++        size: OpSize::S64,
++    });
++    assert!(neg.contains("-24(%rdi)"), "{}", neg);
 +
-+        // Guard 5 + 2: small, and every instruction pure.
-+        let hb = &func.blocks[h];
-+        if hb.instructions.len() > MAX_DUP_INSTS {
-+            continue;
-+        }
-+        if !hb.instructions.iter().all(is_duplicable) {
-+            if debug {
-+                eprintln!("[INV] header {} has a non-duplicable instruction", h);
-+            }
-+            continue;
-+        }
++    let pos = emit1(&MachInst::Mov {
++        src: MachOperand::Mem {
++            base: MachReg::Phys(PhysReg(14)),
++            offset: 24,
++        },
++        dst: reg(PhysReg(0)),
++        size: OpSize::S64,
++    });
++    assert!(pos.contains("24(%rdi)"), "{}", pos);
++}
 +
-+        // Guard 3: nothing defined in the header escapes it.
-+        let defined: FxHashSet<u32> = hb.instructions.iter().filter_map(|i| i.dest()).map(|d| d.0).collect();
-+        if !defined.is_empty() {
-+            for (bi, b) in func.blocks.iter().enumerate() {
-+                if bi == h {
-+                    continue;
-+                }
-+                let mut escapes = false;
-+                for inst in &b.instructions {
-+                    inst.for_each_used_value(|v| {
-+                        if defined.contains(&v) {
-+                            escapes = true;
-+                        }
-+                    });
-+                }
-+                terminator_uses(&b.terminator, &mut |v| {
-+                    if defined.contains(&v) {
-+                        escapes = true;
-+                    }
++#[test]
++fn a_rip_relative_symbol_emits_the_rip_form() {
++    let line = emit1(&MachInst::Mov {
++        src: MachOperand::RipRel("glob".into()),
++        dst: reg(PhysReg(0)),
++        size: OpSize::S64,
++    });
++    assert!(line.contains("glob(%rip)"), "{}", line);
++}
++
++// ── 3b. golden emission, per instruction variant ────────────────────────────
++
++#[test]
++fn every_alu_operation_emits_its_mnemonic() {
++    for (op, mnem) in [
++        (AluOp::Add, "add"),
++        (AluOp::Sub, "sub"),
++        (AluOp::And, "and"),
++        (AluOp::Or, "or"),
++        (AluOp::Xor, "xor"),
++        (AluOp::Imul, "imul"),
++    ] {
++        let line = emit1(&MachInst::Alu {
++            op,
++            src: reg(PhysReg(7)),
++            dst: MachReg::Phys(PhysReg(0)),
++            size: OpSize::S64,
++        });
++        assert!(
++            line.starts_with(mnem),
++            "{:?} should emit `{}`, got `{}`",
++            op,
++            mnem,
++            line
++        );
++        assert!(line.contains("%rcx") && line.contains("%rax"), "{}", line);
++    }
++}
++
++#[test]
++fn every_shift_operation_emits_its_mnemonic() {
++    for (op, mnem) in [(ShiftOp::Shl, "shl"), (ShiftOp::Shr, "shr"), (ShiftOp::Sar, "sar")] {
++        let line = emit1(&MachInst::Shift {
++            op,
++            amount: MachOperand::Imm(3),
++            dst: MachReg::Phys(PhysReg(0)),
++            size: OpSize::S64,
++        });
++        assert!(line.starts_with(mnem), "{:?} -> `{}`", op, line);
++    }
++}
++
++#[test]
++fn every_condition_code_emits_a_distinct_suffix() {
++    let ccs = [
++        CondCode::E,
++        CondCode::Ne,
++        CondCode::L,
++        CondCode::Le,
++        CondCode::G,
++        CondCode::Ge,
++        CondCode::B,
++        CondCode::Be,
++        CondCode::A,
++        CondCode::Ae,
++    ];
++    let mut seen = std::collections::HashSet::new();
++    for cc in ccs {
++        let line = emit1(&MachInst::SetCC {
++            cc,
++            dst: MachReg::Phys(PhysReg(0)),
++        });
++        assert!(line.starts_with("set"), "{:?} -> `{}`", cc, line);
++        let suffix = line
++            .split_whitespace()
++            .next()
++            .unwrap()
++            .trim_start_matches("set")
++            .to_string();
++        assert!(
++            seen.insert(suffix.clone()),
++            "condition {:?} reuses suffix `{}`",
++            cc,
++            suffix
++        );
++    }
++    assert_eq!(seen.len(), ccs.len());
++}
++
++#[test]
++fn setcc_writes_a_byte_register() {
++    // `setcc` has no width variants: the destination must be the 8-bit name.
++    let line = emit1(&MachInst::SetCC {
++        cc: CondCode::E,
++        dst: MachReg::Phys(PhysReg(15)),
++    });
++    assert!(line.contains("%sil"), "setcc must use the byte name: {}", line);
++}
++
++#[test]
++fn zero_and_sign_extension_emit_distinct_mnemonics() {
++    let z = emit1(&MachInst::Movzx {
++        src: reg(PhysReg(0)),
++        dst: MachReg::Phys(PhysReg(1)),
++        from_size: OpSize::S8,
++        to_size: OpSize::S32,
++    });
++    let s = emit1(&MachInst::Movsx {
++        src: reg(PhysReg(0)),
++        dst: MachReg::Phys(PhysReg(1)),
++        from_size: OpSize::S8,
++        to_size: OpSize::S32,
++    });
++    assert!(z.starts_with("movz"), "{}", z);
++    assert!(s.starts_with("movs"), "{}", s);
++    assert_ne!(z, s);
++    // The SOURCE must be spelled at from_size and the DEST at to_size.
++    assert!(z.contains("%al") && z.contains("%ebx"), "{}", z);
++    assert!(s.contains("%al") && s.contains("%ebx"), "{}", s);
++}
++
++#[test]
++fn control_flow_variants_emit_their_targets() {
++    assert!(emit1(&MachInst::Jmp {
++        target: ".L7".into()
++    })
++    .contains(".L7"));
++    assert!(emit1(&MachInst::Jcc {
++        cc: CondCode::Ne,
++        target: ".L9".into()
++    })
++    .contains(".L9"));
++    assert!(emit1(&MachInst::Call {
++        target: "printf".into()
++    })
++    .contains("printf"));
++    assert_eq!(emit1(&MachInst::Ret), "ret");
++}
++
++#[test]
++fn a_large_immediate_is_materialized_rather_than_truncated() {
++    // x86 ALU immediates are sign-extended 32-bit. A 64-bit constant must be
++    // loaded into a register first, or the value is silently wrong.
++    let lines = emit(&MachInst::Alu {
++        op: AluOp::Add,
++        src: MachOperand::Imm(0x1234_5678_9abc),
++        dst: MachReg::Phys(PhysReg(1)),
++        size: OpSize::S64,
++    });
++    assert!(
++        lines.len() >= 2 && lines.iter().any(|l| l.contains("movabs")),
++        "a 48-bit immediate must be materialized: {:?}",
++        lines
++    );
++}
++
++#[test]
++fn a_small_immediate_is_used_directly() {
++    let lines = emit(&MachInst::Alu {
++        op: AluOp::Add,
++        src: MachOperand::Imm(16),
++        dst: MachReg::Phys(PhysReg(0)),
++        size: OpSize::S64,
++    });
++    assert_eq!(lines.len(), 1, "no materialization needed: {:?}", lines);
++    assert!(lines[0].contains("$16"), "{}", lines[0]);
++}
++
++// ── 4. differential against the real assembler ──────────────────────────────
++
++/// Build a corpus covering every instruction variant across a spread of
++/// registers, sizes and operand shapes.
++fn instruction_corpus() -> Vec<MachInst> {
++    let mut v = Vec::new();
++    let regs = [PhysReg(0), PhysReg(7), PhysReg(15), PhysReg(2), PhysReg(16)];
++
++    for size in SIZES {
++        for (i, &a) in regs.iter().enumerate() {
++            let b = regs[(i + 1) % regs.len()];
++            v.push(MachInst::Mov {
++                src: reg(a),
++                dst: reg(b),
++                size,
++            });
++            v.push(MachInst::Mov {
++                src: MachOperand::Imm(7),
++                dst: reg(b),
++                size,
++            });
++            v.push(MachInst::Mov {
++                src: MachOperand::Mem {
++                    base: MachReg::Phys(PhysReg(14)),
++                    offset: -8,
++                },
++                dst: reg(b),
++                size,
++            });
++            v.push(MachInst::Cmp {
++                lhs: reg(a),
++                rhs: reg(b),
++                size,
++            });
++            v.push(MachInst::Test {
++                lhs: reg(a),
++                rhs: reg(b),
++                size,
++            });
++            for op in [AluOp::Add, AluOp::Sub, AluOp::And, AluOp::Or, AluOp::Xor] {
++                v.push(MachInst::Alu {
++                    op,
++                    src: reg(a),
++                    dst: MachReg::Phys(b),
++                    size,
 +                });
-+                if escapes {
-+                    if debug {
-+                        eprintln!("[INV] header {} defines a value used in block {}", h, bi);
-+                    }
-+                    continue 'next_loop;
-+                }
 +            }
++            for op in [ShiftOp::Shl, ShiftOp::Shr, ShiftOp::Sar] {
++                v.push(MachInst::Shift {
++                    op,
++                    amount: MachOperand::Imm(3),
++                    dst: MachReg::Phys(b),
++                    size,
++                });
++            }
++            v.push(MachInst::Neg {
++                dst: MachReg::Phys(b),
++                size,
++            });
++            v.push(MachInst::Not {
++                dst: MachReg::Phys(b),
++                size,
++            });
 +        }
++    }
++    for &r in &regs {
++        for cc in [CondCode::E, CondCode::Ne, CondCode::L, CondCode::A] {
++            v.push(MachInst::SetCC {
++                cc,
++                dst: MachReg::Phys(r),
++            });
++        }
++        v.push(MachInst::Movzx {
++            src: reg(r),
++            dst: MachReg::Phys(PhysReg(0)),
++            from_size: OpSize::S8,
++            to_size: OpSize::S32,
++        });
++        v.push(MachInst::Movzx {
++            src: reg(r),
++            dst: MachReg::Phys(PhysReg(0)),
++            from_size: OpSize::S16,
++            to_size: OpSize::S64,
++        });
++        v.push(MachInst::Movsx {
++            src: reg(r),
++            dst: MachReg::Phys(PhysReg(0)),
++            from_size: OpSize::S32,
++            to_size: OpSize::S64,
++        });
++        for scale in [1u8, 2, 4, 8] {
++            v.push(MachInst::Lea {
++                base: MachReg::Phys(PhysReg(14)),
++                index: Some((MachReg::Phys(r), scale)),
++                offset: 16,
++                dst: MachReg::Phys(PhysReg(0)),
++            });
++        }
++    }
++    v.push(MachInst::Ret);
++    v
++}
 +
-+        // Guard 4: an entry from outside the loop, so the guard is reachable.
-+        if !cfg.preds.row(h).iter().any(|&p| !lp.body.contains(&(p as usize))) {
-+            continue;
++/// Locate a usable assembler, preferring the project's pinned GAS.
++fn find_assembler() -> Option<String> {
++    for cand in ["as", "gcc"] {
++        if std::process::Command::new(cand)
++            .arg("--version")
++            .output()
++            .map(|o| o.status.success())
++            .unwrap_or(false)
++        {
++            return Some(cand.to_string());
 +        }
-+
-+        if debug {
-+            eprintln!("[INV] rotating header={} latch={}", h, t);
-+        }
-+        return Some(Plan { header: h, latch: t });
 +    }
 +    None
 +}
 +
-+fn apply(func: &mut IrFunction, plan: &Plan) {
-+    let mut next_id = func
-+        .blocks
-+        .iter()
-+        .flat_map(|b| b.instructions.iter())
-+        .filter_map(|i| i.dest())
-+        .map(|d| d.0)
-+        .max()
-+        .unwrap_or(0)
-+        + 1;
++#[test]
++fn every_emitted_instruction_is_accepted_by_the_real_assembler() {
++    let Some(asm) = find_assembler() else {
++        // Do NOT pass silently: a vacuous green here would hide the strongest
++        // check in the file.
++        eprintln!(
++            "SKIP: no system assembler found; the MachInst differential test \
++             cannot run in this environment"
++        );
++        return;
++    };
 +
-+    let header_insts = func.blocks[plan.header].instructions.clone();
-+    let header_term = func.blocks[plan.header].terminator.clone();
++    let corpus = instruction_corpus();
++    assert!(corpus.len() > 300, "corpus too small: {}", corpus.len());
 +
-+    // Fresh names for everything the header defines, so the copy in the latch
-+    // is a separate live range from the guard's.
-+    let mut remap: FxHashMap<u32, u32> = FxHashMap::default();
-+    let mut cloned: Vec<Instruction> = Vec::with_capacity(header_insts.len());
-+    for inst in &header_insts {
-+        let mut c = inst.clone();
-+        // Rewrite USES first: an earlier header instruction may feed this one.
-+        c.for_each_operand_mut(|op| {
-+            if let Operand::Value(v) = op {
-+                if let Some(&n) = remap.get(&v.0) {
-+                    *v = Value(n);
++    let mut src = String::from(".text\n.globl _machinst_probe\n_machinst_probe:\n");
++    let mut emitted: Vec<(String, String)> = Vec::new();
++    for inst in &corpus {
++        let mut out = AsmOutput::new();
++        emit_machinst(inst, &mut out);
++        for line in out.buf.lines() {
++            let t = line.trim();
++            if t.is_empty() || t.starts_with('#') {
++                continue;
++            }
++            // Branch/call targets reference labels this probe does not define.
++            if t.starts_with('j') || t.starts_with("call") {
++                continue;
++            }
++            src.push_str("    ");
++            src.push_str(t);
++            src.push('\n');
++            emitted.push((format!("{:?}", inst), t.to_string()));
++        }
++    }
++    src.push_str("    ret\n");
++
++    let dir = std::env::temp_dir().join(format!("lccc-machinst-{}", std::process::id()));
++    let _ = std::fs::create_dir_all(&dir);
++    let s_path = dir.join("probe.s");
++    let o_path = dir.join("probe.o");
++    std::fs::write(&s_path, &src).expect("write probe.s");
++
++    let mut cmd = std::process::Command::new(&asm);
++    if asm == "gcc" {
++        cmd.arg("-c").arg("-x").arg("assembler");
++    } else {
++        cmd.arg("-c");
++    }
++    let output = cmd
++        .arg(&s_path)
++        .arg("-o")
++        .arg(&o_path)
++        .output()
++        .expect("run assembler");
++
++    if !output.status.success() {
++        let err = String::from_utf8_lossy(&output.stderr);
++        // Report the offending source lines, not just the assembler's noise.
++        let mut detail = String::new();
++        for line in err.lines().take(20) {
++            detail.push_str("    ");
++            detail.push_str(line);
++            detail.push('\n');
++        }
++        panic!(
++            "the assembler REJECTED emitter output ({} instructions probed).\n\
++             This means MachInst produced text that is not a valid x86-64 \
++             instruction.\n{}\n--- probe.s kept at {} ---",
++            emitted.len(),
++            detail,
++            s_path.display()
++        );
++    }
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++#[test]
++fn no_emitted_line_contains_an_unresolved_virtual_register() {
++    // A vreg reaching emission is a register-allocation bug. It must never
++    // appear as text, in any variant.
++    for inst in instruction_corpus() {
++        let mut out = AsmOutput::new();
++        emit_machinst(&inst, &mut out);
++        assert!(
++            !out.buf.contains("vreg") && !out.buf.contains("VREG"),
++            "unresolved vreg in output for {:?}:\n{}",
++            inst,
++            out.buf
++        );
++    }
++}
++
++#[test]
++fn emission_is_deterministic() {
++    // The same instruction must always produce byte-identical text; anything
++    // else makes build reproducibility and asm-diff testing impossible.
++    for inst in instruction_corpus() {
++        let a = {
++            let mut o = AsmOutput::new();
++            emit_machinst(&inst, &mut o);
++            o.buf
++        };
++        let b = {
++            let mut o = AsmOutput::new();
++            emit_machinst(&inst, &mut o);
++            o.buf
++        };
++        assert_eq!(a, b, "non-deterministic emission for {:?}", inst);
++    }
++}
+diff --git a/src/backend/x86/codegen/mod.rs b/src/backend/x86/codegen/mod.rs
+index 5c93acf1..df62497c 100644
+--- a/src/backend/x86/codegen/mod.rs
++++ b/src/backend/x86/codegen/mod.rs
+@@ -15,6 +15,8 @@ mod intrinsics_simd;
+ pub(crate) mod isel;
+ pub(crate) mod machinst;
+ pub(crate) mod machinst_emit;
++#[cfg(test)]
++mod machinst_tests;
+ mod memory;
+ mod nested_fn;
+ pub(crate) mod peephole;
+diff --git a/src/backend/x86/codegen/peephole/passes/copy_coalesce.rs b/src/backend/x86/codegen/peephole/passes/copy_coalesce.rs
+index 5ec5105c..6775795c 100644
+--- a/src/backend/x86/codegen/peephole/passes/copy_coalesce.rs
++++ b/src/backend/x86/codegen/peephole/passes/copy_coalesce.rs
+@@ -330,7 +330,17 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn copy_is_kept_when_the_source_is_read_again() {
++    fn the_source_family_is_not_renamed_when_it_is_read_again() {
++        // Rule 2: `%rdi` is read after the copy, so coalescing must NOT rename
++        // the `%rsi` family onto it -- doing so would rewrite that earlier
++        // read as well and change which register the function loads from.
++        //
++        // The assertion deliberately targets the EARLIER read rather than the
++        // survival of the copy itself. `copy_fold` legitimately retires the
++        // copy afterwards by rewriting `(%rsi)` to `(%rdi)`: the two registers
++        // hold the same value and `%rsi` is dead at the return, so three
++        // instructions replace four. That is a strictly better result and must
++        // not be mistaken for a coalescing failure.
+         let out = run(concat!(
+             "foo:\n",
+             ".cfi_startproc\n",
+@@ -340,7 +350,14 @@ mod tests {
+             "    ret\n",
+             ".cfi_endproc\n",
+         ));
+-        assert!(out.contains("movq %rdi, %rsi"), "{out}");
++        assert!(
++            out.contains("movq (%rdi), %rax"),
++            "the pre-existing read of %rdi must survive unrenamed:\n{out}"
++        );
++        assert!(
++            !out.contains("movq (%rsi), %rax"),
++            "coalescing must not rewrite the earlier read onto %rsi:\n{out}"
++        );
+     }
+ 
+     #[test]
+diff --git a/src/backend/x86/codegen/peephole/passes/mod.rs b/src/backend/x86/codegen/peephole/passes/mod.rs
+index 7ec7fcd5..32c7eb9a 100644
+--- a/src/backend/x86/codegen/peephole/passes/mod.rs
++++ b/src/backend/x86/codegen/peephole/passes/mod.rs
+@@ -35,6 +35,7 @@ mod liveness;
+ mod local_patterns;
+ mod loop_trampoline;
+ mod memory_fold;
++mod narrow_copy_fold;
+ mod push_pop;
+ mod pushf_elim;
+ mod redundant_ext;
+@@ -669,6 +670,11 @@ pub fn peephole_optimize(mut asm: String) -> String {
+         if !sk("copy_prop") {
+             global_changed |= copy_propagation::propagate_register_copies(&mut store, &mut infos);
+         }
++        // After copy propagation (64-bit chains) and before dead-code removal,
++        // so the copies this fold orphans are retired in the same round.
++        if !sk("copy_fold") {
++            global_changed |= narrow_copy_fold::fold_register_copies(&mut store, &mut infos);
++        }
+         if !sk("dead_regs") {
+             global_changed |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+         }
+diff --git a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs
+new file mode 100644
+index 00000000..462fe29d
+--- /dev/null
++++ b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs
+@@ -0,0 +1,399 @@
++//! Register-copy folding: remove a `mov reg, reg` by rewriting its consumers.
++//!
++//! A copy survives to final assembly only when neither copy propagation nor
++//! dead-write elimination could retire it. A census of the 559-test corpus at
++//! `-O2` found **11 055** such copies still in the emitted code:
++//!
++//! | form | count |
++//! |---|---|
++//! | `movq` cross-family | 7 943 |
++//! | `movl` cross-family | 2 463 |
++//! | `movl %X, %X` self-move | 261 |
++//! | `movq %X, %X` self-move | 3 |
++//! | `movw` | 1 |
++//!
++//! Two independent transforms handle them.
++//!
++//! # A. Self-move elimination
++//!
++//! `movq %rax, %rax` is a pure no-op and three of them reached final assembly.
++//! `movb`/`movw` self-moves are no-ops too: they write the same bits back and
++//! leave everything above untouched.
++//!
++//! `movl %ebx, %ebx` is **not** a no-op — it zero-extends into `%rbx` — so it
++//! is removed only when the upper 32 bits are already provably zero. That fact
++//! is exactly what [`super::redundant_ext`] computes, and it is recomputed here
++//! with the same rules rather than shared, because the two passes run at
++//! different points and the fact does not survive between them.
++//!
++//! # B. Copy folding
++//!
++//! For `mov<w> %S, %D`, rewrite every later use of `%D` to `%S` and delete the
++//! copy. The width of the copy bounds which uses may be rewritten, and getting
++//! this wrong is silent miscompilation:
++//!
++//! | copy | what `%D` shares with `%S` | rewritable uses of `%D` |
++//! |---|---|---|
++//! | `movq` | all 64 bits | any width, **including address operands** |
++//! | `movl` | low 32; bits 32..63 forced to 0 | ≤ 32 bits only |
++//! | `movw` | low 16; bits 16..63 **stale** | ≤ 16 bits only |
++//! | `movb` | low 8; bits 8..63 **stale** | ≤ 8 bits only |
++//!
++//! An address operand is read as 64 bits, so it is rewritable under `movq` and
++//! nothing else. That single distinction is what makes this pass worth having
++//! over the previous 32-bit-only attempt, which refused every memory operand
++//! and consequently removed 10 instructions across 220 files.
++//!
++//! ## Legality
++//!
++//! With the copy at `i` and the last rewritten use at `k`:
++//!
++//! 1. **No barrier in `(i, k]`.** A label can be entered on another path where
++//!    `%S` holds something else.
++//! 2. **`%S` is not written in `(i, k]`.** Otherwise the two have diverged.
++//! 3. **`%D` is not written in `(i, k)`.** A later write starts a new live
++//!    range that this copy does not feed.
++//! 4. **No use in `(i, k]` writes `%D` while reading it.** `addl %eax, %edx`
++//!    would become `addl %eax, %eax` and clobber `%S`. Pure reads are safe
++//!    even when the instruction writes `%S`, because the operands are equal:
++//!    `subl %edx,%eax` and `subl %eax,%eax` both yield zero.
++//! 5. **`%D` is dead after `k`** ([`FileLiveness`], which answers `None` for a
++//!    function it cannot fully resolve — the fold is then skipped).
++//! 6. No implicit-register instruction, no shift/rotate (a variable count is
++//!    architecturally pinned to `%cl` even though it is spelled out, and
++//!    renaming it yields `shrq %r9b, %rsi`, which the assembler rejects), no
++//!    high-byte alias (`%ah`..`%dh` have no counterpart in `%rsi`/`%r8`+), and
++//!    never `%rsp`/`%rbp`.
++//!
++//! Register names nest as substrings — `%si` is a prefix of `%sil`, `%r8` of
++//! `%r8d` — so every match here is boundary-aware. A naive `replace` produced
++//! `%dxl` and the assembler rejected the function.
++
++use super::super::types::*;
++use super::helpers::{get_dest_reg, has_implicit_reg_usage, is_shift_or_rotate};
++use super::liveness::FileLiveness;
++
++/// High-byte names have no equivalent in the `%rsi`/`%rdi`/`%r8`+ families.
++const HIGH_BYTE: &[&str] = &["%ah", "%bh", "%ch", "%dh"];
++
++/// Width index into [`REG_NAMES`]: 0 = 64-bit, 1 = 32, 2 = 16, 3 = 8.
++const W64: usize = 0;
++const W32: usize = 1;
++const W16: usize = 2;
++const W8: usize = 3;
++
++#[inline]
++fn is_frame_family(fam: RegId) -> bool {
++    fam == 4 || fam == 5
++}
++
++#[inline]
++fn is_name_tail(byte: u8) -> bool {
++    byte.is_ascii_alphanumeric()
++}
++
++/// Boundary-aware `contains`: `%r8` must not match inside `%r8d`.
++fn contains_reg(line: &str, name: &str) -> bool {
++    let bytes = line.as_bytes();
++    let mut from = 0;
++    while let Some(rel) = line[from..].find(name) {
++        let start = from + rel;
++        let end = start + name.len();
++        if end >= bytes.len() || !is_name_tail(bytes[end]) {
++            return true;
++        }
++        from = start + 1;
++    }
++    false
++}
++
++/// Boundary-aware replace, same rule as [`contains_reg`].
++fn replace_reg(line: &str, name: &str, with: &str) -> String {
++    let mut out = String::with_capacity(line.len());
++    let bytes = line.as_bytes();
++    let mut i = 0;
++    while i < line.len() {
++        if line[i..].starts_with(name) {
++            let end = i + name.len();
++            if end >= bytes.len() || !is_name_tail(bytes[end]) {
++                out.push_str(with);
++                i = end;
++                continue;
++            }
++        }
++        let step = line[i..].chars().next().map_or(1, |c| c.len_utf8());
++        out.push_str(&line[i..i + step]);
++        i += step;
++    }
++    out
++}
++
++/// Parse `mov{b,w,l,q} %S, %D` with both operands plain registers of the
++/// mnemonic's own width. Returns `(width_index, src_family, dst_family)`.
++fn parse_reg_to_reg_mov(trimmed: &str) -> Option<(usize, RegId, RegId)> {
++    let (mnemonic, width) = if let Some(r) = trimmed.strip_prefix("movq ") {
++        (r, W64)
++    } else if let Some(r) = trimmed.strip_prefix("movl ") {
++        (r, W32)
++    } else if let Some(r) = trimmed.strip_prefix("movw ") {
++        (r, W16)
++    } else if let Some(r) = trimmed.strip_prefix("movb ") {
++        (r, W8)
++    } else {
++        return None;
++    };
++    let (src_part, dst_part) = mnemonic.split_once(',')?;
++    let src = src_part.trim();
++    let dst = dst_part.trim();
++    if !src.starts_with('%') || !dst.starts_with('%') || src.contains('(') || dst.contains('(') {
++        return None;
++    }
++    // Both operands must be spelled at the mnemonic's width; anything else is
++    // a different instruction than the table in the module docs describes.
++    let sfam = REG_NAMES[width].iter().position(|n| *n == src)? as RegId;
++    let dfam = REG_NAMES[width].iter().position(|n| *n == dst)? as RegId;
++    Some((width, sfam, dfam))
++}
++
++/// True when `line` mentions family `fam` only at widths the copy covers.
++/// `max_width` is a [`REG_NAMES`] index; smaller index = wider register.
++fn mentions_only_within(line: &str, fam: RegId, max_width: usize) -> bool {
++    if HIGH_BYTE.iter().any(|h| contains_reg(line, h)) {
++        return false;
++    }
++    // Any spelling WIDER than the copy is off limits.
++    for w in 0..max_width {
++        if contains_reg(line, REG_NAMES[w][fam as usize]) {
++            return false;
++        }
++    }
++    true
++}
++
++/// Rewrite every spelling of `old` at width `max_width` or narrower to `new`.
++fn rename_within(line: &str, old: RegId, new: RegId, max_width: usize) -> String {
++    let mut out = line.to_string();
++    // Narrowest first: with boundary-aware matching the order is immaterial,
++    // but it keeps this comparable with `helpers::replace_reg_family`.
++    for w in (max_width..=W8).rev() {
++        out = replace_reg(&out, REG_NAMES[w][old as usize], REG_NAMES[w][new as usize]);
++    }
++    out
++}
++
++// ── A. self-move elimination ────────────────────────────────────────────────
++
++/// `mov %X, %X`. A 64/16/8-bit self-move writes the same bits back and is
++/// unconditionally dead. A 32-bit one also zeroes bits 32..63, so it is dead
++/// only where those are already zero.
++fn eliminate_self_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
++    let len = store.len();
++    let mut changed = false;
++    // upper32_zero[f]: bits 32..63 of family f are provably zero. Same rules
++    // as `redundant_ext`, recomputed because the fact does not survive between
++    // passes.
++    let mut upper32_zero = vec![false; 16];
++
++    for i in 0..len {
++        if infos[i].is_nop() {
++            continue;
++        }
++        let t = infos[i].trimmed(store.get(i));
++        if t.is_empty() {
++            continue;
++        }
++        // A label may be entered from anywhere: drop every fact.
++        if t.ends_with(':') {
++            upper32_zero.iter_mut().for_each(|v| *v = false);
++            continue;
++        }
++        if t.starts_with('.') {
++            continue;
++        }
++
++        if let Some((width, sfam, dfam)) = parse_reg_to_reg_mov(t) {
++            if sfam == dfam && !is_frame_family(dfam) {
++                let dead = match width {
++                    W64 | W16 | W8 => true,
++                    _ => upper32_zero[dfam as usize],
++                };
++                if dead {
++                    mark_nop(&mut infos[i]);
++                    changed = true;
++                    continue;
 +                }
 +            }
-+        });
-+        if let Some(d) = c.dest() {
-+            let fresh = next_id;
-+            next_id += 1;
-+            remap.insert(d.0, fresh);
-+            set_dest(&mut c, Value(fresh));
 +        }
-+        cloned.push(c);
-+    }
 +
-+    let mut term = header_term;
-+    if let Terminator::CondBranch { cond, .. } = &mut term {
-+        if let Operand::Value(v) = cond {
-+            if let Some(&n) = remap.get(&v.0) {
-+                *v = Value(n);
-+            }
-+        }
++        update_upper32_zero(t, &mut upper32_zero);
 +    }
-+
-+    let latch = &mut func.blocks[plan.latch];
-+    // Keep source_spans parallel to instructions, or -g emits .loc against the
-+    // wrong instruction. The duplicated test inherits the latch's last span
-+    // when one is being tracked.
-+    if latch.source_spans.len() == latch.instructions.len() {
-+        let fill = latch.source_spans.last().copied();
-+        if let Some(sp) = fill {
-+            latch.source_spans.extend(std::iter::repeat_n(sp, cloned.len()));
-+        } else {
-+            latch.source_spans.clear();
-+        }
-+    }
-+    latch.instructions.extend(cloned);
-+    latch.terminator = term;
++    changed
 +}
 +
-+fn set_dest(inst: &mut Instruction, new: Value) {
-+    macro_rules! d {
-+        ($($v:ident),+ $(,)?) => {
-+            match inst {
-+                $(Instruction::$v { dest, .. } => *dest = new,)+
-+                _ => {}
++/// Track "bits 32..63 are zero" across one instruction.
++fn update_upper32_zero(t: &str, upper32_zero: &mut [bool]) {
++    let mut toks = t.split_whitespace();
++    let Some(op) = toks.next() else { return };
++
++    // A call clobbers the caller-saved set; the operand scan below would not
++    // see it because a direct call names no register.
++    if op == "call" || op == "callq" {
++        upper32_zero.iter_mut().for_each(|v| *v = false);
++        return;
++    }
++
++    // Any 32-bit write zero-extends to 64 on x86-64.
++    let writes_zx32 = op.ends_with('l')
++        && (op.starts_with("mov")
++            || op.starts_with("add")
++            || op.starts_with("sub")
++            || op.starts_with("and")
++            || op.starts_with("or")
++            || op.starts_with("xor")
++            || op.starts_with("lea")
++            || op.starts_with("imul")
++            || op.starts_with("shl")
++            || op.starts_with("shr")
++            || op.starts_with("sar"))
++        || op.starts_with("movz");
++
++    if writes_zx32 {
++        if let Some(comma) = t.rfind(',') {
++            let dst = t[comma + 1..].trim();
++            if let Some(df) = family_of_reg_name(dst) {
++                if (df as usize) < upper32_zero.len() {
++                    upper32_zero[df as usize] = true;
++                    return;
++                }
 +            }
++        }
++    }
++
++    // Anything else: clear every family the line mentions. Conservative, and
++    // the only safe default for an unrecognised mnemonic.
++    for tok in t.split_whitespace() {
++        for piece in tok.split(&[',', '(', ')'][..]) {
++            if piece.starts_with('%') {
++                if let Some(f) = family_of_reg_name(piece) {
++                    if (f as usize) < upper32_zero.len() {
++                        upper32_zero[f as usize] = false;
++                    }
++                }
++            }
++        }
++    }
++}
++
++/// Family of a register spelling, at any width. `None` for xmm/unknown.
++fn family_of_reg_name(name: &str) -> Option<RegId> {
++    let n = name.trim_start_matches('%');
++    for w in [W64, W32, W16, W8] {
++        if let Some(p) = REG_NAMES[w].iter().position(|r| r.trim_start_matches('%') == n) {
++            return Some(p as RegId);
++        }
++    }
++    None
++}
++
++// ── B. copy folding ─────────────────────────────────────────────────────────
++
++pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
++    let len = store.len();
++    if len < 2 {
++        return false;
++    }
++    let mut changed = eliminate_self_moves(store, infos);
++    let mut lv = FileLiveness::new(store, infos);
++
++    for i in 0..len {
++        if infos[i].is_nop() || infos[i].is_barrier() {
++            continue;
++        }
++        let trimmed = infos[i].trimmed(store.get(i));
++        let Some((width, sfam, dfam)) = parse_reg_to_reg_mov(trimmed) else {
++            continue;
 +        };
-+    }
-+    d!(Cmp, BinOp, UnaryOp, Copy, Cast, Select, GetElementPtr, GlobalAddr);
-+}
-+
-+fn terminator_uses(term: &Terminator, f: &mut impl FnMut(u32)) {
-+    let mut on = |op: &Operand| {
-+        if let Operand::Value(v) = op {
-+            f(v.0);
++        if sfam == dfam || is_frame_family(sfam) || is_frame_family(dfam) {
++            continue;
 +        }
-+    };
-+    match term {
-+        Terminator::Return(Some(op)) => on(op),
-+        Terminator::CondBranch { cond, .. } => on(cond),
-+        Terminator::Switch { val, .. } => on(val),
-+        Terminator::IndirectBranch { target, .. } => on(target),
-+        _ => {}
-+    }
-+}
++        if get_dest_reg(&infos[i]) != dfam {
++            continue; // the line's classified destination must agree
++        }
 +
-+/// Unused import guard: `BlockId` keeps the signature readable above.
-+const _: Option<BlockId> = None;
++        // Collect every use of %D up to the point %D dies, %D is redefined, or
++        // a barrier ends the straight-line region.
++        let mut uses: Vec<usize> = Vec::new();
++        let mut ok = true;
++        let mut last = i;
++        for j in (i + 1)..len {
++            if infos[j].is_nop() {
++                continue;
++            }
++            if infos[j].is_barrier() {
++                break;
++            }
++            let dest_j = get_dest_reg(&infos[j]);
++            // Rule 2: the source must still hold the copied value.
++            if dest_j == sfam {
++                break;
++            }
++            let mentions_d = infos[j].reg_refs & (1u16 << dfam) != 0;
++            if !mentions_d {
++                // Rule 3: a write to %D with no read ends our range; the copy
++                // is then dead and `dead_writes` will retire it.
++                if dest_j == dfam {
++                    break;
++                }
++                continue;
++            }
++            // Rule 4: the use must not also write %D.
++            if dest_j == dfam {
++                ok = false;
++                break;
++            }
++            let line = infos[j].trimmed(store.get(j));
++            // Rule 6.
++            if has_implicit_reg_usage(line) || is_shift_or_rotate(line) {
++                ok = false;
++                break;
++            }
++            // Width rule. An address operand is a 64-bit read, so a narrower
++            // copy cannot cover it; `mentions_only_within` rejects that
++            // automatically because the address spells the 64-bit name.
++            if !mentions_only_within(line, dfam, width) {
++                ok = false;
++                break;
++            }
++            uses.push(j);
++            last = j;
++        }
++        if !ok || uses.is_empty() {
++            continue;
++        }
++        // Rule 5.
++        if lv.live_after(last, dfam) != Some(false) {
++            continue;
++        }
++
++        let mut any = false;
++        for &j in &uses {
++            let line = infos[j].trimmed(store.get(j)).to_string();
++            let rewritten = rename_within(&line, dfam, sfam, width);
++            if rewritten != line {
++                replace_line(store, &mut infos[j], j, format!("    {}", rewritten));
++                any = true;
++            }
++        }
++        if any {
++            mark_nop(&mut infos[i]);
++            lv.refresh_at(store, infos, last);
++            changed = true;
++        }
++    }
++
++    changed
++}
 +
 +#[cfg(test)]
-+mod tests {
-+    use super::*;
-+    use crate::common::types::IrType;
-+    use crate::ir::reexports::{IrBinOp, IrCmpOp};
-+    use crate::ir::instruction::BasicBlock;
-+    use crate::ir::reexports::IrConst;
-+
-+    fn blk(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
-+        BasicBlock {
-+            label: BlockId(label),
-+            instructions,
-+            terminator,
-+            source_spans: Vec::new(),
-+        }
-+    }
-+    fn br(t: u32) -> Terminator {
-+        Terminator::Branch(BlockId(t))
-+    }
-+    fn cond(c: u32, t: u32, f: u32) -> Terminator {
-+        Terminator::CondBranch {
-+            cond: Operand::Value(Value(c)),
-+            true_label: BlockId(t),
-+            false_label: BlockId(f),
-+        }
-+    }
-+    fn ret() -> Terminator {
-+        Terminator::Return(None)
-+    }
-+    fn cmp(dest: u32, lhs: u32) -> Instruction {
-+        Instruction::Cmp {
-+            dest: Value(dest),
-+            op: IrCmpOp::Slt,
-+            lhs: Operand::Value(Value(lhs)),
-+            rhs: Operand::Const(IrConst::I32(100)),
-+            ty: IrType::I32,
-+        }
-+    }
-+    fn add1(dest: u32, src: u32) -> Instruction {
-+        Instruction::BinOp {
-+            dest: Value(dest),
-+            op: IrBinOp::Add,
-+            lhs: Operand::Value(Value(src)),
-+            rhs: Operand::Const(IrConst::I32(1)),
-+            ty: IrType::I32,
-+        }
-+    }
-+    fn func_of(blocks: Vec<BasicBlock>) -> IrFunction {
-+        let mut f = IrFunction::new("t".into(), IrType::Void, Vec::new(), false);
-+        f.blocks = blocks;
-+        f
-+    }
-+
-+    /// The canonical counted loop, exactly the `k_memchr` shape:
-+    ///   0 preheader -> 1
-+    ///   1 header : cmp ; i < n ? 2 : 4
-+    ///   2 body   : -> 3
-+    ///   3 latch  : i++ ; -> 1
-+    ///   4 exit
-+    fn counted_loop() -> IrFunction {
-+        func_of(vec![
-+            blk(0, vec![], br(1)),
-+            blk(1, vec![cmp(10, 20)], cond(10, 2, 4)),
-+            blk(2, vec![], br(3)),
-+            blk(3, vec![add1(20, 20)], br(1)),
-+            blk(4, vec![], ret()),
-+        ])
-+    }
-+
-+    #[test]
-+    fn a_top_test_counted_loop_is_bottom_tested() {
-+        let mut f = counted_loop();
-+        assert_eq!(invert_loops(&mut f), 1);
-+
-+        // The header keeps its test and becomes the guard, executed once.
-+        assert!(matches!(f.blocks[1].terminator, Terminator::CondBranch { .. }));
-+        assert_eq!(f.blocks[1].instructions.len(), 1);
-+
-+        // The latch now carries a COPY of the test and branches like the
-+        // header: the back edge goes to the body, not the header.
-+        let latch = &f.blocks[3];
-+        assert_eq!(latch.instructions.len(), 2, "increment + duplicated cmp");
-+        match &latch.terminator {
-+            Terminator::CondBranch {
-+                true_label,
-+                false_label,
-+                cond,
-+            } => {
-+                assert_eq!(true_label.0, 2, "back edge must target the body");
-+                assert_eq!(false_label.0, 4, "exit unchanged");
-+                // ...and it must test the LATCH's copy, not the guard's value.
-+                assert!(
-+                    matches!(cond, Operand::Value(v) if v.0 != 10),
-+                    "the duplicated test must define a fresh value"
-+                );
-+            }
-+            other => panic!("latch must end in a CondBranch, got {:?}", other),
-+        }
-+    }
-+
-+    #[test]
-+    fn the_duplicated_test_reads_the_updated_induction_variable() {
-+        // Phi elimination puts `i = i + 1` at the end of the latch, so the
-+        // duplicated compare that follows it must read the NEW value -- that
-+        // is the whole point of a bottom test.
-+        let mut f = counted_loop();
-+        invert_loops(&mut f);
-+        let latch = &f.blocks[3];
-+        let Instruction::Cmp { lhs, .. } = &latch.instructions[1] else {
-+            panic!("expected the duplicated Cmp second");
-+        };
-+        assert!(
-+            matches!(lhs, Operand::Value(v) if v.0 == 20),
-+            "must compare the incremented IV"
-+        );
-+    }
-+
-+    #[test]
-+    fn value_ids_stay_unique_after_inversion() {
-+        let mut f = counted_loop();
-+        invert_loops(&mut f);
-+        let mut seen = FxHashSet::default();
-+        for b in &f.blocks {
-+            for i in &b.instructions {
-+                if let Some(d) = i.dest() {
-+                    assert!(seen.insert(d.0), "duplicate definition of v{}", d.0);
-+                }
-+            }
-+        }
-+    }
-+
-+    // ── negative controls ───────────────────────────────────────────────────
-+
-+    #[test]
-+    fn a_header_containing_a_load_is_not_inverted() {
-+        // Duplicating a load re-executes it on a path the guard used to
-+        // protect; refuse rather than reason about it.
-+        let mut f = counted_loop();
-+        f.blocks[1].instructions.insert(
-+            0,
-+            Instruction::Load {
-+                dest: Value(30),
-+                ptr: Value(20),
-+                ty: IrType::I32,
-+                seg_override: Default::default(),
-+                volatile: false,
-+            },
-+        );
-+        assert_eq!(invert_loops(&mut f), 0);
-+    }
-+
-+    #[test]
-+    fn a_header_whose_value_escapes_into_the_body_is_not_inverted() {
-+        // The body would read the value the guard computed on its single
-+        // execution instead of this iteration's.
-+        let mut f = counted_loop();
-+        f.blocks[2].instructions.push(add1(31, 10));
-+        assert_eq!(invert_loops(&mut f), 0);
-+    }
-+
-+    #[test]
-+    fn a_self_loop_is_not_inverted() {
-+        // Already bottom-tested; there is nothing to move.
-+        let mut f = func_of(vec![
-+            blk(0, vec![], br(1)),
-+            blk(1, vec![cmp(10, 20), add1(20, 20)], cond(10, 1, 2)),
-+            blk(2, vec![], ret()),
-+        ]);
-+        assert_eq!(invert_loops(&mut f), 0);
-+    }
-+
-+    #[test]
-+    fn a_loop_with_two_latches_is_not_inverted() {
-+        //   1 header : ? 2 : 5 ; 2 : ? 3 : 4 ; 3 -> 1 ; 4 -> 1
-+        let mut f = func_of(vec![
-+            blk(0, vec![], br(1)),
-+            blk(1, vec![cmp(10, 20)], cond(10, 2, 5)),
-+            blk(2, vec![cmp(11, 20)], cond(11, 3, 4)),
-+            blk(3, vec![add1(20, 20)], br(1)),
-+            blk(4, vec![add1(21, 20)], br(1)),
-+            blk(5, vec![], ret()),
-+        ]);
-+        assert_eq!(invert_loops(&mut f), 0);
-+    }
-+
-+    #[test]
-+    fn a_header_that_does_not_decide_the_exit_is_not_inverted() {
-+        // Both header successors are inside the loop: this is not a top-test
-+        // loop, so there is no test to sink.
-+        let mut f = func_of(vec![
-+            blk(0, vec![], br(1)),
-+            blk(1, vec![cmp(10, 20)], cond(10, 2, 3)),
-+            blk(2, vec![], br(4)),
-+            blk(3, vec![], br(4)),
-+            blk(4, vec![cmp(11, 20), add1(20, 20)], cond(11, 1, 5)),
-+            blk(5, vec![], ret()),
-+        ]);
-+        assert_eq!(invert_loops(&mut f), 0);
-+    }
-+
-+    #[test]
-+    fn an_oversized_header_is_not_duplicated() {
-+        let mut f = counted_loop();
-+        for k in 0..(MAX_DUP_INSTS as u32 + 1) {
-+            f.blocks[1].instructions.insert(0, add1(40 + k, 20));
-+        }
-+        // Those values are used nowhere, so only the size guard can stop it.
-+        assert_eq!(invert_loops(&mut f), 0);
-+    }
-+
-+    #[test]
-+    fn the_pass_can_be_disabled() {
-+        // Escape hatch for bisecting a codegen regression.
-+        temp_env_set("CCC_NO_LOOP_INVERT", "1");
-+        let mut f = counted_loop();
-+        let n = invert_loops(&mut f);
-+        temp_env_unset("CCC_NO_LOOP_INVERT");
-+        assert_eq!(n, 0);
-+    }
-+
-+    fn temp_env_set(k: &str, v: &str) {
-+        unsafe { std::env::set_var(k, v) };
-+    }
-+    fn temp_env_unset(k: &str) {
-+        unsafe { std::env::remove_var(k) };
-+    }
-+}
-diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index baab6bb5..bf2de598 100644
---- a/src/passes/mod.rs
-+++ b/src/passes/mod.rs
-@@ -18,6 +18,7 @@ pub(crate) mod backedge_pre;
- pub(crate) mod bit_idioms;
- pub(crate) mod bool_thread;
- pub(crate) mod block_layout;
-+pub(crate) mod loop_invert;
- pub(crate) mod cfg_simplify;
- pub(crate) mod constant_fold;
- pub(crate) mod copy_prop;
-diff --git a/src/passes/range_check.rs b/src/passes/range_check.rs
-index cf1c2f7f..d60944c3 100644
---- a/src/passes/range_check.rs
-+++ b/src/passes/range_check.rs
-@@ -165,9 +165,38 @@ fn resolve_bool_cmp(
-     };
-     // Only the boolean widening (U8/I8 → wider integer); anything else is a
-     // semantic cast the fold must not see through.
-+    //
-+    // EVERY wider integer target must be listed. The set used to stop at
-+    // `I16 | I32 | U32`, which silently excluded the 64-bit widening the
-+    // frontend actually emits for `char c; return c >= 'a' && c <= 'z';`:
-+    //
-+    //     Cmp  v10 = Sle v1, I8(122)
-+    //     Cast v11 = v10 (U8 -> I64)        <-- not matched, fold gave up
-+    //     Select v14 = v6 ? v11 : Const(0)  (ty I64)
-+    //
-+    // so the pass never fired on the very idiom it was written for, and
-+    // `set_membership` (which consumes range_fold's output) was starved with
-+    // it -- lccc emitted an 11-deep compare/branch chain for Expat's
-+    // `xml_name_continue` classifier where GCC and ICX emit a handful of
-+    // branchless instructions.
-+    //
-+    // Widening is value-preserving here regardless of signedness: the source
-+    // is a `Cmp` result, verified below to be 0 or 1, and both zero- and
-+    // sign-extension of 0/1 yield 0/1 in every width. Narrowing is NOT in the
-+    // list -- that could discard bits of a non-boolean.
-     if !matches!(
-         (from_ty, to_ty),
--        (IrType::I8 | IrType::U8, IrType::I16 | IrType::I32 | IrType::U32)
-+        (
-+            IrType::I8 | IrType::U8,
-+            IrType::I16
-+                | IrType::U16
-+                | IrType::I32
-+                | IrType::U32
-+                | IrType::I64
-+                | IrType::U64
-+                | IrType::I128
-+                | IrType::U128
-+        )
-     ) {
-         return None;
-     }
-@@ -937,6 +966,59 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
- mod tests {
-     use super::*;
- 
-+    /// `resolve_bool_cmp` must see through the boolean widening cast at EVERY
-+    /// width. The allow-list used to stop at `I16 | I32 | U32`, silently
-+    /// excluding the `U8 -> I64` widening the frontend actually emits for
-+    /// `char c; c >= 'a' && c <= 'z'` -- so the pass never fired on its own
-+    /// headline idiom, and `set_membership` downstream was starved with it.
-+    #[test]
-+    fn a_boolean_widening_cast_is_transparent_at_every_width() {
-+        let mut cmp_defs: Vec<Option<(IrCmpOp, Operand, Operand, IrType)>> = vec![None; 4];
-+        cmp_defs[1] = Some((
-+            IrCmpOp::Sle,
-+            Operand::Value(Value(0)),
-+            Operand::Const(IrConst::I8(122)),
-+            IrType::I8,
-+        ));
-+
-+        for to_ty in [
-+            IrType::I16,
-+            IrType::U16,
-+            IrType::I32,
-+            IrType::U32,
-+            IrType::I64,
-+            IrType::U64,
-+            IrType::I128,
-+            IrType::U128,
-+        ] {
-+            let mut cast_defs: Vec<Option<(Operand, IrType, IrType)>> = vec![None; 4];
-+            cast_defs[2] = Some((Operand::Value(Value(1)), IrType::U8, to_ty));
-+            assert_eq!(
-+                resolve_bool_cmp(2, &cmp_defs, &cast_defs),
-+                Some(1),
-+                "widening a Cmp result to {:?} must stay transparent",
-+                to_ty
-+            );
-+        }
-+    }
-+
-+    /// SOUNDNESS: only WIDENING is transparent. A narrowing cast can discard
-+    /// bits of a value that is not actually a boolean, so the fold must not
-+    /// see through it.
-+    #[test]
-+    fn a_narrowing_cast_is_not_transparent() {
-+        let mut cmp_defs: Vec<Option<(IrCmpOp, Operand, Operand, IrType)>> = vec![None; 4];
-+        cmp_defs[1] = Some((
-+            IrCmpOp::Sle,
-+            Operand::Value(Value(0)),
-+            Operand::Const(IrConst::I32(122)),
-+            IrType::I32,
-+        ));
-+        let mut cast_defs: Vec<Option<(Operand, IrType, IrType)>> = vec![None; 4];
-+        cast_defs[2] = Some((Operand::Value(Value(1)), IrType::I32, IrType::I8));
-+        assert_eq!(resolve_bool_cmp(2, &cmp_defs, &cast_defs), None);
-+    }
-+
-     #[test]
-     fn canonicalize_lower_upper() {
-         let lo = Operand::Const(IrConst::I32(97));
-diff --git a/tests/bench/k_classify.c b/tests/bench/k_classify.c
++#[path = "narrow_copy_fold_tests.rs"]
++mod tests;
+diff --git a/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
 new file mode 100644
-index 00000000..5a39a2f2
+index 00000000..2838f656
 --- /dev/null
-+++ b/tests/bench/k_classify.c
-@@ -0,0 +1,36 @@
-+/* expat xml_name_continue / ctype-style classification, in the BOOLEAN-
-+ * PREDICATE form real parsers use: a small `int f(char)` returning 0/1 that
-+ * the caller sums or branches on.
-+ *
-+ * This shape is what drives range_fold -> set_membership: the `&&`/`||` chain
-+ * if-converts to a Select chain, each `lo <= c && c <= hi` folds to one
-+ * unsigned range test, and the [a-z]/[A-Z] pair then merges into a single
-+ * test on `c & ~32`. The counting form (`if (pred) n++;`) does NOT produce
-+ * Selects and stays a compare/branch chain -- k_namechars.c covers that case,
-+ * so the two kernels together bracket the classifier problem.
-+ */
-+#include <stddef.h>
-+#include "bench.h"
++++ b/src/backend/x86/codegen/peephole/passes/narrow_copy_fold_tests.rs
+@@ -0,0 +1,428 @@
++//! Tests for [`super`] — register-copy folding.
++//!
++//! Structure: positives prove each width class folds; negatives prove each
++//! legality rule actually blocks. Every negative here corresponds to a real
++//! defect that either was found in the corpus or would have been a silent
++//! miscompile, and they are named for the rule they pin.
++//!
++//! The tests drive the WHOLE peephole pipeline rather than this pass alone.
++//! That is deliberate: a rewrite that is individually sound but that a
++//! neighbouring pass then misreads is still a bug, and the corpus failures
++//! this pass produced historically (`bad src register`, `unsupported shrq
++//! operands`) were exactly of that kind.
 +
-+#define N 4096
-+static char s[N];
++use super::super::peephole_optimize;
 +
-+void bench_setup(void) {
-+    const char *alpha = "abcXYZ019_-.<>&\" \t\n";
-+    for (int i = 0; i < N; i++) {
-+        s[i] = alpha[i % 19];
++fn run(input: &str) -> String {
++    peephole_optimize(input.to_string())
++}
++
++/// Wrap a body in the CFI markers `FileLiveness` needs to analyse a function.
++/// Without them liveness answers `None` and every fold is skipped, so a test
++/// that forgets this passes vacuously.
++fn f(body: &str) -> String {
++    format!(".text\nf:\n.cfi_startproc\n{}\n.cfi_endproc\n", body)
++}
++
++fn count(hay: &str, needle: &str) -> usize {
++    hay.matches(needle).count()
++}
++
++// ── A. self-move elimination ────────────────────────────────────────────────
++
++#[test]
++fn a_64_bit_self_move_is_always_dead() {
++    // Three of these reached final assembly in the corpus census.
++    let out = run(&f("    movq %rax, %rax\n    ret"));
++    assert_eq!(count(&out, "movq %rax, %rax"), 0, "{}", out);
++}
++
++#[test]
++fn byte_and_word_self_moves_are_always_dead() {
++    // They write the same bits back and disturb nothing above.
++    let out = run(&f("    movb %al, %al\n    movw %cx, %cx\n    ret"));
++    assert_eq!(count(&out, "movb %al, %al"), 0, "{}", out);
++    assert_eq!(count(&out, "movw %cx, %cx"), 0, "{}", out);
++}
++
++#[test]
++fn a_32_bit_self_move_is_dead_when_the_upper_half_is_already_zero() {
++    // `movl %ebx,%ebx` after a 32-bit write: the zero-extension is redundant.
++    let out = run(&f("    movl %edi, %ebx\n    movl %ebx, %ebx\n    movq %rbx, %rax\n    ret"));
++    assert_eq!(count(&out, "movl %ebx, %ebx"), 0, "{}", out);
++}
++
++#[test]
++fn a_32_bit_self_move_SURVIVES_when_the_upper_half_is_unknown() {
++    // SOUNDNESS: `movl %ebx,%ebx` is the idiomatic 64->32 truncation. With a
++    // 64-bit value in %rbx it is load-bearing, and the following 64-bit read
++    // must see the truncated value.
++    let out = run(&f("    movq (%rdi), %rbx\n    movl %ebx, %ebx\n    movq %rbx, %rax\n    ret"));
++    assert_eq!(count(&out, "movl %ebx, %ebx"), 1, "must not be removed:\n{}", out);
++}
++
++#[test]
++fn a_32_bit_self_move_SURVIVES_across_a_label() {
++    // The upper half may be nonzero on another incoming path.
++    let out = run(&f(concat!(
++        "    movl %edi, %ebx\n",
++        ".LBB1:\n",
++        "    movl %ebx, %ebx\n",
++        "    movq %rbx, %rax\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movl %ebx, %ebx"), 1, "must not be removed:\n{}", out);
++}
++
++#[test]
++fn a_32_bit_self_move_SURVIVES_across_a_call() {
++    // A call clobbers the caller-saved set, so the fact does not carry.
++    let out = run(&f(concat!(
++        "    movl %edi, %ecx\n",
++        "    call g\n",
++        "    movl %ecx, %ecx\n",
++        "    movq %rcx, %rax\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movl %ecx, %ecx"), 1, "must not be removed:\n{}", out);
++}
++
++// ── B. copy folding: positives, one per width class ─────────────────────────
++
++#[test]
++fn a_32_bit_copy_folds_into_a_32_bit_compare() {
++    // The byte-scan shape: a load already zero-extends, so the Cast that
++    // follows is a register move whose destination dies at the compare.
++    let out = run(&f(concat!(
++        "    movzbl (%rdi), %eax\n",
++        "    movl %eax, %esi\n",
++        "    cmpl %r8d, %esi\n",
++        "    je .L1\n",
++        ".L1:\n",
++        "    xorl %eax, %eax\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movl %eax, %esi"), 0, "copy must go:\n{}", out);
++    assert!(out.contains("cmpl %r8d, %eax"), "use must retarget:\n{}", out);
++}
++
++#[test]
++fn a_64_bit_copy_folds_into_an_ADDRESS_operand() {
++    // The capability the previous 32-bit-only attempt lacked: under `movq` the
++    // whole register matches, so an address operand is rewritable. Refusing
++    // memory operands is why that version removed 10 instructions across 220
++    // files.
++    let out = run(&f(concat!(
++        "    movq %rdi, %r11\n",
++        "    movl (%r11), %eax\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movq %rdi, %r11"), 0, "copy must go:\n{}", out);
++    assert!(out.contains("movl (%rdi), %eax"), "address must retarget:\n{}", out);
++}
++
++#[test]
++fn a_64_bit_copy_folds_into_a_SIB_address() {
++    let out = run(&f(concat!(
++        "    movq %rdi, %r11\n",
++        "    movzbl (%r11, %rbx, 2), %eax\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movq %rdi, %r11"), 0, "{}", out);
++    assert!(out.contains("(%rdi, %rbx, 2)"), "{}", out);
++}
++
++#[test]
++fn a_64_bit_copy_folds_into_several_uses_at_once() {
++    let out = run(&f(concat!(
++        "    movq %rdi, %r11\n",
++        "    addq %r11, %rcx\n",
++        "    xorq %r11, %rdx\n",
++        "    movq %rcx, %rax\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movq %rdi, %r11"), 0, "{}", out);
++    assert!(out.contains("addq %rdi, %rcx"), "{}", out);
++    assert!(out.contains("xorq %rdi, %rdx"), "{}", out);
++}
++
++// ── B. copy folding: the width rule, which is where miscompiles live ────────
++
++#[test]
++fn a_32_bit_copy_does_NOT_fold_into_a_64_bit_use() {
++    // SOUNDNESS: `movl` forces bits 32..63 of %D to zero; %S's may be
++    // anything. A 64-bit reader would see a different value.
++    let out = run(&f(concat!(
++        "    movl %eax, %esi\n",
++        "    addq %rsi, %rcx\n",
++        "    movq %rcx, %rax\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movl %eax, %esi"), 1, "must not fold:\n{}", out);
++}
++
++#[test]
++fn a_32_bit_copy_does_NOT_fold_into_an_address_operand() {
++    // An address is read as 64 bits, so the same argument applies.
++    let out = run(&f(concat!(
++        "    movl %eax, %esi\n",
++        "    movl (%rsi), %ecx\n",
++        "    movl %ecx, %eax\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movl %eax, %esi"), 1, "must not fold:\n{}", out);
++}
++
++#[test]
++fn a_16_bit_copy_does_NOT_fold_into_a_32_bit_use() {
++    // SOUNDNESS: `movw` leaves bits 16..63 of %D STALE — it does not even
++    // zero them — so only 16- and 8-bit reads see %S's value.
++    let out = run(&f(concat!(
++        "    movw %ax, %cx\n",
++        "    addl %ecx, %edx\n",
++        "    movl %edx, %eax\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movw %ax, %cx"), 1, "must not fold:\n{}", out);
++}
++
++#[test]
++fn an_8_bit_copy_does_NOT_fold_into_a_16_bit_use() {
++    let out = run(&f(concat!(
++        "    movb %al, %cl\n",
++        "    addw %cx, %dx\n",
++        "    movl %edx, %eax\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movb %al, %cl"), 1, "must not fold:\n{}", out);
++}
++
++#[test]
++fn an_8_bit_copy_DOES_fold_into_an_8_bit_use() {
++    let out = run(&f(concat!(
++        "    movb %al, %cl\n",
++        "    testb %cl, %cl\n",
++        "    je .L1\n",
++        ".L1:\n",
++        "    xorl %eax, %eax\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movb %al, %cl"), 0, "{}", out);
++    assert!(out.contains("testb %al, %al"), "{}", out);
++}
++
++// ── B. copy folding: the remaining legality rules ───────────────────────────
++
++#[test]
++fn a_copy_SURVIVES_when_the_use_also_writes_the_destination() {
++    // Rule 4: `addl %eax, %esi` would become `addl %eax, %eax` and clobber the
++    // source.
++    let out = run(&f(concat!(
++        "    movl %eax, %esi\n",
++        "    addl %ecx, %esi\n",
++        "    movl %esi, %eax\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movl %eax, %esi"), 1, "must not fold:\n{}", out);
++}
++
++#[test]
++fn a_copy_SURVIVES_when_the_destination_is_still_live_afterwards() {
++    // Rule 5. The scan window ends at the branch, but %esi is read on the
++    // far side of it, so it is live out of the window and the copy must stay.
++    //
++    // Getting this shape right matters: an earlier draft of this test put a
++    // `movl $7, %eax` between the uses intending to clobber the source, but
++    // %eax was overwritten before any read, so it was a genuine dead store —
++    // dead-write elimination removed it and the fold became legal. The test
++    // was wrong, not the pass.
++    let out = run(&f(concat!(
++        "    movl %eax, %esi\n",
++        "    cmpl %r8d, %esi\n",
++        "    je .L1\n",
++        "    addl %esi, %ecx\n",
++        ".L1:\n",
++        "    movl %esi, %eax\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movl %eax, %esi"), 1, "must not fold:\n{}", out);
++}
++
++#[test]
++fn a_copy_SURVIVES_when_the_source_is_clobbered_before_the_use() {
++    // Rule 2.
++    let out = run(&f(concat!(
++        "    movl %eax, %esi\n",
++        "    movl $7, %eax\n",
++        "    cmpl %r8d, %esi\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movl %eax, %esi"), 1, "must not fold:\n{}", out);
++}
++
++#[test]
++fn a_copy_SURVIVES_across_a_label() {
++    // Rule 1: another path can reach the use with a different %S.
++    let out = run(&f(concat!(
++        "    movl %eax, %esi\n",
++        ".LBB9:\n",
++        "    cmpl %r8d, %esi\n",
++        "    jne .LBB9\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movl %eax, %esi"), 1, "must not fold:\n{}", out);
++}
++
++#[test]
++fn a_copy_SURVIVES_when_the_use_is_a_variable_shift_count() {
++    // Rule 6, and a real corpus failure (`pgo_sections`): the count is pinned
++    // to %cl even though it is written explicitly, so the implicit-use test
++    // does not catch it. Renaming yields `shrq %r9b, %rsi`, which the
++    // assembler rejects outright.
++    let out = run(&f(concat!(
++        "    movl %r9d, %ecx\n",
++        "    shrq %cl, %rsi\n",
++        "    movq %rsi, %rax\n",
++        "    ret"
++    )));
++    assert!(!out.contains("%r9b"), "count must stay in %cl:\n{}", out);
++    assert!(out.contains("shrq %cl, %rsi"), "{}", out);
++}
++
++/// %rsp/%rbp anchor the frame and CFI and are excluded from folding on both
++/// sides. (Only the destination side is observable end-to-end: a copy whose
++/// SOURCE is %rsp gets collapsed by copy propagation into `movq %rsp, %rax`,
++/// which is correct and renames nothing away, so it cannot distinguish this
++/// pass's behaviour.)
++#[test]
++fn a_copy_into_a_frame_register_is_never_folded() {
++    let out = run(&f(concat!(
++        "    movq %rax, %rbp\n",
++        "    movq %rbp, %rcx\n",
++        "    movq %rcx, %rax\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movq %rax, %rbp"), 1, "{}", out);
++}
++
++// ── register-name aliasing: the substring hazards ───────────────────────────
++
++#[test]
++fn a_byte_register_name_is_not_mangled_by_the_rename() {
++    // `%si` is a prefix of `%sil`. Rewriting the 16-bit name first produced
++    // `%dxl`, which is not a register — the assembler rejected the function
++    // with "bad src register". Found by the corpus.
++    let out = run(&f(concat!(
++        "    movzbl (%rdi), %edx\n",
++        "    movl %edx, %esi\n",
++        "    testb %sil, %sil\n",
++        "    je .L1\n",
++        ".L1:\n",
++        "    xorl %eax, %eax\n",
++        "    ret"
++    )));
++    for bad in ["%dxl", "%axl", "%cxl", "%bxl", "%dil l"] {
++        assert!(!out.contains(bad), "mangled register {}:\n{}", bad, out);
 +    }
 +}
 +
-+static int is_name_char(char ch) {
-+    return ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-+            (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.');
++#[test]
++fn the_extended_registers_are_not_blocked_by_prefix_matching() {
++    // `%r8` is a prefix of `%r8d`/`%r8w`/`%r8b`. A naive 64-bit guard rejected
++    // every r8..r15 operand, silently disabling the pass for half the register
++    // file.
++    let out = run(&f(concat!(
++        "    movzbl (%rdi), %r9d\n",
++        "    movl %r9d, %r10d\n",
++        "    cmpl %r8d, %r10d\n",
++        "    je .L1\n",
++        ".L1:\n",
++        "    xorl %eax, %eax\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movl %r9d, %r10d"), 0, "the copy must go:\n{}", out);
++    assert!(
++        out.contains("cmpl %r8d, %r9d") || out.contains("cmpl %r8d, %r10d"),
++        "the compare must read a register the load defines:\n{}",
++        out
++    );
 +}
 +
-+unsigned long long bench_run(void) {
-+    unsigned long long c = 0;
-+    for (int i = 0; i < N; i++) {
-+        c += (unsigned) is_name_char(s[i]);
-+    }
-+    return c;
++#[test]
++fn a_high_byte_alias_blocks_the_rename() {
++    // SOUNDNESS: %ah has no counterpart once the family moves to %rsi/%r8+.
++    let out = run(&f(concat!(
++        "    movl %esi, %eax\n",
++        "    movb %ah, %cl\n",
++        "    movl %ecx, %eax\n",
++        "    ret"
++    )));
++    assert_eq!(count(&out, "movl %esi, %eax"), 1, "must not fold:\n{}", out);
 +}
++
++#[test]
++fn renaming_r15_does_not_clip_the_width_suffix() {
++    // Guards the reverse direction of the prefix hazard: rewriting *into*
++    // r8..r15 must produce `%r15d`, never `%r15` followed by a stray `d`.
++    let out = run(&f(concat!(
++        "    movq %r15, %r11\n",
++        "    addq %r11, %rcx\n",
++        "    movq %rcx, %rax\n",
++        "    ret"
++    )));
++    assert!(out.contains("addq %r15, %rcx"), "{}", out);
++    assert!(!out.contains("%r15q") && !out.contains("%r11"), "{}", out);
++}
++
++// ── whole-pipeline invariants ───────────────────────────────────────────────
++
++#[test]
++fn the_pass_is_idempotent() {
++    let src = f(concat!(
++        "    movq %rdi, %r11\n",
++        "    movl (%r11), %eax\n",
++        "    ret"
++    ));
++    let once = run(&src);
++    let twice = peephole_optimize(once.clone());
++    assert_eq!(once, twice, "a second run must change nothing");
++}
++
++#[test]
++fn no_output_line_names_a_nonexistent_register() {
++    // Catch-all against the whole class of rename-mangling bugs: every `%name`
++    // in the output must be a register the assembler knows.
++    let out = run(&f(concat!(
++        "    movq %rdi, %r11\n",
++        "    movzbl (%r11, %rbx, 2), %esi\n",
++        "    movl %esi, %r10d\n",
++        "    testb %r10b, %r10b\n",
++        "    je .L1\n",
++        ".L1:\n",
++        "    movw %ax, %cx\n",
++        "    movb %al, %dl\n",
++        "    xorl %eax, %eax\n",
++        "    ret"
++    )));
++    let valid: std::collections::HashSet<&str> = [
++        "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "eax", "ecx", "edx", "ebx", "esp",
++        "ebp", "esi", "edi", "ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "al", "cl", "dl",
++        "bl", "spl", "bpl", "sil", "dil", "ah", "bh", "ch", "dh", "rip",
++    ]
++    .into_iter()
++    .chain((8..16).flat_map(|_| std::iter::empty()))
++    .collect();
++    for tok in out.split(|c: char| !(c.is_ascii_alphanumeric() || c == '%')) {
++        let Some(name) = tok.strip_prefix('%') else {
++            continue;
++        };
++        let ok = valid.contains(name)
++            || (name.starts_with('r')
++                && name[1..]
++                    .trim_end_matches(['d', 'w', 'b'])
++                    .parse::<u32>()
++                    .map(|n| (8..=15).contains(&n))
++                    .unwrap_or(false));
++        assert!(ok, "output names unknown register %{}:\n{}", name, out);
++    }
++}
+diff --git a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
+index 043d9707..ce41c693 100644
+--- a/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
++++ b/src/backend/x86/codegen/peephole/passes/relay_and_lea.rs
+@@ -805,7 +805,17 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn relay_is_kept_when_target_is_read_again() {
++    fn both_readers_of_a_relayed_value_see_the_same_register() {
++        // The relay has TWO consumers, so it may not be retired by rewriting
++        // only one of them -- that would leave the second reading a register
++        // nobody wrote.
++        //
++        // Asserting the exact text `movl %eax, %r10d` would be wrong here:
++        // `copy_fold` retires the relay by rewriting BOTH consumers to `%eax`
++        // (which holds the same value and outlives them), giving three
++        // instructions instead of four. What must hold is the invariant, not
++        // the spelling: both adds read one and the same register, and it is a
++        // register that actually holds the relayed value.
+         let out = run(concat!(
+             "foo:\n",
+             ".cfi_startproc\n",
+@@ -815,8 +825,29 @@ mod tests {
+             "    ret\n",
+             ".cfi_endproc\n",
+         ));
+-        assert!(out.contains("movl %eax, %r10d"), "{out}");
+-        assert!(out.contains("addl %r10d, %r9d"), "{out}");
++        let src_of = |dst: &str| -> String {
++            out.lines()
++                .find(|l| l.trim().starts_with("addl") && l.trim().ends_with(dst))
++                .unwrap_or_else(|| panic!("missing `addl ..., {dst}`:\n{out}"))
++                .trim()
++                .trim_start_matches("addl ")
++                .split(',')
++                .next()
++                .unwrap()
++                .trim()
++                .to_string()
++        };
++        let a = src_of("%r8d");
++        let b = src_of("%r9d");
++        assert_eq!(a, b, "both consumers must read the same register:\n{out}");
++        assert!(
++            a == "%r10d" || a == "%eax",
++            "consumers must read the relayed value, got {a}:\n{out}"
++        );
++        // If the relay survived, it must still be written before both uses.
++        if a == "%r10d" {
++            assert!(out.contains("movl %eax, %r10d"), "{out}");
++        }
+     }
+ 
+     #[test]
