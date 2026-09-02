@@ -1,2179 +1,784 @@
-diff --git a/engineering/FOLLOWUP-2026-09-02c-machinst-float-layer.md b/engineering/FOLLOWUP-2026-09-02c-machinst-float-layer.md
-new file mode 100644
-index 0000000..da61416
---- /dev/null
-+++ b/engineering/FOLLOWUP-2026-09-02c-machinst-float-layer.md
-@@ -0,0 +1,133 @@
-+# FOLLOWUP 2026-09-02c — MachInst typed scalar-float layer (FMov/FAlu) + vectorizer-orphan ICE fix
-+
-+Base: `10386f4` (origin/main). Session snapshots: **S07-typed-float-layer**, **S08-vec-dce-ice-fix**, S09 (this doc).
-+Deliverable: `/home/user/ms178-1.patch` (APPLIES-CLEAN, verified in fresh worktree at base).
-+
-+## 1. What was built
-+
-+### 1.1 Typed scalar-float MachInst layer (the structural gap)
-+
-+Before: `MachReg` had no XMM representation; **every** float instruction fell back to
-+untyped text emission (`is_mi_unsafe_value` rejected any xmm-domain operand). The
-+typed layer was integer-only — nbody's MI-STREAM contained zero xmm registers.
-+
-+Now (S07):
-+- **`MachInst::FMov`** — scalar SSE moves, S32→`movss` / S64→`movsd`. Reg↔reg emits
-+  the **VEX 3-operand form** (`vmovsd %s,%s,%d`), matching the text path's
-+  merging-move false-dependence fix (nbody 3.1× story). Reg↔mem/slot legacy forms.
-+- **`MachInst::FAlu`** — `v{add,sub,mul,div}s{s,d} src2, %src1, %dst` (VEX
-+  three-operand: no destructive dest, so dest-aliases-operand needs no staging).
-+  Sub/Div keep lhs in src1 (operand order pinned by tests); commutative swap when
-+  only the rhs is xmm-homed (mirrors the text path's swap exactly).
-+- **Emitters**: xmm8–15 (`PhysReg 26..=33`) added to `reg_name`; strict `freg_name`
-+  (no silent fallback — house rule).
-+- **Admission** (double-gated, isel `lower_instruction_typed_inner` +
-+  emit-side `float_typed_candidate` must agree):
-+  - Store/Load F32/F64/D32/D64: value xmm-homed (xmm2..xmm15), address = direct
-+    alloca slot or GPR-held pointer; rejects folded GEP/global addrs (the never-
-+    materialized-pointer segfault class), OverAligned slots, xmm-based pointers,
-+    constants, F128/x87, accumulator/i128/vector values.
-+  - Copy: both sides xmm-homed.
-+  - BinOp Add/Sub/Mul/SDiv F32/F64: dest xmm-homed; lhs xmm + rhs xmm/slot(vreg →
-+    flush-time StackSlot resolution), or commutative rhs-xmm/lhs-slot swap.
-+- **Kill switches**: `CCC_MI_DISABLE_KINDS=float-mov` / `float-alu`
-+  (`machinst_disabled_kinds` widened u16→u32).
-+- Slot-homed rhs in FAlu travels as `MachReg::Vreg` and resolves via
-+  `resolve_stack_vregs`; anything unresolvable trips the existing replay fallback.
-+
-+### 1.2 Pre-existing ICE found + fixed via godbolt oracles (S08)
-+
-+`for (i) gd[i] = gd[i]*k + c;` over a **global** array ICEd at -O2 and -O3:
-+
-+```
-+x86 codegen: value 36 has no register, stack slot, Copy, or GlobalAddr definition
-+```
-+
-+Root cause chain (all verified by instrumentation, then removed):
-+1. Vectorizer hoists `VecBroadcastF64x4` setup into the preheader, then **bails**
-+   out of the loop (twice — two orphaned broadcasts), leaving the loop scalar.
-+2. `IntrinsicOp::is_pure()` **missed the entire modern `Vec*` family** (Broadcast/
-+   Zero/Load/Add/Mul/Fma/Madd/Sub/Div/Sqrt): the `VecBroadcastF64x4` token at
-+   intrinsics.rs:1300 lives in `produces_vector_value()`, not `is_pure()` (ends
-+   :1265). So DCE rooted the dead broadcasts as side-effecting.
-+3. No DCE ran after the vectorizer anyway.
-+4. Codegen: `avx_store_dest` on a homeless vector value falls through to the
-+   pointer interpretation → panic.
-+
-+Fix: (a) `is_pure()` now delegates to `produces_vector_value()` **minus**
-+`VecStoreI64x2` (the one memory-writing op that list contains for slot-sizing
-+reasons — left untouched because regalloc + vector_temp_promotion special-case
-+it); (b) one `dce::eliminate_dead_code` sweep immediately after the
-+vectorize+post-vec-unroll block in `passes/mod.rs`; (c) regression test
-+`vectorize_global_array_bailout_ice.c`; (d) two DCE unit tests (pure unused
-+broadcast removed; `VecStoreF64x4` never removed by purity).
-+
-+## 2. Evidence
-+
-+| Check | Result |
-+|---|---|
-+| unit `cargo test --lib` | **1535/0/6** (was 1517: +11 machinst FMov/FAlu, +5 FAlu isel, +2 DCE) |
-+| regression suite | **569/0/15** (567 + 2 new tests) |
-+| benchmark outputs | **152/0/0** |
-+| `ir_verify_sweep.py` | **569×2 = 1138 configs, 0 violations** |
-+| census `CCC_ISEL_STATS` | **88.05% → 88.99%** (7951→8739 lowered; +788). Note ~284 float moves were previously *invisible* rejections (rejected before stats), so real gain ≈ +3.6pp |
-+| assembler differential | FMov/FAlu corpus through real GAS (2.44) — accepted |
-+| forced-loop stress | nbody/mandelbrot/spectral_norm/fannkuch output **bit-identical to gcc**; spectral_norm ON/OFF binaries byte-identical (md5) |
-+| codegen diff ON/OFF (all 38 benchmarks, forced) | only nbody+mandelbrot differ: 2+1 copy lines `movapd`→`vmovsd` (1-uop, no merge dependence) — layer is otherwise text-neutral |
-+| godbolt `dot8` | lccc 46 vs gcc 21 / clang 14 / icc 24 / icx 10 — see §4 gaps |
-+
-+A/B timing on this 2-core sandbox is ±40% noise (spectral_norm "15% regression"
-+was measured on **byte-identical binaries**); codegen-diff equality is the
-+stronger evidence and it shows neutral-or-better.
-+
-+## 3. Known traps re-verified
-+
-+- Never emit legacy `movsd %xmmA,%xmmB` reg-reg (merging move → false
-+  dependence). VEX 3-operand only.
-+- Folded GEP/global addresses have no materialized register — any new
-+  Load/Store admission MUST reject `folded_gep_values` / `folded_global_addrs`
-+  (this bit the first FMov iteration: segfault reading an unwritten GPR).
-+- `value_to_reg` maps XMM homes to `Vreg` (integer-era assumption) — float
-+  lowerings must construct xmm operands explicitly.
-+- `CCC_MI_FORCE_LOOPS=1` full-suite has 2 PRE-EXISTING integer failures
-+  (`ra09_selfop_xor`, `range_check_fold` — byte-identical codegen with the
-+  float layer on/off). Do not attribute them to the float layer; the 32-inst
-+  loop profitability gate exists for this reason.
-+
-+## 4. Follow-up backlog (data-driven, ranked)
-+
-+1. **Call typed lowering (522 rejections, 48% of the rest)** — biggest single
-+   class; every Call flushes the run. Plan: typed arg moves + `MachInst::Call`
-+   + return home + caller-saved spills as typed stores (interval data already
-+   exists in `caller_save_intervals`). Subset first: ≤6 int/ptr args, no
-+   variadic/struct/i128, named symbol.
-+2. **Vectorizer map-loop bailout over global arrays** (§1.2's trigger): `scale_add`
-+   stays scalar where gcc/clang emit 4-wide packed loops. Find the legality check
-+   that requires alloca/param bases.
-+3. **dot8 gap (46 vs 10–24)**: (a) no full unroll of known-2-trip loops at -O3;
-+   (b) no FMA (`vfmadd*`) despite `-march=x86-64-v3` — `vmulsd+vaddsd` pairs
-+   survive; check FMA3 gating + reduction-accumulator fusion.
-+4. **FCmp (Cmp(float) 11)** — text path stages via xmm0/xmm1 scratch; needs
-+   scratch-reg representation in MachInst (PhysReg ids 17–19 are free; 18/19 →
-+   xmm0/xmm1, never allocatable). Same unlock enables FMov mem↔mem relays and
-+   slot-homed float stores (the remaining 123 Store(float)).
-+5. **Memcpy (92) / Store(other) (79)** typed sequences.
-+6. Loop-gate re-evaluation: with FMov/FAlu text-neutral, raising
-+   `CCC_MI_MAX_LOOP_INSTS` only needs the 2 integer forced-loop failures fixed
-+   first.
-+7. mold/lld linker-oracle script (still missing from scripts/).
-+
-+## 5. File map (this session)
-+
-+- `machinst.rs`: +FMov, +FAluOp/+FAlu variants
-+- `machinst_emit.rs`: xmm8–15 names, `freg_name`, FMov/FAlu arms (VEX forms, loud traps)
-+- `isel.rs`: `is_xmm_phys`; float arms in Store/Load/Copy/BinOp
-+- `emit.rs`: `MI_FLOAT_MOV`/`MI_FLOAT_ALU` bits (u32 mask), `float_typed_candidate`,
-+  bypass in `try_lower_machinst`, FMov/FAlu in `resolve_stack_vregs` +
-+  `has_unresolvable_vreg`
-+- `machinst_tests.rs`: +16 tests (golden/rsp/self-move/5 traps/isel admission ×2/
-+  class-coverage floats/corpus)
-+- `ir/intrinsics.rs`: `is_pure` Vec-family fix
-+- `passes/dce.rs`: +2 tests; `passes/mod.rs`: post-vectorize DCE
-+- `tests/regression/`: `machinst_float_scalar_layer.c`,
-+  `vectorize_global_array_bailout_ice.c`
-diff --git a/src/backend/x86/codegen/emit.rs b/src/backend/x86/codegen/emit.rs
-index 9af0175..65b4af3 100644
---- a/src/backend/x86/codegen/emit.rs
-+++ b/src/backend/x86/codegen/emit.rs
-@@ -553,26 +553,33 @@ pub struct X86Codegen {
-     pub(super) machinst_function_enabled: bool,
-     /// Diagnostic/profitability mask from CCC_MI_DISABLE_KINDS. Each bit
-     /// disables one IR instruction family without disabling whole functions.
--    pub(super) machinst_disabled_kinds: u16,
-+    pub(super) machinst_disabled_kinds: u32,
- }
- 
--const MI_BINOP: u16 = 1 << 0;
--const MI_LOAD: u16 = 1 << 1;
--const MI_STORE: u16 = 1 << 2;
--const MI_COPY: u16 = 1 << 3;
--const MI_CMP: u16 = 1 << 4;
--const MI_CAST: u16 = 1 << 5;
--const MI_UNARY: u16 = 1 << 6;
--const MI_SELECT: u16 = 1 << 7;
--const MI_GEP: u16 = 1 << 8;
--const MI_ALLOCA: u16 = 1 << 9;
--const MI_CAST_WIDEN: u16 = 1 << 10;
--const MI_CAST_NARROW: u16 = 1 << 11;
--const MI_CAST_SAME: u16 = 1 << 12;
--const MI_CAST_SIGNED_SOURCE: u16 = 1 << 13;
--const MI_CAST_UNSIGNED_SOURCE: u16 = 1 << 14;
--
--fn parse_machinst_disabled_kinds() -> u16 {
-+const MI_BINOP: u32 = 1 << 0;
-+const MI_LOAD: u32 = 1 << 1;
-+const MI_STORE: u32 = 1 << 2;
-+const MI_COPY: u32 = 1 << 3;
-+const MI_CMP: u32 = 1 << 4;
-+const MI_CAST: u32 = 1 << 5;
-+const MI_UNARY: u32 = 1 << 6;
-+const MI_SELECT: u32 = 1 << 7;
-+const MI_GEP: u32 = 1 << 8;
-+const MI_ALLOCA: u32 = 1 << 9;
-+const MI_CAST_WIDEN: u32 = 1 << 10;
-+const MI_CAST_NARROW: u32 = 1 << 11;
-+const MI_CAST_SAME: u32 = 1 << 12;
-+const MI_CAST_SIGNED_SOURCE: u32 = 1 << 13;
-+const MI_CAST_UNSIGNED_SOURCE: u32 = 1 << 14;
-+/// Scalar float moves (FMov): float Store/Load/Copy lowered to movss/movsd.
-+/// Separate bit so float lowering can be bisected without losing integer
-+/// coverage of the same instruction kinds.
-+const MI_FLOAT_MOV: u32 = 1 << 15;
-+/// Scalar float arithmetic (FAlu): float Add/Sub/Mul/Div lowered to the VEX
-+/// three-operand vadd/vsub/vmul/vdiv forms.
-+const MI_FLOAT_ALU: u32 = 1 << 16;
-+
-+fn parse_machinst_disabled_kinds() -> u32 {
-     std::env::var("CCC_MI_DISABLE_KINDS")
-         .unwrap_or_default()
-         .split(',')
-@@ -593,13 +600,15 @@ fn parse_machinst_disabled_kinds() -> u16 {
-                 "cast-same" => MI_CAST_SAME,
-                 "cast-signed-source" => MI_CAST_SIGNED_SOURCE,
-                 "cast-unsigned-source" => MI_CAST_UNSIGNED_SOURCE,
--                "all" => u16::MAX,
-+                "float-mov" => MI_FLOAT_MOV,
-+                "float-alu" => MI_FLOAT_ALU,
-+                "all" => u32::MAX,
-                 _ => 0,
-             }
-         })
- }
- 
--fn machinst_kind_bit(inst: &crate::ir::reexports::Instruction) -> u16 {
-+fn machinst_kind_bit(inst: &crate::ir::reexports::Instruction) -> u32 {
-     use crate::ir::reexports::Instruction;
-     match inst {
-         Instruction::BinOp { .. } => MI_BINOP,
-@@ -3749,6 +3758,30 @@ fn resolve_stack_vregs(
-             dst: resolve_op(dst, *size),
-             size: *size,
-         },
-+        // FMov never carries vregs: the lowering admits only xmm-homed
-+        // values and GPR/slot addressing, all pre-colored. Resolve an FMov
-+        // to itself; should a Vreg ever slip in, has_unresolvable_vreg
-+        // rejects the window and the default path replays it. (Resolving to
-+        // StackSlot here could create the mem-to-mem shape the SSE encoder
-+        // cannot express.)
-+        MachInst::FMov { .. } => inst.clone(),
-+        // FAlu's src2 may legitimately be a slot-homed Vreg: resolve it to
-+        // the StackSlot memory operand (the VEX form folds one memory
-+        // source). src1/dst are xmm homes by construction; a Vreg there
-+        // survives and trips the fallback.
-+        MachInst::FAlu {
-+            op,
-+            src2,
-+            src1,
-+            dst,
-+            size,
-+        } => MachInst::FAlu {
-+            op: *op,
-+            src2: resolve_op(src2, *size),
-+            src1: *src1,
-+            dst: *dst,
-+            size: *size,
-+        },
-         MachInst::Alu { op, src, dst, size } => {
-             if let MachReg::Vreg(id) = dst {
-                 if !ra.contains_key(id) {
-@@ -3894,6 +3927,10 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, _ra: &FxHashMap<u32,
-     };
-     match inst {
-         MachInst::Mov { src, dst, .. } => check_op(src) || check_op(dst),
-+        MachInst::FMov { src, dst, .. } => check_op(src) || check_op(dst),
-+        MachInst::FAlu {
-+            src2, src1, dst, ..
-+        } => check_op(src2) || check_reg(src1) || check_reg(dst),
-         MachInst::Alu { src, dst, .. } => check_op(src) || check_reg(dst),
-         MachInst::Imul3 { src, dst, .. } => check_reg(src) || check_reg(dst),
-         MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => check_reg(dst),
-@@ -3950,6 +3987,132 @@ fn is_mi_unsafe_value(
-     false
- }
- 
-+impl X86Codegen {
-+    /// Validate the scalar-float typed subsets: FMov (Store/Load/Copy on
-+    /// F32/F64/D32/D64 whose values are all xmm-homed (xmm2..xmm15) and
-+    /// whose addressing is a direct alloca slot or a GPR-held pointer) and
-+    /// FAlu (Add/Sub/Mul/Div with an xmm-homed dest and xmm/slot-homed
-+    /// sources in the shapes the VEX three-operand form accepts).
-+    ///
-+    /// This is the emit-side twin of the isel float arms; both sides check
-+    /// the same subset so the typed lowering can never see a shape it does
-+    /// not model. Everything else (slot-homed floats needing the xmm scratch
-+    /// relay, constants, xmm-based pointers, folded GEP/global addressing,
-+    /// F128/x87) returns false and keeps the mature text path.
-+    fn float_typed_candidate(
-+        &self,
-+        inst: &crate::ir::reexports::Instruction,
-+        folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
-+    ) -> bool {
-+        use crate::common::types::{AddressSpace, IrType};
-+        use crate::ir::reexports::{Instruction, Operand};
-+
-+        if self.machinst_disabled_kinds & MI_FLOAT_MOV != 0 {
-+            return false;
-+        }
-+        let ra = &self.reg_assignments;
-+        // Same value-domain exclusions as is_mi_unsafe_value minus the float
-+        // type check: accumulator locations, i128 carriers, and vectorizer
-+        // values may all be xmm-homed and F32/F64-typed in the IR while the
-+        // mature path treats them as packed/wide -- a scalar movsd would
-+        // truncate or stale their upper lanes.
-+        let xmm_homed = |v: u32| {
-+            ra.get(&v)
-+                .is_some_and(|r| r.0 >= 20 && r.0 <= 33)
-+                && !self.state.is_accumulator_location(v)
-+                && !self.state.is_i128_value(v)
-+                && !self.state.vector_values.contains(&v)
-+        };
-+        // Pointer admission mirrors the integer Load/Store ptr gate exactly:
-+        // folded GEP/global addresses have NO materialized register (the
-+        // producer was skipped -- reading its home is a segfault), and
-+        // over-aligned alloca slots need the aligned address the default
-+        // path computes.
-+        let gpr_ptr = |v: u32| {
-+            if folded_global_addrs.contains(&v) || self.state.folded_gep_values.contains(&v) {
-+                return false;
-+            }
-+            if let Some(crate::backend::state::SlotAddr::OverAligned(_, _)) =
-+                self.state.resolve_slot_addr(v)
-+            {
-+                return false;
-+            }
-+            self.state.is_alloca(v) || ra.get(&v).is_some_and(|r| r.0 < 20)
-+        };
-+        match inst {
-+            Instruction::Store {
-+                val,
-+                ptr,
-+                ty,
-+                seg_override,
-+                ..
-+            } if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) => {
-+                *seg_override == AddressSpace::Default
-+                    && matches!(val, Operand::Value(v) if xmm_homed(v.0))
-+                    && gpr_ptr(ptr.0)
-+            }
-+            Instruction::Load {
-+                dest,
-+                ptr,
-+                ty,
-+                seg_override,
-+                ..
-+            } if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) => {
-+                *seg_override == AddressSpace::Default && xmm_homed(dest.0) && gpr_ptr(ptr.0)
-+            }
-+            Instruction::Copy { dest, src } => {
-+                let Operand::Value(src_v) = src else {
-+                    return false;
-+                };
-+                let ty_is_scalar_float = self
-+                    .value_types
-+                    .get(&src_v.0)
-+                    .or_else(|| self.value_types.get(&dest.0))
-+                    .is_some_and(|ty| {
-+                        matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64)
-+                    });
-+                ty_is_scalar_float && xmm_homed(src_v.0) && xmm_homed(dest.0)
-+            }
-+            Instruction::BinOp {
-+                dest,
-+                op,
-+                lhs,
-+                rhs,
-+                ty,
-+            } if self.machinst_disabled_kinds & MI_FLOAT_ALU == 0
-+                && matches!(ty, IrType::F32 | IrType::F64)
-+                && matches!(
-+                    op,
-+                    crate::ir::reexports::IrBinOp::Add
-+                        | crate::ir::reexports::IrBinOp::Sub
-+                        | crate::ir::reexports::IrBinOp::Mul
-+                        | crate::ir::reexports::IrBinOp::SDiv
-+                ) =>
-+            {
-+                // Dest must be xmm-homed; then either lhs is xmm-homed (rhs
-+                // xmm or slot), or -- commutative ops only -- rhs is
-+                // xmm-homed and lhs slot-homed. Mirrors the isel arm.
-+                let (Operand::Value(l), Operand::Value(r)) = (lhs, rhs) else {
-+                    return false;
-+                };
-+                if !xmm_homed(dest.0) {
-+                    return false;
+diff --git a/src/backend/x86/codegen/peephole/passes/dead_writes.rs b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
+index a085f61..91fa242 100644
+--- a/src/backend/x86/codegen/peephole/passes/dead_writes.rs
++++ b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
+@@ -448,8 +448,12 @@ const RMW_OPS: &[&str] = &[
+ /// The accumulator is copied into a scratch register, updated, and copied back.
+ /// Applying the operation in place removes both copies. Sound when the scratch
+ /// register is dead after the copy-back, the accumulator is not read between
+-/// the copies, and the operand of the RMW op is not the accumulator itself
+-/// (`xorq %r8, %rax` with `%r8` as the accumulator would become `xorq %r8, %r8`).
++/// the copies, and no source operand of the RMW op mentions the accumulator
++/// (`xorq %r8, %rax` with `%r8` as the accumulator would become `xorq %r8,
++/// %r8`). Source operands that mention the SCRATCH register — including
++/// registers embedded in compound sources like `imulq $imm, %rax` — are
++/// rewritten to the accumulator, which carries the same value once the
++/// staging copy is gone.
+ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+     let len = store.len();
+     let mut lv = FileLiveness::new(store, infos);
+@@ -504,14 +508,44 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
+             i += 1;
+             continue;
+         }
+-        // The operand must not be the accumulator (in-place would alias) and
+-        // must not be the scratch register itself.
+-        if let Some(src_fam) = plain_gp_operand(op_src) {
+-            if src_fam == acc_fam || src_fam == tmp_fam {
+-                i += 1;
+-                continue;
++        // Scan EVERY operand token on the op's source side. Compound sources
++        // such as the 3-operand `imulq $imm, %rax` embed a register after the
++        // immediate; parsing only the whole source string as a bare register
++        // let those forms slip past the alias check, and the fold then
++        // deleted the staging `movq` while the op still read the scratch
++        // register — a stale-register miscompile (found via the dot8
++        // magic-division loop: `imulq $magic, %rax, %rsi` reading a dead
++        // `%rax` instead of the accumulator `%rsi`).
++        //
++        // * Source mentions the ACCUMULATOR anywhere -> reject. The in-place
++        //   form would alias source and destination (historical behaviour
++        //   for the bare-register case, kept conservatively).
++        // * Source mentions the SCRATCH register -> rewrite that token to
++        //   the accumulator: after the fold the staging copy is gone and the
++        //   accumulator carries exactly the value the scratch held. Only the
++        //   exact scratch text is rewritten (width-exact, mirroring the
++        //   move-relay pass); any width-variant alias rejects instead.
++        let mut src_tokens: Vec<&str> = op_src.split(',').map(str::trim).collect();
++        let mut reject = false;
++        for tok in src_tokens.iter_mut() {
++            if let Some(src_fam) = plain_gp_operand(tok) {
++                if src_fam == acc_fam {
++                    reject = true;
++                    break;
 +                }
-+                let has_slot = |v: u32| self.state.get_slot(v).is_some();
-+                if xmm_homed(l.0) {
-+                    return xmm_homed(r.0) || has_slot(r.0);
++                if src_fam == tmp_fam {
++                    if *tok != tmp {
++                        reject = true; // width-variant alias: not text-safe
++                        break;
++                    }
++                    *tok = acc; // scratch carried the accumulator's value
 +                }
-+                let commutative = matches!(
-+                    op,
-+                    crate::ir::reexports::IrBinOp::Add | crate::ir::reexports::IrBinOp::Mul
-+                );
-+                commutative && xmm_homed(r.0) && has_slot(l.0)
-+            }
-+            _ => false,
-+        }
-+    }
-+}
-+
- impl ArchCodegen for X86Codegen {
-     fn is_value_reg_assigned(&self, vid: u32) -> bool {
-         self.reg_assignments.contains_key(&vid)
-@@ -4247,6 +4410,36 @@ impl ArchCodegen for X86Codegen {
              }
          }
- 
-+        // Scalar float FMov bypass. The generic operand scan below rejects
-+        // every XMM-domain value (is_mi_unsafe_value), so the validated
-+        // float subset routes straight to the typed lowering. The candidate
-+        // check is the exact admission predicate for the isel float arms;
-+        // if the lowering still declines (belt and suspenders), the text
-+        // path takes over unchanged.
-+        if self.float_typed_candidate(inst, folded_global_addrs) {
-+            let mut float_alloca_slots = crate::common::fx_hash::FxHashMap::default();
-+            if let crate::ir::reexports::Instruction::Load { ptr, .. }
-+            | crate::ir::reexports::Instruction::Store { ptr, .. } = inst
-+            {
-+                if self.state.is_alloca(ptr.0) {
-+                    if let Some(slot) = self.state.get_slot(ptr.0) {
-+                        float_alloca_slots.insert(ptr.0, slot.0);
-+                    }
-+                }
-+            }
-+            let lowered = super::isel::lower_instruction_typed(
-+                inst,
-+                &self.reg_assignments,
-+                &float_alloca_slots,
-+                Some(&self.value_types),
-+                &mut self.machinst_buf,
-+            );
-+            if lowered {
-+                self.machinst_buf_ir.push(inst.clone());
-+            }
-+            return lowered;
++        if reject {
++            i += 1;
++            continue;
 +        }
-+
-         // Reject instructions involving values we can't handle.
-         // Allocas are allowed for Load/Store ptr (ISel handles via StackSlot).
-         use crate::backend::liveness::for_each_operand_in_instruction;
-diff --git a/src/backend/x86/codegen/isel.rs b/src/backend/x86/codegen/isel.rs
-index 6ca6300..8373360 100644
---- a/src/backend/x86/codegen/isel.rs
-+++ b/src/backend/x86/codegen/isel.rs
-@@ -31,6 +31,13 @@ fn value_to_reg(v: &Value, reg_assignments: &FxHashMap<u32, PhysReg>) -> MachReg
+         let Some(k) = next_real(j + 1) else {
+             i += 1;
+             continue;
+@@ -535,7 +569,8 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
+             i += 1;
+             continue;
+         }
+-        let new_line = format!("    {}{}, {}", op, op_src, acc);
++        let new_src = src_tokens.join(", ");
++        let new_line = format!("    {}{}, {}", op, new_src, acc);
+         mark_nop(&mut infos[i]);
+         replace_line(store, &mut infos[j], j, new_line);
+         mark_nop(&mut infos[k]);
+@@ -549,6 +584,7 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
+ #[cfg(test)]
+ mod tests {
+     use super::super::super::peephole_optimize;
++    use super::*;
+ 
+     fn run(asm: &str) -> String {
+         peephole_optimize(asm.to_string())
+@@ -893,4 +929,73 @@ mod tests {
+         ));
+         assert!(out.contains("movl %edx, %eax"), "{out}");
      }
++
++    // ── accumulator round-trip: compound-source alias guards ──────────────
++    //
++    // Regression for the dot8 magic-division miscompile: an earlier pass
++    // folded the staging copy into the imul source (`imulq $imm, %rax, %rax`
++    // after `movq %rsi, %rax`), then the round-trip fold deleted the staging
++    // copy while rewriting only the DESTINATION — emitting
++    // `imulq $imm, %rax, %rsi` reading the now-stale scratch register.
++
++    #[test]
++    fn acc_roundtrip_rewrites_compound_src_mentioning_scratch() {
++        // Direct drive of the pass (end-to-end runs may legitimately
++        // pre-rewrite the staging copy elsewhere): the 3-operand imul names
++        // the scratch register in its compound source; the fold must move
++        // that mention onto the accumulator together with the destination.
++        let asm = concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    movslq %edi, %rsi\n",
++            "    movq %rsi, %r11\n",
++            "    imulq $1717986919, %r11, %r11\n",
++            "    movq %r11, %rsi\n",
++            "    sarq $33, %rsi\n",
++            "    movq %rsi, (%rdx)\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        );
++        let mut store = LineStore::new(asm.to_string());
++        let mut infos: Vec<LineInfo> = (0..store.len())
++            .map(|i| classify_line(store.get(i)))
++            .collect();
++        assert!(fold_accumulator_roundtrip(&mut store, &mut infos));
++        let out = store.build_result(|i| infos[i].is_nop());
++        assert!(
++            out.contains("imulq $1717986919, %rsi, %rsi"),
++            "expected in-place fold with rewritten src: {out}"
++        );
++        assert!(
++            !out.contains("imulq $1717986919, %r11, %rsi"),
++            "stale-scratch miscompile: {out}"
++        );
++        // The staging copies are gone.
++        assert!(!out.contains("movq %rsi, %r11"), "{out}");
++        assert!(!out.contains("movq %r11, %rsi"), "{out}");
++    }
++
++    #[test]
++    fn acc_roundtrip_never_reads_stale_scratch_when_src_mentions_acc() {
++        let out = run(concat!(
++            "foo:\n",
++            ".cfi_startproc\n",
++            "    movslq %edi, %rsi\n",
++            "    movq %rsi, %rax\n",
++            "    imulq $1717986919, %rsi, %rax\n",
++            "    movq %rax, %rsi\n",
++            "    sarq $33, %rsi\n",
++            "    movq %rsi, (%rdx)\n",
++            "    ret\n",
++            ".cfi_endproc\n",
++        ));
++        // Whatever combination of folds fires, the imul must never end up
++        // reading %rax as its source with %rsi as destination: %rax does not
++        // hold the multiplicand once the staging copy is deleted.
++        assert!(
++            !out.contains("imulq $1717986919, %rax, %rsi"),
++            "stale-scratch miscompile: {out}"
++        );
++    }
++
+ }
+diff --git a/src/common/fp_contract.rs b/src/common/fp_contract.rs
+index 57ba041..db1c712 100644
+--- a/src/common/fp_contract.rs
++++ b/src/common/fp_contract.rs
+@@ -31,6 +31,22 @@ pub enum FpContract {
  }
  
-+/// True when a physical register is an XMM float home (xmm2..xmm15, the
-+/// allocator's float bank; xmm0/xmm1 are text-path scratch and never appear
-+/// as allocator homes). Mirrors `is_xmm_reg` in emit.rs.
-+fn is_xmm_phys(reg: PhysReg) -> bool {
-+    reg.0 >= 20 && reg.0 <= 33
-+}
+ impl FpContract {
++    /// The contraction default for C compilation: [`FpContract::Fast`],
++    /// matching GCC's C default (`-ffp-contract=fast` in GNU dialects since
++    /// 4.6). Verified against the godbolt oracles on a cross-statement
++    /// reduction (`t = a[i]*b[i]; s = s + t;`, -O3 -march=x86-64-v3):
++    /// gcc16.2 and icx fuse to vfmadd by default; only clang (whose C
++    /// default is `on`) keeps the separate pair. The conservative
++    /// [`FpContract::Off`] default lost every scalar FMA opportunity
++    /// against the reference compiler (dot8: 46 instructions vs gcc's 21)
++    /// while changing numerics away from GCC's, not toward it.
++    /// Explicit `-ffp-contract={on,off}` flags always win; `Off` remains
++    /// the enum `Default` for internal/test callers that want the
++    /// fail-closed sentinel.
++    pub const fn c_language_default() -> Self {
++        FpContract::Fast
++    }
 +
- /// Convert an IR Operand to a MachOperand, using physical registers for
- /// values that already have register assignments from the main allocator.
- fn lower_operand_with_regs(op: &Operand, reg_assignments: &FxHashMap<u32, PhysReg>) -> MachOperand {
-@@ -1148,9 +1155,69 @@ fn lower_instruction_typed_inner(
-             rhs,
-             ty,
-         } => {
--            if ty.is_float() || ty.is_128bit() {
-+            if ty.is_128bit() {
-                 return false;
-             }
-+            // Scalar float arithmetic (F32/F64) in the VEX three-operand
-+            // form. Subset: dest xmm-homed; lhs xmm-homed with rhs xmm- or
-+            // slot-homed; or (commutative ops only) rhs xmm-homed with lhs
-+            // slot-homed. Slot-homed operands become Vregs here and resolve
-+            // to StackSlot memory operands at flush time (resolve_stack_vregs);
-+            // an operand that resolves to nothing trips the fallback replay.
-+            // Constants and the sub/div-with-slot-lhs staging case (needs the
-+            // xmm0 scratch) stay on the mature text path.
-+            if matches!(ty, IrType::F32 | IrType::F64) {
-+                // Float division arrives as SDiv with a float type (the IR
-+                // has no separate FDiv); UDiv/Rem with float types do not
-+                // occur and stay on the text path.
-+                let fop = match op {
-+                    IrBinOp::Add => FAluOp::Add,
-+                    IrBinOp::Sub => FAluOp::Sub,
-+                    IrBinOp::Mul => FAluOp::Mul,
-+                    IrBinOp::SDiv => FAluOp::Div,
-+                    _ => return false,
-+                };
-+                let size = OpSize::from_ir_type(*ty);
-+                let Some(&dst_reg) = ra.get(&dest.0) else {
-+                    return false;
-+                };
-+                if !is_xmm_phys(dst_reg) {
-+                    return false;
-+                }
-+                let (Operand::Value(lhs_v), Operand::Value(rhs_v)) = (lhs, rhs) else {
-+                    return false;
-+                };
-+                let lhs_xmm = ra.get(&lhs_v.0).copied().filter(|r| is_xmm_phys(*r));
-+                let rhs_xmm = ra.get(&rhs_v.0).copied().filter(|r| is_xmm_phys(*r));
-+                let commutative = matches!(fop, FAluOp::Add | FAluOp::Mul);
-+                // NOTE: value_to_reg is NOT usable for the xmm side -- it
-+                // deliberately maps XMM homes to Vregs for the integer
-+                // path. Build the operands explicitly: xmm home -> Phys,
-+                // anything else -> Vreg (flush-time slot resolution).
-+                let reg_or_vreg = |vid: u32, xmm: Option<PhysReg>| match xmm {
-+                    Some(r) => MachOperand::Reg(MachReg::Phys(r)),
-+                    None => MachOperand::Reg(MachReg::Vreg(vid)),
-+                };
-+                let (src1, src2) = if let Some(l) = lhs_xmm {
-+                    // src1 = lhs; src2 = rhs (xmm register, or a vreg that
-+                    // flush-time resolution turns into a slot operand).
-+                    (l, reg_or_vreg(rhs_v.0, rhs_xmm))
-+                } else if commutative && rhs_xmm.is_some() {
-+                    // Swapped form, valid for add/mul only. This mirrors the
-+                    // text path's own swap when only the rhs is xmm-homed.
-+                    (rhs_xmm.unwrap(), reg_or_vreg(lhs_v.0, None))
-+                } else {
-+                    return false;
-+                };
-+                out.push(MachInst::FAlu {
-+                    op: fop,
-+                    src2,
-+                    src1: MachReg::Phys(src1),
-+                    dst: MachReg::Phys(dst_reg),
-+                    size,
-+                });
-+                return true;
-+            }
-             // BitTest is lowered by the text path, which uses BT plus
-             // register/stack-aware SETCC materialization and keeps the i32
-             // result zero-extended. MachInst currently has no BT opcode.
-@@ -1171,7 +1238,51 @@ fn lower_instruction_typed_inner(
-             seg_override,
-             ..
-         } => {
--            if ty.is_float() || ty.is_128bit() || ty.is_long_double() {
-+            if ty.is_128bit() || ty.is_long_double() {
-+                return false;
-+            }
-+            // Scalar float load: mirror of the float store subset. The dest
-+            // must be xmm-homed (xmm2..xmm15); the address a direct alloca
-+            // slot or a GPR-held pointer. Slot-homed dests, constants and
-+            // exotic addressing stay on the mature text path.
-+            if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) {
-+                if *seg_override != AddressSpace::Default {
-+                    return false;
-+                }
-+                let Some(&dst_reg) = ra.get(&dest.0) else {
-+                    return false;
-+                };
-+                if !is_xmm_phys(dst_reg) {
-+                    return false;
-+                }
-+                let size = if matches!(ty, IrType::F32 | IrType::D32) {
-+                    OpSize::S32
-+                } else {
-+                    OpSize::S64
-+                };
-+                let dst = MachOperand::Reg(MachReg::Phys(dst_reg));
-+                if let Some(&slot) = alloca_slots.get(&ptr.0) {
-+                    out.push(MachInst::FMov {
-+                        src: MachOperand::StackSlot(slot),
-+                        dst,
-+                        size,
-+                    });
-+                    return true;
-+                }
-+                if let Some(&base) = ra.get(&ptr.0) {
-+                    if is_xmm_phys(base) {
-+                        return false;
-+                    }
-+                    out.push(MachInst::FMov {
-+                        src: MachOperand::Mem {
-+                            base: MachReg::Phys(base),
-+                            offset: 0,
-+                        },
-+                        dst,
-+                        size,
-+                    });
-+                    return true;
-+                }
-                 return false;
-             }
-             if *seg_override != AddressSpace::Default {
-@@ -1227,7 +1338,61 @@ fn lower_instruction_typed_inner(
-             seg_override,
-             ..
-         } => {
--            if ty.is_float() || ty.is_128bit() || ty.is_long_double() {
-+            if ty.is_128bit() || ty.is_long_double() {
-+                return false;
-+            }
-+            // Scalar float store (F32/F64 and the D32/D64 bit-carriers).
-+            //
-+            // Typed subset, mirroring the SSE branch of emit_store_impl: the
-+            // value must already be homed in an xmm allocator register
-+            // (xmm2..xmm15) and the address must be a direct alloca slot or
-+            // a GPR-held pointer. Everything else -- slot-homed values (the
-+            // text path relays through an xmm scratch), constants, xmm-based
-+            // pointers, indexed/folded GEP addressing, F128/x87 -- keeps the
-+            // mature emitter.
-+            if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) {
-+                if *seg_override != AddressSpace::Default {
-+                    return false;
-+                }
-+                let Operand::Value(val_v) = val else {
-+                    return false;
-+                };
-+                let Some(&src_reg) = ra.get(&val_v.0) else {
-+                    return false;
-+                };
-+                if !is_xmm_phys(src_reg) {
-+                    return false;
-+                }
-+                let size = if matches!(ty, IrType::F32 | IrType::D32) {
-+                    OpSize::S32
-+                } else {
-+                    OpSize::S64
-+                };
-+                let src = MachOperand::Reg(MachReg::Phys(src_reg));
-+                if let Some(&slot) = alloca_slots.get(&ptr.0) {
-+                    out.push(MachInst::FMov {
-+                        src,
-+                        dst: MachOperand::StackSlot(slot),
-+                        size,
-+                    });
-+                    return true;
-+                }
-+                if let Some(&base) = ra.get(&ptr.0) {
-+                    // x86 addressing has no xmm base; the text path relays
-+                    // such pointers through rcx -- leave that shape there.
-+                    if is_xmm_phys(base) {
-+                        return false;
-+                    }
-+                    out.push(MachInst::FMov {
-+                        src,
-+                        dst: MachOperand::Mem {
-+                            base: MachReg::Phys(base),
-+                            offset: 0,
-+                        },
-+                        size,
-+                    });
-+                    return true;
-+                }
-                 return false;
-             }
-             // Narrow stores are ordinary `Mov`s at OpSize::S8/S16 and the
-@@ -1279,6 +1444,48 @@ fn lower_instruction_typed_inner(
-             true
-         }
-         Instruction::Copy { dest, src } => {
-+            // Scalar float copy: both sides must be xmm-homed (xmm2..xmm15),
-+            // which makes it a single register-to-register movss/movsd. Any
-+            // mixed or slot-homed shape needs the xmm scratch relay the text
-+            // path owns, so it stays there.
-+            let src_vid = match src {
-+                Operand::Value(v) => Some(v.0),
-+                Operand::Const(_) => None,
-+            };
-+            let float_ty = value_types.and_then(|vt| {
-+                src_vid
-+                    .and_then(|s| vt.get(&s).copied())
-+                    .or_else(|| vt.get(&dest.0).copied())
-+            });
-+            if let Some(ty) = float_ty {
-+                if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) {
-+                    let (Some(src_v), Some(&src_reg)) = (src_vid, src_vid.and_then(|s| ra.get(&s)))
-+                    else {
-+                        return false;
-+                    };
-+                    let Some(&dst_reg) = ra.get(&dest.0) else {
-+                        return false;
-+                    };
-+                    if !is_xmm_phys(src_reg) || !is_xmm_phys(dst_reg) {
-+                        return false;
-+                    }
-+                    let size = if matches!(ty, IrType::F32 | IrType::D32) {
-+                        OpSize::S32
-+                    } else {
-+                        OpSize::S64
-+                    };
-+                    out.push(MachInst::FMov {
-+                        src: MachOperand::Reg(MachReg::Phys(src_reg)),
-+                        dst: MachOperand::Reg(MachReg::Phys(dst_reg)),
-+                        size,
-+                    });
-+                    return true;
-+                }
-+                // F128/long double and 128-bit copies: text path.
-+                if ty.is_long_double() || ty.is_128bit() {
-+                    return false;
-+                }
-+            }
-             // Width-consistent copy: a ≤32-bit value spilled to a 4-byte small
-             // slot must be moved with a 32-bit mov. The historical
-             // unconditional S64 relay (`movq slot,%rax; movq %rax,slot`)
-diff --git a/src/backend/x86/codegen/machinst.rs b/src/backend/x86/codegen/machinst.rs
-index 64629e5..2d721d2 100644
---- a/src/backend/x86/codegen/machinst.rs
-+++ b/src/backend/x86/codegen/machinst.rs
-@@ -45,6 +45,15 @@ pub enum AluOp {
-     Imul, // 2-operand signed multiply (dst *= src)
- }
+     /// Whether backend mul+add fusion is allowed for a candidate pair with
+     /// the given expression tags (`None` = untagged: pass-generated or
+     /// inlined value).
+diff --git a/src/driver/cli.rs b/src/driver/cli.rs
+index 45cc611..cad6f06 100644
+--- a/src/driver/cli.rs
++++ b/src/driver/cli.rs
+@@ -1577,11 +1577,11 @@ impl Driver {
+                 "-fno-fast-math" => {
+                     self.fast_math = false;
+                     self.fp_reassoc = false;
+-                    // Restore the DEFAULT (contract=on, no statement-level
+-                    // fusion in LCCC because SSA loses statement boundaries).
+-                    // Explicit -ffp-contract={on,off,fast} flags always win.
++                    // Restore the language default. In GCC, -ffp-contract is
++                    // orthogonal to -fno-fast-math: the C default (fast)
++                    // stands. Explicit -ffp-contract={on,off,fast} wins.
+                     if !self.fp_contract_explicit {
+-                        self.fp_contract = FpContract::default();
++                        self.fp_contract = FpContract::c_language_default();
+                     }
+                 }
+                 "-funsafe-math-optimizations" | "-fassociative-math" => {
+@@ -2072,23 +2072,19 @@ mod cli_tests {
+         reen.parse_cli_args(&args).unwrap();
+         assert!(reen.fp_contract == FpContract::Fast);
  
-+/// Scalar SSE arithmetic operation (VEX three-operand form).
-+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-+pub enum FAluOp {
-+    Add,
-+    Sub,
-+    Mul,
-+    Div,
-+}
-+
- /// Shift operation.
- #[derive(Debug, Clone, Copy, PartialEq, Eq)]
- pub enum ShiftOp {
-@@ -110,6 +119,45 @@ pub enum MachInst {
-         size: OpSize,
-     },
+-        // GCC parity: default is -ffp-contract=on for gnu C. LCCC's
+-        // SSA-level Mul/Add fusion can change rounding across what the C
+-        // abstract machine sees as separate statements (e.g. the lowered
+-        // form of `double m = a*b; s += m;` looks identical to that of
+-        // `s += a*b;` after SROA/GVN), so fp_contract_fast defaults to
+-        // false. Users who want FMA contraction must explicitly request
+-        // it via -ffp-contract=fast or -ffast-math (which also enables
+-        // reassociation). The backend peephole layer still recognises the
+-        // leaf-return `c + a*b` tree where the mul result is consumed
+-        // exactly once as an FMA, matching GCC's observed vfmadd output
+-        // for that case without affecting loop reductions.
++        // GCC parity: the C default IS -ffp-contract=fast (GNU dialects,
++        // since 4.6). The old assertion here ("default must NOT fuse") was
++        // refuted by the godbolt oracles: on `t = a[i]*b[i]; s = s + t;`
++        // at -O3 -march=x86-64-v3, gcc16.2 and icx emit vfmadd by default
++        // -- only clang (default `on`) keeps the separate pair. The
++        // backend's FMA3 ISA gate keeps baseline x86-64 builds
++        // numerically identical regardless.
+         let mut dflt = Driver::new();
+         let args = vec!["lccc".to_string(), "x.c".to_string()];
+         dflt.parse_cli_args(&args).unwrap();
+         assert!(
+-            dflt.fp_contract == FpContract::Off,
+-            "gnu-C default must NOT fuse mul+add across SSA values without explicit -ffp-contract=fast"
++            dflt.fp_contract == FpContract::Fast,
++            "gnu-C default must match GCC: -ffp-contract=fast"
+         );
  
-+    /// Scalar SSE move: `movss` (S32) / `movsd` (S64).
-+    ///
-+    /// Float values live in the XMM domain (`MachReg::Phys` with an id in
-+    /// 20..=33, i.e. xmm2..xmm15); GPR<->XMM moves are NOT this instruction
-+    /// (those are movd/movq and stay on the text path). At most one operand
-+    /// may be a memory/slot form — x86 has no mem-to-mem SSE move, so the
-+    /// lowering must not produce one (the slot-homed side needs an xmm
-+    /// scratch relay, which the mature text path owns).
-+    ///
-+    /// Size semantics: S32 selects the single-precision mnemonic (movss),
-+    /// S64 the double (movsd). Decimal carriers D32/D64 move through the
-+    /// same bit-exact SSE instructions (mirrors emit_store_impl).
-+    FMov {
-+        src: MachOperand,
-+        dst: MachOperand,
-+        size: OpSize,
-+    },
-+
-+    /// Scalar SSE arithmetic in the VEX three-operand form:
-+    /// `v{add,sub,mul,div}s{s,d} src2, %src1, %dst` computing
-+    /// dst = src1 OP src2.
-+    ///
-+    /// The three-operand form is the whole point: it has no destructive
-+    /// destination, so dest-aliases-an-operand needs no staging copy (the
-+    /// legacy two-address form forced `vmovsd` staging and, for sub/div
-+    /// whose dest held the RHS, an xmm0 relay). `src1` must be an xmm
-+    /// register; `src2` may be an xmm register or ONE memory/slot operand
-+    /// (x86 allows at most one). Size S32 selects the `ss` suffix, S64 `sd`.
-+    ///
-+    /// Operand order is semantically load-bearing for Sub/Div (dst =
-+    /// src1 - src2, src1 / src2): the lowering must keep lhs in src1.
-+    FAlu {
-+        op: FAluOp,
-+        src2: MachOperand,
-+        src1: MachReg,
-+        dst: MachReg,
-+        size: OpSize,
-+    },
-+
-     /// movzx src, dst (zero-extend: movzbl, movzwl, movzbq, movzwq)
-     Movzx {
-         src: MachOperand,
-diff --git a/src/backend/x86/codegen/machinst_emit.rs b/src/backend/x86/codegen/machinst_emit.rs
-index ea36db0..40d1729 100644
---- a/src/backend/x86/codegen/machinst_emit.rs
-+++ b/src/backend/x86/codegen/machinst_emit.rs
-@@ -41,14 +41,24 @@ fn reg_name(reg: PhysReg) -> &'static str {
-         14 => "rdi",
-         15 => "rsi",
-         16 => "rdx",
--        // XMM registers — shouldn't normally appear in GPR MachInst, but handle
--        // gracefully for values that got XMM allocation from the main allocator.
-+        // XMM registers for F64 allocation
-         20 => "xmm2",
-         21 => "xmm3",
-         22 => "xmm4",
-         23 => "xmm5",
-         24 => "xmm6",
-         25 => "xmm7",
-+        // xmm8-xmm15: additional caller-saved float homes (same convention
-+        // as emit.rs phys_reg_name). Reachable now that FMov lowers float
-+        // moves through MachInst.
-+        26 => "xmm8",
-+        27 => "xmm9",
-+        28 => "xmm10",
-+        29 => "xmm11",
-+        30 => "xmm12",
-+        31 => "xmm13",
-+        32 => "xmm14",
-+        33 => "xmm15",
-         // NO SILENT FALLBACK. This arm used to return "rax", so an unexpected
-         // register index produced a syntactically valid instruction naming the
-         // WRONG register -- a silent miscompile, in the most frequently used
-@@ -236,6 +246,33 @@ fn assert_scratch_free(imm: &MachOperand, other: &MachReg) {
-     );
- }
+         // Explicit contract flag is sticky against later -ffast-math
+@@ -2106,8 +2102,8 @@ mod cli_tests {
+             "explicit off survives -ffast-math"
+         );
  
-+/// Map an XMM-allocated PhysReg to its scalar SSE register name.
+-        // -fno-fast-math restores the non-fast default (i.e. fp_contract_fast
+-        // is NOT set). It does not itself enable contraction.
++        // -fno-fast-math is orthogonal to contraction in GCC: the language
++        // default (fast) stands after it.
+         let mut nfm = Driver::new();
+         let args = vec![
+             "lccc".to_string(),
+@@ -2116,9 +2112,20 @@ mod cli_tests {
+         ];
+         nfm.parse_cli_args(&args).unwrap();
+         assert!(
+-            nfm.fp_contract == FpContract::Off,
+-            "-fno-fast-math must not silently turn contraction on"
++            nfm.fp_contract == FpContract::Fast,
++            "-fno-fast-math restores the language default (GCC orthogonality)"
+         );
++
++        // ... and an explicit off still survives -fno-fast-math.
++        let mut nfm_off = Driver::new();
++        let args = vec![
++            "lccc".to_string(),
++            "-ffp-contract=off".to_string(),
++            "-fno-fast-math".to_string(),
++            "x.c".to_string(),
++        ];
++        nfm_off.parse_cli_args(&args).unwrap();
++        assert!(nfm_off.fp_contract == FpContract::Off);
+     }
+ 
+     #[test]
+diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
+index 84b3c9a..c41a91c 100644
+--- a/src/driver/pipeline.rs
++++ b/src/driver/pipeline.rs
+@@ -377,27 +377,17 @@ impl Driver {
+             optimize: false, // Only set to true when user explicitly passes -O1 or higher
+             optimize_size: false,
+             fp_reassoc: false,
+-            // DEFAULT false (contract=on semantics without statement-level
+-            // fusion): empirically verified against GCC 14.2 (Debian
+-            // 14.2.0-19). At plain -O2 GCC emits scalar FMA ONLY for the
+-            // leaf "c + a*b" tree (where GVN/SROA can prove the mul feeds
+-            // ONLY the add AND the multiply has no observable side-effects
+-            // other than the renamed SSA temporary). For loop-carried
+-            // reductions and other contexts LCCC's SSA form does not carry
+-            // enough source-level statement-boundary information to
+-            // distinguish the safe single-expression pattern from the
+-            // cross-statement pattern (`double m = a*b; s += m;`), so the
+-            // conservative / correct choice is to NOT fuse mul+add unless
+-            // the user explicitly opts in via -ffp-contract=fast or
+-            // -ffast-math (which sets fp_contract_fast = true). The GCC
+-            // 14 behavior in loops (vmulsd+vaddsd, no FMA) matches this
+-            // default exactly for reductions; the leaf one-line function
+-            // still benefits from the simple backend peephole in
+-            // emit_float_binop_impl that can produce FMA when the result is
+-            // returned directly (zero additional latency vs separate insns,
+-            // and both forms round identically in that shape because no
+-            // other consumer observes the intermediate mul result).
+-            fp_contract: crate::common::fp_contract::FpContract::default(),
++            // Contraction default for C: FAST, matching GCC's C default
++            // (-ffp-contract=fast). The previous Off default claimed to match
++            // "GCC 14 behavior in loops" -- refuted by the godbolt oracles:
++            // on a cross-statement reduction at -O3 -march=x86-64-v3, gcc16.2
++            // and icx fuse to vfmadd by default (clang, whose default is
++            // `on`, does not). Off forfeited every scalar FMA against the
++            // reference compilers (dot8: lccc 46 insns vs gcc 21 / icx 10).
++            // Explicit -ffp-contract={on,off} wins; the backend additionally
++            // gates on FMA3 ISA availability, so baseline x86-64 builds are
++            // numerically unchanged.
++            fp_contract: crate::common::fp_contract::FpContract::c_language_default(),
+             fp_contract_explicit: false,
+             fast_math: false,
+             verbose: false,
+diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
+index 936dff1..f2d023d 100644
+--- a/src/passes/loop_unroll.rs
++++ b/src/passes/loop_unroll.rs
+@@ -528,6 +528,73 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
+ ///   uses of carried phis with the last clone's corresponding value; the exit
+ ///   block's phi edges from the header label are relabeled to the last
+ ///   clone's latch (the block that now branches to the exit).
++/// Exact static trip count for a constant-stride IV loop, or `None` when the
++/// stride is degenerate (0) or its sign contradicts the exit comparison
++/// (e.g. a negative step against `i < limit`), which would mean the loop
++/// never terminates or never runs past the guard.
 +///
-+/// FMov register operands live in the XMM domain by construction (the
-+/// lowering only routes values whose allocator home is xmm2..xmm15). A GPR
-+/// or unallocated register here is a lowering defect, not an input to paper
-+/// over: name it loudly rather than emit an instruction that assembles with
-+/// the wrong operand class.
-+fn freg_name(reg: PhysReg) -> &'static str {
-+    match reg.0 {
-+        20 => "xmm2",
-+        21 => "xmm3",
-+        22 => "xmm4",
-+        23 => "xmm5",
-+        24 => "xmm6",
-+        25 => "xmm7",
-+        26 => "xmm8",
-+        27 => "xmm9",
-+        28 => "xmm10",
-+        29 => "xmm11",
-+        30 => "xmm12",
-+        31 => "xmm13",
-+        32 => "xmm14",
-+        33 => "xmm15",
-+        _ => unreachable!("invalid machinst XMM register index {}", reg.0),
++/// Complete unrolling needs the EXACT count up front — there is no cleanup
++/// loop — so every arm is closed-form:
++///   * `i <  limit`, step > 0: ceil((limit - init) / step)
++///   * `i <= limit`, step > 0: floor((limit - init) / step) + 1
++///   * `i >  limit`, step < 0: ceil((init - limit) / -step)
++///   * `i >= limit`, step < 0: floor((init - limit) / -step) + 1
++/// The ceil forms are exact for non-divisible spans because the exit test
++/// runs every stride; the floor+1 forms count the last in-range iteration.
++/// Non-positive spans (loop body never executes) yield `None`, matching the
++/// pre-existing step-1 guards. For step == 1 this reduces to the historical
++/// arithmetic verbatim.
++fn complete_unroll_trip(iv_init: i64, limit: i64, cmp_op: IrCmpOp, iv_step: i64) -> Option<i64> {
++    if iv_step == 0 {
++        return None; // non-advancing IV: infinite or empty; not a trip count
 +    }
++    let ascending = iv_step > 0;
++    let trip = match cmp_op {
++        IrCmpOp::Slt | IrCmpOp::Ult => {
++            if !ascending {
++                return None;
++            }
++            let span = limit - iv_init;
++            if span <= 0 {
++                return None;
++            }
++            (span + iv_step - 1) / iv_step
++        }
++        IrCmpOp::Sle | IrCmpOp::Ule => {
++            if !ascending {
++                return None;
++            }
++            let span = limit - iv_init;
++            if span < 0 {
++                return None;
++            }
++            span / iv_step + 1
++        }
++        IrCmpOp::Sgt | IrCmpOp::Ugt => {
++            if ascending {
++                return None;
++            }
++            let span = iv_init - limit;
++            if span <= 0 {
++                return None;
++            }
++            (span + (-iv_step) - 1) / -iv_step
++        }
++        IrCmpOp::Sge | IrCmpOp::Uge => {
++            if ascending {
++                return None;
++            }
++            let span = iv_init - limit;
++            if span < 0 {
++                return None;
++            }
++            span / -iv_step + 1
++        }
++        _ => return None,
++    };
++    Some(trip)
 +}
 +
- /// ALU operation mnemonic.
- fn alu_mnemonic(op: AluOp) -> &'static str {
-     match op {
-@@ -367,6 +404,109 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
-             out.emit_fmt(format_args!("    mov{} {}, {}", suffix, src_str, dst_str));
+ fn try_complete_unroll_general(
+     func: &mut IrFunction,
+     lp: &loop_analysis::NaturalLoop,
+@@ -604,15 +671,14 @@ fn try_complete_unroll_general(
+         return false;
+     }
+ 
+-    // Basic IV: phi in header, Add(phi, 1) in the latch.
++    // Basic IV: phi in header, Add(phi, step) in the latch. The stride may
++    // be any non-zero constant; complete_unroll_trip rejects degenerate
++    // stride/comparison combinations.
+     let Some((iv_phi, iv_ty, iv_step, latch_iv_incr_idx)) =
+         find_iv_in_loop(func, header, latch, latch_label)
+     else {
+         return false;
+     };
+-    if iv_step != 1 {
+-        return false;
+-    }
+ 
+     // Exit from the header's CondBranch.
+     let Some((exit_target, body_entry, cmp_op, _cmp_ty, exit_limit, _iv_is_lhs, _pos)) =
+@@ -645,32 +711,8 @@ fn try_complete_unroll_general(
+     };
+ 
+     // Trip count (same arithmetic as the two-block unroller).
+-    let trip: i64 = match cmp_op {
+-        IrCmpOp::Slt | IrCmpOp::Ult => {
+-            if limit_n <= iv_init {
+-                return false;
+-            }
+-            limit_n - iv_init
+-        }
+-        IrCmpOp::Sle | IrCmpOp::Ule => {
+-            if limit_n < iv_init {
+-                return false;
+-            }
+-            limit_n - iv_init + 1
+-        }
+-        IrCmpOp::Sgt | IrCmpOp::Ugt => {
+-            if iv_init <= limit_n {
+-                return false;
+-            }
+-            iv_init - limit_n
+-        }
+-        IrCmpOp::Sge | IrCmpOp::Uge => {
+-            if iv_init < limit_n {
+-                return false;
+-            }
+-            iv_init - limit_n + 1
+-        }
+-        _ => return false,
++    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step) else {
++        return false;
+     };
+     if !(2..=16).contains(&trip) {
+         return false;
+@@ -1081,9 +1123,6 @@ fn try_complete_unroll_two_block(
+     else {
+         return false;
+     };
+-    if iv_step != 1 {
+-        return false;
+-    }
+     let Some((
+         exit_target,
+         body_entry,
+@@ -1145,32 +1184,8 @@ fn try_complete_unroll_two_block(
+         },
+         _ => return false,
+     };
+-    let trip: i64 = match cmp_op {
+-        IrCmpOp::Slt | IrCmpOp::Ult => {
+-            if limit_n <= iv_init {
+-                return false;
+-            }
+-            limit_n - iv_init
+-        }
+-        IrCmpOp::Sle | IrCmpOp::Ule => {
+-            if limit_n < iv_init {
+-                return false;
+-            }
+-            limit_n - iv_init + 1
+-        }
+-        IrCmpOp::Sgt | IrCmpOp::Ugt => {
+-            if iv_init <= limit_n {
+-                return false;
+-            }
+-            iv_init - limit_n
+-        }
+-        IrCmpOp::Sge | IrCmpOp::Uge => {
+-            if iv_init < limit_n {
+-                return false;
+-            }
+-            iv_init - limit_n + 1
+-        }
+-        _ => return false,
++    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step) else {
++        return false;
+     };
+     // Trip bound 16 with a 512-expanded-instruction budget (levkropp
+     // 1b4bac8b's full-unroll limits, grafted onto our two-block complete
+@@ -3057,4 +3072,146 @@ mod tests {
          }
- 
-+        MachInst::FMov { src, dst, size } => {
-+            let mnem = match size {
-+                OpSize::S32 => "movss",
-+                OpSize::S64 => "movsd",
-+                // 8/16-bit scalar SSE moves do not exist; the lowering only
-+                // produces F32/F64 (and the D32/D64 bit-carriers).
-+                _ => unreachable!("FMov with non-float size {size:?}"),
-+            };
-+            // Register operands format at their XMM name regardless of the
-+            // size suffix; memory operands reuse the S64 GPR formatting.
-+            let fmt = |op: &MachOperand| -> String {
-+                match op {
-+                    MachOperand::Reg(MachReg::Phys(r)) => format!("%{}", freg_name(*r)),
-+                    // A Vreg reaching emission means allocation was skipped
-+                    // (reg_name_pub traps on the same invariant).
-+                    MachOperand::Reg(MachReg::Vreg(id)) => {
-+                        unreachable!("vreg{id} reached FMov emission unallocated")
-+                    }
-+                    // Mem/Slot/RipRel bases are GPRs named at 64-bit width.
-+                    other => fmt_operand(other, OpSize::S64, out),
-+                }
-+            };
-+            match (src, dst) {
-+                // Self-move: nothing to do (same xmm home).
-+                (MachOperand::Reg(a), MachOperand::Reg(b)) if a == b => return,
-+                // Register-to-register copies use the VEX 3-operand form,
-+                // exactly like the text path's load_fp_to_reg: the legacy
-+                // 2-operand `movsd %src, %dst` is a MERGING move that reads
-+                // the destination's upper lane, creating a false dependence
-+                // on whatever last wrote it (nbody's sqrt loop serialised
-+                // 3.1x vs GCC from this before the text path switched).
-+                (MachOperand::Reg(_), MachOperand::Reg(_)) => {
-+                    let src_str = fmt(src);
-+                    let dst_str = fmt(dst);
-+                    out.emit_fmt(format_args!(
-+                        "    v{mnem} {src_str}, {src_str}, {dst_str}"
-+                    ));
-+                    return;
-+                }
-+                // x86 has no mem-to-mem SSE move; the lowering gate refuses
-+                // those shapes (the relay needs an xmm scratch the text path
-+                // owns). Trap rather than emit a broken relay through a
-+                // possibly-live register.
-+                (MachOperand::Mem { .. } | MachOperand::StackSlot(_), MachOperand::Mem { .. } | MachOperand::StackSlot(_)) => {
-+                    unreachable!("FMov mem-to-mem is unencodable; the lowering must reject it")
-+                }
-+                // Immediates have no scalar-SSE form (constants materialize
-+                // through .rodata on the text path).
-+                (MachOperand::Imm(v), _) => {
-+                    unreachable!("FMov from immediate {v} is unencodable")
-+                }
-+                _ => {}
-+            }
-+            let src_str = fmt(src);
-+            let dst_str = fmt(dst);
-+            out.emit_fmt(format_args!("    {mnem} {src_str}, {dst_str}"));
-+        }
-+
-+        MachInst::FAlu {
-+            op,
-+            src2,
-+            src1,
-+            dst,
-+            size,
-+        } => {
-+            let base = match op {
-+                FAluOp::Add => "vadd",
-+                FAluOp::Sub => "vsub",
-+                FAluOp::Mul => "vmul",
-+                FAluOp::Div => "vdiv",
-+            };
-+            let mnem = match size {
-+                OpSize::S32 => format!("{base}ss"),
-+                OpSize::S64 => format!("{base}sd"),
-+                _ => unreachable!("FAlu with non-float size {size:?}"),
-+            };
-+            let src2_str = match src2 {
-+                MachOperand::Reg(MachReg::Phys(r)) => format!("%{}", freg_name(*r)),
-+                MachOperand::Reg(MachReg::Vreg(id)) => {
-+                    unreachable!("vreg{id} reached FAlu emission unallocated")
-+                }
-+                MachOperand::Imm(v) => {
-+                    unreachable!("FAlu from immediate {v} is unencodable; constants materialize via .rodata on the text path")
-+                }
-+                other => fmt_operand(other, OpSize::S64, out),
-+            };
-+            let src1_str = match src1 {
-+                MachReg::Phys(r) => freg_name(*r),
-+                MachReg::Vreg(id) => {
-+                    unreachable!("vreg{id} reached FAlu emission unallocated (src1)")
-+                }
-+            };
-+            let dst_str = match dst {
-+                MachReg::Phys(r) => freg_name(*r),
-+                MachReg::Vreg(id) => {
-+                    unreachable!("vreg{id} reached FAlu emission unallocated (dst)")
-+                }
-+            };
-+            out.emit_fmt(format_args!(
-+                "    {mnem} {src2_str}, %{src1_str}, %{dst_str}"
-+            ));
-+        }
-+
-         MachInst::Alu { op, src, dst, size } => {
-             let mnem = alu_mnemonic(*op);
-             // THERE IS NO TWO-OPERAND 8-BIT `imul`. x86 offers only the
-diff --git a/src/backend/x86/codegen/machinst_tests.rs b/src/backend/x86/codegen/machinst_tests.rs
-index a6cc105..01dc4d6 100644
---- a/src/backend/x86/codegen/machinst_tests.rs
-+++ b/src/backend/x86/codegen/machinst_tests.rs
-@@ -499,6 +499,64 @@ fn instruction_corpus() -> Vec<MachInst> {
-     let mut v = Vec::new();
-     let regs = [PhysReg(0), PhysReg(7), PhysReg(15), PhysReg(2), PhysReg(16)];
- 
-+    // FMov: every xmm allocator home at both scalar widths, plus every
-+    // operand pairing the lowering can produce (reg/reg, reg/mem, mem/reg,
-+    // reg/slot, slot/reg). The assembler differential proves the xmm8-15
-+    // names encode (REX-prefixed) and that no shape is mem-to-mem.
-+    for idx in 20u8..=33 {
-+        let a = PhysReg(idx);
-+        let b = PhysReg(if idx == 33 { 20 } else { idx + 1 });
-+        for size in [OpSize::S32, OpSize::S64] {
-+            v.push(MachInst::FMov {
-+                src: reg(a),
-+                dst: reg(b),
-+                size,
-+            });
-+            for op in [FAluOp::Add, FAluOp::Sub, FAluOp::Mul, FAluOp::Div] {
-+                v.push(MachInst::FAlu {
-+                    op,
-+                    src2: reg(b),
-+                    src1: MachReg::Phys(a),
-+                    dst: MachReg::Phys(a),
-+                    size,
-+                });
-+                v.push(MachInst::FAlu {
-+                    op,
-+                    src2: MachOperand::StackSlot(-32),
-+                    src1: MachReg::Phys(a),
-+                    dst: MachReg::Phys(b),
-+                    size,
-+                });
-+            }
-+            v.push(MachInst::FMov {
-+                src: reg(a),
-+                dst: MachOperand::Mem {
-+                    base: MachReg::Phys(PhysReg(14)),
-+                    offset: -8,
-+                },
-+                size,
-+            });
-+            v.push(MachInst::FMov {
-+                src: MachOperand::Mem {
-+                    base: MachReg::Phys(PhysReg(15)),
-+                    offset: 16,
-+                },
-+                dst: reg(a),
-+                size,
-+            });
-+            v.push(MachInst::FMov {
-+                src: reg(a),
-+                dst: MachOperand::StackSlot(-24),
-+                size,
-+            });
-+            v.push(MachInst::FMov {
-+                src: MachOperand::StackSlot(-24),
-+                dst: reg(a),
-+                size,
-+            });
-+        }
-+    }
-+
-     for size in SIZES {
-         for (i, &a) in regs.iter().enumerate() {
-             let b = regs[(i + 1) % regs.len()];
-@@ -1338,9 +1396,14 @@ fn instruction_selection_covers_the_expected_instruction_classes() {
-     use crate::common::types::IrType;
-     use crate::common::fx_hash::FxHashMap;
- 
--    let ra: FxHashMap<u32, PhysReg> = [(1u32, PhysReg(0)), (2, PhysReg(7)), (3, PhysReg(11))]
--        .into_iter()
--        .collect();
-+    let ra: FxHashMap<u32, PhysReg> = [
-+        (1u32, PhysReg(0)),
-+        (2, PhysReg(7)),
-+        (3, PhysReg(11)),
-+        (4, PhysReg(20)), // xmm2-homed float value
-+    ]
-+    .into_iter()
-+    .collect();
-     let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
- 
-     // One representative of every class the layer claims to own. A `false`
-@@ -1401,6 +1464,48 @@ fn instruction_selection_covers_the_expected_instruction_classes() {
-                 volatile: false,
-             },
-         ),
-+        // Scalar float moves (FMov): value 4 is xmm-homed, 3 is a GPR ptr,
-+        // 9 an alloca slot.
-+        (
-+            "Store(f64)",
-+            Instruction::Store {
-+                val: Operand::Value(Value(4)),
-+                ptr: Value(3),
-+                ty: IrType::F64,
-+                seg_override: Default::default(),
-+                volatile: false,
-+            },
-+        ),
-+        (
-+            "Store(f32)",
-+            Instruction::Store {
-+                val: Operand::Value(Value(4)),
-+                ptr: Value(9),
-+                ty: IrType::F32,
-+                seg_override: Default::default(),
-+                volatile: false,
-+            },
-+        ),
-+        (
-+            "Load(f64)",
-+            Instruction::Load {
-+                dest: Value(4),
-+                ptr: Value(3),
-+                ty: IrType::F64,
-+                seg_override: Default::default(),
-+                volatile: false,
-+            },
-+        ),
-+        (
-+            "BinOp(f64)",
-+            Instruction::BinOp {
-+                dest: Value(4),
-+                op: IrBinOp::Add,
-+                lhs: Operand::Value(Value(4)),
-+                rhs: Operand::Value(Value(4)),
-+                ty: IrType::F64,
-+            },
-+        ),
-         (
-             "Cmp",
-             Instruction::Cmp {
-@@ -1471,3 +1576,739 @@ fn global_addr_lowers_to_an_address_computation_not_a_load() {
-         other => panic!("GlobalAddr must lower to LeaSym, got {other:?}"),
-     }
- }
-+
-+// ── 5. FMov: scalar SSE moves ────────────────────────────────────────────
-+//
-+// Float values live in the XMM domain (PhysReg 20..=33 = xmm2..xmm15). The
-+// golden tests pin the exact AT&T text; the trap tests pin the shapes the
-+// lowering must never produce (they would emit unencodable instructions or
-+// silently relay through a live register); the isel tests pin which IR
-+// shapes reach the typed path at all.
-+
-+/// Canonical xmm names, written independently of the emitter's table.
-+fn expected_xmm(idx: u8) -> &'static str {
-+    match idx {
-+        20 => "xmm2",
-+        21 => "xmm3",
-+        22 => "xmm4",
-+        23 => "xmm5",
-+        24 => "xmm6",
-+        25 => "xmm7",
-+        26 => "xmm8",
-+        27 => "xmm9",
-+        28 => "xmm10",
-+        29 => "xmm11",
-+        30 => "xmm12",
-+        31 => "xmm13",
-+        32 => "xmm14",
-+        33 => "xmm15",
-+        _ => panic!("PhysReg({idx}) is not an xmm allocator home"),
-+    }
-+}
-+
-+const XMM_REGS: &[u8] = &[20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33];
-+
-+#[test]
-+fn fmov_names_every_xmm_home_at_both_scalar_widths() {
-+    for (i, &a) in XMM_REGS.iter().enumerate() {
-+        let b = XMM_REGS[(i + 1) % XMM_REGS.len()];
-+        // Reg-to-reg uses the VEX 3-operand form (no merging-move false
-+        // dependence -- see the emitter comment).
-+        let line = emit1(&MachInst::FMov {
-+            src: reg(PhysReg(a)),
-+            dst: reg(PhysReg(b)),
-+            size: OpSize::S64,
-+        });
-+        assert_eq!(
-+            line,
-+            format!(
-+                "vmovsd %{}, %{}, %{}",
-+                expected_xmm(a),
-+                expected_xmm(a),
-+                expected_xmm(b)
-+            )
-+        );
-+        let line = emit1(&MachInst::FMov {
-+            src: reg(PhysReg(a)),
-+            dst: reg(PhysReg(b)),
-+            size: OpSize::S32,
-+        });
-+        assert_eq!(
-+            line,
-+            format!(
-+                "vmovss %{}, %{}, %{}",
-+                expected_xmm(a),
-+                expected_xmm(a),
-+                expected_xmm(b)
-+            )
-+        );
-+    }
-+}
-+
-+#[test]
-+fn fmov_memory_and_slot_shapes_are_exact() {
-+    // reg -> mem with and without displacement
-+    assert_eq!(
-+        emit1(&MachInst::FMov {
-+            src: reg(PhysReg(21)),
-+            dst: MachOperand::Mem {
-+                base: MachReg::Phys(PhysReg(14)),
-+                offset: 0,
-+            },
-+            size: OpSize::S64,
-+        }),
-+        "movsd %xmm3, (%rdi)"
-+    );
-+    assert_eq!(
-+        emit1(&MachInst::FMov {
-+            src: reg(PhysReg(21)),
-+            dst: MachOperand::Mem {
-+                base: MachReg::Phys(PhysReg(15)),
-+                offset: -16,
-+            },
-+            size: OpSize::S32,
-+        }),
-+        "movss %xmm3, -16(%rsi)"
-+    );
-+    // mem -> reg
-+    assert_eq!(
-+        emit1(&MachInst::FMov {
-+            src: MachOperand::Mem {
-+                base: MachReg::Phys(PhysReg(16)),
-+                offset: 8,
-+            },
-+            dst: reg(PhysReg(26)),
-+            size: OpSize::S64,
-+        }),
-+        "movsd 8(%rdx), %xmm8"
-+    );
-+    // reg <-> stack slot (rbp-relative by default)
-+    assert_eq!(
-+        emit1(&MachInst::FMov {
-+            src: reg(PhysReg(20)),
-+            dst: MachOperand::StackSlot(-8),
-+            size: OpSize::S64,
-+        }),
-+        "movsd %xmm2, -8(%rbp)"
-+    );
-+    assert_eq!(
-+        emit1(&MachInst::FMov {
-+            src: MachOperand::StackSlot(-8),
-+            dst: reg(PhysReg(20)),
-+            size: OpSize::S32,
-+        }),
-+        "movss -8(%rbp), %xmm2"
-+    );
-+}
-+
-+#[test]
-+fn fmov_stack_slot_honors_rsp_addressing() {
-+    let mut out = AsmOutput::new();
-+    out.use_rsp_addressing = true;
-+    out.rsp_frame_size = 64;
-+    emit_machinst(
-+        &MachInst::FMov {
-+            src: reg(PhysReg(20)),
-+            dst: MachOperand::StackSlot(-8),
-+            size: OpSize::S64,
-+        },
-+        &mut out,
-+    );
-+    assert_eq!(out.buf.trim(), "movsd %xmm2, 56(%rsp)");
-+}
-+
-+#[test]
-+fn fmov_self_move_emits_nothing() {
-+    let lines = emit(&MachInst::FMov {
-+        src: reg(PhysReg(23)),
-+        dst: reg(PhysReg(23)),
-+        size: OpSize::S64,
-+    });
-+    assert!(lines.is_empty(), "self-move emitted {lines:?}");
-+}
-+
-+// Trap tests: these shapes are unencodable or would relay through a
-+// possibly-live register. The emitter must refuse them loudly; the isel
-+// gates are what keep them from ever being constructed in practice.
-+
-+#[test]
-+#[should_panic(expected = "non-float size")]
-+fn fmov_rejects_narrow_sizes() {
-+    emit1(&MachInst::FMov {
-+        src: reg(PhysReg(20)),
-+        dst: reg(PhysReg(21)),
-+        size: OpSize::S16,
-+    });
-+}
-+
-+#[test]
-+#[should_panic(expected = "mem-to-mem")]
-+fn fmov_rejects_mem_to_mem() {
-+    emit1(&MachInst::FMov {
-+        src: MachOperand::StackSlot(-8),
-+        dst: MachOperand::Mem {
-+            base: MachReg::Phys(PhysReg(14)),
-+            offset: 0,
-+        },
-+        size: OpSize::S64,
-+    });
-+}
-+
-+#[test]
-+#[should_panic(expected = "mem-to-mem")]
-+fn fmov_rejects_slot_to_slot() {
-+    emit1(&MachInst::FMov {
-+        src: MachOperand::StackSlot(-8),
-+        dst: MachOperand::StackSlot(-16),
-+        size: OpSize::S64,
-+    });
-+}
-+
-+#[test]
-+#[should_panic(expected = "immediate")]
-+fn fmov_rejects_immediate_source() {
-+    emit1(&MachInst::FMov {
-+        src: MachOperand::Imm(0),
-+        dst: reg(PhysReg(20)),
-+        size: OpSize::S64,
-+    });
-+}
-+
-+#[test]
-+#[should_panic(expected = "unallocated")]
-+fn fmov_rejects_unallocated_vreg() {
-+    emit1(&MachInst::FMov {
-+        src: MachOperand::Reg(MachReg::Vreg(42)),
-+        dst: reg(PhysReg(20)),
-+        size: OpSize::S64,
-+    });
-+}
-+
-+// ── FMov isel admission ───────────────────────────────────────────────────
-+//
-+// The typed path must accept exactly the xmm-homed subset and decline
-+// everything else: a `true` on a shape the emitter does not model is a
-+// miscompile, a `false` on a modelled shape is lost coverage.
-+
-+#[test]
-+fn float_moves_lower_through_machinst() {
-+    use crate::common::fx_hash::FxHashMap;
-+    use crate::common::types::IrType;
-+    use crate::ir::reexports::{Instruction, Operand, Value};
-+
-+    // 4: xmm2-homed float value; 5: xmm3-homed; 3: GPR pointer (r10);
-+    // 9: alloca slot at -8.
-+    let ra: FxHashMap<u32, PhysReg> = [
-+        (3u32, PhysReg(11)),
-+        (4, PhysReg(20)),
-+        (5, PhysReg(21)),
-+    ]
-+    .into_iter()
-+    .collect();
-+    let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
-+
-+    let store = |val: u32, ptr: u32, ty: IrType| Instruction::Store {
-+        val: Operand::Value(Value(val)),
-+        ptr: Value(ptr),
-+        ty,
-+        seg_override: Default::default(),
-+        volatile: false,
-+    };
-+    let load = |dest: u32, ptr: u32, ty: IrType| Instruction::Load {
-+        dest: Value(dest),
-+        ptr: Value(ptr),
-+        ty,
-+        seg_override: Default::default(),
-+        volatile: false,
-+    };
-+
-+    // Store F64 through the alloca slot.
-+    let mut out = Vec::new();
-+    assert!(super::isel::lower_instruction_typed(
-+        &store(4, 9, IrType::F64),
-+        &ra,
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    match &out[..] {
-+        [MachInst::FMov {
-+            src: MachOperand::Reg(MachReg::Phys(s)),
-+            dst: MachOperand::StackSlot(off),
-+            size,
-+        }] => {
-+            assert_eq!(*s, PhysReg(20));
-+            assert_eq!(*off, -8);
-+            assert_eq!(*size, OpSize::S64);
-+        }
-+        other => panic!("unexpected lowering: {other:?}"),
-+    }
-+
-+    // Store F32 through the GPR pointer.
-+    let mut out = Vec::new();
-+    assert!(super::isel::lower_instruction_typed(
-+        &store(4, 3, IrType::F32),
-+        &ra,
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    match &out[..] {
-+        [MachInst::FMov {
-+            dst: MachOperand::Mem { base, offset },
-+            size,
-+            ..
-+        }] => {
-+            assert_eq!(*base, MachReg::Phys(PhysReg(11)));
-+            assert_eq!(*offset, 0);
-+            assert_eq!(*size, OpSize::S32);
-+        }
-+        other => panic!("unexpected lowering: {other:?}"),
-+    }
-+
-+    // Load F64 through the GPR pointer into an xmm home.
-+    let mut out = Vec::new();
-+    assert!(super::isel::lower_instruction_typed(
-+        &load(5, 3, IrType::F64),
-+        &ra,
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    match &out[..] {
-+        [MachInst::FMov {
-+            src: MachOperand::Mem { .. },
-+            dst: MachOperand::Reg(MachReg::Phys(d)),
-+            size,
-+        }] => {
-+            assert_eq!(*d, PhysReg(21));
-+            assert_eq!(*size, OpSize::S64);
-+        }
-+        other => panic!("unexpected lowering: {other:?}"),
-+    }
-+
-+    // Load F32 from the alloca slot.
-+    let mut out = Vec::new();
-+    assert!(super::isel::lower_instruction_typed(
-+        &load(5, 9, IrType::F32),
-+        &ra,
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    match &out[..] {
-+        [MachInst::FMov {
-+            src: MachOperand::StackSlot(off),
-+            size,
-+            ..
-+        }] => {
-+            assert_eq!(*off, -8);
-+            assert_eq!(*size, OpSize::S32);
-+        }
-+        other => panic!("unexpected lowering: {other:?}"),
-+    }
-+
-+    // Float Copy between two xmm homes (type from the value-type map).
-+    let mut vt: FxHashMap<u32, IrType> = FxHashMap::default();
-+    vt.insert(4, IrType::F32);
-+    let mut out = Vec::new();
-+    assert!(super::isel::lower_instruction_typed(
-+        &Instruction::Copy {
-+            dest: Value(5),
-+            src: Operand::Value(Value(4)),
-+        },
-+        &ra,
-+        &slots,
-+        Some(&vt),
-+        &mut out,
-+    ));
-+    match &out[..] {
-+        [MachInst::FMov {
-+            src: MachOperand::Reg(MachReg::Phys(s)),
-+            dst: MachOperand::Reg(MachReg::Phys(d)),
-+            size,
-+        }] => {
-+            assert_eq!(*s, PhysReg(20));
-+            assert_eq!(*d, PhysReg(21));
-+            assert_eq!(*size, OpSize::S32);
-+        }
-+        other => panic!("unexpected lowering: {other:?}"),
-+    }
-+}
-+
-+#[test]
-+fn float_moves_outside_the_subset_stay_on_the_text_path() {
-+    use crate::common::fx_hash::FxHashMap;
-+    use crate::common::types::IrType;
-+    use crate::ir::reexports::{Instruction, IrConst, Operand, Value};
-+
-+    let ra: FxHashMap<u32, PhysReg> = [
-+        (3u32, PhysReg(11)),
-+        (4, PhysReg(20)),
-+        (6, PhysReg(22)), // xmm-based pointer
-+    ]
-+    .into_iter()
-+    .collect();
-+    let slots: FxHashMap<u32, i64> = FxHashMap::default();
-+    let store = |val: Operand, ptr: u32, ty: IrType| Instruction::Store {
-+        val,
-+        ptr: Value(ptr),
-+        ty,
-+        seg_override: Default::default(),
-+        volatile: false,
-+    };
-+
-+    // Value with no register home (slot-homed floats need the xmm scratch
-+    // relay the text path owns).
-+    let mut out = Vec::new();
-+    assert!(!super::isel::lower_instruction_typed(
-+        &store(Operand::Value(Value(77)), 3, IrType::F64),
-+        &ra,
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    assert!(out.is_empty());
-+
-+    // Constant source: no scalar-SSE immediate form.
-+    let mut out = Vec::new();
-+    assert!(!super::isel::lower_instruction_typed(
-+        &store(Operand::Const(IrConst::F64(1.0)), 3, IrType::F64),
-+        &ra,
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    assert!(out.is_empty());
-+
-+    // XMM-based pointer: x86 addressing has no xmm base.
-+    let mut out = Vec::new();
-+    assert!(!super::isel::lower_instruction_typed(
-+        &store(Operand::Value(Value(4)), 6, IrType::F64),
-+        &ra,
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    assert!(out.is_empty());
-+
-+    // Pointer with no home at all.
-+    let mut out = Vec::new();
-+    assert!(!super::isel::lower_instruction_typed(
-+        &store(Operand::Value(Value(4)), 88, IrType::F64),
-+        &ra,
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    assert!(out.is_empty());
-+
-+    // F128 goes through x87 on the text path.
-+    let mut out = Vec::new();
-+    assert!(!super::isel::lower_instruction_typed(
-+        &store(Operand::Value(Value(4)), 3, IrType::F128),
-+        &ra,
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    assert!(out.is_empty());
-+
-+    // Load with a GPR dest (mixed domain) stays on the text path.
-+    let mut out = Vec::new();
-+    assert!(!super::isel::lower_instruction_typed(
-+        &Instruction::Load {
-+            dest: Value(3),
-+            ptr: Value(3),
-+            ty: IrType::F64,
-+            seg_override: Default::default(),
-+            volatile: false,
-+        },
-+        &ra,
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    assert!(out.is_empty());
-+
-+    // Float Copy where only one side is xmm-homed.
-+    let mut vt: FxHashMap<u32, IrType> = FxHashMap::default();
-+    vt.insert(4, IrType::F64);
-+    let mut out = Vec::new();
-+    assert!(!super::isel::lower_instruction_typed(
-+        &Instruction::Copy {
-+            dest: Value(3), // GPR dest
-+            src: Operand::Value(Value(4)),
-+        },
-+        &ra,
-+        &slots,
-+        Some(&vt),
-+        &mut out,
-+    ));
-+    assert!(out.is_empty());
-+
-+    // Integer Copy of an untyped value must NOT be hijacked as a float
-+    // move: no value-type entry means the integer width logic applies.
-+    let mut out = Vec::new();
-+    assert!(super::isel::lower_instruction_typed(
-+        &Instruction::Copy {
-+            dest: Value(3),
-+            src: Operand::Value(Value(11)),
-+        },
-+        &ra,
-+        &slots,
-+        Some(&vt),
-+        &mut out,
-+    ));
-+    assert!(
-+        out.iter().all(|mi| !matches!(mi, MachInst::FMov { .. })),
-+        "untyped copy produced FMov: {out:?}"
-+    );
-+}
-+
-+// ── 6. FAlu: scalar SSE arithmetic (VEX three-operand) ───────────────────
-+
-+#[test]
-+fn falu_emits_vex_three_operand_forms() {
-+    // dst = src1 OP src2; AT&T prints `vop src2, %src1, %dst`.
-+    assert_eq!(
-+        emit1(&MachInst::FAlu {
-+            op: FAluOp::Add,
-+            src2: reg(PhysReg(21)),
-+            src1: MachReg::Phys(PhysReg(20)),
-+            dst: MachReg::Phys(PhysReg(22)),
-+            size: OpSize::S64,
-+        }),
-+        "vaddsd %xmm3, %xmm2, %xmm4"
-+    );
-+    assert_eq!(
-+        emit1(&MachInst::FAlu {
-+            op: FAluOp::Sub,
-+            src2: reg(PhysReg(21)),
-+            src1: MachReg::Phys(PhysReg(22)),
-+            dst: MachReg::Phys(PhysReg(22)),
-+            size: OpSize::S64,
-+        }),
-+        "vsubsd %xmm3, %xmm4, %xmm4"
-+    );
-+    assert_eq!(
-+        emit1(&MachInst::FAlu {
-+            op: FAluOp::Mul,
-+            src2: reg(PhysReg(33)),
-+            src1: MachReg::Phys(PhysReg(26)),
-+            dst: MachReg::Phys(PhysReg(27)),
-+            size: OpSize::S32,
-+        }),
-+        "vmulss %xmm15, %xmm8, %xmm9"
-+    );
-+    assert_eq!(
-+        emit1(&MachInst::FAlu {
-+            op: FAluOp::Div,
-+            src2: reg(PhysReg(20)),
-+            src1: MachReg::Phys(PhysReg(21)),
-+            dst: MachReg::Phys(PhysReg(21)),
-+            size: OpSize::S32,
-+        }),
-+        "vdivss %xmm2, %xmm3, %xmm3"
-+    );
-+    // Memory/slot src2 folds into the instruction (single memory operand).
-+    assert_eq!(
-+        emit1(&MachInst::FAlu {
-+            op: FAluOp::Add,
-+            src2: MachOperand::StackSlot(-16),
-+            src1: MachReg::Phys(PhysReg(20)),
-+            dst: MachReg::Phys(PhysReg(21)),
-+            size: OpSize::S64,
-+        }),
-+        "vaddsd -16(%rbp), %xmm2, %xmm3"
-+    );
-+    assert_eq!(
-+        emit1(&MachInst::FAlu {
-+            op: FAluOp::Mul,
-+            src2: MachOperand::Mem {
-+                base: MachReg::Phys(PhysReg(14)),
-+                offset: 8,
-+            },
-+            src1: MachReg::Phys(PhysReg(20)),
-+            dst: MachReg::Phys(PhysReg(21)),
-+            size: OpSize::S64,
-+        }),
-+        "vmulsd 8(%rdi), %xmm2, %xmm3"
-+    );
-+}
-+
-+#[test]
-+#[should_panic(expected = "non-float size")]
-+fn falu_rejects_narrow_sizes() {
-+    emit1(&MachInst::FAlu {
-+        op: FAluOp::Add,
-+        src2: reg(PhysReg(21)),
-+        src1: MachReg::Phys(PhysReg(20)),
-+        dst: MachReg::Phys(PhysReg(22)),
-+        size: OpSize::S16,
-+    });
-+}
-+
-+#[test]
-+#[should_panic(expected = "immediate")]
-+fn falu_rejects_immediate_src2() {
-+    emit1(&MachInst::FAlu {
-+        op: FAluOp::Add,
-+        src2: MachOperand::Imm(1),
-+        src1: MachReg::Phys(PhysReg(20)),
-+        dst: MachReg::Phys(PhysReg(22)),
-+        size: OpSize::S64,
-+    });
-+}
-+
-+#[test]
-+#[should_panic(expected = "unallocated")]
-+fn falu_rejects_unallocated_src1() {
-+    emit1(&MachInst::FAlu {
-+        op: FAluOp::Add,
-+        src2: reg(PhysReg(21)),
-+        src1: MachReg::Vreg(7),
-+        dst: MachReg::Phys(PhysReg(22)),
-+        size: OpSize::S64,
-+    });
-+}
-+
-+#[test]
-+fn float_binops_lower_with_exact_operand_order() {
-+    use crate::common::fx_hash::FxHashMap;
-+    use crate::common::types::IrType;
-+    use crate::ir::reexports::{Instruction, IrBinOp, Operand, Value};
-+
-+    // 4: xmm2 (lhs), 5: xmm3 (rhs), 6: xmm4 (dest), 7: slot-homed value.
-+    let ra: FxHashMap<u32, PhysReg> = [
-+        (4u32, PhysReg(20)),
-+        (5, PhysReg(21)),
-+        (6, PhysReg(22)),
-+    ]
-+    .into_iter()
-+    .collect();
-+    let slots: FxHashMap<u32, i64> = FxHashMap::default();
-+
-+    let binop = |dest: u32, op: IrBinOp, l: u32, r: u32, ty: IrType| Instruction::BinOp {
-+        dest: Value(dest),
-+        op,
-+        lhs: Operand::Value(Value(l)),
-+        rhs: Operand::Value(Value(r)),
-+        ty,
-+    };
-+
-+    // Sub keeps lhs in src1: dst = src1 - src2.
-+    let mut out = Vec::new();
-+    assert!(super::isel::lower_instruction_typed(
-+        &binop(6, IrBinOp::Sub, 4, 5, IrType::F64),
-+        &ra,
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    match &out[..] {
-+        [MachInst::FAlu {
-+            op: FAluOp::Sub,
-+            src2: MachOperand::Reg(MachReg::Phys(s2)),
-+            src1: MachReg::Phys(s1),
-+            dst: MachReg::Phys(d),
-+            size,
-+        }] => {
-+            assert_eq!(*s1, PhysReg(20), "lhs must stay src1 for sub");
-+            assert_eq!(*s2, PhysReg(21));
-+            assert_eq!(*d, PhysReg(22));
-+            assert_eq!(*size, OpSize::S64);
-+        }
-+        other => panic!("unexpected lowering: {other:?}"),
-+    }
-+
-+    // SDiv on floats is the division operator (no separate FDiv in the IR).
-+    let mut out = Vec::new();
-+    assert!(super::isel::lower_instruction_typed(
-+        &binop(6, IrBinOp::SDiv, 4, 5, IrType::F32),
-+        &ra,
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    assert!(
-+        matches!(&out[..], [MachInst::FAlu { op: FAluOp::Div, size: OpSize::S32, .. }]),
-+        "unexpected: {out:?}"
-+    );
-+
-+    // Commutative swap: lhs slot-homed (vreg), rhs xmm -> src1 = rhs.
-+    let mut out = Vec::new();
-+    assert!(super::isel::lower_instruction_typed(
-+        &binop(6, IrBinOp::Mul, 7, 5, IrType::F64),
-+        &ra,
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    match &out[..] {
-+        [MachInst::FAlu {
-+            op: FAluOp::Mul,
-+            src2: MachOperand::Reg(MachReg::Vreg(7)),
-+            src1: MachReg::Phys(s1),
-+            ..
-+        }] => assert_eq!(*s1, PhysReg(21), "rhs must become src1 in swapped form"),
-+        other => panic!("unexpected lowering: {other:?}"),
-+    }
-+
-+    // Non-commutative with slot lhs is REJECTED (text path stages via xmm0).
-+    let mut out = Vec::new();
-+    assert!(!super::isel::lower_instruction_typed(
-+        &binop(6, IrBinOp::Sub, 7, 5, IrType::F64),
-+        &ra,
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    assert!(out.is_empty());
-+
-+    // Slot rhs on a lhs-xmm op is admitted as a vreg (flush-time slot
-+    // resolution folds it into the memory operand).
-+    let mut out = Vec::new();
-+    assert!(super::isel::lower_instruction_typed(
-+        &binop(6, IrBinOp::Add, 4, 7, IrType::F64),
-+        &ra,
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    match &out[..] {
-+        [MachInst::FAlu {
-+            src2: MachOperand::Reg(MachReg::Vreg(7)),
-+            src1: MachReg::Phys(s1),
-+            ..
-+        }] => assert_eq!(*s1, PhysReg(20)),
-+        other => panic!("unexpected lowering: {other:?}"),
-+    }
-+
-+    // GPR dest: rejected.
-+    let mut out = Vec::new();
-+    assert!(!super::isel::lower_instruction_typed(
-+        &binop(3, IrBinOp::Add, 4, 5, IrType::F64),
-+        &ra,
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    assert!(out.is_empty());
-+
-+    // Integer Add is untouched by the float arm.
-+    let mut out = Vec::new();
-+    assert!(super::isel::lower_instruction_typed(
-+        &binop(3, IrBinOp::Add, 1, 2, IrType::I64),
-+        &[(1u32, PhysReg(0)), (2, PhysReg(7)), (3, PhysReg(11))]
-+            .into_iter()
-+            .collect(),
-+        &slots,
-+        None,
-+        &mut out,
-+    ));
-+    assert!(
-+        out.iter().all(|mi| !matches!(mi, MachInst::FAlu { .. })),
-+        "integer add produced FAlu: {out:?}"
-+    );
-+}
-diff --git a/src/ir/intrinsics.rs b/src/ir/intrinsics.rs
-index 6c4d3fa..7a4be67 100644
---- a/src/ir/intrinsics.rs
-+++ b/src/ir/intrinsics.rs
-@@ -1261,7 +1261,17 @@ impl IntrinsicOp {
-             IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4
-             | IntrinsicOp::VecMaxI32x8
-             | IntrinsicOp::VecHorizontalMaxI32x8
--        )
-+        ) ||
-+        // The modern vectorizer's value-producing families (splats, zeros,
-+        // non-volatile vector loads, packed arithmetic) are pure: they read
-+        // no state beyond their operands. Without this, an orphaned
-+        // VecBroadcast left behind by a vectorizer bailout was DCE-rooted
-+        // as "side-effecting", reached codegen with no register or slot
-+        // home, and ICEd the intrinsic emitter (`gd[i] = gd[i]*k + c` over
-+        // a global array). VecStoreI64x2 is the one memory-writing op that
-+        // produces_vector_value() also lists (kept there for slot sizing);
-+        // it is excluded here -- stores are never pure.
-+        (self.produces_vector_value() && !matches!(self, IntrinsicOp::VecStoreI64x2))
      }
  
-     /// Returns true if this intrinsic produces a 128/256-bit vector value
-diff --git a/src/passes/dce.rs b/src/passes/dce.rs
-index 1f61dcd..426e38f 100644
---- a/src/passes/dce.rs
-+++ b/src/passes/dce.rs
-@@ -1057,4 +1057,50 @@ mod tests {
-         assert_eq!(first, 1);
-         assert_eq!(second, 0);
-     }
 +
++    // ── complete_unroll_trip truth table ─────────────────────────────────
++    // Exhaustive closed-form coverage of the constant-stride trip count:
++    // the historical step-1 arithmetic must reduce verbatim, and every
++    // stride>1 / negative-stride arm must match a reference loop simulation.
 +    #[test]
-+    fn dead_pure_vector_intrinsics_are_removed() {
-+        // Regression: an orphaned VecBroadcastF64x4 (vectorizer bailout over
-+        // a global-array map loop) used to be DCE-rooted as "side-effecting"
-+        // because IntrinsicOp::is_pure() missed the modern Vec* families. It
-+        // reached codegen with no register or slot home and ICEd the
-+        // intrinsic emitter. Pure vector value producers with an unused
-+        // dest must be swept.
-+        let mut func = IrFunction::new("vb".to_string(), IrType::Void, vec![], false);
-+        func.blocks.push(BasicBlock {
-+            label: BlockId(0),
-+            instructions: vec![Instruction::Intrinsic {
-+                dest: Some(Value(10)),
-+                op: crate::ir::intrinsics::IntrinsicOp::VecBroadcastF64x4,
-+                dest_ptr: None,
-+                args: vec![Operand::Const(IrConst::F64(2.0))],
-+            }],
-+            terminator: Terminator::Return(None),
-+            source_spans: Vec::new(),
-+        });
-+        let removed = eliminate_dead_code(&mut func);
-+        assert_eq!(removed, 1);
-+        assert!(func.blocks[0].instructions.is_empty());
++    fn unroll_trip_step_one_matches_historical_arithmetic() {
++        use crate::ir::reexports::IrCmpOp::*;
++        // i < 8, step 1  → 8 trips (classic 0..8).
++        assert_eq!(complete_unroll_trip(0, 8, Slt, 1), Some(8));
++        // i <= 7, step 1 → 8 trips.
++        assert_eq!(complete_unroll_trip(0, 7, Sle, 1), Some(8));
++        // Non-zero init.
++        assert_eq!(complete_unroll_trip(3, 8, Slt, 1), Some(5));
++        // Empty / inverted spans stay rejected (pre-existing guards).
++        assert_eq!(complete_unroll_trip(8, 8, Slt, 1), None);
++        assert_eq!(complete_unroll_trip(9, 8, Slt, 1), None);
++        assert_eq!(complete_unroll_trip(8, 7, Sle, 1), None);
 +    }
 +
 +    #[test]
-+    fn vector_store_intrinsics_are_never_removed_by_purity() {
-+        // The mirror image: a store-shaped vector intrinsic must survive DCE
-+        // even when its (nonexistent) result is unused -- it writes memory.
-+        let mut func = IrFunction::new("vs".to_string(), IrType::Void, vec![], false);
-+        func.blocks.push(BasicBlock {
-+            label: BlockId(0),
-+            instructions: vec![Instruction::Intrinsic {
-+                dest: None,
-+                op: crate::ir::intrinsics::IntrinsicOp::VecStoreF64x4,
-+                dest_ptr: Some(Value(3)),
-+                args: vec![Operand::Value(Value(9))],
-+            }],
-+            terminator: Terminator::Return(None),
-+            source_spans: Vec::new(),
-+        });
-+        let removed = eliminate_dead_code(&mut func);
-+        assert_eq!(removed, 0);
-+        assert_eq!(func.blocks[0].instructions.len(), 1);
++    fn unroll_trip_positive_strides() {
++        use crate::ir::reexports::IrCmpOp::*;
++        // dot8's shape: i < 8, i += 4 → exactly 2 trips.
++        assert_eq!(complete_unroll_trip(0, 8, Slt, 4), Some(2));
++        // Non-divisible Slt: ceil. i < 10, i += 3 → 0,3,6,9 → 4 trips.
++        assert_eq!(complete_unroll_trip(0, 10, Slt, 3), Some(4));
++        // Odd limit: i < 7, i += 2 → 0,2,4,6 → 4 trips.
++        assert_eq!(complete_unroll_trip(0, 7, Slt, 2), Some(4));
++        // Sle floor+1: i <= 9, i += 3 → 0,3,6,9 → 4 trips.
++        assert_eq!(complete_unroll_trip(0, 9, Sle, 3), Some(4));
++        // Sle non-divisible: i <= 10, i += 3 → 0,3,6,9 → 4 trips.
++        assert_eq!(complete_unroll_trip(0, 10, Sle, 3), Some(4));
++        // Single iteration: i < 5, i += 5 → 1 (callers reject trip < 2).
++        assert_eq!(complete_unroll_trip(0, 5, Slt, 5), Some(1));
++        // Non-zero init with stride: i = 2; i < 11; i += 3 → 2,5,8 → 3.
++        assert_eq!(complete_unroll_trip(2, 11, Slt, 3), Some(3));
 +    }
- }
-diff --git a/src/passes/mod.rs b/src/passes/mod.rs
-index 6f49b1a..3f32404 100644
---- a/src/passes/mod.rs
-+++ b/src/passes/mod.rs
-@@ -1328,6 +1328,19 @@ pub(crate) fn run_passes(
-                 total_changes += n;
-                 total_changes_excl_dce += n;
-             }
 +
-+            // Post-vectorize DCE. The vectorizer can bail out of a loop
-+            // AFTER hoisting setup intrinsics into the preheader (a map
-+            // loop over a global array left two dead VecBroadcastF64x4
-+            // defs); no DCE ran again before codegen, and the x86
-+            // intrinsic emitter ICEs storing a vector value that never
-+            // received a register or slot home ("value 36 has no
-+            // register, stack slot, Copy, or GlobalAddr definition" on
-+            // `for (i...) gd[i] = gd[i]*k + c;` with a global `gd`).
-+            // Pure intrinsics with an unused dest are DCE-eligible, so
-+            // one sweep here removes every orphaned setup def regardless
-+            // of which bailout path produced it.
-+module.for_each_function(dce::eliminate_dead_code);
-         }
- 
-         // Unroll/vectorize can clone loop bodies that still contained
-@@ -1764,7 +1777,37 @@ pub(crate) fn run_passes(
-                     }
-                 }
-             }
--            module.for_each_function(dce::eliminate_dead_code);
-+            module.for_each_function(|f| {
-+                let removed = dce::eliminate_dead_code(f);
-+                if std::env::var("CCC_PROBE_DCE").is_ok() {
-+                    // Count remaining VecBroadcast dests and their uses.
-+                    let mut bcasts = Vec::new();
-+                    for b in &f.blocks {
-+                        for i in &b.instructions {
-+                            if let crate::ir::reexports::Instruction::Intrinsic { dest: Some(d), op, .. } = i {
-+                                if format!("{op:?}").starts_with("VecBroadcast") {
-+                                    bcasts.push(d.0);
++    #[test]
++    fn unroll_trip_negative_strides_countdown() {
++        use crate::ir::reexports::IrCmpOp::*;
++        // for (i = 10; i > 0; i -= 2) → 10,8,6,4,2 → 5 trips.
++        assert_eq!(complete_unroll_trip(10, 0, Sgt, -2), Some(5));
++        // Non-divisible countdown: i > 0, i -= 3 → 10,7,4,1 → 4 (ceil).
++        assert_eq!(complete_unroll_trip(10, 0, Sgt, -3), Some(4));
++        // Sge floor+1: i >= 0, i -= 3 → 9,6,3,0 → 4 trips.
++        assert_eq!(complete_unroll_trip(9, 0, Sge, -3), Some(4));
++        // Empty countdown.
++        assert_eq!(complete_unroll_trip(0, 0, Sgt, -1), None);
++    }
++
++    #[test]
++    fn unroll_trip_rejects_degenerate_shapes() {
++        use crate::ir::reexports::IrCmpOp::*;
++        // Zero stride: infinite loop, no trip count.
++        assert_eq!(complete_unroll_trip(0, 8, Slt, 0), None);
++        // Sign/stride contradictions: a negative stride against an
++        // ascending comparison diverges (or wraps); must be refused.
++        assert_eq!(complete_unroll_trip(0, 8, Slt, -1), None);
++        assert_eq!(complete_unroll_trip(0, 8, Sle, -4), None);
++        assert_eq!(complete_unroll_trip(8, 0, Sgt, 1), None);
++        assert_eq!(complete_unroll_trip(8, 0, Sge, 2), None);
++        // Equality-style comparisons carry no ordering: refused.
++        assert_eq!(complete_unroll_trip(0, 8, Eq, 1), None);
++    }
++
++    #[test]
++    fn unroll_trip_matches_reference_simulation() {
++        // Cross-check the closed forms against a direct loop simulation
++        // over a dense grid of (init, limit, step) — the helper is the
++        // single source of truth for complete unrolling, so a mismatch
++        // here is a miscompile waiting to happen.
++        use crate::ir::reexports::IrCmpOp::*;
++        for init in -3i64..=6 {
++            for limit in -3i64..=12 {
++                for step in 1i64..=5 {
++                    for &(op, desc) in &[(Slt, "lt"), (Sle, "le")] {
++                        let simulated = (0..)
++                            .scan(init, |i, _| {
++                                let cont = match op {
++                                    Slt => *i < limit,
++                                    _ => *i <= limit,
++                                };
++                                if !cont {
++                                    return None;
 +                                }
-+                            }
++                                let old = *i;
++                                *i += step;
++                                Some(old)
++                            })
++                            .count() as i64;
++                        let closed = complete_unroll_trip(init, limit, op, step);
++                        if simulated == 0 {
++                            assert!(
++                                closed.is_none(),
++                                "{desc}: init={init} limit={limit} step={step} empty loop must reject"
++                            );
++                        } else {
++                            assert_eq!(
++                                closed,
++                                Some(simulated),
++                                "{desc}: init={init} limit={limit} step={step}"
++                            );
 +                        }
 +                    }
-+                    for id in &bcasts {
-+                        let mut uses = 0u32;
-+                        for b in &f.blocks {
-+                            for i in &b.instructions {
-+                                crate::backend::liveness::for_each_operand_in_instruction(i, |op| {
-+                                    if let crate::ir::reexports::Operand::Value(v) = op {
-+                                        if v.0 == *id { uses += 1; }
-+                                    }
-+                                });
-+                            }
-+                        }
-+                        eprintln!("[PROBE-DCE] fn={} bcast v{} uses={}", f.name, id, uses);
-+                    }
-+                    eprintln!("[PROBE-DCE] fn={} removed={}", f.name, removed);
 +                }
-+                removed
-+            });
-         }
-     }
- 
-@@ -1787,7 +1830,37 @@ pub(crate) fn run_passes(
-                     }
-                 }
-             }
--            module.for_each_function(dce::eliminate_dead_code);
-+            module.for_each_function(|f| {
-+                let removed = dce::eliminate_dead_code(f);
-+                if std::env::var("CCC_PROBE_DCE").is_ok() {
-+                    // Count remaining VecBroadcast dests and their uses.
-+                    let mut bcasts = Vec::new();
-+                    for b in &f.blocks {
-+                        for i in &b.instructions {
-+                            if let crate::ir::reexports::Instruction::Intrinsic { dest: Some(d), op, .. } = i {
-+                                if format!("{op:?}").starts_with("VecBroadcast") {
-+                                    bcasts.push(d.0);
++                for step in -5i64..=-1 {
++                    for &(op, desc) in &[(Sgt, "gt"), (Sge, "ge")] {
++                        let simulated = (0..)
++                            .scan(init, |i, _| {
++                                let cont = match op {
++                                    Sgt => *i > limit,
++                                    _ => *i >= limit,
++                                };
++                                if !cont {
++                                    return None;
 +                                }
-+                            }
++                                let old = *i;
++                                *i += step;
++                                Some(old)
++                            })
++                            .count() as i64;
++                        let closed = complete_unroll_trip(init, limit, op, step);
++                        if simulated == 0 {
++                            assert!(
++                                closed.is_none(),
++                                "{desc}: init={init} limit={limit} step={step} empty loop must reject"
++                            );
++                        } else {
++                            assert_eq!(
++                                closed,
++                                Some(simulated),
++                                "{desc}: init={init} limit={limit} step={step}"
++                            );
 +                        }
 +                    }
-+                    for id in &bcasts {
-+                        let mut uses = 0u32;
-+                        for b in &f.blocks {
-+                            for i in &b.instructions {
-+                                crate::backend::liveness::for_each_operand_in_instruction(i, |op| {
-+                                    if let crate::ir::reexports::Operand::Value(v) = op {
-+                                        if v.0 == *id { uses += 1; }
-+                                    }
-+                                });
-+                            }
-+                        }
-+                        eprintln!("[PROBE-DCE] fn={} bcast v{} uses={}", f.name, id, uses);
-+                    }
-+                    eprintln!("[PROBE-DCE] fn={} removed={}", f.name, removed);
 +                }
-+                removed
-+            });
-         }
-     }
- 
-@@ -1914,7 +1987,37 @@ pub(crate) fn run_passes(
-             // arm computations behind; cfg_simplify removes the blocks and
-             // DCE collects the dead def chains (compare feeds, arm values).
-             module.for_each_function(cfg_simplify::simplify_cfg);
--            module.for_each_function(dce::eliminate_dead_code);
-+            module.for_each_function(|f| {
-+                let removed = dce::eliminate_dead_code(f);
-+                if std::env::var("CCC_PROBE_DCE").is_ok() {
-+                    // Count remaining VecBroadcast dests and their uses.
-+                    let mut bcasts = Vec::new();
-+                    for b in &f.blocks {
-+                        for i in &b.instructions {
-+                            if let crate::ir::reexports::Instruction::Intrinsic { dest: Some(d), op, .. } = i {
-+                                if format!("{op:?}").starts_with("VecBroadcast") {
-+                                    bcasts.push(d.0);
-+                                }
-+                            }
-+                        }
-+                    }
-+                    for id in &bcasts {
-+                        let mut uses = 0u32;
-+                        for b in &f.blocks {
-+                            for i in &b.instructions {
-+                                crate::backend::liveness::for_each_operand_in_instruction(i, |op| {
-+                                    if let crate::ir::reexports::Operand::Value(v) = op {
-+                                        if v.0 == *id { uses += 1; }
-+                                    }
-+                                });
-+                            }
-+                        }
-+                        eprintln!("[PROBE-DCE] fn={} bcast v{} uses={}", f.name, id, uses);
-+                    }
-+                    eprintln!("[PROBE-DCE] fn={} removed={}", f.name, removed);
-+                }
-+                removed
-+            });
-         }
-     }
- 
-diff --git a/tests/regression/machinst_float_scalar_layer.c b/tests/regression/machinst_float_scalar_layer.c
++            }
++        }
++    }
++
+ }
+diff --git a/tests/regression/unroll_stride_complete.c b/tests/regression/unroll_stride_complete.c
 new file mode 100644
-index 0000000..9ed5d6b
+index 0000000..71a05d5
 --- /dev/null
-+++ b/tests/regression/machinst_float_scalar_layer.c
-@@ -0,0 +1,114 @@
-+/* Typed scalar-float MachInst layer (FMov / FAlu).
++++ b/tests/regression/unroll_stride_complete.c
+@@ -0,0 +1,128 @@
++/* Constant-stride complete unrolling (found via the dot8 godbolt gap).
 + *
-+ * Exercises the shapes the typed lowering owns: xmm-homed F32/F64 values
-+ * copied register-to-register, stored/loaded through alloca slots and GPR
-+ * pointers, and combined with the VEX three-operand vadd/vsub/vmul/vdiv
-+ * forms -- including the operand-order-sensitive cases (sub/div keep the
-+ * lhs in src1) and the commutative swap when only the rhs is register
-+ * homed. Results are printed bit-exactly so any mnemonic-size mixup
-+ * (movss vs movsd) or operand swap shows up as a diff against the oracle
-+ * build.
++ * Both complete unrollers (two-block and general) historically rejected
++ * `iv_step != 1`, so `for (i = 0; i < 8; i += 4)` — the classic 4-way
++ * software-pipelined accumulator shape — never fully unrolled, and Pass A
++ * routed 2-block loops away from the general cloner, leaving the stride
++ * loop as a loop while gcc/clang/icx all straightened it. dot8 at
++ * -O3 -march=x86-64-v3: lccc 46 instructions vs gcc 21 / clang 14 /
++ * icx 10, with 6 IV-bump instructions per iteration carrying the loop.
++ *
++ * The fix computes the exact static trip count for any non-zero stride
++ * (ceil for `<`/`>`, floor+1 for `<=`/`>=`, sign-consistent), and the
++ * cloner already substituted `init + k*step` per iteration. These kernels
++ * pin the runtime results of every stride arm: exact division, ceil on a
++ * non-divisible span, `<=` with and without residue, trip-1 (must stay
++ * correct, unroll or not), countdown strides, and the FP accumulator
++ * shape that motivated the fix (FMA-contracted at -O3 on v3 targets).
 + */
-+#include <stdint.h>
 +#include <stdio.h>
-+#include <string.h>
 +
-+static double gd[4];
-+static float gf[4];
-+volatile double vd;
-+volatile float vf;
-+
-+static uint64_t dbits(double d) {
-+    uint64_t u;
-+    memcpy(&u, &d, 8);
-+    return u;
-+}
-+static uint32_t fbits(float f) {
-+    uint32_t u;
-+    memcpy(&u, &f, 4);
-+    return u;
-+}
-+
-+double f64_chain(double a, double b) {
-+    double t = a * b; /* vmulsd */
-+    double u = t + a; /* vaddsd */
-+    double w = u - b; /* vsubsd, lhs must stay src1 */
-+    double q = w / a; /* vdivsd, lhs must stay src1 */
-+    double c = q;     /* xmm->xmm copy */
-+    gd[0] = c;        /* store through a global */
-+    return c + gd[0];
-+}
-+
-+float f32_chain(float a, float b) {
-+    float t = a * b;
-+    float u = t + a;
-+    float w = u - b;
-+    float q = w / a;
-+    float c = q;
-+    gf[0] = c;
-+    return c + gf[0];
-+}
-+
-+/* Store + load round-trip through volatile memory (no fold-through). */
-+double slot_roundtrip(double x) {
-+    double local = x * 2.0;
-+    vd = local;
-+    double back = vd;
-+    return back - local; /* exactly 0.0 */
-+}
-+
-+float slot_roundtrip_f(float x) {
-+    float local = x * 3.0f;
-+    vf = local;
-+    float back = vf;
-+    return back - local;
-+}
-+
-+/* Phi-driven copies: the copy set changes per iteration. */
-+double phi_copies(double a, double b, int n) {
-+    double acc = a;
-+    for (int i = 0; i < n; i++) {
-+        double t = acc;
-+        acc = (i & 1) ? t + b : t - b;
-+    }
-+    return acc;
-+}
-+
-+/* Only the rhs stays register-homed across the branch: commutative ops
-+ * must swap (rhs into src1) while sub/div keep their order. */
-+double mixed_homing(double a, double b, int n) {
-+    double acc = 0.0;
-+    for (int i = 0; i < n; i++) {
-+        double lhs = (i & 1) ? a : b; /* slot pressure on lhs */
-+        acc = acc + lhs * b;
-+        acc = acc - lhs;
-+    }
-+    return acc;
-+}
-+
-+int main(void) {
-+    gd[0] = gd[1] = gd[2] = gd[3] = 0.0;
-+    gf[0] = gf[1] = gf[2] = gf[3] = 0.0f;
-+
-+    printf("%.17g\n", f64_chain(3.0, 4.0));
-+    printf("%.9g\n", f32_chain(2.5f, 1.5f));
-+    printf("%.17g\n", slot_roundtrip(1.25));
-+    printf("%.9g\n", slot_roundtrip_f(0.75f));
-+    printf("%.17g\n", phi_copies(10.0, 0.5, 6));
-+    printf("%.17g\n", mixed_homing(1.5, 2.25, 5));
-+
-+    /* Signed zero: (+0.0) + (-0.0) == +0.0 -- the sign bit is observable
-+     * and a swapped/mis-sized add can change it. */
-+    double pz = vd - vd;         /* +0.0 through memory */
-+    double nz = -pz - pz - pz;   /* -0.0: -(+0.0) is -0.0; -0.0-0.0-0.0 stays -0.0 */
-+    double sum = pz + nz;
-+    printf("%016llx\n", (unsigned long long)dbits(sum));
-+
-+    /* F32 and F64 homes must not cross-wire: the same bit pattern means
-+     * different values at the two widths. */
-+    float sf = 1.0f;
-+    double df = 1.0;
-+    printf("%08llx %016llx\n", (unsigned long long)fbits(sf + sf),
-+           (unsigned long long)dbits(df + df));
-+    return 0;
-+}
-diff --git a/tests/regression/vectorize_global_array_bailout_ice.c b/tests/regression/vectorize_global_array_bailout_ice.c
-new file mode 100644
-index 0000000..cb9b7f6
---- /dev/null
-+++ b/tests/regression/vectorize_global_array_bailout_ice.c
-@@ -0,0 +1,38 @@
-+/* Vectorizer-bailout orphan ICE (found via godbolt oracle kernels).
-+ *
-+ * `gd[i] = gd[i] * k + c` over a GLOBAL array made the vectorizer hoist
-+ * VecBroadcastF64x4 setup into the preheader, bail out of the loop (twice:
-+ * one orphan per attempt), and leave the loop scalar. The orphaned
-+ * broadcasts were not DCE-eligible -- IntrinsicOp::is_pure() missed the
-+ * modern Vec* families, so DCE rooted them as side-effecting -- and the
-+ * x86 intrinsic emitter ICEd storing a vector value that never received a
-+ * register or slot home:
-+ *
-+ *   x86 codegen: value 36 has no register, stack slot, Copy, or
-+ *   GlobalAddr definition
-+ *
-+ * The runtime check keeps the scalar loop honest as well.
-+ */
-+double gd[64];
++long la[16], lb[16];
++double da[16], db[16];
 +volatile double sink;
 +
-+void scale_add(double k, double c) {
-+    for (int i = 0; i < 64; i++)
-+        gd[i] = gd[i] * k + c;
++static void init(void) {
++    for (int i = 0; i < 16; i++) {
++        la[i] = i * 3 - 7;
++        lb[i] = (i % 5) - 2;
++        da[i] = i * 0.5 - 1.25;
++        db[i] = (i % 4) * 0.75 + 0.125;
++    }
 +}
 +
-+double sum_scaled(void) {
-+    double s = 0.0;
-+    for (int i = 0; i < 64; i++)
-+        s += gd[i];
++/* dot8's shape: stride 4, exact division, 2 trips. */
++static long dot8i(void) {
++    long s0 = 0, s1 = 0, s2 = 0, s3 = 0;
++    for (int i = 0; i < 8; i += 4) {
++        s0 += la[i] * lb[i];
++        s1 += la[i + 1] * lb[i + 1];
++        s2 += la[i + 2] * lb[i + 2];
++        s3 += la[i + 3] * lb[i + 3];
++    }
++    return (s0 + s1) + (s2 + s3);
++}
++
++static double dot8d(void) {
++    double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
++    for (int i = 0; i < 8; i += 4) {
++        s0 += da[i] * db[i];
++        s1 += da[i + 1] * db[i + 1];
++        s2 += da[i + 2] * db[i + 2];
++        s3 += da[i + 3] * db[i + 3];
++    }
++    return (s0 + s1) + (s2 + s3);
++}
++
++/* Stride 3 over a non-divisible span: i = 0,3,6,9 (ceil). */
++static long s3_10(void) {
++    long s = 0;
++    for (int i = 0; i < 10; i += 3)
++        s += la[i] * i;
++    return s;
++}
++
++/* Odd limit, stride 2: i = 0,2,4,6. */
++static long s2_7(void) {
++    long s = 0;
++    for (int i = 0; i < 7; i += 2)
++        s += la[i] * i - lb[i];
++    return s;
++}
++
++/* `<=` exact (0,3,6,9) and with residue (last still 9). */
++static long sle_9(void) {
++    long s = 0;
++    for (int i = 0; i <= 9; i += 3)
++        s += la[i] * i;
++    return s;
++}
++
++static long sle_10(void) {
++    long s = 0;
++    for (int i = 0; i <= 10; i += 3)
++        s += la[i] * i;
++    return s;
++}
++
++/* Single iteration: trip 1 falls outside the unroll bound; whichever way
++ * it lowers, the result must be one body execution. */
++static long t1(void) {
++    long s = 0;
++    for (int i = 0; i < 5; i += 5)
++        s += la[i] * i;
++    return s;
++}
++
++/* Stride 4, trip 4, both arrays read. */
++static long d16_4(void) {
++    long s = 0;
++    for (int i = 0; i < 16; i += 4)
++        s += la[i] + lb[i];
++    return s;
++}
++
++/* Countdown stride: i = 12,10,8,6,4,2. */
++static long down2(void) {
++    long s = 0;
++    for (int i = 12; i > 0; i -= 2)
++        s += la[i] * i;
++    return s;
++}
++
++/* Non-zero init with stride: i = 2,5,8. */
++static long init2(void) {
++    long s = 0;
++    for (int i = 2; i < 11; i += 3)
++        s += la[i] * lb[i];
 +    return s;
 +}
 +
 +int main(void) {
-+    for (int i = 0; i < 64; i++)
-+        gd[i] = (double)i;
-+    scale_add(2.0, 0.5);
-+    sink = sum_scaled();
-+    /* sum(i*2 + 0.5, i=0..63) = 2*(63*64/2) + 32 = 4032 + 32 = 4064 */
-+    return sink == 4064.0 ? 0 : 1;
++    init();
++    sink = dot8d();
++    printf("%ld %.6g %ld %ld %ld %ld %ld %ld %ld %ld\n",
++           dot8i(), sink, s3_10(), s2_7(), sle_9(), sle_10(), t1(), d16_4(),
++           down2(), init2());
++    return 0;
 +}
+diff --git a/tests/regression/unroll_stride_complete.flags b/tests/regression/unroll_stride_complete.flags
+new file mode 100644
+index 0000000..cd11b1e
+--- /dev/null
++++ b/tests/regression/unroll_stride_complete.flags
+@@ -0,0 +1 @@
++-O3 -march=x86-64-v3
