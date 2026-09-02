@@ -1,784 +1,470 @@
-diff --git a/src/backend/x86/codegen/peephole/passes/dead_writes.rs b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
-index a085f61..91fa242 100644
---- a/src/backend/x86/codegen/peephole/passes/dead_writes.rs
-+++ b/src/backend/x86/codegen/peephole/passes/dead_writes.rs
-@@ -448,8 +448,12 @@ const RMW_OPS: &[&str] = &[
- /// The accumulator is copied into a scratch register, updated, and copied back.
- /// Applying the operation in place removes both copies. Sound when the scratch
- /// register is dead after the copy-back, the accumulator is not read between
--/// the copies, and the operand of the RMW op is not the accumulator itself
--/// (`xorq %r8, %rax` with `%r8` as the accumulator would become `xorq %r8, %r8`).
-+/// the copies, and no source operand of the RMW op mentions the accumulator
-+/// (`xorq %r8, %rax` with `%r8` as the accumulator would become `xorq %r8,
-+/// %r8`). Source operands that mention the SCRATCH register — including
-+/// registers embedded in compound sources like `imulq $imm, %rax` — are
-+/// rewritten to the accumulator, which carries the same value once the
-+/// staging copy is gone.
- pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-     let len = store.len();
-     let mut lv = FileLiveness::new(store, infos);
-@@ -504,14 +508,44 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
-             i += 1;
-             continue;
-         }
--        // The operand must not be the accumulator (in-place would alias) and
--        // must not be the scratch register itself.
--        if let Some(src_fam) = plain_gp_operand(op_src) {
--            if src_fam == acc_fam || src_fam == tmp_fam {
--                i += 1;
--                continue;
-+        // Scan EVERY operand token on the op's source side. Compound sources
-+        // such as the 3-operand `imulq $imm, %rax` embed a register after the
-+        // immediate; parsing only the whole source string as a bare register
-+        // let those forms slip past the alias check, and the fold then
-+        // deleted the staging `movq` while the op still read the scratch
-+        // register — a stale-register miscompile (found via the dot8
-+        // magic-division loop: `imulq $magic, %rax, %rsi` reading a dead
-+        // `%rax` instead of the accumulator `%rsi`).
-+        //
-+        // * Source mentions the ACCUMULATOR anywhere -> reject. The in-place
-+        //   form would alias source and destination (historical behaviour
-+        //   for the bare-register case, kept conservatively).
-+        // * Source mentions the SCRATCH register -> rewrite that token to
-+        //   the accumulator: after the fold the staging copy is gone and the
-+        //   accumulator carries exactly the value the scratch held. Only the
-+        //   exact scratch text is rewritten (width-exact, mirroring the
-+        //   move-relay pass); any width-variant alias rejects instead.
-+        let mut src_tokens: Vec<&str> = op_src.split(',').map(str::trim).collect();
-+        let mut reject = false;
-+        for tok in src_tokens.iter_mut() {
-+            if let Some(src_fam) = plain_gp_operand(tok) {
-+                if src_fam == acc_fam {
-+                    reject = true;
-+                    break;
-+                }
-+                if src_fam == tmp_fam {
-+                    if *tok != tmp {
-+                        reject = true; // width-variant alias: not text-safe
-+                        break;
-+                    }
-+                    *tok = acc; // scratch carried the accumulator's value
-+                }
-             }
-         }
-+        if reject {
-+            i += 1;
-+            continue;
-+        }
-         let Some(k) = next_real(j + 1) else {
-             i += 1;
-             continue;
-@@ -535,7 +569,8 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
-             i += 1;
-             continue;
-         }
--        let new_line = format!("    {}{}, {}", op, op_src, acc);
-+        let new_src = src_tokens.join(", ");
-+        let new_line = format!("    {}{}, {}", op, new_src, acc);
-         mark_nop(&mut infos[i]);
-         replace_line(store, &mut infos[j], j, new_line);
-         mark_nop(&mut infos[k]);
-@@ -549,6 +584,7 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
- #[cfg(test)]
- mod tests {
-     use super::super::super::peephole_optimize;
-+    use super::*;
- 
-     fn run(asm: &str) -> String {
-         peephole_optimize(asm.to_string())
-@@ -893,4 +929,73 @@ mod tests {
-         ));
-         assert!(out.contains("movl %edx, %eax"), "{out}");
-     }
+diff --git a/engineering/FOLLOWUP-2026-09-02-general-cloner-revival.md b/engineering/FOLLOWUP-2026-09-02-general-cloner-revival.md
+new file mode 100644
+index 0000000..03c8b5d
+--- /dev/null
++++ b/engineering/FOLLOWUP-2026-09-02-general-cloner-revival.md
+@@ -0,0 +1,79 @@
++# Follow-up 2026-09-02 — general CFG cloner revival + unroll arithmetic hardening
 +
-+    // ── accumulator round-trip: compound-source alias guards ──────────────
-+    //
-+    // Regression for the dot8 magic-division miscompile: an earlier pass
-+    // folded the staging copy into the imul source (`imulq $imm, %rax, %rax`
-+    // after `movq %rsi, %rax`), then the round-trip fold deleted the staging
-+    // copy while rewriting only the DESTINATION — emitting
-+    // `imulq $imm, %rax, %rsi` reading the now-stale scratch register.
++Supersedes the open question left by the `c72ff2c` review ("was the
++general-cloner stride fix ever exercised?"). Snapshot `S10`, commit
++`62e064f`, base `a726b5b` (latest main at the time of writing).
 +
-+    #[test]
-+    fn acc_roundtrip_rewrites_compound_src_mentioning_scratch() {
-+        // Direct drive of the pass (end-to-end runs may legitimately
-+        // pre-rewrite the staging copy elsewhere): the 3-operand imul names
-+        // the scratch register in its compound source; the fold must move
-+        // that mention onto the accumulator together with the destination.
-+        let asm = concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movslq %edi, %rsi\n",
-+            "    movq %rsi, %r11\n",
-+            "    imulq $1717986919, %r11, %r11\n",
-+            "    movq %r11, %rsi\n",
-+            "    sarq $33, %rsi\n",
-+            "    movq %rsi, (%rdx)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        );
-+        let mut store = LineStore::new(asm.to_string());
-+        let mut infos: Vec<LineInfo> = (0..store.len())
-+            .map(|i| classify_line(store.get(i)))
-+            .collect();
-+        assert!(fold_accumulator_roundtrip(&mut store, &mut infos));
-+        let out = store.build_result(|i| infos[i].is_nop());
-+        assert!(
-+            out.contains("imulq $1717986919, %rsi, %rsi"),
-+            "expected in-place fold with rewritten src: {out}"
-+        );
-+        assert!(
-+            !out.contains("imulq $1717986919, %r11, %rsi"),
-+            "stale-scratch miscompile: {out}"
-+        );
-+        // The staging copies are gone.
-+        assert!(!out.contains("movq %rsi, %r11"), "{out}");
-+        assert!(!out.contains("movq %r11, %rsi"), "{out}");
-+    }
++## 1. Audit verdict on the review claim
 +
-+    #[test]
-+    fn acc_roundtrip_never_reads_stale_scratch_when_src_mentions_acc() {
-+        let out = run(concat!(
-+            "foo:\n",
-+            ".cfi_startproc\n",
-+            "    movslq %edi, %rsi\n",
-+            "    movq %rsi, %rax\n",
-+            "    imulq $1717986919, %rsi, %rax\n",
-+            "    movq %rax, %rsi\n",
-+            "    sarq $33, %rsi\n",
-+            "    movq %rsi, (%rdx)\n",
-+            "    ret\n",
-+            ".cfi_endproc\n",
-+        ));
-+        // Whatever combination of folds fires, the imul must never end up
-+        // reading %rax as its source with %rsi as destination: %rax does not
-+        // hold the multiplicand once the staging copy is deleted.
-+        assert!(
-+            !out.contains("imulq $1717986919, %rax, %rsi"),
-+            "stale-scratch miscompile: {out}"
-+        );
-+    }
++**Claim:** `c72ff2c` added IV-stride scaling to the general CFG cloner
++(`iv_init + t * iv_step` per clone, `iv_init + trip * iv_step` post-loop),
++which only the two-block cloner had; without it a stride-4 multi-block
++loop would clone indices 0,1,2,… instead of 0,4,8,….  The reviewer also
++noted the shipped tests exercise only single-block bodies.
 +
- }
-diff --git a/src/common/fp_contract.rs b/src/common/fp_contract.rs
-index 57ba041..db1c712 100644
---- a/src/common/fp_contract.rs
-+++ b/src/common/fp_contract.rs
-@@ -31,6 +31,22 @@ pub enum FpContract {
- }
- 
- impl FpContract {
-+    /// The contraction default for C compilation: [`FpContract::Fast`],
-+    /// matching GCC's C default (`-ffp-contract=fast` in GNU dialects since
-+    /// 4.6). Verified against the godbolt oracles on a cross-statement
-+    /// reduction (`t = a[i]*b[i]; s = s + t;`, -O3 -march=x86-64-v3):
-+    /// gcc16.2 and icx fuse to vfmadd by default; only clang (whose C
-+    /// default is `on`) keeps the separate pair. The conservative
-+    /// [`FpContract::Off`] default lost every scalar FMA opportunity
-+    /// against the reference compiler (dot8: 46 instructions vs gcc's 21)
-+    /// while changing numerics away from GCC's, not toward it.
-+    /// Explicit `-ffp-contract={on,off}` flags always win; `Off` remains
-+    /// the enum `Default` for internal/test callers that want the
-+    /// fail-closed sentinel.
-+    pub const fn c_language_default() -> Self {
-+        FpContract::Fast
-+    }
++**Verdict: correct on both counts — and understated.**  The scaling is
++present and textually correct.  But the general cloner could not fire on
++*any* standard loop at all:
 +
-     /// Whether backend mul+add fusion is allowed for a candidate pair with
-     /// the given expression tags (`None` = untagged: pass-generated or
-     /// inlined value).
-diff --git a/src/driver/cli.rs b/src/driver/cli.rs
-index 45cc611..cad6f06 100644
---- a/src/driver/cli.rs
-+++ b/src/driver/cli.rs
-@@ -1577,11 +1577,11 @@ impl Driver {
-                 "-fno-fast-math" => {
-                     self.fast_math = false;
-                     self.fp_reassoc = false;
--                    // Restore the DEFAULT (contract=on, no statement-level
--                    // fusion in LCCC because SSA loses statement boundaries).
--                    // Explicit -ffp-contract={on,off,fast} flags always win.
-+                    // Restore the language default. In GCC, -ffp-contract is
-+                    // orthogonal to -fno-fast-math: the C default (fast)
-+                    // stands. Explicit -ffp-contract={on,off,fast} wins.
-                     if !self.fp_contract_explicit {
--                        self.fp_contract = FpContract::default();
-+                        self.fp_contract = FpContract::c_language_default();
-                     }
-                 }
-                 "-funsafe-math-optimizations" | "-fassociative-math" => {
-@@ -2072,23 +2072,19 @@ mod cli_tests {
-         reen.parse_cli_args(&args).unwrap();
-         assert!(reen.fp_contract == FpContract::Fast);
- 
--        // GCC parity: default is -ffp-contract=on for gnu C. LCCC's
--        // SSA-level Mul/Add fusion can change rounding across what the C
--        // abstract machine sees as separate statements (e.g. the lowered
--        // form of `double m = a*b; s += m;` looks identical to that of
--        // `s += a*b;` after SROA/GVN), so fp_contract_fast defaults to
--        // false. Users who want FMA contraction must explicitly request
--        // it via -ffp-contract=fast or -ffast-math (which also enables
--        // reassociation). The backend peephole layer still recognises the
--        // leaf-return `c + a*b` tree where the mul result is consumed
--        // exactly once as an FMA, matching GCC's observed vfmadd output
--        // for that case without affecting loop reductions.
-+        // GCC parity: the C default IS -ffp-contract=fast (GNU dialects,
-+        // since 4.6). The old assertion here ("default must NOT fuse") was
-+        // refuted by the godbolt oracles: on `t = a[i]*b[i]; s = s + t;`
-+        // at -O3 -march=x86-64-v3, gcc16.2 and icx emit vfmadd by default
-+        // -- only clang (default `on`) keeps the separate pair. The
-+        // backend's FMA3 ISA gate keeps baseline x86-64 builds
-+        // numerically identical regardless.
-         let mut dflt = Driver::new();
-         let args = vec!["lccc".to_string(), "x.c".to_string()];
-         dflt.parse_cli_args(&args).unwrap();
-         assert!(
--            dflt.fp_contract == FpContract::Off,
--            "gnu-C default must NOT fuse mul+add across SSA values without explicit -ffp-contract=fast"
-+            dflt.fp_contract == FpContract::Fast,
-+            "gnu-C default must match GCC: -ffp-contract=fast"
-         );
- 
-         // Explicit contract flag is sticky against later -ffast-math
-@@ -2106,8 +2102,8 @@ mod cli_tests {
-             "explicit off survives -ffast-math"
-         );
- 
--        // -fno-fast-math restores the non-fast default (i.e. fp_contract_fast
--        // is NOT set). It does not itself enable contraction.
-+        // -fno-fast-math is orthogonal to contraction in GCC: the language
-+        // default (fast) stands after it.
-         let mut nfm = Driver::new();
-         let args = vec![
-             "lccc".to_string(),
-@@ -2116,9 +2112,20 @@ mod cli_tests {
-         ];
-         nfm.parse_cli_args(&args).unwrap();
-         assert!(
--            nfm.fp_contract == FpContract::Off,
--            "-fno-fast-math must not silently turn contraction on"
-+            nfm.fp_contract == FpContract::Fast,
-+            "-fno-fast-math restores the language default (GCC orthogonality)"
-         );
++* `inst_ok` (general cloner) rejects any header `Cmp` whose operand has
++  "pointer origin" (`operand_has_pointer_origin`, added in PR #302).
++* That walk failed **closed** at recursion depth > 8.  Every counted
++  loop's IV is a cycle — `phi <- Add(phi, step)` in the latch — so the
++  walk spun `phi -> Add -> phi -> …` and returned "pointer" at depth 9.
++* The exit `Cmp` always compares the IV phi, so **every** loop died at
++  that check.  Instrumented evidence: 20/20 general-cloner attempts on
++  seven stride kernels rejected at the header-`Cmp` gate, printing e.g.
++  `Cmp { op: Slt, lhs: Value(40), rhs: Const(I32(16)) }`.
 +
-+        // ... and an explicit off still survives -fno-fast-math.
-+        let mut nfm_off = Driver::new();
-+        let args = vec![
-+            "lccc".to_string(),
-+            "-ffp-contract=off".to_string(),
-+            "-fno-fast-math".to_string(),
-+            "x.c".to_string(),
-+        ];
-+        nfm_off.parse_cli_args(&args).unwrap();
-+        assert!(nfm_off.fp_contract == FpContract::Off);
-     }
- 
-     #[test]
-diff --git a/src/driver/pipeline.rs b/src/driver/pipeline.rs
-index 84b3c9a..c41a91c 100644
---- a/src/driver/pipeline.rs
-+++ b/src/driver/pipeline.rs
-@@ -377,27 +377,17 @@ impl Driver {
-             optimize: false, // Only set to true when user explicitly passes -O1 or higher
-             optimize_size: false,
-             fp_reassoc: false,
--            // DEFAULT false (contract=on semantics without statement-level
--            // fusion): empirically verified against GCC 14.2 (Debian
--            // 14.2.0-19). At plain -O2 GCC emits scalar FMA ONLY for the
--            // leaf "c + a*b" tree (where GVN/SROA can prove the mul feeds
--            // ONLY the add AND the multiply has no observable side-effects
--            // other than the renamed SSA temporary). For loop-carried
--            // reductions and other contexts LCCC's SSA form does not carry
--            // enough source-level statement-boundary information to
--            // distinguish the safe single-expression pattern from the
--            // cross-statement pattern (`double m = a*b; s += m;`), so the
--            // conservative / correct choice is to NOT fuse mul+add unless
--            // the user explicitly opts in via -ffp-contract=fast or
--            // -ffast-math (which sets fp_contract_fast = true). The GCC
--            // 14 behavior in loops (vmulsd+vaddsd, no FMA) matches this
--            // default exactly for reductions; the leaf one-line function
--            // still benefits from the simple backend peephole in
--            // emit_float_binop_impl that can produce FMA when the result is
--            // returned directly (zero additional latency vs separate insns,
--            // and both forms round identically in that shape because no
--            // other consumer observes the intermediate mul result).
--            fp_contract: crate::common::fp_contract::FpContract::default(),
-+            // Contraction default for C: FAST, matching GCC's C default
-+            // (-ffp-contract=fast). The previous Off default claimed to match
-+            // "GCC 14 behavior in loops" -- refuted by the godbolt oracles:
-+            // on a cross-statement reduction at -O3 -march=x86-64-v3, gcc16.2
-+            // and icx fuse to vfmadd by default (clang, whose default is
-+            // `on`, does not). Off forfeited every scalar FMA against the
-+            // reference compilers (dot8: lccc 46 insns vs gcc 21 / icx 10).
-+            // Explicit -ffp-contract={on,off} wins; the backend additionally
-+            // gates on FMA3 ISA availability, so baseline x86-64 builds are
-+            // numerically unchanged.
-+            fp_contract: crate::common::fp_contract::FpContract::c_language_default(),
-             fp_contract_explicit: false,
-             fast_math: false,
-             verbose: false,
++So the `c72ff2c` scaling was dead code as shipped, and the guard's own
++comment ("Numeric and FP nested loops … are unaffected") had been false
++since the day it was written.  Timeline confirms the interaction:
++guard predates the fix (`git log -S` → #302 vs `c72ff2c`).
++
++## 2. Fix
++
++* **`operand_has_pointer_origin`**: depth cap replaced by an iterative
++  visited-set def-web walk.  Each distinct value expands once (linear),
++  pointer producers (`Alloca/DynAlloca/GlobalAddr/LabelAddr/GEP`) are
++  found at *any* depth, and numeric cycles terminate as non-pointer —
++  the guard's documented intent.  Pointer-state loops (the #302
++  motivation) are still rejected: the pointer node itself is reached
++  through the web regardless of cycles.
++* **`complete_unroll_trip`**: fully checked arithmetic.
++  `limit - iv_init` wrapped for extreme pairs (limit = `i64::MAX`,
++  init = -1); `-iv_step` wrapped for `iv_step = i64::MIN`.  Now
++  `checked_sub` / `checked_abs` / overflow-free ceil
++  (`(span-1)/step + 1`) / `checked_add`; any wrap ⇒ `None` (stay
++  rolled).  Unsigned cmp ops keep their conservative i64 reading.
++* **Post-loop IV, both cloners**: `init + trip*step` checked
++  (`checked_mul`+`checked_add`) before substitution; e.g.
++  init 0, limit `i64::MAX`, step 2^62 gives trip 2 but final 2^63 ⇒
++  refuse to clone.  Per-clone constants (`t < trip`) are provably
++  between init and final, so the single final-IV check bounds them all.
++
++## 3. Evidence
++
++| check | result |
++|---|---|
++| new regression `unroll_stride_general_cloner.c` (7 multi-block stride kernels: diamonds up/down, carried-phi diamond, nested, post-loop IV uses, residue trip) vs `gcc -O3 -march=x86-64-v3` | exact match `504 17 256 100 1157 42 53` |
++| red/green: revert only the two scaling lines (cloner revived) | `7 17 21 10 1157 14 15` — 5/7 kernels miscompile ⇒ fix is live and load-bearing |
++| header-`Cmp` rejections after visited-set fix | 20 → 0 on the same kernels |
++| unit tests | 1543 pass / 0 fail (new: `unroll_trip_extremes_never_wrap`) |
++| regression suite | 571 / 0 / 15 skip |
++| benchmark outputs | 152 / 0 / 0 |
++| `ir_verify_sweep.py` | 1142 configs, 0 violations |
++| fresh-worktree verification | patch applies clean on `origin/main` (`a726b5b`), builds, 1543/0 units, 571/0/15 regression, oracle match |
++
++## 4. Remaining backlog (unchanged ranking, minus this item)
++
++1. Typed `Call` lowering in MachInst isel (522 silent rejects).
++2. Vectorizer: global-array map-loop bailout (missed vec on `matmul`-ish
++   kernels writing globals).
++3. dot8 unroll+FMA end-to-end gap vs gcc — re-measure on godbolt now
++   that the general cloner actually fires (nested numeric loops were its
++   stated target; expect change).
++4. FCmp scratch xmm0/xmm1 staging (PhysReg 18/19 idle).
++5. Memcpy(92)/Store-other(79) typed lowering.
++6. Loop-gate `loop_insts ≤ 32` raise experiment.
++7. Linker-oracle script for LTO/whole-program comparisons.
 diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
-index 936dff1..f2d023d 100644
+index d214c3e..f06edfe 100644
 --- a/src/passes/loop_unroll.rs
 +++ b/src/passes/loop_unroll.rs
-@@ -528,6 +528,73 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
- ///   uses of carried phis with the last clone's corresponding value; the exit
- ///   block's phi edges from the header label are relabeled to the last
- ///   clone's latch (the block that now branches to the exit).
-+/// Exact static trip count for a constant-stride IV loop, or `None` when the
-+/// stride is degenerate (0) or its sign contradicts the exit comparison
-+/// (e.g. a negative step against `i < limit`), which would mean the loop
-+/// never terminates or never runs past the guard.
-+///
-+/// Complete unrolling needs the EXACT count up front — there is no cleanup
-+/// loop — so every arm is closed-form:
-+///   * `i <  limit`, step > 0: ceil((limit - init) / step)
-+///   * `i <= limit`, step > 0: floor((limit - init) / step) + 1
-+///   * `i >  limit`, step < 0: ceil((init - limit) / -step)
-+///   * `i >= limit`, step < 0: floor((init - limit) / -step) + 1
-+/// The ceil forms are exact for non-divisible spans because the exit test
-+/// runs every stride; the floor+1 forms count the last in-range iteration.
-+/// Non-positive spans (loop body never executes) yield `None`, matching the
-+/// pre-existing step-1 guards. For step == 1 this reduces to the historical
-+/// arithmetic verbatim.
-+fn complete_unroll_trip(iv_init: i64, limit: i64, cmp_op: IrCmpOp, iv_step: i64) -> Option<i64> {
-+    if iv_step == 0 {
-+        return None; // non-advancing IV: infinite or empty; not a trip count
-+    }
-+    let ascending = iv_step > 0;
-+    let trip = match cmp_op {
-+        IrCmpOp::Slt | IrCmpOp::Ult => {
-+            if !ascending {
-+                return None;
-+            }
-+            let span = limit - iv_init;
-+            if span <= 0 {
-+                return None;
-+            }
-+            (span + iv_step - 1) / iv_step
-+        }
-+        IrCmpOp::Sle | IrCmpOp::Ule => {
-+            if !ascending {
-+                return None;
-+            }
-+            let span = limit - iv_init;
-+            if span < 0 {
-+                return None;
-+            }
-+            span / iv_step + 1
-+        }
-+        IrCmpOp::Sgt | IrCmpOp::Ugt => {
-+            if ascending {
-+                return None;
-+            }
-+            let span = iv_init - limit;
-+            if span <= 0 {
-+                return None;
-+            }
-+            (span + (-iv_step) - 1) / -iv_step
-+        }
-+        IrCmpOp::Sge | IrCmpOp::Uge => {
-+            if ascending {
-+                return None;
-+            }
-+            let span = iv_init - limit;
-+            if span < 0 {
-+                return None;
-+            }
-+            span / -iv_step + 1
-+        }
-+        _ => return None,
-+    };
-+    Some(trip)
-+}
-+
- fn try_complete_unroll_general(
-     func: &mut IrFunction,
-     lp: &loop_analysis::NaturalLoop,
-@@ -604,15 +671,14 @@ fn try_complete_unroll_general(
-         return false;
+@@ -548,47 +548,53 @@ fn complete_unroll_trip(iv_init: i64, limit: i64, cmp_op: IrCmpOp, iv_step: i64)
+     if iv_step == 0 {
+         return None; // non-advancing IV: infinite or empty; not a trip count
      }
- 
--    // Basic IV: phi in header, Add(phi, 1) in the latch.
-+    // Basic IV: phi in header, Add(phi, step) in the latch. The stride may
-+    // be any non-zero constant; complete_unroll_trip rejects degenerate
-+    // stride/comparison combinations.
-     let Some((iv_phi, iv_ty, iv_step, latch_iv_incr_idx)) =
-         find_iv_in_loop(func, header, latch, latch_label)
-     else {
-         return false;
-     };
--    if iv_step != 1 {
--        return false;
--    }
- 
-     // Exit from the header's CondBranch.
-     let Some((exit_target, body_entry, cmp_op, _cmp_ty, exit_limit, _iv_is_lhs, _pos)) =
-@@ -645,32 +711,8 @@ fn try_complete_unroll_general(
-     };
- 
-     // Trip count (same arithmetic as the two-block unroller).
--    let trip: i64 = match cmp_op {
--        IrCmpOp::Slt | IrCmpOp::Ult => {
--            if limit_n <= iv_init {
--                return false;
--            }
--            limit_n - iv_init
--        }
--        IrCmpOp::Sle | IrCmpOp::Ule => {
--            if limit_n < iv_init {
--                return false;
--            }
--            limit_n - iv_init + 1
--        }
--        IrCmpOp::Sgt | IrCmpOp::Ugt => {
--            if iv_init <= limit_n {
--                return false;
--            }
--            iv_init - limit_n
--        }
--        IrCmpOp::Sge | IrCmpOp::Uge => {
--            if iv_init < limit_n {
--                return false;
--            }
--            iv_init - limit_n + 1
--        }
--        _ => return false,
-+    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step) else {
-+        return false;
-     };
-     if !(2..=16).contains(&trip) {
-         return false;
-@@ -1081,9 +1123,6 @@ fn try_complete_unroll_two_block(
-     else {
-         return false;
-     };
--    if iv_step != 1 {
--        return false;
--    }
-     let Some((
-         exit_target,
-         body_entry,
-@@ -1145,32 +1184,8 @@ fn try_complete_unroll_two_block(
-         },
-         _ => return false,
-     };
--    let trip: i64 = match cmp_op {
--        IrCmpOp::Slt | IrCmpOp::Ult => {
--            if limit_n <= iv_init {
--                return false;
--            }
--            limit_n - iv_init
--        }
--        IrCmpOp::Sle | IrCmpOp::Ule => {
--            if limit_n < iv_init {
--                return false;
--            }
--            limit_n - iv_init + 1
--        }
--        IrCmpOp::Sgt | IrCmpOp::Ugt => {
--            if iv_init <= limit_n {
--                return false;
--            }
--            iv_init - limit_n
--        }
--        IrCmpOp::Sge | IrCmpOp::Uge => {
--            if iv_init < limit_n {
--                return false;
--            }
--            iv_init - limit_n + 1
--        }
--        _ => return false,
-+    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step) else {
-+        return false;
-     };
-     // Trip bound 16 with a 512-expanded-instruction budget (levkropp
-     // 1b4bac8b's full-unroll limits, grafted onto our two-block complete
-@@ -3057,4 +3072,146 @@ mod tests {
++    // All intermediates use checked arithmetic.  `limit - iv_init` wraps for
++    // extreme constant pairs (e.g. limit = i64::MAX, iv_init = -1) and
++    // `-iv_step` wraps for iv_step = i64::MIN; a wrapped span would yield a
++    // nonsensical trip count, so bail and leave the loop rolled.
+     let ascending = iv_step > 0;
++    let step_abs = iv_step.checked_abs()?;
+     let trip = match cmp_op {
+         IrCmpOp::Slt | IrCmpOp::Ult => {
+             if !ascending {
+                 return None;
+             }
+-            let span = limit - iv_init;
++            let span = limit.checked_sub(iv_init)?;
+             if span <= 0 {
+                 return None;
+             }
+-            (span + iv_step - 1) / iv_step
++            // ceil(span / step), overflow-free for span >= 1
++            (span - 1) / step_abs + 1
          }
-     }
+         IrCmpOp::Sle | IrCmpOp::Ule => {
+             if !ascending {
+                 return None;
+             }
+-            let span = limit - iv_init;
++            let span = limit.checked_sub(iv_init)?;
+             if span < 0 {
+                 return None;
+             }
+-            span / iv_step + 1
++            (span / step_abs).checked_add(1)?
+         }
+         IrCmpOp::Sgt | IrCmpOp::Ugt => {
+             if ascending {
+                 return None;
+             }
+-            let span = iv_init - limit;
++            let span = iv_init.checked_sub(limit)?;
+             if span <= 0 {
+                 return None;
+             }
+-            (span + (-iv_step) - 1) / -iv_step
++            (span - 1) / step_abs + 1
+         }
+         IrCmpOp::Sge | IrCmpOp::Uge => {
+             if ascending {
+                 return None;
+             }
+-            let span = iv_init - limit;
++            let span = iv_init.checked_sub(limit)?;
+             if span < 0 {
+                 return None;
+             }
+-            span / -iv_step + 1
++            (span / step_abs).checked_add(1)?
+         }
+         _ => return None,
+     };
+@@ -778,8 +784,8 @@ fn try_complete_unroll_general(
+             // FP nested loops—the performance target of the general form—are
+             // unaffected.
+             Instruction::Cmp { lhs, rhs, .. }
+-                if operand_has_pointer_origin(func, lhs, 0)
+-                    || operand_has_pointer_origin(func, rhs, 0) =>
++                if operand_has_pointer_origin(func, lhs)
++                    || operand_has_pointer_origin(func, rhs) =>
+             {
+                 false
+             }
+@@ -1030,7 +1036,13 @@ fn try_complete_unroll_general(
+     func.blocks[latch].terminator = Terminator::Branch(plans[0].header_copy);
  
-+
-+    // ── complete_unroll_trip truth table ─────────────────────────────────
-+    // Exhaustive closed-form coverage of the constant-stride trip count:
-+    // the historical step-1 arithmetic must reduce verbatim, and every
-+    // stride>1 / negative-stride arm must match a reference loop simulation.
-+    #[test]
-+    fn unroll_trip_step_one_matches_historical_arithmetic() {
-+        use crate::ir::reexports::IrCmpOp::*;
-+        // i < 8, step 1  → 8 trips (classic 0..8).
-+        assert_eq!(complete_unroll_trip(0, 8, Slt, 1), Some(8));
-+        // i <= 7, step 1 → 8 trips.
-+        assert_eq!(complete_unroll_trip(0, 7, Sle, 1), Some(8));
-+        // Non-zero init.
-+        assert_eq!(complete_unroll_trip(3, 8, Slt, 1), Some(5));
-+        // Empty / inverted spans stay rejected (pre-existing guards).
-+        assert_eq!(complete_unroll_trip(8, 8, Slt, 1), None);
-+        assert_eq!(complete_unroll_trip(9, 8, Slt, 1), None);
-+        assert_eq!(complete_unroll_trip(8, 7, Sle, 1), None);
-+    }
-+
-+    #[test]
-+    fn unroll_trip_positive_strides() {
-+        use crate::ir::reexports::IrCmpOp::*;
-+        // dot8's shape: i < 8, i += 4 → exactly 2 trips.
-+        assert_eq!(complete_unroll_trip(0, 8, Slt, 4), Some(2));
-+        // Non-divisible Slt: ceil. i < 10, i += 3 → 0,3,6,9 → 4 trips.
-+        assert_eq!(complete_unroll_trip(0, 10, Slt, 3), Some(4));
-+        // Odd limit: i < 7, i += 2 → 0,2,4,6 → 4 trips.
-+        assert_eq!(complete_unroll_trip(0, 7, Slt, 2), Some(4));
-+        // Sle floor+1: i <= 9, i += 3 → 0,3,6,9 → 4 trips.
-+        assert_eq!(complete_unroll_trip(0, 9, Sle, 3), Some(4));
-+        // Sle non-divisible: i <= 10, i += 3 → 0,3,6,9 → 4 trips.
-+        assert_eq!(complete_unroll_trip(0, 10, Sle, 3), Some(4));
-+        // Single iteration: i < 5, i += 5 → 1 (callers reject trip < 2).
-+        assert_eq!(complete_unroll_trip(0, 5, Slt, 5), Some(1));
-+        // Non-zero init with stride: i = 2; i < 11; i += 3 → 2,5,8 → 3.
-+        assert_eq!(complete_unroll_trip(2, 11, Slt, 3), Some(3));
-+    }
-+
-+    #[test]
-+    fn unroll_trip_negative_strides_countdown() {
-+        use crate::ir::reexports::IrCmpOp::*;
-+        // for (i = 10; i > 0; i -= 2) → 10,8,6,4,2 → 5 trips.
-+        assert_eq!(complete_unroll_trip(10, 0, Sgt, -2), Some(5));
-+        // Non-divisible countdown: i > 0, i -= 3 → 10,7,4,1 → 4 (ceil).
-+        assert_eq!(complete_unroll_trip(10, 0, Sgt, -3), Some(4));
-+        // Sge floor+1: i >= 0, i -= 3 → 9,6,3,0 → 4 trips.
-+        assert_eq!(complete_unroll_trip(9, 0, Sge, -3), Some(4));
-+        // Empty countdown.
-+        assert_eq!(complete_unroll_trip(0, 0, Sgt, -1), None);
-+    }
-+
-+    #[test]
-+    fn unroll_trip_rejects_degenerate_shapes() {
-+        use crate::ir::reexports::IrCmpOp::*;
-+        // Zero stride: infinite loop, no trip count.
-+        assert_eq!(complete_unroll_trip(0, 8, Slt, 0), None);
-+        // Sign/stride contradictions: a negative stride against an
-+        // ascending comparison diverges (or wraps); must be refused.
-+        assert_eq!(complete_unroll_trip(0, 8, Slt, -1), None);
-+        assert_eq!(complete_unroll_trip(0, 8, Sle, -4), None);
-+        assert_eq!(complete_unroll_trip(8, 0, Sgt, 1), None);
-+        assert_eq!(complete_unroll_trip(8, 0, Sge, 2), None);
-+        // Equality-style comparisons carry no ordering: refused.
-+        assert_eq!(complete_unroll_trip(0, 8, Eq, 1), None);
-+    }
-+
-+    #[test]
-+    fn unroll_trip_matches_reference_simulation() {
-+        // Cross-check the closed forms against a direct loop simulation
-+        // over a dense grid of (init, limit, step) — the helper is the
-+        // single source of truth for complete unrolling, so a mismatch
-+        // here is a miscompile waiting to happen.
-+        use crate::ir::reexports::IrCmpOp::*;
-+        for init in -3i64..=6 {
-+            for limit in -3i64..=12 {
-+                for step in 1i64..=5 {
-+                    for &(op, desc) in &[(Slt, "lt"), (Sle, "le")] {
-+                        let simulated = (0..)
-+                            .scan(init, |i, _| {
-+                                let cont = match op {
-+                                    Slt => *i < limit,
-+                                    _ => *i <= limit,
-+                                };
-+                                if !cont {
-+                                    return None;
-+                                }
-+                                let old = *i;
-+                                *i += step;
-+                                Some(old)
-+                            })
-+                            .count() as i64;
-+                        let closed = complete_unroll_trip(init, limit, op, step);
-+                        if simulated == 0 {
-+                            assert!(
-+                                closed.is_none(),
-+                                "{desc}: init={init} limit={limit} step={step} empty loop must reject"
-+                            );
-+                        } else {
-+                            assert_eq!(
-+                                closed,
-+                                Some(simulated),
-+                                "{desc}: init={init} limit={limit} step={step}"
-+                            );
-+                        }
-+                    }
-+                }
-+                for step in -5i64..=-1 {
-+                    for &(op, desc) in &[(Sgt, "gt"), (Sge, "ge")] {
-+                        let simulated = (0..)
-+                            .scan(init, |i, _| {
-+                                let cont = match op {
-+                                    Sgt => *i > limit,
-+                                    _ => *i >= limit,
-+                                };
-+                                if !cont {
-+                                    return None;
-+                                }
-+                                let old = *i;
-+                                *i += step;
-+                                Some(old)
-+                            })
-+                            .count() as i64;
-+                        let closed = complete_unroll_trip(init, limit, op, step);
-+                        if simulated == 0 {
-+                            assert!(
-+                                closed.is_none(),
-+                                "{desc}: init={init} limit={limit} step={step} empty loop must reject"
-+                            );
-+                        } else {
-+                            assert_eq!(
-+                                closed,
-+                                Some(simulated),
-+                                "{desc}: init={init} limit={limit} step={step}"
-+                            );
-+                        }
-+                    }
+     // Outside uses: IV → final constant; carried phis → final clone values.
+-    let final_iv = Operand::Const(IrConst::from_i64(iv_init + trip * iv_step, iv_ty));
++    // The post-loop IV may exceed i64 even when the trip count is small
++    // (e.g. init = 0, limit = i64::MAX, step = 2^62 -> trip = 2, final =
++    // 2^63): refuse to clone rather than substitute a wrapped constant.
++    let Some(final_iv_n) = iv_step.checked_mul(trip).and_then(|d| iv_init.checked_add(d)) else {
++        return false;
++    };
++    let final_iv = Operand::Const(IrConst::from_i64(final_iv_n, iv_ty));
+     for (block_index, block) in func.blocks.iter_mut().enumerate() {
+         if lp.body.contains(&block_index) {
+             continue;
+@@ -1375,7 +1387,13 @@ fn try_complete_unroll_two_block(
+     func.blocks[latch].terminator = Terminator::Branch(exit_target);
+     let _ = (body_entry, exit_cond_positive);
+ 
+-    let final_iv = Operand::Const(IrConst::from_i64(iv_init + trip * iv_step, iv_ty));
++    // The post-loop IV may exceed i64 even when the trip count is small
++    // (e.g. init = 0, limit = i64::MAX, step = 2^62 -> trip = 2, final =
++    // 2^63): refuse to clone rather than substitute a wrapped constant.
++    let Some(final_iv_n) = iv_step.checked_mul(trip).and_then(|d| iv_init.checked_add(d)) else {
++        return false;
++    };
++    let final_iv = Operand::Const(IrConst::from_i64(final_iv_n, iv_ty));
+     for (block_index, block) in func.blocks.iter_mut().enumerate() {
+         if lp.body.contains(&block_index) {
+             continue;
+@@ -1519,46 +1537,65 @@ pub(crate) fn subst_value_in_terminator(terminator: &mut Terminator, old_id: u32
+ /// Whether an operand is transitively an object address. Pointer comparisons
+ /// are represented as I64 on x86, so checking only `Cmp.ty == Ptr` misses the
+ /// common `p == &local` form used by pointer-state loops.
+-fn operand_has_pointer_origin(func: &IrFunction, op: &Operand, depth: usize) -> bool {
+-    if depth > 8 {
+-        return true; // fail closed for cyclic/very deep value webs
+-    }
+-    let Operand::Value(value) = op else {
++fn operand_has_pointer_origin(func: &IrFunction, op: &Operand) -> bool {
++    // Walk the def-web of `op` looking for a pointer-producing instruction.
++    // A visited set (rather than a recursion-depth cap) terminates the walk:
++    // induction-variable cycles (`phi <- Add(phi, step)` in the latch) are
++    // ordinary in every counted loop, and a depth cap would fail closed on
++    // them, rejecting the exact numeric loops this analysis is meant to
++    // admit.  Each distinct value is expanded once, so the walk stays linear
++    // in the size of the web; pointer definitions are found at any depth.
++    let Operand::Value(root) = op else {
+         return false;
+     };
+-    let def = func
+-        .blocks
+-        .iter()
+-        .flat_map(|block| block.instructions.iter())
+-        .find(|inst| inst.dest() == Some(*value));
+-    match def {
+-        Some(
+-            Instruction::Alloca { .. }
+-            | Instruction::DynAlloca { .. }
+-            | Instruction::GlobalAddr { .. }
+-            | Instruction::LabelAddr { .. }
+-            | Instruction::GetElementPtr { .. },
+-        ) => true,
+-        Some(Instruction::Copy { src, .. } | Instruction::Cast { src, .. }) => {
+-            operand_has_pointer_origin(func, src, depth + 1)
+-        }
+-        Some(Instruction::Select {
+-            true_val,
+-            false_val,
+-            ..
+-        }) => {
+-            operand_has_pointer_origin(func, true_val, depth + 1)
+-                || operand_has_pointer_origin(func, false_val, depth + 1)
++    let mut visited: FxHashSet<Value> = FxHashSet::default();
++    let mut stack: Vec<Value> = vec![*root];
++    while let Some(value) = stack.pop() {
++        if !visited.insert(value) {
++            continue;
+         }
+-        Some(Instruction::Phi { incoming, .. }) => incoming
++        let def = func
++            .blocks
+             .iter()
+-            .any(|(incoming, _)| operand_has_pointer_origin(func, incoming, depth + 1)),
+-        Some(Instruction::BinOp { lhs, rhs, .. }) => {
+-            operand_has_pointer_origin(func, lhs, depth + 1)
+-                || operand_has_pointer_origin(func, rhs, depth + 1)
++            .flat_map(|block| block.instructions.iter())
++            .find(|inst| inst.dest() == Some(value));
++        let mut push = |stack: &mut Vec<Value>, operand: &Operand| {
++            if let Operand::Value(v) = operand {
++                stack.push(*v);
++            }
++        };
++        match def {
++            Some(
++                Instruction::Alloca { .. }
++                | Instruction::DynAlloca { .. }
++                | Instruction::GlobalAddr { .. }
++                | Instruction::LabelAddr { .. }
++                | Instruction::GetElementPtr { .. },
++            ) => return true,
++            Some(Instruction::Copy { src, .. } | Instruction::Cast { src, .. }) => {
++                push(&mut stack, src);
++            }
++            Some(Instruction::Select {
++                true_val,
++                false_val,
++                ..
++            }) => {
++                push(&mut stack, true_val);
++                push(&mut stack, false_val);
++            }
++            Some(Instruction::Phi { incoming, .. }) => {
++                for (incoming, _) in incoming {
++                    push(&mut stack, incoming);
 +                }
 +            }
-+        }
++            Some(Instruction::BinOp { lhs, rhs, .. }) => {
++                push(&mut stack, lhs);
++                push(&mut stack, rhs);
++            }
++            _ => {}
+         }
+-        _ => false,
+     }
++    false
+ }
+ 
+ fn resolve_const_operand(func: &IrFunction, op: &Operand, depth: usize) -> Option<i64> {
+@@ -3143,6 +3180,32 @@ mod tests {
+         assert_eq!(complete_unroll_trip(0, 8, Eq, 1), None);
+     }
+ 
++    #[test]
++    fn unroll_trip_extremes_never_wrap() {
++        use crate::ir::reexports::IrCmpOp::*;
++        // `limit - iv_init` overflows i64 (MAX - (-1)); the checked span
++        // must refuse rather than produce a wrapped trip count.
++        assert_eq!(complete_unroll_trip(-1, i64::MAX, Slt, 1), None);
++        assert_eq!(complete_unroll_trip(i64::MIN, 0, Sgt, -1), None);
++        // `-iv_step` overflows for iv_step = i64::MIN; checked_abs refuses.
++        assert_eq!(complete_unroll_trip(0, i64::MIN, Sgt, i64::MIN), None);
++        assert_eq!(complete_unroll_trip(0, i64::MAX, Slt, i64::MIN), None);
++        // Representable but huge: 0, 2^62 < MAX → 2 trips.  (The cloner's
++        // checked final IV then refuses to substitute 2^63; see below.)
++        assert_eq!(complete_unroll_trip(0, i64::MAX, Slt, 1 << 62), Some(2));
++        // Sle at the top of the range: span/step + 1 would be MAX + 1.
++        assert_eq!(complete_unroll_trip(0, i64::MAX, Sle, 1), None);
++        // Extremes that stay in range must still unroll.
++        assert_eq!(complete_unroll_trip(i64::MIN, i64::MIN + 8, Slt, 2), Some(4));
++        assert_eq!(complete_unroll_trip(i64::MAX, i64::MAX - 9, Sgt, -3), Some(3));
++        assert_eq!(complete_unroll_trip(i64::MAX - 6, i64::MAX, Sle, 3), Some(3));
++        // The post-loop IV bound used by both cloners: final = init +
++        // trip * step must be computed with checked arithmetic (this mirrors
++        // the cloner-side guard; trip = 2, step = 2^62 → 2^63 overflows).
++        let trip = complete_unroll_trip(0, i64::MAX, Slt, 1 << 62).unwrap();
++        assert!((1i64 << 62).checked_mul(trip).and_then(|d| 0i64.checked_add(d)).is_none());
 +    }
 +
- }
-diff --git a/tests/regression/unroll_stride_complete.c b/tests/regression/unroll_stride_complete.c
+     #[test]
+     fn unroll_trip_matches_reference_simulation() {
+         // Cross-check the closed forms against a direct loop simulation
+diff --git a/tests/regression/unroll_stride_general_cloner.c b/tests/regression/unroll_stride_general_cloner.c
 new file mode 100644
-index 0000000..71a05d5
+index 0000000..cc334ba
 --- /dev/null
-+++ b/tests/regression/unroll_stride_complete.c
-@@ -0,0 +1,128 @@
-+/* Constant-stride complete unrolling (found via the dot8 godbolt gap).
++++ b/tests/regression/unroll_stride_general_cloner.c
+@@ -0,0 +1,132 @@
++/* General-CFG-cloner constant-stride coverage (review follow-up).
 + *
-+ * Both complete unrollers (two-block and general) historically rejected
-+ * `iv_step != 1`, so `for (i = 0; i < 8; i += 4)` — the classic 4-way
-+ * software-pipelined accumulator shape — never fully unrolled, and Pass A
-+ * routed 2-block loops away from the general cloner, leaving the stride
-+ * loop as a loop while gcc/clang/icx all straightened it. dot8 at
-+ * -O3 -march=x86-64-v3: lccc 46 instructions vs gcc 21 / clang 14 /
-+ * icx 10, with 6 IV-bump instructions per iteration carrying the loop.
++ * The complete-unroll stride support has TWO cloners: the two-block cloner
++ * (single-block bodies) and the general CFG cloner (multi-block bodies:
++ * diamonds, nested loops, carried phis with multiple incoming edges).
++ * `unroll_stride_complete.c` pins the stride arms, but every kernel there
++ * has a single-block body -- only the two-block cloner runs. This file
++ * routes stride loops through the GENERAL cloner, whose per-clone IV
++ * substitution (`iv_init + t * iv_step`) and out-of-loop final value
++ * (`iv_init + trip * iv_step`) must both scale by the stride: with the
++ * stride guard lifted but the substitution unscaled, a stride-4 diamond
++ * loop cloned iteration indices 0,1 instead of 0,4 and addressed the
++ * wrong elements (caught in review; this test keeps it caught).
 + *
-+ * The fix computes the exact static trip count for any non-zero stride
-+ * (ceil for `<`/`>`, floor+1 for `<=`/`>=`, sign-consistent), and the
-+ * cloner already substituted `init + k*step` per iteration. These kernels
-+ * pin the runtime results of every stride arm: exact division, ceil on a
-+ * non-divisible span, `<=` with and without residue, trip-1 (must stay
-+ * correct, unroll or not), countdown strides, and the FP accumulator
-+ * shape that motivated the fix (FMA-contracted at -O3 on v3 targets).
++ * Shapes: diamond body (both signs of stride), carried-accumulator phi
++ * with two incoming edges, nested inner loop inside a strided outer
++ * loop, and post-loop uses of the IV (the final-value substitution).
++ * Results are printf'd and diffed against the oracle build.
 + */
 +#include <stdio.h>
 +
 +long la[16], lb[16];
-+double da[16], db[16];
-+volatile double sink;
++volatile long vsink;
 +
 +static void init(void) {
 +    for (int i = 0; i < 16; i++) {
 +        la[i] = i * 3 - 7;
 +        lb[i] = (i % 5) - 2;
-+        da[i] = i * 0.5 - 1.25;
-+        db[i] = (i % 4) * 0.75 + 0.125;
 +    }
 +}
 +
-+/* dot8's shape: stride 4, exact division, 2 trips. */
-+static long dot8i(void) {
-+    long s0 = 0, s1 = 0, s2 = 0, s3 = 0;
++/* Diamond body, ascending stride 4: i = 0,4,8,12. Multi-block body:
++ * the general cloner must substitute 0,4,8 for clones 1..3. */
++static long diamond_up(void) {
++    long s = 0;
++    for (int i = 0; i < 16; i += 4) {
++        if (la[i] > 0)
++            s += la[i] * i;
++        else
++            s -= lb[i] * i;
++    }
++    return s;
++}
++
++/* Diamond body, descending stride 2: i = 14,12,...,2. */
++static long diamond_down(void) {
++    long s = 0;
++    for (int i = 14; i > 0; i -= 2) {
++        if (i & 2)
++            s += la[i];
++        else
++            s -= la[i];
++    }
++    return s;
++}
++
++/* Carried accumulator phi defined in BOTH arms (two incoming back
++ * edges): exercises the general cloner's prev_back threading across
++ * clones with stride 3. i = 1,4,7,10 (non-zero init, ceil trip). */
++static long carried_diamond(void) {
++    long s = 5;
++    for (int i = 1; i < 12; i += 3) {
++        if (la[i] & 1)
++            s = s + i * la[i];
++        else
++            s = s - i * lb[i];
++    }
++    return s;
++}
++
++/* Strided outer loop (multi-block body because of the inner loop):
++ * i = 0,4. The inner unit-stride loop must survive intact in every
++ * clone with the outer IV scaled. */
++static long nested_stride(void) {
++    long s = 0;
 +    for (int i = 0; i < 8; i += 4) {
-+        s0 += la[i] * lb[i];
-+        s1 += la[i + 1] * lb[i + 1];
-+        s2 += la[i + 2] * lb[i + 2];
-+        s3 += la[i + 3] * lb[i + 3];
++        for (int j = 0; j < 4; j++)
++            s += la[i + j] * (j + 1);
 +    }
-+    return (s0 + s1) + (s2 + s3);
++    return s;
 +}
 +
-+static double dot8d(void) {
-+    double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
-+    for (int i = 0; i < 8; i += 4) {
-+        s0 += da[i] * db[i];
-+        s1 += da[i + 1] * db[i + 1];
-+        s2 += da[i + 2] * db[i + 2];
-+        s3 += da[i + 3] * db[i + 3];
++/* Post-loop IV uses: the final value substitution must be
++ * `iv_init + trip * iv_step`, not `iv_init + trip`.
++ * Loop 1: i = 2,5,8 -> exit 11.  Loop 2: i = 9,6,3 -> exit 0. */
++static long post_iv(void) {
++    long s = 0;
++    int i;
++    for (i = 2; i < 11; i += 3)
++        s += la[i];
++    s += i * 100;
++    for (i = 9; i > 0; i -= 3)
++        s += la[i];
++    s += i;
++    return s;
++}
++
++/* Post-loop IV use with a diamond body (final value through the
++ * general cloner): i = 0,3,6,9 -> exit 12. */
++static long post_iv_diamond(void) {
++    long s = 0;
++    int i;
++    for (i = 0; i < 12; i += 3) {
++        if (la[i] & 1)
++            s += i;
++        else
++            s += 2 * i;
 +    }
-+    return (s0 + s1) + (s2 + s3);
++    vsink = s;
++    return i + (int)s;
 +}
 +
-+/* Stride 3 over a non-divisible span: i = 0,3,6,9 (ceil). */
-+static long s3_10(void) {
++/* `<=` exit with diamond body and residue: i = 0,5,10 -> exit 15. */
++static long sle_diamond(void) {
 +    long s = 0;
-+    for (int i = 0; i < 10; i += 3)
-+        s += la[i] * i;
-+    return s;
-+}
-+
-+/* Odd limit, stride 2: i = 0,2,4,6. */
-+static long s2_7(void) {
-+    long s = 0;
-+    for (int i = 0; i < 7; i += 2)
-+        s += la[i] * i - lb[i];
-+    return s;
-+}
-+
-+/* `<=` exact (0,3,6,9) and with residue (last still 9). */
-+static long sle_9(void) {
-+    long s = 0;
-+    for (int i = 0; i <= 9; i += 3)
-+        s += la[i] * i;
-+    return s;
-+}
-+
-+static long sle_10(void) {
-+    long s = 0;
-+    for (int i = 0; i <= 10; i += 3)
-+        s += la[i] * i;
-+    return s;
-+}
-+
-+/* Single iteration: trip 1 falls outside the unroll bound; whichever way
-+ * it lowers, the result must be one body execution. */
-+static long t1(void) {
-+    long s = 0;
-+    for (int i = 0; i < 5; i += 5)
-+        s += la[i] * i;
-+    return s;
-+}
-+
-+/* Stride 4, trip 4, both arrays read. */
-+static long d16_4(void) {
-+    long s = 0;
-+    for (int i = 0; i < 16; i += 4)
-+        s += la[i] + lb[i];
-+    return s;
-+}
-+
-+/* Countdown stride: i = 12,10,8,6,4,2. */
-+static long down2(void) {
-+    long s = 0;
-+    for (int i = 12; i > 0; i -= 2)
-+        s += la[i] * i;
-+    return s;
-+}
-+
-+/* Non-zero init with stride: i = 2,5,8. */
-+static long init2(void) {
-+    long s = 0;
-+    for (int i = 2; i < 11; i += 3)
-+        s += la[i] * lb[i];
-+    return s;
++    int i;
++    for (i = 0; i <= 13; i += 5) {
++        if (la[i] > 0)
++            s += la[i];
++        else
++            s -= la[i];
++    }
++    return s + i;
 +}
 +
 +int main(void) {
 +    init();
-+    sink = dot8d();
-+    printf("%ld %.6g %ld %ld %ld %ld %ld %ld %ld %ld\n",
-+           dot8i(), sink, s3_10(), s2_7(), sle_9(), sle_10(), t1(), d16_4(),
-+           down2(), init2());
++    printf("%ld %ld %ld %ld %ld %ld %ld\n",
++           diamond_up(), diamond_down(), carried_diamond(), nested_stride(),
++           post_iv(), post_iv_diamond(), sle_diamond());
 +    return 0;
 +}
-diff --git a/tests/regression/unroll_stride_complete.flags b/tests/regression/unroll_stride_complete.flags
+diff --git a/tests/regression/unroll_stride_general_cloner.flags b/tests/regression/unroll_stride_general_cloner.flags
 new file mode 100644
 index 0000000..cd11b1e
 --- /dev/null
-+++ b/tests/regression/unroll_stride_complete.flags
++++ b/tests/regression/unroll_stride_general_cloner.flags
 @@ -0,0 +1 @@
 +-O3 -march=x86-64-v3
